@@ -1,0 +1,16 @@
+[package]
+name = "speakerguardd"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Feed-forward speaker protection daemon for amplifiers without sense lines"
+authors = ["The Aurora Silicon Contributors"]
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

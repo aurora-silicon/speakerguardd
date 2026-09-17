@@ -1,0 +1,9 @@
+SUBSYSTEM=="sound", DRIVERS=="snd-soc-macaudio", GOTO="speakerguardd_macaudio"
+GOTO="speakerguardd_end"
+
+LABEL="speakerguardd_macaudio"
+KERNEL=="pcmC*D2c", ATTRS{id}=="AppleJ*", ENV{ACP_IGNORE}="1"
+
+KERNEL=="pcmC*D2c", ATTRS{id}=="AppleJ700", TAG+="systemd", ENV{SYSTEMD_WANTS}="speakerguardd.service"
+
+LABEL="speakerguardd_end"
