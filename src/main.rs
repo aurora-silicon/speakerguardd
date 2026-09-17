@@ -29,6 +29,8 @@ use model::SpeakerState;
 const UNLOCK_MAGIC: i64 = 0xdec1be15u32 as i32 as i64;
 /// The kernel locks the volume again 250 ms after the last write; write well
 /// inside that while the speakers play.
+/// Cadence of the per-speaker debug line.
+const LOG_INTERVAL: Duration = Duration::from_secs(1);
 const PING_INTERVAL: Duration = Duration::from_millis(100);
 /// Volume control steps per dB (t8140-aop-audio: 0.5 dB steps).
 const STEPS_PER_DB: f64 = 2.0;
@@ -252,7 +254,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             }
             last_ping = Instant::now();
         }
-        if last_log.elapsed() >= Duration::from_secs(5) {
+        if last_log.elapsed() >= LOG_INTERVAL {
             for s in &speakers {
                 debug!("{}: {:.3} Vrms {:.1} mW coil {:.1} C magnet {:.1} C reduction {:.1} dB", s.spec.name, s.v_rms, s.power * 1000.0, s.t_coil, s.t_magnet, s.reduction_db);
             }
