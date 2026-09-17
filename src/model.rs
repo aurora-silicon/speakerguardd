@@ -119,9 +119,10 @@ impl SpeakerState {
     /// Governor: the reduction (dB) that keeps the coil inside the window
     /// and the mean power inside the budgets.  Thermal reduction grows
     /// linearly across the window from 0 dB at `limit - headroom - window`
-    /// to `max_db` at `limit - headroom`, and is released only once the coil
-    /// is `hysteresis` below where it started.
-    pub fn govern(&mut self, globals: &Globals, max_db: f64) -> f64 {
+    /// to `t_reduction_max` at `limit - headroom` (and keeps growing at the
+    /// same rate above it), and is released only once the coil is
+    /// `hysteresis` below where it started.
+    pub fn govern(&mut self, globals: &Globals) -> f64 {
         let ceiling = self.spec.t_limit - self.spec.t_headroom;
         let start = ceiling - globals.t_window;
         if self.t_coil > start {
@@ -130,11 +131,11 @@ impl SpeakerState {
             self.reducing = false;
         }
         let thermal = if self.reducing {
-            ((self.t_coil - start) / globals.t_window * max_db).clamp(0.0, max_db)
+            ((self.t_coil - start) / globals.t_window * globals.t_reduction_max).max(0.0)
         } else {
             0.0
         };
-        let wanted = thermal.max(self.budget_reduction()).min(max_db);
+        let wanted = thermal.max(self.budget_reduction());
         // attack at once, release at most 0.5 dB per step so the level does
         // not pump
         self.reduction_db = if wanted >= self.reduction_db { wanted } else { (self.reduction_db - 0.5).max(wanted) };
@@ -171,7 +172,7 @@ mod tests {
     }
 
     fn globals() -> Globals {
-        Globals { sense_pcm: 2, t_ambient: 35.0, t_hysteresis: 5.0, t_window: 20.0, channels: 2, period: 4096 }
+        Globals { sense_pcm: 2, t_ambient: 35.0, t_hysteresis: 5.0, t_window: 20.0, channels: 2, period: 4096, t_reduction_max: 20.0 }
     }
 
     #[test]
@@ -215,7 +216,7 @@ mod tests {
         let p = v * v / 4.43;
         for _ in 0..(3600 * 10) {
             s.step(p, 0.1, 35.0);
-            assert_eq!(s.govern(&globals(), 7.0), 0.0);
+            assert_eq!(s.govern(&globals()), 0.0);
         }
         // 12 mW * (60 + 40) K/W = 1.2 K above ambient
         assert!(s.t_coil < 37.0, "{}", s.t_coil);
@@ -224,25 +225,26 @@ mod tests {
     #[test]
     fn governor_window_and_hysteresis() {
         let mut s = SpeakerState::new(spec(), 35.0);
-        let g = globals();
+        let g = globals(); // t_reduction_max 20 dB at the working limit
         // heat the coil into the window: limit 110 - headroom 10 = 100, window starts at 80
         s.t_coil = 90.0;
         s.t_magnet = 60.0;
-        let r = s.govern(&g, 7.0);
-        assert!((r - 3.5).abs() < 1e-9, "{r}");
+        let r = s.govern(&g);
+        assert!((r - 10.0).abs() < 1e-9, "{r}");
         s.t_coil = 100.0;
-        assert_eq!(s.govern(&g, 7.0), 7.0);
-        s.t_coil = 200.0;
-        assert_eq!(s.govern(&g, 7.0), 7.0);
+        assert_eq!(s.govern(&g), 20.0);
+        // beyond the working limit the reduction keeps growing at the same rate
+        s.t_coil = 110.0;
+        assert_eq!(s.govern(&g), 30.0);
         // back inside the window but above start - hysteresis: still reducing
         s.t_coil = 78.0;
-        let r = s.govern(&g, 7.0);
-        assert!(r > 0.0 && r < 7.0, "{r}");
+        let r = s.govern(&g);
+        assert!(r > 0.0 && r < 30.0, "{r}");
         // released only below start - hysteresis, 0.5 dB per step
         s.t_coil = 70.0;
         let mut last = r;
-        for _ in 0..20 {
-            let now = s.govern(&g, 7.0);
+        for _ in 0..80 {
+            let now = s.govern(&g);
             assert!(now <= last && last - now <= 0.5 + 1e-9);
             last = now;
         }
@@ -270,14 +272,14 @@ mod tests {
             s.step(6.3, 0.1, 35.0);
         }
         assert!(s.t_coil < 75.0, "{}", s.t_coil);
-        let r = s.govern(&g, 20.0);
+        let r = s.govern(&g);
         assert!((r - 10.0 * (3.15f64 / 2.8154).log10()).abs() < 0.05, "{r}");
         // silence: the mean falls back under the budget and the reduction releases
         for _ in 0..20 {
             s.step(0.0, 0.1, 35.0);
-            s.govern(&g, 20.0);
+            s.govern(&g);
         }
-        assert_eq!(s.govern(&g, 20.0), 0.0);
+        assert_eq!(s.govern(&g), 0.0);
         // the minute budget: 2.6 W for a minute ends up over 2.5 W
         for _ in 0..600 {
             s.step(2.6, 0.1, 35.0);

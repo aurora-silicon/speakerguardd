@@ -22,15 +22,16 @@ the power in the coil (`z_nominal`).  That power drives a two-stage lumped
 thermal model - voice coil into magnet (`tr_coil` K/W, `tau_coil` s), magnet
 into ambient (`tr_magnet`, `tau_magnet`) - and the coil temperature drives a
 governor: gain reduction starts `t_window` below the working limit
-(`t_limit - t_headroom`), grows linearly across the window, is released only
-once the coil has cooled `t_hysteresis` below where reduction began, and is
+(`t_limit - t_headroom`), grows linearly across the window to
+`t_reduction_max` dB at the limit (and on beyond it), is released only once
+the coil has cooled `t_hysteresis` below where reduction began, and is
 released slowly.  A windowed power budget (`p_limit_1s`, `p_limit_60s`: the
 mean power over the last second and the last minute) reduces the gain at
 once when a burst would exceed what the pair is rated for, before the coil
 has warmed up.  The larger of the two reductions is written to the card's
 speaker volume control.  If it would exceed `--max-reduction`, the daemon
 exits and leaves the card locked: the safe volume is then the kernel's, not
-the model's.
+the model's (20 dB by default: a model asking for more is wrong).
 
 There is no feedback: the model can only be as good as its constants.  The
 J700's constants - thermal resistances and time constants, coil temperature

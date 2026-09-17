@@ -36,6 +36,9 @@ pub struct Globals {
     pub channels: usize,
     /// Frames per model step.
     pub period: usize,
+    /// Reduction the thermal governor reaches at the coil's working limit
+    /// (dB); more than this means the model, not the music, is wrong.
+    pub t_reduction_max: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -139,6 +142,10 @@ impl Config {
             t_window: num(g, "Globals", "t_window")?,
             channels: num(g, "Globals", "channels")?,
             period: num(g, "Globals", "period")?,
+            t_reduction_max: match g.get("t_reduction_max") {
+                None => 12.0,
+                Some(_) => num(g, "Globals", "t_reduction_max")?,
+            },
         };
         let controls = Controls {
             volume: get(c, "Controls", "volume")?.to_string(),
@@ -193,6 +200,9 @@ impl Config {
         if globals.period == 0 || globals.channels == 0 {
             return Err(ConfigError("[Globals] period and channels must be positive".into()));
         }
+        if !(globals.t_reduction_max > 0.0) {
+            return Err(ConfigError("[Globals] t_reduction_max must be positive".into()));
+        }
         Ok(Config { globals, controls, speakers })
     }
 
@@ -221,6 +231,7 @@ mod tests {
         assert!((c.speakers[1].vs_scale - 7.33).abs() < 1e-9);
         assert!((c.speakers[0].p_limit_1s - 2.8154).abs() < 1e-9);
         assert!((c.speakers[0].p_limit_60s - 2.5).abs() < 1e-9);
+        assert!((c.globals.t_reduction_max - 12.0).abs() < 1e-9);
     }
 
     #[test]

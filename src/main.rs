@@ -80,7 +80,7 @@ fn usage() -> ! {
          Options:\n  \
          -c, --config-path <DIR>         Directory holding <vendor>/<model>.conf\n  \
          -C, --card <ID>                 ALSA card id (default: the first Apple* card)\n  \
-         -m, --max-reduction <DB>        Gain reduction beyond which the daemon exits (default 7)\n  \
+         -m, --max-reduction <DB>        Gain reduction beyond which the daemon exits (default 20)\n  \
          -v, --verbose                   More logging (repeatable)\n  \
          -q, --quiet                     Less logging\n  \
          -h, --help                      This text"
@@ -89,7 +89,7 @@ fn usage() -> ! {
 }
 
 fn parse_args() -> Args {
-    let mut args = Args { config_path: PathBuf::from("/usr/share/speakerguardd"), max_reduction: 7.0, card: None, verbosity: Level::Info };
+    let mut args = Args { config_path: PathBuf::from("/usr/share/speakerguardd"), max_reduction: 20.0, card: None, verbosity: Level::Info };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -192,6 +192,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let mut words = vec![0i32; globals.period * globals.channels];
     let mut last_ping = Instant::now();
     let mut last_log = Instant::now();
+    let mut applied = 0.0f64;
     loop {
         // playback state: the card reports the speakers' sample rate, 0 when closed
         let rate = card.ctl.read_int(&card.sample_rate)? as u32;
@@ -202,7 +203,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             // cool down with no power, keep the lock alive
             for s in speakers.iter_mut() {
                 s.step(0.0, PING_INTERVAL.as_secs_f64(), globals.t_ambient);
-                s.govern(&globals, args.max_reduction);
+                s.govern(&globals);
             }
             card.set_reduction(model::reduction_db(&speakers))?;
             card.ping()?;
@@ -235,13 +236,17 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                 s.v_rms = v;
                 let power = v * v / s.spec.z_nominal;
                 s.step(power, dt, globals.t_ambient);
-                s.govern(&globals, args.max_reduction);
+                s.govern(&globals);
             }
         }
         let reduction = model::reduction_db(&speakers);
         if reduction >= args.max_reduction {
             error!("gain reduction {reduction:.1} dB reached the limit; leaving the card locked");
             return Err("maximum reduction reached".into());
+        }
+        if (reduction - applied).abs() >= 0.5 {
+            info!("gain reduction {reduction:.1} dB");
+            applied = reduction;
         }
         card.set_reduction(reduction)?;
         if last_ping.elapsed() >= PING_INTERVAL {
