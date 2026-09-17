@@ -3,7 +3,7 @@ Description=Speaker Protection Daemon (feed-forward)
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/speakerguardd -c /usr/share/speakerguardd/ -m 7
+ExecStart=/usr/bin/speakerguardd -c /usr/share/speakerguardd
 UMask=0066
 Restart=on-failure
 RestartSec=1
