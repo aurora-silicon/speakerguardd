@@ -43,6 +43,7 @@ enum Level {
 
 static mut VERBOSITY: Level = Level::Info;
 
+/// Log lines carry the kernel's monotonic clock so they line up with dmesg.
 fn log(level: Level, msg: std::fmt::Arguments) {
     // SAFETY: VERBOSITY is written once, before any other thread exists.
     if level <= unsafe { VERBOSITY } {
@@ -52,7 +53,10 @@ fn log(level: Level, msg: std::fmt::Arguments) {
             Level::Info => "I",
             Level::Debug => "D",
         };
-        eprintln!("{tag} {msg}");
+        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        // SAFETY: a valid, writable timespec.
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+        eprintln!("[{:5}.{:06}] {tag} {msg}", ts.tv_sec, ts.tv_nsec / 1000);
     }
 }
 

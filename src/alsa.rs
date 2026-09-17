@@ -7,6 +7,7 @@
 use std::ffi::CStr;
 use std::fs::{File, OpenOptions};
 use std::io;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 
 const IOC_NRBITS: u32 = 8;
@@ -317,7 +318,14 @@ pub struct Capture {
 impl Capture {
     pub fn open(card: u32, device: u32, channels: usize, rate: u32, period: usize) -> io::Result<Capture> {
         let path = format!("/dev/snd/pcmC{card}D{device}c");
-        let file = OpenOptions::new().read(true).write(true).open(&path)?;
+        // A blocking open would wait, silently, for whoever holds the sense
+        // PCM to let go, and the volume lock would time out meanwhile: ask
+        // for EBUSY instead and wait for frames with poll().
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&path)?;
         // SAFETY: an all-ones/zeroed parameter block is the "unconstrained"
         // request the kernel refines.
         let mut hw: HwParams = unsafe { std::mem::zeroed() };
@@ -366,17 +374,38 @@ impl Capture {
             self.started = true;
         }
         let mut xfer = Xferi { result: 0, buf: buf.as_mut_ptr().cast(), frames: self.period as u64 };
-        match ioctl(&self.file, PCM_IOCTL_READI_FRAMES, &mut xfer) {
-            Ok(_) => Ok(true),
-            Err(e) if e.raw_os_error() == Some(libc::EPIPE) => {
-                ioctl(&self.file, PCM_IOCTL_PREPARE, std::ptr::null_mut::<u8>())?;
-                self.started = false;
-                Ok(false)
+        loop {
+            match ioctl(&self.file, PCM_IOCTL_READI_FRAMES, &mut xfer) {
+                Ok(_) => return Ok(true),
+                Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => self.wait_frames()?,
+                Err(e) if e.raw_os_error() == Some(libc::EPIPE) => {
+                    ioctl(&self.file, PCM_IOCTL_PREPARE, std::ptr::null_mut::<u8>())?;
+                    self.started = false;
+                    return Ok(false);
+                }
+                Err(e) => return Err(e),
             }
-            Err(e) => Err(e),
         }
     }
+
+    /// Waits for the next period, bounded so that a stalled stream surfaces
+    /// as ETIMEDOUT rather than a hang.
+    fn wait_frames(&self) -> io::Result<()> {
+        let mut pfd = libc::pollfd { fd: self.file.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        // SAFETY: one initialised pollfd, count 1.
+        let ret = unsafe { libc::poll(&mut pfd, 1, PERIOD_WAIT_MS) };
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if ret == 0 {
+            return Err(io::Error::from_raw_os_error(libc::ETIMEDOUT));
+        }
+        Ok(())
+    }
 }
+
+/// Longest wait for one sense period: several periods at the lowest rate.
+const PERIOD_WAIT_MS: libc::c_int = 500;
 
 impl Drop for Capture {
     fn drop(&mut self) {
