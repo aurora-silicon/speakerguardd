@@ -24,16 +24,21 @@ into ambient (`tr_magnet`, `tau_magnet`) - and the coil temperature drives a
 governor: gain reduction starts `t_window` below the working limit
 (`t_limit - t_headroom`), grows linearly across the window, is released only
 once the coil has cooled `t_hysteresis` below where reduction began, and is
-released slowly.  The reduction is written to the card's speaker volume
-control.  If it would exceed `--max-reduction`, the daemon exits and leaves
-the card locked: the safe volume is then the kernel's, not the model's.
+released slowly.  A windowed power budget (`p_limit_1s`, `p_limit_60s`: the
+mean power over the last second and the last minute) reduces the gain at
+once when a burst would exceed what the pair is rated for, before the coil
+has warmed up.  The larger of the two reductions is written to the card's
+speaker volume control.  If it would exceed `--max-reduction`, the daemon
+exits and leaves the card locked: the safe volume is then the kernel's, not
+the model's.
 
 There is no feedback: the model can only be as good as its constants.  The
-J700's electrical constants come from the machine's own tuning data (see the
-bring-up provenance record); its thermal constants are conservative
-placeholders until they are measured.  On the J700 the kernel additionally
-caps the wire at -20 dBFS regardless of this daemon, so the model currently
-has nothing to do; it becomes the protection once that cap is raised.
+J700's constants - thermal resistances and time constants, coil temperature
+limits, volts at full scale, coil resistance and the power budgets - are the
+machine's own loudspeaker-manager tuning, read back through the public
+AudioUnit API and recorded in the bring-up provenance record.  Without the
+daemon the kernel locks the J700's speakers 20 dB below the amplifier's
+full scale; with it, the model governs up to full scale.
 
 ### Building
 

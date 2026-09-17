@@ -64,6 +64,10 @@ pub struct Speaker {
     pub vs_scale: f64,
     /// Sense PCM channel carrying this speaker.
     pub vs_chan: usize,
+    /// Power budget: the mean power over the last second and the last
+    /// minute may not exceed these (W); 0 disables a budget.
+    pub p_limit_1s: f64,
+    pub p_limit_60s: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -109,6 +113,14 @@ fn get<'a>(section: &'a BTreeMap<String, String>, name: &str, key: &str) -> Resu
         .ok_or_else(|| ConfigError(format!("[{name}] is missing {key}")))
 }
 
+/// A numeric key that may be absent (0 when it is).
+fn optional(values: &BTreeMap<String, String>, section: &str, key: &str) -> Result<f64, ConfigError> {
+    match values.get(key) {
+        None => Ok(0.0),
+        Some(_) => num(values, section, key),
+    }
+}
+
 fn num<T: std::str::FromStr>(section: &BTreeMap<String, String>, name: &str, key: &str) -> Result<T, ConfigError> {
     get(section, name, key)?
         .parse()
@@ -149,6 +161,8 @@ impl Config {
                 z_nominal: s("z_nominal")?,
                 vs_scale: s("vs_scale")?,
                 vs_chan: num(values, section, "vs_chan")?,
+                p_limit_1s: optional(values, section, "p_limit_1s")?,
+                p_limit_60s: optional(values, section, "p_limit_60s")?,
             };
             if speaker.vs_chan >= globals.channels {
                 return Err(ConfigError(format!("[{section}] vs_chan {} beyond {} channels", speaker.vs_chan, globals.channels)));
@@ -167,6 +181,9 @@ impl Config {
             }
             if speaker.t_limit - speaker.t_headroom <= globals.t_ambient + globals.t_window {
                 return Err(ConfigError(format!("[{section}] no room between ambient and the limit")));
+            }
+            if speaker.p_limit_1s < 0.0 || speaker.p_limit_60s < 0.0 {
+                return Err(ConfigError(format!("[{section}] power limits cannot be negative")));
             }
             speakers.push(speaker);
         }
@@ -200,16 +217,27 @@ mod tests {
         assert_eq!(c.speakers.len(), 2);
         assert_eq!(c.speakers[0].name, "Left");
         assert_eq!(c.speakers[1].vs_chan, 1);
-        assert!((c.speakers[0].z_nominal - 4.43).abs() < 1e-9);
+        assert!((c.speakers[0].z_nominal - 4.2).abs() < 1e-9);
+        assert!((c.speakers[1].vs_scale - 7.33).abs() < 1e-9);
+        assert!((c.speakers[0].p_limit_1s - 2.8154).abs() < 1e-9);
+        assert!((c.speakers[0].p_limit_60s - 2.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn power_budget_is_optional() {
+        let none = J700.replace("p_limit_1s = 2.8154\n", "").replace("p_limit_60s = 2.5\n", "");
+        let c = Config::parse(&none).unwrap();
+        assert_eq!(c.speakers[0].p_limit_1s, 0.0);
+        assert!(Config::parse(&J700.replace("p_limit_60s = 2.5", "p_limit_60s = -1")).is_err());
     }
 
     #[test]
     fn rejects_bad_files() {
         assert!(Config::parse("").is_err());
         assert!(Config::parse("[Globals]\nsense_pcm = x\n").is_err());
-        let broken = J700.replace("z_nominal = 4.43", "z_nominal = 0");
+        let broken = J700.replace("z_nominal = 4.2", "z_nominal = 0");
         assert!(Config::parse(&broken).is_err());
-        let hot = J700.replace("t_limit = 110.0", "t_limit = 40.0");
+        let hot = J700.replace("t_limit = 135.0", "t_limit = 40.0");
         assert!(Config::parse(&hot).is_err());
     }
 }

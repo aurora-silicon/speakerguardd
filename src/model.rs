@@ -4,6 +4,9 @@
 //! sense), fed into a two-stage lumped thermal model (coil into magnet,
 //! magnet into ambient, each a first-order lag), and the coil temperature
 //! drives a gain governor with a window below the limit and hysteresis.
+//! A windowed power budget (mean power over the last second and the last
+//! minute) reduces the gain at once when a burst would exceed what the
+//! amplifier/speaker pair is rated for, before the coil has warmed up.
 
 use crate::config::{Globals, Speaker};
 
@@ -20,11 +23,24 @@ pub struct SpeakerState {
     /// Gain reduction applied by the governor (dB, >= 0).
     pub reduction_db: f64,
     reducing: bool,
+    /// Power history for the budgets: (seconds, watts) per step, newest last.
+    history: std::collections::VecDeque<(f64, f64)>,
+    history_s: f64,
 }
 
 impl SpeakerState {
     pub fn new(spec: Speaker, t_ambient: f64) -> SpeakerState {
-        SpeakerState { spec, t_coil: t_ambient, t_magnet: t_ambient, power: 0.0, v_rms: 0.0, reduction_db: 0.0, reducing: false }
+        SpeakerState {
+            spec,
+            t_coil: t_ambient,
+            t_magnet: t_ambient,
+            power: 0.0,
+            v_rms: 0.0,
+            reduction_db: 0.0,
+            reducing: false,
+            history: std::collections::VecDeque::new(),
+            history_s: 0.0,
+        }
     }
 
     /// The RMS voltage a period of sense words puts across the coil.
@@ -49,6 +65,16 @@ impl SpeakerState {
     pub fn step(&mut self, power: f64, dt: f64, t_ambient: f64) {
         let s = &self.spec;
         self.power = power;
+        // keep one minute of history for the budgets
+        self.history.push_back((dt, power));
+        self.history_s += dt;
+        while self.history_s > 60.0 {
+            if let Some((old_dt, _)) = self.history.pop_front() {
+                self.history_s -= old_dt;
+            } else {
+                break;
+            }
+        }
         // magnet: first-order lag toward ambient + P * tr_magnet
         let k_magnet = 1.0 - (-dt / s.tau_magnet).exp();
         let magnet_target = t_ambient + power * s.tr_magnet;
@@ -59,10 +85,42 @@ impl SpeakerState {
         self.t_coil += (coil_target - self.t_coil) * k_coil;
     }
 
-    /// Governor: the reduction (dB) that keeps the coil inside the window.
-    /// Reduction grows linearly across the window from 0 dB at
-    /// `limit - headroom - window` to `max_db` at `limit - headroom`, and is
-    /// released only once the coil is `hysteresis` below where it started.
+    /// Mean power over the last `seconds` (W); time before the first step
+    /// counts as silence.
+    pub fn mean_power(&self, seconds: f64) -> f64 {
+        let mut t = 0.0;
+        let mut e = 0.0;
+        for (dt, p) in self.history.iter().rev() {
+            let take = dt.min(seconds - t);
+            if take <= 0.0 {
+                break;
+            }
+            e += p * take;
+            t += take;
+        }
+        e / seconds
+    }
+
+    /// The reduction (dB) the power budgets ask for: enough to bring the
+    /// windowed mean power back to its limit.
+    fn budget_reduction(&self) -> f64 {
+        let mut db: f64 = 0.0;
+        for (seconds, limit) in [(1.0, self.spec.p_limit_1s), (60.0, self.spec.p_limit_60s)] {
+            if limit > 0.0 {
+                let mean = self.mean_power(seconds);
+                if mean > limit {
+                    db = db.max(10.0 * (mean / limit).log10());
+                }
+            }
+        }
+        db
+    }
+
+    /// Governor: the reduction (dB) that keeps the coil inside the window
+    /// and the mean power inside the budgets.  Thermal reduction grows
+    /// linearly across the window from 0 dB at `limit - headroom - window`
+    /// to `max_db` at `limit - headroom`, and is released only once the coil
+    /// is `hysteresis` below where it started.
     pub fn govern(&mut self, globals: &Globals, max_db: f64) -> f64 {
         let ceiling = self.spec.t_limit - self.spec.t_headroom;
         let start = ceiling - globals.t_window;
@@ -71,11 +129,12 @@ impl SpeakerState {
         } else if self.t_coil < start - globals.t_hysteresis {
             self.reducing = false;
         }
-        let wanted = if self.reducing {
+        let thermal = if self.reducing {
             ((self.t_coil - start) / globals.t_window * max_db).clamp(0.0, max_db)
         } else {
             0.0
         };
+        let wanted = thermal.max(self.budget_reduction()).min(max_db);
         // attack at once, release at most 0.5 dB per step so the level does
         // not pump
         self.reduction_db = if wanted >= self.reduction_db { wanted } else { (self.reduction_db - 0.5).max(wanted) };
@@ -106,6 +165,8 @@ mod tests {
             z_nominal: 4.43,
             vs_scale: 3.3,
             vs_chan: 0,
+            p_limit_1s: 0.0,
+            p_limit_60s: 0.0,
         }
     }
 
@@ -186,5 +247,42 @@ mod tests {
             last = now;
         }
         assert_eq!(last, 0.0);
+    }
+
+    #[test]
+    fn power_budget_reduces_before_the_coil_warms() {
+        // the J700's own numbers
+        let mut spec = spec();
+        spec.tr_coil = 38.0;
+        spec.tau_coil = 3.3;
+        spec.tr_magnet = 26.0;
+        spec.tau_magnet = 100.0;
+        spec.t_limit = 135.0;
+        spec.t_headroom = 15.0;
+        spec.p_limit_1s = 2.8154;
+        spec.p_limit_60s = 2.5;
+        let mut s = SpeakerState::new(spec, 35.0);
+        let g = globals();
+        // a 6.3 W burst (a full-scale sine into 4.2 ohm at 7.3 V): after 0.5 s
+        // the 1 s mean is 3.15 W, over the budget, while the coil (69 C) is
+        // still well below the thermal window (100 C)
+        for _ in 0..5 {
+            s.step(6.3, 0.1, 35.0);
+        }
+        assert!(s.t_coil < 75.0, "{}", s.t_coil);
+        let r = s.govern(&g, 20.0);
+        assert!((r - 10.0 * (3.15f64 / 2.8154).log10()).abs() < 0.05, "{r}");
+        // silence: the mean falls back under the budget and the reduction releases
+        for _ in 0..20 {
+            s.step(0.0, 0.1, 35.0);
+            s.govern(&g, 20.0);
+        }
+        assert_eq!(s.govern(&g, 20.0), 0.0);
+        // the minute budget: 2.6 W for a minute ends up over 2.5 W
+        for _ in 0..600 {
+            s.step(2.6, 0.1, 35.0);
+        }
+        assert!((s.mean_power(60.0) - 2.6).abs() < 0.01);
+        assert!(s.budget_reduction() > 0.1);
     }
 }
