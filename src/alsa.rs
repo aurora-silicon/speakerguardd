@@ -367,7 +367,12 @@ impl Capture {
     /// One period of frames into `buf` (period * channels words).  An overrun
     /// is recovered transparently (the stream is re-prepared) and reported as
     /// Ok(false) so the caller can discard the model step.
-    pub fn read_period(&mut self, buf: &mut [i32]) -> io::Result<bool> {
+    /// Reads one sense period.  `Ok(Some(true))` is a valid period,
+    /// `Ok(Some(false))` an overrun that was recovered (the period is lost),
+    /// `Ok(None)` nothing arrived within one ping interval: the caller must
+    /// ping the lock and call again, because the card locks the volume 250 ms
+    /// after the last ping and nothing may block longer than that.
+    pub fn read_period(&mut self, buf: &mut [i32]) -> io::Result<Option<bool>> {
         assert!(buf.len() >= self.period * self.channels);
         if !self.started {
             ioctl(&self.file, PCM_IOCTL_START, std::ptr::null_mut::<u8>())?;
@@ -376,36 +381,43 @@ impl Capture {
         let mut xfer = Xferi { result: 0, buf: buf.as_mut_ptr().cast(), frames: self.period as u64 };
         loop {
             match ioctl(&self.file, PCM_IOCTL_READI_FRAMES, &mut xfer) {
-                Ok(_) => return Ok(true),
-                Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => self.wait_frames()?,
+                Ok(_) => return Ok(Some(true)),
+                Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => {
+                    if !self.wait_frames()? {
+                        return Ok(None);
+                    }
+                }
                 Err(e) if e.raw_os_error() == Some(libc::EPIPE) => {
                     ioctl(&self.file, PCM_IOCTL_PREPARE, std::ptr::null_mut::<u8>())?;
                     self.started = false;
-                    return Ok(false);
+                    return Ok(Some(false));
                 }
                 Err(e) => return Err(e),
             }
         }
     }
 
-    /// Waits for the next period, bounded so that a stalled stream surfaces
-    /// as ETIMEDOUT rather than a hang.
-    fn wait_frames(&self) -> io::Result<()> {
+    /// Waits for the next period for at most one ping interval.  `Ok(false)`
+    /// means nothing arrived in time; the caller decides when a stream that
+    /// keeps saying so is stalled.
+    fn wait_frames(&self) -> io::Result<bool> {
         let mut pfd = libc::pollfd { fd: self.file.as_raw_fd(), events: libc::POLLIN, revents: 0 };
         // SAFETY: one initialised pollfd, count 1.
         let ret = unsafe { libc::poll(&mut pfd, 1, PERIOD_WAIT_MS) };
         if ret < 0 {
-            return Err(io::Error::last_os_error());
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EINTR) {
+                return Ok(false);
+            }
+            return Err(e);
         }
-        if ret == 0 {
-            return Err(io::Error::from_raw_os_error(libc::ETIMEDOUT));
-        }
-        Ok(())
+        Ok(ret != 0)
     }
 }
 
-/// Longest wait for one sense period: several periods at the lowest rate.
-const PERIOD_WAIT_MS: libc::c_int = 500;
+/// Longest single wait for sense data: well inside the card's 250 ms lock
+/// timeout, so the lock ping between waits is never late.
+const PERIOD_WAIT_MS: libc::c_int = 50;
 
 impl Drop for Capture {
     fn drop(&mut self) {

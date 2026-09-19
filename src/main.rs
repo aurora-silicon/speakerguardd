@@ -34,6 +34,21 @@ const LOG_INTERVAL: Duration = Duration::from_secs(1);
 const PING_INTERVAL: Duration = Duration::from_millis(100);
 /// Volume control steps per dB (t8140-aop-audio: 0.5 dB steps).
 const STEPS_PER_DB: f64 = 2.0;
+/// Consecutive control failures tolerated before the daemon gives up.  While it
+/// stays alive the volume lock stays held; exiting hands the card to its own
+/// safe level, which the listener hears as a one-second dip.
+const MAX_CONTROL_FAILURES: u32 = 50;
+
+/// Errors a PCM or control returns while the playback side is being
+/// reconfigured underneath us (the sense front-end follows the speaker
+/// back-end, which PipeWire opens, suspends and reopens at will).
+fn transient(e: &std::io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::EINVAL | libc::EBADFD | libc::EPIPE | libc::ESTRPIPE | libc::ENODEV
+            | libc::EIO | libc::ETIMEDOUT | libc::EAGAIN | libc::EINTR | libc::ENXIO)
+    )
+}
 
 #[derive(Clone, Copy, PartialEq, PartialOrd)]
 enum Level {
@@ -168,6 +183,26 @@ impl Card {
     }
 }
 
+/// Sense data missing for this long means the stream is gone, not late.
+const STALL_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Pings the volume lock.  A ping that answers ETIMEDOUT is the card's
+/// one-shot notice that the lock had lapsed (it does not re-arm the timer),
+/// so ping once more immediately to take the volume back; otherwise every
+/// volume write until the next ping fails with EINVAL against the safe limit.
+fn ping_lock(card: &Card, last_ping: &mut Instant) -> Result<(), Box<dyn std::error::Error>> {
+    match card.ping() {
+        Ok(()) => {}
+        Err(e) if e.raw_os_error() == Some(libc::ETIMEDOUT) => {
+            warn!("the card locked the volume while we were away; taking it back");
+            card.ping().map_err(|e| format!("lock ping: {e}"))?;
+        }
+        Err(e) => return Err(format!("lock ping: {e}").into()),
+    }
+    *last_ping = Instant::now();
+    Ok(())
+}
+
 fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let (card, card_name) = {
         // the model file is named after the card: AppleJ700 -> apple/j700.conf
@@ -193,9 +228,24 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let mut last_ping = Instant::now();
     let mut last_log = Instant::now();
     let mut applied = 0.0f64;
+    let mut control_failures = 0u32;
+    let mut stalled_since: Option<Instant> = None;
     loop {
         // playback state: the card reports the speakers' sample rate, 0 when closed
-        let rate = card.ctl.read_int(&card.sample_rate)? as u32;
+        let rate = match card.ctl.read_int(&card.sample_rate) {
+            Ok(v) => {
+                control_failures = 0;
+                v as u32
+            }
+            Err(e) if transient(&e) && control_failures < MAX_CONTROL_FAILURES => {
+                control_failures += 1;
+                warn!("sample-rate control: {e}; retrying ({control_failures})");
+                card.ping()?;
+                thread::sleep(PING_INTERVAL);
+                continue;
+            }
+            Err(e) => return Err(format!("sample-rate control: {e}").into()),
+        };
         if rate == 0 {
             if capture.take().is_some() {
                 info!("speakers closed");
@@ -205,9 +255,14 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                 s.step(0.0, PING_INTERVAL.as_secs_f64(), globals.t_ambient);
                 s.govern(&globals);
             }
-            card.set_reduction(model::reduction_db(&speakers))?;
-            card.ping()?;
-            last_ping = Instant::now();
+            if let Err(e) = card.set_reduction(model::reduction_db(&speakers)) {
+                if !transient(&e) || control_failures >= MAX_CONTROL_FAILURES {
+                    return Err(format!("volume control: {e}").into());
+                }
+                control_failures += 1;
+                warn!("volume control: {e}; retrying ({control_failures})");
+            }
+            ping_lock(&card, &mut last_ping)?;
             thread::sleep(PING_INTERVAL);
             continue;
         }
@@ -227,7 +282,39 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         }
         let cap = capture.as_mut().unwrap();
         let dt = globals.period as f64 / rate as f64;
-        let valid = cap.read_period(&mut words)?;
+        // The sense stream dies with the speaker back-end whenever playback is
+        // torn down and rebuilt (EINVAL/EBADFD/EPIPE...).  That is not our
+        // failure: drop the capture, keep the lock, and reopen once the card
+        // reports a rate again.  Exiting here is what the listener heard as a
+        // one-second dip to the safe level at high volume.
+        let valid = match cap.read_period(&mut words) {
+            Ok(Some(v)) => {
+                stalled_since = None;
+                v
+            }
+            Ok(None) => {
+                // No sense data within one ping interval.  Keep the lock alive
+                // first; only a stream silent for a whole STALL_TIMEOUT is
+                // dropped and reopened.
+                let since = *stalled_since.get_or_insert_with(Instant::now);
+                ping_lock(&card, &mut last_ping)?;
+                if since.elapsed() >= STALL_TIMEOUT {
+                    warn!("sense stream stalled for {} ms; reopening", STALL_TIMEOUT.as_millis());
+                    capture = None;
+                    stalled_since = None;
+                }
+                continue;
+            }
+            Err(e) if transient(&e) => {
+                warn!("sense capture: {e}; reopening");
+                capture = None;
+                stalled_since = None;
+                ping_lock(&card, &mut last_ping)?;
+                thread::sleep(PING_INTERVAL);
+                continue;
+            }
+            Err(e) => return Err(format!("sense capture: {e}").into()),
+        };
         if !valid {
             warn!("sense overrun, step skipped");
         } else {
@@ -248,16 +335,16 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             info!("gain reduction {reduction:.1} dB");
             applied = reduction;
         }
-        card.set_reduction(reduction)?;
-        if last_ping.elapsed() >= PING_INTERVAL {
-            match card.ping() {
-                Ok(()) => {}
-                Err(e) if e.raw_os_error() == Some(libc::ETIMEDOUT) => {
-                    warn!("the card locked the volume while we were away; continuing");
-                }
-                Err(e) => return Err(e.into()),
+        match card.set_reduction(reduction) {
+            Ok(()) => control_failures = 0,
+            Err(e) if transient(&e) && control_failures < MAX_CONTROL_FAILURES => {
+                control_failures += 1;
+                warn!("volume control: {e}; retrying ({control_failures})");
             }
-            last_ping = Instant::now();
+            Err(e) => return Err(format!("volume control: {e}").into()),
+        }
+        if last_ping.elapsed() >= PING_INTERVAL {
+            ping_lock(&card, &mut last_ping)?;
         }
         if last_log.elapsed() >= LOG_INTERVAL {
             for s in &speakers {
