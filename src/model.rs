@@ -135,10 +135,23 @@ impl SpeakerState {
         } else {
             0.0
         };
-        let wanted = thermal.max(self.budget_reduction());
+        // Sense measures the output after attenuation. A budget violation
+        // therefore asks for additional attenuation, not a replacement for
+        // the attenuation already applied to the measured samples.
+        let extra = self.budget_reduction();
+        let budget = if extra > 0.0 {
+            self.reduction_db + extra
+        } else {
+            0.0
+        };
+        let wanted = thermal.max(budget);
         // attack at once, release at most 0.5 dB per step so the level does
         // not pump
-        self.reduction_db = if wanted >= self.reduction_db { wanted } else { (self.reduction_db - 0.5).max(wanted) };
+        self.reduction_db = if wanted >= self.reduction_db {
+            wanted
+        } else {
+            (self.reduction_db - 0.5).max(wanted)
+        };
         self.reduction_db
     }
 }
@@ -172,7 +185,15 @@ mod tests {
     }
 
     fn globals() -> Globals {
-        Globals { sense_pcm: 2, t_ambient: 35.0, t_hysteresis: 5.0, t_window: 20.0, channels: 2, period: 4096, t_reduction_max: 20.0 }
+        Globals {
+            sense_pcm: 2,
+            t_ambient: 35.0,
+            t_hysteresis: 5.0,
+            t_window: 20.0,
+            channels: 2,
+            period: 4096,
+            t_reduction_max: 20.0,
+        }
     }
 
     #[test]
@@ -226,7 +247,7 @@ mod tests {
     fn governor_window_and_hysteresis() {
         let mut s = SpeakerState::new(spec(), 35.0);
         let g = globals(); // t_reduction_max 20 dB at the working limit
-        // heat the coil into the window: limit 110 - headroom 10 = 100, window starts at 80
+                           // heat the coil into the window: limit 110 - headroom 10 = 100, window starts at 80
         s.t_coil = 90.0;
         s.t_magnet = 60.0;
         let r = s.govern(&g);
@@ -286,5 +307,20 @@ mod tests {
         }
         assert!((s.mean_power(60.0) - 2.6).abs() < 0.01);
         assert!(s.budget_reduction() > 0.1);
+    }
+
+    #[test]
+    fn budget_reduction_keeps_attenuation_already_on_the_wire() {
+        let mut spec = spec();
+        spec.p_limit_1s = 1.0;
+        let mut state = SpeakerState::new(spec, 35.0);
+        // Sense already includes 6 dB attenuation, yet delivers twice the
+        // budget. Another 3 dB is required; replacing 6 dB with 3 dB is unsafe.
+        state.reduction_db = 6.0;
+        for _ in 0..10 {
+            state.step(2.0, 0.1, 35.0);
+        }
+        let wanted = state.govern(&globals());
+        assert!((wanted - (6.0 + 10.0 * 2f64.log10())).abs() < 1e-8);
     }
 }

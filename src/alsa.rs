@@ -9,6 +9,7 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
+use std::time::{Duration, Instant};
 
 const IOC_NRBITS: u32 = 8;
 const IOC_TYPEBITS: u32 = 8;
@@ -21,7 +22,10 @@ const IOC_WRITE: u32 = 1;
 const IOC_READ: u32 = 2;
 
 const fn ioc(dir: u32, ty: u8, nr: u8, size: usize) -> libc::c_ulong {
-    ((dir << IOC_DIRSHIFT) | ((size as u32) << IOC_SIZESHIFT) | ((ty as u32) << IOC_TYPESHIFT) | ((nr as u32) << IOC_NRSHIFT)) as libc::c_ulong
+    ((dir << IOC_DIRSHIFT)
+        | ((size as u32) << IOC_SIZESHIFT)
+        | ((ty as u32) << IOC_TYPESHIFT)
+        | ((nr as u32) << IOC_NRSHIFT)) as libc::c_ulong
 }
 const fn io(ty: u8, nr: u8) -> libc::c_ulong {
     ioc(0, ty, nr, 0)
@@ -62,7 +66,9 @@ pub struct ElemId {
 
 impl ElemId {
     pub fn name(&self) -> String {
-        CStr::from_bytes_until_nul(&self.name).map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+        CStr::from_bytes_until_nul(&self.name)
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default()
     }
 }
 
@@ -136,12 +142,17 @@ impl Ctl {
             // SAFETY: all-zero is a valid CardInfo; the kernel fills it.
             let mut info: CardInfo = unsafe { std::mem::zeroed() };
             ioctl(&file, CTL_IOCTL_CARD_INFO, &mut info)?;
-            let card_id = CStr::from_bytes_until_nul(&info.id).map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            let card_id = CStr::from_bytes_until_nul(&info.id)
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
             if card_id == id {
                 return Ok(Ctl { file, card });
             }
         }
-        Err(io::Error::new(io::ErrorKind::NotFound, format!("no sound card with id {id}")))
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no sound card with id {id}"),
+        ))
     }
 
     /// Every element id of the card.
@@ -229,6 +240,12 @@ impl Ctl {
         ioctl(&self.file, CTL_IOCTL_ELEM_LOCK, &mut id)?;
         Ok(())
     }
+
+    pub fn unlock(&self, id: &ElemId) -> io::Result<()> {
+        let mut id = *id;
+        ioctl(&self.file, iow::<ElemId>(b'U', 0x15), &mut id)?;
+        Ok(())
+    }
 }
 
 // ---- PCM capture ----
@@ -306,6 +323,46 @@ const PCM_IOCTL_PREPARE: libc::c_ulong = io(b'A', 0x40);
 const PCM_IOCTL_START: libc::c_ulong = io(b'A', 0x42);
 const PCM_IOCTL_DROP: libc::c_ulong = io(b'A', 0x43);
 const PCM_IOCTL_READI_FRAMES: libc::c_ulong = ior::<Xferi>(b'A', 0x51);
+const PCM_IOCTL_DELAY: libc::c_ulong = ior::<i64>(b'A', 0x21);
+
+/// One absolute observation deadline, below the kernel's 250 ms lease.
+pub const SENSE_DEADLINE: Duration = Duration::from_millis(200);
+
+fn collect_period(
+    buf: &mut [i32],
+    channels: usize,
+    period: usize,
+    mut elapsed: impl FnMut() -> Duration,
+    mut read: impl FnMut(&mut [i32], usize) -> io::Result<i64>,
+    mut wait: impl FnMut(Duration) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut done = 0;
+    while done < period {
+        let left = SENSE_DEADLINE
+            .checked_sub(elapsed())
+            .filter(|d| !d.is_zero())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "sense period deadline"))?;
+        match read(&mut buf[done * channels..], period - done) {
+            Ok(n) if n > 0 && n as usize <= period - done => done += n as usize,
+            Ok(n) if n < 0 => return Err(io::Error::from_raw_os_error((-n) as i32)),
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid sense transfer length",
+                ))
+            }
+            Err(e) if matches!(e.raw_os_error(), Some(libc::EAGAIN | libc::EINTR)) => wait(left)?,
+            Err(e) => return Err(e),
+        }
+    }
+    if elapsed() >= SENSE_DEADLINE {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "sense data arrived too late",
+        ));
+    }
+    Ok(())
+}
 
 /// An interleaved S32_LE capture stream with fixed period geometry.
 pub struct Capture {
@@ -316,7 +373,13 @@ pub struct Capture {
 }
 
 impl Capture {
-    pub fn open(card: u32, device: u32, channels: usize, rate: u32, period: usize) -> io::Result<Capture> {
+    pub fn open(
+        card: u32,
+        device: u32,
+        channels: usize,
+        rate: u32,
+        period: usize,
+    ) -> io::Result<Capture> {
         let path = format!("/dev/snd/pcmC{card}D{device}c");
         // A blocking open would wait, silently, for whoever holds the sense
         // PCM to let go, and the volume lock would time out meanwhile: ask
@@ -333,13 +396,21 @@ impl Capture {
             m.bits = [0; 8];
         }
         for i in hw.intervals.iter_mut() {
-            *i = Interval { min: 0, max: u32::MAX, flags: 0 };
+            *i = Interval {
+                min: 0,
+                max: u32::MAX,
+                flags: 0,
+            };
         }
         hw.masks[PARAM_ACCESS].bits[0] = 1 << ACCESS_RW_INTERLEAVED;
         hw.masks[PARAM_FORMAT].bits[0] = 1 << FORMAT_S32_LE;
         hw.masks[PARAM_SUBFORMAT].bits[0] = 1 << SUBFORMAT_STD;
         let fixed = |i: &mut Interval, v: u32| {
-            *i = Interval { min: v, max: v, flags: INTERVAL_INTEGER };
+            *i = Interval {
+                min: v,
+                max: v,
+                flags: INTERVAL_INTEGER,
+            };
         };
         fixed(&mut hw.intervals[PARAM_CHANNELS], channels as u32);
         fixed(&mut hw.intervals[PARAM_RATE], rate);
@@ -361,63 +432,77 @@ impl Capture {
         sw.boundary = (period * 4) as u64 * (1 << 20);
         ioctl(&file, PCM_IOCTL_SW_PARAMS, &mut sw)?;
         ioctl(&file, PCM_IOCTL_PREPARE, std::ptr::null_mut::<u8>())?;
-        Ok(Capture { file, channels, period, started: false })
+        Ok(Capture {
+            file,
+            channels,
+            period,
+            started: false,
+        })
     }
 
-    /// One period of frames into `buf` (period * channels words).  An overrun
-    /// is recovered transparently (the stream is re-prepared) and reported as
-    /// Ok(false) so the caller can discard the model step.
-    /// Reads one sense period.  `Ok(Some(true))` is a valid period,
-    /// `Ok(Some(false))` an overrun that was recovered (the period is lost),
-    /// `Ok(None)` nothing arrived within one ping interval: the caller must
-    /// ping the lock and call again, because the card locks the volume 250 ms
-    /// after the last ping and nothing may block longer than that.
-    pub fn read_period(&mut self, buf: &mut [i32]) -> io::Result<Option<bool>> {
+    /// Return only complete, timely periods. Missing/overrun data cannot
+    /// renew the speaker lease because its power contribution is unknown.
+    pub fn read_period(&mut self, buf: &mut [i32]) -> io::Result<()> {
         assert!(buf.len() >= self.period * self.channels);
+        let started = Instant::now();
         if !self.started {
             ioctl(&self.file, PCM_IOCTL_START, std::ptr::null_mut::<u8>())?;
             self.started = true;
         }
-        let mut xfer = Xferi { result: 0, buf: buf.as_mut_ptr().cast(), frames: self.period as u64 };
-        loop {
-            match ioctl(&self.file, PCM_IOCTL_READI_FRAMES, &mut xfer) {
-                Ok(_) => return Ok(Some(true)),
-                Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => {
-                    if !self.wait_frames()? {
-                        return Ok(None);
-                    }
-                }
-                Err(e) if e.raw_os_error() == Some(libc::EPIPE) => {
-                    ioctl(&self.file, PCM_IOCTL_PREPARE, std::ptr::null_mut::<u8>())?;
-                    self.started = false;
-                    return Ok(Some(false));
-                }
-                Err(e) => return Err(e),
-            }
+        let mut delay = 0i64;
+        ioctl(&self.file, PCM_IOCTL_DELAY, &mut delay)?;
+        if delay < 0 || delay as usize > self.period * 2 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "stale sense backlog",
+            ));
         }
+        collect_period(
+            buf,
+            self.channels,
+            self.period,
+            || started.elapsed(),
+            |words, frames| {
+                let mut xfer = Xferi {
+                    result: 0,
+                    buf: words.as_mut_ptr().cast(),
+                    frames: frames as u64,
+                };
+                ioctl(&self.file, PCM_IOCTL_READI_FRAMES, &mut xfer)?;
+                Ok(xfer.result)
+            },
+            |remaining| self.wait_frames(remaining),
+        )
     }
 
-    /// Waits for the next period for at most one ping interval.  `Ok(false)`
-    /// means nothing arrived in time; the caller decides when a stream that
-    /// keeps saying so is stalled.
-    fn wait_frames(&self) -> io::Result<bool> {
-        let mut pfd = libc::pollfd { fd: self.file.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+    /// Wait only for the remaining absolute deadline; EINTR never resets it.
+    fn wait_frames(&self, remaining: Duration) -> io::Result<()> {
+        let mut pfd = libc::pollfd {
+            fd: self.file.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
         // SAFETY: one initialised pollfd, count 1.
-        let ret = unsafe { libc::poll(&mut pfd, 1, PERIOD_WAIT_MS) };
+        let ret = unsafe { libc::poll(&mut pfd, 1, remaining.as_millis().max(1) as i32) };
         if ret < 0 {
             let e = io::Error::last_os_error();
             if e.raw_os_error() == Some(libc::EINTR) {
-                return Ok(false);
+                return Ok(());
             }
             return Err(e);
         }
-        Ok(ret != 0)
+        if ret == 0 {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "no sense samples"));
+        }
+        if pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "sense PCM unavailable",
+            ));
+        }
+        Ok(())
     }
 }
-
-/// Longest single wait for sense data: well inside the card's 250 ms lock
-/// timeout, so the lock ping between waits is never late.
-const PERIOD_WAIT_MS: libc::c_int = 50;
 
 impl Drop for Capture {
     fn drop(&mut self) {
@@ -428,6 +513,68 @@ impl Drop for Capture {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_transfers_fill_every_sample_before_success() {
+        let mut words = [99; 8];
+        let mut value = 1;
+        collect_period(
+            &mut words,
+            2,
+            4,
+            || Duration::ZERO,
+            |dst, frames| {
+                let count = frames.min(1);
+                dst[..count * 2].fill(value);
+                value += 1;
+                Ok(count as i64)
+            },
+            |_| panic!("no wait required"),
+        )
+        .unwrap();
+        assert_eq!(words, [1, 1, 2, 2, 3, 3, 4, 4]);
+    }
+
+    #[test]
+    fn incomplete_faulted_or_stale_period_never_succeeds() {
+        for result in [0, 5, -(libc::EPIPE as i64)] {
+            assert!(collect_period(
+                &mut [99; 8],
+                2,
+                4,
+                || Duration::ZERO,
+                |_, _| Ok(result),
+                |_| Ok(())
+            )
+            .is_err());
+        }
+        let elapsed = std::cell::Cell::new(Duration::ZERO);
+        let ret = collect_period(
+            &mut [99; 8],
+            2,
+            4,
+            || elapsed.get(),
+            |_, _| Err(io::Error::from_raw_os_error(libc::EAGAIN)),
+            |remaining| {
+                elapsed.set(elapsed.get() + remaining);
+                Ok(())
+            },
+        );
+        assert_eq!(ret.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        let elapsed = std::cell::Cell::new(Duration::ZERO);
+        let ret = collect_period(
+            &mut [99; 8],
+            2,
+            4,
+            || elapsed.get(),
+            |_, frames| {
+                elapsed.set(SENSE_DEADLINE);
+                Ok(frames as i64)
+            },
+            |_| Ok(()),
+        );
+        assert_eq!(ret.unwrap_err().kind(), io::ErrorKind::TimedOut);
+    }
 
     #[test]
     fn layouts_match_asound_h() {

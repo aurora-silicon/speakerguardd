@@ -37,7 +37,7 @@ pub struct Globals {
     /// Frames per model step.
     pub period: usize,
     /// Reduction the thermal governor reaches at the coil's working limit
-    /// (dB); more than this means the model, not the music, is wrong.
+    /// (dB); the separate lease threshold determines when fallback is required.
     pub t_reduction_max: f64,
 }
 
@@ -109,7 +109,11 @@ fn parse_ini(text: &str) -> Result<Sections, ConfigError> {
     Ok(sections)
 }
 
-fn get<'a>(section: &'a BTreeMap<String, String>, name: &str, key: &str) -> Result<&'a str, ConfigError> {
+fn get<'a>(
+    section: &'a BTreeMap<String, String>,
+    name: &str,
+    key: &str,
+) -> Result<&'a str, ConfigError> {
     section
         .get(key)
         .map(String::as_str)
@@ -117,14 +121,22 @@ fn get<'a>(section: &'a BTreeMap<String, String>, name: &str, key: &str) -> Resu
 }
 
 /// A numeric key that may be absent (0 when it is).
-fn optional(values: &BTreeMap<String, String>, section: &str, key: &str) -> Result<f64, ConfigError> {
+fn optional(
+    values: &BTreeMap<String, String>,
+    section: &str,
+    key: &str,
+) -> Result<f64, ConfigError> {
     match values.get(key) {
         None => Ok(0.0),
         Some(_) => num(values, section, key),
     }
 }
 
-fn num<T: std::str::FromStr>(section: &BTreeMap<String, String>, name: &str, key: &str) -> Result<T, ConfigError> {
+fn num<T: std::str::FromStr>(
+    section: &BTreeMap<String, String>,
+    name: &str,
+    key: &str,
+) -> Result<T, ConfigError> {
     get(section, name, key)?
         .parse()
         .map_err(|_| ConfigError(format!("[{name}] {key}: not a number")))
@@ -133,8 +145,12 @@ fn num<T: std::str::FromStr>(section: &BTreeMap<String, String>, name: &str, key
 impl Config {
     pub fn parse(text: &str) -> Result<Config, ConfigError> {
         let sections = parse_ini(text)?;
-        let g = sections.get("Globals").ok_or_else(|| ConfigError("missing [Globals]".into()))?;
-        let c = sections.get("Controls").ok_or_else(|| ConfigError("missing [Controls]".into()))?;
+        let g = sections
+            .get("Globals")
+            .ok_or_else(|| ConfigError("missing [Globals]".into()))?;
+        let c = sections
+            .get("Controls")
+            .ok_or_else(|| ConfigError("missing [Controls]".into()))?;
         let globals = Globals {
             sense_pcm: num(g, "Globals", "sense_pcm")?,
             t_ambient: num(g, "Globals", "t_ambient")?,
@@ -147,6 +163,31 @@ impl Config {
                 Some(_) => num(g, "Globals", "t_reduction_max")?,
             },
         };
+        for (name, value) in [
+            ("t_ambient", globals.t_ambient),
+            ("t_hysteresis", globals.t_hysteresis),
+            ("t_window", globals.t_window),
+            ("t_reduction_max", globals.t_reduction_max),
+        ] {
+            if !value.is_finite() {
+                return Err(ConfigError(format!("[Globals] {name} must be finite")));
+            }
+        }
+        if globals.t_ambient <= -273.15 || globals.t_window <= 0.0 || globals.t_hysteresis < 0.0 {
+            return Err(ConfigError(
+                "invalid ambient temperature or governor window".into(),
+            ));
+        }
+        if globals
+            .period
+            .checked_mul(globals.channels)
+            .filter(|&n| n <= 1_048_576)
+            .is_none()
+        {
+            return Err(ConfigError(
+                "sense period exceeds the allocation limit".into(),
+            ));
+        }
         let controls = Controls {
             volume: get(c, "Controls", "volume")?.to_string(),
             unlock: get(c, "Controls", "unlock")?.to_string(),
@@ -154,7 +195,9 @@ impl Config {
         };
         let mut speakers = Vec::new();
         for (section, values) in &sections {
-            let Some(name) = section.strip_prefix("Speaker/") else { continue };
+            let Some(name) = section.strip_prefix("Speaker/") else {
+                continue;
+            };
             let s = |key| num::<f64>(values, section, key);
             let speaker = Speaker {
                 name: name.to_string(),
@@ -172,7 +215,10 @@ impl Config {
                 p_limit_60s: optional(values, section, "p_limit_60s")?,
             };
             if speaker.vs_chan >= globals.channels {
-                return Err(ConfigError(format!("[{section}] vs_chan {} beyond {} channels", speaker.vs_chan, globals.channels)));
+                return Err(ConfigError(format!(
+                    "[{section}] vs_chan {} beyond {} channels",
+                    speaker.vs_chan, globals.channels
+                )));
             }
             for (key, value) in [
                 ("tr_coil", speaker.tr_coil),
@@ -182,15 +228,36 @@ impl Config {
                 ("z_nominal", speaker.z_nominal),
                 ("vs_scale", speaker.vs_scale),
             ] {
-                if !(value > 0.0) {
-                    return Err(ConfigError(format!("[{section}] {key} must be positive")));
+                if !value.is_finite() || value <= 0.0 {
+                    return Err(ConfigError(format!(
+                        "[{section}] {key} must be finite and positive"
+                    )));
                 }
             }
+            for (key, value) in [
+                ("t_limit", speaker.t_limit),
+                ("t_headroom", speaker.t_headroom),
+                ("p_limit_1s", speaker.p_limit_1s),
+                ("p_limit_60s", speaker.p_limit_60s),
+            ] {
+                if !value.is_finite() {
+                    return Err(ConfigError(format!("[{section}] {key} must be finite")));
+                }
+            }
+            if speaker.t_headroom < 0.0 {
+                return Err(ConfigError(format!(
+                    "[{section}] t_headroom cannot be negative"
+                )));
+            }
             if speaker.t_limit - speaker.t_headroom <= globals.t_ambient + globals.t_window {
-                return Err(ConfigError(format!("[{section}] no room between ambient and the limit")));
+                return Err(ConfigError(format!(
+                    "[{section}] no room between ambient and the limit"
+                )));
             }
             if speaker.p_limit_1s < 0.0 || speaker.p_limit_60s < 0.0 {
-                return Err(ConfigError(format!("[{section}] power limits cannot be negative")));
+                return Err(ConfigError(format!(
+                    "[{section}] power limits cannot be negative"
+                )));
             }
             speakers.push(speaker);
         }
@@ -198,12 +265,20 @@ impl Config {
             return Err(ConfigError("no [Speaker/...] section".into()));
         }
         if globals.period == 0 || globals.channels == 0 {
-            return Err(ConfigError("[Globals] period and channels must be positive".into()));
+            return Err(ConfigError(
+                "[Globals] period and channels must be positive".into(),
+            ));
         }
         if !(globals.t_reduction_max > 0.0) {
-            return Err(ConfigError("[Globals] t_reduction_max must be positive".into()));
+            return Err(ConfigError(
+                "[Globals] t_reduction_max must be positive".into(),
+            ));
         }
-        Ok(Config { globals, controls, speakers })
+        Ok(Config {
+            globals,
+            controls,
+            speakers,
+        })
     }
 
     pub fn load(path: &Path) -> Result<Config, Box<dyn std::error::Error>> {
@@ -217,6 +292,25 @@ mod tests {
     use super::*;
 
     const J700: &str = include_str!("../conf/apple/j700.conf");
+
+    #[test]
+    fn rejects_nonfinite_and_invalid_protection_parameters() {
+        for (from, to) in [
+            ("t_ambient = 50.0", "t_ambient = NaN"),
+            ("t_window = 20.0", "t_window = 0"),
+            ("t_hysteresis = 5.0", "t_hysteresis = -1"),
+            ("tr_coil = 38.0", "tr_coil = inf"),
+            ("t_limit = 135.0", "t_limit = NaN"),
+            ("t_headroom = 15.0", "t_headroom = -1"),
+            ("p_limit_1s = 2.8154", "p_limit_1s = NaN"),
+            ("period = 4096", "period = 18446744073709551615"),
+        ] {
+            assert!(
+                Config::parse(&J700.replace(from, to)).is_err(),
+                "accepted {to}"
+            );
+        }
+    }
 
     #[test]
     fn parses_j700() {
@@ -236,7 +330,9 @@ mod tests {
 
     #[test]
     fn power_budget_is_optional() {
-        let none = J700.replace("p_limit_1s = 2.8154\n", "").replace("p_limit_60s = 2.5\n", "");
+        let none = J700
+            .replace("p_limit_1s = 2.8154\n", "")
+            .replace("p_limit_60s = 2.5\n", "");
         let c = Config::parse(&none).unwrap();
         assert_eq!(c.speakers[0].p_limit_1s, 0.0);
         assert!(Config::parse(&J700.replace("p_limit_60s = 2.5", "p_limit_60s = -1")).is_err());
