@@ -186,6 +186,34 @@ impl Card {
 /// Sense data missing for this long means the stream is gone, not late.
 const STALL_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// How long a sense capture has gone without data.
+#[derive(Default)]
+struct StallClock(Option<Instant>);
+
+impl StallClock {
+    /// A period arrived.
+    fn data(&mut self) {
+        self.0 = None;
+    }
+
+    /// Nothing arrived by `now`.  True once the stream has been silent for
+    /// STALL_TIMEOUT, counted from the first empty wait.
+    fn silent(&mut self, now: Instant) -> bool {
+        let since = *self.0.get_or_insert(now);
+        now.duration_since(since) >= STALL_TIMEOUT
+    }
+}
+
+/// The open sense capture and its stall clock.  The clock lives and dies
+/// with the capture: one left over from an earlier stream (say one closed
+/// while it was waiting) would call the next stream stalled at its first
+/// empty wait, 50 ms after the open and before its first period could
+/// arrive.
+struct Sense {
+    capture: Capture,
+    stall: StallClock,
+}
+
 /// Pings the volume lock.  A ping that answers ETIMEDOUT is the card's
 /// one-shot notice that the lock had lapsed (it does not re-arm the timer),
 /// so ping once more immediately to take the volume back; otherwise every
@@ -223,13 +251,12 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     card.set_reduction(0.0)?;
     info!("{card_name}: volume lock taken, {} volume control(s), max {}", card.volume.len(), card.volume_max);
 
-    let mut capture: Option<Capture> = None;
+    let mut sense: Option<Sense> = None;
     let mut words = vec![0i32; globals.period * globals.channels];
     let mut last_ping = Instant::now();
     let mut last_log = Instant::now();
     let mut applied = 0.0f64;
     let mut control_failures = 0u32;
-    let mut stalled_since: Option<Instant> = None;
     loop {
         // playback state: the card reports the speakers' sample rate, 0 when closed
         let rate = match card.ctl.read_int(&card.sample_rate) {
@@ -247,7 +274,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             Err(e) => return Err(format!("sample-rate control: {e}").into()),
         };
         if rate == 0 {
-            if capture.take().is_some() {
+            if sense.take().is_some() {
                 info!("speakers closed");
             }
             // cool down with no power, keep the lock alive
@@ -266,11 +293,11 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             thread::sleep(PING_INTERVAL);
             continue;
         }
-        if capture.is_none() {
+        if sense.is_none() {
             match Capture::open(card.ctl.card, globals.sense_pcm, globals.channels, rate, globals.period) {
-                Ok(c) => {
+                Ok(capture) => {
                     info!("speakers open at {rate} Hz, sense capture running");
-                    capture = Some(c);
+                    sense = Some(Sense { capture, stall: StallClock::default() });
                 }
                 Err(e) => {
                     warn!("sense PCM: {e}; retrying");
@@ -280,35 +307,33 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        let cap = capture.as_mut().unwrap();
+        let s = sense.as_mut().unwrap();
         let dt = globals.period as f64 / rate as f64;
         // The sense stream dies with the speaker back-end whenever playback is
         // torn down and rebuilt (EINVAL/EBADFD/EPIPE...).  That is not our
         // failure: drop the capture, keep the lock, and reopen once the card
         // reports a rate again.  Exiting here is what the listener heard as a
         // one-second dip to the safe level at high volume.
-        let valid = match cap.read_period(&mut words) {
+        let valid = match s.capture.read_period(&mut words) {
             Ok(Some(v)) => {
-                stalled_since = None;
+                s.stall.data();
                 v
             }
             Ok(None) => {
                 // No sense data within one ping interval.  Keep the lock alive
                 // first; only a stream silent for a whole STALL_TIMEOUT is
                 // dropped and reopened.
-                let since = *stalled_since.get_or_insert_with(Instant::now);
+                let stalled = s.stall.silent(Instant::now());
                 ping_lock(&card, &mut last_ping)?;
-                if since.elapsed() >= STALL_TIMEOUT {
+                if stalled {
                     warn!("sense stream stalled for {} ms; reopening", STALL_TIMEOUT.as_millis());
-                    capture = None;
-                    stalled_since = None;
+                    sense = None;
                 }
                 continue;
             }
             Err(e) if transient(&e) => {
                 warn!("sense capture: {e}; reopening");
-                capture = None;
-                stalled_since = None;
+                sense = None;
                 ping_lock(&card, &mut last_ping)?;
                 thread::sleep(PING_INTERVAL);
                 continue;
@@ -365,5 +390,53 @@ fn main() -> ExitCode {
             error!("{e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const POLL: Duration = Duration::from_millis(50);
+
+    #[test]
+    fn a_silent_stream_stalls_after_the_timeout() {
+        let t0 = Instant::now();
+        let mut clock = StallClock::default();
+        let mut t = t0;
+        while t < t0 + STALL_TIMEOUT {
+            assert!(!clock.silent(t), "stalled after {:?}", t - t0);
+            t += POLL;
+        }
+        assert!(clock.silent(t0 + STALL_TIMEOUT));
+    }
+
+    #[test]
+    fn data_restarts_the_clock() {
+        let t0 = Instant::now();
+        let mut clock = StallClock::default();
+        assert!(!clock.silent(t0));
+        assert!(!clock.silent(t0 + STALL_TIMEOUT - POLL));
+        clock.data();
+        let t1 = t0 + STALL_TIMEOUT + POLL;
+        assert!(!clock.silent(t1));
+        assert!(!clock.silent(t1 + STALL_TIMEOUT - POLL));
+        assert!(clock.silent(t1 + STALL_TIMEOUT));
+    }
+
+    /// The sequence the J700 showed: a stream closed during an empty wait,
+    /// and the next one opened minutes later.  Its first empty wait comes
+    /// 50 ms after the open, before the first period (85 ms at 48 kHz).
+    #[test]
+    fn a_new_capture_gets_its_whole_timeout() {
+        let t0 = Instant::now();
+        let mut old = StallClock::default();
+        assert!(!old.silent(t0));
+
+        let open = t0 + Duration::from_secs(360);
+        let mut clock = StallClock::default();
+        assert!(!clock.silent(open + POLL));
+        assert!(!clock.silent(open + STALL_TIMEOUT));
+        assert!(clock.silent(open + POLL + STALL_TIMEOUT));
     }
 }
