@@ -147,6 +147,26 @@ impl Config {
                 Some(_) => num(g, "Globals", "t_reduction_max")?,
             },
         };
+        for (key, value) in [
+            ("t_ambient", globals.t_ambient),
+            ("t_hysteresis", globals.t_hysteresis),
+            ("t_window", globals.t_window),
+            ("t_reduction_max", globals.t_reduction_max),
+        ] {
+            if !value.is_finite() {
+                return Err(ConfigError(format!("[Globals] {key} must be finite")));
+            }
+        }
+        if globals.t_window <= 0.0 || globals.t_hysteresis < 0.0 {
+            return Err(ConfigError(
+                "[Globals] window must be positive and hysteresis nonnegative".into(),
+            ));
+        }
+        if globals.period.checked_mul(globals.channels).is_none() {
+            return Err(ConfigError(
+                "[Globals] period/channel count overflow".into(),
+            ));
+        }
         let controls = Controls {
             volume: get(c, "Controls", "volume")?.to_string(),
             unlock: get(c, "Controls", "unlock")?.to_string(),
@@ -154,7 +174,8 @@ impl Config {
         };
         let mut speakers = Vec::new();
         for (section, values) in &sections {
-            let Some(name) = section.strip_prefix("Speaker/") else { continue };
+            let Some(name) = section.strip_prefix("Speaker/") else { continue;
+            };
             let s = |key| num::<f64>(values, section, key);
             let speaker = Speaker {
                 name: name.to_string(),
@@ -182,11 +203,28 @@ impl Config {
                 ("z_nominal", speaker.z_nominal),
                 ("vs_scale", speaker.vs_scale),
             ] {
-                if !(value > 0.0) {
+                if !value.is_finite() || !(value > 0.0) {
                     return Err(ConfigError(format!("[{section}] {key} must be positive")));
                 }
             }
-            if speaker.t_limit - speaker.t_headroom <= globals.t_ambient + globals.t_window {
+            for (key, value) in [
+                ("t_limit", speaker.t_limit),
+                ("t_headroom", speaker.t_headroom),
+                ("p_limit_1s", speaker.p_limit_1s),
+                ("p_limit_60s", speaker.p_limit_60s),
+            ] {
+                if !value.is_finite() {
+                    return Err(ConfigError(format!("[{section}] {key} must be finite")));
+                }
+            }
+            if speaker.t_headroom < 0.0 {
+                return Err(ConfigError(format!(
+                    "[{section}] headroom cannot be negative"
+                )));
+            }
+            if !(speaker.t_limit - speaker.t_headroom).is_finite()
+                || !(globals.t_ambient + globals.t_window).is_finite()
+                || speaker.t_limit - speaker.t_headroom <= globals.t_ambient + globals.t_window {
                 return Err(ConfigError(format!("[{section}] no room between ambient and the limit")));
             }
             if speaker.p_limit_1s < 0.0 || speaker.p_limit_60s < 0.0 {
@@ -250,5 +288,57 @@ mod tests {
         assert!(Config::parse(&broken).is_err());
         let hot = J700.replace("t_limit = 135.0", "t_limit = 40.0");
         assert!(Config::parse(&hot).is_err());
+    }
+    #[test]
+    fn rejects_nonfinite_and_invalid_scalar_domains() {
+        for key in [
+            "t_ambient",
+            "t_hysteresis",
+            "t_window",
+            "t_reduction_max",
+            "tr_coil",
+            "tau_coil",
+            "tr_magnet",
+            "tau_magnet",
+            "t_limit",
+            "t_headroom",
+            "z_nominal",
+            "vs_scale",
+            "p_limit_1s",
+            "p_limit_60s",
+        ] {
+            for value in ["NaN", "inf", "-inf"] {
+                let text = J700
+                    .lines()
+                    .map(|line| {
+                        if line.split('=').next().unwrap().trim() == key {
+                            format!("{key} = {value}")
+                        } else {
+                            line.to_string()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(Config::parse(&text).is_err(), "{key}={value}");
+            }
+        }
+        for (key, value) in [
+            ("t_window", "0"),
+            ("t_hysteresis", "-1"),
+            ("t_headroom", "-1"),
+        ] {
+            let text = J700
+                .lines()
+                .map(|line| {
+                    if line.split('=').next().unwrap().trim() == key {
+                        format!("{key} = {value}")
+                    } else {
+                        line.to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(Config::parse(&text).is_err());
+        }
     }
 }

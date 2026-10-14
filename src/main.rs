@@ -13,6 +13,7 @@
 
 mod alsa;
 mod config;
+mod health;
 mod model;
 
 use std::path::PathBuf;
@@ -216,14 +217,20 @@ struct Sense {
 
 /// Pings the volume lock.  A ping that answers ETIMEDOUT is the card's
 /// one-shot notice that the lock had lapsed (it does not re-arm the timer),
-/// so ping once more immediately to take the volume back; otherwise every
+/// so ping once more only while the sensing budget remains healthy; otherwise every
 /// volume write until the next ping fails with EINVAL against the safe limit.
-fn ping_lock(card: &Card, last_ping: &mut Instant) -> Result<(), Box<dyn std::error::Error>> {
-    match card.ping() {
+fn ping_lock(
+    card: &Card,
+    last_ping: &mut Instant,
+    health: &health::SenseHealth,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match health.checked(|| card.ping())? {
         Ok(()) => {}
         Err(e) if e.raw_os_error() == Some(libc::ETIMEDOUT) => {
             warn!("the card locked the volume while we were away; taking it back");
-            card.ping().map_err(|e| format!("lock ping: {e}"))?;
+            health
+                .checked(|| card.ping())?
+                .map_err(|e| format!("lock ping: {e}"))?;
         }
         Err(e) => return Err(format!("lock ping: {e}").into()),
     }
@@ -232,6 +239,9 @@ fn ping_lock(card: &Card, last_ping: &mut Instant) -> Result<(), Box<dyn std::er
 }
 
 fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    if !args.max_reduction.is_finite() || args.max_reduction <= 0.0 {
+        return Err("maximum reduction must be finite and positive".into());
+    }
     let (card, card_name) = {
         // the model file is named after the card: AppleJ700 -> apple/j700.conf
         let (ctl, name) = find_card(args.card.as_deref())?;
@@ -247,8 +257,10 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let globals = cfg.globals.clone();
     let mut speakers: Vec<SpeakerState> = cfg.speakers.iter().map(|s| SpeakerState::new(s.clone(), globals.t_ambient)).collect();
 
-    card.take_lock()?;
-    card.set_reduction(0.0)?;
+    let mut sense_health = health::SenseHealth::default();
+    sense_health.active(Instant::now());
+    sense_health.checked(|| card.take_lock())??;
+    sense_health.checked(|| card.set_reduction(0.0))??;
     info!("{card_name}: volume lock taken, {} volume control(s), max {}", card.volume.len(), card.volume_max);
 
     let mut sense: Option<Sense> = None;
@@ -258,50 +270,78 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let mut applied = 0.0f64;
     let mut control_failures = 0u32;
     loop {
+        // Sample-rate I/O makes playback state unknown until it returns.
+        sense_health.active(Instant::now());
+        sense_health.require(Instant::now())?;
         // playback state: the card reports the speakers' sample rate, 0 when closed
-        let rate = match card.ctl.read_int(&card.sample_rate) {
+        let rate = match sense_health.checked(|| card.ctl.read_int(&card.sample_rate))? {
             Ok(v) => {
                 control_failures = 0;
-                v as u32
+                u32::try_from(v).map_err(|_| "invalid negative or excessive speaker sample rate")?
             }
             Err(e) if transient(&e) && control_failures < MAX_CONTROL_FAILURES => {
+                sense_health.active(Instant::now());
                 control_failures += 1;
                 warn!("sample-rate control: {e}; retrying ({control_failures})");
-                card.ping()?;
+                sense_health.require(Instant::now())?;
+                sense_health.checked(|| card.ping())??;
                 thread::sleep(PING_INTERVAL);
                 continue;
             }
             Err(e) => return Err(format!("sample-rate control: {e}").into()),
         };
         if rate == 0 {
+            sense_health.idle();
             if sense.take().is_some() {
                 info!("speakers closed");
             }
             // cool down with no power, keep the lock alive
             for s in speakers.iter_mut() {
                 s.step(0.0, PING_INTERVAL.as_secs_f64(), globals.t_ambient);
+                if !s.finite() {
+                    return Err("nonfinite speaker model state".into());
+                }
                 s.govern(&globals);
+                if !s.finite() {
+                    return Err("nonfinite speaker governor".into());
+                }
             }
-            if let Err(e) = card.set_reduction(model::reduction_db(&speakers)) {
+            if let Err(e) =
+                sense_health.checked(|| card.set_reduction(model::reduction_db(&speakers)))?
+            {
                 if !transient(&e) || control_failures >= MAX_CONTROL_FAILURES {
                     return Err(format!("volume control: {e}").into());
                 }
                 control_failures += 1;
                 warn!("volume control: {e}; retrying ({control_failures})");
             }
-            ping_lock(&card, &mut last_ping)?;
+            sense_health.require(Instant::now())?;
+            ping_lock(&card, &mut last_ping, &sense_health)?;
             thread::sleep(PING_INTERVAL);
             continue;
         }
+        sense_health.active(Instant::now());
         if sense.is_none() {
-            match Capture::open(card.ctl.card, globals.sense_pcm, globals.channels, rate, globals.period) {
+            match sense_health.checked(|| {
+                Capture::open(
+                    card.ctl.card,
+                    globals.sense_pcm,
+                    globals.channels,
+                    rate,
+                    globals.period,
+                )
+            })? {
                 Ok(capture) => {
                     info!("speakers open at {rate} Hz, sense capture running");
-                    sense = Some(Sense { capture, stall: StallClock::default() });
+                    sense = Some(Sense {
+                        capture,
+                        stall: StallClock::default(),
+                    });
                 }
                 Err(e) => {
                     warn!("sense PCM: {e}; retrying");
-                    card.ping()?;
+                    sense_health.require(Instant::now())?;
+                    sense_health.checked(|| card.ping())??;
                     thread::sleep(PING_INTERVAL);
                     continue;
                 }
@@ -314,7 +354,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         // failure: drop the capture, keep the lock, and reopen once the card
         // reports a rate again.  Exiting here is what the listener heard as a
         // one-second dip to the safe level at high volume.
-        let valid = match s.capture.read_period(&mut words) {
+        let valid = match sense_health.checked(|| s.capture.read_period(&mut words))? {
             Ok(Some(v)) => {
                 s.stall.data();
                 v
@@ -324,9 +364,13 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                 // first; only a stream silent for a whole STALL_TIMEOUT is
                 // dropped and reopened.
                 let stalled = s.stall.silent(Instant::now());
-                ping_lock(&card, &mut last_ping)?;
+                sense_health.require(Instant::now())?;
+                ping_lock(&card, &mut last_ping, &sense_health)?;
                 if stalled {
-                    warn!("sense stream stalled for {} ms; reopening", STALL_TIMEOUT.as_millis());
+                    warn!(
+                        "sense stream stalled for {} ms; reopening",
+                        STALL_TIMEOUT.as_millis()
+                    );
                     sense = None;
                 }
                 continue;
@@ -334,24 +378,46 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             Err(e) if transient(&e) => {
                 warn!("sense capture: {e}; reopening");
                 sense = None;
-                ping_lock(&card, &mut last_ping)?;
+                sense_health.require(Instant::now())?;
+                ping_lock(&card, &mut last_ping, &sense_health)?;
                 thread::sleep(PING_INTERVAL);
                 continue;
             }
             Err(e) => return Err(format!("sense capture: {e}").into()),
         };
         if !valid {
-            warn!("sense overrun, step skipped");
+            warn!("incomplete sense period or overrun, step skipped");
         } else {
             for s in speakers.iter_mut() {
                 let v = s.v_rms_of(&words, globals.channels);
                 s.v_rms = v;
                 let power = v * v / s.spec.z_nominal;
+                if !v.is_finite()
+                    || !power.is_finite()
+                    || power < 0.0
+                    || !dt.is_finite()
+                    || dt <= 0.0
+                {
+                    return Err("invalid speaker sense voltage, power or period".into());
+                }
                 s.step(power, dt, globals.t_ambient);
+                if !s.finite() {
+                    return Err("nonfinite speaker model state".into());
+                }
                 s.govern(&globals);
+                if !s.finite() {
+                    return Err("nonfinite speaker governor".into());
+                }
             }
         }
+        // Renew only after complete frames and all derived model state passed.
+        if valid {
+            sense_health.valid(Instant::now())?;
+        }
         let reduction = model::reduction_db(&speakers);
+        if !reduction.is_finite() {
+            return Err("nonfinite speaker reduction".into());
+        }
         if reduction >= args.max_reduction {
             error!("gain reduction {reduction:.1} dB reached the limit; leaving the card locked");
             return Err("maximum reduction reached".into());
@@ -360,7 +426,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             info!("gain reduction {reduction:.1} dB");
             applied = reduction;
         }
-        match card.set_reduction(reduction) {
+        match sense_health.checked(|| card.set_reduction(reduction))? {
             Ok(()) => control_failures = 0,
             Err(e) if transient(&e) && control_failures < MAX_CONTROL_FAILURES => {
                 control_failures += 1;
@@ -369,11 +435,20 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             Err(e) => return Err(format!("volume control: {e}").into()),
         }
         if last_ping.elapsed() >= PING_INTERVAL {
-            ping_lock(&card, &mut last_ping)?;
+            sense_health.require(Instant::now())?;
+            ping_lock(&card, &mut last_ping, &sense_health)?;
         }
         if last_log.elapsed() >= LOG_INTERVAL {
             for s in &speakers {
-                debug!("{}: {:.3} Vrms {:.1} mW coil {:.1} C magnet {:.1} C reduction {:.1} dB", s.spec.name, s.v_rms, s.power * 1000.0, s.t_coil, s.t_magnet, s.reduction_db);
+                debug!(
+                    "{}: {:.3} Vrms {:.1} mW coil {:.1} C magnet {:.1} C reduction {:.1} dB",
+                    s.spec.name,
+                    s.v_rms,
+                    s.power * 1000.0,
+                    s.t_coil,
+                    s.t_magnet,
+                    s.reduction_db
+                );
             }
             last_log = Instant::now();
         }

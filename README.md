@@ -41,6 +41,24 @@ AudioUnit API and recorded in the bring-up provenance record.  Without the
 daemon the kernel locks the J700's speakers 20 dB below the amplifier's
 full scale; with it, the model governs up to full scale.
 
+### Missing or invalid speaker data
+
+Only a complete, freshly read PCM period with finite voltage, power and model
+state renews the 250 ms sensing budget. Empty, partial or overrun periods and
+capture/control retries keep the existing deadline. A period arriving at or
+after that deadline cannot reset it. Configuration scalars must be finite,
+with positive physical constants and valid window/budget domains; silence and
+negative waveform samples remain valid.
+
+The daemon checks the budget before and after I/O, and before an unlock retry.
+On expiration or invalid model state it exits, releasing its ALSA handles;
+the kernel interlock remains responsible for safe volume. These checks cannot
+make scheduling and ioctls atomic or guarantee a hard 250 ms shutdown time.
+Kernel watchdog/release behavior and thermal protection require qualification
+on the exact hardware and kernel. The unit uses `Restart=no`, so a fatal
+failure stays at protected volume until deliberate service recovery; it does
+not automatically lift the interlock again.
+
 ### Building
 
 Static, from any host:

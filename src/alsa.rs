@@ -368,7 +368,7 @@ impl Capture {
     /// is recovered transparently (the stream is re-prepared) and reported as
     /// Ok(false) so the caller can discard the model step.
     /// Reads one sense period.  `Ok(Some(true))` is a valid period,
-    /// `Ok(Some(false))` an overrun that was recovered (the period is lost),
+    /// `Ok(Some(false))` a short period or recovered overrun (discarded),
     /// `Ok(None)` nothing arrived within one ping interval: the caller must
     /// ping the lock and call again, because the card locks the volume 250 ms
     /// after the last ping and nothing may block longer than that.
@@ -381,7 +381,7 @@ impl Capture {
         let mut xfer = Xferi { result: 0, buf: buf.as_mut_ptr().cast(), frames: self.period as u64 };
         loop {
             match ioctl(&self.file, PCM_IOCTL_READI_FRAMES, &mut xfer) {
-                Ok(_) => return Ok(Some(true)),
+                Ok(_) => return Ok(Some(full_period(xfer.result, self.period)?)),
                 Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => {
                     if !self.wait_frames()? {
                         return Ok(None);
@@ -449,5 +449,41 @@ mod tests {
         assert_eq!(PCM_IOCTL_HW_PARAMS, 0xc260_4111);
         assert_eq!(PCM_IOCTL_READI_FRAMES, 0x8018_4151);
         assert_eq!(PCM_IOCTL_START, 0x4142);
+    }
+}
+
+/// A successful ioctl reports the actual count separately from its return code.
+fn full_period(frames: i64, requested: usize) -> io::Result<bool> {
+    if frames < 0 {
+        return Err(io::Error::from_raw_os_error(
+            frames.saturating_neg().min(i32::MAX as i64) as i32,
+        ));
+    }
+    if frames as u64 > requested as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "sense transfer exceeds requested period",
+        ));
+    }
+    Ok(frames as u64 == requested as u64 && requested != 0)
+}
+
+#[cfg(test)]
+mod transfer_tests {
+    use super::*;
+    #[test]
+    fn only_a_complete_positive_transfer_is_valid() {
+        for frames in [0, 1, 4095] {
+            assert!(!full_period(frames, 4096).unwrap());
+        }
+        assert!(full_period(4096, 4096).unwrap());
+        assert!(!full_period(0, 0).unwrap());
+        assert!(full_period(4097, 4096).is_err());
+        assert_eq!(
+            full_period(-libc::EPIPE as i64, 4096)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EPIPE)
+        );
     }
 }

@@ -116,6 +116,22 @@ impl SpeakerState {
         db
     }
 
+    /// Overflow must be rejected before a period renews the sensing permit.
+    pub fn finite(&self) -> bool {
+        [
+            self.t_coil,
+            self.t_magnet,
+            self.power,
+            self.v_rms,
+            self.reduction_db,
+            self.history_s,
+            self.mean_power(1.0),
+            self.mean_power(60.0),
+        ]
+        .iter()
+        .all(|v| v.is_finite())
+    }
+
     /// Governor: the reduction (dB) that keeps the coil inside the window
     /// and the mean power inside the budgets.  Thermal reduction grows
     /// linearly across the window from 0 dB at `limit - headroom - window`
@@ -286,5 +302,30 @@ mod tests {
         }
         assert!((s.mean_power(60.0) - 2.6).abs() < 0.01);
         assert!(s.budget_reduction() > 0.1);
+    }
+    #[test]
+    fn finite_guard_rejects_overflow_before_governor_or_renewal() {
+        let mut s = SpeakerState::new(spec(), 35.0);
+        s.step(f64::MAX, 0.1, 35.0);
+        assert!(!s.finite());
+        let mut s = SpeakerState::new(spec(), 35.0);
+        s.v_rms = f64::NAN;
+        assert!(!s.finite());
+        let mut s = SpeakerState::new(spec(), 35.0);
+        s.history.push_back((1.0, f64::MAX));
+        s.history.push_back((1.0, f64::MAX));
+        assert!(!s.finite());
+    }
+
+    #[test]
+    fn silence_and_negative_waveform_samples_are_valid() {
+        let s = SpeakerState::new(spec(), 35.0);
+        assert_eq!(s.v_rms_of(&[0; 8], 2), 0.0);
+        let rms = s.v_rms_of(&[i32::MIN, 0, i32::MAX, 0], 2);
+        assert!(rms.is_finite() && rms > 0.0);
+        let mut s = s;
+        s.step(0.0, 0.1, 35.0);
+        s.govern(&globals());
+        assert!(s.finite());
     }
 }
