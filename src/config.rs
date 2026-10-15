@@ -39,6 +39,10 @@ pub struct Globals {
     /// Reduction the thermal governor reaches at the coil's working limit
     /// (dB); more than this means the model, not the music, is wrong.
     pub t_reduction_max: f64,
+    /// The card's own level without a daemon, dB below the volume
+    /// control's maximum (macaudio's safe_vol): what the speakers get once
+    /// the lock lapses.
+    pub safe_reduction: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -146,12 +150,17 @@ impl Config {
                 None => 12.0,
                 Some(_) => num(g, "Globals", "t_reduction_max")?,
             },
+            safe_reduction: match g.get("safe_reduction") {
+                None => 20.0,
+                Some(_) => num(g, "Globals", "safe_reduction")?,
+            },
         };
         for (key, value) in [
             ("t_ambient", globals.t_ambient),
             ("t_hysteresis", globals.t_hysteresis),
             ("t_window", globals.t_window),
             ("t_reduction_max", globals.t_reduction_max),
+            ("safe_reduction", globals.safe_reduction),
         ] {
             if !value.is_finite() {
                 return Err(ConfigError(format!("[Globals] {key} must be finite")));
@@ -174,8 +183,7 @@ impl Config {
         };
         let mut speakers = Vec::new();
         for (section, values) in &sections {
-            let Some(name) = section.strip_prefix("Speaker/") else { continue;
-            };
+            let Some(name) = section.strip_prefix("Speaker/") else { continue };
             let s = |key| num::<f64>(values, section, key);
             let speaker = Speaker {
                 name: name.to_string(),
@@ -241,6 +249,9 @@ impl Config {
         if !(globals.t_reduction_max > 0.0) {
             return Err(ConfigError("[Globals] t_reduction_max must be positive".into()));
         }
+        if !(globals.safe_reduction > 0.0) {
+            return Err(ConfigError("[Globals] safe_reduction must be positive".into()));
+        }
         Ok(Config { globals, controls, speakers })
     }
 
@@ -296,6 +307,7 @@ mod tests {
             "t_hysteresis",
             "t_window",
             "t_reduction_max",
+            "safe_reduction",
             "tr_coil",
             "tau_coil",
             "tr_magnet",

@@ -29,9 +29,11 @@ released slowly.  A windowed power budget (`p_limit_1s`, `p_limit_60s`: the
 mean power over the last second and the last minute) reduces the gain at
 once when a burst would exceed what the pair is rated for, before the coil
 has warmed up.  The larger of the two reductions is written to the card's
-speaker volume control.  If it would exceed `--max-reduction`, the daemon
-exits and leaves the card locked: the safe volume is then the kernel's, not
-the model's (20 dB by default: a model asking for more is wrong).
+speaker volume control.  If it would exceed `--max-reduction` (20 dB by
+default: a model asking for more is wrong), the daemon stops renewing the
+lock and the card falls back to its own safe level; the daemon keeps
+modelling from the sense data and takes the lock back once the reduction is
+3 dB below the limit again.
 
 There is no feedback: the model can only be as good as its constants.  The
 J700's constants - thermal resistances and time constants, coil temperature
@@ -43,21 +45,34 @@ full scale; with it, the model governs up to full scale.
 
 ### Missing or invalid speaker data
 
-Only a complete, freshly read PCM period with finite voltage, power and model
-state renews the 250 ms sensing budget. Empty, partial or overrun periods and
-capture/control retries keep the existing deadline. A period arriving at or
-after that deadline cannot reset it. Configuration scalars must be finite,
-with positive physical constants and valid window/budget domains; silence and
-negative waveform samples remain valid.
+Only a complete PCM period with finite voltage, power and model state counts
+as measured.  Empty, short or overrun periods, capture errors and stream
+reopens are not; configuration scalars must be finite, with positive
+physical constants and valid window/budget domains.
 
-The daemon checks the budget before and after I/O, and before an unlock retry.
-On expiration or invalid model state it exits, releasing its ALSA handles;
-the kernel interlock remains responsible for safe volume. These checks cannot
-make scheduling and ioctls atomic or guarantee a hard 250 ms shutdown time.
-Kernel watchdog/release behavior and thermal protection require qualification
-on the exact hardware and kernel. The unit uses `Restart=no`, so a fatal
-failure stays at protected volume until deliberate service recovery; it does
-not automatically lift the interlock again.
+Time the daemon could not measure while the speakers play is not ignored and
+is not fatal either:
+
+* A period may be up to 100 ms late.  Beyond that, the model is charged for
+  the unmeasured time at the worst case: a full-scale square wave at the gain
+  the card currently applies.  A short gap (an xrun, stream start latency, a
+  PipeWire reconfiguration) therefore costs at most a brief extra reduction,
+  never protection.
+* A stream silent for 500 ms is closed and reopened.  Without a complete
+  period for longer than that, the daemon stops renewing the card's volume
+  lock, and the kernel drops the speakers to its safe level within 250 ms.
+  The lock is taken back after two complete periods in a row.
+
+Exits are left for what the daemon cannot recover from (no card, a
+configuration error, a nonfinite model); the speakers are then at the card's
+safe level.  The unit restarts the daemon (`Restart=on-failure`, five
+attempts a minute), and the model state it writes once a second to
+`/run/speakerguardd/state` (`-s`), cooled by the time between the two runs,
+makes the new run start as hot as the old one stopped.  An unreadable state
+file is taken as a speaker at its working temperature limit.  These checks
+cannot make scheduling and ioctls atomic: a daemon that is late renewing the
+lock is covered by the kernel's 250 ms lock timeout, and the late time is
+charged to the model like any other gap.
 
 ### Building
 
@@ -78,5 +93,5 @@ rule that starts it when a supported card's sense PCM appears.
 
     speakerguardd -c /usr/share/speakerguardd -v
 
-`-C <card id>` selects a card, `-m <dB>` the reduction at which the daemon
-gives up.
+`-C <card id>` selects a card, `-m <dB>` the reduction at which the card's
+safe level takes over, `-s <file>` the model state file (`-s ''` for none).

@@ -7,16 +7,18 @@
 //! through a two-stage thermal model, and the coil temperature governs the
 //! card's speaker volume control.  The card only unlocks that control while
 //! this daemon holds the lock on it and keeps writing the unlock control
-//! (the same interlock the other Macs' speakersafetyd uses); if the model
-//! ever demands more reduction than `--max-reduction`, the daemon exits and
-//! the card falls back to its locked, safe volume.
+//! (the same interlock the other Macs' speakersafetyd uses).  Whenever the
+//! daemon cannot vouch for the speakers -- no complete sense data for longer
+//! than the stall timeout, or a model asking for more than
+//! `--max-reduction` -- it stops renewing the lock, the card falls back to
+//! its safe volume, and the daemon takes the lock back once it can.
 
 mod alsa;
 mod config;
 mod guard;
-mod health;
 mod log;
 mod model;
+mod state;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -38,6 +40,7 @@ struct Args {
     config_path: PathBuf,
     max_reduction: f64,
     card: Option<String>,
+    state: Option<PathBuf>,
     verbosity: Level,
 }
 
@@ -47,7 +50,8 @@ fn usage() -> ! {
          Options:\n  \
          -c, --config-path <DIR>         Directory holding <vendor>/<model>.conf\n  \
          -C, --card <ID>                 ALSA card id (default: the first Apple* card)\n  \
-         -m, --max-reduction <DB>        Gain reduction beyond which the daemon exits (default 20)\n  \
+         -m, --max-reduction <DB>        Gain reduction beyond which the card's safe level takes over (default 20)\n  \
+         -s, --state <FILE>              Model state kept across restarts (default /run/speakerguardd/state)\n  \
          -v, --verbose                   More logging (repeatable)\n  \
          -q, --quiet                     Less logging\n  \
          -h, --help                      This text"
@@ -56,12 +60,16 @@ fn usage() -> ! {
 }
 
 fn parse_args() -> Args {
-    let mut args = Args { config_path: PathBuf::from("/usr/share/speakerguardd"), max_reduction: 20.0, card: None, verbosity: Level::Info };
+    let mut args = Args { config_path: PathBuf::from("/usr/share/speakerguardd"), max_reduction: 20.0, card: None, state: Some(PathBuf::from("/run/speakerguardd/state")), verbosity: Level::Info };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
             "-c" | "--config-path" => args.config_path = PathBuf::from(it.next().unwrap_or_else(|| usage())),
             "-C" | "--card" => args.card = Some(it.next().unwrap_or_else(|| usage())),
+            "-s" | "--state" => {
+                let v = it.next().unwrap_or_else(|| usage());
+                args.state = if v.is_empty() { None } else { Some(PathBuf::from(v)) };
+            }
             "-m" | "--max-reduction" => {
                 args.max_reduction = it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage());
             }
@@ -146,6 +154,12 @@ impl Hw for RealHw {
     fn now(&self) -> Instant {
         Instant::now()
     }
+    fn boottime(&self) -> Duration {
+        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        // SAFETY: a valid, writable timespec.
+        unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts) };
+        Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+    }
     fn sleep(&mut self, d: Duration) {
         thread::sleep(d)
     }
@@ -187,10 +201,14 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     info!("{}: {} speakers, sense PCM {}, period {} frames", path.display(), cfg.speakers.len(), cfg.globals.sense_pcm, cfg.globals.period);
     let (card, card_name) = Card::open(Some(&name), &cfg)?;
     let mut hw = RealHw { card, globals: cfg.globals.clone(), capture: None };
-    let mut guard = Guard::start(&mut hw, &cfg, args.max_reduction)?;
+    let mut guard = Guard::start(&mut hw, &cfg, args.max_reduction, args.state.clone())?;
     info!("{card_name}: volume lock taken, {} volume control(s), max {}", hw.card.volume.len(), hw.card.volume_max);
     loop {
-        guard.tick(&mut hw)?;
+        if let Err(e) = guard.tick(&mut hw) {
+            // the next run starts from where this model was
+            guard.save(&hw);
+            return Err(e);
+        }
     }
 }
 
