@@ -450,7 +450,7 @@ impl Guard {
     /// Write the model state for the next run (atomically; best effort).
     pub fn save<H: Hw>(&mut self, hw: &H) {
         let Some(path) = &self.state_path else { return };
-        let text = state::encode(hw.boottime(), &self.speakers);
+        let text = state::encode(hw.boottime(), &self.speakers, self.armed);
         let tmp = path.with_extension("tmp");
         let result = std::fs::write(&tmp, text).and_then(|()| std::fs::rename(&tmp, path));
         match result {
