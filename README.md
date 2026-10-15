@@ -74,6 +74,25 @@ cannot make scheduling and ioctls atomic: a daemon that is late renewing the
 lock is covered by the kernel's 250 ms lock timeout, and the late time is
 charged to the model like any other gap.
 
+### Relation to speakersafetyd
+
+speakersafetyd protects the speakers of the other Apple laptops from the
+amplifiers' own current and voltage sense (V/ISENSE on the TAS/SN parts,
+S16 sense words): it measures the power, so its model only integrates.  It
+needs the VSENSE/ISENSE switches and an amplifier gain control, and on any
+error it panics and is restarted cold by systemd.  The J700 has none of
+that: a fixed-gain MAX98360A and a digital tap of the S32 words the
+amplifier receives, so the current must be inferred (feed-forward).
+
+For speakersafetyd to cover the J700 it would need, in order: an optional
+current channel (I = V / z_nominal when `is_chan` is absent), S32 sense
+words, optional amplifier controls, and then the parts that matter only
+without measured current: the power budgets, charging unmeasured time, and
+keeping the model across restarts.  The configuration keys here are
+speakersafetyd's, so the J700 file would carry over.  That is a series to
+propose upstream rather than a beta change; until it lands, this daemon is
+the J700's protection.
+
 ### Building
 
 Static, from any host:
