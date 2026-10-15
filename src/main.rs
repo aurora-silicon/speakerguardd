@@ -7,13 +7,18 @@
 //! through a two-stage thermal model, and the coil temperature governs the
 //! card's speaker volume control.  The card only unlocks that control while
 //! this daemon holds the lock on it and keeps writing the unlock control
-//! (the same interlock the other Macs' speakersafetyd uses); if the model
-//! ever demands more reduction than `--max-reduction`, the daemon exits and
-//! the card falls back to its locked, safe volume.
+//! (the same interlock the other Macs' speakersafetyd uses).  Whenever the
+//! daemon cannot vouch for the speakers -- no complete sense data for longer
+//! than the stall timeout, or a model asking for more than
+//! `--max-reduction` -- it stops renewing the lock, the card falls back to
+//! its safe volume, and the daemon takes the lock back once it can.
 
 mod alsa;
 mod config;
+mod guard;
+mod log;
 mod model;
+mod state;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -21,71 +26,21 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use alsa::{Capture, Ctl, ElemId};
-use config::Config;
-use model::SpeakerState;
+use config::{Config, Globals};
+use guard::{Guard, Hw};
+use log::Level;
 
 /// The value the card's "Speaker Volume Unlock" control expects: the kernel
 /// compares the written long with (s32)0xdec1be15.
 const UNLOCK_MAGIC: i64 = 0xdec1be15u32 as i32 as i64;
-/// The kernel locks the volume again 250 ms after the last write; write well
-/// inside that while the speakers play.
-/// Cadence of the per-speaker debug line.
-const LOG_INTERVAL: Duration = Duration::from_secs(1);
-const PING_INTERVAL: Duration = Duration::from_millis(100);
 /// Volume control steps per dB (t8140-aop-audio: 0.5 dB steps).
 const STEPS_PER_DB: f64 = 2.0;
-/// Consecutive control failures tolerated before the daemon gives up.  While it
-/// stays alive the volume lock stays held; exiting hands the card to its own
-/// safe level, which the listener hears as a one-second dip.
-const MAX_CONTROL_FAILURES: u32 = 50;
-
-/// Errors a PCM or control returns while the playback side is being
-/// reconfigured underneath us (the sense front-end follows the speaker
-/// back-end, which PipeWire opens, suspends and reopens at will).
-fn transient(e: &std::io::Error) -> bool {
-    matches!(
-        e.raw_os_error(),
-        Some(libc::EINVAL | libc::EBADFD | libc::EPIPE | libc::ESTRPIPE | libc::ENODEV
-            | libc::EIO | libc::ETIMEDOUT | libc::EAGAIN | libc::EINTR | libc::ENXIO)
-    )
-}
-
-#[derive(Clone, Copy, PartialEq, PartialOrd)]
-enum Level {
-    Error = 0,
-    Warn = 1,
-    Info = 2,
-    Debug = 3,
-}
-
-static mut VERBOSITY: Level = Level::Info;
-
-/// Log lines carry the kernel's monotonic clock so they line up with dmesg.
-fn log(level: Level, msg: std::fmt::Arguments) {
-    // SAFETY: VERBOSITY is written once, before any other thread exists.
-    if level <= unsafe { VERBOSITY } {
-        let tag = match level {
-            Level::Error => "E",
-            Level::Warn => "W",
-            Level::Info => "I",
-            Level::Debug => "D",
-        };
-        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-        // SAFETY: a valid, writable timespec.
-        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-        eprintln!("[{:5}.{:06}] {tag} {msg}", ts.tv_sec, ts.tv_nsec / 1000);
-    }
-}
-
-macro_rules! error { ($($t:tt)*) => { log(Level::Error, format_args!($($t)*)) } }
-macro_rules! warn { ($($t:tt)*) => { log(Level::Warn, format_args!($($t)*)) } }
-macro_rules! info { ($($t:tt)*) => { log(Level::Info, format_args!($($t)*)) } }
-macro_rules! debug { ($($t:tt)*) => { log(Level::Debug, format_args!($($t)*)) } }
 
 struct Args {
     config_path: PathBuf,
     max_reduction: f64,
     card: Option<String>,
+    state: Option<PathBuf>,
     verbosity: Level,
 }
 
@@ -95,7 +50,8 @@ fn usage() -> ! {
          Options:\n  \
          -c, --config-path <DIR>         Directory holding <vendor>/<model>.conf\n  \
          -C, --card <ID>                 ALSA card id (default: the first Apple* card)\n  \
-         -m, --max-reduction <DB>        Gain reduction beyond which the daemon exits (default 20)\n  \
+         -m, --max-reduction <DB>        Gain reduction beyond which the card's safe level takes over (default 20)\n  \
+         -s, --state <FILE>              Model state kept across restarts (default /run/speakerguardd/state)\n  \
          -v, --verbose                   More logging (repeatable)\n  \
          -q, --quiet                     Less logging\n  \
          -h, --help                      This text"
@@ -104,12 +60,16 @@ fn usage() -> ! {
 }
 
 fn parse_args() -> Args {
-    let mut args = Args { config_path: PathBuf::from("/usr/share/speakerguardd"), max_reduction: 20.0, card: None, verbosity: Level::Info };
+    let mut args = Args { config_path: PathBuf::from("/usr/share/speakerguardd"), max_reduction: 20.0, card: None, state: Some(PathBuf::from("/run/speakerguardd/state")), verbosity: Level::Info };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
             "-c" | "--config-path" => args.config_path = PathBuf::from(it.next().unwrap_or_else(|| usage())),
             "-C" | "--card" => args.card = Some(it.next().unwrap_or_else(|| usage())),
+            "-s" | "--state" => {
+                let v = it.next().unwrap_or_else(|| usage());
+                args.state = if v.is_empty() { None } else { Some(PathBuf::from(v)) };
+            }
             "-m" | "--max-reduction" => {
                 args.max_reduction = it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage());
             }
@@ -174,7 +134,7 @@ impl Card {
         self.ctl.write_int(&self.unlock, UNLOCK_MAGIC)
     }
 
-    fn set_reduction(&self, db: f64) -> std::io::Result<()> {
+    fn write_reduction(&self, db: f64) -> std::io::Result<()> {
         let value = (self.volume_max as f64 - db * STEPS_PER_DB).round().max(0.0) as i64;
         for id in &self.volume {
             self.ctl.write_int(id, value)?;
@@ -183,260 +143,83 @@ impl Card {
     }
 }
 
-/// Sense data missing for this long means the stream is gone, not late.
-const STALL_TIMEOUT: Duration = Duration::from_millis(500);
-
-/// How long a sense capture has gone without data.
-#[derive(Default)]
-struct StallClock(Option<Instant>);
-
-impl StallClock {
-    /// A period arrived.
-    fn data(&mut self) {
-        self.0 = None;
-    }
-
-    /// Nothing arrived by `now`.  True once the stream has been silent for
-    /// STALL_TIMEOUT, counted from the first empty wait.
-    fn silent(&mut self, now: Instant) -> bool {
-        let since = *self.0.get_or_insert(now);
-        now.duration_since(since) >= STALL_TIMEOUT
-    }
+/// The card and its sense capture.
+struct RealHw {
+    card: Card,
+    globals: Globals,
+    capture: Option<Capture>,
 }
 
-/// The open sense capture and its stall clock.  The clock lives and dies
-/// with the capture: one left over from an earlier stream (say one closed
-/// while it was waiting) would call the next stream stalled at its first
-/// empty wait, 50 ms after the open and before its first period could
-/// arrive.
-struct Sense {
-    capture: Capture,
-    stall: StallClock,
-}
-
-/// Pings the volume lock.  A ping that answers ETIMEDOUT is the card's
-/// one-shot notice that the lock had lapsed (it does not re-arm the timer),
-/// so ping once more immediately to take the volume back; otherwise every
-/// volume write until the next ping fails with EINVAL against the safe limit.
-fn ping_lock(card: &Card, last_ping: &mut Instant) -> Result<(), Box<dyn std::error::Error>> {
-    match card.ping() {
-        Ok(()) => {}
-        Err(e) if e.raw_os_error() == Some(libc::ETIMEDOUT) => {
-            warn!("the card locked the volume while we were away; taking it back");
-            card.ping().map_err(|e| format!("lock ping: {e}"))?;
+impl Hw for RealHw {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+    fn boottime(&self) -> Duration {
+        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        // SAFETY: a valid, writable timespec.
+        unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts) };
+        Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+    }
+    fn sleep(&mut self, d: Duration) {
+        thread::sleep(d)
+    }
+    fn take_lock(&mut self) -> std::io::Result<()> {
+        self.card.take_lock()
+    }
+    fn ping(&mut self) -> std::io::Result<()> {
+        self.card.ping()
+    }
+    fn set_reduction(&mut self, db: f64) -> std::io::Result<()> {
+        self.card.write_reduction(db)
+    }
+    fn sample_rate(&mut self) -> std::io::Result<i64> {
+        self.card.ctl.read_int(&self.card.sample_rate)
+    }
+    fn open_sense(&mut self, rate: u32) -> std::io::Result<()> {
+        let g = &self.globals;
+        self.capture = Some(Capture::open(self.card.ctl.card, g.sense_pcm, g.channels, rate, g.period)?);
+        Ok(())
+    }
+    fn close_sense(&mut self) {
+        self.capture = None;
+    }
+    fn read_period(&mut self, words: &mut [i32]) -> std::io::Result<Option<bool>> {
+        match self.capture.as_mut() {
+            Some(c) => c.read_period(words),
+            None => Err(std::io::Error::from_raw_os_error(libc::EBADFD)),
         }
-        Err(e) => return Err(format!("lock ping: {e}").into()),
     }
-    *last_ping = Instant::now();
-    Ok(())
 }
 
 fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
-    let (card, card_name) = {
-        // the model file is named after the card: AppleJ700 -> apple/j700.conf
-        let (ctl, name) = find_card(args.card.as_deref())?;
-        drop(ctl);
-        let model = name.strip_prefix("Apple").unwrap_or(&name).to_lowercase();
-        let path = args.config_path.join("apple").join(format!("{model}.conf"));
-        let cfg = Config::load(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-        info!("{}: {} speakers, sense PCM {}, period {} frames", path.display(), cfg.speakers.len(), cfg.globals.sense_pcm, cfg.globals.period);
-        let (card, name) = Card::open(Some(&name), &cfg)?;
-        ((card, cfg), name)
-    };
-    let (mut card, cfg) = card;
-    let globals = cfg.globals.clone();
-    let mut speakers: Vec<SpeakerState> = cfg.speakers.iter().map(|s| SpeakerState::new(s.clone(), globals.t_ambient)).collect();
-
-    card.take_lock()?;
-    card.set_reduction(0.0)?;
-    info!("{card_name}: volume lock taken, {} volume control(s), max {}", card.volume.len(), card.volume_max);
-
-    let mut sense: Option<Sense> = None;
-    let mut words = vec![0i32; globals.period * globals.channels];
-    let mut last_ping = Instant::now();
-    let mut last_log = Instant::now();
-    let mut applied = 0.0f64;
-    let mut control_failures = 0u32;
+    // the model file is named after the card: AppleJ700 -> apple/j700.conf
+    let (ctl, name) = find_card(args.card.as_deref())?;
+    drop(ctl);
+    let model = name.strip_prefix("Apple").unwrap_or(&name).to_lowercase();
+    let path = args.config_path.join("apple").join(format!("{model}.conf"));
+    let cfg = Config::load(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    info!("{}: {} speakers, sense PCM {}, period {} frames", path.display(), cfg.speakers.len(), cfg.globals.sense_pcm, cfg.globals.period);
+    let (card, card_name) = Card::open(Some(&name), &cfg)?;
+    let mut hw = RealHw { card, globals: cfg.globals.clone(), capture: None };
+    let mut guard = Guard::start(&mut hw, &cfg, args.max_reduction, args.state.clone())?;
+    info!("{card_name}: volume lock taken, {} volume control(s), max {}", hw.card.volume.len(), hw.card.volume_max);
     loop {
-        // playback state: the card reports the speakers' sample rate, 0 when closed
-        let rate = match card.ctl.read_int(&card.sample_rate) {
-            Ok(v) => {
-                control_failures = 0;
-                v as u32
-            }
-            Err(e) if transient(&e) && control_failures < MAX_CONTROL_FAILURES => {
-                control_failures += 1;
-                warn!("sample-rate control: {e}; retrying ({control_failures})");
-                card.ping()?;
-                thread::sleep(PING_INTERVAL);
-                continue;
-            }
-            Err(e) => return Err(format!("sample-rate control: {e}").into()),
-        };
-        if rate == 0 {
-            if sense.take().is_some() {
-                info!("speakers closed");
-            }
-            // cool down with no power, keep the lock alive
-            for s in speakers.iter_mut() {
-                s.step(0.0, PING_INTERVAL.as_secs_f64(), globals.t_ambient);
-                s.govern(&globals);
-            }
-            if let Err(e) = card.set_reduction(model::reduction_db(&speakers)) {
-                if !transient(&e) || control_failures >= MAX_CONTROL_FAILURES {
-                    return Err(format!("volume control: {e}").into());
-                }
-                control_failures += 1;
-                warn!("volume control: {e}; retrying ({control_failures})");
-            }
-            ping_lock(&card, &mut last_ping)?;
-            thread::sleep(PING_INTERVAL);
-            continue;
-        }
-        if sense.is_none() {
-            match Capture::open(card.ctl.card, globals.sense_pcm, globals.channels, rate, globals.period) {
-                Ok(capture) => {
-                    info!("speakers open at {rate} Hz, sense capture running");
-                    sense = Some(Sense { capture, stall: StallClock::default() });
-                }
-                Err(e) => {
-                    warn!("sense PCM: {e}; retrying");
-                    card.ping()?;
-                    thread::sleep(PING_INTERVAL);
-                    continue;
-                }
-            }
-        }
-        let s = sense.as_mut().unwrap();
-        let dt = globals.period as f64 / rate as f64;
-        // The sense stream dies with the speaker back-end whenever playback is
-        // torn down and rebuilt (EINVAL/EBADFD/EPIPE...).  That is not our
-        // failure: drop the capture, keep the lock, and reopen once the card
-        // reports a rate again.  Exiting here is what the listener heard as a
-        // one-second dip to the safe level at high volume.
-        let valid = match s.capture.read_period(&mut words) {
-            Ok(Some(v)) => {
-                s.stall.data();
-                v
-            }
-            Ok(None) => {
-                // No sense data within one ping interval.  Keep the lock alive
-                // first; only a stream silent for a whole STALL_TIMEOUT is
-                // dropped and reopened.
-                let stalled = s.stall.silent(Instant::now());
-                ping_lock(&card, &mut last_ping)?;
-                if stalled {
-                    warn!("sense stream stalled for {} ms; reopening", STALL_TIMEOUT.as_millis());
-                    sense = None;
-                }
-                continue;
-            }
-            Err(e) if transient(&e) => {
-                warn!("sense capture: {e}; reopening");
-                sense = None;
-                ping_lock(&card, &mut last_ping)?;
-                thread::sleep(PING_INTERVAL);
-                continue;
-            }
-            Err(e) => return Err(format!("sense capture: {e}").into()),
-        };
-        if !valid {
-            warn!("sense overrun, step skipped");
-        } else {
-            for s in speakers.iter_mut() {
-                let v = s.v_rms_of(&words, globals.channels);
-                s.v_rms = v;
-                let power = v * v / s.spec.z_nominal;
-                s.step(power, dt, globals.t_ambient);
-                s.govern(&globals);
-            }
-        }
-        let reduction = model::reduction_db(&speakers);
-        if reduction >= args.max_reduction {
-            error!("gain reduction {reduction:.1} dB reached the limit; leaving the card locked");
-            return Err("maximum reduction reached".into());
-        }
-        if (reduction - applied).abs() >= 0.5 {
-            info!("gain reduction {reduction:.1} dB");
-            applied = reduction;
-        }
-        match card.set_reduction(reduction) {
-            Ok(()) => control_failures = 0,
-            Err(e) if transient(&e) && control_failures < MAX_CONTROL_FAILURES => {
-                control_failures += 1;
-                warn!("volume control: {e}; retrying ({control_failures})");
-            }
-            Err(e) => return Err(format!("volume control: {e}").into()),
-        }
-        if last_ping.elapsed() >= PING_INTERVAL {
-            ping_lock(&card, &mut last_ping)?;
-        }
-        if last_log.elapsed() >= LOG_INTERVAL {
-            for s in &speakers {
-                debug!("{}: {:.3} Vrms {:.1} mW coil {:.1} C magnet {:.1} C reduction {:.1} dB", s.spec.name, s.v_rms, s.power * 1000.0, s.t_coil, s.t_magnet, s.reduction_db);
-            }
-            last_log = Instant::now();
+        if let Err(e) = guard.tick(&mut hw) {
+            // the next run starts from where this model was
+            guard.save(&hw);
+            return Err(e);
         }
     }
 }
 
 fn main() -> ExitCode {
     let args = parse_args();
-    // SAFETY: single-threaded at this point.
-    unsafe { VERBOSITY = args.verbosity };
+    log::set_verbosity(args.verbosity);
     match run(&args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             error!("{e}");
             ExitCode::FAILURE
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const POLL: Duration = Duration::from_millis(50);
-
-    #[test]
-    fn a_silent_stream_stalls_after_the_timeout() {
-        let t0 = Instant::now();
-        let mut clock = StallClock::default();
-        let mut t = t0;
-        while t < t0 + STALL_TIMEOUT {
-            assert!(!clock.silent(t), "stalled after {:?}", t - t0);
-            t += POLL;
-        }
-        assert!(clock.silent(t0 + STALL_TIMEOUT));
-    }
-
-    #[test]
-    fn data_restarts_the_clock() {
-        let t0 = Instant::now();
-        let mut clock = StallClock::default();
-        assert!(!clock.silent(t0));
-        assert!(!clock.silent(t0 + STALL_TIMEOUT - POLL));
-        clock.data();
-        let t1 = t0 + STALL_TIMEOUT + POLL;
-        assert!(!clock.silent(t1));
-        assert!(!clock.silent(t1 + STALL_TIMEOUT - POLL));
-        assert!(clock.silent(t1 + STALL_TIMEOUT));
-    }
-
-    /// The sequence the J700 showed: a stream closed during an empty wait,
-    /// and the next one opened minutes later.  Its first empty wait comes
-    /// 50 ms after the open, before the first period (85 ms at 48 kHz).
-    #[test]
-    fn a_new_capture_gets_its_whole_timeout() {
-        let t0 = Instant::now();
-        let mut old = StallClock::default();
-        assert!(!old.silent(t0));
-
-        let open = t0 + Duration::from_secs(360);
-        let mut clock = StallClock::default();
-        assert!(!clock.silent(open + POLL));
-        assert!(!clock.silent(open + STALL_TIMEOUT));
-        assert!(clock.silent(open + POLL + STALL_TIMEOUT));
     }
 }

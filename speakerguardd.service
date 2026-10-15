@@ -1,14 +1,20 @@
 [Unit]
 Description=Speaker Protection Daemon (feed-forward)
+# Restarts are safe: until the daemon renews the card's volume lock the
+# speakers sit at the card's safe level, and a restarted daemon resumes the
+# previous run's thermal model from /run/speakerguardd/state.  A crash loop
+# gives up after five attempts and leaves the speakers at that level.
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
 ExecStart=/usr/bin/speakerguardd -c /usr/share/speakerguardd
 UMask=0066
+RuntimeDirectory=speakerguardd
+RuntimeDirectoryPreserve=yes
 Restart=on-failure
 RestartSec=1
-StartLimitInterval=60
-StartLimitBurst=10
 
 [Install]
 WantedBy=multi-user.target
