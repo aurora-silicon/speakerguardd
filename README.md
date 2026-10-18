@@ -108,6 +108,34 @@ The binary talks to the ALSA kernel interface directly (no alsa-lib).
 installs the binary, `conf/apple/*.conf`, the systemd unit and the udev
 rule that starts it when a supported card's sense PCM appears.
 
+The PCM udev event and `multi-user.target` can both precede ALSA card
+discovery. The daemon retries a missing card for up to 30 seconds, using a
+monotonic deadline and 100 ms polling, before returning the discovery error.
+This happens before loading the model or taking the interlock: the kernel
+keeps the speakers at its safe level throughout the wait. Other discovery
+errors (including permission and ioctl failures) still fail immediately.
+`Restart=on-failure` and the saved thermal state remain in effect.
+
+The unit explicitly passes `--wait-for-card 30`; 30 seconds is also the
+binary's default for existing packaged units and manual starts. Override
+`--wait-for-card <SECONDS>` to change the bound, or use `0` for a single
+discovery attempt. A card that never appears still causes a failed start;
+this does not bypass any protection check.
+
+### Testing startup
+
+On Linux, `cargo test --locked` includes simulated discovery deadlines and
+the guard's existing fail-safe tests. The discovery tests also run without
+Linux or audio devices:
+
+    rustc --edition=2021 --test src/startup.rs -o /tmp/speakerguardd-startup-tests
+    /tmp/speakerguardd-startup-tests
+    python3 -m unittest discover -s tests -p 'test_*.py'
+
+For the Neo, see [the three-reboot procedure](tests/neo-three-boots.md).
+Its collector only reads service, journal, package and state information;
+it never plays audio or performs a reboot.
+
 ### Running by hand
 
     speakerguardd -c /usr/share/speakerguardd -v

@@ -18,6 +18,7 @@ mod config;
 mod guard;
 mod log;
 mod model;
+mod startup;
 mod state;
 
 use std::path::PathBuf;
@@ -40,6 +41,7 @@ struct Args {
     config_path: PathBuf,
     max_reduction: f64,
     card: Option<String>,
+    card_wait: Duration,
     state: Option<PathBuf>,
     verbosity: Level,
 }
@@ -50,6 +52,7 @@ fn usage() -> ! {
          Options:\n  \
          -c, --config-path <DIR>         Directory holding <vendor>/<model>.conf\n  \
          -C, --card <ID>                 ALSA card id (default: the first Apple* card)\n  \
+         --wait-for-card <SECONDS>       Wait for card discovery before failing (default 30; 0 disables waiting)\n  \
          -m, --max-reduction <DB>        Gain reduction beyond which the card's safe level takes over (default 20)\n  \
          -s, --state <FILE>              Model state kept across restarts (default /run/speakerguardd/state)\n  \
          -v, --verbose                   More logging (repeatable)\n  \
@@ -60,12 +63,13 @@ fn usage() -> ! {
 }
 
 fn parse_args() -> Args {
-    let mut args = Args { config_path: PathBuf::from("/usr/share/speakerguardd"), max_reduction: 20.0, card: None, state: Some(PathBuf::from("/run/speakerguardd/state")), verbosity: Level::Info };
+    let mut args = Args { config_path: PathBuf::from("/usr/share/speakerguardd"), max_reduction: 20.0, card: None, card_wait: Duration::from_secs(30), state: Some(PathBuf::from("/run/speakerguardd/state")), verbosity: Level::Info };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
             "-c" | "--config-path" => args.config_path = PathBuf::from(it.next().unwrap_or_else(|| usage())),
             "-C" | "--card" => args.card = Some(it.next().unwrap_or_else(|| usage())),
+            "--wait-for-card" => args.card_wait = Duration::from_secs(it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage())),
             "-s" | "--state" => {
                 let v = it.next().unwrap_or_else(|| usage());
                 args.state = if v.is_empty() { None } else { Some(PathBuf::from(v)) };
@@ -193,7 +197,19 @@ impl Hw for RealHw {
 
 fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     // the model file is named after the card: AppleJ700 -> apple/j700.conf
-    let (ctl, name) = find_card(args.card.as_deref())?;
+    // Discovery only: no controls are locked or written until it succeeds,
+    // the configuration is loaded and Guard::start takes the interlock.
+    let mut waiting = false;
+    let (ctl, name) = startup::wait_for_card(args.card_wait, || {
+        let result = find_card(args.card.as_deref());
+        if !waiting && args.card_wait > Duration::ZERO
+            && result.as_ref().is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+        {
+            info!("waiting up to {} s for sound card {}", args.card_wait.as_secs(), args.card.as_deref().unwrap_or("AppleJ*"));
+            waiting = true;
+        }
+        result
+    })?;
     drop(ctl);
     let model = name.strip_prefix("Apple").unwrap_or(&name).to_lowercase();
     let path = args.config_path.join("apple").join(format!("{model}.conf"));
