@@ -307,13 +307,80 @@ const PCM_IOCTL_START: libc::c_ulong = io(b'A', 0x42);
 const PCM_IOCTL_DROP: libc::c_ulong = io(b'A', 0x43);
 const PCM_IOCTL_READI_FRAMES: libc::c_ulong = ior::<Xferi>(b'A', 0x51);
 
-/// An interleaved S32_LE capture stream with fixed period geometry.
-pub struct Capture {
+/// The four calls the period reader makes on a capture PCM, so that its
+/// read discipline can be checked against a simulated kernel.
+pub trait PcmIo {
+    fn start(&mut self) -> io::Result<()>;
+    fn prepare(&mut self) -> io::Result<()>;
+    /// READI_FRAMES on the non-blocking file: the frames transferred, which
+    /// may be fewer than asked for; EAGAIN when none are available.
+    fn readi(&mut self, buf: &mut [i32], frames: usize) -> io::Result<i64>;
+    /// poll(POLLIN) for at most `timeout_ms`.  True when the kernel reports
+    /// the stream readable (a whole period available, or an error state).
+    fn wait(&mut self, timeout_ms: libc::c_int) -> io::Result<bool>;
+}
+
+/// The capture PCM file itself.
+pub struct PcmFile {
     file: File,
+}
+
+impl PcmIo for PcmFile {
+    fn start(&mut self) -> io::Result<()> {
+        ioctl(&self.file, PCM_IOCTL_START, std::ptr::null_mut::<u8>()).map(|_| ())
+    }
+
+    fn prepare(&mut self) -> io::Result<()> {
+        ioctl(&self.file, PCM_IOCTL_PREPARE, std::ptr::null_mut::<u8>()).map(|_| ())
+    }
+
+    fn readi(&mut self, buf: &mut [i32], frames: usize) -> io::Result<i64> {
+        let mut xfer = Xferi { result: 0, buf: buf.as_mut_ptr().cast(), frames: frames as u64 };
+        ioctl(&self.file, PCM_IOCTL_READI_FRAMES, &mut xfer)?;
+        Ok(xfer.result)
+    }
+
+    fn wait(&mut self, timeout_ms: libc::c_int) -> io::Result<bool> {
+        let mut pfd = libc::pollfd { fd: self.file.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        // SAFETY: one initialised pollfd, count 1.
+        let ret = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        if ret < 0 {
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EINTR) {
+                return Ok(false);
+            }
+            return Err(e);
+        }
+        Ok(ret != 0)
+    }
+}
+
+impl Drop for PcmFile {
+    fn drop(&mut self) {
+        let _ = ioctl(&self.file, PCM_IOCTL_DROP, std::ptr::null_mut::<u8>());
+    }
+}
+
+/// Reads whole sense periods from a non-blocking capture.
+///
+/// A READI on a non-blocking PCM transfers whatever the DMA has written so
+/// far, and the kernel refreshes the hardware pointer for it, so with a
+/// fine-grained pointer (the J700's ADMAC reports its residue) a read made
+/// before a whole period is there comes back short.  The reader therefore
+/// never reads on spec: it waits until poll() reports the stream readable,
+/// which for a running capture means at least `avail_min`, one period, is
+/// available, and only then reads a period.  Reading first and polling
+/// second takes whatever arrived during the last 50 ms wait, keeps the
+/// buffer below a period for good, and no read is ever complete again.
+pub struct PeriodReader<P: PcmIo> {
+    io: P,
     pub channels: usize,
     pub period: usize,
     started: bool,
 }
+
+/// An interleaved S32_LE capture stream with fixed period geometry.
+pub type Capture = PeriodReader<PcmFile>;
 
 impl Capture {
     pub fn open(card: u32, device: u32, channels: usize, rate: u32, period: usize) -> io::Result<Capture> {
@@ -352,6 +419,8 @@ impl Capture {
         let mut sw: SwParams = unsafe { std::mem::zeroed() };
         sw.tstamp_mode = 0;
         sw.period_step = 1;
+        // poll() reports the stream readable once a whole period is there;
+        // the reader relies on it (see PeriodReader).
         sw.avail_min = period as u64;
         sw.xfer_align = 1;
         sw.start_threshold = 1;
@@ -360,70 +429,56 @@ impl Capture {
         sw.silence_size = 0;
         sw.boundary = (period * 4) as u64 * (1 << 20);
         ioctl(&file, PCM_IOCTL_SW_PARAMS, &mut sw)?;
-        ioctl(&file, PCM_IOCTL_PREPARE, std::ptr::null_mut::<u8>())?;
-        Ok(Capture { file, channels, period, started: false })
+        let mut io = PcmFile { file };
+        io.prepare()?;
+        Ok(PeriodReader::new(io, channels, period))
+    }
+}
+
+impl<P: PcmIo> PeriodReader<P> {
+    pub fn new(io: P, channels: usize, period: usize) -> PeriodReader<P> {
+        PeriodReader { io, channels, period, started: false }
     }
 
-    /// One period of frames into `buf` (period * channels words).  An overrun
-    /// is recovered transparently (the stream is re-prepared) and reported as
-    /// Ok(false) so the caller can discard the model step.
-    /// Reads one sense period.  `Ok(Some(true))` is a valid period,
-    /// `Ok(Some(false))` a short period or recovered overrun (discarded),
-    /// `Ok(None)` nothing arrived within one ping interval: the caller must
-    /// ping the lock and call again, because the card locks the volume 250 ms
-    /// after the last ping and nothing may block longer than that.
+    #[cfg(test)]
+    pub fn io(&mut self) -> &mut P {
+        &mut self.io
+    }
+
+    /// Reads one sense period into `buf` (period * channels words).
+    /// `Ok(Some(true))` is a valid period, `Ok(Some(false))` a short
+    /// transfer or a recovered overrun (discarded; the stream is
+    /// re-prepared after an overrun), `Ok(None)` no whole period within one
+    /// ping interval: the caller must ping the lock and call again, because
+    /// the card locks the volume 250 ms after the last ping and nothing may
+    /// block longer than that.
     pub fn read_period(&mut self, buf: &mut [i32]) -> io::Result<Option<bool>> {
         assert!(buf.len() >= self.period * self.channels);
         if !self.started {
-            ioctl(&self.file, PCM_IOCTL_START, std::ptr::null_mut::<u8>())?;
+            self.io.start()?;
             self.started = true;
         }
-        let mut xfer = Xferi { result: 0, buf: buf.as_mut_ptr().cast(), frames: self.period as u64 };
-        loop {
-            match ioctl(&self.file, PCM_IOCTL_READI_FRAMES, &mut xfer) {
-                Ok(_) => return Ok(Some(full_period(xfer.result, self.period)?)),
-                Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => {
-                    if !self.wait_frames()? {
-                        return Ok(None);
-                    }
-                }
-                Err(e) if e.raw_os_error() == Some(libc::EPIPE) => {
-                    ioctl(&self.file, PCM_IOCTL_PREPARE, std::ptr::null_mut::<u8>())?;
-                    self.started = false;
-                    return Ok(Some(false));
-                }
-                Err(e) => return Err(e),
-            }
+        // Wait first: a read is only issued once a whole period is there.
+        if !self.io.wait(PERIOD_WAIT_MS)? {
+            return Ok(None);
         }
-    }
-
-    /// Waits for the next period for at most one ping interval.  `Ok(false)`
-    /// means nothing arrived in time; the caller decides when a stream that
-    /// keeps saying so is stalled.
-    fn wait_frames(&self) -> io::Result<bool> {
-        let mut pfd = libc::pollfd { fd: self.file.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-        // SAFETY: one initialised pollfd, count 1.
-        let ret = unsafe { libc::poll(&mut pfd, 1, PERIOD_WAIT_MS) };
-        if ret < 0 {
-            let e = io::Error::last_os_error();
-            if e.raw_os_error() == Some(libc::EINTR) {
-                return Ok(false);
+        match self.io.readi(buf, self.period) {
+            Ok(frames) => Ok(Some(full_period(frames, self.period)?)),
+            // readable but empty: a spurious wakeup
+            Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => Ok(None),
+            Err(e) if e.raw_os_error() == Some(libc::EPIPE) => {
+                self.io.prepare()?;
+                self.started = false;
+                Ok(Some(false))
             }
-            return Err(e);
+            Err(e) => Err(e),
         }
-        Ok(ret != 0)
     }
 }
 
 /// Longest single wait for sense data: well inside the card's 250 ms lock
 /// timeout, so the lock ping between waits is never late.
 const PERIOD_WAIT_MS: libc::c_int = 50;
-
-impl Drop for Capture {
-    fn drop(&mut self) {
-        let _ = ioctl(&self.file, PCM_IOCTL_DROP, std::ptr::null_mut::<u8>());
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -485,5 +540,259 @@ mod transfer_tests {
                 .raw_os_error(),
             Some(libc::EPIPE)
         );
+    }
+}
+
+#[cfg(test)]
+pub mod sim {
+    //! A capture PCM as the ALSA core runs one, on a virtual clock: the DMA
+    //! writes frames continuously (its pointer is `granule` frames fine), a
+    //! period interrupt every `period` frames refreshes the pointer that
+    //! poll() looks at, READI refreshes it itself and transfers what is
+    //! there, and `stop` unread frames are an overrun.
+    use super::*;
+    use std::rc::Rc;
+    use std::time::Duration;
+
+    const STEP: Duration = Duration::from_micros(500);
+
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum State {
+        Prepared,
+        Running,
+        Xrun,
+    }
+
+    pub struct SimPcm {
+        pub t: Duration,
+        rate: f64,
+        period: u64,
+        stop: u64,
+        granule: u64,
+        /// Fraction of the nominal rate the DMA delivers at time t (0 = stalled).
+        flow: Rc<dyn Fn(Duration) -> f64>,
+        state: State,
+        written: f64,
+        hw: u64,
+        irq_hw: u64,
+        next_irq: u64,
+        appl: u64,
+        channels: usize,
+        /// The sample word the next transfer carries.
+        pub word: i32,
+        pub short_reads: u32,
+        pub overruns: u32,
+    }
+
+    impl SimPcm {
+        pub fn new(rate: u32, channels: usize, period: usize, granule: usize, flow: Rc<dyn Fn(Duration) -> f64>, t: Duration) -> SimPcm {
+            let mut s = SimPcm {
+                t,
+                rate: rate as f64,
+                period: period as u64,
+                stop: 4 * period as u64,
+                granule: granule.max(1) as u64,
+                flow,
+                state: State::Prepared,
+                written: 0.0,
+                hw: 0,
+                irq_hw: 0,
+                next_irq: 0,
+                appl: 0,
+                channels,
+                word: 0,
+                short_reads: 0,
+                overruns: 0,
+            };
+            s.reset();
+            s
+        }
+
+        fn reset(&mut self) {
+            self.state = State::Prepared;
+            self.written = 0.0;
+            self.hw = 0;
+            self.irq_hw = 0;
+            self.appl = 0;
+            self.next_irq = self.period;
+        }
+
+        /// Runs the DMA up to `t`.
+        pub fn advance_to(&mut self, t: Duration) {
+            while self.t < t {
+                let dt = STEP.min(t - self.t);
+                if self.state == State::Running {
+                    self.written += self.rate * (self.flow)(self.t).clamp(0.0, 1.0) * dt.as_secs_f64();
+                    let hw = (self.written as u64 / self.granule) * self.granule;
+                    self.hw = hw;
+                    while self.hw >= self.next_irq {
+                        // the period interrupt: snd_pcm_period_elapsed()
+                        self.irq_hw = self.hw;
+                        self.next_irq += self.period;
+                    }
+                    if self.hw - self.appl >= self.stop {
+                        self.state = State::Xrun;
+                        self.overruns += 1;
+                    }
+                }
+                self.t += dt;
+            }
+        }
+    }
+
+    impl PcmIo for SimPcm {
+        fn start(&mut self) -> io::Result<()> {
+            if self.state != State::Prepared {
+                return Err(io::Error::from_raw_os_error(libc::EBADFD));
+            }
+            self.state = State::Running;
+            Ok(())
+        }
+        fn prepare(&mut self) -> io::Result<()> {
+            self.reset();
+            Ok(())
+        }
+        fn readi(&mut self, buf: &mut [i32], frames: usize) -> io::Result<i64> {
+            match self.state {
+                State::Xrun => return Err(io::Error::from_raw_os_error(libc::EPIPE)),
+                State::Prepared => return Err(io::Error::from_raw_os_error(libc::EAGAIN)),
+                State::Running => {}
+            }
+            // __snd_pcm_lib_xfer: hwsync, then whatever is available
+            self.irq_hw = self.hw;
+            let avail = self.hw - self.appl;
+            if avail == 0 {
+                return Err(io::Error::from_raw_os_error(libc::EAGAIN));
+            }
+            let n = avail.min(frames as u64);
+            for (i, w) in buf[..n as usize * self.channels].iter_mut().enumerate() {
+                let frame = (self.appl + (i / self.channels) as u64) % 2;
+                *w = if frame == 0 { self.word } else { -self.word };
+            }
+            self.appl += n;
+            if n < frames as u64 {
+                self.short_reads += 1;
+            }
+            Ok(n as i64)
+        }
+        fn wait(&mut self, timeout_ms: libc::c_int) -> io::Result<bool> {
+            let deadline = self.t + Duration::from_millis(timeout_ms as u64);
+            loop {
+                // snd_pcm_poll: the pointer as of the last interrupt or read
+                let ready = match self.state {
+                    State::Running | State::Prepared => self.irq_hw - self.appl >= self.period,
+                    State::Xrun => true,
+                };
+                if ready {
+                    return Ok(true);
+                }
+                if self.t >= deadline {
+                    return Ok(false);
+                }
+                let next = (self.t + STEP).min(deadline);
+                self.advance_to(next);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod reader_tests {
+    use super::sim::SimPcm;
+    use super::*;
+    use std::rc::Rc;
+    use std::time::Duration;
+
+    const P: usize = 4096;
+
+    fn reader(granule: usize, flow: Rc<dyn Fn(Duration) -> f64>) -> PeriodReader<SimPcm> {
+        PeriodReader::new(SimPcm::new(48000, 2, P, granule, flow, Duration::ZERO), 2, P)
+    }
+
+    /// (complete, short or overrun, empty waits) over `secs` of reading,
+    /// with `work` of processing between reads.
+    fn run(r: &mut PeriodReader<SimPcm>, secs: f64, work: Duration) -> (u32, u32, u32) {
+        let mut buf = vec![0i32; P * 2];
+        let (mut ok, mut bad, mut none) = (0, 0, 0);
+        while r.io().t < Duration::from_secs_f64(secs) {
+            match r.read_period(&mut buf).unwrap() {
+                Some(true) => ok += 1,
+                Some(false) => bad += 1,
+                None => none += 1,
+            }
+            let t = r.io().t + work;
+            r.io().advance_to(t);
+        }
+        (ok, bad, none)
+    }
+
+    /// The J700 sense PCM reports a DMA-precise pointer.  Every period must
+    /// come back whole, at the stream's own rate.
+    #[test]
+    fn a_fine_grained_pointer_gives_only_complete_periods() {
+        for granule in [1, 32, 480, 1024, P] {
+            let mut r = reader(granule, Rc::new(|_| 1.0));
+            let (ok, bad, _) = run(&mut r, 10.0, Duration::from_millis(2));
+            assert_eq!(bad, 0, "granule {granule}");
+            assert_eq!(r.io().short_reads, 0, "granule {granule}");
+            // 10 s at 48 kHz is 117 periods
+            assert!((116..=118).contains(&ok), "granule {granule}: {ok} periods");
+        }
+    }
+
+    /// The PR #2 regression, reproduced: reading before waiting takes what
+    /// the last 50 ms wait let in, short of a period, and from then on the
+    /// buffer never holds a whole one again, although sense data keeps
+    /// flowing at the full rate.  This is the read discipline the reader
+    /// must not have.
+    #[test]
+    fn reading_before_waiting_never_completes_a_period() {
+        let mut pcm = SimPcm::new(48000, 2, P, 32, Rc::new(|_| 1.0), Duration::ZERO);
+        pcm.start().unwrap();
+        let mut buf = vec![0i32; P * 2];
+        let (mut ok, mut short) = (0, 0);
+        while pcm.t < Duration::from_secs(5) {
+            match pcm.readi(&mut buf, P) {
+                Ok(n) if n as usize == P => ok += 1,
+                Ok(_) => short += 1,
+                Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => {
+                    pcm.wait(PERIOD_WAIT_MS).unwrap();
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+        assert_eq!(ok, 0);
+        assert!(short > 50, "{short}");
+    }
+
+    /// A daemon that falls a whole buffer behind gets one overrun, reported
+    /// as an incomplete period, and complete periods right after it.
+    #[test]
+    fn an_overrun_is_reported_once_and_the_stream_resumes() {
+        let mut r = reader(32, Rc::new(|_| 1.0));
+        let (ok, bad, _) = run(&mut r, 1.0, Duration::ZERO);
+        assert!(ok >= 10 && bad == 0);
+        let t = r.io().t + Duration::from_millis(400); // > 4 periods (341 ms)
+        r.io().advance_to(t);
+        let mut buf = vec![0i32; P * 2];
+        assert_eq!(r.read_period(&mut buf).unwrap(), Some(false));
+        assert_eq!(r.io().overruns, 1);
+        let from = r.io().t;
+        let (ok, bad, _) = run(&mut r, 3.0, Duration::ZERO);
+        assert_eq!(bad, 0);
+        let due = ((Duration::from_secs(3) - from).as_secs_f64() * 48000.0 / P as f64) as u32;
+        assert!(ok + 1 >= due, "{ok} of {due} periods");
+    }
+
+    /// No data, no period: a stalled DMA only ever gives empty waits, and a
+    /// stream at a tenth of its rate gives a period a tenth as often.
+    #[test]
+    fn a_stalled_or_slow_stream_gives_no_extra_periods() {
+        let mut r = reader(32, Rc::new(|_| 0.0));
+        assert_eq!(run(&mut r, 2.0, Duration::ZERO), (0, 0, 40));
+        let mut r = reader(32, Rc::new(|_| 0.1));
+        let (ok, bad, _) = run(&mut r, 10.0, Duration::ZERO);
+        assert_eq!(bad, 0);
+        assert!((11..=12).contains(&ok), "{ok}");
     }
 }
