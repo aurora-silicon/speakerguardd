@@ -85,6 +85,35 @@ impl SpeakerState {
         self.t_coil += (coil_target - self.t_coil) * k_coil;
     }
 
+    /// The most power the coil can take while the card's gain is
+    /// `-reduction_db`: a full-scale square wave (V rms = V peak) into the
+    /// coil resistance.  Time the daemon could not measure is charged at it.
+    pub fn worst_case_power(&self, reduction_db: f64) -> f64 {
+        let v = self.spec.vs_scale * 10f64.powf(-reduction_db.max(0.0) / 20.0);
+        v * v / self.spec.z_nominal
+    }
+
+    /// Start as hot as the governor lets the coil run: at the working
+    /// limit, the magnet where steady state would put it.  Used when the
+    /// previous run's state is unreadable.
+    pub fn assume_hot(&mut self, t_ambient: f64) {
+        let s = &self.spec;
+        self.t_coil = s.t_limit - s.t_headroom;
+        self.t_magnet = t_ambient + (self.t_coil - t_ambient) * s.tr_magnet / (s.tr_magnet + s.tr_coil);
+    }
+
+    /// Continue from a saved state: temperatures and the power history's
+    /// last second and minute.
+    pub fn resume(&mut self, t_coil: f64, t_magnet: f64, mean_1s: f64, mean_60s: f64) {
+        self.t_coil = t_coil;
+        self.t_magnet = t_magnet;
+        self.history.clear();
+        let earlier = ((60.0 * mean_60s - mean_1s) / 59.0).max(0.0);
+        self.history.push_back((59.0, earlier));
+        self.history.push_back((1.0, mean_1s));
+        self.history_s = 60.0;
+    }
+
     /// Mean power over the last `seconds` (W); time before the first step
     /// counts as silence.
     pub fn mean_power(&self, seconds: f64) -> f64 {
@@ -114,6 +143,22 @@ impl SpeakerState {
             }
         }
         db
+    }
+
+    /// Overflow must be rejected before a period renews the sensing permit.
+    pub fn finite(&self) -> bool {
+        [
+            self.t_coil,
+            self.t_magnet,
+            self.power,
+            self.v_rms,
+            self.reduction_db,
+            self.history_s,
+            self.mean_power(1.0),
+            self.mean_power(60.0),
+        ]
+        .iter()
+        .all(|v| v.is_finite())
     }
 
     /// Governor: the reduction (dB) that keeps the coil inside the window
@@ -172,7 +217,7 @@ mod tests {
     }
 
     fn globals() -> Globals {
-        Globals { sense_pcm: 2, t_ambient: 35.0, t_hysteresis: 5.0, t_window: 20.0, channels: 2, period: 4096, t_reduction_max: 20.0 }
+        Globals { sense_pcm: 2, t_ambient: 35.0, t_hysteresis: 5.0, t_window: 20.0, channels: 2, period: 4096, t_reduction_max: 20.0, safe_reduction: 20.0 }
     }
 
     #[test]
@@ -286,5 +331,42 @@ mod tests {
         }
         assert!((s.mean_power(60.0) - 2.6).abs() < 0.01);
         assert!(s.budget_reduction() > 0.1);
+    }
+    #[test]
+    fn finite_guard_rejects_overflow_before_governor_or_renewal() {
+        let mut s = SpeakerState::new(spec(), 35.0);
+        s.step(f64::MAX, 0.1, 35.0);
+        assert!(!s.finite());
+        let mut s = SpeakerState::new(spec(), 35.0);
+        s.v_rms = f64::NAN;
+        assert!(!s.finite());
+        let mut s = SpeakerState::new(spec(), 35.0);
+        s.history.push_back((1.0, f64::MAX));
+        s.history.push_back((1.0, f64::MAX));
+        assert!(!s.finite());
+    }
+
+    #[test]
+    fn silence_and_negative_waveform_samples_are_valid() {
+        let s = SpeakerState::new(spec(), 35.0);
+        assert_eq!(s.v_rms_of(&[0; 8], 2), 0.0);
+        let rms = s.v_rms_of(&[i32::MIN, 0, i32::MAX, 0], 2);
+        assert!(rms.is_finite() && rms > 0.0);
+        let mut s = s;
+        s.step(0.0, 0.1, 35.0);
+        s.govern(&globals());
+        assert!(s.finite());
+    }
+
+    #[test]
+    fn worst_case_power_is_a_full_scale_square_wave_at_the_card_gain() {
+        let mut sp = spec();
+        sp.vs_scale = 7.3;
+        sp.z_nominal = 4.2;
+        let s = SpeakerState::new(sp, 35.0);
+        assert!((s.worst_case_power(0.0) - 7.3 * 7.3 / 4.2).abs() < 1e-9);
+        assert!((s.worst_case_power(20.0) - 0.073 * 7.3 / 4.2).abs() < 1e-9);
+        // a negative reduction cannot raise the card above its full scale
+        assert_eq!(s.worst_case_power(-6.0), s.worst_case_power(0.0));
     }
 }
