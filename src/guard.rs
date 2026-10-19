@@ -471,7 +471,12 @@ pub mod fake {
     //! ETIMEDOUT once; volume writes above the safe level fail while
     //! lapsed) and a sense stream that produces one period every
     //! period/rate seconds, carrying the program after the card's gain.
+    //! With `dma` set the sense stream is instead the simulated kernel PCM
+    //! of alsa::sim, read through the daemon's own PeriodReader.
     use super::*;
+    use crate::alsa::sim::SimPcm;
+    use crate::alsa::PeriodReader;
+    use std::rc::Rc;
 
     pub const LOCK_TIMEOUT: Duration = Duration::from_millis(250);
     /// The kernel's safe level without a daemon (macaudio safe_vol).
@@ -503,6 +508,16 @@ pub mod fake {
         /// Extra time a sample-rate read takes at time t (a descheduled
         /// daemon, a slow ioctl).
         pub control_delay: Box<dyn Fn(Duration) -> Duration>,
+        /// Sense through the simulated kernel PCM, whose DMA delivers this
+        /// fraction of its rate at time t (it runs only while that is > 0).
+        pub dma: Option<Rc<dyn Fn(Duration) -> f64>>,
+        /// The simulated DMA pointer's granularity in frames.
+        pub granule: usize,
+        period_frames: usize,
+        pcm: Option<PeriodReader<SimPcm>>,
+        /// When complete and incomplete sense periods reached the daemon.
+        pub complete: Vec<Duration>,
+        pub incomplete: Vec<Duration>,
     }
 
     impl FakeHw {
@@ -526,6 +541,12 @@ pub mod fake {
                 writes: Vec::new(),
                 boot: Duration::from_secs(1000),
                 control_delay: Box::new(|_| Duration::ZERO),
+                dma: None,
+                granule: 32,
+                period_frames,
+                pcm: None,
+                complete: Vec::new(),
+                incomplete: Vec::new(),
             }
         }
 
@@ -609,13 +630,35 @@ pub mod fake {
             self.sense_open = true;
             self.opens += 1;
             self.next_period = self.t + self.period;
+            if let Some(flow) = &self.dma {
+                let pcm = SimPcm::new(48000, self.channels, self.period_frames, self.granule, flow.clone(), self.t);
+                self.pcm = Some(PeriodReader::new(pcm, self.channels, self.period_frames));
+            }
             Ok(())
         }
         fn close_sense(&mut self) {
             self.sense_open = false;
+            self.pcm = None;
         }
         fn read_period(&mut self, words: &mut [i32]) -> io::Result<Option<bool>> {
             assert!(self.sense_open, "read on a closed capture");
+            if self.pcm.is_some() {
+                let gain = 10f64.powf(-self.effective_reduction() / 20.0);
+                let a = ((self.level)(self.t) * gain).clamp(0.0, 1.0);
+                let t = self.t;
+                let reader = self.pcm.as_mut().unwrap();
+                reader.io().advance_to(t);
+                reader.io().word = (a * 2147483647.0) as i32;
+                let read = reader.read_period(words);
+                self.t = reader.io().t;
+                self.lapse_check();
+                match read {
+                    Ok(Some(true)) => self.complete.push(self.t),
+                    Ok(Some(false)) => self.incomplete.push(self.t),
+                    _ => {}
+                }
+                return read;
+            }
             let deadline = self.t + Duration::from_millis(50);
             if !(self.sensing)(self.t) {
                 // the stream is stuck: nothing will come, periods are lost
@@ -898,5 +941,103 @@ mod tests {
         let _g3 = Guard::start(&mut hw3, &cfg, 20.0, Some(path.clone())).unwrap();
         assert!(hw3.writes.first().map(|w| w.1).unwrap() >= cfg.globals.t_reduction_max - 1e-9);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // ---- the J700 sense PCM: a DMA-precise pointer behind a non-blocking read ----
+
+    fn dma_hw(cfg: &Config, flow: impl Fn(Duration) -> f64 + 'static) -> FakeHw {
+        let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
+        hw.dma = Some(std::rc::Rc::new(flow));
+        hw
+    }
+
+    /// Continuous playback through a capture whose pointer moves in 32-frame
+    /// steps: every period arrives whole and the lock is never handed over.
+    /// The PR #2 head read before it waited, got a short transfer every
+    /// 50 ms and handed the card to the kernel 515 ms into the first sound.
+    #[test]
+    fn a_fine_grained_sense_pointer_gives_complete_periods() {
+        let cfg = j700();
+        let mut hw = dma_hw(&cfg, |_| 1.0);
+        let mut g = Guard::start(&mut hw, &cfg, 20.0, None).unwrap();
+        run_until(&mut g, &mut hw, secs(10.0)).unwrap();
+        assert!(hw.incomplete.is_empty(), "{} incomplete, first at {:?}", hw.incomplete.len(), hw.incomplete.first());
+        assert!(hw.complete.len() >= 115, "{} periods", hw.complete.len());
+        assert!(hw.lapses.is_empty(), "{:?}", hw.lapses);
+        assert_eq!(hw.opens, 1);
+        assert!(g.armed());
+        assert_eq!(hw.reduction, 0.0);
+    }
+
+    /// The 2026-10-19 sequence: volume keys pressed in quick succession play
+    /// a short feedback sound per step, so the speakers open and close
+    /// faster than a sense period, then music plays.  Complete sense data
+    /// and the daemon's own gain control must follow within a bounded time.
+    #[test]
+    fn a_burst_of_short_streams_resumes_complete_sense_data() {
+        let cfg = j700();
+        // 20 sounds of 60 ms, 100 ms apart, then 10 s of playback
+        let playing = |t: Duration| {
+            let t = t.as_secs_f64();
+            if (1.0..4.2).contains(&t) {
+                (t - 1.0) % 0.16 < 0.06
+            } else {
+                (4.2..14.2).contains(&t)
+            }
+        };
+        let mut hw = dma_hw(&cfg, move |t| if playing(t) { 1.0 } else { 0.0 });
+        hw.playing = Box::new(playing);
+        hw.level = Box::new(|_| 0.1);
+        let mut g = Guard::start(&mut hw, &cfg, 20.0, None).unwrap();
+        run_until(&mut g, &mut hw, secs(14.2)).unwrap();
+        assert!(hw.opens >= 20, "{} opens", hw.opens);
+        let first = hw.complete.iter().copied().find(|&t| t >= secs(4.2)).expect("no complete period after the burst");
+        assert!(first < secs(4.2 + 0.2), "first complete period at {first:?}");
+        let after: Vec<_> = hw.incomplete.iter().filter(|&&t| t >= secs(4.2)).collect();
+        assert!(after.is_empty(), "incomplete periods after the burst: {after:?}");
+        let n = hw.complete.iter().filter(|&&t| t >= secs(4.2)).count();
+        assert!(n >= 115, "{n} complete periods in 10 s");
+        assert!(hw.lapses.is_empty(), "the card was clamped at {:?}", hw.lapses);
+        assert!(g.armed() && hw.unlocked_at(hw.t));
+        assert!(hw.max_ping_gap(secs(4.2), hw.t) < LOCK_TIMEOUT);
+        assert_eq!(hw.reduction, 0.0, "the daemon governs, not the safe level");
+    }
+
+    /// The safety rule still holds on the real read path: a DMA that stops
+    /// while the speakers play hands the card to the kernel within the blind
+    /// limit and the lock stays lapsed until complete periods return.
+    #[test]
+    fn a_stopped_dma_still_hands_the_card_to_the_kernel() {
+        let cfg = j700();
+        let mut hw = dma_hw(&cfg, |t| if (secs(3.0)..secs(5.0)).contains(&t) { 0.0 } else { 1.0 });
+        let mut g = Guard::start(&mut hw, &cfg, 20.0, None).unwrap();
+        run_until(&mut g, &mut hw, secs(8.0)).unwrap();
+        assert_eq!(hw.lapses.len(), 1, "{:?}", hw.lapses);
+        let lapse = hw.lapses[0];
+        assert!(lapse > secs(3.0) && lapse < secs(3.0) + BLIND_LIMIT + LOCK_TIMEOUT + secs(0.2), "clamped at {lapse:?}");
+        assert!(!hw.pings.iter().any(|&p| p > lapse && p < secs(5.0)), "the lock was renewed while blind");
+        assert!(g.armed() && hw.unlocked_at(hw.t), "taken back after the outage");
+    }
+
+    /// A stream that trickles (a tenth of its rate) is not sense data: it
+    /// never completes a period inside the stall timeout, so the card stays
+    /// with the kernel until the stream is whole again.
+    #[test]
+    fn a_trickling_dma_never_renews_the_lock() {
+        let cfg = j700();
+        let mut hw = dma_hw(&cfg, |t| if (secs(2.0)..secs(8.0)).contains(&t) { 0.1 } else { 1.0 });
+        let mut g = Guard::start(&mut hw, &cfg, 20.0, None).unwrap();
+        run_until(&mut g, &mut hw, secs(8.0)).unwrap();
+        assert_eq!(hw.lapses.len(), 1, "{:?}", hw.lapses);
+        let lapse = hw.lapses[0];
+        // the period in flight when the trickle began still completes (its
+        // frames are all real); the blind limit runs from that one
+        let last = hw.complete.iter().copied().filter(|&t| t < lapse).last().unwrap();
+        assert!(last < secs(2.0) + STALL_TIMEOUT, "a trickle completed a period at {last:?}");
+        assert!(lapse < last + secs(0.0853) + BLIND_LIMIT + LOCK_TIMEOUT + PING_INTERVAL, "clamped at {lapse:?}, last period {last:?}");
+        assert!(!g.armed());
+        assert!(!hw.pings.iter().any(|&p| p > lapse && p < secs(8.0)), "the lock was renewed on a trickle");
+        run_until(&mut g, &mut hw, secs(10.0)).unwrap();
+        assert!(g.armed() && hw.unlocked_at(hw.t));
     }
 }
