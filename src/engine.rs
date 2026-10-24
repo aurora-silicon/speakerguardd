@@ -102,6 +102,14 @@ impl Thermal {
         ((target - alpha) / beta).max(0.0)
     }
 
+    /// Cool for `dt` seconds without power, exactly (one stepped lag over a
+    /// long gap would let the coil chase the magnet's end temperature).
+    pub fn cool_exact(&mut self, dt: f64, t_ambient: f64) {
+        let (alpha, _) = self.coil_after(dt, t_ambient);
+        self.t_magnet = t_ambient + (self.t_magnet - t_ambient) * (-dt / self.tau_magnet).exp();
+        self.t_coil = alpha;
+    }
+
     pub fn finite(&self) -> bool {
         self.t_coil.is_finite() && self.t_magnet.is_finite()
     }
@@ -159,6 +167,11 @@ impl Biquad {
         y
     }
 }
+
+/// The asahi models see this much more power than measured (+0.02 dB): on
+/// recorded sense data their gains then never ask for less than
+/// speakersafetyd's (the f32-versus-f64 rounding was worth up to 0.04 C).
+pub const ASAHI_MARGIN: f64 = 1.005;
 
 /// A reduction that lets nothing through (dB).
 pub const MUTE_DB: f64 = 120.0;
@@ -306,6 +319,10 @@ pub struct Engine {
     pub stats: Stats,
     /// Since start.
     pub total: Stats,
+    /// Replay only: play the recording this much louder (dB).
+    pub extra_gain_db: f64,
+    /// The asahi models were already stepped sample by sample this period.
+    asahi_stepped: bool,
 }
 
 /// How the model starts: no state (cold boot), saved state, or unreadable.
@@ -346,7 +363,17 @@ impl Engine {
             })
             .collect();
         let n = cfg.speakers.len();
-        Engine { cfg: cfg.clone(), asahi, unified, extractor: Extractor::new(n), last: vec![Feature::default(); n], stats: Stats::default(), total: Stats::default() }
+        Engine {
+            cfg: cfg.clone(),
+            asahi,
+            unified,
+            extractor: Extractor::new(n),
+            last: vec![Feature::default(); n],
+            stats: Stats::default(),
+            total: Stats::default(),
+            extra_gain_db: 0.0,
+            asahi_stepped: false,
+        }
     }
 
     fn asahi_speaker(s: &Speaker, g: &Globals, start: Start) -> AsahiSpeaker {
@@ -407,22 +434,29 @@ impl Engine {
     pub fn cool(&mut self, dt: f64) {
         let ta = self.cfg.globals.t_ambient;
         for u in self.unified.iter_mut() {
-            u.ff.step(0.0, dt, ta);
+            u.ff.cool_exact(dt, ta);
             if let Some(v) = u.vi.as_mut() {
-                v.step(0.0, dt, ta);
+                v.cool_exact(dt, ta);
             }
         }
         if let Some(a) = self.asahi.as_mut() {
             for s in a.iter_mut() {
-                s.th.step(0.0, dt, ta);
+                s.th.cool_exact(dt, ta);
             }
         }
     }
 
     /// The speakers are closed: cool, and let the reductions settle.
     pub fn idle(&mut self, dt: f64) {
-        let pre = vec![Feature::default(); self.cfg.speakers.len()];
-        self.advance(&pre, dt, None);
+        self.cool(dt);
+        for u in self.unified.iter_mut() {
+            u.history.push_back((dt, 0.0));
+            u.history_s += dt;
+            u.last_ff_pre = 0.0;
+            u.last_vi_pre = u.vi.as_ref().map(|_| 0.0);
+        }
+        self.trim_history();
+        self.govern_all(dt, false);
     }
 
     /// Time nobody measured, charged at the most each governor's own gain
@@ -463,8 +497,40 @@ impl Engine {
     }
 
     /// One complete sense period: `post` are the sensed features, `applied`
-    /// the reduction (dB) the card applied to each speaker during it.
-    pub fn period(&mut self, post: &[Feature], applied: &[f64], dt: f64, legacy_reduction: f64) {
+    /// the reduction (dB) the card applied to each speaker during it, and
+    /// `words` the period itself (V/I machines: the asahi models integrate
+    /// sample by sample, as speakersafetyd does).
+    pub fn period(&mut self, post: &[Feature], applied: &[f64], dt: f64, legacy_reduction: f64, words: Option<&[i32]>) {
+        if let (Some(words), Some(asahi)) = (words, self.asahi.as_mut()) {
+            let ch = self.cfg.globals.channels;
+            let frames = words.len() / ch;
+            let step = if frames > 0 { dt / frames as f64 } else { dt };
+            let ta = self.cfg.globals.t_ambient;
+            for (k, s) in self.cfg.speakers.iter().enumerate() {
+                let Some(ic) = s.is_chan else { continue };
+                let sa = &mut asahi[k];
+                // the power before the card's gain, under this governor's own
+                // gain, with ASAHI_MARGIN on top so that rounding never leaves
+                // this model cooler than speakersafetyd's own arithmetic
+                let factor = ASAHI_MARGIN * 10f64.powf((applied[k].min(PRE_MAX_DB) + self.extra_gain_db + sa.gain) / 10.0);
+                let (vs, is) = (s.vs_scale / 2147483648.0, s.is_scale / 2147483648.0);
+                let ac = step / (sa.th.tau_coil + step);
+                let am = step / (sa.th.tau_magnet + step);
+                let (mut tc, mut tm) = (sa.th.t_coil, sa.th.t_magnet);
+                for f in words.chunks_exact(ch) {
+                    let p = f[s.vs_chan] as f64 * vs * (f[ic] as f64 * is) * factor;
+                    let coil_target = tm + p * sa.th.tr_coil;
+                    let magnet_target = ta + p * sa.th.tr_magnet;
+                    tc = coil_target * ac + tc * (1.0 - ac);
+                    tm = magnet_target * am + tm * (1.0 - am);
+                }
+                sa.th.t_coil = tc;
+                sa.th.t_magnet = tm;
+            }
+            self.asahi_stepped = true;
+        }
+        let extra = self.extra_gain_db;
+        // the power before the card's gain
         // the power before the card's gain
         let pre: Vec<Feature> = post
             .iter()
@@ -473,7 +539,7 @@ impl Engine {
                 // Under a muted or near-muted card (the SN012776 machines
                 // lock to -100 dB) the sense data is noise: no gain past
                 // PRE_MAX_DB is reconstructed.
-                let k = 10f64.powf(a.min(PRE_MAX_DB) / 10.0);
+                let k = 10f64.powf((a.min(PRE_MAX_DB) + extra) / 10.0);
                 Feature { v_ms: f.v_ms * k, vi: f.vi.map(|p| p * k), i_ms: f.i_ms.map(|p| p * k), r_lf: f.r_lf }
             })
             .collect();
@@ -537,11 +603,14 @@ impl Engine {
             u.last_ff_pre = p_ff;
             u.last_vi_pre = f.vi.map(|p| p.max(0.0));
             if let Some(asahi) = self.asahi.as_mut() {
-                let sa = &mut asahi[k];
-                let p = f.vi.unwrap_or(0.0).max(0.0) * 10f64.powf(sa.gain / 10.0);
-                sa.th.step(p, dt, ta);
+                if !self.asahi_stepped {
+                    let sa = &mut asahi[k];
+                    let p = f.vi.unwrap_or(0.0).max(0.0) * 10f64.powf(sa.gain / 10.0);
+                    sa.th.step(p, dt, ta);
+                }
             }
         }
+        self.asahi_stepped = false;
         self.trim_history();
         let playing = legacy_reduction.is_some();
         self.govern_all(dt, playing);
@@ -827,6 +896,18 @@ mod tests {
     }
 
     #[test]
+    fn exact_cooling_matches_fine_steps() {
+        let mut a = Thermal::new(45.0, 1.3, 50.0, 73.26, 140.0);
+        a.t_magnet = 110.0;
+        let mut b = a.clone();
+        a.cool_exact(30.0, 50.0);
+        for _ in 0..300000 {
+            b.step(0.0, 0.0001, 50.0);
+        }
+        assert!((a.t_coil - b.t_coil).abs() < 0.01 && (a.t_magnet - b.t_magnet).abs() < 0.01, "{a:?} {b:?}");
+    }
+
+    #[test]
     fn the_most_power_reaches_the_target_at_the_horizon() {
         let th = Thermal::new(38.0, 3.3, 26.0, 100.0, 70.0);
         let p = th.max_power(115.0, 3.3, 50.0);
@@ -927,7 +1008,7 @@ mod tests {
                     Feature { v_ms: pre_v_ms * k, vi: vi_ratio.map(|x| x * pre_v_ms / s.r_ff * k), i_ms: None, r_lf: None }
                 })
                 .collect();
-            e.period(&post, &r, dt, 0.0);
+            e.period(&post, &r, dt, 0.0, None);
             for k in 0..c.speakers.len() {
                 let (_, ff, vi) = e.temps(k);
                 if t > 1.0 {
@@ -1024,7 +1105,7 @@ mod tests {
         let mut e = Engine::new(&c, Start::Cold);
         let post = vec![Feature { v_ms: 5e-5, vi: Some(1e-5), i_ms: Some(1e-5), r_lf: None }; 6];
         for _ in 0..200 {
-            e.period(&post, &[99.5; 6], 0.085, 0.0);
+            e.period(&post, &[99.5; 6], 0.085, 0.0, None);
         }
         assert!(e.temps(0).1 < 51.0, "{}", e.temps(0).1);
     }

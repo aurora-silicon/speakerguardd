@@ -445,7 +445,7 @@ impl Guard {
                     s.step_at(power, dt, globals.t_ambient, applied_card);
                     s.govern(&globals);
                 }
-                self.engine.period(&features, &applied, dt, model::reduction_db(&self.speakers));
+                self.engine.period(&features, &applied, dt, model::reduction_db(&self.speakers), Some(&self.words));
                 if let Some(rec) = self.record.as_mut() {
                     if let Err(e) = rec.write(rate, hw.boottime(), &applied, &self.words) {
                         warn!("recording: {e}; stopped");

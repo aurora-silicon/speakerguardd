@@ -204,17 +204,19 @@ pub fn replay(path: &Path, cfg: &Config, gain_db: f64, csv: Option<&Path>) -> Re
     let mut last_t: Option<Duration> = None;
     let mut periods = 0u64;
     let mut gaps = 0.0;
-    let zeros = vec![0.0; cfg.speakers.len()];
     while let Some(p) = rd.next()? {
         if p.rate == 0 {
             continue;
         }
         let dt = g.period as f64 / p.rate as f64;
-        // time between recorded periods beyond one period: the speakers
-        // were closed (or the stream was reopened): cool
+        // time between recorded periods: more than four periods apart the
+        // speakers were closed (or the stream reopened), so the models cool
+        // for the gap, as speakersafetyd does; anything shorter is not
+        // counted (it holds the temperature, the warmer choice)
         if let Some(t0) = last_t {
-            let gap = p.boottime.saturating_sub(t0).as_secs_f64() - dt;
-            if gap > 0.05 {
+            let between = p.boottime.saturating_sub(t0).as_secs_f64();
+            let gap = between - dt;
+            if between > 4.0 * dt {
                 gaps += gap;
                 engine.idle(gap);
                 for s in legacy.iter_mut() {
@@ -241,7 +243,8 @@ pub fn replay(path: &Path, cfg: &Config, gain_db: f64, csv: Option<&Path>) -> Re
             s.step_at(power, dt, g.t_ambient, r_leg);
             s.govern(g);
         }
-        engine.period(&pre, &zeros, dt, r_leg);
+        engine.extra_gain_db = gain_db;
+        engine.period(&post, &p.applied, dt, r_leg, Some(&p.words));
         let r_leg = model::reduction_db(&legacy);
         let ru = engine.reductions(Governor::Unified);
         let ra = engine.reductions(Governor::Asahi);
