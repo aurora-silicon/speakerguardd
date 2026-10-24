@@ -58,14 +58,14 @@ typedef struct LADSPA_Descriptor {
 enum {
 	P_IN_L, P_IN_R, P_OUT_L, P_OUT_R,
 	P_VFS_L, P_VFS_R, P_RE, P_BL, P_MMS, P_KMS, P_RMS,
-	P_XMAX, P_VMAX, P_PEAK, P_MARGIN, P_RELEASE, P_WINDOW,
+	P_XMAX, P_VMAX, P_PEAK, P_MARGIN, P_RELEASE, P_WINDOW, P_HOLD,
 	P_GAIN, P_LATENCY, P_COUNT
 };
 
 static const char *const names[P_COUNT] = {
 	"In L", "In R", "Out L", "Out R",
 	"Vfs L (V)", "Vfs R (V)", "Re (ohm)", "Bl (T m)", "Mms (g)", "Kms (N/m)", "Rms (kg/s)",
-	"Xmax (mm)", "Vmax (m/s)", "Peak (FS)", "Margin", "Release (ms)", "Window (ms)",
+	"Xmax (mm)", "Vmax (m/s)", "Peak (FS)", "Margin", "Release (ms)", "Window (ms)", "Hold (ms)",
 	"Gain (dB)", "latency",
 };
 
@@ -74,7 +74,7 @@ static const LADSPA_PortDescriptor ports[P_COUNT] = {
 	PORT_INPUT | PORT_CONTROL, PORT_INPUT | PORT_CONTROL, PORT_INPUT | PORT_CONTROL, PORT_INPUT | PORT_CONTROL,
 	PORT_INPUT | PORT_CONTROL, PORT_INPUT | PORT_CONTROL, PORT_INPUT | PORT_CONTROL, PORT_INPUT | PORT_CONTROL,
 	PORT_INPUT | PORT_CONTROL, PORT_INPUT | PORT_CONTROL, PORT_INPUT | PORT_CONTROL, PORT_INPUT | PORT_CONTROL,
-	PORT_INPUT | PORT_CONTROL, PORT_OUTPUT | PORT_CONTROL, PORT_OUTPUT | PORT_CONTROL,
+	PORT_INPUT | PORT_CONTROL, PORT_INPUT | PORT_CONTROL, PORT_OUTPUT | PORT_CONTROL, PORT_OUTPUT | PORT_CONTROL,
 };
 
 static const LADSPA_PortRangeHint hints[P_COUNT] = {
@@ -91,6 +91,7 @@ static const LADSPA_PortRangeHint hints[P_COUNT] = {
 	[P_MARGIN] = { HINT_BELOW | HINT_ABOVE, 0.1f, 1.0f },
 	[P_RELEASE] = { HINT_BELOW | HINT_ABOVE, 1.0f, 10000.0f },
 	[P_WINDOW] = { HINT_BELOW | HINT_ABOVE, 0.1f, 50.0f },
+	[P_HOLD] = { HINT_BELOW | HINT_ABOVE, 0.0f, 20.0f },
 };
 
 struct inst {
@@ -100,6 +101,11 @@ struct inst {
 	struct xlim_params cur;
 	int ready;
 };
+
+/* The longest window and hold the controls allow (their upper bounds): the
+ * memory is taken once, at instantiation, never in the audio thread. */
+#define WINDOW_MAX_MS 50.0
+#define HOLD_MAX_MS 20.0
 
 /* The J700's values are the defaults for unconnected or unset controls. */
 static void params_from_ports(struct inst *s, struct xlim_params *p)
@@ -119,8 +125,19 @@ static void params_from_ports(struct inst *s, struct xlim_params *p)
 	TAKE(P_MARGIN, margin, 1.0);
 	TAKE(P_RELEASE, release, 1e-3);
 #undef TAKE
-	if (s->port[P_WINDOW])
-		p->window = (size_t)(*s->port[P_WINDOW] * 1e-3 * (double)s->rate + 0.5);
+	if (s->port[P_WINDOW]) {
+		double ms = (double)*s->port[P_WINDOW];
+		/* out of range (or not a number): an invalid set, refused */
+		p->window = ms > 0.0 && ms <= WINDOW_MAX_MS ? (size_t)(ms * 1e-3 * (double)s->rate + 0.5) : 0;
+	}
+	if (s->port[P_HOLD]) {
+		double ms = (double)*s->port[P_HOLD];
+		/* out of range: refused through an invalid window */
+		if (ms >= 0.0 && ms <= HOLD_MAX_MS)
+			p->hold = (size_t)(ms * 1e-3 * (double)s->rate + 0.5);
+		else
+			p->window = 0;
+	}
 }
 
 static int same(const struct xlim_params *a, const struct xlim_params *b)
@@ -130,11 +147,20 @@ static int same(const struct xlim_params *a, const struct xlim_params *b)
 
 static LADSPA_Handle instantiate(const LADSPA_Descriptor *d, unsigned long rate)
 {
-	struct inst *s = calloc(1, sizeof(*s));
+	struct inst *s;
+	double cap = (WINDOW_MAX_MS + HOLD_MAX_MS) * 1e-3 * (double)rate + 2.0;
 
 	(void)d;
-	if (s)
-		s->rate = rate;
+	if (rate == 0 || cap > (double)(1 << 17))
+		return NULL;
+	s = calloc(1, sizeof(*s));
+	if (!s)
+		return NULL;
+	s->rate = rate;
+	if (xlim_alloc(&s->l, (size_t)cap) != 0) {
+		free(s);
+		return NULL;
+	}
 	return s;
 }
 
@@ -146,21 +172,19 @@ static void connect_port(LADSPA_Handle h, unsigned long port, LADSPA_Data *data)
 		s->port[port] = data;
 }
 
-/* (Re)build the limiter when the controls changed; an invalid set leaves the
- * previous one (or, before any, passes audio through muted: never unlimited). */
+/* Take the controls when they changed, without allocating (the audio
+ * thread calls this): an invalid set leaves the previous one, or, before
+ * any, the output silent (never unlimited).  A change starts the limiter
+ * again from silence. */
 static void configure(struct inst *s)
 {
 	struct xlim_params p;
-	struct xlim n;
 
 	params_from_ports(s, &p);
 	if (s->ready && same(&p, &s->cur))
 		return;
-	if (xlim_init(&n, &p) != 0)
+	if (xlim_configure(&s->l, &p) != 0)
 		return;
-	if (s->ready)
-		xlim_free(&s->l);
-	s->l = n;
 	s->cur = p;
 	s->ready = 1;
 }
@@ -169,10 +193,7 @@ static void activate(LADSPA_Handle h)
 {
 	struct inst *s = h;
 
-	if (s->ready) {
-		xlim_free(&s->l);
-		s->ready = 0;
-	}
+	s->ready = 0;
 	configure(s);
 }
 
@@ -198,15 +219,14 @@ static void run(LADSPA_Handle h, unsigned long frames)
 	if (s->port[P_GAIN])
 		*s->port[P_GAIN] = (LADSPA_Data)(20.0 * log10(s->l.min_gain > 1e-9 ? s->l.min_gain : 1e-9));
 	if (s->port[P_LATENCY])
-		*s->port[P_LATENCY] = (LADSPA_Data)(s->cur.window - 1);
+		*s->port[P_LATENCY] = (LADSPA_Data)(s->cur.window + s->cur.hold - 1);
 }
 
 static void cleanup(LADSPA_Handle h)
 {
 	struct inst *s = h;
 
-	if (s->ready)
-		xlim_free(&s->l);
+	xlim_free(&s->l);
 	free(s);
 }
 

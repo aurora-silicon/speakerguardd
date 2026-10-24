@@ -107,7 +107,7 @@ int main(void)
 		for (size_t k = 0; k < sizeof(fs) / sizeof(fs[0]); k++) {
 			float *o = run_tone(&p, 0.1, fs[k], 0.0, 0.5, &mg);
 			CHECK(mg == 1.0, "%.0f Hz at -20 dBFS: gain dipped to %g", fs[k], mg);
-			size_t d = p.window - 1;
+			size_t d = p.window + p.hold - 1;
 			double err = 0;
 			for (i = d; i < (size_t)(0.5 * RATE); i++) {
 				double want = 0.1 * sin(2 * M_PI * fs[k] * (double)(i - d) / RATE);
@@ -172,6 +172,86 @@ int main(void)
 		printf("music-like: min gain %.1f dB, cone %.3f mm\n", 20 * log10(l.min_gain), 1e3 * c.xpk);
 		xlim_free(&l);
 		free(a); free(b); free(outs[1]);
+	}
+
+	/* latency: an impulse comes out exactly window + hold - 1 frames later,
+	 * unchanged, and the J700's total is inside macOS's 352 frames */
+	{
+		struct xlim l;
+		size_t n = 2000, lat = p.window + p.hold - 1;
+		float *a = calloc(n, sizeof(float)), *b = calloc(n, sizeof(float)), *b2 = calloc(n, sizeof(float));
+		const float *ins[2] = { a, a };
+		float *outs[2] = { b, b2 };
+		a[100] = 0.05f;
+		xlim_init(&l, &p);
+		xlim_run(&l, ins, outs, n);
+		for (i = 0; i < n; i++)
+			CHECK(b[i] == (i == 100 + lat ? 0.05f : 0.0f), "impulse response at %zu: %g", i, b[i]);
+		CHECK(lat <= 352, "latency %zu frames, over the 352 budget", lat);
+		printf("latency: %zu frames (%.2f ms) at 48 kHz\n", lat, 1e3 * (double)lat / RATE);
+		xlim_free(&l);
+		free(a); free(b); free(b2);
+	}
+
+	/* a sample that is not a number is silence: the output stays finite and
+	 * the limiter keeps limiting after it */
+	{
+		struct xlim l;
+		struct cone c;
+		size_t n = 48000;
+		float *a = calloc(n, sizeof(float)), *b = calloc(n, sizeof(float)), *b2 = calloc(n, sizeof(float));
+		const float *ins[2] = { a, a };
+		float *outs[2] = { b, b2 };
+		int finite = 1;
+		for (i = 0; i < n; i++)
+			a[i] = (float)sin(2 * M_PI * f0 * (double)i / RATE);
+		a[1000] = NAN;
+		a[2000] = INFINITY;
+		a[3000] = -INFINITY;
+		xlim_init(&l, &p);
+		xlim_run(&l, ins, outs, n);
+		for (i = 0; i < n; i++)
+			finite &= isfinite(b[i]) && isfinite(b2[i]);
+		CHECK(finite, "a non-finite sample came out");
+		cone_init(&c, &p);
+		cone_feed(&c, b, n, 0);
+		CHECK(c.xpk <= p.x_max * 1.0001, "after non-finite samples the cone reached %.3f mm", 1e3 * c.xpk);
+		xlim_free(&l);
+		free(a); free(b); free(b2);
+	}
+
+	/* ten minutes of limiting leave no drift: a quiet tone is bit-exact
+	 * again afterwards (the running mean is recomputed once a window) */
+	{
+		struct xlim l;
+		size_t blk = 4800, k, d = p.window + p.hold - 1;
+		float *a = calloc(blk, sizeof(float)), *b = calloc(blk, sizeof(float)), *b2 = calloc(blk, sizeof(float));
+		const float *ins[2] = { a, a };
+		float *outs[2] = { b, b2 };
+		unsigned s = 777;
+		double err = 0;
+		xlim_init(&l, &p);
+		for (k = 0; k < 6000; k++) {
+			for (i = 0; i < blk; i++) {
+				s = s * 1103515245u + 12345u;
+				a[i] = (float)(0.6 * (((s >> 8) & 0xffff) / 32768.0 - 1.0) + 0.6 * sin(2 * M_PI * 90.0 * (double)(k * blk + i) / RATE));
+			}
+			xlim_run(&l, ins, outs, blk);
+		}
+		/* five seconds of release, then the quiet tone */
+		for (k = 0; k < 60; k++) {
+			for (i = 0; i < blk; i++)
+				a[i] = (float)(0.1 * sin(2 * M_PI * 1000.0 * (double)(k * blk + i) / RATE));
+			xlim_run(&l, ins, outs, blk);
+			if (k >= 55)
+				for (i = 0; i < blk; i++) {
+					double want = 0.1 * sin(2 * M_PI * 1000.0 * (double)(k * blk + i - d) / RATE);
+					err = fmax(err, fabs((double)b[i] - (double)(float)want));
+				}
+		}
+		CHECK(err == 0.0 && l.gain == 1.0, "after ten minutes: gain %.17g, error %g", l.gain, err);
+		xlim_free(&l);
+		free(a); free(b); free(b2);
 	}
 
 	/* invalid parameters are refused */
