@@ -108,6 +108,11 @@ The binary talks to the ALSA kernel interface directly (no alsa-lib).
 installs the binary, `conf/apple/*.conf`, the systemd unit and the udev
 rule that starts it when a supported card's sense PCM appears.
 
+Keep the unit's `RuntimeDirectory=speakerguardd` and
+`RuntimeDirectoryPreserve=yes` when packaging: they give the daemon
+`/run/speakerguardd` for its model state and keep it across restarts.  A unit
+without them leaves the state unwritten, and every restart starts cold.
+
 The PCM udev event and `multi-user.target` can both precede ALSA card
 discovery. The daemon retries a missing card for up to 30 seconds, using a
 monotonic deadline and 100 ms polling, before returning the discovery error.
@@ -140,5 +145,7 @@ it never plays audio or performs a reboot.
 
     speakerguardd -c /usr/share/speakerguardd -v
 
-`-C <card id>` selects a card, `-m <dB>` the reduction at which the card's
-safe level takes over, `-s <file>` the model state file (`-s ''` for none).
+`-C <card id>` selects a card (by default the one the macaudio driver
+registered, never the AOP card that shares its `AppleJ` prefix), `-m <dB>`
+the reduction at which the card's safe level takes over, `-s <file>` the
+model state file (`-s ''` for none).
