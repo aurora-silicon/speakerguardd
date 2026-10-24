@@ -40,6 +40,12 @@ const UNLOCK_MAGIC: i64 = 0xdec1be15u32 as i32 as i64;
 /// Volume control steps per dB (t8140-aop-audio: 0.5 dB steps).
 const STEPS_PER_DB: f64 = 2.0;
 
+/// The version and the source it was built from (the packaging sets
+/// SPEAKERGUARDD_COMMIT at build time), for `--version` and the journal.
+fn version() -> String {
+    format!("speakerguardd {} ({})", env!("CARGO_PKG_VERSION"), option_env!("SPEAKERGUARDD_COMMIT").unwrap_or("commit unknown"))
+}
+
 struct Args {
     config_path: PathBuf,
     max_reduction: f64,
@@ -60,6 +66,7 @@ fn usage() -> ! {
          -s, --state <FILE>              Model state kept across restarts (default /run/speakerguardd/state)\n  \
          -v, --verbose                   More logging (repeatable)\n  \
          -q, --quiet                     Less logging\n  \
+         -V, --version                   The version and source commit\n  \
          -h, --help                      This text"
     );
     std::process::exit(2)
@@ -82,6 +89,10 @@ fn parse_args() -> Args {
             }
             "-v" | "--verbose" => args.verbosity = Level::Debug,
             "-q" | "--quiet" => args.verbosity = Level::Warn,
+            "-V" | "--version" => {
+                println!("{}", version());
+                std::process::exit(0)
+            }
             _ => usage(),
         }
     }
@@ -361,6 +372,7 @@ fn catch_stop_signals() {
 }
 
 fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    info!("{}", version());
     // the model file is named after the card: AppleJ700 -> apple/j700.conf
     // Discovery only: no controls are locked or written until it succeeds,
     // the configuration is loaded and Guard::start takes the interlock.
