@@ -545,6 +545,14 @@ impl Guard {
             self.seen_to = self.charged_to;
         }
         if self.stall.is_none() {
+            // Opening the sense PCM blocks while the playback side is being
+            // set up (about 100 ms on the J700): renew a lock that is still
+            // held first, so the open cannot run its lease out.  The time is
+            // charged as unmeasured all the same, and an open that blocks
+            // past the lease lets it lapse.
+            if self.armed && hw.now() < self.last_ping + KERNEL_LOCK_TIMEOUT {
+                self.ping_lock(hw)?;
+            }
             match hw.open_sense(rate) {
                 Ok(()) => {
                     info!("speakers open at {rate} Hz, sense capture running");
@@ -850,6 +858,8 @@ pub mod fake {
         pub locked: bool,
         /// The card sends sample-rate change events (else the daemon polls).
         pub events: bool,
+        /// How long opening the sense PCM blocks.
+        pub open_delay: Duration,
         /// Where rate_events last looked.
         events_seen_to: Duration,
     }
@@ -888,6 +898,7 @@ pub mod fake {
                 locked: false,
                 events: true,
                 events_seen_to: Duration::ZERO,
+                open_delay: Duration::ZERO,
             }
         }
 
@@ -1053,6 +1064,8 @@ pub mod fake {
             changed
         }
         fn open_sense(&mut self, _rate: u32) -> io::Result<()> {
+            self.t += self.open_delay;
+            self.lapse_check();
             self.sense_open = true;
             self.opens += 1;
             self.next_period = self.t + self.period;
@@ -1898,5 +1911,24 @@ mod tests {
         assert!(without > with + 1.0, "the polled opening window was not charged: {without:.2} vs {with:.2} C");
         let floor = 50.0 + 0.127 * 64.0;
         assert!(with < floor + 1.0, "an evented quiet stream heated the model to {with:.2} C");
+    }
+
+    /// Opening the J700's sense PCM blocks for about 100 ms while the
+    /// playback is being set up, and a stream seen at its change event is
+    /// opened right then: 0.1.4 let the lock lapse at the start of a sound
+    /// after idle (the last idle ping up to 100 ms before, the open, then a
+    /// 50 ms wait), so its first ~125 ms played at the safe level.
+    #[test]
+    fn a_slow_sense_open_does_not_lapse_the_lock() {
+        let cfg = j700();
+        for start in [1.03, 1.06, 1.09] {
+            let mut hw = dma_hw(&cfg, move |t| if t.as_secs_f64() > start { 1.0 } else { 0.0 });
+            hw.playing = Box::new(move |t| t.as_secs_f64() > start);
+            hw.open_delay = Duration::from_millis(150);
+            let mut g = Guard::start(&mut hw, &cfg, 20.0, tmp_state()).unwrap();
+            run_until(&mut g, &mut hw, secs(3.0)).unwrap();
+            assert!(hw.lapses.is_empty(), "stream at {start} s: the lock lapsed at {:?}", hw.lapses);
+            assert!(g.armed());
+        }
     }
 }
