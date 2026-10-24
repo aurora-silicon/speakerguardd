@@ -2420,6 +2420,29 @@ pub(crate) mod tests {
         assert_eq!(hw.reduction, 0.0);
     }
 
+    /// The time without sense data counts from before the rate read that
+    /// shows a stream.  A read held up 0.12 s (the stream may have played
+    /// all through it) leaves that much less of the blind limit, not more:
+    /// counted from after the read, the lease could be renewed 0.12 s
+    /// longer blind.
+    #[test]
+    fn blindness_counts_from_before_the_rate_read() {
+        let cfg = j700();
+        let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
+        hw.level = Box::new(|_| 0.0);
+        hw.playing = Box::new(|t| t >= secs(2.0));
+        hw.sensing = Box::new(|t| t < secs(2.0));
+        hw.control_delay = Box::new(|t| if (secs(1.97)..secs(2.0)).contains(&t) { Duration::from_millis(120) } else { Duration::ZERO });
+        let mut g = Guard::start(&mut hw, &cfg, 20.0, tmp_state()).unwrap();
+        run_until(&mut g, &mut hw, secs(1.97)).unwrap();
+        assert!(g.armed() && !g.playing);
+        let look = hw.now();
+        g.tick(&mut hw).unwrap();
+        assert!(g.playing && hw.t >= secs(2.09), "the slow read did not show the stream");
+        let seen = g.seen_to.unwrap();
+        assert!(seen <= look, "blindness counted from {:?} after the look", seen.saturating_duration_since(look));
+    }
+
     /// "Peak volume": with a cool speaker and a loud but sustainable program
     /// (0.3 of full scale, 1.1 W into each coil) the daemon leaves the card
     /// at the top of its range, the amplifier's full scale, for the whole
