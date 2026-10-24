@@ -550,6 +550,25 @@ impl AsahiSpeaker {
         self.note(c, m);
     }
 
+    /// `n` samples of `step` seconds at a measured power known only as its
+    /// mean `p` (W): the per-sample integration of `samples`, the hard
+    /// limit checked at every sample (the follow mode).
+    fn constant(&mut self, p: f64, n: usize, step: f64, t_ambient: f64) {
+        let (ac, am) = (step / (self.th.tau_coil + step), step / (self.th.tau_magnet + step));
+        let p = p * ASAHI_MARGIN;
+        let (mut tc, mut tm) = (self.th.t_coil, self.th.t_magnet);
+        let (mut pc, mut pm) = (tc, tm);
+        for _ in 0..n {
+            tc = (tm + p * self.th.tr_coil) * ac + tc * (1.0 - ac);
+            tm = (t_ambient + p * self.th.tr_magnet) * am + tm * (1.0 - am);
+            pc = hi(pc, tc);
+            pm = hi(pm, tm);
+        }
+        self.th.t_coil = tc;
+        self.th.t_magnet = tm;
+        self.note(pc, pm);
+    }
+
     fn idle(&mut self, d: f64, t_ambient: f64) {
         let (c, m) = self.th.hold(0.0, d, t_ambient);
         self.note(c, m);
@@ -1117,6 +1136,45 @@ impl Engine {
             s.worst(reduction[k], d, ta);
         }
         self.govern(d, true);
+    }
+
+    /// The follow mode (follow.rs): `n` samples of `step` seconds in which
+    /// each speaker's measured power (V*I after the card's gain) is known
+    /// only as its mean `power[k]`, with `pre[k]` the power before the
+    /// card's gain.  The asahi models integrate it sample by sample, the
+    /// unified measured-power models take it as one block, and the
+    /// feed-forward models, with no voltage to go on, get nothing.
+    pub fn follow_period(&mut self, power: &[f64], pre: &[f64], n: usize, step: f64) {
+        let ta = self.cfg.globals.t_ambient;
+        for (k, s) in self.asahi.iter_mut().flatten().enumerate() {
+            s.constant(power[k], n, step, ta);
+        }
+        for (k, u) in self.unified.iter_mut().flatten().enumerate() {
+            let full = u.v_worst * u.v_worst / u.z_min;
+            u.blocks(&[0.0], Some(&[power[k]]), &[0.0], Some(&[pre[k].min(full)]), n as f64 * step, ta);
+        }
+        self.govern(n as f64 * step, true);
+    }
+
+    /// The follow mode starts every model at speakersafetyd's coil and
+    /// magnet (the feed-forward models, which it has no figure for, at
+    /// ambient).
+    pub fn follow_start(&mut self, k: usize, coil: f64, magnet: f64) {
+        if let Some(a) = self.asahi.as_mut().map(|a| &mut a[k]) {
+            a.th.t_coil = coil;
+            a.th.t_magnet = magnet;
+            a.coil_peak = coil;
+            a.magnet_peak = magnet;
+            a.coil_hyst = coil;
+            a.magnet_hyst = magnet;
+        }
+        if let Some(u) = self.unified.as_mut().map(|u| &mut u[k]) {
+            if let Some(v) = u.vi.as_mut() {
+                v.t_coil = coil;
+                v.t_magnet = magnet;
+            }
+            u.peak = hi(coil, magnet);
+        }
     }
 
     /// `d` seconds with the speakers known to be closed.
