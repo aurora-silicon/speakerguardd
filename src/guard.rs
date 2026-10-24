@@ -12,10 +12,12 @@
 //!   (placed by the read time less the capture's backlog), or charged as a
 //!   full-scale signal at the least reduction the controls held at any time
 //!   since the last verified boundary, widened by how long the card keeps
-//!   playing samples converted at an earlier gain.  No partial credits, no
-//!   tolerances, no means, no assumption about when inside an uncertain
-//!   interval anything played.  Frames over time already charged add
-//!   nothing.
+//!   playing samples converted at an earlier gain.  While the card holds
+//!   its lock (taken at start or given up, and not renewed since), once
+//!   what it converted before has drained, that reduction is at least the
+//!   card's safe level.  No partial credits, no tolerances, no means, no
+//!   assumption about when inside an uncertain interval anything played.
+//!   Frames over time already charged add nothing.
 //! * Verified boundaries.  The end of measured frames, or two looks at
 //!   closed speakers with no sample-rate change event between them, and
 //!   nothing else.  Without the card's change events nothing between two
