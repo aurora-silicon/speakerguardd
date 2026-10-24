@@ -1,9 +1,10 @@
 [Unit]
 Description=Speaker Protection Daemon (feed-forward)
 # Restarts are safe: until the daemon renews the card's volume lock the
-# speakers sit at the card's safe level, and a restarted daemon resumes the
-# previous run's thermal model from /run/speakerguardd/state.  A crash loop
-# gives up after five attempts and leaves the speakers at that level.
+# speakers sit at the card's safe level.  A restarted daemon resumes the
+# thermal model from /run/speakerguardd/state only after a clean stop, and
+# otherwise starts it at the coils' limit.  A crash loop gives up after five
+# attempts and leaves the speakers at that level.
 StartLimitIntervalSec=60
 StartLimitBurst=5
 

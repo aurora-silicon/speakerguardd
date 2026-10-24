@@ -7,6 +7,12 @@
 //! A windowed power budget (mean power over the last second and the last
 //! minute) reduces the gain at once when a burst would exceed what the
 //! amplifier/speaker pair is rated for, before the coil has warmed up.
+//!
+//! The model is integrated in steps of at most MAX_SUB_DT, and a sense
+//! period in SUB_BLOCKS blocks of its own power, so that a peak inside a
+//! period is seen: each step keeps an upper bound of the coil temperature
+//! over its span, the governor works from it, and a bound at the coil's
+//! limit latches a hard fault that only the daemon clears.
 
 use crate::config::{Globals, Speaker};
 
@@ -20,6 +26,12 @@ pub struct SpeakerState {
     /// Power of the last step (W) and its RMS voltage (V), for logging.
     pub power: f64,
     pub v_rms: f64,
+    /// Upper bound of the coil temperature over the last step (°C).
+    pub t_peak: f64,
+    /// Latched once the coil may have reached its limit (`t_limit`); the
+    /// daemon hands the card to the kernel and clears it once the coil is
+    /// back under its working ceiling (`clear_hard_if_cool`).
+    pub hard: bool,
     /// Gain reduction applied by the governor (dB, >= 0).
     pub reduction_db: f64,
     reducing: bool,
@@ -32,6 +44,10 @@ pub struct SpeakerState {
 /// The most card gain undone when working out the power before it (dB):
 /// past this the sensed words are too quiet to say what the music was.
 pub const PRE_GAIN_MAX_DB: f64 = 30.0;
+/// Longest single integration step (s).
+pub const MAX_SUB_DT: f64 = 0.01;
+/// A sense period is integrated in this many blocks of its own power.
+pub const SUB_BLOCKS: usize = 16;
 
 impl SpeakerState {
     pub fn new(spec: Speaker, t_ambient: f64) -> SpeakerState {
@@ -41,6 +57,8 @@ impl SpeakerState {
             t_magnet: t_ambient,
             power: 0.0,
             v_rms: 0.0,
+            t_peak: t_ambient,
+            hard: false,
             reduction_db: 0.0,
             reducing: false,
             history: std::collections::VecDeque::new(),
@@ -49,6 +67,7 @@ impl SpeakerState {
     }
 
     /// The RMS voltage a period of sense words puts across the coil.
+    #[cfg(test)]
     pub fn v_rms_of(&self, words: &[i32], channels: usize) -> f64 {
         let ch = self.spec.vs_chan;
         let frames = words.len() / channels;
@@ -66,6 +85,30 @@ impl SpeakerState {
         (sum / frames as f64).sqrt()
     }
 
+    /// The power of each of `blocks` equal blocks of a sense period (W),
+    /// and the period's RMS voltage.
+    pub fn block_powers(&self, words: &[i32], channels: usize, blocks: usize) -> (Vec<f64>, f64) {
+        let ch = self.spec.vs_chan;
+        let frames = words.len() / channels;
+        let blocks = blocks.clamp(1, frames.max(1));
+        let scale = self.spec.vs_scale / 2147483648.0;
+        let mut out = Vec::with_capacity(blocks);
+        let mut total = 0.0;
+        for b in 0..blocks {
+            let (lo, hi) = (frames * b / blocks, frames * (b + 1) / blocks);
+            let sum: f64 = (lo..hi)
+                .map(|f| {
+                    let v = words[f * channels + ch] as f64 * scale;
+                    v * v
+                })
+                .sum();
+            total += sum;
+            out.push(if hi > lo { sum / (hi - lo) as f64 / self.spec.z_nominal } else { 0.0 });
+        }
+        let v_rms = if frames > 0 { (total / frames as f64).sqrt() } else { 0.0 };
+        (out, v_rms)
+    }
+
     /// Advance the thermal model by `dt` seconds with `power` watts in the
     /// coil, the card at full gain.
     pub fn step(&mut self, power: f64, dt: f64, t_ambient: f64) {
@@ -79,27 +122,155 @@ impl SpeakerState {
     /// that brings the mean to the budget, not only what is left over the
     /// reduction already applied.
     pub fn step_at(&mut self, power: f64, dt: f64, t_ambient: f64, applied_db: f64) {
-        let s = &self.spec;
         self.power = power;
-        let pre = power * 10f64.powf(applied_db.clamp(0.0, PRE_GAIN_MAX_DB) / 10.0);
-        // keep one minute of history for the budgets
-        self.history.push_back((dt, pre));
-        self.history_s += dt;
-        while self.history_s > 60.0 {
-            if let Some((old_dt, _)) = self.history.pop_front() {
-                self.history_s -= old_dt;
-            } else {
-                break;
+        self.record(power, dt, applied_db);
+        self.t_peak = f64::NEG_INFINITY;
+        self.heat(power, dt, t_ambient);
+    }
+
+    /// `dt` seconds with `power` watts in the coil and `pre` watts before
+    /// the card's gain (for the budgets).
+    pub fn step_pre(&mut self, power: f64, pre: f64, dt: f64, t_ambient: f64) {
+        self.power = power;
+        self.record_pre(pre, dt);
+        self.t_peak = f64::NEG_INFINITY;
+        self.heat(power, dt, t_ambient);
+    }
+
+    /// A sense period of `dt` seconds whose equal blocks carried `powers`
+    /// watts each: the budgets get the period's mean, the coil each block.
+    #[cfg(test)]
+    pub fn step_period(&mut self, powers: &[f64], dt: f64, t_ambient: f64, applied_db: f64) {
+        let g = 10f64.powf(applied_db.clamp(0.0, PRE_GAIN_MAX_DB) / 10.0);
+        let pre: Vec<f64> = powers.iter().map(|p| p * g).collect();
+        self.step_period_pre(powers, &pre, dt, t_ambient)
+    }
+
+    /// The same with each block's power before the card's gain.
+    pub fn step_period_pre(&mut self, powers: &[f64], pre: &[f64], dt: f64, t_ambient: f64) {
+        let n = powers.len().max(1);
+        let mean = powers.iter().sum::<f64>() / n as f64;
+        self.power = mean;
+        self.record_pre(pre.iter().sum::<f64>() / n as f64, dt);
+        self.t_peak = f64::NEG_INFINITY;
+        if powers.is_empty() {
+            self.heat(0.0, dt, t_ambient);
+        }
+        for &p in powers {
+            self.heat(p, dt / n as f64, t_ambient);
+        }
+    }
+
+    /// The power before the card's gain of a block that delivered `power`
+    /// watts, converted at one of the reductions in `possible` (ranges, dB):
+    /// the most that any of them can have taken off a block this loud (a
+    /// reduction that leaves less than the block's power at full scale did
+    /// not convert it), never more than a full-scale signal.
+    pub fn pre_gain(&self, power: f64, possible: &[(f64, f64)]) -> f64 {
+        let full = self.worst_case_power(0.0);
+        if !(power > 0.0) {
+            return power.max(0.0);
+        }
+        // the most reduction that still delivers `power` at full scale
+        let x = 10.0 * (full / power).log10();
+        let mut fit: Option<f64> = None;
+        let mut most = 0.0f64;
+        for &(lo, hi) in possible {
+            most = most.max(hi);
+            if lo <= x {
+                let v = hi.min(x);
+                fit = Some(fit.map_or(v, |f| f.max(v)));
             }
         }
-        // magnet: first-order lag toward ambient + P * tr_magnet
-        let k_magnet = 1.0 - (-dt / s.tau_magnet).exp();
-        let magnet_target = t_ambient + power * s.tr_magnet;
-        self.t_magnet += (magnet_target - self.t_magnet) * k_magnet;
-        // coil: first-order lag toward magnet + P * tr_coil
-        let k_coil = 1.0 - (-dt / s.tau_coil).exp();
-        let coil_target = self.t_magnet + power * s.tr_coil;
-        self.t_coil += (coil_target - self.t_coil) * k_coil;
+        let db = fit.unwrap_or(most).clamp(0.0, PRE_GAIN_MAX_DB);
+        let pre = power * 10f64.powf(db / 10.0);
+        if pre > full { full } else { pre }
+    }
+
+    /// Keep one minute of the power before the card's gain for the budgets.
+    fn record(&mut self, power: f64, dt: f64, applied_db: f64) {
+        self.record_pre(power * 10f64.powf(applied_db.clamp(0.0, PRE_GAIN_MAX_DB) / 10.0), dt)
+    }
+
+    /// The same with the power before the gain given: never more than a
+    /// full-scale signal (nothing before the gain is louder).
+    fn record_pre(&mut self, pre: f64, dt: f64) {
+        if !(dt > 0.0) {
+            return;
+        }
+        let full = self.worst_case_power(0.0);
+        let pre = if pre > full { full } else { pre };
+        self.history.push_back((dt, pre));
+        self.history_s += dt;
+        // drop what is older than a minute: whole entries, then the expired
+        // part of the oldest one (its energy for the rest still counts)
+        while self.history_s > 60.0 {
+            let excess = self.history_s - 60.0;
+            match self.history.front_mut() {
+                Some(front) if front.0 <= excess => {
+                    self.history_s -= front.0;
+                    self.history.pop_front();
+                }
+                Some(front) => {
+                    front.0 -= excess;
+                    self.history_s = 60.0;
+                }
+                None => {
+                    self.history_s = 0.0;
+                    break;
+                }
+            }
+        }
+    }
+
+    /// `dt` seconds at `power` watts, in steps of at most MAX_SUB_DT.  After
+    /// each step the coil's bound over it goes into `t_peak`: the step's end
+    /// value, plus what a power that varied inside the step (its mean is
+    /// what the step used) could have hidden.  From the hottest moment to
+    /// the end of a step of length h the coil cools at most toward the
+    /// magnet with its time constant, so it was at most
+    /// (end - magnet) (e^(h/tau) - 1) above the end; and a step that put
+    /// all of its energy at the very end ends at most
+    /// P tr (h/tau - (1 - e^(-h/tau))) above the constant-power step.
+    fn heat(&mut self, power: f64, dt: f64, t_ambient: f64) {
+        if !(dt > 0.0) {
+            self.t_peak = self.t_peak.max(self.t_coil);
+            return;
+        }
+        let s = &self.spec;
+        let n = (dt / MAX_SUB_DT).ceil().max(1.0);
+        let n = if n.is_finite() { n as u64 } else { 1 };
+        let h = dt / n as f64;
+        let k_magnet = 1.0 - (-h / s.tau_magnet).exp();
+        let k_coil = 1.0 - (-h / s.tau_coil).exp();
+        let grow = (h / s.tau_coil).exp() - 1.0;
+        let late = power * s.tr_coil * (h / s.tau_coil - k_coil).max(0.0);
+        for _ in 0..n {
+            // magnet: first-order lag toward ambient + P * tr_magnet
+            self.t_magnet += (t_ambient + power * s.tr_magnet - self.t_magnet) * k_magnet;
+            // coil: first-order lag toward magnet + P * tr_coil
+            self.t_coil += (self.t_magnet + power * s.tr_coil - self.t_coil) * k_coil;
+            let end = self.t_coil + late;
+            let bound = end + (end - self.t_magnet).max(0.0) * grow;
+            if !(bound <= self.t_peak) {
+                // also takes a NaN, which finite() then rejects
+                self.t_peak = bound;
+            }
+        }
+        if !(self.t_peak < s.t_limit) {
+            self.hard = true;
+        }
+    }
+
+    /// Clear a latched hard fault once the coil is back under its working
+    /// ceiling.  True if one was cleared.
+    pub fn clear_hard_if_cool(&mut self) -> bool {
+        let ceiling = self.spec.t_limit - self.spec.t_headroom;
+        if self.hard && self.t_peak.max(self.t_coil) < ceiling {
+            self.hard = false;
+            return true;
+        }
+        false
     }
 
     /// The most power the coil can take while the card's gain is
@@ -110,13 +281,28 @@ impl SpeakerState {
         v * v / self.spec.z_nominal
     }
 
-    /// Start as hot as the governor lets the coil run: at the working
-    /// limit, the magnet where steady state would put it.  Used when the
-    /// previous run's state is unreadable.
-    pub fn assume_hot(&mut self, t_ambient: f64) {
+    /// Start at the coil's limit with the hard fault latched, the magnet
+    /// where steady state would put it: nothing about the speaker's past is
+    /// known (no state of this daemon, an unreadable one).  The card stays
+    /// with the kernel until the model has cooled under the working ceiling.
+    pub fn assume_latched(&mut self, t_ambient: f64) {
         let s = &self.spec;
-        self.t_coil = s.t_limit - s.t_headroom;
+        self.t_coil = s.t_limit;
         self.t_magnet = t_ambient + (self.t_coil - t_ambient) * s.tr_magnet / (s.tr_magnet + s.tr_coil);
+        self.t_peak = self.t_coil;
+        self.hard = true;
+    }
+
+    /// The steady state at `power` watts, as if it had run for ever; the
+    /// budgets see it as a minute at that power.
+    pub fn settle_at(&mut self, power: f64, t_ambient: f64) {
+        let s = &self.spec;
+        self.t_magnet = t_ambient + power * s.tr_magnet;
+        self.t_coil = self.t_magnet + power * s.tr_coil;
+        self.t_peak = self.t_coil;
+        self.history.clear();
+        self.history.push_back((60.0, power));
+        self.history_s = 60.0;
     }
 
     /// Continue from a saved state: temperatures and the power history's
@@ -124,11 +310,44 @@ impl SpeakerState {
     pub fn resume(&mut self, t_coil: f64, t_magnet: f64, mean_1s: f64, mean_60s: f64) {
         self.t_coil = t_coil;
         self.t_magnet = t_magnet;
+        self.t_peak = t_coil;
+        self.hard = false;
+        // Two means do not say when the energy came.  The most either
+        // budget can see of it later is all of it as late as it can have
+        // been: nothing before the gain is louder than full scale, so the
+        // last second's energy at full scale at the very end of it, and the
+        // rest of the minute's at full scale just before that second.  Each
+        // window then keeps every joule until the latest moment it could
+        // have left.  (A mean over full scale, from an older file, keeps
+        // its whole window instead.)
         self.history.clear();
-        let earlier = ((60.0 * mean_60s - mean_1s) / 59.0).max(0.0);
-        self.history.push_back((59.0, earlier));
-        self.history.push_back((1.0, mean_1s));
-        self.history_s = 60.0;
+        let full = self.worst_case_power(0.0);
+        let last = mean_1s.max(0.0);
+        let older = (60.0 * mean_60s - last).max(0.0);
+        let d_older = (older / full).min(59.0);
+        let d_last = (last / full).min(1.0);
+        if older > 0.0 && d_older > 0.0 {
+            self.history.push_back((d_older, older / d_older));
+        }
+        if d_last < 1.0 {
+            self.history.push_back((1.0 - d_last, 0.0));
+        }
+        if last > 0.0 && d_last > 0.0 {
+            self.history.push_back((d_last, last / d_last));
+        }
+        self.history_s = self.history.iter().map(|e| e.0).sum();
+    }
+
+    /// The governor's state a restart keeps: the latched fault, the peak
+    /// that set it and the reduction being released.  A state without them
+    /// (an older file) is latched whenever its coil is not under the
+    /// working ceiling, where a latch could still have been set.
+    pub fn resume_governor(&mut self, hard: Option<bool>, t_peak: f64, reduction_db: f64) {
+        let ceiling = self.spec.t_limit - self.spec.t_headroom;
+        self.t_peak = t_peak.max(self.t_coil);
+        self.hard = hard.unwrap_or(!(self.t_coil < ceiling));
+        self.reduction_db = reduction_db.max(0.0);
+        self.reducing = self.reduction_db > 0.0;
     }
 
     /// Mean power before the card's gain over the last `seconds` (W); time
@@ -137,10 +356,10 @@ impl SpeakerState {
         let mut t = 0.0;
         let mut e = 0.0;
         for (dt, p) in self.history.iter().rev() {
-            let take = dt.min(seconds - t);
-            if take <= 0.0 {
+            if t >= seconds {
                 break;
             }
+            let take = dt.min(seconds - t);
             e += p * take;
             t += take;
         }
@@ -167,6 +386,7 @@ impl SpeakerState {
         [
             self.t_coil,
             self.t_magnet,
+            self.t_peak,
             self.power,
             self.v_rms,
             self.reduction_db,
@@ -187,13 +407,15 @@ impl SpeakerState {
     pub fn govern(&mut self, globals: &Globals) -> f64 {
         let ceiling = self.spec.t_limit - self.spec.t_headroom;
         let start = ceiling - globals.t_window;
-        if self.t_coil > start {
+        // the hottest the coil may have been over the last step
+        let t = self.t_coil.max(self.t_peak);
+        if t > start {
             self.reducing = true;
-        } else if self.t_coil < start - globals.t_hysteresis {
+        } else if t < start - globals.t_hysteresis {
             self.reducing = false;
         }
         let thermal = if self.reducing {
-            ((self.t_coil - start) / globals.t_window * globals.t_reduction_max).max(0.0)
+            ((t - start) / globals.t_window * globals.t_reduction_max).max(0.0)
         } else {
             0.0
         };
@@ -325,6 +547,8 @@ mod tests {
         spec.t_headroom = 15.0;
         spec.p_limit_1s = 2.8154;
         spec.p_limit_60s = 2.5;
+        spec.vs_scale = 7.3;
+        spec.z_nominal = 4.2;
         let mut s = SpeakerState::new(spec, 35.0);
         let g = globals();
         // a 6.3 W burst (a full-scale sine into 4.2 ohm at 7.3 V): after 0.5 s

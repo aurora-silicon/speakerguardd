@@ -50,29 +50,73 @@ as measured.  Empty, short or overrun periods, capture errors and stream
 reopens are not; configuration scalars must be finite, with positive
 physical constants and valid window/budget domains.
 
-Time the daemon could not measure while the speakers play is not ignored and
-is not fatal either:
+Time the daemon could not measure is not ignored and is not fatal either.
+The rule is deliberately simple:
 
-* A period may be up to 100 ms late.  Beyond that, the model is charged for
-  the unmeasured time at the worst case: a full-scale square wave at the gain
-  the card currently applies.  A short gap (an xrun, stream start latency, a
-  PipeWire reconfiguration) therefore costs at most a brief extra reduction,
-  never protection.
+* The thermal model has one account, and every step advances it by exactly
+  the time stepped.  Time is either covered by measured sense frames, placed
+  by the read time less the capture's backlog, or charged as a full-scale
+  square wave at the least reduction the volume controls held at any time
+  since the last verified boundary (widened by the 500 ms the card can keep
+  playing samples converted at an earlier gain).  There are no tolerances,
+  no partial credits and no assumptions about when inside an uncertain
+  interval anything played.  Frames over time already charged add nothing.
+* A verified boundary is the end of measured frames, or two looks at closed
+  speakers with no sample-rate change event between them.  The events are
+  drained before each look's sample-rate read and again after it, so a
+  stream that comes and goes while the read takes its time is caught; an
+  event after the read is kept for the next look.  The card's change events
+  are required: without them nothing between two looks is known, and the
+  daemon never takes the lock.
+* The power budgets keep the power before the card's gain.  A measured
+  block counts at the most reduction it can have been converted at: any
+  value the controls held from 500 ms before it played, the card's own safe
+  level wherever the daemon may not have held a live lease, and anything
+  for the unknown value before the daemon set one.  A reduction too deep to
+  have delivered a block that loud did not convert it, and nothing before
+  the gain is louder than full scale.
+* Every renewal of the lock, including the one before the blocking sense
+  open, goes through the same decision: the account brought up to date,
+  then the hard limit, the reduction limit and the model's freshness.
 * A stream silent for 500 ms is closed and reopened.  Without a complete
-  period for longer than that, the daemon stops renewing the card's volume
-  lock, and the kernel drops the speakers to its safe level within 250 ms.
-  The lock is taken back after two complete periods in a row.
+  period for longer than that, the daemon gives the card's lock up (macaudio
+  locks the volume at once and stops streams converted at the old gain).
+  The lock is taken back after two complete periods in a row.  Any failure to
+  give the lock up is fatal: the exit gives it up too.
+
+Known costs of that rule, accepted on purpose:
+
+* A stream after idle is charged at full scale from the last look at closed
+  speakers to its first frames (the closed speakers are looked at every
+  25 ms, and opening the sense capture takes about 100 ms on the J700), and
+  the end of a stream from its last frames to the look that sees it closed.
+  On the J700 at 0 dB that is a few degrees on the coil model per stream.
+* A sense outage is charged at full scale at the least gain since the last
+  verified boundary until periods return, so the lock comes back later after
+  one than the speaker strictly needs.
+* For half a second after a gain change the budgets may count a block at
+  the earlier, deeper reduction, which slows a budget's release.  After a
+  start in the middle of playback the samples still playing count as loud
+  as they can have been, a reduction of up to about 1 dB for a second or
+  two on the J700.
 
 Exits are left for what the daemon cannot recover from (no card, a
-configuration error, a nonfinite model); the speakers are then at the card's
-safe level.  The unit restarts the daemon (`Restart=on-failure`, five
-attempts a minute), and the model state it writes once a second to
-`/run/speakerguardd/state` (`-s`), cooled by the time between the two runs,
-makes the new run start as hot as the old one stopped.  An unreadable state
-file is taken as a speaker at its working temperature limit.  These checks
-cannot make scheduling and ioctls atomic: a daemon that is late renewing the
-lock is covered by the kernel's 250 ms lock timeout, and the late time is
-charged to the model like any other gap.
+configuration error, a nonfinite model, a lock it cannot give up); the
+speakers are then at the card's safe level.  The unit restarts the daemon
+(`Restart=on-failure`, five attempts a minute).  A restart resumes the model
+only from the state a clean stop writes to `/run/speakerguardd/state`
+(`-s`): SIGTERM gives the lock up, waits out the 500 ms drain, accounts every
+moment and only then writes it, marked `released 1`, its coverage and its
+write named by one epoch.  It is resumed once: the run that resumes it
+overwrites it (or, failing that, removes it) before it can unlock, and does
+not unlock while it can do neither.  The time since it is charged at the
+card's safe level, and its two budget means are placed at full scale as
+late in their windows as the energy can have come.  Any other state (a
+crash, an older version's file, a state whose model trails its write) or none
+starts every speaker at its coil limit, latched, so the card stays with the
+kernel until the model has cooled under its working ceiling (about 4 s on the
+J700).  A daemon that is late renewing the lock is covered by the kernel's
+250 ms lock timeout, and the late time is charged like any other.
 
 ### Relation to speakersafetyd
 

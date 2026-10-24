@@ -23,6 +23,7 @@ mod state;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -101,9 +102,17 @@ fn find_card(requested: Option<&str>) -> std::io::Result<(Ctl, String)> {
 struct Card {
     ctl: Ctl,
     volume: Vec<ElemId>,
-    volume_max: i64,
+    /// The volume controls' maximum with the lock lifted, read after the
+    /// first successful ping.
+    volume_max: Option<i64>,
+    volume_min: i64,
     unlock: ElemId,
     sample_rate: ElemId,
+    /// Subscribed to the card's change events: the sample-rate control's
+    /// changes wake the loop instead of waiting for its next poll.
+    events: bool,
+    /// A sample-rate change event arrived since the loop last asked.
+    rate_event: bool,
 }
 
 impl Card {
@@ -115,31 +124,71 @@ impl Card {
         }
         let unlock = ctl.find_one(&cfg.controls.unlock)?;
         let sample_rate = ctl.find_one(&cfg.controls.sample_rate)?;
-        Ok((Card { ctl, volume, volume_max: 0, unlock, sample_rate }, name))
+        let events = match ctl.subscribe() {
+            Ok(()) => true,
+            Err(e) => {
+                warn!("control events: {e}; polling the sample rate instead");
+                false
+            }
+        };
+        Ok((Card { ctl, volume, volume_max: None, volume_min: 0, unlock, sample_rate, events, rate_event: false }, name))
     }
 
     /// Take the interlock: every volume control first, then the unlock
-    /// control, then the first ping -- which is when the card lifts the
-    /// volume limit, so the control's range is read after it.
+    /// control.  The first ping, which is when the card lifts the volume
+    /// limit, is the protection loop's to make.
     fn take_lock(&mut self) -> std::io::Result<()> {
         for id in &self.volume {
             self.ctl.lock(id)?;
         }
         self.ctl.lock(&self.unlock)?;
-        self.ping()?;
-        let (_, max) = self.ctl.int_range(&self.volume[0])?;
-        self.volume_max = max;
+        self.volume_min = self.ctl.int_range(&self.volume[0])?.0;
         Ok(())
     }
 
-    fn ping(&self) -> std::io::Result<()> {
-        self.ctl.write_int(&self.unlock, UNLOCK_MAGIC)
+    /// Give the unlock control's lock up and take it again: macaudio locks
+    /// the volume at once and clears the lease (a new owner starts with
+    /// none), whatever was left of it.
+    fn relinquish(&mut self) -> std::io::Result<()> {
+        self.ctl.unlock(&self.unlock)?;
+        self.ctl.lock(&self.unlock)
+    }
+
+    /// Every volume control to its minimum: within the card's limit
+    /// whether or not the volume is locked.
+    fn write_min(&self) -> std::io::Result<()> {
+        for id in &self.volume {
+            self.ctl.write_int(id, self.volume_min)?;
+        }
+        Ok(())
+    }
+
+    /// Renew the lock; the control's range is read after the first ping
+    /// lifted the limit.
+    fn ping(&mut self) -> std::io::Result<()> {
+        self.ctl.write_int(&self.unlock, UNLOCK_MAGIC)?;
+        if self.volume_max.is_none() {
+            let (_, max) = self.ctl.int_range(&self.volume[0])?;
+            self.volume_max = Some(max);
+        }
+        Ok(())
+    }
+
+    /// Drain the queued events; true while a sample-rate change is pending.
+    fn drain(&mut self) -> std::io::Result<bool> {
+        if self.events && self.ctl.events(self.sample_rate.numid)? {
+            self.rate_event = true;
+        }
+        Ok(self.rate_event)
     }
 
     fn write_reduction(&self, db: f64) -> std::io::Result<()> {
+        // without the range nothing can be written (a failed write: the
+        // loop leaves the card at its safe level)
+        let max = self.volume_max.ok_or_else(|| std::io::Error::from_raw_os_error(libc::EAGAIN))?;
         // round the reduction up to the control's step: the card never
         // applies less than the model asked for
-        let value = (self.volume_max as f64 - (db * STEPS_PER_DB - 1e-9).ceil()).max(0.0) as i64;
+        let value = (max as f64 - (db * STEPS_PER_DB - 1e-9).ceil()).max(self.volume_min as f64) as i64;
         for id in &self.volume {
             self.ctl.write_int(id, value)?;
         }
@@ -176,6 +225,12 @@ impl Hw for RealHw {
     fn set_reduction(&mut self, db: f64) -> std::io::Result<()> {
         self.card.write_reduction(db)
     }
+    fn set_min(&mut self) -> std::io::Result<()> {
+        self.card.write_min()
+    }
+    fn relinquish(&mut self) -> std::io::Result<()> {
+        self.card.relinquish()
+    }
     fn sample_rate(&mut self) -> std::io::Result<i64> {
         self.card.ctl.read_int(&self.card.sample_rate)
     }
@@ -187,11 +242,92 @@ impl Hw for RealHw {
     fn close_sense(&mut self) {
         self.capture = None;
     }
+    /// One sense period, or None once a sample-rate change arrives (the
+    /// loop then reads the rate at once) or after one poll.
     fn read_period(&mut self, words: &mut [i32]) -> std::io::Result<Option<bool>> {
+        let Some(c) = self.capture.as_mut() else {
+            return Err(std::io::Error::from_raw_os_error(libc::EBADFD));
+        };
+        if !self.card.events {
+            return c.read_period(words);
+        }
+        c.ensure_started()?;
+        let deadline = Instant::now() + Duration::from_millis(alsa::PERIOD_WAIT_MS as u64);
+        loop {
+            if self.card.drain()? {
+                return Ok(None);
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            let ms = (left.as_micros().div_ceil(1000)) as libc::c_int;
+            let (pcm, ctl) = alsa::poll2(c.fd(), Some(self.card.ctl.fd()), ms)?;
+            if pcm {
+                return c.read_ready(words);
+            }
+            if !ctl || Instant::now() >= deadline {
+                return Ok(None);
+            }
+        }
+    }
+    fn read_tail(&mut self, words: &mut [i32]) -> std::io::Result<usize> {
         match self.capture.as_mut() {
-            Some(c) => c.read_period(words),
+            Some(c) => c.read_tail(words),
+            None => Ok(0),
+        }
+    }
+    fn wait_rate_change(&mut self, timeout: Duration) -> bool {
+        if !self.card.events {
+            thread::sleep(timeout);
+            return false;
+        }
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self.card.drain() {
+                Ok(true) => return true,
+                Ok(false) => {}
+                Err(_) => {
+                    // the events are only a wake-up: fall back to the poll
+                    thread::sleep(deadline.saturating_duration_since(Instant::now()));
+                    return false;
+                }
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            let ms = (left.as_micros().div_ceil(1000)) as libc::c_int;
+            if alsa::poll2(self.card.ctl.fd(), None, ms).is_err() {
+                thread::sleep(deadline.saturating_duration_since(Instant::now()));
+                return false;
+            }
+        }
+    }
+    fn rate_events(&mut self) -> bool {
+        let pending = self.card.drain().unwrap_or(true);
+        self.card.rate_event = false;
+        pending
+    }
+    fn events_available(&self) -> bool {
+        self.card.events
+    }
+    fn queued(&mut self) -> std::io::Result<u64> {
+        match self.capture.as_mut() {
+            Some(c) => c.queued(),
             None => Err(std::io::Error::from_raw_os_error(libc::EBADFD)),
         }
+    }
+}
+
+/// Set by SIGTERM/SIGINT: hand the card back and exit.
+static STOP: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_stop(_: libc::c_int) {
+    STOP.store(true, Ordering::Relaxed);
+}
+
+fn catch_stop_signals() {
+    for sig in [libc::SIGTERM, libc::SIGINT] {
+        // SAFETY: the handler only stores to an atomic.
+        unsafe { libc::signal(sig, on_stop as *const () as libc::sighandler_t) };
     }
 }
 
@@ -217,9 +353,26 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     info!("{}: {} speakers, sense PCM {}, period {} frames", path.display(), cfg.speakers.len(), cfg.globals.sense_pcm, cfg.globals.period);
     let (card, card_name) = Card::open(Some(&name), &cfg)?;
     let mut hw = RealHw { card, globals: cfg.globals.clone(), capture: None };
+    catch_stop_signals();
     let mut guard = Guard::start(&mut hw, &cfg, args.max_reduction, args.state.clone())?;
-    info!("{card_name}: volume lock taken, {} volume control(s), max {}", hw.card.volume.len(), hw.card.volume_max);
+    info!("{card_name}: {} volume control(s) and the unlock control locked", hw.card.volume.len());
+    let mut stopping = false;
     loop {
+        if STOP.load(Ordering::Relaxed) && !stopping {
+            if let Err(e) = guard.stop(&mut hw) {
+                // not a clean stop: the state stays a status readout and the
+                // exit gives the lock up
+                guard.save(&hw);
+                return Err(e);
+            }
+            stopping = true;
+        }
+        if stopping && guard.released(&hw) {
+            // the lock given up and drained, every moment accounted
+            guard.final_save(&hw)?;
+            info!("stopped");
+            return Ok(());
+        }
         if let Err(e) = guard.tick(&mut hw) {
             // the next run starts from where this model was
             guard.save(&hw);
