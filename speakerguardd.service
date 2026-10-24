@@ -15,6 +15,13 @@ Type=simple
 # the speakers at its safe level until the daemon takes the volume lock.
 ExecStart=/usr/bin/speakerguardd -c /usr/share/speakerguardd --wait-for-card 30
 UMask=0066
+# Time the daemon is held up is bounded only by the card's 250 ms lease: run
+# ahead of normal tasks (below PipeWire's audio threads, 83-88), keep every
+# page resident (the daemon calls mlockall), and stop a runaway loop.
+CPUSchedulingPolicy=fifo
+CPUSchedulingPriority=50
+LimitMEMLOCK=64M
+LimitRTTIME=1s
 RuntimeDirectory=speakerguardd
 RuntimeDirectoryPreserve=yes
 Restart=on-failure
