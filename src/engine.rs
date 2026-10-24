@@ -864,6 +864,7 @@ mod tests {
     const J700: &str = include_str!("../conf/apple/j700.conf");
     const J316: &str = include_str!("../conf/apple/j316.conf");
     const J413: &str = include_str!("../conf/apple/j413.conf");
+    const J616: &str = include_str!("../conf/apple/j616.conf");
 
     fn cfg(text: &str) -> Config {
         Config::parse(text).unwrap()
@@ -1147,8 +1148,21 @@ mod tests {
 
     #[test]
     fn configs_parse_and_governors_check() {
-        for text in [J316, J413, J700] {
+        for text in [J316, J413, J616, J700] {
             cfg(text);
+        }
+        // the J616's sense order follows its slots: LW1 RW1 LW2 RW2 LT RT
+        let j616 = cfg(J616);
+        let ch = |n: &str| { let s = &j616.speakers[idx(&j616, n)]; (s.is_chan.unwrap(), s.vs_chan) };
+        assert_eq!(ch("Left Woofer 1"), (0, 1));
+        assert_eq!(ch("Right Woofer 2"), (6, 7));
+        assert_eq!(ch("Left Tweeter"), (8, 9));
+        assert_eq!(ch("Right Tweeter"), (10, 11));
+        // the S2 family values are the J316's
+        let j316 = cfg(J316);
+        for n in ["Left Woofer 1", "Left Tweeter"] {
+            let (a, b) = (&j616.speakers[idx(&j616, n)], &j316.speakers[idx(&j316, n)]);
+            assert_eq!((a.tr_coil, a.tau_coil, a.r_ff, a.vi_tr_coil, a.z_nominal), (b.tr_coil, b.tau_coil, b.r_ff, b.vi_tr_coil, b.z_nominal));
         }
         assert!(Config::parse(&J316.replace("[Globals]", "[Globals]\ngovernor = asahi")).is_ok());
         assert!(Config::parse(&J700.replace("[Globals]", "[Globals]\ngovernor = asahi")).is_err());
