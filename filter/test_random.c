@@ -12,16 +12,21 @@
  *
  * Every case is random signals (tones, bursts out of silence, chirps, square
  * waves, steps, impulses, noise, in any mix, each channel its own), random
- * block sizes and, for some, another window and release.  After each case:
+ * block sizes and, for some, another window and release.  Then the shapes
+ * that came closest, made on purpose: steps, impulse trains at and around
+ * the resonance, square waves at it and at its odd fractions, and tones
+ * that jump from quiet to full scale, from silence or from a quiet tone,
+ * at many phases.  After each:
  *
- *  (a) the oracle's cone never passes Xmax on either channel;
+ *  (a) the oracle's cone stays under TARGET (0.9) of Xmax on either channel;
  *  (b) no output sample passes the sample-peak ceiling;
  *  (c) the output is the input delayed by the reported latency, times a
  *      gain in [0, 1]: never louder, never another sign;
  *  (d) where the limiter never took gain, the output is the delayed input,
  *      bit for bit.
  *
- * XLIM_CASES (default 300) and XLIM_SEED (default 1) set the run.
+ * XLIM_CASES (default 300) and XLIM_SEED (default 1) set the run.  The
+ * worst cone of each part is printed.
  */
 #include "xlim_core.h"
 
@@ -32,8 +37,11 @@
 #include <string.h>
 
 #define RATE 48000.0
+/* the design target for the true cone, a fraction of Xmax */
+#define TARGET 0.9
 
 static int failures;
+static double worst;
 
 /* xorshift64*: the cases depend only on the seed */
 static uint64_t rs;
@@ -144,13 +152,82 @@ static void program(float *s, size_t n)
 	free(acc);
 }
 
+/* Checks (a) to (d) on one run; returns 1 on a failure. */
+static int check(const char *what, int id, const struct xlim_params *p, float *const in[XLIM_CHANNELS], float *const out[XLIM_CHANNELS], size_t n, double min_gain)
+{
+	size_t i, c, d = p->window + p->hold - 1;
+	int bad = 0;
+
+	for (c = 0; c < XLIM_CHANNELS; c++) {
+		struct oracle o;
+
+		oracle_init(&o, p);
+		for (i = 0; i < n; i++)
+			oracle_step(&o, out[c][i] * p->v_fs[c]);
+		if (o.xpk / p->x_max > worst)
+			worst = o.xpk / p->x_max;
+		/* (a) */
+		if (o.xpk > TARGET * p->x_max) {
+			printf("FAIL %s %d ch %zu: cone %.4f mm, %.4f of Xmax\n", what, id, c, 1e3 * o.xpk, o.xpk / p->x_max);
+			bad = 1;
+		}
+		for (i = 0; i < n; i++) {
+			double y = out[c][i], x = i >= d ? in[c][i - d] : 0.0;
+			/* (b) */
+			if (fabs(y) > p->peak + 1e-6) {
+				printf("FAIL %s %d ch %zu: sample %zu at %.6f FS\n", what, id, c, i, y);
+				bad = 1;
+				break;
+			}
+			/* (c) */
+			if (fabs(y) > fabs(x) * (1 + 1e-6) + 1e-9 || y * x < 0) {
+				printf("FAIL %s %d ch %zu: sample %zu is %.9g, the delayed input %.9g\n", what, id, c, i, y, x);
+				bad = 1;
+				break;
+			}
+			/* (d) */
+			if (min_gain == 1.0 && y != x) {
+				printf("FAIL %s %d ch %zu: gain never moved, yet sample %zu is %.9g, not %.9g\n", what, id, c, i, y, x);
+				bad = 1;
+				break;
+			}
+		}
+	}
+	return bad;
+}
+
+/* Run the limiter over in[] into out[], in blocks of random size. */
+static double run(const struct xlim_params *p, float *const in[XLIM_CHANNELS], float *const out[XLIM_CHANNELS], size_t n)
+{
+	struct xlim l;
+	double mg;
+	size_t i;
+
+	if (xlim_init(&l, p) != 0) {
+		printf("FAIL init\n");
+		exit(2);
+	}
+	for (i = 0; i < n;) {
+		size_t b = 1 + (size_t)(urand() * (urand() < 0.2 ? 4096 : 300));
+		if (b > n - i)
+			b = n - i;
+		const float *bi[XLIM_CHANNELS] = { in[0] + i, in[1] + i };
+		float *bo[XLIM_CHANNELS] = { out[0] + i, out[1] + i };
+		xlim_run(&l, bi, bo, b);
+		i += b;
+	}
+	mg = l.min_gain;
+	xlim_free(&l);
+	return mg;
+}
+
 static int run_case(int id, uint64_t seed)
 {
 	struct xlim_params p;
-	struct xlim l;
-	size_t n, i, c, d;
+	size_t n, c;
 	float *in[XLIM_CHANNELS], *out[XLIM_CHANNELS];
-	int bad = 0;
+	double mg;
+	int bad;
 
 	rs = seed * 0x9e3779b97f4a7c15ull + 1;
 	xlim_params_j700(&p, RATE);
@@ -168,58 +245,87 @@ static int run_case(int id, uint64_t seed)
 		memcpy(in[1], in[0], n * sizeof(float));
 	else
 		program(in[1], n);
-	if (xlim_init(&l, &p) != 0) {
-		printf("FAIL case %d: init\n", id);
-		return 1;
-	}
-	for (i = 0; i < n;) {
-		size_t b = 1 + (size_t)(urand() * (urand() < 0.2 ? 4096 : 300));
-		if (b > n - i)
-			b = n - i;
-		const float *bi[XLIM_CHANNELS] = { in[0] + i, in[1] + i };
-		float *bo[XLIM_CHANNELS] = { out[0] + i, out[1] + i };
-		xlim_run(&l, bi, bo, b);
-		i += b;
-	}
-	d = p.window + p.hold - 1;
-	for (c = 0; c < XLIM_CHANNELS; c++) {
-		struct oracle o;
-
-		oracle_init(&o, &p);
-		for (i = 0; i < n; i++)
-			oracle_step(&o, out[c][i] * p.v_fs[c]);
-		/* (a) */
-		if (o.xpk > p.x_max) {
-			printf("FAIL case %d (seed %llu) ch %zu: cone %.4f mm, limit %.3f\n", id, (unsigned long long)seed, c, 1e3 * o.xpk, 1e3 * p.x_max);
-			bad = 1;
-		}
-		for (i = 0; i < n; i++) {
-			double y = out[c][i], x = i >= d ? in[c][i - d] : 0.0;
-			/* (b) */
-			if (fabs(y) > p.peak + 1e-6) {
-				printf("FAIL case %d ch %zu: sample %zu at %.6f FS\n", id, c, i, y);
-				bad = 1;
-				break;
-			}
-			/* (c) */
-			if (fabs(y) > fabs(x) * (1 + 1e-6) + 1e-9 || y * x < 0) {
-				printf("FAIL case %d ch %zu: sample %zu is %.9g, the delayed input %.9g\n", id, c, i, y, x);
-				bad = 1;
-				break;
-			}
-			/* (d) */
-			if (l.min_gain == 1.0 && y != x) {
-				printf("FAIL case %d ch %zu: gain never moved, yet sample %zu is %.9g, not %.9g\n", id, c, i, y, x);
-				bad = 1;
-				break;
-			}
-		}
-	}
-	xlim_free(&l);
+	mg = run(&p, in, out, n);
+	bad = check("case", id, &p, in, out, n, mg);
+	if (bad)
+		printf("  (seed %llu)\n", (unsigned long long)seed);
 	for (c = 0; c < XLIM_CHANNELS; c++) {
 		free(in[c]);
 		free(out[c]);
 	}
+	return bad;
+}
+
+/*
+ * The shapes that came closest, on purpose, both channels alike.  `lead`:
+ * 0 silence before, 1 a -20 dBFS tone at resonance before (the cone already
+ * moving under full gain).  Each runs 0.4 s, the event at 0.1 s.
+ */
+static int shapes(void)
+{
+	const double f0 = 521.95, T0 = 0.1;
+	const size_t n = (size_t)(0.4 * RATE);
+	size_t at = (size_t)(T0 * RATE);
+	struct xlim_params p;
+	float *in[XLIM_CHANNELS], *out[XLIM_CHANNELS];
+	int bad = 0, id = 0, lead, k;
+	size_t i;
+
+	xlim_params_j700(&p, RATE);
+	for (k = 0; k < XLIM_CHANNELS; k++) {
+		in[k] = calloc(n, sizeof(float));
+		out[k] = calloc(n, sizeof(float));
+	}
+#define SHAPE(expr) do { \
+		for (i = 0; i < n; i++) { \
+			double t = ((double)i - (double)at) / RATE, v = lead && i < at ? 0.1 * sin(2 * M_PI * f0 * (double)i / RATE) : 0.0; \
+			if (i >= at) v = (expr); \
+			(void)t; \
+			in[0][i] = in[1][i] = (float)fmax(-1.5, fmin(1.5, v)); \
+		} \
+		bad |= check("shape", id++, &p, in, out, n, run(&p, in, out, n)); \
+	} while (0)
+	for (lead = 0; lead < 2; lead++) {
+		double amps[] = { 0.5, 0.8, 1.0, 1.3 }, phase;
+		size_t j;
+		/* steps, up and down, held 0.1 s then back to silence */
+		for (j = 0; j < 4; j++) {
+			SHAPE(t < 0.1 ? amps[j] : 0.0);
+			SHAPE(t < 0.1 ? -amps[j] : 0.0);
+		}
+		/* steps at 16 phases of the lead tone */
+		for (phase = 0; phase < 16; phase++) {
+			size_t keep = at;
+			at = (size_t)(T0 * RATE + phase * RATE / f0 / 16);
+			SHAPE(1.0);
+			at = keep;
+		}
+		/* one impulse, then trains at and around the resonance period */
+		SHAPE(i == at ? 1.0 : 0.0);
+		{
+			double periods[] = { RATE / f0, RATE / f0 - 1, RATE / f0 + 1, RATE / f0 / 2, RATE / f0 * 2 };
+			for (j = 0; j < 5; j++) {
+				size_t pr = (size_t)(periods[j] + 0.5);
+				SHAPE((i - at) % pr == 0 && i - at < 30 * pr ? 1.0 : 0.0);
+			}
+		}
+		/* square waves at the resonance, its odd fractions and around it */
+		{
+			double fs[] = { f0 / 7, f0 / 5, f0 / 3, f0, 100, 150, 200, 261, 300, 400, 500, 600 };
+			for (j = 0; j < 12; j++)
+				for (phase = 0; phase < 4; phase++)
+					SHAPE(sin(2 * M_PI * fs[j] * t + phase * M_PI / 2) >= 0 ? 1.0 : -1.0);
+		}
+		/* a tone at resonance that jumps to full scale, at 8 phases */
+		for (phase = 0; phase < 8; phase++)
+			SHAPE(sin(2 * M_PI * f0 * ((double)i / RATE) + phase * M_PI / 4));
+	}
+#undef SHAPE
+	for (k = 0; k < XLIM_CHANNELS; k++) {
+		free(in[k]);
+		free(out[k]);
+	}
+	printf("shapes: %d, worst cone %.4f of Xmax\n", id, worst);
 	return bad;
 }
 
@@ -258,6 +364,10 @@ int main(void)
 	}
 	for (id = 0; id < cases; id++)
 		failures += run_case(id, seed0 + (uint64_t)id);
-	printf("random: %d cases from seed %llu, %s (%d failures)\n", cases, (unsigned long long)seed0, failures ? "FAILED" : "ok", failures);
+	printf("random: %d cases from seed %llu, worst cone %.4f of Xmax\n", cases, (unsigned long long)seed0, worst);
+	worst = 0;
+	rs = 12345;
+	failures += shapes();
+	printf("%s (%d failures)\n", failures ? "FAILED" : "ok", failures);
 	return failures != 0;
 }

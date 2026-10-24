@@ -75,7 +75,7 @@ void xlim_run(struct xlim *l, const float *const in[XLIM_CHANNELS], float *const
 /* The displacement (m) and velocity (m/s) the model predicts for one channel's
  * next input sample (for tests; advances that channel's model state). */
 double xlim_model_x(struct xlim_biquad *x, double volts);
-/* The J700's facts (macOS 25G83 AID44 loudspeaker manager): see DESIGN.md. */
+/* The MacBook Neo (J700) driver's values and limits. */
 void xlim_params_j700(struct xlim_params *p, double rate);
 
 #endif

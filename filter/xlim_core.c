@@ -68,19 +68,27 @@ void xlim_params_j700(struct xlim_params *p, double rate)
 	p->x_max = 0.565e-3;
 	p->v_max = 0.0;
 	p->peak = 1.0;
-	p->margin = 0.9;
-	p->release = 0.200;
-	/* 4 ms: the 3.333 ms attack plus the 0.667 ms look-ahead */
-	p->window = (size_t)(0.004 * rate + 0.5);
 	/*
-	 * 2 ms of the cone's memory (its ringing at f0 decays by e in 1.2 ms):
+	 * The true cone must stay under 0.9 of Xmax.  The gain falling across
+	 * the cone's memory adds a little to what the model predicts at the
+	 * requirement, so the prediction is held lower, at 0.89.  Against an
+	 * independent model of the cone, the worst of 87000 random programs
+	 * and 172 worst-case shapes was then 0.8956 of Xmax (0.9057 with the
+	 * prediction held at 0.9).
+	 */
+	p->margin = 0.89;
+	p->release = 0.200;
+	/* the 3.333 ms attack ramp */
+	p->window = (size_t)(0.0033333 * rate + 0.5);
+	/*
+	 * 4 ms of the cone's memory (its ringing at f0 decays by e in 1.2 ms):
 	 * the ramp is over that long before the frame that needs it goes out.
 	 * Without it the cone passed Xmax by up to 13 % on random programs (a
 	 * gain falling across the cone's response is not a gain applied to
-	 * it); with it the worst of 17000 random cases was 0.932 of Xmax.
-	 * 287 frames of latency in all at 48 kHz, inside macOS's 352.
+	 * it).  351 frames of latency in all at 48 kHz, inside a 352-frame
+	 * (7.3 ms) budget.
 	 */
-	p->hold = (size_t)(0.002 * rate + 0.5);
+	p->hold = (size_t)(0.004 * rate + 0.5);
 }
 
 static int valid(const struct xlim_params *p)

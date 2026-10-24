@@ -175,7 +175,7 @@ int main(void)
 	}
 
 	/* latency: an impulse comes out exactly window + hold - 1 frames later,
-	 * unchanged, and the J700's total is inside macOS's 352 frames */
+	 * unchanged, and the J700's total is inside the 352-frame budget */
 	{
 		struct xlim l;
 		size_t n = 2000, lat = p.window + p.hold - 1;

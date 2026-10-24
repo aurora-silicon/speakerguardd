@@ -46,7 +46,7 @@ int main(int argc, char **argv)
 	if (!d || fn(1)) { printf("FAIL descriptor\n"); return 1; }
 	printf("%s: %lu ports\n", d->label, d->nports);
 	D ctl[32] = {0};
-	float vals[][2] = { {4, 7.30}, {5, 7.33}, {6, 4.3}, {7, 0.74}, {8, 0.16}, {9, 1720}, {10, 0.14}, {11, 0.565}, {12, 0}, {13, 1.0}, {14, 0.9}, {15, 200}, {16, 4}, {17, 2} };
+	float vals[][2] = { {4, 7.30}, {5, 7.33}, {6, 4.3}, {7, 0.74}, {8, 0.16}, {9, 1720}, {10, 0.14}, {11, 0.565}, {12, 0}, {13, 1.0}, {14, 0.89}, {15, 200}, {16, 3.3333f}, {17, 4} };
 	enum { GAIN = 18, LATENCY = 19 };
 	enum { N = 48000 };
 	static float in[N], out[N], out2[N];
@@ -69,9 +69,9 @@ int main(int argc, char **argv)
 		for (int i = N / 2; i < N; i++) pk = fmax(pk, fabs(out[i]));
 		printf("%.2f FS at 522 Hz: output peak %.3f FS, min gain %.1f dB, latency %.0f frames\n", a, pk, gmin, ctl[LATENCY]);
 		if (t == 0 && (gmin != 0.0 || fabs(pk - 0.1) > 1e-3)) { printf("FAIL quiet tone changed\n"); fails++; }
-		/* 0.565 mm / (0.196 mm/V * 7.3 V) = 0.395 FS; held at 90% of the limit */
+		/* 0.565 mm / (0.196 mm/V * 7.3 V) = 0.395 FS; held at 89% of the limit */
 		if (t == 1 && !(pk < 0.40 && pk > 0.30)) { printf("FAIL loud tone not limited to ~0.36 FS\n"); fails++; }
-		if (ctl[LATENCY] != 287) { printf("FAIL latency %g\n", ctl[LATENCY]); fails++; }
+		if (ctl[LATENCY] != 351) { printf("FAIL latency %g\n", ctl[LATENCY]); fails++; }
 		if (t == 1) {
 			/* a control changes in the audio thread: no allocation, and the
 			 * new set is taken (a longer hold: more latency) */
@@ -84,7 +84,7 @@ int main(int argc, char **argv)
 			}
 			counting = 0;
 			if (CAN_COUNT && allocs) { printf("FAIL %d allocations in the audio thread\n", allocs); fails++; }
-			if (ctl[LATENCY] != 335) { printf("FAIL the new hold was not taken: latency %g\n", ctl[LATENCY]); fails++; }
+			if (ctl[LATENCY] != 303) { printf("FAIL the new hold was not taken: latency %g\n", ctl[LATENCY]); fails++; }
 			/* an invalid control (not a number) keeps the limiter as it was */
 			ctl[16] = NAN;
 			for (int i = 0; i < N; i += 256) {
@@ -93,9 +93,9 @@ int main(int argc, char **argv)
 			}
 			pk = 0;
 			for (int i = N / 2; i < N; i++) pk = fmax(pk, fabs(out[i]));
-			if (!(pk < 0.40) || ctl[LATENCY] != 335) { printf("FAIL an invalid window changed the limiter: peak %.3f, latency %g\n", pk, ctl[LATENCY]); fails++; }
-			ctl[16] = 4;
-			ctl[17] = 2;
+			if (!(pk < 0.40) || ctl[LATENCY] != 303) { printf("FAIL an invalid window changed the limiter: peak %.3f, latency %g\n", pk, ctl[LATENCY]); fails++; }
+			ctl[16] = 3.3333f;
+			ctl[17] = 4;
 		}
 		d->clean(h);
 	}
