@@ -23,6 +23,7 @@ mod state;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -101,7 +102,10 @@ fn find_card(requested: Option<&str>) -> std::io::Result<(Ctl, String)> {
 struct Card {
     ctl: Ctl,
     volume: Vec<ElemId>,
-    volume_max: i64,
+    /// The volume controls' maximum with the lock lifted, read after the
+    /// first successful ping.
+    volume_max: Option<i64>,
+    volume_min: i64,
     unlock: ElemId,
     sample_rate: ElemId,
 }
@@ -115,31 +119,48 @@ impl Card {
         }
         let unlock = ctl.find_one(&cfg.controls.unlock)?;
         let sample_rate = ctl.find_one(&cfg.controls.sample_rate)?;
-        Ok((Card { ctl, volume, volume_max: 0, unlock, sample_rate }, name))
+        Ok((Card { ctl, volume, volume_max: None, volume_min: 0, unlock, sample_rate }, name))
     }
 
     /// Take the interlock: every volume control first, then the unlock
-    /// control, then the first ping -- which is when the card lifts the
-    /// volume limit, so the control's range is read after it.
+    /// control.  The first ping, which is when the card lifts the volume
+    /// limit, is the protection loop's to make.
     fn take_lock(&mut self) -> std::io::Result<()> {
         for id in &self.volume {
             self.ctl.lock(id)?;
         }
         self.ctl.lock(&self.unlock)?;
-        self.ping()?;
-        let (_, max) = self.ctl.int_range(&self.volume[0])?;
-        self.volume_max = max;
+        self.volume_min = self.ctl.int_range(&self.volume[0])?.0;
         Ok(())
     }
 
-    fn ping(&self) -> std::io::Result<()> {
-        self.ctl.write_int(&self.unlock, UNLOCK_MAGIC)
+    /// Every volume control to its minimum: within the card's limit
+    /// whether or not the volume is locked.
+    fn write_min(&self) -> std::io::Result<()> {
+        for id in &self.volume {
+            self.ctl.write_int(id, self.volume_min)?;
+        }
+        Ok(())
+    }
+
+    /// Renew the lock; the control's range is read after the first ping
+    /// lifted the limit.
+    fn ping(&mut self) -> std::io::Result<()> {
+        self.ctl.write_int(&self.unlock, UNLOCK_MAGIC)?;
+        if self.volume_max.is_none() {
+            let (_, max) = self.ctl.int_range(&self.volume[0])?;
+            self.volume_max = Some(max);
+        }
+        Ok(())
     }
 
     fn write_reduction(&self, db: f64) -> std::io::Result<()> {
+        // without the range nothing can be written (a failed write: the
+        // loop leaves the card at its safe level)
+        let max = self.volume_max.ok_or_else(|| std::io::Error::from_raw_os_error(libc::EAGAIN))?;
         // round the reduction up to the control's step: the card never
         // applies less than the model asked for
-        let value = (self.volume_max as f64 - (db * STEPS_PER_DB - 1e-9).ceil()).max(0.0) as i64;
+        let value = (max as f64 - (db * STEPS_PER_DB - 1e-9).ceil()).max(self.volume_min as f64) as i64;
         for id in &self.volume {
             self.ctl.write_int(id, value)?;
         }
@@ -176,6 +197,9 @@ impl Hw for RealHw {
     fn set_reduction(&mut self, db: f64) -> std::io::Result<()> {
         self.card.write_reduction(db)
     }
+    fn set_min(&mut self) -> std::io::Result<()> {
+        self.card.write_min()
+    }
     fn sample_rate(&mut self) -> std::io::Result<i64> {
         self.card.ctl.read_int(&self.card.sample_rate)
     }
@@ -192,6 +216,26 @@ impl Hw for RealHw {
             Some(c) => c.read_period(words),
             None => Err(std::io::Error::from_raw_os_error(libc::EBADFD)),
         }
+    }
+    fn queued(&mut self) -> std::io::Result<u64> {
+        match self.capture.as_mut() {
+            Some(c) => c.queued(),
+            None => Err(std::io::Error::from_raw_os_error(libc::EBADFD)),
+        }
+    }
+}
+
+/// Set by SIGTERM/SIGINT: hand the card back and exit.
+static STOP: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_stop(_: libc::c_int) {
+    STOP.store(true, Ordering::Relaxed);
+}
+
+fn catch_stop_signals() {
+    for sig in [libc::SIGTERM, libc::SIGINT] {
+        // SAFETY: the handler only stores to an atomic.
+        unsafe { libc::signal(sig, on_stop as *const () as libc::sighandler_t) };
     }
 }
 
@@ -217,9 +261,21 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     info!("{}: {} speakers, sense PCM {}, period {} frames", path.display(), cfg.speakers.len(), cfg.globals.sense_pcm, cfg.globals.period);
     let (card, card_name) = Card::open(Some(&name), &cfg)?;
     let mut hw = RealHw { card, globals: cfg.globals.clone(), capture: None };
+    catch_stop_signals();
     let mut guard = Guard::start(&mut hw, &cfg, args.max_reduction, args.state.clone())?;
-    info!("{card_name}: volume lock taken, {} volume control(s), max {}", hw.card.volume.len(), hw.card.volume_max);
+    info!("{card_name}: {} volume control(s) and the unlock control locked", hw.card.volume.len());
+    let mut stopping = false;
     loop {
+        if STOP.load(Ordering::Relaxed) && !stopping {
+            guard.stop();
+            stopping = true;
+        }
+        if stopping && guard.released(&hw) {
+            // the card has its volume back: the state says so
+            guard.save(&hw);
+            info!("stopped");
+            return Ok(());
+        }
         if let Err(e) = guard.tick(&mut hw) {
             // the next run starts from where this model was
             guard.save(&hw);

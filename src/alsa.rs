@@ -306,6 +306,7 @@ const PCM_IOCTL_PREPARE: libc::c_ulong = io(b'A', 0x40);
 const PCM_IOCTL_START: libc::c_ulong = io(b'A', 0x42);
 const PCM_IOCTL_DROP: libc::c_ulong = io(b'A', 0x43);
 const PCM_IOCTL_READI_FRAMES: libc::c_ulong = ior::<Xferi>(b'A', 0x51);
+const PCM_IOCTL_DELAY: libc::c_ulong = ior::<libc::c_long>(b'A', 0x21);
 
 /// The four calls the period reader makes on a capture PCM, so that its
 /// read discipline can be checked against a simulated kernel.
@@ -318,6 +319,9 @@ pub trait PcmIo {
     /// poll(POLLIN) for at most `timeout_ms`.  True when the kernel reports
     /// the stream readable (a whole period available, or an error state).
     fn wait(&mut self, timeout_ms: libc::c_int) -> io::Result<bool>;
+    /// DELAY: for a capture, the frames captured and not yet read (the
+    /// kernel syncs the hardware pointer first).
+    fn delay(&mut self) -> io::Result<i64>;
 }
 
 /// The capture PCM file itself.
@@ -352,6 +356,12 @@ impl PcmIo for PcmFile {
             return Err(e);
         }
         Ok(ret != 0)
+    }
+
+    fn delay(&mut self) -> io::Result<i64> {
+        let mut frames: libc::c_long = 0;
+        ioctl(&self.file, PCM_IOCTL_DELAY, &mut frames)?;
+        Ok(frames as i64)
     }
 }
 
@@ -452,6 +462,12 @@ impl<P: PcmIo> PeriodReader<P> {
     /// ping interval: the caller must ping the lock and call again, because
     /// the card locks the volume 250 ms after the last ping and nothing may
     /// block longer than that.
+    /// The frames the capture holds beyond what has been read: how long
+    /// ago the period just read ended.
+    pub fn queued(&mut self) -> io::Result<u64> {
+        Ok(self.io.delay()?.max(0) as u64)
+    }
+
     pub fn read_period(&mut self, buf: &mut [i32]) -> io::Result<Option<bool>> {
         assert!(buf.len() >= self.period * self.channels);
         if !self.started {
@@ -504,6 +520,7 @@ mod tests {
         assert_eq!(PCM_IOCTL_HW_PARAMS, 0xc260_4111);
         assert_eq!(PCM_IOCTL_READI_FRAMES, 0x8018_4151);
         assert_eq!(PCM_IOCTL_START, 0x4142);
+        assert_eq!(PCM_IOCTL_DELAY, 0x8008_4121);
     }
 }
 
@@ -674,6 +691,16 @@ pub mod sim {
                 self.short_reads += 1;
             }
             Ok(n as i64)
+        }
+        fn delay(&mut self) -> io::Result<i64> {
+            match self.state {
+                State::Xrun => Err(io::Error::from_raw_os_error(libc::EPIPE)),
+                // DELAY syncs the pointer, as a read does
+                _ => {
+                    self.irq_hw = self.hw;
+                    Ok((self.hw - self.appl) as i64)
+                }
+            }
         }
         fn wait(&mut self, timeout_ms: libc::c_int) -> io::Result<bool> {
             let deadline = self.t + Duration::from_millis(timeout_ms as u64);
