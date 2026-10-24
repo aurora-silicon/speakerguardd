@@ -922,6 +922,10 @@ impl Guard {
     /// One pass of the loop: idle accounting, or one sense period.
     pub fn tick<H: Hw>(&mut self, hw: &mut H) -> Result<(), Box<dyn Error>> {
         let globals = self.globals.clone();
+        // before the rate read: a stream it shows was there by then, and the
+        // time without sense data is counted from here, however long the
+        // daemon is held up after the read
+        let look = hw.now();
         // a change event since the last pass (read before the rate, so that
         // a change after the read is kept for the next pass)
         let changed = std::mem::take(&mut self.event_pending) | hw.rate_events();
@@ -1000,7 +1004,7 @@ impl Guard {
             self.charge(now)?;
             self.playing = true;
             self.closed_seen = false;
-            self.seen_to = Some(now);
+            self.seen_to = Some(look);
         }
         if self.seen_to.is_none() {
             self.seen_to = Some(self.account_to);
@@ -1960,6 +1964,29 @@ mod tests {
             assert!(g.armed(), "{level}: not armed at the end");
             assert_eq!(hw.relinquished, 0, "{level}: {} hand-offs, the coil at {:.1} C", hw.relinquished, g.speakers[0].t_coil);
         }
+    }
+
+    /// The time without sense data counts from before the rate read that
+    /// shows a stream.  A read held up 0.12 s (the stream may have played
+    /// all through it) leaves that much less of the blind limit, not more:
+    /// counted from after the read, the lease could be renewed 0.12 s
+    /// longer blind.
+    #[test]
+    fn blindness_counts_from_before_the_rate_read() {
+        let cfg = j700();
+        let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
+        hw.level = Box::new(|_| 0.0);
+        hw.playing = Box::new(|t| t >= secs(2.0));
+        hw.sensing = Box::new(|t| t < secs(2.0));
+        hw.control_delay = Box::new(|t| if (secs(1.97)..secs(2.0)).contains(&t) { Duration::from_millis(120) } else { Duration::ZERO });
+        let mut g = Guard::start(&mut hw, &cfg, 20.0, tmp_state()).unwrap();
+        run_until(&mut g, &mut hw, secs(1.97)).unwrap();
+        assert!(g.armed() && !g.playing);
+        let look = hw.now();
+        g.tick(&mut hw).unwrap();
+        assert!(g.playing && hw.t >= secs(2.09), "the slow read did not show the stream");
+        let seen = g.seen_to.unwrap();
+        assert!(seen <= look, "blindness counted from {:?} after the look", seen.saturating_duration_since(look));
     }
 
     /// "Peak volume": with a cool speaker and a loud but sustainable program
