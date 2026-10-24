@@ -15,10 +15,19 @@
 //! stale snapshot; the rest of the gap, and all of it after a run that had
 //! released the card, is charged at the worst case the card's own safe
 //! level lets through.
+//!
+//! The engine's models (engine.rs) are saved in the same file, after the
+//! legacy speaker lines (`asahi ...`, `unified ...`): one atomic write, one
+//! coverage epoch, one armed flag and per model its latch, so the same
+//! continuity rules hold for every model.  A model the file does not carry
+//! starts latched at its limit.  A J700 file without the engine is exactly
+//! what 0.1.6 wrote; a reader older than the engine refuses a file with
+//! engine lines, and so starts latched too.
 
 use std::time::Duration;
 
 use crate::config::Globals;
+use crate::engine::{state_name, Engine, SavedAsahi, SavedUnified};
 use crate::model::SpeakerState;
 
 const MAGIC: &str = "speakerguardd-state 2";
@@ -50,9 +59,18 @@ pub struct Saved {
     /// (a file without the line counts as one that may have).
     pub armed: bool,
     pub speakers: Vec<SavedSpeaker>,
+    /// The engine's models (none in a file written without them).
+    pub asahi: Vec<SavedAsahi>,
+    pub unified: Vec<SavedUnified>,
 }
 
+#[cfg(test)]
 pub fn encode(boottime: Duration, covered: Duration, speakers: &[SpeakerState], armed: bool) -> String {
+    encode_with(boottime, covered, speakers, None, armed)
+}
+
+/// The state with the engine's models.
+pub fn encode_with(boottime: Duration, covered: Duration, speakers: &[SpeakerState], engine: Option<&Engine>, armed: bool) -> String {
     let mut out = format!(
         "{MAGIC}\nboottime_ns {}\ncovered_ns {}\narmed {}\n",
         boottime.as_nanos(),
@@ -63,7 +81,7 @@ pub fn encode(boottime: Duration, covered: Duration, speakers: &[SpeakerState], 
     for s in speakers {
         out += &format!(
             "speaker {} {:.6} {:.6} {:.6} {:.6} {:.6} {:.3} {} {:.6}\n",
-            s.spec.name,
+            state_name(&s.spec.name),
             s.t_coil,
             s.t_magnet,
             s.mean_power(1.0),
@@ -74,8 +92,62 @@ pub fn encode(boottime: Duration, covered: Duration, speakers: &[SpeakerState], 
             s.t_peak.max(s.t_coil)
         );
     }
+    if let Some(e) = engine {
+        out += &e.encode();
+    }
     out += "end\n";
     out
+}
+
+/// A temperature a file may carry (°C).
+fn temperature(x: &str) -> Option<f64> {
+    x.parse::<f64>().ok().filter(|v| v.is_finite() && *v > -50.0 && *v < 1000.0)
+}
+
+fn flag(x: &str) -> Option<bool> {
+    match x {
+        "0" => Some(false),
+        "1" => Some(true),
+        _ => None,
+    }
+}
+
+fn asahi_line(f: &[&str]) -> Option<SavedAsahi> {
+    if f.len() != 9 {
+        return None;
+    }
+    let gain: f64 = f[6].parse().ok().filter(|g: &f64| g.is_finite() && *g <= 0.0)?;
+    Some(SavedAsahi {
+        name: f[1].to_string(),
+        t_coil: temperature(f[2])?,
+        t_magnet: temperature(f[3])?,
+        coil_hyst: temperature(f[4])?,
+        magnet_hyst: temperature(f[5])?,
+        gain,
+        hard: flag(f[7])?,
+        t_peak: temperature(f[8])?,
+    })
+}
+
+fn unified_line(f: &[&str]) -> Option<SavedUnified> {
+    if f.len() != 11 {
+        return None;
+    }
+    let vi = match (f[4], f[5]) {
+        ("-", "-") => None,
+        (c, m) => Some((temperature(c)?, temperature(m)?)),
+    };
+    let watts = |x: &str| x.parse::<f64>().ok().filter(|v| v.is_finite() && *v >= 0.0);
+    Some(SavedUnified {
+        name: f[1].to_string(),
+        ff: (temperature(f[2])?, temperature(f[3])?),
+        vi,
+        reduction: watts(f[6])?,
+        mean_1s: watts(f[7])?,
+        mean_60s: watts(f[8])?,
+        hard: flag(f[9])?,
+        t_peak: temperature(f[10])?,
+    })
 }
 
 /// None for anything but a complete, finite, physically possible state.
@@ -89,6 +161,7 @@ pub fn decode(text: &str) -> Option<Saved> {
     let ns: u64 = lines.next()?.strip_prefix("boottime_ns ")?.parse().ok()?;
     let mut covered = None;
     let mut speakers = Vec::new();
+    let (mut asahi, mut unified) = (Vec::new(), Vec::new());
     let mut armed = true;
     let mut ended = false;
     for line in lines {
@@ -115,6 +188,14 @@ pub fn decode(text: &str) -> Option<Saved> {
             continue;
         }
         let f: Vec<&str> = line.split_whitespace().collect();
+        if v2 && f.first() == Some(&"asahi") {
+            asahi.push(asahi_line(&f)?);
+            continue;
+        }
+        if v2 && f.first() == Some(&"unified") {
+            unified.push(unified_line(&f)?);
+            continue;
+        }
         let fields = if v2 { 10 } else { 8 };
         if f.len() != fields || f[0] != "speaker" {
             return None;
@@ -145,7 +226,29 @@ pub fn decode(text: &str) -> Option<Saved> {
     if v2 && covered > Duration::from_nanos(ns) {
         return None;
     }
-    Some(Saved { boottime: Duration::from_nanos(ns), covered, armed, speakers })
+    Some(Saved { boottime: Duration::from_nanos(ns), covered, armed, speakers, asahi, unified })
+}
+
+/// How the time since a saved state's coverage is charged (seconds): while
+/// the run that wrote it may have held the card, everything up to the
+/// file's write time and the `tail` after it at full gain; the rest at the
+/// worst case the card's safe level lets through.
+fn gap(saved: &Saved, now: Duration, tail: Duration) -> (f64, f64) {
+    let elapsed = now.saturating_sub(saved.covered).as_secs_f64();
+    if !saved.armed {
+        return (0.0, elapsed);
+    }
+    let held = saved.boottime.saturating_sub(saved.covered).as_secs_f64() + tail.as_secs_f64();
+    let full = elapsed.min(held).max(0.0);
+    (full, elapsed - full)
+}
+
+/// The engine's models from the saved state, charged by the same rules as
+/// the legacy model's (`restore`); a model the file does not carry starts
+/// latched at its limit.
+pub fn restore_engine(engine: &mut Engine, saved: &Saved, now: Duration, tail: Duration, globals: &Globals) {
+    let (full, safe) = gap(saved, now, tail);
+    engine.resume(&saved.asahi, &saved.unified, full, safe, globals.safe_reduction);
 }
 
 /// Continue every speaker from the saved state, and charge the time since
@@ -159,7 +262,7 @@ pub fn restore(speakers: &mut [SpeakerState], saved: &Saved, now: Duration, tail
     let elapsed = now.saturating_sub(saved.covered).as_secs_f64();
     let held = saved.boottime.saturating_sub(saved.covered).as_secs_f64() + tail.as_secs_f64();
     for s in speakers.iter_mut() {
-        match saved.speakers.iter().find(|x| x.name == s.spec.name) {
+        match saved.speakers.iter().find(|x| x.name == state_name(&s.spec.name)) {
             Some(x) => {
                 s.resume(x.t_coil, x.t_magnet, x.mean_1s, x.mean_60s);
                 s.resume_governor(x.hard, x.t_peak.unwrap_or(x.t_coil), x.reduction_db);
@@ -199,7 +302,7 @@ pub fn restore(speakers: &mut [SpeakerState], saved: &Saved, now: Duration, tail
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::config::{Config, Governor};
 
     const J700: &str = include_str!("../conf/apple/j700.conf");
     const TAIL: Duration = Duration::from_millis(1500);
@@ -388,5 +491,176 @@ mod tests {
         }
         let mean = fresh[0].mean_power(60.0);
         assert!((mean - 8.0 * 29.0 / 60.0).abs() < 0.01, "minute mean {mean} W after 31 s");
+    }
+
+    // ---- the engine's models ----
+
+    const J413: &str = include_str!("../conf/apple/j413.conf");
+    const J316: &str = include_str!("../conf/apple/j316.conf");
+
+    /// An engine for `text` (asahi and unified) with every model at `tc`/`tm`.
+    fn engine_at(text: &str, tc: f64, tm: f64) -> (Config, Vec<SpeakerState>, Engine) {
+        let cfg = Config::parse(text).unwrap();
+        let mut sp: Vec<SpeakerState> = cfg.speakers.iter().map(|s| SpeakerState::new(s.clone(), cfg.globals.t_ambient)).collect();
+        for s in sp.iter_mut() {
+            s.resume(tc, tm, 0.0, 0.0);
+        }
+        let mut e = Engine::new(&cfg, true).unwrap();
+        for a in e.asahi.iter_mut().flatten() {
+            a.th.t_coil = tc;
+            a.th.t_magnet = tm;
+            a.coil_peak = tc;
+            a.magnet_peak = tm;
+            a.coil_hyst = tc;
+            a.magnet_hyst = tm;
+        }
+        for u in e.unified.iter_mut().flatten() {
+            u.ff.t_coil = tc;
+            u.ff.t_magnet = tm;
+            if let Some(v) = u.vi.as_mut() {
+                v.t_coil = tc;
+                v.t_magnet = tm;
+            }
+            u.peak = tc;
+        }
+        e.govern(0.0, false);
+        (cfg, sp, e)
+    }
+
+    fn fresh(cfg: &Config) -> (Vec<SpeakerState>, Engine) {
+        let sp = cfg.speakers.iter().map(|s| SpeakerState::new(s.clone(), cfg.globals.t_ambient)).collect();
+        (sp, Engine::new(cfg, true).unwrap())
+    }
+
+    /// Review F2: the asahi governor's state (its peak hold, gain and
+    /// latch) did not survive a restart; PR #6 saved only temperatures,
+    /// so a restart lost a held peak.  It all comes back, with names that
+    /// have spaces in them (the J316's "Left Woofer 1").
+    #[test]
+    fn the_engines_models_survive_a_restart() {
+        let (cfg, sp, mut e) = engine_at(J316, 128.0, 95.0);
+        {
+            let a = &mut e.asahi.as_mut().unwrap()[2];
+            a.coil_hyst = 133.0;
+            a.hard = true;
+            a.coil_peak = 151.0;
+        }
+        e.govern(0.0, false);
+        let text = encode_with(Duration::from_secs(100), Duration::from_secs(100), &sp, Some(&e), false);
+        assert!(text.contains("speaker Left_Woofer_1 ") && text.contains("asahi Left_Woofer_1 ") && text.contains("unified Left_Woofer_1 "));
+        let saved = decode(&text).unwrap();
+        assert_eq!(saved.speakers.len(), 6);
+        assert_eq!(saved.asahi.len(), 6);
+        assert_eq!(saved.unified.len(), 6);
+        let (mut sp2, mut e2) = fresh(&cfg);
+        restore(&mut sp2, &saved, Duration::from_secs(100), TAIL, &cfg.globals);
+        restore_engine(&mut e2, &saved, Duration::from_secs(100), TAIL, &cfg.globals);
+        e2.govern(0.0, false);
+        let (a, b) = (&e.asahi.as_ref().unwrap()[2], &e2.asahi.as_ref().unwrap()[2]);
+        assert!((a.th.t_coil - b.th.t_coil).abs() < 1e-5);
+        assert!((a.coil_hyst - b.coil_hyst).abs() < 1e-5, "{} vs {}", a.coil_hyst, b.coil_hyst);
+        assert!((a.gain - b.gain).abs() < 1e-5 && b.gain < -2.0, "{} vs {}", a.gain, b.gain);
+        assert!(b.hard, "the latch was lost");
+        assert_eq!(e.reductions(Governor::Asahi), e2.reductions(Governor::Asahi));
+        let (u, v) = (&e.unified.as_ref().unwrap()[0], &e2.unified.as_ref().unwrap()[0]);
+        assert!((u.ff.t_coil - v.ff.t_coil).abs() < 1e-5 && (u.vi.as_ref().unwrap().t_coil - v.vi.as_ref().unwrap().t_coil).abs() < 1e-5);
+        assert!((sp2[0].t_coil - 128.0).abs() < 1e-5);
+    }
+
+    /// A file without the engine's lines (0.1.6, or a run without the
+    /// unified models) says nothing about them: they start latched at the
+    /// limit, the legacy model is restored.  A J700 file without the engine
+    /// is exactly what 0.1.6 writes, so a rollback keeps its continuity.
+    #[test]
+    fn a_model_the_file_does_not_carry_starts_latched() {
+        let (cfg, sp, _) = engine_at(J413, 60.0, 55.0);
+        let saved = decode(&encode(Duration::from_secs(100), Duration::from_secs(100), &sp, false)).unwrap();
+        assert!(saved.asahi.is_empty());
+        let (mut sp2, mut e2) = fresh(&cfg);
+        restore(&mut sp2, &saved, Duration::from_secs(100), TAIL, &cfg.globals);
+        restore_engine(&mut e2, &saved, Duration::from_secs(100), TAIL, &cfg.globals);
+        assert!(e2.asahi.as_ref().unwrap().iter().all(|a| a.hard && a.th.t_coil >= 150.0));
+        assert!(e2.unified.as_ref().unwrap().iter().all(|u| u.hard));
+        assert!(sp2.iter().all(|s| !s.hard));
+        // the J700 without the engine: byte for byte 0.1.6's format
+        let (j700, hot) = hot();
+        let a = encode(Duration::from_secs(5), Duration::from_secs(4), &hot, true);
+        let b = encode_with(Duration::from_secs(5), Duration::from_secs(4), &hot, None, true);
+        assert_eq!(a, b);
+        assert!(a.starts_with("speakerguardd-state 2\n") && !a.contains("asahi") && !a.contains("unified"));
+        let _ = j700;
+    }
+
+    /// Review F5 on the engine: the same continuity rules as the legacy
+    /// model.  A held run's snapshot one second old is charged at full gain
+    /// (it restored 119 C as 108.8 C), the time before its write from the
+    /// coverage epoch, and a released run's gap at the safe level's worst
+    /// case.
+    #[test]
+    fn the_engine_restores_by_the_same_rules() {
+        let (cfg, sp, e) = engine_at(J413, 119.0, 95.0);
+        let g = &cfg.globals;
+        let held = decode(&encode_with(Duration::from_secs(100), Duration::from_secs(100), &sp, Some(&e), true)).unwrap();
+        let (_, mut e1) = fresh(&cfg);
+        restore_engine(&mut e1, &held, Duration::from_secs(101), TAIL, g);
+        for a in e1.asahi.as_ref().unwrap() {
+            assert!(a.th.t_coil >= 119.0 || a.hard, "restored to {:.3} C", a.th.t_coil);
+        }
+        // coverage 50 ms before the write: charged even with no time since
+        let lag = decode(&encode_with(Duration::from_millis(100_050), Duration::from_millis(100_000), &sp, Some(&e), true)).unwrap();
+        let (_, mut e2) = fresh(&cfg);
+        restore_engine(&mut e2, &lag, Duration::from_millis(100_050), TAIL, g);
+        let mut want = e.asahi.as_ref().unwrap()[0].clone();
+        let v = crate::engine::v_worst(&cfg.speakers[0], g);
+        want.th.hold(v * v / cfg.speakers[0].z_nominal.min(cfg.speakers[0].r_ff), 0.05, g.t_ambient);
+        assert!((e2.asahi.as_ref().unwrap()[0].th.t_coil - want.th.t_coil).abs() < 1e-6);
+        // released: the gap at the safe level (here 99.5 dB: it cools)
+        let released = decode(&encode_with(Duration::from_secs(100), Duration::from_secs(100), &sp, Some(&e), false)).unwrap();
+        let (_, mut e3) = fresh(&cfg);
+        restore_engine(&mut e3, &released, Duration::from_secs(110), TAIL, g);
+        let c = e3.asahi.as_ref().unwrap()[0].th.t_coil;
+        assert!(c < 119.0 && c > g.t_ambient, "{c}");
+        assert!(c < e1.asahi.as_ref().unwrap()[0].th.t_coil);
+    }
+
+    /// Review R5 on the unified budgets: the first steps after a restore
+    /// keep the minute's energy.
+    #[test]
+    fn the_unified_minute_budget_survives_a_restore() {
+        let (cfg, sp, mut e) = engine_at(J413, 60.0, 55.0);
+        for u in e.unified.as_mut().unwrap() {
+            u.resume(&crate::engine::SavedUnified { name: String::new(), ff: (60.0, 55.0), vi: Some((60.0, 55.0)), reduction: 0.0, mean_1s: 8.0, mean_60s: 8.0, hard: false, t_peak: 60.0 }, cfg.globals.t_ambient);
+        }
+        let saved = decode(&encode_with(Duration::from_secs(100), Duration::from_secs(100), &sp, Some(&e), false)).unwrap();
+        let (_, mut e2) = fresh(&cfg);
+        restore_engine(&mut e2, &saved, Duration::from_secs(100), TAIL, &cfg.globals);
+        for _ in 0..20 {
+            e2.idle(0.1);
+        }
+        let mean = e2.unified.as_ref().unwrap()[0].mean_pre(60.0);
+        assert!((mean - 8.0 * 58.0 / 60.0).abs() < 0.01, "minute mean {mean} W");
+    }
+
+    #[test]
+    fn rejects_damaged_engine_lines() {
+        let (_, sp, e) = engine_at(J413, 60.0, 55.0);
+        let good = encode_with(Duration::from_secs(1), Duration::from_secs(1), &sp, Some(&e), true);
+        assert!(decode(&good).is_some());
+        let line = good.lines().find(|l| l.starts_with("asahi ")).unwrap().to_string();
+        let mut f: Vec<String> = line.split_whitespace().map(String::from).collect();
+        for (i, bad) in [(2, "NaN"), (6, "3.0"), (7, "2"), (8, "inf")] {
+            let mut g = f.clone();
+            g[i] = bad.to_string();
+            assert!(decode(&good.replace(&line, &g.join(" "))).is_none(), "accepted {bad} in field {i}");
+        }
+        f.pop();
+        assert!(decode(&good.replace(&line, &f.join(" "))).is_none());
+        let uline = good.lines().find(|l| l.starts_with("unified ")).unwrap().to_string();
+        let u: Vec<String> = uline.split_whitespace().map(String::from).collect();
+        for (i, bad) in [(2, "NaN"), (4, "-"), (6, "-1"), (8, "inf"), (9, "2")] {
+            let mut g = u.clone();
+            g[i] = bad.to_string();
+            assert!(decode(&good.replace(&uline, &g.join(" "))).is_none(), "accepted {bad} in unified field {i}");
+        }
     }
 }

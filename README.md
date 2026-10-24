@@ -68,11 +68,64 @@ configuration error, a nonfinite model); the speakers are then at the card's
 safe level.  The unit restarts the daemon (`Restart=on-failure`, five
 attempts a minute), and the model state it writes once a second to
 `/run/speakerguardd/state` (`-s`), cooled by the time between the two runs,
-makes the new run start as hot as the old one stopped.  An unreadable state
-file is taken as a speaker at its working temperature limit.  These checks
+makes the new run start as hot as the old one stopped.  A missing or
+unreadable state file is taken as a speaker at its hard limit, latched, and
+so is a state written before speakersafetyd ran (its flag file under /run
+says it did).  These checks
 cannot make scheduling and ioctls atomic: a daemon that is late renewing the
 lock is covered by the kernel's 250 ms lock timeout, and the late time is
 charged to the model like any other gap.
+
+### Machines with current and voltage sense
+
+The same daemon protects the Apple laptops whose amplifiers report the
+speaker voltage and current (TAS2764-class SN012776, S16 sense words, 14 V
+and 3.75 A at full scale): `conf/apple/j316.conf` (MacBook Pro 16" M1 Pro)
+and `j413.conf` (MacBook Air M2).  It turns the VSENSE and ISENSE switches
+on, sets the amplifier gain to its maximum (the level the model assumes,
+`amp_gain_dbv`) and writes one volume control per speaker, linked by
+`group`.  `j616.conf` (MacBook Pro 16" M4 Pro) says `qualified = false`.
+Nothing has yet checked its sense map, polarity or scaling on the machine,
+and its thermal constants are the J316's.  The daemon refuses to govern it
+without `--allow-unqualified`, and udev does not start it there.
+
+On those machines the governor that writes the card is `asahi`, the
+behaviour Asahi Linux's speakersafetyd ships, reimplemented here from its
+description (credit to the Asahi Linux contributors; speakersafetyd is MIT
+through 2.0.2).  The measured power (V*I, integrated per sample) drives the
+two-node model with speakersafetyd's constants (`vi_*`, `z_nominal`).  The
+reduction ramps from 0 at `t_limit - t_headroom - t_window` to
+speakersafetyd's `min_gain` at the working limit, with peak-hold
+hysteresis.  It differs only toward protection:
+
+* It runs inside the same account as the J700's model.  Unmeasured time is
+  charged at the worst case the card's gain lets through, per speaker and
+  at the gain the card held at the time, instead of skipped.
+* The hard limit is checked at every sample, for the coil and the magnet.
+  A crossing latches and leaves the model at the limit, so later samples
+  cannot hide it.
+* A period whose mean V*I is below -0.01 W is bad sense data.  The card
+  goes to the kernel at once (which mutes these amplifiers), the period's
+  time is charged, and two good periods in a row are needed to take the
+  lock back.
+* The governor's state (temperatures, holds, gain, latch) is saved with the
+  rest of the model, so a restart neither forgets a held peak nor starts
+  colder.  A missing state starts latched, not at speakersafetyd's 119 C.
+
+To use this daemon where speakersafetyd is installed, mask speakersafetyd
+(`systemctl mask --now speakersafetyd`) and start this one.  To go back,
+unmask speakersafetyd and reboot.  Keep speakersafetyd installed.
+
+### Shadow mode and the unified governor
+
+`--shadow` runs every governor the machine supports on the same account
+and writes one JSON line a second to `shadow.jsonl` next to the state file:
+each model's temperatures, each governor's reduction, what the card holds,
+and each estimator's power.  The `unified` governor (a look-ahead regulator
+on the feed-forward model, after the design of macOS's speaker protection,
+tightened by the measured-power model where V/I sense exists) runs only
+there.  It writes the card only with `--experimental-unified`.  A shadow
+changes nothing the governing model does.
 
 ### Relation to speakersafetyd
 
@@ -147,5 +200,9 @@ it never plays audio or performs a reboot.
 
 `-C <card id>` selects a card (by default the one the macaudio driver
 registered, never the AOP card that shares its `AppleJ` prefix), `-m <dB>`
-the reduction at which the card's safe level takes over, `-s <file>` the
-model state file (`-s ''` for none).
+the reduction at which the card's safe level takes over (default the
+configuration's `max_reduction`, else 20), `-s <file>` the model state file
+(`-s ''` for none).  `--governor legacy|asahi|unified` overrides the
+configuration's governor, `--shadow` turns the shadow log on, and
+`--experimental-unified` and `--allow-unqualified` are the two opt-ins
+described above.
