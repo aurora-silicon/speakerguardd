@@ -21,6 +21,38 @@ impl fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
+/// Which governor writes the card; the others run in shadow (see engine.rs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Governor {
+    /// speakerguardd's own window/hysteresis governor on the feed-forward model.
+    Legacy,
+    /// Asahi speakersafetyd's behaviour: measured V*I power, a linear ramp to
+    /// its min_gain across t_window, peak-hold hysteresis.
+    Asahi,
+    /// The model-predictive regulator on the feed-forward model (corrected
+    /// by measured power where V/I sense exists), after macOS's design.
+    Unified,
+}
+
+impl Governor {
+    pub fn name(self) -> &'static str {
+        match self {
+            Governor::Legacy => "legacy",
+            Governor::Asahi => "asahi",
+            Governor::Unified => "unified",
+        }
+    }
+}
+
+/// Sample format of the sense PCM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SenseFormat {
+    /// One S32 word per speaker: what the amplifier receives (J700).
+    S32,
+    /// Interleaved S16 voltage and current sense words (TAS2764/SN012776).
+    S16,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Globals {
     /// The card's speaker sense PCM device number.
@@ -43,6 +75,22 @@ pub struct Globals {
     /// control's maximum (macaudio's safe_vol): what the speakers get once
     /// the lock lapses.
     pub safe_reduction: f64,
+    /// The governor that writes the card (default legacy).
+    pub governor: Governor,
+    /// Compute and log every other governor too (observe only).
+    pub shadow: bool,
+    pub sense_format: SenseFormat,
+    /// The amplifiers' output level at full scale (dBV, a 0 dBFS sine), on
+    /// machines whose amp gain control the daemon sets to its maximum: the
+    /// worst-case power and speakersafetyd's min_gain follow from it.  0 when
+    /// the sense words are the amplifier's own full scale (J700).
+    pub amp_gain_dbv: f64,
+    /// Unified governor: prediction horizon (s) and release time constant (s).
+    pub horizon_s: f64,
+    pub release_s: f64,
+    /// Unified governor: the regulator holds the coil this far below the
+    /// working limit (K).
+    pub t_ctrl_headroom: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -50,6 +98,11 @@ pub struct Controls {
     pub volume: String,
     pub unlock: String,
     pub sample_rate: String,
+    /// Per-speaker controls named "<speaker> <name>" (V/I machines): the
+    /// sense switches turned on, and the amp gain set to its maximum.
+    pub vsense: Option<String>,
+    pub isense: Option<String>,
+    pub amp_gain: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -75,6 +128,33 @@ pub struct Speaker {
     /// minute may not exceed these (W); 0 disables a budget.
     pub p_limit_1s: f64,
     pub p_limit_60s: f64,
+    /// Current sense channel and amps at full scale (V/I machines).
+    pub is_chan: Option<usize>,
+    pub is_scale: f64,
+    /// DC resistance the feed-forward power is computed against (Ω):
+    /// macOS's Reb_ref / RdcOhms.  Defaults to z_nominal.
+    pub r_ff: f64,
+    /// Thermal constants for the model driven by measured V*I power (the
+    /// values validated that way, speakersafetyd's); default: the above.
+    pub vi_tr_coil: f64,
+    pub vi_tau_coil: f64,
+    pub vi_tr_magnet: f64,
+    pub vi_tau_magnet: f64,
+    /// Coil resistance temperature coefficient at 20 °C (1/K), 0 if unknown.
+    pub a_t_20c: f64,
+}
+
+impl Speaker {
+    /// RMS volts of the most the amplifier can put out at the card's full
+    /// gain: a full-scale square wave.
+    pub fn v_worst(&self, globals: &Globals) -> f64 {
+        if globals.amp_gain_dbv > 0.0 {
+            // a 0 dBFS sine is amp_gain_dbv; the square has sqrt(2) more
+            2f64.sqrt() * 10f64.powf(globals.amp_gain_dbv / 20.0)
+        } else {
+            self.vs_scale
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -120,6 +200,23 @@ fn get<'a>(section: &'a BTreeMap<String, String>, name: &str, key: &str) -> Resu
         .ok_or_else(|| ConfigError(format!("[{name}] is missing {key}")))
 }
 
+fn boolean(values: &BTreeMap<String, String>, section: &str, key: &str) -> Result<bool, ConfigError> {
+    match values.get(key).map(|v| v.to_ascii_lowercase()) {
+        None => Ok(false),
+        Some(v) if ["1", "true", "yes", "on"].contains(&v.as_str()) => Ok(true),
+        Some(v) if ["0", "false", "no", "off"].contains(&v.as_str()) => Ok(false),
+        Some(_) => Err(ConfigError(format!("[{section}] {key}: not a boolean"))),
+    }
+}
+
+/// A numeric key that may be absent (`default` when it is).
+fn or(values: &BTreeMap<String, String>, section: &str, key: &str, default: f64) -> Result<f64, ConfigError> {
+    match values.get(key) {
+        None => Ok(default),
+        Some(_) => num(values, section, key),
+    }
+}
+
 /// A numeric key that may be absent (0 when it is).
 fn optional(values: &BTreeMap<String, String>, section: &str, key: &str) -> Result<f64, ConfigError> {
     match values.get(key) {
@@ -154,7 +251,36 @@ impl Config {
                 None => 20.0,
                 Some(_) => num(g, "Globals", "safe_reduction")?,
             },
+            governor: match g.get("governor").map(String::as_str) {
+                None | Some("legacy") => Governor::Legacy,
+                Some("asahi") => Governor::Asahi,
+                Some("unified") => Governor::Unified,
+                Some(v) => return Err(ConfigError(format!("[Globals] governor {v:?}: legacy, asahi or unified"))),
+            },
+            shadow: boolean(g, "Globals", "shadow")?,
+            sense_format: match g.get("sense_format").map(String::as_str) {
+                None | Some("s32") => SenseFormat::S32,
+                Some("s16") => SenseFormat::S16,
+                Some(v) => return Err(ConfigError(format!("[Globals] sense_format {v:?}: s32 or s16"))),
+            },
+            amp_gain_dbv: or(g, "Globals", "amp_gain_dbv", 0.0)?,
+            horizon_s: or(g, "Globals", "horizon_s", 4.6)?,
+            release_s: or(g, "Globals", "release_s", 20.0)?,
+            t_ctrl_headroom: or(g, "Globals", "t_ctrl_headroom", 0.0)?,
         };
+        for (key, value) in [
+            ("amp_gain_dbv", globals.amp_gain_dbv),
+            ("horizon_s", globals.horizon_s),
+            ("release_s", globals.release_s),
+            ("t_ctrl_headroom", globals.t_ctrl_headroom),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                return Err(ConfigError(format!("[Globals] {key} must be finite and nonnegative")));
+            }
+        }
+        if !(globals.horizon_s > 0.0) || !(globals.release_s > 0.0) {
+            return Err(ConfigError("[Globals] horizon_s and release_s must be positive".into()));
+        }
         for (key, value) in [
             ("t_ambient", globals.t_ambient),
             ("t_hysteresis", globals.t_hysteresis),
@@ -180,6 +306,9 @@ impl Config {
             volume: get(c, "Controls", "volume")?.to_string(),
             unlock: get(c, "Controls", "unlock")?.to_string(),
             sample_rate: get(c, "Controls", "sample_rate")?.to_string(),
+            vsense: c.get("vsense").cloned(),
+            isense: c.get("isense").cloned(),
+            amp_gain: c.get("amp_gain").cloned(),
         };
         let mut speakers = Vec::new();
         for (section, values) in &sections {
@@ -199,7 +328,46 @@ impl Config {
                 vs_chan: num(values, section, "vs_chan")?,
                 p_limit_1s: optional(values, section, "p_limit_1s")?,
                 p_limit_60s: optional(values, section, "p_limit_60s")?,
+                is_chan: match values.get("is_chan") {
+                    None => None,
+                    Some(_) => Some(num(values, section, "is_chan")?),
+                },
+                is_scale: optional(values, section, "is_scale")?,
+                r_ff: 0.0,
+                vi_tr_coil: 0.0,
+                vi_tau_coil: 0.0,
+                vi_tr_magnet: 0.0,
+                vi_tau_magnet: 0.0,
+                a_t_20c: optional(values, section, "a_t_20c")?,
             };
+            let mut speaker = speaker;
+            speaker.r_ff = or(values, section, "r_ff", speaker.z_nominal)?;
+            speaker.vi_tr_coil = or(values, section, "vi_tr_coil", speaker.tr_coil)?;
+            speaker.vi_tau_coil = or(values, section, "vi_tau_coil", speaker.tau_coil)?;
+            speaker.vi_tr_magnet = or(values, section, "vi_tr_magnet", speaker.tr_magnet)?;
+            speaker.vi_tau_magnet = or(values, section, "vi_tau_magnet", speaker.tau_magnet)?;
+            if let Some(ch) = speaker.is_chan {
+                if ch >= globals.channels {
+                    return Err(ConfigError(format!("[{section}] is_chan {ch} beyond {} channels", globals.channels)));
+                }
+                if !(speaker.is_scale.is_finite() && speaker.is_scale > 0.0) {
+                    return Err(ConfigError(format!("[{section}] is_chan needs a positive is_scale")));
+                }
+            }
+            for (key, value) in [
+                ("r_ff", speaker.r_ff),
+                ("vi_tr_coil", speaker.vi_tr_coil),
+                ("vi_tau_coil", speaker.vi_tau_coil),
+                ("vi_tr_magnet", speaker.vi_tr_magnet),
+                ("vi_tau_magnet", speaker.vi_tau_magnet),
+            ] {
+                if !value.is_finite() || !(value > 0.0) {
+                    return Err(ConfigError(format!("[{section}] {key} must be positive")));
+                }
+            }
+            if !speaker.a_t_20c.is_finite() || speaker.a_t_20c < 0.0 {
+                return Err(ConfigError(format!("[{section}] a_t_20c must be finite and nonnegative")));
+            }
             if speaker.vs_chan >= globals.channels {
                 return Err(ConfigError(format!("[{section}] vs_chan {} beyond {} channels", speaker.vs_chan, globals.channels)));
             }
@@ -243,6 +411,7 @@ impl Config {
         if speakers.is_empty() {
             return Err(ConfigError("no [Speaker/...] section".into()));
         }
+
         if globals.period == 0 || globals.channels == 0 {
             return Err(ConfigError("[Globals] period and channels must be positive".into()));
         }
@@ -252,7 +421,22 @@ impl Config {
         if !(globals.safe_reduction > 0.0) {
             return Err(ConfigError("[Globals] safe_reduction must be positive".into()));
         }
-        Ok(Config { globals, controls, speakers })
+        let cfg = Config { globals, controls, speakers };
+        cfg.check_governor()?;
+        Ok(cfg)
+    }
+
+    /// The asahi governor needs current sense and the amplifier's level.
+    pub fn check_governor(&self) -> Result<(), ConfigError> {
+        if self.globals.governor == Governor::Asahi {
+            if self.speakers.iter().any(|s| s.is_chan.is_none()) {
+                return Err(ConfigError("governor asahi needs current sense (is_chan) on every speaker".into()));
+            }
+            if !(self.globals.amp_gain_dbv > 0.0) {
+                return Err(ConfigError("governor asahi needs [Globals] amp_gain_dbv".into()));
+            }
+        }
+        Ok(())
     }
 
     pub fn load(path: &Path) -> Result<Config, Box<dyn std::error::Error>> {

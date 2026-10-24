@@ -37,7 +37,7 @@ pub fn encode(boottime: Duration, speakers: &[SpeakerState], armed: bool) -> Str
     for s in speakers {
         out += &format!(
             "speaker {} {:.6} {:.6} {:.6} {:.6} {:.6} {:.3}\n",
-            s.spec.name,
+            crate::engine::state_name(&s.spec.name),
             s.t_coil,
             s.t_magnet,
             s.mean_power(1.0),
@@ -81,7 +81,7 @@ pub fn decode(text: &str) -> Option<Saved> {
 /// no power.  A speaker the file does not name starts hot.
 pub fn restore(speakers: &mut [SpeakerState], saved: &Saved, elapsed: Duration, globals: &Globals) {
     for s in speakers.iter_mut() {
-        match saved.speakers.iter().find(|x| x.name == s.spec.name) {
+        match saved.speakers.iter().find(|x| x.name == crate::engine::state_name(&s.spec.name)) {
             Some(x) => s.resume(x.t_coil, x.t_magnet, x.mean_1s, x.mean_60s),
             None => s.assume_hot(globals.t_ambient),
         }

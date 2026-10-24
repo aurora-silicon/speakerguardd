@@ -8,7 +8,8 @@ use std::io;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crate::config::{Config, Globals};
+use crate::config::{Config, Globals, Governor};
+use crate::engine::{self, Engine, Start};
 use crate::model::{self, SpeakerState};
 use crate::state;
 use crate::{debug, info, warn};
@@ -38,6 +39,11 @@ pub trait Hw {
     fn ping(&mut self) -> io::Result<()>;
     /// Write the gain reduction (dB below the control's maximum).
     fn set_reduction(&mut self, db: f64) -> io::Result<()>;
+    /// Per-speaker reductions, for cards with a volume control per speaker;
+    /// a card with one shared control gets the largest.
+    fn set_reductions(&mut self, db: &[f64]) -> io::Result<()> {
+        self.set_reduction(db.iter().cloned().fold(0.0, f64::max))
+    }
     /// The speakers' sample rate, 0 while they are closed.
     fn sample_rate(&mut self) -> io::Result<i64>;
     fn open_sense(&mut self, rate: u32) -> io::Result<()>;
@@ -122,7 +128,19 @@ pub struct Guard {
     control_failures: u32,
     state_path: Option<PathBuf>,
     save_failed: bool,
+    /// The governors besides legacy (always running), and which one writes.
+    pub engine: Engine,
+    pub governing: Governor,
+    /// Per-speaker reductions the card last accepted (dB).
+    written_per: Vec<f64>,
+    shadow_path: Option<PathBuf>,
+    shadow_failed: bool,
+    /// Raw sense periods kept for --replay.
+    pub record: Option<crate::record::Recorder>,
 }
+
+/// The shadow log is rotated (to `<file>.1`) past this size.
+const SHADOW_MAX_BYTES: u64 = 16 << 20;
 
 impl Guard {
     /// Restore the model from the last run (if any), take the card's volume
@@ -163,6 +181,12 @@ impl Guard {
                 return Err("nonfinite speaker model state".into());
             }
         }
+        let engine = Self::start_engine(hw, cfg, state_path.as_ref());
+        if !engine.finite() {
+            return Err("nonfinite speaker model state".into());
+        }
+        let shadow_path = if globals.shadow { state_path.as_ref().map(|p| p.with_file_name("shadow.jsonl")) } else { None };
+        let n = cfg.speakers.len();
         let now = hw.now();
         let mut g = Guard {
             words: vec![0i32; globals.period * globals.channels],
@@ -182,19 +206,101 @@ impl Guard {
             control_failures: 0,
             state_path,
             save_failed: false,
+            engine,
+            governing: cfg.globals.governor,
+            written_per: vec![f64::INFINITY; n],
+            shadow_path,
+            shadow_failed: false,
+            record: None,
         };
+        info!("governor {}{}", g.governing.name(), if cfg.globals.shadow { ", the others in shadow" } else { "" });
         hw.take_lock()?;
         g.last_ping = hw.now();
-        let reduction = model::reduction_db(&g.speakers);
-        if reduction < max_reduction {
-            hw.set_reduction(reduction)?;
-            g.written = reduction;
+        let (reduction, per) = g.governing_reduction();
+        let fault = g.fault();
+        if reduction < max_reduction && fault.is_none() {
+            g.write(hw, reduction, &per)?;
             g.applied = reduction;
             g.armed = true;
         } else {
-            warn!("the model asks for {reduction:.1} dB; leaving the speakers at the card's safe level");
+            warn!("{}; leaving the speakers at the card's safe level", fault.unwrap_or_else(|| format!("the model asks for {reduction:.1} dB")));
         }
         Ok(g)
+    }
+
+    /// The engine's models: from the saved engine state, cooled by the time
+    /// since; cold when there is no state at all (first start since boot);
+    /// hot when the state is unreadable or only the legacy part exists.
+    fn start_engine<H: Hw>(hw: &H, cfg: &Config, state_path: Option<&PathBuf>) -> Engine {
+        let Some(path) = state_path else { return Engine::new(cfg, Start::Cold) };
+        let epath = path.with_extension("engine");
+        match std::fs::read_to_string(&epath) {
+            Ok(text) => match engine::decode(&text) {
+                Some(saved) => {
+                    let mut e = Engine::new(cfg, Start::Hot);
+                    e.restore(&saved);
+                    let elapsed = hw.boottime().saturating_sub(saved.boottime).as_secs_f64();
+                    let mut left = elapsed.min(3600.0);
+                    while left > 0.0 {
+                        let dt = if elapsed - left < 60.0 { 0.1f64.min(left) } else { 1f64.min(left) };
+                        e.cool(dt);
+                        left -= dt;
+                    }
+                    if elapsed > 3600.0 {
+                        e.cool(elapsed - 3600.0);
+                    }
+                    e
+                }
+                None => {
+                    warn!("{}: unreadable engine state; assuming hot speakers", epath.display());
+                    Engine::new(cfg, Start::Hot)
+                }
+            },
+            Err(e) if e.kind() == io::ErrorKind::NotFound && !path.exists() => Engine::new(cfg, Start::Cold),
+            Err(_) => Engine::new(cfg, Start::Hot),
+        }
+    }
+
+    /// The governing reduction: card-wide (dB) and per speaker.
+    fn governing_reduction(&self) -> (f64, Vec<f64>) {
+        match self.governing {
+            Governor::Legacy => {
+                let r = model::reduction_db(&self.speakers);
+                (r, vec![r; self.speakers.len()])
+            }
+            gov => {
+                let per = self.engine.reductions(gov);
+                (per.iter().cloned().fold(0.0, f64::max), per)
+            }
+        }
+    }
+
+    /// A governing model past its hard limit.
+    fn fault(&self) -> Option<String> {
+        self.engine.hard_fault(self.governing)
+    }
+
+    fn write<H: Hw>(&mut self, hw: &mut H, reduction: f64, per: &[f64]) -> io::Result<()> {
+        if self.governing == Governor::Legacy {
+            hw.set_reduction(reduction)?;
+        } else {
+            hw.set_reductions(per)?;
+        }
+        self.written = reduction;
+        self.written_per = per.to_vec();
+        Ok(())
+    }
+
+    /// What the card applied to each speaker since `from` (dB).
+    fn card_reductions(&self, from: Instant) -> Vec<f64> {
+        let lapsed = !(self.armed || from < self.last_ping + KERNEL_LOCK_TIMEOUT);
+        self.written_per
+            .iter()
+            .map(|&w| {
+                let w = if w.is_finite() { w } else { 0.0 };
+                if lapsed { w.max(self.globals.safe_reduction) } else { w }
+            })
+            .collect()
     }
 
     #[cfg(test)]
@@ -233,7 +339,7 @@ impl Guard {
     }
 
     fn check_model(&self) -> Result<(), Box<dyn Error>> {
-        if self.speakers.iter().all(|s| s.finite()) {
+        if self.speakers.iter().all(|s| s.finite()) && self.engine.finite() {
             Ok(())
         } else {
             Err("nonfinite speaker model state".into())
@@ -274,6 +380,7 @@ impl Guard {
                 s.step(0.0, PING_INTERVAL.as_secs_f64(), globals.t_ambient);
                 s.govern(&globals);
             }
+            self.engine.idle(PING_INTERVAL.as_secs_f64());
             self.check_model()?;
             self.maintain(hw)?;
             hw.sleep(PING_INTERVAL);
@@ -315,8 +422,19 @@ impl Guard {
         match read {
             Ok(Some(true)) => {
                 self.stall.as_mut().unwrap().data();
-                // what the card applied while this period played
-                let applied = self.card_reduction(self.last_valid.unwrap_or_else(|| hw.now()));
+                let features = self.engine.extractor.extract(&self.engine.cfg, &self.words, rate as f64);
+                if let Some((name, p)) = self.engine.cfg.speakers.iter().zip(&features).find_map(|(s, f)| f.vi.filter(|&p| !(p >= -0.01)).map(|p| (s.name.clone(), p))) {
+                    // speakersafetyd's sanity check: negative real power is
+                    // bad sense data, not a measurement
+                    warn!("{name}: negative or invalid sensed power ({p:.3} W); period not counted");
+                    self.fresh = 0;
+                    return self.maintain(hw);
+                }
+                // what the card applied while this period played: card-wide
+                // (legacy) and per speaker (the engine)
+                let since = self.last_valid.unwrap_or_else(|| hw.now());
+                let applied_card = self.card_reduction(since);
+                let applied = self.card_reductions(since);
                 for s in self.speakers.iter_mut() {
                     let v = s.v_rms_of(&self.words, globals.channels);
                     s.v_rms = v;
@@ -324,8 +442,18 @@ impl Guard {
                     if !v.is_finite() || !power.is_finite() || power < 0.0 {
                         return Err("invalid speaker sense voltage or power".into());
                     }
-                    s.step_at(power, dt, globals.t_ambient, applied);
+                    s.step_at(power, dt, globals.t_ambient, applied_card);
                     s.govern(&globals);
+                }
+                self.engine.period(&features, &applied, dt, model::reduction_db(&self.speakers));
+                if let Some(rec) = self.record.as_mut() {
+                    if let Err(e) = rec.write(rate, hw.boottime(), &applied, &self.words) {
+                        warn!("recording: {e}; stopped");
+                        self.record = None;
+                    } else if rec.full() {
+                        info!("recording reached its size limit; stopped");
+                        self.record = None;
+                    }
                 }
                 self.check_model()?;
                 // only a complete period whose model state is valid renews
@@ -381,21 +509,23 @@ impl Guard {
                     s.step_at(p, (now - from).as_secs_f64(), globals.t_ambient, reduction);
                     s.govern(globals);
                 }
+                self.engine.blind((now - from).as_secs_f64());
                 self.check_model()?;
                 self.charged_to = Some(now);
             }
         }
-        let reduction = model::reduction_db(&self.speakers);
+        let (reduction, per) = self.governing_reduction();
         if !reduction.is_finite() {
             return Err("nonfinite speaker reduction".into());
         }
+        let fault = self.fault();
         if self.armed {
             let why = if blind > BLIND_LIMIT {
                 Some(format!("no complete sense data for {} ms", blind.as_millis()))
             } else if reduction >= self.max_reduction {
                 Some(format!("the model asks for {reduction:.1} dB"))
             } else {
-                None
+                fault.clone()
             };
             if let Some(why) = why {
                 warn!("{why}; leaving the speakers at the card's safe level");
@@ -403,7 +533,7 @@ impl Guard {
             }
         } else {
             let seeing = self.dt.is_none() || (self.fresh >= REARM_PERIODS && blind <= BLIND_SLACK);
-            if seeing && reduction < self.max_reduction - REARM_MARGIN_DB {
+            if seeing && reduction < self.max_reduction - REARM_MARGIN_DB && fault.is_none() {
                 self.ping_lock(hw)?;
                 info!("taking the volume lock back at {reduction:.1} dB");
                 self.armed = true;
@@ -415,9 +545,8 @@ impl Guard {
                 info!("gain reduction {reduction:.1} dB");
                 self.applied = reduction;
             }
-            match hw.set_reduction(reduction) {
+            match self.write(hw, reduction, &per) {
                 Ok(()) => {
-                    self.written = reduction;
                     self.control_failures = 0;
                 }
                 Err(e) if transient(&e) && self.control_failures < MAX_CONTROL_FAILURES => {
@@ -444,9 +573,31 @@ impl Guard {
                 );
             }
             self.save(hw);
+            self.shadow(hw);
             self.last_log = hw.now();
         }
         Ok(())
+    }
+
+    /// Append one line to the shadow log (best effort; rotated by size).
+    fn shadow<H: Hw>(&mut self, hw: &H) {
+        let Some(path) = self.shadow_path.clone() else { return };
+        let legacy: Vec<(f64, f64)> = self.speakers.iter().map(|s| (s.t_coil, s.reduction_db)).collect();
+        let applied = self.card_reductions(hw.now());
+        let line = self.engine.shadow_line(hw.boottime().as_secs_f64(), self.governing, self.armed, &applied, &legacy, model::reduction_db(&self.speakers));
+        if std::fs::metadata(&path).map_or(false, |m| m.len() > SHADOW_MAX_BYTES) {
+            let _ = std::fs::rename(&path, path.with_extension("jsonl.1"));
+        }
+        use std::io::Write as _;
+        let result = std::fs::OpenOptions::new().create(true).append(true).open(&path).and_then(|mut f| f.write_all(line.as_bytes()));
+        match result {
+            Ok(()) => self.shadow_failed = false,
+            Err(e) if !self.shadow_failed => {
+                warn!("{}: {e}; no shadow log", path.display());
+                self.shadow_failed = true;
+            }
+            Err(_) => {}
+        }
     }
 
     /// Write the model state for the next run (atomically; best effort).
@@ -454,7 +605,13 @@ impl Guard {
         let Some(path) = &self.state_path else { return };
         let text = state::encode(hw.boottime(), &self.speakers, self.armed);
         let tmp = path.with_extension("tmp");
-        let result = std::fs::write(&tmp, text).and_then(|()| std::fs::rename(&tmp, path));
+        let etext = self.engine.encode(hw.boottime());
+        let etmp = path.with_extension("engine.tmp");
+        let epath = path.with_extension("engine");
+        let result = std::fs::write(&tmp, text)
+            .and_then(|()| std::fs::rename(&tmp, path))
+            .and_then(|()| std::fs::write(&etmp, etext))
+            .and_then(|()| std::fs::rename(&etmp, &epath));
         match result {
             Ok(()) => self.save_failed = false,
             Err(e) if !self.save_failed => {

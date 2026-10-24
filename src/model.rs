@@ -230,11 +230,35 @@ mod tests {
             vs_chan: 0,
             p_limit_1s: 0.0,
             p_limit_60s: 0.0,
+            is_chan: None,
+            is_scale: 0.0,
+            r_ff: 4.43,
+            vi_tr_coil: 60.0,
+            vi_tau_coil: 3.0,
+            vi_tr_magnet: 40.0,
+            vi_tau_magnet: 200.0,
+            a_t_20c: 0.0,
         }
     }
 
     fn globals() -> Globals {
-        Globals { sense_pcm: 2, t_ambient: 35.0, t_hysteresis: 5.0, t_window: 20.0, channels: 2, period: 4096, t_reduction_max: 20.0, safe_reduction: 20.0 }
+        Globals {
+            sense_pcm: 2,
+            t_ambient: 35.0,
+            t_hysteresis: 5.0,
+            t_window: 20.0,
+            channels: 2,
+            period: 4096,
+            t_reduction_max: 20.0,
+            safe_reduction: 20.0,
+            governor: crate::config::Governor::Legacy,
+            shadow: false,
+            sense_format: crate::config::SenseFormat::S32,
+            amp_gain_dbv: 0.0,
+            horizon_s: 4.6,
+            release_s: 20.0,
+            t_ctrl_headroom: 0.0,
+        }
     }
 
     #[test]

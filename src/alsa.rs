@@ -296,6 +296,7 @@ const PARAM_RATE: usize = 11 - 8;
 const PARAM_PERIOD_SIZE: usize = 13 - 8;
 const PARAM_PERIODS: usize = 15 - 8;
 const ACCESS_RW_INTERLEAVED: u32 = 3;
+const FORMAT_S16_LE: u32 = 2;
 const FORMAT_S32_LE: u32 = 10;
 const SUBFORMAT_STD: u32 = 0;
 const INTERVAL_INTEGER: u32 = 1 << 2;
@@ -320,9 +321,12 @@ pub trait PcmIo {
     fn wait(&mut self, timeout_ms: libc::c_int) -> io::Result<bool>;
 }
 
-/// The capture PCM file itself.
+/// The capture PCM file itself.  An S16 stream is read into `scratch` and
+/// widened (<< 16), so every reader sees S32 full scale.
 pub struct PcmFile {
     file: File,
+    s16: bool,
+    scratch: Vec<i16>,
 }
 
 impl PcmIo for PcmFile {
@@ -335,8 +339,17 @@ impl PcmIo for PcmFile {
     }
 
     fn readi(&mut self, buf: &mut [i32], frames: usize) -> io::Result<i64> {
-        let mut xfer = Xferi { result: 0, buf: buf.as_mut_ptr().cast(), frames: frames as u64 };
+        if !self.s16 {
+            let mut xfer = Xferi { result: 0, buf: buf.as_mut_ptr().cast(), frames: frames as u64 };
+            ioctl(&self.file, PCM_IOCTL_READI_FRAMES, &mut xfer)?;
+            return Ok(xfer.result);
+        }
+        let channels = if frames == 0 { 0 } else { buf.len() / frames };
+        self.scratch.resize(frames * channels, 0);
+        let mut xfer = Xferi { result: 0, buf: self.scratch.as_mut_ptr().cast(), frames: frames as u64 };
         ioctl(&self.file, PCM_IOCTL_READI_FRAMES, &mut xfer)?;
+        let got = (xfer.result.max(0) as usize).min(frames) * channels;
+        widen(&self.scratch[..got], &mut buf[..got]);
         Ok(xfer.result)
     }
 
@@ -352,6 +365,13 @@ impl PcmIo for PcmFile {
             return Err(e);
         }
         Ok(ret != 0)
+    }
+}
+
+/// S16 sense words as S32 full scale.
+pub fn widen(src: &[i16], dst: &mut [i32]) {
+    for (d, &x) in dst.iter_mut().zip(src) {
+        *d = (x as i32) << 16;
     }
 }
 
@@ -379,11 +399,12 @@ pub struct PeriodReader<P: PcmIo> {
     started: bool,
 }
 
-/// An interleaved S32_LE capture stream with fixed period geometry.
+/// An interleaved S32_LE (or S16_LE, widened) capture stream with fixed
+/// period geometry.
 pub type Capture = PeriodReader<PcmFile>;
 
 impl Capture {
-    pub fn open(card: u32, device: u32, channels: usize, rate: u32, period: usize) -> io::Result<Capture> {
+    pub fn open(card: u32, device: u32, channels: usize, rate: u32, period: usize, s16: bool) -> io::Result<Capture> {
         let path = format!("/dev/snd/pcmC{card}D{device}c");
         // A blocking open would wait, silently, for whoever holds the sense
         // PCM to let go, and the volume lock would time out meanwhile: ask
@@ -403,7 +424,7 @@ impl Capture {
             *i = Interval { min: 0, max: u32::MAX, flags: 0 };
         }
         hw.masks[PARAM_ACCESS].bits[0] = 1 << ACCESS_RW_INTERLEAVED;
-        hw.masks[PARAM_FORMAT].bits[0] = 1 << FORMAT_S32_LE;
+        hw.masks[PARAM_FORMAT].bits[0] = 1 << if s16 { FORMAT_S16_LE } else { FORMAT_S32_LE };
         hw.masks[PARAM_SUBFORMAT].bits[0] = 1 << SUBFORMAT_STD;
         let fixed = |i: &mut Interval, v: u32| {
             *i = Interval { min: v, max: v, flags: INTERVAL_INTEGER };
@@ -429,7 +450,7 @@ impl Capture {
         sw.silence_size = 0;
         sw.boundary = (period * 4) as u64 * (1 << 20);
         ioctl(&file, PCM_IOCTL_SW_PARAMS, &mut sw)?;
-        let mut io = PcmFile { file };
+        let mut io = PcmFile { file, s16, scratch: Vec::new() };
         io.prepare()?;
         Ok(PeriodReader::new(io, channels, period))
     }
