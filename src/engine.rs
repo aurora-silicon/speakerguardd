@@ -152,10 +152,13 @@ impl Thermal {
     /// `h` seconds at a constant `power`, exactly, for any `h`.  Returns
     /// bounds of the coil and of the magnet over the interval.  The magnet
     /// moves monotonically toward its target, so its bound is an end.  The
-    /// coil's drive (magnet plus P Rc) does too; a coil below a drive that
-    /// falls rises until it meets the drive and follows it down, so it never
-    /// passes where the drive started, and in every other case the coil's
-    /// extremes are the interval's ends.
+    /// coil is a constant plus two exponentials, so it has at most one
+    /// extremum inside the interval: its bound is the larger end or that
+    /// extremum.  (A coil below a falling drive rises until it meets the
+    /// drive; the bound was where the drive started, however short the
+    /// interval, and a sliver of uncovered time at 20 dB then latched a
+    /// model 10 K under its limit: review r2 of speakerguardd#8, found by
+    /// the V/I harness.)
     pub fn hold(&mut self, power: f64, h: f64, t_ambient: f64) -> (f64, f64) {
         let (c0, m0) = (self.t_coil, self.t_magnet);
         if !(h > 0.0) {
@@ -163,14 +166,40 @@ impl Thermal {
         }
         let (alpha, beta) = self.coil_after(h, t_ambient);
         let m_inf = t_ambient + power * self.tr_magnet;
+        let inside = self.coil_extremum(power, h, t_ambient);
         self.t_magnet = m_inf + (m0 - m_inf) * (-h / self.tau_magnet).exp();
         self.t_coil = alpha + beta * power;
-        let mut coil = hi(c0, self.t_coil);
-        let drive0 = m0 + power * self.tr_coil;
-        if !(c0 >= drive0) && !(m0 <= m_inf) {
-            coil = hi(coil, drive0);
+        (hi(hi(c0, self.t_coil), inside), hi(m0, self.t_magnet))
+    }
+
+    /// The coil at its extremum strictly inside (0, h) at a constant
+    /// `power` from the current state, or -inf when it has none there.
+    /// The coil is c_inf + K e^(-t/tau_m) + C e^(-t/tau_c), whose
+    /// derivative has one zero at most.  Equal time constants keep the
+    /// old bound (where the drive starts, for a coil below a falling
+    /// drive).
+    fn coil_extremum(&self, power: f64, h: f64, t_ambient: f64) -> f64 {
+        let (tc, tm) = (self.tau_coil, self.tau_magnet);
+        let m_inf = t_ambient + power * self.tr_magnet;
+        let c_inf = m_inf + power * self.tr_coil;
+        if (tm - tc).abs() <= 1e-6 * tc {
+            let drive0 = self.t_magnet + power * self.tr_coil;
+            return if !(self.t_coil >= drive0) && !(self.t_magnet <= m_inf) { drive0 } else { f64::NEG_INFINITY };
         }
-        (coil, hi(m0, self.t_magnet))
+        let k = tm / (tm - tc) * (self.t_magnet - m_inf);
+        let c = self.t_coil - c_inf - k;
+        // c'(t) = -(K / tau_m) e^(-t/tau_m) - (C / tau_c) e^(-t/tau_c) = 0
+        let ratio = -(k * tc) / (c * tm);
+        if !(ratio > 0.0) {
+            return f64::NEG_INFINITY;
+        }
+        let t = ratio.ln() / (1.0 / tm - 1.0 / tc);
+        if !(t > 0.0 && t < h) {
+            return f64::NEG_INFINITY;
+        }
+        let v = c_inf + k * (-t / tm).exp() + c * (-t / tc).exp();
+        // rounding never brings the bound under the coil
+        v + 1e-9 * v.abs().max(1.0)
     }
 
     /// `dt` seconds at a power that varies inside them around a mean of
@@ -1273,6 +1302,50 @@ mod tests {
             }
             assert!(bc >= mc - 1e-6 && bm >= mm - 1e-6, "start {c0}/{m0} at {p} W: bound {bc}/{bm}, inside {mc}/{mm}");
             assert!((th.t_coil - fine.t_coil).abs() < 1e-6);
+        }
+    }
+
+    /// The bound over a short interval is the coil's own maximum, not
+    /// where the drive started: a coil at 139.9 C over a magnet at 138.3 C,
+    /// 0.42 W for 100 us (a sliver of uncovered time at 20 dB on the J316
+    /// tweeter) peaks at 139.9 C.  The old bound said 157.5 C and latched
+    /// the model at every renewal.  Over random states, powers and
+    /// intervals the bound is never under the coil at any point inside,
+    /// and never more than a fine step above its maximum.
+    #[test]
+    fn a_constant_power_step_bounds_its_inside_tightly() {
+        let mut th = Thermal::new(45.0, 1.3, 50.0, 73.26, 139.9);
+        th.t_magnet = 138.3;
+        let (bc, _) = th.hold(0.42, 1e-4, 50.0);
+        assert!(bc < 139.91, "a 100 us sliver bounded at {bc} C");
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut f = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 11) as f64 / (1u64 << 53) as f64
+        };
+        for _ in 0..400 {
+            let (trc, tauc, trm, taum) = (5.0 + 100.0 * f(), 0.5 + 5.0 * f(), 5.0 + 200.0 * f(), 20.0 + 200.0 * f());
+            let c0 = 50.0 + 150.0 * f();
+            let m0 = 50.0 + 150.0 * f();
+            let p = [0.0, 0.01, 0.4, 3.0, 40.0][(f() * 5.0) as usize];
+            let h = [1e-4, 0.01, 0.3, 3.0, 30.0][(f() * 5.0) as usize];
+            let mut th = Thermal::new(trc, tauc, trm, taum, c0);
+            th.t_magnet = m0;
+            let mut fine = th.clone();
+            let (bc, bm) = th.hold(p, h, 50.0);
+            let (mut mc, mut mm) = (c0, m0);
+            let n = 4000;
+            for _ in 0..n {
+                fine.hold(p, h / n as f64, 50.0);
+                mc = mc.max(fine.t_coil);
+                mm = mm.max(fine.t_magnet);
+            }
+            assert!(bc >= mc - 1e-6 && bm >= mm - 1e-6, "{trc}/{tauc}/{trm}/{taum} from {c0}/{m0} at {p} W for {h} s: bound {bc}/{bm}, inside {mc}/{mm}");
+            // a fine step's own bound at most above the maximum
+            let slack = (p * trc + (m0 - c0).abs()) * (h / n as f64) / tauc + 1e-6;
+            assert!(bc <= mc + slack, "{trc}/{tauc}/{trm}/{taum} from {c0}/{m0} at {p} W for {h} s: bound {bc}, maximum {mc}");
         }
     }
 
