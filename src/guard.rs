@@ -315,6 +315,8 @@ impl Guard {
         match read {
             Ok(Some(true)) => {
                 self.stall.as_mut().unwrap().data();
+                // what the card applied while this period played
+                let applied = self.card_reduction(self.last_valid.unwrap_or_else(|| hw.now()));
                 for s in self.speakers.iter_mut() {
                     let v = s.v_rms_of(&self.words, globals.channels);
                     s.v_rms = v;
@@ -322,7 +324,7 @@ impl Guard {
                     if !v.is_finite() || !power.is_finite() || power < 0.0 {
                         return Err("invalid speaker sense voltage or power".into());
                     }
-                    s.step(power, dt, globals.t_ambient);
+                    s.step_at(power, dt, globals.t_ambient, applied);
                     s.govern(&globals);
                 }
                 self.check_model()?;
@@ -376,7 +378,7 @@ impl Guard {
                 let globals = &self.globals;
                 for s in self.speakers.iter_mut() {
                     let p = s.worst_case_power(reduction);
-                    s.step(p, (now - from).as_secs_f64(), globals.t_ambient);
+                    s.step_at(p, (now - from).as_secs_f64(), globals.t_ambient, reduction);
                     s.govern(globals);
                 }
                 self.check_model()?;
@@ -901,6 +903,53 @@ mod tests {
         run_until(&mut g, &mut hw, secs(10.0)).unwrap();
         assert!(hw.writes.iter().all(|&(_, db)| db == 0.0), "{:?}", hw.writes.iter().find(|w| w.1 != 0.0));
         assert!(hw.lapses.is_empty());
+    }
+
+    /// The power budgets must hold the mean power the speakers actually get
+    /// at or under the budget.  A budget reduction computed from the power
+    /// after the card's gain only asks for the excess left over the
+    /// reduction already applied, so in steady state it settles at about
+    /// half of the dB the budget needs (6.3 W against 2.8154 W: 1.75 dB
+    /// instead of 3.5 dB, 4.2 W through the speakers instead of 2.8 W).
+    /// The thermal model is made unreachable here so only the budgets act.
+    #[test]
+    fn the_power_budgets_hold_the_mean_power_at_the_budget() {
+        let base = J700.replace("t_limit = 135.0", "t_limit = 2000.0");
+        for (one_s, sixty_s, watts, settle) in [
+            (true, false, 3.5, 30.0),
+            (true, false, 4.5, 30.0),
+            (true, false, 6.3, 30.0),
+            (false, true, 2.6, 240.0),
+            (false, true, 3.5, 240.0),
+            (false, true, 6.3, 240.0),
+        ] {
+            let mut text = base.clone();
+            if !one_s {
+                text = text.replace("p_limit_1s = 2.8154", "p_limit_1s = 0");
+            }
+            if !sixty_s {
+                text = text.replace("p_limit_60s = 2.5", "p_limit_60s = 0");
+            }
+            let cfg = Config::parse(&text).unwrap();
+            let limit = if one_s { 2.8154 } else { 2.5 };
+            // a square wave at `level` of full scale: (level * vs_scale)^2 / z
+            // watts before the card's gain (the left speaker: 7.3 V, 4.2 ohm)
+            let level = (watts * 4.2f64).sqrt() / 7.3;
+            let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
+            hw.level = Box::new(move |_| level);
+            let mut g = Guard::start(&mut hw, &cfg, 20.0, None).unwrap();
+            run_until(&mut g, &mut hw, secs(settle)).unwrap();
+            let want = 10.0 * (watts / limit).log10();
+            // the reduction over the last 10 s, and the power it lets through
+            let tail: Vec<f64> = hw.writes.iter().filter(|w| w.0 >= secs(settle - 10.0)).map(|w| w.1).collect();
+            let mean_db = tail.iter().sum::<f64>() / tail.len() as f64;
+            let through = watts * 10f64.powf(-mean_db / 10.0);
+            assert!(
+                (mean_db - want).abs() < 0.3 && through <= limit * 1.08,
+                "{} s budget {limit} W at {watts} W: {mean_db:.2} dB (want {want:.2} dB), {through:.2} W through",
+                if one_s { 1 } else { 60 }
+            );
+        }
     }
 
     /// A restarted daemon must not start cold: with the state file of a hot

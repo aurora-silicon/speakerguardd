@@ -137,7 +137,9 @@ impl Card {
     }
 
     fn write_reduction(&self, db: f64) -> std::io::Result<()> {
-        let value = (self.volume_max as f64 - db * STEPS_PER_DB).round().max(0.0) as i64;
+        // round the reduction up to the control's step: the card never
+        // applies less than the model asked for
+        let value = (self.volume_max as f64 - (db * STEPS_PER_DB - 1e-9).ceil()).max(0.0) as i64;
         for id in &self.volume {
             self.ctl.write_int(id, value)?;
         }
