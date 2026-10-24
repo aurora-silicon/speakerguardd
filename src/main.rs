@@ -41,6 +41,28 @@ use log::Level;
 const UNLOCK_MAGIC: i64 = 0xdec1be15u32 as i32 as i64;
 /// Volume control steps per dB (t8140-aop-audio: 0.5 dB steps).
 const STEPS_PER_DB: f64 = 2.0;
+/// The exit status of a configuration the daemon refuses to govern (an
+/// unqualified machine, a missing opt-in, an unreadable file), before the
+/// card is touched.  A restart cannot change it, and the unit does not
+/// restart on it (RestartPreventExitStatus), so a drop-in's OnFailure=
+/// hands the speakers back to the protection it replaced at once.
+const EXIT_REFUSED: u8 = 78;
+
+/// A refusal to govern (EXIT_REFUSED).
+#[derive(Debug)]
+struct Refused(String);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+fn exit_status(e: &(dyn std::error::Error + 'static)) -> u8 {
+    if e.is::<Refused>() { EXIT_REFUSED } else { 1 }
+}
 
 struct Args {
     config_path: PathBuf,
@@ -478,9 +500,8 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     drop(ctl);
     let model = name.strip_prefix("Apple").unwrap_or(&name).to_lowercase();
     let path = args.config_path.join("apple").join(format!("{model}.conf"));
-    let mut cfg = Config::load(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     // before any control of the card is touched
-    override_config(&mut cfg, args).map_err(|e| format!("{}: {e}", path.display()))?;
+    let cfg = load_config(&path, args)?;
     info!("{}: {} speakers{}, sense PCM {}, period {} frames", path.display(), cfg.speakers.len(), if cfg.has_vi() { " with V/I sense" } else { "" }, cfg.globals.sense_pcm, cfg.globals.period);
     let (card, card_name) = Card::open(Some(&name), &cfg)?;
     let mut hw = RealHw { card, globals: cfg.globals.clone(), capture: None };
@@ -516,6 +537,14 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             return Err(e);
         }
     }
+}
+
+/// The machine's configuration with the command line's choices over it,
+/// or the refusal to govern it.
+fn load_config(path: &std::path::Path, args: &Args) -> Result<Config, Refused> {
+    let mut cfg = Config::load(path).map_err(|e| Refused(format!("{}: {e}", path.display())))?;
+    override_config(&mut cfg, args).map_err(|e| Refused(format!("{}: {e}", path.display())))?;
+    Ok(cfg)
 }
 
 /// Command-line governor and shadow choices over the config's, and the
@@ -576,7 +605,63 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             error!("{e}");
-            ExitCode::FAILURE
+            ExitCode::from(exit_status(e.as_ref()))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(conf: &std::path::Path) -> Args {
+        Args {
+            config_path: conf.to_path_buf(),
+            max_reduction: None,
+            card: None,
+            card_wait: Duration::ZERO,
+            state: None,
+            verbosity: Level::Info,
+            shadow: false,
+            governor: None,
+            horizon: None,
+            ctrl_headroom: None,
+            unified_caps: false,
+            experimental_unified: false,
+            allow_unqualified: false,
+            record: None,
+            record_max_mb: 0,
+            replay: None,
+            model: None,
+            gain_db: 0.0,
+            csv: None,
+        }
+    }
+
+    /// Review X4 of speakerguardd#8: the unit conflicted with
+    /// speakersafetyd, so starting it on an M1 Pro, M2 or J616 stopped
+    /// speakersafetyd, then refused the unqualified configuration and
+    /// exited, and after five tries neither daemon ran.  The packaged unit
+    /// never stops another protection daemon, and a refusal exits with a
+    /// status the unit does not restart on.
+    #[test]
+    fn a_refusal_to_govern_leaves_the_other_protection_running() {
+        let unit = include_str!("../speakerguardd.service");
+        let directive = |name: &str| -> Vec<String> {
+            unit.lines().map(str::trim).filter(|l| l.starts_with(&format!("{name}="))).map(|l| l[name.len() + 1..].to_string()).collect()
+        };
+        assert!(directive("Conflicts").iter().all(|v| !v.contains("speakersafetyd")), "the unit stops speakersafetyd: {:?}", directive("Conflicts"));
+        assert!(directive("RestartPreventExitStatus").iter().any(|v| v.split_whitespace().any(|x| x == EXIT_REFUSED.to_string())), "a refusal is restarted");
+        let conf = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("conf");
+        for m in ["j316", "j413", "j616"] {
+            let path = conf.join("apple").join(format!("{m}.conf"));
+            let e = load_config(&path, &args(&conf)).expect_err("an unqualified machine was governed");
+            assert_eq!(exit_status(&e), EXIT_REFUSED, "{m}: {e}");
+        }
+        let missing = conf.join("apple").join("j000.conf");
+        assert_eq!(exit_status(&load_config(&missing, &args(&conf)).unwrap_err()), EXIT_REFUSED);
+        assert!(load_config(&conf.join("apple").join("j700.conf"), &args(&conf)).is_ok());
+        let other: Box<dyn std::error::Error> = "sense capture: EIO".into();
+        assert_eq!(exit_status(other.as_ref()), 1);
     }
 }

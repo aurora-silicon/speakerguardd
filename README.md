@@ -155,10 +155,15 @@ control per speaker, linked by `group`.
 None of the three is qualified on the machine yet, and their files say
 `qualified = false`.  The daemon refuses to govern them without
 `--allow-unqualified`, and udev starts it only on the J700, so installing
-the package never displaces speakersafetyd.  Governing one of them takes
-an explicit enable: mask speakersafetyd (`systemctl mask --now
-speakersafetyd`) and start this daemon with `--allow-unqualified`.  To go
-back, unmask speakersafetyd and reboot.  Keep speakersafetyd installed.
+the package never displaces speakersafetyd.  The unit never stops it
+either: one daemon holds the card's interlock, whichever takes it first,
+and a configuration this daemon refuses to govern exits with status 78
+before it touches the card, which the unit does not restart on.  Governing
+one of them takes an explicit enable: mask speakersafetyd (`systemctl mask
+--now speakersafetyd`) and start this daemon with `--allow-unqualified`, or
+use a drop-in that adds `Conflicts=speakersafetyd.service` together with
+`OnFailure=speakersafetyd.service`.  To go back, unmask speakersafetyd and
+reboot.  Keep speakersafetyd installed.
 
 On those machines the governor that writes the card is `asahi`, the
 behaviour Asahi Linux's speakersafetyd ships, reimplemented here from its
