@@ -2,9 +2,12 @@
 /*
  * LADSPA wrapper for the excursion limiter, for a PipeWire filter-chain:
  *
- *   { type = ladspa  plugin = "/usr/lib64/ladspa/speakerguard-xlim.so"
+ *   { type = ladspa  plugin = "speakerguard-xlim"
  *     label = speakerguard_xlim  name = xlim
  *     control = { "Xmax (mm)" = 0.565 ... } }
+ *
+ * with links into xlim:in_l and xlim:in_r and out of xlim:out_l and
+ * xlim:out_r.  Its "latency" output reports the delay to the host.
  *
  * The plugin ABI below is the LADSPA 1.1 interface, declared here so the
  * build needs no SDK header.
@@ -63,7 +66,7 @@ enum {
 };
 
 static const char *const names[P_COUNT] = {
-	"In L", "In R", "Out L", "Out R",
+	"in_l", "in_r", "out_l", "out_r",
 	"Vfs L (V)", "Vfs R (V)", "Re (ohm)", "Bl (T m)", "Mms (g)", "Kms (N/m)", "Rms (kg/s)",
 	"Xmax (mm)", "Vmax (m/s)", "Peak (FS)", "Margin", "Release (ms)", "Window (ms)", "Hold (ms)",
 	"Gain (dB)", "latency",
