@@ -54,30 +54,44 @@ Time the daemon could not measure is not ignored and is not fatal either.
 The rule is deliberately simple:
 
 * The thermal model has one account, and every step advances it by exactly
-  the time stepped.  Time is either covered by measured sense frames, placed
-  by the read time less the capture's backlog, or charged as a full-scale
-  square wave at the least reduction the volume controls held at any time
-  since the last verified boundary (widened by the 500 ms the card can keep
-  playing samples converted at an earlier gain).  There are no tolerances,
-  no partial credits and no assumptions about when inside an uncertain
-  interval anything played.  Frames over time already charged add nothing.
+  the time stepped.  Time is either covered by measured sense frames or
+  charged as a full-scale square wave at the least reduction the volume
+  controls held at any time since the last verified boundary (widened by the
+  500 ms the card can keep playing samples converted at an earlier gain).
+  There are no tolerances, no partial credits and no assumptions about when
+  inside an uncertain interval anything played.  Frames over time already
+  charged add nothing.
+* Frames are placed by the capture's backlog, read between two clock reads.
+  The position is whole frames, so their end is known only to within a
+  frame and whatever the two reads leave open.  Only the frames that
+  certainly played inside the placed span are credited, at the most
+  energetic of their possible alignments; the uncertain slivers at either
+  end are charged.
 * A verified boundary is the end of measured frames, or two looks at closed
   speakers with no sample-rate change event between them.  The events are
   drained before each look's sample-rate read and again after it, so a
   stream that comes and goes while the read takes its time is caught; an
-  event after the read is kept for the next look.  The card's change events
-  are required: without them nothing between two looks is known, and the
-  daemon never takes the lock.
-* The power budgets keep the power before the card's gain.  A measured
-  block counts at the most reduction it can have been converted at: any
-  value the controls held from 500 ms before it played, the card's own safe
-  level wherever the daemon may not have held a live lease, and anything
-  for the unknown value before the daemon set one.  A reduction too deep to
-  have delivered a block that loud did not convert it, and nothing before
-  the gain is louder than full scale.
+  event after the read is kept for the next look.  A quiet look vouches
+  only for the time up to 5 ms before it, where an event could still be on
+  its way.  The card's change events are required: without them nothing
+  between two looks is known, and the daemon never takes the lock.
+* The power budgets keep the power before the card's gain.  Each measured
+  frame counts at the most reduction it can have been converted at: any
+  value the controls held from 500 ms before it played (the reduction the
+  card applies, rounded up to its steps; after a failed write, anything
+  from the old value to the new one rounded up), the card's own safe level
+  from the moment the daemon's lease may have run out, and anything for the
+  controls' value before the daemon set one.  A reduction too deep to have
+  delivered a frame that loud did not convert it; a word is taken a step
+  above itself; nothing before the gain is louder than full scale, and a
+  frame the card may have muted counts as full scale.  A budget window that
+  cuts a step counts as much of the step's energy as full scale fits in
+  the part it covers.
 * Every renewal of the lock, including the one before the blocking sense
   open, goes through the same decision: the account brought up to date,
-  then the hard limit, the reduction limit and the model's freshness.
+  then the hard limit, the reduction limit, the model's freshness and the
+  sense data's.  The check is made again after the renewal itself, which
+  can block, and a renewal that left the model behind is given up again.
 * A stream silent for 500 ms is closed and reopened.  Without a complete
   period for longer than that, the daemon gives the card's lock up (macaudio
   locks the volume at once and stops streams converted at the old gain).
@@ -94,11 +108,17 @@ Known costs of that rule, accepted on purpose:
 * A sense outage is charged at full scale at the least gain since the last
   verified boundary until periods return, so the lock comes back later after
   one than the speaker strictly needs.
-* For half a second after a gain change the budgets may count a block at
+* For half a second after a gain change the budgets may count a frame at
   the earlier, deeper reduction, which slows a budget's release.  After a
   start in the middle of playback the samples still playing count as loud
   as they can have been, a reduction of up to about 1 dB for a second or
   two on the J700.
+* A frame of every period is charged at full scale (the position's
+  uncertainty): about 3 mW on the J700's coils.
+* After a start without a clean stop the budgets assume a minute of full
+  scale (up to about 7 dB on the J700, easing over the minute after the
+  start), and after a clean stop the time since it counts as full scale
+  before the gain.
 
 Exits are left for what the daemon cannot recover from (no card, a
 configuration error, a nonfinite model, a lock it cannot give up); the
@@ -109,13 +129,17 @@ only from the state a clean stop writes to `/run/speakerguardd/state`
 moment and only then writes it, marked `released 1`, its coverage and its
 write named by one epoch.  It is resumed once: the run that resumes it
 overwrites it (or, failing that, removes it) before it can unlock, and does
-not unlock while it can do neither.  The time since it is charged at the
-card's safe level, and its two budget means are placed at full scale as
-late in their windows as the energy can have come.  Any other state (a
-crash, an older version's file, a state whose model trails its write) or none
-starts every speaker at its coil limit, latched, so the card stays with the
-kernel until the model has cooled under its working ceiling (about 4 s on the
-J700).  A daemon that is late renewing the lock is covered by the kernel's
+not unlock while it can do neither; the state is read only once the daemon
+holds the card's lock.  The time since it is charged at the card's safe
+level, and its two budget means are placed at full scale as late in their
+windows as the energy can have come.  The clock reads that pair the boot
+time with the daemon's own clock, at the final save and at the restore, are
+bounded: whatever time lies between them is charged once more at full scale
+and full gain.  Any other state (a crash, an older version's file, a state
+whose model trails its write) or none starts every speaker at its coil limit
+plus what the samples a dead run left queued can add, latched, so the card
+stays with the kernel until the model has cooled under its working ceiling
+(about 7 s on the J700).  A daemon that is late renewing the lock is covered by the kernel's
 250 ms lock timeout, and the late time is charged like any other.
 
 ### Machines with current and voltage sense
@@ -150,12 +174,14 @@ hysteresis.  It differs only toward protection:
   each speaker's least reduction since the last verified boundary, instead
   of skipped.
 * The hard limit is checked at every sample, for the coil and the magnet.
-  A crossing latches and leaves the model at the limit, so later samples
-  cannot hide it.
+  A crossing latches.  Negative V*I after it in the same stretch leaves the
+  model at the limit at least, so a bad sample cannot hide the crossing,
+  while a latched model with no negative samples cools as it should.
 * A period whose mean V*I is below -0.01 W is bad sense data: uncovered
   time, charged at full scale, never measured.  The card goes to the kernel
   at once (which mutes these amplifiers), and two good periods in a row are
-  needed to take the lock back.
+  needed to take the lock back.  The wait for them survives a clean stop
+  and restart.
 * The governor's state (temperatures, holds, gain, latch) is saved with the
   rest of the model and resumed only from a clean stop.  A missing state,
   or a run of speakersafetyd since boot (its flag file under /run), starts
@@ -210,6 +236,32 @@ match and nothing it measured was lost or rejected in the recording;
 otherwise it says why and exits with status 3.  A certificate is about the
 recording, not the speakers: it says the replay saw what the live daemon
 saw.
+
+### Randomized interleavings
+
+`src/harness.rs` runs the real guard on the J700 model against a simulated
+world: streams of
+any length (shorter than a period too), a program before the card's gain,
+copy chunks converted at the gain the card really held and played through a
+queue of up to 341 ms, the lease in playing time, macaudio stopping old-gain
+streams when its lock goes, control writes that fail or land partly, rounded
+to their steps, sample-rate reads that fail or block, change events with
+latency, a capture that stalls, shortens or blocks on its position, a
+daemon descheduled between any two calls, pauses between paired clock reads,
+and restarts (clean, crashed, the state damaged, removed or rewritten as the
+old format).  An oracle written apart from the daemon integrates what was
+really played into its own thermal model and keeps the true power before
+the gain.  After every pass it asserts that the model is never cooler than
+the oracle's, that its budgets never hold less energy before the gain, that
+while the daemon holds the lease the card never applies less reduction than
+the true state needs, and that what cannot be proven ends with the card at
+its safe level (no lock without events, none after a failed rate read, no
+renewal blind past the limit, a latched start from anything but a clean
+stop).  Failures shrink to a minimal scenario printed as Rust; each one it
+found is a test of its own.
+
+    cargo test --release harness                      # 200 cases
+    SPEAKERGUARDD_CASES=1000000 cargo test --release harness
 
 ### Relation to speakersafetyd
 

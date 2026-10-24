@@ -17,6 +17,8 @@ mod alsa;
 mod config;
 mod engine;
 mod guard;
+#[cfg(test)]
+mod harness;
 mod log;
 mod model;
 mod record;
@@ -284,26 +286,35 @@ impl Card {
         Ok((max as f64 - (db * STEPS_PER_DB - 1e-9).ceil()).max(self.volume_min as f64) as i64)
     }
 
-    fn write_reduction(&self, db: f64) -> std::io::Result<()> {
+    /// The reduction a control value applies (dB).
+    fn db_of(&self, value: i64) -> f64 {
+        (self.volume_max.unwrap_or(value) - value) as f64 / STEPS_PER_DB
+    }
+
+    /// Returns the reduction the controls now apply (dB).
+    fn write_reduction(&self, db: f64) -> std::io::Result<f64> {
         let value = self.value_of(db)?;
         for id in &self.volume {
             self.ctl.write_int(id, value)?;
         }
-        Ok(())
+        Ok(self.db_of(value))
     }
 
     /// One reduction per speaker on cards with a control each, the largest
-    /// on the others.
-    fn write_reductions(&self, db: &[f64]) -> std::io::Result<()> {
+    /// on the others.  Returns what each speaker's control now applies.
+    fn write_reductions(&self, db: &[f64]) -> std::io::Result<Vec<f64>> {
         match &self.per_speaker {
             Some(ids) if ids.len() == db.len() => {
                 let values = db.iter().map(|&d| self.value_of(d)).collect::<std::io::Result<Vec<i64>>>()?;
-                for (id, v) in ids.iter().zip(values) {
+                for (id, &v) in ids.iter().zip(&values) {
                     self.ctl.write_int(id, v)?;
                 }
-                Ok(())
+                Ok(values.iter().map(|&v| self.db_of(v)).collect())
             }
-            _ => self.write_reduction(db.iter().cloned().fold(0.0, f64::max)),
+            _ => {
+                let applied = self.write_reduction(db.iter().cloned().fold(0.0, f64::max))?;
+                Ok(vec![applied; db.len()])
+            }
         }
     }
 }
@@ -334,11 +345,14 @@ impl Hw for RealHw {
     fn ping(&mut self) -> std::io::Result<()> {
         self.card.ping()
     }
-    fn set_reduction(&mut self, db: f64) -> std::io::Result<()> {
+    fn set_reduction(&mut self, db: f64) -> std::io::Result<f64> {
         self.card.write_reduction(db)
     }
-    fn set_reductions(&mut self, db: &[f64]) -> std::io::Result<()> {
+    fn set_reductions(&mut self, db: &[f64]) -> std::io::Result<Vec<f64>> {
         self.card.write_reductions(db)
+    }
+    fn step_db(&self) -> f64 {
+        1.0 / STEPS_PER_DB
     }
     fn set_min(&mut self) -> std::io::Result<()> {
         self.card.write_min()

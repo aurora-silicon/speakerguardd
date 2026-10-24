@@ -253,7 +253,7 @@ pub fn decode(text: &str) -> Option<Saved> {
 
 /// Continue every speaker from a clean stop's state and charge the time
 /// since at the worst case the card's own safe level lets through (no
-/// daemon held the card).  Anything else - a v1 file, a state not written
+/// daemon held the card), a full-scale signal before the gain.  Anything else - a v1 file, a state not written
 /// by a clean stop, one whose model did not cover up to its write, a
 /// speaker it does not name - starts at the coil's limit, latched.  True
 /// if the state was resumed.
@@ -270,17 +270,21 @@ pub fn restore(speakers: &mut [SpeakerState], saved: &Saved, now: Duration, glob
         };
         s.resume(x.t_coil, x.t_magnet, x.mean_1s, x.mean_60s);
         s.resume_governor(Some(x.hard), x.t_peak, x.reduction_db);
+        // the gap: what the card's safe level lets through for the heat,
+        // and a full-scale signal before the gain for the budgets (review
+        // r5 V3: the input may have been full scale all along)
         let p = s.worst_case_power(globals.safe_reduction);
+        let pre = s.worst_case_power(0.0);
         let mut left = elapsed;
         if left > 3600.0 {
             // an hour at it is its steady state for any real speaker
             let hard = s.hard;
-            s.settle_at(p, globals.t_ambient);
+            s.settle_at(p, pre, globals.t_ambient);
             s.hard = hard;
         } else {
             while left > 0.0 {
                 let dt = left.min(1.0);
-                s.step_at(p, dt, globals.t_ambient, 0.0);
+                s.step_pre(p, pre, dt, globals.t_ambient);
                 left -= dt;
             }
         }
@@ -421,7 +425,7 @@ mod tests {
         saved.speakers.retain(|s| s.name == "Left");
         let mut f = fresh(&cfg);
         restore(&mut f, &saved, T, &cfg.globals);
-        assert_eq!(f[1].t_coil, 135.0);
+        assert!(f[1].t_coil >= 135.0);
         assert!(f[1].hard);
     }
 

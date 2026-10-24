@@ -56,7 +56,9 @@ use std::time::{Duration, Instant};
 
 use crate::config::{Config, Governor, SenseFormat};
 use crate::guard::{Accounted, Guard, Hw, Trace, KERNEL_LOCK_TIMEOUT, MUTE_DB};
-use crate::model::PRE_GAIN_MAX_DB;
+/// The most card gain a replay rebuilds a program through (dB): past it the
+/// recorded words are too quiet to say what the program was.
+const PRE_GAIN_MAX_DB: f64 = 30.0;
 
 const MAGIC: &str = "speakerguardd-record 2";
 
@@ -781,11 +783,11 @@ impl Hw for ReplayHw {
         self.card.lease_left = KERNEL_LOCK_TIMEOUT;
         Ok(())
     }
-    fn set_reduction(&mut self, db: f64) -> io::Result<()> {
+    fn set_reduction(&mut self, db: f64) -> io::Result<f64> {
         let n = self.card.per.len();
-        self.set_reductions(&vec![db; n])
+        Ok(self.set_reductions(&vec![db; n])?.into_iter().fold(0.0, f64::max))
     }
-    fn set_reductions(&mut self, db: &[f64]) -> io::Result<()> {
+    fn set_reductions(&mut self, db: &[f64]) -> io::Result<Vec<f64>> {
         self.lapse();
         if !self.card.unlocked && db.iter().any(|&d| d < self.card.safe) {
             return Err(io::Error::from_raw_os_error(libc::EINVAL));
@@ -793,7 +795,11 @@ impl Hw for ReplayHw {
         for (p, &d) in self.card.per.iter_mut().zip(db) {
             *p = d;
         }
-        Ok(())
+        // the card rounds each up to its 0.5 dB step
+        Ok(db.iter().map(|&d| rounded(d)).collect())
+    }
+    fn step_db(&self) -> f64 {
+        0.5
     }
     fn set_min(&mut self) -> io::Result<()> {
         self.lapse();

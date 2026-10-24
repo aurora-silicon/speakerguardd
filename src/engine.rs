@@ -43,7 +43,7 @@ use std::collections::VecDeque;
 use std::fmt::Write as _;
 
 use crate::config::{Config, Globals, Governor, Speaker};
-use crate::model::{budget_envelope, converted_at, MAX_SUB_DT, PRE_GAIN_MAX_DB, SUB_BLOCKS};
+use crate::model::{budget_envelope, converted_at, DRAIN_S, MAX_SUB_DT, SUB_BLOCKS};
 
 /// The asahi models see this much more power than measured (+0.02 dB): on
 /// recorded sense data their gains then never ask for less than
@@ -354,10 +354,10 @@ fn record(history: &mut VecDeque<(f64, f64)>, history_s: &mut f64, dt: f64, powe
     }
 }
 
-/// The power before the card's gain, from the power after it: no gain past
-/// PRE_GAIN_MAX_DB is undone (under a muted card the sense data is noise).
+/// The power before the card's gain, from the power after it (the callers
+/// cap it at full scale).
 fn pre_gain(power: f64, applied_db: f64) -> f64 {
-    power * 10f64.powf(applied_db.clamp(0.0, PRE_GAIN_MAX_DB) / 10.0)
+    power * 10f64.powf(applied_db.max(0.0) / 10.0)
 }
 
 /// speakersafetyd's model and governor for one speaker.
@@ -407,7 +407,11 @@ impl AsahiSpeaker {
     }
 
     fn assume_latched(&mut self, t_ambient: f64) {
-        self.th.set_at(self.t_limit, t_ambient);
+        // a run that died under the limit may have left its gain on the
+        // queued samples: they play out for up to the drain at full scale
+        let p = self.v_worst * self.v_worst / self.z_min;
+        let drain = p * self.th.tr_coil * (1.0 - (-DRAIN_S / self.th.tau_coil).exp());
+        self.th.set_at(self.t_limit + drain, t_ambient);
         self.coil_peak = self.th.t_coil;
         self.magnet_peak = self.th.t_magnet;
         self.coil_hyst = self.th.t_coil;
@@ -442,13 +446,19 @@ impl AsahiSpeaker {
         let (trc, trm) = (self.th.tr_coil, self.th.tr_magnet);
         let (mut tc, mut tm) = (self.th.t_coil, self.th.t_magnet);
         let (mut pc, mut pm) = (tc, tm);
-        // the samples' own highs: a model that starts at the limit (latched)
-        // may cool from it
-        let (mut xc, mut xm) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+        // At or over the limit the model latches; negative V*I after that
+        // point cools the model, never the coil, so the model may not say
+        // the coil came back under the limit in this stretch.  Cooling with
+        // no negative power after the crossing is real (a model that starts
+        // over the limit, latched, may cool from it).
         let mut crossed = false;
+        let mut negative_after = false;
         for (i, f) in words.chunks_exact(channels).enumerate() {
             let (ac, am) = if i == 0 { (ac1, am1) } else { (acn, amn) };
             let p = f[vc] as f64 * vs * (f[ic] as f64 * is) * ASAHI_MARGIN;
+            if crossed && p < 0.0 {
+                negative_after = true;
+            }
             let coil_target = tm + p * trc;
             let magnet_target = t_ambient + p * trm;
             tc = coil_target * ac + tc * (1.0 - ac);
@@ -458,14 +468,12 @@ impl AsahiSpeaker {
             }
             pc = hi(pc, tc);
             pm = hi(pm, tm);
-            xc = hi(xc, tc);
-            xm = hi(xm, tm);
         }
-        if crossed {
-            if !(xc < self.t_limit) {
+        if negative_after {
+            if !(pc < self.t_limit) {
                 tc = hi(tc, self.t_limit);
             }
-            if !(xm < self.t_limit) {
+            if !(pm < self.t_limit) {
                 tm = hi(tm, self.t_limit);
             }
         }
@@ -599,12 +607,24 @@ impl UnifiedSpeaker {
     }
 
     fn assume_latched(&mut self, t_ambient: f64) {
-        self.ff.set_at(self.t_limit, t_ambient);
+        // the drain's heat on top of the limit, and a minute of full scale
+        // in the budgets (nothing about the past is known)
+        let full_ff = self.v_worst * self.v_worst / self.r_ff;
+        let drain = |th: &Thermal, p: f64| p * th.tr_coil * (1.0 - (-DRAIN_S / th.tau_coil).exp());
+        let d = drain(&self.ff, full_ff);
+        self.ff.set_at(self.t_limit + d, t_ambient);
+        let mut peak = self.ff.t_coil;
+        let full_vi = self.v_worst * self.v_worst / self.z_min;
         if let Some(v) = self.vi.as_mut() {
-            v.set_at(self.t_limit, t_ambient);
+            let d = drain(v, full_vi);
+            v.set_at(self.t_limit + d, t_ambient);
+            peak = peak.max(v.t_coil);
         }
-        self.peak = self.t_limit;
+        self.peak = peak;
         self.hard = true;
+        self.history.clear();
+        self.history.push_back((60.0, full_ff));
+        self.history_s = 60.0;
     }
 
     fn note(&mut self, peak: f64) {
@@ -618,46 +638,31 @@ impl UnifiedSpeaker {
         mean_of(&self.history, seconds)
     }
 
-    /// The power before the card's gain of a block whose mean V^2 is
-    /// `v_ms` and whose power after it is `power`, converted at one of the
-    /// `possible` reductions: the most that can have delivered a block this
-    /// loud, never more than full scale gives (`full`).
-    fn pre_of(&self, v_ms: f64, power: f64, full: f64, possible: &[(f64, f64)]) -> f64 {
-        if !(power > 0.0) {
-            return power.max(0.0);
-        }
-        let room = if v_ms > 0.0 { 10.0 * (self.v_worst * self.v_worst / v_ms).log10() } else { PRE_GAIN_MAX_DB };
-        let pre = power * 10f64.powf(converted_at(room, possible) / 10.0);
-        if pre > full { full } else { pre }
-    }
-
-    /// Measured blocks of equal length: (V^2 mean, V*I mean) each, after
-    /// the card's gain, which applied one of the `possible` reductions.
-    fn blocks(&mut self, blocks: &[(f64, Option<f64>)], span: f64, possible: &[(f64, f64)], t_ambient: f64) {
-        let n = blocks.len().max(1) as f64;
+    /// Measured blocks of equal length: the V^2 means, the V*I means (V/I
+    /// machines), and each block's power before the card's gain for the
+    /// feed-forward and the measured model (each frame inverted on its own,
+    /// at most full scale: Engine::measured).
+    fn blocks(&mut self, v_ms: &[f64], vi: Option<&[f64]>, pre_ff: &[f64], pre_vi: Option<&[f64]>, span: f64, t_ambient: f64) {
+        let n = v_ms.len().max(1) as f64;
         let h = span / n;
         let mut peak = self.peak_floor.take().unwrap_or(f64::NEG_INFINITY).max(self.ff.hottest());
-        for &(v_ms, _) in blocks {
-            let (c, m) = self.ff.varying(v_ms / self.r_ff, h, t_ambient);
+        for &v2 in v_ms {
+            let (c, m) = self.ff.varying(v2 / self.r_ff, h, t_ambient);
             peak = hi(peak, hi(c, m));
         }
-        let mut mean_vi = None;
-        if let Some(vi) = self.vi.as_mut() {
-            peak = hi(peak, vi.hottest());
+        if let (Some(model), Some(vi)) = (self.vi.as_mut(), vi) {
+            peak = hi(peak, model.hottest());
             // negative blocks only ever dropped: never cooler than measured
-            for &(_, p) in blocks {
-                let (c, m) = vi.varying(p.unwrap_or(0.0).max(0.0), h, t_ambient);
+            for &p in vi {
+                let (c, m) = model.varying(p.max(0.0), h, t_ambient);
                 peak = hi(peak, hi(c, m));
             }
-            mean_vi = Some(blocks.iter().map(|b| b.1.unwrap_or(0.0).max(0.0)).sum::<f64>() / n);
         }
         self.note(peak);
-        let full_ff = self.v_worst * self.v_worst / self.r_ff;
-        let full_vi = self.v_worst * self.v_worst / self.z_min;
-        let pre = blocks.iter().map(|b| self.pre_of(b.0, b.0 / self.r_ff, full_ff, possible)).sum::<f64>() / n;
+        let pre = pre_ff.iter().sum::<f64>() / n;
         record(&mut self.history, &mut self.history_s, span, pre);
         self.last_ff_pre = pre;
-        self.last_vi_pre = mean_vi.map(|_| blocks.iter().map(|b| self.pre_of(b.0, b.1.unwrap_or(0.0).max(0.0), full_vi, possible)).sum::<f64>() / n);
+        self.last_vi_pre = if self.vi.is_some() { pre_vi.map(|p| p.iter().sum::<f64>() / n) } else { None };
     }
 
     fn worst(&mut self, reduction: f64, d: f64, t_ambient: f64) {
@@ -748,7 +753,14 @@ impl UnifiedSpeaker {
 
     #[cfg(test)]
     pub fn blocks_for_test(&mut self, blocks: &[(f64, Option<f64>)], span: f64, applied: f64, t_ambient: f64) {
-        self.blocks(blocks, span, &[(applied, applied)], t_ambient)
+        let full_ff = self.v_worst * self.v_worst / self.r_ff;
+        let full_vi = self.v_worst * self.v_worst / self.z_min;
+        let v: Vec<f64> = blocks.iter().map(|b| b.0).collect();
+        let vi: Vec<f64> = blocks.iter().map(|b| b.1.unwrap_or(0.0)).collect();
+        let pf: Vec<f64> = v.iter().map(|&x| pre_gain(x / self.r_ff, applied).min(full_ff)).collect();
+        let pv: Vec<f64> = vi.iter().map(|&x| pre_gain(x.max(0.0), applied).min(full_vi)).collect();
+        let has_vi = blocks.iter().any(|b| b.1.is_some());
+        self.blocks(&v, has_vi.then_some(&vi[..]), &pf, has_vi.then_some(&pv[..]), span, t_ambient)
     }
 
     fn clear_hard_if_cool(&mut self) -> bool {
@@ -945,42 +957,88 @@ impl Engine {
         Ok(())
     }
 
-    /// `frames` measured frames in `words`, `step` seconds each, all of
-    /// them over time not yet accounted except the first, of which only
-    /// `first` (0 < first <= 1) of its step is.  The card applied one of
-    /// `possible[k]` to speaker k (the models get the sensed power; the
-    /// reductions only rebuild the power before the gain for the unified
-    /// budgets).  The asahi models integrate every sample; the unified ones
-    /// blocks, the first frame on its own when it is only partly new
-    /// (review P8-3: no frame is integrated over time already accounted,
-    /// and no stretch is reduced to its blocks' means).
-    pub fn measured(&mut self, words: &[i32], frames: usize, step: f64, first: f64, possible: &[Vec<(f64, f64)>]) {
-        if frames == 0 || !(step > 0.0) || !(first > 0.0) {
+    /// `frames` measured frames in `words`, `step` seconds each, of which
+    /// only `certain` certainly played up to the account's new end (their
+    /// place is `shift` frames open) and the newest `k` of those are over
+    /// time not yet accounted, the oldest of them for `first` (0 < first <=
+    /// 1) of its step.  Each model takes the most energetic run of them for
+    /// itself (the asahi models the most V*I, the unified ones the most V^2,
+    /// V*I and power before the gain).  The card applied one of
+    /// `possible[k]` to speaker k: the models get the sensed power, the
+    /// reductions only rebuild each frame's power before the gain for the
+    /// unified budgets, frame by frame (a block can hold frames converted
+    /// at different gains).  The asahi models integrate every sample, the
+    /// unified ones blocks, the first frame on its own when it is only
+    /// partly new (review P8-3).
+    #[allow(clippy::too_many_arguments)]
+    pub fn measured(&mut self, words: &[i32], frames: usize, certain: usize, k: usize, shift: usize, step: f64, first: f64, possible: &[Vec<(f64, f64)>]) {
+        if frames == 0 || k == 0 || !(step > 0.0) || !(first > 0.0) || certain + shift > frames || k > certain {
             return;
         }
         let g = self.cfg.globals.clone();
         let ch = g.channels;
-        let words = &words[..frames * ch];
-        let span = step * ((frames - 1) as f64 + first.min(1.0));
-        if let Some(asahi) = self.asahi.as_mut() {
-            for (k, s) in self.cfg.speakers.iter().enumerate() {
-                let Some(ic) = s.is_chan else { continue };
-                asahi[k].samples(words, ch, (s.vs_chan, ic), (s.vs_scale / 2147483648.0, s.is_scale / 2147483648.0), step, first.min(1.0), g.t_ambient);
-            }
-        }
-        if self.unified.is_some() {
-            let (head, rest, rest_frames) = if first < 1.0 && frames > 1 { (Some(&words[..ch]), &words[ch..], frames - 1) } else { (None, words, frames) };
-            let n = (SUB_BLOCKS * rest_frames).div_ceil(g.period).max(1).min(rest_frames);
-            let head_f = head.map(|w| block_features(&self.cfg, w, 1));
-            let per = block_features(&self.cfg, rest, n);
-            let rest_s = if head.is_some() { step * rest_frames as f64 } else { span };
-            let unified = self.unified.as_mut().unwrap();
-            for (k, b) in per.iter().enumerate() {
-                if let Some(h) = &head_f {
-                    unified[k].blocks(&h[k], step * first, &possible[k], g.t_ambient);
-                    unified[k].peak_floor = Some(unified[k].peak);
+        let first = first.min(1.0);
+        let span = step * ((k - 1) as f64 + first);
+        let run = |o: usize| (o + certain - k, o + certain);
+        let best = |x: &[f64]| (0..=shift).max_by(|&a, &b| {
+            let (sa, sb) = (run(a), run(b));
+            x[sa.0..sa.1].iter().sum::<f64>().total_cmp(&x[sb.0..sb.1].iter().sum::<f64>())
+        }).unwrap_or(0);
+        for (sk, s) in self.cfg.speakers.iter().enumerate() {
+            let vs = s.vs_scale / 2147483648.0;
+            let is = s.is_scale / 2147483648.0;
+            // per frame: V^2, V*I, and the powers before the gain
+            let mut v2 = Vec::with_capacity(frames);
+            let mut vi = Vec::with_capacity(frames);
+            let mut pre_ff = Vec::with_capacity(frames);
+            let mut pre_vi = Vec::with_capacity(frames);
+            let unified = self.unified.as_ref().map(|u| &u[sk]);
+            for f in 0..frames {
+                let wv = words[f * ch + s.vs_chan] as f64;
+                let wi = s.is_chan.map_or(0.0, |ic| words[f * ch + ic] as f64);
+                v2.push((wv * vs).powi(2));
+                vi.push(wv * vs * (wi * is));
+                if let Some(u) = unified {
+                    let room = if wv != 0.0 { 20.0 * (2147483648.0 / wv.abs()).log10() } else { f64::INFINITY };
+                    let gain = 10f64.powf(converted_at(room, &possible[sk]) / 10.0);
+                    let vup = (wv.abs() + 1.0) * vs;
+                    let iup = (wi.abs() + 1.0) * is;
+                    let full_ff = u.v_worst * u.v_worst / u.r_ff;
+                    let full_vi = u.v_worst * u.v_worst / u.z_min;
+                    pre_ff.push((vup * vup / u.r_ff * gain).min(full_ff));
+                    pre_vi.push(if wv * wi > 0.0 { (vup * iup * gain).min(full_vi) } else { 0.0 });
                 }
-                unified[k].blocks(b, rest_s, &possible[k], g.t_ambient);
+            }
+            if let (Some(asahi), Some(ic)) = (self.asahi.as_mut(), s.is_chan) {
+                let (a, b) = run(best(&vi));
+                asahi[sk].samples(&words[a * ch..b * ch], ch, (s.vs_chan, ic), (vs, is), step, first, g.t_ambient);
+            }
+            if let Some(u) = self.unified.as_mut() {
+                let vi_pos: Vec<f64> = vi.iter().map(|x| x.max(0.0)).collect();
+                let rf = run(best(&v2));
+                let rv = run(best(&vi_pos));
+                let rp = run(best(&pre_ff));
+                let rq = run(best(&pre_vi));
+                let has_vi = s.is_chan.is_some();
+                // the first frame on its own when only part of it is new
+                let parts: &[(usize, usize, f64)] = if first < 1.0 && k > 1 { &[(0, 1, first), (1, k, 1.0)] } else { &[(0, k, 1.0)] };
+                for (i, &(lo, hi_, w)) in parts.iter().enumerate() {
+                    let n = hi_ - lo;
+                    let blocks = (SUB_BLOCKS * n).div_ceil(g.period).clamp(1, n);
+                    let means = |x: &[f64], r: (usize, usize)| -> Vec<f64> {
+                        let x = &x[r.0 + lo..r.0 + hi_];
+                        (0..blocks).map(|b| {
+                            let (a, c) = (n * b / blocks, n * (b + 1) / blocks);
+                            if c > a { x[a..c].iter().sum::<f64>() / (c - a) as f64 } else { 0.0 }
+                        }).collect()
+                    };
+                    let (bv, bvi, bp, bq) = (means(&v2, rf), means(&vi, rv), means(&pre_ff, rp), means(&pre_vi, rq));
+                    let secs = if n == 1 { step * w } else { step * n as f64 };
+                    if i > 0 {
+                        u[sk].peak_floor = Some(u[sk].peak);
+                    }
+                    u[sk].blocks(&bv, has_vi.then_some(&bvi[..]), &bp, has_vi.then_some(&bq[..]), secs, g.t_ambient);
+                }
             }
         }
         self.govern(span, true);
@@ -1143,35 +1201,6 @@ impl Engine {
         o.push_str("]}\n");
         o
     }
-}
-
-/// Per speaker, `blocks` equal blocks of the frames: (V^2 mean, V*I mean).
-fn block_features(cfg: &Config, words: &[i32], blocks: usize) -> Vec<Vec<(f64, Option<f64>)>> {
-    let ch = cfg.globals.channels;
-    let frames = words.len() / ch;
-    let blocks = blocks.clamp(1, frames.max(1));
-    cfg.speakers
-        .iter()
-        .map(|s| {
-            let vs = s.vs_scale / 2147483648.0;
-            let is = s.is_scale / 2147483648.0;
-            (0..blocks)
-                .map(|b| {
-                    let (lo, hi) = (frames * b / blocks, frames * (b + 1) / blocks);
-                    let n = (hi - lo).max(1) as f64;
-                    let (mut v2, mut vi) = (0.0, 0.0);
-                    for f in lo..hi {
-                        let v = words[f * ch + s.vs_chan] as f64 * vs;
-                        v2 += v * v;
-                        if let Some(ic) = s.is_chan {
-                            vi += v * (words[f * ch + ic] as f64 * is);
-                        }
-                    }
-                    (v2 / n, s.is_chan.map(|_| vi / n))
-                })
-                .collect()
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -1341,7 +1370,7 @@ mod tests {
             let mut e = Engine::new(&c, false).unwrap();
             set_asahi(&mut e, 100.0, 80.0);
             e.asahi.as_mut().unwrap()[k].gain = gain;
-            e.measured(&words, c.globals.period, 1.0 / 48000.0, 1.0, &vec![vec![(0.0, 0.0)]; c.speakers.len()]);
+            e.measured(&words, c.globals.period, c.globals.period, c.globals.period, 0, 1.0 / 48000.0, 1.0, &vec![vec![(0.0, 0.0)]; c.speakers.len()]);
             e.asahi.as_ref().unwrap()[k].th.clone()
         };
         let (asked_nothing, asked_six) = (run(0.0), run(-6.0));
@@ -1367,7 +1396,7 @@ mod tests {
         let tm = 50.0 + (119.0 - 50.0) * 200.0 / 304.9;
         set_asahi(&mut e, 119.0, tm);
         e.check(&w, 48000.0).expect("the period's mean power is positive");
-        e.measured(&w, c.globals.period, 1.0 / 48000.0, 1.0, &vec![vec![(0.0, 0.0)]; c.speakers.len()]);
+        e.measured(&w, c.globals.period, c.globals.period, c.globals.period, 0, 1.0 / 48000.0, 1.0, &vec![vec![(0.0, 0.0)]; c.speakers.len()]);
         let a = &e.asahi.as_ref().unwrap()[k];
         assert!(a.coil_peak > 170.0, "peak {}", a.coil_peak);
         assert!(a.hard && e.hard(Governor::Asahi), "the crossing did not latch");
@@ -1382,9 +1411,41 @@ mod tests {
         }
         let mut e = Engine::new(&c, false).unwrap();
         set_asahi(&mut e, 119.0, tm);
-        e.measured(&quiet, c.globals.period, 1.0 / 48000.0, 1.0, &vec![vec![(0.0, 0.0)]; c.speakers.len()]);
+        e.measured(&quiet, c.globals.period, c.globals.period, c.globals.period, 0, 1.0 / 48000.0, 1.0, &vec![vec![(0.0, 0.0)]; c.speakers.len()]);
         let a = &e.asahi.as_ref().unwrap()[k];
         assert!(!a.hard && a.coil_peak < 150.0 && a.th.t_coil < a.coil_peak, "{} / {}", a.th.t_coil, a.coil_peak);
+    }
+
+    /// A latched model a little over the limit (a period's uncertain frames
+    /// charged at full scale) cools through samples with no negative power:
+    /// holding it at the limit there kept the latch for good.  Negative
+    /// power after the crossing still leaves it at the limit.
+    #[test]
+    fn a_latched_model_over_the_limit_cools_unless_negative_power_follows() {
+        let c = cfg(J413);
+        let k = idx(&c, "Left Tweeter");
+        let s = &c.speakers[k];
+        let tm = 50.0 + (150.0 - 50.0) * 200.0 / 304.9;
+        for negative in [false, true] {
+            let mut w = vec![0i32; c.globals.channels * c.globals.period];
+            if negative {
+                for f in w.chunks_exact_mut(c.globals.channels).skip(2000).take(4) {
+                    f[s.vs_chan] = word(1.0, 14.0);
+                    f[s.is_chan.unwrap()] = word(-0.5, 3.75);
+                }
+            }
+            let mut e = Engine::new(&c, false).unwrap();
+            set_asahi(&mut e, 150.04, tm);
+            e.asahi.as_mut().unwrap()[k].hard = true;
+            e.measured(&w, c.globals.period, c.globals.period, c.globals.period, 0, 1.0 / 48000.0, 1.0, &vec![vec![(0.0, 0.0)]; c.speakers.len()]);
+            let a = &e.asahi.as_ref().unwrap()[k];
+            assert!(a.hard, "the latch holds");
+            if negative {
+                assert!(a.th.t_coil >= 150.0, "negative power after the crossing cooled it to {}", a.th.t_coil);
+            } else {
+                assert!(a.th.t_coil < 150.0, "silence left it at {}", a.th.t_coil);
+            }
+        }
     }
 
     /// The same for the magnet, and for arithmetic that goes nonfinite.
@@ -1403,7 +1464,7 @@ mod tests {
         }
         let mut e = Engine::new(&c, false).unwrap();
         set_asahi(&mut e, 60.0, 149.99);
-        e.measured(&w, c.globals.period, 1.0 / 48000.0, 1.0, &vec![vec![(0.0, 0.0)]; c.speakers.len()]);
+        e.measured(&w, c.globals.period, c.globals.period, c.globals.period, 0, 1.0 / 48000.0, 1.0, &vec![vec![(0.0, 0.0)]; c.speakers.len()]);
         let a = &e.asahi.as_ref().unwrap()[k];
         assert!(a.magnet_peak >= 150.0 && a.hard, "magnet peak {} not latched", a.magnet_peak);
         assert!(a.th.t_magnet >= 150.0 && a.th.t_coil < 150.0, "ends at {} / {}", a.th.t_coil, a.th.t_magnet);
@@ -1411,7 +1472,7 @@ mod tests {
         let mut e = Engine::new(&c, false).unwrap();
         set_asahi(&mut e, 60.0, 60.0);
         e.asahi.as_mut().unwrap()[k].th.tr_magnet = f64::INFINITY;
-        e.measured(&w, c.globals.period, 1.0 / 48000.0, 1.0, &vec![vec![(0.0, 0.0)]; c.speakers.len()]);
+        e.measured(&w, c.globals.period, c.globals.period, c.globals.period, 0, 1.0 / 48000.0, 1.0, &vec![vec![(0.0, 0.0)]; c.speakers.len()]);
         assert!(e.asahi.as_ref().unwrap()[k].hard && !e.finite());
     }
 
@@ -1461,7 +1522,7 @@ mod tests {
                 .collect();
             let ta = c.globals.t_ambient;
             for (k, b) in blocks.iter().enumerate() {
-                e.unified.as_mut().unwrap()[k].blocks(b, dt, &[(r[k], r[k])], ta);
+                e.unified.as_mut().unwrap()[k].blocks_for_test(b, dt, r[k], ta);
                 if let (Some(a), Some(p)) = (e.asahi.as_mut(), b[0].1) {
                     // the asahi model on the period's mean power
                     let (cc, mm) = a[k].th.varying(p * ASAHI_MARGIN, dt, ta);
@@ -1562,13 +1623,15 @@ mod tests {
         let ta = c.globals.t_ambient;
         for _ in 0..200 {
             for u in e.unified.as_mut().unwrap() {
-                u.blocks(&[(5e-5, Some(1e-5))], 0.085, &[(99.5, 99.5)], ta);
+                u.blocks_for_test(&[(5e-5, Some(1e-5))], 0.085, 99.5, ta);
             }
             e.govern(0.085, true);
         }
         assert!(e.temps(0).1 < 51.0, "{}", e.temps(0).1);
-        // the power before the gain is rebuilt up to PRE_GAIN_MAX_DB only
-        assert!(e.unified.as_ref().unwrap()[0].mean_pre(1.0) < 5e-5 / 2.7 * 1001.0);
+        // the power before the gain under a muted card is not known: it
+        // counts as up to full scale, never more
+        let u = &e.unified.as_ref().unwrap()[0];
+        assert!(u.mean_pre(1.0) <= u.v_worst * u.v_worst / u.r_ff + 1e-9);
     }
 
     #[test]
