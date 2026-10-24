@@ -414,27 +414,39 @@ impl Capture {
             .write(true)
             .custom_flags(libc::O_NONBLOCK)
             .open(&path)?;
-        // SAFETY: an all-ones/zeroed parameter block is the "unconstrained"
-        // request the kernel refines.
-        let mut hw: HwParams = unsafe { std::mem::zeroed() };
-        for m in hw.masks.iter_mut() {
-            m.bits = [0; 8];
+        // The hardware period is the sense period, or the largest even
+        // fraction of it the device takes (the SN012776 machines' 12-channel
+        // sense allows 64 KiB per period, less than one 4096-frame S16
+        // period).  The buffer always holds four sense periods, and the
+        // reader waits for a whole sense period either way (avail_min).
+        let mut split = 1;
+        loop {
+            // SAFETY: an all-ones/zeroed parameter block is the
+            // "unconstrained" request the kernel refines.
+            let mut hw: HwParams = unsafe { std::mem::zeroed() };
+            for m in hw.masks.iter_mut() {
+                m.bits = [0; 8];
+            }
+            for i in hw.intervals.iter_mut() {
+                *i = Interval { min: 0, max: u32::MAX, flags: 0 };
+            }
+            hw.masks[PARAM_ACCESS].bits[0] = 1 << ACCESS_RW_INTERLEAVED;
+            hw.masks[PARAM_FORMAT].bits[0] = 1 << if s16 { FORMAT_S16_LE } else { FORMAT_S32_LE };
+            hw.masks[PARAM_SUBFORMAT].bits[0] = 1 << SUBFORMAT_STD;
+            let fixed = |i: &mut Interval, v: u32| {
+                *i = Interval { min: v, max: v, flags: INTERVAL_INTEGER };
+            };
+            fixed(&mut hw.intervals[PARAM_CHANNELS], channels as u32);
+            fixed(&mut hw.intervals[PARAM_RATE], rate);
+            fixed(&mut hw.intervals[PARAM_PERIOD_SIZE], (period / split) as u32);
+            fixed(&mut hw.intervals[PARAM_PERIODS], (4 * split) as u32);
+            hw.rmask = u32::MAX;
+            match ioctl(&file, PCM_IOCTL_HW_PARAMS, &mut hw) {
+                Ok(_) => break,
+                Err(e) if e.raw_os_error() == Some(libc::EINVAL) && split < 16 && period % (split * 2) == 0 => split *= 2,
+                Err(e) => return Err(e),
+            }
         }
-        for i in hw.intervals.iter_mut() {
-            *i = Interval { min: 0, max: u32::MAX, flags: 0 };
-        }
-        hw.masks[PARAM_ACCESS].bits[0] = 1 << ACCESS_RW_INTERLEAVED;
-        hw.masks[PARAM_FORMAT].bits[0] = 1 << if s16 { FORMAT_S16_LE } else { FORMAT_S32_LE };
-        hw.masks[PARAM_SUBFORMAT].bits[0] = 1 << SUBFORMAT_STD;
-        let fixed = |i: &mut Interval, v: u32| {
-            *i = Interval { min: v, max: v, flags: INTERVAL_INTEGER };
-        };
-        fixed(&mut hw.intervals[PARAM_CHANNELS], channels as u32);
-        fixed(&mut hw.intervals[PARAM_RATE], rate);
-        fixed(&mut hw.intervals[PARAM_PERIOD_SIZE], period as u32);
-        fixed(&mut hw.intervals[PARAM_PERIODS], 4);
-        hw.rmask = u32::MAX;
-        ioctl(&file, PCM_IOCTL_HW_PARAMS, &mut hw)?;
 
         // SAFETY: zeroed is a valid base; every field is set below.
         let mut sw: SwParams = unsafe { std::mem::zeroed() };

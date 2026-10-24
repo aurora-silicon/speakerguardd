@@ -91,10 +91,10 @@ impl Thermal {
     /// maximum over the horizon is its value now or at the end: it lags a
     /// drive that only rises (the magnet warms) or, hotter than the drive,
     /// first falls toward it.
+    /// Over the target already, it is the power that brings the coil back
+    /// to the target by the end of the horizon (0 when even silence would
+    /// not).
     pub fn max_power(&self, target: f64, h: f64, t_ambient: f64) -> f64 {
-        if self.t_coil >= target {
-            return 0.0;
-        }
         let (alpha, beta) = self.coil_after(h, t_ambient);
         if beta <= 0.0 {
             return 0.0;
@@ -159,6 +159,9 @@ impl Biquad {
         y
     }
 }
+
+/// A reduction that lets nothing through (dB).
+pub const MUTE_DB: f64 = 120.0;
 
 /// The most card gain undone when reconstructing the power before it (dB).
 pub const PRE_MAX_DB: f64 = 30.0;
@@ -595,11 +598,16 @@ impl Engine {
                     if p_pre <= 0.0 {
                         return 0.0;
                     }
-                    let pmax = th.max_power(target, g.horizon_s, ta);
+                    // Under the target, look ahead over the horizon; at or
+                    // over it, get back to it by the end of the next period.
+                    let h = if th.t_coil < target { g.horizon_s } else { dt.max(0.02) };
+                    let pmax = th.max_power(target, h, ta);
+                    // nothing may pass: as good as muted (and far past
+                    // --max-reduction, so the kernel takes over)
                     if pmax <= 0.0 {
-                        f64::INFINITY
+                        MUTE_DB
                     } else {
-                        db(p_pre / pmax).max(0.0)
+                        db(p_pre / pmax).clamp(0.0, MUTE_DB)
                     }
                 };
                 wanted = wanted.max(need(u.last_ff_pre, &u.ff));
@@ -828,7 +836,18 @@ mod tests {
             sim.step(p, 0.001, 50.0);
         }
         assert!((sim.t_coil - 115.0).abs() < 0.05, "{}", sim.t_coil);
-        let hot = Thermal::new(38.0, 3.3, 26.0, 100.0, 116.0);
+        // over the target: the power that brings it back to the target in h
+        let mut hot = Thermal::new(38.0, 3.3, 26.0, 100.0, 116.0);
+        hot.t_magnet = 70.0;
+        let p = hot.max_power(115.0, 3.3, 50.0);
+        assert!(p > 0.0);
+        let mut sim = hot.clone();
+        for _ in 0..3300 {
+            sim.step(p, 0.001, 50.0);
+        }
+        assert!((sim.t_coil - 115.0).abs() < 0.05, "{}", sim.t_coil);
+        // a magnet at the target: nothing brings the coil back in time
+        hot.t_magnet = 118.0;
         assert_eq!(hot.max_power(115.0, 3.3, 50.0), 0.0);
     }
 
