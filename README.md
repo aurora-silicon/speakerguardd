@@ -39,15 +39,41 @@ The J700 converts on copy, ahead of a playback queue of up to 341 ms, so a
 written reduction reaches only what is converted after it.  Audio already
 queued at a lower gain keeps playing, and only giving the lock up stops it
 (macaudio stops the old-gain stream at once).  The daemon gives the lock up
-for that reason too, in two cases:
-* The coils' thermal reduction has risen more than 3 dB over the least the
-  card may still be playing, and that queued audio, at the level the
-  program was last seen to deliver, could take a coil within 3 K of its
-  limit.
-* Any program at all could take a coil there before its next look.  This is
+for that reason too, in two cases, each logged as itself:
+* Any program at all could take a coil within 3 K of its limit before its
+  next look, through the least reduction the card may be playing.  This is
   what it has to assume while it cannot see.
-It takes the lock back after two whole periods.  Steady programs never do
-this; loud bursts after quiet ones on a warm coil do.
+* The coils' thermal reduction has risen more than 3 dB over that least
+  reduction, and the audio converted at it, at the level the program was
+  last seen to deliver, could take a coil there in the time it can still
+  play: until a queue's length (341 ms) after the controls stopped holding
+  it.
+It takes the lock back after two whole periods.
+
+A daemon that is held up (a call that blocks, the scheduler) cannot write
+anything: the card keeps converting at the last reduction written until the
+kernel's lease runs out and macaudio stops the stream.  So the daemon never
+writes less than a floor: the reduction at which full scale for a lease, a
+period and the stop, behind a copy queue (0.68 s on the J700), keeps every
+coil 3 K under its limit.  It rises with the coil, and the governor takes
+over from it at about 110 C.  This costs loudness at the top of the volume
+range, accepted on purpose:
+
+| Coil model (its magnet where a steady program puts it) | 50 C | 70 C | 85 C | 100 C | 110 C |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Floor | 0.5 dB | 1.5 dB | 2.5 dB | 3.9 dB | 5.0 dB |
+| Floor on the J700's 0.5 dB steps | 0.5 dB | 2.0 dB | 3.0 dB | 4.0 dB | 5.5 dB |
+| Governor | 0 dB | 0 dB | 0 dB | 0 dB | 6.0 dB |
+
+The card rounds every reduction up to its step, the floor's too.  A cold
+J700 never plays at the amplifier's full scale, but 0.5 dB under it.  A
+loud program that warms the coils to 85-100 C plays 3-4 dB under it where
+the governor alone would take nothing yet.  In return, loud bursts
+after quiet passages are not stopped (no hand-off in any of the programs the
+seventh review measured, where the queue rule alone stopped up to 60 a
+minute, each an XRUN and about 170 ms at the card's safe level), and a
+daemon held up for anything up to the lease no longer takes a coil past its
+limit.
 
 There is no feedback: the model can only be as good as its constants.  The
 J700's constants - thermal resistances and time constants, coil temperature
@@ -132,6 +158,8 @@ Known costs of that rule, accepted on purpose:
   scale (up to about 7 dB on the J700, easing over the minute after the
   start), and after a clean stop the time since it counts as full scale
   before the gain.
+* The floor under every write (see above): 0.5 dB on a cold coil, rising
+  to 5 dB at 110 C.
 
 Exits are left for what the daemon cannot recover from (no card, a
 configuration error, a nonfinite model, a lock it cannot give up); the
