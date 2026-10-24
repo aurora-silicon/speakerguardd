@@ -95,7 +95,9 @@ impl SpeakerState {
     }
 
     /// The power of each of `blocks` equal blocks of a sense period (W),
-    /// and the period's RMS voltage.
+    /// and the period's RMS voltage (the tests' reference; the guard
+    /// converts frame by frame).
+    #[cfg(test)]
     pub fn block_powers(&self, words: &[i32], channels: usize, blocks: usize) -> (Vec<f64>, f64) {
         let ch = self.spec.vs_chan;
         let frames = words.len() / channels;

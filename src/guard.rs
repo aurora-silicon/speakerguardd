@@ -774,7 +774,9 @@ impl Guard {
     /// them only for its part over that time, frames wholly over it not at
     /// all (a whole period stays whole whatever the clock's rounding, and a
     /// partly accounted one is integrated frame for frame, never as its
-    /// blocks' means).
+    /// blocks' means).  The loop places every period with `place`; this is
+    /// for the tests.
+    #[cfg(test)]
     fn measure(&mut self, end: Instant, frames: usize) -> Result<(), Box<dyn Error>> {
         self.measure_shifted(end, frames, 0)
     }
