@@ -16,6 +16,8 @@
 mod alsa;
 mod config;
 mod guard;
+#[cfg(test)]
+mod harness;
 mod log;
 mod model;
 mod startup;
@@ -182,7 +184,8 @@ impl Card {
         Ok(self.rate_event)
     }
 
-    fn write_reduction(&self, db: f64) -> std::io::Result<()> {
+    /// Returns the reduction the controls now apply (dB).
+    fn write_reduction(&self, db: f64) -> std::io::Result<f64> {
         // without the range nothing can be written (a failed write: the
         // loop leaves the card at its safe level)
         let max = self.volume_max.ok_or_else(|| std::io::Error::from_raw_os_error(libc::EAGAIN))?;
@@ -192,7 +195,7 @@ impl Card {
         for id in &self.volume {
             self.ctl.write_int(id, value)?;
         }
-        Ok(())
+        Ok((max - value) as f64 / STEPS_PER_DB)
     }
 }
 
@@ -222,8 +225,11 @@ impl Hw for RealHw {
     fn ping(&mut self) -> std::io::Result<()> {
         self.card.ping()
     }
-    fn set_reduction(&mut self, db: f64) -> std::io::Result<()> {
+    fn set_reduction(&mut self, db: f64) -> std::io::Result<f64> {
         self.card.write_reduction(db)
+    }
+    fn step_db(&self) -> f64 {
+        1.0 / STEPS_PER_DB
     }
     fn set_min(&mut self) -> std::io::Result<()> {
         self.card.write_min()
