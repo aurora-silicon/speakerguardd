@@ -97,8 +97,7 @@ The rule is deliberately simple:
   from the moment the daemon's lease may have run out, and anything for the
   controls' value before the daemon set one.  A reduction too deep to have
   delivered a frame that loud did not convert it; a word is taken a step
-  above itself; nothing before the gain is louder than full scale, and a
-  frame the card may have muted counts as full scale.  A budget window that
+  above itself; nothing before the gain is louder than full scale.  A budget window that
   cuts a step counts as much of the step's energy as full scale fits in
   the part it covers.
 * Every renewal of the lock, including the one before the blocking sense
@@ -260,4 +259,10 @@ it never plays audio or performs a reboot.
 `-C <card id>` selects a card (by default the one the macaudio driver
 registered, never the AOP card that shares its `AppleJ` prefix), `-m <dB>`
 the reduction at which the card's safe level takes over, `-s <file>` the
-model state file (`-s ''` for none).
+model state file (`-s ''` for none).  `-V` prints the version and the
+source commit, which the daemon also logs when it starts.
+
+The daemon writes the controls to the card's safe value at its start and
+before each unlock.  The card accepts that value while the volume is locked.
+Until the first unlock the speakers play at the card's safe level, as they
+do without the daemon, and an unlock never lets anything louder through.
