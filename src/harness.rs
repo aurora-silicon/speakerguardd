@@ -40,7 +40,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
-use crate::guard::{Guard, Hw, BLIND_LIMIT, DRAIN, KERNEL_LOCK_TIMEOUT, MUTE_DB, QUEUE_BOUND};
+use crate::guard::{Guard, Hw, BLIND_LIMIT, DRAIN, KERNEL_LOCK_TIMEOUT, QUEUE_BOUND};
 use crate::model::SpeakerState;
 use crate::state;
 
@@ -103,8 +103,8 @@ pub enum Fault {
     Pause { at: f64, len: f64 },
     /// Volume writes fail; partly when `partial` (the new value lands).
     WriteFail { at: f64, len: f64, partial: bool },
-    /// Minimum writes fail.
-    MinFail { at: f64, len: f64 },
+    /// Writes of the safe value fail.
+    SafeFail { at: f64, len: f64 },
     /// The capture delivers nothing.
     SenseLoss { at: f64, len: f64 },
     /// One period is short (overrun).
@@ -195,7 +195,7 @@ impl Scenario {
                 2 => Fault::WakeLate { at, len: r.range(0.05, 1.0), delay: r.range(0.005, 0.1) },
                 3 => Fault::Pause { at, len: r.range(0.05, 0.8) },
                 4 => Fault::WriteFail { at, len: r.range(0.01, 0.4), partial: r.chance(0.5) },
-                5 => Fault::MinFail { at, len: r.range(0.01, 0.4) },
+                5 => Fault::SafeFail { at, len: r.range(0.01, 0.4) },
                 6 => Fault::SenseLoss { at, len: r.range(0.02, 0.9) },
                 7 => Fault::ShortPeriod { at },
                 8 => Fault::PositionFail { at },
@@ -686,16 +686,16 @@ impl Hw for World<'_> {
         self.note_gain();
         Ok(applied)
     }
-    fn set_min(&mut self) -> io::Result<()> {
+    fn set_safe(&mut self) -> io::Result<f64> {
         self.maybe_pause();
         let t = self.now_s();
         self.advance(t);
-        if self.fault_on(|f| if let Fault::MinFail { at, len } = f { Some((*at, *len)) } else { None }) {
+        if self.fault_on(|f| if let Fault::SafeFail { at, len } = f { Some((*at, *len)) } else { None }) {
             return Err(io::Error::from_raw_os_error(libc::EIO));
         }
-        self.control = MUTE_DB;
+        self.control = self.safe();
         self.note_gain();
-        Ok(())
+        Ok(self.safe())
     }
     fn relinquish(&mut self) -> io::Result<()> {
         self.maybe_pause();

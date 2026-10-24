@@ -156,6 +156,29 @@ impl Card {
         self.ctl.lock(&self.unlock)
     }
 
+    /// Every volume control to the card's safe value: the most the card
+    /// accepts while the volume is locked (macaudio limits the controls'
+    /// range to it there), or, once the range with the lock lifted is
+    /// known, that maximum less `safe_db`, whichever is lower.  The minimum
+    /// where that write fails (the card always accepts it).  The reduction
+    /// now applied (dB).
+    fn write_safe(&self, safe_db: f64) -> std::io::Result<f64> {
+        let (_, limit) = self.ctl.int_range(&self.volume[0])?;
+        let value = match self.volume_max {
+            Some(max) => limit.min(max - (safe_db * STEPS_PER_DB - 1e-9).ceil() as i64),
+            None => limit,
+        }
+        .max(self.volume_min);
+        match self.volume.iter().try_for_each(|id| self.ctl.write_int(id, value)) {
+            Ok(()) => Ok(safe_db),
+            Err(e) => {
+                warn!("volume control: {e} at the safe value; writing the minimum");
+                self.write_min()?;
+                Ok(guard::MUTE_DB)
+            }
+        }
+    }
+
     /// Every volume control to its minimum: within the card's limit
     /// whether or not the volume is locked.
     fn write_min(&self) -> std::io::Result<()> {
@@ -231,8 +254,8 @@ impl Hw for RealHw {
     fn step_db(&self) -> f64 {
         1.0 / STEPS_PER_DB
     }
-    fn set_min(&mut self) -> std::io::Result<()> {
-        self.card.write_min()
+    fn set_safe(&mut self) -> std::io::Result<f64> {
+        self.card.write_safe(self.globals.safe_reduction)
     }
     fn relinquish(&mut self) -> std::io::Result<()> {
         self.card.relinquish()

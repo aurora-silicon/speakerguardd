@@ -32,8 +32,9 @@
 //!   level from where the lease may have run out), never above full scale.
 //! * The lock.  Not taken before the model allows it and the daemon can see:
 //!   no unlock at start, and while the speakers play not before
-//!   REARM_PERIODS complete periods.  Controls to their minimum before each
-//!   unlock.  Every renewal goes through one decision (`decide`), made
+//!   REARM_PERIODS complete periods.  Controls to the card's safe value
+//!   before each unlock.  Every renewal goes through one decision
+//!   (`decide`), made
 //!   again after the renewal itself.  Every
 //!   hand-off gives the card's lock up (macaudio locks the volume and stops
 //!   streams converted at the old gain); if that fails the daemon exits,
@@ -131,9 +132,11 @@ pub trait Hw {
     fn step_db(&self) -> f64 {
         0.0
     }
-    /// Turn every volume control to its minimum, which the card accepts
-    /// while the volume is locked: done before each unlock.
-    fn set_min(&mut self) -> io::Result<()>;
+    /// Turn every volume control to the card's own safe value, which it
+    /// accepts while the volume is locked: done at the start and before
+    /// each unlock.  The reduction the controls now apply (dB): the safe
+    /// level, or MUTE_DB where only their minimum could be written.
+    fn set_safe(&mut self) -> io::Result<f64>;
     /// Give the card's lock up and take it again: the card locks the
     /// volume at once, drops what was left of its lease and stops the
     /// streams converted at the old gain.
@@ -312,8 +315,9 @@ pub struct Guard {
     /// The last verified boundary.
     verified_at: Instant,
     rate_failures: u32,
-    /// Failures of the volume writes: to the minimum before an unlock, and
-    /// to the governed reduction.  Each clears only on its own success.
+    /// Failures of the volume writes: to the card's safe value before an
+    /// unlock, and to the governed reduction.  Each clears only on its own
+    /// success.
     min_failures: u32,
     target_failures: u32,
     state_path: Option<PathBuf>,
@@ -342,17 +346,22 @@ impl Guard {
         }
         // The controls' value before this run is unknown, and the budgets
         // count samples converted at it as loud as they can have been: with
-        // the controls at their minimum from here on that lasts the copy
-        // queue's half second, not until the first unlock.  The minimum is
-        // the one value the card accepts while locked; the speakers are
-        // silent until the first unlock.  Without events there is no
-        // unlock: they stay at the card's safe level.
-        let min_now = events && match hw.set_min() {
-            Ok(()) => true,
-            Err(e) => {
-                warn!("volume control: {e}; the controls' value stays unknown");
-                false
+        // the controls at the card's safe value from here on that lasts the
+        // copy queue's half second, not until the first unlock.  The card
+        // accepts that value while locked, so the speakers play at its safe
+        // level until the first unlock, as without the daemon, instead of
+        // silent (review r6).  Without events there is no unlock: they stay
+        // there.
+        let safe_now = if events {
+            match hw.set_safe() {
+                Ok(applied) => Some(applied.max(globals.safe_reduction)),
+                Err(e) => {
+                    warn!("volume control: {e}; the controls' value stays unknown");
+                    None
+                }
             }
+        } else {
+            None
         };
         let mut speakers: Vec<SpeakerState> = cfg.speakers.iter().map(|s| SpeakerState::new(s.clone(), globals.t_ambient)).collect();
         let latched = |speakers: &mut Vec<SpeakerState>| {
@@ -445,13 +454,16 @@ impl Guard {
             unlocked_at: now,
             last_log: now,
             last_write: now,
-            written: if min_now { MUTE_DB } else { f64::INFINITY },
-            written_hi: if min_now { MUTE_DB } else { f64::INFINITY },
+            written: safe_now.unwrap_or(f64::INFINITY),
+            written_hi: safe_now.unwrap_or(f64::INFINITY),
             requested: f64::NAN,
             applied: 0.0,
             gains: {
                 let unknown = Gain { at: now, lo: f64::INFINITY, hi: f64::INFINITY, kernel: true };
-                if min_now { vec![unknown, Gain { at: now, lo: MUTE_DB, hi: MUTE_DB, kernel: true }] } else { vec![unknown] }
+                match safe_now {
+                    Some(v) => vec![unknown, Gain { at: now, lo: v, hi: v, kernel: true }],
+                    None => vec![unknown],
+                }
             },
             verified_at: now,
             rate_failures: 0,
@@ -1184,15 +1196,18 @@ impl Guard {
                 self.invalidated = self.invalidate(hw);
             }
             if seeing && reduction < self.max_reduction - REARM_MARGIN_DB && self.invalidated {
-                match hw.set_min() {
-                    Ok(()) => {
-                        self.written = MUTE_DB;
-                        self.written_hi = MUTE_DB;
+                // the unlock lets nothing through louder than the card's own
+                // safe level
+                match hw.set_safe() {
+                    Ok(applied) => {
+                        let v = applied.max(self.globals.safe_reduction);
+                        self.written = v;
+                        self.written_hi = v;
                         self.requested = f64::NAN;
                         self.note_written(hw.now());
                         self.min_failures = 0;
-                        // the minimum write may have blocked: the model must
-                        // still be current at the unlock
+                        // the write may have blocked: the model must still
+                        // be current at the unlock
                         if self.fresh_enough(hw.now()) {
                             self.ping_lock(hw)?;
                             if self.fresh_enough(hw.now()) {
@@ -1349,10 +1364,10 @@ pub mod fake {
         /// the speakers are idle), and where it was last brought up to date.
         lease_left: Duration,
         lease_t: Duration,
-        /// Writes of the governed reduction (not the minimum) fail (EIO).
+        /// Writes of the governed reduction (not of the safe value) fail (EIO).
         pub target_fail: Box<dyn Fn(Duration) -> bool>,
-        /// How long a minimum write blocks.
-        pub min_delay: Duration,
+        /// How long a write of the safe value blocks.
+        pub safe_delay: Duration,
         pub relinquished: u32,
         pub lapses: Vec<Duration>,
         /// Reduction (dB) last accepted by the card.
@@ -1412,7 +1427,7 @@ pub mod fake {
                 lease_left: Duration::ZERO,
                 lease_t: Duration::ZERO,
                 target_fail: Box::new(|_| false),
-                min_delay: Duration::ZERO,
+                safe_delay: Duration::ZERO,
                 relinquished: 0,
                 lapses: Vec::new(),
                 reduction: SAFE_DB,
@@ -1530,14 +1545,14 @@ pub mod fake {
             self.pings.push(self.t);
             Ok(())
         }
-        fn set_min(&mut self) -> io::Result<()> {
-            self.t += self.min_delay;
+        fn set_safe(&mut self) -> io::Result<f64> {
+            self.t += self.safe_delay;
             self.lapse_check();
             if (self.volume_fail)(self.t) {
                 return Err(io::Error::from_raw_os_error(libc::EIO));
             }
-            self.reduction = MUTE_DB;
-            Ok(())
+            self.reduction = SAFE_DB;
+            Ok(SAFE_DB)
         }
         fn relinquish(&mut self) -> io::Result<()> {
             self.lapse_check();
@@ -2313,9 +2328,9 @@ mod tests {
     }
 
     /// The unlock never lets an older value through: the controls are at
-    /// their minimum when the lock is lifted.
+    /// the card's safe value when the lock is lifted.
     #[test]
-    fn the_unlock_happens_on_muted_controls() {
+    fn the_unlock_happens_at_the_safe_value() {
         let cfg = j700();
         let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
         hw.reduction = 0.0; // an earlier run left full volume in the controls
@@ -2323,7 +2338,7 @@ mod tests {
         while hw.pings.is_empty() {
             g.tick(&mut hw).unwrap();
             if hw.pings.is_empty() {
-                assert!(hw.reduction >= MUTE_DB || !hw.unlocked_at(hw.t));
+                assert!(hw.reduction >= SAFE_DB || !hw.unlocked_at(hw.t));
             }
         }
         assert_eq!(hw.writes.first().map(|w| w.1), Some(0.0));
@@ -2646,7 +2661,7 @@ mod tests {
         assert!(got > cfg.globals.t_ambient + 5.0);
     }
 
-    /// Review R7: a working minimum write cleared the target write's
+    /// Review R7: a working safe-value write cleared the target write's
     /// failure count, so 700 failed target writes renewed 700 times without
     /// ever giving up.  Each operation now keeps its own count.
     #[test]
@@ -2659,20 +2674,20 @@ mod tests {
         let err = run_until(&mut g, &mut hw, secs(200.0)).expect_err("700 failed target writes and still running");
         assert!(err.contains("volume control"), "{err}");
         assert!(hw.pings.len() <= MAX_CONTROL_FAILURES as usize + 1, "{} pings", hw.pings.len());
-        assert!(hw.reduction >= MUTE_DB, "the controls stayed at their minimum");
+        assert!(hw.reduction >= SAFE_DB, "the controls stayed at the safe value");
     }
 
-    /// Review R2: a minimum write that blocks for 2 s must not be followed
-    /// by an unlock on a model two seconds behind.
+    /// Review R2: a safe-value write that blocks for 2 s must not be
+    /// followed by an unlock on a model two seconds behind.
     #[test]
-    fn no_unlock_after_a_blocking_minimum_write() {
+    fn no_unlock_after_a_blocking_safe_write() {
         let cfg = j700();
         let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
         hw.playing = Box::new(|_| false);
-        hw.min_delay = Duration::from_secs(2);
+        hw.safe_delay = Duration::from_secs(2);
         let mut g = Guard::start(&mut hw, &cfg, 20.0, tmp_state()).unwrap();
         run_until(&mut g, &mut hw, secs(10.0)).unwrap();
-        assert!(hw.pings.is_empty(), "every unlock followed a 2 s minimum write");
+        assert!(hw.pings.is_empty(), "every unlock followed a 2 s safe-value write");
     }
 
     /// The state file names what the model covers: during a stream, the
@@ -2794,7 +2809,7 @@ mod tests {
         fn sleep(&mut self, d: Duration) { self.hw.sleep(d) }
         fn take_lock(&mut self) -> io::Result<()> { self.hw.take_lock() }
         fn ping(&mut self) -> io::Result<()> { self.hw.ping() }
-        fn set_min(&mut self) -> io::Result<()> { self.hw.set_min() }
+        fn set_safe(&mut self) -> io::Result<f64> { self.hw.set_safe() }
         fn set_reduction(&mut self, d: f64) -> io::Result<f64> { self.hw.set_reduction(d) }
         fn relinquish(&mut self) -> io::Result<()> { self.hw.relinquish() }
         fn sample_rate(&mut self) -> io::Result<i64> { self.hw.sample_rate() }
@@ -2985,7 +3000,7 @@ mod tests {
         fn sleep(&mut self, d: Duration) { self.hw.sleep(d) }
         fn take_lock(&mut self) -> io::Result<()> { self.hw.take_lock() }
         fn ping(&mut self) -> io::Result<()> { self.hw.ping() }
-        fn set_min(&mut self) -> io::Result<()> { self.hw.set_min() }
+        fn set_safe(&mut self) -> io::Result<f64> { self.hw.set_safe() }
         fn set_reduction(&mut self, d: f64) -> io::Result<f64> { self.hw.set_reduction(d) }
         fn relinquish(&mut self) -> io::Result<()> {
             if self.fail_relinquish {
@@ -3096,7 +3111,7 @@ mod tests {
         fn sleep(&mut self, d: Duration) { self.hw.sleep(d) }
         fn take_lock(&mut self) -> io::Result<()> { self.hw.take_lock() }
         fn ping(&mut self) -> io::Result<()> { self.hw.ping() }
-        fn set_min(&mut self) -> io::Result<()> { self.hw.set_min() }
+        fn set_safe(&mut self) -> io::Result<f64> { self.hw.set_safe() }
         fn set_reduction(&mut self, d: f64) -> io::Result<f64> { self.hw.set_reduction(d) }
         fn relinquish(&mut self) -> io::Result<()> { self.hw.relinquish() }
         fn sample_rate(&mut self) -> io::Result<i64> {
@@ -3306,7 +3321,7 @@ mod tests {
     }
 
     /// The bound is not a blanket one: a block too loud to have come
-    /// through the minimum written before an unlock (or any reduction the
+    /// through the safe value written before an unlock (or any reduction the
     /// card did not apply long) is undone at a reduction that can have
     /// delivered it, and the budgets of a steady stream at full gain after
     /// an unlock stay where its real power puts them.
@@ -3381,7 +3396,7 @@ mod tests {
         fn sleep(&mut self, d: Duration) { self.hw.sleep(d) }
         fn take_lock(&mut self) -> io::Result<()> { self.hw.take_lock() }
         fn ping(&mut self) -> io::Result<()> { self.hw.ping() }
-        fn set_min(&mut self) -> io::Result<()> { self.hw.set_min() }
+        fn set_safe(&mut self) -> io::Result<f64> { self.hw.set_safe() }
         fn set_reduction(&mut self, d: f64) -> io::Result<f64> { self.hw.set_reduction(d) }
         fn relinquish(&mut self) -> io::Result<()> { self.hw.relinquish() }
         fn sample_rate(&mut self) -> io::Result<i64> { self.hw.sample_rate() }
@@ -3570,7 +3585,7 @@ mod tests {
         fn sleep(&mut self, d: Duration) { self.hw.sleep(d) }
         fn take_lock(&mut self) -> io::Result<()> { self.hw.take_lock() }
         fn ping(&mut self) -> io::Result<()> { self.hw.ping() }
-        fn set_min(&mut self) -> io::Result<()> { self.hw.set_min() }
+        fn set_safe(&mut self) -> io::Result<f64> { self.hw.set_safe() }
         fn set_reduction(&mut self, d: f64) -> io::Result<f64> { self.hw.set_reduction(d) }
         fn relinquish(&mut self) -> io::Result<()> { self.hw.relinquish() }
         fn sample_rate(&mut self) -> io::Result<i64> { self.hw.sample_rate() }
@@ -3683,7 +3698,7 @@ mod tests {
             self.hw.take_lock()
         }
         fn ping(&mut self) -> io::Result<()> { self.hw.ping() }
-        fn set_min(&mut self) -> io::Result<()> { self.hw.set_min() }
+        fn set_safe(&mut self) -> io::Result<f64> { self.hw.set_safe() }
         fn set_reduction(&mut self, d: f64) -> io::Result<f64> { self.hw.set_reduction(d) }
         fn relinquish(&mut self) -> io::Result<()> { self.hw.relinquish() }
         fn sample_rate(&mut self) -> io::Result<i64> { self.hw.sample_rate() }
