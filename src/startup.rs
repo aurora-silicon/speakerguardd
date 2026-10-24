@@ -49,6 +49,20 @@ fn wait<T>(
     }
 }
 
+/// The id of the speaker card in `/proc/asound/cards`: the one the
+/// macaudio driver registered.  Apple machines carry other cards whose ids
+/// also start with "AppleJ" (the AOP's "AppleJ700AOP", "AppleJ316HPAI"),
+/// and the order of /proc/asound entries is not a promise.
+pub fn macaudio_card(cards: &str) -> Option<String> {
+    cards.lines().find_map(|line| {
+        // " 1 [AppleJ700      ]: macaudio - MacBook Neo J700"
+        let (_, rest) = line.split_once('[')?;
+        let (id, rest) = rest.split_once(']')?;
+        let driver = rest.strip_prefix(':')?.split(" - ").next()?.trim();
+        (driver == "macaudio").then(|| id.trim().to_string())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,5 +225,16 @@ mod tests {
         .is_err());
         assert_eq!(probes, 2);
         assert_eq!(clock.sleeps, vec![POLL]);
+    }
+
+    #[test]
+    fn the_speaker_card_is_the_macaudio_one() {
+        let neo = " 0 [AppleJ700AOP   ]: t8140-aop-audio - MacBook Neo J700 AOP\n                      MacBook Neo J700 AOP Audio\n 1 [AppleJ700      ]: macaudio - MacBook Neo J700\n                      MacBook Neo J700\n 2 [UDULTC4K       ]: USB-Audio - Plugable UD-ULTC4K\n                      DisplayLink Plugable UD-ULTC4K at usb-xhci-hcd.2.auto-1.2, super speed\n";
+        assert_eq!(macaudio_card(neo).as_deref(), Some("AppleJ700"));
+        let m1pro = " 0 [AppleJ316HPAI  ]: aop_audio - MacBook Pro J316 HPAI\n                      MacBook Pro J316 High-Power Audio Interface\n 1 [AppleJ316      ]: macaudio - MacBook Pro J316\n                      MacBook Pro J316\n";
+        assert_eq!(macaudio_card(m1pro).as_deref(), Some("AppleJ316"));
+        assert_eq!(macaudio_card(" 0 [Generic        ]: HDA-Intel - HD-Audio Generic\n"), None);
+        assert_eq!(macaudio_card(""), None);
+        assert_eq!(macaudio_card("--- no cards ---\n"), None);
     }
 }

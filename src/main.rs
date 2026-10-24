@@ -51,7 +51,7 @@ fn usage() -> ! {
         "Usage: speakerguardd [OPTIONS]\n\n\
          Options:\n  \
          -c, --config-path <DIR>         Directory holding <vendor>/<model>.conf\n  \
-         -C, --card <ID>                 ALSA card id (default: the first Apple* card)\n  \
+         -C, --card <ID>                 ALSA card id (default: the macaudio card)\n  \
          --wait-for-card <SECONDS>       Wait for card discovery before failing (default 30; 0 disables waiting)\n  \
          -m, --max-reduction <DB>        Gain reduction beyond which the card's safe level takes over (default 20)\n  \
          -s, --state <FILE>              Model state kept across restarts (default /run/speakerguardd/state)\n  \
@@ -86,18 +86,16 @@ fn parse_args() -> Args {
 }
 
 /// The card id: Apple's ADT-derived "AppleJ<model>" as macaudio sets it.
+/// Without `-C`, the card the macaudio driver registered.
 fn find_card(requested: Option<&str>) -> std::io::Result<(Ctl, String)> {
     if let Some(id) = requested {
         return Ok((Ctl::open_by_id(id)?, id.to_string()));
     }
-    for entry in std::fs::read_dir("/proc/asound")? {
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with("AppleJ") {
-            return Ok((Ctl::open_by_id(&name)?, name));
-        }
+    let cards = std::fs::read_to_string("/proc/asound/cards")?;
+    match startup::macaudio_card(&cards) {
+        Some(id) => Ok((Ctl::open_by_id(&id)?, id)),
+        None => Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no macaudio sound card")),
     }
-    Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no Apple sound card"))
 }
 
 struct Card {
@@ -205,7 +203,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         if !waiting && args.card_wait > Duration::ZERO
             && result.as_ref().is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
         {
-            info!("waiting up to {} s for sound card {}", args.card_wait.as_secs(), args.card.as_deref().unwrap_or("AppleJ*"));
+            info!("waiting up to {} s for sound card {}", args.card_wait.as_secs(), args.card.as_deref().unwrap_or("(macaudio)"));
             waiting = true;
         }
         result
