@@ -154,6 +154,40 @@ protection, tightened by the measured-power model where V/I sense exists)
 runs only there.  It writes the card only with `--experimental-unified`.  A
 shadow changes nothing the governing model does.
 
+### Recording and replay
+
+`--record FILE` keeps what the guard sees and decides: every sample-rate
+change and change event, every sense open, every complete period's words
+with the most reduction the card may have applied over it (its safe level
+whenever the lock was not held throughout), the frames read at each close,
+every lost or unusable period, failed control writes, the lock taken and
+handed back with the reason, the governing latch, and the model the guard
+started from.  It stops at `--record-max-mb` (512 by default) and says so in
+the file.
+
+`--replay FILE --model NAME` runs the guard itself on the recording,
+offline: the speakers open and close where they did, the periods arrive
+when they were read, losses and failed reads recur at their times, and a
+simulated card keeps the kernel's lease, notice and safe level.  The
+program before the card's gain is rebuilt from the words and the recorded
+gain, then played through the gains the replayed guard writes (rounded up
+to the control's step, `--gain-db` louder if asked) and clipped at full
+scale.  `--governor` replays another governor on the same program,
+`--csv FILE` writes a line per period.
+
+The replay reports its account: how much was measured, charged and cooled,
+with every uncovered interval listed as charged, not measured.  It lists
+what it cannot reproduce: lost frames, bad sense data, failed reads and
+opens, failed control writes and the daemon's own lateness (neither is
+replayed), periods played louder than recorded where the recording cannot
+say what the program was, and an early end.  With the recorded governor at
+0 dB it also compares its lock and latch transitions with the live ones.
+It certifies a recording only when none of that is there, the transitions
+match and nothing it measured was lost or rejected in the recording;
+otherwise it says why and exits with status 3.  A certificate is about the
+recording, not the speakers: it says the replay saw what the live daemon
+saw.
+
 ### Relation to speakersafetyd
 
 speakersafetyd protects the speakers of the other Apple laptops from the

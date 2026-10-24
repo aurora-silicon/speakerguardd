@@ -62,6 +62,7 @@ use std::time::{Duration, Instant};
 use crate::config::{Config, Globals, Governor};
 use crate::engine::Engine;
 use crate::model::{self, SpeakerState, SUB_BLOCKS};
+use crate::record::{self, Recorder};
 use crate::state;
 use crate::{debug, info, warn};
 
@@ -194,6 +195,48 @@ pub const FOREIGN_FLAGS: &[&str] = &["/run/speakersafetyd/speakersafetyd.flag", 
 /// The shadow log is rotated (to `<file>.1`) past this size.
 const SHADOW_MAX_BYTES: u64 = 16 << 20;
 
+/// How a span of the account was accounted.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Accounted {
+    /// Covered by measured sense frames.
+    Measured,
+    /// Not covered: charged as a full-scale signal.
+    Charged,
+    /// Verified closed speakers.
+    Cooled,
+}
+
+/// The decisions a replay compares with the live run's, and its account.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Trace {
+    /// The lock taken (true) or the card handed to the kernel, and why.
+    Permit(bool, String),
+    /// The governing model's hard latch set or cleared.
+    Latch(bool),
+    /// A span of the account (boot times) and how it was accounted.
+    Account(Duration, Duration, Accounted),
+}
+
+/// One record, or the recording stops (a write failure, its size limit).
+/// Recording never decides anything: a blocked write only delays the loop,
+/// which the account charges like any other lateness.
+fn rec_do(rec: &mut Option<Recorder>, t: Duration, f: impl FnOnce(&mut Recorder, u64) -> io::Result<()>) {
+    let Some(r) = rec.as_mut() else { return };
+    let ns = t.as_nanos() as u64;
+    match f(r, ns) {
+        Ok(()) if r.full() => {
+            let _ = r.end(ns);
+            info!("recording reached its size limit; stopped");
+            *rec = None;
+        }
+        Ok(()) => {}
+        Err(e) => {
+            warn!("recording: {e}; stopped");
+            *rec = None;
+        }
+    }
+}
+
 pub struct Guard {
     globals: Globals,
     pub speakers: Vec<SpeakerState>,
@@ -259,6 +302,20 @@ pub struct Guard {
     shadow_failed: bool,
     /// The last sense data was not a measurement (one warning per run).
     bad_data: bool,
+    /// What each control held over the last measured frames (for the
+    /// recording's rebuilt program).
+    last_applied: Vec<f64>,
+    /// The recording (--record), and the replay's trace.
+    pub rec: Option<Recorder>,
+    pub trace: Option<Vec<(Duration, Trace)>>,
+    /// Boot time at the guard's `Instant` zero (for the trace).
+    boot_at: Option<(Instant, Duration)>,
+    /// The last sample-rate read recorded (rate or -errno).
+    rec_rate: Option<i64>,
+    /// The governing latch as last recorded.
+    last_hard: bool,
+    /// When the lock was last taken (None while it is not held).
+    armed_at: Option<Instant>,
 }
 
 impl Guard {
@@ -401,7 +458,75 @@ impl Guard {
             shadow_path,
             shadow_failed: false,
             bad_data: false,
+            last_applied: vec![0.0; n],
+            rec: None,
+            trace: None,
+            boot_at: None,
+            rec_rate: None,
+            last_hard: false,
+            armed_at: None,
         })
+    }
+
+    /// For the recording: the most reduction each control may have applied
+    /// over [from, to).  Unless the lock was held all through it the card
+    /// may have been at its safe level, the larger reduction (the louder
+    /// program rebuilt from the sensed words, the safer guess there).
+    fn applied_over(&self, from: Instant, most: &[f64]) -> Vec<f64> {
+        let held_through = self.armed && self.armed_at.is_some_and(|t| t <= from);
+        let safe = self.globals.safe_reduction;
+        most.iter().map(|&m| if held_through { m } else { m.max(safe) }).collect()
+    }
+
+    /// Start recording: the header and the model this guard starts from
+    /// (what a replay starts from: written as a clean stop's state at this
+    /// instant, which is how the replay resumes it unchanged).
+    pub fn attach_recorder<H: Hw>(&mut self, hw: &H, rec: Recorder) {
+        let boot = hw.boottime();
+        let text = state::encode_with(boot, boot, &self.speakers, self.engine.as_ref(), false, true);
+        let mut slot = Some(rec);
+        let (gov, max) = (self.governing, self.max_reduction);
+        rec_do(&mut slot, boot, |r, t| r.start(t, gov, max, &text));
+        self.rec = slot;
+        self.last_hard = self.governing_state().2;
+    }
+
+    /// Keep a trace of decisions and of the account (the replay).
+    pub fn start_trace<H: Hw>(&mut self, hw: &H) {
+        self.trace = Some(Vec::new());
+        self.boot_at = Some((hw.now(), hw.boottime()));
+        self.last_hard = self.governing_state().2;
+    }
+
+    /// Whether the daemon renews the card's lock (for the replay's log).
+    pub fn armed_now(&self) -> bool {
+        self.armed
+    }
+
+    /// A guard `Instant` as boot time (the trace's clock).
+    fn boot_of(&self, t: Instant) -> Duration {
+        match self.boot_at {
+            Some((i, b)) if t >= i => b + (t - i),
+            Some((i, b)) => b.saturating_sub(i - t),
+            None => Duration::ZERO,
+        }
+    }
+
+    /// A span of the account, for the trace.
+    fn note_account(&mut self, from: Instant, to: Instant, how: Accounted) {
+        if self.trace.is_some() && to > from {
+            let (a, b) = (self.boot_of(from), self.boot_of(to));
+            self.trace.as_mut().unwrap().push((b, Trace::Account(a, b, how)));
+        }
+    }
+
+    /// The lock was taken or given up.
+    fn note_permit<H: Hw>(&mut self, hw: &H, armed: bool, why: &str) {
+        let t = hw.boottime();
+        if let Some(tr) = self.trace.as_mut() {
+            tr.push((t, Trace::Permit(armed, why.to_string())));
+        }
+        rec_do(&mut self.rec, t, |r, ns| r.permit(ns, armed, why));
     }
 
     #[cfg(test)]
@@ -416,9 +541,11 @@ impl Guard {
     pub fn stop<H: Hw>(&mut self, hw: &mut H) -> Result<(), Box<dyn Error>> {
         if self.armed {
             info!("stopping: leaving the speakers at the card's safe level");
+            self.note_permit(hw, false, "stopping");
         }
         self.stopping = true;
         self.armed = false;
+        self.armed_at = None;
         hw.relinquish().map_err(|e| format!("giving up the volume lock: {e}"))?;
         self.relinquished_at = Some(hw.now());
         Ok(())
@@ -536,12 +663,14 @@ impl Guard {
     /// exits, which gives the lock up too.
     fn hand_off<H: Hw>(&mut self, hw: &mut H) -> Result<(), Box<dyn Error>> {
         self.armed = false;
+        self.armed_at = None;
         hw.relinquish().map_err(|e| format!("giving up the volume lock: {e}").into())
     }
 
     fn disarm<H: Hw>(&mut self, hw: &mut H, why: &str) -> Result<(), Box<dyn Error>> {
         if self.armed {
             warn!("{why}; leaving the speakers at the card's safe level");
+            self.note_permit(hw, false, why);
             self.hand_off(hw)?;
         }
         Ok(())
@@ -589,6 +718,7 @@ impl Guard {
         if let Some(e) = self.engine.as_mut() {
             e.worst(d, &least);
         }
+        self.note_account(self.account_to, to, Accounted::Charged);
         self.account_to = to;
         self.check_model()
     }
@@ -605,6 +735,7 @@ impl Guard {
             if let Some(e) = self.engine.as_mut() {
                 e.idle(d);
             }
+            self.note_account(self.account_to, to, Accounted::Cooled);
             self.account_to = to;
         }
         self.verify(to);
@@ -655,6 +786,8 @@ impl Guard {
             // the card's gain let through
             e.measured(words, frames, dt, if whole { dt } else { span }, &most);
         }
+        self.last_applied = most;
+        self.note_account(self.account_to, end, Accounted::Measured);
         self.account_to = end;
         self.verify(end);
         self.check_model()
@@ -679,13 +812,17 @@ impl Guard {
                 if frames == 0 {
                     break;
                 }
+                let queued = hw.queued();
+                let ch = self.globals.channels;
+                let q_rec = *queued.as_ref().unwrap_or(&0);
+                rec_do(&mut self.rec, hw.boottime(), |r, t| r.tail(t, q_rec, frames, &self.words[..frames * ch]));
                 if let Err(why) = self.check_sense(frames) {
                     // not a measurement: the rest up to now is charged
                     self.bad_sense(hw, &why)?;
                     break;
                 }
                 // without the capture's position the frames cannot be placed
-                let Ok(q) = hw.queued() else { break };
+                let Ok(q) = queued else { break };
                 let now = hw.now();
                 let end = now.checked_sub(Duration::from_secs_f64(q as f64 / self.rate.max(1) as f64)).unwrap_or(now);
                 self.measure(end, frames)?;
@@ -728,7 +865,16 @@ impl Guard {
         // a change event since the last pass (read before the rate, so that
         // a change after the read is kept for the next pass)
         let changed = hw.rate_events();
-        let rate = match hw.sample_rate() {
+        let read = hw.sample_rate();
+        let seen = match &read {
+            Ok(v) => *v,
+            Err(e) => -(e.raw_os_error().unwrap_or(libc::EIO) as i64).max(1),
+        };
+        if self.rec.is_some() && (self.rec_rate != Some(seen) || seen < 0) {
+            self.rec_rate = Some(seen);
+            rec_do(&mut self.rec, hw.boottime(), |r, t| r.rate(t, seen));
+        }
+        let rate = match read {
             Ok(v) => {
                 self.rate_failures = 0;
                 self.unknown = false;
@@ -772,7 +918,9 @@ impl Guard {
             self.fresh = 0;
             self.closed_seen = true;
             self.maintain(hw)?;
-            hw.wait_rate_change(IDLE_POLL);
+            if hw.wait_rate_change(IDLE_POLL) {
+                rec_do(&mut self.rec, hw.boottime(), |r, t| r.wake(t));
+            }
             return Ok(());
         }
         let dt = globals.period as f64 / rate as f64;
@@ -801,7 +949,10 @@ impl Guard {
             if self.armed && hw.now() < self.last_ping + KERNEL_LOCK_TIMEOUT {
                 self.ping_lock(hw)?;
             }
-            match hw.open_sense(rate) {
+            let opened = hw.open_sense(rate);
+            let errno = opened.as_ref().err().map_or(0, |e| e.raw_os_error().unwrap_or(libc::EIO));
+            rec_do(&mut self.rec, hw.boottime(), |r, t| r.open(t, errno));
+            match opened {
                 Ok(()) => {
                     info!("speakers open at {rate} Hz, sense capture running");
                     self.stall = Some(StallClock::default());
@@ -824,6 +975,8 @@ impl Guard {
                     Err(e) => {
                         // without its position the period cannot be placed
                         warn!("sense capture position: {e}; period discarded");
+                        let errno = e.raw_os_error().unwrap_or(libc::EIO);
+                        rec_do(&mut self.rec, hw.boottime(), |r, t| r.loss(t, record::LOSS_POSITION, errno));
                         self.fresh = 0;
                         return self.maintain(hw);
                     }
@@ -831,7 +984,15 @@ impl Guard {
                 self.stall.as_mut().unwrap().data();
                 let now = hw.now();
                 let end = now.checked_sub(Duration::from_secs_f64(queued as f64 / rate as f64)).unwrap_or(now);
+                let read_at = hw.boottime();
+                let start = end.checked_sub(Duration::from_secs_f64(dt)).unwrap_or(end);
                 if let Err(why) = self.check_sense(globals.period) {
+                    if self.rec.is_some() {
+                        // what the card may have applied over it
+                        let (_, most) = self.held();
+                        let applied = self.applied_over(start, &most);
+                        rec_do(&mut self.rec, read_at, |r, t| r.period(t, queued, rate, false, &applied, &self.words));
+                    }
                     // uncovered time: charged at full scale up to the
                     // period's end, never measured; the period does not
                     // count as seen
@@ -841,16 +1002,22 @@ impl Guard {
                 }
                 self.bad_data = false;
                 self.measure(end, globals.period)?;
+                if self.rec.is_some() {
+                    let applied = self.applied_over(start, &self.last_applied);
+                    rec_do(&mut self.rec, read_at, |r, t| r.period(t, queued, rate, true, &applied, &self.words));
+                }
                 self.seen_to = Some(now);
                 self.fresh = self.fresh.saturating_add(1);
             }
             Ok(Some(false)) => {
                 warn!("incomplete sense period or overrun, step skipped");
+                rec_do(&mut self.rec, hw.boottime(), |r, t| r.loss(t, record::LOSS_SHORT, 0));
                 self.fresh = 0;
             }
             Ok(None) => {
                 if self.stall.as_mut().unwrap().silent(hw.now()) {
                     warn!("sense stream stalled for {} ms; reopening", STALL_TIMEOUT.as_millis());
+                    rec_do(&mut self.rec, hw.boottime(), |r, t| r.loss(t, record::LOSS_STALL, 0));
                     self.stall = None;
                     self.fresh = 0;
                     hw.close_sense();
@@ -858,6 +1025,8 @@ impl Guard {
             }
             Err(e) if transient(&e) => {
                 warn!("sense capture: {e}; reopening");
+                let errno = e.raw_os_error().unwrap_or(libc::EIO);
+                rec_do(&mut self.rec, hw.boottime(), |r, t| r.loss(t, record::LOSS_CAPTURE, errno));
                 self.stall = None;
                 self.fresh = 0;
                 hw.close_sense();
@@ -924,6 +1093,14 @@ impl Guard {
         if !reduction.is_finite() {
             return Err("nonfinite speaker reduction".into());
         }
+        if hard != self.last_hard {
+            self.last_hard = hard;
+            let t = hw.boottime();
+            if let Some(tr) = self.trace.as_mut() {
+                tr.push((t, Trace::Latch(hard)));
+            }
+            rec_do(&mut self.rec, t, |r, ns| r.latch(ns, hard));
+        }
         if self.armed && now >= self.last_ping + KERNEL_LOCK_TIMEOUT {
             // the daemon was late and the card may have taken its volume
             // back: give it up, then take it again the safe way
@@ -956,6 +1133,8 @@ impl Guard {
                             self.ping_lock(hw)?;
                             info!("taking the volume lock{} at {reduction:.1} dB", if self.held { " back" } else { "" });
                             self.armed = true;
+                            self.armed_at = Some(hw.now());
+                            self.note_permit(hw, true, "lock taken");
                             self.held = true;
                             self.applied = reduction;
                         } else {
@@ -965,6 +1144,7 @@ impl Guard {
                     Err(e) if transient(&e) && self.min_failures < MAX_CONTROL_FAILURES => {
                         self.min_failures += 1;
                         warn!("volume control: {e}; not taking the lock ({})", self.min_failures);
+                        rec_do(&mut self.rec, hw.boottime(), |r, t| r.control_failure(t, record::FAIL_MIN));
                     }
                     Err(e) => return Err(format!("volume control: {e}").into()),
                 }
@@ -995,6 +1175,7 @@ impl Guard {
                     // each applies at least the smaller reduction
                     self.write_failed(&per);
                     self.note_written(hw.now());
+                    rec_do(&mut self.rec, hw.boottime(), |r, t| r.control_failure(t, record::FAIL_TARGET));
                     self.disarm(hw, "the volume control failed")?;
                 }
                 Err(e) => return Err(format!("volume control: {e}").into()),

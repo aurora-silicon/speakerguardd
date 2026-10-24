@@ -19,6 +19,7 @@ mod engine;
 mod guard;
 mod log;
 mod model;
+mod record;
 mod startup;
 mod state;
 
@@ -53,6 +54,12 @@ struct Args {
     unified_caps: bool,
     experimental_unified: bool,
     allow_unqualified: bool,
+    record: Option<PathBuf>,
+    record_max_mb: u64,
+    replay: Option<PathBuf>,
+    model: Option<String>,
+    gain_db: f64,
+    csv: Option<PathBuf>,
 }
 
 fn usage() -> ! {
@@ -71,6 +78,12 @@ fn usage() -> ! {
          --unified-caps                  macOS-style caps on the unified governor's thermal and power axes\n  \
          --experimental-unified          Let the (shadow-only) unified governor write the card\n  \
          --allow-unqualified             Govern a machine whose configuration says qualified = false\n  \
+         --record <FILE>                 Record what the guard sees and decides, for --replay\n  \
+         --record-max-mb <MB>            Stop recording past this size (default 512)\n  \
+         --replay <FILE>                 Run the guard on a recording offline (no card); exit 3 if it cannot certify it\n  \
+         --model <NAME>                  With --replay: the config (apple/<NAME>.conf)\n  \
+         --gain-db <DB>                  With --replay: play the recording this much louder\n  \
+         --csv <FILE>                    With --replay: one line per period\n  \
          -v, --verbose                   More logging (repeatable)\n  \
          -q, --quiet                     Less logging\n  \
          -h, --help                      This text"
@@ -93,6 +106,12 @@ fn parse_args() -> Args {
         unified_caps: false,
         experimental_unified: false,
         allow_unqualified: false,
+        record: None,
+        record_max_mb: 512,
+        replay: None,
+        model: None,
+        gain_db: 0.0,
+        csv: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -112,6 +131,12 @@ fn parse_args() -> Args {
             "--unified-caps" => args.unified_caps = true,
             "--experimental-unified" => args.experimental_unified = true,
             "--allow-unqualified" => args.allow_unqualified = true,
+            "--record" => args.record = Some(PathBuf::from(it.next().unwrap_or_else(|| usage()))),
+            "--record-max-mb" => args.record_max_mb = it.next().and_then(|v| v.parse().ok()).filter(|&m: &u64| m > 0).unwrap_or_else(|| usage()),
+            "--replay" => args.replay = Some(PathBuf::from(it.next().unwrap_or_else(|| usage()))),
+            "--model" => args.model = Some(it.next().unwrap_or_else(|| usage())),
+            "--gain-db" => args.gain_db = it.next().and_then(|v| v.parse().ok()).filter(|g: &f64| g.is_finite()).unwrap_or_else(|| usage()),
+            "--csv" => args.csv = Some(PathBuf::from(it.next().unwrap_or_else(|| usage()))),
             "--ctrl-headroom" => args.ctrl_headroom = Some(it.next().and_then(|v| v.parse().ok()).filter(|h: &f64| h.is_finite() && *h >= 0.0).unwrap_or_else(|| usage())),
             "--horizon" => args.horizon = Some(it.next().and_then(|v| v.parse().ok()).filter(|h: &f64| h.is_finite() && *h > 0.0).unwrap_or_else(|| usage())),
             "-v" | "--verbose" => args.verbosity = Level::Debug,
@@ -448,6 +473,11 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     catch_stop_signals();
     let max_reduction = args.max_reduction.unwrap_or(cfg.globals.max_reduction);
     let mut guard = Guard::start(&mut hw, &cfg, max_reduction, args.state.clone())?;
+    if let Some(path) = &args.record {
+        let max = args.record_max_mb.saturating_mul(1 << 20);
+        guard.attach_recorder(&hw, record::Recorder::create(path, &cfg, hw.card.events, max)?);
+        info!("recording to {}", path.display());
+    }
     info!("{card_name}: {} volume control(s) and the unlock control locked", hw.card.volume.len());
     let mut stopping = false;
     loop {
@@ -497,9 +527,37 @@ fn override_config(cfg: &mut Config, args: &Args) -> Result<(), Box<dyn std::err
     Ok(())
 }
 
+/// --replay: the guard on a recording, offline.  Exit 3 when the replay
+/// cannot certify the recording.
+fn replay(args: &Args, path: &std::path::Path) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let model = args.model.as_deref().ok_or("--replay needs --model")?;
+    let conf = args.config_path.join("apple").join(format!("{model}.conf"));
+    let mut cfg = Config::load(&conf).map_err(|e| format!("{}: {e}", conf.display()))?;
+    cfg.globals.shadow |= args.shadow;
+    if let Some(h) = args.horizon {
+        cfg.globals.horizon_s = h;
+    }
+    if let Some(h) = args.ctrl_headroom {
+        cfg.globals.t_ctrl_headroom = h;
+    }
+    cfg.globals.unified_caps |= args.unified_caps;
+    let out = record::replay(path, &cfg, &record::Replay { gain_db: args.gain_db, governor: args.governor, max_reduction: args.max_reduction, csv: args.csv.clone() })?;
+    print!("{}", out.text);
+    Ok(if out.certified { ExitCode::SUCCESS } else { ExitCode::from(3) })
+}
+
 fn main() -> ExitCode {
     let args = parse_args();
     log::set_verbosity(args.verbosity);
+    if let Some(path) = &args.replay {
+        return match replay(&args, path) {
+            Ok(code) => code,
+            Err(e) => {
+                error!("{e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     match run(&args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
