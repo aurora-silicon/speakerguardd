@@ -4,6 +4,8 @@ Description=Speaker Protection Daemon (feed-forward)
 # speakers sit at the card's safe level, and a restarted daemon resumes the
 # previous run's thermal model from /run/speakerguardd/state.  A crash loop
 # gives up after five attempts and leaves the speakers at that level.
+# One daemon owns the speaker sense PCM and the volume interlock.
+Conflicts=speakersafetyd.service
 StartLimitIntervalSec=60
 StartLimitBurst=5
 
