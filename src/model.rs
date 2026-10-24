@@ -131,11 +131,19 @@ impl SpeakerState {
 
     /// A sense period of `dt` seconds whose equal blocks carried `powers`
     /// watts each: the budgets get the period's mean, the coil each block.
+    #[cfg(test)]
     pub fn step_period(&mut self, powers: &[f64], dt: f64, t_ambient: f64, applied_db: f64) {
+        let g = 10f64.powf(applied_db.clamp(0.0, PRE_GAIN_MAX_DB) / 10.0);
+        let pre: Vec<f64> = powers.iter().map(|p| p * g).collect();
+        self.step_period_pre(powers, &pre, dt, t_ambient)
+    }
+
+    /// The same with each block's power before the card's gain.
+    pub fn step_period_pre(&mut self, powers: &[f64], pre: &[f64], dt: f64, t_ambient: f64) {
         let n = powers.len().max(1);
         let mean = powers.iter().sum::<f64>() / n as f64;
         self.power = mean;
-        self.record(mean, dt, applied_db);
+        self.record_pre(pre.iter().sum::<f64>() / n as f64, dt);
         self.t_peak = f64::NEG_INFINITY;
         if powers.is_empty() {
             self.heat(0.0, dt, t_ambient);
@@ -145,12 +153,34 @@ impl SpeakerState {
         }
     }
 
+    /// The power before the card's gain of a block that delivered `power`
+    /// watts, converted at one of the reductions in `possible` (ranges, dB):
+    /// the most that any of them can have taken off a block this loud (a
+    /// reduction that leaves less than the block's power at full scale did
+    /// not convert it), never more than a full-scale signal.
+    pub fn pre_gain(&self, power: f64, possible: &[(f64, f64)]) -> f64 {
+        let full = self.worst_case_power(0.0);
+        if !(power > 0.0) {
+            return power.max(0.0);
+        }
+        let db = converted_at(10.0 * (full / power).log10(), possible);
+        let pre = power * 10f64.powf(db / 10.0);
+        if pre > full { full } else { pre }
+    }
+
     /// Keep one minute of the power before the card's gain for the budgets.
     fn record(&mut self, power: f64, dt: f64, applied_db: f64) {
+        self.record_pre(power * 10f64.powf(applied_db.clamp(0.0, PRE_GAIN_MAX_DB) / 10.0), dt)
+    }
+
+    /// The same with the power before the gain given: never more than a
+    /// full-scale signal (nothing before the gain is louder).
+    fn record_pre(&mut self, pre: f64, dt: f64) {
         if !(dt > 0.0) {
             return;
         }
-        let pre = power * 10f64.powf(applied_db.clamp(0.0, PRE_GAIN_MAX_DB) / 10.0);
+        let full = self.worst_case_power(0.0);
+        let pre = if pre > full { full } else { pre };
         self.history.push_back((dt, pre));
         self.history_s += dt;
         // drop what is older than a minute: whole entries, then the expired
@@ -263,15 +293,8 @@ impl SpeakerState {
         self.t_magnet = t_magnet;
         self.t_peak = t_coil;
         self.hard = false;
-        // Two means do not say when in the minute the energy came.  The
-        // most the minute budget can see of it later is all of it as late
-        // as possible: the last second's own energy, and the rest in the
-        // second before it, so it stays in the minute window for 58 s.
-        self.history.clear();
-        let earlier = (60.0 * mean_60s - mean_1s).max(0.0);
-        self.history.push_back((1.0, earlier));
-        self.history.push_back((1.0, mean_1s));
-        self.history_s = 2.0;
+        // two means do not say when the energy came (budget_envelope)
+        (self.history, self.history_s) = budget_envelope(mean_1s, mean_60s, self.worst_case_power(0.0));
     }
 
     /// The governor's state a restart keeps: the latched fault, the peak
@@ -361,6 +384,49 @@ impl SpeakerState {
         self.reduction_db = if wanted >= self.reduction_db { wanted } else { (self.reduction_db - 0.5).max(wanted) };
         self.reduction_db
     }
+}
+
+/// The reduction (dB) a measured block was converted at, for the budgets:
+/// the most of the `possible` ones (ranges) that can have delivered it,
+/// `room` being the most reduction that still delivers the block at full
+/// scale (10 log10 of full scale over its power); the most of all when none
+/// can.  At most PRE_GAIN_MAX_DB.
+pub fn converted_at(room: f64, possible: &[(f64, f64)]) -> f64 {
+    let mut fit: Option<f64> = None;
+    let mut most = 0.0f64;
+    for &(lo, hi) in possible {
+        most = most.max(hi);
+        if lo <= room {
+            let v = hi.min(room);
+            fit = Some(fit.map_or(v, |f| f.max(v)));
+        }
+    }
+    fit.unwrap_or(most).clamp(0.0, PRE_GAIN_MAX_DB)
+}
+
+/// A budget history from its two saved means: all of the energy as late as
+/// it can have come, at `full` (the power of a full-scale signal; nothing
+/// before the gain is louder), the last second's at the very end of it and
+/// the rest of the minute's just before that second.  Each window then
+/// keeps every joule until the latest moment it could have left.  (A mean
+/// over full scale, from an older file, keeps its whole window instead.)
+pub fn budget_envelope(mean_1s: f64, mean_60s: f64, full: f64) -> (std::collections::VecDeque<(f64, f64)>, f64) {
+    let mut h = std::collections::VecDeque::new();
+    let last = mean_1s.max(0.0);
+    let older = (60.0 * mean_60s - last).max(0.0);
+    let d_older = (older / full).min(59.0);
+    let d_last = (last / full).min(1.0);
+    if older > 0.0 && d_older > 0.0 {
+        h.push_back((d_older, older / d_older));
+    }
+    if d_last < 1.0 {
+        h.push_back((1.0 - d_last, 0.0));
+    }
+    if last > 0.0 && d_last > 0.0 {
+        h.push_back((d_last, last / d_last));
+    }
+    let total = h.iter().map(|e| e.0).sum();
+    (h, total)
 }
 
 /// The card-wide result of one step: the reduction to apply to the shared
@@ -511,6 +577,8 @@ mod tests {
         spec.t_headroom = 15.0;
         spec.p_limit_1s = 2.8154;
         spec.p_limit_60s = 2.5;
+        spec.vs_scale = 7.3;
+        spec.z_nominal = 4.2;
         let mut s = SpeakerState::new(spec, 35.0);
         let g = globals();
         // a 6.3 W burst (a full-scale sine into 4.2 ohm at 7.3 V): after 0.5 s

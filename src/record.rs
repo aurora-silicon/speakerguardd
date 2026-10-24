@@ -1279,9 +1279,11 @@ mod tests {
         assert!(live.armed());
         let out = replay(&path, &cfg, &Replay { gain_db: 0.0, governor: None, max_reduction: None, csv: None }).unwrap();
         assert!(out.certified, "{}", out.text);
-        // louder, the muted periods' program is unknown: not certified
+        // louder: the periods before the lock are muted in the replay too
+        // (the guard turns the controls down at its start), the rest is
+        // played 6 dB louder and governed harder
         let loud = replay(&path, &cfg, &Replay { gain_db: 6.0, governor: None, max_reduction: None, csv: None }).unwrap();
-        assert!(!loud.certified && loud.text.contains("more than 30 dB"), "{}", loud.text);
+        assert!(loud.text.contains("at +6.0 dB") && !loud.text.contains("more than 30 dB"), "{}", loud.text);
         // another governor on the same program: not compared, still run
         let uni = replay(&path, &cfg, &Replay { gain_db: 0.0, governor: Some(Governor::Unified), max_reduction: None, csv: None }).unwrap();
         assert!(uni.text.contains("governor unified") && uni.text.contains("not compared"), "{}", uni.text);

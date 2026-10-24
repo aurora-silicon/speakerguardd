@@ -1,25 +1,22 @@
 // SPDX-License-Identifier: MIT
 //! The model's state across restarts.  A daemon that exits leaves the
 //! speakers at the card's safe level; the one systemd starts next must not
-//! begin with a cold coil, or a crash would reset the protection.  The state
-//! (temperatures and recent power per speaker) is written once a second to
-//! a file under /run, stamped with CLOCK_BOOTTIME, and cooled on load by
-//! the time that has passed since.  Each speaker line also carries the last
-//! sensed RMS voltage and the governor's reduction, and an `armed` line says
-//! whether the daemon holds the card: the file doubles as a status readout
-//! (`cat /run/speakerguardd/state`) for measurements on the machine.
-//!
-//! Only a clean stop's state (`released 1`, its model covering up to the
-//! write) is resumed, and the time since it is charged at the worst case
-//! the card's own safe level lets through; anything else starts latched at
-//! the limit.
+//! begin with a cold coil, or a crash would reset the protection.  The file
+//! under /run, stamped with CLOCK_BOOTTIME, is rewritten every half second
+//! as a status readout (`cat /run/speakerguardd/state`: temperatures, recent
+//! power, sensed RMS voltage, reduction, whether the daemon holds the card),
+//! and once more by a clean stop, which alone is resumed: written after the
+//! lock was given up and drained, its model covering every moment up to the
+//! write, marked `released 1`.  A run that resumes it overwrites it before
+//! it can unlock.  The time since is charged at the card's safe level;
+//! anything else starts every speaker at its coil limit, latched.
 //!
 //! The engine's models (engine.rs) are saved in the same file, after the
 //! legacy speaker lines (`asahi ...`, `unified ...`): one atomic write and
 //! the same clean-stop rule for every model.  A model the file does not
 //! carry starts latched at its limit.  A J700 file without the engine is
-//! exactly what 0.1.8 writes; a reader older than the engine refuses a file
-//! with engine lines, and so starts latched too.
+//! what 0.1.9 writes; a reader older than the engine refuses a file with
+//! engine lines, and so starts latched too.
 
 use std::time::Duration;
 
@@ -57,6 +54,8 @@ pub struct Saved {
     /// drained, every moment up to `covered` accounted.  Only such a state
     /// is resumed.
     pub released: bool,
+    /// The run was recovering from bad sense data.
+    pub recovering: bool,
     pub speakers: Vec<SavedSpeaker>,
     /// The engine's models (none in a file written without them).
     pub asahi: Vec<SavedAsahi>,
@@ -78,6 +77,14 @@ pub fn encode(boottime: Duration, covered: Duration, speakers: &[SpeakerState], 
 
 /// The state with the engine's models.
 pub fn encode_with(boottime: Duration, covered: Duration, speakers: &[SpeakerState], engine: Option<&Engine>, armed: bool, released: bool) -> String {
+    encode_full(boottime, covered, speakers, engine, armed, released, false)
+}
+
+/// `encode_with`, and whether the run is still recovering from bad sense
+/// data (a `recovering 1` line: the next run does not take the lock before
+/// REARM_PERIODS valid periods either; a reader without it refuses the
+/// file, and so starts latched).
+pub fn encode_full(boottime: Duration, covered: Duration, speakers: &[SpeakerState], engine: Option<&Engine>, armed: bool, released: bool, recovering: bool) -> String {
     let mut out = format!(
         "{MAGIC}\nboottime_ns {}\ncovered_ns {}\narmed {}\nreleased {}\n",
         boottime.as_nanos(),
@@ -85,6 +92,9 @@ pub fn encode_with(boottime: Duration, covered: Duration, speakers: &[SpeakerSta
         armed as u8,
         (released && !armed) as u8
     );
+    if recovering {
+        out += "recovering 1\n";
+    }
     out += "# speaker name t_coil_C t_magnet_C mean_1s_W mean_60s_W v_rms_V reduction_dB hard t_peak_C\n";
     for s in speakers {
         out += &format!(
@@ -175,6 +185,7 @@ pub fn decode(text: &str) -> Option<Saved> {
     let (mut asahi, mut unified) = (Vec::new(), Vec::new());
     let mut armed = true;
     let mut released = false;
+    let mut recovering = false;
     let mut ended = false;
     for line in lines {
         if ended {
@@ -194,6 +205,10 @@ pub fn decode(text: &str) -> Option<Saved> {
         };
         if let Some(v) = line.strip_prefix("armed ") {
             armed = flag(v)?;
+            continue;
+        }
+        if let Some(v) = line.strip_prefix("recovering ") {
+            recovering = flag(v)?;
             continue;
         }
         if let Some(v) = line.strip_prefix("released ") {
@@ -233,7 +248,7 @@ pub fn decode(text: &str) -> Option<Saved> {
         return None;
     }
     let covered = Duration::from_nanos(covered.unwrap_or(0).min(ns));
-    Some(Saved { boottime: Duration::from_nanos(ns), covered, armed, released: v2 && released && !armed, speakers, asahi, unified })
+    Some(Saved { boottime: Duration::from_nanos(ns), covered, armed, released: v2 && released && !armed, recovering, speakers, asahi, unified })
 }
 
 /// Continue every speaker from a clean stop's state and charge the time
@@ -665,5 +680,59 @@ mod tests {
             g[i] = bad.to_string();
             assert!(decode(&good.replace(&uline, &g.join(" "))).is_none(), "accepted {bad} in unified field {i}");
         }
+    }
+
+    /// Review r4 U3: the two saved means were spread over whole seconds,
+    /// so energy at the newest edge of either window left it too early
+    /// (2.6 W and 0 dB where 3.9 W needed 1.4 dB half a second later; 2.48
+    /// W where 2.53 W needed 0.06 dB a minute later).  Both witnesses and a
+    /// sweep of concentrated histories: the restored budgets are never
+    /// below the uninterrupted ones, at any later moment, with new input
+    /// near either budget.
+    #[test]
+    fn restored_budgets_never_expire_energy_early() {
+        let cfg = Config::parse(J700).unwrap();
+        let g = &cfg.globals;
+        let spec = cfg.speakers[0].clone();
+        let full = SpeakerState::new(spec.clone(), 50.0).worst_case_power(0.0);
+        // (quiet before, burst at full scale before the gain, quiet after)
+        let mut cases = vec![(59.8, 0.2, 0.0), (58.5, 0.5, 1.0)];
+        for &after in &[0.0, 0.05, 0.3, 0.7, 0.95, 1.0, 1.1, 2.0, 20.0, 57.0, 58.4] {
+            for &len in &[0.05, 0.3, 1.0] {
+                if after + len <= 60.0 {
+                    cases.push((60.0 - after - len, len, after));
+                }
+            }
+        }
+        for &(before, len, after) in &cases {
+            let mut live = SpeakerState::new(spec.clone(), 50.0);
+            live.step_at(0.0, before, 50.0, 20.0);
+            live.step_at(live.worst_case_power(20.0), len, 50.0, 20.0);
+            if after > 0.0 {
+                live.step_at(0.0, after, 50.0, 20.0);
+            }
+            let saved = decode(&encode(T, T, std::slice::from_ref(&live), false, true)).unwrap();
+            let mut restored = vec![SpeakerState::new(spec.clone(), 50.0)];
+            assert!(restore(&mut restored, &saved, T, g));
+            let mut r = restored.pop().unwrap();
+            let mut l = live.clone();
+            for step in 0..1240 {
+                // 50 ms steps: near the 1 s budget first, then the minute's
+                let pre = if step < 30 { 2.7 } else { 2.49 };
+                for s in [&mut l, &mut r] {
+                    s.step_at(pre / 10.0, 0.05, 50.0, 10.0);
+                    s.govern(g);
+                }
+                let at = (step + 1) as f64 * 0.05;
+                for w in [1.0, 60.0] {
+                    assert!(r.mean_power(w) >= l.mean_power(w) - 1e-5, "{len} s burst {after} s before the save, {at:.2} s later: {w} s mean {} W restored, {} W live", r.mean_power(w), l.mean_power(w));
+                }
+                assert!(r.reduction_db >= l.reduction_db - 1e-4, "{len} s burst {after} s before the save, {at:.2} s later: {} dB restored, {} dB live", r.reduction_db, l.reduction_db);
+            }
+        }
+        // nothing before the gain is louder than full scale
+        let mut s = SpeakerState::new(spec, 50.0);
+        s.step_at(1000.0, 1.0, 50.0, 0.0);
+        assert!((s.mean_power(1.0) - full).abs() < 1e-9);
     }
 }
