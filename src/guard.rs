@@ -3,7 +3,7 @@
 //! timing rules can be exercised without a sound card: the card's volume
 //! lock, its speaker sample-rate control and the sense capture.
 //!
-//! The rules it keeps (0.1.8 to 0.1.10: simple over precise):
+//! The rules it keeps (0.1.8: simple over precise):
 //!
 //! * One account.  The thermal model has accounted wall time up to
 //!   `account_to`, and every step advances it by exactly the time stepped:
@@ -12,40 +12,41 @@
 //!   (placed by the read time less the capture's backlog), or charged as a
 //!   full-scale signal at the least reduction the controls held at any time
 //!   since the last verified boundary, widened by how long the card keeps
-//!   playing samples converted at an earlier gain.  No partial credits, no
-//!   tolerances, no means, no assumption about when inside an uncertain
-//!   interval anything played.  Frames over time already charged add
-//!   nothing.
+//!   playing samples converted at an earlier gain.  While the card holds
+//!   its lock (taken at start or given up, and not renewed since), once
+//!   what it converted before has drained, that reduction is at least the
+//!   card's safe level.  No partial credits, no tolerances, no means, no
+//!   assumption about when inside an uncertain interval anything played.
+//!   Frames over time already charged add nothing.
 //! * Verified boundaries.  The end of measured frames, or two looks at
-//!   closed speakers with no sample-rate change event between them (drained
-//!   before each look's read and after it, a look vouching only up to
-//!   EVENT_SLACK before it), and nothing else.  Without the card's change
-//!   events nothing between two looks is known, and the daemon never takes
-//!   the lock.
-//! * Placement.  Frames are placed by a whole-frame position read between
-//!   two clock reads: only the frames that certainly played in the placed
-//!   span are credited, at their most energetic alignment; the rest of the
-//!   span is charged.
-//! * The budgets' power before the gain: each measured frame at the most
-//!   reduction that can have converted it (any the controls may have held
-//!   from QUEUE_BOUND before it, rounded to their steps, the card's safe
-//!   level from where the lease may have run out), never above full scale.
+//!   closed speakers with no sample-rate change event between them, and
+//!   nothing else.  Without the card's change events nothing between two
+//!   looks is known, and the daemon never takes the lock.
 //! * The lock.  Not taken before the model allows it and the daemon can see:
 //!   no unlock at start, and while the speakers play not before
 //!   REARM_PERIODS complete periods.  Controls to their minimum before each
-//!   unlock.  Every renewal goes through one decision (`decide`), made
-//!   again after the renewal itself.  Every
-//!   hand-off gives the card's lock up (macaudio locks the volume and stops
-//!   streams converted at the old gain); if that fails the daemon exits,
-//!   which does the same.
+//!   unlock.  Every hand-off gives the card's lock up (macaudio locks the
+//!   volume and stops streams converted at the old gain); if that fails the
+//!   daemon exits, which does the same.
 //! * A model that may have reached a coil's limit inside a period latches a
 //!   hard fault; the card stays with the kernel until the coil has cooled.
 //! * Restarts.  Only a state written by a clean stop, after the lock was
 //!   given up, its converted samples drained and every moment accounted,
-//!   is resumed, read under the card's lock and only once: the run that
-//!   resumes it overwrites it before any unlock.  Any other state, or none,
-//!   starts at the coil's limit plus the drain's heat, latched, with a
-//!   minute of full scale in the budgets.
+//!   is resumed.  Any other state, or none, starts at the coil's limit,
+//!   latched, and so does every state while another protection daemon
+//!   (speakersafetyd) has run this boot: its flag file says it may have
+//!   driven the speakers since.
+//! * The engine's models (engine.rs: the asahi governor on the machines with
+//!   V/I sense, the unified one when it governs or the shadow log runs) get
+//!   exactly this account: the same measured frames over the same time, the
+//!   same charges at each speaker's least reduction since the last verified
+//!   boundary, the same cooling.  Whichever model governs, its reductions
+//!   are written per speaker and its hard latch hands the card to the
+//!   kernel.
+//! * Sense data that is not a measurement (a mean V*I below -0.01 W, or
+//!   nonfinite) is uncovered time: charged at full scale, never measured.
+//!   The card is handed off at once and REARM_PERIODS good periods in a row
+//!   are needed to take it back.
 //!
 //! The cost, accepted: every stream after idle is charged at full scale
 //! from the last look at closed speakers (up to one idle poll) to its first
@@ -60,8 +61,10 @@ use std::io;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crate::config::{Config, Globals};
+use crate::config::{Config, Globals, Governor};
+use crate::engine::Engine;
 use crate::model::{self, SpeakerState, SUB_BLOCKS};
+use crate::record::{self, Recorder};
 use crate::state;
 use crate::{debug, info, warn};
 
@@ -87,7 +90,7 @@ pub const STALL_TIMEOUT: Duration = Duration::from_millis(500);
 /// How long the card can keep playing samples converted at an earlier gain
 /// after a gain change: the J700 converts on copy into a playback queue of
 /// up to 16384 frames, 341 ms at 48 kHz.  With margin.
-pub const QUEUE_BOUND: Duration = Duration::from_millis((model::DRAIN_S * 1000.0) as u64);
+pub const QUEUE_BOUND: Duration = Duration::from_millis(500);
 /// After the lock is given up, the time until samples converted at the old
 /// gain are certainly gone (macaudio's stop work, then the queue).
 pub const DRAIN: Duration = QUEUE_BOUND;
@@ -97,18 +100,18 @@ pub const DRAIN: Duration = QUEUE_BOUND;
 pub const EVENT_SLACK: Duration = Duration::from_millis(5);
 /// How much longer than the queue the controls' history is kept before the
 /// last verified boundary: frames measured partly over the account reach
-/// back up to one block (at most 32 ms) before it.
+/// back up to one frame before it.
 const GAIN_RETAIN: Duration = Duration::from_secs(1);
 
-/// What the controls held from `at` on: `lo` and `hi` the least and the
-/// most (dB; infinite = unknown; anything between them when they differ,
-/// after a failed write), `kernel` whether the card's safe level may have
-/// applied instead.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// What each speaker's control held from `at` on: `lo` and `hi` the least
+/// and the most (dB; infinite = unknown; anything between them when they
+/// differ, after a failed write), `kernel` whether the card's safe level may
+/// have applied instead.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Gain {
     pub at: Instant,
-    pub lo: f64,
-    pub hi: f64,
+    pub lo: Vec<f64>,
+    pub hi: Vec<f64>,
     pub kernel: bool,
 }
 
@@ -127,6 +130,14 @@ pub trait Hw {
     /// the reduction the card applies: the control's steps round it up
     /// (review r5 V6).
     fn set_reduction(&mut self, db: f64) -> io::Result<f64>;
+    /// Per-speaker reductions, for cards with a volume control per speaker;
+    /// a card with one shared control gets the largest.  A failure may
+    /// leave some controls at the new value and some at the old one.
+    /// Returns what each speaker's control applies.
+    fn set_reductions(&mut self, db: &[f64]) -> io::Result<Vec<f64>> {
+        let applied = self.set_reduction(db.iter().cloned().fold(0.0, f64::max))?;
+        Ok(vec![applied; db.len()])
+    }
     /// The controls' step (dB): a request is applied rounded up to it.
     fn step_db(&self) -> f64 {
         0.0
@@ -231,6 +242,64 @@ pub const REARM_PERIODS: u32 = 2;
 pub const REARM_MARGIN_DB: f64 = 3.0;
 /// The reduction the volume controls' minimum stands for (dB).
 pub const MUTE_DB: f64 = 120.0;
+/// Where speakersafetyd notes that it has run since boot (its "warm boot"
+/// flag: /run/speakersafetyd/speakersafetyd.flag from 2.0, written into its
+/// runtime directory, /run/speakersafetyd.flag before; the ref Macs run
+/// 1.0.2 and 2.0.1).  Only its presence counts; its absence proves nothing,
+/// as 2.0's runtime directory goes when the service stops.
+pub const FOREIGN_FLAGS: &[&str] = &["/run/speakersafetyd/speakersafetyd.flag", "/run/speakersafetyd.flag"];
+/// The shadow log is rotated (to `<file>.1`) past this size.
+const SHADOW_MAX_BYTES: u64 = 16 << 20;
+
+/// How a span of the account was accounted.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Accounted {
+    /// Covered by measured sense frames.
+    Measured,
+    /// Not covered: charged as a full-scale signal.
+    Charged,
+    /// Verified closed speakers.
+    Cooled,
+}
+
+/// The decisions a replay compares with the live run's, and its account.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Trace {
+    /// The lock taken (true) or the card handed to the kernel, and why.
+    Permit(bool, String),
+    /// The governing model's hard latch set or cleared.
+    Latch(bool),
+    /// A span of the account (boot times) and how it was accounted.
+    Account(Duration, Duration, Accounted),
+}
+
+/// Record at the boot time now, read only while a recording runs (a clock
+/// read is a call that can block or be descheduled like any other).
+fn rec_now<H: Hw>(rec: &mut Option<Recorder>, hw: &H, f: impl FnOnce(&mut Recorder, u64) -> io::Result<()>) {
+    if rec.is_some() {
+        rec_do(rec, hw.boottime(), f);
+    }
+}
+
+/// One record, or the recording stops (a write failure, its size limit).
+/// Recording never decides anything: a blocked write only delays the loop,
+/// which the account charges like any other lateness.
+fn rec_do(rec: &mut Option<Recorder>, t: Duration, f: impl FnOnce(&mut Recorder, u64) -> io::Result<()>) {
+    let Some(r) = rec.as_mut() else { return };
+    let ns = t.as_nanos() as u64;
+    match f(r, ns) {
+        Ok(()) if r.full() => {
+            let _ = r.end(ns);
+            info!("recording reached its size limit; stopped");
+            *rec = None;
+        }
+        Ok(()) => {}
+        Err(e) => {
+            warn!("recording: {e}; stopped");
+            *rec = None;
+        }
+    }
+}
 
 pub struct Guard {
     globals: Globals,
@@ -278,21 +347,20 @@ pub struct Guard {
     last_log: Instant,
     /// When the governed reduction was last written.
     last_write: Instant,
-    /// The reduction the card's volume controls hold, as far as the daemon
-    /// knows (dB; infinite = unknown, taken as full gain): what the card
-    /// applies, its steps' rounding included.
-    written: f64,
-    /// The most the controls may hold (after a failed write some may hold
-    /// the new value and some the old: frames may be converted at either).
-    written_hi: f64,
-    /// The reduction last asked for.
-    requested: f64,
+    /// The reduction each speaker's volume control holds, as far as the
+    /// daemon knows (dB; infinite = unknown, taken as full gain): what the
+    /// card applies, its steps' rounding included; the least of it after a
+    /// failed write.
+    written: Vec<f64>,
+    /// The most each control may hold (after a failed write, the new value
+    /// rounded up by a step, or the old one).
+    written_hi: Vec<f64>,
+    /// The reductions last asked for.
+    requested: Vec<f64>,
     applied: f64,
-    /// What the controls held: (from, the least and the most of it, the
-    /// card's own safe level may have applied instead), oldest first, back
-    /// to QUEUE_BOUND + GAIN_RETAIN before the last verified boundary.  The
-    /// card applies its safe level whenever the daemon does not hold a live
-    /// lease.
+    /// What the controls held, oldest first, back to QUEUE_BOUND +
+    /// GAIN_RETAIN before the last verified boundary.  The card applies its
+    /// safe level whenever the daemon does not hold a live lease.
     gains: Vec<Gain>,
     /// The last verified boundary.
     verified_at: Instant,
@@ -307,31 +375,97 @@ pub struct Guard {
     stopping: bool,
     /// When the lock was given up for the stop.
     relinquished_at: Option<Instant>,
+    /// Since when the card has certainly held its lock (taken at start, or
+    /// given up and taken again) with no renewal since: from then on it
+    /// applies at least its safe level to whatever it converts.  None from
+    /// the first renewal on.
+    locked_at: Option<Instant>,
+    /// The engine's models: the asahi ones on machines with V/I sense, the
+    /// unified ones when they govern or the shadow log runs.  None on the
+    /// J700's default (legacy, no shadow).
+    pub engine: Option<Engine>,
+    /// The governor whose reductions are written.
+    pub governing: Governor,
+    shadow_path: Option<PathBuf>,
+    shadow_failed: bool,
+    /// The last sense data was not a measurement (one warning per run).
+    bad_data: bool,
+    /// Bad sense data was seen and REARM_PERIODS valid complete periods in
+    /// a row have not followed yet: the lock is not taken, idle or not
+    /// (review P8-2).  Carried by a clean stop's state.
+    recovering: bool,
+    /// Valid complete periods in a row since the last bad data.
+    good_since_bad: u32,
+    /// What each control held over the last measured frames (for the
+    /// recording's rebuilt program).
+    last_applied: Vec<f64>,
+    /// The recording (--record), and the replay's trace.
+    pub rec: Option<Recorder>,
+    pub trace: Option<Vec<(Duration, Trace)>>,
+    /// Boot time at the guard's `Instant` zero (for the trace).
+    boot_at: Option<(Instant, Duration)>,
+    /// The last sample-rate read recorded (rate or -errno).
+    rec_rate: Option<i64>,
+    /// The governing latch as last recorded.
+    last_hard: bool,
+    /// When the lock was last taken (None while it is not held).
+    armed_at: Option<Instant>,
 }
 
 impl Guard {
     /// Restore the model from a clean stop (if there is one) and lock the
     /// card's controls.  The volume lock is not lifted here.
+    /// speakersafetyd's flag files are consulted (FOREIGN_FLAGS).
     pub fn start<H: Hw>(hw: &mut H, cfg: &Config, max_reduction: f64, state_path: Option<PathBuf>) -> Result<Guard, Box<dyn Error>> {
+        // tests run on machines that may have speakersafetyd: they name
+        // their flag files themselves
+        let foreign: Vec<PathBuf> = if cfg!(test) { Vec::new() } else { FOREIGN_FLAGS.iter().map(PathBuf::from).collect() };
+        Self::start_with(hw, cfg, max_reduction, state_path, &foreign)
+    }
+
+    /// `start`, with the flag files of other protection daemons to consult.
+    pub fn start_with<H: Hw>(hw: &mut H, cfg: &Config, max_reduction: f64, state_path: Option<PathBuf>, foreign: &[PathBuf]) -> Result<Guard, Box<dyn Error>> {
         if !max_reduction.is_finite() || max_reduction <= 0.0 {
             return Err("maximum reduction must be finite and positive".into());
         }
+        // the unified governor's opt-in, an unqualified machine's, and the
+        // asahi governor's sense, before the card is touched
+        cfg.check_governor()?;
         let globals = cfg.globals.clone();
+        let governing = globals.governor;
+        let mut engine = Engine::new(cfg, governing == Governor::Unified || globals.shadow);
+        if governing != Governor::Legacy && !engine.as_ref().is_some_and(|e| e.has(governing)) {
+            return Err(format!("governor {} has no models on this machine", governing.name()).into());
+        }
+        let mut speakers: Vec<SpeakerState> = cfg.speakers.iter().map(|s| SpeakerState::new(s.clone(), globals.t_ambient)).collect();
+        let latched = |speakers: &mut Vec<SpeakerState>, engine: &mut Option<Engine>| {
+            for s in speakers.iter_mut() {
+                s.assume_latched(globals.t_ambient);
+            }
+            if let Some(e) = engine.as_mut() {
+                e.assume_latched();
+            }
+        };
+        // what the card applied before this run: after a clean stop the
+        // last owner gave the lock up and drained before writing it, so the
+        // card has applied at least its own safe level since; otherwise a
+        // dead owner's gain may still be playing
         // The card first: its lock is what makes this run the only owner,
-        // so the state is read and consumed under it (review r5 V2: a state
-        // read before could be stale by the time the lock is taken).
+        // so the state is read and consumed under it (review r5 V2).
         hw.take_lock()?;
         let events = hw.events_available();
         if !events {
             warn!("no control events from the card: streams between two looks cannot be accounted; leaving the speakers at the card's safe level");
         }
         // The controls' value before this run is unknown, and the budgets
-        // count samples converted at it as loud as they can have been: with
-        // the controls at their minimum from here on that lasts the copy
-        // queue's half second, not until the first unlock.  The minimum is
-        // the one value the card accepts while locked; the speakers are
-        // silent until the first unlock.  Without events there is no
-        // unlock: they stay at the card's safe level.
+        // must count samples converted at it as loud as they can have been:
+        // with the controls at their minimum from here on that lasts the
+        // copy queue's half second, not until the first unlock (on a
+        // machine whose budgets need more than --max-reduction for a
+        // full-scale signal, never).  The minimum is the one value the
+        // card accepts while locked; the speakers are silent until the
+        // first unlock.  Without events there is no unlock: they stay at
+        // the card's safe level.
         let min_now = events && match hw.set_min() {
             Ok(()) => true,
             Err(e) => {
@@ -339,49 +473,58 @@ impl Guard {
                 false
             }
         };
-        let mut speakers: Vec<SpeakerState> = cfg.speakers.iter().map(|s| SpeakerState::new(s.clone(), globals.t_ambient)).collect();
-        let latched = |speakers: &mut Vec<SpeakerState>| {
-            for s in speakers.iter_mut() {
-                s.assume_latched(globals.t_ambient);
-            }
-        };
-        // what the card applied before this run: after a clean stop the
-        // last owner gave the lock up and drained before writing it, so the
-        // card has applied at least its own safe level since; otherwise a
-        // dead owner's gain may still be playing
         let mut resumed = false;
+        let mut recovering = false;
         let mut restored_at = None;
         match &state_path {
             None => {
                 warn!("no model state file: assuming hot speakers (latched)");
-                latched(&mut speakers);
+                latched(&mut speakers, &mut engine);
             }
             Some(path) => match std::fs::read_to_string(path) {
                 Ok(text) => match state::decode(&text) {
                     Some(saved) => {
                         let at = hw.boottime();
+                        if let Some(e) = engine.as_mut() {
+                            state::restore_engine(e, &saved, at, &globals);
+                        }
                         if state::restore(&mut speakers, &saved, at, &globals) {
                             resumed = true;
                             restored_at = Some(at);
-                            info!("model restored from {} (a clean stop {:.1} s ago)", path.display(), hw.boottime().saturating_sub(saved.boottime).as_secs_f64());
+                            recovering = saved.recovering;
+                            info!("model restored from {} (a clean stop {:.1} s ago)", path.display(), at.saturating_sub(saved.boottime).as_secs_f64());
                         } else {
                             info!("{}: not from a clean stop; assuming hot speakers (latched)", path.display());
                         }
                     }
                     None => {
                         warn!("{}: unreadable model state; assuming hot speakers (latched)", path.display());
-                        latched(&mut speakers);
+                        latched(&mut speakers, &mut engine);
                     }
                 },
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
                     info!("{}: no model state; assuming hot speakers (latched)", path.display());
-                    latched(&mut speakers);
+                    latched(&mut speakers, &mut engine);
                 }
                 Err(e) => {
                     warn!("{}: {e}; assuming hot speakers (latched)", path.display());
-                    latched(&mut speakers);
+                    latched(&mut speakers, &mut engine);
                 }
             },
+        }
+        // another protection daemon ran this boot: it may have driven the
+        // speakers after this daemon's last state (or before its first)
+        for p in foreign {
+            let present = match std::fs::symlink_metadata(p) {
+                Ok(_) => true,
+                Err(e) => e.kind() != io::ErrorKind::NotFound,
+            };
+            if present {
+                info!("{}: speakersafetyd has run since boot; assuming hot speakers (latched)", p.display());
+                latched(&mut speakers, &mut engine);
+                resumed = false;
+                break;
+            }
         }
         for s in speakers.iter_mut() {
             s.govern(&globals);
@@ -389,11 +532,23 @@ impl Guard {
                 return Err("nonfinite speaker model state".into());
             }
         }
+        // the governor's output before anything may unlock (review F2)
+        if let Some(e) = engine.as_mut() {
+            e.govern(0.0, false);
+            if !e.finite() {
+                return Err("nonfinite speaker model state".into());
+            }
+        }
+        if governing != Governor::Legacy {
+            info!("governor {}{}", governing.name(), if globals.shadow { ", the others in shadow" } else { "" });
+        }
+        let shadow_path = if globals.shadow { state_path.as_ref().map(|p| p.with_file_name("shadow.jsonl")) } else { None };
+        let n = speakers.len();
         let now = hw.now();
         if let Some(at) = restored_at {
             // The restore covers up to its boot time, the account starts at
-            // this monotonic time: whatever lay between them is charged at
-            // a full-scale signal at full gain, as long as the two boot-time
+            // this monotonic time: whatever lay between them is charged at a
+            // full-scale signal at full gain, as long as the two boot-time
             // reads around it lay apart (as in the final save).
             let pairing = hw.boottime().saturating_sub(at).as_secs_f64();
             if pairing > 0.0 {
@@ -401,6 +556,9 @@ impl Guard {
                     let full = s.worst_case_power(0.0);
                     s.step_pre(full, full, pairing, globals.t_ambient);
                     s.govern(&globals);
+                }
+                if let Some(e) = engine.as_mut() {
+                    e.worst(pairing, &vec![0.0; n]);
                 }
             }
         }
@@ -429,13 +587,13 @@ impl Guard {
             last_ping: now,
             last_log: now,
             last_write: now,
-            written: if min_now { MUTE_DB } else { f64::INFINITY },
-            written_hi: if min_now { MUTE_DB } else { f64::INFINITY },
-            requested: f64::NAN,
+            written: vec![if min_now { MUTE_DB } else { f64::INFINITY }; n],
+            written_hi: vec![if min_now { MUTE_DB } else { f64::INFINITY }; n],
+            requested: vec![f64::NAN; n],
             applied: 0.0,
             gains: {
-                let unknown = Gain { at: now, lo: f64::INFINITY, hi: f64::INFINITY, kernel: true };
-                if min_now { vec![unknown, Gain { at: now, lo: MUTE_DB, hi: MUTE_DB, kernel: true }] } else { vec![unknown] }
+                let unknown = Gain { at: now, lo: vec![f64::INFINITY; n], hi: vec![f64::INFINITY; n], kernel: true };
+                if min_now { vec![unknown, Gain { at: now, lo: vec![MUTE_DB; n], hi: vec![MUTE_DB; n], kernel: true }] } else { vec![unknown] }
             },
             verified_at: now,
             rate_failures: 0,
@@ -446,6 +604,22 @@ impl Guard {
             save_failed: false,
             stopping: false,
             relinquished_at: None,
+            // the lock taken above: macaudio clears any lease with it
+            locked_at: Some(now),
+            engine,
+            governing,
+            shadow_path,
+            shadow_failed: false,
+            bad_data: false,
+            recovering,
+            good_since_bad: 0,
+            last_applied: vec![0.0; n],
+            rec: None,
+            trace: None,
+            boot_at: None,
+            rec_rate: None,
+            last_hard: false,
+            armed_at: None,
         };
         // a clean stop is resumed once: gone before this run can unlock
         g.invalidated = g.invalidate(hw);
@@ -472,6 +646,77 @@ impl Guard {
         }
     }
 
+    /// For the recording: the most reduction each control may have applied
+    /// over [from, to).  Unless the lock was held all through it the card
+    /// may have been at its safe level, the larger reduction (the louder
+    /// program rebuilt from the sensed words, the safer guess there).
+    fn applied_over(&self, from: Instant, most: &[f64]) -> Vec<f64> {
+        let held_through = self.armed && self.armed_at.is_some_and(|t| t <= from);
+        let safe = self.globals.safe_reduction;
+        most.iter().map(|&m| if held_through { m } else { m.max(safe) }).collect()
+    }
+
+    /// Start recording: the header and the model this guard starts from
+    /// (what a replay starts from: written as a clean stop's state at this
+    /// instant, which is how the replay resumes it unchanged).
+    pub fn attach_recorder<H: Hw>(&mut self, hw: &H, rec: Recorder) {
+        let boot = hw.boottime();
+        let text = state::encode_with(boot, boot, &self.speakers, self.engine.as_ref(), false, true);
+        let mut slot = Some(rec);
+        let (gov, max) = (self.governing, self.max_reduction);
+        rec_do(&mut slot, boot, |r, t| r.start(t, gov, max, &text));
+        self.rec = slot;
+        self.last_hard = self.governing_state().2;
+        // the account's spans are recorded in boot time
+        if self.boot_at.is_none() {
+            self.boot_at = Some((hw.now(), boot));
+        }
+    }
+
+    /// Keep a trace of decisions and of the account (the replay).
+    pub fn start_trace<H: Hw>(&mut self, hw: &H) {
+        self.trace = Some(Vec::new());
+        self.boot_at = Some((hw.now(), hw.boottime()));
+        self.last_hard = self.governing_state().2;
+    }
+
+    /// Whether the daemon renews the card's lock (for the replay's log).
+    pub fn armed_now(&self) -> bool {
+        self.armed
+    }
+
+    /// A guard `Instant` as boot time (the trace's clock).
+    fn boot_of(&self, t: Instant) -> Duration {
+        match self.boot_at {
+            Some((i, b)) if t >= i => b + (t - i),
+            Some((i, b)) => b.saturating_sub(i - t),
+            None => Duration::ZERO,
+        }
+    }
+
+    /// A span of the account, for the trace and the recording.
+    fn note_account(&mut self, from: Instant, to: Instant, how: Accounted) {
+        if to > from && (self.trace.is_some() || self.rec.is_some()) {
+            let (a, b) = (self.boot_of(from), self.boot_of(to));
+            if let Some(tr) = self.trace.as_mut() {
+                tr.push((b, Trace::Account(a, b, how)));
+            }
+            rec_do(&mut self.rec, b, |r, ns| r.account(ns, a.as_nanos() as u64, how));
+        }
+    }
+
+    /// The lock was taken or given up.
+    fn note_permit<H: Hw>(&mut self, hw: &H, armed: bool, why: &str) {
+        if self.trace.is_none() && self.rec.is_none() {
+            return;
+        }
+        let t = hw.boottime();
+        if let Some(tr) = self.trace.as_mut() {
+            tr.push((t, Trace::Permit(armed, why.to_string())));
+        }
+        rec_do(&mut self.rec, t, |r, ns| r.permit(ns, armed, why));
+    }
+
     #[cfg(test)]
     pub fn armed(&self) -> bool {
         self.armed
@@ -490,12 +735,15 @@ impl Guard {
     pub fn stop<H: Hw>(&mut self, hw: &mut H) -> Result<(), Box<dyn Error>> {
         if self.armed {
             info!("stopping: leaving the speakers at the card's safe level");
+            self.note_permit(hw, false, "stopping");
         }
         self.stopping = true;
         self.armed = false;
+        self.armed_at = None;
         self.note_written(hw.now());
         hw.relinquish().map_err(|e| format!("giving up the volume lock: {e}"))?;
         self.relinquished_at = Some(hw.now());
+        self.locked_at = self.relinquished_at;
         Ok(())
     }
 
@@ -516,9 +764,7 @@ impl Guard {
         // closest of a few tries) and the model charged up to it as usual.
         // The file names the later boot time; the time between the reads is
         // then charged once more at a full-scale signal at full gain, which
-        // heats more than anything the card can have done in it, so neither
-        // the part the model already holds nor the part it skips can make
-        // the restored model cooler than the speaker.
+        // heats more than anything the card can have done in it.
         let (mut boot, mut now, mut after) = (hw.boottime(), hw.now(), hw.boottime());
         for _ in 0..3 {
             if after.saturating_sub(boot) <= Duration::from_millis(1) {
@@ -535,6 +781,9 @@ impl Guard {
                 s.step_pre(full, full, pairing, ta);
                 s.govern(&self.globals);
             }
+            if let Some(e) = self.engine.as_mut() {
+                e.worst(pairing, &vec![0.0; self.written.len()]);
+            }
             self.check_model()?;
         }
         if self.write_state(hw, after, after, true) {
@@ -544,15 +793,48 @@ impl Guard {
         }
     }
 
-    /// The reduction the controls hold, unknown taken as full gain.
-    fn written_db(&self) -> f64 {
-        if self.written.is_finite() { self.written } else { 0.0 }
+    /// The reduction each control holds, unknown taken as full gain.
+    fn written_db(&self) -> Vec<f64> {
+        self.written.iter().map(|&w| if w.is_finite() { w } else { 0.0 }).collect()
     }
 
-    /// The controls' value, or whether the daemon holds the lease, changed
+    /// A write of `wanted` failed: some controls may hold it and some the
+    /// old value, so each holds at least the smaller reduction (review F1
+    /// of speakerguardd#6) and at most the larger, rounded up by up to a
+    /// step the card may have taken; an unknown control stays unknown.
+    fn write_failed(&mut self, wanted: &[f64], step: f64) {
+        for ((w, h), &r) in self.written.iter_mut().zip(self.written_hi.iter_mut()).zip(wanted) {
+            if w.is_finite() {
+                *w = w.min(r);
+            }
+            if h.is_finite() {
+                *h = h.max(r + step);
+            }
+        }
+        self.requested = vec![f64::NAN; wanted.len()];
+    }
+
+    /// The governing reductions: card-wide (dB), per speaker, and whether
+    /// the governing model latched its hard limit.
+    fn governing_state(&self) -> (f64, Vec<f64>, bool) {
+        let n = self.speakers.len();
+        match (self.governing, self.engine.as_ref()) {
+            (Governor::Legacy, _) | (_, None) => {
+                let r = model::reduction_db(&self.speakers);
+                (r, vec![r; n], self.speakers.iter().any(|s| s.hard))
+            }
+            (gov, Some(e)) => {
+                let per = e.reductions(gov);
+                let r = if per.iter().all(|r| r.is_finite()) { per.iter().cloned().fold(0.0, f64::max) } else { f64::NAN };
+                (r, per, e.hard(gov))
+            }
+        }
+    }
+
+    /// The controls' values, or whether the daemon holds the lease, changed
     /// at `at`.
     fn note_written(&mut self, at: Instant) {
-        let g = Gain { at, lo: self.written, hi: self.written_hi, kernel: !self.armed };
+        let g = Gain { at, lo: self.written.clone(), hi: self.written_hi.clone(), kernel: !self.armed };
         if self.gains.last().is_none_or(|e| e.lo != g.lo || e.hi != g.hi || e.kernel != g.kernel) {
             self.gains.push(g);
         }
@@ -563,9 +845,9 @@ impl Guard {
     /// converted samples at it.
     fn mark_kernel_since(&mut self, from: Instant) {
         if let Some(i) = self.gains.iter().rposition(|e| e.at <= from) {
-            let e = self.gains[i];
-            if !e.kernel && e.at < from {
-                self.gains.insert(i + 1, Gain { at: from, kernel: true, ..e });
+            if !self.gains[i].kernel && self.gains[i].at < from {
+                let e = Gain { at: from, kernel: true, ..self.gains[i].clone() };
+                self.gains.insert(i + 1, e);
             }
         }
         for e in self.gains.iter_mut().filter(|e| e.at >= from) {
@@ -592,34 +874,68 @@ impl Guard {
         })
     }
 
-    /// The least reduction the card may have applied to samples playing
-    /// after `from` (unknown counts as full gain): the controls' least
-    /// since QUEUE_BOUND before it.
-    fn least_since(&self, from: Instant) -> f64 {
-        let from = from.checked_sub(QUEUE_BOUND).unwrap_or(from);
+    /// The least reduction each speaker's control may have applied to
+    /// samples playing after `from` (unknown counts as full gain): the
+    /// least since QUEUE_BOUND before it.  When the card has held its lock
+    /// since before that (a hand-off that has drained), each control's
+    /// least is its value or the card's safe level, whichever is more
+    /// (review X1 of speakerguardd#8).
+    fn least_since(&self, from: Instant) -> Vec<f64> {
+        let converted = from.checked_sub(QUEUE_BOUND);
+        let from = converted.unwrap_or(from);
         let far = from + Duration::from_secs(1 << 20);
-        self.held_over(from, far).map(|e| if e.lo.is_finite() { e.lo } else { 0.0 }).fold(self.written_db(), f64::min)
+        let mut least = self.written_db();
+        for e in self.held_over(from, far) {
+            for (l, &x) in least.iter_mut().zip(&e.lo) {
+                *l = l.min(if x.is_finite() { x } else { 0.0 });
+            }
+        }
+        if self.locked_at.is_some_and(|t| converted.is_some_and(|c| c >= t)) {
+            let safe = self.globals.safe_reduction;
+            for l in least.iter_mut() {
+                *l = l.max(safe);
+            }
+        }
+        least
     }
 
-    /// The reductions (ranges, dB) the card may have converted samples at
-    /// over [from, to]: each value the controls may have held (after a
-    /// failed write the old and the new), the card's safe level over them
-    /// while the daemon may not have held a live lease, anything for an
+    /// The reductions (ranges, dB) the card may have converted each
+    /// speaker's samples at over [from, to]: what its control may have held
+    /// (after a failed write anything from the old value to the new one
+    /// rounded up), the card's safe level over it while the daemon may not
+    /// have held a live lease, anything (from `unknown_floor`) for an
     /// unknown value.
-    fn possible_reductions(&self, from: Instant, to: Instant) -> Vec<(f64, f64)> {
+    fn possible_reductions(&self, from: Instant, to: Instant) -> Vec<Vec<(f64, f64)>> {
         let safe = self.globals.safe_reduction;
-        let mut out = Vec::new();
+        let mut out = vec![Vec::new(); self.written.len()];
         for e in self.held_over(from, to) {
-            if e.lo.is_finite() && e.hi.is_finite() {
-                out.push((e.lo, e.hi));
-                if e.kernel && safe > e.lo {
-                    out.push((safe, safe.max(e.hi)));
+            for ((o, &lo), &hi) in out.iter_mut().zip(&e.lo).zip(&e.hi) {
+                if lo.is_finite() && hi.is_finite() {
+                    o.push((lo, hi));
+                    if e.kernel && safe > lo {
+                        o.push((safe, safe.max(hi)));
+                    }
+                } else {
+                    o.push((self.unknown_floor, MUTE_DB));
                 }
-            } else {
-                out.push((self.unknown_floor, MUTE_DB));
             }
         }
         out
+    }
+
+    /// The least and the most known reduction each control held since
+    /// QUEUE_BOUND before the last verified boundary (unknown counts as full
+    /// gain), for the recording's rebuilt program.
+    fn held(&self) -> (Vec<f64>, Vec<f64>) {
+        let least = self.least_since(self.verified_at);
+        let from = self.verified_at.checked_sub(QUEUE_BOUND).unwrap_or(self.verified_at);
+        let mut most = self.written_db();
+        for e in self.held_over(from, from + Duration::from_secs(1 << 20)) {
+            for (m, &x) in most.iter_mut().zip(&e.hi) {
+                *m = m.max(if x.is_finite() && x < MUTE_DB { x } else { 0.0 });
+            }
+        }
+        (least, most)
     }
 
     /// Give the card's lock up: macaudio locks the volume at once and stops
@@ -633,13 +949,17 @@ impl Guard {
             self.mark_kernel_since(lapse);
         }
         self.armed = false;
+        self.armed_at = None;
         self.note_written(hw.now());
-        hw.relinquish().map_err(|e| format!("giving up the volume lock: {e}").into())
+        hw.relinquish().map_err(|e| format!("giving up the volume lock: {e}"))?;
+        self.locked_at = Some(hw.now());
+        Ok(())
     }
 
     fn disarm<H: Hw>(&mut self, hw: &mut H, why: &str) -> Result<(), Box<dyn Error>> {
         if self.armed {
             warn!("{why}; leaving the speakers at the card's safe level");
+            self.note_permit(hw, false, why);
             self.hand_off(hw)?;
         }
         Ok(())
@@ -648,6 +968,8 @@ impl Guard {
     /// Pings the volume lock.  A ping that answers ETIMEDOUT is the card's
     /// one-shot notice that the lock had lapsed, so ping once more.
     fn ping_lock<H: Hw>(&mut self, hw: &mut H) -> Result<(), Box<dyn Error>> {
+        // whatever the ping answers, the card may be unlocked from here on
+        self.locked_at = None;
         match hw.ping() {
             Ok(()) => {}
             Err(e) if e.raw_os_error() == Some(libc::ETIMEDOUT) => {
@@ -666,7 +988,7 @@ impl Guard {
     }
 
     fn check_model(&self) -> Result<(), Box<dyn Error>> {
-        if self.speakers.iter().all(|s| s.finite()) {
+        if self.speakers.iter().all(|s| s.finite()) && self.engine.as_ref().is_none_or(Engine::finite) {
             Ok(())
         } else {
             Err("nonfinite speaker model state".into())
@@ -682,11 +1004,15 @@ impl Guard {
         let d = (to - self.account_to).as_secs_f64();
         let least = self.least_since(self.verified_at);
         let globals = &self.globals;
-        for s in self.speakers.iter_mut() {
-            let p = s.worst_case_power(least);
-            s.step_at(p, d, globals.t_ambient, least);
+        for (s, &r) in self.speakers.iter_mut().zip(&least) {
+            let p = s.worst_case_power(r);
+            s.step_at(p, d, globals.t_ambient, r);
             s.govern(globals);
         }
+        if let Some(e) = self.engine.as_mut() {
+            e.worst(d, &least);
+        }
+        self.note_account(self.account_to, to, Accounted::Charged);
         self.account_to = to;
         self.check_model()
     }
@@ -700,6 +1026,10 @@ impl Guard {
                 s.step(0.0, d, globals.t_ambient);
                 s.govern(globals);
             }
+            if let Some(e) = self.engine.as_mut() {
+                e.idle(d);
+            }
+            self.note_account(self.account_to, to, Accounted::Cooled);
             self.account_to = to;
         }
         self.verify(to);
@@ -709,11 +1039,11 @@ impl Guard {
     /// `frames` sense frames in `self.words` whose last one was captured at
     /// `end` (the read time less the capture's backlog).  Time before them
     /// since the account's end is charged first.  Of the frames, those over
-    /// time not yet accounted are integrated as a period is; the oldest of
-    /// them only for its part over that time, frames wholly over it not at
-    /// all (a whole period stays whole whatever the clock's rounding, and a
-    /// partly accounted one is integrated frame for frame, never as its
-    /// blocks' means).
+    /// time not yet accounted are integrated as a period is, every model
+    /// the same way; the oldest of them only for its part over that time,
+    /// frames wholly over it not at all (review P8-3).  The loop places
+    /// every period with `place`; this is for the tests.
+    #[cfg(test)]
     fn measure(&mut self, end: Instant, frames: usize) -> Result<(), Box<dyn Error>> {
         self.measure_shifted(end, frames, 0)
     }
@@ -721,9 +1051,10 @@ impl Guard {
     /// The same for frames whose end is only known to lie between `end`
     /// and `shift` frames after it.  Only `frames - shift` of them then
     /// certainly played up to `end`, and which ones is not known: each
-    /// model takes the most energetic run of that many (its thermal model
-    /// the most delivered energy, its budgets the most before the gain), and
-    /// the time before the run is charged.
+    /// model takes the most energetic run of that many (the legacy thermal
+    /// model the most delivered energy, its budgets the most before the
+    /// gain; the engine's models likewise), and the time before the run is
+    /// charged.
     fn measure_shifted(&mut self, end: Instant, frames: usize, shift: usize) -> Result<(), Box<dyn Error>> {
         if frames == 0 || self.rate == 0 || end <= self.account_to {
             return Ok(());
@@ -756,25 +1087,25 @@ impl Guard {
         // `end`, converted up to QUEUE_BOUND before they played, each at any
         // reduction the card may have applied then (the most that can have
         // delivered the frame is the safer guess).
-        let played = end.checked_sub(Duration::from_secs_f64(k as f64 / rate)).unwrap_or(end);
+        let played = end.checked_sub(Duration::from_secs_f64(frames as f64 / rate)).unwrap_or(end);
         let converted = played.checked_sub(QUEUE_BOUND).unwrap_or(played);
         let possible = self.possible_reductions(converted, end);
         let parts: &[(usize, usize, f64)] = if first < 1.0 { &[(0, 1, first), (1, k, 1.0)] } else { &[(0, k, 1.0)] };
-        // block means of a run of per-frame values
+        // the models take the blocks as equal shares of the run's time, so
+        // each block's sum is spread over an equal share: the run's energy
+        // is exact however its frames split
         let means = |x: &[f64], blocks: usize| -> Vec<f64> {
             let n = x.len();
             (0..blocks).map(|b| {
                 let (lo, hi) = (n * b / blocks, n * (b + 1) / blocks);
-                if hi > lo { x[lo..hi].iter().sum::<f64>() / (hi - lo) as f64 } else { 0.0 }
+                x[lo..hi].iter().sum::<f64>() / (n as f64 / blocks as f64)
             }).collect()
         };
-        for s in self.speakers.iter_mut() {
-            let (p, q) = s.frame_powers(all, ch, &possible);
+        for (s, pos) in self.speakers.iter_mut().zip(&possible) {
+            let (p, q) = s.frame_powers(all, ch, pos);
             if p.iter().any(|x| !x.is_finite()) || q.iter().any(|x| !x.is_finite() || *x < 0.0) {
                 return Err("invalid speaker sense voltage or power".into());
             }
-            // the run of `k` frames (ending `certain` frames after its
-            // offset) with the most energy, for each model
             let run = |o: usize| (o + certain - k, o + certain);
             let best = |x: &[f64]| (0..=shift).max_by(|&a, &b| {
                 let (sa, sb) = (run(a), run(b));
@@ -782,7 +1113,7 @@ impl Guard {
             }).unwrap_or(0);
             let (hp, hq) = (run(best(&p)), run(best(&q)));
             let (heat, budget) = (&p[hp.0..hp.1], &q[hq.0..hq.1]);
-            let v = (heat.iter().sum::<f64>() / k as f64 * s.spec.z_nominal).sqrt();
+            let v = (heat.iter().sum::<f64>() / k as f64 * s.spec.r_ff).sqrt();
             let mut peak = f64::NEG_INFINITY;
             for &(lo, hi, w) in parts {
                 if hi <= lo {
@@ -800,6 +1131,14 @@ impl Guard {
             s.v_rms = v;
             s.govern(&globals);
         }
+        if let Some(e) = self.engine.as_mut() {
+            // the same frames over the same time: the sensed power is what
+            // the card's gain let through
+            e.measured(all, frames, certain, k, shift, 1.0 / rate, first, &possible);
+        }
+        // for the recording: the most known reduction over them
+        self.last_applied = possible.iter().map(|p| p.iter().map(|r| if r.1 >= MUTE_DB { 0.0 } else { r.1 }).fold(0.0, f64::max)).collect();
+        self.note_account(self.account_to, end, Accounted::Measured);
         self.account_to = end;
         self.verify(end);
         self.check_model()
@@ -839,10 +1178,19 @@ impl Guard {
                 if frames == 0 {
                     break;
                 }
-                // without the capture's position the frames cannot be placed
                 let before = hw.now();
-                let Ok(q) = hw.queued() else { break };
+                let queued = hw.queued();
                 let after = hw.now();
+                let ch = self.globals.channels;
+                let q_rec = *queued.as_ref().unwrap_or(&0);
+                rec_now(&mut self.rec, hw, |r, t| r.tail(t, q_rec, frames, &self.words[..frames * ch]));
+                if let Err(why) = self.check_sense(frames) {
+                    // not a measurement: the rest up to now is charged
+                    self.bad_sense(hw, &why)?;
+                    break;
+                }
+                // without the capture's position the frames cannot be placed
+                let Ok(q) = queued else { break };
                 self.place(before, after, q, frames)?;
                 measured += frames;
                 if frames < self.globals.period || measured > 8 * self.globals.period {
@@ -855,13 +1203,51 @@ impl Guard {
         Ok(measured)
     }
 
+    /// Whether `frames` sense frames in `self.words` are a measurement: on
+    /// the machines with V/I sense, a mean V*I below -0.01 W, or a
+    /// nonfinite one, is bad sense data (review F3 of speakerguardd#6).
+    fn check_sense(&mut self, frames: usize) -> Result<(), String> {
+        let Some(e) = self.engine.as_mut() else { return Ok(()) };
+        let words = &self.words[..frames * self.globals.channels];
+        e.check(words, self.rate as f64)
+    }
+
+    /// Bad sense data: the card goes to the kernel at once, and the lock
+    /// is only taken back after REARM_PERIODS complete periods that are
+    /// measurements again.  Its time stays uncovered, charged at full
+    /// scale like any other.
+    fn bad_sense<H: Hw>(&mut self, hw: &mut H, why: &str) -> Result<(), Box<dyn Error>> {
+        if !self.bad_data || self.armed {
+            warn!("{why}: the sense data is not a measurement");
+        }
+        self.bad_data = true;
+        self.recovering = true;
+        self.fresh = 0;
+        self.good_since_bad = 0;
+        self.disarm(hw, "the sense data is not a measurement")
+    }
+
     /// One pass of the loop: idle accounting, or one sense period.
     pub fn tick<H: Hw>(&mut self, hw: &mut H) -> Result<(), Box<dyn Error>> {
         let globals = self.globals.clone();
+        // before the rate read: a stream it shows was there by then, and the
+        // time without sense data is counted from here, however long the
+        // daemon is held up after the read
+        let look = hw.now();
         // a change event since the last pass (read before the rate, so that
         // a change after the read is kept for the next pass)
-        let changed = std::mem::take(&mut self.event_pending) | hw.rate_events();
-        let rate = match hw.sample_rate() {
+        let before = hw.rate_events();
+        let changed = std::mem::take(&mut self.event_pending) | before;
+        let read = hw.sample_rate();
+        let seen = match &read {
+            Ok(v) => *v,
+            Err(e) => -(e.raw_os_error().unwrap_or(libc::EIO) as i64).max(1),
+        };
+        if self.rec.is_some() && (self.rec_rate != Some(seen) || seen < 0) {
+            self.rec_rate = Some(seen);
+            rec_now(&mut self.rec, hw, |r, t| r.rate(t, seen));
+        }
+        let rate = match read {
             Ok(v) => {
                 self.rate_failures = 0;
                 self.unknown = false;
@@ -875,6 +1261,7 @@ impl Guard {
                 self.unknown = true;
                 self.closed_seen = false;
                 self.fresh = 0;
+                self.good_since_bad = 0;
                 self.disarm(hw, "the speaker sample-rate control failed")?;
                 self.maintain(hw)?;
                 hw.sleep(PING_INTERVAL);
@@ -909,15 +1296,25 @@ impl Guard {
                 } else {
                     // a change between two looks at closed speakers (a
                     // stream that came and went), or nothing known
+                    let from = self.account_to;
                     self.charge(now)?;
+                    if self.rec.is_some() {
+                        // what decided it, for a replay (review P8-8): its
+                        // own events cannot say
+                        let (a, b) = (self.boot_of(from), self.boot_of(now));
+                        rec_do(&mut self.rec, b, |r, ns| r.look(ns, a.as_nanos() as u64, changed, late));
+                    }
                 }
             }
             self.dt = None;
             self.seen_to = None;
             self.fresh = 0;
+            self.good_since_bad = 0;
             self.closed_seen = true;
             self.maintain(hw)?;
-            hw.wait_rate_change(IDLE_POLL);
+            if hw.wait_rate_change(IDLE_POLL) {
+                rec_now(&mut self.rec, hw, |r, t| r.wake(t));
+            }
             return Ok(());
         }
         let dt = globals.period as f64 / rate as f64;
@@ -933,7 +1330,7 @@ impl Guard {
             self.charge(now)?;
             self.playing = true;
             self.closed_seen = false;
-            self.seen_to = Some(now);
+            self.seen_to = Some(look);
         }
         if self.seen_to.is_none() {
             self.seen_to = Some(self.account_to);
@@ -948,7 +1345,10 @@ impl Guard {
             if self.armed {
                 self.decide(hw, true)?;
             }
-            match hw.open_sense(rate) {
+            let opened = hw.open_sense(rate);
+            let errno = opened.as_ref().err().map_or(0, |e| e.raw_os_error().unwrap_or(libc::EIO));
+            rec_now(&mut self.rec, hw, |r, t| r.open(t, errno));
+            match opened {
                 Ok(()) => {
                     info!("speakers open at {rate} Hz, sense capture running");
                     self.stall = Some(StallClock::default());
@@ -972,33 +1372,70 @@ impl Guard {
                     Err(e) => {
                         // without its position the period cannot be placed
                         warn!("sense capture position: {e}; period discarded");
+                        let errno = e.raw_os_error().unwrap_or(libc::EIO);
+                        rec_now(&mut self.rec, hw, |r, t| r.loss(t, record::LOSS_POSITION, errno));
                         self.fresh = 0;
+                        self.good_since_bad = 0;
                         return self.maintain(hw);
                     }
                 };
                 let after = hw.now();
                 self.stall.as_mut().unwrap().data();
+                // the latest the frames can end (bad data is charged to it)
+                let end = after.checked_sub(Duration::from_secs_f64(queued as f64 / rate as f64)).unwrap_or(after);
+                let read_at = if self.rec.is_some() { hw.boottime() } else { Duration::ZERO };
+                let start = end.checked_sub(Duration::from_secs_f64(dt)).unwrap_or(end);
+                if let Err(why) = self.check_sense(globals.period) {
+                    if self.rec.is_some() {
+                        // what the card may have applied over it
+                        let (_, most) = self.held();
+                        let applied = self.applied_over(start, &most);
+                        rec_do(&mut self.rec, read_at, |r, t| r.period(t, queued, rate, false, &applied, &self.words));
+                    }
+                    // uncovered time: charged at full scale up to the
+                    // period's end, never measured; the period does not
+                    // count as seen
+                    self.charge(end)?;
+                    self.bad_sense(hw, &why)?;
+                    return self.maintain(hw);
+                }
+                self.bad_data = false;
+                self.good_since_bad = self.good_since_bad.saturating_add(1);
+                if self.good_since_bad >= REARM_PERIODS {
+                    self.recovering = false;
+                }
                 self.place(before, after, queued, globals.period)?;
+                if self.rec.is_some() {
+                    let applied = self.applied_over(start, &self.last_applied);
+                    rec_do(&mut self.rec, read_at, |r, t| r.period(t, queued, rate, true, &applied, &self.words));
+                }
                 // when data last arrived (a backlog being read is data)
                 self.seen_to = Some(before);
                 self.fresh = self.fresh.saturating_add(1);
             }
             Ok(Some(false)) => {
                 warn!("incomplete sense period or overrun, step skipped");
+                rec_now(&mut self.rec, hw, |r, t| r.loss(t, record::LOSS_SHORT, 0));
                 self.fresh = 0;
+                self.good_since_bad = 0;
             }
             Ok(None) => {
                 if self.stall.as_mut().unwrap().silent(hw.now()) {
                     warn!("sense stream stalled for {} ms; reopening", STALL_TIMEOUT.as_millis());
+                    rec_now(&mut self.rec, hw, |r, t| r.loss(t, record::LOSS_STALL, 0));
                     self.stall = None;
                     self.fresh = 0;
+                    self.good_since_bad = 0;
                     hw.close_sense();
                 }
             }
             Err(e) if transient(&e) => {
                 warn!("sense capture: {e}; reopening");
+                let errno = e.raw_os_error().unwrap_or(libc::EIO);
+                rec_now(&mut self.rec, hw, |r, t| r.loss(t, record::LOSS_CAPTURE, errno));
                 self.stall = None;
                 self.fresh = 0;
+                self.good_since_bad = 0;
                 hw.close_sense();
                 self.maintain(hw)?;
                 hw.sleep(PING_INTERVAL);
@@ -1031,7 +1468,7 @@ impl Guard {
     fn write_state<H: Hw>(&mut self, hw: &H, boot: Duration, covered: Duration, released: bool) -> bool {
         let Some(path) = &self.state_path else { return true };
         self.last_save_try = Some(hw.now());
-        let text = state::encode(boot, covered, &self.speakers, self.armed, released);
+        let text = state::encode_full(boot, covered, &self.speakers, self.engine.as_ref(), self.armed, released, self.recovering);
         match state_write(path, &text) {
             Ok(()) => {
                 self.save_failed = false;
@@ -1048,9 +1485,7 @@ impl Guard {
     }
 
     /// The model is current enough to lift or renew the lock now (checked
-    /// again after anything that may block, the renewal itself included):
-    /// its account is recent, and the sense data has not been missing for
-    /// the blind limit.
+    /// again after anything that may block).
     fn fresh_enough(&self, now: Instant) -> bool {
         let allowed = Duration::from_secs_f64(self.dt.unwrap_or(0.0)) + BLIND_SLACK;
         now.saturating_duration_since(self.account_to) <= allowed && !(self.playing && self.overdue(now) > BLIND_LIMIT)
@@ -1074,11 +1509,20 @@ impl Guard {
             // nothing can cover the time since the account's end any more
             self.charge(now)?;
         }
-        let reduction = model::reduction_db(&self.speakers);
+        let (reduction, per, hard) = self.governing_state();
         if !reduction.is_finite() {
             return Err("nonfinite speaker reduction".into());
         }
-        let hard = self.speakers.iter().any(|s| s.hard);
+        if hard != self.last_hard {
+            self.last_hard = hard;
+            if self.trace.is_some() || self.rec.is_some() {
+                let t = hw.boottime();
+                if let Some(tr) = self.trace.as_mut() {
+                    tr.push((t, Trace::Latch(hard)));
+                }
+                rec_do(&mut self.rec, t, |r, ns| r.latch(ns, hard));
+            }
+        }
         if self.armed && now >= self.last_ping + KERNEL_LOCK_TIMEOUT {
             // the daemon was late and the card may have taken its volume
             // back: give it up, then take it again the safe way
@@ -1098,7 +1542,9 @@ impl Guard {
             if let Some(why) = why {
                 self.disarm(hw, &why)?;
             }
-        } else if !self.stopping && !self.unknown && !hard && self.events && !renew_now {
+        } else if !self.stopping && !self.unknown && !hard && self.events && !renew_now && !self.recovering {
+            // after bad sense data, REARM_PERIODS valid periods in a row
+            // first, idle or not (review P8-2)
             let seeing = !self.playing || (self.fresh >= REARM_PERIODS && blind <= BLIND_SLACK);
             let retry = self.last_save_try.is_none_or(|t| hw.now().duration_since(t) >= SAVE_INTERVAL);
             if seeing && reduction < self.max_reduction - REARM_MARGIN_DB && !self.invalidated && retry {
@@ -1108,9 +1554,10 @@ impl Guard {
             if seeing && reduction < self.max_reduction - REARM_MARGIN_DB && self.invalidated {
                 match hw.set_min() {
                     Ok(()) => {
-                        self.written = MUTE_DB;
-                        self.written_hi = MUTE_DB;
-                        self.requested = f64::NAN;
+                        let n = self.written.len();
+                        self.written = vec![MUTE_DB; n];
+                        self.written_hi = vec![MUTE_DB; n];
+                        self.requested = vec![f64::NAN; n];
                         self.note_written(hw.now());
                         self.min_failures = 0;
                         // the minimum write may have blocked: the model must
@@ -1120,13 +1567,16 @@ impl Guard {
                             if self.fresh_enough(hw.now()) {
                                 info!("taking the volume lock{} at {reduction:.1} dB", if self.held { " back" } else { "" });
                                 self.armed = true;
+                                self.armed_at = Some(hw.now());
                                 self.note_written(hw.now());
+                                self.note_permit(hw, true, "lock taken");
                                 self.held = true;
                                 self.applied = reduction;
                             } else {
                                 // the ping itself blocked: give it up again
                                 debug!("not taking the lock: the ping blocked");
                                 hw.relinquish().map_err(|e| format!("giving up the volume lock: {e}"))?;
+                                self.locked_at = Some(hw.now());
                             }
                         } else {
                             debug!("not taking the lock: the model fell behind");
@@ -1135,6 +1585,7 @@ impl Guard {
                     Err(e) if transient(&e) && self.min_failures < MAX_CONTROL_FAILURES => {
                         self.min_failures += 1;
                         warn!("volume control: {e}; not taking the lock ({})", self.min_failures);
+                        rec_now(&mut self.rec, hw, |r, t| r.control_failure(t, record::FAIL_MIN));
                     }
                     Err(e) => return Err(format!("volume control: {e}").into()),
                 }
@@ -1145,14 +1596,19 @@ impl Guard {
                 info!("gain reduction {reduction:.1} dB");
                 self.applied = reduction;
             }
-            let due = reduction != self.requested || hw.now().duration_since(self.last_write) >= PING_INTERVAL;
-            match if due { hw.set_reduction(reduction).map(Some) } else { Ok(None) } {
+            let due = per != self.requested || hw.now().duration_since(self.last_write) >= PING_INTERVAL;
+            // the legacy governor writes one value to every control; the
+            // engine's write per speaker (a card with one control gets the
+            // largest)
+            let n = per.len();
+            let write = |hw: &mut H| if self.governing == Governor::Legacy { hw.set_reduction(reduction).map(|a| vec![a; n]) } else { hw.set_reductions(&per) };
+            match if due { write(hw).map(Some) } else { Ok(None) } {
                 Ok(None) => {}
                 Ok(Some(applied)) => {
-                    // what the card applies, never less than asked for
-                    self.written = if applied.is_finite() { applied.max(reduction) } else { reduction };
-                    self.written_hi = self.written;
-                    self.requested = reduction;
+                    // what the cards apply, never less than asked for
+                    self.written = per.iter().zip(applied.iter().chain(std::iter::repeat(&f64::NAN))).map(|(&r, &a)| if a.is_finite() { a.max(r) } else { r }).collect();
+                    self.written_hi = self.written.clone();
+                    self.requested = per.clone();
                     self.last_write = hw.now();
                     self.note_written(hw.now());
                     self.target_failures = 0;
@@ -1161,18 +1617,12 @@ impl Guard {
                     self.target_failures += 1;
                     warn!("volume control: {e} ({})", self.target_failures);
                     // some controls may hold the new value and some the old:
-                    // the card applies at least the smaller reduction
-                    self.requested = f64::NAN;
-                    if self.written.is_finite() {
-                        self.written = self.written.min(reduction);
-                    }
-                    // and the most is the larger, rounded up by up to a step
-                    // the card may have taken: frames may be converted at
-                    // anything between
-                    if self.written_hi.is_finite() {
-                        self.written_hi = self.written_hi.max(reduction + hw.step_db());
-                    }
+                    // each applies at least the smaller reduction, at most
+                    // the larger rounded up
+                    let step = hw.step_db();
+                    self.write_failed(&per, step);
                     self.note_written(hw.now());
+                    rec_now(&mut self.rec, hw, |r, t| r.control_failure(t, record::FAIL_TARGET));
                     self.disarm(hw, "the volume control failed")?;
                 }
                 Err(e) => return Err(format!("volume control: {e}").into()),
@@ -1200,10 +1650,20 @@ impl Guard {
                 info!("{}: coil back under its working limit", s.spec.name);
             }
         }
+        for name in self.engine.as_mut().map(Engine::clear_hard_if_cool).unwrap_or_default() {
+            info!("{name}: back under its working limit");
+        }
         if hw.now().duration_since(self.last_log) >= LOG_INTERVAL {
-            for s in &self.speakers {
+            for (k, s) in self.speakers.iter().enumerate() {
+                let engine = match &self.engine {
+                    Some(e) => {
+                        let (a, ff, vi) = e.temps(k);
+                        format!(" | asahi {a:.1} C, unified {ff:.1}/{vi:.1} C, {} {:.1} dB", self.governing.name(), per.get(k).copied().unwrap_or(f64::NAN))
+                    }
+                    None => String::new(),
+                };
                 debug!(
-                    "{}: {:.3} Vrms {:.1} mW coil {:.1} C magnet {:.1} C reduction {:.1} dB{}",
+                    "{}: {:.3} Vrms {:.1} mW coil {:.1} C magnet {:.1} C reduction {:.1} dB{}{engine}",
                     s.spec.name,
                     s.v_rms,
                     s.power * 1000.0,
@@ -1213,6 +1673,7 @@ impl Guard {
                     if self.armed { "" } else { " (card at its safe level)" }
                 );
             }
+            self.shadow(hw);
             self.last_log = hw.now();
         }
         if self.last_save_try.is_none_or(|t| hw.now().duration_since(t) >= SAVE_INTERVAL) {
@@ -1225,6 +1686,26 @@ impl Guard {
     /// resume it).
     pub fn save<H: Hw>(&mut self, hw: &H) {
         self.save_now(hw);
+    }
+
+    /// Append one line to the shadow log (best effort; rotated by size).
+    fn shadow<H: Hw>(&mut self, hw: &H) {
+        let (Some(path), Some(e)) = (self.shadow_path.clone(), self.engine.as_ref()) else { return };
+        let legacy: Vec<(f64, f64)> = self.speakers.iter().map(|s| (s.t_coil, s.reduction_db)).collect();
+        let line = e.shadow_line(hw.boottime().as_secs_f64(), self.governing, self.armed, &self.written, &legacy);
+        if std::fs::metadata(&path).is_ok_and(|m| m.len() > SHADOW_MAX_BYTES) {
+            let _ = std::fs::rename(&path, path.with_extension("jsonl.1"));
+        }
+        use std::io::Write as _;
+        let result = std::fs::OpenOptions::new().create(true).append(true).open(&path).and_then(|mut f| f.write_all(line.as_bytes()));
+        match result {
+            Ok(()) => self.shadow_failed = false,
+            Err(e) if !self.shadow_failed => {
+                warn!("{}: {e}; no shadow log", path.display());
+                self.shadow_failed = true;
+            }
+            Err(_) => {}
+        }
     }
 }
 
@@ -1304,13 +1785,28 @@ pub mod fake {
         last_end: Duration,
         pub locked: bool,
         /// The card sends sample-rate change events (else the daemon polls).
+        /// The card rounds reductions up to 0.5 dB steps, as the J700 does.
+        pub steps: bool,
         pub events: bool,
         /// How long opening the sense PCM blocks.
         pub open_delay: Duration,
         /// Where rate_events last looked.
         events_seen_to: Duration,
-        /// The card rounds reductions up to 0.5 dB steps, as the J700 does.
-        pub steps: bool,
+        /// The kernel's safe level (SAFE_DB, the J700's; 99.5 on the V/I
+        /// machines).
+        pub safe: f64,
+        /// Per-speaker controls: what each last accepted (empty: one
+        /// shared control, `reduction`).
+        pub per: Vec<f64>,
+        /// The speaker each sense channel belongs to (empty: every channel
+        /// carries the shared control's gain).
+        pub chan_speaker: Vec<Option<usize>>,
+        /// A per-speaker write fails (EIO) at time t after this many
+        /// speakers took the new value.
+        pub partial_fail: Box<dyn Fn(Duration) -> Option<usize>>,
+        /// Rewrites each complete period's words (the n-th period, from 0).
+        pub tweak: Option<Box<dyn FnMut(u32, &mut [i32])>>,
+        pub delivered: u32,
     }
 
     impl FakeHw {
@@ -1350,10 +1846,65 @@ pub mod fake {
                 lossy: false,
                 last_end: Duration::ZERO,
                 locked: false,
+                steps: false,
                 events: true,
                 events_seen_to: Duration::ZERO,
                 open_delay: Duration::ZERO,
-                steps: false,
+                safe: SAFE_DB,
+                per: Vec::new(),
+                chan_speaker: Vec::new(),
+                partial_fail: Box::new(|_| None),
+                tweak: None,
+                delivered: 0,
+            }
+        }
+
+        /// A card with a volume control per speaker and the sense channels
+        /// of `cfg` (V and I of each speaker), at the configuration's safe
+        /// level.
+        pub fn per_speaker(cfg: &Config) -> FakeHw {
+            let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
+            hw.safe = cfg.globals.safe_reduction;
+            hw.reduction = hw.safe;
+            hw.per = vec![hw.safe; cfg.speakers.len()];
+            hw.chan_speaker = vec![None; cfg.globals.channels];
+            for (k, s) in cfg.speakers.iter().enumerate() {
+                hw.chan_speaker[s.vs_chan] = Some(k);
+                if let Some(ic) = s.is_chan {
+                    hw.chan_speaker[ic] = Some(k);
+                }
+            }
+            hw
+        }
+
+        /// The gain the card applies to speaker `k`.
+        pub fn effective_of(&self, k: usize) -> f64 {
+            let r = self.per.get(k).copied().unwrap_or(self.reduction);
+            if self.unlocked_at(self.t) {
+                r
+            } else {
+                r.max(self.safe)
+            }
+        }
+
+        /// The gain on sense channel `c`.
+        fn chan_reduction(&self, c: usize) -> f64 {
+            match self.chan_speaker.get(c).copied().flatten() {
+                Some(k) if !self.per.is_empty() => self.effective_of(k),
+                _ => self.effective_reduction(),
+            }
+        }
+
+        /// `frames` frames of the program at time t through the card's
+        /// gains: a square wave, sign alternating frame to frame.
+        fn fill(&self, words: &mut [i32], frames: usize) {
+            let level = (self.level)(self.t);
+            let per: Vec<i32> = (0..self.channels)
+                .map(|c| ((level * 10f64.powf(-self.chan_reduction(c) / 20.0)).clamp(0.0, 1.0) * 2147483647.0) as i32)
+                .collect();
+            for (i, w) in words[..frames * self.channels].iter_mut().enumerate() {
+                let word = per[i % self.channels];
+                *w = if (i / self.channels) % 2 == 0 { word } else { -word };
             }
         }
 
@@ -1387,7 +1938,7 @@ pub mod fake {
             if self.unlocked_at(self.t) {
                 self.reduction
             } else {
-                self.reduction.max(SAFE_DB)
+                self.reduction.max(self.safe)
             }
         }
 
@@ -1457,6 +2008,9 @@ pub mod fake {
                 return Err(io::Error::from_raw_os_error(libc::EIO));
             }
             self.reduction = MUTE_DB;
+            for p in self.per.iter_mut() {
+                *p = MUTE_DB;
+            }
             Ok(())
         }
         fn relinquish(&mut self) -> io::Result<()> {
@@ -1479,13 +2033,42 @@ pub mod fake {
             if (self.volume_fail)(self.t) || (self.target_fail)(self.t) {
                 return Err(io::Error::from_raw_os_error(libc::EIO));
             }
-            if !self.unlocked_at(self.t) && db < SAFE_DB {
+            if !self.unlocked_at(self.t) && db < self.safe {
                 return Err(io::Error::from_raw_os_error(libc::EINVAL));
             }
             let db = if self.steps { (db * 2.0 - 1e-9).ceil() / 2.0 } else { db };
             self.reduction = db;
+            for p in self.per.iter_mut() {
+                *p = db;
+            }
             self.writes.push((self.t, db));
             Ok(db)
+        }
+        fn set_reductions(&mut self, db: &[f64]) -> io::Result<Vec<f64>> {
+            if self.per.is_empty() {
+                let a = self.set_reduction(db.iter().cloned().fold(0.0, f64::max))?;
+                return Ok(vec![a; db.len()]);
+            }
+            self.lapse_check();
+            if (self.volume_fail)(self.t) || (self.target_fail)(self.t) {
+                return Err(io::Error::from_raw_os_error(libc::EIO));
+            }
+            if !self.unlocked_at(self.t) && db.iter().any(|&d| d < self.safe) {
+                return Err(io::Error::from_raw_os_error(libc::EINVAL));
+            }
+            let upto = (self.partial_fail)(self.t);
+            for (k, (p, &d)) in self.per.iter_mut().zip(db).enumerate() {
+                if upto.is_some_and(|n| k >= n) {
+                    return Err(io::Error::from_raw_os_error(libc::EIO));
+                }
+                *p = d;
+            }
+            if upto.is_some() {
+                return Err(io::Error::from_raw_os_error(libc::EIO));
+            }
+            self.reduction = db.iter().cloned().fold(0.0, f64::max);
+            self.writes.push((self.t, self.reduction));
+            Ok(db.to_vec())
         }
         fn sample_rate(&mut self) -> io::Result<i64> {
             self.t += (self.control_delay)(self.t);
@@ -1505,13 +2088,13 @@ pub mod fake {
             if !self.sense_open {
                 return Ok(0);
             }
-            let gain = 10f64.powf(-self.effective_reduction() / 20.0);
-            let a = ((self.level)(self.t) * gain).clamp(0.0, 1.0);
-            let word = (a * 2147483647.0) as i32;
-            if let Some(reader) = self.pcm.as_mut() {
+            if self.pcm.is_some() {
+                let gain = 10f64.powf(-self.effective_reduction() / 20.0);
+                let a = ((self.level)(self.t) * gain).clamp(0.0, 1.0);
                 let t = self.t;
+                let reader = self.pcm.as_mut().unwrap();
                 reader.io().advance_to(t);
-                reader.io().word = word;
+                reader.io().word = (a * 2147483647.0) as i32;
                 return reader.read_tail(words);
             }
             // the frames since the last whole period, up to where the
@@ -1522,10 +2105,7 @@ pub mod fake {
                 return Ok(0);
             }
             let k = ((stop.saturating_sub(start).as_secs_f64() * 48000.0) as usize).min(self.period_frames - 1);
-            for (i, w) in words[..k * self.channels].iter_mut().enumerate() {
-                let frame = i / self.channels;
-                *w = if frame % 2 == 0 { word } else { -word };
-            }
+            self.fill(words, k);
             self.last_end = self.t;
             Ok(k)
         }
@@ -1636,20 +2216,18 @@ pub mod fake {
             self.last_end = self.next_period;
             self.next_period += self.period;
             self.lapse_check();
-            let gain = 10f64.powf(-self.effective_reduction() / 20.0);
-            let a = ((self.level)(self.t) * gain).clamp(0.0, 1.0);
-            let word = (a * 2147483647.0) as i32;
-            for (i, w) in words.iter_mut().enumerate() {
-                let frame = i / self.channels;
-                *w = if frame % 2 == 0 { word } else { -word };
+            self.fill(words, self.period_frames);
+            if let Some(tweak) = self.tweak.as_mut() {
+                tweak(self.delivered, words);
             }
+            self.delivered += 1;
             Ok(Some(true))
         }
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::fake::*;
     use super::*;
 
@@ -1872,6 +2450,29 @@ mod tests {
         assert_eq!(hw.reduction, 0.0);
     }
 
+    /// The time without sense data counts from before the rate read that
+    /// shows a stream.  A read held up 0.12 s (the stream may have played
+    /// all through it) leaves that much less of the blind limit, not more:
+    /// counted from after the read, the lease could be renewed 0.12 s
+    /// longer blind.
+    #[test]
+    fn blindness_counts_from_before_the_rate_read() {
+        let cfg = j700();
+        let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
+        hw.level = Box::new(|_| 0.0);
+        hw.playing = Box::new(|t| t >= secs(2.0));
+        hw.sensing = Box::new(|t| t < secs(2.0));
+        hw.control_delay = Box::new(|t| if (secs(1.97)..secs(2.0)).contains(&t) { Duration::from_millis(120) } else { Duration::ZERO });
+        let mut g = Guard::start(&mut hw, &cfg, 20.0, tmp_state()).unwrap();
+        run_until(&mut g, &mut hw, secs(1.97)).unwrap();
+        assert!(g.armed() && !g.playing);
+        let look = hw.now();
+        g.tick(&mut hw).unwrap();
+        assert!(g.playing && hw.t >= secs(2.09), "the slow read did not show the stream");
+        let seen = g.seen_to.unwrap();
+        assert!(seen <= look, "blindness counted from {:?} after the look", seen.saturating_duration_since(look));
+    }
+
     /// "Peak volume": with a cool speaker and a loud but sustainable program
     /// (0.3 of full scale, 1.1 W into each coil) the daemon leaves the card
     /// at the top of its range, the amplifier's full scale, for the whole
@@ -1882,27 +2483,9 @@ mod tests {
         let cfg = j700();
         let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
         hw.level = Box::new(|_| 0.3);
-        hw.playing = Box::new(|t| t >= secs(1.0));
         let mut g = Guard::start(&mut hw, &cfg, 20.0, tmp_state()).unwrap();
         run_until(&mut g, &mut hw, secs(10.0)).unwrap();
         assert!(hw.writes.iter().all(|&(_, db)| db == 0.0), "{:?}", hw.writes.iter().find(|w| w.1 != 0.0));
-        assert!(hw.lapses.is_empty());
-    }
-
-    /// A start in the middle of playback does not know the gain the card
-    /// converted the samples still playing at (the controls' value before
-    /// the start is unknown; after a clean stop it is at least the card's
-    /// safe level): their power before the gain is charged to the budgets
-    /// as high as it can have been, for the half second they can play.  The
-    /// cost is a small, short reduction.
-    #[test]
-    fn a_start_during_playback_costs_little() {
-        let cfg = j700();
-        let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
-        hw.level = Box::new(|_| 0.3);
-        let mut g = Guard::start(&mut hw, &cfg, 20.0, tmp_state()).unwrap();
-        run_until(&mut g, &mut hw, secs(10.0)).unwrap();
-        assert!(hw.writes.iter().all(|&(t, db)| db <= 1.0 && (t < secs(2.5) || db == 0.0)), "{:?}", hw.writes.iter().filter(|w| w.1 != 0.0).collect::<Vec<_>>());
         assert!(hw.lapses.is_empty());
     }
 
@@ -2502,10 +3085,12 @@ mod tests {
         let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
         let mut g = Guard::start(&mut hw, &cfg, 20.0, tmp_state()).unwrap();
         g.rate = 48000;
-        g.written = 0.0;
-        g.written_hi = 0.0;
+        g.written = vec![0.0; 2];
+        g.written_hi = g.written.clone();
         let t0 = hw.now();
-        g.gains = vec![Gain { at: t0, lo: 0.0, hi: 0.0, kernel: false }];
+        g.gains = vec![Gain { at: t0, lo: vec![0.0; 2], hi: vec![0.0; 2], kernel: false }];
+        // a lease held by hand: the card applies the controls
+        g.locked_at = None;
         g.verified_at = t0;
         g.account_to = t0;
         for w in g.words.iter_mut() {
@@ -2611,10 +3196,12 @@ mod tests {
         let mut g = Guard::start(&mut hw, &cfg, 20.0, tmp_state()).unwrap();
         g.rate = 48000;
         g.armed = true;
-        g.written = 0.0;
-        g.written_hi = 0.0;
+        g.written = vec![0.0; 2];
+        g.written_hi = g.written.clone();
         let t0 = hw.now();
-        g.gains = vec![Gain { at: t0, lo: 0.0, hi: 0.0, kernel: false }];
+        g.gains = vec![Gain { at: t0, lo: vec![0.0; 2], hi: vec![0.0; 2], kernel: false }];
+        // a lease held by hand: the card applies the controls
+        g.locked_at = None;
         g.verified_at = t0;
         g.account_to = t0;
         hw.t += Duration::from_millis(150);
@@ -2677,6 +3264,7 @@ mod tests {
         fn ping(&mut self) -> io::Result<()> { self.hw.ping() }
         fn set_min(&mut self) -> io::Result<()> { self.hw.set_min() }
         fn set_reduction(&mut self, d: f64) -> io::Result<f64> { self.hw.set_reduction(d) }
+        fn set_reductions(&mut self, d: &[f64]) -> io::Result<Vec<f64>> { self.hw.set_reductions(d) }
         fn relinquish(&mut self) -> io::Result<()> { self.hw.relinquish() }
         fn sample_rate(&mut self) -> io::Result<i64> { self.hw.sample_rate() }
         fn open_sense(&mut self, r: u32) -> io::Result<()> { self.hw.open_sense(r) }
@@ -2822,10 +3410,12 @@ mod tests {
         let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
         let mut g = Guard::start(&mut hw, &cfg, 20.0, tmp_state()).unwrap();
         g.rate = 48000;
-        g.written = 20.0;
-        g.written_hi = 20.0;
+        g.written = vec![20.0; 2];
+        g.written_hi = g.written.clone();
         let t0 = hw.now();
-        g.gains = vec![Gain { at: t0, lo: 20.0, hi: 20.0, kernel: false }];
+        g.gains = vec![Gain { at: t0, lo: vec![20.0; 2], hi: vec![20.0; 2], kernel: false }];
+        // a lease held by hand: the card applies the controls
+        g.locked_at = None;
         g.verified_at = t0;
         g.account_to = t0;
         for s in &mut g.speakers {
@@ -2868,6 +3458,7 @@ mod tests {
         fn ping(&mut self) -> io::Result<()> { self.hw.ping() }
         fn set_min(&mut self) -> io::Result<()> { self.hw.set_min() }
         fn set_reduction(&mut self, d: f64) -> io::Result<f64> { self.hw.set_reduction(d) }
+        fn set_reductions(&mut self, d: &[f64]) -> io::Result<Vec<f64>> { self.hw.set_reductions(d) }
         fn relinquish(&mut self) -> io::Result<()> {
             if self.fail_relinquish {
                 return Err(io::Error::from_raw_os_error(libc::EIO));
@@ -2960,6 +3551,735 @@ mod tests {
         assert!(!(g.armed() && reference.t_coil > 120.0), "rearmed while the true coil is still over the ceiling");
     }
 
+    // ---- the engine on the guard: speakerguardd#6's review witnesses, and
+    // the r3 rules on the V/I path ----
+
+    const J413: &str = include_str!("../conf/apple/j413.conf");
+    const J316: &str = include_str!("../conf/apple/j316.conf");
+    const J616: &str = include_str!("../conf/apple/j616.conf");
+
+    /// The J413's configuration, allowed to govern for these offline tests
+    /// (it is not qualified on the machine).
+    pub fn j413() -> Config {
+        let mut c = Config::parse(J413).unwrap();
+        c.allow_unqualified = true;
+        c
+    }
+
+    /// A clean stop's state of its own for `cfg`: every model's coil at
+    /// `tc` and magnet at `tm`, written at the fake's start (boot 1000 s).
+    pub fn vi_state(cfg: &Config, tc: f64, tm: f64) -> PathBuf {
+        let path = missing_state().unwrap();
+        let g = &cfg.globals;
+        let mut sp: Vec<SpeakerState> = cfg.speakers.iter().map(|s| SpeakerState::new(s.clone(), g.t_ambient)).collect();
+        for s in sp.iter_mut() {
+            s.resume(tc, tm, 0.0, 0.0);
+        }
+        let mut e = Engine::new(cfg, true).unwrap();
+        for a in e.asahi.iter_mut().flatten() {
+            a.th.t_coil = tc;
+            a.th.t_magnet = tm;
+            a.coil_peak = tc;
+            a.magnet_peak = tm;
+            a.coil_hyst = tc;
+            a.magnet_hyst = tm;
+        }
+        for u in e.unified.iter_mut().flatten() {
+            u.ff.t_coil = tc;
+            u.ff.t_magnet = tm;
+            if let Some(v) = u.vi.as_mut() {
+                v.t_coil = tc;
+                v.t_magnet = tm;
+            }
+            u.peak = tc;
+        }
+        let boot = Duration::from_secs(1000);
+        std::fs::write(&path, state::encode_with(boot, boot, &sp, Some(&e), false, true)).unwrap();
+        path
+    }
+
+    fn asahi(g: &Guard) -> &Vec<crate::engine::AsahiSpeaker> {
+        g.engine.as_ref().unwrap().asahi.as_ref().unwrap()
+    }
+
+    fn idx(cfg: &Config, name: &str) -> usize {
+        cfg.speakers.iter().position(|s| s.name == name).unwrap()
+    }
+
+    /// The guard never believes a control holds more reduction than it does.
+    fn belief_holds(g: &Guard, hw: &FakeHw) {
+        for (k, (&w, &p)) in g.written.iter().zip(&hw.per).enumerate() {
+            assert!(!w.is_finite() || w <= p + 1e-9, "speaker {k}: believed {w} dB, the control holds {p} dB at {:?}", hw.t);
+        }
+    }
+
+    /// The worst case of speaker `k`'s measured-power models at `db`.
+    fn vi_worst(cfg: &Config, k: usize, db: f64) -> f64 {
+        let v = crate::engine::v_worst(&cfg.speakers[k], &cfg.globals) * 10f64.powf(-db / 20.0);
+        v * v / cfg.speakers[k].z_nominal.min(cfg.speakers[k].r_ff)
+    }
+
+    /// The V/I path end to end: a quiet program, per-speaker controls.
+    #[test]
+    fn vi_healthy_playback_keeps_the_lock_at_full_scale() {
+        let cfg = j413();
+        let mut hw = FakeHw::per_speaker(&cfg);
+        hw.level = Box::new(|_| 0.03);
+        let mut g = Guard::start(&mut hw, &cfg, cfg.globals.max_reduction, Some(vi_state(&cfg, 55.0, 52.0))).unwrap();
+        assert_eq!(g.governing, Governor::Asahi);
+        run_until(&mut g, &mut hw, secs(10.0)).unwrap();
+        assert!(hw.lapses.is_empty(), "{:?}", hw.lapses);
+        assert!(hw.max_ping_gap(secs(0.3), hw.t) < LOCK_TIMEOUT);
+        assert!(g.armed() && hw.per.iter().all(|&p| p == 0.0), "{:?}", hw.per);
+        assert_eq!(hw.opens, 1);
+        assert!(!g.engine.as_ref().unwrap().hard(Governor::Asahi));
+    }
+
+    /// Review F1, volume route, with the asahi governor: 160 failed writes
+    /// left 0 dB of 6.2 dB applied and the lock renewed 54 times.  The first
+    /// failure gives the lock up, nothing renews while the control fails,
+    /// and the guard never believes more reduction than a control holds.
+    #[test]
+    fn vi_a_failing_volume_control_hands_the_card_to_the_kernel() {
+        let cfg = j413();
+        let mut hw = FakeHw::per_speaker(&cfg);
+        hw.level = Box::new(|_| 0.06);
+        hw.volume_fail = Box::new(|t| (secs(2.0)..secs(5.0)).contains(&t));
+        let mut g = Guard::start(&mut hw, &cfg, cfg.globals.max_reduction, Some(vi_state(&cfg, 122.0, 95.0))).unwrap();
+        while hw.t < secs(30.0) {
+            g.tick(&mut hw).unwrap();
+            belief_holds(&g, &hw);
+            if (secs(2.1)..secs(5.0)).contains(&hw.t) {
+                assert!(!g.armed());
+                assert!((0..cfg.speakers.len()).all(|k| hw.effective_of(k) >= hw.safe), "the card plays above its safe level at {:?}", hw.t);
+            }
+        }
+        let renewed: Vec<_> = hw.pings.iter().filter(|&&p| p >= secs(2.0) && p < secs(5.0)).collect();
+        assert!(renewed.is_empty(), "renewed while the volume control failed: {renewed:?}");
+        assert!(hw.relinquished >= 1, "the hand-off did not give the lock up");
+        assert!(g.armed() && hw.unlocked_at(hw.t), "taken back once the control works");
+        let want = g.engine.as_ref().unwrap().reductions(Governor::Asahi);
+        assert!(hw.per.iter().zip(&want).all(|(p, w)| (p - w).abs() < 0.5), "the governor's reductions are written after recovery: {:?} vs {want:?}", hw.per);
+    }
+
+    /// Review F1: a failed per-speaker write leaves each control at the old
+    /// value or the new one, so each counts at the smaller reduction, and
+    /// an unknown control stays unknown (full gain).  Charges use each
+    /// control's own least.
+    #[test]
+    fn a_failed_per_speaker_write_keeps_the_smaller_reduction_of_each_control() {
+        let cfg = j413();
+        let mut hw = FakeHw::per_speaker(&cfg);
+        let mut g = Guard::start(&mut hw, &cfg, cfg.globals.max_reduction, Some(vi_state(&cfg, 60.0, 55.0))).unwrap();
+        g.written = vec![10.0; 4];
+        g.written_hi = g.written.clone();
+        g.write_failed(&[2.0, 2.0, 6.0, 6.0], 0.0);
+        assert_eq!(g.written, vec![2.0, 2.0, 6.0, 6.0]);
+        g.write_failed(&[8.0; 4], 0.0);
+        assert_eq!(g.written, vec![2.0, 2.0, 6.0, 6.0]);
+        let t0 = hw.now();
+        g.gains = vec![Gain { at: t0, lo: g.written.clone(), hi: g.written.clone(), kernel: false }];
+        // a lease held by hand: the card applies the controls
+        g.locked_at = None;
+        g.verified_at = t0;
+        g.account_to = t0;
+        let before = asahi(&g).clone();
+        g.charge(t0 + Duration::from_millis(50)).unwrap();
+        for (k, s) in before.iter().enumerate() {
+            let mut want = s.clone();
+            want.th.hold(vi_worst(&cfg, k, g.written[k]), 0.05, cfg.globals.t_ambient);
+            assert!((asahi(&g)[k].th.t_coil - want.th.t_coil).abs() < 1e-9, "speaker {k}");
+        }
+        g.written = vec![f64::INFINITY; 4];
+        g.written_hi = g.written.clone();
+        g.write_failed(&[8.0; 4], 0.0);
+        assert!(g.written.iter().all(|w| w.is_infinite()), "an unknown control became a known one");
+        // in the loop: a partial write hands the card over at once, and the
+        // belief never runs ahead of a control
+        let mut hw = FakeHw::per_speaker(&cfg);
+        hw.level = Box::new(|_| 0.06);
+        hw.partial_fail = Box::new(|t| if (secs(2.0)..secs(3.0)).contains(&t) { Some(2) } else { None });
+        let mut g = Guard::start(&mut hw, &cfg, cfg.globals.max_reduction, Some(vi_state(&cfg, 122.0, 95.0))).unwrap();
+        let mut handed = false;
+        while hw.t < secs(4.0) {
+            g.tick(&mut hw).unwrap();
+            belief_holds(&g, &hw);
+            handed |= hw.t >= secs(2.0) && hw.t < secs(3.0) && !g.armed();
+        }
+        assert!(handed, "a partial write did not hand the card over");
+    }
+
+    /// Review F1, sample-rate route, on a V/I machine: unknown playback
+    /// state from the start never unlocks and never opens capture blind;
+    /// the time is charged at full scale (at the unknown controls' full
+    /// gain), so the lock comes back only once that has cooled.
+    #[test]
+    fn vi_a_failing_rate_control_never_unlocks() {
+        let cfg = j413();
+        let mut hw = FakeHw::per_speaker(&cfg);
+        hw.rate_fail = Box::new(|t| t < secs(2.0));
+        let mut g = Guard::start(&mut hw, &cfg, cfg.globals.max_reduction, Some(vi_state(&cfg, 60.0, 55.0))).unwrap();
+        run_until(&mut g, &mut hw, secs(2.0)).unwrap();
+        assert!(hw.pings.is_empty(), "unlocked {} times with the playback state unknown", hw.pings.len());
+        assert!(!g.armed() && hw.opens == 0);
+        assert!(asahi(&g).iter().all(|a| a.hard), "two unknown seconds at full scale did not latch the models");
+        run_until(&mut g, &mut hw, secs(600.0)).unwrap();
+        assert!(g.armed() && hw.unlocked_at(hw.t), "never taken back");
+    }
+
+    /// Review F2: a valid 139 C state and a damaged file both started
+    /// armed at 0 dB.  The governor's output is computed in start; the
+    /// 139 C start needs the kernel and does not unlock until the ramp
+    /// allows; the damaged one starts latched at the limit.
+    #[test]
+    fn vi_a_hot_or_damaged_start_waits_for_the_ramp() {
+        let cfg = j413();
+        let mut hw = FakeHw::per_speaker(&cfg);
+        hw.playing = Box::new(|_| false);
+        let mut g = Guard::start(&mut hw, &cfg, cfg.globals.max_reduction, Some(vi_state(&cfg, 139.0, 105.0))).unwrap();
+        let demand = |g: &Guard| g.engine.as_ref().unwrap().reductions(Governor::Asahi).into_iter().fold(0.0, f64::max);
+        assert!(demand(&g) >= cfg.globals.max_reduction, "the ramp was not computed at start: {:.2} dB", demand(&g));
+        assert!(hw.pings.is_empty(), "unlocked at start");
+        let mut last = demand(&g);
+        while hw.pings.is_empty() && hw.t < secs(60.0) {
+            g.tick(&mut hw).unwrap();
+            last = demand(&g);
+        }
+        assert!(!hw.pings.is_empty(), "never armed");
+        assert!(last < cfg.globals.max_reduction - REARM_MARGIN_DB, "unlocked with the ramp at {last:.2} dB");
+        assert!(hw.t > secs(1.0), "unlocked after {:?}", hw.t);
+        let path = vi_state(&cfg, 60.0, 55.0);
+        std::fs::write(&path, "damaged").unwrap();
+        let mut hw = FakeHw::per_speaker(&cfg);
+        let g = Guard::start(&mut hw, &cfg, cfg.globals.max_reduction, Some(path)).unwrap();
+        assert!(asahi(&g).iter().all(|a| a.hard && a.th.t_coil >= 150.0));
+        assert!(hw.pings.is_empty());
+        assert!(demand(&g) >= cfg.globals.max_reduction);
+    }
+
+    /// Review F3: half the periods with negative V*I kept the card armed at
+    /// 0 dB, and their time was neither measured nor charged (the tweeter
+    /// model cooled from 119 to 104.6 C).  A bad period is uncovered time:
+    /// charged at full scale at the least gain held, never measured, and
+    /// the card is handed off at once.  At the J413 tweeter's sensitivity
+    /// that charge latches the model.
+    #[test]
+    fn vi_bad_sense_data_hands_off_at_once_and_is_charged() {
+        let cfg = j413();
+        let ch = cfg.globals.channels;
+        let negate = |cfg: &Config| {
+            let ics: Vec<usize> = cfg.speakers.iter().map(|s| s.is_chan.unwrap()).collect();
+            move |w: &mut [i32]| {
+                for f in w.chunks_exact_mut(ch) {
+                    for &ic in &ics {
+                        f[ic] = -f[ic];
+                    }
+                }
+            }
+        };
+        let run = |bad: bool| {
+            let mut hw = FakeHw::per_speaker(&cfg);
+            hw.level = Box::new(|_| 0.04);
+            let flip = negate(&cfg);
+            hw.tweak = Some(Box::new(move |n, w| {
+                if bad && n >= 20 && n % 2 == 1 {
+                    flip(w);
+                }
+            }));
+            let mut g = Guard::start(&mut hw, &cfg, cfg.globals.max_reduction, Some(vi_state(&cfg, 55.0, 52.0))).unwrap();
+            let (mut seen, mut latched) = (0, false);
+            while hw.t < secs(9.0) {
+                let before = hw.delivered;
+                let loud = (0..cfg.speakers.len()).any(|k| hw.effective_of(k) < hw.safe);
+                g.tick(&mut hw).unwrap();
+                latched |= asahi(&g).iter().any(|a| a.hard);
+                if bad && loud && hw.delivered > before && before >= 20 && before % 2 == 1 {
+                    seen += 1;
+                    assert!(!g.armed(), "armed after bad sense data at {:?}", hw.t);
+                    assert!((0..cfg.speakers.len()).all(|k| hw.effective_of(k) >= hw.safe), "the card plays above its safe level at {:?}", hw.t);
+                }
+            }
+            (g, hw, seen, latched)
+        };
+        let (good, ghw, _, good_latched) = run(false);
+        let (bad, bhw, seen, bad_latched) = run(true);
+        assert!(ghw.delivered >= 100 && bhw.delivered >= 100);
+        assert!(!good_latched && good.armed());
+        assert!(seen >= 1, "no bad period arrived at full level");
+        assert!(bad_latched, "bad periods charged at less than the gain the card held");
+        let k = idx(&cfg, "Left Woofer");
+        assert!(asahi(&bad)[k].th.t_coil > asahi(&good)[k].th.t_coil + 1.0, "{:.2} vs {:.2} C", asahi(&bad)[k].th.t_coil, asahi(&good)[k].th.t_coil);
+        // a single bad period: the lock comes back only after two good ones
+        let mut hw = FakeHw::per_speaker(&cfg);
+        hw.level = Box::new(|_| 0.02);
+        let flip = negate(&cfg);
+        hw.tweak = Some(Box::new(move |n, w| {
+            if n == 20 {
+                flip(w);
+            }
+        }));
+        let mut g = Guard::start(&mut hw, &cfg, 40.0, Some(vi_state(&cfg, 55.0, 52.0))).unwrap();
+        let mut bad_at = None;
+        while hw.t < secs(20.0) {
+            g.tick(&mut hw).unwrap();
+            if bad_at.is_none() && hw.delivered == 21 {
+                bad_at = Some(hw.t);
+                assert!(!g.armed());
+            }
+        }
+        let bad_at = bad_at.unwrap();
+        let back = hw.pings.iter().copied().find(|&p| p > bad_at).expect("never taken back");
+        assert!(back + Duration::from_millis(1) >= bad_at + secs(2.0 * 4096.0 / 48000.0), "taken back at {back:?}, bad period at {bad_at:?}");
+    }
+
+    fn word(x: f64, fs: f64) -> i32 {
+        (((x / fs * 32768.0).round().clamp(-32768.0, 32767.0)) as i16 as i32) << 16
+    }
+
+    /// Review F4 at the loop: the +25 W / -20 W period ends at 122 C after
+    /// a 175 C peak, and the guard stayed armed at 2.1 dB.  The latch is set
+    /// inside the period and the card goes to the kernel before any renewal.
+    #[test]
+    fn vi_an_intra_period_peak_hands_the_card_to_the_kernel() {
+        let cfg = j413();
+        let k = idx(&cfg, "Left Tweeter");
+        let (vc, ic) = (cfg.speakers[k].vs_chan, cfg.speakers[k].is_chan.unwrap());
+        let ch = cfg.globals.channels;
+        let mut hw = FakeHw::per_speaker(&cfg);
+        hw.level = Box::new(|_| 0.02);
+        hw.tweak = Some(Box::new(move |n, w| {
+            if n == 30 {
+                for (i, f) in w.chunks_exact_mut(ch).enumerate() {
+                    let p = if i < 1920 { 25.0 } else { -20.0 };
+                    f[vc] = word(7.0, 14.0);
+                    f[ic] = word(p / 7.0, 3.75);
+                }
+            }
+        }));
+        let mut g = Guard::start(&mut hw, &cfg, cfg.globals.max_reduction, Some(vi_state(&cfg, 119.0, 50.0 + 69.0 * 200.0 / 304.9))).unwrap();
+        let mut at = None;
+        while hw.t < secs(4.0) {
+            let pings = hw.pings.len();
+            g.tick(&mut hw).unwrap();
+            if asahi(&g).iter().any(|a| a.hard) {
+                assert_eq!(hw.pings.len(), pings, "renewed with a latched model at {:?}", hw.t);
+            }
+            if at.is_none() && hw.delivered == 31 {
+                at = Some(hw.t);
+                assert!(asahi(&g)[k].hard, "the crossing did not latch");
+                assert!(!g.armed(), "armed after the model may have reached the hard limit");
+                assert!(asahi(&g)[k].th.t_coil >= 150.0, "the period's last samples cooled the model back");
+            }
+        }
+        let at = at.unwrap();
+        assert!(!hw.pings.iter().any(|&p| p >= at && p < at + secs(1.0)), "renewed after the latch");
+    }
+
+    /// Review F5 and R8 on a V/I machine: a missing state started the asahi
+    /// models at speakersafetyd's 119 C cold boot.  It starts latched at the
+    /// limit, and so does a clean stop of a run without the engine.
+    #[test]
+    fn vi_a_missing_state_starts_latched() {
+        let cfg = j413();
+        let mut hw = FakeHw::per_speaker(&cfg);
+        let g = Guard::start(&mut hw, &cfg, cfg.globals.max_reduction, missing_state()).unwrap();
+        assert!(asahi(&g).iter().all(|a| a.hard && a.th.t_coil >= 150.0), "{:?}", asahi(&g)[0].th);
+        let path = tmp_state().unwrap();
+        let mut sp: Vec<SpeakerState> = cfg.speakers.iter().map(|s| SpeakerState::new(s.clone(), cfg.globals.t_ambient)).collect();
+        for s in sp.iter_mut() {
+            s.resume(60.0, 55.0, 0.0, 0.0);
+        }
+        std::fs::write(&path, state::encode(hw.boot, hw.boot, &sp, false, true)).unwrap();
+        let mut hw = FakeHw::per_speaker(&cfg);
+        let g = Guard::start(&mut hw, &cfg, cfg.globals.max_reduction, Some(path)).unwrap();
+        assert!(asahi(&g).iter().all(|a| a.hard));
+        assert!(g.speakers.iter().all(|s| !s.hard && s.t_coil < 61.0));
+    }
+
+    /// Review F5 and r3 T4 on the engine: a held snapshot is not resumed.
+    /// 0.1.6 (and PR #6) cooled the time after it as silence; whatever the
+    /// paused lease let play is not bounded by it.
+    #[test]
+    fn vi_a_held_snapshot_restarts_latched() {
+        let cfg = j413();
+        let path = vi_state(&cfg, 119.0, 95.0);
+        let text = std::fs::read_to_string(&path).unwrap().replace("armed 0\nreleased 1", "armed 1\nreleased 0");
+        std::fs::write(&path, text).unwrap();
+        let mut hw = FakeHw::per_speaker(&cfg);
+        hw.boot += secs(1.0);
+        let g = Guard::start(&mut hw, &cfg, cfg.globals.max_reduction, Some(path)).unwrap();
+        assert!(asahi(&g).iter().all(|a| a.hard && a.th.t_coil >= 150.0));
+    }
+
+    /// Review F5: speakersafetyd's own warm-boot flag says it ran this boot
+    /// and may have driven the speakers after this daemon's last state.  A
+    /// clean stop's state of this daemon does not outweigh it.
+    #[test]
+    fn speakersafetyds_flag_starts_every_model_latched() {
+        let cfg = j413();
+        let path = vi_state(&cfg, 55.0, 52.0);
+        let flag = path.with_file_name("speakersafetyd.flag");
+        let mut hw = FakeHw::per_speaker(&cfg);
+        let g = Guard::start_with(&mut hw, &cfg, cfg.globals.max_reduction, Some(path.clone()), std::slice::from_ref(&flag)).unwrap();
+        assert!(asahi(&g).iter().all(|a| !a.hard), "latched without the flag");
+        std::fs::write(&flag, "started").unwrap();
+        let mut hw = FakeHw::per_speaker(&cfg);
+        let g = Guard::start_with(&mut hw, &cfg, cfg.globals.max_reduction, Some(path), &[flag]).unwrap();
+        assert!(asahi(&g).iter().all(|a| a.hard && a.th.t_coil >= 150.0));
+        assert!(g.speakers.iter().all(|s| s.hard));
+    }
+
+    /// Review F6 on the engine: a complete period after lost time erased it
+    /// (the tweeter cooled from 120.4 to 119.3 C).  The loss is charged,
+    /// which on the J413's tweeter at full gain latches it; a queued
+    /// backlog is measured, not charged.
+    #[test]
+    fn vi_a_period_after_lost_time_does_not_erase_it() {
+        let cfg = j413();
+        let k = idx(&cfg, "Left Woofer");
+        let run = |delay: bool, lossy: bool| {
+            let mut hw = FakeHw::per_speaker(&cfg);
+            hw.level = Box::new(|_| 0.03);
+            hw.lossy = lossy;
+            if delay {
+                hw.control_delay = Box::new(|t| if (secs(2.0)..secs(2.05)).contains(&t) { Duration::from_millis(240) } else { Duration::ZERO });
+            }
+            let mut g = Guard::start(&mut hw, &cfg, cfg.globals.max_reduction, Some(vi_state(&cfg, 55.0, 52.0))).unwrap();
+            run_until(&mut g, &mut hw, secs(2.6)).unwrap();
+            (asahi(&g)[k].th.t_coil, asahi(&g).iter().any(|a| a.hard))
+        };
+        let ((clean, _), (queued, queued_hard), (lost, lost_hard)) = (run(false, false), run(true, false), run(true, true));
+        assert!((queued - clean).abs() < 0.5 && !queued_hard, "a queued backlog was charged: {queued:.2} vs {clean:.2} C");
+        assert!(lost > clean + 5.0, "lost time was not charged: {lost:.2} vs {clean:.2} C");
+        assert!(lost_hard, "155 ms at full gain did not latch the tweeter's model");
+    }
+
+    /// Review R6 on the engine: 1.5 ms losses before silent periods are
+    /// charged, not filled with the next period's power.
+    #[test]
+    fn vi_small_gaps_are_charged_on_the_engine_too() {
+        let cfg = j413();
+        let k = idx(&cfg, "Left Woofer");
+        let mut hw = FakeHw::per_speaker(&cfg);
+        let mut g = Guard::start(&mut hw, &cfg, 40.0, Some(vi_state(&cfg, 55.0, 52.0))).unwrap();
+        g.rate = 48000;
+        g.written = vec![0.0; 4];
+        g.written_hi = g.written.clone();
+        let t0 = hw.now();
+        g.gains = vec![Gain { at: t0, lo: vec![0.0; 4], hi: vec![0.0; 4], kernel: false }];
+        // a lease held by hand: the card applies the controls
+        g.locked_at = None;
+        g.verified_at = t0;
+        g.account_to = t0;
+        for w in g.words.iter_mut() {
+            *w = 0;
+        }
+        let mut reference = Engine::new(&cfg, false).unwrap();
+        reference.asahi.as_mut().unwrap()[k] = asahi(&g)[k].clone();
+        let zeros = vec![0i32; cfg.globals.channels * 4096];
+        let dt = Duration::from_secs_f64(4096.0 / 48000.0);
+        let mut end = t0;
+        for _ in 0..200 {
+            end += Duration::from_micros(1500) + dt;
+            g.measure(end, 4096).unwrap();
+            reference.worst(0.0015, &[0.0; 4]);
+            reference.measured(&zeros, 4096, 4096, 4096, 0, dt.as_secs_f64() / 4096.0, 1.0, &vec![vec![(0.0, 0.0)]; 4]);
+        }
+        let want = reference.asahi.as_ref().unwrap()[k].th.t_coil;
+        let got = asahi(&g)[k].th.t_coil;
+        // the same charges and frames (to the nanoseconds of the clock)
+        assert!(got >= want - 1e-3, "after losses {got:.4} C, charged {want:.4} C");
+        assert!(got > 55.0 + 1.0, "{got}");
+    }
+
+    /// Review F8: the unqualified machines (the J616, and the J316 and J413
+    /// until they are qualified on the device) are not governed, and their
+    /// card is not touched, without --allow-unqualified; udev starts the
+    /// daemon on none of them.
+    #[test]
+    fn an_unqualified_machine_is_not_governed() {
+        for text in [J616, J316, J413] {
+            let mut cfg = Config::parse(text).unwrap();
+            let mut hw = FakeHw::per_speaker(&cfg);
+            assert!(Guard::start(&mut hw, &cfg, 7.0, tmp_state()).is_err());
+            assert!(!hw.locked, "the interlock was taken");
+            cfg.allow_unqualified = true;
+            assert!(Guard::start(&mut hw, &cfg, 7.0, tmp_state()).is_ok());
+        }
+        let rules = include_str!("../95-speakerguardd.rules");
+        let starts: Vec<&str> = rules.lines().filter(|l| l.contains("SYSTEMD_WANTS")).collect();
+        for m in ["J616", "J316", "J413"] {
+            assert!(starts.iter().all(|l| !l.contains(m)), "udev starts the daemon on the {m}: {starts:?}");
+        }
+        assert!(starts.iter().any(|l| l.contains("AppleJ700")));
+    }
+
+    /// The unified governor is shadow-only: it does not govern without its
+    /// opt-in, and as a shadow it changes nothing the legacy governor does.
+    #[test]
+    fn the_unified_governor_is_shadow_only() {
+        let mut cfg = j700();
+        cfg.globals.governor = Governor::Unified;
+        let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
+        assert!(Guard::start(&mut hw, &cfg, 20.0, tmp_state()).is_err());
+        cfg.allow_unified = true;
+        let g = Guard::start(&mut hw, &cfg, 20.0, tmp_state()).unwrap();
+        assert_eq!(g.governing, Governor::Unified);
+        let writes = |shadow: bool| {
+            let mut cfg = j700();
+            cfg.globals.shadow = shadow;
+            let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
+            hw.level = Box::new(|_| 0.6);
+            let path = tmp_state();
+            let mut g = Guard::start(&mut hw, &cfg, 20.0, path.clone()).unwrap();
+            run_until(&mut g, &mut hw, secs(15.0)).unwrap();
+            let log = path.unwrap().with_file_name("shadow.jsonl");
+            (hw.writes.clone(), hw.pings.clone(), std::fs::read_to_string(log).map(|t| t.lines().count()).unwrap_or(0))
+        };
+        let ((w0, p0, l0), (w1, p1, l1)) = (writes(false), writes(true));
+        assert_eq!(w0, w1, "the shadow changed the legacy governor's writes");
+        assert_eq!(p0, p1);
+        assert_eq!(l0, 0);
+        assert!(l1 >= 10, "{l1} shadow lines");
+    }
+
+    /// Group linking and per-speaker writes: a hot tweeter and cool woofers
+    /// on the J316 get their own group's reduction, the same on both sides.
+    #[test]
+    fn per_speaker_reductions_are_linked_by_group() {
+        let mut cfg = Config::parse(J316).unwrap();
+        cfg.allow_unqualified = true;
+        let path = vi_state(&cfg, 55.0, 52.0);
+        let mut hw = FakeHw::per_speaker(&cfg);
+        hw.playing = Box::new(|_| false);
+        let mut g = Guard::start(&mut hw, &cfg, cfg.globals.max_reduction, Some(path)).unwrap();
+        run_until(&mut g, &mut hw, secs(1.0)).unwrap();
+        assert!(g.armed());
+        let (lt, rt, lw) = (idx(&cfg, "Left Tweeter"), idx(&cfg, "Right Tweeter"), idx(&cfg, "Left Woofer 1"));
+        {
+            let a = &mut g.engine.as_mut().unwrap().asahi.as_mut().unwrap()[lt];
+            a.th.t_coil = 124.0;
+            a.th.t_magnet = 123.0;
+            a.coil_peak = 124.0;
+            a.magnet_peak = 123.0;
+        }
+        run_until(&mut g, &mut hw, secs(1.3)).unwrap();
+        assert!(g.armed());
+        assert!(hw.per[lt] > 0.5 && hw.per[lt] == hw.per[rt], "{:?}", hw.per);
+        assert_eq!(hw.per[lw], 0.0, "{:?}", hw.per);
+    }
+
+    /// r3 T2 and T3 on the engine: the hand-off gives the lock up and writes
+    /// nothing, and time around it is charged at each control's least
+    /// reduction since the last verified boundary: woofers at 0 dB and
+    /// tweeters at 6 dB stay so, before the hand-off and after it.
+    #[test]
+    fn vi_time_around_a_hand_off_is_charged_per_speaker_at_the_least_held() {
+        let cfg = j413();
+        let mut hw = FakeHw::per_speaker(&cfg);
+        let mut g = Guard::start(&mut hw, &cfg, 40.0, Some(vi_state(&cfg, 60.0, 55.0))).unwrap();
+        let (lt, lw) = (idx(&cfg, "Left Tweeter"), idx(&cfg, "Left Woofer"));
+        let mut per = vec![0.0; 4];
+        per[lt] = 6.0;
+        per[idx(&cfg, "Right Tweeter")] = 6.0;
+        g.rate = 48000;
+        g.armed = true;
+        g.written = per.clone();
+        g.written_hi = g.written.clone();
+        let t0 = hw.now();
+        g.gains = vec![Gain { at: t0, lo: per.clone(), hi: per.clone(), kernel: false }];
+        // a lease held by hand: the card applies the controls
+        g.locked_at = None;
+        g.verified_at = t0;
+        g.account_to = t0;
+        let writes = hw.writes.len();
+        hw.t += Duration::from_millis(150);
+        g.disarm(&mut hw, "test").unwrap();
+        assert_eq!(hw.relinquished, 1, "the hand-off gave the lock up");
+        assert_eq!(hw.writes.len(), writes, "the hand-off wrote the controls");
+        for d in [0.15, 0.1] {
+            let before = asahi(&g).clone();
+            hw.t += Duration::from_millis(if d == 0.1 { 100 } else { 0 });
+            g.charge(hw.now()).unwrap();
+            for k in [lt, lw] {
+                let mut want = before[k].clone();
+                want.th.hold(vi_worst(&cfg, k, per[k]), d, cfg.globals.t_ambient);
+                assert!((asahi(&g)[k].th.t_coil - want.th.t_coil).abs() < 1e-9, "speaker {k} over {d} s");
+            }
+        }
+    }
+
+    /// r3 T1 on the engine: a stream that opens and closes while the event
+    /// wake is late is charged whole, for the measured-power models too.
+    #[test]
+    fn vi_a_late_event_wake_charges_the_whole_interval() {
+        let cfg = j413();
+        let k = idx(&cfg, "Left Woofer");
+        let playing = |t: Duration| (10..90).contains(&(t.as_millis() % 100));
+        let mut inner = FakeHw::per_speaker(&cfg);
+        inner.playing = Box::new(playing);
+        inner.level = Box::new(|_| 0.85);
+        let mut hw = DelayedWait { hw: inner };
+        let mut g = Guard::start(&mut hw, &cfg, 40.0, Some(vi_state(&cfg, 55.0, 52.0))).unwrap();
+        let mut reference = asahi(&g)[k].clone();
+        let t0 = hw.hw.t0;
+        let mut ref_to = g.account_to - t0;
+        for _ in 0..120 {
+            let gain = hw.hw.effective_of(k);
+            g.tick(&mut hw).unwrap();
+            let to = g.account_to - t0;
+            let mut at = ref_to;
+            while at < to {
+                let d = Duration::from_micros(500).min(to - at);
+                let p = if playing(at) { vi_worst(&cfg, k, gain) } else { 0.0 };
+                reference.th.hold(p, d.as_secs_f64(), cfg.globals.t_ambient);
+                at += d;
+            }
+            ref_to = to;
+            assert!(asahi(&g)[k].th.t_coil >= reference.th.t_coil - 0.5, "at {to:?}: model {:.2} C, charged reference {:.2} C", asahi(&g)[k].th.t_coil, reference.th.t_coil);
+        }
+    }
+
+    /// r3 T1 on a V/I machine without events: never armed.
+    #[test]
+    fn vi_without_control_events_the_lock_is_never_taken() {
+        let cfg = j413();
+        let mut hw = FakeHw::per_speaker(&cfg);
+        hw.events = false;
+        hw.playing = Box::new(|t| (10..90).contains(&(t.as_millis() % 100)));
+        let mut g = Guard::start(&mut hw, &cfg, cfg.globals.max_reduction, Some(vi_state(&cfg, 55.0, 52.0))).unwrap();
+        run_until(&mut g, &mut hw, secs(3.0)).unwrap();
+        assert!(hw.pings.is_empty() && !g.armed(), "{} pings", hw.pings.len());
+    }
+
+    /// r3 T2 on the engine: a clean stop with pending time accounts it for
+    /// the engine's models too before its final state, and that state
+    /// resumes them.
+    #[test]
+    fn vi_a_clean_stop_accounts_the_engine_before_its_final_state() {
+        let cfg = j413();
+        let k = idx(&cfg, "Left Woofer");
+        let path = vi_state(&cfg, 90.0, 80.0);
+        let mut hw = FakeHw::per_speaker(&cfg);
+        hw.level = Box::new(|_| 0.0);
+        let mut g = Guard::start(&mut hw, &cfg, 40.0, Some(path.clone())).unwrap();
+        run_until(&mut g, &mut hw, secs(1.0)).unwrap();
+        hw.sensing = Box::new(|_| false);
+        g.tick(&mut hw).unwrap();
+        let lag = hw.now() - g.account_to;
+        assert!(lag >= secs(0.049));
+        let mut reference = asahi(&g)[k].clone();
+        reference.th.hold(vi_worst(&cfg, k, 0.0), lag.as_secs_f64(), cfg.globals.t_ambient);
+        g.stop(&mut hw).unwrap();
+        while !g.released(&hw) {
+            g.tick(&mut hw).unwrap();
+        }
+        g.final_save(&hw).unwrap();
+        let saved = state::decode(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(saved.proven() && saved.asahi.len() == 4);
+        let mut e = Engine::new(&cfg, false).unwrap();
+        assert!(state::restore_engine(&mut e, &saved, hw.boottime(), &cfg.globals));
+        let restored = e.asahi.as_ref().unwrap()[k].th.t_coil;
+        assert!(restored >= reference.th.t_coil - 2.0, "restored {restored:.3} C, the pending interval alone needs {:.3} C", reference.th.t_coil);
+    }
+
+    /// r3 T6 on the engine: frames over time already charged add nothing,
+    /// and frames partly over it count only for the rest, at the most power
+    /// of the blocks that cover it.
+    #[test]
+    fn vi_frames_over_charged_time_add_nothing_to_the_engine() {
+        let cfg = j413();
+        let mut hw = FakeHw::per_speaker(&cfg);
+        let mut g = Guard::start(&mut hw, &cfg, 40.0, Some(vi_state(&cfg, 123.0, 100.0))).unwrap();
+        g.rate = 48000;
+        g.written = vec![99.5; 4];
+        g.written_hi = g.written.clone();
+        let t0 = hw.now();
+        g.gains = vec![Gain { at: t0, lo: vec![99.5; 4], hi: vec![99.5; 4], kernel: false }];
+        // a lease held by hand: the card applies the controls
+        g.locked_at = None;
+        g.verified_at = t0;
+        g.account_to = t0;
+        hw.sleep(secs(0.3));
+        g.charge(hw.now()).unwrap();
+        let after = asahi(&g).clone();
+        for w in g.words.iter_mut() {
+            *w = 0;
+        }
+        for i in 1..=3 {
+            g.measure(t0 + secs(i as f64 * 4096.0 / 48000.0), 4096).unwrap();
+        }
+        for (k, a) in after.iter().enumerate() {
+            assert_eq!(asahi(&g)[k].th, a.th, "already charged time was integrated again (speaker {k})");
+        }
+        // partly over: the first half quiet and the second loud, the last
+        // quarter not yet accounted: those frames, sample by sample (the
+        // oldest of them for its new part only)
+        let k = idx(&cfg, "Left Woofer");
+        let (vc, ic) = (cfg.speakers[k].vs_chan, cfg.speakers[k].is_chan.unwrap());
+        let ch = cfg.globals.channels;
+        for (i, f) in g.words.chunks_exact_mut(ch).enumerate() {
+            let on = i >= 2048;
+            f[vc] = if on { word(4.0, 14.0) } else { 0 };
+            f[ic] = if on { word(1.0, 3.75) } else { 0 };
+        }
+        let quarter = secs(4096.0 / 48000.0 / 4.0);
+        let start = g.account_to;
+        let before = asahi(&g)[k].clone();
+        g.measure(start + quarter, 4096).unwrap();
+        let mut want = before.th.clone();
+        let p = (word(4.0, 14.0) as f64 / 2147483648.0 * 14.0) * (word(1.0, 3.75) as f64 / 2147483648.0 * 3.75) * crate::engine::ASAHI_MARGIN;
+        let new = quarter.as_secs_f64() * 48000.0;
+        let n = new.ceil() as usize;
+        for i in 0..n {
+            let h = if i == 0 { (new - (n - 1) as f64) / 48000.0 } else { 1.0 / 48000.0 };
+            let (ac, am) = (h / (want.tau_coil + h), h / (want.tau_magnet + h));
+            let (tc, tm) = (want.t_magnet + p * want.tr_coil, cfg.globals.t_ambient + p * want.tr_magnet);
+            want.t_coil = tc * ac + want.t_coil * (1.0 - ac);
+            want.t_magnet = tm * am + want.t_magnet * (1.0 - am);
+        }
+        assert!((asahi(&g)[k].th.t_coil - want.t_coil).abs() < 1e-9, "{} vs {}", asahi(&g)[k].th.t_coil, want.t_coil);
+        assert_eq!(g.account_to, start + quarter);
+    }
+
+    /// Review R4 on the engine: an asahi latch saved with the coil still
+    /// over the working ceiling holds after a restart until it is under it.
+    #[test]
+    fn vi_a_latched_state_is_honoured_after_a_restart() {
+        let cfg = j413();
+        let path = missing_state().unwrap();
+        let g0 = &cfg.globals;
+        let mut sp: Vec<SpeakerState> = cfg.speakers.iter().map(|s| SpeakerState::new(s.clone(), g0.t_ambient)).collect();
+        for s in sp.iter_mut() {
+            s.resume(60.0, 55.0, 0.0, 0.0);
+        }
+        let mut e = Engine::new(&cfg, false).unwrap();
+        for a in e.asahi.as_mut().unwrap() {
+            a.th.t_coil = 60.0;
+            a.th.t_magnet = 55.0;
+        }
+        let k = idx(&cfg, "Left Tweeter");
+        {
+            let a = &mut e.asahi.as_mut().unwrap()[k];
+            a.th.t_coil = 145.0;
+            a.th.t_magnet = 100.0;
+            a.coil_peak = 152.0;
+            a.coil_hyst = 150.0;
+            a.hard = true;
+        }
+        let mut hw = FakeHw::per_speaker(&cfg);
+        hw.playing = Box::new(|_| false);
+        std::fs::write(&path, state::encode_with(hw.boot, hw.boot, &sp, Some(&e), false, true)).unwrap();
+        hw.boot += Duration::from_millis(50);
+        let mut g = Guard::start(&mut hw, &cfg, cfg.globals.max_reduction, Some(path)).unwrap();
+        assert!(asahi(&g)[k].hard, "the latch was lost");
+        while hw.pings.is_empty() && hw.t < secs(30.0) {
+            g.tick(&mut hw).unwrap();
+        }
+        assert!(!hw.pings.is_empty(), "never rearmed");
+        assert!(asahi(&g)[k].th.t_coil < 140.0, "rearmed at {:.2} C", asahi(&g)[k].th.t_coil);
+    }
+
     // ---- 0.1.9: the PR #7 fourth review's witnesses (r4), as safe outcomes ----
 
     /// A sample-rate read the daemon is descheduled in: its change event
@@ -2979,6 +4299,7 @@ mod tests {
         fn ping(&mut self) -> io::Result<()> { self.hw.ping() }
         fn set_min(&mut self) -> io::Result<()> { self.hw.set_min() }
         fn set_reduction(&mut self, d: f64) -> io::Result<f64> { self.hw.set_reduction(d) }
+        fn set_reductions(&mut self, d: &[f64]) -> io::Result<Vec<f64>> { self.hw.set_reductions(d) }
         fn relinquish(&mut self) -> io::Result<()> { self.hw.relinquish() }
         fn sample_rate(&mut self) -> io::Result<i64> {
             if self.enable {
@@ -3137,9 +4458,11 @@ mod tests {
         let mut g = Guard::start(&mut hw, &cfg, 20.0, tmp_state()).unwrap();
         let t0 = hw.now();
         g.rate = 48000;
-        g.written = 0.0;
-        g.written_hi = 0.0;
-        g.gains = vec![Gain { at: t0 - secs(0.1), lo: 20.0, hi: 20.0, kernel: false }, Gain { at: t0, lo: 0.0, hi: 0.0, kernel: false }];
+        g.written = vec![0.0; 2];
+        g.written_hi = g.written.clone();
+        g.gains = vec![Gain { at: t0 - secs(0.1), lo: vec![20.0; 2], hi: vec![20.0; 2], kernel: false }, Gain { at: t0, lo: vec![0.0; 2], hi: vec![0.0; 2], kernel: false }];
+        // a lease held by hand: the card applies the controls
+        g.locked_at = None;
         g.verified_at = t0;
         g.account_to = t0;
         for w in &mut g.words {
@@ -3168,9 +4491,9 @@ mod tests {
         let mut g = Guard::start(&mut hw, &cfg, 20.0, tmp_state()).unwrap();
         let t0 = hw.now();
         g.rate = 48000;
-        g.written = 0.0;
-        g.written_hi = 0.0;
-        g.gains = vec![Gain { at: t0, lo: 0.0, hi: 0.0, kernel: true }];
+        g.written = vec![0.0; 2];
+        g.written_hi = g.written.clone();
+        g.gains = vec![Gain { at: t0, lo: vec![0.0; 2], hi: vec![0.0; 2], kernel: true }];
         g.verified_at = t0;
         g.account_to = t0;
         for w in &mut g.words {
@@ -3198,9 +4521,11 @@ mod tests {
         let mut g = Guard::start(&mut hw, &cfg, 20.0, tmp_state()).unwrap();
         let t0 = hw.now();
         g.rate = 48000;
-        g.written = 0.0;
-        g.written_hi = 0.0;
-        g.gains = vec![Gain { at: t0 - secs(0.2), lo: MUTE_DB, hi: MUTE_DB, kernel: true }, Gain { at: t0 - secs(0.2), lo: MUTE_DB, hi: MUTE_DB, kernel: false }, Gain { at: t0 - secs(0.2), lo: 0.0, hi: 0.0, kernel: false }];
+        g.written = vec![0.0; 2];
+        g.written_hi = g.written.clone();
+        g.gains = vec![Gain { at: t0 - secs(0.2), lo: vec![MUTE_DB; 2], hi: vec![MUTE_DB; 2], kernel: true }, Gain { at: t0 - secs(0.2), lo: vec![MUTE_DB; 2], hi: vec![MUTE_DB; 2], kernel: false }, Gain { at: t0 - secs(0.2), lo: vec![0.0; 2], hi: vec![0.0; 2], kernel: false }];
+        // a lease held by hand: the card applies the controls
+        g.locked_at = None;
         g.verified_at = t0;
         g.account_to = t0;
         for w in &mut g.words {
@@ -3234,8 +4559,8 @@ mod tests {
             assert!(!s.hard && s.reduction_db < 17.0);
         }
         hw.set_reduction(6.0).unwrap();
-        g.written = 6.0;
-        g.written_hi = 6.0;
+        g.written = vec![6.0; 2];
+        g.written_hi = g.written.clone();
         g.note_written(hw.now());
         hw.sleep(secs(0.195));
         let before = hw.pings.len();
@@ -3264,6 +4589,7 @@ mod tests {
         fn ping(&mut self) -> io::Result<()> { self.hw.ping() }
         fn set_min(&mut self) -> io::Result<()> { self.hw.set_min() }
         fn set_reduction(&mut self, d: f64) -> io::Result<f64> { self.hw.set_reduction(d) }
+        fn set_reductions(&mut self, d: &[f64]) -> io::Result<Vec<f64>> { self.hw.set_reductions(d) }
         fn relinquish(&mut self) -> io::Result<()> { self.hw.relinquish() }
         fn sample_rate(&mut self) -> io::Result<i64> { self.hw.sample_rate() }
         fn open_sense(&mut self, r: u32) -> io::Result<()> { self.hw.open_sense(r) }
@@ -3305,6 +4631,156 @@ mod tests {
         hw3.boot = hw2.boottime() + secs(0.5);
         let g3 = Guard::start(&mut hw3, &cfg, 20.0, Some(p)).unwrap();
         assert!(g3.speakers[0].hard, "the clean stop was resumed twice");
+    }
+
+    // ---- the PR #8 review's V/I witnesses (P8-2, P8-3), as safe outcomes ----
+
+    /// A card whose closing tail is scripted.
+    struct TailHw {
+        hw: FakeHw,
+        tail: Option<Vec<i32>>,
+    }
+    impl Hw for TailHw {
+        fn now(&self) -> Instant { self.hw.now() }
+        fn boottime(&self) -> Duration { self.hw.boottime() }
+        fn sleep(&mut self, d: Duration) { self.hw.sleep(d) }
+        fn take_lock(&mut self) -> io::Result<()> { self.hw.take_lock() }
+        fn ping(&mut self) -> io::Result<()> { self.hw.ping() }
+        fn set_min(&mut self) -> io::Result<()> { self.hw.set_min() }
+        fn set_reduction(&mut self, d: f64) -> io::Result<f64> { self.hw.set_reduction(d) }
+        fn set_reductions(&mut self, d: &[f64]) -> io::Result<Vec<f64>> { self.hw.set_reductions(d) }
+        fn relinquish(&mut self) -> io::Result<()> { self.hw.relinquish() }
+        fn sample_rate(&mut self) -> io::Result<i64> { self.hw.sample_rate() }
+        fn open_sense(&mut self, r: u32) -> io::Result<()> { self.hw.open_sense(r) }
+        fn close_sense(&mut self) { self.hw.close_sense() }
+        fn read_period(&mut self, w: &mut [i32]) -> io::Result<Option<bool>> { self.hw.read_period(w) }
+        fn queued(&mut self) -> io::Result<u64> { Ok(0) }
+        fn read_tail(&mut self, w: &mut [i32]) -> io::Result<usize> {
+            match self.tail.take() {
+                Some(t) => {
+                    w[..t.len()].copy_from_slice(&t);
+                    Ok(t.len() / self.hw.channels)
+                }
+                None => Ok(0),
+            }
+        }
+        fn wait_rate_change(&mut self, d: Duration) -> bool { self.hw.wait_rate_change(d) }
+        fn rate_events(&mut self) -> bool { self.hw.rate_events() }
+        fn events_available(&self) -> bool { true }
+    }
+
+    /// Review P8-2: a closing tail with negative V*I handed the card off,
+    /// then the idle look in the same pass took it back with no good period
+    /// since.  After bad sense data REARM_PERIODS valid periods come first,
+    /// idle or not.
+    #[test]
+    fn bad_sense_data_at_close_is_not_followed_by_an_idle_rearm() {
+        let c = j413();
+        let mut hw = TailHw { hw: FakeHw::per_speaker(&c), tail: None };
+        hw.hw.level = Box::new(|_| 0.001);
+        let mut g = Guard::start(&mut hw, &c, 7.0, Some(vi_state(&c, 55.0, 52.0))).unwrap();
+        for _ in 0..20 {
+            g.tick(&mut hw).unwrap();
+            if g.armed() {
+                break;
+            }
+        }
+        assert!(g.armed());
+        let mut tail = vec![0; 48 * c.globals.channels];
+        let s = &c.speakers[0];
+        for f in tail.chunks_exact_mut(c.globals.channels) {
+            f[s.vs_chan] = word(1.0, 14.0);
+            f[s.is_chan.unwrap()] = word(-0.1, 3.75);
+        }
+        hw.tail = Some(tail);
+        hw.hw.playing = Box::new(|_| false);
+        hw.sleep(secs(0.001));
+        let pings = hw.hw.pings.len();
+        g.tick(&mut hw).unwrap();
+        assert!(g.bad_data && g.recovering, "the bad tail was not seen");
+        assert!(!g.armed() && hw.hw.pings.len() == pings, "rearmed in the pass that handed off for bad data");
+        // idle afterwards: still no lock without good periods
+        for _ in 0..40 {
+            g.tick(&mut hw).unwrap();
+        }
+        assert!(!g.armed(), "an idle look took the lock back after bad data");
+    }
+
+    /// Review P8-3: a whole period, contiguous with the last, whose
+    /// Duration rounding made it look partial, was integrated as its
+    /// blocks' means (a +/- 25 W pair in one block cancelled): no latch at
+    /// 149 C where the samples cross 150 C, 0 dB at 119 C where 2.1 dB is
+    /// needed.  Every frame over new time is integrated sample by sample.
+    #[test]
+    fn a_whole_period_is_integrated_sample_by_sample_whatever_the_rounding() {
+        let c = j413();
+        let k = idx(&c, "Left Tweeter");
+        let s = c.speakers[k].clone();
+        let dt = 4096.0 / 48000.0;
+        for tc in [149.0, 119.0] {
+            let p = vi_state(&c, tc, 100.0);
+            let saved = state::decode(&std::fs::read_to_string(&p).unwrap()).unwrap();
+            let mut hw = FakeHw::per_speaker(&c);
+            let mut g = Guard::start(&mut hw, &c, 40.0, Some(p)).unwrap();
+            g.rate = 48000;
+            for (i, f) in g.words.chunks_exact_mut(c.globals.channels).enumerate() {
+                if i >= 3840 {
+                    f[s.vs_chan] = word(7.0, 14.0);
+                    f[s.is_chan.unwrap()] = word(if i < 3968 { 25.0 / 7.0 } else { -25.0 / 7.0 }, 3.75);
+                }
+            }
+            g.check_sense(4096).unwrap();
+            let mut reference = Engine::new(&c, false).unwrap();
+            state::restore_engine(&mut reference, &saved, hw.boottime(), &c.globals);
+            reference.check(&g.words, 48000.0).unwrap();
+            reference.measured(&g.words, 4096, 4096, 4096, 0, 1.0 / 48000.0, 1.0, &vec![vec![(0.0, 0.0)]; c.speakers.len()]);
+            let end = hw.now() + secs(dt);
+            g.measure(end, 4096).unwrap();
+            let (got, want) = (&asahi(&g)[k], &reference.asahi.as_ref().unwrap()[k]);
+            assert_eq!(got.hard, want.hard, "{tc} C: the latch");
+            assert!(got.coil_peak >= want.coil_peak - 1e-6, "{tc} C: peak {} vs samplewise {}", got.coil_peak, want.coil_peak);
+            assert!(got.gain <= want.gain + 1e-9, "{tc} C: {} dB vs samplewise {} dB", -got.gain, -want.gain);
+            // and against the review's own sample-by-sample integration
+            if tc > 140.0 {
+                assert!(got.hard, "149 C: the samples cross 150 C");
+            } else {
+                assert!(-got.gain >= 2.0, "119 C: {} dB where the samples need 2.07 dB", -got.gain);
+            }
+        }
+    }
+
+    /// The same where only the last 256 frames are new: they are integrated
+    /// sample by sample from where the account stood (0.2's rest path held
+    /// their blocks' means: no latch at 148 C where they cross 150 C).
+    #[test]
+    fn a_partly_accounted_period_integrates_its_new_frames_sample_by_sample() {
+        let c = j413();
+        let k = idx(&c, "Left Tweeter");
+        let s = c.speakers[k].clone();
+        let p = vi_state(&c, 148.0, 100.0);
+        let saved = state::decode(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        let mut hw = FakeHw::per_speaker(&c);
+        let mut g = Guard::start(&mut hw, &c, 40.0, Some(p)).unwrap();
+        g.rate = 48000;
+        for (i, f) in g.words.chunks_exact_mut(c.globals.channels).enumerate() {
+            if i >= 3840 {
+                f[s.vs_chan] = word(7.0, 14.0);
+                f[s.is_chan.unwrap()] = word(if i < 3968 { 25.0 / 7.0 } else { -25.0 / 7.0 }, 3.75);
+            }
+        }
+        g.check_sense(4096).unwrap();
+        let t0 = hw.now();
+        let end = t0 + Duration::from_nanos((256.0e9 / 48000.0) as u64 + 1);
+        g.account_to = t0;
+        let mut reference = Engine::new(&c, false).unwrap();
+        state::restore_engine(&mut reference, &saved, hw.boottime(), &c.globals);
+        let ch = c.globals.channels;
+        let tail = &g.words[(4096 - 256) * ch..4096 * ch];
+        reference.measured(tail, 256, 256, 256, 0, 1.0 / 48000.0, 1.0, &vec![vec![(0.0, 0.0)]; c.speakers.len()]);
+        g.measure(end, 4096).unwrap();
+        let (got, want) = (&asahi(&g)[k], &reference.asahi.as_ref().unwrap()[k]);
+        assert!(want.hard, "the samples cross the limit");
+        assert!(got.hard, "the new frames' crossing was not seen");
     }
 
     // ---- 0.1.10: the PR #7 fifth review's witnesses (r5), as safe outcomes ----
@@ -3372,9 +4848,11 @@ mod tests {
         let mut g = Guard::start(&mut hw, &cfg, 20.0, Some(p)).unwrap();
         let t0 = hw.now();
         g.rate = 48000;
-        g.written = 0.0;
-        g.written_hi = 0.0;
-        g.gains = vec![Gain { at: t0 - secs(0.2), lo: 20.0, hi: 20.0, kernel: false }, Gain { at: t0, lo: 0.0, hi: 0.0, kernel: false }];
+        g.written = vec![0.0; g.speakers.len()];
+        g.written_hi = vec![0.0; g.speakers.len()];
+        g.gains = vec![Gain { at: t0 - secs(0.2), lo: vec![20.0; g.speakers.len()], hi: vec![20.0; g.speakers.len()], kernel: false }, Gain { at: t0, lo: vec![0.0; g.speakers.len()], hi: vec![0.0; g.speakers.len()], kernel: false }];
+        // a lease held by hand: the card applies the controls
+        g.locked_at = None;
         g.account_to = t0;
         g.verified_at = t0;
         let full = g.speakers[0].worst_case_power(0.0);
@@ -3421,7 +4899,7 @@ mod tests {
             }
         }
         assert!(lowest >= required, "applied {lowest} dB, the input's budget needs {required} dB");
-        assert!(g.gains.iter().all(|e| !e.lo.is_finite() || e.lo >= MUTE_DB || (e.lo * 2.0).fract() == 0.0), "a requested value in the history: {:?}", g.gains);
+        assert!(g.gains.iter().all(|e| e.lo.iter().all(|&lo| !lo.is_finite() || lo >= MUTE_DB || (lo * 2.0).fract() == 0.0)), "a requested value in the history: {:?}", g.gains);
     }
 
     /// The clock reads of the final save, with a pause between the boot
@@ -3453,6 +4931,7 @@ mod tests {
         fn ping(&mut self) -> io::Result<()> { self.hw.ping() }
         fn set_min(&mut self) -> io::Result<()> { self.hw.set_min() }
         fn set_reduction(&mut self, d: f64) -> io::Result<f64> { self.hw.set_reduction(d) }
+        fn set_reductions(&mut self, d: &[f64]) -> io::Result<Vec<f64>> { self.hw.set_reductions(d) }
         fn relinquish(&mut self) -> io::Result<()> { self.hw.relinquish() }
         fn sample_rate(&mut self) -> io::Result<i64> { self.hw.sample_rate() }
         fn open_sense(&mut self, r: u32) -> io::Result<()> { self.hw.open_sense(r) }
@@ -3485,9 +4964,9 @@ mod tests {
                 s.hard = true;
                 s.govern(&cfg.globals);
             }
-            g.written = 20.0;
-            g.written_hi = 20.0;
-            g.gains = vec![Gain { at: hw.now() - secs(2.0), lo: 20.0, hi: 20.0, kernel: true }];
+            g.written = vec![20.0; g.speakers.len()];
+            g.written_hi = vec![20.0; g.speakers.len()];
+            g.gains = vec![Gain { at: hw.now() - secs(2.0), lo: vec![20.0; g.speakers.len()], hi: vec![20.0; g.speakers.len()], kernel: true }];
             g.verified_at = hw.now();
             g.account_to = hw.now();
             g.stop(&mut hw).unwrap();
@@ -3566,6 +5045,7 @@ mod tests {
         fn ping(&mut self) -> io::Result<()> { self.hw.ping() }
         fn set_min(&mut self) -> io::Result<()> { self.hw.set_min() }
         fn set_reduction(&mut self, d: f64) -> io::Result<f64> { self.hw.set_reduction(d) }
+        fn set_reductions(&mut self, d: &[f64]) -> io::Result<Vec<f64>> { self.hw.set_reductions(d) }
         fn relinquish(&mut self) -> io::Result<()> { self.hw.relinquish() }
         fn sample_rate(&mut self) -> io::Result<i64> { self.hw.sample_rate() }
         fn open_sense(&mut self, r: u32) -> io::Result<()> { self.hw.open_sense(r) }
@@ -3605,5 +5085,165 @@ mod tests {
         reference.step(0.0, (hw.hw.t - begin).as_secs_f64(), 50.0);
         reference.govern(&cfg.globals);
         assert!(hw.hw.reduction >= reference.reduction_db - 1e-6, "unlocked at {} dB, the other owner's run needs {} dB", hw.hw.reduction, reference.reduction_db);
+    }
+
+    #[test]
+    fn a_start_during_playback_costs_little() {
+        let cfg = j700();
+        let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
+        hw.level = Box::new(|_| 0.3);
+        let mut g = Guard::start(&mut hw, &cfg, 20.0, tmp_state()).unwrap();
+        run_until(&mut g, &mut hw, secs(10.0)).unwrap();
+        assert!(hw.writes.iter().all(|&(t, db)| db <= 1.0 && (t < secs(2.5) || db == 0.0)), "{:?}", hw.writes.iter().filter(|w| w.1 != 0.0).collect::<Vec<_>>());
+        assert!(hw.lapses.is_empty());
+    }
+
+    // ---- review r2 of speakerguardd#8 ----
+
+    /// Seeded sense noise for the V/I witnesses: `n` LSB either way on every
+    /// S16 word, on top of a per-channel offset of up to `dc` LSB, as the
+    /// M1 Pro's sense lines carry it.
+    pub fn sense_noise(channels: usize, n: i32, dc: i32, seed: u64) -> impl FnMut(&mut [i32]) {
+        let mut x = seed | 1;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let offsets: Vec<i32> = (0..channels).map(|_| if dc > 0 { (next() % (2 * dc as u64 + 1)) as i32 - dc } else { 0 }).collect();
+        move |w: &mut [i32]| {
+            for (i, v) in w.iter_mut().enumerate() {
+                let r = if n > 0 { (next() % (2 * n as u64 + 1)) as i32 - n } else { 0 };
+                *v = (r + offsets[i % channels]).clamp(-32768, 32767) << 16;
+            }
+        }
+    }
+
+    /// Review X1: after a hand-off the controls keep the governed value,
+    /// but the card holds its lock and so its safe level.  Once what was
+    /// converted before the hand-off has drained, uncovered time is charged
+    /// at each control's value or the safe level, whichever is more, until
+    /// the next renewal.  Before the drain it is charged at the controls'.
+    #[test]
+    fn vi_a_drained_hand_off_charges_at_the_safe_level() {
+        let cfg = j413();
+        let safe = cfg.globals.safe_reduction;
+        let mut hw = FakeHw::per_speaker(&cfg);
+        hw.level = Box::new(|_| 0.02);
+        let mut g = Guard::start(&mut hw, &cfg, cfg.globals.max_reduction, Some(vi_state(&cfg, 60.0, 55.0))).unwrap();
+        run_until(&mut g, &mut hw, secs(2.0)).unwrap();
+        assert!(g.armed() && hw.per.iter().all(|&p| p == 0.0), "{:?}", hw.per);
+        g.disarm(&mut hw, "a test hand-off").unwrap();
+        let handed = hw.t;
+        assert!(g.written.iter().all(|&w| w == 0.0), "the controls keep the governed value");
+        assert!(g.least_since(g.verified_at).iter().all(|&r| r == 0.0), "charged at the safe level before the drain");
+        // the card stays with the kernel (the ramp is not the point here)
+        g.max_reduction = 0.1;
+        while hw.t < handed + DRAIN + secs(0.3) {
+            g.tick(&mut hw).unwrap();
+            assert!(!g.armed());
+        }
+        assert!(g.verified_at >= g.locked_at.unwrap() + DRAIN, "no verified boundary after the drain");
+        assert_eq!(g.least_since(g.verified_at), vec![safe; cfg.speakers.len()]);
+        // a charge heats every model at the safe level's worst case
+        let ta = cfg.globals.t_ambient;
+        let before: Vec<_> = asahi(&g).iter().map(|a| a.th.clone()).collect();
+        let to = g.account_to + secs(0.2);
+        g.charge(to).unwrap();
+        for (k, (a, b)) in asahi(&g).iter().zip(before).enumerate() {
+            let mut want = b.clone();
+            want.hold(vi_worst(&cfg, k, safe), 0.2, ta);
+            assert!((a.th.t_coil - want.t_coil).abs() < 1e-9, "{}: charged to {} C, the safe level gives {} C", cfg.speakers[k].name, a.th.t_coil, want.t_coil);
+        }
+        // a renewal ends it
+        g.max_reduction = cfg.globals.max_reduction;
+        while !g.armed() && hw.t < secs(30.0) {
+            g.tick(&mut hw).unwrap();
+        }
+        assert!(g.armed() && g.locked_at.is_none());
+        assert!(g.least_since(g.verified_at).iter().all(|&r| r < safe));
+    }
+
+    /// Review X1: with the governed 0 dB still on the controls, a sense
+    /// outage latched the asahi tweeter, and the stream then played on at
+    /// the safe level.  Each period's sliver of uncovered time was charged
+    /// at 0 dB, which put the model back over the limit, and the next
+    /// negative V*I sample held it there: with +-1 LSB of noise the latch
+    /// never cleared and the lock was never taken back.  Now the latch
+    /// clears once the model is under the working limit, and the lock
+    /// comes back, whatever the noise.
+    #[test]
+    fn vi_a_latch_after_a_hand_off_clears_through_sense_noise() {
+        let cfg = j413();
+        let k = idx(&cfg, "Left Tweeter");
+        let ceiling = cfg.speakers[k].t_limit - cfg.speakers[k].t_headroom;
+        for (n, dc) in [(0, 0), (1, 0), (3, 2), (9, 10)] {
+            let mut hw = FakeHw::per_speaker(&cfg);
+            hw.level = Box::new(|_| 0.05);
+            let noisy = std::rc::Rc::new(std::cell::Cell::new(false));
+            let on = noisy.clone();
+            let mut noise = sense_noise(cfg.globals.channels, n, dc, 0x9e37_79b9 + n as u64);
+            hw.tweak = Some(Box::new(move |_, w| {
+                if on.get() {
+                    noise(w);
+                }
+            }));
+            let mut g = Guard::start(&mut hw, &cfg, cfg.globals.max_reduction, Some(vi_state(&cfg, 110.0, 100.0))).unwrap();
+            while !g.armed() && hw.t < secs(5.0) {
+                g.tick(&mut hw).unwrap();
+            }
+            assert!(g.armed() && hw.per.iter().all(|&p| p == 0.0), "not governing at 0 dB: {:?}", hw.per);
+            hw.sensing = Box::new(|_| false);
+            while !asahi(&g)[k].hard && hw.t < secs(30.0) {
+                g.tick(&mut hw).unwrap();
+            }
+            assert!(asahi(&g)[k].hard && asahi(&g)[k].th.t_coil >= 150.0, "the outage did not latch the tweeter");
+            let latched = hw.t;
+            hw.sensing = Box::new(|_| true);
+            noisy.set(true);
+            let (mut cleared, mut rearmed) = (None, None);
+            while hw.t < latched + secs(60.0) && rearmed.is_none() {
+                g.tick(&mut hw).unwrap();
+                let a = &asahi(&g)[k];
+                if cleared.is_none() && !g.engine.as_ref().unwrap().hard(Governor::Asahi) {
+                    cleared = Some(hw.t - latched);
+                    let hottest = a.th.t_coil.max(a.th.t_magnet).max(a.coil_peak).max(a.magnet_peak);
+                    assert!(hottest < ceiling, "+-{n} LSB: cleared at {hottest} C");
+                }
+                if g.armed() {
+                    rearmed = Some(hw.t - latched);
+                }
+            }
+            let cleared = cleared.unwrap_or_else(|| panic!("+-{n} LSB: the latch never cleared (tweeter {:.3} C)", asahi(&g)[k].th.t_coil));
+            let rearmed = rearmed.unwrap_or_else(|| panic!("+-{n} LSB: the lock was never taken back"));
+            assert!(cleared < secs(15.0) && rearmed < secs(30.0), "+-{n} LSB: cleared after {cleared:?}, taken back after {rearmed:?}");
+        }
+    }
+
+    /// Review X3: with nothing known (no state, as after every boot) the
+    /// V/I machines sat at the card's safe level for 163 s (J413) and
+    /// 127 s (J316) while the drain's magnet cooled.  The latched start now
+    /// holds the drain from coil and magnet at the limit
+    /// (engine::a_latched_start_bounds_every_past_it_stands_for), and the
+    /// lock comes back once the ramp allows, sooner.
+    #[test]
+    fn vi_a_start_with_nothing_known_takes_the_lock_back_sooner() {
+        let mut j316 = Config::parse(include_str!("../conf/apple/j316.conf")).unwrap();
+        j316.allow_unqualified = true;
+        for (cfg, within) in [(j413(), 70.0), (j316, 95.0)] {
+            let mut hw = FakeHw::per_speaker(&cfg);
+            hw.level = Box::new(|_| 0.0);
+            let mut g = Guard::start(&mut hw, &cfg, cfg.globals.max_reduction, missing_state()).unwrap();
+            assert!(asahi(&g).iter().all(|a| a.hard && a.th.t_coil >= 150.0));
+            while !g.armed() && hw.t < secs(300.0) {
+                g.tick(&mut hw).unwrap();
+            }
+            assert!(g.armed(), "{}: never taken back", cfg.speakers[0].name);
+            eprintln!("X3 {} speakers: the lock taken back after {:.1} s", cfg.speakers.len(), hw.t.as_secs_f64());
+            assert!(hw.t < secs(within), "{}: taken back after {:?}", cfg.speakers[0].name, hw.t);
+            let demand = g.engine.as_ref().unwrap().reductions(Governor::Asahi).into_iter().fold(0.0, f64::max);
+            assert!(demand < cfg.globals.max_reduction - REARM_MARGIN_DB);
+        }
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "speakerguardd"
-version = "0.1.0"
+version = "0.1.10"
 edition = "2021"
 license = "MIT"
 description = "Feed-forward speaker protection daemon for amplifiers without sense lines"

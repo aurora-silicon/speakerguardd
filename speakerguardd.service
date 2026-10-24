@@ -5,6 +5,13 @@ Description=Speaker Protection Daemon (feed-forward)
 # thermal model from /run/speakerguardd/state only after a clean stop, and
 # otherwise starts it at the coils' limit.  A crash loop gives up after five
 # attempts and leaves the speakers at that level.
+# One daemon owns the speaker sense PCM and the volume interlock: whichever
+# takes it first protects the speakers, and the other cannot start.  This
+# unit never stops another protection daemon (speakersafetyd on the
+# machines with V/I sense) to make room: a machine is switched to this one
+# on purpose, by masking speakersafetyd or by a drop-in that adds
+# Conflicts=speakersafetyd.service together with
+# OnFailure=speakersafetyd.service.
 StartLimitIntervalSec=60
 StartLimitBurst=5
 
@@ -19,6 +26,9 @@ RuntimeDirectory=speakerguardd
 RuntimeDirectoryPreserve=yes
 Restart=on-failure
 RestartSec=1
+# A configuration the daemon refuses to govern exits 78 before the card is
+# touched; restarting cannot change it.
+RestartPreventExitStatus=78
 
 [Install]
 WantedBy=multi-user.target
