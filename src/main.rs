@@ -41,7 +41,7 @@ const STEPS_PER_DB: f64 = 2.0;
 
 struct Args {
     config_path: PathBuf,
-    max_reduction: f64,
+    max_reduction: Option<f64>,
     card: Option<String>,
     card_wait: Duration,
     state: Option<PathBuf>,
@@ -57,6 +57,7 @@ struct Args {
     horizon: Option<f64>,
     ctrl_headroom: Option<f64>,
     unified_caps: bool,
+    experimental_unified: bool,
 }
 
 fn usage() -> ! {
@@ -66,7 +67,7 @@ fn usage() -> ! {
          -c, --config-path <DIR>         Directory holding <vendor>/<model>.conf\n  \
          -C, --card <ID>                 ALSA card id (default: the macaudio card)\n  \
          --wait-for-card <SECONDS>       Wait for card discovery before failing (default 30; 0 disables waiting)\n  \
-         -m, --max-reduction <DB>        Gain reduction beyond which the card's safe level takes over (default 20)\n  \
+         -m, --max-reduction <DB>        Gain reduction beyond which the card's safe level takes over (default: the config's, else 20)\n  \
          -s, --state <FILE>              Model state kept across restarts (default /run/speakerguardd/state)\n  \
          --governor <NAME>               legacy, asahi or unified (default: the config's, else legacy)\n  \
          --shadow                        Run the other governors too and log them to shadow.jsonl next to the state\n  \
@@ -79,6 +80,7 @@ fn usage() -> ! {
          --horizon <S>                   The unified governor's prediction horizon (default: the config's)\n  \
          --ctrl-headroom <K>             The unified governor's margin under the working limit (default: the config's)\n  \
          --unified-caps                  macOS-style caps on the unified governor's thermal and power axes\n  \
+         --experimental-unified          Let the (shadow-only) unified governor write the card\n  \
          -v, --verbose                   More logging (repeatable)\n  \
          -q, --quiet                     Less logging\n  \
          -h, --help                      This text"
@@ -89,7 +91,7 @@ fn usage() -> ! {
 fn parse_args() -> Args {
     let mut args = Args {
         config_path: PathBuf::from("/usr/share/speakerguardd"),
-        max_reduction: 20.0,
+        max_reduction: None,
         card: None,
         card_wait: Duration::from_secs(30),
         state: Some(PathBuf::from("/run/speakerguardd/state")),
@@ -105,6 +107,7 @@ fn parse_args() -> Args {
         horizon: None,
         ctrl_headroom: None,
         unified_caps: false,
+        experimental_unified: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -117,7 +120,7 @@ fn parse_args() -> Args {
                 args.state = if v.is_empty() { None } else { Some(PathBuf::from(v)) };
             }
             "-m" | "--max-reduction" => {
-                args.max_reduction = it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage());
+                args.max_reduction = Some(it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage()));
             }
             "--shadow" => args.shadow = true,
             "--governor" => {
@@ -135,6 +138,7 @@ fn parse_args() -> Args {
             "--gain-db" => args.gain_db = it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage()),
             "--csv" => args.csv = Some(PathBuf::from(it.next().unwrap_or_else(|| usage()))),
             "--unified-caps" => args.unified_caps = true,
+            "--experimental-unified" => args.experimental_unified = true,
             "--ctrl-headroom" => args.ctrl_headroom = Some(it.next().and_then(|v| v.parse().ok()).filter(|h: &f64| *h >= 0.0).unwrap_or_else(|| usage())),
             "--horizon" => args.horizon = Some(it.next().and_then(|v| v.parse().ok()).filter(|h: &f64| *h > 0.0).unwrap_or_else(|| usage())),
             "-v" | "--verbose" => args.verbosity = Level::Debug,
@@ -325,7 +329,8 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     info!("{}: {} speakers, sense PCM {}, period {} frames", path.display(), cfg.speakers.len(), cfg.globals.sense_pcm, cfg.globals.period);
     let (card, card_name) = Card::open(Some(&name), &cfg)?;
     let mut hw = RealHw { card, globals: cfg.globals.clone(), capture: None };
-    let mut guard = Guard::start(&mut hw, &cfg, args.max_reduction, args.state.clone())?;
+    let max_reduction = args.max_reduction.unwrap_or(cfg.globals.max_reduction);
+    let mut guard = Guard::start(&mut hw, &cfg, max_reduction, args.state.clone())?;
     if let Some(path) = &args.record {
         guard.record = Some(record::Recorder::create(path, &cfg, args.record_max_mb << 20)?);
         info!("recording sense periods to {}", path.display());
@@ -353,6 +358,7 @@ fn override_config(cfg: &mut Config, args: &Args) -> Result<(), Box<dyn std::err
         cfg.globals.t_ctrl_headroom = h;
     }
     cfg.globals.unified_caps |= args.unified_caps;
+    cfg.allow_unified = args.experimental_unified || args.replay.is_some();
     cfg.check_governor()?;
     Ok(())
 }

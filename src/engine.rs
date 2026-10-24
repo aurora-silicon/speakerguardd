@@ -1172,9 +1172,13 @@ mod tests {
             let (a, b) = (&j616.speakers[idx(&j616, n)], &j316.speakers[idx(&j316, n)]);
             assert_eq!((a.tr_coil, a.tau_coil, a.r_ff, a.vi_tr_coil, a.z_nominal), (b.tr_coil, b.tau_coil, b.r_ff, b.vi_tr_coil, b.z_nominal));
         }
-        assert!(Config::parse(&J316.replace("[Globals]", "[Globals]\ngovernor = asahi")).is_ok());
+        assert!(Config::parse(&J316.replace("governor = asahi", "governor = legacy")).is_ok());
         assert!(Config::parse(&J700.replace("[Globals]", "[Globals]\ngovernor = asahi")).is_err());
-        assert!(Config::parse(&J700.replace("[Globals]", "[Globals]\ngovernor = unified")).is_ok());
+        // unified is shadow-only unless the command line allows it
+        assert!(Config::parse(&J700.replace("[Globals]", "[Globals]\ngovernor = unified")).is_err());
+        assert_eq!(cfg(J316).globals.governor, Governor::Asahi);
+        assert_eq!(cfg(J316).globals.max_reduction, 7.0);
+        assert_eq!(cfg(J700).globals.governor, Governor::Legacy);
         assert!(Config::parse(&J700.replace("[Globals]", "[Globals]\ngovernor = loud")).is_err());
         let c = cfg(J316);
         assert_eq!(c.speakers.iter().find(|s| s.name == "Left Tweeter").unwrap().is_chan, Some(4));

@@ -260,6 +260,7 @@ mod tests {
             t_ctrl_headroom: 0.0,
             unified_caps: false,
             p_reduction_max: 0.0,
+            max_reduction: 20.0,
         }
     }
 

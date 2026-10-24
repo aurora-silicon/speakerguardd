@@ -5,5 +5,8 @@ LABEL="speakerguardd_macaudio"
 KERNEL=="pcmC*D2c", ATTRS{id}=="AppleJ*", ENV{ACP_IGNORE}="1"
 
 KERNEL=="pcmC*D2c", ATTRS{id}=="AppleJ700", TAG+="systemd", ENV{SYSTEMD_WANTS}="speakerguardd.service"
+# Machines with V/I sense that speakersafetyd also covers: mask speakersafetyd
+# to use this daemon there (the unit conflicts with it; see README.md).
+KERNEL=="pcmC*D2c", ATTRS{id}=="AppleJ316|AppleJ413|AppleJ616", TAG+="systemd", ENV{SYSTEMD_WANTS}="speakerguardd.service"
 
 LABEL="speakerguardd_end"

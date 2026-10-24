@@ -97,6 +97,9 @@ pub struct Globals {
     /// limit, where the daemon hands the speakers to the kernel.
     pub unified_caps: bool,
     pub p_reduction_max: f64,
+    /// Gain reduction beyond which the card's safe level takes over (dB);
+    /// `-m` overrides it.  speakersafetyd's machines use 7.
+    pub max_reduction: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -168,6 +171,8 @@ pub struct Config {
     pub globals: Globals,
     pub controls: Controls,
     pub speakers: Vec<Speaker>,
+    /// Set only by --experimental-unified.
+    pub allow_unified: bool,
 }
 
 type Sections = BTreeMap<String, BTreeMap<String, String>>;
@@ -275,7 +280,11 @@ impl Config {
             t_ctrl_headroom: or(g, "Globals", "t_ctrl_headroom", 0.0)?,
             unified_caps: boolean(g, "Globals", "unified_caps")?,
             p_reduction_max: or(g, "Globals", "p_reduction_max", 0.0)?,
+            max_reduction: or(g, "Globals", "max_reduction", 20.0)?,
         };
+        if !(globals.max_reduction.is_finite() && globals.max_reduction > 0.0) {
+            return Err(ConfigError("[Globals] max_reduction must be finite and positive".into()));
+        }
         for (key, value) in [
             ("amp_gain_dbv", globals.amp_gain_dbv),
             ("horizon_s", globals.horizon_s),
@@ -430,13 +439,18 @@ impl Config {
         if !(globals.safe_reduction > 0.0) {
             return Err(ConfigError("[Globals] safe_reduction must be positive".into()));
         }
-        let cfg = Config { globals, controls, speakers };
+        let cfg = Config { globals, controls, speakers, allow_unified: false };
         cfg.check_governor()?;
         Ok(cfg)
     }
 
     /// The asahi governor needs current sense and the amplifier's level.
+    /// The unified governor is shadow-only: it may write the card only with
+    /// `allow_unified` (the command line's --experimental-unified).
     pub fn check_governor(&self) -> Result<(), ConfigError> {
+        if self.globals.governor == Governor::Unified && !self.allow_unified {
+            return Err(ConfigError("governor unified is shadow-only (pass --experimental-unified to let it write the card)".into()));
+        }
         if self.globals.governor == Governor::Asahi {
             if self.speakers.iter().any(|s| s.is_chan.is_none()) {
                 return Err(ConfigError("governor asahi needs current sense (is_chan) on every speaker".into()));

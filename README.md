@@ -74,6 +74,46 @@ cannot make scheduling and ioctls atomic: a daemon that is late renewing the
 lock is covered by the kernel's 250 ms lock timeout, and the late time is
 charged to the model like any other gap.
 
+### Machines with current and voltage sense
+
+The same daemon protects the Apple laptops whose amplifiers report the
+speaker voltage and current (TAS2764-class SN012776: S16 sense words, 14 V
+and 3.75 A at full scale): `conf/apple/j316.conf` (MacBook Pro 16" M1 Pro),
+`j413.conf` (MacBook Air M2) and `j616.conf` (MacBook Pro 16" M4 Pro).  It
+turns the VSENSE/ISENSE switches on, sets the amplifier gain to its maximum
+(the level the model assumes, `amp_gain_dbv`) and writes one volume control
+per speaker, linked by `group`.
+
+On those machines the governor that writes the card is `asahi`: the
+behaviour Asahi Linux's speakersafetyd ships, reimplemented here from its
+description (credit: the Asahi Linux contributors; speakersafetyd is MIT
+through 2.0.2).  The measured power (mean V*I, integrated per sample) drives
+the two-node model with speakersafetyd's constants (`vi_*`, `z_nominal`), and
+the reduction ramps from 0 at `t_limit - t_headroom - t_window` to
+speakersafetyd's `min_gain` at the working limit, with peak-hold hysteresis.
+It differs only toward protection: unmeasured time is charged at the worst
+case instead of skipped, a negative sensed power is not counted, and a fault
+hands the speakers to the kernel (which mutes these amplifiers) instead of
+a panic.  On a 338 s recording from a J316, replayed at up to 18 dB louder,
+speakersafetyd's own coil model driven by this governor's gains peaks lower
+for every speaker at every level.
+
+To use this daemon where speakersafetyd is installed, mask speakersafetyd
+(`systemctl mask --now speakersafetyd`) and start this one; to go back,
+unmask speakersafetyd and reboot.  Keep speakersafetyd installed.
+
+### Shadow, recording and replay
+
+`--shadow` computes every other governor on the same sense data and writes
+one JSON line a second to `shadow.jsonl` next to the state file: each
+estimator's power, each governor's reduction, and each governor's models fed
+the power its own gains would have let through.  The `unified` governor (a
+look-ahead regulator on the feed-forward model, after the design of macOS's
+speaker protection) runs only there; it writes the card only with
+`--experimental-unified`.  `--record FILE` keeps the raw sense periods and
+`--replay FILE --model NAME [--gain-db DB]` runs every governor on them
+offline, louder if asked, and prints what each would have done.
+
 ### Relation to speakersafetyd
 
 speakersafetyd protects the speakers of the other Apple laptops from the
