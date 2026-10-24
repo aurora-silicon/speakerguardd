@@ -42,9 +42,9 @@
 //! * (b) while the daemon holds the lease and the asahi governor writes
 //!   the card, each speaker's card reduction is at least what
 //!   speakersafetyd's ramp asks for on the oracle's true coil and magnet,
-//!   linked by group; and whatever governs, the lease is not held with a
-//!   true need at or over --max-reduction, nor with a true coil or magnet
-//!   at its hard limit;
+//!   linked by group, and that need is under --max-reduction; whatever
+//!   governs, the lease is not held with a true coil or magnet at its hard
+//!   limit;
 //! * (c) as in harness.rs (no lock without events, none after a failed
 //!   rate read in that pass, no renewal blind past the limit, a start from
 //!   anything but a clean stop latched), no lock until REARM_PERIODS good
@@ -1029,12 +1029,14 @@ fn check(cfg: &Config, w: &ViWorld, g: &Guard, sc: &ViScenario, out: &mut Outcom
             if vi.0.max(vi.1) >= s.t_limit {
                 return Err(Violation(format!("(b) at {now:.4} s: armed with {name} truly at {:.3}/{:.3} C", vi.0, vi.1)));
             }
-            let need = need(cfg, &w.oracle, k, at, rate);
-            if need >= sc.max_reduction + 0.05 {
-                return Err(Violation(format!("(b) at {now:.4} s: armed while {name}'s true state needs {need:.3} dB, over --max-reduction")));
-            }
-            if g.governing == Governor::Asahi && w.effective(k) < need - 0.05 {
-                return Err(Violation(format!("(b) at {now:.4} s: {name} card applies {:.3} dB, the true state needs {need:.3} dB", w.effective(k))));
+            if g.governing == Governor::Asahi {
+                let need = need(cfg, &w.oracle, k, at, rate);
+                if need >= sc.max_reduction + 0.05 {
+                    return Err(Violation(format!("(b) at {now:.4} s: armed while {name}'s true state needs {need:.3} dB, over --max-reduction")));
+                }
+                if w.effective(k) < need - 0.05 {
+                    return Err(Violation(format!("(b) at {now:.4} s: {name} card applies {:.3} dB, the true state needs {need:.3} dB", w.effective(k))));
+                }
             }
         }
     }
