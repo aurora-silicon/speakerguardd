@@ -67,6 +67,7 @@ impl SpeakerState {
     }
 
     /// The RMS voltage a period of sense words puts across the coil.
+    #[cfg(test)]
     pub fn v_rms_of(&self, words: &[i32], channels: usize) -> f64 {
         let ch = self.spec.vs_chan;
         let frames = words.len() / channels;

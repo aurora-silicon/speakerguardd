@@ -8,7 +8,7 @@ use std::ffi::CStr;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 
 const IOC_NRBITS: u32 = 8;
 const IOC_TYPEBITS: u32 = 8;
@@ -116,6 +116,17 @@ const CTL_IOCTL_ELEM_INFO: libc::c_ulong = iowr::<ElemInfo>(b'U', 0x11);
 const CTL_IOCTL_ELEM_READ: libc::c_ulong = iowr::<ElemValue>(b'U', 0x12);
 const CTL_IOCTL_ELEM_WRITE: libc::c_ulong = iowr::<ElemValue>(b'U', 0x13);
 const CTL_IOCTL_ELEM_LOCK: libc::c_ulong = iow::<ElemId>(b'U', 0x14);
+const CTL_IOCTL_SUBSCRIBE_EVENTS: libc::c_ulong = iowr::<libc::c_int>(b'U', 0x16);
+
+/// `struct snd_ctl_event` for SNDRV_CTL_EVENT_ELEM: the mask and the id.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CtlEvent {
+    ty: i32,
+    mask: u32,
+    id: ElemId,
+}
+const CTL_EVENT_ELEM: i32 = 0;
 
 /// A control device; the file descriptor is the lock owner the kernel sees.
 pub struct Ctl {
@@ -229,6 +240,69 @@ impl Ctl {
         ioctl(&self.file, CTL_IOCTL_ELEM_LOCK, &mut id)?;
         Ok(())
     }
+
+    /// Ask for change events on this file, and make it non-blocking so
+    /// that `events` can drain them.
+    pub fn subscribe(&self) -> io::Result<()> {
+        let mut on: libc::c_int = 1;
+        ioctl(&self.file, CTL_IOCTL_SUBSCRIBE_EVENTS, &mut on)?;
+        // SAFETY: plain fcntl calls on an open descriptor.
+        unsafe {
+            let fl = libc::fcntl(self.file.as_raw_fd(), libc::F_GETFL);
+            if fl < 0 || libc::fcntl(self.file.as_raw_fd(), libc::F_SETFL, fl | libc::O_NONBLOCK) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+
+    /// Drain the queued events; true if one was about `numid`.
+    pub fn events(&self, numid: u32) -> io::Result<bool> {
+        let mut hit = false;
+        // SAFETY: all-zero events are valid; read() fills whole ones.
+        let mut buf: [CtlEvent; 32] = unsafe { std::mem::zeroed() };
+        loop {
+            // SAFETY: the buffer is writable for its full size.
+            let n = unsafe { libc::read(self.file.as_raw_fd(), buf.as_mut_ptr().cast(), std::mem::size_of_val(&buf)) };
+            if n < 0 {
+                let e = io::Error::last_os_error();
+                return match e.raw_os_error() {
+                    Some(libc::EAGAIN) => Ok(hit),
+                    Some(libc::EINTR) => continue,
+                    _ => Err(e),
+                };
+            }
+            let count = n as usize / std::mem::size_of::<CtlEvent>();
+            hit |= buf[..count].iter().any(|ev| ev.ty == CTL_EVENT_ELEM && ev.id.numid == numid);
+            if count < buf.len() {
+                return Ok(hit);
+            }
+        }
+    }
+
+    pub fn fd(&self) -> RawFd {
+        self.file.as_raw_fd()
+    }
+}
+
+/// poll() two descriptors for input for at most `timeout_ms`: whether each
+/// is readable.  An interrupted wait reports neither.
+pub fn poll2(a: RawFd, b: Option<RawFd>, timeout_ms: libc::c_int) -> io::Result<(bool, bool)> {
+    let mut fds = [
+        libc::pollfd { fd: a, events: libc::POLLIN, revents: 0 },
+        libc::pollfd { fd: b.unwrap_or(-1), events: libc::POLLIN, revents: 0 },
+    ];
+    let n = if b.is_some() { 2 } else { 1 };
+    // SAFETY: n initialised pollfds.
+    let ret = unsafe { libc::poll(fds.as_mut_ptr(), n, timeout_ms) };
+    if ret < 0 {
+        let e = io::Error::last_os_error();
+        if e.raw_os_error() == Some(libc::EINTR) {
+            return Ok((false, false));
+        }
+        return Err(e);
+    }
+    Ok((fds[0].revents != 0, n == 2 && fds[1].revents != 0))
 }
 
 // ---- PCM capture ----
@@ -455,6 +529,21 @@ impl<P: PcmIo> PeriodReader<P> {
         &mut self.io
     }
 
+    /// The frames the capture holds beyond what has been read: how long
+    /// ago the period just read ended.
+    pub fn queued(&mut self) -> io::Result<u64> {
+        Ok(self.io.delay()?.max(0) as u64)
+    }
+
+    /// Start the capture if it is not running yet.
+    pub fn ensure_started(&mut self) -> io::Result<()> {
+        if !self.started {
+            self.io.start()?;
+            self.started = true;
+        }
+        Ok(())
+    }
+
     /// Reads one sense period into `buf` (period * channels words).
     /// `Ok(Some(true))` is a valid period, `Ok(Some(false))` a short
     /// transfer or a recovered overrun (discarded; the stream is
@@ -462,22 +551,23 @@ impl<P: PcmIo> PeriodReader<P> {
     /// ping interval: the caller must ping the lock and call again, because
     /// the card locks the volume 250 ms after the last ping and nothing may
     /// block longer than that.
-    /// The frames the capture holds beyond what has been read: how long
-    /// ago the period just read ended.
-    pub fn queued(&mut self) -> io::Result<u64> {
-        Ok(self.io.delay()?.max(0) as u64)
+    pub fn read_period(&mut self, buf: &mut [i32]) -> io::Result<Option<bool>> {
+        self.read_period_within(buf, PERIOD_WAIT_MS)
     }
 
-    pub fn read_period(&mut self, buf: &mut [i32]) -> io::Result<Option<bool>> {
+    /// `read_period` waiting at most `timeout_ms`.
+    pub fn read_period_within(&mut self, buf: &mut [i32], timeout_ms: libc::c_int) -> io::Result<Option<bool>> {
         assert!(buf.len() >= self.period * self.channels);
-        if !self.started {
-            self.io.start()?;
-            self.started = true;
-        }
+        self.ensure_started()?;
         // Wait first: a read is only issued once a whole period is there.
-        if !self.io.wait(PERIOD_WAIT_MS)? {
+        if !self.io.wait(timeout_ms)? {
             return Ok(None);
         }
+        self.read_ready(buf)
+    }
+
+    /// The read half of `read_period`, once the stream is readable.
+    pub fn read_ready(&mut self, buf: &mut [i32]) -> io::Result<Option<bool>> {
         match self.io.readi(buf, self.period) {
             Ok(frames) => Ok(Some(full_period(frames, self.period)?)),
             // readable but empty: a spurious wakeup
@@ -490,11 +580,33 @@ impl<P: PcmIo> PeriodReader<P> {
             Err(e) => Err(e),
         }
     }
+
+    /// Whatever the capture holds now, up to a period, without waiting:
+    /// the frames a stream that is closing left after its last whole
+    /// period.  0 when there are none or the stream cannot give them.
+    pub fn read_tail(&mut self, buf: &mut [i32]) -> io::Result<usize> {
+        assert!(buf.len() >= self.period * self.channels);
+        if !self.started {
+            return Ok(0);
+        }
+        match self.io.readi(buf, self.period) {
+            Ok(frames) if frames >= 0 => Ok((frames as usize).min(self.period)),
+            Ok(frames) => Err(io::Error::from_raw_os_error(frames.saturating_neg().min(i32::MAX as i64) as i32)),
+            Err(e) if matches!(e.raw_os_error(), Some(libc::EAGAIN | libc::EPIPE | libc::EBADFD | libc::ESTRPIPE | libc::ENODEV)) => Ok(0),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+impl Capture {
+    pub fn fd(&self) -> RawFd {
+        self.io.file.as_raw_fd()
+    }
 }
 
 /// Longest single wait for sense data: well inside the card's 250 ms lock
 /// timeout, so the lock ping between waits is never late.
-const PERIOD_WAIT_MS: libc::c_int = 50;
+pub const PERIOD_WAIT_MS: libc::c_int = 50;
 
 #[cfg(test)]
 mod tests {
@@ -521,6 +633,8 @@ mod tests {
         assert_eq!(PCM_IOCTL_READI_FRAMES, 0x8018_4151);
         assert_eq!(PCM_IOCTL_START, 0x4142);
         assert_eq!(PCM_IOCTL_DELAY, 0x8008_4121);
+        assert_eq!(CTL_IOCTL_SUBSCRIBE_EVENTS, 0xc004_5516);
+        assert_eq!(std::mem::size_of::<CtlEvent>(), 72);
     }
 }
 

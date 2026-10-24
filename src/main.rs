@@ -108,6 +108,11 @@ struct Card {
     volume_min: i64,
     unlock: ElemId,
     sample_rate: ElemId,
+    /// Subscribed to the card's change events: the sample-rate control's
+    /// changes wake the loop instead of waiting for its next poll.
+    events: bool,
+    /// A sample-rate change event arrived since the loop last asked.
+    rate_event: bool,
 }
 
 impl Card {
@@ -119,7 +124,14 @@ impl Card {
         }
         let unlock = ctl.find_one(&cfg.controls.unlock)?;
         let sample_rate = ctl.find_one(&cfg.controls.sample_rate)?;
-        Ok((Card { ctl, volume, volume_max: None, volume_min: 0, unlock, sample_rate }, name))
+        let events = match ctl.subscribe() {
+            Ok(()) => true,
+            Err(e) => {
+                warn!("control events: {e}; polling the sample rate instead");
+                false
+            }
+        };
+        Ok((Card { ctl, volume, volume_max: None, volume_min: 0, unlock, sample_rate, events, rate_event: false }, name))
     }
 
     /// Take the interlock: every volume control first, then the unlock
@@ -152,6 +164,14 @@ impl Card {
             self.volume_max = Some(max);
         }
         Ok(())
+    }
+
+    /// Drain the queued events; true while a sample-rate change is pending.
+    fn drain(&mut self) -> std::io::Result<bool> {
+        if self.events && self.ctl.events(self.sample_rate.numid)? {
+            self.rate_event = true;
+        }
+        Ok(self.rate_event)
     }
 
     fn write_reduction(&self, db: f64) -> std::io::Result<()> {
@@ -211,11 +231,69 @@ impl Hw for RealHw {
     fn close_sense(&mut self) {
         self.capture = None;
     }
+    /// One sense period, or None once a sample-rate change arrives (the
+    /// loop then reads the rate at once) or after one poll.
     fn read_period(&mut self, words: &mut [i32]) -> std::io::Result<Option<bool>> {
-        match self.capture.as_mut() {
-            Some(c) => c.read_period(words),
-            None => Err(std::io::Error::from_raw_os_error(libc::EBADFD)),
+        let Some(c) = self.capture.as_mut() else {
+            return Err(std::io::Error::from_raw_os_error(libc::EBADFD));
+        };
+        if !self.card.events {
+            return c.read_period(words);
         }
+        c.ensure_started()?;
+        let deadline = Instant::now() + Duration::from_millis(alsa::PERIOD_WAIT_MS as u64);
+        loop {
+            if self.card.drain()? {
+                return Ok(None);
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            let ms = (left.as_micros().div_ceil(1000)) as libc::c_int;
+            let (pcm, ctl) = alsa::poll2(c.fd(), Some(self.card.ctl.fd()), ms)?;
+            if pcm {
+                return c.read_ready(words);
+            }
+            if !ctl || Instant::now() >= deadline {
+                return Ok(None);
+            }
+        }
+    }
+    fn read_tail(&mut self, words: &mut [i32]) -> std::io::Result<usize> {
+        match self.capture.as_mut() {
+            Some(c) => c.read_tail(words),
+            None => Ok(0),
+        }
+    }
+    fn wait_rate_change(&mut self, timeout: Duration) -> bool {
+        if !self.card.events {
+            thread::sleep(timeout);
+            return false;
+        }
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self.card.drain() {
+                Ok(true) => return true,
+                Ok(false) => {}
+                Err(_) => {
+                    // the events are only a wake-up: fall back to the poll
+                    thread::sleep(deadline.saturating_duration_since(Instant::now()));
+                    return false;
+                }
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            let ms = (left.as_micros().div_ceil(1000)) as libc::c_int;
+            if alsa::poll2(self.card.ctl.fd(), None, ms).is_err() {
+                thread::sleep(deadline.saturating_duration_since(Instant::now()));
+                return false;
+            }
+        }
+    }
+    fn rate_events(&mut self) -> bool {
+        let pending = self.card.drain().unwrap_or(true);
+        self.card.rate_event = false;
+        pending
     }
     fn queued(&mut self) -> std::io::Result<u64> {
         match self.capture.as_mut() {

@@ -8,13 +8,16 @@
 //! * The card's volume lock is only renewed while every safety-critical
 //!   control operation of the pass succeeded: a failed sample-rate read or
 //!   volume write hands the speakers to the card's safe level at once.
-//! * Every moment of playback is accounted, by a measured sense period or
-//!   at the worst case the card's gain lets through: a period covers the
-//!   time it was captured over (its backlog in the capture buffer taken
-//!   into account), and time no period covers is charged before the next
-//!   one is.  The windows at a stream's edges are the exception: the time
-//!   before the stream is first seen open (one idle poll at most) and the
-//!   time after its last period until it is seen closed.
+//! * Every moment of playback is accounted, by measured sense frames or at
+//!   the worst case the card's gain lets through: a period covers the time
+//!   it was captured over (its backlog in the capture buffer taken into
+//!   account), and time no period covers is charged before the next one
+//!   is.  A stream's edges too: the sample-rate control's change events
+//!   wake the loop when a stream opens or closes, the window from that
+//!   wake-up to the first captured frame is charged at the worst case, and
+//!   at close the frames after the last whole period are read and measured
+//!   and the rest of the window is charged.  Without change events the
+//!   opening window runs from the last time the speakers were seen closed.
 //! * The lock is not taken before the model allows it and the daemon can
 //!   see: no unlock at start, and while the speakers play not before
 //!   REARM_PERIODS complete periods.
@@ -78,6 +81,14 @@ pub trait Hw {
     fn read_period(&mut self, words: &mut [i32]) -> io::Result<Option<bool>>;
     /// Frames the capture holds beyond the period just read.
     fn queued(&mut self) -> io::Result<u64>;
+    /// Whatever the capture holds now, up to a period, without waiting
+    /// (frames; 0 when there are none or the stream cannot give them).
+    fn read_tail(&mut self, words: &mut [i32]) -> io::Result<usize>;
+    /// Wait up to `timeout` for a change of the speakers' sample rate.
+    /// True if one woke the wait.
+    fn wait_rate_change(&mut self, timeout: Duration) -> bool;
+    /// Whether the sample rate changed since the last call (consumes it).
+    fn rate_events(&mut self) -> bool;
 }
 
 /// Errors a PCM or control returns while the playback side is being
@@ -162,6 +173,12 @@ pub struct Guard {
     seen_to: Option<Instant>,
     /// When the speakers were last seen closed.
     last_closed: Option<Instant>,
+    /// When a sample-rate change last woke the idle wait.
+    event_wake: Option<Instant>,
+    /// The model's idle cooling has run up to here.
+    idle_to: Option<Instant>,
+    /// The speakers' rate while they play (0 before the first stream).
+    rate: u32,
     /// The last sample-rate read failed: playback state unknown.
     unknown: bool,
     /// Complete periods in a row.
@@ -254,6 +271,9 @@ impl Guard {
             charged_to: None,
             seen_to: None,
             last_closed: None,
+            event_wake: None,
+            idle_to: None,
+            rate: 0,
             unknown: false,
             fresh: 0,
             // an earlier run may have pinged just before: its lock runs out
@@ -358,24 +378,31 @@ impl Guard {
         self.check_model()
     }
 
-    /// A complete period whose last frame was captured at `end`.
-    fn account_period(&mut self, end: Instant, dt: f64) -> Result<(), Box<dyn Error>> {
+    /// `frames` sense frames in `self.words` whose last one was captured at
+    /// `end`.
+    fn account_frames(&mut self, end: Instant, frames: usize) -> Result<(), Box<dyn Error>> {
+        if frames == 0 || self.rate == 0 {
+            return Ok(());
+        }
+        let dt = frames as f64 / self.rate as f64;
         let start = end.checked_sub(Duration::from_secs_f64(dt)).unwrap_or(end);
         let mut lo = self.charged_to.unwrap_or(start);
         if lo + PERIOD_JITTER < start {
-            // time no period covers (lost frames, a reopened capture, a
-            // late first period): charged before this one is
+            // time no frames cover (lost frames, a reopened capture, the
+            // window before a stream's first frame): charged first
             self.charge_worst(lo, start)?;
             lo = start;
         }
-        // the period's own power covers what is left of it, up to the jitter
-        // before it; a part already charged at the worst case is not charged
-        // again
+        // the frames' own power covers what is left of their span, up to
+        // the jitter before it; a part already charged at the worst case is
+        // not charged again
         let span = end.saturating_duration_since(lo).as_secs_f64();
         let applied = self.card_reduction(lo);
         let globals = self.globals.clone();
+        let words = &self.words[..frames * globals.channels];
+        let blocks = (SUB_BLOCKS * frames).div_ceil(globals.period).max(1);
         for s in self.speakers.iter_mut() {
-            let (powers, v) = s.block_powers(&self.words, globals.channels, SUB_BLOCKS);
+            let (powers, v) = s.block_powers(words, globals.channels, blocks);
             if !v.is_finite() || powers.iter().any(|p| !p.is_finite() || *p < 0.0) {
                 return Err("invalid speaker sense voltage or power".into());
             }
@@ -390,9 +417,58 @@ impl Guard {
         Ok(())
     }
 
+    /// A closing stream: measure what the capture holds after the last
+    /// whole period, then charge the rest of the window up to now.
+    fn account_close<H: Hw>(&mut self, hw: &mut H) -> Result<usize, Box<dyn Error>> {
+        let mut measured = 0;
+        let Some(_) = self.charged_to else { return Ok(0) };
+        if self.stall.is_some() && !self.unknown {
+            loop {
+                let mut words = std::mem::take(&mut self.words);
+                let read = hw.read_tail(&mut words);
+                self.words = words;
+                let frames = match read {
+                    Ok(f) => f,
+                    Err(e) => {
+                        warn!("sense capture at close: {e}");
+                        0
+                    }
+                };
+                if frames == 0 {
+                    break;
+                }
+                let end = hw.now().checked_sub(Duration::from_secs_f64(hw.queued().unwrap_or(0) as f64 / self.rate.max(1) as f64)).unwrap_or(hw.now());
+                self.account_frames(end, frames)?;
+                measured += frames;
+                if frames < self.globals.period || measured > 8 * self.globals.period {
+                    break;
+                }
+            }
+        }
+        let now = hw.now();
+        if let Some(charged) = self.charged_to {
+            if charged + PERIOD_JITTER < now {
+                self.charge_worst(charged, now)?;
+            }
+        }
+        self.charged_to = None;
+        Ok(measured)
+    }
+
+    /// The idle wait: until the next ping is due or the sample rate changes.
+    fn idle_wait<H: Hw>(&mut self, hw: &mut H) {
+        if hw.wait_rate_change(PING_INTERVAL) {
+            self.event_wake = Some(hw.now());
+        }
+    }
+
     /// One pass of the loop: idle cooling, or one sense period.
     pub fn tick<H: Hw>(&mut self, hw: &mut H) -> Result<(), Box<dyn Error>> {
         let globals = self.globals.clone();
+        // a change event since the last pass: read before the rate, so that
+        // a change after the read is kept for the next pass
+        let changed = hw.rate_events();
+        let woke = self.event_wake.take();
         // playback state: the card reports the speakers' sample rate, 0 when closed
         let rate = match hw.sample_rate() {
             Ok(v) => {
@@ -410,6 +486,7 @@ impl Guard {
                 if self.charged_to.is_none() {
                     self.charged_to = Some(self.last_closed.unwrap_or_else(|| hw.now()));
                 }
+                self.idle_to = None;
                 self.disarm("the speaker sample-rate control failed");
                 self.maintain(hw)?;
                 hw.sleep(PING_INTERVAL);
@@ -418,25 +495,34 @@ impl Guard {
             Err(e) => return Err(format!("sample-rate control: {e}").into()),
         };
         if rate == 0 {
-            // the time since the last period, if the sense had stalled
-            self.charge_blind(hw)?;
+            if self.charged_to.is_none() && changed {
+                // a stream opened and closed again between two looks: the
+                // time since the wake-up (or the last look) is unmeasured
+                if let Some(from) = woke.or(self.last_closed) {
+                    self.charged_to = Some(from);
+                }
+            }
+            // the stream's last frames, and the rest of its closing window
+            let tail = self.account_close(hw)?;
             self.dt = None;
-            self.charged_to = None;
             self.seen_to = None;
             self.fresh = 0;
             if self.stall.take().is_some() {
                 hw.close_sense();
-                info!("speakers closed");
+                info!("speakers closed ({tail} sense frames after the last whole period)");
             }
-            // cool down with no power (for at most the time it took)
+            // cool down with no power for the time the speakers were closed
+            let now = hw.now();
+            let idle = self.idle_to.map_or(0.0, |t| now.saturating_duration_since(t).as_secs_f64());
             for s in self.speakers.iter_mut() {
-                s.step(0.0, PING_INTERVAL.as_secs_f64(), globals.t_ambient);
+                s.step(0.0, idle, globals.t_ambient);
                 s.govern(&globals);
             }
+            self.idle_to = Some(now);
             self.check_model()?;
-            self.last_closed = Some(hw.now());
+            self.last_closed = Some(now);
             self.maintain(hw)?;
-            hw.sleep(PING_INTERVAL);
+            self.idle_wait(hw);
             return Ok(());
         }
         let dt = globals.period as f64 / rate as f64;
@@ -444,10 +530,15 @@ impl Guard {
             return Err("invalid sense period".into());
         }
         self.dt = Some(dt);
+        self.rate = rate;
+        self.idle_to = None;
         if self.charged_to.is_none() {
-            // a stream seen for the first time is accounted from here
+            // a stream seen for the first time is accounted from the change
+            // event that announced it, or from the last time the speakers
+            // were seen closed; the window up to its first frame is charged
             let now = hw.now();
-            self.charged_to = Some(now);
+            let from = if changed { woke.or(self.last_closed) } else { self.last_closed };
+            self.charged_to = Some(from.map_or(now, |f| f.min(now)));
             self.seen_to = Some(now);
         }
         if self.seen_to.is_none() {
@@ -490,7 +581,7 @@ impl Guard {
                 self.stall.as_mut().unwrap().data();
                 let now = hw.now();
                 let end = now.checked_sub(Duration::from_secs_f64(queued as f64 / rate as f64)).unwrap_or(now);
-                self.account_period(end, dt)?;
+                self.account_frames(end, globals.period)?;
                 self.seen_to = Some(now);
                 self.fresh = self.fresh.saturating_add(1);
             }
@@ -706,6 +797,8 @@ pub mod fake {
     use std::rc::Rc;
 
     pub const LOCK_TIMEOUT: Duration = Duration::from_millis(250);
+    /// How long after a sample-rate change its event wakes the daemon.
+    pub const EVENT_LATENCY: Duration = Duration::from_micros(200);
     /// The kernel's safe level without a daemon (macaudio safe_vol).
     pub const SAFE_DB: f64 = 20.0;
 
@@ -755,6 +848,10 @@ pub mod fake {
         /// Where the period last returned ended.
         last_end: Duration,
         pub locked: bool,
+        /// The card sends sample-rate change events (else the daemon polls).
+        pub events: bool,
+        /// Where rate_events last looked.
+        events_seen_to: Duration,
     }
 
     impl FakeHw {
@@ -789,7 +886,23 @@ pub mod fake {
                 lossy: false,
                 last_end: Duration::ZERO,
                 locked: false,
+                events: true,
+                events_seen_to: Duration::ZERO,
             }
+        }
+
+        /// The first time in (from, to] the speakers open or close.
+        pub fn next_change(&self, from: Duration, to: Duration) -> Option<Duration> {
+            let was = (self.playing)(from);
+            let step = Duration::from_micros(250);
+            let mut t = from + step;
+            while t <= to {
+                if (self.playing)(t) != was {
+                    return Some(t);
+                }
+                t += step;
+            }
+            None
         }
 
         /// The first successful lock renewal.
@@ -894,6 +1007,51 @@ pub mod fake {
             }
             Ok((self.t.saturating_sub(self.last_end).as_secs_f64() * 48000.0) as u64)
         }
+        fn read_tail(&mut self, words: &mut [i32]) -> io::Result<usize> {
+            if !self.sense_open {
+                return Ok(0);
+            }
+            let gain = 10f64.powf(-self.effective_reduction() / 20.0);
+            let a = ((self.level)(self.t) * gain).clamp(0.0, 1.0);
+            let word = (a * 2147483647.0) as i32;
+            if let Some(reader) = self.pcm.as_mut() {
+                let t = self.t;
+                reader.io().advance_to(t);
+                reader.io().word = word;
+                return reader.read_tail(words);
+            }
+            // the frames since the last whole period, up to where the
+            // stream stopped (or now)
+            let start = self.next_period.saturating_sub(self.period);
+            let stop = self.next_change(start, self.t).unwrap_or(self.t).min(self.t);
+            if !(self.sensing)(start) {
+                return Ok(0);
+            }
+            let k = ((stop.saturating_sub(start).as_secs_f64() * 48000.0) as usize).min(self.period_frames - 1);
+            for (i, w) in words[..k * self.channels].iter_mut().enumerate() {
+                let frame = i / self.channels;
+                *w = if frame % 2 == 0 { word } else { -word };
+            }
+            self.last_end = self.t;
+            Ok(k)
+        }
+        fn wait_rate_change(&mut self, timeout: Duration) -> bool {
+            if self.events {
+                if let Some(c) = self.next_change(self.t, self.t + timeout) {
+                    self.t = c + EVENT_LATENCY;
+                    self.lapse_check();
+                    return true;
+                }
+            }
+            self.t += timeout;
+            self.lapse_check();
+            false
+        }
+        fn rate_events(&mut self) -> bool {
+            let changed = self.events && self.next_change(self.events_seen_to, self.t).is_some();
+            self.events_seen_to = self.t;
+            changed
+        }
         fn open_sense(&mut self, _rate: u32) -> io::Result<()> {
             self.sense_open = true;
             self.opens += 1;
@@ -910,6 +1068,37 @@ pub mod fake {
         }
         fn read_period(&mut self, words: &mut [i32]) -> io::Result<Option<bool>> {
             assert!(self.sense_open, "read on a closed capture");
+            // a sample-rate change ends the wait early, as the card's event does
+            let change = if self.events { self.next_change(self.t, self.t + Duration::from_millis(50)) } else { None };
+            if self.pcm.is_some() {
+                if let Some(c) = change {
+                    let ms = (c.saturating_sub(self.t).as_micros().div_ceil(1000)).max(1) as libc::c_int;
+                    let gain = 10f64.powf(-self.effective_reduction() / 20.0);
+                    let a = ((self.level)(self.t) * gain).clamp(0.0, 1.0);
+                    let t = self.t;
+                    let reader = self.pcm.as_mut().unwrap();
+                    reader.io().advance_to(t);
+                    reader.io().word = (a * 2147483647.0) as i32;
+                    let read = reader.read_period_within(words, ms);
+                    self.t = reader.io().t.max(if read.as_ref().is_ok_and(|r| r.is_none()) { c + EVENT_LATENCY } else { Duration::ZERO });
+                    self.lapse_check();
+                    match read {
+                        Ok(Some(true)) => self.complete.push(self.t),
+                        Ok(Some(false)) => self.incomplete.push(self.t),
+                        _ => {}
+                    }
+                    return read;
+                }
+            }
+            if self.pcm.is_none() {
+                if let Some(c) = change {
+                    if c < self.next_period || !(self.sensing)(self.t) {
+                        self.t = c + EVENT_LATENCY;
+                        self.lapse_check();
+                        return Ok(None);
+                    }
+                }
+            }
             if self.pcm.is_some() {
                 let gain = 10f64.powf(-self.effective_reduction() / 20.0);
                 let a = ((self.level)(self.t) * gain).clamp(0.0, 1.0);
@@ -1653,5 +1842,61 @@ mod tests {
         let g2 = Guard::start(&mut hw2, &cfg, 20.0, Some(path)).unwrap();
         // 0.5 s at the safe level: cooler, by what the coil sheds in that time
         assert!(g2.speakers[0].t_coil < coil && g2.speakers[0].t_coil > coil - 10.0, "{} vs {coil}", g2.speakers[0].t_coil);
+    }
+
+    // ---- 0.1.4: a stream's edges ----
+
+    /// Streams shorter than a sense period (UI sounds) never completed one,
+    /// so 0.1.3 measured none of them: sixty 40 ms streams 10 ms apart at
+    /// half of full scale left the model where it was.  Their frames are
+    /// now read at close and the windows around them charged, so they heat
+    /// the model as much as a continuous stream of the same mean power.
+    #[test]
+    fn back_to_back_short_streams_heat_the_model() {
+        let cfg = j700();
+        fn bursts(t: Duration) -> bool {
+            let s = t.as_secs_f64();
+            (1.0..4.0).contains(&s) && (s - 1.0) % 0.05 < 0.04
+        }
+        fn continuous(t: Duration) -> bool {
+            (1.0..4.0).contains(&t.as_secs_f64())
+        }
+        let rise = |playing: fn(Duration) -> bool, level: f64| {
+            let mut hw = dma_hw(&cfg, move |t| if playing(t) { 1.0 } else { 0.0 });
+            hw.playing = Box::new(playing);
+            hw.level = Box::new(move |_| level);
+            let mut g = Guard::start(&mut hw, &cfg, 20.0, tmp_state()).unwrap();
+            run_until(&mut g, &mut hw, secs(0.9)).unwrap();
+            let before = g.speakers[0].t_coil;
+            run_until(&mut g, &mut hw, secs(4.1)).unwrap();
+            (g.speakers[0].t_coil - before, hw.opens)
+        };
+        let (b, opens) = rise(bursts, 0.5);
+        let (c, _) = rise(continuous, 0.5 * 0.8f64.sqrt());
+        assert!(opens >= 55, "{opens} streams");
+        assert!(c > 10.0, "the continuous stream heated the coil by only {c:.2} K");
+        assert!(b >= 0.8 * c, "sixty 40 ms streams heated the coil by {b:.2} K, a continuous stream of the same mean power by {c:.2} K");
+    }
+
+    /// With change events the window before a stream's first frame is the
+    /// event's latency and the capture's start, not an idle poll: a quiet
+    /// stream opened in the middle of an idle wait is not charged 100 ms at
+    /// the worst case.
+    #[test]
+    fn a_change_event_starts_the_account_at_the_stream() {
+        let cfg = j700();
+        let coil = |events: bool| {
+            let mut hw = dma_hw(&cfg, |t| if t > secs(1.05) { 1.0 } else { 0.0 });
+            hw.playing = Box::new(|t| t > secs(1.05));
+            hw.level = Box::new(|_| 0.01);
+            hw.events = events;
+            let mut g = Guard::start(&mut hw, &cfg, 20.0, tmp_state()).unwrap();
+            run_until(&mut g, &mut hw, secs(1.5)).unwrap();
+            g.speakers[0].t_coil
+        };
+        let (with, without) = (coil(true), coil(false));
+        assert!(without > with + 1.0, "the polled opening window was not charged: {without:.2} vs {with:.2} C");
+        let floor = 50.0 + 0.127 * 64.0;
+        assert!(with < floor + 1.0, "an evented quiet stream heated the model to {with:.2} C");
     }
 }
