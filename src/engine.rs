@@ -679,20 +679,28 @@ impl Engine {
                         db(p_pre / pmax).clamp(0.0, MUTE_DB)
                     }
                 };
-                wanted = wanted.max(need(u.last_ff_pre, &u.ff));
+                let mut thermal = need(u.last_ff_pre, &u.ff);
                 // where V/I sense exists the measured-power model can only
                 // tighten the feed-forward one
                 if let (Some(vi), Some(p)) = (u.vi.as_ref(), u.last_vi_pre) {
-                    wanted = wanted.max(need(p, vi));
+                    thermal = thermal.max(need(p, vi));
                 }
+                let mut power: f64 = 0.0;
                 for (seconds, limit) in [(1.0, s.p_limit_1s), (60.0, s.p_limit_60s)] {
                     if limit > 0.0 {
                         let mean = u.mean_pre(seconds);
                         if mean > limit {
-                            wanted = wanted.max(db(mean / limit));
+                            power = power.max(db(mean / limit));
                         }
                     }
                 }
+                if g.unified_caps {
+                    thermal = thermal.min(g.t_reduction_max);
+                    if g.p_reduction_max > 0.0 {
+                        power = power.min(g.p_reduction_max);
+                    }
+                }
+                wanted = wanted.max(thermal).max(power);
             }
             // No silent cap: past --max-reduction the guard hands the
             // speakers to the kernel's safe level instead.

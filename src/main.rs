@@ -55,6 +55,8 @@ struct Args {
     gain_db: f64,
     csv: Option<PathBuf>,
     horizon: Option<f64>,
+    ctrl_headroom: Option<f64>,
+    unified_caps: bool,
 }
 
 fn usage() -> ! {
@@ -75,6 +77,8 @@ fn usage() -> ! {
          --gain-db <DB>                  With --replay: play the recording this much louder\n  \
          --csv <FILE>                    With --replay: one line per period\n  \
          --horizon <S>                   The unified governor's prediction horizon (default: the config's)\n  \
+         --ctrl-headroom <K>             The unified governor's margin under the working limit (default: the config's)\n  \
+         --unified-caps                  macOS-style caps on the unified governor's thermal and power axes\n  \
          -v, --verbose                   More logging (repeatable)\n  \
          -q, --quiet                     Less logging\n  \
          -h, --help                      This text"
@@ -99,6 +103,8 @@ fn parse_args() -> Args {
         gain_db: 0.0,
         csv: None,
         horizon: None,
+        ctrl_headroom: None,
+        unified_caps: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -128,6 +134,8 @@ fn parse_args() -> Args {
             "--model" => args.model = Some(it.next().unwrap_or_else(|| usage())),
             "--gain-db" => args.gain_db = it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage()),
             "--csv" => args.csv = Some(PathBuf::from(it.next().unwrap_or_else(|| usage()))),
+            "--unified-caps" => args.unified_caps = true,
+            "--ctrl-headroom" => args.ctrl_headroom = Some(it.next().and_then(|v| v.parse().ok()).filter(|h: &f64| *h >= 0.0).unwrap_or_else(|| usage())),
             "--horizon" => args.horizon = Some(it.next().and_then(|v| v.parse().ok()).filter(|h: &f64| *h > 0.0).unwrap_or_else(|| usage())),
             "-v" | "--verbose" => args.verbosity = Level::Debug,
             "-q" | "--quiet" => args.verbosity = Level::Warn,
@@ -341,6 +349,10 @@ fn override_config(cfg: &mut Config, args: &Args) -> Result<(), Box<dyn std::err
     if let Some(h) = args.horizon {
         cfg.globals.horizon_s = h;
     }
+    if let Some(h) = args.ctrl_headroom {
+        cfg.globals.t_ctrl_headroom = h;
+    }
+    cfg.globals.unified_caps |= args.unified_caps;
     cfg.check_governor()?;
     Ok(())
 }

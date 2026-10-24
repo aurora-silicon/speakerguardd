@@ -91,6 +91,12 @@ pub struct Globals {
     /// Unified governor: the regulator holds the coil this far below the
     /// working limit (K).
     pub t_ctrl_headroom: f64,
+    /// Unified governor, macOS-style axis caps (off by default): the thermal
+    /// reduction stops at t_reduction_max and the power-budget reduction at
+    /// p_reduction_max (dB); past them the coil may run up to its hard
+    /// limit, where the daemon hands the speakers to the kernel.
+    pub unified_caps: bool,
+    pub p_reduction_max: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -267,12 +273,15 @@ impl Config {
             horizon_s: or(g, "Globals", "horizon_s", 4.6)?,
             release_s: or(g, "Globals", "release_s", 20.0)?,
             t_ctrl_headroom: or(g, "Globals", "t_ctrl_headroom", 0.0)?,
+            unified_caps: boolean(g, "Globals", "unified_caps")?,
+            p_reduction_max: or(g, "Globals", "p_reduction_max", 0.0)?,
         };
         for (key, value) in [
             ("amp_gain_dbv", globals.amp_gain_dbv),
             ("horizon_s", globals.horizon_s),
             ("release_s", globals.release_s),
             ("t_ctrl_headroom", globals.t_ctrl_headroom),
+            ("p_reduction_max", globals.p_reduction_max),
         ] {
             if !value.is_finite() || value < 0.0 {
                 return Err(ConfigError(format!("[Globals] {key} must be finite and nonnegative")));
