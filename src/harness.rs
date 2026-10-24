@@ -44,6 +44,9 @@ use crate::guard::{Guard, Hw, BLIND_LIMIT, DRAIN, MUTE_DB};
 use crate::model::SpeakerState;
 use crate::state;
 
+/// The V/I machines' world (the J316 and the J413).
+pub mod vi;
+
 const J700: &str = include_str!("../conf/apple/j700.conf");
 /// The world's sample rate.
 const HARNESS_RATE: f64 = 16000.0;

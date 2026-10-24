@@ -270,6 +270,21 @@ found is a test of its own.
     cargo test --release harness                      # 200 cases
     SPEAKERGUARDD_CASES=1000000 cargo test --release harness
 
+`src/harness/vi.rs` does the same on the J316 and the J413, with the asahi
+governor writing a volume control per speaker and the unified models in
+shadow or governing.  Each stream has a share for each speaker and plays a
+sine or a square into a load of random impedance and phase, so V*I goes
+negative over part of every cycle.  The sense words are S16 V and I with up
+to 20 LSB of noise and fixed offsets, and periods can be bad sense data or
+reach the daemon late.  The gain is the amplifier's own or a copy queue's.
+Its oracle integrates the true power into the measured-power model and
+both feed-forward ones.  On top of the J700 world's properties it checks
+that no lock follows bad sense data before two good periods or holds a
+latched model, and, after a quiet tail as long as the daemon's own models
+need to cool, that the latch has cleared and the lock is back.
+
+    SPEAKERGUARDD_VI_CASES=100000 cargo test --release harness::vi
+
 ### Relation to speakersafetyd
 
 speakersafetyd protects the speakers of the other Apple laptops from the
