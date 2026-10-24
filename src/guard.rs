@@ -1017,7 +1017,9 @@ impl Guard {
     /// since the account's end is charged first.  Of the frames, those over
     /// time not yet accounted are integrated as a period is, every model
     /// the same way; the oldest of them only for its part over that time,
-    /// frames wholly over it not at all (review P8-3).
+    /// frames wholly over it not at all (review P8-3).  The loop places
+    /// every period with `place`; this is for the tests.
+    #[cfg(test)]
     fn measure(&mut self, end: Instant, frames: usize) -> Result<(), Box<dyn Error>> {
         self.measure_shifted(end, frames, 0)
     }
