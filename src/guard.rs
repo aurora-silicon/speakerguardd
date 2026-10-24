@@ -5215,4 +5215,30 @@ pub(crate) mod tests {
             assert!(cleared < secs(15.0) && rearmed < secs(30.0), "+-{n} LSB: cleared after {cleared:?}, taken back after {rearmed:?}");
         }
     }
+
+    /// Review X3: with nothing known (no state, as after every boot) the
+    /// V/I machines sat at the card's safe level for 163 s (J413) and
+    /// 127 s (J316) while the drain's magnet cooled.  The latched start now
+    /// holds the drain from coil and magnet at the limit
+    /// (engine::a_latched_start_bounds_every_past_it_stands_for), and the
+    /// lock comes back once the ramp allows, sooner.
+    #[test]
+    fn vi_a_start_with_nothing_known_takes_the_lock_back_sooner() {
+        let mut j316 = Config::parse(include_str!("../conf/apple/j316.conf")).unwrap();
+        j316.allow_unqualified = true;
+        for (cfg, within) in [(j413(), 70.0), (j316, 95.0)] {
+            let mut hw = FakeHw::per_speaker(&cfg);
+            hw.level = Box::new(|_| 0.0);
+            let mut g = Guard::start(&mut hw, &cfg, cfg.globals.max_reduction, missing_state()).unwrap();
+            assert!(asahi(&g).iter().all(|a| a.hard && a.th.t_coil >= 150.0));
+            while !g.armed() && hw.t < secs(300.0) {
+                g.tick(&mut hw).unwrap();
+            }
+            assert!(g.armed(), "{}: never taken back", cfg.speakers[0].name);
+            eprintln!("X3 {} speakers: the lock taken back after {:.1} s", cfg.speakers.len(), hw.t.as_secs_f64());
+            assert!(hw.t < secs(within), "{}: taken back after {:?}", cfg.speakers[0].name, hw.t);
+            let demand = g.engine.as_ref().unwrap().reductions(Governor::Asahi).into_iter().fold(0.0, f64::max);
+            assert!(demand < cfg.globals.max_reduction - REARM_MARGIN_DB);
+        }
+    }
 }

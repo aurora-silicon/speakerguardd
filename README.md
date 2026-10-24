@@ -174,9 +174,15 @@ hysteresis.  It differs only toward protection:
   each speaker's least reduction since the last verified boundary, instead
   of skipped.
 * The hard limit is checked at every sample, for the coil and the magnet.
-  A crossing latches.  Negative V*I after it in the same stretch leaves the
-  model at the limit at least, so a bad sample cannot hide the crossing,
-  while a latched model with no negative samples cools as it should.
+  A crossing latches.  Negative V*I beyond 1 mW after it in the same
+  stretch leaves the model at the limit at least, so a bad sample cannot
+  hide the crossing, while a latched model cools as it should through
+  sense noise (a few LSB, which makes nearly half the samples of a silent
+  period negative) or no negative samples at all.
+* After a hand-off, once what was converted at the old gain has drained,
+  uncovered time is charged at each control's value or the card's safe
+  level, whichever is more, until the lock is renewed: the card holds its
+  safe level while the daemon does not hold the lock.
 * A period whose mean V*I is below -0.01 W is bad sense data: uncovered
   time, charged at full scale, never measured.  The card goes to the kernel
   at once (which mutes these amplifiers), and two good periods in a row are
@@ -185,7 +191,11 @@ hysteresis.  It differs only toward protection:
 * The governor's state (temperatures, holds, gain, latch) is saved with the
   rest of the model and resumed only from a clean stop.  A missing state,
   or a run of speakersafetyd since boot (its flag file under /run), starts
-  every model latched, not at speakersafetyd's 119 C.
+  every model latched, not at speakersafetyd's 119 C: coil and magnet at
+  the hard limit with the half second of drain at full scale held on top.
+  On these speakers that keeps the card at its safe level for about a
+  minute after every boot (58 s on the J413, 84 s on the J316), mostly the
+  time their magnets take to cool from the limit.
 
 At the J413 tweeter's sensitivity a full-scale charge heats its model by
 about 2 C per millisecond, so stream edges and sense hiccups cost much more

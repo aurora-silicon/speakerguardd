@@ -99,14 +99,31 @@ impl Thermal {
         Thermal { tr_coil, tau_coil, tr_magnet, tau_magnet, t_coil: t, t_magnet: t }
     }
 
-    /// The coil at `t`, the magnet where steady state would put it.
-    pub fn set_at(&mut self, t: f64, t_ambient: f64) {
-        self.t_coil = t;
-        self.t_magnet = t_ambient + (t - t_ambient) * self.tr_magnet / (self.tr_magnet + self.tr_coil);
-    }
-
     pub fn finite(&self) -> bool {
         self.t_coil.is_finite() && self.t_magnet.is_finite()
+    }
+
+    /// A start that knows nothing of the speaker's past (review X3 of
+    /// speakerguardd#8).  The run before kept this model's coil and magnet
+    /// under `limit` (its latch hands the card over at either), so the
+    /// truth was under it too; after that it may have left its gain on the
+    /// samples still to play, up to the drain at `full` watts; after that
+    /// the card held its safe level, at most `safe` watts.  The two-node
+    /// model is monotone in its state and its power, so the bounds of the
+    /// drain held from (limit, limit), no lower than the steady state of
+    /// the safe level, hold every such past from then on, however long ago
+    /// the drain ended.  (The magnet used to start where steady state would
+    /// put it for the coil's bound, 736 C on the J413 tweeter where the
+    /// drain can take it to 203 C, and cooled for two minutes.)
+    pub fn latched_start(&mut self, limit: f64, full: f64, safe: f64, t_ambient: f64) -> (f64, f64) {
+        self.t_coil = limit;
+        self.t_magnet = limit;
+        let (coil, magnet) = self.hold(full, DRAIN_S, t_ambient);
+        let magnet = hi(magnet, t_ambient + safe * self.tr_magnet);
+        let coil = hi(coil, magnet + safe * self.tr_coil);
+        self.t_coil = coil;
+        self.t_magnet = magnet;
+        (coil, magnet)
     }
 
     /// The coil after `h` seconds at a constant `power`, in closed form:
@@ -443,12 +460,11 @@ impl AsahiSpeaker {
         }
     }
 
-    fn assume_latched(&mut self, t_ambient: f64) {
+    fn assume_latched(&mut self, g: &Globals) {
         // a run that died under the limit may have left its gain on the
         // queued samples: they play out for up to the drain at full scale
         let p = self.v_worst * self.v_worst / self.z_min;
-        let drain = p * self.th.tr_coil * (1.0 - (-DRAIN_S / self.th.tau_coil).exp());
-        self.th.set_at(self.t_limit + drain, t_ambient);
+        self.th.latched_start(self.t_limit, p, p * 10f64.powf(-g.safe_reduction.max(0.0) / 10.0), g.t_ambient);
         self.coil_peak = self.th.t_coil;
         self.magnet_peak = self.th.t_magnet;
         self.coil_hyst = self.th.t_coil;
@@ -646,19 +662,17 @@ impl UnifiedSpeaker {
         }
     }
 
-    fn assume_latched(&mut self, t_ambient: f64) {
+    fn assume_latched(&mut self, g: &Globals) {
         // the drain's heat on top of the limit, and a minute of full scale
         // in the budgets (nothing about the past is known)
+        let safe = 10f64.powf(-g.safe_reduction.max(0.0) / 10.0);
         let full_ff = self.v_worst * self.v_worst / self.r_ff;
-        let drain = |th: &Thermal, p: f64| p * th.tr_coil * (1.0 - (-DRAIN_S / th.tau_coil).exp());
-        let d = drain(&self.ff, full_ff);
-        self.ff.set_at(self.t_limit + d, t_ambient);
-        let mut peak = self.ff.t_coil;
+        let (c, m) = self.ff.latched_start(self.t_limit, full_ff, full_ff * safe, g.t_ambient);
+        let mut peak = hi(c, m);
         let full_vi = self.v_worst * self.v_worst / self.z_min;
         if let Some(v) = self.vi.as_mut() {
-            let d = drain(v, full_vi);
-            v.set_at(self.t_limit + d, t_ambient);
-            peak = peak.max(v.t_coil);
+            let (c, m) = v.latched_start(self.t_limit, full_vi, full_vi * safe, g.t_ambient);
+            peak = hi(peak, hi(c, m));
         }
         self.peak = peak;
         self.hard = true;
@@ -826,7 +840,7 @@ impl UnifiedSpeaker {
     /// released and the power history's last second and minute, the
     /// minute's energy as late as it could have been (model.rs).  A
     /// measured-power model the file does not carry starts latched.
-    pub fn resume(&mut self, x: &SavedUnified, t_ambient: f64) {
+    pub fn resume(&mut self, x: &SavedUnified) {
         self.ff.t_coil = x.ff.0;
         self.ff.t_magnet = x.ff.1;
         let mut peak = x.t_peak.max(x.ff.0);
@@ -839,7 +853,9 @@ impl UnifiedSpeaker {
                     peak = peak.max(c);
                 }
                 None => {
-                    vi.set_at(self.t_limit, t_ambient);
+                    // its coil and magnet were under the limit, no more
+                    vi.t_coil = self.t_limit;
+                    vi.t_magnet = self.t_limit;
                     peak = peak.max(self.t_limit);
                     missing = true;
                 }
@@ -929,12 +945,12 @@ impl Engine {
     /// Nothing is known about the speakers: every model at its hard limit,
     /// latched.
     pub fn assume_latched(&mut self) {
-        let ta = self.cfg.globals.t_ambient;
+        let g = self.cfg.globals.clone();
         for s in self.asahi.iter_mut().flatten() {
-            s.assume_latched(ta);
+            s.assume_latched(&g);
         }
         for s in self.unified.iter_mut().flatten() {
-            s.assume_latched(ta);
+            s.assume_latched(&g);
         }
     }
 
@@ -943,7 +959,8 @@ impl Engine {
     /// through (no daemon held the card since).  A speaker a model has no
     /// saved line for starts latched at its limit, uncharged.
     pub fn resume(&mut self, asahi: &[SavedAsahi], unified: &[SavedUnified], safe: f64, safe_db: f64) {
-        let ta = self.cfg.globals.t_ambient;
+        let g = self.cfg.globals.clone();
+        let ta = g.t_ambient;
         let names: Vec<String> = self.cfg.speakers.iter().map(|s| state_name(&s.name)).collect();
         for (k, s) in self.asahi.iter_mut().flatten().enumerate() {
             match asahi.iter().find(|x| x.name == names[k]) {
@@ -959,13 +976,13 @@ impl Engine {
                     s.coil_peak = pc;
                     s.magnet_peak = pm;
                 }
-                None => s.assume_latched(ta),
+                None => s.assume_latched(&g),
             }
         }
         for (k, s) in self.unified.iter_mut().flatten().enumerate() {
             match unified.iter().find(|x| x.name == names[k]) {
                 Some(x) => {
-                    s.resume(x, ta);
+                    s.resume(x);
                     let mut p = s.peak;
                     if safe > 0.0 {
                         s.worst(safe_db, safe, ta);
@@ -973,7 +990,7 @@ impl Engine {
                     }
                     s.peak = p;
                 }
-                None => s.assume_latched(ta),
+                None => s.assume_latched(&g),
             }
         }
     }
@@ -1346,6 +1363,68 @@ mod tests {
             // a fine step's own bound at most above the maximum
             let slack = (p * trc + (m0 - c0).abs()) * (h / n as f64) / tauc + 1e-6;
             assert!(bc <= mc + slack, "{trc}/{tauc}/{trm}/{taum} from {c0}/{m0} at {p} W for {h} s: bound {bc}, maximum {mc}");
+        }
+    }
+
+    /// Review X3 of speakerguardd#8: a start that knows nothing put the
+    /// magnet where steady state would put the drain's coil (736 C on the
+    /// J413 tweeter), and the V/I machines sat at their safe level for two
+    /// to three minutes.  The start holds the drain from coil and magnet
+    /// at the limit instead.  It is never early: from any state under the
+    /// limit, any part of the drain at full scale and any time at the safe
+    /// level after it, the truth is never hotter than the start's model at
+    /// any time after, nor under the working limit later.
+    #[test]
+    fn a_latched_start_bounds_every_past_it_stands_for() {
+        for text in [J316, J413, J700] {
+            let c = cfg(text);
+            let g = &c.globals;
+            let ta = g.t_ambient;
+            let mut e = Engine::new(&c, true).unwrap();
+            e.assume_latched();
+            let safe = 10f64.powf(-g.safe_reduction / 10.0);
+            for (k, s) in c.speakers.iter().enumerate() {
+                let u = &e.unified.as_ref().unwrap()[k];
+                let mut models = vec![(u.ff.clone(), u.v_worst * u.v_worst / u.r_ff)];
+                if let Some(v) = &u.vi {
+                    models.push((v.clone(), u.v_worst * u.v_worst / u.z_min));
+                }
+                if let Some(a) = e.asahi.as_ref().map(|a| &a[k]) {
+                    assert!(a.hard && a.th.t_coil >= s.t_limit);
+                    models.push((a.th.clone(), a.v_worst * a.v_worst / a.z_min));
+                }
+                let ceiling = s.t_limit - s.t_headroom;
+                for (start, full) in models {
+                    for c0 in [ta, 100.0, s.t_limit] {
+                        for m0 in [ta, 100.0, s.t_limit] {
+                            for drain in [0.0, 0.1, DRAIN_S / 2.0, DRAIN_S] {
+                                for gap in [0.0, 0.05, 2.0, 30.0] {
+                                    let mut truth = start.clone();
+                                    truth.t_coil = c0;
+                                    truth.t_magnet = m0;
+                                    truth.hold(full, drain, ta);
+                                    truth.hold(full * safe, gap, ta);
+                                    let mut model = start.clone();
+                                    let (mut t_cool, mut m_cool) = (None, None);
+                                    for i in 0..1200 {
+                                        assert!(model.t_coil >= truth.t_coil - 1e-9 && model.t_magnet >= truth.t_magnet - 1e-9,
+                                            "{}: from {c0}/{m0}, {drain} s of drain and {gap} s after it, the truth {:?} is hotter than the start {:?} {} s later", s.name, truth, model, i as f64 * 0.5);
+                                        if t_cool.is_none() && truth.hottest() < ceiling {
+                                            t_cool = Some(i);
+                                        }
+                                        if m_cool.is_none() && model.hottest() < ceiling {
+                                            m_cool = Some(i);
+                                        }
+                                        truth.hold(full * safe, 0.5, ta);
+                                        model.hold(full * safe, 0.5, ta);
+                                    }
+                                    assert!(m_cool.is_none() || m_cool >= t_cool, "{}: the start cools before the truth", s.name);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
