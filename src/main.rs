@@ -652,7 +652,14 @@ mod tests {
         };
         assert!(directive("Conflicts").iter().all(|v| !v.contains("speakersafetyd")), "the unit stops speakersafetyd: {:?}", directive("Conflicts"));
         assert!(directive("RestartPreventExitStatus").iter().any(|v| v.split_whitespace().any(|x| x == EXIT_REFUSED.to_string())), "a refusal is restarted");
-        let conf = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("conf");
+        // the configurations as built in, in a directory of their own (review
+        // Z5 of speakerguardd#8: read from the source tree at run time, a
+        // missing file passed the refusal half for the wrong reason)
+        let conf = std::env::temp_dir().join(format!("speakerguardd-x4-{}", std::process::id()));
+        std::fs::create_dir_all(conf.join("apple")).unwrap();
+        for (m, text) in [("j316", include_str!("../conf/apple/j316.conf")), ("j413", include_str!("../conf/apple/j413.conf")), ("j616", include_str!("../conf/apple/j616.conf")), ("j700", include_str!("../conf/apple/j700.conf"))] {
+            std::fs::write(conf.join("apple").join(format!("{m}.conf")), text).unwrap();
+        }
         for m in ["j316", "j413", "j616"] {
             let path = conf.join("apple").join(format!("{m}.conf"));
             let e = load_config(&path, &args(&conf)).expect_err("an unqualified machine was governed");
@@ -663,5 +670,6 @@ mod tests {
         assert!(load_config(&conf.join("apple").join("j700.conf"), &args(&conf)).is_ok());
         let other: Box<dyn std::error::Error> = "sense capture: EIO".into();
         assert_eq!(exit_status(other.as_ref()), 1);
+        let _ = std::fs::remove_dir_all(&conf);
     }
 }
