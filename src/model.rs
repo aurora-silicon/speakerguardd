@@ -23,10 +23,15 @@ pub struct SpeakerState {
     /// Gain reduction applied by the governor (dB, >= 0).
     pub reduction_db: f64,
     reducing: bool,
-    /// Power history for the budgets: (seconds, watts) per step, newest last.
+    /// Power history for the budgets: (seconds, watts before the card's
+    /// gain) per step, newest last.
     history: std::collections::VecDeque<(f64, f64)>,
     history_s: f64,
 }
+
+/// The most card gain undone when working out the power before it (dB):
+/// past this the sensed words are too quiet to say what the music was.
+pub const PRE_GAIN_MAX_DB: f64 = 30.0;
 
 impl SpeakerState {
     pub fn new(spec: Speaker, t_ambient: f64) -> SpeakerState {
@@ -61,12 +66,24 @@ impl SpeakerState {
         (sum / frames as f64).sqrt()
     }
 
-    /// Advance the thermal model by `dt` seconds with `power` watts in the coil.
+    /// Advance the thermal model by `dt` seconds with `power` watts in the
+    /// coil, the card at full gain.
     pub fn step(&mut self, power: f64, dt: f64, t_ambient: f64) {
+        self.step_at(power, dt, t_ambient, 0.0)
+    }
+
+    /// Advance the thermal model by `dt` seconds with `power` watts in the
+    /// coil while the card applied `applied_db` of reduction.  The coil
+    /// heats with the power it got; the budgets keep the power before the
+    /// card's gain, so that the reduction they ask for is the whole one
+    /// that brings the mean to the budget, not only what is left over the
+    /// reduction already applied.
+    pub fn step_at(&mut self, power: f64, dt: f64, t_ambient: f64, applied_db: f64) {
         let s = &self.spec;
         self.power = power;
+        let pre = power * 10f64.powf(applied_db.clamp(0.0, PRE_GAIN_MAX_DB) / 10.0);
         // keep one minute of history for the budgets
-        self.history.push_back((dt, power));
+        self.history.push_back((dt, pre));
         self.history_s += dt;
         while self.history_s > 60.0 {
             if let Some((old_dt, _)) = self.history.pop_front() {
@@ -114,8 +131,8 @@ impl SpeakerState {
         self.history_s = 60.0;
     }
 
-    /// Mean power over the last `seconds` (W); time before the first step
-    /// counts as silence.
+    /// Mean power before the card's gain over the last `seconds` (W); time
+    /// before the first step counts as silence.
     pub fn mean_power(&self, seconds: f64) -> f64 {
         let mut t = 0.0;
         let mut e = 0.0;
@@ -130,8 +147,8 @@ impl SpeakerState {
         e / seconds
     }
 
-    /// The reduction (dB) the power budgets ask for: enough to bring the
-    /// windowed mean power back to its limit.
+    /// The reduction (dB) the power budgets ask for: what brings the mean
+    /// power the speaker gets over each window to its limit.
     fn budget_reduction(&self) -> f64 {
         let mut db: f64 = 0.0;
         for (seconds, limit) in [(1.0, self.spec.p_limit_1s), (60.0, self.spec.p_limit_60s)] {
