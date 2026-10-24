@@ -249,10 +249,10 @@ opens, failed control writes and the daemon's own lateness (neither is
 replayed), periods played louder than recorded where the recording cannot
 say what the program was, and an early end.  With the recorded governor at
 0 dB it also compares its lock and latch transitions with the live ones.
-Its account is compared with the live one in every case: time the live
-daemon charged that the replay measured or cooled, time it measured that
-the replay cooled, or a replayed account that ends early, all refuse the
-certificate.  It certifies a recording only when none of that is there, the
+Its account is compared with the live one in every case, span by whole
+span to a frame at each end: time the live daemon charged that the replay
+measured or cooled, time it measured that the replay cooled, or a replayed
+account that ends early, all refuse the certificate.  It certifies a recording only when none of that is there, the
 transitions match and nothing it measured was lost or rejected in the
 recording; otherwise it says why and exits with status 3.  Recordings from
 before 0.1.10 (format 2) are not read.  A certificate is about the

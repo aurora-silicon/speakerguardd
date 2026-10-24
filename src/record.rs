@@ -1149,6 +1149,8 @@ pub fn replay(path: &Path, cfg: &Config, opts: &Replay) -> Result<Outcome, Box<d
     let live_latches = tl.latches.clone();
     let live_account = tl.accounts.clone();
     let live_end = live_account.iter().map(|a| a.1).max();
+    // the recording's fastest rate (its frame is the account's resolution)
+    let fastest = tl.rates.iter().map(|r| r.1).chain(tl.periods.iter().map(|p| p.rate as i64)).filter(|&r| r > 0).max().unwrap_or(48000);
     let (start, last, config_matches) = (tl.start, tl.last, fingerprint(&cfg) == tl.config);
     let initial = tl.state.clone();
     let recorded_gov = tl.governor;
@@ -1260,10 +1262,14 @@ pub fn replay(path: &Path, cfg: &Config, opts: &Replay) -> Result<Outcome, Box<d
         .copied()
         .filter(|&(a, b)| spans.iter().any(|s| s.2 == Accounted::Measured && s.0 + slack < b && a + slack < s.1))
         .collect();
-    // The account against the live one's (review P8-8): inside each live
-    // span, outside a band at each end, time the live daemon charged must
-    // be charged here and time it measured must not be cooled.
-    let band = Duration::from_millis(5);
+    // The account against the live one's (review P8-8): over each whole
+    // live span, time the live daemon charged must be charged here and time
+    // it measured must not be cooled.  The replay places frames to a frame
+    // of where the live daemon did, so each span may differ by up to a
+    // frame at each end at the recording's fastest rate, and by nothing
+    // more (review X5 of speakerguardd#8: a band of 5 ms at each end left
+    // every span under 10 ms uncompared).
+    let band = Duration::from_secs_f64(1.0 / fastest as f64);
     let overlap = |a: Duration, b: Duration, pred: &dyn Fn(Accounted) -> bool| -> Duration {
         let i = spans.partition_point(|s| s.1 <= a);
         spans[i..].iter().take_while(|s| s.0 < b).filter(|s| pred(s.2)).map(|s| s.1.min(b).saturating_sub(s.0.max(a))).sum()
@@ -1271,19 +1277,15 @@ pub fn replay(path: &Path, cfg: &Config, opts: &Replay) -> Result<Outcome, Box<d
     let (mut uncharged, mut cooled_measured) = (Duration::ZERO, Duration::ZERO);
     let mut first_uncharged = None;
     for &(a, b, how) in &live_account {
-        let (a, b) = (a + band, b.saturating_sub(band));
-        if a >= b {
-            continue;
-        }
         match how {
             Accounted::Charged => {
-                let d = overlap(a, b, &|h| h != Accounted::Charged);
+                let d = overlap(a, b, &|h| h != Accounted::Charged).saturating_sub(2 * band);
                 if !d.is_zero() {
-                    first_uncharged.get_or_insert(a - band);
+                    first_uncharged.get_or_insert(a);
                 }
                 uncharged += d;
             }
-            Accounted::Measured => cooled_measured += overlap(a, b, &|h| h == Accounted::Cooled),
+            Accounted::Measured => cooled_measured += overlap(a, b, &|h| h == Accounted::Cooled).saturating_sub(2 * band),
             Accounted::Cooled => {}
         }
     }
@@ -1362,11 +1364,10 @@ pub fn replay(path: &Path, cfg: &Config, opts: &Replay) -> Result<Outcome, Box<d
         let _ = writeln!(o, "equivalence with the live run: not compared (another governor, gain, --max-reduction or configuration)");
     }
     let mut refused = Vec::new();
-    let tiny = Duration::from_micros(500);
-    if uncharged > tiny {
+    if !uncharged.is_zero() {
         refused.push(format!("the replay did not charge {:.1} ms the live daemon charged (from {:.3} s)", uncharged.as_secs_f64() * 1000.0, first_uncharged.map_or(0.0, rel)));
     }
-    if cooled_measured > tiny {
+    if !cooled_measured.is_zero() {
         refused.push(format!("the replay cooled {:.1} ms the live daemon measured", cooled_measured.as_secs_f64() * 1000.0));
     }
     if let Some(e) = live_end {
@@ -1709,6 +1710,31 @@ mod tests {
         drop(r);
         let out = replay(&short, &c, &Replay { gain_db: 0.0, governor: None, max_reduction: None, csv: None }).unwrap();
         assert!(out.text.contains("it ends at 0.020 s, here at 0.020 s"), "{}", out.text);
+    }
+
+    /// Review X5 of speakerguardd#8: the comparison left out 5 ms at each
+    /// end of every live span, so a charged span under 10 ms that the
+    /// replay cooled was never compared and the recording certified.  Whole
+    /// spans are compared now, to a frame at each end.
+    #[test]
+    fn a_short_live_charge_the_replay_cools_is_refused() {
+        let c = j413();
+        let state = std::fs::read_to_string(vi_state(&c, 55.0, 52.0)).unwrap();
+        let t0 = 1_000_000_000_000u64;
+        let us = 1_000u64;
+        for len in [8000u64, 1000, 200] {
+            let path = tmp(&format!("short-{len}.rec"));
+            let mut r = Recorder::create(&path, &c, true, 1 << 20).unwrap();
+            r.start(t0, Governor::Asahi, 7.0, &state).unwrap();
+            r.rate(t0, 0).unwrap();
+            r.permit(t0, true, "lock taken").unwrap();
+            r.account(t0 + 20_000 * us, t0, Accounted::Cooled).unwrap();
+            r.account(t0 + (20_000 + len) * us, t0 + 20_000 * us, Accounted::Charged).unwrap();
+            r.account(t0 + (115_000 + len) * us, t0 + (20_000 + len) * us, Accounted::Cooled).unwrap();
+            drop(r);
+            let out = replay(&path, &c, &Replay { gain_db: 0.0, governor: None, max_reduction: None, csv: None }).unwrap();
+            assert!(!out.certified && out.text.contains("the replay did not charge"), "{len} us charged live:\n{}", out.text);
+        }
     }
 
     /// Review P8-8 (parser): a complete period header with its words cut off
