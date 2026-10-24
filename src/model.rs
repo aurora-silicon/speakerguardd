@@ -262,11 +262,15 @@ impl SpeakerState {
         self.t_magnet = t_magnet;
         self.t_peak = t_coil;
         self.hard = false;
+        // Two means do not say when in the minute the energy came.  The
+        // most the minute budget can see of it later is all of it as late
+        // as possible: the last second's own energy, and the rest in the
+        // second before it, so it stays in the minute window for 58 s.
         self.history.clear();
-        let earlier = ((60.0 * mean_60s - mean_1s) / 59.0).max(0.0);
-        self.history.push_back((59.0, earlier));
+        let earlier = (60.0 * mean_60s - mean_1s).max(0.0);
+        self.history.push_back((1.0, earlier));
         self.history.push_back((1.0, mean_1s));
-        self.history_s = 60.0;
+        self.history_s = 2.0;
     }
 
     /// The governor's state a restart keeps: the latched fault, the peak

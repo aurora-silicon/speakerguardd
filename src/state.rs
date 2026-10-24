@@ -22,7 +22,7 @@ use crate::config::Globals;
 use crate::model::SpeakerState;
 
 const MAGIC: &str = "speakerguardd-state 2";
-/// The format 0.1.2 to 0.1.5 wrote: no coverage epoch, no latch.
+/// The format 0.1.2 to 0.1.5 wrote: never resumed.
 const MAGIC_V1: &str = "speakerguardd-state 1";
 
 #[derive(Debug, Clone, PartialEq)]
@@ -34,30 +34,33 @@ pub struct SavedSpeaker {
     pub mean_60s: f64,
     /// The governor's reduction being released (dB).
     pub reduction_db: f64,
-    /// The latched hard fault and the peak bound (None in a v1 file).
-    pub hard: Option<bool>,
-    pub t_peak: Option<f64>,
+    /// The latched hard fault and the peak bound.
+    pub hard: bool,
+    pub t_peak: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Saved {
     /// When the file was written.
     pub boottime: Duration,
-    /// Up to when the model it holds has accounted the speakers' power:
-    /// time after this is unknown to it, whatever the file's write time.
+    /// Up to when the model it holds has accounted the speakers' power.
     pub covered: Duration,
-    /// Whether the run that wrote it may have held the card's volume lock
-    /// (a file without the line counts as one that may have).
+    /// Whether the run held the card's volume lock at the write (status).
     pub armed: bool,
+    /// Written by a clean stop: the lock given up, its converted samples
+    /// drained, every moment up to `covered` accounted.  Only such a state
+    /// is resumed.
+    pub released: bool,
     pub speakers: Vec<SavedSpeaker>,
 }
 
-pub fn encode(boottime: Duration, covered: Duration, speakers: &[SpeakerState], armed: bool) -> String {
+pub fn encode(boottime: Duration, covered: Duration, speakers: &[SpeakerState], armed: bool, released: bool) -> String {
     let mut out = format!(
-        "{MAGIC}\nboottime_ns {}\ncovered_ns {}\narmed {}\n",
+        "{MAGIC}\nboottime_ns {}\ncovered_ns {}\narmed {}\nreleased {}\n",
         boottime.as_nanos(),
         covered.min(boottime).as_nanos(),
-        armed as u8
+        armed as u8,
+        (released && !armed) as u8
     );
     out += "# speaker name t_coil_C t_magnet_C mean_1s_W mean_60s_W v_rms_V reduction_dB hard t_peak_C\n";
     for s in speakers {
@@ -78,7 +81,8 @@ pub fn encode(boottime: Duration, covered: Duration, speakers: &[SpeakerState], 
     out
 }
 
-/// None for anything but a complete, finite, physically possible state.
+/// None for anything but a complete, finite, physically possible v2 state.
+/// A v1 file decodes as never released (it is not resumed).
 pub fn decode(text: &str) -> Option<Saved> {
     let mut lines = text.lines();
     let v2 = match lines.next()? {
@@ -90,6 +94,7 @@ pub fn decode(text: &str) -> Option<Saved> {
     let mut covered = None;
     let mut speakers = Vec::new();
     let mut armed = true;
+    let mut released = false;
     let mut ended = false;
     for line in lines {
         if ended {
@@ -102,12 +107,17 @@ pub fn decode(text: &str) -> Option<Saved> {
             ended = true;
             continue;
         }
+        let flag = |v: &str| match v {
+            "0" => Some(false),
+            "1" => Some(true),
+            _ => None,
+        };
         if let Some(v) = line.strip_prefix("armed ") {
-            armed = match v {
-                "0" => false,
-                "1" => true,
-                _ => return None,
-            };
+            armed = flag(v)?;
+            continue;
+        }
+        if let Some(v) = line.strip_prefix("released ") {
+            released = flag(v)?;
             continue;
         }
         if let Some(v) = line.strip_prefix("covered_ns ") {
@@ -124,63 +134,41 @@ pub fn decode(text: &str) -> Option<Saved> {
             return None;
         }
         let (hard, t_peak) = if v2 {
-            let hard = match f[8] {
-                "0" => false,
-                "1" => true,
-                _ => return None,
-            };
             let peak: f64 = f[9].parse().ok().filter(|p: &f64| p.is_finite())?;
-            (Some(hard), Some(peak))
+            (flag(f[8])?, peak)
         } else {
-            (None, None)
+            (true, v[0])
         };
         speakers.push(SavedSpeaker { name: f[1].to_string(), t_coil: v[0], t_magnet: v[1], mean_1s: v[2], mean_60s: v[3], reduction_db: v[5], hard, t_peak });
     }
-    // a v2 file is whole only with its end line
     if speakers.is_empty() || (v2 && !ended) {
         return None;
     }
-    // a v1 file says nothing about coverage: its write time is all there is
-    let covered = Duration::from_nanos(covered.unwrap_or(ns).min(ns));
-    if v2 && covered > Duration::from_nanos(ns) {
-        return None;
-    }
-    Some(Saved { boottime: Duration::from_nanos(ns), covered, armed, speakers })
+    let covered = Duration::from_nanos(covered.unwrap_or(0).min(ns));
+    Some(Saved { boottime: Duration::from_nanos(ns), covered, armed, released: v2 && released && !armed, speakers })
 }
 
-/// Continue every speaker from the saved state, and charge the time since
-/// the model's coverage ended (`now` is the time since boot): while the
-/// run that wrote it may have held the card, that is everything up to the
-/// file's write time and the `tail` after it, at full gain; the rest, and
-/// all of it after a run that had released the card, at the worst case the
-/// card's safe level lets through.  A speaker the file does not name starts
-/// latched at its limit.
-pub fn restore(speakers: &mut [SpeakerState], saved: &Saved, now: Duration, tail: Duration, globals: &Globals) {
-    let elapsed = now.saturating_sub(saved.covered).as_secs_f64();
-    let held = saved.boottime.saturating_sub(saved.covered).as_secs_f64() + tail.as_secs_f64();
+/// Continue every speaker from a clean stop's state and charge the time
+/// since at the worst case the card's own safe level lets through (no
+/// daemon held the card).  Anything else - a v1 file, a state not written
+/// by a clean stop, one whose model did not cover up to its write, a
+/// speaker it does not name - starts at the coil's limit, latched.  True
+/// if the state was resumed.
+pub fn restore(speakers: &mut [SpeakerState], saved: &Saved, now: Duration, globals: &Globals) -> bool {
+    let proven = saved.released && saved.covered == saved.boottime;
+    let elapsed = now.saturating_sub(saved.boottime).as_secs_f64();
     for s in speakers.iter_mut() {
-        match saved.speakers.iter().find(|x| x.name == s.spec.name) {
-            Some(x) => {
-                s.resume(x.t_coil, x.t_magnet, x.mean_1s, x.mean_60s);
-                s.resume_governor(x.hard, x.t_peak.unwrap_or(x.t_coil), x.reduction_db);
-            }
-            None => {
+        let x = match saved.speakers.iter().find(|x| x.name == s.spec.name) {
+            Some(x) if proven => x,
+            _ => {
                 s.assume_latched(globals.t_ambient);
                 continue;
             }
-        }
-        let mut left = elapsed;
-        if saved.armed {
-            let t = left.min(held);
-            if t > 0.0 {
-                s.step_at(s.worst_case_power(0.0), t, globals.t_ambient, 0.0);
-                left -= t;
-            }
-        }
-        // the safe level's worst case, as it reached the speaker (the
-        // budgets' "before the card's gain" history is about this run's
-        // gain, not the kernel's)
+        };
+        s.resume(x.t_coil, x.t_magnet, x.mean_1s, x.mean_60s);
+        s.resume_governor(Some(x.hard), x.t_peak, x.reduction_db);
         let p = s.worst_case_power(globals.safe_reduction);
+        let mut left = elapsed;
         if left > 3600.0 {
             // an hour at it is its steady state for any real speaker
             let hard = s.hard;
@@ -194,6 +182,7 @@ pub fn restore(speakers: &mut [SpeakerState], saved: &Saved, now: Duration, tail
             }
         }
     }
+    proven
 }
 
 #[cfg(test)]
@@ -202,7 +191,6 @@ mod tests {
     use crate::config::Config;
 
     const J700: &str = include_str!("../conf/apple/j700.conf");
-    const TAIL: Duration = Duration::from_millis(1500);
 
     fn hot() -> (Config, Vec<SpeakerState>) {
         let cfg = Config::parse(J700).unwrap();
@@ -215,178 +203,177 @@ mod tests {
         (cfg, sp)
     }
 
+    fn fresh(cfg: &Config) -> Vec<SpeakerState> {
+        cfg.speakers.iter().map(|s| SpeakerState::new(s.clone(), cfg.globals.t_ambient)).collect()
+    }
+
+    const T: Duration = Duration::from_secs(100);
+
     #[test]
     fn round_trip() {
-        let (_, sp) = hot();
-        let text = encode(Duration::from_secs(42), Duration::from_secs(42), &sp, true);
-        let saved = decode(&text).unwrap();
-        assert_eq!(saved.boottime, Duration::from_secs(42));
+        let (_, mut sp) = hot();
+        sp[0].hard = true;
+        sp[0].t_peak = 131.0;
+        let saved = decode(&encode(T, T, &sp, false, true)).unwrap();
+        assert_eq!(saved.boottime, T);
+        assert_eq!(saved.covered, T);
+        assert!(saved.released && !saved.armed);
         assert_eq!(saved.speakers.len(), 2);
         assert!((saved.speakers[0].t_coil - sp[0].t_coil).abs() < 1e-5);
+        assert!(saved.speakers[0].hard && (saved.speakers[0].t_peak - 131.0).abs() < 1e-5);
         assert!((saved.speakers[1].mean_60s - sp[1].mean_power(60.0)).abs() < 1e-5);
+        // a held card is never a release
+        assert!(!decode(&encode(T, T, &sp, true, true)).unwrap().released);
     }
 
     #[test]
     fn rejects_damaged_files() {
         let (_, sp) = hot();
-        let good = encode(Duration::from_secs(1), Duration::from_secs(1), &sp, true);
+        let good = encode(T, T, &sp, false, true);
         assert!(decode("").is_none());
         assert!(decode(&good.replace("speakerguardd-state 2", "speakerguardd-state 3")).is_none());
-        assert!(decode(&good[..good.len() - 10]).is_none());
+        let end = good.find("\nend").unwrap() + 4;
+        for n in 0..end {
+            assert!(decode(&good[..n]).is_none(), "accepted a prefix of {n} bytes");
+        }
         let nan = good.replacen(&format!("{:.6}", sp[0].t_coil), "NaN", 1);
         assert!(decode(&nan).is_none());
-        assert!(decode(&format!("{MAGIC}\nboottime_ns 5\n")).is_none());
     }
 
-    /// A restarted daemon continues hot: right away it asks for the same
-    /// reduction the old one had, and only time without power cools it.
+    /// Only a clean stop's state is resumed: released, and its model
+    /// covering up to its write.
     #[test]
-    fn a_restart_resumes_a_hot_model_and_cools_it_by_the_gap() {
+    fn only_a_clean_stop_is_resumed() {
         let (cfg, sp) = hot();
         let g = &cfg.globals;
-        let saved = decode(&encode(Duration::from_secs(100), Duration::from_secs(100), &sp, true)).unwrap();
-        let mut fresh: Vec<SpeakerState> = cfg.speakers.iter().map(|s| SpeakerState::new(s.clone(), g.t_ambient)).collect();
-        restore(&mut fresh, &saved, Duration::from_secs(100), TAIL, g);
-        assert!((fresh[0].t_coil - sp[0].t_coil).abs() < 1e-5);
-        assert!(fresh[0].t_coil > 90.0, "{}", fresh[0].t_coil);
-        assert!((fresh[0].mean_power(60.0) - sp[0].mean_power(60.0)).abs() < 1e-3);
-        // a run that had released the card: the gap cools at the safe level
-        let released = decode(&encode(Duration::from_secs(100), Duration::from_secs(100), &sp, false)).unwrap();
-        let mut later: Vec<SpeakerState> = cfg.speakers.iter().map(|s| SpeakerState::new(s.clone(), g.t_ambient)).collect();
-        restore(&mut later, &released, Duration::from_secs(110), TAIL, g);
-        assert!(later[0].t_coil < fresh[0].t_coil - 10.0, "{} vs {}", later[0].t_coil, fresh[0].t_coil);
-        assert!(later[0].t_coil > g.t_ambient);
-        // ...and never below the steady state of the safe level's worst case
+        for (text, want) in [
+            (encode(T, T, &sp, false, true), true),
+            (encode(T, T, &sp, false, false), false),
+            (encode(T, T, &sp, true, false), false),
+            (encode(T, T - Duration::from_millis(50), &sp, false, true), false),
+        ] {
+            let saved = decode(&text).unwrap();
+            let mut f = fresh(&cfg);
+            assert_eq!(restore(&mut f, &saved, T, g), want, "{text}");
+            if want {
+                assert!((f[0].t_coil - sp[0].t_coil).abs() < 1e-5 && !f[0].hard);
+            } else {
+                assert!(f.iter().all(|s| s.hard && s.t_coil >= s.spec.t_limit), "not resumed, so latched at the limit");
+            }
+        }
+    }
+
+    /// A clean stop's state is cooled over the gap at the safe level's
+    /// worst case (no daemon held the card), never below its steady state.
+    #[test]
+    fn a_resumed_state_cools_at_the_safe_level() {
+        let (cfg, sp) = hot();
+        let g = &cfg.globals;
+        let saved = decode(&encode(T, T, &sp, false, true)).unwrap();
+        let mut later = fresh(&cfg);
+        assert!(restore(&mut later, &saved, T + Duration::from_secs(10), g));
+        assert!(later[0].t_coil < sp[0].t_coil - 10.0, "{} vs {}", later[0].t_coil, sp[0].t_coil);
         let floor = {
             let s = &later[0];
-            let p = s.worst_case_power(g.safe_reduction);
-            g.t_ambient + p * (s.spec.tr_coil + s.spec.tr_magnet)
+            g.t_ambient + s.worst_case_power(g.safe_reduction) * (s.spec.tr_coil + s.spec.tr_magnet)
         };
-        let mut cold: Vec<SpeakerState> = cfg.speakers.iter().map(|s| SpeakerState::new(s.clone(), g.t_ambient)).collect();
-        restore(&mut cold, &released, Duration::from_secs(7300), TAIL, g);
+        let mut cold = fresh(&cfg);
+        restore(&mut cold, &saved, T + Duration::from_secs(7200), g);
         assert!((cold[0].t_coil - floor).abs() < 0.5, "{} vs {floor}", cold[0].t_coil);
     }
 
-    /// Review F5 (speakerguardd#6, also in 0.1.2): the time after a
-    /// snapshot of a run that held the card is not silence.  A 119 C coil
-    /// saved one second before the restart restored to 108.8 C in 0.1.2;
-    /// it must not come back colder than it was.
-    #[test]
-    fn the_time_after_a_snapshot_of_a_held_card_is_not_cooled() {
-        let (cfg, mut sp) = hot();
-        let g = &cfg.globals;
-        for s in sp.iter_mut() {
-            s.resume(119.0, 95.0, 0.0, 0.0);
-        }
-        let saved = decode(&encode(Duration::from_secs(100), Duration::from_secs(100), &sp, true)).unwrap();
-        assert!(saved.armed);
-        let mut fresh: Vec<SpeakerState> = cfg.speakers.iter().map(|s| SpeakerState::new(s.clone(), g.t_ambient)).collect();
-        restore(&mut fresh, &saved, Duration::from_secs(101), TAIL, g);
-        assert!(fresh[0].t_coil >= 119.0, "restored to {:.3} C", fresh[0].t_coil);
-        // a file without the armed line (0.1.2 wrote one; damaged ones may not) counts as held
-        let text = encode(Duration::from_secs(100), Duration::from_secs(100), &sp, false).replace("armed 0\n", "");
-        assert!(decode(&text).unwrap().armed);
-    }
-
-    #[test]
-    fn an_unknown_speaker_starts_latched() {
-        let (cfg, sp) = hot();
-        let mut saved = decode(&encode(Duration::ZERO, Duration::ZERO, &sp, false)).unwrap();
-        saved.speakers.retain(|s| s.name == "Left");
-        let mut fresh: Vec<SpeakerState> = cfg.speakers.iter().map(|s| SpeakerState::new(s.clone(), 50.0)).collect();
-        restore(&mut fresh, &saved, Duration::ZERO, TAIL, &cfg.globals);
-        assert_eq!(fresh[1].t_coil, 135.0);
-        assert!(fresh[1].hard, "an unknown speaker starts latched");
-    }
-
-    /// A v1 file (0.1.2 to 0.1.5) still restores; its coverage is its write
-    /// time, and a coil not under the working ceiling comes back latched.
-    #[test]
-    fn a_v1_file_restores_conservatively() {
-        let (cfg, mut sp) = hot();
-        let g = &cfg.globals;
-        for s in sp.iter_mut() {
-            s.resume(131.9, 100.0, 0.0, 0.0);
-        }
-        let v1 = encode(Duration::from_secs(100), Duration::from_secs(100), &sp, false)
-            .replace("speakerguardd-state 2", "speakerguardd-state 1")
-            .lines()
-            .filter(|l| !l.starts_with("covered_ns"))
-            .map(|l| if l.starts_with("speaker ") { l.split_whitespace().take(8).collect::<Vec<_>>().join(" ") } else { l.to_string() })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let saved = decode(&v1).expect("v1 decodes");
-        assert_eq!(saved.covered, saved.boottime);
-        assert_eq!(saved.speakers[0].hard, None);
-        let mut fresh: Vec<SpeakerState> = cfg.speakers.iter().map(|s| SpeakerState::new(s.clone(), g.t_ambient)).collect();
-        restore(&mut fresh, &saved, Duration::from_secs(100), TAIL, g);
-        assert!(fresh[0].hard, "131.9 C without a latch record must come back latched");
-    }
-
-    /// Review R4: the latch and its peak survive a restart.  0.1.3 wrote
-    /// neither, and a run latched at a 135.3 C peak, saved at 131.9 C,
-    /// rearmed after a restart at 127.0 C (16.6 dB).
     #[test]
     fn the_hard_latch_survives_a_restart() {
         let (cfg, mut sp) = hot();
-        let g = &cfg.globals;
         for s in sp.iter_mut() {
             s.resume(131.9, 100.0, 0.0, 0.0);
             s.hard = true;
             s.t_peak = 135.256;
         }
-        let saved = decode(&encode(Duration::from_secs(100), Duration::from_secs(100), &sp, false)).unwrap();
-        assert_eq!(saved.speakers[0].hard, Some(true));
-        let mut fresh: Vec<SpeakerState> = cfg.speakers.iter().map(|s| SpeakerState::new(s.clone(), g.t_ambient)).collect();
-        restore(&mut fresh, &saved, Duration::from_millis(100_050), TAIL, g);
-        assert!(fresh[0].hard && fresh[0].t_peak >= 131.9);
-        assert!(!fresh[0].clear_hard_if_cool(), "cleared above the ceiling");
+        let saved = decode(&encode(T, T, &sp, false, true)).unwrap();
+        let mut f = fresh(&cfg);
+        assert!(restore(&mut f, &saved, T + Duration::from_millis(50), &cfg.globals));
+        assert!(f[0].hard && f[0].t_peak >= 131.9);
+        assert!(!f[0].clear_hard_if_cool(), "cleared above the ceiling");
     }
 
-    /// Review R2: the time between the model's coverage and the file's
-    /// write is charged on restore.  0.1.3 stamped a snapshot as current
-    /// over 50 ms of unaccounted playback and restored it as is.
     #[test]
-    fn the_time_before_the_write_is_charged_from_the_coverage_epoch() {
-        let (cfg, mut sp) = hot();
-        let g = &cfg.globals;
-        for s in sp.iter_mut() {
-            s.resume(56.829, 52.0, 0.0, 0.0);
-        }
-        let saved = decode(&encode(Duration::from_millis(100_050), Duration::from_millis(100_000), &sp, true)).unwrap();
-        assert_eq!(saved.covered, Duration::from_millis(100_000));
-        let mut fresh: Vec<SpeakerState> = cfg.speakers.iter().map(|s| SpeakerState::new(s.clone(), g.t_ambient)).collect();
-        // a restart with no time since the write: the 50 ms before it still counts
-        restore(&mut fresh, &saved, Duration::from_millis(100_050), TAIL, g);
-        let mut want = fresh[0].clone();
-        want.resume(56.829, 52.0, 0.0, 0.0);
-        want.step_at(want.worst_case_power(0.0), 0.05, g.t_ambient, 0.0);
-        assert!(fresh[0].t_coil >= want.t_coil - 1e-9, "{} vs {}", fresh[0].t_coil, want.t_coil);
+    fn an_unknown_speaker_starts_latched() {
+        let (cfg, sp) = hot();
+        let mut saved = decode(&encode(T, T, &sp, false, true)).unwrap();
+        saved.speakers.retain(|s| s.name == "Left");
+        let mut f = fresh(&cfg);
+        restore(&mut f, &saved, T, &cfg.globals);
+        assert_eq!(f[1].t_coil, 135.0);
+        assert!(f[1].hard);
     }
 
-    /// Review R5: the first update after a restore keeps the minute's
-    /// energy.  0.1.3 dropped the whole 59 s entry on the first step: an
-    /// 8 W minute read 0.13 W two seconds later.
+    /// Review r3 T7: a v1 file (0.1.2 to 0.1.5) has no coverage and no clean
+    /// stop: it is never resumed.  0.1.6 took its write time as coverage and
+    /// restored 100 C where 50 ms of full gain before the write needed 107 C.
+    #[test]
+    fn a_v1_file_is_never_resumed() {
+        let (cfg, mut sp) = hot();
+        for s in sp.iter_mut() {
+            s.resume(100.0, 100.0, 0.0, 0.0);
+        }
+        let v1 = encode(T, T, &sp, false, true)
+            .replace("speakerguardd-state 2", "speakerguardd-state 1")
+            .lines()
+            .filter(|l| !l.starts_with("covered_ns") && !l.starts_with("released") && *l != "end")
+            .map(|l| if l.starts_with("speaker ") { l.split_whitespace().take(8).collect::<Vec<_>>().join(" ") } else { l.to_string() })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let saved = decode(&v1).expect("v1 decodes");
+        assert!(!saved.released);
+        let mut f = fresh(&cfg);
+        assert!(!restore(&mut f, &saved, T, &cfg.globals));
+        assert!(f[0].hard && f[0].t_coil >= 107.251);
+    }
+
+    /// Review r3 T5: two saved means do not say when in the minute the
+    /// energy came.  A minute of 29 s quiet, 30 s at 10 W before the gain
+    /// and 1 s quiet still means 5 W twenty seconds later; 0.1.6's uniform
+    /// reconstruction had aged it to 3.3 W.  The restore keeps the energy
+    /// as late as it could be.
+    #[test]
+    fn the_minute_budget_keeps_energy_as_late_as_it_could_be() {
+        let cfg = Config::parse(J700).unwrap();
+        let mut sp = fresh(&cfg);
+        for s in sp.iter_mut() {
+            for _ in 0..290 { s.step_at(0.0, 0.1, 50.0, 10.0); }
+            for _ in 0..300 { s.step_at(1.0, 0.1, 50.0, 10.0); }
+            for _ in 0..10 { s.step_at(0.0, 0.1, 50.0, 10.0); }
+        }
+        let saved = decode(&encode(T, T, &sp, false, true)).unwrap();
+        let mut restored = fresh(&cfg);
+        assert!(restore(&mut restored, &saved, T, &cfg.globals));
+        for step in 0..600 {
+            for s in sp.iter_mut().chain(restored.iter_mut()) {
+                s.step(0.0, 0.1, 50.0);
+                s.govern(&cfg.globals);
+            }
+            assert!(restored[0].mean_power(60.0) >= sp[0].mean_power(60.0) - 1e-6, "at {:.1} s: {} vs {} W", (step + 1) as f64 / 10.0, restored[0].mean_power(60.0), sp[0].mean_power(60.0));
+            assert!(restored[0].reduction_db >= sp[0].reduction_db - 1e-6);
+        }
+    }
+
+    /// The uniform case too (the PR #7 review's R5): an 8 W minute keeps
+    /// at least its true share at every later moment.
     #[test]
     fn the_minute_budget_survives_the_first_steps_after_a_restore() {
         let (cfg, mut sp) = hot();
-        let g = &cfg.globals;
         for s in sp.iter_mut() {
             s.resume(60.0, 55.0, 8.0, 8.0);
         }
-        let saved = decode(&encode(Duration::from_secs(100), Duration::from_secs(100), &sp, false)).unwrap();
-        let mut fresh: Vec<SpeakerState> = cfg.speakers.iter().map(|s| SpeakerState::new(s.clone(), g.t_ambient)).collect();
-        restore(&mut fresh, &saved, Duration::from_secs(100), TAIL, g);
-        for _ in 0..20 {
-            fresh[0].step(0.0, 0.1, g.t_ambient);
+        let saved = decode(&encode(T, T, &sp, false, true)).unwrap();
+        let mut f = fresh(&cfg);
+        restore(&mut f, &saved, T, &cfg.globals);
+        for step in 1..=600 {
+            f[0].step(0.0, 0.1, cfg.globals.t_ambient);
+            let elapsed = step as f64 / 10.0;
+            let truth = 8.0 * ((60.0 - elapsed).max(0.0)) / 60.0;
+            assert!(f[0].mean_power(60.0) >= truth - 1e-6, "at {elapsed} s: {} W vs {truth} W", f[0].mean_power(60.0));
         }
-        let mean = fresh[0].mean_power(60.0);
-        assert!((mean - 8.0 * 58.0 / 60.0).abs() < 0.01, "minute mean {mean} W");
-        // and it ages out over the minute, not at once
-        for _ in 0..290 {
-            fresh[0].step(0.0, 0.1, g.t_ambient);
-        }
-        let mean = fresh[0].mean_power(60.0);
-        assert!((mean - 8.0 * 29.0 / 60.0).abs() < 0.01, "minute mean {mean} W after 31 s");
     }
 }

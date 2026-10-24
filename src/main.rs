@@ -306,6 +306,9 @@ impl Hw for RealHw {
         self.card.rate_event = false;
         pending
     }
+    fn events_available(&self) -> bool {
+        self.card.events
+    }
     fn queued(&mut self) -> std::io::Result<u64> {
         match self.capture.as_mut() {
             Some(c) => c.queued(),
@@ -356,12 +359,17 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let mut stopping = false;
     loop {
         if STOP.load(Ordering::Relaxed) && !stopping {
-            guard.stop(&mut hw);
+            if let Err(e) = guard.stop(&mut hw) {
+                // not a clean stop: the state stays a status readout and the
+                // exit gives the lock up
+                guard.save(&hw);
+                return Err(e);
+            }
             stopping = true;
         }
         if stopping && guard.released(&hw) {
-            // the card has its volume back: the state says so
-            guard.save(&hw);
+            // the lock given up and drained, every moment accounted
+            guard.final_save(&hw)?;
             info!("stopped");
             return Ok(());
         }
