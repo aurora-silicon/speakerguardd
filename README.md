@@ -75,6 +75,15 @@ minute, each an XRUN and about 170 ms at the card's safe level), and a
 daemon held up for anything up to the lease no longer takes a coil past its
 limit.
 
+While the daemon is held up (descheduled, blocked in a call, waiting for a
+page) it can decide nothing, and the card's 250 ms lease bounds what plays,
+which the floor allows for.  To make that rarer the unit runs it at a
+real-time priority below PipeWire's
+(`CPUSchedulingPolicy=fifo`, priority 50) and it locks its memory
+(`mlockall`).  Every ten minutes it logs how long it was held up: the gaps
+between lock renewals, the latency of each kind of call, and the major page
+faults.  That measures, without a sound, whether a shorter lease is needed.
+
 There is no feedback: the model can only be as good as its constants.  The
 J700's constants - thermal resistances and time constants, coil temperature
 limits, volts at full scale, coil resistance and the power budgets - are the
