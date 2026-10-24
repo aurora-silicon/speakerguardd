@@ -28,7 +28,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use alsa::{Capture, Ctl, ElemId};
-use config::{Config, Globals};
+use config::{Config, Globals, Governor, SenseFormat};
 use guard::{Guard, Hw};
 use log::Level;
 
@@ -124,6 +124,29 @@ impl Card {
         }
         let unlock = ctl.find_one(&cfg.controls.unlock)?;
         let sample_rate = ctl.find_one(&cfg.controls.sample_rate)?;
+        // V/I machines: sense on, amplifier at the gain the model assumes
+        // (speakersafetyd does the same; the kernel clamps the range).  None
+        // of these lifts the volume lock.
+        for s in &cfg.speakers {
+            for sw in [&cfg.controls.vsense, &cfg.controls.isense].into_iter().flatten() {
+                let id = ctl.find_one(&format!("{} {}", s.name, sw))?;
+                ctl.lock(&id)?;
+                ctl.write_int(&id, 1)?;
+                if ctl.read_int(&id)? != 1 {
+                    return Err(format!("{} {sw}: did not turn on", s.name).into());
+                }
+            }
+            if let Some(gain) = &cfg.controls.amp_gain {
+                let id = ctl.find_one(&format!("{} {}", s.name, gain))?;
+                ctl.lock(&id)?;
+                let (_, max) = ctl.int_range(&id)?;
+                ctl.write_int(&id, max)?;
+                if ctl.read_int(&id)? != max {
+                    return Err(format!("{} {gain}: did not take its maximum", s.name).into());
+                }
+                info!("{}: {gain} at its maximum ({max}), {:.1} dBV assumed", s.name, cfg.globals.amp_gain_dbv);
+            }
+        }
         let events = match ctl.subscribe() {
             Ok(()) => true,
             Err(e) => {
@@ -236,7 +259,7 @@ impl Hw for RealHw {
     }
     fn open_sense(&mut self, rate: u32) -> std::io::Result<()> {
         let g = &self.globals;
-        self.capture = Some(Capture::open(self.card.ctl.card, g.sense_pcm, g.channels, rate, g.period)?);
+        self.capture = Some(Capture::open(self.card.ctl.card, g.sense_pcm, g.channels, rate, g.period, g.sense_format == SenseFormat::S16)?);
         Ok(())
     }
     fn close_sense(&mut self) {
@@ -350,7 +373,12 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let model = name.strip_prefix("Apple").unwrap_or(&name).to_lowercase();
     let path = args.config_path.join("apple").join(format!("{model}.conf"));
     let cfg = Config::load(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    info!("{}: {} speakers, sense PCM {}, period {} frames", path.display(), cfg.speakers.len(), cfg.globals.sense_pcm, cfg.globals.period);
+    // before any control of the card is touched
+    cfg.check_governor().map_err(|e| format!("{}: {e}", path.display()))?;
+    if cfg.globals.governor != Governor::Legacy {
+        return Err(format!("{}: governor {} is not supported by this build", path.display(), cfg.globals.governor.name()).into());
+    }
+    info!("{}: {} speakers{}, sense PCM {}, period {} frames", path.display(), cfg.speakers.len(), if cfg.has_vi() { " with V/I sense" } else { "" }, cfg.globals.sense_pcm, cfg.globals.period);
     let (card, card_name) = Card::open(Some(&name), &cfg)?;
     let mut hw = RealHw { card, globals: cfg.globals.clone(), capture: None };
     catch_stop_signals();
