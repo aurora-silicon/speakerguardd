@@ -373,6 +373,11 @@ pub struct Guard {
     stopping: bool,
     /// When the lock was given up for the stop.
     relinquished_at: Option<Instant>,
+    /// Since when the card has certainly held its lock (taken at start, or
+    /// given up and taken again) with no renewal since: from then on it
+    /// applies at least its safe level to whatever it converts.  None from
+    /// the first renewal on.
+    locked_at: Option<Instant>,
     /// The engine's models: the asahi ones on machines with V/I sense, the
     /// unified ones when they govern or the shadow log runs.  None on the
     /// J700's default (legacy, no shadow).
@@ -597,6 +602,8 @@ impl Guard {
             save_failed: false,
             stopping: false,
             relinquished_at: None,
+            // the lock taken above: macaudio clears any lease with it
+            locked_at: Some(now),
             engine,
             governing,
             shadow_path,
@@ -734,6 +741,7 @@ impl Guard {
         self.note_written(hw.now());
         hw.relinquish().map_err(|e| format!("giving up the volume lock: {e}"))?;
         self.relinquished_at = Some(hw.now());
+        self.locked_at = self.relinquished_at;
         Ok(())
     }
 
@@ -866,14 +874,24 @@ impl Guard {
 
     /// The least reduction each speaker's control may have applied to
     /// samples playing after `from` (unknown counts as full gain): the
-    /// least since QUEUE_BOUND before it.
+    /// least since QUEUE_BOUND before it.  When the card has held its lock
+    /// since before that (a hand-off that has drained), each control's
+    /// least is its value or the card's safe level, whichever is more
+    /// (review X1 of speakerguardd#8).
     fn least_since(&self, from: Instant) -> Vec<f64> {
-        let from = from.checked_sub(QUEUE_BOUND).unwrap_or(from);
+        let converted = from.checked_sub(QUEUE_BOUND);
+        let from = converted.unwrap_or(from);
         let far = from + Duration::from_secs(1 << 20);
         let mut least = self.written_db();
         for e in self.held_over(from, far) {
             for (l, &x) in least.iter_mut().zip(&e.lo) {
                 *l = l.min(if x.is_finite() { x } else { 0.0 });
+            }
+        }
+        if self.locked_at.is_some_and(|t| converted.is_some_and(|c| c >= t)) {
+            let safe = self.globals.safe_reduction;
+            for l in least.iter_mut() {
+                *l = l.max(safe);
             }
         }
         least
@@ -931,7 +949,9 @@ impl Guard {
         self.armed = false;
         self.armed_at = None;
         self.note_written(hw.now());
-        hw.relinquish().map_err(|e| format!("giving up the volume lock: {e}").into())
+        hw.relinquish().map_err(|e| format!("giving up the volume lock: {e}"))?;
+        self.locked_at = Some(hw.now());
+        Ok(())
     }
 
     fn disarm<H: Hw>(&mut self, hw: &mut H, why: &str) -> Result<(), Box<dyn Error>> {
@@ -946,6 +966,8 @@ impl Guard {
     /// Pings the volume lock.  A ping that answers ETIMEDOUT is the card's
     /// one-shot notice that the lock had lapsed, so ping once more.
     fn ping_lock<H: Hw>(&mut self, hw: &mut H) -> Result<(), Box<dyn Error>> {
+        // whatever the ping answers, the card may be unlocked from here on
+        self.locked_at = None;
         match hw.ping() {
             Ok(()) => {}
             Err(e) if e.raw_os_error() == Some(libc::ETIMEDOUT) => {
@@ -1549,6 +1571,7 @@ impl Guard {
                                 // the ping itself blocked: give it up again
                                 debug!("not taking the lock: the ping blocked");
                                 hw.relinquish().map_err(|e| format!("giving up the volume lock: {e}"))?;
+                                self.locked_at = Some(hw.now());
                             }
                         } else {
                             debug!("not taking the lock: the model fell behind");
@@ -3061,6 +3084,8 @@ pub(crate) mod tests {
         g.written_hi = g.written.clone();
         let t0 = hw.now();
         g.gains = vec![Gain { at: t0, lo: vec![0.0; 2], hi: vec![0.0; 2], kernel: false }];
+        // a lease held by hand: the card applies the controls
+        g.locked_at = None;
         g.verified_at = t0;
         g.account_to = t0;
         for w in g.words.iter_mut() {
@@ -3170,6 +3195,8 @@ pub(crate) mod tests {
         g.written_hi = g.written.clone();
         let t0 = hw.now();
         g.gains = vec![Gain { at: t0, lo: vec![0.0; 2], hi: vec![0.0; 2], kernel: false }];
+        // a lease held by hand: the card applies the controls
+        g.locked_at = None;
         g.verified_at = t0;
         g.account_to = t0;
         hw.t += Duration::from_millis(150);
@@ -3382,6 +3409,8 @@ pub(crate) mod tests {
         g.written_hi = g.written.clone();
         let t0 = hw.now();
         g.gains = vec![Gain { at: t0, lo: vec![20.0; 2], hi: vec![20.0; 2], kernel: false }];
+        // a lease held by hand: the card applies the controls
+        g.locked_at = None;
         g.verified_at = t0;
         g.account_to = t0;
         for s in &mut g.speakers {
@@ -3645,6 +3674,8 @@ pub(crate) mod tests {
         assert_eq!(g.written, vec![2.0, 2.0, 6.0, 6.0]);
         let t0 = hw.now();
         g.gains = vec![Gain { at: t0, lo: g.written.clone(), hi: g.written.clone(), kernel: false }];
+        // a lease held by hand: the card applies the controls
+        g.locked_at = None;
         g.verified_at = t0;
         g.account_to = t0;
         let before = asahi(&g).clone();
@@ -3931,6 +3962,8 @@ pub(crate) mod tests {
         g.written_hi = g.written.clone();
         let t0 = hw.now();
         g.gains = vec![Gain { at: t0, lo: vec![0.0; 4], hi: vec![0.0; 4], kernel: false }];
+        // a lease held by hand: the card applies the controls
+        g.locked_at = None;
         g.verified_at = t0;
         g.account_to = t0;
         for w in g.words.iter_mut() {
@@ -4050,6 +4083,8 @@ pub(crate) mod tests {
         g.written_hi = g.written.clone();
         let t0 = hw.now();
         g.gains = vec![Gain { at: t0, lo: per.clone(), hi: per.clone(), kernel: false }];
+        // a lease held by hand: the card applies the controls
+        g.locked_at = None;
         g.verified_at = t0;
         g.account_to = t0;
         let writes = hw.writes.len();
@@ -4156,6 +4191,8 @@ pub(crate) mod tests {
         g.written_hi = g.written.clone();
         let t0 = hw.now();
         g.gains = vec![Gain { at: t0, lo: vec![99.5; 4], hi: vec![99.5; 4], kernel: false }];
+        // a lease held by hand: the card applies the controls
+        g.locked_at = None;
         g.verified_at = t0;
         g.account_to = t0;
         hw.sleep(secs(0.3));
@@ -4419,6 +4456,8 @@ pub(crate) mod tests {
         g.written = vec![0.0; 2];
         g.written_hi = g.written.clone();
         g.gains = vec![Gain { at: t0 - secs(0.1), lo: vec![20.0; 2], hi: vec![20.0; 2], kernel: false }, Gain { at: t0, lo: vec![0.0; 2], hi: vec![0.0; 2], kernel: false }];
+        // a lease held by hand: the card applies the controls
+        g.locked_at = None;
         g.verified_at = t0;
         g.account_to = t0;
         for w in &mut g.words {
@@ -4480,6 +4519,8 @@ pub(crate) mod tests {
         g.written = vec![0.0; 2];
         g.written_hi = g.written.clone();
         g.gains = vec![Gain { at: t0 - secs(0.2), lo: vec![MUTE_DB; 2], hi: vec![MUTE_DB; 2], kernel: true }, Gain { at: t0 - secs(0.2), lo: vec![MUTE_DB; 2], hi: vec![MUTE_DB; 2], kernel: false }, Gain { at: t0 - secs(0.2), lo: vec![0.0; 2], hi: vec![0.0; 2], kernel: false }];
+        // a lease held by hand: the card applies the controls
+        g.locked_at = None;
         g.verified_at = t0;
         g.account_to = t0;
         for w in &mut g.words {
@@ -4805,6 +4846,8 @@ pub(crate) mod tests {
         g.written = vec![0.0; g.speakers.len()];
         g.written_hi = vec![0.0; g.speakers.len()];
         g.gains = vec![Gain { at: t0 - secs(0.2), lo: vec![20.0; g.speakers.len()], hi: vec![20.0; g.speakers.len()], kernel: false }, Gain { at: t0, lo: vec![0.0; g.speakers.len()], hi: vec![0.0; g.speakers.len()], kernel: false }];
+        // a lease held by hand: the card applies the controls
+        g.locked_at = None;
         g.account_to = t0;
         g.verified_at = t0;
         let full = g.speakers[0].worst_case_power(0.0);
@@ -5048,5 +5091,128 @@ pub(crate) mod tests {
         run_until(&mut g, &mut hw, secs(10.0)).unwrap();
         assert!(hw.writes.iter().all(|&(t, db)| db <= 1.0 && (t < secs(2.5) || db == 0.0)), "{:?}", hw.writes.iter().filter(|w| w.1 != 0.0).collect::<Vec<_>>());
         assert!(hw.lapses.is_empty());
+    }
+
+    // ---- review r2 of speakerguardd#8 ----
+
+    /// Seeded sense noise for the V/I witnesses: `n` LSB either way on every
+    /// S16 word, on top of a per-channel offset of up to `dc` LSB, as the
+    /// M1 Pro's sense lines carry it.
+    pub fn sense_noise(channels: usize, n: i32, dc: i32, seed: u64) -> impl FnMut(&mut [i32]) {
+        let mut x = seed | 1;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let offsets: Vec<i32> = (0..channels).map(|_| if dc > 0 { (next() % (2 * dc as u64 + 1)) as i32 - dc } else { 0 }).collect();
+        move |w: &mut [i32]| {
+            for (i, v) in w.iter_mut().enumerate() {
+                let r = if n > 0 { (next() % (2 * n as u64 + 1)) as i32 - n } else { 0 };
+                *v = (r + offsets[i % channels]).clamp(-32768, 32767) << 16;
+            }
+        }
+    }
+
+    /// Review X1: after a hand-off the controls keep the governed value,
+    /// but the card holds its lock and so its safe level.  Once what was
+    /// converted before the hand-off has drained, uncovered time is charged
+    /// at each control's value or the safe level, whichever is more, until
+    /// the next renewal.  Before the drain it is charged at the controls'.
+    #[test]
+    fn vi_a_drained_hand_off_charges_at_the_safe_level() {
+        let cfg = j413();
+        let safe = cfg.globals.safe_reduction;
+        let mut hw = FakeHw::per_speaker(&cfg);
+        hw.level = Box::new(|_| 0.02);
+        let mut g = Guard::start(&mut hw, &cfg, cfg.globals.max_reduction, Some(vi_state(&cfg, 60.0, 55.0))).unwrap();
+        run_until(&mut g, &mut hw, secs(2.0)).unwrap();
+        assert!(g.armed() && hw.per.iter().all(|&p| p == 0.0), "{:?}", hw.per);
+        g.disarm(&mut hw, "a test hand-off").unwrap();
+        let handed = hw.t;
+        assert!(g.written.iter().all(|&w| w == 0.0), "the controls keep the governed value");
+        assert!(g.least_since(g.verified_at).iter().all(|&r| r == 0.0), "charged at the safe level before the drain");
+        // the card stays with the kernel (the ramp is not the point here)
+        g.max_reduction = 0.1;
+        while hw.t < handed + DRAIN + secs(0.3) {
+            g.tick(&mut hw).unwrap();
+            assert!(!g.armed());
+        }
+        assert!(g.verified_at >= g.locked_at.unwrap() + DRAIN, "no verified boundary after the drain");
+        assert_eq!(g.least_since(g.verified_at), vec![safe; cfg.speakers.len()]);
+        // a charge heats every model at the safe level's worst case
+        let ta = cfg.globals.t_ambient;
+        let before: Vec<_> = asahi(&g).iter().map(|a| a.th.clone()).collect();
+        let to = g.account_to + secs(0.2);
+        g.charge(to).unwrap();
+        for (k, (a, b)) in asahi(&g).iter().zip(before).enumerate() {
+            let mut want = b.clone();
+            want.hold(vi_worst(&cfg, k, safe), 0.2, ta);
+            assert!((a.th.t_coil - want.t_coil).abs() < 1e-9, "{}: charged to {} C, the safe level gives {} C", cfg.speakers[k].name, a.th.t_coil, want.t_coil);
+        }
+        // a renewal ends it
+        g.max_reduction = cfg.globals.max_reduction;
+        while !g.armed() && hw.t < secs(30.0) {
+            g.tick(&mut hw).unwrap();
+        }
+        assert!(g.armed() && g.locked_at.is_none());
+        assert!(g.least_since(g.verified_at).iter().all(|&r| r < safe));
+    }
+
+    /// Review X1: with the governed 0 dB still on the controls, a sense
+    /// outage latched the asahi tweeter, and the stream then played on at
+    /// the safe level.  Each period's sliver of uncovered time was charged
+    /// at 0 dB, which put the model back over the limit, and the next
+    /// negative V*I sample held it there: with +-1 LSB of noise the latch
+    /// never cleared and the lock was never taken back.  Now the latch
+    /// clears once the model is under the working limit, and the lock
+    /// comes back, whatever the noise.
+    #[test]
+    fn vi_a_latch_after_a_hand_off_clears_through_sense_noise() {
+        let cfg = j413();
+        let k = idx(&cfg, "Left Tweeter");
+        let ceiling = cfg.speakers[k].t_limit - cfg.speakers[k].t_headroom;
+        for (n, dc) in [(0, 0), (1, 0), (3, 2), (9, 10)] {
+            let mut hw = FakeHw::per_speaker(&cfg);
+            hw.level = Box::new(|_| 0.05);
+            let noisy = std::rc::Rc::new(std::cell::Cell::new(false));
+            let on = noisy.clone();
+            let mut noise = sense_noise(cfg.globals.channels, n, dc, 0x9e37_79b9 + n as u64);
+            hw.tweak = Some(Box::new(move |_, w| {
+                if on.get() {
+                    noise(w);
+                }
+            }));
+            let mut g = Guard::start(&mut hw, &cfg, cfg.globals.max_reduction, Some(vi_state(&cfg, 110.0, 100.0))).unwrap();
+            while !g.armed() && hw.t < secs(5.0) {
+                g.tick(&mut hw).unwrap();
+            }
+            assert!(g.armed() && hw.per.iter().all(|&p| p == 0.0), "not governing at 0 dB: {:?}", hw.per);
+            hw.sensing = Box::new(|_| false);
+            while !asahi(&g)[k].hard && hw.t < secs(30.0) {
+                g.tick(&mut hw).unwrap();
+            }
+            assert!(asahi(&g)[k].hard && asahi(&g)[k].th.t_coil >= 150.0, "the outage did not latch the tweeter");
+            let latched = hw.t;
+            hw.sensing = Box::new(|_| true);
+            noisy.set(true);
+            let (mut cleared, mut rearmed) = (None, None);
+            while hw.t < latched + secs(60.0) && rearmed.is_none() {
+                g.tick(&mut hw).unwrap();
+                let a = &asahi(&g)[k];
+                if cleared.is_none() && !g.engine.as_ref().unwrap().hard(Governor::Asahi) {
+                    cleared = Some(hw.t - latched);
+                    let hottest = a.th.t_coil.max(a.th.t_magnet).max(a.coil_peak).max(a.magnet_peak);
+                    assert!(hottest < ceiling, "+-{n} LSB: cleared at {hottest} C");
+                }
+                if g.armed() {
+                    rearmed = Some(hw.t - latched);
+                }
+            }
+            let cleared = cleared.unwrap_or_else(|| panic!("+-{n} LSB: the latch never cleared (tweeter {:.3} C)", asahi(&g)[k].th.t_coil));
+            let rearmed = rearmed.unwrap_or_else(|| panic!("+-{n} LSB: the lock was never taken back"));
+            assert!(cleared < secs(15.0) && rearmed < secs(30.0), "+-{n} LSB: cleared after {cleared:?}, taken back after {rearmed:?}");
+        }
     }
 }

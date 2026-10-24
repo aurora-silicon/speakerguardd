@@ -52,6 +52,14 @@ pub const ASAHI_MARGIN: f64 = 1.005;
 /// A mean V*I below this (W) is bad sense data, not a measurement
 /// (speakersafetyd's sanity bound).
 pub const VI_MIN: f64 = -0.01;
+/// A sample's V*I between this (W) and zero is sense noise, not power the
+/// speaker gave back (review X1 of speakerguardd#8).  An M1 Pro recording
+/// (14 V and 3.75 A S16 sense) has 7 to 9 LSB of noise on V and I: of 14.4
+/// million samples in its quiet periods 45% have negative V*I, the most
+/// negative -44.6 uW and none below -78 uW.  Its playback periods go down
+/// to -50 mW on the tweeters and -0.93 W on the woofers.  1 mW is 22 times
+/// the noise and 50 times under the tweeters' playback.
+pub const VI_NOISE_FLOOR: f64 = 1e-3;
 /// What the unified regulator asks for when nothing may pass (dB): far past
 /// any --max-reduction, so the kernel takes over.
 const NOTHING_DB: f64 = 120.0;
@@ -433,9 +441,11 @@ impl AsahiSpeaker {
     /// governor asked for.  The hard limit is checked at every sample, so
     /// that power swinging positive then negative inside a period cannot
     /// carry the model over the limit and back unseen (review F4).  A
-    /// crossing also leaves the model at the limit at least: the negative
-    /// V*I after it cools the model, never the coil, so the model cannot
-    /// say the coil came back down.
+    /// crossing also leaves the model at the limit at least when negative
+    /// V*I beyond the noise floor follows it: that cools the model, never
+    /// the coil, so the model cannot say the coil came back down.  Negative
+    /// noise does not (review X1 of speakerguardd#8): it would hold a model
+    /// at the limit for as long as the sense lines carry noise.
     /// The first frame is `first` of a step long (the part of it over
     /// time not yet accounted).
     #[allow(clippy::too_many_arguments)]
@@ -450,13 +460,14 @@ impl AsahiSpeaker {
         // point cools the model, never the coil, so the model may not say
         // the coil came back under the limit in this stretch.  Cooling with
         // no negative power after the crossing is real (a model that starts
-        // over the limit, latched, may cool from it).
+        // over the limit, latched, may cool from it), and so is cooling
+        // through sense noise (VI_NOISE_FLOOR).
         let mut crossed = false;
         let mut negative_after = false;
         for (i, f) in words.chunks_exact(channels).enumerate() {
             let (ac, am) = if i == 0 { (ac1, am1) } else { (acn, amn) };
             let p = f[vc] as f64 * vs * (f[ic] as f64 * is) * ASAHI_MARGIN;
-            if crossed && p < 0.0 {
+            if crossed && p < -VI_NOISE_FLOOR {
                 negative_after = true;
             }
             let coil_target = tm + p * trc;
@@ -1444,6 +1455,58 @@ mod tests {
                 assert!(a.th.t_coil >= 150.0, "negative power after the crossing cooled it to {}", a.th.t_coil);
             } else {
                 assert!(a.th.t_coil < 150.0, "silence left it at {}", a.th.t_coil);
+            }
+        }
+    }
+
+    /// Review X1 of speakerguardd#8: sense noise of a few LSB gives nearly
+    /// half the samples of a silent period negative V*I, and each held a
+    /// latched model over the limit at the limit.  A model a little over
+    /// it cools through such noise; negative power beyond the noise floor
+    /// after the crossing still leaves it at the limit.
+    #[test]
+    fn a_latched_model_over_the_limit_cools_through_sense_noise() {
+        let c = cfg(J413);
+        let k = idx(&c, "Left Tweeter");
+        let s = &c.speakers[k];
+        let (vc, ic, ch, period) = (s.vs_chan, s.is_chan.unwrap(), c.globals.channels, c.globals.period);
+        let tm = 50.0 + (150.0 - 50.0) * 200.0 / 304.9;
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut lsb = move |n: i32| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x % (2 * n as u64 + 1)) as i32 - n
+        };
+        for (n, dc) in [(1, 0), (3, 2), (9, 8), (30, 10)] {
+            for beyond in [false, true] {
+                let mut w = vec![0i32; ch * period];
+                let mut negative = 0;
+                for (i, f) in w.chunks_exact_mut(ch).enumerate() {
+                    // offsets of opposite signs: a negative mean as well
+                    let (v, cur) = (lsb(n) + dc, lsb(n) - dc);
+                    negative += (v * cur < 0) as usize;
+                    f[vc] = v << 16;
+                    f[ic] = cur << 16;
+                    if beyond && (2000..2004).contains(&i) {
+                        // 1 V and -20 mA: -20 mW
+                        f[vc] = word(1.0, 14.0);
+                        f[ic] = word(-0.02, 3.75);
+                    }
+                }
+                assert!(negative > period / 6, "+-{n} LSB: {negative} negative samples");
+                let mut e = Engine::new(&c, false).unwrap();
+                set_asahi(&mut e, 150.04, tm);
+                e.asahi.as_mut().unwrap()[k].hard = true;
+                e.check(&w, 48000.0).expect("noise is a measurement");
+                e.measured(&w, period, period, period, 0, 1.0 / 48000.0, 1.0, &vec![vec![(0.0, 0.0)]; c.speakers.len()]);
+                let a = &e.asahi.as_ref().unwrap()[k];
+                assert!(a.hard, "the latch holds");
+                if beyond {
+                    assert!(a.th.t_coil >= 150.0, "+-{n} LSB: negative power after the crossing cooled it to {}", a.th.t_coil);
+                } else {
+                    assert!(a.th.t_coil < 150.0, "+-{n} LSB: the noise held it at {}", a.th.t_coil);
+                }
             }
         }
     }
