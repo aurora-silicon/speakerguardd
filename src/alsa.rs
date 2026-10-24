@@ -116,6 +116,7 @@ const CTL_IOCTL_ELEM_INFO: libc::c_ulong = iowr::<ElemInfo>(b'U', 0x11);
 const CTL_IOCTL_ELEM_READ: libc::c_ulong = iowr::<ElemValue>(b'U', 0x12);
 const CTL_IOCTL_ELEM_WRITE: libc::c_ulong = iowr::<ElemValue>(b'U', 0x13);
 const CTL_IOCTL_ELEM_LOCK: libc::c_ulong = iow::<ElemId>(b'U', 0x14);
+const CTL_IOCTL_ELEM_UNLOCK: libc::c_ulong = iow::<ElemId>(b'U', 0x15);
 const CTL_IOCTL_SUBSCRIBE_EVENTS: libc::c_ulong = iowr::<libc::c_int>(b'U', 0x16);
 
 /// `struct snd_ctl_event` for SNDRV_CTL_EVENT_ELEM: the mask and the id.
@@ -238,6 +239,13 @@ impl Ctl {
     pub fn lock(&self, id: &ElemId) -> io::Result<()> {
         let mut id = *id;
         ioctl(&self.file, CTL_IOCTL_ELEM_LOCK, &mut id)?;
+        Ok(())
+    }
+
+    /// Give the element lock up.
+    pub fn unlock(&self, id: &ElemId) -> io::Result<()> {
+        let mut id = *id;
+        ioctl(&self.file, CTL_IOCTL_ELEM_UNLOCK, &mut id)?;
         Ok(())
     }
 
@@ -634,6 +642,7 @@ mod tests {
         assert_eq!(PCM_IOCTL_START, 0x4142);
         assert_eq!(PCM_IOCTL_DELAY, 0x8008_4121);
         assert_eq!(CTL_IOCTL_SUBSCRIBE_EVENTS, 0xc004_5516);
+        assert_eq!(CTL_IOCTL_ELEM_UNLOCK, 0x4040_5515);
         assert_eq!(std::mem::size_of::<CtlEvent>(), 72);
     }
 }

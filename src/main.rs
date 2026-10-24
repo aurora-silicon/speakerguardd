@@ -146,6 +146,14 @@ impl Card {
         Ok(())
     }
 
+    /// Give the unlock control's lock up and take it again: macaudio locks
+    /// the volume at once and clears the lease (a new owner starts with
+    /// none), whatever was left of it.
+    fn relinquish(&mut self) -> std::io::Result<()> {
+        self.ctl.unlock(&self.unlock)?;
+        self.ctl.lock(&self.unlock)
+    }
+
     /// Every volume control to its minimum: within the card's limit
     /// whether or not the volume is locked.
     fn write_min(&self) -> std::io::Result<()> {
@@ -219,6 +227,9 @@ impl Hw for RealHw {
     }
     fn set_min(&mut self) -> std::io::Result<()> {
         self.card.write_min()
+    }
+    fn relinquish(&mut self) -> std::io::Result<()> {
+        self.card.relinquish()
     }
     fn sample_rate(&mut self) -> std::io::Result<i64> {
         self.card.ctl.read_int(&self.card.sample_rate)
@@ -345,7 +356,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let mut stopping = false;
     loop {
         if STOP.load(Ordering::Relaxed) && !stopping {
-            guard.stop();
+            guard.stop(&mut hw);
             stopping = true;
         }
         if stopping && guard.released(&hw) {

@@ -152,11 +152,23 @@ impl SpeakerState {
         let pre = power * 10f64.powf(applied_db.clamp(0.0, PRE_GAIN_MAX_DB) / 10.0);
         self.history.push_back((dt, pre));
         self.history_s += dt;
+        // drop what is older than a minute: whole entries, then the expired
+        // part of the oldest one (its energy for the rest still counts)
         while self.history_s > 60.0 {
-            if let Some((old_dt, _)) = self.history.pop_front() {
-                self.history_s -= old_dt;
-            } else {
-                break;
+            let excess = self.history_s - 60.0;
+            match self.history.front_mut() {
+                Some(front) if front.0 <= excess => {
+                    self.history_s -= front.0;
+                    self.history.pop_front();
+                }
+                Some(front) => {
+                    front.0 -= excess;
+                    self.history_s = 60.0;
+                }
+                None => {
+                    self.history_s = 0.0;
+                    break;
+                }
             }
         }
     }
@@ -219,22 +231,16 @@ impl SpeakerState {
         v * v / self.spec.z_nominal
     }
 
-    /// Start as hot as the governor lets the coil run: at the working
-    /// limit, the magnet where steady state would put it.  Used when the
-    /// previous run's state is unreadable.
-    pub fn assume_hot(&mut self, t_ambient: f64) {
+    /// Start at the coil's limit with the hard fault latched, the magnet
+    /// where steady state would put it: nothing about the speaker's past is
+    /// known (no state of this daemon, an unreadable one).  The card stays
+    /// with the kernel until the model has cooled under the working ceiling.
+    pub fn assume_latched(&mut self, t_ambient: f64) {
         let s = &self.spec;
-        self.t_coil = s.t_limit - s.t_headroom;
+        self.t_coil = s.t_limit;
         self.t_magnet = t_ambient + (self.t_coil - t_ambient) * s.tr_magnet / (s.tr_magnet + s.tr_coil);
         self.t_peak = self.t_coil;
-    }
-
-    /// Start as hot as the card's own safe level can make the speaker:
-    /// the steady state of the worst-case power at `safe_reduction`.  Used
-    /// when no earlier run of this boot left a state, so no daemon has held
-    /// the card's volume lock since boot.
-    pub fn assume_safe_level(&mut self, t_ambient: f64, safe_reduction: f64) {
-        self.settle_at(self.worst_case_power(safe_reduction), t_ambient);
+        self.hard = true;
     }
 
     /// The steady state at `power` watts, as if it had run for ever; the
@@ -255,11 +261,24 @@ impl SpeakerState {
         self.t_coil = t_coil;
         self.t_magnet = t_magnet;
         self.t_peak = t_coil;
+        self.hard = false;
         self.history.clear();
         let earlier = ((60.0 * mean_60s - mean_1s) / 59.0).max(0.0);
         self.history.push_back((59.0, earlier));
         self.history.push_back((1.0, mean_1s));
         self.history_s = 60.0;
+    }
+
+    /// The governor's state a restart keeps: the latched fault, the peak
+    /// that set it and the reduction being released.  A state without them
+    /// (an older file) is latched whenever its coil is not under the
+    /// working ceiling, where a latch could still have been set.
+    pub fn resume_governor(&mut self, hard: Option<bool>, t_peak: f64, reduction_db: f64) {
+        let ceiling = self.spec.t_limit - self.spec.t_headroom;
+        self.t_peak = t_peak.max(self.t_coil);
+        self.hard = hard.unwrap_or(!(self.t_coil < ceiling));
+        self.reduction_db = reduction_db.max(0.0);
+        self.reducing = self.reduction_db > 0.0;
     }
 
     /// Mean power before the card's gain over the last `seconds` (W); time
