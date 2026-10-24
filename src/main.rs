@@ -119,6 +119,9 @@ struct Card {
     /// first successful ping.
     volume_max: Option<i64>,
     volume_min: i64,
+    /// The most they accept while the volume is locked (macaudio limits
+    /// the range to the card's safe level), read when the lock is taken.
+    locked_max: Option<i64>,
     unlock: ElemId,
     sample_rate: ElemId,
     /// Subscribed to the card's change events: the sample-rate control's
@@ -144,7 +147,7 @@ impl Card {
                 false
             }
         };
-        Ok((Card { ctl, volume, volume_max: None, volume_min: 0, unlock, sample_rate, events, rate_event: false }, name))
+        Ok((Card { ctl, volume, volume_max: None, volume_min: 0, locked_max: None, unlock, sample_rate, events, rate_event: false }, name))
     }
 
     /// Take the interlock: every volume control first, then the unlock
@@ -155,7 +158,9 @@ impl Card {
             self.ctl.lock(id)?;
         }
         self.ctl.lock(&self.unlock)?;
-        self.volume_min = self.ctl.int_range(&self.volume[0])?.0;
+        let (min, locked) = self.ctl.int_range(&self.volume[0])?;
+        self.volume_min = min;
+        self.locked_max = Some(locked);
         Ok(())
     }
 
@@ -172,7 +177,9 @@ impl Card {
     /// range to it there), or, once the range with the lock lifted is
     /// known, that maximum less `safe_db`, whichever is lower.  The minimum
     /// where that write fails (the card always accepts it).  The reduction
-    /// now applied (dB).
+    /// now applied (dB), from the value written once the maximum is known;
+    /// before that, the card's own safe level, taken to be `safe_db` until
+    /// the first ping checks it (review r7 Y5).
     fn write_safe(&self, safe_db: f64) -> std::io::Result<f64> {
         let (_, limit) = self.ctl.int_range(&self.volume[0])?;
         let value = match self.volume_max {
@@ -181,7 +188,10 @@ impl Card {
         }
         .max(self.volume_min);
         match self.volume.iter().try_for_each(|id| self.ctl.write_int(id, value)) {
-            Ok(()) => Ok(safe_db),
+            Ok(()) => Ok(match self.volume_max {
+                Some(max) => (max - value) as f64 / STEPS_PER_DB,
+                None => safe_db,
+            }),
             Err(e) => {
                 warn!("volume control: {e} at the safe value; writing the minimum");
                 self.write_min()?;
@@ -267,6 +277,10 @@ impl Hw for RealHw {
     }
     fn set_safe(&mut self) -> std::io::Result<f64> {
         self.card.write_safe(self.globals.safe_reduction)
+    }
+    fn card_safe_db(&self) -> Option<f64> {
+        let (max, locked) = (self.card.volume_max?, self.card.locked_max?);
+        Some((max - locked) as f64 / STEPS_PER_DB)
     }
     fn relinquish(&mut self) -> std::io::Result<()> {
         self.card.relinquish()
