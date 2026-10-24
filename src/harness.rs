@@ -34,19 +34,24 @@
 //! `SPEAKERGUARDD_SEED` the first seed; failures are shrunk and printed as a
 //! scenario to paste into a witness test.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::io;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
-use crate::guard::{Guard, Hw, BLIND_LIMIT, DRAIN, MUTE_DB};
+use crate::guard::{Guard, Hw, BLIND_LIMIT, DRAIN, KERNEL_LOCK_TIMEOUT, MUTE_DB, QUEUE_BOUND};
 use crate::model::SpeakerState;
 use crate::state;
 
 const J700: &str = include_str!("../conf/apple/j700.conf");
-/// The world's sample rate.
+/// The world's sample rate, and the J700's own (with its 4096-frame period).
 const HARNESS_RATE: f64 = 16000.0;
+const REAL_RATE: f64 = 48000.0;
+/// macaudio's stop after the lock is given up or lapses: a work item, a few
+/// milliseconds; the stock world's 0.45 s is the drain premise's bound.
+pub const PROMPT_STOP: f64 = 0.005;
+pub const STOCK_STOP: f64 = 0.45;
 
 /// SplitMix64.
 #[derive(Clone)]
@@ -144,6 +149,15 @@ pub struct Scenario {
     pub max_reduction: f64,
     /// Change-event latency (s).
     pub latency: f64,
+    /// The speakers' true coil and magnet temperatures at the start, a
+    /// clean stop's state saying the same (else ambient).
+    pub hot: Option<(f64, f64)>,
+    /// From a lock given up or lapsed to the stop of what was converted
+    /// before it (s).
+    pub stop: f64,
+    /// The J700's own rate and period (48 kHz, 4096) instead of the cheaper
+    /// 16 kHz and 512.
+    pub real_rate: bool,
     pub streams: Vec<Stream>,
     pub faults: Vec<Fault>,
     pub restarts: Vec<Restart>,
@@ -201,12 +215,24 @@ impl Scenario {
             };
             restarts.push(Restart { at: r.range(0.2, horizon), clean: r.chance(0.5), gap: if r.chance(0.5) { r.range(0.0, 0.05) } else { r.range(0.05, 2.0) }, damage });
         }
+        let real_rate = r.chance(0.2);
+        let clean_start = r.chance(0.8);
+        let hot = (clean_start && r.chance(0.25)).then(|| {
+            let c = r.range(80.0, 128.0);
+            (c, 50.0 + (c - 50.0) * r.range(0.3, 0.45))
+        });
+        let stop = match (r.f() * 10.0) as u32 {
+            0..=3 => PROMPT_STOP,
+            4..=6 => STOCK_STOP,
+            _ => r.range(PROMPT_STOP, STOCK_STOP),
+        };
         // the program changes on sample boundaries (the oracle integrates
         // per sample, the capture reads per frame)
-        let grid = |x: f64| (x * HARNESS_RATE).round() / HARNESS_RATE;
+        let rate = if real_rate { REAL_RATE } else { HARNESS_RATE };
+        let grid = |x: f64| (x * rate).round() / rate;
         for s in streams.iter_mut() {
             s.open = grid(s.open);
-            s.close = grid(s.close).max(s.open + 1.0 / HARNESS_RATE);
+            s.close = grid(s.close).max(s.open + 1.0 / rate);
             for l in s.levels.iter_mut() {
                 l.0 = grid(l.0);
             }
@@ -216,9 +242,12 @@ impl Scenario {
             events: !r.chance(0.08),
             steps: r.chance(0.7),
             initial_db: r.range(0.0, 30.0),
-            clean_start: r.chance(0.8),
+            clean_start,
             max_reduction: if r.chance(0.5) { 20.0 } else { r.range(6.0, 30.0) },
             latency: r.range(0.0, 0.002),
+            hot,
+            stop,
+            real_rate,
             streams,
             faults,
             restarts,
@@ -239,7 +268,7 @@ impl Scenario {
         let faults: Vec<String> = self.faults.iter().map(|x| format!("Fault::{x:?}")).collect();
         let restarts: Vec<String> = self.restarts.iter().map(|r| format!("Restart {{ at: {}, clean: {}, gap: {}, damage: Damage::{:?} }}", f(r.at), r.clean, f(r.gap), r.damage)).collect();
         format!(
-            "Scenario {{ horizon: {}, events: {}, steps: {}, initial_db: {}, clean_start: {}, max_reduction: {}, latency: {}, streams: vec![{}], faults: vec![{}], restarts: vec![{}] }}",
+            "Scenario {{ horizon: {}, events: {}, steps: {}, initial_db: {}, clean_start: {}, max_reduction: {}, latency: {}, hot: {}, stop: {}, real_rate: {}, streams: vec![{}], faults: vec![{}], restarts: vec![{}] }}",
             f(self.horizon),
             self.events,
             self.steps,
@@ -247,6 +276,9 @@ impl Scenario {
             self.clean_start,
             f(self.max_reduction),
             f(self.latency),
+            self.hot.map_or("None".to_string(), |(c, m)| format!("Some(({}, {}))", f(c), f(m))),
+            f(self.stop),
+            self.real_rate,
             streams.join(", "),
             faults.join(", "),
             restarts.join(", ")
@@ -276,6 +308,9 @@ struct Oracle {
     ta: f64,
     tc: Vec<f64>,
     tm: Vec<f64>,
+    limit: Vec<f64>,
+    /// When each true coil first reached its limit (s, world time).
+    pub crossed: Vec<Option<f64>>,
     /// Up to where (s, world time) it has integrated.
     to: f64,
     /// Per sample: coil temperature per speaker, and cumulative energy
@@ -285,8 +320,9 @@ struct Oracle {
 }
 
 impl Oracle {
-    fn new(cfg: &Config) -> Oracle {
+    fn new(cfg: &Config, hot: Option<(f64, f64)>) -> Oracle {
         let n = cfg.speakers.len();
+        let (c0, m0) = hot.unwrap_or((cfg.globals.t_ambient, cfg.globals.t_ambient));
         Oracle {
             full: cfg.speakers.iter().map(|s| s.vs_scale * s.vs_scale / s.z_nominal).collect(),
             trc: cfg.speakers.iter().map(|s| s.tr_coil).collect(),
@@ -294,8 +330,10 @@ impl Oracle {
             trm: cfg.speakers.iter().map(|s| s.tr_magnet).collect(),
             tau_m: cfg.speakers.iter().map(|s| s.tau_magnet).collect(),
             ta: cfg.globals.t_ambient,
-            tc: vec![cfg.globals.t_ambient; n],
-            tm: vec![cfg.globals.t_ambient; n],
+            tc: vec![c0; n],
+            tm: vec![m0; n],
+            limit: cfg.speakers.iter().map(|s| s.t_limit).collect(),
+            crossed: vec![None; n],
             to: 0.0,
             coil: vec![Vec::new(); n],
             energy: vec![vec![0.0]; n],
@@ -316,6 +354,9 @@ impl Oracle {
                 self.tc[k] += dc * d;
             }
             self.coil[k].push(self.tc[k] as f32);
+            if self.crossed[k].is_none() && self.tc[k] >= self.limit[k] {
+                self.crossed[k] = Some(self.to + h);
+            }
             let e = *self.energy[k].last().unwrap() + pre[k] * h;
             self.energy[k].push(e);
         }
@@ -324,7 +365,7 @@ impl Oracle {
 
     fn coil_at(&self, k: usize, t: f64, rate: f64) -> f64 {
         let i = ((t * rate).floor() as usize).min(self.coil[k].len().saturating_sub(1));
-        if self.coil[k].is_empty() { self.ta } else { self.coil[k][i] as f64 }
+        if self.coil[k].is_empty() { self.tc[k] } else { self.coil[k][i] as f64 }
     }
 
     /// Mean power before the gain over the `w` seconds up to `t`.
@@ -384,6 +425,9 @@ pub struct World<'a> {
     /// When a sample-rate read last first showed the speakers open.
     pub sighted: f64,
     last_rate: i64,
+    /// When the daemon was held up (descheduled, blocked in a call, gone):
+    /// what the kernel's lease bounds, not the daemon.
+    pub held: RefCell<Vec<(f64, f64)>>,
 }
 
 impl<'a> World<'a> {
@@ -392,7 +436,7 @@ impl<'a> World<'a> {
         World {
             sc,
             cfg,
-            rate: HARNESS_RATE as u32,
+            rate: if sc.real_rate { REAL_RATE as u32 } else { HARNESS_RATE as u32 },
             t0: Instant::now(),
             boot0: 1000.0,
             t: Cell::new(0.0),
@@ -412,13 +456,21 @@ impl<'a> World<'a> {
             events_seen: 0.0,
             edges: sc.edges(),
             once_used: vec![false; sc.faults.len()],
-            oracle: Oracle::new(cfg),
+            oracle: Oracle::new(cfg, sc.hot),
             last_period: 0.0,
             rate_failed: false,
             writes: 0,
             last_ping_at: 0.0,
             sighted: 0.0,
             last_rate: 0,
+            held: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// The daemon is held up from `from` for `len`.
+    fn hold(&self, from: f64, len: f64) {
+        if len > 0.0 {
+            self.held.borrow_mut().push((from, from + len));
         }
     }
 
@@ -495,7 +547,7 @@ impl<'a> World<'a> {
                     // macaudio's timeout: locked, the one-shot notice, and
                     // the streams at the old gain stopped
                     self.notice = true;
-                    self.relock(b, DRAIN.as_secs_f64() * 0.9);
+                    self.relock(b, self.sc.stop);
                 }
             }
             t = b;
@@ -544,6 +596,7 @@ impl<'a> World<'a> {
             if let Fault::Pause { at, len } = self.sc.faults[i] {
                 if !self.pauses_used[i] && t >= at {
                     self.pauses_used[i] = true;
+                    self.hold(t, len);
                     self.advance(t + len);
                     return;
                 }
@@ -572,6 +625,7 @@ impl Hw for World<'_> {
         let p = self.split_pending.replace(0.0);
         if p > 0.0 {
             // no lease or oracle work here (&self): the next call settles it
+            self.hold(self.t.get(), p);
             self.t.set(self.t.get() + p);
         }
         self.t0 + Duration::from_secs_f64(self.t.get())
@@ -649,7 +703,7 @@ impl Hw for World<'_> {
         self.advance(t);
         self.notice = false;
         let t = self.now_s();
-        self.relock(t, DRAIN.as_secs_f64() * 0.9);
+        self.relock(t, self.sc.stop);
         Ok(())
     }
     fn sample_rate(&mut self) -> io::Result<i64> {
@@ -663,6 +717,7 @@ impl Hw for World<'_> {
         }
         // the value the read returns is the state at some point inside it
         let seen = t + delay * 0.5;
+        self.hold(t, delay);
         self.advance(t + delay);
         self.rate_failed = self.fault_on(|f| if let Fault::RateFail { at, len } = f { Some((*at, *len)) } else { None });
         if self.rate_failed {
@@ -684,6 +739,7 @@ impl Hw for World<'_> {
             }
         }
         let t = self.now_s();
+        self.hold(t, delay);
         self.advance(t + delay);
         self.sense_open = true;
         self.next_end = self.on_grid(self.now_s() + self.period_s());
@@ -749,6 +805,7 @@ impl Hw for World<'_> {
         if let Some(i) = self.once(|f| if let Fault::SlowPosition { at, .. } = f { Some(*at) } else { None }) {
             if let Fault::SlowPosition { delay, .. } = self.sc.faults[i] {
                 let t = self.now_s();
+                self.hold(t, delay);
                 self.advance(t + delay);
             }
         }
@@ -789,6 +846,7 @@ impl Hw for World<'_> {
         });
         if self.sc.events {
             if let Some(c) = self.change_in(t, to) {
+                self.hold(c, late.unwrap_or(0.0));
                 self.advance(c + late.unwrap_or(0.0));
                 return true;
             }
@@ -822,10 +880,10 @@ impl World<'_> {
 #[derive(Debug)]
 pub struct Violation(pub String);
 
-fn harness_cfg() -> Config {
+fn harness_cfg(real_rate: bool) -> Config {
     // shorter periods at a lower rate keep a case cheap; every rule the
     // guard keeps is per period or per second, not per frame count
-    Config::parse(&J700.replace("period = 4096", "period = 512")).unwrap()
+    if real_rate { Config::parse(J700).unwrap() } else { Config::parse(&J700.replace("period = 4096", "period = 512")).unwrap() }
 }
 
 fn state_dir(tag: u64) -> PathBuf {
@@ -890,10 +948,20 @@ fn need(cfg: &Config, o: &Oracle, k: usize, t: f64, rate: f64) -> f64 {
 
 /// Run one scenario; the first violation, if any.
 pub fn run(sc: &Scenario, seed: u64) -> Result<(), Violation> {
-    let cfg = harness_cfg();
+    let cfg = harness_cfg(sc.real_rate);
     let path = state_dir(seed);
     if sc.clean_start {
-        let cold: Vec<SpeakerState> = cfg.speakers.iter().map(|s| SpeakerState::new(s.clone(), cfg.globals.t_ambient)).collect();
+        let cold: Vec<SpeakerState> = cfg
+            .speakers
+            .iter()
+            .map(|s| {
+                let mut x = SpeakerState::new(s.clone(), cfg.globals.t_ambient);
+                if let Some((c, m)) = sc.hot {
+                    x.resume(c, m, 0.0, 0.0);
+                }
+                x
+            })
+            .collect();
         std::fs::write(&path, state::encode(Duration::from_secs(1000), Duration::from_secs(1000), &cold, false, true)).unwrap();
     }
     let mut rng = Rng::new(seed ^ 0x5eed);
@@ -962,6 +1030,8 @@ pub fn run(sc: &Scenario, seed: u64) -> Result<(), Violation> {
             drop(g);
             w.owner_gone();
             let t = w.now_s();
+            // gone: the drain bounds what was converted before
+            w.hold(t, r.gap + DRAIN.as_secs_f64());
             w.advance(t + r.gap);
             damage(&path, r.damage, &mut rng);
             expect_latched = !clean || r.damage != Damage::None;
@@ -1006,6 +1076,20 @@ fn check(cfg: &Config, w: &World, g: &Guard, sc: &Scenario, rate: f64) -> Result
             }
             if need >= sc.max_reduction + 0.01 {
                 return Err(Violation(format!("(b) at {now:.4} s: armed while the true state needs {need:.3} dB, over --max-reduction")));
+            }
+        }
+    }
+    // (d) with a prompt stop, the true coil never reaches its limit unless
+    // the daemon was held up (descheduled, blocked in a call, gone) inside
+    // the queue and lease before it: the kernel's lease bounds that, not
+    // the daemon (review r6 W1)
+    if sc.stop <= 2.0 * PROMPT_STOP {
+        let reach = QUEUE_BOUND.as_secs_f64() + KERNEL_LOCK_TIMEOUT.as_secs_f64();
+        for k in 0..cfg.speakers.len() {
+            if let Some(tx) = w.oracle.crossed[k] {
+                if !w.held.borrow().iter().any(|&(a, b)| a < tx && b > tx - reach) {
+                    return Err(Violation(format!("(d) at {now:.4} s: {} true coil reached {} C at {tx:.4} s, the daemon not held up", cfg.speakers[k].name, cfg.speakers[k].t_limit)));
+                }
             }
         }
     }
@@ -1150,7 +1234,7 @@ mod tests {
     /// the program
     #[test]
     fn h01_a_muted_cards_program_counts_up_to_full_scale() {
-        let sc = Scenario { horizon: 0.8512992841882598, events: true, steps: true, initial_db: 5.069778520926467, clean_start: false, max_reduction: 20.0, latency: 0.0018184671294329293, streams: vec![Stream { open: 0.1786875, close: 0.6805, depth: 0.22262230157550328, chunk: 0.03503873415172144, levels: vec![(0.1786875, 0.7263536145167477)] }], faults: vec![], restarts: vec![] };
+        let sc = Scenario { horizon: 0.8512992841882598, events: true, steps: true, initial_db: 5.069778520926467, clean_start: false, max_reduction: 20.0, latency: 0.0018184671294329293, hot: None, stop: STOCK_STOP, real_rate: false, streams: vec![Stream { open: 0.1786875, close: 0.6805, depth: 0.22262230157550328, chunk: 0.03503873415172144, levels: vec![(0.1786875, 0.7263536145167477)] }], faults: vec![], restarts: vec![] };
         if let Err(v) = run(&sc, 2) {
             panic!("{}", v.0);
         }
@@ -1160,7 +1244,7 @@ mod tests {
     /// step's energy may all lie inside the window
     #[test]
     fn h02_a_window_edge_inside_a_step_keeps_its_energy() {
-        let sc = Scenario { horizon: 2.2825362494252692, events: true, steps: true, initial_db: 23.94279022270308, clean_start: true, max_reduction: 28.66189827231709, latency: 0.000390993496961817, streams: vec![Stream { open: 0.02425, close: 1.246875, depth: 0.011040719404831987, chunk: 0.05484923872317915, levels: vec![(0.02425, 0.1295805609583719), (0.9309375, 0.820600623277012)] }], faults: vec![], restarts: vec![] };
+        let sc = Scenario { horizon: 2.2825362494252692, events: true, steps: true, initial_db: 23.94279022270308, clean_start: true, max_reduction: 28.66189827231709, latency: 0.000390993496961817, hot: None, stop: STOCK_STOP, real_rate: false, streams: vec![Stream { open: 0.02425, close: 1.246875, depth: 0.011040719404831987, chunk: 0.05484923872317915, levels: vec![(0.02425, 0.1295805609583719), (0.9309375, 0.820600623277012)] }], faults: vec![], restarts: vec![] };
         if let Err(v) = run(&sc, 90) {
             panic!("{}", v.0);
         }
@@ -1170,7 +1254,7 @@ mod tests {
     /// frames late, over time they did not see
     #[test]
     fn h03_a_pause_inside_the_position_read_is_charged() {
-        let sc = Scenario { horizon: 2.3885480926654754, events: true, steps: true, initial_db: 21.498398967648416, clean_start: false, max_reduction: 20.0, latency: 0.0004522025101898588, streams: vec![Stream { open: 0.1785, close: 1.0409375, depth: 0.006633982013763149, chunk: 0.07409119427696939, levels: vec![(0.1785, 0.4511432842990031)] }, Stream { open: 1.11425, close: 1.998125, depth: 0.16514753344546107, chunk: 0.08442897332825991, levels: vec![(1.11425, 1.0)] }], faults: vec![Fault::SlowPosition { at: 1.0334075760348387, delay: 0.2791832557563448 }], restarts: vec![] };
+        let sc = Scenario { horizon: 2.3885480926654754, events: true, steps: true, initial_db: 21.498398967648416, clean_start: false, max_reduction: 20.0, latency: 0.0004522025101898588, hot: None, stop: STOCK_STOP, real_rate: false, streams: vec![Stream { open: 0.1785, close: 1.0409375, depth: 0.006633982013763149, chunk: 0.07409119427696939, levels: vec![(0.1785, 0.4511432842990031)] }, Stream { open: 1.11425, close: 1.998125, depth: 0.16514753344546107, chunk: 0.08442897332825991, levels: vec![(1.11425, 1.0)] }], faults: vec![Fault::SlowPosition { at: 1.0334075760348387, delay: 0.2791832557563448 }], restarts: vec![] };
         if let Err(v) = run(&sc, 9730) {
             panic!("{}", v.0);
         }
@@ -1181,7 +1265,7 @@ mod tests {
     /// gain
     #[test]
     fn h04_a_lease_that_lapsed_in_a_pause_counts_at_the_safe_level() {
-        let sc = Scenario { horizon: 3.155570610102389, events: true, steps: false, initial_db: 26.10114978447397, clean_start: true, max_reduction: 20.0, latency: 0.0012320645760977352, streams: vec![Stream { open: 1.9656875, close: 3.1703125, depth: 0.042835273227909865, chunk: 0.12382195164106484, levels: vec![(1.9656875, 0.32633048955365695), (2.049, 1.0)] }], faults: vec![Fault::Pause { at: 2.51102217381004, len: 0.4713081063261734 }], restarts: vec![] };
+        let sc = Scenario { horizon: 3.155570610102389, events: true, steps: false, initial_db: 26.10114978447397, clean_start: true, max_reduction: 20.0, latency: 0.0012320645760977352, hot: None, stop: STOCK_STOP, real_rate: false, streams: vec![Stream { open: 1.9656875, close: 3.1703125, depth: 0.042835273227909865, chunk: 0.12382195164106484, levels: vec![(1.9656875, 0.32633048955365695), (2.049, 1.0)] }], faults: vec![Fault::Pause { at: 2.51102217381004, len: 0.4713081063261734 }], restarts: vec![] };
         if let Err(v) = run(&sc, 491) {
             panic!("{}", v.0);
         }
@@ -1191,7 +1275,7 @@ mod tests {
     /// that step is most of it
     #[test]
     fn h05_a_quantized_word_is_undone_from_the_step_above() {
-        let sc = Scenario { horizon: 0.0599409674611242, events: true, steps: true, initial_db: 21.957687476343008, clean_start: true, max_reduction: 20.0, latency: 0.001616603188832694, streams: vec![Stream { open: 0.0, close: 0.2429375, depth: 0.16837715593902544, chunk: 0.05718612666174021, levels: vec![(0.0, 0.6010230250311033)] }], faults: vec![], restarts: vec![] };
+        let sc = Scenario { horizon: 0.0599409674611242, events: true, steps: true, initial_db: 21.957687476343008, clean_start: true, max_reduction: 20.0, latency: 0.001616603188832694, hot: None, stop: STOCK_STOP, real_rate: false, streams: vec![Stream { open: 0.0, close: 0.2429375, depth: 0.16837715593902544, chunk: 0.05718612666174021, levels: vec![(0.0, 0.6010230250311033)] }], faults: vec![], restarts: vec![] };
         if let Err(v) = run(&sc, 31207) {
             panic!("{}", v.0);
         }
@@ -1202,7 +1286,7 @@ mod tests {
     /// they played
     #[test]
     fn h06_a_latched_start_allows_for_the_drain() {
-        let sc = Scenario { horizon: 1.251812419924582, events: true, steps: true, initial_db: 27.44081520087309, clean_start: true, max_reduction: 27.13686626220497, latency: 0.0016988581872146402, streams: vec![Stream { open: 0.1671875, close: 1.6003125, depth: 0.3230662247814654, chunk: 0.014692416538317876, levels: vec![(0.1671875, 1.0)] }], faults: vec![], restarts: vec![Restart { at: 0.9856943206086262, clean: false, gap: 0.010534984879947952, damage: Damage::Truncate }] };
+        let sc = Scenario { horizon: 1.251812419924582, events: true, steps: true, initial_db: 27.44081520087309, clean_start: true, max_reduction: 27.13686626220497, latency: 0.0016988581872146402, hot: None, stop: STOCK_STOP, real_rate: false, streams: vec![Stream { open: 0.1671875, close: 1.6003125, depth: 0.3230662247814654, chunk: 0.014692416538317876, levels: vec![(0.1671875, 1.0)] }], faults: vec![], restarts: vec![Restart { at: 0.9856943206086262, clean: false, gap: 0.010534984879947952, damage: Damage::Truncate }] };
         if let Err(v) = run(&sc, 7536) {
             panic!("{}", v.0);
         }
@@ -1212,7 +1296,7 @@ mod tests {
     /// empty budgets
     #[test]
     fn h07_a_latched_start_fills_the_budgets() {
-        let sc = Scenario { horizon: 2.0783673930377433, events: true, steps: false, initial_db: 9.731376993566748, clean_start: true, max_reduction: 20.335554254317596, latency: 0.000354247808518634, streams: vec![Stream { open: 0.1786875, close: 0.6805, depth: 0.22262230157550328, chunk: 0.03503873415172144, levels: vec![(0.1786875, 0.7263536145167477)] }], faults: vec![], restarts: vec![Restart { at: 1.2851157652684382, clean: true, gap: 0.04486077686697355, damage: Damage::Garbage }] };
+        let sc = Scenario { horizon: 2.0783673930377433, events: true, steps: false, initial_db: 9.731376993566748, clean_start: true, max_reduction: 20.335554254317596, latency: 0.000354247808518634, hot: None, stop: STOCK_STOP, real_rate: false, streams: vec![Stream { open: 0.1786875, close: 0.6805, depth: 0.22262230157550328, chunk: 0.03503873415172144, levels: vec![(0.1786875, 0.7263536145167477)] }], faults: vec![], restarts: vec![Restart { at: 1.2851157652684382, clean: true, gap: 0.04486077686697355, damage: Damage::Garbage }] };
         if let Err(v) = run(&sc, 2) {
             panic!("{}", v.0);
         }
@@ -1222,7 +1306,7 @@ mod tests {
     /// rounded up by the card's step, or the old one
     #[test]
     fn h08_a_failed_write_may_hold_either_value_rounded() {
-        let sc = Scenario { horizon: 1.627405116610055, events: true, steps: true, initial_db: 28.237640200955045, clean_start: true, max_reduction: 20.380038427832506, latency: 0.0015341868532922792, streams: vec![Stream { open: 0.095375, close: 1.38825, depth: 0.21188516420537634, chunk: 0.10680010421938611, levels: vec![(0.095375, 1.0)] }], faults: vec![Fault::WriteFail { at: 0.777646723519306, len: 0.29781161818308416, partial: true }], restarts: vec![] };
+        let sc = Scenario { horizon: 1.627405116610055, events: true, steps: true, initial_db: 28.237640200955045, clean_start: true, max_reduction: 20.380038427832506, latency: 0.0015341868532922792, hot: None, stop: STOCK_STOP, real_rate: false, streams: vec![Stream { open: 0.095375, close: 1.38825, depth: 0.21188516420537634, chunk: 0.10680010421938611, levels: vec![(0.095375, 1.0)] }], faults: vec![Fault::WriteFail { at: 0.777646723519306, len: 0.29781161818308416, partial: true }], restarts: vec![] };
         if let Err(v) = run(&sc, 1825) {
             panic!("{}", v.0);
         }
@@ -1232,7 +1316,7 @@ mod tests {
     /// never accounted
     #[test]
     fn h09_a_pause_between_the_restore_and_the_account_is_charged() {
-        let sc = Scenario { horizon: 2.928420911226999, events: true, steps: false, initial_db: 4.888315429532138, clean_start: true, max_reduction: 23.234492511002504, latency: 0.0011127913864885102, streams: vec![Stream { open: 2.141625, close: 2.8581875, depth: 0.02145407892811289, chunk: 0.12186952711139563, levels: vec![(2.141625, 0.7958562745533154), (2.304625, 1.0)] }], faults: vec![Fault::ClockSplit { at: 1.9204718059173433, len: 0.8763733500041099, pause: 0.5508989092032914 }], restarts: vec![Restart { at: 1.341825145655577, clean: true, gap: 0.400185452348696, damage: Damage::None }] };
+        let sc = Scenario { horizon: 2.928420911226999, events: true, steps: false, initial_db: 4.888315429532138, clean_start: true, max_reduction: 23.234492511002504, latency: 0.0011127913864885102, hot: None, stop: STOCK_STOP, real_rate: false, streams: vec![Stream { open: 2.141625, close: 2.8581875, depth: 0.02145407892811289, chunk: 0.12186952711139563, levels: vec![(2.141625, 0.7958562745533154), (2.304625, 1.0)] }], faults: vec![Fault::ClockSplit { at: 1.9204718059173433, len: 0.8763733500041099, pause: 0.5508989092032914 }], restarts: vec![Restart { at: 1.341825145655577, clean: true, gap: 0.400185452348696, damage: Damage::None }] };
         if let Err(v) = run(&sc, 2390) {
             panic!("{}", v.0);
         }
@@ -1242,7 +1326,7 @@ mod tests {
     /// renewed the lease for a model that fell behind in it
     #[test]
     fn h10_a_renewal_that_blocked_is_given_up() {
-        let sc = Scenario { horizon: 0.3314836495643965, events: true, steps: false, initial_db: 11.943046727961843, clean_start: true, max_reduction: 20.0, latency: 0.0011068940999893085, streams: vec![Stream { open: 0.189375, close: 1.251, depth: 0.05990837127267815, chunk: 0.07367432026365783, levels: vec![(0.189375, 0.13390352805020111)] }], faults: vec![Fault::Pause { at: 0.30805992731269566, len: 0.6532891305737285 }], restarts: vec![] };
+        let sc = Scenario { horizon: 0.3314836495643965, events: true, steps: false, initial_db: 11.943046727961843, clean_start: true, max_reduction: 20.0, latency: 0.0011068940999893085, hot: None, stop: STOCK_STOP, real_rate: false, streams: vec![Stream { open: 0.189375, close: 1.251, depth: 0.05990837127267815, chunk: 0.07367432026365783, levels: vec![(0.189375, 0.13390352805020111)] }], faults: vec![Fault::Pause { at: 0.30805992731269566, len: 0.6532891305737285 }], restarts: vec![] };
         if let Err(v) = run(&sc, 836) {
             panic!("{}", v.0);
         }
@@ -1252,7 +1336,7 @@ mod tests {
     /// the event of a stream that had just opened was still on its way
     #[test]
     fn h11_a_quiet_look_leaves_room_for_an_event_in_flight() {
-        let sc = Scenario { horizon: 1.2107584259764679, events: true, steps: false, initial_db: 22.304290374327, clean_start: true, max_reduction: 20.0, latency: 0.0011260319537750706, streams: vec![Stream { open: 0.081125, close: 0.1085, depth: 0.18839094734845602, chunk: 0.07371997855972491, levels: vec![(0.081125, 0.45867228920373126)] }, Stream { open: 0.819, close: 1.7278125, depth: 0.1305016407120471, chunk: 0.10246173918957761, levels: vec![(0.819, 0.9583760879040607)] }], faults: vec![Fault::RateSlow { at: 0.6470822909786041, delay: 0.16004630036156928 }], restarts: vec![] };
+        let sc = Scenario { horizon: 1.2107584259764679, events: true, steps: false, initial_db: 22.304290374327, clean_start: true, max_reduction: 20.0, latency: 0.0011260319537750706, hot: None, stop: STOCK_STOP, real_rate: false, streams: vec![Stream { open: 0.081125, close: 0.1085, depth: 0.18839094734845602, chunk: 0.07371997855972491, levels: vec![(0.081125, 0.45867228920373126)] }, Stream { open: 0.819, close: 1.7278125, depth: 0.1305016407120471, chunk: 0.10246173918957761, levels: vec![(0.819, 0.9583760879040607)] }], faults: vec![Fault::RateSlow { at: 0.6470822909786041, delay: 0.16004630036156928 }], restarts: vec![] };
         if let Err(v) = run(&sc, 8186) {
             panic!("{}", v.0);
         }
@@ -1262,8 +1346,60 @@ mod tests {
     /// newest frame (silence) stood for audio
     #[test]
     fn h12_a_whole_frame_position_credits_only_the_frames_in_place() {
-        let sc = Scenario { horizon: 0.05578727863485379, events: true, steps: true, initial_db: 21.88303195441253, clean_start: true, max_reduction: 12.551147664370191, latency: 0.00010863814179938114, streams: vec![Stream { open: 0.0, close: 0.0319375, depth: 0.07950821479397462, chunk: 0.014305498443731114, levels: vec![(0.0, 0.9181227951171709)] }], faults: vec![], restarts: vec![] };
+        let sc = Scenario { horizon: 0.05578727863485379, events: true, steps: true, initial_db: 21.88303195441253, clean_start: true, max_reduction: 12.551147664370191, latency: 0.00010863814179938114, hot: None, stop: STOCK_STOP, real_rate: false, streams: vec![Stream { open: 0.0, close: 0.0319375, depth: 0.07950821479397462, chunk: 0.014305498443731114, levels: vec![(0.0, 0.9181227951171709)] }], faults: vec![], restarts: vec![] };
         if let Err(v) = run(&sc, 182140) {
+            panic!("{}", v.0);
+        }
+    }
+
+    /// Review r6 W1: a coil warm from earlier (98 C) and a full-scale
+    /// program behind 234 ms of copy queue, at the J700's own rate and with
+    /// a prompt stop.  The reductions the daemon wrote reached the card's
+    /// conversions only after the queue, and nothing stopped what was
+    /// queued: the true coil reached 135 C at 0.47 s.  A thermal reduction
+    /// risen over what is queued, on a program loud enough to take the coil
+    /// to its limit, hands the card off, and macaudio's stop ends it.
+    #[test]
+    fn h14_a_loud_onset_behind_a_deep_queue_is_stopped() {
+        let sc = Scenario { horizon: 0.4726309380577496, events: true, steps: true, initial_db: 19.781479777723412, clean_start: true, max_reduction: 20.0, latency: 0.0014382855108595665, hot: Some((98.0381734377485, 68.3398433352163)), stop: 0.005, real_rate: true, streams: vec![Stream { open: 0.17922916666666666, close: 1.0126041666666667, depth: 0.234160691154884, chunk: 0.09983093758227513, levels: vec![(0.17922916666666666, 1.0)] }], faults: vec![], restarts: vec![] };
+        if let Err(v) = run(&sc, 11745) {
+            panic!("{}", v.0);
+        }
+    }
+
+    /// Review r6 W1, the review's own witness (seed 58000000402): a cold
+    /// clean start, one full-scale stream behind 250 ms of queue, the
+    /// J700's rate, a prompt stop.  The true coil reached 136.88 C at 0.83 s.
+    #[test]
+    fn h15_the_reviews_deep_queue_witness() {
+        let sc = Scenario { horizon: 0.8221620154541234, events: true, steps: true, initial_db: 16.41996615926243, clean_start: true, max_reduction: 20.0, latency: 0.0005377583844289573, hot: None, stop: PROMPT_STOP, real_rate: true, streams: vec![Stream { open: 0.1505, close: 1.321, depth: 0.25007785341386235, chunk: 0.08269437863607634, levels: vec![(0.1505, 1.0)] }], faults: vec![], restarts: vec![] };
+        if let Err(v) = run(&sc, 58000000402) {
+            panic!("{}", v.0);
+        }
+    }
+
+    /// Review r6 W1, the queue rule alone: an 81 C coil, a full-scale
+    /// program behind 254 ms of queue, a lost position read on the way.
+    /// The daemon was never blind long enough for the reach rule; what was
+    /// queued at the lower gain would have taken the coil to 135 C at 0.50 s.
+    #[test]
+    fn h16_audio_queued_at_a_lower_gain_is_stopped() {
+        let sc = Scenario { horizon: 0.4981996127056075, events: true, steps: true, initial_db: 8.937846981086235, clean_start: true, max_reduction: 29.14419758867056, latency: 0.00046426028307954394, hot: Some((80.7566466776157, 60.653860278473985)), stop: 0.005, real_rate: true, streams: vec![Stream { open: 0.08889583333333333, close: 1.5641666666666667, depth: 0.2537959494175387, chunk: 0.07846874840100372, levels: vec![(0.08889583333333333, 1.0)] }], faults: vec![Fault::PositionFail { at: 0.3980241985431683 }], restarts: vec![] };
+        if let Err(v) = run(&sc, 52949) {
+            panic!("{}", v.0);
+        }
+    }
+
+    /// Review r6 W1, the reach rule alone: a 97 C coil and a full-scale
+    /// onset the daemon cannot see (the capture delivers nothing for
+    /// 0.57 s).  Its account charged the blind time at full scale, but the
+    /// hand-off came only at the latch; the true coil reached 135 C at
+    /// 0.49 s.  A coil that could reach its limit before the next look, on
+    /// any program, is handed off now.
+    #[test]
+    fn h17_a_blind_guard_hands_off_before_the_limit() {
+        let sc = Scenario { horizon: 0.5036921644207981, events: true, steps: true, initial_db: 16.34278643281134, clean_start: true, max_reduction: 23.91409190628302, latency: 0.0014071413693688252, hot: Some((96.96265196323591, 65.71970989360003)), stop: 0.005, real_rate: false, streams: vec![Stream { open: 0.1860625, close: 0.923875, depth: 0.23575628406011143, chunk: 0.028000256783642864, levels: vec![(0.1860625, 1.0)] }], faults: vec![Fault::SenseLoss { at: 0.18454502105662224, len: 0.5659032047466186 }], restarts: vec![] };
+        if let Err(v) = run(&sc, 148723) {
             panic!("{}", v.0);
         }
     }

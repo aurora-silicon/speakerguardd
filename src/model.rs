@@ -34,6 +34,13 @@ pub struct SpeakerState {
     pub hard: bool,
     /// Gain reduction applied by the governor (dB, >= 0).
     pub reduction_db: f64,
+    /// Its thermal part: what the coil's temperature asks for, without the
+    /// power budgets or the release (dB, >= 0).
+    pub thermal_db: f64,
+    /// The loudest 1/SUB_BLOCKS of the latest measured period, as the power
+    /// the coil got (W): what the program delivered when last seen.  Zero
+    /// once the speakers close.
+    pub p_recent: f64,
     reducing: bool,
     /// Power history for the budgets: (seconds, watts before the card's
     /// gain) per step, newest last.
@@ -60,6 +67,8 @@ impl SpeakerState {
             t_peak: t_ambient,
             hard: false,
             reduction_db: 0.0,
+            thermal_db: 0.0,
+            p_recent: 0.0,
             reducing: false,
             history: std::collections::VecDeque::new(),
             history_s: 0.0,
@@ -231,43 +240,32 @@ impl SpeakerState {
         }
     }
 
-    /// `dt` seconds at `power` watts, in steps of at most MAX_SUB_DT.  After
-    /// each step the coil's bound over it goes into `t_peak`: the step's end
-    /// value, plus what a power that varied inside the step (its mean is
-    /// what the step used) could have hidden.  From the hottest moment to
-    /// the end of a step of length h the coil cools at most toward the
-    /// magnet with its time constant, so it was at most
-    /// (end - magnet) (e^(h/tau) - 1) above the end; and a step that put
-    /// all of its energy at the very end ends at most
-    /// P tr (h/tau - (1 - e^(-h/tau))) above the constant-power step.
+    /// `dt` seconds at `power` watts (see `heat_temps`); the coil's bound
+    /// over them goes into `t_peak`.
     fn heat(&mut self, power: f64, dt: f64, t_ambient: f64) {
         if !(dt > 0.0) {
             self.t_peak = self.t_peak.max(self.t_coil);
             return;
         }
-        let s = &self.spec;
-        let n = (dt / MAX_SUB_DT).ceil().max(1.0);
-        let n = if n.is_finite() { n as u64 } else { 1 };
-        let h = dt / n as f64;
-        let k_magnet = 1.0 - (-h / s.tau_magnet).exp();
-        let k_coil = 1.0 - (-h / s.tau_coil).exp();
-        let grow = (h / s.tau_coil).exp() - 1.0;
-        let late = power * s.tr_coil * (h / s.tau_coil - k_coil).max(0.0);
-        for _ in 0..n {
-            // magnet: first-order lag toward ambient + P * tr_magnet
-            self.t_magnet += (t_ambient + power * s.tr_magnet - self.t_magnet) * k_magnet;
-            // coil: first-order lag toward magnet + P * tr_coil
-            self.t_coil += (self.t_magnet + power * s.tr_coil - self.t_coil) * k_coil;
-            let end = self.t_coil + late;
-            let bound = end + (end - self.t_magnet).max(0.0) * grow;
-            if !(bound <= self.t_peak) {
-                // also takes a NaN, which finite() then rejects
-                self.t_peak = bound;
-            }
+        let (c, m, peak) = heat_temps(&self.spec, self.t_coil, self.t_magnet, power, dt, t_ambient);
+        self.t_coil = c;
+        self.t_magnet = m;
+        if !(peak <= self.t_peak) {
+            // also takes a NaN, which finite() then rejects
+            self.t_peak = peak;
         }
-        if !(self.t_peak < s.t_limit) {
+        if !(self.t_peak < self.spec.t_limit) {
             self.hard = true;
         }
+    }
+
+    /// The hottest the coil can get if `power` watts reach it for `secs`
+    /// from now (the bound `heat` keeps), the model not advanced.
+    pub fn peak_if(&self, power: f64, secs: f64, t_ambient: f64) -> f64 {
+        if !(secs > 0.0) {
+            return self.t_coil;
+        }
+        heat_temps(&self.spec, self.t_coil, self.t_magnet, power, secs, t_ambient).2.max(self.t_coil)
     }
 
     /// Clear a latched hard fault once the coil is back under its working
@@ -447,12 +445,45 @@ impl SpeakerState {
         } else {
             0.0
         };
+        self.thermal_db = thermal;
         let wanted = thermal.max(self.budget_reduction());
         // attack at once, release at most 0.5 dB per step so the level does
         // not pump
         self.reduction_db = if wanted >= self.reduction_db { wanted } else { (self.reduction_db - 0.5).max(wanted) };
         self.reduction_db
     }
+}
+
+/// `dt` seconds at `power` watts from coil `tc` and magnet `tm`, in steps of
+/// at most MAX_SUB_DT: the end temperatures and the coil's bound over the
+/// steps.  After each step the bound is the step's end value, plus what a
+/// power that varied inside the step (its mean is what the step used) could
+/// have hidden.  From the hottest moment to the end of a step of length h
+/// the coil cools at most toward the magnet with its time constant, so it
+/// was at most (end - magnet) (e^(h/tau) - 1) above the end; and a step that
+/// put all of its energy at the very end ends at most
+/// P tr (h/tau - (1 - e^(-h/tau))) above the constant-power step.
+fn heat_temps(s: &Speaker, mut tc: f64, mut tm: f64, power: f64, dt: f64, t_ambient: f64) -> (f64, f64, f64) {
+    let n = (dt / MAX_SUB_DT).ceil().max(1.0);
+    let n = if n.is_finite() { n as u64 } else { 1 };
+    let h = dt / n as f64;
+    let k_magnet = 1.0 - (-h / s.tau_magnet).exp();
+    let k_coil = 1.0 - (-h / s.tau_coil).exp();
+    let grow = (h / s.tau_coil).exp() - 1.0;
+    let late = power * s.tr_coil * (h / s.tau_coil - k_coil).max(0.0);
+    let mut peak = f64::NEG_INFINITY;
+    for _ in 0..n {
+        // magnet: first-order lag toward ambient + P * tr_magnet
+        tm += (t_ambient + power * s.tr_magnet - tm) * k_magnet;
+        // coil: first-order lag toward magnet + P * tr_coil
+        tc += (tm + power * s.tr_coil - tc) * k_coil;
+        let end = tc + late;
+        let bound = end + (end - tm).max(0.0) * grow;
+        if !(bound <= peak) {
+            peak = bound;
+        }
+    }
+    (tc, tm, peak)
 }
 
 /// The reduction (dB) a measured frame was converted at, for the budgets:

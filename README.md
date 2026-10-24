@@ -35,6 +35,20 @@ lock and the card falls back to its own safe level; the daemon keeps
 modelling from the sense data and takes the lock back once the reduction is
 3 dB below the limit again.
 
+The J700 converts on copy, ahead of a playback queue of up to 341 ms, so a
+written reduction reaches only what is converted after it.  Audio already
+queued at a lower gain keeps playing, and only giving the lock up stops it
+(macaudio stops the old-gain stream at once).  The daemon gives the lock up
+for that reason too, in two cases:
+* The coils' thermal reduction has risen more than 3 dB over the least the
+  card may still be playing, and that queued audio, at the level the
+  program was last seen to deliver, could take a coil within 3 K of its
+  limit.
+* Any program at all could take a coil there before its next look.  This is
+  what it has to assume while it cannot see.
+It takes the lock back after two whole periods.  Steady programs never do
+this; loud bursts after quiet ones on a warm coil do.
+
 There is no feedback: the model can only be as good as its constants.  The
 J700's constants - thermal resistances and time constants, coil temperature
 limits, volts at full scale, coil resistance and the power budgets - are the
@@ -161,8 +175,13 @@ while the daemon holds the lease the card never applies less reduction than
 the true state needs, and that what cannot be proven ends with the card at
 its safe level (no lock without events, none after a failed rate read, no
 renewal blind past the limit, a latched start from anything but a clean
-stop).  Failures shrink to a minimal scenario printed as Rust; each one it
-found is a test of its own.
+stop).  Where macaudio stops old-gain audio promptly, it also asserts that
+the true coil never reaches its limit unless the daemon was held up
+(descheduled, blocked in a call or gone) in the queue and lease before it.
+That bound is the kernel's lease, not the daemon's.  Scenarios start cold
+or hot, at 16 kHz or at the J700's own 48 kHz and 4096 frames, with a prompt
+or a slow stop.  Failures shrink to a minimal scenario printed as Rust; each
+one it found is a test of its own.
 
     cargo test --release harness                      # 200 cases
     SPEAKERGUARDD_CASES=1000000 cargo test --release harness

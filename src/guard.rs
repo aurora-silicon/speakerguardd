@@ -229,6 +229,18 @@ pub const REARM_PERIODS: u32 = 2;
 /// Hysteresis between handing the card to the kernel at --max-reduction and
 /// taking it back.
 pub const REARM_MARGIN_DB: f64 = 3.0;
+/// How far the coils' thermal reduction may rise over the least reduction
+/// the card may still be playing audio at before that audio is stopped
+/// (review r6 W1), dB ...
+pub const FLUSH_JUMP_DB: f64 = 3.0;
+/// ... and how close to its limit that audio, at the program's level when
+/// last seen, may then take a coil, K.
+pub const FLUSH_MARGIN_K: f64 = 3.0;
+/// The longest the guard goes between decisions while it holds the lock
+/// (a period, a ping): a coil that could come within FLUSH_MARGIN_K of its
+/// limit in this long, at full scale through the least reduction the card
+/// may be playing, is handed off now rather than at the next look.
+pub const REACH_HORIZON: Duration = PING_INTERVAL;
 /// The reduction the volume controls' minimum stands for (dB).
 pub const MUTE_DB: f64 = 120.0;
 
@@ -275,6 +287,9 @@ pub struct Guard {
     fresh: u32,
     words: Vec<i32>,
     last_ping: Instant,
+    /// When the lock was last taken: what the card converted before it was
+    /// at its safe level, or was stopped when the lock was given up.
+    unlocked_at: Instant,
     last_log: Instant,
     /// When the governed reduction was last written.
     last_write: Instant,
@@ -427,6 +442,7 @@ impl Guard {
             unknown_floor,
             fresh: 0,
             last_ping: now,
+            unlocked_at: now,
             last_log: now,
             last_write: now,
             written: if min_now { MUTE_DB } else { f64::INFINITY },
@@ -599,6 +615,51 @@ impl Guard {
         let from = from.checked_sub(QUEUE_BOUND).unwrap_or(from);
         let far = from + Duration::from_secs(1 << 20);
         self.held_over(from, far).map(|e| if e.lo.is_finite() { e.lo } else { 0.0 }).fold(self.written_db(), f64::min)
+    }
+
+    /// Review r6 W1: the card converts on copy, ahead of a queue of up to
+    /// QUEUE_BOUND, so audio already converted at a lower reduction keeps
+    /// playing whatever is written now; only a hand-off stops it (macaudio's
+    /// stop work).  It has to be stopped when the coils' thermal reduction
+    /// has risen more than FLUSH_JUMP_DB over the least the card may still
+    /// be playing, and that audio, at the level the program was last seen
+    /// to deliver, could take a coil within FLUSH_MARGIN_K of its limit; or
+    /// when any program at all could take one there before the next look
+    /// (REACH_HORIZON), which is what a blind guard has to assume.  The
+    /// speaker and how hot, if so.  What the card converted before the lock
+    /// was last taken was at its safe level, or was stopped then.
+    fn queue_threat(&self, now: Instant) -> Option<(usize, f64)> {
+        let from = now.checked_sub(QUEUE_BOUND).unwrap_or(now).max(self.unlocked_at);
+        let (least, most) = self
+            .held_over(from, now)
+            .map(|e| if e.lo.is_finite() { e.lo } else { 0.0 })
+            .filter(|&lo| lo < MUTE_DB)
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), lo| (a.min(lo), b.max(lo)));
+        if !least.is_finite() {
+            return None;
+        }
+        let mut worst: Option<(usize, f64)> = None;
+        let mut note = |k: usize, peak: f64, s: &SpeakerState| {
+            if peak >= s.spec.t_limit - FLUSH_MARGIN_K && worst.is_none_or(|w: (usize, f64)| peak > w.1) {
+                worst = Some((k, peak));
+            }
+        };
+        // whatever the program, before the next look (the measured level
+        // says nothing while the guard is blind)
+        for (k, s) in self.speakers.iter().enumerate() {
+            note(k, s.peak_if(s.worst_case_power(least), REACH_HORIZON.as_secs_f64(), self.globals.t_ambient), s);
+        }
+        let thermal = self.speakers.iter().map(|s| s.thermal_db).fold(0.0, f64::max);
+        if thermal - least <= FLUSH_JUMP_DB {
+            return worst;
+        }
+        for (k, s) in self.speakers.iter().enumerate() {
+            // the program as last seen may have come through as much as the
+            // most reduction in the window: the least can deliver it louder
+            let p = (s.p_recent * 10f64.powf((most - least).max(0.0) / 10.0)).min(s.worst_case_power(least));
+            note(k, s.peak_if(p, QUEUE_BOUND.as_secs_f64(), self.globals.t_ambient), s);
+        }
+        worst
     }
 
     /// The reductions (ranges, dB) the card may have converted samples at
@@ -784,6 +845,7 @@ impl Guard {
             let (heat, budget) = (&p[hp.0..hp.1], &q[hq.0..hq.1]);
             let v = (heat.iter().sum::<f64>() / k as f64 * s.spec.z_nominal).sqrt();
             let mut peak = f64::NEG_INFINITY;
+            let mut loudest = 0.0f64;
             for &(lo, hi, w) in parts {
                 if hi <= lo {
                     continue;
@@ -792,12 +854,14 @@ impl Guard {
                 let blocks = (SUB_BLOCKS * n).div_ceil(globals.period).clamp(1, n);
                 let powers = means(&heat[lo..hi], blocks);
                 let pre = means(&budget[lo..hi], blocks);
+                loudest = powers.iter().fold(loudest, |a, &b| a.max(b));
                 let secs = if n == 1 { w / rate } else { n as f64 / rate };
                 s.step_period_pre(&powers, &pre, secs, globals.t_ambient);
                 peak = peak.max(s.t_peak);
             }
             s.t_peak = peak;
             s.v_rms = v;
+            s.p_recent = loudest;
             s.govern(&globals);
         }
         self.account_to = end;
@@ -888,6 +952,9 @@ impl Guard {
                 // the stream's last frames, then the rest up to this look
                 let tail = self.account_close(hw)?;
                 self.playing = false;
+                for s in self.speakers.iter_mut() {
+                    s.p_recent = 0.0;
+                }
                 if self.stall.take().is_some() {
                     hw.close_sense();
                     info!("speakers closed ({tail} sense frames after the last whole period)");
@@ -1092,6 +1159,11 @@ impl Guard {
                 Some("a coil may have reached its limit".to_string())
             } else if reduction >= self.max_reduction {
                 Some(format!("the model asks for {reduction:.1} dB"))
+            } else if let Some((k, peak)) = self.queue_threat(now) {
+                // only a hand-off stops what the card already converted; the
+                // program is seen whole again before the lock is retaken
+                self.fresh = 0;
+                Some(format!("{} could reach {peak:.0} C on audio queued at a lower gain", self.speakers[k].spec.name))
             } else {
                 None
             };
@@ -1120,7 +1192,9 @@ impl Guard {
                             if self.fresh_enough(hw.now()) {
                                 info!("taking the volume lock{} at {reduction:.1} dB", if self.held { " back" } else { "" });
                                 self.armed = true;
-                                self.note_written(hw.now());
+                                let t = hw.now();
+                                self.unlocked_at = t;
+                                self.note_written(t);
                                 self.held = true;
                                 self.applied = reduction;
                             } else {
@@ -1870,6 +1944,22 @@ mod tests {
         assert_eq!(hw.lapses.len(), 1, "{:?}", hw.lapses);
         assert!(g.armed() && hw.unlocked_at(hw.t));
         assert_eq!(hw.reduction, 0.0);
+    }
+
+    /// Review r6 W1's flush is for audio queued at a gain the coils have
+    /// outgrown fast; a long loud program that warms the coils slowly is
+    /// the governor's alone and never stops the stream.
+    #[test]
+    fn steady_loud_playback_is_governed_without_flushes() {
+        let cfg = j700();
+        for level in [0.3, 0.5, 0.8] {
+            let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
+            hw.level = Box::new(move |_| level);
+            let mut g = Guard::start(&mut hw, &cfg, 20.0, tmp_state()).unwrap();
+            run_until(&mut g, &mut hw, secs(120.0)).unwrap();
+            assert!(g.armed(), "{level}: not armed at the end");
+            assert_eq!(hw.relinquished, 0, "{level}: {} hand-offs, the coil at {:.1} C", hw.relinquished, g.speakers[0].t_coil);
+        }
     }
 
     /// "Peak volume": with a cool speaker and a loud but sustainable program
