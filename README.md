@@ -294,3 +294,7 @@ The daemon writes the controls to the card's safe value at its start and
 before each unlock.  The card accepts that value while the volume is locked.
 Until the first unlock the speakers play at the card's safe level, as they
 do without the daemon, and an unlock never lets anything louder through.
+At the first ping the daemon reads the controls' range with the lock lifted
+and checks the card's safe level (the locked maximum against it) against
+`safe_reduction`.  A card that is louder there than the configuration says
+is never unlocked: the speakers stay at its safe level.

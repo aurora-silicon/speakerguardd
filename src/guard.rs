@@ -144,9 +144,18 @@ pub trait Hw {
     }
     /// Turn every volume control to the card's own safe value, which it
     /// accepts while the volume is locked: done at the start and before
-    /// each unlock.  The reduction the controls now apply (dB): the safe
-    /// level, or MUTE_DB where only their minimum could be written.
+    /// each unlock.  The reduction the controls now apply (dB), as written:
+    /// the safe level, or MUTE_DB where only their minimum could be written.
+    /// Before the controls' unlocked range is known that is the configured
+    /// safe level, which the first ping checks (`card_safe_db`).
     fn set_safe(&mut self) -> io::Result<f64>;
+    /// The card's own safe level (dB below the controls' maximum) once both
+    /// ranges have been read: the most the controls accept while the volume
+    /// is locked, against their maximum with the lock lifted.  None before
+    /// the first ping, and for a card that does not say.
+    fn card_safe_db(&self) -> Option<f64> {
+        None
+    }
     /// Give the card's lock up and take it again: the card locks the
     /// volume at once, drops what was left of its lease and stops the
     /// streams converted at the old gain.
@@ -280,6 +289,16 @@ enum Threat {
     Queue,
 }
 
+/// A reduction a control write reports, checked: a number of dB at or
+/// above 0.
+fn valid_db(db: f64) -> io::Result<f64> {
+    if db >= 0.0 {
+        Ok(db)
+    } else {
+        Err(io::Error::new(io::ErrorKind::InvalidData, format!("the safe write reported {db} dB")))
+    }
+}
+
 /// Where frames whose position was read between `before` and `after` with
 /// `queued` frames of backlog end: the earliest they can (`early`), and how
 /// many frames later they can (`shift`).  A whole-frame position: the frames
@@ -372,6 +391,9 @@ pub struct Guard {
     stopping: bool,
     /// When the lock was given up for the stop.
     relinquished_at: Option<Instant>,
+    /// The card's safe level is louder than the configured one: the lock
+    /// is never taken.
+    safe_mismatch: bool,
 }
 
 impl Guard {
@@ -399,8 +421,9 @@ impl Guard {
         // silent (review r6).  Without events there is no unlock: they stay
         // there.
         let safe_now = if events {
-            match hw.set_safe() {
-                Ok(applied) => Some(applied.max(globals.safe_reduction)),
+            // what the write applied, as it says (review r7 Y5)
+            match hw.set_safe().and_then(valid_db) {
+                Ok(applied) => Some(applied),
                 Err(e) => {
                     warn!("volume control: {e}; the controls' value stays unknown");
                     None
@@ -520,6 +543,7 @@ impl Guard {
             save_failed: false,
             stopping: false,
             relinquished_at: None,
+            safe_mismatch: false,
         };
         // a clean stop is resumed once: gone before this run can unlock
         g.invalidated = g.invalidate(hw);
@@ -878,6 +902,22 @@ impl Guard {
         }
         self.last_ping = t0;
         Ok(())
+    }
+
+    /// The card's own safe level, once known, is no louder than the
+    /// configured one, which every lapse and the safe writes before the
+    /// first ping are accounted at (review r7 Y5).  A louder one means the
+    /// configuration does not match the kernel: the lock is never taken,
+    /// and the speakers stay at the card's safe level.
+    fn card_safe_ok<H: Hw>(&mut self, hw: &H) -> bool {
+        if let Some(card) = hw.card_safe_db() {
+            let configured = self.globals.safe_reduction;
+            if card < configured - 1e-6 && !self.safe_mismatch {
+                warn!("the card's safe level is {card:.1} dB, louder than the configured {configured:.1} dB; leaving the speakers at the card's safe level");
+                self.safe_mismatch = true;
+            }
+        }
+        !self.safe_mismatch
     }
 
     fn check_model(&self) -> Result<(), Box<dyn Error>> {
@@ -1335,12 +1375,11 @@ impl Guard {
                 // the clean stop this run may have resumed goes first
                 self.invalidated = self.invalidate(hw);
             }
-            if seeing && reduction < self.max_reduction - REARM_MARGIN_DB && self.invalidated {
+            if seeing && reduction < self.max_reduction - REARM_MARGIN_DB && self.invalidated && !self.safe_mismatch {
                 // the unlock lets nothing through louder than the card's own
                 // safe level
-                match hw.set_safe() {
-                    Ok(applied) => {
-                        let v = applied.max(self.globals.safe_reduction);
+                match hw.set_safe().and_then(valid_db) {
+                    Ok(v) => {
                         self.written = v;
                         self.written_hi = v;
                         self.requested = f64::NAN;
@@ -1350,7 +1389,9 @@ impl Guard {
                         // be current at the unlock
                         if self.fresh_enough(hw.now()) {
                             self.ping_lock(hw)?;
-                            if self.fresh_enough(hw.now()) {
+                            if !self.card_safe_ok(hw) {
+                                hw.relinquish().map_err(|e| format!("giving up the volume lock: {e}"))?;
+                            } else if self.fresh_enough(hw.now()) {
                                 let target = self.target_db(hw, reduction);
                                 info!("taking the volume lock{} at {target:.1} dB", if self.held { " back" } else { "" });
                                 self.armed = true;
@@ -2265,6 +2306,76 @@ mod tests {
             let near = |s: &SpeakerState, db: f64| s.peak_if(s.worst_case_power(db), secs_held, 50.0) >= s.spec.t_limit - FLUSH_MARGIN_K;
             assert!(!g.speakers.iter().any(|s| near(s, floor)), "{t} C: the floor lets a coil near its limit");
             assert!(g.speakers.iter().any(|s| near(s, floor - 0.05)), "{t} C: the floor is higher than it needs");
+        }
+    }
+
+    /// Review r7 Y4 and Y5: the history holds what the safe write says it
+    /// applied, at the start and at the unlock, not the configured level
+    /// (nor the minimum).  A card whose safe writes apply 18 dB, then
+    /// 17.5 dB, is louder than the configured 20 dB says.
+    struct SafeSays {
+        hw: FakeHw,
+        says: Vec<f64>,
+        card: Option<f64>,
+    }
+    impl Hw for SafeSays {
+        fn now(&self) -> Instant { self.hw.now() }
+        fn boottime(&self) -> Duration { self.hw.boottime() }
+        fn sleep(&mut self, d: Duration) { self.hw.sleep(d) }
+        fn take_lock(&mut self) -> io::Result<()> { self.hw.take_lock() }
+        fn ping(&mut self) -> io::Result<()> { self.hw.ping() }
+        fn set_safe(&mut self) -> io::Result<f64> {
+            self.hw.set_safe()?;
+            let v = if self.says.len() > 1 { self.says.remove(0) } else { self.says[0] };
+            self.hw.reduction = v;
+            Ok(v)
+        }
+        fn card_safe_db(&self) -> Option<f64> { self.card }
+        fn set_reduction(&mut self, d: f64) -> io::Result<f64> { self.hw.set_reduction(d) }
+        fn relinquish(&mut self) -> io::Result<()> { self.hw.relinquish() }
+        fn sample_rate(&mut self) -> io::Result<i64> { self.hw.sample_rate() }
+        fn open_sense(&mut self, r: u32) -> io::Result<()> { self.hw.open_sense(r) }
+        fn close_sense(&mut self) { self.hw.close_sense() }
+        fn read_period(&mut self, w: &mut [i32]) -> io::Result<Option<bool>> { self.hw.read_period(w) }
+        fn queued(&mut self) -> io::Result<u64> { self.hw.queued() }
+        fn read_tail(&mut self, w: &mut [i32]) -> io::Result<usize> { self.hw.read_tail(w) }
+        fn wait_rate_change(&mut self, d: Duration) -> bool { self.hw.wait_rate_change(d) }
+        fn rate_events(&mut self) -> bool { self.hw.rate_events() }
+        fn events_available(&self) -> bool { true }
+    }
+
+    #[test]
+    fn the_history_holds_what_the_safe_write_applied() {
+        let cfg = j700();
+        let mut hw = SafeSays { hw: FakeHw::new(2, 4096), says: vec![18.0, 17.5], card: None };
+        hw.hw.level = Box::new(|_| 0.0);
+        let mut g = Guard::start(&mut hw, &cfg, 20.0, tmp_state()).unwrap();
+        assert_eq!((g.written, g.written_hi), (18.0, 18.0));
+        assert!(g.gains.iter().any(|e| e.lo == 18.0 && e.hi == 18.0), "{:?}", g.gains);
+        while !g.armed() {
+            g.tick(&mut hw).unwrap();
+        }
+        assert!(g.gains.iter().any(|e| e.lo == 17.5 && e.hi == 17.5), "the unlock's safe write: {:?}", g.gains);
+    }
+
+    /// Review r7 Y5: a card whose own safe level (its locked range against
+    /// its unlocked one) is louder than the configured one plays louder
+    /// than every lapse is accounted at: the lock is never taken.  One that
+    /// is quieter, or the same, is fine.
+    #[test]
+    fn a_card_louder_at_its_safe_level_than_configured_is_never_unlocked() {
+        let cfg = j700();
+        for (card, unlocks) in [(15.0, false), (20.0, true), (25.0, true)] {
+            let mut hw = SafeSays { hw: FakeHw::new(2, 4096), says: vec![20.0], card: Some(card) };
+            hw.hw.level = Box::new(|_| 0.0);
+            let mut g = Guard::start(&mut hw, &cfg, 20.0, tmp_state()).unwrap();
+            while hw.hw.t < secs(5.0) {
+                g.tick(&mut hw).unwrap();
+            }
+            assert_eq!(g.armed(), unlocks, "a card safe level of {card} dB");
+            if !unlocks {
+                assert!(hw.hw.pings.len() <= 1 && !hw.hw.unlocked_at(hw.hw.t), "{:?}", hw.hw.pings);
+            }
         }
     }
 
