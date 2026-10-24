@@ -210,14 +210,17 @@ change and change event, every sense open, every complete period's words
 with the most reduction the card may have applied over it (its safe level
 whenever the lock was not held throughout), the frames read at each close,
 every lost or unusable period, failed control writes, the lock taken and
-handed back with the reason, the governing latch, and the model the guard
-started from.  It stops at `--record-max-mb` (512 by default) and says so in
+handed back with the reason, the governing latch, every span of its account
+(measured, charged or cooled), each look at closed speakers that charged
+with the change events it saw, and the model the guard started from.  It stops at `--record-max-mb` (512 by default) and says so in
 the file.
 
 `--replay FILE --model NAME` runs the guard itself on the recording,
 offline: the speakers open and close where they did, the periods arrive
-when they were read, losses and failed reads recur at their times, and a
-simulated card keeps the kernel's lease, notice and safe level.  The
+when they were read, losses and failed reads recur at their times, the
+looks at closed speakers come where the live ones did and see the same
+events, and a simulated card keeps the kernel's lease, notice and safe
+level.  The
 program before the card's gain is rebuilt from the words and the recorded
 gain, then played through the gains the replayed guard writes (rounded up
 to the control's step, `--gain-db` louder if asked) and clipped at full
@@ -231,9 +234,13 @@ opens, failed control writes and the daemon's own lateness (neither is
 replayed), periods played louder than recorded where the recording cannot
 say what the program was, and an early end.  With the recorded governor at
 0 dB it also compares its lock and latch transitions with the live ones.
-It certifies a recording only when none of that is there, the transitions
-match and nothing it measured was lost or rejected in the recording;
-otherwise it says why and exits with status 3.  A certificate is about the
+Its account is compared with the live one in every case: time the live
+daemon charged that the replay measured or cooled, time it measured that
+the replay cooled, or a replayed account that ends early, all refuse the
+certificate.  It certifies a recording only when none of that is there, the
+transitions match and nothing it measured was lost or rejected in the
+recording; otherwise it says why and exits with status 3.  Recordings from
+before 0.1.10 (format 2) are not read.  A certificate is about the
 recording, not the speakers: it says the replay saw what the live daemon
 saw.
 

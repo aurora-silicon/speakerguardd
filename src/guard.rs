@@ -658,6 +658,10 @@ impl Guard {
         rec_do(&mut slot, boot, |r, t| r.start(t, gov, max, &text));
         self.rec = slot;
         self.last_hard = self.governing_state().2;
+        // the account's spans are recorded in boot time
+        if self.boot_at.is_none() {
+            self.boot_at = Some((hw.now(), boot));
+        }
     }
 
     /// Keep a trace of decisions and of the account (the replay).
@@ -681,11 +685,14 @@ impl Guard {
         }
     }
 
-    /// A span of the account, for the trace.
+    /// A span of the account, for the trace and the recording.
     fn note_account(&mut self, from: Instant, to: Instant, how: Accounted) {
-        if self.trace.is_some() && to > from {
+        if to > from && (self.trace.is_some() || self.rec.is_some()) {
             let (a, b) = (self.boot_of(from), self.boot_of(to));
-            self.trace.as_mut().unwrap().push((b, Trace::Account(a, b, how)));
+            if let Some(tr) = self.trace.as_mut() {
+                tr.push((b, Trace::Account(a, b, how)));
+            }
+            rec_do(&mut self.rec, b, |r, ns| r.account(ns, a.as_nanos() as u64, how));
         }
     }
 
@@ -1260,7 +1267,14 @@ impl Guard {
                 } else {
                     // a change between two looks at closed speakers (a
                     // stream that came and went), or nothing known
+                    let from = self.account_to;
                     self.charge(now)?;
+                    if self.rec.is_some() {
+                        // what decided it, for a replay (review P8-8): its
+                        // own events cannot say
+                        let (a, b) = (self.boot_of(from), self.boot_of(now));
+                        rec_do(&mut self.rec, b, |r, ns| r.look(ns, a.as_nanos() as u64, changed, late));
+                    }
                 }
             }
             self.dt = None;

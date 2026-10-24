@@ -17,6 +17,12 @@
 //! * `A` the lock taken or handed to the kernel, with the reason; `H` the
 //!   governing model's hard latch set or cleared; `X` a failed control
 //!   write.  `Z` the end, when the recording stopped early.
+//! * `C` a span of the guard's account (from, to) and how it was accounted:
+//!   measured, charged at full scale or cooled.  `K` a look at closed
+//!   speakers that charged, with the span it charged and the change events
+//!   it saw before and after its rate read: the rate reads alone cannot say
+//!   (an event for a stream that came and went between two looks, or one
+//!   whose rate was never read as open).
 //!
 //! The recording starts with the model the live guard started from, written
 //! as a clean stop's state at that instant, so that the replayed guard
@@ -25,7 +31,9 @@
 //! The replay runs the real guard on a simulated card driven by the
 //! recording: the speakers open and close where the live daemon saw them
 //! do so, the periods arrive when it read them, losses, failed rate reads
-//! and failed opens recur at their times.  The program before the card's
+//! and failed opens recur at their times.  It looks at closed speakers
+//! where the live daemon did, never inside a span the live daemon charged
+//! at its next look, and those looks see the events the live ones saw.  The program before the card's
 //! gain is rebuilt from each period's words and the gain the card applied
 //! (rounded up to the control's 0.5 dB step), and played through the gains
 //! the replayed guard writes, rounded the same way, `--gain-db` louder if
@@ -45,7 +53,10 @@
 //! The replay also reports the replayed guard's account: every span is
 //! measured, charged or cooled, and every uncovered interval is listed as
 //! charged.  Lost frames and bad sense data are never measured; a replay
-//! that measured any of them would refuse to certify.
+//! that measured any of them would refuse to certify.  The account is
+//! compared with the live one's too: a replay that measured or cooled time
+//! the live daemon charged, cooled time it measured, or whose account ends
+//! before the live one does refuses to certify, whatever its decisions.
 
 use std::error::Error;
 use std::fmt::Write as _;
@@ -55,12 +66,12 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::config::{Config, Governor, SenseFormat};
-use crate::guard::{Accounted, Guard, Hw, Trace, KERNEL_LOCK_TIMEOUT, MUTE_DB};
+use crate::guard::{Accounted, Guard, Hw, Trace, EVENT_SLACK, KERNEL_LOCK_TIMEOUT, MUTE_DB};
 /// The most card gain a replay rebuilds a program through (dB): past it the
 /// recorded words are too quiet to say what the program was.
 const PRE_GAIN_MAX_DB: f64 = 30.0;
 
-const MAGIC: &str = "speakerguardd-record 2";
+const MAGIC: &str = "speakerguardd-record 3";
 
 /// Loss kinds (`L`).
 pub const LOSS_SHORT: u8 = 1;
@@ -209,6 +220,24 @@ impl Recorder {
         self.put(&b)
     }
 
+    /// A span of the account, ending at `t`.
+    pub fn account(&mut self, t: u64, from: u64, how: Accounted) -> io::Result<()> {
+        let mut b = Self::head(b'C', t);
+        b.extend_from_slice(&from.to_le_bytes());
+        b.push(account_code(how));
+        self.put(&b)
+    }
+
+    /// A look at closed speakers that charged from `from` to `t`, and the
+    /// change events it saw before and after its rate read.
+    pub fn look(&mut self, t: u64, from: u64, changed: bool, late: bool) -> io::Result<()> {
+        let mut b = Self::head(b'K', t);
+        b.extend_from_slice(&from.to_le_bytes());
+        b.push(changed as u8);
+        b.push(late as u8);
+        self.put(&b)
+    }
+
     pub fn control_failure(&mut self, t: u64, kind: u8) -> io::Result<()> {
         let mut b = Self::head(b'X', t);
         b.push(kind);
@@ -226,6 +255,34 @@ impl Recorder {
 impl Drop for Recorder {
     fn drop(&mut self) {
         let _ = self.out.flush();
+    }
+}
+
+fn account_code(how: Accounted) -> u8 {
+    match how {
+        Accounted::Measured => 0,
+        Accounted::Charged => 1,
+        Accounted::Cooled => 2,
+    }
+}
+
+fn account_of(v: u8) -> Option<Accounted> {
+    [Accounted::Measured, Accounted::Charged, Accounted::Cooled].into_iter().find(|&a| account_code(a) == v)
+}
+
+/// A look at closed speakers that charged (`K`).
+struct Look {
+    t: Duration,
+    from: Duration,
+    changed: bool,
+    late: bool,
+}
+
+impl Look {
+    /// Where the live daemon's look before it was: it cooled up to `from`
+    /// there (or the span starts where something else left the account).
+    fn edge(&self) -> Duration {
+        (self.from + EVENT_SLACK).min(self.t)
     }
 }
 
@@ -267,6 +324,9 @@ struct Timeline {
     permits: Vec<(Duration, bool, String)>,
     latches: Vec<(Duration, bool)>,
     failures: Vec<(Duration, u8)>,
+    /// The live account's spans: (from, to, how).
+    accounts: Vec<(Duration, Duration, Accounted)>,
+    looks: Vec<Look>,
     truncated: Option<Duration>,
     last: Duration,
 }
@@ -305,7 +365,11 @@ fn governor_of(v: u8) -> Option<Governor> {
 
 impl Timeline {
     fn read(path: &Path, cfg: &Config) -> Result<Timeline, Box<dyn Error>> {
-        let mut inp = BufReader::new(File::open(path)?);
+        let file = File::open(path)?;
+        // a record's words past the end of the file are not there, whatever
+        // a seek over them says
+        let file_len = file.metadata()?.len();
+        let mut inp = BufReader::new(file);
         let mut header = Vec::new();
         loop {
             let b = read_u8(&mut inp).map_err(|_| "not a speakerguardd recording")?;
@@ -354,6 +418,8 @@ impl Timeline {
             permits: Vec::new(),
             latches: Vec::new(),
             failures: Vec::new(),
+            accounts: Vec::new(),
+            looks: Vec::new(),
             truncated: None,
             last: Duration::ZERO,
         };
@@ -407,6 +473,9 @@ impl Timeline {
                         }
                         size += 8 + 4 + 1 + 4 * speakers as u64;
                         let n = (channels * period * word) as u64;
+                        if offset + size + n > file_len {
+                            return Err(io::ErrorKind::UnexpectedEof.into());
+                        }
                         tl.periods.push(Period { t, queued, rate, measured, applied, offset: offset + size });
                         inp.seek_relative(n as i64)?;
                         size += n;
@@ -418,8 +487,11 @@ impl Timeline {
                         if frames > period {
                             return Err(io::Error::new(io::ErrorKind::InvalidData, "tail longer than a period"));
                         }
-                        tl.tails.push(Tail { t, queued, frames, offset: offset + size });
                         let n = (channels * frames * word) as u64;
+                        if offset + size + n > file_len {
+                            return Err(io::ErrorKind::UnexpectedEof.into());
+                        }
+                        tl.tails.push(Tail { t, queued, frames, offset: offset + size });
                         inp.seek_relative(n as i64)?;
                         size += n;
                     }
@@ -443,6 +515,19 @@ impl Timeline {
                     b'X' => {
                         tl.failures.push((t, read_u8(&mut inp)?));
                         size += 1;
+                    }
+                    b'C' => {
+                        let from = Duration::from_nanos(read_u64(&mut inp)?);
+                        let how = account_of(read_u8(&mut inp)?).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "account"))?;
+                        tl.accounts.push((from, t, how));
+                        size += 9;
+                    }
+                    b'K' => {
+                        let from = Duration::from_nanos(read_u64(&mut inp)?);
+                        let changed = read_u8(&mut inp)? == 1;
+                        let late = read_u8(&mut inp)? == 1;
+                        tl.looks.push(Look { t, from, changed, late });
+                        size += 10;
                     }
                     b'Z' => {
                         let _ = read_u8(&mut inp)?;
@@ -618,7 +703,6 @@ pub struct ReplayHw {
     used_tail: usize,
     position_error: Option<i32>,
     queued: u64,
-    events_seen_to: Duration,
     lease_t: Duration,
     /// The speaker each sense channel belongs to.
     chan_speaker: Vec<Option<usize>>,
@@ -628,6 +712,14 @@ pub struct ReplayHw {
     /// PRE_GAIN_MAX_DB.  Unqualifiable.
     pub clip_ambiguous: Vec<(Duration, Duration, &'static str)>,
     pub delivered: u32,
+    /// The live daemon's looks at closed speakers: where each cooled span
+    /// was looked at, and where each charging look and the look before it
+    /// were.
+    schedule: Vec<Duration>,
+    /// The next charging look whose events are not yet served, and how
+    /// many of its two event reads were.
+    next_look: usize,
+    look_reads: u8,
 }
 
 impl ReplayHw {
@@ -640,10 +732,16 @@ impl ReplayHw {
             }
         }
         let n = cfg.speakers.len();
+        let mut schedule: Vec<Duration> = tl.accounts.iter().filter(|a| a.2 == Accounted::Cooled).map(|a| a.1 + EVENT_SLACK).collect();
+        for k in &tl.looks {
+            schedule.push(k.edge());
+            schedule.push(k.t);
+        }
+        schedule.sort();
+        schedule.dedup();
         Ok(ReplayHw {
             bt: tl.start,
             lease_t: tl.start,
-            events_seen_to: tl.start,
             tl,
             file: File::open(path)?,
             t0: Instant::now(),
@@ -659,6 +757,9 @@ impl ReplayHw {
             clipped_periods: 0,
             clip_ambiguous: Vec::new(),
             delivered: 0,
+            schedule,
+            next_look: 0,
+            look_reads: 0,
         })
     }
 
@@ -921,20 +1022,50 @@ impl Hw for ReplayHw {
         Ok(frames)
     }
     fn wait_rate_change(&mut self, timeout: Duration) -> bool {
-        let to = self.bt + timeout;
-        if self.tl.events {
-            if let Some(c) = self.tl.change_in(self.bt, to) {
-                self.advance_to(c + Duration::from_micros(200));
+        // inside a span the live daemon charged at its next look it did not
+        // look in between, and neither does the replay (a look there would
+        // cool what the live daemon charged)
+        let i = self.tl.looks.partition_point(|k| k.t <= self.bt);
+        if let Some(k) = self.tl.looks.get(i) {
+            if k.edge() <= self.bt {
+                let t = k.t;
+                self.advance_to(t);
                 return true;
             }
         }
-        self.advance_to(to);
-        false
+        let to = self.bt + timeout;
+        let mut wake = to;
+        // the live daemon's own looks
+        let j = self.schedule.partition_point(|&t| t <= self.bt);
+        if let Some(&t) = self.schedule.get(j) {
+            wake = wake.min(t);
+        }
+        if self.tl.events {
+            if let Some(c) = self.tl.change_in(self.bt, wake) {
+                wake = wake.min(c + Duration::from_micros(200));
+            }
+        }
+        self.advance_to(wake);
+        wake < to
     }
     fn rate_events(&mut self) -> bool {
-        let changed = self.tl.events && self.tl.change_in(self.events_seen_to, self.bt).is_some();
-        self.events_seen_to = self.bt;
-        changed
+        // At a look the live daemon charged at, the events it saw there:
+        // before its rate read, then after it.  Elsewhere the live daemon
+        // saw none at closed speakers (it would have charged), and while
+        // the speakers play they decide nothing.
+        let tol = Duration::from_millis(1);
+        while self.tl.looks.get(self.next_look).is_some_and(|k| k.t + tol < self.bt) {
+            self.next_look += 1;
+            self.look_reads = 0;
+        }
+        let Some(k) = self.tl.looks.get(self.next_look).filter(|k| k.t <= self.bt + tol) else { return false };
+        let seen = if self.look_reads == 0 { k.changed } else { k.late };
+        self.look_reads += 1;
+        if self.look_reads == 2 {
+            self.next_look += 1;
+            self.look_reads = 0;
+        }
+        seen
     }
     fn events_available(&self) -> bool {
         self.tl.events
@@ -1016,6 +1147,8 @@ pub fn replay(path: &Path, cfg: &Config, opts: &Replay) -> Result<Outcome, Box<d
     let mut ambiguous = tl.ambiguous();
     let live_permits: Vec<(Duration, bool)> = tl.permits.iter().map(|p| (p.0, p.1)).collect();
     let live_latches = tl.latches.clone();
+    let live_account = tl.accounts.clone();
+    let live_end = live_account.iter().map(|a| a.1).max();
     let (start, last, config_matches) = (tl.start, tl.last, fingerprint(&cfg) == tl.config);
     let initial = tl.state.clone();
     let recorded_gov = tl.governor;
@@ -1030,6 +1163,7 @@ pub fn replay(path: &Path, cfg: &Config, opts: &Replay) -> Result<Outcome, Box<d
     // what the replayed guard must never measure: the recording's lost
     // frames and bad sense data
     let never_measured: Vec<(Duration, Duration)> = ambiguous.iter().filter(|a| a.2 == "frames the capture lost" || a.2 == "bad sense data").map(|a| (a.0, a.1)).collect();
+    let data_end = tl.periods.iter().map(|p| p.t).chain(tl.tails.iter().map(|x| x.t)).max().unwrap_or(start);
     let mut hw = ReplayHw::new(tl, &cfg, path, opts.gain_db)?;
     let mut g = Guard::start_with(&mut hw, &cfg, max_reduction, Some(state), &[])?;
     g.start_trace(&hw);
@@ -1050,9 +1184,11 @@ pub fn replay(path: &Path, cfg: &Config, opts: &Replay) -> Result<Outcome, Box<d
     let (mut playing_s, mut kernel_s) = (0.0, 0.0);
     let mut hottest = vec![(f64::MIN, f64::MIN, f64::MIN, f64::MIN); n];
     let mut fatal = None;
-    // the replay ends where the recording does: after its last record the
-    // live daemon's view is not known
-    let end = last;
+    // The replay ends with the look that ended the live account (after it
+    // the live daemon's view is not known: a later wake says only that an
+    // event came), once every period and tail is read.  A recording with no
+    // account ends with its last record.
+    let end = live_end.map_or(last, |e| (e + EVENT_SLACK).max(data_end) + Duration::from_micros(1));
     let mut delivered = 0;
     while hw.boottime_now() < end {
         let before = hw.boottime_now();
@@ -1124,6 +1260,34 @@ pub fn replay(path: &Path, cfg: &Config, opts: &Replay) -> Result<Outcome, Box<d
         .copied()
         .filter(|&(a, b)| spans.iter().any(|s| s.2 == Accounted::Measured && s.0 + slack < b && a + slack < s.1))
         .collect();
+    // The account against the live one's (review P8-8): inside each live
+    // span, outside a band at each end, time the live daemon charged must
+    // be charged here and time it measured must not be cooled.
+    let band = Duration::from_millis(5);
+    let overlap = |a: Duration, b: Duration, pred: &dyn Fn(Accounted) -> bool| -> Duration {
+        let i = spans.partition_point(|s| s.1 <= a);
+        spans[i..].iter().take_while(|s| s.0 < b).filter(|s| pred(s.2)).map(|s| s.1.min(b).saturating_sub(s.0.max(a))).sum()
+    };
+    let (mut uncharged, mut cooled_measured) = (Duration::ZERO, Duration::ZERO);
+    let mut first_uncharged = None;
+    for &(a, b, how) in &live_account {
+        let (a, b) = (a + band, b.saturating_sub(band));
+        if a >= b {
+            continue;
+        }
+        match how {
+            Accounted::Charged => {
+                let d = overlap(a, b, &|h| h != Accounted::Charged);
+                if !d.is_zero() {
+                    first_uncharged.get_or_insert(a - band);
+                }
+                uncharged += d;
+            }
+            Accounted::Measured => cooled_measured += overlap(a, b, &|h| h == Accounted::Cooled),
+            Accounted::Cooled => {}
+        }
+    }
+    let replay_end = spans.iter().map(|s| s.1).max();
 
     let rel = |t: Duration| t.saturating_sub(start).as_secs_f64();
     let mut o = String::new();
@@ -1169,6 +1333,15 @@ pub fn replay(path: &Path, cfg: &Config, opts: &Replay) -> Result<Outcome, Box<d
     for m in &measured_there {
         let _ = writeln!(o, "  measured where the recording lost or rejected the frames: {:.3} to {:.3} s", rel(m.0), rel(m.1));
     }
+    let ends = |e: Option<Duration>| e.map_or("-".to_string(), |e| format!("{:.3} s", rel(e)));
+    let _ = writeln!(
+        o,
+        "account against the live one: {:.1} ms the live daemon charged not charged here, {:.1} ms it measured cooled here; it ends at {}, here at {}",
+        uncharged.as_secs_f64() * 1000.0,
+        cooled_measured.as_secs_f64() * 1000.0,
+        ends(live_end),
+        ends(replay_end)
+    );
     let _ = writeln!(o, "clipping: {} periods clipped at full scale", hw.clipped_periods);
     let total: f64 = ambiguous.iter().map(|a| a.1.saturating_sub(a.0).as_secs_f64()).sum::<f64>() + 0.0;
     let _ = writeln!(o, "ambiguous: {} intervals, {:.3} s", ambiguous.len(), total);
@@ -1189,6 +1362,18 @@ pub fn replay(path: &Path, cfg: &Config, opts: &Replay) -> Result<Outcome, Box<d
         let _ = writeln!(o, "equivalence with the live run: not compared (another governor, gain, --max-reduction or configuration)");
     }
     let mut refused = Vec::new();
+    let tiny = Duration::from_micros(500);
+    if uncharged > tiny {
+        refused.push(format!("the replay did not charge {:.1} ms the live daemon charged (from {:.3} s)", uncharged.as_secs_f64() * 1000.0, first_uncharged.map_or(0.0, rel)));
+    }
+    if cooled_measured > tiny {
+        refused.push(format!("the replay cooled {:.1} ms the live daemon measured", cooled_measured.as_secs_f64() * 1000.0));
+    }
+    if let Some(e) = live_end {
+        if replay_end.is_none_or(|r| r + band < e) {
+            refused.push(format!("the replay's account ends at {}, the live one at {}", ends(replay_end), ends(live_end)));
+        }
+    }
     if !measured_there.is_empty() {
         refused.push("the replay measured frames the recording lost or rejected".into());
     }
@@ -1416,5 +1601,131 @@ mod tests {
         let mem = Mem::default();
         let _r = Recorder::to(Box::new(mem.clone()), &cfg, true, 1 << 20).unwrap();
         assert!(String::from_utf8_lossy(&mem.0.borrow()).starts_with(MAGIC));
+    }
+
+    /// The replay's account in seconds per kind, from its text.
+    fn account_line(o: &Outcome) -> (f64, f64, f64) {
+        let l = o.text.lines().find(|l| l.starts_with("account: ")).unwrap();
+        let v: Vec<f64> = l.split(" s ").filter_map(|w| w.rsplit(' ').next()?.parse().ok()).collect();
+        (v[0], v[1], v[2])
+    }
+
+    /// A descheduled idle wait that sees an event after a short stream has
+    /// already closed: the rate never reads as open.
+    struct WakeOnly {
+        hw: FakeHw,
+        pending: bool,
+        /// How long each wait takes before the event wakes it.
+        wait: f64,
+    }
+    impl Hw for WakeOnly {
+        fn now(&self) -> Instant { self.hw.now() }
+        fn boottime(&self) -> Duration { self.hw.boottime() }
+        fn sleep(&mut self, d: Duration) { self.hw.sleep(d) }
+        fn take_lock(&mut self) -> io::Result<()> { self.hw.take_lock() }
+        fn ping(&mut self) -> io::Result<()> { self.hw.ping() }
+        fn set_min(&mut self) -> io::Result<()> { self.hw.set_min() }
+        fn set_reduction(&mut self, d: f64) -> io::Result<f64> { self.hw.set_reduction(d) }
+        fn set_reductions(&mut self, d: &[f64]) -> io::Result<Vec<f64>> { self.hw.set_reductions(d) }
+        fn relinquish(&mut self) -> io::Result<()> { self.hw.relinquish() }
+        fn sample_rate(&mut self) -> io::Result<i64> { Ok(0) }
+        fn open_sense(&mut self, r: u32) -> io::Result<()> { self.hw.open_sense(r) }
+        fn close_sense(&mut self) { self.hw.close_sense() }
+        fn read_period(&mut self, w: &mut [i32]) -> io::Result<Option<bool>> { self.hw.read_period(w) }
+        fn read_tail(&mut self, _w: &mut [i32]) -> io::Result<usize> { Ok(0) }
+        fn queued(&mut self) -> io::Result<u64> { Ok(0) }
+        fn wait_rate_change(&mut self, _d: Duration) -> bool {
+            self.hw.sleep(secs(self.wait));
+            self.pending = true;
+            true
+        }
+        fn rate_events(&mut self) -> bool { std::mem::take(&mut self.pending) }
+        fn events_available(&self) -> bool { true }
+    }
+
+    /// Review P8-8: four 5 ms event wakes at closed speakers, the rate never
+    /// read as open.  The live guard charged them (15 ms at full scale); the
+    /// replay ran no look there, accounted nothing and certified.  The
+    /// recording keeps the looks that charged and the events they saw, and
+    /// the replay charges what the live guard charged.  The same with the
+    /// waits longer than the replay's own poll (a descheduled daemon): the
+    /// replay looks nowhere inside a span the live daemon charged.
+    #[test]
+    fn event_only_charges_replay_as_charged() {
+        for wait in [0.005, 0.1] {
+            event_only_case(wait);
+        }
+    }
+
+    fn event_only_case(wait: f64) {
+        let c = j413();
+        let path = tmp("wake-only.rec");
+        let mut hw = WakeOnly { hw: FakeHw::per_speaker(&c), pending: false, wait };
+        hw.hw.playing = Box::new(|_| false);
+        let mut g = Guard::start(&mut hw, &c, 7.0, Some(vi_state(&c, 55.0, 52.0))).unwrap();
+        g.attach_recorder(&hw, Recorder::create(&path, &c, true, 1 << 20).unwrap());
+        g.start_trace(&hw);
+        for _ in 0..4 {
+            g.tick(&mut hw).unwrap();
+        }
+        g.rec = None;
+        let live: f64 = g.trace.as_ref().unwrap().iter().filter_map(|(_, x)| if let Trace::Account(a, b, Accounted::Charged) = x { Some((*b - *a).as_secs_f64()) } else { None }).sum();
+        assert!(live >= 3.0 * wait - 1e-4, "the live guard charged {live} s");
+        let tl = Timeline::read(&path, &c).unwrap();
+        assert!(tl.periods.is_empty() && tl.looks.len() >= 3, "{} looks", tl.looks.len());
+        let out = replay(&path, &c, &Replay { gain_db: 0.0, governor: None, max_reduction: None, csv: None }).unwrap();
+        let (_, charged, cooled) = account_line(&out);
+        assert!((charged - live).abs() < 1e-3 && cooled < 1e-3, "live charged {live} s\n{}", out.text);
+        assert!(out.text.contains("0.0 ms the live daemon charged not charged here"), "{}", out.text);
+        assert!(out.certified, "{}", out.text);
+    }
+
+    /// Time the live guard charged that the replay cools (here a span the
+    /// recording says was charged at a look whose record is missing) is not
+    /// certified, whatever the decisions.
+    #[test]
+    fn a_replay_that_cools_live_charged_time_is_refused() {
+        let c = j413();
+        let path = tmp("cooled.rec");
+        let state = std::fs::read_to_string(vi_state(&c, 55.0, 52.0)).unwrap();
+        let t0 = 1_000_000_000_000u64;
+        let ms = 1_000_000u64;
+        let mut r = Recorder::create(&path, &c, true, 1 << 20).unwrap();
+        r.start(t0, Governor::Asahi, 7.0, &state).unwrap();
+        r.rate(t0, 0).unwrap();
+        r.account(t0 + 20 * ms, t0, Accounted::Cooled).unwrap();
+        r.account(t0 + 300 * ms, t0 + 20 * ms, Accounted::Charged).unwrap();
+        r.account(t0 + 395 * ms, t0 + 300 * ms, Accounted::Cooled).unwrap();
+        drop(r);
+        let out = replay(&path, &c, &Replay { gain_db: 0.0, governor: None, max_reduction: None, csv: None }).unwrap();
+        assert!(!out.certified && out.text.contains("the replay did not charge"), "{}", out.text);
+        // the replay looks where the live daemon cooled, and its account
+        // ends where the live one does
+        let short = tmp("short.rec");
+        let mut r = Recorder::create(&short, &c, true, 1 << 20).unwrap();
+        r.start(t0, Governor::Asahi, 7.0, &state).unwrap();
+        r.rate(t0, 0).unwrap();
+        r.account(t0 + 20 * ms, t0, Accounted::Cooled).unwrap();
+        drop(r);
+        let out = replay(&short, &c, &Replay { gain_db: 0.0, governor: None, max_reduction: None, csv: None }).unwrap();
+        assert!(out.text.contains("it ends at 0.020 s, here at 0.020 s"), "{}", out.text);
+    }
+
+    /// Review P8-8 (parser): a complete period header with its words cut off
+    /// by the end of the file was read as a whole period, and nothing
+    /// ambiguous.  The words must be in the file.
+    #[test]
+    fn a_period_without_its_words_ends_the_recording() {
+        let c = j413();
+        let path = tmp("missing-payload.rec");
+        let state = std::fs::read_to_string(vi_state(&c, 55.0, 52.0)).unwrap();
+        let mut r = Recorder::create(&path, &c, true, 1 << 20).unwrap();
+        r.start(1_000_000_000_000, Governor::Asahi, 7.0, &state).unwrap();
+        r.rate(1_000_000_000_000, 48000).unwrap();
+        r.period(1_000_100_000_000, 0, 48000, true, &vec![0.0; c.speakers.len()], &[]).unwrap();
+        drop(r);
+        let tl = Timeline::read(&path, &c).unwrap();
+        assert!(tl.periods.is_empty() && tl.truncated.is_some(), "{} periods, truncated {:?}", tl.periods.len(), tl.truncated);
+        assert!(tl.ambiguous().iter().any(|a| a.2.contains("stopped here")));
     }
 }
