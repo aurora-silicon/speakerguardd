@@ -1091,11 +1091,14 @@ impl Guard {
         let converted = played.checked_sub(QUEUE_BOUND).unwrap_or(played);
         let possible = self.possible_reductions(converted, end);
         let parts: &[(usize, usize, f64)] = if first < 1.0 { &[(0, 1, first), (1, k, 1.0)] } else { &[(0, k, 1.0)] };
+        // the models take the blocks as equal shares of the run's time, so
+        // each block's sum is spread over an equal share: the run's energy
+        // is exact however its frames split
         let means = |x: &[f64], blocks: usize| -> Vec<f64> {
             let n = x.len();
             (0..blocks).map(|b| {
                 let (lo, hi) = (n * b / blocks, n * (b + 1) / blocks);
-                if hi > lo { x[lo..hi].iter().sum::<f64>() / (hi - lo) as f64 } else { 0.0 }
+                x[lo..hi].iter().sum::<f64>() / (n as f64 / blocks as f64)
             }).collect()
         };
         for (s, pos) in self.speakers.iter_mut().zip(&possible) {

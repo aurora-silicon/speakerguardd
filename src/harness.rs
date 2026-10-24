@@ -1271,6 +1271,28 @@ mod tests {
         }
     }
 
+    /// Found by a 2M-case run on #8 (seed 8100719359), and on 0.1.10 too:
+    /// frames that did not split evenly into blocks lost energy in the
+    /// longer ones, here a 1 s budget 0.5% under the truth (fleet's h18 on
+    /// #7, with the cause)
+    #[test]
+    fn h14_uneven_blocks_keep_their_energy() {
+        let sc = Scenario { horizon: 1.3191381306084726, events: true, steps: true, initial_db: 7.493479721540933, clean_start: true, max_reduction: 23.88707311652583, latency: 2.823637145963387e-5, streams: vec![Stream { open: 0.5955625, close: 0.6128125, depth: 0.010634848836597837, chunk: 0.015157138903645648, levels: vec![(0.5955625, 0.08864516066450345), (0.6115, 1.0)] }], faults: vec![Fault::Pause { at: 0.7913133366864289, len: 0.28896169769964836 }], restarts: vec![Restart { at: 1.1394017029306982, clean: true, gap: 0.033278459087805544, damage: Damage::OldFormat }] };
+        if let Err(v) = run(&sc, 8100719359) {
+            panic!("{}", v.0);
+        }
+    }
+
+    /// The same at a stream's start (seed 8100823990): three levels in
+    /// 37 ms, a 1 s budget 0.16% under the truth
+    #[test]
+    fn h15_uneven_blocks_at_a_streams_start() {
+        let sc = Scenario { horizon: 0.05482742479889784, events: true, steps: true, initial_db: 3.404129695199801, clean_start: true, max_reduction: 25.617181783492246, latency: 0.0007715919483243825, streams: vec![Stream { open: 0.0, close: 0.037, depth: 0.1401714025960735, chunk: 0.06664888229065302, levels: vec![(0.0, 0.28306136900502155), (0.010125, 0.8684249612520664), (0.0281875, 0.061139625341538495)] }], faults: vec![], restarts: vec![] };
+        if let Err(v) = run(&sc, 8100823990) {
+            panic!("{}", v.0);
+        }
+    }
+
     /// Found on the V/I rework (#8): a clock read made for a recording that
     /// was not running held the daemon up 0.16 s after the stream's rate
     /// read, and the time without sense data was counted from after the

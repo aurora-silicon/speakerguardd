@@ -1082,11 +1082,13 @@ impl Engine {
                 for (i, &(lo, hi_, w)) in parts.iter().enumerate() {
                     let n = hi_ - lo;
                     let blocks = (SUB_BLOCKS * n).div_ceil(g.period).clamp(1, n);
+                    // equal shares of the time, as the models take them:
+                    // the run's energy is exact however its frames split
                     let means = |x: &[f64], r: (usize, usize)| -> Vec<f64> {
                         let x = &x[r.0 + lo..r.0 + hi_];
                         (0..blocks).map(|b| {
                             let (a, c) = (n * b / blocks, n * (b + 1) / blocks);
-                            if c > a { x[a..c].iter().sum::<f64>() / (c - a) as f64 } else { 0.0 }
+                            x[a..c].iter().sum::<f64>() / (n as f64 / blocks as f64)
                         }).collect()
                     };
                     let (bv, bvi, bp, bq) = (means(&v2, rf), means(&vi, rv), means(&pre_ff, rp), means(&pre_vi, rq));
@@ -1426,6 +1428,34 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Frames that do not split evenly into blocks: each block was its own
+    /// mean, but the models take the blocks as equal shares of the time, so
+    /// the longer blocks lost energy (1.8% of the loud one in fleet's J700
+    /// case, 274 frames in nine blocks).  The unified models' minute of
+    /// power before the gain now holds the run's energy exactly.
+    #[test]
+    fn uneven_blocks_keep_the_runs_energy() {
+        let c = cfg(&J413.replace("period = 4096", "period = 512"));
+        let (ch, rate) = (c.globals.channels, 48000.0);
+        let n = 274;
+        let k = idx(&c, "Left Tweeter");
+        let s = &c.speakers[k];
+        let mut w = vec![0i32; ch * n];
+        for (i, f) in w.chunks_exact_mut(ch).enumerate() {
+            // quiet, then loud in the last few frames (the last block)
+            f[s.vs_chan] = word(if i >= n - 20 { 9.0 } else { 0.5 }, 14.0) * if i % 2 == 0 { 1 } else { -1 };
+            f[s.is_chan.unwrap()] = word(0.1, 3.75);
+        }
+        let mut e = Engine::new(&c, true).unwrap();
+        e.measured(&w, n, n, n, 0, 1.0 / rate, 1.0, &vec![vec![(0.0, 0.0)]; c.speakers.len()]);
+        let u = &e.unified.as_ref().unwrap()[k];
+        let full = u.v_worst * u.v_worst / u.r_ff;
+        let vs = s.vs_scale / 2147483648.0;
+        let want: f64 = w.chunks_exact(ch).map(|f| (((f[s.vs_chan] as f64).abs() + 1.0) * vs).powi(2) / u.r_ff).map(|p| p.min(full)).sum::<f64>() / rate;
+        let got = u.mean_pre(1.0);
+        assert!((got - want).abs() <= 1e-9 * want, "{got} J in the last second, the frames carry {want} J");
     }
 
     #[test]
