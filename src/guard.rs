@@ -247,6 +247,19 @@ pub const REACH_HORIZON: Duration = PING_INTERVAL;
 /// The reduction the volume controls' minimum stands for (dB).
 pub const MUTE_DB: f64 = 120.0;
 
+/// Where frames whose position was read between `before` and `after` with
+/// `queued` frames of backlog end: the earliest they can (`early`), and how
+/// many frames later they can (`shift`).  A whole-frame position: the frames
+/// end up to a frame before the backlog says, and anywhere the two clock
+/// reads leave open.
+fn placement(before: Instant, after: Instant, queued: u64, rate: u32) -> (Instant, usize) {
+    let rate = rate.max(1) as f64;
+    let early = before.checked_sub(Duration::from_secs_f64((queued + 1) as f64 / rate)).unwrap_or(before);
+    let late = after.checked_sub(Duration::from_secs_f64(queued as f64 / rate)).unwrap_or(after);
+    let shift = (late.saturating_duration_since(early).as_secs_f64() * rate).ceil() as usize;
+    (early, shift)
+}
+
 pub struct Guard {
     globals: Globals,
     pub speakers: Vec<SpeakerState>,
@@ -721,6 +734,10 @@ impl Guard {
     /// Pings the volume lock.  A ping that answers ETIMEDOUT is the card's
     /// one-shot notice that the lock had lapsed, so ping once more.
     fn ping_lock<H: Hw>(&mut self, hw: &mut H) -> Result<(), Box<dyn Error>> {
+        // the lease starts when the card takes the ping, which can be any
+        // time inside the call: from before it, the lapse it bounds is the
+        // earliest (review r6 W4)
+        let t0 = hw.now();
         match hw.ping() {
             Ok(()) => {}
             Err(e) if e.raw_os_error() == Some(libc::ETIMEDOUT) => {
@@ -730,11 +747,14 @@ impl Guard {
                 // the card held its safe level from the lapse (not before
                 // the lease's length after the last ping) until now
                 self.mark_kernel_since(self.last_ping + KERNEL_LOCK_TIMEOUT);
+                let t1 = hw.now();
                 hw.ping().map_err(|e| format!("lock ping: {e}"))?;
+                self.last_ping = t1;
+                return Ok(());
             }
             Err(e) => return Err(format!("lock ping: {e}").into()),
         }
-        self.last_ping = hw.now();
+        self.last_ping = t0;
         Ok(())
     }
 
@@ -815,8 +835,11 @@ impl Guard {
         // card may have converted them at its safe level (review r5 V4),
         // whatever the next decision makes of it, and whether or not the
         // lock has been given up since.
+        // the frames may have played up to `shift` frames after `end`
+        // (review r6 W5): the lapse and the candidates to the late bound
+        let late_end = end + Duration::from_secs_f64(shift as f64 / rate);
         let lapse = self.last_ping + KERNEL_LOCK_TIMEOUT;
-        if end > lapse {
+        if late_end > lapse {
             self.mark_kernel_since(lapse);
         }
         let globals = self.globals.clone();
@@ -833,7 +856,7 @@ impl Guard {
         // delivered the frame is the safer guess).
         let played = end.checked_sub(Duration::from_secs_f64(k as f64 / rate)).unwrap_or(end);
         let converted = played.checked_sub(QUEUE_BOUND).unwrap_or(played);
-        let possible = self.possible_reductions(converted, end);
+        let possible = self.possible_reductions(converted, late_end);
         let parts: &[(usize, usize, f64)] = if first < 1.0 { &[(0, 1, first), (1, k, 1.0)] } else { &[(0, k, 1.0)] };
         // block means of a run of per-frame values
         let means = |x: &[f64], blocks: usize| -> Vec<f64> {
@@ -889,12 +912,7 @@ impl Guard {
     /// charged (a pause around the position read never lets them stand for
     /// time they did not see).
     fn place(&mut self, before: Instant, after: Instant, queued: u64, frames: usize) -> Result<(), Box<dyn Error>> {
-        let rate = self.rate.max(1) as f64;
-        // a whole-frame position: the frames end up to a frame before the
-        // backlog says, and anywhere the two clock reads leave open
-        let early = before.checked_sub(Duration::from_secs_f64((queued + 1) as f64 / rate)).unwrap_or(before);
-        let late = after.checked_sub(Duration::from_secs_f64(queued as f64 / rate)).unwrap_or(after);
-        let shift = (late.saturating_duration_since(early).as_secs_f64() * rate).ceil() as usize;
+        let (early, shift) = placement(before, after, queued, self.rate);
         self.measure_shifted(early, frames, shift)
     }
 
@@ -1241,12 +1259,21 @@ impl Guard {
                 self.applied = reduction;
             }
             let due = reduction != self.requested || hw.now().duration_since(self.last_write) >= PING_INTERVAL;
+            // the card takes the value somewhere inside the call (review r6
+            // W4): from before it, either value may convert a frame
+            let t0 = hw.now();
             match if due { hw.set_reduction(reduction).map(Some) } else { Ok(None) } {
                 Ok(None) => {}
                 Ok(Some(applied)) => {
                     // what the card applies, never less than asked for
-                    self.written = if applied.is_finite() { applied.max(reduction) } else { reduction };
-                    self.written_hi = self.written;
+                    let new = if applied.is_finite() { applied.max(reduction) } else { reduction };
+                    if new != self.written || new != self.written_hi {
+                        self.written = self.written.min(new);
+                        self.written_hi = self.written_hi.max(new);
+                        self.note_written(t0);
+                    }
+                    self.written = new;
+                    self.written_hi = new;
                     self.requested = reduction;
                     self.last_write = hw.now();
                     self.note_written(hw.now());
@@ -2006,6 +2033,157 @@ mod tests {
         assert!(seen <= look, "blindness counted from {:?} after the look", seen.saturating_duration_since(look));
     }
 
+    /// A Hw that stalls after a ping or a write took effect (descheduled
+    /// on the way back), as the sixth review's pauses after the effect.
+    struct StallAfter {
+        hw: FakeHw,
+        ping_stall: Duration,
+        write_stall: Duration,
+    }
+    impl Hw for StallAfter {
+        fn now(&self) -> Instant { self.hw.now() }
+        fn boottime(&self) -> Duration { self.hw.boottime() }
+        fn sleep(&mut self, d: Duration) { self.hw.sleep(d) }
+        fn take_lock(&mut self) -> io::Result<()> { self.hw.take_lock() }
+        fn ping(&mut self) -> io::Result<()> {
+            let r = self.hw.ping();
+            self.hw.t += self.ping_stall;
+            r
+        }
+        fn set_safe(&mut self) -> io::Result<f64> { self.hw.set_safe() }
+        fn set_reduction(&mut self, d: f64) -> io::Result<f64> {
+            let r = self.hw.set_reduction(d);
+            self.hw.t += self.write_stall;
+            r
+        }
+        fn relinquish(&mut self) -> io::Result<()> { self.hw.relinquish() }
+        fn sample_rate(&mut self) -> io::Result<i64> { self.hw.sample_rate() }
+        fn open_sense(&mut self, r: u32) -> io::Result<()> { self.hw.open_sense(r) }
+        fn close_sense(&mut self) { self.hw.close_sense() }
+        fn read_period(&mut self, w: &mut [i32]) -> io::Result<Option<bool>> { self.hw.read_period(w) }
+        fn queued(&mut self) -> io::Result<u64> { self.hw.queued() }
+        fn read_tail(&mut self, w: &mut [i32]) -> io::Result<usize> { self.hw.read_tail(w) }
+        fn wait_rate_change(&mut self, d: Duration) -> bool { self.hw.wait_rate_change(d) }
+        fn rate_events(&mut self) -> bool { self.hw.rate_events() }
+        fn events_available(&self) -> bool { true }
+    }
+
+    /// Review r6 W4: a ping that took effect before the daemon stalled
+    /// 0.2 s on its way back started the lease before the clock read; the
+    /// lapse it bounds is counted from before the call.
+    #[test]
+    fn the_lease_counts_from_before_the_ping() {
+        let cfg = j700();
+        let mut hw = StallAfter { hw: FakeHw::new(2, 4096), ping_stall: Duration::ZERO, write_stall: Duration::ZERO };
+        hw.hw.level = Box::new(|_| 0.0);
+        let mut g = Guard::start(&mut hw, &cfg, 20.0, tmp_state()).unwrap();
+        while !g.armed() {
+            g.tick(&mut hw).unwrap();
+        }
+        hw.ping_stall = secs(0.2);
+        let before = hw.now();
+        g.ping_lock(&mut hw).unwrap();
+        assert!(g.last_ping <= before, "the lease counted from {:?} after the call began", g.last_ping.saturating_duration_since(before));
+    }
+
+    /// Review r6 W4: a write that took effect before the daemon stalled
+    /// 0.15 s: frames converted at the new value in the stall may not be
+    /// inverted at the old one alone.  From before the call either may.
+    #[test]
+    fn a_write_holds_both_values_from_before_the_call() {
+        let cfg = j700();
+        let mut hw = StallAfter { hw: FakeHw::new(2, 4096), ping_stall: Duration::ZERO, write_stall: Duration::ZERO };
+        hw.hw.level = Box::new(|_| 0.0);
+        let mut g = Guard::start(&mut hw, &cfg, 20.0, tmp_state()).unwrap();
+        while !g.armed() || hw.hw.t < secs(3.0) {
+            g.tick(&mut hw).unwrap();
+        }
+        let old = g.written;
+        assert_eq!(old, 0.0);
+        hw.hw.level = Box::new(|_| 0.7);
+        hw.write_stall = secs(0.05);
+        let mut t0 = hw.now();
+        while g.written == old {
+            t0 = hw.now();
+            g.tick(&mut hw).unwrap();
+        }
+        let new = g.written;
+        assert!(g.armed() && new > old && new < cfg.globals.safe_reduction, "{new} dB");
+        // the entry from before the call holds both; the new value alone
+        // only from after it
+        let both = g.gains.iter().any(|e| e.at >= t0 && e.lo <= old && e.hi >= new && e.at + secs(0.04) <= hw.now());
+        assert!(both, "no entry with {old} and {new} from before the write: {:?}", g.gains.iter().rev().take(4).collect::<Vec<_>>());
+    }
+
+    /// Review r6 W5: frames placed at `end` may have played up to `shift`
+    /// frames later; a lease that ran out in between counts.
+    #[test]
+    fn a_shifted_run_checks_the_lapse_at_its_late_bound() {
+        let cfg = j700();
+        let p = cold_file(&cfg);
+        let mut hw = FakeHw::new(2, 4096);
+        let mut g = Guard::start(&mut hw, &cfg, 20.0, Some(p)).unwrap();
+        let t0 = hw.now();
+        g.rate = 48000;
+        g.armed = true;
+        g.last_ping = t0;
+        g.account_to = t0 + secs(0.2);
+        g.gains = vec![Gain { at: t0 - secs(1.0), lo: 0.0, hi: 0.0, kernel: false }];
+        // ends 10 ms before the lapse, may have played 20 ms later
+        g.measure_shifted(t0 + secs(0.24), 4096, 960).unwrap();
+        let lapse = t0 + KERNEL_LOCK_TIMEOUT;
+        assert!(g.gains.iter().any(|e| e.kernel && e.at <= lapse + secs(1e-6) && e.at >= lapse - secs(1e-6)), "no safe level from the lapse: {:?}", g.gains);
+    }
+
+    /// Review r6 W8 (h04's line on its own): a hand-off after the lease ran
+    /// out marks the card's safe level from the lapse.
+    #[test]
+    fn a_hand_off_after_a_lapse_marks_the_safe_level_from_it() {
+        let cfg = j700();
+        let p = cold_file(&cfg);
+        let mut hw = FakeHw::new(2, 4096);
+        let mut g = Guard::start(&mut hw, &cfg, 20.0, Some(p)).unwrap();
+        let t0 = hw.now();
+        g.armed = true;
+        g.last_ping = t0;
+        g.gains = vec![Gain { at: t0 - secs(1.0), lo: 0.0, hi: 0.0, kernel: false }];
+        hw.t += secs(0.4);
+        g.disarm(&mut hw, "test").unwrap();
+        let lapse = t0 + KERNEL_LOCK_TIMEOUT;
+        assert!(g.possible_reductions(lapse + secs(0.01), lapse + secs(0.1)).iter().any(|r| r.0 >= cfg.globals.safe_reduction), "{:?}", g.gains);
+    }
+
+    /// Review r6 W8 (h08's line on its own): after a failed write the card
+    /// may hold the new value rounded up by a step.
+    #[test]
+    fn a_failed_write_may_have_landed_a_step_up() {
+        let cfg = j700();
+        let mut hw = FakeHw::new(2, 4096);
+        hw.steps = true;
+        hw.level = Box::new(|_| 0.0);
+        let mut g = Guard::start(&mut hw, &cfg, 20.0, tmp_state()).unwrap();
+        while !g.armed() {
+            g.tick(&mut hw).unwrap();
+        }
+        hw.level = Box::new(|_| 1.0);
+        hw.target_fail = Box::new(|_| true);
+        while g.target_failures == 0 {
+            g.tick(&mut hw).unwrap();
+        }
+        let asked = model::reduction_db(&g.speakers);
+        assert!(g.written_hi >= asked + hw.step_db() - 1e-9, "the most the card may hold is {} dB, asked {asked} dB", g.written_hi);
+    }
+
+    /// Review r6 W8 (h12's line on its own): a whole-frame position leaves
+    /// a frame of doubt even when both clock reads agree.
+    #[test]
+    fn a_whole_frame_position_leaves_a_frame_of_doubt() {
+        let t = Instant::now() + secs(10.0);
+        for q in [0u64, 37, 4096] {
+            assert!(placement(t, t, q, 48000).1 >= 1, "{q} frames queued");
+        }
+    }
+
     /// "Peak volume": with a cool speaker and a loud but sustainable program
     /// (0.3 of full scale, 1.1 W into each coil) the daemon leaves the card
     /// at the top of its range, the amplifier's full scale, for the whole
@@ -2027,16 +2205,20 @@ mod tests {
     /// converted the samples still playing at (the controls' value before
     /// the start is unknown; after a clean stop it is at least the card's
     /// safe level): their power before the gain is charged to the budgets
-    /// as high as it can have been, for the half second they can play.  The
-    /// cost is a small, short reduction.
+    /// as high as it can have been, for the half second they can play.
+    /// Since the start no longer mutes the speakers (review r6), what they
+    /// play in that half second counts so too, at most the full-scale
+    /// budget reduction.  The cost is a short reduction, gone within the
+    /// budget's second.
     #[test]
     fn a_start_during_playback_costs_little() {
         let cfg = j700();
         let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
         hw.level = Box::new(|_| 0.3);
         let mut g = Guard::start(&mut hw, &cfg, 20.0, tmp_state()).unwrap();
+        let full = 10.0 * (g.speakers[0].worst_case_power(0.0) / cfg.speakers[0].p_limit_1s).log10();
         run_until(&mut g, &mut hw, secs(10.0)).unwrap();
-        assert!(hw.writes.iter().all(|&(t, db)| db <= 1.0 && (t < secs(2.5) || db == 0.0)), "{:?}", hw.writes.iter().filter(|w| w.1 != 0.0).collect::<Vec<_>>());
+        assert!(hw.writes.iter().all(|&(t, db)| db <= full + 0.5 && (t < secs(2.5) || db == 0.0)), "{:?}", hw.writes.iter().filter(|w| w.1 != 0.0).collect::<Vec<_>>());
         assert!(hw.lapses.is_empty());
     }
 

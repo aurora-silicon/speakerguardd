@@ -488,6 +488,10 @@ fn heat_temps(s: &Speaker, mut tc: f64, mut tm: f64, power: f64, dt: f64, t_ambi
     (tc, tm, peak)
 }
 
+/// How far a word may sit outside the reduction that converted it, from the
+/// rounding of the card's gain table (dB).
+pub const ROOM_EPS_DB: f64 = 1e-5;
+
 /// The reduction (dB) a measured frame was converted at, for the budgets:
 /// the most of the `possible` ones (ranges) that can have delivered it,
 /// `room` being the most reduction that still delivers it at full scale;
@@ -499,7 +503,10 @@ pub fn converted_at(room: f64, possible: &[(f64, f64)]) -> f64 {
     let mut most = 0.0f64;
     for &(lo, hi) in possible {
         most = most.max(hi);
-        if lo <= room {
+        // the card's gain table is rounded (up to 3.1e-6 dB on the J700):
+        // a full-scale word at a reduction can land a hair outside it
+        // (review r6 W3)
+        if lo <= room + ROOM_EPS_DB {
             let v = hi.min(room);
             fit = Some(fit.map_or(v, |f| f.max(v)));
         }
@@ -516,6 +523,15 @@ pub fn reduction_db(states: &[SpeakerState]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review r6 W3: the card's gain table is rounded, and a full-scale
+    /// word at 17 dB lands 2e-9 dB outside it; the frame is still the 17 dB
+    /// candidate's, not the next lower one's.
+    #[test]
+    fn a_word_a_hair_outside_its_reduction_still_fits_it() {
+        assert!((converted_at(16.999999998, &[(16.5, 16.5), (17.0, 17.0)]) - 17.0).abs() < 1e-6);
+        assert!((converted_at(16.999999998, &[(0.0, 0.0), (17.0, 17.0)]) - 17.0).abs() < 1e-6);
+    }
 
     fn spec() -> Speaker {
         Speaker {

@@ -28,7 +28,30 @@
 //!   lock without change events, none after a failed rate read in that
 //!   pass, no renewal while the speakers play without a complete period for
 //!   the blind limit, and a start from anything but a clean stop is
-//!   latched.
+//!   latched;
+//! * (d) where macaudio stops old-gain audio promptly, the true coil never
+//!   reaches its limit unless the daemon was held up (descheduled, blocked
+//!   in a call, gone) within the queue and the lease before it.
+//!
+//! The oracle shares the plant with the daemon: the two-node equations,
+//! the constants, P = V^2 / z_nominal, the full scale and the governor's
+//! ramp.  So (a) and (b) check the implementation, not the physics.
+//!
+//! Its tolerances, declared (review r6 W7):
+//! * COIL_TOL_K, 0.02 K on the coil: the daemon's per-block bound leaves
+//!   out of its state the term for energy late in a block, under 1e-3 K a
+//!   block.
+//! * The budget windows: the oracle's starts two frames later (whole-frame
+//!   placement), and BUDGET_REL (0.1 %) plus BUDGET_ABS (1 uW) are allowed
+//!   between the daemon's trimmed history and the oracle's exact window.
+//!   The sixth review, checking at 1e-9, found the largest real underbound
+//!   at 0.017 % (about 0.001 dB) in 491,307 cases.
+//! * NEED_TOL_DB, 0.01 dB in (b), and again over --max-reduction: the need
+//!   is the oracle's sampled coil through the ramp, so rounding-level
+//!   differences (6.574 against 6.574 dB) are not a finding.
+//! * BLIND_TOL_S, 60 ms past BLIND_LIMIT and a period in (c): the daemon
+//!   decides once a look (25 ms idle, up to a period playing), the oracle
+//!   at every sample.
 //!
 //! `SPEAKERGUARDD_CASES` sets the number of random cases (default 200) and
 //! `SPEAKERGUARDD_SEED` the first seed; failures are shrunk and printed as a
@@ -52,6 +75,12 @@ const REAL_RATE: f64 = 48000.0;
 /// milliseconds; the stock world's 0.45 s is the drain premise's bound.
 pub const PROMPT_STOP: f64 = 0.005;
 pub const STOCK_STOP: f64 = 0.45;
+/// The oracle's declared tolerances (see the module text).
+const COIL_TOL_K: f64 = 0.02;
+const BUDGET_REL: f64 = 1e-3;
+const BUDGET_ABS: f64 = 1e-6;
+const NEED_TOL_DB: f64 = 0.01;
+const BLIND_TOL_S: f64 = 0.06;
 
 /// SplitMix64.
 #[derive(Clone)]
@@ -1051,7 +1080,7 @@ fn check(cfg: &Config, w: &World, g: &Guard, sc: &Scenario, rate: f64) -> Result
         // (a) the model is never cooler than the speaker, its budgets never
         // hold less energy before the gain
         let truth = w.oracle.coil_at(k, at, rate);
-        if g.speakers[k].t_coil < truth - 0.02 {
+        if g.speakers[k].t_coil < truth - COIL_TOL_K {
             return Err(Violation(format!("(a) at {now:.4} s, accounted {at:.4} s: {} model {:.3} C, true coil {:.3} C", cfg.speakers[k].name, g.speakers[k].t_coil, truth)));
         }
         for win in [1.0, 60.0] {
@@ -1063,7 +1092,7 @@ fn check(cfg: &Config, w: &World, g: &Guard, sc: &Scenario, rate: f64) -> Result
             // frames later (the resolution of the measurement, not time).
             let edge = 2.0 / rate;
             let o = w.oracle.mean_pre(k, at, win - edge, rate) * (win - edge) / win;
-            if m < o * (1.0 - 1e-3) - 1e-6 {
+            if m < o * (1.0 - BUDGET_REL) - BUDGET_ABS {
                 return Err(Violation(format!("(a) at {now:.4} s, accounted {at:.4} s: {} {win} s budget {:.4} W before the gain, true {:.4} W", cfg.speakers[k].name, m, o)));
             }
         }
@@ -1071,10 +1100,10 @@ fn check(cfg: &Config, w: &World, g: &Guard, sc: &Scenario, rate: f64) -> Result
         // least what the true state needs
         if g.armed() && w.unlocked {
             let need = need(cfg, &w.oracle, k, at, rate);
-            if w.effective() < need - 0.01 && need < sc.max_reduction {
+            if w.effective() < need - NEED_TOL_DB && need < sc.max_reduction {
                 return Err(Violation(format!("(b) at {now:.4} s: {} card applies {:.3} dB, the true state needs {:.3} dB", cfg.speakers[k].name, w.effective(), need)));
             }
-            if need >= sc.max_reduction + 0.01 {
+            if need >= sc.max_reduction + NEED_TOL_DB {
                 return Err(Violation(format!("(b) at {now:.4} s: armed while the true state needs {need:.3} dB, over --max-reduction")));
             }
         }
@@ -1108,7 +1137,7 @@ fn check(cfg: &Config, w: &World, g: &Guard, sc: &Scenario, rate: f64) -> Result
         if sc.open_at(w.last_ping_at).is_some() && w.last_rate > 0 {
             // from when the daemon could know the stream: its sighting
             let since = w.last_ping_at - w.last_period.max(w.sighted);
-            if since > BLIND_LIMIT.as_secs_f64() + period + 0.06 {
+            if since > BLIND_LIMIT.as_secs_f64() + period + BLIND_TOL_S {
                 return Err(Violation(format!("(c) at {now:.4} s: the lease renewed at {:.4} s, {since:.3} s without a complete period while the speakers play", w.last_ping_at)));
             }
         }
