@@ -13,8 +13,9 @@
 //! * The load: each speaker's current is its voltage over an impedance of
 //!   random magnitude and phase (up to 60 degrees either way), so V*I is
 //!   negative for part of every cycle of a sine.  The magnitude is never
-//!   under the speaker's smallest (`z_nominal` or `r_ff`), nor so small
-//!   that the current passes the sense's full scale.
+//!   under the speaker's smallest (`z_nominal` or `r_ff`).  Where it draws
+//!   more than the sense's full scale, the current word clips at its rail
+//!   while the speaker gets the whole current.
 //! * The sense words: V over `vs_scale` and I over `is_scale`, rounded to
 //!   S16, with up to `noise` LSB either way on every word and a fixed
 //!   offset of up to `dc` LSB per channel (the M1 Pro's sense lines carry
@@ -451,7 +452,10 @@ impl<'a> ViWorld<'a> {
         let safe = cfg.globals.safe_reduction;
         let n = cfg.speakers.len();
         let vpk = 2f64.sqrt() * 10f64.powf(cfg.globals.amp_gain_dbv / 20.0);
-        let z: Vec<f64> = cfg.speakers.iter().zip(&sc.loads).map(|(s, l)| s.z_nominal.min(s.r_ff).max(vpk / s.is_scale) * l.0).collect();
+        // down to the speaker's smallest impedance: where that draws more
+        // than the sense's full scale, the current word clips at its rail
+        // and the speaker still gets the whole current (review Z2)
+        let z: Vec<f64> = cfg.speakers.iter().zip(&sc.loads).map(|(s, l)| s.z_nominal.min(s.r_ff) * l.0).collect();
         let mut x = sc.seed | 1;
         let offsets = (0..cfg.globals.channels)
             .map(|_| {

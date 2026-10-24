@@ -60,6 +60,22 @@ pub const VI_MIN: f64 = -0.01;
 /// to -50 mW on the tweeters and -0.93 W on the woofers.  1 mW is 22 times
 /// the noise and 50 times under the tweeters' playback.
 pub const VI_NOISE_FLOOR: f64 = 1e-3;
+/// A current word at or past this (S16 words widened to S32) is at the
+/// sense's rail.
+const I_RAIL: f64 = (32767i64 << 16) as f64;
+
+/// The power one sample of V and I words stands for (W).  A current word
+/// at its rail says only that the current was at least that much (review
+/// Z2 of speakerguardd#8: at full scale the J316 and J616 woofers' 2.7 ohm
+/// draw 4.4 A, past the 3.75 A the sense reads, and V*I read up to 15%
+/// low).  No current can pass `i_max`, the amplifier's peak voltage over
+/// the smallest impedance the speaker can present, so such a sample stands
+/// for |V| times that.  V^2 over the impedance would not do: a reactive
+/// load's current peaks while the voltage is low.
+pub fn sense_power(wv: f64, wi: f64, (vs, is): (f64, f64), i_max: f64) -> f64 {
+    let (v, p) = (wv * vs, wv * vs * (wi * is));
+    if wi.abs() >= I_RAIL { p.max(v.abs() * i_max) } else { p }
+}
 /// What the unified regulator asks for when nothing may pass (dB): far past
 /// any --max-reduction, so the kernel takes over.
 const NOTHING_DB: f64 = 120.0;
@@ -511,7 +527,7 @@ impl AsahiSpeaker {
         let mut negative_after = false;
         for (i, f) in words.chunks_exact(channels).enumerate() {
             let (ac, am) = if i == 0 { (ac1, am1) } else { (acn, amn) };
-            let p = f[vc] as f64 * vs * (f[ic] as f64 * is) * ASAHI_MARGIN;
+            let p = sense_power(f[vc] as f64, f[ic] as f64, (vs, is), self.v_worst / self.z_min) * ASAHI_MARGIN;
             if crossed && p < -VI_NOISE_FLOOR {
                 negative_after = true;
             }
@@ -1050,11 +1066,12 @@ impl Engine {
             let mut pre_ff = Vec::with_capacity(frames);
             let mut pre_vi = Vec::with_capacity(frames);
             let unified = self.unified.as_ref().map(|u| &u[sk]);
+            let i_max = v_worst(s, &g) / s.z_nominal.min(s.r_ff);
             for f in 0..frames {
                 let wv = words[f * ch + s.vs_chan] as f64;
                 let wi = s.is_chan.map_or(0.0, |ic| words[f * ch + ic] as f64);
                 v2.push((wv * vs).powi(2));
-                vi.push(wv * vs * (wi * is));
+                vi.push(sense_power(wv, wi, (vs, is), i_max));
                 if let Some(u) = unified {
                     let room = if wv != 0.0 { 20.0 * (2147483648.0 / wv.abs()).log10() } else { f64::INFINITY };
                     let gain = 10f64.powf(converted_at(room, &possible[sk]) / 10.0);
@@ -1063,7 +1080,8 @@ impl Engine {
                     let full_ff = u.v_worst * u.v_worst / u.r_ff;
                     let full_vi = u.v_worst * u.v_worst / u.z_min;
                     pre_ff.push((vup * vup / u.r_ff * gain).min(full_ff));
-                    pre_vi.push(if wv * wi > 0.0 { (vup * iup * gain).min(full_vi) } else { 0.0 });
+                    let up = if wi.abs() >= I_RAIL { (vup * iup).max(vup * i_max) } else { vup * iup };
+                    pre_vi.push(if wv * wi > 0.0 || wi.abs() >= I_RAIL { (up * gain).min(full_vi) } else { 0.0 });
                 }
             }
             if let (Some(asahi), Some(ic)) = (self.asahi.as_mut(), s.is_chan) {
@@ -1691,6 +1709,44 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Review Z2 of speakerguardd#8: the current sense reads at most
+    /// 3.75 A, and a full-scale program into the J316 woofer's 2.7 ohm
+    /// draws 4.4 A.  A current word at its rail stands for |V| times the
+    /// most current the amplifier can drive into the speaker, not for V
+    /// times the rail, so the model heats at least as much as the speaker
+    /// can have.
+    #[test]
+    fn a_current_word_at_its_rail_is_bounded_by_the_voltage() {
+        let c = cfg(J316);
+        let k = idx(&c, "Left Woofer 1");
+        let s = c.speakers[k].clone();
+        let (ch, period) = (c.globals.channels, c.globals.period);
+        let v = 11.9;
+        let mut w = vec![0i32; ch * period];
+        for f in w.chunks_exact_mut(ch) {
+            f[s.vs_chan] = word(v, 14.0);
+            // 4.4 A, which the sense clips to its rail
+            f[s.is_chan.unwrap()] = word(4.4, 3.75);
+        }
+        let mut e = Engine::new(&c, false).unwrap();
+        set_asahi(&mut e, 60.0, 55.0);
+        e.measured(&w, period, period, period, 0, 1.0 / 48000.0, 1.0, &vec![vec![(0.0, 0.0)]; c.speakers.len()]);
+        let got = e.asahi.as_ref().unwrap()[k].th.t_coil;
+        // speakersafetyd's integration at the bound, sample by sample
+        let vq = (v / 14.0 * 32768.0).round() / 32768.0 * 14.0;
+        let p = vq * v_worst(&s, &c.globals) / s.z_nominal.min(s.r_ff) * ASAHI_MARGIN;
+        let step = 1.0 / 48000.0;
+        let (ac, am) = (step / (s.vi_tau_coil + step), step / (s.vi_tau_magnet + step));
+        let (mut tc, mut tm) = (60.0f64, 55.0f64);
+        for _ in 0..period {
+            tc = (tm + p * s.vi_tr_coil) * ac + tc * (1.0 - ac);
+            tm = (c.globals.t_ambient + p * s.vi_tr_magnet) * am + tm * (1.0 - am);
+        }
+        assert!((got - tc).abs() < 1e-9, "a clipped period heated the model to {got} C, the bound to {tc} C");
+        // under the rail, V*I as it is
+        assert_eq!(sense_power(word(v, 14.0) as f64, word(3.0, 3.75) as f64, (14.0 / 2147483648.0, 3.75 / 2147483648.0), 2.7), (word(v, 14.0) as f64 * 14.0 / 2147483648.0) * (word(3.0, 3.75) as f64 * 3.75 / 2147483648.0));
     }
 
     /// The same for the magnet, and for arithmetic that goes nonfinite.
