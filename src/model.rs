@@ -533,6 +533,21 @@ mod tests {
         assert!((converted_at(16.999999998, &[(0.0, 0.0), (17.0, 17.0)]) - 17.0).abs() < 1e-6);
     }
 
+    /// h05's line on its own (review r7 Y4): what was played is up to a
+    /// step above its word, and undone by a deep gain that step is a share
+    /// of the frame's power before the gain.  A word of 1288 at the
+    /// controls' minimum (120 dB) was anything up to 1289: the budgets take
+    /// the step above.  (In the harness's world the frame of doubt charged
+    /// with every run outweighs the step, under the oracle's 0.1 %.)
+    #[test]
+    fn a_quantized_word_is_undone_from_the_step_above() {
+        let s = SpeakerState::new(spec(), 35.0);
+        let (_, pre) = s.frame_powers(&[1288, 1288], 2, &[(120.0, 120.0)]);
+        let up = 1289.0 * s.spec.vs_scale / 2147483648.0;
+        let want = up * up / s.spec.z_nominal * 1e12;
+        assert!(pre[0] >= want * (1.0 - 1e-12), "{} W before the gain, the step above gives {want} W", pre[0]);
+    }
+
     fn spec() -> Speaker {
         Speaker {
             name: "Left".into(),

@@ -31,7 +31,9 @@
 //!   latched;
 //! * (d) where macaudio stops old-gain audio promptly, the true coil never
 //!   reaches its limit unless the daemon was held up (descheduled, blocked
-//!   in a call, gone) within the queue and the lease before it.
+//!   in a call, gone) for at least HELD_MIN, ending no longer before the
+//!   crossing than the lease, a period and the stop.  The cases it exempts
+//!   are counted and printed.
 //!
 //! The oracle shares the plant with the daemon: the two-node equations,
 //! the constants, P = V^2 / z_nominal, the full scale and the governor's
@@ -60,10 +62,11 @@
 use std::cell::{Cell, RefCell};
 use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
-use crate::guard::{Guard, Hw, BLIND_LIMIT, DRAIN, KERNEL_LOCK_TIMEOUT, QUEUE_BOUND};
+use crate::guard::{Guard, Hw, BLIND_LIMIT, DRAIN, KERNEL_LOCK_TIMEOUT, MUTE_DB};
 use crate::model::SpeakerState;
 use crate::state;
 
@@ -81,6 +84,15 @@ const BUDGET_REL: f64 = 1e-3;
 const BUDGET_ABS: f64 = 1e-6;
 const NEED_TOL_DB: f64 = 0.01;
 const BLIND_TOL_S: f64 = 0.06;
+/// The shortest hold-up (d) exempts: the seventh review found none
+/// shorter in any crossing (160,000 cases at 48 kHz with a prompt stop,
+/// each gone once its hold-ups were taken out).
+const HELD_MIN: f64 = 0.085;
+
+/// Cases whose crossing (d) exempted as held up, over the process (the
+/// randomized test prints it: a change that makes the held-up class worse
+/// shows there, though it fails nothing).
+pub static EXEMPTED: AtomicU64 = AtomicU64::new(0);
 
 /// SplitMix64.
 #[derive(Clone)]
@@ -132,7 +144,9 @@ pub enum Fault {
     Pause { at: f64, len: f64 },
     /// Volume writes fail; partly when `partial` (the new value lands).
     WriteFail { at: f64, len: f64, partial: bool },
-    /// Writes of the safe value fail.
+    /// Writes of the safe value fail: for the first half of `len` the
+    /// daemon's fallback to the controls' minimum lands (the card always
+    /// takes it), for the rest that fails too.
     SafeFail { at: f64, len: f64 },
     /// The capture delivers nothing.
     SenseLoss { at: f64, len: f64 },
@@ -457,6 +471,8 @@ pub struct World<'a> {
     /// When the daemon was held up (descheduled, blocked in a call, gone):
     /// what the kernel's lease bounds, not the daemon.
     pub held: RefCell<Vec<(f64, f64)>>,
+    /// A crossing (d) exempted as held up.
+    pub exempted: Cell<bool>,
 }
 
 impl<'a> World<'a> {
@@ -493,6 +509,7 @@ impl<'a> World<'a> {
             sighted: 0.0,
             last_rate: 0,
             held: RefCell::new(Vec::new()),
+            exempted: Cell::new(false),
         }
     }
 
@@ -501,6 +518,22 @@ impl<'a> World<'a> {
         if len > 0.0 {
             self.held.borrow_mut().push((from, from + len));
         }
+    }
+
+    /// Whether the daemon was held up for HELD_MIN at a stretch (hold-ups
+    /// back to back count as one) ending after `from` and starting before
+    /// `to`.
+    fn held_up(&self, from: f64, to: f64) -> bool {
+        let mut spans = self.held.borrow().clone();
+        spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut merged: Vec<(f64, f64)> = Vec::new();
+        for (a, b) in spans {
+            match merged.last_mut() {
+                Some(m) if a <= m.1 + 1e-3 => m.1 = m.1.max(b),
+                _ => merged.push((a, b)),
+            }
+        }
+        merged.iter().any(|&(a, b)| b - a >= HELD_MIN && a < to && b > from)
     }
 
     fn now_s(&self) -> f64 {
@@ -719,6 +752,12 @@ impl Hw for World<'_> {
         self.maybe_pause();
         let t = self.now_s();
         self.advance(t);
+        if self.fault_on(|f| if let Fault::SafeFail { at, len } = f { Some((*at, *len * 0.5)) } else { None }) {
+            // the safe value failed, the minimum landed (review r7 Y4)
+            self.control = MUTE_DB;
+            self.note_gain();
+            return Ok(MUTE_DB);
+        }
         if self.fault_on(|f| if let Fault::SafeFail { at, len } = f { Some((*at, *len)) } else { None }) {
             return Err(io::Error::from_raw_os_error(libc::EIO));
         }
@@ -977,6 +1016,17 @@ fn need(cfg: &Config, o: &Oracle, k: usize, t: f64, rate: f64) -> f64 {
 
 /// Run one scenario; the first violation, if any.
 pub fn run(sc: &Scenario, seed: u64) -> Result<(), Violation> {
+    run_with(sc, seed, !strict_d())
+}
+
+/// `SPEAKERGUARDD_STRICT_D=1`: (d) exempts no crossing, held up or not.
+fn strict_d() -> bool {
+    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *S.get_or_init(|| std::env::var("SPEAKERGUARDD_STRICT_D").is_ok_and(|v| v == "1"))
+}
+
+/// The same, with (d) exempting held-up crossings or none.
+pub fn run_with(sc: &Scenario, seed: u64, held_exempt: bool) -> Result<(), Violation> {
     let cfg = harness_cfg(sc.real_rate);
     let path = state_dir(seed);
     if sc.clean_start {
@@ -1030,7 +1080,7 @@ pub fn run(sc: &Scenario, seed: u64) -> Result<(), Violation> {
                     let at = (g.account_to() - w.t0).as_secs_f64();
                     eprintln!("TRACE now {:.6} at {:.6} armed {} unlocked {} eff {:.2} coil {:.3}/{:.3} m1 {:.5}/{:.5} hist {:?}", w.now_s(), at, g.armed(), w.unlocked, w.effective(), g.speakers[0].t_coil, w.oracle.coil_at(0, at, rate), g.speakers[0].mean_power(1.0), w.oracle.mean_pre(0, at, 1.0, rate), g.speakers[0].history_tail(8));
                 }
-                check(&cfg, &w, &g, sc, rate)?;
+                check(&cfg, &w, &g, sc, rate, held_exempt)?;
             }
             let r = if exited {
                 Restart { at: w.now_s(), clean: false, gap: 1.0, damage: Damage::None }
@@ -1051,7 +1101,7 @@ pub fn run(sc: &Scenario, seed: u64) -> Result<(), Violation> {
                         let at = (g.account_to() - w.t0).as_secs_f64();
                         eprintln!("TRACE stop now {:.4} at {:.4} eff {:.2} m1 {:.4}/{:.4} hist {:?}", w.now_s(), at, w.effective(), g.speakers[0].mean_power(1.0), w.oracle.mean_pre(0, at, 1.0, rate), g.speakers[0].history_tail(4));
                     }
-                    check(&cfg, &w, &g, sc, rate)?;
+                    check(&cfg, &w, &g, sc, rate, held_exempt)?;
                     n += 1;
                 }
                 clean = g.released(&w) && g.final_save(&w).is_ok();
@@ -1070,10 +1120,13 @@ pub fn run(sc: &Scenario, seed: u64) -> Result<(), Violation> {
         }
     })();
     let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    if w.exempted.get() {
+        EXEMPTED.fetch_add(1, Ordering::Relaxed);
+    }
     result
 }
 
-fn check(cfg: &Config, w: &World, g: &Guard, sc: &Scenario, rate: f64) -> Result<(), Violation> {
+fn check(cfg: &Config, w: &World, g: &Guard, sc: &Scenario, rate: f64, held_exempt: bool) -> Result<(), Violation> {
     let at = (g.account_to() - w.t0).as_secs_f64();
     let now = w.now_s();
     for k in 0..cfg.speakers.len() {
@@ -1109,16 +1162,19 @@ fn check(cfg: &Config, w: &World, g: &Guard, sc: &Scenario, rate: f64) -> Result
         }
     }
     // (d) with a prompt stop, the true coil never reaches its limit unless
-    // the daemon was held up (descheduled, blocked in a call, gone) inside
-    // the queue and lease before it: the kernel's lease bounds that, not
-    // the daemon (review r6 W1)
+    // the daemon was held up (descheduled, blocked in a call, gone) for at
+    // least HELD_MIN, ending no longer before the crossing than the lease,
+    // a period and the stop: after that the daemon has looked, and the
+    // lapse stopped the rest (review r6 W1, r7 Y3).  Exempted crossings
+    // are counted.
     if sc.stop <= 2.0 * PROMPT_STOP {
-        let reach = QUEUE_BOUND.as_secs_f64() + KERNEL_LOCK_TIMEOUT.as_secs_f64();
+        let after = KERNEL_LOCK_TIMEOUT.as_secs_f64() + w.period_s() + sc.stop;
         for k in 0..cfg.speakers.len() {
             if let Some(tx) = w.oracle.crossed[k] {
-                if !w.held.borrow().iter().any(|&(a, b)| a < tx && b > tx - reach) {
-                    return Err(Violation(format!("(d) at {now:.4} s: {} true coil reached {} C at {tx:.4} s, the daemon not held up", cfg.speakers[k].name, cfg.speakers[k].t_limit)));
+                if !(held_exempt && w.held_up(tx - after, tx)) {
+                    return Err(Violation(format!("(d) at {now:.4} s: {} true coil reached {} C at {tx:.4} s, the daemon not held up for {} ms in the {:.0} ms before", cfg.speakers[k].name, cfg.speakers[k].t_limit, HELD_MIN * 1000.0, after * 1000.0)));
                 }
+                w.exempted.set(true);
             }
         }
     }
@@ -1222,6 +1278,9 @@ mod tests {
     /// The randomized interleavings (see the module's doc).
     #[test]
     fn random_interleavings_keep_the_properties() {
+        // the daemon's journal for a million cases says nothing a failure's
+        // trace (trace_one) does not
+        crate::log::set_verbosity(crate::log::Level::Error);
         let n = cases();
         let from = first_seed();
         let threads = std::thread::available_parallelism().map_or(1, |p| p.get()).min(32) as u64;
@@ -1248,6 +1307,7 @@ mod tests {
                 });
             }
         });
+        eprintln!("{n} cases from seed {from}: {} crossings exempted as held up", EXEMPTED.load(Ordering::Relaxed));
         if let Some((seed, why)) = found.into_inner().unwrap() {
             let small = shrink(Scenario::random(seed), seed);
             let after = run(&small, seed).err().map(|v| v.0).unwrap_or_default();
@@ -1260,21 +1320,26 @@ mod tests {
 
     /// a muted card (the controls at their minimum) let nothing of the
     /// program through; 0.1.9 undid at most 30 dB of it, so the budgets lost
-    /// the program
+    /// the program.  Re-shrunk with the safe value at the start (review r7
+    /// Y4, seed 68000001207): a safe write that fails falls back to the
+    /// minimum, here at a crashed run's restart while a stream plays.
     #[test]
     fn h01_a_muted_cards_program_counts_up_to_full_scale() {
-        let sc = Scenario { horizon: 0.8512992841882598, events: true, steps: true, initial_db: 5.069778520926467, clean_start: false, max_reduction: 20.0, latency: 0.0018184671294329293, hot: None, stop: STOCK_STOP, real_rate: false, streams: vec![Stream { open: 0.1786875, close: 0.6805, depth: 0.22262230157550328, chunk: 0.03503873415172144, levels: vec![(0.1786875, 0.7263536145167477)] }], faults: vec![], restarts: vec![] };
-        if let Err(v) = run(&sc, 2) {
+        let sc = Scenario { horizon: 1.7484979569031336, events: true, steps: true, initial_db: 17.502958087709438, clean_start: true, max_reduction: 20.0, latency: 0.0012476219498364254, hot: None, stop: 0.054201460834836415, real_rate: true, streams: vec![Stream { open: 0.13720833333333332, close: 0.6610833333333334, depth: 0.27190940552075354, chunk: 0.048661904299849165, levels: vec![(0.13720833333333332, 0.5921145138650336)] }], faults: vec![Fault::SafeFail { at: 0.06664686244441291, len: 0.35948167451417523 }], restarts: vec![Restart { at: 0.21213151255358087, clean: false, gap: 0.01580691991332931, damage: Damage::Truncate }] };
+        if let Err(v) = run(&sc, 68000001207) {
             panic!("{}", v.0);
         }
     }
 
     /// a budget window that cut a step took its energy pro rata, though the
-    /// step's energy may all lie inside the window
+    /// step's energy may all lie inside the window.  Re-shrunk with r6 W4's
+    /// two-value entries in place (review r7 Y4, seed 68000000409): a
+    /// latched start at the J700's rate, a quiet program stepping to full
+    /// scale.
     #[test]
     fn h02_a_window_edge_inside_a_step_keeps_its_energy() {
-        let sc = Scenario { horizon: 2.2825362494252692, events: true, steps: true, initial_db: 23.94279022270308, clean_start: true, max_reduction: 28.66189827231709, latency: 0.000390993496961817, hot: None, stop: STOCK_STOP, real_rate: false, streams: vec![Stream { open: 0.02425, close: 1.246875, depth: 0.011040719404831987, chunk: 0.05484923872317915, levels: vec![(0.02425, 0.1295805609583719), (0.9309375, 0.820600623277012)] }], faults: vec![], restarts: vec![] };
-        if let Err(v) = run(&sc, 90) {
+        let sc = Scenario { horizon: 1.8671056300513578, events: true, steps: false, initial_db: 22.741827083884665, clean_start: false, max_reduction: 14.765689997659974, latency: 0.00044692557267933265, hot: None, stop: 0.005, real_rate: true, streams: vec![Stream { open: 0.60625, close: 1.5842083333333334, depth: 0.09726107902714844, chunk: 0.06888391362304154, levels: vec![(0.60625, 0.15177905099000988), (0.7344583333333333, 1.0)] }], faults: vec![], restarts: vec![] };
+        if let Err(v) = run(&sc, 68000000409) {
             panic!("{}", v.0);
         }
     }
@@ -1301,7 +1366,10 @@ mod tests {
     }
 
     /// a word is up to a step below what was played; undone by a deep gain,
-    /// that step is most of it
+    /// that step is most of it.  This case no longer finds it (review r7
+    /// Y4): every run now charges a frame of doubt at full scale, which
+    /// outweighs the step under the oracle's 0.1 %.  Its line has its own
+    /// test (`model::tests::a_quantized_word_is_undone_from_the_step_above`).
     #[test]
     fn h05_a_quantized_word_is_undone_from_the_step_above() {
         let sc = Scenario { horizon: 0.0599409674611242, events: true, steps: true, initial_db: 21.957687476343008, clean_start: true, max_reduction: 20.0, latency: 0.001616603188832694, hot: None, stop: STOCK_STOP, real_rate: false, streams: vec![Stream { open: 0.0, close: 0.2429375, depth: 0.16837715593902544, chunk: 0.05718612666174021, levels: vec![(0.0, 0.6010230250311033)] }], faults: vec![], restarts: vec![] };
@@ -1362,11 +1430,14 @@ mod tests {
     }
 
     /// a look at closed speakers vouched for the time right up to it, though
-    /// the event of a stream that had just opened was still on its way
+    /// the event of a stream that had just opened was still on its way.
+    /// Re-shrunk with r6 W4 in place (review r7 Y4, the review's seed
+    /// 68000014521): a slow rate read, then a stream whose event lands
+    /// after the next look's read.
     #[test]
     fn h11_a_quiet_look_leaves_room_for_an_event_in_flight() {
-        let sc = Scenario { horizon: 1.2107584259764679, events: true, steps: false, initial_db: 22.304290374327, clean_start: true, max_reduction: 20.0, latency: 0.0011260319537750706, hot: None, stop: STOCK_STOP, real_rate: false, streams: vec![Stream { open: 0.081125, close: 0.1085, depth: 0.18839094734845602, chunk: 0.07371997855972491, levels: vec![(0.081125, 0.45867228920373126)] }, Stream { open: 0.819, close: 1.7278125, depth: 0.1305016407120471, chunk: 0.10246173918957761, levels: vec![(0.819, 0.9583760879040607)] }], faults: vec![Fault::RateSlow { at: 0.6470822909786041, delay: 0.16004630036156928 }], restarts: vec![] };
-        if let Err(v) = run(&sc, 8186) {
+        let sc = Scenario { horizon: 0.050542354273446055, events: true, steps: true, initial_db: 11.36764533853065, clean_start: true, max_reduction: 26.90816544380242, latency: 0.0016246791266595721, hot: None, stop: 0.45, real_rate: false, streams: vec![Stream { open: 0.1424375, close: 0.1765, depth: 0.21038361041633205, chunk: 0.017670612243353676, levels: vec![(0.1424375, 0.4849090354764226)] }], faults: vec![Fault::RateSlow { at: 0.014875611006044318, delay: 0.1182518162038026 }], restarts: vec![] };
+        if let Err(v) = run(&sc, 68000014521) {
             panic!("{}", v.0);
         }
     }
@@ -1429,6 +1500,32 @@ mod tests {
     fn h17_a_blind_guard_hands_off_before_the_limit() {
         let sc = Scenario { horizon: 0.5036921644207981, events: true, steps: true, initial_db: 16.34278643281134, clean_start: true, max_reduction: 23.91409190628302, latency: 0.0014071413693688252, hot: Some((96.96265196323591, 65.71970989360003)), stop: 0.005, real_rate: false, streams: vec![Stream { open: 0.1860625, close: 0.923875, depth: 0.23575628406011143, chunk: 0.028000256783642864, levels: vec![(0.1860625, 1.0)] }], faults: vec![Fault::SenseLoss { at: 0.18454502105662224, len: 0.5659032047466186 }], restarts: vec![] };
         if let Err(v) = run(&sc, 148723) {
+            panic!("{}", v.0);
+        }
+    }
+
+    /// Review r7 Y2, the review's worst held-up onset (seed 60000004590,
+    /// its world): a 93 C coil from a clean stop, a full-scale stream
+    /// behind 215 ms of queue at the J700's rate, and one position read
+    /// that blocks 233 ms just after it starts.  The card kept converting
+    /// at the 0 dB the governor wrote until the lease ran out: 145 C.  The
+    /// floor under every write keeps the true coil under its limit with no
+    /// exemption for the hold-up.
+    #[test]
+    fn h19_a_daemon_held_up_at_a_loud_onset_keeps_the_coil_under_its_limit() {
+        let sc = Scenario { horizon: 2.601130690019173, events: true, steps: true, initial_db: 27.44196948597806, clean_start: true, max_reduction: 20.0, latency: 0.0014074644805897334, hot: Some((93.40670186409456, 65.92385564957644)), stop: PROMPT_STOP, real_rate: true, streams: vec![Stream { open: 0.5878125, close: 0.9659791666666667, depth: 0.16651519892902647, chunk: 0.11559821364631316, levels: vec![(0.5878125, 0.9173164452843175)] }, Stream { open: 2.1817083333333334, close: 3.3399791666666667, depth: 0.214572448259926, chunk: 0.050705970872372996, levels: vec![(2.1817083333333334, 1.0)] }], faults: vec![Fault::SlowPosition { at: 1.8013168926411023, delay: 0.23333579861037512 }, Fault::ShortPeriod { at: 1.480782982539603 }], restarts: vec![] };
+        if let Err(v) = run_with(&sc, 60000004590, false) {
+            panic!("{}", v.0);
+        }
+    }
+
+    /// Review r7 Y2, the review's deep-queue pause (seed 58000003892): a
+    /// cold coil, a full-scale stream behind 255 ms of queue, the capture
+    /// lost and the daemon descheduled 454 ms.  136.5 C without the floor.
+    #[test]
+    fn h20_a_descheduled_daemon_behind_a_deep_queue_keeps_the_coil_under_its_limit() {
+        let sc = Scenario { horizon: 0.556879324714331, events: true, steps: true, initial_db: 6.983902804740892, clean_start: true, max_reduction: 20.0, latency: 0.0006999288241433795, hot: None, stop: PROMPT_STOP, real_rate: true, streams: vec![Stream { open: 0.018291666666666668, close: 0.9735625, depth: 0.25489488086407913, chunk: 0.01741568677698285, levels: vec![(0.018291666666666668, 1.0)] }], faults: vec![Fault::SenseLoss { at: 0.3547456617352162, len: 0.8684501024116017 }, Fault::Pause { at: 0.5454473286939842, len: 0.45413327133912273 }], restarts: vec![] };
+        if let Err(v) = run_with(&sc, 58000003892, false) {
             panic!("{}", v.0);
         }
     }

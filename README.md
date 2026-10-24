@@ -204,8 +204,11 @@ its safe level (no lock without events, none after a failed rate read, no
 renewal blind past the limit, a latched start from anything but a clean
 stop).  Where macaudio stops old-gain audio promptly, it also asserts that
 the true coil never reaches its limit unless the daemon was held up
-(descheduled, blocked in a call or gone) in the queue and lease before it.
-That bound is the kernel's lease, not the daemon's.  Scenarios start cold
+(descheduled, blocked in a call or gone) for at least 85 ms, ending no
+longer before the crossing than the lease, a period and the stop.  That
+bound is the kernel's lease, not the daemon's, and the crossings it exempts
+are counted.  A safe write that fails falls back to the controls' minimum,
+as the daemon does.  Scenarios start cold
 or hot, at 16 kHz or at the J700's own 48 kHz and 4096 frames, with a prompt
 or a slow stop.  Failures shrink to a minimal scenario printed as Rust; each
 one it found is a test of its own.
