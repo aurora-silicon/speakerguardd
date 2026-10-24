@@ -1504,6 +1504,20 @@ mod tests {
         }
     }
 
+    /// Found on #8's harness run (seed 8100719359), and on 0.1.10: a 17 ms
+    /// stream read whole at its close (274 frames certain), its loud end in
+    /// a 31-frame block among 30-frame ones.  The block means were
+    /// integrated as equal shares, so the loud block lost 1.8 % of its
+    /// energy and the 1 s budget held 0.0180 W against a true 0.0181 W at
+    /// the window's old edge.  Each block's energy now keeps its share.
+    #[test]
+    fn h18_a_run_in_uneven_blocks_keeps_its_energy() {
+        let sc = Scenario { horizon: 1.3191381306084726, events: true, steps: true, initial_db: 7.493479721540933, clean_start: true, max_reduction: 23.88707311652583, latency: 2.823637145963387e-5, hot: None, stop: STOCK_STOP, real_rate: false, streams: vec![Stream { open: 0.5955625, close: 0.6128125, depth: 0.010634848836597837, chunk: 0.015157138903645648, levels: vec![(0.5955625, 0.08864516066450345), (0.6115, 1.0)] }], faults: vec![Fault::Pause { at: 0.7913133366864289, len: 0.28896169769964836 }], restarts: vec![Restart { at: 1.1394017029306982, clean: true, gap: 0.033278459087805544, damage: Damage::OldFormat }] };
+        if let Err(v) = run(&sc, 8100719359) {
+            panic!("{}", v.0);
+        }
+    }
+
     /// Review r7 Y2, the review's worst held-up onset (seed 60000004590,
     /// its world): a 93 C coil from a clean stop, a full-scale stream
     /// behind 215 ms of queue at the J700's rate, and one position read

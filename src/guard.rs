@@ -1020,12 +1020,17 @@ impl Guard {
         let converted = played.checked_sub(QUEUE_BOUND).unwrap_or(played);
         let possible = self.possible_reductions(converted, late_end);
         let parts: &[(usize, usize, f64)] = if first < 1.0 { &[(0, 1, first), (1, k, 1.0)] } else { &[(0, k, 1.0)] };
-        // block means of a run of per-frame values
+        // Block powers of a run of per-frame values.  The models give every
+        // block an equal share of the run's time, so each block's energy is
+        // spread over that share: a run whose frames do not divide evenly
+        // keeps its energy exactly (a 274-frame tail in 30- and 31-frame
+        // blocks lost 1.8 % of a loud last block before).
         let means = |x: &[f64], blocks: usize| -> Vec<f64> {
             let n = x.len();
+            let share = n as f64 / blocks as f64;
             (0..blocks).map(|b| {
                 let (lo, hi) = (n * b / blocks, n * (b + 1) / blocks);
-                if hi > lo { x[lo..hi].iter().sum::<f64>() / (hi - lo) as f64 } else { 0.0 }
+                if hi > lo { x[lo..hi].iter().sum::<f64>() / share } else { 0.0 }
             }).collect()
         };
         for s in self.speakers.iter_mut() {
