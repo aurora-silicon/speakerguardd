@@ -6419,6 +6419,9 @@ mod persist_interval_review {
             let mut cfg = Config::parse(text).unwrap();
             cfg.globals.boot_resume = BootResume::Idle;
             cfg.globals.governor = Governor::Unified;
+            // Explicit opt-ins for this synthetic run with FakeHw.
+            cfg.allow_unified = true;
+            cfg.allow_unqualified = true;
             cfg.globals.shadow = true;
             cfg.globals.safe_reduction = 20.0;
             let text = fixture(&cfg, 50.0, 50.0, 7);
