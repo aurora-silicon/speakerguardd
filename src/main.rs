@@ -21,6 +21,7 @@ mod guard;
 mod harness;
 mod log;
 mod model;
+mod persist;
 mod record;
 mod startup;
 mod state;
@@ -70,6 +71,7 @@ struct Args {
     card: Option<String>,
     card_wait: Duration,
     state: Option<PathBuf>,
+    persist: Option<PathBuf>,
     verbosity: Level,
     shadow: bool,
     governor: Option<Governor>,
@@ -97,6 +99,7 @@ fn usage() -> ! {
          --wait-for-card <SECONDS>       Wait for card discovery before failing (default 30; 0 disables waiting)\n  \
          -m, --max-reduction <DB>        Gain reduction beyond which the card's safe level takes over (default: the config's, else 20)\n  \
          -s, --state <FILE>              Model state kept across restarts (default /run/speakerguardd/state)\n  \
+         --persist <FILE>                Model state kept across a reboot, with boot_resume = idle (default /var/lib/speakerguardd/state; empty: none)\n  \
          --governor <NAME>               legacy, asahi or unified (default: the config's, else legacy)\n  \
          --guard <NAME>                  asahi: the unified governor's card also gets the asahi governor's reductions (default: the config's, else none)\n  \
          --shadow                        Run every governor and log them to shadow.jsonl next to the state\n  \
@@ -125,6 +128,7 @@ fn parse_args() -> Args {
         card: None,
         card_wait: Duration::from_secs(30),
         state: Some(PathBuf::from("/run/speakerguardd/state")),
+        persist: Some(PathBuf::from("/var/lib/speakerguardd/state")),
         verbosity: Level::Info,
         shadow: false,
         governor: None,
@@ -150,6 +154,10 @@ fn parse_args() -> Args {
             "-s" | "--state" => {
                 let v = it.next().unwrap_or_else(|| usage());
                 args.state = if v.is_empty() { None } else { Some(PathBuf::from(v)) };
+            }
+            "--persist" => {
+                let v = it.next().unwrap_or_else(|| usage());
+                args.persist = if v.is_empty() { None } else { Some(PathBuf::from(v)) };
             }
             "-m" | "--max-reduction" => {
                 args.max_reduction = Some(it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage()));
@@ -471,6 +479,23 @@ impl Hw for RealHw {
     fn events_available(&self) -> bool {
         self.card.events
     }
+    fn wall(&self) -> persist::Wall {
+        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        // SAFETY: a valid, writable timespec.
+        let rt = unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts) } == 0 && ts.tv_sec > 0;
+        let realtime = rt.then(|| Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32));
+        // SAFETY: a zeroed timex with modes 0 only reads the kernel's state.
+        let mut tx: libc::timex = unsafe { std::mem::zeroed() };
+        let state = unsafe { libc::adjtimex(&mut tx) };
+        let synced = state >= 0 && state != libc::TIME_ERROR && tx.status & libc::STA_UNSYNC == 0;
+        let rtc = std::fs::read_to_string("/sys/class/rtc/rtc0/since_epoch").ok().and_then(|s| s.trim().parse::<u64>().ok()).filter(|&s| s > 0).map(Duration::from_secs);
+        let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        persist::Wall { realtime, synced, rtc, boot_id }
+    }
+    fn shutting_down(&self) -> bool {
+        // systemd says "stopping" from the start of a shutdown
+        std::process::Command::new("systemctl").arg("is-system-running").output().is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "stopping")
+    }
     fn queued(&mut self) -> std::io::Result<u64> {
         match self.capture.as_mut() {
             Some(c) => c.queued(),
@@ -518,7 +543,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let mut hw = RealHw { card, globals: cfg.globals.clone(), capture: None };
     catch_stop_signals();
     let max_reduction = args.max_reduction.unwrap_or(cfg.globals.max_reduction);
-    let mut guard = Guard::start(&mut hw, &cfg, max_reduction, args.state.clone())?;
+    let mut guard = Guard::start_persist(&mut hw, &cfg, max_reduction, args.state.clone(), args.persist.clone())?;
     if let Some(path) = &args.record {
         let max = args.record_max_mb.saturating_mul(1 << 20);
         guard.attach_recorder(&hw, record::Recorder::create(path, &cfg, hw.card.events, max)?);
@@ -635,6 +660,7 @@ mod tests {
             card: None,
             card_wait: Duration::ZERO,
             state: None,
+            persist: None,
             verbosity: Level::Info,
             shadow: false,
             governor: None,

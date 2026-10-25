@@ -539,6 +539,7 @@ mod tests {
             max_reduction: 20.0,
             qualified: true,
             guard: None,
+            boot_resume: crate::config::BootResume::Latched,
         }
     }
 
