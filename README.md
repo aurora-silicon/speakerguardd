@@ -290,28 +290,36 @@ playback is part of this contribution procedure.
 boot, so by default every boot starts latched at the coils' limit (on the
 Neo, an 11.9 dB first lock released over 7.6 min).  With `boot_resume =
 idle` in `[Globals]`, a clean stop made while systemd shuts the system down
-also writes its state to `/var/lib/speakerguardd/state` (`--persist`;
-`StateDirectory=` in the unit), stamped with the boot's id, the RTC and
-CLOCK_REALTIME.  The first start of the next boot (no state under `/run`)
-resumes it and charges the whole time since at the card's safe level.  The
-gap is the shortest of the clocks both boots trust: the RTC, and the
-system clock where the kernel called it synchronized at both ends or the
-RTC agrees with it.  A clock that went back, two that disagree by more
-than 2 s plus 0.1 %, a gap shorter than this boot's uptime, or any state
-that is not a clean stop at shutdown starts latched.  Every start, with
-the option or without, removes the file before it can unlock (and does not
-unlock while it cannot), so it is resumed at most once and never after the
-speakers have been driven since.  A stop that is not a shutdown writes
-none: after it a restart or speakersafetyd may drive the speakers to the
-reboot, which no clock records.
+also writes its state to `/var/lib/speakerguardd/state` (`--persist`).  The
+daemon makes the directory itself, after the card is locked; the unit adds
+nothing that could fail before the daemon runs.  The record is checksummed
+and bound to the machine (`/etc/machine-id`), the parsed configuration
+and the boot that wrote it.  It is written and synced only when the
+system clock is synchronized.  The first start of the next boot (no state
+under `/run`) resumes it only if all of the following hold:
+
+* the journal lists the writing boot as the one just before this one, so
+  no Linux boot in between drove the speakers;
+* the machine and configuration match and the checksum holds;
+* no temperature is under the ambient;
+* the system clock is synchronized at both ends, any RTC agrees with it,
+  and the gap is no shorter than this boot's uptime.
+
+The state is restored over the shortest and the longest the gap can have
+been, at the card's safe level, and each temperature takes the hotter
+result.  Anything it cannot prove starts latched.  Every start removes the
+file and syncs its directory before it can unlock, and does not unlock
+while it cannot, with the option or without and with `--persist ''`.  A
+stop that is not a shutdown writes nothing.
 
 > **Dual boot hazard.**  `idle` assumes nothing drove the speakers between
-> the shutdown and this boot.  On a machine that also boots macOS (every
-> Apple Silicon Mac can), macOS may have played in that gap and left a coil
-> at its limit; this boot would start from the cooler state saved before it,
-> and a coil could run up to (limit minus the saved temperature) over its
-> limit.  Linux cannot see whether another OS ran.  Set `idle` only on a
-> machine that boots nothing else; the default keeps the latched start.
+> the shutdown and this boot, and that a clock the kernel calls synchronized
+> is right.  On a machine that also boots macOS (every Apple Silicon Mac can),
+> macOS may have played in that gap and left a coil at its limit.  The
+> journal knows Linux boots only.  This boot would start from the cooler
+> state saved before it; a review of the J700 model measured 58 K over the
+> limit that way.  Set `idle` only on a machine that boots nothing else;
+> the default keeps the latched start.
 
 ### Machines with current and voltage sense
 

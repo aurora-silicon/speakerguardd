@@ -3,44 +3,57 @@
 //! default).  The state under /run (state.rs) dies with the boot, so every
 //! boot starts at the coils' limit, latched: on the Neo that cost an 11.9
 //! dB first lock, released over 7.6 min.  A clean stop made while the
-//! system shuts down also writes its state here, under /var/lib, with the
-//! boot's id, CLOCK_REALTIME (and whether the kernel called it
-//! synchronized) and the RTC.  The first start of the next boot resumes it,
-//! charging the whole time since at the worst case the card's own safe
-//! level lets through, as a restart within a boot does.
+//! system shuts down also writes its state here, under /var/lib.  The
+//! first start of the next boot resumes it, charging the time since at the
+//! worst case the card's own safe level lets through, as a restart within
+//! a boot does.  Anything this file cannot prove starts latched, as
+//! without it.
 //!
-//! Only such a state is resumed: after a clean stop at shutdown nothing in
-//! that boot can drive the speakers again (no restart, no OnFailure
-//! fallback), and the card holds its safe level to the power-off.  A
-//! periodic state is never resumed: after it the daemon, or speakersafetyd
-//! after it, may have driven the speakers at their limit up to the reboot,
-//! whose time no clock records.  Every start consumes the file before the
-//! lock can be lifted, so a state is resumed at most once and never after
-//! this boot has driven the speakers.
+//! What it has to prove (review of 753f9ca, 2026-10-26):
+//! * **Continuity.**  The boot that wrote it is the one the system journal
+//!   lists immediately before this one, so no Linux boot in between drove
+//!   the speakers (one with persistence off, one that consumed it and lost
+//!   the unlink in a power cut, speakersafetyd).  Without a journal that
+//!   knows the previous boot, it is not resumed.
+//! * **Origin.**  The same machine (/etc/machine-id) and the same parsed
+//!   configuration (record::fingerprint), and a checksum over the whole
+//!   record: a file from elsewhere, or damaged into valid text, is not
+//!   resumed.  Every temperature is at least the configuration's ambient
+//!   (no model goes colder): a colder one is damage.
+//! * **Time.**  The gap is CLOCK_REALTIME's, and only while the kernel
+//!   called it synchronized at both ends (a clock stepped while it was not
+//!   is not trusted); the RTC, where both ends have it, has to agree to 2 s
+//!   plus 0.1 %; and it is never shorter than this boot's uptime.  The
+//!   clocks are read after the snapshot's account closes, and the boot time
+//!   between the two is kept: the state is restored over the shortest and
+//!   the longest time it can have been, and each temperature takes the
+//!   hotter of the two.
 //!
-//! **What Linux cannot see.**  The gap between the shutdown and this boot
-//! is taken to be idle at the card's safe level.  On a machine that also
-//! boots macOS (or anything else that drives the same speakers), another
-//! OS may have run in that gap and left a coil at its limit; this boot
-//! would then start from the cold state saved before it and could let a
-//! coil run up to (limit - saved temperature) hotter than its limit.
-//! Nothing Linux can read proves no other OS ran, so `idle` is for
-//! machines that boot only Linux; the default keeps the latched start.
+//! Only a clean stop at shutdown is kept: after it nothing in that boot
+//! drives the speakers again, and the card holds its safe level to the
+//! power-off.  Every start, with the option or without, removes the file
+//! (durably: the directory synced) before the lock can be lifted, and does
+//! not unlock while it cannot.
 //!
-//! The gap is measured by every trustworthy clock and the shortest is
-//! taken: the RTC (it runs through the power-off) and CLOCK_REALTIME (only
-//! if the kernel called it synchronized at both ends, unless the RTC
-//! confirms it).  Clocks that went back, disagree by more than 2 s plus
-//! 0.1 %, or measure less than this boot's own uptime, are not trusted: the
-//! start is latched.
+//! **What Linux cannot see.**  The journal knows Linux boots only.  On a
+//! machine that also boots macOS (or anything else that drives the same
+//! speakers), another OS may have run between the shutdown and this boot
+//! and left a coil at its limit; this boot would start from the cooler
+//! state saved before it.  On the J700 the review measured 58 K over the
+//! limit that way.  Nothing Linux can read proves no other OS ran, so
+//! `idle` is for machines that boot nothing else, and it also assumes a
+//! clock the kernel calls synchronized is right.  The default keeps the
+//! latched start.
 
 use std::time::Duration;
 
 use crate::state::{self, Saved};
 
-const MAGIC: &str = "speakerguardd-boot 1";
-/// The RTC counts whole seconds, and two clocks are read a little apart.
+const MAGIC: &str = "speakerguardd-boot 2";
+/// Two clocks read a little apart, and the RTC's whole seconds.
 const SLACK: Duration = Duration::from_secs(2);
+/// The most a clock read can sit away from the boot time read next to it.
+const READ_EPS: Duration = Duration::from_millis(50);
 
 /// The clocks and the boot, as read now.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -52,84 +65,131 @@ pub struct Wall {
     pub boot_id: Option<String>,
 }
 
+/// Where a record comes from: the machine and the parsed configuration.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Origin {
+    pub machine_id: Option<String>,
+    pub config: u64,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Persisted {
     pub wall: Wall,
+    pub origin: Origin,
+    /// Boot time from the snapshot's end to after the clocks were read.
+    pub pairing: Duration,
     pub state: Saved,
 }
 
-/// The file for `state` (a clean stop's state text) written at `wall`, or
-/// None if no clock could time the gap or the boot has no id.
-pub fn encode(wall: &Wall, state: &str) -> Option<String> {
-    let boot_id = wall.boot_id.as_deref().filter(|b| !b.is_empty() && !b.contains(char::is_whitespace))?;
-    if wall.rtc.is_none() && !(wall.realtime.is_some() && wall.synced) {
-        return None;
-    }
-    let opt = |d: Option<Duration>| d.map_or("-".to_string(), |d| d.as_nanos().to_string());
-    Some(format!("{MAGIC}\nboot_id {boot_id}\nrealtime_ns {}\nsynced {}\nrtc_ns {}\n{state}", opt(wall.realtime), wall.synced as u8, opt(wall.rtc)))
+fn fnv(text: &str) -> u64 {
+    text.bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3))
+}
+
+fn word(s: &str) -> Option<&str> {
+    Some(s).filter(|s| !s.is_empty() && !s.contains(char::is_whitespace))
+}
+
+/// A boot id as the kernel and the journal write it (with or without
+/// dashes), compared without them.
+pub fn same_boot(a: &str, b: &str) -> bool {
+    let n = |s: &str| s.trim().replace('-', "").to_ascii_lowercase();
+    !n(a).is_empty() && n(a) == n(b)
+}
+
+/// The record for `state` (a clean stop's state text, its snapshot ending
+/// `pairing` of boot time before the clocks in `wall` were read), or None
+/// if the system clock was not synchronized or the boot or machine has no
+/// id: such a record could not be resumed.
+pub fn encode(wall: &Wall, origin: &Origin, pairing: Duration, state: &str) -> Option<String> {
+    let boot_id = word(wall.boot_id.as_deref()?)?;
+    let machine = word(origin.machine_id.as_deref()?)?;
+    let realtime = wall.realtime.filter(|_| wall.synced)?;
+    let rtc = wall.rtc.map_or("-".to_string(), |d| d.as_nanos().to_string());
+    let body = format!(
+        "boot_id {boot_id}\nmachine_id {machine}\nconfig {:016x}\nrealtime_ns {}\nsynced 1\nrtc_ns {rtc}\npairing_ns {}\n{state}",
+        origin.config,
+        realtime.as_nanos(),
+        pairing.as_nanos()
+    );
+    Some(format!("{MAGIC}\nsum {:016x}\n{body}", fnv(&body)))
 }
 
 pub fn decode(text: &str) -> Option<Persisted> {
-    let mut lines = text.splitn(6, '\n');
-    if lines.next()? != MAGIC {
+    let rest = text.strip_prefix(MAGIC)?.strip_prefix('\n')?;
+    let (sum, body) = rest.strip_prefix("sum ")?.split_once('\n')?;
+    if u64::from_str_radix(sum, 16).ok()? != fnv(body) || sum.len() != 16 {
         return None;
     }
-    let boot_id = lines.next()?.strip_prefix("boot_id ")?.to_string();
-    let ns = |v: &str| -> Option<Option<Duration>> {
-        if v == "-" {
-            Some(None)
-        } else {
-            v.parse::<u64>().ok().map(|n| Some(Duration::from_nanos(n)))
-        }
+    let mut lines = body.splitn(8, '\n');
+    let mut field = |key: &str| -> Option<String> { lines.next()?.strip_prefix(key)?.strip_prefix(' ').map(str::to_string) };
+    let boot_id = field("boot_id")?;
+    let machine = field("machine_id")?;
+    let config = u64::from_str_radix(&field("config")?, 16).ok()?;
+    let realtime: u64 = field("realtime_ns")?.parse().ok()?;
+    if field("synced")? != "1" {
+        return None;
+    }
+    let rtc = match field("rtc_ns")?.as_str() {
+        "-" => None,
+        v => Some(Duration::from_nanos(v.parse().ok()?)),
     };
-    let realtime = ns(lines.next()?.strip_prefix("realtime_ns ")?)?;
-    let synced = match lines.next()?.strip_prefix("synced ")? {
-        "0" => false,
-        "1" => true,
-        _ => return None,
-    };
-    let rtc = ns(lines.next()?.strip_prefix("rtc_ns ")?)?;
+    let pairing: u64 = field("pairing_ns")?.parse().ok()?;
     let state = state::decode(lines.next()?)?;
-    if boot_id.is_empty() || boot_id.contains(char::is_whitespace) {
-        return None;
-    }
-    Some(Persisted { wall: Wall { realtime, synced, rtc, boot_id: Some(boot_id) }, state })
+    word(&boot_id)?;
+    word(&machine)?;
+    Some(Persisted {
+        wall: Wall { realtime: Some(Duration::from_nanos(realtime)), synced: true, rtc, boot_id: Some(boot_id) },
+        origin: Origin { machine_id: Some(machine), config },
+        pairing: Duration::from_nanos(pairing),
+        state,
+    })
 }
 
-/// The time since the file's clean stop, by the clocks both ends trust, at
-/// least this boot's `uptime`; or why it cannot be resumed.
-pub fn gap(p: &Persisted, now: &Wall, uptime: Duration) -> Result<Duration, String> {
+/// Every temperature the record holds is at least `floor` (the
+/// configuration's ambient, under which no model goes): a colder one is
+/// damage, not a cold speaker.
+pub fn plausible(p: &Persisted, floor: f64) -> bool {
+    let ok = |t: f64| t.is_finite() && t >= floor - 1e-6;
+    let s = &p.state;
+    s.speakers.iter().all(|x| ok(x.t_coil) && ok(x.t_magnet) && ok(x.t_peak))
+        && s.asahi.iter().all(|x| ok(x.t_coil) && ok(x.t_magnet) && ok(x.coil_hyst) && ok(x.magnet_hyst) && ok(x.t_peak))
+        && s.unified.iter().all(|x| ok(x.ff.0) && ok(x.ff.1) && ok(x.t_peak) && x.vi.is_none_or(|v| ok(v.0) && ok(v.1)))
+}
+
+/// The shortest and the longest the time since the record's snapshot can
+/// have been, by the clocks both ends trust, never shorter than this boot's
+/// `uptime`; or why it cannot be resumed.  `previous` is the boot the
+/// journal lists immediately before this one.
+pub fn gap(p: &Persisted, now: &Wall, origin: &Origin, previous: Option<&str>, uptime: Duration) -> Result<(Duration, Duration), String> {
     if !p.state.proven() {
         return Err("not a clean stop".into());
     }
-    match (&p.wall.boot_id, &now.boot_id) {
-        (Some(a), Some(b)) if a != b => {}
-        (_, None) => return Err("this boot has no id".into()),
-        _ => return Err("written in this boot".into()),
+    if p.origin != *origin || origin.machine_id.is_none() {
+        return Err("written on another machine or under another configuration".into());
     }
-    let since = |a: Option<Duration>, b: Option<Duration>| match (a, b) {
-        (Some(a), Some(b)) => Some(b.checked_sub(a).ok_or(())),
-        _ => None,
+    let written = p.wall.boot_id.as_deref().unwrap_or("");
+    match (&now.boot_id, previous) {
+        (None, _) => return Err("this boot has no id".into()),
+        (Some(b), _) if same_boot(b, written) => return Err("written in this boot".into()),
+        (_, None) => return Err("the journal does not show the previous boot".into()),
+        (_, Some(prev)) if !same_boot(prev, written) => return Err("another boot came between".into()),
+        _ => {}
+    }
+    let (Some(then), Some(at), true, true) = (p.wall.realtime, now.realtime, p.wall.synced, now.synced) else {
+        return Err("the system clock is not synchronized at both ends".into());
     };
-    let rtc = since(p.wall.rtc, now.rtc);
-    let rt = since(p.wall.realtime, now.realtime).filter(|_| rtc.is_some() || (p.wall.synced && now.synced));
-    let gaps: Vec<Duration> = match (rtc, rt) {
-        (None, None) => return Err("no clock both boots trust".into()),
-        (Some(Err(())), _) | (_, Some(Err(()))) => return Err("a clock went back".into()),
-        (Some(Ok(a)), Some(Ok(b))) => {
-            let (lo, hi) = (a.min(b), a.max(b));
-            if hi - lo > SLACK + hi / 1000 {
-                return Err(format!("the RTC and the system clock disagree ({:.1} s against {:.1} s)", a.as_secs_f64(), b.as_secs_f64()));
-            }
-            vec![a, b]
+    let g = at.checked_sub(then).ok_or("the system clock went back")?;
+    if let (Some(a), Some(b)) = (p.wall.rtc, now.rtc) {
+        let r = b.checked_sub(a).ok_or("the RTC went back")?;
+        let (lo, hi) = (r.min(g), r.max(g));
+        if hi - lo > SLACK + hi / 1000 {
+            return Err(format!("the RTC and the system clock disagree ({:.1} s against {:.1} s)", r.as_secs_f64(), g.as_secs_f64()));
         }
-        (Some(Ok(a)), None) | (None, Some(Ok(a))) => vec![a],
-    };
-    let g = gaps.into_iter().min().unwrap_or_default();
+    }
     if g + SLACK < uptime {
         return Err(format!("{:.1} s since the stop, under this boot's uptime of {:.1} s", g.as_secs_f64(), uptime.as_secs_f64()));
     }
-    Ok(g.max(uptime))
+    Ok((g.saturating_sub(READ_EPS).max(uptime), (g + p.pairing + READ_EPS).max(uptime)))
 }
 
 #[cfg(test)]
@@ -141,9 +201,9 @@ mod tests {
     const J316: &str = include_str!("../conf/apple/j316.conf");
     const T: Duration = Duration::from_secs(5000);
 
-    fn clean() -> String {
+    fn clean(t: f64) -> String {
         let cfg = Config::parse(J316).unwrap();
-        let sp: Vec<SpeakerState> = cfg.speakers.iter().map(|s| SpeakerState::new(s.clone(), 60.0)).collect();
+        let sp: Vec<SpeakerState> = cfg.speakers.iter().map(|s| SpeakerState::new(s.clone(), t)).collect();
         state::encode(T, T, &sp, false, true)
     }
 
@@ -151,48 +211,69 @@ mod tests {
         Wall { realtime: Some(Duration::from_secs(rt)), synced, rtc: rtc.map(Duration::from_secs), boot_id: Some(boot.into()) }
     }
 
+    fn origin() -> Origin {
+        Origin { machine_id: Some("m1".into()), config: 7 }
+    }
+
     #[test]
     fn round_trip_and_damage() {
         let w = wall("a1", 1_800_000_000, true, Some(1_800_000_001));
-        let text = encode(&w, &clean()).unwrap();
+        let text = encode(&w, &origin(), Duration::from_millis(3), &clean(60.0)).unwrap();
         let p = decode(&text).unwrap();
-        assert_eq!(p.wall, w);
-        assert!(p.state.proven());
-        for n in 0..text.rfind("\nend").unwrap() + 4 {
+        assert_eq!((p.wall.clone(), p.origin.clone(), p.pairing), (w.clone(), origin(), Duration::from_millis(3)));
+        assert!(p.state.proven() && plausible(&p, 50.0));
+        for n in 0..text.len() {
             assert!(decode(&text[..n]).is_none(), "accepted a prefix of {n} bytes");
         }
-        assert!(decode(&text.replace("synced 1", "synced 2")).is_none());
-        // nothing to time the gap by: not written
-        assert!(encode(&wall("a1", 1, false, None), &clean()).is_none());
-        assert!(encode(&Wall { boot_id: None, ..w.clone() }, &clean()).is_none());
+        // damage into valid text: a colder coil, a cleared latch
+        let i = text.find("speaker ").unwrap();
+        let cold = format!("{}{}", &text[..i], text[i..].replacen("60.000000", "-47.598243", 1));
+        assert!(decode(&cold).is_none(), "the checksum let a changed temperature through");
+        // not written: no synchronized clock, no boot or machine id
+        assert!(encode(&wall("a1", 1, false, Some(1)), &origin(), Duration::ZERO, &clean(60.0)).is_none());
+        assert!(encode(&Wall { boot_id: None, ..w.clone() }, &origin(), Duration::ZERO, &clean(60.0)).is_none());
+        assert!(encode(&w, &Origin { machine_id: None, config: 7 }, Duration::ZERO, &clean(60.0)).is_none());
+        // a record colder than the ambient floor is implausible
+        let p = decode(&encode(&w, &origin(), Duration::ZERO, &clean(-47.6)).unwrap()).unwrap();
+        assert!(!plausible(&p, 50.0));
     }
 
-    /// The gap is the shortest trusted clock's, and never less than this
-    /// boot's uptime; anything a clock cannot vouch for is latched.
+    /// Review of 753f9ca: only the boot just before this one, on the same
+    /// machine and configuration, with the system clock synchronized at both
+    /// ends (the RTC alone counts whole seconds), no shorter than the
+    /// uptime; restored over the shortest and the longest time it can have
+    /// been (the clocks were read `pairing` after the snapshot).
     #[test]
-    fn only_trusted_clocks_time_the_gap() {
-        let p = |w: Wall| decode(&encode(&w, &clean()).unwrap()).unwrap();
+    fn only_a_proven_interval_is_resumed() {
+        let p = decode(&encode(&wall("a1", 1000, true, Some(500)), &origin(), Duration::from_secs(1), &clean(60.0)).unwrap()).unwrap();
         let up = Duration::from_secs(8);
-        let then = p(wall("a1", 1000, false, Some(500)));
-        // the RTC alone (the system clock unsynchronized at boot)
-        assert_eq!(gap(&then, &wall("b2", 1300, false, Some(800)), up), Ok(Duration::from_secs(300)));
-        // the shorter of two that agree
-        assert_eq!(gap(&then, &wall("b2", 1299, false, Some(800)), up), Ok(Duration::from_secs(299)));
-        // the same boot, no boot id, a clock gone back, two that disagree
-        assert!(gap(&then, &wall("a1", 1300, false, Some(800)), up).is_err());
-        assert!(gap(&then, &Wall { boot_id: None, ..wall("b2", 1300, false, Some(800)) }, up).is_err());
-        assert!(gap(&then, &wall("b2", 1300, false, Some(400)), up).is_err());
-        assert!(gap(&then, &wall("b2", 9300, false, Some(800)), up).is_err());
-        // a gap shorter than this boot has been up
-        assert!(gap(&then, &wall("b2", 1003, false, Some(503)), up).is_err());
-        // the system clock alone: only synchronized at both ends
-        let rt = p(wall("a1", 1000, true, None));
-        assert_eq!(gap(&rt, &wall("b2", 1600, true, None), up), Ok(Duration::from_secs(600)));
-        assert!(gap(&rt, &wall("b2", 1600, false, None), up).is_err());
+        let now = wall("b2", 1300, true, Some(800));
+        let (lo, hi) = gap(&p, &now, &origin(), Some("a1"), up).unwrap();
+        assert!(lo <= Duration::from_secs(300) && lo >= Duration::from_millis(299_900), "{lo:?}");
+        assert!(hi >= Duration::from_secs(301) && hi <= Duration::from_millis(301_100), "{hi:?}");
+        // dashes in one id and not the other are the same boot
+        assert!(gap(&p, &now, &origin(), Some("A-1"), up).is_ok());
+        for (why, w, o, prev) in [
+            ("another boot between", now.clone(), origin(), Some("x9")),
+            ("no journal", now.clone(), origin(), None),
+            ("this boot", wall("a1", 1300, true, Some(800)), origin(), Some("a1")),
+            ("another machine", now.clone(), Origin { machine_id: Some("m2".into()), config: 7 }, Some("a1")),
+            ("another configuration", now.clone(), Origin { machine_id: Some("m1".into()), config: 8 }, Some("a1")),
+            ("unsynchronized now", wall("b2", 1300, false, Some(800)), origin(), Some("a1")),
+            ("RTC alone", Wall { realtime: None, synced: false, ..now.clone() }, origin(), Some("a1")),
+            ("clock back", wall("b2", 990, true, Some(490)), origin(), Some("a1")),
+            ("RTC back", wall("b2", 1300, true, Some(400)), origin(), Some("a1")),
+            ("clocks disagree", wall("b2", 87400, true, Some(800)), origin(), Some("a1")),
+            ("under the uptime", wall("b2", 1003, true, Some(503)), origin(), Some("a1")),
+        ] {
+            assert!(gap(&p, &w, &o, prev, up).is_err(), "{why}");
+        }
+        // a backward clock with the uptime under the slack (review P6)
+        assert!(gap(&p, &wall("b2", 999, true, Some(499)), &origin(), Some("a1"), Duration::from_secs(1)).is_err());
         // a state that is no clean stop
         let cfg = Config::parse(J316).unwrap();
         let sp: Vec<SpeakerState> = cfg.speakers.iter().map(|s| SpeakerState::new(s.clone(), 60.0)).collect();
-        let running = decode(&encode(&wall("a1", 1000, false, Some(500)), &state::encode(T, T, &sp, true, false)).unwrap()).unwrap();
-        assert!(gap(&running, &wall("b2", 1300, false, Some(800)), up).is_err());
+        let running = decode(&encode(&wall("a1", 1000, true, Some(500)), &origin(), Duration::ZERO, &state::encode(T, T, &sp, true, false)).unwrap()).unwrap();
+        assert!(gap(&running, &now, &origin(), Some("a1"), up).is_err());
     }
 }
