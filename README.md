@@ -232,9 +232,17 @@ hysteresis.  It differs only toward protection:
   a period with at least 0.1 V and 20 mA rms, current that
   does not follow the voltage (sum(v i) under 0.2 of sqrt(sum(v^2)
   sum(i^2)); a live load of up to 60 degrees keeps it over 0.4) is no
-  reading, at once from 0.5 V rms and after 2 s of such program under it.  What V and I cannot tell apart is a line reading a fraction
-  of its current on a program with no low-band current from a higher
-  impedance: the tweeters, and treble-only programs on the woofers.
+  reading, at once from 0.5 V rms and after 2 s of such program under
+  it.  What V and I cannot tell apart is a line reading a fraction of its
+  current on a program with no low-band current from a higher impedance:
+  the tweeters, and treble-only programs on the woofers.
+  With `twin_ratio` set (off by default), a speaker is also compared with
+  its left/right twin: over the last 10 s, with at least 5 s where both
+  carry 0.1 V rms and their voltages correlate at 0.6 or more (so a source
+  panned to one side cannot trip it), an effective admittance (sum(v i)
+  over sum(v^2)) under `twin_ratio` of the twin's reads low.  Twins on
+  today's recordings from the three V/I machines agreed within 0.95 to
+  1.04.
 * `z_min` in a speaker's section sets its smallest impedance (a unit's
   own DC resistance) when it is lower than the default, the smaller of
   `z_nominal` and `r_ff`.

@@ -169,11 +169,35 @@ pub const PF_HOLD_S: f64 = 2.0;
 /// reading again once that has held for LOG_BACK (review r4 DD2); the
 /// bound itself follows the line at once.
 const LOG_LOST: u32 = 2;
+/// The twin comparison's window (s).  It counts only periods where both
+/// twins carry at least TWIN_V2_MIN mean square volts and the line reads,
+/// at least TWIN_MIN_S of them, and only when the twins' voltages are
+/// alike, a correlation of TWIN_CORR_MIN or more, so a source panned to
+/// one side cannot trip it.  A speaker reading low by it reads again over
+/// TWIN_CLEAR times twin_ratio.
+const TWIN_WINDOW_S: f64 = 10.0;
+const TWIN_V2_MIN: f64 = 0.01;
+const TWIN_MIN_S: f64 = 5.0;
+const TWIN_CORR_MIN: f64 = 0.6;
+const TWIN_CLEAR: f64 = 1.1;
 const LOG_BACK: u32 = 5;
 /// Measured stretches further apart than this (s) do not follow each
 /// other: what a line lost at the end of the first may have under-read is
 /// charged, since the next cannot show it.
 pub const DEAD_GAP_S: f64 = 0.010;
+
+/// Each speaker's left/right twin: the speaker whose name has Left and
+/// Right swapped.
+fn twins(cfg: &Config) -> Vec<Option<usize>> {
+    let names: Vec<&str> = cfg.speakers.iter().map(|s| s.name.as_str()).collect();
+    names
+        .iter()
+        .map(|n| {
+            let other = if n.contains("Left") { n.replace("Left", "Right") } else if n.contains("Right") { n.replace("Right", "Left") } else { return None };
+            names.iter().position(|m| *m == other)
+        })
+        .collect()
+}
 
 /// Block `len` frames long at `step` seconds a frame.
 pub fn dead_block(len_s: f64, step: f64) -> usize {
@@ -1151,6 +1175,12 @@ pub struct Engine {
     /// lost state has held since the log last changed.
     lf: Vec<(f64, f64, f64)>,
     pub low: Vec<bool>,
+    /// Per speaker: its left/right twin, the decaying sums of v*i, v^2,
+    /// seconds and v times the twin's v over its periods with a reading
+    /// line, and whether it reads low against the twin.
+    twin: Vec<Option<usize>>,
+    tw: Vec<(f64, f64, f64, f64)>,
+    pub low_twin: Vec<bool>,
     /// Per speaker: seconds of judged program the power-factor condition
     /// has held, the low-band bound has been exceeded, and the low-band
     /// test has had nothing to judge.
@@ -1183,7 +1213,7 @@ impl Engine {
             return None;
         }
         let n = cfg.speakers.len();
-        Some(Engine { cfg: cfg.clone(), asahi, unified, extractor: Extractor::new(n), last: vec![Feature::default(); n], lost: vec![false; n], lost_changed: Vec::new(), pending: vec![0.0; n], reading: vec![false; n], gap: f64::INFINITY, lf: vec![(0.0, 0.0, 0.0); n], low: vec![false; n], logged: vec![(false, 0); n], pf_held: vec![0.0; n], low_held: vec![0.0; n], low_idle: vec![0.0; n] })
+        Some(Engine { cfg: cfg.clone(), asahi, unified, extractor: Extractor::new(n), last: vec![Feature::default(); n], lost: vec![false; n], lost_changed: Vec::new(), pending: vec![0.0; n], reading: vec![false; n], gap: f64::INFINITY, lf: vec![(0.0, 0.0, 0.0); n], low: vec![false; n], logged: vec![(false, 0); n], pf_held: vec![0.0; n], low_held: vec![0.0; n], low_idle: vec![0.0; n], twin: twins(cfg), tw: vec![(0.0, 0.0, 0.0, 0.0); n], low_twin: vec![false; n] })
     }
 
     pub fn has(&self, gov: Governor) -> bool {
@@ -1364,6 +1394,30 @@ impl Engine {
                     }
                 }
                 lost |= self.low[sk];
+                // against its left/right twin, from the periods its line
+                // reads (the comparison's own verdict aside)
+                if let (true, Some(o)) = (g.twin_ratio > 0.0, self.twin[sk]) {
+                    let decay = (-span / TWIN_WINDOW_S).exp();
+                    let ov = &self.last[o];
+                    let take = !lost && f.v_ms >= TWIN_V2_MIN && ov.v_ms >= TWIN_V2_MIN;
+                    // the twins' voltages over the period, against each other
+                    let os = &self.cfg.speakers[o];
+                    let ovs = os.vs_scale / 2147483648.0;
+                    let x = if take { (0..frames).map(|q| words[q * ch + s.vs_chan] as f64 * vs * words[q * ch + os.vs_chan] as f64 * ovs).sum::<f64>() } else { 0.0 };
+                    let n = frames as f64;
+                    let t = &mut self.tw[sk];
+                    *t = (t.0 * decay + if take { vi_m * n } else { 0.0 }, t.1 * decay + if take { f.v_ms * n } else { 0.0 }, t.2 * decay + if take { span } else { 0.0 }, t.3 * decay + x);
+                    let (a, b) = (self.tw[sk], self.tw[o]);
+                    if a.2 >= TWIN_MIN_S && b.2 >= TWIN_MIN_S && b.0 > 0.0 && a.3 >= TWIN_CORR_MIN * (a.1 * b.1).sqrt() {
+                        let ratio = (a.0 / a.1) / (b.0 / b.1);
+                        if !(ratio >= g.twin_ratio) {
+                            self.low_twin[sk] = true;
+                        } else if ratio > TWIN_CLEAR * g.twin_ratio {
+                            self.low_twin[sk] = false;
+                        }
+                    }
+                    lost |= self.low_twin[sk];
+                }
             }
             for f in 0..frames {
                 let wv = words[f * ch + s.vs_chan] as f64;
@@ -2840,6 +2894,49 @@ mod tests {
         assert!(run(0.10, 4).iter().all(|&l| !l), "0.1 V at a right angle for four periods was lost");
         assert!(run(0.2, 36).iter().all(|&l| l), "0.2 V at a right angle for 3 s reads");
         assert!(run(1.0, 1).iter().all(|&l| l), "1 V at a right angle reads");
+    }
+
+    /// Review r4 DD1 of speakerguardd#8, what V and I alone cannot see: a
+    /// tweeter line reading half on a treble program (no low-band current
+    /// to judge it by).  Its effective admittance against its right twin's
+    /// gives it away within the window, the twin's own line stays read,
+    /// and nothing is compared with the comparison off, with the right side
+    /// silent (a source panned left), or with the twins playing different
+    /// programs.
+    #[test]
+    fn a_line_reading_low_against_its_twin_is_lost() {
+        let run = |ratio: f64, right_amp: f64, right_freq: f64| {
+            let mut c = cfg(J413);
+            c.globals.twin_ratio = ratio;
+            let (ch, p) = (c.globals.channels, c.globals.period);
+            let possible = vec![vec![(0.0, 0.0)]; c.speakers.len()];
+            let mut e = Engine::new(&c, true).unwrap();
+            e.govern(0.0, false);
+            let w16 = |x: f64, fs: f64| ((x / fs * 32767.0).round().clamp(-32768.0, 32767.0) as i32) << 16;
+            // 8 s of periods
+            for n in 0..95 {
+                let mut w = vec![0i32; p * ch];
+                for f in 0..p {
+                    let t = (n * p + f) as f64 / 48000.0;
+                    for s in &c.speakers {
+                        let left = s.name.contains("Left");
+                        let (amp, freq) = if left { (3.0, 3000.0) } else { (right_amp, right_freq) };
+                        let v = amp * (2.0 * std::f64::consts::PI * freq * t).sin();
+                        w[f * ch + s.vs_chan] = w16(v, s.vs_scale);
+                        w[f * ch + s.is_chan.unwrap()] = w16(if left { 0.5 } else { 1.0 } * v / (1.2 * s.z_min()), s.is_scale);
+                    }
+                }
+                e.check(&w, 48000.0).unwrap();
+                e.measured(&w, p, p, p, 0, 1.0 / 48000.0, 1.0, &possible);
+            }
+            let names: Vec<String> = c.speakers.iter().map(|s| s.name.clone()).collect();
+            names.into_iter().zip(e.lost.clone()).collect::<Vec<_>>()
+        };
+        let lost = run(0.8, 3.0, 3000.0);
+        assert!(lost.iter().all(|(n, l)| *l == n.contains("Left")), "the left side reading half: {lost:?}");
+        for (what, r) in [("off", run(0.0, 3.0, 3000.0)), ("panned left", run(0.8, 0.0, 3000.0)), ("different programs", run(0.8, 3.0, 4700.0))] {
+            assert!(r.iter().all(|(_, l)| !l), "{what}: {r:?}");
+        }
     }
 
     /// Review r4 DD2: a line flapping between lost and reading every

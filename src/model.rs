@@ -534,6 +534,7 @@ mod tests {
             horizon_s: 4.6,
             release_s: 20.0,
             t_ctrl_headroom: 0.0,
+            twin_ratio: 0.0,
             unified_caps: false,
             p_reduction_max: 0.0,
             max_reduction: 20.0,

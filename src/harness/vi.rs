@@ -127,7 +127,7 @@ pub enum ViFault {
     IDead { at: f64, len: f64 },
     /// ... reads `k` of the current plus `offset` amps (a line that reads
     /// low but plausibly, or a dead one carrying an offset: review r4 DD1).
-    ILow { at: f64, len: f64, k: f64, offset: f64 },
+    ILow { at: f64, len: f64, k: f64, offset: f64, mask: u32 },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -143,6 +143,8 @@ pub struct ViScenario {
     pub unified: bool,
     /// The unified governor writes the card under the asahi guard.
     pub guard: bool,
+    /// The configuration's twin_ratio (0: no twin comparison).
+    pub twin_ratio: f64,
     pub noise: i32,
     pub dc: i32,
     pub seed: u64,
@@ -253,6 +255,7 @@ impl ViScenario {
             faults,
             restarts,
             guard: false,
+            twin_ratio: 0.0,
         };
         // drawn after everything else, so every other field of a seed is
         // what it was before the guard
@@ -318,6 +321,7 @@ impl ViScenario {
             shadow: false,
             unified: false,
             guard,
+            twin_ratio: 0.0,
             noise: 3,
             dc: 3,
             seed: 700000001,
@@ -379,8 +383,8 @@ impl ViScenario {
         let restarts: Vec<String> = self.restarts.iter().map(|r| format!("Restart {{ at: {}, clean: {}, gap: {}, damage: Damage::{:?} }}", f(r.at), r.clean, f(r.gap), r.damage)).collect();
         let loads: Vec<String> = self.loads.iter().map(|l| format!("({}, {})", f(l.0), f(l.1))).collect();
         format!(
-            "ViScenario {{ j413: {}, rate: {}, amp_gain: {}, shadow: {}, unified: {}, guard: {}, noise: {}, dc: {}, seed: {}, loads: vec![{}], horizon: {}, tail: {}, events: {}, steps: {}, initial_db: {}, clean_start: {}, max_reduction: {}, latency: {}, streams: vec![{}], faults: vec![{}], restarts: vec![{}] }}",
-            self.j413, self.rate, self.amp_gain, self.shadow, self.unified, self.guard, self.noise, self.dc, self.seed, loads.join(", "), f(self.horizon), self.tail, self.events, self.steps,
+            "ViScenario {{ j413: {}, rate: {}, amp_gain: {}, shadow: {}, unified: {}, guard: {}, twin_ratio: {}, noise: {}, dc: {}, seed: {}, loads: vec![{}], horizon: {}, tail: {}, events: {}, steps: {}, initial_db: {}, clean_start: {}, max_reduction: {}, latency: {}, streams: vec![{}], faults: vec![{}], restarts: vec![{}] }}",
+            self.j413, self.rate, self.amp_gain, self.shadow, self.unified, self.guard, f(self.twin_ratio), self.noise, self.dc, self.seed, loads.join(", "), f(self.horizon), self.tail, self.events, self.steps,
             f(self.initial_db), self.clean_start, f(self.max_reduction), f(self.latency), streams.join(", "), faults.join(", "), restarts.join(", ")
         )
     }
@@ -407,6 +411,7 @@ pub fn vi_cfg(sc: &ViScenario) -> Config {
     let mut c = Config::parse(&text.replace("period = 4096", "period = 512")).unwrap();
     c.allow_unqualified = true;
     c.globals.shadow = sc.shadow;
+    c.globals.twin_ratio = sc.twin_ratio;
     if sc.guard {
         c.globals.governor = Governor::Unified;
         c.globals.guard = Some(Governor::Asahi);
@@ -709,7 +714,7 @@ impl<'a> ViWorld<'a> {
         }
         let low = if tau < self.calm_from {
             self.sc.faults.iter().find_map(|x| match x {
-                ViFault::ILow { at, len, k, offset } if tau >= *at && tau < at + len => Some((*k, *offset)),
+                ViFault::ILow { at, len, k, offset, mask } if tau >= *at && tau < at + len => Some((*k, *offset, *mask)),
                 _ => None,
             })
         } else {
@@ -731,7 +736,8 @@ impl<'a> ViWorld<'a> {
                 (((x / fs * 32768.0).round() as i64 + (noise + self.offsets[c]) as i64).clamp(-32768, 32767) as i32) << 16
             };
             f[s.vs_chan] = word(v, s.vs_scale, s.vs_chan);
-            f[ic] = word(if dead { 0.0 } else if let Some((k, o)) = low { k * i + o } else { i }, s.is_scale, ic);
+            let low = low.filter(|l| l.2 == 0 || l.2 & (1 << k) != 0);
+            f[ic] = word(if dead { 0.0 } else if let Some((kk, o, _)) = low { kk * i + o } else { i }, s.is_scale, ic);
         }
     }
 
@@ -1644,6 +1650,19 @@ mod tests {
         if !all {
             low.retain(|&((j413, freq, _, _), k, o, guard)| !j413 && guard && ((freq == 100.0 && k == 0.2) || (freq == 0.0 && o == 0.3)));
         }
+        // the left speakers reading low on programs with no low-band current,
+        // against their right twins (twin_ratio 0.8)
+        let mut twin: Vec<((bool, f64, bool, f64), f64, bool)> = Vec::new();
+        for guard in [true, false] {
+            for k in [0.2, 0.5, 0.7] {
+                twin.push(((false, 0.0, false, 0.35), k, guard));
+                twin.push(((false, 3000.0, true, 0.5), k, guard));
+                twin.push(((true, 0.0, false, 0.2), k, guard));
+            }
+        }
+        if !all {
+            twin.retain(|&((j413, freq, _, _), k, guard)| !j413 && freq == 3000.0 && k == 0.5 && guard);
+        }
         let threads = std::thread::available_parallelism().map_or(1, |p| p.get()).min(32);
         let lines = std::sync::Mutex::new(Vec::new());
         let failed = std::sync::Mutex::new(Vec::new());
@@ -1673,8 +1692,32 @@ mod tests {
                 s.spawn(move || {
                     for &((j413, freq, tweeters, level), k, offset, guard) in chunk {
                         let mut sc = ViScenario::long(j413, freq, tweeters, level, guard, false, secs);
-                        sc.faults.push(ViFault::ILow { at: 0.0, len: secs + 10.0, k, offset });
+                        sc.faults.push(ViFault::ILow { at: 0.0, len: secs + 10.0, k, offset, mask: 0 });
                         let what = format!("{} {} Hz{} at {level} {} reading {k} plus {offset} A", if j413 { "J413" } else { "J316" }, freq, if tweeters { " (tweeters)" } else { "" }, if guard { "guarded" } else { "asahi" });
+                        match run(&sc, 700000001) {
+                            Ok(o) => {
+                                lines.lock().unwrap().push(format!("{what}: VI truth {:.1} K under its limit, FF truth {:.1}", o.vi_to_limit, o.ff_to_limit));
+                                if !(o.vi_to_limit > 0.0) {
+                                    failed.lock().unwrap().push(format!("{what}: the measured-power truth reached its limit: {:.2} K under it", o.vi_to_limit));
+                                }
+                            }
+                            Err(v) => failed.lock().unwrap().push(format!("{what}: {}", v.0)),
+                        }
+                    }
+                });
+            }
+        });
+        std::thread::scope(|s| {
+            for chunk in twin.chunks(twin.len().div_ceil(threads).max(1)) {
+                let (lines, failed) = (&lines, &failed);
+                s.spawn(move || {
+                    for &((j413, freq, tweeters, level), k, guard) in chunk {
+                        let mut sc = ViScenario::long(j413, freq, tweeters, level, guard, false, secs);
+                        sc.twin_ratio = 0.8;
+                        let cfg = vi_cfg(&sc);
+                        let mask = cfg.speakers.iter().enumerate().filter(|(_, sp)| sp.name.contains("Left")).fold(0u32, |m, (i, _)| m | 1 << i);
+                        sc.faults.push(ViFault::ILow { at: 0.0, len: secs + 10.0, k, offset: 0.0, mask });
+                        let what = format!("{} {} Hz{} at {level} {} the left side reading {k}, twins compared", if j413 { "J413" } else { "J316" }, freq, if tweeters { " (tweeters)" } else { "" }, if guard { "guarded" } else { "asahi" });
                         match run(&sc, 700000001) {
                             Ok(o) => {
                                 lines.lock().unwrap().push(format!("{what}: VI truth {:.1} K under its limit, FF truth {:.1}", o.vi_to_limit, o.ff_to_limit));
@@ -1726,7 +1769,7 @@ mod tests {
                     for &((j413, freq, tw, level), (k, offset), guard) in chunk {
                         let mut v = ViScenario::long(j413, freq, tw, level, guard, false, secs);
                         if (k, offset) != (1.0, 0.0) {
-                            v.faults.push(ViFault::ILow { at: 0.0, len: secs + 10.0, k, offset });
+                            v.faults.push(ViFault::ILow { at: 0.0, len: secs + 10.0, k, offset, mask: 0 });
                         }
                         let what = format!("{} {} Hz{} {level} {} k {k} offset {offset}", if j413 { "J413" } else { "J316" }, freq, if tw { " tweeters" } else { "" }, if guard { "guarded" } else { "asahi" });
                         let line = match run(&v, 700000003) {
