@@ -5850,7 +5850,7 @@ mod persist_review {
     //! The review of 753f9ca (2026-10-26, REVIEW-persist-rtc.md): its
     //! witnesses, each asserting the behaviour that closes it.
     use super::fake::*;
-    use super::tests::{j700, missing_state};
+    use super::tests::{j700, missing_state, run_until};
     use super::*;
     use crate::persist::{self, Origin, Wall};
 
@@ -6127,6 +6127,9 @@ mod persist_review {
             let snap_rt = Duration::from_secs(1_800_000_000) + snap.saturating_sub(base);
             let text = std::fs::read_to_string(&keep).unwrap();
             let p = persist::decode(&text).unwrap();
+            // The exported age bracket must retain the injected second,
+            // even if a legacy upper envelope hides its thermal effect.
+            assert!(p.pairing >= Duration::from_secs(1));
             let restart = p.wall.realtime.unwrap() + Duration::from_secs(3);
             let saved = Saved { boottime: Duration::ZERO, covered: Duration::ZERO, ..p.state };
             let mut truth: Vec<_> = cfg.speakers.iter().map(|s| SpeakerState::new(s.clone(), 50.0)).collect();
@@ -6319,6 +6322,35 @@ mod persist_interval_review {
             assert!(g.speakers.iter().all(|s| s.hard && s.t_coil >= s.spec.t_limit));
             assert!(!keep.exists());
             assert!(hw.pings.is_empty());
+        }
+    }
+
+    #[test]
+    fn uncertain_warming_age_reaches_every_engine() {
+        for text in [include_str!("../conf/apple/j700.conf"), include_str!("../conf/apple/j316.conf")] {
+            let mut cfg = Config::parse(text).unwrap();
+            cfg.globals.boot_resume = BootResume::Idle;
+            cfg.globals.governor = Governor::Unified;
+            cfg.globals.shadow = true;
+            cfg.globals.safe_reduction = 20.0;
+            let text = fixture(&cfg, 50.0, 50.0, 7);
+            let p = persist::decode(&text).unwrap();
+            let saved = Saved { boottime: Duration::ZERO, covered: Duration::ZERO, ..p.state };
+            let (g, _, _) = boot(&cfg, &text, 4, Some("old"));
+            let mut at = Engine::new(&cfg, true).unwrap();
+            state::restore_engine(&mut at, &saved, Duration::from_millis(8300), &cfg.globals);
+            let bound = g.engine.as_ref().unwrap();
+            for (b, a) in bound.asahi.iter().flatten().zip(at.asahi.iter().flatten()) {
+                assert!(b.th.t_coil >= a.th.t_coil && b.th.t_magnet >= a.th.t_magnet);
+                assert!(b.coil_peak >= a.coil_peak && b.magnet_peak >= a.magnet_peak);
+            }
+            for (b, a) in bound.unified.iter().flatten().zip(at.unified.iter().flatten()) {
+                assert!(b.ff.t_coil >= a.ff.t_coil && b.ff.t_magnet >= a.ff.t_magnet);
+                assert!(b.peak >= a.peak);
+                if let (Some(b), Some(a)) = (&b.vi, &a.vi) {
+                    assert!(b.t_coil >= a.t_coil && b.t_magnet >= a.t_magnet);
+                }
+            }
         }
     }
 
