@@ -308,7 +308,8 @@ under `/run`) resumes it only if all of the following hold:
 The timestamp is read between two synchronization queries while a
 `TFD_TIMER_CANCEL_ON_SET` timer watches for a clock step. An unsynchronized
 query, a step, a pending leap transition or a failed watch rejects the
-sample. Restore also rejects a wall-clock read taking more than 50 ms.
+sample. The guarded sample must finish within 50 ms of boot time, on both
+save and restore. Restore also bounds the whole wall-clock read to 50 ms.
 The shutdown record keeps the whole delay from the model snapshot through
 the clock reads. These bounds give an interval of possible snapshot ages.
 The restored coil, magnet and governing peaks bound that entire interval,
