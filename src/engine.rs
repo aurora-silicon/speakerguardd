@@ -109,7 +109,8 @@ const NOTHING_DB: f64 = 120.0;
 /// A current line reads far too little for its voltage (review r4 BB1 of
 /// speakerguardd#8) when, over a 10 ms block, |V|/|I| (rms) is over
 /// DEAD_RATIO times the speaker's nominal impedance, or over a 1 ms block
-/// DEAD_RATIO_SHORT times it.  A live line stays under both: through a load
+/// DEAD_RATIO_SHORT times it in two short blocks in a row.  A live line
+/// stays under both: through a load
 /// of up to 60 degrees, a sine of 20 Hz or more reads at most 2.4 times
 /// its impedance over 10 ms and 23.7 times over 1 ms, and a laptop
 /// driver's impedance peaks at a few times its nominal (the J616s's left
@@ -126,6 +127,34 @@ pub const DEAD_BLOCK_MIN: usize = 8;
 /// the most current there can be heats next to nothing (3.7 mW into 2.7
 /// ohm), and the current is too close to the sense noise to judge.
 pub const DEAD_V_MIN: f64 = 0.1;
+/// A line that reads low but plausibly (review r4 DD1 of speakerguardd#8):
+/// its low-band resistance, sum(v i) / sum(i^2) over the last LOW_WINDOW_S
+/// of program with at least RTH_I_MIN rms of low-band current, puts the
+/// coil above anything a live line can.  A live coil's is its DC
+/// resistance, which rises with its temperature (a_t_20c, copper's 0.39 %/K
+/// where the file has none): LOW_R_RATIO times z_min at 20 C, scaled to the
+/// measured-power model's coil (no cooler than the truth while the line
+/// reads, and cooler still when it reads low).  On the J616s's woofers at
+/// full volume it is 1.28 to 1.49 times z_min against a bound of 1.6 to
+/// 1.8; a line reading half doubles it.  Under LOW_R_CLEAR of the bound
+/// the line reads again.
+pub const LOW_R_RATIO: f64 = 1.35;
+pub const LOW_R_CLEAR: f64 = 0.9;
+pub const LOW_WINDOW_S: f64 = 3.0;
+const COPPER_ALPHA: f64 = 0.0039;
+/// ... and a line whose current does not follow its voltage at all (a
+/// dead line carrying a DC offset: the rms ratio stays plausible while
+/// V*I averages to nothing): over a stretch with at least DEAD_V_MIN and
+/// PF_I_MIN rms, sum(v i) / sqrt(sum(v^2) sum(i^2)) under PF_MIN.  A live
+/// load of up to 60 degrees keeps it at 0.4 or more on any program whose
+/// impedance spans up to 4 to 1.
+pub const PF_MIN: f64 = 0.2;
+pub const PF_I_MIN: f64 = 0.02;
+/// A lost line is logged once it has held for LOG_LOST stretches, and as
+/// reading again once that has held for LOG_BACK (review r4 DD2); the
+/// bound itself follows the line at once.
+const LOG_LOST: u32 = 2;
+const LOG_BACK: u32 = 5;
 /// Measured stretches further apart than this (s) do not follow each
 /// other: what a line lost at the end of the first may have under-read is
 /// charged, since the next cannot show it.
@@ -147,17 +176,22 @@ pub fn line_lost(v: &[f64], i: &[f64], z_nominal: f64, step: f64) -> (bool, bool
         let block = dead_block(len, step);
         let limit = (ratio * z_nominal).powi(2);
         let mut f0 = 0;
+        // a short block counts only after another: a dead line stays dead,
+        // a reactive load's current zero does not (review r4 DD2)
+        let mut run = 0;
         while f0 + block <= n {
             let (mut v_ms, mut i_ms) = (0.0, 0.0);
             for f in f0..f0 + block {
                 v_ms += v[f] * v[f];
                 i_ms += i[f] * i[f];
             }
+            let low = v_ms >= DEAD_V_MIN * DEAD_V_MIN * block as f64 && !(i_ms * limit >= v_ms);
             if v_ms >= DEAD_V_MIN * DEAD_V_MIN * block as f64 {
                 judged |= long;
-                if !(i_ms * limit >= v_ms) {
-                    lost = true;
-                }
+            }
+            run = if low { run + 1 } else { 0 };
+            if run >= if long { 1 } else { 2 } {
+                lost = true;
             }
             f0 += block;
         }
@@ -389,6 +423,8 @@ pub struct Feature {
     pub i_ms: Option<f64>,
     /// Low-band resistance estimate (Ω), when the band had enough current.
     pub r_lf: Option<f64>,
+    /// The low band's sums of v*i and i^2 and the frames they cover.
+    pub lf: (f64, f64, usize),
 }
 
 /// A second-order low-pass (RBJ biquad) for the resistance thermometer.
@@ -484,6 +520,7 @@ impl Extractor {
             if s.is_chan.is_some() {
                 f.vi = Some(vi / n);
                 f.i_ms = Some(i2 / n);
+                f.lf = (lvi, li2, frames);
                 if (li2 / n).sqrt() >= RTH_I_MIN {
                     let r = lvi / li2;
                     if r.is_finite() && r > 0.5 * s.r_ff && r < 3.0 * s.r_ff {
@@ -587,7 +624,7 @@ impl AsahiSpeaker {
             hard: false,
             t_limit: s.t_limit,
             ceiling: work,
-            z_min: s.z_nominal.min(s.r_ff),
+            z_min: s.z_min(),
             v_worst: v_worst(s, g),
         }
     }
@@ -803,7 +840,7 @@ impl UnifiedSpeaker {
             t_limit: s.t_limit,
             ceiling: s.t_limit - s.t_headroom,
             r_ff: s.r_ff,
-            z_min: s.z_nominal.min(s.r_ff),
+            z_min: s.z_min(),
             v_worst: v_worst(s, g),
         }
     }
@@ -1094,6 +1131,12 @@ pub struct Engine {
     /// showed the line reading (review r4 BB1).
     pending: Vec<f64>,
     reading: Vec<bool>,
+    /// Per speaker: the low band's decaying sums of v*i, i^2 and frames,
+    /// whether the line reads low by them (DD1), and the stretches the
+    /// lost state has held since the log last changed.
+    lf: Vec<(f64, f64, f64)>,
+    pub low: Vec<bool>,
+    logged: Vec<(bool, u32)>,
     /// Seconds accounted since the last measured stretch, or none since an
     /// idle span (the next stretch does not follow it).
     gap: f64,
@@ -1119,7 +1162,7 @@ impl Engine {
             return None;
         }
         let n = cfg.speakers.len();
-        Some(Engine { cfg: cfg.clone(), asahi, unified, extractor: Extractor::new(n), last: vec![Feature::default(); n], lost: vec![false; n], lost_changed: Vec::new(), pending: vec![0.0; n], reading: vec![false; n], gap: f64::INFINITY })
+        Some(Engine { cfg: cfg.clone(), asahi, unified, extractor: Extractor::new(n), last: vec![Feature::default(); n], lost: vec![false; n], lost_changed: Vec::new(), pending: vec![0.0; n], reading: vec![false; n], gap: f64::INFINITY, lf: vec![(0.0, 0.0, 0.0); n], low: vec![false; n], logged: vec![(false, 0); n] })
     }
 
     pub fn has(&self, gov: Governor) -> bool {
@@ -1241,11 +1284,11 @@ impl Engine {
             // well enough to say what the program was
             let mut known = Vec::with_capacity(frames);
             let unified = self.unified.as_ref().map(|u| &u[sk]);
-            let i_max = v_worst(s, &g) / s.z_nominal.min(s.r_ff);
-            let z_min = s.z_nominal.min(s.r_ff);
+            let i_max = v_worst(s, &g) / s.z_min();
+            let z_min = s.z_min();
             // A current line that reads far too little for its voltage in
             // any block of the stretch is lost for all of it (review r4 BB1)
-            let (lost, judged) = match s.is_chan {
+            let (mut lost, judged) = match s.is_chan {
                 Some(ic) => {
                     let v: Vec<f64> = (0..frames).map(|f| words[f * ch + s.vs_chan] as f64 * vs).collect();
                     let i: Vec<f64> = (0..frames).map(|f| words[f * ch + ic] as f64 * is).collect();
@@ -1253,6 +1296,34 @@ impl Engine {
                 }
                 None => (false, false),
             };
+            if s.is_chan.is_some() {
+                // a line that reads low but plausibly, or not with its
+                // voltage at all (DD1), from the stretch's features
+                let f = &self.last[sk];
+                let (vi_m, i_ms) = (f.vi.unwrap_or(0.0), f.i_ms.unwrap_or(0.0));
+                if f.v_ms >= DEAD_V_MIN * DEAD_V_MIN && i_ms >= PF_I_MIN * PF_I_MIN && !(vi_m >= PF_MIN * (f.v_ms * i_ms).sqrt()) {
+                    lost = true;
+                }
+                let decay = (-span / LOW_WINDOW_S).exp();
+                let w = &mut self.lf[sk];
+                *w = (w.0 * decay + f.lf.0, w.1 * decay + f.lf.1, w.2 * decay + f.lf.2 as f64);
+                if w.2 > 0.0 && w.1 / w.2 >= RTH_I_MIN * RTH_I_MIN {
+                    let r = w.0 / w.1;
+                    let alpha = if s.a_t_20c > 0.0 { s.a_t_20c } else { COPPER_ALPHA };
+                    let t_coil = match (self.asahi.as_ref(), self.unified.as_ref().and_then(|u| u[sk].vi.as_ref())) {
+                        (Some(a), _) => a[sk].th.t_coil,
+                        (None, Some(v)) => v.t_coil,
+                        (None, None) => g.t_ambient,
+                    };
+                    let bound = LOW_R_RATIO * z_min * (1.0 + alpha * (t_coil - 20.0).max(0.0));
+                    if r > bound || !r.is_finite() {
+                        self.low[sk] = true;
+                    } else if r < LOW_R_CLEAR * bound {
+                        self.low[sk] = false;
+                    }
+                }
+                lost |= self.low[sk];
+            }
             for f in 0..frames {
                 let wv = words[f * ch + s.vs_chan] as f64;
                 let wi = s.is_chan.map_or(0.0, |ic| words[f * ch + ic] as f64);
@@ -1308,8 +1379,13 @@ impl Engine {
                 charge = e;
                 self.pending[sk] = if lost { 0.0 } else { deficit[frames.saturating_sub(long + frames % long)..].iter().sum() };
                 self.reading[sk] = reading;
-                if lost != self.lost[sk] {
+                let (shown, held) = self.logged[sk];
+                let held = if lost != shown { held + 1 } else { 0 };
+                if held >= if lost { LOG_LOST } else { LOG_BACK } {
                     self.lost_changed.push((sk, lost));
+                    self.logged[sk] = (lost, 0);
+                } else {
+                    self.logged[sk] = (shown, held);
                 }
                 self.lost[sk] = lost;
             }
@@ -2494,12 +2570,79 @@ mod tests {
         }
     }
 
+    /// Review r4 DD3 of speakerguardd#8, after its randomized edge-charge
+    /// test: a line that dies at any frame, for three short blocks or more,
+    /// with a gap or a close after any stretch, leaves the models no cooler
+    /// than ones fed the bound (a live line at z_min) once its stretches are
+    /// charged: the stretch after it, a gap, or the speakers closing.
+    #[test]
+    fn a_line_lost_anywhere_is_charged_by_the_next_stretch() {
+        let c = cfg(J413);
+        let (ch, p) = (c.globals.channels, c.globals.period);
+        let possible = vec![vec![(0.0, 0.0)]; c.speakers.len()];
+        let vw = v_worst(&c.speakers[0], &c.globals);
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut rnd = |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        for case in 0..600 {
+            let rate = [8000.0, 16000.0, 48000.0][rnd(3) as usize];
+            let freq = [0.0, 100.0, 1000.0, 3000.0][rnd(4) as usize];
+            let amp = vw * (0.3 + 0.7 * rnd(1000) as f64 / 1000.0);
+            let short = dead_block(DEAD_SHORT_S, 1.0 / rate) as u64;
+            // a quarter of them die in the last three short blocks of a
+            // stretch, where no block of it can show the line lost
+            let d0 = if rnd(4) == 0 { (1 + rnd(4)) * p as u64 - 1 - rnd(3 * short) } else { rnd(4 * p as u64) };
+            let len = 3 * short + 1 + rnd(2 * p as u64);
+            let gap = rnd(4);
+            let run = |bound: bool| {
+                let mut e = Engine::new(&c, true).unwrap();
+                e.govern(0.0, false);
+                for st in 0..4u64 {
+                    let mut w = vec![0i32; p * ch];
+                    for f in 0..p as u64 {
+                        let n = st * p as u64 + f;
+                        let t = n as f64 / rate;
+                        let v = if freq == 0.0 { if n % 2 == 0 { amp } else { -amp } } else { amp * (2.0 * std::f64::consts::PI * freq * t).sin() };
+                        let dead = n >= d0 && n < d0 + len;
+                        for s in &c.speakers {
+                            w[f as usize * ch + s.vs_chan] = ((v / s.vs_scale * 32767.0).round() as i32) << 16;
+                            // the bound's current stays under the sense's full scale
+                            let i = if !dead { v / 4.0 } else if bound { v / s.z_min() } else { 0.0 };
+                            w[f as usize * ch + s.is_chan.unwrap()] = ((i / s.is_scale * 32767.0).round().clamp(-32767.0, 32767.0) as i32) << 16;
+                        }
+                    }
+                    e.measured(&w, p, p, p, 0, 1.0 / rate, 1.0, &possible);
+                    if st == gap {
+                        e.worst(0.02, &vec![60.0; c.speakers.len()]);
+                    }
+                }
+                e.idle(0.5);
+                e
+            };
+            let (a, b) = (run(false), run(true));
+            for k in 0..c.speakers.len() {
+                let (m, r) = (&a.asahi.as_ref().unwrap()[k].th, &b.asahi.as_ref().unwrap()[k].th);
+                // the bound's current words round to S16, a part in 10^4
+                let tol = |r: f64| 1e-4 * (r - c.globals.t_ambient).abs() + 1e-6;
+                assert!(m.t_coil >= r.t_coil - tol(r.t_coil) && m.t_magnet >= r.t_magnet - tol(r.t_magnet), "case {case}: {} Hz at {rate} Hz, {amp:.1} V, dead from {d0} for {len}, gap after {gap}: {} asahi {} / {} C under the bound's {} / {} C", freq, c.speakers[k].name, m.t_coil, m.t_magnet, r.t_coil, r.t_magnet);
+                let (m, r) = (a.unified.as_ref().unwrap()[k].vi.as_ref().unwrap(), b.unified.as_ref().unwrap()[k].vi.as_ref().unwrap());
+                assert!(m.t_coil >= r.t_coil - tol(r.t_coil), "case {case}: {} unified vi {} under {}", c.speakers[k].name, m.t_coil, r.t_coil);
+            }
+        }
+    }
+
     /// A live line through a reactive load, a sine as low as 20 Hz, is
     /// never read as lost, however its blocks fall on the cycle; nor a
     /// quiet program on a line that carries only its noise.
     #[test]
     fn a_live_line_through_a_reactive_load_is_not_lost() {
-        let step = 1.0 / 48000.0;
+        // and at the 8 kHz sense rate, where single short blocks of a 20 Hz
+        // load at 60 degrees and 4 times nominal read as lost (review r4 DD2)
+        for step in [1.0 / 48000.0, 1.0 / 8000.0] {
         for freq in [20.0, 40.0, 100.0, 1000.0] {
             for phase in [-1.047, -0.5, 0.5, 1.047] {
                 for z in [1.0, 2.0, 4.0] {
@@ -2507,11 +2650,35 @@ mod tests {
                         let t0 = start as f64 / 16.0 / freq;
                         let v: Vec<f64> = (0..4096).map(|f| 10.0 * (2.0 * std::f64::consts::PI * freq * (t0 + f as f64 * step)).sin()).collect();
                         let i: Vec<f64> = (0..4096).map(|f| 10.0 / (4.0 * z) * (2.0 * std::f64::consts::PI * freq * (t0 + f as f64 * step) - phase).sin()).collect();
-                        assert!(!line_lost(&v, &i, 4.0, step).0, "{freq} Hz, {phase} rad, {z} x nominal, from {t0} s");
+                        assert!(!line_lost(&v, &i, 4.0, step).0, "{freq} Hz, {phase} rad, {z} x nominal, from {t0} s, {} Hz", 1.0 / step);
                     }
                 }
             }
         }
+        }
+        // the review's corner in sense words (review r4 DD2): 20 Hz at 60
+        // degrees and 4 times nominal, 8 kHz, S16 with up to 3 LSB of noise
+        // and a 3 LSB offset, from 0.15 to 12 V peak
+        let step = 1.0 / 8000.0;
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut noise = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x % 7) as f64 - 3.0
+        };
+        for amp in [0.15, 0.3, 1.0, 3.0, 12.0] {
+            for phase in [-1.047, 1.047] {
+                for start in 0..64 {
+                    let t0 = start as f64 / 64.0 / 20.0;
+                    let q = |x: f64, fs: f64, n: f64, o: f64| ((x / fs * 32768.0).round() + n + o).clamp(-32768.0, 32767.0) / 32768.0 * fs;
+                    let v: Vec<f64> = (0..512).map(|f| q(amp * (2.0 * std::f64::consts::PI * 20.0 * (t0 + f as f64 * step)).sin(), 14.0, 0.0, 0.0)).collect();
+                    let i: Vec<f64> = (0..512).map(|f| q(amp / 16.0 * (2.0 * std::f64::consts::PI * 20.0 * (t0 + f as f64 * step) - phase).sin(), 3.75, noise(), 3.0)).collect();
+                    assert!(!line_lost(&v, &i, 4.0, step).0, "{amp} V, {phase} rad, from {t0} s at 8 kHz");
+                }
+            }
+        }
+        let step = 1.0 / 48000.0;
         // 0.05 V rms on a line of 3 LSB of noise: too quiet to judge
         let v: Vec<f64> = (0..4096).map(|f| 0.07 * (f as f64 * 0.13).sin()).collect();
         let i: Vec<f64> = (0..4096).map(|f| if f % 2 == 0 { 3.0 } else { -3.0 } * 3.75 / 32768.0).collect();
@@ -2519,6 +2686,85 @@ mod tests {
         // a dead one under a program of a volt: lost
         let v: Vec<f64> = (0..4096).map(|f| 1.4 * (f as f64 * 0.13).sin()).collect();
         assert_eq!(line_lost(&v, &i, 4.0, step), (true, true));
+    }
+
+    /// Periods of a sine of `amp` volts at `freq` on every speaker of the
+    /// J316, the current reading `k` of a load of `z` times the speaker's
+    /// smallest impedance plus `offset` amps; through check() and measured()
+    /// as the guard runs them, the models at `t` C.
+    fn low_run(freq: f64, amp: f64, z: f64, k: f64, offset: f64, periods: usize, t: f64) -> Engine {
+        let c = cfg(J316);
+        let (ch, p) = (c.globals.channels, c.globals.period);
+        let possible = vec![vec![(0.0, 0.0)]; c.speakers.len()];
+        let mut e = Engine::new(&c, true).unwrap();
+        set_asahi(&mut e, t, t);
+        e.govern(0.0, false);
+        let w32 = |x: f64, fs: f64| ((x / fs * 32767.0).round().clamp(-32768.0, 32767.0) as i32) << 16;
+        for n in 0..periods {
+            let mut w = vec![0i32; p * ch];
+            for f in 0..p {
+                let x = 2.0 * std::f64::consts::PI * freq * (n * p + f) as f64 / 48000.0;
+                for s in &c.speakers {
+                    w[f * ch + s.vs_chan] = w32(amp * x.sin(), s.vs_scale);
+                    w[f * ch + s.is_chan.unwrap()] = w32(k * amp / (z * s.z_min()) * x.sin() + offset, s.is_scale);
+                }
+            }
+            e.check(&w, 48000.0).unwrap();
+            e.measured(&w, p, p, p, 0, 1.0 / 48000.0, 1.0, &possible);
+            set_asahi(&mut e, t, t);
+        }
+        e
+    }
+
+    /// Review r4 DD1 of speakerguardd#8: a line that reads low but
+    /// plausibly, or a dead one carrying a DC offset, is lost too.  A line
+    /// reading 0.4 of a load at 1.2 times z_min puts the low-band
+    /// resistance at 3 times z_min, over the bound a live coil can reach
+    /// even at its limit; within the window it is lost.  A dead line with
+    /// 0.2 A of offset reads a plausible rms against 3 V, but its current
+    /// does not follow the voltage.  A live line at 1.45 times z_min is a
+    /// hot coil (the J616s's woofers at full volume): lost with the model at
+    /// 20 C, not at 120 C.
+    #[test]
+    fn a_line_that_reads_low_or_off_its_voltage_is_lost() {
+        // 3 s of 60 Hz at 3 V, 85 ms a period
+        let low = low_run(60.0, 3.0, 1.2, 0.4, 0.0, 40, 50.0);
+        assert!(low.lost.iter().all(|&l| l), "a line reading 0.4: {:?}", low.lost);
+        let live = low_run(60.0, 3.0, 1.2, 1.0, 0.0, 40, 50.0);
+        assert!(live.lost.iter().all(|&l| !l), "a live line: {:?}", live.lost);
+        let offset = low_run(1000.0, 3.0, 1.2, 0.0, 0.2, 2, 50.0);
+        assert!(offset.lost.iter().all(|&l| l), "a dead line with an offset: {:?}", offset.lost);
+        let cold = low_run(60.0, 3.0, 1.45, 1.0, 0.0, 40, 20.0);
+        assert!(cold.lost.iter().all(|&l| l), "1.45 times z_min at 20 C: {:?}", cold.lost);
+        let hot = low_run(60.0, 3.0, 1.45, 1.0, 0.0, 40, 120.0);
+        assert!(hot.lost.iter().all(|&l| !l), "1.45 times z_min at 120 C: {:?}", hot.lost);
+    }
+
+    /// Review r4 DD2: a line flapping between lost and reading every
+    /// stretch is logged once, not every period; the bound follows it.
+    #[test]
+    fn a_line_at_the_threshold_is_logged_once() {
+        let c = cfg(J316);
+        let (ch, p) = (c.globals.channels, c.globals.period);
+        let possible = vec![vec![(0.0, 0.0)]; c.speakers.len()];
+        let mut e = Engine::new(&c, true).unwrap();
+        e.govern(0.0, false);
+        let mut changes = 0;
+        for n in 0..40 {
+            let dead = n % 2 == 0;
+            let mut w = vec![0i32; p * ch];
+            for f in 0..p {
+                let v = 3.0 * (2.0 * std::f64::consts::PI * 1000.0 * f as f64 / 48000.0).sin();
+                for s in &c.speakers {
+                    w[f * ch + s.vs_chan] = ((v / s.vs_scale * 32767.0).round() as i32) << 16;
+                    w[f * ch + s.is_chan.unwrap()] = if dead { 0 } else { ((v / 4.0 / s.is_scale * 32767.0).round() as i32) << 16 };
+                }
+            }
+            e.measured(&w, p, p, p, 0, 1.0 / 48000.0, 1.0, &possible);
+            assert!(e.lost.iter().all(|&l| l == dead), "the bound follows the line");
+            changes += std::mem::take(&mut e.lost_changed).len();
+        }
+        assert_eq!(changes, 0, "a line flapping every period was logged {changes} times");
     }
 
     /// Frames the card held at its safe level say nothing of the program:

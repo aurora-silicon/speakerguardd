@@ -96,7 +96,9 @@ pub fn fingerprint(cfg: &Config) -> u64 {
     if cfg.globals.guard.is_none() {
         globals = globals.replace(", guard: None", "");
     }
-    let text = format!("{globals}{:?}{:?}", cfg.controls, cfg.speakers);
+    // nor does a speaker without its own z_min
+    let speakers = format!("{:?}", cfg.speakers).replace(", z_min_override: None", "");
+    let text = format!("{globals}{:?}{speakers}", cfg.controls);
     text.bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3))
 }
 

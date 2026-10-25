@@ -1222,7 +1222,7 @@ impl Guard {
             for (k, lost) in std::mem::take(&mut e.lost_changed) {
                 let name = &self.speakers[k].spec.name;
                 if lost {
-                    warn!("{name}: the current sense reads far too little for the voltage; its measured power is bounded by V^2 over the speaker's smallest impedance until it reads again");
+                    warn!("{name}: the current sense reads too little for the voltage, or not with it; its measured power is bounded by V^2 over the speaker's smallest impedance until it reads again");
                 } else {
                     info!("{name}: the current sense reads again");
                 }

@@ -210,16 +210,32 @@ hysteresis.  It differs only toward protection:
   caught within a millisecond).  A live line through a reactive load
   stays well under both down to 20 Hz.  The measured-power models then
   take V^2 over the speaker's smallest impedance, the most current there
-  can be, until the line reads again, and the daemon logs both changes.
+  can be, until the line reads again, and the daemon logs both changes
+  (once a change has held for a few periods; the bound follows the line
+  at once).  The short block counts only when two in a row read lost.
   What a line lost too briefly for a block to show may have under-read
   at a period's end or start (the most current less what was read) is
   charged unless the next or last period shows the line reading, and at
   once when the speakers close or measurement stops.  Below the blocks'
   floor (0.1 V rms, or the line's own noise times the ratio) a dead line
   cannot be told from a quiet one, and it under-reads there at most that
-  voltage squared over the smallest impedance.  A line that reads low but
-  plausibly (the J616s's left woofer 1 reads half) is not caught; group
-  linking covers it there.
+  voltage squared over the smallest impedance.
+* A line that reads low but plausibly, or a dead one carrying a DC
+  offset, is lost the same way.  Over the last 3 s of program with at
+  least 20 mA rms below 120 Hz, the low band's resistance (sum(v i) over
+  sum(i^2)) above 1.35 times the smallest impedance, raised with the
+  measured-power model's coil temperature at the coil's temperature
+  coefficient, is more than a live coil can show.  On the J616s's woofers
+  at full volume it is 1.28 to 1.49 times; a line reading half doubles
+  it.  And over a period with at least 0.1 V and 20 mA rms, current that
+  does not follow the voltage (sum(v i) under 0.2 of sqrt(sum(v^2)
+  sum(i^2)); a live load of up to 60 degrees keeps it over 0.4) is no
+  reading.  What V and I cannot tell apart is a line reading a fraction
+  of its current on a program with no low-band current from a higher
+  impedance: the tweeters, and treble-only programs on the woofers.
+* `z_min` in a speaker's section sets its smallest impedance (a unit's
+  own DC resistance) when it is lower than the default, the smaller of
+  `z_nominal` and `r_ff`.
 
 At the J413 tweeter's sensitivity a full-scale charge heats its model by
 about 2 C per millisecond, so stream edges and sense hiccups cost much more

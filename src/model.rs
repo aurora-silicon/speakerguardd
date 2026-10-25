@@ -513,6 +513,7 @@ mod tests {
             vi_tr_magnet: 40.0,
             vi_tau_magnet: 200.0,
             a_t_20c: 0.0,
+            z_min_override: None,
         }
     }
 

@@ -125,6 +125,9 @@ pub enum ViFault {
     /// Every current word of the samples played in [at, at + len) reads
     /// only its noise and offset.
     IDead { at: f64, len: f64 },
+    /// ... reads `k` of the current plus `offset` amps (a line that reads
+    /// low but plausibly, or a dead one carrying an offset: review r4 DD1).
+    ILow { at: f64, len: f64, k: f64, offset: f64 },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -561,6 +564,11 @@ pub struct ViWorld<'a> {
     /// A period with a dead current line was delivered: the current-fed
     /// models cannot know their truth from then on.
     i_dead_seen: Cell<bool>,
+    /// A period with a line reading low (ILow) was delivered: the
+    /// current-fed models are not checked against their truth from then on
+    /// (its detection takes seconds of program); the long class checks the
+    /// outcome.
+    i_low_seen: Cell<bool>,
 }
 
 impl<'a> ViWorld<'a> {
@@ -571,7 +579,7 @@ impl<'a> ViWorld<'a> {
         // down to the speaker's smallest impedance: where that draws more
         // than the sense's full scale, the current word clips at its rail
         // and the speaker still gets the whole current (review Z2)
-        let z: Vec<f64> = cfg.speakers.iter().zip(&sc.loads).map(|(s, l)| s.z_nominal.min(s.r_ff) * l.0).collect();
+        let z: Vec<f64> = cfg.speakers.iter().zip(&sc.loads).map(|(s, l)| s.z_min() * l.0).collect();
         let mut x = sc.seed | 1;
         let offsets = (0..cfg.globals.channels)
             .map(|_| {
@@ -618,6 +626,7 @@ impl<'a> ViWorld<'a> {
             pending: None,
             unverified: vec![[false; 4]; n],
             i_dead_seen: Cell::new(false),
+            i_low_seen: Cell::new(false),
         }
     }
 
@@ -698,6 +707,17 @@ impl<'a> ViWorld<'a> {
         if dead {
             self.i_dead_seen.set(true);
         }
+        let low = if tau < self.calm_from {
+            self.sc.faults.iter().find_map(|x| match x {
+                ViFault::ILow { at, len, k, offset } if tau >= *at && tau < at + len => Some((*k, *offset)),
+                _ => None,
+            })
+        } else {
+            None
+        };
+        if low.is_some() {
+            self.i_low_seen.set(true);
+        }
         for (k, s) in self.cfg.speakers.iter().enumerate() {
             let ic = s.is_chan.unwrap();
             if bad {
@@ -711,7 +731,7 @@ impl<'a> ViWorld<'a> {
                 (((x / fs * 32768.0).round() as i64 + (noise + self.offsets[c]) as i64).clamp(-32768, 32767) as i32) << 16
             };
             f[s.vs_chan] = word(v, s.vs_scale, s.vs_chan);
-            f[ic] = word(if dead { 0.0 } else { i }, s.is_scale, ic);
+            f[ic] = word(if dead { 0.0 } else if let Some((k, o)) = low { k * i + o } else { i }, s.is_scale, ic);
         }
     }
 
@@ -1103,6 +1123,16 @@ pub struct Outcome {
     /// measured-power truth and less the feed-forward truth (K).
     pub vi_to_limit: f64,
     pub ff_to_limit: f64,
+    /// Times the lease was given up, and the playing time spent at the
+    /// card's safe level after the first lock (s).
+    pub handoffs: u32,
+    pub kernel_s: f64,
+    was_armed: bool,
+    last_t: f64,
+    /// The hottest asahi model coil (C) and the largest reduction the
+    /// card applied while the lease was held (dB).
+    pub asahi_peak: f64,
+    pub card_max: f64,
 }
 
 /// speakersafetyd's ramp on the oracle's true coil and magnet (dB), linked
@@ -1122,28 +1152,41 @@ fn need(cfg: &Config, o: &Oracle, k: usize, t: f64, rate: f64, slack: &[f64]) ->
     (0..cfg.speakers.len()).filter(|&j| cfg.speakers[j].group == group).map(own).fold(0.0, f64::max)
 }
 
-/// How much cooler than its truth a current-fed model may be once a dead
-/// current line was seen (K, coil and magnet alike), review r4 BB1 of
-/// speakerguardd#8.  The engine bounds a lost line's power by V^2 over the
-/// speaker's smallest impedance.  It can miss: steadily, whole long blocks
-/// under the floor where the line's noise passes for a reading; at each of
-/// a dead stretch's two ends, up to two short blocks at full power and two
-/// long blocks at the short blocks' floor (charged late, if at all); and
-/// inside a cycle of a sine, the lead a reactive load's power can take
-/// over V^2 over its impedance, at most 0.171 Vp^2 / (|Z| omega) joules.
-fn dead_slack(cfg: &Config, sc: &ViScenario, vpk: f64, k: usize) -> f64 {
+/// How much cooler than its truth a current-fed model may be at `t` once a
+/// dead current line was seen (K, coil and magnet alike), review r4 BB1
+/// and DD3 of speakerguardd#8.  The engine bounds a lost line's power by
+/// V^2 over the speaker's smallest impedance.  It can miss: steadily,
+/// whole long blocks under the floor where the line's noise passes for a
+/// reading; at each end of a dead stretch, until the engine has charged
+/// what it may have missed there (by the end of the next stretch, or at a
+/// gap), up to three short blocks at full power (two lost in a row are
+/// needed, DD2) and two long blocks at the short blocks' floor; and inside
+/// a cycle of a sine, the lead a reactive load's power can take over V^2
+/// over its impedance, at most 0.171 Vp^2 / (|Z| omega) joules.
+fn dead_slack(cfg: &Config, sc: &ViScenario, vpk: f64, k: usize, t: f64) -> f64 {
     let s = &cfg.speakers[k];
     let step = 1.0 / sc.rate as f64;
-    let z_min = s.z_nominal.min(s.r_ff);
+    let z_min = s.z_min();
     let i_noise = (sc.noise + sc.dc.abs()) as f64 / 32768.0 * s.is_scale;
     let floor = |ratio: f64| DEAD_V_MIN.max(ratio * s.z_nominal * i_noise).powi(2) / z_min;
     let (p_long, p_short, p_full) = (floor(DEAD_RATIO), floor(DEAD_RATIO_SHORT), vpk * vpk / z_min);
     let (short, long) = (dead_block(DEAD_SHORT_S, step) as f64, dead_block(DEAD_LONG_S, step) as f64);
-    let edges = 2.0 * 2.0 * step * (short * p_full + long * p_short);
+    let edge = step * (3.0 * short * p_full + 2.0 * long * p_short);
+    let (rc, rm) = (s.vi_tr_coil / s.vi_tau_coil, s.vi_tr_magnet / s.vi_tau_magnet);
+    let period = cfg.globals.period as f64 * step;
+    let mut edges = 0.0;
+    for f in &sc.faults {
+        if let ViFault::IDead { at, len } = *f {
+            for e in [at, at + len] {
+                if e <= t && t - e <= 3.0 * period {
+                    edges += edge * rc.max(rm);
+                }
+            }
+        }
+    }
     let f_min = sc.streams.iter().filter(|x| x.freq > 0.0).map(|x| x.freq).fold(f64::INFINITY, f64::min);
     let lead = if f_min.is_finite() { 0.171 * p_full / (2.0 * PI * f_min) } else { 0.0 };
-    let rate = (s.vi_tr_coil / s.vi_tau_coil).max(s.vi_tr_magnet / s.vi_tau_magnet);
-    p_long * (s.vi_tr_coil + s.vi_tr_magnet) + (edges + lead) * rate
+    p_long * (s.vi_tr_coil + s.vi_tr_magnet) + edges + lead * rc.max(rm)
 }
 
 fn check(cfg: &Config, w: &ViWorld, g: &Guard, sc: &ViScenario, out: &mut Outcome) -> Result<(), Violation> {
@@ -1154,9 +1197,10 @@ fn check(cfg: &Config, w: &ViWorld, g: &Guard, sc: &ViScenario, out: &mut Outcom
     let e = g.engine.as_ref().expect("a V/I machine runs the engine");
     let tol = 0.02;
     let dead = w.i_dead_seen.get();
+    let low = w.i_low_seen.get();
     let asahi_bound = g.governing == Governor::Asahi || g.guard() == Some(Governor::Asahi);
     // after a dead current line, what the current-fed models may lack
-    let slack: Vec<f64> = (0..cfg.speakers.len()).map(|k| if dead { dead_slack(cfg, sc, w.vpk, k) } else { 0.0 }).collect();
+    let slack: Vec<f64> = (0..cfg.speakers.len()).map(|k| if dead { dead_slack(cfg, sc, w.vpk, k, at) } else { 0.0 }).collect();
     for (k, s) in cfg.speakers.iter().enumerate() {
         let name = &s.name;
         let vi = w.oracle.at(k, VI, at, rate);
@@ -1169,7 +1213,7 @@ fn check(cfg: &Config, w: &ViWorld, g: &Guard, sc: &ViScenario, out: &mut Outcom
         // (a) every model never cooler than its truth
         let skip = w.unverified[k];
         let a = &e.asahi.as_ref().unwrap()[k];
-        if !skip[0] && (a.th.t_coil < vi.0 - tv || a.th.t_magnet < vi.1 - tv) {
+        if !skip[0] && !low && (a.th.t_coil < vi.0 - tv || a.th.t_magnet < vi.1 - tv) {
             return Err(Violation(format!("(a) at {now:.4} s, accounted {at:.4} s: {name} asahi {:.3}/{:.3} C, true {:.3}/{:.3} C", a.th.t_coil, a.th.t_magnet, vi.0, vi.1)));
         }
         let l = &g.speakers[k];
@@ -1181,7 +1225,7 @@ fn check(cfg: &Config, w: &ViWorld, g: &Guard, sc: &ViScenario, out: &mut Outcom
                 return Err(Violation(format!("(a) at {now:.4} s, accounted {at:.4} s: {name} unified ff {:.3}/{:.3} C, true {:.3}/{:.3} C", u.ff.t_coil, u.ff.t_magnet, ffr.0, ffr.1)));
             }
             if let Some(m) = &u.vi {
-                if !skip[3] && (m.t_coil < vi.0 - tv || m.t_magnet < vi.1 - tv) {
+                if !skip[3] && !low && (m.t_coil < vi.0 - tv || m.t_magnet < vi.1 - tv) {
                     return Err(Violation(format!("(a) at {now:.4} s, accounted {at:.4} s: {name} unified vi {:.3}/{:.3} C, true {:.3}/{:.3} C", m.t_coil, m.t_magnet, vi.0, vi.1)));
                 }
             }
@@ -1189,13 +1233,13 @@ fn check(cfg: &Config, w: &ViWorld, g: &Guard, sc: &ViScenario, out: &mut Outcom
         let _ = ta;
         // (b) while the lease is held
         if g.armed() && w.unlocked {
-            if vi.0.max(vi.1) >= s.t_limit + slack[k] {
+            if !low && vi.0.max(vi.1) >= s.t_limit + slack[k] {
                 return Err(Violation(format!("(b) at {now:.4} s: armed with {name} truly at {:.3}/{:.3} C", vi.0, vi.1)));
             }
             if g.governing == Governor::Unified && ffr.0.max(ffr.1) >= s.t_limit {
                 return Err(Violation(format!("(b) at {now:.4} s: armed with {name}'s feed-forward truth at {:.3}/{:.3} C", ffr.0, ffr.1)));
             }
-            if asahi_bound {
+            if asahi_bound && !low {
                 let need = need(cfg, &w.oracle, k, at, rate, &slack);
                 if need >= sc.max_reduction + 0.05 {
                     return Err(Violation(format!("(b) at {now:.4} s: armed while {name}'s true state needs {need:.3} dB, over --max-reduction")));
@@ -1227,6 +1271,17 @@ fn check(cfg: &Config, w: &ViWorld, g: &Guard, sc: &ViScenario, out: &mut Outcom
                 return Err(Violation(format!("(c) at {now:.4} s: the lease renewed at {:.4} s, {since:.3} s without a complete period while the speakers play", w.last_ping_at)));
             }
         }
+    }
+    let armed = g.armed() && w.unlocked;
+    out.handoffs += (out.was_armed && !armed) as u32;
+    if !armed && out.was_armed | (out.handoffs > 0) && sc.open_at(now).is_some() {
+        out.kernel_s += (now - out.last_t).max(0.0);
+    }
+    out.was_armed = armed;
+    out.last_t = now;
+    out.asahi_peak = e.asahi.as_ref().unwrap().iter().map(|a| a.coil_peak).fold(out.asahi_peak, f64::max);
+    if armed {
+        out.card_max = (0..cfg.speakers.len()).map(|k| w.effective(k)).fold(out.card_max, f64::max);
     }
     let hard = e.governed(g.governing).1;
     out.latched |= hard;
@@ -1572,6 +1627,23 @@ mod tests {
             // the review's hottest dead-line programs
             jobs.retain(|&(j413, freq, _, level, _, dead)| dead && matches!((j413, freq as u32, (level * 100.0) as u32), (false, 100, 35) | (false, 3000, 50) | (true, 0, 20)));
         }
+        // lines that read low on a program with low-band current, and dead
+        // lines carrying an offset (review r4 DD1): (program, k, offset)
+        let mut low: Vec<((bool, f64, bool, f64), f64, f64, bool)> = Vec::new();
+        for guard in [true, false] {
+            for k in [0.11, 0.2, 0.5] {
+                low.push(((false, 100.0, false, 0.35), k, 0.0, guard));
+                low.push(((true, 100.0, false, 0.35), k, 0.0, guard));
+            }
+            for o in [0.1, 0.3] {
+                low.push(((false, 0.0, false, 0.35), 0.0, o, guard));
+                low.push(((false, 3000.0, true, 0.5), 0.0, o, guard));
+                low.push(((true, 0.0, false, 0.2), 0.0, o, guard));
+            }
+        }
+        if !all {
+            low.retain(|&((j413, freq, _, _), k, o, guard)| !j413 && guard && ((freq == 100.0 && k == 0.2) || (freq == 0.0 && o == 0.3)));
+        }
         let threads = std::thread::available_parallelism().map_or(1, |p| p.get()).min(32);
         let lines = std::sync::Mutex::new(Vec::new());
         let failed = std::sync::Mutex::new(Vec::new());
@@ -1595,11 +1667,114 @@ mod tests {
                 });
             }
         });
+        std::thread::scope(|s| {
+            for chunk in low.chunks(low.len().div_ceil(threads).max(1)) {
+                let (lines, failed) = (&lines, &failed);
+                s.spawn(move || {
+                    for &((j413, freq, tweeters, level), k, offset, guard) in chunk {
+                        let mut sc = ViScenario::long(j413, freq, tweeters, level, guard, false, secs);
+                        sc.faults.push(ViFault::ILow { at: 0.0, len: secs + 10.0, k, offset });
+                        let what = format!("{} {} Hz{} at {level} {} reading {k} plus {offset} A", if j413 { "J413" } else { "J316" }, freq, if tweeters { " (tweeters)" } else { "" }, if guard { "guarded" } else { "asahi" });
+                        match run(&sc, 700000001) {
+                            Ok(o) => {
+                                lines.lock().unwrap().push(format!("{what}: VI truth {:.1} K under its limit, FF truth {:.1}", o.vi_to_limit, o.ff_to_limit));
+                                if !(o.vi_to_limit > 0.0) {
+                                    failed.lock().unwrap().push(format!("{what}: the measured-power truth reached its limit: {:.2} K under it", o.vi_to_limit));
+                                }
+                            }
+                            Err(v) => failed.lock().unwrap().push(format!("{what}: {}", v.0)),
+                        }
+                    }
+                });
+            }
+        });
         let mut v = lines.into_inner().unwrap();
         v.sort();
         eprintln!("VI LONG\n{}", v.join("\n"));
         let f = failed.into_inner().unwrap();
         assert!(f.is_empty(), "{}", f.join("\n"));
+    }
+
+    /// Review r4 DD1 of speakerguardd#8: lines that read low but plausibly,
+    /// or a dead line carrying a DC offset, over the review's 120 s programs
+    /// (SPEAKERGUARDD_VI_LOW_S sets the length).  Prints the hottest
+    /// measured-power truth per program, line and mode; the properties are
+    /// checked as for any case, with the current-fed models' (a) and (b)
+    /// left out once such a line is seen.  SPEAKERGUARDD_VI_PROBE runs it.
+    #[test]
+    fn vi_low_lines_probe() {
+        if std::env::var("SPEAKERGUARDD_VI_PROBE").is_err() {
+            return;
+        }
+        let secs: f64 = std::env::var("SPEAKERGUARDD_VI_LOW_S").ok().and_then(|v| v.parse().ok()).unwrap_or(120.0);
+        let programs = [(false, 0.0, false, 0.35), (false, 100.0, false, 0.35), (false, 3000.0, true, 0.5), (true, 0.0, false, 0.2), (true, 100.0, false, 0.35)];
+        let lines = [(0.0, 0.0), (0.11, 0.0), (0.2, 0.0), (0.5, 0.0), (0.7, 0.0), (1.0, 0.0), (0.0, 0.1), (0.0, 0.3)];
+        let mut jobs = Vec::new();
+        for &p in &programs {
+            for &l in &lines {
+                for guard in [true, false] {
+                    jobs.push((p, l, guard));
+                }
+            }
+        }
+        let threads = std::thread::available_parallelism().map_or(1, |p| p.get()).min(32);
+        let out = std::sync::Mutex::new(Vec::new());
+        std::thread::scope(|sc| {
+            for chunk in jobs.chunks(jobs.len().div_ceil(threads)) {
+                let out = &out;
+                sc.spawn(move || {
+                    for &((j413, freq, tw, level), (k, offset), guard) in chunk {
+                        let mut v = ViScenario::long(j413, freq, tw, level, guard, false, secs);
+                        if (k, offset) != (1.0, 0.0) {
+                            v.faults.push(ViFault::ILow { at: 0.0, len: secs + 10.0, k, offset });
+                        }
+                        let what = format!("{} {} Hz{} {level} {} k {k} offset {offset}", if j413 { "J413" } else { "J316" }, freq, if tw { " tweeters" } else { "" }, if guard { "guarded" } else { "asahi" });
+                        let line = match run(&v, 700000003) {
+                            Ok(o) => format!("{what}: VI truth {:.1} C, {:.1} K under the limit", o.hottest_true, o.vi_to_limit),
+                            Err(e) => format!("{what}: {}", e.0),
+                        };
+                        out.lock().unwrap().push(line);
+                    }
+                });
+            }
+        });
+        let mut v = out.into_inner().unwrap();
+        v.sort();
+        eprintln!("LOW\n{}", v.join("\n"));
+    }
+
+    /// Short streams a few seconds apart on the J413 (a J713 user's report
+    /// on speakerguardd#8): each stream's open and close are charged at
+    /// full scale for the time no frames measured, about 2 C a millisecond
+    /// on the tweeters' models.  Prints, per scenario, the hand-offs, the
+    /// playing time at the card's safe level, the hottest asahi coil and the
+    /// largest reduction while the lease was held.  SPEAKERGUARDD_VI_PROBE
+    /// runs it.
+    #[test]
+    fn vi_short_streams_probe() {
+        if std::env::var("SPEAKERGUARDD_VI_PROBE").is_err() {
+            return;
+        }
+        let mut lines = Vec::new();
+        for (j413, guard) in [(true, false), (true, true), (false, false), (false, true)] {
+            for (n, gap, len, level) in [(4, 8.0, 0.5, 0.3), (4, 8.0, 0.5, 0.05), (10, 3.0, 0.3, 0.3), (6, 1.0, 0.2, 0.1)] {
+                let mut sc = ViScenario::long(j413, 1000.0, false, level, guard, false, 1.0);
+                let spk = sc.loads.len();
+                sc.streams.clear();
+                let start = 1.0;
+                for i in 0..n {
+                    let open = start + i as f64 * gap;
+                    sc.streams.push(ViStream { open, close: open + len, depth: 0.0, chunk: 0.01, levels: vec![(open, level)], share: vec![1.0; spk], freq: 1000.0 });
+                }
+                sc.horizon = start + n as f64 * gap + 1.0;
+                let what = format!("{} {} {n} x {len} s every {gap} s at {level}", if j413 { "J413" } else { "J316" }, if guard { "guarded" } else { "asahi" });
+                match run(&sc, 700000002) {
+                    Ok(o) => lines.push(format!("{what}: hand-offs {}, {:.2} s at the safe level, asahi coil peak {:.1} C, card up to {:.1} dB", o.handoffs, o.kernel_s, o.asahi_peak, o.card_max)),
+                    Err(v) => lines.push(format!("{what}: {}", v.0)),
+                }
+            }
+        }
+        eprintln!("PROBE\n{}", lines.join("\n"));
     }
 
     /// The randomized interleavings on the V/I machines (see the module's

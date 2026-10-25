@@ -175,6 +175,11 @@ pub struct Speaker {
     pub vi_tau_magnet: f64,
     /// Coil resistance temperature coefficient at 20 °C (1/K), 0 if unknown.
     pub a_t_20c: f64,
+    /// The smallest impedance the speaker can present (Ω), when known
+    /// better than the default, the smaller of z_nominal and r_ff: a unit's
+    /// own DC resistance (review r4 addendum 4 of speakerguardd#8).  Never
+    /// above the default.
+    pub z_min_override: Option<f64>,
 }
 
 impl Speaker {
@@ -182,9 +187,8 @@ impl Speaker {
     /// DC resistance where it is known and lower than the nominal one, as
     /// the most real power a voltage can drive is V^2 over the coil's
     /// resistance.
-    #[cfg(test)]
     pub fn z_min(&self) -> f64 {
-        self.z_nominal.min(self.r_ff)
+        self.z_min_override.unwrap_or(self.z_nominal.min(self.r_ff))
     }
 }
 
@@ -392,6 +396,10 @@ impl Config {
                 vi_tr_magnet: 0.0,
                 vi_tau_magnet: 0.0,
                 a_t_20c: optional(values, section, "a_t_20c")?,
+                z_min_override: match values.get("z_min") {
+                    None => None,
+                    Some(_) => Some(num::<f64>(values, section, "z_min")?),
+                },
             };
             speaker.r_ff = or(values, section, "r_ff", speaker.z_nominal)?;
             speaker.vi_tr_coil = or(values, section, "vi_tr_coil", speaker.tr_coil)?;
@@ -418,6 +426,11 @@ impl Config {
             ] {
                 if !value.is_finite() || !(value > 0.0) {
                     return Err(ConfigError(format!("[{section}] {key} must be positive")));
+                }
+            }
+            if let Some(z) = speaker.z_min_override {
+                if !(z.is_finite() && z > 0.0 && z <= speaker.z_nominal.min(speaker.r_ff)) {
+                    return Err(ConfigError(format!("[{section}] z_min must be positive and no more than z_nominal and r_ff")));
                 }
             }
             if !speaker.a_t_20c.is_finite() || speaker.a_t_20c < 0.0 {
@@ -557,6 +570,20 @@ mod tests {
 
     fn idx(c: &Config, name: &str) -> usize {
         c.speakers.iter().position(|s| s.name == name).unwrap()
+    }
+
+    /// A speaker's own smallest impedance (a unit's DC resistance, review
+    /// r4 addendum 4): taken when no larger than the default, refused above.
+    #[test]
+    fn z_min_can_only_be_lowered() {
+        let c = Config::parse(J413).unwrap();
+        assert!((c.speakers[idx(&c, "Left Tweeter")].z_min() - 3.72).abs() < 1e-9);
+        let text = J413.replacen("[Speaker/Left Tweeter]\n", "[Speaker/Left Tweeter]\nz_min = 3.55\n", 1);
+        let c = Config::parse(&text).unwrap();
+        assert!((c.speakers[idx(&c, "Left Tweeter")].z_min() - 3.55).abs() < 1e-9);
+        assert!((c.speakers[idx(&c, "Right Tweeter")].z_min() - 3.72).abs() < 1e-9);
+        let text = J413.replacen("[Speaker/Left Tweeter]\n", "[Speaker/Left Tweeter]\nz_min = 3.9\n", 1);
+        assert!(Config::parse(&text).is_err());
     }
 
     #[test]
