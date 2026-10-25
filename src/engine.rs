@@ -1633,6 +1633,85 @@ impl Engine {
         (per, hard)
     }
 
+    /// Bound an onset even when the last measured program was silence or
+    /// mute. `pending_s` includes the unobserved time and the old gain's
+    /// queue; during it either the old or the new gain may play. After
+    /// that, the new gain can play for a whole lease before the kernel
+    /// takes over. Check the safe-level tail too, including its interior
+    /// coil maximum. These are predictions on copies, never model charges.
+    pub fn onset_reductions(
+        &self,
+        gov: Governor,
+        pending: &[f64],
+        pending_s: f64,
+        lease_s: f64,
+    ) -> Vec<f64> {
+        let g = &self.cfg.globals;
+        let own: Vec<_> = self
+            .cfg
+            .speakers
+            .iter()
+            .enumerate()
+            .map(|(k, s)| {
+                let Some(a) = self.asahi.as_ref().and_then(|a| a.get(k)) else {
+                    return 0.0;
+                };
+                let mut models = vec![(&a.th, a.v_worst.powi(2) / a.z_min * ASAHI_MARGIN)];
+                if gov == Governor::Unified {
+                    if let Some(u) = self.unified.as_ref().and_then(|u| u.get(k)) {
+                        models.push((&u.ff, u.v_worst.powi(2) / u.r_ff));
+                    }
+                }
+                let target = s.t_limit - s.t_headroom;
+                let old = 10f64.powf(-pending[k].max(0.0) / 10.0);
+                let safe = 10f64.powf(-g.safe_reduction.max(0.0) / 10.0);
+                let fits = |gain: f64| {
+                    models.iter().all(|(th, full)| {
+                        let mut th = (*th).clone();
+                        let (c, m) = th.hold(full * old.max(gain), pending_s, g.t_ambient);
+                        if !(c < target && m < target) {
+                            return false;
+                        }
+                        let (c, m) = th.hold(full * gain, lease_s, g.t_ambient);
+                        if !(c < target && m < target) {
+                            return false;
+                        }
+                        let power = full * safe;
+                        let steady = g.t_ambient + power * (th.tr_coil + th.tr_magnet);
+                        // Infinity is only the extremum search's upper endpoint;
+                        // no infinite duration is integrated (equal taus included).
+                        let peak = hi(
+                            hi(th.t_coil, steady),
+                            th.coil_extremum(power, f64::INFINITY, g.t_ambient),
+                        );
+                        peak < target && th.t_magnet < target
+                    })
+                };
+                if fits(1.0) {
+                    return 0.0;
+                }
+                if !fits(0.0) {
+                    return NOTHING_DB;
+                }
+                let (mut lo, mut hi) = (0.0, 1.0);
+                for _ in 0..32 {
+                    let mid = (lo + hi) / 2.0;
+                    if fits(mid) {
+                        lo = mid;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                if lo > 0.0 {
+                    (-db(lo)).max(0.0)
+                } else {
+                    NOTHING_DB
+                }
+            })
+            .collect();
+        link(&self.cfg, &own)
+    }
+
     /// A model of `gov` latched at its hard limit (a governor this engine
     /// does not run counts as one).
     pub fn hard(&self, gov: Governor) -> bool {

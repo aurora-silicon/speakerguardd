@@ -41,6 +41,17 @@ use log::Level;
 const UNLOCK_MAGIC: i64 = 0xdec1be15u32 as i32 as i64;
 /// Volume control steps per dB (t8140-aop-audio: 0.5 dB steps).
 const STEPS_PER_DB: f64 = 2.0;
+
+/// Refuse a ceiling the control cannot apply. Clamping to its minimum
+/// would return less attenuation than requested while the guard accounts
+/// it as at least the request, which is unsafe for an onset bound.
+fn reduction_value(min: i64, max: i64, db: f64) -> std::io::Result<i64> {
+    let value = max as f64 - (db * STEPS_PER_DB - 1e-9).ceil();
+    if !db.is_finite() || db < 0.0 || min > max || value < min as f64 {
+        return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    Ok(value as i64)
+}
 /// The exit status of a configuration the daemon refuses to govern (an
 /// unqualified machine, a missing opt-in, an unreadable file), before the
 /// card is touched.  A restart cannot change it, and the unit does not
@@ -321,10 +332,7 @@ impl Card {
         // without the range nothing can be written (a failed write: the
         // loop leaves the card at its safe level)
         let max = self.volume_max.ok_or_else(|| std::io::Error::from_raw_os_error(libc::EAGAIN))?;
-        if !db.is_finite() {
-            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
-        }
-        Ok((max as f64 - (db * STEPS_PER_DB - 1e-9).ceil()).max(self.volume_min as f64) as i64)
+        reduction_value(self.volume_min, max, db)
     }
 
     /// The reduction a control value applies (dB).
@@ -659,6 +667,27 @@ mod tests {
             gain_db: 0.0,
             csv: None,
         }
+    }
+
+    #[test]
+    fn an_unreachable_reduction_is_refused_instead_of_clamped() {
+        for (min, max) in [(0, 200), (-100, 48), (7, 7)] {
+            let most = (max - min) as f64 / STEPS_PER_DB;
+            assert_eq!(reduction_value(min, max, 0.0).unwrap(), max);
+            assert_eq!(reduction_value(min, max, most).unwrap(), min);
+            assert!(reduction_value(min, max, most + 0.001).is_err());
+            for requested in [0.001, 0.24, 0.5, 3.01, 12.99, 25.001] {
+                if requested <= most {
+                    let value = reduction_value(min, max, requested).unwrap();
+                    let applied = (max - value) as f64 / STEPS_PER_DB;
+                    assert!(applied >= requested && applied < requested + 0.5);
+                }
+            }
+        }
+        for invalid in [f64::NAN, f64::INFINITY, -1.0, 1000.0] {
+            assert!(reduction_value(0, 200, invalid).is_err());
+        }
+        assert!(reduction_value(10, 0, 0.0).is_err());
     }
 
     /// Review X4 of speakerguardd#8: the unit conflicted with

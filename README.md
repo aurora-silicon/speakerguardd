@@ -414,6 +414,23 @@ gain the card is known to have applied.  A charge, which stands for time
 no frames measured, heats every model at the worst case but is not the
 program, and frames the card held at its safe level say nothing about it.
 
+V/I machines also keep a ceiling for a full-scale onset. A quiet period
+does not bound the next period. Before writing a gain, the guard projects
+full-scale power at the proposed gain and at any louder gain still in the
+queue, using the amplifier's maximum voltage and the smallest impedance.
+It covers the unobserved time, the half-second queue bound, a whole kernel
+lease and the allowed control delay. It checks both thermal nodes and the
+safe-level tail after handoff. Unified also checks its feed-forward model.
+The projection uses model copies, so it adds no energy to the account.
+
+This ceiling can reduce even a quiet program. It can need more attenuation
+than `--max-reduction`, which still applies to the governor's request and
+keeps its existing handoff and re-arm rules. The ceiling only adds
+attenuation to an otherwise permitted write. If the old queued audio
+already uses the available headroom, the guard gives up the lease. Mute
+does not erase those earlier gains. J700 has no V/I path and keeps its
+existing behavior. None of this qualifies a draft profile for hardware.
+
 On the V/I machines it governs under the asahi guard (`governor = unified`
 and `guard = asahi` in their files, or `--governor unified --guard asahi`).
 The guard needs V/I sense on every speaker:
