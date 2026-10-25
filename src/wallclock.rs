@@ -7,6 +7,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::time::Duration;
 
 trait Clock {
+    fn boottime(&mut self) -> Option<Duration>;
     fn watch(&mut self) -> bool;
     fn synced(&mut self) -> bool;
     fn realtime(&mut self) -> Option<Duration>;
@@ -14,15 +15,23 @@ trait Clock {
 }
 
 fn sample(clock: &mut impl Clock) -> Option<Duration> {
+    let start = clock.boottime()?;
     if !clock.watch() || !clock.synced() {
         return None;
     }
     let time = clock.realtime()?;
-    (clock.synced() && clock.unchanged()).then_some(time)
+    if !clock.synced() || !clock.unchanged() {
+        return None;
+    }
+    let end = clock.boottime()?;
+    (end.checked_sub(start)? <= crate::persist::READ_EPS).then_some(time)
 }
 
 struct LinuxClock(Option<OwnedFd>);
 impl Clock for LinuxClock {
+    fn boottime(&mut self) -> Option<Duration> {
+        read_clock(libc::CLOCK_BOOTTIME)
+    }
     fn watch(&mut self) -> bool {
         // SAFETY: creates a private descriptor; OwnedFd closes it on every path.
         let fd = unsafe {
@@ -61,14 +70,7 @@ impl Clock for LinuxClock {
         state == libc::TIME_OK && tx.status & (libc::STA_UNSYNC | libc::STA_CLOCKERR) == 0
     }
     fn realtime(&mut self) -> Option<Duration> {
-        let mut ts = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
-        // SAFETY: a valid writable timespec.
-        let ok = unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts) } == 0;
-        (ok && ts.tv_sec > 0 && (0..1_000_000_000).contains(&ts.tv_nsec))
-            .then(|| Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32))
+        read_clock(libc::CLOCK_REALTIME)
     }
     fn unchanged(&mut self) -> bool {
         let Some(fd) = &self.0 else { return false };
@@ -87,8 +89,19 @@ impl Clock for LinuxClock {
     }
 }
 
+fn read_clock(id: libc::clockid_t) -> Option<Duration> {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: a valid writable timespec.
+    let ok = unsafe { libc::clock_gettime(id, &mut ts) } == 0;
+    (ok && ts.tv_sec >= 0 && (0..1_000_000_000).contains(&ts.tv_nsec))
+        .then(|| Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32))
+}
+
 pub fn synchronized_realtime() -> Option<Duration> {
-    sample(&mut LinuxClock(None))
+    sample(&mut LinuxClock(None)).filter(|t| !t.is_zero())
 }
 
 #[cfg(test)]
@@ -100,8 +113,16 @@ mod tests {
         query: usize,
         changed: bool,
         watch_ok: bool,
+        read_delay: Duration,
     }
     impl Clock for Transition {
+        fn boottime(&mut self) -> Option<Duration> {
+            Some(if self.query == 0 {
+                Duration::ZERO
+            } else {
+                self.read_delay
+            })
+        }
         fn watch(&mut self) -> bool {
             self.watch_ok
         }
@@ -130,6 +151,7 @@ mod tests {
                     query: 0,
                     changed: false,
                     watch_ok: true,
+                    read_delay: Duration::ZERO,
                 };
                 assert_eq!(sample(&mut c), None, "step {step}, status {status:?}");
             }
@@ -140,10 +162,25 @@ mod tests {
             query: 0,
             changed: false,
             watch_ok: true,
+            read_delay: Duration::ZERO,
         };
         assert_eq!(sample(&mut c), Some(Duration::from_secs(1_800_000_000)));
         c.watch_ok = false;
         assert_eq!(sample(&mut c), None);
+    }
+    #[test]
+    fn synchronization_queries_cannot_span_an_unbounded_delay() {
+        for read_delay in [Duration::from_millis(51), Duration::from_secs(60)] {
+            let mut c = Transition {
+                step: 0,
+                status: [true, true],
+                query: 0,
+                changed: false,
+                watch_ok: true,
+                read_delay,
+            };
+            assert_eq!(sample(&mut c), None);
+        }
     }
     #[test]
     fn read_only_kernel_sample_does_not_change_the_clock() {
