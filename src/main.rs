@@ -241,12 +241,20 @@ impl Card {
             if let Some(gain) = &cfg.controls.amp_gain {
                 let id = ctl.find_one(&format!("{} {}", s.name, gain))?;
                 ctl.lock(&id)?;
-                let (_, max) = ctl.int_range(&id)?;
+                let (_, top) = ctl.int_range(&id)?;
+                // the profile's own index where it names one: a control
+                // that goes further would play louder than every worst
+                // case assumes; one that stops short plays quieter
+                let max = cfg.globals.amp_gain_index.map_or(top, |want| want.min(top));
                 ctl.write_int(&id, max)?;
                 if ctl.read_int(&id)? != max {
-                    return Err(format!("{} {gain}: did not take its maximum", s.name).into());
+                    return Err(format!("{} {gain}: did not take {max}", s.name).into());
                 }
-                info!("{}: {gain} at its maximum ({max}), {:.1} dBV assumed", s.name, cfg.globals.amp_gain_dbv);
+                if max < top {
+                    info!("{}: {gain} at {max} of {top} (the profile's amp_gain_index), {:.1} dBV assumed", s.name, cfg.globals.amp_gain_dbv);
+                } else {
+                    info!("{}: {gain} at its maximum ({max}), {:.1} dBV assumed", s.name, cfg.globals.amp_gain_dbv);
+                }
             }
         }
         let events = match ctl.subscribe() {

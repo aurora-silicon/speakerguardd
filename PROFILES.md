@@ -85,6 +85,7 @@ The header resolves the source labels to full public URLs.
 | `a_t_20c` | Resistance temperature coefficient at 20 degrees C, per K | Asahi; not a unit calibration |
 | `is_scale`, `vs_scale` | Amps and volts at full-scale I/V words | Asahi, 3.75 A and 14 V |
 | `amp_gain_dbv` | RMS output voltage in dBV for a full-scale sine | Public cap and 11 + 0.5 * index relation; later boards use the largest sibling cap |
+| `amp_gain_index` | The amp gain control value `amp_gain_dbv` stands for | The same index; the daemon writes it (or the control's maximum, if lower) instead of a higher maximum the card may offer |
 | `safe_reduction` | Kernel fallback below unlocked volume, dB | Public TI path and existing J316, 99.5 dB; unknown boards use J700's more pessimistic 20 dB |
 | `max_reduction`, `t_reduction_max` | Kernel handoff threshold and thermal ramp range, dB | Existing J316, 7 and 20 dB |
 | `horizon_s`, `release_s` | FF prediction and release time, seconds | Existing J316, 4.6 and 20 seconds |

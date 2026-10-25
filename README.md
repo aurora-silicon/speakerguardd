@@ -152,6 +152,13 @@ profile explicitly sets `qualified = false`; governing it requires
 The new profiles select `unified` with `guard = asahi`, keeping the
 measured-power guard alongside feed-forward protection.
 
+"In service" marks the three machines this daemon has governed since
+2026-10-25 (an M1 Pro J316s, an M2 J413 and an M4 Pro J616s), with the
+feed-forward model primary under the asahi guard, each change reviewed
+before it was installed.  They still say `qualified = false` until a
+formal qualification changes it, so governing them also takes
+`--allow-unqualified`.
+
 There are 35 profile families covering 53 board variants, including 31
 new drafts. The filename uses
 the family name, for example `apple/j714.conf` for J714s/c. Match the actual
@@ -167,9 +174,9 @@ The output count is the number of separately modelled amplifier outputs.
 | MacBook Pro 13-inch M1 | J293 | 4 | untested | [Asahi J293](https://github.com/AsahiLinux/speakersafetyd/blob/8c519e9594b6635d8a5e134d36dcb8ab5ea4a00f/conf/apple/j293.conf) |
 | MacBook Air 13-inch M1 | J313 | 2 | untested | [Asahi J313](https://github.com/AsahiLinux/speakersafetyd/blob/8c519e9594b6635d8a5e134d36dcb8ab5ea4a00f/conf/apple/j313.conf) |
 | MacBook Pro 14-inch M1 Pro/Max | J314s/c | 6 | untested | [Asahi J314](https://github.com/AsahiLinux/speakersafetyd/blob/8c519e9594b6635d8a5e134d36dcb8ab5ea4a00f/conf/apple/j314.conf) |
-| MacBook Pro 16-inch M1 Pro/Max | J316s/c | 6 | untested | [existing profile](conf/apple/j316.conf) |
+| MacBook Pro 16-inch M1 Pro/Max | J316s/c | 6 | in service, not yet qualified | [existing profile](conf/apple/j316.conf) |
 | Mac Studio M1 Max/Ultra | J375c/d | 1 | untested | [Asahi J375](https://github.com/AsahiLinux/speakersafetyd/blob/8c519e9594b6635d8a5e134d36dcb8ab5ea4a00f/conf/apple/j375.conf) |
-| MacBook Air 13-inch M2 | J413 | 4 | untested | [existing profile](conf/apple/j413.conf) |
+| MacBook Air 13-inch M2 | J413 | 4 | in service, not yet qualified | [existing profile](conf/apple/j413.conf) |
 | MacBook Pro 14-inch M2 Pro/Max | J414s/c | 6 | untested | [Asahi J414](https://github.com/AsahiLinux/speakersafetyd/blob/8c519e9594b6635d8a5e134d36dcb8ab5ea4a00f/conf/apple/j414.conf) |
 | MacBook Air 15-inch M2 | J415 | 6 | untested | [Asahi J415](https://github.com/AsahiLinux/speakersafetyd/blob/8c519e9594b6635d8a5e134d36dcb8ab5ea4a00f/conf/apple/j415.conf) |
 | MacBook Pro 16-inch M2 Pro/Max | J416s/c | 6 | untested | [Asahi J416](https://github.com/AsahiLinux/speakersafetyd/blob/8c519e9594b6635d8a5e134d36dcb8ab5ea4a00f/conf/apple/j416.conf) |
@@ -185,7 +192,7 @@ The output count is the number of separately modelled amplifier outputs.
 | MacBook Air 13-inch M3 | J613 | 4 | untested | [Asahi J613](https://github.com/AsahiLinux/speakersafetyd/blob/8c519e9594b6635d8a5e134d36dcb8ab5ea4a00f/conf/apple/j613.conf) |
 | MacBook Pro 14-inch M4 Pro/Max | J614s/c | 6 | untested | [Apple count](https://support.apple.com/en-us/121553), [Asahi J504](https://github.com/AsahiLinux/speakersafetyd/blob/8c519e9594b6635d8a5e134d36dcb8ab5ea4a00f/conf/apple/j504.conf) sibling assumptions |
 | MacBook Air 15-inch M3 | J615 | 6 | untested | [Asahi J615](https://github.com/AsahiLinux/speakersafetyd/blob/8c519e9594b6635d8a5e134d36dcb8ab5ea4a00f/conf/apple/j615.conf) |
-| MacBook Pro 16-inch M4 Pro/Max | J616s/c | 6 | untested | [existing profile](conf/apple/j616.conf) |
+| MacBook Pro 16-inch M4 Pro/Max | J616s/c | 6 | in service, not yet qualified | [existing profile](conf/apple/j616.conf) |
 | MacBook Neo A18 Pro | J700 | 2 | qualified | [existing profile](conf/apple/j700.conf), [Apple specs](https://www.apple.com/macbook-neo/specs/) |
 | MacBook Pro 14-inch M5 | J704 | 6 | untested | [Apple count](https://support.apple.com/en-us/125405), [Asahi J504](https://github.com/AsahiLinux/speakersafetyd/blob/8c519e9594b6635d8a5e134d36dcb8ab5ea4a00f/conf/apple/j504.conf) sibling assumptions |
 | MacBook Air 13-inch M4 | J713 | 4 | untested | [Apple count](https://support.apple.com/en-us/122209), [Asahi J413](https://github.com/AsahiLinux/speakersafetyd/blob/8c519e9594b6635d8a5e134d36dcb8ab5ea4a00f/conf/apple/j413.conf) sibling assumptions |
