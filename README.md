@@ -227,7 +227,7 @@ hysteresis.  It differs only toward protection:
   measured-power model's coil temperature at the coil's temperature
   coefficient, is more than a live coil can show.  On the J616s's woofers
   at full volume it is 1.28 to 1.49 times; a line reading half doubles
-  it.  And over a period with at least 0.1 V and 20 mA rms, current that
+  it.  And over a period with at least 0.3 V and 20 mA rms, current that
   does not follow the voltage (sum(v i) under 0.2 of sqrt(sum(v^2)
   sum(i^2)); a live load of up to 60 degrees keeps it over 0.4) is no
   reading.  What V and I cannot tell apart is a line reading a fraction

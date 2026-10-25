@@ -144,12 +144,16 @@ pub const LOW_WINDOW_S: f64 = 3.0;
 const COPPER_ALPHA: f64 = 0.0039;
 /// ... and a line whose current does not follow its voltage at all (a
 /// dead line carrying a DC offset: the rms ratio stays plausible while
-/// V*I averages to nothing): over a stretch with at least DEAD_V_MIN and
+/// V*I averages to nothing): over a stretch with at least PF_V_MIN and
 /// PF_I_MIN rms, sum(v i) / sqrt(sum(v^2) sum(i^2)) under PF_MIN.  A live
 /// load of up to 60 degrees keeps it at 0.4 or more on any program whose
-/// impedance spans up to 4 to 1.
+/// impedance spans up to 4 to 1.  Under PF_V_MIN it is not judged: the
+/// M2's right woofer read 0.1 V and 25 mA at a power factor near 0 in a
+/// quiet passage, and what an offset line under it can hide is at most
+/// 0.3^2 W over the smallest impedance (22 mW at 4 ohm).
 pub const PF_MIN: f64 = 0.2;
 pub const PF_I_MIN: f64 = 0.02;
+pub const PF_V_MIN: f64 = 0.3;
 /// A lost line is logged once it has held for LOG_LOST stretches, and as
 /// reading again once that has held for LOG_BACK (review r4 DD2); the
 /// bound itself follows the line at once.
@@ -1301,7 +1305,7 @@ impl Engine {
                 // voltage at all (DD1), from the stretch's features
                 let f = &self.last[sk];
                 let (vi_m, i_ms) = (f.vi.unwrap_or(0.0), f.i_ms.unwrap_or(0.0));
-                if f.v_ms >= DEAD_V_MIN * DEAD_V_MIN && i_ms >= PF_I_MIN * PF_I_MIN && !(vi_m >= PF_MIN * (f.v_ms * i_ms).sqrt()) {
+                if f.v_ms >= PF_V_MIN * PF_V_MIN && i_ms >= PF_I_MIN * PF_I_MIN && !(vi_m >= PF_MIN * (f.v_ms * i_ms).sqrt()) {
                     lost = true;
                 }
                 let decay = (-span / LOW_WINDOW_S).exp();
@@ -2738,6 +2742,38 @@ mod tests {
         assert!(cold.lost.iter().all(|&l| l), "1.45 times z_min at 20 C: {:?}", cold.lost);
         let hot = low_run(60.0, 3.0, 1.45, 1.0, 0.0, 40, 120.0);
         assert!(hot.lost.iter().all(|&l| !l), "1.45 times z_min at 120 C: {:?}", hot.lost);
+    }
+
+    /// The power-factor test's voltage gate: the M2's right woofer read
+    /// 0.10 V rms against 25 mA with the current near a right angle to the
+    /// voltage (a power factor of -0.015 to 0.014) for four periods of a
+    /// quiet passage, and was bounded and logged for it.  Under 0.3 V it is
+    /// not judged; the same current at 1 V is no reading.
+    #[test]
+    fn a_quiet_line_at_a_right_angle_is_not_judged() {
+        let run = |v_rms: f64| {
+            let c = cfg(J413);
+            let (ch, p) = (c.globals.channels, c.globals.period);
+            let possible = vec![vec![(0.0, 0.0)]; c.speakers.len()];
+            let mut e = Engine::new(&c, true).unwrap();
+            e.govern(0.0, false);
+            let w16 = |x: f64, fs: f64| ((x / fs * 32767.0).round().clamp(-32768.0, 32767.0) as i32) << 16;
+            for n in 0..4 {
+                let mut w = vec![0i32; p * ch];
+                for f in 0..p {
+                    let x = 2.0 * std::f64::consts::PI * 1000.0 * (n * p + f) as f64 / 48000.0;
+                    for s in &c.speakers {
+                        w[f * ch + s.vs_chan] = w16(v_rms * 2f64.sqrt() * x.sin(), s.vs_scale);
+                        w[f * ch + s.is_chan.unwrap()] = w16(0.0255 * 2f64.sqrt() * x.cos(), s.is_scale);
+                    }
+                }
+                e.check(&w, 48000.0).unwrap();
+                e.measured(&w, p, p, p, 0, 1.0 / 48000.0, 1.0, &possible);
+            }
+            e.lost.clone()
+        };
+        assert!(run(0.10).iter().all(|&l| !l), "0.1 V at a right angle was judged");
+        assert!(run(1.0).iter().all(|&l| l), "1 V at a right angle reads");
     }
 
     /// Review r4 DD2: a line flapping between lost and reading every
