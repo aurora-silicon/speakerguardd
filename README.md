@@ -243,6 +243,13 @@ hysteresis.  It differs only toward protection:
   it; from 0.3 V and 20 mA its power is bounded meanwhile.  What V and I cannot tell apart is a line reading a fraction
   of its current on a program with no low-band current from a higher
   impedance: the tweeters, and treble-only programs on the woofers.
+  With `twin_ratio` set (off by default), a speaker is also compared with
+  its left/right twin: over the last 10 s, with at least 5 s where both
+  carry 0.1 V rms and their voltages correlate at 0.6 or more (so a source
+  panned to one side cannot trip it), an effective admittance (sum(v i)
+  over sum(v^2)) under `twin_ratio` of the twin's reads low.  Twins on
+  today's recordings from the three V/I machines agreed within 0.95 to
+  1.04.
 * `z_min` in a speaker's section sets its smallest impedance (a unit's
   own DC resistance) when it is lower than the default, the smaller of
   `z_nominal` and `r_ff`.

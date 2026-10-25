@@ -105,6 +105,10 @@ pub struct Globals {
     /// Unified governor: the regulator holds the coil this far below the
     /// working limit (K).
     pub t_ctrl_headroom: f64,
+    /// A speaker whose effective admittance, sum(v i) / sum(v^2) over the
+    /// last 10 s, is under this share of its left/right twin's reads low
+    /// (review r4 DD1 of speakerguardd#8); 0 turns the comparison off.
+    pub twin_ratio: f64,
     /// Unified governor, macOS-style axis caps (off by default): the thermal
     /// reduction stops at t_reduction_max and the power-budget reduction at
     /// p_reduction_max (dB); past them the coil may run up to its hard
@@ -306,6 +310,7 @@ impl Config {
             horizon_s: or(g, "Globals", "horizon_s", 4.6)?,
             release_s: or(g, "Globals", "release_s", 20.0)?,
             t_ctrl_headroom: or(g, "Globals", "t_ctrl_headroom", 0.0)?,
+            twin_ratio: or(g, "Globals", "twin_ratio", 0.0)?,
             unified_caps: boolean(g, "Globals", "unified_caps", false)?,
             p_reduction_max: or(g, "Globals", "p_reduction_max", 0.0)?,
             max_reduction: or(g, "Globals", "max_reduction", 20.0)?,
@@ -325,10 +330,14 @@ impl Config {
             ("release_s", globals.release_s),
             ("t_ctrl_headroom", globals.t_ctrl_headroom),
             ("p_reduction_max", globals.p_reduction_max),
+            ("twin_ratio", globals.twin_ratio),
         ] {
             if !value.is_finite() || value < 0.0 {
                 return Err(ConfigError(format!("[Globals] {key} must be finite and nonnegative")));
             }
+        }
+        if globals.twin_ratio >= 1.0 {
+            return Err(ConfigError("[Globals] twin_ratio must be under 1".into()));
         }
         if !(globals.horizon_s > 0.0) || !(globals.release_s > 0.0) {
             return Err(ConfigError("[Globals] horizon_s and release_s must be positive".into()));
