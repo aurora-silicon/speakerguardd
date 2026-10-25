@@ -292,23 +292,20 @@ impl SpeakerState {
         v * v / self.spec.r_ff
     }
 
-    /// Start at the coil's limit with the hard fault latched, the magnet
-    /// where steady state would put it: nothing about the speaker's past is
-    /// known (no state of this daemon, an unreadable one).  The card stays
-    /// with the kernel until the model has cooled under the working ceiling.
-    pub fn assume_latched(&mut self, t_ambient: f64) {
+    /// Nothing about the speaker's past is known. Bound coil and magnet
+    /// independently, including queued full-scale audio and any time at
+    /// the kernel's safe level. A hot magnet need not have the steady-state
+    /// relationship to the coil. Keep the hard fault latched until cool.
+    pub fn assume_latched(&mut self, globals: &Globals) {
         let s = &self.spec;
-        // A run that kept the coil under its limit may have died with its
-        // gain on the samples still queued: they play out for up to the
-        // drain at full scale (the hottest it can then be).
-        let drain = self.worst_case_power(0.0) * s.tr_coil * (1.0 - (-DRAIN_S / s.tau_coil).exp());
-        self.t_coil = s.t_limit + drain;
-        self.t_magnet = t_ambient + (self.t_coil - t_ambient) * s.tr_magnet / (s.tr_magnet + s.tr_coil);
+        let full = self.worst_case_power(0.0);
+        let safe = self.worst_case_power(globals.safe_reduction);
+        let mut th = crate::engine::Thermal::new(s.tr_coil, s.tau_coil, s.tr_magnet, s.tau_magnet, s.t_limit);
+        (self.t_coil, self.t_magnet) = th.latched_start(s.t_limit, full, safe, globals.t_ambient);
         self.t_peak = self.t_coil;
         self.hard = true;
         // nor is the power before the gain: a minute of full scale for the
         // budgets (they ask for their most until the minute has passed)
-        let full = self.worst_case_power(0.0);
         self.history.clear();
         self.history.push_back((60.0, full));
         self.history_s = 60.0;

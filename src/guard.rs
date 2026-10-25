@@ -55,8 +55,8 @@
 //! frames, and the end of every stream from its last frames to the look
 //! that sees it closed; a sense outage is charged at full scale at the
 //! least gain since the last verified boundary until periods return, and a
-//! restart without a clean stop starts latched (about 4 s with the
-//! speakers at the card's safe level on the J700).
+//! restart without a clean stop starts from independent hot coil and
+//! magnet bounds, latched until the model cools.
 
 use std::error::Error;
 use std::io;
@@ -484,7 +484,7 @@ impl Guard {
         let mut speakers: Vec<SpeakerState> = cfg.speakers.iter().map(|s| SpeakerState::new(s.clone(), globals.t_ambient)).collect();
         let latched = |speakers: &mut Vec<SpeakerState>, engine: &mut Option<Engine>| {
             for s in speakers.iter_mut() {
-                s.assume_latched(globals.t_ambient);
+                s.assume_latched(&globals);
             }
             if let Some(e) = engine.as_mut() {
                 e.assume_latched();
@@ -2668,7 +2668,7 @@ pub(crate) mod tests {
         std::fs::write(&path, "garbage").unwrap();
         let mut hw3 = FakeHw::new(cfg.globals.channels, cfg.globals.period);
         let mut g3 = Guard::start(&mut hw3, &cfg, 20.0, Some(path.clone())).unwrap();
-        run_until(&mut g3, &mut hw3, secs(12.0)).unwrap();
+        run_until(&mut g3, &mut hw3, secs(60.0)).unwrap();
         // (hot: 12 dB, released by at most 0.5 dB per period before it arms)
         assert!(hw3.writes.first().map(|w| w.1).unwrap() >= cfg.globals.t_reduction_max - 2.0);
     }
@@ -2846,7 +2846,7 @@ pub(crate) mod tests {
         let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
         let mut g = Guard::start(&mut hw, &cfg, 20.0, Some(path)).unwrap();
         assert!(hw.pings.is_empty(), "unlocked at start");
-        run_until(&mut g, &mut hw, secs(12.0)).unwrap();
+        run_until(&mut g, &mut hw, secs(60.0)).unwrap();
         let first = hw.first_ping().expect("never armed");
         let second_period = secs(2.0 * cfg.globals.period as f64 / 48000.0);
         assert!(first + Duration::from_millis(1) >= second_period, "unlocked at {first:?}, before two complete periods");
@@ -2864,7 +2864,7 @@ pub(crate) mod tests {
         run_until(&mut g, &mut hw, secs(0.5)).unwrap();
         assert!(hw.pings.is_empty(), "unlocked a start that needs a hand-off");
         // it cools and takes the card once it may
-        run_until(&mut g, &mut hw, secs(30.0)).unwrap();
+        run_until(&mut g, &mut hw, secs(120.0)).unwrap();
         let first = hw.first_ping().expect("never armed");
         assert!(first > secs(0.5));
         assert!(hw.writes.iter().all(|w| w.1 < 10.0 - REARM_MARGIN_DB + 1e-9), "{:?}", hw.writes.first());
@@ -5573,3 +5573,7 @@ pub(crate) mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "hot_start_tests.rs"]
+mod hot_start_tests;

@@ -9,7 +9,8 @@
 //! lock was given up and drained, its model covering every moment up to the
 //! write, marked `released 1`.  A run that resumes it overwrites it before
 //! it can unlock.  The time since is charged at the card's safe level;
-//! anything else starts every speaker at its coil limit, latched.
+//! anything else starts every speaker from independent hot coil and magnet
+//! bounds, including the queued drain and the safe-level floor, latched.
 //!
 //! The engine's models (engine.rs) are saved in the same file, after the
 //! legacy speaker lines (`asahi ...`, `unified ...`): one atomic write and
@@ -255,7 +256,8 @@ pub fn decode(text: &str) -> Option<Saved> {
 /// since at the worst case the card's own safe level lets through (no
 /// daemon held the card), a full-scale signal before the gain.  Anything else - a v1 file, a state not written
 /// by a clean stop, one whose model did not cover up to its write, a
-/// speaker it does not name - starts at the coil's limit, latched.  True
+/// speaker it does not name - starts from independent hot coil and magnet
+/// bounds, latched. True
 /// if the state was resumed.
 pub fn restore(speakers: &mut [SpeakerState], saved: &Saved, now: Duration, globals: &Globals) -> bool {
     let proven = saved.proven();
@@ -264,7 +266,7 @@ pub fn restore(speakers: &mut [SpeakerState], saved: &Saved, now: Duration, glob
         let x = match saved.speakers.iter().find(|x| x.name == state_name(&s.spec.name)) {
             Some(x) if proven => x,
             _ => {
-                s.assume_latched(globals.t_ambient);
+                s.assume_latched(globals);
                 continue;
             }
         };
