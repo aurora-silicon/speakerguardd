@@ -89,6 +89,8 @@ use crate::guard::{Guard, Hw, BLIND_LIMIT, DRAIN, MUTE_DB, REARM_MARGIN_DB, REAR
 use crate::model::SpeakerState;
 use crate::state;
 
+mod recurrent;
+
 const J316: &str = include_str!("../../conf/apple/j316.conf");
 const J413: &str = include_str!("../../conf/apple/j413.conf");
 /// The longest quiet tail run (s); a tail its bound puts beyond this is
@@ -453,6 +455,8 @@ struct Oracle {
     n: u64,
     base: u64,
     hist: Vec<Vec<[f32; 6]>>,
+    /// Exact sample peaks, including unaccounted time and lost current lines.
+    vi_peaks: [f64; 6],
 }
 
 impl Oracle {
@@ -466,7 +470,7 @@ impl Oracle {
             })
             .collect();
         let k = cfg.speakers.len();
-        Oracle { ta: cfg.globals.t_ambient, nodes, now: vec![[(0.0, 0.0); 3]; k], n: 0, base: 0, hist: vec![Vec::new(); k] }
+        Oracle { ta: cfg.globals.t_ambient, nodes, now: vec![[(0.0, 0.0); 3]; k], n: 0, base: 0, hist: vec![Vec::new(); k], vi_peaks: [0.0; 6] }
     }
 
     /// One sample of `h` seconds; per speaker the true V*I, V^2/z_nominal
@@ -479,6 +483,8 @@ impl Oracle {
                 out[2 * j] = (self.now[k][j].0 + self.ta) as f32;
                 out[2 * j + 1] = (self.now[k][j].1 + self.ta) as f32;
             }
+            let vi = self.now[k][VI];
+            self.vi_peaks[k] = self.vi_peaks[k].max(self.ta + vi.0.max(vi.1));
             self.hist[k].push(out);
         }
         self.n += 1;
@@ -690,12 +696,14 @@ impl<'a> ViWorld<'a> {
             }
             self.gain_at(k, kappa)
         };
+        let level = recurrent::level(self.cfg.speakers[k].name.contains("Tweeter"), tau, level);
         let a = level * 10f64.powf(-gain / 20.0) * self.vpk;
-        if s.freq == 0.0 {
+        let freq = recurrent::frequency(tau, s.freq);
+        if freq == 0.0 {
             let v = if n % 2 == 0 { a } else { -a };
             (v, v / self.z[k])
         } else {
-            let x = 2.0 * PI * s.freq * tau;
+            let x = 2.0 * PI * freq * tau;
             (a * x.sin(), a / self.z[k] * (x - self.phi[k]).sin())
         }
     }
@@ -763,6 +771,7 @@ impl<'a> ViWorld<'a> {
                 p[j] = [v * i, v * v / s.z_nominal, v * v / s.r_ff];
             }
             self.oracle.step(h, &p);
+            recurrent::observe(self);
         }
     }
 
@@ -1117,6 +1126,8 @@ pub struct Outcome {
     pub tail_checked: bool,
     pub tail_skipped: bool,
     pub hottest_true: f64,
+    /// Per speaker, maximum true V/I temperature over every oracle sample.
+    pub true_vi_peaks: [f64; 6],
     pub guarded: bool,
     pub i_dead: bool,
     /// The least, over speakers and time, of the hard limit less the
@@ -1411,6 +1422,7 @@ pub fn run(sc: &ViScenario, seed: u64) -> Result<Outcome, Violation> {
         }
     })();
     let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    out.true_vi_peaks = w.oracle.vi_peaks;
     result.map(|()| out)
 }
 
@@ -1656,6 +1668,7 @@ mod tests {
                         let what = format!("{} {} Hz{} at {level} {} {}", if j413 { "J413" } else { "J316" }, freq, if tweeters { " (tweeters)" } else { "" }, if guard { "guarded" } else { "asahi" }, if dead { "dead" } else { "live" });
                         match run(&sc, 700000001) {
                             Ok(o) => {
+                                recurrent::assert_true_vi_limit(&sc, &o);
                                 lines.lock().unwrap().push(format!("{what}: VI truth {:.1} K under its limit, FF truth {:.1}", o.vi_to_limit, o.ff_to_limit));
                                 if !(o.vi_to_limit > 0.0) || (guard && !(o.ff_to_limit > 0.0)) {
                                     failed.lock().unwrap().push(format!("{what}: a truth reached its limit: VI {:.2} K, FF {:.2} K under it", o.vi_to_limit, o.ff_to_limit));
@@ -1677,6 +1690,7 @@ mod tests {
                         let what = format!("{} {} Hz{} at {level} {} reading {k} plus {offset} A", if j413 { "J413" } else { "J316" }, freq, if tweeters { " (tweeters)" } else { "" }, if guard { "guarded" } else { "asahi" });
                         match run(&sc, 700000001) {
                             Ok(o) => {
+                                recurrent::assert_true_vi_limit(&sc, &o);
                                 lines.lock().unwrap().push(format!("{what}: VI truth {:.1} K under its limit, FF truth {:.1}", o.vi_to_limit, o.ff_to_limit));
                                 if !(o.vi_to_limit > 0.0) {
                                     failed.lock().unwrap().push(format!("{what}: the measured-power truth reached its limit: {:.2} K under it", o.vi_to_limit));
