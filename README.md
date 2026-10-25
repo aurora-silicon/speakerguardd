@@ -166,8 +166,13 @@ use a drop-in that adds `Conflicts=speakersafetyd.service` together with
 `OnFailure=speakersafetyd.service`.  To go back, unmask speakersafetyd and
 reboot.  Keep speakersafetyd installed.
 
-On those machines the governor that writes the card is `asahi`, the
-behaviour Asahi Linux's speakersafetyd ships, reimplemented here from its
+On those machines the files' governor is `unified` under `guard = asahi`
+(below): the feed-forward model is primary, as in macOS, where the
+signal-driven model always runs and V/I sense checks it, and the asahi
+governor's measured-power model is a second, independent limit on every
+speaker.  This is what all three machines have run since 2026-10-25 under
+review r4.  `--governor asahi --guard none` gives the asahi governor alone,
+the behaviour Asahi Linux's speakersafetyd ships, reimplemented here from its
 description (credit to the Asahi Linux contributors; speakersafetyd is MIT
 through 2.0.2).  The measured power (V*I, integrated per sample) drives the
 two-node model with speakersafetyd's constants (`vi_*`, `z_nominal`).  The
@@ -271,9 +276,9 @@ gain the card is known to have applied.  A charge, which stands for time
 no frames measured, heats every model at the worst case but is not the
 program, and frames the card held at its safe level say nothing about it.
 
-On the V/I machines it governs under the asahi guard (`--governor unified
---guard asahi`, or `guard = asahi` in the configuration).  The guard
-needs V/I sense on every speaker:
+On the V/I machines it governs under the asahi guard (`governor = unified`
+and `guard = asahi` in their files, or `--governor unified --guard asahi`).
+The guard needs V/I sense on every speaker:
 
 * each speaker's control gets the larger of the two governors'
   reductions, group-linked, every period, and either one's hard latch

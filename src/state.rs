@@ -505,7 +505,7 @@ mod tests {
 
     /// An engine for `text` (asahi and unified) with every model at `tc`/`tm`.
     fn engine_at(text: &str, tc: f64, tm: f64) -> (Config, Vec<SpeakerState>, Engine) {
-        let cfg = Config::parse(text).unwrap();
+        let cfg = Config::parse(&Config::asahi_alone(text)).unwrap();
         let mut sp = fresh(&cfg);
         for s in sp.iter_mut() {
             s.resume(tc, tm, 0.0, 0.0);

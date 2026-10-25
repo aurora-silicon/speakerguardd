@@ -412,7 +412,12 @@ pub fn vi_cfg(sc: &ViScenario) -> Config {
         c.globals.guard = Some(Governor::Asahi);
     } else if sc.unified {
         c.globals.governor = Governor::Unified;
+        c.globals.guard = None;
         c.allow_unified = true;
+    } else {
+        // asahi alone (speakersafetyd's behaviour), whatever the file says
+        c.globals.governor = Governor::Asahi;
+        c.globals.guard = None;
     }
     c
 }

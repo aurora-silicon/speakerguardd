@@ -3655,7 +3655,7 @@ pub(crate) mod tests {
     /// The J413's configuration, allowed to govern for these offline tests
     /// (it is not qualified on the machine).
     pub fn j413() -> Config {
-        let mut c = Config::parse(J413).unwrap();
+        let mut c = Config::parse(&Config::asahi_alone(J413)).unwrap();
         c.allow_unqualified = true;
         c
     }
@@ -4141,7 +4141,7 @@ pub(crate) mod tests {
     /// on the J316 get their own group's reduction, the same on both sides.
     #[test]
     fn per_speaker_reductions_are_linked_by_group() {
-        let mut cfg = Config::parse(J316).unwrap();
+        let mut cfg = Config::parse(&Config::asahi_alone(J316)).unwrap();
         cfg.allow_unqualified = true;
         let path = vi_state(&cfg, 55.0, 52.0);
         let mut hw = FakeHw::per_speaker(&cfg);
@@ -4166,7 +4166,7 @@ pub(crate) mod tests {
     /// The J316 under the unified governor, with the asahi guard or (with
     /// the experimental flag) without it, at the given program level.
     fn unified_j316(guard: bool, level: f64) -> (Config, FakeHw) {
-        let mut cfg = Config::parse(J316).unwrap();
+        let mut cfg = Config::parse(&Config::asahi_alone(J316)).unwrap();
         cfg.allow_unqualified = true;
         cfg.globals.governor = Governor::Unified;
         if guard {
@@ -4315,7 +4315,7 @@ pub(crate) mod tests {
             }
             e.reductions(Governor::Unified)
         };
-        let cfg = Config::parse(J316).unwrap();
+        let cfg = Config::parse(&Config::asahi_alone(J316)).unwrap();
         // the amplifier's loudest sine: attacked at once
         let full = run(2f64.sqrt() * 10f64.powf(cfg.globals.amp_gain_dbv / 20.0));
         assert!(full.iter().all(|&r| r > 3.0), "a full-scale onset under the failed write: {full:?}");
@@ -5555,7 +5555,7 @@ pub(crate) mod tests {
     /// lock comes back once the ramp allows, sooner.
     #[test]
     fn vi_a_start_with_nothing_known_takes_the_lock_back_sooner() {
-        let mut j316 = Config::parse(include_str!("../conf/apple/j316.conf")).unwrap();
+        let mut j316 = Config::parse(&Config::asahi_alone(include_str!("../conf/apple/j316.conf"))).unwrap();
         j316.allow_unqualified = true;
         for (cfg, within) in [(j413(), 70.0), (j316, 95.0)] {
             let mut hw = FakeHw::per_speaker(&cfg);
