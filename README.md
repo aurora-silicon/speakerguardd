@@ -418,9 +418,12 @@ V/I machines also keep a ceiling for a full-scale onset. A quiet period
 does not bound the next period. Before writing a gain, the guard projects
 full-scale power at the proposed gain and at any louder gain still in the
 queue, using the amplifier's maximum voltage and the smallest impedance.
-It covers the unobserved time, the half-second queue bound, a whole kernel
-lease and the allowed control delay. It checks both thermal nodes and the
+It covers the unobserved time, the old lease and half-second queue bound,
+a possible renewed lease and the allowed control delay. It checks both
+thermal nodes and the
 safe-level tail after handoff. Unified also checks its feed-forward model.
+The prediction reserves the whole possible energy dose at once, so idle
+gaps in the kernel's playing-time lease cannot hide a later onset.
 The projection uses model copies, so it adds no energy to the account.
 
 This ceiling can reduce even a quiet program. It can need more attenuation

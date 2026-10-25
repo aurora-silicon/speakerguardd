@@ -1595,7 +1595,10 @@ impl Guard {
     fn bound_onset(&self, now: Instant, per: &mut [f64]) -> bool {
         let Some(e) = self.engine.as_ref().filter(|e| e.asahi.is_some()) else { return true };
         let pending = self.least_since(self.account_to);
-        let pending_s = now.saturating_duration_since(self.account_to).as_secs_f64() + QUEUE_BOUND.as_secs_f64();
+        // A target write can block while the old lease runs down. Keep
+        // that entire allowance and its queue at the old or new gain;
+        // a subsequent renewal can grant a fresh lease at the new gain.
+        let pending_s = now.saturating_duration_since(self.account_to).as_secs_f64() + QUEUE_BOUND.as_secs_f64() + KERNEL_LOCK_TIMEOUT.as_secs_f64();
         // A renewal can follow a blocking write only while the account is
         // this fresh. Reserve that delay as well as a full new lease.
         let lease_s = KERNEL_LOCK_TIMEOUT.as_secs_f64() + self.dt.unwrap_or(0.0) + BLIND_SLACK.as_secs_f64();

@@ -1634,11 +1634,12 @@ impl Engine {
     }
 
     /// Bound an onset even when the last measured program was silence or
-    /// mute. `pending_s` includes the unobserved time and the old gain's
-    /// queue; during it either the old or the new gain may play. After
-    /// that, the new gain can play for a whole lease before the kernel
-    /// takes over. Check the safe-level tail too, including its interior
-    /// coil maximum. These are predictions on copies, never model charges.
+    /// mute. `pending_s` includes the unobserved time, the old lease and
+    /// its queue; during it either the old or the new gain may play. The new
+    /// gain can then play for a whole lease before the kernel takes over.
+    /// The lease counts playing time, so reserve the entire energy dose
+    /// without relying on contiguous playback. Check the safe-level tail
+    /// too. These are predictions on copies, never model charges.
     pub fn onset_reductions(
         &self,
         gov: Governor,
@@ -1668,11 +1669,15 @@ impl Engine {
                 let fits = |gain: f64| {
                     models.iter().all(|(th, full)| {
                         let mut th = (*th).clone();
-                        let (c, m) = th.hold(full * old.max(gain), pending_s, g.t_ambient);
-                        if !(c < target && m < target) {
-                            return false;
-                        }
-                        let (c, m) = th.hold(full * gain, lease_s, g.t_ambient);
+                        // Idle can warm a coil below its magnet. This
+                        // envelope covers every idle delay before the dose,
+                        // including small below-ambient sense estimates.
+                        th.t_magnet = hi(th.t_magnet, g.t_ambient);
+                        th.t_coil = hi(th.t_coil, th.t_magnet);
+                        // Each joule adds at most impulse's node increments,
+                        // wherever it lands among the lease's idle gaps.
+                        let energy = full * (old.max(gain) * pending_s + gain * lease_s);
+                        let (c, m) = th.impulse(energy);
                         if !(c < target && m < target) {
                             return false;
                         }
@@ -3204,4 +3209,50 @@ mod tests {
         assert_eq!(r[idx(&c, "Left Woofer 1")], 6.0);
         assert_eq!(r[idx(&c, "Left Tweeter")], 4.0);
     }
+    /// The kernel lease counts playing time. A paused daemon can leave a
+    /// quiet card idle before an onset; the reserve must cover that later
+    /// onset too, including a coil initially below a warm magnet.
+    #[test]
+    fn the_onset_reserve_covers_idle_gaps_in_a_playing_time_lease() {
+        let c = cfg(include_str!("../conf/apple/j316.conf"));
+        for gov in [Governor::Asahi, Governor::Unified] {
+            let mut e = Engine::new(&c, true).unwrap();
+            for a in e.asahi.as_mut().unwrap() {
+                a.th.t_coil = 50.0;
+                a.th.t_magnet = 125.0;
+            }
+            for u in e.unified.as_mut().unwrap() {
+                u.ff.t_coil = 50.0;
+                u.ff.t_magnet = 125.0;
+            }
+            e.govern(0.0, false);
+            assert!(e.governed(gov).0.iter().all(|r| *r < c.globals.max_reduction));
+            let per = e.onset_reductions(gov, &vec![120.0; c.speakers.len()], 0.75, 0.435);
+            assert!(per.iter().all(|r| r.is_finite() && *r < 30.0));
+            for (k, s) in c.speakers.iter().enumerate() {
+                let a = &e.asahi.as_ref().unwrap()[k];
+                let mut models = vec![(a.th.clone(), v_worst(s, &c.globals).powi(2) / s.z_min() * ASAHI_MARGIN)];
+                if gov == Governor::Unified {
+                    models.push((e.unified.as_ref().unwrap()[k].ff.clone(), v_worst(s, &c.globals).powi(2) / s.r_ff));
+                }
+                for (th, full) in models {
+                    for delay in [0.0, 1.0, 10.0, 100.0] {
+                        for chunks in [1, 8] {
+                            let mut th = th.clone();
+                            let mut peak = th.hold(0.0, delay, c.globals.t_ambient).0;
+                            for _ in 0..chunks {
+                                let (coil, magnet) = th.hold(full * 10f64.powf(-per[k] / 10.0), 1.185 / chunks as f64, c.globals.t_ambient);
+                                peak = peak.max(coil).max(magnet);
+                                peak = peak.max(th.hold(0.0, 1.0, c.globals.t_ambient).0);
+                            }
+                            peak = peak.max(th.hold(full * 10f64.powf(-c.globals.safe_reduction / 10.0), 10000.0, c.globals.t_ambient).0);
+                            assert!(peak <= s.t_limit - s.t_headroom + 1e-6,
+                                "{gov:?} {} after {delay} s idle, {chunks} chunks: {peak} C", s.name);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
 }

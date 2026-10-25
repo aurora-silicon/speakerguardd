@@ -10,6 +10,7 @@ struct Tracked {
     hw: FakeHw,
     gains: Vec<(Duration, Vec<f64>)>,
     clean_start: bool,
+    full_onset: Option<Duration>,
 }
 impl Tracked {
     fn snap(&mut self) {
@@ -92,6 +93,15 @@ impl Hw for Tracked {
     fn read_period(&mut self, w: &mut [i32]) -> io::Result<Option<bool>> {
         self.snap();
         let result = self.hw.read_period(w);
+        if self.clean_start
+            && self.full_onset.is_none()
+            && matches!(&result, Ok(Some(true)))
+            && w.iter().any(|v| *v != 0)
+        {
+            // FakeHw chooses the level when it fills a completed period.
+            // Its first nonzero block therefore starts one period earlier.
+            self.full_onset = Some(self.hw.t.saturating_sub(self.hw.period));
+        }
         self.snap();
         result
     }
@@ -125,7 +135,13 @@ fn full_scale_run(mut cfg: Config, seconds: u64, clean_start: bool) -> (Config, 
     cfg.allow_unqualified = true;
     cfg.allow_unified = true;
     let mut hw = FakeHw::per_speaker(&cfg);
-    hw.level = Box::new(|_| 1.0);
+    hw.level = Box::new(move |t| {
+        if clean_start && t < Duration::from_secs(2) {
+            0.0
+        } else {
+            1.0
+        }
+    });
     // Preserve the review's static loads. Avoid a current rail in this
     // witness so the onset cannot be confused with current-rail handling.
     let specs = cfg.speakers.clone();
@@ -145,6 +161,7 @@ fn full_scale_run(mut cfg: Config, seconds: u64, clean_start: bool) -> (Config, 
         hw,
         gains: Vec::new(),
         clean_start,
+        full_onset: None,
     };
     let state = if clean_start {
         Some(tests::vi_state(
@@ -205,15 +222,31 @@ fn check_truth(cfg: &Config, hw: &Tracked, name: &str, must_rearm: bool) {
                 let mut peak = initial;
                 let (mut at, mut gain) = (Duration::ZERO, MUTE_DB);
                 for (to, next) in &hw.gains {
-                    peak = peak.max(
-                        truth
-                            .hold(
-                                v * v / if ff { s.r_ff } else { z } * 10f64.powf(-gain / 10.0),
-                                to.saturating_sub(at).as_secs_f64(),
-                                cfg.globals.t_ambient,
-                            )
-                            .0,
-                    );
+                    let onset = if hw.clean_start {
+                        hw.full_onset.unwrap()
+                    } else {
+                        Duration::ZERO
+                    };
+                    let quiet_to = (*to).min(onset);
+                    if quiet_to > at {
+                        peak = peak.max(
+                            truth
+                                .hold(0.0, (quiet_to - at).as_secs_f64(), cfg.globals.t_ambient)
+                                .0,
+                        );
+                    }
+                    let from = at.max(onset);
+                    if *to > from {
+                        peak = peak.max(
+                            truth
+                                .hold(
+                                    v * v / if ff { s.r_ff } else { z } * 10f64.powf(-gain / 10.0),
+                                    (*to - from).as_secs_f64(),
+                                    cfg.globals.t_ambient,
+                                )
+                                .0,
+                        );
+                    }
                     at = *to;
                     gain = next[k];
                 }
@@ -275,12 +308,40 @@ fn every_vi_profile_bounds_full_scale_after_mute() {
             continue;
         }
         let (cfg, hw) = full_scale_run(cfg, 60, true);
+        // A fallback whose worst-case steady state is above the working
+        // limit cannot support the ceiling's safe tail. All other files
+        // must actually unlock while quiet before the full-scale onset.
+        let safe = 10f64.powf(-cfg.globals.safe_reduction / 10.0);
+        let viable = cfg.speakers.iter().all(|s| {
+            let p = v_worst(s, &cfg.globals).powi(2) * safe;
+            let target = s.t_limit - s.t_headroom;
+            cfg.globals.t_ambient
+                + p / s.z_min() * crate::engine::ASAHI_MARGIN * (s.vi_tr_coil + s.vi_tr_magnet)
+                < target
+                && cfg.globals.t_ambient + p / s.r_ff * (s.tr_coil + s.tr_magnet) < target
+        });
         check_truth(
             &cfg,
             &hw,
             path.file_stem().unwrap().to_str().unwrap(),
-            false,
+            viable,
         );
+        if viable {
+            assert!(
+                hw.hw
+                    .pings
+                    .first()
+                    .is_some_and(|t| *t < hw.full_onset.unwrap()),
+                "{} never unlocked before its onset",
+                path.display()
+            );
+        } else {
+            assert!(
+                hw.hw.pings.is_empty(),
+                "{} unlocked with an unbounded safe tail",
+                path.display()
+            );
+        }
     }
 }
 
