@@ -35,6 +35,57 @@ lock and the card falls back to its own safe level; the daemon keeps
 modelling from the sense data and takes the lock back once the reduction is
 3 dB below the limit again.
 
+The J700 converts on copy, ahead of a playback queue of up to 341 ms, so a
+written reduction reaches only what is converted after it.  Audio already
+queued at a lower gain keeps playing, and only giving the lock up stops it
+(macaudio stops the old-gain stream at once).  The daemon gives the lock up
+for that reason too, in two cases, each logged as itself:
+* Any program at all could take a coil within 3 K of its limit before its
+  next look, through the least reduction the card may be playing.  This is
+  what it has to assume while it cannot see.
+* The coils' thermal reduction has risen more than 3 dB over that least
+  reduction, and the audio converted at it, at the level the program was
+  last seen to deliver, could take a coil there in the time it can still
+  play: until a queue's length (341 ms) after the controls stopped holding
+  it.
+It takes the lock back after two whole periods.  The V/I machines'
+amplifiers apply their gain as each sample plays, so neither rule, nor the
+floor below, applies there.
+
+A daemon that is held up (a call that blocks, the scheduler) cannot write
+anything: the card keeps converting at the last reduction written until the
+kernel's lease runs out and macaudio stops the stream.  So the daemon never
+writes less than a floor: the reduction at which full scale for a lease, a
+period and the stop, behind a copy queue (0.68 s on the J700), keeps every
+coil 3 K under its limit.  It rises with the coil, and the governor takes
+over from it at about 110 C.  This costs loudness at the top of the volume
+range, accepted on purpose:
+
+| Coil model (its magnet where a steady program puts it) | 50 C | 70 C | 85 C | 100 C | 110 C |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Floor | 0.5 dB | 1.5 dB | 2.5 dB | 3.9 dB | 5.0 dB |
+| Floor on the J700's 0.5 dB steps | 0.5 dB | 2.0 dB | 3.0 dB | 4.0 dB | 5.5 dB |
+| Governor | 0 dB | 0 dB | 0 dB | 0 dB | 6.0 dB |
+
+The card rounds every reduction up to its step, the floor's too.  A cold
+J700 never plays at the amplifier's full scale, but 0.5 dB under it.  A
+loud program that warms the coils to 85-100 C plays 3-4 dB under it where
+the governor alone would take nothing yet.  In return, loud bursts
+after quiet passages are not stopped (no hand-off in any of the programs the
+seventh review measured, where the queue rule alone stopped up to 60 a
+minute, each an XRUN and about 170 ms at the card's safe level), and a
+daemon held up for anything up to the lease no longer takes a coil past its
+limit.
+
+While the daemon is held up (descheduled, blocked in a call, waiting for a
+page) it can decide nothing, and the card's 250 ms lease bounds what plays,
+which the floor allows for.  To make that rarer the unit runs it at a
+real-time priority below PipeWire's
+(`CPUSchedulingPolicy=fifo`, priority 50) and it locks its memory
+(`mlockall`).  Every ten minutes it logs how long it was held up: the gaps
+between lock renewals, the latency of each kind of call, and the major page
+faults.  That measures, without a sound, whether a shorter lease is needed.
+
 There is no feedback: the model can only be as good as its constants.  The
 J700's constants - thermal resistances and time constants, coil temperature
 limits, volts at full scale, coil resistance and the power budgets - are the
@@ -83,8 +134,7 @@ The rule is deliberately simple:
   from the moment the daemon's lease may have run out, and anything for the
   controls' value before the daemon set one.  A reduction too deep to have
   delivered a frame that loud did not convert it; a word is taken a step
-  above itself; nothing before the gain is louder than full scale, and a
-  frame the card may have muted counts as full scale.  A budget window that
+  above itself; nothing before the gain is louder than full scale.  A budget window that
   cuts a step counts as much of the step's energy as full scale fits in
   the part it covers.
 * Every renewal of the lock, including the one before the blocking sense
@@ -119,6 +169,8 @@ Known costs of that rule, accepted on purpose:
   scale (up to about 7 dB on the J700, easing over the minute after the
   start), and after a clean stop the time since it counts as full scale
   before the gain.
+* The floor under every write (see above): 0.5 dB on a cold coil, rising
+  to 5 dB at 110 C.
 
 Exits are left for what the daemon cannot recover from (no card, a
 configuration error, a nonfinite model, a lock it cannot give up); the
@@ -310,8 +362,16 @@ while the daemon holds the lease the card never applies less reduction than
 the true state needs, and that what cannot be proven ends with the card at
 its safe level (no lock without events, none after a failed rate read, no
 renewal blind past the limit, a latched start from anything but a clean
-stop).  Failures shrink to a minimal scenario printed as Rust; each one it
-found is a test of its own.
+stop).  Where macaudio stops old-gain audio promptly, it also asserts that
+the true coil never reaches its limit unless the daemon was held up
+(descheduled, blocked in a call or gone) for at least 85 ms, ending no
+longer before the crossing than the lease, a period and the stop.  That
+bound is the kernel's lease, not the daemon's, and the crossings it exempts
+are counted.  A safe write that fails falls back to the controls' minimum,
+as the daemon does.  Scenarios start cold
+or hot, at 16 kHz or at the J700's own 48 kHz and 4096 frames, with a prompt
+or a slow stop.  Failures shrink to a minimal scenario printed as Rust; each
+one it found is a test of its own.
 
     cargo test --release harness                      # 200 cases
     SPEAKERGUARDD_CASES=1000000 cargo test --release harness
@@ -408,9 +468,24 @@ it never plays audio or performs a reboot.
 
 `-C <card id>` selects a card (by default the one the macaudio driver
 registered, never the AOP card that shares its `AppleJ` prefix), `-m <dB>`
-the reduction at which the card's safe level takes over, `-s <file>` the
-model state file (`-s ''` for none).  `--governor legacy|asahi|unified`
-overrides the configuration's governor, `--guard asahi|none` its guard, and
-`-m` defaults to its `max_reduction`; `--shadow` turns the shadow log on,
-and `--experimental-unified` and `--allow-unqualified` are the two opt-ins
-described above.
+the reduction at which the card's safe level takes over (on the J700 the
+floor under every write is not counted against it, so on a warm coil a `-m`
+under about 4.5 dB can be exceeded by the floor without a hand-off: more
+reduction, not less), `-s <file>` the model state file (`-s ''` for none).
+`--governor legacy|asahi|unified` overrides the configuration's governor,
+`--guard asahi|none` its guard, and `-m` defaults to its `max_reduction`;
+`--shadow` turns the shadow log on, and `--experimental-unified` and
+`--allow-unqualified` are the two opt-ins described above.  `-V` prints the
+version and the source commit, which the daemon also logs when it starts
+(`make` takes the commit from git; a package sets `SPEAKERGUARDD_COMMIT`).
+
+The daemon writes the controls to the card's safe value at its start and
+before each unlock.  The card accepts that value while the volume is locked.
+Until the first unlock the speakers play at the card's safe level, as they
+do without the daemon, and an unlock never lets anything louder through.
+At the first ping the daemon reads the controls' range with the lock lifted
+and checks the card's safe level (the locked maximum against it) against
+`safe_reduction`.  A card that is louder there than the configuration says
+is never unlocked: the speakers stay at its safe level.  (The SN012776
+machines lock to the control's lowest step above mute, 100 dB down, against
+their configured 99.5 dB.)

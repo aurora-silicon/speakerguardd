@@ -5,6 +5,10 @@ SHAREDIR ?= $(PREFIX)/share/speakerguardd
 UNITDIR ?= $(PREFIX)/lib/systemd/system
 UDEVDIR ?= $(PREFIX)/lib/udev/rules.d
 TARGET ?= aarch64-unknown-linux-musl
+# The commit the binary names (`-V` and the journal): this checkout's, or
+# what a package built from a tarball passes in.
+SPEAKERGUARDD_COMMIT ?= $(shell git rev-parse --short=12 HEAD 2>/dev/null)
+export SPEAKERGUARDD_COMMIT
 
 all:
 	cargo build --release --target $(TARGET)

@@ -185,7 +185,7 @@ impl ViScenario {
                 2 => ViFault::Base(Fault::WakeLate { at, len: r.range(0.05, 1.0), delay: r.range(0.005, 0.1) }),
                 3 => ViFault::Base(Fault::Pause { at, len: r.range(0.05, 0.8) }),
                 4 => ViFault::Base(Fault::WriteFail { at, len: r.range(0.01, 0.4), partial: r.chance(0.5) }),
-                5 => ViFault::Base(Fault::MinFail { at, len: r.range(0.01, 0.4) }),
+                5 => ViFault::Base(Fault::SafeFail { at, len: r.range(0.01, 0.4) }),
                 6 => ViFault::Base(Fault::SenseLoss { at, len: r.range(0.02, 0.9) }),
                 7 => ViFault::Base(Fault::ShortPeriod { at }),
                 8 => ViFault::Base(Fault::PositionFail { at }),
@@ -823,18 +823,28 @@ impl Hw for ViWorld<'_> {
         self.note_gain(t);
         Ok(applied)
     }
-    fn set_min(&mut self) -> io::Result<()> {
+    fn set_safe(&mut self) -> io::Result<f64> {
         self.maybe_pause();
         let t = self.now_s();
         self.advance(t);
-        if self.fault_on(|f| if let Fault::MinFail { at, len } = f { Some((*at, *len)) } else { None }) {
+        if self.fault_on(|f| if let Fault::SafeFail { at, len } = f { Some((*at, *len * 0.5)) } else { None }) {
+            // the safe value failed, the minimum landed (review r7 Y4 of
+            // speakerguardd#7)
+            for c in self.controls.iter_mut() {
+                *c = MUTE_DB;
+            }
+            self.note_gain(t);
+            return Ok(MUTE_DB);
+        }
+        if self.fault_on(|f| if let Fault::SafeFail { at, len } = f { Some((*at, *len)) } else { None }) {
             return Err(io::Error::from_raw_os_error(libc::EIO));
         }
+        let safe = self.safe();
         for c in self.controls.iter_mut() {
-            *c = MUTE_DB;
+            *c = safe;
         }
         self.note_gain(t);
-        Ok(())
+        Ok(safe)
     }
     fn relinquish(&mut self) -> io::Result<()> {
         self.maybe_pause();

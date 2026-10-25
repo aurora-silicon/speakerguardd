@@ -66,10 +66,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::config::{Config, Governor, SenseFormat};
-use crate::guard::{Accounted, Guard, Hw, Trace, EVENT_SLACK, KERNEL_LOCK_TIMEOUT, MUTE_DB};
+use crate::guard::{Accounted, Guard, Hw, Trace, EVENT_SLACK, KERNEL_LOCK_TIMEOUT};
 /// The most card gain a replay rebuilds a program through (dB): past it the
 /// recorded words are too quiet to say what the program was.
-const PRE_GAIN_MAX_DB: f64 = 30.0;
+pub const PRE_GAIN_MAX_DB: f64 = 30.0;
 
 const MAGIC: &str = "speakerguardd-record 3";
 /// In the start record's governor code: the asahi guard was on.
@@ -833,6 +833,12 @@ impl ReplayHw {
         let mut unknown = false;
         let factor: Vec<f64> = (0..ch)
             .map(|c| match self.chan_speaker[c] {
+                Some(k) if rounded(applied.get(k).copied().unwrap_or(0.0)) > PRE_GAIN_MAX_DB && self.card.effective(k) > PRE_GAIN_MAX_DB => {
+                    // recorded and replayed under more than 30 dB (the V/I
+                    // cards' safe level is 100 dB down): the words are
+                    // noise either way, played as recorded
+                    1.0
+                }
                 Some(k) => {
                     let recorded = rounded(applied.get(k).copied().unwrap_or(0.0));
                     let mut louder = recorded - self.card.effective(k) + self.gain_db;
@@ -916,12 +922,13 @@ impl Hw for ReplayHw {
     fn step_db(&self) -> f64 {
         0.5
     }
-    fn set_min(&mut self) -> io::Result<()> {
+    fn set_safe(&mut self) -> io::Result<f64> {
         self.lapse();
+        let safe = self.card.safe;
         for p in self.card.per.iter_mut() {
-            *p = MUTE_DB;
+            *p = safe;
         }
-        Ok(())
+        Ok(safe)
     }
     fn relinquish(&mut self) -> io::Result<()> {
         self.lapse();
@@ -1647,7 +1654,7 @@ mod tests {
         fn sleep(&mut self, d: Duration) { self.hw.sleep(d) }
         fn take_lock(&mut self) -> io::Result<()> { self.hw.take_lock() }
         fn ping(&mut self) -> io::Result<()> { self.hw.ping() }
-        fn set_min(&mut self) -> io::Result<()> { self.hw.set_min() }
+        fn set_safe(&mut self) -> io::Result<f64> { self.hw.set_safe() }
         fn set_reduction(&mut self, d: f64) -> io::Result<f64> { self.hw.set_reduction(d) }
         fn set_reductions(&mut self, d: &[f64]) -> io::Result<Vec<f64>> { self.hw.set_reductions(d) }
         fn relinquish(&mut self) -> io::Result<()> { self.hw.relinquish() }

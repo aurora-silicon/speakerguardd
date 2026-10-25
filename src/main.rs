@@ -24,6 +24,7 @@ mod model;
 mod record;
 mod startup;
 mod state;
+mod stats;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -62,6 +63,14 @@ impl std::error::Error for Refused {}
 
 fn exit_status(e: &(dyn std::error::Error + 'static)) -> u8 {
     if e.is::<Refused>() { EXIT_REFUSED } else { 1 }
+}
+
+/// The version and the source it was built from (the Makefile and the
+/// packaging set SPEAKERGUARDD_COMMIT at build time), for `--version` and
+/// the journal.
+fn version() -> String {
+    let commit = option_env!("SPEAKERGUARDD_COMMIT").filter(|c| !c.is_empty()).unwrap_or("commit unknown");
+    format!("speakerguardd {} ({commit})", env!("CARGO_PKG_VERSION"))
 }
 
 struct Args {
@@ -113,6 +122,7 @@ fn usage() -> ! {
          --csv <FILE>                    With --replay: one line per period\n  \
          -v, --verbose                   More logging (repeatable)\n  \
          -q, --quiet                     Less logging\n  \
+         -V, --version                   The version and source commit\n  \
          -h, --help                      This text"
     );
     std::process::exit(2)
@@ -176,6 +186,10 @@ fn parse_args() -> Args {
             "--horizon" => args.horizon = Some(it.next().and_then(|v| v.parse().ok()).filter(|h: &f64| h.is_finite() && *h > 0.0).unwrap_or_else(|| usage())),
             "-v" | "--verbose" => args.verbosity = Level::Debug,
             "-q" | "--quiet" => args.verbosity = Level::Warn,
+            "-V" | "--version" => {
+                println!("{}", version());
+                std::process::exit(0)
+            }
             _ => usage(),
         }
     }
@@ -205,6 +219,9 @@ struct Card {
     /// One volume control per speaker ("<speaker> <volume>"), in speaker
     /// order, on cards that have them (V/I machines).
     per_speaker: Option<Vec<ElemId>>,
+    /// The most they accept while the volume is locked (macaudio limits
+    /// the range to the card's safe level), read when the lock is taken.
+    locked_max: Option<i64>,
     unlock: ElemId,
     sample_rate: ElemId,
     /// Subscribed to the card's change events: the sample-rate control's
@@ -256,7 +273,7 @@ impl Card {
                 false
             }
         };
-        Ok((Card { ctl, volume, volume_max: None, volume_min: 0, per_speaker, unlock, sample_rate, events, rate_event: false }, name))
+        Ok((Card { ctl, volume, volume_max: None, volume_min: 0, locked_max: None, per_speaker, unlock, sample_rate, events, rate_event: false }, name))
     }
 
     /// Take the interlock: every volume control first, then the unlock
@@ -267,7 +284,9 @@ impl Card {
             self.ctl.lock(id)?;
         }
         self.ctl.lock(&self.unlock)?;
-        self.volume_min = self.ctl.int_range(&self.volume[0])?.0;
+        let (min, locked) = self.ctl.int_range(&self.volume[0])?;
+        self.volume_min = min;
+        self.locked_max = Some(locked);
         Ok(())
     }
 
@@ -277,6 +296,34 @@ impl Card {
     fn relinquish(&mut self) -> std::io::Result<()> {
         self.ctl.unlock(&self.unlock)?;
         self.ctl.lock(&self.unlock)
+    }
+
+    /// Every volume control to the card's safe value: the most the card
+    /// accepts while the volume is locked (macaudio limits the controls'
+    /// range to it there), or, once the range with the lock lifted is
+    /// known, that maximum less `safe_db`, whichever is lower.  The minimum
+    /// where that write fails (the card always accepts it).  The reduction
+    /// now applied (dB), from the value written once the maximum is known;
+    /// before that, the card's own safe level, taken to be `safe_db` until
+    /// the first ping checks it (review r7 Y5).
+    fn write_safe(&self, safe_db: f64) -> std::io::Result<f64> {
+        let (_, limit) = self.ctl.int_range(&self.volume[0])?;
+        let value = match self.volume_max {
+            Some(max) => limit.min(max - (safe_db * STEPS_PER_DB - 1e-9).ceil() as i64),
+            None => limit,
+        }
+        .max(self.volume_min);
+        match self.volume.iter().try_for_each(|id| self.ctl.write_int(id, value)) {
+            Ok(()) => Ok(match self.volume_max {
+                Some(max) => (max - value) as f64 / STEPS_PER_DB,
+                None => safe_db,
+            }),
+            Err(e) => {
+                warn!("volume control: {e} at the safe value; writing the minimum");
+                self.write_min()?;
+                Ok(guard::MUTE_DB)
+            }
+        }
     }
 
     /// Every volume control to its minimum: within the card's limit
@@ -357,6 +404,18 @@ struct RealHw {
     card: Card,
     globals: Globals,
     capture: Option<Capture>,
+    /// How long its calls hold the daemon up (summarised to the journal).
+    stats: stats::Stats,
+}
+
+impl RealHw {
+    /// Time one call into `kind`'s counter.
+    fn timed<T>(&mut self, kind: stats::Call, f: impl FnOnce(&mut Self) -> T) -> T {
+        let t = Instant::now();
+        let r = f(self);
+        self.stats.call(kind, t.elapsed());
+        r
+    }
 }
 
 impl Hw for RealHw {
@@ -376,29 +435,40 @@ impl Hw for RealHw {
         self.card.take_lock()
     }
     fn ping(&mut self) -> std::io::Result<()> {
-        self.card.ping()
+        let r = self.timed(stats::Call::Ping, |h| h.card.ping());
+        if r.is_ok() {
+            self.stats.renewed(Instant::now());
+        }
+        r
     }
     fn set_reduction(&mut self, db: f64) -> std::io::Result<f64> {
-        self.card.write_reduction(db)
+        self.timed(stats::Call::Write, |h| h.card.write_reduction(db))
     }
     fn set_reductions(&mut self, db: &[f64]) -> std::io::Result<Vec<f64>> {
-        self.card.write_reductions(db)
+        self.timed(stats::Call::Write, |h| h.card.write_reductions(db))
     }
     fn step_db(&self) -> f64 {
         1.0 / STEPS_PER_DB
     }
-    fn set_min(&mut self) -> std::io::Result<()> {
-        self.card.write_min()
+    fn set_safe(&mut self) -> std::io::Result<f64> {
+        let safe = self.globals.safe_reduction;
+        self.timed(stats::Call::Write, |h| h.card.write_safe(safe))
+    }
+    fn card_safe_db(&self) -> Option<f64> {
+        let (max, locked) = (self.card.volume_max?, self.card.locked_max?);
+        Some((max - locked) as f64 / STEPS_PER_DB)
     }
     fn relinquish(&mut self) -> std::io::Result<()> {
-        self.card.relinquish()
+        self.stats.released();
+        self.timed(stats::Call::Relinquish, |h| h.card.relinquish())
     }
     fn sample_rate(&mut self) -> std::io::Result<i64> {
-        self.card.ctl.read_int(&self.card.sample_rate)
+        self.timed(stats::Call::Rate, |h| h.card.ctl.read_int(&h.card.sample_rate))
     }
     fn open_sense(&mut self, rate: u32) -> std::io::Result<()> {
-        let g = &self.globals;
-        self.capture = Some(Capture::open(self.card.ctl.card, g.sense_pcm, g.channels, rate, g.period, g.sense_format == SenseFormat::S16)?);
+        let g = self.globals.clone();
+        let c = self.timed(stats::Call::Open, |h| Capture::open(h.card.ctl.card, g.sense_pcm, g.channels, rate, g.period, g.sense_format == SenseFormat::S16))?;
+        self.capture = Some(c);
         Ok(())
     }
     fn close_sense(&mut self) {
@@ -464,7 +534,7 @@ impl Hw for RealHw {
         }
     }
     fn rate_events(&mut self) -> bool {
-        let pending = self.card.drain().unwrap_or(true);
+        let pending = self.timed(stats::Call::Events, |h| h.card.drain().unwrap_or(true));
         self.card.rate_event = false;
         pending
     }
@@ -472,10 +542,10 @@ impl Hw for RealHw {
         self.card.events
     }
     fn queued(&mut self) -> std::io::Result<u64> {
-        match self.capture.as_mut() {
+        self.timed(stats::Call::Position, |h| match h.capture.as_mut() {
             Some(c) => c.queued(),
             None => Err(std::io::Error::from_raw_os_error(libc::EBADFD)),
-        }
+        })
     }
 }
 
@@ -494,6 +564,14 @@ fn catch_stop_signals() {
 }
 
 fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    info!("{}", version());
+    // Time the daemon is held up is bounded only by the kernel's lease: no
+    // page of it may have to come back from storage first.  The unit gives
+    // it a real-time priority below PipeWire's and the locked-memory limit.
+    // SAFETY: a plain system call on this process.
+    if unsafe { libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE) } != 0 {
+        warn!("mlockall: {}; page faults can hold the daemon up", std::io::Error::last_os_error());
+    }
     // the model file is named after the card: AppleJ700 -> apple/j700.conf
     // Discovery only: no controls are locked or written until it succeeds,
     // the configuration is loaded and Guard::start takes the interlock.
@@ -515,7 +593,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let cfg = load_config(&path, args)?;
     info!("{}: {} speakers{}, sense PCM {}, period {} frames", path.display(), cfg.speakers.len(), if cfg.has_vi() { " with V/I sense" } else { "" }, cfg.globals.sense_pcm, cfg.globals.period);
     let (card, card_name) = Card::open(Some(&name), &cfg)?;
-    let mut hw = RealHw { card, globals: cfg.globals.clone(), capture: None };
+    let mut hw = RealHw { card, globals: cfg.globals.clone(), capture: None, stats: stats::Stats::new(Instant::now()) };
     catch_stop_signals();
     let max_reduction = args.max_reduction.unwrap_or(cfg.globals.max_reduction);
     let mut guard = Guard::start(&mut hw, &cfg, max_reduction, args.state.clone())?;
@@ -546,6 +624,10 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             // the next run starts from where this model was
             guard.save(&hw);
             return Err(e);
+        }
+        let now = Instant::now();
+        if hw.stats.due(now) {
+            info!("{}", hw.stats.summary(now));
         }
     }
 }

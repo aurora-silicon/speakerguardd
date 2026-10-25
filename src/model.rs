@@ -35,6 +35,13 @@ pub struct SpeakerState {
     pub hard: bool,
     /// Gain reduction applied by the governor (dB, >= 0).
     pub reduction_db: f64,
+    /// Its thermal part: what the coil's temperature asks for, without the
+    /// power budgets or the release (dB, >= 0).
+    pub thermal_db: f64,
+    /// The loudest 1/SUB_BLOCKS of the latest measured period, as the power
+    /// the coil got (W): what the program delivered when last seen.  Zero
+    /// once the speakers close.
+    pub p_recent: f64,
     reducing: bool,
     /// Power history for the budgets: (seconds, watts before the card's
     /// gain) per step, newest last.
@@ -61,6 +68,8 @@ impl SpeakerState {
             t_peak: t_ambient,
             hard: false,
             reduction_db: 0.0,
+            thermal_db: 0.0,
+            p_recent: 0.0,
             reducing: false,
             history: std::collections::VecDeque::new(),
             history_s: 0.0,
@@ -234,43 +243,32 @@ impl SpeakerState {
         }
     }
 
-    /// `dt` seconds at `power` watts, in steps of at most MAX_SUB_DT.  After
-    /// each step the coil's bound over it goes into `t_peak`: the step's end
-    /// value, plus what a power that varied inside the step (its mean is
-    /// what the step used) could have hidden.  From the hottest moment to
-    /// the end of a step of length h the coil cools at most toward the
-    /// magnet with its time constant, so it was at most
-    /// (end - magnet) (e^(h/tau) - 1) above the end; and a step that put
-    /// all of its energy at the very end ends at most
-    /// P tr (h/tau - (1 - e^(-h/tau))) above the constant-power step.
+    /// `dt` seconds at `power` watts (see `heat_temps`); the coil's bound
+    /// over them goes into `t_peak`.
     fn heat(&mut self, power: f64, dt: f64, t_ambient: f64) {
         if !(dt > 0.0) {
             self.t_peak = self.t_peak.max(self.t_coil);
             return;
         }
-        let s = &self.spec;
-        let n = (dt / MAX_SUB_DT).ceil().max(1.0);
-        let n = if n.is_finite() { n as u64 } else { 1 };
-        let h = dt / n as f64;
-        let k_magnet = 1.0 - (-h / s.tau_magnet).exp();
-        let k_coil = 1.0 - (-h / s.tau_coil).exp();
-        let grow = (h / s.tau_coil).exp() - 1.0;
-        let late = power * s.tr_coil * (h / s.tau_coil - k_coil).max(0.0);
-        for _ in 0..n {
-            // magnet: first-order lag toward ambient + P * tr_magnet
-            self.t_magnet += (t_ambient + power * s.tr_magnet - self.t_magnet) * k_magnet;
-            // coil: first-order lag toward magnet + P * tr_coil
-            self.t_coil += (self.t_magnet + power * s.tr_coil - self.t_coil) * k_coil;
-            let end = self.t_coil + late;
-            let bound = end + (end - self.t_magnet).max(0.0) * grow;
-            if !(bound <= self.t_peak) {
-                // also takes a NaN, which finite() then rejects
-                self.t_peak = bound;
-            }
+        let (c, m, peak) = heat_temps(&self.spec, self.t_coil, self.t_magnet, power, dt, t_ambient);
+        self.t_coil = c;
+        self.t_magnet = m;
+        if !(peak <= self.t_peak) {
+            // also takes a NaN, which finite() then rejects
+            self.t_peak = peak;
         }
-        if !(self.t_peak < s.t_limit) {
+        if !(self.t_peak < self.spec.t_limit) {
             self.hard = true;
         }
+    }
+
+    /// The hottest the coil can get if `power` watts reach it for `secs`
+    /// from now (the bound `heat` keeps), the model not advanced.
+    pub fn peak_if(&self, power: f64, secs: f64, t_ambient: f64) -> f64 {
+        if !(secs > 0.0) {
+            return self.t_coil;
+        }
+        heat_temps(&self.spec, self.t_coil, self.t_magnet, power, secs, t_ambient).2.max(self.t_coil)
     }
 
     /// Clear a latched hard fault once the coil is back under its working
@@ -428,6 +426,7 @@ impl SpeakerState {
         } else {
             0.0
         };
+        self.thermal_db = thermal;
         let wanted = thermal.max(self.budget_reduction());
         // attack at once, release at most 0.5 dB per step so the level does
         // not pump
@@ -435,6 +434,42 @@ impl SpeakerState {
         self.reduction_db
     }
 }
+
+/// `dt` seconds at `power` watts from coil `tc` and magnet `tm`, in steps of
+/// at most MAX_SUB_DT: the end temperatures and the coil's bound over the
+/// steps.  After each step the bound is the step's end value, plus what a
+/// power that varied inside the step (its mean is what the step used) could
+/// have hidden.  From the hottest moment to the end of a step of length h
+/// the coil cools at most toward the magnet with its time constant, so it
+/// was at most (end - magnet) (e^(h/tau) - 1) above the end; and a step that
+/// put all of its energy at the very end ends at most
+/// P tr (h/tau - (1 - e^(-h/tau))) above the constant-power step.
+fn heat_temps(s: &Speaker, mut tc: f64, mut tm: f64, power: f64, dt: f64, t_ambient: f64) -> (f64, f64, f64) {
+    let n = (dt / MAX_SUB_DT).ceil().max(1.0);
+    let n = if n.is_finite() { n as u64 } else { 1 };
+    let h = dt / n as f64;
+    let k_magnet = 1.0 - (-h / s.tau_magnet).exp();
+    let k_coil = 1.0 - (-h / s.tau_coil).exp();
+    let grow = (h / s.tau_coil).exp() - 1.0;
+    let late = power * s.tr_coil * (h / s.tau_coil - k_coil).max(0.0);
+    let mut peak = f64::NEG_INFINITY;
+    for _ in 0..n {
+        // magnet: first-order lag toward ambient + P * tr_magnet
+        tm += (t_ambient + power * s.tr_magnet - tm) * k_magnet;
+        // coil: first-order lag toward magnet + P * tr_coil
+        tc += (tm + power * s.tr_coil - tc) * k_coil;
+        let end = tc + late;
+        let bound = end + (end - tm).max(0.0) * grow;
+        if !(bound <= peak) {
+            peak = bound;
+        }
+    }
+    (tc, tm, peak)
+}
+
+/// How far a word may sit outside the reduction that converted it, from the
+/// rounding of the card's gain table (dB).
+pub const ROOM_EPS_DB: f64 = 1e-5;
 
 /// The reduction (dB) a measured frame was converted at, for the budgets:
 /// the most of the `possible` ones (ranges) that can have delivered it,
@@ -447,7 +482,10 @@ pub fn converted_at(room: f64, possible: &[(f64, f64)]) -> f64 {
     let mut most = 0.0f64;
     for &(lo, hi) in possible {
         most = most.max(hi);
-        if lo <= room {
+        // the card's gain table is rounded (up to 3.1e-6 dB on the J700):
+        // a full-scale word at a reduction can land a hair outside it
+        // (review r6 W3)
+        if lo <= room + ROOM_EPS_DB {
             let v = hi.min(room);
             fit = Some(fit.map_or(v, |f| f.max(v)));
         }
@@ -489,6 +527,30 @@ pub fn reduction_db(states: &[SpeakerState]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review r6 W3: the card's gain table is rounded, and a full-scale
+    /// word at 17 dB lands 2e-9 dB outside it; the frame is still the 17 dB
+    /// candidate's, not the next lower one's.
+    #[test]
+    fn a_word_a_hair_outside_its_reduction_still_fits_it() {
+        assert!((converted_at(16.999999998, &[(16.5, 16.5), (17.0, 17.0)]) - 17.0).abs() < 1e-6);
+        assert!((converted_at(16.999999998, &[(0.0, 0.0), (17.0, 17.0)]) - 17.0).abs() < 1e-6);
+    }
+
+    /// h05's line on its own (review r7 Y4): what was played is up to a
+    /// step above its word, and undone by a deep gain that step is a share
+    /// of the frame's power before the gain.  A word of 1288 at the
+    /// controls' minimum (120 dB) was anything up to 1289: the budgets take
+    /// the step above.  (In the harness's world the frame of doubt charged
+    /// with every run outweighs the step, under the oracle's 0.1 %.)
+    #[test]
+    fn a_quantized_word_is_undone_from_the_step_above() {
+        let s = SpeakerState::new(spec(), 35.0);
+        let (_, pre) = s.frame_powers(&[1288, 1288], 2, &[(120.0, 120.0)]);
+        let up = 1289.0 * s.spec.vs_scale / 2147483648.0;
+        let want = up * up / s.spec.z_nominal * 1e12;
+        assert!(pre[0] >= want * (1.0 - 1e-12), "{} W before the gain, the step above gives {want} W", pre[0]);
+    }
 
     fn spec() -> Speaker {
         Speaker {
