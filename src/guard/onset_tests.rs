@@ -133,11 +133,11 @@ fn full_scale_run(mut cfg: Config, seconds: u64, clean_start: bool) -> (Config, 
     hw.tweak = Some(Box::new(move |_, words| {
         for frame in words.chunks_exact_mut(globals.channels) {
             for s in &specs {
-                let v = v_worst(s, &globals).min(s.vs_scale);
+                let v = v_worst(s, &globals);
                 let z = s.z_nominal.max(v / s.is_scale * 1.01);
-                frame[s.vs_chan] = (frame[s.vs_chan] as f64 * v / s.vs_scale) as i32;
-                frame[s.is_chan.unwrap()] =
-                    (frame[s.vs_chan] as f64 * s.vs_scale / (z * s.is_scale)) as i32;
+                let volts = frame[s.vs_chan] as f64 / 2147483648.0 * v;
+                frame[s.vs_chan] = (volts / s.vs_scale * 2147483648.0) as i32;
+                frame[s.is_chan.unwrap()] = (volts / (z * s.is_scale) * 2147483648.0) as i32;
             }
         }
     }));
@@ -177,7 +177,7 @@ fn check_truth(cfg: &Config, hw: &Tracked, name: &str, must_rearm: bool) {
         hw.hw.pings.first()
     );
     for (k, s) in cfg.speakers.iter().enumerate() {
-        let v = v_worst(s, &cfg.globals).min(s.vs_scale);
+        let v = v_worst(s, &cfg.globals);
         let z = s.z_nominal.max(v / s.is_scale * 1.01);
         // A clean cold state only vouches for a cold speaker. The reviewed
         // unknown-history starts must also bound both hot thermal nodes.
