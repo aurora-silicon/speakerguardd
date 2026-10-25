@@ -96,6 +96,9 @@ pub fn fingerprint(cfg: &Config) -> u64 {
     if cfg.globals.guard.is_none() {
         globals = globals.replace(", guard: None", "");
     }
+    // nor a profile without its own amp gain index (review L2-1: the
+    // recordings made before the field existed still match)
+    globals = globals.replace(", amp_gain_index: None", "");
     // nor does a speaker without its own z_min
     let speakers = format!("{:?}", cfg.speakers).replace(", z_min_override: None", "");
     let text = format!("{globals}{:?}{speakers}", cfg.controls);
@@ -1777,5 +1780,30 @@ mod tests {
         let tl = Timeline::read(&path, &c).unwrap();
         assert!(tl.periods.is_empty() && tl.truncated.is_some(), "{} periods, truncated {:?}", tl.periods.len(), tl.truncated);
         assert!(tl.ambiguous().iter().any(|a| a.2.contains("stopped here")));
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_history {
+    /// Review L2-1: the fingerprint of every shipped file without the
+    /// newer optional keys is the one 36bf6b6 computed, so recordings made
+    /// before them still certify.
+    #[test]
+    fn the_shipped_files_keep_their_fingerprints() {
+        for (name, text, want) in [
+            ("j700", include_str!("../conf/apple/j700.conf"), 0x09c595d1ff48e20bu64),
+            ("j316", include_str!("../conf/apple/j316.conf"), 0xb070f3441d6d361f),
+            ("j413", include_str!("../conf/apple/j413.conf"), 0xd39b9751276bd101),
+            ("j616", include_str!("../conf/apple/j616.conf"), 0x7232d0cccd01ca3f),
+        ] {
+            // the V/I files' governor lines changed since; as 36bf6b6 had them
+            let text = text.replace("governor = unified\nguard = asahi\n", "governor = asahi\n");
+            let cfg = crate::config::Config::parse(&text).unwrap();
+            assert_eq!(super::fingerprint(&cfg), want, "{name}");
+        }
+        // an index set is part of the configuration
+        let with = include_str!("../conf/apple/j316.conf").replace("amp_gain_dbv = 18.5", "amp_gain_dbv = 18.5\namp_gain_index = 15");
+        let without = include_str!("../conf/apple/j316.conf");
+        assert_ne!(super::fingerprint(&crate::config::Config::parse(&with).unwrap()), super::fingerprint(&crate::config::Config::parse(without).unwrap()));
     }
 }
