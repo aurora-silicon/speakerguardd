@@ -4189,6 +4189,25 @@ pub(crate) mod tests {
         assert_eq!(card, asahi, "the card under the guard is not the guard's ramp");
     }
 
+    /// Review r4 of speakerguardd#8: a guarded start that did not follow a
+    /// clean stop, with a stream already playing (a crash restart), takes
+    /// the lock back once the latched start has cooled.  The first half
+    /// second may have been converted at any value, and read as full scale
+    /// it would keep the regulator over the hand-over for as long as the
+    /// stream plays.  On these cards it cannot be: the owner's death drops
+    /// its lock and the amplifiers apply the card's safe level as they
+    /// play, so those frames are 100 dB down and never the prediction.  A
+    /// regression test, which holds with or without
+    /// frames_at_an_ambiguous_gain_are_not_the_prediction's rule.
+    #[test]
+    fn a_guarded_start_into_a_playing_stream_takes_the_lock_back() {
+        let (cfg, mut hw) = unified_j316(true, 0.1);
+        let mut g = Guard::start(&mut hw, &cfg, cfg.globals.max_reduction, missing_state()).unwrap();
+        assert!(g.engine.as_ref().unwrap().governed(Governor::Unified).1, "not a latched start");
+        run_until(&mut g, &mut hw, secs(150.0)).unwrap();
+        assert!(g.armed(), "still at the card's safe level: unified {:?}, asahi {:?}", g.engine.as_ref().unwrap().reductions(Governor::Unified), g.engine.as_ref().unwrap().reductions(Governor::Asahi));
+    }
+
     /// Review r4 of speakerguardd#8: a current line that reads nothing
     /// (ISENSE off, a dead line) is not bad sense data (V*I is 0), and the
     /// asahi models see no power.  Under the guard the feed-forward model
