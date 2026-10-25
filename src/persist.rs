@@ -91,6 +91,12 @@ fn fnv(text: &str) -> u64 {
     text.bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3))
 }
 
+/// Bind the format promise as well as the data. A v2 body checksum must
+/// not become a v3 record just by flipping the header's last bit.
+fn record_sum(body: &str) -> u64 {
+    fnv(&format!("{MAGIC}\n{body}"))
+}
+
 fn word(s: &str) -> Option<&str> {
     Some(s).filter(|s| !s.is_empty() && !s.contains(char::is_whitespace))
 }
@@ -117,13 +123,13 @@ pub fn encode(wall: &Wall, origin: &Origin, pairing: Duration, state: &str) -> O
         realtime.as_nanos(),
         pairing.as_nanos()
     );
-    Some(format!("{MAGIC}\nsum {:016x}\n{body}", fnv(&body)))
+    Some(format!("{MAGIC}\nsum {:016x}\n{body}", record_sum(&body)))
 }
 
 pub fn decode(text: &str) -> Option<Persisted> {
     let rest = text.strip_prefix(MAGIC)?.strip_prefix('\n')?;
     let (sum, body) = rest.strip_prefix("sum ")?.split_once('\n')?;
-    if u64::from_str_radix(sum, 16).ok()? != fnv(body) || sum.len() != 16 {
+    if u64::from_str_radix(sum, 16).ok()? != record_sum(body) || sum.len() != 16 {
         return None;
     }
     let mut lines = body.splitn(8, '\n');
@@ -243,6 +249,19 @@ mod tests {
         // a record colder than the ambient floor is implausible
         let p = decode(&encode(&w, &origin(), Duration::ZERO, &clean(-47.6)).unwrap()).unwrap();
         assert!(!plausible(&p, 50.0));
+    }
+
+    #[test]
+    fn a_version_bit_flip_cannot_promote_an_old_checksum() {
+        let good = encode(&wall("old", 1000, true, Some(500)), &origin(), Duration::ZERO, &clean(60.0)).unwrap();
+        let body = good.splitn(3, '\n').nth(2).unwrap();
+        // Exact v2 checksum rule, followed by a single changed header bit.
+        let old = format!("speakerguardd-boot 2\nsum {:016x}\n{body}", fnv(body));
+        let promoted = old.replacen("speakerguardd-boot 2", MAGIC, 1);
+        assert_eq!(old.bytes().zip(promoted.bytes()).map(|(a, b)| (a ^ b).count_ones()).sum::<u32>(), 1);
+        assert!(decode(&old).is_none());
+        assert!(decode(&promoted).is_none(), "the version promise was not covered by the checksum");
+        assert!(decode(&good).is_some());
     }
 
     /// Review of 753f9ca: only the boot just before this one, on the same

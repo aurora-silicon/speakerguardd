@@ -152,7 +152,8 @@ daemon makes the directory itself, after the card is locked; the unit adds
 nothing that could fail before the daemon runs.  The record is checksummed
 and bound to the machine (`/etc/machine-id`), the parsed configuration
 and the boot that wrote it. Version 3 refuses older records whose clock
-samples lacked the synchronization watch. It is written and synced only when the
+samples lacked the synchronization watch. The checksum covers the version
+header too, so a damaged header cannot promote an older record. It is written and synced only when the
 system clock is synchronized.  The first start of the next boot (no state
 under `/run`) resumes it only if all of the following hold:
 
