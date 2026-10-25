@@ -1234,6 +1234,39 @@ impl Engine {
         }
     }
 
+    /// Raise the restored temperatures to the extrema over every allowed
+    /// age. `hold` includes interior coil extrema, also for equal taus.
+    /// Keep the longest-age full-scale history already installed in self.
+    pub fn bound_resume_interval(&mut self, saved: &crate::state::Saved, lo: std::time::Duration, hi: std::time::Duration) {
+        let mut low = Engine::new(&self.cfg, self.unified.is_some()).unwrap();
+        let g = self.cfg.globals.clone();
+        crate::state::restore_engine(&mut low, saved, lo, &g);
+        let span = (hi - lo).as_secs_f64();
+        for s in low.asahi.iter_mut().flatten() {
+            s.worst(g.safe_reduction, span, g.t_ambient);
+            s.th.t_coil = s.th.t_coil.max(s.coil_peak);
+            s.th.t_magnet = s.th.t_magnet.max(s.magnet_peak);
+            s.coil_hyst = s.coil_hyst.max(s.th.t_coil);
+            s.magnet_hyst = s.magnet_hyst.max(s.th.t_magnet);
+        }
+        for s in low.unified.iter_mut().flatten() {
+            let factor = 10f64.powf(-g.safe_reduction.max(0.0) / 10.0);
+            let power = s.v_worst * s.v_worst * factor;
+            let (c, m) = s.ff.hold(power / s.r_ff, span, g.t_ambient);
+            s.ff.t_coil = c;
+            s.ff.t_magnet = m;
+            s.peak = crate::engine::hi(s.peak, c.max(m));
+            if let Some(v) = s.vi.as_mut() {
+                let (c, m) = v.hold(power / s.z_min, span, g.t_ambient);
+                v.t_coil = c;
+                v.t_magnet = m;
+                s.peak = crate::engine::hi(s.peak, c.max(m));
+            }
+            s.hard |= s.peak >= s.t_limit;
+        }
+        self.raise_to(&low);
+    }
+
     pub fn has(&self, gov: Governor) -> bool {
         match gov {
             Governor::Legacy => false,

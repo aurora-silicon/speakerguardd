@@ -151,32 +151,70 @@ also writes its state to `/var/lib/speakerguardd/state` (`--persist`).  The
 daemon makes the directory itself, after the card is locked; the unit adds
 nothing that could fail before the daemon runs.  The record is checksummed
 and bound to the machine (`/etc/machine-id`), the parsed configuration
-and the boot that wrote it.  It is written and synced only when the
+and the boot that wrote it. Version 3 refuses older records whose clock
+samples lacked the synchronization watch. It is written and synced only when the
 system clock is synchronized.  The first start of the next boot (no state
 under `/run`) resumes it only if all of the following hold:
 
-* the journal lists the writing boot as the one just before this one, so
-  no Linux boot in between drove the speakers;
+* the journal lists the writing boot as the one just before this one;
 * the machine and configuration match and the checksum holds;
 * no temperature is under the ambient;
 * the system clock is synchronized at both ends, any RTC agrees with it,
   and the gap is no shorter than this boot's uptime.
 
-The state is restored over the shortest and the longest the gap can have
-been, at the card's safe level, and each temperature takes the hotter
-result.  Anything it cannot prove starts latched.  Every start removes the
-file and syncs its directory before it can unlock, and does not unlock
-while it cannot, with the option or without and with `--persist ''`.  A
-stop that is not a shutdown writes nothing.
+The timestamp is read between two synchronization queries while a
+`TFD_TIMER_CANCEL_ON_SET` timer watches for a clock step. An unsynchronized
+query, a step, a pending leap transition or a failed watch rejects the
+sample. Restore also rejects a wall-clock read taking more than 50 ms.
+The shutdown record keeps the whole delay from the model snapshot through
+the clock reads. These bounds give an interval of possible snapshot ages.
+The restored coil, magnet and governing peaks bound that entire interval,
+including interior coil extrema. The legacy model uses an invariant upper
+bound that also covers its magnet-first numerical steps. Full-scale power
+before the gain is charged to the budgets through the longest possible age.
 
-> **Dual boot hazard.**  `idle` assumes nothing drove the speakers between
-> the shutdown and this boot, and that a clock the kernel calls synchronized
-> is right.  On a machine that also boots macOS (every Apple Silicon Mac can),
-> macOS may have played in that gap and left a coil at its limit.  The
-> journal knows Linux boots only.  This boot would start from the cooler
-> state saved before it; a review of the J700 model measured 58 K over the
-> limit that way.  Set `idle` only on a machine that boots nothing else;
-> the default keeps the latched start.
+Every start removes the file and syncs its directory before it can unlock,
+and does not unlock while it cannot, with the option or without and with
+`--persist ''`. A stop that is not a shutdown writes nothing.
+
+#### The contract for idle restore
+
+Setting `boot_resume = idle` asserts all of these operating conditions.
+They are requirements on the installation and its owners, not facts proved
+by the record or by `journalctl --list-boots`.
+
+* Every intervening Linux boot must leave a retained boot entry in the same
+  persistent journal consulted at restore. Journal storage must work from
+  early boot through shutdown and retain every boot until this record is
+  consumed. Volatile storage, unwritable persistent storage, vacuuming,
+  journal replacement or a boot that leaves no messages break this contract.
+  Adjacency among retained entries does not prove that no boot is missing.
+* Every speaker protection owner must participate in the same durable
+  invalidation protocol, using the same persistent path before it can drive
+  the speakers. This includes alternate governors, recovery systems and
+  runs with persistence disabled. Redirecting the path must first durably
+  invalidate the old path. After the final shutdown save no later owner
+  may drive the speakers above the card's safe level in that writing boot.
+  systemd reporting `stopping` does not establish this last-owner property.
+* No other OS may drive these speakers between the saved state and restore.
+  Linux cannot see that history. Every Apple Silicon Mac can boot another OS;
+  merely calling an installation Linux-only does not establish continuity.
+* A clock reported synchronized must be correct,
+  and its elapsed-time rate must remain trustworthy across shutdown and boot.
+  Agreement with the RTC does not detect clocks moved forward together.
+  Clock administration must preserve this contract; the sample watch is
+  local to each read, not a record of clock history while Linux was down.
+
+If any condition cannot be guaranteed, keep `boot_resume = latched`.
+After a known break, durably remove the old record before enabling idle
+restore again. The default remains latched. The regression suite retains
+synthetic missing-boot, later-owner and synchronized-but-wrong-clock cases
+as examples outside this contract. They deliberately show that the parser
+can accept such histories; no journal predicate proves their absence.
+
+An unsupported other-OS history restored a J700 model cold enough to exceed
+its limit by 58 K in review. This is a model calculation, not a measured
+speaker temperature. Idle restore must not be used on dual-boot machines.
 
 ### Machines with current and voltage sense
 

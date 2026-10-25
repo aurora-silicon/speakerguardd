@@ -9,29 +9,32 @@
 //! a boot does.  Anything this file cannot prove starts latched, as
 //! without it.
 //!
-//! What it has to prove (review of 753f9ca, 2026-10-26):
-//! * **Continuity.**  The boot that wrote it is the one the system journal
-//!   lists immediately before this one, so no Linux boot in between drove
-//!   the speakers (one with persistence off, one that consumed it and lost
-//!   the unlink in a power cut, speakersafetyd).  Without a journal that
-//!   knows the previous boot, it is not resumed.
+//! Restore requirements and operating assumptions:
+//! * **Continuity.** The writing boot is adjacent in the retained journal.
+//!   This is only a necessary check. Enabling idle restore asserts the
+//!   README's complete history/owner contract: no unrecorded Linux boots,
+//!   no other OS, the same durable invalidation path for every owner, and
+//!   no later owner above the safe level after the writing boot's save.
+//!   A volatile, incomplete or vacuumed journal cannot establish this.
 //! * **Origin.**  The same machine (/etc/machine-id) and the same parsed
 //!   configuration (record::fingerprint), and a checksum over the whole
 //!   record: a file from elsewhere, or damaged into valid text, is not
 //!   resumed.  Every temperature is at least the configuration's ambient
 //!   (no model goes colder): a colder one is damage.
 //! * **Time.**  The gap is CLOCK_REALTIME's, and only while the kernel
-//!   called it synchronized at both ends (a clock stepped while it was not
-//!   is not trusted); the RTC, where both ends have it, has to agree to 2 s
+//!   called it synchronized before and after each sample, with a timerfd
+//!   watch rejecting clock steps during the read; the RTC, where both
+//!   ends have it, has to agree to 2 s
 //!   plus 0.1 %; and it is never shorter than this boot's uptime.  The
 //!   clocks are read after the snapshot's account closes, and the boot time
 //!   between the two is kept: the state is restored over the shortest and
-//!   the longest time it can have been, and each temperature takes the
-//!   hotter of the two.
+//!   the longest time it can have been, bounding the whole interval with
+//!   interior extrema, not just the two endpoint temperatures.
 //!
-//! Only a clean stop at shutdown is kept: after it nothing in that boot
-//! drives the speakers again, and the card holds its safe level to the
-//! power-off.  Every start, with the option or without, removes the file
+//! Only a clean stop at shutdown is kept. The installation must guarantee
+//! that after it no owner exceeds the card's safe level until power-off;
+//! systemd stopping alone cannot prove this. Every start, with the option
+//! or without, removes the file
 //! (durably: the directory synced) before the lock can be lifted, and does
 //! not unlock while it cannot.
 //!
@@ -41,25 +44,28 @@
 //! and left a coil at its limit; this boot would start from the cooler
 //! state saved before it.  On the J700 the review measured 58 K over the
 //! limit that way.  Nothing Linux can read proves no other OS ran, so
-//! `idle` is for machines that boot nothing else, and it also assumes a
-//! clock the kernel calls synchronized is right.  The default keeps the
-//! latched start.
+//! `idle` requires the full README contract, including correct synchronized
+//! clocks and complete retained Linux history, not just a Linux-only label.
+//! The default keeps the latched start.
 
 use std::time::Duration;
 
 use crate::state::{self, Saved};
 
-const MAGIC: &str = "speakerguardd-boot 2";
+// Version 2 could certify a timestamp sampled before synchronization.
+// Its checksum cannot establish the stronger sample contract.
+const MAGIC: &str = "speakerguardd-boot 3";
 /// Two clocks read a little apart, and the RTC's whole seconds.
 const SLACK: Duration = Duration::from_secs(2);
 /// The most a clock read can sit away from the boot time read next to it.
-const READ_EPS: Duration = Duration::from_millis(50);
+pub const READ_EPS: Duration = Duration::from_millis(50);
 
 /// The clocks and the boot, as read now.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Wall {
     pub realtime: Option<Duration>,
-    /// The kernel called CLOCK_REALTIME synchronized.
+    /// The timestamp passed the synchronization and clock-change watch.
+    /// Test implementations must uphold the same contract as wallclock.rs.
     pub synced: bool,
     pub rtc: Option<Duration>,
     pub boot_id: Option<String>,
@@ -219,6 +225,7 @@ mod tests {
     fn round_trip_and_damage() {
         let w = wall("a1", 1_800_000_000, true, Some(1_800_000_001));
         let text = encode(&w, &origin(), Duration::from_millis(3), &clean(60.0)).unwrap();
+        assert!(decode(&text.replacen(MAGIC, "speakerguardd-boot 2", 1)).is_none());
         let p = decode(&text).unwrap();
         assert_eq!((p.wall.clone(), p.origin.clone(), p.pairing), (w.clone(), origin(), Duration::from_millis(3)));
         assert!(p.state.proven() && plausible(&p, 50.0));
