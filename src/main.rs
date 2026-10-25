@@ -21,6 +21,8 @@ mod guard;
 mod harness;
 mod log;
 mod model;
+mod persist;
+mod wallclock;
 mod record;
 mod startup;
 mod state;
@@ -70,6 +72,8 @@ struct Args {
     card: Option<String>,
     card_wait: Duration,
     state: Option<PathBuf>,
+    persist: Option<PathBuf>,
+    persist_off: bool,
     verbosity: Level,
     shadow: bool,
     governor: Option<Governor>,
@@ -97,6 +101,7 @@ fn usage() -> ! {
          --wait-for-card <SECONDS>       Wait for card discovery before failing (default 30; 0 disables waiting)\n  \
          -m, --max-reduction <DB>        Gain reduction beyond which the card's safe level takes over (default: the config's, else 20)\n  \
          -s, --state <FILE>              Model state kept across restarts (default /run/speakerguardd/state)\n  \
+         --persist <FILE>                Model state kept across a reboot, with boot_resume = idle (default /var/lib/speakerguardd/state; empty: never kept or resumed, still removed)\n  \
          --governor <NAME>               legacy, asahi or unified (default: the config's, else legacy)\n  \
          --guard <NAME>                  asahi: the unified governor's card also gets the asahi governor's reductions (default: the config's, else none)\n  \
          --shadow                        Run every governor and log them to shadow.jsonl next to the state\n  \
@@ -125,6 +130,8 @@ fn parse_args() -> Args {
         card: None,
         card_wait: Duration::from_secs(30),
         state: Some(PathBuf::from("/run/speakerguardd/state")),
+        persist: Some(PathBuf::from("/var/lib/speakerguardd/state")),
+        persist_off: false,
         verbosity: Level::Info,
         shadow: false,
         governor: None,
@@ -150,6 +157,16 @@ fn parse_args() -> Args {
             "-s" | "--state" => {
                 let v = it.next().unwrap_or_else(|| usage());
                 args.state = if v.is_empty() { None } else { Some(PathBuf::from(v)) };
+            }
+            "--persist" => {
+                // empty: neither resumed nor kept, but still removed at the
+                // start (a later boot must not resume a state this one
+                // made stale)
+                let v = it.next().unwrap_or_else(|| usage());
+                args.persist_off = v.is_empty();
+                if !v.is_empty() {
+                    args.persist = Some(PathBuf::from(v));
+                }
             }
             "-m" | "--max-reduction" => {
                 args.max_reduction = Some(it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage()));
@@ -471,6 +488,28 @@ impl Hw for RealHw {
     fn events_available(&self) -> bool {
         self.card.events
     }
+    fn wall(&self) -> persist::Wall {
+        let realtime = wallclock::synchronized_realtime();
+        let synced = realtime.is_some();
+        let rtc = std::fs::read_to_string("/sys/class/rtc/rtc0/since_epoch").ok().and_then(|s| s.trim().parse::<u64>().ok()).filter(|&s| s > 0).map(Duration::from_secs);
+        let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        persist::Wall { realtime, synced, rtc, boot_id }
+    }
+    fn previous_boot(&self) -> Option<String> {
+        // `journalctl --list-boots`: the line indexed -1, its second column
+        let out = std::process::Command::new("journalctl").args(["--list-boots", "--no-pager", "-q"]).output().ok().filter(|o| o.status.success())?;
+        String::from_utf8_lossy(&out.stdout).lines().find_map(|l| {
+            let mut f = l.split_whitespace();
+            (f.next() == Some("-1")).then(|| f.next().map(str::to_string)).flatten()
+        })
+    }
+    fn machine_id(&self) -> Option<String> {
+        std::fs::read_to_string("/etc/machine-id").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    }
+    fn shutting_down(&self) -> bool {
+        // systemd says "stopping" from the start of a shutdown
+        std::process::Command::new("systemctl").arg("is-system-running").output().is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "stopping")
+    }
     fn queued(&mut self) -> std::io::Result<u64> {
         match self.capture.as_mut() {
             Some(c) => c.queued(),
@@ -518,7 +557,13 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let mut hw = RealHw { card, globals: cfg.globals.clone(), capture: None };
     catch_stop_signals();
     let max_reduction = args.max_reduction.unwrap_or(cfg.globals.max_reduction);
-    let mut guard = Guard::start(&mut hw, &cfg, max_reduction, args.state.clone())?;
+    // --persist '': the file is still removed at the start, but neither
+    // read nor written
+    let mut cfg = cfg;
+    if args.persist_off {
+        cfg.globals.boot_resume = config::BootResume::Latched;
+    }
+    let mut guard = Guard::start_persist(&mut hw, &cfg, max_reduction, args.state.clone(), args.persist.clone())?;
     if let Some(path) = &args.record {
         let max = args.record_max_mb.saturating_mul(1 << 20);
         guard.attach_recorder(&hw, record::Recorder::create(path, &cfg, hw.card.events, max)?);
@@ -635,6 +680,8 @@ mod tests {
             card: None,
             card_wait: Duration::ZERO,
             state: None,
+            persist: None,
+            persist_off: false,
             verbosity: Level::Info,
             shadow: false,
             governor: None,

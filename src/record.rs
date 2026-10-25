@@ -96,6 +96,9 @@ pub fn fingerprint(cfg: &Config) -> u64 {
     if cfg.globals.guard.is_none() {
         globals = globals.replace(", guard: None", "");
     }
+    // nor a file on the default boot_resume (the recordings made before
+    // the key existed still match)
+    globals = globals.replace(", boot_resume: Latched", "");
     // nor does a speaker without its own z_min
     let speakers = format!("{:?}", cfg.speakers).replace(", z_min_override: None", "");
     let text = format!("{globals}{:?}{speakers}", cfg.controls);
@@ -1777,5 +1780,26 @@ mod tests {
         let tl = Timeline::read(&path, &c).unwrap();
         assert!(tl.periods.is_empty() && tl.truncated.is_some(), "{} periods, truncated {:?}", tl.periods.len(), tl.truncated);
         assert!(tl.ambiguous().iter().any(|a| a.2.contains("stopped here")));
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_history {
+    /// The fingerprint of every shipped file on the default boot_resume is
+    /// the one 36bf6b6 computed, so recordings made before the key still
+    /// certify; `idle` is part of it.
+    #[test]
+    fn the_shipped_files_keep_their_fingerprints() {
+        for (name, text, want) in [
+            ("j700", include_str!("../conf/apple/j700.conf"), 0x09c595d1ff48e20bu64),
+            ("j316", include_str!("../conf/apple/j316.conf"), 0xb070f3441d6d361f),
+            ("j413", include_str!("../conf/apple/j413.conf"), 0xd39b9751276bd101),
+            ("j616", include_str!("../conf/apple/j616.conf"), 0x7232d0cccd01ca3f),
+        ] {
+            assert_eq!(super::fingerprint(&crate::config::Config::parse(text).unwrap()), want, "{name}");
+        }
+        let mut idle = crate::config::Config::parse(include_str!("../conf/apple/j700.conf")).unwrap();
+        idle.globals.boot_resume = crate::config::BootResume::Idle;
+        assert_ne!(super::fingerprint(&idle), 0x09c595d1ff48e20b);
     }
 }

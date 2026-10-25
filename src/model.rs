@@ -329,6 +329,17 @@ impl SpeakerState {
 
     /// Continue from a saved state: temperatures and the power history's
     /// last second and minute.
+    /// Each temperature, peak, latch and reduction at least `o`'s (two
+    /// restores of one state over different spans: persist.rs).  The
+    /// budgets keep this one's history.
+    pub fn raise_to(&mut self, o: &SpeakerState) {
+        self.t_coil = self.t_coil.max(o.t_coil);
+        self.t_magnet = self.t_magnet.max(o.t_magnet);
+        self.t_peak = self.t_peak.max(o.t_peak);
+        self.hard |= o.hard;
+        self.reduction_db = self.reduction_db.max(o.reduction_db);
+    }
+
     pub fn resume(&mut self, t_coil: f64, t_magnet: f64, mean_1s: f64, mean_60s: f64) {
         self.t_coil = t_coil;
         self.t_magnet = t_magnet;
@@ -539,6 +550,7 @@ mod tests {
             max_reduction: 20.0,
             qualified: true,
             guard: None,
+            boot_resume: crate::config::BootResume::Latched,
         }
     }
 

@@ -1207,6 +1207,86 @@ impl Engine {
         Some(Engine { cfg: cfg.clone(), asahi, unified, extractor: Extractor::new(n), last: vec![Feature::default(); n], lost: vec![false; n], lost_changed: Vec::new(), pending: vec![0.0; n], reading: vec![false; n], gap: f64::INFINITY, lf: vec![(0.0, 0.0, 0.0); n], low: vec![false; n], logged: vec![(false, 0); n], pf_held: vec![0.0; n], low_held: vec![0.0; n], low_bound: vec![false; n], low_set_bound: vec![f64::INFINITY; n], bounded: vec![false; n] })
     }
 
+    /// Each model's temperatures, holds, peaks and latches at least
+    /// `o`'s, its gain no higher (two restores of one state over different
+    /// spans: persist.rs).  The budgets keep this engine's history.
+    pub fn raise_to(&mut self, o: &Engine) {
+        for (a, b) in self.asahi.iter_mut().flatten().zip(o.asahi.iter().flatten()) {
+            a.th.t_coil = a.th.t_coil.max(b.th.t_coil);
+            a.th.t_magnet = a.th.t_magnet.max(b.th.t_magnet);
+            a.coil_hyst = a.coil_hyst.max(b.coil_hyst);
+            a.magnet_hyst = a.magnet_hyst.max(b.magnet_hyst);
+            a.coil_peak = a.coil_peak.max(b.coil_peak);
+            a.magnet_peak = a.magnet_peak.max(b.magnet_peak);
+            a.gain = a.gain.min(b.gain);
+            a.hard |= b.hard;
+        }
+        for (a, b) in self.unified.iter_mut().flatten().zip(o.unified.iter().flatten()) {
+            a.ff.t_coil = a.ff.t_coil.max(b.ff.t_coil);
+            a.ff.t_magnet = a.ff.t_magnet.max(b.ff.t_magnet);
+            if let (Some(x), Some(y)) = (a.vi.as_mut(), b.vi.as_ref()) {
+                x.t_coil = x.t_coil.max(y.t_coil);
+                x.t_magnet = x.t_magnet.max(y.t_magnet);
+            }
+            a.peak = a.peak.max(b.peak);
+            a.reduction = a.reduction.max(b.reduction);
+            a.hard |= b.hard;
+        }
+    }
+
+    /// Raise the restored temperatures to the extrema over every allowed
+    /// age. `hold` includes interior coil extrema, also for equal taus.
+    /// Keep the longest-age full-scale history already installed in self.
+    pub fn bound_resume_interval(&mut self, saved: &crate::state::Saved, lo: std::time::Duration, hi: std::time::Duration) {
+        let mut low = Engine::new(&self.cfg, self.unified.is_some()).unwrap();
+        let g = self.cfg.globals.clone();
+        crate::state::restore_engine(&mut low, saved, lo, &g);
+        let span = (hi - lo).as_secs_f64();
+        for s in low.asahi.iter_mut().flatten() {
+            s.worst(g.safe_reduction, span, g.t_ambient);
+            s.th.t_coil = s.th.t_coil.max(s.coil_peak);
+            s.th.t_magnet = s.th.t_magnet.max(s.magnet_peak);
+            s.coil_hyst = s.coil_hyst.max(s.th.t_coil);
+            s.magnet_hyst = s.magnet_hyst.max(s.th.t_magnet);
+        }
+        for s in low.unified.iter_mut().flatten() {
+            let factor = 10f64.powf(-g.safe_reduction.max(0.0) / 10.0);
+            let power = s.v_worst * s.v_worst * factor;
+            let (c, m) = s.ff.hold(power / s.r_ff, span, g.t_ambient);
+            s.ff.t_coil = c;
+            s.ff.t_magnet = m;
+            s.peak = crate::engine::hi(s.peak, c.max(m));
+            if let Some(v) = s.vi.as_mut() {
+                let (c, m) = v.hold(power / s.z_min, span, g.t_ambient);
+                v.t_coil = c;
+                v.t_magnet = m;
+                s.peak = crate::engine::hi(s.peak, c.max(m));
+            }
+            s.hard |= s.peak >= s.t_limit;
+        }
+        self.raise_to(&low);
+        let eps = crate::state::RECORD_TEMP_EPS;
+        for a in self.asahi.iter_mut().flatten() {
+            a.th.t_coil += eps;
+            a.th.t_magnet += eps;
+            a.coil_peak = a.th.t_coil.max(a.coil_peak + eps);
+            a.magnet_peak = a.th.t_magnet.max(a.magnet_peak + eps);
+            a.coil_hyst = a.th.t_coil.max(a.coil_hyst + eps);
+            a.magnet_hyst = a.th.t_magnet.max(a.magnet_hyst + eps);
+            a.hard |= a.coil_peak.max(a.magnet_peak) >= a.t_limit;
+        }
+        for u in self.unified.iter_mut().flatten() {
+            u.ff.t_coil += eps;
+            u.ff.t_magnet += eps;
+            if let Some(v) = u.vi.as_mut() {
+                v.t_coil += eps;
+                v.t_magnet += eps;
+            }
+            u.peak += eps;
+            u.hard |= u.peak >= u.t_limit;
+        }
+    }
+
     pub fn has(&self, gov: Governor) -> bool {
         match gov {
             Governor::Legacy => false,
