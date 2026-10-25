@@ -105,10 +105,14 @@ const NOTHING_DB: f64 = 120.0;
 /// prediction stays where the last known frames left it.  The replay's
 /// PRE_GAIN_MAX_DB draws the same line.
 pub const PREDICT_MAX_DB: f64 = 30.0;
-/// Nor do frames the card may have converted at gains this far apart (dB):
-/// the most that fits makes any word under them full scale.  At a start
-/// that did not follow a clean stop the controls' value before the run is
-/// unknown (0 dB to mute), and a write in flight may span a large step.
+/// Nor do frames that fit one candidate range wider than this (dB): an
+/// unknown control value (0 dB to mute, at a start that did not follow a
+/// clean stop) or a failed write, under which the most that fits makes any
+/// word full scale.  A frame that fits several exact values keeps the most
+/// that fits (review r4 CC1 of speakerguardd#8): the V/I amplifiers apply
+/// a new gain as they play, so that is the newer value after an attack and
+/// the right one after a retake, and leaving such frames out blinded the
+/// regulator for half a second after every gain change over this.
 pub const PREDICT_SPREAD_DB: f64 = 1.0;
 /// Below this the low band carries too little current to read a resistance.
 const RTH_I_MIN: f64 = 0.02;
@@ -1133,8 +1137,8 @@ impl Engine {
                 if let Some(u) = unified {
                     let room = if wv != 0.0 { 20.0 * (2147483648.0 / wv.abs()).log10() } else { f64::INFINITY };
                     let at = converted_at(room, &possible[sk]);
-                    let least = possible[sk].iter().filter(|r| r.0 <= room).map(|r| r.0).fold(f64::INFINITY, f64::min);
-                    known.push(at <= PREDICT_MAX_DB && at - least.max(0.0) <= PREDICT_SPREAD_DB);
+                    let wide = possible[sk].iter().any(|r| r.0 <= room && r.1 - r.0 > PREDICT_SPREAD_DB);
+                    known.push(at <= PREDICT_MAX_DB && !wide);
                     let gain = 10f64.powf(at / 10.0);
                     let vup = (wv.abs() + 1.0) * vs;
                     let iup = (wi.abs() + 1.0) * is;
@@ -2130,14 +2134,13 @@ mod tests {
         }
     }
 
-    /// Nor do frames the card may have converted at gains far apart.  With
-    /// the controls' value unknown (0 dB to mute: a start that did not
-    /// follow a clean stop) the most that fits made audible words full
-    /// scale: the J316 asked 13.6 dB on its tweeters and 9.5 dB on its
-    /// woofers, and the frames at the card's safe level that followed
-    /// never replaced it, 85 s on.  The same from 0 to the safe level (a
-    /// write from the safe level in flight).  A step of the release is not
-    /// that far apart.
+    /// Nor do frames that fit one wide candidate range.  With the
+    /// controls' value unknown (0 dB to mute: a start that did not follow
+    /// a clean stop) the most that fits made audible words full scale: the
+    /// J316 asked 13.6 dB on its tweeters and 9.5 dB on its woofers, and
+    /// the frames at the card's safe level that followed never replaced
+    /// it, 85 s on.  The same for a write in flight from the safe level.
+    /// A step of the release is not that wide.
     #[test]
     fn frames_at_an_ambiguous_gain_are_not_the_prediction() {
         let c = cfg(J316);
@@ -2152,6 +2155,30 @@ mod tests {
         assert!(e.reductions(Governor::Unified).iter().all(|&r| r == 0.0), "{:?}", e.reductions(Governor::Unified));
         periods(&mut e, &program, 3, true, &vec![vec![(1.5, 2.0)]; n]);
         assert!(e.unified.as_ref().unwrap().iter().all(|u| u.last_ff_pre > 0.1));
+    }
+
+    /// Review r4 CC1 of speakerguardd#8: a frame that fits several exact
+    /// values (a retake at 4 dB with the hold's 0 dB still in the
+    /// look-back, an attack over 1 dB) is the program at the most that
+    /// fits.  Left out, a full-scale program after every retake was
+    /// invisible to the regulator for half a second: on a dead current
+    /// line the measured-power truth went from 90 to 208 C.
+    #[test]
+    fn frames_that_fit_several_exact_gains_are_the_prediction() {
+        let c = cfg(J316);
+        let n = c.speakers.len();
+        let mut e = Engine::new(&c, true).unwrap();
+        e.govern(0.0, false);
+        // the amplifier's loudest sine, at 4 dB, with 0 dB still a candidate
+        let amp = 2f64.sqrt() * 10f64.powf((c.globals.amp_gain_dbv - 4.0) / 20.0);
+        periods(&mut e, &program(&c, amp, 4.0), 1, true, &vec![vec![(0.0, 0.0), (4.0, 4.0)]; n]);
+        for (k, u) in e.unified.as_ref().unwrap().iter().enumerate() {
+            let s = &c.speakers[k];
+            // the program before the 4 dB: the amplifier's full sine
+            let full = 10f64.powf(c.globals.amp_gain_dbv / 10.0) / s.r_ff;
+            assert!(u.last_ff_pre > 0.9 * full, "{}: predicted {} W, the program is {full} W", s.name, u.last_ff_pre);
+            assert!(u.reduction > 3.0, "{}: {} dB", s.name, u.reduction);
+        }
     }
 
     /// Frames the card held at its safe level say nothing of the program:
