@@ -221,9 +221,17 @@ impl Hw for Tracked {
 /// voltage bounded by its amplifier and sense rail and load set to r_ff.
 #[test]
 fn every_legacy_profile_holds_full_scale_from_a_hot_start() {
-    for (name, cfg) in profiles().into_iter().filter(|(name, _)| name != "j700") {
+    for (name, cfg) in profiles().into_iter().filter(|(name, _)| name != "j700" && name != "j413") {
         check_legacy_hot_start(name, cfg);
     }
+}
+
+#[test]
+fn j413_tweeters_hold_full_scale_for_twenty_minutes() {
+    check_legacy_hot_start(
+        "j413".to_owned(),
+        Config::parse(include_str!("../conf/apple/j413.conf")).unwrap(),
+    );
 }
 
 #[test]

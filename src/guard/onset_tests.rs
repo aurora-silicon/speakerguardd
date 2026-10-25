@@ -318,7 +318,7 @@ fn every_vi_profile_bounds_full_scale_after_mute() {
         if !cfg.has_vi() {
             continue;
         }
-        let (cfg, hw) = full_scale_run(cfg, 60, true);
+        let (cfg, hw) = full_scale_run(cfg, 120, true);
         // A fallback whose worst-case steady state is above the working
         // limit cannot support the ceiling's safe tail. All other files
         // must actually unlock while quiet before the full-scale onset.
@@ -455,5 +455,24 @@ fn every_vi_profile_bounds_hot_full_scale_onsets() {
             // drafts cannot fit their declared fallback and stay locked.
             check_truth(&cfg, &hw, name, ["j316", "j413", "j616"].contains(&name));
         }
+    }
+}
+
+/// The deployed J413 guarded path reached 230.194 C from a clean cold
+/// start when full scale followed two seconds of silence. Keep this
+/// command-line governor combination explicit, even if file defaults move.
+#[test]
+fn reviewed_guarded_quiet_to_full_onsets_stay_under_the_limit() {
+    crate::log::set_verbosity(crate::log::Level::Error);
+    for name in ["j316", "j413"] {
+        let text = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(format!("conf/apple/{name}.conf")),
+        ).unwrap();
+        let mut cfg = Config::parse(&text).unwrap();
+        cfg.globals.governor = Governor::Unified;
+        cfg.globals.guard = Some(Governor::Asahi);
+        let (cfg, hw) = full_scale_run(cfg, 120, true);
+        check_truth(&cfg, &hw, &format!("{name}-quiet"), true);
     }
 }
