@@ -308,6 +308,45 @@ pub fn restore_engine(engine: &mut Engine, saved: &Saved, now: Duration, globals
     true
 }
 
+/// Restore an uncertain cross-boot age. Histories use the longest age at
+/// full-scale pre-gain power. Temperatures bound the entire interval,
+/// including a coil warmed by a cooling magnet between the endpoints.
+pub fn restore_interval(speakers: &mut [SpeakerState], engine: &mut Option<Engine>, saved: &Saved, lo: Duration, hi: Duration, globals: &Globals) -> bool {
+    if hi < lo || !restore(speakers, saved, hi, globals) {
+        return false;
+    }
+    let mut low = speakers.to_vec();
+    restore(&mut low, saved, lo, globals);
+    let start = lo.saturating_sub(saved.boottime).as_secs_f64();
+    let span = (hi - lo).as_secs_f64();
+    for (s, low) in speakers.iter_mut().zip(&low) {
+        let Some(x) = saved.speakers.iter().find(|x| x.name == state_name(&s.spec.name)) else { continue };
+        let p = s.worst_case_power(globals.safe_reduction);
+        let spec = s.spec.clone();
+        let mut th = crate::engine::Thermal::new(spec.tr_coil, spec.tau_coil, spec.tr_magnet, spec.tau_magnet, x.t_coil);
+        th.t_magnet = x.t_magnet;
+        th.hold(p, start, globals.t_ambient);
+        // Legacy heat steps advance the magnet before the coil. Bound
+        // both that discretization and the continuous plant. The magnet
+        // is monotone; neither update can leave this invariant rectangle:
+        // M <= max(M(lo), M(infinity)), C <= max(C(lo), M_bound + P Rc).
+        // This also covers the arbitrary phase of the legacy substeps.
+        let magnet = th.t_magnet.max(low.t_magnet).max(globals.t_ambient + p * spec.tr_magnet);
+        let coil = th.t_coil.max(low.t_coil).max(magnet + p * spec.tr_coil);
+        let (pc, pm) = th.hold(p, span, globals.t_ambient);
+        s.raise_to(low);
+        s.t_coil = s.t_coil.max(coil).max(pc);
+        s.t_magnet = s.t_magnet.max(magnet).max(pm);
+        s.t_peak = s.t_peak.max(s.t_coil).max(x.t_peak);
+        s.hard |= s.t_peak >= spec.t_limit;
+    }
+    if let Some(e) = engine {
+        restore_engine(e, saved, hi, globals);
+        e.bound_resume_interval(saved, lo, hi);
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,6 +370,78 @@ mod tests {
     }
 
     const T: Duration = Duration::from_secs(100);
+
+    /// Every interior age, not just the endpoints, must fit the restored
+    /// state. Include cooling magnets, rising magnets, long ages crossing
+    /// the legacy steady-state shortcut, and every shipped thermal model.
+    #[test]
+    fn interval_restore_bounds_all_nodes_and_governing_peaks() {
+        for text in [J700, include_str!("../conf/apple/j316.conf"), include_str!("../conf/apple/j413.conf"), include_str!("../conf/apple/j616.conf")] {
+            let cfg = Config::parse(text).unwrap();
+            for (tc, tm) in [(66.062964, 64.843034), (125.0, 95.0), (55.0, 125.0), (50.0, 50.0)] {
+                let mut sp = fresh(&cfg);
+                for s in &mut sp { s.resume(tc, tm, 0.0, 0.0); }
+                let mut en = Engine::new(&cfg, true);
+                for e in en.iter_mut() {
+                    for a in e.asahi.iter_mut().flatten() {
+                        (a.th.t_coil, a.th.t_magnet, a.coil_hyst, a.magnet_hyst, a.coil_peak, a.magnet_peak, a.hard) = (tc, tm, tc, tm, tc, tm, false);
+                    }
+                    for u in e.unified.iter_mut().flatten() {
+                        (u.ff.t_coil, u.ff.t_magnet, u.peak, u.hard) = (tc, tm, tc, false);
+                        if let Some(v) = u.vi.as_mut() { (v.t_coil, v.t_magnet) = (tc, tm); }
+                    }
+                }
+                let mut saved = decode(&encode_with(T, T, &sp, en.as_ref(), false, true)).unwrap();
+                saved.boottime = Duration::ZERO;
+                saved.covered = Duration::ZERO;
+                for (lo, hi) in [(0.0, 0.1), (3.95, 11.05), (20.0, 60.0), (3599.0, 3601.0), (7200.0, 9000.0)] {
+                    let mut bound = fresh(&cfg);
+                    let mut engine = Engine::new(&cfg, true);
+                    assert!(restore_interval(&mut bound, &mut engine, &saved, Duration::from_secs_f64(lo), Duration::from_secs_f64(hi), &cfg.globals));
+                    for i in 0..=40 {
+                        let age = Duration::from_secs_f64(lo + (hi - lo) * i as f64 / 40.0);
+                        let mut actual = fresh(&cfg);
+                        restore(&mut actual, &saved, age, &cfg.globals);
+                        for (b, a) in bound.iter().zip(&actual) {
+                            assert!(b.t_coil + 1e-6 >= a.t_coil && b.t_magnet + 1e-6 >= a.t_magnet, "{} at {age:?}: {b:?} / {a:?}", b.spec.name);
+                            assert!(b.t_peak + 1e-6 >= a.t_peak);
+                            // Continuous two-node plant, independently evaluated
+                            // from the serialized state, including the residual
+                            // that the old hour shortcut discarded.
+                            let x = saved.speakers.iter().find(|x| x.name == state_name(&b.spec.name)).unwrap();
+                            let p = b.worst_case_power(cfg.globals.safe_reduction);
+                            let s = &b.spec;
+                            let t = age.as_secs_f64();
+                            let m_inf = cfg.globals.t_ambient + p * s.tr_magnet;
+                            let c_inf = m_inf + p * s.tr_coil;
+                            let k = (x.t_magnet - m_inf) * s.tau_magnet / (s.tau_magnet - s.tau_coil);
+                            let coil = c_inf + k * (-t / s.tau_magnet).exp() + (x.t_coil - c_inf - k) * (-t / s.tau_coil).exp();
+                            let magnet = m_inf + (x.t_magnet - m_inf) * (-t / s.tau_magnet).exp();
+                            assert!(b.t_coil + 1e-6 >= coil && b.t_magnet + 1e-6 >= magnet);
+                        }
+                        let mut at = Engine::new(&cfg, true);
+                        if let (Some(b), Some(a)) = (engine.as_ref(), at.as_mut()) {
+                            restore_engine(a, &saved, age, &cfg.globals);
+                            for (b, a) in b.asahi.iter().flatten().zip(a.asahi.iter().flatten()) {
+                                assert!(b.th.t_coil + 1e-6 >= a.th.t_coil && b.th.t_magnet + 1e-6 >= a.th.t_magnet);
+                                assert!(b.coil_peak + 1e-6 >= a.coil_peak && b.magnet_peak + 1e-6 >= a.magnet_peak);
+                                assert!(b.coil_hyst + 1e-6 >= a.coil_hyst && b.magnet_hyst + 1e-6 >= a.magnet_hyst);
+                                assert!(!a.hard || b.hard);
+                            }
+                            for (b, a) in b.unified.iter().flatten().zip(a.unified.iter().flatten()) {
+                                assert!(b.ff.t_coil + 1e-6 >= a.ff.t_coil && b.ff.t_magnet + 1e-6 >= a.ff.t_magnet);
+                                assert!(b.peak + 1e-6 >= a.peak);
+                                if let (Some(b), Some(a)) = (&b.vi, &a.vi) {
+                                    assert!(b.t_coil + 1e-6 >= a.t_coil && b.t_magnet + 1e-6 >= a.t_magnet);
+                                }
+                                assert!(!a.hard || b.hard);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn round_trip() {

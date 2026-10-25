@@ -22,6 +22,7 @@ mod harness;
 mod log;
 mod model;
 mod persist;
+mod wallclock;
 mod record;
 mod startup;
 mod state;
@@ -504,14 +505,8 @@ impl Hw for RealHw {
         self.card.events
     }
     fn wall(&self) -> persist::Wall {
-        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-        // SAFETY: a valid, writable timespec.
-        let rt = unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts) } == 0 && ts.tv_sec > 0;
-        let realtime = rt.then(|| Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32));
-        // SAFETY: a zeroed timex with modes 0 only reads the kernel's state.
-        let mut tx: libc::timex = unsafe { std::mem::zeroed() };
-        let state = unsafe { libc::adjtimex(&mut tx) };
-        let synced = state >= 0 && state != libc::TIME_ERROR && tx.status & libc::STA_UNSYNC == 0;
+        let realtime = wallclock::synchronized_realtime();
+        let synced = realtime.is_some();
         let rtc = std::fs::read_to_string("/sys/class/rtc/rtc0/since_epoch").ok().and_then(|s| s.trim().parse::<u64>().ok()).filter(|&s| s > 0).map(Duration::from_secs);
         let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
         persist::Wall { realtime, synced, rtc, boot_id }

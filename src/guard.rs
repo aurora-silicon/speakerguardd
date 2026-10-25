@@ -655,36 +655,24 @@ impl Guard {
                         None => Err("unreadable or damaged".to_string()),
                         Some(p) if !crate::persist::plausible(&p, globals.t_ambient) => Err("a temperature under the ambient: damaged".to_string()),
                         Some(p) => {
+                            let previous = hw.previous_boot();
                             let at = hw.boottime();
-                            crate::persist::gap(&p, &hw.wall(), &origin, hw.previous_boot().as_deref(), at).map(|g| (p, g, at))
+                            let wall = hw.wall();
+                            let end = hw.boottime();
+                            if end < at || end - at > crate::persist::READ_EPS {
+                                Err("the clock sample took too long".to_string())
+                            } else {
+                                crate::persist::gap(&p, &wall, &origin, previous.as_deref(), at).map(|g| (p, g, at))
+                            }
                         }
                     },
                 };
                 match why {
                     Ok((p, (lo, hi), at)) => {
-                        // from fresh models: the saved state, then the gap at
-                        // the card's safe level, over the shortest and the
-                        // longest it can have been; each temperature the
-                        // hotter of the two
                         let saved = Saved { boottime: Duration::ZERO, covered: Duration::ZERO, ..p.state };
-                        let restore = |elapsed: Duration| {
-                            let mut sp: Vec<SpeakerState> = cfg.speakers.iter().map(|s| SpeakerState::new(s.clone(), globals.t_ambient)).collect();
-                            let mut en = Engine::new(cfg, governing == Governor::Unified || globals.shadow);
-                            if let Some(e) = en.as_mut() {
-                                state::restore_engine(e, &saved, elapsed, &globals);
-                            }
-                            let ok = state::restore(&mut sp, &saved, elapsed, &globals);
-                            (sp, en, ok)
-                        };
-                        let (mut sp, mut en, ok_lo) = restore(lo);
-                        let (sp_hi, en_hi, ok_hi) = restore(hi);
-                        if ok_lo && ok_hi {
-                            for (a, b) in sp.iter_mut().zip(&sp_hi) {
-                                a.raise_to(b);
-                            }
-                            if let (Some(a), Some(b)) = (en.as_mut(), en_hi.as_ref()) {
-                                a.raise_to(b);
-                            }
+                        let mut sp: Vec<SpeakerState> = cfg.speakers.iter().map(|s| SpeakerState::new(s.clone(), globals.t_ambient)).collect();
+                        let mut en = Engine::new(cfg, governing == Governor::Unified || globals.shadow);
+                        if state::restore_interval(&mut sp, &mut en, &saved, lo, hi, &globals) {
                             speakers = sp;
                             engine = en;
                             resumed = true;
@@ -1006,7 +994,7 @@ impl Guard {
 
     /// At a clean stop while the system shuts down, with `boot_resume =
     /// idle`: the final state again, for the next boot (persist.rs), stamped
-    /// with the clocks read before the model's account was closed.  A
+    /// with the clocks read after the model's account was closed.  A
     /// failure costs only the next boot's latched start.
     fn persist<H: Hw>(&mut self, hw: &H, after: Duration) {
         let Some(pp) = self.persist_path.clone() else { return };
@@ -2141,6 +2129,8 @@ pub mod fake {
         /// The clocks and boot id (persist.rs), and whether the system is
         /// shutting down.
         pub wall: crate::persist::Wall,
+        pub wall_delay: Duration,
+        wall_elapsed: std::cell::Cell<Duration>,
         pub shutting: bool,
         pub previous_boot: Option<String>,
         pub machine: Option<String>,
@@ -2194,6 +2184,8 @@ pub mod fake {
                 tweak: None,
                 delivered: 0,
                 wall: crate::persist::Wall::default(),
+                wall_delay: Duration::ZERO,
+                wall_elapsed: std::cell::Cell::new(Duration::ZERO),
                 shutting: false,
                 previous_boot: None,
                 machine: None,
@@ -2316,6 +2308,7 @@ pub mod fake {
 
     impl Hw for FakeHw {
         fn wall(&self) -> crate::persist::Wall {
+            self.wall_elapsed.set(self.wall_elapsed.get() + self.wall_delay);
             self.wall.clone()
         }
         fn shutting_down(&self) -> bool {
@@ -2328,10 +2321,10 @@ pub mod fake {
             self.machine.clone()
         }
         fn now(&self) -> Instant {
-            self.t0 + self.t
+            self.t0 + self.t + self.wall_elapsed.get()
         }
         fn boottime(&self) -> Duration {
-            self.boot + self.t
+            self.boot + self.t + self.wall_elapsed.get()
         }
         fn sleep(&mut self, d: Duration) {
             self.t += d;
@@ -5945,7 +5938,7 @@ mod persist_review {
     //! The review of 753f9ca (2026-10-26, REVIEW-persist-rtc.md): its
     //! witnesses, each asserting the behaviour that closes it.
     use super::fake::*;
-    use super::tests::{j700, missing_state, run_until};
+    use super::tests::{j700, missing_state};
     use super::*;
     use crate::persist::{self, Origin, Wall};
 
@@ -6314,5 +6307,252 @@ mod persist_review {
         let mut parent = Guard::start(&mut refhw, &cfg, 20.0, missing_state()).unwrap();
         let without = peak(&mut parent, &mut refhw);
         assert!(with <= without + 1e-9, "{with} C against the parent's {without} C");
+    }
+}
+
+#[cfg(test)]
+mod persist_interval_review {
+    use super::fake::*;
+    use super::tests::{j700, missing_state};
+    use super::*;
+    use crate::persist::{self, Origin, Wall};
+    fn wall(id: &str, t: u64) -> Wall {
+        Wall {
+            realtime: Some(Duration::from_secs(t)),
+            synced: true,
+            rtc: Some(Duration::from_secs(t)),
+            boot_id: Some(id.into()),
+        }
+    }
+    fn origin(cfg: &Config) -> Origin {
+        Origin {
+            machine_id: Some("machine".into()),
+            config: record::fingerprint(cfg),
+        }
+    }
+    fn fixture(cfg: &Config, tc: f64, tm: f64, pair: u64) -> String {
+        fixture_writer(cfg, tc, tm, pair, "old")
+    }
+    fn fixture_writer(cfg: &Config, tc: f64, tm: f64, pair: u64, writer: &str) -> String {
+        let mut sp: Vec<_> = cfg
+            .speakers
+            .iter()
+            .map(|s| SpeakerState::new(s.clone(), 50.0))
+            .collect();
+        for s in &mut sp {
+            s.resume(tc, tm, 0.0, 0.0);
+        }
+        let mut en = Engine::new(cfg, true);
+        if let Some(e) = en.as_mut() {
+            for a in e.asahi.iter_mut().flatten() {
+                (
+                    a.th.t_coil,
+                    a.th.t_magnet,
+                    a.coil_hyst,
+                    a.magnet_hyst,
+                    a.coil_peak,
+                    a.magnet_peak,
+                    a.hard,
+                ) = (tc, tm, tc, tm, tc, tm, false);
+            }
+            for u in e.unified.iter_mut().flatten() {
+                (u.ff.t_coil, u.ff.t_magnet, u.peak, u.hard) = (tc, tm, tc, false);
+                if let Some(v) = u.vi.as_mut() {
+                    (v.t_coil, v.t_magnet) = (tc, tm);
+                }
+            }
+        }
+        let s = state::encode_with(
+            Duration::from_secs(500),
+            Duration::from_secs(500),
+            &sp,
+            en.as_ref(),
+            false,
+            true,
+        );
+        persist::encode(
+            &wall(writer, 1_800_000_000),
+            &origin(cfg),
+            Duration::from_secs(pair),
+            &s,
+        )
+        .unwrap()
+    }
+    fn boot(cfg: &Config, text: &str, gap: u64, prev: Option<&str>) -> (Guard, FakeHw, PathBuf) {
+        let keep = missing_state().unwrap();
+        std::fs::write(&keep, text).unwrap();
+        let mut hw = FakeHw::per_speaker(cfg);
+        hw.boot = Duration::from_secs(1);
+        hw.wall = wall("new", 1_800_000_000 + gap);
+        hw.machine = Some("machine".into());
+        hw.previous_boot = prev.map(str::to_string);
+        let g =
+            Guard::start_persist(&mut hw, cfg, 20.0, missing_state(), Some(keep.clone())).unwrap();
+        (g, hw, keep)
+    }
+    #[test]
+    fn a_stalled_restore_clock_read_starts_latched() {
+        let mut cfg = j700();
+        cfg.globals.boot_resume = BootResume::Idle;
+        for delay in [Duration::from_millis(51), Duration::from_secs(60)] {
+            let keep = missing_state().unwrap();
+            std::fs::write(&keep, fixture(&cfg, 125.0, 95.0, 0)).unwrap();
+            let mut hw = FakeHw::per_speaker(&cfg);
+            hw.boot = Duration::from_secs(1);
+            hw.wall = wall("new", 1_800_000_002);
+            hw.wall_delay = delay;
+            hw.previous_boot = Some("old".into());
+            hw.machine = Some("machine".into());
+            let g = Guard::start_persist(&mut hw, &cfg, 20.0, missing_state(), Some(keep.clone())).unwrap();
+            assert!(g.speakers.iter().all(|s| s.hard && s.t_coil >= s.spec.t_limit));
+            assert!(!keep.exists());
+            assert!(hw.pings.is_empty());
+        }
+    }
+
+    #[test]
+    fn interior_peak_is_bounded() {
+        let mut cfg = j700();
+        cfg.globals.boot_resume = BootResume::Idle;
+        // A reachable cool-down, entirely below the soft target: 0.7 W for
+        // 2000 s, 20 s quiet, then 0.5 s at the safe level during a clean stop.
+        let mut sp: Vec<_> = cfg
+            .speakers
+            .iter()
+            .map(|s| SpeakerState::new(s.clone(), 50.0))
+            .collect();
+        for s in &mut sp {
+            s.step_pre(0.7, 0.7, 2000.0, 50.0);
+            s.step_pre(0.0, 0.0, 20.0, 50.0);
+            let p = s.worst_case_power(20.0);
+            s.step_pre(p, s.worst_case_power(0.0), 0.5, 50.0);
+            s.govern(&cfg.globals);
+        }
+        let text = state::encode(
+            Duration::from_secs(500),
+            Duration::from_secs(500),
+            &sp,
+            false,
+            true,
+        );
+        let text = persist::encode(
+            &wall("old", 1_800_000_000),
+            &origin(&cfg),
+            Duration::from_secs(7),
+            &text,
+        )
+        .unwrap();
+        let p = persist::decode(&text).unwrap();
+        let saved = Saved {
+            boottime: Duration::ZERO,
+            covered: Duration::ZERO,
+            ..p.state
+        };
+        let (g, _, _) = boot(&cfg, &text, 4, Some("old"));
+        let mut mid: Vec<_> = cfg
+            .speakers
+            .iter()
+            .map(|s| SpeakerState::new(s.clone(), 50.0))
+            .collect();
+        // Valid timing: read 4.3 s after snapshot, stall 2.7 s after reading;
+        // next wall read is 4 s after the old one, at uptime 1 s. True age 8.3 s.
+        state::restore(&mut mid, &saved, Duration::from_millis(8300), &cfg.globals);
+        eprintln!("interval peak snapshot=({:.9},{:.9}) resumed={:.9} true_8_3s={:.9} deficit={:.9} resumed_peak={:.9} bracket=[3.95,11.05] pairing=7 uptime=1",sp[0].t_coil,sp[0].t_magnet,g.speakers[0].t_coil,mid[0].t_coil,mid[0].t_coil-g.speakers[0].t_coil,g.speakers[0].t_peak);
+        assert!(g.speakers[0].t_coil >= mid[0].t_coil && g.speakers[0].t_peak >= mid[0].t_coil);
+    }
+    #[test]
+    fn unsupported_incorrect_synchronized_clock() {
+        let mut cfg = j700();
+        cfg.globals.boot_resume = BootResume::Idle;
+        let text = fixture(&cfg, 135.0, 100.0, 0);
+        let (g, _, _) = boot(&cfg, &text, 86400, Some("old"));
+        let (correct, _, _) = boot(&cfg, &text, 10, Some("old"));
+        eprintln!(
+            "COMMON_FORWARD_JUMP synchronized_wrong restored={:.9} correct={:.9} deficit={:.9}",
+            g.speakers[0].t_coil,
+            correct.speakers[0].t_coil,
+            correct.speakers[0].t_coil - g.speakers[0].t_coil
+        );
+        assert!(correct.speakers[0].t_coil - g.speakers[0].t_coil > 40.0);
+        let mut p = persist::decode(&text).unwrap();
+        p.wall.realtime = None;
+        p.wall.synced = false;
+        let now = Wall {
+            realtime: None,
+            synced: false,
+            ..wall("new", 1_800_000_002)
+        };
+        assert!(
+            persist::gap(&p, &now, &origin(&cfg), Some("old"), Duration::from_secs(1)).is_err()
+        );
+    }
+    #[test]
+    fn journal_adjacency_is_necessary_but_not_a_completeness_proof() {
+        let mut cfg = j700();
+        cfg.globals.boot_resume = BootResume::Idle;
+        let text = fixture(&cfg, 60.0, 55.0, 0);
+        assert!(boot(&cfg, &text, 120, Some("intermediate")).0.speakers[0].hard);
+        assert!(boot(&cfg, &text, 120, None).0.speakers[0].hard);
+        let mut p = persist::decode(&text).unwrap();
+        p.origin.machine_id = Some("other".into());
+        assert!(persist::gap(
+            &p,
+            &wall("new", 1_800_000_120),
+            &origin(&cfg),
+            Some("old"),
+            Duration::from_secs(1)
+        )
+        .is_err());
+        // A journal with an unlogged middle boot has precisely this accepted -1.
+        let (g, _, _) = boot(&cfg, &text, 120, Some("old"));
+        eprintln!(
+            "JOURNAL_HOLE_OR_SAME_BOOT_FOREIGN_OWNER accepted={:.9} hard={}",
+            g.speakers[0].t_coil, g.speakers[0].hard
+        );
+        assert!(!g.speakers[0].hard);
+    }
+
+    #[test]
+    fn unsupported_later_owner_in_the_writing_boot() {
+        let mut cfg = j700();
+        cfg.globals.boot_resume = BootResume::Idle;
+        let text = fixture(&cfg, 60.0, 55.0, 0);
+        let (g, _, _) = boot(&cfg, &text, 70, Some("old"));
+        let s = &cfg.speakers[0];
+        let mut truth =
+            crate::engine::Thermal::new(s.tr_coil, s.tau_coil, s.tr_magnet, s.tau_magnet, 60.0);
+        truth.t_magnet = 55.0;
+        let hot = truth.hold(1.0, 60.0, 50.0).0;
+        truth.hold(g.speakers[0].worst_case_power(20.0), 10.0, 50.0);
+        eprintln!("SAME_BOOT_FOREIGN_OWNER later_owner_peak={hot:.9} resumed={:.9} truth_after_10s={:.9} deficit={:.9}",g.speakers[0].t_coil,truth.t_coil,truth.t_coil-g.speakers[0].t_coil);
+        assert!(hot < 135.0 && truth.t_coil > g.speakers[0].t_coil + 10.0 && !g.speakers[0].hard);
+    }
+
+    #[test]
+    fn unsupported_sparse_journal_list() {
+        let journal = "-1 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa earlier boot\n 0 cccccccccccccccccccccccccccccccc current boot\n";
+        let previous = journal
+            .lines()
+            .find_map(|l| {
+                let mut f = l.split_whitespace();
+                (f.next() == Some("-1"))
+                    .then(|| f.next().map(str::to_string))
+                    .flatten()
+            })
+            .unwrap();
+        assert_eq!(previous, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let mut cfg = j700();
+        cfg.globals.boot_resume = BootResume::Idle;
+        let (g, _, _) = boot(
+            &cfg,
+            &fixture_writer(&cfg, 60.0, 55.0, 0, &previous),
+            70,
+            Some(&previous),
+        );
+        eprintln!(
+            "SPARSE_JOURNAL synthetic_list_previous={previous} accepted_temperature={:.9} hard={}",
+            g.speakers[0].t_coil, g.speakers[0].hard
+        );
+        assert!(!g.speakers[0].hard);
     }
 }
