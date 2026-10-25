@@ -1265,6 +1265,26 @@ impl Engine {
             s.hard |= s.peak >= s.t_limit;
         }
         self.raise_to(&low);
+        let eps = crate::state::RECORD_TEMP_EPS;
+        for a in self.asahi.iter_mut().flatten() {
+            a.th.t_coil += eps;
+            a.th.t_magnet += eps;
+            a.coil_peak = a.th.t_coil.max(a.coil_peak + eps);
+            a.magnet_peak = a.th.t_magnet.max(a.magnet_peak + eps);
+            a.coil_hyst = a.th.t_coil.max(a.coil_hyst + eps);
+            a.magnet_hyst = a.th.t_magnet.max(a.magnet_hyst + eps);
+            a.hard |= a.coil_peak.max(a.magnet_peak) >= a.t_limit;
+        }
+        for u in self.unified.iter_mut().flatten() {
+            u.ff.t_coil += eps;
+            u.ff.t_magnet += eps;
+            if let Some(v) = u.vi.as_mut() {
+                v.t_coil += eps;
+                v.t_magnet += eps;
+            }
+            u.peak += eps;
+            u.hard |= u.peak >= u.t_limit;
+        }
     }
 
     pub fn has(&self, gov: Governor) -> bool {

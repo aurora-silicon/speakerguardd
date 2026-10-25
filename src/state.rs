@@ -20,6 +20,12 @@
 
 use std::time::Duration;
 
+/// The state text rounds temperatures to six decimals. A one-microkelvin
+/// allowance dominates the half-microkelvin encoding error at either node
+/// and floating-point evaluation noise. The thermal system is monotone
+/// and does not amplify a uniform initial temperature error.
+pub(crate) const RECORD_TEMP_EPS: f64 = 1e-6;
+
 use crate::config::Globals;
 use crate::engine::{state_name, Engine, SavedAsahi, SavedUnified};
 use crate::model::SpeakerState;
@@ -333,9 +339,9 @@ pub fn restore_interval(speakers: &mut [SpeakerState], engine: &mut Option<Engin
         let coil = th.t_coil.max(low.t_coil).max(magnet + p * spec.tr_coil);
         let (pc, pm) = th.hold(p, span, globals.t_ambient);
         s.raise_to(low);
-        s.t_coil = s.t_coil.max(coil).max(pc);
-        s.t_magnet = s.t_magnet.max(magnet).max(pm);
-        s.t_peak = s.t_peak.max(s.t_coil).max(x.t_peak);
+        s.t_coil = s.t_coil.max(coil).max(pc) + RECORD_TEMP_EPS;
+        s.t_magnet = s.t_magnet.max(magnet).max(pm) + RECORD_TEMP_EPS;
+        s.t_peak = (s.t_peak.max(x.t_peak) + RECORD_TEMP_EPS).max(s.t_coil);
         s.hard |= s.t_peak >= spec.t_limit;
     }
     if let Some(e) = engine {
@@ -368,6 +374,50 @@ mod tests {
     }
 
     const T: Duration = Duration::from_secs(100);
+
+    /// A genuine in-memory state can round down in the record. Compare
+    /// with that unrounded state, rather than treating decoded values as
+    /// truth. No tolerance may hide a colder restored node or peak.
+    #[test]
+    fn persistent_temperatures_cover_record_rounding() {
+        let cfg = Config::parse(include_str!("../conf/apple/j316.conf")).unwrap();
+        let (tc, tm) = (125.12345649, 95.12345649);
+        let mut truth = fresh(&cfg);
+        for s in &mut truth { s.resume(tc, tm, 0.0, 0.0); }
+        let mut engine_truth = Engine::new(&cfg, true).unwrap();
+        for a in engine_truth.asahi.iter_mut().flatten() {
+            (a.th.t_coil, a.th.t_magnet, a.coil_hyst, a.magnet_hyst, a.coil_peak, a.magnet_peak, a.hard) = (tc, tm, tc, tm, tc, tm, false);
+        }
+        for u in engine_truth.unified.iter_mut().flatten() {
+            (u.ff.t_coil, u.ff.t_magnet, u.peak, u.hard) = (tc, tm, tc, false);
+            if let Some(v) = u.vi.as_mut() { (v.t_coil, v.t_magnet) = (tc, tm); }
+        }
+        let saved = decode(&encode_with(T, T, &truth, Some(&engine_truth), false, true)).unwrap();
+        let saved = Saved { boottime: Duration::ZERO, covered: Duration::ZERO, ..saved };
+        let mut bound = fresh(&cfg);
+        let mut engine_bound = Engine::new(&cfg, true);
+        assert!(restore_interval(&mut bound, &mut engine_bound, &saved, Duration::from_secs(1), Duration::from_secs(1), &cfg.globals));
+        for s in &mut truth {
+            s.step_pre(s.worst_case_power(cfg.globals.safe_reduction), s.worst_case_power(0.0), 1.0, cfg.globals.t_ambient);
+        }
+        engine_truth.worst(1.0, &vec![cfg.globals.safe_reduction; cfg.speakers.len()]);
+        for (b, a) in bound.iter().zip(&truth) {
+            assert!(b.t_coil >= a.t_coil && b.t_magnet >= a.t_magnet, "{}: rounded restore {b:?}, unrounded truth {a:?}", b.spec.name);
+        }
+        let engine_bound = engine_bound.unwrap();
+        for (b, a) in engine_bound.asahi.iter().flatten().zip(engine_truth.asahi.iter().flatten()) {
+            assert!(b.th.t_coil >= a.th.t_coil && b.th.t_magnet >= a.th.t_magnet);
+            assert!(b.coil_peak >= a.coil_peak && b.magnet_peak >= a.magnet_peak);
+            assert!(b.coil_hyst >= a.coil_hyst && b.magnet_hyst >= a.magnet_hyst);
+        }
+        for (b, a) in engine_bound.unified.iter().flatten().zip(engine_truth.unified.iter().flatten()) {
+            assert!(b.ff.t_coil >= a.ff.t_coil && b.ff.t_magnet >= a.ff.t_magnet);
+            assert!(b.peak >= a.peak);
+            if let (Some(b), Some(a)) = (&b.vi, &a.vi) {
+                assert!(b.t_coil >= a.t_coil && b.t_magnet >= a.t_magnet);
+            }
+        }
+    }
 
     /// Every interior age, not just the endpoints, must fit the restored
     /// state. Include cooling magnets, rising magnets, long ages crossing

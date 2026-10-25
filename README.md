@@ -170,7 +170,8 @@ save and restore. Restore also bounds the whole wall-clock read to 50 ms.
 The shutdown record keeps the whole delay from the model snapshot through
 the clock reads. These bounds give an interval of possible snapshot ages.
 The restored coil, magnet and governing peaks bound that entire interval,
-including interior coil extrema. The legacy model uses an invariant upper
+including interior coil extrema. A one-microkelvin upward allowance covers
+the temperature record's six-decimal rounding. The legacy model uses an invariant upper
 bound that also covers its magnet-first numerical steps. Full-scale power
 before the gain is charged to the budgets through the longest possible age.
 
