@@ -289,19 +289,15 @@ impl SpeakerState {
         v * v / self.spec.z_nominal
     }
 
-    /// Start at the coil's limit with the hard fault latched, the magnet
-    /// where steady state would put it: nothing about the speaker's past is
-    /// known (no state of this daemon, an unreadable one).  The card stays
-    /// with the kernel until the model has cooled under the working ceiling.
+    /// Unknown history can leave either node at the hard limit. Bound
+    /// them independently, then cover a possible queued full-scale drain.
+    /// The J700 safe-level equilibrium is colder than this envelope.
     pub fn assume_latched(&mut self, t_ambient: f64) {
-        let s = &self.spec;
-        // A run that kept the coil under its limit may have died with its
-        // gain on the samples still queued: they play out for up to the
-        // drain at full scale (the hottest it can then be).
-        let drain = self.worst_case_power(0.0) * s.tr_coil * (1.0 - (-DRAIN_S / s.tau_coil).exp());
-        self.t_coil = s.t_limit + drain;
-        self.t_magnet = t_ambient + (self.t_coil - t_ambient) * s.tr_magnet / (s.tr_magnet + s.tr_coil);
-        self.t_peak = self.t_coil;
+        self.t_coil = self.spec.t_limit;
+        self.t_magnet = self.spec.t_limit;
+        self.t_peak = self.spec.t_limit;
+        self.heat(self.worst_case_power(0.0), DRAIN_S, t_ambient);
+        self.t_coil = self.t_peak;
         self.hard = true;
         // nor is the power before the gain: a minute of full scale for the
         // budgets (they ask for their most until the minute has passed)
@@ -720,5 +716,37 @@ mod tests {
         assert!((s.worst_case_power(20.0) - 0.073 * 7.3 / 4.2).abs() < 1e-9);
         // a negative reduction cannot raise the card above its full scale
         assert_eq!(s.worst_case_power(-6.0), s.worst_case_power(0.0));
+    }
+}
+
+#[cfg(test)]
+mod independent_start_tests {
+    use super::*;
+    #[test]
+    fn unknown_start_bounds_a_hot_coil_and_a_hot_magnet() {
+        let cfg = crate::config::Config::parse(include_str!("../conf/apple/j700.conf")).unwrap();
+        for spec in cfg.speakers {
+            let mut bound = SpeakerState::new(spec.clone(), cfg.globals.t_ambient);
+            bound.assume_latched(cfg.globals.t_ambient);
+            assert!(bound.hard);
+            assert!(bound.t_coil >= spec.t_limit && bound.t_magnet >= spec.t_limit);
+            let full = bound.worst_case_power(0.0);
+            let safe = bound.worst_case_power(cfg.globals.safe_reduction);
+            for c in [cfg.globals.t_ambient, spec.t_limit] {
+                for m in [cfg.globals.t_ambient, spec.t_limit] {
+                    for drain in [0.0, 0.1, DRAIN_S] {
+                        let mut actual = SpeakerState::new(spec.clone(), c);
+                        actual.t_magnet = m;
+                        actual.step(full, drain, cfg.globals.t_ambient);
+                        let mut upper = bound.clone();
+                        for _ in 0..6000 {
+                            assert!(upper.t_coil >= actual.t_coil - 1e-8 && upper.t_magnet >= actual.t_magnet - 1e-8);
+                            upper.step(safe, 0.1, cfg.globals.t_ambient);
+                            actual.step(safe, 0.1, cfg.globals.t_ambient);
+                        }
+                    }
+                }
+            }
+        }
     }
 }

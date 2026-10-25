@@ -314,3 +314,14 @@ At the first ping the daemon reads the controls' range with the lock lifted
 and checks the card's safe level (the locked maximum against it) against
 `safe_reduction`.  A card that is louder there than the configuration says
 is never unlocked: the speakers stay at its safe level.
+
+The hot-start backport bounds the J700 coil and magnet independently,
+including the possible queued full-scale drain. An unknown prior session
+keeps the hard latch until this envelope has cooled. The existing floor,
+queue rules and kernel safe level remain in effect. A no-device 20-minute
+full-scale regression starts both truth nodes at 135 C.
+
+The controls are held at minimum before the first unlock and each retake.
+Even the kernel safe level can add heat when both nodes start at the hard
+limit. The minimum write prevents that startup dose. Kernel fallback,
+copy-queue accounting and the running output floor are unchanged.
