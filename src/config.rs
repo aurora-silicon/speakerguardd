@@ -207,6 +207,10 @@ pub struct Config {
 
 type Sections = BTreeMap<String, BTreeMap<String, String>>;
 
+#[cfg(test)]
+#[path = "profile_tests.rs"]
+mod profile_tests;
+
 fn parse_ini(text: &str) -> Result<Sections, ConfigError> {
     let mut sections: Sections = BTreeMap::new();
     let mut current: Option<String> = None;
