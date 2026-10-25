@@ -1906,13 +1906,13 @@ impl Guard {
         }
         if self.armed {
             // what is written: the governor's reduction, never under the
-            // floor (review r7 Y2)
-            let reduction = self.target_db(hw, reduction);
+            // floor (review r7 Y2), whose bisection runs once a pass
+            let floor = self.target_db(hw, 0.0);
+            let reduction = reduction.max(floor);
             if (reduction - self.applied).abs() >= 0.5 {
                 info!("gain reduction {reduction:.1} dB");
                 self.applied = reduction;
             }
-            let floor = self.target_db(hw, 0.0);
             let per: Vec<f64> = per.iter().map(|&r| r.max(floor)).collect();
             let due = per != self.requested || hw.now().duration_since(self.last_write) >= PING_INTERVAL;
             // the legacy governor writes one value to every control; the
@@ -2996,6 +2996,25 @@ pub(crate) mod tests {
             if !unlocks {
                 assert!(hw.hw.pings.len() <= 1 && !hw.hw.unlocked_at(hw.hw.t), "{:?}", hw.hw.pings);
             }
+        }
+    }
+
+    /// The copy-queue rules and the floor follow the configuration: on for
+    /// the J700, which converts on copy, and off for every V/I machine,
+    /// whose amplifiers apply their gain as each sample plays (a V/I file
+    /// that lost its sense keys or amp_gain_dbv would turn them on, which
+    /// costs loudness, never protection).
+    #[test]
+    fn the_copy_queue_rules_hold_on_the_j700_only() {
+        let start = |cfg: &Config| {
+            let mut hw = if cfg.has_vi() { FakeHw::per_speaker(cfg) } else { FakeHw::new(cfg.globals.channels, cfg.globals.period) };
+            Guard::start(&mut hw, cfg, cfg.globals.max_reduction, tmp_state()).unwrap().copy_queue
+        };
+        assert!(start(&j700()));
+        for text in [J316, J413, J616] {
+            let mut cfg = Config::parse(text).unwrap();
+            cfg.allow_unqualified = true;
+            assert!(!start(&cfg), "{}", cfg.speakers[0].name);
         }
     }
 
