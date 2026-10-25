@@ -446,6 +446,10 @@ fn legacy_onset_ceiling_uses_its_ff_nodes_instead_of_the_vi_shadow() {
     cfg.globals.guard = None;
     let mut hw = FakeHw::per_speaker(&cfg);
     let mut g = Guard::start(&mut hw, &cfg, cfg.globals.max_reduction, None).unwrap();
+    // Establish a drained minimum before injecting the two model states.
+    // An unknown earlier full gain must otherwise forbid the warm request.
+    hw.sleep(QUEUE_BOUND + Duration::from_millis(1));
+    g.account_to = hw.now();
     for s in &mut g.speakers {
         s.settle_at(0.0, 0.0, cfg.globals.t_ambient);
         s.t_coil = 130.0;

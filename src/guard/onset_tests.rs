@@ -262,8 +262,8 @@ fn check_truth(cfg: &Config, hw: &Tracked, name: &str, must_rearm: bool) {
                     gain = next[k];
                 }
                 eprintln!(
-                    "ONSET {name} {:?} {} ff={ff} initial={initial} peak={peak:.6}",
-                    cfg.globals.governor, s.name
+                    "ONSET {name} {:?} {} ff={ff} initial={initial} peak={peak:.6} clean={}",
+                    cfg.globals.governor, s.name, hw.clean_start
                 );
                 assert!(
                     peak <= s.t_limit + 1e-6,
@@ -318,40 +318,46 @@ fn every_vi_profile_bounds_full_scale_after_mute() {
         if !cfg.has_vi() {
             continue;
         }
-        let (cfg, hw) = full_scale_run(cfg, 120, true);
-        // A fallback whose worst-case steady state is above the working
-        // limit cannot support the ceiling's safe tail. All other files
-        // must actually unlock while quiet before the full-scale onset.
-        let safe = 10f64.powf(-cfg.globals.safe_reduction / 10.0);
-        let viable = cfg.speakers.iter().all(|s| {
-            let p = v_worst(s, &cfg.globals).powi(2) * safe;
-            let target = s.t_limit - s.t_headroom;
-            cfg.globals.t_ambient
-                + p / s.z_min() * crate::engine::ASAHI_MARGIN * (s.vi_tr_coil + s.vi_tr_magnet)
-                < target
-                && cfg.globals.t_ambient + p / s.r_ff * (s.tr_coil + s.tr_magnet) < target
-        });
-        check_truth(
-            &cfg,
-            &hw,
-            path.file_stem().unwrap().to_str().unwrap(),
-            viable,
-        );
-        if viable {
-            assert!(
-                hw.hw
-                    .pings
-                    .first()
-                    .is_some_and(|t| *t < hw.full_onset.unwrap()),
-                "{} never unlocked before its onset",
-                path.display()
+        for gov in [Governor::Asahi, Governor::Unified] {
+            let mut cfg = cfg.clone();
+            cfg.globals.governor = gov;
+            cfg.globals.guard = (gov == Governor::Unified).then_some(Governor::Asahi);
+            let (cfg, hw) = full_scale_run(cfg, 120, true);
+            // A fallback whose worst-case steady state is above the working
+            // limit cannot support the ceiling's safe tail. All other files
+            // must actually unlock while quiet before the full-scale onset.
+            let safe = 10f64.powf(-cfg.globals.safe_reduction / 10.0);
+            let viable = cfg.speakers.iter().all(|s| {
+                let p = v_worst(s, &cfg.globals).powi(2) * safe;
+                let target = s.t_limit - s.t_headroom;
+                cfg.globals.t_ambient
+                    + p / s.z_min() * crate::engine::ASAHI_MARGIN * (s.vi_tr_coil + s.vi_tr_magnet)
+                    < target
+                    && (gov != Governor::Unified
+                        || cfg.globals.t_ambient + p / s.r_ff * (s.tr_coil + s.tr_magnet) < target)
+            });
+            check_truth(
+                &cfg,
+                &hw,
+                path.file_stem().unwrap().to_str().unwrap(),
+                viable,
             );
-        } else {
-            assert!(
-                hw.hw.pings.is_empty(),
-                "{} unlocked with an unbounded safe tail",
-                path.display()
-            );
+            if viable {
+                assert!(
+                    hw.hw
+                        .pings
+                        .first()
+                        .is_some_and(|t| *t < hw.full_onset.unwrap()),
+                    "{} never unlocked before its onset",
+                    path.display()
+                );
+            } else {
+                assert!(
+                    hw.hw.pings.is_empty(),
+                    "{} unlocked with an unbounded safe tail",
+                    path.display()
+                );
+            }
         }
     }
 }
@@ -474,5 +480,41 @@ fn reviewed_guarded_quiet_to_full_onsets_stay_under_the_limit() {
         cfg.globals.guard = Some(Governor::Asahi);
         let (cfg, hw) = full_scale_run(cfg, 120, true);
         check_truth(&cfg, &hw, &format!("{name}-quiet"), true);
+    }
+}
+
+#[test]
+fn a_failed_legacy_write_keeps_the_card_wide_ceiling_as_a_candidate() {
+    let mut cfg = Config::parse(include_str!("../../conf/apple/j413.conf")).unwrap();
+    cfg.allow_unqualified = true;
+    cfg.globals.governor = Governor::Legacy;
+    cfg.globals.guard = None;
+    let mut hw = FakeHw::per_speaker(&cfg);
+    hw.level = Box::new(|_| 0.0);
+    let path = tests::vi_state(&cfg, cfg.globals.t_ambient, cfg.globals.t_ambient);
+    let mut g = Guard::start(&mut hw, &cfg, cfg.globals.max_reduction, Some(path)).unwrap();
+    while hw.t < Duration::from_secs(2) { g.tick(&mut hw).unwrap(); }
+    assert!(g.armed());
+    for s in &mut g.speakers {
+        if s.spec.name.contains("Tweeter") {
+            s.t_coil = 60.0;
+            s.t_magnet = 75.0;
+        }
+    }
+    for a in g.engine.as_mut().unwrap().asahi.as_mut().unwrap() {
+        a.th.t_coil = 60.0;
+        a.th.t_magnet = 75.0;
+    }
+    let (_, mut per, _) = g.governing_state();
+    assert!(g.bound_onset(hw.now(), &mut per));
+    let target = per.iter().copied().fold(0.0, f64::max);
+    assert!(per.iter().any(|r| *r < target));
+    // An I/O error does not say which individual controls accepted the
+    // scalar write. Every control must retain the attempted scalar value.
+    hw.target_fail = Box::new(|_| true);
+    g.decide(&mut hw, false).unwrap();
+    assert!(!g.armed());
+    for set in &g.written_set {
+        assert!(set.iter().any(|&(lo, hi)| lo <= target && hi >= target), "{set:?} omitted {target}");
     }
 }

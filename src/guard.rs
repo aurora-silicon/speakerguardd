@@ -1738,12 +1738,15 @@ impl Guard {
                 info!("gain reduction {reduction:.1} dB");
                 self.applied = reduction;
             }
-            let due = per != self.requested || hw.now().duration_since(self.last_write) >= PING_INTERVAL;
-            // the legacy governor writes one value to every control; the
-            // engine's write per speaker (a card with one control gets the
-            // largest)
-            let n = per.len();
+            // The legacy write sends the largest ceiling to every control.
+            // Track that same request on failure too: any control may have
+            // accepted it before a later control failed.
             let target = per.iter().copied().fold(reduction, f64::max);
+            if self.governing == Governor::Legacy {
+                per.fill(target);
+            }
+            let due = per != self.requested || hw.now().duration_since(self.last_write) >= PING_INTERVAL;
+            let n = per.len();
             let write = |hw: &mut H| if self.governing == Governor::Legacy { hw.set_reduction(target).map(|a| vec![a; n]) } else { hw.set_reductions(&per) };
             match if due { write(hw).map(Some) } else { Ok(None) } {
                 Ok(None) => {}
