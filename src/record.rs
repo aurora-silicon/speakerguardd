@@ -99,6 +99,9 @@ pub fn fingerprint(cfg: &Config) -> u64 {
     // nor a profile without its own amp gain index (review L2-1: the
     // recordings made before the field existed still match)
     globals = globals.replace(", amp_gain_index: None", "");
+    // nor a file on the default boot_resume (the recordings made before
+    // the key existed still match)
+    globals = globals.replace(", boot_resume: Latched", "");
     // nor does a speaker without its own z_min
     let speakers = format!("{:?}", cfg.speakers).replace(", z_min_override: None", "");
     let text = format!("{globals}{:?}{speakers}", cfg.controls);
@@ -1809,5 +1812,8 @@ mod fingerprint_history {
         let with = include_str!("../conf/apple/j316.conf").replace("amp_gain_dbv = 18.5", "amp_gain_dbv = 18.5\namp_gain_index = 15");
         let without = include_str!("../conf/apple/j316.conf");
         assert_ne!(super::fingerprint(&crate::config::Config::parse(&with).unwrap()), super::fingerprint(&crate::config::Config::parse(without).unwrap()));
+        let mut idle = crate::config::Config::parse(include_str!("../conf/apple/j700.conf")).unwrap();
+        idle.globals.boot_resume = crate::config::BootResume::Idle;
+        assert_ne!(super::fingerprint(&idle), 0x09c595d1ff48e20b);
     }
 }
