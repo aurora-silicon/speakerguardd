@@ -1747,7 +1747,7 @@ mod tests {
     const J616: &str = include_str!("../conf/apple/j616.conf");
 
     fn cfg(text: &str) -> Config {
-        Config::parse(text).unwrap()
+        Config::parse(&Config::asahi_alone(text)).unwrap()
     }
 
     fn idx(c: &Config, name: &str) -> usize {

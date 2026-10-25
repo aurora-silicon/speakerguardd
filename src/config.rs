@@ -536,6 +536,16 @@ impl Config {
         Ok(())
     }
 
+    /// Tests: `text` with speakersafetyd's governor alone, the V/I files'
+    /// default before the feed-forward model became primary (the tests
+    /// written against it keep their meaning).
+    #[cfg(test)]
+    pub fn asahi_alone(text: &str) -> String {
+        let s = text.replace("governor = unified\nguard = asahi\n", "governor = asahi\n");
+        assert!(s != text || !text.contains("guard = asahi"), "the file's governor lines changed");
+        s
+    }
+
     pub fn load(path: &Path) -> Result<Config, Box<dyn std::error::Error>> {
         let text = fs::read_to_string(path)?;
         Ok(Config::parse(&text)?)
@@ -591,7 +601,9 @@ mod tests {
         for text in [J316, J413, J616] {
             let c = Config::parse(text).unwrap();
             assert!(c.has_vi());
-            assert_eq!(c.globals.governor, Governor::Asahi);
+            // feed-forward primary, the V/I model guarding it
+            assert_eq!(c.globals.governor, Governor::Unified);
+            assert_eq!(c.globals.guard, Some(Governor::Asahi));
             assert_eq!(c.globals.sense_format, SenseFormat::S16);
             assert_eq!(c.globals.max_reduction, 7.0);
             assert_eq!(c.controls.isense.as_deref(), Some("ISENSE Switch"));
@@ -641,7 +653,7 @@ mod tests {
     /// still needs the experimental flag.
     #[test]
     fn the_asahi_guard_lets_the_unified_governor_write_the_card() {
-        let guarded = J316.replace("governor = asahi", "governor = unified\nguard = asahi");
+        let guarded = J316.to_string();
         let mut c = Config::parse(&guarded).unwrap();
         assert_eq!(c.globals.guard, Some(Governor::Asahi));
         c.allow_unqualified = true;
@@ -649,7 +661,7 @@ mod tests {
         c.globals.guard = None;
         assert!(c.check_governor().is_err(), "unified governed alone without the flag");
         // the guard guards the unified governor only, and needs V/I sense
-        assert!(Config::parse(&J316.replace("governor = asahi", "governor = asahi\nguard = asahi")).is_err());
+        assert!(Config::parse(&J316.replace("governor = unified", "governor = asahi")).is_err());
         assert!(Config::parse(&J700.replace("[Globals]", "[Globals]\ngovernor = unified\nguard = asahi")).is_err());
         assert!(Config::parse(&guarded.replace("amp_gain_dbv = 18.5", "amp_gain_dbv = 0")).is_err());
         assert!(Config::parse(&guarded.replace("guard = asahi", "guard = legacy")).is_err());
@@ -657,7 +669,7 @@ mod tests {
         // the command line's choice is checked the same way
         let mut c = Config::parse(J316).unwrap();
         c.allow_unqualified = true;
-        c.globals.guard = Some(Governor::Asahi);
+        c.globals.governor = Governor::Asahi;
         assert!(c.check_governor().is_err(), "guarded the asahi governor");
         c.globals.governor = Governor::Unified;
         assert!(c.check_governor().is_ok());
@@ -674,7 +686,7 @@ mod tests {
         // asahi needs current sense and the amplifier's level
         assert!(Config::parse(&J700.replace("[Globals]", "[Globals]\ngovernor = asahi")).is_err());
         assert!(Config::parse(&J316.replace("amp_gain_dbv = 18.5", "amp_gain_dbv = 0")).is_err());
-        assert!(Config::parse(&J316.replace("governor = asahi", "governor = legacy")).is_ok());
+        assert!(Config::parse(&J316.replace("governor = unified\nguard = asahi", "governor = legacy")).is_ok());
         assert!(Config::parse(&J700.replace("[Globals]", "[Globals]\ngovernor = loud")).is_err());
         // a current channel on the voltage channel is a broken map
         assert!(Config::parse(&J413.replacen("is_chan = 0", "is_chan = 1", 1)).is_err());
