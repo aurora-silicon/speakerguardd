@@ -50,12 +50,19 @@
 //!   measured-power model has the same constants under a look-ahead: on
 //!   loud tweeters it asked for more than speakersafetyd's ramp and handed
 //!   the card over more often, for no protection the guard lacks.  It
-//!   still runs, latches and is logged.)  Current that reads too little (a
-//!   dead current line) only makes the asahi models see less: the guard
-//!   then adds nothing, and the feed-forward model governs alone, as it
-//!   does on a machine without current sense.  Sense data that is not a
-//!   measurement at all stays a fault, as without the guard: the
-//!   feed-forward model's voltage comes from the same words.
+//!   still runs, latches and is logged.)  A dead current line is bounded,
+//!   below.  Sense data that is not a measurement at all stays a fault, as
+//!   without the guard: the feed-forward model's voltage comes from the
+//!   same words.
+//! * A current line that reads far too little for its voltage (a dead or
+//!   faulty line, see DEAD_RATIO) is lost for the stretch (review r4 BB1
+//!   of speakerguardd#8).  The measured-power models then take V^2 over
+//!   the speaker's smallest impedance, the most current there can be, as
+//!   at the sense's rail: the asahi governor, and the guard, keep Asahi's
+//!   constants with a bound at least as hot as a live line, instead of
+//!   seeing nothing.  What a line lost too briefly for a block to show
+//!   may have under-read at a stretch's ends is charged late (Engine::
+//!   measured).
 //! * Resistance thermometry from low-band V/I (`R = sum(v i) / sum(i^2)`)
 //!   is only measured and logged.
 
@@ -99,6 +106,65 @@ pub fn sense_power(wv: f64, wi: f64, (vs, is): (f64, f64), i_max: f64) -> f64 {
 /// What the unified regulator asks for when nothing may pass (dB): far past
 /// any --max-reduction, so the kernel takes over.
 const NOTHING_DB: f64 = 120.0;
+/// A current line reads far too little for its voltage (review r4 BB1 of
+/// speakerguardd#8) when, over a 10 ms block, |V|/|I| (rms) is over
+/// DEAD_RATIO times the speaker's nominal impedance, or over a 1 ms block
+/// DEAD_RATIO_SHORT times it.  A live line stays under both: through a load
+/// of up to 60 degrees, a sine of 20 Hz or more reads at most 2.4 times
+/// its impedance over 10 ms and 23.7 times over 1 ms, and a laptop
+/// driver's impedance peaks at a few times its nominal (the J616s's left
+/// woofer 1, whose current sense reads half, at twice).  The short block
+/// catches a loud program's lost line within a millisecond; the long one
+/// a quiet program's, whose sense noise the short one cannot see past.
+pub const DEAD_RATIO: f64 = 10.0;
+pub const DEAD_RATIO_SHORT: f64 = 100.0;
+pub const DEAD_LONG_S: f64 = 0.010;
+pub const DEAD_SHORT_S: f64 = 0.001;
+/// Neither block is shorter than this (frames).
+pub const DEAD_BLOCK_MIN: usize = 8;
+/// A block is judged only at this much voltage or more (V rms): under it
+/// the most current there can be heats next to nothing (3.7 mW into 2.7
+/// ohm), and the current is too close to the sense noise to judge.
+pub const DEAD_V_MIN: f64 = 0.1;
+/// Measured stretches further apart than this (s) do not follow each
+/// other: what a line lost at the end of the first may have under-read is
+/// charged, since the next cannot show it.
+pub const DEAD_GAP_S: f64 = 0.010;
+
+/// Block `len` frames long at `step` seconds a frame.
+pub fn dead_block(len_s: f64, step: f64) -> usize {
+    ((len_s / step).round() as usize).max(DEAD_BLOCK_MIN)
+}
+
+/// Whether the current line `i` (A) lost its reading against the voltage
+/// `v` (V) anywhere in a stretch, and whether a 10 ms block of it carried
+/// a voltage to judge (and so, not lost, showed the line reading).
+pub fn line_lost(v: &[f64], i: &[f64], z_nominal: f64, step: f64) -> (bool, bool) {
+    let n = v.len().min(i.len());
+    let mut lost = false;
+    let mut judged = false;
+    for (len, ratio, long) in [(DEAD_LONG_S, DEAD_RATIO, true), (DEAD_SHORT_S, DEAD_RATIO_SHORT, false)] {
+        let block = dead_block(len, step);
+        let limit = (ratio * z_nominal).powi(2);
+        let mut f0 = 0;
+        while f0 + block <= n {
+            let (mut v_ms, mut i_ms) = (0.0, 0.0);
+            for f in f0..f0 + block {
+                v_ms += v[f] * v[f];
+                i_ms += i[f] * i[f];
+            }
+            if v_ms >= DEAD_V_MIN * DEAD_V_MIN * block as f64 {
+                judged |= long;
+                if !(i_ms * limit >= v_ms) {
+                    lost = true;
+                }
+            }
+            f0 += block;
+        }
+    }
+    (lost, judged)
+}
+
 /// Frames the card may have converted at more reduction than this (dB)
 /// say too little about the program for the unified regulator to predict
 /// it from them (the card's safe level, an unknown control): the
@@ -238,6 +304,21 @@ impl Thermal {
         self.t_magnet = m_inf + (m0 - m_inf) * (-h / self.tau_magnet).exp();
         self.t_coil = alpha + beta * power;
         (hi(hi(c0, self.t_coil), inside), hi(m0, self.t_magnet))
+    }
+
+    /// `e` joules at once: heat a stretch under-read, charged late (a lost
+    /// current line, review r4 BB1 of speakerguardd#8).  The coil rises by
+    /// e * Rc / tau_c and the magnet by e * Rm / tau_m, as at an instant of
+    /// the power that carries it, the coil by at least the magnet's rise:
+    /// the response then only falls, so heat charged late is never cooler
+    /// than the same heat earlier.
+    pub fn impulse(&mut self, e: f64) -> (f64, f64) {
+        if e != 0.0 {
+            let m = e * self.tr_magnet / self.tau_magnet;
+            self.t_coil += hi(e * self.tr_coil / self.tau_coil, m);
+            self.t_magnet += m;
+        }
+        (self.t_coil, self.t_magnet)
     }
 
     /// The coil at its extremum strictly inside (0, h) at a constant
@@ -545,7 +626,7 @@ impl AsahiSpeaker {
     /// The first frame is `first` of a step long (the part of it over
     /// time not yet accounted).
     #[allow(clippy::too_many_arguments)]
-    fn samples(&mut self, words: &[i32], channels: usize, (vc, ic): (usize, usize), (vs, is): (f64, f64), step: f64, first: f64, t_ambient: f64) {
+    fn samples(&mut self, words: &[i32], channels: usize, (vc, ic): (usize, usize), (vs, is): (f64, f64), step: f64, first: f64, t_ambient: f64, lost: bool) {
         let coeffs = |h: f64| (h / (self.th.tau_coil + h), h / (self.th.tau_magnet + h));
         let (ac1, am1) = coeffs(step * first);
         let (acn, amn) = coeffs(step);
@@ -562,7 +643,12 @@ impl AsahiSpeaker {
         let mut negative_after = false;
         for (i, f) in words.chunks_exact(channels).enumerate() {
             let (ac, am) = if i == 0 { (ac1, am1) } else { (acn, amn) };
-            let p = sense_power(f[vc] as f64, f[ic] as f64, (vs, is), self.v_worst / self.z_min) * ASAHI_MARGIN;
+            let p = if lost {
+                // the current line is lost: the most current there can be
+                (f[vc] as f64 * vs).powi(2) / self.z_min
+            } else {
+                sense_power(f[vc] as f64, f[ic] as f64, (vs, is), self.v_worst / self.z_min)
+            } * ASAHI_MARGIN;
             if crossed && p < -VI_NOISE_FLOOR {
                 negative_after = true;
             }
@@ -604,6 +690,13 @@ impl AsahiSpeaker {
     fn idle(&mut self, d: f64, t_ambient: f64) {
         let (c, m) = self.th.hold(0.0, d, t_ambient);
         self.note(c, m);
+    }
+
+    /// `e` joules a lost current line may have under-read, charged late
+    /// (see Engine::measured).
+    fn charge(&mut self, e: f64) {
+        let (c, m) = self.th.impulse(e * ASAHI_MARGIN);
+        self.note(hi(self.coil_peak, c), hi(self.magnet_peak, m));
     }
 
     /// speakersafetyd's ramp: hold each temperature up to `t_hysteresis`
@@ -871,6 +964,14 @@ impl UnifiedSpeaker {
         }
     }
 
+    /// `e` joules a lost current line may have under-read, charged late
+    /// on the measured-power model (see Engine::measured).
+    fn charge_vi(&mut self, e: f64) {
+        let Some(vi) = self.vi.as_mut() else { return };
+        let (c, m) = vi.impulse(e);
+        self.note(hi(self.peak, hi(c, m)));
+    }
+
     #[cfg(test)]
     pub fn idle_for_test(&mut self, d: f64, t_ambient: f64) {
         self.idle(d, t_ambient)
@@ -984,6 +1085,18 @@ pub struct Engine {
     pub extractor: Extractor,
     /// The features of the last stretch of measured frames.
     pub last: Vec<Feature>,
+    /// Per speaker: whether its current line was lost over the last
+    /// stretch, and the transitions since the guard last logged them.
+    pub lost: Vec<bool>,
+    pub lost_changed: Vec<(usize, bool)>,
+    /// Per speaker: the heat (J) a line lost at the end of the last stretch
+    /// may have under-read, not yet charged, and whether that stretch
+    /// showed the line reading (review r4 BB1).
+    pending: Vec<f64>,
+    reading: Vec<bool>,
+    /// Seconds accounted since the last measured stretch, or none since an
+    /// idle span (the next stretch does not follow it).
+    gap: f64,
 }
 
 /// Every speaker of a group gets the group's largest reduction.
@@ -1006,7 +1119,7 @@ impl Engine {
             return None;
         }
         let n = cfg.speakers.len();
-        Some(Engine { cfg: cfg.clone(), asahi, unified, extractor: Extractor::new(n), last: vec![Feature::default(); n] })
+        Some(Engine { cfg: cfg.clone(), asahi, unified, extractor: Extractor::new(n), last: vec![Feature::default(); n], lost: vec![false; n], lost_changed: Vec::new(), pending: vec![0.0; n], reading: vec![false; n], gap: f64::INFINITY })
     }
 
     pub fn has(&self, gov: Governor) -> bool {
@@ -1129,11 +1242,22 @@ impl Engine {
             let mut known = Vec::with_capacity(frames);
             let unified = self.unified.as_ref().map(|u| &u[sk]);
             let i_max = v_worst(s, &g) / s.z_nominal.min(s.r_ff);
+            let z_min = s.z_nominal.min(s.r_ff);
+            // A current line that reads far too little for its voltage in
+            // any block of the stretch is lost for all of it (review r4 BB1)
+            let (lost, judged) = match s.is_chan {
+                Some(ic) => {
+                    let v: Vec<f64> = (0..frames).map(|f| words[f * ch + s.vs_chan] as f64 * vs).collect();
+                    let i: Vec<f64> = (0..frames).map(|f| words[f * ch + ic] as f64 * is).collect();
+                    line_lost(&v, &i, s.z_nominal, step)
+                }
+                None => (false, false),
+            };
             for f in 0..frames {
                 let wv = words[f * ch + s.vs_chan] as f64;
                 let wi = s.is_chan.map_or(0.0, |ic| words[f * ch + ic] as f64);
                 v2.push((wv * vs).powi(2));
-                vi.push(sense_power(wv, wi, (vs, is), i_max));
+                vi.push(if lost { (wv * vs).powi(2) / z_min } else { sense_power(wv, wi, (vs, is), i_max) });
                 if let Some(u) = unified {
                     let room = if wv != 0.0 { 20.0 * (2147483648.0 / wv.abs()).log10() } else { f64::INFINITY };
                     let at = converted_at(room, &possible[sk]);
@@ -1146,12 +1270,52 @@ impl Engine {
                     let full_vi = u.v_worst * u.v_worst / u.z_min;
                     pre_ff.push((vup * vup / u.r_ff * gain).min(full_ff));
                     let up = if wi.abs() >= I_RAIL { (vup * iup).max(vup * i_max) } else { vup * iup };
-                    pre_vi.push(if wv * wi > 0.0 || wi.abs() >= I_RAIL { (up * gain).min(full_vi) } else { 0.0 });
+                    pre_vi.push(if lost {
+                        (vup * vup / z_min * gain).min(full_vi)
+                    } else if wv * wi > 0.0 || wi.abs() >= I_RAIL {
+                        (up * gain).min(full_vi)
+                    } else {
+                        0.0
+                    });
                 }
+            }
+            let mut charge = 0.0;
+            if s.is_chan.is_some() {
+                // What a line lost where no block could show it may have
+                // under-read: the most current there can be, less what the
+                // sense read, at the end of the stretch before (its last
+                // long block and the rest) and at the start of this one.
+                // The end's is charged unless this stretch follows it and
+                // shows the line reading; the start's unless the stretch
+                // before did.  A lost stretch is bounded throughout.  The
+                // charge comes after the stretch's own frames: heat charged
+                // later is never cooler (Thermal::impulse).
+                let deficit: Vec<f64> = (0..frames).map(|f| {
+                    let wv = words[f * ch + s.vs_chan] as f64;
+                    let wi = words[f * ch + s.is_chan.unwrap()] as f64;
+                    ((wv * vs).powi(2) / z_min - sense_power(wv, wi, (vs, is), i_max)).max(0.0) * step
+                }).collect();
+                let long = dead_block(DEAD_LONG_S, step);
+                let follows = self.gap <= DEAD_GAP_S;
+                let reading = !lost && judged;
+                let mut e = 0.0;
+                if !(follows && reading) {
+                    e += self.pending[sk];
+                }
+                if !lost && !(follows && self.reading[sk]) {
+                    e += deficit[..long.min(frames)].iter().sum::<f64>();
+                }
+                charge = e;
+                self.pending[sk] = if lost { 0.0 } else { deficit[frames.saturating_sub(long + frames % long)..].iter().sum() };
+                self.reading[sk] = reading;
+                if lost != self.lost[sk] {
+                    self.lost_changed.push((sk, lost));
+                }
+                self.lost[sk] = lost;
             }
             if let (Some(asahi), Some(ic)) = (self.asahi.as_mut(), s.is_chan) {
                 let (a, b) = run(best(&vi));
-                asahi[sk].samples(&words[a * ch..b * ch], ch, (s.vs_chan, ic), (vs, is), step, first, g.t_ambient);
+                asahi[sk].samples(&words[a * ch..b * ch], ch, (s.vs_chan, ic), (vs, is), step, first, g.t_ambient, lost);
             }
             if let Some(u) = self.unified.as_mut() {
                 let vi_pos: Vec<f64> = vi.iter().map(|x| x.max(0.0)).collect();
@@ -1190,8 +1354,37 @@ impl Engine {
                 }
                 u[sk].predict(pf, if has_vi { pv } else { None });
             }
+            if charge > 0.0 {
+                if let Some(a) = self.asahi.as_mut() {
+                    a[sk].charge(charge);
+                }
+                if let Some(u) = self.unified.as_mut() {
+                    u[sk].charge_vi(charge);
+                }
+            }
         }
+        self.gap = 0.0;
         self.govern(span, true);
+    }
+
+    /// Time accounted without a measurement: past DEAD_GAP_S (or `idle`)
+    /// the next stretch does not follow the last, and what a line lost at
+    /// that one's end may have under-read is charged now.
+    fn unmeasured(&mut self, d: f64, idle: bool) {
+        self.gap = if idle { f64::INFINITY } else { self.gap + d };
+        if self.gap > DEAD_GAP_S {
+            for (k, e) in std::mem::take(&mut self.pending).into_iter().enumerate() {
+                if e > 0.0 {
+                    if let Some(a) = self.asahi.as_mut() {
+                        a[k].charge(e);
+                    }
+                    if let Some(u) = self.unified.as_mut() {
+                        u[k].charge_vi(e);
+                    }
+                }
+            }
+            self.pending = vec![0.0; self.cfg.speakers.len()];
+        }
     }
 
     /// `d` seconds of possible playback no frames measured, at the most the
@@ -1200,6 +1393,7 @@ impl Engine {
         if !(d > 0.0) {
             return;
         }
+        self.unmeasured(d, false);
         let ta = self.cfg.globals.t_ambient;
         for (k, s) in self.asahi.iter_mut().flatten().enumerate() {
             s.worst(reduction[k], d, ta);
@@ -1212,6 +1406,7 @@ impl Engine {
 
     /// `d` seconds with the speakers known to be closed.
     pub fn idle(&mut self, d: f64) {
+        self.unmeasured(d.max(0.0), true);
         if !(d > 0.0) {
             self.govern(0.0, false);
             return;
@@ -1783,9 +1978,12 @@ mod tests {
                     f[vc] = v << 16;
                     f[ic] = cur << 16;
                     if beyond && (2000..2004).contains(&i) {
-                        // 1 V and -20 mA: -20 mW
+                        // 1 V and -250 mA: -250 mW, a current that fits
+                        // the voltage (one that reads far too little for
+                        // it is a lost line, bounded instead: review r4
+                        // BB1)
                         f[vc] = word(1.0, 14.0);
-                        f[ic] = word(-0.02, 3.75);
+                        f[ic] = word(-0.25, 3.75);
                     }
                 }
                 assert!(negative > period / 6, "+-{n} LSB: {negative} negative samples");
@@ -1826,6 +2024,11 @@ mod tests {
         }
         let mut e = Engine::new(&c, false).unwrap();
         set_asahi(&mut e, 60.0, 55.0);
+        // right after a stretch that showed the line reading: nothing a
+        // lost line's start may have under-read is charged (the samples'
+        // 11.90 V is a hair over the amplifier's 11.899)
+        e.reading = vec![true; c.speakers.len()];
+        e.gap = 0.0;
         e.measured(&w, period, period, period, 0, 1.0 / 48000.0, 1.0, &vec![vec![(0.0, 0.0)]; c.speakers.len()]);
         let got = e.asahi.as_ref().unwrap()[k].th.t_coil;
         // speakersafetyd's integration at the bound, sample by sample
@@ -2179,6 +2382,143 @@ mod tests {
             assert!(u.last_ff_pre > 0.9 * full, "{}: predicted {} W, the program is {full} W", s.name, u.last_ff_pre);
             assert!(u.reduction > 3.0, "{}: {} dB", s.name, u.reduction);
         }
+    }
+
+    /// Review r4 BB1 of speakerguardd#8: a current line that reads nothing
+    /// while the voltage carries a program is lost, and the measured-power
+    /// models take V^2 over the smallest impedance: exactly what a live
+    /// line at that impedance gives them, the most current there can be.
+    #[test]
+    fn a_dead_current_line_is_bounded_by_the_voltage() {
+        for text in [J316, J413] {
+            let c = cfg(text);
+            let n = c.speakers.len();
+            let possible = vec![vec![(0.0, 0.0)]; n];
+            let amp = 4.0;
+            let run = |live: bool| {
+                let mut e = Engine::new(&c, true).unwrap();
+                e.govern(0.0, false);
+                let (ch, p) = (c.globals.channels, c.globals.period);
+                let mut w = vec![0i32; p * ch];
+                for f in 0..p {
+                    let v = amp * (2.0 * std::f64::consts::PI * 1000.0 * f as f64 / 48000.0).sin();
+                    for s in &c.speakers {
+                        w[f * ch + s.vs_chan] = ((v / s.vs_scale * 2147483648.0) as i64).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+                        let i = if live { v / s.z_min() } else { 0.0 };
+                        w[f * ch + s.is_chan.unwrap()] = ((i / s.is_scale * 2147483648.0) as i64).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+                    }
+                }
+                periods(&mut e, &w, 40, true, &possible);
+                e
+            };
+            let (dead, live) = (run(false), run(true));
+            assert!(dead.lost.iter().all(|&l| l) && live.lost.iter().all(|&l| !l), "{:?} / {:?}", dead.lost, live.lost);
+            for k in 0..n {
+                let (a, b) = (&dead.asahi.as_ref().unwrap()[k], &live.asahi.as_ref().unwrap()[k]);
+                assert!(a.th.t_coil > 60.0, "{}: the lost line's model stayed at {} C", c.speakers[k].name, a.th.t_coil);
+                assert!((a.th.t_coil - b.th.t_coil).abs() < 0.05 && (a.th.t_magnet - b.th.t_magnet).abs() < 0.05, "{}: {} / {} C against the live line's {} / {} C", c.speakers[k].name, a.th.t_coil, a.th.t_magnet, b.th.t_coil, b.th.t_magnet);
+                let (uv, lv) = (dead.unified.as_ref().unwrap()[k].vi.as_ref().unwrap(), live.unified.as_ref().unwrap()[k].vi.as_ref().unwrap());
+                assert!((uv.t_coil - lv.t_coil).abs() < 0.05, "{}: unified's measured-power model {} against {} C", c.speakers[k].name, uv.t_coil, lv.t_coil);
+            }
+        }
+    }
+
+    /// Stretches of a 10 V sine at 1 kHz into 4 ohm on every speaker of the
+    /// J413, the current line dead at the frames where `dead(stretch,
+    /// frame)` holds; half a second idle before the stretches in `idle`
+    /// (and after the last with `idle_after`).  With `bound` the dead frames
+    /// read the most current there can be instead: the truth's bound.
+    fn lost_run(dead: &dyn Fn(usize, usize) -> bool, stretches: usize, idle: &[usize], idle_after: bool, bound: bool) -> Engine {
+        let c = cfg(J413);
+        let (ch, p) = (c.globals.channels, c.globals.period);
+        let possible = vec![vec![(0.0, 0.0)]; c.speakers.len()];
+        let mut e = Engine::new(&c, true).unwrap();
+        e.govern(0.0, false);
+        let w32 = |x: f64, fs: f64| ((x / fs * 2147483648.0) as i64).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+        for st in 0..stretches {
+            if idle.contains(&st) {
+                e.idle(0.5);
+            }
+            let mut w = vec![0i32; p * ch];
+            for f in 0..p {
+                let v = 10.0 * (2.0 * std::f64::consts::PI * 1000.0 * (st * p + f) as f64 / 48000.0).sin();
+                for s in &c.speakers {
+                    w[f * ch + s.vs_chan] = w32(v, s.vs_scale);
+                    let i = if !dead(st, f) { v / 4.0 } else if bound { v / s.z_min() } else { 0.0 };
+                    w[f * ch + s.is_chan.unwrap()] = w32(i, s.is_scale);
+                }
+            }
+            e.measured(&w, p, p, p, 0, 1.0 / 48000.0, 1.0, &possible);
+        }
+        if idle_after {
+            e.idle(0.5);
+        }
+        e
+    }
+
+    /// Review r4 BB1 of speakerguardd#8: what a lost line hides where no
+    /// block can show it is charged, so the models are never cooler than
+    /// ones that took the bound from the moment the line died.  A line
+    /// lost in the last 30 frames of a stretch (a short block is 48): its
+    /// tail, once the next stretch shows the line lost, and at once when
+    /// the speakers close after it.  A line that reads again 40 frames
+    /// into a stretch: that stretch's start.  And a loud program's line
+    /// lost for 5 ms inside a stretch is lost there, though no long block
+    /// is mostly dead.
+    #[test]
+    fn what_a_lost_line_hides_is_charged() {
+        let p = cfg(J413).globals.period;
+        let tail = move |st: usize, f: usize| st > 0 || f >= p - 30;
+        let cases: [(&str, &dyn Fn(usize, usize) -> bool, usize, &[usize], bool, &[bool]); 4] = [
+            ("lost at a stretch's end", &tail, 2, &[], false, &[false, true]),
+            ("lost at a stretch's end, then closed", &|st, f| st == 0 && f >= p - 30, 1, &[], true, &[false]),
+            ("reading again 40 frames in", &|st, f| st == 0 || f < 40, 2, &[], false, &[true, false]),
+            ("lost for 5 ms", &|_, f| (2000..2240).contains(&f), 1, &[], false, &[true]),
+        ];
+        let c = cfg(J413);
+        for (what, dead, n, idle, idle_after, lost) in cases {
+            let truth = lost_run(dead, n, idle, idle_after, true);
+            assert!(truth.lost.iter().all(|&l| !l), "{what}: the bound read as lost");
+            // the flags after each stretch
+            for st in 0..n {
+                let e = lost_run(dead, st + 1, idle, false, false);
+                assert!(e.lost.iter().all(|&l| l == lost[st]), "{what}: after stretch {st}: {:?}", e.lost);
+            }
+            let e = lost_run(dead, n, idle, idle_after, false);
+            for k in 0..c.speakers.len() {
+                let (a, r) = (&e.asahi.as_ref().unwrap()[k], &truth.asahi.as_ref().unwrap()[k]);
+                assert!(a.th.t_coil >= r.th.t_coil - 1e-9 && a.th.t_magnet >= r.th.t_magnet - 1e-9, "{what}: {} asahi {} / {} C under the bound's {} / {} C", c.speakers[k].name, a.th.t_coil, a.th.t_magnet, r.th.t_coil, r.th.t_magnet);
+                let (u, v) = (e.unified.as_ref().unwrap()[k].vi.as_ref().unwrap(), truth.unified.as_ref().unwrap()[k].vi.as_ref().unwrap());
+                assert!(u.t_coil >= v.t_coil - 1e-9 && u.t_magnet >= v.t_magnet - 1e-9, "{what}: {} unified vi {} C under the bound's {} C", c.speakers[k].name, u.t_coil, v.t_coil);
+            }
+        }
+    }
+
+    /// A live line through a reactive load, a sine as low as 20 Hz, is
+    /// never read as lost, however its blocks fall on the cycle; nor a
+    /// quiet program on a line that carries only its noise.
+    #[test]
+    fn a_live_line_through_a_reactive_load_is_not_lost() {
+        let step = 1.0 / 48000.0;
+        for freq in [20.0, 40.0, 100.0, 1000.0] {
+            for phase in [-1.047, -0.5, 0.5, 1.047] {
+                for z in [1.0, 2.0, 4.0] {
+                    for start in 0..16 {
+                        let t0 = start as f64 / 16.0 / freq;
+                        let v: Vec<f64> = (0..4096).map(|f| 10.0 * (2.0 * std::f64::consts::PI * freq * (t0 + f as f64 * step)).sin()).collect();
+                        let i: Vec<f64> = (0..4096).map(|f| 10.0 / (4.0 * z) * (2.0 * std::f64::consts::PI * freq * (t0 + f as f64 * step) - phase).sin()).collect();
+                        assert!(!line_lost(&v, &i, 4.0, step).0, "{freq} Hz, {phase} rad, {z} x nominal, from {t0} s");
+                    }
+                }
+            }
+        }
+        // 0.05 V rms on a line of 3 LSB of noise: too quiet to judge
+        let v: Vec<f64> = (0..4096).map(|f| 0.07 * (f as f64 * 0.13).sin()).collect();
+        let i: Vec<f64> = (0..4096).map(|f| if f % 2 == 0 { 3.0 } else { -3.0 } * 3.75 / 32768.0).collect();
+        assert_eq!(line_lost(&v, &i, 4.0, step), (false, false));
+        // a dead one under a program of a volt: lost
+        let v: Vec<f64> = (0..4096).map(|f| 1.4 * (f as f64 * 0.13).sin()).collect();
+        assert_eq!(line_lost(&v, &i, 4.0, step), (true, true));
     }
 
     /// Frames the card held at its safe level say nothing of the program:

@@ -202,6 +202,24 @@ hysteresis.  It differs only toward protection:
   On these speakers that keeps the card at its safe level for about a
   minute after every boot (58 s on the J413, 84 s on the J316), mostly the
   time their magnets take to cool from the limit.
+* A current line that reads far too little for its voltage (a dead or
+  switched-off line, where speakersafetyd sees no power at all) is lost
+  for the period.  That is a 10 ms block with at least 0.1 V rms whose
+  current is under a tenth of what the speaker's nominal impedance would
+  draw, or a 1 ms block under a hundredth (a loud program's lost line,
+  caught within a millisecond).  A live line through a reactive load
+  stays well under both down to 20 Hz.  The measured-power models then
+  take V^2 over the speaker's smallest impedance, the most current there
+  can be, until the line reads again, and the daemon logs both changes.
+  What a line lost too briefly for a block to show may have under-read
+  at a period's end or start (the most current less what was read) is
+  charged unless the next or last period shows the line reading, and at
+  once when the speakers close or measurement stops.  Below the blocks'
+  floor (0.1 V rms, or the line's own noise times the ratio) a dead line
+  cannot be told from a quiet one, and it under-reads there at most that
+  voltage squared over the smallest impedance.  A line that reads low but
+  plausibly (the J616s's left woofer 1 reads half) is not caught; group
+  linking covers it there.
 
 At the J413 tweeter's sensitivity a full-scale charge heats its model by
 about 2 C per millisecond, so stream edges and sense hiccups cost much more
@@ -238,10 +256,9 @@ needs V/I sense on every speaker:
 * the regulator then holds the feed-forward model only.  The
   measured-power side is the guard's: unified's own measured-power model
   still runs, latches and is logged;
-* current that reads too little (a dead or switched-off current line) is
-  not bad sense data (V*I is 0): the asahi models see no power, the guard
-  adds nothing, and the feed-forward model governs alone, as it does on a
-  machine without current sense;
+* a dead or switched-off current line is bounded as under the asahi
+  governor alone (above), so the guard keeps speakersafetyd's constants
+  on it instead of leaving the feed-forward model alone;
 * a period that is not a measurement (mean V*I below -0.01 W, or
   nonfinite) stays a fault as above, because the feed-forward model's
   voltage comes from the same words.
@@ -331,10 +348,17 @@ latched model, and, after a quiet tail as long as the daemon's own models
 need to cool, that the latch has cleared and the lock is back.  Under the
 guard it checks that the card is never less protective than speakersafetyd
 alone on the true state, and that the lock is never held with the
-feed-forward truth at its hard limit.  Guarded cases can lose their current
-line for a while, after which only the feed-forward side is checked.
+feed-forward truth at its hard limit.  Any case can lose its current line
+for a while, after which the measured-power models are checked against
+the truth less what the dead-line bound can miss.  Some cases end in a
+full-scale onset, at the top of a staircase or inside a partial write
+failure.  A long class runs steady programs for minutes, long enough to
+heat the feed-forward truth, under the asahi governor and the guard with
+the current lines live and dead, and checks that the measured-power truth
+never reaches its limit.
 
     SPEAKERGUARDD_VI_CASES=100000 cargo test --release harness::vi
+    SPEAKERGUARDD_VI_LONG=1 cargo test --release vi_long     # 120 x 120 s
 
 ### Relation to speakersafetyd
 

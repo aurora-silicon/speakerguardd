@@ -119,7 +119,14 @@ pub struct Gain {
 }
 
 /// A control holds at most this many candidate values; past it the two
-/// closest merge into the span between them, which holds both.
+/// closest merge into the span between them, which holds both, so no value
+/// is lost.  A merged span wider than PREDICT_SPREAD_DB leaves its frames
+/// out of the unified regulator's prediction (the budgets still read them
+/// at the most).  The guard does not reach the cap today: every failed
+/// write hands the card off, and every retake starts from the minimum, so
+/// a set holds at most two values.  A change that lets failures pile up in
+/// one armed stretch should raise the cap or keep a merged span's frames
+/// (review r4 addendum 3 of speakerguardd#8).
 const CANDIDATES_MAX: usize = 4;
 
 /// Add the range `r` to a control's candidate values, merged with any it
@@ -1212,6 +1219,14 @@ impl Guard {
             // the same frames over the same time: the sensed power is what
             // the card's gain let through
             e.measured(all, frames, certain, k, shift, 1.0 / rate, first, &possible);
+            for (k, lost) in std::mem::take(&mut e.lost_changed) {
+                let name = &self.speakers[k].spec.name;
+                if lost {
+                    warn!("{name}: the current sense reads far too little for the voltage; its measured power is bounded by V^2 over the speaker's smallest impedance until it reads again");
+                } else {
+                    info!("{name}: the current sense reads again");
+                }
+            }
         }
         // for the recording: the most known reduction over them
         self.last_applied = possible.iter().map(|p| p.iter().map(|r| if r.1 >= MUTE_DB { 0.0 } else { r.1 }).fold(0.0, f64::max)).collect();
@@ -4328,53 +4343,56 @@ pub(crate) mod tests {
         assert!(g.armed(), "still at the card's safe level: unified {:?}, asahi {:?}", g.engine.as_ref().unwrap().reductions(Governor::Unified), g.engine.as_ref().unwrap().reductions(Governor::Asahi));
     }
 
-    /// Review r4 of speakerguardd#8: a current line that reads nothing
-    /// (ISENSE off, a dead line) is not bad sense data (V*I is 0), and the
-    /// asahi models see no power.  Under the guard the feed-forward model
-    /// then governs alone and holds its coil at its target, as on a machine
-    /// without current sense.  The asahi governor alone plays on at 0 dB
-    /// while the same model passes its hard limit.
+    /// Review r4 BB1 of speakerguardd#8: a current line that reads nothing
+    /// while its voltage carries a program (ISENSE off, a dead line) is
+    /// lost, and the measured power is bounded by V^2 over the speaker's
+    /// smallest impedance, the most a live line could read.  Under the
+    /// guard and under the asahi governor alone the card is held as a live
+    /// line at that impedance holds it.  Before, the asahi models saw no
+    /// power: the asahi governor alone played on at 0 dB while the
+    /// feed-forward model passed its hard limit, and the guard added
+    /// nothing.
     #[test]
-    fn a_dead_current_line_leaves_the_feed_forward_model_governing() {
-        let run = |guard: bool| {
-            let (mut cfg, mut hw) = unified_j316(guard, 0.3);
+    fn a_dead_current_line_is_governed_as_the_most_current_there_can_be() {
+        let run = |guard: bool, dead: bool, level: f64| {
+            let (mut cfg, mut hw) = unified_j316(guard, level);
             if !guard {
                 cfg.globals.governor = Governor::Asahi;
                 cfg.globals.shadow = true;
             }
-            let ics: Vec<usize> = cfg.speakers.iter().map(|s| s.is_chan.unwrap()).collect();
+            let lines: Vec<(usize, usize, f64)> = cfg.speakers.iter().map(|s| (s.vs_chan, s.is_chan.unwrap(), s.vs_scale / s.is_scale / s.z_min())).collect();
             let ch = cfg.globals.channels;
             hw.tweak = Some(Box::new(move |_, w: &mut [i32]| {
                 for f in w.chunks_exact_mut(ch) {
-                    for &ic in &ics {
-                        f[ic] = 0;
+                    for &(vc, ic, k) in &lines {
+                        f[ic] = if dead { 0 } else { (f[vc] as f64 * k).round().clamp(i32::MIN as f64, i32::MAX as f64) as i32 };
                     }
                 }
             }));
             let mut g = Guard::start(&mut hw, &cfg, cfg.globals.max_reduction, Some(vi_state(&cfg, 55.0, 52.0))).unwrap();
-            let (mut hottest, mut handed, mut was) = (0.0f64, 0, false);
+            let (mut cards, mut hottest) = (Vec::new(), 0.0f64);
             while hw.t < secs(120.0) {
                 g.tick(&mut hw).unwrap();
                 let e = g.engine.as_ref().unwrap();
-                if guard && g.armed() {
-                    let (u, a) = (e.reductions(Governor::Unified), e.reductions(Governor::Asahi));
-                    assert!(a.iter().all(|&r| r == 0.0), "the asahi models saw power: {a:?}");
-                    assert_eq!(hw.per, u, "at {:?}", hw.t);
-                }
-                handed += (was && !g.armed()) as u32;
-                was = g.armed();
+                cards.push(if g.armed() { hw.per.clone() } else { vec![f64::INFINITY; cfg.speakers.len()] });
                 hottest = (0..cfg.speakers.len()).map(|k| e.temps(k).1).fold(hottest, f64::max);
             }
-            (g, hw, hottest, handed)
+            let lost = g.engine.as_ref().unwrap().lost.clone();
+            (cards, hottest, lost, g)
         };
-        let (g, hw, hot, handed) = run(true);
-        assert!(g.armed() && handed == 0, "handed off {handed} times");
-        assert!(hot <= 140.3, "the feed-forward model reached {hot} C");
-        assert!(!g.engine.as_ref().unwrap().hard(Governor::Unified));
-        assert!(hw.per.iter().all(|&p| p > 1.0), "the feed-forward model asked for too little: {:?}", hw.per);
-        let (g, hw, hot, _) = run(false);
-        assert!(g.armed() && hw.per.iter().all(|&p| p == 0.0), "{:?}", hw.per);
-        assert!(hot >= 150.0, "the feed-forward model only reached {hot} C under the asahi governor");
+        for guard in [true, false] {
+            // loud enough for the asahi ramp to ask 6.5 dB, not the 7 that
+            // hands the card off
+            let (dead, hot_dead, lost_dead, g) = run(guard, true, 0.25);
+            let (live, hot_live, lost_live, _) = run(guard, false, 0.25);
+            assert!(lost_dead.iter().all(|&l| l) && lost_live.iter().all(|&l| !l), "{lost_dead:?} / {lost_live:?}");
+            assert!(g.armed() && dead.iter().skip(10).all(|c| c.iter().all(|x| x.is_finite())), "guard {guard}: the dead line handed the card off");
+            assert_eq!(dead.len(), live.len());
+            let worst = dead.iter().zip(&live).flat_map(|(d, l)| d.iter().zip(l).map(|(d, l)| l - d)).fold(0.0f64, f64::max);
+            assert!(worst <= 0.01, "guard {guard}: the dead line was held up to {worst} dB less than a live line at the smallest impedance");
+            assert!(live.last().unwrap().iter().any(|&p| p > 1.0), "guard {guard}: the live line at the smallest impedance asked for nothing: {:?}", live.last());
+            assert!((hot_dead - hot_live).abs() < 0.5, "guard {guard}: {hot_dead} against {hot_live} C");
+        }
     }
 
     /// r3 T2 and T3 on the engine: the hand-off gives the lock up and writes
