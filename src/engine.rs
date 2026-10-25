@@ -35,6 +35,11 @@
 //!   model's coil at or under `t_limit - t_headroom - t_ctrl_headroom` over
 //!   the next `horizon_s`, attacks at once and releases with `release_s`;
 //!   the 1 s and 60 s power budgets hold on the power before the gain.
+//!   Its prediction of the program is the power before the gain of the
+//!   frames last measured at a gain the card is known to have applied
+//!   (review r4 of speakerguardd#8): a charge stands for time nobody
+//!   measured and heats every model at the worst case, but is not the
+//!   program, and neither are frames the card held at its safe level.
 //!   Shadow-only unless the command line says --experimental-unified.
 //! * Resistance thermometry from low-band V/I (`R = sum(v i) / sum(i^2)`)
 //!   is only measured and logged.
@@ -79,6 +84,12 @@ pub fn sense_power(wv: f64, wi: f64, (vs, is): (f64, f64), i_max: f64) -> f64 {
 /// What the unified regulator asks for when nothing may pass (dB): far past
 /// any --max-reduction, so the kernel takes over.
 const NOTHING_DB: f64 = 120.0;
+/// Frames the card may have converted at more reduction than this (dB)
+/// say too little about the program for the unified regulator to predict
+/// it from them (the card's safe level, an unknown control): the
+/// prediction stays where the last known frames left it.  The replay's
+/// PRE_GAIN_MAX_DB draws the same line.
+pub const PREDICT_MAX_DB: f64 = 30.0;
 /// Below this the low band carries too little current to read a resistance.
 const RTH_I_MIN: f64 = 0.02;
 /// Low band for the thermometer: well below laptop drivers' resonance.
@@ -640,7 +651,9 @@ pub struct UnifiedSpeaker {
     history_s: f64,
     /// dB, >= 0
     pub reduction: f64,
-    /// The latest power before the gain: feed-forward and measured (W).
+    /// The regulator's prediction of the program: the power before the
+    /// gain of the last frames measured at a known gain, feed-forward and
+    /// measured (W).  Not a charge's worst case.
     last_ff_pre: f64,
     last_vi_pre: Option<f64>,
     pub hard: bool,
@@ -709,10 +722,10 @@ impl UnifiedSpeaker {
     }
 
     /// Measured blocks of equal length: the V^2 means, the V*I means (V/I
-    /// machines), and each block's power before the card's gain for the
-    /// feed-forward and the measured model (each frame inverted on its own,
-    /// at most full scale: Engine::measured).
-    fn blocks(&mut self, v_ms: &[f64], vi: Option<&[f64]>, pre_ff: &[f64], pre_vi: Option<&[f64]>, span: f64, t_ambient: f64) {
+    /// machines), and each block's feed-forward power before the card's
+    /// gain for the budgets (each frame inverted on its own, at most full
+    /// scale: Engine::measured).  The regulator's prediction is `predict`'s.
+    fn blocks(&mut self, v_ms: &[f64], vi: Option<&[f64]>, pre_ff: &[f64], span: f64, t_ambient: f64) {
         let n = v_ms.len().max(1) as f64;
         let h = span / n;
         let mut peak = self.peak_floor.take().unwrap_or(f64::NEG_INFINITY).max(self.ff.hottest());
@@ -731,10 +744,27 @@ impl UnifiedSpeaker {
         self.note(peak);
         let pre = pre_ff.iter().sum::<f64>() / n;
         record(&mut self.history, &mut self.history_s, span, pre);
-        self.last_ff_pre = pre;
-        self.last_vi_pre = if self.vi.is_some() { pre_vi.map(|p| p.iter().sum::<f64>() / n) } else { None };
     }
 
+    /// The program as the last frames measured at a known gain had it
+    /// before the gain (None: no such frame, the prediction stays).
+    fn predict(&mut self, ff: Option<f64>, vi: Option<f64>) {
+        if let Some(p) = ff {
+            self.last_ff_pre = p;
+        }
+        if let (Some(p), true) = (vi, self.vi.is_some()) {
+            self.last_vi_pre = Some(p);
+        }
+    }
+
+    /// `d` seconds nobody measured, at the most the card's `reduction`
+    /// lets through: every model heats at that worst case and the budgets
+    /// count it, but the regulator's prediction stays the measured
+    /// program's.  The account charges at least a frame before every
+    /// period (where a period's frames end is known only to a frame), and
+    /// that frame's full scale, taken as the program for the next horizon,
+    /// held the regulator 9 to 14 dB down on quiet content on the J616
+    /// (review r4 of speakerguardd#8).
     fn worst(&mut self, reduction: f64, d: f64, t_ambient: f64) {
         let v = self.v_worst * 10f64.powf(-reduction.max(0.0) / 20.0);
         let (c, m) = self.ff.hold(v * v / self.r_ff, d, t_ambient);
@@ -746,8 +776,6 @@ impl UnifiedSpeaker {
         self.note(peak);
         let pre = pre_gain(v * v / self.r_ff, reduction);
         record(&mut self.history, &mut self.history_s, d, pre);
-        self.last_ff_pre = pre;
-        self.last_vi_pre = self.vi.as_ref().map(|_| pre_gain(v * v / self.z_min, reduction));
     }
 
     fn idle(&mut self, d: f64, t_ambient: f64) {
@@ -830,7 +858,11 @@ impl UnifiedSpeaker {
         let pf: Vec<f64> = v.iter().map(|&x| pre_gain(x / self.r_ff, applied).min(full_ff)).collect();
         let pv: Vec<f64> = vi.iter().map(|&x| pre_gain(x.max(0.0), applied).min(full_vi)).collect();
         let has_vi = blocks.iter().any(|b| b.1.is_some());
-        self.blocks(&v, has_vi.then_some(&vi[..]), &pf, has_vi.then_some(&pv[..]), span, t_ambient)
+        self.blocks(&v, has_vi.then_some(&vi[..]), &pf, span, t_ambient);
+        if applied <= PREDICT_MAX_DB {
+            let mean = |x: &[f64]| x.iter().sum::<f64>() / x.len().max(1) as f64;
+            self.predict(Some(mean(&pf)), has_vi.then(|| mean(&pv)));
+        }
     }
 
     fn clear_hard_if_cool(&mut self) -> bool {
@@ -1065,6 +1097,9 @@ impl Engine {
             let mut vi = Vec::with_capacity(frames);
             let mut pre_ff = Vec::with_capacity(frames);
             let mut pre_vi = Vec::with_capacity(frames);
+            // per frame: whether the gain it was converted at is known
+            // well enough to say what the program was
+            let mut known = Vec::with_capacity(frames);
             let unified = self.unified.as_ref().map(|u| &u[sk]);
             let i_max = v_worst(s, &g) / s.z_nominal.min(s.r_ff);
             for f in 0..frames {
@@ -1074,7 +1109,9 @@ impl Engine {
                 vi.push(sense_power(wv, wi, (vs, is), i_max));
                 if let Some(u) = unified {
                     let room = if wv != 0.0 { 20.0 * (2147483648.0 / wv.abs()).log10() } else { f64::INFINITY };
-                    let gain = 10f64.powf(converted_at(room, &possible[sk]) / 10.0);
+                    let at = converted_at(room, &possible[sk]);
+                    known.push(at <= PREDICT_MAX_DB);
+                    let gain = 10f64.powf(at / 10.0);
                     let vup = (wv.abs() + 1.0) * vs;
                     let iup = (wi.abs() + 1.0) * is;
                     let full_ff = u.v_worst * u.v_worst / u.r_ff;
@@ -1095,6 +1132,13 @@ impl Engine {
                 let rp = run(best(&pre_ff));
                 let rq = run(best(&pre_vi));
                 let has_vi = s.is_chan.is_some();
+                // the prediction: the newest k frames' program, over the
+                // frames converted at a known gain
+                let known_mean = |x: &[f64], r: (usize, usize)| -> Option<f64> {
+                    let (sum, n) = (r.0..r.1).filter(|&f| known[f]).fold((0.0, 0usize), |(s, n), f| (s + x[f], n + 1));
+                    (n > 0).then(|| sum / n as f64)
+                };
+                let (pf, pv) = (known_mean(&pre_ff, rp), known_mean(&pre_vi, rq));
                 // the first frame on its own when only part of it is new
                 let parts: &[(usize, usize, f64)] = if first < 1.0 && k > 1 { &[(0, 1, first), (1, k, 1.0)] } else { &[(0, k, 1.0)] };
                 for (i, &(lo, hi_, w)) in parts.iter().enumerate() {
@@ -1109,13 +1153,14 @@ impl Engine {
                             x[a..c].iter().sum::<f64>() / (n as f64 / blocks as f64)
                         }).collect()
                     };
-                    let (bv, bvi, bp, bq) = (means(&v2, rf), means(&vi, rv), means(&pre_ff, rp), means(&pre_vi, rq));
+                    let (bv, bvi, bp) = (means(&v2, rf), means(&vi, rv), means(&pre_ff, rp));
                     let secs = if n == 1 { step * w } else { step * n as f64 };
                     if i > 0 {
                         u[sk].peak_floor = Some(u[sk].peak);
                     }
-                    u[sk].blocks(&bv, has_vi.then_some(&bvi[..]), &bp, has_vi.then_some(&bq[..]), secs, g.t_ambient);
+                    u[sk].blocks(&bv, has_vi.then_some(&bvi[..]), &bp, secs, g.t_ambient);
                 }
+                u[sk].predict(pf, if has_vi { pv } else { None });
             }
         }
         self.govern(span, true);
@@ -1287,6 +1332,7 @@ mod tests {
     const J700: &str = include_str!("../conf/apple/j700.conf");
     const J316: &str = include_str!("../conf/apple/j316.conf");
     const J413: &str = include_str!("../conf/apple/j413.conf");
+    const J616: &str = include_str!("../conf/apple/j616.conf");
 
     fn cfg(text: &str) -> Config {
         Config::parse(text).unwrap()
@@ -1933,6 +1979,134 @@ mod tests {
         // counts as up to full scale, never more
         let u = &e.unified.as_ref().unwrap()[0];
         assert!(u.mean_pre(1.0) <= u.v_worst * u.v_worst / u.r_ff + 1e-9);
+        // and it is not the regulator's prediction (review r4 of
+        // speakerguardd#8): nothing is asked for on its account
+        assert!(e.reductions(Governor::Unified).iter().all(|&r| r == 0.0), "{:?}", e.reductions(Governor::Unified));
+    }
+
+    /// A period of sense words for `c`: every speaker a sine of `amp` volts
+    /// peak at 1 kHz into `z` ohm, V and I in phase, S16 widened.
+    fn program(c: &Config, amp: f64, z: f64) -> Vec<i32> {
+        let (ch, n) = (c.globals.channels, c.globals.period);
+        let mut w = vec![0i32; n * ch];
+        for f in 0..n {
+            let v = amp * (2.0 * std::f64::consts::PI * 1000.0 * f as f64 / 48000.0).sin();
+            for s in &c.speakers {
+                w[f * ch + s.vs_chan] = ((v / s.vs_scale * 32767.0).round() as i32) << 16;
+                if let Some(ic) = s.is_chan {
+                    w[f * ch + ic] = ((v / z / s.is_scale * 32767.0).round() as i32) << 16;
+                }
+            }
+        }
+        w
+    }
+
+    /// `periods` periods of `words` measured at `possible`, each after a
+    /// one-frame charge at 0 dB when `sliver` (where the account cannot
+    /// place a period's frames closer than a frame, as live: review r4 of
+    /// speakerguardd#8).
+    fn periods(e: &mut Engine, words: &[i32], periods: usize, sliver: bool, possible: &[Vec<(f64, f64)>]) {
+        let n = e.cfg.globals.period;
+        let k = e.cfg.speakers.len();
+        for _ in 0..periods {
+            if sliver {
+                e.worst(1.0 / 48000.0, &vec![0.0; k]);
+            }
+            e.measured(words, n, n, n, 0, 1.0 / 48000.0, 1.0, possible);
+        }
+    }
+
+    /// Review r4 of speakerguardd#8: the account charges at least a frame
+    /// at full scale before every period, and the unified regulator took
+    /// that frame for the program of its next horizon.  A quiet program
+    /// was held 9 to 14 dB down (13.7 dB on the J616's tweeters through a
+    /// whole live session, at 52 C).  Its prediction is the measured
+    /// program's now; the charges still heat every model as they did.
+    #[test]
+    fn a_charge_before_each_quiet_period_holds_no_reduction() {
+        for text in [J316, J616] {
+            let c = cfg(text);
+            let n = c.speakers.len();
+            let possible = vec![vec![(0.0, 0.0)]; n];
+            let quiet = program(&c, 0.15, 4.0);
+            let run = |sliver: bool| {
+                let mut e = Engine::new(&c, true).unwrap();
+                e.govern(0.0, false);
+                periods(&mut e, &quiet, 60, sliver, &possible);
+                e
+            };
+            let (plain, charged) = (run(false), run(true));
+            assert!(charged.reductions(Governor::Unified).iter().all(|&r| r == 0.0), "{:?}", charged.reductions(Governor::Unified));
+            assert!(plain.reductions(Governor::Unified).iter().all(|&r| r == 0.0));
+            // the charges heat every model: at least half of what one
+            // frame at full scale adds from ambient, on every model
+            for k in 0..n {
+                let s = &c.speakers[k];
+                let full = v_worst(s, &c.globals).powi(2);
+                let frame = 1.0 / 48000.0;
+                let least = |tr: f64, tau: f64, r: f64| 0.5 * full / r * tr * (1.0 - (-frame / tau).exp());
+                let (pa, pf, pv) = plain.temps(k);
+                let (ca, cf, cv) = charged.temps(k);
+                assert!(cf - pf >= least(s.tr_coil, s.tau_coil, s.r_ff), "{}: ff {cf} vs {pf}", s.name);
+                assert!(cv - pv >= least(s.vi_tr_coil, s.vi_tau_coil, s.z_min()), "{}: vi {cv} vs {pv}", s.name);
+                assert!(ca - pa >= least(s.vi_tr_coil, s.vi_tau_coil, s.z_min()), "{}: asahi {ca} vs {pa}", s.name);
+            }
+        }
+    }
+
+    /// The guard on that fix: a full-scale onset measured at a known gain
+    /// is attacked within its own period, at the whole of what the
+    /// regulator needs for it.
+    #[test]
+    fn a_full_scale_onset_is_attacked_at_once() {
+        for text in [J316, J616] {
+            let c = cfg(text);
+            let n = c.speakers.len();
+            let g = &c.globals;
+            let possible = vec![vec![(0.0, 0.0)]; n];
+            let mut e = Engine::new(&c, true).unwrap();
+            e.govern(0.0, false);
+            periods(&mut e, &program(&c, 0.15, 4.0), 30, true, &possible);
+            assert!(e.reductions(Governor::Unified).iter().all(|&r| r == 0.0));
+            // the amplifier's loudest sine, 18.5 dBV
+            let amp = 2f64.sqrt() * 10f64.powf(g.amp_gain_dbv / 20.0);
+            let loud = program(&c, amp, 4.0);
+            periods(&mut e, &loud, 1, true, &possible);
+            for (k, s) in c.speakers.iter().enumerate() {
+                let u = &e.unified.as_ref().unwrap()[k];
+                let ch = g.channels;
+                let vs = s.vs_scale / 2147483648.0;
+                let p = (0..g.period).map(|f| ((loud[f * ch + s.vs_chan] as f64).abs() + 1.0).powi(2) * vs * vs / s.r_ff).sum::<f64>() / g.period as f64;
+                let target = s.t_limit - s.t_headroom - g.t_ctrl_headroom;
+                assert!(u.ff.t_coil < target);
+                let need = db(p / u.ff.max_power(target, g.horizon_s, g.t_ambient));
+                assert!(need > 3.0, "{}: {need} dB", s.name);
+                assert!(u.reduction >= need - 1e-9, "{}: {} dB after the onset, the regulator needs {need} dB", s.name, u.reduction);
+            }
+        }
+    }
+
+    /// Frames the card held at its safe level say nothing of the program:
+    /// they do not become the regulator's prediction (at full scale, the
+    /// most a word inverted at -99.5 dB can stand for, they kept a stream
+    /// that plays through a restart muted), while the budgets still count
+    /// them at up to full scale.
+    #[test]
+    fn frames_at_the_cards_safe_level_are_not_the_prediction() {
+        let c = cfg(J316);
+        let n = c.speakers.len();
+        let safe = c.globals.safe_reduction;
+        let mut e = Engine::new(&c, true).unwrap();
+        e.govern(0.0, false);
+        // the noise a muted card's sense lines carry: a few LSB
+        let noise = program(&c, 14.0 * 4.0 / 32768.0, 4.0);
+        periods(&mut e, &noise, 60, false, &vec![vec![(safe, safe)]; n]);
+        assert!(e.reductions(Governor::Unified).iter().all(|&r| r == 0.0), "{:?}", e.reductions(Governor::Unified));
+        let u = &e.unified.as_ref().unwrap()[0];
+        assert!(u.mean_pre(1.0) > 1.0, "the budgets no longer count a muted card's frames as loud: {} W", u.mean_pre(1.0));
+        // the same frames at a known gain are a prediction like any other
+        periods(&mut e, &program(&c, 4.0, 4.0), 5, false, &vec![vec![(0.0, 0.0)]; n]);
+        assert!(e.unified.as_ref().unwrap().iter().all(|u| u.last_ff_pre > 1.0));
     }
 
     #[test]
