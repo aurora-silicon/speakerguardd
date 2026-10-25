@@ -137,11 +137,15 @@ windows as the energy can have come.  The clock reads that pair the boot
 time with the daemon's own clock, at the final save and at the restore, are
 bounded: whatever time lies between them is charged once more at full scale
 and full gain.  Any other state (a crash, an older version's file, a state
-whose model trails its write) or none starts every speaker at its coil limit
-plus what the samples a dead run left queued can add, latched, so the card
-stays with the kernel until the model has cooled under its working ceiling
-(about 7 s on the J700).  A daemon that is late renewing the lock is covered by the kernel's
-250 ms lock timeout, and the late time is charged like any other.
+whose model trails its write) or none starts both coil and magnet from
+independent upper bounds. Each starts at its hard limit, with the possible
+queued full-scale drain added and a floor at the kernel safe level's steady
+state. The fault stays latched until the model cools under its working
+ceiling, about 25 s on the J700. A hot magnet after another OS ran need not
+have the steady-state relationship to the coil. This assumes each actual
+node was at or below its hard limit before the queued drain. A daemon that
+is late renewing the lock is covered by the kernel's 250 ms lock timeout,
+and the late time is charged like any other.
 
 ### Speaker profile coverage
 
