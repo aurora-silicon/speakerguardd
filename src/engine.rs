@@ -140,10 +140,14 @@ pub const DEAD_V_MIN: f64 = 0.1;
 /// r4 EE2); a line reading half doubles it, and one reading 0.55 to 0.65
 /// still clears it.  The power is bounded from the first stretch R is
 /// over the bound, and stays bounded until R reads under LOW_R_CLEAR of
-/// the least bound since then, on audible program: the deployed rule
+/// the least bound since the first fault, on audible program: the
+/// deployed rule
 /// (2f7d16d), judged against a bound that cannot rise with the heat the
 /// bounded model takes, and cleared only on program the card played
-/// (review r4 addenda 6a and 6b).  Nothing else clears it: a passage
+/// (review r4 addenda 6a and 6b). Recovery clears the fault, but keeps
+/// that reference across later faults: the protective model can still
+/// carry excess heat from the first bound (addendum 6c). Nothing else
+/// clears it: a passage
 /// without bass is no evidence the line reads again, and a line just over
 /// the bound may read 0.65 of its current.  Only the verdict that is
 /// logged (and kept in `lost`) waits: at once from LOW_FAST times the
@@ -1172,7 +1176,8 @@ pub struct Engine {
     pf_held: Vec<f64>,
     low_held: Vec<f64>,
     /// ... whether the low band bounds the power (from the first stretch R
-    /// was over the bound), and the least bound since then.
+    /// was over the bound), and the least bound across fault episodes.
+    /// Recovery does not remove the protective model's excess heat.
     low_bound: Vec<bool>,
     low_set_bound: Vec<f64>,
     /// Per speaker: whether its power was bounded over the last stretch (a
@@ -1409,7 +1414,10 @@ impl Engine {
                         self.low_bound[sk] = false;
                         self.low[sk] = false;
                         self.low_held[sk] = 0.0;
-                        self.low_set_bound[sk] = f64::INFINITY;
+                        // Recovery proves the current line reads again. It
+                        // does not undo the heat charged while it was
+                        // bounded. Keep that episode's reference so this
+                        // model's extra heat cannot hide a recurring fault.
                     }
                 }
                 waiting |= self.low_bound[sk];
@@ -2991,6 +2999,82 @@ mod tests {
         assert!(e.bounded[lw1] && !e.lost[lw1], "0.4 V over a 30 mA offset: bounded {}, lost {}", e.bounded[lw1], e.lost[lw1]);
         let (db, _) = e.governed(Governor::Unified);
         assert!(rounded(db[lw1]) >= 0.5, "asked {} dB", db[lw1]);
+    }
+
+    /// Recovery clears the fault, not the reference that detected it. A
+    /// second fault must be judged the same way even if bounded accounting
+    /// has since heated the protective model.
+    #[test]
+    fn recovery_rearms_the_low_line_without_raising_its_reference() {
+        let c = cfg(J316);
+        let (ch, p) = (c.globals.channels, c.globals.period);
+        let possible = vec![vec![(0.0, 0.0)]; c.speakers.len()];
+        let mut e = Engine::new(&c, true).unwrap();
+        set_asahi(&mut e, 59.0, 59.0);
+        e.govern(0.0, false);
+        let mut sample = 0;
+        let mut play = |e: &mut Engine, ratio: f64, periods: usize, temperature: f64| {
+            for _ in 0..periods {
+                let mut words = vec![0; p * ch];
+                let word = |x: f64, scale: f64| ((x / scale * 32768.0).round() as i32) << 16;
+                for f in 0..p {
+                    let v = 3.0 * (2.0 * std::f64::consts::PI * 60.0 * (sample + f) as f64 / 48000.0).sin();
+                    for s in &c.speakers {
+                        words[f * ch + s.vs_chan] = word(v, s.vs_scale);
+                        words[f * ch + s.is_chan.unwrap()] = word(v * ratio / (1.2 * s.z_min()), s.is_scale);
+                    }
+                }
+                sample += p;
+                set_asahi(e, temperature, temperature);
+                e.check(&words, 48000.0).unwrap();
+                e.measured(&words, p, p, p, 0, 1.0 / 48000.0, 1.0, &possible);
+            }
+        };
+        play(&mut e, 0.65, 40, 59.0);
+        assert!(e.low.iter().all(|x| *x));
+        play(&mut e, 1.0, 180, 120.0);
+        assert!(e.low.iter().all(|x| !x) && e.bounded.iter().all(|x| !x), "healthy bass must clear the first fault");
+        play(&mut e, 0.65, 180, 120.0);
+        assert!(e.low.iter().all(|x| *x) && e.bounded.iter().all(|x| *x), "the same line fault must be protected again");
+    }
+
+    /// Four judged 10 ms blocks just inside the block ratio gate, then
+    /// quiet blocks below its voltage floor. The aggregate ratio gate is
+    /// closed, while the deployed PF gate still protects this S16 period.
+    #[test]
+    fn cold_burst_then_quiet_keeps_the_deployed_pf_gate() {
+        let c = cfg(J316);
+        let (ch, p) = (c.globals.channels, c.globals.period);
+        let mut e = Engine::new(&c, true).unwrap();
+        set_asahi(&mut e, 50.0, 50.0);
+        e.govern(0.0, false);
+        let word = |x: f64, scale: f64| ((x / scale * 32767.0).round().clamp(-32768.0, 32767.0) as i32) << 16;
+        let mut words = vec![0; p * ch];
+        for s in &c.speakers {
+            let dc = word(0.03, s.is_scale);
+            let current = dc as f64 * s.is_scale / 2147483648.0;
+            let burst = current * DEAD_RATIO * s.z_nominal * 0.999;
+            for f in 0..p {
+                let rms = if f < 1920 { burst } else { 0.099 };
+                let v = rms * 2f64.sqrt() * (2.0 * std::f64::consts::PI * 1000.0 * f as f64 / 48000.0).sin();
+                words[f * ch + s.vs_chan] = word(v, s.vs_scale);
+                words[f * ch + s.is_chan.unwrap()] = if f < 1920 { dc } else { 0 };
+            }
+            let voltage: Vec<_> = (0..p).map(|f| words[f * ch + s.vs_chan] as f64 * s.vs_scale / 2147483648.0).collect();
+            let current: Vec<_> = (0..p).map(|f| words[f * ch + s.is_chan.unwrap()] as f64 * s.is_scale / 2147483648.0).collect();
+            let (lost, judged) = line_lost(&voltage, &current, s.z_nominal, 1.0 / 48000.0);
+            assert!(judged && !lost, "the block detector must accept this fixture");
+        }
+        e.check(&words, 48000.0).unwrap();
+        for (f, s) in e.last.iter().zip(&c.speakers) {
+            let i_ms = f.i_ms.unwrap();
+            assert!(f.v_ms >= PF_BASE_V.powi(2) && i_ms >= PF_BASE_I.powi(2));
+            assert!(i_ms * (DEAD_RATIO * s.z_nominal).powi(2) < f.v_ms, "the aggregate ratio gate must be closed");
+            assert!(f.vi.unwrap() < PF_MIN * (f.v_ms * i_ms).sqrt());
+        }
+        let possible = vec![vec![(0.0, 0.0)]; c.speakers.len()];
+        e.measured(&words, p, p, p, 0, 1.0 / 48000.0, 1.0, &possible);
+        assert!(e.bounded.iter().all(|x| *x), "the deployed PF gate must bound this cold burst");
     }
 
     /// The power-factor test's voltage gate: the M2's right woofer read
