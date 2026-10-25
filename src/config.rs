@@ -99,6 +99,11 @@ pub struct Globals {
     /// worst-case power and speakersafetyd's min_gain follow from it.  0 when
     /// the sense words are the amplifier's own full scale (J700).
     pub amp_gain_dbv: f64,
+    /// The amp gain control value `amp_gain_dbv` stands for: when set, the
+    /// daemon writes it (or the control's maximum, if that is lower)
+    /// instead of the maximum, so a control with a wider range than the
+    /// profile assumed does not play louder than every worst case.
+    pub amp_gain_index: Option<i64>,
     /// Unified governor: prediction horizon (s) and release time constant (s).
     pub horizon_s: f64,
     pub release_s: f64,
@@ -307,6 +312,10 @@ impl Config {
                 Some(v) => return Err(ConfigError(format!("[Globals] sense_format {v:?}: s32 or s16"))),
             },
             amp_gain_dbv: or(g, "Globals", "amp_gain_dbv", 0.0)?,
+            amp_gain_index: match g.get("amp_gain_index") {
+                None => None,
+                Some(v) => Some(v.parse::<i64>().ok().filter(|i| *i >= 0).ok_or_else(|| ConfigError(format!("[Globals] amp_gain_index {v:?}: a control value, 0 or more")))?),
+            },
             horizon_s: or(g, "Globals", "horizon_s", 4.6)?,
             release_s: or(g, "Globals", "release_s", 20.0)?,
             t_ctrl_headroom: or(g, "Globals", "t_ctrl_headroom", 0.0)?,
@@ -371,6 +380,9 @@ impl Config {
             isense: c.get("isense").cloned(),
             amp_gain: c.get("amp_gain").cloned(),
         };
+        if globals.amp_gain_index.is_some() && controls.amp_gain.is_none() {
+            return Err(ConfigError("[Globals] amp_gain_index needs [Controls] amp_gain".into()));
+        }
         let mut speakers = Vec::new();
         for (section, values) in &sections {
             let Some(name) = section.strip_prefix("Speaker/") else { continue };
@@ -598,6 +610,18 @@ mod tests {
         assert!((c.speakers[idx(&c, "Right Tweeter")].z_min() - 3.72).abs() < 1e-9);
         let text = J413.replacen("[Speaker/Left Tweeter]\n", "[Speaker/Left Tweeter]\nz_min = 3.9\n", 1);
         assert!(Config::parse(&text).is_err());
+    }
+
+    /// amp_gain_index: the control value amp_gain_dbv stands for, a
+    /// nonnegative integer, only with an amp gain control to write.
+    #[test]
+    fn amp_gain_index_is_a_control_value() {
+        assert_eq!(Config::parse(J316).unwrap().globals.amp_gain_index, None);
+        let with = J316.replace("amp_gain_dbv = 18.5", "amp_gain_dbv = 18.5\namp_gain_index = 15");
+        assert_eq!(Config::parse(&with).unwrap().globals.amp_gain_index, Some(15));
+        assert!(Config::parse(&with.replace("amp_gain_index = 15", "amp_gain_index = -1")).is_err());
+        assert!(Config::parse(&with.replace("amp_gain_index = 15", "amp_gain_index = 1.5")).is_err());
+        assert!(Config::parse(&J700.replace("[Globals]", "[Globals]\namp_gain_index = 15")).is_err());
     }
 
     #[test]
