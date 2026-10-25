@@ -1207,6 +1207,33 @@ impl Engine {
         Some(Engine { cfg: cfg.clone(), asahi, unified, extractor: Extractor::new(n), last: vec![Feature::default(); n], lost: vec![false; n], lost_changed: Vec::new(), pending: vec![0.0; n], reading: vec![false; n], gap: f64::INFINITY, lf: vec![(0.0, 0.0, 0.0); n], low: vec![false; n], logged: vec![(false, 0); n], pf_held: vec![0.0; n], low_held: vec![0.0; n], low_bound: vec![false; n], low_set_bound: vec![f64::INFINITY; n], bounded: vec![false; n] })
     }
 
+    /// Each model's temperatures, holds, peaks and latches at least
+    /// `o`'s, its gain no higher (two restores of one state over different
+    /// spans: persist.rs).  The budgets keep this engine's history.
+    pub fn raise_to(&mut self, o: &Engine) {
+        for (a, b) in self.asahi.iter_mut().flatten().zip(o.asahi.iter().flatten()) {
+            a.th.t_coil = a.th.t_coil.max(b.th.t_coil);
+            a.th.t_magnet = a.th.t_magnet.max(b.th.t_magnet);
+            a.coil_hyst = a.coil_hyst.max(b.coil_hyst);
+            a.magnet_hyst = a.magnet_hyst.max(b.magnet_hyst);
+            a.coil_peak = a.coil_peak.max(b.coil_peak);
+            a.magnet_peak = a.magnet_peak.max(b.magnet_peak);
+            a.gain = a.gain.min(b.gain);
+            a.hard |= b.hard;
+        }
+        for (a, b) in self.unified.iter_mut().flatten().zip(o.unified.iter().flatten()) {
+            a.ff.t_coil = a.ff.t_coil.max(b.ff.t_coil);
+            a.ff.t_magnet = a.ff.t_magnet.max(b.ff.t_magnet);
+            if let (Some(x), Some(y)) = (a.vi.as_mut(), b.vi.as_ref()) {
+                x.t_coil = x.t_coil.max(y.t_coil);
+                x.t_magnet = x.t_magnet.max(y.t_magnet);
+            }
+            a.peak = a.peak.max(b.peak);
+            a.reduction = a.reduction.max(b.reduction);
+            a.hard |= b.hard;
+        }
+    }
+
     pub fn has(&self, gov: Governor) -> bool {
         match gov {
             Governor::Legacy => false,

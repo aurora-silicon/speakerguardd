@@ -212,6 +212,14 @@ pub trait Hw {
     fn shutting_down(&self) -> bool {
         false
     }
+    /// The boot the system journal lists immediately before this one.
+    fn previous_boot(&self) -> Option<String> {
+        None
+    }
+    /// This machine's id (/etc/machine-id).
+    fn machine_id(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Errors a PCM or control returns while the playback side is being
@@ -249,6 +257,48 @@ fn state_write(path: &std::path::Path, text: &str) -> io::Result<()> {
 fn state_remove(path: &std::path::Path) -> io::Result<()> {
     state_io_fails()?;
     std::fs::remove_file(path)
+}
+
+/// The directory holding `path`, synced: what was renamed or removed in it
+/// is on the disk (a power cut cannot bring a removed file back).  A
+/// directory that does not exist holds nothing.
+fn sync_dir(path: &std::path::Path) -> io::Result<()> {
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+    match std::fs::File::open(dir) {
+        Ok(d) => d.sync_all(),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Remove `path` for good, or say why not (a file that is not there is
+/// gone, once its directory is synced).
+fn state_remove_durable(path: &std::path::Path) -> io::Result<()> {
+    state_io_fails()?;
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    sync_dir(path)
+}
+
+/// Write `path` for good: the file synced, renamed into place, the
+/// directory synced (created, private, if it is missing).
+fn state_write_durable(path: &std::path::Path, text: &str) -> io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::DirBuilderExt as _;
+    state_io_fails()?;
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    }
+    let tmp = path.with_extension("tmp");
+    let mut f = std::fs::File::create(&tmp)?;
+    f.write_all(text.as_bytes())?;
+    f.sync_all()?;
+    drop(f);
+    std::fs::rename(&tmp, path)?;
+    sync_dir(path)
 }
 
 /// How long a sense capture has gone without data.
@@ -418,8 +468,10 @@ pub struct Guard {
     min_failures: u32,
     target_failures: u32,
     state_path: Option<PathBuf>,
-    /// The state kept across a reboot (persist.rs).
+    /// The state kept across a reboot (persist.rs), and the configuration's
+    /// fingerprint it is bound to.
     persist_path: Option<PathBuf>,
+    config_fp: u64,
     last_save_try: Option<Instant>,
     save_failed: bool,
     stopping: bool,
@@ -587,37 +639,55 @@ impl Guard {
             },
         }
         // the state a clean stop left at the last shutdown: whatever this
-        // start makes of it, `invalidate` removes it below, before this run
-        // can drive the speakers (and no unlock follows while it cannot)
+        // start makes of it, `invalidate` removes it below, durably, before
+        // this run can drive the speakers (and no unlock follows while it
+        // cannot)
         if let Some(pp) = &persist_path {
             if first_of_boot && globals.boot_resume == BootResume::Idle {
+                let origin = crate::persist::Origin { machine_id: hw.machine_id(), config: crate::record::fingerprint(cfg) };
                 let why = match std::fs::read_to_string(pp) {
                     Err(e) if e.kind() == io::ErrorKind::NotFound => Err("no state from the last shutdown".to_string()),
                     Err(e) => Err(e.to_string()),
                     Ok(t) => match crate::persist::decode(&t) {
-                        None => Err("unreadable".to_string()),
+                        None => Err("unreadable or damaged".to_string()),
+                        Some(p) if !crate::persist::plausible(&p, globals.t_ambient) => Err("a temperature under the ambient: damaged".to_string()),
                         Some(p) => {
                             let at = hw.boottime();
-                            crate::persist::gap(&p, &hw.wall(), at).map(|g| (p, g, at))
+                            crate::persist::gap(&p, &hw.wall(), &origin, hw.previous_boot().as_deref(), at).map(|g| (p, g, at))
                         }
                     },
                 };
                 match why {
-                    Ok((p, gap, at)) => {
-                        // from fresh models: the saved state, then the gap
-                        // at the card's safe level
-                        speakers = cfg.speakers.iter().map(|s| SpeakerState::new(s.clone(), globals.t_ambient)).collect();
-                        engine = Engine::new(cfg, governing == Governor::Unified || globals.shadow);
+                    Ok((p, (lo, hi), at)) => {
+                        // from fresh models: the saved state, then the gap at
+                        // the card's safe level, over the shortest and the
+                        // longest it can have been; each temperature the
+                        // hotter of the two
                         let saved = Saved { boottime: Duration::ZERO, covered: Duration::ZERO, ..p.state };
-                        let elapsed = gap;
-                        if let Some(e) = engine.as_mut() {
-                            state::restore_engine(e, &saved, elapsed, &globals);
-                        }
-                        if state::restore(&mut speakers, &saved, elapsed, &globals) {
+                        let restore = |elapsed: Duration| {
+                            let mut sp: Vec<SpeakerState> = cfg.speakers.iter().map(|s| SpeakerState::new(s.clone(), globals.t_ambient)).collect();
+                            let mut en = Engine::new(cfg, governing == Governor::Unified || globals.shadow);
+                            if let Some(e) = en.as_mut() {
+                                state::restore_engine(e, &saved, elapsed, &globals);
+                            }
+                            let ok = state::restore(&mut sp, &saved, elapsed, &globals);
+                            (sp, en, ok)
+                        };
+                        let (mut sp, mut en, ok_lo) = restore(lo);
+                        let (sp_hi, en_hi, ok_hi) = restore(hi);
+                        if ok_lo && ok_hi {
+                            for (a, b) in sp.iter_mut().zip(&sp_hi) {
+                                a.raise_to(b);
+                            }
+                            if let (Some(a), Some(b)) = (en.as_mut(), en_hi.as_ref()) {
+                                a.raise_to(b);
+                            }
+                            speakers = sp;
+                            engine = en;
                             resumed = true;
                             restored_at = Some(at);
                             recovering = saved.recovering;
-                            info!("model restored from {} (a clean stop at shutdown {:.1} s ago, the gap taken as idle at the card's safe level)", pp.display(), gap.as_secs_f64());
+                            info!("model restored from {} (a clean stop at the last shutdown, {:.1} to {:.1} s ago, the gap taken as idle at the card's safe level)", pp.display(), lo.as_secs_f64(), hi.as_secs_f64());
                         } else {
                             latched(&mut speakers, &mut engine);
                         }
@@ -717,6 +787,7 @@ impl Guard {
             target_failures: 0,
             state_path,
             persist_path,
+            config_fp: crate::record::fingerprint(cfg),
             last_save_try: None,
             save_failed: false,
             stopping: false,
@@ -747,7 +818,7 @@ impl Guard {
     /// remove it.  True once no clean stop is left for a later start.
     fn invalidate<H: Hw>(&mut self, hw: &H) -> bool {
         if let Some(pp) = self.persist_path.clone() {
-            match state_remove(&pp) {
+            match state_remove_durable(&pp) {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => {
@@ -901,9 +972,6 @@ impl Guard {
         // The file names the later boot time; the time between the reads is
         // then charged once more at a full-scale signal at full gain, which
         // heats more than anything the card can have done in it.
-        // the clocks for a reboot's resume, read first: the gap it charges
-        // then starts no later than the model's account ends
-        let wall = hw.wall();
         let (mut boot, mut now, mut after) = (hw.boottime(), hw.now(), hw.boottime());
         for _ in 0..3 {
             if after.saturating_sub(boot) <= Duration::from_millis(1) {
@@ -926,7 +994,7 @@ impl Guard {
             self.check_model()?;
         }
         if self.write_state(hw, after, after, true) {
-            self.persist(hw, &wall, after);
+            self.persist(hw, after);
             Ok(())
         } else {
             Err("the final model state could not be saved".into())
@@ -937,17 +1005,25 @@ impl Guard {
     /// idle`: the final state again, for the next boot (persist.rs), stamped
     /// with the clocks read before the model's account was closed.  A
     /// failure costs only the next boot's latched start.
-    fn persist<H: Hw>(&mut self, hw: &H, wall: &crate::persist::Wall, after: Duration) {
+    fn persist<H: Hw>(&mut self, hw: &H, after: Duration) {
         let Some(pp) = self.persist_path.clone() else { return };
         if self.globals.boot_resume != BootResume::Idle || !hw.shutting_down() {
             return;
         }
+        // the clocks after the snapshot's account closed, and the boot time
+        // after them: the record names both ends of that interval
+        let wall = hw.wall();
+        let pairing = hw.boottime().saturating_sub(after);
+        let origin = crate::persist::Origin { machine_id: hw.machine_id(), config: self.config_fp };
         let text = state::encode_full(after, after, &self.speakers, self.engine.as_ref(), false, true, self.recovering);
-        match crate::persist::encode(wall, &text) {
-            None => info!("{}: no clock to time the reboot by; the next boot starts latched", pp.display()),
-            Some(t) => match state_write(&pp, &t) {
+        match crate::persist::encode(&wall, &origin, pairing, &text) {
+            None => info!("{}: no synchronized clock, boot id or machine id; the next boot starts latched", pp.display()),
+            Some(t) => match state_write_durable(&pp, &t) {
                 Ok(()) => info!("model state kept for the next boot in {}", pp.display()),
-                Err(e) => warn!("{}: {e}; the next boot starts latched", pp.display()),
+                Err(e) => {
+                    warn!("{}: {e}; the next boot starts latched", pp.display());
+                    let _ = state_remove_durable(&pp);
+                }
             },
         }
     }
@@ -2012,6 +2088,8 @@ pub mod fake {
         /// shutting down.
         pub wall: crate::persist::Wall,
         pub shutting: bool,
+        pub previous_boot: Option<String>,
+        pub machine: Option<String>,
     }
 
     impl FakeHw {
@@ -2063,6 +2141,8 @@ pub mod fake {
                 delivered: 0,
                 wall: crate::persist::Wall::default(),
                 shutting: false,
+                previous_boot: None,
+                machine: None,
             }
         }
 
@@ -2186,6 +2266,12 @@ pub mod fake {
         }
         fn shutting_down(&self) -> bool {
             self.shutting
+        }
+        fn previous_boot(&self) -> Option<String> {
+            self.previous_boot.clone()
+        }
+        fn machine_id(&self) -> Option<String> {
+            self.machine.clone()
         }
         fn now(&self) -> Instant {
             self.t0 + self.t
@@ -3177,7 +3263,7 @@ pub(crate) mod tests {
     #[test]
     fn a_clean_stop_at_shutdown_is_resumed_by_the_next_boot_only_with_idle() {
         use crate::persist::Wall;
-        let wall = |boot: &str, s: u64| Wall { realtime: Some(Duration::from_secs(s)), synced: false, rtc: Some(Duration::from_secs(s)), boot_id: Some(boot.into()) };
+        let wall = |boot: &str, s: u64| Wall { realtime: Some(Duration::from_secs(s)), synced: true, rtc: Some(Duration::from_secs(s)), boot_id: Some(boot.into()) };
         // a hot run, stopped at shutdown (or not); its persisted file
         let shutdown = |idle: bool, shutting: bool| {
             let mut cfg = j700();
@@ -3190,6 +3276,7 @@ pub(crate) mod tests {
             let mut g = Guard::start_persist(&mut hw, &cfg, 20.0, Some(run), Some(keep.clone())).unwrap();
             run_until(&mut g, &mut hw, secs(10.0)).unwrap();
             hw.wall = wall("first", 1_800_000_000);
+            hw.machine = Some("m".into());
             hw.shutting = shutting;
             g.stop(&mut hw).unwrap();
             while !g.released(&hw) {
@@ -3209,6 +3296,8 @@ pub(crate) mod tests {
             let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
             hw.boot = Duration::from_secs(10);
             hw.wall = wall("second", (1_800_000_000 + gap) as u64);
+            hw.machine = Some("m".into());
+            hw.previous_boot = Some("first".into());
             let g = Guard::start_persist(&mut hw, cfg, 20.0, Some(run.unwrap_or_else(|| missing_state().unwrap())), Some(keep.clone())).unwrap();
             assert!(!keep.exists(), "the start did not consume the last shutdown's state");
             std::fs::write(keep, text).unwrap();
@@ -5760,5 +5849,382 @@ pub(crate) mod tests {
             let demand = g.engine.as_ref().unwrap().reductions(Governor::Asahi).into_iter().fold(0.0, f64::max);
             assert!(demand < cfg.globals.max_reduction - REARM_MARGIN_DB);
         }
+    }
+}
+
+#[cfg(test)]
+mod persist_review {
+    //! The review of 753f9ca (2026-10-26, REVIEW-persist-rtc.md): its
+    //! witnesses, each asserting the behaviour that closes it.
+    use super::fake::*;
+    use super::tests::{j700, missing_state, run_until};
+    use super::*;
+    use crate::persist::{self, Origin, Wall};
+
+    fn wall(id: &str, t: u64) -> Wall {
+        Wall { realtime: Some(Duration::from_secs(t)), synced: true, rtc: Some(Duration::from_secs(t)), boot_id: Some(id.into()) }
+    }
+
+    fn origin(cfg: &Config) -> Origin {
+        Origin { machine_id: Some("machine".into()), config: crate::record::fingerprint(cfg) }
+    }
+
+    /// A clean stop's record at `tc`/`tm` in every model, written by boot
+    /// "old" at 1_800_000_000.
+    fn fixture(cfg: &Config, tc: f64, tm: f64) -> String {
+        let mut sp: Vec<_> = cfg.speakers.iter().map(|s| SpeakerState::new(s.clone(), cfg.globals.t_ambient)).collect();
+        for s in &mut sp {
+            s.resume(tc, tm, 0.0, 0.0);
+        }
+        let mut e = Engine::new(cfg, true);
+        if let Some(e) = e.as_mut() {
+            for a in e.asahi.iter_mut().flatten() {
+                (a.th.t_coil, a.th.t_magnet, a.coil_hyst, a.magnet_hyst, a.coil_peak, a.magnet_peak, a.hard) = (tc, tm, tc, tm, tc, tm, false);
+            }
+            for u in e.unified.iter_mut().flatten() {
+                (u.ff.t_coil, u.ff.t_magnet, u.peak, u.hard) = (tc, tm, tc, false);
+                if let Some(v) = u.vi.as_mut() {
+                    (v.t_coil, v.t_magnet) = (tc, tm);
+                }
+            }
+        }
+        let text = state::encode_with(Duration::from_secs(500), Duration::from_secs(500), &sp, e.as_ref(), false, true);
+        persist::encode(&wall("old", 1_800_000_000), &origin(cfg), Duration::ZERO, &text).unwrap()
+    }
+
+    /// The next boot, `up` s up, `gap` s after the record, the journal
+    /// naming `prev` before it.
+    fn boot_with(cfg: &Config, text: &str, gap: u64, up: f64, prev: Option<&str>) -> (Guard, FakeHw, PathBuf) {
+        let keep = missing_state().unwrap();
+        std::fs::write(&keep, text).unwrap();
+        let mut hw = FakeHw::per_speaker(cfg);
+        hw.boot = Duration::from_secs_f64(up);
+        hw.wall = wall("new", 1_800_000_000 + gap);
+        hw.machine = Some("machine".into());
+        hw.previous_boot = prev.map(str::to_string);
+        let g = Guard::start_persist(&mut hw, cfg, 20.0, missing_state(), Some(keep.clone())).unwrap();
+        (g, hw, keep)
+    }
+
+    fn boot(cfg: &Config, text: &str, gap: u64, up: f64) -> (Guard, FakeHw, PathBuf) {
+        boot_with(cfg, text, gap, up, Some("old"))
+    }
+
+    fn idle() -> Config {
+        let mut cfg = j700();
+        cfg.globals.boot_resume = BootResume::Idle;
+        cfg
+    }
+
+    fn latched(g: &Guard) -> bool {
+        g.speakers.iter().all(|s| s.hard && s.t_coil >= s.spec.t_limit)
+    }
+
+    /// A proven record is resumed (the control for the rest).
+    #[test]
+    fn a_proven_record_is_resumed() {
+        let cfg = idle();
+        let (g, _, keep) = boot(&cfg, &fixture(&cfg, 60.0, 55.0), 60, 10.0);
+        assert!(!g.speakers[0].hard && g.speakers[0].t_coil < 60.0, "{}", g.speakers[0].t_coil);
+        assert!(!keep.exists());
+    }
+
+    /// The default ignores the record's contents and clocks entirely: the
+    /// same models and card writes as a start without it.
+    #[test]
+    fn the_default_is_the_start_without_it() {
+        let cfg = j700();
+        let valid = fixture(&cfg, 60.0, 55.0);
+        for (name, text) in [("valid", valid.clone()), ("empty", String::new()), ("partial", valid[..valid.len() / 2].into()), ("cold", fixture(&cfg, -49.0, -49.0))] {
+            for gap in [0, 60, 86400] {
+                let (mut g, mut hw, keep) = boot(&cfg, &text, gap, 10.0);
+                let mut refhw = FakeHw::per_speaker(&cfg);
+                refhw.boot = hw.boot;
+                let mut reference = Guard::start(&mut refhw, &cfg, 20.0, missing_state()).unwrap();
+                assert!(!keep.exists());
+                for _ in 0..200 {
+                    let m = |g: &Guard| g.speakers.iter().map(|s| (s.t_coil, s.t_magnet, s.hard)).collect::<Vec<_>>();
+                    assert_eq!(m(&g), m(&reference), "{name} {gap}");
+                    g.tick(&mut hw).unwrap();
+                    reference.tick(&mut refhw).unwrap();
+                    assert_eq!(hw.per, refhw.per, "{name} {gap}");
+                    assert_eq!(g.armed(), reference.armed());
+                }
+            }
+        }
+    }
+
+    /// DEFAULT_PREEXEC_FAILURE: the unit adds nothing that can fail before
+    /// the daemon runs (no StateDirectory=); the daemon makes the directory
+    /// itself, only to keep a record, after the card is locked.
+    #[test]
+    fn the_unit_has_no_new_setup_before_the_daemon() {
+        let unit = include_str!("../speakerguardd.service");
+        for key in ["StateDirectory", "CacheDirectory", "LogsDirectory", "ConfigurationDirectory", "ReadWritePaths"] {
+            assert!(!unit.lines().any(|l| l.trim_start().starts_with(key)), "{key} in the unit");
+        }
+    }
+
+    /// Removal failures block the unlock under both policies.
+    #[test]
+    fn a_record_that_cannot_be_removed_blocks_the_unlock() {
+        for idle_on in [false, true] {
+            let mut cfg = j700();
+            if idle_on {
+                cfg.globals.boot_resume = BootResume::Idle;
+            }
+            let keep = missing_state().unwrap();
+            std::fs::create_dir(&keep).unwrap();
+            let mut hw = FakeHw::per_speaker(&cfg);
+            hw.playing = Box::new(|_| false);
+            let mut g = Guard::start_persist(&mut hw, &cfg, 20.0, missing_state(), Some(keep.clone())).unwrap();
+            run_until(&mut g, &mut hw, Duration::from_secs(600)).unwrap();
+            assert!(hw.pings.is_empty() && !g.armed());
+            std::fs::remove_dir(keep).unwrap();
+            run_until(&mut g, &mut hw, Duration::from_secs(602)).unwrap();
+            assert!(g.armed());
+        }
+    }
+
+    /// A failed keep (ENOSPC) leaves no record.
+    #[test]
+    fn a_failed_keep_leaves_no_record() {
+        let cfg = idle();
+        let keep = missing_state().unwrap();
+        std::os::unix::fs::symlink("/dev/full", keep.with_extension("tmp")).unwrap();
+        let mut hw = FakeHw::per_speaker(&cfg);
+        (hw.shutting, hw.wall, hw.machine) = (true, wall("old", 1_800_000_000), Some("machine".into()));
+        let mut g = Guard::start_persist(&mut hw, &cfg, 20.0, missing_state(), Some(keep.clone())).unwrap();
+        run_until(&mut g, &mut hw, Duration::from_secs(2)).unwrap();
+        g.stop(&mut hw).unwrap();
+        while !g.released(&hw) {
+            g.tick(&mut hw).unwrap();
+        }
+        g.final_save(&hw).unwrap();
+        assert!(!keep.exists());
+    }
+
+    /// COMMON_FORWARD_JUMP and RTC_QUANTIZATION: a gap only by a system
+    /// clock the kernel calls synchronized at both ends (a clock stepped
+    /// while it was not, or the RTC's whole seconds alone, start latched).
+    #[test]
+    fn an_unsynchronized_or_rtc_only_gap_is_latched() {
+        let cfg = idle();
+        let text = fixture(&cfg, 135.0, 100.0);
+        for (why, w) in [
+            ("both clocks a day ahead, unsynchronized", Wall { synced: false, ..wall("new", 1_800_086_400) }),
+            ("the RTC alone", Wall { realtime: None, synced: false, ..wall("new", 1_800_000_002) }),
+        ] {
+            let keep = missing_state().unwrap();
+            std::fs::write(&keep, &text).unwrap();
+            let mut hw = FakeHw::per_speaker(&cfg);
+            (hw.boot, hw.wall, hw.machine, hw.previous_boot) = (Duration::from_secs(1), w, Some("machine".into()), Some("old".into()));
+            let g = Guard::start_persist(&mut hw, &cfg, 20.0, missing_state(), Some(keep)).unwrap();
+            assert!(latched(&g), "{why}");
+        }
+    }
+
+    /// SAVE_CLOCK_OVERLAP: the clocks are read after the snapshot's account
+    /// closes, and the restore covers the whole interval between them: the
+    /// resumed coil is never colder than the snapshot restored over the
+    /// true time since it, whichever side of the snapshot the second the
+    /// read takes falls.
+    #[test]
+    fn the_restore_covers_the_time_around_the_clock_read() {
+        struct SlowWall<'a> {
+            hw: &'a FakeHw,
+            delay: std::cell::Cell<Duration>,
+            /// the second passes before the read, not after it
+            before: bool,
+        }
+        impl Hw for SlowWall<'_> {
+            fn now(&self) -> Instant {
+                self.hw.now() + self.delay.get()
+            }
+            fn boottime(&self) -> Duration {
+                self.hw.boottime() + self.delay.get()
+            }
+            fn wall(&self) -> Wall {
+                // a second passes around the clocks' read
+                if self.before {
+                    self.delay.set(self.delay.get() + Duration::from_secs(1));
+                }
+                let mut w = self.hw.wall.clone();
+                w.realtime = w.realtime.map(|r| r + self.delay.get());
+                w.rtc = w.rtc.map(|r| r + self.delay.get());
+                if !self.before {
+                    self.delay.set(self.delay.get() + Duration::from_secs(1));
+                }
+                w
+            }
+            fn shutting_down(&self) -> bool {
+                true
+            }
+            fn machine_id(&self) -> Option<String> {
+                self.hw.machine.clone()
+            }
+            fn events_available(&self) -> bool {
+                true
+            }
+            fn sleep(&mut self, _: Duration) {
+                unreachable!()
+            }
+            fn take_lock(&mut self) -> io::Result<()> {
+                unreachable!()
+            }
+            fn ping(&mut self) -> io::Result<()> {
+                unreachable!()
+            }
+            fn set_reduction(&mut self, _: f64) -> io::Result<f64> {
+                unreachable!()
+            }
+            fn set_min(&mut self) -> io::Result<()> {
+                unreachable!()
+            }
+            fn relinquish(&mut self) -> io::Result<()> {
+                unreachable!()
+            }
+            fn sample_rate(&mut self) -> io::Result<i64> {
+                unreachable!()
+            }
+            fn open_sense(&mut self, _: u32) -> io::Result<()> {
+                unreachable!()
+            }
+            fn close_sense(&mut self) {
+                unreachable!()
+            }
+            fn read_period(&mut self, _: &mut [i32]) -> io::Result<Option<bool>> {
+                unreachable!()
+            }
+            fn queued(&mut self) -> io::Result<u64> {
+                unreachable!()
+            }
+            fn read_tail(&mut self, _: &mut [i32]) -> io::Result<usize> {
+                unreachable!()
+            }
+            fn wait_rate_change(&mut self, _: Duration) -> bool {
+                unreachable!()
+            }
+            fn rate_events(&mut self) -> bool {
+                unreachable!()
+            }
+        }
+        // a hot snapshot cools over the gap, an ambient one warms toward
+        // the safe level's steady state: the short and the long end
+        for (before, tc, tm) in [(false, 125.0, 95.0), (true, 125.0, 95.0), (false, 50.0, 50.0), (true, 50.0, 50.0)] {
+            let cfg = idle();
+            let (run, keep) = (missing_state().unwrap(), missing_state().unwrap());
+            let mut hw = FakeHw::per_speaker(&cfg);
+            (hw.wall, hw.machine) = (wall("old", 1_800_000_000), Some("machine".into()));
+            let mut g = Guard::start_persist(&mut hw, &cfg, 20.0, Some(run.clone()), Some(keep.clone())).unwrap();
+            g.stop(&mut hw).unwrap();
+            while !g.released(&hw) {
+                g.tick(&mut hw).unwrap();
+            }
+            for s in &mut g.speakers {
+                s.resume(tc, tm, 0.0, 0.0);
+            }
+            g.account_to = hw.now();
+            let base = hw.boottime();
+            let slow = SlowWall { hw: &hw, delay: std::cell::Cell::new(Duration::ZERO), before };
+            g.final_save(&slow).unwrap();
+            // the snapshot's end on the clocks (they and the boot time move
+            // together here): the boot time it names, against the base
+            let snap = state::decode(&std::fs::read_to_string(&run).unwrap()).unwrap().boottime;
+            let snap_rt = Duration::from_secs(1_800_000_000) + snap.saturating_sub(base);
+            let text = std::fs::read_to_string(&keep).unwrap();
+            let p = persist::decode(&text).unwrap();
+            let restart = p.wall.realtime.unwrap() + Duration::from_secs(3);
+            let saved = Saved { boottime: Duration::ZERO, covered: Duration::ZERO, ..p.state };
+            let mut truth: Vec<_> = cfg.speakers.iter().map(|s| SpeakerState::new(s.clone(), 50.0)).collect();
+            state::restore(&mut truth, &saved, restart - snap_rt, &cfg.globals);
+            let stamp = p.wall.realtime.unwrap().as_secs() - 1_800_000_000;
+            let (resumed, _, _) = boot(&cfg, &text, stamp + 3, 1.0);
+            assert!(!resumed.speakers[0].hard);
+            assert!(resumed.speakers[0].t_coil >= truth[0].t_coil - 1e-6, "{before} {tc}: {} against {} over the true {:?}", resumed.speakers[0].t_coil, truth[0].t_coil, restart - snap_rt);
+        }
+    }
+
+    /// FOREIGN_CONFIG and FINITE_COLD_CORRUPTION: another configuration,
+    /// another machine, a temperature under the ambient, and damage start
+    /// latched.
+    #[test]
+    fn a_foreign_or_damaged_record_is_latched() {
+        let cfg = idle();
+        let mut changed = Config::parse(&include_str!("../conf/apple/j700.conf").replace("tr_magnet = 26.0", "tr_magnet = 52.0")).unwrap();
+        changed.globals.boot_resume = BootResume::Idle;
+        assert!(latched(&boot(&changed, &fixture(&cfg, 60.0, 55.0), 10, 10.0).0), "another configuration");
+        let other = fixture(&cfg, 60.0, 55.0).replace("machine_id machine", "machine_id other");
+        assert!(latched(&boot(&cfg, &other, 10, 10.0).0), "another machine (and a broken sum)");
+        assert!(latched(&boot(&cfg, &fixture(&cfg, -49.0, -49.0), 1, 1.0).0), "-49 C");
+        assert!(latched(&boot(&cfg, &fixture(&cfg, 49.0, 49.0), 60, 10.0).0), "under the 50 C ambient");
+        let good = fixture(&cfg, 60.0, 55.0);
+        let i = good.find("speaker ").unwrap();
+        let damaged = format!("{}{}", &good[..i], good[i..].replacen("60.000000", "40.000000", 1));
+        assert!(latched(&boot(&cfg, &damaged, 10, 10.0).0), "damaged");
+    }
+
+    /// REAPPEARED_UNLINK and DISABLED_PERSIST_HISTORY: a record whose boot
+    /// is not the one just before this one starts latched, whatever kept it
+    /// alive (an unlink lost in a power cut, a boot with persistence off);
+    /// and persistence off still removes it.
+    #[test]
+    fn only_the_boot_just_before_is_resumed() {
+        let cfg = idle();
+        let text = fixture(&cfg, 60.0, 55.0);
+        // consumed by "new", which drove the speakers; the unlink lost
+        let (mut g, mut hw, keep) = boot(&cfg, &text, 60, 10.0);
+        assert!(!keep.exists());
+        hw.level = Box::new(|_| 1.0);
+        run_until(&mut g, &mut hw, Duration::from_secs(30)).unwrap();
+        assert!(!hw.pings.is_empty());
+        std::fs::write(&keep, &text).unwrap();
+        let mut next = FakeHw::per_speaker(&cfg);
+        (next.boot, next.wall, next.machine, next.previous_boot) = (Duration::from_secs(10), wall("third", 1_800_000_120), Some("machine".into()), Some("new".into()));
+        assert!(latched(&Guard::start_persist(&mut next, &cfg, 20.0, missing_state(), Some(keep.clone())).unwrap()), "a reappeared record");
+        // no journal of the previous boot
+        assert!(latched(&boot_with(&cfg, &text, 60, 10.0, None).0), "no journal");
+        // a boot with persistence off (latched, its path kept) removes it
+        let mut middle_cfg = cfg.clone();
+        middle_cfg.globals.boot_resume = BootResume::Latched;
+        std::fs::write(&keep, &text).unwrap();
+        let mut mid = FakeHw::per_speaker(&middle_cfg);
+        mid.wall = wall("intermediate", 1_800_000_060);
+        let _ = Guard::start_persist(&mut mid, &middle_cfg, 20.0, missing_state(), Some(keep.clone())).unwrap();
+        assert!(!keep.exists(), "persistence off left the record");
+    }
+
+    /// DUAL_BOOT_J700: under the default, a start after another OS left
+    /// both nodes at the limit runs exactly as the start without the
+    /// record (the parent's latched start), truth for truth; `idle` is not
+    /// for such machines (persist.rs, README).
+    #[test]
+    fn the_default_is_the_parents_start_after_another_os() {
+        let cfg = j700();
+        let peak = |g: &mut Guard, hw: &mut FakeHw| {
+            hw.level = Box::new(|_| 1.0);
+            while hw.t < Duration::from_secs(30) {
+                g.tick(hw).unwrap();
+            }
+            let s = &cfg.speakers[0];
+            let mut truth = crate::engine::Thermal::new(s.tr_coil, s.tau_coil, s.tr_magnet, s.tau_magnet, s.t_limit);
+            let (mut at, mut db, mut peak) = (Duration::ZERO, MUTE_DB, s.t_limit);
+            for (to, next) in hw.writes.iter().copied().chain(std::iter::once((hw.t, MUTE_DB))) {
+                if to > at {
+                    let p = g.speakers[0].worst_case_power(db);
+                    peak = peak.max(truth.hold(p, (to - at).as_secs_f64(), cfg.globals.t_ambient).0);
+                }
+                (at, db) = (to, next);
+            }
+            peak
+        };
+        let (mut g, mut hw, _) = boot(&cfg, &fixture(&cfg, 50.0, 50.0), 7200, 10.0);
+        assert!(latched(&g));
+        let with = peak(&mut g, &mut hw);
+        let mut refhw = FakeHw::per_speaker(&cfg);
+        refhw.boot = hw.boot;
+        let mut parent = Guard::start(&mut refhw, &cfg, 20.0, missing_state()).unwrap();
+        let without = peak(&mut parent, &mut refhw);
+        assert!(with <= without + 1e-9, "{with} C against the parent's {without} C");
     }
 }
