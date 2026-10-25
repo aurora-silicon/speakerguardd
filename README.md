@@ -298,7 +298,10 @@ it never plays audio or performs a reboot.
 
 `-C <card id>` selects a card (by default the one the macaudio driver
 registered, never the AOP card that shares its `AppleJ` prefix), `-m <dB>`
-the reduction at which the card's safe level takes over, `-s <file>` the
+the reduction at which the card's safe level takes over (the floor under
+every write is not counted against it, so on a warm coil a `-m` under about
+4.5 dB can be exceeded by the floor without a hand-off: more reduction, not
+less), `-s <file>` the
 model state file (`-s ''` for none).  `-V` prints the version and the
 source commit, which the daemon also logs when it starts (`make` takes the
 commit from git; a package sets `SPEAKERGUARDD_COMMIT`).

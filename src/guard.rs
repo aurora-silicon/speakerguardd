@@ -2303,12 +2303,13 @@ mod tests {
         let cfg = j700();
         let secs_held = f64::from(COPY_QUEUE_FRAMES) / 48000.0 + 0.25 + 4096.0 / 48000.0 + 0.005;
         for (t, cost) in [(50.0, 0.46), (60.0, 0.96), (70.0, 1.53), (85.0, 2.54), (100.0, 3.86), (110.0, 5.04), (120.0, 6.66)] {
-            let magnet = 50.0 + (t - 50.0) * 26.0 / 64.0;
+            let ta = cfg.globals.t_ambient;
+            let magnet = ta + (t - ta) * 26.0 / 64.0;
             let (g, _) = w1_state(t, magnet, &[(1.0, 0.0)], 2.0);
             let floor = g.floor_db(0.0);
             eprintln!("floor at a {t} C coil (magnet {magnet:.1} C): {floor:.2} dB, the governor {:.2} dB", model::reduction_db(&g.speakers));
             assert!((floor - cost).abs() < 0.05, "{t} C: {floor} dB");
-            let near = |s: &SpeakerState, db: f64| s.peak_if(s.worst_case_power(db), secs_held, 50.0) >= s.spec.t_limit - FLUSH_MARGIN_K;
+            let near = |s: &SpeakerState, db: f64| s.peak_if(s.worst_case_power(db), secs_held, ta) >= s.spec.t_limit - FLUSH_MARGIN_K;
             assert!(!g.speakers.iter().any(|s| near(s, floor)), "{t} C: the floor lets a coil near its limit");
             assert!(g.speakers.iter().any(|s| near(s, floor - 0.05)), "{t} C: the floor is higher than it needs");
         }

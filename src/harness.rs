@@ -1172,7 +1172,8 @@ fn check(cfg: &Config, w: &World, g: &Guard, sc: &Scenario, rate: f64, held_exem
         for k in 0..cfg.speakers.len() {
             if let Some(tx) = w.oracle.crossed[k] {
                 if !(held_exempt && w.held_up(tx - after, tx)) {
-                    return Err(Violation(format!("(d) at {now:.4} s: {} true coil reached {} C at {tx:.4} s, the daemon not held up for {} ms in the {:.0} ms before", cfg.speakers[k].name, cfg.speakers[k].t_limit, HELD_MIN * 1000.0, after * 1000.0)));
+                    let why = if held_exempt { format!("the daemon not held up for {} ms in the {:.0} ms before", HELD_MIN * 1000.0, after * 1000.0) } else { "no hold-up exempted (strict)".to_string() };
+                    return Err(Violation(format!("(d) at {now:.4} s: {} true coil reached {} C at {tx:.4} s, {why}", cfg.speakers[k].name, cfg.speakers[k].t_limit)));
                 }
                 w.exempted.set(true);
             }
@@ -1540,6 +1541,20 @@ mod tests {
     fn h20_a_descheduled_daemon_behind_a_deep_queue_keeps_the_coil_under_its_limit() {
         let sc = Scenario { horizon: 0.556879324714331, events: true, steps: true, initial_db: 6.983902804740892, clean_start: true, max_reduction: 20.0, latency: 0.0006999288241433795, hot: None, stop: PROMPT_STOP, real_rate: true, streams: vec![Stream { open: 0.018291666666666668, close: 0.9735625, depth: 0.25489488086407913, chunk: 0.01741568677698285, levels: vec![(0.018291666666666668, 1.0)] }], faults: vec![Fault::SenseLoss { at: 0.3547456617352162, len: 0.8684501024116017 }, Fault::Pause { at: 0.5454473286939842, len: 0.45413327133912273 }], restarts: vec![] };
         if let Err(v) = run_with(&sc, 58000003892, false) {
+            panic!("{}", v.0);
+        }
+    }
+
+    /// The eighth review's floor witness (seed 76000006345, strict (d)): a
+    /// cold coil, a full-scale program behind 242 ms of queue at the J700's
+    /// rate, and a position read that blocks 273 ms.  Without the floor (or
+    /// without its queue term) the true coil reaches 135 C at 0.94 s; with
+    /// it the coil stays under its limit, with no exemption for the
+    /// hold-up, whether the W1 rules are there or not.
+    #[test]
+    fn h21_a_blocked_position_read_behind_a_deep_queue_keeps_the_coil_under_its_limit() {
+        let sc = Scenario { horizon: 0.830637202335804, events: true, steps: false, initial_db: 28.19950617226469, clean_start: true, max_reduction: 20.0, latency: 0.0007410581904489438, hot: None, stop: 0.005, real_rate: true, streams: vec![Stream { open: 0.17541666666666667, close: 1.3851666666666667, depth: 0.24185941828101082, chunk: 0.05424296040778713, levels: vec![(0.17541666666666667, 0.9748312635194445), (0.5083125, 1.0)] }], faults: vec![Fault::SlowPosition { at: 0.7105244284180827, delay: 0.2729590007709205 }], restarts: vec![] };
+        if let Err(v) = run_with(&sc, 76000006345, false) {
             panic!("{}", v.0);
         }
     }
