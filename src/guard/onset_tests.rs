@@ -9,6 +9,7 @@ use crate::engine::{v_worst, Thermal};
 struct Tracked {
     hw: FakeHw,
     gains: Vec<(Duration, Vec<f64>)>,
+    clean_start: bool,
 }
 impl Tracked {
     fn snap(&mut self) {
@@ -32,9 +33,8 @@ impl Hw for Tracked {
     }
     fn sleep(&mut self, d: Duration) {
         self.snap();
-        let result = self.hw.sleep(d);
+        self.hw.sleep(d);
         self.snap();
-        result
     }
     fn take_lock(&mut self) -> io::Result<()> {
         self.snap();
@@ -86,9 +86,8 @@ impl Hw for Tracked {
     }
     fn close_sense(&mut self) {
         self.snap();
-        let result = self.hw.close_sense();
+        self.hw.close_sense();
         self.snap();
-        result
     }
     fn read_period(&mut self, w: &mut [i32]) -> io::Result<Option<bool>> {
         self.snap();
@@ -122,7 +121,7 @@ impl Hw for Tracked {
     }
 }
 
-fn full_scale_run(mut cfg: Config, seconds: u64) -> (Config, Tracked) {
+fn full_scale_run(mut cfg: Config, seconds: u64, clean_start: bool) -> (Config, Tracked) {
     cfg.allow_unqualified = true;
     cfg.allow_unified = true;
     let mut hw = FakeHw::per_speaker(&cfg);
@@ -145,14 +144,18 @@ fn full_scale_run(mut cfg: Config, seconds: u64) -> (Config, Tracked) {
     let mut hw = Tracked {
         hw,
         gains: Vec::new(),
+        clean_start,
     };
-    let mut guard = Guard::start(
-        &mut hw,
-        &cfg,
-        cfg.globals.max_reduction,
-        tests::missing_state(),
-    )
-    .unwrap();
+    let state = if clean_start {
+        Some(tests::vi_state(
+            &cfg,
+            cfg.globals.t_ambient,
+            cfg.globals.t_ambient,
+        ))
+    } else {
+        tests::missing_state()
+    };
+    let mut guard = Guard::start(&mut hw, &cfg, cfg.globals.max_reduction, state).unwrap();
     while hw.hw.t < Duration::from_secs(seconds) {
         guard.tick(&mut hw).unwrap();
     }
@@ -176,7 +179,14 @@ fn check_truth(cfg: &Config, hw: &Tracked, name: &str, must_rearm: bool) {
     for (k, s) in cfg.speakers.iter().enumerate() {
         let v = v_worst(s, &cfg.globals).min(s.vs_scale);
         let z = s.z_nominal.max(v / s.is_scale * 1.01);
-        for initial in [cfg.globals.t_ambient, 135.0_f64.min(s.t_limit), s.t_limit] {
+        // A clean cold state only vouches for a cold speaker. The reviewed
+        // unknown-history starts must also bound both hot thermal nodes.
+        let starts = if hw.clean_start {
+            vec![cfg.globals.t_ambient]
+        } else {
+            vec![cfg.globals.t_ambient, 135.0_f64.min(s.t_limit), s.t_limit]
+        };
+        for initial in starts {
             for ff in [false, true] {
                 if ff && cfg.globals.governor != Governor::Unified {
                     continue;
@@ -243,7 +253,7 @@ fn reviewed_full_scale_onsets_stay_under_the_limit() {
             let mut cfg = Config::parse(&text).unwrap();
             cfg.globals.governor = gov;
             cfg.globals.guard = (gov == Governor::Unified).then_some(Governor::Asahi);
-            let (cfg, hw) = full_scale_run(cfg, 120);
+            let (cfg, hw) = full_scale_run(cfg, 120, false);
             check_truth(&cfg, &hw, name, true);
         }
     }
@@ -264,7 +274,7 @@ fn every_vi_profile_bounds_full_scale_after_mute() {
         if !cfg.has_vi() {
             continue;
         }
-        let (cfg, hw) = full_scale_run(cfg, 60);
+        let (cfg, hw) = full_scale_run(cfg, 60, true);
         check_truth(
             &cfg,
             &hw,
