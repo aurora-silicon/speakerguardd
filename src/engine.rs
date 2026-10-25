@@ -138,24 +138,22 @@ pub const DEAD_V_MIN: f64 = 0.1;
 /// full volume it is 1.28 to 1.49 times z_min against a bound of 1.6 to
 /// 1.8, and one misfired at 1.002 of it at +10 dB of replay gain (review
 /// r4 EE2); a line reading half doubles it, and one reading 0.55 to 0.65
-/// still clears it.  At LOW_FAST times the bound or more the line reads
-/// low at once; in the marginal band under that, once R has stayed over
-/// the bound for LOW_SET_S of program, its power bounded meanwhile (review
-/// r4 addendum 6a: a 1 s hold on every verdict left a bad line unbounded
-/// for its first second).  The wait and the verdict are judged against
-/// the least bound since R went over it.  It reads again under
-/// LOW_R_CLEAR of that bound, and a marginal verdict (R
-/// never past LOW_MARGINAL times the bound) also after LOW_FORGET_S of
-/// program with no low-band current to judge it by, counted only while
-/// the card is not at its safe level; a line far over the bound stays
-/// low through any passage without bass.
+/// still clears it.  The power is bounded from the first stretch R is
+/// over the bound, and stays bounded until R reads under LOW_R_CLEAR of
+/// the least bound since then, on audible program: the deployed rule
+/// (2f7d16d), judged against a bound that cannot rise with the heat the
+/// bounded model takes, and cleared only on program the card played
+/// (review r4 addenda 6a and 6b).  Nothing else clears it: a passage
+/// without bass is no evidence the line reads again, and a line just over
+/// the bound may read 0.65 of its current.  Only the verdict that is
+/// logged (and kept in `lost`) waits: at once from LOW_FAST times the
+/// bound, else once R has stayed over it for LOW_SET_S of program (the
+/// review's +10 dB misfire at 1.002 of it lasted under a second).
 pub const LOW_R_RATIO: f64 = 1.35;
 pub const LOW_R_CLEAR: f64 = 0.9;
 pub const LOW_WINDOW_S: f64 = 3.0;
 pub const LOW_FAST: f64 = 1.25;
 pub const LOW_SET_S: f64 = 1.0;
-pub const LOW_MARGINAL: f64 = 1.15;
-pub const LOW_FORGET_S: f64 = 30.0;
 const COPPER_ALPHA: f64 = 0.0039;
 /// ... and a line whose current does not follow its voltage at all (a
 /// dead line carrying a DC offset: the rms ratio stays plausible while
@@ -167,7 +165,9 @@ const COPPER_ALPHA: f64 = 0.0039;
 /// load of up to 60 degrees keeps it at 0.4 or more on any program whose
 /// impedance spans up to 4 to 1.  At PF_FAST_V or more the line is lost
 /// at once; under it, once the condition has held for PF_HOLD_S of judged
-/// program (review r4 EE1).  Every misfire seen on real data (the M2's
+/// program (review r4 EE1).  Where the deployed rule judged it (PF_BASE_V
+/// and PF_BASE_I or more) the power is bounded meanwhile, so only the
+/// verdict waits there (review r4 addendum 6b).  Every misfire seen on real data (the M2's
 /// right woofer at 0.1 V and 25 mA in a quiet passage, the M1 Pro's
 /// tweeters at 0.12 to 0.38 V) lasted at most four periods, while an offset
 /// line stays offset; what it can hide meanwhile is at most PF_FAST_V^2
@@ -178,6 +178,8 @@ pub const PF_MIN: f64 = 0.2;
 pub const PF_V_MIN: f64 = 0.1;
 pub const PF_FAST_V: f64 = 0.5;
 pub const PF_HOLD_S: f64 = 2.0;
+pub const PF_BASE_V: f64 = 0.3;
+pub const PF_BASE_I: f64 = 0.02;
 /// A lost line is logged once it has held for LOG_LOST stretches, and as
 /// reading again once that has held for LOG_BACK (review r4 DD2); the
 /// bound itself follows the line at once.
@@ -1165,16 +1167,17 @@ pub struct Engine {
     lf: Vec<(f64, f64, f64)>,
     pub low: Vec<bool>,
     /// Per speaker: seconds of judged program the power-factor condition
-    /// has held, the low-band bound has been exceeded, and the low-band
-    /// test has had nothing to judge.
+    /// has held and R has stayed over the low-band bound (the verdicts'
+    /// waits).
     pf_held: Vec<f64>,
     low_held: Vec<f64>,
-    low_idle: Vec<f64>,
-    /// ... and how far over the bound (a share of it) R has been since the
-    /// line read low, and the least bound since R went over it (the wait
-    /// and the verdict are judged against it).
-    low_peak: Vec<f64>,
+    /// ... whether the low band bounds the power (from the first stretch R
+    /// was over the bound), and the least bound since then.
+    low_bound: Vec<bool>,
     low_set_bound: Vec<f64>,
+    /// Per speaker: whether its power was bounded over the last stretch (a
+    /// lost line, or a verdict that waits where the deployed rule bounded).
+    pub bounded: Vec<bool>,
     logged: Vec<(bool, u32)>,
     /// Seconds accounted since the last measured stretch, or none since an
     /// idle span (the next stretch does not follow it).
@@ -1201,7 +1204,7 @@ impl Engine {
             return None;
         }
         let n = cfg.speakers.len();
-        Some(Engine { cfg: cfg.clone(), asahi, unified, extractor: Extractor::new(n), last: vec![Feature::default(); n], lost: vec![false; n], lost_changed: Vec::new(), pending: vec![0.0; n], reading: vec![false; n], gap: f64::INFINITY, lf: vec![(0.0, 0.0, 0.0); n], low: vec![false; n], logged: vec![(false, 0); n], pf_held: vec![0.0; n], low_held: vec![0.0; n], low_idle: vec![0.0; n], low_peak: vec![0.0; n], low_set_bound: vec![f64::INFINITY; n] })
+        Some(Engine { cfg: cfg.clone(), asahi, unified, extractor: Extractor::new(n), last: vec![Feature::default(); n], lost: vec![false; n], lost_changed: Vec::new(), pending: vec![0.0; n], reading: vec![false; n], gap: f64::INFINITY, lf: vec![(0.0, 0.0, 0.0); n], low: vec![false; n], logged: vec![(false, 0); n], pf_held: vec![0.0; n], low_held: vec![0.0; n], low_bound: vec![false; n], low_set_bound: vec![f64::INFINITY; n], bounded: vec![false; n] })
     }
 
     pub fn has(&self, gov: Governor) -> bool {
@@ -1347,32 +1350,31 @@ impl Engine {
                 // voltage at all (DD1), from the stretch's features
                 let f = &self.last[sk];
                 let (vi_m, i_ms) = (f.vi.unwrap_or(0.0), f.i_ms.unwrap_or(0.0));
-                if f.v_ms >= PF_V_MIN * PF_V_MIN && i_ms * (DEAD_RATIO * s.z_nominal).powi(2) >= f.v_ms {
+                // judged where FF1's gate or the deployed rule's is open
+                let base = f.v_ms >= PF_BASE_V * PF_BASE_V && i_ms >= PF_BASE_I * PF_BASE_I;
+                if base || (f.v_ms >= PF_V_MIN * PF_V_MIN && i_ms * (DEAD_RATIO * s.z_nominal).powi(2) >= f.v_ms) {
                     if !(vi_m >= PF_MIN * (f.v_ms * i_ms).sqrt()) {
                         self.pf_held[sk] += span;
                         if f.v_ms >= PF_FAST_V * PF_FAST_V || self.pf_held[sk] >= PF_HOLD_S {
                             lost = true;
+                        } else if base {
+                            waiting = true;
                         }
                     } else {
                         self.pf_held[sk] = 0.0;
                     }
                 }
-                // the low band is judged on program the card played at a
-                // gain it may have applied: at its safe level the words are
-                // the sense's noise, whose resistance is anything (it
-                // cleared a line reading 0.65 at a hand-off: review r4
-                // addendum 6a)
+                // the low band's window takes every stretch, as the deployed
+                // rule's did; only clearing needs program the card played
+                // at a gain it may have applied (at its safe level the words
+                // are the sense's noise, and they cleared a line reading
+                // 0.65 at a hand-off: review r4 addendum 6a)
                 let audible = f.v_ms >= DEAD_V_MIN * DEAD_V_MIN && possible[sk].iter().any(|r| r.0 <= PREDICT_MAX_DB);
-                if audible {
-                    let decay = (-span / LOW_WINDOW_S).exp();
-                    let w = &mut self.lf[sk];
-                    *w = (w.0 * decay + f.lf.0, w.1 * decay + f.lf.1, w.2 * decay + f.lf.2 as f64);
-                }
+                let decay = (-span / LOW_WINDOW_S).exp();
+                let w = &mut self.lf[sk];
+                *w = (w.0 * decay + f.lf.0, w.1 * decay + f.lf.1, w.2 * decay + f.lf.2 as f64);
                 let w = self.lf[sk];
-                if !audible {
-                    // nothing to judge by, and no time toward forgetting
-                } else if w.2 > 0.0 && w.1 / w.2 >= RTH_I_MIN * RTH_I_MIN {
-                    self.low_idle[sk] = 0.0;
+                if w.2 > 0.0 && w.1 / w.2 >= RTH_I_MIN * RTH_I_MIN {
                     let r = w.0 / w.1;
                     let alpha = if s.a_t_20c > 0.0 { s.a_t_20c } else { COPPER_ALPHA };
                     let t_coil = match (self.asahi.as_ref(), self.unified.as_ref().and_then(|u| u[sk].vi.as_ref())) {
@@ -1381,54 +1383,40 @@ impl Engine {
                         (None, None) => g.t_ambient,
                     };
                     let bound = LOW_R_RATIO * z_min * (1.0 + alpha * (t_coil - 20.0).max(0.0));
-                    // R is judged against the least bound since the
-                    // evidence began (since R first went over it, or since
-                    // the line read low): the bound rises with the model,
-                    // which the bounded line heats with the most power there
-                    // can be, and that must not end the wait or clear the
-                    // verdict.  On a J316 tweeter on bass, with its line
-                    // reading 0.65, the model ran from 95 to 113 C in four
-                    // periods of the wait, past the line's R, and the line
-                    // was never bounded again (review r4 addendum 6a)
+                    // R is judged against the least bound since it first
+                    // went over it: the bound rises with the model, which
+                    // the bounded line heats with the most power there can
+                    // be, and that must not end the bound.  On a J316
+                    // tweeter on bass, with its line reading 0.65, the model
+                    // ran from 95 to 113 C in four periods, past the line's
+                    // R (review r4 addendum 6a)
                     let held_bound = bound.min(self.low_set_bound[sk]);
                     let over = if r.is_finite() { r / held_bound } else { f64::INFINITY };
                     if over > 1.0 {
-                        self.low_held[sk] += span;
+                        self.low_bound[sk] = true;
                         self.low_set_bound[sk] = held_bound;
-                        if !self.low[sk] && (over >= LOW_FAST || self.low_held[sk] >= LOW_SET_S) {
+                        self.low_held[sk] += span;
+                        if over >= LOW_FAST || self.low_held[sk] >= LOW_SET_S {
                             self.low[sk] = true;
-                        }
-                        if self.low[sk] {
-                            self.low_peak[sk] = self.low_peak[sk].max(over);
-                        } else {
-                            waiting = true;
                         }
                     } else {
                         self.low_held[sk] = 0.0;
-                        if !self.low[sk] {
-                            self.low_set_bound[sk] = f64::INFINITY;
-                        }
                     }
-                    // it reads again under LOW_R_CLEAR of that bound
-                    if self.low[sk] && r < LOW_R_CLEAR * held_bound {
-                        self.low[sk] = false;
-                        self.low_peak[sk] = 0.0;
-                        self.low_set_bound[sk] = f64::INFINITY;
-                    }
-                } else {
-                    // program at a gain the card may have played it at, with
-                    // nothing in the low band to judge the line by
-                    self.low_idle[sk] += span;
-                    if self.low_idle[sk] >= LOW_FORGET_S && self.low_peak[sk] < LOW_MARGINAL {
+                    // the bound (and the verdict) end only on evidence the
+                    // line reads: R under LOW_R_CLEAR of that bound, on
+                    // program the card played
+                    if self.low_bound[sk] && audible && r < LOW_R_CLEAR * held_bound {
+                        self.low_bound[sk] = false;
                         self.low[sk] = false;
                         self.low_held[sk] = 0.0;
-                        self.low_peak[sk] = 0.0;
                         self.low_set_bound[sk] = f64::INFINITY;
                     }
                 }
+                waiting |= self.low_bound[sk];
                 lost |= self.low[sk];
             }
             let bounded = lost || waiting;
+            self.bounded[sk] = bounded;
             for f in 0..frames {
                 let wv = words[f * ch + s.vs_chan] as f64;
                 let wi = s.is_chan.map_or(0.0, |ic| words[f * ch + ic] as f64);
@@ -2917,15 +2905,92 @@ mod tests {
         assert!(e.low.iter().all(|&l| l));
         pass(&mut e, &treble(3.0), 950, &open, 50.0);
         assert!(e.low.iter().all(|&l| l), "a line reading 0.2 was forgotten in treble: {:?}", e.low);
-        // a marginal verdict (a hot coil just over the bound, the misfire's
-        // kind) clears after 30 s of treble, not of the card's safe level
+        // a marginal verdict (just over the bound, the misfire's kind, but
+        // a line reading 0.65 is one too) is kept through any passage
+        // without bass, at the card's safe level or not (review r4
+        // addendum 6b); bass the line reads under 0.9 of its bound clears
+        // it, on program the card played
         let mut m = low_run(60.0, 3.0, 1.6, 1.0, 0.0, 40, 59.0);
         assert!(m.low.iter().all(|&l| l), "1.6 times z_min at 59 C for 3 s: {:?}", m.low);
         let safe = vec![vec![(99.5, 99.5)]; c.speakers.len()];
         pass(&mut m, &treble(3.0), 600, &safe, 59.0);
         assert!(m.low.iter().all(|&l| l), "a marginal flag cleared at the card's safe level");
-        pass(&mut m, &treble(3.0), 600, &open, 59.0);
-        assert!(m.low.iter().all(|&l| !l), "a marginal flag stuck: {:?}", m.low);
+        pass(&mut m, &treble(3.0), 1200, &open, 59.0);
+        assert!(m.low.iter().all(|&l| l) && m.bounded.iter().all(|&b| b), "a marginal flag forgotten in treble: {:?}", m.low);
+        let bass = |z: f64| -> Vec<i32> {
+            let w32 = |x: f64, fs: f64| ((x / fs * 32767.0).round().clamp(-32768.0, 32767.0) as i32) << 16;
+            let mut w = vec![0i32; p * ch];
+            for f in 0..p {
+                let x = 2.0 * std::f64::consts::PI * 60.0 * f as f64 / 48000.0;
+                for s in &c.speakers {
+                    w[f * ch + s.vs_chan] = w32(3.0 * x.sin(), s.vs_scale);
+                    w[f * ch + s.is_chan.unwrap()] = w32(3.0 / (z * s.z_min()) * x.sin(), s.is_scale);
+                }
+            }
+            w
+        };
+        pass(&mut m, &bass(1.2), 60, &safe, 59.0);
+        assert!(m.low.iter().all(|&l| l), "cleared by bass at the card's safe level");
+        pass(&mut m, &bass(1.2), 60, &open, 59.0);
+        assert!(m.low.iter().all(|&l| !l) && m.bounded.iter().all(|&b| !b), "a line reading again stayed bounded: {:?}", m.low);
+    }
+
+    /// Review r4 addendum 6b: wherever the deployed rule (2f7d16d) bounded
+    /// a line's power, the rework bounds it too, only its verdict waits.
+    /// From a warm state (the asahi models at 120 C): a line reading 0.61
+    /// of a 1.2 z_min load for one period, then 0.67, back inside the old
+    /// rule's band (under the bound, over 0.9 of it) - bounded throughout,
+    /// asking at least the old rule's 2.0 dB (rounded) at 0.34 s; and 0.4 V
+    /// rms at 1 kHz over a 30 mA offset (a power factor near 0, inside the
+    /// old rule's 0.3 V and 20 mA) - bounded from the first period, asking
+    /// at least its 0.5 dB.
+    #[test]
+    fn a_waiting_verdict_keeps_the_deployed_rules_bound() {
+        let mut c = cfg(J316);
+        c.globals.governor = Governor::Unified;
+        c.globals.guard = Some(Governor::Asahi);
+        let (ch, p) = (c.globals.channels, c.globals.period);
+        let possible = vec![vec![(0.0, 0.0)]; c.speakers.len()];
+        let w16 = |x: f64, fs: f64| ((x / fs * 32767.0).round().clamp(-32768.0, 32767.0) as i32) << 16;
+        let lw1 = c.speakers.iter().position(|s| s.name == "Left Woofer 1").unwrap();
+        let rounded = |db: f64| (db * 2.0 - 1e-9).ceil() / 2.0;
+        let mut e = Engine::new(&c, true).unwrap();
+        set_asahi(&mut e, 120.0, 120.0);
+        e.govern(0.0, false);
+        for n in 0..12 {
+            let k = if n == 0 { 0.61 } else { 0.67 };
+            let mut w = vec![0; p * ch];
+            for f in 0..p {
+                let v = 3.0 * (2.0 * std::f64::consts::PI * 60.0 * (n * p + f) as f64 / 48000.0).sin();
+                for s in &c.speakers {
+                    w[f * ch + s.vs_chan] = w16(v, s.vs_scale);
+                    w[f * ch + s.is_chan.unwrap()] = w16(k * v / (1.2 * s.z_min()), s.is_scale);
+                }
+            }
+            e.check(&w, 48000.0).unwrap();
+            e.measured(&w, p, p, p, 0, 1.0 / 48000.0, 1.0, &possible);
+            assert!(e.bounded[lw1], "period {n}: the 0.61/0.67 line was not bounded");
+            if n == 3 {
+                let (db, _) = e.governed(Governor::Unified);
+                assert!(rounded(db[lw1]) >= 2.0, "asked {} dB at 0.34 s", db[lw1]);
+            }
+        }
+        let mut e = Engine::new(&c, true).unwrap();
+        set_asahi(&mut e, 120.0, 120.0);
+        e.govern(0.0, false);
+        let mut w = vec![0; p * ch];
+        for f in 0..p {
+            let v = 0.4 * 2f64.sqrt() * (2.0 * std::f64::consts::PI * 1000.0 * f as f64 / 48000.0).sin();
+            for s in &c.speakers {
+                w[f * ch + s.vs_chan] = w16(v, s.vs_scale);
+                w[f * ch + s.is_chan.unwrap()] = w16(0.03, s.is_scale);
+            }
+        }
+        e.check(&w, 48000.0).unwrap();
+        e.measured(&w, p, p, p, 0, 1.0 / 48000.0, 1.0, &possible);
+        assert!(e.bounded[lw1] && !e.lost[lw1], "0.4 V over a 30 mA offset: bounded {}, lost {}", e.bounded[lw1], e.lost[lw1]);
+        let (db, _) = e.governed(Governor::Unified);
+        assert!(rounded(db[lw1]) >= 0.5, "asked {} dB", db[lw1]);
     }
 
     /// The power-factor test's voltage gate: the M2's right woofer read

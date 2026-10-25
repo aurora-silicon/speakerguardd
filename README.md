@@ -227,20 +227,20 @@ hysteresis.  It differs only toward protection:
   measured-power model's coil temperature at the coil's temperature
   coefficient, is more than a live coil can show.  On the J616s's woofers
   at full volume it is 1.28 to 1.49 times; a line reading half doubles
-  it.  From 1.25 times the bound the line is lost at once; under that
-  it has to stay over the bound for a second of program, its power
-  bounded meanwhile, and the bound it is judged against is the least
-  since R went over it (the bounded model heats, and its rising bound
-  must not end the wait or clear the verdict).  It reads again under
-  0.9 of that bound; a verdict that never went past 1.15 times its
-  bound also clears after 30 s of audible program with no low-band
-  current to judge it by.  The low band is judged on audible program
-  only, never at the card's safe level.  And over a period with at
-  least 0.1 V rms and the current the dead-line test passes, current
-  that does not follow the voltage (sum(v i) under 0.2 of
-  sqrt(sum(v^2) sum(i^2)); a live load of up to 60 degrees keeps it
-  over 0.4) is no reading, at once from 0.5 V rms and after 2 s of such
-  program under it.  What V and I cannot tell apart is a line reading a fraction
+  it.  The power is bounded from the first stretch R is over the bound
+  and stays bounded until R reads under 0.9 of the least bound since
+  then, on program the card played (not at its safe level, whose words
+  are the sense's noise).  The least bound: the bound rises with the
+  model's coil, which the bounded line itself heats, and that must not
+  end the bound.  Nothing else clears it; a passage without bass is no
+  evidence that the line reads again.  Only the logged verdict waits: at
+  once from 1.25 times the bound, else after R has stayed over it for a
+  second of program.  And over a period with at least 0.1 V rms and the
+  current the dead-line test passes, or 0.3 V and 20 mA, current that
+  does not follow the voltage (sum(v i) under 0.2 of sqrt(sum(v^2)
+  sum(i^2)); a live load of up to 60 degrees keeps it over 0.4) is no
+  reading, at once from 0.5 V rms and after 2 s of such program under
+  it; from 0.3 V and 20 mA its power is bounded meanwhile.  What V and I cannot tell apart is a line reading a fraction
   of its current on a program with no low-band current from a higher
   impedance: the tweeters, and treble-only programs on the woofers.
 * `z_min` in a speaker's section sets its smallest impedance (a unit's
