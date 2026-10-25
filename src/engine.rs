@@ -135,25 +135,36 @@ pub const DEAD_V_MIN: f64 = 0.1;
 /// where the file has none): LOW_R_RATIO times z_min at 20 C, scaled to the
 /// measured-power model's coil (no cooler than the truth while the line
 /// reads, and cooler still when it reads low).  On the J616s's woofers at
-/// full volume it is 1.28 to 1.49 times z_min against a bound of 1.6 to
-/// 1.8; a line reading half doubles it.  Under LOW_R_CLEAR of the bound
-/// the line reads again.
-pub const LOW_R_RATIO: f64 = 1.35;
+/// full volume it is 1.28 to 1.49 times z_min against a bound of 1.9 to
+/// 2.2, about 0.7 of it (1.35 left them at 0.87 to 0.94, and one misfired
+/// at +10 dB of replay gain: review r4 EE2); a line reading half doubles
+/// it.  The line reads low once R has stayed over the bound for LOW_SET_S
+/// of program, and reads again under LOW_R_CLEAR of the bound, or after
+/// LOW_FORGET_S of program with no low-band current to judge it by.
+pub const LOW_R_RATIO: f64 = 1.6;
 pub const LOW_R_CLEAR: f64 = 0.9;
 pub const LOW_WINDOW_S: f64 = 3.0;
+pub const LOW_SET_S: f64 = 1.0;
+pub const LOW_FORGET_S: f64 = 30.0;
 const COPPER_ALPHA: f64 = 0.0039;
 /// ... and a line whose current does not follow its voltage at all (a
 /// dead line carrying a DC offset: the rms ratio stays plausible while
 /// V*I averages to nothing): over a stretch with at least PF_V_MIN and
 /// PF_I_MIN rms, sum(v i) / sqrt(sum(v^2) sum(i^2)) under PF_MIN.  A live
 /// load of up to 60 degrees keeps it at 0.4 or more on any program whose
-/// impedance spans up to 4 to 1.  Under PF_V_MIN it is not judged: the
-/// M2's right woofer read 0.1 V and 25 mA at a power factor near 0 in a
-/// quiet passage, and what an offset line under it can hide is at most
-/// 0.3^2 W over the smallest impedance (22 mW at 4 ohm).
+/// impedance spans up to 4 to 1.  At PF_FAST_V or more the line is lost
+/// at once; under it, once the condition has held for PF_HOLD_S of judged
+/// program (review r4 EE1).  Every misfire seen on real data (the M2's
+/// right woofer at 0.1 V and 25 mA in a quiet passage, the M1 Pro's
+/// tweeters at 0.12 to 0.38 V) lasted at most four periods, while an offset
+/// line stays offset; what it can hide meanwhile is at most PF_FAST_V^2
+/// over the smallest impedance for PF_HOLD_S, 67 mW for 2 s on the J413's
+/// tweeters.
 pub const PF_MIN: f64 = 0.2;
 pub const PF_I_MIN: f64 = 0.02;
-pub const PF_V_MIN: f64 = 0.3;
+pub const PF_V_MIN: f64 = 0.1;
+pub const PF_FAST_V: f64 = 0.5;
+pub const PF_HOLD_S: f64 = 2.0;
 /// A lost line is logged once it has held for LOG_LOST stretches, and as
 /// reading again once that has held for LOG_BACK (review r4 DD2); the
 /// bound itself follows the line at once.
@@ -1140,6 +1151,12 @@ pub struct Engine {
     /// lost state has held since the log last changed.
     lf: Vec<(f64, f64, f64)>,
     pub low: Vec<bool>,
+    /// Per speaker: seconds of judged program the power-factor condition
+    /// has held, the low-band bound has been exceeded, and the low-band
+    /// test has had nothing to judge.
+    pf_held: Vec<f64>,
+    low_held: Vec<f64>,
+    low_idle: Vec<f64>,
     logged: Vec<(bool, u32)>,
     /// Seconds accounted since the last measured stretch, or none since an
     /// idle span (the next stretch does not follow it).
@@ -1166,7 +1183,7 @@ impl Engine {
             return None;
         }
         let n = cfg.speakers.len();
-        Some(Engine { cfg: cfg.clone(), asahi, unified, extractor: Extractor::new(n), last: vec![Feature::default(); n], lost: vec![false; n], lost_changed: Vec::new(), pending: vec![0.0; n], reading: vec![false; n], gap: f64::INFINITY, lf: vec![(0.0, 0.0, 0.0); n], low: vec![false; n], logged: vec![(false, 0); n] })
+        Some(Engine { cfg: cfg.clone(), asahi, unified, extractor: Extractor::new(n), last: vec![Feature::default(); n], lost: vec![false; n], lost_changed: Vec::new(), pending: vec![0.0; n], reading: vec![false; n], gap: f64::INFINITY, lf: vec![(0.0, 0.0, 0.0); n], low: vec![false; n], logged: vec![(false, 0); n], pf_held: vec![0.0; n], low_held: vec![0.0; n], low_idle: vec![0.0; n] })
     }
 
     pub fn has(&self, gov: Governor) -> bool {
@@ -1305,13 +1322,21 @@ impl Engine {
                 // voltage at all (DD1), from the stretch's features
                 let f = &self.last[sk];
                 let (vi_m, i_ms) = (f.vi.unwrap_or(0.0), f.i_ms.unwrap_or(0.0));
-                if f.v_ms >= PF_V_MIN * PF_V_MIN && i_ms >= PF_I_MIN * PF_I_MIN && !(vi_m >= PF_MIN * (f.v_ms * i_ms).sqrt()) {
-                    lost = true;
+                if f.v_ms >= PF_V_MIN * PF_V_MIN && i_ms >= PF_I_MIN * PF_I_MIN {
+                    if !(vi_m >= PF_MIN * (f.v_ms * i_ms).sqrt()) {
+                        self.pf_held[sk] += span;
+                        if f.v_ms >= PF_FAST_V * PF_FAST_V || self.pf_held[sk] >= PF_HOLD_S {
+                            lost = true;
+                        }
+                    } else {
+                        self.pf_held[sk] = 0.0;
+                    }
                 }
                 let decay = (-span / LOW_WINDOW_S).exp();
                 let w = &mut self.lf[sk];
                 *w = (w.0 * decay + f.lf.0, w.1 * decay + f.lf.1, w.2 * decay + f.lf.2 as f64);
                 if w.2 > 0.0 && w.1 / w.2 >= RTH_I_MIN * RTH_I_MIN {
+                    self.low_idle[sk] = 0.0;
                     let r = w.0 / w.1;
                     let alpha = if s.a_t_20c > 0.0 { s.a_t_20c } else { COPPER_ALPHA };
                     let t_coil = match (self.asahi.as_ref(), self.unified.as_ref().and_then(|u| u[sk].vi.as_ref())) {
@@ -1321,9 +1346,21 @@ impl Engine {
                     };
                     let bound = LOW_R_RATIO * z_min * (1.0 + alpha * (t_coil - 20.0).max(0.0));
                     if r > bound || !r.is_finite() {
-                        self.low[sk] = true;
-                    } else if r < LOW_R_CLEAR * bound {
+                        self.low_held[sk] += span;
+                        if self.low_held[sk] >= LOW_SET_S {
+                            self.low[sk] = true;
+                        }
+                    } else {
+                        self.low_held[sk] = 0.0;
+                        if r < LOW_R_CLEAR * bound {
+                            self.low[sk] = false;
+                        }
+                    }
+                } else {
+                    self.low_idle[sk] += span;
+                    if self.low_idle[sk] >= LOW_FORGET_S {
                         self.low[sk] = false;
+                        self.low_held[sk] = 0.0;
                     }
                 }
                 lost |= self.low[sk];
@@ -1731,7 +1768,7 @@ mod tests {
             x ^= x << 17;
             (x >> 11) as f64 / (1u64 << 53) as f64
         };
-        for _ in 0..400 {
+        for _ in 0..600 {
             let (trc, tauc, trm, taum) = (5.0 + 100.0 * f(), 0.5 + 5.0 * f(), 5.0 + 200.0 * f(), 20.0 + 200.0 * f());
             let c0 = 50.0 + 150.0 * f();
             let m0 = 50.0 + 150.0 * f();
@@ -2727,8 +2764,9 @@ mod tests {
     /// even at its limit; within the window it is lost.  A dead line with
     /// 0.2 A of offset reads a plausible rms against 3 V, but its current
     /// does not follow the voltage.  A live line at 1.45 times z_min is a
-    /// hot coil (the J616s's woofers at full volume): lost with the model at
-    /// 20 C, not at 120 C.
+    /// hot coil: a live line at 1.75 times z_min is lost with the model at
+    /// 20 C, not at 120 C (the J616s's woofers at full volume read 1.28 to
+    /// 1.49).
     #[test]
     fn a_line_that_reads_low_or_off_its_voltage_is_lost() {
         // 3 s of 60 Hz at 3 V, 85 ms a period
@@ -2738,27 +2776,54 @@ mod tests {
         assert!(live.lost.iter().all(|&l| !l), "a live line: {:?}", live.lost);
         let offset = low_run(1000.0, 3.0, 1.2, 0.0, 0.2, 2, 50.0);
         assert!(offset.lost.iter().all(|&l| l), "a dead line with an offset: {:?}", offset.lost);
-        let cold = low_run(60.0, 3.0, 1.45, 1.0, 0.0, 40, 20.0);
-        assert!(cold.lost.iter().all(|&l| l), "1.45 times z_min at 20 C: {:?}", cold.lost);
-        let hot = low_run(60.0, 3.0, 1.45, 1.0, 0.0, 40, 120.0);
-        assert!(hot.lost.iter().all(|&l| !l), "1.45 times z_min at 120 C: {:?}", hot.lost);
+        let cold = low_run(60.0, 3.0, 1.75, 1.0, 0.0, 40, 20.0);
+        assert!(cold.lost.iter().all(|&l| l), "1.75 times z_min at 20 C: {:?}", cold.lost);
+        let hot = low_run(60.0, 3.0, 1.75, 1.0, 0.0, 40, 120.0);
+        assert!(hot.lost.iter().all(|&l| !l), "1.75 times z_min at 120 C: {:?}", hot.lost);
+        // the review's misfire at +10 dB of replay gain: 1.55 times z_min
+        // with the model's coil at 59 C, over 1.35's bound and under 1.6's
+        let real = low_run(60.0, 3.0, 1.55, 1.0, 0.0, 40, 59.0);
+        assert!(real.lost.iter().all(|&l| !l), "1.55 times z_min at 59 C: {:?}", real.lost);
+        // and a line reading low is judged on a second of program, not one
+        // update
+        let early = low_run(60.0, 3.0, 1.2, 0.4, 0.0, 5, 50.0);
+        assert!(early.lost.iter().all(|&l| !l), "lost after five periods: {:?}", early.lost);
+        // a lost low line reads again once there is nothing to judge it by
+        // for LOW_FORGET_S, so a misfire cannot stay (review r4 EE2)
+        let mut e = low_run(60.0, 3.0, 1.2, 0.4, 0.0, 40, 50.0);
+        assert!(e.low.iter().all(|&l| l));
+        let c = cfg(J316);
+        let (ch, p) = (c.globals.channels, c.globals.period);
+        let possible = vec![vec![(0.0, 0.0)]; c.speakers.len()];
+        let treble: Vec<i32> = (0..p * ch).map(|q| {
+            let (f, k) = (q / ch, q % ch);
+            let x = (3.0 * (2.0 * std::f64::consts::PI * 3000.0 * f as f64 / 48000.0).sin() / 14.0 * 32767.0) as i32;
+            if c.speakers.iter().any(|s| s.vs_chan == k) { x << 16 } else { (x / 3) << 16 }
+        }).collect();
+        for _ in 0..600 {
+            e.check(&treble, 48000.0).unwrap();
+            e.measured(&treble, p, p, p, 0, 1.0 / 48000.0, 1.0, &possible);
+        }
+        assert!(e.low.iter().all(|&l| !l), "the low-band flag stuck: {:?}", e.low);
     }
 
     /// The power-factor test's voltage gate: the M2's right woofer read
     /// 0.10 V rms against 25 mA with the current near a right angle to the
     /// voltage (a power factor of -0.015 to 0.014) for four periods of a
-    /// quiet passage, and was bounded and logged for it.  Under 0.3 V it is
-    /// not judged; the same current at 1 V is no reading.
+    /// quiet passage, and was bounded and logged for it.  Under 0.5 V the
+    /// condition has to hold for 2 s of program (review r4 EE1): those four
+    /// periods are not enough, three seconds at 0.2 V are; the same current
+    /// at 1 V is no reading at once.
     #[test]
     fn a_quiet_line_at_a_right_angle_is_not_judged() {
-        let run = |v_rms: f64| {
+        let run = |v_rms: f64, periods: usize| {
             let c = cfg(J413);
             let (ch, p) = (c.globals.channels, c.globals.period);
             let possible = vec![vec![(0.0, 0.0)]; c.speakers.len()];
             let mut e = Engine::new(&c, true).unwrap();
             e.govern(0.0, false);
             let w16 = |x: f64, fs: f64| ((x / fs * 32767.0).round().clamp(-32768.0, 32767.0) as i32) << 16;
-            for n in 0..4 {
+            for n in 0..periods {
                 let mut w = vec![0i32; p * ch];
                 for f in 0..p {
                     let x = 2.0 * std::f64::consts::PI * 1000.0 * (n * p + f) as f64 / 48000.0;
@@ -2772,8 +2837,9 @@ mod tests {
             }
             e.lost.clone()
         };
-        assert!(run(0.10).iter().all(|&l| !l), "0.1 V at a right angle was judged");
-        assert!(run(1.0).iter().all(|&l| l), "1 V at a right angle reads");
+        assert!(run(0.10, 4).iter().all(|&l| !l), "0.1 V at a right angle for four periods was lost");
+        assert!(run(0.2, 36).iter().all(|&l| l), "0.2 V at a right angle for 3 s reads");
+        assert!(run(1.0, 1).iter().all(|&l| l), "1 V at a right angle reads");
     }
 
     /// Review r4 DD2: a line flapping between lost and reading every
