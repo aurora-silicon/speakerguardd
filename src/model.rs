@@ -131,11 +131,11 @@ impl SpeakerState {
         for f in 0..frames {
             let w = words[f * channels + ch] as f64;
             let v = w * scale;
-            p.push(v * v / self.spec.z_nominal);
+            p.push(v * v / self.spec.r_ff);
             let w = w.abs();
             let room = if w > 0.0 { 20.0 * (2147483648.0 / w).log10() } else { f64::INFINITY };
             let up = (w + 1.0) * scale;
-            let pre = up * up / self.spec.z_nominal * 10f64.powf(converted_at(room, possible) / 10.0);
+            let pre = up * up / self.spec.r_ff * 10f64.powf(converted_at(room, possible) / 10.0);
             q.push(if pre > full { full } else { pre });
         }
         (p, q)
@@ -538,6 +538,22 @@ mod tests {
             qualified: true,
             guard: None,
         }
+    }
+
+    #[test]
+    fn frame_power_uses_the_feed_forward_resistance() {
+        let mut sp = spec();
+        sp.vs_scale = 8.0;
+        sp.z_nominal = 4.0;
+        sp.r_ff = 2.0;
+        let s = SpeakerState::new(sp, 35.0);
+        // Half scale is 4 V, or 8 W through the configured 2 ohm FF bound.
+        let words = [1i32 << 30];
+        let (p, pre) = s.frame_powers(&words, 1, &[(0.0, 0.0)]);
+        assert!((p[0] - 8.0).abs() < 1e-12, "{p:?}");
+        assert!(pre[0] >= 8.0 && pre[0] < 8.0 + 1e-7, "{pre:?}");
+        let (blocks, _) = s.block_powers(&words, 1, 1);
+        assert_eq!(p, blocks, "frame and block heat disagree");
     }
 
     #[test]
