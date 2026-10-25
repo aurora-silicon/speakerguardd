@@ -962,13 +962,16 @@ impl Guard {
         // heats more than anything the card can have done in it.
         let (mut boot, mut now, mut after) = (hw.boottime(), hw.now(), hw.boottime());
         for _ in 0..3 {
-            if after.saturating_sub(boot) <= Duration::from_millis(1) {
+            if !boot.is_zero() && after >= boot && after - boot <= Duration::from_millis(1) {
                 break;
             }
             (boot, now, after) = (hw.boottime(), hw.now(), hw.boottime());
         }
+        let Some(span) = after.checked_sub(boot).filter(|_| !boot.is_zero() && !after.is_zero()) else {
+            return Err("the final snapshot has no trustworthy boot-time epoch".into());
+        };
         self.charge(now)?;
-        let pairing = after.saturating_sub(boot).as_secs_f64();
+        let pairing = span.as_secs_f64();
         if pairing > 0.0 {
             let ta = self.globals.t_ambient;
             for s in self.speakers.iter_mut() {
@@ -1001,7 +1004,11 @@ impl Guard {
         // the clocks after the snapshot's account closed, and the boot time
         // after them: the record names both ends of that interval
         let wall = hw.wall();
-        let pairing = hw.boottime().saturating_sub(after);
+        let end = hw.boottime();
+        let Some(pairing) = end.checked_sub(after).filter(|_| !after.is_zero() && !end.is_zero()) else {
+            info!("{}: no trustworthy boot-time pairing; the next boot starts latched", pp.display());
+            return;
+        };
         let origin = crate::persist::Origin { machine_id: hw.machine_id(), config: self.config_fp };
         let text = state::encode_full(after, after, &self.speakers, self.engine.as_ref(), false, true, self.recovering);
         match crate::persist::encode(&wall, &origin, pairing, &text) {
@@ -6029,13 +6036,19 @@ mod persist_review {
             delay: std::cell::Cell<Duration>,
             /// the second passes before the read, not after it
             before: bool,
+            broken_pairing: bool,
+            broken_epoch: bool,
         }
         impl Hw for SlowWall<'_> {
             fn now(&self) -> Instant {
                 self.hw.now() + self.delay.get()
             }
             fn boottime(&self) -> Duration {
-                self.hw.boottime() + self.delay.get()
+                if self.broken_epoch || (self.broken_pairing && !self.delay.get().is_zero()) {
+                    Duration::ZERO // the RealHw sentinel when CLOCK_BOOTTIME fails
+                } else {
+                    self.hw.boottime() + self.delay.get()
+                }
             }
             fn wall(&self) -> Wall {
                 // a second passes around the clocks' read
@@ -6119,7 +6132,7 @@ mod persist_review {
             }
             g.account_to = hw.now();
             let base = hw.boottime();
-            let slow = SlowWall { hw: &hw, delay: std::cell::Cell::new(Duration::ZERO), before };
+            let slow = SlowWall { hw: &hw, delay: std::cell::Cell::new(Duration::ZERO), before, broken_pairing: false, broken_epoch: false };
             g.final_save(&slow).unwrap();
             // the snapshot's end on the clocks (they and the boot time move
             // together here): the boot time it names, against the base
@@ -6138,6 +6151,18 @@ mod persist_review {
             let (resumed, _, _) = boot(&cfg, &text, stamp + 3, 1.0);
             assert!(!resumed.speakers[0].hard);
             assert!(resumed.speakers[0].t_coil >= truth[0].t_coil - 1e-6, "{before} {tc}: {} against {} over the true {:?}", resumed.speakers[0].t_coil, truth[0].t_coil, restart - snap_rt);
+            // A missing final monotonic read must not erase the second of
+            // uncertainty. Runtime state has a valid epoch; cross-boot
+            // state cannot be kept without the later pairing read.
+            std::fs::remove_file(&keep).unwrap();
+            let broken = SlowWall { hw: &hw, delay: std::cell::Cell::new(Duration::ZERO), before, broken_pairing: true, broken_epoch: false };
+            g.final_save(&broken).unwrap();
+            assert!(!keep.exists(), "a failed pairing read was treated as zero delay");
+            // Nor can both failed epoch reads make a clean /run record
+            // stamped at zero (and a later restart cool it for the uptime).
+            let broken = SlowWall { hw: &hw, delay: std::cell::Cell::new(Duration::ZERO), before, broken_pairing: false, broken_epoch: true };
+            assert!(g.final_save(&broken).is_err());
+            assert!(!keep.exists());
         }
     }
 

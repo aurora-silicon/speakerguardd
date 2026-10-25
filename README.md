@@ -169,7 +169,9 @@ query, a step, a pending leap transition or a failed watch rejects the
 sample. The guarded sample must finish within 50 ms of boot time, on both
 save and restore. Restore also bounds the whole wall-clock read to 50 ms.
 The shutdown record keeps the whole delay from the model snapshot through
-the clock reads. These bounds give an interval of possible snapshot ages.
+the clock reads. Missing or backward boot-time reads cannot produce a
+clean snapshot or a persistent pairing. These bounds give an interval of
+possible snapshot ages.
 The restored coil, magnet and governing peaks bound that entire interval,
 including interior coil extrema. A one-microkelvin upward allowance covers
 the temperature record's six-decimal rounding. The legacy model uses an invariant upper
