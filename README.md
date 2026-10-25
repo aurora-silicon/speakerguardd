@@ -286,6 +286,33 @@ review of the constants, and an explicit change to `qualified`; parsing,
 read-only checks and a sibling match alone are insufficient. No loud
 playback is part of this contribution procedure.
 
+**Across a reboot (`boot_resume`, off by default).**  `/run` dies with the
+boot, so by default every boot starts latched at the coils' limit (on the
+Neo, an 11.9 dB first lock released over 7.6 min).  With `boot_resume =
+idle` in `[Globals]`, a clean stop made while systemd shuts the system down
+also writes its state to `/var/lib/speakerguardd/state` (`--persist`;
+`StateDirectory=` in the unit), stamped with the boot's id, the RTC and
+CLOCK_REALTIME.  The first start of the next boot (no state under `/run`)
+resumes it and charges the whole time since at the card's safe level.  The
+gap is the shortest of the clocks both boots trust: the RTC, and the
+system clock where the kernel called it synchronized at both ends or the
+RTC agrees with it.  A clock that went back, two that disagree by more
+than 2 s plus 0.1 %, a gap shorter than this boot's uptime, or any state
+that is not a clean stop at shutdown starts latched.  Every start, with
+the option or without, removes the file before it can unlock (and does not
+unlock while it cannot), so it is resumed at most once and never after the
+speakers have been driven since.  A stop that is not a shutdown writes
+none: after it a restart or speakersafetyd may drive the speakers to the
+reboot, which no clock records.
+
+> **Dual boot hazard.**  `idle` assumes nothing drove the speakers between
+> the shutdown and this boot.  On a machine that also boots macOS (every
+> Apple Silicon Mac can), macOS may have played in that gap and left a coil
+> at its limit; this boot would start from the cooler state saved before it,
+> and a coil could run up to (limit minus the saved temperature) over its
+> limit.  Linux cannot see whether another OS ran.  Set `idle` only on a
+> machine that boots nothing else; the default keeps the latched start.
+
 ### Machines with current and voltage sense
 
 The same daemon can protect the Apple laptops whose amplifiers report the

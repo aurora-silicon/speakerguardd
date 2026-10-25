@@ -63,11 +63,11 @@ use std::io;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crate::config::{Config, Globals, Governor};
+use crate::config::{BootResume, Config, Globals, Governor};
 use crate::engine::Engine;
 use crate::model::{self, SpeakerState, SUB_BLOCKS};
 use crate::record::{self, Recorder};
-use crate::state;
+use crate::state::{self, Saved};
 use crate::{debug, info, warn};
 
 #[cfg(test)]
@@ -206,6 +206,15 @@ pub trait Hw {
     fn rate_events(&mut self) -> bool;
     /// The card's change events are being delivered.
     fn events_available(&self) -> bool;
+    /// The clocks and the boot's id (persist.rs); none by default.
+    fn wall(&self) -> crate::persist::Wall {
+        crate::persist::Wall::default()
+    }
+    /// The system is shutting down: after a clean stop now nothing drives
+    /// the speakers again this boot.
+    fn shutting_down(&self) -> bool {
+        false
+    }
 }
 
 /// Errors a PCM or control returns while the playback side is being
@@ -412,6 +421,8 @@ pub struct Guard {
     min_failures: u32,
     target_failures: u32,
     state_path: Option<PathBuf>,
+    /// The state kept across a reboot (persist.rs).
+    persist_path: Option<PathBuf>,
     last_save_try: Option<Instant>,
     save_failed: bool,
     stopping: bool,
@@ -457,7 +468,9 @@ pub struct Guard {
 impl Guard {
     /// Restore the model from a clean stop (if there is one) and lock the
     /// card's controls.  The volume lock is not lifted here.
-    /// speakersafetyd's flag files are consulted (FOREIGN_FLAGS).
+    /// speakersafetyd's flag files are consulted (FOREIGN_FLAGS).  The
+    /// daemon itself starts with `start_persist`.
+    #[cfg(test)]
     pub fn start<H: Hw>(hw: &mut H, cfg: &Config, max_reduction: f64, state_path: Option<PathBuf>) -> Result<Guard, Box<dyn Error>> {
         // tests run on machines that may have speakersafetyd: they name
         // their flag files themselves
@@ -465,8 +478,20 @@ impl Guard {
         Self::start_with(hw, cfg, max_reduction, state_path, &foreign)
     }
 
+    /// `start`, with the state kept across a reboot (persist.rs): consumed
+    /// whatever happens, resumed only by the first start of a boot with
+    /// `boot_resume = idle`, and written by a clean stop at shutdown.
+    pub fn start_persist<H: Hw>(hw: &mut H, cfg: &Config, max_reduction: f64, state_path: Option<PathBuf>, persist_path: Option<PathBuf>) -> Result<Guard, Box<dyn Error>> {
+        let foreign: Vec<PathBuf> = if cfg!(test) { Vec::new() } else { FOREIGN_FLAGS.iter().map(PathBuf::from).collect() };
+        Self::start_inner(hw, cfg, max_reduction, state_path, &foreign, persist_path)
+    }
+
     /// `start`, with the flag files of other protection daemons to consult.
     pub fn start_with<H: Hw>(hw: &mut H, cfg: &Config, max_reduction: f64, state_path: Option<PathBuf>, foreign: &[PathBuf]) -> Result<Guard, Box<dyn Error>> {
+        Self::start_inner(hw, cfg, max_reduction, state_path, foreign, None)
+    }
+
+    fn start_inner<H: Hw>(hw: &mut H, cfg: &Config, max_reduction: f64, state_path: Option<PathBuf>, foreign: &[PathBuf], persist_path: Option<PathBuf>) -> Result<Guard, Box<dyn Error>> {
         if !max_reduction.is_finite() || max_reduction <= 0.0 {
             return Err("maximum reduction must be finite and positive".into());
         }
@@ -523,6 +548,8 @@ impl Guard {
         let mut resumed = false;
         let mut recovering = false;
         let mut restored_at = None;
+        // no state under /run at all: the first start of a boot
+        let mut first_of_boot = false;
         match &state_path {
             None => {
                 warn!("no model state file: assuming hot speakers (latched)");
@@ -550,7 +577,10 @@ impl Guard {
                     }
                 },
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    info!("{}: no model state; assuming hot speakers (latched)", path.display());
+                    first_of_boot = true;
+                    if !(persist_path.is_some() && globals.boot_resume == BootResume::Idle) {
+                        info!("{}: no model state; assuming hot speakers (latched)", path.display());
+                    }
                     latched(&mut speakers, &mut engine);
                 }
                 Err(e) => {
@@ -558,6 +588,46 @@ impl Guard {
                     latched(&mut speakers, &mut engine);
                 }
             },
+        }
+        // the state a clean stop left at the last shutdown: whatever this
+        // start makes of it, `invalidate` removes it below, before this run
+        // can drive the speakers (and no unlock follows while it cannot)
+        if let Some(pp) = &persist_path {
+            if first_of_boot && globals.boot_resume == BootResume::Idle {
+                let why = match std::fs::read_to_string(pp) {
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => Err("no state from the last shutdown".to_string()),
+                    Err(e) => Err(e.to_string()),
+                    Ok(t) => match crate::persist::decode(&t) {
+                        None => Err("unreadable".to_string()),
+                        Some(p) => {
+                            let at = hw.boottime();
+                            crate::persist::gap(&p, &hw.wall(), at).map(|g| (p, g, at))
+                        }
+                    },
+                };
+                match why {
+                    Ok((p, gap, at)) => {
+                        // from fresh models: the saved state, then the gap
+                        // at the card's safe level
+                        speakers = cfg.speakers.iter().map(|s| SpeakerState::new(s.clone(), globals.t_ambient)).collect();
+                        engine = Engine::new(cfg, governing == Governor::Unified || globals.shadow);
+                        let saved = Saved { boottime: Duration::ZERO, covered: Duration::ZERO, ..p.state };
+                        let elapsed = gap;
+                        if let Some(e) = engine.as_mut() {
+                            state::restore_engine(e, &saved, elapsed, &globals);
+                        }
+                        if state::restore(&mut speakers, &saved, elapsed, &globals) {
+                            resumed = true;
+                            restored_at = Some(at);
+                            recovering = saved.recovering;
+                            info!("model restored from {} (a clean stop at shutdown {:.1} s ago, the gap taken as idle at the card's safe level)", pp.display(), gap.as_secs_f64());
+                        } else {
+                            latched(&mut speakers, &mut engine);
+                        }
+                    }
+                    Err(why) => info!("{}: {why}; assuming hot speakers (latched)", pp.display()),
+                }
+            }
         }
         // another protection daemon ran this boot: it may have driven the
         // speakers after this daemon's last state (or before its first)
@@ -649,6 +719,7 @@ impl Guard {
             min_failures: 0,
             target_failures: 0,
             state_path,
+            persist_path,
             last_save_try: None,
             save_failed: false,
             stopping: false,
@@ -678,6 +749,19 @@ impl Guard {
     /// Replace the state file with this run's status (released 0), or
     /// remove it.  True once no clean stop is left for a later start.
     fn invalidate<H: Hw>(&mut self, hw: &H) -> bool {
+        if let Some(pp) = self.persist_path.clone() {
+            match state_remove(&pp) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    if !self.invalidate_failed {
+                        warn!("{}: {e}; the last shutdown's state could not be removed, so the lock is not taken", pp.display());
+                        self.invalidate_failed = true;
+                    }
+                    return false;
+                }
+            }
+        }
         let Some(path) = self.state_path.clone() else { return true };
         if self.save_now(hw) {
             return true;
@@ -820,6 +904,9 @@ impl Guard {
         // The file names the later boot time; the time between the reads is
         // then charged once more at a full-scale signal at full gain, which
         // heats more than anything the card can have done in it.
+        // the clocks for a reboot's resume, read first: the gap it charges
+        // then starts no later than the model's account ends
+        let wall = hw.wall();
         let (mut boot, mut now, mut after) = (hw.boottime(), hw.now(), hw.boottime());
         for _ in 0..3 {
             if after.saturating_sub(boot) <= Duration::from_millis(1) {
@@ -842,9 +929,29 @@ impl Guard {
             self.check_model()?;
         }
         if self.write_state(hw, after, after, true) {
+            self.persist(hw, &wall, after);
             Ok(())
         } else {
             Err("the final model state could not be saved".into())
+        }
+    }
+
+    /// At a clean stop while the system shuts down, with `boot_resume =
+    /// idle`: the final state again, for the next boot (persist.rs), stamped
+    /// with the clocks read before the model's account was closed.  A
+    /// failure costs only the next boot's latched start.
+    fn persist<H: Hw>(&mut self, hw: &H, wall: &crate::persist::Wall, after: Duration) {
+        let Some(pp) = self.persist_path.clone() else { return };
+        if self.globals.boot_resume != BootResume::Idle || !hw.shutting_down() {
+            return;
+        }
+        let text = state::encode_full(after, after, &self.speakers, self.engine.as_ref(), false, true, self.recovering);
+        match crate::persist::encode(wall, &text) {
+            None => info!("{}: no clock to time the reboot by; the next boot starts latched", pp.display()),
+            Some(t) => match state_write(&pp, &t) {
+                Ok(()) => info!("model state kept for the next boot in {}", pp.display()),
+                Err(e) => warn!("{}: {e}; the next boot starts latched", pp.display()),
+            },
         }
     }
 
@@ -1955,6 +2062,10 @@ pub mod fake {
         /// Rewrites each complete period's words (the n-th period, from 0).
         pub tweak: Option<Box<dyn FnMut(u32, &mut [i32])>>,
         pub delivered: u32,
+        /// The clocks and boot id (persist.rs), and whether the system is
+        /// shutting down.
+        pub wall: crate::persist::Wall,
+        pub shutting: bool,
     }
 
     impl FakeHw {
@@ -2004,6 +2115,8 @@ pub mod fake {
                 partial_fail: Box::new(|_| None),
                 tweak: None,
                 delivered: 0,
+                wall: crate::persist::Wall::default(),
+                shutting: false,
             }
         }
 
@@ -2122,6 +2235,12 @@ pub mod fake {
     }
 
     impl Hw for FakeHw {
+        fn wall(&self) -> crate::persist::Wall {
+            self.wall.clone()
+        }
+        fn shutting_down(&self) -> bool {
+            self.shutting
+        }
         fn now(&self) -> Instant {
             self.t0 + self.t
         }
@@ -3101,6 +3220,76 @@ pub(crate) mod tests {
         let g2 = Guard::start(&mut hw2, &cfg, 20.0, Some(path)).unwrap();
         // 0.5 s at the safe level: cooler, by what the coil sheds in that time
         assert!(g2.speakers[0].t_coil < coil && g2.speakers[0].t_coil > coil - 10.0, "{} vs {coil}", g2.speakers[0].t_coil);
+    }
+
+    /// Across a reboot (persist.rs): a clean stop while the system shuts
+    /// down keeps its state under /var/lib; with `boot_resume = idle` the
+    /// next boot's first start resumes it, the gap at the card's safe
+    /// level, and by default it starts latched as before.  The file is
+    /// consumed by any start; a stop that is no shutdown keeps none; a
+    /// clock gone back, or a state under /run, keeps the latched start.
+    #[test]
+    fn a_clean_stop_at_shutdown_is_resumed_by_the_next_boot_only_with_idle() {
+        use crate::persist::Wall;
+        let wall = |boot: &str, s: u64| Wall { realtime: Some(Duration::from_secs(s)), synced: false, rtc: Some(Duration::from_secs(s)), boot_id: Some(boot.into()) };
+        // a hot run, stopped at shutdown (or not); its persisted file
+        let shutdown = |idle: bool, shutting: bool| {
+            let mut cfg = j700();
+            if idle {
+                cfg.globals.boot_resume = BootResume::Idle;
+            }
+            let (run, keep) = (missing_state().unwrap(), missing_state().unwrap());
+            let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
+            hw.level = Box::new(|_| 0.6);
+            let mut g = Guard::start_persist(&mut hw, &cfg, 20.0, Some(run), Some(keep.clone())).unwrap();
+            run_until(&mut g, &mut hw, secs(10.0)).unwrap();
+            hw.wall = wall("first", 1_800_000_000);
+            hw.shutting = shutting;
+            g.stop(&mut hw).unwrap();
+            while !g.released(&hw) {
+                g.tick(&mut hw).unwrap();
+            }
+            g.final_save(&hw).unwrap();
+            (cfg, keep, g.speakers[0].t_coil)
+        };
+        let (_, none, _) = shutdown(true, false);
+        assert!(!none.exists(), "a stop that is no shutdown kept a state for the next boot");
+        let (_, none, _) = shutdown(false, true);
+        assert!(!none.exists(), "kept a state for the next boot without boot_resume = idle");
+        // the next boot, 10 s up, `gap` s after the stop, with or without a
+        // state under /run
+        let boot = |cfg: &Config, keep: &PathBuf, gap: i64, run: Option<PathBuf>| {
+            let text = std::fs::read_to_string(keep).unwrap();
+            let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
+            hw.boot = Duration::from_secs(10);
+            hw.wall = wall("second", (1_800_000_000 + gap) as u64);
+            let g = Guard::start_persist(&mut hw, cfg, 20.0, Some(run.unwrap_or_else(|| missing_state().unwrap())), Some(keep.clone())).unwrap();
+            assert!(!keep.exists(), "the start did not consume the last shutdown's state");
+            std::fs::write(keep, text).unwrap();
+            g
+        };
+        let (cfg, keep, coil) = shutdown(true, true);
+        assert!(keep.exists(), "no state kept at shutdown");
+        let limit = cfg.speakers[0].t_limit;
+        assert!(coil > cfg.globals.t_ambient + 10.0, "the run was not hot: {coil}");
+        let g = boot(&cfg, &keep, 60, None);
+        let t = g.speakers[0].t_coil;
+        assert!(!g.speakers[0].hard && t < coil && t < limit - 10.0, "60 s after: {t} against {coil} at the stop");
+        // a minute later it is cooler still
+        assert!(boot(&cfg, &keep, 120, None).speakers[0].t_coil < t);
+        // a clock gone back, a gap shorter than the uptime: latched
+        for gap in [-5, 3] {
+            assert!(boot(&cfg, &keep, gap, None).speakers.iter().all(|s| s.hard && s.t_coil >= s.spec.t_limit), "resumed with a gap of {gap} s");
+        }
+        // not the first start of the boot (a status under /run): latched
+        let status = missing_state().unwrap();
+        let hot: Vec<SpeakerState> = cfg.speakers.iter().map(|s| SpeakerState::new(s.clone(), 60.0)).collect();
+        std::fs::write(&status, state::encode(Duration::from_secs(5), Duration::from_secs(5), &hot, true, false)).unwrap();
+        assert!(boot(&cfg, &keep, 60, Some(status)).speakers.iter().all(|s| s.hard), "resumed the last boot's state in a later start");
+        // by default: latched, and the file consumed all the same
+        let mut latched = cfg.clone();
+        latched.globals.boot_resume = BootResume::Latched;
+        assert!(boot(&latched, &keep, 60, None).speakers.iter().all(|s| s.hard), "resumed without boot_resume = idle");
     }
 
     // ---- 0.1.4: a stream's edges ----
