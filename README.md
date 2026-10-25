@@ -78,8 +78,9 @@ The rule is deliberately simple:
 * The power budgets keep the power before the card's gain.  Each measured
   frame counts at the most reduction it can have been converted at: any
   value the controls held from 500 ms before it played (the reduction the
-  card applies, rounded up to its steps; after a failed write, anything
-  from the old value to the new one rounded up), the card's own safe level
+  card applies, rounded up to its steps; after a failed write, the old
+  value or the new one rounded up, since each control's write is atomic),
+  the card's own safe level
   from the moment the daemon's lease may have run out, and anything for the
   controls' value before the daemon set one.  A reduction too deep to have
   delivered a frame that loud did not convert it; a word is taken a step

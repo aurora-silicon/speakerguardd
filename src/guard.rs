@@ -106,15 +106,40 @@ pub const EVENT_SLACK: Duration = Duration::from_millis(5);
 const GAIN_RETAIN: Duration = Duration::from_secs(1);
 
 /// What each speaker's control held from `at` on: `lo` and `hi` the least
-/// and the most (dB; infinite = unknown; anything between them when they
-/// differ, after a failed write), `kernel` whether the card's safe level may
-/// have applied instead.
+/// and the most (dB; infinite = unknown), `cands` the values it may hold
+/// between them, each up to a step wide (empty: anything from `lo` to
+/// `hi`), `kernel` whether the card's safe level may have applied instead.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Gain {
     pub at: Instant,
     pub lo: Vec<f64>,
     pub hi: Vec<f64>,
     pub kernel: bool,
+    pub cands: Vec<Vec<(f64, f64)>>,
+}
+
+/// A control holds at most this many candidate values; past it the two
+/// closest merge into the span between them, which holds both.
+const CANDIDATES_MAX: usize = 4;
+
+/// Add the range `r` to a control's candidate values, merged with any it
+/// overlaps.
+fn add_candidate(set: &mut Vec<(f64, f64)>, r: (f64, f64)) {
+    set.push(r);
+    set.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut out: Vec<(f64, f64)> = Vec::with_capacity(set.len());
+    for &(a, b) in set.iter() {
+        match out.last_mut() {
+            Some(last) if a <= last.1 => last.1 = last.1.max(b),
+            _ => out.push((a, b)),
+        }
+    }
+    while out.len() > CANDIDATES_MAX {
+        let i = (0..out.len() - 1).min_by(|&i, &j| (out[i + 1].0 - out[i].1).total_cmp(&(out[j + 1].0 - out[j].1))).unwrap();
+        out[i].1 = out[i].1.max(out[i + 1].1);
+        out.remove(i + 1);
+    }
+    *set = out;
 }
 
 /// What the loop needs from the machine.
@@ -357,6 +382,11 @@ pub struct Guard {
     /// The most each control may hold (after a failed write, the new value
     /// rounded up by a step, or the old one).
     written_hi: Vec<f64>,
+    /// The values each control may hold: one after a write that worked,
+    /// the old ones and the new one (up to a step above it) after one that
+    /// failed, since each control's write is atomic (review r4 CC1 of
+    /// speakerguardd#8).  Empty while unknown.
+    written_set: Vec<Vec<(f64, f64)>>,
     /// The reductions last asked for.
     requested: Vec<f64>,
     applied: f64,
@@ -597,11 +627,12 @@ impl Guard {
             last_write: now,
             written: vec![if min_now { MUTE_DB } else { f64::INFINITY }; n],
             written_hi: vec![if min_now { MUTE_DB } else { f64::INFINITY }; n],
+            written_set: vec![if min_now { vec![(MUTE_DB, MUTE_DB)] } else { Vec::new() }; n],
             requested: vec![f64::NAN; n],
             applied: 0.0,
             gains: {
-                let unknown = Gain { at: now, lo: vec![f64::INFINITY; n], hi: vec![f64::INFINITY; n], kernel: true };
-                if min_now { vec![unknown, Gain { at: now, lo: vec![MUTE_DB; n], hi: vec![MUTE_DB; n], kernel: true }] } else { vec![unknown] }
+                let unknown = Gain { at: now, lo: vec![f64::INFINITY; n], hi: vec![f64::INFINITY; n], kernel: true, cands: vec![Vec::new(); n] };
+                if min_now { vec![unknown, Gain { at: now, lo: vec![MUTE_DB; n], hi: vec![MUTE_DB; n], kernel: true, cands: vec![vec![(MUTE_DB, MUTE_DB)]; n] }] } else { vec![unknown] }
             },
             verified_at: now,
             rate_failures: 0,
@@ -816,16 +847,37 @@ impl Guard {
     /// old value, so each holds at least the smaller reduction (review F1
     /// of speakerguardd#6) and at most the larger, rounded up by up to a
     /// step the card may have taken; an unknown control stays unknown.
+    /// Each control's write is atomic, so it holds one of those values, not
+    /// anything between them (review r4 CC1 of speakerguardd#8).
     fn write_failed(&mut self, wanted: &[f64], step: f64) {
-        for ((w, h), &r) in self.written.iter_mut().zip(self.written_hi.iter_mut()).zip(wanted) {
+        for (((w, h), set), &r) in self.written.iter_mut().zip(self.written_hi.iter_mut()).zip(self.written_set.iter_mut()).zip(wanted) {
             if w.is_finite() {
                 *w = w.min(r);
             }
             if h.is_finite() {
                 *h = h.max(r + step);
             }
+            if w.is_finite() && h.is_finite() {
+                add_candidate(set, (r, r + step));
+            } else {
+                set.clear();
+            }
         }
         self.requested = vec![f64::NAN; wanted.len()];
+    }
+
+    /// Each control's candidate values for the history, or none (the span
+    /// from the least to the most) where they do not account for exactly
+    /// that span.
+    fn candidates(&self) -> Vec<Vec<(f64, f64)>> {
+        self.written_set
+            .iter()
+            .zip(self.written.iter().zip(&self.written_hi))
+            .map(|(set, (&lo, &hi))| {
+                let (a, b) = set.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), r| (a.min(r.0), b.max(r.1)));
+                if !set.is_empty() && a == lo && b == hi { set.clone() } else { Vec::new() }
+            })
+            .collect()
     }
 
     /// The governing reductions: card-wide (dB), per speaker, and whether
@@ -850,8 +902,8 @@ impl Guard {
     /// The controls' values, or whether the daemon holds the lease, changed
     /// at `at`.
     fn note_written(&mut self, at: Instant) {
-        let g = Gain { at, lo: self.written.clone(), hi: self.written_hi.clone(), kernel: !self.armed };
-        if self.gains.last().is_none_or(|e| e.lo != g.lo || e.hi != g.hi || e.kernel != g.kernel) {
+        let g = Gain { at, lo: self.written.clone(), hi: self.written_hi.clone(), kernel: !self.armed, cands: self.candidates() };
+        if self.gains.last().is_none_or(|e| e.lo != g.lo || e.hi != g.hi || e.kernel != g.kernel || e.cands != g.cands) {
             self.gains.push(g);
         }
     }
@@ -925,11 +977,20 @@ impl Guard {
         let safe = self.globals.safe_reduction;
         let mut out = vec![Vec::new(); self.written.len()];
         for e in self.held_over(from, to) {
-            for ((o, &lo), &hi) in out.iter_mut().zip(&e.lo).zip(&e.hi) {
+            for (k, o) in out.iter_mut().enumerate() {
+                let (lo, hi) = (e.lo[k], e.hi[k]);
                 if lo.is_finite() && hi.is_finite() {
-                    o.push((lo, hi));
-                    if e.kernel && safe > lo {
-                        o.push((safe, safe.max(hi)));
+                    // a failed write's old and new values, or the span
+                    let span = [(lo, hi)];
+                    let values = match e.cands.get(k) {
+                        Some(c) if !c.is_empty() => &c[..],
+                        _ => &span[..],
+                    };
+                    for &(a, b) in values {
+                        o.push((a, b));
+                        if e.kernel && safe > a {
+                            o.push((safe, safe.max(b)));
+                        }
                     }
                 } else {
                     o.push((self.unknown_floor, MUTE_DB));
@@ -1573,6 +1634,7 @@ impl Guard {
                         let n = self.written.len();
                         self.written = vec![MUTE_DB; n];
                         self.written_hi = vec![MUTE_DB; n];
+                        self.written_set = vec![vec![(MUTE_DB, MUTE_DB)]; n];
                         self.requested = vec![f64::NAN; n];
                         self.note_written(hw.now());
                         self.min_failures = 0;
@@ -1624,6 +1686,7 @@ impl Guard {
                     // what the cards apply, never less than asked for
                     self.written = per.iter().zip(applied.iter().chain(std::iter::repeat(&f64::NAN))).map(|(&r, &a)| if a.is_finite() { a.max(r) } else { r }).collect();
                     self.written_hi = self.written.clone();
+                    self.written_set = self.written.iter().map(|&w| vec![(w, w)]).collect();
                     self.requested = per.clone();
                     self.last_write = hw.now();
                     self.note_written(hw.now());
@@ -3104,7 +3167,7 @@ pub(crate) mod tests {
         g.written = vec![0.0; 2];
         g.written_hi = g.written.clone();
         let t0 = hw.now();
-        g.gains = vec![Gain { at: t0, lo: vec![0.0; 2], hi: vec![0.0; 2], kernel: false }];
+        g.gains = vec![Gain { at: t0, lo: vec![0.0; 2], hi: vec![0.0; 2], kernel: false, cands: Vec::new() }];
         // a lease held by hand: the card applies the controls
         g.locked_at = None;
         g.verified_at = t0;
@@ -3215,7 +3278,7 @@ pub(crate) mod tests {
         g.written = vec![0.0; 2];
         g.written_hi = g.written.clone();
         let t0 = hw.now();
-        g.gains = vec![Gain { at: t0, lo: vec![0.0; 2], hi: vec![0.0; 2], kernel: false }];
+        g.gains = vec![Gain { at: t0, lo: vec![0.0; 2], hi: vec![0.0; 2], kernel: false, cands: Vec::new() }];
         // a lease held by hand: the card applies the controls
         g.locked_at = None;
         g.verified_at = t0;
@@ -3429,7 +3492,7 @@ pub(crate) mod tests {
         g.written = vec![20.0; 2];
         g.written_hi = g.written.clone();
         let t0 = hw.now();
-        g.gains = vec![Gain { at: t0, lo: vec![20.0; 2], hi: vec![20.0; 2], kernel: false }];
+        g.gains = vec![Gain { at: t0, lo: vec![20.0; 2], hi: vec![20.0; 2], kernel: false, cands: Vec::new() }];
         // a lease held by hand: the card applies the controls
         g.locked_at = None;
         g.verified_at = t0;
@@ -3694,7 +3757,7 @@ pub(crate) mod tests {
         g.write_failed(&[8.0; 4], 0.0);
         assert_eq!(g.written, vec![2.0, 2.0, 6.0, 6.0]);
         let t0 = hw.now();
-        g.gains = vec![Gain { at: t0, lo: g.written.clone(), hi: g.written.clone(), kernel: false }];
+        g.gains = vec![Gain { at: t0, lo: g.written.clone(), hi: g.written.clone(), kernel: false, cands: Vec::new() }];
         // a lease held by hand: the card applies the controls
         g.locked_at = None;
         g.verified_at = t0;
@@ -3982,7 +4045,7 @@ pub(crate) mod tests {
         g.written = vec![0.0; 4];
         g.written_hi = g.written.clone();
         let t0 = hw.now();
-        g.gains = vec![Gain { at: t0, lo: vec![0.0; 4], hi: vec![0.0; 4], kernel: false }];
+        g.gains = vec![Gain { at: t0, lo: vec![0.0; 4], hi: vec![0.0; 4], kernel: false, cands: Vec::new() }];
         // a lease held by hand: the card applies the controls
         g.locked_at = None;
         g.verified_at = t0;
@@ -4189,6 +4252,63 @@ pub(crate) mod tests {
         assert_eq!(card, asahi, "the card under the guard is not the guard's ramp");
     }
 
+    /// Review r4 CC1 (addendum 2) of speakerguardd#8: each control's write
+    /// is atomic, so a write that fails part way leaves each control at its
+    /// old value or the new one, never between them.  The first write after
+    /// an unlock, from the unlock's minimum to 0 dB, read as the span from 0
+    /// dB to mute, left a full-scale onset under it out of the regulator's
+    /// prediction (an onset inside a partial write failure crossed 150 C
+    /// 425 times in 7,020 on a dead line, against 173 with the span read
+    /// at its most); read at its most, it held an audible program as if it
+    /// were full scale (CC2).  As the two values, the onset is the program
+    /// at 0 dB and is attacked, and a moderate program is what it is.
+    #[test]
+    fn a_failed_first_write_after_an_unlock_leaves_either_value() {
+        let run = |amp: f64| {
+            let (cfg, mut hw) = unified_j316(true, 0.1);
+            let mut g = Guard::start(&mut hw, &cfg, cfg.globals.max_reduction, Some(vi_state(&cfg, 55.0, 52.0))).unwrap();
+            let n = cfg.speakers.len();
+            // the unlock's minimum, held
+            g.armed = true;
+            g.written = vec![MUTE_DB; n];
+            g.written_hi = g.written.clone();
+            g.written_set = vec![vec![(MUTE_DB, MUTE_DB)]; n];
+            let t0 = hw.now();
+            g.gains = vec![Gain { at: t0, lo: g.written.clone(), hi: g.written.clone(), kernel: false, cands: g.candidates() }];
+            // the first write, 0 dB, fails part way
+            g.write_failed(&vec![0.0; n], 0.5);
+            g.note_written(t0 + secs(0.01));
+            assert_eq!((g.written[0], g.written_hi[0]), (0.0, MUTE_DB));
+            let possible = g.possible_reductions(t0, t0 + secs(0.2));
+            for p in &possible {
+                assert!(p.contains(&(0.0, 0.5)) && p.contains(&(MUTE_DB, MUTE_DB)) && p.iter().all(|r| r.1 - r.0 <= 0.5), "{p:?}");
+            }
+            // a period of a sine of `amp` volts peak at 1 kHz on every speaker
+            let (ch, period) = (cfg.globals.channels, cfg.globals.period);
+            let mut w = vec![0i32; ch * period];
+            for f in 0..period {
+                let v = amp * (2.0 * std::f64::consts::PI * 1000.0 * f as f64 / 48000.0).sin();
+                for sp in &cfg.speakers {
+                    w[f * ch + sp.vs_chan] = ((v / sp.vs_scale * 32767.0).round() as i32) << 16;
+                    w[f * ch + sp.is_chan.unwrap()] = ((v / 4.0 / sp.is_scale * 32767.0).round() as i32) << 16;
+                }
+            }
+            let e = g.engine.as_mut().unwrap();
+            e.govern(0.0, false);
+            for _ in 0..2 {
+                e.measured(&w, period, period, period, 0, 1.0 / 48000.0, 1.0, &possible);
+            }
+            e.reductions(Governor::Unified)
+        };
+        let cfg = Config::parse(J316).unwrap();
+        // the amplifier's loudest sine: attacked at once
+        let full = run(2f64.sqrt() * 10f64.powf(cfg.globals.amp_gain_dbv / 20.0));
+        assert!(full.iter().all(|&r| r > 3.0), "a full-scale onset under the failed write: {full:?}");
+        // 2.5 V peak, about 1 W into 3 ohm: nothing to hold
+        let moderate = run(2.5);
+        assert!(moderate.iter().all(|&r| r == 0.0), "a moderate program under the failed write: {moderate:?}");
+    }
+
     /// Review r4 of speakerguardd#8: a guarded start that did not follow a
     /// clean stop, with a stream already playing (a crash restart), takes
     /// the lock back once the latched start has cooled.  The first half
@@ -4275,7 +4395,7 @@ pub(crate) mod tests {
         g.written = per.clone();
         g.written_hi = g.written.clone();
         let t0 = hw.now();
-        g.gains = vec![Gain { at: t0, lo: per.clone(), hi: per.clone(), kernel: false }];
+        g.gains = vec![Gain { at: t0, lo: per.clone(), hi: per.clone(), kernel: false, cands: Vec::new() }];
         // a lease held by hand: the card applies the controls
         g.locked_at = None;
         g.verified_at = t0;
@@ -4383,7 +4503,7 @@ pub(crate) mod tests {
         g.written = vec![99.5; 4];
         g.written_hi = g.written.clone();
         let t0 = hw.now();
-        g.gains = vec![Gain { at: t0, lo: vec![99.5; 4], hi: vec![99.5; 4], kernel: false }];
+        g.gains = vec![Gain { at: t0, lo: vec![99.5; 4], hi: vec![99.5; 4], kernel: false, cands: Vec::new() }];
         // a lease held by hand: the card applies the controls
         g.locked_at = None;
         g.verified_at = t0;
@@ -4648,7 +4768,7 @@ pub(crate) mod tests {
         g.rate = 48000;
         g.written = vec![0.0; 2];
         g.written_hi = g.written.clone();
-        g.gains = vec![Gain { at: t0 - secs(0.1), lo: vec![20.0; 2], hi: vec![20.0; 2], kernel: false }, Gain { at: t0, lo: vec![0.0; 2], hi: vec![0.0; 2], kernel: false }];
+        g.gains = vec![Gain { at: t0 - secs(0.1), lo: vec![20.0; 2], hi: vec![20.0; 2], kernel: false, cands: Vec::new() }, Gain { at: t0, lo: vec![0.0; 2], hi: vec![0.0; 2], kernel: false, cands: Vec::new() }];
         // a lease held by hand: the card applies the controls
         g.locked_at = None;
         g.verified_at = t0;
@@ -4681,7 +4801,7 @@ pub(crate) mod tests {
         g.rate = 48000;
         g.written = vec![0.0; 2];
         g.written_hi = g.written.clone();
-        g.gains = vec![Gain { at: t0, lo: vec![0.0; 2], hi: vec![0.0; 2], kernel: true }];
+        g.gains = vec![Gain { at: t0, lo: vec![0.0; 2], hi: vec![0.0; 2], kernel: true, cands: Vec::new() }];
         g.verified_at = t0;
         g.account_to = t0;
         for w in &mut g.words {
@@ -4711,7 +4831,7 @@ pub(crate) mod tests {
         g.rate = 48000;
         g.written = vec![0.0; 2];
         g.written_hi = g.written.clone();
-        g.gains = vec![Gain { at: t0 - secs(0.2), lo: vec![MUTE_DB; 2], hi: vec![MUTE_DB; 2], kernel: true }, Gain { at: t0 - secs(0.2), lo: vec![MUTE_DB; 2], hi: vec![MUTE_DB; 2], kernel: false }, Gain { at: t0 - secs(0.2), lo: vec![0.0; 2], hi: vec![0.0; 2], kernel: false }];
+        g.gains = vec![Gain { at: t0 - secs(0.2), lo: vec![MUTE_DB; 2], hi: vec![MUTE_DB; 2], kernel: true, cands: Vec::new() }, Gain { at: t0 - secs(0.2), lo: vec![MUTE_DB; 2], hi: vec![MUTE_DB; 2], kernel: false, cands: Vec::new() }, Gain { at: t0 - secs(0.2), lo: vec![0.0; 2], hi: vec![0.0; 2], kernel: false, cands: Vec::new() }];
         // a lease held by hand: the card applies the controls
         g.locked_at = None;
         g.verified_at = t0;
@@ -5038,7 +5158,7 @@ pub(crate) mod tests {
         g.rate = 48000;
         g.written = vec![0.0; g.speakers.len()];
         g.written_hi = vec![0.0; g.speakers.len()];
-        g.gains = vec![Gain { at: t0 - secs(0.2), lo: vec![20.0; g.speakers.len()], hi: vec![20.0; g.speakers.len()], kernel: false }, Gain { at: t0, lo: vec![0.0; g.speakers.len()], hi: vec![0.0; g.speakers.len()], kernel: false }];
+        g.gains = vec![Gain { at: t0 - secs(0.2), lo: vec![20.0; g.speakers.len()], hi: vec![20.0; g.speakers.len()], kernel: false, cands: Vec::new() }, Gain { at: t0, lo: vec![0.0; g.speakers.len()], hi: vec![0.0; g.speakers.len()], kernel: false, cands: Vec::new() }];
         // a lease held by hand: the card applies the controls
         g.locked_at = None;
         g.account_to = t0;
@@ -5154,7 +5274,7 @@ pub(crate) mod tests {
             }
             g.written = vec![20.0; g.speakers.len()];
             g.written_hi = vec![20.0; g.speakers.len()];
-            g.gains = vec![Gain { at: hw.now() - secs(2.0), lo: vec![20.0; g.speakers.len()], hi: vec![20.0; g.speakers.len()], kernel: true }];
+            g.gains = vec![Gain { at: hw.now() - secs(2.0), lo: vec![20.0; g.speakers.len()], hi: vec![20.0; g.speakers.len()], kernel: true, cands: Vec::new() }];
             g.verified_at = hw.now();
             g.account_to = hw.now();
             g.stop(&mut hw).unwrap();

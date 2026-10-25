@@ -107,8 +107,8 @@ const NOTHING_DB: f64 = 120.0;
 pub const PREDICT_MAX_DB: f64 = 30.0;
 /// Nor do frames that fit one candidate range wider than this (dB): an
 /// unknown control value (0 dB to mute, at a start that did not follow a
-/// clean stop) or a failed write, under which the most that fits makes any
-/// word full scale.  A frame that fits several exact values keeps the most
+/// clean stop), under which the most that fits makes any word full scale.
+/// (A failed write is its old and new values, not the span between them.)  A frame that fits several exact values keeps the most
 /// that fits (review r4 CC1 of speakerguardd#8): the V/I amplifiers apply
 /// a new gain as they play, so that is the newer value after an attack and
 /// the right one after a retake, and leaving such frames out blinded the
