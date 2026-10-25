@@ -1593,6 +1593,32 @@ mod tests {
         assert!((y.1 - m).abs() < 1e-6 && (y.0 - c).abs() < 1e-6, "{y:?} vs {c} / {m}");
     }
 
+    /// Silence followed by full-scale squares on every output, including
+    /// a gain write that fails partly just before another onset. Exercise
+    /// both instantaneous amplifier gain and old-gain audio in a queue.
+    #[test]
+    fn vi_full_scale_onsets_with_queued_audio_stay_bounded() {
+        for j413 in [false, true] {
+            for guard in [false, true] {
+                for amp_gain in [false, true] {
+                    let mut sc = ViScenario::long(j413, 0.0, false, 1.0, guard, false, 20.0);
+                    sc.amp_gain = amp_gain;
+                    sc.loads.fill((1.0, 0.0));
+                    sc.noise = 0;
+                    sc.dc = 0;
+                    sc.rate = 48000;
+                    sc.streams[0].depth = 0.213;
+                    sc.streams[0].chunk = 0.128;
+                    sc.streams[0].levels = vec![(0.05, 0.0), (2.0, 1.0), (7.0, 0.0), (10.0, 1.0)];
+                    sc.faults.push(ViFault::Base(Fault::WriteFail { at: 9.95, len: 0.2, partial: true }));
+                    let out = run(&sc, 3085).unwrap_or_else(|v| panic!("{}\n{}", sc.to_rust(), v.0));
+                    assert!(out.vi_to_limit > 0.0, "VI truth reached its limit: {out:?}");
+                    if guard { assert!(out.ff_to_limit > 0.0, "FF truth reached its limit: {out:?}"); }
+                }
+            }
+        }
+    }
+
     #[test]
     fn vi_trace_one() {
         let Ok(seed) = std::env::var("SPEAKERGUARDD_VI_TRACE").map(|v| v.parse::<u64>().unwrap()) else { return };

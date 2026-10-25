@@ -1512,14 +1512,16 @@ mod tests {
     fn bad_sense_data_replays_charged_not_measured() {
         let cfg = j413();
         let ch = cfg.globals.channels;
-        let ics: Vec<usize> = cfg.speakers.iter().map(|s| s.is_chan.unwrap()).collect();
+        let slots: Vec<_> = cfg.speakers.iter().map(|s| (s.vs_chan, s.is_chan.unwrap())).collect();
         let mut hw = FakeHw::per_speaker(&cfg);
         hw.level = Box::new(|_| 0.02);
         hw.tweak = Some(Box::new(move |n, w| {
             if n == 30 {
                 for f in w.chunks_exact_mut(ch) {
-                    for &ic in &ics {
-                        f[ic] = -f[ic];
+                    for &(vc, ic) in &slots {
+                        // A sensor fault, independent of the protected gain.
+                        f[vc] = i32::MAX / 2;
+                        f[ic] = -i32::MAX / 2;
                     }
                 }
             }
@@ -1547,8 +1549,9 @@ mod tests {
         hw.lossy = true;
         hw.control_delay = Box::new(|t| if (secs(2.0)..secs(2.05)).contains(&t) { Duration::from_millis(500) } else { Duration::ZERO });
         let path = tmp("gap.rec");
-        let live = record(&cfg, &mut hw, Some(vi_state(&cfg, 55.0, 52.0)), secs(4.0), &path);
-        let live_latched = live.engine.as_ref().unwrap().asahi.as_ref().unwrap().iter().any(|a| a.hard);
+        record(&cfg, &mut hw, Some(vi_state(&cfg, 55.0, 52.0)), secs(4.0), &path);
+        let tl = Timeline::read(&path, &cfg).unwrap();
+        let live_charged: f64 = tl.accounts.iter().filter(|a| a.2 == Accounted::Charged).map(|(a, b, _)| (*b - *a).as_secs_f64()).sum();
         let out = replay(&path, &cfg, &Replay { gain_db: 0.0, governor: None, guard: None, max_reduction: None, csv: None }).unwrap();
         assert!(!out.certified, "{}", out.text);
         assert!(out.text.contains("frames the capture lost") || out.text.contains("stalled"), "{}", out.text);
@@ -1557,8 +1560,9 @@ mod tests {
         let longest = out.text.lines().skip_while(|l| !l.starts_with("charged, not measured")).nth(1).unwrap_or("");
         assert!(longest.contains("ms)"), "{}", out.text);
         assert!(out.text.contains("hand-off"), "the replayed guard never handed off over the gap:\n{}", out.text);
-        assert!(live_latched, "the live guard did not charge the gap");
-        assert!(!out.text.contains("0 latches"), "{}", out.text);
+        // The full-scale ceiling can now prevent a latch. The gap still
+        // belongs to the charged account and still refuses certification.
+        assert!(live_charged > 0.15, "the live guard charged only {live_charged} s");
     }
 
     /// The transitions the recording keeps: the start state, lock changes

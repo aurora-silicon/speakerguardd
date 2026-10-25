@@ -455,3 +455,13 @@ overrides the configuration's governor, `--guard asahi|none` its guard, and
 `-m` defaults to its `max_reduction`; `--shadow` turns the shadow log on,
 and `--experimental-unified` and `--allow-unqualified` are the two opt-ins
 described above.
+
+### Interim V/I output ceiling
+
+This branch backports the onset-energy ceiling from `fix/vi-onset-energy`
+onto the deployed source. It reserves full-scale energy before each V/I
+output write, including old queued samples, a new lease and idle gaps.
+The existing governor still decides handoff and re-arm. The ceiling only
+adds attenuation and can reduce even quiet content. It covers the J413
+and J316 onset witnesses without changing thermal limits or amplifier gain.
+J700 uses its existing legacy path and is outside this interim change.

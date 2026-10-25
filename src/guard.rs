@@ -70,6 +70,9 @@ use crate::record::{self, Recorder};
 use crate::state;
 use crate::{debug, info, warn};
 
+#[cfg(test)]
+mod onset_tests;
+
 /// The kernel locks the volume again 250 ms after the last write; write well
 /// inside that while the speakers play.
 pub const PING_INTERVAL: Duration = Duration::from_millis(100);
@@ -1589,6 +1592,22 @@ impl Guard {
         self.decide(hw, false)
     }
 
+    fn bound_onset(&self, now: Instant, per: &mut [f64]) -> bool {
+        let Some(e) = self.engine.as_ref().filter(|e| e.asahi.is_some()) else { return true };
+        let pending = self.least_since(self.account_to);
+        // A target write can block while the old lease runs down. Keep
+        // that entire allowance and its queue at the old or new gain;
+        // a subsequent renewal can grant a fresh lease at the new gain.
+        let pending_s = now.saturating_duration_since(self.account_to).as_secs_f64() + QUEUE_BOUND.as_secs_f64() + KERNEL_LOCK_TIMEOUT.as_secs_f64();
+        // A renewal can follow a blocking write only while the account is
+        // this fresh. Reserve that delay as well as a full new lease.
+        let lease_s = KERNEL_LOCK_TIMEOUT.as_secs_f64() + self.dt.unwrap_or(0.0) + BLIND_SLACK.as_secs_f64();
+        let onset = e.onset_reductions(self.governing, &pending, pending_s, lease_s);
+        let ready = onset.iter().all(|r| r.is_finite() && *r < MUTE_DB);
+        for (r, floor) in per.iter_mut().zip(onset) { *r = r.max(floor); }
+        ready
+    }
+
     /// Every renewal of the lock goes through here: the account brought up
     /// to date, then the faults, the reduction limit and the model's
     /// freshness decide whether the daemon keeps the card.  With `renew_now`
@@ -1601,10 +1620,15 @@ impl Guard {
             // nothing can cover the time since the account's end any more
             self.charge(now)?;
         }
-        let (reduction, per, hard) = self.governing_state();
+        let (reduction, mut per, hard) = self.governing_state();
         if !reduction.is_finite() {
             return Err("nonfinite speaker reduction".into());
         }
+        // Keep the governor's handoff threshold and re-arm hysteresis.
+        // The onset ceiling is additional attenuation, never permission to
+        // retain a lease the governor would give up. Its floor can exceed
+        // --max-reduction even on a cold speaker with a quiet program.
+        let onset_ready = self.bound_onset(now, &mut per);
         if hard != self.last_hard {
             self.last_hard = hard;
             if self.trace.is_some() || self.rec.is_some() {
@@ -1628,13 +1652,15 @@ impl Guard {
                 Some("a coil may have reached its limit".to_string())
             } else if reduction >= self.max_reduction {
                 Some(format!("the model asks for {reduction:.1} dB"))
+            } else if !onset_ready {
+                Some("not enough headroom for unobserved full-scale audio".to_string())
             } else {
                 None
             };
             if let Some(why) = why {
                 self.disarm(hw, &why)?;
             }
-        } else if !self.stopping && !self.unknown && !hard && self.events && !renew_now && !self.recovering {
+        } else if !self.stopping && !self.unknown && !hard && onset_ready && self.events && !renew_now && !self.recovering {
             // after bad sense data, REARM_PERIODS valid periods in a row
             // first, idle or not (review P8-2)
             let seeing = !self.playing || (self.fresh >= REARM_PERIODS && blind <= BLIND_SLACK);
@@ -1685,6 +1711,12 @@ impl Guard {
             }
         }
         if self.armed {
+            // set_min and the initial ping can block. Recompute from the
+            // account and control history at the actual write boundary.
+            if !self.bound_onset(hw.now(), &mut per) {
+                self.disarm(hw, "not enough headroom at the volume write")?;
+                return Ok(());
+            }
             if (reduction - self.applied).abs() >= 0.5 {
                 info!("gain reduction {reduction:.1} dB");
                 self.applied = reduction;
@@ -1694,7 +1726,8 @@ impl Guard {
             // engine's write per speaker (a card with one control gets the
             // largest)
             let n = per.len();
-            let write = |hw: &mut H| if self.governing == Governor::Legacy { hw.set_reduction(reduction).map(|a| vec![a; n]) } else { hw.set_reductions(&per) };
+            let target = per.iter().copied().fold(reduction, f64::max);
+            let write = |hw: &mut H| if self.governing == Governor::Legacy { hw.set_reduction(target).map(|a| vec![a; n]) } else { hw.set_reductions(&per) };
             match if due { write(hw).map(Some) } else { Ok(None) } {
                 Ok(None) => {}
                 Ok(Some(applied)) => {
@@ -3707,6 +3740,18 @@ pub(crate) mod tests {
         }
     }
 
+    /// A known queued gain for a synthetic state injection. Onset tests
+    /// and the oracle harness separately exercise real gain trajectories.
+    fn pending_gain(g: &mut Guard, hw: &mut FakeHw, db: f64) {
+        let per = vec![db; g.speakers.len()];
+        hw.set_reductions(&per).unwrap();
+        g.written = per.clone();
+        g.written_hi = per.clone();
+        g.written_set = vec![vec![(db, db)]; per.len()];
+        g.gains = vec![Gain { at: hw.now() - QUEUE_BOUND, lo: per.clone(), hi: per, kernel: false, cands: g.candidates() }];
+        g.locked_at = None;
+    }
+
     /// The worst case of speaker `k`'s measured-power models at `db`.
     fn vi_worst(cfg: &Config, k: usize, db: f64) -> f64 {
         let v = crate::engine::v_worst(&cfg.speakers[k], &cfg.globals) * 10f64.powf(-db / 20.0);
@@ -3715,7 +3760,7 @@ pub(crate) mod tests {
 
     /// The V/I path end to end: a quiet program, per-speaker controls.
     #[test]
-    fn vi_healthy_playback_keeps_the_lock_at_full_scale() {
+    fn vi_healthy_playback_keeps_the_lock_under_the_onset_ceiling() {
         let cfg = j413();
         let mut hw = FakeHw::per_speaker(&cfg);
         hw.level = Box::new(|_| 0.03);
@@ -3724,7 +3769,7 @@ pub(crate) mod tests {
         run_until(&mut g, &mut hw, secs(10.0)).unwrap();
         assert!(hw.lapses.is_empty(), "{:?}", hw.lapses);
         assert!(hw.max_ping_gap(secs(0.3), hw.t) < LOCK_TIMEOUT);
-        assert!(g.armed() && hw.per.iter().all(|&p| p == 0.0), "{:?}", hw.per);
+        assert!(g.armed() && hw.per.iter().all(|&p| p > 0.0 && p < hw.safe), "{:?}", hw.per);
         assert_eq!(hw.opens, 1);
         assert!(!g.engine.as_ref().unwrap().hard(Governor::Asahi));
     }
@@ -3753,7 +3798,7 @@ pub(crate) mod tests {
         assert!(hw.relinquished >= 1, "the hand-off did not give the lock up");
         assert!(g.armed() && hw.unlocked_at(hw.t), "taken back once the control works");
         let want = g.engine.as_ref().unwrap().reductions(Governor::Asahi);
-        assert!(hw.per.iter().zip(&want).all(|(p, w)| (p - w).abs() < 0.5), "the governor's reductions are written after recovery: {:?} vs {want:?}", hw.per);
+        assert!(hw.per.iter().zip(&want).all(|(p, w)| *p >= *w && *p < hw.safe), "the governor and onset ceiling apply after recovery: {:?} vs {want:?}", hw.per);
     }
 
     /// Review F1: a failed per-speaker write leaves each control at the old
@@ -3862,11 +3907,12 @@ pub(crate) mod tests {
         let cfg = j413();
         let ch = cfg.globals.channels;
         let negate = |cfg: &Config| {
-            let ics: Vec<usize> = cfg.speakers.iter().map(|s| s.is_chan.unwrap()).collect();
+            let slots: Vec<_> = cfg.speakers.iter().map(|s| (s.vs_chan, s.is_chan.unwrap())).collect();
             move |w: &mut [i32]| {
                 for f in w.chunks_exact_mut(ch) {
-                    for &ic in &ics {
-                        f[ic] = -f[ic];
+                    for &(vc, ic) in &slots {
+                        f[vc] = i32::MAX / 2;
+                        f[ic] = -i32::MAX / 2;
                     }
                 }
             }
@@ -3881,13 +3927,17 @@ pub(crate) mod tests {
                 }
             }));
             let mut g = Guard::start(&mut hw, &cfg, cfg.globals.max_reduction, Some(vi_state(&cfg, 55.0, 52.0))).unwrap();
-            let (mut seen, mut latched) = (0, false);
+            let (mut seen, mut latched, mut injected) = (0, false, false);
             while hw.t < secs(9.0) {
                 let before = hw.delivered;
-                let loud = (0..cfg.speakers.len()).any(|k| hw.effective_of(k) < hw.safe);
+                // Retain the old full-gain bad-period accounting witness.
+                if bad && !injected && before >= 21 && g.armed() {
+                    pending_gain(&mut g, &mut hw, 0.0);
+                    injected = true;
+                }
                 g.tick(&mut hw).unwrap();
                 latched |= asahi(&g).iter().any(|a| a.hard);
-                if bad && loud && hw.delivered > before && before >= 20 && before % 2 == 1 {
+                if bad && hw.delivered > before && before >= 20 && before % 2 == 1 {
                     seen += 1;
                     assert!(!g.armed(), "armed after bad sense data at {:?}", hw.t);
                     assert!((0..cfg.speakers.len()).all(|k| hw.effective_of(k) >= hw.safe), "the card plays above its safe level at {:?}", hw.t);
@@ -3899,7 +3949,7 @@ pub(crate) mod tests {
         let (bad, bhw, seen, bad_latched) = run(true);
         assert!(ghw.delivered >= 100 && bhw.delivered >= 100);
         assert!(!good_latched && good.armed());
-        assert!(seen >= 1, "no bad period arrived at full level");
+        assert!(seen >= 1, "no bad period arrived");
         assert!(bad_latched, "bad periods charged at less than the gain the card held");
         let k = idx(&cfg, "Left Woofer");
         assert!(asahi(&bad)[k].th.t_coil > asahi(&good)[k].th.t_coil + 1.0, "{:.2} vs {:.2} C", asahi(&bad)[k].th.t_coil, asahi(&good)[k].th.t_coil);
@@ -4039,6 +4089,8 @@ pub(crate) mod tests {
                 hw.control_delay = Box::new(|t| if (secs(2.0)..secs(2.05)).contains(&t) { Duration::from_millis(240) } else { Duration::ZERO });
             }
             let mut g = Guard::start(&mut hw, &cfg, cfg.globals.max_reduction, Some(vi_state(&cfg, 55.0, 52.0))).unwrap();
+            run_until(&mut g, &mut hw, secs(1.99)).unwrap();
+            pending_gain(&mut g, &mut hw, 0.0);
             run_until(&mut g, &mut hw, secs(2.6)).unwrap();
             (asahi(&g)[k].th.t_coil, asahi(&g).iter().any(|a| a.hard))
         };
@@ -4149,6 +4201,7 @@ pub(crate) mod tests {
         let mut g = Guard::start(&mut hw, &cfg, cfg.globals.max_reduction, Some(path)).unwrap();
         run_until(&mut g, &mut hw, secs(1.0)).unwrap();
         assert!(g.armed());
+        pending_gain(&mut g, &mut hw, 25.0);
         let (lt, rt, lw) = (idx(&cfg, "Left Tweeter"), idx(&cfg, "Right Tweeter"), idx(&cfg, "Left Woofer 1"));
         {
             let a = &mut g.engine.as_mut().unwrap().asahi.as_mut().unwrap()[lt];
@@ -4160,7 +4213,7 @@ pub(crate) mod tests {
         run_until(&mut g, &mut hw, secs(1.3)).unwrap();
         assert!(g.armed());
         assert!(hw.per[lt] > 0.5 && hw.per[lt] == hw.per[rt], "{:?}", hw.per);
-        assert_eq!(hw.per[lw], 0.0, "{:?}", hw.per);
+        assert!(hw.per[lw] > 0.0 && hw.per[lw] < hw.per[lt], "{:?}", hw.per);
     }
 
     /// The J316 under the unified governor, with the asahi guard or (with
@@ -4189,10 +4242,14 @@ pub(crate) mod tests {
     #[test]
     fn the_asahi_guard_gives_each_speaker_the_larger_reduction() {
         let start = |guard: bool| {
-            let (cfg, mut hw) = unified_j316(guard, 0.1);
+            let (mut cfg, mut hw) = unified_j316(guard, 0.1);
+            // Isolate governor composition from the 7 dB handoff; the
+            // onset/handoff regression tests retain that threshold.
+            cfg.globals.max_reduction = 40.0;
             let mut g = Guard::start(&mut hw, &cfg, cfg.globals.max_reduction, Some(vi_state(&cfg, 55.0, 52.0))).unwrap();
             run_until(&mut g, &mut hw, secs(1.0)).unwrap();
             assert!(g.armed());
+            pending_gain(&mut g, &mut hw, 25.0);
             let tweeters: Vec<usize> = (0..cfg.speakers.len()).filter(|&k| cfg.speakers[k].name.contains("Tweeter")).collect();
             let e = g.engine.as_mut().unwrap();
             for (k, s) in cfg.speakers.iter().enumerate() {
@@ -4215,7 +4272,7 @@ pub(crate) mod tests {
             let e = g.engine.as_ref().unwrap();
             let (u, a) = (e.reductions(Governor::Unified), e.reductions(Governor::Asahi));
             for (k, s) in cfg.speakers.iter().enumerate() {
-                assert_eq!(hw.per[k], u[k].max(a[k]), "{} at {:?}: the card {} dB, unified {} dB, asahi {} dB", s.name, hw.t, hw.per[k], u[k], a[k]);
+                assert!(hw.per[k] >= u[k].max(a[k]), "{} at {:?}: the card {} dB, unified {} dB, asahi {} dB", s.name, hw.t, hw.per[k], u[k], a[k]);
             }
             let woofers = (0..u.len()).filter(|k| !tweeters.contains(k));
             both |= tweeters.iter().all(|&k| a[k] > u[k] + 1.0) && woofers.clone().all(|k| u[k] > a[k] + 1.0);
@@ -4226,7 +4283,7 @@ pub(crate) mod tests {
         run_until(&mut g2, &mut hw2, secs(1.5)).unwrap();
         let e = g2.engine.as_ref().unwrap();
         let (u, a) = (e.reductions(Governor::Unified), e.reductions(Governor::Asahi));
-        assert!(tweeters2.iter().all(|&k| hw2.per[k] == u[k] && a[k] > u[k] + 1.0), "card {:?}, unified {u:?}, asahi {a:?}", hw2.per);
+        assert!(tweeters2.iter().all(|&k| hw2.per[k] >= u[k] && a[k] > u[k] + 1.0), "card {:?}, unified {u:?}, asahi {a:?}", hw2.per);
         // the asahi model's latch alone hands the guarded card over, with
         // both governors asking for less than the hand-over
         g.engine.as_mut().unwrap().asahi.as_mut().unwrap()[tweeters[0]].hard = true;
@@ -4261,10 +4318,10 @@ pub(crate) mod tests {
         };
         let (alone, _, card, tweeters) = demand(false);
         assert!(tweeters.iter().all(|&k| alone[k] > 1.0), "the regulator alone did not tighten on its measured-power model: {alone:?}");
-        assert_eq!(card, alone);
+        assert!(card.iter().zip(&alone).all(|(c, a)| c >= a));
         let (guarded, asahi, card, _) = demand(true);
         assert!(guarded.iter().all(|&r| r == 0.0), "the guarded regulator tightened on its measured-power model: {guarded:?}");
-        assert_eq!(card, asahi, "the card under the guard is not the guard's ramp");
+        assert!(card.iter().zip(&asahi).all(|(c, a)| c >= a), "the onset ceiling must keep the guard's ramp");
     }
 
     /// Review r4 CC1 (addendum 2) of speakerguardd#8: each control's write
@@ -4378,15 +4435,18 @@ pub(crate) mod tests {
                 hottest = (0..cfg.speakers.len()).map(|k| e.temps(k).1).fold(hottest, f64::max);
             }
             let lost = g.engine.as_ref().unwrap().lost.clone();
+            hw.level = Box::new(|_| 0.0);
+            run_until(&mut g, &mut hw, secs(150.0)).unwrap();
+            assert!(g.armed(), "the quiet tail must recover from a headroom handoff");
             (cards, hottest, lost, g)
         };
         for guard in [true, false] {
-            // loud enough for the asahi ramp to ask 6.5 dB, not the 7 that
-            // hands the card off
+            // The onset ceiling can hand off over the run. Live and dead
+            // lines still have the same bound and recover in the quiet tail.
             let (dead, hot_dead, lost_dead, g) = run(guard, true, 0.25);
             let (live, hot_live, lost_live, _) = run(guard, false, 0.25);
             assert!(lost_dead.iter().all(|&l| l) && lost_live.iter().all(|&l| !l), "{lost_dead:?} / {lost_live:?}");
-            assert!(g.armed() && dead.iter().skip(10).all(|c| c.iter().all(|x| x.is_finite())), "guard {guard}: the dead line handed the card off");
+            assert!(g.armed() && dead.iter().skip(10).any(|c| c.iter().all(|x| x.is_finite())), "guard {guard}: the dead line never governed or recovered");
             assert_eq!(dead.len(), live.len());
             let worst = dead.iter().zip(&live).flat_map(|(d, l)| d.iter().zip(l).map(|(d, l)| l - d)).fold(0.0f64, f64::max);
             assert!(worst <= 0.01, "guard {guard}: the dead line was held up to {worst} dB less than a live line at the smallest impedance");
@@ -5459,13 +5519,14 @@ pub(crate) mod tests {
         hw.level = Box::new(|_| 0.02);
         let mut g = Guard::start(&mut hw, &cfg, cfg.globals.max_reduction, Some(vi_state(&cfg, 60.0, 55.0))).unwrap();
         run_until(&mut g, &mut hw, secs(2.0)).unwrap();
-        assert!(g.armed() && hw.per.iter().all(|&p| p == 0.0), "{:?}", hw.per);
+        assert!(g.armed() && hw.per.iter().all(|&p| p > 0.0 && p < hw.safe), "{:?}", hw.per);
+        let before = g.written.clone();
         g.disarm(&mut hw, "a test hand-off").unwrap();
         let handed = hw.t;
-        assert!(g.written.iter().all(|&w| w == 0.0), "the controls keep the governed value");
-        assert!(g.least_since(g.verified_at).iter().all(|&r| r == 0.0), "charged at the safe level before the drain");
+        assert_eq!(g.written, before, "the controls keep the written ceiling");
+        assert!(g.least_since(g.verified_at).iter().zip(&before).all(|(r, w)| r <= w), "charged above the held reduction before the drain");
         // the card stays with the kernel (the ramp is not the point here)
-        g.max_reduction = 0.1;
+        g.stopping = true;
         while hw.t < handed + DRAIN + secs(0.3) {
             g.tick(&mut hw).unwrap();
             assert!(!g.armed());
@@ -5483,7 +5544,7 @@ pub(crate) mod tests {
             assert!((a.th.t_coil - want.t_coil).abs() < 1e-9, "{}: charged to {} C, the safe level gives {} C", cfg.speakers[k].name, a.th.t_coil, want.t_coil);
         }
         // a renewal ends it
-        g.max_reduction = cfg.globals.max_reduction;
+        g.stopping = false;
         while !g.armed() && hw.t < secs(30.0) {
             g.tick(&mut hw).unwrap();
         }
@@ -5519,7 +5580,10 @@ pub(crate) mod tests {
             while !g.armed() && hw.t < secs(5.0) {
                 g.tick(&mut hw).unwrap();
             }
-            assert!(g.armed() && hw.per.iter().all(|&p| p == 0.0), "not governing at 0 dB: {:?}", hw.per);
+            assert!(g.armed(), "not governing: {:?}", hw.per);
+            // Preserve the old full-gain outage as an accounting/latch
+            // witness. New gain writes cannot create this queue.
+            pending_gain(&mut g, &mut hw, 0.0);
             hw.sensing = Box::new(|_| false);
             while !asahi(&g)[k].hard && hw.t < secs(30.0) {
                 g.tick(&mut hw).unwrap();
