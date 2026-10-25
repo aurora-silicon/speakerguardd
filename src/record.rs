@@ -96,6 +96,10 @@ pub fn fingerprint(cfg: &Config) -> u64 {
     if cfg.globals.guard.is_none() {
         globals = globals.replace(", guard: None", "");
     }
+    // nor one without the twin comparison
+    if cfg.globals.twin_ratio == 0.0 {
+        globals = globals.replace(", twin_ratio: 0.0", "");
+    }
     // nor does a speaker without its own z_min
     let speakers = format!("{:?}", cfg.speakers).replace(", z_min_override: None", "");
     let text = format!("{globals}{:?}{speakers}", cfg.controls);
