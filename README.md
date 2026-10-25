@@ -632,3 +632,23 @@ overrides the configuration's governor, `--guard asahi|none` its guard, and
 `-m` defaults to its `max_reduction`; `--shadow` turns the shadow log on,
 and `--experimental-unified` and `--allow-unqualified` are the two opt-ins
 described above.
+
+### Strict profile bounds
+
+The full-scale hot-start regression now runs for 20 simulated minutes by
+default on every installed profile. It checks every effective gain interval,
+including lease expiry, from independently hot coil and magnet nodes.
+The onset tests also cover every V/I profile from ambient and hot starts,
+with Asahi alone and unified plus Asahi.
+
+The legacy governor on V/I profiles now reserves full-scale energy using
+its own feed-forward state and resistance before each output write. Its
+Asahi shadow cannot supply that bound. The reserve shares the V/I onset
+calculation and includes old queued audio, a possible renewed lease, idle
+gaps and the kernel safe-level tail. It changes neither measured heat nor
+power-budget history. Existing latches and handoff thresholds still apply.
+J700 keeps its legacy floor policy and independent hot-node initialization.
+
+A draft profile whose declared fallback does not fit the reserve stays
+locked. Passing these software sweeps does not qualify a machine or its
+thermal constants. The output ceiling may attenuate quiet content too.

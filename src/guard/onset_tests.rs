@@ -193,6 +193,17 @@ fn check_truth(cfg: &Config, hw: &Tracked, name: &str, must_rearm: bool) {
         hw.hw.pings.len(),
         hw.hw.pings.first()
     );
+    if let Ok(dir) = std::env::var("SPEAKERGUARDD_ONSET_CSV_DIR") {
+        use std::io::Write as _;
+        let tag = format!("{name}-{:?}-{}", cfg.globals.governor, hw.clean_start);
+        let path = std::path::Path::new(&dir).join(format!("onset-{tag}.csv"));
+        let mut file = std::fs::File::create(path).unwrap();
+        writeln!(file, "time_ns,{}", cfg.speakers.iter().map(|s| s.name.clone()).collect::<Vec<_>>().join(",")).unwrap();
+        for (at, db) in &hw.gains {
+            writeln!(file, "{},{}", at.as_nanos(), db.iter().map(|d| format!("{d:.17}")).collect::<Vec<_>>().join(",")).unwrap();
+        }
+        eprintln!("ONSET_TRACE {tag} onset_ns={}", hw.full_onset.unwrap_or_default().as_nanos());
+    }
     for (k, s) in cfg.speakers.iter().enumerate() {
         let v = v_worst(s, &cfg.globals);
         let z = s.z_nominal.max(v / s.is_scale * 1.01);
@@ -419,4 +430,30 @@ fn the_onset_ceiling_cannot_bypass_a_governor_handoff() {
     );
     assert!(hw.per.iter().all(|r| *r >= 0.0));
     let _ = std::fs::remove_file(state);
+}
+
+/// Every installed V/I profile, including drafts, must bound both truth
+/// nodes at the hard limit, not just a cold start or a selected chassis.
+#[test]
+fn every_vi_profile_bounds_hot_full_scale_onsets() {
+    crate::log::set_verbosity(crate::log::Level::Error);
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("conf/apple");
+    let mut paths: Vec<_> = std::fs::read_dir(dir).unwrap()
+        .map(|p| p.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|e| e == "conf")).collect();
+    paths.sort();
+    for path in paths {
+        let cfg = Config::parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        if !cfg.has_vi() { continue; }
+        let name = path.file_stem().unwrap().to_str().unwrap();
+        for gov in [Governor::Asahi, Governor::Unified] {
+            let mut cfg = cfg.clone();
+            cfg.globals.governor = gov;
+            cfg.globals.guard = (gov == Governor::Unified).then_some(Governor::Asahi);
+            let (cfg, hw) = full_scale_run(cfg, 120, false);
+            // Retain the original witnesses' recovery requirement. Some
+            // drafts cannot fit their declared fallback and stay locked.
+            check_truth(&cfg, &hw, name, ["j316", "j413", "j616"].contains(&name));
+        }
+    }
 }

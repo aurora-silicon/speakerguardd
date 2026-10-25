@@ -442,6 +442,61 @@ impl Thermal {
     }
 }
 
+/// Full-scale energy that may still arrive before the kernel's safe tail.
+/// The thermal states and power bounds must refer to the same accounted time.
+#[allow(clippy::too_many_arguments)]
+pub fn onset_reduction(
+    models: &[(&Thermal, f64)], target: f64, ambient: f64,
+    safe: f64, old: f64, pending_s: f64, lease_s: f64,
+) -> f64 {
+    let fits = |gain: f64| {
+        models.iter().all(|(th, full)| {
+            let mut th = (*th).clone();
+            // Idle can warm a coil below its magnet. This
+            // envelope covers every idle delay before the dose,
+            // including small below-ambient sense estimates.
+            th.t_magnet = hi(th.t_magnet, ambient);
+            th.t_coil = hi(th.t_coil, th.t_magnet);
+            // Each joule adds at most impulse's node increments,
+            // wherever it lands among the lease's idle gaps.
+            let energy = full * (old.max(gain) * pending_s + gain * lease_s);
+            let (c, m) = th.impulse(energy);
+            if !(c < target && m < target) {
+                return false;
+            }
+            let power = full * safe;
+            let steady = ambient + power * (th.tr_coil + th.tr_magnet);
+            // Infinity is only the extremum search's upper endpoint;
+            // no infinite duration is integrated (equal taus included).
+            let peak = hi(
+                hi(th.t_coil, steady),
+                th.coil_extremum(power, f64::INFINITY, ambient),
+            );
+            peak < target && th.t_magnet < target
+        })
+    };
+    if fits(1.0) {
+        return 0.0;
+    }
+    if !fits(0.0) {
+        return NOTHING_DB;
+    }
+    let (mut lo, mut hi) = (0.0, 1.0);
+    for _ in 0..32 {
+        let mid = (lo + hi) / 2.0;
+        if fits(mid) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    if lo > 0.0 {
+        (-db(lo)).max(0.0)
+    } else {
+        NOTHING_DB
+    }
+}
+
 /// What one stretch of sense frames says about one speaker (power after
 /// the card's gain).
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -1663,55 +1718,11 @@ impl Engine {
                         models.push((&u.ff, u.v_worst.powi(2) / u.r_ff));
                     }
                 }
-                let target = s.t_limit - s.t_headroom;
-                let old = 10f64.powf(-pending[k].max(0.0) / 10.0);
-                let safe = 10f64.powf(-g.safe_reduction.max(0.0) / 10.0);
-                let fits = |gain: f64| {
-                    models.iter().all(|(th, full)| {
-                        let mut th = (*th).clone();
-                        // Idle can warm a coil below its magnet. This
-                        // envelope covers every idle delay before the dose,
-                        // including small below-ambient sense estimates.
-                        th.t_magnet = hi(th.t_magnet, g.t_ambient);
-                        th.t_coil = hi(th.t_coil, th.t_magnet);
-                        // Each joule adds at most impulse's node increments,
-                        // wherever it lands among the lease's idle gaps.
-                        let energy = full * (old.max(gain) * pending_s + gain * lease_s);
-                        let (c, m) = th.impulse(energy);
-                        if !(c < target && m < target) {
-                            return false;
-                        }
-                        let power = full * safe;
-                        let steady = g.t_ambient + power * (th.tr_coil + th.tr_magnet);
-                        // Infinity is only the extremum search's upper endpoint;
-                        // no infinite duration is integrated (equal taus included).
-                        let peak = hi(
-                            hi(th.t_coil, steady),
-                            th.coil_extremum(power, f64::INFINITY, g.t_ambient),
-                        );
-                        peak < target && th.t_magnet < target
-                    })
-                };
-                if fits(1.0) {
-                    return 0.0;
-                }
-                if !fits(0.0) {
-                    return NOTHING_DB;
-                }
-                let (mut lo, mut hi) = (0.0, 1.0);
-                for _ in 0..32 {
-                    let mid = (lo + hi) / 2.0;
-                    if fits(mid) {
-                        lo = mid;
-                    } else {
-                        hi = mid;
-                    }
-                }
-                if lo > 0.0 {
-                    (-db(lo)).max(0.0)
-                } else {
-                    NOTHING_DB
-                }
+                onset_reduction(
+                    &models, s.t_limit - s.t_headroom, g.t_ambient,
+                    10f64.powf(-g.safe_reduction.max(0.0) / 10.0),
+                    10f64.powf(-pending[k].max(0.0) / 10.0), pending_s, lease_s,
+                )
             })
             .collect();
         link(&self.cfg, &own)

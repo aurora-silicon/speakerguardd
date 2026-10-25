@@ -262,7 +262,7 @@ fn check_legacy_hot_start(name: String, mut cfg: Config) {
             std::env::var("SPEAKERGUARDD_HOT_SECONDS")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(120),
+                .unwrap_or(1200),
         )
     {
         g.tick(&mut hw).unwrap();
@@ -274,6 +274,12 @@ fn check_legacy_hot_start(name: String, mut cfg: Config) {
             .map(|k| hw.hw.effective_of(k))
             .collect(),
     ));
+    for lapse in &hw.hw.lapses {
+        let exact = hw.gains.iter().any(|(at, _)| at == lapse);
+        let already_safe = hw.gains.iter().rev().find(|(at, _)| at <= lapse)
+            .is_some_and(|(_, db)| db.iter().all(|r| *r >= hw.hw.safe));
+        assert!(exact || already_safe, "{name}: missed effective lease change at {lapse:?}");
+    }
     if let Ok(dir) = std::env::var("SPEAKERGUARDD_HOT_CSV_DIR") {
         use std::io::Write as _;
         let mut file =
@@ -422,4 +428,32 @@ fn random_unknown_histories_stay_below_every_profiles_start() {
         }
     }
     eprintln!("HOT_RANDOM seed={seed} histories={count} cases_per_speaker={cases}");
+}
+
+#[test]
+fn legacy_onset_ceiling_uses_its_ff_nodes_instead_of_the_vi_shadow() {
+    let mut cfg = Config::parse(include_str!("../conf/apple/j413.conf")).unwrap();
+    cfg.allow_unqualified = true;
+    cfg.globals.governor = Governor::Legacy;
+    cfg.globals.guard = None;
+    let mut hw = FakeHw::per_speaker(&cfg);
+    let mut g = Guard::start(&mut hw, &cfg, cfg.globals.max_reduction, None).unwrap();
+    for s in &mut g.speakers {
+        s.settle_at(0.0, 0.0, cfg.globals.t_ambient);
+        s.t_coil = 130.0;
+        s.t_magnet = 130.0;
+    }
+    for a in g.engine.as_mut().unwrap().asahi.as_mut().unwrap() {
+        a.th.t_coil = cfg.globals.t_ambient;
+        a.th.t_magnet = cfg.globals.t_ambient;
+    }
+    let mut warm = vec![0.0; cfg.speakers.len()];
+    assert!(g.bound_onset(hw.now(), &mut warm));
+    for s in &mut g.speakers {
+        s.settle_at(0.0, 0.0, cfg.globals.t_ambient);
+    }
+    let mut cold = vec![0.0; cfg.speakers.len()];
+    assert!(g.bound_onset(hw.now(), &mut cold));
+    assert!(warm.iter().zip(cold).all(|(w, c)| *w > c));
+    assert!(warm.iter().all(|r| *r > 0.0 && *r < MUTE_DB));
 }

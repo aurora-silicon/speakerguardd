@@ -1593,7 +1593,6 @@ impl Guard {
     }
 
     fn bound_onset(&self, now: Instant, per: &mut [f64]) -> bool {
-        let Some(e) = self.engine.as_ref().filter(|e| e.asahi.is_some()) else { return true };
         let pending = self.least_since(self.account_to);
         // A target write can block while the old lease runs down. Keep
         // that entire allowance and its queue at the old or new gain;
@@ -1602,7 +1601,25 @@ impl Guard {
         // A renewal can follow a blocking write only while the account is
         // this fresh. Reserve that delay as well as a full new lease.
         let lease_s = KERNEL_LOCK_TIMEOUT.as_secs_f64() + self.dt.unwrap_or(0.0) + BLIND_SLACK.as_secs_f64();
-        let onset = e.onset_reductions(self.governing, &pending, pending_s, lease_s);
+        let onset = if self.governing == Governor::Legacy && self.speakers.iter().any(|s| s.spec.is_chan.is_some()) {
+            self.speakers.iter().enumerate().map(|(k, s)| {
+                let mut th = crate::engine::Thermal::new(
+                    s.spec.tr_coil, s.spec.tau_coil, s.spec.tr_magnet,
+                    s.spec.tau_magnet, s.t_coil,
+                );
+                th.t_magnet = s.t_magnet;
+                crate::engine::onset_reduction(
+                    &[(&th, s.worst_case_power(0.0))],
+                    s.spec.t_limit - s.spec.t_headroom, self.globals.t_ambient,
+                    10f64.powf(-self.globals.safe_reduction.max(0.0) / 10.0),
+                    10f64.powf(-pending[k].max(0.0) / 10.0), pending_s, lease_s,
+                )
+            }).collect()
+        } else if let Some(e) = self.engine.as_ref().filter(|e| e.asahi.is_some()) {
+            e.onset_reductions(self.governing, &pending, pending_s, lease_s)
+        } else {
+            return true;
+        };
         let ready = onset.iter().all(|r| r.is_finite() && *r < MUTE_DB);
         for (r, floor) in per.iter_mut().zip(onset) { *r = r.max(floor); }
         ready
