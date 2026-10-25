@@ -143,6 +143,138 @@ stays with the kernel until the model has cooled under its working ceiling
 (about 7 s on the J700).  A daemon that is late renewing the lock is covered by the kernel's
 250 ms lock timeout, and the late time is charged like any other.
 
+### Speaker profile coverage
+
+The status below is the status shipped in these files. A public thermal
+model or a matching speaker count does not qualify a machine. Every added
+profile explicitly sets `qualified = false`; governing it requires
+`--allow-unqualified`. The existing J700 qualification is unchanged.
+The new profiles select `unified` with `guard = asahi`, keeping the
+measured-power guard alongside feed-forward protection.
+
+There are 35 profile families covering 53 board variants, including 31
+new drafts. The filename uses
+the family name, for example `apple/j714.conf` for J714s/c. Match the actual
+ALSA card ID before any use; a missing matching profile remains an error.
+Board identities come from the [Asahi device list](https://asahilinux.org/docs/hw/devices/device-list/).
+Suffixes in the table expand to full board names, for example J714s and J714c.
+The output count is the number of separately modelled amplifier outputs.
+
+| Machine | Board | Outputs | Status | Public source |
+| --- | --- | --- | --- | --- |
+| Mac Pro M2 Ultra | J180d | 2 | untested | [Asahi J180](https://github.com/AsahiLinux/speakersafetyd/blob/8c519e9594b6635d8a5e134d36dcb8ab5ea4a00f/conf/apple/j180.conf) |
+| Mac mini M1 | J274 | 1 | untested | [Asahi J274](https://github.com/AsahiLinux/speakersafetyd/blob/8c519e9594b6635d8a5e134d36dcb8ab5ea4a00f/conf/apple/j274.conf) |
+| MacBook Pro 13-inch M1 | J293 | 4 | untested | [Asahi J293](https://github.com/AsahiLinux/speakersafetyd/blob/8c519e9594b6635d8a5e134d36dcb8ab5ea4a00f/conf/apple/j293.conf) |
+| MacBook Air 13-inch M1 | J313 | 2 | untested | [Asahi J313](https://github.com/AsahiLinux/speakersafetyd/blob/8c519e9594b6635d8a5e134d36dcb8ab5ea4a00f/conf/apple/j313.conf) |
+| MacBook Pro 14-inch M1 Pro/Max | J314s/c | 6 | untested | [Asahi J314](https://github.com/AsahiLinux/speakersafetyd/blob/8c519e9594b6635d8a5e134d36dcb8ab5ea4a00f/conf/apple/j314.conf) |
+| MacBook Pro 16-inch M1 Pro/Max | J316s/c | 6 | untested | [existing profile](conf/apple/j316.conf) |
+| Mac Studio M1 Max/Ultra | J375c/d | 1 | untested | [Asahi J375](https://github.com/AsahiLinux/speakersafetyd/blob/8c519e9594b6635d8a5e134d36dcb8ab5ea4a00f/conf/apple/j375.conf) |
+| MacBook Air 13-inch M2 | J413 | 4 | untested | [existing profile](conf/apple/j413.conf) |
+| MacBook Pro 14-inch M2 Pro/Max | J414s/c | 6 | untested | [Asahi J414](https://github.com/AsahiLinux/speakersafetyd/blob/8c519e9594b6635d8a5e134d36dcb8ab5ea4a00f/conf/apple/j414.conf) |
+| MacBook Air 15-inch M2 | J415 | 6 | untested | [Asahi J415](https://github.com/AsahiLinux/speakersafetyd/blob/8c519e9594b6635d8a5e134d36dcb8ab5ea4a00f/conf/apple/j415.conf) |
+| MacBook Pro 16-inch M2 Pro/Max | J416s/c | 6 | untested | [Asahi J416](https://github.com/AsahiLinux/speakersafetyd/blob/8c519e9594b6635d8a5e134d36dcb8ab5ea4a00f/conf/apple/j416.conf) |
+| Mac mini M2 | J473 | 1 | untested | [Asahi J473](https://github.com/AsahiLinux/speakersafetyd/blob/8c519e9594b6635d8a5e134d36dcb8ab5ea4a00f/conf/apple/j473.conf) |
+| Mac mini M2 Pro | J474s | 1 | untested | [Asahi J474](https://github.com/AsahiLinux/speakersafetyd/blob/8c519e9594b6635d8a5e134d36dcb8ab5ea4a00f/conf/apple/j474.conf) |
+| Mac Studio M2 Max/Ultra | J475c/d | 1 | untested | [Asahi J475](https://github.com/AsahiLinux/speakersafetyd/blob/8c519e9594b6635d8a5e134d36dcb8ab5ea4a00f/conf/apple/j475.conf) |
+| MacBook Pro 13-inch M2 | J493 | 4 | untested | [Asahi J493](https://github.com/AsahiLinux/speakersafetyd/blob/8c519e9594b6635d8a5e134d36dcb8ab5ea4a00f/conf/apple/j493.conf) |
+| MacBook Pro 14-inch M3 | J504 | 6 | untested | [Asahi J504](https://github.com/AsahiLinux/speakersafetyd/blob/8c519e9594b6635d8a5e134d36dcb8ab5ea4a00f/conf/apple/j504.conf) |
+| MacBook Pro 14-inch M3 Pro/Max | J514s/c/m | 6 | untested | [Asahi J514](https://github.com/AsahiLinux/speakersafetyd/blob/8c519e9594b6635d8a5e134d36dcb8ab5ea4a00f/conf/apple/j514.conf) |
+| MacBook Pro 16-inch M3 Pro/Max | J516s/c/m | 6 | untested | [Asahi J516](https://github.com/AsahiLinux/speakersafetyd/blob/8c519e9594b6635d8a5e134d36dcb8ab5ea4a00f/conf/apple/j516.conf) |
+| Mac Studio M3 Ultra / M4 Max | J575d/c | 1 | untested | [Asahi J575](https://github.com/AsahiLinux/speakersafetyd/blob/8c519e9594b6635d8a5e134d36dcb8ab5ea4a00f/conf/apple/j575.conf); M4 Max uses sibling assumptions |
+| MacBook Pro 14-inch M4 | J604 | 6 | untested | [Apple count](https://support.apple.com/en-us/121552), [Asahi J504](https://github.com/AsahiLinux/speakersafetyd/blob/8c519e9594b6635d8a5e134d36dcb8ab5ea4a00f/conf/apple/j504.conf) sibling assumptions |
+| MacBook Air 13-inch M3 | J613 | 4 | untested | [Asahi J613](https://github.com/AsahiLinux/speakersafetyd/blob/8c519e9594b6635d8a5e134d36dcb8ab5ea4a00f/conf/apple/j613.conf) |
+| MacBook Pro 14-inch M4 Pro/Max | J614s/c | 6 | untested | [Apple count](https://support.apple.com/en-us/121553), [Asahi J504](https://github.com/AsahiLinux/speakersafetyd/blob/8c519e9594b6635d8a5e134d36dcb8ab5ea4a00f/conf/apple/j504.conf) sibling assumptions |
+| MacBook Air 15-inch M3 | J615 | 6 | untested | [Asahi J615](https://github.com/AsahiLinux/speakersafetyd/blob/8c519e9594b6635d8a5e134d36dcb8ab5ea4a00f/conf/apple/j615.conf) |
+| MacBook Pro 16-inch M4 Pro/Max | J616s/c | 6 | untested | [existing profile](conf/apple/j616.conf) |
+| MacBook Neo A18 Pro | J700 | 2 | qualified | [existing profile](conf/apple/j700.conf), [Apple specs](https://www.apple.com/macbook-neo/specs/) |
+| MacBook Pro 14-inch M5 | J704 | 6 | untested | [Apple count](https://support.apple.com/en-us/125405), [Asahi J504](https://github.com/AsahiLinux/speakersafetyd/blob/8c519e9594b6635d8a5e134d36dcb8ab5ea4a00f/conf/apple/j504.conf) sibling assumptions |
+| MacBook Air 13-inch M4 | J713 | 4 | untested | [Apple count](https://support.apple.com/en-us/122209), [Asahi J413](https://github.com/AsahiLinux/speakersafetyd/blob/8c519e9594b6635d8a5e134d36dcb8ab5ea4a00f/conf/apple/j413.conf) sibling assumptions |
+| MacBook Pro 14-inch M5 Pro/Max | J714s/c | 6 | untested | [Apple count](https://support.apple.com/en-us/126318), [Asahi J504](https://github.com/AsahiLinux/speakersafetyd/blob/8c519e9594b6635d8a5e134d36dcb8ab5ea4a00f/conf/apple/j504.conf) sibling assumptions |
+| MacBook Air 15-inch M4 | J715 | 6 | untested | [Apple count](https://support.apple.com/en-us/122210), [Asahi J415](https://github.com/AsahiLinux/speakersafetyd/blob/8c519e9594b6635d8a5e134d36dcb8ab5ea4a00f/conf/apple/j415.conf) sibling assumptions |
+| MacBook Pro 16-inch M5 Pro/Max | J716s/c | 6 | untested | [Apple count](https://support.apple.com/en-us/126319), [Asahi J316](https://github.com/AsahiLinux/speakersafetyd/blob/8c519e9594b6635d8a5e134d36dcb8ab5ea4a00f/conf/apple/j316.conf) thermal / [J616](conf/apple/j616.conf) routing assumptions |
+| Mac mini M4 / M4 Pro | J773g/s | 1 | untested | [Apple count](https://support.apple.com/en-us/121555), [Asahi J375](https://github.com/AsahiLinux/speakersafetyd/blob/8c519e9594b6635d8a5e134d36dcb8ab5ea4a00f/conf/apple/j375.conf) sibling assumptions |
+| Mac Studio M5 Max/Ultra | J775c/d | 1 | untested | [Apple count](https://www.apple.com/mac-studio/specs/), [Asahi J375](https://github.com/AsahiLinux/speakersafetyd/blob/8c519e9594b6635d8a5e134d36dcb8ab5ea4a00f/conf/apple/j375.conf) sibling assumptions |
+| MacBook Air 13-inch M5 | J813 | 4 | untested | [Apple count](https://www.apple.com/macbook-air/specs/), [Asahi J413](https://github.com/AsahiLinux/speakersafetyd/blob/8c519e9594b6635d8a5e134d36dcb8ab5ea4a00f/conf/apple/j413.conf) sibling assumptions |
+| MacBook Air 15-inch M5 | J815 | 6 | untested | [Apple count](https://www.apple.com/macbook-air/specs/), [Asahi J415](https://github.com/AsahiLinux/speakersafetyd/blob/8c519e9594b6635d8a5e134d36dcb8ab5ea4a00f/conf/apple/j415.conf) sibling assumptions |
+| Mac mini M6 / M5 Pro | J873g/s | 1 | untested | [Apple count](https://support.apple.com/en-us/128108), [Asahi J375](https://github.com/AsahiLinux/speakersafetyd/blob/8c519e9594b6635d8a5e134d36dcb8ab5ea4a00f/conf/apple/j375.conf) sibling assumptions |
+
+The Asahi links pin speakersafetyd 2.0.2, the last MIT release. Each new
+file cites its numeric sources and labels borrowed fields. See
+[profile provenance and format](PROFILES.md) for amplifier gains, V/I
+mapping, resistance assumptions, thermal limits and licensing. Apple
+specs establish counts for later machines, not their amp or sense mapping.
+These drafts make no claim of macOS parity or validated loudness.
+
+The following machines have internal speakers but no profile in this
+branch. The [Asahi iMac data](https://github.com/AsahiLinux/speakersafetyd/blob/8c519e9594b6635d8a5e134d36dcb8ab5ea4a00f/conf/apple/j456.conf)
+has thermal constants but no PCM, controls or V/I map, and the
+[public kernel](https://github.com/aurora-silicon/linux/blob/070c8e4d43a40ac464fe8bd491c090688a92b63a/sound/soc/apple/macaudio.c)
+excludes SSM3515 from its sense route. Inventing a working feedback path
+would misrepresent that hardware. These need a supported feed-forward tap
+and a calibrated amplifier scale before a runnable profile can be added.
+
+| Machine | Board | Status | Missing public data |
+| --- | --- | --- | --- |
+| iMac M1, four ports | J456 | skipped | SSM3515 sense/tap route and scale |
+| iMac M1, two ports | J457 | skipped | SSM3515 sense/tap route and scale |
+| iMac M3, two ports | J433 | skipped | Compatible amp/tap mapping and scale |
+| iMac M3, four ports | J434 | skipped | Compatible amp/tap mapping and scale |
+| iMac M4, two ports | J623 | skipped | Compatible amp/tap mapping and scale |
+| iMac M4, four ports | J624 | skipped | Compatible amp/tap mapping and scale |
+
+M6 coverage is the publicly documented Mac mini, J873g. There are no
+speculative profiles for unannounced board identities. iPhones and iPads
+are outside this Mac profile inventory.
+
+### Helping validate an untested profile
+
+Start with read-only information, with the current speaker protection
+running and no test playback. On Linux, substitute the actual card ID for
+`AppleJ314` in these commands:
+
+```sh
+tr '\0' '\n' < /proc/device-tree/compatible
+uname -r
+cat /proc/asound/cards /proc/asound/pcm
+arecord -l
+amixer -c AppleJ314 contents
+systemctl status speakerguardd.service speakersafetyd.service --no-pager
+journalctl -u speakerguardd.service -u speakersafetyd.service -n 200 --no-pager
+```
+
+Include the board, kernel and daemon revision, exact profile, PCM format,
+channel count, amp gain control range, sense switches, volume range and
+current protection service. Compare the names and slots with the profile
+and its linked UCM/graph sources. Do not change mixer values, enable a
+raw speaker route, stop protection, or use test tones for this check.
+
+For a recording, send a short existing speakerguardd `--record FILE`
+capture and its corresponding profile and journal through a maintainer's
+agreed private channel. The recording contains the words the amplifier
+sees and can contain recoverable audio. Review it and redact identifying
+logs before sharing; do not publish private audio, serial numbers or lab
+records. If the current protector is speakersafetyd, its existing
+blackbox capture and journal are useful initial evidence too.
+
+`--record` belongs to the governing daemon in this version. It is not a
+read-only capture mode, and `--shadow` still lets the primary governor
+write controls. Do not start a second daemon, restart protection, or opt
+into an untested profile just to collect evidence. A new recording needs
+a separately reviewed handoff with protection continuously in place.
+Idle evidence is welcome; do not raise the volume or start loud playback.
+Only an already approved, protected session can provide meaningful
+nonzero sense data.
+
+Maintainers should check slot order, polarity, V*I sign, scale, impedance,
+thermal behaviour, suspend/resume and fallback from the recording. Use
+`--replay FILE --model j314 -c conf --csv replay.csv` for offline review.
+A successful replay certificate describes the recording, not hardware
+safety. Silent samples cannot establish polarity or coil resistance.
+Qualification requires evidence for every role and board variant, a
+review of the constants, and an explicit change to `qualified`; parsing,
+read-only checks and a sibling match alone are insufficient. No loud
+playback is part of this contribution procedure.
+
 ### Machines with current and voltage sense
 
 The same daemon can protect the Apple laptops whose amplifiers report the
@@ -159,12 +291,11 @@ None of the three is qualified on the machine yet, and their files say
 the package never displaces speakersafetyd.  The unit never stops it
 either: one daemon holds the card's interlock, whichever takes it first,
 and a configuration this daemon refuses to govern exits with status 78
-before it touches the card, which the unit does not restart on.  Governing
-one of them takes an explicit enable: mask speakersafetyd (`systemctl mask
---now speakersafetyd`) and start this daemon with `--allow-unqualified`, or
-use a drop-in that adds `Conflicts=speakersafetyd.service` together with
-`OnFailure=speakersafetyd.service`.  To go back, unmask speakersafetyd and
-reboot.  Keep speakersafetyd installed.
+before it touches the card, which the unit does not restart on. Keep the
+current protection running. A change of governing daemon needs a reviewed
+handoff with fallback and rollback available. `--allow-unqualified` is an
+explicit risk opt-in, not a qualification procedure. Keep speakersafetyd
+installed and available for fallback.
 
 On those machines the files' governor is `unified` under `guard = asahi`
 (below): the feed-forward model is primary, as in macOS, where the
