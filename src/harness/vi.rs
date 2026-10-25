@@ -3,9 +3,10 @@
 //! voltage and current (S16 words) and have a volume control each, with
 //! the asahi governor writing the card, the unified models in shadow or
 //! (with the command line's opt-in) governing, against an oracle of its
-//! own.  The card, its lease and its events, the capture, the clock, the
-//! faults and the restarts behave as in the J700 world (harness.rs), with
-//! these differences.
+//! own, or the unified governor writing it under the asahi guard.  The
+//! card, its lease and its events, the capture, the clock, the faults and
+//! the restarts behave as in the J700 world (harness.rs), with these
+//! differences.
 //!
 //! * The program: each stream has a level (as there) and a share of it
 //!   for each speaker (a crossover's), played as a sine of the stream's
@@ -23,7 +24,9 @@
 //!   period read inside a `BadData` fault says half scale of V and of
 //!   reversed I, a mean V*I far below speakersafetyd's -0.01 W bound.
 //!   Late blocks: a period can reach the daemon well after it ended, held
-//!   in the capture.
+//!   in the capture.  A dead current line (guarded cases): inside an
+//!   `IDead` fault every current word carries only its noise and offset,
+//!   while the speaker gets the whole current.
 //! * The gain: the amplifier's own volume, applied as each sample plays,
 //!   which is how these cards apply it; or the J700's copy queue, applied
 //!   as each chunk is converted and stopped when the lock goes (harsher).
@@ -41,11 +44,17 @@
 //!   model with its constants, coil and magnet, at the time accounted (to
 //!   a sample: frames are whole samples);
 //! * (b) while the daemon holds the lease and the asahi governor writes
-//!   the card, each speaker's card reduction is at least what
-//!   speakersafetyd's ramp asks for on the oracle's true coil and magnet,
-//!   linked by group, and that need is under --max-reduction; whatever
-//!   governs, the lease is not held with a true coil or magnet at its hard
-//!   limit;
+//!   the card, or the unified one under the asahi guard, each speaker's
+//!   card reduction is at least what speakersafetyd's ramp asks for on the
+//!   oracle's true coil and magnet, linked by group, and that need is
+//!   under --max-reduction: never less protective than speakersafetyd
+//!   alone; whatever governs, the lease is not held with a true coil or
+//!   magnet at its hard limit, the measured-power truth's and, when the
+//!   unified governor writes the card, the feed-forward truth's (the one
+//!   unified's model is checked against).  After a dead current line the
+//!   asahi models and unified's measured-power model cannot know their
+//!   truth: (a) and (b) skip them and the measured-power truth, and the
+//!   feed-forward model stands alone;
 //! * (c) as in harness.rs (no lock without events, none after a failed
 //!   rate read in that pass, no renewal blind past the limit, a start from
 //!   anything but a clean stop latched), no lock until REARM_PERIODS good
@@ -103,6 +112,9 @@ pub enum ViFault {
     BadData { at: f64, len: f64 },
     /// One period reaches the daemon `delay` after it ended.
     LateBlock { at: f64, delay: f64 },
+    /// Every current word of the samples played in [at, at + len) reads
+    /// only its noise and offset (guarded cases).
+    IDead { at: f64, len: f64 },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -116,6 +128,8 @@ pub struct ViScenario {
     pub shadow: bool,
     /// The unified governor writes the card (--experimental-unified).
     pub unified: bool,
+    /// The unified governor writes the card under the asahi guard.
+    pub guard: bool,
     pub noise: i32,
     pub dc: i32,
     pub seed: u64,
@@ -225,7 +239,15 @@ impl ViScenario {
             streams,
             faults,
             restarts,
+            guard: false,
         };
+        // drawn after everything else, so every other field of a seed is
+        // what it was before the guard
+        sc.guard = r.chance(0.35);
+        if sc.guard && r.chance(0.4) {
+            let at = r.range(0.0, horizon);
+            sc.faults.push(ViFault::IDead { at, len: r.range(0.05, 2.0) });
+        }
         sc.add_tail();
         sc
     }
@@ -266,8 +288,8 @@ impl ViScenario {
         let restarts: Vec<String> = self.restarts.iter().map(|r| format!("Restart {{ at: {}, clean: {}, gap: {}, damage: Damage::{:?} }}", f(r.at), r.clean, f(r.gap), r.damage)).collect();
         let loads: Vec<String> = self.loads.iter().map(|l| format!("({}, {})", f(l.0), f(l.1))).collect();
         format!(
-            "ViScenario {{ j413: {}, rate: {}, amp_gain: {}, shadow: {}, unified: {}, noise: {}, dc: {}, seed: {}, loads: vec![{}], horizon: {}, tail: {}, events: {}, steps: {}, initial_db: {}, clean_start: {}, max_reduction: {}, latency: {}, streams: vec![{}], faults: vec![{}], restarts: vec![{}] }}",
-            self.j413, self.rate, self.amp_gain, self.shadow, self.unified, self.noise, self.dc, self.seed, loads.join(", "), f(self.horizon), self.tail, self.events, self.steps,
+            "ViScenario {{ j413: {}, rate: {}, amp_gain: {}, shadow: {}, unified: {}, guard: {}, noise: {}, dc: {}, seed: {}, loads: vec![{}], horizon: {}, tail: {}, events: {}, steps: {}, initial_db: {}, clean_start: {}, max_reduction: {}, latency: {}, streams: vec![{}], faults: vec![{}], restarts: vec![{}] }}",
+            self.j413, self.rate, self.amp_gain, self.shadow, self.unified, self.guard, self.noise, self.dc, self.seed, loads.join(", "), f(self.horizon), self.tail, self.events, self.steps,
             f(self.initial_db), self.clean_start, f(self.max_reduction), f(self.latency), streams.join(", "), faults.join(", "), restarts.join(", ")
         )
     }
@@ -294,7 +316,10 @@ pub fn vi_cfg(sc: &ViScenario) -> Config {
     let mut c = Config::parse(&text.replace("period = 4096", "period = 512")).unwrap();
     c.allow_unqualified = true;
     c.globals.shadow = sc.shadow;
-    if sc.unified {
+    if sc.guard {
+        c.globals.governor = Governor::Unified;
+        c.globals.guard = Some(Governor::Asahi);
+    } else if sc.unified {
         c.globals.governor = Governor::Unified;
         c.allow_unified = true;
     }
@@ -445,6 +470,9 @@ pub struct ViWorld<'a> {
     /// not govern and whose truth was hotter than their latched start: (a)
     /// no longer holds for them (see `latched_start`).
     unverified: Vec<[bool; 4]>,
+    /// A period with a dead current line was delivered: the current-fed
+    /// models cannot know their truth from then on.
+    i_dead_seen: Cell<bool>,
 }
 
 impl<'a> ViWorld<'a> {
@@ -501,6 +529,7 @@ impl<'a> ViWorld<'a> {
             good_since_bad: 0,
             pending: None,
             unverified: vec![[false; 4]; n],
+            i_dead_seen: Cell::new(false),
         }
     }
 
@@ -576,6 +605,11 @@ impl<'a> ViWorld<'a> {
 
     /// The sense words of sample `n` into one frame.
     fn frame(&self, n: u64, f: &mut [i32], bad: bool) {
+        let tau = n as f64 / self.rate;
+        let dead = tau < self.calm_from && self.sc.faults.iter().any(|x| matches!(x, ViFault::IDead { at, len } if tau >= *at && tau < at + len));
+        if dead {
+            self.i_dead_seen.set(true);
+        }
         for (k, s) in self.cfg.speakers.iter().enumerate() {
             let ic = s.is_chan.unwrap();
             if bad {
@@ -589,7 +623,7 @@ impl<'a> ViWorld<'a> {
                 (((x / fs * 32768.0).round() as i64 + (noise + self.offsets[c]) as i64).clamp(-32768, 32767) as i32) << 16
             };
             f[s.vs_chan] = word(v, s.vs_scale, s.vs_chan);
-            f[ic] = word(i, s.is_scale, ic);
+            f[ic] = word(if dead { 0.0 } else { i }, s.is_scale, ic);
         }
     }
 
@@ -975,6 +1009,8 @@ pub struct Outcome {
     pub tail_checked: bool,
     pub tail_skipped: bool,
     pub hottest_true: f64,
+    pub guarded: bool,
+    pub i_dead: bool,
 }
 
 /// speakersafetyd's ramp on the oracle's true coil and magnet (dB), linked
@@ -1001,6 +1037,8 @@ fn check(cfg: &Config, w: &ViWorld, g: &Guard, sc: &ViScenario, out: &mut Outcom
     let ta = cfg.globals.t_ambient;
     let e = g.engine.as_ref().expect("a V/I machine runs the engine");
     let tol = 0.02;
+    let dead = w.i_dead_seen.get();
+    let asahi_bound = g.governing == Governor::Asahi || g.guard() == Some(Governor::Asahi);
     for (k, s) in cfg.speakers.iter().enumerate() {
         let name = &s.name;
         let vi = w.oracle.at(k, VI, at, rate);
@@ -1010,7 +1048,7 @@ fn check(cfg: &Config, w: &ViWorld, g: &Guard, sc: &ViScenario, out: &mut Outcom
         // (a) every model never cooler than its truth
         let skip = w.unverified[k];
         let a = &e.asahi.as_ref().unwrap()[k];
-        if !skip[0] && (a.th.t_coil < vi.0 - tol || a.th.t_magnet < vi.1 - tol) {
+        if !skip[0] && !dead && (a.th.t_coil < vi.0 - tol || a.th.t_magnet < vi.1 - tol) {
             return Err(Violation(format!("(a) at {now:.4} s, accounted {at:.4} s: {name} asahi {:.3}/{:.3} C, true {:.3}/{:.3} C", a.th.t_coil, a.th.t_magnet, vi.0, vi.1)));
         }
         let l = &g.speakers[k];
@@ -1022,7 +1060,7 @@ fn check(cfg: &Config, w: &ViWorld, g: &Guard, sc: &ViScenario, out: &mut Outcom
                 return Err(Violation(format!("(a) at {now:.4} s, accounted {at:.4} s: {name} unified ff {:.3}/{:.3} C, true {:.3}/{:.3} C", u.ff.t_coil, u.ff.t_magnet, ffr.0, ffr.1)));
             }
             if let Some(m) = &u.vi {
-                if !skip[3] && (m.t_coil < vi.0 - tol || m.t_magnet < vi.1 - tol) {
+                if !skip[3] && !dead && (m.t_coil < vi.0 - tol || m.t_magnet < vi.1 - tol) {
                     return Err(Violation(format!("(a) at {now:.4} s, accounted {at:.4} s: {name} unified vi {:.3}/{:.3} C, true {:.3}/{:.3} C", m.t_coil, m.t_magnet, vi.0, vi.1)));
                 }
             }
@@ -1030,10 +1068,13 @@ fn check(cfg: &Config, w: &ViWorld, g: &Guard, sc: &ViScenario, out: &mut Outcom
         let _ = ta;
         // (b) while the lease is held
         if g.armed() && w.unlocked {
-            if vi.0.max(vi.1) >= s.t_limit {
+            if !dead && vi.0.max(vi.1) >= s.t_limit {
                 return Err(Violation(format!("(b) at {now:.4} s: armed with {name} truly at {:.3}/{:.3} C", vi.0, vi.1)));
             }
-            if g.governing == Governor::Asahi {
+            if g.governing == Governor::Unified && ffr.0.max(ffr.1) >= s.t_limit {
+                return Err(Violation(format!("(b) at {now:.4} s: armed with {name}'s feed-forward truth at {:.3}/{:.3} C", ffr.0, ffr.1)));
+            }
+            if asahi_bound && !dead {
                 let need = need(cfg, &w.oracle, k, at, rate);
                 if need >= sc.max_reduction + 0.05 {
                     return Err(Violation(format!("(b) at {now:.4} s: armed while {name}'s true state needs {need:.3} dB, over --max-reduction")));
@@ -1055,7 +1096,7 @@ fn check(cfg: &Config, w: &ViWorld, g: &Guard, sc: &ViScenario, out: &mut Outcom
         if w.bad_seen && w.good_since_bad < REARM_PERIODS {
             return Err(Violation(format!("(c) at {now:.4} s: armed {} good periods after bad sense data", w.good_since_bad)));
         }
-        if e.hard(g.governing) {
+        if e.governed(g.governing).1 {
             return Err(Violation(format!("(c) at {now:.4} s: armed with the governing model latched")));
         }
         let period = w.period_s();
@@ -1066,8 +1107,10 @@ fn check(cfg: &Config, w: &ViWorld, g: &Guard, sc: &ViScenario, out: &mut Outcom
             }
         }
     }
-    let hard = e.hard(g.governing);
+    let hard = e.governed(g.governing).1;
     out.latched |= hard;
+    out.guarded |= g.guard().is_some();
+    out.i_dead |= dead;
     out.handed_off |= !g.armed() && out.latched;
     out.rearmed_after_latch |= out.latched && g.armed() && !hard;
     out.bad_data |= w.bad_seen;
@@ -1118,7 +1161,7 @@ pub fn run(sc: &ViScenario, seed: u64) -> Result<Outcome, Violation> {
     if sc.clean_start {
         let ta = cfg.globals.t_ambient;
         let cold: Vec<SpeakerState> = cfg.speakers.iter().map(|s| SpeakerState::new(s.clone(), ta)).collect();
-        let engine = Engine::new(&cfg, sc.unified || sc.shadow);
+        let engine = Engine::new(&cfg, sc.unified || sc.guard || sc.shadow);
         let boot = Duration::from_secs(1000);
         std::fs::write(&path, state::encode_with(boot, boot, &cold, engine.as_ref(), false, true)).unwrap();
     }
@@ -1204,8 +1247,9 @@ pub fn run(sc: &ViScenario, seed: u64) -> Result<Outcome, Violation> {
 fn latched_start(cfg: &Config, w: &mut ViWorld, g: &Guard) {
     let at = (g.account_to() - w.t0).as_secs_f64();
     let e = g.engine.as_ref().unwrap();
+    let guarded = g.guard() == Some(Governor::Asahi);
     let governs = |m: usize| match g.governing {
-        Governor::Unified => m == 2 || m == 3,
+        Governor::Unified => m == 2 || m == 3 || (guarded && m == 0),
         _ => m == 0,
     };
     for k in 0..cfg.speakers.len() {
@@ -1393,7 +1437,7 @@ mod tests {
         let from = first_seed();
         let threads = std::thread::available_parallelism().map_or(1, |p| p.get()).min(32) as u64;
         let found: std::sync::Mutex<Option<(u64, String)>> = std::sync::Mutex::new(None);
-        let tally = std::sync::Mutex::new([0u64; 8]);
+        let tally = std::sync::Mutex::new([0u64; 10]);
         std::thread::scope(|s| {
             for th in 0..threads {
                 let (found, tally) = (&found, &tally);
@@ -1415,6 +1459,8 @@ mod tests {
                                 t[5] += o.tail_checked as u64;
                                 t[6] += o.tail_skipped as u64;
                                 t[7] += (o.hottest_true >= 150.0) as u64;
+                                t[8] += o.guarded as u64;
+                                t[9] += o.i_dead as u64;
                             }
                             Err(v) => {
                                 let mut f = found.lock().unwrap();
@@ -1430,7 +1476,7 @@ mod tests {
             }
         });
         let t = tally.into_inner().unwrap();
-        let summary = format!("VI SUMMARY seeds {from}..{} passed {} latched {} handed-off {} rearmed-after-latch {} bad-data {} tail-checked {} tail-skipped {} true-over-150 {}", from + n - 1, t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7]);
+        let summary = format!("VI SUMMARY seeds {from}..{} passed {} latched {} handed-off {} rearmed-after-latch {} bad-data {} tail-checked {} tail-skipped {} true-over-150 {} guarded {} dead-current {}", from + n - 1, t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7], t[8], t[9]);
         eprintln!("{summary}");
         if let Ok(path) = std::env::var("SPEAKERGUARDD_VI_SUMMARY") {
             use std::io::Write as _;

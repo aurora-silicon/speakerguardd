@@ -42,7 +42,9 @@
 //!   same charges at each speaker's least reduction since the last verified
 //!   boundary, the same cooling.  Whichever model governs, its reductions
 //!   are written per speaker and its hard latch hands the card to the
-//!   kernel.
+//!   kernel.  Under the asahi guard (the unified governor only) each
+//!   speaker gets the larger of the two governors' reductions, and either
+//!   one's latch hands the card over.
 //! * Sense data that is not a measurement (a mean V*I below -0.01 W, or
 //!   nonfinite) is uncovered time: charged at full scale, never measured.
 //!   The card is handed off at once and REARM_PERIODS good periods in a row
@@ -437,6 +439,11 @@ impl Guard {
         if governing != Governor::Legacy && !engine.as_ref().is_some_and(|e| e.has(governing)) {
             return Err(format!("governor {} has no models on this machine", governing.name()).into());
         }
+        if let Some(guard) = globals.guard {
+            if !engine.as_ref().is_some_and(|e| e.has(guard)) {
+                return Err(format!("guard {} has no models on this machine", guard.name()).into());
+            }
+        }
         let mut speakers: Vec<SpeakerState> = cfg.speakers.iter().map(|s| SpeakerState::new(s.clone(), globals.t_ambient)).collect();
         let latched = |speakers: &mut Vec<SpeakerState>, engine: &mut Option<Engine>| {
             for s in speakers.iter_mut() {
@@ -540,7 +547,8 @@ impl Guard {
             }
         }
         if governing != Governor::Legacy {
-            info!("governor {}{}", governing.name(), if globals.shadow { ", the others in shadow" } else { "" });
+            let guard = globals.guard.map_or(String::new(), |g| format!(" under the {} guard", g.name()));
+            info!("governor {}{guard}{}", governing.name(), if globals.shadow { ", the others in shadow" } else { "" });
         }
         let shadow_path = if globals.shadow { state_path.as_ref().map(|p| p.with_file_name("shadow.jsonl")) } else { None };
         let n = speakers.len();
@@ -663,8 +671,8 @@ impl Guard {
         let boot = hw.boottime();
         let text = state::encode_with(boot, boot, &self.speakers, self.engine.as_ref(), false, true);
         let mut slot = Some(rec);
-        let (gov, max) = (self.governing, self.max_reduction);
-        rec_do(&mut slot, boot, |r, t| r.start(t, gov, max, &text));
+        let (gov, guard, max) = (self.governing, self.globals.guard, self.max_reduction);
+        rec_do(&mut slot, boot, |r, t| r.start(t, gov, guard, max, &text));
         self.rec = slot;
         self.last_hard = self.governing_state().2;
         // the account's spans are recorded in boot time
@@ -683,6 +691,12 @@ impl Guard {
     /// Whether the daemon renews the card's lock (for the replay's log).
     pub fn armed_now(&self) -> bool {
         self.armed
+    }
+
+    /// The governor whose reductions the governing one's are raised to.
+    #[cfg(test)]
+    pub fn guard(&self) -> Option<Governor> {
+        self.globals.guard
     }
 
     /// A guard `Instant` as boot time (the trace's clock).
@@ -824,9 +838,11 @@ impl Guard {
                 (r, vec![r; n], self.speakers.iter().any(|s| s.hard))
             }
             (gov, Some(e)) => {
-                let per = e.reductions(gov);
+                // with the asahi guard, each speaker's larger reduction of
+                // the two governors and either one's latch
+                let (per, hard) = e.governed(gov);
                 let r = if per.iter().all(|r| r.is_finite()) { per.iter().cloned().fold(0.0, f64::max) } else { f64::NAN };
-                (r, per, e.hard(gov))
+                (r, per, hard)
             }
         }
     }
@@ -4067,6 +4083,159 @@ pub(crate) mod tests {
         assert!(g.armed());
         assert!(hw.per[lt] > 0.5 && hw.per[lt] == hw.per[rt], "{:?}", hw.per);
         assert_eq!(hw.per[lw], 0.0, "{:?}", hw.per);
+    }
+
+    /// The J316 under the unified governor, with the asahi guard or (with
+    /// the experimental flag) without it, at the given program level.
+    fn unified_j316(guard: bool, level: f64) -> (Config, FakeHw) {
+        let mut cfg = Config::parse(J316).unwrap();
+        cfg.allow_unqualified = true;
+        cfg.globals.governor = Governor::Unified;
+        if guard {
+            cfg.globals.guard = Some(Governor::Asahi);
+        } else {
+            cfg.allow_unified = true;
+        }
+        let mut hw = FakeHw::per_speaker(&cfg);
+        hw.level = Box::new(move |_| level);
+        (cfg, hw)
+    }
+
+    /// Review r4 of speakerguardd#8, the asahi guard: with the unified
+    /// governor writing the card, every period each speaker's control
+    /// holds the larger of the two governors' reductions, group-linked:
+    /// the asahi ramp's on hot tweeters, the unified regulator's on woofers
+    /// whose feed-forward model it predicts past its target.  The asahi
+    /// model's latch alone hands the card to the kernel.  Without the guard
+    /// the tweeters get only unified's.
+    #[test]
+    fn the_asahi_guard_gives_each_speaker_the_larger_reduction() {
+        let start = |guard: bool| {
+            let (cfg, mut hw) = unified_j316(guard, 0.1);
+            let mut g = Guard::start(&mut hw, &cfg, cfg.globals.max_reduction, Some(vi_state(&cfg, 55.0, 52.0))).unwrap();
+            run_until(&mut g, &mut hw, secs(1.0)).unwrap();
+            assert!(g.armed());
+            let tweeters: Vec<usize> = (0..cfg.speakers.len()).filter(|&k| cfg.speakers[k].name.contains("Tweeter")).collect();
+            let e = g.engine.as_mut().unwrap();
+            for (k, s) in cfg.speakers.iter().enumerate() {
+                if tweeters.contains(&k) {
+                    let a = &mut e.asahi.as_mut().unwrap()[k];
+                    (a.th.t_coil, a.th.t_magnet, a.coil_peak, a.magnet_peak) = (126.0, 120.0, 126.0, 120.0);
+                } else {
+                    let u = &mut e.unified.as_mut().unwrap()[k];
+                    (u.ff.t_coil, u.ff.t_magnet) = (139.0, 135.0);
+                }
+                let _ = s;
+            }
+            (cfg, hw, g, tweeters)
+        };
+        let (cfg, mut hw, mut g, tweeters) = start(true);
+        let mut both = false;
+        while hw.t < secs(3.0) {
+            g.tick(&mut hw).unwrap();
+            assert!(g.armed(), "handed off at {:?}", hw.t);
+            let e = g.engine.as_ref().unwrap();
+            let (u, a) = (e.reductions(Governor::Unified), e.reductions(Governor::Asahi));
+            for (k, s) in cfg.speakers.iter().enumerate() {
+                assert_eq!(hw.per[k], u[k].max(a[k]), "{} at {:?}: the card {} dB, unified {} dB, asahi {} dB", s.name, hw.t, hw.per[k], u[k], a[k]);
+            }
+            let woofers = (0..u.len()).filter(|k| !tweeters.contains(k));
+            both |= tweeters.iter().all(|&k| a[k] > u[k] + 1.0) && woofers.clone().all(|k| u[k] > a[k] + 1.0);
+        }
+        assert!(both, "the two governors never each bound a group of their own");
+        // without the guard the tweeters get unified's
+        let (_, mut hw2, mut g2, tweeters2) = start(false);
+        run_until(&mut g2, &mut hw2, secs(1.5)).unwrap();
+        let e = g2.engine.as_ref().unwrap();
+        let (u, a) = (e.reductions(Governor::Unified), e.reductions(Governor::Asahi));
+        assert!(tweeters2.iter().all(|&k| hw2.per[k] == u[k] && a[k] > u[k] + 1.0), "card {:?}, unified {u:?}, asahi {a:?}", hw2.per);
+        // the asahi model's latch alone hands the guarded card over, with
+        // both governors asking for less than the hand-over
+        g.engine.as_mut().unwrap().asahi.as_mut().unwrap()[tweeters[0]].hard = true;
+        let e = g.engine.as_ref().unwrap();
+        assert!(!e.hard(Governor::Unified));
+        assert!(e.governed(Governor::Unified).0.iter().all(|&r| r < cfg.globals.max_reduction - 1.0));
+        g.tick(&mut hw).unwrap();
+        assert!(!g.armed(), "the asahi latch did not hand the card over");
+    }
+
+    /// Review r4 of speakerguardd#8: under the asahi guard the unified
+    /// regulator holds the feed-forward model only, the measured-power side
+    /// being the guard's.  A hot measured-power model with a cool
+    /// feed-forward one asks nothing of the guarded regulator (the card
+    /// still gets the guard's ramp, and the model's latch), where alone
+    /// (the experimental flag) the regulator tightens on it.
+    #[test]
+    fn under_the_guard_the_regulator_holds_the_feed_forward_model() {
+        let demand = |guard: bool| {
+            let (cfg, mut hw) = unified_j316(guard, 0.1);
+            let mut g = Guard::start(&mut hw, &cfg, cfg.globals.max_reduction, Some(vi_state(&cfg, 55.0, 52.0))).unwrap();
+            run_until(&mut g, &mut hw, secs(1.0)).unwrap();
+            for u in g.engine.as_mut().unwrap().unified.as_mut().unwrap() {
+                let v = u.vi.as_mut().unwrap();
+                (v.t_coil, v.t_magnet) = (132.0, 128.0);
+            }
+            run_until(&mut g, &mut hw, secs(1.2)).unwrap();
+            assert!(g.armed());
+            let e = g.engine.as_ref().unwrap();
+            let tweeters: Vec<usize> = (0..cfg.speakers.len()).filter(|&k| cfg.speakers[k].name.contains("Tweeter")).collect();
+            (e.reductions(Governor::Unified), e.reductions(Governor::Asahi), hw.per.clone(), tweeters)
+        };
+        let (alone, _, card, tweeters) = demand(false);
+        assert!(tweeters.iter().all(|&k| alone[k] > 1.0), "the regulator alone did not tighten on its measured-power model: {alone:?}");
+        assert_eq!(card, alone);
+        let (guarded, asahi, card, _) = demand(true);
+        assert!(guarded.iter().all(|&r| r == 0.0), "the guarded regulator tightened on its measured-power model: {guarded:?}");
+        assert_eq!(card, asahi, "the card under the guard is not the guard's ramp");
+    }
+
+    /// Review r4 of speakerguardd#8: a current line that reads nothing
+    /// (ISENSE off, a dead line) is not bad sense data (V*I is 0), and the
+    /// asahi models see no power.  Under the guard the feed-forward model
+    /// then governs alone and holds its coil at its target, as on a machine
+    /// without current sense.  The asahi governor alone plays on at 0 dB
+    /// while the same model passes its hard limit.
+    #[test]
+    fn a_dead_current_line_leaves_the_feed_forward_model_governing() {
+        let run = |guard: bool| {
+            let (mut cfg, mut hw) = unified_j316(guard, 0.3);
+            if !guard {
+                cfg.globals.governor = Governor::Asahi;
+                cfg.globals.shadow = true;
+            }
+            let ics: Vec<usize> = cfg.speakers.iter().map(|s| s.is_chan.unwrap()).collect();
+            let ch = cfg.globals.channels;
+            hw.tweak = Some(Box::new(move |_, w: &mut [i32]| {
+                for f in w.chunks_exact_mut(ch) {
+                    for &ic in &ics {
+                        f[ic] = 0;
+                    }
+                }
+            }));
+            let mut g = Guard::start(&mut hw, &cfg, cfg.globals.max_reduction, Some(vi_state(&cfg, 55.0, 52.0))).unwrap();
+            let (mut hottest, mut handed, mut was) = (0.0f64, 0, false);
+            while hw.t < secs(120.0) {
+                g.tick(&mut hw).unwrap();
+                let e = g.engine.as_ref().unwrap();
+                if guard && g.armed() {
+                    let (u, a) = (e.reductions(Governor::Unified), e.reductions(Governor::Asahi));
+                    assert!(a.iter().all(|&r| r == 0.0), "the asahi models saw power: {a:?}");
+                    assert_eq!(hw.per, u, "at {:?}", hw.t);
+                }
+                handed += (was && !g.armed()) as u32;
+                was = g.armed();
+                hottest = (0..cfg.speakers.len()).map(|k| e.temps(k).1).fold(hottest, f64::max);
+            }
+            (g, hw, hottest, handed)
+        };
+        let (g, hw, hot, handed) = run(true);
+        assert!(g.armed() && handed == 0, "handed off {handed} times");
+        assert!(hot <= 140.3, "the feed-forward model reached {hot} C");
+        assert!(!g.engine.as_ref().unwrap().hard(Governor::Unified));
+        assert!(hw.per.iter().all(|&p| p > 1.0), "the feed-forward model asked for too little: {:?}", hw.per);
+        let (g, hw, hot, _) = run(false);
+        assert!(g.armed() && hw.per.iter().all(|&p| p == 0.0), "{:?}", hw.per);
+        assert!(hot >= 150.0, "the feed-forward model only reached {hot} C under the asahi governor");
     }
 
     /// r3 T2 and T3 on the engine: the hand-off gives the lock up and writes

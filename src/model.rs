@@ -537,6 +537,7 @@ mod tests {
             p_reduction_max: 0.0,
             max_reduction: 20.0,
             qualified: true,
+            guard: None,
         }
     }
 

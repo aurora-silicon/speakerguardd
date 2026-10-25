@@ -72,6 +72,8 @@ use crate::guard::{Accounted, Guard, Hw, Trace, EVENT_SLACK, KERNEL_LOCK_TIMEOUT
 const PRE_GAIN_MAX_DB: f64 = 30.0;
 
 const MAGIC: &str = "speakerguardd-record 3";
+/// In the start record's governor code: the asahi guard was on.
+const GUARD_BIT: u8 = 0x80;
 
 /// Loss kinds (`L`).
 pub const LOSS_SHORT: u8 = 1;
@@ -87,8 +89,14 @@ const END_FULL: u8 = 1;
 /// A short fingerprint of a configuration, so that a replay can say it is
 /// not running the configuration that was recorded.
 pub fn fingerprint(cfg: &Config) -> u64 {
-    // FNV-1a over the parsed configuration's debug form
-    let text = format!("{:?}{:?}{:?}", cfg.globals, cfg.controls, cfg.speakers);
+    // FNV-1a over the parsed configuration's debug form; a configuration
+    // without a guard reads as it did before the guard existed, so the
+    // recordings made then still match it
+    let mut globals = format!("{:?}", cfg.globals);
+    if cfg.globals.guard.is_none() {
+        globals = globals.replace(", guard: None", "");
+    }
+    let text = format!("{globals}{:?}{:?}", cfg.controls, cfg.speakers);
     text.bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3))
 }
 
@@ -153,9 +161,11 @@ impl Recorder {
         }
     }
 
-    pub fn start(&mut self, t: u64, governor: Governor, max_reduction: f64, state: &str) -> io::Result<()> {
+    /// The start: the governor's code carries the asahi guard in its top
+    /// bit (GUARD_BIT).
+    pub fn start(&mut self, t: u64, governor: Governor, guard: Option<Governor>, max_reduction: f64, state: &str) -> io::Result<()> {
         let mut b = Self::head(b'S', t);
-        b.push(governor as u8);
+        b.push(governor as u8 | if guard.is_some() { GUARD_BIT } else { 0 });
         b.extend_from_slice(&max_reduction.to_le_bytes());
         b.extend_from_slice(&(state.len() as u32).to_le_bytes());
         b.extend_from_slice(state.as_bytes());
@@ -312,6 +322,7 @@ struct Timeline {
     config: u64,
     start: Duration,
     governor: Governor,
+    guard: Option<Governor>,
     max_reduction: f64,
     state: String,
     /// Sample-rate observations: (when, rate or -errno), the opening ones
@@ -408,6 +419,7 @@ impl Timeline {
             config,
             start: Duration::ZERO,
             governor: Governor::Legacy,
+            guard: None,
             max_reduction: 20.0,
             state: String::new(),
             rates: Vec::new(),
@@ -445,7 +457,9 @@ impl Timeline {
                 match tag {
                     b'S' => {
                         tl.start = t;
-                        tl.governor = governor_of(read_u8(&mut inp)?).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "governor"))?;
+                        let code = read_u8(&mut inp)?;
+                        tl.governor = governor_of(code & !GUARD_BIT).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "governor"))?;
+                        tl.guard = (code & GUARD_BIT != 0).then_some(Governor::Asahi);
                         tl.max_reduction = read_f64(&mut inp)?;
                         let n = read_u32(&mut inp)? as usize;
                         let mut s = vec![0u8; n];
@@ -1077,6 +1091,9 @@ pub struct Replay {
     pub gain_db: f64,
     /// Default: the recorded governor and --max-reduction.
     pub governor: Option<Governor>,
+    /// Default: the recorded guard, when the governor is the recorded one
+    /// (Some(None): no guard).
+    pub guard: Option<Option<Governor>>,
     pub max_reduction: Option<f64>,
     pub csv: Option<PathBuf>,
 }
@@ -1142,8 +1159,13 @@ pub fn replay(path: &Path, cfg: &Config, opts: &Replay) -> Result<Outcome, Box<d
     cfg.allow_unified = true;
     cfg.allow_unqualified = true;
     cfg.globals.governor = opts.governor.unwrap_or(tl.governor);
+    cfg.globals.guard = match opts.guard {
+        Some(g) => g,
+        None if cfg.globals.governor == tl.governor => tl.guard,
+        None => None,
+    };
     let max_reduction = opts.max_reduction.unwrap_or(tl.max_reduction);
-    let same = cfg.globals.governor == tl.governor && opts.gain_db == 0.0 && max_reduction == tl.max_reduction && fingerprint(&cfg) == tl.config;
+    let same = cfg.globals.governor == tl.governor && cfg.globals.guard == tl.guard && opts.gain_db == 0.0 && max_reduction == tl.max_reduction && fingerprint(&cfg) == tl.config;
     let mut ambiguous = tl.ambiguous();
     let live_permits: Vec<(Duration, bool)> = tl.permits.iter().map(|p| (p.0, p.1)).collect();
     let live_latches = tl.latches.clone();
@@ -1451,7 +1473,7 @@ mod tests {
         let csv = path.with_file_name("clean.csv");
         let live = record(&cfg, &mut hw, tmp_state(), secs(10.0), &path);
         assert!(live.armed());
-        let out = replay(&path, &cfg, &Replay { gain_db: 0.0, governor: None, max_reduction: None, csv: Some(csv.clone()) }).unwrap();
+        let out = replay(&path, &cfg, &Replay { gain_db: 0.0, governor: None, guard: None, max_reduction: None, csv: Some(csv.clone()) }).unwrap();
         assert!(out.text.contains("equivalence with the live run: lock"), "{}", out.text);
         assert!(out.certified, "{}", out.text);
         assert!(out.text.contains("live only") && !out.text.contains("certification: refused"), "{}", out.text);
@@ -1469,15 +1491,15 @@ mod tests {
         let path = tmp("vi.rec");
         let live = record(&cfg, &mut hw, Some(vi_state(&cfg, 110.0, 100.0)), secs(8.0), &path);
         assert!(live.armed());
-        let out = replay(&path, &cfg, &Replay { gain_db: 0.0, governor: None, max_reduction: None, csv: None }).unwrap();
+        let out = replay(&path, &cfg, &Replay { gain_db: 0.0, governor: None, guard: None, max_reduction: None, csv: None }).unwrap();
         assert!(out.certified, "{}", out.text);
         // louder: the periods before the lock are muted in the replay too
         // (the guard turns the controls down at its start), the rest is
         // played 6 dB louder and governed harder
-        let loud = replay(&path, &cfg, &Replay { gain_db: 6.0, governor: None, max_reduction: None, csv: None }).unwrap();
+        let loud = replay(&path, &cfg, &Replay { gain_db: 6.0, governor: None, guard: None, max_reduction: None, csv: None }).unwrap();
         assert!(loud.text.contains("at +6.0 dB") && !loud.text.contains("more than 30 dB"), "{}", loud.text);
         // another governor on the same program: not compared, still run
-        let uni = replay(&path, &cfg, &Replay { gain_db: 0.0, governor: Some(Governor::Unified), max_reduction: None, csv: None }).unwrap();
+        let uni = replay(&path, &cfg, &Replay { gain_db: 0.0, governor: Some(Governor::Unified), guard: None, max_reduction: None, csv: None }).unwrap();
         assert!(uni.text.contains("governor unified") && uni.text.contains("not compared"), "{}", uni.text);
     }
 
@@ -1505,7 +1527,7 @@ mod tests {
         let tl = Timeline::read(&path, &cfg).unwrap();
         let bad: Vec<_> = tl.periods.iter().filter(|p| !p.measured).collect();
         assert_eq!(bad.len(), 1, "the bad period was not recorded as such");
-        let out = replay(&path, &cfg, &Replay { gain_db: 0.0, governor: None, max_reduction: None, csv: None }).unwrap();
+        let out = replay(&path, &cfg, &Replay { gain_db: 0.0, governor: None, guard: None, max_reduction: None, csv: None }).unwrap();
         assert!(!out.certified && out.text.contains("bad sense data"), "{}", out.text);
         assert!(!out.text.contains("measured where the recording"), "{}", out.text);
         assert!(out.text.contains("hand-off: the sense data is not a measurement"), "{}", out.text);
@@ -1525,7 +1547,7 @@ mod tests {
         let path = tmp("gap.rec");
         let live = record(&cfg, &mut hw, Some(vi_state(&cfg, 55.0, 52.0)), secs(4.0), &path);
         let live_latched = live.engine.as_ref().unwrap().asahi.as_ref().unwrap().iter().any(|a| a.hard);
-        let out = replay(&path, &cfg, &Replay { gain_db: 0.0, governor: None, max_reduction: None, csv: None }).unwrap();
+        let out = replay(&path, &cfg, &Replay { gain_db: 0.0, governor: None, guard: None, max_reduction: None, csv: None }).unwrap();
         assert!(!out.certified, "{}", out.text);
         assert!(out.text.contains("frames the capture lost") || out.text.contains("stalled"), "{}", out.text);
         // the gap is an uncovered interval: charged, never measured
@@ -1572,7 +1594,7 @@ mod tests {
         hw.level = Box::new(|_| 0.3);
         let path = tmp("loud.rec");
         record(&cfg, &mut hw, tmp_state(), secs(20.0), &path);
-        let at = |gain_db: f64| replay(&path, &cfg, &Replay { gain_db, governor: None, max_reduction: None, csv: None }).unwrap();
+        let at = |gain_db: f64| replay(&path, &cfg, &Replay { gain_db, governor: None, guard: None, max_reduction: None, csv: None }).unwrap();
         let (quiet, loud) = (at(0.0), at(20.0));
         let mean = |o: &Outcome| -> f64 {
             let l = o.text.lines().find(|l| l.starts_with("card while playing")).unwrap();
@@ -1596,7 +1618,7 @@ mod tests {
         assert!(g.rec.is_none(), "the recorder did not stop at its limit");
         let tl = Timeline::read(&path, &cfg).unwrap();
         assert!(tl.truncated.is_some());
-        let out = replay(&path, &cfg, &Replay { gain_db: 0.0, governor: None, max_reduction: None, csv: None }).unwrap();
+        let out = replay(&path, &cfg, &Replay { gain_db: 0.0, governor: None, guard: None, max_reduction: None, csv: None }).unwrap();
         assert!(!out.certified && out.text.contains("stopped here"), "{}", out.text);
         // and an in-memory recorder sees the same header
         let mem = Mem::default();
@@ -1674,7 +1696,7 @@ mod tests {
         assert!(live >= 3.0 * wait - 1e-4, "the live guard charged {live} s");
         let tl = Timeline::read(&path, &c).unwrap();
         assert!(tl.periods.is_empty() && tl.looks.len() >= 3, "{} looks", tl.looks.len());
-        let out = replay(&path, &c, &Replay { gain_db: 0.0, governor: None, max_reduction: None, csv: None }).unwrap();
+        let out = replay(&path, &c, &Replay { gain_db: 0.0, governor: None, guard: None, max_reduction: None, csv: None }).unwrap();
         let (_, charged, cooled) = account_line(&out);
         assert!((charged - live).abs() < 1e-3 && cooled < 1e-3, "live charged {live} s\n{}", out.text);
         assert!(out.text.contains("0.0 ms the live daemon charged not charged here"), "{}", out.text);
@@ -1692,23 +1714,23 @@ mod tests {
         let t0 = 1_000_000_000_000u64;
         let ms = 1_000_000u64;
         let mut r = Recorder::create(&path, &c, true, 1 << 20).unwrap();
-        r.start(t0, Governor::Asahi, 7.0, &state).unwrap();
+        r.start(t0, Governor::Asahi, None, 7.0, &state).unwrap();
         r.rate(t0, 0).unwrap();
         r.account(t0 + 20 * ms, t0, Accounted::Cooled).unwrap();
         r.account(t0 + 300 * ms, t0 + 20 * ms, Accounted::Charged).unwrap();
         r.account(t0 + 395 * ms, t0 + 300 * ms, Accounted::Cooled).unwrap();
         drop(r);
-        let out = replay(&path, &c, &Replay { gain_db: 0.0, governor: None, max_reduction: None, csv: None }).unwrap();
+        let out = replay(&path, &c, &Replay { gain_db: 0.0, governor: None, guard: None, max_reduction: None, csv: None }).unwrap();
         assert!(!out.certified && out.text.contains("the replay did not charge"), "{}", out.text);
         // the replay looks where the live daemon cooled, and its account
         // ends where the live one does
         let short = tmp("short.rec");
         let mut r = Recorder::create(&short, &c, true, 1 << 20).unwrap();
-        r.start(t0, Governor::Asahi, 7.0, &state).unwrap();
+        r.start(t0, Governor::Asahi, None, 7.0, &state).unwrap();
         r.rate(t0, 0).unwrap();
         r.account(t0 + 20 * ms, t0, Accounted::Cooled).unwrap();
         drop(r);
-        let out = replay(&short, &c, &Replay { gain_db: 0.0, governor: None, max_reduction: None, csv: None }).unwrap();
+        let out = replay(&short, &c, &Replay { gain_db: 0.0, governor: None, guard: None, max_reduction: None, csv: None }).unwrap();
         assert!(out.text.contains("it ends at 0.020 s, here at 0.020 s"), "{}", out.text);
     }
 
@@ -1725,14 +1747,14 @@ mod tests {
         for len in [8000u64, 1000, 200] {
             let path = tmp(&format!("short-{len}.rec"));
             let mut r = Recorder::create(&path, &c, true, 1 << 20).unwrap();
-            r.start(t0, Governor::Asahi, 7.0, &state).unwrap();
+            r.start(t0, Governor::Asahi, None, 7.0, &state).unwrap();
             r.rate(t0, 0).unwrap();
             r.permit(t0, true, "lock taken").unwrap();
             r.account(t0 + 20_000 * us, t0, Accounted::Cooled).unwrap();
             r.account(t0 + (20_000 + len) * us, t0 + 20_000 * us, Accounted::Charged).unwrap();
             r.account(t0 + (115_000 + len) * us, t0 + (20_000 + len) * us, Accounted::Cooled).unwrap();
             drop(r);
-            let out = replay(&path, &c, &Replay { gain_db: 0.0, governor: None, max_reduction: None, csv: None }).unwrap();
+            let out = replay(&path, &c, &Replay { gain_db: 0.0, governor: None, guard: None, max_reduction: None, csv: None }).unwrap();
             assert!(!out.certified && out.text.contains("the replay did not charge"), "{len} us charged live:\n{}", out.text);
         }
     }
@@ -1746,7 +1768,7 @@ mod tests {
         let path = tmp("missing-payload.rec");
         let state = std::fs::read_to_string(vi_state(&c, 55.0, 52.0)).unwrap();
         let mut r = Recorder::create(&path, &c, true, 1 << 20).unwrap();
-        r.start(1_000_000_000_000, Governor::Asahi, 7.0, &state).unwrap();
+        r.start(1_000_000_000_000, Governor::Asahi, None, 7.0, &state).unwrap();
         r.rate(1_000_000_000_000, 48000).unwrap();
         r.period(1_000_100_000_000, 0, 48000, true, &vec![0.0; c.speakers.len()], &[]).unwrap();
         drop(r);

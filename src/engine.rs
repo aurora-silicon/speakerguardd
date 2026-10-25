@@ -40,7 +40,22 @@
 //!   (review r4 of speakerguardd#8): a charge stands for time nobody
 //!   measured and heats every model at the worst case, but is not the
 //!   program, and neither are frames the card held at its safe level.
-//!   Shadow-only unless the command line says --experimental-unified.
+//!   It writes the card under the asahi guard, or alone with
+//!   --experimental-unified.
+//! * The asahi guard (`guard = asahi`, the unified governor only): the
+//!   card gets each speaker's larger reduction of the unified and the
+//!   asahi governor, group-linked, and either one's hard latch hands it to
+//!   the kernel.  The unified regulator then holds the feed-forward model
+//!   only, and the measured-power side is the guard's.  (Unified's own
+//!   measured-power model has the same constants under a look-ahead: on
+//!   loud tweeters it asked for more than speakersafetyd's ramp and handed
+//!   the card over more often, for no protection the guard lacks.  It
+//!   still runs, latches and is logged.)  Current that reads too little (a
+//!   dead current line) only makes the asahi models see less: the guard
+//!   then adds nothing, and the feed-forward model governs alone, as it
+//!   does on a machine without current sense.  Sense data that is not a
+//!   measurement at all stays a fault, as without the guard: the
+//!   feed-forward model's voltage comes from the same words.
 //! * Resistance thermometry from low-band V/I (`R = sum(v i) / sum(i^2)`)
 //!   is only measured and logged.
 
@@ -812,8 +827,11 @@ impl UnifiedSpeaker {
             };
             let mut thermal = need(self.last_ff_pre, &self.ff);
             // where V/I sense exists the measured-power model can only
-            // tighten the feed-forward one
-            if let (Some(vi), Some(p)) = (self.vi.as_ref(), self.last_vi_pre) {
+            // tighten the feed-forward one; under the asahi guard the
+            // measured-power side is the guard's (its own model still runs,
+            // latches and is logged): the regulator holds the feed-forward
+            // model, as macOS's does
+            if let (Some(vi), Some(p), None) = (self.vi.as_ref(), self.last_vi_pre, g.guard) {
                 thermal = thermal.max(need(p, vi));
             }
             let mut power: f64 = 0.0;
@@ -1224,6 +1242,23 @@ impl Engine {
         link(&self.cfg, &own)
     }
 
+    /// What the card gets when `gov` governs: each speaker's reduction
+    /// (dB, group-linked) and whether a model it answers to latched its
+    /// hard limit.  Under the asahi guard the unified governor's card gets
+    /// each speaker's larger reduction of the two and either one's latch;
+    /// a NaN in either reaches the guard's finite check.
+    pub fn governed(&self, gov: Governor) -> (Vec<f64>, bool) {
+        let mut per = self.reductions(gov);
+        let mut hard = self.hard(gov);
+        if let (Governor::Unified, Some(guard)) = (gov, self.cfg.globals.guard) {
+            for (r, g) in per.iter_mut().zip(self.reductions(guard)) {
+                *r = hi(*r, g);
+            }
+            hard |= self.hard(guard);
+        }
+        (per, hard)
+    }
+
     /// A model of `gov` latched at its hard limit (a governor this engine
     /// does not run counts as one).
     pub fn hard(&self, gov: Governor) -> bool {
@@ -1287,6 +1322,9 @@ impl Engine {
     pub fn shadow_line(&self, boottime_s: f64, governing: Governor, armed: bool, written: &[f64], legacy: &[(f64, f64)]) -> String {
         let mut o = String::new();
         let _ = write!(o, "{{\"t\":{boottime_s:.3},\"gov\":\"{}\",\"armed\":{armed}", governing.name());
+        if let (Governor::Unified, Some(g)) = (governing, self.cfg.globals.guard) {
+            let _ = write!(o, ",\"guard\":\"{}\"", g.name());
+        }
         let ra = self.asahi.as_ref().map(|_| self.reductions(Governor::Asahi));
         let ru = self.unified.as_ref().map(|_| self.reductions(Governor::Unified));
         o.push_str(",\"spk\":[");

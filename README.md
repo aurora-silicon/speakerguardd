@@ -212,11 +212,42 @@ that means in use.
 `--shadow` runs every governor the machine supports on the same account
 and writes one JSON line a second to `shadow.jsonl` next to the state file:
 each model's temperatures, each governor's reduction, what each control
-holds, and each estimator's power.  The `unified` governor (a look-ahead
-regulator on the feed-forward model, after the design of macOS's speaker
-protection, tightened by the measured-power model where V/I sense exists)
-runs only there.  It writes the card only with `--experimental-unified`.  A
-shadow changes nothing the governing model does.
+holds, and each estimator's power.  A shadow changes nothing the
+governing model does.
+
+The `unified` governor is a look-ahead regulator on the feed-forward
+model, after the design of macOS's speaker protection: power from the
+sensed voltage against the speaker's reference resistance (`r_ff`) drives
+the two-node model with macOS's open-loop constants, and the regulator
+lets through the most power that keeps the coil at or under the working
+limit over the next `horizon_s`.  It attacks at once and releases over
+`release_s`.  It predicts the program from the frames last measured at a
+gain the card is known to have applied.  A charge, which stands for time
+no frames measured, heats every model at the worst case but is not the
+program, and frames the card held at its safe level say nothing about it.
+
+On the V/I machines it governs under the asahi guard (`--governor unified
+--guard asahi`, or `guard = asahi` in the configuration).  The guard
+needs V/I sense on every speaker:
+
+* each speaker's control gets the larger of the two governors'
+  reductions, group-linked, every period, and either one's hard latch
+  hands the card to the kernel, so the card is never less protected than
+  under the asahi governor alone;
+* the regulator then holds the feed-forward model only.  The
+  measured-power side is the guard's: unified's own measured-power model
+  still runs, latches and is logged;
+* current that reads too little (a dead or switched-off current line) is
+  not bad sense data (V*I is 0): the asahi models see no power, the guard
+  adds nothing, and the feed-forward model governs alone, as it does on a
+  machine without current sense;
+* a period that is not a measurement (mean V*I below -0.01 W, or
+  nonfinite) stays a fault as above, because the feed-forward model's
+  voltage comes from the same words.
+
+Without the guard it writes the card only with `--experimental-unified`.
+Resistance thermometry from low-band V/I is logged only: without a pilot
+tone, content alone does not carry a trustworthy coil resistance.
 
 ### Recording and replay
 
@@ -286,8 +317,8 @@ found is a test of its own.
     SPEAKERGUARDD_CASES=1000000 cargo test --release harness
 
 `src/harness/vi.rs` does the same on the J316 and the J413, with the asahi
-governor writing a volume control per speaker and the unified models in
-shadow or governing.  Each stream has a share for each speaker and plays a
+governor writing a volume control per speaker, or the unified governor
+under the asahi guard, and the unified models in shadow or governing.  Each stream has a share for each speaker and plays a
 sine or a square into a load of random impedance and phase, so V*I goes
 negative over part of every cycle.  The sense words are S16 V and I with up
 to 20 LSB of noise and fixed offsets, and periods can be bad sense data or
@@ -296,7 +327,11 @@ Its oracle integrates the true power into the measured-power model and
 both feed-forward ones.  On top of the J700 world's properties it checks
 that no lock follows bad sense data before two good periods or holds a
 latched model, and, after a quiet tail as long as the daemon's own models
-need to cool, that the latch has cleared and the lock is back.
+need to cool, that the latch has cleared and the lock is back.  Under the
+guard it checks that the card is never less protective than speakersafetyd
+alone on the true state, and that the lock is never held with the
+feed-forward truth at its hard limit.  Guarded cases can lose their current
+line for a while, after which only the feed-forward side is checked.
 
     SPEAKERGUARDD_VI_CASES=100000 cargo test --release harness::vi
 
@@ -375,7 +410,7 @@ it never plays audio or performs a reboot.
 registered, never the AOP card that shares its `AppleJ` prefix), `-m <dB>`
 the reduction at which the card's safe level takes over, `-s <file>` the
 model state file (`-s ''` for none).  `--governor legacy|asahi|unified`
-overrides the configuration's governor and `-m` defaults to its
-`max_reduction`; `--shadow` turns the shadow log on, and
-`--experimental-unified` and `--allow-unqualified` are the two opt-ins
+overrides the configuration's governor, `--guard asahi|none` its guard, and
+`-m` defaults to its `max_reduction`; `--shadow` turns the shadow log on,
+and `--experimental-unified` and `--allow-unqualified` are the two opt-ins
 described above.

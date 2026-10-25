@@ -32,8 +32,9 @@ pub enum Governor {
     /// ramp to its min_gain across t_window, peak-hold hysteresis.
     Asahi,
     /// The look-ahead regulator on the feed-forward model, tightened by the
-    /// measured-power model where V/I sense exists.  Shadow-only: it writes
-    /// the card only with --experimental-unified.
+    /// measured-power model where V/I sense exists.  It writes the card
+    /// under the asahi guard (`guard = asahi`), or alone only with
+    /// --experimental-unified.
     Unified,
 }
 
@@ -118,6 +119,11 @@ pub struct Globals {
     /// for offline work: the daemon refuses to govern with it unless the
     /// command line says --allow-unqualified.
     pub qualified: bool,
+    /// A second governor whose reductions the card also gets: with the
+    /// unified governor, `asahi` gives each speaker the larger of the two
+    /// governors' reductions, and either one's hard latch hands the card
+    /// to the kernel.  Needs V/I sense on every speaker.
+    pub guard: Option<Governor>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -300,6 +306,11 @@ impl Config {
             p_reduction_max: or(g, "Globals", "p_reduction_max", 0.0)?,
             max_reduction: or(g, "Globals", "max_reduction", 20.0)?,
             qualified: boolean(g, "Globals", "qualified", true)?,
+            guard: match g.get("guard").map(String::as_str) {
+                None | Some("none") => None,
+                Some("asahi") => Some(Governor::Asahi),
+                Some(v) => return Err(ConfigError(format!("[Globals] guard {v:?}: none or asahi"))),
+            },
         };
         if !(globals.max_reduction.is_finite() && globals.max_reduction > 0.0) {
             return Err(ConfigError("[Globals] max_reduction must be finite and positive".into()));
@@ -474,28 +485,37 @@ impl Config {
         self.speakers.iter().all(|s| s.is_chan.is_some()) && self.globals.amp_gain_dbv > 0.0
     }
 
-    /// What the file itself must hold for its governor: the asahi governor
-    /// needs current sense on every speaker and the amplifier's level.
+    /// What the file itself must hold for its governor and guard: the
+    /// asahi governor, and the asahi guard, need current sense on every
+    /// speaker and the amplifier's level; the guard guards the unified
+    /// governor only.
     fn check_hardware(&self) -> Result<(), ConfigError> {
-        if self.globals.governor == Governor::Asahi {
+        let g = &self.globals;
+        for (asahi, what) in [(g.governor == Governor::Asahi, "governor asahi"), (g.guard == Some(Governor::Asahi), "guard asahi")] {
+            if !asahi {
+                continue;
+            }
             if self.speakers.iter().any(|s| s.is_chan.is_none()) {
-                return Err(ConfigError("governor asahi needs current sense (is_chan) on every speaker".into()));
+                return Err(ConfigError(format!("{what} needs current sense (is_chan) on every speaker")));
             }
-            if !(self.globals.amp_gain_dbv > 0.0) {
-                return Err(ConfigError("governor asahi needs [Globals] amp_gain_dbv".into()));
+            if !(g.amp_gain_dbv > 0.0) {
+                return Err(ConfigError(format!("{what} needs [Globals] amp_gain_dbv")));
             }
+        }
+        if g.guard.is_some() && g.governor != Governor::Unified {
+            return Err(ConfigError(format!("guard asahi guards the unified governor, not {}", g.governor.name())));
         }
         Ok(())
     }
 
     /// Whether this configuration may write the card, after the command
     /// line's choices: the asahi governor needs V/I sense, the unified one
-    /// --experimental-unified, and an unqualified machine
-    /// --allow-unqualified.  Guard::start checks it again.
+    /// the asahi guard or --experimental-unified, and an unqualified
+    /// machine --allow-unqualified.  Guard::start checks it again.
     pub fn check_governor(&self) -> Result<(), ConfigError> {
         self.check_hardware()?;
-        if self.globals.governor == Governor::Unified && !self.allow_unified {
-            return Err(ConfigError("governor unified is shadow-only (pass --experimental-unified to let it write the card)".into()));
+        if self.globals.governor == Governor::Unified && self.globals.guard.is_none() && !self.allow_unified {
+            return Err(ConfigError("governor unified writes the card under guard asahi (or alone with --experimental-unified)".into()));
         }
         if !self.globals.qualified && !self.allow_unqualified {
             return Err(ConfigError("this machine's configuration is not qualified (qualified = false): the daemon does not govern it without --allow-unqualified".into()));
@@ -587,6 +607,33 @@ mod tests {
         }
         assert!(Config::parse(J700).unwrap().check_governor().is_ok());
         assert!(Config::parse(&J700.replace("[Globals]", "[Globals]\nqualified = maybe")).is_err());
+    }
+
+    /// The unified governor writes the card under the asahi guard, which
+    /// needs V/I sense on every speaker and guards nothing else; alone it
+    /// still needs the experimental flag.
+    #[test]
+    fn the_asahi_guard_lets_the_unified_governor_write_the_card() {
+        let guarded = J316.replace("governor = asahi", "governor = unified\nguard = asahi");
+        let mut c = Config::parse(&guarded).unwrap();
+        assert_eq!(c.globals.guard, Some(Governor::Asahi));
+        c.allow_unqualified = true;
+        assert!(c.check_governor().is_ok(), "{:?}", c.check_governor());
+        c.globals.guard = None;
+        assert!(c.check_governor().is_err(), "unified governed alone without the flag");
+        // the guard guards the unified governor only, and needs V/I sense
+        assert!(Config::parse(&J316.replace("governor = asahi", "governor = asahi\nguard = asahi")).is_err());
+        assert!(Config::parse(&J700.replace("[Globals]", "[Globals]\ngovernor = unified\nguard = asahi")).is_err());
+        assert!(Config::parse(&guarded.replace("amp_gain_dbv = 18.5", "amp_gain_dbv = 0")).is_err());
+        assert!(Config::parse(&guarded.replace("guard = asahi", "guard = legacy")).is_err());
+        assert_eq!(Config::parse(&guarded.replace("guard = asahi", "guard = none")).unwrap().globals.guard, None);
+        // the command line's choice is checked the same way
+        let mut c = Config::parse(J316).unwrap();
+        c.allow_unqualified = true;
+        c.globals.guard = Some(Governor::Asahi);
+        assert!(c.check_governor().is_err(), "guarded the asahi governor");
+        c.globals.governor = Governor::Unified;
+        assert!(c.check_governor().is_ok());
     }
 
     /// The unified governor is shadow-only: a file naming it parses, so the

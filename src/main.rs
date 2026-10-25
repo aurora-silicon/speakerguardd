@@ -73,6 +73,8 @@ struct Args {
     verbosity: Level,
     shadow: bool,
     governor: Option<Governor>,
+    /// Some(None): --guard none.
+    guard: Option<Option<Governor>>,
     horizon: Option<f64>,
     ctrl_headroom: Option<f64>,
     unified_caps: bool,
@@ -96,11 +98,12 @@ fn usage() -> ! {
          -m, --max-reduction <DB>        Gain reduction beyond which the card's safe level takes over (default: the config's, else 20)\n  \
          -s, --state <FILE>              Model state kept across restarts (default /run/speakerguardd/state)\n  \
          --governor <NAME>               legacy, asahi or unified (default: the config's, else legacy)\n  \
+         --guard <NAME>                  asahi: the unified governor's card also gets the asahi governor's reductions (default: the config's, else none)\n  \
          --shadow                        Run every governor and log them to shadow.jsonl next to the state\n  \
          --horizon <S>                   The unified governor's prediction horizon (default: the config's)\n  \
          --ctrl-headroom <K>             The unified governor's margin under the working limit (default: the config's)\n  \
          --unified-caps                  macOS-style caps on the unified governor's thermal and power axes\n  \
-         --experimental-unified          Let the (shadow-only) unified governor write the card\n  \
+         --experimental-unified          Let the unified governor write the card without the guard\n  \
          --allow-unqualified             Govern a machine whose configuration says qualified = false\n  \
          --record <FILE>                 Record what the guard sees and decides, for --replay\n  \
          --record-max-mb <MB>            Stop recording past this size (default 512)\n  \
@@ -125,6 +128,7 @@ fn parse_args() -> Args {
         verbosity: Level::Info,
         shadow: false,
         governor: None,
+        guard: None,
         horizon: None,
         ctrl_headroom: None,
         unified_caps: false,
@@ -152,6 +156,13 @@ fn parse_args() -> Args {
             }
             "--shadow" => args.shadow = true,
             "--governor" => args.governor = Some(it.next().as_deref().and_then(Governor::parse).unwrap_or_else(|| usage())),
+            "--guard" => {
+                args.guard = Some(match it.next().as_deref() {
+                    Some("asahi") => Some(Governor::Asahi),
+                    Some("none") => None,
+                    _ => usage(),
+                })
+            }
             "--unified-caps" => args.unified_caps = true,
             "--experimental-unified" => args.experimental_unified = true,
             "--allow-unqualified" => args.allow_unqualified = true,
@@ -553,6 +564,9 @@ fn override_config(cfg: &mut Config, args: &Args) -> Result<(), Box<dyn std::err
     if let Some(g) = args.governor {
         cfg.globals.governor = g;
     }
+    if let Some(g) = args.guard {
+        cfg.globals.guard = g;
+    }
     cfg.globals.shadow |= args.shadow;
     if let Some(h) = args.horizon {
         cfg.globals.horizon_s = h;
@@ -584,7 +598,7 @@ fn replay(args: &Args, path: &std::path::Path) -> Result<ExitCode, Box<dyn std::
         cfg.globals.t_ctrl_headroom = h;
     }
     cfg.globals.unified_caps |= args.unified_caps;
-    let out = record::replay(path, &cfg, &record::Replay { gain_db: args.gain_db, governor: args.governor, max_reduction: args.max_reduction, csv: args.csv.clone() })?;
+    let out = record::replay(path, &cfg, &record::Replay { gain_db: args.gain_db, governor: args.governor, guard: args.guard, max_reduction: args.max_reduction, csv: args.csv.clone() })?;
     print!("{}", out.text);
     Ok(if out.certified { ExitCode::SUCCESS } else { ExitCode::from(3) })
 }
@@ -624,6 +638,7 @@ mod tests {
             verbosity: Level::Info,
             shadow: false,
             governor: None,
+            guard: None,
             horizon: None,
             ctrl_headroom: None,
             unified_caps: false,
