@@ -41,10 +41,12 @@ const UNLOCK_MAGIC: i64 = 0xdec1be15u32 as i32 as i64;
 /// Volume control steps per dB (t8140-aop-audio: 0.5 dB steps).
 const STEPS_PER_DB: f64 = 2.0;
 
-/// The version and the source it was built from (the packaging sets
-/// SPEAKERGUARDD_COMMIT at build time), for `--version` and the journal.
+/// The version and the source it was built from (the Makefile and the
+/// packaging set SPEAKERGUARDD_COMMIT at build time), for `--version` and
+/// the journal.
 fn version() -> String {
-    format!("speakerguardd {} ({})", env!("CARGO_PKG_VERSION"), option_env!("SPEAKERGUARDD_COMMIT").unwrap_or("commit unknown"))
+    let commit = option_env!("SPEAKERGUARDD_COMMIT").filter(|c| !c.is_empty()).unwrap_or("commit unknown");
+    format!("speakerguardd {} ({commit})", env!("CARGO_PKG_VERSION"))
 }
 
 struct Args {

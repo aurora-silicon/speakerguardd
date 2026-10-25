@@ -300,7 +300,8 @@ it never plays audio or performs a reboot.
 registered, never the AOP card that shares its `AppleJ` prefix), `-m <dB>`
 the reduction at which the card's safe level takes over, `-s <file>` the
 model state file (`-s ''` for none).  `-V` prints the version and the
-source commit, which the daemon also logs when it starts.
+source commit, which the daemon also logs when it starts (`make` takes the
+commit from git; a package sets `SPEAKERGUARDD_COMMIT`).
 
 The daemon writes the controls to the card's safe value at its start and
 before each unlock.  The card accepts that value while the volume is locked.
