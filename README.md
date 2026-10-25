@@ -35,6 +35,55 @@ lock and the card falls back to its own safe level; the daemon keeps
 modelling from the sense data and takes the lock back once the reduction is
 3 dB below the limit again.
 
+The J700 converts on copy, ahead of a playback queue of up to 341 ms, so a
+written reduction reaches only what is converted after it.  Audio already
+queued at a lower gain keeps playing, and only giving the lock up stops it
+(macaudio stops the old-gain stream at once).  The daemon gives the lock up
+for that reason too, in two cases, each logged as itself:
+* Any program at all could take a coil within 3 K of its limit before its
+  next look, through the least reduction the card may be playing.  This is
+  what it has to assume while it cannot see.
+* The coils' thermal reduction has risen more than 3 dB over that least
+  reduction, and the audio converted at it, at the level the program was
+  last seen to deliver, could take a coil there in the time it can still
+  play: until a queue's length (341 ms) after the controls stopped holding
+  it.
+It takes the lock back after two whole periods.
+
+A daemon that is held up (a call that blocks, the scheduler) cannot write
+anything: the card keeps converting at the last reduction written until the
+kernel's lease runs out and macaudio stops the stream.  So the daemon never
+writes less than a floor: the reduction at which full scale for a lease, a
+period and the stop, behind a copy queue (0.68 s on the J700), keeps every
+coil 3 K under its limit.  It rises with the coil, and the governor takes
+over from it at about 110 C.  This costs loudness at the top of the volume
+range, accepted on purpose:
+
+| Coil model (its magnet where a steady program puts it) | 50 C | 70 C | 85 C | 100 C | 110 C |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Floor | 0.5 dB | 1.5 dB | 2.5 dB | 3.9 dB | 5.0 dB |
+| Floor on the J700's 0.5 dB steps | 0.5 dB | 2.0 dB | 3.0 dB | 4.0 dB | 5.5 dB |
+| Governor | 0 dB | 0 dB | 0 dB | 0 dB | 6.0 dB |
+
+The card rounds every reduction up to its step, the floor's too.  A cold
+J700 never plays at the amplifier's full scale, but 0.5 dB under it.  A
+loud program that warms the coils to 85-100 C plays 3-4 dB under it where
+the governor alone would take nothing yet.  In return, loud bursts
+after quiet passages are not stopped (no hand-off in any of the programs the
+seventh review measured, where the queue rule alone stopped up to 60 a
+minute, each an XRUN and about 170 ms at the card's safe level), and a
+daemon held up for anything up to the lease no longer takes a coil past its
+limit.
+
+While the daemon is held up (descheduled, blocked in a call, waiting for a
+page) it can decide nothing, and the card's 250 ms lease bounds what plays,
+which the floor allows for.  To make that rarer the unit runs it at a
+real-time priority below PipeWire's
+(`CPUSchedulingPolicy=fifo`, priority 50) and it locks its memory
+(`mlockall`).  Every ten minutes it logs how long it was held up: the gaps
+between lock renewals, the latency of each kind of call, and the major page
+faults.  That measures, without a sound, whether a shorter lease is needed.
+
 There is no feedback: the model can only be as good as its constants.  The
 J700's constants - thermal resistances and time constants, coil temperature
 limits, volts at full scale, coil resistance and the power budgets - are the
@@ -50,29 +99,131 @@ as measured.  Empty, short or overrun periods, capture errors and stream
 reopens are not; configuration scalars must be finite, with positive
 physical constants and valid window/budget domains.
 
-Time the daemon could not measure while the speakers play is not ignored and
-is not fatal either:
+Time the daemon could not measure is not ignored and is not fatal either.
+The rule is deliberately simple:
 
-* A period may be up to 100 ms late.  Beyond that, the model is charged for
-  the unmeasured time at the worst case: a full-scale square wave at the gain
-  the card currently applies.  A short gap (an xrun, stream start latency, a
-  PipeWire reconfiguration) therefore costs at most a brief extra reduction,
-  never protection.
+* The thermal model has one account, and every step advances it by exactly
+  the time stepped.  Time is either covered by measured sense frames or
+  charged as a full-scale square wave at the least reduction the volume
+  controls held at any time since the last verified boundary (widened by the
+  500 ms the card can keep playing samples converted at an earlier gain).
+  There are no tolerances, no partial credits and no assumptions about when
+  inside an uncertain interval anything played.  Frames over time already
+  charged add nothing.
+* Frames are placed by the capture's backlog, read between two clock reads.
+  The position is whole frames, so their end is known only to within a
+  frame and whatever the two reads leave open.  Only the frames that
+  certainly played inside the placed span are credited, at the most
+  energetic of their possible alignments; the uncertain slivers at either
+  end are charged.
+* A verified boundary is the end of measured frames, or two looks at closed
+  speakers with no sample-rate change event between them.  The events are
+  drained before each look's sample-rate read and again after it, so a
+  stream that comes and goes while the read takes its time is caught; an
+  event after the read is kept for the next look.  A quiet look vouches
+  only for the time up to 5 ms before it, where an event could still be on
+  its way.  The card's change events are required: without them nothing
+  between two looks is known, and the daemon never takes the lock.
+* The power budgets keep the power before the card's gain.  Each measured
+  frame counts at the most reduction it can have been converted at: any
+  value the controls held from 500 ms before it played (the reduction the
+  card applies, rounded up to its steps; after a failed write, anything
+  from the old value to the new one rounded up), the card's own safe level
+  from the moment the daemon's lease may have run out, and anything for the
+  controls' value before the daemon set one.  A reduction too deep to have
+  delivered a frame that loud did not convert it; a word is taken a step
+  above itself; nothing before the gain is louder than full scale.  A budget window that
+  cuts a step counts as much of the step's energy as full scale fits in
+  the part it covers.
+* Every renewal of the lock, including the one before the blocking sense
+  open, goes through the same decision: the account brought up to date,
+  then the hard limit, the reduction limit, the model's freshness and the
+  sense data's.  The check is made again after the renewal itself, which
+  can block, and a renewal that left the model behind is given up again.
 * A stream silent for 500 ms is closed and reopened.  Without a complete
-  period for longer than that, the daemon stops renewing the card's volume
-  lock, and the kernel drops the speakers to its safe level within 250 ms.
-  The lock is taken back after two complete periods in a row.
+  period for longer than that, the daemon gives the card's lock up (macaudio
+  locks the volume at once and stops streams converted at the old gain).
+  The lock is taken back after two complete periods in a row.  Any failure to
+  give the lock up is fatal: the exit gives it up too.
+
+Known costs of that rule, accepted on purpose:
+
+* A stream after idle is charged at full scale from the last look at closed
+  speakers to its first frames (the closed speakers are looked at every
+  25 ms, and opening the sense capture takes about 100 ms on the J700), and
+  the end of a stream from its last frames to the look that sees it closed.
+  On the J700 at 0 dB that is a few degrees on the coil model per stream.
+* A sense outage is charged at full scale at the least gain since the last
+  verified boundary until periods return, so the lock comes back later after
+  one than the speaker strictly needs.
+* For half a second after a gain change the budgets may count a frame at
+  the earlier, deeper reduction, which slows a budget's release.  After a
+  start in the middle of playback the samples still playing count as loud
+  as they can have been, a reduction of up to about 1 dB for a second or
+  two on the J700.
+* A frame of every period is charged at full scale (the position's
+  uncertainty): about 3 mW on the J700's coils.
+* After a start without a clean stop the budgets assume a minute of full
+  scale (up to about 7 dB on the J700, easing over the minute after the
+  start), and after a clean stop the time since it counts as full scale
+  before the gain.
+* The floor under every write (see above): 0.5 dB on a cold coil, rising
+  to 5 dB at 110 C.
 
 Exits are left for what the daemon cannot recover from (no card, a
-configuration error, a nonfinite model); the speakers are then at the card's
-safe level.  The unit restarts the daemon (`Restart=on-failure`, five
-attempts a minute), and the model state it writes once a second to
-`/run/speakerguardd/state` (`-s`), cooled by the time between the two runs,
-makes the new run start as hot as the old one stopped.  An unreadable state
-file is taken as a speaker at its working temperature limit.  These checks
-cannot make scheduling and ioctls atomic: a daemon that is late renewing the
-lock is covered by the kernel's 250 ms lock timeout, and the late time is
-charged to the model like any other gap.
+configuration error, a nonfinite model, a lock it cannot give up); the
+speakers are then at the card's safe level.  The unit restarts the daemon
+(`Restart=on-failure`, five attempts a minute).  A restart resumes the model
+only from the state a clean stop writes to `/run/speakerguardd/state`
+(`-s`): SIGTERM gives the lock up, waits out the 500 ms drain, accounts every
+moment and only then writes it, marked `released 1`, its coverage and its
+write named by one epoch.  It is resumed once: the run that resumes it
+overwrites it (or, failing that, removes it) before it can unlock, and does
+not unlock while it can do neither; the state is read only once the daemon
+holds the card's lock.  The time since it is charged at the card's safe
+level, and its two budget means are placed at full scale as late in their
+windows as the energy can have come.  The clock reads that pair the boot
+time with the daemon's own clock, at the final save and at the restore, are
+bounded: whatever time lies between them is charged once more at full scale
+and full gain.  Any other state (a crash, an older version's file, a state
+whose model trails its write) or none starts every speaker at its coil limit
+plus what the samples a dead run left queued can add, latched, so the card
+stays with the kernel until the model has cooled under its working ceiling
+(about 7 s on the J700).  A daemon that is late renewing the lock is covered by the kernel's
+250 ms lock timeout, and the late time is charged like any other.
+
+### Randomized interleavings
+
+`src/harness.rs` runs the real guard against a simulated world: streams of
+any length (shorter than a period too), a program before the card's gain,
+copy chunks converted at the gain the card really held and played through a
+queue of up to 341 ms, the lease in playing time, macaudio stopping old-gain
+streams when its lock goes, control writes that fail or land partly, rounded
+to their steps, sample-rate reads that fail or block, change events with
+latency, a capture that stalls, shortens or blocks on its position, a
+daemon descheduled between any two calls, pauses between paired clock reads,
+and restarts (clean, crashed, the state damaged, removed or rewritten as the
+old format).  An oracle written apart from the daemon integrates what was
+really played into its own thermal model and keeps the true power before
+the gain.  After every pass it asserts that the model is never cooler than
+the oracle's, that its budgets never hold less energy before the gain, that
+while the daemon holds the lease the card never applies less reduction than
+the true state needs, and that what cannot be proven ends with the card at
+its safe level (no lock without events, none after a failed rate read, no
+renewal blind past the limit, a latched start from anything but a clean
+stop).  Where macaudio stops old-gain audio promptly, it also asserts that
+the true coil never reaches its limit unless the daemon was held up
+(descheduled, blocked in a call or gone) for at least 85 ms, ending no
+longer before the crossing than the lease, a period and the stop.  That
+bound is the kernel's lease, not the daemon's, and the crossings it exempts
+are counted.  A safe write that fails falls back to the controls' minimum,
+as the daemon does.  Scenarios start cold
+or hot, at 16 kHz or at the J700's own 48 kHz and 4096 frames, with a prompt
+or a slow stop.  Failures shrink to a minimal scenario printed as Rust; each
+one it found is a test of its own.
+
+    cargo test --release harness                      # 200 cases
+    SPEAKERGUARDD_CASES=1000000 cargo test --release harness
 
 ### Relation to speakersafetyd
 
@@ -147,5 +298,19 @@ it never plays audio or performs a reboot.
 
 `-C <card id>` selects a card (by default the one the macaudio driver
 registered, never the AOP card that shares its `AppleJ` prefix), `-m <dB>`
-the reduction at which the card's safe level takes over, `-s <file>` the
-model state file (`-s ''` for none).
+the reduction at which the card's safe level takes over (the floor under
+every write is not counted against it, so on a warm coil a `-m` under about
+4.5 dB can be exceeded by the floor without a hand-off: more reduction, not
+less), `-s <file>` the
+model state file (`-s ''` for none).  `-V` prints the version and the
+source commit, which the daemon also logs when it starts (`make` takes the
+commit from git; a package sets `SPEAKERGUARDD_COMMIT`).
+
+The daemon writes the controls to the card's safe value at its start and
+before each unlock.  The card accepts that value while the volume is locked.
+Until the first unlock the speakers play at the card's safe level, as they
+do without the daemon, and an unlock never lets anything louder through.
+At the first ping the daemon reads the controls' range with the lock lifted
+and checks the card's safe level (the locked maximum against it) against
+`safe_reduction`.  A card that is louder there than the configuration says
+is never unlocked: the speakers stay at its safe level.

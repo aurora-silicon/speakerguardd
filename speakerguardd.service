@@ -1,9 +1,10 @@
 [Unit]
 Description=Speaker Protection Daemon (feed-forward)
 # Restarts are safe: until the daemon renews the card's volume lock the
-# speakers sit at the card's safe level, and a restarted daemon resumes the
-# previous run's thermal model from /run/speakerguardd/state.  A crash loop
-# gives up after five attempts and leaves the speakers at that level.
+# speakers sit at the card's safe level.  A restarted daemon resumes the
+# thermal model from /run/speakerguardd/state only after a clean stop, and
+# otherwise starts it at the coils' limit.  A crash loop gives up after five
+# attempts and leaves the speakers at that level.
 StartLimitIntervalSec=60
 StartLimitBurst=5
 
@@ -14,6 +15,13 @@ Type=simple
 # the speakers at its safe level until the daemon takes the volume lock.
 ExecStart=/usr/bin/speakerguardd -c /usr/share/speakerguardd --wait-for-card 30
 UMask=0066
+# Time the daemon is held up is bounded only by the card's 250 ms lease: run
+# ahead of normal tasks (below PipeWire's audio threads, 83-88), keep every
+# page resident (the daemon calls mlockall), and stop a runaway loop.
+CPUSchedulingPolicy=fifo
+CPUSchedulingPriority=50
+LimitMEMLOCK=64M
+LimitRTTIME=1s
 RuntimeDirectory=speakerguardd
 RuntimeDirectoryPreserve=yes
 Restart=on-failure
