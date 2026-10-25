@@ -376,10 +376,14 @@ hysteresis.  It differs only toward protection:
   at full volume it is 1.28 to 1.49 times; a line reading half doubles
   it.  The power is bounded from the first stretch R is over the bound
   and stays bounded until R reads under 0.9 of the least bound since
-  then, on program the card played (not at its safe level, whose words
+  the first fault, on program the card played (not at its safe level, whose words
   are the sense's noise).  The least bound: the bound rises with the
   model's coil, which the bounded line itself heats, and that must not
-  end the bound.  Nothing else clears it; a passage without bass is no
+  end the bound. Recovery clears the fault but retains that reference.
+  The model can still carry excess heat from the earlier bound, so its
+  higher temperature must not hide a second fault. This can keep the
+  detector more conservative after a recovery. Nothing else clears it;
+  a passage without bass is no
   evidence that the line reads again.  Only the logged verdict waits: at
   once from 1.25 times the bound, else after R has stayed over it for a
   second of program.  And over a period with at least 0.1 V rms and the
@@ -552,6 +556,29 @@ never reaches its limit.
 
     SPEAKERGUARDD_VI_CASES=100000 cargo test --release harness::vi
     SPEAKERGUARDD_VI_LONG=1 cargo test --release vi_long     # 120 x 120 s
+
+The recurrent-line tests in `src/harness/vi/recurrent.rs` keep the 768
+synthetic adversarial cases paired with each speaker's baseline peak.
+They include fault, recovery, another fault, control failures and changes
+between bass and treble. The late-mute witness preserves all 3,999 oracle
+and gain rows before 40 s, then mutes the tweeters and raises the woofer
+program over 60.25 to 65 s. Its early-mute control runs too. These controls
+and the long class assert each speaker's true V/I limit over every oracle
+sample, including after a low-line fault and during hand-offs. The cold
+burst/quiet engine test requires the deployed 0.3 V / 20 mA PF gate.
+
+The broad family pins both baseline and reviewed-parent peaks. It rejects
+new per-speaker limit crossings against baseline and higher peaks against
+the reviewed parent (0.02 K tolerance for the peak comparison, none for a
+limit crossing). The ordinary case 667 woofers must also stay within their
+baseline peaks. Some higher baseline-relative peaks already exist in the
+reviewed parent; they are retained, with their trajectories checked, rather
+than attributed to this fix. The existing partial-line and no-bass limit
+crossings remain unqualified. These are software tests only. Nonzero twin
+operation remains disabled and unqualified.
+
+    cargo test --offline --locked --release recurrent
+    cargo test --offline --locked --release cold_burst
 
 ### Relation to speakersafetyd
 
