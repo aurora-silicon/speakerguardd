@@ -3095,18 +3095,42 @@ pub(crate) mod tests {
     /// has cooled, instead of exiting for good.
     #[test]
     fn the_reduction_limit_clamps_instead_of_exiting_and_recovers() {
-        let cfg = j700();
-        let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
-        hw.level = Box::new(|t|if t<secs(2.0) {0.1} else {1.0}); // a full-scale square wave: 12.7 W
-        hw.playing = Box::new(|t| t < secs(10.0));
-        hw.reduction_limit = 6.0;
-        let mut g = Guard::start(&mut hw, &cfg, 6.0, tmp_state()).unwrap();
-        run_until(&mut g, &mut hw, secs(60.0)).expect("the reduction limit must not end the daemon");
-        assert!(!hw.lapses.is_empty(), "the limit handed the card to the kernel");
-        assert!(hw.unlocked_at(hw.t), "the lock is taken back once cool");
+        // A declared reference card with the original thermal constants and
+        // node limits. FF authority is in path; the V/I scalar guard can still
+        // demand more reduction than an actuator provides.
+        let mut cfg=j700();
+        cfg.globals.channels=4;cfg.globals.safe_reduction=100.0;
+        cfg.globals.amp_gain_dbv=14.5;
+        cfg.globals.governor=Governor::Unified;cfg.globals.guard=Some(Governor::Asahi);
+        cfg.playback_cards=vec!["ReferenceVI".into()];
+        for (k,sp) in cfg.speakers.iter_mut().enumerate() {
+            sp.is_chan=Some(k+2);sp.is_scale=sp.vs_scale/sp.z_nominal;
+        }
+        let mut hw=FakeHw::per_speaker(&cfg);hw.enable_gate(&cfg);
+        hw.level=Box::new(|_|1.0);
+        hw.playing=Box::new(|t|t<secs(8.0));hw.reduction_limit=6.0;
+        let mut g=Guard::start(&mut hw,&cfg,6.0,Some(vi_state(&cfg,50.0,50.0))).unwrap();
+        g.start_trace(&hw);
+        while hw.t<secs(60.0) {
+            g.tick(&mut hw).expect("range exhaustion must not end the daemon");
+            assert!(g.speakers.iter().all(|sp|sp.t_peak<=sp.spec.t_limit+1e-6));
+        }
+        assert!(!hw.lapses.is_empty(),"the limit handed the card to the kernel");
+        assert!(g.trace.as_ref().unwrap().iter().any(|(_,e)|matches!(e,Trace::Permit(false,why) if why.contains("volume control range"))));
+        assert!(hw.unlocked_at(hw.t),"the lock is taken back once cool");
         let handed_off=*hw.lapses.last().unwrap();
         let recovered=hw.writes.iter().find(|(at,_)|*at>handed_off).expect("no recovery target");
         assert!(recovered.1<6.0-3.0+1e-9,"first recovery target {} dB",recovered.1);
+    }
+
+    #[test]
+    fn a_narrow_legacy_range_cannot_bypass_the_conservative_onset_floor() {
+        let cfg=j700();let mut hw=FakeHw::new(cfg.globals.channels,cfg.globals.period);
+        hw.level=Box::new(|_|1.0);hw.playing=Box::new(|t|t<secs(8.0));hw.reduction_limit=6.0;
+        let mut g=Guard::start(&mut hw,&cfg,6.0,tmp_state()).unwrap();
+        run_until(&mut g,&mut hw,secs(60.0)).unwrap();
+        assert!(hw.pings.is_empty(),"unrepresentable legacy onset acquired a lease");
+        assert!(!hw.unlocked_at(hw.t));
     }
 
     /// One complete period after an outage is not enough to take the lock
