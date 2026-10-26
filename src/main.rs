@@ -135,6 +135,10 @@ fn usage() -> ! {
 }
 
 fn parse_args() -> Args {
+    parse_args_from(std::env::args().skip(1))
+}
+
+fn parse_args_from(arguments: impl IntoIterator<Item = String>) -> Args {
     let mut args = Args {
         config_path: PathBuf::from("/usr/share/speakerguardd"),
         max_reduction: None,
@@ -159,7 +163,7 @@ fn parse_args() -> Args {
         gain_db: 0.0,
         csv: None,
     };
-    let mut it = std::env::args().skip(1);
+    let mut it = arguments.into_iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "-c" | "--config-path" => args.config_path = PathBuf::from(it.next().unwrap_or_else(|| usage())),
@@ -690,30 +694,50 @@ mod tests {
     use super::*;
 
     fn args(conf: &std::path::Path) -> Args {
-        Args {
-            config_path: conf.to_path_buf(),
-            max_reduction: None,
-            card: None,
-            card_wait: Duration::ZERO,
-            state: None,
-            persist: None,
-            persist_off: false,
-            verbosity: Level::Info,
-            shadow: false,
-            governor: None,
-            guard: None,
-            horizon: None,
-            ctrl_headroom: None,
-            unified_caps: false,
-            experimental_unified: false,
-            allow_unqualified: false,
-            record: None,
-            record_max_mb: 0,
-            replay: None,
-            model: None,
-            gain_db: 0.0,
-            csv: None,
+        let mut args = parse_args_from([]);
+        args.config_path = conf.to_path_buf();
+        args
+    }
+
+    #[test]
+    fn packaged_policy_is_the_default_and_useful_overrides_remain() {
+        let defaults = parse_args_from([]);
+        assert_eq!(defaults.config_path, PathBuf::from("/usr/share/speakerguardd"));
+        assert!(defaults.card.is_none());
+        assert_eq!(defaults.card_wait, Duration::from_secs(30));
+        assert!(!defaults.allow_unqualified);
+        assert!(!defaults.shadow && defaults.record.is_none());
+        for text in [include_str!("../conf/apple/j316.conf"),
+                     include_str!("../conf/apple/j413.conf"),
+                     include_str!("../conf/apple/j616.conf")] {
+            let mut cfg = Config::parse(text).unwrap();
+            assert!(override_config(&mut cfg, &defaults).is_err());
+            assert_eq!(cfg.globals.governor, Governor::Unified);
+            assert_eq!(cfg.globals.guard, Some(Governor::Asahi));
+            assert!(!cfg.globals.qualified);
+            // The opt-in does not need duplicate governor/guard switches.
+            let allowed = parse_args_from(["--allow-unqualified".to_string()]);
+            override_config(&mut cfg, &allowed).unwrap();
+            assert_eq!(cfg.globals.governor, Governor::Unified);
+            assert_eq!(cfg.globals.guard, Some(Governor::Asahi));
+            assert!(!cfg.globals.qualified);
+            // Existing units and deliberate alternative governors still work.
+            let old = parse_args_from(["--allow-unqualified", "--governor", "unified",
+                "--guard", "asahi", "--shadow", "--record", "/tmp/example.rec3"]
+                .map(str::to_string));
+            override_config(&mut cfg, &old).unwrap();
+            assert!(cfg.globals.shadow);
+            assert_eq!(old.record, Some(PathBuf::from("/tmp/example.rec3")));
+            let legacy = parse_args_from(["--allow-unqualified", "--governor", "legacy",
+                "--guard", "none"].map(str::to_string));
+            override_config(&mut cfg, &legacy).unwrap();
+            assert_eq!(cfg.globals.governor, Governor::Legacy);
+            assert_eq!(cfg.globals.guard, None);
         }
+        let mut neo = Config::parse(include_str!("../conf/apple/j700.conf")).unwrap();
+        override_config(&mut neo, &defaults).unwrap();
+        assert_eq!(neo.globals.governor, Governor::Legacy);
+        assert_eq!(neo.globals.guard, None);
     }
 
     #[test]

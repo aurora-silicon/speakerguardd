@@ -20,7 +20,9 @@ Type=simple
 # Boot-target and PCM udev activation can precede ALSA card discovery.
 # Wait inside the daemon before touching the interlock; the kernel keeps
 # the speakers at its safe level until the daemon takes the volume lock.
-ExecStart=/usr/bin/speakerguardd -c /usr/share/speakerguardd --wait-for-card 30
+# Packaged per-device policy and bounded card discovery are the defaults.
+# Deliberate CLI overrides remain available in a local drop-in.
+ExecStart=/usr/bin/speakerguardd
 UMask=0066
 RuntimeDirectory=speakerguardd
 RuntimeDirectoryPreserve=yes

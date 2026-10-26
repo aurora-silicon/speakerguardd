@@ -734,7 +734,15 @@ it never plays audio or performs a reboot.
 
 ### Running by hand
 
-    speakerguardd -c /usr/share/speakerguardd -v
+    speakerguardd -v
+
+The default data directory is `/usr/share/speakerguardd`. The macaudio card
+ID comes from the device tree through ALSA (`AppleJ413` selects
+`apple/j413.conf`); that packaged file selects the governor, guard and
+qualification state. A plain `speakerguardd` uses those choices and waits
+up to 30 seconds for discovery. Unqualified profiles still require the
+deliberate `--allow-unqualified` opt-in. The packaged unit omits redundant
+default arguments; local units may continue to use them.
 
 `-C <card id>` selects a card (by default the one the macaudio driver
 registered, never the AOP card that shares its `AppleJ` prefix), `-m <dB>`
