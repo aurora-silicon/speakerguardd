@@ -714,12 +714,16 @@ impl<'a> ViWorld<'a> {
         let digital = self.gate.as_ref().map_or(1.0,|g|g.ratio(n,k));
         let a = level * digital * 10f64.powf(-gain / 20.0) * self.vpk;
         let freq = recurrent::frequency(tau, s.freq);
+        let analogue=10f64.powf(-gain/20.0);
         if freq == 0.0 {
-            let v = if n % 2 == 0 { a } else { -a };
+            let v = self.gate.as_ref().map_or_else(||if n%2==0 {a} else {-a},
+                |q|f64::from(q.sample(n,k))/2147483648.0*self.vpk*analogue);
             (v, v / self.z[k])
         } else {
             let x = 2.0 * PI * freq * tau;
-            (a * x.sin(), a / self.z[k] * (x - self.phi[k]).sin())
+            let v=self.gate.as_ref().map_or(a*x.sin(),|q|
+                f64::from(q.sample(n,k))/2147483648.0*self.vpk*analogue);
+            (v, a / self.z[k] * (x - self.phi[k]).sin())
         }
     }
 
@@ -1503,7 +1507,7 @@ fn run_internal(sc:&ViScenario,seed:u64,use_gate:bool)->Result<Outcome,Violation
         for (k,s) in cfg.speakers.iter().enumerate(){for(j,model)in[(VI,"vi"),(FFR,"ff")] {
             let(c,m)=a[k][j].peaks();rows.push(super::continuous::Row{speaker:s.name.clone(),model,active:j==VI||cfg.globals.governor==Governor::Unified,limit:s.t_limit,coil:c,magnet:m});
         }}
-        super::continuous::record(seed,sc.to_rust(),if sc.j413{"j413"}else{"j316"},rows,result.as_ref().err().map(|e|e.0.clone()),out.handoffs as u64);
+        super::continuous::record(seed,sc.to_rust(),if sc.j413{"j413"}else{"j316"},rows,result.as_ref().err().map(|e|e.0.clone()),out.handoffs as u64,w.gate.is_some());
     }
     let _ = std::fs::remove_dir_all(path.parent().unwrap());
     out.true_vi_peaks = w.oracle.vi_peaks;

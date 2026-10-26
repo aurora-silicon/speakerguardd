@@ -116,6 +116,7 @@ struct Case {
     rows: Vec<Row>,
     error: Option<String>,
     handoffs: u64,
+    gated: bool,
 }
 fn id(s: &str) -> u64 {
     s.bytes().fold(14695981039346656037, |h, b| {
@@ -129,6 +130,7 @@ pub(super) fn record(
     rows: Vec<Row>,
     error: Option<String>,
     handoffs: u64,
+    gated: bool,
 ) {
     LAST.with(|x| {
         *x.borrow_mut() = Some(Case {
@@ -139,6 +141,7 @@ pub(super) fn record(
             rows,
             error,
             handoffs,
+            gated,
         })
     });
 }
@@ -285,7 +288,7 @@ fn campaign(full: bool) {
     let mut csv = std::env::var_os("PAIR_METRICS")
         .map(|p| std::io::BufWriter::new(std::fs::File::create(p).unwrap()));
     if let Some(f) = csv.as_mut() {
-        writeln!(f,"kind,seed,scenario,profile,thermal,active,speaker,properties_pass,handoffs,limit_c,coil_c,magnet_c,error").unwrap();
+        writeln!(f,"kind,seed,scenario,profile,thermal,active,speaker,properties_pass,handoffs,limit_c,coil_c,magnet_c,error,gate_in_loop").unwrap();
     }
     for c in &cases {
         let r = refs
@@ -307,7 +310,7 @@ fn campaign(full: bool) {
             if let Some(f) = csv.as_mut() {
                 writeln!(
                     f,
-                    "{},{},{},{},{},{},{},{},{},{:.12},{:.12},{:.12},{}",
+                    "{},{},{},{},{},{},{},{},{},{:.12},{:.12},{:.12},{},{}",
                     c.kind,
                     c.seed,
                     c.input,
@@ -323,7 +326,8 @@ fn campaign(full: bool) {
                     c.error
                         .as_deref()
                         .unwrap_or("")
-                        .replace([',', '\n', '\r'], ";")
+                        .replace([',', '\n', '\r'], ";"),
+                    c.gated
                 )
                 .unwrap();
             }
@@ -341,6 +345,7 @@ fn campaign(full: bool) {
         rows,
         failures.len()
     );
+    eprintln!("GATE_PATH cases={} fallback={}",cases.iter().filter(|c|c.gated).count(),cases.iter().filter(|c|!c.gated).count());
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 #[test]

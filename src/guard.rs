@@ -1743,7 +1743,7 @@ impl Guard {
             // same decision as every renewal (a fault the charge above just
             // found hands the card off instead).  The time is charged all
             // the same.
-            if self.armed {
+            if self.armed || self.playback.is_some() {
                 self.decide(hw, true)?;
             }
             let opened = hw.open_sense(rate);
@@ -1907,7 +1907,8 @@ impl Guard {
     /// again after anything that may block).
     fn fresh_enough(&self, now: Instant) -> bool {
         if self.playback.is_some() {
-            return now.saturating_duration_since(self.account_to)<KERNEL_LOCK_TIMEOUT;
+            return now.saturating_duration_since(self.account_to)<KERNEL_LOCK_TIMEOUT
+                && !(self.playing && self.overdue(now)>BLIND_LIMIT);
         }
         let allowed = Duration::from_secs_f64(self.dt.unwrap_or(0.0)) + BLIND_SLACK;
         now.saturating_duration_since(self.account_to) <= allowed && !(self.playing && self.overdue(now) > BLIND_LIMIT)

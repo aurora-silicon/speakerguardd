@@ -445,7 +445,10 @@ impl DescriptorQueue {
                 self.rows.push_back(Rendered {
                     start: self.next,
                     words: output,
-                    original: input,
+                    original: input
+                        .into_iter()
+                        .map(|x| self.gate.normalized_input(x))
+                        .collect(),
                 });
                 self.next += self.gate.frames as u64;
                 self.active.push_back((self.next, ticket));
@@ -475,7 +478,8 @@ impl DescriptorQueue {
             .unwrap();
         let i = (n - r.start) as usize * self.gate.channels + physical;
         if r.original[i] == 0 {
-            0.0
+            assert_eq!(r.words[i], 0);
+            1.0 // no additional attenuation of an already-zero PCM word
         } else {
             f64::from(r.words[i]) / f64::from(r.original[i])
         }
@@ -660,6 +664,30 @@ fn pcm_epochs_start_on_the_same_grid_as_the_sample_oracle() {
             let after = t + 0.25 / f64::from(rate);
             assert_eq!(DescriptorQueue::first_frame(after, rate), n + 1);
             assert_eq!(DescriptorQueue::frame_at(after, rate), n);
+        }
+    }
+}
+
+#[test]
+fn a_unity_j616_grant_adds_no_attenuation_to_its_native_pcm_words() {
+    let cfg = Config::parse(include_str!("../conf/apple/j616.conf")).unwrap();
+    let mut q = DescriptorQueue::new(&cfg, 48000, 64, 1_000_000_000);
+    q.gate.owner(true, q.ns(0.0)).unwrap();
+    let s = q.gate.status(q.ns(0.0)).unwrap();
+    q.gate
+        .write(
+            &s.grant(
+                &vec![1 << 40; s.speakers],
+                &vec![crate::playback::UNITY; s.speakers],
+            )
+            .unwrap(),
+            q.ns(0.0),
+        )
+        .unwrap();
+    q.advance(0.0, |n, k| 0.031 + (n + 4 * k as u64) as f64 * 0.00000137);
+    for n in 0..64 {
+        for k in 0..cfg.speakers.len() {
+            assert_eq!(q.ratio(n, k), 1.0);
         }
     }
 }
