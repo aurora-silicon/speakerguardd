@@ -1806,10 +1806,12 @@ impl Guard {
         // A renewal can follow a blocking write only while the account is
         // this fresh. Reserve that delay as well as a full new lease.
         let lease_s = KERNEL_LOCK_TIMEOUT.as_secs_f64() + self.dt.unwrap_or(0.0) + BLIND_SLACK.as_secs_f64();
-        let Some(e) = self.engine.as_ref().filter(|e| e.asahi.is_some()) else { return true };
-        // Keep PR #12's V/I reserve, including when legacy governs. The
-        // legacy model needs its own FF reserve in addition to that bound.
-        let mut onset = e.onset_reductions(self.governing, &pending, pending_s, lease_s);
+        // A legacy-only profile has no V/I engine. It still needs the
+        // pending-output and lease bound of its own feed-forward model.
+        // Keep PR #12's V/I reserve as well whenever that model exists.
+        let mut onset = self.engine.as_ref().filter(|e| e.asahi.is_some())
+            .map_or_else(|| vec![0.0; per.len()], |e|
+                e.onset_reductions(self.governing, &pending, pending_s, lease_s));
         if self.governing == Governor::Legacy {
             for (k, s) in self.speakers.iter().enumerate() {
                 let mut th = crate::engine::Thermal::new(
@@ -4109,6 +4111,21 @@ pub(crate) mod tests {
     fn vi_worst(cfg: &Config, k: usize, db: f64) -> f64 {
         let v = crate::engine::v_worst(&cfg.speakers[k], &cfg.globals) * 10f64.powf(-db / 20.0);
         v * v / cfg.speakers[k].z_nominal.min(cfg.speakers[k].r_ff)
+    }
+
+    #[test]
+    fn legacy_only_onset_is_bounded_without_a_vi_engine() {
+        let cfg = j700();
+        let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
+        let mut g = Guard::start(&mut hw, &cfg, cfg.globals.max_reduction, tmp_state()).unwrap();
+        assert!(g.engine.is_none());
+        for speaker in &mut g.speakers {
+            speaker.t_coil = speaker.spec.t_limit - speaker.spec.t_headroom - 0.1;
+            speaker.t_magnet = speaker.t_coil;
+        }
+        let mut per = vec![0.0; cfg.speakers.len()];
+        let _ = g.bound_onset(hw.now(), &mut per);
+        assert!(per.iter().all(|r| *r > 0.0), "legacy onset reserve was skipped: {per:?}");
     }
 
     /// The V/I path end to end: a quiet program, per-speaker controls.
