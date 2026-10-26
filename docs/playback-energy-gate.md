@@ -56,7 +56,7 @@ provably below the safe hardware cap. Possible partial playback is never refunde
 
 ## Energy and thermal proof
 
-Counters use Q30 normalized frames at a fixed reference rate of 48000 Hz;
+Counters use Q20 normalized frames at a fixed reference rate of 48000 Hz;
 rate epochs never reinterpret lifetime totals. S16_LE, S24_LE-in-32 and S32_LE
 are normalized separately; output quantization goes toward zero before billing.
 Transfer 1 meters squared amplitude and needs a complete certified energy norm.
@@ -109,6 +109,20 @@ never labelled captured sense measurements. The reader retains format 3 support.
 A sense-only replay explicitly refuses certification for a ledger-governed run
 until the immutable programme and gate can be reconstructed. This preserves the
 record/replay flags without claiming an unsupported equivalence result.
+
+## Version 2 units and residual state
+
+The unshipped ABI is now version 2 with Q20 normalized units. Ten years of
+continuous full-scale input fit in the lifetime counters; Q30 could naturally
+saturate within days. Per-sample billing still rounds upward and grants down.
+
+The final 24 bytes carry immutable per-speaker `tail_us` bounds: residual
+energy expressed as full-input-power-equivalent microseconds. Every grant,
+power window and temperature projection reserves that debt. A qualified bound
+must cover arbitrary prior input and allowed route/rate/gain/clock transitions,
+including DSP state populated by safe-cached raw data before DVC. Ticket refunds
+cannot erase that state. Unknown tails remain unqualified; the actual TAS
+helpers still return NONE. No coefficients or bounds are guessed.
 
 ## Required acceptance
 

@@ -207,7 +207,8 @@ impl PlaybackModel {
             }
             let driver = &mut self.drivers[k];
             let e = playback::joules(energy, driver.full);
-            let pending = playback::joules(status.submitted[k] - status.completed[k], driver.full);
+            let pending = playback::joules(status.submitted[k] - status.completed[k], driver.full)
+                + playback::tail_joules(status.tail_us[k], driver.full);
             let fp = driver.ff.hold(driver.safe, dt, self.cfg.globals.t_ambient);
             let impulse = driver.ff.impulse(e);
             let mut ff = driver.ff.clone();
@@ -330,7 +331,7 @@ impl PlaybackModel {
                 Debt {
                     queued: pending,
                     unspent: 0.0,
-                    downstream_tail: 0.0,
+                    downstream_tail: playback::tail_joules(self.last.tail_us[k], d.full),
                 },
             ) else {
                 return Ok(None);
@@ -339,7 +340,12 @@ impl PlaybackModel {
                 if limit > 0.0 {
                     let past =
                         Self::window(&self.delivered, self.last.clock_ns, k, seconds, d.full);
-                    room = room.min((limit - d.safe) * seconds - past - pending);
+                    room = room.min(
+                        (limit - d.safe) * seconds
+                            - past
+                            - pending
+                            - playback::tail_joules(self.last.tail_us[k], d.full),
+                    );
                 }
             }
             if !(room.is_finite() && room > 0.0) {
@@ -429,6 +435,41 @@ impl PlaybackModel {
 mod tests {
     use super::*;
     use crate::gate_sim::KernelGate;
+    #[test]
+    fn residual_state_debt_reduces_grants_and_can_refuse_them() {
+        let cfg = Config::parse(include_str!("../conf/apple/j413.conf")).unwrap();
+        let model = |tail_us| {
+            let mut gate = KernelGate::with_tail(&cfg, 48000, 64, tail_us);
+            gate.start(1).unwrap();
+            gate.owner(true, 1).unwrap();
+            let states = cfg
+                .speakers
+                .iter()
+                .cloned()
+                .map(|s| SpeakerState::with_globals(s, &cfg.globals))
+                .collect::<Vec<_>>();
+            let engine = Engine::new(&cfg, true);
+            PlaybackModel::new(
+                &cfg,
+                &states,
+                engine.as_ref(),
+                Instant::now(),
+                gate.status(1).unwrap(),
+            )
+            .unwrap()
+        };
+        let no_tail = model(0);
+        let with_tail = model(1000);
+        let before = Snapshot::decode(no_tail.packet().unwrap().unwrap()).unwrap();
+        let after = Snapshot::decode(with_tail.packet().unwrap().unwrap()).unwrap();
+        let expected = 48u64 * (1u64 << playback::UNIT_SHIFT);
+        for k in 0..cfg.speakers.len() {
+            assert!(before.ceiling[k] > after.ceiling[k]);
+            assert!(before.ceiling[k].abs_diff(after.ceiling[k] + expected) <= 2);
+        }
+        assert!(model(10_000_000).packet().unwrap().is_none());
+    }
+
     #[test]
     fn unsupported_live_routes_keep_conservative_source_budgets() {
         let cfg = Config::parse(include_str!("../conf/apple/j413.conf")).unwrap();

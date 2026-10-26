@@ -111,7 +111,7 @@ pub fn additional_joules(models: &[Constraint<'_>], debt: Debt) -> Result<f64, R
     }
 }
 
-/// Convert joules to the kernel prototype's Q30-squared-frame units,
+/// Convert joules to the kernel prototype's Q20-normalized-frame units,
 /// rounding DOWN. Rate, voltage/load bound and counters belong to one epoch.
 /// Lifetime counters travel as integers; never convert the total to f64.
 pub fn cumulative_ceiling(
@@ -130,7 +130,7 @@ pub fn cumulative_ceiling(
     }
     // Keep conversions far from f64's ambiguous u64 endpoint and below its
     // exact integer range. One grant may be at most 2^52 normalized units.
-    let units = joules / watts_full_scale * f64::from(rate) * (1u64 << 30) as f64;
+    let units = joules / watts_full_scale * f64::from(rate) * crate::playback::UNIT_SCALE;
     if !units.is_finite() || !(0.0..=(1u64 << 52) as f64).contains(&units) {
         return Err(Refusal::InvalidLedger);
     }
@@ -288,7 +288,9 @@ mod tests {
             let joules = f64::from(n) / 12345.0;
             let total = cumulative_ceiling(u64::MAX - (1u64 << 50), joules, watts, rate).unwrap();
             let credit = total - (u64::MAX - (1u64 << 50));
-            assert!((credit as f64 / (1u64 << 30) as f64 / f64::from(rate)) * watts <= joules);
+            assert!(
+                (credit as f64 / crate::playback::UNIT_SCALE / f64::from(rate)) * watts <= joules
+            );
         }
         assert_eq!(
             cumulative_ceiling(u64::MAX, 1.0, watts, rate),
@@ -402,7 +404,7 @@ mod tests {
                     Err(error) => panic!("{} {}: {error:?}", path.display(), speaker.name),
                 };
                 let cap = cumulative_ceiling(0, credit, full, 48000).unwrap();
-                let actual = cap as f64 / (1u64 << 30) as f64 / 48000.0 * full;
+                let actual = cap as f64 / crate::playback::UNIT_SCALE / 48000.0 * full;
                 assert!(actual <= credit);
                 if unsafe_tail {
                     // This contract must never be activated. Preserve the

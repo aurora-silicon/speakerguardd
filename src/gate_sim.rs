@@ -17,8 +17,17 @@ use std::{
 };
 
 struct Api {
-    new:
-        unsafe extern "C" fn(u32, u32, u32, u32, u32, u32, u32, *const libc::c_char) -> *mut c_void,
+    new: unsafe extern "C" fn(
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *const libc::c_char,
+    ) -> *mut c_void,
     free: unsafe extern "C" fn(*mut c_void),
     owner: unsafe extern "C" fn(*mut c_void, libc::c_int, u64) -> libc::c_int,
     snapshot: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) -> libc::c_int,
@@ -78,6 +87,7 @@ fn api() -> &'static Api {
                 new: symbol!(
                     "ag_new",
                     unsafe extern "C" fn(
+                        u32,
                         u32,
                         u32,
                         u32,
@@ -155,6 +165,9 @@ pub struct KernelGate {
 
 impl KernelGate {
     pub fn new(cfg: &Config, rate: u32, frames: usize) -> Self {
+        Self::with_tail(cfg, rate, frames, 0)
+    }
+    pub fn with_tail(cfg: &Config, rate: u32, frames: usize, tail_us: u32) -> Self {
         let card = CString::new(
             cfg.playback_cards
                 .first()
@@ -183,6 +196,7 @@ impl KernelGate {
                 transfer,
                 (cfg.globals.amp_gain_dbv * 1000.0).round() as u32,
                 safe,
+                tail_us,
                 card.as_ptr(),
             )
         };
@@ -769,7 +783,7 @@ fn listening_meter_includes_the_kernel_clamp_and_safe_floor() {
     q.gate
         .write(
             &s.grant(
-                &vec![16 * (1 << 28); s.speakers],
+                &vec![16 * (1 << (crate::playback::UNIT_SHIFT - 2)); s.speakers],
                 &vec![crate::playback::UNITY; s.speakers],
             )
             .unwrap(),

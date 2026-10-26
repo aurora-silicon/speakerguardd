@@ -5,9 +5,11 @@
 use std::io;
 
 pub const BYTES: usize = 512;
+pub const VERSION: u32 = 2;
+pub const UNIT_SHIFT: u32 = 20;
 pub const SPEAKERS: usize = 6;
 pub const UNIT_RATE: f64 = 48000.0;
-pub const UNIT_SCALE: f64 = (1u64 << 30) as f64;
+pub const UNIT_SCALE: f64 = (1u64 << UNIT_SHIFT) as f64;
 pub const UNITY: u32 = 1 << 31;
 pub const AVAILABLE: u32 = 1;
 pub const CONFIGURED: u32 = 2;
@@ -61,18 +63,22 @@ pub struct Snapshot {
     pub unbudgeted: [u64; SPEAKERS],
     pub ceiling: [u64; SPEAKERS],
     pub gains: [u32; SPEAKERS],
+    pub tail_us: [u32; SPEAKERS],
     pub card: String,
 }
 
 impl Snapshot {
     pub fn decode(wire: [u8; BYTES]) -> io::Result<Self> {
-        if get32(&wire, 0) != 1 || wire[488..].iter().any(|&b| b != 0) {
+        if get32(&wire, 0) != VERSION {
             return Err(invalid());
         }
         let end = wire[456..488]
             .iter()
             .position(|&b| b == 0)
             .ok_or_else(invalid)?;
+        if wire[456 + end..488].iter().any(|b| *b != 0) {
+            return Err(invalid());
+        }
         let card = std::str::from_utf8(&wire[456..456 + end])
             .map_err(|_| invalid())?
             .to_owned();
@@ -104,6 +110,7 @@ impl Snapshot {
             unbudgeted: a64(336),
             ceiling: a64(384),
             gains: a32(432),
+            tail_us: a32(488),
             card,
             wire,
             order: std::array::from_fn(|k| k),
@@ -171,7 +178,8 @@ impl Snapshot {
             refunded,
             unbudgeted,
             ceiling,
-            gains
+            gains,
+            tail_us
         );
         self.order = order;
         Ok(self)
@@ -235,7 +243,7 @@ mod tests {
     use super::*;
     fn receipt() -> Snapshot {
         let mut wire = [0u8; BYTES];
-        put32(&mut wire, 0, 1);
+        put32(&mut wire, 0, VERSION);
         put32(
             &mut wire,
             4,
@@ -310,7 +318,7 @@ mod tests {
     #[test]
     fn corrupt_receipts_are_errors_instead_of_empty_energy() {
         let s = receipt();
-        for at in [0, 4, 488] {
+        for at in [0, 4, 487] {
             let mut wire = s.wire;
             wire[at] = 0xff;
             assert!(Snapshot::decode(wire).is_err());
@@ -323,4 +331,11 @@ mod tests {
         put64(&mut wire, 32, 1);
         assert!(Snapshot::decode(wire).is_err());
     }
+}
+
+/// Residual DSP/load energy in full-input-power-equivalent microseconds.
+/// The producer must round its qualified bound upward; this conversion does too.
+pub fn tail_joules(microseconds: u32, watts: f64) -> f64 {
+    watts * f64::from(microseconds) * 1e-6 * (1.0 + 1e-12)
+        + if microseconds > 0 { 1e-15 } else { 0.0 }
 }
