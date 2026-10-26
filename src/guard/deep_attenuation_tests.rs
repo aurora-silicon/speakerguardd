@@ -89,3 +89,29 @@ fn a_failed_deep_write_still_hands_the_card_back() {
     assert!((0..hw.per.len()).all(|k| hw.effective_of(k) >= hw.safe));
     let _ = std::fs::remove_file(path);
 }
+
+#[test]
+fn a_late_wakeup_measures_retained_periods_before_charging_uncertainty() {
+    let cfg = tests::j413();
+    let mut hw = FakeHw::per_speaker(&cfg);
+    hw.level = Box::new(|_| 0.0);
+    let path = vi_state(&cfg, 55.0, 52.0);
+    let mut g = Guard::start(&mut hw, &cfg, 7.0, Some(path.clone())).unwrap();
+    run_until(&mut g, &mut hw, Duration::from_secs(2)).unwrap();
+    g.decide(&mut hw, true).unwrap();
+    assert!(g.armed());
+    g.start_trace(&hw);
+    let relinquished = hw.relinquished;
+    let before = hw.delivered;
+    hw.sleep(Duration::from_millis(210));
+    g.tick(&mut hw).unwrap();
+    assert!(hw.delivered >= before + 2, "did not drain the retained backlog");
+    assert!(g.armed() && hw.unlocked_at(hw.t));
+    assert_eq!(hw.relinquished, relinquished);
+    let charged: f64 = g.trace.as_ref().unwrap().iter().filter_map(|(_, t)| match t {
+        Trace::Account(a, b, Accounted::Charged) => Some((*b - *a).as_secs_f64()),
+        _ => None,
+    }).sum();
+    assert!(charged < 0.001, "charged {charged} s despite retained measurements");
+    let _ = std::fs::remove_file(path);
+}

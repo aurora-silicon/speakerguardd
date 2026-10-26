@@ -1465,87 +1465,105 @@ impl Guard {
                 }
             }
         }
-        let mut words = std::mem::take(&mut self.words);
-        let read = hw.read_period(&mut words);
-        self.words = words;
-        match read {
-            Ok(Some(true)) => {
-                let before = hw.now();
-                let queued = match hw.queued() {
-                    Ok(q) => q,
-                    Err(e) => {
-                        // without its position the period cannot be placed
-                        warn!("sense capture position: {e}; period discarded");
-                        let errno = e.raw_os_error().unwrap_or(libc::EIO);
-                        rec_now(&mut self.rec, hw, |r, t| r.loss(t, record::LOSS_POSITION, errno));
-                        self.fresh = 0;
-                        self.good_since_bad = 0;
+        let drain_deadline = hw.now() + Duration::from_millis(10);
+        let mut drained = 0;
+        loop {
+            let mut words = std::mem::take(&mut self.words);
+            let read = hw.read_period(&mut words);
+            self.words = words;
+            match read {
+                Ok(Some(true)) => {
+                    let before = hw.now();
+                    let queued = match hw.queued() {
+                        Ok(q) => q,
+                        Err(e) => {
+                            // without its position the period cannot be placed
+                            warn!("sense capture position: {e}; period discarded");
+                            let errno = e.raw_os_error().unwrap_or(libc::EIO);
+                            rec_now(&mut self.rec, hw, |r, t| r.loss(t, record::LOSS_POSITION, errno));
+                            self.fresh = 0;
+                            self.good_since_bad = 0;
+                            return self.maintain(hw);
+                        }
+                    };
+                    let after = hw.now();
+                    self.stall.as_mut().unwrap().data();
+                    // the latest the frames can end (bad data is charged to it)
+                    let end = after.checked_sub(Duration::from_secs_f64(queued as f64 / rate as f64)).unwrap_or(after);
+                    let read_at = if self.rec.is_some() { hw.boottime() } else { Duration::ZERO };
+                    let start = end.checked_sub(Duration::from_secs_f64(dt)).unwrap_or(end);
+                    if let Err(why) = self.check_sense(globals.period) {
+                        if self.rec.is_some() {
+                            // what the card may have applied over it
+                            let (_, most) = self.held();
+                            let applied = self.applied_over(start, &most);
+                            rec_do(&mut self.rec, read_at, |r, t| r.period(t, queued, rate, false, &applied, &self.words));
+                        }
+                        // uncovered time: charged at full scale up to the
+                        // period's end, never measured; the period does not
+                        // count as seen
+                        self.charge(end)?;
+                        self.bad_sense(hw, &why)?;
                         return self.maintain(hw);
                     }
-                };
-                let after = hw.now();
-                self.stall.as_mut().unwrap().data();
-                // the latest the frames can end (bad data is charged to it)
-                let end = after.checked_sub(Duration::from_secs_f64(queued as f64 / rate as f64)).unwrap_or(after);
-                let read_at = if self.rec.is_some() { hw.boottime() } else { Duration::ZERO };
-                let start = end.checked_sub(Duration::from_secs_f64(dt)).unwrap_or(end);
-                if let Err(why) = self.check_sense(globals.period) {
-                    if self.rec.is_some() {
-                        // what the card may have applied over it
-                        let (_, most) = self.held();
-                        let applied = self.applied_over(start, &most);
-                        rec_do(&mut self.rec, read_at, |r, t| r.period(t, queued, rate, false, &applied, &self.words));
+                    self.bad_data = false;
+                    self.good_since_bad = self.good_since_bad.saturating_add(1);
+                    if self.good_since_bad >= REARM_PERIODS {
+                        self.recovering = false;
                     }
-                    // uncovered time: charged at full scale up to the
-                    // period's end, never measured; the period does not
-                    // count as seen
-                    self.charge(end)?;
-                    self.bad_sense(hw, &why)?;
-                    return self.maintain(hw);
+                    self.place(before, after, queued, globals.period)?;
+                    if self.rec.is_some() {
+                        let applied = self.applied_over(start, &self.last_applied);
+                        rec_do(&mut self.rec, read_at, |r, t| r.period(t, queued, rate, true, &applied, &self.words));
+                    }
+                    // when data last arrived (a backlog being read is data)
+                    self.seen_to = Some(before);
+                    self.fresh = self.fresh.saturating_add(1);
+                    drained += 1;
+                    // A delayed wake may leave several complete periods in
+                    // the capture. Measure those retained frames before a
+                    // renewal could charge their time as unknown. Never
+                    // renew on stale state, drain indefinitely, or postpone
+                    // a hard fault. Missing/overrun frames still get charged.
+                    if queued >= globals.period as u64 && drained < 8
+                        && hw.now() < drain_deadline
+                        && (!self.armed || hw.now() < self.last_ping + KERNEL_LOCK_TIMEOUT)
+                        && !self.governing_state().2
+                    {
+                        continue;
+                    }
                 }
-                self.bad_data = false;
-                self.good_since_bad = self.good_since_bad.saturating_add(1);
-                if self.good_since_bad >= REARM_PERIODS {
-                    self.recovering = false;
+                Ok(Some(false)) => {
+                    warn!("incomplete sense period or overrun, step skipped");
+                    rec_now(&mut self.rec, hw, |r, t| r.loss(t, record::LOSS_SHORT, 0));
+                    self.fresh = 0;
+                    self.good_since_bad = 0;
                 }
-                self.place(before, after, queued, globals.period)?;
-                if self.rec.is_some() {
-                    let applied = self.applied_over(start, &self.last_applied);
-                    rec_do(&mut self.rec, read_at, |r, t| r.period(t, queued, rate, true, &applied, &self.words));
+                Ok(None) => {
+                    if self.stall.as_mut().unwrap().silent(hw.now()) {
+                        warn!("sense stream stalled for {} ms; reopening", STALL_TIMEOUT.as_millis());
+                        rec_now(&mut self.rec, hw, |r, t| r.loss(t, record::LOSS_STALL, 0));
+                        self.stall = None;
+                        self.fresh = 0;
+                        self.good_since_bad = 0;
+                        hw.close_sense();
+                    }
                 }
-                // when data last arrived (a backlog being read is data)
-                self.seen_to = Some(before);
-                self.fresh = self.fresh.saturating_add(1);
-            }
-            Ok(Some(false)) => {
-                warn!("incomplete sense period or overrun, step skipped");
-                rec_now(&mut self.rec, hw, |r, t| r.loss(t, record::LOSS_SHORT, 0));
-                self.fresh = 0;
-                self.good_since_bad = 0;
-            }
-            Ok(None) => {
-                if self.stall.as_mut().unwrap().silent(hw.now()) {
-                    warn!("sense stream stalled for {} ms; reopening", STALL_TIMEOUT.as_millis());
-                    rec_now(&mut self.rec, hw, |r, t| r.loss(t, record::LOSS_STALL, 0));
+                Err(e) if transient(&e) => {
+                    warn!("sense capture: {e}; reopening");
+                    let errno = e.raw_os_error().unwrap_or(libc::EIO);
+                    rec_now(&mut self.rec, hw, |r, t| r.loss(t, record::LOSS_CAPTURE, errno));
                     self.stall = None;
                     self.fresh = 0;
                     self.good_since_bad = 0;
                     hw.close_sense();
+                    self.maintain(hw)?;
+                    hw.sleep(PING_INTERVAL);
+                    return Ok(());
                 }
+                Err(e) => return Err(format!("sense capture: {e}").into()),
             }
-            Err(e) if transient(&e) => {
-                warn!("sense capture: {e}; reopening");
-                let errno = e.raw_os_error().unwrap_or(libc::EIO);
-                rec_now(&mut self.rec, hw, |r, t| r.loss(t, record::LOSS_CAPTURE, errno));
-                self.stall = None;
-                self.fresh = 0;
-                self.good_since_bad = 0;
-                hw.close_sense();
-                self.maintain(hw)?;
-                hw.sleep(PING_INTERVAL);
-                return Ok(());
-            }
-            Err(e) => return Err(format!("sense capture: {e}").into()),
+            break;
         }
         self.maintain(hw)
     }

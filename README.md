@@ -52,6 +52,21 @@ AudioUnit API and recorded in the bring-up provenance record.  Without the
 daemon the kernel locks the J700's speakers 20 dB below the amplifier's
 full scale; with it, the model governs up to full scale.
 
+### Delayed wakeups
+
+A delayed wake can leave complete periods queued in the sense capture.
+The loop drains up to eight retained periods, for at most 10 ms, before
+considering a renewal. It measures those frames at their verified capture
+positions instead of first charging their time as unknown. A hard fault
+ends the drain immediately. Missing frames and uncertain position edges
+still count at full scale for their actual duration; a delay does not
+justify assuming that the music stayed quiet.
+
+The packaged service currently uses normal scheduling and does not pin
+memory. Higher priority and memory locking can reduce jitter, but cannot
+prove a deadline under I/O stalls and are not needed for the attenuation
+policy. The kernel lease is unchanged.
+
 ### Missing or invalid speaker data
 
 Only a complete PCM period with finite voltage, power and model state counts
