@@ -5528,7 +5528,7 @@ pub(crate) mod tests {
             assert!((a.th.t_coil - want.t_coil).abs() < 1e-9, "{}: charged to {} C, the safe level gives {} C", cfg.speakers[k].name, a.th.t_coil, want.t_coil);
         }
         // a renewal ends it
-        g.max_reduction = cfg.globals.max_reduction;
+        g.stopping = false;
         while !g.armed() && hw.t < secs(30.0) {
             g.tick(&mut hw).unwrap();
         }
