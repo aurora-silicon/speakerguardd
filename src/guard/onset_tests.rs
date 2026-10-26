@@ -23,6 +23,7 @@ impl Tracked {
     }
 }
 impl Hw for Tracked {
+    fn step_db(&self) -> f64 { self.hw.step_db() }
     fn now(&self) -> Instant {
         self.hw.now()
     }
@@ -57,7 +58,10 @@ impl Hw for Tracked {
     }
     fn set_reductions(&mut self, d: &[f64]) -> io::Result<Vec<f64>> {
         self.snap();
-        let result = self.hw.set_reductions(d);
+        let rounded: Vec<_> = d.iter().map(|&v| {
+            if self.hw.steps { (v * 2.0 - 1e-9).ceil() / 2.0 } else { v }
+        }).collect();
+        let result = self.hw.set_reductions(&rounded);
         self.snap();
         result
     }
@@ -131,17 +135,21 @@ impl Hw for Tracked {
     }
 }
 
-fn full_scale_run(mut cfg: Config, seconds: u64, clean_start: bool) -> (Config, Tracked) {
+fn full_scale_run(cfg: Config, seconds: u64, clean_start: bool) -> (Config, Tracked) {
+    programme_run(cfg, seconds, clean_start, false, Box::new(move |t| {
+        if clean_start && t < Duration::from_secs(2) { 0.0 } else { 1.0 }
+    }))
+}
+
+fn programme_run(
+    mut cfg: Config, seconds: u64, clean_start: bool, steps: bool,
+    level: Box<dyn Fn(Duration) -> f64>,
+) -> (Config, Tracked) {
     cfg.allow_unqualified = true;
     cfg.allow_unified = true;
     let mut hw = FakeHw::per_speaker(&cfg);
-    hw.level = Box::new(move |t| {
-        if clean_start && t < Duration::from_secs(2) {
-            0.0
-        } else {
-            1.0
-        }
-    });
+    hw.steps = steps;
+    hw.level = level;
     // Preserve the review's static loads. Avoid a current rail in this
     // witness so the onset cannot be confused with current-rail handling.
     let specs = cfg.speakers.clone();
@@ -517,4 +525,63 @@ fn a_failed_legacy_write_keeps_the_card_wide_ceiling_as_a_candidate() {
     for set in &g.written_set {
         assert!(set.iter().any(|&(lo, hi)| lo <= target && hi >= target), "{set:?} omitted {target}");
     }
+}
+
+
+/// The deterministic listening acceptance schedule. Cubic volume scaling
+/// is applied before protection. At both points the deployed baseline has
+/// zero mean attenuation on every output after the first minute from cold.
+/// Keep this gate strict while the playback-energy contract is unresolved.
+#[test]
+fn ordinary_quiet_programme_costs_at_most_one_db() {
+    crate::log::set_verbosity(crate::log::Level::Error);
+    let mut failures = Vec::new();
+    for name in ["j316", "j413"] {
+        let text = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(format!("conf/apple/{name}.conf")),
+        ).unwrap();
+        for point in [30u32, 60] {
+            let mut cfg = Config::parse(&text).unwrap();
+            cfg.globals.governor = Governor::Unified;
+            cfg.globals.guard = Some(Governor::Asahi);
+            let volume = (point as f64 / 100.0).powi(3);
+            let level = Box::new(move |t: Duration| {
+                let phase = t.as_secs_f64() % 60.0;
+                let programme = if phase < 2.0 { 0.0 }
+                    else if phase < 20.0 { 0.10 }
+                    else if phase < 30.0 { 0.03 }
+                    else if phase < 45.0 { 0.25 }
+                    else if phase < 50.0 { 0.0 }
+                    else { 0.08 };
+                volume * programme
+            });
+            let (cfg, hw) = programme_run(cfg, 600, true, true, level);
+            let mut totals = vec![0.0; cfg.speakers.len()];
+            let mut active_s = 0.0;
+            for pair in hw.gains.windows(2) {
+                let (from, to) = (pair[0].0.as_secs_f64(), pair[1].0.as_secs_f64());
+                // Exclude the first minute and every silent interval.
+                for cycle in 1..10 {
+                    for (start, end) in [(2.0, 45.0), (50.0, 60.0)] {
+                        let base = cycle as f64 * 60.0;
+                        let seconds = (to.min(base + end) - from.max(base + start)).max(0.0);
+                        active_s += seconds;
+                        for (total, gain) in totals.iter_mut().zip(&pair[0].1) {
+                            *total += seconds * gain;
+                        }
+                    }
+                }
+            }
+            assert!((active_s - 477.0).abs() < 1e-6, "{active_s} active seconds");
+            for (speaker, total) in cfg.speakers.iter().zip(totals) {
+                let loss = total / active_s;
+                eprintln!("LISTENING_COST {name} {point}% {} extra_db={loss:.6}", speaker.name);
+                if loss > 1.0 + 1e-6 {
+                    failures.push(format!("{name} {point}% {}: {loss:.3} dB", speaker.name));
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "ordinary listening exceeds 1 dB: {}", failures.join("; "));
 }

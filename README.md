@@ -652,3 +652,13 @@ J700 keeps its legacy floor policy and independent hot-node initialization.
 A draft profile whose declared fallback does not fit the reserve stays
 locked. Passing these software sweeps does not qualify a machine or its
 thermal constants. The output ceiling may attenuate quiet content too.
+
+The listening-cost release gate is
+`ordinary_quiet_programme_costs_at_most_one_db`. It applies a deterministic
+quiet programme at normalized cubic 30% and 60% and measures each output's
+mean attenuation during active playback after the first minute. The deployed
+baseline has zero attenuation in those cold-start cases. The current standing
+reserve fails this gate, so this branch is not ready for release. A proportional
+bound needs enforceable knowledge of upcoming playback energy or a sufficiently
+short enforced response deadline. The sense capture's backlog contains past
+audio and cannot certify the next period's energy.
