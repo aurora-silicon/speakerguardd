@@ -344,6 +344,34 @@ fn actual_kernel_expiry_and_owner_death_keep_the_safe_level() {
         .raw_os_error(),
         Some(libc::EPERM)
     );
+    // Death before expiry is a different fault: revoke a live lease while a
+    // loud immutable copy is still outstanding, without forgiving its dose.
+    let mut live = KernelGate::new(&cfg, 48000, 32);
+    live.owner(true, 1).unwrap();
+    let initial = live.status(1).unwrap();
+    live.write(
+        &initial
+            .grant(&cap, &vec![crate::playback::UNITY; initial.speakers])
+            .unwrap(),
+        1,
+    )
+    .unwrap();
+    let (ticket, _) = live
+        .submit(&vec![i32::MIN; 32 * cfg.speakers.len()], 2)
+        .unwrap();
+    let before = live.status(2).unwrap();
+    assert!(live.unlocked(2));
+    assert!(before.submitted.iter().any(|n| *n > 0));
+    live.owner(false, 3).unwrap();
+    assert!(!live.unlocked(3));
+    let after = live.status(3).unwrap();
+    assert_eq!(after.submitted, before.submitted);
+    assert_eq!(after.completed, before.completed);
+    assert_eq!(after.pending, before.pending);
+    live.retire(ticket, 4).unwrap();
+    let retired = live.status(4).unwrap();
+    assert_eq!(retired.completed, before.submitted);
+    assert_eq!(retired.refunded, before.refunded);
 }
 
 /// Immutable, five-descriptor playback queue. Programme access is restricted
