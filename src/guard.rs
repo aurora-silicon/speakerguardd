@@ -3328,7 +3328,11 @@ pub(crate) mod tests {
             let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
             hw.level = Box::new(|_| 0.6);
             let mut g = Guard::start_persist(&mut hw, &cfg, 20.0, Some(run), Some(keep.clone())).unwrap();
-            run_until(&mut g, &mut hw, secs(10.0)).unwrap();
+            // Independent hot-node initialization can remain latched past
+            // ten seconds. This fixture needs an active, healthy hot run
+            // before shutdown, not a snapshot of the startup latch.
+            run_until(&mut g, &mut hw, secs(60.0)).unwrap();
+            assert!(g.armed() && g.speakers.iter().all(|s| !s.hard), "the hot shutdown fixture never became active");
             hw.wall = wall("first", 1_800_000_000);
             hw.machine = Some("m".into());
             hw.shutting = shutting;
