@@ -997,6 +997,12 @@ impl Guard {
         let Some(span) = after.checked_sub(boot).filter(|_| !boot.is_zero() && !after.is_zero()) else {
             return Err("the final snapshot has no trustworthy boot-time epoch".into());
         };
+        // A blocking drain operation can cross the feedback deadline after
+        // the last decide(). A clean save must not erase that recovery need.
+        if self.playback.is_some() && self.playing
+            && now.checked_add(span).is_none_or(|at|self.overdue(at)>BLIND_LIMIT) {
+            self.recovering=true;
+        }
         self.charge(now)?;
         if let Some(playback)=self.playback.as_mut() {
             let ns=u64::try_from(after.as_nanos()).map_err(|_|"playback save clock overflow")?;
@@ -1306,6 +1312,12 @@ impl Guard {
             if !status.qualified(&self.playback_cfg) {return Ok(());}
             self.playback=Some(crate::playback_model::PlaybackModel::new(
                 &self.playback_cfg,&self.speakers,self.engine.as_ref(),self.account_to,status.clone())?);
+            // A thermal snapshot and an output receipt are not evidence of
+            // recent V/I capture in this process. Retain the initial feedback
+            // rearm sequence, including a takeover of a still-playing PCM.
+            if self.playback_cfg.has_vi() && self.fresh<REARM_PERIODS {
+                self.recovering=true;self.good_since_bad=0;
+            }
             info!("using the kernel's immutable playback energy contract");
         }
         let boot0=hw.boottime();let mono=hw.now();let boot1=hw.boottime();

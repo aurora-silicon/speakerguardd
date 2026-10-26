@@ -1970,7 +1970,7 @@ mod tests {
 
 #[test]
 fn kernel_gate_reference_plants_survive_retained_fault_schedules() {
-    for seed in [7312918695,7312919903,7312900005] {
+    for seed in [7312918695,7312919903,7312900005,7312914617] {
         let mut sc=ViScenario::random(seed);
         // Explicit scalar reference path, with the original fault schedule.
         // The unchanged continuous campaign separately retains both gain types.
