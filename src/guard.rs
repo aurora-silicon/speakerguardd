@@ -60,8 +60,8 @@
 //! frames, and the end of every stream from its last frames to the look
 //! that sees it closed; a sense outage is charged at full scale at the
 //! least gain since the last verified boundary until periods return; a
-//! restart without a clean stop starts latched (about 4 s with the
-//! speakers at the card's safe level on the J700); and the floor takes
+//! restart without a clean stop starts latched, with the controls at
+//! minimum until both unknown hot nodes have cooled; and the floor takes
 //! 0.5 dB on a cold J700 coil, 2.5 dB at 85 C and 3.9 dB at 100 C (3 and
 //! 4 dB on the card's 0.5 dB steps), where the governor alone takes
 //! nothing.
@@ -142,12 +142,10 @@ pub trait Hw {
     fn step_db(&self) -> f64 {
         0.0
     }
-    /// Turn every volume control to the card's own safe value, which it
-    /// accepts while the volume is locked: done at the start and before
-    /// each unlock.  The reduction the controls now apply (dB), as written:
-    /// the safe level, or MUTE_DB where only their minimum could be written.
-    /// Before the controls' unlocked range is known that is the configured
-    /// safe level, which the first ping checks (`card_safe_db`).
+    /// Turn every volume control to its minimum, which it accepts while
+    /// locked, at startup and before each unlock, even without events.
+    /// Return MUTE_DB to account for the applied minimum. The kernel's
+    /// separate fallback level is checked after the first ping (`card_safe_db`).
     fn set_safe(&mut self) -> io::Result<f64>;
     /// The card's own safe level (dB below the controls' maximum) once both
     /// ranges have been read: the most the controls accept while the volume
@@ -2578,10 +2576,8 @@ mod tests {
     /// the start is unknown; after a clean stop it is at least the card's
     /// safe level): their power before the gain is charged to the budgets
     /// as high as it can have been, for the half second they can play.
-    /// Since the start no longer mutes the speakers (review r6), what they
-    /// play in that half second counts so too, at most the full-scale
-    /// budget reduction.  The cost is a short reduction, gone within the
-    /// budget's second.
+    /// Writing minimum at startup does not erase those old conversions.
+    /// Their cost is a short reduction, gone within the budget's second.
     #[test]
     fn a_start_during_playback_costs_little() {
         let cfg = j700();
@@ -3433,7 +3429,8 @@ mod tests {
     }
 
     /// Review r3 T1, without events: nothing between two looks is known, so
-    /// the lock is never taken.  0.1.6 polled and renewed at 0 dB.
+    /// the volume is never unlocked. The initial minimum write must still
+    /// happen. 0.1.6 polled and renewed at 0 dB.
     #[test]
     fn without_control_events_the_lock_is_never_taken() {
         let cfg = j700();
@@ -3441,9 +3438,10 @@ mod tests {
         hw.events = false;
         hw.playing = Box::new(|t| (10..90).contains(&(t.as_millis() % 100)));
         let mut g = Guard::start(&mut hw, &cfg, 20.0, tmp_state()).unwrap();
+        assert_eq!(hw.effective_reduction(), MUTE_DB, "startup skipped the minimum write");
         run_until(&mut g, &mut hw, secs(3.0)).unwrap();
         assert!(hw.pings.is_empty() && !g.armed(), "{} pings", hw.pings.len());
-        assert!(hw.effective_reduction() >= SAFE_DB);
+        assert_eq!(hw.effective_reduction(), MUTE_DB);
     }
 
     /// Review r3 T2: a clean stop with time not yet accounted (the sense
