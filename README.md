@@ -676,18 +676,51 @@ and the long class assert each speaker's true V/I limit over every oracle
 sample, including after a low-line fault and during hand-offs. The cold
 burst/quiet engine test requires the deployed 0.3 V / 20 mA PF gate.
 
-The broad family pins both baseline and reviewed-parent peaks. It rejects
-new per-speaker limit crossings against baseline and higher peaks against
-the reviewed parent (0.02 K tolerance for the peak comparison, none for a
-limit crossing). The ordinary case 667 woofers must also stay within their
-baseline peaks. Some higher baseline-relative peaks already exist in the
-reviewed parent; they are retained, with their trajectories checked, rather
-than attributed to this fix. The existing partial-line and no-bass limit
-crossings remain unqualified. These are software tests only. Nonzero twin
-operation remains disabled and unqualified.
+The broad family retains both baseline and reviewed-parent peak tables and
+all input fingerprints. Its hard gate is each speaker's absolute V/I limit.
+Changes relative to either historical table are reported separately; a
+previous crossing is never an exemption. The earlier relative-peak predicate
+is not the continuous thermal criterion. These are software model checks,
+not physical speaker qualification. Nonzero twin operation remains disabled
+and unqualified.
 
     cargo test --offline --locked --release recurrent
     cargo test --offline --locked --release cold_burst
+
+### Continuous limits and the listening release gate
+
+The original interleaving properties cover accounted or armed states. They
+can pass while a true model temperature crosses its limit elsewhere in the
+program. `src/harness/continuous.rs` adds a separate check of both thermal
+nodes over every interval, including interior maxima, with no armed-state
+mask. It retains all 30,144 paired inputs: 144 long programs, 20,000 V/I
+seeds and 10,000 Legacy seeds. All 865 cases that fail either historical
+source run as default regressions, including all 17 newly crossing cases.
+The complete campaign is an additional mandatory acceptance run:
+
+    PAIR_METRICS=continuous.csv cargo test --offline --locked --release harness::continuous::all_30144_continuous_cases_stay_within_limits -- --ignored --exact
+
+The input fingerprints, complete counterexample rows, new-crossing rows and
+historical limits are in `src/harness/`; see `README-continuous.md` there.
+The historical archive contains 72 shared rows and two packaged-Neo rows
+from a separate source/fixture. Those two rows are never counted as reruns
+of a different fixture. The original Euler/RK4 property oracles remain;
+the continuous check uses exact interval extrema and a parallel exact
+Legacy state.
+
+Thermal checks and the ordinary-listening budget must pass on the same
+candidate. Listening acceptance uses the seven retained archives at cubic
+30%, 60% and recorded level across three source comparisons (63 replays),
+plus the retained quiet schedule. Cost must stay within 1 dB; J616 must stay
+at exactly zero change at 30% and 60%. Comparisons include per-speaker means
+and common normal-playing intervals. Private recordings and detailed replay
+records stay outside this repository.
+
+The current full-dose onset reserve still fails that listening budget. The
+complete continuous campaign must also pass before release; narrower
+property passes are insufficient. This branch is not ready to deploy. A
+quiet capture is past audio, not a guarantee about upcoming output. No
+quiet-history exception or reserve cap is used to weaken onset protection.
 
 ### Relation to speakersafetyd
 
