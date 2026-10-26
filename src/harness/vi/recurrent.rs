@@ -331,18 +331,18 @@ fn all_768_adversarial_cases() {
         for (k, speaker) in vi_cfg(&sc).speakers.iter().enumerate() {
             let before = expected[k + 2].parse::<f64>().unwrap();
             let after = peaks[k];
-            // Existing no-bass/partial-line gaps are kept in the pair.
-            // Never grant their allowance to a different speaker: every
-            // previously safe speaker must still pass its hard limit.
-            if before <= speaker.t_limit && !(after <= speaker.t_limit) {
+            // Retain the same inputs and both historical references, but
+            // enforce the absolute gate on every output. Inherited
+            // crossings are failures too.
+            if !(after.is_finite() && after <= speaker.t_limit) {
                 failures.push(format!(
-                    "case {id}, {} new true V/I limit crossing: {before:.9} -> {after:.9} C",
+                    "case {id}, {} true V/I limit crossing: {before:.9} -> {after:.9} C",
                     speaker.name
                 ));
             }
             // The reviewed parent already changes some complete-loop
             // peaks relative to baseline. Keep both references: forbid
-            // new baseline limit crossings above, and any added peak
+            // absolute limit crossings above, and any added peak
             // relative to this fix's exact parent here. The ordinary
             // recovered-line witness also keeps the woofer's baseline
             // ceiling, not its hotter parent result.
@@ -406,5 +406,6 @@ fn ordinary_recurrent_line_keeps_the_baseline_woofer_peak() {
             );
         }
     }
+    assert_true_vi_limit(&sc, &out);
     eprintln!("ORDINARY case=667 peaks={:?}", out.true_vi_peaks);
 }
