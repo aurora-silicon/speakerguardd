@@ -163,6 +163,11 @@ pub trait Hw {
     fn take_lock(&mut self) -> io::Result<()>;
     /// Renew the card's volume lock ("Speaker Volume Unlock").
     fn ping(&mut self) -> io::Result<()>;
+    /// The optional kernel contract; absence keeps the conservative path.
+    fn playback_status(&mut self) -> io::Result<Option<crate::playback::Snapshot>> { Ok(None) }
+    fn playback_write(&mut self, _bytes: &[u8;crate::playback::BYTES]) -> io::Result<()> {
+        Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP))
+    }
     /// Write the gain reduction (dB below the control's maximum).  Returns
     /// the reduction the card applies: the control's steps round it up
     /// (review r5 V6).
@@ -403,6 +408,8 @@ fn rec_do(rec: &mut Option<Recorder>, t: Duration, f: impl FnOnce(&mut Recorder,
 }
 
 pub struct Guard {
+    playback_cfg: Config,
+    playback: Option<crate::playback_model::PlaybackModel>,
     globals: Globals,
     pub speakers: Vec<SpeakerState>,
     // Historical config/recording value, retained for replay compatibility.
@@ -748,6 +755,8 @@ impl Guard {
         }
         let unknown_floor = if resumed { globals.safe_reduction } else { 0.0 };
         let mut g = Guard {
+            playback_cfg: cfg.clone(),
+            playback: None,
             words: vec![0i32; globals.period * globals.channels],
             globals,
             speakers,
@@ -958,6 +967,8 @@ impl Guard {
     /// old gain have drained.
     pub fn released<H: Hw>(&self, hw: &H) -> bool {
         !self.armed && self.relinquished_at.is_some_and(|t| hw.now() >= t + DRAIN)
+            && self.playback.as_ref().is_none_or(|p|p.last.submitted==p.last.completed
+                && p.last.flags & crate::playback::LIVE == 0)
     }
 
     /// The state a restart may resume: everything up to now accounted, the
@@ -983,6 +994,12 @@ impl Guard {
             return Err("the final snapshot has no trustworthy boot-time epoch".into());
         };
         self.charge(now)?;
+        if let Some(playback)=self.playback.as_mut() {
+            let ns=u64::try_from(after.as_nanos()).map_err(|_|"playback save clock overflow")?;
+            let rows=playback.close_to_for_save(ns)?;
+            self.engine=playback.monitor.clone();
+            self.publish_playback(rows,now,0.0)?;
+        }
         let pairing = span.as_secs_f64();
         if pairing > 0.0 {
             let ta = self.globals.t_ambient;
@@ -1241,7 +1258,8 @@ impl Guard {
 
     /// Pings the volume lock.  A ping that answers ETIMEDOUT is the card's
     /// one-shot notice that the lock had lapsed, so ping once more.
-    fn ping_lock<H: Hw>(&mut self, hw: &mut H) -> Result<(), Box<dyn Error>> {
+    fn ping_lock<H: Hw>(&mut self, hw: &mut H) -> Result<bool, Box<dyn Error>> {
+        if !self.issue_playback(hw)? {return Ok(false);}
         // whatever the ping answers, the card may be unlocked from here on
         self.locked_at = None;
         match hw.ping() {
@@ -1258,7 +1276,7 @@ impl Guard {
             Err(e) => return Err(format!("lock ping: {e}").into()),
         }
         self.last_ping = hw.now();
-        Ok(())
+        Ok(true)
     }
 
     fn check_model(&self) -> Result<(), Box<dyn Error>> {
@@ -1269,9 +1287,83 @@ impl Guard {
         }
     }
 
+    /// Reconcile one atomic kernel receipt. A completion retires energy debt;
+    /// it does not imply that an unreported descriptor was quiet or discarded.
+    fn refresh_playback<H: Hw>(&mut self, hw: &mut H) -> Result<(), Box<dyn Error>> {
+        let status=hw.playback_status()?;
+        let Some(status)=status else {
+            if self.playback.is_some() {return Err("the active playback contract disappeared".into());}
+            return Ok(());
+        };
+        if self.playback.is_none() {
+            if !status.qualified(&self.playback_cfg) {return Ok(());}
+            self.playback=Some(crate::playback_model::PlaybackModel::new(
+                &self.playback_cfg,&self.speakers,self.engine.as_ref(),self.account_to,status.clone())?);
+            info!("using the kernel's immutable playback energy contract");
+        }
+        let boot0=hw.boottime();let mono=hw.now();let boot1=hw.boottime();
+        let stamp=Duration::from_nanos(status.clock_ns);
+        if boot1<boot0 || stamp>boot1 {return Err("invalid playback clock pairing".into());}
+        let at=mono.checked_sub(boot1.saturating_sub(stamp)).unwrap_or(self.account_to).max(self.account_to);
+        let uncertainty=(boot1-boot0).as_secs_f64();
+        let playback=self.playback.as_mut().unwrap();
+        let rows=playback.update(status)?;
+        playback.closed_monitor(at);
+        self.engine=playback.monitor.clone();
+        self.publish_playback(rows,at,uncertainty)
+    }
+
+    fn publish_playback(&mut self,mut rows:Vec<crate::playback_model::Projection>,at:Instant,uncertainty:f64)->Result<(),Box<dyn Error>> {
+        for (k,row) in rows.iter_mut().enumerate() {
+            // A split userspace clock read may span a scheduling gap. It
+            // cannot move the public accounted boundary past unbounded heat.
+            if uncertainty>0.0 {
+                let e=self.speakers[k].worst_case_power(0.0)*uncertainty;
+                row.ff.impulse(e);
+                row.ff_peak.0=row.ff_peak.0.max(row.ff.t_coil);
+                row.ff_peak.1=row.ff_peak.1.max(row.ff.t_magnet);
+                if let Some(v)=row.vi.as_mut() {
+                    v.impulse(e);row.vi_peak.0=row.vi_peak.0.max(v.t_coil);row.vi_peak.1=row.vi_peak.1.max(v.t_magnet);
+                }
+            }
+            let speaker=&mut self.speakers[k];
+            speaker.t_coil=row.ff.t_coil;speaker.t_magnet=row.ff.t_magnet;
+            speaker.t_peak=row.ff_peak.0.max(row.ff_peak.1);
+            if !(speaker.t_peak<speaker.spec.t_limit) {speaker.hard=true;}
+            speaker.set_playback_means(row.means.0,row.means.1);
+            speaker.govern(&self.globals);
+        }
+        if let Some(engine)=&mut self.engine {engine.adopt_playback(&rows);}
+        let from=self.account_to;
+        self.account_to=at;
+        if at>from {self.note_account(from,at,Accounted::Measured);}
+        self.check_model()
+    }
+
+    fn issue_playback<H: Hw>(&mut self, hw: &mut H) -> Result<bool,Box<dyn Error>> {
+        if self.playback.is_none() {return Ok(true);}
+        for _ in 0..3 {
+            self.refresh_playback(hw)?;
+            if self.armed && self.playback.as_ref().unwrap().last.flags & crate::playback::LIVE == 0 {
+                return Ok(false);
+            }
+            let Some(packet)=self.playback.as_ref().unwrap().packet()? else {return Ok(false);};
+            match hw.playback_write(&packet) {
+                Ok(())=>return Ok(true),
+                // EAGAIN can have installed protected-copy mode while an
+                // unaffordable raw prefix drains under the hardware lock.
+                Err(e) if e.raw_os_error()==Some(libc::EAGAIN)=>return Ok(false),
+                Err(e) if [Some(libc::ESTALE),Some(libc::ETIMEDOUT)].contains(&e.raw_os_error())=>continue,
+                Err(e)=>return Err(e.into()),
+            }
+        }
+        Ok(false)
+    }
+
     /// Charge the time from the account's end to `to` as a full-scale
     /// signal at the least reduction held since the last verified boundary.
     fn charge(&mut self, to: Instant) -> Result<(), Box<dyn Error>> {
+        if self.playback.is_some() {return Ok(());}
         if to <= self.account_to {
             return Ok(());
         }
@@ -1293,6 +1385,7 @@ impl Guard {
 
     /// Verified closed speakers from the account's end to `to`: no power.
     fn cool(&mut self, to: Instant) -> Result<(), Box<dyn Error>> {
+        if self.playback.is_some() {return Ok(());}
         if to > self.account_to {
             let d = (to - self.account_to).as_secs_f64();
             let globals = &self.globals;
@@ -1330,6 +1423,11 @@ impl Guard {
     /// gain; the engine's models likewise), and the time before the run is
     /// charged.
     fn measure_shifted(&mut self, end: Instant, frames: usize, shift: usize) -> Result<(), Box<dyn Error>> {
+        if let Some(playback)=self.playback.as_mut() {
+            playback.observe(&self.words[..frames*self.globals.channels],frames,end,self.rate as f64)?;
+            self.last_applied=self.written.clone();
+            return Ok(());
+        }
         if frames == 0 || self.rate == 0 || end <= self.account_to {
             return Ok(());
         }
@@ -1511,6 +1609,7 @@ impl Guard {
 
     /// One pass of the loop: idle accounting, or one sense period.
     pub fn tick<H: Hw>(&mut self, hw: &mut H) -> Result<(), Box<dyn Error>> {
+        self.refresh_playback(hw)?;
         let globals = self.globals.clone();
         // before the rate read: a stream it shows was there by then, and the
         // time without sense data is counted from here, however long the
@@ -1787,6 +1886,9 @@ impl Guard {
     /// The model is current enough to lift or renew the lock now (checked
     /// again after anything that may block).
     fn fresh_enough(&self, now: Instant) -> bool {
+        if self.playback.is_some() {
+            return now.saturating_duration_since(self.account_to)<KERNEL_LOCK_TIMEOUT;
+        }
         let allowed = Duration::from_secs_f64(self.dt.unwrap_or(0.0)) + BLIND_SLACK;
         now.saturating_duration_since(self.account_to) <= allowed && !(self.playing && self.overdue(now) > BLIND_LIMIT)
     }
@@ -1798,6 +1900,7 @@ impl Guard {
     }
 
     fn bound_onset(&self, now: Instant, per: &mut [f64]) -> bool {
+        if let Some(playback)=&self.playback {return playback.ready;}
         let pending = self.least_since(self.account_to);
         // A target write can block while the old lease runs down. Keep
         // that entire allowance and its queue at the old or new gain;
@@ -1850,6 +1953,10 @@ impl Guard {
     /// a lock that is kept is renewed whatever its age (before something
     /// that blocks), and a cleared fault waits for the next pass.
     fn decide<H: Hw>(&mut self, hw: &mut H, renew_now: bool) -> Result<(), Box<dyn Error>> {
+        self.refresh_playback(hw)?;
+        if self.armed && self.playback.as_ref().is_some_and(|p|p.last.flags & crate::playback::LIVE == 0) {
+            self.disarm(hw,"the kernel playback grant is no longer live")?;
+        }
         let now = hw.now();
         let blind = self.overdue(now);
         if self.unknown || (self.playing && blind > BLIND_SLACK) {
@@ -1881,7 +1988,8 @@ impl Guard {
             self.disarm(hw, "the card's lock lapsed while the daemon was away")?;
         }
         if self.armed {
-            let why = if blind > BLIND_LIMIT {
+            let blind_limit=if self.playback.is_some() {STALL_TIMEOUT} else {BLIND_LIMIT};
+            let why = if blind > blind_limit {
                 Some(format!("no complete sense data for {} ms", blind.as_millis()))
             } else if hard {
                 Some("a coil may have reached its limit".to_string())
@@ -1917,7 +2025,7 @@ impl Guard {
                         // the minimum write may have blocked: the model must
                         // still be current at the unlock
                         if self.fresh_enough(hw.now()) {
-                            self.ping_lock(hw)?;
+                            if !self.ping_lock(hw)? {return Ok(());}
                             if self.fresh_enough(hw.now()) {
                                 info!("taking the volume lock{} at {reduction:.1} dB", if self.held { " back" } else { "" });
                                 self.armed = true;
@@ -2001,7 +2109,9 @@ impl Guard {
             if self.armed && (renew_now || hw.now().duration_since(self.last_ping) >= PING_INTERVAL) {
                 // the write may have blocked: renew only on a current model
                 if self.fresh_enough(hw.now()) {
-                    self.ping_lock(hw)?;
+                    if !self.ping_lock(hw)? {
+                        self.disarm(hw,"no complete playback grant could be installed")?;
+                    }
                     // a ping that blocked (or found the lock lapsed and took
                     // it again) must not carry a model that fell behind in it
                     if !self.fresh_enough(hw.now()) {

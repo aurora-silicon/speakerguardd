@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
-//! Proof prototype for the playback contract. Test-only until the kernel
-//! descriptor adapter, device transfer bounds and ledger ABI are qualified.
-//! Production retains the existing full-scale onset reserve on every kernel.
+//! Finite-energy grant proof used by the production playback model.
+//! Negotiation requires a qualified kernel transfer and a packaged card match.
+//! Unsupported paths retain the existing full-scale onset reserve.
 
 use crate::engine::Thermal;
 

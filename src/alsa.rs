@@ -209,6 +209,35 @@ impl Ctl {
         Ok(self.value_of(id)?.value[0])
     }
 
+    fn check_bytes(&self, id: &ElemId) -> io::Result<()> {
+        // SAFETY: zero is valid and ioctl fills the complete matching layout.
+        let mut info: ElemInfo = unsafe { std::mem::zeroed() };
+        info.id=*id;
+        ioctl(&self.file,CTL_IOCTL_ELEM_INFO,&mut info)?;
+        if info.ty!=4 || info.count!=512 { return Err(io::Error::from_raw_os_error(libc::EPROTO)); }
+        Ok(())
+    }
+
+    pub fn read_bytes(&self, id: &ElemId) -> io::Result<[u8;512]> {
+        self.check_bytes(id)?;
+        let value=self.value_of(id)?;
+        let mut out=[0u8;512];
+        // SAFETY: the value union has 1024 initialized bytes; BYTES uses its
+        // first 512 bytes. Both ranges are valid and do not overlap.
+        unsafe { std::ptr::copy_nonoverlapping(value.value.as_ptr().cast::<u8>(),out.as_mut_ptr(),512); }
+        Ok(out)
+    }
+
+    pub fn write_bytes(&self, id: &ElemId, bytes: &[u8;512]) -> io::Result<()> {
+        self.check_bytes(id)?;
+        // SAFETY: zero is a valid ElemValue and bytes fit in the value union.
+        let mut value: ElemValue = unsafe { std::mem::zeroed() };
+        value.id=*id;
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(),value.value.as_mut_ptr().cast::<u8>(),512); }
+        ioctl(&self.file,CTL_IOCTL_ELEM_WRITE,&mut value)?;
+        Ok(())
+    }
+
     /// Integer control: every channel to the same value.
     pub fn write_int(&self, id: &ElemId, value: i64) -> io::Result<()> {
         let mut v = self.value_of(id)?;

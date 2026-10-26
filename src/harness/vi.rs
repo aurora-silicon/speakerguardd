@@ -583,6 +583,7 @@ pub struct ViWorld<'a> {
     /// (its detection takes seconds of program); the long class checks the
     /// outcome.
     i_low_seen: Cell<bool>,
+    gate: Option<crate::gate_sim::DescriptorQueue>,
 }
 
 impl<'a> ViWorld<'a> {
@@ -641,6 +642,9 @@ impl<'a> ViWorld<'a> {
             unverified: vec![[false; 4]; n],
             i_dead_seen: Cell::new(false),
             i_low_seen: Cell::new(false),
+            gate: (std::env::var_os("SPEAKERGUARDD_GATE_MODEL").is_some()
+                && sc.amp_gain && !cfg.playback_cards.is_empty()).then(||
+                crate::gate_sim::DescriptorQueue::new(cfg,sc.rate,cfg.globals.period,1_000_000_000_000)),
         }
     }
 
@@ -705,7 +709,8 @@ impl<'a> ViWorld<'a> {
             self.gain_at(k, kappa)
         };
         let level = recurrent::level(self.cfg.speakers[k].name.contains("Tweeter"), tau, level);
-        let a = level * 10f64.powf(-gain / 20.0) * self.vpk;
+        let digital = self.gate.as_ref().map_or(1.0,|g|g.ratio(n,k));
+        let a = level * digital * 10f64.powf(-gain / 20.0) * self.vpk;
         let freq = recurrent::frequency(tau, s.freq);
         if freq == 0.0 {
             let v = if n % 2 == 0 { a } else { -a };
@@ -754,10 +759,31 @@ impl<'a> ViWorld<'a> {
     /// Bring the world to `to`: the lease in playing time, the oracle.
     fn advance(&mut self, to: f64) {
         let to = to.max(self.now_s());
+        let gate_deadline=self.gate.as_mut().map(|g| {
+            let s=g.gate.status(g.ns(self.t.get())).unwrap();
+            if s.flags & crate::playback::LIVE != 0 {
+                s.deadline_ns.saturating_sub(1_000_000_000_000) as f64*1e-9
+            } else {self.t.get()}
+        });
+        if let Some(gate)=&mut self.gate {
+            let sc=self.sc;let cfg=self.cfg;let rate=self.rate;
+            gate.advance(to,|n,k| {
+                let tau=n as f64/rate;
+                let Some(s)=sc.open_at(tau) else {return 0.0;};
+                let i=s.levels.partition_point(|l|l.0<=tau);
+                let level=if i==0 {s.levels[0].1} else {s.levels[i-1].1} * s.share[k];
+                let level=recurrent::level(cfg.speakers[k].name.contains("Tweeter"),tau,level);
+                let freq=recurrent::frequency(tau,s.freq);
+                if freq==0.0 {if n%2==0 {level} else {-level}} else {level*(2.0*PI*freq*tau).sin()}
+            });
+        }
         let mut t = self.lease_t;
         let step = 0.0005;
         while t < to {
             let b = (t + step).min(to);
+            if self.unlocked && gate_deadline.is_some_and(|deadline|b>=deadline) {
+                self.notice=true;self.relock(b,0.0);
+            }
             if self.unlocked && self.sc.open_at(t).is_some() {
                 self.lease_left -= b - t;
                 if self.lease_left <= 0.0 {
@@ -781,6 +807,7 @@ impl<'a> ViWorld<'a> {
             self.oracle.step(h, &p);
             recurrent::observe(self);
         }
+        if let Some(g)=&mut self.gate {g.prune_before(self.oracle.n.saturating_sub((self.rate*5.0) as u64));}
     }
 
     fn fault_on(&self, f: impl Fn(&Fault) -> Option<(f64, f64)>) -> bool {
@@ -825,6 +852,7 @@ impl<'a> ViWorld<'a> {
     }
 
     pub fn owner_gone(&mut self) {
+        if let Some(g)=&mut self.gate {g.gate.owner(false,g.ns(self.t.get())).unwrap();}
         self.owner = false;
         self.notice = false;
         let t = self.now_s();
@@ -891,7 +919,18 @@ impl Hw for ViWorld<'_> {
     fn take_lock(&mut self) -> io::Result<()> {
         self.maybe_pause();
         self.owner = true;
+        if let Some(g)=&mut self.gate {g.gate.owner(true,g.ns(self.t.get()))?;}
         Ok(())
+    }
+    fn playback_status(&mut self)->io::Result<Option<crate::playback::Snapshot>> {
+        let t=self.now_s();self.advance(t);
+        self.gate.as_mut().map(|g|g.gate.status(g.ns(t))).transpose()
+    }
+    fn playback_write(&mut self,wire:&[u8;crate::playback::BYTES])->io::Result<()> {
+        self.maybe_pause();let t=self.now_s();self.advance(t);
+        let Some(g)=&mut self.gate else {return Err(io::Error::from_raw_os_error(libc::ENOTTY));};
+        g.gate.write(wire,g.ns(t))?;
+        self.unlocked=true;self.note_gain(t);Ok(())
     }
     fn ping(&mut self) -> io::Result<()> {
         self.maybe_pause();
@@ -904,6 +943,7 @@ impl Hw for ViWorld<'_> {
         if !self.owner {
             return Err(io::Error::from_raw_os_error(libc::EPERM));
         }
+        if let Some(g)=&mut self.gate {g.gate.ping(g.ns(t))?;}
         self.unlocked = true;
         self.lease_left = 0.25;
         self.last_ping_at = self.now_s();
@@ -966,6 +1006,9 @@ impl Hw for ViWorld<'_> {
         let t = self.now_s();
         self.advance(t);
         self.notice = false;
+        if let Some(g)=&mut self.gate {
+            let now=g.ns(t);let status=g.gate.status(now)?;g.gate.write(&status.revoke(),now)?;
+        }
         let t = self.now_s();
         self.relock(t, DRAIN.as_secs_f64() * 0.9);
         Ok(())

@@ -900,6 +900,7 @@ pub struct UnifiedSpeaker {
     /// (dt, feed-forward power before the gain) per step, one minute.
     history: VecDeque<(f64, f64)>,
     history_s: f64,
+    playback_means: Option<(f64,f64)>,
     /// dB, >= 0
     pub reduction: f64,
     /// The regulator's prediction of the program: the power before the
@@ -928,6 +929,7 @@ impl UnifiedSpeaker {
             vi: s.is_chan.map(|_| Thermal::new(s.vi_tr_coil, s.vi_tau_coil, s.vi_tr_magnet, s.vi_tau_magnet, ta)),
             history: VecDeque::new(),
             history_s: 0.0,
+            playback_means: None,
             reduction: 0.0,
             last_ff_pre: 0.0,
             last_vi_pre: None,
@@ -969,6 +971,10 @@ impl UnifiedSpeaker {
     }
 
     pub fn mean_pre(&self, seconds: f64) -> f64 {
+        if let Some((short,long))=self.playback_means {
+            if seconds==1.0 {return short;}
+            if seconds==60.0 {return long;}
+        }
         mean_of(&self.history, seconds)
     }
 
@@ -1212,6 +1218,7 @@ pub struct SavedUnified {
 
 /// The engine: the asahi models (machines with V/I sense) and the unified
 /// ones (when they govern or the shadow log runs).
+#[derive(Clone)]
 pub struct Engine {
     pub cfg: Config,
     pub asahi: Option<Vec<AsahiSpeaker>>,
@@ -1261,6 +1268,28 @@ pub fn link(cfg: &Config, own: &[f64]) -> Vec<f64> {
 }
 
 impl Engine {
+    /// Mirror the authoritative output account for status and the V/I guard.
+    /// The independent sense monitor may only raise these temperature bounds.
+    pub fn adopt_playback(&mut self, rows: &[crate::playback_model::Projection]) {
+        for (k,row) in rows.iter().enumerate() {
+            if let Some(a)=self.asahi.as_mut() {
+                let th=row.vi.as_ref().unwrap_or(&row.ff);
+                a[k].th=th.clone();
+                a[k].note(row.vi_peak.0,row.vi_peak.1);
+                a[k].govern(&self.cfg.globals);
+            }
+            if let Some(u)=self.unified.as_mut() {
+                u[k].ff=row.ff.clone();
+                u[k].vi=row.vi.clone();
+                u[k].playback_means=Some(row.means);
+                u[k].peak=row.ff_peak.0.max(row.ff_peak.1).max(row.vi_peak.0).max(row.vi_peak.1);
+                if !(u[k].peak<u[k].t_limit) {u[k].hard=true;}
+                // Feed-forward authority is now the finite kernel grant,
+                // rather than a forecast that repeats one period for 4.6 s.
+                u[k].reduction=0.0;
+            }
+        }
+    }
     /// The models this configuration runs, at ambient and unlatched (the
     /// guard then restores them or starts them latched); None when there
     /// is nothing to run besides the legacy model.
