@@ -107,8 +107,8 @@ pub fn same_boot(a: &str, b: &str) -> bool {
 
 /// The record for `state` (a clean stop's state text, its snapshot ending
 /// `pairing` of boot time before the clocks in `wall` were read), or None
-/// if the system clock was not synchronized or the boot or machine has no
-/// id: such a record could not be resumed.
+/// if the independent RTC is absent, the system clock fails its checks,
+/// or the boot or machine has no id: such a record could not be resumed.
 pub fn encode(wall: &Wall, origin: &Origin, pairing: Duration, state: &str) -> Option<String> {
     let boot_id = word(wall.boot_id.as_deref()?)?;
     let machine = word(origin.machine_id.as_deref()?)?;
@@ -267,7 +267,8 @@ mod tests {
     fn a_version_change_cannot_promote_an_old_checksum() {
         let good = encode(&wall("old", 1000, true, Some(500)), &origin(), Duration::ZERO, &clean(60.0)).unwrap();
         let body = good.splitn(3, '\n').nth(2).unwrap();
-        // Exact v2 checksum rule, followed by a single changed header bit.
+        // A v3 checksum binds its own header. Changing the format header
+        // cannot turn that record into a v4 timestamp promise.
         let old = format!("speakerguardd-boot 3\nsum {:016x}\n{body}", fnv(&format!("speakerguardd-boot 3\n{body}")));
         let promoted = old.replacen("speakerguardd-boot 3", MAGIC, 1);
         assert_ne!(old, promoted);

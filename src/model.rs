@@ -133,7 +133,7 @@ impl SpeakerState {
     /// gains (review r5 V5), a frame only one.  A frame converted at
     /// reduction r was at most the configured maximum times 10^(-r/20),
     /// and its word is at most
-    /// what was played: r fits iff r <= 20 log10(vs_scale / word).  What
+    /// what was played: r fits iff r <= 20 log10(v_max / sensed_voltage).  What
     /// was played is within a step above the word: the step up is its
     /// power's bound (it matters only where the gain undone is deep).
     /// A voltage rail below the amplifier cap stands for full possible

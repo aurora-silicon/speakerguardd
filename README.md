@@ -781,3 +781,12 @@ when it exceeds the sense full scale. Startup, uncovered time and budget
 caps use that same configured bound. A saturated voltage word cannot prove
 that the amplifier stopped at the sense rail; those frames use the declared
 power bound in both thermal paths. The profiles remain unqualified.
+
+
+The recurrent-line gate retains all 768 inputs and both historical reference
+tables. Every output must meet its own hard limit, including cases that were
+already over at a reference revision. The log also reports every increase
+above a reviewed-parent peak. Composed changes to attenuation and handoff
+can change those below-limit peaks; the historical comparison remains
+visible alongside the absolute result. The listening-cost gate remains a
+separate release requirement.

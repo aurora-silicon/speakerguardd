@@ -1015,7 +1015,7 @@ impl Guard {
         let origin = crate::persist::Origin { machine_id: hw.machine_id(), config: self.config_fp };
         let text = state::encode_full(after, after, &self.speakers, self.engine.as_ref(), false, true, self.recovering);
         match crate::persist::encode(&wall, &origin, pairing, &text) {
-            None => info!("{}: no synchronized clock, boot id or machine id; the next boot starts latched", pp.display()),
+            None => info!("{}: no checked realtime, independent RTC, boot id or machine id; the next boot starts latched", pp.display()),
             Some(t) => match state_write_durable(&pp, &t) {
                 Ok(()) => info!("model state kept for the next boot in {}", pp.display()),
                 Err(e) => {
