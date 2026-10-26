@@ -116,8 +116,8 @@ pub struct Globals {
     /// limit, where the daemon hands the speakers to the kernel.
     pub unified_caps: bool,
     pub p_reduction_max: f64,
-    /// Gain reduction beyond which the card's safe level takes over (dB);
-    /// `-m` overrides it.  speakersafetyd's machines use 7.
+    /// Historical handoff threshold, retained for old configs/recordings.
+    /// `-m` overrides the recorded value; writes use the hardware range.
     pub max_reduction: f64,
     /// Whether this machine's sense mapping and thermal constants have been
     /// qualified on the machine itself.  An unqualified configuration is

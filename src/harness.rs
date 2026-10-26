@@ -1004,11 +1004,11 @@ fn check(cfg: &Config, w: &World, g: &Guard, sc: &Scenario, rate: f64) -> Result
         // least what the true state needs
         if g.armed() && w.unlocked {
             let need = need(cfg, &w.oracle, k, at, rate);
-            if w.effective() < need - 0.01 && need < sc.max_reduction {
+            if w.effective() < need - 0.01 {
                 return Err(Violation(format!("(b) at {now:.4} s: {} card applies {:.3} dB, the true state needs {:.3} dB", cfg.speakers[k].name, w.effective(), need)));
             }
-            if need >= sc.max_reduction + 0.01 {
-                return Err(Violation(format!("(b) at {now:.4} s: armed while the true state needs {need:.3} dB, over --max-reduction")));
+            if need > w.reduction_limit_db().unwrap() + 0.01 {
+                return Err(Violation(format!("(b) at {now:.4} s: armed while the true state needs {need:.3} dB, beyond the hardware range")));
             }
         }
     }

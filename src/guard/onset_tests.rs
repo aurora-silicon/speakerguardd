@@ -417,7 +417,7 @@ fn a_mute_write_does_not_erase_energy_at_an_earlier_gain() {
 }
 
 #[test]
-fn the_onset_ceiling_cannot_bypass_a_governor_handoff() {
+fn the_onset_ceiling_cannot_bypass_the_hardware_range() {
     let cfg = tests::j413();
     let mut hw = FakeHw::per_speaker(&cfg);
     hw.level = Box::new(|_| 0.0);
@@ -435,12 +435,12 @@ fn the_onset_ceiling_cannot_bypass_a_governor_handoff() {
     assert!(g.armed());
     assert!(hw.per.iter().any(|r| *r > cfg.globals.max_reduction));
     for a in g.engine.as_mut().unwrap().asahi.as_mut().unwrap() {
-        a.gain = -cfg.globals.max_reduction;
+        a.gain = -100.6;
     }
     g.decide(&mut hw, false).unwrap();
     assert!(
         !g.armed(),
-        "the original governor threshold still hands the card off"
+        "an unrepresentable target must hand the card off"
     );
     assert!(hw.per.iter().all(|r| *r >= 0.0));
     let _ = std::fs::remove_file(state);

@@ -29,11 +29,20 @@ released slowly.  A windowed power budget (`p_limit_1s`, `p_limit_60s`: the
 mean power over the last second and the last minute) reduces the gain at
 once when a burst would exceed what the pair is rated for, before the coil
 has warmed up.  The larger of the two reductions is written to the card's
-speaker volume control.  If it would exceed `--max-reduction` (20 dB by
-default: a model asking for more is wrong), the daemon stops renewing the
-lock and the card falls back to its own safe level; the daemon keeps
-modelling from the sense data and takes the lock back once the reduction is
-3 dB below the limit again.
+speaker volume control. Ordinary model requests keep using that same ramp,
+including requests above the old 7 dB handoff on V/I machines. The daemon
+uses the attenuation needed by the most restrictive governor and onset
+reserve, rounded up to the card's steps. The unlocked control range is the
+limit (201 half-dB steps, or 100.5 dB, on the supported cards), rather than
+a fixed model threshold.
+
+A hard model or sense fault, lost observations, failed control write or
+unrepresentable attenuation still gives the lock back to the kernel.
+After a range fault, the target must fit with 3 dB to spare before the lock
+is taken back. Hard-temperature latches and the requirement for two good
+sense periods after bad data still apply. The old `max_reduction` setting
+and `-m` option are accepted for configuration and recording compatibility;
+they no longer cause a handoff during normal attenuation.
 
 There is no feedback: the model can only be as good as its constants.  The
 J700's constants - thermal resistances and time constants, coil temperature
@@ -42,6 +51,21 @@ machine's own loudspeaker-manager tuning, read back through the public
 AudioUnit API and recorded in the bring-up provenance record.  Without the
 daemon the kernel locks the J700's speakers 20 dB below the amplifier's
 full scale; with it, the model governs up to full scale.
+
+### Delayed wakeups
+
+A delayed wake can leave complete periods queued in the sense capture.
+The loop drains up to eight retained periods, for at most 10 ms, before
+considering a renewal. It measures those frames at their verified capture
+positions instead of first charging their time as unknown. A hard fault
+ends the drain immediately. Missing frames and uncertain position edges
+still count at full scale for their actual duration; a delay does not
+justify assuming that the music stayed quiet.
+
+The packaged service currently uses normal scheduling and does not pin
+memory. Higher priority and memory locking can reduce jitter, but cannot
+prove a deadline under I/O stalls and are not needed for the attenuation
+policy. The kernel lease is unchanged.
 
 ### Missing or invalid speaker data
 
@@ -520,8 +544,8 @@ gaps in the kernel's playing-time lease cannot hide a later onset.
 The projection uses model copies, so it adds no energy to the account.
 
 This ceiling can reduce even a quiet program. It can need more attenuation
-than `--max-reduction`, which still applies to the governor's request and
-keeps its existing handoff and re-arm rules. The ceiling only adds
+than the old `max_reduction` threshold. Both the governor request and this
+ceiling must fit the unlocked hardware range. The ceiling only adds
 attenuation to an otherwise permitted write. If the old queued audio
 already uses the available headroom, the guard gives up the lease. Mute
 does not erase those earlier gains. J700 has no V/I path and keeps its
@@ -745,11 +769,10 @@ deliberate `--allow-unqualified` opt-in. The packaged unit omits redundant
 default arguments; local units may continue to use them.
 
 `-C <card id>` selects a card (by default the one the macaudio driver
-registered, never the AOP card that shares its `AppleJ` prefix), `-m <dB>`
-the reduction at which the card's safe level takes over, `-s <file>` the
+registered, never the AOP card that shares its `AppleJ` prefix), `-s <file>` the
 model state file (`-s ''` for none).  `--governor legacy|asahi|unified`
 overrides the configuration's governor, `--guard asahi|none` its guard, and
-`-m` defaults to its `max_reduction`; `--shadow` turns the shadow log on,
+`-m` retains its historical recording value; `--shadow` turns the shadow log on,
 and `--experimental-unified` and `--allow-unqualified` are the two opt-ins
 described above.
 
@@ -766,7 +789,7 @@ its own feed-forward state and resistance before each output write. Its
 Asahi shadow cannot supply that bound. The existing V/I reserve remains in effect too. The FF reserve shares the
 V/I onset calculation and includes old queued audio, a possible renewed lease, idle
 gaps and the kernel safe-level tail. It changes neither measured heat nor
-power-budget history. Existing latches and handoff thresholds still apply.
+power-budget history. Existing hard latches still apply. A range fault uses the hardware limit and its re-arm margin.
 J700 keeps its legacy floor policy and independent hot-node initialization.
 
 A draft profile whose declared fallback does not fit the reserve stays

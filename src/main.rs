@@ -9,8 +9,8 @@
 //! this daemon holds the lock on it and keeps writing the unlock control
 //! (the same interlock the other Macs' speakersafetyd uses).  Whenever the
 //! daemon cannot vouch for the speakers -- no complete sense data for longer
-//! than the stall timeout, or a model asking for more than
-//! `--max-reduction` -- it stops renewing the lock, the card falls back to
+//! than the stall timeout, a hard fault or a target beyond the hardware
+//! range -- it stops renewing the lock, the card falls back to
 //! its safe volume, and the daemon takes the lock back once it can.
 
 mod alsa;
@@ -110,7 +110,7 @@ fn usage() -> ! {
          -c, --config-path <DIR>         Directory holding <vendor>/<model>.conf\n  \
          -C, --card <ID>                 ALSA card id (default: the macaudio card)\n  \
          --wait-for-card <SECONDS>       Wait for card discovery before failing (default 30; 0 disables waiting)\n  \
-         -m, --max-reduction <DB>        Gain reduction beyond which the card's safe level takes over (default: the config's, else 20)\n  \
+         -m, --max-reduction <DB>        Historical recording threshold, accepted for compatibility (writes use the hardware range)\n  \
          -s, --state <FILE>              Model state kept across restarts (default /run/speakerguardd/state)\n  \
          --persist <FILE>                Model state kept across a reboot, with boot_resume = idle (default /var/lib/speakerguardd/state; empty: never kept or resumed, still removed)\n  \
          --governor <NAME>               legacy, asahi or unified (default: the config's, else legacy)\n  \
@@ -333,8 +333,16 @@ impl Card {
     fn ping(&mut self) -> std::io::Result<()> {
         self.ctl.write_int(&self.unlock, UNLOCK_MAGIC)?;
         if self.volume_max.is_none() {
-            let (_, max) = self.ctl.int_range(&self.volume[0])?;
-            self.volume_max = Some(max);
+            let range = self.ctl.int_range(&self.volume[0])?;
+            if range.0 != self.volume_min || range.1 < range.0 {
+                return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+            }
+            for id in &self.volume[1..] {
+                if self.ctl.int_range(id)? != range {
+                    return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+                }
+            }
+            self.volume_max = Some(range.1);
         }
         Ok(())
     }
@@ -420,6 +428,9 @@ impl Hw for RealHw {
     }
     fn set_reductions(&mut self, db: &[f64]) -> std::io::Result<Vec<f64>> {
         self.card.write_reductions(db)
+    }
+    fn reduction_limit_db(&self) -> Option<f64> {
+        self.card.volume_max.map(|max| (max - self.card.volume_min) as f64 / STEPS_PER_DB)
     }
     fn step_db(&self) -> f64 {
         1.0 / STEPS_PER_DB
@@ -742,7 +753,7 @@ mod tests {
 
     #[test]
     fn an_unreachable_reduction_is_refused_instead_of_clamped() {
-        for (min, max) in [(0, 200), (-100, 48), (7, 7)] {
+        for (min, max) in [(0, 201), (0, 200), (-100, 48), (7, 7)] {
             let most = (max - min) as f64 / STEPS_PER_DB;
             assert_eq!(reduction_value(min, max, 0.0).unwrap(), max);
             assert_eq!(reduction_value(min, max, most).unwrap(), min);
