@@ -16,7 +16,9 @@ use std::time::Duration;
 use crate::config::Globals;
 use crate::model::SpeakerState;
 
-const MAGIC: &str = "speakerguardd-state 2";
+// A pre-bound initializer may have underestimated the magnet even
+// after a clean stop. New and old readers fail closed across this boundary.
+const MAGIC: &str = "speakerguardd-state 3";
 /// The format 0.1.2 to 0.1.5 wrote: never resumed.
 const MAGIC_V1: &str = "speakerguardd-state 1";
 
@@ -76,11 +78,11 @@ pub fn encode(boottime: Duration, covered: Duration, speakers: &[SpeakerState], 
     out
 }
 
-/// None for anything but a complete, finite, physically possible v2 state.
+/// None for anything but a complete, finite, physically possible current-generation state.
 /// A v1 file decodes as never released (it is not resumed).
 pub fn decode(text: &str) -> Option<Saved> {
     let mut lines = text.lines();
-    let v2 = match lines.next()? {
+    let current = match lines.next()? {
         MAGIC => true,
         MAGIC_V1 => false,
         _ => return None,
@@ -120,7 +122,7 @@ pub fn decode(text: &str) -> Option<Saved> {
             continue;
         }
         let f: Vec<&str> = line.split_whitespace().collect();
-        let fields = if v2 { 10 } else { 8 };
+        let fields = if current { 10 } else { 8 };
         if f.len() != fields || f[0] != "speaker" {
             return None;
         }
@@ -128,7 +130,7 @@ pub fn decode(text: &str) -> Option<Saved> {
         if v.iter().any(|x| !x.is_finite()) || v[2] < 0.0 || v[3] < 0.0 || v[0] < -50.0 || v[1] < -50.0 || v[5] < 0.0 {
             return None;
         }
-        let (hard, t_peak) = if v2 {
+        let (hard, t_peak) = if current {
             let peak: f64 = f[9].parse().ok().filter(|p: &f64| p.is_finite())?;
             (flag(f[8])?, peak)
         } else {
@@ -136,11 +138,11 @@ pub fn decode(text: &str) -> Option<Saved> {
         };
         speakers.push(SavedSpeaker { name: f[1].to_string(), t_coil: v[0], t_magnet: v[1], mean_1s: v[2], mean_60s: v[3], reduction_db: v[5], hard, t_peak });
     }
-    if speakers.is_empty() || (v2 && !ended) {
+    if speakers.is_empty() || (current && !ended) {
         return None;
     }
     let covered = Duration::from_nanos(covered.unwrap_or(0).min(ns));
-    Some(Saved { boottime: Duration::from_nanos(ns), covered, armed, released: v2 && released && !armed, speakers })
+    Some(Saved { boottime: Duration::from_nanos(ns), covered, armed, released: current && released && !armed, speakers })
 }
 
 /// Continue every speaker from a clean stop's state and charge the time
@@ -208,6 +210,27 @@ mod tests {
 
     const T: Duration = Duration::from_secs(100);
 
+    /// A clean marker proves the previous process stopped, not that its
+    /// older initializer bounded an independently hot magnet. Do not
+    /// promote those temperatures across the model-generation boundary.
+    #[test]
+    fn an_old_clean_snapshot_cannot_carry_the_old_magnet_bound() {
+        let (cfg, mut sp) = hot();
+        for s in &mut sp {
+            s.t_coil = s.spec.t_limit;
+            s.t_magnet = cfg.globals.t_ambient
+                + (s.spec.t_limit - cfg.globals.t_ambient)
+                    * s.spec.tr_magnet / (s.spec.tr_coil + s.spec.tr_magnet);
+            s.hard = true;
+            s.t_peak = s.spec.t_limit;
+            assert!(s.t_magnet < s.spec.t_limit);
+        }
+        let current = encode(T, T, &sp, false, true);
+        let old = format!("speakerguardd-state 2\n{}", current.split_once('\n').unwrap().1);
+        assert!(decode(&old).is_none(), "pre-bound model state was trusted after upgrade");
+        assert!(decode(&current).unwrap().released);
+    }
+
     #[test]
     fn round_trip() {
         let (_, mut sp) = hot();
@@ -230,7 +253,7 @@ mod tests {
         let (_, sp) = hot();
         let good = encode(T, T, &sp, false, true);
         assert!(decode("").is_none());
-        assert!(decode(&good.replace("speakerguardd-state 2", "speakerguardd-state 3")).is_none());
+        assert!(decode(&good.replace("speakerguardd-state 3", "speakerguardd-state 4")).is_none());
         let end = good.find("\nend").unwrap() + 4;
         for n in 0..end {
             assert!(decode(&good[..n]).is_none(), "accepted a prefix of {n} bytes");
@@ -317,7 +340,7 @@ mod tests {
             s.resume(100.0, 100.0, 0.0, 0.0);
         }
         let v1 = encode(T, T, &sp, false, true)
-            .replace("speakerguardd-state 2", "speakerguardd-state 1")
+            .replace("speakerguardd-state 3", "speakerguardd-state 1")
             .lines()
             .filter(|l| !l.starts_with("covered_ns") && !l.starts_with("released") && *l != "end")
             .map(|l| if l.starts_with("speaker ") { l.split_whitespace().take(8).collect::<Vec<_>>().join(" ") } else { l.to_string() })

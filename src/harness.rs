@@ -979,7 +979,7 @@ fn damage(path: &PathBuf, how: Damage, rng: &mut Rng) {
         Damage::OldFormat => {
             if let Ok(t) = std::fs::read_to_string(path) {
                 let v1: Vec<String> = t
-                    .replace("speakerguardd-state 2", "speakerguardd-state 1")
+                    .replace("speakerguardd-state 3", "speakerguardd-state 1")
                     .lines()
                     .filter(|l| !l.starts_with("covered_ns") && !l.starts_with("released") && *l != "end")
                     .map(|l| if l.starts_with("speaker ") { l.split_whitespace().take(8).collect::<Vec<_>>().join(" ") } else { l.to_string() })
