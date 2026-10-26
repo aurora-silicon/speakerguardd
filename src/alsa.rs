@@ -293,9 +293,9 @@ impl Ctl {
         Ok(())
     }
 
-    /// Drain the queued events; true if one was about `numid`.
-    pub fn events(&self, numid: u32) -> io::Result<bool> {
-        let mut hit = false;
+    /// Drain controls, keeping a rate change distinct from gate readiness.
+    pub fn events(&self, rate_id:u32, energy_id:Option<u32>) -> io::Result<(bool,bool)> {
+        let mut hit = (false,false);
         // SAFETY: all-zero events are valid; read() fills whole ones.
         let mut buf: [CtlEvent; 32] = unsafe { std::mem::zeroed() };
         loop {
@@ -310,7 +310,8 @@ impl Ctl {
                 };
             }
             let count = n as usize / std::mem::size_of::<CtlEvent>();
-            hit |= buf[..count].iter().any(|ev| ev.ty == CTL_EVENT_ELEM && ev.id.numid == numid);
+            hit.0 |= buf[..count].iter().any(|ev|ev.ty==CTL_EVENT_ELEM && ev.id.numid==rate_id);
+            hit.1 |= buf[..count].iter().any(|ev|ev.ty==CTL_EVENT_ELEM && Some(ev.id.numid)==energy_id);
             if count < buf.len() {
                 return Ok(hit);
             }
@@ -681,6 +682,30 @@ pub const PERIOD_WAIT_MS: libc::c_int = 50;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn energy_readiness_wakes_without_fabricating_a_rate_event() {
+        use std::os::fd::FromRawFd;
+        use std::io::Write;
+        let mut fds=[-1;2];
+        // SAFETY: two writable fd slots; both returned descriptors are owned.
+        assert_eq!(unsafe {libc::pipe2(fds.as_mut_ptr(),libc::O_NONBLOCK|libc::O_CLOEXEC)},0);
+        let ctl=Ctl{file:unsafe {File::from_raw_fd(fds[0])},card:0};
+        let mut writer=unsafe {File::from_raw_fd(fds[1])};
+        let send=|writer:&mut File,numid:u32| {
+            // SAFETY: zero initializes every byte including padding; this
+            // pipe fixture carries exactly the public event structure.
+            let mut event:CtlEvent=unsafe {std::mem::zeroed()};
+            event.id.numid=numid;
+            let bytes=unsafe {std::slice::from_raw_parts((&event as *const CtlEvent).cast::<u8>(),std::mem::size_of_val(&event))};
+            writer.write_all(bytes).unwrap();
+        };
+        send(&mut writer,20);send(&mut writer,30);
+        assert_eq!(ctl.events(10,Some(20)).unwrap(),(false,true));
+        assert_eq!(ctl.events(10,Some(20)).unwrap(),(false,false));
+        send(&mut writer,10);send(&mut writer,20);
+        assert_eq!(ctl.events(10,Some(20)).unwrap(),(true,true));
+    }
 
     #[test]
     fn layouts_match_asound_h() {

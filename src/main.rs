@@ -359,12 +359,12 @@ impl Card {
         Ok(())
     }
 
-    /// Drain the queued events; true while a sample-rate change is pending.
+    /// Gate readiness wakes the loop without inventing a sample-rate edge.
     fn drain(&mut self) -> std::io::Result<bool> {
-        if self.events && self.ctl.events(self.sample_rate.numid)? {
-            self.rate_event = true;
-        }
-        Ok(self.rate_event)
+        let (rate,energy)=if self.events {self.ctl.events(self.sample_rate.numid,self.energy.as_ref().map(|e|e.numid))?}
+            else {(false,false)};
+        self.rate_event |= rate;
+        Ok(self.rate_event || energy)
     }
 
     /// The control value for a reduction, rounded up to the control's
@@ -511,7 +511,7 @@ impl Hw for RealHw {
         let deadline = Instant::now() + timeout;
         loop {
             match self.card.drain() {
-                Ok(true) => return true,
+                Ok(true) => return self.card.rate_event,
                 Ok(false) => {}
                 Err(_) => {
                     // the events are only a wake-up: fall back to the poll
@@ -531,7 +531,8 @@ impl Hw for RealHw {
         }
     }
     fn rate_events(&mut self) -> bool {
-        let pending = self.card.drain().unwrap_or(true);
+        let failed=self.card.drain().is_err();
+        let pending=self.card.rate_event || failed;
         self.card.rate_event = false;
         pending
     }

@@ -1,37 +1,37 @@
 {
   "speaker-energy.c": {
     "upstream": "sound/soc/apple/speaker-energy.c",
-    "commit": "d4d6c2706ef3736c1b9572ed7996be49a5a627c4",
+    "commit": "20b673e9ec1bca0b234363d78a9c086bd8b3156d",
     "sha256": "8d47f64f2ea7e70747c193087f58435675732fe4538ef18c481c93f954919544"
   },
   "speaker-energy.h": {
     "upstream": "sound/soc/apple/speaker-energy.h",
-    "commit": "d4d6c2706ef3736c1b9572ed7996be49a5a627c4",
+    "commit": "20b673e9ec1bca0b234363d78a9c086bd8b3156d",
     "sha256": "df68f3277aa18d6e0c6fcd19094b23bca8309ee3ab7ef197bbd4a4873c256413"
   },
   "apple-admac-payload.h": {
     "upstream": "drivers/dma/apple-admac-payload.h",
-    "commit": "d4d6c2706ef3736c1b9572ed7996be49a5a627c4",
+    "commit": "20b673e9ec1bca0b234363d78a9c086bd8b3156d",
     "sha256": "7979122d22a9908a716dce211d4c17970deb662e33049a9d7de5d0cec0e6bada"
   },
   "apple-admac.h": {
     "upstream": "include/linux/dma/apple-admac.h",
-    "commit": "d4d6c2706ef3736c1b9572ed7996be49a5a627c4",
+    "commit": "20b673e9ec1bca0b234363d78a9c086bd8b3156d",
     "sha256": "47946247974a13f30cca6ccfd5b8ff0be28616dcadfb5b7aad3ce80c4c8261ae"
   },
   "apple-speaker.h": {
     "upstream": "include/uapi/sound/apple-speaker.h",
-    "commit": "d4d6c2706ef3736c1b9572ed7996be49a5a627c4",
-    "sha256": "3cd87fa90a20a6b0c03f745428615e1540eb4169d965dfb975a4b539bfdb6d2c"
+    "commit": "20b673e9ec1bca0b234363d78a9c086bd8b3156d",
+    "sha256": "cb1a71fae24b32612216fefbbef179f1f8514e7614d41f9931ace3c4c0d11ad5"
   },
   "gate-host.c": {
     "upstream": "tools/testing/selftests/alsa/apple-speaker-energy/gate-host.c",
-    "commit": "d4d6c2706ef3736c1b9572ed7996be49a5a627c4",
-    "sha256": "6ebf630a8427ef99d743d877fd5c08abadee39ebd8a00919822de971c34dc616"
+    "commit": "20b673e9ec1bca0b234363d78a9c086bd8b3156d",
+    "sha256": "72c21360a6986a0c20213b7b3f8d4ecb8fededc443d570a3aa4fcb6854703dfd"
   },
   "build-host.py": {
     "upstream": "tools/testing/selftests/alsa/apple-speaker-energy/build-host.py",
-    "commit": "d4d6c2706ef3736c1b9572ed7996be49a5a627c4",
+    "commit": "20b673e9ec1bca0b234363d78a9c086bd8b3156d",
     "sha256": "bbf6039e0b68c2dd95a42f63bd13356ceff85526db0c57ee33cb5b052b834f73"
   }
 }

@@ -412,6 +412,7 @@ fn rec_do(rec: &mut Option<Recorder>, t: Duration, f: impl FnOnce(&mut Recorder,
 pub struct Guard {
     playback_cfg: Config,
     playback: Option<crate::playback_model::PlaybackModel>,
+    playback_required: bool,
     globals: Globals,
     pub speakers: Vec<SpeakerState>,
     // Historical config/recording value, retained for replay compatibility.
@@ -759,6 +760,7 @@ impl Guard {
         let mut g = Guard {
             playback_cfg: cfg.clone(),
             playback: None,
+            playback_required: false,
             words: vec![0i32; globals.period * globals.channels],
             globals,
             speakers,
@@ -1294,9 +1296,10 @@ impl Guard {
     fn refresh_playback<H: Hw>(&mut self, hw: &mut H) -> Result<(), Box<dyn Error>> {
         let status=hw.playback_status()?;
         let Some(status)=status else {
-            if self.playback.is_some() {return Err("the active playback contract disappeared".into());}
+            if self.playback.is_some() || self.playback_required {return Err("the active playback contract disappeared".into());}
             return Ok(());
         };
+        self.playback_required |= status.flags & crate::playback::REQUIRED != 0;
         let wire=status.wire();
         rec_now(&mut self.rec,hw,|r,t|r.playback_receipt(t,&wire));
         if self.playback.is_none() {
@@ -1336,6 +1339,10 @@ impl Guard {
             if !(speaker.t_peak<speaker.spec.t_limit) {speaker.hard=true;}
             speaker.set_playback_means(row.means.0,row.means.1);
             speaker.govern(&self.globals);
+            // The finite grant bounds FF thermal and delivered power budgets
+            // in path. Keep the independent V/I scalar guard, without applying
+            // a second legacy ramp to the deliberately pessimistic queue dose.
+            speaker.reduction_db=0.0;
         }
         if let Some(engine)=&mut self.engine {engine.adopt_playback(&rows);}
         let from=self.account_to;
@@ -1914,6 +1921,7 @@ impl Guard {
 
     fn bound_onset(&self, now: Instant, per: &mut [f64]) -> bool {
         if let Some(playback)=&self.playback {return playback.ready;}
+        if self.playback_required {return false;}
         let pending = self.least_since(self.account_to);
         // A target write can block while the old lease runs down. Keep
         // that entire allowance and its queue at the old or new gain;
@@ -2016,7 +2024,7 @@ impl Guard {
             if let Some(why) = why {
                 self.disarm(hw, &why)?;
             }
-        } else if !self.stopping && !self.unknown && !hard && onset_ready && range_ready && self.events && !renew_now && !self.recovering {
+        } else if !self.stopping && !self.unknown && !hard && onset_ready && range_ready && self.events && (!renew_now || self.playback.is_some()) && !self.recovering {
             // after bad sense data, REARM_PERIODS valid periods in a row
             // first, idle or not (review P8-2)
             // A qualified finite grant already bounds unseen playback. A
@@ -2926,6 +2934,19 @@ pub(crate) mod tests {
         assert!(hw.max_ping_gap(Duration::ZERO, hw.t) < LOCK_TIMEOUT);
         assert_eq!(hw.reduction, 0.0);
         assert_eq!(hw.opens, 1);
+    }
+
+    #[test]
+    fn unsupported_profiles_cannot_unlock_a_required_kernel_gate() {
+        let mut cfg=j700();
+        let mut hw=FakeHw::new(cfg.globals.channels,cfg.globals.period);
+        hw.enable_gate(&cfg);
+        cfg.playback_cards.clear();cfg.playback_slots.clear();
+        let mut g=Guard::start(&mut hw,&cfg,20.0,tmp_state()).unwrap();
+        run_until(&mut g,&mut hw,Duration::from_secs(3)).unwrap();
+        assert!(g.playback.is_none() && g.playback_required);
+        assert!(!g.armed());assert!(hw.pings.is_empty());
+        assert!(!hw.gate.as_ref().unwrap().gate.unlocked(hw.boottime().as_nanos().try_into().unwrap()));
     }
 
     #[test]

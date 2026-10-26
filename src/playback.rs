@@ -16,6 +16,7 @@ pub const FAILED: u32 = 8;
 pub const OWNED: u32 = 16;
 pub const LIVE: u32 = 32;
 pub const PLAYING: u32 = 64;
+pub const REQUIRED: u32 = 128;
 const REVOKE: u32 = 1 << 31;
 
 fn invalid() -> io::Error {
@@ -107,7 +108,7 @@ impl Snapshot {
             wire,
             order: std::array::from_fn(|k| k),
         };
-        if out.flags & !127 != 0
+        if out.flags & !255 != 0
             || out.speakers > SPEAKERS
             || out.channels > SPEAKERS
             || out.pending > 8
@@ -179,7 +180,7 @@ impl Snapshot {
     /// Only a kernel certificate for the complete downstream path qualifies.
     /// Unknown versions/profiles keep the existing conservative policy.
     pub fn qualified(&self, cfg: &crate::config::Config) -> bool {
-        let required = AVAILABLE | CONFIGURED | TRANSFER_VALID | OWNED;
+        let required = AVAILABLE | CONFIGURED | TRANSFER_VALID | OWNED | REQUIRED;
         self.flags & required == required
             && self.flags & FAILED == 0
             && [1, 2].contains(&self.transfer)
@@ -238,7 +239,7 @@ mod tests {
         put32(
             &mut wire,
             4,
-            AVAILABLE | CONFIGURED | TRANSFER_VALID | OWNED,
+            AVAILABLE | CONFIGURED | TRANSFER_VALID | OWNED | REQUIRED,
         );
         put64(&mut wire, 8, 1);
         put64(&mut wire, 16, 1);

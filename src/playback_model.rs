@@ -96,7 +96,12 @@ impl PlaybackModel {
                     vi
                 });
                 let voltage = crate::engine::v_worst(s, &cfg.globals).max(s.vs_scale);
-                let full = voltage * voltage / s.z_min() * ASAHI_MARGIN;
+                let margin = if s.is_chan.is_some() {
+                    ASAHI_MARGIN
+                } else {
+                    1.0
+                };
+                let full = voltage * voltage / s.z_min() * margin;
                 let denominator = if status.transfer == 2 {
                     20000.0
                 } else {
@@ -168,6 +173,8 @@ impl PlaybackModel {
         let status = status.for_profile(&self.cfg)?;
         if status.flags & playback::FAILED != 0
             || status.card != self.last.card
+            || status.amp_gain_millidbv != self.last.amp_gain_millidbv
+            || status.safe_reduction_millidb != self.last.safe_reduction_millidb
             || status.epoch < self.last.epoch
             || (status.epoch == self.last.epoch && status.sequence < self.last.sequence)
             || status.speakers != self.drivers.len()
@@ -176,6 +183,9 @@ impl PlaybackModel {
             return Err(bad());
         }
         let dt = (status.clock_ns - self.last.clock_ns) as f64 * 1e-9;
+        let unobserved_source = (status.flags & playback::PLAYING != 0
+            && !status.qualified(&self.cfg))
+            || (self.last.flags & playback::PLAYING != 0 && !self.last.qualified(&self.cfg));
         let mut source = Vec::new();
         let mut delivered = Vec::new();
         let mut rows = Vec::new();
@@ -232,7 +242,16 @@ impl PlaybackModel {
                     vi_peak.1 = vi_peak.1.max(a[k].magnet_peak);
                 }
             }
-            source.push(playback::joules(raw, driver.full));
+            // Unsupported live routes retain the old full-scale source
+            // budget assumption, even while hardware caps bound their heat.
+            source.push(
+                playback::joules(raw, driver.full)
+                    + if unobserved_source {
+                        driver.full * dt
+                    } else {
+                        0.0
+                    },
+            );
             delivered.push(e);
             rows.push(Projection {
                 ff,
@@ -403,5 +422,41 @@ impl PlaybackModel {
             self.drivers.iter().map(|d| d.full * dt).collect(),
         ));
         self.update(snapshot)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gate_sim::KernelGate;
+    #[test]
+    fn unsupported_live_routes_keep_conservative_source_budgets() {
+        let cfg = Config::parse(include_str!("../conf/apple/j413.conf")).unwrap();
+        let mut gate = KernelGate::new(&cfg, 48000, 64);
+        gate.start(1).unwrap();
+        gate.owner(true, 1).unwrap();
+        let states = cfg
+            .speakers
+            .iter()
+            .cloned()
+            .map(|s| SpeakerState::with_globals(s, &cfg.globals))
+            .collect::<Vec<_>>();
+        let engine = Engine::new(&cfg, true);
+        let mut model = PlaybackModel::new(
+            &cfg,
+            &states,
+            engine.as_ref(),
+            Instant::now(),
+            gate.status(1).unwrap(),
+        )
+        .unwrap();
+        let mut unsupported = gate.status(1_000_000_001).unwrap();
+        unsupported.flags &= !playback::CONFIGURED;
+        let rows = model.update(unsupported).unwrap();
+        assert!(model.packet().unwrap().is_none());
+        assert!(rows.iter().all(|r| r.means.0 > 1.0));
+        let mut bad = gate.status(1_000_000_002).unwrap();
+        bad.safe_reduction_millidb -= 1;
+        assert!(model.update(bad).is_err());
     }
 }

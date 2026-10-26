@@ -340,6 +340,7 @@ pub struct DescriptorQueue {
     rate: u32,
     boot_ns: u64,
     next: u64,
+    playing: bool,
     rows: std::collections::VecDeque<Rendered>,
     active: std::collections::VecDeque<(u64, u64)>,
 }
@@ -357,6 +358,7 @@ impl DescriptorQueue {
             rate,
             boot_ns,
             next: 0,
+            playing: true,
             rows: Default::default(),
             active: Default::default(),
         }
@@ -364,14 +366,34 @@ impl DescriptorQueue {
     pub fn ns(&self, seconds: f64) -> u64 {
         self.boot_ns + (seconds * 1e9).round() as u64
     }
+    /// A PCM close proves discard; a new prepare starts a distinct epoch.
+    /// Retired discarded copies remain conservatively billed as possibly played.
+    pub fn set_playing(&mut self, playing: bool, seconds: f64) -> bool {
+        if self.playing == playing {
+            return false;
+        }
+        let now = self.ns(seconds);
+        if playing {
+            self.gate.start(now).unwrap();
+            self.next = (seconds * f64::from(self.rate)).ceil() as u64;
+        } else {
+            self.gate.stop(now).unwrap();
+            self.active.clear();
+        }
+        self.playing = playing;
+        true
+    }
     /// Render at descriptor-publication boundaries, including during a
     /// userspace stall. Retire each descriptor exactly once in FIFO order.
     pub fn advance(&mut self, seconds: f64, mut programme: impl FnMut(u64, usize) -> f64) {
+        if !self.playing {
+            return;
+        }
         let target = (seconds * f64::from(self.rate)).floor() as u64;
         let mut at = self
             .active
             .front()
-            .map_or(0, |r| r.0.saturating_sub(self.gate.frames as u64));
+            .map_or(self.next, |r| r.0.saturating_sub(self.gate.frames as u64));
         loop {
             if at > target {
                 break;
@@ -565,4 +587,38 @@ fn a_restart_never_forgives_possibly_played_payloads() {
     assert_eq!(after.completed, before.submitted);
     assert_eq!(after.refunded, before.refunded);
     assert!(!gate.unlocked(6));
+}
+
+#[test]
+fn pcm_close_and_restart_revoke_and_replace_overlapping_future_copies() {
+    let cfg = Config::parse(include_str!("../conf/apple/j413.conf")).unwrap();
+    let mut q = DescriptorQueue::new(&cfg, 48000, 4096, 1_000_000_000);
+    q.gate.owner(true, q.ns(0.0)).unwrap();
+    let s = q.gate.status(q.ns(0.0)).unwrap();
+    let old = s
+        .grant(
+            &vec![1 << 44; s.speakers],
+            &vec![crate::playback::UNITY; s.speakers],
+        )
+        .unwrap();
+    q.gate.write(&old, q.ns(0.0)).unwrap();
+    q.advance(0.0, |_, _| 0.8);
+    let before = q.gate.status(q.ns(0.01)).unwrap();
+    q.set_playing(false, 0.01);
+    let stopped = q.gate.status(q.ns(0.01)).unwrap();
+    assert_eq!(stopped.completed, before.submitted);
+    assert_eq!(stopped.pending, 0);
+    assert!(!q.gate.unlocked(q.ns(0.01)));
+    q.set_playing(true, 0.02);
+    q.advance(0.02, |_, _| 0.2);
+    let after = q.gate.status(q.ns(0.02)).unwrap();
+    assert!(after.epoch > before.epoch);
+    assert_eq!(after.submitted, before.submitted);
+    assert!(q.sample(1000, 0) < (2147483647.0 * 0.201) as i32);
+    assert!(q.sample(1000, 0) > (2147483647.0 * 0.199) as i32);
+    assert_eq!(
+        q.gate.write(&old, q.ns(0.02)).unwrap_err().raw_os_error(),
+        Some(libc::ESTALE)
+    );
+    assert!(!q.gate.unlocked(q.ns(0.02)));
 }
