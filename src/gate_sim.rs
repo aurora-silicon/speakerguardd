@@ -341,6 +341,7 @@ pub struct DescriptorQueue {
     boot_ns: u64,
     next: u64,
     playing: bool,
+    pub debug_case: u64,
     rows: std::collections::VecDeque<Rendered>,
     active: std::collections::VecDeque<(u64, u64)>,
 }
@@ -359,12 +360,37 @@ impl DescriptorQueue {
             boot_ns,
             next: 0,
             playing: true,
+            debug_case: 0,
             rows: Default::default(),
             active: Default::default(),
         }
     }
     pub fn ns(&self, seconds: f64) -> u64 {
         self.boot_ns + (seconds * 1e9).round() as u64
+    }
+    fn first_frame(seconds: f64, rate: u32) -> u64 {
+        let rate = f64::from(rate);
+        let mut n = (seconds * rate).ceil() as u64;
+        // Match the plant's sample-time comparison exactly; ceil of a
+        // rounded (n/rate)*rate can otherwise invent a one-frame hole.
+        while n > 0 && (n - 1) as f64 / rate >= seconds {
+            n -= 1;
+        }
+        while (n as f64 / rate) < seconds {
+            n += 1;
+        }
+        n
+    }
+    fn frame_at(seconds: f64, rate: u32) -> u64 {
+        let rate = f64::from(rate);
+        let mut n = (seconds * rate).floor() as u64;
+        while (n + 1) as f64 / rate <= seconds {
+            n += 1;
+        }
+        while n > 0 && n as f64 / rate > seconds {
+            n -= 1;
+        }
+        n
     }
     /// A PCM close proves discard; a new prepare starts a distinct epoch.
     /// Retired discarded copies remain conservatively billed as possibly played.
@@ -375,7 +401,7 @@ impl DescriptorQueue {
         let now = self.ns(seconds);
         if playing {
             self.gate.start(now).unwrap();
-            self.next = (seconds * f64::from(self.rate)).ceil() as u64;
+            self.next = Self::first_frame(seconds, self.rate);
         } else {
             self.gate.stop(now).unwrap();
             self.active.clear();
@@ -389,7 +415,7 @@ impl DescriptorQueue {
         if !self.playing {
             return;
         }
-        let target = (seconds * f64::from(self.rate)).floor() as u64;
+        let target = Self::frame_at(seconds, self.rate);
         let mut at = self
             .active
             .front()
@@ -439,7 +465,8 @@ impl DescriptorQueue {
             .iter()
             .rev()
             .find(|r| r.start <= n && n < r.start + self.gate.frames as u64)
-            .expect("oracle cannot read unrendered playback");
+            .unwrap_or_else(||panic!("oracle cannot read unrendered playback: case={} frame={n} model={k} next={} playing={} rows={} first={:?} last={:?}",
+                self.debug_case,self.next,self.playing,self.rows.len(),self.rows.front().map(|r|r.start),self.rows.back().map(|r|r.start)));
         let physical = self
             .gate
             .model_of_slot
@@ -621,4 +648,18 @@ fn pcm_close_and_restart_revoke_and_replace_overlapping_future_copies() {
         Some(libc::ESTALE)
     );
     assert!(!q.gate.unlocked(q.ns(0.02)));
+}
+
+#[test]
+fn pcm_epochs_start_on_the_same_grid_as_the_sample_oracle() {
+    for rate in [44100, 48000, 96000, 192000] {
+        for n in (0..rate as u64).step_by(37) {
+            let t = n as f64 / f64::from(rate);
+            assert_eq!(DescriptorQueue::first_frame(t, rate), n);
+            assert_eq!(DescriptorQueue::frame_at(t, rate), n);
+            let after = t + 0.25 / f64::from(rate);
+            assert_eq!(DescriptorQueue::first_frame(after, rate), n + 1);
+            assert_eq!(DescriptorQueue::frame_at(after, rate), n);
+        }
+    }
 }

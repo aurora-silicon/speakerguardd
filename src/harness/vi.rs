@@ -1430,6 +1430,7 @@ fn run_internal(sc:&ViScenario,seed:u64,use_gate:bool)->Result<Outcome,Violation
     }
     let mut rng = Rng::new(seed ^ 0x5eed);
     let mut w = ViWorld::new(sc, &cfg,use_gate);
+    if let Some(q)=&mut w.gate {q.debug_case=seed;}
     let mut restarts = sc.restarts.clone();
     restarts.sort_by(|a, b| a.at.total_cmp(&b.at));
     let mut next_restart = 0;
