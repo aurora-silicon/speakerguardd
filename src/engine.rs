@@ -91,6 +91,12 @@ pub const VI_NOISE_FLOOR: f64 = 1e-3;
 /// sense's rail.
 const I_RAIL: f64 = (32767i64 << 16) as f64;
 
+/// A voltage rail below the declared amplifier cap is a lower reading,
+/// not a ceiling on delivered voltage. S16 sense words arrive widened.
+fn voltage_clipped(word: f64, scale: f64, amplifier: f64) -> bool {
+    word.abs() >= I_RAIL && amplifier > scale * 2147483648.0
+}
+
 /// The power one sample of V and I words stands for (W).  A current word
 /// at its rail says only that the current was at least that much (review
 /// Z2 of speakerguardd#8: at full scale the J316 and J616 woofers' 2.7 ohm
@@ -769,7 +775,9 @@ impl AsahiSpeaker {
         let mut negative_after = false;
         for (i, f) in words.chunks_exact(channels).enumerate() {
             let (ac, am) = if i == 0 { (ac1, am1) } else { (acn, amn) };
-            let p = if lost {
+            let p = if voltage_clipped(f[vc] as f64, vs, self.v_worst) {
+                self.v_worst.powi(2) / self.z_min
+            } else if lost {
                 // the current line is lost: the most current there can be
                 (f[vc] as f64 * vs).powi(2) / self.z_min
             } else {
@@ -1563,21 +1571,23 @@ impl Engine {
             for f in 0..frames {
                 let wv = words[f * ch + s.vs_chan] as f64;
                 let wi = s.is_chan.map_or(0.0, |ic| words[f * ch + ic] as f64);
-                v2.push((wv * vs).powi(2));
-                vi.push(if bounded { (wv * vs).powi(2) / z_min } else { sense_power(wv, wi, (vs, is), i_max) });
+                let clipped = voltage_clipped(wv, vs, v_worst(s, &g));
+                let v_squared = if clipped { v_worst(s, &g).powi(2) } else { (wv * vs).powi(2) };
+                v2.push(v_squared);
+                vi.push(if clipped || bounded { v_squared / z_min } else { sense_power(wv, wi, (vs, is), i_max) });
                 if let Some(u) = unified {
                     let room = if wv != 0.0 { 20.0 * (2147483648.0 / wv.abs()).log10() } else { f64::INFINITY };
                     let at = converted_at(room, &possible[sk]);
                     let wide = possible[sk].iter().any(|r| r.0 <= room && r.1 - r.0 > PREDICT_SPREAD_DB);
                     known.push(at <= PREDICT_MAX_DB && !wide);
                     let gain = 10f64.powf(at / 10.0);
-                    let vup = (wv.abs() + 1.0) * vs;
+                    let vup = if clipped { v_worst(s, &g) } else { (wv.abs() + 1.0) * vs };
                     let iup = (wi.abs() + 1.0) * is;
                     let full_ff = u.v_worst * u.v_worst / u.r_ff;
                     let full_vi = u.v_worst * u.v_worst / u.z_min;
                     pre_ff.push((vup * vup / u.r_ff * gain).min(full_ff));
                     let up = if wi.abs() >= I_RAIL { (vup * iup).max(vup * i_max) } else { vup * iup };
-                    pre_vi.push(if bounded {
+                    pre_vi.push(if clipped || bounded {
                         (vup * vup / z_min * gain).min(full_vi)
                     } else if wv * wi > 0.0 || wi.abs() >= I_RAIL {
                         (up * gain).min(full_vi)
@@ -3430,4 +3440,37 @@ mod tests {
         }
     }
 
+}
+
+#[cfg(test)]
+mod amplifier_rail_tests {
+    use super::*;
+    #[test]
+    fn both_models_bound_a_voltage_rail_below_the_amplifier_cap() {
+        let mut cfg = Config::parse(include_str!("../conf/apple/j274.conf")).unwrap();
+        cfg.globals.governor = Governor::Unified;
+        cfg.globals.guard = Some(Governor::Asahi);
+        let mut engine = Engine::new(&cfg, true).unwrap();
+        let mut words = vec![0; cfg.globals.period * cfg.globals.channels];
+        for frame in words.chunks_exact_mut(cfg.globals.channels) {
+            for speaker in &cfg.speakers { frame[speaker.vs_chan] = 32767 << 16; }
+        }
+        let dt = cfg.globals.period as f64 / 48000.0;
+        let possible = vec![vec![(0.0, 0.0)]; cfg.speakers.len()];
+        engine.measured(&words, cfg.globals.period, cfg.globals.period, cfg.globals.period, 0, 1.0 / 48000.0, 1.0, &possible);
+        for (k, speaker) in cfg.speakers.iter().enumerate() {
+            let v = v_worst(speaker, &cfg.globals);
+            assert!(v > speaker.vs_scale, "the witness needs a real voltage rail");
+            let mut ff = Thermal::new(speaker.tr_coil, speaker.tau_coil, speaker.tr_magnet, speaker.tau_magnet, cfg.globals.t_ambient);
+            let mut vi = Thermal::new(speaker.vi_tr_coil, speaker.vi_tau_coil, speaker.vi_tr_magnet, speaker.vi_tau_magnet, cfg.globals.t_ambient);
+            ff.hold(v * v / speaker.r_ff, dt, cfg.globals.t_ambient);
+            vi.hold(v * v / speaker.z_min(), dt, cfg.globals.t_ambient);
+            let a = &engine.asahi.as_ref().unwrap()[k].th;
+            let u = &engine.unified.as_ref().unwrap()[k];
+            // Independent integration orders differ by a few picokelvin.
+            const EPS: f64 = 1e-9;
+            assert!(a.t_coil + EPS >= vi.t_coil && a.t_magnet + EPS >= vi.t_magnet, "V/I {a:?} under {vi:?}");
+            assert!(u.ff.t_coil + EPS >= ff.t_coil && u.ff.t_magnet + EPS >= ff.t_magnet, "FF {:?} under {ff:?}", u.ff);
+        }
+    }
 }

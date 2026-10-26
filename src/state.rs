@@ -266,6 +266,8 @@ pub fn decode(text: &str) -> Option<Saved> {
 /// bounds, latched. True
 /// if the state was resumed.
 pub fn restore(speakers: &mut [SpeakerState], saved: &Saved, now: Duration, globals: &Globals) -> bool {
+    // The voltage cap is derived from the active configuration, not saved.
+    for speaker in speakers.iter_mut() { speaker.configure_voltage(globals); }
     let proven = saved.proven();
     let elapsed = now.saturating_sub(saved.boottime).as_secs_f64();
     for s in speakers.iter_mut() {

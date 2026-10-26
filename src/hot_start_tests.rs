@@ -34,8 +34,9 @@ fn every_profile_bounds_independent_hot_nodes_and_unknown_history() {
         for spec in &cfg.speakers {
             let mut s = SpeakerState::new(spec.clone(), g.t_ambient);
             s.assume_latched(g);
-            let full = s.worst_case_power(0.0);
-            let safe = s.worst_case_power(g.safe_reduction);
+            let full = crate::engine::v_worst(spec, g).max(spec.vs_scale).powi(2) / spec.r_ff;
+            let safe = full * 10f64.powf(-g.safe_reduction.max(0.0) / 10.0);
+            assert!(s.worst_case_power(0.0) >= full - 1e-12, "{name} {} declared amplifier is not bounded", spec.name);
             assert!(s.hard && s.t_peak >= spec.t_limit);
             assert_eq!(s.mean_power(1.0), full);
             assert!((s.mean_power(60.0) - full).abs() < 1e-12);
@@ -255,7 +256,7 @@ fn check_legacy_hot_start(name: String, mut cfg: Config) {
     hw.tweak = Some(Box::new(move |_, words| {
         for frame in words.chunks_exact_mut(channels) {
             for s in &specs {
-                let v = crate::engine::v_worst(s, &gg).min(s.vs_scale);
+                let v = crate::engine::v_worst(s, &gg);
                 frame[s.vs_chan] = (frame[s.vs_chan] as f64 * v / s.vs_scale) as i32;
             }
         }
@@ -320,9 +321,7 @@ fn check_legacy_hot_start(name: String, mut cfg: Config) {
         let (mut at, mut db, mut peak) = (Duration::ZERO, MUTE_DB, s.t_limit);
         for (to, dbs) in &hw.gains {
             if *to > at {
-                let power = crate::engine::v_worst(s, &cfg.globals)
-                    .min(s.vs_scale)
-                    .powi(2)
+                let power = crate::engine::v_worst(s, &cfg.globals).powi(2)
                     / s.r_ff
                     * 10f64.powf(-db / 10.0);
                 peak = peak.max(

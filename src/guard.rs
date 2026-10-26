@@ -561,7 +561,7 @@ impl Guard {
                 return Err(format!("guard {} has no models on this machine", guard.name()).into());
             }
         }
-        let mut speakers: Vec<SpeakerState> = cfg.speakers.iter().map(|s| SpeakerState::new(s.clone(), globals.t_ambient)).collect();
+        let mut speakers: Vec<SpeakerState> = cfg.speakers.iter().map(|s| SpeakerState::with_globals(s.clone(), &globals)).collect();
         let latched = |speakers: &mut Vec<SpeakerState>, engine: &mut Option<Engine>| {
             for s in speakers.iter_mut() {
                 s.assume_latched(&globals);
@@ -670,7 +670,7 @@ impl Guard {
                 match why {
                     Ok((p, (lo, hi), at)) => {
                         let saved = Saved { boottime: Duration::ZERO, covered: Duration::ZERO, ..p.state };
-                        let mut sp: Vec<SpeakerState> = cfg.speakers.iter().map(|s| SpeakerState::new(s.clone(), globals.t_ambient)).collect();
+                        let mut sp: Vec<SpeakerState> = cfg.speakers.iter().map(|s| SpeakerState::with_globals(s.clone(), &globals)).collect();
                         let mut en = Engine::new(cfg, governing == Governor::Unified || globals.shadow);
                         if state::restore_interval(&mut sp, &mut en, &saved, lo, hi, &globals) {
                             speakers = sp;
