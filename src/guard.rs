@@ -1104,7 +1104,7 @@ impl Guard {
         let n = self.speakers.len();
         match (self.governing, self.engine.as_ref()) {
             (Governor::Legacy, _) | (_, None) => {
-                let r = model::reduction_db(&self.speakers);
+                let r = if self.playback.is_some() {0.0} else {model::reduction_db(&self.speakers)};
                 (r, vec![r; n], self.speakers.iter().any(|s| s.hard))
             }
             (gov, Some(e)) => {
@@ -1339,10 +1339,9 @@ impl Guard {
             if !(speaker.t_peak<speaker.spec.t_limit) {speaker.hard=true;}
             speaker.set_playback_means(row.means.0,row.means.1);
             speaker.govern(&self.globals);
-            // The finite grant bounds FF thermal and delivered power budgets
-            // in path. Keep the independent V/I scalar guard, without applying
-            // a second legacy ramp to the deliberately pessimistic queue dose.
-            speaker.reduction_db=0.0;
+            // Keep the legacy demand visible in model diagnostics and saved
+            // states. The finite grant, rather than a duplicate scalar ramp,
+            // is its in-path authority (see governing_state).
         }
         if let Some(engine)=&mut self.engine {engine.adopt_playback(&rows);}
         let from=self.account_to;
@@ -1981,6 +1980,11 @@ impl Guard {
         }
         let now = hw.now();
         let blind = self.overdue(now);
+        if self.playback.is_some() && self.playing && blind>BLIND_LIMIT {
+            // Persist this across clean daemon restarts too: a new process
+            // cannot manufacture fresh V/I feedback for a still-playing PCM.
+            self.recovering=true;self.fresh=0;self.good_since_bad=0;
+        }
         if self.unknown || (self.playing && blind > BLIND_SLACK) {
             // nothing can cover the time since the account's end any more
             self.charge(now)?;
@@ -2975,6 +2979,7 @@ pub(crate) mod tests {
     fn a_300ms_sense_gap_does_not_kill_the_daemon() {
         let cfg = j700();
         let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
+        hw.enable_gate(&cfg);
         hw.sensing = Box::new(|t| !(secs(2.0)..secs(2.3)).contains(&t));
         let mut g = Guard::start(&mut hw, &cfg, 20.0, tmp_state()).unwrap();
         run_until(&mut g, &mut hw, secs(8.0)).expect("the daemon must survive a short sense gap");
@@ -2992,6 +2997,7 @@ pub(crate) mod tests {
     fn a_long_sense_outage_clamps_through_the_kernel_then_recovers() {
         let cfg = j700();
         let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
+        hw.enable_gate(&cfg);
         hw.sensing = Box::new(|t| !(secs(2.0)..secs(4.0)).contains(&t));
         let mut g = Guard::start(&mut hw, &cfg, 20.0, tmp_state()).unwrap();
         run_until(&mut g, &mut hw, secs(4.0)).expect("a sense outage must not end the daemon");
@@ -3034,6 +3040,7 @@ pub(crate) mod tests {
     fn a_single_period_after_an_outage_does_not_take_the_lock_back() {
         let cfg = j700();
         let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
+        hw.enable_gate(&cfg);
         // one period's worth of data in the middle of a long outage
         hw.sensing = Box::new(|t| t < secs(2.0) || (secs(3.4)..secs(3.48)).contains(&t) || t >= secs(6.0));
         let mut g = Guard::start(&mut hw, &cfg, 20.0, tmp_state()).unwrap();
@@ -3073,6 +3080,7 @@ pub(crate) mod tests {
     fn a_lapse_from_a_late_daemon_is_taken_back() {
         let cfg = j700();
         let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
+        hw.enable_gate(&cfg);
         hw.control_delay = Box::new(|t| if (secs(3.0)..secs(3.1)).contains(&t) { Duration::from_millis(400) } else { Duration::ZERO });
         let mut g = Guard::start(&mut hw, &cfg, 20.0, tmp_state()).unwrap();
         run_until(&mut g, &mut hw, secs(6.0)).expect("a late daemon must recover the lock");
@@ -3175,6 +3183,7 @@ pub(crate) mod tests {
         let cfg = j700();
         let path = tmp_state().unwrap();
         let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
+        hw.enable_gate(&cfg);
         hw.level = Box::new(|_| 0.6); // 4.6 W: budget and coil both govern
         let mut g = Guard::start(&mut hw, &cfg, 20.0, Some(path.clone())).unwrap();
         run_until(&mut g, &mut hw, secs(20.0)).unwrap();
@@ -3185,6 +3194,8 @@ pub(crate) mod tests {
         drop(g);
         // the next run, 0.5 s later (systemd's restart delay), after a
         // crash: the old run held the card, so the gap is charged at full gain
+        // The saved state also remains conservative on a kernel without
+        // the new gate; DMA owner/restart accounting has separate C tests.
         let mut hw2 = FakeHw::new(cfg.globals.channels, cfg.globals.period);
         hw2.boot = hw.boot + hw.t + Duration::from_millis(500);
         hw2.level = Box::new(|_| 0.6);
@@ -3199,6 +3210,7 @@ pub(crate) mod tests {
         drop(g2);
         // whereas the first run of a boot starts from the card's safe level
         let mut cold = FakeHw::new(cfg.globals.channels, cfg.globals.period);
+        cold.enable_gate(&cfg);
         let mut c = Guard::start(&mut cold, &cfg, 20.0, tmp_state()).unwrap();
         run_until(&mut c, &mut cold, secs(0.5)).unwrap();
         assert_eq!(cold.writes.first().map(|w| w.1), Some(0.0));
@@ -3415,6 +3427,7 @@ pub(crate) mod tests {
     fn the_unlock_happens_on_muted_controls() {
         let cfg = j700();
         let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
+        hw.enable_gate(&cfg);
         hw.reduction = 0.0; // an earlier run left full volume in the controls
         let mut g = Guard::start(&mut hw, &cfg, 20.0, tmp_state()).unwrap();
         while hw.pings.is_empty() {
@@ -4165,6 +4178,8 @@ pub(crate) mod tests {
         fn boottime(&self) -> Duration { self.hw.boottime() }
         fn sleep(&mut self, d: Duration) { self.hw.sleep(d) }
         fn take_lock(&mut self) -> io::Result<()> { self.hw.take_lock() }
+        fn playback_status(&mut self)->io::Result<Option<crate::playback::Snapshot>> {self.hw.playback_status()}
+        fn playback_write(&mut self,b:&[u8;crate::playback::BYTES])->io::Result<()> {self.hw.playback_write(b)}
         fn ping(&mut self) -> io::Result<()> { self.hw.ping() }
         fn set_min(&mut self) -> io::Result<()> { self.hw.set_min() }
         fn set_reduction(&mut self, d: f64) -> io::Result<f64> { self.hw.set_reduction(d) }
@@ -4222,6 +4237,7 @@ pub(crate) mod tests {
     fn a_failed_stop_is_an_error() {
         let cfg = j700();
         let mut hw = CopyQueue { hw: FakeHw::new(2, 4096), until: Duration::ZERO, old_db: 0.0, fail_relinquish: true };
+        hw.hw.enable_gate(&cfg);
         hw.hw.playing = Box::new(|_| false);
         let mut g = Guard::start(&mut hw, &cfg, 20.0, tmp_state()).unwrap();
         g.tick(&mut hw).unwrap();
