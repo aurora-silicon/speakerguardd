@@ -24,6 +24,11 @@
 //!   (an event for a stream that came and went between two looks, or one
 //!   whose rate was never read as open).
 //!
+//! Format 4 also retains `E` (512-byte kernel receipt) and `G` (512-byte
+//! grant plus i32 ioctl errno) records. Account code 3 denotes the kernel
+//! ledger rather than captured sense frames. The reader accepts format 3;
+//! a sense-only replay explicitly refuses to certify a playback-ledger run.
+//!
 //! The recording starts with the model the live guard started from, written
 //! as a clean stop's state at that instant, so that the replayed guard
 //! resumes exactly that model (latched where the live one was latched).
@@ -71,7 +76,7 @@ use crate::guard::{Accounted, Guard, Hw, Trace, EVENT_SLACK, KERNEL_LOCK_TIMEOUT
 /// recorded words are too quiet to say what the program was.
 const PRE_GAIN_MAX_DB: f64 = 30.0;
 
-const MAGIC: &str = "speakerguardd-record 3";
+const MAGIC: &str = "speakerguardd-record 4";
 /// In the start record's governor code: the asahi guard was on.
 const GUARD_BIT: u8 = 0x80;
 
@@ -256,6 +261,14 @@ impl Recorder {
         self.put(&b)
     }
 
+    pub fn playback_receipt(&mut self,t:u64,wire:&[u8;crate::playback::BYTES])->io::Result<()> {
+        let mut b=Self::head(b'E',t);b.extend_from_slice(wire);self.put(&b)
+    }
+
+    pub fn playback_grant(&mut self,t:u64,wire:&[u8;crate::playback::BYTES],errno:i32)->io::Result<()> {
+        let mut b=Self::head(b'G',t);b.extend_from_slice(wire);b.extend_from_slice(&errno.to_le_bytes());self.put(&b)
+    }
+
     pub fn control_failure(&mut self, t: u64, kind: u8) -> io::Result<()> {
         let mut b = Self::head(b'X', t);
         b.push(kind);
@@ -281,11 +294,12 @@ fn account_code(how: Accounted) -> u8 {
         Accounted::Measured => 0,
         Accounted::Charged => 1,
         Accounted::Cooled => 2,
+        Accounted::Playback => 3,
     }
 }
 
 fn account_of(v: u8) -> Option<Accounted> {
-    [Accounted::Measured, Accounted::Charged, Accounted::Cooled].into_iter().find(|&a| account_code(a) == v)
+    [Accounted::Measured, Accounted::Charged, Accounted::Cooled, Accounted::Playback].into_iter().find(|&a| account_code(a) == v)
 }
 
 /// A look at closed speakers that charged (`K`).
@@ -345,6 +359,7 @@ struct Timeline {
     failures: Vec<(Duration, u8)>,
     /// The live account's spans: (from, to, how).
     accounts: Vec<(Duration, Duration, Accounted)>,
+    playback_account: bool,
     looks: Vec<Look>,
     truncated: Option<Duration>,
     last: Duration,
@@ -401,7 +416,9 @@ impl Timeline {
             }
         }
         let header = String::from_utf8(header)?;
-        let rest = header.strip_prefix(MAGIC).ok_or("not a speakerguardd recording (or an older format)")?;
+        let version4=header.starts_with(MAGIC);
+        let rest = header.strip_prefix(MAGIC).or_else(||header.strip_prefix("speakerguardd-record 3"))
+            .ok_or("not a speakerguardd recording (or an older format)")?;
         let mut kv = std::collections::BTreeMap::new();
         for w in rest.split_whitespace() {
             if let Some((k, v)) = w.split_once('=') {
@@ -439,6 +456,7 @@ impl Timeline {
             latches: Vec::new(),
             failures: Vec::new(),
             accounts: Vec::new(),
+            playback_account: false,
             looks: Vec::new(),
             truncated: None,
             last: Duration::ZERO,
@@ -541,8 +559,17 @@ impl Timeline {
                     b'C' => {
                         let from = Duration::from_nanos(read_u64(&mut inp)?);
                         let how = account_of(read_u8(&mut inp)?).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "account"))?;
+                        if how==Accounted::Playback {
+                            if !version4 {return Err(io::Error::new(io::ErrorKind::InvalidData,"playback account in old format"));}
+                            tl.playback_account=true;
+                        }
                         tl.accounts.push((from, t, how));
                         size += 9;
+                    }
+                    b'E'|b'G' if version4 => {
+                        let mut wire=[0u8;crate::playback::BYTES];inp.read_exact(&mut wire)?;
+                        if tag==b'E' {crate::playback::Snapshot::decode(wire)?;} else {let _=read_u32(&mut inp)?;size+=4;}
+                        size+=crate::playback::BYTES as u64;
                     }
                     b'K' => {
                         let from = Duration::from_nanos(read_u64(&mut inp)?);
@@ -1175,6 +1202,9 @@ pub fn replay(path: &Path, cfg: &Config, opts: &Replay) -> Result<Outcome, Box<d
     let max_reduction = opts.max_reduction.unwrap_or(tl.max_reduction);
     let same = cfg.globals.governor == tl.governor && cfg.globals.guard == tl.guard && opts.gain_db == 0.0 && max_reduction == tl.max_reduction && fingerprint(&cfg) == tl.config;
     let mut ambiguous = tl.ambiguous();
+    if tl.playback_account {
+        ambiguous.push((tl.start,tl.last,"kernel energy receipts retained; this sense-only replay cannot reconstruct the immutable queued programme".into()));
+    }
     let live_permits: Vec<(Duration, bool)> = tl.permits.iter().map(|p| (p.0, p.1)).collect();
     let live_latches = tl.latches.clone();
     let live_account = tl.accounts.clone();
@@ -1319,7 +1349,7 @@ pub fn replay(path: &Path, cfg: &Config, opts: &Replay) -> Result<Outcome, Box<d
                 uncharged += d;
             }
             Accounted::Measured => cooled_measured += overlap(a, b, &|h| h == Accounted::Cooled).saturating_sub(2 * band),
-            Accounted::Cooled => {}
+            Accounted::Cooled | Accounted::Playback => {}
         }
     }
     let replay_end = spans.iter().map(|s| s.1).max();
@@ -1359,6 +1389,7 @@ pub fn replay(path: &Path, cfg: &Config, opts: &Replay) -> Result<Outcome, Box<d
         let _ = writeln!(o, "  {}: hottest coil legacy {} asahi {} unified ff {} vi {} C", s.name, f(h.0), f(h.1), f(h.2), f(h.3));
     }
     let _ = writeln!(o, "account: {:.3} s measured, {:.3} s charged at full scale (not measured), {:.3} s cooled", total_of(Accounted::Measured), total_of(Accounted::Charged), total_of(Accounted::Cooled));
+    let _=writeln!(o,"kernel playback account: {:.3} s (separate from sense measurements)",total_of(Accounted::Playback));
     let mut longest = charged.clone();
     longest.sort_by_key(|c| std::cmp::Reverse(c.1 - c.0));
     let _ = writeln!(o, "charged, not measured: {} uncovered intervals", charged.len());
@@ -1639,6 +1670,49 @@ mod tests {
         let mem = Mem::default();
         let _r = Recorder::to(Box::new(mem.clone()), &cfg, true, 1 << 20).unwrap();
         assert!(String::from_utf8_lossy(&mem.0.borrow()).starts_with(MAGIC));
+    }
+
+    #[test]
+    fn recorded_kernel_accounts_are_distinct_and_sense_only_replay_refuses_them() {
+        let cfg=j700();let path=tmp("kernel-account.rec");
+        let boot=1_000_000_000_000u64;
+        let mut gate=crate::gate_sim::KernelGate::new(&cfg,48000,64);
+        gate.owner(true,boot).unwrap();let status=gate.status(boot).unwrap();
+        let initial=std::fs::read_to_string(tmp_state().unwrap()).unwrap();
+        let mut recorder=Recorder::create(&path,&cfg,true,1<<20).unwrap();
+        recorder.start(boot,Governor::Legacy,None,20.0,&initial).unwrap();
+        recorder.rate(boot,0).unwrap();
+        recorder.playback_receipt(boot,&status.wire()).unwrap();
+        let grant=status.grant(&vec![1<<30;status.speakers],&vec![crate::playback::UNITY;status.speakers]).unwrap();
+        recorder.playback_grant(boot,&grant,libc::EAGAIN).unwrap();
+        recorder.account(boot+100_000_000,boot,Accounted::Playback).unwrap();
+        drop(recorder);
+        let timeline=Timeline::read(&path,&cfg).unwrap();
+        assert!(timeline.playback_account);
+        assert_eq!(timeline.accounts.len(),1);
+        assert_eq!(timeline.accounts[0].2,Accounted::Playback);
+        let outcome=replay(&path,&cfg,&Replay{gain_db:0.0,governor:None,guard:None,max_reduction:None,csv:None}).unwrap();
+        assert!(!outcome.certified);
+        assert!(outcome.text.contains("cannot reconstruct the immutable queued programme"),"{}",outcome.text);
+        let mut bytes=std::fs::read(&path).unwrap();
+        // Format 3 cannot smuggle new accounting or grant records.
+        let version=b"speakerguardd-record ".len();bytes[version]=b'3';
+        std::fs::write(&path,bytes).unwrap();
+        assert!(Timeline::read(&path,&cfg).is_err());
+    }
+
+    #[test]
+    fn format_three_recordings_remain_readable() {
+        let cfg=j700();let path=tmp("legacy-format.rec");
+        let mut hw=FakeHw::new(cfg.globals.channels,cfg.globals.period);
+        record(&cfg,&mut hw,tmp_state(),secs(2.0),&path);
+        let before=Timeline::read(&path,&cfg).unwrap();
+        let mut bytes=std::fs::read(&path).unwrap();bytes[b"speakerguardd-record ".len()]=b'3';
+        std::fs::write(&path,bytes).unwrap();
+        let after=Timeline::read(&path,&cfg).unwrap();
+        assert_eq!(after.accounts,before.accounts);
+        assert_eq!(after.periods.len(),before.periods.len());
+        assert_eq!(after.start,before.start);
     }
 
     /// The replay's account in seconds per kind, from its text.

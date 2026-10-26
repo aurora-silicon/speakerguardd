@@ -101,6 +101,15 @@ ledger/payload helpers and host adapter are dual GPL-2.0-only OR MIT; no existin
 Linux driver or test was relicensed. No Apple implementation or tuning file,
 recording, credential or private lab record is copied into public source.
 
+## Diagnostic evidence
+
+Recording format 4 retains raw 512-byte kernel receipts and grant attempts with
+ioctl outcomes. Ledger-covered spans have a separate account code; they are
+never labelled captured sense measurements. The reader retains format 3 support.
+A sense-only replay explicitly refuses certification for a ledger-governed run
+until the immutable programme and gate can be reconstructed. This preserves the
+record/replay flags without claiming an unsupported equivalence result.
+
 ## Required acceptance
 
 KUnit exercises the ledger, payload ownership and actual macaudio control/trigger

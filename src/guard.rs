@@ -366,6 +366,8 @@ pub enum Accounted {
     Charged,
     /// Verified closed speakers.
     Cooled,
+    /// Authenticated kernel output ledger, independent of capture coverage.
+    Playback,
 }
 
 /// The decisions a replay compares with the live run's, and its account.
@@ -1295,6 +1297,8 @@ impl Guard {
             if self.playback.is_some() {return Err("the active playback contract disappeared".into());}
             return Ok(());
         };
+        let wire=status.wire();
+        rec_now(&mut self.rec,hw,|r,t|r.playback_receipt(t,&wire));
         if self.playback.is_none() {
             if !status.qualified(&self.playback_cfg) {return Ok(());}
             self.playback=Some(crate::playback_model::PlaybackModel::new(
@@ -1336,7 +1340,7 @@ impl Guard {
         if let Some(engine)=&mut self.engine {engine.adopt_playback(&rows);}
         let from=self.account_to;
         self.account_to=at;
-        if at>from {self.note_account(from,at,Accounted::Measured);}
+        if at>from {self.note_account(from,at,Accounted::Playback);}
         self.check_model()
     }
 
@@ -1348,12 +1352,15 @@ impl Guard {
                 return Ok(false);
             }
             let Some(packet)=self.playback.as_ref().unwrap().packet()? else {return Ok(false);};
-            match hw.playback_write(&packet) {
+            let result=hw.playback_write(&packet);
+            let errno=match &result {Ok(())=>0,Err(e)=>e.raw_os_error().unwrap_or(libc::EIO)};
+            rec_now(&mut self.rec,hw,|r,t|r.playback_grant(t,&packet,errno));
+            match result {
                 Ok(())=>return Ok(true),
                 // EAGAIN can have installed protected-copy mode while an
                 // unaffordable raw prefix drains under the hardware lock.
                 Err(e) if e.raw_os_error()==Some(libc::EAGAIN)=>return Ok(false),
-                Err(e) if [Some(libc::ESTALE),Some(libc::ETIMEDOUT)].contains(&e.raw_os_error())=>continue,
+                Err(e) if [Some(libc::ESTALE),Some(libc::ETIMEDOUT),Some(libc::ERANGE)].contains(&e.raw_os_error())=>continue,
                 Err(e)=>return Err(e.into()),
             }
         }
@@ -1425,6 +1432,12 @@ impl Guard {
     fn measure_shifted(&mut self, end: Instant, frames: usize, shift: usize) -> Result<(), Box<dyn Error>> {
         if let Some(playback)=self.playback.as_mut() {
             playback.observe(&self.words[..frames*self.globals.channels],frames,end,self.rate as f64)?;
+            // Logging keeps the measured voltage/power. The authenticated
+            // output ledger remains the sole feed-forward heat account.
+            for speaker in &mut self.speakers {
+                speaker.v_rms=speaker.v_rms_of(&self.words[..frames*self.globals.channels],self.globals.channels);
+                speaker.power=speaker.v_rms*speaker.v_rms/speaker.spec.r_ff;
+            }
             self.last_applied=self.written.clone();
             return Ok(());
         }
@@ -2006,7 +2019,11 @@ impl Guard {
         } else if !self.stopping && !self.unknown && !hard && onset_ready && range_ready && self.events && !renew_now && !self.recovering {
             // after bad sense data, REARM_PERIODS valid periods in a row
             // first, idle or not (review P8-2)
-            let seeing = !self.playing || (self.fresh >= REARM_PERIODS && blind <= BLIND_SLACK);
+            // A qualified finite grant already bounds unseen playback. A
+            // trustworthy restored model need not wait six capture periods
+            // before its first grant; bad-data recovery still requires them.
+            let seeing = !self.playing || (self.fresh >= REARM_PERIODS && blind <= BLIND_SLACK)
+                || (self.playback.is_some() && !self.bad_data && self.fresh_enough(now));
             let retry = self.last_save_try.is_none_or(|t| hw.now().duration_since(t) >= SAVE_INTERVAL);
             if seeing && !self.invalidated && retry {
                 // the clean stop this run may have resumed goes first
@@ -2297,6 +2314,8 @@ pub mod fake {
         pub shutting: bool,
         pub previous_boot: Option<String>,
         pub machine: Option<String>,
+        pub gate: Option<crate::gate_sim::DescriptorQueue>,
+        gate_gains: Vec<(Duration,Vec<f64>)>,
     }
 
     impl FakeHw {
@@ -2353,7 +2372,25 @@ pub mod fake {
                 shutting: false,
                 previous_boot: None,
                 machine: None,
+                gate: None,
+                gate_gains: Vec::new(),
             }
+        }
+
+        /// Explicit reference-plant fixture. This does not qualify the real
+        /// J700 firmware or a real TAS processing path.
+        pub fn enable_gate(&mut self,cfg:&Config) {
+            assert!(self.gate.is_none());
+            self.gate=Some(crate::gate_sim::DescriptorQueue::new(cfg,48000,self.period_frames,
+                self.boot.as_nanos().try_into().unwrap()));
+            self.note_gate_gain(self.t);
+        }
+
+        fn note_gate_gain(&mut self,at:Duration) {
+            if self.gate.is_none() {return;}
+            let n=self.gate.as_ref().unwrap().gate.channels;
+            let gains=(0..n).map(|k|self.effective_of(k)).collect::<Vec<_>>();
+            if self.gate_gains.last().is_none_or(|(_,g)|*g!=gains) {self.gate_gains.push((at,gains));}
         }
 
         /// A card with a volume control per speaker and the sense channels
@@ -2395,6 +2432,21 @@ pub mod fake {
         /// `frames` frames of the program at time t through the card's
         /// gains: a square wave, sign alternating frame to frame.
         fn fill(&self, words: &mut [i32], frames: usize) {
+            if let Some(q)=&self.gate {
+                let start=if frames==self.period_frames {self.last_end.saturating_sub(self.period)}
+                    else {self.next_period.saturating_sub(self.period)};
+                let first=(start.as_secs_f64()*48000.0).round() as u64;
+                for f in 0..frames {
+                    let n=first+f as u64;let at=Duration::from_secs_f64(n as f64/48000.0);
+                    let j=self.gate_gains.partition_point(|(t,_)|*t<=at).saturating_sub(1);
+                    for c in 0..self.channels {
+                        let k=self.chan_speaker.get(c).copied().flatten().unwrap_or(c);
+                        let gain=10f64.powf(-self.gate_gains[j].1[k]/20.0);
+                        words[f*self.channels+c]=(f64::from(q.sample(n,k))*gain) as i32;
+                    }
+                }
+                return;
+            }
             let level = (self.level)(self.t);
             let per: Vec<i32> = (0..self.channels)
                 .map(|c| ((level * 10f64.powf(-self.chan_reduction(c) / 20.0)).clamp(0.0, 1.0) * 2147483647.0) as i32)
@@ -2442,6 +2494,22 @@ pub mod fake {
         /// Run the lease down by the playing time since it was last looked
         /// at; at zero the card locks the volume (macaudio's timeout work).
         fn lapse_check(&mut self) {
+            if let Some(q)=&mut self.gate {
+                let playing=&self.playing;let level=&self.level;
+                q.advance(self.t.as_secs_f64(),|n,_| {
+                    let at=Duration::from_secs_f64(n as f64/48000.0);
+                    if !(playing)(at) {0.0} else {let x=(level)(at);if n%2==0 {x} else {-x}}
+                });
+                q.prune_before((self.t.as_secs_f64().max(5.0)-5.0).floor() as u64*48000);
+                let expiry=self.lease_t+self.lease_left;
+                if self.t>=expiry && !self.lease_left.is_zero() && self.last_ok_ping.is_some() && !self.notice_pending {
+                    self.lapses.push(expiry);self.notice_pending=true;
+                }
+                self.lease_left=self.lease_left.saturating_sub(self.t.saturating_sub(self.lease_t));
+                self.lease_t=self.t;
+                if self.notice_pending {self.note_gate_gain(expiry);}
+                return;
+            }
             let step = Duration::from_micros(500);
             let mut a = self.lease_t;
             while a < self.t && !self.lease_left.is_zero() {
@@ -2496,10 +2564,30 @@ pub mod fake {
         }
         fn take_lock(&mut self) -> io::Result<()> {
             self.locked = true;
+            if let Some(q)=&mut self.gate {q.gate.owner(true,q.ns(self.t.as_secs_f64()))?;}
             Ok(())
+        }
+        fn playback_status(&mut self)->io::Result<Option<crate::playback::Snapshot>> {
+            self.lapse_check();
+            self.gate.as_mut().map(|q|q.gate.status(q.ns(self.t.as_secs_f64()))).transpose()
+        }
+        fn playback_write(&mut self,wire:&[u8;crate::playback::BYTES])->io::Result<()> {
+            self.lapse_check();
+            let q=self.gate.as_mut().ok_or_else(||io::Error::from_raw_os_error(libc::ENOTTY))?;
+            let now=q.ns(self.t.as_secs_f64());let result=q.gate.write(wire,now);
+            if result.is_ok() {
+                let deadline=u64::from_le_bytes(wire[32..40].try_into().unwrap());
+                self.lease_left=Duration::from_nanos(deadline.saturating_sub(now));
+                self.last_ok_ping=Some(self.t);self.lease_t=self.t;
+            } else if !q.gate.unlocked(now) {self.lease_left=Duration::ZERO;}
+            self.note_gate_gain(self.t);result
         }
         fn ping(&mut self) -> io::Result<()> {
             self.lapse_check();
+            if let Some(q)=&mut self.gate {
+                let result=q.gate.ping(q.ns(self.t.as_secs_f64()));
+                if result.is_err() {self.notice_pending=false;self.last_ok_ping=None;return result;}
+            }
             if self.notice_pending {
                 // the one-shot notice; the timer is not re-armed
                 self.notice_pending = false;
@@ -2509,6 +2597,7 @@ pub mod fake {
             self.last_ok_ping = Some(self.t);
             self.lease_left = LOCK_TIMEOUT;
             self.pings.push(self.t);
+            self.note_gate_gain(self.t);
             Ok(())
         }
         fn set_min(&mut self) -> io::Result<()> {
@@ -2521,6 +2610,7 @@ pub mod fake {
             for p in self.per.iter_mut() {
                 *p = MUTE_DB;
             }
+            self.note_gate_gain(self.t);
             Ok(())
         }
         fn relinquish(&mut self) -> io::Result<()> {
@@ -2533,6 +2623,8 @@ pub mod fake {
             self.last_ok_ping = None;
             self.notice_pending = false;
             self.relinquished += 1;
+            if let Some(q)=&mut self.gate {q.gate.owner(true,q.ns(self.t.as_secs_f64()))?;}
+            self.note_gate_gain(self.t);
             Ok(())
         }
         fn reduction_limit_db(&self) -> Option<f64> {
@@ -2555,6 +2647,7 @@ pub mod fake {
                 *p = db;
             }
             self.writes.push((self.t, db));
+            self.note_gate_gain(self.t);
             Ok(db)
         }
         fn set_reductions(&mut self, db: &[f64]) -> io::Result<Vec<f64>> {
@@ -2581,6 +2674,7 @@ pub mod fake {
             }
             self.reduction = db.iter().cloned().fold(0.0, f64::max);
             self.writes.push((self.t, self.reduction));
+            self.note_gate_gain(self.t);
             Ok(db.to_vec())
         }
         fn sample_rate(&mut self) -> io::Result<i64> {
@@ -2825,6 +2919,7 @@ pub(crate) mod tests {
     fn healthy_playback_keeps_the_lock_and_full_volume() {
         let cfg = j700();
         let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
+        hw.enable_gate(&cfg);
         let mut g = Guard::start(&mut hw, &cfg, 20.0, tmp_state()).unwrap();
         run_until(&mut g, &mut hw, Duration::from_secs(10)).unwrap();
         assert!(hw.lapses.is_empty(), "{:?}", hw.lapses);
@@ -2996,6 +3091,7 @@ pub(crate) mod tests {
     fn a_cool_speaker_gets_the_full_scale() {
         let cfg = j700();
         let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
+        hw.enable_gate(&cfg);
         hw.level = Box::new(|_| 0.3);
         let mut g = Guard::start(&mut hw, &cfg, 20.0, tmp_state()).unwrap();
         run_until(&mut g, &mut hw, secs(10.0)).unwrap();
@@ -5978,6 +6074,7 @@ pub(crate) mod tests {
     fn a_start_during_playback_costs_little() {
         let cfg = j700();
         let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
+        hw.enable_gate(&cfg);
         hw.level = Box::new(|_| 0.3);
         let mut g = Guard::start(&mut hw, &cfg, 20.0, tmp_state()).unwrap();
         run_until(&mut g, &mut hw, secs(10.0)).unwrap();

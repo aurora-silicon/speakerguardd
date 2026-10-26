@@ -211,6 +211,10 @@ impl Snapshot {
         Ok(wire)
     }
 
+    pub fn wire(&self) -> [u8; BYTES] {
+        self.wire
+    }
+
     pub fn revoke(&self) -> [u8; BYTES] {
         let mut wire = self.wire;
         put32(&mut wire, 4, REVOKE);

@@ -431,6 +431,21 @@ impl DescriptorQueue {
             f64::from(r.words[i]) / f64::from(r.original[i])
         }
     }
+    pub fn sample(&self, n: u64, k: usize) -> i32 {
+        let r = self
+            .rows
+            .iter()
+            .rev()
+            .find(|r| r.start <= n && n < r.start + self.gate.frames as u64)
+            .expect("sense cannot read unrendered playback");
+        let physical = self
+            .gate
+            .model_of_slot
+            .iter()
+            .position(|m| *m == k)
+            .unwrap();
+        r.words[(n - r.start) as usize * self.gate.channels + physical]
+    }
     pub fn prune_before(&mut self, n: u64) {
         while self
             .rows
