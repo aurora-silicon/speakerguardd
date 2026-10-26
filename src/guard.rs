@@ -410,27 +410,18 @@ impl Guard {
         hw.take_lock()?;
         let events = hw.events_available();
         if !events {
-            warn!("no control events from the card: streams between two looks cannot be accounted; leaving the speakers at the card's safe level");
+            warn!("no control events from the card: streams between two looks cannot be accounted; keeping the volume locked at its minimum");
         }
-        // The controls' value before this run is unknown, and the budgets
-        // count samples converted at it as loud as they can have been: with
-        // the controls at the card's safe value from here on that lasts the
-        // copy queue's half second, not until the first unlock.  The card
-        // accepts that value while locked, so the speakers play at its safe
-        // level until the first unlock, as without the daemon, instead of
-        // silent (review r6).  Without events there is no unlock: they stay
-        // there.
-        let safe_now = if events {
-            // what the write applied, as it says (review r7 Y5)
-            match hw.set_safe().and_then(valid_db) {
-                Ok(applied) => Some(applied),
-                Err(e) => {
-                    warn!("volume control: {e}; the controls' value stays unknown");
-                    None
-                }
+        // Bound the old copy queue, then hold the controls at their
+        // minimum until the hot-start model permits an unlock. This write
+        // is needed even without events: in that case we never unlock,
+        // but the kernel safe level alone can still warm a hot magnet.
+        let safe_now = match hw.set_safe().and_then(valid_db) {
+            Ok(applied) => Some(applied),
+            Err(e) => {
+                warn!("volume control: {e}; the controls' value stays unknown");
+                None
             }
-        } else {
-            None
         };
         let mut speakers: Vec<SpeakerState> = cfg.speakers.iter().map(|s| SpeakerState::new(s.clone(), globals.t_ambient)).collect();
         let latched = |speakers: &mut Vec<SpeakerState>| {
@@ -4431,10 +4422,20 @@ impl Hw for Tracked {
 }
 
 
-#[test] fn full_scale_after_independent_hot_nodes() {
+#[test]
+fn full_scale_after_independent_hot_nodes() {
+    check_full_scale_after_independent_hot_nodes(true);
+}
+
+#[test]
+fn full_scale_after_hot_start_without_control_events() {
+    check_full_scale_after_independent_hot_nodes(false);
+}
+
+fn check_full_scale_after_independent_hot_nodes(events: bool) {
 crate::log::set_verbosity(crate::log::Level::Error);
 let cfg=Config::parse(include_str!("../conf/apple/j700.conf")).unwrap();
-let mut hw=FakeHw::new(cfg.globals.channels,cfg.globals.period);hw.level=Box::new(|_|1.0);
+let mut hw=FakeHw::new(cfg.globals.channels,cfg.globals.period);hw.events=events;hw.level=Box::new(|_|1.0);
 let mut hw=Tracked{hw,gains:Vec::new()};
 let mut g=Guard::start(&mut hw,&cfg,20.0,None).unwrap();
 while hw.hw.t<Duration::from_secs(1200){g.tick(&mut hw).unwrap();}hw.snap();
@@ -4460,6 +4461,7 @@ for (k,s) in cfg.speakers.iter().enumerate() {
     eprintln!("NEO_HOT {} peak={peak:.9} limit={}",s.name,s.t_limit);
     assert!(peak<=s.t_limit+1e-6);
 }
-eprintln!("NEO_TRACE pings={} first={:?} lapses={}",hw.hw.pings.len(),hw.hw.pings.first(),hw.hw.lapses.len());
+eprintln!("NEO_TRACE events={events} pings={} first={:?} lapses={}",hw.hw.pings.len(),hw.hw.pings.first(),hw.hw.lapses.len());
+assert!(events || hw.hw.pings.is_empty(), "unlocked without control events");
 }
 }
