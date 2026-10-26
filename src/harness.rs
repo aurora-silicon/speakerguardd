@@ -46,6 +46,7 @@ use crate::state;
 
 /// The V/I machines' world (the J316 and the J413).
 pub mod vi;
+mod continuous;
 
 const J700: &str = include_str!("../conf/apple/j700.conf");
 /// The world's sample rate.
@@ -285,6 +286,7 @@ struct Oracle {
     /// before the gain per speaker (J).
     coil: Vec<Vec<f32>>,
     energy: Vec<Vec<f64>>,
+    audit: Option<Vec<continuous::Thermal>>,
 }
 
 impl Oracle {
@@ -302,6 +304,7 @@ impl Oracle {
             to: 0.0,
             coil: vec![Vec::new(); n],
             energy: vec![vec![0.0]; n],
+            audit: continuous::enabled().then(|| cfg.speakers.iter().map(|s| continuous::Thermal::new(cfg.globals.t_ambient,s.tr_coil,s.tr_magnet,s.tau_coil,s.tau_magnet)).collect()),
         }
     }
 
@@ -309,6 +312,7 @@ impl Oracle {
     /// power before the gain `pre` (W).
     fn step(&mut self, h: f64, p: &[f64], pre: &[f64]) {
         for k in 0..self.tc.len() {
+            if let Some(a)=self.audit.as_mut() {a[k].advance(p[k],h);}
             // sub-stepped forward Euler of the two-node model
             let sub = 4;
             let d = h / sub as f64;
@@ -973,6 +977,10 @@ pub fn run(sc: &Scenario, seed: u64) -> Result<(), Violation> {
             }
         }
     })();
+    if let Some(a)=&w.oracle.audit {
+        let rows=cfg.speakers.iter().zip(a).map(|(s,t)|{let(c,m)=t.peaks();continuous::Row{speaker:s.name.clone(),model:"ff",active:true,limit:s.t_limit,coil:c,magnet:m}}).collect();
+        continuous::record(seed,sc.to_rust(),"j700",rows,result.as_ref().err().map(|e|e.0.clone()),0);
+    }
     let _ = std::fs::remove_dir_all(path.parent().unwrap());
     result
 }

@@ -460,13 +460,14 @@ struct Oracle {
     n: u64,
     base: u64,
     hist: Vec<Vec<[f32; 6]>>,
+    audit: Option<Vec<[super::continuous::Thermal;3]>>,
     /// Exact sample peaks, including unaccounted time and lost current lines.
     vi_peaks: [f64; 6],
 }
 
 impl Oracle {
     fn new(cfg: &Config) -> Oracle {
-        let nodes = cfg
+        let nodes: Vec<[Node;3]> = cfg
             .speakers
             .iter()
             .map(|s| {
@@ -475,7 +476,8 @@ impl Oracle {
             })
             .collect();
         let k = cfg.speakers.len();
-        Oracle { ta: cfg.globals.t_ambient, nodes, now: vec![[(0.0, 0.0); 3]; k], n: 0, base: 0, hist: vec![Vec::new(); k], vi_peaks: [0.0; 6] }
+        let audit=super::continuous::enabled().then(||nodes.iter().map(|ns|std::array::from_fn(|j|{let n=ns[j];super::continuous::Thermal::new(cfg.globals.t_ambient,n.trc,n.trm,n.tau_c,n.tau_m)})).collect());
+        Oracle { ta: cfg.globals.t_ambient, nodes, now: vec![[(0.0, 0.0); 3]; k], n: 0, base: 0, hist: vec![Vec::new(); k], audit, vi_peaks: [0.0; 6] }
     }
 
     /// One sample of `h` seconds; per speaker the true V*I, V^2/z_nominal
@@ -484,6 +486,7 @@ impl Oracle {
         for k in 0..self.now.len() {
             let mut out = [0f32; 6];
             for j in 0..3 {
+                if let Some(a)=self.audit.as_mut() {let(c,m)=self.now[k][j];a[k][j].observe(c+self.ta,m+self.ta,p[k][j],h);}
                 self.now[k][j] = self.nodes[k][j].step(self.now[k][j], p[k][j], h);
                 out[2 * j] = (self.now[k][j].0 + self.ta) as f32;
                 out[2 * j + 1] = (self.now[k][j].1 + self.ta) as f32;
@@ -1426,6 +1429,13 @@ pub fn run(sc: &ViScenario, seed: u64) -> Result<Outcome, Violation> {
             }
         }
     })();
+    if let Some(a)=&w.oracle.audit {
+        let mut rows=Vec::new();
+        for (k,s) in cfg.speakers.iter().enumerate(){for(j,model)in[(VI,"vi"),(FFR,"ff")] {
+            let(c,m)=a[k][j].peaks();rows.push(super::continuous::Row{speaker:s.name.clone(),model,active:j==VI||cfg.globals.governor==Governor::Unified,limit:s.t_limit,coil:c,magnet:m});
+        }}
+        super::continuous::record(seed,sc.to_rust(),if sc.j413{"j413"}else{"j316"},rows,result.as_ref().err().map(|e|e.0.clone()),out.handoffs as u64);
+    }
     let _ = std::fs::remove_dir_all(path.parent().unwrap());
     out.true_vi_peaks = w.oracle.vi_peaks;
     result.map(|()| out)
