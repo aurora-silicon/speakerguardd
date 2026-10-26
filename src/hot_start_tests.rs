@@ -439,7 +439,7 @@ fn random_unknown_histories_stay_below_every_profiles_start() {
 }
 
 #[test]
-fn legacy_onset_ceiling_uses_its_ff_nodes_instead_of_the_vi_shadow() {
+fn legacy_onset_ceiling_keeps_both_ff_and_vi_reserves() {
     let mut cfg = Config::parse(include_str!("../conf/apple/j413.conf")).unwrap();
     cfg.allow_unqualified = true;
     cfg.globals.governor = Governor::Legacy;
@@ -466,6 +466,16 @@ fn legacy_onset_ceiling_uses_its_ff_nodes_instead_of_the_vi_shadow() {
     }
     let mut cold = vec![0.0; cfg.speakers.len()];
     assert!(g.bound_onset(hw.now(), &mut cold));
-    assert!(warm.iter().zip(cold).all(|(w, c)| *w > c));
+    assert!(warm.iter().zip(&cold).all(|(w, c)| *w > *c));
     assert!(warm.iter().all(|r| *r > 0.0 && *r < MUTE_DB));
+    // PR #12 already reserved the V/I model on this path. Adding an FF
+    // bound must not remove that protection when the FF state is colder.
+    for a in g.engine.as_mut().unwrap().asahi.as_mut().unwrap() {
+        a.th.t_coil = 130.0;
+        a.th.t_magnet = 130.0;
+    }
+    let mut warm_vi = vec![0.0; cfg.speakers.len()];
+    assert!(g.bound_onset(hw.now(), &mut warm_vi));
+    assert!(warm_vi.iter().zip(&cold).all(|(w, c)| *w > *c), "the V/I reserve was removed: {warm_vi:?} vs {cold:?}");
+
 }

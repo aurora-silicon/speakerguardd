@@ -643,8 +643,8 @@ with Asahi alone and unified plus Asahi.
 
 The legacy governor on V/I profiles now reserves full-scale energy using
 its own feed-forward state and resistance before each output write. Its
-Asahi shadow cannot supply that bound. The reserve shares the V/I onset
-calculation and includes old queued audio, a possible renewed lease, idle
+Asahi shadow cannot supply that bound. The existing V/I reserve remains in effect too. The FF reserve shares the
+V/I onset calculation and includes old queued audio, a possible renewed lease, idle
 gaps and the kernel safe-level tail. It changes neither measured heat nor
 power-budget history. Existing latches and handoff thresholds still apply.
 J700 keeps its legacy floor policy and independent hot-node initialization.
