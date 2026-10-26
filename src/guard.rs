@@ -502,7 +502,7 @@ impl Guard {
         hw.take_lock()?;
         let events = hw.events_available();
         if !events {
-            warn!("no control events from the card: streams between two looks cannot be accounted; leaving the speakers at the card's safe level");
+            warn!("no control events from the card: streams between two looks cannot be accounted; keeping the volume locked at its minimum");
         }
         // The controls' value before this run is unknown, and the budgets
         // must count samples converted at it as loud as they can have been:
@@ -511,9 +511,9 @@ impl Guard {
         // machine whose budgets need more than --max-reduction for a
         // full-scale signal, never).  The minimum is the one value the
         // card accepts while locked; the speakers are silent until the
-        // first unlock.  Without events there is no unlock: they stay at
-        // the card's safe level.
-        let min_now = events && match hw.set_min() {
+        // first unlock. Without events there is no unlock; the minimum
+        // write is still needed to protect independently hot nodes.
+        let min_now = match hw.set_min() {
             Ok(()) => true,
             Err(e) => {
                 warn!("volume control: {e}; the controls' value stays unknown");
@@ -3482,7 +3482,7 @@ pub(crate) mod tests {
         let mut g = Guard::start(&mut hw, &cfg, 20.0, tmp_state()).unwrap();
         run_until(&mut g, &mut hw, secs(3.0)).unwrap();
         assert!(hw.pings.is_empty() && !g.armed(), "{} pings", hw.pings.len());
-        assert!(hw.effective_reduction() >= SAFE_DB);
+        assert!(hw.effective_reduction() >= MUTE_DB, "startup minimum was skipped without events");
     }
 
     /// Review r3 T2: a clean stop with time not yet accounted (the sense
