@@ -15,9 +15,9 @@
 //! The engine's models (engine.rs) are saved in the same file, after the
 //! legacy speaker lines (`asahi ...`, `unified ...`): one atomic write and
 //! the same clean-stop rule for every model.  A model the file does not
-//! carry starts latched at its limit.  A J700 file without the engine is
-//! what 0.1.9 writes; a reader older than the engine refuses a file with
-//! engine lines, and so starts latched too.
+//! carry starts latched at its limit. Generation 2 snapshots predate the
+//! independent hot-node bounds and are refused even after a clean stop.
+//! Older readers refuse generation 3 rather than resuming its temperatures.
 
 use std::time::Duration;
 
@@ -31,7 +31,9 @@ use crate::config::Globals;
 use crate::engine::{state_name, Engine, SavedAsahi, SavedUnified};
 use crate::model::SpeakerState;
 
-const MAGIC: &str = "speakerguardd-state 2";
+// A clean stop from an older initializer is not a temperature bound.
+// New readers reject v2, and old readers reject v3 on rollback.
+const MAGIC: &str = "speakerguardd-state 3";
 /// The format 0.1.2 to 0.1.5 wrote: never resumed.
 const MAGIC_V1: &str = "speakerguardd-state 1";
 
@@ -177,11 +179,11 @@ fn unified_line(f: &[&str]) -> Option<SavedUnified> {
     })
 }
 
-/// None for anything but a complete, finite, physically possible v2 state.
+/// None for anything but a complete, finite, physically possible current-generation state.
 /// A v1 file decodes as never released (it is not resumed).
 pub fn decode(text: &str) -> Option<Saved> {
     let mut lines = text.lines();
-    let v2 = match lines.next()? {
+    let current = match lines.next()? {
         MAGIC => true,
         MAGIC_V1 => false,
         _ => return None,
@@ -227,15 +229,15 @@ pub fn decode(text: &str) -> Option<Saved> {
             continue;
         }
         let f: Vec<&str> = line.split_whitespace().collect();
-        if v2 && f.first() == Some(&"asahi") {
+        if current && f.first() == Some(&"asahi") {
             asahi.push(asahi_line(&f)?);
             continue;
         }
-        if v2 && f.first() == Some(&"unified") {
+        if current && f.first() == Some(&"unified") {
             unified.push(unified_line(&f)?);
             continue;
         }
-        let fields = if v2 { 10 } else { 8 };
+        let fields = if current { 10 } else { 8 };
         if f.len() != fields || f[0] != "speaker" {
             return None;
         }
@@ -243,7 +245,7 @@ pub fn decode(text: &str) -> Option<Saved> {
         if v.iter().any(|x| !x.is_finite()) || v[2] < 0.0 || v[3] < 0.0 || v[0] < -50.0 || v[1] < -50.0 || v[5] < 0.0 {
             return None;
         }
-        let (hard, t_peak) = if v2 {
+        let (hard, t_peak) = if current {
             let peak: f64 = f[9].parse().ok().filter(|p: &f64| p.is_finite())?;
             (flag(f[8])?, peak)
         } else {
@@ -251,11 +253,11 @@ pub fn decode(text: &str) -> Option<Saved> {
         };
         speakers.push(SavedSpeaker { name: f[1].to_string(), t_coil: v[0], t_magnet: v[1], mean_1s: v[2], mean_60s: v[3], reduction_db: v[5], hard, t_peak });
     }
-    if speakers.is_empty() || (v2 && !ended) {
+    if speakers.is_empty() || (current && !ended) {
         return None;
     }
     let covered = Duration::from_nanos(covered.unwrap_or(0).min(ns));
-    Some(Saved { boottime: Duration::from_nanos(ns), covered, armed, released: v2 && released && !armed, recovering, speakers, asahi, unified })
+    Some(Saved { boottime: Duration::from_nanos(ns), covered, armed, released: current && released && !armed, recovering, speakers, asahi, unified })
 }
 
 /// Continue every speaker from a clean stop's state and charge the time
@@ -495,6 +497,27 @@ mod tests {
         }
     }
 
+    /// A clean marker proves the previous process stopped, not that its
+    /// older initializer bounded an independently hot magnet. Do not
+    /// promote those temperatures across the model-generation boundary.
+    #[test]
+    fn an_old_clean_snapshot_cannot_carry_the_old_magnet_bound() {
+        let (cfg, mut sp) = hot();
+        for s in &mut sp {
+            s.t_coil = s.spec.t_limit;
+            s.t_magnet = cfg.globals.t_ambient
+                + (s.spec.t_limit - cfg.globals.t_ambient)
+                    * s.spec.tr_magnet / (s.spec.tr_coil + s.spec.tr_magnet);
+            s.hard = true;
+            s.t_peak = s.spec.t_limit;
+            assert!(s.t_magnet < s.spec.t_limit);
+        }
+        let current = encode(T, T, &sp, false, true);
+        let old = format!("speakerguardd-state 2\n{}", current.split_once('\n').unwrap().1);
+        assert!(decode(&old).is_none(), "pre-bound model state was trusted after upgrade");
+        assert!(decode(&current).unwrap().released);
+    }
+
     #[test]
     fn round_trip() {
         let (_, mut sp) = hot();
@@ -517,7 +540,7 @@ mod tests {
         let (_, sp) = hot();
         let good = encode(T, T, &sp, false, true);
         assert!(decode("").is_none());
-        assert!(decode(&good.replace("speakerguardd-state 2", "speakerguardd-state 3")).is_none());
+        assert!(decode(&good.replace("speakerguardd-state 3", "speakerguardd-state 4")).is_none());
         let end = good.find("\nend").unwrap() + 4;
         for n in 0..end {
             assert!(decode(&good[..n]).is_none(), "accepted a prefix of {n} bytes");
@@ -604,7 +627,7 @@ mod tests {
             s.resume(100.0, 100.0, 0.0, 0.0);
         }
         let v1 = encode(T, T, &sp, false, true)
-            .replace("speakerguardd-state 2", "speakerguardd-state 1")
+            .replace("speakerguardd-state 3", "speakerguardd-state 1")
             .lines()
             .filter(|l| !l.starts_with("covered_ns") && !l.starts_with("released") && *l != "end")
             .map(|l| if l.starts_with("speaker ") { l.split_whitespace().take(8).collect::<Vec<_>>().join(" ") } else { l.to_string() })
@@ -762,7 +785,7 @@ mod tests {
         }
         // a v1 file carries no engine at all and is never resumed
         let v1 = encode(T, T, &sp, false, true)
-            .replace("speakerguardd-state 2", "speakerguardd-state 1")
+            .replace("speakerguardd-state 3", "speakerguardd-state 1")
             .lines()
             .filter(|l| !l.starts_with("covered_ns") && !l.starts_with("released") && *l != "end")
             .map(|l| if l.starts_with("speaker ") { l.split_whitespace().take(8).collect::<Vec<_>>().join(" ") } else { l.to_string() })
@@ -773,9 +796,9 @@ mod tests {
         assert!(e3.asahi.as_ref().unwrap().iter().all(|a| a.hard));
     }
 
-    /// A clean stop of a run without the engine (0.1.8, or no unified
-    /// models) says nothing about them: they start latched, the legacy
-    /// model is resumed.  A J700 file without the engine is exactly 0.1.8's.
+    /// A current-generation clean stop without an engine says nothing
+    /// about its models: they start latched while the legacy model resumes.
+    /// Older generations are refused separately, even without an engine.
     #[test]
     fn a_model_the_file_does_not_carry_starts_latched() {
         let (cfg, sp, _) = engine_at(J413, 60.0, 55.0);
@@ -791,7 +814,7 @@ mod tests {
         let (_, hot) = hot();
         let a = encode(T, T, &hot, false, true);
         assert_eq!(a, encode_with(T, T, &hot, None, false, true));
-        assert!(a.starts_with("speakerguardd-state 2\n") && !a.contains("asahi") && !a.contains("unified"));
+        assert!(a.starts_with("speakerguardd-state 3\n") && !a.contains("asahi") && !a.contains("unified"));
     }
 
     /// Review r3 T5 on the unified budgets: two means do not say when in

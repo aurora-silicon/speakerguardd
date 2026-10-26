@@ -798,3 +798,10 @@ above a reviewed-parent peak. Composed changes to attenuation and handoff
 can change those below-limit peaks; the historical comparison remains
 visible alongside the absolute result. The listening-cost gate remains a
 separate release requirement.
+
+Runtime snapshots use model generation 3. A clean stop written before the
+independent hot-node and voltage bounds is not evidence that its saved model
+bounded the speakers. Those older snapshots are refused and startup stays
+latched. Older readers also refuse generation 3 on rollback. Historical
+recordings remain readable, but an untrusted initial state starts the replay
+latched and makes it diagnostic. Profile fingerprints are unchanged.

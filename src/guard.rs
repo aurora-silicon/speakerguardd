@@ -5482,6 +5482,22 @@ pub(crate) mod tests {
         p
     }
 
+    #[test]
+    fn a_prebound_clean_file_starts_with_independent_hot_nodes() {
+        let cfg = j700();
+        let p = cold_file(&cfg);
+        let text = std::fs::read_to_string(&p).unwrap();
+        let old = format!("speakerguardd-state 2\n{}", text.split_once('\n').unwrap().1);
+        std::fs::write(&p, old).unwrap();
+        let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
+        hw.level = Box::new(|_| 0.0);
+        let g = Guard::start(&mut hw, &cfg, 20.0, Some(p)).unwrap();
+        assert!(!g.armed());
+        assert!(g.speakers.iter().all(|s| s.hard
+            && s.t_coil >= s.spec.t_limit && s.t_magnet >= s.spec.t_limit));
+        assert_eq!(hw.effective_reduction(), MUTE_DB);
+    }
+
     /// Review r5 V3: the gap after a clean stop may have carried a
     /// full-scale signal through the card's safe level: its budgets count
     /// it at full scale before the gain (0.1.9 counted the 20 dB lower

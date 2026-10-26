@@ -1183,6 +1183,9 @@ pub fn replay(path: &Path, cfg: &Config, opts: &Replay) -> Result<Outcome, Box<d
     let fastest = tl.rates.iter().map(|r| r.1).chain(tl.periods.iter().map(|p| p.rate as i64)).filter(|&r| r > 0).max().unwrap_or(48000);
     let (start, last, config_matches) = (tl.start, tl.last, fingerprint(&cfg) == tl.config);
     let initial = tl.state.clone();
+    if !crate::state::decode(&initial).is_some_and(|saved| saved.proven()) {
+        ambiguous.push((start, start, "untrusted initial model generation; replay starts latched".into()));
+    }
     let recorded_gov = tl.governor;
     // the recorded model state, as the replayed guard's state file
     static RUN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -1585,7 +1588,7 @@ mod tests {
         let path = tmp("transitions.rec");
         record(&cfg, &mut hw, tmp_state(), secs(7.0), &path);
         let tl = Timeline::read(&path, &cfg).unwrap();
-        assert!(tl.state.starts_with("speakerguardd-state 2"), "{}", tl.state);
+        assert!(tl.state.starts_with("speakerguardd-state 3"), "{}", tl.state);
         assert!(tl.permits.iter().any(|p| p.1) && tl.permits.iter().any(|p| !p.1 && p.2.contains("no complete sense data")), "{:?}", tl.permits);
         assert!(tl.permits.iter().any(|p| !p.1 && p.2.contains("volume control")), "{:?}", tl.permits);
         assert!(tl.losses.iter().any(|l| l.1 == LOSS_STALL), "{:?}", tl.losses);
