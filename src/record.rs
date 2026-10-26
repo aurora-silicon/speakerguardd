@@ -1611,6 +1611,9 @@ mod tests {
     fn the_recording_keeps_the_guards_transitions() {
         let cfg = j700();
         let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
+        // Isolate the missing-data transition from the old kernel's
+        // conservative onset floor; retain every event/fault assertion.
+        hw.enable_gate(&cfg);
         hw.level = Box::new(|_| 0.1);
         hw.sensing = Box::new(|t| !(secs(2.0)..secs(3.0)).contains(&t));
         // while the lock is held (after the outage, 0.1.8 keeps the card

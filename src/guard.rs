@@ -2341,6 +2341,10 @@ pub mod fake {
         pub machine: Option<String>,
         pub gate: Option<crate::gate_sim::DescriptorQueue>,
         gate_gains: Vec<(Duration,Vec<f64>)>,
+        observe: bool,
+        /// Captured spans and literal normalized-square means, independent
+        /// of the daemon's account and gain reconstruction.
+        pub observed_periods: Vec<(Duration,Duration,Vec<f64>)>,
     }
 
     impl FakeHw {
@@ -2399,6 +2403,8 @@ pub mod fake {
                 machine: None,
                 gate: None,
                 gate_gains: Vec::new(),
+                observe: false,
+                observed_periods: Vec::new(),
             }
         }
 
@@ -2412,10 +2418,31 @@ pub mod fake {
         }
 
         fn note_gate_gain(&mut self,at:Duration) {
-            if self.gate.is_none() {return;}
-            let n=self.gate.as_ref().unwrap().gate.channels;
+            if self.gate.is_none() && !self.observe {return;}
+            let n=self.gate.as_ref().map_or_else(||if self.per.is_empty() {self.channels} else {self.per.len()},|q|q.gate.channels);
             let gains=(0..n).map(|k|self.effective_of(k)).collect::<Vec<_>>();
             if self.gate_gains.last().is_none_or(|(_,g)|*g!=gains) {self.gate_gains.push((at,gains));}
+        }
+
+        pub fn observe_card(&mut self) {
+            self.observe=true;self.note_gate_gain(self.t);
+        }
+        pub fn observed_gain(&self,at:Duration,k:usize)->f64 {
+            let i=self.gate_gains.partition_point(|(t,_)|*t<=at).saturating_sub(1);
+            self.gate_gains[i].1[k]
+        }
+        pub fn observed_least_gain(&self,from:Duration,to:Duration,k:usize)->f64 {
+            self.gate_gains.iter().filter(|(t,_)|*t>from && *t<=to)
+                .fold(self.observed_gain(from,k),|r,(_,g)|r.min(g[k]))
+        }
+        fn observe_period(&mut self,words:&[i32],frames:usize) {
+            if !self.observe || frames==0 {return;}
+            let mut square=vec![0.0;self.channels];
+            for f in words[..frames*self.channels].chunks_exact(self.channels) {
+                for (p,w) in square.iter_mut().zip(f) {*p+=(f64::from(*w)/2147483648.0).powi(2)/frames as f64;}
+            }
+            let dt=Duration::from_secs_f64(frames as f64/48000.0);
+            self.observed_periods.push((self.last_end.saturating_sub(dt),self.last_end,square));
         }
 
         /// A card with a volume control per speaker and the sense channels
@@ -2544,6 +2571,7 @@ pub mod fake {
                     if self.lease_left.is_zero() && self.last_ok_ping.is_some() && !self.notice_pending {
                         self.lapses.push(b);
                         self.notice_pending = true;
+                        self.note_gate_gain(b);
                     }
                 }
                 a = b;
@@ -2793,6 +2821,9 @@ pub mod fake {
                     let read = reader.read_period_within(words, ms);
                     self.t = reader.io().t.max(if read.as_ref().is_ok_and(|r| r.is_none()) { c + EVENT_LATENCY } else { Duration::ZERO });
                     self.lapse_check();
+                    if self.gate.is_some() && read.as_ref().is_ok_and(|r|*r==Some(true)) {
+                        self.last_end=self.t;self.fill(words,self.period_frames);
+                    }
                     match read {
                         Ok(Some(true)) => self.complete.push(self.t),
                         Ok(Some(false)) => self.incomplete.push(self.t),
@@ -2820,6 +2851,9 @@ pub mod fake {
                 let read = reader.read_period(words);
                 self.t = reader.io().t;
                 self.lapse_check();
+                if self.gate.is_some() && read.as_ref().is_ok_and(|r|*r==Some(true)) {
+                    self.last_end=self.t;self.fill(words,self.period_frames);
+                }
                 match read {
                     Ok(Some(true)) => self.complete.push(self.t),
                     Ok(Some(false)) => self.incomplete.push(self.t),
@@ -2853,6 +2887,7 @@ pub mod fake {
                 tweak(self.delivered, words);
             }
             self.delivered += 1;
+            self.observe_period(words,self.period_frames);
             Ok(Some(true))
         }
     }
@@ -2930,6 +2965,32 @@ pub(crate) mod tests {
         let boot = Duration::from_secs(1000);
         std::fs::write(&path, state::encode(boot, boot, &cold, false, true)).unwrap();
         Some(path)
+    }
+
+    /// Independent information-bound oracle: literal captured words cover
+    /// their own spans. Unseen spans may contain full scale at any gain the
+    /// observed card could still have copied within the queue contract.
+    fn information_bound(cfg:&Config,hw:&FakeHw,to:Duration,charge_missing:bool)->crate::engine::Thermal {
+        let sp=&cfg.speakers[0];let ambient=cfg.globals.t_ambient;
+        let mut th=crate::engine::Thermal::new(sp.tr_coil,sp.tau_coil,sp.tr_magnet,sp.tau_magnet,ambient);
+        let full=sp.vs_scale*sp.vs_scale/sp.r_ff;
+        let mut at=Duration::ZERO;
+        while at<to {
+            let end=(at+Duration::from_micros(500)).min(to);let mid=at+(end-at)/2;
+            let measured=hw.observed_periods.iter().find(|(a,b,_)|*a<=mid && mid<*b);
+            let power=if let Some((_,_,square))=measured {square[sp.vs_chan]*full}
+                else if charge_missing {
+                    let gain=hw.observed_least_gain(mid.saturating_sub(QUEUE_BOUND),mid,0);
+                    full*10f64.powf(-gain/10.0)
+                } else {0.0};
+            th.hold(power,(end-at).as_secs_f64(),ambient);at=end;
+        }
+        th
+    }
+    fn information_bound_holds(actual:&SpeakerState,expected:&crate::engine::Thermal) {
+        assert!(actual.t_coil+0.05>=expected.t_coil && actual.t_magnet+0.05>=expected.t_magnet,
+            "account {:.6}/{:.6} C, independent word/gain oracle {:.6}/{:.6} C",
+            actual.t_coil,actual.t_magnet,expected.t_coil,expected.t_magnet);
     }
 
     /// Run the loop until `until`, returning the first error.
@@ -3036,14 +3097,16 @@ pub(crate) mod tests {
     fn the_reduction_limit_clamps_instead_of_exiting_and_recovers() {
         let cfg = j700();
         let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
-        hw.level = Box::new(|_| 1.0); // a full-scale square wave: 12.7 W
-        hw.playing = Box::new(|t| t < secs(8.0));
+        hw.level = Box::new(|t|if t<secs(2.0) {0.1} else {1.0}); // a full-scale square wave: 12.7 W
+        hw.playing = Box::new(|t| t < secs(10.0));
         hw.reduction_limit = 6.0;
         let mut g = Guard::start(&mut hw, &cfg, 6.0, tmp_state()).unwrap();
         run_until(&mut g, &mut hw, secs(60.0)).expect("the reduction limit must not end the daemon");
         assert!(!hw.lapses.is_empty(), "the limit handed the card to the kernel");
         assert!(hw.unlocked_at(hw.t), "the lock is taken back once cool");
-        assert!(hw.reduction < 6.0 - 3.0 + 1e-9, "{}", hw.reduction);
+        let handed_off=*hw.lapses.last().unwrap();
+        let recovered=hw.writes.iter().find(|(at,_)|*at>handed_off).expect("no recovery target");
+        assert!(recovered.1<6.0-3.0+1e-9,"first recovery target {} dB",recovered.1);
     }
 
     /// One complete period after an outage is not enough to take the lock
@@ -3251,6 +3314,7 @@ pub(crate) mod tests {
     fn a_fine_grained_sense_pointer_gives_complete_periods() {
         let cfg = j700();
         let mut hw = dma_hw(&cfg, |_| 1.0);
+        hw.enable_gate(&cfg);
         let mut g = Guard::start(&mut hw, &cfg, 20.0, tmp_state()).unwrap();
         run_until(&mut g, &mut hw, secs(10.0)).unwrap();
         assert!(hw.incomplete.is_empty(), "{} incomplete, first at {:?}", hw.incomplete.len(), hw.incomplete.first());
@@ -3502,12 +3566,20 @@ pub(crate) mod tests {
         hw.control_delay = Box::new(|t| if (secs(2.5)..secs(2.55)).contains(&t) { Duration::from_millis(600) } else { Duration::ZERO });
         let mut g = Guard::start(&mut hw, &cfg, 40.0, Some(path)).unwrap();
         let mut tripped = None;
+        let mut injected=false;
         while hw.t < secs(5.5) {
+            if !injected && (secs(2.5)..secs(2.55)).contains(&hw.t) {
+                assert!(g.armed(),"the fault needs a held lease");
+                pending_gain(&mut g,&mut hw,0.0);
+                for sp in &mut g.speakers {sp.resume(95.0,70.0,0.0,0.0);}
+                g.account_to=hw.now();injected=true;
+            }
             g.tick(&mut hw).unwrap();
             if g.speakers.iter().any(|s| s.hard) && tripped.is_none() {
                 tripped = Some(hw.t);
             }
         }
+        assert!(injected,"the queued-gain fault was not injected");
         let at = tripped.expect("the model never reached the coil limit");
         assert!(at < secs(3.3), "tripped at {at:?}");
         assert!(!hw.pings.iter().any(|&p| p > at && p < at + secs(1.0)), "renewed after the coil limit at {at:?}");
@@ -3523,18 +3595,21 @@ pub(crate) mod tests {
         let coil_after = |delay: bool, lossy: bool| {
             let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
             hw.level = Box::new(|_| 0.1);
-            hw.lossy = lossy;
+            hw.lossy = lossy;hw.observe_card();
             if delay {
                 hw.control_delay = Box::new(|t| if (secs(2.0)..secs(2.05)).contains(&t) { Duration::from_millis(240) } else { Duration::ZERO });
             }
             let mut g = Guard::start(&mut hw, &cfg, 20.0, tmp_state()).unwrap();
             run_until(&mut g, &mut hw, secs(2.6)).unwrap();
-            g.speakers[0].t_coil
+            let to=g.account_to-hw.t0;
+            (g.speakers[0].clone(),information_bound(&cfg,&hw,to,true),information_bound(&cfg,&hw,to,false))
         };
         let (clean, queued, lost) = (coil_after(false, false), coil_after(true, false), coil_after(true, true));
-        assert!((queued - clean).abs() < 0.5, "a queued backlog was charged: {queued:.2} vs {clean:.2} C");
-        // about 155 ms at 12.7 W: some 18 C on a 50 C coil
-        assert!(lost > clean + 12.0, "lost time was not charged: {lost:.2} vs {clean:.2} C");
+        assert!((queued.0.t_coil-clean.0.t_coil).abs()<0.5,"a retained backlog was charged");
+        // The conservative kernel uses a nonzero reduction now. Compare to
+        // its observed gain, not an assumed 12.7 W at an unwritten 0 dB.
+        information_bound_holds(&lost.0,&lost.1);
+        assert!(lost.1.t_coil>lost.2.t_coil+0.1,"the fixture must expose unpaid lost time");
     }
 
     /// Review F6, repeated: losses each shorter than a period plus the
@@ -3545,16 +3620,19 @@ pub(crate) mod tests {
         let coil_after = |hiccups: bool| {
             let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
             hw.level = Box::new(|_| 0.1);
-            hw.lossy = true;
+            hw.lossy = true;hw.observe_card();
             if hiccups {
                 hw.control_delay = Box::new(|t| if t.as_secs_f64() % 1.0 < 0.05 && t > secs(1.0) { Duration::from_millis(150) } else { Duration::ZERO });
             }
             let mut g = Guard::start(&mut hw, &cfg, 20.0, tmp_state()).unwrap();
             run_until(&mut g, &mut hw, secs(10.0)).unwrap();
-            g.speakers[0].t_coil
+            let to=g.account_to-hw.t0;
+            (g.speakers[0].clone(),information_bound(&cfg,&hw,to,true),information_bound(&cfg,&hw,to,false))
         };
         let (clean, lossy) = (coil_after(false), coil_after(true));
-        assert!(lossy > clean + 20.0, "{lossy:.2} vs {clean:.2} C");
+        information_bound_holds(&lossy.0,&lossy.1);
+        assert!(lossy.1.t_coil>lossy.2.t_coil+0.1,"missing periods were not exercised");
+        assert!(lossy.0.t_coil>clean.0.t_coil,"repeated losses did not retain uncertainty");
     }
 
 
@@ -3974,14 +4052,15 @@ pub(crate) mod tests {
             // of which played at 0 dB before the hand-off
             let pending = hw.now().saturating_duration_since(g.account_to).as_secs_f64();
             let start = g.speakers[0].clone();
+            let gain=hw.effective_reduction();
             g.tick(&mut hw).unwrap();
-            (g.speakers[0].t_coil, start, pending)
+            (g.speakers[0].t_coil, start, pending,gain)
         };
-        let (failed, start, pending) = coil(true);
+        let (failed, start, pending,gain) = coil(true);
         assert!(pending > 0.0);
         let mut want = start.clone();
-        want.step_at(want.worst_case_power(0.0), pending, cfg.globals.t_ambient, 0.0);
-        assert!(failed >= want.t_coil - 1e-6, "{failed:.3} C, the pending {pending:.3} s at 0 dB gives {:.3} C", want.t_coil);
+        want.step_at(want.worst_case_power(gain), pending, cfg.globals.t_ambient, gain);
+        assert!(failed >= want.t_coil - 1e-6, "{failed:.3} C, the pending {pending:.3} s at {gain:.3} dB gives {:.3} C", want.t_coil);
     }
 
     // ---- 0.1.8: the PR #7 third review's witnesses (r3), as safe outcomes ----
@@ -4229,6 +4308,7 @@ pub(crate) mod tests {
             g.tick(&mut hw).unwrap();
         }
         let mut reference = g.speakers[0].clone();
+        hw.old_db=hw.hw.reduction;
         hw.until = hw.hw.t + secs(0.2);
         g.disarm(&mut hw, "synthetic hand-off").unwrap();
         assert_eq!(hw.hw.relinquished, 1);
@@ -4238,7 +4318,7 @@ pub(crate) mod tests {
         for _ in 0..3 {
             g.tick(&mut hw).unwrap();
         }
-        reference.step(reference.worst_case_power(0.0), (g.account_to - from).as_secs_f64(), 50.0);
+        reference.step(reference.worst_case_power(hw.old_db), (g.account_to - from).as_secs_f64(), 50.0);
         assert!(g.speakers[0].t_coil >= reference.t_coil - 0.5, "model {:.2} C, the old gain needs {:.2} C", g.speakers[0].t_coil, reference.t_coil);
     }
 
@@ -5350,16 +5430,16 @@ pub(crate) mod tests {
     fn a_stream_inside_a_rate_read_is_charged() {
         let cfg = j700();
         let mut hw = ReadRace { hw: FakeHw::new(2, 4096), pending: false, slow: true, enable: false };
-        hw.hw.playing = Box::new(|_| false);
+        hw.hw.playing = Box::new(|_| false);hw.hw.observe_card();
         let mut g = Guard::start(&mut hw, &cfg, 20.0, missing_state()).unwrap();
         // from the real latched start, cooled by verified quiet looks
         for _ in 0..10000 {
             g.tick(&mut hw).unwrap();
-            if g.armed() && hw.hw.reduction == 0.0 {
+            if g.armed() {
                 break;
             }
         }
-        assert!(g.armed() && hw.hw.reduction == 0.0);
+        assert!(g.armed());
         let begin = hw.hw.t;
         hw.hw.playing = Box::new(move |t| t >= begin && (10..90).contains(&((t - begin).as_millis() % 125)));
         hw.enable = true;
@@ -5370,7 +5450,8 @@ pub(crate) mod tests {
             let to = g.account_to - hw.hw.t0;
             while ref_to < to {
                 let d = secs(0.0005).min(to - ref_to);
-                let p = if (hw.hw.playing)(ref_to) { reference.worst_case_power(0.0) } else { 0.0 };
+                let gain=hw.hw.observed_least_gain(ref_to.saturating_sub(QUEUE_BOUND),ref_to,0);
+                let p = if (hw.hw.playing)(ref_to) { reference.worst_case_power(gain) } else { 0.0 };
                 reference.step(p, d.as_secs_f64(), 50.0);
                 ref_to += d;
             }
@@ -5395,10 +5476,11 @@ pub(crate) mod tests {
         // this one's read: it must not be cooled over
         g.event_pending = true;
         let before = g.speakers[0].clone();
+        let gain=hw.effective_reduction();
         let from = g.account_to;
         g.tick(&mut hw).unwrap();
         let mut want = before.clone();
-        want.step_at(want.worst_case_power(0.0), (g.account_to - from).as_secs_f64(), 50.0, 0.0);
+        want.step_at(want.worst_case_power(gain), (g.account_to - from).as_secs_f64(), 50.0, gain);
         assert!(g.account_to > from && g.speakers[0].t_coil >= want.t_coil - 1e-9, "a pending event was cooled over");
     }
 
@@ -5568,7 +5650,7 @@ pub(crate) mod tests {
         hw.playing = Box::new(|_| false);
         hw.level = Box::new(|_| 0.0);
         let mut g = Guard::start(&mut hw, &cfg, 20.0, tmp_state()).unwrap();
-        g.tick(&mut hw).unwrap();
+        while !g.armed() && hw.t<secs(2.0) {g.tick(&mut hw).unwrap();}
         assert!(g.armed());
         for s in &mut g.speakers {
             s.resume(110.0, 100.0, 0.0, 0.0);
