@@ -89,6 +89,8 @@ use crate::guard::{Guard, Hw, BLIND_LIMIT, DRAIN, MUTE_DB, REARM_MARGIN_DB, REAR
 use crate::model::SpeakerState;
 use crate::state;
 
+mod recurrent;
+
 const J316: &str = include_str!("../../conf/apple/j316.conf");
 const J413: &str = include_str!("../../conf/apple/j413.conf");
 /// The longest quiet tail run (s); a tail its bound puts beyond this is
@@ -458,11 +460,14 @@ struct Oracle {
     n: u64,
     base: u64,
     hist: Vec<Vec<[f32; 6]>>,
+    audit: Option<Vec<[super::continuous::Thermal;3]>>,
+    /// Exact sample peaks, including unaccounted time and lost current lines.
+    vi_peaks: [f64; 6],
 }
 
 impl Oracle {
     fn new(cfg: &Config) -> Oracle {
-        let nodes = cfg
+        let nodes: Vec<[Node;3]> = cfg
             .speakers
             .iter()
             .map(|s| {
@@ -471,7 +476,8 @@ impl Oracle {
             })
             .collect();
         let k = cfg.speakers.len();
-        Oracle { ta: cfg.globals.t_ambient, nodes, now: vec![[(0.0, 0.0); 3]; k], n: 0, base: 0, hist: vec![Vec::new(); k] }
+        let audit=super::continuous::enabled().then(||nodes.iter().map(|ns|std::array::from_fn(|j|{let n=ns[j];super::continuous::Thermal::new(cfg.globals.t_ambient,n.trc,n.trm,n.tau_c,n.tau_m)})).collect());
+        Oracle { ta: cfg.globals.t_ambient, nodes, now: vec![[(0.0, 0.0); 3]; k], n: 0, base: 0, hist: vec![Vec::new(); k], audit, vi_peaks: [0.0; 6] }
     }
 
     /// One sample of `h` seconds; per speaker the true V*I, V^2/z_nominal
@@ -480,10 +486,13 @@ impl Oracle {
         for k in 0..self.now.len() {
             let mut out = [0f32; 6];
             for j in 0..3 {
+                if let Some(a)=self.audit.as_mut() {let(c,m)=self.now[k][j];a[k][j].observe(c+self.ta,m+self.ta,p[k][j],h);}
                 self.now[k][j] = self.nodes[k][j].step(self.now[k][j], p[k][j], h);
                 out[2 * j] = (self.now[k][j].0 + self.ta) as f32;
                 out[2 * j + 1] = (self.now[k][j].1 + self.ta) as f32;
             }
+            let vi = self.now[k][VI];
+            self.vi_peaks[k] = self.vi_peaks[k].max(self.ta + vi.0.max(vi.1));
             self.hist[k].push(out);
         }
         self.n += 1;
@@ -695,12 +704,14 @@ impl<'a> ViWorld<'a> {
             }
             self.gain_at(k, kappa)
         };
+        let level = recurrent::level(self.cfg.speakers[k].name.contains("Tweeter"), tau, level);
         let a = level * 10f64.powf(-gain / 20.0) * self.vpk;
-        if s.freq == 0.0 {
+        let freq = recurrent::frequency(tau, s.freq);
+        if freq == 0.0 {
             let v = if n % 2 == 0 { a } else { -a };
             (v, v / self.z[k])
         } else {
-            let x = 2.0 * PI * s.freq * tau;
+            let x = 2.0 * PI * freq * tau;
             (a * x.sin(), a / self.z[k] * (x - self.phi[k]).sin())
         }
     }
@@ -768,6 +779,7 @@ impl<'a> ViWorld<'a> {
                 p[j] = [v * i, v * v / s.z_nominal, v * v / s.r_ff];
             }
             self.oracle.step(h, &p);
+            recurrent::observe(self);
         }
     }
 
@@ -1122,6 +1134,8 @@ pub struct Outcome {
     pub tail_checked: bool,
     pub tail_skipped: bool,
     pub hottest_true: f64,
+    /// Per speaker, maximum true V/I temperature over every oracle sample.
+    pub true_vi_peaks: [f64; 6],
     pub guarded: bool,
     pub i_dead: bool,
     /// The least, over speakers and time, of the hard limit less the
@@ -1246,8 +1260,8 @@ fn check(cfg: &Config, w: &ViWorld, g: &Guard, sc: &ViScenario, out: &mut Outcom
             }
             if asahi_bound && !low {
                 let need = need(cfg, &w.oracle, k, at, rate, &slack);
-                if need >= sc.max_reduction + 0.05 {
-                    return Err(Violation(format!("(b) at {now:.4} s: armed while {name}'s true state needs {need:.3} dB, over --max-reduction")));
+                if need > w.reduction_limit_db().unwrap() + 0.05 {
+                    return Err(Violation(format!("(b) at {now:.4} s: armed while {name}'s true state needs {need:.3} dB, beyond the hardware range")));
                 }
                 if w.effective(k) < need - 0.05 {
                     return Err(Violation(format!("(b) at {now:.4} s: {name} card applies {:.3} dB, the true state needs {need:.3} dB", w.effective(k))));
@@ -1415,7 +1429,15 @@ pub fn run(sc: &ViScenario, seed: u64) -> Result<Outcome, Violation> {
             }
         }
     })();
+    if let Some(a)=&w.oracle.audit {
+        let mut rows=Vec::new();
+        for (k,s) in cfg.speakers.iter().enumerate(){for(j,model)in[(VI,"vi"),(FFR,"ff")] {
+            let(c,m)=a[k][j].peaks();rows.push(super::continuous::Row{speaker:s.name.clone(),model,active:j==VI||cfg.globals.governor==Governor::Unified,limit:s.t_limit,coil:c,magnet:m});
+        }}
+        super::continuous::record(seed,sc.to_rust(),if sc.j413{"j413"}else{"j316"},rows,result.as_ref().err().map(|e|e.0.clone()),out.handoffs as u64);
+    }
     let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    out.true_vi_peaks = w.oracle.vi_peaks;
     result.map(|()| out)
 }
 
@@ -1480,7 +1502,7 @@ fn tail(cfg: &Config, w: &mut ViWorld, g: &mut Guard, sc: &ViScenario, out: &mut
     // uncovered time may still be charged at the old gain
     let settle = w.now_s() + DRAIN.as_secs_f64() + 0.5;
     quiet(w, g, settle)?;
-    let bound = if sc.events && g.governing == Governor::Asahi { cooling_bound(cfg, g, sc.max_reduction) } else { None };
+    let bound = if sc.events && g.governing == Governor::Asahi { cooling_bound(cfg, g, w.reduction_limit_db().unwrap()) } else { None };
     let assert_d = bound.is_some_and(|b| b + TAIL_SLACK <= TAIL_MAX);
     let len = bound.map_or(5.0, |b| (b + TAIL_SLACK).min(TAIL_MAX));
     let from = w.now_s();
@@ -1687,6 +1709,7 @@ mod tests {
                         let what = format!("{} {} Hz{} at {level} {} {}", if j413 { "J413" } else { "J316" }, freq, if tweeters { " (tweeters)" } else { "" }, if guard { "guarded" } else { "asahi" }, if dead { "dead" } else { "live" });
                         match run(&sc, 700000001) {
                             Ok(o) => {
+                                recurrent::assert_true_vi_limit(&sc, &o);
                                 lines.lock().unwrap().push(format!("{what}: VI truth {:.1} K under its limit, FF truth {:.1}", o.vi_to_limit, o.ff_to_limit));
                                 if !(o.vi_to_limit > 0.0) || (guard && !(o.ff_to_limit > 0.0)) {
                                     failed.lock().unwrap().push(format!("{what}: a truth reached its limit: VI {:.2} K, FF {:.2} K under it", o.vi_to_limit, o.ff_to_limit));
@@ -1708,6 +1731,7 @@ mod tests {
                         let what = format!("{} {} Hz{} at {level} {} reading {k} plus {offset} A", if j413 { "J413" } else { "J316" }, freq, if tweeters { " (tweeters)" } else { "" }, if guard { "guarded" } else { "asahi" });
                         match run(&sc, 700000001) {
                             Ok(o) => {
+                                recurrent::assert_true_vi_limit(&sc, &o);
                                 lines.lock().unwrap().push(format!("{what}: VI truth {:.1} K under its limit, FF truth {:.1}", o.vi_to_limit, o.ff_to_limit));
                                 if !(o.vi_to_limit > 0.0) {
                                     failed.lock().unwrap().push(format!("{what}: the measured-power truth reached its limit: {:.2} K under it", o.vi_to_limit));

@@ -23,6 +23,7 @@ impl Tracked {
     }
 }
 impl Hw for Tracked {
+    fn step_db(&self) -> f64 { self.hw.step_db() }
     fn now(&self) -> Instant {
         self.hw.now()
     }
@@ -57,7 +58,10 @@ impl Hw for Tracked {
     }
     fn set_reductions(&mut self, d: &[f64]) -> io::Result<Vec<f64>> {
         self.snap();
-        let result = self.hw.set_reductions(d);
+        let rounded: Vec<_> = d.iter().map(|&v| {
+            if self.hw.steps { (v * 2.0 - 1e-9).ceil() / 2.0 } else { v }
+        }).collect();
+        let result = self.hw.set_reductions(&rounded);
         self.snap();
         result
     }
@@ -131,17 +135,21 @@ impl Hw for Tracked {
     }
 }
 
-fn full_scale_run(mut cfg: Config, seconds: u64, clean_start: bool) -> (Config, Tracked) {
+fn full_scale_run(cfg: Config, seconds: u64, clean_start: bool) -> (Config, Tracked) {
+    programme_run(cfg, seconds, clean_start, false, Box::new(move |t| {
+        if clean_start && t < Duration::from_secs(2) { 0.0 } else { 1.0 }
+    }))
+}
+
+fn programme_run(
+    mut cfg: Config, seconds: u64, clean_start: bool, steps: bool,
+    level: Box<dyn Fn(Duration) -> f64>,
+) -> (Config, Tracked) {
     cfg.allow_unqualified = true;
     cfg.allow_unified = true;
     let mut hw = FakeHw::per_speaker(&cfg);
-    hw.level = Box::new(move |t| {
-        if clean_start && t < Duration::from_secs(2) {
-            0.0
-        } else {
-            1.0
-        }
-    });
+    hw.steps = steps;
+    hw.level = level;
     // Preserve the review's static loads. Avoid a current rail in this
     // witness so the onset cannot be confused with current-rail handling.
     let specs = cfg.speakers.clone();
@@ -193,6 +201,17 @@ fn check_truth(cfg: &Config, hw: &Tracked, name: &str, must_rearm: bool) {
         hw.hw.pings.len(),
         hw.hw.pings.first()
     );
+    if let Ok(dir) = std::env::var("SPEAKERGUARDD_ONSET_CSV_DIR") {
+        use std::io::Write as _;
+        let tag = format!("{name}-{:?}-{}", cfg.globals.governor, hw.clean_start);
+        let path = std::path::Path::new(&dir).join(format!("onset-{tag}.csv"));
+        let mut file = std::fs::File::create(path).unwrap();
+        writeln!(file, "time_ns,{}", cfg.speakers.iter().map(|s| s.name.clone()).collect::<Vec<_>>().join(",")).unwrap();
+        for (at, db) in &hw.gains {
+            writeln!(file, "{},{}", at.as_nanos(), db.iter().map(|d| format!("{d:.17}")).collect::<Vec<_>>().join(",")).unwrap();
+        }
+        eprintln!("ONSET_TRACE {tag} onset_ns={}", hw.full_onset.unwrap_or_default().as_nanos());
+    }
     for (k, s) in cfg.speakers.iter().enumerate() {
         let v = v_worst(s, &cfg.globals);
         let z = s.z_nominal.max(v / s.is_scale * 1.01);
@@ -251,8 +270,8 @@ fn check_truth(cfg: &Config, hw: &Tracked, name: &str, must_rearm: bool) {
                     gain = next[k];
                 }
                 eprintln!(
-                    "ONSET {name} {:?} {} ff={ff} initial={initial} peak={peak:.6}",
-                    cfg.globals.governor, s.name
+                    "ONSET {name} {:?} {} ff={ff} initial={initial} peak={peak:.6} clean={}",
+                    cfg.globals.governor, s.name, hw.clean_start
                 );
                 assert!(
                     peak <= s.t_limit + 1e-6,
@@ -307,40 +326,46 @@ fn every_vi_profile_bounds_full_scale_after_mute() {
         if !cfg.has_vi() {
             continue;
         }
-        let (cfg, hw) = full_scale_run(cfg, 60, true);
-        // A fallback whose worst-case steady state is above the working
-        // limit cannot support the ceiling's safe tail. All other files
-        // must actually unlock while quiet before the full-scale onset.
-        let safe = 10f64.powf(-cfg.globals.safe_reduction / 10.0);
-        let viable = cfg.speakers.iter().all(|s| {
-            let p = v_worst(s, &cfg.globals).powi(2) * safe;
-            let target = s.t_limit - s.t_headroom;
-            cfg.globals.t_ambient
-                + p / s.z_min() * crate::engine::ASAHI_MARGIN * (s.vi_tr_coil + s.vi_tr_magnet)
-                < target
-                && cfg.globals.t_ambient + p / s.r_ff * (s.tr_coil + s.tr_magnet) < target
-        });
-        check_truth(
-            &cfg,
-            &hw,
-            path.file_stem().unwrap().to_str().unwrap(),
-            viable,
-        );
-        if viable {
-            assert!(
-                hw.hw
-                    .pings
-                    .first()
-                    .is_some_and(|t| *t < hw.full_onset.unwrap()),
-                "{} never unlocked before its onset",
-                path.display()
+        for gov in [Governor::Asahi, Governor::Unified] {
+            let mut cfg = cfg.clone();
+            cfg.globals.governor = gov;
+            cfg.globals.guard = (gov == Governor::Unified).then_some(Governor::Asahi);
+            let (cfg, hw) = full_scale_run(cfg, 120, true);
+            // A fallback whose worst-case steady state is above the working
+            // limit cannot support the ceiling's safe tail. All other files
+            // must actually unlock while quiet before the full-scale onset.
+            let safe = 10f64.powf(-cfg.globals.safe_reduction / 10.0);
+            let viable = cfg.speakers.iter().all(|s| {
+                let p = v_worst(s, &cfg.globals).powi(2) * safe;
+                let target = s.t_limit - s.t_headroom;
+                cfg.globals.t_ambient
+                    + p / s.z_min() * crate::engine::ASAHI_MARGIN * (s.vi_tr_coil + s.vi_tr_magnet)
+                    < target
+                    && (gov != Governor::Unified
+                        || cfg.globals.t_ambient + p / s.r_ff * (s.tr_coil + s.tr_magnet) < target)
+            });
+            check_truth(
+                &cfg,
+                &hw,
+                path.file_stem().unwrap().to_str().unwrap(),
+                viable,
             );
-        } else {
-            assert!(
-                hw.hw.pings.is_empty(),
-                "{} unlocked with an unbounded safe tail",
-                path.display()
-            );
+            if viable {
+                assert!(
+                    hw.hw
+                        .pings
+                        .first()
+                        .is_some_and(|t| *t < hw.full_onset.unwrap()),
+                    "{} never unlocked before its onset",
+                    path.display()
+                );
+            } else {
+                assert!(
+                    hw.hw.pings.is_empty(),
+                    "{} unlocked with an unbounded safe tail",
+                    path.display()
+                );
+            }
         }
     }
 }
@@ -392,7 +417,7 @@ fn a_mute_write_does_not_erase_energy_at_an_earlier_gain() {
 }
 
 #[test]
-fn the_onset_ceiling_cannot_bypass_a_governor_handoff() {
+fn the_onset_ceiling_cannot_bypass_the_hardware_range() {
     let cfg = tests::j413();
     let mut hw = FakeHw::per_speaker(&cfg);
     hw.level = Box::new(|_| 0.0);
@@ -410,13 +435,153 @@ fn the_onset_ceiling_cannot_bypass_a_governor_handoff() {
     assert!(g.armed());
     assert!(hw.per.iter().any(|r| *r > cfg.globals.max_reduction));
     for a in g.engine.as_mut().unwrap().asahi.as_mut().unwrap() {
-        a.gain = -cfg.globals.max_reduction;
+        a.gain = -100.6;
     }
     g.decide(&mut hw, false).unwrap();
     assert!(
         !g.armed(),
-        "the original governor threshold still hands the card off"
+        "an unrepresentable target must hand the card off"
     );
     assert!(hw.per.iter().all(|r| *r >= 0.0));
     let _ = std::fs::remove_file(state);
+}
+
+/// Every installed V/I profile, including drafts, must bound both truth
+/// nodes at the hard limit, not just a cold start or a selected chassis.
+#[test]
+fn every_vi_profile_bounds_hot_full_scale_onsets() {
+    crate::log::set_verbosity(crate::log::Level::Error);
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("conf/apple");
+    let mut paths: Vec<_> = std::fs::read_dir(dir).unwrap()
+        .map(|p| p.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|e| e == "conf")).collect();
+    paths.sort();
+    for path in paths {
+        let cfg = Config::parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        if !cfg.has_vi() { continue; }
+        let name = path.file_stem().unwrap().to_str().unwrap();
+        for gov in [Governor::Asahi, Governor::Unified] {
+            let mut cfg = cfg.clone();
+            cfg.globals.governor = gov;
+            cfg.globals.guard = (gov == Governor::Unified).then_some(Governor::Asahi);
+            let (cfg, hw) = full_scale_run(cfg, 120, false);
+            // Retain the original witnesses' recovery requirement. Some
+            // drafts cannot fit their declared fallback and stay locked.
+            check_truth(&cfg, &hw, name, ["j316", "j413", "j616"].contains(&name));
+        }
+    }
+}
+
+/// The deployed J413 guarded path reached 230.194 C from a clean cold
+/// start when full scale followed two seconds of silence. Keep this
+/// command-line governor combination explicit, even if file defaults move.
+#[test]
+fn reviewed_guarded_quiet_to_full_onsets_stay_under_the_limit() {
+    crate::log::set_verbosity(crate::log::Level::Error);
+    for name in ["j316", "j413"] {
+        let text = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(format!("conf/apple/{name}.conf")),
+        ).unwrap();
+        let mut cfg = Config::parse(&text).unwrap();
+        cfg.globals.governor = Governor::Unified;
+        cfg.globals.guard = Some(Governor::Asahi);
+        let (cfg, hw) = full_scale_run(cfg, 120, true);
+        check_truth(&cfg, &hw, &format!("{name}-quiet"), true);
+    }
+}
+
+#[test]
+fn a_failed_legacy_write_keeps_the_card_wide_ceiling_as_a_candidate() {
+    let mut cfg = Config::parse(include_str!("../../conf/apple/j413.conf")).unwrap();
+    cfg.allow_unqualified = true;
+    cfg.globals.governor = Governor::Legacy;
+    cfg.globals.guard = None;
+    let mut hw = FakeHw::per_speaker(&cfg);
+    hw.level = Box::new(|_| 0.0);
+    let path = tests::vi_state(&cfg, cfg.globals.t_ambient, cfg.globals.t_ambient);
+    let mut g = Guard::start(&mut hw, &cfg, cfg.globals.max_reduction, Some(path)).unwrap();
+    while hw.t < Duration::from_secs(2) { g.tick(&mut hw).unwrap(); }
+    assert!(g.armed());
+    for s in &mut g.speakers {
+        if s.spec.name.contains("Tweeter") {
+            s.t_coil = 60.0;
+            s.t_magnet = 75.0;
+        }
+    }
+    for a in g.engine.as_mut().unwrap().asahi.as_mut().unwrap() {
+        a.th.t_coil = 60.0;
+        a.th.t_magnet = 75.0;
+    }
+    let (_, mut per, _) = g.governing_state();
+    assert!(g.bound_onset(hw.now(), &mut per));
+    let target = per.iter().copied().fold(0.0, f64::max);
+    assert!(per.iter().any(|r| *r < target));
+    // An I/O error does not say which individual controls accepted the
+    // scalar write. Every control must retain the attempted scalar value.
+    hw.target_fail = Box::new(|_| true);
+    g.decide(&mut hw, false).unwrap();
+    assert!(!g.armed());
+    for set in &g.written_set {
+        assert!(set.iter().any(|&(lo, hi)| lo <= target && hi >= target), "{set:?} omitted {target}");
+    }
+}
+
+
+/// The deterministic listening acceptance schedule. Cubic volume scaling
+/// is applied before protection. At both points the deployed baseline has
+/// zero mean attenuation on every output after the first minute from cold.
+/// Keep this gate strict while the playback-energy contract is unresolved.
+#[test]
+fn ordinary_quiet_programme_costs_at_most_one_db() {
+    crate::log::set_verbosity(crate::log::Level::Error);
+    let mut failures = Vec::new();
+    for name in ["j316", "j413"] {
+        let text = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(format!("conf/apple/{name}.conf")),
+        ).unwrap();
+        for point in [30u32, 60] {
+            let mut cfg = Config::parse(&text).unwrap();
+            cfg.globals.governor = Governor::Unified;
+            cfg.globals.guard = Some(Governor::Asahi);
+            let volume = (point as f64 / 100.0).powi(3);
+            let level = Box::new(move |t: Duration| {
+                let phase = t.as_secs_f64() % 60.0;
+                let programme = if phase < 2.0 { 0.0 }
+                    else if phase < 20.0 { 0.10 }
+                    else if phase < 30.0 { 0.03 }
+                    else if phase < 45.0 { 0.25 }
+                    else if phase < 50.0 { 0.0 }
+                    else { 0.08 };
+                volume * programme
+            });
+            let (cfg, hw) = programme_run(cfg, 600, true, true, level);
+            let mut totals = vec![0.0; cfg.speakers.len()];
+            let mut active_s = 0.0;
+            for pair in hw.gains.windows(2) {
+                let (from, to) = (pair[0].0.as_secs_f64(), pair[1].0.as_secs_f64());
+                // Exclude the first minute and every silent interval.
+                for cycle in 1..10 {
+                    for (start, end) in [(2.0, 45.0), (50.0, 60.0)] {
+                        let base = cycle as f64 * 60.0;
+                        let seconds = (to.min(base + end) - from.max(base + start)).max(0.0);
+                        active_s += seconds;
+                        for (total, gain) in totals.iter_mut().zip(&pair[0].1) {
+                            *total += seconds * gain;
+                        }
+                    }
+                }
+            }
+            assert!((active_s - 477.0).abs() < 1e-6, "{active_s} active seconds");
+            for (speaker, total) in cfg.speakers.iter().zip(totals) {
+                let loss = total / active_s;
+                eprintln!("LISTENING_COST {name} {point}% {} extra_db={loss:.6}", speaker.name);
+                if loss > 1.0 + 1e-6 {
+                    failures.push(format!("{name} {point}% {}: {loss:.3} dB", speaker.name));
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "ordinary listening exceeds 1 dB: {}", failures.join("; "));
 }

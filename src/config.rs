@@ -116,8 +116,8 @@ pub struct Globals {
     /// limit, where the daemon hands the speakers to the kernel.
     pub unified_caps: bool,
     pub p_reduction_max: f64,
-    /// Gain reduction beyond which the card's safe level takes over (dB);
-    /// `-m` overrides it.  speakersafetyd's machines use 7.
+    /// Historical handoff threshold, retained for old configs/recordings.
+    /// `-m` overrides the recorded value; writes use the hardware range.
     pub max_reduction: f64,
     /// Whether this machine's sense mapping and thermal constants have been
     /// qualified on the machine itself.  An unqualified configuration is
@@ -129,6 +129,18 @@ pub struct Globals {
     /// governors' reductions, and either one's hard latch hands the card
     /// to the kernel.  Needs V/I sense on every speaker.
     pub guard: Option<Governor>,
+    /// What the first start of a boot assumes of the time since the last
+    /// one (persist.rs): `latched` (the default) starts at the coils'
+    /// limit; `idle` resumes the state a clean stop at shutdown left, the
+    /// gap at the card's safe level, which is only sound on a machine no
+    /// other OS drives the speakers on.
+    pub boot_resume: BootResume,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootResume {
+    Latched,
+    Idle,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -327,6 +339,11 @@ impl Config {
                 None | Some("none") => None,
                 Some("asahi") => Some(Governor::Asahi),
                 Some(v) => return Err(ConfigError(format!("[Globals] guard {v:?}: none or asahi"))),
+            },
+            boot_resume: match g.get("boot_resume").map(String::as_str) {
+                None | Some("latched") => BootResume::Latched,
+                Some("idle") => BootResume::Idle,
+                Some(v) => return Err(ConfigError(format!("[Globals] boot_resume {v:?}: latched or idle"))),
             },
         };
         if !(globals.max_reduction.is_finite() && globals.max_reduction > 0.0) {

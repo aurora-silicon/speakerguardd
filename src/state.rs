@@ -9,22 +9,31 @@
 //! lock was given up and drained, its model covering every moment up to the
 //! write, marked `released 1`.  A run that resumes it overwrites it before
 //! it can unlock.  The time since is charged at the card's safe level;
-//! anything else starts every speaker at its coil limit, latched.
+//! anything else starts every speaker from independent hot coil and magnet
+//! bounds, including the queued drain and the safe-level floor, latched.
 //!
 //! The engine's models (engine.rs) are saved in the same file, after the
 //! legacy speaker lines (`asahi ...`, `unified ...`): one atomic write and
 //! the same clean-stop rule for every model.  A model the file does not
-//! carry starts latched at its limit.  A J700 file without the engine is
-//! what 0.1.9 writes; a reader older than the engine refuses a file with
-//! engine lines, and so starts latched too.
+//! carry starts latched at its limit. Generation 2 snapshots predate the
+//! independent hot-node bounds and are refused even after a clean stop.
+//! Readers from before generation 3 refuse it rather than resuming its temperatures.
 
 use std::time::Duration;
+
+/// The state text rounds temperatures to six decimals. A one-microkelvin
+/// allowance dominates the half-microkelvin encoding error at either node
+/// and floating-point evaluation noise. The thermal system is monotone
+/// and does not amplify a uniform initial temperature error.
+pub(crate) const RECORD_TEMP_EPS: f64 = 1e-6;
 
 use crate::config::Globals;
 use crate::engine::{state_name, Engine, SavedAsahi, SavedUnified};
 use crate::model::SpeakerState;
 
-const MAGIC: &str = "speakerguardd-state 2";
+// A clean stop from an older initializer is not a temperature bound.
+// New readers reject v2, and old readers reject v3 on rollback.
+const MAGIC: &str = "speakerguardd-state 3";
 /// The format 0.1.2 to 0.1.5 wrote: never resumed.
 const MAGIC_V1: &str = "speakerguardd-state 1";
 
@@ -170,11 +179,11 @@ fn unified_line(f: &[&str]) -> Option<SavedUnified> {
     })
 }
 
-/// None for anything but a complete, finite, physically possible v2 state.
+/// None for anything but a complete, finite, physically possible current-generation state.
 /// A v1 file decodes as never released (it is not resumed).
 pub fn decode(text: &str) -> Option<Saved> {
     let mut lines = text.lines();
-    let v2 = match lines.next()? {
+    let current = match lines.next()? {
         MAGIC => true,
         MAGIC_V1 => false,
         _ => return None,
@@ -220,15 +229,15 @@ pub fn decode(text: &str) -> Option<Saved> {
             continue;
         }
         let f: Vec<&str> = line.split_whitespace().collect();
-        if v2 && f.first() == Some(&"asahi") {
+        if current && f.first() == Some(&"asahi") {
             asahi.push(asahi_line(&f)?);
             continue;
         }
-        if v2 && f.first() == Some(&"unified") {
+        if current && f.first() == Some(&"unified") {
             unified.push(unified_line(&f)?);
             continue;
         }
-        let fields = if v2 { 10 } else { 8 };
+        let fields = if current { 10 } else { 8 };
         if f.len() != fields || f[0] != "speaker" {
             return None;
         }
@@ -236,7 +245,7 @@ pub fn decode(text: &str) -> Option<Saved> {
         if v.iter().any(|x| !x.is_finite()) || v[2] < 0.0 || v[3] < 0.0 || v[0] < -50.0 || v[1] < -50.0 || v[5] < 0.0 {
             return None;
         }
-        let (hard, t_peak) = if v2 {
+        let (hard, t_peak) = if current {
             let peak: f64 = f[9].parse().ok().filter(|p: &f64| p.is_finite())?;
             (flag(f[8])?, peak)
         } else {
@@ -244,27 +253,30 @@ pub fn decode(text: &str) -> Option<Saved> {
         };
         speakers.push(SavedSpeaker { name: f[1].to_string(), t_coil: v[0], t_magnet: v[1], mean_1s: v[2], mean_60s: v[3], reduction_db: v[5], hard, t_peak });
     }
-    if speakers.is_empty() || (v2 && !ended) {
+    if speakers.is_empty() || (current && !ended) {
         return None;
     }
     let covered = Duration::from_nanos(covered.unwrap_or(0).min(ns));
-    Some(Saved { boottime: Duration::from_nanos(ns), covered, armed, released: v2 && released && !armed, recovering, speakers, asahi, unified })
+    Some(Saved { boottime: Duration::from_nanos(ns), covered, armed, released: current && released && !armed, recovering, speakers, asahi, unified })
 }
 
 /// Continue every speaker from a clean stop's state and charge the time
 /// since at the worst case the card's own safe level lets through (no
 /// daemon held the card), a full-scale signal before the gain.  Anything else - a v1 file, a state not written
 /// by a clean stop, one whose model did not cover up to its write, a
-/// speaker it does not name - starts at the coil's limit, latched.  True
+/// speaker it does not name - starts from independent hot coil and magnet
+/// bounds, latched. True
 /// if the state was resumed.
 pub fn restore(speakers: &mut [SpeakerState], saved: &Saved, now: Duration, globals: &Globals) -> bool {
+    // The voltage cap is derived from the active configuration, not saved.
+    for speaker in speakers.iter_mut() { speaker.configure_voltage(globals); }
     let proven = saved.proven();
     let elapsed = now.saturating_sub(saved.boottime).as_secs_f64();
     for s in speakers.iter_mut() {
         let x = match saved.speakers.iter().find(|x| x.name == state_name(&s.spec.name)) {
             Some(x) if proven => x,
             _ => {
-                s.assume_latched(globals.t_ambient);
+                s.assume_latched(globals);
                 continue;
             }
         };
@@ -306,6 +318,45 @@ pub fn restore_engine(engine: &mut Engine, saved: &Saved, now: Duration, globals
     true
 }
 
+/// Restore an uncertain cross-boot age. Histories use the longest age at
+/// full-scale pre-gain power. Temperatures bound the entire interval,
+/// including a coil warmed by a cooling magnet between the endpoints.
+pub fn restore_interval(speakers: &mut [SpeakerState], engine: &mut Option<Engine>, saved: &Saved, lo: Duration, hi: Duration, globals: &Globals) -> bool {
+    if hi < lo || !restore(speakers, saved, hi, globals) {
+        return false;
+    }
+    let mut low = speakers.to_vec();
+    restore(&mut low, saved, lo, globals);
+    let start = lo.saturating_sub(saved.boottime).as_secs_f64();
+    let span = (hi - lo).as_secs_f64();
+    for (s, low) in speakers.iter_mut().zip(&low) {
+        let Some(x) = saved.speakers.iter().find(|x| x.name == state_name(&s.spec.name)) else { continue };
+        let p = s.worst_case_power(globals.safe_reduction);
+        let spec = s.spec.clone();
+        let mut th = crate::engine::Thermal::new(spec.tr_coil, spec.tau_coil, spec.tr_magnet, spec.tau_magnet, x.t_coil);
+        th.t_magnet = x.t_magnet;
+        th.hold(p, start, globals.t_ambient);
+        // Legacy heat steps advance the magnet before the coil. Bound
+        // both that discretization and the continuous plant. The magnet
+        // is monotone; neither update can leave this invariant rectangle:
+        // M <= max(M(lo), M(infinity)), C <= max(C(lo), M_bound + P Rc).
+        // This also covers the arbitrary phase of the legacy substeps.
+        let magnet = th.t_magnet.max(low.t_magnet).max(globals.t_ambient + p * spec.tr_magnet);
+        let coil = th.t_coil.max(low.t_coil).max(magnet + p * spec.tr_coil);
+        let (pc, pm) = th.hold(p, span, globals.t_ambient);
+        s.raise_to(low);
+        s.t_coil = s.t_coil.max(coil).max(pc) + RECORD_TEMP_EPS;
+        s.t_magnet = s.t_magnet.max(magnet).max(pm) + RECORD_TEMP_EPS;
+        s.t_peak = (s.t_peak.max(x.t_peak) + RECORD_TEMP_EPS).max(s.t_coil);
+        s.hard |= s.t_peak >= spec.t_limit;
+    }
+    if let Some(e) = engine {
+        restore_engine(e, saved, hi, globals);
+        e.bound_resume_interval(saved, lo, hi);
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,6 +381,169 @@ mod tests {
 
     const T: Duration = Duration::from_secs(100);
 
+    /// PR #20 uses this generation for the same independently hot-node
+    /// initializer. Its legacy-only writer has no engine records. Keep
+    /// that clean-stop format readable without allocating a new generation.
+    #[test]
+    fn neo_generation_three_clean_stop_remains_readable() {
+        let text = include_str!("../tests/neo-generation-three.state");
+        let saved = decode(text).unwrap();
+        assert!(saved.proven());
+        assert_eq!(saved.boottime, T);
+        assert!(saved.asahi.is_empty() && saved.unified.is_empty());
+        let cfg = Config::parse(J700).unwrap();
+        let mut speakers = fresh(&cfg);
+        assert!(restore(&mut speakers, &saved, T, &cfg.globals));
+        assert_eq!(speakers.len(), 2);
+        for (i, s) in speakers.iter().enumerate() {
+            assert!(!s.hard);
+            assert!((s.t_coil - (125.12345649 + i as f64)).abs() < RECORD_TEMP_EPS);
+            assert!((s.t_magnet - (95.12345649 + i as f64)).abs() < RECORD_TEMP_EPS);
+            assert!((s.t_peak - (131.12345649 + i as f64)).abs() < RECORD_TEMP_EPS);
+        }
+        let rewritten = encode(T, T, &speakers, false, true);
+        assert!(rewritten.starts_with("speakerguardd-state 3\n"));
+        assert!(decode(&rewritten).unwrap().proven());
+        assert!(decode(&text.replacen("state 3", "state 2", 1)).is_none());
+    }
+
+    /// A genuine in-memory state can round down in the record. Compare
+    /// with that unrounded state, rather than treating decoded values as
+    /// truth. No tolerance may hide a colder restored node or peak.
+    #[test]
+    fn persistent_temperatures_cover_record_rounding() {
+        let cfg = Config::parse(include_str!("../conf/apple/j316.conf")).unwrap();
+        let (tc, tm) = (125.12345649, 95.12345649);
+        let mut truth = fresh(&cfg);
+        for s in &mut truth { s.resume(tc, tm, 0.0, 0.0); }
+        let mut engine_truth = Engine::new(&cfg, true).unwrap();
+        for a in engine_truth.asahi.iter_mut().flatten() {
+            (a.th.t_coil, a.th.t_magnet, a.coil_hyst, a.magnet_hyst, a.coil_peak, a.magnet_peak, a.hard) = (tc, tm, tc, tm, tc, tm, false);
+        }
+        for u in engine_truth.unified.iter_mut().flatten() {
+            (u.ff.t_coil, u.ff.t_magnet, u.peak, u.hard) = (tc, tm, tc, false);
+            if let Some(v) = u.vi.as_mut() { (v.t_coil, v.t_magnet) = (tc, tm); }
+        }
+        let saved = decode(&encode_with(T, T, &truth, Some(&engine_truth), false, true)).unwrap();
+        let saved = Saved { boottime: Duration::ZERO, covered: Duration::ZERO, ..saved };
+        let mut bound = fresh(&cfg);
+        let mut engine_bound = Engine::new(&cfg, true);
+        assert!(restore_interval(&mut bound, &mut engine_bound, &saved, Duration::from_secs(1), Duration::from_secs(1), &cfg.globals));
+        for s in &mut truth {
+            s.step_pre(s.worst_case_power(cfg.globals.safe_reduction), s.worst_case_power(0.0), 1.0, cfg.globals.t_ambient);
+        }
+        engine_truth.worst(1.0, &vec![cfg.globals.safe_reduction; cfg.speakers.len()]);
+        for (b, a) in bound.iter().zip(&truth) {
+            assert!(b.t_coil >= a.t_coil && b.t_magnet >= a.t_magnet, "{}: rounded restore {b:?}, unrounded truth {a:?}", b.spec.name);
+        }
+        let engine_bound = engine_bound.unwrap();
+        for (b, a) in engine_bound.asahi.iter().flatten().zip(engine_truth.asahi.iter().flatten()) {
+            assert!(b.th.t_coil >= a.th.t_coil && b.th.t_magnet >= a.th.t_magnet);
+            assert!(b.coil_peak >= a.coil_peak && b.magnet_peak >= a.magnet_peak);
+            assert!(b.coil_hyst >= a.coil_hyst && b.magnet_hyst >= a.magnet_hyst);
+        }
+        for (b, a) in engine_bound.unified.iter().flatten().zip(engine_truth.unified.iter().flatten()) {
+            assert!(b.ff.t_coil >= a.ff.t_coil && b.ff.t_magnet >= a.ff.t_magnet);
+            assert!(b.peak >= a.peak);
+            if let (Some(b), Some(a)) = (&b.vi, &a.vi) {
+                assert!(b.t_coil >= a.t_coil && b.t_magnet >= a.t_magnet);
+            }
+        }
+    }
+
+    /// Every interior age, not just the endpoints, must fit the restored
+    /// state. Include cooling magnets, rising magnets, long ages crossing
+    /// the legacy steady-state shortcut, and every shipped thermal model.
+    #[test]
+    fn interval_restore_bounds_all_nodes_and_governing_peaks() {
+        for text in [J700, include_str!("../conf/apple/j316.conf"), include_str!("../conf/apple/j413.conf"), include_str!("../conf/apple/j616.conf")] {
+            let cfg = Config::parse(text).unwrap();
+            for (tc, tm) in [(66.062964, 64.843034), (125.0, 95.0), (55.0, 125.0), (50.0, 50.0)] {
+                let mut sp = fresh(&cfg);
+                for s in &mut sp { s.resume(tc, tm, 0.0, 0.0); }
+                let mut en = Engine::new(&cfg, true);
+                for e in en.iter_mut() {
+                    for a in e.asahi.iter_mut().flatten() {
+                        (a.th.t_coil, a.th.t_magnet, a.coil_hyst, a.magnet_hyst, a.coil_peak, a.magnet_peak, a.hard) = (tc, tm, tc, tm, tc, tm, false);
+                    }
+                    for u in e.unified.iter_mut().flatten() {
+                        (u.ff.t_coil, u.ff.t_magnet, u.peak, u.hard) = (tc, tm, tc, false);
+                        if let Some(v) = u.vi.as_mut() { (v.t_coil, v.t_magnet) = (tc, tm); }
+                    }
+                }
+                let mut saved = decode(&encode_with(T, T, &sp, en.as_ref(), false, true)).unwrap();
+                saved.boottime = Duration::ZERO;
+                saved.covered = Duration::ZERO;
+                for (lo, hi) in [(0.0, 0.1), (3.95, 11.05), (20.0, 60.0), (3599.0, 3601.0), (7200.0, 9000.0)] {
+                    let mut bound = fresh(&cfg);
+                    let mut engine = Engine::new(&cfg, true);
+                    assert!(restore_interval(&mut bound, &mut engine, &saved, Duration::from_secs_f64(lo), Duration::from_secs_f64(hi), &cfg.globals));
+                    for i in 0..=40 {
+                        let age = Duration::from_secs_f64(lo + (hi - lo) * i as f64 / 40.0);
+                        let mut actual = fresh(&cfg);
+                        restore(&mut actual, &saved, age, &cfg.globals);
+                        for (b, a) in bound.iter().zip(&actual) {
+                            assert!(b.t_coil + 1e-6 >= a.t_coil && b.t_magnet + 1e-6 >= a.t_magnet, "{} at {age:?}: {b:?} / {a:?}", b.spec.name);
+                            assert!(b.t_peak + 1e-6 >= a.t_peak);
+                            // Continuous two-node plant, independently evaluated
+                            // from the serialized state, including the residual
+                            // that the old hour shortcut discarded.
+                            let x = saved.speakers.iter().find(|x| x.name == state_name(&b.spec.name)).unwrap();
+                            let p = b.worst_case_power(cfg.globals.safe_reduction);
+                            let s = &b.spec;
+                            let t = age.as_secs_f64();
+                            let m_inf = cfg.globals.t_ambient + p * s.tr_magnet;
+                            let c_inf = m_inf + p * s.tr_coil;
+                            let k = (x.t_magnet - m_inf) * s.tau_magnet / (s.tau_magnet - s.tau_coil);
+                            let coil = c_inf + k * (-t / s.tau_magnet).exp() + (x.t_coil - c_inf - k) * (-t / s.tau_coil).exp();
+                            let magnet = m_inf + (x.t_magnet - m_inf) * (-t / s.tau_magnet).exp();
+                            assert!(b.t_coil + 1e-6 >= coil && b.t_magnet + 1e-6 >= magnet);
+                        }
+                        let mut at = Engine::new(&cfg, true);
+                        if let (Some(b), Some(a)) = (engine.as_ref(), at.as_mut()) {
+                            restore_engine(a, &saved, age, &cfg.globals);
+                            for (b, a) in b.asahi.iter().flatten().zip(a.asahi.iter().flatten()) {
+                                assert!(b.th.t_coil + 1e-6 >= a.th.t_coil && b.th.t_magnet + 1e-6 >= a.th.t_magnet);
+                                assert!(b.coil_peak + 1e-6 >= a.coil_peak && b.magnet_peak + 1e-6 >= a.magnet_peak);
+                                assert!(b.coil_hyst + 1e-6 >= a.coil_hyst && b.magnet_hyst + 1e-6 >= a.magnet_hyst);
+                                assert!(!a.hard || b.hard);
+                            }
+                            for (b, a) in b.unified.iter().flatten().zip(a.unified.iter().flatten()) {
+                                assert!(b.ff.t_coil + 1e-6 >= a.ff.t_coil && b.ff.t_magnet + 1e-6 >= a.ff.t_magnet);
+                                assert!(b.peak + 1e-6 >= a.peak);
+                                if let (Some(b), Some(a)) = (&b.vi, &a.vi) {
+                                    assert!(b.t_coil + 1e-6 >= a.t_coil && b.t_magnet + 1e-6 >= a.t_magnet);
+                                }
+                                assert!(!a.hard || b.hard);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A clean marker proves the previous process stopped, not that its
+    /// older initializer bounded an independently hot magnet. Do not
+    /// promote those temperatures across the model-generation boundary.
+    #[test]
+    fn an_old_clean_snapshot_cannot_carry_the_old_magnet_bound() {
+        let (cfg, mut sp) = hot();
+        for s in &mut sp {
+            s.t_coil = s.spec.t_limit;
+            s.t_magnet = cfg.globals.t_ambient
+                + (s.spec.t_limit - cfg.globals.t_ambient)
+                    * s.spec.tr_magnet / (s.spec.tr_coil + s.spec.tr_magnet);
+            s.hard = true;
+            s.t_peak = s.spec.t_limit;
+            assert!(s.t_magnet < s.spec.t_limit);
+        }
+        let current = encode(T, T, &sp, false, true);
+        let old = format!("speakerguardd-state 2\n{}", current.split_once('\n').unwrap().1);
+        assert!(decode(&old).is_none(), "pre-bound model state was trusted after upgrade");
+        assert!(decode(&current).unwrap().released);
+    }
+
     #[test]
     fn round_trip() {
         let (_, mut sp) = hot();
@@ -352,7 +566,7 @@ mod tests {
         let (_, sp) = hot();
         let good = encode(T, T, &sp, false, true);
         assert!(decode("").is_none());
-        assert!(decode(&good.replace("speakerguardd-state 2", "speakerguardd-state 3")).is_none());
+        assert!(decode(&good.replace("speakerguardd-state 3", "speakerguardd-state 4")).is_none());
         let end = good.find("\nend").unwrap() + 4;
         for n in 0..end {
             assert!(decode(&good[..n]).is_none(), "accepted a prefix of {n} bytes");
@@ -439,7 +653,7 @@ mod tests {
             s.resume(100.0, 100.0, 0.0, 0.0);
         }
         let v1 = encode(T, T, &sp, false, true)
-            .replace("speakerguardd-state 2", "speakerguardd-state 1")
+            .replace("speakerguardd-state 3", "speakerguardd-state 1")
             .lines()
             .filter(|l| !l.starts_with("covered_ns") && !l.starts_with("released") && *l != "end")
             .map(|l| if l.starts_with("speaker ") { l.split_whitespace().take(8).collect::<Vec<_>>().join(" ") } else { l.to_string() })
@@ -597,7 +811,7 @@ mod tests {
         }
         // a v1 file carries no engine at all and is never resumed
         let v1 = encode(T, T, &sp, false, true)
-            .replace("speakerguardd-state 2", "speakerguardd-state 1")
+            .replace("speakerguardd-state 3", "speakerguardd-state 1")
             .lines()
             .filter(|l| !l.starts_with("covered_ns") && !l.starts_with("released") && *l != "end")
             .map(|l| if l.starts_with("speaker ") { l.split_whitespace().take(8).collect::<Vec<_>>().join(" ") } else { l.to_string() })
@@ -608,9 +822,9 @@ mod tests {
         assert!(e3.asahi.as_ref().unwrap().iter().all(|a| a.hard));
     }
 
-    /// A clean stop of a run without the engine (0.1.8, or no unified
-    /// models) says nothing about them: they start latched, the legacy
-    /// model is resumed.  A J700 file without the engine is exactly 0.1.8's.
+    /// A current-generation clean stop without an engine says nothing
+    /// about its models: they start latched while the legacy model resumes.
+    /// Older generations are refused separately, even without an engine.
     #[test]
     fn a_model_the_file_does_not_carry_starts_latched() {
         let (cfg, sp, _) = engine_at(J413, 60.0, 55.0);
@@ -626,7 +840,7 @@ mod tests {
         let (_, hot) = hot();
         let a = encode(T, T, &hot, false, true);
         assert_eq!(a, encode_with(T, T, &hot, None, false, true));
-        assert!(a.starts_with("speakerguardd-state 2\n") && !a.contains("asahi") && !a.contains("unified"));
+        assert!(a.starts_with("speakerguardd-state 3\n") && !a.contains("asahi") && !a.contains("unified"));
     }
 
     /// Review r3 T5 on the unified budgets: two means do not say when in

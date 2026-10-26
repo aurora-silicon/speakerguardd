@@ -99,6 +99,9 @@ pub fn fingerprint(cfg: &Config) -> u64 {
     // nor a profile without its own amp gain index (review L2-1: the
     // recordings made before the field existed still match)
     globals = globals.replace(", amp_gain_index: None", "");
+    // nor a file on the default boot_resume (the recordings made before
+    // the key existed still match)
+    globals = globals.replace(", boot_resume: Latched", "");
     // nor does a speaker without its own z_min
     let speakers = format!("{:?}", cfg.speakers).replace(", z_min_override: None", "");
     let text = format!("{globals}{:?}{speakers}", cfg.controls);
@@ -1180,6 +1183,9 @@ pub fn replay(path: &Path, cfg: &Config, opts: &Replay) -> Result<Outcome, Box<d
     let fastest = tl.rates.iter().map(|r| r.1).chain(tl.periods.iter().map(|p| p.rate as i64)).filter(|&r| r > 0).max().unwrap_or(48000);
     let (start, last, config_matches) = (tl.start, tl.last, fingerprint(&cfg) == tl.config);
     let initial = tl.state.clone();
+    if !crate::state::decode(&initial).is_some_and(|saved| saved.proven()) {
+        ambiguous.push((start, start, "untrusted initial model generation; replay starts latched".into()));
+    }
     let recorded_gov = tl.governor;
     // the recorded model state, as the replayed guard's state file
     static RUN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -1582,7 +1588,7 @@ mod tests {
         let path = tmp("transitions.rec");
         record(&cfg, &mut hw, tmp_state(), secs(7.0), &path);
         let tl = Timeline::read(&path, &cfg).unwrap();
-        assert!(tl.state.starts_with("speakerguardd-state 2"), "{}", tl.state);
+        assert!(tl.state.starts_with("speakerguardd-state 3"), "{}", tl.state);
         assert!(tl.permits.iter().any(|p| p.1) && tl.permits.iter().any(|p| !p.1 && p.2.contains("no complete sense data")), "{:?}", tl.permits);
         assert!(tl.permits.iter().any(|p| !p.1 && p.2.contains("volume control")), "{:?}", tl.permits);
         assert!(tl.losses.iter().any(|l| l.1 == LOSS_STALL), "{:?}", tl.losses);
@@ -1809,5 +1815,8 @@ mod fingerprint_history {
         let with = include_str!("../conf/apple/j316.conf").replace("amp_gain_dbv = 18.5", "amp_gain_dbv = 18.5\namp_gain_index = 15");
         let without = include_str!("../conf/apple/j316.conf");
         assert_ne!(super::fingerprint(&crate::config::Config::parse(&with).unwrap()), super::fingerprint(&crate::config::Config::parse(without).unwrap()));
+        let mut idle = crate::config::Config::parse(include_str!("../conf/apple/j700.conf")).unwrap();
+        idle.globals.boot_resume = crate::config::BootResume::Idle;
+        assert_ne!(super::fingerprint(&idle), 0x09c595d1ff48e20b);
     }
 }

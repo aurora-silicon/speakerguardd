@@ -9,8 +9,8 @@
 //! this daemon holds the lock on it and keeps writing the unlock control
 //! (the same interlock the other Macs' speakersafetyd uses).  Whenever the
 //! daemon cannot vouch for the speakers -- no complete sense data for longer
-//! than the stall timeout, or a model asking for more than
-//! `--max-reduction` -- it stops renewing the lock, the card falls back to
+//! than the stall timeout, a hard fault or a target beyond the hardware
+//! range -- it stops renewing the lock, the card falls back to
 //! its safe volume, and the daemon takes the lock back once it can.
 
 mod alsa;
@@ -21,6 +21,8 @@ mod guard;
 mod harness;
 mod log;
 mod model;
+mod persist;
+mod wallclock;
 mod record;
 mod startup;
 mod state;
@@ -81,6 +83,8 @@ struct Args {
     card: Option<String>,
     card_wait: Duration,
     state: Option<PathBuf>,
+    persist: Option<PathBuf>,
+    persist_off: bool,
     verbosity: Level,
     shadow: bool,
     governor: Option<Governor>,
@@ -106,8 +110,9 @@ fn usage() -> ! {
          -c, --config-path <DIR>         Directory holding <vendor>/<model>.conf\n  \
          -C, --card <ID>                 ALSA card id (default: the macaudio card)\n  \
          --wait-for-card <SECONDS>       Wait for card discovery before failing (default 30; 0 disables waiting)\n  \
-         -m, --max-reduction <DB>        Gain reduction beyond which the card's safe level takes over (default: the config's, else 20)\n  \
+         -m, --max-reduction <DB>        Historical recording threshold, accepted for compatibility (writes use the hardware range)\n  \
          -s, --state <FILE>              Model state kept across restarts (default /run/speakerguardd/state)\n  \
+         --persist <FILE>                Model state kept across a reboot, with boot_resume = idle (default /var/lib/speakerguardd/state; empty: never kept or resumed, still removed)\n  \
          --governor <NAME>               legacy, asahi or unified (default: the config's, else legacy)\n  \
          --guard <NAME>                  asahi: the unified governor's card also gets the asahi governor's reductions (default: the config's, else none)\n  \
          --shadow                        Run every governor and log them to shadow.jsonl next to the state\n  \
@@ -130,12 +135,18 @@ fn usage() -> ! {
 }
 
 fn parse_args() -> Args {
+    parse_args_from(std::env::args().skip(1))
+}
+
+fn parse_args_from(arguments: impl IntoIterator<Item = String>) -> Args {
     let mut args = Args {
         config_path: PathBuf::from("/usr/share/speakerguardd"),
         max_reduction: None,
         card: None,
         card_wait: Duration::from_secs(30),
         state: Some(PathBuf::from("/run/speakerguardd/state")),
+        persist: Some(PathBuf::from("/var/lib/speakerguardd/state")),
+        persist_off: false,
         verbosity: Level::Info,
         shadow: false,
         governor: None,
@@ -152,7 +163,7 @@ fn parse_args() -> Args {
         gain_db: 0.0,
         csv: None,
     };
-    let mut it = std::env::args().skip(1);
+    let mut it = arguments.into_iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "-c" | "--config-path" => args.config_path = PathBuf::from(it.next().unwrap_or_else(|| usage())),
@@ -161,6 +172,16 @@ fn parse_args() -> Args {
             "-s" | "--state" => {
                 let v = it.next().unwrap_or_else(|| usage());
                 args.state = if v.is_empty() { None } else { Some(PathBuf::from(v)) };
+            }
+            "--persist" => {
+                // empty: neither resumed nor kept, but still removed at the
+                // start (a later boot must not resume a state this one
+                // made stale)
+                let v = it.next().unwrap_or_else(|| usage());
+                args.persist_off = v.is_empty();
+                if !v.is_empty() {
+                    args.persist = Some(PathBuf::from(v));
+                }
             }
             "-m" | "--max-reduction" => {
                 args.max_reduction = Some(it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage()));
@@ -312,8 +333,16 @@ impl Card {
     fn ping(&mut self) -> std::io::Result<()> {
         self.ctl.write_int(&self.unlock, UNLOCK_MAGIC)?;
         if self.volume_max.is_none() {
-            let (_, max) = self.ctl.int_range(&self.volume[0])?;
-            self.volume_max = Some(max);
+            let range = self.ctl.int_range(&self.volume[0])?;
+            if range.0 != self.volume_min || range.1 < range.0 {
+                return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+            }
+            for id in &self.volume[1..] {
+                if self.ctl.int_range(id)? != range {
+                    return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+                }
+            }
+            self.volume_max = Some(range.1);
         }
         Ok(())
     }
@@ -399,6 +428,9 @@ impl Hw for RealHw {
     }
     fn set_reductions(&mut self, db: &[f64]) -> std::io::Result<Vec<f64>> {
         self.card.write_reductions(db)
+    }
+    fn reduction_limit_db(&self) -> Option<f64> {
+        self.card.volume_max.map(|max| (max - self.card.volume_min) as f64 / STEPS_PER_DB)
     }
     fn step_db(&self) -> f64 {
         1.0 / STEPS_PER_DB
@@ -487,6 +519,28 @@ impl Hw for RealHw {
     fn events_available(&self) -> bool {
         self.card.events
     }
+    fn wall(&self) -> persist::Wall {
+        let realtime = wallclock::synchronized_realtime();
+        let synced = realtime.is_some();
+        let rtc = std::fs::read_to_string("/sys/class/rtc/rtc0/since_epoch").ok().and_then(|s| s.trim().parse::<u64>().ok()).filter(|&s| s > 0).map(Duration::from_secs);
+        let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        persist::Wall { realtime, synced, rtc, boot_id }
+    }
+    fn previous_boot(&self) -> Option<String> {
+        // `journalctl --list-boots`: the line indexed -1, its second column
+        let out = std::process::Command::new("journalctl").args(["--list-boots", "--no-pager", "-q"]).output().ok().filter(|o| o.status.success())?;
+        String::from_utf8_lossy(&out.stdout).lines().find_map(|l| {
+            let mut f = l.split_whitespace();
+            (f.next() == Some("-1")).then(|| f.next().map(str::to_string)).flatten()
+        })
+    }
+    fn machine_id(&self) -> Option<String> {
+        std::fs::read_to_string("/etc/machine-id").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    }
+    fn shutting_down(&self) -> bool {
+        // systemd says "stopping" from the start of a shutdown
+        std::process::Command::new("systemctl").arg("is-system-running").output().is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "stopping")
+    }
     fn queued(&mut self) -> std::io::Result<u64> {
         match self.capture.as_mut() {
             Some(c) => c.queued(),
@@ -534,7 +588,13 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let mut hw = RealHw { card, globals: cfg.globals.clone(), capture: None };
     catch_stop_signals();
     let max_reduction = args.max_reduction.unwrap_or(cfg.globals.max_reduction);
-    let mut guard = Guard::start(&mut hw, &cfg, max_reduction, args.state.clone())?;
+    // --persist '': the file is still removed at the start, but neither
+    // read nor written
+    let mut cfg = cfg;
+    if args.persist_off {
+        cfg.globals.boot_resume = config::BootResume::Latched;
+    }
+    let mut guard = Guard::start_persist(&mut hw, &cfg, max_reduction, args.state.clone(), args.persist.clone())?;
     if let Some(path) = &args.record {
         let max = args.record_max_mb.saturating_mul(1 << 20);
         guard.attach_recorder(&hw, record::Recorder::create(path, &cfg, hw.card.events, max)?);
@@ -645,33 +705,55 @@ mod tests {
     use super::*;
 
     fn args(conf: &std::path::Path) -> Args {
-        Args {
-            config_path: conf.to_path_buf(),
-            max_reduction: None,
-            card: None,
-            card_wait: Duration::ZERO,
-            state: None,
-            verbosity: Level::Info,
-            shadow: false,
-            governor: None,
-            guard: None,
-            horizon: None,
-            ctrl_headroom: None,
-            unified_caps: false,
-            experimental_unified: false,
-            allow_unqualified: false,
-            record: None,
-            record_max_mb: 0,
-            replay: None,
-            model: None,
-            gain_db: 0.0,
-            csv: None,
+        let mut args = parse_args_from([]);
+        args.config_path = conf.to_path_buf();
+        args
+    }
+
+    #[test]
+    fn packaged_policy_is_the_default_and_useful_overrides_remain() {
+        let defaults = parse_args_from([]);
+        assert_eq!(defaults.config_path, PathBuf::from("/usr/share/speakerguardd"));
+        assert!(defaults.card.is_none());
+        assert_eq!(defaults.card_wait, Duration::from_secs(30));
+        assert!(!defaults.allow_unqualified);
+        assert!(!defaults.shadow && defaults.record.is_none());
+        for text in [include_str!("../conf/apple/j316.conf"),
+                     include_str!("../conf/apple/j413.conf"),
+                     include_str!("../conf/apple/j616.conf")] {
+            let mut cfg = Config::parse(text).unwrap();
+            assert!(override_config(&mut cfg, &defaults).is_err());
+            assert_eq!(cfg.globals.governor, Governor::Unified);
+            assert_eq!(cfg.globals.guard, Some(Governor::Asahi));
+            assert!(!cfg.globals.qualified);
+            // The opt-in does not need duplicate governor/guard switches.
+            let allowed = parse_args_from(["--allow-unqualified".to_string()]);
+            override_config(&mut cfg, &allowed).unwrap();
+            assert_eq!(cfg.globals.governor, Governor::Unified);
+            assert_eq!(cfg.globals.guard, Some(Governor::Asahi));
+            assert!(!cfg.globals.qualified);
+            // Existing units and deliberate alternative governors still work.
+            let old = parse_args_from(["--allow-unqualified", "--governor", "unified",
+                "--guard", "asahi", "--shadow", "--record", "/tmp/example.rec3"]
+                .map(str::to_string));
+            override_config(&mut cfg, &old).unwrap();
+            assert!(cfg.globals.shadow);
+            assert_eq!(old.record, Some(PathBuf::from("/tmp/example.rec3")));
+            let legacy = parse_args_from(["--allow-unqualified", "--governor", "legacy",
+                "--guard", "none"].map(str::to_string));
+            override_config(&mut cfg, &legacy).unwrap();
+            assert_eq!(cfg.globals.governor, Governor::Legacy);
+            assert_eq!(cfg.globals.guard, None);
         }
+        let mut neo = Config::parse(include_str!("../conf/apple/j700.conf")).unwrap();
+        override_config(&mut neo, &defaults).unwrap();
+        assert_eq!(neo.globals.governor, Governor::Legacy);
+        assert_eq!(neo.globals.guard, None);
     }
 
     #[test]
     fn an_unreachable_reduction_is_refused_instead_of_clamped() {
-        for (min, max) in [(0, 200), (-100, 48), (7, 7)] {
+        for (min, max) in [(0, 201), (0, 200), (-100, 48), (7, 7)] {
             let most = (max - min) as f64 / STEPS_PER_DB;
             assert_eq!(reduction_value(min, max, 0.0).unwrap(), max);
             assert_eq!(reduction_value(min, max, most).unwrap(), min);
