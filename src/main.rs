@@ -21,6 +21,8 @@ mod guard;
 mod harness;
 mod log;
 mod model;
+#[cfg(test)]
+mod playback_grant;
 mod persist;
 mod wallclock;
 mod record;
