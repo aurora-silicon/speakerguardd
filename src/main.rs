@@ -9,8 +9,8 @@
 //! this daemon holds the lock on it and keeps writing the unlock control
 //! (the same interlock the other Macs' speakersafetyd uses).  Whenever the
 //! daemon cannot vouch for the speakers -- no complete sense data for longer
-//! than the stall timeout, or a model asking for more than
-//! `--max-reduction` -- it stops renewing the lock, the card falls back to
+//! than the stall timeout, a hard fault or a target beyond the hardware
+//! range -- it stops renewing the lock, the card falls back to
 //! its safe volume, and the daemon takes the lock back once it can.
 
 mod alsa;
@@ -41,6 +41,16 @@ use log::Level;
 const UNLOCK_MAGIC: i64 = 0xdec1be15u32 as i32 as i64;
 /// Volume control steps per dB (t8140-aop-audio: 0.5 dB steps).
 const STEPS_PER_DB: f64 = 2.0;
+/// Refuse a ceiling the control cannot apply. Clamping to its minimum
+/// would return less attenuation than requested while the guard accounts
+/// it as at least the request, which would understate the model's attenuation.
+fn reduction_value(min: i64, max: i64, db: f64) -> std::io::Result<i64> {
+    let value = max as f64 - (db * STEPS_PER_DB - 1e-9).ceil();
+    if !db.is_finite() || db < 0.0 || min > max || value < min as f64 {
+        return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    Ok(value as i64)
+}
 /// The exit status of a configuration the daemon refuses to govern (an
 /// unqualified machine, a missing opt-in, an unreadable file), before the
 /// card is touched.  A restart cannot change it, and the unit does not
@@ -95,7 +105,7 @@ fn usage() -> ! {
          -c, --config-path <DIR>         Directory holding <vendor>/<model>.conf\n  \
          -C, --card <ID>                 ALSA card id (default: the macaudio card)\n  \
          --wait-for-card <SECONDS>       Wait for card discovery before failing (default 30; 0 disables waiting)\n  \
-         -m, --max-reduction <DB>        Gain reduction beyond which the card's safe level takes over (default: the config's, else 20)\n  \
+         -m, --max-reduction <DB>        Historical recording threshold, accepted for compatibility (writes use the hardware range)\n  \
          -s, --state <FILE>              Model state kept across restarts (default /run/speakerguardd/state)\n  \
          --governor <NAME>               legacy, asahi or unified (default: the config's, else legacy)\n  \
          --guard <NAME>                  asahi: the unified governor's card also gets the asahi governor's reductions (default: the config's, else none)\n  \
@@ -293,8 +303,16 @@ impl Card {
     fn ping(&mut self) -> std::io::Result<()> {
         self.ctl.write_int(&self.unlock, UNLOCK_MAGIC)?;
         if self.volume_max.is_none() {
-            let (_, max) = self.ctl.int_range(&self.volume[0])?;
-            self.volume_max = Some(max);
+            let range = self.ctl.int_range(&self.volume[0])?;
+            if range.0 != self.volume_min || range.1 < range.0 {
+                return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+            }
+            for id in &self.volume[1..] {
+                if self.ctl.int_range(id)? != range {
+                    return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+                }
+            }
+            self.volume_max = Some(range.1);
         }
         Ok(())
     }
@@ -313,10 +331,7 @@ impl Card {
         // without the range nothing can be written (a failed write: the
         // loop leaves the card at its safe level)
         let max = self.volume_max.ok_or_else(|| std::io::Error::from_raw_os_error(libc::EAGAIN))?;
-        if !db.is_finite() {
-            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
-        }
-        Ok((max as f64 - (db * STEPS_PER_DB - 1e-9).ceil()).max(self.volume_min as f64) as i64)
+        reduction_value(self.volume_min, max, db)
     }
 
     /// The reduction a control value applies (dB).
@@ -383,6 +398,9 @@ impl Hw for RealHw {
     }
     fn set_reductions(&mut self, db: &[f64]) -> std::io::Result<Vec<f64>> {
         self.card.write_reductions(db)
+    }
+    fn reduction_limit_db(&self) -> Option<f64> {
+        self.card.volume_max.map(|max| (max - self.card.volume_min) as f64 / STEPS_PER_DB)
     }
     fn step_db(&self) -> f64 {
         1.0 / STEPS_PER_DB
@@ -651,6 +669,27 @@ mod tests {
             gain_db: 0.0,
             csv: None,
         }
+    }
+
+    #[test]
+    fn an_unreachable_reduction_is_refused_instead_of_clamped() {
+        for (min, max) in [(0, 201), (0, 200), (-100, 48), (7, 7)] {
+            let most = (max - min) as f64 / STEPS_PER_DB;
+            assert_eq!(reduction_value(min, max, 0.0).unwrap(), max);
+            assert_eq!(reduction_value(min, max, most).unwrap(), min);
+            assert!(reduction_value(min, max, most + 0.001).is_err());
+            for requested in [0.001, 0.24, 0.5, 3.01, 12.99, 25.001] {
+                if requested <= most {
+                    let value = reduction_value(min, max, requested).unwrap();
+                    let applied = (max - value) as f64 / STEPS_PER_DB;
+                    assert!(applied >= requested && applied < requested + 0.5);
+                }
+            }
+        }
+        for invalid in [f64::NAN, f64::INFINITY, -1.0, 1000.0] {
+            assert!(reduction_value(0, 200, invalid).is_err());
+        }
+        assert!(reduction_value(10, 0, 0.0).is_err());
     }
 
     /// Review X4 of speakerguardd#8: the unit conflicted with

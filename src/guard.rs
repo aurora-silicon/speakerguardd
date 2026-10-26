@@ -176,6 +176,12 @@ pub trait Hw {
     fn step_db(&self) -> f64 {
         0.0
     }
+    /// Deepest representable attenuation, inclusive. None until the first
+    /// unlock reveals the full range; the controls stay at minimum then.
+    /// Simulated cards use the 201 half-dB steps of the supported hardware.
+    fn reduction_limit_db(&self) -> Option<f64> {
+        Some(100.5)
+    }
     /// Turn every volume control to its minimum, which the card accepts
     /// while the volume is locked: done before each unlock.
     fn set_min(&mut self) -> io::Result<()>;
@@ -271,8 +277,7 @@ pub const BLIND_LIMIT: Duration = STALL_TIMEOUT;
 pub const KERNEL_LOCK_TIMEOUT: Duration = Duration::from_millis(250);
 /// Consecutive complete periods needed before the lock is taken back.
 pub const REARM_PERIODS: u32 = 2;
-/// Hysteresis between handing the card to the kernel at --max-reduction and
-/// taking it back.
+/// Hysteresis after a target exceeds the hardware attenuation range.
 pub const REARM_MARGIN_DB: f64 = 3.0;
 /// The reduction the volume controls' minimum stands for (dB).
 pub const MUTE_DB: f64 = 120.0;
@@ -338,7 +343,10 @@ fn rec_do(rec: &mut Option<Recorder>, t: Duration, f: impl FnOnce(&mut Recorder,
 pub struct Guard {
     globals: Globals,
     pub speakers: Vec<SpeakerState>,
+    // Historical config/recording value, retained for replay compatibility.
     max_reduction: f64,
+    /// A range fault clears only with REARM_MARGIN_DB of headroom.
+    range_fault: bool,
     /// True while the daemon renews the card's volume lock.
     armed: bool,
     /// Ever armed in this run (for the log).
@@ -613,6 +621,7 @@ impl Guard {
             globals,
             speakers,
             max_reduction,
+            range_fault: false,
             armed: false,
             held: false,
             stall: None,
@@ -1589,8 +1598,19 @@ impl Guard {
         self.decide(hw, false)
     }
 
+    fn within_range<H: Hw>(&mut self, hw: &H, per: &[f64]) -> bool {
+        let Some(limit) = hw.reduction_limit_db() else { return !self.range_fault };
+        let needed = per.iter().copied().fold(0.0, f64::max);
+        if !limit.is_finite() || limit <= 0.0 || per.iter().any(|r| !r.is_finite() || *r < 0.0) || needed > limit {
+            self.range_fault = true;
+        } else if needed <= (limit - REARM_MARGIN_DB).max(0.0) {
+            self.range_fault = false;
+        }
+        !self.range_fault
+    }
+
     /// Every renewal of the lock goes through here: the account brought up
-    /// to date, then the faults, the reduction limit and the model's
+    /// to date, then the faults, the hardware range and the model's
     /// freshness decide whether the daemon keeps the card.  With `renew_now`
     /// a lock that is kept is renewed whatever its age (before something
     /// that blocks), and a cleared fault waits for the next pass.
@@ -1605,6 +1625,9 @@ impl Guard {
         if !reduction.is_finite() {
             return Err("nonfinite speaker reduction".into());
         }
+        // Ordinary model demand uses the same governor ramp at every
+        // depth. Only an unrepresentable target gives the card up.
+        let range_ready = self.within_range(hw, &per);
         if hard != self.last_hard {
             self.last_hard = hard;
             if self.trace.is_some() || self.rec.is_some() {
@@ -1626,24 +1649,24 @@ impl Guard {
                 Some(format!("no complete sense data for {} ms", blind.as_millis()))
             } else if hard {
                 Some("a coil may have reached its limit".to_string())
-            } else if reduction >= self.max_reduction {
-                Some(format!("the model asks for {reduction:.1} dB"))
+            } else if !range_ready {
+                Some("the required attenuation exceeds the volume control range".to_string())
             } else {
                 None
             };
             if let Some(why) = why {
                 self.disarm(hw, &why)?;
             }
-        } else if !self.stopping && !self.unknown && !hard && self.events && !renew_now && !self.recovering {
+        } else if !self.stopping && !self.unknown && !hard && range_ready && self.events && !renew_now && !self.recovering {
             // after bad sense data, REARM_PERIODS valid periods in a row
             // first, idle or not (review P8-2)
             let seeing = !self.playing || (self.fresh >= REARM_PERIODS && blind <= BLIND_SLACK);
             let retry = self.last_save_try.is_none_or(|t| hw.now().duration_since(t) >= SAVE_INTERVAL);
-            if seeing && reduction < self.max_reduction - REARM_MARGIN_DB && !self.invalidated && retry {
+            if seeing && !self.invalidated && retry {
                 // the clean stop this run may have resumed goes first
                 self.invalidated = self.invalidate(hw);
             }
-            if seeing && reduction < self.max_reduction - REARM_MARGIN_DB && self.invalidated {
+            if seeing && self.invalidated {
                 match hw.set_min() {
                     Ok(()) => {
                         let n = self.written.len();
@@ -1685,6 +1708,12 @@ impl Guard {
             }
         }
         if self.armed {
+            // The first ping reveals the unlocked hardware range. Check
+            // again before leaving minimum, before writing any target.
+            if !self.within_range(hw, &per) || hw.reduction_limit_db().is_none() {
+                self.disarm(hw, "the required attenuation exceeds the volume control range")?;
+                return Ok(());
+            }
             if (reduction - self.applied).abs() >= 0.5 {
                 info!("gain reduction {reduction:.1} dB");
                 self.applied = reduction;
@@ -1881,6 +1910,7 @@ pub mod fake {
         /// The card sends sample-rate change events (else the daemon polls).
         /// The card rounds reductions up to 0.5 dB steps, as the J700 does.
         pub steps: bool,
+        pub reduction_limit: f64,
         pub events: bool,
         /// How long opening the sense PCM blocks.
         pub open_delay: Duration,
@@ -1941,6 +1971,7 @@ pub mod fake {
                 last_end: Duration::ZERO,
                 locked: false,
                 steps: false,
+                reduction_limit: 100.5,
                 events: true,
                 events_seen_to: Duration::ZERO,
                 open_delay: Duration::ZERO,
@@ -2118,6 +2149,9 @@ pub mod fake {
             self.notice_pending = false;
             self.relinquished += 1;
             Ok(())
+        }
+        fn reduction_limit_db(&self) -> Option<f64> {
+            Some(self.reduction_limit)
         }
         fn step_db(&self) -> f64 {
             if self.steps { 0.5 } else { 0.0 }
@@ -2474,7 +2508,7 @@ pub(crate) mod tests {
         assert_eq!(hw.reduction, 0.0);
     }
 
-    /// When the model asks for more than --max-reduction the card is handed
+    /// When the model asks for more than the hardware range the card is handed
     /// to the kernel's safe level, but the daemon keeps modelling (the sense
     /// tap shows the clamped wire) and takes the lock back once the speaker
     /// has cooled, instead of exiting for good.
@@ -2484,6 +2518,7 @@ pub(crate) mod tests {
         let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
         hw.level = Box::new(|_| 1.0); // a full-scale square wave: 12.7 W
         hw.playing = Box::new(|t| t < secs(8.0));
+        hw.reduction_limit = 6.0;
         let mut g = Guard::start(&mut hw, &cfg, 6.0, tmp_state()).unwrap();
         run_until(&mut g, &mut hw, secs(60.0)).expect("the reduction limit must not end the daemon");
         assert!(!hw.lapses.is_empty(), "the limit handed the card to the kernel");
@@ -2860,6 +2895,7 @@ pub(crate) mod tests {
         std::fs::write(&path, "damaged").unwrap(); // hot: 12 dB
         let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
         hw.playing = Box::new(|_| false);
+        hw.reduction_limit = 10.0;
         let mut g = Guard::start(&mut hw, &cfg, 10.0, Some(path)).unwrap();
         run_until(&mut g, &mut hw, secs(0.5)).unwrap();
         assert!(hw.pings.is_empty(), "unlocked a start that needs a hand-off");
@@ -3840,8 +3876,8 @@ pub(crate) mod tests {
             last = demand(&g);
         }
         assert!(!hw.pings.is_empty(), "never armed");
-        assert!(last < cfg.globals.max_reduction - REARM_MARGIN_DB, "unlocked with the ramp at {last:.2} dB");
-        assert!(hw.t > secs(1.0), "unlocked after {:?}", hw.t);
+        assert!(last <= hw.reduction_limit, "unlocked beyond the hardware range at {last:.2} dB");
+        assert!(!g.governing_state().2, "unlocked with a latched model");
         let path = vi_state(&cfg, 60.0, 55.0);
         std::fs::write(&path, "damaged").unwrap();
         let mut hw = FakeHw::per_speaker(&cfg);
@@ -3862,11 +3898,15 @@ pub(crate) mod tests {
         let cfg = j413();
         let ch = cfg.globals.channels;
         let negate = |cfg: &Config| {
-            let ics: Vec<usize> = cfg.speakers.iter().map(|s| s.is_chan.unwrap()).collect();
+            let slots: Vec<_> = cfg.speakers.iter().map(|s| (s.vs_chan, s.is_chan.unwrap())).collect();
             move |w: &mut [i32]| {
                 for f in w.chunks_exact_mut(ch) {
-                    for &ic in &ics {
-                        f[ic] = -f[ic];
+                    // Inject an actual invalid measurement at any gain.
+                    // Simply flipping tiny attenuated words can stay inside
+                    // the accepted negative-power noise floor.
+                    for &(vc, ic) in &slots {
+                        f[vc] = word(7.0, 14.0);
+                        f[ic] = word(-0.5, 3.75);
                     }
                 }
             }
@@ -3952,11 +3992,15 @@ pub(crate) mod tests {
         }));
         let mut g = Guard::start(&mut hw, &cfg, cfg.globals.max_reduction, Some(vi_state(&cfg, 119.0, 50.0 + 69.0 * 200.0 / 304.9))).unwrap();
         let mut at = None;
+        let mut cooled = None;
         while hw.t < secs(4.0) {
             let pings = hw.pings.len();
             g.tick(&mut hw).unwrap();
             if asahi(&g).iter().any(|a| a.hard) {
                 assert_eq!(hw.pings.len(), pings, "renewed with a latched model at {:?}", hw.t);
+            }
+            if at.is_some() && cooled.is_none() && !asahi(&g).iter().any(|a| a.hard) {
+                cooled = Some(hw.t);
             }
             if at.is_none() && hw.delivered == 31 {
                 at = Some(hw.t);
@@ -3966,7 +4010,8 @@ pub(crate) mod tests {
             }
         }
         let at = at.unwrap();
-        assert!(!hw.pings.iter().any(|&p| p >= at && p < at + secs(1.0)), "renewed after the latch");
+        let until = cooled.unwrap_or(hw.t);
+        assert!(!hw.pings.iter().any(|&p| p >= at && p < until), "renewed before the latch cooled");
     }
 
     /// Review F5 and R8 on a V/I machine: a missing state started the asahi
@@ -5464,8 +5509,8 @@ pub(crate) mod tests {
         let handed = hw.t;
         assert!(g.written.iter().all(|&w| w == 0.0), "the controls keep the governed value");
         assert!(g.least_since(g.verified_at).iter().all(|&r| r == 0.0), "charged at the safe level before the drain");
-        // the card stays with the kernel (the ramp is not the point here)
-        g.max_reduction = 0.1;
+        // Keep the card with the kernel while testing its drained history.
+        g.stopping = true;
         while hw.t < handed + DRAIN + secs(0.3) {
             g.tick(&mut hw).unwrap();
             assert!(!g.armed());
@@ -5483,7 +5528,7 @@ pub(crate) mod tests {
             assert!((a.th.t_coil - want.t_coil).abs() < 1e-9, "{}: charged to {} C, the safe level gives {} C", cfg.speakers[k].name, a.th.t_coil, want.t_coil);
         }
         // a renewal ends it
-        g.max_reduction = cfg.globals.max_reduction;
+        g.stopping = false;
         while !g.armed() && hw.t < secs(30.0) {
             g.tick(&mut hw).unwrap();
         }
@@ -5569,7 +5614,12 @@ pub(crate) mod tests {
             eprintln!("X3 {} speakers: the lock taken back after {:.1} s", cfg.speakers.len(), hw.t.as_secs_f64());
             assert!(hw.t < secs(within), "{}: taken back after {:?}", cfg.speakers[0].name, hw.t);
             let demand = g.engine.as_ref().unwrap().reductions(Governor::Asahi).into_iter().fold(0.0, f64::max);
-            assert!(demand < cfg.globals.max_reduction - REARM_MARGIN_DB);
+            assert!(demand <= hw.reduction_limit);
+            assert!(!g.governing_state().2);
         }
     }
 }
+
+#[cfg(test)]
+#[path = "guard/deep_attenuation_tests.rs"]
+mod deep_attenuation_tests;
