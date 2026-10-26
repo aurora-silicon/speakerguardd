@@ -21,15 +21,12 @@
 //!   record: a file from elsewhere, or damaged into valid text, is not
 //!   resumed.  Every temperature is at least the configuration's ambient
 //!   (no model goes colder): a colder one is damage.
-//! * **Time.**  The gap is CLOCK_REALTIME's, and only while the kernel
-//!   called it synchronized before and after each sample, with a timerfd
-//!   watch rejecting clock steps during the read; the RTC, where both
-//!   ends have it, has to agree to 2 s
-//!   plus 0.1 %; and it is never shorter than this boot's uptime.  The
-//!   clocks are read after the snapshot's account closes, and the boot time
-//!   between the two is kept: the state is restored over the shortest and
-//!   the longest time it can have been, bounding the whole interval with
-//!   interior extrema, not just the two endpoint temperatures.
+//! * **Time.** Best-effort synchronized realtime must agree with an
+//!   independent, accurate RTC at both ends. Overlapping setters can evade
+//!   the timerfd watch. The restored interval therefore includes the full
+//!   RTC uncertainty, not just the realtime gap. Missing RTC starts latched.
+//!   RTC quantization, bounded read placement and 0.1% rate uncertainty are
+//!   included, as is snapshot pairing. Restore bounds every interior age.
 //!
 //! Only a clean stop at shutdown is kept. The installation must guarantee
 //! that after it no owner exceeds the card's safe level until power-off;
@@ -52,9 +49,9 @@ use std::time::Duration;
 
 use crate::state::{self, Saved};
 
-// Version 2 could certify a timestamp sampled before synchronization.
-// Its checksum cannot establish the stronger sample contract.
-const MAGIC: &str = "speakerguardd-boot 3";
+// Earlier formats did not require an independent RTC age bound.
+// Do not promote their timestamp promise by changing only the header.
+const MAGIC: &str = "speakerguardd-boot 4";
 /// Two clocks read a little apart, and the RTC's whole seconds.
 const SLACK: Duration = Duration::from_secs(2);
 /// The most a clock read can sit away from the boot time read next to it.
@@ -64,8 +61,8 @@ pub const READ_EPS: Duration = Duration::from_millis(50);
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Wall {
     pub realtime: Option<Duration>,
-    /// The timestamp passed the synchronization and clock-change watch.
-    /// Test implementations must uphold the same contract as wallclock.rs.
+    /// Passed the best-effort synchronization/watch checks. These do not
+    /// prove coherence under overlapping setters; gap also requires RTC.
     pub synced: bool,
     pub rtc: Option<Duration>,
     pub boot_id: Option<String>,
@@ -116,7 +113,7 @@ pub fn encode(wall: &Wall, origin: &Origin, pairing: Duration, state: &str) -> O
     let boot_id = word(wall.boot_id.as_deref()?)?;
     let machine = word(origin.machine_id.as_deref()?)?;
     let realtime = wall.realtime.filter(|_| wall.synced)?;
-    let rtc = wall.rtc.map_or("-".to_string(), |d| d.as_nanos().to_string());
+    let rtc = wall.rtc?.as_nanos().to_string();
     let body = format!(
         "boot_id {boot_id}\nmachine_id {machine}\nconfig {:016x}\nrealtime_ns {}\nsynced 1\nrtc_ns {rtc}\npairing_ns {}\n{state}",
         origin.config,
@@ -191,17 +188,32 @@ pub fn gap(p: &Persisted, now: &Wall, origin: &Origin, previous: Option<&str>, u
         return Err("the system clock is not synchronized at both ends".into());
     };
     let g = at.checked_sub(then).ok_or("the system clock went back")?;
-    if let (Some(a), Some(b)) = (p.wall.rtc, now.rtc) {
-        let r = b.checked_sub(a).ok_or("the RTC went back")?;
-        let (lo, hi) = (r.min(g), r.max(g));
-        if hi - lo > SLACK + hi / 1000 {
-            return Err(format!("the RTC and the system clock disagree ({:.1} s against {:.1} s)", r.as_secs_f64(), g.as_secs_f64()));
-        }
+    // A CANCEL_ON_SET watch can miss two overlapping setters whose
+    // notifications both inspect the restored offset. Do not use its
+    // realtime sample alone as an elapsed-time proof. Require an
+    // independent RTC and include its entire uncertainty interval.
+    let (Some(a), Some(b)) = (p.wall.rtc, now.rtc) else {
+        return Err("idle restore needs an independent RTC at both ends".into());
+    };
+    let r = b.checked_sub(a).ok_or("the RTC went back")?;
+    let (short, long) = (r.min(g), r.max(g));
+    if long - short > SLACK + long / 1000 {
+        return Err(format!("the RTC and the system clock disagree ({:.1} s against {:.1} s)", r.as_secs_f64(), g.as_secs_f64()));
     }
-    if g + SLACK < uptime {
-        return Err(format!("{:.1} s since the stop, under this boot's uptime of {:.1} s", g.as_secs_f64(), uptime.as_secs_f64()));
+    // Whole-second quantization at both ends, bounded read placement and
+    // the supported RTC rate error of at most 0.1%. Divide by 999 rather
+    // than 1000 to cover conversion from RTC elapsed time to true time.
+    let uncertainty = SLACK + READ_EPS * 2 + r / 999 + Duration::from_nanos(1);
+    let rtc_lo = r.saturating_sub(uncertainty);
+    let rtc_hi = r.checked_add(uncertainty).and_then(|v| v.checked_add(p.pairing))
+        .ok_or("RTC age interval overflow")?;
+    if rtc_hi < uptime || g + SLACK < uptime {
+        return Err("the clock interval is shorter than this boot's uptime".into());
     }
-    Ok((g.saturating_sub(READ_EPS).max(uptime), (g + p.pairing + READ_EPS).max(uptime)))
+    let lo = g.saturating_sub(READ_EPS).min(rtc_lo).max(uptime);
+    let hi = g.checked_add(p.pairing).and_then(|v| v.checked_add(READ_EPS))
+        .ok_or("realtime age interval overflow")?.max(rtc_hi).max(uptime);
+    Ok((lo, hi))
 }
 
 #[cfg(test)]
@@ -252,13 +264,13 @@ mod tests {
     }
 
     #[test]
-    fn a_version_bit_flip_cannot_promote_an_old_checksum() {
+    fn a_version_change_cannot_promote_an_old_checksum() {
         let good = encode(&wall("old", 1000, true, Some(500)), &origin(), Duration::ZERO, &clean(60.0)).unwrap();
         let body = good.splitn(3, '\n').nth(2).unwrap();
         // Exact v2 checksum rule, followed by a single changed header bit.
-        let old = format!("speakerguardd-boot 2\nsum {:016x}\n{body}", fnv(body));
-        let promoted = old.replacen("speakerguardd-boot 2", MAGIC, 1);
-        assert_eq!(old.bytes().zip(promoted.bytes()).map(|(a, b)| (a ^ b).count_ones()).sum::<u32>(), 1);
+        let old = format!("speakerguardd-boot 3\nsum {:016x}\n{body}", fnv(&format!("speakerguardd-boot 3\n{body}")));
+        let promoted = old.replacen("speakerguardd-boot 3", MAGIC, 1);
+        assert_ne!(old, promoted);
         assert!(decode(&old).is_none());
         assert!(decode(&promoted).is_none(), "the version promise was not covered by the checksum");
         assert!(decode(&good).is_some());
@@ -275,8 +287,8 @@ mod tests {
         let up = Duration::from_secs(8);
         let now = wall("b2", 1300, true, Some(800));
         let (lo, hi) = gap(&p, &now, &origin(), Some("a1"), up).unwrap();
-        assert!(lo <= Duration::from_secs(300) && lo >= Duration::from_millis(299_900), "{lo:?}");
-        assert!(hi >= Duration::from_secs(301) && hi <= Duration::from_millis(301_100), "{hi:?}");
+        assert!(lo <= Duration::from_secs(300) && lo >= Duration::from_secs(297), "{lo:?}");
+        assert!(hi >= Duration::from_secs(301) && hi <= Duration::from_secs(304), "{hi:?}");
         // dashes in one id and not the other are the same boot
         assert!(gap(&p, &now, &origin(), Some("A-1"), up).is_ok());
         for (why, w, o, prev) in [
@@ -302,4 +314,9 @@ mod tests {
         let running = decode(&encode(&wall("a1", 1000, true, Some(500)), &origin(), Duration::ZERO, &state::encode(T, T, &sp, true, false)).unwrap()).unwrap();
         assert!(gap(&running, &now, &origin(), Some("a1"), up).is_err());
     }
+    #[test]
+    fn absent_rtc_cannot_write_an_idle_restore_promise() {
+        assert!(encode(&wall("old", 1000, true, None), &origin(), Duration::ZERO, &clean(60.0)).is_none());
+    }
+
 }

@@ -5960,6 +5960,10 @@ mod persist_review {
     /// A clean stop's record at `tc`/`tm` in every model, written by boot
     /// "old" at 1_800_000_000.
     fn fixture(cfg: &Config, tc: f64, tm: f64) -> String {
+        fixture_at(cfg, tc, tm, &wall("old", 1_800_000_000))
+    }
+
+    fn fixture_at(cfg: &Config, tc: f64, tm: f64, clock: &Wall) -> String {
         let mut sp: Vec<_> = cfg.speakers.iter().map(|s| SpeakerState::new(s.clone(), cfg.globals.t_ambient)).collect();
         for s in &mut sp {
             s.resume(tc, tm, 0.0, 0.0);
@@ -5977,7 +5981,7 @@ mod persist_review {
             }
         }
         let text = state::encode_with(Duration::from_secs(500), Duration::from_secs(500), &sp, e.as_ref(), false, true);
-        persist::encode(&wall("old", 1_800_000_000), &origin(cfg), Duration::ZERO, &text).unwrap()
+        persist::encode(clock, &origin(cfg), Duration::ZERO, &text).unwrap()
     }
 
     /// The next boot, `up` s up, `gap` s after the record, the journal
@@ -6015,6 +6019,56 @@ mod persist_review {
         let (g, _, keep) = boot(&cfg, &fixture(&cfg, 60.0, 55.0), 60, 10.0);
         assert!(!g.speakers[0].hard && g.speakers[0].t_coil < 60.0, "{}", g.speakers[0].t_coil);
         assert!(!keep.exists());
+    }
+
+    /// The watch can accept a wrong middle timestamp when two setters
+    /// restore the offset before either notification. The RTC interval
+    /// must cover the real age; missing RTC must retain the hot latch.
+    #[test]
+    fn overlapping_clock_setters_cannot_restore_a_colder_model() {
+        let mut cfg = Config::parse(include_str!("../conf/apple/j316.conf")).unwrap();
+        cfg.allow_unqualified = true;
+        cfg.allow_unified = true;
+        cfg.globals.boot_resume = BootResume::Idle;
+        cfg.globals.governor = Governor::Unified;
+        cfg.globals.guard = Some(Governor::Asahi);
+        let age = Duration::from_millis(1001);
+        for step in [1, 60] {
+            let mut old = wall("old", 1_800_000_000);
+            old.realtime = Some(Duration::from_secs(1_800_000_000 - step));
+            let text = fixture_at(&cfg, 125.0, 95.0, &old);
+            let saved = persist::decode(&text).unwrap().state;
+            let saved = Saved { boottime: Duration::ZERO, covered: Duration::ZERO, ..saved };
+            let mut truth: Vec<_> = cfg.speakers.iter().map(|s| SpeakerState::with_globals(s.clone(), &cfg.globals)).collect();
+            let mut truth_engine = Engine::new(&cfg, true);
+            assert!(state::restore_interval(&mut truth, &mut truth_engine, &saved, age, age, &cfg.globals));
+            for rtc_available in [false, true] {
+                let keep = missing_state().unwrap();
+                std::fs::write(&keep, &text).unwrap();
+                let mut hw = FakeHw::per_speaker(&cfg);
+                hw.boot = age;
+                hw.wall = wall("new", 1_800_000_001);
+                if !rtc_available { hw.wall.rtc = None; }
+                hw.machine = Some("machine".into());
+                hw.previous_boot = Some("old".into());
+                let g = Guard::start_persist(&mut hw, &cfg, 20.0, missing_state(), Some(keep)).unwrap();
+                if !rtc_available || step == 60 { assert!(latched(&g)); }
+                for (bound, actual) in g.speakers.iter().zip(&truth) {
+                    assert!(bound.t_coil >= actual.t_coil && bound.t_magnet >= actual.t_magnet,
+                        "step={step} rtc={rtc_available}: {bound:?} under {actual:?}");
+                }
+                let en = g.engine.as_ref().unwrap();
+                let reference = truth_engine.as_ref().unwrap();
+                for (bound, actual) in en.asahi.as_ref().unwrap().iter().zip(reference.asahi.as_ref().unwrap()) {
+                    assert!(bound.th.t_coil >= actual.th.t_coil && bound.th.t_magnet >= actual.th.t_magnet);
+                }
+                for (bound, actual) in en.unified.as_ref().unwrap().iter().zip(reference.unified.as_ref().unwrap()) {
+                    assert!(bound.ff.t_coil >= actual.ff.t_coil && bound.ff.t_magnet >= actual.ff.t_magnet);
+                    let (a,b) = (bound.vi.as_ref().unwrap(), actual.vi.as_ref().unwrap());
+                    assert!(a.t_coil >= b.t_coil && a.t_magnet >= b.t_magnet);
+                }
+            }
+        }
     }
 
     /// The default ignores the record's contents and clocks entirely: the

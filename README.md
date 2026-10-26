@@ -294,8 +294,8 @@ also writes its state to `/var/lib/speakerguardd/state` (`--persist`).  The
 daemon makes the directory itself, after the card is locked; the unit adds
 nothing that could fail before the daemon runs.  The record is checksummed
 and bound to the machine (`/etc/machine-id`), the parsed configuration
-and the boot that wrote it. Version 3 refuses older records whose clock
-samples lacked the synchronization watch. The checksum covers the version
+and the boot that wrote it. Version 4 requires an independent RTC age bound
+and refuses older records. The checksum covers the version
 header too, so a damaged header cannot promote an older record. It is written and synced only when the
 system clock is synchronized.  The first start of the next boot (no state
 under `/run`) resumes it only if all of the following hold:
@@ -303,13 +303,19 @@ under `/run`) resumes it only if all of the following hold:
 * the journal lists the writing boot as the one just before this one;
 * the machine and configuration match and the checksum holds;
 * no temperature is under the ambient;
-* the system clock is synchronized at both ends, any RTC agrees with it,
-  and the gap is no shorter than this boot's uptime.
+* the system clock passes synchronization checks at both ends and agrees
+  with an independent, accurate RTC present at both ends;
+* the age interval covers RTC quantization, read placement, up to 0.1% RTC
+  rate uncertainty and the snapshot pairing, and is no shorter than uptime.
 
 The timestamp is read between two synchronization queries while a
 `TFD_TIMER_CANCEL_ON_SET` timer watches for a clock step. An unsynchronized
 query, a step, a pending leap transition or a failed watch rejects the
-sample. The guarded sample must finish within 50 ms of boot time, on both
+sample. Overlapping setters can restore the offset before both timerfd
+notifications and evade this watch. Realtime alone therefore cannot authorize
+idle restore. The entire independent RTC interval is included even when it
+agrees with realtime; a missing RTC keeps the hot latch. The guarded sample
+must finish within 50 ms of boot time, on both
 save and restore. Restore also bounds the whole wall-clock read to 50 ms.
 The shutdown record keeps the whole delay from the model snapshot through
 the clock reads. Missing or backward boot-time reads cannot produce a
@@ -347,9 +353,10 @@ by the record or by `journalctl --list-boots`.
 * No other OS may drive these speakers between the saved state and restore.
   Linux cannot see that history. Every Apple Silicon Mac can boot another OS;
   merely calling an installation Linux-only does not establish continuity.
-* A clock reported synchronized must be correct,
-  and its elapsed-time rate must remain trustworthy across shutdown and boot.
-  Agreement with the RTC does not detect clocks moved forward together.
+* The independent RTC must remain accurate and its rate error stay within
+  0.1% across shutdown and boot. It must not be adjusted with the system
+  realtime clock during capture. Agreement does not detect both clocks
+  moved forward together.
   Clock administration must preserve this contract; the sample watch is
   local to each read, not a record of clock history while Linux was down.
 
@@ -767,3 +774,10 @@ reserve fails this gate, so this branch is not ready for release. A proportional
 bound needs enforceable knowledge of upcoming playback energy or a sufficiently
 short enforced response deadline. The sense capture's backlog contains past
 audio and cannot certify the next period's energy.
+
+
+The strict legacy sweep uses the profile's declared amplifier maximum even
+when it exceeds the sense full scale. Startup, uncovered time and budget
+caps use that same configured bound. A saturated voltage word cannot prove
+that the amplifier stopped at the sense rail; those frames use the declared
+power bound in both thermal paths. The profiles remain unqualified.

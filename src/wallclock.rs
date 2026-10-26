@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 //! Pair synchronization status with a realtime sample. Two status reads
 //! alone miss an unsynchronized step between them. A CANCEL_ON_SET timer
-//! watches the whole read, including both status queries.
+//! watches the whole read, including both status queries. Net-zero
+//! overlapping setters can evade it; persistence also requires an RTC bound.
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::time::Duration;
@@ -190,5 +191,30 @@ mod tests {
         assert!(c.watch());
         assert!(c.unchanged());
         assert!(c.realtime().is_some());
+    }
+}
+
+#[cfg(test)]
+mod overlapping_setters {
+    use super::*;
+    struct NetZero { step: u64, reads: usize }
+    impl Clock for NetZero {
+        fn boottime(&mut self) -> Option<Duration> {
+            self.reads += 1;
+            Some(Duration::from_millis((self.reads - 1) as u64))
+        }
+        fn watch(&mut self) -> bool { true }
+        fn synced(&mut self) -> bool { true }
+        fn realtime(&mut self) -> Option<Duration> { Some(Duration::from_secs(1_800_000_000 - self.step)) }
+        fn unchanged(&mut self) -> bool { true }
+    }
+    #[test]
+    fn a_net_zero_notification_is_not_an_elapsed_time_proof() {
+        for step in [1, 60] {
+            let sample = sample(&mut NetZero { step, reads: 0 }).unwrap();
+            // Both status reads and the final offset can be correct while
+            // the middle timestamp was wrong. The RTC gate must catch it.
+            assert_eq!(sample, Duration::from_secs(1_800_000_000 - step));
+        }
     }
 }
