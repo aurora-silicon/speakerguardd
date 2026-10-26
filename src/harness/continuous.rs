@@ -368,3 +368,48 @@ fn published_copy_gain_witness_stays_within_limits() {
         );
     }
 }
+
+/// A clean, cold model does not make a long queued programme safe. Without
+/// the legacy onset bound, the full-scale queued case reaches 137.194652 C
+/// against J700's 135 C limit, despite satisfying the armed-state oracle.
+#[test]
+fn cold_legacy_long_queued_programmes_stay_within_limits() {
+    crate::log::set_verbosity(crate::log::Level::Error);
+    let mut failures = Vec::new();
+    for steps in [false, true] {
+        for (depth, chunk) in [(0.0, 0.004), (0.213, 0.128)] {
+            for level in [0.3, 1.0] {
+                let scenario = Scenario {
+                    horizon: 1202.0,
+                    events: true,
+                    steps,
+                    initial_db: 20.0,
+                    clean_start: true,
+                    max_reduction: 20.0,
+                    latency: 0.0,
+                    streams: vec![super::Stream {
+                        open: 0.0,
+                        close: 1202.0,
+                        depth,
+                        chunk,
+                        levels: vec![(0.0, 0.0), (2.0, level)],
+                    }],
+                    faults: vec![],
+                    restarts: vec![],
+                };
+                let case = capture("cold-legacy-long", || super::run(&scenario, 7313200001));
+                if let Some(error) = case.error {
+                    failures.push(format!("steps={steps} depth={depth} chunk={chunk} level={level}: {error}"));
+                }
+                for p in case.rows {
+                    let peak = p.coil.max(p.magnet);
+                    eprintln!("COLD_LEGACY steps={steps} depth={depth} chunk={chunk} level={level} {}: {peak:.12} / {}", p.speaker, p.limit);
+                    if !peak.is_finite() || peak > p.limit + 1e-6 {
+                        failures.push(format!("steps={steps} depth={depth} chunk={chunk} level={level} {}: {peak:.12} > {}", p.speaker, p.limit));
+                    }
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}

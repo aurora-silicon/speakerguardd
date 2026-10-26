@@ -17,7 +17,7 @@
 //! the same clean-stop rule for every model.  A model the file does not
 //! carry starts latched at its limit. Generation 2 snapshots predate the
 //! independent hot-node bounds and are refused even after a clean stop.
-//! Older readers refuse generation 3 rather than resuming its temperatures.
+//! Readers from before generation 3 refuse it rather than resuming its temperatures.
 
 use std::time::Duration;
 
@@ -380,6 +380,32 @@ mod tests {
     }
 
     const T: Duration = Duration::from_secs(100);
+
+    /// PR #20 uses this generation for the same independently hot-node
+    /// initializer. Its legacy-only writer has no engine records. Keep
+    /// that clean-stop format readable without allocating a new generation.
+    #[test]
+    fn neo_generation_three_clean_stop_remains_readable() {
+        let text = include_str!("../tests/neo-generation-three.state");
+        let saved = decode(text).unwrap();
+        assert!(saved.proven());
+        assert_eq!(saved.boottime, T);
+        assert!(saved.asahi.is_empty() && saved.unified.is_empty());
+        let cfg = Config::parse(J700).unwrap();
+        let mut speakers = fresh(&cfg);
+        assert!(restore(&mut speakers, &saved, T, &cfg.globals));
+        assert_eq!(speakers.len(), 2);
+        for (i, s) in speakers.iter().enumerate() {
+            assert!(!s.hard);
+            assert!((s.t_coil - (125.12345649 + i as f64)).abs() < RECORD_TEMP_EPS);
+            assert!((s.t_magnet - (95.12345649 + i as f64)).abs() < RECORD_TEMP_EPS);
+            assert!((s.t_peak - (131.12345649 + i as f64)).abs() < RECORD_TEMP_EPS);
+        }
+        let rewritten = encode(T, T, &speakers, false, true);
+        assert!(rewritten.starts_with("speakerguardd-state 3\n"));
+        assert!(decode(&rewritten).unwrap().proven());
+        assert!(decode(&text.replacen("state 3", "state 2", 1)).is_none());
+    }
 
     /// A genuine in-memory state can round down in the record. Compare
     /// with that unrounded state, rather than treating decoded values as

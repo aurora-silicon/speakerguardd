@@ -858,6 +858,9 @@ separate release requirement.
 Runtime snapshots use model generation 3. A clean stop written before the
 independent hot-node and voltage bounds is not evidence that its saved model
 bounded the speakers. Those older snapshots are refused and startup stays
-latched. Older readers also refuse generation 3 on rollback. Historical
+latched. Readers from before generation 3 also refuse it on rollback. PR #20's
+Legacy clean-stop writer already uses generation 3; its synthetic writer
+fixture remains readable here, and this branch does not introduce generation 4.
+Historical
 recordings remain readable, but an untrusted initial state starts the replay
 latched and makes it diagnostic. Profile fingerprints are unchanged.

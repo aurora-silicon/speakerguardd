@@ -15,3 +15,10 @@ applies to the continuous limit. Original Euler/RK4 assertions stay intact.
 explicit packaged-Neo rows from a different source/fixture. Generated model
 fixtures contain no recordings or private device identity. They use the
 repository's MIT license. Raw recordings remain private.
+
+`cold_legacy_long_queued_programmes_stay_within_limits` also retains a cold
+Legacy counterexample outside the original campaign: two seconds of silence
+followed by twenty minutes at full scale, with a 213 ms queue and 128 ms copy
+chunks. Without the Legacy onset bound it reaches 137.194652 C against the
+135 C limit while the armed-state oracle passes. The regression covers both
+continuous and stepped controls, an empty queue too, and 30% programme level.
