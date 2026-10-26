@@ -11,9 +11,21 @@ struct Tracked {
     gains: Vec<(Duration, Vec<f64>)>,
     clean_start: bool,
     full_onset: Option<Duration>,
+    digital: Vec<(Duration,Duration,Vec<f64>)>,
+    metric_frame: u64,
 }
 impl Tracked {
     fn snap(&mut self) {
+        if let Some(q)=&self.hw.gate {
+            let to=q.emitted_frames(self.hw.t.as_secs_f64());
+            // 10 ms metric cells align with every original programme edge.
+            while self.metric_frame+480<=to {
+                let end=self.metric_frame+480;
+                self.digital.push((Duration::from_secs_f64(self.metric_frame as f64/48000.0),
+                    Duration::from_secs_f64(end as f64/48000.0),q.rms_reduction(self.metric_frame,end)));
+                self.metric_frame=end;
+            }
+        }
         let gains: Vec<_> = (0..self.hw.per.len())
             .map(|k| self.hw.effective_of(k))
             .collect();
@@ -43,6 +55,12 @@ impl Hw for Tracked {
         let result = self.hw.take_lock();
         self.snap();
         result
+    }
+    fn playback_status(&mut self)->io::Result<Option<crate::playback::Snapshot>> {
+        self.snap();let value=self.hw.playback_status();self.snap();value
+    }
+    fn playback_write(&mut self,b:&[u8;crate::playback::BYTES])->io::Result<()> {
+        self.snap();let value=self.hw.playback_write(b);self.snap();value
     }
     fn ping(&mut self) -> io::Result<()> {
         self.snap();
@@ -142,14 +160,20 @@ fn full_scale_run(cfg: Config, seconds: u64, clean_start: bool) -> (Config, Trac
 }
 
 fn programme_run(
-    mut cfg: Config, seconds: u64, clean_start: bool, steps: bool,
+    cfg: Config, seconds: u64, clean_start: bool, steps: bool,
     level: Box<dyn Fn(Duration) -> f64>,
-) -> (Config, Tracked) {
+) -> (Config, Tracked) {programme_run_with_gate(cfg,seconds,clean_start,steps,level,false)}
+
+fn programme_run_with_gate(
+    mut cfg: Config,seconds:u64,clean_start:bool,steps:bool,
+    level:Box<dyn Fn(Duration)->f64>,gated:bool,
+)->(Config,Tracked) {
     cfg.allow_unqualified = true;
     cfg.allow_unified = true;
     let mut hw = FakeHw::per_speaker(&cfg);
     hw.steps = steps;
     hw.level = level;
+    if gated {hw.enable_gate(&cfg);}
     // Preserve the review's static loads. Avoid a current rail in this
     // witness so the onset cannot be confused with current-rail handling.
     let specs = cfg.speakers.clone();
@@ -170,6 +194,7 @@ fn programme_run(
         gains: Vec::new(),
         clean_start,
         full_onset: None,
+        digital: Vec::new(),metric_frame: 0,
     };
     let state = if clean_start {
         Some(tests::vi_state(
@@ -556,7 +581,11 @@ fn ordinary_quiet_programme_costs_at_most_one_db() {
                     else { 0.08 };
                 volume * programme
             });
-            let (cfg, hw) = programme_run(cfg, 600, true, true, level);
+            // Use the same bounded-current contract as the phase-uncertain
+            // thermal campaign. A different, stronger certificate must never
+            // be selected merely to make a quiet replay pass.
+            let (cfg, hw) = programme_run_with_gate(cfg, 600, true, true, level,true);
+            let mut digital_totals=vec![0.0;cfg.speakers.len()];
             let mut totals = vec![0.0; cfg.speakers.len()];
             let mut active_s = 0.0;
             for pair in hw.gains.windows(2) {
@@ -573,11 +602,23 @@ fn ordinary_quiet_programme_costs_at_most_one_db() {
                     }
                 }
             }
+            let mut digital_s=0.0;
+            for (from,to,reductions) in &hw.digital {
+                for cycle in 1..10 {for (start,end) in [(2.0,45.0),(50.0,60.0)] {
+                    let base=cycle as f64*60.0;
+                    let seconds=(to.as_secs_f64().min(base+end)-from.as_secs_f64().max(base+start)).max(0.0);
+                    if seconds>0.0 {
+                        digital_s+=seconds;
+                        for (total,db) in digital_totals.iter_mut().zip(reductions) {*total+=seconds*db;}
+                    }
+                }}
+            }
+            assert!((digital_s-477.0).abs()<1e-6,"{digital_s} digitally measured active seconds");
             assert!((active_s - 477.0).abs() < 1e-6, "{active_s} active seconds");
-            for (speaker, total) in cfg.speakers.iter().zip(totals) {
-                let loss = total / active_s;
-                eprintln!("LISTENING_COST {name} {point}% {} extra_db={loss:.6}", speaker.name);
-                if loss > 1.0 + 1e-6 {
+            for ((speaker, total),digital) in cfg.speakers.iter().zip(totals).zip(digital_totals) {
+                let loss = (total+digital) / active_s;
+                eprintln!("LISTENING_COST {name} {point}% {} extra_db={loss:.6} control_db={:.6} kernel_db={:.6}", speaker.name,total/active_s,digital/active_s);
+                if !loss.is_finite() || loss > 1.0 + 1e-6 {
                     failures.push(format!("{name} {point}% {}: {loss:.3} dB", speaker.name));
                 }
             }

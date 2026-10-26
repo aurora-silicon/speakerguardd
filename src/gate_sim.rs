@@ -347,6 +347,7 @@ pub struct DescriptorQueue {
 }
 struct Rendered {
     start: u64,
+    end: u64,
     words: Vec<i32>,
     original: Vec<i32>,
 }
@@ -404,6 +405,10 @@ impl DescriptorQueue {
             self.next = Self::first_frame(seconds, self.rate);
         } else {
             self.gate.stop(now).unwrap();
+            let end = Self::first_frame(seconds, self.rate);
+            for r in &mut self.rows {
+                r.end = r.end.min(end);
+            }
             self.active.clear();
         }
         self.playing = playing;
@@ -444,6 +449,7 @@ impl DescriptorQueue {
                 let (ticket, output) = self.gate.submit(&input, ns).unwrap();
                 self.rows.push_back(Rendered {
                     start: self.next,
+                    end: self.next + self.gate.frames as u64,
                     words: output,
                     original: input
                         .into_iter()
@@ -467,7 +473,7 @@ impl DescriptorQueue {
             .rows
             .iter()
             .rev()
-            .find(|r| r.start <= n && n < r.start + self.gate.frames as u64)
+            .find(|r| r.start <= n && n < r.end)
             .unwrap_or_else(||panic!("oracle cannot read unrendered playback: case={} frame={n} model={k} next={} playing={} rows={} first={:?} last={:?}",
                 self.debug_case,self.next,self.playing,self.rows.len(),self.rows.front().map(|r|r.start),self.rows.back().map(|r|r.start)));
         let physical = self
@@ -489,7 +495,7 @@ impl DescriptorQueue {
             .rows
             .iter()
             .rev()
-            .find(|r| r.start <= n && n < r.start + self.gate.frames as u64)
+            .find(|r| r.start <= n && n < r.end)
             .expect("sense cannot read unrendered playback");
         let physical = self
             .gate
@@ -499,6 +505,68 @@ impl DescriptorQueue {
             .unwrap();
         r.words[(n - r.start) as usize * self.gate.channels + physical]
     }
+    pub fn emitted_frames(&self, seconds: f64) -> u64 {
+        Self::frame_at(seconds, self.rate)
+    }
+
+    /// RMS-equivalent attenuation of the actual native queued words. This
+    /// compares the same PCM format on both sides, not integer conversion
+    /// against an unrepresentable float. Every requested frame must exist.
+    pub fn rms_reduction(&self, from: u64, to: u64) -> Vec<f64> {
+        assert!(to > from);
+        let channels = self.gate.channels;
+        let mut input = vec![0.0; channels];
+        let mut output = vec![0.0; channels];
+        let mut covered = 0;
+        let mut identical = true;
+        for r in &self.rows {
+            let start = from.max(r.start);
+            let end = to.min(r.end);
+            if end <= start {
+                continue;
+            }
+            covered += end - start;
+            let lo = (start - r.start) as usize * channels;
+            let hi = (end - r.start) as usize * channels;
+            identical &= r.original[lo..hi] == r.words[lo..hi];
+            for (a, b) in r.original[lo..hi]
+                .chunks_exact(channels)
+                .zip(r.words[lo..hi].chunks_exact(channels))
+            {
+                for k in 0..channels {
+                    input[k] += f64::from(a[k]).powi(2);
+                    output[k] += f64::from(b[k]).powi(2);
+                }
+            }
+        }
+        assert_eq!(
+            covered,
+            to - from,
+            "listening metric must cover actual queued frames exactly"
+        );
+        if identical {
+            return vec![0.0; channels];
+        }
+        (0..channels)
+            .map(|model| {
+                let k = self
+                    .gate
+                    .model_of_slot
+                    .iter()
+                    .position(|m| *m == model)
+                    .unwrap();
+                if input[k] == 0.0 {
+                    assert_eq!(output[k], 0.0);
+                    0.0
+                } else if output[k] == 0.0 {
+                    f64::INFINITY
+                } else {
+                    10.0 * (input[k] / output[k]).log10()
+                }
+            })
+            .collect()
+    }
+
     pub fn prune_before(&mut self, n: u64) {
         while self
             .rows
@@ -690,4 +758,28 @@ fn a_unity_j616_grant_adds_no_attenuation_to_its_native_pcm_words() {
             assert_eq!(q.ratio(n, k), 1.0);
         }
     }
+}
+
+#[test]
+fn listening_meter_includes_the_kernel_clamp_and_safe_floor() {
+    let cfg = Config::parse(include_str!("../conf/apple/j700.conf")).unwrap();
+    let mut q = DescriptorQueue::new(&cfg, 48000, 32, 1_000_000_000);
+    q.gate.owner(true, q.ns(0.0)).unwrap();
+    let s = q.gate.status(q.ns(0.0)).unwrap();
+    q.gate
+        .write(
+            &s.grant(
+                &vec![16 * (1 << 28); s.speakers],
+                &vec![crate::playback::UNITY; s.speakers],
+            )
+            .unwrap(),
+            q.ns(0.0),
+        )
+        .unwrap();
+    q.advance(0.0, |_, _| 0.5);
+    let expected = 10.0 * (2.0f64 / 1.01).log10();
+    for db in q.rms_reduction(0, 32) {
+        assert!((db - expected).abs() < 1e-6, "{db} vs {expected}");
+    }
+    assert!(q.rms_reduction(16, 32).iter().all(|db| *db > 19.999));
 }
