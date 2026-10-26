@@ -29,11 +29,19 @@ released slowly.  A windowed power budget (`p_limit_1s`, `p_limit_60s`: the
 mean power over the last second and the last minute) reduces the gain at
 once when a burst would exceed what the pair is rated for, before the coil
 has warmed up.  The larger of the two reductions is written to the card's
-speaker volume control.  If it would exceed `--max-reduction` (20 dB by
-default: a model asking for more is wrong), the daemon stops renewing the
-lock and the card falls back to its own safe level; the daemon keeps
-modelling from the sense data and takes the lock back once the reduction is
-3 dB below the limit again.
+speaker volume control. Ordinary model requests keep using that same ramp,
+including requests above the old 7 dB handoff on V/I machines. The daemon
+uses the attenuation needed by the most restrictive governor, rounded up to the card's steps. The unlocked control range is the
+limit (201 half-dB steps, or 100.5 dB, on the supported cards), rather than
+a fixed model threshold.
+
+A hard model or sense fault, lost observations, failed control write or
+unrepresentable attenuation still gives the lock back to the kernel.
+After a range fault, the target must fit with 3 dB to spare before the lock
+is taken back. Hard-temperature latches and the requirement for two good
+sense periods after bad data still apply. The old `max_reduction` setting
+and `-m` option are accepted for configuration and recording compatibility;
+they no longer cause a handoff during normal attenuation.
 
 There is no feedback: the model can only be as good as its constants.  The
 J700's constants - thermal resistances and time constants, coil temperature
@@ -448,10 +456,9 @@ it never plays audio or performs a reboot.
     speakerguardd -c /usr/share/speakerguardd -v
 
 `-C <card id>` selects a card (by default the one the macaudio driver
-registered, never the AOP card that shares its `AppleJ` prefix), `-m <dB>`
-the reduction at which the card's safe level takes over, `-s <file>` the
+registered, never the AOP card that shares its `AppleJ` prefix), `-s <file>` the
 model state file (`-s ''` for none).  `--governor legacy|asahi|unified`
 overrides the configuration's governor, `--guard asahi|none` its guard, and
-`-m` defaults to its `max_reduction`; `--shadow` turns the shadow log on,
+`-m` retains its historical recording value; `--shadow` turns the shadow log on,
 and `--experimental-unified` and `--allow-unqualified` are the two opt-ins
 described above.

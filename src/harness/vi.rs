@@ -1241,8 +1241,8 @@ fn check(cfg: &Config, w: &ViWorld, g: &Guard, sc: &ViScenario, out: &mut Outcom
             }
             if asahi_bound && !low {
                 let need = need(cfg, &w.oracle, k, at, rate, &slack);
-                if need >= sc.max_reduction + 0.05 {
-                    return Err(Violation(format!("(b) at {now:.4} s: armed while {name}'s true state needs {need:.3} dB, over --max-reduction")));
+                if need > w.reduction_limit_db().unwrap() + 0.05 {
+                    return Err(Violation(format!("(b) at {now:.4} s: armed while {name}'s true state needs {need:.3} dB, beyond the hardware range")));
                 }
                 if w.effective(k) < need - 0.05 {
                     return Err(Violation(format!("(b) at {now:.4} s: {name} card applies {:.3} dB, the true state needs {need:.3} dB", w.effective(k))));
@@ -1475,7 +1475,7 @@ fn tail(cfg: &Config, w: &mut ViWorld, g: &mut Guard, sc: &ViScenario, out: &mut
     // uncovered time may still be charged at the old gain
     let settle = w.now_s() + DRAIN.as_secs_f64() + 0.5;
     quiet(w, g, settle)?;
-    let bound = if sc.events && g.governing == Governor::Asahi { cooling_bound(cfg, g, sc.max_reduction) } else { None };
+    let bound = if sc.events && g.governing == Governor::Asahi { cooling_bound(cfg, g, w.reduction_limit_db().unwrap()) } else { None };
     let assert_d = bound.is_some_and(|b| b + TAIL_SLACK <= TAIL_MAX);
     let len = bound.map_or(5.0, |b| (b + TAIL_SLACK).min(TAIL_MAX));
     let from = w.now_s();
