@@ -4,6 +4,7 @@ BINDIR ?= $(PREFIX)/bin
 SHAREDIR ?= $(PREFIX)/share/speakerguardd
 UNITDIR ?= $(PREFIX)/lib/systemd/system
 UDEVDIR ?= $(PREFIX)/lib/udev/rules.d
+SLEEPDIR ?= $(PREFIX)/lib/systemd/system-sleep
 TARGET ?= aarch64-unknown-linux-musl
 
 all:
@@ -13,10 +14,11 @@ test:
 	cargo test
 
 install: all
-	install -dDm0755 $(DESTDIR)$(BINDIR) $(DESTDIR)$(SHAREDIR)/apple $(DESTDIR)$(UNITDIR) $(DESTDIR)$(UDEVDIR)
+	install -dDm0755 $(DESTDIR)$(BINDIR) $(DESTDIR)$(SHAREDIR)/apple $(DESTDIR)$(UNITDIR) $(DESTDIR)$(UDEVDIR) $(DESTDIR)$(SLEEPDIR)
 	install -pm0755 target/$(TARGET)/release/speakerguardd $(DESTDIR)$(BINDIR)/
 	install -pm0644 conf/apple/*.conf $(DESTDIR)$(SHAREDIR)/apple/
 	install -pm0644 speakerguardd.service $(DESTDIR)$(UNITDIR)/
 	install -pm0644 95-speakerguardd.rules $(DESTDIR)$(UDEVDIR)/
+	install -pm0755 tools/suspend-checkpoint $(DESTDIR)$(SLEEPDIR)/speakerguardd
 
 .PHONY: all test install

@@ -112,7 +112,8 @@ pub struct Globals {
     pub unified_caps: bool,
     pub p_reduction_max: f64,
     /// Gain reduction beyond which the card's safe level takes over (dB);
-    /// `-m` overrides it.  speakersafetyd's machines use 7.
+    /// `-m` overrides it. V/I profiles allow deep governed attenuation so
+    /// a hot cross-OS start can keep the card instead of hard muting it.
     pub max_reduction: f64,
     /// Whether this machine's sense mapping and thermal constants have been
     /// qualified on the machine itself.  An unqualified configuration is
@@ -593,7 +594,7 @@ mod tests {
             assert!(c.has_vi());
             assert_eq!(c.globals.governor, Governor::Asahi);
             assert_eq!(c.globals.sense_format, SenseFormat::S16);
-            assert_eq!(c.globals.max_reduction, 7.0);
+        assert_eq!(c.globals.max_reduction, 60.0);
             assert_eq!(c.controls.isense.as_deref(), Some("ISENSE Switch"));
         }
         let c = Config::parse(J316).unwrap();

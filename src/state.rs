@@ -56,6 +56,9 @@ pub struct Saved {
     pub released: bool,
     /// The run was recovering from bad sense data.
     pub recovering: bool,
+    /// Full-scale power bound for a run that began from the cross-OS hot
+    /// envelope; absent in older records and false for ordinary starts.
+    pub hot_floor: bool,
     pub speakers: Vec<SavedSpeaker>,
     /// The engine's models (none in a file written without them).
     pub asahi: Vec<SavedAsahi>,
@@ -186,6 +189,7 @@ pub fn decode(text: &str) -> Option<Saved> {
     let mut armed = true;
     let mut released = false;
     let mut recovering = false;
+    let mut hot_floor = false;
     let mut ended = false;
     for line in lines {
         if ended {
@@ -209,6 +213,10 @@ pub fn decode(text: &str) -> Option<Saved> {
         }
         if let Some(v) = line.strip_prefix("recovering ") {
             recovering = flag(v)?;
+            continue;
+        }
+        if let Some(v) = line.strip_prefix("hot_floor ") {
+            hot_floor = flag(v)?;
             continue;
         }
         if let Some(v) = line.strip_prefix("released ") {
@@ -248,7 +256,7 @@ pub fn decode(text: &str) -> Option<Saved> {
         return None;
     }
     let covered = Duration::from_nanos(covered.unwrap_or(0).min(ns));
-    Some(Saved { boottime: Duration::from_nanos(ns), covered, armed, released: v2 && released && !armed, recovering, speakers, asahi, unified })
+    Some(Saved { boottime: Duration::from_nanos(ns), covered, armed, released: v2 && released && !armed, recovering, hot_floor, speakers, asahi, unified })
 }
 
 /// Continue every speaker from a clean stop's state and charge the time
@@ -303,6 +311,53 @@ pub fn restore_engine(engine: &mut Engine, saved: &Saved, now: Duration, globals
     }
     let elapsed = now.saturating_sub(saved.boottime).as_secs_f64();
     engine.resume(&saved.asahi, &saved.unified, elapsed, globals.safe_reduction);
+    engine.hot_floor = saved.hot_floor;
+    true
+}
+
+/// A live checkpoint may miss one save cadence before a crash. Charge
+/// full-gain power for that interval, then use exact zero-power cooling.
+/// A clean-stop checkpoint has no unrecorded playback interval.
+pub fn restore_checkpoint(speakers: &mut [SpeakerState], engine: &mut Option<Engine>, saved: &Saved,
+                          elapsed: Duration, active: bool, globals: &Globals) -> bool {
+    let mut state = saved.clone();
+    state.boottime = Duration::ZERO;
+    state.covered = Duration::ZERO;
+    state.released = true;
+    state.armed = false;
+    // Saved temperatures have six decimals; move each to the upper edge.
+    for s in &mut state.speakers { s.t_coil += 1e-6; s.t_magnet += 1e-6; s.t_peak += 1e-6; }
+    for s in &mut state.asahi {
+        s.t_coil += 1e-6; s.t_magnet += 1e-6; s.coil_hyst += 1e-6;
+        s.magnet_hyst += 1e-6; s.t_peak += 1e-6;
+    }
+    for s in &mut state.unified {
+        s.ff.0 += 1e-6; s.ff.1 += 1e-6; s.t_peak += 1e-6;
+        if let Some(v) = &mut s.vi { v.0 += 1e-6; v.1 += 1e-6; }
+    }
+    if !restore(speakers, &state, Duration::ZERO, globals) { return false; }
+    if let Some(e) = engine.as_mut() { restore_engine(e, &state, Duration::ZERO, globals); }
+    let missing = if active { crate::checkpoint::UNCLEAN_BOUND } else { Duration::ZERO };
+    if active {
+        let gap = missing.as_secs_f64();
+        for s in speakers.iter_mut() {
+            let old_magnet = s.t_magnet;
+            let full = s.worst_case_power(0.0);
+            s.step_pre(full, full, gap, globals.t_ambient);
+            s.t_coil = s.t_coil.max(s.t_peak);
+            s.t_magnet = s.t_magnet.max(old_magnet);
+        }
+        if let Some(e) = engine.as_mut() {
+            e.worst(gap, &vec![0.0; speakers.len()]);
+            e.bound_checkpoint_gap_peak();
+        }
+    }
+    // The unsaved playback may have occupied the first part of the wall
+    // gap. It gets no simultaneous cooling credit. Even if the observed
+    // gap is shorter, charging the whole bound only raises temperatures.
+    let age = elapsed.saturating_sub(missing).as_secs_f64();
+    for s in speakers.iter_mut() { s.cool_exact(age, globals.t_ambient); }
+    if let Some(e) = engine.as_mut() { e.cool_checkpoint(age); }
     true
 }
 
@@ -312,6 +367,21 @@ mod tests {
     use crate::config::{Config, Governor};
 
     const J700: &str = include_str!("../conf/apple/j700.conf");
+
+    #[test]
+    fn cross_os_power_bound_survives_a_clean_restart_until_cool() {
+        let cfg = Config::parse(include_str!("../conf/apple/j616.conf")).unwrap();
+        let speakers: Vec<_> = cfg.speakers.iter().map(|s| SpeakerState::new(s.clone(), cfg.globals.t_ambient)).collect();
+        let mut e = Engine::new(&cfg, true).unwrap();
+        e.assume_external_hot();
+        let saved = decode(&encode_with(T, T, &speakers, Some(&e), false, true)).unwrap();
+        assert!(saved.hot_floor);
+        let mut resumed = Engine::new(&cfg, true).unwrap();
+        assert!(restore_engine(&mut resumed, &saved, T, &cfg.globals));
+        assert!(resumed.hot_floor);
+        resumed.cool_checkpoint(3600.0);
+        assert!(!resumed.hot_floor);
+    }
 
     fn hot() -> (Config, Vec<SpeakerState>) {
         let cfg = Config::parse(J700).unwrap();

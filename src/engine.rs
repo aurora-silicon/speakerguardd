@@ -799,6 +799,24 @@ pub fn v_worst(s: &Speaker, g: &Globals) -> f64 {
     }
 }
 
+/// 150 C at both nodes when the other OS stopped, followed by an assumed
+/// 30 s silent transition and 1 C margin. Taking the hotter of the two
+/// configured plants covers their different coil and magnet constants.
+pub fn external_hot_bounds(s: &Speaker, ambient: f64) -> (f64, f64) {
+    let mut coil = ambient;
+    let mut magnet = ambient;
+    for (rc, tc, rm, tm) in [
+        (s.tr_coil, s.tau_coil, s.tr_magnet, s.tau_magnet),
+        (s.vi_tr_coil, s.vi_tau_coil, s.vi_tr_magnet, s.vi_tau_magnet),
+    ] {
+        let mut plant = Thermal::new(rc, tc, rm, tm, s.t_limit);
+        plant.hold(0.0, 30.0, ambient);
+        coil = hi(coil, plant.t_coil);
+        magnet = hi(magnet, plant.t_magnet);
+    }
+    (coil + 1.0, magnet + 1.0)
+}
+
 /// The unified regulator's models and state for one speaker.
 #[derive(Debug, Clone)]
 pub struct UnifiedSpeaker {
@@ -1121,6 +1139,9 @@ pub struct SavedUnified {
 /// ones (when they govern or the shadow log runs).
 pub struct Engine {
     pub cfg: Config,
+    /// This run began from the external hot envelope. Persisted so a warm
+    /// restart keeps the full-scale startup power bound.
+    pub hot_floor: bool,
     pub asahi: Option<Vec<AsahiSpeaker>>,
     pub unified: Option<Vec<UnifiedSpeaker>>,
     pub extractor: Extractor,
@@ -1166,7 +1187,7 @@ impl Engine {
             return None;
         }
         let n = cfg.speakers.len();
-        Some(Engine { cfg: cfg.clone(), asahi, unified, extractor: Extractor::new(n), last: vec![Feature::default(); n], lost: vec![false; n], lost_changed: Vec::new(), pending: vec![0.0; n], reading: vec![false; n], gap: f64::INFINITY, lf: vec![(0.0, 0.0, 0.0); n], low: vec![false; n], logged: vec![(false, 0); n] })
+        Some(Engine { cfg: cfg.clone(), hot_floor: false, asahi, unified, extractor: Extractor::new(n), last: vec![Feature::default(); n], lost: vec![false; n], lost_changed: Vec::new(), pending: vec![0.0; n], reading: vec![false; n], gap: f64::INFINITY, lf: vec![(0.0, 0.0, 0.0); n], low: vec![false; n], logged: vec![(false, 0); n] })
     }
 
     pub fn has(&self, gov: Governor) -> bool {
@@ -1180,6 +1201,7 @@ impl Engine {
     /// Nothing is known about the speakers: every model at its hard limit,
     /// latched.
     pub fn assume_latched(&mut self) {
+        self.hot_floor = false;
         let g = self.cfg.globals.clone();
         for s in self.asahi.iter_mut().flatten() {
             s.assume_latched(&g);
@@ -1498,7 +1520,111 @@ impl Engine {
         for s in self.unified.iter_mut().flatten() {
             s.idle(d, ta);
         }
+        if self.hot_floor && self.asahi.iter().flatten().all(|s| s.th.t_coil <= ta + 0.1 && s.th.t_magnet <= ta + 0.1)
+            && self.unified.iter().flatten().all(|s| s.ff.t_coil <= ta + 0.1 && s.ff.t_magnet <= ta + 0.1
+                && s.vi.as_ref().is_none_or(|v| v.t_coil <= ta + 0.1 && v.t_magnet <= ta + 0.1)) {
+            self.hot_floor = false;
+        }
         self.govern(d.max(0.0), false);
+    }
+
+    /// A checkpoint can span a long known-silent interval. The peak over
+    /// that entire interval is historical; at its end only the current
+    /// coil and magnet temperatures govern the next unlock. A zero-length
+    /// interval keeps the previous peak and latch unchanged.
+    pub fn cool_checkpoint(&mut self, d: f64) {
+        self.idle(d);
+        if d > 0.0 {
+            for s in self.asahi.iter_mut().flatten() {
+                s.coil_peak = s.th.t_coil;
+                s.magnet_peak = s.th.t_magnet;
+            }
+            for s in self.unified.iter_mut().flatten() {
+                s.peak = hi(s.ff.hottest(), s.vi.as_ref().map_or(f64::NEG_INFINITY, Thermal::hottest));
+            }
+            self.govern(0.0, false);
+            self.clear_hard_if_cool();
+        }
+    }
+
+    /// When the wall gap is shorter than the unsaved-playback bound (or
+    /// untrustworthy), the crash may have happened anywhere inside that
+    /// bound. Raise each live node to its hottest possible point there.
+    pub fn bound_checkpoint_gap_peak(&mut self) {
+        for s in self.asahi.iter_mut().flatten() {
+            s.th.t_coil = hi(s.th.t_coil, s.coil_peak);
+            s.th.t_magnet = hi(s.th.t_magnet, s.magnet_peak);
+        }
+        for s in self.unified.iter_mut().flatten() {
+            s.ff.t_coil = hi(s.ff.t_coil, s.peak);
+            s.ff.t_magnet = hi(s.ff.t_magnet, s.peak);
+            if let Some(v) = s.vi.as_mut() {
+                v.t_coil = hi(v.t_coil, s.peak);
+                v.t_magnet = hi(v.t_magnet, s.peak);
+            }
+        }
+        self.govern(0.0, true);
+    }
+
+    /// Unknown previous speaker owner: the cross-OS design envelope after
+    /// a 30 s silent boot transition. Start from both nodes at the hotter
+    /// of the feed-forward and V/I plants after a 150 C/150 C shutdown,
+    /// plus 1 C for rounding and measurement error. This is deliberately
+    /// below the 150 C hard fault: the power bound in `governed` controls
+    /// the first sound instead of a startup latch or a timer.
+    pub fn assume_external_hot(&mut self) {
+        self.hot_floor = true;
+        let ambient = self.cfg.globals.t_ambient;
+        for (k, spec) in self.cfg.speakers.iter().enumerate() {
+            let (coil, magnet) = external_hot_bounds(spec, ambient);
+            if let Some(s) = self.asahi.as_mut().and_then(|v| v.get_mut(k)) {
+                s.th.t_coil = coil;
+                s.th.t_magnet = magnet;
+                s.coil_peak = coil;
+                s.magnet_peak = magnet;
+                s.coil_hyst = coil;
+                s.magnet_hyst = magnet;
+                s.hard = !(coil < spec.t_limit && magnet < spec.t_limit);
+            }
+            if let Some(s) = self.unified.as_mut().and_then(|v| v.get_mut(k)) {
+                s.ff.t_coil = coil;
+                s.ff.t_magnet = magnet;
+                if let Some(v) = s.vi.as_mut() {
+                    v.t_coil = coil;
+                    v.t_magnet = magnet;
+                }
+                s.peak = coil.max(magnet);
+                s.hard = !(s.peak < spec.t_limit);
+            }
+        }
+        self.govern(0.0, false);
+    }
+
+    /// Bound an unknown full-scale square wave for one second of capture,
+    /// scheduling and playback queue latency. This bound applies even before
+    /// the first sensed frame and tightens the program-based governor when
+    /// the model starts hot. It falls from the thermal equations, not time
+    /// since boot; a hotter checkpoint receives the same protection.
+    fn full_scale_floor(&self) -> Vec<f64> {
+        let ambient = self.cfg.globals.t_ambient;
+        let target = |k: usize| {
+            let s = &self.cfg.speakers[k];
+            s.t_limit - s.t_headroom - self.cfg.globals.t_ctrl_headroom
+        };
+        self.cfg.speakers.iter().enumerate().map(|(k, s)| {
+            let mut allowed = f64::INFINITY;
+            if let Some(a) = self.asahi.as_ref().and_then(|v| v.get(k)) {
+                allowed = allowed.min(a.th.max_power(target(k), 1.0, ambient));
+            }
+            if let Some(u) = self.unified.as_ref().and_then(|v| v.get(k)) {
+                allowed = allowed.min(u.ff.max_power(target(k), 1.0, ambient));
+                if let Some(v) = &u.vi {
+                    allowed = allowed.min(v.max_power(target(k), 1.0, ambient));
+                }
+            }
+            let full = v_worst(s, &self.cfg.globals).powi(2) / s.z_min();
+            if allowed <= 0.0 { NOTHING_DB } else { db(full / allowed).clamp(0.0, NOTHING_DB) }
+        }).collect()
     }
 
     pub fn govern(&mut self, dt: f64, playing: bool) {
@@ -1540,6 +1666,12 @@ impl Engine {
                 *r = hi(*r, g);
             }
             hard |= self.hard(guard);
+        }
+        if self.hot_floor && self.cfg.has_vi() {
+            for (r, floor) in per.iter_mut().zip(self.full_scale_floor()) {
+                *r = hi(*r, floor);
+            }
+            per = link(&self.cfg, &per);
         }
         (per, hard)
     }
@@ -1586,6 +1718,7 @@ impl Engine {
     /// The engine's lines of the state file.
     pub fn encode(&self) -> String {
         let mut o = String::new();
+        if self.hot_floor { o += "hot_floor 1\n"; }
         if let Some(a) = &self.asahi {
             o += "# asahi name t_coil_C t_magnet_C coil_hold_C magnet_hold_C gain_dB hard t_peak_C\n";
             for (s, x) in self.cfg.speakers.iter().zip(a) {
@@ -2872,5 +3005,66 @@ mod tests {
         let r = link(&c, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         assert_eq!(r[idx(&c, "Left Woofer 1")], 6.0);
         assert_eq!(r[idx(&c, "Left Tweeter")], 4.0);
+    }
+
+    #[test]
+    fn cross_os_hot_start_governs_pink_and_max_power_for_120_seconds() {
+        // Full-scale square power dominates every sample of full-scale
+        // pink noise and the max-power sweep. Charge that square at every
+        // 100 ms decision, then independently integrate each actual program
+        // at 1 ms. The governing models must stay under the working limit,
+        // and both lower-power programs therefore stay under the hard limit.
+        for (name, text) in [("M1 Pro", J316), ("M2", J413), ("J616s", J616)] {
+            let mut c = cfg(text);
+            c.globals.governor = Governor::Unified;
+            c.globals.guard = Some(Governor::Asahi);
+            let mut e = Engine::new(&c, true).unwrap();
+            e.assume_external_hot();
+            let mut actual = [0.0, 1.0].map(|_| c.speakers.iter().map(|s| {
+                let (tc, tm) = external_hot_bounds(s, c.globals.t_ambient);
+                (tc, tm)
+            }).collect::<Vec<_>>());
+            let mut first = None;
+            let mut curve = Vec::new();
+            let mut peaks = [(0.0_f64, 0.0_f64); 2];
+            for step in 0..1200 {
+                let t = step as f64 / 10.0;
+                let (db, hard) = e.governed(Governor::Unified);
+                assert!(!hard, "{name} latched at {t:.1} s");
+                assert!(db.iter().all(|r| *r < c.globals.max_reduction - 3.0), "{name} muted at {t:.1} s: {db:?}");
+                if first.is_none() { first = Some(t); }
+                if [0, 10, 50, 300, 600, 1199].contains(&step) {
+                    curve.push((t, db.iter().copied().fold(0.0, f64::max)));
+                }
+                for (k, s) in c.speakers.iter().enumerate() {
+                    let full = v_worst(s, &c.globals).powi(2) / s.z_min();
+                    for ms in 0..100 {
+                        // Deterministic full-scale pink-like envelope, with
+                        // bounded sample power. The sweep reaches full power
+                        // in each 10 s cycle and holds it for the last 2 s.
+                        let pink = 0.15 + 0.85 * ((step * 100 + ms) as f64 * 0.037).sin().powi(2);
+                        let sweep = ((t % 10.0) / 8.0).min(1.0);
+                        for (program, factor) in [pink, sweep].into_iter().enumerate() {
+                            let (ref mut tc, ref mut tm) = actual[program][k];
+                            let p = full * factor * 10f64.powf(-db[k] / 10.0);
+                            let am = 1.0 - (-0.001 / s.vi_tau_magnet).exp();
+                            let ac = 1.0 - (-0.001 / s.vi_tau_coil).exp();
+                            *tm += (c.globals.t_ambient + p * s.vi_tr_magnet - *tm) * am;
+                            *tc += (*tm + p * s.vi_tr_coil - *tc) * ac;
+                            peaks[program].0 = peaks[program].0.max(*tc);
+                            peaks[program].1 = peaks[program].1.max(*tm);
+                            assert!(*tc < s.t_limit - s.t_headroom + 0.2 && *tm < s.t_limit - s.t_headroom + 0.2,
+                                "{name} {} program {program} exceeded working limit at {t:.1} s: {tc:.2}/{tm:.2}", s.name);
+                        }
+                    }
+                }
+                e.worst(0.1, &db);
+                for a in e.asahi.as_ref().unwrap() {
+                    assert!(a.th.t_coil < a.ceiling + 0.2 && a.th.t_magnet < a.ceiling + 0.2,
+                        "{name} governing V/I plant reached {:.2}/{:.2}", a.th.t_coil, a.th.t_magnet);
+                }
+            }
+            eprintln!("{name}: first modeled audio at {:.1} s; attenuation (s,dB): {curve:?}; pink/sweep peak coil/magnet: {peaks:?}", first.unwrap());
+        }
     }
 }

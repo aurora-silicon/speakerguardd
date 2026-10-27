@@ -124,8 +124,8 @@ Known costs of that rule, accepted on purpose:
 Exits are left for what the daemon cannot recover from (no card, a
 configuration error, a nonfinite model, a lock it cannot give up); the
 speakers are then at the card's safe level.  The unit restarts the daemon
-(`Restart=on-failure`, five attempts a minute).  A restart resumes the model
-only from the state a clean stop writes to `/run/speakerguardd/state`
+(`Restart=on-failure`, five attempts a minute).  A restart first uses the model
+from a clean stop in `/run/speakerguardd/state`
 (`-s`): SIGTERM gives the lock up, waits out the 500 ms drain, accounts every
 moment and only then writes it, marked `released 1`, its coverage and its
 write named by one epoch.  It is resumed once: the run that resumes it
@@ -136,12 +136,58 @@ level, and its two budget means are placed at full scale as late in their
 windows as the energy can have come.  The clock reads that pair the boot
 time with the daemon's own clock, at the final save and at the restore, are
 bounded: whatever time lies between them is charged once more at full scale
-and full gain.  Any other state (a crash, an older version's file, a state
-whose model trails its write) or none starts every speaker at its coil limit
-plus what the samples a dead run left queued can add, latched, so the card
-stays with the kernel until the model has cooled under its working ceiling
-(about 7 s on the J700).  A daemon that is late renewing the lock is covered by the kernel's
+and full gain.  On V/I machines, a missing or non-released `/run` state instead
+uses the durable checkpoint described below. With no valid checkpoint the
+V/I models start at the governed cross-OS hot envelope. The
+J700 retains its hot, latched fallback (about 7 s to clear), because its
+20 dB kernel safe level can still heat the coil. A daemon that is late renewing the lock is covered by the kernel's
 250 ms lock timeout, and the late time is charged like any other.
+
+#### Durable boot state on V/I machines
+
+Every 9 s while running, on a requested suspend, and after every clean
+stop, the daemon atomically writes and syncs `/var/lib/speakerguardd/state`.
+The record holds the full model, a UTC `CLOCK_REALTIME` timestamp, boot ID,
+machine ID, parsed configuration fingerprint, RTC reading when present, and
+a checksum. The daemon makes the private directory only after taking the
+card lock. It writes an initial checkpoint before lifting that lock. A clean
+stop also writes `/var/lib/speakerguardd/last-shutdown`; the next start
+consumes it. This marker records Linux's prior stop for diagnosis. Since
+macOS does not have to touch the Linux filesystem, it does not attest that
+Linux was the last speaker owner.
+
+On restore, the coil and magnet evolve toward the configured ambient with
+the same coupled time constants and exact exponential solution used by the
+V/I models. An unclean checkpoint first bounds 11 s of full-gain
+playback at maximum power, covering the maximum 10 s playable checkpoint age
+plus the 250 ms kernel lease and 500 ms playback queue (including any earlier peak), then cools by
+elapsed time beyond the charged
+window. With no trustworthy elapsed time it charges the full 11 s and
+credits no cooling. A failed periodic write
+exits the daemon, allowing the card's lock to expire. A clean-stop checkpoint
+does not need the missing-playback charge. Within one boot, cooling credit
+is the smaller of positive `CLOCK_REALTIME` and `CLOCK_BOOTTIME` deltas.
+Across boots, neither RTC nor realtime proves a lower bound on off time.
+A clean checkpoint matching the last Linux shutdown marker can be resumed
+within 90 s of positive wall-clock time, with **zero cooling credit**. This
+preserves the interim Linux-to-Linux fast restart behavior. All other
+cross-boot checkpoints are rejected and use the hot envelope. The marker
+is an operational fast-restart signal, not proof that another OS could not
+have played during that short gap.
+
+The daemon refuses to renew the card's lease once the last successful
+snapshot is 10 s old. The kernel returns to its safe level within 250 ms
+if it stalls or dies; the queue drains within 500 ms. The 11 s charge
+covers those intervals with 250 ms margin. With no trusted same-boot state,
+the V/I models start at the hotter of their feed-forward and measured-power
+plants after 30 s of zero-power cooling from 150 °C at both nodes, plus 1 °C.
+This is the configured cross-OS design envelope for these host models.
+Before every handover and renewal, the governor also bounds a full-scale
+square wave over the next second against each plant's working limit. It
+starts at deep attenuation and releases gain as the model cools. A model at
+or above the hard limit, invalid profile, or failed model check still hands
+the card to the kernel. These are host-model claims for the stated cross-OS
+envelope; device qualification and audio timing remain hardware gates.
 
 ### Machines with current and voltage sense
 
@@ -194,14 +240,11 @@ hysteresis.  It differs only toward protection:
   at once (which mutes these amplifiers), and two good periods in a row are
   needed to take the lock back.  The wait for them survives a clean stop
   and restart.
-* The governor's state (temperatures, holds, gain, latch) is saved with the
-  rest of the model and resumed only from a clean stop.  A missing state,
-  or a run of speakersafetyd since boot (its flag file under /run), starts
-  every model latched, not at speakersafetyd's 119 C: coil and magnet at
-  the hard limit with the half second of drain at full scale held on top.
-  On these speakers that keeps the card at its safe level for about a
-  minute after every boot (58 s on the J413, 84 s on the J316), mostly the
-  time their magnets take to cool from the limit.
+* The governor's state (temperatures, holds, gain, latch) is included in
+  the durable checkpoint. A missing or corrupt state starts all models at
+  the hot envelope. A run of speakersafetyd since boot (its flag under `/run`) still
+  latches every model, since it may have driven the speakers after this
+  daemon's last checkpoint.
 * A current line that reads far too little for its voltage (a dead or
   switched-off line, where speakersafetyd sees no power at all) is lost
   for the period.  That is a 10 ms block with at least 0.1 V rms whose
@@ -407,13 +450,16 @@ The binary talks to the ALSA kernel interface directly (no alsa-lib).
 
     make install
 
-installs the binary, `conf/apple/*.conf`, the systemd unit and the udev
-rule that starts it when a supported card's sense PCM appears.
+installs the binary, `conf/apple/*.conf`, the systemd unit, the suspend
+checkpoint hook and the udev rule that starts it when a supported card's
+sense PCM appears.
 
 Keep the unit's `RuntimeDirectory=speakerguardd` and
 `RuntimeDirectoryPreserve=yes` when packaging: they give the daemon
 `/run/speakerguardd` for its model state and keep it across restarts.  A unit
-without them leaves the state unwritten, and every restart starts cold.
+without them leaves the `/run` status unwritten. On V/I machines the daemon
+also needs a writable `/var/lib/speakerguardd` for durable checkpoints; it
+refuses to lift the card lock if its initial checkpoint cannot be written.
 
 The PCM udev event and `multi-user.target` can both precede ALSA card
 discovery. The daemon retries a missing card for up to 30 seconds, using a
@@ -450,7 +496,8 @@ it never plays audio or performs a reboot.
 `-C <card id>` selects a card (by default the one the macaudio driver
 registered, never the AOP card that shares its `AppleJ` prefix), `-m <dB>`
 the reduction at which the card's safe level takes over, `-s <file>` the
-model state file (`-s ''` for none).  `--governor legacy|asahi|unified`
+model status file (`-s ''` for none); `--persist <file>` selects the durable
+checkpoint (`--persist ''` disables it). `--governor legacy|asahi|unified`
 overrides the configuration's governor, `--guard asahi|none` its guard, and
 `-m` defaults to its `max_reduction`; `--shadow` turns the shadow log on,
 and `--experimental-unified` and `--allow-unqualified` are the two opt-ins

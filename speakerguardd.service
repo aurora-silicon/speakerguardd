@@ -2,9 +2,12 @@
 Description=Speaker Protection Daemon (feed-forward)
 # Restarts are safe: until the daemon renews the card's volume lock the
 # speakers sit at the card's safe level.  A restarted daemon resumes the
-# thermal model from /run/speakerguardd/state only after a clean stop, and
-# otherwise starts it at the coils' limit.  A crash loop gives up after five
-# attempts and leaves the speakers at that level.
+# thermal model from /run/speakerguardd/state after a clean stop or the
+# durable checkpoint in /var/lib/speakerguardd/state within this boot. With
+# no provably current state the V/I models start at the cross-OS hot envelope,
+# with full-scale program power bounded by the governor before unlock.
+# A crash loop gives up after five tries;
+# the card then holds its safe level.
 # One daemon owns the speaker sense PCM and the volume interlock: whichever
 # takes it first protects the speakers, and the other cannot start.  This
 # unit never stops another protection daemon (speakersafetyd on the
@@ -21,6 +24,8 @@ Type=simple
 # Wait inside the daemon before touching the interlock; the kernel keeps
 # the speakers at its safe level until the daemon takes the volume lock.
 ExecStart=/usr/bin/speakerguardd -c /usr/share/speakerguardd --wait-for-card 30
+# This unit never prunes recordings. Replace a local destructive ExecStartPre
+# with the packaged preservation helper; see docs/recording-retention.md.
 UMask=0066
 RuntimeDirectory=speakerguardd
 RuntimeDirectoryPreserve=yes

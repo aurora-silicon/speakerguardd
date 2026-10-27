@@ -1,0 +1,50 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Run only after the recording owner has stopped, e.g. as ExecStartPre.
+# No deletion, wildcard expansion, or overwrite of an earlier archive.
+set -eu
+umask 077
+if [ "$#" -ne 1 ]; then
+    echo 'usage: preserve-recordings /absolute/recording-path' >&2
+    exit 64
+fi
+path=$1
+case "$path" in /*) ;; *) echo 'recording path must be absolute' >&2; exit 64 ;; esac
+lock="${path}.preserve-lock"
+if ! mkdir -- "$lock"; then
+    echo "recording preservation refused: lock exists or cannot be created: $lock" >&2
+    exit 1
+fi
+finish() {
+    result=$?
+    rmdir -- "$lock" || true
+    if [ "$result" -ne 0 ]; then
+        echo 'recording preservation failed; retained files must be inspected before restart' >&2
+    fi
+    exit "$result"
+}
+trap finish EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+found=false
+for file in "$path" "${path}.previous" "${path}.next"; do
+    if [ -e "$file" ] || [ -L "$file" ]; then
+        if [ ! -f "$file" ] || [ -L "$file" ]; then
+            echo "refusing non-regular recording: $file" >&2
+            exit 1
+        fi
+        found=true
+    fi
+done
+if [ "$found" = false ]; then
+    echo 'recording preservation: no prior recording segments' >&2
+    exit 0
+fi
+saved=$(mktemp -d -- "${path}.saved.XXXXXXXXXX")
+for file in "$path" "${path}.previous" "${path}.next"; do
+    if [ -e "$file" ]; then
+        mv -- "$file" "$saved/"
+        echo "recording evidence kept: $saved/$(basename -- "$file")" >&2
+    fi
+done

@@ -1,0 +1,51 @@
+name: Thermal checkpoint tests
+on:
+  pull_request:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked --release checkpoint
+      - run: cargo test --locked --release durable_boot_tests
+      - run: cargo test --locked --release
+      - run: cargo test --locked --release cross_os_hot_start_governs_pink_and_max_power_for_120_seconds -- --nocapture
+      - run: cargo test --locked --release cold_cross_os_boot_takes_the_governed_lock_within_one_second -- --nocapture
+  rpm:
+    runs-on: ubuntu-24.04-arm
+    container: fedora:${{ matrix.fedora }}
+    strategy:
+      fail-fast: false
+      matrix:
+        fedora: [44, 45]
+    steps:
+      - name: Install build tools
+        run: dnf install -y git cargo rust rpm-build systemd-rpm-macros
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Build and test RPM
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          sha=$(git rev-parse HEAD)
+          sources="$GITHUB_WORKSPACE/rpmbuild/SOURCES"
+          mkdir -p "$sources" "$GITHUB_WORKSPACE/rpmbuild/RPMS"
+          git archive --format=tar --prefix="speakerguardd-$sha/" HEAD | gzip -n > "$sources/speakerguardd-$sha.tar.gz"
+          cargo vendor --locked vendor > vendor-config.toml
+          tar -czf "$sources/speakerguardd-vendor-$sha.tar.gz" vendor
+          cp packaging/use-feedback-guard packaging/50-j700-guard.conf "$sources/"
+          rpmbuild -ba packaging/speakerguardd.spec --define "commit $sha" --define "_topdir $GITHUB_WORKSPACE/rpmbuild"
+          find "$GITHUB_WORKSPACE/rpmbuild/RPMS" -name '*.rpm' -exec sha256sum {} \; > "$GITHUB_WORKSPACE/rpmbuild/SHA256SUMS"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: speakerguardd-fc${{ matrix.fedora }}-aarch64
+          path: |
+            rpmbuild/RPMS/**/*.rpm
+            rpmbuild/SRPMS/*.rpm
+            rpmbuild/SHA256SUMS

@@ -314,6 +314,20 @@ impl SpeakerState {
         self.history_s = 60.0;
     }
 
+    /// Zero-power evolution of the coupled coil and magnet, using the
+    /// same exact exponential plant as the V/I governors.
+    pub fn cool_exact(&mut self, elapsed: f64, ambient: f64) {
+        let s = &self.spec;
+        let mut th = crate::engine::Thermal::new(s.tr_coil, s.tau_coil, s.tr_magnet, s.tau_magnet, self.t_coil);
+        th.t_magnet = self.t_magnet;
+        th.hold(0.0, elapsed, ambient);
+        self.t_coil = th.t_coil;
+        self.t_magnet = th.t_magnet;
+        self.t_peak = self.t_coil.max(self.t_magnet);
+        self.record_pre(0.0, elapsed);
+        self.clear_hard_if_cool();
+    }
+
     /// The steady state at `power` watts, as if it had run for ever; the
     /// budgets see it as a minute at `pre` watts before the gain.
     pub fn settle_at(&mut self, power: f64, pre: f64, t_ambient: f64) {

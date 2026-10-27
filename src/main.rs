@@ -14,6 +14,7 @@
 //! its safe volume, and the daemon takes the lock back once it can.
 
 mod alsa;
+mod checkpoint;
 mod config;
 mod engine;
 mod guard;
@@ -70,6 +71,7 @@ struct Args {
     card: Option<String>,
     card_wait: Duration,
     state: Option<PathBuf>,
+    persist: Option<PathBuf>,
     verbosity: Level,
     shadow: bool,
     governor: Option<Governor>,
@@ -97,6 +99,7 @@ fn usage() -> ! {
          --wait-for-card <SECONDS>       Wait for card discovery before failing (default 30; 0 disables waiting)\n  \
          -m, --max-reduction <DB>        Gain reduction beyond which the card's safe level takes over (default: the config's, else 20)\n  \
          -s, --state <FILE>              Model state kept across restarts (default /run/speakerguardd/state)\n  \
+         --persist <FILE>                Durable thermal state (default /var/lib/speakerguardd/state; empty disables)\n  \
          --governor <NAME>               legacy, asahi or unified (default: the config's, else legacy)\n  \
          --guard <NAME>                  asahi: the unified governor's card also gets the asahi governor's reductions (default: the config's, else none)\n  \
          --shadow                        Run every governor and log them to shadow.jsonl next to the state\n  \
@@ -125,6 +128,7 @@ fn parse_args() -> Args {
         card: None,
         card_wait: Duration::from_secs(30),
         state: Some(PathBuf::from("/run/speakerguardd/state")),
+        persist: Some(PathBuf::from("/var/lib/speakerguardd/state")),
         verbosity: Level::Info,
         shadow: false,
         governor: None,
@@ -150,6 +154,10 @@ fn parse_args() -> Args {
             "-s" | "--state" => {
                 let v = it.next().unwrap_or_else(|| usage());
                 args.state = if v.is_empty() { None } else { Some(PathBuf::from(v)) };
+            }
+            "--persist" => {
+                let v = it.next().unwrap_or_else(|| usage());
+                args.persist = if v.is_empty() { None } else { Some(PathBuf::from(v)) };
             }
             "-m" | "--max-reduction" => {
                 args.max_reduction = Some(it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage()));
@@ -471,6 +479,17 @@ impl Hw for RealHw {
     fn events_available(&self) -> bool {
         self.card.events
     }
+    fn clock(&self) -> checkpoint::Clock {
+        let realtime = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok();
+        let rtc = std::fs::read_to_string("/sys/class/rtc/rtc0/since_epoch").ok()
+            .and_then(|s| s.trim().parse::<u64>().ok()).filter(|&s| s > 0).map(Duration::from_secs);
+        let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()
+            .map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        checkpoint::Clock { realtime, rtc, boot_id, boottime: self.boottime() }
+    }
+    fn machine_id(&self) -> Option<String> {
+        std::fs::read_to_string("/etc/machine-id").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    }
     fn queued(&mut self) -> std::io::Result<u64> {
         match self.capture.as_mut() {
             Some(c) => c.queued(),
@@ -481,6 +500,7 @@ impl Hw for RealHw {
 
 /// Set by SIGTERM/SIGINT: hand the card back and exit.
 static STOP: AtomicBool = AtomicBool::new(false);
+static SNAPSHOT: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn on_stop(_: libc::c_int) {
     STOP.store(true, Ordering::Relaxed);
@@ -491,6 +511,13 @@ fn catch_stop_signals() {
         // SAFETY: the handler only stores to an atomic.
         unsafe { libc::signal(sig, on_stop as *const () as libc::sighandler_t) };
     }
+    // A system-sleep hook requests a durable checkpoint without stopping
+    // ownership of the card.
+    unsafe { libc::signal(libc::SIGUSR1, on_snapshot as *const () as libc::sighandler_t) };
+}
+
+extern "C" fn on_snapshot(_: libc::c_int) {
+    SNAPSHOT.store(true, Ordering::Relaxed);
 }
 
 fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
@@ -518,7 +545,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let mut hw = RealHw { card, globals: cfg.globals.clone(), capture: None };
     catch_stop_signals();
     let max_reduction = args.max_reduction.unwrap_or(cfg.globals.max_reduction);
-    let mut guard = Guard::start(&mut hw, &cfg, max_reduction, args.state.clone())?;
+    let mut guard = Guard::start_persist(&mut hw, &cfg, max_reduction, args.state.clone(), args.persist.clone())?;
     if let Some(path) = &args.record {
         let max = args.record_max_mb.saturating_mul(1 << 20);
         guard.attach_recorder(&hw, record::Recorder::create(path, &cfg, hw.card.events, max)?);
@@ -527,6 +554,9 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     info!("{card_name}: {} volume control(s) and the unlock control locked", hw.card.volume.len());
     let mut stopping = false;
     loop {
+        if SNAPSHOT.swap(false, Ordering::Relaxed) {
+            guard.suspend_checkpoint(&hw)?;
+        }
         if STOP.load(Ordering::Relaxed) && !stopping {
             if let Err(e) = guard.stop(&mut hw) {
                 // not a clean stop: the state stays a status readout and the
@@ -635,6 +665,7 @@ mod tests {
             card: None,
             card_wait: Duration::ZERO,
             state: None,
+            persist: None,
             verbosity: Level::Info,
             shadow: false,
             governor: None,

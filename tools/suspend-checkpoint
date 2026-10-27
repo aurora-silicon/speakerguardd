@@ -1,0 +1,17 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# systemd-sleep invokes this before suspend; wait for the daemon's atomic
+# replacement so the state is on disk before the machine sleeps.
+[ "$1" = pre ] || exit 0
+systemctl is-active --quiet speakerguardd.service || exit 0
+path=/var/lib/speakerguardd/state
+before=$(stat -c %y "$path" 2>/dev/null || :)
+systemctl kill --signal=SIGUSR1 --kill-whom=main speakerguardd.service || exit 1
+i=0
+while [ "$i" -lt 40 ]; do
+    after=$(stat -c %y "$path" 2>/dev/null || :)
+    [ -n "$after" ] && [ "$after" != "$before" ] && exit 0
+    sleep 0.05
+    i=$((i + 1))
+done
+exit 1
