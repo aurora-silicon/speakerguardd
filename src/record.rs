@@ -150,6 +150,8 @@ impl Write for AsyncWriter {
 
 impl Recorder {
     pub fn create(path: &Path, cfg: &Config, events: bool, max_bytes: u64) -> io::Result<Recorder> {
+        // Failed preservation must not truncate an active file or pair a new
+        // run with an old sidecar.
         let segment = (max_bytes / 2).max(1);
         refuse_stale_sidecars(path)?;
         let mut rec = Recorder::to_mode(Box::new(BufWriter::new(File::options().write(true).create_new(true).open(path)?)), cfg, events, segment, true)?;
@@ -1649,6 +1651,34 @@ mod tests {
 
     fn complete_test_recorder(path: &Path, cfg: &Config, events: bool, max: u64) -> Recorder {
         Recorder::to(Box::new(BufWriter::new(File::create(path).unwrap())), cfg, events, max).unwrap()
+    }
+
+    #[test]
+    fn failed_preservation_cannot_truncate_or_pair_recordings() {
+        fn async_writer_refuses(path: &Path, cfg: &Config) {
+            let mut rec = Recorder::create_async(path, cfg, true, 1 << 20).unwrap();
+            let start = Instant::now();
+            loop {
+                match rec.out.write_all(b"probe") {
+                    Err(e) if e.kind() == io::ErrorKind::BrokenPipe => break,
+                    _ if start.elapsed() < Duration::from_secs(1) => std::thread::yield_now(),
+                    other => panic!("async writer did not reject stale evidence: {other:?}"),
+                }
+            }
+        }
+        let cfg = j700();
+        let path = tmp("restart.rec");
+        std::fs::write(&path, b"active evidence").unwrap();
+        assert!(Recorder::create(&path, &cfg, true, 1 << 20).is_err());
+        async_writer_refuses(&path, &cfg);
+        assert_eq!(std::fs::read(&path).unwrap(), b"active evidence");
+        std::fs::remove_file(&path).unwrap();
+        let previous = path.with_file_name("restart.rec.previous");
+        std::fs::write(&previous, b"old run").unwrap();
+        assert!(Recorder::create(&path, &cfg, true, 1 << 20).is_err());
+        async_writer_refuses(&path, &cfg);
+        assert!(!path.exists());
+        assert_eq!(std::fs::read(&previous).unwrap(), b"old run");
     }
 
     /// Record a live run of the guard on the fake card into `path`.
