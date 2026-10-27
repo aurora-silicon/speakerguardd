@@ -121,7 +121,18 @@ pub struct Recorder {
 
 impl Recorder {
     pub fn create(path: &Path, cfg: &Config, events: bool, max_bytes: u64) -> io::Result<Recorder> {
-        Recorder::to(Box::new(BufWriter::new(File::create(path)?)), cfg, events, max_bytes)
+        // A failed restart preservation must never truncate its evidence or
+        // pair a new run with old rolling segments.
+        for suffix in [".previous", ".next"] {
+            let mut name = path.as_os_str().to_os_string();
+            name.push(suffix);
+            match std::fs::symlink_metadata(std::path::PathBuf::from(name)) {
+                Ok(_) => return Err(io::Error::new(io::ErrorKind::AlreadyExists, "stale recording sidecar")),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {},
+                Err(e) => return Err(e),
+            }
+        }
+        Recorder::to(Box::new(BufWriter::new(File::options().write(true).create_new(true).open(path)?)), cfg, events, max_bytes)
     }
 
     pub fn to(mut out: Box<dyn Write>, cfg: &Config, events: bool, max_bytes: u64) -> io::Result<Recorder> {
@@ -1461,6 +1472,21 @@ mod tests {
     fn tmp(name: &str) -> PathBuf {
         let p = tmp_state().unwrap();
         p.with_file_name(name)
+    }
+
+    #[test]
+    fn failed_preservation_cannot_truncate_or_pair_recordings() {
+        let cfg = j700();
+        let path = tmp("restart.rec");
+        std::fs::write(&path, b"active evidence").unwrap();
+        assert!(Recorder::create(&path, &cfg, true, 1 << 20).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"active evidence");
+        std::fs::remove_file(&path).unwrap();
+        let previous = path.with_file_name("restart.rec.previous");
+        std::fs::write(&previous, b"old run").unwrap();
+        assert!(Recorder::create(&path, &cfg, true, 1 << 20).is_err());
+        assert!(!path.exists());
+        assert_eq!(std::fs::read(&previous).unwrap(), b"old run");
     }
 
     /// Record a live run of the guard on the fake card into `path`.
