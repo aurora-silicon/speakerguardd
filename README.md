@@ -582,8 +582,31 @@ whenever the lock was not held throughout), the frames read at each close,
 every lost or unusable period, failed control writes, the lock taken and
 handed back with the reason, the governing latch, every span of its account
 (measured, charged or cooled), each look at closed speakers that charged
-with the change events it saw, and the model the guard started from.  It stops at `--record-max-mb` (512 by default) and says so in
-the file.
+with the change events it saw, and the model the guard started from.
+
+`--record-max-mb` (512 by default, MiB) is a rolling budget: the active
+`FILE` and `FILE.previous` each target half that size. At a limit, the
+recorder finishes the current guard tick, closes that segment with an early-end
+marker, replaces `FILE.previous`, and starts a new `FILE`. Every rotation logs
+a warning. Protection keeps running. Records are never split: each segment may
+exceed its target by its start state and one tick's records (including a
+bounded close drain). A temporary `FILE.next` also exists while rotating.
+These three sidecar names are reserved for the recorder; do not use them for
+other files. This budget does not include evidence archived outside the ring.
+
+A new segment includes a fresh model snapshot and an explicit rotation-loss
+record. It keeps recent electrical evidence, but does not retain the preceding
+capture backlog, interlock or decision context. Replay refuses to certify
+rotated segments; they are diagnostic windows, not complete live-run replays.
+Save both segments outside the ring before they are replaced if a full run is
+needed. Existing tools that watch one inode must stop and re-admit on rotation.
+A stale `.next` or `.previous` at startup is preserved; recording is declined
+with a warning rather than pairing two runs. The live recorder hands complete
+records to a bounded writer queue. A full queue or writer failure drops
+recording; filesystem calls never run in the governing tick. The writer logs
+open, write and rotation errors. Ring files without an early-end marker are
+unsealed and replay refuses to certify them, including after a failed
+rotation or crash. Protection continues throughout.
 
 `--replay FILE --model NAME` runs the guard itself on the recording,
 offline: the speakers open and close where they did, the periods arrive
