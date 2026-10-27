@@ -559,9 +559,18 @@ fn a_failed_legacy_write_keeps_the_card_wide_ceiling_as_a_candidate() {
 /// Keep this gate strict while the playback-energy contract is unresolved.
 #[test]
 fn ordinary_quiet_programme_costs_at_most_one_db() {
+    quiet_programme_costs(&[("j316", 1.0), ("j413", 1.0)]);
+}
+
+#[test]
+fn j616_ordinary_quiet_programme_has_zero_extra_attenuation() {
+    quiet_programme_costs(&[("j616", 0.0)]);
+}
+
+fn quiet_programme_costs(profiles: &[(&str, f64)]) {
     crate::log::set_verbosity(crate::log::Level::Error);
     let mut failures = Vec::new();
-    for name in ["j316", "j413"] {
+    for &(name, budget) in profiles {
         let text = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join(format!("conf/apple/{name}.conf")),
@@ -618,11 +627,12 @@ fn ordinary_quiet_programme_costs_at_most_one_db() {
             for ((speaker, total),digital) in cfg.speakers.iter().zip(totals).zip(digital_totals) {
                 let loss = (total+digital) / active_s;
                 eprintln!("LISTENING_COST {name} {point}% {} extra_db={loss:.6} control_db={:.6} kernel_db={:.6}", speaker.name,total/active_s,digital/active_s);
-                if !loss.is_finite() || loss > 1.0 + 1e-6 {
-                    failures.push(format!("{name} {point}% {}: {loss:.3} dB", speaker.name));
+                let exceeds = if budget == 0.0 { loss != 0.0 } else { loss > budget + 1e-6 };
+                if !loss.is_finite() || exceeds {
+                    failures.push(format!("{name} {point}% {}: {loss:.3} dB (budget {budget} dB)", speaker.name));
                 }
             }
         }
     }
-    assert!(failures.is_empty(), "ordinary listening exceeds 1 dB: {}", failures.join("; "));
+    assert!(failures.is_empty(), "ordinary listening exceeds its per-device budget: {}", failures.join("; "));
 }
