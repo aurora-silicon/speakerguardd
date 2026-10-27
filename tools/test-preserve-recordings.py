@@ -30,14 +30,14 @@ class Retention(unittest.TestCase):
         for run in range(4):
             for suffix in ['', '.previous', '.next']:
                 Path(str(self.path) + suffix).write_bytes(f'{run}:{suffix}'.encode())
-            result = self.run_helper(25)
+            result = self.run_helper(40)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stderr.count('recording evidence kept:'), 3)
         archives = list(self.root.glob(self.path.name + '.saved.*'))
-        self.assertEqual(len(archives), 1)
+        self.assertEqual(len(archives), 2)
         self.assertTrue(all((p.stat().st_mode & 0o777) == 0o700 for p in archives))
         self.assertEqual({f.read_bytes() for p in archives for f in p.iterdir()},
-                         {f'3:{suffix}'.encode() for suffix in ['', '.previous', '.next']})
+                         {f'{run}:{suffix}'.encode() for run in (2, 3) for suffix in ['', '.previous', '.next']})
         self.assertEqual(historical.read_bytes(), b'old evidence')
     def test_empty_and_missing_files(self):
         self.assertEqual(self.run_helper().returncode, 0)
