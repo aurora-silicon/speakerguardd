@@ -1943,6 +1943,7 @@ mod tests {
         let (tx, _stalled_reader) = mpsc::sync_channel(1);
         let rec = Recorder::to_mode(Box::new(AsyncWriter(tx)), &cfg, hw.events, 1 << 20, true).unwrap();
         let mut g = Guard::start(&mut hw, &cfg, 20.0, tmp_state()).unwrap();
+        g.start_trace(&hw);
         let begun = Instant::now();
         g.attach_recorder(&hw, rec);
         run_until(&mut g, &mut hw, secs(3.0)).unwrap();
@@ -1950,8 +1951,10 @@ mod tests {
         assert!(begun.elapsed() < Duration::from_secs(1), "a full writer queue delayed protection");
         let mut control = FakeHw::new(cfg.globals.channels, cfg.globals.period);
         let mut baseline = Guard::start(&mut control, &cfg, 20.0, tmp_state()).unwrap();
+        baseline.start_trace(&control);
         run_until(&mut baseline, &mut control, secs(3.0)).unwrap();
-        assert_eq!(g.armed(), baseline.armed());
+        assert_eq!(g.trace, baseline.trace);
+        assert_eq!(hw.writes, control.writes);
     }
 
     #[test]
