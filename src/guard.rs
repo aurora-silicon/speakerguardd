@@ -389,9 +389,9 @@ fn rec_now<H: Hw>(rec: &mut Option<Recorder>, hw: &H, f: impl FnOnce(&mut Record
     }
 }
 
-/// One record, or the recording stops (a write failure, its size limit).
-/// Recording never decides anything: a blocked write only delays the loop,
-/// which the account charges like any other lateness.
+/// One record, or recording stops on failure (or a non-file writer's limit).
+/// The live file recorder uses a bounded nonblocking queue; storage stalls
+/// drop evidence without delaying a governing tick.
 fn rec_do(rec: &mut Option<Recorder>, t: Duration, f: impl FnOnce(&mut Recorder, u64) -> io::Result<()>) {
     let Some(r) = rec.as_mut() else { return };
     let ns = t.as_nanos() as u64;
@@ -1640,6 +1640,18 @@ impl Guard {
 
     /// One pass of the loop: idle accounting, or one sense period.
     pub fn tick<H: Hw>(&mut self, hw: &mut H) -> Result<(), Box<dyn Error>> {
+        if self.rec.as_ref().is_some_and(Recorder::needs_rotation) {
+            let boot = hw.boottime();
+            let text = state::encode_with(boot, boot, &self.speakers, self.engine.as_ref(), false, true);
+            let result = self.rec.as_mut().unwrap().rotate(boot.as_nanos() as u64,
+                self.governing, self.globals.guard, self.max_reduction, &text);
+            if let Err(e) = result {
+                warn!("recording rotation failed: {e}; recording stopped; protection continues");
+                self.rec = None;
+            } else {
+                self.rec_rate = None;
+            }
+        }
         self.refresh_playback(hw)?;
         let globals = self.globals.clone();
         // before the rate read: a stream it shows was there by then, and the
