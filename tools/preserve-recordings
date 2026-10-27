@@ -1,50 +1,96 @@
-#!/bin/sh
+#!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-# Run only after the recording owner has stopped, e.g. as ExecStartPre.
-# No deletion, wildcard expansion, or overwrite of an earlier archive.
-set -eu
-umask 077
-if [ "$#" -ne 1 ]; then
-    echo 'usage: preserve-recordings /absolute/recording-path' >&2
-    exit 64
-fi
-path=$1
-case "$path" in /*) ;; *) echo 'recording path must be absolute' >&2; exit 64 ;; esac
-lock="${path}.preserve-lock"
-if ! mkdir -- "$lock"; then
-    echo "recording preservation refused: lock exists or cannot be created: $lock" >&2
-    exit 1
-fi
-finish() {
-    result=$?
-    rmdir -- "$lock" || true
-    if [ "$result" -ne 0 ]; then
-        echo 'recording preservation failed; retained files must be inspected before restart' >&2
-    fi
-    exit "$result"
-}
-trap finish EXIT
-trap 'exit 129' HUP
-trap 'exit 130' INT
-trap 'exit 143' TERM
-found=false
-for file in "$path" "${path}.previous" "${path}.next"; do
-    if [ -e "$file" ] || [ -L "$file" ]; then
-        if [ ! -f "$file" ] || [ -L "$file" ]; then
-            echo "refusing non-regular recording: $file" >&2
-            exit 1
-        fi
-        found=true
-    fi
-done
-if [ "$found" = false ]; then
-    echo 'recording preservation: no prior recording segments' >&2
-    exit 0
-fi
-saved=$(mktemp -d -- "${path}.saved.XXXXXXXXXX")
-for file in "$path" "${path}.previous" "${path}.next"; do
-    if [ -e "$file" ]; then
-        mv -- "$file" "$saved/"
-        echo "recording evidence kept: $saved/$(basename -- "$file")" >&2
-    fi
-done
+"""Preserve stopped recording segments within a bounded archive budget."""
+import os
+from pathlib import Path
+import re
+import shutil
+import stat
+import sys
+import tempfile
+
+DEFAULT_BUDGET = 4 * 1024 ** 3
+
+
+def fail(message):
+    print(f"recording preservation failed: {message}; protection must start without overwriting evidence", file=sys.stderr)
+    return 1
+
+
+def bytes_in(directory):
+    allowed = {directory.name.split('.saved.')[0] + suffix for suffix in ('', '.previous', '.next')}
+    total = 0
+    for p in directory.iterdir():
+        if p.name not in allowed or not stat.S_ISREG(p.lstat().st_mode):
+            raise OSError(f"unrecognized archive content: {p}")
+        total += p.stat().st_size
+    return total
+
+
+def main():
+    if len(sys.argv) != 2 or not Path(sys.argv[1]).is_absolute():
+        return fail("usage: preserve-recordings /absolute/recording-path")
+    path = Path(sys.argv[1])
+    try:
+        budget = int(os.environ.get("SG_RECORD_ARCHIVE_MAX_BYTES", DEFAULT_BUDGET))
+        if budget <= 0:
+            return fail("archive budget must be positive")
+        lock = Path(str(path) + ".preserve-lock")
+        lock.mkdir(mode=0o700)
+    except (OSError, ValueError) as e:
+        return fail(str(e))
+    try:
+        sources = [Path(str(path) + suffix) for suffix in ("", ".previous", ".next")]
+        present = []
+        for source in sources:
+            try:
+                mode = source.lstat().st_mode
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISREG(mode):
+                return fail(f"refusing non-regular recording: {source}")
+            present.append(source)
+        if not present:
+            print("recording preservation: no prior recording segments", file=sys.stderr)
+        else:
+            incoming = sum(p.stat().st_size for p in present)
+            if incoming > budget:
+                return fail("current evidence exceeds archive budget; retained in place")
+            saved = Path(tempfile.mkdtemp(prefix=path.name + ".saved.", dir=path.parent))
+            marker = saved / ".incomplete"
+            marker.touch(exist_ok=False)
+            for source in present:
+                os.replace(source, saved / source.name)
+                print(f"recording evidence kept: {saved / source.name}", file=sys.stderr)
+            marker.unlink()
+        archives = []
+        for candidate in path.parent.glob(path.name + ".saved.*"):
+            if not re.fullmatch(re.escape(path.name) + r"\.saved\.[A-Za-z0-9_]{8,10}", candidate.name):
+                continue
+            if candidate.is_symlink() or not candidate.is_dir():
+                continue
+            archives.append((candidate.stat().st_mtime_ns, candidate.name, candidate))
+        archives.sort()
+        total = sum(bytes_in(item[2]) for item in archives)
+        newest = archives[-1][2] if archives else None
+        for _, _, old in archives:
+            if total <= budget:
+                break
+            if old == newest:
+                return fail("newest archive alone exceeds disk budget")
+            size = bytes_in(old)
+            shutil.rmtree(old)
+            total -= size
+            print(f"recording archive budget: removed oldest {old}", file=sys.stderr)
+        return 0
+    except OSError as e:
+        return fail(str(e))
+    finally:
+        try:
+            lock.rmdir()
+        except OSError as e:
+            print(f"recording preservation lock cleanup failed: {e}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
