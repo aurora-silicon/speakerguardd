@@ -600,9 +600,13 @@ capture backlog, interlock or decision context. Replay refuses to certify
 rotated segments; they are diagnostic windows, not complete live-run replays.
 Save both segments outside the ring before they are replaced if a full run is
 needed. Existing tools that watch one inode must stop and re-admit on rotation.
-A stale `.next` is preserved and stops recording with a warning rather than
-being overwritten. Any rotation/write failure stops recording only; protection
-continues and its normal accounting covers delays caused by recording I/O.
+A stale `.next` or `.previous` at startup is preserved; recording is declined
+with a warning rather than pairing two runs. The live recorder hands complete
+records to a bounded writer queue. A full queue or writer failure drops
+recording; filesystem calls never run in the governing tick. The writer logs
+open, write and rotation errors. Ring files without an early-end marker are
+unsealed and replay refuses to certify them, including after a failed
+rotation or crash. Protection continues throughout.
 
 `--replay FILE --model NAME` runs the guard itself on the recording,
 offline: the speakers open and close where they did, the periods arrive

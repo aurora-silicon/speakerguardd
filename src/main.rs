@@ -617,8 +617,13 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let mut guard = Guard::start_persist(&mut hw, &cfg, max_reduction, args.state.clone(), args.persist.clone())?;
     if let Some(path) = &args.record {
         let max = args.record_max_mb.saturating_mul(1 << 20);
-        guard.attach_recorder(&hw, record::Recorder::create(path, &cfg, hw.card.events, max)?);
-        info!("recording to {}", path.display());
+        match record::Recorder::create_async(path, &cfg, hw.card.events, max) {
+            Ok(rec) => {
+                guard.attach_recorder(&hw, rec);
+                info!("recording to {}", path.display());
+            }
+            Err(e) => warn!("recording disabled: {e}; protection continues"),
+        }
     }
     info!("{card_name}: {} volume control(s) and the unlock control locked", hw.card.volume.len());
     let mut stopping = false;
