@@ -85,6 +85,8 @@ pub const LOSS_SHORT: u8 = 1;
 pub const LOSS_STALL: u8 = 2;
 pub const LOSS_CAPTURE: u8 = 3;
 pub const LOSS_POSITION: u8 = 4;
+/// A rolling segment starts without the preceding capture/decision context.
+pub const LOSS_ROTATION: u8 = 5;
 /// Control failure kinds (`X`).
 pub const FAIL_MIN: u8 = 1;
 pub const FAIL_TARGET: u8 = 2;
@@ -122,26 +124,31 @@ pub struct Recorder {
     out: Box<dyn Write>,
     s16: bool,
     left: u64,
+    ring: Option<(PathBuf, u64)>,
+    header: Vec<u8>,
 }
 
 impl Recorder {
     pub fn create(path: &Path, cfg: &Config, events: bool, max_bytes: u64) -> io::Result<Recorder> {
-        Recorder::to(Box::new(BufWriter::new(File::create(path)?)), cfg, events, max_bytes)
+        let segment = (max_bytes / 2).max(1);
+        let mut rec = Recorder::to(Box::new(BufWriter::new(File::create(path)?)), cfg, events, segment)?;
+        rec.ring = Some((path.to_path_buf(), segment));
+        Ok(rec)
     }
 
     pub fn to(mut out: Box<dyn Write>, cfg: &Config, events: bool, max_bytes: u64) -> io::Result<Recorder> {
         let s16 = cfg.globals.sense_format == SenseFormat::S16;
-        writeln!(
-            out,
-            "{MAGIC} channels={} period={} s16={} speakers={} events={} config={:016x}",
+        let header = format!(
+            "{MAGIC} channels={} period={} s16={} speakers={} events={} config={:016x}\n",
             cfg.globals.channels,
             cfg.globals.period,
             s16 as u8,
             cfg.speakers.len(),
             events as u8,
             fingerprint(cfg)
-        )?;
-        Ok(Recorder { out, s16, left: max_bytes })
+        ).into_bytes();
+        out.write_all(&header)?;
+        Ok(Recorder { out, s16, left: max_bytes.saturating_sub(header.len() as u64), ring: None, header })
     }
 
     fn put(&mut self, b: &[u8]) -> io::Result<()> {
@@ -152,7 +159,40 @@ impl Recorder {
 
     /// The size limit was reached: the recording ends here.
     pub fn full(&self) -> bool {
-        self.left == 0
+        self.left == 0 && self.ring.is_none()
+    }
+
+    pub fn needs_rotation(&self) -> bool {
+        self.left == 0 && self.ring.is_some()
+    }
+
+    /// Rotate only between guard ticks. Complete records are never split.
+    /// Each segment can exceed half the requested budget by its start state
+    /// and one guard tick's records. A staging file exists during rotation.
+    pub fn rotate(&mut self, t: u64, governor: Governor, guard: Option<Governor>, max: f64, state: &str) -> io::Result<()> {
+        let (path, segment) = self.ring.clone().expect("file recorder");
+        let sidecar = |suffix: &str| {
+            let mut name = path.as_os_str().to_os_string();
+            name.push(suffix);
+            PathBuf::from(name)
+        };
+        let next = sidecar(".next");
+        let previous = sidecar(".previous");
+        // Never truncate staging evidence left by a failure/crash.
+        let mut out = BufWriter::new(File::options().write(true).create_new(true).open(&next)?);
+        out.write_all(&self.header)?;
+        let mut fresh = Recorder { out: Box::new(out), s16: self.s16,
+            left: segment.saturating_sub(self.header.len() as u64),
+            ring: self.ring.clone(), header: self.header.clone() };
+        fresh.start(t, governor, guard, max, state)?;
+        fresh.loss(t, LOSS_ROTATION, 0)?;
+        fresh.out.flush()?;
+        self.end(t)?;
+        std::fs::rename(&path, &previous)?;
+        std::fs::rename(&next, &path)?;
+        crate::warn!("recording size limit: rotated {}; replaced rolling .previous segment; protection continues", path.display());
+        *self = fresh;
+        Ok(())
     }
 
     fn head(tag: u8, t: u64) -> Vec<u8> {
@@ -660,6 +700,7 @@ impl Timeline {
                 LOSS_STALL => "a stalled capture".to_string(),
                 LOSS_CAPTURE => format!("a capture error ({errno})"),
                 LOSS_POSITION => format!("a position error ({errno})"),
+                LOSS_ROTATION => "recording rotated; preceding capture and decision context is unavailable".to_string(),
                 _ => "a lost period".to_string(),
             };
             out.push((t.saturating_sub(self.dt(48000)), t, what));
@@ -1654,7 +1695,7 @@ mod tests {
         assert!(loud.text.contains("not compared"), "{}", loud.text);
     }
 
-    /// A recording that stopped at its size limit says so, and what follows
+    /// A non-file writer that stopped at its size limit says so, and what follows
     /// is not certified.
     #[test]
     fn a_full_recording_ends_and_is_not_certified() {
@@ -1662,7 +1703,8 @@ mod tests {
         let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
         let path = tmp("full.rec");
         let mut g = Guard::start(&mut hw, &cfg, 20.0, tmp_state()).unwrap();
-        g.attach_recorder(&hw, Recorder::create(&path, &cfg, hw.events, 400_000).unwrap());
+        let output = Box::new(BufWriter::new(File::create(&path).unwrap()));
+        g.attach_recorder(&hw, Recorder::to(output, &cfg, hw.events, 400_000).unwrap());
         run_until(&mut g, &mut hw, secs(3.0)).unwrap();
         assert!(g.rec.is_none(), "the recorder did not stop at its limit");
         let tl = Timeline::read(&path, &cfg).unwrap();
@@ -1716,6 +1758,56 @@ mod tests {
         assert_eq!(after.accounts,before.accounts);
         assert_eq!(after.periods.len(),before.periods.len());
         assert_eq!(after.start,before.start);
+    }
+
+    #[test]
+    fn recorder_ring_keeps_recent_periods_and_refuses_segment_certification() {
+        let cfg = j700();
+        let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
+        let path = tmp("ring.rec");
+        let previous = path.with_file_name("ring.rec.previous");
+        let mut g = Guard::start(&mut hw, &cfg, 20.0, tmp_state()).unwrap();
+        g.attach_recorder(&hw, Recorder::create(&path, &cfg, hw.events, 400_000).unwrap());
+        run_until(&mut g, &mut hw, secs(8.0)).unwrap();
+        assert!(g.rec.is_some(), "size limit must rotate rather than stop V/I evidence");
+        g.rec = None; // flush current segment before offline inspection
+        let current = Timeline::read(&path, &cfg).unwrap();
+        let old = Timeline::read(&previous, &cfg).unwrap();
+        assert!(old.start > hw.boot + secs(1.0), "several rotations must replace the oldest window");
+        assert!(current.start > old.start && current.last >= hw.boot + secs(7.8));
+        assert!(!current.periods.is_empty() && !old.periods.is_empty());
+        assert!(current.state.starts_with("speakerguardd-state 3"));
+        assert!(old.truncated.is_some());
+        assert!(current.losses.iter().any(|l| l.1 == 5));
+        let bytes = std::fs::metadata(&path).unwrap().len() + std::fs::metadata(&previous).unwrap().len();
+        assert!(bytes < 400_000 + 4 * (cfg.globals.channels * cfg.globals.period * 4) as u64,
+            "whole-tick overshoot must remain bounded: {bytes}");
+        for p in [&path, &previous] {
+            let out = replay(p, &cfg, &Replay { gain_db: 0.0, governor: None, guard: None, max_reduction: None, csv: None }).unwrap();
+            assert!(!out.certified && out.text.contains("recording rotated"), "{}", out.text);
+        }
+    }
+
+    #[test]
+    fn recorder_ring_failure_preserves_staging_and_protection() {
+        let cfg = j700();
+        let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
+        let path = tmp("ring-failure.rec");
+        let next = path.with_file_name("ring-failure.rec.next");
+        std::fs::write(&next, b"retained crash evidence").unwrap();
+        let mut g = Guard::start(&mut hw, &cfg, 20.0, tmp_state()).unwrap();
+        g.attach_recorder(&hw, Recorder::create(&path, &cfg, hw.events, 400_000).unwrap());
+        g.start_trace(&hw);
+        run_until(&mut g, &mut hw, secs(3.0)).unwrap();
+        assert!(g.rec.is_none(), "stale staging must stop recording without overwriting it");
+        assert_eq!(std::fs::read(&next).unwrap(), b"retained crash evidence");
+        assert!(!Timeline::read(&path, &cfg).unwrap().periods.is_empty());
+        let mut control = FakeHw::new(cfg.globals.channels, cfg.globals.period);
+        let mut baseline = Guard::start(&mut control, &cfg, 20.0, tmp_state()).unwrap();
+        baseline.start_trace(&control);
+        run_until(&mut baseline, &mut control, secs(3.0)).unwrap();
+        assert_eq!(format!("{:?}", g.trace), format!("{:?}", baseline.trace),
+            "a recorder failure must not alter governing decisions or accounting");
     }
 
     /// The replay's account in seconds per kind, from its text.

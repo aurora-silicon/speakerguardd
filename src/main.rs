@@ -127,7 +127,7 @@ fn usage() -> ! {
          --experimental-unified          Let the unified governor write the card without the guard\n  \
          --allow-unqualified             Govern a machine whose configuration says qualified = false\n  \
          --record <FILE>                 Record what the guard sees and decides, for --replay\n  \
-         --record-max-mb <MB>            Stop recording past this size (default 512)\n  \
+         --record-max-mb <MB>            Rolling recording budget (default 512)\n  \
          --replay <FILE>                 Run the guard on a recording offline (no card); exit 3 if it cannot certify it\n  \
          --model <NAME>                  With --replay: the config (apple/<NAME>.conf)\n  \
          --gain-db <DB>                  With --replay: play the recording this much louder\n  \
