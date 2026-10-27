@@ -2008,8 +2008,12 @@ mod tests {
         let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
         let path = tmp("missing-directory").join("recording.rec");
         let mut g = Guard::start(&mut hw, &cfg, 20.0, tmp_state()).unwrap();
-        let rec = Recorder::create_async(&path, &cfg, hw.events, 400_000).unwrap();
-        g.attach_recorder(&hw, rec);
+        // The worker may reject the missing directory before or after the
+        // constructor queues its header. Both outcomes must keep governing.
+        match Recorder::create_async(&path, &cfg, hw.events, 400_000) {
+            Ok(rec) => g.attach_recorder(&hw, rec),
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::BrokenPipe),
+        }
         run_until(&mut g, &mut hw, secs(3.0)).unwrap();
         assert!(g.rec.is_none(), "failed writer must disconnect and drop recording");
         assert!(!path.exists());
