@@ -311,3 +311,32 @@ including their cross term. It also specifies paid or nonincreasing epoch
 transitions and a set-valued alternative to a unique pre-DAC replay inverse.
 The exact synthetic examples do not qualify any physical route or change
 production protection.
+
+## Pending listening acceptance markers
+
+The two failures in the published 321-pass / 2-fail / 1-ignored suite are
+intentional **pending acceptance markers**, not passing tests or waivers:
+
+| Test in `src/guard/onset_tests.rs` | Reason it remains pending | Required exit condition |
+| --- | --- | --- |
+| `ordinary_quiet_programme_costs_at_most_one_db` | The unchanged linear bounded-current fixture exceeds 1 dB: J413 tweeters lose 1.544 dB at 30%, and J316/J413 lose more at 60%. The necessary-dose bound above excludes the J413 60% budget even under optimistic assumptions. | A complete qualified transfer must pass the unchanged J316/J413 assertions and all thermal/fault checks consistently. |
+| `j616_ordinary_quiet_programme_has_zero_extra_attenuation` | At 30% every speaker has zero loss, but at 60% woofers lose 16.521 dB and active tweeter cells can be fully clamped (infinite dB loss). The necessary-dose bound above excludes zero loss at 60% for this fixture. | The same qualified transfer must pass the unchanged exact-zero assertions at both points, as well as the thermal/fault checks. |
+
+Both remain ordinary `#[test]` assertions: no ignore, expected-panic annotation,
+relaxed threshold or success-on-failure wrapper is applied. A default suite
+still exits unsuccessfully. Their failure blocks safe-and-loud acceptance and
+keeps this PR draft. The separately executed extended thermal test accounts
+for the existing single ignored test; neither listening assertion is ignored.
+
+To reproduce just these markers on an admitted buildbox, from this checkout:
+
+```
+cargo test --offline --locked --release -j8 ordinary_quiet_programme -- --nocapture --test-threads=2
+```
+
+Expect two selected tests and a failing Cargo exit under the current fixture.
+Retain that exit and every speaker/point row. A hypothetical squared-transfer
+experiment is conditional evidence only; it cannot replace this default result
+or qualify hardware. Passing these synthetic assertions later is also necessary
+but insufficient: the original 63 replays still need justified native inputs
+and their unchanged listening budgets on the same certificate.
