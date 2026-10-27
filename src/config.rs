@@ -214,6 +214,10 @@ pub struct Config {
     pub globals: Globals,
     pub controls: Controls,
     pub speakers: Vec<Speaker>,
+    /// Packaged DT/ALSA identities allowed to negotiate a playback certificate.
+    pub playback_cards: Vec<String>,
+    /// Profile speaker order to DT playback slot order.
+    pub playback_slots: Vec<usize>,
     /// Set only by the command line (--experimental-unified, or a replay):
     /// the unified governor may write the card.
     pub allow_unified: bool,
@@ -521,7 +525,24 @@ impl Config {
         if !(globals.safe_reduction > 0.0) {
             return Err(ConfigError("[Globals] safe_reduction must be positive".into()));
         }
-        let cfg = Config { globals, controls, speakers, allow_unified: false, allow_unqualified: false };
+        let playback_cards = match sections.get("Playback").and_then(|s| s.get("cards")) {
+            None => Vec::new(),
+            Some(text) => text.split(',').map(|s|s.trim().to_owned()).collect(),
+        };
+        if playback_cards.iter().any(|s| s.is_empty() || !s.bytes().all(|c|c.is_ascii_alphanumeric())) {
+            return Err(ConfigError("[Playback] cards must be comma-separated ALSA ids".into()));
+        }
+        let playback_slots = match sections.get("Playback").and_then(|s|s.get("slots")) {
+            None=>Vec::new(),
+            Some(text)=>text.split(',').map(|s|s.trim().parse::<usize>()
+                .map_err(|_|ConfigError("[Playback] invalid slot".into()))).collect::<Result<Vec<_>,_>>()?,
+        };
+        if !playback_cards.is_empty() && (playback_slots.len()!=speakers.len()
+            || playback_slots.iter().any(|&k|k>=speakers.len())
+            || (0..speakers.len()).any(|k|!playback_slots.contains(&k))) {
+            return Err(ConfigError("[Playback] slots must be a permutation of all physical slots".into()));
+        }
+        let cfg = Config { globals, controls, speakers, playback_cards, playback_slots, allow_unified: false, allow_unqualified: false };
         cfg.check_hardware()?;
         Ok(cfg)
     }

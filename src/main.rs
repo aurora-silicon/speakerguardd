@@ -21,6 +21,11 @@ mod guard;
 mod harness;
 mod log;
 mod model;
+mod playback;
+mod playback_grant;
+mod playback_model;
+#[cfg(test)]
+mod gate_sim;
 mod persist;
 mod wallclock;
 mod record;
@@ -239,6 +244,7 @@ struct Card {
     per_speaker: Option<Vec<ElemId>>,
     unlock: ElemId,
     sample_rate: ElemId,
+    energy: Option<ElemId>,
     /// Subscribed to the card's change events: the sample-rate control's
     /// changes wake the loop instead of waiting for its next poll.
     events: bool,
@@ -255,6 +261,11 @@ impl Card {
         }
         let unlock = ctl.find_one(&cfg.controls.unlock)?;
         let sample_rate = ctl.find_one(&cfg.controls.sample_rate)?;
+        let energy = match ctl.find_one("Speaker Energy Grant") {
+            Ok(id) => Some(id),
+            Err(e) if e.kind()==std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        };
         let named: Vec<Option<ElemId>> = cfg.speakers.iter().map(|s| ctl.find_one(&format!("{} {}", s.name, cfg.controls.volume)).ok()).collect();
         // every per-speaker control is one of the locked volume controls
         let per_speaker = if named.iter().all(|n| n.is_some_and(|id| volume.iter().any(|v| v.numid == id.numid))) { Some(named.into_iter().flatten().collect()) } else { None };
@@ -296,7 +307,7 @@ impl Card {
                 false
             }
         };
-        Ok((Card { ctl, volume, volume_max: None, volume_min: 0, per_speaker, unlock, sample_rate, events, rate_event: false }, name))
+        Ok((Card { ctl, volume, volume_max: None, volume_min: 0, per_speaker, unlock, sample_rate, energy, events, rate_event: false }, name))
     }
 
     /// Take the interlock: every volume control first, then the unlock
@@ -307,6 +318,7 @@ impl Card {
             self.ctl.lock(id)?;
         }
         self.ctl.lock(&self.unlock)?;
+        if let Some(id)=&self.energy { self.ctl.lock(id)?; }
         self.volume_min = self.ctl.int_range(&self.volume[0])?.0;
         Ok(())
     }
@@ -347,12 +359,12 @@ impl Card {
         Ok(())
     }
 
-    /// Drain the queued events; true while a sample-rate change is pending.
+    /// Gate readiness wakes the loop without inventing a sample-rate edge.
     fn drain(&mut self) -> std::io::Result<bool> {
-        if self.events && self.ctl.events(self.sample_rate.numid)? {
-            self.rate_event = true;
-        }
-        Ok(self.rate_event)
+        let (rate,energy)=if self.events {self.ctl.events(self.sample_rate.numid,self.energy.as_ref().map(|e|e.numid))?}
+            else {(false,false)};
+        self.rate_event |= rate;
+        Ok(self.rate_event || energy)
     }
 
     /// The control value for a reduction, rounded up to the control's
@@ -423,6 +435,13 @@ impl Hw for RealHw {
     fn ping(&mut self) -> std::io::Result<()> {
         self.card.ping()
     }
+    fn playback_status(&mut self) -> std::io::Result<Option<playback::Snapshot>> {
+        self.card.energy.as_ref().map(|id| self.card.ctl.read_bytes(id).and_then(playback::Snapshot::decode)).transpose()
+    }
+    fn playback_write(&mut self, bytes: &[u8;playback::BYTES]) -> std::io::Result<()> {
+        let id=self.card.energy.as_ref().ok_or_else(||std::io::Error::from_raw_os_error(libc::EOPNOTSUPP))?;
+        self.card.ctl.write_bytes(id,bytes)
+    }
     fn set_reduction(&mut self, db: f64) -> std::io::Result<f64> {
         self.card.write_reduction(db)
     }
@@ -492,7 +511,7 @@ impl Hw for RealHw {
         let deadline = Instant::now() + timeout;
         loop {
             match self.card.drain() {
-                Ok(true) => return true,
+                Ok(true) => return self.card.rate_event,
                 Ok(false) => {}
                 Err(_) => {
                     // the events are only a wake-up: fall back to the poll
@@ -512,7 +531,8 @@ impl Hw for RealHw {
         }
     }
     fn rate_events(&mut self) -> bool {
-        let pending = self.card.drain().unwrap_or(true);
+        let failed=self.card.drain().is_err();
+        let pending=self.card.rate_event || failed;
         self.card.rate_event = false;
         pending
     }

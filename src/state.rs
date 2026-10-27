@@ -63,7 +63,7 @@ pub struct Saved {
     /// drained, every moment up to `covered` accounted.  Only such a state
     /// is resumed.
     pub released: bool,
-    /// The run was recovering from bad sense data.
+    /// The run was recovering from bad or stalled sense data.
     pub recovering: bool,
     pub speakers: Vec<SavedSpeaker>,
     /// The engine's models (none in a file written without them).
@@ -89,7 +89,7 @@ pub fn encode_with(boottime: Duration, covered: Duration, speakers: &[SpeakerSta
     encode_full(boottime, covered, speakers, engine, armed, released, false)
 }
 
-/// `encode_with`, and whether the run is still recovering from bad sense
+/// `encode_with`, and whether the run is still recovering from bad or stalled sense
 /// data (a `recovering 1` line: the next run does not take the lock before
 /// REARM_PERIODS valid periods either; a reader without it refuses the
 /// file, and so starts latched).
