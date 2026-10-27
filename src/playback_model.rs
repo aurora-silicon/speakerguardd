@@ -40,6 +40,9 @@ pub struct PlaybackModel {
     source: VecDeque<(u64, Vec<f64>)>,
     delivered: VecDeque<(u64, Vec<f64>)>,
     initial: Vec<(f64, f64)>,
+    // Authenticated lifetime billed dose bounds every pre-takeover delivered
+    // window. Source means/temperature restore cannot authenticate its timing.
+    initial_delivered: Vec<f64>,
     origin_ns: u64,
     pub monitor: Option<Engine>,
     monitor_to: Instant,
@@ -58,7 +61,7 @@ impl PlaybackModel {
             return Err(bad());
         }
         let status = status.for_profile(cfg)?;
-        let drivers = cfg
+        let drivers: Vec<Driver> = cfg
             .speakers
             .iter()
             .enumerate()
@@ -107,6 +110,8 @@ impl PlaybackModel {
                 } else {
                     10000.0
                 };
+                // One Ps reserve covers background AND every unbilled
+                // fallback contribution under the joint transfer certificate.
                 let safe =
                     full * 10f64.powf(-f64::from(status.safe_reduction_millidb) / denominator);
                 Driver { ff, vi, full, safe }
@@ -116,6 +121,16 @@ impl PlaybackModel {
             .iter()
             .map(|s| (s.mean_power(1.0), s.mean_power(60.0)))
             .collect();
+        let initial_delivered = drivers
+            .iter()
+            .enumerate()
+            .map(|(k, d)| {
+                let units = status.completed[k]
+                    .checked_sub(status.refunded[k])
+                    .ok_or_else(bad)?;
+                Ok(playback::joules(units, d.full))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
         let origin_ns = status.clock_ns;
         Ok(Self {
             cfg: cfg.clone(),
@@ -124,6 +139,7 @@ impl PlaybackModel {
             source: VecDeque::new(),
             delivered: VecDeque::new(),
             initial,
+            initial_delivered,
             origin_ns,
             monitor: engine.cloned(),
             monitor_to: at,
@@ -167,6 +183,15 @@ impl PlaybackModel {
             age += dt;
         }
         energy
+    }
+
+    fn initial_delivered_energy(&self, now: u64, k: usize, seconds: f64) -> f64 {
+        // All earlier charged output may have occurred just before the first
+        // authenticated receipt, even after clean restore or late qualification.
+        // At most full power fits in the remaining pre-origin part of a window.
+        // New completions and pending/residual debt remain separate below.
+        let elapsed = now.saturating_sub(self.origin_ns) as f64 * 1e-9;
+        self.initial_delivered[k].min(self.drivers[k].full * (seconds - elapsed).max(0.0))
     }
 
     pub fn update(&mut self, status: Snapshot) -> io::Result<Vec<Projection>> {
@@ -339,7 +364,8 @@ impl PlaybackModel {
             for (seconds, limit) in [(1.0, s.p_limit_1s), (60.0, s.p_limit_60s)] {
                 if limit > 0.0 {
                     let past =
-                        Self::window(&self.delivered, self.last.clock_ns, k, seconds, d.full);
+                        Self::window(&self.delivered, self.last.clock_ns, k, seconds, d.full)
+                            + self.initial_delivered_energy(self.last.clock_ns, k, seconds);
                     room = room.min(
                         (limit - d.safe) * seconds
                             - past
@@ -499,5 +525,194 @@ mod tests {
         let mut bad = gate.status(1_000_000_002).unwrap();
         bad.safe_reduction_millidb -= 1;
         assert!(model.update(bad).is_err());
+    }
+}
+
+#[cfg(test)]
+mod takeover_regression {
+    use super::*;
+    use crate::gate_sim::KernelGate;
+    // Clean/cold source state, nonzero authenticated completed counters, delayed
+    // qualification and repeated owners must all retain both delivered windows.
+    #[test]
+    fn both_takeover_windows_keep_uncertain_history_until_it_ages_out() {
+        for seconds in [1u64, 60] {
+            let mut cfg = Config::parse(include_str!("../conf/apple/j700.conf")).unwrap();
+            let states = cfg
+                .speakers
+                .iter()
+                .cloned()
+                .map(|s| SpeakerState::with_globals(s, &cfg.globals))
+                .collect::<Vec<_>>();
+            let mut gate = KernelGate::new(&cfg, 48000, 64);
+            let origin = 90_000_000_000;
+            gate.start(origin).unwrap();
+            gate.owner(true, origin).unwrap();
+            let mut receipt = gate.status(origin).unwrap();
+            let full = crate::engine::v_worst(&cfg.speakers[0], &cfg.globals)
+                .max(cfg.speakers[0].vs_scale)
+                .powi(2)
+                / cfg.speakers[0].z_min();
+            let safe = full * 10f64.powf(-f64::from(receipt.safe_reduction_millidb) / 10000.0);
+            let limit = safe + 1.0 / seconds as f64;
+            for s in &mut cfg.speakers {
+                s.p_limit_1s = if seconds == 1 { limit } else { 0.0 };
+                s.p_limit_60s = if seconds == 60 { limit } else { 0.0 };
+            }
+            let two_joules = cumulative_ceiling(0, 2.0, full, 48000).unwrap();
+            for k in 0..cfg.speakers.len() {
+                receipt.completed[k] = two_joules;
+                receipt.submitted[k] = two_joules;
+            }
+            // The model-state clock is deliberately older than qualification.
+            let at = Instant::now().checked_sub(Duration::from_secs(30)).unwrap();
+            for takeover in 0..3 {
+                receipt.epoch += takeover;
+                let mut model =
+                    PlaybackModel::new(&cfg, &states, None, at, receipt.clone()).unwrap();
+                model.update(receipt.clone()).unwrap();
+                assert!(
+                    model.packet().unwrap().is_none(),
+                    "{seconds}s takeover minted credit"
+                );
+                let mut end = receipt.clone();
+                end.clock_ns += seconds * 1_000_000_000 - 1;
+                model.update(end.clone()).unwrap();
+                let old_bound = model.initial_delivered_energy(end.clock_ns, 0, seconds as f64);
+                assert!(old_bound > 0.0, "window must retain its open boundary");
+                // Safe background leaves less than the entire window available.
+                let extra = model
+                    .packet()
+                    .unwrap()
+                    .map(|wire| {
+                        let cap = Snapshot::decode(wire).unwrap().ceiling[0];
+                        playback::joules(cap - model.last.submitted[0], full)
+                    })
+                    .unwrap_or(0.0);
+                assert!(old_bound + extra + safe * seconds as f64 <= limit * seconds as f64 + 1e-9);
+                end.clock_ns += 1;
+                model.update(end).unwrap();
+                assert_eq!(
+                    model.initial_delivered_energy(model.last.clock_ns, 0, seconds as f64),
+                    0.0
+                );
+                assert!(
+                    model.packet().unwrap().is_some(),
+                    "credit must recover after {seconds}s"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn takeover_preserves_pending_tail_and_refund_accounting() {
+        let cfg = Config::parse(include_str!("../conf/apple/j700.conf")).unwrap();
+        let states = cfg
+            .speakers
+            .iter()
+            .cloned()
+            .map(|s| SpeakerState::with_globals(s, &cfg.globals))
+            .collect::<Vec<_>>();
+        let mut gate = KernelGate::with_tail(&cfg, 48000, 64, 1000);
+        gate.start(1).unwrap();
+        gate.owner(true, 1).unwrap();
+        let mut status = gate.status(1).unwrap();
+        for k in 0..cfg.speakers.len() {
+            status.completed[k] = 1000;
+            status.refunded[k] = 400;
+            status.submitted[k] = 1200;
+        }
+        let mut model =
+            PlaybackModel::new(&cfg, &states, None, Instant::now(), status.clone()).unwrap();
+        assert_eq!(
+            model.initial_delivered[0],
+            playback::joules(600, model.drivers[0].full)
+        );
+        let before = model.initial_delivered[0];
+        status.clock_ns += 1;
+        status.completed[0] += 200;
+        model.update(status).unwrap();
+        assert_eq!(model.initial_delivered[0], before);
+        assert_eq!(
+            model.delivered.back().unwrap().1[0],
+            playback::joules(200, model.drivers[0].full)
+        );
+        assert_eq!(model.last.tail_us[0], 1000);
+    }
+
+    #[test]
+    fn completed_predecessor_dose_still_occupies_the_one_second_window() {
+        let mut cfg = Config::parse(include_str!("../conf/apple/j700.conf")).unwrap();
+        for s in &mut cfg.speakers {
+            s.p_limit_1s = 1.0;
+            s.p_limit_60s = 0.0;
+        }
+        let full: Vec<_> = cfg
+            .speakers
+            .iter()
+            .map(|s| {
+                let voltage = crate::engine::v_worst(s, &cfg.globals).max(s.vs_scale);
+                voltage * voltage / s.z_min()
+            })
+            .collect();
+        let mut gate = KernelGate::new(&cfg, 48000, 64);
+        let mut now = 1_000_000_000u64;
+        gate.start(now).unwrap();
+        gate.owner(true, now).unwrap();
+        let start = gate.status(now).unwrap();
+        let ceilings: Vec<_> = full
+            .iter()
+            .map(|&f| cumulative_ceiling(0, 1.0, f, 48000).unwrap())
+            .collect();
+        gate.write(
+            &start.grant(&ceilings, &vec![UNITY; full.len()]).unwrap(),
+            now,
+        )
+        .unwrap();
+        // All 80 periods finish within 107 ms and the predecessor's 250 ms
+        // grant. The thermal starting bounds below exceed this one-joule dose.
+        for _ in 0..80 {
+            let (ticket, _) = gate.submit(&vec![i32::MAX; 64 * full.len()], now).unwrap();
+            now += 1_333_334;
+            gate.retire(ticket, now).unwrap();
+        }
+        let before = gate.status(now).unwrap();
+        let prior = playback::joules(before.completed[0] - before.refunded[0], full[0]);
+        assert!(prior > 0.99 && prior < 1.01);
+        gate.owner(true, now).unwrap(); // owner handover revokes credit, keeps lifetime dose
+        let states: Vec<_> = cfg
+            .speakers
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(k, s)| {
+                let mut state = SpeakerState::with_globals(s, &cfg.globals);
+                let raw = playback::joules(before.source_completed[k], full[k]);
+                state.resume(65.0, 55.0, raw, raw / 60.0);
+                state
+            })
+            .collect();
+        let mut model = PlaybackModel::new(
+            &cfg,
+            &states,
+            None,
+            Instant::now(),
+            gate.status(now).unwrap(),
+        )
+        .unwrap();
+        model.update(gate.status(now).unwrap()).unwrap();
+        let extra = model
+            .packet()
+            .unwrap()
+            .map(|wire| {
+                let cap = Snapshot::decode(wire).unwrap().ceiling[0];
+                playback::joules(cap - model.last.submitted[0], full[0])
+            })
+            .unwrap_or(0.0);
+        eprintln!("AUTHENTICATED_HISTORY previous_completed_J={prior:.12} additional_J={extra:.12} total_J={:.12} limit_J=1", prior+extra);
+        assert!(
+            prior + extra <= 1.0 + 1e-9,
+            "a new process must retain recently delivered energy"
+        );
     }
 }
