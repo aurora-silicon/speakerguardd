@@ -1768,6 +1768,7 @@ mod tests {
         let previous = path.with_file_name("ring.rec.previous");
         let mut g = Guard::start(&mut hw, &cfg, 20.0, tmp_state()).unwrap();
         g.attach_recorder(&hw, Recorder::create(&path, &cfg, hw.events, 400_000).unwrap());
+        g.start_trace(&hw);
         run_until(&mut g, &mut hw, secs(8.0)).unwrap();
         assert!(g.rec.is_some(), "size limit must rotate rather than stop V/I evidence");
         g.rec = None; // flush current segment before offline inspection
@@ -1786,6 +1787,12 @@ mod tests {
             let out = replay(p, &cfg, &Replay { gain_db: 0.0, governor: None, guard: None, max_reduction: None, csv: None }).unwrap();
             assert!(!out.certified && out.text.contains("recording rotated"), "{}", out.text);
         }
+        let mut control = FakeHw::new(cfg.globals.channels, cfg.globals.period);
+        let mut baseline = Guard::start(&mut control, &cfg, 20.0, tmp_state()).unwrap();
+        baseline.start_trace(&control);
+        run_until(&mut baseline, &mut control, secs(8.0)).unwrap();
+        assert_eq!(g.trace, baseline.trace);
+        assert_eq!(hw.writes, control.writes);
     }
 
     #[test]
@@ -1806,8 +1813,26 @@ mod tests {
         let mut baseline = Guard::start(&mut control, &cfg, 20.0, tmp_state()).unwrap();
         baseline.start_trace(&control);
         run_until(&mut baseline, &mut control, secs(3.0)).unwrap();
-        assert_eq!(format!("{:?}", g.trace), format!("{:?}", baseline.trace),
+        assert_eq!(g.trace, baseline.trace,
             "a recorder failure must not alter governing decisions or accounting");
+    }
+
+    #[test]
+    fn recorder_ring_s16_retains_whole_recent_vi_periods() {
+        let cfg = j413();
+        let mut hw = FakeHw::per_speaker(&cfg);
+        let path = tmp("ring-s16.rec");
+        let mut g = Guard::start(&mut hw, &cfg, 7.0, Some(vi_state(&cfg, 55.0, 52.0))).unwrap();
+        g.attach_recorder(&hw, Recorder::create(&path, &cfg, hw.events, 400_000).unwrap());
+        run_until(&mut g, &mut hw, secs(3.0)).unwrap();
+        assert!(g.rec.is_some(), "S16 V/I recording must continue beyond its limit");
+        g.rec = None;
+        for p in [&path, &path.with_file_name("ring-s16.rec.previous")] {
+            let timeline = Timeline::read(p, &cfg).unwrap();
+            assert!(timeline.s16 && !timeline.periods.is_empty());
+            assert_eq!(timeline.channels, cfg.globals.channels);
+            assert!(timeline.ambiguous().iter().any(|x| x.2.contains("recording rotated")));
+        }
     }
 
     /// The replay's account in seconds per kind, from its text.
