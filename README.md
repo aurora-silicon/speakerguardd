@@ -575,6 +575,10 @@ tone, content alone does not carry a trustworthy coil resistance.
 
 ### Recording and replay
 
+For recording overrides, see [restart evidence preservation](docs/recording-retention.md).
+Local pre-start pruning can delete older evidence even though this repository
+unit does not. The installed preservation helper keeps it instead.
+
 `--record FILE` keeps what the guard sees and decides: every sample-rate
 change and change event, every sense open, every complete period's words
 with the most reduction the card may have applied over it (its safe level
