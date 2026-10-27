@@ -340,3 +340,24 @@ experiment is conditional evidence only; it cannot replace this default result
 or qualify hardware. Passing these synthetic assertions later is also necessary
 but insufficient: the original 63 replays still need justified native inputs
 and their unchanged listening budgets on the same certificate.
+
+
+## Delivered windows on takeover
+
+A new playback model bounds pre-takeover delivered energy from the kernel's
+monotonic lifetime completed-minus-refunded counters, independently of saved
+source means or temperatures. For either enabled window W, at elapsed time dt
+since the first authenticated receipt, the retained dose is bounded by
+`min(lifetime_billed_joules, full_input_power * max(0, W-dt))`. This places
+unknown prior energy as late as possible. Every grant subtracts that bound,
+newly completed history, pending debt, the residual reserve and the joint safe
+baseline. Clean restores, delayed qualification and repeated takeovers cannot
+mint new window headroom. After W seconds the uncertainty ages out; existing
+pending and residual debt still applies. No lifetime counter is reset.
+
+The transfer certificate must reserve background and unbilled PCM jointly:
+`P0 + F_certificate * g_fallback^p <= Ps` at every allowed boundary and epoch.
+Separate background and signal bounds cannot each consume the entire Ps.
+Real TAS helpers remain NONE until that and all other physical obligations
+are proved. The mathematical checker and host-ledger regressions qualify no
+hardware and do not close either listening assertion or the original replays.
