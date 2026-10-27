@@ -390,8 +390,8 @@ fn rec_now<H: Hw>(rec: &mut Option<Recorder>, hw: &H, f: impl FnOnce(&mut Record
 }
 
 /// One record, or recording stops on failure (or a non-file writer's limit).
-/// Recording never decides anything: a blocked write only delays the loop,
-/// which the account charges like any other lateness.
+/// The live file recorder uses a bounded nonblocking queue; storage stalls
+/// drop evidence without delaying a governing tick.
 fn rec_do(rec: &mut Option<Recorder>, t: Duration, f: impl FnOnce(&mut Recorder, u64) -> io::Result<()>) {
     let Some(r) = rec.as_mut() else { return };
     let ns = t.as_nanos() as u64;
