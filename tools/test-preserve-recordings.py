@@ -11,6 +11,7 @@ import importlib.util
 from unittest import mock
 
 HELPER = Path(__file__).with_name('preserve-recordings').resolve()
+MIGRATION = HELPER.parent.parent / 'docs' / 'recording-retention.md'
 
 class Retention(unittest.TestCase):
     def setUp(self):
@@ -78,6 +79,7 @@ class Retention(unittest.TestCase):
         result = self.run_helper()
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.path.read_bytes(), b'protected evidence')
+        self.assertIn('ExecStartPre=-/usr/lib/speakerguardd/preserve-recordings', MIGRATION.read_text())
     def test_partial_move_is_marked_incomplete_and_never_pruned(self):
         loader = importlib.machinery.SourceFileLoader('preserve_recordings_test', str(HELPER))
         spec = importlib.util.spec_from_loader(loader.name, loader)
