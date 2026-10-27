@@ -4,7 +4,6 @@
 import os
 from pathlib import Path
 import re
-import shutil
 import stat
 import sys
 import tempfile
@@ -21,10 +20,35 @@ def bytes_in(directory):
     allowed = {directory.name.split('.saved.')[0] + suffix for suffix in ('', '.previous', '.next')}
     total = 0
     for p in directory.iterdir():
-        if p.name not in allowed or not stat.S_ISREG(p.lstat().st_mode):
+        if p.name not in allowed | {'.incomplete'} or not stat.S_ISREG(p.lstat().st_mode):
             raise OSError(f"unrecognized archive content: {p}")
         total += p.stat().st_size
     return total
+
+
+def remove_archive(directory):
+    """Leave a marker if deleting an old archive stops partway through."""
+    marker = directory / '.incomplete'
+    marker.touch(exist_ok=False)
+    for p in directory.iterdir():
+        if p != marker:
+            p.unlink()
+    marker.unlink()
+    directory.rmdir()
+
+
+def archives_for(path):
+    archives = []
+    for candidate in path.parent.glob(path.name + '.saved.*'):
+        if not re.fullmatch(re.escape(path.name) + r"\.saved\.[A-Za-z0-9_]{8,10}", candidate.name):
+            continue
+        if candidate.is_symlink() or not candidate.is_dir():
+            continue
+        size = bytes_in(candidate)
+        incomplete = (candidate / '.incomplete').exists()
+        archives.append((candidate.stat().st_mtime_ns, candidate.name, candidate, size, incomplete))
+    archives.sort()
+    return archives
 
 
 def main():
@@ -50,12 +74,24 @@ def main():
             if not stat.S_ISREG(mode):
                 return fail(f"refusing non-regular recording: {source}")
             present.append(source)
+        incoming = sum(p.stat().st_size for p in present)
+        if incoming > budget:
+            return fail("current evidence exceeds archive budget; retained in place")
+        archives = archives_for(path)
+        total = sum(item[3] for item in archives)
+        for _, _, old, size, incomplete in archives:
+            if total + incoming <= budget:
+                break
+            if incomplete:
+                continue
+            remove_archive(old)
+            total -= size
+            print(f"recording archive budget: removed oldest {old}", file=sys.stderr)
+        if total + incoming > budget:
+            return fail("incomplete evidence leaves insufficient archive budget; retained in place")
         if not present:
             print("recording preservation: no prior recording segments", file=sys.stderr)
         else:
-            incoming = sum(p.stat().st_size for p in present)
-            if incoming > budget:
-                return fail("current evidence exceeds archive budget; retained in place")
             saved = Path(tempfile.mkdtemp(prefix=path.name + ".saved.", dir=path.parent))
             marker = saved / ".incomplete"
             marker.touch(exist_ok=False)
@@ -63,25 +99,6 @@ def main():
                 os.replace(source, saved / source.name)
                 print(f"recording evidence kept: {saved / source.name}", file=sys.stderr)
             marker.unlink()
-        archives = []
-        for candidate in path.parent.glob(path.name + ".saved.*"):
-            if not re.fullmatch(re.escape(path.name) + r"\.saved\.[A-Za-z0-9_]{8,10}", candidate.name):
-                continue
-            if candidate.is_symlink() or not candidate.is_dir():
-                continue
-            archives.append((candidate.stat().st_mtime_ns, candidate.name, candidate))
-        archives.sort()
-        total = sum(bytes_in(item[2]) for item in archives)
-        newest = archives[-1][2] if archives else None
-        for _, _, old in archives:
-            if total <= budget:
-                break
-            if old == newest:
-                return fail("newest archive alone exceeds disk budget")
-            size = bytes_in(old)
-            shutil.rmtree(old)
-            total -= size
-            print(f"recording archive budget: removed oldest {old}", file=sys.stderr)
         return 0
     except OSError as e:
         return fail(str(e))
