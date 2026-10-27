@@ -1,37 +1,37 @@
 {
   "speaker-energy.c": {
     "upstream": "sound/soc/apple/speaker-energy.c",
-    "commit": "88ae13bcb731e7c77230011db0b78f4e652cb8f7",
-    "sha256": "712e3f2056f15490030e8fcc392be265bd861f9d744867bd3c6bd0bcc486ac8c"
+    "commit": "9a4e993b2f3b912cc064799d33803a2f047c693d",
+    "sha256": "5e1b1205226785240ca400a84ae09515a58220c8bc16904b75630025dcd669a0"
   },
   "speaker-energy.h": {
     "upstream": "sound/soc/apple/speaker-energy.h",
-    "commit": "88ae13bcb731e7c77230011db0b78f4e652cb8f7",
+    "commit": "9a4e993b2f3b912cc064799d33803a2f047c693d",
     "sha256": "71e0c6158a1a07f2a0319212ebdef49c7d82ab499959f63e212a07d2fc12a3d0"
   },
   "apple-admac-payload.h": {
     "upstream": "drivers/dma/apple-admac-payload.h",
-    "commit": "88ae13bcb731e7c77230011db0b78f4e652cb8f7",
+    "commit": "9a4e993b2f3b912cc064799d33803a2f047c693d",
     "sha256": "7979122d22a9908a716dce211d4c17970deb662e33049a9d7de5d0cec0e6bada"
   },
   "apple-admac.h": {
     "upstream": "include/linux/dma/apple-admac.h",
-    "commit": "88ae13bcb731e7c77230011db0b78f4e652cb8f7",
+    "commit": "9a4e993b2f3b912cc064799d33803a2f047c693d",
     "sha256": "47946247974a13f30cca6ccfd5b8ff0be28616dcadfb5b7aad3ce80c4c8261ae"
   },
   "apple-speaker.h": {
     "upstream": "include/uapi/sound/apple-speaker.h",
-    "commit": "88ae13bcb731e7c77230011db0b78f4e652cb8f7",
+    "commit": "9a4e993b2f3b912cc064799d33803a2f047c693d",
     "sha256": "8176c5c4a9a15ccf71e9c4b79120460341e7451b378b624866be1754d59538a8"
   },
   "gate-host.c": {
     "upstream": "tools/testing/selftests/alsa/apple-speaker-energy/gate-host.c",
-    "commit": "88ae13bcb731e7c77230011db0b78f4e652cb8f7",
+    "commit": "9a4e993b2f3b912cc064799d33803a2f047c693d",
     "sha256": "c255e34cf04e99894fe143a48b40b3aecb32ce6265008b47f40620de45f609a9"
   },
   "build-host.py": {
     "upstream": "tools/testing/selftests/alsa/apple-speaker-energy/build-host.py",
-    "commit": "88ae13bcb731e7c77230011db0b78f4e652cb8f7",
+    "commit": "9a4e993b2f3b912cc064799d33803a2f047c693d",
     "sha256": "bbf6039e0b68c2dd95a42f63bd13356ceff85526db0c57ee33cb5b052b834f73"
   }
 }

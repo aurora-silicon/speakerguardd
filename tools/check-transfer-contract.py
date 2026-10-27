@@ -175,6 +175,53 @@ def inverse_interval(a, observed):
                 minimum_at=str(minimum_at), maximum_at=str(maximum_at))
 
 
+
+def safe_supply(background, coefficient, fallback_gain, exponent, safe_power):
+    """Joint allowance for unbilled PCM and background, for both ABI metrics.
+
+    The storage bound/tail remains a separate obligation at every boundary.
+    This predicate qualifies no physical device or time-varying transition.
+    """
+    return (background >= 0 and coefficient >= 0 and 0 <= fallback_gain <= 1
+            and exponent in (1, 2) and safe_power >= 0
+            and background + coefficient * fallback_gain**exponent <= safe_power)
+
+
+def verify_safe_supply():
+    checks = 0
+    # The former premises admit Ps background PLUS Ps free PCM. Reject the
+    # review's stateless plant (110 C reserved, 170 C actual at equilibrium).
+    ambient, resistance, full, safe, background = Q(50), Q(60), Q(10), Q(1), Q(1)
+    fallback = Q(1, 10)
+    assert background <= safe and full*fallback <= safe
+    assert ambient+resistance*safe == 110
+    assert ambient+resistance*(background+full*fallback) == 170
+    assert not safe_supply(background, full, fallback, 1, safe)
+    for exponent in (1, 2):
+        for gain in [Q(0), Q(1, 10), Q(1, 2), Q(1)]:
+            for coefficient in [Q(0), Q(1), Q(10)]:
+                free_pcm = coefficient * gain**exponent
+                for background in [Q(0), Q(1, 4), Q(1)]:
+                    required = background+free_pcm
+                    assert safe_supply(background, coefficient, gain, exponent, required)
+                    assert not safe_supply(background, coefficient, gain, exponent, required-Q(1, 100))
+                    # Every waveform, not only full-scale fallback: paid words
+                    # include all signal supply; free words share this Ps.
+                    for word in [Q(-1), Q(-1, 3), Q(0), Q(1, 3), Q(1)]:
+                        assert background+coefficient*abs(word*gain)**exponent <= required
+                    for duration in [Q(1, 48000), Q(1), Q(60)]:
+                        assert (background+free_pcm)*duration <= required*duration
+                    checks += 1
+    # Nonzero P0 is possible if the signal norm leaves real headroom; testing
+    # only P0=0 would conceal the double spend. There is no tail amortization.
+    assert safe_supply(Q(1, 4), Q(3, 4), Q(1), 2, Q(1))
+    assert not safe_supply(Q(-1), Q(1), Q(1), 2, Q(1))
+    return dict(joint_supply_witnesses=checks, both_metrics=True,
+                old_separate_premises_rejected=True, nonzero_background=True,
+                clock_and_route_epochs_require_same_bound=True,
+                physical_certificate=False)
+
+
 def main():
     storage = [verify_storage(a) for a in [Q(0), Q(1, 2), Q(3, 4), Q(99, 100)]]
     a = Q(3, 4)
@@ -210,6 +257,7 @@ def main():
     assert repeated_minimum_output_energy > p
     print(json.dumps(dict(scope=__doc__, physical_certificate=False,
         storage_identities=storage,
+        joint_safe_supply=verify_safe_supply(),
         weighted_residual=verify_weighted_residual(),
         inverse_witness=dict(samples=len(words), identical_output=True,
             input_a_squared_dose=str(energy(words)),
