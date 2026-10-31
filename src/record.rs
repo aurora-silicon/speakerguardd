@@ -96,6 +96,9 @@ pub const FAIL_TARGET: u8 = 2;
 const END_FULL: u8 = 1;
 /// `Z` after a clean stop: the recording is complete, not cut short.
 const END_CLEAN: u8 = 2;
+/// How far the replay moves its clock to where the live daemon's own
+/// processing ended an account span it charged (a close, the final save).
+const LIVE_REACH: Duration = Duration::from_millis(100);
 
 /// A short fingerprint of a configuration, so that a replay can say it is
 /// not running the configuration that was recorded.
@@ -820,6 +823,11 @@ impl Timeline {
         Duration::from_secs_f64(self.period as f64 / rate.max(1) as f64)
     }
 
+    /// When the live daemon stopped cleanly (gave the lock up to stop).
+    fn clean_stop(&self) -> Option<Duration> {
+        self.permits.iter().find(|p| !p.1 && p.2 == "stopping").map(|p| p.0)
+    }
+
     /// The end of a period's frames, as the live daemon placed them.
     fn end_of(&self, p: &Period) -> Duration {
         p.t.saturating_sub(Duration::from_secs_f64(p.queued as f64 / p.rate.max(1) as f64))
@@ -980,6 +988,10 @@ impl ReplayHw {
         for k in &tl.looks {
             schedule.push(k.edge());
             schedule.push(k.t);
+        }
+        // a clean stop: the replay stops where the live daemon did
+        if let Some(t) = tl.clean_stop() {
+            schedule.push(t);
         }
         schedule.sort();
         schedule.dedup();
@@ -1450,9 +1462,30 @@ pub fn replay(path: &Path, cfg: &Config, opts: &Replay) -> Result<Outcome, Box<d
     // account ends with its last record.
     let end = live_end.map_or(last, |e| (e + EVENT_SLACK).max(data_end) + Duration::from_micros(1));
     let mut delivered = 0;
+    let stop_at = hw.tl.clean_stop();
+    let mut stopping = false;
     while hw.boottime_now() < end {
         let before = hw.boottime_now();
         let was_playing = hw.playing_now();
+        // the live daemon's clean stop, as its main loop runs it
+        if !stopping && stop_at.is_some_and(|t| before >= t) {
+            if let Err(e) = g.stop(&mut hw) {
+                fatal = Some(format!("at {:.3} s: {e}", before.saturating_sub(start).as_secs_f64()));
+                break;
+            }
+            stopping = true;
+        }
+        if stopping && g.released(&hw) {
+            // the live daemon's final save ended its account where its own
+            // clock reads put it: end there too, within reach
+            if let Some(e) = live_end.filter(|&e| e > hw.bt && e <= hw.bt + LIVE_REACH) {
+                hw.advance_to(e);
+            }
+            if let Err(e) = g.final_save(&hw) {
+                fatal = Some(format!("at {:.3} s: {e}", before.saturating_sub(start).as_secs_f64()));
+            }
+            break;
+        }
         if let Err(e) = g.tick(&mut hw) {
             fatal = Some(format!("at {:.3} s: {e}", hw.boottime_now().saturating_sub(start).as_secs_f64()));
             break;
@@ -1500,7 +1533,8 @@ pub fn replay(path: &Path, cfg: &Config, opts: &Replay) -> Result<Outcome, Box<d
     let trace = g.trace.take().unwrap_or_default();
     let rep_permits: Vec<(Duration, bool)> = trace.iter().filter_map(|(t, e)| if let Trace::Permit(a, _) = e { Some((*t, *a)) } else { None }).collect();
     let rep_latches: Vec<(Duration, bool)> = trace.iter().filter_map(|(t, e)| if let Trace::Latch(s) = e { Some((*t, *s)) } else { None }).collect();
-    let handoffs: Vec<&String> = trace.iter().filter_map(|(_, e)| if let Trace::Permit(false, why) = e { Some(why) } else { None }).collect();
+    // a replayed clean stop gives the lock up too, but hands nothing off
+    let handoffs: Vec<&String> = trace.iter().filter_map(|(_, e)| if let Trace::Permit(false, why) = e { (why != "stopping").then_some(why) } else { None }).collect();
     let spans: Vec<(Duration, Duration, Accounted)> = trace.iter().filter_map(|(_, e)| if let Trace::Account(a, b, how) = e { Some((*a, *b, *how)) } else { None }).collect();
     let total_of = |how: Accounted| spans.iter().filter(|s| s.2 == how).map(|s| (s.1 - s.0).as_secs_f64()).sum::<f64>() + 0.0;
     // adjacent charges are one uncovered interval
@@ -1802,6 +1836,24 @@ mod tests {
             let path = record_live(&cfg, if clean { "sealed.rec" } else { "unsealed.rec" }, clean);
             let tl = Timeline::read(&path, &cfg).unwrap();
             assert_eq!(tl.truncated.is_none(), clean, "clean stop {clean}: truncated {:?}", tl.truncated);
+            std::fs::remove_file(&path).unwrap();
+        }
+    }
+
+    /// The replay stops where the live daemon stopped cleanly, and a live
+    /// recording with a clean stop certifies; one without it does not.
+    #[test]
+    fn a_cleanly_stopped_live_recording_certifies() {
+        let cfg = j700();
+        for clean in [true, false] {
+            let path = record_live(&cfg, if clean { "stopped.rec" } else { "killed.rec" }, clean);
+            let out = replay(&path, &cfg, &Replay { gain_db: 0.0, governor: None, guard: None, max_reduction: None, csv: None }).unwrap();
+            assert_eq!(out.certified, clean, "{}", out.text);
+            if clean {
+                assert!(out.text.contains("0 hand-offs") && out.text.contains("0 live only, 0 replay only"), "{}", out.text);
+            } else {
+                assert!(out.text.contains("the recording stopped here"), "{}", out.text);
+            }
             std::fs::remove_file(&path).unwrap();
         }
     }
