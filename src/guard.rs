@@ -1310,6 +1310,10 @@ impl Guard {
         if !self.issue_playback(hw)? {return Ok(false);}
         // whatever the ping answers, the card may be unlocked from here on
         self.locked_at = None;
+        // The lease may begin anywhere inside the write, including before
+        // a scheduling pause. Keep main's earliest possible boundary.
+        let t0 = hw.now();
+        let mut renewed_at = t0;
         match hw.ping() {
             Ok(()) => {}
             Err(e) if e.raw_os_error() == Some(libc::ETIMEDOUT) => {
@@ -1319,11 +1323,12 @@ impl Guard {
                 // the card held its safe level from the lapse (not before
                 // the lease's length after the last ping) until now
                 self.mark_kernel_since(self.last_ping + KERNEL_LOCK_TIMEOUT);
+                renewed_at = hw.now();
                 hw.ping().map_err(|e| format!("lock ping: {e}"))?;
             }
             Err(e) => return Err(format!("lock ping: {e}").into()),
         }
-        self.last_ping = hw.now();
+        self.last_ping = renewed_at;
         Ok(true)
     }
 
@@ -1512,8 +1517,11 @@ impl Guard {
         // card may have converted them at its safe level (review r5 V4),
         // whatever the next decision makes of it, and whether or not the
         // lock has been given up since.
+        // A shifted period may have played after its earliest end. Its
+        // gain candidates include a lease lapse at that later boundary.
+        let late_end = end + Duration::from_secs_f64(shift as f64 / rate);
         let lapse = self.last_ping + KERNEL_LOCK_TIMEOUT;
-        if end > lapse {
+        if late_end > lapse {
             self.mark_kernel_since(lapse);
         }
         let globals = self.globals.clone();
@@ -1530,7 +1538,7 @@ impl Guard {
         // delivered the frame is the safer guess).
         let played = end.checked_sub(Duration::from_secs_f64(frames as f64 / rate)).unwrap_or(end);
         let converted = played.checked_sub(QUEUE_BOUND).unwrap_or(played);
-        let possible = self.possible_reductions(converted, end);
+        let possible = self.possible_reductions(converted, late_end);
         let parts: &[(usize, usize, f64)] = if first < 1.0 { &[(0, 1, first), (1, k, 1.0)] } else { &[(0, k, 1.0)] };
         // the models take the blocks as equal shares of the run's time, so
         // each block's sum is spread over an equal share: the run's energy
@@ -1556,6 +1564,7 @@ impl Guard {
             let (heat, budget) = (&p[hp.0..hp.1], &q[hq.0..hq.1]);
             let v = (heat.iter().sum::<f64>() / k as f64 * s.spec.r_ff).sqrt();
             let mut peak = f64::NEG_INFINITY;
+            let mut loudest = 0.0f64;
             for &(lo, hi, w) in parts {
                 if hi <= lo {
                     continue;
@@ -1564,12 +1573,14 @@ impl Guard {
                 let blocks = (SUB_BLOCKS * n).div_ceil(globals.period).clamp(1, n);
                 let powers = means(&heat[lo..hi], blocks);
                 let pre = means(&budget[lo..hi], blocks);
+                loudest = powers.iter().copied().fold(loudest, f64::max);
                 let secs = if n == 1 { w / rate } else { n as f64 / rate };
                 s.step_period_pre(&powers, &pre, secs, globals.t_ambient);
                 peak = peak.max(s.t_peak);
             }
             s.t_peak = peak;
             s.v_rms = v;
+            s.p_recent = loudest;
             s.govern(&globals);
         }
         if let Some(e) = self.engine.as_mut() {
@@ -1737,6 +1748,7 @@ impl Guard {
                 // the stream's last frames, then the rest up to this look
                 let tail = self.account_close(hw)?;
                 self.playing = false;
+                for s in &mut self.speakers { s.p_recent = 0.0; }
                 if self.stall.take().is_some() {
                     hw.close_sense();
                     info!("speakers closed ({tail} sense frames after the last whole period)");
