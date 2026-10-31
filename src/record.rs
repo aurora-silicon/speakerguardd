@@ -1732,6 +1732,32 @@ mod tests {
         assert!(uni.text.contains("governor unified") && uni.text.contains("not compared"), "{}", uni.text);
     }
 
+    /// Synthetic complete-writer fixtures for the RC machine matrix.
+    /// This does not certify production async rings or physical hardware.
+    #[test]
+    fn rc_machine_profiles_replay_their_synthetic_decisions() {
+        for (name, text) in [
+            ("j313", include_str!("../conf/apple/j313.conf")),
+            ("j314", include_str!("../conf/apple/j314.conf")),
+            ("j316", include_str!("../conf/apple/j316.conf")),
+            ("j413", include_str!("../conf/apple/j413.conf")),
+            ("j616", include_str!("../conf/apple/j616.conf")),
+        ] {
+            let mut cfg = Config::parse(text).unwrap();
+            cfg.allow_unqualified = true;
+            cfg.allow_unified = true;
+            let mut hw = FakeHw::per_speaker(&cfg);
+            hw.level = Box::new(|_| 0.05);
+            let path = tmp(&format!("rc-{name}.rec"));
+            let live = record(&cfg, &mut hw, Some(vi_state(&cfg, 55.0, 52.0)), secs(8.0), &path);
+            assert!(live.armed(), "{name}: synthetic run never armed");
+            let out = replay(&path, &cfg, &Replay { gain_db: 0.0, governor: None,
+                guard: None, max_reduction: None, csv: None }).unwrap();
+            assert!(out.certified, "{name}: {}", out.text);
+            eprintln!("RC_PROFILE {name}: synthetic replay certified");
+        }
+    }
+
     /// Bad sense data in a recording replays as what it was: uncovered time,
     /// charged at full scale, never measured, and the replay does not
     /// certify it.
