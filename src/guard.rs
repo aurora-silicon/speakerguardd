@@ -578,7 +578,7 @@ impl Guard {
                     // no /run state is not proof that no daemon unlocked the
                     // card this boot: the marker is (boot.rs), and nothing
                     // may have overridden the card's safe level
-                    let refused = crate::boot::marker_says_unlocked(&path.with_file_name(crate::boot::MARKER_NAME), &hw.stamp()).or_else(|| hw.protection_override());
+                    let refused = crate::boot::marker_says_unlocked(&crate::boot::marker_path(path), &hw.stamp()).or_else(|| hw.protection_override());
                     let start = match refused {
                         Some(why) => Err(Some(why)),
                         None => evidence_start(hw, cfg, persist_path.as_deref()).ok_or(None),
@@ -696,7 +696,7 @@ impl Guard {
         // finds no /run state may start from evidence: the marker that it
         // must not goes down first, durably, and stays (boot.rs)
         if let (Some(_), Some(path), false) = (&self.persist_path, &self.state_path, self.marked) {
-            let marker = path.with_file_name(crate::boot::MARKER_NAME);
+            let marker = crate::boot::marker_path(path);
             match state_write_durable(&marker, &crate::boot::marker_text(&hw.stamp())) {
                 Ok(()) => self.marked = true,
                 Err(e) => {
@@ -2242,6 +2242,8 @@ mod tests {
         static N: AtomicU32 = AtomicU32::new(0);
         let dir = std::env::temp_dir().join(format!("speakerguardd-test-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
         let _ = std::fs::remove_dir_all(&dir);
+        // and a stale evidence marker beside it (boot.rs `marker_path`)
+        let _ = std::fs::remove_file(crate::boot::marker_path(&dir.join("state")));
         std::fs::create_dir_all(&dir).unwrap();
         Some(dir.join("state"))
     }

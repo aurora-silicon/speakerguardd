@@ -328,7 +328,7 @@ fn start_at(cfg: &Config, run: &std::path::Path, keep: &std::path::Path, now: St
 }
 
 fn marker_of(run: &std::path::Path) -> PathBuf {
-    run.with_file_name(boot::MARKER_NAME)
+    boot::marker_path(run)
 }
 
 /// Truth from `crashed` (coil, magnet per speaker), 1 s at the safe level,
@@ -519,4 +519,25 @@ fn a_hot_chassis_raises_the_ambient_of_the_bound() {
     // the floor alone (67 C) is under the 50 C ambient's bound
     assert!(magnet(&base) > 67.0 + 10.0);
     assert!(magnet(&warm) >= magnet(&base) + (m_star(65.0) - m_star(50.0)) - 0.5, "{} against {}", magnet(&warm), magnet(&base));
+}
+
+/// The marker sits outside the /run state's directory (the unit's
+/// RuntimeDirectory): `systemctl clean --what=runtime` or removing the
+/// directory after an unlock leaves it, and the next start of the boot is
+/// latched (non-blocking note 1 of the round 2 safety review).
+#[test]
+fn the_marker_survives_the_runtime_directory() {
+    assert_eq!(boot::marker_path(std::path::Path::new("/run/speakerguardd/state")), std::path::Path::new("/run/speakerguardd.unlocked"));
+    assert_eq!(boot::marker_path(std::path::Path::new("state")), std::path::Path::new("unlocked"));
+    let cfg = j700();
+    let (run, keep) = (missing_state().unwrap(), missing_state().unwrap());
+    let (mut g, mut hw) = start_at(&cfg, &run, &keep, stamp("second", RTC0, false), |_| {});
+    run_until(&mut g, &mut hw, secs(2.0)).unwrap();
+    assert!(g.armed());
+    drop(g);
+    std::fs::remove_dir_all(run.parent().unwrap()).unwrap();
+    assert!(marker_of(&run).exists(), "removing the runtime directory took the marker");
+    let (g2, _) = start_at(&cfg, &run, &keep, stamp("second", RTC0 + 10, false), |_| {});
+    assert!(g2.speakers.iter().all(|s| s.hard), "the start after the runtime directory was removed was not latched");
+    let _ = std::fs::remove_file(marker_of(&run));
 }
