@@ -4,6 +4,7 @@ BINDIR ?= $(PREFIX)/bin
 SHAREDIR ?= $(PREFIX)/share/speakerguardd
 UNITDIR ?= $(PREFIX)/lib/systemd/system
 UDEVDIR ?= $(PREFIX)/lib/udev/rules.d
+LIBDIR ?= $(PREFIX)/lib64
 TARGET ?= aarch64-unknown-linux-musl
 # The commit the binary names (`-V` and the journal): this checkout's, or
 # what a package built from a tarball passes in.
@@ -23,4 +24,15 @@ install: all
 	install -pm0644 speakerguardd.service $(DESTDIR)$(UNITDIR)/
 	install -pm0644 95-speakerguardd.rules $(DESTDIR)$(UDEVDIR)/
 
-.PHONY: all test install
+# the speakers' excursion limiter (a LADSPA plugin for the PipeWire graph),
+# built and installed apart from the daemon
+filter:
+	$(MAKE) -C filter
+
+filter-test:
+	$(MAKE) -C filter test
+
+install-filter: filter
+	$(MAKE) -C filter install DESTDIR=$(DESTDIR) LIBDIR=$(LIBDIR)
+
+.PHONY: all test install filter filter-test install-filter

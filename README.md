@@ -397,6 +397,36 @@ speakersafetyd's, so the J700 file would carry over.  That is a series to
 propose upstream rather than a beta change; until it lands, this daemon is
 the J700's protection.
 
+### Excursion limiter (filter/)
+
+`filter/` holds `speakerguard-xlim`, a look-ahead limiter for the J700's
+speaker graph (a LADSPA plugin for PipeWire's filter-chain).  It predicts
+the cone's displacement for every sample from the driver's lumped model
+(Bl 0.74 T m, Mms 0.16 g, Kms 1720 N/m, Rms 0.14 kg/s, Re 4.3 ohm,
+resonance at 522 Hz, closed box) at the amplifier's full scale (7.30 and
+7.33 V).  It lowers the gain just enough, ahead of time, that the cone
+stays under 0.9 of the 0.565 mm displacement limit, and that no sample
+passes full scale.  It never raises the gain, and the two channels share
+one gain.  Below its limits the output is the input delayed, bit for bit.
+The attack ramp is 3.333 ms and ends 4 ms before the frame that needs it,
+the cone's memory.  The release is 200 ms.  The latency is 351 frames at
+48 kHz (7.3 ms), which the plugin reports to the host.
+
+The daemon is unchanged by it.  It stays the thermal and power governor
+and the only holder of the card's volume lock.  Its sense tap is
+downstream of the graph, so it sees the limited words.
+
+`make filter-test` checks the limiter against an independent model of the
+cone (its continuous equation of motion, integrated by Runge-Kutta).  The
+inputs are random programs (tones, bursts, chirps, square waves, steps,
+impulses, noise, random block sizes) and a set of worst-case shapes.  The
+worst of 87000 random programs and 172 shapes was 0.8956 of the limit.
+The tests also cover the latency, non-finite input, ten minutes without
+drift, and no allocation in the audio thread.  `XLIM_CASES` and
+`XLIM_SEED` widen the random run.  `make install-filter` installs the
+plugin to `$(LIBDIR)/ladspa`.  The J700 graph that uses it is a variant in
+asahi-audio (`firs/j700/graph-xlim.json`), off by default.
+
 ### Building
 
 Static, from any host:
