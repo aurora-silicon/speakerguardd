@@ -1120,6 +1120,21 @@ impl Hw for ReplayHw {
     fn now(&self) -> Instant {
         self.t0 + self.bt.saturating_sub(self.tl.start)
     }
+    fn closed_at(&mut self, from: Instant) -> Instant {
+        // The live daemon charged a closing stream from where its account
+        // had reached up to when it was done with it, which its own
+        // processing time decided.  Take the end of the span it charged
+        // from there (its account says where), within reach.
+        let from = self.tl.start + from.saturating_duration_since(self.t0);
+        let band = Duration::from_millis(1);
+        let span = self.tl.accounts.iter().find(|&&(a, b, how)| how == Accounted::Charged
+            && a + band >= from && a <= from + band
+            && b > self.bt && b <= self.bt + LIVE_REACH);
+        if let Some(&(_, b, _)) = span {
+            self.advance_to(b);
+        }
+        self.now()
+    }
     fn boottime(&self) -> Duration {
         self.bt
     }
@@ -1271,10 +1286,13 @@ impl Hw for ReplayHw {
             let x = &self.tl.tails[i];
             (x.offset, x.frames, x.t, x.queued)
         };
+        // read when the live daemon read it, as a period is
+        self.advance_to(t);
         // the tail was read under the gain of the stream's last period
         let applied = self.tl.periods[..self.next_period].last().map_or_else(|| vec![0.0; self.card.per.len()], |p| p.applied.clone());
         self.load(offset, frames, &applied, t, t, words)?;
-        self.queued = queued;
+        let rate = self.tl.periods[..self.next_period].last().map_or(0, |p| p.rate);
+        self.queued = queued + (self.bt.saturating_sub(t).as_secs_f64() * rate as f64) as u64;
         Ok(frames)
     }
     fn wait_rate_change(&mut self, timeout: Duration) -> bool {
@@ -1856,6 +1874,25 @@ mod tests {
             }
             std::fs::remove_file(&path).unwrap();
         }
+    }
+
+    /// The live daemon charges a closing stream up to when it is done with
+    /// it, which its own processing time decides; the replay charges the
+    /// same span, and the recording certifies.
+    #[test]
+    fn a_slow_close_replays_as_the_live_daemon_charged_it() {
+        let cfg = j700();
+        let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
+        hw.level = Box::new(|_| 0.6);
+        hw.playing = Box::new(|t| (t > secs(1.0) && t < secs(3.0)) || (t > secs(4.0) && t < secs(4.5)));
+        hw.close_delay = Duration::from_millis(3);
+        let path = tmp("slow-close.rec");
+        let live = record(&cfg, &mut hw, tmp_state(), secs(6.0), &path);
+        assert!(live.armed());
+        let out = replay(&path, &cfg, &Replay { gain_db: 0.0, governor: None, guard: None, max_reduction: None, csv: None }).unwrap();
+        assert!(out.text.contains("account against the live one: 0.0 ms the live daemon charged not charged here"), "{}", out.text);
+        assert!(out.certified, "{}", out.text);
+        std::fs::remove_file(&path).unwrap();
     }
 
     /// A V/I recording certifies too: the periods before the lock, played

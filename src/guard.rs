@@ -155,6 +155,13 @@ fn add_candidate(set: &mut Vec<(f64, f64)>, r: (f64, f64)) {
 /// What the loop needs from the machine.
 pub trait Hw {
     fn now(&self) -> Instant;
+    /// Up to when a closing stream is charged, its account having reached
+    /// `from` with its last frames.  Live, that is now; a replay takes the
+    /// live daemon's (it cannot replay the daemon's own processing time).
+    fn closed_at(&mut self, from: Instant) -> Instant {
+        let _ = from;
+        self.now()
+    }
     /// Time since boot, suspend included (CLOCK_BOOTTIME).
     fn boottime(&self) -> Duration;
     fn sleep(&mut self, d: Duration);
@@ -1621,7 +1628,7 @@ impl Guard {
                 }
             }
         }
-        let now = hw.now();
+        let now = hw.closed_at(self.account_to);
         self.charge(now)?;
         Ok(measured)
     }
@@ -2328,6 +2335,8 @@ pub mod fake {
         /// A late read finds only the newest period: the frames before it
         /// are lost, not queued (no overrun is reported).
         pub lossy: bool,
+        /// Time the daemon takes after a stream's last frames, before it charges the rest.
+        pub close_delay: Duration,
         /// Where the period last returned ended.
         last_end: Duration,
         pub locked: bool,
@@ -2397,6 +2406,7 @@ pub mod fake {
                 writes: Vec::new(),
                 boot: Duration::from_secs(1000),
                 control_delay: Box::new(|_| Duration::ZERO),
+                close_delay: Duration::ZERO,
                 dma: None,
                 granule: 32,
                 period_frames,
@@ -2767,6 +2777,11 @@ pub mod fake {
                 return reader.queued();
             }
             Ok((self.t.saturating_sub(self.last_end).as_secs_f64() * 48000.0) as u64)
+        }
+        fn closed_at(&mut self, _from: Instant) -> Instant {
+            // the daemon's own time after a stream's last frames
+            self.t += self.close_delay;
+            self.now()
         }
         fn read_tail(&mut self, words: &mut [i32]) -> io::Result<usize> {
             if !self.sense_open {
