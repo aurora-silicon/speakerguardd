@@ -331,8 +331,12 @@ impl SpeakerState {
         // Bound every shorter drain too, and any later time at the kernel
         // safe level. With M >= M_safe and C >= M + P_safe Rc, neither
         // node can rise above this envelope while the safe level holds.
-        self.t_magnet = self.t_magnet.max(limit).max(globals.t_ambient + safe * tr_magnet);
-        self.t_coil = self.t_peak.max(self.t_magnet + safe * tr_coil);
+        // Do not let max's NaN handling conceal an overflow in the drain:
+        // the guard must still reject a nonfinite model before unlocking.
+        if self.t_coil.is_finite() && self.t_magnet.is_finite() && self.t_peak.is_finite() {
+            self.t_magnet = self.t_magnet.max(limit).max(globals.t_ambient + safe * tr_magnet);
+            self.t_coil = self.t_peak.max(self.t_magnet + safe * tr_coil);
+        }
         self.t_peak = self.t_coil;
         self.hard = true;
         // nor is the power before the gain: a minute of full scale for the
@@ -891,6 +895,20 @@ mod amplifier_rail_tests {
 #[cfg(test)]
 mod independent_start_tests {
     use super::*;
+
+    #[test]
+    fn a_latched_drain_overflow_stays_nonfinite() {
+        let text = include_str!("../conf/apple/j700.conf")
+            .replace("tr_coil = 38.0", "tr_coil = 1e308")
+            .replace("tr_magnet = 26.0", "tr_magnet = 1e308");
+        let cfg = crate::config::Config::parse(&text).unwrap();
+        for spec in cfg.speakers {
+            let mut bound = SpeakerState::with_globals(spec, &cfg.globals);
+            bound.assume_latched(&cfg.globals);
+            assert!(bound.hard);
+            assert!(!bound.finite(), "safe-level floors must not hide a nonfinite full-scale drain");
+        }
+    }
     #[test]
     fn unknown_start_bounds_a_hot_coil_and_a_hot_magnet() {
         let cfg = crate::config::Config::parse(include_str!("../conf/apple/j700.conf")).unwrap();
