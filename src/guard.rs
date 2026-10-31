@@ -193,6 +193,8 @@ pub trait Hw {
     /// Turn every volume control to its minimum, which the card accepts
     /// while the volume is locked: done before each unlock.
     fn set_min(&mut self) -> io::Result<()>;
+    /// Attenuation enforced by the kernel while locked, once discovered.
+    fn card_safe_db(&self) -> Option<f64> { None }
     /// Give the card's lock up and take it again: the card locks the
     /// volume at once, drops what was left of its lease and stops the
     /// streams converted at the old gain.
@@ -347,7 +349,43 @@ pub const REARM_PERIODS: u32 = 2;
 /// Hysteresis after a target exceeds the hardware attenuation range.
 pub const REARM_MARGIN_DB: f64 = 3.0;
 /// The reduction the volume controls' minimum stands for (dB).
+/// How far the coils' thermal reduction may rise over the least reduction
+/// the card may still be playing audio at before that audio is stopped
+/// (review r6 W1), dB ...
+pub const FLUSH_JUMP_DB: f64 = 3.0;
+/// ... and how close to its limit that audio, at the program's level when
+/// last seen, may then take a coil, K.
+pub const FLUSH_MARGIN_K: f64 = 3.0;
+/// The longest the guard goes between decisions while it holds the lock
+/// (a period, a ping): a coil that could come within FLUSH_MARGIN_K of its
+/// limit in this long, at full scale through the least reduction the card
+/// may be playing, is handed off now rather than at the next look.
+pub const REACH_HORIZON: Duration = PING_INTERVAL;
+/// The speakers' copy queue in frames: what the card converted plays at
+/// most this long after it (the J700's 16384 frames, 341 ms at 48 kHz;
+/// QUEUE_BOUND is the same with margin).
+pub const COPY_QUEUE_FRAMES: u32 = 16384;
+/// The rate the queue and the period are timed at before the first stream
+/// shows its own (the J700's).
+const DEFAULT_RATE: u32 = 48000;
+/// macaudio's stop of the streams converted at the old gain once the lock
+/// is given up or lapses: a work item, milliseconds.
+pub const STOP_LATENCY: Duration = Duration::from_millis(5);
+/// The floor's grid on a card without steps (dB).
+const FLOOR_GRID_DB: f64 = 0.1;
 pub const MUTE_DB: f64 = 120.0;
+/// Which of the W1 rules found a coil at risk (each is logged as itself,
+/// review r7 Y8).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Threat {
+    /// Any program, through the least reduction the card may be playing,
+    /// before the next look.
+    Reach,
+    /// The program as last seen, on audio queued at a lower reduction.
+    Queue,
+}
+
+
 /// Where speakersafetyd notes that it has run since boot (its "warm boot"
 /// flag: /run/speakersafetyd/speakersafetyd.flag from 2.0, written into its
 /// runtime directory, /run/speakersafetyd.flag before; the ref Macs run
@@ -1943,6 +1981,135 @@ impl Guard {
         self.decide(hw, false)
     }
 
+    /// The entries of the controls' history that held at some time in
+    /// [from, to], each with when it stopped holding (`to` for the last).
+    fn held_spans(&self, from: Instant, to: Instant) -> impl Iterator<Item = (&Gain, Instant)> + '_ {
+        self.gains.iter().enumerate().filter_map(move |(i, e)| {
+            let next = self.gains.get(i + 1).map(|n| n.at);
+            let overlaps = next.is_none_or(|n| n > from) && (e.at <= to || i == 0);
+            overlaps.then_some((e, next.map_or(to, |n| n.min(to))))
+        })
+    }
+
+    /// The speakers' rate, the default before the first stream.
+    fn timing_rate(&self) -> f64 {
+        f64::from(if self.rate > 0 { self.rate } else { DEFAULT_RATE })
+    }
+
+    /// How long audio the card converted can still play: the copy queue.
+    fn copy_queue(&self) -> Duration {
+        Duration::from_secs_f64(f64::from(COPY_QUEUE_FRAMES) / self.timing_rate())
+    }
+
+    /// The longest the guard goes between looks at the program while it
+    /// plays: a sense period.
+    fn period(&self) -> Duration {
+        Duration::from_secs_f64(self.globals.period as f64 / self.timing_rate())
+    }
+
+    /// Review r6 W1: the card converts on copy, ahead of a queue of up to
+    /// QUEUE_BOUND, so audio already converted at a lower reduction keeps
+    /// playing whatever is written now; only a hand-off stops it (macaudio's
+    /// stop work).  Two rules, the first that finds a coil within
+    /// FLUSH_MARGIN_K of its limit:
+    /// * reach: any program at all through the least reduction the card may
+    ///   be playing, before the next look (REACH_HORIZON), which is what a
+    ///   blind guard has to assume;
+    /// * queue: the coils' thermal reduction has risen more than
+    ///   FLUSH_JUMP_DB over that least, and the audio converted at it, at
+    ///   the level the program was last seen to deliver, plays on until a
+    ///   copy queue after the controls stopped holding it (review r7 Y1: not
+    ///   a whole QUEUE_BOUND from now, which stopped bursts the queue no
+    ///   longer held).
+    ///
+    /// The speaker, how hot and by which rule, if so.  What the card
+    /// converted before the lock was last taken was at its safe level, or
+    /// was stopped then.
+    fn queue_threat(&self, now: Instant) -> Option<(usize, f64, Threat)> {
+        let from = now.checked_sub(QUEUE_BOUND).unwrap_or(now).max(self.armed_at.unwrap_or(now));
+        let lo_of = |e: &Gain| e.lo.iter().map(|v| if v.is_finite() { *v } else { 0.0 }).fold(f64::INFINITY, f64::min);
+        let (least, most) = self
+            .held_over(from, now)
+            .map(lo_of)
+            .filter(|&lo| lo < MUTE_DB)
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), lo| (a.min(lo), b.max(lo)));
+        if !least.is_finite() {
+            return None;
+        }
+        let ta = self.globals.t_ambient;
+        // the measured level says nothing while the guard is blind
+        let reach = REACH_HORIZON.as_secs_f64();
+        if let Some((k, peak)) = self.hottest(|s| s.peak_if(s.worst_case_power(least), reach, ta)) {
+            return Some((k, peak, Threat::Reach));
+        }
+        let thermal = self.speakers.iter().map(|s| s.thermal_db).fold(0.0, f64::max);
+        if thermal - least <= FLUSH_JUMP_DB {
+            return None;
+        }
+        let held_to = self.held_spans(from, now).filter(|&(e, _)| lo_of(e) <= least).map(|(_, to)| to).max().unwrap_or(from);
+        let plays = (held_to + self.copy_queue()).saturating_duration_since(now).min(QUEUE_BOUND).as_secs_f64();
+        self.hottest(|s| {
+            // the program as last seen may have come through as much as the
+            // most reduction in the window: the least can deliver it louder
+            let p = (s.p_recent * 10f64.powf((most - least).max(0.0) / 10.0)).min(s.worst_case_power(least));
+            s.peak_if(p, plays, ta)
+        })
+        .map(|(k, peak)| (k, peak, Threat::Queue))
+    }
+
+    /// The speaker whose coil `peak` puts within FLUSH_MARGIN_K of its
+    /// limit, the hottest if several, and how hot.
+    fn hottest(&self, peak: impl Fn(&SpeakerState) -> f64) -> Option<(usize, f64)> {
+        self.speakers
+            .iter()
+            .enumerate()
+            .map(|(k, s)| (k, peak(s), s.spec.t_limit - FLUSH_MARGIN_K))
+            .filter(|&(_, p, near)| p >= near)
+            .map(|(k, p, _)| (k, p))
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+    }
+
+    /// Why a W1 rule hands the card off, as the journal says it.
+    fn threat_reason(&self, k: usize, peak: f64, rule: Threat) -> String {
+        let name = &self.speakers[k].spec.name;
+        match rule {
+            Threat::Reach => format!("{name} could reach {peak:.0} C in {} ms at full scale through the least gain the card may be playing", REACH_HORIZON.as_millis()),
+            Threat::Queue => format!("{name} could reach {peak:.0} C on audio queued at a lower gain"),
+        }
+    }
+
+    /// The least reduction (dB) the guard writes, whatever the governor
+    /// asks (review r7 Y2).  A daemon held up right after a write (a call
+    /// that blocks, the scheduler) leaves the card converting at it until
+    /// the lease runs out and macaudio stops the stream: up to the lease,
+    /// a period to have looked, and the stop, behind a copy queue of audio
+    /// converted before it.  The floor keeps full scale for all of that
+    /// FLUSH_MARGIN_K under every coil's limit, rounded up to `grid`.
+    fn floor_db(&self, grid: f64) -> f64 {
+        let secs = (self.copy_queue() + KERNEL_LOCK_TIMEOUT + self.period() + STOP_LATENCY).as_secs_f64();
+        let ta = self.globals.t_ambient;
+        let mut floor = 0.0f64;
+        for s in &self.speakers {
+            let under = |db: f64| s.peak_if(s.worst_case_power(db), secs, ta) < s.spec.t_limit - FLUSH_MARGIN_K;
+            if under(floor) {
+                continue;
+            }
+            // the coil's bound rises with the power: bisect, keeping the
+            // side that is under
+            let (mut lo, mut hi) = (floor, MUTE_DB);
+            for _ in 0..24 {
+                let mid = 0.5 * (lo + hi);
+                if under(mid) {
+                    hi = mid;
+                } else {
+                    lo = mid;
+                }
+            }
+            floor = hi;
+        }
+        if grid > 0.0 && floor > 0.0 { (floor / grid - 1e-9).ceil() * grid } else { floor }
+    }
+
     fn bound_onset(&self, now: Instant, per: &mut [f64]) -> bool {
         if let Some(playback)=&self.playback {return playback.ready;}
         if self.playback_required {return false;}
@@ -1975,6 +2142,12 @@ impl Guard {
                 );
                 onset[k] = onset[k].max(ff);
             }
+        }
+        // Keep main's J700 floor as an additional bound, even where the
+        // newer full-dose projection is already stricter.
+        if !self.playback_cfg.has_vi() {
+            let floor = self.floor_db(FLOOR_GRID_DB);
+            for r in &mut onset { *r = r.max(floor); }
         }
         let ready = onset.iter().all(|r| r.is_finite() && *r < MUTE_DB);
         for (r, floor) in per.iter_mut().zip(onset) { *r = r.max(floor); }
@@ -2043,6 +2216,10 @@ impl Guard {
                 Some(format!("no complete sense data for {} ms", blind.as_millis()))
             } else if hard {
                 Some("a coil may have reached its limit".to_string())
+            } else if !self.playback_cfg.has_vi() && self.queue_threat(now).is_some() {
+                let (k, peak, rule) = self.queue_threat(now).unwrap();
+                self.fresh = 0;
+                Some(self.threat_reason(k, peak, rule))
             } else if !range_ready {
                 Some("the required attenuation exceeds the volume control range".to_string())
             } else if !onset_ready {
@@ -2080,6 +2257,10 @@ impl Guard {
                         // still be current at the unlock
                         if self.fresh_enough(hw.now()) {
                             if !self.ping_lock(hw)? {return Ok(());}
+                            if hw.card_safe_db().is_some_and(|db| !db.is_finite() || db < self.globals.safe_reduction - 1e-6) {
+                                hw.relinquish()?;
+                                return Err("kernel safe level is louder than the configured bound".into());
+                            }
                             if self.fresh_enough(hw.now()) {
                                 info!("taking the volume lock{} at {reduction:.1} dB", if self.held { " back" } else { "" });
                                 self.armed = true;

@@ -1313,3 +1313,6 @@ mod tests {
         }
     }
 }
+
+// Keep the mainline J700 oracle and held-up queue witnesses.
+mod mainline;

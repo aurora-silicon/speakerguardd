@@ -31,6 +31,7 @@ mod wallclock;
 mod record;
 mod startup;
 mod state;
+mod stats;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -80,6 +81,14 @@ impl std::error::Error for Refused {}
 
 fn exit_status(e: &(dyn std::error::Error + 'static)) -> u8 {
     if e.is::<Refused>() { EXIT_REFUSED } else { 1 }
+}
+
+/// The version and the source it was built from (the Makefile and the
+/// packaging set SPEAKERGUARDD_COMMIT at build time), for `--version` and
+/// the journal.
+fn version() -> String {
+    let commit = option_env!("SPEAKERGUARDD_COMMIT").filter(|c| !c.is_empty()).unwrap_or("commit unknown");
+    format!("speakerguardd {} ({commit})", env!("CARGO_PKG_VERSION"))
 }
 
 struct Args {
@@ -213,6 +222,7 @@ fn parse_args_from(arguments: impl IntoIterator<Item = String>) -> Args {
             "--horizon" => args.horizon = Some(it.next().and_then(|v| v.parse().ok()).filter(|h: &f64| h.is_finite() && *h > 0.0).unwrap_or_else(|| usage())),
             "-v" | "--verbose" => args.verbosity = Level::Debug,
             "-q" | "--quiet" => args.verbosity = Level::Warn,
+            "-V" | "--version" => { println!("{}", version()); std::process::exit(0); }
             _ => usage(),
         }
     }
@@ -239,6 +249,7 @@ struct Card {
     /// first successful ping.
     volume_max: Option<i64>,
     volume_min: i64,
+    locked_max: Option<i64>,
     /// One volume control per speaker ("<speaker> <volume>"), in speaker
     /// order, on cards that have them (V/I machines).
     per_speaker: Option<Vec<ElemId>>,
@@ -307,7 +318,7 @@ impl Card {
                 false
             }
         };
-        Ok((Card { ctl, volume, volume_max: None, volume_min: 0, per_speaker, unlock, sample_rate, energy, events, rate_event: false }, name))
+        Ok((Card { ctl, volume, volume_max: None, volume_min: 0, locked_max: None, per_speaker, unlock, sample_rate, energy, events, rate_event: false }, name))
     }
 
     /// Take the interlock: every volume control first, then the unlock
@@ -319,7 +330,14 @@ impl Card {
         }
         self.ctl.lock(&self.unlock)?;
         if let Some(id)=&self.energy { self.ctl.lock(id)?; }
-        self.volume_min = self.ctl.int_range(&self.volume[0])?.0;
+        let locked = self.ctl.int_range(&self.volume[0])?;
+        for id in &self.volume[1..] {
+            if self.ctl.int_range(id)? != locked {
+                return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+            }
+        }
+        self.volume_min = locked.0;
+        self.locked_max = Some(locked.1);
         Ok(())
     }
 
@@ -414,6 +432,17 @@ struct RealHw {
     card: Card,
     globals: Globals,
     capture: Option<Capture>,
+    stats: stats::Stats,
+}
+
+impl RealHw {
+    /// Time one call into `kind`'s counter.
+    fn timed<T>(&mut self, kind: stats::Call, f: impl FnOnce(&mut Self) -> T) -> T {
+        let t = Instant::now();
+        let r = f(self);
+        self.stats.call(kind, t.elapsed());
+        r
+    }
 }
 
 impl Hw for RealHw {
@@ -433,7 +462,9 @@ impl Hw for RealHw {
         self.card.take_lock()
     }
     fn ping(&mut self) -> std::io::Result<()> {
-        self.card.ping()
+        let result = self.timed(stats::Call::Ping, |h| h.card.ping());
+        if result.is_ok() { self.stats.renewed(Instant::now()); }
+        result
     }
     fn playback_status(&mut self) -> std::io::Result<Option<playback::Snapshot>> {
         self.card.energy.as_ref().map(|id| self.card.ctl.read_bytes(id).and_then(playback::Snapshot::decode)).transpose()
@@ -443,10 +474,10 @@ impl Hw for RealHw {
         self.card.ctl.write_bytes(id,bytes)
     }
     fn set_reduction(&mut self, db: f64) -> std::io::Result<f64> {
-        self.card.write_reduction(db)
+        self.timed(stats::Call::Write, |h| h.card.write_reduction(db))
     }
     fn set_reductions(&mut self, db: &[f64]) -> std::io::Result<Vec<f64>> {
-        self.card.write_reductions(db)
+        self.timed(stats::Call::Write, |h| h.card.write_reductions(db))
     }
     fn reduction_limit_db(&self) -> Option<f64> {
         self.card.volume_max.map(|max| (max - self.card.volume_min) as f64 / STEPS_PER_DB)
@@ -455,17 +486,21 @@ impl Hw for RealHw {
         1.0 / STEPS_PER_DB
     }
     fn set_min(&mut self) -> std::io::Result<()> {
-        self.card.write_min()
+        self.timed(stats::Call::Write, |h| h.card.write_min())
+    }
+    fn card_safe_db(&self) -> Option<f64> {
+        Some((self.card.volume_max? - self.card.locked_max?) as f64 / STEPS_PER_DB)
     }
     fn relinquish(&mut self) -> std::io::Result<()> {
-        self.card.relinquish()
+        self.stats.released();
+        self.timed(stats::Call::Relinquish, |h| h.card.relinquish())
     }
     fn sample_rate(&mut self) -> std::io::Result<i64> {
-        self.card.ctl.read_int(&self.card.sample_rate)
+        self.timed(stats::Call::Rate, |h| h.card.ctl.read_int(&h.card.sample_rate))
     }
     fn open_sense(&mut self, rate: u32) -> std::io::Result<()> {
-        let g = &self.globals;
-        self.capture = Some(Capture::open(self.card.ctl.card, g.sense_pcm, g.channels, rate, g.period, g.sense_format == SenseFormat::S16)?);
+        let g = self.globals.clone();
+        self.capture = Some(self.timed(stats::Call::Open, |h| Capture::open(h.card.ctl.card, g.sense_pcm, g.channels, rate, g.period, g.sense_format == SenseFormat::S16))?);
         Ok(())
     }
     fn close_sense(&mut self) {
@@ -562,10 +597,10 @@ impl Hw for RealHw {
         std::process::Command::new("systemctl").arg("is-system-running").output().is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "stopping")
     }
     fn queued(&mut self) -> std::io::Result<u64> {
-        match self.capture.as_mut() {
+        self.timed(stats::Call::Position, |h| match h.capture.as_mut() {
             Some(c) => c.queued(),
             None => Err(std::io::Error::from_raw_os_error(libc::EBADFD)),
-        }
+        })
     }
 }
 
@@ -584,6 +619,12 @@ fn catch_stop_signals() {
 }
 
 fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    info!("{}", version());
+    // The hardware-free replay path never enters run(). Keep main's
+    // resident-memory protection for the governing process.
+    if unsafe { libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE) } != 0 {
+        warn!("mlockall: {}; page faults can hold the daemon up", std::io::Error::last_os_error());
+    }
     // the model file is named after the card: AppleJ700 -> apple/j700.conf
     // Discovery only: no controls are locked or written until it succeeds,
     // the configuration is loaded and Guard::start takes the interlock.
@@ -605,7 +646,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let cfg = load_config(&path, args)?;
     info!("{}: {} speakers{}, sense PCM {}, period {} frames", path.display(), cfg.speakers.len(), if cfg.has_vi() { " with V/I sense" } else { "" }, cfg.globals.sense_pcm, cfg.globals.period);
     let (card, card_name) = Card::open(Some(&name), &cfg)?;
-    let mut hw = RealHw { card, globals: cfg.globals.clone(), capture: None };
+    let mut hw = RealHw { card, globals: cfg.globals.clone(), capture: None, stats: stats::Stats::new(Instant::now()) };
     catch_stop_signals();
     let max_reduction = args.max_reduction.unwrap_or(cfg.globals.max_reduction);
     // --persist '': the file is still removed at the start, but neither
@@ -648,6 +689,8 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             guard.save(&hw);
             return Err(e);
         }
+        let now = Instant::now();
+        if hw.stats.due(now) { info!("{}", hw.stats.summary(now)); }
     }
 }
 
