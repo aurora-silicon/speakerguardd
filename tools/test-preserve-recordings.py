@@ -140,29 +140,48 @@ class Retention(unittest.TestCase):
         spec = importlib.util.spec_from_loader(loader.name, loader)
         helper = importlib.util.module_from_spec(spec)
         loader.exec_module(helper)
-        self.path.write_bytes(b'A' * 8)
-        previous = Path(str(self.path) + '.previous')
-        previous.write_bytes(b'B' * 8)
-        self.assertEqual(self.run_helper(16).returncode, 0)
-        archive = next(self.root.glob(self.path.name + '.saved.*'))
-        self.path.write_bytes(b'C' * 8)
         real_unlink = Path.unlink
-        def fail_second_segment(p, *args, **kwargs):
-            if p == archive / previous.name:
-                raise OSError('injected deletion failure')
-            return real_unlink(p, *args, **kwargs)
-        with mock.patch.object(helper.Path, 'unlink', autospec=True, side_effect=fail_second_segment), \
-             mock.patch.object(helper.sys, 'argv', ['preserve-recordings', str(self.path)]), \
-             mock.patch.dict(helper.os.environ, {'SG_RECORD_ARCHIVE_MAX_BYTES': '16'}):
-            self.assertNotEqual(helper.main(), 0)
-        self.assertTrue((archive / '.incomplete').exists())
-        self.assertEqual((archive / previous.name).read_bytes(), b'B' * 8)
-        self.assertEqual(self.path.read_bytes(), b'C' * 8)
-        self.assertLessEqual(self.archive_bytes(), 16)
-        for _ in range(3):
-            self.assertEqual(self.run_helper(16).returncode, 0)
-            self.assertLessEqual(self.archive_bytes(), 16)
-            self.assertTrue((archive / '.incomplete').exists())
+        real_iterdir = Path.iterdir
+        # A directory may return either segment first. If the first delete
+        # fails, all 16 bytes remain and later preservation must refuse new
+        # evidence. If one delete succeeds first, the remaining 8 bytes plus
+        # the new 8 bytes fit. Neither case may prune the incomplete archive.
+        for previous_first in [False, True]:
+            with self.subTest(previous_first=previous_first):
+                self.path = self.root / f'recording with spaces-order-{previous_first}'
+                self.path.write_bytes(b'A' * 8)
+                previous = Path(str(self.path) + '.previous')
+                previous.write_bytes(b'B' * 8)
+                self.assertEqual(self.run_helper(16).returncode, 0)
+                archive = next(self.root.glob(self.path.name + '.saved.*'))
+                self.path.write_bytes(b'C' * 8)
+                def fail_previous(p, *args, **kwargs):
+                    if p == archive / previous.name:
+                        raise OSError('injected deletion failure')
+                    return real_unlink(p, *args, **kwargs)
+                def ordered_entries(p):
+                    entries = list(real_iterdir(p))
+                    if p == archive:
+                        entries.sort(key=lambda entry: entry.name, reverse=previous_first)
+                    return iter(entries)
+                with mock.patch.object(helper.Path, 'unlink', autospec=True, side_effect=fail_previous), \
+                     mock.patch.object(helper.Path, 'iterdir', autospec=True, side_effect=ordered_entries), \
+                     mock.patch.object(helper.sys, 'argv', ['preserve-recordings', str(self.path)]), \
+                     mock.patch.dict(helper.os.environ, {'SG_RECORD_ARCHIVE_MAX_BYTES': '16'}):
+                    self.assertNotEqual(helper.main(), 0)
+                self.assertTrue((archive / '.incomplete').exists())
+                self.assertEqual((archive / previous.name).read_bytes(), b'B' * 8)
+                self.assertEqual(self.path.read_bytes(), b'C' * 8)
+                self.assertEqual(self.archive_bytes(), 16 if previous_first else 8)
+                for _ in range(3):
+                    result = self.run_helper(16)
+                    if previous_first:
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertEqual(self.path.read_bytes(), b'C' * 8)
+                    else:
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertLessEqual(self.archive_bytes(), 16)
+                    self.assertTrue((archive / '.incomplete').exists())
     def test_inherited_pruner_loses_historical_files(self):
         # Same keep-two pipeline as the deployed override, in synthetic scratch.
         for i in range(5):
