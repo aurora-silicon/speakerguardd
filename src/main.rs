@@ -175,36 +175,14 @@ impl Card {
         self.ctl.lock(&self.unlock)
     }
 
-    /// Every volume control to the card's safe value: the most the card
-    /// accepts while the volume is locked (macaudio limits the controls'
-    /// range to it there), or, once the range with the lock lifted is
-    /// known, that maximum less `safe_db`, whichever is lower.  The minimum
-    /// where that write fails (the card always accepts it).  The reduction
-    /// now applied (dB), from the value written once the maximum is known;
-    /// before that, the card's own safe level, taken to be `safe_db` until
-    /// the first ping checks it (review r7 Y5).
-    fn write_safe(&self, safe_db: f64) -> std::io::Result<f64> {
-        let (_, limit) = self.ctl.int_range(&self.volume[0])?;
-        let value = match self.volume_max {
-            Some(max) => limit.min(max - (safe_db * STEPS_PER_DB - 1e-9).ceil() as i64),
-            None => limit,
-        }
-        .max(self.volume_min);
-        match self.volume.iter().try_for_each(|id| self.ctl.write_int(id, value)) {
-            Ok(()) => Ok(match self.volume_max {
-                Some(max) => (max - value) as f64 / STEPS_PER_DB,
-                None => safe_db,
-            }),
-            Err(e) => {
-                warn!("volume control: {e} at the safe value; writing the minimum");
-                self.write_min()?;
-                Ok(guard::MUTE_DB)
-            }
-        }
+    /// Keep the controls at minimum before an unlock. A hot speaker can
+    /// still rise at the kernel safe level while both thermal nodes are
+    /// at the hard limit. The minimum is accepted while locked too.
+    fn write_safe(&self, _safe_db: f64) -> std::io::Result<f64> {
+        self.write_min()?;
+        Ok(guard::MUTE_DB)
     }
 
-    /// Every volume control to its minimum: within the card's limit
-    /// whether or not the volume is locked.
     fn write_min(&self) -> std::io::Result<()> {
         for id in &self.volume {
             self.ctl.write_int(id, self.volume_min)?;

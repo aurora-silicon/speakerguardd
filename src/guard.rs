@@ -60,8 +60,8 @@
 //! frames, and the end of every stream from its last frames to the look
 //! that sees it closed; a sense outage is charged at full scale at the
 //! least gain since the last verified boundary until periods return; a
-//! restart without a clean stop starts latched (about 4 s with the
-//! speakers at the card's safe level on the J700); and the floor takes
+//! restart without a clean stop starts latched, with the controls at
+//! minimum until both unknown hot nodes have cooled; and the floor takes
 //! 0.5 dB on a cold J700 coil, 2.5 dB at 85 C and 3.9 dB at 100 C (3 and
 //! 4 dB on the card's 0.5 dB steps), where the governor alone takes
 //! nothing.
@@ -142,12 +142,10 @@ pub trait Hw {
     fn step_db(&self) -> f64 {
         0.0
     }
-    /// Turn every volume control to the card's own safe value, which it
-    /// accepts while the volume is locked: done at the start and before
-    /// each unlock.  The reduction the controls now apply (dB), as written:
-    /// the safe level, or MUTE_DB where only their minimum could be written.
-    /// Before the controls' unlocked range is known that is the configured
-    /// safe level, which the first ping checks (`card_safe_db`).
+    /// Turn every volume control to its minimum, which it accepts while
+    /// locked, at startup and before each unlock, even without events.
+    /// Return MUTE_DB to account for the applied minimum. The kernel's
+    /// separate fallback level is checked after the first ping (`card_safe_db`).
     fn set_safe(&mut self) -> io::Result<f64>;
     /// The card's own safe level (dB below the controls' maximum) once both
     /// ranges have been read: the most the controls accept while the volume
@@ -410,27 +408,18 @@ impl Guard {
         hw.take_lock()?;
         let events = hw.events_available();
         if !events {
-            warn!("no control events from the card: streams between two looks cannot be accounted; leaving the speakers at the card's safe level");
+            warn!("no control events from the card: streams between two looks cannot be accounted; keeping the volume locked at its minimum");
         }
-        // The controls' value before this run is unknown, and the budgets
-        // count samples converted at it as loud as they can have been: with
-        // the controls at the card's safe value from here on that lasts the
-        // copy queue's half second, not until the first unlock.  The card
-        // accepts that value while locked, so the speakers play at its safe
-        // level until the first unlock, as without the daemon, instead of
-        // silent (review r6).  Without events there is no unlock: they stay
-        // there.
-        let safe_now = if events {
-            // what the write applied, as it says (review r7 Y5)
-            match hw.set_safe().and_then(valid_db) {
-                Ok(applied) => Some(applied),
-                Err(e) => {
-                    warn!("volume control: {e}; the controls' value stays unknown");
-                    None
-                }
+        // Bound the old copy queue, then hold the controls at their
+        // minimum until the hot-start model permits an unlock. This write
+        // is needed even without events: in that case we never unlock,
+        // but the kernel safe level alone can still warm a hot magnet.
+        let safe_now = match hw.set_safe().and_then(valid_db) {
+            Ok(applied) => Some(applied),
+            Err(e) => {
+                warn!("volume control: {e}; the controls' value stays unknown");
+                None
             }
-        } else {
-            None
         };
         let mut speakers: Vec<SpeakerState> = cfg.speakers.iter().map(|s| SpeakerState::new(s.clone(), globals.t_ambient)).collect();
         let latched = |speakers: &mut Vec<SpeakerState>| {
@@ -1750,8 +1739,8 @@ pub mod fake {
             if (self.volume_fail)(self.t) {
                 return Err(io::Error::from_raw_os_error(libc::EIO));
             }
-            self.reduction = SAFE_DB;
-            Ok(SAFE_DB)
+            self.reduction = MUTE_DB;
+            Ok(MUTE_DB)
         }
         fn relinquish(&mut self) -> io::Result<()> {
             self.lapse_check();
@@ -2587,10 +2576,8 @@ mod tests {
     /// the start is unknown; after a clean stop it is at least the card's
     /// safe level): their power before the gain is charged to the budgets
     /// as high as it can have been, for the half second they can play.
-    /// Since the start no longer mutes the speakers (review r6), what they
-    /// play in that half second counts so too, at most the full-scale
-    /// budget reduction.  The cost is a short reduction, gone within the
-    /// budget's second.
+    /// Writing minimum at startup does not erase those old conversions.
+    /// Their cost is a short reduction, gone within the budget's second.
     #[test]
     fn a_start_during_playback_costs_little() {
         let cfg = j700();
@@ -2691,7 +2678,7 @@ mod tests {
         std::fs::write(&path, "garbage").unwrap();
         let mut hw3 = FakeHw::new(cfg.globals.channels, cfg.globals.period);
         let mut g3 = Guard::start(&mut hw3, &cfg, 20.0, Some(path.clone())).unwrap();
-        run_until(&mut g3, &mut hw3, secs(12.0)).unwrap();
+        run_until(&mut g3, &mut hw3, secs(60.0)).unwrap();
         // (hot: 12 dB, released by at most 0.5 dB per period before it arms)
         assert!(hw3.writes.first().map(|w| w.1).unwrap() >= cfg.globals.t_reduction_max - 2.0);
     }
@@ -2869,7 +2856,7 @@ mod tests {
         let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
         let mut g = Guard::start(&mut hw, &cfg, 20.0, Some(path)).unwrap();
         assert!(hw.pings.is_empty(), "unlocked at start");
-        run_until(&mut g, &mut hw, secs(12.0)).unwrap();
+        run_until(&mut g, &mut hw, secs(60.0)).unwrap();
         let first = hw.first_ping().expect("never armed");
         let second_period = secs(2.0 * cfg.globals.period as f64 / 48000.0);
         assert!(first + Duration::from_millis(1) >= second_period, "unlocked at {first:?}, before two complete periods");
@@ -2887,7 +2874,7 @@ mod tests {
         run_until(&mut g, &mut hw, secs(0.5)).unwrap();
         assert!(hw.pings.is_empty(), "unlocked a start that needs a hand-off");
         // it cools and takes the card once it may
-        run_until(&mut g, &mut hw, secs(30.0)).unwrap();
+        run_until(&mut g, &mut hw, secs(120.0)).unwrap();
         let first = hw.first_ping().expect("never armed");
         assert!(first > secs(0.5));
         assert!(hw.writes.iter().all(|w| w.1 < 10.0 - REARM_MARGIN_DB + 1e-9), "{:?}", hw.writes.first());
@@ -3442,7 +3429,8 @@ mod tests {
     }
 
     /// Review r3 T1, without events: nothing between two looks is known, so
-    /// the lock is never taken.  0.1.6 polled and renewed at 0 dB.
+    /// the volume is never unlocked. The initial minimum write must still
+    /// happen. 0.1.6 polled and renewed at 0 dB.
     #[test]
     fn without_control_events_the_lock_is_never_taken() {
         let cfg = j700();
@@ -3450,9 +3438,10 @@ mod tests {
         hw.events = false;
         hw.playing = Box::new(|t| (10..90).contains(&(t.as_millis() % 100)));
         let mut g = Guard::start(&mut hw, &cfg, 20.0, tmp_state()).unwrap();
+        assert_eq!(hw.effective_reduction(), MUTE_DB, "startup skipped the minimum write");
         run_until(&mut g, &mut hw, secs(3.0)).unwrap();
         assert!(hw.pings.is_empty() && !g.armed(), "{} pings", hw.pings.len());
-        assert!(hw.effective_reduction() >= SAFE_DB);
+        assert_eq!(hw.effective_reduction(), MUTE_DB);
     }
 
     /// Review r3 T2: a clean stop with time not yet accounted (the sense
@@ -4319,4 +4308,158 @@ mod tests {
         reference.govern(&cfg.globals);
         assert!(hw.hw.reduction >= reference.reduction_db - 1e-6, "unlocked at {} dB, the other owner's run needs {} dB", hw.hw.reduction, reference.reduction_db);
     }
+}
+
+#[cfg(test)] mod independent_hot_start {use super::*;use super::fake::*;
+struct Tracked {
+    hw: FakeHw,
+    gains: Vec<(Duration, Vec<f64>)>,
+}
+impl Tracked {
+    fn snap(&mut self) {
+        let db: Vec<_> = (0..self.hw.channels)
+            .map(|_| self.hw.effective_reduction())
+            .collect();
+        if self.gains.last().is_none_or(|(_, last)| *last != db) {
+            self.gains.push((self.hw.t, db));
+        }
+    }
+}
+impl Hw for Tracked {
+    fn now(&self) -> Instant {
+        self.hw.now()
+    }
+    fn boottime(&self) -> Duration {
+        self.hw.boottime()
+    }
+    fn events_available(&self) -> bool {
+        self.hw.events_available()
+    }
+    fn sleep(&mut self, d: Duration) {
+        self.snap();
+        self.hw.sleep(d);
+        self.snap();
+    }
+    fn take_lock(&mut self) -> io::Result<()> {
+        self.snap();
+        let out = self.hw.take_lock();
+        self.snap();
+        out
+    }
+    fn ping(&mut self) -> io::Result<()> {
+        self.snap();
+        let out = self.hw.ping();
+        self.snap();
+        out
+    }
+    fn set_reduction(&mut self, d: f64) -> io::Result<f64> {
+        self.snap();
+        let out = self.hw.set_reduction(d);
+        self.snap();
+        out
+    }
+    fn set_safe(&mut self) -> io::Result<f64> {
+        self.snap();
+        let out = self.hw.set_safe();
+        self.snap();
+        out
+    }
+    fn relinquish(&mut self) -> io::Result<()> {
+        self.snap();
+        let out = self.hw.relinquish();
+        self.snap();
+        out
+    }
+    fn sample_rate(&mut self) -> io::Result<i64> {
+        self.snap();
+        let out = self.hw.sample_rate();
+        self.snap();
+        out
+    }
+    fn open_sense(&mut self, r: u32) -> io::Result<()> {
+        self.snap();
+        let out = self.hw.open_sense(r);
+        self.snap();
+        out
+    }
+    fn close_sense(&mut self) {
+        self.snap();
+        self.hw.close_sense();
+        self.snap();
+    }
+    fn read_period(&mut self, w: &mut [i32]) -> io::Result<Option<bool>> {
+        self.snap();
+        let out = self.hw.read_period(w);
+        self.snap();
+        out
+    }
+    fn queued(&mut self) -> io::Result<u64> {
+        self.snap();
+        let out = self.hw.queued();
+        self.snap();
+        out
+    }
+    fn read_tail(&mut self, w: &mut [i32]) -> io::Result<usize> {
+        self.snap();
+        let out = self.hw.read_tail(w);
+        self.snap();
+        out
+    }
+    fn wait_rate_change(&mut self, d: Duration) -> bool {
+        self.snap();
+        let out = self.hw.wait_rate_change(d);
+        self.snap();
+        out
+    }
+    fn rate_events(&mut self) -> bool {
+        self.snap();
+        let out = self.hw.rate_events();
+        self.snap();
+        out
+    }
+}
+
+
+#[test]
+fn full_scale_after_independent_hot_nodes() {
+    check_full_scale_after_independent_hot_nodes(true);
+}
+
+#[test]
+fn full_scale_after_hot_start_without_control_events() {
+    check_full_scale_after_independent_hot_nodes(false);
+}
+
+fn check_full_scale_after_independent_hot_nodes(events: bool) {
+crate::log::set_verbosity(crate::log::Level::Error);
+let cfg=Config::parse(include_str!("../conf/apple/j700.conf")).unwrap();
+let mut hw=FakeHw::new(cfg.globals.channels,cfg.globals.period);hw.events=events;hw.level=Box::new(|_|1.0);
+let mut hw=Tracked{hw,gains:Vec::new()};
+let mut g=Guard::start(&mut hw,&cfg,20.0,None).unwrap();
+while hw.hw.t<Duration::from_secs(1200){g.tick(&mut hw).unwrap();}hw.snap();
+hw.gains.push((hw.hw.t,vec![hw.hw.effective_reduction();cfg.speakers.len()]));
+for lapse in &hw.hw.lapses {assert!(hw.gains.iter().any(|(at,_)|at==lapse)||hw.gains.iter().rev().find(|(at,_)|at<=lapse).is_some_and(|(_,ds)|ds.iter().all(|d|*d>=cfg.globals.safe_reduction)));}
+for (k,s) in cfg.speakers.iter().enumerate() {
+    let (mut c,mut m,mut peak)=(s.t_limit,s.t_limit,s.t_limit);
+    let (mut at,mut db)=(Duration::ZERO,MUTE_DB);
+    for (to,ds) in &hw.gains {
+        let h=(*to-at).as_secs_f64();
+        if h>0.0 {
+            let p=s.vs_scale.powi(2)/s.z_nominal*10f64.powf(-db/10.0);
+            let mi=cfg.globals.t_ambient+p*s.tr_magnet;let ci=mi+p*s.tr_coil;
+            let b=(m-mi)*s.tau_magnet/(s.tau_magnet-s.tau_coil);let a=c-ci-b;
+            let cc=|t:f64|ci+a*(-t/s.tau_coil).exp()+b*(-t/s.tau_magnet).exp();
+            peak=peak.max(c).max(cc(h));
+            let ratio=-a*s.tau_magnet/(b*s.tau_coil);
+            if ratio>0.0 {let t=ratio.ln()/(1.0/s.tau_coil-1.0/s.tau_magnet);if t>0.0&&t<h {peak=peak.max(cc(t));}}
+            c=cc(h);m=mi+(m-mi)*(-h/s.tau_magnet).exp();
+        }
+        at=*to;db=ds[k];
+    }
+    eprintln!("NEO_HOT {} peak={peak:.9} limit={}",s.name,s.t_limit);
+    assert!(peak<=s.t_limit+1e-6);
+}
+eprintln!("NEO_TRACE events={events} pings={} first={:?} lapses={}",hw.hw.pings.len(),hw.hw.pings.first(),hw.hw.lapses.len());
+assert!(events || hw.hw.pings.is_empty(), "unlocked without control events");
+}
 }

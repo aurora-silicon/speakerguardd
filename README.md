@@ -306,11 +306,21 @@ model state file (`-s ''` for none).  `-V` prints the version and the
 source commit, which the daemon also logs when it starts (`make` takes the
 commit from git; a package sets `SPEAKERGUARDD_COMMIT`).
 
-The daemon writes the controls to the card's safe value at its start and
-before each unlock.  The card accepts that value while the volume is locked.
-Until the first unlock the speakers play at the card's safe level, as they
-do without the daemon, and an unlock never lets anything louder through.
-At the first ping the daemon reads the controls' range with the lock lifted
-and checks the card's safe level (the locked maximum against it) against
-`safe_reduction`.  A card that is louder there than the configuration says
-is never unlocked: the speakers stay at its safe level.
+The daemon writes the controls to their minimum at startup and before each
+unlock. The startup write also runs when control events are unavailable;
+that path never unlocks. The card accepts the minimum while locked. At the
+first ping the daemon reads the controls' range with the lock lifted and
+checks the card's safe level against `safe_reduction`. A card whose fallback
+is louder than configured is handed back to the kernel.
+
+The hot-start backport bounds the J700 coil and magnet independently,
+including the possible queued full-scale drain. An unknown prior session
+keeps the hard latch until this envelope has cooled. The existing floor,
+queue rules and kernel safe level remain in effect. A no-device 20-minute
+full-scale regression starts both truth nodes at 135 C, with and without
+control events. The no-events case also checks that no ping occurs.
+
+The controls are held at minimum before the first unlock and each retake.
+Even the kernel safe level can add heat when both nodes start at the hard
+limit. The minimum write prevents that startup dose. Kernel fallback,
+copy-queue accounting and the running output floor are unchanged.
