@@ -348,6 +348,8 @@ pub const REARM_PERIODS: u32 = 2;
 pub const REARM_MARGIN_DB: f64 = 3.0;
 /// The reduction the volume controls' minimum stands for (dB).
 pub const MUTE_DB: f64 = 120.0;
+/// How long a clean stop waits for the recording's last records to reach the disk.
+const RECORD_FINISH: Duration = Duration::from_secs(2);
 /// Where speakersafetyd notes that it has run since boot (its "warm boot"
 /// flag: /run/speakersafetyd/speakersafetyd.flag from 2.0, written into its
 /// runtime directory, /run/speakersafetyd.flag before; the ref Macs run
@@ -1025,6 +1027,12 @@ impl Guard {
         }
         if self.write_state(hw, after, after, true) {
             self.persist(hw, after);
+            if let Some(mut r) = self.rec.take() {
+                // the last records reach the disk before the process ends
+                if !r.finish(RECORD_FINISH) {
+                    warn!("recording: its last records may be missing");
+                }
+            }
             Ok(())
         } else {
             Err("the final model state could not be saved".into())

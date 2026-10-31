@@ -128,6 +128,8 @@ pub struct Recorder {
     ring: Option<(PathBuf, u64)>,
     header: Vec<u8>,
     async_tx: Option<SyncSender<DiskCommand>>,
+    /// The disk worker's end: true once it has written and flushed everything.
+    done: Option<mpsc::Receiver<bool>>,
 }
 
 enum DiskCommand {
@@ -164,6 +166,7 @@ impl Recorder {
     pub fn create_async(path: &Path, cfg: &Config, events: bool, max_bytes: u64) -> io::Result<Recorder> {
         let segment = (max_bytes / 2).max(1);
         let (tx, rx) = mpsc::sync_channel(32);
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
         let file = path.to_path_buf();
         std::thread::Builder::new().name("sg-record-writer".into()).spawn(move || {
             let result = (|| -> io::Result<()> {
@@ -179,13 +182,16 @@ impl Recorder {
                 }
                 out.flush()
             })();
-            if let Err(e) = result {
+            if let Err(e) = &result {
                 crate::warn!("recording disabled: {e}; protection continues");
             }
+            // a clean stop waits for this (Recorder::finish)
+            let _ = done_tx.send(result.is_ok());
         })?;
         let mut rec = Recorder::to_mode(Box::new(AsyncWriter(tx.clone())), cfg, events, segment, true)?;
         rec.ring = Some((path.to_path_buf(), segment));
         rec.async_tx = Some(tx);
+        rec.done = Some(done_rx);
         Ok(rec)
     }
 
@@ -205,13 +211,28 @@ impl Recorder {
             fingerprint(cfg), ring as u8
         ).into_bytes();
         out.write_all(&header)?;
-        Ok(Recorder { out, s16, left: max_bytes.saturating_sub(header.len() as u64), ring: None, header, async_tx: None })
+        Ok(Recorder { out, s16, left: max_bytes.saturating_sub(header.len() as u64), ring: None, header, async_tx: None, done: None })
     }
 
     fn put(&mut self, b: &[u8]) -> io::Result<()> {
         self.out.write_all(b)?;
         self.left = self.left.saturating_sub(b.len() as u64);
         Ok(())
+    }
+
+    /// A clean stop: write out what is queued, close the recording, and wait
+    /// for the disk worker, at most `timeout`, so that the process does not
+    /// end before the last records are on disk.  Only the clean stop waits:
+    /// a recorder dropped on a full queue or a failed rotation never blocks
+    /// the governing loop.  True once everything is written.
+    pub fn finish(&mut self, timeout: Duration) -> bool {
+        let flushed = self.out.flush().is_ok();
+        self.out = Box::new(io::sink());
+        self.async_tx = None;
+        match self.done.take() {
+            Some(done) => done.recv_timeout(timeout) == Ok(true) && flushed,
+            None => flushed,
+        }
     }
 
     /// The size limit was reached: the recording ends here.
@@ -256,7 +277,7 @@ impl Recorder {
         out.write_all(&self.header)?;
         let mut fresh = Recorder { out: Box::new(out), s16: self.s16,
             left: segment.saturating_sub(self.header.len() as u64),
-            ring: self.ring.clone(), header: self.header.clone(), async_tx: None };
+            ring: self.ring.clone(), header: self.header.clone(), async_tx: None, done: None };
         fresh.start(t, governor, guard, max, state)?;
         fresh.loss(t, LOSS_ROTATION, 0)?;
         fresh.out.flush()?;
@@ -1708,6 +1729,24 @@ mod tests {
         assert!(out.text.contains("live only") && !out.text.contains("certification: refused"), "{}", out.text);
         let csv = std::fs::read_to_string(csv).unwrap();
         assert!(csv.lines().count() > 100);
+    }
+
+    /// A clean stop's finish waits for the disk worker: every record the
+    /// recorder queued is in the file.
+    #[test]
+    fn finishing_an_async_recorder_writes_everything() {
+        let cfg = j700();
+        let path = tmp("async-finish.rec");
+        let _ = std::fs::remove_file(&path);
+        let mut rec = Recorder::create_async(&path, &cfg, true, 1 << 30).unwrap();
+        let header = rec.header.len();
+        let chunk = vec![0x55u8; 4096];
+        for _ in 0..16 {
+            rec.out.write_all(&chunk).unwrap();
+        }
+        assert!(rec.finish(Duration::from_secs(5)));
+        assert_eq!(std::fs::metadata(&path).unwrap().len() as usize, header + 16 * chunk.len());
+        std::fs::remove_file(&path).unwrap();
     }
 
     /// A V/I recording certifies too: the periods before the lock, played
