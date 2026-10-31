@@ -4,10 +4,12 @@ Description=Speaker Protection Daemon (feed-forward)
 # speakers sit at the card's safe level.  A restarted daemon resumes the
 # thermal model from /run/speakerguardd/state only after a clean stop, and
 # otherwise starts it at the coils' limit.  The first start of a boot
-# starts from evidence (boot_resume = evidence): the hottest any protected
-# past can have left the speakers, narrowed by the last run's record in
-# /var/lib/speakerguardd (a clean stop's, or a checkpoint written every
-# 10 s while running).  A crash loop gives up after five
+# (no /run state and no /run/speakerguardd/unlocked marker of this boot)
+# starts from evidence (boot_resume = evidence, on machines where every
+# owner governs one model): the hottest any protected past can have left
+# the speakers, narrowed by the last run's record in /var/lib/speakerguardd
+# (a clean stop's, or a checkpoint written every 10 s while running).
+# RuntimeDirectoryPreserve keeps that marker across restarts.  A crash loop gives up after five
 # attempts and leaves the speakers at that level.
 # One daemon owns the speaker sense PCM and the volume interlock: whichever
 # takes it first protects the speakers, and the other cannot start.  This

@@ -339,13 +339,17 @@ impl SpeakerState {
     /// it the most a protected coil can have taken in the rest of the
     /// minute (or the record's, if more).  Latched only at the limit.
     pub fn assume_evidence(&mut self, globals: &Globals, saved: Option<(f64, f64, f64)>, d: Option<f64>, uptime: f64, floor: f64) {
-        use crate::boot::{budget_history, protected_energy, start_bound};
+        use crate::boot::{budget_history, protected_energy, start_bound_in, SENSOR_MARGIN_K};
         self.configure_voltage(globals);
         let s = &self.spec;
         let ta = globals.t_ambient;
-        let th = crate::engine::Thermal::new(s.tr_coil, s.tau_coil, s.tr_magnet, s.tau_magnet, ta);
+        // a chassis sensor over the model's ambient raises the ambient the
+        // bound relaxes toward, not only the floor (`floor` is the sensor
+        // plus its margin)
+        let ta_hi = if floor.is_finite() { ta.max(floor - SENSOR_MARGIN_K) } else { ta };
+        let th = crate::engine::Thermal::new(s.tr_coil, s.tau_coil, s.tr_magnet, s.tau_magnet, ta_hi);
         let safe = self.worst_case_power(globals.safe_reduction);
-        let (c, m) = start_bound(&th, s.t_limit, ta, safe, uptime, saved.map(|x| (x.0, x.1)), d);
+        let (c, m) = start_bound_in(&th, s.t_limit, ta_hi, ta, safe, uptime, saved.map(|x| (x.0, x.1)), d);
         self.t_coil = c.max(floor);
         self.t_magnet = m.max(floor);
         self.t_peak = self.t_coil;

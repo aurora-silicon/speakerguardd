@@ -582,6 +582,10 @@ impl Hw for RealHw {
     fn chassis(&self) -> Option<f64> {
         boot::chassis_temperature(std::path::Path::new("/sys/class/hwmon"))
     }
+    fn protection_override(&self) -> Option<String> {
+        // speakersafetyd's flags are checked for every start (guard.rs)
+        boot::protection_override(&[], boot::OVERRIDE_PARAMS)
+    }
     fn wall(&self) -> persist::Wall {
         let realtime = wallclock::synchronized_realtime();
         let synced = realtime.is_some();

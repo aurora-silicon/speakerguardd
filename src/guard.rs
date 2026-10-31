@@ -229,6 +229,11 @@ pub trait Hw {
     fn chassis(&self) -> Option<f64> {
         None
     }
+    /// Why the card's safe level since boot cannot be vouched for (a
+    /// kernel override is set), if it cannot.
+    fn protection_override(&self) -> Option<String> {
+        None
+    }
     /// The clocks and the boot's id (persist.rs); none by default.
     fn wall(&self) -> crate::persist::Wall {
         crate::persist::Wall::default()
@@ -325,6 +330,12 @@ fn state_write_durable(path: &std::path::Path, text: &str) -> io::Result<()> {
     drop(f);
     std::fs::rename(&tmp, path)?;
     sync_dir(path)
+}
+
+/// Every owner of these speakers governs one model (boot.rs, "One
+/// model"): no V/I sense, the legacy governor, no guard.
+pub fn one_model(cfg: &Config) -> bool {
+    cfg.controls.vsense.is_none() && cfg.controls.isense.is_none() && cfg.globals.governor == Governor::Legacy && cfg.globals.guard.is_none()
 }
 
 /// The first start of a boot with `boot_resume = evidence` (boot.rs): the
@@ -594,6 +605,9 @@ pub struct Guard {
     /// The state kept across a reboot (persist.rs), and the configuration's
     /// fingerprint it is bound to.
     persist_path: Option<PathBuf>,
+    /// This run has written the /run marker that no later start of this
+    /// boot may start from evidence (boot.rs).
+    marked: bool,
     /// Writes the running checkpoints for the next boot (boot_resume =
     /// evidence), off the protection loop.
     checkpoint: Option<crate::boot::Checkpointer>,
@@ -674,7 +688,12 @@ impl Guard {
         // the unified governor's opt-in, an unqualified machine's, and the
         // asahi governor's sense, before the card is touched
         cfg.check_governor()?;
-        let globals = cfg.globals.clone();
+        let mut globals = cfg.globals.clone();
+        if globals.boot_resume == BootResume::Evidence && !one_model(cfg) {
+            // C2 of the 2026-10-31 safety review (boot.rs, "One model")
+            info!("boot_resume evidence needs one model shared with every other owner (no V/I sense, the legacy governor, no guard): the first start of a boot is latched");
+            globals.boot_resume = BootResume::Latched;
+        }
         let governing = globals.governor;
         let mut engine = Engine::new(cfg, governing == Governor::Unified || globals.shadow);
         if governing != Governor::Legacy && !engine.as_ref().is_some_and(|e| e.has(governing)) {
@@ -757,16 +776,26 @@ impl Guard {
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
                     first_of_boot = true;
                     if globals.boot_resume == BootResume::Evidence && persist_path.is_some() {
-                        // no daemon unlocked the card this boot: it has held
-                        // its safe level since the kernel started
-                        match evidence_start(hw, cfg, persist_path.as_deref()) {
-                            Some((sp, en, why)) => {
+                        // no /run state is not proof that no daemon unlocked
+                        // the card this boot: the marker is (boot.rs), and
+                        // nothing may have overridden the card's safe level
+                        let refused = crate::boot::marker_says_unlocked(&path.with_file_name(crate::boot::MARKER_NAME), &hw.stamp()).or_else(|| hw.protection_override());
+                        let start = match refused {
+                            Some(why) => Err(Some(why)),
+                            None => evidence_start(hw, cfg, persist_path.as_deref()).ok_or(None),
+                        };
+                        match start {
+                            Err(Some(why)) => {
+                                info!("{}: no model state, but {why}; assuming hot speakers (latched)", path.display());
+                                latched(&mut speakers, &mut engine);
+                            }
+                            Ok((sp, en, why)) => {
                                 speakers = sp;
                                 engine = en;
                                 evidence = true;
                                 info!("{why}");
                             }
-                            None => {
+                            Err(None) => {
                                 info!("{}: no model state, but a record from this boot; assuming hot speakers (latched)", path.display());
                                 latched(&mut speakers, &mut engine);
                             }
@@ -935,6 +964,7 @@ impl Guard {
             },
             last_checkpoint: None,
             persist_path,
+            marked: false,
             config_fp: crate::record::fingerprint(cfg),
             last_save_try: None,
             save_failed: false,
@@ -965,6 +995,22 @@ impl Guard {
     /// Replace the state file with this run's status (released 0), or
     /// remove it.  True once no clean stop is left for a later start.
     fn invalidate<H: Hw>(&mut self, hw: &H) -> bool {
+        // with a record for the next boot, a later start of this boot that
+        // finds no /run state may start from evidence: the marker that it
+        // must not goes down first, durably, and stays (boot.rs)
+        if let (Some(_), Some(path), false) = (&self.persist_path, &self.state_path, self.marked) {
+            let marker = path.with_file_name(crate::boot::MARKER_NAME);
+            match state_write_durable(&marker, &crate::boot::marker_text(&hw.stamp())) {
+                Ok(()) => self.marked = true,
+                Err(e) => {
+                    if !self.invalidate_failed {
+                        warn!("{}: {e}; the marker for this boot could not be written, so the lock is not taken", marker.display());
+                        self.invalidate_failed = true;
+                    }
+                    return false;
+                }
+            }
+        }
         if let Some(pp) = self.persist_path.clone() {
             match state_remove_durable(&pp) {
                 Ok(()) => {}
@@ -981,6 +1027,15 @@ impl Guard {
         let Some(path) = self.state_path.clone() else { return true };
         if self.save_now(hw) {
             return true;
+        }
+        if self.persist_path.is_some() {
+            // fail closed: a restart must find this run's state, never
+            // none (removing it would make it look like a first start)
+            if !self.invalidate_failed {
+                warn!("{}: the model state could not be written, so the lock is not taken", path.display());
+                self.invalidate_failed = true;
+            }
+            return false;
         }
         match state_remove(&path) {
             Ok(()) => true,
@@ -2683,6 +2738,8 @@ pub mod fake {
         pub stamp: crate::boot::Stamp,
         /// The hottest chassis sensor.
         pub chassis: Option<f64>,
+        /// A kernel override of the safe level is set (boot.rs).
+        pub overridden: Option<String>,
         pub wall_delay: Duration,
         wall_elapsed: std::cell::Cell<Duration>,
         pub shutting: bool,
@@ -2747,6 +2804,7 @@ pub mod fake {
                 wall: crate::persist::Wall::default(),
                 stamp: crate::boot::Stamp::default(),
                 chassis: None,
+                overridden: None,
                 wall_delay: Duration::ZERO,
                 wall_elapsed: std::cell::Cell::new(Duration::ZERO),
                 shutting: false,
@@ -2948,6 +3006,9 @@ pub mod fake {
         }
         fn chassis(&self) -> Option<f64> {
             self.chassis
+        }
+        fn protection_override(&self) -> Option<String> {
+            self.overridden.clone()
         }
         fn wall(&self) -> crate::persist::Wall {
             self.wall_elapsed.set(self.wall_elapsed.get() + self.wall_delay);

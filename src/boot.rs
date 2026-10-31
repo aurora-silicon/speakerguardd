@@ -19,6 +19,42 @@
 //! clocks are right beyond what they are checked for, not that the machine
 //! was off.
 //!
+//! **The first start of a boot.**  The uptime is credited as time at the
+//! card's safe level only when no daemon can have unlocked the card since
+//! the kernel started.  The absence of the /run state alone does not show
+//! that (it can be lost, or never written).  So, before the first unlock
+//! of every boot, a daemon writes a marker next to the /run state carrying
+//! the boot id (`MARKER_NAME`), durably, and never removes it; and with a
+//! record for the next boot configured it unlocks only once its /run state
+//! is written (no removal counts instead).  A start that finds the marker
+//! from this boot (or any marker it cannot read) starts latched.  So does
+//! one that finds speakersafetyd's flag (guard.rs `FOREIGN_FLAGS`, checked
+//! for every start), or a kernel override of the card's safe level
+//! (`protection_override`).
+//!
+//! **One model.**  The assumption bounds the model an owner governed.  A
+//! model the past owner did not govern has no bound from it: speakersafetyd
+//! governs the asahi model, macOS on the V/I machines its own, with
+//! constants up to three times apart.  So the evidence start runs only
+//! where every owner governs the same model: no V/I sense, the legacy
+//! governor and no guard (the Neo, whose model is macOS's lsm2 static model
+//! with its constants).  Anywhere else `evidence` starts latched
+//! (`one_model`).
+//!
+//! **Residual risks** (accepted, see the 2026-10-31 safety review):
+//! - An RTC set back by another OS by less than the true elapsed time
+//!   narrows the magnet's bound wrongly.  Early in boot the system clock is
+//!   set from the RTC, so the two agreeing proves little there.  The error
+//!   is at most `(M* - m0) exp(-(1 + r) d' / tau_m)` with `d'` the RTC
+//!   interval: about 12 K on the Neo at 60 s, under 1 K past 200 s, and it
+//!   needs an OS that writes the RTC backwards while playing loud.
+//! - macOS appears to start its model at the 50 C ambient each boot, so its
+//!   model can under-read the truth after a hot hand-over from Linux.
+//!   Simulated: with reboot gaps of 20 s or more each way the truth stays
+//!   under this start on both nodes for every macOS play length (10 s to
+//!   1000 s); only with 10 s + 5 s gaps is the magnet 2.4 K over, and
+//!   there macOS itself had already taken the true coil to 149-164 C.
+//!
 //! **The magnet bound.**  With the two-node model (the coil follows the
 //! magnet plus `P Rc` with `tau_c`, the magnet follows ambient plus `P Rm`
 //! with `tau_m`), let `r = Rm / Rc` and `Y = tau_m M - r tau_c C`.
@@ -48,7 +84,10 @@
 //! plus what the time since can have added; without one, or one that
 //! cannot be trusted, the bound is `M*` itself.  Chassis sensors (hwmon)
 //! can only raise a start, never lower it: a coil can be 80 K over its
-//! chassis a second after loud playback, so no sensor can vouch for it.
+//! chassis a second after loud playback, so no sensor can vouch for it.  A
+//! sensor hotter than the model's ambient is the ambient of the bound (the
+//! magnet relaxes toward it), and the start is no colder than it plus a
+//! margin.
 //!
 //! **Clocks.** Only the RTC interval since the record narrows anything,
 //! and only by bounding how long another owner had to warm the magnet: a
@@ -78,7 +117,15 @@ const MAGIC: &str = "speakerguardd-evidence 1";
 /// The hottest a magnet can be after `d` seconds (None: any time) of any
 /// program that kept its coil at or under `t_hard`, from a saved magnet
 /// `m0` (None: unknown).  See the module comment.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn magnet_bound(th: &Thermal, t_hard: f64, ta: f64, m0: Option<f64>, d: Option<f64>) -> f64 {
+    magnet_bound_in(th, t_hard, ta, ta, m0, d)
+}
+
+/// `magnet_bound` with the ambient since the record at most `ta`, and the
+/// coil at the record at least `c_lo` (the model's own ambient: no node of
+/// it goes colder).  A hotter `ta` only makes the bound hotter.
+pub fn magnet_bound_in(th: &Thermal, t_hard: f64, ta: f64, c_lo: f64, m0: Option<f64>, d: Option<f64>) -> f64 {
     let r = th.tr_magnet / th.tr_coil;
     let e = (1.0 + r) * th.tau_coil / th.tau_magnet;
     let valid = [r, e, t_hard, ta].iter().all(|v| v.is_finite()) && r > 0.0 && e < 1.0;
@@ -91,9 +138,9 @@ pub fn magnet_bound(th: &Thermal, t_hard: f64, ta: f64, m0: Option<f64>, d: Opti
     let y = match m0 {
         None => y_star,
         Some(m0) => {
-            // the coil was at least the ambient (no model node goes
-            // colder), which only makes this starting Y larger
-            let y0 = th.tau_magnet * m0 - r * th.tau_coil * ta;
+            // the coil was at least the model's ambient (no model node
+            // goes colder), which only makes this starting Y larger
+            let y0 = th.tau_magnet * m0 - r * th.tau_coil * c_lo.min(ta);
             match d {
                 _ if y0 >= y_star => y0,
                 None => y_star,
@@ -124,8 +171,17 @@ pub fn tail_bound(th: &Thermal, coil: f64, magnet: f64, power: f64, lo: f64, ta:
 /// The start of one node pair: the coil at `t_hard` (or the saved coil, if
 /// hotter) and the bounded magnet when the last owner stopped, then at
 /// least `uptime` at `safe_power`.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn start_bound(th: &Thermal, t_hard: f64, ta: f64, safe_power: f64, uptime: f64, saved: Option<(f64, f64)>, d: Option<f64>) -> (f64, f64) {
-    let m = magnet_bound(th, t_hard, ta, saved.map(|s| s.1), d);
+    start_bound_in(th, t_hard, ta, ta, safe_power, uptime, saved, d)
+}
+
+/// `start_bound` with the ambient `ta` (the hottest of the model's own and
+/// a chassis sensor's) and the model's own ambient `c_lo` (the coldest a
+/// saved coil can have been).
+#[allow(clippy::too_many_arguments)]
+pub fn start_bound_in(th: &Thermal, t_hard: f64, ta: f64, c_lo: f64, safe_power: f64, uptime: f64, saved: Option<(f64, f64)>, d: Option<f64>) -> (f64, f64) {
+    let m = magnet_bound_in(th, t_hard, ta, c_lo, saved.map(|s| s.1), d);
     let m = saved.map_or(m, |s| m.max(s.1));
     let c = saved.map_or(t_hard, |s| s.0.max(t_hard)).max(m);
     tail_bound(th, c, m, safe_power, uptime, ta)
@@ -186,6 +242,57 @@ pub fn chassis_temperature(hwmon: &Path) -> Option<f64> {
         }
     }
     best
+}
+
+/// The marker a daemon writes next to its /run state before the first
+/// unlock of a boot, and never removes (see the module comment).
+pub const MARKER_NAME: &str = "unlocked";
+
+/// The marker's text: the boot id, or `unknown`.
+pub fn marker_text(now: &Stamp) -> String {
+    format!("{}\n", now.boot_id.as_deref().filter(|b| !b.trim().is_empty()).unwrap_or("unknown"))
+}
+
+/// Why a daemon may have unlocked the card this boot (`marker` read with
+/// this boot's `now`), or None when no marker of this boot exists.  Only a
+/// marker naming another boot id, with this boot's known, is set aside
+/// (a /run that is not a tmpfs); anything unreadable counts.
+pub fn marker_says_unlocked(marker: &Path, now: &Stamp) -> Option<String> {
+    match std::fs::read_to_string(marker) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => Some(format!("{}: {e}", marker.display())),
+        Ok(text) => {
+            let id = text.trim();
+            match now.boot_id.as_deref() {
+                Some(b) if !id.is_empty() && id != "unknown" && !same_id(id, b) => None,
+                _ => Some(format!("{} says a daemon unlocked the card this boot", marker.display())),
+            }
+        }
+    }
+}
+
+/// The kernel parameters that override the card's safe level.
+pub const OVERRIDE_PARAMS: &[&str] = &["/sys/module/snd_soc_macaudio/parameters/please_blow_up_my_speakers"];
+
+/// Why the card's safe level since boot cannot be vouched for by this
+/// machine's state (`flags`, `params`), or None.  A parameter that cannot
+/// be read, or reads anything but 0 or N, counts as set.
+pub fn protection_override(flags: &[&str], params: &[&str]) -> Option<String> {
+    for f in flags {
+        match std::fs::symlink_metadata(f) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return Some(format!("{f}: speakersafetyd has run since boot")),
+        }
+    }
+    for p in params {
+        match std::fs::read_to_string(p) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Some(format!("{p}: {e}")),
+            Ok(v) if matches!(v.trim(), "0" | "N" | "n") => {}
+            Ok(v) => return Some(format!("{p} is {}: the kernel's safe level is overridden", v.trim())),
+        }
+    }
+    None
 }
 
 /// What a record says about the moment it was written.
