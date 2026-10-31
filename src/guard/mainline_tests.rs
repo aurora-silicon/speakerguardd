@@ -146,3 +146,89 @@ fn secs(s: f64) -> Duration { Duration::from_secs_f64(s) }
         }
     }
 
+    /// A Hw that stalls after a ping or a write took effect (descheduled
+    /// on the way back), as the sixth review's pauses after the effect.
+    struct StallAfter {
+        hw: FakeHw,
+        ping_stall: Duration,
+        write_stall: Duration,
+    }
+    impl Hw for StallAfter {
+        fn now(&self) -> Instant { self.hw.now() }
+        fn boottime(&self) -> Duration { self.hw.boottime() }
+        fn sleep(&mut self, d: Duration) { self.hw.sleep(d) }
+        fn take_lock(&mut self) -> io::Result<()> { self.hw.take_lock() }
+        fn ping(&mut self) -> io::Result<()> {
+            let r = self.hw.ping();
+            self.hw.t += self.ping_stall;
+            r
+        }
+        fn set_min(&mut self) -> io::Result<()> { self.hw.set_min() }
+        fn set_reduction(&mut self, d: f64) -> io::Result<f64> {
+            let r = self.hw.set_reduction(d);
+            self.hw.t += self.write_stall;
+            r
+        }
+        fn relinquish(&mut self) -> io::Result<()> { self.hw.relinquish() }
+        fn sample_rate(&mut self) -> io::Result<i64> { self.hw.sample_rate() }
+        fn open_sense(&mut self, r: u32) -> io::Result<()> { self.hw.open_sense(r) }
+        fn close_sense(&mut self) { self.hw.close_sense() }
+        fn read_period(&mut self, w: &mut [i32]) -> io::Result<Option<bool>> { self.hw.read_period(w) }
+        fn queued(&mut self) -> io::Result<u64> { self.hw.queued() }
+        fn read_tail(&mut self, w: &mut [i32]) -> io::Result<usize> { self.hw.read_tail(w) }
+        fn wait_rate_change(&mut self, d: Duration) -> bool { self.hw.wait_rate_change(d) }
+        fn rate_events(&mut self) -> bool { self.hw.rate_events() }
+        fn events_available(&self) -> bool { true }
+    }
+
+    /// Review r6 W4: a ping that took effect before the daemon stalled
+    /// 0.2 s on its way back started the lease before the clock read; the
+    /// lapse it bounds is counted from before the call.
+    #[test]
+    fn the_lease_counts_from_before_the_ping() {
+        let cfg = j700();
+        let mut hw = StallAfter { hw: FakeHw::new(2, 4096), ping_stall: Duration::ZERO, write_stall: Duration::ZERO };
+        hw.hw.level = Box::new(|_| 0.0);
+        let mut g = Guard::start(&mut hw, &cfg, 20.0, tmp_state()).unwrap();
+        while !g.armed() {
+            g.tick(&mut hw).unwrap();
+        }
+        hw.ping_stall = secs(0.2);
+        let before = hw.now();
+        g.ping_lock(&mut hw).unwrap();
+        assert!(g.last_ping <= before, "the lease counted from {:?} after the call began", g.last_ping.saturating_duration_since(before));
+    }
+
+    /// Review r6 W5: frames placed at `end` may have played up to `shift`
+    /// frames later; a lease that ran out in between counts.
+    #[test]
+    fn a_shifted_run_checks_the_lapse_at_its_late_bound() {
+        let cfg = j700();
+        let p = tmp_state().unwrap();
+        let mut hw = FakeHw::new(2, 4096);
+        let mut g = Guard::start(&mut hw, &cfg, 20.0, Some(p)).unwrap();
+        let t0 = hw.now();
+        g.rate = 48000;
+        g.armed = true;
+        g.last_ping = t0;
+        g.account_to = t0 + secs(0.2);
+        g.gains = vec![Gain { at: t0 - secs(1.0), lo: vec![0.0; 2], hi: vec![0.0; 2], kernel: false, cands: vec![vec![(0.0, 0.0)]; 2] }];
+        // ends 10 ms before the lapse, may have played 20 ms later
+        g.measure_shifted(t0 + secs(0.24), 4096, 960).unwrap();
+        let lapse = t0 + KERNEL_LOCK_TIMEOUT;
+        assert!(g.gains.iter().any(|e| e.kernel && e.at <= lapse + secs(1e-6) && e.at >= lapse - secs(1e-6)), "no safe level from the lapse: {:?}", g.gains);
+    }
+
+
+#[test]
+fn recent_programme_power_is_observed_and_cleared_on_close() {
+    let cfg = j700();
+    let mut hw = FakeHw::new(2, 4096);
+    hw.level = Box::new(|_| 0.5);
+    hw.playing = Box::new(|t| t < secs(2.0));
+    let mut g = Guard::start(&mut hw, &cfg, 20.0, tmp_state()).unwrap();
+    super::tests::run_until(&mut g, &mut hw, secs(1.0)).unwrap();
+    assert!(g.speakers.iter().all(|s| s.p_recent > 0.0));
+    super::tests::run_until(&mut g, &mut hw, secs(3.0)).unwrap();
+    assert!(g.speakers.iter().all(|s| s.p_recent == 0.0));
+}
