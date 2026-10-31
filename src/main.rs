@@ -143,6 +143,7 @@ fn usage() -> ! {
          --csv <FILE>                    With --replay: one line per period\n  \
          -v, --verbose                   More logging (repeatable)\n  \
          -q, --quiet                     Less logging\n  \
+         -V, --version                   The version and source commit\n  \
          -h, --help                      This text"
     );
     std::process::exit(2)
