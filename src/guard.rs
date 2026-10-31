@@ -1028,6 +1028,10 @@ impl Guard {
         if self.write_state(hw, after, after, true) {
             self.persist(hw, after);
             if let Some(mut r) = self.rec.take() {
+                // complete: everything up to the stop is in the recording
+                if let Err(e) = r.seal(after.as_nanos() as u64) {
+                    warn!("recording: sealing it failed: {e}");
+                }
                 // the last records reach the disk before the process ends
                 if !r.finish(RECORD_FINISH) {
                     warn!("recording: its last records may be missing");

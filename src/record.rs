@@ -16,7 +16,8 @@
 //!   period (short, stalled, a capture or position error).
 //! * `A` the lock taken or handed to the kernel, with the reason; `H` the
 //!   governing model's hard latch set or cleared; `X` a failed control
-//!   write.  `Z` the end, when the recording stopped early.
+//!   write.  `Z` the end: a clean stop's seal (the recording is complete),
+//!   or an early end (the size limit).
 //! * `C` a span of the guard's account (from, to) and how it was accounted:
 //!   measured, charged at full scale or cooled.  `K` a look at closed
 //!   speakers that charged, with the span it charged and the change events
@@ -93,6 +94,8 @@ pub const FAIL_MIN: u8 = 1;
 pub const FAIL_TARGET: u8 = 2;
 /// Why a recording ended early (`Z`).
 const END_FULL: u8 = 1;
+/// `Z` after a clean stop: the recording is complete, not cut short.
+const END_CLEAN: u8 = 2;
 
 /// A short fingerprint of a configuration, so that a replay can say it is
 /// not running the configuration that was recorded.
@@ -218,6 +221,16 @@ impl Recorder {
         self.out.write_all(b)?;
         self.left = self.left.saturating_sub(b.len() as u64);
         Ok(())
+    }
+
+    /// A clean stop: seal the recording as complete.  Only the clean stop
+    /// does this; a crash or kill leaves a ring recording unsealed, and the
+    /// reader treats it as cut short.
+    pub fn seal(&mut self, t: u64) -> io::Result<()> {
+        let mut b = Self::head(b'Z', t);
+        b.push(END_CLEAN);
+        self.put(&b)?;
+        self.out.flush()
     }
 
     /// A clean stop: write out what is queued, close the recording, and wait
@@ -635,6 +648,7 @@ impl Timeline {
         };
         let mut wakes = Vec::new();
         let mut started = false;
+        let mut sealed = false;
         loop {
             let tag = match read_u8(&mut inp) {
                 Ok(t) => t,
@@ -754,8 +768,13 @@ impl Timeline {
                         size += 10;
                     }
                     b'Z' => {
-                        let _ = read_u8(&mut inp)?;
-                        tl.truncated = Some(t);
+                        // a clean stop's seal ends a complete recording;
+                        // any other end (the size limit) is an early one
+                        if read_u8(&mut inp)? == END_CLEAN {
+                            sealed = true;
+                        } else {
+                            tl.truncated = Some(t);
+                        }
                         size += 1;
                     }
                     _ => return Err(io::Error::new(io::ErrorKind::InvalidData, format!("unknown record {tag:#x}"))),
@@ -775,7 +794,7 @@ impl Timeline {
             }
             offset += size;
             tl.last = tl.last.max(t);
-            if tl.truncated.is_some() {
+            if tl.truncated.is_some() || sealed {
                 break;
             }
         }
@@ -1747,6 +1766,44 @@ mod tests {
         assert!(rec.finish(Duration::from_secs(5)));
         assert_eq!(std::fs::metadata(&path).unwrap().len() as usize, header + 16 * chunk.len());
         std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A live run in a ring recording, as the daemon records (written
+    /// synchronously here: on the fake card a test outruns the async
+    /// worker, whose full queue drops records), with or without a clean
+    /// stop at its end.
+    fn record_live(cfg: &Config, name: &str, clean: bool) -> PathBuf {
+        let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
+        hw.level = Box::new(|_| 0.6);
+        hw.playing = Box::new(|t| t > secs(2.0) && t < secs(4.0));
+        let path = tmp(name);
+        let _ = std::fs::remove_file(&path);
+        let mut g = Guard::start(&mut hw, cfg, cfg.globals.max_reduction, tmp_state()).unwrap();
+        g.attach_recorder(&hw, Recorder::create(&path, cfg, hw.events, 1 << 30).unwrap());
+        run_until(&mut g, &mut hw, secs(6.0)).unwrap();
+        assert!(g.armed());
+        if clean {
+            g.stop(&mut hw).unwrap();
+            while !g.released(&hw) {
+                g.tick(&mut hw).unwrap();
+            }
+            g.final_save(&hw).unwrap();
+        }
+        drop(g);
+        path
+    }
+
+    /// A clean stop seals a ring recording: it reads as complete.  Without
+    /// one (a crash, a kill) it still reads as cut short.
+    #[test]
+    fn a_clean_stop_seals_a_live_recording() {
+        let cfg = j700();
+        for clean in [true, false] {
+            let path = record_live(&cfg, if clean { "sealed.rec" } else { "unsealed.rec" }, clean);
+            let tl = Timeline::read(&path, &cfg).unwrap();
+            assert_eq!(tl.truncated.is_none(), clean, "clean stop {clean}: truncated {:?}", tl.truncated);
+            std::fs::remove_file(&path).unwrap();
+        }
     }
 
     /// A V/I recording certifies too: the periods before the lock, played
