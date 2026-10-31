@@ -425,6 +425,17 @@ impl Thermal {
         v + 1e-9 * v.abs().max(1.0)
     }
 
+    /// Both node peaks over an indefinite constant-power tail. Reuse the
+    /// same interior-extremum bound as hold(), including its conservative
+    /// near-equal-pole case, without integrating an infinite interval.
+    pub fn indefinite_peaks(&self, power: f64, t_ambient: f64) -> (f64, f64) {
+        let magnet = hi(self.t_magnet, t_ambient + power * self.tr_magnet);
+        let steady = t_ambient + power * (self.tr_coil + self.tr_magnet);
+        let coil = hi(hi(self.t_coil, steady),
+            self.coil_extremum(power, f64::INFINITY, t_ambient));
+        (coil, magnet)
+    }
+
     /// `dt` seconds at a power that varies inside them around a mean of
     /// `power`, in steps of at most MAX_SUB_DT; bounds of the coil and the
     /// magnet as model.rs keeps them: each step's end, plus what energy

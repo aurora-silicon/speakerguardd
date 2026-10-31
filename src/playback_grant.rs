@@ -70,10 +70,14 @@ impl Constraint<'_> {
         }
         let b = th.tr_magnet / th.tau_magnet;
         let k = (th.tr_coil / th.tau_coil).max(b);
-        let magnet = th
-            .t_magnet
-            .max(self.ambient + self.safe_power * th.tr_magnet);
-        let coil = th.t_coil.max(magnet + self.safe_power * th.tr_coil);
+        // The old invariant rectangle jumped the coil immediately to
+        // max(Tm, Tm_safe) + Ps*Rc. A hot magnet cools while the coil warms;
+        // use the actual constant-tail extremum instead. Unknown output
+        // energy still retains its complete arbitrary-delay impulse bound.
+        let (coil, magnet) = th.indefinite_peaks(self.safe_power, self.ambient);
+        // Both are sufficient bounds. Retain the old one if extremum
+        // rounding makes it tighter, so numerical padding cannot regress it.
+        let coil = coil.min(th.t_coil.max(magnet + self.safe_power * th.tr_coil));
         // A deliberate numerical margin; not a raised thermal limit.
         let margin = 1e-8 * self.ceiling.abs().max(1.0);
         let available =
@@ -341,6 +345,67 @@ mod tests {
                 assert!(c < 130.0 && m < 130.0);
             }
         }
+    }
+
+    #[test]
+    fn safe_tail_recovers_headroom_from_a_cooling_hot_magnet() {
+        let mut th = Thermal::new(104.9, 3.9, 129.5, 70.0, 60.0);
+        th.t_magnet = 100.0;
+        let c = constraint(&th);
+        let old_magnet = th.t_magnet.max(c.ambient + c.safe_power * th.tr_magnet);
+        let old_coil = th.t_coil.max(old_magnet + c.safe_power * th.tr_coil);
+        let b = th.tr_magnet / th.tau_magnet;
+        let k = (th.tr_coil / th.tau_coil).max(b);
+        let margin = 1e-8 * c.ceiling;
+        let old_credit = ((c.ceiling - margin - old_coil) / k)
+            .min((c.ceiling - margin - old_magnet) / b);
+        let new_credit = additional_joules(&[c], zero_debt()).unwrap();
+        assert!(new_credit > old_credit + 0.1,
+            "a cooling hot magnet still costs the instantaneous rectangle: old={old_credit} new={new_credit}");
+        eprintln!("SAFE_TAIL_CREDIT old_J={old_credit:.12} new_J={new_credit:.12}");
+    }
+
+    #[test]
+    fn safe_tail_full_dose_reserve_covers_hot_nodes_and_every_arrival_delay() {
+        let mut admitted = 0;
+        let mut refused = 0;
+        for (rc, tc, rm, tm) in [
+            (104.9, 3.9, 129.5, 70.0), (26.91, 1.55, 23.93, 73.26),
+            (20.0, 3.0, 30.0, 3.0), (20.0, 30.0, 30.0, 3.0),
+            (20.0, 3.0, 30.0, 3.000001),
+        ] {
+            for coil in [50.0, 65.0, 90.0, 110.0, 125.0] {
+                for magnet in [50.0, 65.0, 90.0, 110.0, 125.0] {
+                    for safe in [0.0, 0.02, 0.2] {
+                        let mut initial = Thermal::new(rc, tc, rm, tm, coil);
+                        initial.t_magnet = magnet;
+                        let c = Constraint { safe_power: safe, ..constraint(&initial) };
+                        let debt = Debt { queued: 0.1, unspent: 0.2, downstream_tail: 0.3 };
+                        let credit = match additional_joules(&[c], debt) {
+                            Ok(credit) => credit,
+                            Err(Refusal::Exhausted) => { refused += 1; continue; }
+                            Err(error) => panic!("{error:?}"),
+                        };
+                        for delay in [0.0, 0.1, 1.0, 10.0, 1000.0] {
+                            let mut truth = initial.clone();
+                            let (c, m) = exact_interval(&mut truth, 50.0, safe, delay);
+                            assert!(c < 130.0 && m < 130.0);
+                            // The entire new grant plus every old obligation
+                            // can arrive together; no finite power, duration,
+                            // lease freshness or cooling gap is assumed.
+                            let (c, m) = truth.impulse(credit + debt.total().unwrap());
+                            assert!(c < 130.0 && m < 130.0);
+                            let (c, m) = exact_interval(&mut truth, 50.0, safe, 100000.0);
+                            assert!(c < 130.0 && m < 130.0,
+                                "model=({rc},{tc},{rm},{tm}) start=({coil},{magnet}) safe={safe} delay={delay} credit={credit} peaks=({c},{m})");
+                            admitted += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(admitted > 1000);
+        eprintln!("SAFE_TAIL_WITNESSES admitted={admitted} refused-starts={refused}");
     }
 
     #[test]
