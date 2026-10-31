@@ -130,8 +130,11 @@ pub struct Globals {
     /// to the kernel.  Needs V/I sense on every speaker.
     pub guard: Option<Governor>,
     /// What the first start of a boot assumes of the time since the last
-    /// one (persist.rs): `latched` (the default) starts at the coils'
-    /// limit; `idle` resumes the state a clean stop at shutdown left, the
+    /// one: `evidence` (the default, boot.rs) starts from the hottest any
+    /// owner that kept the coils under their hard limit can have left
+    /// them, narrowed by the last run's record, where every owner governs
+    /// one model (guard.rs `one_model`; latched elsewhere); `latched` starts at the
+    /// coils' limit (persist.rs); `idle` resumes the state a clean stop at shutdown left, the
     /// gap at the card's safe level, which is only sound on a machine no
     /// other OS drives the speakers on.
     pub boot_resume: BootResume,
@@ -139,6 +142,7 @@ pub struct Globals {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BootResume {
+    Evidence,
     Latched,
     Idle,
 }
@@ -345,9 +349,10 @@ impl Config {
                 Some(v) => return Err(ConfigError(format!("[Globals] guard {v:?}: none or asahi"))),
             },
             boot_resume: match g.get("boot_resume").map(String::as_str) {
-                None | Some("latched") => BootResume::Latched,
+                None | Some("evidence") => BootResume::Evidence,
+                Some("latched") => BootResume::Latched,
                 Some("idle") => BootResume::Idle,
-                Some(v) => return Err(ConfigError(format!("[Globals] boot_resume {v:?}: latched or idle"))),
+                Some(v) => return Err(ConfigError(format!("[Globals] boot_resume {v:?}: evidence, latched or idle"))),
             },
         };
         if !(globals.max_reduction.is_finite() && globals.max_reduction > 0.0) {

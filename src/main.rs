@@ -14,6 +14,7 @@
 //! its safe volume, and the daemon takes the lock back once it can.
 
 mod alsa;
+mod boot;
 mod config;
 mod engine;
 mod guard;
@@ -126,7 +127,7 @@ fn usage() -> ! {
          --wait-for-card <SECONDS>       Wait for card discovery before failing (default 30; 0 disables waiting)\n  \
          -m, --max-reduction <DB>        Historical recording threshold, accepted for compatibility (writes use the hardware range)\n  \
          -s, --state <FILE>              Model state kept across restarts (default /run/speakerguardd/state)\n  \
-         --persist <FILE>                Model state kept across a reboot, with boot_resume = idle (default /var/lib/speakerguardd/state; empty: never kept or resumed, still removed)\n  \
+         --persist <FILE>                The last run's record for the next boot (boot_resume = evidence or idle; default /var/lib/speakerguardd/state; empty: every boot starts latched, the file still removed)\n  \
          --governor <NAME>               legacy, asahi or unified (default: the config's, else legacy)\n  \
          --guard <NAME>                  asahi: the unified governor's card also gets the asahi governor's reductions (default: the config's, else none)\n  \
          --shadow                        Run every governor and log them to shadow.jsonl next to the state\n  \
@@ -574,6 +575,16 @@ impl Hw for RealHw {
     }
     fn events_available(&self) -> bool {
         self.card.events
+    }
+    fn stamp(&self) -> boot::Stamp {
+        boot::read_stamp()
+    }
+    fn chassis(&self) -> Option<f64> {
+        boot::chassis_temperature(std::path::Path::new("/sys/class/hwmon"))
+    }
+    fn protection_override(&self) -> Option<String> {
+        // speakersafetyd's flags are checked for every start (guard.rs)
+        boot::protection_override(&[], boot::OVERRIDE_PARAMS)
     }
     fn wall(&self) -> persist::Wall {
         let realtime = wallclock::synchronized_realtime();

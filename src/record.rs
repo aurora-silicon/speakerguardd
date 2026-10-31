@@ -109,7 +109,8 @@ pub fn fingerprint(cfg: &Config) -> u64 {
     globals = globals.replace(", amp_gain_index: None", "");
     // nor a file on the default boot_resume (the recordings made before
     // the key existed still match)
-    globals = globals.replace(", boot_resume: Latched", "");
+    // (and the boot start, which says nothing of what a recording holds)
+    globals = globals.replace(", boot_resume: Latched", "").replace(", boot_resume: Evidence", "");
     // nor does a speaker without its own z_min
     let speakers = format!("{:?}", cfg.speakers).replace(", z_min_override: None", "");
     let text = format!("{globals}{:?}{speakers}", cfg.controls);

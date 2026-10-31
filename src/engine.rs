@@ -1394,6 +1394,60 @@ impl Engine {
 
     /// Nothing is known about the speakers: every model at its hard limit,
     /// latched.
+    /// The first start of a boot from evidence (boot.rs): every model node
+    /// from the hottest a protected past can have left it, `saved` (the
+    /// last run's record, if usable) narrowing the magnet, `d` the longest
+    /// another owner can have had since it, at least `uptime` at the
+    /// card's safe level since, and no colder than `floor` (a chassis
+    /// sensor plus margin).  Nothing is latched that is under its limit.
+    pub fn assume_evidence(&mut self, saved: Option<&crate::state::Saved>, d: Option<f64>, uptime: f64, floor: f64) {
+        use crate::boot::{budget_history, protected_energy, start_bound_in, SENSOR_MARGIN_K};
+        let g = self.cfg.globals.clone();
+        let ta = g.t_ambient;
+        // a chassis sensor over the model's ambient is the bound's ambient
+        let ta_hi = if floor.is_finite() { ta.max(floor - SENSOR_MARGIN_K) } else { ta };
+        let safe = 10f64.powf(-g.safe_reduction.max(0.0) / 10.0);
+        let names: Vec<String> = self.cfg.speakers.iter().map(|s| state_name(&s.name)).collect();
+        for (k, s) in self.asahi.iter_mut().flatten().enumerate() {
+            let rec = saved.and_then(|x| x.asahi.iter().find(|a| a.name == names[k])).map(|a| (a.t_coil, a.t_magnet));
+            let p = s.v_worst * s.v_worst / s.z_min * safe;
+            let (c, m) = start_bound_in(&s.th, s.t_limit, ta_hi, ta, p, uptime, rec, d);
+            s.th.t_coil = c.max(floor);
+            s.th.t_magnet = m.max(floor);
+            s.coil_peak = s.th.t_coil;
+            s.magnet_peak = s.th.t_magnet;
+            s.coil_hyst = s.th.t_coil;
+            s.magnet_hyst = s.th.t_magnet;
+            s.gain = 0.0;
+            s.hard = !(s.coil_peak < s.t_limit && s.magnet_peak < s.t_limit);
+        }
+        for (k, s) in self.unified.iter_mut().flatten().enumerate() {
+            let rec = saved.and_then(|x| x.unified.iter().find(|u| u.name == names[k]));
+            let p_ff = s.v_worst * s.v_worst / s.r_ff * safe;
+            let (c, m) = start_bound_in(&s.ff, s.t_limit, ta_hi, ta, p_ff, uptime, rec.map(|u| u.ff), d);
+            s.ff.t_coil = c.max(floor);
+            s.ff.t_magnet = m.max(floor);
+            let mut peak = hi(s.ff.t_coil, s.ff.t_magnet);
+            let z_min = s.z_min;
+            if let Some(v) = s.vi.as_mut() {
+                let p_vi = s.v_worst * s.v_worst / z_min * safe;
+                let (c, m) = start_bound_in(v, s.t_limit, ta_hi, ta, p_vi, uptime, rec.and_then(|u| u.vi), d);
+                v.t_coil = c.max(floor);
+                v.t_magnet = m.max(floor);
+                peak = hi(peak, hi(v.t_coil, v.t_magnet));
+            }
+            s.peak = peak;
+            s.hard = !(peak < s.t_limit);
+            s.reduction = 0.0;
+            let len = 60.0 - uptime.clamp(0.0, 60.0);
+            let older = protected_energy(&s.ff, s.t_limit, ta, len)
+                .max(rec.map_or(0.0, |u| 60.0 * u.mean_60s))
+                .min(s.v_worst * s.v_worst / s.r_ff * len);
+            s.history = budget_history(uptime, p_ff, older).into_iter().collect();
+            s.history_s = s.history.iter().map(|e| e.0).sum();
+        }
+    }
+
     pub fn assume_latched(&mut self) {
         let g = self.cfg.globals.clone();
         for s in self.asahi.iter_mut().flatten() {
