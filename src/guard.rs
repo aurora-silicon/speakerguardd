@@ -7323,3 +7323,6 @@ mod persist_interval_review {
 #[cfg(test)]
 #[path = "guard/deep_attenuation_tests.rs"]
 mod deep_attenuation_tests;
+
+#[cfg(test)]
+mod mainline_tests;

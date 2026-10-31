@@ -72,7 +72,7 @@ use crate::guard::{Guard, Hw, BLIND_LIMIT, DRAIN, KERNEL_LOCK_TIMEOUT, MUTE_DB};
 use crate::model::SpeakerState;
 use crate::state;
 
-const J700: &str = include_str!("../conf/apple/j700.conf");
+const J700: &str = include_str!("../../conf/apple/j700.conf");
 /// The world's sample rate, and the J700's own (with its 4096-frame period).
 const HARNESS_RATE: f64 = 16000.0;
 const REAL_RATE: f64 = 48000.0;
