@@ -101,3 +101,48 @@ fn secs(s: f64) -> Duration { Duration::from_secs_f64(s) }
         }
     }
 
+    struct SafeSays {
+        hw: FakeHw,
+        card: Option<f64>,
+    }
+    impl Hw for SafeSays {
+        fn now(&self) -> Instant { self.hw.now() }
+        fn boottime(&self) -> Duration { self.hw.boottime() }
+        fn sleep(&mut self, d: Duration) { self.hw.sleep(d) }
+        fn take_lock(&mut self) -> io::Result<()> { self.hw.take_lock() }
+        fn ping(&mut self) -> io::Result<()> { self.hw.ping() }
+        fn set_min(&mut self) -> io::Result<()> { self.hw.set_min() }
+        fn card_safe_db(&self) -> Option<f64> { self.card }
+        fn set_reduction(&mut self, d: f64) -> io::Result<f64> { self.hw.set_reduction(d) }
+        fn relinquish(&mut self) -> io::Result<()> { self.hw.relinquish() }
+        fn sample_rate(&mut self) -> io::Result<i64> { self.hw.sample_rate() }
+        fn open_sense(&mut self, r: u32) -> io::Result<()> { self.hw.open_sense(r) }
+        fn close_sense(&mut self) { self.hw.close_sense() }
+        fn read_period(&mut self, w: &mut [i32]) -> io::Result<Option<bool>> { self.hw.read_period(w) }
+        fn queued(&mut self) -> io::Result<u64> { self.hw.queued() }
+        fn read_tail(&mut self, w: &mut [i32]) -> io::Result<usize> { self.hw.read_tail(w) }
+        fn wait_rate_change(&mut self, d: Duration) -> bool { self.hw.wait_rate_change(d) }
+        fn rate_events(&mut self) -> bool { self.hw.rate_events() }
+        fn events_available(&self) -> bool { true }
+    }
+
+    #[test]
+    fn a_card_louder_at_its_safe_level_than_configured_is_never_unlocked() {
+        let cfg = j700();
+        for (card, unlocks) in [(15.0, false), (20.0, true), (25.0, true)] {
+            let mut hw = SafeSays { hw: FakeHw::new(2, 4096), card: Some(card) };
+            hw.hw.level = Box::new(|_| 0.0);
+            let mut g = Guard::start(&mut hw, &cfg, 20.0, tmp_state()).unwrap();
+            while hw.hw.t < secs(5.0) {
+                if let Err(e) = g.tick(&mut hw) {
+                    assert!(!unlocks && e.to_string().contains("kernel safe level"), "{e}");
+                    break;
+                }
+            }
+            assert_eq!(g.armed(), unlocks, "a card safe level of {card} dB");
+            if !unlocks {
+                assert!(hw.hw.pings.len() <= 1 && !hw.hw.unlocked_at(hw.hw.t), "{:?}", hw.hw.pings);
+            }
+        }
+    }
+
