@@ -312,3 +312,73 @@ fn print_idle_attenuation_by_temperature() {
         eprintln!("coil {c} magnet {m}: idle {idle:.1} dB, -14 dBFS square {:.1} dB, floor {:.2} dB", hw.reduction, g.floor_db(0.0));
     }
 }
+
+/// SAFETY REVIEW counterexample (expected to FAIL on #29 as submitted).
+///
+/// "No state under /run" is taken as "no daemon unlocked the card this
+/// boot", but `invalidate` treats a removed /run state as invalidated when
+/// the write fails (/run full), and the checkpoint under /var/lib is
+/// best-effort (a write failure is only a warning).  Here both writes fail
+/// (their temporary names are directories, standing in for ENOSPC), the
+/// first run starts from evidence, unlocks, plays full scale for a minute,
+/// and dies without a clean stop.  The restart a second later (systemd
+/// Restart=on-failure, RestartSec=1) finds neither file and starts from
+/// evidence again, crediting the whole uptime as time at the safe level,
+/// although the coil was at the daemon's own working limit a second ago.
+/// Truth is stepped from the crashed model with the gains the restarted
+/// guard lets through; it must stay under the hard limit.
+#[test]
+fn review_crash_restart_without_run_state_is_not_a_first_start() {
+    let cfg = j700();
+    let ta = cfg.globals.t_ambient;
+    let (run, keep) = (missing_state().unwrap(), missing_state().unwrap());
+    std::fs::create_dir_all(run.with_extension("tmp")).unwrap();
+    std::fs::create_dir_all(keep.with_extension("tmp")).unwrap();
+    let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
+    hw.boot = UPTIME;
+    hw.stamp = stamp("first", RTC0, true);
+    hw.level = Box::new(|_| 1.0);
+    let mut g = Guard::start_persist(&mut hw, &cfg, 20.0, Some(run.clone()), Some(keep.clone())).unwrap();
+    run_until(&mut g, &mut hw, secs(60.0)).unwrap();
+    assert!(g.armed(), "the first run never unlocked");
+    let crashed: Vec<(f64, f64)> = g.speakers.iter().map(|s| (s.t_coil, s.t_magnet)).collect();
+    let boot_at_crash = hw.boot + hw.t;
+    // a crash: no stop, no final save; the checkpointer thread just ends
+    drop(g);
+    assert!(!run.exists() && !keep.exists(), "the test premise: neither file was written");
+    // the restart, a second later, in the same boot
+    let mut hw2 = FakeHw::new(cfg.globals.channels, cfg.globals.period);
+    hw2.boot = boot_at_crash + secs(1.0);
+    hw2.stamp = stamp("first", RTC0 + 70, true);
+    hw2.level = Box::new(|_| 1.0);
+    let mut g2 = Guard::start_persist(&mut hw2, &cfg, 20.0, Some(run), Some(keep)).unwrap();
+    let start: Vec<(f64, f64)> = g2.speakers.iter().map(|s| (s.t_coil, s.t_magnet)).collect();
+    eprintln!("crashed model {crashed:?}; restart starts at {start:?}");
+    // truth: the crashed model, then 1 s at the safe level
+    let mut truth: Vec<SpeakerState> = g2.speakers.iter().zip(&crashed).map(|(s, &(c, m))| {
+        let mut t = SpeakerState::new(s.spec.clone(), ta);
+        t.t_coil = c;
+        t.t_magnet = m;
+        let p = t.worst_case_power(cfg.globals.safe_reduction);
+        t.step(p, 1.0, ta);
+        t.hard = false;
+        t
+    }).collect();
+    let mut last = hw2.t;
+    let mut hottest: f64 = 0.0;
+    while hw2.t < secs(120.0) {
+        let applied = if g2.armed() { hw2.reduction } else { cfg.globals.safe_reduction.max(hw2.reduction) };
+        g2.tick(&mut hw2).unwrap();
+        let dt = (hw2.t - last).as_secs_f64();
+        last = hw2.t;
+        for t in truth.iter_mut() {
+            let p = t.worst_case_power(applied);
+            t.step(p, dt, ta);
+            hottest = hottest.max(t.t_peak.max(t.t_coil));
+        }
+    }
+    let limit = cfg.speakers[0].t_limit;
+    eprintln!("truth hottest {hottest} C over 120 s of full scale from the restart");
+    assert!(hottest < limit, "truth reached {hottest} C against the {limit} C hard limit");
+    assert!(start.iter().zip(&crashed).all(|(s, c)| s.0 >= c.0 - 1.0 && s.1 >= c.1 - 1.0), "the restart started cooler than the crashed model: {start:?} against {crashed:?}");
+}
