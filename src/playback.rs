@@ -11,6 +11,9 @@ pub const SPEAKERS: usize = 6;
 pub const UNIT_RATE: f64 = 48000.0;
 pub const UNIT_SCALE: f64 = (1u64 << UNIT_SHIFT) as f64;
 pub const UNITY: u32 = 1 << 31;
+/// Immutable LEAP payload, 0.5 at wire full scale. Userspace PCM is S32_LE.
+/// Distinct from ordinary ALSA FLOAT_LE, whose full scale is 1.0.
+pub const FORMAT_NEO_F32: u32 = 0x1000000e;
 pub const AVAILABLE: u32 = 1;
 pub const CONFIGURED: u32 = 2;
 pub const TRANSFER_VALID: u32 = 4;
@@ -129,7 +132,7 @@ impl Snapshot {
             && (out.rate < 8000
                 || out.speakers == 0
                 || out.channels == 0
-                || ![2, 6, 10].contains(&out.format))
+                || ![2, 6, 10, FORMAT_NEO_F32].contains(&out.format))
         {
             return Err(invalid());
         }
@@ -196,6 +199,8 @@ impl Snapshot {
             && cfg.playback_slots.len() == cfg.speakers.len()
             && self.speakers == cfg.speakers.len()
             && self.channels == self.speakers
+            && (self.format != FORMAT_NEO_F32
+                || (self.card == "AppleJ700" && self.channels == 2 && !cfg.has_vi()))
             && cfg.globals.amp_gain_dbv * 1000.0 + 1e-6 >= f64::from(self.amp_gain_millidbv)
             && f64::from(self.safe_reduction_millidb) / 1000.0 >= cfg.globals.safe_reduction
     }
@@ -314,6 +319,32 @@ mod tests {
         let mut s = receipt();
         s.amp_gain_millidbv += 1;
         assert!(!s.qualified(&cfg));
+    }
+    #[test]
+    fn neo_payload_format_requires_its_identity_and_full_qualification() {
+        let cfg = crate::config::Config::parse(include_str!("../conf/apple/j700.conf")).unwrap();
+        let mut wire = receipt().wire;
+        put32(&mut wire, 44, 2);
+        put32(&mut wire, 48, 2);
+        put32(&mut wire, 52, FORMAT_NEO_F32);
+        put32(&mut wire, 56, 1);
+        put32(&mut wire, 60, 0);
+        put32(&mut wire, 64, 20000);
+        wire[456..488].fill(0);
+        wire[456..465].copy_from_slice(b"AppleJ700");
+        let s = Snapshot::decode(wire).unwrap();
+        assert!(s.qualified(&cfg)); // reference certificate, not real hardware
+        for missing in [TRANSFER_VALID, OWNED, REQUIRED, CONFIGURED] {
+            let mut s = s.clone();
+            s.flags &= !missing;
+            assert!(!s.qualified(&cfg));
+        }
+        let mut s = s;
+        s.card = "AppleJ616".into();
+        let other = crate::config::Config::parse(include_str!("../conf/apple/j616.conf")).unwrap();
+        assert!(!s.qualified(&other));
+        put32(&mut wire, 52, 14); // ordinary ALSA FLOAT_LE is a different scale
+        assert!(Snapshot::decode(wire).is_err());
     }
     #[test]
     fn corrupt_receipts_are_errors_instead_of_empty_energy() {

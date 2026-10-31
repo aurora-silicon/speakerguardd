@@ -53,7 +53,7 @@ static void host_safe(struct host_gate *g)
 	if (g->unlocked)
 		g->notice = true;
 	g->unlocked = false;
-	apple_energy_hardware_safe(&g->gate, true);
+	apple_energy_hardware_safe(&g->gate, g->format != APPLE_ENERGY_FORMAT_NEO_F32);
 }
 
 static void host_expire(struct host_gate *g, u64 now)
@@ -73,7 +73,8 @@ void *ag_new(u32 rate, u32 channels, u32 frames, u32 format, u32 transfer,
 	u32 k, width = format == 2 ? 2 : 4;
 
 	if (channels < 1 || channels > 6 || frames < 1 || frames > 4096 ||
-	    (format != 2 && format != 6 && format != 10) ||
+	    (format != 2 && format != 6 && format != 10 &&
+	     format != APPLE_ENERGY_FORMAT_NEO_F32) ||
 	    (transfer != 1 && transfer != 2))
 		return NULL;
 	g = calloc(1, sizeof(*g));
@@ -99,8 +100,9 @@ void *ag_new(u32 rate, u32 channels, u32 frames, u32 format, u32 transfer,
 		goto fail;
 	apple_energy_fallback(
 		&g->gate,
+		format == APPLE_ENERGY_FORMAT_NEO_F32 ? 0 :
 		(u32)floor(2147483648.0 * pow(10.0, -(double)safe / 20000.0)));
-	apple_energy_hardware_safe(&g->gate, true);
+	apple_energy_hardware_safe(&g->gate, g->format != APPLE_ENERGY_FORMAT_NEO_F32);
 	g->payload.filter = (struct apple_admac_playback_filter){
 		.buffer_bytes = (size_t)frames * channels * width,
 		.period_bytes = (size_t)frames * channels * width,
