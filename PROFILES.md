@@ -57,6 +57,13 @@ M3 Ultra and M4 Max identities; the M4 variant still needs its own check.
 The older public kernel has no audio configuration for the later M4/M5/M6
 boards. Their assumed routing is not evidence of kernel audio support.
 
+J713 is not one of these drafts. It is inferred to have the J413's speakers
+(shared chassis, ADT DC resistances), so its profile is
+j413.conf on the J713's measured twelve-channel sense stream, with its
+tweeters' own ADT DC resistances as z_min. Its kernel holds a locked
+SN012776 at about -100 dB, as on the J413, so it keeps the J413's 99.5 dB
+safe_reduction ([#10](https://github.com/aurora-silicon/speakerguardd/pull/10)).
+
 ## What the numbers mean
 
 A file has `[Globals]`, `[Controls]` and one `[Speaker/<name>]` section per
@@ -131,7 +138,7 @@ For later machines, the choices are:
 | --- | --- | --- |
 | J604, J614, J704, J714 | J504 | Same thermal constants as J314, with the lower 130 C woofer hard limit; later J504 slot order is explicit |
 | J716 | J316 thermal / J616 routing | The Asahi 140 C hard limit, below the existing J616's 150 C; later J616 slot order is a declared assumption, not a measured M5 map |
-| J713, J813 | J413 | J413 thermal set, with older 13-inch Air J313's lower 120 C hard limit and larger 15 K margin |
+| J813 | J413 | J413 thermal set, with older 13-inch Air J313's lower 120 C hard limit and larger 15 K margin |
 | J715, J815 | J415 | The public 15-inch Air set, including left/right differences; not the less resistive 13-inch woofer model |
 | J773, J775, J873 | J375 | Mono desktop set, with its 40 K margin and the highest public sibling amplifier cap, 21 dBV |
 
