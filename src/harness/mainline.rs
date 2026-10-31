@@ -959,7 +959,7 @@ fn harness_cfg(real_rate: bool) -> Config {
 fn state_dir(tag: u64) -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
-    let dir = std::env::temp_dir().join(format!("speakerguardd-harness-{}-{tag}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+    let dir = std::env::temp_dir().join(format!("speakerguardd-mainline-harness-{}-{tag}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir.join("state")
