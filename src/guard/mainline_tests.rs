@@ -3,6 +3,7 @@
 use super::*;
 use super::fake::*;
 use super::tests::{j700, tmp_state};
+fn secs(s: f64) -> Duration { Duration::from_secs_f64(s) }
     /// A guard holding the J700's lock at 48 kHz, both coils at `coil` and
     /// their magnets at `magnet`, the controls' history (seconds ago, dB)
     /// as given and the lock taken `unlocked` s ago: the W1 rules' state.
