@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -62,6 +63,7 @@ cargo = ['cargo', 'test', '--locked', '--release', '-j8']
 compiled = run('compile', cargo + ['--no-run']) == 0
 if compiled:
     run('full-release', cargo + ['--', '--test-threads=4'])
+if compiled and '--standard-only' not in sys.argv:
     run('continuous-fallback', cargo + ['harness::continuous::all_30144_continuous_cases_stay_within_limits',
         '--', '--ignored', '--exact', '--nocapture'], {'PAIR_METRICS': str(OUT/'continuous-fallback.csv')})
     run('continuous-reference', cargo + ['harness::continuous::all_30144_continuous_cases_stay_within_limits',
