@@ -307,6 +307,37 @@ impl SpeakerState {
         self.history_s = 60.0;
     }
 
+    /// The first start of a boot from evidence (boot.rs): the hottest a
+    /// past that kept the coil under its limit can have left it, `saved`
+    /// (coil, magnet, 60 s mean of the last run's record) narrowing the
+    /// magnet, `d` the longest another owner can have had since, at least
+    /// `uptime` at the card's safe level since, and no colder than
+    /// `floor`.  The budgets hold the safe level for the uptime and before
+    /// it the most a protected coil can have taken in the rest of the
+    /// minute (or the record's, if more).  Latched only at the limit.
+    pub fn assume_evidence(&mut self, globals: &Globals, saved: Option<(f64, f64, f64)>, d: Option<f64>, uptime: f64, floor: f64) {
+        use crate::boot::{budget_history, protected_energy, start_bound_in, Thermal, SENSOR_MARGIN_K};
+        let s = &self.spec;
+        let ta = globals.t_ambient;
+        // a chassis sensor over the model's ambient raises the ambient the
+        // bound relaxes toward, not only the floor (`floor` is the sensor
+        // plus its margin)
+        let ta_hi = if floor.is_finite() { ta.max(floor - SENSOR_MARGIN_K) } else { ta };
+        let th = Thermal::new(s.tr_coil, s.tau_coil, s.tr_magnet, s.tau_magnet, ta_hi);
+        let safe = self.worst_case_power(globals.safe_reduction);
+        let (c, m) = start_bound_in(&th, s.t_limit, ta_hi, ta, safe, uptime, saved.map(|x| (x.0, x.1)), d);
+        self.t_coil = c.max(floor);
+        self.t_magnet = m.max(floor);
+        self.t_peak = self.t_coil;
+        self.hard = !(self.t_peak < s.t_limit);
+        self.reduction_db = 0.0;
+        self.reducing = false;
+        let len = 60.0 - uptime.clamp(0.0, 60.0);
+        let older = protected_energy(&th, s.t_limit, ta, len).max(saved.map_or(0.0, |x| 60.0 * x.2)).min(self.worst_case_power(0.0) * len);
+        self.history = budget_history(uptime, safe, older).into_iter().collect();
+        self.history_s = self.history.iter().map(|e| e.0).sum();
+    }
+
     /// The steady state at `power` watts, as if it had run for ever; the
     /// budgets see it as a minute at `pre` watts before the gain.
     pub fn settle_at(&mut self, power: f64, pre: f64, t_ambient: f64) {
