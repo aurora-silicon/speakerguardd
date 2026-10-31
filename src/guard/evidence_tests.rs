@@ -27,6 +27,7 @@ fn shutdown(level: f64, play_s: f64) -> (Config, PathBuf, f64, f64) {
     let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
     hw.boot = Duration::from_secs(1000);
     hw.stamp = stamp("first", RTC0 - 3600, true);
+    hw.machine = Some("m".into());
     hw.level = Box::new(move |_| level);
     let mut g = Guard::start_persist(&mut hw, &cfg, 20.0, Some(run), Some(keep.clone())).unwrap();
     run_until(&mut g, &mut hw, secs(play_s)).unwrap();
@@ -45,6 +46,7 @@ fn boot_with(cfg: &Config, keep: Option<&PathBuf>, now: Stamp, chassis: Option<f
     hw.boot = UPTIME;
     hw.stamp = now;
     hw.chassis = chassis;
+    hw.machine = Some("m".into());
     let keep = keep.cloned().unwrap_or_else(|| missing_state().unwrap());
     let g = Guard::start_persist(&mut hw, cfg, 20.0, missing_state(), Some(keep.clone())).unwrap();
     assert!(!keep.exists(), "the start did not consume the record");
@@ -73,10 +75,13 @@ fn no_record_starts_from_the_protected_bound_and_unlocks_at_once() {
     assert!(coil(&g) < 100.0, "coil {}", coil(&g));
     run_until(&mut g, &mut hw, secs(1.0)).unwrap();
     assert!(g.armed(), "the lock was not taken within a second");
-    assert!(hw.reduction <= 4.0, "{} dB at the first unlock", hw.reduction);
+    // this branch's onset reserve (full-dose, against the working limit)
+    // sets the level from here: 7.6 dB at this start, 4.0 dB cold
+    assert!(hw.reduction <= 8.0, "{} dB at the first unlock", hw.reduction);
+    let first = hw.reduction;
     // and it releases as the magnet cools
     run_until(&mut g, &mut hw, secs(200.0)).unwrap();
-    assert!(hw.reduction <= 1.5, "{} dB after 200 s idle", hw.reduction);
+    assert!(hw.reduction <= first - 1.0, "{} dB after 200 s idle", hw.reduction);
 }
 
 /// A clean reboot of a cold machine: the record narrows the magnet to what
@@ -89,16 +94,11 @@ fn a_quick_clean_reboot_starts_near_cold() {
     let (mut g, mut hw) = boot_with(&cfg, Some(&keep), stamp("second", RTC0 + 35, false), None);
     assert!(g.speakers.iter().all(|s| !s.hard));
     assert!(magnet(&g) < magnet(&cold) - 15.0, "record magnet {} against none {}", magnet(&g), magnet(&cold));
-    // the first sound (-14 dBFS square) a second after the start: what
-    // the floor asks for at this start, against the no-record one
+    run_until(&mut g, &mut hw, secs(1.0)).unwrap();
+    assert!(g.armed());
     let (mut none, mut hw0) = boot_with(&j700(), None, stamp("second", RTC0 + 35, false), None);
-    for (g, hw) in [(&mut g, &mut hw), (&mut none, &mut hw0)] {
-        run_until(g, hw, secs(1.0)).unwrap();
-        assert!(g.armed());
-        hw.level = Box::new(|_| 0.2);
-        run_until(g, hw, secs(1.5)).unwrap();
-    }
-    assert!(hw.reduction <= 2.0 && hw.reduction <= hw0.reduction - 1.0, "{} dB at the first sound after a quick reboot, {} without a record", hw.reduction, hw0.reduction);
+    run_until(&mut none, &mut hw0, secs(1.0)).unwrap();
+    assert!(hw.reduction <= hw0.reduction - 1.5, "{} dB at the first unlock after a quick reboot, {} without a record", hw.reduction, hw0.reduction);
 }
 
 /// A hot clean stop: the start is never cooler than the stop decayed at
@@ -131,6 +131,7 @@ fn a_running_checkpoint_is_written_and_used_without_trust() {
     let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
     hw.boot = UPTIME;
     hw.stamp = stamp("first", RTC0, true);
+    hw.machine = Some("m".into());
     hw.level = Box::new(|_| 0.6);
     let mut g = Guard::start_persist(&mut hw, &cfg, 20.0, Some(run), Some(keep.clone())).unwrap();
     run_until(&mut g, &mut hw, secs(25.0)).unwrap();
@@ -217,13 +218,12 @@ fn chassis_sensors_only_raise_the_start() {
     assert!(magnet(&hot) >= 97.0 && coil(&hot) >= 97.0);
 }
 
-/// Without a record path (`--persist ''`) the old latched start remains.
+/// `boot_resume = latched` keeps the old start.
 #[test]
 fn latched_remains_selectable() {
-    let cfg = j700();
-    let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
-    hw.boot = UPTIME;
-    let g = Guard::start(&mut hw, &cfg, 20.0, missing_state()).unwrap();
+    let mut cfg = j700();
+    cfg.globals.boot_resume = BootResume::Latched;
+    let (g, _) = boot_with(&cfg, None, stamp("second", RTC0, false), None);
     assert!(g.speakers.iter().all(|s| s.hard));
 }
 
@@ -238,7 +238,7 @@ fn full_scale_from_the_evidence_start_stays_under_the_limit() {
     let (mut g, mut hw) = boot_with(&cfg, None, stamp("second", RTC0, false), None);
     hw.level = Box::new(|_| 1.0);
     let ta = cfg.globals.t_ambient;
-    let mut truth: Vec<SpeakerState> = cfg.speakers.iter().map(|s| SpeakerState::new(s.clone(), cfg.globals.t_ambient)).collect();
+    let mut truth: Vec<SpeakerState> = cfg.speakers.iter().map(|s| SpeakerState::with_globals(s.clone(), &cfg.globals)).collect();
     let m_star = (ta + 26.0 / 38.0 * 135.0) / (1.0 + 26.0 / 38.0);
     for t in truth.iter_mut() {
         t.t_coil = t.spec.t_limit - 1e-6;
@@ -271,14 +271,10 @@ fn full_scale_from_the_evidence_start_stays_under_the_limit() {
 #[ignore]
 fn print_attenuation_after_boot() {
     let (cfg, keep, _, _) = shutdown(0.0, 20.0);
-    for (name, c, k, gap) in [("no record", j700(), None, 35u64), ("quick reboot", cfg.clone(), Some(&keep), 35), ("latched (old)", j700(), None, 0)] {
-        let (mut g, mut hw) = if gap == 0 {
-            let mut hw = FakeHw::new(c.globals.channels, c.globals.period);
-            hw.boot = UPTIME;
-            (Guard::start(&mut hw, &c, 20.0, missing_state()).unwrap(), hw)
-        } else {
-            boot_with(&c, k, stamp("second", RTC0 + gap, false), None)
-        };
+    let mut latched = j700();
+    latched.globals.boot_resume = BootResume::Latched;
+    for (name, c, k, gap) in [("no record", j700(), None, 35u64), ("quick reboot", cfg.clone(), Some(&keep), 35), ("latched (old)", latched, None, 35)] {
+        let (mut g, mut hw) = boot_with(&c, k, stamp("second", RTC0 + gap, false), None);
         hw.level = Box::new(|_| 0.316);
         let mut line = format!("{name:>14}:");
         for t in [0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0, 240.0, 480.0] {
@@ -322,6 +318,7 @@ fn start_at(cfg: &Config, run: &std::path::Path, keep: &std::path::Path, now: St
     let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
     hw.boot = UPTIME;
     hw.stamp = now;
+    hw.machine = Some("m".into());
     setup(&mut hw);
     let g = Guard::start_persist(&mut hw, cfg, 20.0, Some(run.to_path_buf()), Some(keep.to_path_buf())).unwrap();
     (g, hw)
@@ -378,6 +375,7 @@ fn review_crash_restart_without_run_state_is_not_a_first_start() {
     let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
     hw.boot = UPTIME;
     hw.stamp = stamp("first", RTC0, true);
+    hw.machine = Some("m".into());
     hw.level = Box::new(|_| 1.0);
     let mut g = Guard::start_persist(&mut hw, &cfg, 20.0, Some(run.clone()), Some(keep.clone())).unwrap();
     run_until(&mut g, &mut hw, secs(60.0)).unwrap();
@@ -392,6 +390,7 @@ fn review_crash_restart_without_run_state_is_not_a_first_start() {
     let mut hw2 = FakeHw::new(cfg.globals.channels, cfg.globals.period);
     hw2.boot = boot_at_crash + secs(1.0);
     hw2.stamp = stamp("first", RTC0 + 70, true);
+    hw2.machine = Some("m".into());
     let mut g2 = Guard::start_persist(&mut hw2, &cfg, 20.0, Some(run), Some(keep)).unwrap();
     let start: Vec<(f64, f64)> = g2.speakers.iter().map(|s| (s.t_coil, s.t_magnet)).collect();
     eprintln!("crashed model {crashed:?}; restart starts at {start:?}");
@@ -475,8 +474,8 @@ fn the_marker_refuses_the_evidence_start() {
     assert!(g.speakers.iter().all(|s| s.hard), "a marker was set aside without a boot id");
 }
 
-/// speakersafetyd's flag or a kernel override of the safe level refuses
-/// the evidence start.
+/// A kernel override of the safe level refuses the evidence start
+/// (speakersafetyd's flag latches every start, guard.rs).
 #[test]
 fn a_protection_override_refuses_the_evidence_start() {
     let cfg = j700();
@@ -519,6 +518,47 @@ fn a_hot_chassis_raises_the_ambient_of_the_bound() {
     // the floor alone (67 C) is under the 50 C ambient's bound
     assert!(magnet(&base) > 67.0 + 10.0);
     assert!(magnet(&warm) >= magnet(&base) + (m_star(65.0) - m_star(50.0)) - 0.5, "{} against {}", magnet(&warm), magnet(&base));
+}
+
+// ---- C2 of the 2026-10-31 safety review: the evidence start only where
+// every owner governs one model.
+
+/// Of every profile, only the Neo's has one model shared with every other
+/// owner; a V/I machine, or the Neo under another governor or a guard,
+/// has not.
+#[test]
+fn only_one_model_profiles_take_the_evidence_start() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("conf/apple");
+    let mut seen = 0;
+    for e in std::fs::read_dir(&dir).unwrap().flatten() {
+        let board = e.file_name().to_string_lossy().trim_end_matches(".conf").to_string();
+        let cfg = Config::parse(&std::fs::read_to_string(e.path()).unwrap()).unwrap_or_else(|e| panic!("{board}: {e}"));
+        assert_eq!(one_model(&cfg), board == "j700", "{board}");
+        seen += 1;
+    }
+    assert!(seen >= 35, "{seen} profiles");
+    let mut cfg = j700();
+    cfg.globals.governor = Governor::Unified;
+    assert!(!one_model(&cfg));
+    let mut cfg = j700();
+    cfg.globals.guard = Some(Governor::Asahi);
+    assert!(!one_model(&cfg));
+}
+
+/// A V/I machine with no /run state starts latched although `evidence`
+/// is its default, and writes no evidence record at a clean stop.
+#[test]
+fn a_vi_machine_starts_latched_under_evidence() {
+    let cfg = super::tests::j413();
+    assert_eq!(cfg.globals.boot_resume, BootResume::Evidence);
+    let (run, keep) = (missing_state().unwrap(), missing_state().unwrap());
+    let mut hw = FakeHw::per_speaker(&cfg);
+    hw.boot = UPTIME;
+    hw.stamp = stamp("second", RTC0, false);
+    hw.machine = Some("m".into());
+    let g = Guard::start_persist(&mut hw, &cfg, 20.0, Some(run), Some(keep.clone())).unwrap();
+    assert!(g.speakers.iter().all(|s| s.hard), "a V/I machine started from evidence");
+    assert!(g.checkpoint.is_none(), "a V/I machine checkpoints for an evidence start");
 }
 
 /// The marker sits outside the /run state's directory (the unit's

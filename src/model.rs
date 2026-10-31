@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 //! The protection model: the power delivered to each voice coil is estimated
-//! from the words on the speaker wire (feed-forward, there is no current
-//! sense), fed into a two-stage lumped thermal model (coil into magnet,
+//! from the words on the speaker wire (feed-forward: V^2 against the coil's
+//! DC resistance `r_ff`, which is `z_nominal` unless the configuration
+//! names it), fed into a two-stage lumped thermal model (coil into magnet,
 //! magnet into ambient, each a first-order lag), and the coil temperature
 //! drives a gain governor with a window below the limit and hysteresis.
 //! A windowed power budget (mean power over the last second and the last
@@ -20,6 +21,8 @@ use crate::config::{Globals, Speaker};
 #[derive(Debug, Clone)]
 pub struct SpeakerState {
     pub spec: Speaker,
+    /// Full-scale voltage bound, including an amplifier cap above sense full scale.
+    v_max: f64,
     /// Voice coil and magnet temperatures (°C).
     pub t_coil: f64,
     pub t_magnet: f64,
@@ -46,6 +49,8 @@ pub struct SpeakerState {
     /// gain) per step, newest last.
     history: std::collections::VecDeque<(f64, f64)>,
     history_s: f64,
+    /// Authenticated playback history plus unresolved source-queue energy.
+    playback_means: Option<(f64, f64)>,
 }
 
 /// How long samples converted at an earlier gain can keep playing (s): the
@@ -59,6 +64,7 @@ pub const SUB_BLOCKS: usize = 16;
 impl SpeakerState {
     pub fn new(spec: Speaker, t_ambient: f64) -> SpeakerState {
         SpeakerState {
+            v_max: spec.vs_scale,
             spec,
             t_coil: t_ambient,
             t_magnet: t_ambient,
@@ -72,11 +78,22 @@ impl SpeakerState {
             reducing: false,
             history: std::collections::VecDeque::new(),
             history_s: 0.0,
+            playback_means: None,
         }
     }
 
+    pub fn with_globals(spec: Speaker, globals: &Globals) -> SpeakerState {
+        let mut state = Self::new(spec, globals.t_ambient);
+        state.configure_voltage(globals);
+        state
+    }
+
+    pub(crate) fn configure_voltage(&mut self, globals: &Globals) {
+        let amplifier = crate::engine::v_worst(&self.spec, globals);
+        self.v_max = self.spec.vs_scale.max(amplifier);
+    }
+
     /// The RMS voltage a period of sense words puts across the coil.
-    #[cfg(test)]
     pub fn v_rms_of(&self, words: &[i32], channels: usize) -> f64 {
         let ch = self.spec.vs_chan;
         let frames = words.len() / channels;
@@ -114,7 +131,7 @@ impl SpeakerState {
                 })
                 .sum();
             total += sum;
-            out.push(if hi > lo { sum / (hi - lo) as f64 / self.spec.z_nominal } else { 0.0 });
+            out.push(if hi > lo { sum / (hi - lo) as f64 / self.spec.r_ff } else { 0.0 });
         }
         let v_rms = if frames > 0 { (total / frames as f64).sqrt() } else { 0.0 };
         (out, v_rms)
@@ -125,10 +142,13 @@ impl SpeakerState {
     /// (ranges, dB) that can have delivered it, never more than a
     /// full-scale signal.  A block can hold frames converted at different
     /// gains (review r5 V5), a frame only one.  A frame converted at
-    /// reduction r was at most vs_scale 10^(-r/20) and its word is at most
-    /// what was played: r fits iff r <= 20 log10(vs_scale / word).  What
+    /// reduction r was at most the configured maximum times 10^(-r/20),
+    /// and its word is at most
+    /// what was played: r fits iff r <= 20 log10(v_max / sensed_voltage).  What
     /// was played is within a step above the word: the step up is its
     /// power's bound (it matters only where the gain undone is deep).
+    /// A voltage rail below the amplifier cap stands for full possible
+    /// power, because the sense cannot report the excess voltage.
     pub fn frame_powers(&self, words: &[i32], channels: usize, possible: &[(f64, f64)]) -> (Vec<f64>, Vec<f64>) {
         let ch = self.spec.vs_chan;
         let frames = words.len() / channels;
@@ -139,11 +159,12 @@ impl SpeakerState {
         for f in 0..frames {
             let w = words[f * channels + ch] as f64;
             let v = w * scale;
-            p.push(v * v / self.spec.z_nominal);
+            let clipped = self.v_max > self.spec.vs_scale && w.abs() >= (32767i64 << 16) as f64;
+            p.push(if clipped { full } else { v * v / self.spec.r_ff });
             let w = w.abs();
-            let room = if w > 0.0 { 20.0 * (2147483648.0 / w).log10() } else { f64::INFINITY };
+            let room = if w > 0.0 { 20.0 * (self.v_max / (w * scale)).log10() } else { f64::INFINITY };
             let up = (w + 1.0) * scale;
-            let pre = up * up / self.spec.z_nominal * 10f64.powf(converted_at(room, possible) / 10.0);
+            let pre = if clipped { full } else { up * up / self.spec.r_ff * 10f64.powf(converted_at(room, possible) / 10.0) };
             q.push(if pre > full { full } else { pre });
         }
         (p, q)
@@ -285,23 +306,41 @@ impl SpeakerState {
     /// `-reduction_db`: a full-scale square wave (V rms = V peak) into the
     /// coil resistance.  Time the daemon could not measure is charged at it.
     pub fn worst_case_power(&self, reduction_db: f64) -> f64 {
-        let v = self.spec.vs_scale * 10f64.powf(-reduction_db.max(0.0) / 20.0);
-        v * v / self.spec.z_nominal
+        let v = self.v_max * 10f64.powf(-reduction_db.max(0.0) / 20.0);
+        v * v / self.spec.r_ff
     }
 
-    /// Unknown history can leave either node at the hard limit. Bound
-    /// them independently, then cover a possible queued full-scale drain.
-    /// The J700 safe-level equilibrium is colder than this envelope.
-    pub fn assume_latched(&mut self, t_ambient: f64) {
-        self.t_coil = self.spec.t_limit;
-        self.t_magnet = self.spec.t_limit;
-        self.t_peak = self.spec.t_limit;
-        self.heat(self.worst_case_power(0.0), DRAIN_S, t_ambient);
-        self.t_coil = self.t_peak;
+    /// Nothing about the speaker's past is known. Bound coil and magnet
+    /// independently, including queued full-scale audio and any time at
+    /// the kernel's safe level. A hot magnet need not have the steady-state
+    /// relationship to the coil. Keep the hard fault latched until cool.
+    pub fn assume_latched(&mut self, globals: &Globals) {
+        self.configure_voltage(globals);
+        let full = self.worst_case_power(0.0);
+        let safe = self.worst_case_power(globals.safe_reduction);
+        let (limit, tr_coil, tr_magnet) = (self.spec.t_limit, self.spec.tr_coil, self.spec.tr_magnet);
+        self.t_coil = limit;
+        self.t_magnet = limit;
+        self.t_peak = limit;
+        // Use this model's own conservative substeps and interval peak, as
+        // main's hot-start bound does. Thermal::hold solves the continuous
+        // equations exactly, but heat advances the magnet before the coil:
+        // its drain can finish above that continuous endpoint (on J700 by
+        // 0.0017 K). An exact continuous start cannot bound this model.
+        self.heat(full, DRAIN_S, globals.t_ambient);
+        // Bound every shorter drain too, and any later time at the kernel
+        // safe level. With M >= M_safe and C >= M + P_safe Rc, neither
+        // node can rise above this envelope while the safe level holds.
+        // Do not let max's NaN handling conceal an overflow in the drain:
+        // the guard must still reject a nonfinite model before unlocking.
+        if self.t_coil.is_finite() && self.t_magnet.is_finite() && self.t_peak.is_finite() {
+            self.t_magnet = self.t_magnet.max(limit).max(globals.t_ambient + safe * tr_magnet);
+            self.t_coil = self.t_peak.max(self.t_magnet + safe * tr_coil);
+            self.t_peak = self.t_coil;
+        }
         self.hard = true;
         // nor is the power before the gain: a minute of full scale for the
         // budgets (they ask for their most until the minute has passed)
-        let full = self.worst_case_power(0.0);
         self.history.clear();
         self.history.push_back((60.0, full));
         self.history_s = 60.0;
@@ -316,14 +355,15 @@ impl SpeakerState {
     /// it the most a protected coil can have taken in the rest of the
     /// minute (or the record's, if more).  Latched only at the limit.
     pub fn assume_evidence(&mut self, globals: &Globals, saved: Option<(f64, f64, f64)>, d: Option<f64>, uptime: f64, floor: f64) {
-        use crate::boot::{budget_history, protected_energy, start_bound_in, Thermal, SENSOR_MARGIN_K};
+        use crate::boot::{budget_history, protected_energy, start_bound_in, SENSOR_MARGIN_K};
+        self.configure_voltage(globals);
         let s = &self.spec;
         let ta = globals.t_ambient;
         // a chassis sensor over the model's ambient raises the ambient the
         // bound relaxes toward, not only the floor (`floor` is the sensor
         // plus its margin)
         let ta_hi = if floor.is_finite() { ta.max(floor - SENSOR_MARGIN_K) } else { ta };
-        let th = Thermal::new(s.tr_coil, s.tau_coil, s.tr_magnet, s.tau_magnet, ta_hi);
+        let th = crate::engine::Thermal::new(s.tr_coil, s.tau_coil, s.tr_magnet, s.tau_magnet, ta_hi);
         let safe = self.worst_case_power(globals.safe_reduction);
         let (c, m) = start_bound_in(&th, s.t_limit, ta_hi, ta, safe, uptime, saved.map(|x| (x.0, x.1)), d);
         self.t_coil = c.max(floor);
@@ -336,6 +376,7 @@ impl SpeakerState {
         let older = protected_energy(&th, s.t_limit, ta, len).max(saved.map_or(0.0, |x| 60.0 * x.2)).min(self.worst_case_power(0.0) * len);
         self.history = budget_history(uptime, safe, older).into_iter().collect();
         self.history_s = self.history.iter().map(|e| e.0).sum();
+        self.playback_means = None;
     }
 
     /// The steady state at `power` watts, as if it had run for ever; the
@@ -353,35 +394,24 @@ impl SpeakerState {
 
     /// Continue from a saved state: temperatures and the power history's
     /// last second and minute.
+    /// Each temperature, peak, latch and reduction at least `o`'s (two
+    /// restores of one state over different spans: persist.rs).  The
+    /// budgets keep this one's history.
+    pub fn raise_to(&mut self, o: &SpeakerState) {
+        self.t_coil = self.t_coil.max(o.t_coil);
+        self.t_magnet = self.t_magnet.max(o.t_magnet);
+        self.t_peak = self.t_peak.max(o.t_peak);
+        self.hard |= o.hard;
+        self.reduction_db = self.reduction_db.max(o.reduction_db);
+    }
+
     pub fn resume(&mut self, t_coil: f64, t_magnet: f64, mean_1s: f64, mean_60s: f64) {
         self.t_coil = t_coil;
         self.t_magnet = t_magnet;
         self.t_peak = t_coil;
         self.hard = false;
-        // Two means do not say when the energy came.  The most either
-        // budget can see of it later is all of it as late as it can have
-        // been: nothing before the gain is louder than full scale, so the
-        // last second's energy at full scale at the very end of it, and the
-        // rest of the minute's at full scale just before that second.  Each
-        // window then keeps every joule until the latest moment it could
-        // have left.  (A mean over full scale, from an older file, keeps
-        // its whole window instead.)
-        self.history.clear();
-        let full = self.worst_case_power(0.0);
-        let last = mean_1s.max(0.0);
-        let older = (60.0 * mean_60s - last).max(0.0);
-        let d_older = (older / full).min(59.0);
-        let d_last = (last / full).min(1.0);
-        if older > 0.0 && d_older > 0.0 {
-            self.history.push_back((d_older, older / d_older));
-        }
-        if d_last < 1.0 {
-            self.history.push_back((1.0 - d_last, 0.0));
-        }
-        if last > 0.0 && d_last > 0.0 {
-            self.history.push_back((d_last, last / d_last));
-        }
-        self.history_s = self.history.iter().map(|e| e.0).sum();
+        // two means do not say when the energy came (budget_envelope)
+        (self.history, self.history_s) = budget_envelope(mean_1s, mean_60s, self.worst_case_power(0.0));
     }
 
     /// The governor's state a restart keeps: the latched fault, the peak
@@ -402,6 +432,10 @@ impl SpeakerState {
     /// it as full scale fits there): the mean is an upper bound, whatever
     /// the energy's place inside each step.
     pub fn mean_power(&self, seconds: f64) -> f64 {
+        if let Some((short,long))=self.playback_means {
+            if seconds==1.0 {return short;}
+            if seconds==60.0 {return long;}
+        }
         let full = self.worst_case_power(0.0);
         let mut t = 0.0;
         let mut e = 0.0;
@@ -414,6 +448,10 @@ impl SpeakerState {
             t += take;
         }
         e / seconds
+    }
+
+    pub fn set_playback_means(&mut self, short: f64, long: f64) {
+        self.playback_means=Some((short,long));
     }
 
     /// The reduction (dB) the power budgets ask for: what brings the mean
@@ -439,6 +477,7 @@ impl SpeakerState {
     /// Overflow must be rejected before a period renews the sensing permit.
     pub fn finite(&self) -> bool {
         [
+            self.v_max,
             self.t_coil,
             self.t_magnet,
             self.t_peak,
@@ -541,6 +580,31 @@ pub fn converted_at(room: f64, possible: &[(f64, f64)]) -> f64 {
     fit.unwrap_or(most).max(0.0)
 }
 
+/// A budget history from its two saved means: all of the energy as late as
+/// it can have come, at `full` (the power of a full-scale signal; nothing
+/// before the gain is louder), the last second's at the very end of it and
+/// the rest of the minute's just before that second.  Each window then
+/// keeps every joule until the latest moment it could have left.  (A mean
+/// over full scale, from an older file, keeps its whole window instead.)
+pub fn budget_envelope(mean_1s: f64, mean_60s: f64, full: f64) -> (std::collections::VecDeque<(f64, f64)>, f64) {
+    let mut h = std::collections::VecDeque::new();
+    let last = mean_1s.max(0.0);
+    let older = (60.0 * mean_60s - last).max(0.0);
+    let d_older = (older / full).min(59.0);
+    let d_last = (last / full).min(1.0);
+    if older > 0.0 && d_older > 0.0 {
+        h.push_back((d_older, older / d_older));
+    }
+    if d_last < 1.0 {
+        h.push_back((1.0 - d_last, 0.0));
+    }
+    if last > 0.0 && d_last > 0.0 {
+        h.push_back((d_last, last / d_last));
+    }
+    let total = h.iter().map(|e| e.0).sum();
+    (h, total)
+}
+
 /// The card-wide result of one step: the reduction to apply to the shared
 /// volume control is the largest any speaker needs.
 pub fn reduction_db(states: &[SpeakerState]) -> f64 {
@@ -590,11 +654,59 @@ mod tests {
             vs_chan: 0,
             p_limit_1s: 0.0,
             p_limit_60s: 0.0,
+            is_chan: None,
+            is_scale: 0.0,
+            r_ff: 4.43,
+            vi_tr_coil: 60.0,
+            vi_tau_coil: 3.0,
+            vi_tr_magnet: 40.0,
+            vi_tau_magnet: 200.0,
+            a_t_20c: 0.0,
+            z_min_override: None,
         }
     }
 
     fn globals() -> Globals {
-        Globals { sense_pcm: 2, t_ambient: 35.0, t_hysteresis: 5.0, t_window: 20.0, channels: 2, period: 4096, t_reduction_max: 20.0, safe_reduction: 20.0 }
+        Globals {
+            sense_pcm: 2,
+            t_ambient: 35.0,
+            t_hysteresis: 5.0,
+            t_window: 20.0,
+            channels: 2,
+            period: 4096,
+            t_reduction_max: 20.0,
+            safe_reduction: 20.0,
+            governor: crate::config::Governor::Legacy,
+            shadow: false,
+            sense_format: crate::config::SenseFormat::S32,
+            amp_gain_dbv: 0.0,
+            amp_gain_index: None,
+            horizon_s: 4.6,
+            release_s: 20.0,
+            t_ctrl_headroom: 0.0,
+            unified_caps: false,
+            p_reduction_max: 0.0,
+            max_reduction: 20.0,
+            qualified: true,
+            guard: None,
+            boot_resume: crate::config::BootResume::Latched,
+        }
+    }
+
+    #[test]
+    fn frame_power_uses_the_feed_forward_resistance() {
+        let mut sp = spec();
+        sp.vs_scale = 8.0;
+        sp.z_nominal = 4.0;
+        sp.r_ff = 2.0;
+        let s = SpeakerState::new(sp, 35.0);
+        // Half scale is 4 V, or 8 W through the configured 2 ohm FF bound.
+        let words = [1i32 << 30];
+        let (p, pre) = s.frame_powers(&words, 1, &[(0.0, 0.0)]);
+        assert!((p[0] - 8.0).abs() < 1e-12, "{p:?}");
+        assert!(pre[0] >= 8.0 && pre[0] < 8.0 + 1e-7, "{pre:?}");
+        let (blocks, _) = s.block_powers(&words, 1, 1);
+        assert_eq!(p, blocks, "frame and block heat disagree");
     }
 
     #[test]
@@ -741,24 +853,83 @@ mod tests {
     fn worst_case_power_is_a_full_scale_square_wave_at_the_card_gain() {
         let mut sp = spec();
         sp.vs_scale = 7.3;
+        // the parser defaults r_ff to z_nominal (the J700)
         sp.z_nominal = 4.2;
-        let s = SpeakerState::new(sp, 35.0);
+        sp.r_ff = 4.2;
+        let s = SpeakerState::new(sp.clone(), 35.0);
         assert!((s.worst_case_power(0.0) - 7.3 * 7.3 / 4.2).abs() < 1e-9);
         assert!((s.worst_case_power(20.0) - 0.073 * 7.3 / 4.2).abs() < 1e-9);
         // a negative reduction cannot raise the card above its full scale
         assert_eq!(s.worst_case_power(-6.0), s.worst_case_power(0.0));
+        // a machine whose DC resistance is known and below the nominal
+        // impedance (the J316's woofers: 2.7 against 3.6 ohm) is charged
+        // against the DC resistance, as its feed-forward constants assume
+        sp.z_nominal = 3.6;
+        sp.r_ff = 2.7;
+        let s = SpeakerState::new(sp, 35.0);
+        assert!((s.worst_case_power(0.0) - 7.3 * 7.3 / 2.7).abs() < 1e-9);
+        let (p, _) = s.block_powers(&[i32::MAX, 0], 2, 1);
+        assert!((p[0] - 7.3 * 7.3 / 2.7).abs() < 1e-6, "{}", p[0]);
+    }
+}
+
+#[cfg(test)]
+mod amplifier_rail_tests {
+    use super::*;
+    #[test]
+    fn a_saturated_voltage_word_does_not_cap_the_amplifier_power() {
+        let cfg = crate::config::Config::parse(include_str!("../conf/apple/j274.conf")).unwrap();
+        for spec in &cfg.speakers {
+            let v = crate::engine::v_worst(spec, &cfg.globals);
+            assert!(v > spec.vs_scale, "the witness needs a cap above sense full scale");
+            let state = SpeakerState::with_globals(spec.clone(), &cfg.globals);
+            let mut words = vec![0; cfg.globals.channels];
+            words[spec.vs_chan] = 32767 << 16;
+            let (power, before) = state.frame_powers(&words, cfg.globals.channels, &[(0.0, 0.0)]);
+            let full = v * v / spec.r_ff;
+            assert!(power[0] >= full && before[0] >= full);
+        }
     }
 }
 
 #[cfg(test)]
 mod independent_start_tests {
     use super::*;
+
+    #[test]
+    fn a_latched_drain_overflow_stays_nonfinite() {
+        let text = include_str!("../conf/apple/j700.conf")
+            .replace("tr_coil = 38.0", "tr_coil = 1e308")
+            .replace("tr_magnet = 26.0", "tr_magnet = 1e308");
+        let cfg = crate::config::Config::parse(&text).unwrap();
+        for spec in cfg.speakers {
+            let mut bound = SpeakerState::with_globals(spec, &cfg.globals);
+            bound.assume_latched(&cfg.globals);
+            assert!(bound.hard);
+            assert!(!bound.finite(), "safe-level floors must not hide a nonfinite full-scale drain");
+        }
+    }
+
+    #[test]
+    fn a_latched_peak_overflow_stays_nonfinite() {
+        let text = include_str!("../conf/apple/j700.conf")
+            .replace("tau_coil = 3.3", "tau_coil = 0.000001");
+        let cfg = crate::config::Config::parse(&text).unwrap();
+        for spec in cfg.speakers {
+            let mut bound = SpeakerState::with_globals(spec, &cfg.globals);
+            bound.assume_latched(&cfg.globals);
+            assert!(bound.t_coil.is_finite() && bound.t_magnet.is_finite(), "this witness overflows only the interval peak");
+            assert!(!bound.t_peak.is_finite(), "the endpoint must not overwrite a nonfinite peak");
+            assert!(!bound.finite());
+            assert!(bound.hard);
+        }
+    }
     #[test]
     fn unknown_start_bounds_a_hot_coil_and_a_hot_magnet() {
         let cfg = crate::config::Config::parse(include_str!("../conf/apple/j700.conf")).unwrap();
         for spec in cfg.speakers {
             let mut bound = SpeakerState::new(spec.clone(), cfg.globals.t_ambient);
-            bound.assume_latched(cfg.globals.t_ambient);
+            bound.assume_latched(&cfg.globals);
             assert!(bound.hard);
             assert!(bound.t_coil >= spec.t_limit && bound.t_magnet >= spec.t_limit);
             let full = bound.worst_case_power(0.0);

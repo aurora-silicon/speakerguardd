@@ -209,6 +209,35 @@ impl Ctl {
         Ok(self.value_of(id)?.value[0])
     }
 
+    fn check_bytes(&self, id: &ElemId) -> io::Result<()> {
+        // SAFETY: zero is valid and ioctl fills the complete matching layout.
+        let mut info: ElemInfo = unsafe { std::mem::zeroed() };
+        info.id=*id;
+        ioctl(&self.file,CTL_IOCTL_ELEM_INFO,&mut info)?;
+        if info.ty!=4 || info.count!=512 { return Err(io::Error::from_raw_os_error(libc::EPROTO)); }
+        Ok(())
+    }
+
+    pub fn read_bytes(&self, id: &ElemId) -> io::Result<[u8;512]> {
+        self.check_bytes(id)?;
+        let value=self.value_of(id)?;
+        let mut out=[0u8;512];
+        // SAFETY: the value union has 1024 initialized bytes; BYTES uses its
+        // first 512 bytes. Both ranges are valid and do not overlap.
+        unsafe { std::ptr::copy_nonoverlapping(value.value.as_ptr().cast::<u8>(),out.as_mut_ptr(),512); }
+        Ok(out)
+    }
+
+    pub fn write_bytes(&self, id: &ElemId, bytes: &[u8;512]) -> io::Result<()> {
+        self.check_bytes(id)?;
+        // SAFETY: zero is a valid ElemValue and bytes fit in the value union.
+        let mut value: ElemValue = unsafe { std::mem::zeroed() };
+        value.id=*id;
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(),value.value.as_mut_ptr().cast::<u8>(),512); }
+        ioctl(&self.file,CTL_IOCTL_ELEM_WRITE,&mut value)?;
+        Ok(())
+    }
+
     /// Integer control: every channel to the same value.
     pub fn write_int(&self, id: &ElemId, value: i64) -> io::Result<()> {
         let mut v = self.value_of(id)?;
@@ -264,9 +293,9 @@ impl Ctl {
         Ok(())
     }
 
-    /// Drain the queued events; true if one was about `numid`.
-    pub fn events(&self, numid: u32) -> io::Result<bool> {
-        let mut hit = false;
+    /// Drain controls, keeping a rate change distinct from gate readiness.
+    pub fn events(&self, rate_id:u32, energy_id:Option<u32>) -> io::Result<(bool,bool)> {
+        let mut hit = (false,false);
         // SAFETY: all-zero events are valid; read() fills whole ones.
         let mut buf: [CtlEvent; 32] = unsafe { std::mem::zeroed() };
         loop {
@@ -281,7 +310,8 @@ impl Ctl {
                 };
             }
             let count = n as usize / std::mem::size_of::<CtlEvent>();
-            hit |= buf[..count].iter().any(|ev| ev.ty == CTL_EVENT_ELEM && ev.id.numid == numid);
+            hit.0 |= buf[..count].iter().any(|ev|ev.ty==CTL_EVENT_ELEM && ev.id.numid==rate_id);
+            hit.1 |= buf[..count].iter().any(|ev|ev.ty==CTL_EVENT_ELEM && Some(ev.id.numid)==energy_id);
             if count < buf.len() {
                 return Ok(hit);
             }
@@ -378,6 +408,7 @@ const PARAM_RATE: usize = 11 - 8;
 const PARAM_PERIOD_SIZE: usize = 13 - 8;
 const PARAM_PERIODS: usize = 15 - 8;
 const ACCESS_RW_INTERLEAVED: u32 = 3;
+const FORMAT_S16_LE: u32 = 2;
 const FORMAT_S32_LE: u32 = 10;
 const SUBFORMAT_STD: u32 = 0;
 const INTERVAL_INTEGER: u32 = 1 << 2;
@@ -406,9 +437,12 @@ pub trait PcmIo {
     fn delay(&mut self) -> io::Result<i64>;
 }
 
-/// The capture PCM file itself.
+/// The capture PCM file itself.  An S16 stream is read into `scratch` and
+/// widened (<< 16), so every reader sees S32 full scale.
 pub struct PcmFile {
     file: File,
+    s16: bool,
+    scratch: Vec<i16>,
 }
 
 impl PcmIo for PcmFile {
@@ -421,8 +455,17 @@ impl PcmIo for PcmFile {
     }
 
     fn readi(&mut self, buf: &mut [i32], frames: usize) -> io::Result<i64> {
-        let mut xfer = Xferi { result: 0, buf: buf.as_mut_ptr().cast(), frames: frames as u64 };
+        if !self.s16 {
+            let mut xfer = Xferi { result: 0, buf: buf.as_mut_ptr().cast(), frames: frames as u64 };
+            ioctl(&self.file, PCM_IOCTL_READI_FRAMES, &mut xfer)?;
+            return Ok(xfer.result);
+        }
+        let channels = if frames == 0 { 0 } else { buf.len() / frames };
+        self.scratch.resize(frames * channels, 0);
+        let mut xfer = Xferi { result: 0, buf: self.scratch.as_mut_ptr().cast(), frames: frames as u64 };
         ioctl(&self.file, PCM_IOCTL_READI_FRAMES, &mut xfer)?;
+        let got = (xfer.result.max(0) as usize).min(frames) * channels;
+        widen(&self.scratch[..got], &mut buf[..got]);
         Ok(xfer.result)
     }
 
@@ -444,6 +487,13 @@ impl PcmIo for PcmFile {
         let mut frames: libc::c_long = 0;
         ioctl(&self.file, PCM_IOCTL_DELAY, &mut frames)?;
         Ok(frames as i64)
+    }
+}
+
+/// S16 sense words as S32 full scale.
+pub fn widen(src: &[i16], dst: &mut [i32]) {
+    for (d, &x) in dst.iter_mut().zip(src) {
+        *d = (x as i32) << 16;
     }
 }
 
@@ -471,11 +521,12 @@ pub struct PeriodReader<P: PcmIo> {
     started: bool,
 }
 
-/// An interleaved S32_LE capture stream with fixed period geometry.
+/// An interleaved S32_LE (or S16_LE, widened) capture stream with fixed
+/// period geometry.
 pub type Capture = PeriodReader<PcmFile>;
 
 impl Capture {
-    pub fn open(card: u32, device: u32, channels: usize, rate: u32, period: usize) -> io::Result<Capture> {
+    pub fn open(card: u32, device: u32, channels: usize, rate: u32, period: usize, s16: bool) -> io::Result<Capture> {
         let path = format!("/dev/snd/pcmC{card}D{device}c");
         // A blocking open would wait, silently, for whoever holds the sense
         // PCM to let go, and the volume lock would time out meanwhile: ask
@@ -485,27 +536,39 @@ impl Capture {
             .write(true)
             .custom_flags(libc::O_NONBLOCK)
             .open(&path)?;
-        // SAFETY: an all-ones/zeroed parameter block is the "unconstrained"
-        // request the kernel refines.
-        let mut hw: HwParams = unsafe { std::mem::zeroed() };
-        for m in hw.masks.iter_mut() {
-            m.bits = [0; 8];
+        // The hardware period is the sense period, or the largest even
+        // fraction of it the device takes (the SN012776 machines' 12-channel
+        // sense allows 64 KiB per period, less than one 4096-frame S16
+        // period).  The buffer always holds four sense periods, and the
+        // reader waits for a whole sense period either way (avail_min).
+        let mut split = 1;
+        loop {
+            // SAFETY: an all-ones/zeroed parameter block is the
+            // "unconstrained" request the kernel refines.
+            let mut hw: HwParams = unsafe { std::mem::zeroed() };
+            for m in hw.masks.iter_mut() {
+                m.bits = [0; 8];
+            }
+            for i in hw.intervals.iter_mut() {
+                *i = Interval { min: 0, max: u32::MAX, flags: 0 };
+            }
+            hw.masks[PARAM_ACCESS].bits[0] = 1 << ACCESS_RW_INTERLEAVED;
+            hw.masks[PARAM_FORMAT].bits[0] = 1 << if s16 { FORMAT_S16_LE } else { FORMAT_S32_LE };
+            hw.masks[PARAM_SUBFORMAT].bits[0] = 1 << SUBFORMAT_STD;
+            let fixed = |i: &mut Interval, v: u32| {
+                *i = Interval { min: v, max: v, flags: INTERVAL_INTEGER };
+            };
+            fixed(&mut hw.intervals[PARAM_CHANNELS], channels as u32);
+            fixed(&mut hw.intervals[PARAM_RATE], rate);
+            fixed(&mut hw.intervals[PARAM_PERIOD_SIZE], (period / split) as u32);
+            fixed(&mut hw.intervals[PARAM_PERIODS], (4 * split) as u32);
+            hw.rmask = u32::MAX;
+            match ioctl(&file, PCM_IOCTL_HW_PARAMS, &mut hw) {
+                Ok(_) => break,
+                Err(e) if e.raw_os_error() == Some(libc::EINVAL) && split < 16 && period % (split * 2) == 0 => split *= 2,
+                Err(e) => return Err(e),
+            }
         }
-        for i in hw.intervals.iter_mut() {
-            *i = Interval { min: 0, max: u32::MAX, flags: 0 };
-        }
-        hw.masks[PARAM_ACCESS].bits[0] = 1 << ACCESS_RW_INTERLEAVED;
-        hw.masks[PARAM_FORMAT].bits[0] = 1 << FORMAT_S32_LE;
-        hw.masks[PARAM_SUBFORMAT].bits[0] = 1 << SUBFORMAT_STD;
-        let fixed = |i: &mut Interval, v: u32| {
-            *i = Interval { min: v, max: v, flags: INTERVAL_INTEGER };
-        };
-        fixed(&mut hw.intervals[PARAM_CHANNELS], channels as u32);
-        fixed(&mut hw.intervals[PARAM_RATE], rate);
-        fixed(&mut hw.intervals[PARAM_PERIOD_SIZE], period as u32);
-        fixed(&mut hw.intervals[PARAM_PERIODS], 4);
-        hw.rmask = u32::MAX;
-        ioctl(&file, PCM_IOCTL_HW_PARAMS, &mut hw)?;
 
         // SAFETY: zeroed is a valid base; every field is set below.
         let mut sw: SwParams = unsafe { std::mem::zeroed() };
@@ -521,7 +584,7 @@ impl Capture {
         sw.silence_size = 0;
         sw.boundary = (period * 4) as u64 * (1 << 20);
         ioctl(&file, PCM_IOCTL_SW_PARAMS, &mut sw)?;
-        let mut io = PcmFile { file };
+        let mut io = PcmFile { file, s16, scratch: Vec::new() };
         io.prepare()?;
         Ok(PeriodReader::new(io, channels, period))
     }
@@ -621,6 +684,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn energy_readiness_wakes_without_fabricating_a_rate_event() {
+        use std::os::fd::FromRawFd;
+        use std::io::Write;
+        let mut fds=[-1;2];
+        // SAFETY: two writable fd slots; both returned descriptors are owned.
+        assert_eq!(unsafe {libc::pipe2(fds.as_mut_ptr(),libc::O_NONBLOCK|libc::O_CLOEXEC)},0);
+        let ctl=Ctl{file:unsafe {File::from_raw_fd(fds[0])},card:0};
+        let mut writer=unsafe {File::from_raw_fd(fds[1])};
+        let send=|writer:&mut File,numid:u32| {
+            // SAFETY: zero initializes every byte including padding; this
+            // pipe fixture carries exactly the public event structure.
+            let mut event:CtlEvent=unsafe {std::mem::zeroed()};
+            event.id.numid=numid;
+            let bytes=unsafe {std::slice::from_raw_parts((&event as *const CtlEvent).cast::<u8>(),std::mem::size_of_val(&event))};
+            writer.write_all(bytes).unwrap();
+        };
+        send(&mut writer,20);send(&mut writer,30);
+        assert_eq!(ctl.events(10,Some(20)).unwrap(),(false,true));
+        assert_eq!(ctl.events(10,Some(20)).unwrap(),(false,false));
+        send(&mut writer,10);send(&mut writer,20);
+        assert_eq!(ctl.events(10,Some(20)).unwrap(),(true,true));
+    }
+
+    #[test]
     fn layouts_match_asound_h() {
         assert_eq!(std::mem::size_of::<ElemId>(), 64);
         assert_eq!(std::mem::size_of::<ElemList>(), 80);
@@ -630,6 +717,13 @@ mod tests {
         assert_eq!(std::mem::size_of::<HwParams>(), 608);
         assert_eq!(std::mem::size_of::<SwParams>(), 136);
         assert_eq!(std::mem::size_of::<Xferi>(), 24);
+    }
+
+    #[test]
+    fn s16_sense_words_widen_to_s32_full_scale() {
+        let mut out = [0i32; 3];
+        widen(&[i16::MIN, -1, i16::MAX], &mut out);
+        assert_eq!(out, [i32::MIN, -65536, 0x7fff0000]);
     }
 
     #[test]
