@@ -97,7 +97,7 @@ timeout and the exact command/script and artifact paths. Wait for policy
 approval and resource/ownership admission. Use the controller's supported
 upload/download capabilities for scripts and private evidence. Do not open a
 separate transport. The lead owns these requests; this document grants no
-deployment permission. There is no display, activity, session or time gate.
+deployment permission.
 
 Before any sound, retain a private manifest with:
 
@@ -156,8 +156,7 @@ The following is the command sequence inside a policy-approved Neo execute
 request. The lead supplies `AUDIO_USER`/`AUDIO_UID` for the configured audio
 server, its numeric `SINK` object for `audio_effect.j700-convolver`, a fresh
 private `RUN` directory, and `PINK_WAV`/`SECONDS_AUDIO` = reference/20 or
-sustain/240. The stimulus path must be readable by the audio client. Resolving
-that configured server is routing, not a presence test.
+sustain/240. The stimulus path must be readable by the audio client.
 Run the shell as the approved operator; only the audio client uses its account.
 
 ```bash
