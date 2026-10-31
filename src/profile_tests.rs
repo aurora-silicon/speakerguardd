@@ -30,7 +30,6 @@ const ADDED: &[(&str, &str, usize, f64)] = &[
     ("j614", include_str!("../conf/apple/j614.conf"), 6, 21.0),
     ("j615", include_str!("../conf/apple/j615.conf"), 6, 18.5),
     ("j704", include_str!("../conf/apple/j704.conf"), 6, 21.0),
-    ("j713", include_str!("../conf/apple/j713.conf"), 4, 21.0),
     ("j714", include_str!("../conf/apple/j714.conf"), 6, 21.0),
     ("j715", include_str!("../conf/apple/j715.conf"), 6, 21.0),
     ("j716", include_str!("../conf/apple/j716.conf"), 6, 21.0),
@@ -101,7 +100,7 @@ fn every_new_file_is_in_the_admission_matrix() {
     let expected: BTreeSet<_> = ADDED
         .iter()
         .map(|(b, ..)| b.to_string())
-        .chain(["j316", "j413", "j616", "j700"].map(str::to_string))
+        .chain(["j316", "j413", "j616", "j700", "j713"].map(str::to_string))
         .collect();
     let actual: BTreeSet<_> =
         fs::read_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("conf/apple"))

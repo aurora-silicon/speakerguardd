@@ -630,6 +630,7 @@ mod tests {
 
     const J316: &str = include_str!("../conf/apple/j316.conf");
     const J413: &str = include_str!("../conf/apple/j413.conf");
+    const J713: &str = include_str!("../conf/apple/j713.conf");
     const J616: &str = include_str!("../conf/apple/j616.conf");
 
     fn idx(c: &Config, name: &str) -> usize {
@@ -664,7 +665,7 @@ mod tests {
 
     #[test]
     fn parses_the_vi_machines() {
-        for text in [J316, J413, J616] {
+        for text in [J316, J413, J616, J713] {
             let c = Config::parse(text).unwrap();
             assert!(c.has_vi());
             // feed-forward primary, the V/I model guarding it
@@ -689,6 +690,25 @@ mod tests {
         assert_eq!(ch("Right Woofer 2"), (6, 7));
         assert_eq!(ch("Left Tweeter"), (8, 9));
         assert_eq!(ch("Right Tweeter"), (10, 11));
+        // the J713: the J413's speakers on the M4 AOP's twelve-channel stream,
+        // with its tweeters' own DC resistances as their minimum impedance
+        let j713 = Config::parse(J713).unwrap();
+        let j413 = Config::parse(J413).unwrap();
+        assert_eq!(j713.globals.channels, 12);
+        assert!(!j713.globals.qualified);
+        let mut globals = j713.globals.clone();
+        globals.channels = j413.globals.channels;
+        assert_eq!(globals, j413.globals);
+        assert_eq!(j713.controls, j413.controls);
+        assert_eq!(j713.speakers.len(), j413.speakers.len());
+        for (a, b) in j713.speakers.iter().zip(&j413.speakers) {
+            let mut a = a.clone();
+            a.z_min_override = b.z_min_override;
+            assert_eq!(&a, b, "{}", b.name);
+        }
+        let s = |c: &Config, n: &str| c.speakers[idx(c, n)].clone();
+        assert!((s(&j713, "Left Tweeter").z_min() - 3.55).abs() < 1e-9);
+        assert!((s(&j713, "Right Tweeter").z_min() - 3.68).abs() < 1e-9);
         let j700 = Config::parse(J700).unwrap();
         assert!(!j700.has_vi());
         assert_eq!(j700.globals.governor, Governor::Legacy);

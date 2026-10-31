@@ -396,7 +396,7 @@ mod tests {
                         // Some draft profiles' fallback equilibrium is above
                         // their working or even hard ceiling. Refuse credit;
                         // do not raise that ceiling to make them admissible.
-                        assert!(!["j316", "j413", "j616", "j700"]
+                        assert!(!["j316", "j413", "j616", "j700", "j713"]
                             .contains(&path.file_stem().unwrap().to_str().unwrap()));
                         refused += 1;
                         0.0

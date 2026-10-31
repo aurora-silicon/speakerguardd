@@ -816,10 +816,10 @@ mod tests {
         // missing file passed the refusal half for the wrong reason)
         let conf = std::env::temp_dir().join(format!("speakerguardd-x4-{}", std::process::id()));
         std::fs::create_dir_all(conf.join("apple")).unwrap();
-        for (m, text) in [("j316", include_str!("../conf/apple/j316.conf")), ("j413", include_str!("../conf/apple/j413.conf")), ("j616", include_str!("../conf/apple/j616.conf")), ("j700", include_str!("../conf/apple/j700.conf"))] {
+        for (m, text) in [("j316", include_str!("../conf/apple/j316.conf")), ("j413", include_str!("../conf/apple/j413.conf")), ("j616", include_str!("../conf/apple/j616.conf")), ("j700", include_str!("../conf/apple/j700.conf")), ("j713", include_str!("../conf/apple/j713.conf"))] {
             std::fs::write(conf.join("apple").join(format!("{m}.conf")), text).unwrap();
         }
-        for m in ["j316", "j413", "j616"] {
+        for m in ["j316", "j413", "j616", "j713"] {
             let path = conf.join("apple").join(format!("{m}.conf"));
             let e = load_config(&path, &args(&conf)).expect_err("an unqualified machine was governed");
             assert_eq!(exit_status(&e), EXIT_REFUSED, "{m}: {e}");

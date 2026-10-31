@@ -492,7 +492,7 @@ fn every_vi_profile_bounds_hot_full_scale_onsets() {
             let (cfg, hw) = full_scale_run(cfg, 120, false);
             // Retain the original witnesses' recovery requirement. Some
             // drafts cannot fit their declared fallback and stay locked.
-            check_truth(&cfg, &hw, name, ["j316", "j413", "j616"].contains(&name));
+            check_truth(&cfg, &hw, name, ["j316", "j413", "j616", "j713"].contains(&name));
         }
     }
 }

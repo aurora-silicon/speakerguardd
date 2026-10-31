@@ -187,7 +187,7 @@ before it was installed.  They still say `qualified = false` until a
 formal qualification changes it, so governing them also takes
 `--allow-unqualified`.
 
-There are 35 profile families covering 53 board variants, including 31
+There are 35 profile families covering 53 board variants, including 30
 new drafts. The filename uses
 the family name, for example `apple/j714.conf` for J714s/c. Match the actual
 ALSA card ID before any use; a missing matching profile remains an error.
@@ -223,7 +223,7 @@ The output count is the number of separately modelled amplifier outputs.
 | MacBook Pro 16-inch M4 Pro/Max | J616s/c | 6 | in service, not yet qualified | [existing profile](conf/apple/j616.conf) |
 | MacBook Neo A18 Pro | J700 | 2 | qualified | [existing profile](conf/apple/j700.conf), [Apple specs](https://www.apple.com/macbook-neo/specs/) |
 | MacBook Pro 14-inch M5 | J704 | 6 | untested | [Apple count](https://support.apple.com/en-us/125405), [Asahi J504](https://github.com/AsahiLinux/speakersafetyd/blob/8c519e9594b6635d8a5e134d36dcb8ab5ea4a00f/conf/apple/j504.conf) sibling assumptions |
-| MacBook Air 13-inch M4 | J713 | 4 | untested | [Apple count](https://support.apple.com/en-us/122209), [Asahi J413](https://github.com/AsahiLinux/speakersafetyd/blob/8c519e9594b6635d8a5e134d36dcb8ab5ea4a00f/conf/apple/j413.conf) sibling assumptions |
+| MacBook Air 13-inch M4 | J713 | 4 | in service on one J713, not yet qualified | [profile](conf/apple/j713.conf): the J413 constants on its measured 12-channel stream ([#10](https://github.com/aurora-silicon/speakerguardd/pull/10)) |
 | MacBook Pro 14-inch M5 Pro/Max | J714s/c | 6 | untested | [Apple count](https://support.apple.com/en-us/126318), [Asahi J504](https://github.com/AsahiLinux/speakersafetyd/blob/8c519e9594b6635d8a5e134d36dcb8ab5ea4a00f/conf/apple/j504.conf) sibling assumptions |
 | MacBook Air 15-inch M4 | J715 | 6 | untested | [Apple count](https://support.apple.com/en-us/122210), [Asahi J415](https://github.com/AsahiLinux/speakersafetyd/blob/8c519e9594b6635d8a5e134d36dcb8ab5ea4a00f/conf/apple/j415.conf) sibling assumptions |
 | MacBook Pro 16-inch M5 Pro/Max | J716s/c | 6 | untested | [Apple count](https://support.apple.com/en-us/126319), [Asahi J316](https://github.com/AsahiLinux/speakersafetyd/blob/8c519e9594b6635d8a5e134d36dcb8ab5ea4a00f/conf/apple/j316.conf) thermal / [J616](conf/apple/j616.conf) routing assumptions |
