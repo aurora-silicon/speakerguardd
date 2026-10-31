@@ -429,11 +429,31 @@ impl Thermal {
     /// same interior-extremum bound as hold(), including its conservative
     /// near-equal-pole case, without integrating an infinite interval.
     pub fn indefinite_peaks(&self, power: f64, t_ambient: f64) -> (f64, f64) {
-        let magnet = hi(self.t_magnet, t_ambient + power * self.tr_magnet);
+        let m_inf = t_ambient + power * self.tr_magnet;
+        let magnet = hi(self.t_magnet, m_inf);
+        let rectangle = hi(self.t_coil, magnet + power * self.tr_coil);
         let steady = t_ambient + power * (self.tr_coil + self.tr_magnet);
+        // The grant proof accepts finite inputs, not just installed profile
+        // magnitudes. Overflow/underflow in an extremum's coefficient ratio
+        // must retain the rectangle, never look like "no interior peak".
+        let (tc, tm) = (self.tau_coil, self.tau_magnet);
+        if (tm - tc).abs() <= 1e-6 * tc { return (rectangle, magnet); }
+        let slow = tm / (tm - tc) * (self.t_magnet - m_inf);
+        let fast = self.t_coil - steady - slow;
+        let numerator = slow * tc;
+        let denominator = fast * tm;
+        let ratio = -numerator / denominator;
+        let rate = 1.0 / tm - 1.0 / tc;
+        let at = ratio.ln() / rate;
+        if ![numerator, denominator, ratio, rate].into_iter().all(f64::is_normal)
+            || !at.is_finite() || at <= 0.0 {
+            return (rectangle, magnet);
+        }
+        let scale = self.t_coil.abs() + self.t_magnet.abs() + t_ambient.abs()
+            + m_inf.abs() + steady.abs() + slow.abs() + fast.abs();
         let coil = hi(hi(self.t_coil, steady),
-            self.coil_extremum(power, f64::INFINITY, t_ambient));
-        (coil, magnet)
+            self.coil_extremum(power, f64::INFINITY, t_ambient)) + 1e-9 * scale;
+        (if coil.is_finite() { coil.min(rectangle) } else { rectangle }, magnet)
     }
 
     /// `dt` seconds at a power that varies inside them around a mean of

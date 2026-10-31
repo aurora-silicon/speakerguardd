@@ -15,6 +15,10 @@ temperature and safe equilibrium. Equal and near-equal poles retain the
 existing conservative drive bound. No infinite interval is integrated.
 The old rectangle remains a second sufficient bound; taking the smaller of
 the two prevents the extremum's upward rounding allowance from adding loss.
+Non-normal or non-finite extremum arithmetic falls back to the rectangle;
+coefficient-scale padding covers cancellation in the refined result. This
+keeps an overflowing ratio from erasing a real interior peak for extreme
+finite model states. The existing onset/extremum implementation is unchanged.
 
 ## Complete energy reserve
 

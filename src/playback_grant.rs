@@ -366,6 +366,15 @@ mod tests {
     }
 
     #[test]
+    fn safe_tail_extreme_finite_states_keep_the_rectangle() {
+        let mut th = Thermal::new(104.9, 3.9, 129.5, 70.0, 50.0);
+        th.t_magnet = 1e308;
+        let (coil, magnet) = th.indefinite_peaks(0.2, 50.0);
+        assert_eq!(coil, 1e308, "an overflowing ratio erased the hot magnet");
+        assert_eq!(magnet, 1e308);
+    }
+
+    #[test]
     fn safe_tail_full_dose_reserve_covers_hot_nodes_and_every_arrival_delay() {
         let mut admitted = 0;
         let mut refused = 0;
