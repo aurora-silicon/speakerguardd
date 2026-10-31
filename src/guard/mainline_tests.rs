@@ -254,7 +254,7 @@ fn j700_keeps_the_configured_governor_handoff_limit() {
     g.gains = vec![Gain { at: now, lo: vec![20.0; 2], hi: vec![20.0; 2],
         kernel: false, cands: vec![vec![(20.0, 20.0)]; 2] }];
     for s in &mut g.speakers {
-        s.resume(120.0, 70.0, 0.0, 0.0);
+        s.resume(110.0, 70.0, 0.0, 0.0);
         s.govern(&cfg.globals);
     }
     let (demand, mut per, hard) = g.governing_state();
