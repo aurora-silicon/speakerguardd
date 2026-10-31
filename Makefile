@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 PREFIX ?= /usr
 BINDIR ?= $(PREFIX)/bin
+LIBEXECDIR ?= $(PREFIX)/lib/speakerguardd
 SHAREDIR ?= $(PREFIX)/share/speakerguardd
 UNITDIR ?= $(PREFIX)/lib/systemd/system
 UDEVDIR ?= $(PREFIX)/lib/udev/rules.d
@@ -18,7 +19,8 @@ test:
 	cargo test
 
 install: all
-	install -dDm0755 $(DESTDIR)$(BINDIR) $(DESTDIR)$(SHAREDIR)/apple $(DESTDIR)$(UNITDIR) $(DESTDIR)$(UDEVDIR)
+	install -dDm0755 $(DESTDIR)$(LIBEXECDIR) $(DESTDIR)$(BINDIR) $(DESTDIR)$(SHAREDIR)/apple $(DESTDIR)$(UNITDIR) $(DESTDIR)$(UDEVDIR)
+	install -pm0755 tools/preserve-recordings $(DESTDIR)$(LIBEXECDIR)/
 	install -pm0755 target/$(TARGET)/release/speakerguardd $(DESTDIR)$(BINDIR)/
 	install -pm0644 conf/apple/*.conf $(DESTDIR)$(SHAREDIR)/apple/
 	install -pm0644 conf/LICENSE.asahi $(DESTDIR)$(SHAREDIR)/
