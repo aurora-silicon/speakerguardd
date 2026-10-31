@@ -324,3 +324,9 @@ The controls are held at minimum before the first unlock and each retake.
 Even the kernel safe level can add heat when both nodes start at the hard
 limit. The minimum write prevents that startup dose. Kernel fallback,
 copy-queue accounting and the running output floor are unchanged.
+
+Runtime model generation 3 refuses clean snapshots saved before the independent
+hot-node bounds. A clean stop alone cannot prove the older initializer bounded
+the magnet. Refusing the old snapshot starts latched at independent hot-node
+bounds; older readers also refuse generation 3 on rollback. The running floor,
+queue policy, configuration and useful CLI options are unchanged.
