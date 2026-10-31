@@ -72,6 +72,8 @@ use crate::{debug, info, warn};
 
 #[cfg(test)]
 mod onset_tests;
+#[cfg(test)]
+mod evidence_tests;
 
 /// The kernel locks the volume again 250 ms after the last write; write well
 /// inside that while the speakers play.
@@ -219,6 +221,14 @@ pub trait Hw {
     fn rate_events(&mut self) -> bool;
     /// The card's change events are being delivered.
     fn events_available(&self) -> bool;
+    /// The clocks and ids for an evidence record (boot.rs); none by default.
+    fn stamp(&self) -> crate::boot::Stamp {
+        crate::boot::Stamp::default()
+    }
+    /// The hottest chassis sensor (°C), if the machine reports one.
+    fn chassis(&self) -> Option<f64> {
+        None
+    }
     /// The clocks and the boot's id (persist.rs); none by default.
     fn wall(&self) -> crate::persist::Wall {
         crate::persist::Wall::default()
@@ -315,6 +325,60 @@ fn state_write_durable(path: &std::path::Path, text: &str) -> io::Result<()> {
     drop(f);
     std::fs::rename(&tmp, path)?;
     sync_dir(path)
+}
+
+/// The first start of a boot with `boot_resume = evidence` (boot.rs): the
+/// models from the hottest a protected past can have left them, the last
+/// run's record under /var/lib narrowing it where it can, and a line for
+/// the journal saying which.  The record is read here and removed by
+/// `invalidate` before the lock can be lifted, as before.  None when the
+/// record is this very boot's: a daemon ran this boot (its /run state is
+/// gone), so the card has not held its safe level since the kernel started.
+fn evidence_start<H: Hw>(hw: &H, cfg: &Config, persist: Option<&std::path::Path>) -> Option<(Vec<SpeakerState>, Option<Engine>, String)> {
+    let g = &cfg.globals;
+    let uptime = hw.boottime().as_secs_f64();
+    let now = hw.stamp();
+    let fp = crate::record::fingerprint(cfg);
+    let mut why = String::from("no record of the last run");
+    let mut saved: Option<Saved> = None;
+    let mut d: Option<f64> = None;
+    if let Some(pp) = persist {
+        match std::fs::read_to_string(pp) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => why = format!("{}: {e}", pp.display()),
+            Ok(text) => match crate::boot::decode(&text) {
+                None => why = format!("{}: unreadable or damaged record", pp.display()),
+                Some(r) if r.stamp.boot_id.is_some() && r.stamp.boot_id == now.boot_id => return None,
+                Some(r) => match crate::boot::usable(&r, &now, fp) {
+                    Err(e) => why = format!("{}: {e}", pp.display()),
+                    Ok(hi) => match state::decode(&r.state) {
+                        Some(st) if st.speakers.iter().all(|x| x.t_coil.is_finite() && x.t_magnet.is_finite() && x.t_coil >= g.t_ambient - 1e-6 && x.t_magnet >= g.t_ambient - 1e-6) => {
+                            d = hi.map(|h| (h - uptime).max(0.0));
+                            let kind = if r.clean { "a clean stop" } else { "a running checkpoint" };
+                            why = match hi {
+                                Some(h) => format!("{kind} from {h:.0} s ago at most"),
+                                None => format!("{kind}, no trustworthy clock interval"),
+                            };
+                            saved = Some(st);
+                        }
+                        _ => why = format!("{}: implausible model state", pp.display()),
+                    },
+                },
+            },
+        }
+    }
+    let floor = hw.chassis().map_or(f64::NEG_INFINITY, |t| t + crate::boot::SENSOR_MARGIN_K);
+    let mut speakers: Vec<SpeakerState> = cfg.speakers.iter().map(|s| SpeakerState::with_globals(s.clone(), g)).collect();
+    for s in speakers.iter_mut() {
+        let rec = saved.as_ref().and_then(|x| x.speakers.iter().find(|y| y.name == crate::engine::state_name(&s.spec.name))).map(|y| (y.t_coil, y.t_magnet, y.mean_60s));
+        s.assume_evidence(g, rec, d, uptime, floor);
+    }
+    let mut engine = Engine::new(cfg, g.governor == Governor::Unified || g.shadow);
+    if let Some(e) = engine.as_mut() {
+        e.assume_evidence(saved.as_ref(), d, uptime, floor);
+    }
+    let temps: Vec<String> = speakers.iter().map(|s| format!("{} coil {:.1} C magnet {:.1} C", s.spec.name, s.t_coil, s.t_magnet)).collect();
+    Some((speakers, engine, format!("starting from evidence ({why}; {uptime:.1} s at the safe level since boot): {}", temps.join(", "))))
 }
 
 /// How long a sense capture has gone without data.
@@ -530,6 +594,10 @@ pub struct Guard {
     /// The state kept across a reboot (persist.rs), and the configuration's
     /// fingerprint it is bound to.
     persist_path: Option<PathBuf>,
+    /// Writes the running checkpoints for the next boot (boot_resume =
+    /// evidence), off the protection loop.
+    checkpoint: Option<crate::boot::Checkpointer>,
+    last_checkpoint: Option<Instant>,
     config_fp: u64,
     last_save_try: Option<Instant>,
     save_failed: bool,
@@ -658,6 +726,8 @@ impl Guard {
         let mut restored_at = None;
         // no state under /run at all: the first start of a boot
         let mut first_of_boot = false;
+        // ... started from evidence (boot.rs)
+        let mut evidence = false;
         match &state_path {
             None => {
                 warn!("no model state file: assuming hot speakers (latched)");
@@ -686,10 +756,27 @@ impl Guard {
                 },
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
                     first_of_boot = true;
-                    if !(persist_path.is_some() && globals.boot_resume == BootResume::Idle) {
-                        info!("{}: no model state; assuming hot speakers (latched)", path.display());
+                    if globals.boot_resume == BootResume::Evidence && persist_path.is_some() {
+                        // no daemon unlocked the card this boot: it has held
+                        // its safe level since the kernel started
+                        match evidence_start(hw, cfg, persist_path.as_deref()) {
+                            Some((sp, en, why)) => {
+                                speakers = sp;
+                                engine = en;
+                                evidence = true;
+                                info!("{why}");
+                            }
+                            None => {
+                                info!("{}: no model state, but a record from this boot; assuming hot speakers (latched)", path.display());
+                                latched(&mut speakers, &mut engine);
+                            }
+                        }
+                    } else {
+                        if !(persist_path.is_some() && globals.boot_resume == BootResume::Idle) {
+                            info!("{}: no model state; assuming hot speakers (latched)", path.display());
+                        }
+                        latched(&mut speakers, &mut engine);
                     }
-                    latched(&mut speakers, &mut engine);
                 }
                 Err(e) => {
                     warn!("{}: {e}; assuming hot speakers (latched)", path.display());
@@ -754,6 +841,7 @@ impl Guard {
                 info!("{}: speakersafetyd has run since boot; assuming hot speakers (latched)", p.display());
                 latched(&mut speakers, &mut engine);
                 resumed = false;
+                evidence = false;
                 break;
             }
         }
@@ -794,7 +882,11 @@ impl Guard {
                 }
             }
         }
-        let unknown_floor = if resumed { globals.safe_reduction } else { 0.0 };
+        // after a clean stop, or at the first start of a boot (no daemon
+        // has unlocked the card since the kernel started), the card has
+        // applied at least its own safe level
+        let globals_boot_resume = globals.boot_resume;
+        let unknown_floor = if resumed || evidence { globals.safe_reduction } else { 0.0 };
         let mut g = Guard {
             playback_cfg: cfg.clone(),
             playback: None,
@@ -837,6 +929,11 @@ impl Guard {
             min_failures: 0,
             target_failures: 0,
             state_path,
+            checkpoint: match (&persist_path, globals_boot_resume) {
+                (Some(pp), BootResume::Evidence) => Some(crate::boot::Checkpointer::spawn(pp.clone(), crate::record::fingerprint(cfg), |p, t| state_write_durable(p, t))),
+                _ => None,
+            },
+            last_checkpoint: None,
             persist_path,
             config_fp: crate::record::fingerprint(cfg),
             last_save_try: None,
@@ -1075,6 +1172,21 @@ impl Guard {
     /// failure costs only the next boot's latched start.
     fn persist<H: Hw>(&mut self, hw: &H, after: Duration) {
         let Some(pp) = self.persist_path.clone() else { return };
+        if self.globals.boot_resume == BootResume::Evidence {
+            // no checkpoint may land after the clean record
+            if let Some(mut c) = self.checkpoint.take() {
+                c.finish();
+            }
+            let stamp = hw.stamp();
+            let pairing = hw.boottime().saturating_sub(after);
+            let state = state::encode_full(after, after, &self.speakers, self.engine.as_ref(), false, true, self.recovering);
+            let text = crate::boot::encode(&crate::boot::Record { clean: true, stamp, config: self.config_fp, pairing, state });
+            match state_write_durable(&pp, &text) {
+                Ok(()) => info!("model state kept for the next boot in {}", pp.display()),
+                Err(e) => warn!("{}: {e}; the next boot starts from its own bounds", pp.display()),
+            }
+            return;
+        }
         if self.globals.boot_resume != BootResume::Idle || !hw.shutting_down() {
             return;
         }
@@ -2414,7 +2526,28 @@ impl Guard {
         if self.last_save_try.is_none_or(|t| hw.now().duration_since(t) >= SAVE_INTERVAL) {
             self.save_now(hw);
         }
+        self.offer_checkpoint(hw);
         Ok(())
+    }
+
+    /// Every CHECKPOINT_INTERVAL, the model as it is now for the next boot
+    /// (boot.rs: a running checkpoint is only ever a starting magnet; the
+    /// time after it is bounded by the protected-past rule, not trusted).
+    fn offer_checkpoint<H: Hw>(&mut self, hw: &H) {
+        if self.checkpoint.is_none() || self.stopping || !self.invalidated {
+            return;
+        }
+        let now = hw.now();
+        if self.last_checkpoint.is_some_and(|t| now.duration_since(t) < crate::boot::CHECKPOINT_INTERVAL) {
+            return;
+        }
+        self.last_checkpoint = Some(now);
+        let boot = hw.boottime();
+        let covered = boot.saturating_sub(now.saturating_duration_since(self.account_to));
+        let text = state::encode_full(boot, covered, &self.speakers, self.engine.as_ref(), self.armed, false, self.recovering);
+        if let Some(c) = &self.checkpoint {
+            c.offer(text, boot);
+        }
     }
 
     /// Write the state file as a status readout (a restart does not
@@ -2546,6 +2679,10 @@ pub mod fake {
         /// The clocks and boot id (persist.rs), and whether the system is
         /// shutting down.
         pub wall: crate::persist::Wall,
+        /// The clocks and ids an evidence record sees (boot.rs).
+        pub stamp: crate::boot::Stamp,
+        /// The hottest chassis sensor.
+        pub chassis: Option<f64>,
         pub wall_delay: Duration,
         wall_elapsed: std::cell::Cell<Duration>,
         pub shutting: bool,
@@ -2608,6 +2745,8 @@ pub mod fake {
                 tweak: None,
                 delivered: 0,
                 wall: crate::persist::Wall::default(),
+                stamp: crate::boot::Stamp::default(),
+                chassis: None,
                 wall_delay: Duration::ZERO,
                 wall_elapsed: std::cell::Cell::new(Duration::ZERO),
                 shutting: false,
@@ -2804,6 +2943,12 @@ pub mod fake {
     }
 
     impl Hw for FakeHw {
+        fn stamp(&self) -> crate::boot::Stamp {
+            self.stamp.clone()
+        }
+        fn chassis(&self) -> Option<f64> {
+            self.chassis
+        }
         fn wall(&self) -> crate::persist::Wall {
             self.wall_elapsed.set(self.wall_elapsed.get() + self.wall_delay);
             self.wall.clone()
@@ -3940,9 +4085,7 @@ pub(crate) mod tests {
         // a hot run, stopped at shutdown (or not); its persisted file
         let shutdown = |idle: bool, shutting: bool| {
             let mut cfg = j700();
-            if idle {
-                cfg.globals.boot_resume = BootResume::Idle;
-            }
+            cfg.globals.boot_resume = if idle { BootResume::Idle } else { BootResume::Latched };
             let (run, keep) = (missing_state().unwrap(), missing_state().unwrap());
             let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
             hw.level = Box::new(|_| 0.6);
@@ -6739,11 +6882,14 @@ mod persist_review {
         }
     }
 
-    /// The default ignores the record's contents and clocks entirely: the
-    /// same models and card writes as a start without it.
+    /// `latched` ignores the record's contents and clocks entirely: the
+    /// same models and card writes as a start without it.  (The default
+    /// is now `evidence`, guard/evidence_tests.rs, which reads only its
+    /// own format and never this one.)
     #[test]
     fn the_default_is_the_start_without_it() {
-        let cfg = j700();
+        let mut cfg = j700();
+        cfg.globals.boot_resume = BootResume::Latched;
         let valid = fixture(&cfg, 60.0, 55.0);
         for (name, text) in [("valid", valid.clone()), ("empty", String::new()), ("partial", valid[..valid.len() / 2].into()), ("cold", fixture(&cfg, -49.0, -49.0))] {
             for gap in [0, 60, 86400] {
@@ -7031,7 +7177,11 @@ mod persist_review {
     /// for such machines (persist.rs, README).
     #[test]
     fn the_default_is_the_parents_start_after_another_os() {
-        let cfg = j700();
+        // `latched`: the default before evidence starts (boot.rs), whose
+        // own assumption (another OS kept its coil under the hard limit,
+        // so its magnet under M*) is checked in guard/evidence_tests.rs
+        let mut cfg = j700();
+        cfg.globals.boot_resume = BootResume::Latched;
         let peak = |g: &mut Guard, hw: &mut FakeHw| {
             hw.level = Box::new(|_| 1.0);
             while hw.t < Duration::from_secs(30) {
