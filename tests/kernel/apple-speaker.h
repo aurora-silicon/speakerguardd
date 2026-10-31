@@ -24,6 +24,11 @@
 #define MACAUDIO_ENERGY_TRANSFER_ENERGY_NORM 1
 #define MACAUDIO_ENERGY_TRANSFER_BOUNDED_CURRENT 2
 
+/* Not SNDRV_PCM_FORMAT_FLOAT_LE: the Neo's LEAP uses 0.5, not 1.0, at FS.
+ * This describes immutable DMA payloads; the userspace PCM remains S32_LE.
+ */
+#define MACAUDIO_ENERGY_FORMAT_NEO_F32 0x1000000e
+
 struct macaudio_energy_ctl {
 	__le32 version;
 	__le32 flags;

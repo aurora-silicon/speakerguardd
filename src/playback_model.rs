@@ -496,6 +496,57 @@ mod tests {
         assert!(model(10_000_000).packet().unwrap().is_none());
     }
 
+
+    /// A declared scalar reference transfer can remove the fixed floor at a
+    /// hot state. This is a software listening witness, not a Neo certificate
+    /// or an acoustic/pink-noise measurement.
+    #[test]
+    fn neo_native_reference_at_hot_state_has_no_fixed_floor_for_four_minutes() {
+        let cfg = Config::parse(include_str!("../conf/apple/j700.conf")).unwrap();
+        let mut gate = KernelGate::new(&cfg, 48000, 64);
+        let origin = 1_000_000_000;
+        gate.start(origin).unwrap();
+        gate.owner(true, origin).unwrap();
+        let states = cfg.speakers.iter().cloned().map(|spec| {
+            let mut state = SpeakerState::with_globals(spec, &cfg.globals);
+            state.t_coil = 110.0;
+            state.t_magnet = 80.0;
+            state
+        }).collect::<Vec<_>>();
+        let mut model = PlaybackModel::new(&cfg, &states, None, Instant::now(),
+            gate.status(origin).unwrap()).unwrap();
+        assert_eq!(model.last.format, playback::FORMAT_NEO_F32);
+        let input = (0..64).flat_map(|n| model.drivers.iter().map(move |d| {
+            let sign = if n % 2 == 0 { 1.0 } else { -1.0 };
+            (sign * (0.75 / d.full).sqrt() * 2147483647.0) as i32
+        })).collect::<Vec<_>>();
+        let native = input.iter().map(|x| gate.normalized_input(*x)).collect::<Vec<_>>();
+        gate.write(&model.packet().unwrap().expect("initial finite grant"), origin).unwrap();
+        let mut queue = VecDeque::new();
+        for _ in 0..5 {
+            let (ticket, words) = gate.submit(&input, origin).unwrap();
+            assert_eq!(words, native);
+            queue.push_back(ticket);
+        }
+        let mut hottest = 110.0f64;
+        for n in 1..=240u64 * 48000 / 64 {
+            let now = origin + (n * 64 * 1_000_000_000).div_ceil(48000);
+            gate.retire(queue.pop_front().unwrap(), now).unwrap();
+            // Actual production sense cadence: one update per 4096 frames,
+            // not an implausibly fast daemon renewal at each descriptor.
+            if n % 64 == 0 {
+                let rows = model.update(gate.status(now).unwrap()).unwrap();
+                for row in rows { hottest = hottest.max(row.ff_peak.0).max(row.ff_peak.1); }
+                gate.write(&model.packet().unwrap().expect("reviewed reference still below working limit"), now).unwrap();
+            }
+            let (ticket, words) = gate.submit(&input, now).unwrap();
+            assert_eq!(words, native, "a fixed floor or unpaid clamp at descriptor {n}");
+            queue.push_back(ticket);
+        }
+        assert!(hottest < 120.0, "{hottest}");
+        eprintln!("NEO_NATIVE_REFERENCE seconds=240 coil_start=110 magnet_start=80 paid_watts=0.75 extra_db=0 hottest_bound={hottest:.6} physical_certificate=false");
+    }
+
     #[test]
     fn unsupported_live_routes_keep_conservative_source_budgets() {
         let cfg = Config::parse(include_str!("../conf/apple/j413.conf")).unwrap();

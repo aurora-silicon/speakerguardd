@@ -329,23 +329,77 @@ static int apple_energy_width(int format)
 		return 2;
 	case SNDRV_PCM_FORMAT_S24_LE:
 	case SNDRV_PCM_FORMAT_S32_LE:
+	case APPLE_ENERGY_FORMAT_NEO_F32:
 		return 4;
 	default:
 		return -EINVAL;
 	}
 }
 
-static s32 apple_energy_get(const void *sample, int format)
+/* Decode exactly with integers. Only Q31-representable words are accepted;
+ * fractional Q31 input must not survive as unbilled raw-prefix energy.
+ * The producer's integer-to-float conversion satisfies this restriction.
+ */
+static int apple_energy_float_get(u32 bits, s32 *value)
+{
+	u32 exponent = (bits >> 23) & 255;
+	u32 magnitude = (bits & 0x7fffff) | (1U << 23);
+
+	if (!(bits & 0x7fffffff)) {
+		*value = 0;
+		return 0;
+	}
+	if (exponent < 95 || exponent > 126)
+		return -EINVAL;
+	if (exponent < 118) {
+		u32 shift = 118 - exponent;
+
+		if (magnitude & ((1U << shift) - 1))
+			return -EINVAL;
+		magnitude >>= shift;
+	} else {
+		magnitude <<= exponent - 118;
+	}
+	if (magnitude > (1U << 31) ||
+	    (!(bits & (1U << 31)) && magnitude == (1U << 31)))
+		return -EINVAL;
+	*value = bits & (1U << 31) ? -(s64)magnitude : magnitude;
+	return 0;
+}
+
+static int apple_energy_get(const void *sample, int format, s32 *value)
 {
 	if (format == SNDRV_PCM_FORMAT_S16_LE)
-		return (s32)(s16)get_unaligned_le16(sample) * 65536;
-	if (format == SNDRV_PCM_FORMAT_S24_LE)
-		return sign_extend32(get_unaligned_le32(sample), 23) * 256;
-	return (s32)get_unaligned_le32(sample);
+		*value = (s32)(s16)get_unaligned_le16(sample) * 65536;
+	else if (format == SNDRV_PCM_FORMAT_S24_LE)
+		*value = sign_extend32(get_unaligned_le32(sample), 23) * 256;
+	else if (format == APPLE_ENERGY_FORMAT_NEO_F32)
+		return apple_energy_float_get(get_unaligned_le32(sample), value);
+	else
+		*value = (s32)get_unaligned_le32(sample);
+	return 0;
 }
 
 static s32 apple_energy_put(void *sample, s32 value, int format)
 {
+	if (format == APPLE_ENERGY_FORMAT_NEO_F32) {
+		u32 magnitude = value < 0 ? -(s64)value : value;
+		u32 sign = value < 0 ? (1U << 31) : 0;
+		u32 bits, p, mantissa;
+
+		if (!magnitude) {
+			put_unaligned_le32(0, sample);
+			return 0;
+		}
+		p = 31 - __builtin_clz(magnitude);
+		mantissa = p > 23 ? magnitude >> (p - 23) :
+				    magnitude << (23 - p);
+		bits = sign | ((p + 95) << 23) | (mantissa & 0x7fffff);
+		put_unaligned_le32(bits, sample);
+		/* Truncation is toward zero for both signs; bill the emitted word. */
+		apple_energy_float_get(bits, &value);
+		return value;
+	}
 	if (format == SNDRV_PCM_FORMAT_S16_LE) {
 		value /=
 			65536; /* toward zero, never more energy than was authorized */
@@ -401,21 +455,29 @@ int apple_energy_filter_pcm(struct apple_energy_gate *gate, void *samples,
 			     APPLE_ENERGY_QUEUE];
 	memset(entry, 0, sizeof(*entry));
 	entry->id = ++gate->next_ticket;
-	entry->born_safe = gate->hardware_safe;
+	/* A Neo volume limit only affects future producer copies. Even a
+	 * mistaken caller's hardware-safe assertion cannot forgive old words.
+	 */
+	entry->born_safe = gate->hardware_safe &&
+		format != APPLE_ENERGY_FORMAT_NEO_F32;
 	entry->safe_epoch = gate->safe_epoch;
-	entry->raw = gate->hardware_safe && gate->cache_raw;
+	entry->raw = entry->born_safe && gate->cache_raw;
 	for (f = 0; f < frames; f++) {
 		for (ch = 0; ch < channels; ch++) {
 			void *word = samples + (f * channels + ch) * width;
-			s32 input = apple_energy_get(word, format);
-			s32 sample = input;
-			s32 fallback =
-				apple_energy_scale(input, gate->fallback_q31);
+			s32 input, sample, fallback;
 			s32 floor;
 			u32 gain = APPLE_ENERGY_UNITY;
 			bool mapped = false;
 			u64 cost;
 
+			ret = apple_energy_get(word, format, &input);
+			if (ret) {
+				gate->failed = true;
+				goto fail;
+			}
+			sample = input;
+			fallback = apple_energy_scale(input, gate->fallback_q31);
 			for (k = 0; k < gate->state.speakers; k++) {
 				if (gate->slot[k] != ch)
 					continue;

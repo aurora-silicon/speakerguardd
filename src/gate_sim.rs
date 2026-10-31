@@ -168,6 +168,9 @@ impl KernelGate {
         Self::with_tail(cfg, rate, frames, 0)
     }
     pub fn with_tail(cfg: &Config, rate: u32, frames: usize, tail_us: u32) -> Self {
+        Self::with_format(cfg, rate, frames, tail_us, None)
+    }
+    fn with_format(cfg: &Config, rate: u32, frames: usize, tail_us: u32, payload_format: Option<u32>) -> Self {
         let card = CString::new(
             cfg.playback_cards
                 .first()
@@ -181,11 +184,11 @@ impl KernelGate {
         } else {
             (cfg.globals.safe_reduction * 1000.0).round() as u32
         };
-        let format = if cfg.playback_cards.iter().any(|s| s == "AppleJ616") {
-            6
-        } else {
-            10
-        };
+        let format = payload_format.unwrap_or_else(|| {
+            if cfg.playback_cards.iter().any(|s| s == "AppleJ700") {
+                crate::playback::FORMAT_NEO_F32
+            } else if cfg.playback_cards.iter().any(|s| s == "AppleJ616") { 6 } else { 10 }
+        });
         // SAFETY: bounded numeric dimensions and a valid NUL-terminated card id.
         let p = unsafe {
             (api().new)(
@@ -239,6 +242,16 @@ impl KernelGate {
         unsafe { (api().unlocked)(self.pointer.as_ptr(), now) != 0 }
     }
     pub fn submit(&mut self, input: &[i32], now: u64) -> io::Result<(u64, Vec<i32>)> {
+        if self.format != crate::playback::FORMAT_NEO_F32 {
+            return self.submit_payload_bits(input, now);
+        }
+        let bits: Vec<i32> = input.iter().map(|x| neo_payload_bits(*x)).collect();
+        let (ticket, output) = self.submit_payload_bits(&bits, now)?;
+        Ok((ticket, output.iter().map(|x| neo_normalized(*x)).collect()))
+    }
+    /// The C adapter receives exact native DMA bits, independently of the
+    /// test plant's normalized-Q31 convention.
+    fn submit_payload_bits(&mut self, input: &[i32], now: u64) -> io::Result<(u64, Vec<i32>)> {
         assert_eq!(input.len(), self.frames * self.channels);
         let mut output = vec![0i32; input.len()];
         let mut ticket = 0;
@@ -270,9 +283,24 @@ impl KernelGate {
         match self.format {
             2 => (x / 65536) * 65536,
             6 => (x / 256) * 256,
+            crate::playback::FORMAT_NEO_F32 => neo_normalized(neo_payload_bits(x)),
             _ => x,
         }
     }
+}
+
+// Test plant conversion uses IEEE arithmetic, independently of the kernel's
+// integer bit construction. Correct round-to-nearest toward zero when needed.
+fn neo_payload_bits(x: i32) -> i32 {
+    let exact = f64::from(x) / 4294967296.0;
+    let mut word = exact as f32;
+    if f64::from(word).abs() > exact.abs() {
+        word = f32::from_bits(word.to_bits() - 1);
+    }
+    word.to_bits() as i32
+}
+fn neo_normalized(bits: i32) -> i32 {
+    (f64::from(f32::from_bits(bits as u32)) * 4294967296.0) as i32
 }
 
 impl Drop for KernelGate {
@@ -395,7 +423,10 @@ struct Rendered {
 }
 impl DescriptorQueue {
     pub fn new(cfg: &Config, rate: u32, frames: usize, boot_ns: u64) -> Self {
-        let mut gate = KernelGate::new(cfg, rate, frames);
+        Self::with_format(cfg, rate, frames, boot_ns, None)
+    }
+    fn with_format(cfg: &Config, rate: u32, frames: usize, boot_ns: u64, payload_format: Option<u32>) -> Self {
+        let mut gate = KernelGate::with_format(cfg, rate, frames, 0, payload_format);
         gate.start(boot_ns).unwrap();
         Self {
             gate,
@@ -805,7 +836,9 @@ fn a_unity_j616_grant_adds_no_attenuation_to_its_native_pcm_words() {
 #[test]
 fn listening_meter_includes_the_kernel_clamp_and_safe_floor() {
     let cfg = Config::parse(include_str!("../conf/apple/j700.conf")).unwrap();
-    let mut q = DescriptorQueue::new(&cfg, 48000, 32, 1_000_000_000);
+    // Pin the original integer reference plant and its nonzero safe floor.
+    // The actual Neo float payload instead mutes; death tests cover that.
+    let mut q = DescriptorQueue::with_format(&cfg, 48000, 32, 1_000_000_000, Some(10));
     q.gate.owner(true, q.ns(0.0)).unwrap();
     let s = q.gate.status(q.ns(0.0)).unwrap();
     q.gate
@@ -824,4 +857,49 @@ fn listening_meter_includes_the_kernel_clamp_and_safe_floor() {
         assert!((db - expected).abs() < 1e-6, "{db} vs {expected}");
     }
     assert!(q.rms_reduction(16, 32).iter().all(|db| *db > 19.999));
+}
+
+
+/// Exercise the actual C meter/private-copy helper with the Neo's DMA bits.
+/// This reference transfer is test-only and certifies no AOP firmware.
+#[test]
+fn neo_float_payload_death_at_every_descriptor_boundary_preserves_credit() {
+    use crate::playback::{FORMAT_NEO_F32, UNIT_SCALE, UNITY};
+    let cfg = Config::parse(include_str!("../conf/apple/j700.conf")).unwrap();
+    for death in 0..=8 {
+        for close_owner in [false, true] {
+            let mut gate = KernelGate::with_format(&cfg, 48000, 1, 0, Some(FORMAT_NEO_F32));
+            gate.owner(true, 1).unwrap();
+            let s = gate.status(1).unwrap();
+            assert!(s.qualified(&cfg));
+            let cap = vec![4 * UNIT_SCALE as u64; 2];
+            gate.write(&s.grant(&cap, &[UNITY; 2]).unwrap(), 1).unwrap();
+            let mut previous = None;
+            let mut delivered = [0.0; 2];
+            for n in 0..16 {
+                if n == death && close_owner {
+                    gate.owner(false, n + 2).unwrap();
+                }
+                if let Some(ticket) = previous.take() {
+                    gate.retire(ticket, n + 2).unwrap();
+                }
+                let (ticket, words) = gate.submit_payload_bits(&[(-0.5f32).to_bits() as i32; 2], n + 2).unwrap();
+                previous = Some(ticket);
+                for k in 0..2 {
+                    let normalized = f64::from(f32::from_bits(words[k] as u32)) * 2.0;
+                    delivered[k] += normalized * normalized;
+                    assert!(delivered[k] <= 4.0, "death={death}, close={close_owner}, n={n}");
+                    if close_owner && n >= death { assert_eq!(words[k], 0); }
+                }
+            }
+            gate.retire(previous.unwrap(), 99).unwrap();
+            let end = gate.status(99).unwrap();
+            assert_eq!(end.submitted, end.completed);
+            assert_eq!(end.refunded, [0; 6], "copy-time safe gain cannot refund old words");
+            assert!(end.submitted[..2].iter().all(|x| *x <= cap[0]));
+            // A stopped daemon can retain its FD. After expiry neither the
+            // old magic ping nor cyclic repetition may replenish its dose.
+            assert_eq!(gate.submit_payload_bits(&[(-0.5f32).to_bits() as i32; 2], 300_000_001).unwrap().1, vec![0; 2]);
+        }
+    }
 }
