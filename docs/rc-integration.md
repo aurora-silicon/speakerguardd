@@ -5,7 +5,10 @@ candidate after RC `5d8076e23479`. The seven conflicts in README, boot,
 guard, evidence tests, main, model and state use the RC implementation:
 it includes #28's C1/C2 fixes, the external marker, independently hot nodes,
 no-events minimum write and #20 generation-3 compatibility. Main's exported
-no-events evidence checker is retained. #30 remains a separate stacked PR;
+no-events evidence checker and its two independent 20-minute hot-start
+oracles are retained, along with the model hot-node comparison test.
+The test adapter uses the RC `set_min` and `assume_latched` interfaces;
+the programmes, thermal oracle and limits are unchanged. #30 remains a separate stacked PR;
 its native-float transfer work is not folded into this reconciliation.
 Version `0.1.13-rc.2` distinguishes this source from the earlier RC pins.
 The two listening budgets remain unmet, so this is a draft candidate.

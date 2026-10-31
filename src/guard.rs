@@ -7558,3 +7558,6 @@ mod deep_attenuation_tests;
 
 #[cfg(test)]
 mod mainline_tests;
+
+#[cfg(test)]
+mod independent_hot_start;

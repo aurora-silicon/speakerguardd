@@ -875,3 +875,35 @@ mod amplifier_rail_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod independent_start_tests {
+    use super::*;
+    #[test]
+    fn unknown_start_bounds_a_hot_coil_and_a_hot_magnet() {
+        let cfg = crate::config::Config::parse(include_str!("../conf/apple/j700.conf")).unwrap();
+        for spec in cfg.speakers {
+            let mut bound = SpeakerState::new(spec.clone(), cfg.globals.t_ambient);
+            bound.assume_latched(&cfg.globals);
+            assert!(bound.hard);
+            assert!(bound.t_coil >= spec.t_limit && bound.t_magnet >= spec.t_limit);
+            let full = bound.worst_case_power(0.0);
+            let safe = bound.worst_case_power(cfg.globals.safe_reduction);
+            for c in [cfg.globals.t_ambient, spec.t_limit] {
+                for m in [cfg.globals.t_ambient, spec.t_limit] {
+                    for drain in [0.0, 0.1, DRAIN_S] {
+                        let mut actual = SpeakerState::new(spec.clone(), c);
+                        actual.t_magnet = m;
+                        actual.step(full, drain, cfg.globals.t_ambient);
+                        let mut upper = bound.clone();
+                        for _ in 0..6000 {
+                            assert!(upper.t_coil >= actual.t_coil - 1e-8 && upper.t_magnet >= actual.t_magnet - 1e-8);
+                            upper.step(safe, 0.1, cfg.globals.t_ambient);
+                            actual.step(safe, 0.1, cfg.globals.t_ambient);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
