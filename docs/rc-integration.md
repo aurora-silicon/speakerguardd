@@ -13,6 +13,22 @@ its native-float transfer work is not folded into this reconciliation.
 Version `0.1.13-rc.2` distinguishes this source from the earlier RC pins.
 The two listening budgets remain unmet, so this is a draft candidate.
 
+The retained independent hot-node comparison exposed a real legacy-start
+bound mismatch on the reconciled RC: `Thermal::hold` integrates the continuous
+equations exactly, while `SpeakerState::heat` advances the magnet before the
+coil in at most 10 ms substeps. After a full-scale 0.5 s J700 left-channel
+drain from 135 C on both nodes, the continuous coil is 202.875711672 C and
+the legacy coil is 202.877427892 C. The continuous endpoint is too low to
+bound the legacy model. The legacy unknown-history start now uses its own
+`heat` interval peak, as main did, and keeps independent floors for both
+nodes and the safe-level steady state. This raises the legacy bound; the
+continuous V/I engine start, evidence start, C1/C2, generation 3, marker and
+independent oracle (including its 1e-8 assertion) are unchanged. Three failed
+tests on source `526790d` were observed in Fedora run 41194590811, Arch run
+41194590761 and Nix run 41194590907: this bound test plus both listening gates.
+Final-source validation is required before any release; the listening fixes
+are tracked separately.
+
 Original integration snapshot: 2026-10-31. Main baseline: `34aeed9085ad0f66cb8f266f997e11dd781470a6`. All 19 open PRs are accounted for: 17 RyanTheTide and two report-only erikwb PRs. Original branches are preserved.
 
 ## Merge-order graph

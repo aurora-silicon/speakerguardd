@@ -316,11 +316,23 @@ impl SpeakerState {
     /// relationship to the coil. Keep the hard fault latched until cool.
     pub fn assume_latched(&mut self, globals: &Globals) {
         self.configure_voltage(globals);
-        let s = &self.spec;
         let full = self.worst_case_power(0.0);
         let safe = self.worst_case_power(globals.safe_reduction);
-        let mut th = crate::engine::Thermal::new(s.tr_coil, s.tau_coil, s.tr_magnet, s.tau_magnet, s.t_limit);
-        (self.t_coil, self.t_magnet) = th.latched_start(s.t_limit, full, safe, globals.t_ambient);
+        let (limit, tr_coil, tr_magnet) = (self.spec.t_limit, self.spec.tr_coil, self.spec.tr_magnet);
+        self.t_coil = limit;
+        self.t_magnet = limit;
+        self.t_peak = limit;
+        // Use this model's own conservative substeps and interval peak, as
+        // main's hot-start bound does. Thermal::hold solves the continuous
+        // equations exactly, but heat advances the magnet before the coil:
+        // its drain can finish above that continuous endpoint (on J700 by
+        // 0.0017 K). An exact continuous start cannot bound this model.
+        self.heat(full, DRAIN_S, globals.t_ambient);
+        // Bound every shorter drain too, and any later time at the kernel
+        // safe level. With M >= M_safe and C >= M + P_safe Rc, neither
+        // node can rise above this envelope while the safe level holds.
+        self.t_magnet = self.t_magnet.max(limit).max(globals.t_ambient + safe * tr_magnet);
+        self.t_coil = self.t_peak.max(self.t_magnet + safe * tr_coil);
         self.t_peak = self.t_coil;
         self.hard = true;
         // nor is the power before the gain: a minute of full scale for the
