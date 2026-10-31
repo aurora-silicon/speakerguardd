@@ -96,6 +96,9 @@ pub fn fingerprint(cfg: &Config) -> u64 {
     if cfg.globals.guard.is_none() {
         globals = globals.replace(", guard: None", "");
     }
+    // nor a profile without its own amp gain index (review L2-1: the
+    // recordings made before the field existed still match)
+    globals = globals.replace(", amp_gain_index: None", "");
     // nor does a speaker without its own z_min
     let speakers = format!("{:?}", cfg.speakers).replace(", z_min_override: None", "");
     let text = format!("{globals}{:?}{speakers}", cfg.controls);
@@ -1512,14 +1515,16 @@ mod tests {
     fn bad_sense_data_replays_charged_not_measured() {
         let cfg = j413();
         let ch = cfg.globals.channels;
-        let ics: Vec<usize> = cfg.speakers.iter().map(|s| s.is_chan.unwrap()).collect();
+        let slots: Vec<_> = cfg.speakers.iter().map(|s| (s.vs_chan, s.is_chan.unwrap())).collect();
         let mut hw = FakeHw::per_speaker(&cfg);
         hw.level = Box::new(|_| 0.02);
         hw.tweak = Some(Box::new(move |n, w| {
             if n == 30 {
                 for f in w.chunks_exact_mut(ch) {
-                    for &ic in &ics {
-                        f[ic] = -f[ic];
+                    for &(vc, ic) in &slots {
+                        // A sensor fault, independent of the protected gain.
+                        f[vc] = i32::MAX / 2;
+                        f[ic] = -i32::MAX / 2;
                     }
                 }
             }
@@ -1547,8 +1552,9 @@ mod tests {
         hw.lossy = true;
         hw.control_delay = Box::new(|t| if (secs(2.0)..secs(2.05)).contains(&t) { Duration::from_millis(500) } else { Duration::ZERO });
         let path = tmp("gap.rec");
-        let live = record(&cfg, &mut hw, Some(vi_state(&cfg, 55.0, 52.0)), secs(4.0), &path);
-        let live_latched = live.engine.as_ref().unwrap().asahi.as_ref().unwrap().iter().any(|a| a.hard);
+        record(&cfg, &mut hw, Some(vi_state(&cfg, 55.0, 52.0)), secs(4.0), &path);
+        let tl = Timeline::read(&path, &cfg).unwrap();
+        let live_charged: f64 = tl.accounts.iter().filter(|a| a.2 == Accounted::Charged).map(|(a, b, _)| (*b - *a).as_secs_f64()).sum();
         let out = replay(&path, &cfg, &Replay { gain_db: 0.0, governor: None, guard: None, max_reduction: None, csv: None }).unwrap();
         assert!(!out.certified, "{}", out.text);
         assert!(out.text.contains("frames the capture lost") || out.text.contains("stalled"), "{}", out.text);
@@ -1557,8 +1563,9 @@ mod tests {
         let longest = out.text.lines().skip_while(|l| !l.starts_with("charged, not measured")).nth(1).unwrap_or("");
         assert!(longest.contains("ms)"), "{}", out.text);
         assert!(out.text.contains("hand-off"), "the replayed guard never handed off over the gap:\n{}", out.text);
-        assert!(live_latched, "the live guard did not charge the gap");
-        assert!(!out.text.contains("0 latches"), "{}", out.text);
+        // The full-scale ceiling can now prevent a latch. The gap still
+        // belongs to the charged account and still refuses certification.
+        assert!(live_charged > 0.15, "the live guard charged only {live_charged} s");
     }
 
     /// The transitions the recording keeps: the start state, lock changes
@@ -1777,5 +1784,30 @@ mod tests {
         let tl = Timeline::read(&path, &c).unwrap();
         assert!(tl.periods.is_empty() && tl.truncated.is_some(), "{} periods, truncated {:?}", tl.periods.len(), tl.truncated);
         assert!(tl.ambiguous().iter().any(|a| a.2.contains("stopped here")));
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_history {
+    /// Review L2-1: the fingerprint of every shipped file without the
+    /// newer optional keys is the one 36bf6b6 computed, so recordings made
+    /// before them still certify.
+    #[test]
+    fn the_shipped_files_keep_their_fingerprints() {
+        for (name, text, want) in [
+            ("j700", include_str!("../conf/apple/j700.conf"), 0x09c595d1ff48e20bu64),
+            ("j316", include_str!("../conf/apple/j316.conf"), 0xb070f3441d6d361f),
+            ("j413", include_str!("../conf/apple/j413.conf"), 0xd39b9751276bd101),
+            ("j616", include_str!("../conf/apple/j616.conf"), 0x7232d0cccd01ca3f),
+        ] {
+            // the V/I files' governor lines changed since; as 36bf6b6 had them
+            let text = text.replace("governor = unified\nguard = asahi\n", "governor = asahi\n");
+            let cfg = crate::config::Config::parse(&text).unwrap();
+            assert_eq!(super::fingerprint(&cfg), want, "{name}");
+        }
+        // an index set is part of the configuration
+        let with = include_str!("../conf/apple/j316.conf").replace("amp_gain_dbv = 18.5", "amp_gain_dbv = 18.5\namp_gain_index = 15");
+        let without = include_str!("../conf/apple/j316.conf");
+        assert_ne!(super::fingerprint(&crate::config::Config::parse(&with).unwrap()), super::fingerprint(&crate::config::Config::parse(without).unwrap()));
     }
 }

@@ -99,6 +99,11 @@ pub struct Globals {
     /// worst-case power and speakersafetyd's min_gain follow from it.  0 when
     /// the sense words are the amplifier's own full scale (J700).
     pub amp_gain_dbv: f64,
+    /// The amp gain control value `amp_gain_dbv` stands for: when set, the
+    /// daemon writes it (or the control's maximum, if that is lower)
+    /// instead of the maximum, so a control with a wider range than the
+    /// profile assumed does not play louder than every worst case.
+    pub amp_gain_index: Option<i64>,
     /// Unified governor: prediction horizon (s) and release time constant (s).
     pub horizon_s: f64,
     pub release_s: f64,
@@ -207,6 +212,10 @@ pub struct Config {
 
 type Sections = BTreeMap<String, BTreeMap<String, String>>;
 
+#[cfg(test)]
+#[path = "profile_tests.rs"]
+mod profile_tests;
+
 fn parse_ini(text: &str) -> Result<Sections, ConfigError> {
     let mut sections: Sections = BTreeMap::new();
     let mut current: Option<String> = None;
@@ -303,6 +312,10 @@ impl Config {
                 Some(v) => return Err(ConfigError(format!("[Globals] sense_format {v:?}: s32 or s16"))),
             },
             amp_gain_dbv: or(g, "Globals", "amp_gain_dbv", 0.0)?,
+            amp_gain_index: match g.get("amp_gain_index") {
+                None => None,
+                Some(v) => Some(v.parse::<i64>().ok().filter(|i| *i >= 0).ok_or_else(|| ConfigError(format!("[Globals] amp_gain_index {v:?}: a control value, 0 or more")))?),
+            },
             horizon_s: or(g, "Globals", "horizon_s", 4.6)?,
             release_s: or(g, "Globals", "release_s", 20.0)?,
             t_ctrl_headroom: or(g, "Globals", "t_ctrl_headroom", 0.0)?,
@@ -367,6 +380,9 @@ impl Config {
             isense: c.get("isense").cloned(),
             amp_gain: c.get("amp_gain").cloned(),
         };
+        if globals.amp_gain_index.is_some() && controls.amp_gain.is_none() {
+            return Err(ConfigError("[Globals] amp_gain_index needs [Controls] amp_gain".into()));
+        }
         let mut speakers = Vec::new();
         for (section, values) in &sections {
             let Some(name) = section.strip_prefix("Speaker/") else { continue };
@@ -536,6 +552,16 @@ impl Config {
         Ok(())
     }
 
+    /// Tests: `text` with speakersafetyd's governor alone, the V/I files'
+    /// default before the feed-forward model became primary (the tests
+    /// written against it keep their meaning).
+    #[cfg(test)]
+    pub fn asahi_alone(text: &str) -> String {
+        let s = text.replace("governor = unified\nguard = asahi\n", "governor = asahi\n");
+        assert!(s != text || !text.contains("guard = asahi"), "the file's governor lines changed");
+        s
+    }
+
     pub fn load(path: &Path) -> Result<Config, Box<dyn std::error::Error>> {
         let text = fs::read_to_string(path)?;
         Ok(Config::parse(&text)?)
@@ -586,12 +612,26 @@ mod tests {
         assert!(Config::parse(&text).is_err());
     }
 
+    /// amp_gain_index: the control value amp_gain_dbv stands for, a
+    /// nonnegative integer, only with an amp gain control to write.
+    #[test]
+    fn amp_gain_index_is_a_control_value() {
+        assert_eq!(Config::parse(J316).unwrap().globals.amp_gain_index, None);
+        let with = J316.replace("amp_gain_dbv = 18.5", "amp_gain_dbv = 18.5\namp_gain_index = 15");
+        assert_eq!(Config::parse(&with).unwrap().globals.amp_gain_index, Some(15));
+        assert!(Config::parse(&with.replace("amp_gain_index = 15", "amp_gain_index = -1")).is_err());
+        assert!(Config::parse(&with.replace("amp_gain_index = 15", "amp_gain_index = 1.5")).is_err());
+        assert!(Config::parse(&J700.replace("[Globals]", "[Globals]\namp_gain_index = 15")).is_err());
+    }
+
     #[test]
     fn parses_the_vi_machines() {
         for text in [J316, J413, J616] {
             let c = Config::parse(text).unwrap();
             assert!(c.has_vi());
-            assert_eq!(c.globals.governor, Governor::Asahi);
+            // feed-forward primary, the V/I model guarding it
+            assert_eq!(c.globals.governor, Governor::Unified);
+            assert_eq!(c.globals.guard, Some(Governor::Asahi));
             assert_eq!(c.globals.sense_format, SenseFormat::S16);
             assert_eq!(c.globals.max_reduction, 7.0);
             assert_eq!(c.controls.isense.as_deref(), Some("ISENSE Switch"));
@@ -641,7 +681,7 @@ mod tests {
     /// still needs the experimental flag.
     #[test]
     fn the_asahi_guard_lets_the_unified_governor_write_the_card() {
-        let guarded = J316.replace("governor = asahi", "governor = unified\nguard = asahi");
+        let guarded = J316.to_string();
         let mut c = Config::parse(&guarded).unwrap();
         assert_eq!(c.globals.guard, Some(Governor::Asahi));
         c.allow_unqualified = true;
@@ -649,7 +689,7 @@ mod tests {
         c.globals.guard = None;
         assert!(c.check_governor().is_err(), "unified governed alone without the flag");
         // the guard guards the unified governor only, and needs V/I sense
-        assert!(Config::parse(&J316.replace("governor = asahi", "governor = asahi\nguard = asahi")).is_err());
+        assert!(Config::parse(&J316.replace("governor = unified", "governor = asahi")).is_err());
         assert!(Config::parse(&J700.replace("[Globals]", "[Globals]\ngovernor = unified\nguard = asahi")).is_err());
         assert!(Config::parse(&guarded.replace("amp_gain_dbv = 18.5", "amp_gain_dbv = 0")).is_err());
         assert!(Config::parse(&guarded.replace("guard = asahi", "guard = legacy")).is_err());
@@ -657,7 +697,7 @@ mod tests {
         // the command line's choice is checked the same way
         let mut c = Config::parse(J316).unwrap();
         c.allow_unqualified = true;
-        c.globals.guard = Some(Governor::Asahi);
+        c.globals.governor = Governor::Asahi;
         assert!(c.check_governor().is_err(), "guarded the asahi governor");
         c.globals.governor = Governor::Unified;
         assert!(c.check_governor().is_ok());
@@ -674,7 +714,7 @@ mod tests {
         // asahi needs current sense and the amplifier's level
         assert!(Config::parse(&J700.replace("[Globals]", "[Globals]\ngovernor = asahi")).is_err());
         assert!(Config::parse(&J316.replace("amp_gain_dbv = 18.5", "amp_gain_dbv = 0")).is_err());
-        assert!(Config::parse(&J316.replace("governor = asahi", "governor = legacy")).is_ok());
+        assert!(Config::parse(&J316.replace("governor = unified\nguard = asahi", "governor = legacy")).is_ok());
         assert!(Config::parse(&J700.replace("[Globals]", "[Globals]\ngovernor = loud")).is_err());
         // a current channel on the voltage channel is a broken map
         assert!(Config::parse(&J413.replacen("is_chan = 0", "is_chan = 1", 1)).is_err());

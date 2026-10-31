@@ -21,6 +21,7 @@ install: all
 	install -dDm0755 $(DESTDIR)$(BINDIR) $(DESTDIR)$(SHAREDIR)/apple $(DESTDIR)$(UNITDIR) $(DESTDIR)$(UDEVDIR)
 	install -pm0755 target/$(TARGET)/release/speakerguardd $(DESTDIR)$(BINDIR)/
 	install -pm0644 conf/apple/*.conf $(DESTDIR)$(SHAREDIR)/apple/
+	install -pm0644 conf/LICENSE.asahi $(DESTDIR)$(SHAREDIR)/
 	install -pm0644 speakerguardd.service $(DESTDIR)$(UNITDIR)/
 	install -pm0644 95-speakerguardd.rules $(DESTDIR)$(UDEVDIR)/
 

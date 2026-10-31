@@ -135,36 +135,51 @@ pub const DEAD_V_MIN: f64 = 0.1;
 /// where the file has none): LOW_R_RATIO times z_min at 20 C, scaled to the
 /// measured-power model's coil (no cooler than the truth while the line
 /// reads, and cooler still when it reads low).  On the J616s's woofers at
-/// full volume it is 1.28 to 1.49 times z_min against a bound of 1.9 to
-/// 2.2, about 0.7 of it (1.35 left them at 0.87 to 0.94, and one misfired
-/// at +10 dB of replay gain: review r4 EE2); a line reading half doubles
-/// it.  The line reads low once R has stayed over the bound for LOW_SET_S
-/// of program, and reads again under LOW_R_CLEAR of the bound, or after
-/// LOW_FORGET_S of program with no low-band current to judge it by.
-pub const LOW_R_RATIO: f64 = 1.6;
+/// full volume it is 1.28 to 1.49 times z_min against a bound of 1.6 to
+/// 1.8, and one misfired at 1.002 of it at +10 dB of replay gain (review
+/// r4 EE2); a line reading half doubles it, and one reading 0.55 to 0.65
+/// still clears it.  The power is bounded from the first stretch R is
+/// over the bound, and stays bounded until R reads under LOW_R_CLEAR of
+/// the least bound since then, on audible program: the deployed rule
+/// (2f7d16d), judged against a bound that cannot rise with the heat the
+/// bounded model takes, and cleared only on program the card played
+/// (review r4 addenda 6a and 6b).  Nothing else clears it: a passage
+/// without bass is no evidence the line reads again, and a line just over
+/// the bound may read 0.65 of its current.  Only the verdict that is
+/// logged (and kept in `lost`) waits: at once from LOW_FAST times the
+/// bound, else once R has stayed over it for LOW_SET_S of program (the
+/// review's +10 dB misfire at 1.002 of it lasted under a second).
+pub const LOW_R_RATIO: f64 = 1.35;
 pub const LOW_R_CLEAR: f64 = 0.9;
 pub const LOW_WINDOW_S: f64 = 3.0;
+pub const LOW_FAST: f64 = 1.25;
 pub const LOW_SET_S: f64 = 1.0;
-pub const LOW_FORGET_S: f64 = 30.0;
 const COPPER_ALPHA: f64 = 0.0039;
 /// ... and a line whose current does not follow its voltage at all (a
 /// dead line carrying a DC offset: the rms ratio stays plausible while
-/// V*I averages to nothing): over a stretch with at least PF_V_MIN and
-/// PF_I_MIN rms, sum(v i) / sqrt(sum(v^2) sum(i^2)) under PF_MIN.  A live
+/// V*I averages to nothing): over a stretch with at least PF_V_MIN and a
+/// current the dead-line test passes (at least the voltage over DEAD_RATIO
+/// times the nominal impedance, so that a dead line with a small offset is
+/// judged here if it is not there: review r4 FF1), sum(v i) / sqrt(sum(v^2)
+/// sum(i^2)) under PF_MIN.  A live
 /// load of up to 60 degrees keeps it at 0.4 or more on any program whose
 /// impedance spans up to 4 to 1.  At PF_FAST_V or more the line is lost
 /// at once; under it, once the condition has held for PF_HOLD_S of judged
-/// program (review r4 EE1).  Every misfire seen on real data (the M2's
+/// program (review r4 EE1).  Where the deployed rule judged it (PF_BASE_V
+/// and PF_BASE_I or more) the power is bounded meanwhile, so only the
+/// verdict waits there (review r4 addendum 6b).  Every misfire seen on real data (the M2's
 /// right woofer at 0.1 V and 25 mA in a quiet passage, the M1 Pro's
 /// tweeters at 0.12 to 0.38 V) lasted at most four periods, while an offset
 /// line stays offset; what it can hide meanwhile is at most PF_FAST_V^2
-/// over the smallest impedance for PF_HOLD_S, 67 mW for 2 s on the J413's
-/// tweeters.
+/// over the smallest impedance for PF_HOLD_S: 92.6 mW on the J316's and
+/// J616's woofers, 78.1 mW on their tweeters, 62.5 mW on the J413's
+/// woofers and 67.2 mW on its tweeters (5.0 K after 2 s there), once.
 pub const PF_MIN: f64 = 0.2;
-pub const PF_I_MIN: f64 = 0.02;
 pub const PF_V_MIN: f64 = 0.1;
 pub const PF_FAST_V: f64 = 0.5;
 pub const PF_HOLD_S: f64 = 2.0;
+pub const PF_BASE_V: f64 = 0.3;
+pub const PF_BASE_I: f64 = 0.02;
 /// A lost line is logged once it has held for LOG_LOST stretches, and as
 /// reading again once that has held for LOG_BACK (review r4 DD2); the
 /// bound itself follows the line at once.
@@ -1152,11 +1167,17 @@ pub struct Engine {
     lf: Vec<(f64, f64, f64)>,
     pub low: Vec<bool>,
     /// Per speaker: seconds of judged program the power-factor condition
-    /// has held, the low-band bound has been exceeded, and the low-band
-    /// test has had nothing to judge.
+    /// has held and R has stayed over the low-band bound (the verdicts'
+    /// waits).
     pf_held: Vec<f64>,
     low_held: Vec<f64>,
-    low_idle: Vec<f64>,
+    /// ... whether the low band bounds the power (from the first stretch R
+    /// was over the bound), and the least bound since then.
+    low_bound: Vec<bool>,
+    low_set_bound: Vec<f64>,
+    /// Per speaker: whether its power was bounded over the last stretch (a
+    /// lost line, or a verdict that waits where the deployed rule bounded).
+    pub bounded: Vec<bool>,
     logged: Vec<(bool, u32)>,
     /// Seconds accounted since the last measured stretch, or none since an
     /// idle span (the next stretch does not follow it).
@@ -1183,7 +1204,7 @@ impl Engine {
             return None;
         }
         let n = cfg.speakers.len();
-        Some(Engine { cfg: cfg.clone(), asahi, unified, extractor: Extractor::new(n), last: vec![Feature::default(); n], lost: vec![false; n], lost_changed: Vec::new(), pending: vec![0.0; n], reading: vec![false; n], gap: f64::INFINITY, lf: vec![(0.0, 0.0, 0.0); n], low: vec![false; n], logged: vec![(false, 0); n], pf_held: vec![0.0; n], low_held: vec![0.0; n], low_idle: vec![0.0; n] })
+        Some(Engine { cfg: cfg.clone(), asahi, unified, extractor: Extractor::new(n), last: vec![Feature::default(); n], lost: vec![false; n], lost_changed: Vec::new(), pending: vec![0.0; n], reading: vec![false; n], gap: f64::INFINITY, lf: vec![(0.0, 0.0, 0.0); n], low: vec![false; n], logged: vec![(false, 0); n], pf_held: vec![0.0; n], low_held: vec![0.0; n], low_bound: vec![false; n], low_set_bound: vec![f64::INFINITY; n], bounded: vec![false; n] })
     }
 
     pub fn has(&self, gov: Governor) -> bool {
@@ -1317,26 +1338,43 @@ impl Engine {
                 }
                 None => (false, false),
             };
+            // A low-band verdict that waits (in the marginal band) bounds
+            // the stretch's power while it waits, but is neither logged nor
+            // kept until it has held (review r4 addendum 6a: the wait alone
+            // left a bad line unbounded for its first second).  The
+            // power-factor wait under PF_FAST_V does not: what it can hide is
+            // at most PF_FAST_V^2 / z_min for PF_HOLD_S, once
+            let mut waiting = false;
             if s.is_chan.is_some() {
                 // a line that reads low but plausibly, or not with its
                 // voltage at all (DD1), from the stretch's features
                 let f = &self.last[sk];
                 let (vi_m, i_ms) = (f.vi.unwrap_or(0.0), f.i_ms.unwrap_or(0.0));
-                if f.v_ms >= PF_V_MIN * PF_V_MIN && i_ms >= PF_I_MIN * PF_I_MIN {
+                // judged where FF1's gate or the deployed rule's is open
+                let base = f.v_ms >= PF_BASE_V * PF_BASE_V && i_ms >= PF_BASE_I * PF_BASE_I;
+                if base || (f.v_ms >= PF_V_MIN * PF_V_MIN && i_ms * (DEAD_RATIO * s.z_nominal).powi(2) >= f.v_ms) {
                     if !(vi_m >= PF_MIN * (f.v_ms * i_ms).sqrt()) {
                         self.pf_held[sk] += span;
                         if f.v_ms >= PF_FAST_V * PF_FAST_V || self.pf_held[sk] >= PF_HOLD_S {
                             lost = true;
+                        } else if base {
+                            waiting = true;
                         }
                     } else {
                         self.pf_held[sk] = 0.0;
                     }
                 }
+                // the low band's window takes every stretch, as the deployed
+                // rule's did; only clearing needs program the card played
+                // at a gain it may have applied (at its safe level the words
+                // are the sense's noise, and they cleared a line reading
+                // 0.65 at a hand-off: review r4 addendum 6a)
+                let audible = f.v_ms >= DEAD_V_MIN * DEAD_V_MIN && possible[sk].iter().any(|r| r.0 <= PREDICT_MAX_DB);
                 let decay = (-span / LOW_WINDOW_S).exp();
                 let w = &mut self.lf[sk];
                 *w = (w.0 * decay + f.lf.0, w.1 * decay + f.lf.1, w.2 * decay + f.lf.2 as f64);
+                let w = self.lf[sk];
                 if w.2 > 0.0 && w.1 / w.2 >= RTH_I_MIN * RTH_I_MIN {
-                    self.low_idle[sk] = 0.0;
                     let r = w.0 / w.1;
                     let alpha = if s.a_t_20c > 0.0 { s.a_t_20c } else { COPPER_ALPHA };
                     let t_coil = match (self.asahi.as_ref(), self.unified.as_ref().and_then(|u| u[sk].vi.as_ref())) {
@@ -1345,31 +1383,45 @@ impl Engine {
                         (None, None) => g.t_ambient,
                     };
                     let bound = LOW_R_RATIO * z_min * (1.0 + alpha * (t_coil - 20.0).max(0.0));
-                    if r > bound || !r.is_finite() {
+                    // R is judged against the least bound since it first
+                    // went over it: the bound rises with the model, which
+                    // the bounded line heats with the most power there can
+                    // be, and that must not end the bound.  On a J316
+                    // tweeter on bass, with its line reading 0.65, the model
+                    // ran from 95 to 113 C in four periods, past the line's
+                    // R (review r4 addendum 6a)
+                    let held_bound = bound.min(self.low_set_bound[sk]);
+                    let over = if r.is_finite() { r / held_bound } else { f64::INFINITY };
+                    if over > 1.0 {
+                        self.low_bound[sk] = true;
+                        self.low_set_bound[sk] = held_bound;
                         self.low_held[sk] += span;
-                        if self.low_held[sk] >= LOW_SET_S {
+                        if over >= LOW_FAST || self.low_held[sk] >= LOW_SET_S {
                             self.low[sk] = true;
                         }
                     } else {
                         self.low_held[sk] = 0.0;
-                        if r < LOW_R_CLEAR * bound {
-                            self.low[sk] = false;
-                        }
                     }
-                } else {
-                    self.low_idle[sk] += span;
-                    if self.low_idle[sk] >= LOW_FORGET_S {
+                    // the bound (and the verdict) end only on evidence the
+                    // line reads: R under LOW_R_CLEAR of that bound, on
+                    // program the card played
+                    if self.low_bound[sk] && audible && r < LOW_R_CLEAR * held_bound {
+                        self.low_bound[sk] = false;
                         self.low[sk] = false;
                         self.low_held[sk] = 0.0;
+                        self.low_set_bound[sk] = f64::INFINITY;
                     }
                 }
+                waiting |= self.low_bound[sk];
                 lost |= self.low[sk];
             }
+            let bounded = lost || waiting;
+            self.bounded[sk] = bounded;
             for f in 0..frames {
                 let wv = words[f * ch + s.vs_chan] as f64;
                 let wi = s.is_chan.map_or(0.0, |ic| words[f * ch + ic] as f64);
                 v2.push((wv * vs).powi(2));
-                vi.push(if lost { (wv * vs).powi(2) / z_min } else { sense_power(wv, wi, (vs, is), i_max) });
+                vi.push(if bounded { (wv * vs).powi(2) / z_min } else { sense_power(wv, wi, (vs, is), i_max) });
                 if let Some(u) = unified {
                     let room = if wv != 0.0 { 20.0 * (2147483648.0 / wv.abs()).log10() } else { f64::INFINITY };
                     let at = converted_at(room, &possible[sk]);
@@ -1382,7 +1434,7 @@ impl Engine {
                     let full_vi = u.v_worst * u.v_worst / u.z_min;
                     pre_ff.push((vup * vup / u.r_ff * gain).min(full_ff));
                     let up = if wi.abs() >= I_RAIL { (vup * iup).max(vup * i_max) } else { vup * iup };
-                    pre_vi.push(if lost {
+                    pre_vi.push(if bounded {
                         (vup * vup / z_min * gain).min(full_vi)
                     } else if wv * wi > 0.0 || wi.abs() >= I_RAIL {
                         (up * gain).min(full_vi)
@@ -1409,16 +1461,16 @@ impl Engine {
                 }).collect();
                 let long = dead_block(DEAD_LONG_S, step);
                 let follows = self.gap <= DEAD_GAP_S;
-                let reading = !lost && judged;
+                let reading = !bounded && judged;
                 let mut e = 0.0;
                 if !(follows && reading) {
                     e += self.pending[sk];
                 }
-                if !lost && !(follows && self.reading[sk]) {
+                if !bounded && !(follows && self.reading[sk]) {
                     e += deficit[..long.min(frames)].iter().sum::<f64>();
                 }
                 charge = e;
-                self.pending[sk] = if lost { 0.0 } else { deficit[frames.saturating_sub(long + frames % long)..].iter().sum() };
+                self.pending[sk] = if bounded { 0.0 } else { deficit[frames.saturating_sub(long + frames % long)..].iter().sum() };
                 self.reading[sk] = reading;
                 let (shown, held) = self.logged[sk];
                 let held = if lost != shown { held + 1 } else { 0 };
@@ -1432,7 +1484,7 @@ impl Engine {
             }
             if let (Some(asahi), Some(ic)) = (self.asahi.as_mut(), s.is_chan) {
                 let (a, b) = run(best(&vi));
-                asahi[sk].samples(&words[a * ch..b * ch], ch, (s.vs_chan, ic), (vs, is), step, first, g.t_ambient, lost);
+                asahi[sk].samples(&words[a * ch..b * ch], ch, (s.vs_chan, ic), (vs, is), step, first, g.t_ambient, bounded);
             }
             if let Some(u) = self.unified.as_mut() {
                 let vi_pos: Vec<f64> = vi.iter().map(|x| x.max(0.0)).collect();
@@ -1581,6 +1633,90 @@ impl Engine {
         (per, hard)
     }
 
+    /// Bound an onset even when the last measured program was silence or
+    /// mute. `pending_s` includes the unobserved time, the old lease and
+    /// its queue; during it either the old or the new gain may play. The new
+    /// gain can then play for a whole lease before the kernel takes over.
+    /// The lease counts playing time, so reserve the entire energy dose
+    /// without relying on contiguous playback. Check the safe-level tail
+    /// too. These are predictions on copies, never model charges.
+    pub fn onset_reductions(
+        &self,
+        gov: Governor,
+        pending: &[f64],
+        pending_s: f64,
+        lease_s: f64,
+    ) -> Vec<f64> {
+        let g = &self.cfg.globals;
+        let own: Vec<_> = self
+            .cfg
+            .speakers
+            .iter()
+            .enumerate()
+            .map(|(k, s)| {
+                let Some(a) = self.asahi.as_ref().and_then(|a| a.get(k)) else {
+                    return 0.0;
+                };
+                let mut models = vec![(&a.th, a.v_worst.powi(2) / a.z_min * ASAHI_MARGIN)];
+                if gov == Governor::Unified {
+                    if let Some(u) = self.unified.as_ref().and_then(|u| u.get(k)) {
+                        models.push((&u.ff, u.v_worst.powi(2) / u.r_ff));
+                    }
+                }
+                let target = s.t_limit - s.t_headroom;
+                let old = 10f64.powf(-pending[k].max(0.0) / 10.0);
+                let safe = 10f64.powf(-g.safe_reduction.max(0.0) / 10.0);
+                let fits = |gain: f64| {
+                    models.iter().all(|(th, full)| {
+                        let mut th = (*th).clone();
+                        // Idle can warm a coil below its magnet. This
+                        // envelope covers every idle delay before the dose,
+                        // including small below-ambient sense estimates.
+                        th.t_magnet = hi(th.t_magnet, g.t_ambient);
+                        th.t_coil = hi(th.t_coil, th.t_magnet);
+                        // Each joule adds at most impulse's node increments,
+                        // wherever it lands among the lease's idle gaps.
+                        let energy = full * (old.max(gain) * pending_s + gain * lease_s);
+                        let (c, m) = th.impulse(energy);
+                        if !(c < target && m < target) {
+                            return false;
+                        }
+                        let power = full * safe;
+                        let steady = g.t_ambient + power * (th.tr_coil + th.tr_magnet);
+                        // Infinity is only the extremum search's upper endpoint;
+                        // no infinite duration is integrated (equal taus included).
+                        let peak = hi(
+                            hi(th.t_coil, steady),
+                            th.coil_extremum(power, f64::INFINITY, g.t_ambient),
+                        );
+                        peak < target && th.t_magnet < target
+                    })
+                };
+                if fits(1.0) {
+                    return 0.0;
+                }
+                if !fits(0.0) {
+                    return NOTHING_DB;
+                }
+                let (mut lo, mut hi) = (0.0, 1.0);
+                for _ in 0..32 {
+                    let mid = (lo + hi) / 2.0;
+                    if fits(mid) {
+                        lo = mid;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                if lo > 0.0 {
+                    (-db(lo)).max(0.0)
+                } else {
+                    NOTHING_DB
+                }
+            })
+            .collect();
+        link(&self.cfg, &own)
+    }
+
     /// A model of `gov` latched at its hard limit (a governor this engine
     /// does not run counts as one).
     pub fn hard(&self, gov: Governor) -> bool {
@@ -1695,7 +1831,7 @@ mod tests {
     const J616: &str = include_str!("../conf/apple/j616.conf");
 
     fn cfg(text: &str) -> Config {
-        Config::parse(text).unwrap()
+        Config::parse(&Config::asahi_alone(text)).unwrap()
     }
 
     fn idx(c: &Config, name: &str) -> usize {
@@ -2734,6 +2870,13 @@ mod tests {
     /// smallest impedance plus `offset` amps; through check() and measured()
     /// as the guard runs them, the models at `t` C.
     fn low_run(freq: f64, amp: f64, z: f64, k: f64, offset: f64, periods: usize, t: f64) -> Engine {
+        low_run_with(freq, amp, z, k, offset, periods, t, &|_| Some(t))
+    }
+
+    /// ... with the asahi models set to `t` at the start and to `at(n)`
+    /// after period n (None: left as the period took them)
+    #[allow(clippy::too_many_arguments)]
+    fn low_run_with(freq: f64, amp: f64, z: f64, k: f64, offset: f64, periods: usize, t: f64, at: &dyn Fn(usize) -> Option<f64>) -> Engine {
         let c = cfg(J316);
         let (ch, p) = (c.globals.channels, c.globals.period);
         let possible = vec![vec![(0.0, 0.0)]; c.speakers.len()];
@@ -2752,7 +2895,9 @@ mod tests {
             }
             e.check(&w, 48000.0).unwrap();
             e.measured(&w, p, p, p, 0, 1.0 / 48000.0, 1.0, &possible);
-            set_asahi(&mut e, t, t);
+            if let Some(t) = at(n) {
+                set_asahi(&mut e, t, t);
+            }
         }
         e
     }
@@ -2763,10 +2908,9 @@ mod tests {
     /// resistance at 3 times z_min, over the bound a live coil can reach
     /// even at its limit; within the window it is lost.  A dead line with
     /// 0.2 A of offset reads a plausible rms against 3 V, but its current
-    /// does not follow the voltage.  A live line at 1.45 times z_min is a
-    /// hot coil: a live line at 1.75 times z_min is lost with the model at
-    /// 20 C, not at 120 C (the J616s's woofers at full volume read 1.28 to
-    /// 1.49).
+    /// does not follow the voltage.  A hot coil is no low line: a live line
+    /// at 1.75 times z_min is lost with the model at 20 C, not at 120 C
+    /// (the J616s's woofers at full volume read 1.28 to 1.49).
     #[test]
     fn a_line_that_reads_low_or_off_its_voltage_is_lost() {
         // 3 s of 60 Hz at 3 V, 85 ms a period
@@ -2776,35 +2920,161 @@ mod tests {
         assert!(live.lost.iter().all(|&l| !l), "a live line: {:?}", live.lost);
         let offset = low_run(1000.0, 3.0, 1.2, 0.0, 0.2, 2, 50.0);
         assert!(offset.lost.iter().all(|&l| l), "a dead line with an offset: {:?}", offset.lost);
+        // and one with 15 mA of offset on a quiet program (0.4 V rms), too
+        // much current for the dead-line test and too little for the old
+        // 20 mA gate (review r4 FF1): lost within its 2 s
+        let small = low_run(1000.0, 0.57, 1.2, 0.0, 0.015, 30, 50.0);
+        assert!(small.lost.iter().all(|&l| l), "a dead line with 15 mA of offset at 0.4 V: {:?}", small.lost);
         let cold = low_run(60.0, 3.0, 1.75, 1.0, 0.0, 40, 20.0);
         assert!(cold.lost.iter().all(|&l| l), "1.75 times z_min at 20 C: {:?}", cold.lost);
         let hot = low_run(60.0, 3.0, 1.75, 1.0, 0.0, 40, 120.0);
         assert!(hot.lost.iter().all(|&l| !l), "1.75 times z_min at 120 C: {:?}", hot.lost);
-        // the review's misfire at +10 dB of replay gain: 1.55 times z_min
-        // with the model's coil at 59 C, over 1.35's bound and under 1.6's
-        let real = low_run(60.0, 3.0, 1.55, 1.0, 0.0, 40, 59.0);
-        assert!(real.lost.iter().all(|&l| !l), "1.55 times z_min at 59 C: {:?}", real.lost);
-        // and a line reading low is judged on a second of program, not one
-        // update
-        let early = low_run(60.0, 3.0, 1.2, 0.4, 0.0, 5, 50.0);
-        assert!(early.lost.iter().all(|&l| !l), "lost after five periods: {:?}", early.lost);
-        // a lost low line reads again once there is nothing to judge it by
-        // for LOW_FORGET_S, so a misfire cannot stay (review r4 EE2)
-        let mut e = low_run(60.0, 3.0, 1.2, 0.4, 0.0, 40, 50.0);
-        assert!(e.low.iter().all(|&l| l));
+        // review r4 addendum 6a: a line reading 0.11 on bass is bounded in
+        // its first period, and one reading 0.6 is flagged
+        let first = low_run(60.0, 3.0, 1.2, 0.11, 0.0, 1, 50.0);
+        assert!(first.lost.iter().all(|&l| l), "a line reading 0.11, first period: {:?}", first.lost);
+        let six = low_run(60.0, 3.0, 1.2, 0.6, 0.0, 40, 50.0);
+        assert!(six.lost.iter().all(|&l| l), "a line reading 0.6: {:?}", six.lost);
+        // the review's misfire at +10 dB of replay gain was 1.002 of the
+        // bound (1.55 times z_min with the model at 59 C): in the marginal
+        // band a verdict waits a second of program
+        let real = low_run(60.0, 3.0, 1.55, 1.0, 0.0, 5, 59.0);
+        assert!(real.lost.iter().all(|&l| !l), "1.55 times z_min at 59 C, five periods: {:?}", real.lost);
+        // ... but its power is bounded while it waits: three periods of a
+        // line reading 0.65 (1.19 of the bound at 59 C) heat the asahi
+        // models as a dead line's do (review r4 addendum 6a)
+        let free = |_: usize| None;
+        let waits = low_run_with(60.0, 3.0, 1.2, 0.65, 0.0, 3, 59.0, &free);
+        let dead = low_run_with(60.0, 3.0, 1.2, 0.0, 0.0, 3, 59.0, &free);
+        assert!(waits.lost.iter().all(|&l| !l), "a verdict in the marginal band did not wait: {:?}", waits.lost);
+        for (w, d) in waits.asahi.as_ref().unwrap().iter().zip(dead.asahi.as_ref().unwrap()) {
+            assert!((w.th.t_coil - d.th.t_coil).abs() < 1e-9, "a waiting line was not bounded: {} against {} C", w.th.t_coil, d.th.t_coil);
+        }
+        // and the wait is judged against the bound it began at: the
+        // bounded model heats (a J316 tweeter ran from 95 to 113 C in four
+        // periods), and its bound passing the line's R must not end the
+        // wait.  The same line, the model climbing from 59 to 125 C over
+        // the first six periods, reads low after its second
+        let climb = |n: usize| Some(59.0 + 11.0 * (n + 1).min(6) as f64);
+        let heats = low_run_with(60.0, 3.0, 1.2, 0.65, 0.0, 20, 59.0, &climb);
+        assert!(heats.lost.iter().all(|&l| l), "a wait ended by the bounded model's heat: {:?}", heats.lost);
+        // and once it reads low, the model's heat must not clear it: set
+        // after its second at 59 C, it stays low with the model at 165 C,
+        // where 0.9 of the bound now would be over its R
+        let hot = |n: usize| Some(if n < 14 { 59.0 } else { 165.0 });
+        let kept = low_run_with(60.0, 3.0, 1.2, 0.65, 0.0, 40, 59.0, &hot);
+        assert!(kept.lost.iter().all(|&l| l), "a verdict cleared by the bounded model's heat: {:?}", kept.lost);
         let c = cfg(J316);
         let (ch, p) = (c.globals.channels, c.globals.period);
+        let treble = |level: f64| -> Vec<i32> {
+            (0..p * ch).map(|q| {
+                let (f, k) = (q / ch, q % ch);
+                let x = (level * (2.0 * std::f64::consts::PI * 3000.0 * f as f64 / 48000.0).sin() / 14.0 * 32767.0) as i32;
+                if c.speakers.iter().any(|s| s.vs_chan == k) { x << 16 } else { (x / 3) << 16 }
+            }).collect()
+        };
+        // the models held where they were, so that only the low-band test
+        // decides
+        let pass = |e: &mut Engine, w: &[i32], n: usize, possible: &[Vec<(f64, f64)>], t: f64| {
+            for _ in 0..n {
+                e.check(w, 48000.0).unwrap();
+                e.measured(w, p, p, p, 0, 1.0 / 48000.0, 1.0, possible);
+                set_asahi(e, t, t);
+            }
+        };
+        let open = vec![vec![(0.0, 0.0)]; c.speakers.len()];
+        // a line reading 0.2 stays low through 80 s of treble (bass, treble,
+        // bass: review r4 addendum 6a), where nothing judges it
+        let mut e = low_run(60.0, 3.0, 1.2, 0.2, 0.0, 240, 50.0);
+        assert!(e.low.iter().all(|&l| l));
+        pass(&mut e, &treble(3.0), 950, &open, 50.0);
+        assert!(e.low.iter().all(|&l| l), "a line reading 0.2 was forgotten in treble: {:?}", e.low);
+        // a marginal verdict (just over the bound, the misfire's kind, but
+        // a line reading 0.65 is one too) is kept through any passage
+        // without bass, at the card's safe level or not (review r4
+        // addendum 6b); bass the line reads under 0.9 of its bound clears
+        // it, on program the card played
+        let mut m = low_run(60.0, 3.0, 1.6, 1.0, 0.0, 40, 59.0);
+        assert!(m.low.iter().all(|&l| l), "1.6 times z_min at 59 C for 3 s: {:?}", m.low);
+        let safe = vec![vec![(99.5, 99.5)]; c.speakers.len()];
+        pass(&mut m, &treble(3.0), 600, &safe, 59.0);
+        assert!(m.low.iter().all(|&l| l), "a marginal flag cleared at the card's safe level");
+        pass(&mut m, &treble(3.0), 1200, &open, 59.0);
+        assert!(m.low.iter().all(|&l| l) && m.bounded.iter().all(|&b| b), "a marginal flag forgotten in treble: {:?}", m.low);
+        let bass = |z: f64| -> Vec<i32> {
+            let w32 = |x: f64, fs: f64| ((x / fs * 32767.0).round().clamp(-32768.0, 32767.0) as i32) << 16;
+            let mut w = vec![0i32; p * ch];
+            for f in 0..p {
+                let x = 2.0 * std::f64::consts::PI * 60.0 * f as f64 / 48000.0;
+                for s in &c.speakers {
+                    w[f * ch + s.vs_chan] = w32(3.0 * x.sin(), s.vs_scale);
+                    w[f * ch + s.is_chan.unwrap()] = w32(3.0 / (z * s.z_min()) * x.sin(), s.is_scale);
+                }
+            }
+            w
+        };
+        pass(&mut m, &bass(1.2), 60, &safe, 59.0);
+        assert!(m.low.iter().all(|&l| l), "cleared by bass at the card's safe level");
+        pass(&mut m, &bass(1.2), 60, &open, 59.0);
+        assert!(m.low.iter().all(|&l| !l) && m.bounded.iter().all(|&b| !b), "a line reading again stayed bounded: {:?}", m.low);
+    }
+
+    /// Review r4 addendum 6b: wherever the deployed rule (2f7d16d) bounded
+    /// a line's power, the rework bounds it too, only its verdict waits.
+    /// From a warm state (the asahi models at 120 C): a line reading 0.61
+    /// of a 1.2 z_min load for one period, then 0.67, back inside the old
+    /// rule's band (under the bound, over 0.9 of it) - bounded throughout,
+    /// asking at least the old rule's 2.0 dB (rounded) at 0.34 s; and 0.4 V
+    /// rms at 1 kHz over a 30 mA offset (a power factor near 0, inside the
+    /// old rule's 0.3 V and 20 mA) - bounded from the first period, asking
+    /// at least its 0.5 dB.
+    #[test]
+    fn a_waiting_verdict_keeps_the_deployed_rules_bound() {
+        let mut c = cfg(J316);
+        c.globals.governor = Governor::Unified;
+        c.globals.guard = Some(Governor::Asahi);
+        let (ch, p) = (c.globals.channels, c.globals.period);
         let possible = vec![vec![(0.0, 0.0)]; c.speakers.len()];
-        let treble: Vec<i32> = (0..p * ch).map(|q| {
-            let (f, k) = (q / ch, q % ch);
-            let x = (3.0 * (2.0 * std::f64::consts::PI * 3000.0 * f as f64 / 48000.0).sin() / 14.0 * 32767.0) as i32;
-            if c.speakers.iter().any(|s| s.vs_chan == k) { x << 16 } else { (x / 3) << 16 }
-        }).collect();
-        for _ in 0..600 {
-            e.check(&treble, 48000.0).unwrap();
-            e.measured(&treble, p, p, p, 0, 1.0 / 48000.0, 1.0, &possible);
+        let w16 = |x: f64, fs: f64| ((x / fs * 32767.0).round().clamp(-32768.0, 32767.0) as i32) << 16;
+        let lw1 = c.speakers.iter().position(|s| s.name == "Left Woofer 1").unwrap();
+        let rounded = |db: f64| (db * 2.0 - 1e-9).ceil() / 2.0;
+        let mut e = Engine::new(&c, true).unwrap();
+        set_asahi(&mut e, 120.0, 120.0);
+        e.govern(0.0, false);
+        for n in 0..12 {
+            let k = if n == 0 { 0.61 } else { 0.67 };
+            let mut w = vec![0; p * ch];
+            for f in 0..p {
+                let v = 3.0 * (2.0 * std::f64::consts::PI * 60.0 * (n * p + f) as f64 / 48000.0).sin();
+                for s in &c.speakers {
+                    w[f * ch + s.vs_chan] = w16(v, s.vs_scale);
+                    w[f * ch + s.is_chan.unwrap()] = w16(k * v / (1.2 * s.z_min()), s.is_scale);
+                }
+            }
+            e.check(&w, 48000.0).unwrap();
+            e.measured(&w, p, p, p, 0, 1.0 / 48000.0, 1.0, &possible);
+            assert!(e.bounded[lw1], "period {n}: the 0.61/0.67 line was not bounded");
+            if n == 3 {
+                let (db, _) = e.governed(Governor::Unified);
+                assert!(rounded(db[lw1]) >= 2.0, "asked {} dB at 0.34 s", db[lw1]);
+            }
         }
-        assert!(e.low.iter().all(|&l| !l), "the low-band flag stuck: {:?}", e.low);
+        let mut e = Engine::new(&c, true).unwrap();
+        set_asahi(&mut e, 120.0, 120.0);
+        e.govern(0.0, false);
+        let mut w = vec![0; p * ch];
+        for f in 0..p {
+            let v = 0.4 * 2f64.sqrt() * (2.0 * std::f64::consts::PI * 1000.0 * f as f64 / 48000.0).sin();
+            for s in &c.speakers {
+                w[f * ch + s.vs_chan] = w16(v, s.vs_scale);
+                w[f * ch + s.is_chan.unwrap()] = w16(0.03, s.is_scale);
+            }
+        }
+        e.check(&w, 48000.0).unwrap();
+        e.measured(&w, p, p, p, 0, 1.0 / 48000.0, 1.0, &possible);
+        assert!(e.bounded[lw1] && !e.lost[lw1], "0.4 V over a 30 mA offset: bounded {}, lost {}", e.bounded[lw1], e.lost[lw1]);
+        let (db, _) = e.governed(Governor::Unified);
+        assert!(rounded(db[lw1]) >= 0.5, "asked {} dB", db[lw1]);
     }
 
     /// The power-factor test's voltage gate: the M2's right woofer read
@@ -2939,4 +3209,50 @@ mod tests {
         assert_eq!(r[idx(&c, "Left Woofer 1")], 6.0);
         assert_eq!(r[idx(&c, "Left Tweeter")], 4.0);
     }
+    /// The kernel lease counts playing time. A paused daemon can leave a
+    /// quiet card idle before an onset; the reserve must cover that later
+    /// onset too, including a coil initially below a warm magnet.
+    #[test]
+    fn the_onset_reserve_covers_idle_gaps_in_a_playing_time_lease() {
+        let c = cfg(include_str!("../conf/apple/j316.conf"));
+        for gov in [Governor::Asahi, Governor::Unified] {
+            let mut e = Engine::new(&c, true).unwrap();
+            for a in e.asahi.as_mut().unwrap() {
+                a.th.t_coil = 50.0;
+                a.th.t_magnet = 125.0;
+            }
+            for u in e.unified.as_mut().unwrap() {
+                u.ff.t_coil = 50.0;
+                u.ff.t_magnet = 125.0;
+            }
+            e.govern(0.0, false);
+            assert!(e.governed(gov).0.iter().all(|r| *r < c.globals.max_reduction));
+            let per = e.onset_reductions(gov, &vec![120.0; c.speakers.len()], 0.75, 0.435);
+            assert!(per.iter().all(|r| r.is_finite() && *r < 30.0));
+            for (k, s) in c.speakers.iter().enumerate() {
+                let a = &e.asahi.as_ref().unwrap()[k];
+                let mut models = vec![(a.th.clone(), v_worst(s, &c.globals).powi(2) / s.z_min() * ASAHI_MARGIN)];
+                if gov == Governor::Unified {
+                    models.push((e.unified.as_ref().unwrap()[k].ff.clone(), v_worst(s, &c.globals).powi(2) / s.r_ff));
+                }
+                for (th, full) in models {
+                    for delay in [0.0, 1.0, 10.0, 100.0] {
+                        for chunks in [1, 8] {
+                            let mut th = th.clone();
+                            let mut peak = th.hold(0.0, delay, c.globals.t_ambient).0;
+                            for _ in 0..chunks {
+                                let (coil, magnet) = th.hold(full * 10f64.powf(-per[k] / 10.0), 1.185 / chunks as f64, c.globals.t_ambient);
+                                peak = peak.max(coil).max(magnet);
+                                peak = peak.max(th.hold(0.0, 1.0, c.globals.t_ambient).0);
+                            }
+                            peak = peak.max(th.hold(full * 10f64.powf(-c.globals.safe_reduction / 10.0), 10000.0, c.globals.t_ambient).0);
+                            assert!(peak <= s.t_limit - s.t_headroom + 1e-6,
+                                "{gov:?} {} after {delay} s idle, {chunks} chunks: {peak} C", s.name);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
 }

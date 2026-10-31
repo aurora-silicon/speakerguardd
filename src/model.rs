@@ -593,6 +593,7 @@ mod tests {
             shadow: false,
             sense_format: crate::config::SenseFormat::S32,
             amp_gain_dbv: 0.0,
+            amp_gain_index: None,
             horizon_s: 4.6,
             release_s: 20.0,
             t_ctrl_headroom: 0.0,
