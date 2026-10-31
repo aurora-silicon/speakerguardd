@@ -312,3 +312,211 @@ fn print_idle_attenuation_by_temperature() {
         eprintln!("coil {c} magnet {m}: idle {idle:.1} dB, -14 dBFS square {:.1} dB, floor {:.2} dB", hw.reduction, g.floor_db(0.0));
     }
 }
+
+// ---- C1 of the 2026-10-31 safety review: a missing /run state does not
+// prove that no daemon unlocked the card this boot.
+
+/// A start of this boot with its /run state at `run` (and the marker next
+/// to it), the record at `keep`, `setup` applied to the card first.
+fn start_at(cfg: &Config, run: &std::path::Path, keep: &std::path::Path, now: Stamp, setup: impl FnOnce(&mut FakeHw)) -> (Guard, FakeHw) {
+    let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
+    hw.boot = UPTIME;
+    hw.stamp = now;
+    setup(&mut hw);
+    let g = Guard::start_persist(&mut hw, cfg, 20.0, Some(run.to_path_buf()), Some(keep.to_path_buf())).unwrap();
+    (g, hw)
+}
+
+fn marker_of(run: &std::path::Path) -> PathBuf {
+    run.with_file_name(boot::MARKER_NAME)
+}
+
+/// Truth from `crashed` (coil, magnet per speaker), 1 s at the safe level,
+/// then `g` driving full scale for 120 s with the gains it lets through;
+/// the hottest the true coil gets.
+fn truth_after_restart(cfg: &Config, g: &mut Guard, hw: &mut FakeHw, crashed: &[(f64, f64)]) -> f64 {
+    let ta = cfg.globals.t_ambient;
+    let mut truth: Vec<SpeakerState> = g.speakers.iter().zip(crashed).map(|(s, &(c, m))| {
+        let mut t = SpeakerState::new(s.spec.clone(), ta);
+        t.t_coil = c;
+        t.t_magnet = m;
+        let p = t.worst_case_power(cfg.globals.safe_reduction);
+        t.step(p, 1.0, ta);
+        t.hard = false;
+        t
+    }).collect();
+    hw.level = Box::new(|_| 1.0);
+    let mut last = hw.t;
+    let mut hottest: f64 = 0.0;
+    while hw.t < secs(120.0) {
+        let applied = if g.armed() { hw.reduction } else { cfg.globals.safe_reduction.max(hw.reduction) };
+        g.tick(hw).unwrap();
+        let dt = (hw.t - last).as_secs_f64();
+        last = hw.t;
+        for t in truth.iter_mut() {
+            let p = t.worst_case_power(applied);
+            t.step(p, dt, ta);
+            hottest = hottest.max(t.t_peak.max(t.t_coil));
+        }
+    }
+    hottest
+}
+
+/// SAFETY REVIEW counterexample (C1), kept as a regression test.  The
+/// reviewer's premise (both writes fail) can no longer unlock at all, see
+/// the next test; here the first run unlocks normally, plays full scale
+/// for a minute and dies without a clean stop, and its /run state is then
+/// lost and the record under /var/lib never written (its temporary name
+/// is a directory, standing in for ENOSPC).  The restart a second later in
+/// the same boot finds neither file, but finds the marker: latched, never
+/// cooler than the crashed model, and truth stays under the hard limit.
+#[test]
+fn review_crash_restart_without_run_state_is_not_a_first_start() {
+    let cfg = j700();
+    let (run, keep) = (missing_state().unwrap(), missing_state().unwrap());
+    std::fs::create_dir_all(keep.with_extension("tmp")).unwrap();
+    let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
+    hw.boot = UPTIME;
+    hw.stamp = stamp("first", RTC0, true);
+    hw.level = Box::new(|_| 1.0);
+    let mut g = Guard::start_persist(&mut hw, &cfg, 20.0, Some(run.clone()), Some(keep.clone())).unwrap();
+    run_until(&mut g, &mut hw, secs(60.0)).unwrap();
+    assert!(g.armed(), "the first run never unlocked");
+    let crashed: Vec<(f64, f64)> = g.speakers.iter().map(|s| (s.t_coil, s.t_magnet)).collect();
+    let boot_at_crash = hw.boot + hw.t;
+    // a crash: no stop, no final save; the checkpointer thread just ends
+    drop(g);
+    std::fs::remove_file(&run).unwrap();
+    assert!(!run.exists() && !keep.exists(), "the test premise: neither file is there");
+    assert!(marker_of(&run).exists(), "no marker after an unlock");
+    let mut hw2 = FakeHw::new(cfg.globals.channels, cfg.globals.period);
+    hw2.boot = boot_at_crash + secs(1.0);
+    hw2.stamp = stamp("first", RTC0 + 70, true);
+    let mut g2 = Guard::start_persist(&mut hw2, &cfg, 20.0, Some(run), Some(keep)).unwrap();
+    let start: Vec<(f64, f64)> = g2.speakers.iter().map(|s| (s.t_coil, s.t_magnet)).collect();
+    eprintln!("crashed model {crashed:?}; restart starts at {start:?}");
+    assert!(g2.speakers.iter().all(|s| s.hard), "the restart did not start latched");
+    assert!(start.iter().zip(&crashed).all(|(s, c)| s.0 >= c.0 - 1.0 && s.1 >= c.1 - 1.0), "the restart started cooler than the crashed model: {start:?} against {crashed:?}");
+    let hottest = truth_after_restart(&cfg, &mut g2, &mut hw2, &crashed);
+    let limit = cfg.speakers[0].t_limit;
+    eprintln!("truth hottest {hottest} C over 120 s of full scale from the restart");
+    assert!(hottest < limit, "truth reached {hottest} C against the {limit} C hard limit");
+}
+
+/// The reviewer's literal premise: the /run state and the record both fail
+/// to write.  Fail closed: the run never unlocks (no removal of the /run
+/// state counts as invalidating it), and its restart starts latched.
+#[test]
+fn a_run_state_that_cannot_be_written_keeps_the_card_locked() {
+    let cfg = j700();
+    let (run, keep) = (missing_state().unwrap(), missing_state().unwrap());
+    std::fs::create_dir_all(run.with_extension("tmp")).unwrap();
+    std::fs::create_dir_all(keep.with_extension("tmp")).unwrap();
+    let (mut g, mut hw) = start_at(&cfg, &run, &keep, stamp("first", RTC0, true), |hw| hw.level = Box::new(|_| 1.0));
+    run_until(&mut g, &mut hw, secs(60.0)).unwrap();
+    assert!(!g.armed(), "unlocked without a /run state");
+    assert!(hw.reduction >= cfg.globals.safe_reduction - 1e-9, "{} dB", hw.reduction);
+    drop(g);
+    assert!(!run.exists() && !keep.exists());
+    let (g2, _) = start_at(&cfg, &run, &keep, stamp("first", RTC0 + 70, true), |_| {});
+    assert!(g2.speakers.iter().all(|s| s.hard), "the restart did not start latched");
+}
+
+/// The marker is written (with the boot id) before the first unlock, and a
+/// clean stop leaves it in place.
+#[test]
+fn the_marker_is_written_before_the_unlock_and_kept() {
+    let cfg = j700();
+    let (run, keep) = (missing_state().unwrap(), missing_state().unwrap());
+    let (mut g, mut hw) = start_at(&cfg, &run, &keep, stamp("second", RTC0, false), |_| {});
+    assert!(!g.speakers.iter().any(|s| s.hard), "not an evidence start");
+    assert_eq!(std::fs::read_to_string(marker_of(&run)).unwrap().trim(), "second", "no marker before the unlock");
+    run_until(&mut g, &mut hw, secs(1.0)).unwrap();
+    assert!(g.armed());
+    g.stop(&mut hw).unwrap();
+    while !g.released(&hw) {
+        g.tick(&mut hw).unwrap();
+    }
+    g.final_save(&hw).unwrap();
+    assert!(marker_of(&run).exists(), "the marker was removed");
+}
+
+/// A marker that cannot be written: the lock is never taken.
+#[test]
+fn a_marker_that_cannot_be_written_keeps_the_card_locked() {
+    let cfg = j700();
+    let (run, keep) = (missing_state().unwrap(), missing_state().unwrap());
+    std::fs::create_dir_all(marker_of(&run).with_extension("tmp")).unwrap();
+    let (mut g, mut hw) = start_at(&cfg, &run, &keep, stamp("second", RTC0, false), |_| {});
+    run_until(&mut g, &mut hw, secs(5.0)).unwrap();
+    assert!(!g.armed(), "unlocked without the marker");
+}
+
+/// This boot's marker, or one that cannot be read, refuses the evidence
+/// start; another boot's (a /run that is not a tmpfs) does not.
+#[test]
+fn the_marker_refuses_the_evidence_start() {
+    let cfg = j700();
+    for (why, body, latched) in [("this boot's", Some("second\n"), true), ("this boot's, dashes and case", Some("SE-COND\n"), true), ("unknown boot", Some("unknown\n"), true), ("empty", Some(""), true), ("unreadable", None, true), ("another boot's", Some("first\n"), false)] {
+        let (run, keep) = (missing_state().unwrap(), missing_state().unwrap());
+        match body {
+            Some(b) => std::fs::write(marker_of(&run), b).unwrap(),
+            None => std::fs::create_dir_all(marker_of(&run)).unwrap(),
+        }
+        let (g, _) = start_at(&cfg, &run, &keep, stamp("second", RTC0, false), |_| {});
+        assert_eq!(g.speakers.iter().all(|s| s.hard), latched, "{why}");
+    }
+    // no boot id now: any marker counts
+    let (run, keep) = (missing_state().unwrap(), missing_state().unwrap());
+    std::fs::write(marker_of(&run), "first\n").unwrap();
+    let mut now = stamp("x", RTC0, false);
+    now.boot_id = None;
+    let (g, _) = start_at(&cfg, &run, &keep, now, |_| {});
+    assert!(g.speakers.iter().all(|s| s.hard), "a marker was set aside without a boot id");
+}
+
+/// speakersafetyd's flag or a kernel override of the safe level refuses
+/// the evidence start.
+#[test]
+fn a_protection_override_refuses_the_evidence_start() {
+    let cfg = j700();
+    let (run, keep) = (missing_state().unwrap(), missing_state().unwrap());
+    let (g, _) = start_at(&cfg, &run, &keep, stamp("second", RTC0, false), |hw| hw.overridden = Some("please_blow_up_my_speakers is 1".into()));
+    assert!(g.speakers.iter().all(|s| s.hard), "an override did not latch the start");
+}
+
+/// The override check itself, on files: a missing parameter or flag is no
+/// override; 0/N is none; anything else, or an unreadable one, is one.
+#[test]
+fn protection_override_reads_flags_and_parameters() {
+    let dir = missing_state().unwrap().parent().unwrap().to_path_buf();
+    let p = dir.join("param");
+    let flag = dir.join("flag");
+    let (ps, fs) = (p.to_str().unwrap(), flag.to_str().unwrap());
+    assert_eq!(boot::protection_override(&[fs], &[ps]), None);
+    for (v, set) in [("0\n", false), ("N\n", false), ("1\n", true), ("Y\n", true), ("-1\n", true)] {
+        std::fs::write(&p, v).unwrap();
+        assert_eq!(boot::protection_override(&[fs], &[ps]).is_some(), set, "{v:?}");
+    }
+    std::fs::remove_file(&p).unwrap();
+    std::fs::create_dir_all(&p).unwrap();
+    assert!(boot::protection_override(&[fs], &[ps]).is_some(), "an unreadable parameter");
+    std::fs::remove_dir(&p).unwrap();
+    std::fs::write(&flag, "").unwrap();
+    assert!(boot::protection_override(&[fs], &[ps]).is_some(), "speakersafetyd's flag");
+}
+
+/// A chassis sensor over the model's ambient is the bound's ambient, not
+/// only a floor: the magnet starts at least at M* for that ambient
+/// (cooled for the uptime), above the floor alone.
+#[test]
+fn a_hot_chassis_raises_the_ambient_of_the_bound() {
+    let cfg = j700();
+    let (base, _) = boot_with(&cfg, None, stamp("second", RTC0, false), None);
+    let (warm, _) = boot_with(&cfg, None, stamp("second", RTC0, false), Some(65.0));
+    let r = 26.0 / 38.0;
+    let m_star = |ta: f64| (ta + r * 135.0) / (1.0 + r);
+    // the floor alone (67 C) is under the 50 C ambient's bound
+    assert!(magnet(&base) > 67.0 + 10.0);
+    assert!(magnet(&warm) >= magnet(&base) + (m_star(65.0) - m_star(50.0)) - 0.5, "{} against {}", magnet(&warm), magnet(&base));
+}

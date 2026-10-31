@@ -257,6 +257,9 @@ impl Hw for RealHw {
     fn chassis(&self) -> Option<f64> {
         boot::chassis_temperature(std::path::Path::new("/sys/class/hwmon"))
     }
+    fn protection_override(&self) -> Option<String> {
+        boot::protection_override(boot::FOREIGN_FLAGS, boot::OVERRIDE_PARAMS)
+    }
     fn now(&self) -> Instant {
         Instant::now()
     }

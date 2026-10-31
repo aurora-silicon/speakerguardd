@@ -137,6 +137,11 @@ pub trait Hw {
     fn chassis(&self) -> Option<f64> {
         None
     }
+    /// Why the card's safe level since boot cannot be vouched for
+    /// (speakersafetyd ran, or a kernel override is set), if it cannot.
+    fn protection_override(&self) -> Option<String> {
+        None
+    }
     /// Lock every volume control and the unlock control.  No ping: the
     /// card's volume stays limited until the daemon decides to lift it.
     fn take_lock(&mut self) -> io::Result<()>;
@@ -484,6 +489,9 @@ pub struct Guard {
     checkpoint: Option<crate::boot::Checkpointer>,
     last_checkpoint: Option<Instant>,
     persist_path: Option<PathBuf>,
+    /// This run has written the /run marker that no later start of this
+    /// boot may start from evidence (boot.rs).
+    marked: bool,
     config_fp: u64,
     last_save_try: Option<Instant>,
     save_failed: bool,
@@ -567,13 +575,25 @@ impl Guard {
                     }
                 },
                 Err(e) if e.kind() == io::ErrorKind::NotFound && persist_path.is_some() => {
-                    match evidence_start(hw, cfg, persist_path.as_deref()) {
-                        Some((sp, why)) => {
+                    // no /run state is not proof that no daemon unlocked the
+                    // card this boot: the marker is (boot.rs), and nothing
+                    // may have overridden the card's safe level
+                    let refused = crate::boot::marker_says_unlocked(&path.with_file_name(crate::boot::MARKER_NAME), &hw.stamp()).or_else(|| hw.protection_override());
+                    let start = match refused {
+                        Some(why) => Err(Some(why)),
+                        None => evidence_start(hw, cfg, persist_path.as_deref()).ok_or(None),
+                    };
+                    match start {
+                        Err(Some(why)) => {
+                            info!("{}: no model state, but {why}; assuming hot speakers (latched)", path.display());
+                            latched(&mut speakers);
+                        }
+                        Ok((sp, why)) => {
                             speakers = sp;
                             evidence = true;
                             info!("{why}");
                         }
-                        None => {
+                        Err(None) => {
                             info!("{}: no model state, but a record from this boot; assuming hot speakers (latched)", path.display());
                             latched(&mut speakers);
                         }
@@ -656,6 +676,7 @@ impl Guard {
             checkpoint: persist_path.as_ref().map(|pp| crate::boot::Checkpointer::spawn(pp.clone(), fp, |p, t| state_write_durable(p, t))),
             last_checkpoint: None,
             persist_path,
+            marked: false,
             config_fp: fp,
             last_save_try: None,
             save_failed: false,
@@ -671,6 +692,22 @@ impl Guard {
     /// Replace the state file with this run's status (released 0), or
     /// remove it.  True once no clean stop is left for a later start.
     fn invalidate<H: Hw>(&mut self, hw: &H) -> bool {
+        // with a record for the next boot, a later start of this boot that
+        // finds no /run state may start from evidence: the marker that it
+        // must not goes down first, durably, and stays (boot.rs)
+        if let (Some(_), Some(path), false) = (&self.persist_path, &self.state_path, self.marked) {
+            let marker = path.with_file_name(crate::boot::MARKER_NAME);
+            match state_write_durable(&marker, &crate::boot::marker_text(&hw.stamp())) {
+                Ok(()) => self.marked = true,
+                Err(e) => {
+                    if !self.invalidate_failed {
+                        warn!("{}: {e}; the marker for this boot could not be written, so the lock is not taken", marker.display());
+                        self.invalidate_failed = true;
+                    }
+                    return false;
+                }
+            }
+        }
         // the record a start from evidence read: gone, durably, before
         // this run can drive the speakers (a later boot must not start
         // from a record older than what this run did)
@@ -690,6 +727,15 @@ impl Guard {
         let Some(path) = self.state_path.clone() else { return true };
         if self.save_now(hw) {
             return true;
+        }
+        if self.persist_path.is_some() {
+            // fail closed: a restart must find this run's state, never
+            // none (removing it would make it look like a first start)
+            if !self.invalidate_failed {
+                warn!("{}: the model state could not be written, so the lock is not taken", path.display());
+                self.invalidate_failed = true;
+            }
+            return false;
         }
         match state_remove(&path) {
             Ok(()) => true,
@@ -1755,6 +1801,8 @@ pub mod fake {
         pub stamp: crate::boot::Stamp,
         /// The hottest chassis sensor.
         pub chassis: Option<f64>,
+        /// speakersafetyd ran, or a kernel override is set (boot.rs).
+        pub overridden: Option<String>,
         /// Extra time a sample-rate read takes at time t (a descheduled
         /// daemon, a slow ioctl).
         pub control_delay: Box<dyn Fn(Duration) -> Duration>,
@@ -1815,6 +1863,7 @@ pub mod fake {
                 boot: Duration::from_secs(1000),
                 stamp: crate::boot::Stamp::default(),
                 chassis: None,
+                overridden: None,
                 control_delay: Box::new(|_| Duration::ZERO),
                 dma: None,
                 granule: 32,
@@ -1905,6 +1954,9 @@ pub mod fake {
         }
         fn chassis(&self) -> Option<f64> {
             self.chassis
+        }
+        fn protection_override(&self) -> Option<String> {
+            self.overridden.clone()
         }
         fn now(&self) -> Instant {
             self.t0 + self.t
