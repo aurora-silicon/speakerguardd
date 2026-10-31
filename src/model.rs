@@ -49,6 +49,8 @@ pub struct SpeakerState {
     /// gain) per step, newest last.
     history: std::collections::VecDeque<(f64, f64)>,
     history_s: f64,
+    /// Authenticated playback history plus unresolved source-queue energy.
+    playback_means: Option<(f64, f64)>,
 }
 
 /// How long samples converted at an earlier gain can keep playing (s): the
@@ -76,6 +78,7 @@ impl SpeakerState {
             reducing: false,
             history: std::collections::VecDeque::new(),
             history_s: 0.0,
+            playback_means: None,
         }
     }
 
@@ -91,7 +94,6 @@ impl SpeakerState {
     }
 
     /// The RMS voltage a period of sense words puts across the coil.
-    #[cfg(test)]
     pub fn v_rms_of(&self, words: &[i32], channels: usize) -> f64 {
         let ch = self.spec.vs_chan;
         let frames = words.len() / channels;
@@ -381,6 +383,10 @@ impl SpeakerState {
     /// it as full scale fits there): the mean is an upper bound, whatever
     /// the energy's place inside each step.
     pub fn mean_power(&self, seconds: f64) -> f64 {
+        if let Some((short,long))=self.playback_means {
+            if seconds==1.0 {return short;}
+            if seconds==60.0 {return long;}
+        }
         let full = self.worst_case_power(0.0);
         let mut t = 0.0;
         let mut e = 0.0;
@@ -393,6 +399,10 @@ impl SpeakerState {
             t += take;
         }
         e / seconds
+    }
+
+    pub fn set_playback_means(&mut self, short: f64, long: f64) {
+        self.playback_means=Some((short,long));
     }
 
     /// The reduction (dB) the power budgets ask for: what brings the mean

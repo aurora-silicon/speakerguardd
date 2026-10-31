@@ -979,7 +979,7 @@ pub fn run(sc: &Scenario, seed: u64) -> Result<(), Violation> {
     })();
     if let Some(a)=&w.oracle.audit {
         let rows=cfg.speakers.iter().zip(a).map(|(s,t)|{let(c,m)=t.peaks();continuous::Row{speaker:s.name.clone(),model:"ff",active:true,limit:s.t_limit,coil:c,magnet:m}}).collect();
-        continuous::record(seed,sc.to_rust(),"j700",rows,result.as_ref().err().map(|e|e.0.clone()),0);
+        continuous::record(seed,sc.to_rust(),"j700",rows,result.as_ref().err().map(|e|e.0.clone()),0,false);
     }
     let _ = std::fs::remove_dir_all(path.parent().unwrap());
     result

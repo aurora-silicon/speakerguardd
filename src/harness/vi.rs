@@ -583,10 +583,12 @@ pub struct ViWorld<'a> {
     /// (its detection takes seconds of program); the long class checks the
     /// outcome.
     i_low_seen: Cell<bool>,
+    gate: Option<crate::gate_sim::DescriptorQueue>,
+    energy_deadline: f64,
 }
 
 impl<'a> ViWorld<'a> {
-    pub fn new(sc: &'a ViScenario, cfg: &'a Config) -> ViWorld<'a> {
+    pub fn new(sc: &'a ViScenario, cfg: &'a Config, use_gate:bool) -> ViWorld<'a> {
         let safe = cfg.globals.safe_reduction;
         let n = cfg.speakers.len();
         let vpk = 2f64.sqrt() * 10f64.powf(cfg.globals.amp_gain_dbv / 20.0);
@@ -641,6 +643,10 @@ impl<'a> ViWorld<'a> {
             unverified: vec![[false; 4]; n],
             i_dead_seen: Cell::new(false),
             i_low_seen: Cell::new(false),
+            gate: (use_gate && sc.amp_gain && !cfg.playback_cards.is_empty()).then(||
+                {let mut q=crate::gate_sim::DescriptorQueue::new(cfg,sc.rate,cfg.globals.period,1_000_000_000_000);
+                 q.set_playing(sc.open_at(0.0).is_some(),0.0);q}),
+            energy_deadline: 0.0,
         }
     }
 
@@ -705,14 +711,19 @@ impl<'a> ViWorld<'a> {
             self.gain_at(k, kappa)
         };
         let level = recurrent::level(self.cfg.speakers[k].name.contains("Tweeter"), tau, level);
-        let a = level * 10f64.powf(-gain / 20.0) * self.vpk;
+        let digital = self.gate.as_ref().map_or(1.0,|g|g.ratio(n,k));
+        let a = level * digital * 10f64.powf(-gain / 20.0) * self.vpk;
         let freq = recurrent::frequency(tau, s.freq);
+        let analogue=10f64.powf(-gain/20.0);
         if freq == 0.0 {
-            let v = if n % 2 == 0 { a } else { -a };
+            let v = self.gate.as_ref().map_or_else(||if n%2==0 {a} else {-a},
+                |q|f64::from(q.sample(n,k))/2147483648.0*self.vpk*analogue);
             (v, v / self.z[k])
         } else {
             let x = 2.0 * PI * freq * tau;
-            (a * x.sin(), a / self.z[k] * (x - self.phi[k]).sin())
+            let v=self.gate.as_ref().map_or(a*x.sin(),|q|
+                f64::from(q.sample(n,k))/2147483648.0*self.vpk*analogue);
+            (v, a / self.z[k] * (x - self.phi[k]).sin())
         }
     }
 
@@ -754,11 +765,41 @@ impl<'a> ViWorld<'a> {
     /// Bring the world to `to`: the lease in playing time, the oracle.
     fn advance(&mut self, to: f64) {
         let to = to.max(self.now_s());
+        let gate_deadline=self.gate.as_ref().map(|_|self.energy_deadline);
+        let mut gate_epoch=None;
+        if let Some(gate)=&mut self.gate {
+            let sc=self.sc;let cfg=self.cfg;let rate=self.rate;
+            let source_at=Cell::new(sc.open_at(self.lease_t));
+            let mut programme=|n:u64,k:usize| {
+                let tau=n as f64/rate;
+                let Some(s)=source_at.get() else {return 0.0;};
+                if tau<s.open || tau>=s.close {return 0.0;}
+                let i=s.levels.partition_point(|l|l.0<=tau);
+                let level=if i==0 {s.levels[0].1} else {s.levels[i-1].1} * s.share[k];
+                let level=recurrent::level(cfg.speakers[k].name.contains("Tweeter"),tau,level);
+                let freq=recurrent::frequency(tau,s.freq);
+                if freq==0.0 {if n%2==0 {level} else {-level}} else {level*(2.0*PI*freq*tau).sin()}
+            };
+            for edge in self.edges.iter().copied().filter(|e|*e>self.lease_t && *e<=to) {
+                gate.advance(edge,&mut programme);
+                let next=sc.open_at(edge);
+                if let (Some(a),Some(b))=(source_at.get(),next) {
+                    if !std::ptr::eq(a,b) && gate.set_playing(false,edge) {gate_epoch.get_or_insert(edge);}
+                }
+                if gate.set_playing(next.is_some(),edge) {gate_epoch.get_or_insert(edge);}
+                source_at.set(next);
+            }
+            gate.advance(to,&mut programme);
+        }
         let mut t = self.lease_t;
         let step = 0.0005;
+        if let Some(deadline)=gate_deadline {
+            let end=gate_epoch.map_or(deadline,|e|e.min(deadline));
+            if self.unlocked && end<=to {self.notice=true;self.relock(end.max(self.lease_t),0.0);}
+        }
         while t < to {
             let b = (t + step).min(to);
-            if self.unlocked && self.sc.open_at(t).is_some() {
+            if self.gate.is_none() && self.unlocked && self.sc.open_at(t).is_some() {
                 self.lease_left -= b - t;
                 if self.lease_left <= 0.0 {
                     self.notice = true;
@@ -781,6 +822,7 @@ impl<'a> ViWorld<'a> {
             self.oracle.step(h, &p);
             recurrent::observe(self);
         }
+        if let Some(g)=&mut self.gate {g.prune_before(self.oracle.n.saturating_sub((self.rate*5.0) as u64));}
     }
 
     fn fault_on(&self, f: impl Fn(&Fault) -> Option<(f64, f64)>) -> bool {
@@ -825,6 +867,7 @@ impl<'a> ViWorld<'a> {
     }
 
     pub fn owner_gone(&mut self) {
+        if let Some(g)=&mut self.gate {g.gate.owner(false,g.ns(self.t.get())).unwrap();}
         self.owner = false;
         self.notice = false;
         let t = self.now_s();
@@ -891,18 +934,40 @@ impl Hw for ViWorld<'_> {
     fn take_lock(&mut self) -> io::Result<()> {
         self.maybe_pause();
         self.owner = true;
+        if let Some(g)=&mut self.gate {
+            g.gate.owner(true,g.ns(self.t.get()))?;
+            self.relock(self.t.get(),0.0);
+        }
         Ok(())
+    }
+    fn playback_status(&mut self)->io::Result<Option<crate::playback::Snapshot>> {
+        let t=self.now_s();self.advance(t);
+        self.gate.as_mut().map(|g|g.gate.status(g.ns(t))).transpose()
+    }
+    fn playback_write(&mut self,wire:&[u8;crate::playback::BYTES])->io::Result<()> {
+        self.maybe_pause();let t=self.now_s();self.advance(t);
+        let Some(g)=&mut self.gate else {return Err(io::Error::from_raw_os_error(libc::ENOTTY));};
+        let result=g.gate.write(wire,g.ns(t));
+        self.unlocked=g.gate.unlocked(g.ns(t));
+        if result.is_ok() {
+            self.energy_deadline=u64::from_le_bytes(wire[32..40].try_into().unwrap()).saturating_sub(1_000_000_000_000) as f64*1e-9;
+        }
+        if !self.unlocked {self.lease_left=0.0;}
+        self.note_gain(t);result
     }
     fn ping(&mut self) -> io::Result<()> {
         self.maybe_pause();
         let t = self.now_s();
         self.advance(t);
-        if self.notice {
+        if self.notice && self.gate.is_none() {
             self.notice = false;
             return Err(io::Error::from_raw_os_error(libc::ETIMEDOUT));
         }
         if !self.owner {
             return Err(io::Error::from_raw_os_error(libc::EPERM));
+        }
+        if let Some(g)=&mut self.gate {
+            let result=g.gate.ping(g.ns(t));self.notice=false;result?;
         }
         self.unlocked = true;
         self.lease_left = 0.25;
@@ -966,6 +1031,9 @@ impl Hw for ViWorld<'_> {
         let t = self.now_s();
         self.advance(t);
         self.notice = false;
+        if let Some(g)=&mut self.gate {
+            let now=g.ns(t);g.gate.owner(true,now)?;
+        }
         let t = self.now_s();
         self.relock(t, DRAIN.as_secs_f64() * 0.9);
         Ok(())
@@ -1351,6 +1419,10 @@ fn cooling_bound(cfg: &Config, g: &Guard, max_reduction: f64) -> Option<f64> {
 
 /// Run one scenario; the first violation, if any.
 pub fn run(sc: &ViScenario, seed: u64) -> Result<Outcome, Violation> {
+    run_internal(sc,seed,std::env::var_os("SPEAKERGUARDD_GATE_MODEL").is_some())
+}
+
+fn run_internal(sc:&ViScenario,seed:u64,use_gate:bool)->Result<Outcome,Violation> {
     let cfg = vi_cfg(sc);
     let path = state_dir(seed ^ 0x76);
     if sc.clean_start {
@@ -1361,7 +1433,8 @@ pub fn run(sc: &ViScenario, seed: u64) -> Result<Outcome, Violation> {
         std::fs::write(&path, state::encode_with(boot, boot, &cold, engine.as_ref(), false, true)).unwrap();
     }
     let mut rng = Rng::new(seed ^ 0x5eed);
-    let mut w = ViWorld::new(sc, &cfg);
+    let mut w = ViWorld::new(sc, &cfg,use_gate);
+    if let Some(q)=&mut w.gate {q.debug_case=seed;}
     let mut restarts = sc.restarts.clone();
     restarts.sort_by(|a, b| a.at.total_cmp(&b.at));
     let mut next_restart = 0;
@@ -1434,7 +1507,7 @@ pub fn run(sc: &ViScenario, seed: u64) -> Result<Outcome, Violation> {
         for (k,s) in cfg.speakers.iter().enumerate(){for(j,model)in[(VI,"vi"),(FFR,"ff")] {
             let(c,m)=a[k][j].peaks();rows.push(super::continuous::Row{speaker:s.name.clone(),model,active:j==VI||cfg.globals.governor==Governor::Unified,limit:s.t_limit,coil:c,magnet:m});
         }}
-        super::continuous::record(seed,sc.to_rust(),if sc.j413{"j413"}else{"j316"},rows,result.as_ref().err().map(|e|e.0.clone()),out.handoffs as u64);
+        super::continuous::record(seed,sc.to_rust(),if sc.j413{"j413"}else{"j316"},rows,result.as_ref().err().map(|e|e.0.clone()),out.handoffs as u64,w.gate.is_some());
     }
     let _ = std::fs::remove_dir_all(path.parent().unwrap());
     out.true_vi_peaks = w.oracle.vi_peaks;
@@ -1892,5 +1965,16 @@ mod tests {
             let after = run(&small, seed).err().map(|v| v.0).unwrap_or_default();
             panic!("seed {seed}: {why}\nshrunk: {after}\nWITNESS {}", small.to_rust());
         }
+    }
+}
+
+#[test]
+fn kernel_gate_reference_plants_survive_retained_fault_schedules() {
+    for seed in [7312918695,7312919903,7312900005,7312914617] {
+        let mut sc=ViScenario::random(seed);
+        // Explicit scalar reference path, with the original fault schedule.
+        // The unchanged continuous campaign separately retains both gain types.
+        sc.amp_gain=true;
+        run_internal(&sc,seed,true).unwrap();
     }
 }
