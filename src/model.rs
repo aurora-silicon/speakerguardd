@@ -336,8 +336,8 @@ impl SpeakerState {
         if self.t_coil.is_finite() && self.t_magnet.is_finite() && self.t_peak.is_finite() {
             self.t_magnet = self.t_magnet.max(limit).max(globals.t_ambient + safe * tr_magnet);
             self.t_coil = self.t_peak.max(self.t_magnet + safe * tr_coil);
+            self.t_peak = self.t_coil;
         }
-        self.t_peak = self.t_coil;
         self.hard = true;
         // nor is the power before the gain: a minute of full scale for the
         // budgets (they ask for their most until the minute has passed)
@@ -907,6 +907,21 @@ mod independent_start_tests {
             bound.assume_latched(&cfg.globals);
             assert!(bound.hard);
             assert!(!bound.finite(), "safe-level floors must not hide a nonfinite full-scale drain");
+        }
+    }
+
+    #[test]
+    fn a_latched_peak_overflow_stays_nonfinite() {
+        let text = include_str!("../conf/apple/j700.conf")
+            .replace("tau_coil = 3.3", "tau_coil = 0.000001");
+        let cfg = crate::config::Config::parse(&text).unwrap();
+        for spec in cfg.speakers {
+            let mut bound = SpeakerState::with_globals(spec, &cfg.globals);
+            bound.assume_latched(&cfg.globals);
+            assert!(bound.t_coil.is_finite() && bound.t_magnet.is_finite(), "this witness overflows only the interval peak");
+            assert!(!bound.t_peak.is_finite(), "the endpoint must not overwrite a nonfinite peak");
+            assert!(!bound.finite());
+            assert!(bound.hard);
         }
     }
     #[test]
