@@ -310,10 +310,14 @@ review of the constants, and an explicit change to `qualified`; parsing,
 read-only checks and a sibling match alone are insufficient. No loud
 playback is part of this contribution procedure.
 
-**Across a reboot (`boot_resume`, off by default).**  `/run` dies with the
-boot, so by default every boot starts latched at the coils' limit (on the
-Neo, an 11.9 dB first lock released over 7.6 min).  With `boot_resume =
-idle` in `[Globals]`, a clean stop made while systemd shuts the system down
+**Across a reboot.** The default `boot_resume = evidence` uses the
+protected-past start only on a single-model profile (currently J700 with
+the legacy governor and no guard). V/I or multiple-model configurations
+start latched; a different past owner need not have bounded all their
+models. See `src/boot.rs` for the evidence bound and refusal rules.
+
+The separate, opt-in `boot_resume = idle` mode has a stricter ownership
+contract. With `idle` in `[Globals]`, a clean stop made while systemd shuts the system down
 also writes its state to `/var/lib/speakerguardd/state` (`--persist`).  The
 daemon makes the directory itself, after the card is locked; the unit adds
 nothing that could fail before the daemon runs.  The record is checksummed
@@ -386,7 +390,8 @@ by the record or by `journalctl --list-boots`.
 
 If any condition cannot be guaranteed, keep `boot_resume = latched`.
 After a known break, durably remove the old record before enabling idle
-restore again. The default remains latched. The regression suite retains
+restore again. The independent `evidence` mode does not use this idle-restore
+contract. The regression suite retains
 synthetic missing-boot, later-owner and synchronized-but-wrong-clock cases
 as examples outside this contract. They deliberately show that the parser
 can accept such histories; no journal predicate proves their absence.
@@ -816,10 +821,12 @@ rule that starts it when a supported card's sense PCM appears.
 Keep the unit's `RuntimeDirectory=speakerguardd` and
 `RuntimeDirectoryPreserve=yes` when packaging: they give the daemon
 `/run/speakerguardd` for its model state and keep it across restarts.  A unit
-without them leaves the state unwritten, and every restart starts cold.
+without them may leave the state unwritten; an unproven restart starts
+latched, never cold.
 
-The first start of a boot starts from evidence (`src/boot.rs`) rather than
-latched at the coils' limit.  Before its first unlock of a boot the daemon
+The first start of a boot on J700 can start from evidence (`src/boot.rs`).
+V/I or multiple-model configurations retain the latched start. Before its
+first unlock of a boot the daemon
 writes `/run/speakerguardd.unlocked` (the boot id), beside the
 RuntimeDirectory rather than in it, so cleaning or removing
 `/run/speakerguardd` cannot make a later start of the boot look like the
@@ -835,8 +842,8 @@ keeps the speakers at its safe level throughout the wait. Other discovery
 errors (including permission and ioctl failures) still fail immediately.
 `Restart=on-failure` and the saved thermal state remain in effect.
 
-The unit explicitly passes `--wait-for-card 30`; 30 seconds is also the
-binary's default for existing packaged units and manual starts. Override
+The packaged unit uses the binary's default 30-second discovery wait.
+Existing units may also explicitly pass `--wait-for-card 30`. Override
 `--wait-for-card <SECONDS>` to change the bound, or use `0` for a single
 discovery attempt. A card that never appears still causes a failed start;
 this does not bypass any protection check.

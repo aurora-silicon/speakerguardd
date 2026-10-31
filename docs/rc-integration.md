@@ -1,6 +1,16 @@
 # Release candidate integration map
 
-Snapshot: 2026-10-31. Main baseline: `34aeed9085ad0f66cb8f266f997e11dd781470a6`. All 19 open PRs are accounted for: 17 RyanTheTide and two report-only erikwb PRs. Original branches are preserved.
+Reconciliation update: main `028702964884` is merged by ancestry into the
+candidate after RC `5d8076e23479`. The seven conflicts in README, boot,
+guard, evidence tests, main, model and state use the RC implementation:
+it includes #28's C1/C2 fixes, the external marker, independently hot nodes,
+no-events minimum write and #20 generation-3 compatibility. Main's exported
+no-events evidence checker is retained. #30 remains a separate stacked PR;
+its native-float transfer work is not folded into this reconciliation.
+Version `0.1.13-rc.2` distinguishes this source from the earlier RC pins.
+The two listening budgets remain unmet, so this is a draft candidate.
+
+Original integration snapshot: 2026-10-31. Main baseline: `34aeed9085ad0f66cb8f266f997e11dd781470a6`. All 19 open PRs are accounted for: 17 RyanTheTide and two report-only erikwb PRs. Original branches are preserved.
 
 ## Merge-order graph
 
