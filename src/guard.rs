@@ -129,6 +129,14 @@ pub trait Hw {
     /// Time since boot, suspend included (CLOCK_BOOTTIME).
     fn boottime(&self) -> Duration;
     fn sleep(&mut self, d: Duration);
+    /// The clocks and ids for an evidence record (boot.rs); none by default.
+    fn stamp(&self) -> crate::boot::Stamp {
+        crate::boot::Stamp::default()
+    }
+    /// The hottest chassis sensor (°C), if the machine reports one.
+    fn chassis(&self) -> Option<f64> {
+        None
+    }
     /// Lock every volume control and the unlock control.  No ping: the
     /// card's volume stays limited until the daemon decides to lift it.
     fn take_lock(&mut self) -> io::Result<()>;
@@ -210,6 +218,94 @@ fn state_write(path: &std::path::Path, text: &str) -> io::Result<()> {
     state_io_fails()?;
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, text).and_then(|()| std::fs::rename(&tmp, path))
+}
+
+/// Write the record for the next boot durably: the data, then the rename,
+/// then the directory, each on disk before the next.
+fn state_write_durable(path: &std::path::Path, text: &str) -> io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::DirBuilderExt as _;
+    state_io_fails()?;
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    }
+    let tmp = path.with_extension("tmp");
+    let mut f = std::fs::File::create(&tmp)?;
+    f.write_all(text.as_bytes())?;
+    f.sync_all()?;
+    drop(f);
+    std::fs::rename(&tmp, path)?;
+    sync_dir(path)
+}
+
+fn sync_dir(path: &std::path::Path) -> io::Result<()> {
+    match path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        Some(dir) => std::fs::File::open(dir)?.sync_all(),
+        None => Ok(()),
+    }
+}
+
+/// Remove the record durably (the directory synced after).
+fn state_remove_durable(path: &std::path::Path) -> io::Result<()> {
+    state_io_fails()?;
+    std::fs::remove_file(path)?;
+    sync_dir(path)
+}
+
+/// A short fingerprint of the parsed configuration: a record written under
+/// another one is not used.
+pub fn fingerprint(cfg: &Config) -> u64 {
+    let text = format!("{:?}{:?}{:?}", cfg.globals, cfg.controls, cfg.speakers);
+    text.bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3))
+}
+
+/// The first start of a boot from evidence (boot.rs): the models from the
+/// hottest a protected past can have left them, the last run's record
+/// under /var/lib narrowing it where it can, and a line for the journal
+/// saying which.  None when the record is this very boot's: a daemon ran
+/// this boot (its /run state is gone), so the card has not held its safe
+/// level since the kernel started.
+fn evidence_start<H: Hw>(hw: &H, cfg: &Config, persist: Option<&std::path::Path>) -> Option<(Vec<SpeakerState>, String)> {
+    let g = &cfg.globals;
+    let uptime = hw.boottime().as_secs_f64();
+    let now = hw.stamp();
+    let fp = fingerprint(cfg);
+    let mut why = String::from("no record of the last run");
+    let mut saved: Option<state::Saved> = None;
+    let mut d: Option<f64> = None;
+    if let Some(pp) = persist {
+        match std::fs::read_to_string(pp) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => why = format!("{}: {e}", pp.display()),
+            Ok(text) => match crate::boot::decode(&text) {
+                None => why = format!("{}: unreadable or damaged record", pp.display()),
+                Some(r) if r.stamp.boot_id.is_some() && r.stamp.boot_id == now.boot_id => return None,
+                Some(r) => match crate::boot::usable(&r, &now, fp) {
+                    Err(e) => why = format!("{}: {e}", pp.display()),
+                    Ok(hi) => match state::decode(&r.state) {
+                        Some(st) if st.speakers.iter().all(|x| x.t_coil.is_finite() && x.t_magnet.is_finite() && x.t_coil >= g.t_ambient - 1e-6 && x.t_magnet >= g.t_ambient - 1e-6) => {
+                            d = hi.map(|h| (h - uptime).max(0.0));
+                            let kind = if r.clean { "a clean stop" } else { "a running checkpoint" };
+                            why = match hi {
+                                Some(h) => format!("{kind} from {h:.0} s ago at most"),
+                                None => format!("{kind}, no trustworthy clock interval"),
+                            };
+                            saved = Some(st);
+                        }
+                        _ => why = format!("{}: implausible model state", pp.display()),
+                    },
+                },
+            },
+        }
+    }
+    let floor = hw.chassis().map_or(f64::NEG_INFINITY, |t| t + crate::boot::SENSOR_MARGIN_K);
+    let mut speakers: Vec<SpeakerState> = cfg.speakers.iter().map(|s| SpeakerState::new(s.clone(), g.t_ambient)).collect();
+    for s in speakers.iter_mut() {
+        let rec = saved.as_ref().and_then(|x| x.speakers.iter().find(|y| y.name == s.spec.name.replace(' ', "_") || y.name == s.spec.name)).map(|y| (y.t_coil, y.t_magnet, y.mean_60s));
+        s.assume_evidence(g, rec, d, uptime, floor);
+    }
+    let temps: Vec<String> = speakers.iter().map(|s| format!("{} coil {:.1} C magnet {:.1} C", s.spec.name, s.t_coil, s.t_magnet)).collect();
+    Some((speakers, format!("starting from evidence ({why}; {uptime:.1} s at the safe level since boot): {}", temps.join(", "))))
 }
 
 fn state_remove(path: &std::path::Path) -> io::Result<()> {
@@ -384,6 +480,11 @@ pub struct Guard {
     min_failures: u32,
     target_failures: u32,
     state_path: Option<PathBuf>,
+    /// The record for the next boot (boot.rs), and its checkpoint writer.
+    checkpoint: Option<crate::boot::Checkpointer>,
+    last_checkpoint: Option<Instant>,
+    persist_path: Option<PathBuf>,
+    config_fp: u64,
     last_save_try: Option<Instant>,
     save_failed: bool,
     stopping: bool,
@@ -398,6 +499,13 @@ impl Guard {
     /// Restore the model from a clean stop (if there is one) and lock the
     /// card's controls.  The volume lock is not lifted here.
     pub fn start<H: Hw>(hw: &mut H, cfg: &Config, max_reduction: f64, state_path: Option<PathBuf>) -> Result<Guard, Box<dyn Error>> {
+        Self::start_persist(hw, cfg, max_reduction, state_path, None)
+    }
+
+    /// `start`, with the record for the next boot under /var/lib: given
+    /// one, the first start of a boot starts from evidence (boot.rs)
+    /// rather than latched at the coils' limit.
+    pub fn start_persist<H: Hw>(hw: &mut H, cfg: &Config, max_reduction: f64, state_path: Option<PathBuf>, persist_path: Option<PathBuf>) -> Result<Guard, Box<dyn Error>> {
         if !max_reduction.is_finite() || max_reduction <= 0.0 {
             return Err("maximum reduction must be finite and positive".into());
         }
@@ -433,6 +541,9 @@ impl Guard {
         // dead owner's gain may still be playing
         let mut resumed = false;
         let mut restored_at = None;
+        // started from evidence (boot.rs): no daemon unlocked the card this
+        // boot, so it has held its safe level since the kernel started
+        let mut evidence = false;
         match &state_path {
             None => {
                 warn!("no model state file: assuming hot speakers (latched)");
@@ -455,6 +566,19 @@ impl Guard {
                         latched(&mut speakers);
                     }
                 },
+                Err(e) if e.kind() == io::ErrorKind::NotFound && persist_path.is_some() => {
+                    match evidence_start(hw, cfg, persist_path.as_deref()) {
+                        Some((sp, why)) => {
+                            speakers = sp;
+                            evidence = true;
+                            info!("{why}");
+                        }
+                        None => {
+                            info!("{}: no model state, but a record from this boot; assuming hot speakers (latched)", path.display());
+                            latched(&mut speakers);
+                        }
+                    }
+                }
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
                     info!("{}: no model state; assuming hot speakers (latched)", path.display());
                     latched(&mut speakers);
@@ -486,7 +610,8 @@ impl Guard {
                 }
             }
         }
-        let unknown_floor = if resumed { globals.safe_reduction } else { 0.0 };
+        let unknown_floor = if resumed || evidence { globals.safe_reduction } else { 0.0 };
+        let fp = fingerprint(cfg);
         let mut g = Guard {
             words: vec![0i32; globals.period * globals.channels],
             globals,
@@ -528,6 +653,10 @@ impl Guard {
             min_failures: 0,
             target_failures: 0,
             state_path,
+            checkpoint: persist_path.as_ref().map(|pp| crate::boot::Checkpointer::spawn(pp.clone(), fp, |p, t| state_write_durable(p, t))),
+            last_checkpoint: None,
+            persist_path,
+            config_fp: fp,
             last_save_try: None,
             save_failed: false,
             stopping: false,
@@ -542,6 +671,22 @@ impl Guard {
     /// Replace the state file with this run's status (released 0), or
     /// remove it.  True once no clean stop is left for a later start.
     fn invalidate<H: Hw>(&mut self, hw: &H) -> bool {
+        // the record a start from evidence read: gone, durably, before
+        // this run can drive the speakers (a later boot must not start
+        // from a record older than what this run did)
+        if let Some(pp) = self.persist_path.clone() {
+            match state_remove_durable(&pp) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    if !self.invalidate_failed {
+                        warn!("{}: {e}; the last run's record could not be removed, so the lock is not taken", pp.display());
+                        self.invalidate_failed = true;
+                    }
+                    return false;
+                }
+            }
+        }
         let Some(path) = self.state_path.clone() else { return true };
         if self.save_now(hw) {
             return true;
@@ -625,9 +770,48 @@ impl Guard {
             self.check_model()?;
         }
         if self.write_state(hw, after, after, true) {
+            self.persist(hw, after);
             Ok(())
         } else {
             Err("the final model state could not be saved".into())
+        }
+    }
+
+    /// A clean stop's record for the next boot (boot.rs), after the last
+    /// checkpoint.  A failure leaves the last checkpoint, or none: either
+    /// way the next boot starts from its own bounds.
+    fn persist<H: Hw>(&mut self, hw: &H, after: Duration) {
+        let Some(pp) = self.persist_path.clone() else { return };
+        if let Some(mut c) = self.checkpoint.take() {
+            c.finish();
+        }
+        let stamp = hw.stamp();
+        let pairing = hw.boottime().saturating_sub(after);
+        let state = state::encode(after, after, &self.speakers, false, true);
+        let text = crate::boot::encode(&crate::boot::Record { clean: true, stamp, config: self.config_fp, pairing, state });
+        match state_write_durable(&pp, &text) {
+            Ok(()) => info!("model state kept for the next boot in {}", pp.display()),
+            Err(e) => warn!("{}: {e}; the next boot starts from its own bounds", pp.display()),
+        }
+    }
+
+    /// Every CHECKPOINT_INTERVAL, the model as it is now for the next boot
+    /// (boot.rs: a running checkpoint is only ever a starting magnet; the
+    /// time after it is bounded by the protected-past rule, not trusted).
+    fn offer_checkpoint<H: Hw>(&mut self, hw: &H) {
+        if self.checkpoint.is_none() || self.stopping || !self.invalidated {
+            return;
+        }
+        let now = hw.now();
+        if self.last_checkpoint.is_some_and(|t| now.duration_since(t) < crate::boot::CHECKPOINT_INTERVAL) {
+            return;
+        }
+        self.last_checkpoint = Some(now);
+        let boot = hw.boottime();
+        let covered = boot.saturating_sub(now.saturating_duration_since(self.account_to));
+        let text = state::encode(boot, covered, &self.speakers, self.armed, false);
+        if let Some(c) = &self.checkpoint {
+            c.offer(text, boot);
         }
     }
 
@@ -1501,6 +1685,7 @@ impl Guard {
         if self.last_save_try.is_none_or(|t| hw.now().duration_since(t) >= SAVE_INTERVAL) {
             self.save_now(hw);
         }
+        self.offer_checkpoint(hw);
         Ok(())
     }
 
@@ -1510,6 +1695,9 @@ impl Guard {
         self.save_now(hw);
     }
 }
+
+#[cfg(test)]
+mod evidence_tests;
 
 #[cfg(test)]
 pub mod fake {
@@ -1563,6 +1751,10 @@ pub mod fake {
         pub writes: Vec<(Duration, f64)>,
         /// CLOCK_BOOTTIME at t = 0.
         pub boot: Duration,
+        /// The clocks and ids an evidence record sees (boot.rs).
+        pub stamp: crate::boot::Stamp,
+        /// The hottest chassis sensor.
+        pub chassis: Option<f64>,
         /// Extra time a sample-rate read takes at time t (a descheduled
         /// daemon, a slow ioctl).
         pub control_delay: Box<dyn Fn(Duration) -> Duration>,
@@ -1621,6 +1813,8 @@ pub mod fake {
                 reduction: SAFE_DB,
                 writes: Vec::new(),
                 boot: Duration::from_secs(1000),
+                stamp: crate::boot::Stamp::default(),
+                chassis: None,
                 control_delay: Box::new(|_| Duration::ZERO),
                 dma: None,
                 granule: 32,
@@ -1706,6 +1900,12 @@ pub mod fake {
     }
 
     impl Hw for FakeHw {
+        fn stamp(&self) -> crate::boot::Stamp {
+            self.stamp.clone()
+        }
+        fn chassis(&self) -> Option<f64> {
+            self.chassis
+        }
         fn now(&self) -> Instant {
             self.t0 + self.t
         }

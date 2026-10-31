@@ -14,6 +14,7 @@
 //! its safe volume, and the daemon takes the lock back once it can.
 
 mod alsa;
+mod boot;
 mod config;
 mod guard;
 #[cfg(test)]
@@ -55,6 +56,7 @@ struct Args {
     card: Option<String>,
     card_wait: Duration,
     state: Option<PathBuf>,
+    persist: Option<PathBuf>,
     verbosity: Level,
 }
 
@@ -67,6 +69,7 @@ fn usage() -> ! {
          --wait-for-card <SECONDS>       Wait for card discovery before failing (default 30; 0 disables waiting)\n  \
          -m, --max-reduction <DB>        Gain reduction beyond which the card's safe level takes over (default 20)\n  \
          -s, --state <FILE>              Model state kept across restarts (default /run/speakerguardd/state)\n  \
+         --persist <FILE>                The last run's record for the next boot (default /var/lib/speakerguardd/state; empty: every boot starts latched)\n  \
          -v, --verbose                   More logging (repeatable)\n  \
          -q, --quiet                     Less logging\n  \
          -V, --version                   The version and source commit\n  \
@@ -76,7 +79,7 @@ fn usage() -> ! {
 }
 
 fn parse_args() -> Args {
-    let mut args = Args { config_path: PathBuf::from("/usr/share/speakerguardd"), max_reduction: 20.0, card: None, card_wait: Duration::from_secs(30), state: Some(PathBuf::from("/run/speakerguardd/state")), verbosity: Level::Info };
+    let mut args = Args { config_path: PathBuf::from("/usr/share/speakerguardd"), max_reduction: 20.0, card: None, card_wait: Duration::from_secs(30), state: Some(PathBuf::from("/run/speakerguardd/state")), persist: Some(PathBuf::from("/var/lib/speakerguardd/state")), verbosity: Level::Info };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -86,6 +89,10 @@ fn parse_args() -> Args {
             "-s" | "--state" => {
                 let v = it.next().unwrap_or_else(|| usage());
                 args.state = if v.is_empty() { None } else { Some(PathBuf::from(v)) };
+            }
+            "--persist" => {
+                let v = it.next().unwrap_or_else(|| usage());
+                args.persist = if v.is_empty() { None } else { Some(PathBuf::from(v)) };
             }
             "-m" | "--max-reduction" => {
                 args.max_reduction = it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage());
@@ -244,6 +251,12 @@ impl RealHw {
 }
 
 impl Hw for RealHw {
+    fn stamp(&self) -> boot::Stamp {
+        boot::read_stamp()
+    }
+    fn chassis(&self) -> Option<f64> {
+        boot::chassis_temperature(std::path::Path::new("/sys/class/hwmon"))
+    }
     fn now(&self) -> Instant {
         Instant::now()
     }
@@ -416,7 +429,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let (card, card_name) = Card::open(Some(&name), &cfg)?;
     let mut hw = RealHw { card, globals: cfg.globals.clone(), capture: None, stats: stats::Stats::new(Instant::now()) };
     catch_stop_signals();
-    let mut guard = Guard::start(&mut hw, &cfg, args.max_reduction, args.state.clone())?;
+    let mut guard = Guard::start_persist(&mut hw, &cfg, args.max_reduction, args.state.clone(), args.persist.clone())?;
     info!("{card_name}: {} volume control(s) and the unlock control locked", hw.card.volume.len());
     let mut stopping = false;
     loop {
