@@ -16,7 +16,8 @@
 //!   period (short, stalled, a capture or position error).
 //! * `A` the lock taken or handed to the kernel, with the reason; `H` the
 //!   governing model's hard latch set or cleared; `X` a failed control
-//!   write.  `Z` the end, when the recording stopped early.
+//!   write.  `Z` the end: a clean stop's seal (the recording is complete),
+//!   or an early end (the size limit).
 //! * `C` a span of the guard's account (from, to) and how it was accounted:
 //!   measured, charged at full scale or cooled.  `K` a look at closed
 //!   speakers that charged, with the span it charged and the change events
@@ -93,6 +94,11 @@ pub const FAIL_MIN: u8 = 1;
 pub const FAIL_TARGET: u8 = 2;
 /// Why a recording ended early (`Z`).
 const END_FULL: u8 = 1;
+/// `Z` after a clean stop: the recording is complete, not cut short.
+const END_CLEAN: u8 = 2;
+/// How far the replay moves its clock to where the live daemon's own
+/// processing ended an account span it charged (a close, the final save).
+const LIVE_REACH: Duration = Duration::from_millis(100);
 
 /// A short fingerprint of a configuration, so that a replay can say it is
 /// not running the configuration that was recorded.
@@ -128,6 +134,8 @@ pub struct Recorder {
     ring: Option<(PathBuf, u64)>,
     header: Vec<u8>,
     async_tx: Option<SyncSender<DiskCommand>>,
+    /// The disk worker's end: true once it has written and flushed everything.
+    done: Option<mpsc::Receiver<bool>>,
 }
 
 enum DiskCommand {
@@ -164,6 +172,7 @@ impl Recorder {
     pub fn create_async(path: &Path, cfg: &Config, events: bool, max_bytes: u64) -> io::Result<Recorder> {
         let segment = (max_bytes / 2).max(1);
         let (tx, rx) = mpsc::sync_channel(32);
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
         let file = path.to_path_buf();
         std::thread::Builder::new().name("sg-record-writer".into()).spawn(move || {
             let result = (|| -> io::Result<()> {
@@ -179,13 +188,16 @@ impl Recorder {
                 }
                 out.flush()
             })();
-            if let Err(e) = result {
+            if let Err(e) = &result {
                 crate::warn!("recording disabled: {e}; protection continues");
             }
+            // a clean stop waits for this (Recorder::finish)
+            let _ = done_tx.send(result.is_ok());
         })?;
         let mut rec = Recorder::to_mode(Box::new(AsyncWriter(tx.clone())), cfg, events, segment, true)?;
         rec.ring = Some((path.to_path_buf(), segment));
         rec.async_tx = Some(tx);
+        rec.done = Some(done_rx);
         Ok(rec)
     }
 
@@ -205,13 +217,38 @@ impl Recorder {
             fingerprint(cfg), ring as u8
         ).into_bytes();
         out.write_all(&header)?;
-        Ok(Recorder { out, s16, left: max_bytes.saturating_sub(header.len() as u64), ring: None, header, async_tx: None })
+        Ok(Recorder { out, s16, left: max_bytes.saturating_sub(header.len() as u64), ring: None, header, async_tx: None, done: None })
     }
 
     fn put(&mut self, b: &[u8]) -> io::Result<()> {
         self.out.write_all(b)?;
         self.left = self.left.saturating_sub(b.len() as u64);
         Ok(())
+    }
+
+    /// A clean stop: seal the recording as complete.  Only the clean stop
+    /// does this; a crash or kill leaves a ring recording unsealed, and the
+    /// reader treats it as cut short.
+    pub fn seal(&mut self, t: u64) -> io::Result<()> {
+        let mut b = Self::head(b'Z', t);
+        b.push(END_CLEAN);
+        self.put(&b)?;
+        self.out.flush()
+    }
+
+    /// A clean stop: write out what is queued, close the recording, and wait
+    /// for the disk worker, at most `timeout`, so that the process does not
+    /// end before the last records are on disk.  Only the clean stop waits:
+    /// a recorder dropped on a full queue or a failed rotation never blocks
+    /// the governing loop.  True once everything is written.
+    pub fn finish(&mut self, timeout: Duration) -> bool {
+        let flushed = self.out.flush().is_ok();
+        self.out = Box::new(io::sink());
+        self.async_tx = None;
+        match self.done.take() {
+            Some(done) => done.recv_timeout(timeout) == Ok(true) && flushed,
+            None => flushed,
+        }
     }
 
     /// The size limit was reached: the recording ends here.
@@ -256,7 +293,7 @@ impl Recorder {
         out.write_all(&self.header)?;
         let mut fresh = Recorder { out: Box::new(out), s16: self.s16,
             left: segment.saturating_sub(self.header.len() as u64),
-            ring: self.ring.clone(), header: self.header.clone(), async_tx: None };
+            ring: self.ring.clone(), header: self.header.clone(), async_tx: None, done: None };
         fresh.start(t, governor, guard, max, state)?;
         fresh.loss(t, LOSS_ROTATION, 0)?;
         fresh.out.flush()?;
@@ -614,6 +651,7 @@ impl Timeline {
         };
         let mut wakes = Vec::new();
         let mut started = false;
+        let mut sealed = false;
         loop {
             let tag = match read_u8(&mut inp) {
                 Ok(t) => t,
@@ -733,8 +771,13 @@ impl Timeline {
                         size += 10;
                     }
                     b'Z' => {
-                        let _ = read_u8(&mut inp)?;
-                        tl.truncated = Some(t);
+                        // a clean stop's seal ends a complete recording;
+                        // any other end (the size limit) is an early one
+                        if read_u8(&mut inp)? == END_CLEAN {
+                            sealed = true;
+                        } else {
+                            tl.truncated = Some(t);
+                        }
                         size += 1;
                     }
                     _ => return Err(io::Error::new(io::ErrorKind::InvalidData, format!("unknown record {tag:#x}"))),
@@ -754,7 +797,7 @@ impl Timeline {
             }
             offset += size;
             tl.last = tl.last.max(t);
-            if tl.truncated.is_some() {
+            if tl.truncated.is_some() || sealed {
                 break;
             }
         }
@@ -778,6 +821,11 @@ impl Timeline {
 
     fn dt(&self, rate: u32) -> Duration {
         Duration::from_secs_f64(self.period as f64 / rate.max(1) as f64)
+    }
+
+    /// When the live daemon stopped cleanly (gave the lock up to stop).
+    fn clean_stop(&self) -> Option<Duration> {
+        self.permits.iter().find(|p| !p.1 && p.2 == "stopping").map(|p| p.0)
     }
 
     /// The end of a period's frames, as the live daemon placed them.
@@ -941,6 +989,10 @@ impl ReplayHw {
             schedule.push(k.edge());
             schedule.push(k.t);
         }
+        // a clean stop: the replay stops where the live daemon did
+        if let Some(t) = tl.clean_stop() {
+            schedule.push(t);
+        }
         schedule.sort();
         schedule.dedup();
         Ok(ReplayHw {
@@ -1067,6 +1119,21 @@ impl ReplayHw {
 impl Hw for ReplayHw {
     fn now(&self) -> Instant {
         self.t0 + self.bt.saturating_sub(self.tl.start)
+    }
+    fn closed_at(&mut self, from: Instant) -> Instant {
+        // The live daemon charged a closing stream from where its account
+        // had reached up to when it was done with it, which its own
+        // processing time decided.  Take the end of the span it charged
+        // from there (its account says where), within reach.
+        let from = self.tl.start + from.saturating_duration_since(self.t0);
+        let band = Duration::from_millis(1);
+        let span = self.tl.accounts.iter().find(|&&(a, b, how)| how == Accounted::Charged
+            && a + band >= from && a <= from + band
+            && b > self.bt && b <= self.bt + LIVE_REACH);
+        if let Some(&(_, b, _)) = span {
+            self.advance_to(b);
+        }
+        self.now()
     }
     fn boottime(&self) -> Duration {
         self.bt
@@ -1219,10 +1286,13 @@ impl Hw for ReplayHw {
             let x = &self.tl.tails[i];
             (x.offset, x.frames, x.t, x.queued)
         };
+        // read when the live daemon read it, as a period is
+        self.advance_to(t);
         // the tail was read under the gain of the stream's last period
         let applied = self.tl.periods[..self.next_period].last().map_or_else(|| vec![0.0; self.card.per.len()], |p| p.applied.clone());
         self.load(offset, frames, &applied, t, t, words)?;
-        self.queued = queued;
+        let rate = self.tl.periods[..self.next_period].last().map_or(0, |p| p.rate);
+        self.queued = queued + (self.bt.saturating_sub(t).as_secs_f64() * rate as f64) as u64;
         Ok(frames)
     }
     fn wait_rate_change(&mut self, timeout: Duration) -> bool {
@@ -1410,9 +1480,30 @@ pub fn replay(path: &Path, cfg: &Config, opts: &Replay) -> Result<Outcome, Box<d
     // account ends with its last record.
     let end = live_end.map_or(last, |e| (e + EVENT_SLACK).max(data_end) + Duration::from_micros(1));
     let mut delivered = 0;
+    let stop_at = hw.tl.clean_stop();
+    let mut stopping = false;
     while hw.boottime_now() < end {
         let before = hw.boottime_now();
         let was_playing = hw.playing_now();
+        // the live daemon's clean stop, as its main loop runs it
+        if !stopping && stop_at.is_some_and(|t| before >= t) {
+            if let Err(e) = g.stop(&mut hw) {
+                fatal = Some(format!("at {:.3} s: {e}", before.saturating_sub(start).as_secs_f64()));
+                break;
+            }
+            stopping = true;
+        }
+        if stopping && g.released(&hw) {
+            // the live daemon's final save ended its account where its own
+            // clock reads put it: end there too, within reach
+            if let Some(e) = live_end.filter(|&e| e > hw.bt && e <= hw.bt + LIVE_REACH) {
+                hw.advance_to(e);
+            }
+            if let Err(e) = g.final_save(&hw) {
+                fatal = Some(format!("at {:.3} s: {e}", before.saturating_sub(start).as_secs_f64()));
+            }
+            break;
+        }
         if let Err(e) = g.tick(&mut hw) {
             fatal = Some(format!("at {:.3} s: {e}", hw.boottime_now().saturating_sub(start).as_secs_f64()));
             break;
@@ -1460,7 +1551,8 @@ pub fn replay(path: &Path, cfg: &Config, opts: &Replay) -> Result<Outcome, Box<d
     let trace = g.trace.take().unwrap_or_default();
     let rep_permits: Vec<(Duration, bool)> = trace.iter().filter_map(|(t, e)| if let Trace::Permit(a, _) = e { Some((*t, *a)) } else { None }).collect();
     let rep_latches: Vec<(Duration, bool)> = trace.iter().filter_map(|(t, e)| if let Trace::Latch(s) = e { Some((*t, *s)) } else { None }).collect();
-    let handoffs: Vec<&String> = trace.iter().filter_map(|(_, e)| if let Trace::Permit(false, why) = e { Some(why) } else { None }).collect();
+    // a replayed clean stop gives the lock up too, but hands nothing off
+    let handoffs: Vec<&String> = trace.iter().filter_map(|(_, e)| if let Trace::Permit(false, why) = e { (why != "stopping").then_some(why) } else { None }).collect();
     let spans: Vec<(Duration, Duration, Accounted)> = trace.iter().filter_map(|(_, e)| if let Trace::Account(a, b, how) = e { Some((*a, *b, *how)) } else { None }).collect();
     let total_of = |how: Accounted| spans.iter().filter(|s| s.2 == how).map(|s| (s.1 - s.0).as_secs_f64()).sum::<f64>() + 0.0;
     // adjacent charges are one uncovered interval
@@ -1708,6 +1800,99 @@ mod tests {
         assert!(out.text.contains("live only") && !out.text.contains("certification: refused"), "{}", out.text);
         let csv = std::fs::read_to_string(csv).unwrap();
         assert!(csv.lines().count() > 100);
+    }
+
+    /// A clean stop's finish waits for the disk worker: every record the
+    /// recorder queued is in the file.
+    #[test]
+    fn finishing_an_async_recorder_writes_everything() {
+        let cfg = j700();
+        let path = tmp("async-finish.rec");
+        let _ = std::fs::remove_file(&path);
+        let mut rec = Recorder::create_async(&path, &cfg, true, 1 << 30).unwrap();
+        let header = rec.header.len();
+        let chunk = vec![0x55u8; 4096];
+        for _ in 0..16 {
+            rec.out.write_all(&chunk).unwrap();
+        }
+        assert!(rec.finish(Duration::from_secs(5)));
+        assert_eq!(std::fs::metadata(&path).unwrap().len() as usize, header + 16 * chunk.len());
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A live run in a ring recording, as the daemon records (written
+    /// synchronously here: on the fake card a test outruns the async
+    /// worker, whose full queue drops records), with or without a clean
+    /// stop at its end.
+    fn record_live(cfg: &Config, name: &str, clean: bool) -> PathBuf {
+        let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
+        hw.level = Box::new(|_| 0.6);
+        hw.playing = Box::new(|t| t > secs(2.0) && t < secs(4.0));
+        let path = tmp(name);
+        let _ = std::fs::remove_file(&path);
+        let mut g = Guard::start(&mut hw, cfg, cfg.globals.max_reduction, tmp_state()).unwrap();
+        g.attach_recorder(&hw, Recorder::create(&path, cfg, hw.events, 1 << 30).unwrap());
+        run_until(&mut g, &mut hw, secs(6.0)).unwrap();
+        assert!(g.armed());
+        if clean {
+            g.stop(&mut hw).unwrap();
+            while !g.released(&hw) {
+                g.tick(&mut hw).unwrap();
+            }
+            g.final_save(&hw).unwrap();
+        }
+        drop(g);
+        path
+    }
+
+    /// A clean stop seals a ring recording: it reads as complete.  Without
+    /// one (a crash, a kill) it still reads as cut short.
+    #[test]
+    fn a_clean_stop_seals_a_live_recording() {
+        let cfg = j700();
+        for clean in [true, false] {
+            let path = record_live(&cfg, if clean { "sealed.rec" } else { "unsealed.rec" }, clean);
+            let tl = Timeline::read(&path, &cfg).unwrap();
+            assert_eq!(tl.truncated.is_none(), clean, "clean stop {clean}: truncated {:?}", tl.truncated);
+            std::fs::remove_file(&path).unwrap();
+        }
+    }
+
+    /// The replay stops where the live daemon stopped cleanly, and a live
+    /// recording with a clean stop certifies; one without it does not.
+    #[test]
+    fn a_cleanly_stopped_live_recording_certifies() {
+        let cfg = j700();
+        for clean in [true, false] {
+            let path = record_live(&cfg, if clean { "stopped.rec" } else { "killed.rec" }, clean);
+            let out = replay(&path, &cfg, &Replay { gain_db: 0.0, governor: None, guard: None, max_reduction: None, csv: None }).unwrap();
+            assert_eq!(out.certified, clean, "{}", out.text);
+            if clean {
+                assert!(out.text.contains("0 hand-offs") && out.text.contains("0 live only, 0 replay only"), "{}", out.text);
+            } else {
+                assert!(out.text.contains("the recording stopped here"), "{}", out.text);
+            }
+            std::fs::remove_file(&path).unwrap();
+        }
+    }
+
+    /// The live daemon charges a closing stream up to when it is done with
+    /// it, which its own processing time decides; the replay charges the
+    /// same span, and the recording certifies.
+    #[test]
+    fn a_slow_close_replays_as_the_live_daemon_charged_it() {
+        let cfg = j700();
+        let mut hw = FakeHw::new(cfg.globals.channels, cfg.globals.period);
+        hw.level = Box::new(|_| 0.6);
+        hw.playing = Box::new(|t| (t > secs(1.0) && t < secs(3.0)) || (t > secs(4.0) && t < secs(4.5)));
+        hw.close_delay = Duration::from_millis(3);
+        let path = tmp("slow-close.rec");
+        let live = record(&cfg, &mut hw, tmp_state(), secs(6.0), &path);
+        assert!(live.armed());
+        let out = replay(&path, &cfg, &Replay { gain_db: 0.0, governor: None, guard: None, max_reduction: None, csv: None }).unwrap();
+        assert!(out.text.contains("account against the live one: 0.0 ms the live daemon charged not charged here"), "{}", out.text);
+        assert!(out.certified, "{}", out.text);
+        std::fs::remove_file(&path).unwrap();
     }
 
     /// A V/I recording certifies too: the periods before the lock, played

@@ -155,6 +155,13 @@ fn add_candidate(set: &mut Vec<(f64, f64)>, r: (f64, f64)) {
 /// What the loop needs from the machine.
 pub trait Hw {
     fn now(&self) -> Instant;
+    /// Up to when a closing stream is charged, its account having reached
+    /// `from` with its last frames.  Live, that is now; a replay takes the
+    /// live daemon's (it cannot replay the daemon's own processing time).
+    fn closed_at(&mut self, from: Instant) -> Instant {
+        let _ = from;
+        self.now()
+    }
     /// Time since boot, suspend included (CLOCK_BOOTTIME).
     fn boottime(&self) -> Duration;
     fn sleep(&mut self, d: Duration);
@@ -348,6 +355,8 @@ pub const REARM_PERIODS: u32 = 2;
 pub const REARM_MARGIN_DB: f64 = 3.0;
 /// The reduction the volume controls' minimum stands for (dB).
 pub const MUTE_DB: f64 = 120.0;
+/// How long a clean stop waits for the recording's last records to reach the disk.
+const RECORD_FINISH: Duration = Duration::from_secs(2);
 /// Where speakersafetyd notes that it has run since boot (its "warm boot"
 /// flag: /run/speakersafetyd/speakersafetyd.flag from 2.0, written into its
 /// runtime directory, /run/speakersafetyd.flag before; the ref Macs run
@@ -1025,6 +1034,16 @@ impl Guard {
         }
         if self.write_state(hw, after, after, true) {
             self.persist(hw, after);
+            if let Some(mut r) = self.rec.take() {
+                // complete: everything up to the stop is in the recording
+                if let Err(e) = r.seal(after.as_nanos() as u64) {
+                    warn!("recording: sealing it failed: {e}");
+                }
+                // the last records reach the disk before the process ends
+                if !r.finish(RECORD_FINISH) {
+                    warn!("recording: its last records may be missing");
+                }
+            }
             Ok(())
         } else {
             Err("the final model state could not be saved".into())
@@ -1609,7 +1628,7 @@ impl Guard {
                 }
             }
         }
-        let now = hw.now();
+        let now = hw.closed_at(self.account_to);
         self.charge(now)?;
         Ok(measured)
     }
@@ -2316,6 +2335,8 @@ pub mod fake {
         /// A late read finds only the newest period: the frames before it
         /// are lost, not queued (no overrun is reported).
         pub lossy: bool,
+        /// Time the daemon takes after a stream's last frames, before it charges the rest.
+        pub close_delay: Duration,
         /// Where the period last returned ended.
         last_end: Duration,
         pub locked: bool,
@@ -2385,6 +2406,7 @@ pub mod fake {
                 writes: Vec::new(),
                 boot: Duration::from_secs(1000),
                 control_delay: Box::new(|_| Duration::ZERO),
+                close_delay: Duration::ZERO,
                 dma: None,
                 granule: 32,
                 period_frames,
@@ -2755,6 +2777,11 @@ pub mod fake {
                 return reader.queued();
             }
             Ok((self.t.saturating_sub(self.last_end).as_secs_f64() * 48000.0) as u64)
+        }
+        fn closed_at(&mut self, _from: Instant) -> Instant {
+            // the daemon's own time after a stream's last frames
+            self.t += self.close_delay;
+            self.now()
         }
         fn read_tail(&mut self, words: &mut [i32]) -> io::Result<usize> {
             if !self.sense_open {
