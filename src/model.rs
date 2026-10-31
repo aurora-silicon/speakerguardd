@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 //! The protection model: the power delivered to each voice coil is estimated
-//! from the words on the speaker wire (feed-forward, there is no current
-//! sense), fed into a two-stage lumped thermal model (coil into magnet,
+//! from the words on the speaker wire (feed-forward: V^2 against the coil's
+//! DC resistance `r_ff`, which is `z_nominal` unless the configuration
+//! names it), fed into a two-stage lumped thermal model (coil into magnet,
 //! magnet into ambient, each a first-order lag), and the coil temperature
 //! drives a gain governor with a window below the limit and hysteresis.
 //! A windowed power budget (mean power over the last second and the last
@@ -114,7 +115,7 @@ impl SpeakerState {
                 })
                 .sum();
             total += sum;
-            out.push(if hi > lo { sum / (hi - lo) as f64 / self.spec.z_nominal } else { 0.0 });
+            out.push(if hi > lo { sum / (hi - lo) as f64 / self.spec.r_ff } else { 0.0 });
         }
         let v_rms = if frames > 0 { (total / frames as f64).sqrt() } else { 0.0 };
         (out, v_rms)
@@ -286,7 +287,7 @@ impl SpeakerState {
     /// coil resistance.  Time the daemon could not measure is charged at it.
     pub fn worst_case_power(&self, reduction_db: f64) -> f64 {
         let v = self.spec.vs_scale * 10f64.powf(-reduction_db.max(0.0) / 20.0);
-        v * v / self.spec.z_nominal
+        v * v / self.spec.r_ff
     }
 
     /// Start at the coil's limit with the hard fault latched, the magnet
@@ -331,30 +332,8 @@ impl SpeakerState {
         self.t_magnet = t_magnet;
         self.t_peak = t_coil;
         self.hard = false;
-        // Two means do not say when the energy came.  The most either
-        // budget can see of it later is all of it as late as it can have
-        // been: nothing before the gain is louder than full scale, so the
-        // last second's energy at full scale at the very end of it, and the
-        // rest of the minute's at full scale just before that second.  Each
-        // window then keeps every joule until the latest moment it could
-        // have left.  (A mean over full scale, from an older file, keeps
-        // its whole window instead.)
-        self.history.clear();
-        let full = self.worst_case_power(0.0);
-        let last = mean_1s.max(0.0);
-        let older = (60.0 * mean_60s - last).max(0.0);
-        let d_older = (older / full).min(59.0);
-        let d_last = (last / full).min(1.0);
-        if older > 0.0 && d_older > 0.0 {
-            self.history.push_back((d_older, older / d_older));
-        }
-        if d_last < 1.0 {
-            self.history.push_back((1.0 - d_last, 0.0));
-        }
-        if last > 0.0 && d_last > 0.0 {
-            self.history.push_back((d_last, last / d_last));
-        }
-        self.history_s = self.history.iter().map(|e| e.0).sum();
+        // two means do not say when the energy came (budget_envelope)
+        (self.history, self.history_s) = budget_envelope(mean_1s, mean_60s, self.worst_case_power(0.0));
     }
 
     /// The governor's state a restart keeps: the latched fault, the peak
@@ -514,6 +493,31 @@ pub fn converted_at(room: f64, possible: &[(f64, f64)]) -> f64 {
     fit.unwrap_or(most).max(0.0)
 }
 
+/// A budget history from its two saved means: all of the energy as late as
+/// it can have come, at `full` (the power of a full-scale signal; nothing
+/// before the gain is louder), the last second's at the very end of it and
+/// the rest of the minute's just before that second.  Each window then
+/// keeps every joule until the latest moment it could have left.  (A mean
+/// over full scale, from an older file, keeps its whole window instead.)
+pub fn budget_envelope(mean_1s: f64, mean_60s: f64, full: f64) -> (std::collections::VecDeque<(f64, f64)>, f64) {
+    let mut h = std::collections::VecDeque::new();
+    let last = mean_1s.max(0.0);
+    let older = (60.0 * mean_60s - last).max(0.0);
+    let d_older = (older / full).min(59.0);
+    let d_last = (last / full).min(1.0);
+    if older > 0.0 && d_older > 0.0 {
+        h.push_back((d_older, older / d_older));
+    }
+    if d_last < 1.0 {
+        h.push_back((1.0 - d_last, 0.0));
+    }
+    if last > 0.0 && d_last > 0.0 {
+        h.push_back((d_last, last / d_last));
+    }
+    let total = h.iter().map(|e| e.0).sum();
+    (h, total)
+}
+
 /// The card-wide result of one step: the reduction to apply to the shared
 /// volume control is the largest any speaker needs.
 pub fn reduction_db(states: &[SpeakerState]) -> f64 {
@@ -563,11 +567,41 @@ mod tests {
             vs_chan: 0,
             p_limit_1s: 0.0,
             p_limit_60s: 0.0,
+            is_chan: None,
+            is_scale: 0.0,
+            r_ff: 4.43,
+            vi_tr_coil: 60.0,
+            vi_tau_coil: 3.0,
+            vi_tr_magnet: 40.0,
+            vi_tau_magnet: 200.0,
+            a_t_20c: 0.0,
+            z_min_override: None,
         }
     }
 
     fn globals() -> Globals {
-        Globals { sense_pcm: 2, t_ambient: 35.0, t_hysteresis: 5.0, t_window: 20.0, channels: 2, period: 4096, t_reduction_max: 20.0, safe_reduction: 20.0 }
+        Globals {
+            sense_pcm: 2,
+            t_ambient: 35.0,
+            t_hysteresis: 5.0,
+            t_window: 20.0,
+            channels: 2,
+            period: 4096,
+            t_reduction_max: 20.0,
+            safe_reduction: 20.0,
+            governor: crate::config::Governor::Legacy,
+            shadow: false,
+            sense_format: crate::config::SenseFormat::S32,
+            amp_gain_dbv: 0.0,
+            horizon_s: 4.6,
+            release_s: 20.0,
+            t_ctrl_headroom: 0.0,
+            unified_caps: false,
+            p_reduction_max: 0.0,
+            max_reduction: 20.0,
+            qualified: true,
+            guard: None,
+        }
     }
 
     #[test]
@@ -714,11 +748,22 @@ mod tests {
     fn worst_case_power_is_a_full_scale_square_wave_at_the_card_gain() {
         let mut sp = spec();
         sp.vs_scale = 7.3;
+        // the parser defaults r_ff to z_nominal (the J700)
         sp.z_nominal = 4.2;
-        let s = SpeakerState::new(sp, 35.0);
+        sp.r_ff = 4.2;
+        let s = SpeakerState::new(sp.clone(), 35.0);
         assert!((s.worst_case_power(0.0) - 7.3 * 7.3 / 4.2).abs() < 1e-9);
         assert!((s.worst_case_power(20.0) - 0.073 * 7.3 / 4.2).abs() < 1e-9);
         // a negative reduction cannot raise the card above its full scale
         assert_eq!(s.worst_case_power(-6.0), s.worst_case_power(0.0));
+        // a machine whose DC resistance is known and below the nominal
+        // impedance (the J316's woofers: 2.7 against 3.6 ohm) is charged
+        // against the DC resistance, as its feed-forward constants assume
+        sp.z_nominal = 3.6;
+        sp.r_ff = 2.7;
+        let s = SpeakerState::new(sp, 35.0);
+        assert!((s.worst_case_power(0.0) - 7.3 * 7.3 / 2.7).abs() < 1e-9);
+        let (p, _) = s.block_powers(&[i32::MAX, 0], 2, 1);
+        assert!((p[0] - 7.3 * 7.3 / 2.7).abs() < 1e-6, "{}", p[0]);
     }
 }

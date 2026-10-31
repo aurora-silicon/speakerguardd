@@ -35,55 +35,6 @@ lock and the card falls back to its own safe level; the daemon keeps
 modelling from the sense data and takes the lock back once the reduction is
 3 dB below the limit again.
 
-The J700 converts on copy, ahead of a playback queue of up to 341 ms, so a
-written reduction reaches only what is converted after it.  Audio already
-queued at a lower gain keeps playing, and only giving the lock up stops it
-(macaudio stops the old-gain stream at once).  The daemon gives the lock up
-for that reason too, in two cases, each logged as itself:
-* Any program at all could take a coil within 3 K of its limit before its
-  next look, through the least reduction the card may be playing.  This is
-  what it has to assume while it cannot see.
-* The coils' thermal reduction has risen more than 3 dB over that least
-  reduction, and the audio converted at it, at the level the program was
-  last seen to deliver, could take a coil there in the time it can still
-  play: until a queue's length (341 ms) after the controls stopped holding
-  it.
-It takes the lock back after two whole periods.
-
-A daemon that is held up (a call that blocks, the scheduler) cannot write
-anything: the card keeps converting at the last reduction written until the
-kernel's lease runs out and macaudio stops the stream.  So the daemon never
-writes less than a floor: the reduction at which full scale for a lease, a
-period and the stop, behind a copy queue (0.68 s on the J700), keeps every
-coil 3 K under its limit.  It rises with the coil, and the governor takes
-over from it at about 110 C.  This costs loudness at the top of the volume
-range, accepted on purpose:
-
-| Coil model (its magnet where a steady program puts it) | 50 C | 70 C | 85 C | 100 C | 110 C |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Floor | 0.5 dB | 1.5 dB | 2.5 dB | 3.9 dB | 5.0 dB |
-| Floor on the J700's 0.5 dB steps | 0.5 dB | 2.0 dB | 3.0 dB | 4.0 dB | 5.5 dB |
-| Governor | 0 dB | 0 dB | 0 dB | 0 dB | 6.0 dB |
-
-The card rounds every reduction up to its step, the floor's too.  A cold
-J700 never plays at the amplifier's full scale, but 0.5 dB under it.  A
-loud program that warms the coils to 85-100 C plays 3-4 dB under it where
-the governor alone would take nothing yet.  In return, loud bursts
-after quiet passages are not stopped (no hand-off in any of the programs the
-seventh review measured, where the queue rule alone stopped up to 60 a
-minute, each an XRUN and about 170 ms at the card's safe level), and a
-daemon held up for anything up to the lease no longer takes a coil past its
-limit.
-
-While the daemon is held up (descheduled, blocked in a call, waiting for a
-page) it can decide nothing, and the card's 250 ms lease bounds what plays,
-which the floor allows for.  To make that rarer the unit runs it at a
-real-time priority below PipeWire's
-(`CPUSchedulingPolicy=fifo`, priority 50) and it locks its memory
-(`mlockall`).  Every ten minutes it logs how long it was held up: the gaps
-between lock renewals, the latency of each kind of call, and the major page
-faults.  That measures, without a sound, whether a shorter lease is needed.
-
 There is no feedback: the model can only be as good as its constants.  The
 J700's constants - thermal resistances and time constants, coil temperature
 limits, volts at full scale, coil resistance and the power budgets - are the
@@ -127,12 +78,14 @@ The rule is deliberately simple:
 * The power budgets keep the power before the card's gain.  Each measured
   frame counts at the most reduction it can have been converted at: any
   value the controls held from 500 ms before it played (the reduction the
-  card applies, rounded up to its steps; after a failed write, anything
-  from the old value to the new one rounded up), the card's own safe level
+  card applies, rounded up to its steps; after a failed write, the old
+  value or the new one rounded up, since each control's write is atomic),
+  the card's own safe level
   from the moment the daemon's lease may have run out, and anything for the
   controls' value before the daemon set one.  A reduction too deep to have
   delivered a frame that loud did not convert it; a word is taken a step
-  above itself; nothing before the gain is louder than full scale.  A budget window that
+  above itself; nothing before the gain is louder than full scale, and a
+  frame the card may have muted counts as full scale.  A budget window that
   cuts a step counts as much of the step's energy as full scale fits in
   the part it covers.
 * Every renewal of the lock, including the one before the blocking sense
@@ -167,8 +120,6 @@ Known costs of that rule, accepted on purpose:
   scale (up to about 7 dB on the J700, easing over the minute after the
   start), and after a clean stop the time since it counts as full scale
   before the gain.
-* The floor under every write (see above): 0.5 dB on a cold coil, rising
-  to 5 dB at 110 C.
 
 Exits are left for what the daemon cannot recover from (no card, a
 configuration error, a nonfinite model, a lock it cannot give up); the
@@ -192,9 +143,193 @@ stays with the kernel until the model has cooled under its working ceiling
 (about 7 s on the J700).  A daemon that is late renewing the lock is covered by the kernel's
 250 ms lock timeout, and the late time is charged like any other.
 
+### Machines with current and voltage sense
+
+The same daemon can protect the Apple laptops whose amplifiers report the
+speaker voltage and current (TAS2764-class SN012776, S16 sense words, 14 V
+and 3.75 A at full scale): `conf/apple/j316.conf` (MacBook Pro 16" M1 Pro),
+`j413.conf` (MacBook Air M2) and `j616.conf` (MacBook Pro 16" M4 Pro).  It
+turns the VSENSE and ISENSE switches on, sets the amplifier gain to its
+maximum (the level the model assumes, `amp_gain_dbv`) and writes one volume
+control per speaker, linked by `group`.
+
+None of the three is qualified on the machine yet, and their files say
+`qualified = false`.  The daemon refuses to govern them without
+`--allow-unqualified`, and udev starts it only on the J700, so installing
+the package never displaces speakersafetyd.  The unit never stops it
+either: one daemon holds the card's interlock, whichever takes it first,
+and a configuration this daemon refuses to govern exits with status 78
+before it touches the card, which the unit does not restart on.  Governing
+one of them takes an explicit enable: mask speakersafetyd (`systemctl mask
+--now speakersafetyd`) and start this daemon with `--allow-unqualified`, or
+use a drop-in that adds `Conflicts=speakersafetyd.service` together with
+`OnFailure=speakersafetyd.service`.  To go back, unmask speakersafetyd and
+reboot.  Keep speakersafetyd installed.
+
+On those machines the governor that writes the card is `asahi`, the
+behaviour Asahi Linux's speakersafetyd ships, reimplemented here from its
+description (credit to the Asahi Linux contributors; speakersafetyd is MIT
+through 2.0.2).  The measured power (V*I, integrated per sample) drives the
+two-node model with speakersafetyd's constants (`vi_*`, `z_nominal`).  The
+reduction ramps from 0 at `t_limit - t_headroom - t_window` to
+speakersafetyd's `min_gain` at the working limit, with peak-hold
+hysteresis.  It differs only toward protection:
+
+* It runs inside the same account as the J700's model and by the same
+  rule: time not covered by measured frames is charged at full scale at
+  each speaker's least reduction since the last verified boundary, instead
+  of skipped.
+* The hard limit is checked at every sample, for the coil and the magnet.
+  A crossing latches.  Negative V*I beyond 1 mW after it in the same
+  stretch leaves the model at the limit at least, so a bad sample cannot
+  hide the crossing, while a latched model cools as it should through
+  sense noise (a few LSB, which makes nearly half the samples of a silent
+  period negative) or no negative samples at all.
+* After a hand-off, once what was converted at the old gain has drained,
+  uncovered time is charged at each control's value or the card's safe
+  level, whichever is more, until the lock is renewed: the card holds its
+  safe level while the daemon does not hold the lock.
+* A period whose mean V*I is below -0.01 W is bad sense data: uncovered
+  time, charged at full scale, never measured.  The card goes to the kernel
+  at once (which mutes these amplifiers), and two good periods in a row are
+  needed to take the lock back.  The wait for them survives a clean stop
+  and restart.
+* The governor's state (temperatures, holds, gain, latch) is saved with the
+  rest of the model and resumed only from a clean stop.  A missing state,
+  or a run of speakersafetyd since boot (its flag file under /run), starts
+  every model latched, not at speakersafetyd's 119 C: coil and magnet at
+  the hard limit with the half second of drain at full scale held on top.
+  On these speakers that keeps the card at its safe level for about a
+  minute after every boot (58 s on the J413, 84 s on the J316), mostly the
+  time their magnets take to cool from the limit.
+* A current line that reads far too little for its voltage (a dead or
+  switched-off line, where speakersafetyd sees no power at all) is lost
+  for the period.  That is a 10 ms block with at least 0.1 V rms whose
+  current is under a tenth of what the speaker's nominal impedance would
+  draw, or a 1 ms block under a hundredth (a loud program's lost line,
+  caught within a millisecond).  A live line through a reactive load
+  stays well under both down to 20 Hz.  The measured-power models then
+  take V^2 over the speaker's smallest impedance, the most current there
+  can be, until the line reads again, and the daemon logs both changes
+  (once a change has held for a few periods; the bound follows the line
+  at once).  The short block counts only when two in a row read lost.
+  What a line lost too briefly for a block to show may have under-read
+  at a period's end or start (the most current less what was read) is
+  charged unless the next or last period shows the line reading, and at
+  once when the speakers close or measurement stops.  Below the blocks'
+  floor (0.1 V rms, or the line's own noise times the ratio) a dead line
+  cannot be told from a quiet one, and it under-reads there at most that
+  voltage squared over the smallest impedance.
+* A line that reads low but plausibly, or a dead one carrying a DC
+  offset, is lost the same way.  Over the last 3 s of program with at
+  least 20 mA rms below 120 Hz, the low band's resistance (sum(v i) over
+  sum(i^2)) above 1.6 times the smallest impedance, raised with the
+  measured-power model's coil temperature at the coil's temperature
+  coefficient, is more than a live coil can show.  On the J616s's woofers
+  at full volume it is 1.28 to 1.49 times; a line reading half doubles
+  it (it has to stay over the bound for a second of program, and a flag
+  with no low-band current to judge it by clears after 30 s).  And over
+  a period with at least 0.1 V and 20 mA rms, current that
+  does not follow the voltage (sum(v i) under 0.2 of sqrt(sum(v^2)
+  sum(i^2)); a live load of up to 60 degrees keeps it over 0.4) is no
+  reading, at once from 0.5 V rms and after 2 s of such program under it.  What V and I cannot tell apart is a line reading a fraction
+  of its current on a program with no low-band current from a higher
+  impedance: the tweeters, and treble-only programs on the woofers.
+* `z_min` in a speaker's section sets its smallest impedance (a unit's
+  own DC resistance) when it is lower than the default, the smaller of
+  `z_nominal` and `r_ff`.
+
+At the J413 tweeter's sensitivity a full-scale charge heats its model by
+about 2 C per millisecond, so stream edges and sense hiccups cost much more
+there than on the J700.  Qualification on the machine has to show what
+that means in use.
+
+### Shadow mode and the unified governor
+
+`--shadow` runs every governor the machine supports on the same account
+and writes one JSON line a second to `shadow.jsonl` next to the state file:
+each model's temperatures, each governor's reduction, what each control
+holds, and each estimator's power.  A shadow changes nothing the
+governing model does.
+
+The `unified` governor is a look-ahead regulator on the feed-forward
+model, after the design of macOS's speaker protection: power from the
+sensed voltage against the speaker's reference resistance (`r_ff`) drives
+the two-node model with macOS's open-loop constants, and the regulator
+lets through the most power that keeps the coil at or under the working
+limit over the next `horizon_s`.  It attacks at once and releases over
+`release_s`.  It predicts the program from the frames last measured at a
+gain the card is known to have applied.  A charge, which stands for time
+no frames measured, heats every model at the worst case but is not the
+program, and frames the card held at its safe level say nothing about it.
+
+On the V/I machines it governs under the asahi guard (`--governor unified
+--guard asahi`, or `guard = asahi` in the configuration).  The guard
+needs V/I sense on every speaker:
+
+* each speaker's control gets the larger of the two governors'
+  reductions, group-linked, every period, and either one's hard latch
+  hands the card to the kernel, so the card is never less protected than
+  under the asahi governor alone;
+* the regulator then holds the feed-forward model only.  The
+  measured-power side is the guard's: unified's own measured-power model
+  still runs, latches and is logged;
+* a dead or switched-off current line is bounded as under the asahi
+  governor alone (above), so the guard keeps speakersafetyd's constants
+  on it instead of leaving the feed-forward model alone;
+* a period that is not a measurement (mean V*I below -0.01 W, or
+  nonfinite) stays a fault as above, because the feed-forward model's
+  voltage comes from the same words.
+
+Without the guard it writes the card only with `--experimental-unified`.
+Resistance thermometry from low-band V/I is logged only: without a pilot
+tone, content alone does not carry a trustworthy coil resistance.
+
+### Recording and replay
+
+`--record FILE` keeps what the guard sees and decides: every sample-rate
+change and change event, every sense open, every complete period's words
+with the most reduction the card may have applied over it (its safe level
+whenever the lock was not held throughout), the frames read at each close,
+every lost or unusable period, failed control writes, the lock taken and
+handed back with the reason, the governing latch, every span of its account
+(measured, charged or cooled), each look at closed speakers that charged
+with the change events it saw, and the model the guard started from.  It stops at `--record-max-mb` (512 by default) and says so in
+the file.
+
+`--replay FILE --model NAME` runs the guard itself on the recording,
+offline: the speakers open and close where they did, the periods arrive
+when they were read, losses and failed reads recur at their times, the
+looks at closed speakers come where the live ones did and see the same
+events, and a simulated card keeps the kernel's lease, notice and safe
+level.  The
+program before the card's gain is rebuilt from the words and the recorded
+gain, then played through the gains the replayed guard writes (rounded up
+to the control's step, `--gain-db` louder if asked) and clipped at full
+scale.  `--governor` replays another governor on the same program,
+`--csv FILE` writes a line per period.
+
+The replay reports its account: how much was measured, charged and cooled,
+with every uncovered interval listed as charged, not measured.  It lists
+what it cannot reproduce: lost frames, bad sense data, failed reads and
+opens, failed control writes and the daemon's own lateness (neither is
+replayed), periods played louder than recorded where the recording cannot
+say what the program was, and an early end.  With the recorded governor at
+0 dB it also compares its lock and latch transitions with the live ones.
+Its account is compared with the live one in every case, span by whole
+span to a frame at each end: time the live daemon charged that the replay
+measured or cooled, time it measured that the replay cooled, or a replayed
+account that ends early, all refuse the certificate.  It certifies a recording only when none of that is there, the
+transitions match and nothing it measured was lost or rejected in the
+recording; otherwise it says why and exits with status 3.  Recordings from
+before 0.1.10 (format 2) are not read.  A certificate is about the
+recording, not the speakers: it says the replay saw what the live daemon
+saw.
+
 ### Randomized interleavings
 
-`src/harness.rs` runs the real guard against a simulated world: streams of
+`src/harness.rs` runs the real guard on the J700 model against a simulated
+world: streams of
 any length (shorter than a period too), a program before the card's gain,
 copy chunks converted at the gain the card really held and played through a
 queue of up to 341 ms, the lease in playing time, macaudio stopping old-gain
@@ -211,19 +346,37 @@ while the daemon holds the lease the card never applies less reduction than
 the true state needs, and that what cannot be proven ends with the card at
 its safe level (no lock without events, none after a failed rate read, no
 renewal blind past the limit, a latched start from anything but a clean
-stop).  Where macaudio stops old-gain audio promptly, it also asserts that
-the true coil never reaches its limit unless the daemon was held up
-(descheduled, blocked in a call or gone) for at least 85 ms, ending no
-longer before the crossing than the lease, a period and the stop.  That
-bound is the kernel's lease, not the daemon's, and the crossings it exempts
-are counted.  A safe write that fails falls back to the controls' minimum,
-as the daemon does.  Scenarios start cold
-or hot, at 16 kHz or at the J700's own 48 kHz and 4096 frames, with a prompt
-or a slow stop.  Failures shrink to a minimal scenario printed as Rust; each
-one it found is a test of its own.
+stop).  Failures shrink to a minimal scenario printed as Rust; each one it
+found is a test of its own.
 
     cargo test --release harness                      # 200 cases
     SPEAKERGUARDD_CASES=1000000 cargo test --release harness
+
+`src/harness/vi.rs` does the same on the J316 and the J413, with the asahi
+governor writing a volume control per speaker, or the unified governor
+under the asahi guard, and the unified models in shadow or governing.  Each stream has a share for each speaker and plays a
+sine or a square into a load of random impedance and phase, so V*I goes
+negative over part of every cycle.  The sense words are S16 V and I with up
+to 20 LSB of noise and fixed offsets, and periods can be bad sense data or
+reach the daemon late.  The gain is the amplifier's own or a copy queue's.
+Its oracle integrates the true power into the measured-power model and
+both feed-forward ones.  On top of the J700 world's properties it checks
+that no lock follows bad sense data before two good periods or holds a
+latched model, and, after a quiet tail as long as the daemon's own models
+need to cool, that the latch has cleared and the lock is back.  Under the
+guard it checks that the card is never less protective than speakersafetyd
+alone on the true state, and that the lock is never held with the
+feed-forward truth at its hard limit.  Any case can lose its current line
+for a while, after which the measured-power models are checked against
+the truth less what the dead-line bound can miss.  Some cases end in a
+full-scale onset, at the top of a staircase or inside a partial write
+failure.  A long class runs steady programs for minutes, long enough to
+heat the feed-forward truth, under the asahi governor and the guard with
+the current lines live and dead, and checks that the measured-power truth
+never reaches its limit.
+
+    SPEAKERGUARDD_VI_CASES=100000 cargo test --release harness::vi
+    SPEAKERGUARDD_VI_LONG=1 cargo test --release vi_long     # 120 x 120 s
 
 ### Relation to speakersafetyd
 
@@ -298,19 +451,9 @@ it never plays audio or performs a reboot.
 
 `-C <card id>` selects a card (by default the one the macaudio driver
 registered, never the AOP card that shares its `AppleJ` prefix), `-m <dB>`
-the reduction at which the card's safe level takes over (the floor under
-every write is not counted against it, so on a warm coil a `-m` under about
-4.5 dB can be exceeded by the floor without a hand-off: more reduction, not
-less), `-s <file>` the
-model state file (`-s ''` for none).  `-V` prints the version and the
-source commit, which the daemon also logs when it starts (`make` takes the
-commit from git; a package sets `SPEAKERGUARDD_COMMIT`).
-
-The daemon writes the controls to the card's safe value at its start and
-before each unlock.  The card accepts that value while the volume is locked.
-Until the first unlock the speakers play at the card's safe level, as they
-do without the daemon, and an unlock never lets anything louder through.
-At the first ping the daemon reads the controls' range with the lock lifted
-and checks the card's safe level (the locked maximum against it) against
-`safe_reduction`.  A card that is louder there than the configuration says
-is never unlocked: the speakers stay at its safe level.
+the reduction at which the card's safe level takes over, `-s <file>` the
+model state file (`-s ''` for none).  `--governor legacy|asahi|unified`
+overrides the configuration's governor, `--guard asahi|none` its guard, and
+`-m` defaults to its `max_reduction`; `--shadow` turns the shadow log on,
+and `--experimental-unified` and `--allow-unqualified` are the two opt-ins
+described above.
