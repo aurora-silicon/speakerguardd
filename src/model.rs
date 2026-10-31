@@ -21,6 +21,8 @@ use crate::config::{Globals, Speaker};
 #[derive(Debug, Clone)]
 pub struct SpeakerState {
     pub spec: Speaker,
+    /// Full-scale voltage bound, including an amplifier cap above sense full scale.
+    v_max: f64,
     /// Voice coil and magnet temperatures (°C).
     pub t_coil: f64,
     pub t_magnet: f64,
@@ -60,6 +62,7 @@ pub const SUB_BLOCKS: usize = 16;
 impl SpeakerState {
     pub fn new(spec: Speaker, t_ambient: f64) -> SpeakerState {
         SpeakerState {
+            v_max: spec.vs_scale,
             spec,
             t_coil: t_ambient,
             t_magnet: t_ambient,
@@ -74,6 +77,17 @@ impl SpeakerState {
             history: std::collections::VecDeque::new(),
             history_s: 0.0,
         }
+    }
+
+    pub fn with_globals(spec: Speaker, globals: &Globals) -> SpeakerState {
+        let mut state = Self::new(spec, globals.t_ambient);
+        state.configure_voltage(globals);
+        state
+    }
+
+    pub(crate) fn configure_voltage(&mut self, globals: &Globals) {
+        let amplifier = crate::engine::v_worst(&self.spec, globals);
+        self.v_max = self.spec.vs_scale.max(amplifier);
     }
 
     /// The RMS voltage a period of sense words puts across the coil.
@@ -126,10 +140,13 @@ impl SpeakerState {
     /// (ranges, dB) that can have delivered it, never more than a
     /// full-scale signal.  A block can hold frames converted at different
     /// gains (review r5 V5), a frame only one.  A frame converted at
-    /// reduction r was at most vs_scale 10^(-r/20) and its word is at most
-    /// what was played: r fits iff r <= 20 log10(vs_scale / word).  What
+    /// reduction r was at most the configured maximum times 10^(-r/20),
+    /// and its word is at most
+    /// what was played: r fits iff r <= 20 log10(v_max / sensed_voltage).  What
     /// was played is within a step above the word: the step up is its
     /// power's bound (it matters only where the gain undone is deep).
+    /// A voltage rail below the amplifier cap stands for full possible
+    /// power, because the sense cannot report the excess voltage.
     pub fn frame_powers(&self, words: &[i32], channels: usize, possible: &[(f64, f64)]) -> (Vec<f64>, Vec<f64>) {
         let ch = self.spec.vs_chan;
         let frames = words.len() / channels;
@@ -140,11 +157,12 @@ impl SpeakerState {
         for f in 0..frames {
             let w = words[f * channels + ch] as f64;
             let v = w * scale;
-            p.push(v * v / self.spec.z_nominal);
+            let clipped = self.v_max > self.spec.vs_scale && w.abs() >= (32767i64 << 16) as f64;
+            p.push(if clipped { full } else { v * v / self.spec.r_ff });
             let w = w.abs();
-            let room = if w > 0.0 { 20.0 * (2147483648.0 / w).log10() } else { f64::INFINITY };
+            let room = if w > 0.0 { 20.0 * (self.v_max / (w * scale)).log10() } else { f64::INFINITY };
             let up = (w + 1.0) * scale;
-            let pre = up * up / self.spec.z_nominal * 10f64.powf(converted_at(room, possible) / 10.0);
+            let pre = if clipped { full } else { up * up / self.spec.r_ff * 10f64.powf(converted_at(room, possible) / 10.0) };
             q.push(if pre > full { full } else { pre });
         }
         (p, q)
@@ -286,27 +304,25 @@ impl SpeakerState {
     /// `-reduction_db`: a full-scale square wave (V rms = V peak) into the
     /// coil resistance.  Time the daemon could not measure is charged at it.
     pub fn worst_case_power(&self, reduction_db: f64) -> f64 {
-        let v = self.spec.vs_scale * 10f64.powf(-reduction_db.max(0.0) / 20.0);
+        let v = self.v_max * 10f64.powf(-reduction_db.max(0.0) / 20.0);
         v * v / self.spec.r_ff
     }
 
-    /// Start at the coil's limit with the hard fault latched, the magnet
-    /// where steady state would put it: nothing about the speaker's past is
-    /// known (no state of this daemon, an unreadable one).  The card stays
-    /// with the kernel until the model has cooled under the working ceiling.
-    pub fn assume_latched(&mut self, t_ambient: f64) {
+    /// Nothing about the speaker's past is known. Bound coil and magnet
+    /// independently, including queued full-scale audio and any time at
+    /// the kernel's safe level. A hot magnet need not have the steady-state
+    /// relationship to the coil. Keep the hard fault latched until cool.
+    pub fn assume_latched(&mut self, globals: &Globals) {
+        self.configure_voltage(globals);
         let s = &self.spec;
-        // A run that kept the coil under its limit may have died with its
-        // gain on the samples still queued: they play out for up to the
-        // drain at full scale (the hottest it can then be).
-        let drain = self.worst_case_power(0.0) * s.tr_coil * (1.0 - (-DRAIN_S / s.tau_coil).exp());
-        self.t_coil = s.t_limit + drain;
-        self.t_magnet = t_ambient + (self.t_coil - t_ambient) * s.tr_magnet / (s.tr_magnet + s.tr_coil);
+        let full = self.worst_case_power(0.0);
+        let safe = self.worst_case_power(globals.safe_reduction);
+        let mut th = crate::engine::Thermal::new(s.tr_coil, s.tau_coil, s.tr_magnet, s.tau_magnet, s.t_limit);
+        (self.t_coil, self.t_magnet) = th.latched_start(s.t_limit, full, safe, globals.t_ambient);
         self.t_peak = self.t_coil;
         self.hard = true;
         // nor is the power before the gain: a minute of full scale for the
         // budgets (they ask for their most until the minute has passed)
-        let full = self.worst_case_power(0.0);
         self.history.clear();
         self.history.push_back((60.0, full));
         self.history_s = 60.0;
@@ -327,6 +343,17 @@ impl SpeakerState {
 
     /// Continue from a saved state: temperatures and the power history's
     /// last second and minute.
+    /// Each temperature, peak, latch and reduction at least `o`'s (two
+    /// restores of one state over different spans: persist.rs).  The
+    /// budgets keep this one's history.
+    pub fn raise_to(&mut self, o: &SpeakerState) {
+        self.t_coil = self.t_coil.max(o.t_coil);
+        self.t_magnet = self.t_magnet.max(o.t_magnet);
+        self.t_peak = self.t_peak.max(o.t_peak);
+        self.hard |= o.hard;
+        self.reduction_db = self.reduction_db.max(o.reduction_db);
+    }
+
     pub fn resume(&mut self, t_coil: f64, t_magnet: f64, mean_1s: f64, mean_60s: f64) {
         self.t_coil = t_coil;
         self.t_magnet = t_magnet;
@@ -391,6 +418,7 @@ impl SpeakerState {
     /// Overflow must be rejected before a period renews the sensing permit.
     pub fn finite(&self) -> bool {
         [
+            self.v_max,
             self.t_coil,
             self.t_magnet,
             self.t_peak,
@@ -602,7 +630,24 @@ mod tests {
             max_reduction: 20.0,
             qualified: true,
             guard: None,
+            boot_resume: crate::config::BootResume::Latched,
         }
+    }
+
+    #[test]
+    fn frame_power_uses_the_feed_forward_resistance() {
+        let mut sp = spec();
+        sp.vs_scale = 8.0;
+        sp.z_nominal = 4.0;
+        sp.r_ff = 2.0;
+        let s = SpeakerState::new(sp, 35.0);
+        // Half scale is 4 V, or 8 W through the configured 2 ohm FF bound.
+        let words = [1i32 << 30];
+        let (p, pre) = s.frame_powers(&words, 1, &[(0.0, 0.0)]);
+        assert!((p[0] - 8.0).abs() < 1e-12, "{p:?}");
+        assert!(pre[0] >= 8.0 && pre[0] < 8.0 + 1e-7, "{pre:?}");
+        let (blocks, _) = s.block_powers(&words, 1, 1);
+        assert_eq!(p, blocks, "frame and block heat disagree");
     }
 
     #[test]
@@ -766,5 +811,24 @@ mod tests {
         assert!((s.worst_case_power(0.0) - 7.3 * 7.3 / 2.7).abs() < 1e-9);
         let (p, _) = s.block_powers(&[i32::MAX, 0], 2, 1);
         assert!((p[0] - 7.3 * 7.3 / 2.7).abs() < 1e-6, "{}", p[0]);
+    }
+}
+
+#[cfg(test)]
+mod amplifier_rail_tests {
+    use super::*;
+    #[test]
+    fn a_saturated_voltage_word_does_not_cap_the_amplifier_power() {
+        let cfg = crate::config::Config::parse(include_str!("../conf/apple/j274.conf")).unwrap();
+        for spec in &cfg.speakers {
+            let v = crate::engine::v_worst(spec, &cfg.globals);
+            assert!(v > spec.vs_scale, "the witness needs a cap above sense full scale");
+            let state = SpeakerState::with_globals(spec.clone(), &cfg.globals);
+            let mut words = vec![0; cfg.globals.channels];
+            words[spec.vs_chan] = 32767 << 16;
+            let (power, before) = state.frame_powers(&words, cfg.globals.channels, &[(0.0, 0.0)]);
+            let full = v * v / spec.r_ff;
+            assert!(power[0] >= full && before[0] >= full);
+        }
     }
 }

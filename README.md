@@ -29,11 +29,20 @@ released slowly.  A windowed power budget (`p_limit_1s`, `p_limit_60s`: the
 mean power over the last second and the last minute) reduces the gain at
 once when a burst would exceed what the pair is rated for, before the coil
 has warmed up.  The larger of the two reductions is written to the card's
-speaker volume control.  If it would exceed `--max-reduction` (20 dB by
-default: a model asking for more is wrong), the daemon stops renewing the
-lock and the card falls back to its own safe level; the daemon keeps
-modelling from the sense data and takes the lock back once the reduction is
-3 dB below the limit again.
+speaker volume control. Ordinary model requests keep using that same ramp,
+including requests above the old 7 dB handoff on V/I machines. The daemon
+uses the attenuation needed by the most restrictive governor and onset
+reserve, rounded up to the card's steps. The unlocked control range is the
+limit (201 half-dB steps, or 100.5 dB, on the supported cards), rather than
+a fixed model threshold.
+
+A hard model or sense fault, lost observations, failed control write or
+unrepresentable attenuation still gives the lock back to the kernel.
+After a range fault, the target must fit with 3 dB to spare before the lock
+is taken back. Hard-temperature latches and the requirement for two good
+sense periods after bad data still apply. The old `max_reduction` setting
+and `-m` option are accepted for configuration and recording compatibility;
+they no longer cause a handoff during normal attenuation.
 
 There is no feedback: the model can only be as good as its constants.  The
 J700's constants - thermal resistances and time constants, coil temperature
@@ -42,6 +51,21 @@ machine's own loudspeaker-manager tuning, read back through the public
 AudioUnit API and recorded in the bring-up provenance record.  Without the
 daemon the kernel locks the J700's speakers 20 dB below the amplifier's
 full scale; with it, the model governs up to full scale.
+
+### Delayed wakeups
+
+A delayed wake can leave complete periods queued in the sense capture.
+The loop drains up to eight retained periods, for at most 10 ms, before
+considering a renewal. It measures those frames at their verified capture
+positions instead of first charging their time as unknown. A hard fault
+ends the drain immediately. Missing frames and uncertain position edges
+still count at full scale for their actual duration; a delay does not
+justify assuming that the music stayed quiet.
+
+The packaged service currently uses normal scheduling and does not pin
+memory. Higher priority and memory locking can reduce jitter, but cannot
+prove a deadline under I/O stalls and are not needed for the attenuation
+policy. The kernel lease is unchanged.
 
 ### Missing or invalid speaker data
 
@@ -137,11 +161,15 @@ windows as the energy can have come.  The clock reads that pair the boot
 time with the daemon's own clock, at the final save and at the restore, are
 bounded: whatever time lies between them is charged once more at full scale
 and full gain.  Any other state (a crash, an older version's file, a state
-whose model trails its write) or none starts every speaker at its coil limit
-plus what the samples a dead run left queued can add, latched, so the card
-stays with the kernel until the model has cooled under its working ceiling
-(about 7 s on the J700).  A daemon that is late renewing the lock is covered by the kernel's
-250 ms lock timeout, and the late time is charged like any other.
+whose model trails its write) or none starts both coil and magnet from
+independent upper bounds. Each starts at its hard limit, with the possible
+queued full-scale drain added and a floor at the kernel safe level's steady
+state. The fault stays latched until the model cools under its working
+ceiling, about 25 s on the J700. A hot magnet after another OS ran need not
+have the steady-state relationship to the coil. This assumes each actual
+node was at or below its hard limit before the queued drain. A daemon that
+is late renewing the lock is covered by the kernel's 250 ms lock timeout,
+and the late time is charged like any other.
 
 ### Speaker profile coverage
 
@@ -282,6 +310,91 @@ review of the constants, and an explicit change to `qualified`; parsing,
 read-only checks and a sibling match alone are insufficient. No loud
 playback is part of this contribution procedure.
 
+**Across a reboot (`boot_resume`, off by default).**  `/run` dies with the
+boot, so by default every boot starts latched at the coils' limit (on the
+Neo, an 11.9 dB first lock released over 7.6 min).  With `boot_resume =
+idle` in `[Globals]`, a clean stop made while systemd shuts the system down
+also writes its state to `/var/lib/speakerguardd/state` (`--persist`).  The
+daemon makes the directory itself, after the card is locked; the unit adds
+nothing that could fail before the daemon runs.  The record is checksummed
+and bound to the machine (`/etc/machine-id`), the parsed configuration
+and the boot that wrote it. Version 4 requires an independent RTC age bound
+and refuses older records. The checksum covers the version
+header too, so a damaged header cannot promote an older record. It is written and synced only when the
+system clock is synchronized.  The first start of the next boot (no state
+under `/run`) resumes it only if all of the following hold:
+
+* the journal lists the writing boot as the one just before this one;
+* the machine and configuration match and the checksum holds;
+* no temperature is under the ambient;
+* the system clock passes synchronization checks at both ends and agrees
+  with an independent, accurate RTC present at both ends;
+* the age interval covers RTC quantization, read placement, up to 0.1% RTC
+  rate uncertainty and the snapshot pairing, and is no shorter than uptime.
+
+The timestamp is read between two synchronization queries while a
+`TFD_TIMER_CANCEL_ON_SET` timer watches for a clock step. An unsynchronized
+query, a step, a pending leap transition or a failed watch rejects the
+sample. Overlapping setters can restore the offset before both timerfd
+notifications and evade this watch. Realtime alone therefore cannot authorize
+idle restore. The entire independent RTC interval is included even when it
+agrees with realtime; a missing RTC keeps the hot latch. The guarded sample
+must finish within 50 ms of boot time, on both
+save and restore. Restore also bounds the whole wall-clock read to 50 ms.
+The shutdown record keeps the whole delay from the model snapshot through
+the clock reads. Missing or backward boot-time reads cannot produce a
+clean snapshot or a persistent pairing. These bounds give an interval of
+possible snapshot ages.
+The restored coil, magnet and governing peaks bound that entire interval,
+including interior coil extrema. A one-microkelvin upward allowance covers
+the temperature record's six-decimal rounding. The legacy model uses an invariant upper
+bound that also covers its magnet-first numerical steps. Full-scale power
+before the gain is charged to the budgets through the longest possible age.
+
+Every start removes the file and syncs its directory before it can unlock,
+and does not unlock while it cannot, with the option or without and with
+`--persist ''`. A stop that is not a shutdown writes nothing.
+
+#### The contract for idle restore
+
+Setting `boot_resume = idle` asserts all of these operating conditions.
+They are requirements on the installation and its owners, not facts proved
+by the record or by `journalctl --list-boots`.
+
+* Every intervening Linux boot must leave a retained boot entry in the same
+  persistent journal consulted at restore. Journal storage must work from
+  early boot through shutdown and retain every boot until this record is
+  consumed. Volatile storage, unwritable persistent storage, vacuuming,
+  journal replacement or a boot that leaves no messages break this contract.
+  Adjacency among retained entries does not prove that no boot is missing.
+* Every speaker protection owner must participate in the same durable
+  invalidation protocol, using the same persistent path before it can drive
+  the speakers. This includes alternate governors, recovery systems and
+  runs with persistence disabled. Redirecting the path must first durably
+  invalidate the old path. After the final shutdown save no later owner
+  may drive the speakers above the card's safe level in that writing boot.
+  systemd reporting `stopping` does not establish this last-owner property.
+* No other OS may drive these speakers between the saved state and restore.
+  Linux cannot see that history. Every Apple Silicon Mac can boot another OS;
+  merely calling an installation Linux-only does not establish continuity.
+* The independent RTC must remain accurate and its rate error stay within
+  0.1% across shutdown and boot. It must not be adjusted with the system
+  realtime clock during capture. Agreement does not detect both clocks
+  moved forward together.
+  Clock administration must preserve this contract; the sample watch is
+  local to each read, not a record of clock history while Linux was down.
+
+If any condition cannot be guaranteed, keep `boot_resume = latched`.
+After a known break, durably remove the old record before enabling idle
+restore again. The default remains latched. The regression suite retains
+synthetic missing-boot, later-owner and synchronized-but-wrong-clock cases
+as examples outside this contract. They deliberately show that the parser
+can accept such histories; no journal predicate proves their absence.
+
+An unsupported other-OS history restored a J700 model cold enough to exceed
+its limit by 58 K in review. This is a model calculation, not a measured
+speaker temperature. Idle restore must not be used on dual-boot machines.
+
 ### Machines with current and voltage sense
 
 The same daemon can protect the Apple laptops whose amplifiers report the
@@ -372,10 +485,14 @@ hysteresis.  It differs only toward protection:
   at full volume it is 1.28 to 1.49 times; a line reading half doubles
   it.  The power is bounded from the first stretch R is over the bound
   and stays bounded until R reads under 0.9 of the least bound since
-  then, on program the card played (not at its safe level, whose words
+  the first fault, on program the card played (not at its safe level, whose words
   are the sense's noise).  The least bound: the bound rises with the
   model's coil, which the bounded line itself heats, and that must not
-  end the bound.  Nothing else clears it; a passage without bass is no
+  end the bound. Recovery clears the fault but retains that reference.
+  The model can still carry excess heat from the earlier bound, so its
+  higher temperature must not hide a second fault. This can keep the
+  detector more conservative after a recovery. Nothing else clears it;
+  a passage without bass is no
   evidence that the line reads again.  Only the logged verdict waits: at
   once from 1.25 times the bound, else after R has stayed over it for a
   second of program.  And over a period with at least 0.1 V rms and the
@@ -427,8 +544,8 @@ gaps in the kernel's playing-time lease cannot hide a later onset.
 The projection uses model copies, so it adds no energy to the account.
 
 This ceiling can reduce even a quiet program. It can need more attenuation
-than `--max-reduction`, which still applies to the governor's request and
-keeps its existing handoff and re-arm rules. The ceiling only adds
+than the old `max_reduction` threshold. Both the governor request and this
+ceiling must fit the unlocked hardware range. The ceiling only adds
 attenuation to an otherwise permitted write. If the old queued audio
 already uses the available headroom, the guard gives up the lease. Mute
 does not erase those earlier gains. J700 has no V/I path and keeps its
@@ -549,6 +666,62 @@ never reaches its limit.
     SPEAKERGUARDD_VI_CASES=100000 cargo test --release harness::vi
     SPEAKERGUARDD_VI_LONG=1 cargo test --release vi_long     # 120 x 120 s
 
+The recurrent-line tests in `src/harness/vi/recurrent.rs` keep the 768
+synthetic adversarial cases paired with each speaker's baseline peak.
+They include fault, recovery, another fault, control failures and changes
+between bass and treble. The late-mute witness preserves all 3,999 oracle
+and gain rows before 40 s, then mutes the tweeters and raises the woofer
+program over 60.25 to 65 s. Its early-mute control runs too. These controls
+and the long class assert each speaker's true V/I limit over every oracle
+sample, including after a low-line fault and during hand-offs. The cold
+burst/quiet engine test requires the deployed 0.3 V / 20 mA PF gate.
+
+The broad family retains both baseline and reviewed-parent peak tables and
+all input fingerprints. Its hard gate is each speaker's absolute V/I limit.
+Changes relative to either historical table are reported separately; a
+previous crossing is never an exemption. The earlier relative-peak predicate
+is not the continuous thermal criterion. These are software model checks,
+not physical speaker qualification. Nonzero twin operation remains disabled
+and unqualified.
+
+    cargo test --offline --locked --release recurrent
+    cargo test --offline --locked --release cold_burst
+
+### Continuous limits and the listening release gate
+
+The original interleaving properties cover accounted or armed states. They
+can pass while a true model temperature crosses its limit elsewhere in the
+program. `src/harness/continuous.rs` adds a separate check of both thermal
+nodes over every interval, including interior maxima, with no armed-state
+mask. It retains all 30,144 paired inputs: 144 long programs, 20,000 V/I
+seeds and 10,000 Legacy seeds. All 865 cases that fail either historical
+source run as default regressions, including all 17 newly crossing cases.
+The complete campaign is an additional mandatory acceptance run:
+
+    PAIR_METRICS=continuous.csv cargo test --offline --locked --release harness::continuous::all_30144_continuous_cases_stay_within_limits -- --ignored --exact
+
+The input fingerprints, complete counterexample rows, new-crossing rows and
+historical limits are in `src/harness/`; see `README-continuous.md` there.
+The historical archive contains 72 shared rows and two packaged-Neo rows
+from a separate source/fixture. Those two rows are never counted as reruns
+of a different fixture. The original Euler/RK4 property oracles remain;
+the continuous check uses exact interval extrema and a parallel exact
+Legacy state.
+
+Thermal checks and the ordinary-listening budget must pass on the same
+candidate. Listening acceptance uses the seven retained archives at cubic
+30%, 60% and recorded level across three source comparisons (63 replays),
+plus the retained quiet schedule. Cost must stay within 1 dB; J616 must stay
+at exactly zero change at 30% and 60%. Comparisons include per-speaker means
+and common normal-playing intervals. Private recordings and detailed replay
+records stay outside this repository.
+
+The current full-dose onset reserve still fails that listening budget. The
+complete continuous campaign must also pass before release; narrower
+property passes are insufficient. This branch is not ready to deploy. A
+quiet capture is past audio, not a guarantee about upcoming output. No
+quiet-history exception or reserve cap is used to weaken onset protection.
+
 ### Relation to speakersafetyd
 
 speakersafetyd protects the speakers of the other Apple laptops from the
@@ -648,13 +821,76 @@ it never plays audio or performs a reboot.
 
 ### Running by hand
 
-    speakerguardd -c /usr/share/speakerguardd -v
+    speakerguardd -v
+
+The default data directory is `/usr/share/speakerguardd`. The macaudio card
+ID comes from the device tree through ALSA (`AppleJ413` selects
+`apple/j413.conf`); that packaged file selects the governor, guard and
+qualification state. A plain `speakerguardd` uses those choices and waits
+up to 30 seconds for discovery. Unqualified profiles still require the
+deliberate `--allow-unqualified` opt-in. The packaged unit omits redundant
+default arguments; local units may continue to use them.
 
 `-C <card id>` selects a card (by default the one the macaudio driver
-registered, never the AOP card that shares its `AppleJ` prefix), `-m <dB>`
-the reduction at which the card's safe level takes over, `-s <file>` the
+registered, never the AOP card that shares its `AppleJ` prefix), `-s <file>` the
 model state file (`-s ''` for none).  `--governor legacy|asahi|unified`
 overrides the configuration's governor, `--guard asahi|none` its guard, and
-`-m` defaults to its `max_reduction`; `--shadow` turns the shadow log on,
+`-m` retains its historical recording value; `--shadow` turns the shadow log on,
 and `--experimental-unified` and `--allow-unqualified` are the two opt-ins
 described above.
+
+### Strict profile bounds
+
+The full-scale hot-start regression now runs for 20 simulated minutes by
+default on every installed profile. It checks every effective gain interval,
+including lease expiry, from independently hot coil and magnet nodes.
+The onset tests also cover every V/I profile from ambient and hot starts,
+with Asahi alone and unified plus Asahi.
+
+The legacy governor on V/I profiles now reserves full-scale energy using
+its own feed-forward state and resistance before each output write. Its
+Asahi shadow cannot supply that bound. The existing V/I reserve remains in effect too. The FF reserve shares the
+V/I onset calculation and includes old queued audio, a possible renewed lease, idle
+gaps and the kernel safe-level tail. It changes neither measured heat nor
+power-budget history. Existing hard latches still apply. A range fault uses the hardware limit and its re-arm margin.
+J700 keeps its legacy floor policy and independent hot-node initialization.
+
+A draft profile whose declared fallback does not fit the reserve stays
+locked. Passing these software sweeps does not qualify a machine or its
+thermal constants. The output ceiling may attenuate quiet content too.
+
+The listening-cost release gate is
+`ordinary_quiet_programme_costs_at_most_one_db`. It applies a deterministic
+quiet programme at normalized cubic 30% and 60% and measures each output's
+mean attenuation during active playback after the first minute. The deployed
+baseline has zero attenuation in those cold-start cases. The current standing
+reserve fails this gate, so this branch is not ready for release. A proportional
+bound needs enforceable knowledge of upcoming playback energy or a sufficiently
+short enforced response deadline. The sense capture's backlog contains past
+audio and cannot certify the next period's energy.
+
+
+The strict legacy sweep uses the profile's declared amplifier maximum even
+when it exceeds the sense full scale. Startup, uncovered time and budget
+caps use that same configured bound. A saturated voltage word cannot prove
+that the amplifier stopped at the sense rail; those frames use the declared
+power bound in both thermal paths. The profiles remain unqualified.
+
+
+The recurrent-line gate retains all 768 inputs and both historical reference
+tables. Every output must meet its own hard limit, including cases that were
+already over at a reference revision. The log also reports every increase
+above a reviewed-parent peak. Composed changes to attenuation and handoff
+can change those below-limit peaks; the historical comparison remains
+visible alongside the absolute result. The listening-cost gate remains a
+separate release requirement.
+
+Runtime snapshots use model generation 3. A clean stop written before the
+independent hot-node and voltage bounds is not evidence that its saved model
+bounded the speakers. Those older snapshots are refused and startup stays
+latched. Readers from before generation 3 also refuse it on rollback. PR #20's
+Legacy clean-stop writer already uses generation 3; its synthetic writer
+fixture remains readable here, and this branch does not introduce generation 4.
+Historical
+recordings remain readable, but an untrusted initial state starts the replay
+latched and makes it diagnostic. Profile fingerprints are unchanged.

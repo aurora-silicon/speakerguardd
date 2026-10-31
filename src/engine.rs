@@ -91,6 +91,12 @@ pub const VI_NOISE_FLOOR: f64 = 1e-3;
 /// sense's rail.
 const I_RAIL: f64 = (32767i64 << 16) as f64;
 
+/// A voltage rail below the declared amplifier cap is a lower reading,
+/// not a ceiling on delivered voltage. S16 sense words arrive widened.
+fn voltage_clipped(word: f64, scale: f64, amplifier: f64) -> bool {
+    word.abs() >= I_RAIL && amplifier > scale * 2147483648.0
+}
+
 /// The power one sample of V and I words stands for (W).  A current word
 /// at its rail says only that the current was at least that much (review
 /// Z2 of speakerguardd#8: at full scale the J316 and J616 woofers' 2.7 ohm
@@ -140,10 +146,14 @@ pub const DEAD_V_MIN: f64 = 0.1;
 /// r4 EE2); a line reading half doubles it, and one reading 0.55 to 0.65
 /// still clears it.  The power is bounded from the first stretch R is
 /// over the bound, and stays bounded until R reads under LOW_R_CLEAR of
-/// the least bound since then, on audible program: the deployed rule
+/// the least bound since the first fault, on audible program: the
+/// deployed rule
 /// (2f7d16d), judged against a bound that cannot rise with the heat the
 /// bounded model takes, and cleared only on program the card played
-/// (review r4 addenda 6a and 6b).  Nothing else clears it: a passage
+/// (review r4 addenda 6a and 6b). Recovery clears the fault, but keeps
+/// that reference across later faults: the protective model can still
+/// carry excess heat from the first bound (addendum 6c). Nothing else
+/// clears it: a passage
 /// without bass is no evidence the line reads again, and a line just over
 /// the bound may read 0.65 of its current.  Only the verdict that is
 /// logged (and kept in `lost`) waits: at once from LOW_FAST times the
@@ -442,6 +452,61 @@ impl Thermal {
     }
 }
 
+/// Full-scale energy that may still arrive before the kernel's safe tail.
+/// The thermal states and power bounds must refer to the same accounted time.
+#[allow(clippy::too_many_arguments)]
+pub fn onset_reduction(
+    models: &[(&Thermal, f64)], target: f64, ambient: f64,
+    safe: f64, old: f64, pending_s: f64, lease_s: f64,
+) -> f64 {
+    let fits = |gain: f64| {
+        models.iter().all(|(th, full)| {
+            let mut th = (*th).clone();
+            // Idle can warm a coil below its magnet. This
+            // envelope covers every idle delay before the dose,
+            // including small below-ambient sense estimates.
+            th.t_magnet = hi(th.t_magnet, ambient);
+            th.t_coil = hi(th.t_coil, th.t_magnet);
+            // Each joule adds at most impulse's node increments,
+            // wherever it lands among the lease's idle gaps.
+            let energy = full * (old.max(gain) * pending_s + gain * lease_s);
+            let (c, m) = th.impulse(energy);
+            if !(c < target && m < target) {
+                return false;
+            }
+            let power = full * safe;
+            let steady = ambient + power * (th.tr_coil + th.tr_magnet);
+            // Infinity is only the extremum search's upper endpoint;
+            // no infinite duration is integrated (equal taus included).
+            let peak = hi(
+                hi(th.t_coil, steady),
+                th.coil_extremum(power, f64::INFINITY, ambient),
+            );
+            peak < target && th.t_magnet < target
+        })
+    };
+    if fits(1.0) {
+        return 0.0;
+    }
+    if !fits(0.0) {
+        return NOTHING_DB;
+    }
+    let (mut lo, mut hi) = (0.0, 1.0);
+    for _ in 0..32 {
+        let mid = (lo + hi) / 2.0;
+        if fits(mid) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    if lo > 0.0 {
+        (-db(lo)).max(0.0)
+    } else {
+        NOTHING_DB
+    }
+}
+
 /// What one stretch of sense frames says about one speaker (power after
 /// the card's gain).
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -710,7 +775,9 @@ impl AsahiSpeaker {
         let mut negative_after = false;
         for (i, f) in words.chunks_exact(channels).enumerate() {
             let (ac, am) = if i == 0 { (ac1, am1) } else { (acn, amn) };
-            let p = if lost {
+            let p = if voltage_clipped(f[vc] as f64, vs, self.v_worst) {
+                self.v_worst.powi(2) / self.z_min
+            } else if lost {
                 // the current line is lost: the most current there can be
                 (f[vc] as f64 * vs).powi(2) / self.z_min
             } else {
@@ -1172,7 +1239,8 @@ pub struct Engine {
     pf_held: Vec<f64>,
     low_held: Vec<f64>,
     /// ... whether the low band bounds the power (from the first stretch R
-    /// was over the bound), and the least bound since then.
+    /// was over the bound), and the least bound across fault episodes.
+    /// Recovery does not remove the protective model's excess heat.
     low_bound: Vec<bool>,
     low_set_bound: Vec<f64>,
     /// Per speaker: whether its power was bounded over the last stretch (a
@@ -1205,6 +1273,86 @@ impl Engine {
         }
         let n = cfg.speakers.len();
         Some(Engine { cfg: cfg.clone(), asahi, unified, extractor: Extractor::new(n), last: vec![Feature::default(); n], lost: vec![false; n], lost_changed: Vec::new(), pending: vec![0.0; n], reading: vec![false; n], gap: f64::INFINITY, lf: vec![(0.0, 0.0, 0.0); n], low: vec![false; n], logged: vec![(false, 0); n], pf_held: vec![0.0; n], low_held: vec![0.0; n], low_bound: vec![false; n], low_set_bound: vec![f64::INFINITY; n], bounded: vec![false; n] })
+    }
+
+    /// Each model's temperatures, holds, peaks and latches at least
+    /// `o`'s, its gain no higher (two restores of one state over different
+    /// spans: persist.rs).  The budgets keep this engine's history.
+    pub fn raise_to(&mut self, o: &Engine) {
+        for (a, b) in self.asahi.iter_mut().flatten().zip(o.asahi.iter().flatten()) {
+            a.th.t_coil = a.th.t_coil.max(b.th.t_coil);
+            a.th.t_magnet = a.th.t_magnet.max(b.th.t_magnet);
+            a.coil_hyst = a.coil_hyst.max(b.coil_hyst);
+            a.magnet_hyst = a.magnet_hyst.max(b.magnet_hyst);
+            a.coil_peak = a.coil_peak.max(b.coil_peak);
+            a.magnet_peak = a.magnet_peak.max(b.magnet_peak);
+            a.gain = a.gain.min(b.gain);
+            a.hard |= b.hard;
+        }
+        for (a, b) in self.unified.iter_mut().flatten().zip(o.unified.iter().flatten()) {
+            a.ff.t_coil = a.ff.t_coil.max(b.ff.t_coil);
+            a.ff.t_magnet = a.ff.t_magnet.max(b.ff.t_magnet);
+            if let (Some(x), Some(y)) = (a.vi.as_mut(), b.vi.as_ref()) {
+                x.t_coil = x.t_coil.max(y.t_coil);
+                x.t_magnet = x.t_magnet.max(y.t_magnet);
+            }
+            a.peak = a.peak.max(b.peak);
+            a.reduction = a.reduction.max(b.reduction);
+            a.hard |= b.hard;
+        }
+    }
+
+    /// Raise the restored temperatures to the extrema over every allowed
+    /// age. `hold` includes interior coil extrema, also for equal taus.
+    /// Keep the longest-age full-scale history already installed in self.
+    pub fn bound_resume_interval(&mut self, saved: &crate::state::Saved, lo: std::time::Duration, hi: std::time::Duration) {
+        let mut low = Engine::new(&self.cfg, self.unified.is_some()).unwrap();
+        let g = self.cfg.globals.clone();
+        crate::state::restore_engine(&mut low, saved, lo, &g);
+        let span = (hi - lo).as_secs_f64();
+        for s in low.asahi.iter_mut().flatten() {
+            s.worst(g.safe_reduction, span, g.t_ambient);
+            s.th.t_coil = s.th.t_coil.max(s.coil_peak);
+            s.th.t_magnet = s.th.t_magnet.max(s.magnet_peak);
+            s.coil_hyst = s.coil_hyst.max(s.th.t_coil);
+            s.magnet_hyst = s.magnet_hyst.max(s.th.t_magnet);
+        }
+        for s in low.unified.iter_mut().flatten() {
+            let factor = 10f64.powf(-g.safe_reduction.max(0.0) / 10.0);
+            let power = s.v_worst * s.v_worst * factor;
+            let (c, m) = s.ff.hold(power / s.r_ff, span, g.t_ambient);
+            s.ff.t_coil = c;
+            s.ff.t_magnet = m;
+            s.peak = crate::engine::hi(s.peak, c.max(m));
+            if let Some(v) = s.vi.as_mut() {
+                let (c, m) = v.hold(power / s.z_min, span, g.t_ambient);
+                v.t_coil = c;
+                v.t_magnet = m;
+                s.peak = crate::engine::hi(s.peak, c.max(m));
+            }
+            s.hard |= s.peak >= s.t_limit;
+        }
+        self.raise_to(&low);
+        let eps = crate::state::RECORD_TEMP_EPS;
+        for a in self.asahi.iter_mut().flatten() {
+            a.th.t_coil += eps;
+            a.th.t_magnet += eps;
+            a.coil_peak = a.th.t_coil.max(a.coil_peak + eps);
+            a.magnet_peak = a.th.t_magnet.max(a.magnet_peak + eps);
+            a.coil_hyst = a.th.t_coil.max(a.coil_hyst + eps);
+            a.magnet_hyst = a.th.t_magnet.max(a.magnet_hyst + eps);
+            a.hard |= a.coil_peak.max(a.magnet_peak) >= a.t_limit;
+        }
+        for u in self.unified.iter_mut().flatten() {
+            u.ff.t_coil += eps;
+            u.ff.t_magnet += eps;
+            if let Some(v) = u.vi.as_mut() {
+                v.t_coil += eps;
+                v.t_magnet += eps;
+            }
+            u.peak += eps;
+            u.hard |= u.peak >= u.t_limit;
+        }
     }
 
     pub fn has(&self, gov: Governor) -> bool {
@@ -1409,7 +1557,10 @@ impl Engine {
                         self.low_bound[sk] = false;
                         self.low[sk] = false;
                         self.low_held[sk] = 0.0;
-                        self.low_set_bound[sk] = f64::INFINITY;
+                        // Recovery proves the current line reads again. It
+                        // does not undo the heat charged while it was
+                        // bounded. Keep that episode's reference so this
+                        // model's extra heat cannot hide a recurring fault.
                     }
                 }
                 waiting |= self.low_bound[sk];
@@ -1420,21 +1571,23 @@ impl Engine {
             for f in 0..frames {
                 let wv = words[f * ch + s.vs_chan] as f64;
                 let wi = s.is_chan.map_or(0.0, |ic| words[f * ch + ic] as f64);
-                v2.push((wv * vs).powi(2));
-                vi.push(if bounded { (wv * vs).powi(2) / z_min } else { sense_power(wv, wi, (vs, is), i_max) });
+                let clipped = voltage_clipped(wv, vs, v_worst(s, &g));
+                let v_squared = if clipped { v_worst(s, &g).powi(2) } else { (wv * vs).powi(2) };
+                v2.push(v_squared);
+                vi.push(if clipped || bounded { v_squared / z_min } else { sense_power(wv, wi, (vs, is), i_max) });
                 if let Some(u) = unified {
                     let room = if wv != 0.0 { 20.0 * (2147483648.0 / wv.abs()).log10() } else { f64::INFINITY };
                     let at = converted_at(room, &possible[sk]);
                     let wide = possible[sk].iter().any(|r| r.0 <= room && r.1 - r.0 > PREDICT_SPREAD_DB);
                     known.push(at <= PREDICT_MAX_DB && !wide);
                     let gain = 10f64.powf(at / 10.0);
-                    let vup = (wv.abs() + 1.0) * vs;
+                    let vup = if clipped { v_worst(s, &g) } else { (wv.abs() + 1.0) * vs };
                     let iup = (wi.abs() + 1.0) * is;
                     let full_ff = u.v_worst * u.v_worst / u.r_ff;
                     let full_vi = u.v_worst * u.v_worst / u.z_min;
                     pre_ff.push((vup * vup / u.r_ff * gain).min(full_ff));
                     let up = if wi.abs() >= I_RAIL { (vup * iup).max(vup * i_max) } else { vup * iup };
-                    pre_vi.push(if bounded {
+                    pre_vi.push(if clipped || bounded {
                         (vup * vup / z_min * gain).min(full_vi)
                     } else if wv * wi > 0.0 || wi.abs() >= I_RAIL {
                         (up * gain).min(full_vi)
@@ -1663,55 +1816,11 @@ impl Engine {
                         models.push((&u.ff, u.v_worst.powi(2) / u.r_ff));
                     }
                 }
-                let target = s.t_limit - s.t_headroom;
-                let old = 10f64.powf(-pending[k].max(0.0) / 10.0);
-                let safe = 10f64.powf(-g.safe_reduction.max(0.0) / 10.0);
-                let fits = |gain: f64| {
-                    models.iter().all(|(th, full)| {
-                        let mut th = (*th).clone();
-                        // Idle can warm a coil below its magnet. This
-                        // envelope covers every idle delay before the dose,
-                        // including small below-ambient sense estimates.
-                        th.t_magnet = hi(th.t_magnet, g.t_ambient);
-                        th.t_coil = hi(th.t_coil, th.t_magnet);
-                        // Each joule adds at most impulse's node increments,
-                        // wherever it lands among the lease's idle gaps.
-                        let energy = full * (old.max(gain) * pending_s + gain * lease_s);
-                        let (c, m) = th.impulse(energy);
-                        if !(c < target && m < target) {
-                            return false;
-                        }
-                        let power = full * safe;
-                        let steady = g.t_ambient + power * (th.tr_coil + th.tr_magnet);
-                        // Infinity is only the extremum search's upper endpoint;
-                        // no infinite duration is integrated (equal taus included).
-                        let peak = hi(
-                            hi(th.t_coil, steady),
-                            th.coil_extremum(power, f64::INFINITY, g.t_ambient),
-                        );
-                        peak < target && th.t_magnet < target
-                    })
-                };
-                if fits(1.0) {
-                    return 0.0;
-                }
-                if !fits(0.0) {
-                    return NOTHING_DB;
-                }
-                let (mut lo, mut hi) = (0.0, 1.0);
-                for _ in 0..32 {
-                    let mid = (lo + hi) / 2.0;
-                    if fits(mid) {
-                        lo = mid;
-                    } else {
-                        hi = mid;
-                    }
-                }
-                if lo > 0.0 {
-                    (-db(lo)).max(0.0)
-                } else {
-                    NOTHING_DB
-                }
+                onset_reduction(
+                    &models, s.t_limit - s.t_headroom, g.t_ambient,
+                    10f64.powf(-g.safe_reduction.max(0.0) / 10.0),
+                    10f64.powf(-pending[k].max(0.0) / 10.0), pending_s, lease_s,
+                )
             })
             .collect();
         link(&self.cfg, &own)
@@ -3077,6 +3186,82 @@ mod tests {
         assert!(rounded(db[lw1]) >= 0.5, "asked {} dB", db[lw1]);
     }
 
+    /// Recovery clears the fault, not the reference that detected it. A
+    /// second fault must be judged the same way even if bounded accounting
+    /// has since heated the protective model.
+    #[test]
+    fn recovery_rearms_the_low_line_without_raising_its_reference() {
+        let c = cfg(J316);
+        let (ch, p) = (c.globals.channels, c.globals.period);
+        let possible = vec![vec![(0.0, 0.0)]; c.speakers.len()];
+        let mut e = Engine::new(&c, true).unwrap();
+        set_asahi(&mut e, 59.0, 59.0);
+        e.govern(0.0, false);
+        let mut sample = 0;
+        let mut play = |e: &mut Engine, ratio: f64, periods: usize, temperature: f64| {
+            for _ in 0..periods {
+                let mut words = vec![0; p * ch];
+                let word = |x: f64, scale: f64| ((x / scale * 32768.0).round() as i32) << 16;
+                for f in 0..p {
+                    let v = 3.0 * (2.0 * std::f64::consts::PI * 60.0 * (sample + f) as f64 / 48000.0).sin();
+                    for s in &c.speakers {
+                        words[f * ch + s.vs_chan] = word(v, s.vs_scale);
+                        words[f * ch + s.is_chan.unwrap()] = word(v * ratio / (1.2 * s.z_min()), s.is_scale);
+                    }
+                }
+                sample += p;
+                set_asahi(e, temperature, temperature);
+                e.check(&words, 48000.0).unwrap();
+                e.measured(&words, p, p, p, 0, 1.0 / 48000.0, 1.0, &possible);
+            }
+        };
+        play(&mut e, 0.65, 40, 59.0);
+        assert!(e.low.iter().all(|x| *x));
+        play(&mut e, 1.0, 180, 120.0);
+        assert!(e.low.iter().all(|x| !x) && e.bounded.iter().all(|x| !x), "healthy bass must clear the first fault");
+        play(&mut e, 0.65, 180, 120.0);
+        assert!(e.low.iter().all(|x| *x) && e.bounded.iter().all(|x| *x), "the same line fault must be protected again");
+    }
+
+    /// Four judged 10 ms blocks just inside the block ratio gate, then
+    /// quiet blocks below its voltage floor. The aggregate ratio gate is
+    /// closed, while the deployed PF gate still protects this S16 period.
+    #[test]
+    fn cold_burst_then_quiet_keeps_the_deployed_pf_gate() {
+        let c = cfg(J316);
+        let (ch, p) = (c.globals.channels, c.globals.period);
+        let mut e = Engine::new(&c, true).unwrap();
+        set_asahi(&mut e, 50.0, 50.0);
+        e.govern(0.0, false);
+        let word = |x: f64, scale: f64| ((x / scale * 32767.0).round().clamp(-32768.0, 32767.0) as i32) << 16;
+        let mut words = vec![0; p * ch];
+        for s in &c.speakers {
+            let dc = word(0.03, s.is_scale);
+            let current = dc as f64 * s.is_scale / 2147483648.0;
+            let burst = current * DEAD_RATIO * s.z_nominal * 0.999;
+            for f in 0..p {
+                let rms = if f < 1920 { burst } else { 0.099 };
+                let v = rms * 2f64.sqrt() * (2.0 * std::f64::consts::PI * 1000.0 * f as f64 / 48000.0).sin();
+                words[f * ch + s.vs_chan] = word(v, s.vs_scale);
+                words[f * ch + s.is_chan.unwrap()] = if f < 1920 { dc } else { 0 };
+            }
+            let voltage: Vec<_> = (0..p).map(|f| words[f * ch + s.vs_chan] as f64 * s.vs_scale / 2147483648.0).collect();
+            let current: Vec<_> = (0..p).map(|f| words[f * ch + s.is_chan.unwrap()] as f64 * s.is_scale / 2147483648.0).collect();
+            let (lost, judged) = line_lost(&voltage, &current, s.z_nominal, 1.0 / 48000.0);
+            assert!(judged && !lost, "the block detector must accept this fixture");
+        }
+        e.check(&words, 48000.0).unwrap();
+        for (f, s) in e.last.iter().zip(&c.speakers) {
+            let i_ms = f.i_ms.unwrap();
+            assert!(f.v_ms >= PF_BASE_V.powi(2) && i_ms >= PF_BASE_I.powi(2));
+            assert!(i_ms * (DEAD_RATIO * s.z_nominal).powi(2) < f.v_ms, "the aggregate ratio gate must be closed");
+            assert!(f.vi.unwrap() < PF_MIN * (f.v_ms * i_ms).sqrt());
+        }
+        let possible = vec![vec![(0.0, 0.0)]; c.speakers.len()];
+        e.measured(&words, p, p, p, 0, 1.0 / 48000.0, 1.0, &possible);
+        assert!(e.bounded.iter().all(|x| *x), "the deployed PF gate must bound this cold burst");
+    }
+
     /// The power-factor test's voltage gate: the M2's right woofer read
     /// 0.10 V rms against 25 mA with the current near a right angle to the
     /// voltage (a power factor of -0.015 to 0.014) for four periods of a
@@ -3255,4 +3440,37 @@ mod tests {
         }
     }
 
+}
+
+#[cfg(test)]
+mod amplifier_rail_tests {
+    use super::*;
+    #[test]
+    fn both_models_bound_a_voltage_rail_below_the_amplifier_cap() {
+        let mut cfg = Config::parse(include_str!("../conf/apple/j274.conf")).unwrap();
+        cfg.globals.governor = Governor::Unified;
+        cfg.globals.guard = Some(Governor::Asahi);
+        let mut engine = Engine::new(&cfg, true).unwrap();
+        let mut words = vec![0; cfg.globals.period * cfg.globals.channels];
+        for frame in words.chunks_exact_mut(cfg.globals.channels) {
+            for speaker in &cfg.speakers { frame[speaker.vs_chan] = 32767 << 16; }
+        }
+        let dt = cfg.globals.period as f64 / 48000.0;
+        let possible = vec![vec![(0.0, 0.0)]; cfg.speakers.len()];
+        engine.measured(&words, cfg.globals.period, cfg.globals.period, cfg.globals.period, 0, 1.0 / 48000.0, 1.0, &possible);
+        for (k, speaker) in cfg.speakers.iter().enumerate() {
+            let v = v_worst(speaker, &cfg.globals);
+            assert!(v > speaker.vs_scale, "the witness needs a real voltage rail");
+            let mut ff = Thermal::new(speaker.tr_coil, speaker.tau_coil, speaker.tr_magnet, speaker.tau_magnet, cfg.globals.t_ambient);
+            let mut vi = Thermal::new(speaker.vi_tr_coil, speaker.vi_tau_coil, speaker.vi_tr_magnet, speaker.vi_tau_magnet, cfg.globals.t_ambient);
+            ff.hold(v * v / speaker.r_ff, dt, cfg.globals.t_ambient);
+            vi.hold(v * v / speaker.z_min(), dt, cfg.globals.t_ambient);
+            let a = &engine.asahi.as_ref().unwrap()[k].th;
+            let u = &engine.unified.as_ref().unwrap()[k];
+            // Independent integration orders differ by a few picokelvin.
+            const EPS: f64 = 1e-9;
+            assert!(a.t_coil + EPS >= vi.t_coil && a.t_magnet + EPS >= vi.t_magnet, "V/I {a:?} under {vi:?}");
+            assert!(u.ff.t_coil + EPS >= ff.t_coil && u.ff.t_magnet + EPS >= ff.t_magnet, "FF {:?} under {ff:?}", u.ff);
+        }
+    }
 }
