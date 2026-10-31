@@ -55,7 +55,7 @@ Dashed edges describe semantic absorption, not rewritten Git ancestry. Direct me
 
 ## Conflict decisions
 
-* #8 versus main: Cargo identity stays on the newer release line; the V/I-aware guard is used. Mainline J700 queue-threat checks, floor, safe-level verification, resident memory and latency counters are retained by integration fixes. Its independent J700 harness and focused queue/floor witnesses remain in the candidate.
+* #8 versus main: Cargo identity stays on the newer release line; the V/I-aware guard is used. Mainline J700 configured ordinary-demand hand-off limit and re-arm margin, queue-threat checks, floor, safe-level verification, resident memory and latency counters are retained by integration fixes. Its independent J700 harness and focused queue/floor witnesses remain in the candidate.
 * #9, #12, #15, #21 and #25 merge without textual conflict after #8 resolution. Mainline model changes remain alongside the later hot-node and resistance repairs.
 * #24 overlaps Makefile, README, three profiles, service, config, engine, guard, main, state and recording helpers. The #25 ring/preservation code and #11/#15/#20 startup implementation win. No assumed cross-OS cooling, marker-only ownership proof, shortened onset dose, new suspend hook or device-specific deployment packaging is introduced.
 

@@ -2228,6 +2228,11 @@ impl Guard {
                 Some(format!("no complete sense data for {} ms", blind.as_millis()))
             } else if hard {
                 Some("a coil may have reached its limit".to_string())
+            } else if !self.playback_cfg.has_vi() && reduction >= self.max_reduction {
+                // Main's J700 policy remains stricter than the V/I smooth
+                // range policy: the onset floor is additional attenuation,
+                // but ordinary governor demand still hands off at -m.
+                Some(format!("the J700 model asks for {reduction:.1} dB"))
             } else if !self.playback_cfg.has_vi() && self.queue_threat(now).is_some() {
                 let (k, peak, rule) = self.queue_threat(now).unwrap();
                 self.fresh = 0;
@@ -2242,7 +2247,9 @@ impl Guard {
             if let Some(why) = why {
                 self.disarm(hw, &why)?;
             }
-        } else if !self.stopping && !self.unknown && !hard && onset_ready && range_ready && self.events && (!renew_now || self.playback.is_some()) && !self.recovering {
+        } else if !self.stopping && !self.unknown && !hard && onset_ready && range_ready && self.events
+            && (self.playback_cfg.has_vi() || reduction < self.max_reduction - REARM_MARGIN_DB)
+            && (!renew_now || self.playback.is_some()) && !self.recovering {
             // after bad sense data, REARM_PERIODS valid periods in a row
             // first, idle or not (review P8-2)
             // A qualified finite grant already bounds unseen playback. A

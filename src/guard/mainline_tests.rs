@@ -232,3 +232,34 @@ fn recent_programme_power_is_observed_and_cleared_on_close() {
     super::tests::run_until(&mut g, &mut hw, secs(3.0)).unwrap();
     assert!(g.speakers.iter().all(|s| s.p_recent == 0.0));
 }
+
+/// The full V/I smoothing stack must not silently remove main's J700
+/// configured hand-off policy. The queue and onset bounds alone permit
+/// this state, so only the ordinary-demand limit hands it back.
+#[test]
+fn j700_keeps_the_configured_governor_handoff_limit() {
+    let cfg = j700();
+    let mut hw = FakeHw::new(2, 4096);
+    let mut g = Guard::start(&mut hw, &cfg, 4.0, tmp_state()).unwrap();
+    let now = hw.now();
+    g.armed = true;
+    g.armed_at = Some(now);
+    g.last_ping = now;
+    g.rate = 48000;
+    g.written = vec![10.0; 2];
+    g.written_hi = g.written.clone();
+    g.written_set = vec![vec![(10.0, 10.0)]; 2];
+    g.gains = vec![Gain { at: now, lo: vec![10.0; 2], hi: vec![10.0; 2],
+        kernel: false, cands: vec![vec![(10.0, 10.0)]; 2] }];
+    for s in &mut g.speakers {
+        s.resume(110.0, 70.0, 0.0, 0.0);
+        s.govern(&cfg.globals);
+    }
+    let (demand, mut per, hard) = g.governing_state();
+    assert!(demand > 4.0 && !hard);
+    assert!(g.bound_onset(now, &mut per));
+    assert!(g.queue_threat(now).is_none());
+    g.decide(&mut hw, false).unwrap();
+    assert!(!g.armed(), "ordinary J700 demand bypassed its configured hand-off limit");
+    assert_eq!(hw.relinquished, 1);
+}
