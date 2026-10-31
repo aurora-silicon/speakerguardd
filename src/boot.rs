@@ -23,8 +23,11 @@
 //! card's safe level only when no daemon can have unlocked the card since
 //! the kernel started.  The absence of the /run state alone does not show
 //! that (it can be lost, or never written).  So, before the first unlock
-//! of every boot, a daemon writes a marker next to the /run state carrying
-//! the boot id (`MARKER_NAME`), durably, and never removes it; and with a
+//! of every boot, a daemon writes a marker beside the /run state's
+//! directory carrying the boot id (`marker_path`: /run/speakerguardd.unlocked,
+//! outside the unit's RuntimeDirectory, so neither `systemctl clean
+//! --what=runtime` nor removing /run/speakerguardd takes it), durably, and
+//! never removes it; and with a
 //! record for the next boot configured it unlocks only once its /run state
 //! is written (no removal counts instead).  A start that finds the marker
 //! from this boot (or any marker it cannot read) starts latched.  So does
@@ -54,6 +57,9 @@
 //!   under this start on both nodes for every macOS play length (10 s to
 //!   1000 s); only with 10 s + 5 s gaps is the magnet 2.4 K over, and
 //!   there macOS itself had already taken the true coil to 149-164 C.
+//! - A daemon without the marker (0.1.12 before it) that ran earlier in the
+//!   same boot and fell back to removing its /run state looks like no
+//!   daemon at all.  Replace the binary only across a reboot.
 //!
 //! **The magnet bound.**  With the two-node model (the coil follows the
 //! magnet plus `P Rc` with `tau_c`, the magnet follows ambient plus `P Rm`
@@ -244,9 +250,19 @@ pub fn chassis_temperature(hwmon: &Path) -> Option<f64> {
     best
 }
 
-/// The marker a daemon writes next to its /run state before the first
-/// unlock of a boot, and never removes (see the module comment).
+/// The marker a daemon writes before the first unlock of a boot, and
+/// never removes (see the module comment): beside the /run state's
+/// directory, named after it (`/run/speakerguardd/state` gives
+/// `/run/speakerguardd.unlocked`), or next to a state with no directory.
 pub const MARKER_NAME: &str = "unlocked";
+
+pub fn marker_path(state: &Path) -> std::path::PathBuf {
+    let dir = state.parent().filter(|d| !d.as_os_str().is_empty());
+    match (dir.and_then(Path::parent).filter(|g| !g.as_os_str().is_empty()), dir.and_then(Path::file_name)) {
+        (Some(up), Some(name)) => up.join(format!("{}.{MARKER_NAME}", name.to_string_lossy())),
+        _ => state.with_file_name(MARKER_NAME),
+    }
+}
 
 /// The marker's text: the boot id, or `unknown`.
 pub fn marker_text(now: &Stamp) -> String {

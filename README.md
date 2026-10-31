@@ -818,6 +818,15 @@ Keep the unit's `RuntimeDirectory=speakerguardd` and
 `/run/speakerguardd` for its model state and keep it across restarts.  A unit
 without them leaves the state unwritten, and every restart starts cold.
 
+The first start of a boot starts from evidence (`src/boot.rs`) rather than
+latched at the coils' limit.  Before its first unlock of a boot the daemon
+writes `/run/speakerguardd.unlocked` (the boot id), beside the
+RuntimeDirectory rather than in it, so cleaning or removing
+`/run/speakerguardd` cannot make a later start of the boot look like the
+first.  The daemon needs `/run` writable for it, or it never takes the
+lock.  Replace the binary only across a reboot: an older build without the
+marker that ran earlier in the same boot can look like no daemon at all.
+
 The PCM udev event and `multi-user.target` can both precede ALSA card
 discovery. The daemon retries a missing card for up to 30 seconds, using a
 monotonic deadline and 100 ms polling, before returning the discovery error.
