@@ -160,7 +160,7 @@ def profile_rows():
 
 
 if __name__ == '__main__':
-    print(json.dumps(dict(scope='No stronger universal bound from the existing bounded-current premises; '
+    print(json.dumps(dict(scope='No gate-closing PCM-only universal bound from the existing bounded-current premises; '
                          'does not rule out a future independently qualified physical contract.',
                          witness_checks=verify_witnesses(),
                          conditional_passivity=verify_conditional_passivity(), rows=profile_rows()), indent=2))
