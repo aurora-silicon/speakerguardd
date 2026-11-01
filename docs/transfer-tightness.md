@@ -1,8 +1,8 @@
 # Why PCM statistics cannot tighten the bounded-current contract
 
-The existing reference premises do not imply a tighter energy contract that
-can close both listening assertions. This is a universal-contract
-infeasibility result. It does **not** prove that the actual loudspeakers lack
+No PCM-only universal energy bound derived from the existing reference
+premises can close both listening assertions. This is an infeasibility
+result for that contract class. It does **not** prove that the actual loudspeakers lack
 a tighter physical transfer. Identifying and qualifying that narrower plant
 class would require an additional premise; it cannot be inferred from PCM
 statistics or successful finite replays. No production certificate is enabled.
@@ -81,6 +81,14 @@ observer after verified observations, with all timing/fault rules retained;
 it does not prove a smaller universal queued-energy contract. A new bound
 would need an enforced physical restriction or an authenticated certificate
 covering that continuation and every transition.
+
+This argument does not rule out separately authenticated upper bounds on
+completed physical energy refining already-spent heat. That would require
+a measurement error bound valid through under-reading/dead sense faults
+and timing gaps, beyond the bounded-current premise proved here. Quiet
+observations alone do not establish it. Queued and residual debt must
+remain protected. No such refinement or measurement certificate is
+implemented or qualified by this work.
 
 The official [TAS2764 datasheet, section 8.4.2.1](https://www.ti.com/lit/ds/symlink/tas2764.pdf)
 and [TAS2770 datasheet, section 8.4.3.1](https://www.ti.com/lit/ds/symlink/tas2770.pdf)
