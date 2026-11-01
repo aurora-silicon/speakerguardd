@@ -5,6 +5,12 @@ certificate. No TAS2764, TAS2770 or AOP route is enabled by this document.
 The examples below are newly authored mathematical systems, not models of
 those devices. Keep the existing safe caps until all obligations are met.
 
+The [bounded-current tightness proof](transfer-tightness.md) shows why input
+bands, crest factor and finite observations alone cannot establish a smaller
+universal supply bound from the retained premises. It includes reproducible
+necessary-dose obstructions for both listening assertions; it does not rule
+out a future independently qualified physical transfer.
+
 ## A bound that composes with the ledger
 
 Let `x[n]` be the **delivered private-copy words**, normalized by their actual
