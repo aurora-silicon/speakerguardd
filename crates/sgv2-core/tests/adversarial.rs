@@ -2072,7 +2072,6 @@ impl FailSafeUnit for Box<dyn ProtectionUnit> {
 /// slicings; on x86_64 the scalar sums happen to agree here. A `LaneAcc`
 /// window accumulator, as the model meters use, would make it invariant.
 #[test]
-#[ignore = "FINDING 16 (lane B): closed-loop window sums depend on host slicing (aarch64)"]
 fn spp3_closed_loop_is_slice_invariant() {
     let p = spp3_cl();
     let x = signal(31, 1, 48_000 * 4, 0.7, Hostility::Clean);

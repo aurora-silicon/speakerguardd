@@ -500,7 +500,7 @@ impl ChannelParams {
         if !(pos(self.temp_sense_window_time_s)
             && pos(self.temp_sense_smoothing_tau_s)
             && pos(self.tlim_err_decay_time_s)
-            && self.temp_sense_window_time_s <= 60.0)
+            && self.temp_sense_window_time_s <= 2.0)
         {
             return Err(InitError::Invalid("closed-loop times"));
         }
@@ -576,8 +576,10 @@ impl Thermal {
 struct Cl {
     window: usize,
     n: usize,
-    v_sq: f64,
-    i_sq: f64,
+    /// Window sums of V^2 and I^2, lane-keyed by the frame's position in
+    /// the window so they are bit-identical however the host slices.
+    v_sq: dsp::LaneAcc,
+    i_sq: dsp::LaneAcc,
     v_scale2: f64,
     i_scale2: f64,
     v_floor: f64,
@@ -631,8 +633,8 @@ impl Cl {
         Some(Cl {
             window,
             n: 0,
-            v_sq: 0.0,
-            i_sq: 0.0,
+            v_sq: dsp::LaneAcc::new(),
+            i_sq: dsp::LaneAcc::new(),
             v_scale2: vs * vs,
             i_scale2: is * is,
             v_floor: c.v_pwr_thres as f64,
@@ -665,8 +667,8 @@ impl Cl {
 
     fn reset(&mut self, limit: f64) {
         self.n = 0;
-        self.v_sq = 0.0;
-        self.i_sq = 0.0;
+        self.v_sq.clear();
+        self.i_sq.clear();
         self.r_s = Some(self.cal_r / self.rdc_scale.max(f64::MIN_POSITIVE));
         self.accepted = None;
         self.valid = false;
@@ -679,8 +681,8 @@ impl Cl {
     /// its partial sums are discarded (spec 7).
     fn lose(&mut self) {
         self.n = 0;
-        self.v_sq = 0.0;
-        self.i_sq = 0.0;
+        self.v_sq.clear();
+        self.i_sq.clear();
         self.accepted = None;
         self.valid = false;
     }
@@ -692,17 +694,17 @@ impl Cl {
         let mut k = 0;
         while k < i.len() {
             let m = (self.window - self.n).min(i.len() - k);
-            self.v_sq += dsp::sum_sq(&v[k..k + m]);
-            self.i_sq += dsp::sum_sq(&i[k..k + m]);
+            self.v_sq.add_sq(&v[k..k + m], self.n);
+            self.i_sq.add_sq(&i[k..k + m], self.n);
             self.n += m;
             k += m;
             if self.n == self.window {
                 let nn = self.window as f64;
-                let v_ms = self.v_sq * self.v_scale2 / nn;
-                let i_ms = self.i_sq * self.i_scale2 / nn;
+                let v_ms = self.v_sq.total() * self.v_scale2 / nn;
+                let i_ms = self.i_sq.total() * self.i_scale2 / nn;
                 self.n = 0;
-                self.v_sq = 0.0;
-                self.i_sq = 0.0;
+                self.v_sq.clear();
+                self.i_sq.clear();
                 if v_ms.is_finite() && i_ms.is_finite() && v_ms > self.v_floor && i_ms > self.i_floor {
                     let r = libm::sqrt(v_ms / i_ms);
                     let rs = match self.r_s {
