@@ -26,14 +26,14 @@
 //! - **Smoothing.** Toward the request with the slot's attack (down) or
 //!   release (up) time, as 99 %-settling times:
 //!   `a = 1 - exp(ln(0.01) / (t * rate))`, per sample.
-//! - **Output.** `y = x * min(1, g * d)`, where `d` is the output dezipper
+//! - **Output.** `y = clamp(x * g * d, -1, 1)`, where `d` is the output dezipper
 //!   (rig-confirmed, bit-exact): zero for the first 5 ms after
 //!   initialisation, then a Float32 RBJ low pass (20 Hz, Q 0.6513333,
 //!   transposed direct form II with fused multiply-adds) of a unit step. Its Float32 fixed point is the reference's "+0.052 dB
 //!   trim" (1.0060077 at 48 kHz, rate dependent): gain state, not a stage.
-//!   An `AudioUnitReset` does not restart it; silence advances it. The
-//!   engine never passes a sample above its input (review_bound), so the
-//!   overshoot and the trim are capped at unity. Zero latency.
+//!   An `AudioUnitReset` does not restart it; silence advances it. Its
+//!   trajectory passes as the reference's does, bounded at its own peak
+//!   ([`DEZIPPER_PEAK`]); the output is held to full scale. Zero latency.
 //! - **Bypass** (ID 0, at the next call): a bit-exact copy that freezes all
 //!   thermal, gain, link and startup state; clearing it resumes that state.
 //!
@@ -88,6 +88,10 @@ pub const NOMINAL_TRIM: f32 = 1.006_007_7;
 /// The output dezipper's low pass (rig-confirmed, bit-exact on 25G83): an
 /// RBJ low pass at exactly 20 Hz, Q 0.6513333.
 const DEZIPPER_HZ: f64 = 20.0;
+/// The dezipper's largest value on its startup step (rig: 1.02834 at
+/// 48 kHz, 1886 samples after unmute): the most the engine's atsp gain can
+/// be above unity.
+pub const DEZIPPER_PEAK: f32 = 1.028_35;
 const DEZIPPER_Q: f64 = 0.651_333_3;
 /// Silence after initialisation (spec 5; 240 frames at 48 kHz).
 pub const STARTUP_MUTE_S: f64 = 0.005;
@@ -344,7 +348,7 @@ impl Unit {
     pub fn bypassed(&self) -> bool {
         self.bypass
     }
-    /// The startup dezipper's current value (before the unity cap).
+    /// The startup dezipper's current value.
     pub fn dezipper_gain(&self) -> f32 {
         self.run.as_ref().map_or(0.0, |r| r.dez_now)
     }
@@ -497,15 +501,17 @@ impl Run {
                 let x = crate::dsp::bound1(raw) as f64;
                 let xm = crate::dsp::meter1(raw) as f64;
                 // never above the input (review_bound): the dezipper's
-                // overshoot and fixed point are capped at unity
-                // the panic is immediate (the 25G83 gain is down 20 dB within
-                // about 50 ms whatever the attack): at most 0.1 at once
-                // (linked like the requests; after the dezipper, so its
-                // overshoot cannot lift the cap)
+                // The dezipper's own trajectory passes as the reference's
+                // does (its 1.0283 overshoot and its +0.052 dB fixed point:
+                // the thermal model sees the same drive), bounded at its
+                // peak; the output is held to full scale. The panic is
+                // immediate (the 25G83 gain is down 20 dB within about 50 ms
+                // whatever the attack): at most 0.1 at once, linked like the
+                // requests and after the dezipper.
                 let g = ch.gain * d;
-                let g = if g.is_finite() { g.clamp(0.0, 1.0) } else { 0.0 };
+                let g = if g.is_finite() { g.clamp(0.0, DEZIPPER_PEAK as f64) } else { 0.0 };
                 let g = if pan[c] { g.min(PANIC_GAIN) } else { g };
-                io.output[c][k] = (x * g) as f32;
+                io.output[c][k] = ((x * g) as f32).clamp(-1.0, 1.0);
                 ch.p_drive += ch.a_attack * (ch.elec * xm * xm - ch.p_drive);
                 let u = ch.gain * xm;
                 let p = ch.elec * u * u;

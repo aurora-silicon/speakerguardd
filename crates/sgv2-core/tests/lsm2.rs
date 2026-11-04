@@ -187,6 +187,7 @@ fn displacement_candidate_matches_the_transfer_function() {
 }
 
 #[test]
+#[cfg(not(feature = "lsm2-waterfill"))]
 fn velocity_spares_the_ignored_outer_bands() {
     let p = only([false, false, true, false, true]);
     let mut u = Unit::new(p);

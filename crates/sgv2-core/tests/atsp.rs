@@ -171,9 +171,12 @@ fn startup_mute_then_unity() {
     u.process(Io { frames: n, input: &i, sense: &[], output: &mut o });
     assert!(outs[0][..240].iter().all(|&y| y == 0.0));
     assert!(outs[0][241] > 0.0);
-    // the reference's +0.052 dB trim is capped at unity: never above input
-    assert!(outs[0].iter().all(|&y| y <= 0.01));
-    assert_eq!(outs[0][n - 1], 0.01);
+    // the dezipper passes as the reference's: up to its 1.0283 overshoot,
+    // settling at its +0.052 dB fixed point
+    let peak = sgv2_core::atsp::DEZIPPER_PEAK;
+    assert!(outs[0].iter().all(|&y| y <= 0.01 * peak));
+    assert!(outs[0].iter().any(|&y| y > 0.0102));
+    assert!((outs[0][n - 1] / 0.01 - sgv2_core::atsp::NOMINAL_TRIM).abs() < 1e-5, "{}", outs[0][n - 1] / 0.01);
 }
 
 #[test]

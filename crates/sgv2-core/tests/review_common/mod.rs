@@ -293,7 +293,12 @@ pub fn never_above_input_sensed(
                 if !x.is_finite() {
                     assert_eq!(y, 0.0, "{:?} block {b}: non-finite input passed", unit.kind());
                 } else {
-                    let bound = x.abs().min(1.0) * (1.0 + 1e-6);
+                    // atsp passes its startup dezipper as the reference does
+                    // (up to its own 1.0283 peak); the output stays within
+                    // full scale
+                    let over =
+                        if unit.kind() == sgv2_core::UnitKind::Atsp { sgv2_core::atsp::DEZIPPER_PEAK } else { 1.0 };
+                    let bound = (x.abs() * over).min(1.0) * (1.0 + 1e-6);
                     assert!(y.abs() <= bound, "{:?} block {b} ch {c} frame {k}: {y} from {x}", unit.kind());
                 }
             }

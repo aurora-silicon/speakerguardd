@@ -724,7 +724,8 @@ proptest! {
         prop_assert!(!u.is_failsafe());
         let x = signal(seed ^ 1, n, len, amp, h);
         let rr = render(&mut u, &x, None, &slices(sl), &mut no_sense, false);
-        check_bound(&x, &rr.out, 0, 1.0, "atsp");
+        // the dezipper passes up to its own peak, as the reference's does
+        check_bound(&x, &rr.out, 0, atsp::DEZIPPER_PEAK, "atsp");
         check_state_finite(&rr.tele[0].1, n, "atsp");
     }
 
@@ -1366,7 +1367,7 @@ fn load_and_probe(bytes: &[u8]) {
     }
     if let Ok(p) = atsp::Params::from_blob(bytes) {
         let mut u = atsp::Unit::new(p);
-        let g = if u.is_failsafe() { FAILSAFE_GAIN } else { 1.0 };
+        let g = if u.is_failsafe() { FAILSAFE_GAIN } else { atsp::DEZIPPER_PEAK };
         probe(&mut u, p.channels as usize, 0, g, "atsp blob", Hostility::Wild);
     }
 }

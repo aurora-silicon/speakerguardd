@@ -1209,9 +1209,9 @@ impl Run {
                 // a common share s so the band velocities sum to the limit:
                 // sum_k min(p_k, s) + sum_ignored p_k = Vlim, g_k = min(1, s/p_k)
                 let gv = waterfill(&c.pk_vel_band, c.vel_limit_now, c.ignore_low, c.ignore_high, c.vel_floor);
-                for k in 0..BANDS {
-                    let v = if self.ctl[2] && g_vel < 1.0 { gv[k] } else { 1.0 };
-                    c.band_target[k] = g_disp.min(v) as f32;
+                for (t, &g) in c.band_target.iter_mut().zip(&gv) {
+                    let v = if self.ctl[2] && g_vel < 1.0 { g } else { 1.0 };
+                    *t = g_disp.min(v) as f32;
                 }
                 c.pk_vel_band = [0.0; BANDS];
             }
