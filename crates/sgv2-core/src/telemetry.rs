@@ -112,7 +112,12 @@ pub struct Telemetry {
 
 impl Telemetry {
     pub const fn new() -> Self {
-        Self { frame: 0, health: Health::OK, channels: [ChannelState::ABSENT; MAX_CHANNELS], global: GlobalState::ABSENT }
+        Self {
+            frame: 0,
+            health: Health::OK,
+            channels: [ChannelState::ABSENT; MAX_CHANNELS],
+            global: GlobalState::ABSENT,
+        }
     }
     pub fn clear(&mut self) {
         *self = Self { frame: self.frame, ..Self::new() };

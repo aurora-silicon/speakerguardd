@@ -85,6 +85,60 @@ pub fn dot(a: &[f32], b: &[f32]) -> f64 {
     }
 }
 
+/// `sum a[n] * b[n]` in f32, sequential: the scalar reference of
+/// [`dot_f32`] (the lsm2 FIR banks).
+#[inline]
+pub fn dot_f32_scalar(a: &[f32], b: &[f32]) -> f32 {
+    let n = a.len().min(b.len());
+    let mut acc = 0.0f32;
+    for i in 0..n {
+        acc += a[i] * b[i];
+    }
+    acc
+}
+
+/// `sum a[n] * b[n]` in f32: the lsm2 FIR banks' kernel. On aarch64, NEON
+/// with four independent 4-lane FMA accumulators (16 products per
+/// iteration), the lanes summed pairwise at the end; elsewhere the scalar
+/// reference. The re-association changes only rounding: the difference
+/// from [`dot_f32_scalar`] is below `n * 2^-23 * sum |a[n] b[n]|` (tested
+/// at `2e-6` of that sum for the 319- and 1,024-tap banks).
+#[inline]
+pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
+    let n = a.len().min(b.len());
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: every access is below `n`, the shorter of the two slices.
+    unsafe {
+        let (pa, pb) = (a.as_ptr(), b.as_ptr());
+        let mut a0 = vdupq_n_f32(0.0);
+        let mut a1 = vdupq_n_f32(0.0);
+        let mut a2 = vdupq_n_f32(0.0);
+        let mut a3 = vdupq_n_f32(0.0);
+        let mut i = 0;
+        while i + 16 <= n {
+            a0 = vfmaq_f32(a0, vld1q_f32(pa.add(i)), vld1q_f32(pb.add(i)));
+            a1 = vfmaq_f32(a1, vld1q_f32(pa.add(i + 4)), vld1q_f32(pb.add(i + 4)));
+            a2 = vfmaq_f32(a2, vld1q_f32(pa.add(i + 8)), vld1q_f32(pb.add(i + 8)));
+            a3 = vfmaq_f32(a3, vld1q_f32(pa.add(i + 12)), vld1q_f32(pb.add(i + 12)));
+            i += 16;
+        }
+        while i + 4 <= n {
+            a0 = vfmaq_f32(a0, vld1q_f32(pa.add(i)), vld1q_f32(pb.add(i)));
+            i += 4;
+        }
+        let mut acc = vaddvq_f32(vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3)));
+        while i < n {
+            acc += *pa.add(i) * *pb.add(i);
+            i += 1;
+        }
+        acc
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        dot_f32_scalar(a, b)
+    }
+}
+
 /// Largest `|x[n]|`, NaN-propagating as "infinite" (a non-finite sample
 /// must never look quiet to a peak check).
 #[inline]

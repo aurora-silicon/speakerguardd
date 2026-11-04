@@ -1,98 +1,143 @@
 //! `lsm2`: signal-only loudspeaker model and five-axis constraint
 //! controller (MacBook Neo, MacBook Air M4/M5), from the behaviour
-//! specification. This is the model-only configuration the Neo ships
-//! (static model, system ID bypassed, no closed-loop temperature); a tuning
-//! that asks for the DSP estimator or closed-loop temperature is refused.
+//! specification (SPEC-LSM2 v1.1). This is the model-only configuration the
+//! Neo ships (static model, system ID bypassed, no closed-loop
+//! temperature); a tuning that asks for the DSP estimator or closed-loop
+//! temperature is refused.
 //!
-//! Implemented as specified:
-//! - **Latency.** Audio is delayed by two filterbank stages plus the speaker
-//!   response look-ahead (`2*FilterbankLatency + SpeakerResponseLookAhead`),
-//!   and the unit reports it. State persists across host calls of any size.
-//! - **Model.** Per channel `u = V_FS * x`, and stable digital realisations
-//!   (bilinear transform) of the one-resonator transfer functions
-//!   `I/U = 1/(R + Bl^2/Zm)`, `X/U = Bl/(R (Mms s^2 + Rms s + Kms) + Bl^2 s)`
-//!   and `V = sX`, with `R = Rdc + Rpar` and `Zm = Mms s + Rms + Kms/s`. The
-//!   current uses the admittance block's mechanics; displacement and
-//!   velocity use the displacement block's.
-//! - **Coil power and thermal model.** `Pcoil = i^2 Rdc` and the two-node
-//!   recurrence per sample: `Tvc += avc (Tmag + P Rth_vc - Tvc)`,
-//!   `Tmag += amag (Tamb + P Rth_mag - Tmag)`.
-//! - **Candidates**, linear in [0, 1], a disabled axis giving 1:
-//!   - sample peak and displacement: `min(1, limit / max|q|)`;
-//!   - power: four one-pole averages, `min(1, sqrt(budget_j / Pbar_j))`, the
-//!     minimum, floored at `-MaxPowerAttenuation`;
-//!   - velocity: `min(1, limit / max|v|)`, floored at
-//!     `-MaxVelocityAttenuation`;
-//!   - temperature: floored at `-MaxTemperatureAttenuation`.
-//! - **Combination.** Fast gain `min(peak, displacement, velocity)`, slow gain
-//!   `min(power, temperature)`, slow gains linked across channels when
-//!   `LinkSlowGainsAcrossChannels`; the applied gain is the minimum of the
-//!   smoothed fast and slow gains. Downward moves use `AttackTime`; recovery
-//!   uses `FastReleaseTime` (fast) and `SlowReleaseTime` (slow).
-//!   `EnableMitigation = 0` keeps the modelling and latency and attenuates
-//!   nothing on macOS; here it is refused (fail-safe), as is a tuning with
-//!   neither thermal axis (power or temperature) enabled: either would run
-//!   the speakers unprotected while health reports OK.
-//! - **Latency floor.** The controller decides every 256 frames over the
-//!   samples still in the delay line, so a latency below 256 frames lets a
-//!   transient leave before any decision has seen it; such a tuning is
-//!   refused. (The Neo's is 352.)
-//! - **Controller cadence.** Candidates update every 256 frames over the
-//!   samples still in the delay line (everything that has not yet left).
+//! Signal flow per channel, at the sample rate:
+//!
+//! ```text
+//! x ─┬─ five-band complementary FIR bank (319 taps, centred) ─ c[k] ─┬─ look-ahead ─ Σ g[k]·c[k] ─ × min(gpeak, gslow) ─ y
+//!    │                                                               └─ u[k]=Vfs·c[k] → x/v models → band candidates
+//!    ├─ |x| → sample-peak candidate
+//!    └─ pressure FIR → 8–12 kHz band → mask energy → velocity limit
+//! y ─ u=Vfs·y → current model → u·i → four power averages, two thermal nodes (the monitor)
+//! ```
+//!
+//! - **Latency** `2*FilterbankLatency + SpeakerResponseLookAhead` (352 frames
+//!   at 48 kHz): the FIR bank's centre (`FilterbankLatency - 1`, 159) plus
+//!   the look-ahead the controller acts in. With every gain at unity the
+//!   output is the input delayed exactly, bit for bit (spec 6.1: the bank is
+//!   bypassed). A latency below the 256-frame controller cadence is refused
+//!   (a transient could leave before any decision saw it).
+//! - **Filterbank** (spec 6.3): zero-phase Linkwitz-Riley low passes at the
+//!   geometric-mean crossovers, sampled on the design grid of twice the
+//!   filterbank latency (320 points at 48 kHz), successive differences of
+//!   the cumulative low passes, inverse real DFT, centred truncation to
+//!   `2*FilterbankLatency - 1` taps (319), generated in f64 and rounded once
+//!   to f32.
+//!   The fifth band is the delayed input minus the other four, so the bank
+//!   sums to the delay exactly.
+//! - **Candidates** every controller frame (256 frames, spec 10), linear in
+//!   [0, 1], a disabled axis giving 1, combined by `min`:
+//!   - sample peak: `min(1, AmplitudeLimit / max|x|)`;
+//!   - displacement and velocity: the models run on the program the bank
+//!     resynthesises, `min(1, limit / max|q|)`, applied as band gains:
+//!     displacement to every band, velocity (floored at
+//!     `-MaxVelocityAttenuation`) to every band but the outer ones when
+//!     `VelocityIgnoreLow/HighBand`; the velocity limit follows the masking
+//!     curve (spec 6.2);
+//!   - power: `max(-MaxPowerAttenuation, min_j sqrt(budget_j / Pbar_j))`,
+//!     the budgets the preset's or property 64008's, times
+//!     `PowerBudgetsScale`;
+//!   - temperature: the linear-in-dB knee of spec 6.1 on the coil
+//!     temperature.
+//!   - Slow gains (power, temperature) are linked across channels.
+//! - **Smoothing** per sample with the exponential one-pole (spec 6.1):
+//!   attack `AttackTime`; release `LowBandReleaseTime` (band 0),
+//!   `FastReleaseTime` (other bands, peak), `SlowReleaseTime` (slow).
+//! - **Monitor** (measured against the 25G83 controller logs, see the
+//!   TODO(SPEC) list): the power averages and the thermal model run on the
+//!   protected output. `Pamp = idle + ratio * max(mean32(u*i), 0) *
+//!   (Rdc+Rpar)/Rdc` every 32 frames into the four exponential averages;
+//!   the thermal input is `u*i` per sample, backward Euler, the coil node in
+//!   series on the magnet node: `Tvc = Tamb + theta_mag + theta_vc`.
 //!
 //! Full scale: the program is held to digital full scale (`clamp(x, -1,
-//! 1)`, a non-finite sample 0) before the model and on the output, so the
-//! model sees the drive the speaker can get and a huge finite sample cannot
-//! leave it hot for minutes. A model state that goes non-finite latches the
-//! 20 dB fail-safe (`Health::MODEL_FAULT`) until reset.
+//! 1)`, a non-finite sample 0) before the bank and every model, so a huge
+//! finite sample cannot leave the model hot for minutes. A model state that
+//! goes non-finite latches the 20 dB fail-safe (`Health::MODEL_FAULT`) until
+//! reset. `EnableMitigation = 0` (macOS: model only, no attenuation) and a
+//! tuning with neither thermal axis are refused: either would run the
+//! speakers unprotected while health reports OK.
 //!
 //! Hand-off: `save_state`/`restore_state` carry the coil and magnet rises,
 //! the four power averages and the slow gain to the next stream or
-//! instance, cooled for the gap (the continuous two-node solution; the
-//! averages decay toward idle) with the slow gain released toward unity.
-//! The reference resets on reinitialisation (spec 8); a speaker does not
-//! cool because a stream restarted, so here it never does.
+//! instance, cooled for the gap (the series nodes decay with their own
+//! constants; the averages toward idle) with the slow gain released toward
+//! unity. The reference resets on reinitialisation (spec 8); a speaker does
+//! not cool because a stream restarted, so here it never does.
 //!
 //! Failure: the reference unit fails initialisation outright when neither
 //! estimator can be built. Here an unusable parameter set, or a geometry
 //! mismatch, gives the 20 dB fail-safe, which on the Neo equals the
 //! kernel's own floor.
 //!
-//! TODO(SPEC), each a stand-in that is never less restrictive than the
-//! specification permits (spec 6.1), none a margin on a specified quantity:
-//! - **Filterbank.** The band split is not specified, so displacement and
-//!   velocity act broadband. A broadband gain at the band candidate's value
-//!   reduces every band at least as much as the band gain would.
-//!   `VelocityIgnoreLowBand/HighBand` therefore have no effect yet.
-//! - **Velocity masking.** The 8-12 kHz detector and knot curve are not
-//!   specified; the limit is the lowest knot, `VelocityLimit0` (unmasked).
-//! - **Temperature knee.** Not specified. The stand-in applies the full
-//!   `MaxTemperatureAttenuation` once the predicted coil temperature
-//!   (`Tvc + TemperatureHeadroom`) reaches the soft limit, unity below.
-//! - **One-pole convention** (`pole`): `exp(-1/(tau*rate))`, per sample.
-//! - **Amplifier input power.** The budgets apply to the low-rail affine
-//!   model `idle + ratio * max(0, u*i)`; whether the load term is `u*i` or
-//!   coil power is not specified. Mid/high rails, battery input, CPMS and
-//!   soft knees below 100 % are refused.
-//! - **Property 6632** (flow model): not applied, the preset's model is
-//!   used (spec: nonfatal, not graph-conformant).
+//! TODO(SPEC), each the most literal reading of the specification or the
+//! measured 25G83 behaviour where the two disagree:
+//! - **Model resistance.** Spec 4.1 puts `R = Rdc + Rpar` in the
+//!   displacement and velocity models; the 25G83 controller signal log
+//!   matches `R = Rdc` (impulse response to 1e-5 relative), so `Rdc` is used.
+//! - **Current model.** The logged current is a second-order filter with
+//!   the physical zeros and `1/Rdc` at DC and Nyquist, but its poles are
+//!   about 0.9 % more damped than the admittance block's
+//!   `Rdc, Bl, Mms, Rms, Kms` give (pole Q 1.9225 against 1.9402). The
+//!   bilinear admittance of the block is used: 0.011 dB too much current at
+//!   1 kHz, 0.08 dB at resonance.
+//! - **Thermal input.** Spec 6.1 says `Pcoil = i^2 Rdc`; the logged thermal
+//!   state matches `u*i` (0.00014 degC over 180 s against 0.9 degC), and the
+//!   two nodes in series. The magnet node relaxes with 99.867 s, not the
+//!   100 s field (factor 1/(1+1.3315e-3)); the field is used.
+//! - **Filterbank order rule.** "Lowest even LR order whose adjacent-centre
+//!   stop-band error fits in 159 samples" is not defined; LR4 (plus 2 or 4
+//!   for `Bandwidth` 1/2) is used. The spec's band-0 anchors (centre tap
+//!   0.0062462287, -6 dB at 149.41 Hz) are not met by any LR order at the
+//!   geometric-mean crossover (LR4: 0.0059281, 130.69 Hz).
+//! - **Candidate windows.** Which predicted samples a controller frame
+//!   examines; here every sample that entered since the previous frame.
+//! - **Band candidates.** How displacement/velocity per band are formed.
+//!   Each band's own motion against the whole limit gives twice the 25G83
+//!   velocity gain on a 1 kHz tone (0.738 against 0.3645: the tone sits on
+//!   the 1031 Hz crossover); the full-band motion matches, so the
+//!   full-band candidate is applied to the bands it may act on.
+//! - **Mask detector.** The 8-12 kHz band filter, the mean-square window
+//!   and the dB reference; here second-order Butterworth high/low passes
+//!   on the pressure FIR's output, a controller-frame mean square, 10 log10
+//!   of it, smoothed in dB at the controller cadence.
+//! - **Pressure path.** Which modeled signal the 1,024-tap response
+//!   filters; here the normalised input.
+//! - **Temperature gain.** The 25G83 temperature gain falls from about
+//!   63 degC under the 1 kHz and 200 Hz ramps (0.886 at 63.4 degC) with a
+//!   trajectory that does not depend on the coil temperature, where the
+//!   knee (soft 120 degC, headroom 5) gives unity. The knee is used.
+//! - **Meters.** `ModeledAmplifierPower` matches the sum over channels of
+//!   the 1 s average. `AmplifierInputPowerPerSpeaker` is closest (within
+//!   1.2 %) to the largest 1 ms average over the last controller frame and
+//!   the channels, which is used.
+//! - Mid/high rails, battery input and soft knees below 100 % are refused.
 
 use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::blob::{BlobError, Pod};
-use crate::delay::Delay;
 use crate::{
-    cool_coupled, dsp, gap_or_zero, release_toward_unity, ChannelState, HandOff, Health, Io, ProtectionUnit, Telemetry,
-    UnitKind, FAILSAFE_GAIN, MAX_CHANNELS,
+    dsp, gap_or_zero, release_toward_unity, ChannelState, HandOff, Health, Io, ProtectionUnit, Telemetry, UnitKind,
+    FAILSAFE_GAIN, MAX_CHANNELS,
 };
 
 /// Controller update cadence in frames (spec 10: exactly 256).
 pub const CONTROLLER_FRAMES: usize = 256;
+/// Power/thermal substep in frames (spec 6.1).
+pub const SUBSTEP_FRAMES: usize = 32;
+/// Filterbank bands.
+pub const BANDS: usize = 5;
+/// Taps of the property-6632 pressure response.
+pub const PRESSURE_TAPS: usize = 1024;
 const EPS: f64 = f32::MIN_POSITIVE as f64;
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ChannelParams {
     /// Host program port feeding this channel.
     pub source: u32,
@@ -104,11 +149,18 @@ pub struct ChannelParams {
     pub mms_kg: f32,
     pub rms: f32,
     pub kms: f32,
-    /// Displacement/velocity model.
+    /// Displacement model.
+    pub disp_rdc: f32,
     pub disp_bl: f32,
     pub disp_mms_kg: f32,
     pub disp_rms: f32,
     pub disp_kms: f32,
+    /// Velocity model.
+    pub vel_rdc: f32,
+    pub vel_bl: f32,
+    pub vel_mms_kg: f32,
+    pub vel_rms: f32,
+    pub vel_kms: f32,
     /// Thermal type block.
     pub rth_vc: f32,
     pub tau_vc: f32,
@@ -118,12 +170,83 @@ pub struct ChannelParams {
     /// Limits.
     pub amplitude_limit: f32,
     pub displacement_limit: f32,
-    pub velocity_limit0: f32,
+    /// Velocity plateaus `VelocityLimit0..2`, m/s.
+    pub velocity_limit: [f32; 3],
+    /// Mask energy knots `MaskEnergy0..3`, dB.
+    pub mask_energy_db: [f32; 4],
+    /// `MaskBandMin`, `MaskBandMax`, Hz.
+    pub mask_band_hz: [f32; 2],
+    /// `MaskAttack`, `MaskRelease`, s.
+    pub mask_attack_s: f32,
+    pub mask_release_s: f32,
+    /// `MaskAttackFast`, s, and `MaskAttackRange`, dB.
+    pub mask_attack_fast_s: f32,
+    pub mask_attack_range_db: f32,
     pub max_velocity_attenuation_db: f32,
+    pub velocity_ignore_low_band: u32,
+    pub velocity_ignore_high_band: u32,
     pub temperature_soft_limit: f32,
     pub temperature_hard_limit: f32,
     pub temperature_headroom: f32,
     pub max_temperature_attenuation_db: f32,
+    /// `BandCenter0..4`, Hz.
+    pub band_center_hz: [f32; BANDS],
+    /// `Bandwidth` enum 0/1/2.
+    pub bandwidth: u32,
+    /// Number of pressure-response taps (0 without property 6632, else
+    /// [`PRESSURE_TAPS`]).
+    pub pressure_taps: u32,
+    pub pressure_fir: [f32; PRESSURE_TAPS],
+}
+
+impl Default for ChannelParams {
+    fn default() -> Self {
+        ChannelParams {
+            source: 0,
+            volts_full_scale: 0.0,
+            parasitic_resistance: 0.0,
+            rdc: 0.0,
+            bl: 0.0,
+            mms_kg: 0.0,
+            rms: 0.0,
+            kms: 0.0,
+            disp_rdc: 0.0,
+            disp_bl: 0.0,
+            disp_mms_kg: 0.0,
+            disp_rms: 0.0,
+            disp_kms: 0.0,
+            vel_rdc: 0.0,
+            vel_bl: 0.0,
+            vel_mms_kg: 0.0,
+            vel_rms: 0.0,
+            vel_kms: 0.0,
+            rth_vc: 0.0,
+            tau_vc: 0.0,
+            rth_mag: 0.0,
+            tau_mag: 0.0,
+            ambient: 0.0,
+            amplitude_limit: 0.0,
+            displacement_limit: 0.0,
+            velocity_limit: [0.0; 3],
+            mask_energy_db: [0.0; 4],
+            mask_band_hz: [0.0; 2],
+            mask_attack_s: 0.0,
+            mask_release_s: 0.0,
+            mask_attack_fast_s: 0.0,
+            mask_attack_range_db: 0.0,
+            max_velocity_attenuation_db: 0.0,
+            velocity_ignore_low_band: 0,
+            velocity_ignore_high_band: 0,
+            temperature_soft_limit: 0.0,
+            temperature_hard_limit: 0.0,
+            temperature_headroom: 0.0,
+            max_temperature_attenuation_db: 0.0,
+            band_center_hz: [0.0; BANDS],
+            bandwidth: 0,
+            pressure_taps: 0,
+            pressure_fir: [0.0; PRESSURE_TAPS],
+        }
+    }
 }
 
 #[repr(C)]
@@ -145,11 +268,13 @@ pub struct Params {
     pub attack_time_ms: f32,
     pub fast_release_time_ms: f32,
     pub slow_release_time_ms: f32,
+    pub low_band_release_time_ms: f32,
     pub filterbank_latency_ms: f32,
     pub speaker_response_lookahead_ms: f32,
     pub power_time_scale_s: [f32; 4],
     pub power_hard_limit_w: [f32; 4],
     pub power_soft_limit_pct: [f32; 4],
+    pub power_budgets_scale: f32,
     pub max_power_attenuation_db: f32,
     pub low_rail_idle_power_w: f32,
     pub low_rail_power_ratio: f32,
@@ -157,8 +282,7 @@ pub struct Params {
     pub other_power_features: u32,
     /// Runtime CPMS budgets (property 64008, set by the platform after
     /// initialisation): when present they replace the four power hard
-    /// limits, a key the platform does not send being 50 W (spec 9.x).
-    /// TODO(SPEC): the Linux source of the value and whether it changes.
+    /// limits, a key the platform does not send being 50 W (spec 6.1, 8).
     pub runtime_budget_present: u32,
     pub runtime_budget_w: [f32; 4],
     pub ch: [ChannelParams; MAX_CHANNELS],
@@ -169,8 +293,9 @@ unsafe impl Pod for Params {}
 // SAFETY: as above.
 unsafe impl Pod for ChannelParams {}
 
-const _: () = assert!(core::mem::size_of::<ChannelParams>() == 25 * 4);
-const _: () = assert!(core::mem::size_of::<Params>() == (37 + MAX_CHANNELS * 25) * 4);
+const CH_WORDS: usize = 52 + PRESSURE_TAPS;
+const _: () = assert!(core::mem::size_of::<ChannelParams>() == CH_WORDS * 4);
+const _: () = assert!(core::mem::size_of::<Params>() == (39 + MAX_CHANNELS * CH_WORDS) * 4);
 
 impl Default for Params {
     fn default() -> Self {
@@ -189,11 +314,13 @@ impl Default for Params {
             attack_time_ms: 0.0,
             fast_release_time_ms: 0.0,
             slow_release_time_ms: 0.0,
+            low_band_release_time_ms: 0.0,
             filterbank_latency_ms: 0.0,
             speaker_response_lookahead_ms: 0.0,
             power_time_scale_s: [0.0; 4],
             power_hard_limit_w: [0.0; 4],
             power_soft_limit_pct: [0.0; 4],
+            power_budgets_scale: 1.0,
             max_power_attenuation_db: 0.0,
             low_rail_idle_power_w: 0.0,
             low_rail_power_ratio: 0.0,
@@ -221,15 +348,18 @@ impl Params {
         }
         let pos = |v: f32| v.is_finite() && v > 0.0;
         let nonneg = |v: f32| v.is_finite() && v >= 0.0;
-        if !(pos(self.attack_time_ms) && pos(self.fast_release_time_ms) && pos(self.slow_release_time_ms)) {
+        if !(pos(self.attack_time_ms)
+            && pos(self.fast_release_time_ms)
+            && pos(self.slow_release_time_ms)
+            && pos(self.low_band_release_time_ms))
+        {
             return Err(InitError::Invalid("controller times"));
         }
         if !(nonneg(self.filterbank_latency_ms) && nonneg(self.speaker_response_lookahead_ms)) {
             return Err(InitError::Invalid("latency"));
         }
-        let lat =
-            (2.0 * self.filterbank_latency_ms + self.speaker_response_lookahead_ms) * 1e-3 * self.sample_rate as f32;
-        if lat > 16384.0 {
+        // The bank needs a centre tap and at least one on each side.
+        if self.filterbank_frames() < 2 || self.latency_frames() > 16384 {
             return Err(InitError::Invalid("latency"));
         }
         if self.latency_frames() < CONTROLLER_FRAMES {
@@ -252,7 +382,8 @@ impl Params {
         if self.runtime_budget_present != 0 && !self.runtime_budget_w.iter().all(|&v| pos(v)) {
             return Err(InitError::Invalid("runtime power budgets"));
         }
-        if !(nonneg(self.max_power_attenuation_db)
+        if !(pos(self.power_budgets_scale)
+            && nonneg(self.max_power_attenuation_db)
             && nonneg(self.low_rail_idle_power_w)
             && pos(self.low_rail_power_ratio))
         {
@@ -264,15 +395,59 @@ impl Params {
                 return Err(InitError::Invalid("channel source"));
             }
             seen |= 1 << c.source;
-            let mech = [c.rdc, c.bl, c.mms_kg, c.rms, c.kms, c.disp_bl, c.disp_mms_kg, c.disp_rms, c.disp_kms];
+            let mech = [
+                c.rdc,
+                c.bl,
+                c.mms_kg,
+                c.rms,
+                c.kms,
+                c.disp_rdc,
+                c.disp_bl,
+                c.disp_mms_kg,
+                c.disp_rms,
+                c.disp_kms,
+                c.vel_rdc,
+                c.vel_bl,
+                c.vel_mms_kg,
+                c.vel_rms,
+                c.vel_kms,
+            ];
             if !(pos(c.volts_full_scale) && nonneg(c.parasitic_resistance) && mech.iter().all(|&v| pos(v))) {
                 return Err(InitError::Invalid("loudspeaker model"));
             }
             if !(pos(c.rth_vc) && pos(c.tau_vc) && pos(c.rth_mag) && pos(c.tau_mag) && c.ambient.is_finite()) {
                 return Err(InitError::Invalid("thermal model"));
             }
-            if ![c.amplitude_limit, c.displacement_limit, c.velocity_limit0].iter().all(|&v| pos(v)) {
+            if !(pos(c.amplitude_limit) && pos(c.displacement_limit) && c.velocity_limit.iter().all(|&v| pos(v))) {
                 return Err(InitError::Invalid("limits"));
+            }
+            if !(c.mask_energy_db.iter().all(|v| v.is_finite())
+                && c.mask_energy_db.windows(2).all(|w| w[0] <= w[1])
+                && c.velocity_limit.windows(2).all(|w| w[0] <= w[1]))
+            {
+                return Err(InitError::Invalid("velocity mask curve"));
+            }
+            let nyq = self.sample_rate as f32 / 2.0;
+            if !(pos(c.mask_band_hz[0])
+                && c.mask_band_hz[0] < c.mask_band_hz[1]
+                && c.mask_band_hz[1] < nyq
+                && pos(c.mask_attack_s)
+                && pos(c.mask_release_s)
+                && pos(c.mask_attack_fast_s)
+                && nonneg(c.mask_attack_range_db))
+            {
+                return Err(InitError::Invalid("velocity mask detector"));
+            }
+            if !(c.band_center_hz.iter().all(|&f| pos(f) && f < nyq)
+                && c.band_center_hz.windows(2).all(|w| w[0] < w[1])
+                && c.bandwidth <= 2)
+            {
+                return Err(InitError::Invalid("filterbank"));
+            }
+            if !(c.pressure_taps == 0 || c.pressure_taps as usize == PRESSURE_TAPS)
+                || !c.pressure_fir.iter().all(|v| v.is_finite())
+            {
+                return Err(InitError::Invalid("pressure response"));
             }
             if !(c.temperature_soft_limit.is_finite()
                 && c.temperature_hard_limit.is_finite()
@@ -286,12 +461,16 @@ impl Params {
         Ok(())
     }
 
+    /// One filterbank stage in frames.
+    pub fn filterbank_frames(&self) -> usize {
+        libm::round(self.filterbank_latency_ms as f64 * 1e-3 * self.sample_rate as f64) as usize
+    }
+
     /// The audio latency in frames: two filterbank stages plus the speaker
     /// response look-ahead, each rounded to frames.
     pub fn latency_frames(&self) -> usize {
-        let rate = self.sample_rate as f64;
-        let frames = |ms: f32| libm::round(ms as f64 * 1e-3 * rate) as usize;
-        2 * frames(self.filterbank_latency_ms) + frames(self.speaker_response_lookahead_ms)
+        let la = libm::round(self.speaker_response_lookahead_ms as f64 * 1e-3 * self.sample_rate as f64) as usize;
+        2 * self.filterbank_frames() + la
     }
 
     /// Decode and check a complete blob.
@@ -309,13 +488,55 @@ impl Params {
     }
 }
 
-/// Per-sample one-pole pole (TODO(SPEC): the coefficient convention).
-pub fn pole(rate: f64, tau_s: f64) -> f64 {
-    libm::exp(-1.0 / (tau_s * rate))
+/// The exponential one-pole coefficient of spec 6.1 for an update every
+/// `delta_s` seconds: `exp(-delta/tau)`.
+pub fn pole(delta_s: f64, tau_s: f64) -> f64 {
+    libm::exp(-delta_s / tau_s)
 }
 
 fn db_to_lin(db: f64) -> f64 {
     libm::pow(10.0, -db / 20.0)
+}
+
+/// The five centred FIR bands of the complementary filterbank (spec 6.3)
+/// for a filterbank stage of `stage` frames: `2*stage - 1` taps, the centre
+/// at `stage - 1`, designed on a grid of `2*stage` points; generated in f64
+/// and rounded once to f32. `h[k][j]` multiplies `x[n - j]`; the bands sum
+/// to a delay of `stage - 1` in f64.
+pub fn filterbank(rate: f64, centers: &[f32; BANDS], bandwidth: u32, stage: usize) -> [Vec<f32>; BANDS] {
+    let order = 4.0 + 2.0 * bandwidth as f64;
+    let half = stage - 1;
+    let grid = 2 * stage;
+    let mut fc = [0.0f64; BANDS - 1];
+    for (k, f) in fc.iter_mut().enumerate() {
+        *f = libm::sqrt(centers[k] as f64 * centers[k + 1] as f64);
+    }
+    // zero-phase magnitudes on the design grid, bins 0..=grid/2
+    let bins = grid / 2 + 1;
+    let mut mag: [Vec<f64>; BANDS] = core::array::from_fn(|_| vec![0.0; bins]);
+    for b in 0..bins {
+        let f = b as f64 * rate / grid as f64;
+        let mut prev = 0.0;
+        for (k, m) in mag.iter_mut().enumerate() {
+            let cum = if k < BANDS - 1 { 1.0 / (1.0 + libm::pow(f / fc[k], order)) } else { 1.0 };
+            m[b] = cum - prev;
+            prev = cum;
+        }
+    }
+    let n = grid as f64;
+    core::array::from_fn(|k| {
+        (0..2 * half + 1)
+            .map(|j| {
+                // tap j is time t = j - half of the zero-phase response
+                let t = j as f64 - half as f64;
+                let mut acc = mag[k][0] + mag[k][bins - 1] * libm::cos(core::f64::consts::PI * t);
+                for (b, &m) in mag[k].iter().enumerate().take(bins - 1).skip(1) {
+                    acc += 2.0 * m * libm::cos(2.0 * core::f64::consts::PI * b as f64 * t / n);
+                }
+                (acc / n) as f32
+            })
+            .collect()
+    })
 }
 
 /// Direct-form-I biquad in f64 (the model states are small and stiff).
@@ -340,6 +561,15 @@ impl Biquad {
         let a2 = d[2] * k2 - d[1] * k + d[0];
         Biquad { b: [b0 / a0, b1 / a0, b2 / a0], a: [a1 / a0, a2 / a0], x: [0.0; 2], y: [0.0; 2] }
     }
+    /// Second-order Butterworth high or low pass at `f` Hz (bilinear,
+    /// prewarped).
+    fn butter2(f: f64, rate: f64, high: bool) -> Self {
+        let w = 2.0 * rate * libm::tan(core::f64::consts::PI * f / rate);
+        let q = core::f64::consts::SQRT_2;
+        let d = [w * w, w * q, 1.0];
+        let n = if high { [0.0, 0.0, 1.0] } else { [w * w, 0.0, 0.0] };
+        Biquad::bilinear(n, d, rate)
+    }
     #[inline]
     fn step(&mut self, x: f64) -> f64 {
         let y = self.b[0] * x + self.b[1] * self.x[0] + self.b[2] * self.x[1]
@@ -355,14 +585,107 @@ impl Biquad {
     }
 }
 
+/// A history kept twice over, so the last `len` samples are always one
+/// contiguous slice (newest last) for the FIR dot products.
+struct History {
+    buf: Vec<f32>,
+    len: usize,
+    pos: usize,
+}
+
+impl History {
+    fn new(len: usize) -> Self {
+        History { buf: vec![0.0; 2 * len], len, pos: 0 }
+    }
+    #[inline]
+    fn push(&mut self, x: f32) {
+        self.buf[self.pos] = x;
+        self.buf[self.pos + self.len] = x;
+        self.pos += 1;
+        if self.pos == self.len {
+            self.pos = 0;
+        }
+    }
+    /// The last `len` samples, oldest first.
+    #[inline]
+    fn window(&self) -> &[f32] {
+        &self.buf[self.pos..self.pos + self.len]
+    }
+    /// The sample `age` samples ago (0 = newest).
+    #[inline]
+    fn ago(&self, age: usize) -> f32 {
+        self.buf[self.pos + self.len - 1 - age]
+    }
+    fn clear(&mut self) {
+        self.buf.iter_mut().for_each(|v| *v = 0.0);
+        self.pos = 0;
+    }
+}
+
+/// FIR dot product `sum taps[j] * x[n - j]` over a window whose newest
+/// sample is last. Sequential f32 accumulation: the scalar reference.
+#[inline]
+pub fn fir_scalar(taps: &[f32], window: &[f32]) -> f32 {
+    let n = taps.len();
+    let mut acc = 0.0f32;
+    for j in 0..n {
+        acc += taps[j] * window[n - 1 - j];
+    }
+    acc
+}
+
+/// The same dot product with the taps stored reversed, so both run
+/// forward (vectorised on aarch64, see [`crate::dsp::dot_f32`]).
+#[inline]
+pub fn fir_reversed(rev_taps: &[f32], window: &[f32]) -> f32 {
+    crate::dsp::dot_f32(rev_taps, window)
+}
+
+/// One one-pole gain smoother at the sample rate: `attack` when moving
+/// down, `release` up. Snaps to the target within one f32 step, so a gain
+/// that returns to unity is exactly unity (and the bank is bypassed).
+#[inline]
+fn smooth(g: &mut f32, target: f32, attack: f32, release: f32) {
+    let r = if target < *g { attack } else { release };
+    let next = target + r * (*g - target);
+    *g = if (next - target).abs() <= f32::EPSILON * target.abs() { target } else { next };
+}
+
 struct Chan {
     src: usize,
-    delay: Delay,
     vfs: f64,
-    rdc: f64,
-    current: Biquad,
+    /// Input history: the bank's window plus the look-ahead. The bands are
+    /// evaluated at the output, and only those whose gain differs from the
+    /// top band's (unity audio costs no FIR at all).
+    hist: History,
+    /// Bank taps reversed (dot-product order), bands 0..3.
+    taps_rev: [Vec<f32>; BANDS - 1],
+    /// Prediction models on the bank's centre (the program the bands
+    /// resynthesise).
     disp: Biquad,
     vel: Biquad,
+    /// Peaks since the previous controller frame.
+    pk_in: f32,
+    pk_disp: f32,
+    pk_vel: f32,
+    /// Masking path.
+    pressure_rev: Vec<f32>,
+    p_hist: History,
+    mask_hp: Biquad,
+    mask_lp: Biquad,
+    mask_acc: f64,
+    mask_db: f64,
+    mask_init: bool,
+    vel_lim: [f64; 3],
+    mask_knots: [f64; 4],
+    mask_a: f64,
+    mask_af: f64,
+    mask_r: f64,
+    mask_range: f64,
+    vel_limit_now: f64,
+    // Monitor on the output.
+    current: Biquad,
+    load_scale: f64,
     rth_vc: f64,
     rth_mag: f64,
     a_vc: f64,
@@ -370,27 +693,32 @@ struct Chan {
     tau_vc: f64,
     tau_mag: f64,
     ambient: f64,
-    t_vc: f64,
-    t_mag: f64,
+    th_vc: f64,
+    th_mag: f64,
+    sub_acc: f64,
     pbar: [f64; 4],
-    /// Per-sample |input|, |x|, |v| of the samples still in the delay line.
-    hist_peak: Vec<f32>,
-    hist_disp: Vec<f32>,
-    hist_vel: Vec<f32>,
+    /// Largest 1 ms average over the running controller frame, and over
+    /// the last complete one (the per-speaker meter).
+    pbar1_peak: f64,
+    pbar1_frame: f64,
+    // Limits.
     amp_limit: f64,
     disp_limit: f64,
-    vel_limit: f64,
     vel_floor: f64,
+    ignore_low: bool,
+    ignore_high: bool,
     t_soft: f64,
+    t_hard: f64,
     t_headroom: f64,
-    temp_floor: f64,
+    t_max_db: f64,
+    // Candidates and gains.
     cand: [f64; 5],
-    fast_target: f32,
+    band_target: [f32; BANDS],
+    band_g: [f32; BANDS],
+    peak_target: f32,
+    peak_g: f32,
     slow_target: f32,
-    fast: f32,
-    slow: f32,
-    last_x: f64,
-    last_v: f64,
+    slow_g: f32,
 }
 
 pub struct Unit {
@@ -401,9 +729,14 @@ pub struct Unit {
 struct Run {
     n: usize,
     latency: usize,
-    hist_len: usize,
-    hist_pos: usize,
+    /// The bank's centre tap.
+    half: usize,
+    /// Frames between the bank's centre and the output.
+    look: usize,
+    /// A model state went non-finite: the fail-safe is latched until reset.
+    fault: bool,
     pos: usize,
+    sub: usize,
     frame: u64,
     last_frame: u64,
     mitigate: bool,
@@ -417,10 +750,10 @@ struct Run {
     ratio: f64,
     r_attack: f32,
     r_fast: f32,
+    r_low: f32,
     r_slow: f32,
+    linked_power: f64,
     ch: Vec<Chan>,
-    /// A model state went non-finite: the fail-safe is latched until reset.
-    fault: bool,
 }
 
 impl Unit {
@@ -441,6 +774,15 @@ impl Unit {
     }
 }
 
+/// Bilinear models `X/U` and `V/U` of one block, `R = Rdc` (see the
+/// TODO(SPEC) on the model resistance).
+fn motion(rdc: f32, bl: f32, mms: f32, rms: f32, kms: f32, rate: f64, vel: bool) -> Biquad {
+    let (r, bl, m, rm, k) = (rdc as f64, bl as f64, mms as f64, rms as f64, kms as f64);
+    let den = [r * k, r * rm + bl * bl, r * m];
+    let num = if vel { [0.0, bl, 0.0] } else { [bl, 0.0, 0.0] };
+    Biquad::bilinear(num, den, rate)
+}
+
 impl Run {
     fn new(p: &Params) -> Result<Run, InitError> {
         p.validate()?;
@@ -456,24 +798,48 @@ impl Run {
         let n = p.channels as usize;
         let rate = p.sample_rate as f64;
         let latency = p.latency_frames();
-        let hist_len = latency + 1;
+        let stage = p.filterbank_frames();
+        let half = stage - 1;
+        let look = latency - half;
         let dt = 1.0 / rate;
+        let ctl_dt = CONTROLLER_FRAMES as f64 / rate;
         let mut ch = Vec::with_capacity(n);
         for c in &p.ch[..n] {
-            let r = c.rdc as f64 + c.parasitic_resistance as f64;
-            let (bl, m, rm, k) = (c.bl as f64, c.mms_kg as f64, c.rms as f64, c.kms as f64);
+            let h = filterbank(rate, &c.band_center_hz, c.bandwidth, stage);
+            let taps_rev: [Vec<f32>; BANDS - 1] = core::array::from_fn(|k| h[k].iter().rev().copied().collect());
+            let (r, bl, m, rm, k) = (c.rdc as f64, c.bl as f64, c.mms_kg as f64, c.rms as f64, c.kms as f64);
             // I/U = (m s^2 + rm s + k) / (r m s^2 + (r rm + bl^2) s + r k)
             let current = Biquad::bilinear([k, rm, m], [r * k, r * rm + bl * bl, r * m], rate);
-            let (bl2, m2, rm2, k2) = (c.disp_bl as f64, c.disp_mms_kg as f64, c.disp_rms as f64, c.disp_kms as f64);
-            let den = [r * k2, r * rm2 + bl2 * bl2, r * m2];
+            let disp = motion(c.disp_rdc, c.disp_bl, c.disp_mms_kg, c.disp_rms, c.disp_kms, rate, false);
+            let vel = motion(c.vel_rdc, c.vel_bl, c.vel_mms_kg, c.vel_rms, c.vel_kms, rate, true);
+            let taps = c.pressure_taps as usize;
+            let pressure_rev: Vec<f32> = (0..taps).map(|j| c.pressure_fir[taps - 1 - j]).collect();
             ch.push(Chan {
                 src: c.source as usize,
-                delay: Delay::new(latency),
                 vfs: c.volts_full_scale as f64,
-                rdc: c.rdc as f64,
+                hist: History::new(2 * half + 1 + look),
+                taps_rev,
+                disp,
+                vel,
+                pk_in: 0.0,
+                pk_disp: 0.0,
+                pk_vel: 0.0,
+                pressure_rev,
+                p_hist: History::new(taps.max(1)),
+                mask_hp: Biquad::butter2(c.mask_band_hz[0] as f64, rate, true),
+                mask_lp: Biquad::butter2(c.mask_band_hz[1] as f64, rate, false),
+                mask_acc: 0.0,
+                mask_db: 0.0,
+                mask_init: false,
+                vel_lim: c.velocity_limit.map(|v| v as f64),
+                mask_knots: c.mask_energy_db.map(|v| v as f64),
+                mask_a: pole(ctl_dt, c.mask_attack_s as f64),
+                mask_af: pole(ctl_dt, c.mask_attack_fast_s as f64),
+                mask_r: pole(ctl_dt, c.mask_release_s as f64),
+                mask_range: c.mask_attack_range_db as f64,
+                vel_limit_now: c.velocity_limit[0] as f64,
                 current,
-                disp: Biquad::bilinear([bl2, 0.0, 0.0], den, rate),
-                vel: Biquad::bilinear([0.0, bl2, 0.0], den, rate),
+                load_scale: (c.rdc as f64 + c.parasitic_resistance as f64) / c.rdc as f64,
                 rth_vc: c.rth_vc as f64,
                 rth_mag: c.rth_mag as f64,
                 a_vc: dt / (c.tau_vc as f64 + dt),
@@ -481,41 +847,47 @@ impl Run {
                 tau_vc: c.tau_vc as f64,
                 tau_mag: c.tau_mag as f64,
                 ambient: c.ambient as f64,
-                t_vc: c.ambient as f64,
-                t_mag: c.ambient as f64,
+                th_vc: 0.0,
+                th_mag: 0.0,
+                sub_acc: 0.0,
                 pbar: [0.0; 4],
-                hist_peak: vec![0.0; hist_len],
-                hist_disp: vec![0.0; hist_len],
-                hist_vel: vec![0.0; hist_len],
+                pbar1_peak: 0.0,
+                pbar1_frame: 0.0,
                 amp_limit: c.amplitude_limit as f64,
                 disp_limit: c.displacement_limit as f64,
-                vel_limit: c.velocity_limit0 as f64,
                 vel_floor: db_to_lin(c.max_velocity_attenuation_db as f64),
+                ignore_low: c.velocity_ignore_low_band != 0,
+                ignore_high: c.velocity_ignore_high_band != 0,
                 t_soft: c.temperature_soft_limit as f64,
+                t_hard: c.temperature_hard_limit as f64,
                 t_headroom: c.temperature_headroom as f64,
-                temp_floor: db_to_lin(c.max_temperature_attenuation_db as f64),
+                t_max_db: c.max_temperature_attenuation_db as f64,
                 cand: [1.0; 5],
-                fast_target: 1.0,
+                band_target: [1.0; BANDS],
+                band_g: [1.0; BANDS],
+                peak_target: 1.0,
+                peak_g: 1.0,
                 slow_target: 1.0,
-                fast: 1.0,
-                slow: 1.0,
-                last_x: 0.0,
-                last_v: 0.0,
+                slow_g: 1.0,
             });
         }
         let mut p_pole = [0.0; 4];
         let mut budget = [0.0; 4];
+        let sub_dt = SUBSTEP_FRAMES as f64 / rate;
         for j in 0..4 {
-            p_pole[j] = pole(rate, p.power_time_scale_s[j] as f64);
-            budget[j] =
-                if p.runtime_budget_present != 0 { p.runtime_budget_w[j] } else { p.power_hard_limit_w[j] } as f64;
+            p_pole[j] = pole(sub_dt, p.power_time_scale_s[j] as f64);
+            let b = if p.runtime_budget_present != 0 { p.runtime_budget_w[j] } else { p.power_hard_limit_w[j] };
+            budget[j] = b as f64 * p.power_budgets_scale as f64;
         }
+        let sample = |ms: f32| pole(dt, ms as f64 * 1e-3) as f32;
         Ok(Run {
             n,
             latency,
-            hist_len,
-            hist_pos: 0,
+            half,
+            look,
+            fault: false,
             pos: 0,
+            sub: 0,
             frame: 0,
             last_frame: 0,
             mitigate: p.enable_mitigation != 0,
@@ -533,78 +905,168 @@ impl Run {
             power_floor: db_to_lin(p.max_power_attenuation_db as f64),
             idle: p.low_rail_idle_power_w as f64,
             ratio: p.low_rail_power_ratio as f64,
-            r_attack: pole(rate, p.attack_time_ms as f64 * 1e-3) as f32,
-            r_fast: pole(rate, p.fast_release_time_ms as f64 * 1e-3) as f32,
-            r_slow: pole(rate, p.slow_release_time_ms as f64 * 1e-3) as f32,
+            r_attack: sample(p.attack_time_ms),
+            r_fast: sample(p.fast_release_time_ms),
+            r_low: sample(p.low_band_release_time_ms),
+            r_slow: sample(p.slow_release_time_ms),
+            linked_power: 1.0,
             ch,
-            fault: false,
         })
     }
 
     fn reset(&mut self) {
         for c in self.ch.iter_mut() {
-            c.delay.clear();
-            c.current.clear();
+            c.hist.clear();
             c.disp.clear();
             c.vel.clear();
-            c.t_vc = c.ambient;
-            c.t_mag = c.ambient;
+            c.pk_in = 0.0;
+            c.pk_disp = 0.0;
+            c.pk_vel = 0.0;
+            c.p_hist.clear();
+            c.mask_hp.clear();
+            c.mask_lp.clear();
+            c.mask_acc = 0.0;
+            c.mask_db = 0.0;
+            c.mask_init = false;
+            c.vel_limit_now = c.vel_lim[0];
+            c.current.clear();
+            c.th_vc = 0.0;
+            c.th_mag = 0.0;
+            c.sub_acc = 0.0;
             c.pbar = [0.0; 4];
-            c.hist_peak.iter_mut().for_each(|v| *v = 0.0);
-            c.hist_disp.iter_mut().for_each(|v| *v = 0.0);
-            c.hist_vel.iter_mut().for_each(|v| *v = 0.0);
+            c.pbar1_peak = 0.0;
+            c.pbar1_frame = 0.0;
             c.cand = [1.0; 5];
-            c.fast_target = 1.0;
+            c.band_target = [1.0; BANDS];
+            c.band_g = [1.0; BANDS];
+            c.peak_target = 1.0;
+            c.peak_g = 1.0;
             c.slow_target = 1.0;
-            c.fast = 1.0;
-            c.slow = 1.0;
-            c.last_x = 0.0;
-            c.last_v = 0.0;
+            c.slow_g = 1.0;
         }
-        self.hist_pos = 0;
         self.pos = 0;
+        self.sub = 0;
         self.frame = 0;
         self.last_frame = 0;
+        self.linked_power = 1.0;
         self.fault = false;
     }
 
-    /// Model one input sample of every channel.
+    /// One input sample of one channel through the analysis paths; returns
+    /// the protected output sample.
     #[inline]
-    fn model(&mut self, io: &Io<'_, '_>, k: usize) {
-        let hp = self.hist_pos;
-        for c in self.ch.iter_mut() {
-            let x = dsp::bound1(io.input[c.src][k]) as f64;
-            let u = c.vfs * x;
-            let i = c.current.step(u);
-            let xd = c.disp.step(u);
-            let v = c.vel.step(u);
-            let p = i * i * c.rdc;
-            let old_mag = c.t_mag;
-            c.t_vc += c.a_vc * (old_mag + p * c.rth_vc - c.t_vc);
-            c.t_mag += c.a_mag * (c.ambient + p * c.rth_mag - c.t_mag);
-            let pamp = self.idle + self.ratio * (u * i).max(0.0);
-            for j in 0..4 {
-                c.pbar[j] = pamp + self.p_pole[j] * (c.pbar[j] - pamp);
-            }
-            c.hist_peak[hp] = x.abs() as f32;
-            c.hist_disp[hp] = xd.abs() as f32;
-            c.hist_vel[hp] = v.abs() as f32;
-            c.last_x = xd;
-            c.last_v = v;
+    fn sample(&mut self, ci: usize, x: f32) -> f32 {
+        let (mitigate, look, half) = (self.mitigate, self.look, self.half);
+        let (r_attack, r_fast, r_low, r_slow) = (self.r_attack, self.r_fast, self.r_low, self.r_slow);
+        let c = &mut self.ch[ci];
+        let x = dsp::bound1(x);
+        c.hist.push(x);
+        c.pk_in = c.pk_in.max(x.abs());
+        // The program the bands resynthesise, at the bank's centre.
+        let centre = c.hist.ago(half);
+        let u = c.vfs * centre as f64;
+        let xd = c.disp.step(u);
+        let v = c.vel.step(u);
+        c.pk_disp = c.pk_disp.max(libm::fabs(xd) as f32);
+        c.pk_vel = c.pk_vel.max(libm::fabs(v) as f32);
+        // Masking path.
+        if !c.pressure_rev.is_empty() {
+            c.p_hist.push(x);
+            let p = fir_reversed(&c.pressure_rev, c.p_hist.window()) as f64;
+            let m = c.mask_lp.step(c.mask_hp.step(p));
+            c.mask_acc += m * m;
         }
-        self.hist_pos = (hp + 1) % self.hist_len;
+        // Output: the delayed input with the band gains, then broadband.
+        // Bands 0..3 by FIR at the output's window, band 4 the complement:
+        // y = g4 dry + sum_k<4 (g_k - g4) c_k.
+        let dry = c.hist.ago(half + look);
+        let mut y = dry;
+        if mitigate {
+            for k in 0..BANDS {
+                let r = if k == 0 { r_low } else { r_fast };
+                smooth(&mut c.band_g[k], c.band_target[k], r_attack, r);
+            }
+            let g4 = c.band_g[BANDS - 1];
+            if c.band_g.iter().any(|&g| g != 1.0) {
+                let w = c.hist.window();
+                let w = &w[w.len() - look - (2 * half + 1)..w.len() - look];
+                y = g4 * dry;
+                for (taps, &g) in c.taps_rev.iter().zip(&c.band_g) {
+                    if g != g4 {
+                        y += (g - g4) * fir_reversed(taps, w);
+                    }
+                }
+            }
+            smooth(&mut c.peak_g, c.peak_target, r_attack, r_fast);
+            smooth(&mut c.slow_g, c.slow_target, r_attack, r_slow);
+            let g = c.peak_g.min(c.slow_g);
+            if g != 1.0 {
+                y *= g;
+            }
+        }
+        // Held to digital full scale on the output too: band corrections on
+        // a full-scale input can ring past it.
+        let y = y.clamp(-1.0, 1.0);
+        // Monitor on the protected output.
+        let u = c.vfs * y as f64;
+        let i = c.current.step(u);
+        let p = u * i;
+        c.th_mag += c.a_mag * (p * c.rth_mag - c.th_mag);
+        c.th_vc += c.a_vc * (p * c.rth_vc - c.th_vc);
+        c.sub_acc += p;
+        y
     }
 
-    /// Controller update over every sample still in the delay line.
-    fn control(&mut self) {
+    /// The 32-frame power substep of every channel.
+    fn substep(&mut self) {
         for c in self.ch.iter_mut() {
-            let pk = c.hist_peak.iter().fold(0.0f32, |m, &v| m.max(v));
-            let xd = c.hist_disp.iter().fold(0.0f32, |m, &v| m.max(v));
-            let vl = c.hist_vel.iter().fold(0.0f32, |m, &v| m.max(v));
-            let ratio = |limit: f64, q: f32| (limit / (q as f64).max(EPS)).min(1.0);
-            let g_peak = if self.ctl[0] { ratio(c.amp_limit, pk) } else { 1.0 };
-            let g_disp = if self.ctl[1] { ratio(c.disp_limit, xd) } else { 1.0 };
-            let g_vel = if self.ctl[2] { ratio(c.vel_limit, vl).max(c.vel_floor) } else { 1.0 };
+            let load = c.sub_acc / SUBSTEP_FRAMES as f64 * c.load_scale;
+            c.sub_acc = 0.0;
+            let pamp = self.idle + self.ratio * load.max(0.0);
+            for j in 0..4 {
+                c.pbar[j] = self.p_pole[j] * c.pbar[j] + (1.0 - self.p_pole[j]) * pamp;
+            }
+            c.pbar1_peak = c.pbar1_peak.max(c.pbar[0]);
+        }
+    }
+
+    /// Controller update.
+    fn control(&mut self) {
+        let ratio = |limit: f64, q: f32| (limit / (q as f64).max(EPS)).min(1.0);
+        for c in self.ch.iter_mut() {
+            c.pbar1_frame = c.pbar1_peak;
+            c.pbar1_peak = 0.0;
+            // velocity limit from the mask level
+            if !c.pressure_rev.is_empty() {
+                let e = 10.0 * libm::log10((c.mask_acc / CONTROLLER_FRAMES as f64).max(1e-30));
+                if !c.mask_init {
+                    c.mask_db = e;
+                    c.mask_init = true;
+                } else {
+                    let r = if e > c.mask_db {
+                        if e - c.mask_db >= c.mask_range {
+                            c.mask_af
+                        } else {
+                            c.mask_a
+                        }
+                    } else {
+                        c.mask_r
+                    };
+                    c.mask_db = e + r * (c.mask_db - e);
+                }
+                c.mask_acc = 0.0;
+                c.vel_limit_now = mask_curve(c.mask_db, &c.mask_knots, &c.vel_lim);
+            }
+            let g_peak = if self.ctl[0] { ratio(c.amp_limit, c.pk_in) } else { 1.0 };
+            let g_disp = if self.ctl[1] { ratio(c.disp_limit, c.pk_disp) } else { 1.0 };
+            let g_vel = if self.ctl[2] { ratio(c.vel_limit_now, c.pk_vel).max(c.vel_floor) } else { 1.0 };
+            for k in 0..BANDS {
+                let ignored = (k == 0 && c.ignore_low) || (k == BANDS - 1 && c.ignore_high);
+                c.band_target[k] = (if ignored { g_disp } else { g_disp.min(g_vel) }) as f32;
+            }
+            c.pk_in = 0.0;
+            c.pk_disp = 0.0;
+            c.pk_vel = 0.0;
             let g_pow = if self.ctl[3] {
                 let mut g = 1.0f64;
                 for j in 0..4 {
@@ -615,76 +1077,100 @@ impl Run {
                 1.0
             };
             let g_temp = if self.ctl[4] {
-                // TODO(SPEC): the knee (restrictive stand-in, module docs)
-                let predicted = c.t_vc + c.t_headroom;
-                // a non-finite temperature takes the restrictive path
-                if predicted >= c.t_soft || predicted.is_nan() {
-                    c.temp_floor
-                } else {
-                    1.0
-                }
+                let t = c.ambient + c.th_mag + c.th_vc;
+                temperature_gain(t, c.t_headroom, c.t_soft, c.t_hard, c.t_max_db)
             } else {
                 1.0
             };
             c.cand = [g_peak, g_disp, g_vel, g_pow, g_temp];
-            c.fast_target = g_peak.min(g_disp).min(g_vel) as f32;
+            c.peak_target = g_peak as f32;
             c.slow_target = g_pow.min(g_temp) as f32;
             // any non-finite model or controller state latches the fail-safe
-            let model = [c.t_vc, c.t_mag, c.last_x, c.last_v].iter().chain(&c.pbar).all(|v| v.is_finite());
-            let gains = c.cand.iter().all(|v| v.is_finite()) && c.fast.is_finite() && c.slow.is_finite();
-            if !(model && gains) {
+            let model = [c.th_vc, c.th_mag, c.mask_db].iter().chain(&c.pbar).all(|v| v.is_finite());
+            let motion = [&c.disp, &c.vel, &c.current].iter().all(|b| b.y[0].is_finite());
+            let gains = c.cand.iter().all(|v| v.is_finite())
+                && c.band_g.iter().all(|v| v.is_finite())
+                && c.peak_g.is_finite()
+                && c.slow_g.is_finite();
+            if !(model && motion && gains) {
                 self.fault = true;
             }
         }
+        let mut pow = 1.0f64;
+        for c in &self.ch {
+            pow = pow.min(c.cand[3]);
+        }
+        self.linked_power = if self.link { pow } else { f64::NAN };
         if self.link && self.n > 1 {
-            let (mut slow, mut pow) = (1.0f32, 1.0f32);
+            let mut slow = 1.0f32;
             for c in &self.ch {
                 slow = slow.min(c.slow_target);
-                pow = pow.min(c.cand[3] as f32);
             }
             for c in self.ch.iter_mut() {
-                c.slow_target = if self.unlink_temp { pow.min(c.cand[4] as f32) } else { slow };
+                c.slow_target = if self.unlink_temp { (pow.min(c.cand[4])) as f32 } else { slow };
             }
         }
     }
 
     fn process(&mut self, io: &mut Io<'_, '_>) {
-        let frames = io.frames;
-        let mut k = 0;
-        while k < frames {
-            let m = (CONTROLLER_FRAMES - self.pos).min(frames - k);
-            for s in k..k + m {
-                self.model(io, s);
+        for k in 0..io.frames {
+            for ci in 0..self.n {
+                let src = self.ch[ci].src;
+                let y = self.sample(ci, io.input[src][k]);
+                io.output[src][k] = y;
             }
-            for c in self.ch.iter_mut() {
-                let inp = &io.input[c.src][k..k + m];
-                let out = &mut io.output[c.src][k..k + m];
-                // SAFETY: distinct slices of `m` samples.
-                unsafe { c.delay.run(inp.as_ptr(), out.as_mut_ptr(), m) };
-                dsp::bound(out);
-                if self.mitigate {
-                    for o in out.iter_mut() {
-                        let rf = if c.fast_target < c.fast { self.r_attack } else { self.r_fast };
-                        c.fast = c.fast_target + rf * (c.fast - c.fast_target);
-                        let rs = if c.slow_target < c.slow { self.r_attack } else { self.r_slow };
-                        c.slow = c.slow_target + rs * (c.slow - c.slow_target);
-                        *o *= c.fast.min(c.slow);
-                    }
-                }
+            self.sub += 1;
+            if self.sub == SUBSTEP_FRAMES {
+                self.sub = 0;
+                self.substep();
             }
-            k += m;
-            self.pos += m;
-            self.frame += m as u64;
+            self.pos += 1;
+            self.frame += 1;
             if self.pos == CONTROLLER_FRAMES {
                 self.pos = 0;
                 self.control();
                 self.last_frame = self.frame - CONTROLLER_FRAMES as u64;
                 if self.fault {
-                    crate::failsafe::fill_from(io, k, FAILSAFE_GAIN);
+                    crate::failsafe::fill_from(io, k + 1, FAILSAFE_GAIN);
                     return;
                 }
             }
         }
+    }
+}
+
+/// The linear-in-dB temperature knee of spec 6.1. Equal limits form a step;
+/// reversed or non-finite inputs take the capped branch.
+pub fn temperature_gain(t: f64, headroom: f64, soft: f64, hard: f64, max_db: f64) -> f64 {
+    let x = t + headroom - soft;
+    let span = hard - soft;
+    let z = if !(x.is_finite() && span.is_finite()) || span < 0.0 {
+        1.0
+    } else if span == 0.0 {
+        if x >= 0.0 {
+            1.0
+        } else {
+            0.0
+        }
+    } else {
+        (x / span).clamp(0.0, 1.0)
+    };
+    libm::pow(10.0, -(max_db * z) / 20.0)
+}
+
+/// The velocity limit of spec 6.2 for smoothed mask level `e` dB.
+pub fn mask_curve(e: f64, k: &[f64; 4], v: &[f64; 3]) -> f64 {
+    let lerp = |a: f64, b: f64, t: f64| a + (b - a) * t;
+    if e <= k[0] {
+        v[0]
+    } else if e < k[1] {
+        lerp(v[0], v[1], (e - k[0]) / (k[1] - k[0]))
+    } else if e <= k[2] {
+        v[1]
+    } else if e < k[3] {
+        lerp(v[1], v[2], (e - k[2]) / (k[3] - k[2]))
+    } else {
+        v[2]
     }
 }
 
@@ -733,26 +1219,34 @@ impl ProtectionUnit for Unit {
         if run.fault {
             out.health = Health(Health::FAILSAFE | Health::MODEL_FAULT);
         }
+        let (mut amp_1s, mut amp_now) = (0.0f64, 0.0f64);
         for c in &run.ch {
             let mut s = ChannelState::ABSENT;
+            let t = c.ambient + c.th_mag + c.th_vc;
             s.modeled_power_w = c.pbar[2] as f32;
-            s.coil_temp_c = c.t_vc as f32;
-            s.magnet_temp_c = c.t_mag as f32;
-            s.ol_temp_c = c.t_vc as f32;
-            s.displacement_m = c.last_x as f32;
-            s.velocity_m_s = c.last_v as f32;
+            s.coil_temp_c = t as f32;
+            s.magnet_temp_c = (c.ambient + c.th_mag) as f32;
+            s.control_temp_c = t as f32;
+            s.ol_temp_c = t as f32;
+            s.velocity_limit_m_s = c.vel_limit_now as f32;
+            s.mask_db = if c.mask_init { c.mask_db as f32 } else { f32::NAN };
             for (a, &g) in s.axis_gain.iter_mut().zip(&c.cand) {
                 *a = g as f32;
             }
-            s.gain = if run.fault {
-                FAILSAFE_GAIN
-            } else if run.mitigate {
-                c.fast.min(c.slow)
-            } else {
-                1.0
-            };
+            if run.linked_power.is_finite() {
+                s.axis_gain[3] = run.linked_power as f32;
+            }
+            s.band_gain = c.band_g;
+            s.gain = if run.fault { FAILSAFE_GAIN } else { c.peak_g.min(c.slow_g) };
             out.channels[c.src] = s;
+            amp_1s += c.pbar[2];
+            amp_now = amp_now.max(c.pbar1_frame);
         }
+        let g = &mut out.global;
+        g.power_hard_limit_w = run.budget.map(|b| b as f32);
+        g.power_gain = (if run.linked_power.is_finite() { run.linked_power } else { 1.0 }) as f32;
+        g.modeled_amp_power_w = amp_1s as f32;
+        g.amp_input_power_w = amp_now as f32;
     }
     fn reset(&mut self) {
         if let Some(r) = self.run.as_mut() {
@@ -768,11 +1262,12 @@ impl ProtectionUnit for Unit {
         out.sample_rate = self.params.sample_rate;
         for (i, c) in run.ch.iter().enumerate() {
             let n = &mut out.node[i];
-            // rises over ambient; a coil below ambient carries no heat
-            n[0] = (c.t_vc - c.ambient).max(0.0);
-            n[1] = (c.t_mag - c.ambient).max(0.0);
+            // rises (coil over magnet, magnet over ambient); a node below
+            // its reference carries no heat
+            n[0] = c.th_vc.max(0.0);
+            n[1] = c.th_mag.max(0.0);
             n[2..6].copy_from_slice(&c.pbar);
-            out.gain[i] = c.slow as f64;
+            out.gain[i] = c.slow_g as f64;
         }
         true
     }
@@ -785,16 +1280,17 @@ impl ProtectionUnit for Unit {
         }
         let t = gap_or_zero(gap_s);
         let samples = t * rate as f64;
+        let substeps = samples / SUBSTEP_FRAMES as f64;
         for (i, c) in run.ch.iter_mut().enumerate() {
             let s = &state.node[i];
-            let (v, m) = cool_coupled(s[0], s[1], c.tau_vc, c.tau_mag, t);
-            c.t_vc = c.ambient + v;
-            c.t_mag = c.ambient + m;
+            // the series nodes cool independently, each with its own constant
+            c.th_vc = s[0] * libm::exp(-t / c.tau_vc);
+            c.th_mag = s[1] * libm::exp(-t / c.tau_mag);
             for j in 0..4 {
-                c.pbar[j] = run.idle + (s[2 + j] - run.idle) * libm::pow(run.p_pole[j], samples);
+                c.pbar[j] = run.idle + (s[2 + j] - run.idle) * libm::pow(run.p_pole[j], substeps);
             }
             let g = release_toward_unity(state.gain[i], run.r_slow as f64, samples) as f32;
-            c.slow = g;
+            c.slow_g = g;
             c.slow_target = g;
         }
         true
@@ -817,6 +1313,7 @@ mod fault_tests {
             attack_time_ms: 2.0,
             fast_release_time_ms: 150.0,
             slow_release_time_ms: 10_000.0,
+            low_band_release_time_ms: 150.0,
             filterbank_latency_ms: 2.5,
             speaker_response_lookahead_ms: 1.0,
             power_time_scale_s: [0.002, 0.2, 2.0, 30.0],
@@ -836,10 +1333,16 @@ mod fault_tests {
                 mms_kg: 0.0002,
                 rms: 0.2,
                 kms: 1500.0,
+                disp_rdc: 4.0,
                 disp_bl: 0.8,
                 disp_mms_kg: 0.00022,
                 disp_rms: 0.25,
                 disp_kms: 1600.0,
+                vel_rdc: 4.0,
+                vel_bl: 0.8,
+                vel_mms_kg: 0.0002,
+                vel_rms: 0.2,
+                vel_kms: 1500.0,
                 rth_vc: 30.0,
                 tau_vc: 2.0,
                 rth_mag: 20.0,
@@ -847,12 +1350,20 @@ mod fault_tests {
                 ambient: 40.0,
                 amplitude_limit: 1.0,
                 displacement_limit: 0.0005,
-                velocity_limit0: 0.5,
+                velocity_limit: [0.5, 0.6, 0.9],
+                mask_energy_db: [-40.0, -30.0, -20.0, -10.0],
+                mask_band_hz: [8000.0, 12000.0],
+                mask_attack_s: 0.01,
+                mask_release_s: 0.1,
+                mask_attack_fast_s: 0.005,
+                mask_attack_range_db: 70.0,
                 max_velocity_attenuation_db: 18.0,
                 temperature_soft_limit: 110.0,
                 temperature_hard_limit: 125.0,
                 temperature_headroom: 4.0,
                 max_temperature_attenuation_db: 10.0,
+                band_center_hz: [60.0, 300.0, 650.0, 1600.0, 5000.0],
+                ..ChannelParams::default()
             };
         }
         p
@@ -868,11 +1379,11 @@ mod fault_tests {
         (o0, h)
     }
 
-    /// Review finding 1: a non-finite state latches 20 dB until reset.
+    /// A non-finite state latches 20 dB until reset.
     #[test]
     fn a_non_finite_model_state_latches_the_failsafe_until_reset() {
         let poisons: [fn(&mut Run); 3] =
-            [|r| r.ch[0].t_mag = f64::NAN, |r| r.ch[1].pbar[2] = f64::INFINITY, |r| r.ch[0].slow = f32::NAN];
+            [|r| r.ch[0].th_mag = f64::NAN, |r| r.ch[1].pbar[2] = f64::INFINITY, |r| r.ch[0].slow_g = f32::NAN];
         for poison in poisons {
             let mut u = Unit::new(params());
             let (o, h) = run(&mut u, 0.01, 1024);
@@ -888,7 +1399,6 @@ mod fault_tests {
             let mut t = Telemetry::new();
             u.telemetry(&mut t);
             assert!(t.health.0 & Health::MODEL_FAULT != 0 && t.channels[0].gain == FAILSAFE_GAIN);
-            // a state the unit no longer trusts is never handed on
             let mut rec = HandOff::EMPTY;
             assert!(!u.save_state(&mut rec));
             u.reset();

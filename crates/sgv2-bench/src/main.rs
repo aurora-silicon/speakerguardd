@@ -49,6 +49,8 @@ fn spp3_params(n: usize) -> spp3::Params {
     p
 }
 
+/// The Neo's geometry (two 160-frame filterbank stages, 32 frames of
+/// look-ahead, a 1,024-tap pressure response) on synthetic values.
 fn lsm2_params() -> lsm2::Params {
     let mut p = lsm2::Params {
         channels: 2,
@@ -64,8 +66,9 @@ fn lsm2_params() -> lsm2::Params {
         attack_time_ms: 2.0,
         fast_release_time_ms: 150.0,
         slow_release_time_ms: 10_000.0,
-        filterbank_latency_ms: 2.5,
-        speaker_response_lookahead_ms: 1.0,
+        low_band_release_time_ms: 150.0,
+        filterbank_latency_ms: 10.0 / 3.0,
+        speaker_response_lookahead_ms: 2.0 / 3.0,
         power_time_scale_s: [0.002, 0.2, 2.0, 30.0],
         power_hard_limit_w: [50.0, 20.0, 2.0, 1.5],
         power_soft_limit_pct: [100.0; 4],
@@ -73,6 +76,10 @@ fn lsm2_params() -> lsm2::Params {
         low_rail_power_ratio: 1.0,
         ..lsm2::Params::default()
     };
+    let mut fir = [0.0f32; lsm2::PRESSURE_TAPS];
+    for (k, v) in fir.iter_mut().enumerate() {
+        *v = (-(k as f32) / 40.0).exp() * if k % 2 == 0 { 1.0 } else { -0.5 };
+    }
     for c in 0..2 {
         p.ch[c] = lsm2::ChannelParams {
             source: c as u32,
@@ -83,10 +90,16 @@ fn lsm2_params() -> lsm2::Params {
             mms_kg: 0.0002,
             rms: 0.2,
             kms: 1500.0,
+            disp_rdc: 4.0,
             disp_bl: 0.8,
             disp_mms_kg: 0.00022,
             disp_rms: 0.25,
             disp_kms: 1600.0,
+            vel_rdc: 4.0,
+            vel_bl: 0.8,
+            vel_mms_kg: 0.0002,
+            vel_rms: 0.2,
+            vel_kms: 1500.0,
             rth_vc: 30.0,
             tau_vc: 2.0,
             rth_mag: 20.0,
@@ -94,12 +107,24 @@ fn lsm2_params() -> lsm2::Params {
             ambient: 40.0,
             amplitude_limit: 1.0,
             displacement_limit: 0.0005,
-            velocity_limit0: 0.5,
+            velocity_limit: [0.5, 0.6, 0.9],
+            mask_energy_db: [-40.0, -30.0, -20.0, -10.0],
+            mask_band_hz: [8000.0, 12000.0],
+            mask_attack_s: 0.01,
+            mask_release_s: 0.1,
+            mask_attack_fast_s: 0.005,
+            mask_attack_range_db: 70.0,
             max_velocity_attenuation_db: 18.0,
+            velocity_ignore_low_band: 1,
+            velocity_ignore_high_band: 1,
             temperature_soft_limit: 110.0,
             temperature_hard_limit: 125.0,
             temperature_headroom: 4.0,
             max_temperature_attenuation_db: 10.0,
+            band_center_hz: [62.0, 293.0, 650.0, 1634.0, 4953.0],
+            pressure_taps: lsm2::PRESSURE_TAPS as u32,
+            pressure_fir: fir,
+            ..lsm2::ChannelParams::default()
         };
     }
     p

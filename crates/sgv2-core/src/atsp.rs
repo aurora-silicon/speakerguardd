@@ -74,8 +74,8 @@ use alloc::vec::Vec;
 
 use crate::blob::{BlobError, Pod};
 use crate::{
-    gap_or_zero, release_toward_unity, ChannelState, HandOff, Health, Io, ProtectionUnit, Telemetry,
-    UnitKind, FAILSAFE_GAIN, MAX_CHANNELS,
+    gap_or_zero, release_toward_unity, ChannelState, HandOff, Health, Io, ProtectionUnit, Telemetry, UnitKind,
+    FAILSAFE_GAIN, MAX_CHANNELS,
 };
 
 const EPS: f64 = f32::MIN_POSITIVE as f64;
