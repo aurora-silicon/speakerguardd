@@ -14,7 +14,13 @@
 //! (not real time) resets the unit and restores the latest record that
 //! fits it, aged by the time since it was published. A new instance in the
 //! same process therefore starts from the state the previous one left.
-//! State does not survive the process.
+//!
+//! Across processes, the engine page carries two more slots of this layout
+//! (`repr(C)`, timed by CLOCK_BOOTTIME, which counts a suspend and restarts
+//! at a reboot): `saved`, which `run` publishes like the process slot, and
+//! `provided`, which the supervisor fills from the last good `saved` record
+//! it persisted under /run. A new process restores from `provided` when its
+//! own slot is empty (see `start_stream`).
 
 use std::sync::atomic::{fence, AtomicU64, Ordering};
 use std::sync::OnceLock;
@@ -26,7 +32,9 @@ const HEADER: usize = 4;
 const WORDS: usize = HEADER + MAX_CHANNELS * HANDOFF_NODES + MAX_CHANNELS;
 
 /// One hand-off record: kind, channels, rate, publish time (ns since the
-/// process epoch), then the nodes and gains as f64 bits.
+/// process epoch, or CLOCK_BOOTTIME in the page's slots), then the nodes and
+/// gains as f64 bits. All atomics: zeroed memory is an empty slot.
+#[repr(C)]
 pub struct Slot {
     /// Even: stable; odd: a writer is inside; 0: never written.
     seq: AtomicU64,
@@ -50,6 +58,20 @@ pub fn init() {
     EPOCH.get_or_init(Instant::now);
 }
 
+/// CLOCK_BOOTTIME in ns: the time base of the page's slots. Through the
+/// vDSO on aarch64 and x86_64 Linux, so real-time safe.
+pub fn boottime_ns() -> u64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    #[cfg(target_os = "linux")]
+    let clock = libc::CLOCK_BOOTTIME;
+    // elsewhere (host tests only) the monotonic clock
+    #[cfg(not(target_os = "linux"))]
+    let clock = libc::CLOCK_MONOTONIC;
+    // SAFETY: a valid out-pointer.
+    unsafe { libc::clock_gettime(clock, &mut ts) };
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
+
 fn now_ns() -> Option<u64> {
     EPOCH.get().map(|e| u64::try_from(e.elapsed().as_nanos()).unwrap_or(u64::MAX))
 }
@@ -66,7 +88,9 @@ impl Slot {
         self.publish_at(s, t);
     }
 
-    fn publish_at(&self, s: &HandOff, t_ns: u64) {
+    /// Publish with an explicit time stamp (the page's slots use
+    /// [`boottime_ns`]). Real-time safe, as [`Slot::publish`].
+    pub fn publish_at(&self, s: &HandOff, t_ns: u64) {
         let seq = self.seq.load(Ordering::Relaxed);
         if seq & 1 == 1 {
             return;
@@ -94,7 +118,14 @@ impl Slot {
         self.latest_at(now)
     }
 
-    fn latest_at(&self, now_ns: u64) -> Option<(HandOff, f64)> {
+    /// The latest record and its age at `now_ns` (same time base as the
+    /// publish).
+    pub fn latest_at(&self, now_ns: u64) -> Option<(HandOff, f64)> {
+        self.read().map(|(h, t)| (h, now_ns.saturating_sub(t) as f64 * 1e-9))
+    }
+
+    /// The latest record and its publish stamp, consistently read.
+    pub fn read(&self) -> Option<(HandOff, u64)> {
         for _ in 0..64 {
             let s1 = self.seq.load(Ordering::Acquire);
             if s1 == 0 {
@@ -115,7 +146,7 @@ impl Slot {
             }
             fence(Ordering::Acquire);
             if self.seq.load(Ordering::Relaxed) == s1 {
-                return Some((h, now_ns.saturating_sub(t) as f64 * 1e-9));
+                return Some((h, t));
             }
         }
         None
