@@ -37,11 +37,24 @@
 //!   target is `min(smoothed g_ff, group min g_hard)`, bypassing the attack.
 //! - **Dezipper.** The selected target crosses two cascaded per-sample
 //!   one-poles, `k = 1 - exp(ln(0.01) / (0.005 fs))`.
+//! - **Full scale.** The program is held to digital full scale (`clamp(x,
+//!   -1, 1)`, the most any converter delivers) before the gain and before
+//!   both model meters, so the meters see the drive the speaker can get
+//!   and no finite sample can overflow them. In-range audio is unchanged.
 //! - **Fail-safe.** A channel-count mismatch, or non-finite drive (the
-//!   simple-meter failure), gives 20 dB for the affected frames.
+//!   simple-meter failure), gives 20 dB for the affected frames. A model
+//!   state that goes non-finite latches the 20 dB fail-safe
+//!   (`Health::MODEL_FAULT`) until reset; candidate selection propagates
+//!   NaN, so it can never fall back to unity.
 //! - **Reset.** The parameters' start state (64007 = 2: ambient, the macOS
 //!   configuration), unity gains, model history cleared, CL temperature
 //!   reported as 20 C.
+//! - **Hand-off.** `save_state`/`restore_state` carry the coil, magnet and
+//!   virtual-coil nodes, the hard-path arm flag and the selected gain to
+//!   the next stream or instance (spec 10's process-global state vector):
+//!   each node aged by `exp(-gap/tau)`, the gain advanced toward unity
+//!   with `k_release`, the arm flag kept only while the aged `T_OL` is
+//!   still at or above the limit. The closed loop restarts invalid.
 //!
 //! TODO(SPEC):
 //! - the generated pilot sine and its content-gate envelope (spec 18: the
@@ -50,8 +63,14 @@
 //!   from the drive and the model;
 //! - `Thermal_SafeTlim*` (open; never relaxes below the ordinary limit, so
 //!   leaving it out is not less restrictive);
-//! - the hard candidate when the feed-forward filter is disabled (the
-//!   virtual coil is then taken as the real coil);
+//! - the hard candidate when the feed-forward filter is disabled
+//!   (`ThermalFFSpeedupFactor <= 0`). The law needs a virtual coil that
+//!   does not exist then: taking the real coil instead settles about 70 C
+//!   above the limit (the real coil sees the attenuated drive), and a
+//!   physical-pole node on the unprotected drive overshoots the same way.
+//!   The stand-in holds the fixed 20 dB fail-safe gain while armed, which
+//!   holds the limit; the feed-forward candidate stays at unity, as the
+//!   reference shows. A non-finite factor is refused;
 //! - closed loop (spec 7), implemented: V and I mean squares per
 //!   `TempSenseWindowTime` window with the independent mean-square floors,
 //!   `R = RdcScale * smooth(sqrt(V_ms / I_ms))` accepted in `RebRange`,
@@ -59,6 +78,13 @@
 //!   between `a_t_20C` and `a_t_35C`, and the corrected limit
 //!   `clamp(Tlim + T_OL - T_CL, Tlim, Tlim + TlimAdjCap)` smoothed with the
 //!   99 % law over `TlimErrDecayTime`, falling back to `Tlim` on rejection.
+//!   A segment the sense bus cannot feed (no bus, a missing port, a port
+//!   shorter than the call) invalidates the window at once and discards
+//!   its partial sums (spec 7: a missing bus invalidates the window), and
+//!   an accepted measurement expires one window plus one update after it
+//!   was taken, so a stale cool `T_CL` can never hold the limit up. The raw
+//!   limit then returns to `Tlim` at once and `TlimAdj` decays over
+//!   `TlimErrDecayTime`, as on rejection.
 //!   A channel runs it only with CL feedback configured and a calibration
 //!   record inside `CalTempRange`/`RebRange`. Still TODO(SPEC): the
 //!   sensor's DC-block/band-limit filter (raw samples are used, exact for a
@@ -84,7 +110,10 @@ use crate::blob::{BlobError, Pod};
 use crate::delay::Delay;
 use crate::dsp;
 use crate::sense::{BlockSums, DelayEstimator};
-use crate::{ChannelState, Health, Io, ProtectionUnit, Telemetry, UnitKind, FAILSAFE_GAIN, MAX_CHANNELS};
+use crate::{
+    gap_or_zero, release_toward_unity, ChannelState, HandOff, Health, Io, ProtectionUnit, Telemetry, UnitKind,
+    FAILSAFE_GAIN, MAX_CHANNELS,
+};
 
 /// CL temperature reported before any valid measurement (spec section 10).
 const T_CL_UNMEASURED: f32 = 20.0;
@@ -310,7 +339,9 @@ impl Params {
         Ok(p)
     }
 
-    /// Structural checks only: the model trusts the tuning's values.
+    /// Structural and range checks. Every value `process` uses is checked
+    /// here, so `process` has no panic path and no diverging recurrence for
+    /// any accepted parameter set; anything else is the fail-safe.
     pub fn validate(&self) -> Result<(), InitError> {
         let n = self.channels as usize;
         if n == 0 || n > MAX_CHANNELS {
@@ -333,6 +364,10 @@ impl Params {
         if !self.thermal_ambient_temp.is_finite() {
             return Err(InitError::Invalid("ambient"));
         }
+        // one thermal update: the forward recurrence `1 - dt/tau` goes
+        // negative, and then diverges, below it
+        let dt = THERMAL_FRAMES as f32 / self.sample_rate as f32;
+        let nonneg = |v: f32| v.is_finite() && v >= 0.0;
         let mut seen = 0u32;
         for c in &self.ch[..n] {
             if c.source as usize >= n || seen & (1 << c.source) != 0 {
@@ -343,7 +378,19 @@ impl Params {
             {
                 return Err(InitError::Invalid("thermal constants"));
             }
-            if !(c.initial_theta_vc.is_finite() && c.initial_theta_mg.is_finite()) {
+            if !(c.tau_tvc >= dt && c.tau_tmg >= dt) {
+                return Err(InitError::Invalid("time constant below one thermal update"));
+            }
+            // nonpositive disables the feed-forward candidate (spec 6); NaN
+            // or infinity is no setting at all
+            if !c.thermal_ff_speedup_factor.is_finite() {
+                return Err(InitError::Invalid("ThermalFFSpeedupFactor"));
+            }
+            if c.thermal_ff_speedup_factor > 0.0 && c.thermal_ff_speedup_factor * c.tau_tvc < dt {
+                return Err(InitError::Invalid("feed-forward pole below one thermal update"));
+            }
+            // a rise below ambient would allow more drive than a cold start
+            if !(nonneg(c.initial_theta_vc) && nonneg(c.initial_theta_mg)) {
                 return Err(InitError::Invalid("start state"));
             }
             if !(c.rampout.is_finite() && c.rampout >= 0.0) {
@@ -357,6 +404,9 @@ impl Params {
             }
             if !(pos(c.reb_ref) && c.rshunt.is_finite() && c.rshunt >= 0.0 && pos(c.ag)) {
                 return Err(InitError::Invalid("electrical constants"));
+            }
+            if c.cl_thermal_feedback_enabled != 0 {
+                c.validate_closed_loop()?;
             }
         }
         Ok(())
@@ -377,14 +427,53 @@ impl Params {
     }
 }
 
+impl ChannelParams {
+    /// The closed-loop dictionary, when CL feedback is configured: every
+    /// field the window, the resistance smoother and the corrected limit
+    /// use, so the limit can only ever move inside `[Tlim, Tlim + cap]`.
+    /// (The calibration record itself is checked against these ranges when
+    /// the unit is built; one outside them runs that channel open loop.)
+    fn validate_closed_loop(&self) -> Result<(), InitError> {
+        let pos = |v: f32| v.is_finite() && v > 0.0;
+        let nonneg = |v: f32| v.is_finite() && v >= 0.0;
+        if !(pos(self.temp_sense_window_time_s)
+            && pos(self.temp_sense_smoothing_tau_s)
+            && pos(self.tlim_err_decay_time_s)
+            && self.temp_sense_window_time_s <= 60.0)
+        {
+            return Err(InitError::Invalid("closed-loop times"));
+        }
+        if !(pos(self.imon_scale) && pos(self.vmon_scale) && nonneg(self.i_pwr_thres) && nonneg(self.v_pwr_thres)) {
+            return Err(InitError::Invalid("closed-loop sense scales"));
+        }
+        if !(pos(self.rdc_scale) && pos(self.reb_range_min) && self.reb_range_max.is_finite())
+            || self.reb_range_min > self.reb_range_max
+        {
+            return Err(InitError::Invalid("RebRange"));
+        }
+        let (t0, t1) = (self.cal_temp_range_min, self.cal_temp_range_max);
+        if !(t0.is_finite() && t1.is_finite() && t0 <= t1) {
+            return Err(InitError::Invalid("CalTempRange"));
+        }
+        if !(self.a_t_20c.is_finite() && self.a_t_35c.is_finite()) {
+            return Err(InitError::Invalid("temperature coefficients"));
+        }
+        if !nonneg(self.tlim_adj_cap) {
+            return Err(InitError::Invalid("TlimAdjCap"));
+        }
+        Ok(())
+    }
+}
+
 /// Thermal update cadence, frames (spec 6: 256 at 48 kHz).
 pub const THERMAL_FRAMES: usize = 256;
 /// Hard-coded prediction margin in the candidate, C (spec 6).
 const PREDICTION_MARGIN: f64 = 1.0;
 /// Hard-path target below the limit, C (spec 6).
 const HARD_TARGET_BELOW: f64 = 5.0;
-/// Clamp of the candidate ratio (spec 6).
-const RATIO_MIN: f64 = 0.01;
+/// Clamp of the candidate ratio (spec 6): 1e-4, a 0.01 linear-gain
+/// (-40 dB) floor, not a 0.1 gain floor.
+const RATIO_MIN: f64 = 1e-4;
 /// Dezipper 99 % settling time, s (spec 6).
 const DEZIPPER_S: f64 = 0.005;
 const MODEL_SCRATCH: usize = 256;
@@ -408,12 +497,13 @@ pub fn settle99(seconds: f64, rate: f64) -> f64 {
 struct Thermal {
     a: f64,
     b: f64,
+    tau: f64,
     theta: f64,
 }
 
 impl Thermal {
     fn new(r_th: f64, tau: f64, dt: f64, start: f64) -> Self {
-        Thermal { a: 1.0 - dt / tau, b: 0.5 * r_th * dt / tau, theta: start }
+        Thermal { a: 1.0 - dt / tau, b: 0.5 * r_th * dt / tau, tau, theta: start }
     }
     #[inline]
     fn step(&mut self, p: f64, p_prev: f64) {
@@ -444,6 +534,8 @@ struct Cl {
     /// Latest accepted window, until the next update consumes it.
     accepted: Option<f64>,
     valid: bool,
+    /// Frames since the last accepted window.
+    age: usize,
     t_cl: f64,
     limit_s: f64,
     /// Diagnostics of the last completed window (NaN before the first).
@@ -507,6 +599,7 @@ impl Cl {
             k_lim: settle99(c.tlim_err_decay_time_s as f64, r),
             accepted: None,
             valid: false,
+            age: 0,
             t_cl: tc,
             limit_s: c.temperature_limit as f64,
             last_v_ms: f64::NAN,
@@ -521,10 +614,21 @@ impl Cl {
         self.r_s = Some(self.cal_r / self.rdc_scale.max(f64::MIN_POSITIVE));
         self.accepted = None;
         self.valid = false;
+        self.age = 0;
         self.t_cl = self.cal_t;
         self.limit_s = limit;
         self.last_v_ms = f64::NAN;
         self.last_i_ms = f64::NAN;
+    }
+
+    /// The sense bus could not feed a segment: the window is invalid and
+    /// its partial sums are discarded (spec 7).
+    fn lose(&mut self) {
+        self.n = 0;
+        self.v_sq = 0.0;
+        self.i_sq = 0.0;
+        self.accepted = None;
+        self.valid = false;
     }
 
     /// Raw telemetry of one segment. TODO(SPEC): the sensor's DC-block /
@@ -558,6 +662,7 @@ impl Cl {
                     if re >= self.reb_min && re <= self.reb_max {
                         self.accepted = Some(self.cal_t + (re / self.cal_r - 1.0) * self.inv_temp_co);
                         self.valid = true;
+                        self.age = 0;
                     } else {
                         self.valid = false;
                     }
@@ -573,7 +678,14 @@ impl Cl {
         if let Some(t) = self.accepted.take() {
             self.t_cl = t;
         }
-        let raw = if self.valid { (limit + (t_ol - self.t_cl)).clamp(limit, limit + self.cap) } else { limit };
+        // a measurement older than one window (plus this update) is stale
+        self.age = self.age.saturating_add(THERMAL_FRAMES);
+        if self.age > self.window.saturating_add(THERMAL_FRAMES) {
+            self.valid = false;
+        }
+        // max/min, not clamp: never a panic on the RT thread, and a NaN
+        // error falls back to the plain limit
+        let raw = if self.valid { (limit + (t_ol - self.t_cl)).max(limit).min(limit + self.cap) } else { limit };
         self.limit_s += self.k_lim * (raw - self.limit_s);
         self.limit_s
     }
@@ -591,7 +703,11 @@ struct Chan {
     hard_on: f64,
     vc: Thermal,
     mg: Thermal,
-    ff: Option<Thermal>,
+    /// The feed-forward virtual coil on the unprotected drive (`tau_ff`).
+    /// With the candidate disabled it runs at the physical `tau_Tvc` and
+    /// nothing reads it.
+    ff: Thermal,
+    ff_on: bool,
     init_vc: f64,
     init_mg: f64,
     p_prev: f64,
@@ -639,6 +755,8 @@ struct Run {
     sums: BlockSums,
     sense_ok: bool,
     estimator: DelayEstimator,
+    /// A model state went non-finite: the fail-safe is latched until reset.
+    fault: bool,
 }
 
 pub struct Unit {
@@ -713,7 +831,9 @@ impl Run {
             };
             let (reb, series, ag) = (c.reb_ref as f64, (c.rshunt + c.rampout) as f64, c.ag as f64);
             let ff_factor = c.thermal_ff_speedup_factor as f64;
-            let ff = (ff_factor > 0.0).then(|| Thermal::new(c.t_sett_vc as f64, ff_factor * c.tau_tvc as f64, dt, 0.0));
+            let ff_on = ff_factor > 0.0;
+            let ff_tau = if ff_on { ff_factor * c.tau_tvc as f64 } else { c.tau_tvc as f64 };
+            let ff = Thermal::new(c.t_sett_vc as f64, ff_tau, dt, 0.0);
             ch.push(Chan {
                 src: c.source as usize,
                 group: gi,
@@ -730,6 +850,7 @@ impl Run {
                 vc: Thermal::new(c.t_sett_vc as f64, c.tau_tvc as f64, dt, c.initial_theta_vc as f64),
                 mg: Thermal::new(c.t_sett_mg as f64, c.tau_tmg as f64, dt, c.initial_theta_mg as f64),
                 ff,
+                ff_on,
                 init_vc: c.initial_theta_vc as f64,
                 init_mg: c.initial_theta_mg as f64,
                 p_prev: 0.0,
@@ -766,6 +887,7 @@ impl Run {
             sums,
             sense_ok: false,
             estimator: DelayEstimator::new(),
+            fault: false,
         })
     }
 
@@ -774,9 +896,7 @@ impl Run {
             c.delay.clear();
             c.vc.theta = c.init_vc;
             c.mg.theta = c.init_mg;
-            if let Some(f) = c.ff.as_mut() {
-                f.theta = 0.0;
-            }
+            c.ff.theta = 0.0;
             c.p_prev = 0.0;
             c.p_ff_prev = 0.0;
             c.acc.clear();
@@ -801,6 +921,7 @@ impl Run {
         self.sums.clear();
         self.sense_ok = false;
         self.estimator.reset();
+        self.fault = false;
     }
 
     /// Frames `off..off+len` of the host buffers, inside one thermal update.
@@ -820,15 +941,16 @@ impl Run {
             let inp = &io.input[c.src][off..off + len];
             let out = &mut io.output[c.src][off..off + len];
             let curve = &self.curve[c.group * THERMAL_FRAMES..][..len];
-            dsp::mul_to(inp, curve, out);
+            // the program held to full scale, times the gain
+            let non_finite = dsp::mul_bounded_to(inp, curve, out);
             if c.headroom != 1.0 {
                 dsp::scale_in_place(out, c.headroom);
             }
-            if dsp::peak_abs(out) == f32::INFINITY {
+            if non_finite {
                 // simple-meter failure: at most 20 dB below the input on
                 // these frames, non-finite samples muted
                 for ((o, &x), &g) in out.iter_mut().zip(inp).zip(curve) {
-                    *o = if x.is_finite() { x * (g * c.headroom).min(FAILSAFE_GAIN) } else { 0.0 };
+                    *o = dsp::bound1(x) * (g * c.headroom).min(FAILSAFE_GAIN);
                 }
                 *health |= Health::FAILSAFE;
             }
@@ -842,7 +964,8 @@ impl Run {
                 if FF_FROM_UNPROTECTED {
                     // SAFETY: as above, for the input.
                     unsafe { c.delay_in.run(inp.as_ptr().add(m0), c.scratch.as_mut_ptr(), m) };
-                    dsp::sanitize(&mut c.scratch[..m]);
+                    // held to full scale like the program the output carries
+                    dsp::bound(&mut c.scratch[..m]);
                     c.acc_in.add_sq(&c.scratch[..m], phase + m0);
                 }
                 m0 += m;
@@ -863,7 +986,12 @@ impl Run {
                         cl.feed(i, v);
                     }
                 }
-                _ => self.sums.complete = false,
+                _ => {
+                    self.sums.complete = false;
+                    if let Some(cl) = c.cl.as_mut() {
+                        cl.lose();
+                    }
+                }
             }
         }
         self.sums.frames += len;
@@ -899,9 +1027,7 @@ impl Run {
             c.mg.step(p, c.p_prev);
             let p_ff = if FF_FROM_UNPROTECTED { c.elec * c.acc_in.total() / n } else { p };
             c.acc_in.clear();
-            if let Some(f) = c.ff.as_mut() {
-                f.step(p_ff, c.p_ff_prev);
-            }
+            c.ff.step(p_ff, c.p_ff_prev);
             c.p_prev = p;
             c.p_ff_prev = p_ff;
             let t_ol = self.ambient + c.vc.theta + c.mg.theta;
@@ -912,11 +1038,9 @@ impl Run {
                 None => c.limit,
             };
             let num = limit - self.ambient - c.mg.theta;
-            // TODO(SPEC): with the feed-forward filter disabled the hard
-            // candidate takes the real coil as its virtual coil.
-            let vcff = c.ff.map_or(c.vc.theta, |f| f.theta);
+            let vcff = c.ff.theta;
             let ratio = |num: f64| libm::sqrt((num / (vcff + PREDICTION_MARGIN)).clamp(RATIO_MIN, 1.0));
-            c.g_ff = if c.ff.is_some() { ratio(num) } else { 1.0 };
+            c.g_ff = if c.ff_on { ratio(num) } else { 1.0 };
             // the hard path follows the corrected limit (reference: a
             // closed-loop run holds T_OL far above limit + headroom without
             // the panic)
@@ -925,15 +1049,24 @@ impl Run {
             } else if t_ol < limit {
                 c.armed = false;
             }
-            c.g_hard = if c.armed { ratio(num - HARD_TARGET_BELOW) } else { 1.0 };
-            ff_t[c.group] = ff_t[c.group].min(c.g_ff);
-            hard_t[c.group] = hard_t[c.group].min(c.g_hard);
+            // TODO(SPEC): without the feed-forward filter there is no virtual
+            // coil for the hard law; the fixed 20 dB holds the limit (module
+            // docs)
+            c.g_hard = if !c.armed {
+                1.0
+            } else if c.ff_on {
+                ratio(num - HARD_TARGET_BELOW)
+            } else {
+                FAILSAFE_GAIN as f64
+            };
+            ff_t[c.group] = min_nan(ff_t[c.group], c.g_ff);
+            hard_t[c.group] = min_nan(hard_t[c.group], c.g_hard);
         }
         for (gi, g) in self.groups.iter_mut().enumerate() {
             let t = ff_t[gi];
             let k = if t < g.g { self.k_attack } else { self.k_release };
             g.g += k * (t - g.g);
-            let sel = g.g.min(hard_t[gi]);
+            let sel = min_nan(g.g, hard_t[gi]);
             // The smoother's state is the selected gain: after the hard path
             // disarms, the gain releases from where the hard path left it
             // (no step back up). Black-box reference: thermal_ramp_1k.
@@ -955,6 +1088,27 @@ impl Run {
         self.estimator.end_block();
         self.sums.clear();
         self.last_frame = self.frame - THERMAL_FRAMES as u64;
+        // any non-finite model or controller state latches the fail-safe
+        let chans = self.ch.iter().all(|c| {
+            let lim = c.cl.as_ref().is_none_or(|cl| cl.limit_s.is_finite() && cl.t_cl.is_finite());
+            let ff = c.ff.theta.is_finite();
+            c.vc.theta.is_finite() && c.mg.theta.is_finite() && ff && lim && c.g_ff.is_finite() && c.g_hard.is_finite()
+        });
+        let groups = self.groups.iter().all(|g| g.g.is_finite() && g.sel.is_finite());
+        if !(chans && groups) {
+            self.fault = true;
+        }
+    }
+}
+
+/// `min` that propagates NaN (`f64::min` drops it, which here would turn a
+/// poisoned candidate into unity gain).
+#[inline]
+fn min_nan(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        f64::NAN
+    } else {
+        a.min(b)
     }
 }
 
@@ -983,6 +1137,10 @@ impl ProtectionUnit for Unit {
             failsafe_io(&mut io);
             return Health(Health::FAILSAFE | Health::CHANNEL_MISMATCH);
         }
+        if run.fault {
+            failsafe_io(&mut io);
+            return Health(Health::FAILSAFE | Health::MODEL_FAULT);
+        }
         let mut health = 0u32;
         let mut off = 0;
         while off < frames {
@@ -993,6 +1151,10 @@ impl ProtectionUnit for Unit {
             if run.pos == THERMAL_FRAMES {
                 run.update();
                 run.pos = 0;
+                if run.fault {
+                    crate::failsafe::fill_from(&mut io, off, FAILSAFE_GAIN);
+                    return Health(Health::FAILSAFE | Health::MODEL_FAULT);
+                }
             }
         }
         if !run.sense_ok {
@@ -1012,6 +1174,9 @@ impl ProtectionUnit for Unit {
         };
         out.frame = run.last_frame;
         out.health = Health(if run.sense_ok { 0 } else { Health::OPEN_LOOP });
+        if run.fault {
+            out.health = Health(Health::FAILSAFE | Health::MODEL_FAULT);
+        }
         for c in run.ch.iter() {
             let g = &run.groups[c.group];
             let t_ol = (run.ambient + c.vc.theta + c.mg.theta) as f32;
@@ -1039,7 +1204,7 @@ impl ProtectionUnit for Unit {
             }
             // axis 4 is temperature: the selected (pre-dezipper) target
             s.axis_gain[4] = g.sel;
-            s.gain = g.z2;
+            s.gain = if run.fault { FAILSAFE_GAIN } else { g.z2 };
             out.channels[c.src] = s;
         }
     }
@@ -1049,22 +1214,173 @@ impl ProtectionUnit for Unit {
             r.reset();
         }
     }
+
+    fn save_state(&self, out: &mut HandOff) -> bool {
+        let Some(run) = self.run.as_ref().filter(|r| !r.fault) else { return false };
+        *out = HandOff::EMPTY;
+        out.kind = UnitKind::Spp3 as u32;
+        out.channels = run.n as u32;
+        out.sample_rate = self.params.sample_rate;
+        for (i, c) in run.ch.iter().enumerate() {
+            out.node[i][..4].copy_from_slice(&[c.vc.theta, c.mg.theta, c.ff.theta, c.armed as u8 as f64]);
+            out.gain[i] = run.groups[c.group].g;
+        }
+        true
+    }
+
+    fn restore_state(&mut self, state: &HandOff, gap_s: f64) -> bool {
+        let rate = self.params.sample_rate;
+        let Some(run) = self.run.as_mut() else { return false };
+        if !state.fits(UnitKind::Spp3, run.n, rate) {
+            return false;
+        }
+        let t = gap_or_zero(gap_s);
+        let updates = t * rate as f64 / THERMAL_FRAMES as f64;
+        let mut g = [1.0f64; MAX_CHANNELS];
+        for (i, c) in run.ch.iter_mut().enumerate() {
+            let s = &state.node[i];
+            c.vc.theta = s[0] * libm::exp(-t / c.vc.tau);
+            c.mg.theta = s[1] * libm::exp(-t / c.mg.tau);
+            c.ff.theta = s[2] * libm::exp(-t / c.ff.tau);
+            // hysteresis: an armed hard path stays armed until T_OL < limit
+            c.armed = s[3] != 0.0 && run.ambient + c.vc.theta + c.mg.theta >= c.limit;
+            g[c.group] = g[c.group].min(state.gain[i]);
+        }
+        let k = 1.0 - run.k_release;
+        for (gi, grp) in run.groups.iter_mut().enumerate() {
+            let v = release_toward_unity(g[gi], k, updates);
+            *grp = Group { g: v, sel: v as f32, z1: v as f32, z2: v as f32 };
+        }
+        run.curve.iter_mut().for_each(|v| *v = 1.0);
+        true
+    }
 }
 
-/// 20 dB on whatever geometry the host gave, never indexing past a buffer.
+/// 20 dB on whatever geometry the host gave, never indexing past a buffer,
+/// finite and bounded for any input (see [`crate::failsafe::fill_from`]).
 pub(crate) fn failsafe_io(io: &mut Io<'_, '_>) {
-    let frames = io.frames;
-    for (c, out) in io.output.iter_mut().enumerate() {
-        let n = frames.min(out.len());
-        let out = &mut out[..n];
-        match io.input.get(c) {
-            Some(inp) => {
-                let m = n.min(inp.len());
-                dsp::scale_to(&inp[..m], FAILSAFE_GAIN, &mut out[..m]);
-                dsp::sanitize(&mut out[..m]);
-                out[m..].fill(0.0);
-            }
-            None => out.fill(0.0),
+    crate::failsafe::fill_from(io, 0, FAILSAFE_GAIN);
+}
+
+#[cfg(test)]
+mod fault_tests {
+    use super::*;
+
+    fn params() -> Params {
+        let mut p = Params {
+            channels: 2,
+            sample_rate: 48_000,
+            block_frames: 512,
+            thermal_ambient_temp: 40.0,
+            thermal_gain_attack_time_s: 0.5,
+            thermal_gain_release_time_s: 2.0,
+            thermal_lookahead_delay_ms: 1.0,
+            thermal_protection_enabled: 1,
+            ..Params::default()
+        };
+        for c in 0..2 {
+            p.ch[c] = ChannelParams {
+                source: c as u32,
+                t_sett_vc: 20.0,
+                t_sett_mg: 10.0,
+                tau_tvc: 0.4,
+                tau_tmg: 3.0,
+                temperature_limit: 120.0,
+                hard_temp_limit_headroom: 8.0,
+                reb_ref: 4.0,
+                rshunt: 0.2,
+                ag: 10.0,
+                thermal_ff_speedup_factor: 0.5,
+                ..Default::default()
+            };
         }
+        p
+    }
+
+    fn run(u: &mut Unit, x: f32, n: usize) -> (Vec<f32>, Health) {
+        let input = vec![x; n];
+        let ins: [&[f32]; 2] = [&input, &input];
+        let mut o0 = vec![0.0f32; n];
+        let mut o1 = vec![0.0f32; n];
+        let mut outs: [&mut [f32]; 2] = [&mut o0, &mut o1];
+        let h = u.process(Io { frames: n, input: &ins, sense: &[], output: &mut outs });
+        (o0, h)
+    }
+
+    /// Review finding 1: a NaN state used to vanish in `f64::min` and leave
+    /// unity gain. Every way a state can go non-finite now latches 20 dB.
+    #[test]
+    fn a_non_finite_model_state_latches_the_failsafe_until_reset() {
+        let poisons: [fn(&mut Run); 4] = [
+            |r| r.ch[0].mg.theta = f64::NAN,
+            |r| r.ch[1].vc.theta = f64::INFINITY,
+            |r| r.ch[0].ff.theta = f64::NAN,
+            |r| r.groups[0].g = f64::NAN,
+        ];
+        for poison in poisons {
+            let mut u = Unit::new(params());
+            let (o, h) = run(&mut u, 0.5, 512);
+            assert_eq!((o[511], h.0 & Health::FAILSAFE), (0.5, 0));
+            poison(u.run.as_mut().unwrap());
+            // the next update latches; the frames after it get 20 dB
+            let (o, h) = run(&mut u, 0.5, 512);
+            assert!(h.0 & Health::MODEL_FAULT != 0 && h.is_failsafe());
+            assert!((o[511] - 0.05).abs() < 1e-7, "{}", o[511]);
+            for _ in 0..4 {
+                let (o, h) = run(&mut u, 1.0, 300);
+                assert!(h.0 & Health::MODEL_FAULT != 0);
+                assert!(o.iter().all(|&v| (v - FAILSAFE_GAIN).abs() < 1e-7));
+            }
+            let mut t = Telemetry::new();
+            u.telemetry(&mut t);
+            assert!(t.health.0 & Health::MODEL_FAULT != 0 && t.channels[0].gain == FAILSAFE_GAIN);
+            // a state the unit no longer trusts is never handed on
+            let mut rec = HandOff::EMPTY;
+            assert!(!u.save_state(&mut rec));
+            u.reset();
+            let (o, h) = run(&mut u, 0.5, 512);
+            assert_eq!((o[511], h.0 & Health::FAILSAFE), (0.5, 0));
+        }
+    }
+
+    /// Review finding 3: an accepted measurement expires one window (plus
+    /// one update) after it was taken, even if no segment ever reports the
+    /// bus lost.
+    #[test]
+    fn a_closed_loop_measurement_expires_after_one_window() {
+        let mut c = params().ch[0];
+        c.cl_thermal_feedback_enabled = 1;
+        c.cal_present = 1;
+        c.cal_r = 4.0;
+        c.cal_t = 25.0;
+        c.imon_scale = 1.0;
+        c.vmon_scale = 1.0;
+        c.temp_sense_window_time_s = 0.02;
+        c.temp_sense_smoothing_tau_s = 0.5;
+        c.rdc_scale = 1.0;
+        c.reb_range_min = 2.0;
+        c.reb_range_max = 8.0;
+        c.cal_temp_range_min = 10.0;
+        c.cal_temp_range_max = 50.0;
+        c.a_t_20c = 0.004;
+        c.a_t_35c = 0.004;
+        c.tlim_err_decay_time_s = 1.0;
+        c.tlim_adj_cap = 30.0;
+        let mut cl = Cl::new(&c, 48_000.0, 48_000.0 / THERMAL_FRAMES as f64).unwrap();
+        let w = cl.window;
+        let (i, v) = (vec![0.25f32; w], vec![1.0f32; w]);
+        cl.feed(&i, &v);
+        assert!(cl.valid);
+        let mut updates = 0;
+        while cl.valid {
+            cl.update(200.0, 120.0);
+            updates += 1;
+            assert!(updates * THERMAL_FRAMES <= w + 2 * THERMAL_FRAMES, "still valid after {updates} updates");
+        }
+        // and a lost segment invalidates at once
+        cl.feed(&i, &v);
+        assert!(cl.valid);
+        cl.lose();
+        assert!(!cl.valid && cl.n == 0);
     }
 }
