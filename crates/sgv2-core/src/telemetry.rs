@@ -67,10 +67,16 @@ impl ChannelState {
     };
 }
 
-/// Unit-wide state (lsm2 controller and meters). NaN when absent.
+/// Unit-wide state (spp3 and lsm2 meters, the lsm2 controller). NaN when
+/// absent.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct GlobalState {
+    /// spp3: the unit-wide modeled and measured speaker power, W.
+    pub modeled_power_w: f32,
+    pub measured_power_w: f32,
+    /// spp3: the unit-wide thermal gain, dB.
+    pub thermal_gain_db: f32,
     /// The four power budgets in force (preset or runtime), W.
     pub power_hard_limit_w: [f32; 4],
     /// The linked (slow) power gain, linear.
@@ -84,6 +90,9 @@ pub struct GlobalState {
 
 impl GlobalState {
     pub const ABSENT: GlobalState = GlobalState {
+        modeled_power_w: f32::NAN,
+        measured_power_w: f32::NAN,
+        thermal_gain_db: f32::NAN,
         power_hard_limit_w: [f32::NAN; 4],
         power_gain: f32::NAN,
         modeled_amp_power_w: f32::NAN,

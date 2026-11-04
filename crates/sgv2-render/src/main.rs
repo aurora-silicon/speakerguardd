@@ -265,7 +265,12 @@ fn channel_json(c: &ChannelState, audio_gain: Option<f32>) -> String {
 
 fn global_json(g: &sgv2_core::GlobalState) -> String {
     format!(
-        "{{\"power_hard_limit_w\":{},\"power_gain\":{},\"modeled_amp_power_w\":{},\"amp_input_power_per_speaker_w\":{}}}",
+        "{{\"modeled_power_w\":{},\"measured_power_w\":{},\"thermal_gain_db\":{},\
+         \"power_hard_limit_w\":{},\"power_gain\":{},\"modeled_amp_power_w\":{},\
+         \"amp_input_power_per_speaker_w\":{}}}",
+        num(g.modeled_power_w),
+        num(g.measured_power_w),
+        num(g.thermal_gain_db),
         arr(&g.power_hard_limit_w),
         num(g.power_gain),
         num(g.modeled_amp_power_w),

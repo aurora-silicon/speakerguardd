@@ -1045,6 +1045,13 @@ impl ProtectionUnit for Unit {
             s.gain = g.z2;
             out.channels[c.src] = s;
         }
+        // TODO(SPEC): how the unit-wide meters combine the channels. Here:
+        // the summed channel powers and the most restrictive thermal gain.
+        let chans = &out.channels[..run.ch.len()];
+        out.global.modeled_power_w = chans.iter().map(|c| c.modeled_power_w).sum();
+        out.global.measured_power_w = chans.iter().map(|c| c.measured_power_w).sum();
+        let g = chans.iter().map(|c| c.axis_gain[4]).fold(1.0f32, f32::min);
+        out.global.thermal_gain_db = 20.0 * libm::log10f(g);
     }
 
     fn reset(&mut self) {
