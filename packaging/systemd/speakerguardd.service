@@ -28,8 +28,11 @@ RuntimeDirectoryPreserve=restart
 DevicePolicy=closed
 DeviceAllow=char-alsa rw
 # Real-time scheduling and locked memory for the 10 ms loop; chown hands the
-# engine page and the session report to the session user.
-CapabilityBoundingSet=CAP_SYS_NICE CAP_IPC_LOCK CAP_CHOWN CAP_FOWNER
+# engine page and the session report to the session user. CAP_SYS_ADMIN: the
+# kernel (sgv2k2) requires it to lock "Speaker Protection" and to write it,
+# so a seat user with the control device's uaccess ACL cannot own the
+# speakers. The service runs as root, so the bounding set is what it keeps.
+CapabilityBoundingSet=CAP_SYS_NICE CAP_IPC_LOCK CAP_CHOWN CAP_FOWNER CAP_SYS_ADMIN
 LimitRTPRIO=99
 LimitMEMLOCK=infinity
 ProtectSystem=strict
