@@ -74,6 +74,8 @@ pub struct DelayEstimator {
     candidate: Option<usize>,
     stable: u32,
     locked: Option<u32>,
+    /// The current envelope point holds a non-finite sum.
+    poisoned: bool,
 }
 
 impl Default for DelayEstimator {
@@ -97,11 +99,19 @@ impl DelayEstimator {
             candidate: None,
             stable: 0,
             locked: None,
+            poisoned: false,
         }
     }
 
     pub fn reset(&mut self) {
         *self = Self::new();
+    }
+
+    /// Forget the correlation evidence but keep the accepted delay.
+    fn restart(&mut self) {
+        let locked = self.locked;
+        *self = Self::new();
+        self.locked = locked;
     }
 
     /// The accepted delay in frames.
@@ -120,10 +130,23 @@ impl DelayEstimator {
     /// over channels, is `v_e`.
     #[inline]
     pub fn push_sums(&mut self, out_e: f32, v_e: f32, frames: usize) {
-        self.acc_out += out_e;
-        self.acc_v += v_e;
+        // a non-finite point would stay in the forgotten correlations for
+        // good: the point that holds one restarts the correlation instead
+        // (at the point boundary, so how the frames arrived does not
+        // matter; the lock is kept, the delay is a property of the
+        // configuration)
+        if out_e.is_finite() && v_e.is_finite() {
+            self.acc_out += out_e;
+            self.acc_v += v_e;
+        } else {
+            self.poisoned = true;
+        }
         self.acc_n += frames;
         if self.acc_n >= ENV {
+            if self.poisoned {
+                self.restart();
+                return;
+            }
             self.point(self.acc_out, self.acc_v);
             self.acc_out = 0.0;
             self.acc_v = 0.0;
@@ -168,6 +191,11 @@ impl DelayEstimator {
             if c > self.corr[best_j] {
                 best_j = j;
             }
+        }
+        if !sum.is_finite() {
+            // finite inputs whose products overflowed
+            self.restart();
+            return;
         }
         let best = MAX_LAG - 1 - best_j;
         let mean = sum / MAX_LAG as f32;

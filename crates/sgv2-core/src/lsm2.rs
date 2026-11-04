@@ -40,10 +40,10 @@
 //! - **Controller cadence.** Candidates update every 256 frames over the
 //!   samples still in the delay line (everything that has not yet left).
 //!
-//! Full scale: the program is held to digital full scale (`clamp(x, -1,
-//! 1)`, a non-finite sample 0) before the model and on the output, so the
-//! model sees the drive the speaker can get and a huge finite sample cannot
-//! leave it hot for minutes. A model state that goes non-finite latches the
+//! Full scale: the output is held to digital full scale (`clamp(x, -1,
+//! 1)`, a non-finite sample 0). The model sees the program unclamped as
+//! the reference does, bounded only at `dsp::METER_FS` (16 FS), so a huge
+//! finite sample cannot overflow it or leave it hot for hours. A model state that goes non-finite latches the
 //! 20 dB fail-safe (`Health::MODEL_FAULT`) until reset.
 //!
 //! Hand-off: `save_state`/`restore_state` carry the coil and magnet rises,
@@ -66,9 +66,14 @@
 //!   `VelocityIgnoreLowBand/HighBand` therefore have no effect yet.
 //! - **Velocity masking.** The 8-12 kHz detector and knot curve are not
 //!   specified; the limit is the lowest knot, `VelocityLimit0` (unmasked).
-//! - **Temperature knee.** Not specified. The stand-in applies the full
-//!   `MaxTemperatureAttenuation` once the predicted coil temperature
-//!   (`Tvc + TemperatureHeadroom`) reaches the soft limit, unity below.
+//! - **Temperature knee** (spec 6.1, implemented): linear in dB from the
+//!   soft to the hard limit on `Tvc + TemperatureHeadroom`, capped at
+//!   `MaxTemperatureAttenuation`. Beyond the reference, a coil past
+//!   `TemperatureHardLimit` (temperature axis enabled) gets the 20 dB
+//!   fail-safe gain at once (at most;
+//!   the other gains still apply) until it is back below the soft limit: macOS stops at the knee's
+//!   cap, which with a 0 dB cap lets the coil run past the hard limit at
+//!   unity. Never less restrictive than the reference.
 //! - **One-pole convention** (`pole`): `exp(-1/(tau*rate))`, per sample.
 //! - **Amplifier input power.** The budgets apply to the low-rail affine
 //!   model `idle + ratio * max(0, u*i)`; whether the load term is `u*i` or
@@ -382,8 +387,13 @@ struct Chan {
     vel_limit: f64,
     vel_floor: f64,
     t_soft: f64,
+    t_hard: f64,
     t_headroom: f64,
     temp_floor: f64,
+    max_temp_db: f64,
+    /// The coil passed TemperatureHardLimit: 20 dB on the slow gain until
+    /// it is back below the soft limit.
+    hard_armed: bool,
     cand: [f64; 5],
     fast_target: f32,
     slow_target: f32,
@@ -441,6 +451,41 @@ impl Unit {
     }
 }
 
+impl Chan {
+    /// The hard-limit backstop, applied at once (bypassing the attack, as
+    /// spp3's and atsp's hard paths are).
+    #[inline]
+    fn backstop(&self) -> f32 {
+        if self.hard_armed {
+            FAILSAFE_GAIN
+        } else {
+            1.0
+        }
+    }
+
+    /// The temperature candidate, spec 6.1's linear-in-dB knee:
+    /// `z = clamp((Tvc + headroom - soft) / (hard - soft), 0, 1)`,
+    /// `G = 10^(-MaxTemperatureAttenuation z / 20)`. Equal limits form a
+    /// step; reversed or non-finite limits or temperature take the capped
+    /// branch.
+    fn temperature_knee(&self) -> f64 {
+        let t = self.t_vc + self.t_headroom;
+        let (soft, hard) = (self.t_soft, self.t_hard);
+        if !(t.is_finite() && soft.is_finite() && hard.is_finite()) || hard < soft {
+            return self.temp_floor;
+        }
+        if hard == soft {
+            return if t >= soft { self.temp_floor } else { 1.0 };
+        }
+        let z = ((t - soft) / (hard - soft)).clamp(0.0, 1.0);
+        if z == 1.0 {
+            self.temp_floor
+        } else {
+            db_to_lin(self.max_temp_db * z)
+        }
+    }
+}
+
 impl Run {
     fn new(p: &Params) -> Result<Run, InitError> {
         p.validate()?;
@@ -492,8 +537,11 @@ impl Run {
                 vel_limit: c.velocity_limit0 as f64,
                 vel_floor: db_to_lin(c.max_velocity_attenuation_db as f64),
                 t_soft: c.temperature_soft_limit as f64,
+                t_hard: c.temperature_hard_limit as f64,
                 t_headroom: c.temperature_headroom as f64,
                 temp_floor: db_to_lin(c.max_temperature_attenuation_db as f64),
+                max_temp_db: c.max_temperature_attenuation_db as f64,
+                hard_armed: false,
                 cand: [1.0; 5],
                 fast_target: 1.0,
                 slow_target: 1.0,
@@ -554,6 +602,7 @@ impl Run {
             c.hist_disp.iter_mut().for_each(|v| *v = 0.0);
             c.hist_vel.iter_mut().for_each(|v| *v = 0.0);
             c.cand = [1.0; 5];
+            c.hard_armed = false;
             c.fast_target = 1.0;
             c.slow_target = 1.0;
             c.fast = 1.0;
@@ -573,7 +622,7 @@ impl Run {
     fn model(&mut self, io: &Io<'_, '_>, k: usize) {
         let hp = self.hist_pos;
         for c in self.ch.iter_mut() {
-            let x = dsp::bound1(io.input[c.src][k]) as f64;
+            let x = dsp::meter1(io.input[c.src][k]) as f64;
             let u = c.vfs * x;
             let i = c.current.step(u);
             let xd = c.disp.step(u);
@@ -614,18 +663,16 @@ impl Run {
             } else {
                 1.0
             };
-            let g_temp = if self.ctl[4] {
-                // TODO(SPEC): the knee (restrictive stand-in, module docs)
-                let predicted = c.t_vc + c.t_headroom;
-                // a non-finite temperature takes the restrictive path
-                if predicted >= c.t_soft || predicted.is_nan() {
-                    c.temp_floor
-                } else {
-                    1.0
-                }
-            } else {
-                1.0
-            };
+            let g_temp = if self.ctl[4] { c.temperature_knee() } else { 1.0 };
+            // hard-limit backstop of the temperature axis, with hysteresis
+            // down to the soft limit
+            if !self.ctl[4] {
+                c.hard_armed = false;
+            } else if c.t_vc > c.t_hard || c.t_vc.is_nan() {
+                c.hard_armed = true;
+            } else if c.t_vc < c.t_soft.min(c.t_hard) {
+                c.hard_armed = false;
+            }
             c.cand = [g_peak, g_disp, g_vel, g_pow, g_temp];
             c.fast_target = g_peak.min(g_disp).min(g_vel) as f32;
             c.slow_target = g_pow.min(g_temp) as f32;
@@ -668,7 +715,7 @@ impl Run {
                         c.fast = c.fast_target + rf * (c.fast - c.fast_target);
                         let rs = if c.slow_target < c.slow { self.r_attack } else { self.r_slow };
                         c.slow = c.slow_target + rs * (c.slow - c.slow_target);
-                        *o *= c.fast.min(c.slow);
+                        *o *= c.fast.min(c.slow).min(c.backstop());
                     }
                 }
             }
@@ -747,7 +794,7 @@ impl ProtectionUnit for Unit {
             s.gain = if run.fault {
                 FAILSAFE_GAIN
             } else if run.mitigate {
-                c.fast.min(c.slow)
+                c.fast.min(c.slow).min(c.backstop())
             } else {
                 1.0
             };
@@ -772,6 +819,7 @@ impl ProtectionUnit for Unit {
             n[0] = (c.t_vc - c.ambient).max(0.0);
             n[1] = (c.t_mag - c.ambient).max(0.0);
             n[2..6].copy_from_slice(&c.pbar);
+            n[6] = c.hard_armed as u8 as f64;
             out.gain[i] = c.slow as f64;
         }
         true
@@ -793,6 +841,9 @@ impl ProtectionUnit for Unit {
             for j in 0..4 {
                 c.pbar[j] = run.idle + (s[2 + j] - run.idle) * libm::pow(run.p_pole[j], samples);
             }
+            // hysteresis: an armed backstop stays armed while the cooled coil
+            // is still at or above the soft limit
+            c.hard_armed = run.ctl[4] && s[6] != 0.0 && c.t_vc >= c.t_soft.min(c.t_hard);
             let g = release_toward_unity(state.gain[i], run.r_slow as f64, samples) as f32;
             c.slow = g;
             c.slow_target = g;

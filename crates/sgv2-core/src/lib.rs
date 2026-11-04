@@ -149,7 +149,7 @@ pub trait ProtectionUnit {
 }
 
 /// Thermal nodes per channel in a [`HandOff`] record.
-pub const HANDOFF_NODES: usize = 6;
+pub const HANDOFF_NODES: usize = 8;
 
 /// A unit's persistent thermal state, handed from one stream to the next.
 /// A speaker stays hot across a pause, a suspend or a graph rebuild, so a
@@ -163,8 +163,8 @@ pub struct HandOff {
     pub sample_rate: u32,
     /// Per unit channel, the unit's thermal nodes (layout per unit: spp3
     /// coil, magnet, virtual-coil rises over ambient in K and the hard-path
-    /// arm flag; atsp coil and magnet rises; lsm2 coil and magnet rises and
-    /// the four power averages in W).
+    /// arm flag; atsp coil and magnet rises; lsm2 coil and magnet rises,
+    /// the four power averages in W and the hard-limit arm flag).
     pub node: [[f64; HANDOFF_NODES]; MAX_CHANNELS],
     /// Per unit channel, the slow (thermal) controller gain, linear.
     pub gain: [f64; MAX_CHANNELS],

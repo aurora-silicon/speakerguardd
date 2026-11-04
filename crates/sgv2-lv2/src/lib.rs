@@ -273,11 +273,33 @@ unsafe extern "C" fn run(handle: *mut c_void, frames: u32) {
     let mut input = [empty; MAX_CHANNELS];
     let mut sense = [empty; MAX_SENSE];
     let mut out_store: [&mut [f32]; MAX_CHANNELS] = Default::default();
-    for c in 0..n {
-        let (i, o) = (instance.ports[c], instance.ports[n + c]);
-        if i.is_null() || o.is_null() {
-            return;
+    // A missing program port: every connected output gets the 20 dB
+    // fail-safe of its own input (silence without one), never a stale
+    // buffer, and the call still reports and beats.
+    if (0..2 * n).any(|p| instance.ports[p].is_null()) {
+        for c in 0..n {
+            let (i, o) = (instance.ports[c], instance.ports[n + c]);
+            if o.is_null() {
+                continue;
+            }
+            // Raw pointers only: `i` may be `o` itself (in place, each
+            // sample read before it is written); another channel's input
+            // aliasing this output is muted instead.
+            let cross = (0..n).any(|k| k != c && core::ptr::eq(instance.ports[k], o));
+            for k in 0..frames {
+                // SAFETY: connected audio ports hold `frames` samples.
+                unsafe {
+                    let y = if i.is_null() || cross {
+                        0.0
+                    } else {
+                        sgv2_core::dsp::bound1(*i.add(k)) * sgv2_core::FAILSAFE_GAIN
+                    };
+                    *o.add(k) = y;
+                }
+            }
         }
+        finish_call(instance, frames, Health(Health::FAILSAFE | Health::CHANNEL_MISMATCH));
+        return;
     }
     // The core needs distinct input and output buffers. PipeWire's
     // filter-graph gives every port its own buffer; if a host ever connects
@@ -289,6 +311,7 @@ unsafe extern "C" fn run(handle: *mut c_void, frames: u32) {
             // SAFETY: connected audio ports hold `frames` samples.
             unsafe { core::slice::from_raw_parts_mut(instance.ports[n + c], frames) }.fill(0.0);
         }
+        finish_call(instance, frames, Health(Health::FAILSAFE | Health::CHANNEL_MISMATCH));
         return;
     }
     for c in 0..n {
@@ -328,6 +351,24 @@ unsafe extern "C" fn run(handle: *mut c_void, frames: u32) {
         page.beat(instance.frames, health, delay);
     }
     for (port, value) in [(2 * n + s, latency), (2 * n + s + 1, health.0 as f32), (2 * n + s + 2, delay as f32)] {
+        let p = instance.ports[port];
+        if !p.is_null() {
+            // SAFETY: control ports point at one f32.
+            unsafe { *p = value };
+        }
+    }
+}
+
+/// A call the unit did not run: the frame count, the heartbeat and the
+/// control ports still move, so the supervisor sees the fault.
+fn finish_call(instance: &mut Instance, frames: usize, health: Health) {
+    let (n, s) = (instance.channels, instance.sense);
+    instance.frames += frames as u64;
+    if let Some(page) = &instance.page {
+        page.beat(instance.frames, health, -1);
+    }
+    let latency = instance.unit.unit().latency_frames() as f32;
+    for (port, value) in [(2 * n + s, latency), (2 * n + s + 1, health.0 as f32), (2 * n + s + 2, -1.0)] {
         let p = instance.ports[port];
         if !p.is_null() {
             // SAFETY: control ports point at one f32.

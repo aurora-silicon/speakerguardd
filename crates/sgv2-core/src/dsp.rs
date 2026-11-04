@@ -187,6 +187,21 @@ pub fn mul_to(a: &[f32], b: &[f32], y: &mut [f32]) {
 /// non-finite. For `|a[n]| <= 1` the result is bit-identical to `mul_to`.
 #[inline]
 pub fn mul_bounded_to(a: &[f32], b: &[f32], y: &mut [f32]) -> bool {
+    mul_clamped_to(a, b, y, 1.0)
+}
+
+/// `y[n] = meter1(a[n]) * b[n]`: the program as the model meters see it,
+/// times the gain. Returns whether any `a[n]` was non-finite.
+#[inline]
+pub fn mul_metered_to(a: &[f32], b: &[f32], y: &mut [f32]) -> bool {
+    mul_clamped_to(a, b, y, METER_FS)
+}
+
+/// `y[n] = clamp1(a[n], lim) * b[n]`, a non-finite `a[n]` 0; returns
+/// whether any `a[n]` was non-finite. For `|a[n]| <= lim` bit-identical to
+/// `mul_to`.
+#[inline]
+pub fn mul_clamped_to(a: &[f32], b: &[f32], y: &mut [f32], lim: f32) -> bool {
     let n = a.len().min(b.len()).min(y.len());
     #[cfg(not(target_arch = "aarch64"))]
     let (i, mut bad) = (0, false);
@@ -195,8 +210,8 @@ pub fn mul_bounded_to(a: &[f32], b: &[f32], y: &mut [f32]) -> bool {
     let (i, mut bad) = unsafe {
         let mut i = 0;
         let (pa, pb, py) = (a.as_ptr(), b.as_ptr(), y.as_mut_ptr());
-        let one = vdupq_n_f32(1.0);
-        let neg = vdupq_n_f32(-1.0);
+        let one = vdupq_n_f32(lim);
+        let neg = vdupq_n_f32(-lim);
         let inf = vdupq_n_f32(f32::INFINITY);
         let zero = vdupq_n_f32(0.0);
         let mut nf = vdupq_n_u32(0);
@@ -213,7 +228,7 @@ pub fn mul_bounded_to(a: &[f32], b: &[f32], y: &mut [f32]) -> bool {
     };
     for ((o, &x), &g) in y[i..n].iter_mut().zip(&a[i..n]).zip(&b[i..n]) {
         bad |= !x.is_finite();
-        *o = bound1(x) * g;
+        *o = if x.abs() < f32::INFINITY { x.clamp(-lim, lim) } else { 0.0 } * g;
     }
     bad
 }
@@ -399,16 +414,41 @@ pub fn sanitize(x: &mut [f32]) -> usize {
 }
 
 /// One sample held to digital full scale: `clamp(x, -1, 1)`, a non-finite
-/// sample 0. No converter can deliver more than full scale, so this is the
-/// drive a sample can actually produce; every model meter and every output
-/// sample goes through it, which also bounds every square sum (16 lanes of
-/// at most 1024 unit squares per update never approach `f32::MAX`).
+/// sample 0. Every output sample goes through it, so no unit ever hands
+/// the converter more than full scale or a non-finite value.
 #[inline]
 pub fn bound1(x: f32) -> f32 {
     if x.abs() < f32::INFINITY {
         x.clamp(-1.0, 1.0)
     } else {
         0.0
+    }
+}
+
+/// The bound on what the model meters see, in units of full scale. The
+/// meters follow the reference, which meters the program unclamped (a
+/// tuning's own EQ can peak slightly over full scale, and under-metering is
+/// the less protective direction); 16 FS is far above any real program yet
+/// keeps every square sum finite (16 lanes of at most 1024 samples of
+/// 256 FS^2 per update) and keeps NaN and Inf out of the model.
+pub const METER_FS: f32 = 16.0;
+
+/// One sample as the model meters see it: `clamp(x, -METER_FS, METER_FS)`,
+/// a non-finite sample 0.
+#[inline]
+pub fn meter1(x: f32) -> f32 {
+    if x.abs() < f32::INFINITY {
+        x.clamp(-METER_FS, METER_FS)
+    } else {
+        0.0
+    }
+}
+
+/// [`meter1`] in place.
+#[inline]
+pub fn meter(x: &mut [f32]) {
+    for v in x.iter_mut() {
+        *v = meter1(*v);
     }
 }
 
@@ -454,18 +494,6 @@ pub fn clamp_in_place(x: &mut [f32], lim: f32) {
     for v in x.iter_mut() {
         *v = clamp1(*v, lim);
     }
-}
-
-/// `y[n] = clamp1(a[n], lim) * b[n]`; returns whether any `a[n]` was
-/// non-finite. For `|a[n]| <= lim` bit-identical to `mul_to`.
-#[inline]
-pub fn mul_clamped_to(a: &[f32], b: &[f32], y: &mut [f32], lim: f32) -> bool {
-    let mut bad = false;
-    for ((o, &x), &g) in y.iter_mut().zip(a).zip(b) {
-        bad |= !x.is_finite();
-        *o = clamp1(x, lim) * g;
-    }
-    bad
 }
 
 #[cfg(test)]
