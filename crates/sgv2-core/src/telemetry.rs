@@ -5,6 +5,9 @@
 
 use crate::{Health, MAX_CHANNELS};
 
+/// `repr(C)`: records cross a shared mapping between the plugin (inside
+/// PipeWire) and the supervisor.
+#[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct ChannelState {
     // spp3 / atsp / lsm2 thermal
@@ -47,6 +50,7 @@ impl ChannelState {
     };
 }
 
+#[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct Telemetry {
     /// Sample index of the first frame of the quantum this describes.

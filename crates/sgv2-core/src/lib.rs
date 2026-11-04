@@ -13,12 +13,21 @@
 //! - Until a unit's behaviour is implemented it attenuates by the
 //!   fail-safe amount; nothing in this crate ever passes audio through
 //!   unprotected.
-#![cfg_attr(not(test), no_std)]
+#![cfg_attr(not(any(test, feature = "std")), no_std)]
+
+// Storage (look-ahead lines, per-channel state) is allocated once, when a
+// unit is built from its parameters; `process` never allocates.
+extern crate alloc;
 
 pub mod atsp;
 pub mod blob;
+pub mod delay;
+pub mod dsp;
 pub mod failsafe;
 pub mod lsm2;
+pub mod placeholder;
+pub mod ring;
+pub mod sense;
 pub mod spp3;
 pub mod telemetry;
 
@@ -60,6 +69,7 @@ impl UnitKind {
 }
 
 /// Health of the unit after a `process` call, as bits.
+#[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Health(pub u32);
 

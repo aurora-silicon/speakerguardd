@@ -4,7 +4,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use sgv2_core::{atsp, lsm2, spp3, Io, ProtectionUnit, Telemetry};
+use sgv2_core::{atsp, lsm2, placeholder, spp3, Io, ProtectionUnit, Telemetry};
 
 struct Counting;
 static ALLOCS: AtomicUsize = AtomicUsize::new(0);
@@ -38,9 +38,76 @@ fn run(unit: &mut dyn ProtectionUnit, channels: usize, sense: usize) {
     }
 }
 
+/// A valid synthetic spp3 set (not any Mac's values).
+fn spp3_synthetic() -> spp3::Params {
+    let mut p = spp3::Params {
+        channels: 6,
+        sample_rate: 48_000,
+        block_frames: 512,
+        thermal_ambient_temp: 40.0,
+        thermal_gain_attack_time_s: 1.0,
+        thermal_gain_release_time_s: 5.0,
+        thermal_lookahead_delay_ms: 1.0,
+        thermal_protection_enabled: 1,
+        ..spp3::Params::default()
+    };
+    for c in 0..6 {
+        p.ch[c] = spp3::ChannelParams {
+            source: c as u32,
+            group: (c / 4) as u32,
+            t_sett_vc: 20.0,
+            t_sett_mg: 20.0,
+            tau_tvc: 1.0,
+            tau_tmg: 50.0,
+            temperature_limit: 100.0,
+            hard_temp_limit_headroom: 5.0,
+            reb_ref: 4.0,
+            rshunt: 0.1,
+            ag: 10.0,
+            imon_scale: 1.0,
+            vmon_scale: 10.0,
+            sense_i: 2 * c as u32,
+            sense_v: 2 * c as u32 + 1,
+            thermal_ff_speedup_factor: 0.5,
+            ..Default::default()
+        };
+    }
+    p
+}
+
 #[test]
 fn no_unit_allocates_in_process() {
     run(&mut spp3::Unit::new(spp3::Params::default()), 6, 12);
+    let mut real = spp3::Unit::new(spp3_synthetic());
+    assert!(!real.is_failsafe());
+    run(&mut real, 6, 12);
+    run(&mut real, 6, 0);
+    run(&mut real, 5, 12);
+    run(&mut placeholder::Unit::new(placeholder::Params { channels: 6, ..Default::default() }), 6, 12);
     run(&mut lsm2::Unit::new(lsm2::Params::default()), 2, 0);
     run(&mut atsp::Unit::new(atsp::Params::default()), 4, 0);
+    let slot = atsp::Slot {
+        channel_mask: 0b1111,
+        gain_link: 1,
+        amplifier_sensitivity: 10.0,
+        rdc: 8.0,
+        rth_vc: 30.0,
+        tau_vc: 1.0,
+        rth_mg: 40.0,
+        tau_mg: 20.0,
+        ambient: 40.0,
+        temperature_limit: 110.0,
+        hard_limit_headroom: 8.0,
+        attack_ms: 500.0,
+        release_ms: 5000.0,
+    };
+    let mut a = atsp::Unit::new(atsp::Params {
+        channels: 4,
+        sample_rate: 48_000,
+        block_frames: 512,
+        slot: [slot, Default::default(), Default::default()],
+        ..Default::default()
+    });
+    assert!(!a.is_failsafe());
+    run(&mut a, 4, 0);
 }
