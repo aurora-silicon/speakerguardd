@@ -15,6 +15,8 @@
 #define APPLE_ENERGY_UNITY 0x80000000U
 #define APPLE_ENERGY_SQUARED 0
 #define APPLE_ENERGY_ABSOLUTE 1
+/* Private payload format: IEEE binary32, with 0.5 at the speaker wire's FS. */
+#define APPLE_ENERGY_FORMAT_NEO_F32 0x1000000e
 
 struct apple_energy_snapshot {
 	u64 epoch;
