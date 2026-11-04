@@ -34,6 +34,12 @@
 //! - **Controller cadence.** Candidates update every 256 frames over the
 //!   samples still in the delay line (everything that has not yet left).
 //!
+//! Full scale: the program is held to digital full scale (`clamp(x, -1,
+//! 1)`, a non-finite sample 0) before the model and on the output, so the
+//! model sees the drive the speaker can get and a huge finite sample cannot
+//! leave it hot for minutes. A model state that goes non-finite latches the
+//! 20 dB fail-safe (`Health::MODEL_FAULT`) until reset.
+//!
 //! Failure: the reference unit fails initialisation outright when neither
 //! estimator can be built. Here an unusable parameter set, or a geometry
 //! mismatch, gives the 20 dB fail-safe, which on the Neo equals the
@@ -378,6 +384,8 @@ struct Run {
     r_fast: f32,
     r_slow: f32,
     ch: Vec<Chan>,
+    /// A model state went non-finite: the fail-safe is latched until reset.
+    fault: bool,
 }
 
 impl Unit {
@@ -493,6 +501,7 @@ impl Run {
             r_fast: pole(rate, p.fast_release_time_ms as f64 * 1e-3) as f32,
             r_slow: pole(rate, p.slow_release_time_ms as f64 * 1e-3) as f32,
             ch,
+            fault: false,
         })
     }
 
@@ -520,6 +529,7 @@ impl Run {
         self.pos = 0;
         self.frame = 0;
         self.last_frame = 0;
+        self.fault = false;
     }
 
     /// Model one input sample of every channel.
@@ -527,8 +537,7 @@ impl Run {
     fn model(&mut self, io: &Io<'_, '_>, k: usize) {
         let hp = self.hist_pos;
         for c in self.ch.iter_mut() {
-            let x = io.input[c.src][k];
-            let x = if x.is_finite() { x as f64 } else { 0.0 };
+            let x = dsp::bound1(io.input[c.src][k]) as f64;
             let u = c.vfs * x;
             let i = c.current.step(u);
             let xd = c.disp.step(u);
@@ -584,6 +593,12 @@ impl Run {
             c.cand = [g_peak, g_disp, g_vel, g_pow, g_temp];
             c.fast_target = g_peak.min(g_disp).min(g_vel) as f32;
             c.slow_target = g_pow.min(g_temp) as f32;
+            // any non-finite model or controller state latches the fail-safe
+            let model = [c.t_vc, c.t_mag, c.last_x, c.last_v].iter().chain(&c.pbar).all(|v| v.is_finite());
+            let gains = c.cand.iter().all(|v| v.is_finite()) && c.fast.is_finite() && c.slow.is_finite();
+            if !(model && gains) {
+                self.fault = true;
+            }
         }
         if self.link && self.n > 1 {
             let (mut slow, mut pow) = (1.0f32, 1.0f32);
@@ -610,7 +625,7 @@ impl Run {
                 let out = &mut io.output[c.src][k..k + m];
                 // SAFETY: distinct slices of `m` samples.
                 unsafe { c.delay.run(inp.as_ptr(), out.as_mut_ptr(), m) };
-                dsp::sanitize(out);
+                dsp::bound(out);
                 if self.mitigate {
                     for o in out.iter_mut() {
                         let rf = if c.fast_target < c.fast { self.r_attack } else { self.r_fast };
@@ -628,6 +643,10 @@ impl Run {
                 self.pos = 0;
                 self.control();
                 self.last_frame = self.frame - CONTROLLER_FRAMES as u64;
+                if self.fault {
+                    crate::failsafe::fill_from(io, k, FAILSAFE_GAIN);
+                    return;
+                }
             }
         }
     }
@@ -655,7 +674,14 @@ impl ProtectionUnit for Unit {
             crate::spp3::failsafe_io(&mut io);
             return Health(Health::FAILSAFE | Health::CHANNEL_MISMATCH);
         }
+        if run.fault {
+            crate::spp3::failsafe_io(&mut io);
+            return Health(Health::FAILSAFE | Health::MODEL_FAULT);
+        }
         run.process(&mut io);
+        if run.fault {
+            return Health(Health::FAILSAFE | Health::MODEL_FAULT);
+        }
         Health::OK
     }
     fn telemetry(&self, out: &mut Telemetry) {
@@ -668,6 +694,9 @@ impl ProtectionUnit for Unit {
             return;
         };
         out.frame = run.last_frame;
+        if run.fault {
+            out.health = Health(Health::FAILSAFE | Health::MODEL_FAULT);
+        }
         for c in &run.ch {
             let mut s = ChannelState::ABSENT;
             s.modeled_power_w = c.pbar[2] as f32;
@@ -679,13 +708,113 @@ impl ProtectionUnit for Unit {
             for (a, &g) in s.axis_gain.iter_mut().zip(&c.cand) {
                 *a = g as f32;
             }
-            s.gain = if run.mitigate { c.fast.min(c.slow) } else { 1.0 };
+            s.gain = if run.fault {
+                FAILSAFE_GAIN
+            } else if run.mitigate {
+                c.fast.min(c.slow)
+            } else {
+                1.0
+            };
             out.channels[c.src] = s;
         }
     }
     fn reset(&mut self) {
         if let Some(r) = self.run.as_mut() {
             r.reset();
+        }
+    }
+}
+
+#[cfg(test)]
+mod fault_tests {
+    use super::*;
+
+    fn params() -> Params {
+        let mut p = Params {
+            channels: 2,
+            sample_rate: 48_000,
+            enable_mitigation: 1,
+            control_power: 1,
+            control_temperature: 1,
+            link_slow_gains: 1,
+            model_only: 1,
+            attack_time_ms: 2.0,
+            fast_release_time_ms: 150.0,
+            slow_release_time_ms: 10_000.0,
+            filterbank_latency_ms: 2.5,
+            speaker_response_lookahead_ms: 1.0,
+            power_time_scale_s: [0.002, 0.2, 2.0, 30.0],
+            power_hard_limit_w: [50.0, 20.0, 2.0, 1.5],
+            power_soft_limit_pct: [100.0; 4],
+            max_power_attenuation_db: 4.0,
+            low_rail_power_ratio: 1.0,
+            ..Params::default()
+        };
+        for c in 0..2 {
+            p.ch[c] = ChannelParams {
+                source: c as u32,
+                volts_full_scale: 6.0,
+                parasitic_resistance: 0.2,
+                rdc: 4.0,
+                bl: 0.8,
+                mms_kg: 0.0002,
+                rms: 0.2,
+                kms: 1500.0,
+                disp_bl: 0.8,
+                disp_mms_kg: 0.00022,
+                disp_rms: 0.25,
+                disp_kms: 1600.0,
+                rth_vc: 30.0,
+                tau_vc: 2.0,
+                rth_mag: 20.0,
+                tau_mag: 60.0,
+                ambient: 40.0,
+                amplitude_limit: 1.0,
+                displacement_limit: 0.0005,
+                velocity_limit0: 0.5,
+                max_velocity_attenuation_db: 18.0,
+                temperature_soft_limit: 110.0,
+                temperature_hard_limit: 125.0,
+                temperature_headroom: 4.0,
+                max_temperature_attenuation_db: 10.0,
+            };
+        }
+        p
+    }
+
+    fn run(u: &mut Unit, x: f32, n: usize) -> (Vec<f32>, Health) {
+        let input = vec![x; n];
+        let ins: [&[f32]; 2] = [&input, &input];
+        let mut o0 = vec![0.0f32; n];
+        let mut o1 = vec![0.0f32; n];
+        let mut outs: [&mut [f32]; 2] = [&mut o0, &mut o1];
+        let h = u.process(Io { frames: n, input: &ins, sense: &[], output: &mut outs });
+        (o0, h)
+    }
+
+    /// Review finding 1: a non-finite state latches 20 dB until reset.
+    #[test]
+    fn a_non_finite_model_state_latches_the_failsafe_until_reset() {
+        let poisons: [fn(&mut Run); 3] =
+            [|r| r.ch[0].t_mag = f64::NAN, |r| r.ch[1].pbar[2] = f64::INFINITY, |r| r.ch[0].slow = f32::NAN];
+        for poison in poisons {
+            let mut u = Unit::new(params());
+            let (o, h) = run(&mut u, 0.01, 1024);
+            assert_eq!((o[1023], h), (0.01, Health::OK));
+            poison(u.run.as_mut().unwrap());
+            let (_, h) = run(&mut u, 0.01, 512);
+            assert!(h.0 & Health::MODEL_FAULT != 0 && h.is_failsafe());
+            for _ in 0..4 {
+                let (o, h) = run(&mut u, 1.0, 300);
+                assert!(h.0 & Health::MODEL_FAULT != 0);
+                assert!(o.iter().all(|&v| (v - FAILSAFE_GAIN).abs() < 1e-7));
+            }
+            let mut t = Telemetry::new();
+            u.telemetry(&mut t);
+            assert!(t.health.0 & Health::MODEL_FAULT != 0 && t.channels[0].gain == FAILSAFE_GAIN);
+            u.reset();
+            let (o, h) = run(&mut u, 0.01, 1024);
+            assert_eq!((o[1023], h), (0.01, Health::OK));
         }
     }
 }

@@ -37,8 +37,15 @@
 //!   target is `min(smoothed g_ff, group min g_hard)`, bypassing the attack.
 //! - **Dezipper.** The selected target crosses two cascaded per-sample
 //!   one-poles, `k = 1 - exp(ln(0.01) / (0.005 fs))`.
+//! - **Full scale.** The program is held to digital full scale (`clamp(x,
+//!   -1, 1)`, the most any converter delivers) before the gain and before
+//!   both model meters, so the meters see the drive the speaker can get
+//!   and no finite sample can overflow them. In-range audio is unchanged.
 //! - **Fail-safe.** A channel-count mismatch, or non-finite drive (the
-//!   simple-meter failure), gives 20 dB for the affected frames.
+//!   simple-meter failure), gives 20 dB for the affected frames. A model
+//!   state that goes non-finite latches the 20 dB fail-safe
+//!   (`Health::MODEL_FAULT`) until reset; candidate selection propagates
+//!   NaN, so it can never fall back to unity.
 //! - **Reset.** The parameters' start state (64007 = 2: ambient, the macOS
 //!   configuration), unity gains, model history cleared, CL temperature
 //!   reported as 20 C.
@@ -630,6 +637,8 @@ struct Run {
     sums: BlockSums,
     sense_ok: bool,
     estimator: DelayEstimator,
+    /// A model state went non-finite: the fail-safe is latched until reset.
+    fault: bool,
 }
 
 pub struct Unit {
@@ -757,6 +766,7 @@ impl Run {
             sums,
             sense_ok: false,
             estimator: DelayEstimator::new(),
+            fault: false,
         })
     }
 
@@ -792,6 +802,7 @@ impl Run {
         self.sums.clear();
         self.sense_ok = false;
         self.estimator.reset();
+        self.fault = false;
     }
 
     /// Frames `off..off+len` of the host buffers, inside one thermal update.
@@ -811,15 +822,16 @@ impl Run {
             let inp = &io.input[c.src][off..off + len];
             let out = &mut io.output[c.src][off..off + len];
             let curve = &self.curve[c.group * THERMAL_FRAMES..][..len];
-            dsp::mul_to(inp, curve, out);
+            // the program held to full scale, times the gain
+            let non_finite = dsp::mul_bounded_to(inp, curve, out);
             if c.headroom != 1.0 {
                 dsp::scale_in_place(out, c.headroom);
             }
-            if dsp::peak_abs(out) == f32::INFINITY {
+            if non_finite {
                 // simple-meter failure: at most 20 dB below the input on
                 // these frames, non-finite samples muted
                 for ((o, &x), &g) in out.iter_mut().zip(inp).zip(curve) {
-                    *o = if x.is_finite() { x * (g * c.headroom).min(FAILSAFE_GAIN) } else { 0.0 };
+                    *o = dsp::bound1(x) * (g * c.headroom).min(FAILSAFE_GAIN);
                 }
                 *health |= Health::FAILSAFE;
             }
@@ -833,7 +845,8 @@ impl Run {
                 if FF_FROM_UNPROTECTED {
                     // SAFETY: as above, for the input.
                     unsafe { c.delay_in.run(inp.as_ptr().add(m0), c.scratch.as_mut_ptr(), m) };
-                    dsp::sanitize(&mut c.scratch[..m]);
+                    // held to full scale like the program the output carries
+                    dsp::bound(&mut c.scratch[..m]);
                     c.acc_in.add_sq(&c.scratch[..m], phase + m0);
                 }
                 m0 += m;
@@ -917,14 +930,14 @@ impl Run {
                 c.armed = false;
             }
             c.g_hard = if c.armed { ratio(num - HARD_TARGET_BELOW) } else { 1.0 };
-            ff_t[c.group] = ff_t[c.group].min(c.g_ff);
-            hard_t[c.group] = hard_t[c.group].min(c.g_hard);
+            ff_t[c.group] = min_nan(ff_t[c.group], c.g_ff);
+            hard_t[c.group] = min_nan(hard_t[c.group], c.g_hard);
         }
         for (gi, g) in self.groups.iter_mut().enumerate() {
             let t = ff_t[gi];
             let k = if t < g.g { self.k_attack } else { self.k_release };
             g.g += k * (t - g.g);
-            let sel = g.g.min(hard_t[gi]);
+            let sel = min_nan(g.g, hard_t[gi]);
             // The smoother's state is the selected gain: after the hard path
             // disarms, the gain releases from where the hard path left it
             // (no step back up). Black-box reference: thermal_ramp_1k.
@@ -946,6 +959,27 @@ impl Run {
         self.estimator.end_block();
         self.sums.clear();
         self.last_frame = self.frame - THERMAL_FRAMES as u64;
+        // any non-finite model or controller state latches the fail-safe
+        let chans = self.ch.iter().all(|c| {
+            let lim = c.cl.as_ref().is_none_or(|cl| cl.limit_s.is_finite() && cl.t_cl.is_finite());
+            let ff = c.ff.is_none_or(|f| f.theta.is_finite());
+            c.vc.theta.is_finite() && c.mg.theta.is_finite() && ff && lim && c.g_ff.is_finite() && c.g_hard.is_finite()
+        });
+        let groups = self.groups.iter().all(|g| g.g.is_finite() && g.sel.is_finite());
+        if !(chans && groups) {
+            self.fault = true;
+        }
+    }
+}
+
+/// `min` that propagates NaN (`f64::min` drops it, which here would turn a
+/// poisoned candidate into unity gain).
+#[inline]
+fn min_nan(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        f64::NAN
+    } else {
+        a.min(b)
     }
 }
 
@@ -974,6 +1008,10 @@ impl ProtectionUnit for Unit {
             failsafe_io(&mut io);
             return Health(Health::FAILSAFE | Health::CHANNEL_MISMATCH);
         }
+        if run.fault {
+            failsafe_io(&mut io);
+            return Health(Health::FAILSAFE | Health::MODEL_FAULT);
+        }
         let mut health = 0u32;
         let mut off = 0;
         while off < frames {
@@ -984,6 +1022,10 @@ impl ProtectionUnit for Unit {
             if run.pos == THERMAL_FRAMES {
                 run.update();
                 run.pos = 0;
+                if run.fault {
+                    crate::failsafe::fill_from(&mut io, off, FAILSAFE_GAIN);
+                    return Health(Health::FAILSAFE | Health::MODEL_FAULT);
+                }
             }
         }
         if !run.sense_ok {
@@ -1003,6 +1045,9 @@ impl ProtectionUnit for Unit {
         };
         out.frame = run.last_frame;
         out.health = Health(if run.sense_ok { 0 } else { Health::OPEN_LOOP });
+        if run.fault {
+            out.health = Health(Health::FAILSAFE | Health::MODEL_FAULT);
+        }
         for c in run.ch.iter() {
             let g = &run.groups[c.group];
             let t_ol = (run.ambient + c.vc.theta + c.mg.theta) as f32;
@@ -1027,7 +1072,7 @@ impl ProtectionUnit for Unit {
             }
             // axis 4 is temperature: the selected (pre-dezipper) target
             s.axis_gain[4] = g.sel;
-            s.gain = g.z2;
+            s.gain = if run.fault { FAILSAFE_GAIN } else { g.z2 };
             out.channels[c.src] = s;
         }
     }
@@ -1043,4 +1088,83 @@ impl ProtectionUnit for Unit {
 /// finite and bounded for any input (see [`crate::failsafe::fill_from`]).
 pub(crate) fn failsafe_io(io: &mut Io<'_, '_>) {
     crate::failsafe::fill_from(io, 0, FAILSAFE_GAIN);
+}
+
+#[cfg(test)]
+mod fault_tests {
+    use super::*;
+
+    fn params() -> Params {
+        let mut p = Params {
+            channels: 2,
+            sample_rate: 48_000,
+            block_frames: 512,
+            thermal_ambient_temp: 40.0,
+            thermal_gain_attack_time_s: 0.5,
+            thermal_gain_release_time_s: 2.0,
+            thermal_lookahead_delay_ms: 1.0,
+            thermal_protection_enabled: 1,
+            ..Params::default()
+        };
+        for c in 0..2 {
+            p.ch[c] = ChannelParams {
+                source: c as u32,
+                t_sett_vc: 20.0,
+                t_sett_mg: 10.0,
+                tau_tvc: 0.4,
+                tau_tmg: 3.0,
+                temperature_limit: 120.0,
+                hard_temp_limit_headroom: 8.0,
+                reb_ref: 4.0,
+                rshunt: 0.2,
+                ag: 10.0,
+                thermal_ff_speedup_factor: 0.5,
+                ..Default::default()
+            };
+        }
+        p
+    }
+
+    fn run(u: &mut Unit, x: f32, n: usize) -> (Vec<f32>, Health) {
+        let input = vec![x; n];
+        let ins: [&[f32]; 2] = [&input, &input];
+        let mut o0 = vec![0.0f32; n];
+        let mut o1 = vec![0.0f32; n];
+        let mut outs: [&mut [f32]; 2] = [&mut o0, &mut o1];
+        let h = u.process(Io { frames: n, input: &ins, sense: &[], output: &mut outs });
+        (o0, h)
+    }
+
+    /// Review finding 1: a NaN state used to vanish in `f64::min` and leave
+    /// unity gain. Every way a state can go non-finite now latches 20 dB.
+    #[test]
+    fn a_non_finite_model_state_latches_the_failsafe_until_reset() {
+        let poisons: [fn(&mut Run); 4] = [
+            |r| r.ch[0].mg.theta = f64::NAN,
+            |r| r.ch[1].vc.theta = f64::INFINITY,
+            |r| r.ch[0].ff.as_mut().unwrap().theta = f64::NAN,
+            |r| r.groups[0].g = f64::NAN,
+        ];
+        for poison in poisons {
+            let mut u = Unit::new(params());
+            let (o, h) = run(&mut u, 0.5, 512);
+            assert_eq!((o[511], h.0 & Health::FAILSAFE), (0.5, 0));
+            poison(u.run.as_mut().unwrap());
+            // the next update latches; the frames after it get 20 dB
+            let (o, h) = run(&mut u, 0.5, 512);
+            assert!(h.0 & Health::MODEL_FAULT != 0 && h.is_failsafe());
+            assert!((o[511] - 0.05).abs() < 1e-7, "{}", o[511]);
+            for _ in 0..4 {
+                let (o, h) = run(&mut u, 1.0, 300);
+                assert!(h.0 & Health::MODEL_FAULT != 0);
+                assert!(o.iter().all(|&v| (v - FAILSAFE_GAIN).abs() < 1e-7));
+            }
+            let mut t = Telemetry::new();
+            u.telemetry(&mut t);
+            assert!(t.health.0 & Health::MODEL_FAULT != 0 && t.channels[0].gain == FAILSAFE_GAIN);
+            u.reset();
+            let (o, h) = run(&mut u, 0.5, 512);
+            assert_eq!((o[511], h.0 & Health::FAILSAFE), (0.5, 0));
+        }
+    }
 }

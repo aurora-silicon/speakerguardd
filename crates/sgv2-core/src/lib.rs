@@ -84,6 +84,9 @@ impl Health {
     /// Sense data was expected and is unusable; affected channels run
     /// open loop. This is a normal state, not a fault.
     pub const OPEN_LOOP: u32 = 1 << 3;
+    /// A model state went non-finite. The unit has latched the fail-safe
+    /// until `reset`; it never trusts that state again.
+    pub const MODEL_FAULT: u32 = 1 << 4;
 
     pub fn is_failsafe(self) -> bool {
         self.0 & Self::FAILSAFE != 0

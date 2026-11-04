@@ -17,6 +17,11 @@
 //! - the 20 dB panic while `T_vc > T_limit + headroom`, at once;
 //! - reset at ambient and unity gain.
 //!
+//! The program is held to digital full scale (`clamp(x, -1, 1)`, a
+//! non-finite sample 0) before the gain and before both power meters, so
+//! no finite sample can overflow them. A model state that goes non-finite
+//! latches the 20 dB fail-safe (`Health::MODEL_FAULT`) until reset.
+//!
 //! A tuning with the global `Bypass` set is refused (the unit then runs the
 //! fail-safe): bypass is never a protection state. A channel no slot claims
 //! is unconstrained by the specification; it is refused too, since an
@@ -35,6 +40,8 @@ use crate::{dsp, ChannelState, Health, Io, ProtectionUnit, Telemetry, UnitKind, 
 const EPS: f64 = f32::MIN_POSITIVE as f64;
 /// Longest update in host-block mode (`block_frames = 0`), frames.
 const HOST_MAX: usize = 4096;
+/// Stack chunk for bounding the unprotected drive before metering.
+const BOUND_CHUNK: usize = 64;
 
 /// One speaker-type slot (A, B or C).
 #[repr(C)]
@@ -173,6 +180,8 @@ struct Run {
     pos: usize,
     frame: u64,
     last_frame: u64,
+    /// A model state went non-finite: the fail-safe is latched until reset.
+    fault: bool,
 }
 
 pub struct Unit {
@@ -269,7 +278,7 @@ impl Run {
         let ch: Vec<Chan> =
             ch.into_iter().map(|c| c.ok_or(InitError::Invalid("unclaimed channel"))).collect::<Result<_, _>>()?;
         let curve = vec![1.0; groups.len() * block];
-        Ok(Run { n, block, dynamic, rate, ch, groups, curve, pos: 0, frame: 0, last_frame: 0 })
+        Ok(Run { n, block, dynamic, rate, ch, groups, curve, pos: 0, frame: 0, last_frame: 0, fault: false })
     }
 
     fn reset(&mut self) {
@@ -290,33 +299,39 @@ impl Run {
         self.pos = 0;
         self.frame = 0;
         self.last_frame = 0;
+        self.fault = false;
     }
 
-    fn segment(&mut self, io: &mut Io<'_, '_>, off: usize, len: usize) {
+    /// Returns whether any input sample was non-finite (the meter failure:
+    /// those frames get at most the fail-safe gain).
+    fn segment(&mut self, io: &mut Io<'_, '_>, off: usize, len: usize) -> bool {
         let phase = self.pos;
+        let mut failed = false;
         for (c, ch) in self.ch.iter_mut().enumerate() {
             let inp = &io.input[c][off..off + len];
             let out = &mut io.output[c][off..off + len];
             let curve = &self.curve[ch.group * self.block + phase..][..len];
-            let mut acc = ch.acc_in;
-            acc.add_sq(inp, phase);
-            if !acc.is_finite() {
-                acc = ch.acc_in;
-                for (k, &v) in inp.iter().enumerate() {
-                    acc.add_sq(&[if v.is_finite() { v } else { 0.0 }], phase + k);
-                }
+            // the unprotected drive, held to full scale
+            let mut k = 0;
+            while k < len {
+                let m = (len - k).min(BOUND_CHUNK);
+                let mut x = [0.0f32; BOUND_CHUNK];
+                x[..m].copy_from_slice(&inp[k..k + m]);
+                dsp::bound(&mut x[..m]);
+                ch.acc_in.add_sq(&x[..m], phase + k);
+                k += m;
             }
-            ch.acc_in = acc;
-            dsp::mul_to(inp, curve, out);
-            if dsp::peak_abs(out) == f32::INFINITY {
+            if dsp::mul_bounded_to(inp, curve, out) {
                 for ((o, &x), &g) in out.iter_mut().zip(inp).zip(curve) {
-                    *o = if x.is_finite() { x * g.min(FAILSAFE_GAIN) } else { 0.0 };
+                    *o = dsp::bound1(x) * g.min(FAILSAFE_GAIN);
                 }
+                failed = true;
             }
             // P covers the protected drive x[n]
             ch.acc.add_sq(out, phase);
         }
         self.frame += len as u64;
+        failed
     }
 
     fn end_block(&mut self) {
@@ -341,10 +356,19 @@ impl Run {
             let p_drive = c.elec * c.acc_in.total() / blk;
             c.acc_in.clear();
             let allow = (c.span - c.theta_mg) / c.rth_vc;
-            c.g_target = libm::sqrt(allow.max(0.0) / p_drive.max(EPS)).min(1.0);
+            c.g_target = if allow.is_nan() || p_drive.is_nan() {
+                f64::NAN
+            } else {
+                libm::sqrt(allow.max(0.0) / p_drive.max(EPS)).min(1.0)
+            };
             c.hard = c.ambient + c.theta_vc > c.hard_limit;
-            tgt[c.group] = tgt[c.group].min(c.g_target);
+            tgt[c.group] =
+                if tgt[c.group].is_nan() || c.g_target.is_nan() { f64::NAN } else { tgt[c.group].min(c.g_target) };
             hard[c.group] |= c.hard;
+        }
+        // any non-finite model or controller state latches the fail-safe
+        if !self.ch.iter().all(|c| c.theta_vc.is_finite() && c.theta_mg.is_finite() && c.g_target.is_finite()) {
+            self.fault = true;
         }
         for (gi, g) in self.groups.iter_mut().enumerate() {
             let t = tgt[gi] as f32;
@@ -358,6 +382,9 @@ impl Run {
                 *c = v;
             }
             g.gain = v;
+            if !v.is_finite() {
+                self.fault = true;
+            }
             g.hard = hard[gi];
             if g.hard {
                 curve.iter_mut().for_each(|c| *c *= FAILSAFE_GAIN);
@@ -389,22 +416,33 @@ impl ProtectionUnit for Unit {
             crate::spp3::failsafe_io(&mut io);
             return Health(Health::FAILSAFE | Health::CHANNEL_MISMATCH);
         }
+        if run.fault {
+            crate::spp3::failsafe_io(&mut io);
+            return Health(Health::FAILSAFE | Health::MODEL_FAULT);
+        }
+        let mut health = 0;
         let mut off = 0;
         while off < frames {
             let len = (run.block - run.pos).min(frames - off);
-            run.segment(&mut io, off, len);
+            if run.segment(&mut io, off, len) {
+                health |= Health::FAILSAFE;
+            }
             off += len;
             run.pos += len;
             if run.pos == run.block {
                 run.end_block();
                 run.pos = 0;
+                if run.fault {
+                    crate::failsafe::fill_from(&mut io, off, FAILSAFE_GAIN);
+                    return Health(Health::FAILSAFE | Health::MODEL_FAULT);
+                }
             }
         }
         if run.dynamic && run.pos > 0 {
             run.end_block();
             run.pos = 0;
         }
-        Health::OK
+        Health(health)
     }
     fn telemetry(&self, out: &mut Telemetry) {
         out.clear();
@@ -416,6 +454,9 @@ impl ProtectionUnit for Unit {
             return;
         };
         out.frame = run.last_frame;
+        if run.fault {
+            out.health = Health(Health::FAILSAFE | Health::MODEL_FAULT);
+        }
         for (i, c) in run.ch.iter().enumerate() {
             let g = &run.groups[c.group];
             let mut s = ChannelState::ABSENT;
@@ -424,13 +465,87 @@ impl ProtectionUnit for Unit {
             s.magnet_temp_c = (c.ambient + c.theta_mg) as f32;
             s.ol_temp_c = s.coil_temp_c;
             s.axis_gain[4] = c.g_target as f32;
-            s.gain = if g.hard { g.gain * FAILSAFE_GAIN } else { g.gain };
+            s.gain = if run.fault {
+                FAILSAFE_GAIN
+            } else if g.hard {
+                g.gain * FAILSAFE_GAIN
+            } else {
+                g.gain
+            };
             out.channels[i] = s;
         }
     }
     fn reset(&mut self) {
         if let Some(r) = self.run.as_mut() {
             r.reset();
+        }
+    }
+}
+
+#[cfg(test)]
+mod fault_tests {
+    use super::*;
+
+    fn params() -> Params {
+        let s = Slot {
+            channel_mask: 0b11,
+            gain_link: 1,
+            amplifier_sensitivity: 10.0,
+            rdc: 8.0,
+            rth_vc: 30.0,
+            tau_vc: 1.0,
+            rth_mg: 40.0,
+            tau_mg: 20.0,
+            ambient: 40.0,
+            temperature_limit: 110.0,
+            hard_limit_headroom: 8.0,
+            attack_ms: 500.0,
+            release_ms: 5000.0,
+        };
+        Params {
+            channels: 2,
+            sample_rate: 48_000,
+            block_frames: 512,
+            slot: [s, Slot::default(), Slot::default()],
+            ..Params::default()
+        }
+    }
+
+    fn run(u: &mut Unit, x: f32, n: usize) -> (Vec<f32>, Health) {
+        let input = vec![x; n];
+        let ins: [&[f32]; 2] = [&input, &input];
+        let mut o0 = vec![0.0f32; n];
+        let mut o1 = vec![0.0f32; n];
+        let mut outs: [&mut [f32]; 2] = [&mut o0, &mut o1];
+        let h = u.process(Io { frames: n, input: &ins, sense: &[], output: &mut outs });
+        (o0, h)
+    }
+
+    /// Review finding 1: a NaN magnet used to give `allow.max(0)` = 0 and
+    /// mute for good, or unity through `min`; it now latches 20 dB.
+    #[test]
+    fn a_non_finite_model_state_latches_the_failsafe_until_reset() {
+        let poisons: [fn(&mut Run); 3] =
+            [|r| r.ch[0].theta_mg = f64::NAN, |r| r.ch[1].theta_vc = f64::INFINITY, |r| r.groups[0].gain = f32::NAN];
+        for poison in poisons {
+            let mut u = Unit::new(params());
+            let (o, h) = run(&mut u, 0.01, 512);
+            assert_eq!((o[511], h), (0.01, Health::OK));
+            poison(u.run.as_mut().unwrap());
+            // the block's end latches (here the end of this call)
+            let (_, h) = run(&mut u, 0.01, 512);
+            assert!(h.0 & Health::MODEL_FAULT != 0 && h.is_failsafe());
+            for _ in 0..4 {
+                let (o, h) = run(&mut u, 1.0, 300);
+                assert!(h.0 & Health::MODEL_FAULT != 0);
+                assert!(o.iter().all(|&v| (v - FAILSAFE_GAIN).abs() < 1e-7));
+            }
+            let mut t = Telemetry::new();
+            u.telemetry(&mut t);
+            assert!(t.health.0 & Health::MODEL_FAULT != 0 && t.channels[0].gain == FAILSAFE_GAIN);
+            u.reset();
+            let (o, h) = run(&mut u, 0.01, 512);
+            assert_eq!((o[511], h), (0.01, Health::OK));
         }
     }
 }
