@@ -12,6 +12,15 @@
 //!             [--audio-out OUT.f32] [--prop 64008=CPMS.json]
 //! ```
 //!
+//! `--file-ch N` reads a program file of N channels, stream channel c taking
+//! file channel c mod N (the rig host's mapping). `--limit-frames N` renders
+//! only the first N frames.
+//!
+//! `--preset-param ID=VALUE` sets an atsp AU parameter in the decoded
+//! parameters before initialisation; `--param ID=VALUE` sets one at run time
+//! after initialisation, `--param-at FRAME:ID=VALUE` at the slice starting
+//! on that frame (the unit's `set_parameter`).
+//!
 //! `--prop 64008=FILE` applies the runtime CPMS power budgets to an lsm2
 //! unit, as the platform does right after initialisation: a JSON object of
 //! `cpms_ts_i`, `cpms_ts_100`, `cpms_ts_1000`, `cpms_ts_thermal` in mW.
@@ -41,13 +50,18 @@ struct Args {
     out: Option<String>,
     audio_out: Option<String>,
     cpms: Option<String>,
+    file_channels: usize,
+    limit_frames: usize,
+    preset_params: Vec<(u32, f32)>,
+    params_at: Vec<(usize, u32, f32)>,
 }
 
 fn usage() -> ExitCode {
     eprintln!(
         "usage: sgv2-render --unit spp3|lsm2|atsp [--blob P] --case NAME --in X.f32 --ch N \
          [--sense S.f32 --sense-ch M] [--slices 512|1,7,31] [--out T.jsonl] [--audio-out O.f32] \
-         [--prop 64008=CPMS.json]"
+         [--prop 64008=CPMS.json] [--file-ch N] [--limit-frames N] [--preset-param ID=V] \
+         [--param ID=V] [--param-at FRAME:ID=V]"
     );
     ExitCode::from(2)
 }
@@ -65,6 +79,14 @@ fn parse_args() -> Option<Args> {
         out: None,
         audio_out: None,
         cpms: None,
+        file_channels: 0,
+        limit_frames: 0,
+        preset_params: Vec::new(),
+        params_at: Vec::new(),
+    };
+    let id_val = |v: &str| -> Option<(u32, f32)> {
+        let (i, x) = v.split_once('=')?;
+        Some((i.parse().ok()?, x.parse().ok()?))
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -85,6 +107,15 @@ fn parse_args() -> Option<Args> {
             }
             "--out" => a.out = Some(v),
             "--audio-out" => a.audio_out = Some(v),
+            "--file-ch" => a.file_channels = v.parse().ok()?,
+            "--limit-frames" => a.limit_frames = v.parse().ok()?,
+            "--preset-param" => a.preset_params.push(id_val(&v)?),
+            "--param" => a.params_at.push((0, id_val(&v)?.0, id_val(&v)?.1)),
+            "--param-at" => {
+                let (f, rest) = v.split_once(':')?;
+                let (i, x) = id_val(rest)?;
+                a.params_at.push((f.parse().ok()?, i, x));
+            }
             "--prop" => match v.split_once('=') {
                 Some(("64008", f)) => a.cpms = Some(f.to_string()),
                 _ => return None,
@@ -106,6 +137,11 @@ fn read_f32(path: &str, channels: usize) -> io::Result<Vec<Vec<f32>>> {
     let mut bytes = Vec::new();
     File::open(path)?.read_to_end(&mut bytes)?;
     Ok(deinterleave(&bytes, channels))
+}
+
+/// Stream channel c takes file channel c mod `file` (the rig host's map).
+fn map_channels(file: Vec<Vec<f32>>, channels: usize) -> Vec<Vec<f32>> {
+    (0..channels).map(|c| file[c % file.len()].clone()).collect()
 }
 
 fn deinterleave(bytes: &[u8], channels: usize) -> Vec<Vec<f32>> {
@@ -136,7 +172,12 @@ fn parse_cpms(text: &str) -> Option<[f32; 4]> {
 
 /// Build the unit. A missing or unusable blob gives the fail-safe, as the
 /// plugin does.
-fn make_unit(kind: UnitKind, blob: Option<&[u8]>, cpms: Option<[f32; 4]>) -> (Box<dyn ProtectionUnit>, String) {
+fn make_unit(
+    kind: UnitKind,
+    blob: Option<&[u8]>,
+    cpms: Option<[f32; 4]>,
+    preset: &[(u32, f32)],
+) -> (Box<dyn ProtectionUnit>, String) {
     let Some(bytes) = blob else {
         return (Box::new(FailSafe::new(kind, Health::NO_PARAMS)), String::from("none"));
     };
@@ -148,7 +189,9 @@ fn make_unit(kind: UnitKind, blob: Option<&[u8]>, cpms: Option<[f32; 4]>) -> (Bo
         Ok(_) => {}
     }
     let unit: Result<Box<dyn ProtectionUnit>, String> = match kind {
-        UnitKind::Spp3 => spp3::Params::from_blob(bytes).map(|p| Box::new(spp3::Unit::new(p)) as _).map_err(|e| format!("{e:?}")),
+        UnitKind::Spp3 => {
+            spp3::Params::from_blob(bytes).map(|p| Box::new(spp3::Unit::new(p)) as _).map_err(|e| format!("{e:?}"))
+        }
         UnitKind::Lsm2 => lsm2::Params::from_blob(bytes)
             .map(|mut p| {
                 if let Some(w) = cpms {
@@ -158,7 +201,15 @@ fn make_unit(kind: UnitKind, blob: Option<&[u8]>, cpms: Option<[f32; 4]>) -> (Bo
                 Box::new(lsm2::Unit::new(p)) as _
             })
             .map_err(|e| format!("{e:?}")),
-        UnitKind::Atsp => atsp::Params::from_blob(bytes).map(|p| Box::new(atsp::Unit::new(p)) as _).map_err(|e| format!("{e:?}")),
+        UnitKind::Atsp => atsp::Params::from_blob(bytes).map_err(|e| format!("{e:?}")).and_then(|mut p| {
+            for &(id, v) in preset {
+                if !p.set(id, v) {
+                    return Err(format!("preset parameter {id}"));
+                }
+            }
+            p.validate().map_err(|e| format!("{e:?}"))?;
+            Ok(Box::new(atsp::Unit::new(p)) as _)
+        }),
     };
     match unit {
         Ok(u) => (u, String::from(if cpms.is_some() { "blob+64008" } else { "blob" })),
@@ -248,6 +299,7 @@ fn render(
     program: &[Vec<f32>],
     sense: &[Vec<f32>],
     slices: &[usize],
+    params_at: &[(usize, u32, f32)],
     trace: &mut dyn Write,
     mut audio: Option<&mut dyn Write>,
 ) -> io::Result<()> {
@@ -261,6 +313,14 @@ fn render(
     let unit_name = fourcc(kind);
     let (mut pos, mut k) = (0usize, 0usize);
     while pos < frames {
+        for &(f, id, v) in params_at {
+            if f == pos && !unit.set_parameter(id, v) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("parameter {id} is not run-time settable"),
+                ));
+            }
+        }
         let n = slices[k % slices.len()].min(frames - pos);
         k += 1;
         let ins: Vec<&[f32]> = program.iter().map(|c| &c[pos..pos + n]).collect();
@@ -308,7 +368,14 @@ fn render(
 }
 
 fn run(a: &Args) -> io::Result<()> {
-    let program = read_f32(&a.input, a.channels)?;
+    let mut program = if a.file_channels > 0 {
+        map_channels(read_f32(&a.input, a.file_channels)?, a.channels)
+    } else {
+        read_f32(&a.input, a.channels)?
+    };
+    if a.limit_frames > 0 {
+        program.iter_mut().for_each(|c| c.truncate(a.limit_frames));
+    }
     let sense = match &a.sense {
         Some(p) if a.sense_channels > 0 => read_f32(p, a.sense_channels)?,
         _ => Vec::new(),
@@ -321,7 +388,10 @@ fn run(a: &Args) -> io::Result<()> {
         ),
         None => None,
     };
-    let (mut unit, params) = make_unit(a.unit, blob.as_deref(), cpms);
+    if !a.preset_params.is_empty() && a.unit != UnitKind::Atsp {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "--preset-param is atsp only"));
+    }
+    let (mut unit, params) = make_unit(a.unit, blob.as_deref(), cpms, &a.preset_params);
     let mut stdout_trace;
     let mut file_trace = open_out(&a.out)?;
     let trace: &mut dyn Write = match file_trace.as_mut() {
@@ -340,6 +410,7 @@ fn run(a: &Args) -> io::Result<()> {
         &program,
         &sense,
         &a.slices,
+        &a.params_at,
         trace,
         audio.as_mut().map(|w| w as &mut dyn Write),
     )
@@ -386,11 +457,22 @@ mod tests {
     fn no_blob_renders_failsafe_in_any_slicing() {
         let program = vec![vec![0.25f32; 1000], vec![-0.5f32; 1000]];
         for slices in [&[512usize][..], &[1, 7, 31, 96, 127, 160][..]] {
-            let (mut unit, params) = make_unit(UnitKind::Lsm2, None, None);
+            let (mut unit, params) = make_unit(UnitKind::Lsm2, None, None, &[]);
             let mut trace = Vec::new();
             let mut audio = Vec::new();
-            render(unit.as_mut(), &params, UnitKind::Lsm2, "t", &program, &[], slices, &mut trace, Some(&mut audio))
-                .unwrap();
+            render(
+                unit.as_mut(),
+                &params,
+                UnitKind::Lsm2,
+                "t",
+                &program,
+                &[],
+                slices,
+                &[],
+                &mut trace,
+                Some(&mut audio),
+            )
+            .unwrap();
             let text = String::from_utf8(trace).unwrap();
             let lines: Vec<&str> = text.lines().collect();
             let mut frames = 0;
@@ -408,7 +490,7 @@ mod tests {
 
     #[test]
     fn blob_errors_fall_back_to_failsafe() {
-        let (_, p) = make_unit(UnitKind::Spp3, Some(b"short"), None);
+        let (_, p) = make_unit(UnitKind::Spp3, Some(b"short"), None, &[]);
         assert_eq!(p, "blob-Short");
     }
 

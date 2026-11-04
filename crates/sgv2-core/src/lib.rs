@@ -115,6 +115,12 @@ pub trait ProtectionUnit {
     fn telemetry(&self, out: &mut Telemetry);
     /// Return to the initial state (stream start).
     fn reset(&mut self);
+    /// Change one AU parameter at run time (the unit's own ID map), taking
+    /// effect at the next call. False when the unit has no such run-time
+    /// parameter.
+    fn set_parameter(&mut self, _id: u32, _value: f32) -> bool {
+        false
+    }
 }
 
 /// Linear gain of [`FAILSAFE_ATTENUATION_DB`]: 10^(-20/20) = 0.1.

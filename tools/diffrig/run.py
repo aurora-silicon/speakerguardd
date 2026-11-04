@@ -81,8 +81,13 @@ def main(argv):
         unit, ch = meta["unit"], meta["channels"]
         o = os.path.join(out, case)
         os.makedirs(o, exist_ok=True)
+        # The rig host reads a file of file_ch channels, stream channel c taking
+        # file channel c mod file_ch.
+        fch = meta.get("file_channels", c.get("file_ch", ch))
+        if not os.path.exists(os.path.join(signals, f"{c['signal']}.{fch}ch.f32")):
+            fch = 2
         args = [render, "--unit", unit, "--case", case,
-                "--in", os.path.join(signals, f"{c['signal']}.{ch}ch.f32"), "--ch", str(ch),
+                "--in", os.path.join(signals, f"{c['signal']}.{fch}ch.f32"), "--ch", str(ch), "--file-ch", str(fch),
                 "--slices", slices or str(meta["quantum"]),
                 "--out", os.path.join(o, "trace.jsonl"), "--audio-out", os.path.join(o, "out.f32")]
         tele = os.path.join(d, "run.tele.f32")
@@ -92,6 +97,14 @@ def main(argv):
         blob = blobs.get(f"{unit}-aid{aid}", blobs.get(unit))
         if blob:
             args += ["--blob", blob]
+        if c.get("limit_frames"):
+            args += ["--limit-frames", str(c["limit_frames"])]
+        for pp in c.get("preset_params", []):
+            args += ["--preset-param", pp]
+        for pp in c.get("params", []):
+            args += ["--param", pp]
+        for pp in c.get("params_at", []):
+            args += ["--param-at", pp]
         if c.get("runtime", True):
             for num, path in runtime.get(unit, []):
                 args += ["--prop", f"{num}={path}"]
