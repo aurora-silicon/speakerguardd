@@ -653,6 +653,38 @@ impl Cl {
         })
     }
 
+    /// Per-update controller state of unit channel `c`, in the order of
+    /// the reference's `Reb_Data` record where it has the field:
+    /// `[smoothed g_ff, selected target, Tlim_eff, theta_ff, theta_vc,
+    /// theta_mg, Pcoil, Pdrv, T_CL, CL window accepted, pilot target
+    /// amplitude]`. Diagnostics for the rig; NaN where absent.
+    pub fn controller_state(&self, c: usize) -> [f64; 11] {
+        let Some(r) = self.run.as_ref() else { return [f64::NAN; 11] };
+        let Some(ch) = r.ch.get(c) else { return [f64::NAN; 11] };
+        let g = &r.groups[ch.group];
+        let pilot = ch.pilot.as_ref().map_or(f64::NAN, |p| {
+            (if !p.on {
+                0.0
+            } else if p.high {
+                p.a_hi
+            } else {
+                p.a_lo
+            }) as f64
+        });
+        [
+            ch.g_ff,
+            g.g,
+            ch.tlim_eff,
+            ch.ff.map_or(f64::NAN, |f| f.theta),
+            ch.vc.theta,
+            ch.mg.theta,
+            ch.p_model,
+            ch.p_drv,
+            ch.cl.as_ref().map_or(f64::NAN, |l| l.t_cl),
+            ch.cl.as_ref().map_or(f64::NAN, |l| l.valid as u8 as f64),
+            pilot,
+        ]
+    }
     /// `AudioUnitReset` (spec 10): `T_CL = T_cal`, `R = R_cal`, zero
     /// adjustment, no accepted window until the next acquisition.
     fn reset(&mut self, base: f64) {
@@ -939,6 +971,38 @@ impl Unit {
     /// update, `None` without a generator.
     pub fn pilot_state(&self, c: usize) -> Option<(bool, bool)> {
         self.run.as_ref().and_then(|r| r.ch.get(c)).and_then(|c| c.pilot.as_ref()).map(|p| (p.on, p.high))
+    }
+    /// Per-update controller state of unit channel `c`, in the order of
+    /// the reference's `Reb_Data` record where it has the field:
+    /// `[smoothed g_ff, selected target, Tlim_eff, theta_ff, theta_vc,
+    /// theta_mg, Pcoil, Pdrv, T_CL, CL window accepted, pilot target
+    /// amplitude]`. Diagnostics for the rig; NaN where absent.
+    pub fn controller_state(&self, c: usize) -> [f64; 11] {
+        let Some(r) = self.run.as_ref() else { return [f64::NAN; 11] };
+        let Some(ch) = r.ch.get(c) else { return [f64::NAN; 11] };
+        let g = &r.groups[ch.group];
+        let pilot = ch.pilot.as_ref().map_or(f64::NAN, |p| {
+            (if !p.on {
+                0.0
+            } else if p.high {
+                p.a_hi
+            } else {
+                p.a_lo
+            }) as f64
+        });
+        [
+            ch.g_ff,
+            g.g,
+            ch.tlim_eff,
+            ch.ff.map_or(f64::NAN, |f| f.theta),
+            ch.vc.theta,
+            ch.mg.theta,
+            ch.p_model,
+            ch.p_drv,
+            ch.cl.as_ref().map_or(f64::NAN, |l| l.t_cl),
+            ch.cl.as_ref().map_or(f64::NAN, |l| l.valid as u8 as f64),
+            pilot,
+        ]
     }
     /// `AudioUnitReset` (spec 10): clears only the closed-loop estimator.
     /// The open-loop coil, magnet and feed-forward temperatures, the gain
