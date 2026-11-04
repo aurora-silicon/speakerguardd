@@ -640,8 +640,11 @@ impl SafeTlim {
             safe: safe.min(normal) as f64,
             offset: offset.min(0.0),
             init,
-            // the zero seed: the first update takes the reload branch
-            count: 0,
+            // seeded full: the rig's hot rebuild (64007 = 1, predicate true
+            // from its first update) latches one full count after the
+            // rebuild, not never (a zero seed would wrap); a cold start
+            // reloads on its first update either way
+            count: init,
             latched: false,
         }
     }
@@ -661,13 +664,14 @@ impl SafeTlim {
         } else {
             self.count = self.init;
         }
-        if self.count == 0 {
+        // a zero count (TimeMin 0) latches on the first update either way
+        if self.count == 0 || self.init == 0 {
             self.latched = true;
         }
     }
     /// Kernel construction (and the trait's stream-start reset).
     fn reconstruct(&mut self) {
-        self.count = 0;
+        self.count = self.init;
         self.latched = false;
     }
 }
@@ -1857,7 +1861,10 @@ impl ProtectionUnit for Unit {
             c.ff.theta = s[2] * libm::exp(-t / c.ff.tau);
             // hysteresis: an armed hard path stays armed until T_OL < limit
             c.armed = s[3] != 0.0 && run.ambient + c.vc.theta + c.mg.theta >= c.safe.base();
-            c.hold = HOLD_START;
+            // a restored channel does not re-trigger the release hold: the
+            // rig's newinst=0 releases from the restored gain toward the
+            // fresh candidate at once (ctl[0] 0.528 from the first update)
+            c.hold = Hold { state: HoldState::Released, ..HOLD_START };
             g[c.group] = g[c.group].min(state.gain[i]);
         }
         let k = 1.0 - run.k_release;
