@@ -105,10 +105,10 @@ pub fn dot_f32_scalar(a: &[f32], b: &[f32]) -> f32 {
 /// at `2e-6` of that sum for the 319- and 1,024-tap banks).
 #[inline]
 pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
-    let n = a.len().min(b.len());
     #[cfg(target_arch = "aarch64")]
     // SAFETY: every access is below `n`, the shorter of the two slices.
     unsafe {
+        let n = a.len().min(b.len());
         let (pa, pb) = (a.as_ptr(), b.as_ptr());
         let mut a0 = vdupq_n_f32(0.0);
         let mut a1 = vdupq_n_f32(0.0);
