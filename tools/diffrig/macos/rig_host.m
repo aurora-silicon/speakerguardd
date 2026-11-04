@@ -159,7 +159,7 @@ int main(int argc, const char **argv) {
         const char *unit = "spp3", *strip = NULL, *sidecar = NULL, *spts = NULL, *in = NULL, *tele = NULL,
                    *plant = NULL, *out = NULL;
         int nch = 0, q = 512, telech = 12, every = 1, notele = 0;
-        double pace = 0; // >0: render at most pace x real time (lets the units' async log writers keep up)
+        double pace = 0; int maxframes = 0; // >0: render at most pace x real time (lets the units' async log writers keep up)
         double sr = 48000;
         UInt32 propIds[32], propVals[32]; int nprops = 0;
         UInt32 cfIds[16]; const char *cfPaths[16]; int ncf = 0;
@@ -171,7 +171,7 @@ int main(int argc, const char **argv) {
             else if (ARG("--spts")) spts = v; else if (ARG("--in")) in = v; else if (ARG("--ch")) nch = atoi(v);
             else if (ARG("--q")) q = atoi(v); else if (ARG("--sr")) sr = atof(v); else if (ARG("--tele")) tele = v;
             else if (ARG("--tele-ch")) telech = atoi(v); else if (ARG("--plant")) plant = v;
-            else if (ARG("--every")) every = atoi(v); else if (ARG("--pace")) pace = atof(v); else if (ARG("--out")) out = v;
+            else if (ARG("--every")) every = atoi(v); else if (ARG("--pace")) pace = atof(v); else if (ARG("--maxframes")) maxframes = atoi(v); else if (ARG("--out")) out = v;
             else if (ARG("--prop")) { sscanf(v, "%u=%u", &propIds[nprops], &propVals[nprops]); nprops++; }
             else if (ARG("--plistprop")) { char *eq = strchr(v, '='); plIds[npl] = (UInt32)atoi(v); plPaths[npl++] = eq + 1; }
             else if (ARG("--cfprop")) { char *eq = strchr(v, '='); cfIds[ncf] = (UInt32)atoi(v); cfPaths[ncf++] = eq + 1; }
@@ -221,7 +221,7 @@ int main(int argc, const char **argv) {
             CFDataRef d = (__bridge CFDataRef)[NSData dataWithContentsOfFile:@(spts)];
             ck(AudioUnitSetProperty(au, 64009, 0, 0, &d, sizeof d), "SpTS 64009");
         }
-        UInt32 mx = q;
+        UInt32 mx = maxframes > q ? (UInt32)maxframes : (UInt32)q;
         die(AudioUnitSetProperty(au, kAudioUnitProperty_MaximumFramesPerSlice, 0, 0, &mx, 4), "maxframes");
         AudioStreamBasicDescription af = fmt(sr, nch, true), tf = fmt(sr, telech, false);
         die(AudioUnitSetProperty(au, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0, &af, sizeof af), "in fmt");

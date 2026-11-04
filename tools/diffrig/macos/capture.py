@@ -91,6 +91,8 @@ def cases():
     # failure cases
     C.append(dict(name="spp3-nosidecar-pink_steps", unit="spp3", signal="pink_steps", sidecar=False))
     # host slice-size invariance (lsm2 consumes any count)
+    for s in ["pink_steps", "tokyo_30s"]:  # without the runtime properties (preset limits only)
+        C.append(dict(name=f"lsm2-noruntime-{s}", unit="lsm2", signal=s, runtime=False))
     for q in (1, 7, 160, 4096):
         C.append(dict(name=f"lsm2-q{q}-tone_bursts", unit="lsm2", signal="tone_bursts", q=q, logs=q >= 64))
     for q in (256, 1024):
@@ -117,7 +119,11 @@ def run_case(c, outroot, force=False):
     props, paths = propstrip_props(unit)
     for pr in c.get("props", props):
         args += ["--prop", pr]
-    for pr in c.get("cfprops", []):
+    # Properties the live graph sets at run time (not tuning), as observed on the Mac,
+    # from the rig data dir: cal/runtime-<unit>.json = ["ID=fixture.json", ...].
+    runtime = os.path.join(RIG, "cal", f"runtime-{unit}.json")
+    rt = json.load(open(runtime)) if os.path.exists(runtime) and c.get("runtime", True) else []
+    for pr in rt + c.get("cfprops", []):
         prop, fixture = pr.split("=", 1)
         args += ["--cfprop", f"{prop}={os.path.join(RIG, 'cal', fixture)}"]
     for pr in paths:
