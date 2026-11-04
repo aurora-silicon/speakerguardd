@@ -312,7 +312,7 @@ pub fn never_above_input_sensed(
 /// (each output sample mixes 319 input samples with per-band gains), so the
 /// output is checked finite and within digital full scale, and every
 /// reported gain within [0, 1]. Its spectral bound (complementary bands with
-/// gains in [0, 1] raise no frequency by more than the bank's +0.17 dB
+/// gains in [0, 1] raise no frequency by more than the bank's +0.26 dB
 /// truncation ripple) is tested in tests/lsm2.rs.
 pub fn never_above_full_scale(unit: &mut dyn ProtectionUnit, channels: usize, seed: u64, blocks: usize) {
     let mut rng = Rng(seed);

@@ -391,7 +391,7 @@ fn a_bad_hand_off_record_leaves_the_reset_state() {
 fn band_gains_never_raise_any_frequency() {
     // zero-phase, nonnegative, complementary bands: |sum g_k H_k(f)| <= 1
     // on the design grid; the 319-tap truncation ripples between grid
-    // points, bounded here at +0.17 dB (measured +0.14)
+    // points, bounded here at +0.26 dB (measured +0.20 with the rig-law bank)
     let c = params().ch[0].band_center_hz;
     let h = lsm2::filterbank(RATE as f64, &c, 0, 160);
     let gains = [[1.0, 0.3, 0.3, 0.3, 1.0], [0.1, 1.0, 1.0, 1.0, 1.0], [1.0, 1.0, 0.5, 1.0, 0.2]];
@@ -406,7 +406,7 @@ fn band_gains_never_raise_any_frequency() {
                     im -= g[k] * t as f64 * ph.sin();
                 }
             }
-            assert!((re * re + im * im).sqrt() <= 1.02, "{g:?} {f} Hz: {}", (re * re + im * im).sqrt());
+            assert!((re * re + im * im).sqrt() <= 1.03, "{g:?} {f} Hz: {}", (re * re + im * im).sqrt());
         }
     }
 }
@@ -433,4 +433,24 @@ fn peak_reserves_the_pilot_amplitude() {
     let pk = sine(1000.0, 1.0012, 0.2).iter().fold(0f32, |m, v| m.max(v.abs()));
     let want = (1.0 - 10f32.powf(-36.0 / 20.0)) / pk;
     assert!((g - want).abs() < 1e-6, "{g} {want}");
+}
+
+#[test]
+fn filterbank_matches_the_rig_construction_anchors() {
+    // rig law 10 on the spec's AID44 left centres: centre tap 0.00625 and
+    // -3/-6/-12 dB at about 108/150/204 Hz for band 0 (150 Hz grid)
+    let c = [62.23778f32, 292.82724, 649.9541, 1634.0066, 4953.1763];
+    let h = lsm2::filterbank(RATE as f64, &c, 0, 160);
+    assert!((h[0][159] - 0.00625).abs() < 1e-6, "{}", h[0][159]);
+    let mag = |f: f64| {
+        let w = 2.0 * std::f64::consts::PI * f / RATE as f64;
+        let (re, im) = h[0].iter().enumerate().fold((0.0, 0.0), |(r, i), (j, &t)| {
+            let ph = w * (j as f64 - 159.0);
+            (r + t as f64 * ph.cos(), i - t as f64 * ph.sin())
+        });
+        20.0 * (re * re + im * im).sqrt().log10()
+    };
+    for (f, db) in [(107.98, -3.0), (149.88, -6.0), (203.54, -12.0)] {
+        assert!((mag(f) - db).abs() < 0.05, "{f} Hz: {} dB", mag(f));
+    }
 }

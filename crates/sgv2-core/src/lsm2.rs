@@ -29,14 +29,14 @@
 //!   output is the input delayed exactly, bit for bit (spec 6.1: the bank is
 //!   bypassed). A latency below the 256-frame controller cadence is refused
 //!   (a transient could leave before any decision saw it).
-//! - **Filterbank** (spec 6.3): zero-phase Linkwitz-Riley low passes at the
-//!   geometric-mean crossovers, sampled on the design grid of twice the
-//!   filterbank latency (320 points at 48 kHz), successive differences of
-//!   the cumulative low passes, inverse real DFT, centred truncation to
-//!   `2*FilterbankLatency - 1` taps (319), generated in f64 and rounded once
-//!   to f32.
-//!   The fifth band is the delayed input minus the other four, so the bank
-//!   sums to the delay exactly.
+//! - **Filterbank** (rig law 10; the spec's random-order LR is not it): on
+//!   the design grid of `M = 2*FilterbankLatency*fs` points (320 at 48 kHz,
+//!   150 Hz bins), each band centre snapped to a bin; cumulative low pass k
+//!   is 1 up to centre bin k, 0 from centre bin k+1, `cos^2` between; bands
+//!   are successive differences, inverse real DFT, centred, the `M/2` tap
+//!   dropped (319 taps), generated in f64 and rounded once to f32. The
+//!   fifth band is the delayed input minus the other four, so the bank sums
+//!   to the delay exactly.
 //! - **Candidates** every controller frame (256 frames, spec 10), linear in
 //!   [0, 1], a disabled axis giving 1, combined by `min`:
 //!   - sample peak: `min(1, (AmplitudeLimit - pilot) / max|x|)`, the pilot
@@ -104,11 +104,6 @@
 //!   `Rdc, Bl, Mms, Rms, Kms` give (pole Q 1.9225 against 1.9402). The
 //!   bilinear admittance of the block is used: 0.011 dB too much current at
 //!   1 kHz, 0.08 dB at resonance.
-//! - **Filterbank order rule.** "Lowest even LR order whose adjacent-centre
-//!   stop-band error fits in 159 samples" is not defined; LR4 (plus 2 or 4
-//!   for `Bandwidth` 1/2) is used. The spec's band-0 anchors (centre tap
-//!   0.0062462287, -6 dB at 149.41 Hz) are not met by any LR order at the
-//!   geometric-mean crossover (LR4: 0.0059281, 130.69 Hz).
 //! - **Candidate windows.** Which predicted samples a controller frame
 //!   examines; here every sample that entered since the previous frame.
 //! - **Band candidates.** How displacement/velocity per band are formed.
@@ -534,21 +529,31 @@ fn db_to_lin(db: f64) -> f64 {
 /// and rounded once to f32. `h[k][j]` multiplies `x[n - j]`; the bands sum
 /// to a delay of `stage - 1` in f64.
 pub fn filterbank(rate: f64, centers: &[f32; BANDS], bandwidth: u32, stage: usize) -> [Vec<f32>; BANDS] {
-    let order = 4.0 + 2.0 * bandwidth as f64;
+    // TODO(SPEC): Bandwidth 1 is bit-identical to 0 on 25G83, and 2 turns
+    // the velocity attenuation off; neither changes the bank here.
+    let _ = bandwidth;
     let half = stage - 1;
     let grid = 2 * stage;
-    let mut fc = [0.0f64; BANDS - 1];
-    for (k, f) in fc.iter_mut().enumerate() {
-        *f = libm::sqrt(centers[k] as f64 * centers[k + 1] as f64);
-    }
-    // zero-phase magnitudes on the design grid, bins 0..=grid/2
+    // rig law 10: each centre snapped to a bin of the design grid
+    let df = rate / grid as f64;
+    let bin: [f64; BANDS] = core::array::from_fn(|k| libm::round(centers[k] as f64 / df));
+    // zero-phase magnitudes on the design grid, bins 0..=grid/2: the
+    // cumulative low pass k is 1 up to centre bin k, 0 from centre bin k+1,
+    // a cos^2 crossfade between
     let bins = grid / 2 + 1;
     let mut mag: [Vec<f64>; BANDS] = core::array::from_fn(|_| vec![0.0; bins]);
     for b in 0..bins {
-        let f = b as f64 * rate / grid as f64;
+        let bf = b as f64;
         let mut prev = 0.0;
         for (k, m) in mag.iter_mut().enumerate() {
-            let cum = if k < BANDS - 1 { 1.0 / (1.0 + libm::pow(f / fc[k], order)) } else { 1.0 };
+            let cum = if k == BANDS - 1 || bf <= bin[k] {
+                1.0
+            } else if bf >= bin[k + 1] {
+                0.0
+            } else {
+                let c = libm::cos(core::f64::consts::FRAC_PI_2 * (bf - bin[k]) / (bin[k + 1] - bin[k]));
+                c * c
+            };
             m[b] = cum - prev;
             prev = cum;
         }
