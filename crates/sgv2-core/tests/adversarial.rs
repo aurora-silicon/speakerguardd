@@ -1947,7 +1947,6 @@ fn spp3_short_time_constants_stay_stable() {
 /// `complete` no longer checks the sums' finiteness, so `health` reads 0
 /// while `sense_power` is NaN and the closed loop rejects every window.
 #[test]
-#[ignore = "FINDING 10 (lane B): non-finite sense is not reported as OPEN_LOOP"]
 fn spp3_non_finite_sense_is_open_loop() {
     for v in [f32::NAN, f32::INFINITY, 1e30] {
         let mut u = spp3::Unit::new(spp3_cl());
@@ -1966,7 +1965,6 @@ fn spp3_non_finite_sense_is_open_loop() {
 /// the estimator non-finite sense because `complete` no longer checks
 /// finiteness (FINDING 10).
 #[test]
-#[ignore = "FINDING 12 (lane B): one NaN sense frame stops the delay estimator for good"]
 fn delay_estimator_recovers_from_a_nan_sense_frame() {
     use sgv2_core::sense::DelayEstimator;
     let d = 1536usize;
@@ -2004,7 +2002,6 @@ fn delay_estimator_recovers_from_a_nan_sense_frame() {
 /// delayed by a fixed amount; the unit should lock the delay as a fresh
 /// unit does.
 #[test]
-#[ignore = "FINDING 12 (lane B): one NaN sense frame stops the delay estimator for good"]
 fn spp3_sense_delay_survives_a_nan_sense_call() {
     let p = spp3_minimal(1.0);
     let x = signal(21, 1, 48_000 * 8, 0.8, Hostility::Clean);

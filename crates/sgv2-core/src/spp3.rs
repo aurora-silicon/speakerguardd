@@ -806,6 +806,8 @@ struct Run {
     last_frame: u64,
     sums: BlockSums,
     sense_ok: bool,
+    /// A non-finite sense sample in the current update: it runs open loop.
+    sense_bad: bool,
     estimator: DelayEstimator,
     /// A model state went non-finite: the fail-safe is latched until reset.
     fault: bool,
@@ -939,6 +941,7 @@ impl Run {
             last_frame: 0,
             sums,
             sense_ok: false,
+            sense_bad: false,
             estimator: DelayEstimator::new(),
             fault: false,
         })
@@ -973,6 +976,7 @@ impl Run {
         self.last_frame = 0;
         self.sums.clear();
         self.sense_ok = false;
+        self.sense_bad = false;
         self.estimator.reset();
         self.fault = false;
     }
@@ -1040,6 +1044,11 @@ impl Run {
             match (sense.get(si), sense.get(sv)) {
                 (Some(i), Some(v)) if i.len() >= off + len && v.len() >= off + len => {
                     let (i, v) = (&i[off..off + len], &v[off..off + len]);
+                    // non-finite sense is unusable sense: the block runs open
+                    // loop (the closed loop rejects such a window itself)
+                    if dsp::peak_abs(i) == f32::INFINITY || dsp::peak_abs(v) == f32::INFINITY {
+                        self.sense_bad = true;
+                    }
                     c.acc_vi.add_prod(v, i, phase);
                     if let Some(cl) = c.cl.as_mut() {
                         cl.feed(i, v);
@@ -1066,6 +1075,8 @@ impl Run {
                         ve += dsp::sum_sq(&sense[sv][kk..kk + m]);
                     }
                 }
+                // (non-finite or overflowing sums restart the estimator's
+                // correlation at the envelope point that holds them)
                 self.estimator.push_sums(oe as f32, ve as f32, m);
                 kk += m;
             }
@@ -1134,7 +1145,10 @@ impl Run {
             g.g = sel;
             g.sel = sel as f32;
         }
-        let complete = self.sums.complete && self.sums.frames == THERMAL_FRAMES;
+        let complete = self.sums.complete
+            && !self.sense_bad
+            && self.sums.frames == THERMAL_FRAMES
+            && self.ch.iter().all(|c| c.sense.is_none() || c.acc_vi.is_finite());
         for c in self.ch.iter_mut() {
             c.vi_power = if c.sense.is_some() && complete && c.acc_vi.is_finite() {
                 c.acc_vi.total() * c.vi_scale / n
@@ -1144,6 +1158,7 @@ impl Run {
             c.acc_vi.clear();
         }
         self.sense_ok = complete;
+        self.sense_bad = false;
         self.estimator.end_block();
         self.sums.clear();
         self.last_frame = self.frame - THERMAL_FRAMES as u64;
