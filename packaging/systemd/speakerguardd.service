@@ -15,7 +15,11 @@ RestartPreventExitStatus=78
 WatchdogSec=1s
 RuntimeDirectory=speakerguardd
 RuntimeDirectoryMode=0755
-# TODO(lane D): device access list, capabilities and hardening review.
+# The speaker card's control device only: it owns "Speaker Protection"
+# there, and closing it (any exit) withdraws protection at once.
+DevicePolicy=closed
+DeviceAllow=char-alsa rw
+# TODO(lane D): capabilities and the rest of the hardening review.
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
