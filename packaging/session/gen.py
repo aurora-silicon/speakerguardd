@@ -64,6 +64,10 @@ def pipewire_conf(m, c):
     # halve its period to 256 and add 256 frames of headroom, and its
     # follower then resyncs (drops frames) on ordinary chunk jitter.
     sense_batch = "" if c.get("sense_batch", True) else "\n            api.alsa.disable-batch = true"
+    # The sense is a follower without resampling: PipeWire resyncs it (drops
+    # or skips frames, shifting it against the program) when its delay is off
+    # target by more than max((quantum + headroom) / 2, 256) frames, so the
+    # headroom sets how late a graph cycle may run before the sense shifts.
     if sense:
         sense_obj = f"""
     {{   factory = adapter
@@ -78,7 +82,7 @@ def pipewire_conf(m, c):
             audio.channels         = {sense}
             audio.position         = {aux(sense)}
             api.alsa.period-size   = {QUANTUM}
-            api.alsa.headroom      = 0{sense_batch}
+            api.alsa.headroom      = {c.get('sense_headroom', 0)}{sense_batch}
             node.group             = "{n['group']}"
             node.passive           = true
             priority.driver        = 0
