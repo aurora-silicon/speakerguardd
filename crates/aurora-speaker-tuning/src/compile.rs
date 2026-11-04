@@ -746,7 +746,14 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
 /// without the masking path, which the spec calls nonfatal but not
 /// graph-conformant.
 fn pressure_response(t: &Tuning, c: usize, diags: &mut Diagnostics) -> Option<[f32; lsm2::PRESSURE_TAPS]> {
-    let f = t.protection.property_files.iter().find(|f| f.number == 6632)?;
+    let Some(f) = t.protection.property_files.iter().find(|f| f.number == 6632) else {
+        diags.warn(
+            "lsm2-6632-absent",
+            "compile",
+            "the strip sets no property 6632: no pressure response, no masking path (not graph-conformant)",
+        );
+        return None;
+    };
     let data = f
         .value
         .as_dict()
@@ -762,7 +769,15 @@ fn pressure_response(t: &Tuning, c: usize, diags: &mut Diagnostics) -> Option<[f
             for (o, w) in fir.iter_mut().zip(b.chunks_exact(4)) {
                 *o = f32::from_le_bytes([w[0], w[1], w[2], w[3]]);
             }
-            fir.iter().all(|v| v.is_finite()).then_some(fir)
+            if fir.iter().all(|v| v.is_finite()) {
+                return Some(fir);
+            }
+            diags.warn(
+                "lsm2-6632-pressure",
+                &f.path,
+                format!("ChannelData[{c}].PressureResponse has a non-finite tap"),
+            );
+            None
         }
         _ => {
             diags.warn(
