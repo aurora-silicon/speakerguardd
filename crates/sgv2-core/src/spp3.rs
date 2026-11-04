@@ -713,7 +713,10 @@ impl Run {
             };
             let (reb, series, ag) = (c.reb_ref as f64, (c.rshunt + c.rampout) as f64, c.ag as f64);
             let ff_factor = c.thermal_ff_speedup_factor as f64;
-            let ff = (ff_factor > 0.0).then(|| Thermal::new(c.t_sett_vc as f64, ff_factor * c.tau_tvc as f64, dt, 0.0));
+            // SPEC-SPP3 section 10: the feed-forward node starts equal to the
+            // coil node (zero cold, `theta_vc0` hot).
+            let ff = (ff_factor > 0.0)
+                .then(|| Thermal::new(c.t_sett_vc as f64, ff_factor * c.tau_tvc as f64, dt, c.initial_theta_vc as f64));
             ch.push(Chan {
                 src: c.source as usize,
                 group: gi,
@@ -775,7 +778,7 @@ impl Run {
             c.vc.theta = c.init_vc;
             c.mg.theta = c.init_mg;
             if let Some(f) = c.ff.as_mut() {
-                f.theta = 0.0;
+                f.theta = c.init_vc;
             }
             c.p_prev = 0.0;
             c.p_ff_prev = 0.0;
