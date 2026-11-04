@@ -200,7 +200,7 @@ pub fn channel(name: &str, group: i128, cl: bool) -> Value {
     ]);
     let ol_disp = dict(vec![
         ("Q_d", r(1.1)),
-        ("ag", r(9.5)),
+        ("ag", r(11.89)),
         ("ct", r(0.3)),
         ("g_bw", i(1)),
         ("kt", i(2000)),

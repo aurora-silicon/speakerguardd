@@ -122,6 +122,46 @@ fn centi_db(a_mv: f64, b_mv: f64) -> f64 {
     2000.0 * (a_mv / b_mv).log10()
 }
 
+/// The supervisor's operating-point tolerance: half a 0.5 dB gain step.
+pub const OPERATING_POINT_TOLERANCE_DB: f64 = 0.25;
+
+/// The header's operating point from the tuning's per-channel full-scale
+/// peak voltages, volts (spp3 `ag`, lsm2 `VoltsFullScale`, atsp `Amplifier
+/// sensitivity`; Daybreak t-4662: all peak volts at a normalized sample of
+/// 1).  The header holds one value: the first channel's.  The payload keeps
+/// every channel's own value; they must all lie within one operating point
+/// of the header's (the J700's 7.30/7.33 V do, 0.036 dB apart), or the amps
+/// cannot share the gain the supervisor checks.  The machine description's
+/// amp gain is a cross-check, reported when it disagrees.
+fn operating_point(what: &str, volts: &[f32], d: &Description, diags: &mut Diagnostics) -> Result<u32> {
+    let first = *volts.first().ok_or_else(|| bad(format!("no {what}")))?;
+    if !volts.iter().all(|v| v.is_finite() && *v > 0.0) {
+        return Err(bad(format!("{what} {volts:?} is not a positive voltage on every channel")));
+    }
+    let mv = (f64::from(first) * 1000.0).round();
+    for (c, v) in volts.iter().enumerate() {
+        let off = centi_db(f64::from(*v) * 1000.0, mv) / 100.0;
+        if off.abs() > OPERATING_POINT_TOLERANCE_DB {
+            return Err(bad(format!(
+                "channel {c} {what} {v} V is {off:+.3} dB from channel 0's: not one operating point"
+            )));
+        }
+    }
+    let machine = f64::from(d.full_scale_mv());
+    let off = centi_db(mv, machine) / 100.0;
+    if off.abs() > OPERATING_POINT_TOLERANCE_DB {
+        diags.warn(
+            "compile-full-scale",
+            "compile",
+            format!(
+                "{what} gives {mv} mV peak, the {} amp setting {machine} mV ({off:+.2} dB): the supervisor will not grant",
+                d.board
+            ),
+        );
+    }
+    Ok(mv as u32)
+}
+
 fn bad(message: impl Into<String>) -> Error {
     Error::format("compile", message)
 }
@@ -379,22 +419,10 @@ fn compile_spp3(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
     if sense == 0 {
         diags.warn("compile-no-sense", "compile", "the graph has no telemetry bus: closed loop cannot run");
     }
-    // TODO(SPEC): spp3's output scaling.  Until the specification fixes it,
-    // the operating point is the one the supervisor reads back from the
-    // machine's amp gain; the tuning's `ag` is reported against it.
-    let full_scale_mv = b.description.full_scale_mv();
-    let ag_mv = 1000.0 * f64::from(p.ch[0].ag);
-    if ag_mv > 0.0 && centi_db(ag_mv, f64::from(full_scale_mv)).abs() > 25.0 {
-        diags.info(
-            "compile-full-scale-ag",
-            "compile",
-            format!(
-                "the tuning's ag is {:.0} mV, the machine's full scale {full_scale_mv} mV ({:+.2} dB; TODO(SPEC) spp3 output scaling)",
-                ag_mv,
-                centi_db(ag_mv, f64::from(full_scale_mv)) / 100.0
-            ),
-        );
-    }
+    // `ag` is the amp's peak volts at digital full scale (SPEC-SPP3 section
+    // 4; Daybreak t-4662).
+    let ag: Vec<f32> = p.ch[..n].iter().map(|c| c.ag).collect();
+    let full_scale_mv = operating_point("ag", &ag, b.description, diags)?;
     let blob =
         build_for(sgv2_core::UnitKind::Spp3, p.channels, sense, p.sample_rate, b.machine, full_scale_mv, p.as_bytes());
     spp3::Params::from_blob(&blob).map_err(|e| bad(format!("the engine rejects the compiled blob: {e:?}")))?;
@@ -692,25 +720,9 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
     p.other_power_features = (get(mid)? != 0.0) as u32
         | ((get(high)? != 0.0) as u32) << 1
         | ((get(id::amp0(id::A_USE_BATTERY))? != 0.0) as u32) << 2;
-    // The operating point is the tuning's VoltsFullScale (KERNEL.md 2.3),
-    // one value for every channel: the amps share one gain setting.
-    let vfs = p.ch[0].volts_full_scale;
-    // AID44's per-channel calibration is 7.30/7.33 V (0.036 dB apart) on one
-    // amp gain setting: the same 0.25 dB window as the machine check below.
-    if !(vfs.is_finite() && vfs > 0.0)
-        || p.ch[..n].iter().any(|c| centi_db(f64::from(c.volts_full_scale), f64::from(vfs)).abs() > 25.0)
-    {
-        return Err(bad("the channels' VoltsFullScale differ or are not positive: no single operating point"));
-    }
-    let full_scale_mv = (f64::from(vfs) * 1000.0).round() as u32;
-    let machine_mv = b.description.full_scale_mv();
-    if centi_db(f64::from(full_scale_mv), f64::from(machine_mv)).abs() > 25.0 {
-        diags.warn(
-            "compile-full-scale",
-            "compile",
-            format!("VoltsFullScale is {full_scale_mv} mV, the machine's amp gain gives {machine_mv} mV: the supervisor will not grant"),
-        );
-    }
+    // VoltsFullScale is peak volts (KERNEL.md 2.3; Daybreak t-4662).
+    let vfs: Vec<f32> = p.ch[..n].iter().map(|c| c.volts_full_scale).collect();
+    let full_scale_mv = operating_point("VoltsFullScale", &vfs, b.description, diags)?;
     let blob =
         build_for(sgv2_core::UnitKind::Lsm2, p.channels, 0, p.sample_rate, b.machine, full_scale_mv, p.as_bytes());
     lsm2::Params::from_blob(&blob).map_err(|e| bad(format!("the engine rejects the compiled blob: {e:?}")))?;
@@ -765,7 +777,7 @@ fn pressure_response(t: &Tuning, c: usize, diags: &mut Diagnostics) -> Option<[f
 
 // ------------------------------------------------------------------ atsp
 
-fn compile_atsp(t: &Tuning, b: &Bound, _diags: &mut Diagnostics) -> Result<Compiled> {
+fn compile_atsp(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compiled> {
     let n = channels(t)?;
     let rate = sample_rate(t)?;
     // A graph without a reblocker runs the unit on the host's block: 0.
@@ -806,8 +818,9 @@ fn compile_atsp(t: &Tuning, b: &Bound, _diags: &mut Diagnostics) -> Result<Compi
             hard_limit_headroom: get(b + 10)?,
         };
     }
-    // TODO(SPEC): atsp's output scaling; the machine's amp gain meanwhile.
-    let full_scale_mv = b.description.full_scale_mv();
+    // `Amplifier sensitivity [V/Fs]` of each slot that drives a channel.
+    let sens: Vec<f32> = p.slot.iter().filter(|s| s.channel_mask != 0).map(|s| s.amplifier_sensitivity).collect();
+    let full_scale_mv = operating_point("Amplifier sensitivity", &sens, b.description, diags)?;
     let blob =
         build_for(sgv2_core::UnitKind::Atsp, p.channels, 0, p.sample_rate, b.machine, full_scale_mv, p.as_bytes());
     atsp::Params::from_blob(&blob).map_err(|e| bad(format!("the engine rejects the compiled blob: {e:?}")))?;
