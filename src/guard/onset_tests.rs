@@ -636,3 +636,46 @@ fn quiet_programme_costs(profiles: &[(&str, f64)]) {
     }
     assert!(failures.is_empty(), "ordinary listening exceeds its per-device budget: {}", failures.join("; "));
 }
+
+/// The production path (no kernel playback grant: every shipped kernel)
+/// on the same schedule. A meter, not a gate: it prints what the onset
+/// reserve costs where the grant cannot be negotiated.
+#[test]
+#[ignore]
+fn production_path_listening_cost_meter() {
+    crate::log::set_verbosity(crate::log::Level::Error);
+    for name in ["j316", "j413", "j616"] {
+        let text = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("conf/apple/{name}.conf"))).unwrap();
+        for point in [30u32, 60] {
+            let mut cfg = Config::parse(&text).unwrap();
+            cfg.globals.governor = Governor::Unified;
+            cfg.globals.guard = Some(Governor::Asahi);
+            let volume = (point as f64 / 100.0).powi(3);
+            let level = Box::new(move |t: Duration| {
+                let phase = t.as_secs_f64() % 60.0;
+                let programme = if phase < 2.0 { 0.0 } else if phase < 20.0 { 0.10 }
+                    else if phase < 30.0 { 0.03 } else if phase < 45.0 { 0.25 }
+                    else if phase < 50.0 { 0.0 } else { 0.08 };
+                volume * programme
+            });
+            let (cfg, hw) = programme_run_with_gate(cfg, 600, true, true, level, false);
+            let mut totals = vec![0.0; cfg.speakers.len()];
+            let mut active_s = 0.0;
+            for pair in hw.gains.windows(2) {
+                let (from, to) = (pair[0].0.as_secs_f64(), pair[1].0.as_secs_f64());
+                for cycle in 1..10 {
+                    for (start, end) in [(2.0, 45.0), (50.0, 60.0)] {
+                        let base = cycle as f64 * 60.0;
+                        let seconds = (to.min(base + end) - from.max(base + start)).max(0.0);
+                        active_s += seconds;
+                        for (total, gain) in totals.iter_mut().zip(&pair[0].1) { *total += seconds * gain; }
+                    }
+                }
+            }
+            for (speaker, total) in cfg.speakers.iter().zip(totals) {
+                eprintln!("LISTENING_COST_PRODUCTION {name} {point}% {} control_db={:.3}", speaker.name, total / active_s);
+            }
+        }
+    }
+}
