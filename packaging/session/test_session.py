@@ -160,6 +160,46 @@ class Checks(unittest.TestCase):
         self.assertEqual(s.wanted(g), list(zip(p["pout"], p["spk"])))
 
 
+class Stop(unittest.TestCase):
+    def test_stopping_unlinks_the_amps_and_the_sense_within_its_bound(self):
+        import time
+
+        g, p, s = build("j616")
+        c = MACHINES["j616"]
+        ran = []
+
+        class Slow:
+            def __init__(self, argv):
+                ran.append(argv)
+                self.t = time.monotonic()
+                self.killed = False
+
+            def poll(self):
+                return -9 if self.killed else None
+
+            def wait(self, timeout):
+                if timeout < 5:
+                    raise sgs.subprocess.TimeoutExpired("pw-link", timeout)
+
+            def kill(self):
+                self.killed = True
+
+        orig = sgs.subprocess.Popen
+        sgs.subprocess.Popen = lambda argv, **kw: Slow(argv)
+        try:
+            t0 = time.monotonic()
+            s.unlink_all(g, 0.2)
+            took = time.monotonic() - t0
+        finally:
+            sgs.subprocess.Popen = orig
+        # every amp link and every sense link, nothing else (the voicing stays)
+        self.assertEqual(len(ran), c["amps"] + c["sense"], ran)
+        self.assertTrue(all(a[:2] == ["pw-link", "-d"] for a in ran), ran)
+        # bounded: a pw-link that does not finish is killed, not waited for
+        self.assertLess(took, 1.0)
+        self.assertEqual(s.pending, {})
+
+
 class Generated(unittest.TestCase):
     def test_generated_files_are_current(self):
         import subprocess
