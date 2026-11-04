@@ -80,6 +80,16 @@ GLOBAL_NOT_COMPARED = {
     "health_bits": "the macOS health bit layout is not mapped to sgv2 Health bits by the specification",
     "global_gain": "TODO(SPEC): the scale (linear or dB) of the lsm2 controller global gain is not fixed",
 }
+# Per-unit fields that are not compared, with the reason (field names as
+# reported: "global.<name>" for global fields).
+UNIT_NOT_COMPARED = {
+    "spp3": {
+        "global.modeled_power_w": "TODO(SPEC): the five-second reporting smoother of the summed modeled "
+                                  "power is not specified (SPEC-SPP3 4, 15)",
+        "global.measured_power_w": "TODO(SPEC): the five-second reporting smoother of the summed measured "
+                                   "power is not specified (SPEC-SPP3 15)",
+    },
+}
 AUDIO_TOLERANCE = 1e-5
 # Relative errors use max(|ref|, floor) so values near zero do not give
 # meaningless ratios.
@@ -238,8 +248,12 @@ def compare(ref, got):
             ok_slice &= ok
 
         rg, gg = r.get("global") or {}, g.get("global")
+        unit_skip = UNIT_NOT_COMPARED.get(r.get("unit"), {})
         for name in sorted(rg):
             rv = rg[name]
+            if "global." + name in unit_skip:
+                skip("global." + name, unit_skip["global." + name])
+                continue
             if name in GLOBAL_NOT_COMPARED:
                 skip("global." + name, GLOBAL_NOT_COMPARED[name])
                 continue
@@ -340,14 +354,22 @@ def compare_audio(ref_path, got_path, channels, ref_latency=0, got_latency=0):
         if bad is not None:
             nonfinite[side] = {"frame": bad // channels, "channel": bad % channels}
     worst, at = 0.0, None
+    # also, for information, the error over samples both sides keep inside
+    # digital full scale (sgv2 holds its output to +-1 FS; the reference may
+    # emit more, which no converter delivers). It does not decide the pass.
+    worst_fs, at_fs = 0.0, None
     for i in range(max(n, 0)):
         for c in range(channels):
-            d = abs(a[(i + ref_latency) * channels + c] - b[(i + got_latency) * channels + c])
+            ra, gb = a[(i + ref_latency) * channels + c], b[(i + got_latency) * channels + c]
+            d = abs(ra - gb)
             if not d <= worst:
                 worst, at = (d if math.isfinite(d) else math.inf), {"frame": i, "channel": c}
+            if abs(ra) <= 1.0 and abs(gb) < 1.0 and not d <= worst_fs:
+                worst_fs, at_fs = (d if math.isfinite(d) else math.inf), {"frame": i, "channel": c}
     ok = (n > 0 and not nonfinite and math.isfinite(worst) and worst <= AUDIO_TOLERANCE
           and na - ref_latency == nb - got_latency)
-    rep = {"pass": ok, "frames": n, "max_abs_error": worst, "at": at, "tolerance": AUDIO_TOLERANCE}
+    rep = {"pass": ok, "frames": n, "max_abs_error": worst, "at": at, "tolerance": AUDIO_TOLERANCE,
+           "max_abs_error_within_fs": worst_fs, "at_within_fs": at_fs}
     if nonfinite:
         rep["non_finite"] = nonfinite
     return ok, rep
@@ -397,7 +419,7 @@ def self_test():
     def rec(side, frame, frames, gain, temp, failsafe=False, cl=None):
         return {"schema": 1, "side": side, "unit": "spp3", "case": "c", "frame": frame, "frames": frames,
                 "mode": {"failsafe": failsafe, "closed_loop": cl},
-                "global": {"modeled_power_w": 1.0},
+                "global": {"thermal_gain_db": -6.0},
                 "channels": [{"gain": gain, "coil_temp_c": temp, "ol_temp_c": None}]}
 
     def idx(*rs):
@@ -448,7 +470,12 @@ def self_test():
     noglobal = idx(rec("sgv2", 0, 512, 0.5, 60.0))
     del noglobal[("c", 512)]["global"]
     ok, rep = compare(idx(rec("macos", 0, 512, 0.5, 60.0)), noglobal)
-    assert not ok and rep["fields"]["global.modeled_power_w"]["missing"] == 1, rep
+    assert not ok and rep["fields"]["global.thermal_gain_db"]["missing"] == 1, rep
+    # a per-unit not-compared field is skipped and listed with its reason
+    pw = idx(rec("macos", 0, 512, 0.5, 60.0))
+    pw[("c", 512)]["global"]["modeled_power_w"] = 3.0
+    ok, rep = compare(pw, idx(rec("sgv2", 0, 512, 0.5, 60.0)))
+    assert ok and "global.modeled_power_w" in rep["not_compared"], rep
     r1 = idx(rec("macos", 0, 512, 0.5, 60.0))
     r1[("c", 512)]["channels"][0]["control_temp_c"] = 40.0
     assert not compare(r1, idx(rec("sgv2", 0, 512, 0.5, 60.0)))[0]

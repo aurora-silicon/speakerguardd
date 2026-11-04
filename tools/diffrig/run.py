@@ -183,7 +183,8 @@ def main(argv):
         note = "".join([f"; absent on sgv2: {missing}" if missing else "",
                         f"; not compared: {skipped}" if skipped else "",
                         f"; {rep['inputs']}" if rep.get("inputs") else ""])
-        rows.append((case, ok, f"audio {arep.get('max_abs_error', float('nan')):.3g}; {worst}{note}"))
+        rows.append((case, ok, f"audio {arep.get('max_abs_error', float('nan')):.3g} "
+                             f"(within FS {arep.get('max_abs_error_within_fs', float('nan')):.3g}); {worst}{note}"))
         all_ok &= ok
     with open(os.path.join(out, "summary.md"), "w") as fd:
         fd.write("| case | pass | worst error per field |\n|---|---|---|\n")

@@ -229,7 +229,8 @@ enum Event {
     /// `uninit`/`reinit`/`newinst`/`newinst_ci` with an optional 64007
     /// value: the kernel is rebuilt with that start state (the strip's when
     /// absent); under 0 it restores the hand-off record of the last update.
-    Rebuild(Option<u32>),
+    /// `in_place` is an Uninitialize + Initialize of the same AU instance.
+    Rebuild { state: Option<u32>, in_place: bool },
 }
 
 impl Event {
@@ -242,7 +243,10 @@ impl Event {
                 Event::Sleep
             }
             "tsjump" | "classinfo" => Event::None,
-            "uninit" | "reinit" | "newinst" | "newinst_ci" => Event::Rebuild(v.map(|v| v.parse()).transpose().ok()?),
+            "uninit" | "reinit" | "newinst" | "newinst_ci" => Event::Rebuild {
+                state: v.map(|v| v.parse()).transpose().ok()?,
+                in_place: matches!(k, "uninit" | "reinit"),
+            },
             _ => return None,
         })
     }
@@ -250,7 +254,7 @@ impl Event {
 
 /// Rebuilds the unit for an [`Event::Rebuild`]; `None` when the unit kind
 /// has no rebuild model.
-type Rebuild<'a> = &'a dyn Fn(Option<u32>) -> Option<Box<dyn ProtectionUnit>>;
+type Rebuild<'a> = &'a dyn Fn(Option<u32>, bool) -> Option<Box<dyn ProtectionUnit>>;
 
 /// Render the whole program, writing trace lines and audio as it goes.
 #[allow(clippy::too_many_arguments)]
@@ -289,10 +293,10 @@ fn render(
                 Event::Reset => unit.host_reset(),
                 Event::Sleep => {}
                 Event::None => {}
-                Event::Rebuild(p) => {
+                Event::Rebuild { state: p, in_place } => {
                     let mut rec = HandOff::EMPTY;
                     let saved = unit.save_state(&mut rec);
-                    let new = rebuild(p).ok_or_else(|| io::Error::other("no rebuild model for this unit"))?;
+                    let new = rebuild(p, in_place).ok_or_else(|| io::Error::other("no rebuild model for this unit"))?;
                     *unit = new;
                     // only 64007 = 0 restores the record, and with no ageing:
                     // the rig's newinst=0 after 2 s of idle continues at the
@@ -321,11 +325,20 @@ fn render(
             .collect();
         let cl: Vec<&str> =
             t.channels[..channels].iter().map(|c| if c.closed_loop { "true" } else { "false" }).collect();
+        // spp3's global thermal-gain meter (global 12): the most restrictive
+        // part thermal gain, dB
+        let global = if kind == UnitKind::Spp3 {
+            let g = t.channels[..channels].iter().map(|c| c.axis_gain[4]).fold(f32::INFINITY, f32::min);
+            let db = if g.is_finite() && g > 0.0 { 20.0 * g.log10() } else { f32::NAN };
+            format!("{{\"thermal_gain_db\":{}}}", num(db))
+        } else {
+            String::from("{}")
+        };
         writeln!(
             trace,
             "{{\"schema\":1,\"side\":\"sgv2\",\"unit\":\"{unit_name}\",\"case\":\"{case}\",\"frame\":{pos},\
              \"frames\":{n},\"latency\":{latency},\"params\":\"{params}\",\"cfprops\":[{cfprop_ids}],\"health\":{},\
-             \"mode\":{{\"failsafe\":{},\"closed_loop\":[{}]}},\"channels\":[{}]}}",
+             \"mode\":{{\"failsafe\":{},\"closed_loop\":[{}]}},\"global\":{global},\"channels\":[{}]}}",
             health.0,
             health.is_failsafe(),
             cl.join(","),
@@ -367,13 +380,23 @@ fn run(a: &Args) -> io::Result<()> {
     let mut events = a.events.clone();
     events.sort_by_key(|(f, _)| *f);
     let kind = a.unit;
-    let rebuild = |p: Option<u32>| -> Option<Box<dyn ProtectionUnit>> {
+    let rebuild = |p: Option<u32>, in_place: bool| -> Option<Box<dyn ProtectionUnit>> {
         let b = blob.as_deref()?;
         match kind {
             UnitKind::Spp3 => {
                 let mut q = spp3::Params::from_blob(b).ok()?;
                 if let Some(v) = p {
                     q.thermal_state_override = v;
+                }
+                // the reference's in-place re-Initialize takes the pilot's low
+                // level as its high level too (headroom 1 - A_lo, the high
+                // target never selected again; rig, restore-uninit/reinit).
+                // A reference quirk the plugin does not reproduce: the rig
+                // renders it so the comparison is like for like.
+                if in_place {
+                    for c in q.ch.iter_mut() {
+                        c.pilot_ampl_hi_db = c.pilot_ampl_lo_db;
+                    }
                 }
                 Some(Box::new(spp3::Unit::new(q)))
             }
@@ -460,7 +483,7 @@ mod tests {
                 slices,
                 &[64009, 7],
                 &[],
-                &|_| None,
+                &|_, _| None,
                 &mut trace,
                 Some(&mut audio),
             )
@@ -519,9 +542,9 @@ mod tests {
         assert_eq!(Event::parse("sleep=2"), Some(Event::Sleep));
         assert_eq!(Event::parse("tsjump=240000"), Some(Event::None));
         assert_eq!(Event::parse("classinfo"), Some(Event::None));
-        assert_eq!(Event::parse("newinst=0"), Some(Event::Rebuild(Some(0))));
-        assert_eq!(Event::parse("uninit"), Some(Event::Rebuild(None)));
-        assert_eq!(Event::parse("newinst_ci=1"), Some(Event::Rebuild(Some(1))));
+        assert_eq!(Event::parse("newinst=0"), Some(Event::Rebuild { state: Some(0), in_place: false }));
+        assert_eq!(Event::parse("uninit"), Some(Event::Rebuild { state: None, in_place: true }));
+        assert_eq!(Event::parse("newinst_ci=1"), Some(Event::Rebuild { state: Some(1), in_place: false }));
         assert_eq!(Event::parse("bogus"), None);
         assert_eq!(Event::parse("sleep"), None);
     }
