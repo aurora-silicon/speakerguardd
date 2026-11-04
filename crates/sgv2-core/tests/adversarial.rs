@@ -1386,6 +1386,16 @@ impl HardOracle {
                 Some(false) => keep_or_disarm(prev),
                 None => (keep_or_disarm(prev) == Some(true)).then_some(true),
             };
+            // rig law 6a by policy: the feed-forward node above 1000 K holds
+            // the hard path (the unit flags MODEL_RANGE), undecided within
+            // rounding of the threshold
+            if c.ff_on {
+                c.armed = match cmp(c.theta_ff as f64, 1000.0) {
+                    Some(true) => Some(true),
+                    Some(false) => c.armed,
+                    None => (c.armed == Some(true)).then_some(true),
+                };
+            }
             // the virtual coil, independently: the unit's must agree
             let cs = &unit_cs[ci];
             if c.ff_on {
@@ -2335,7 +2345,10 @@ fn spp3_feed_forward_off_still_holds_the_hard_limit() {
 fn spp3_closed_loop_falls_back_when_the_sense_bus_disappears() {
     let mut u = spp3::Unit::new(spp3_cl());
     let (g0, t0) = drive1(&mut u, 0.6, None, 48_000 * 10, Some(4.0));
-    assert!(t0.channels[0].closed_loop && t0.channels[0].tlim_adj_c > 1.0, "control: the closed loop corrects");
+    // control: the closed loop runs and accepts windows; the correction is
+    // capped at the base (CL_RELAXATION off, J616s live-test incident)
+    assert!(t0.channels[0].closed_loop, "control: the closed loop runs");
+    assert!(t0.channels[0].tlim_adj_c <= 0.0, "control: the closed loop never relaxes the limit");
     assert!(g0 > 0.0);
     let (g, t) = drive1(&mut u, 0.6, None, 48_000 * 30, None);
     let (g_open, _) = drive1(&mut spp3::Unit::new(spp3_minimal(0.5)), 0.6, None, 48_000 * 40, None);
@@ -2696,7 +2709,8 @@ fn spp3_closed_loop_is_slice_invariant() {
     let s = vec![i, v];
     let reference = render(&mut spp3::Unit::new(p), &x, Some(&s), &[256], &mut no_sense, false);
     assert!(reference.tele[0].1.channels[0].closed_loop, "control: the closed loop runs");
-    assert!(reference.tele[0].1.channels[0].tlim_adj_c > 0.0, "control: the closed loop corrects");
+    // the correction is capped at the base (CL_RELAXATION off)
+    assert!(reference.tele[0].1.channels[0].tlim_adj_c <= 0.0, "control: the closed loop never relaxes the limit");
     for cuts in [vec![1usize], vec![16], vec![64], vec![128]] {
         let r = render(&mut spp3::Unit::new(p), &x, Some(&s), &cuts, &mut no_sense, false);
         assert_eq!(tele_bits(&r.tele[0].1), tele_bits(&reference.tele[0].1), "state differs with slices {cuts:?}");
