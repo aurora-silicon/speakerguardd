@@ -16,9 +16,11 @@
 //! - a hard amp fault (over-temperature, over-current, group off), or a
 //!   granted card whose amps are not at the operating volume, releases and
 //!   latches released for the life of the process;
-//! - a lapsed lease (`ETIMEDOUT`) is a fault for this tick: the kernel has
-//!   already stopped playback, and the grant comes back only through two
-//!   clean ticks;
+//! - a lapsed lease (`ETIMEDOUT`) grants nothing on this tick: the kernel
+//!   has already stopped playback (a supervisor stall), or the system has
+//!   just resumed (the first write after a resume). This tick's observation
+//!   was clean, so it counts as the first of the two clean ticks, and the
+//!   grant comes back on the next clean tick;
 //! - losing ownership (`EPERM`) or any other kernel error ends the loop, so
 //!   the process exits and the kernel's floor holds (the control file
 //!   closes, which withdraws protection at once).
@@ -168,8 +170,9 @@ impl Supervisor {
             Action::Renew => match kernel.renew() {
                 Ok(()) => Ok(if was_held { Event::Renewed } else { Event::Granted }),
                 Err(KernelError::Lapsed) => {
-                    // count it as a faulted tick: back through two clean ticks
+                    // released, with this clean tick as the first of two
                     self.lease.tick(Observation::default());
+                    self.lease.tick(obs);
                     Ok(Event::Lapsed)
                 }
                 Err(KernelError::Sleeping) => {
@@ -428,13 +431,21 @@ mod tests {
     }
 
     #[test]
-    fn a_lapse_goes_back_through_two_clean_ticks() {
+    fn a_lapse_or_a_resume_grants_again_on_the_next_clean_tick() {
         let mut k = Lapsing(Recorder::healthy(6), false);
         let mut s = j316();
         s.tick(CLEAN, &mut k).unwrap();
         assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Granted));
+        // sgv2k2: the first write after a resume (or a lapse) is ETIMEDOUT
         k.1 = true;
         assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Lapsed));
+        assert!(!s.granted());
+        assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Granted));
+        // a fault on the next tick still keeps it released
+        k.1 = true;
+        assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Lapsed));
+        let bad = Observation { heartbeat_fresh: false, ..CLEAN };
+        assert_eq!(s.tick(bad, &mut k), Ok(Event::StayedReleased));
         assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::StayedReleased));
         assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Granted));
     }
