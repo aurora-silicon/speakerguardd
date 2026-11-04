@@ -112,6 +112,7 @@ def cases():
         for q in (1, 7, 160, 4096):
             C.append(dict(name=f"atsp-aid{aid}-q{q}-tone_bursts", unit="atsp", aid=aid,
                           signal="tone_bursts", q=q))
+    C += atsp_probe_cases()
     # spp3 closed-loop edges (AID35, synthetic SpTS, rig plant)
     cl = dict(unit="spp3", aid=35, cfprops=["64009=spts-synth-nominal.json"], clsp=True)
     ramp = "thermal_ramp_1k"  # 120 s at -3 dBFS (deep in limiting from ~1 s) then 60 s release
@@ -264,12 +265,49 @@ def runtime_signal(name, nch):
     return path
 
 
+def atsp_probe_cases():
+    """Mask, unclaimed-channel and bypass probes (SPEC-ATSP sections 4-6), with run-time
+    property records like every other case."""
+    C = []
+    C.append(dict(name="atsp-aid18-bypass-pink_steps", unit="atsp", aid=18,
+                  signal="pink_steps", ch=4, file_ch=2, params=["0=1"]))
+    C.append(dict(name="atsp-aid18-unclaimed-all-pink_steps", unit="atsp", aid=18,
+                  signal="pink_steps", ch=4, file_ch=2, preset_params=["13=0", "26=0", "39=0"]))
+    C.append(dict(name="atsp-aid18-unclaimed-ch23-pink_steps", unit="atsp", aid=18,
+                  signal="pink_steps", ch=4, file_ch=2, preset_params=["13=3"]))
+    # AID2 is a one-channel desktop preset whose shipped type-A mask is 0xffff
+    for suffix, mask in (("shipped-ffff", None), ("mask-1", 1), ("mask-0", 0), ("mask-2", 2)):
+        C.append(dict(name=f"atsp-aid2-{suffix}-thermal15s", unit="atsp", aid=2,
+                      signal="thermal_ramp_1k", ch=1, file_ch=2, limit_frames=15 * 48000,
+                      preset_params=[] if mask is None else [f"13={mask}"]))
+    for suffix, params in (("mask-ffff", ["13=65535"]), ("mask-16", ["13=16"]),
+                           ("mask-5-unlinked", ["13=5", "40=0"])):
+        C.append(dict(name=f"atsp-aid18-{suffix}-thermal15s", unit="atsp", aid=18,
+                      signal="thermal_ramp_1k", ch=4, file_ch=2, limit_frames=15 * 48000,
+                      preset_params=params))
+    # AID4 has distinct type-A/B models: default routing, overlap precedence and the
+    # zero-based channel bit; every gain link off so both trajectories stay observable
+    for suffix, (a, b) in (("separate", (1, 2)), ("swapped", (2, 1)), ("zero", (0, 0)),
+                           ("overlap-bit0", (1, 1)), ("high-only", (4, 0))):
+        C.append(dict(name=f"atsp-aid4-mask-{suffix}-thermal15s", unit="atsp", aid=4,
+                      signal="thermal_ramp_1k", ch=2, file_ch=2, limit_frames=15 * 48000,
+                      preset_params=[f"13={a}", f"26={b}", "39=0", "12=0", "25=0", "38=0", "40=0", "14=1"]))
+    C.append(dict(name="atsp-aid18-bypass-then-enable-thermal15s", unit="atsp", aid=18,
+                  signal="thermal_ramp_1k", ch=4, file_ch=2, limit_frames=15 * 48000,
+                  params=["0=1"], params_at=["512000:0=0"]))
+    C.append(dict(name="atsp-aid18-run-bypass-resume-thermal15s", unit="atsp", aid=18,
+                  signal="thermal_ramp_1k", ch=4, file_ch=2, limit_frames=15 * 48000,
+                  params_at=["256000:0=1", "512000:0=0"]))
+    return C
+
+
 def run_case(c, outroot, force=False):
     if os.geteuid() == 0:
         raise RuntimeError("refusing to run as root: a missed log redirect would write system directories")
     d = os.path.abspath(os.path.join(outroot, c["name"]))
     unit, aid, q = c["unit"], c["aid"], c.get("q", 512)
-    nch = atsp_channels(aid) if unit == "atsp" else 6
+    nch = c.get("ch") or (atsp_channels(aid) if unit == "atsp" else 6)
+    fch = c.get("file_ch", nch)  # the input file's width: stream channel k reads file channel k mod fch
     env = dict(os.environ, DYLD_INSERT_LIBRARIES=os.path.join(BIN, "prefshim.dylib"),
                RIGREDIR_TO=os.path.join(d, "logs"))
     if c["signal"].startswith("rt-"):
@@ -279,15 +317,25 @@ def run_case(c, outroot, force=False):
     # The edge list sets no run-time graph properties: only the case's own fixtures.
     runtime_file, cfprops = capture.resolve_cfprops(c, use_runtime=False)
     args = [os.path.join(BIN, "rig_host"), "--unit", unit, "--strip", strip_path(aid),
-            "--in", os.path.join(SIG, f"{c['signal']}.{nch}ch.f32"), "--ch", str(nch),
+            "--in", os.path.join(SIG, f"{c['signal']}.{fch}ch.f32"), "--ch", str(nch), "--file-ch", str(fch),
             "--q", str(q), "--out", os.path.join(d, "run")]
     if c.get("sr"):
         args += ["--sr", str(c["sr"])]
+    if c.get("limit_frames"):
+        args += ["--limit-frames", str(c["limit_frames"])]
+    # atsp AU parameters: preset_params rewrite stored preset records before ClassInfo,
+    # params_at ["FRAME:ID=V"] are set at run time (global scope)
+    for pr in c.get("preset_params", []):
+        args += ["--preset-param", pr]
+    for pr in c.get("params_at", []):
+        args += ["--param-at", pr]
     for ev in c.get("events", []):
         args += ["--event", ev]
     if c.get("dump_params"):
         args += ["--dump-params"]
-    expect_frames = os.path.getsize(os.path.join(SIG, f"{c['signal']}.{nch}ch.f32")) // (4 * nch)
+    expect_frames = os.path.getsize(os.path.join(SIG, f"{c['signal']}.{fch}ch.f32")) // (4 * fch)
+    if c.get("limit_frames"):
+        expect_frames = min(expect_frames, int(c["limit_frames"]))
     if unit == "spp3":
         sc = sidecar_path(aid)
         if c.get("sidecar_patch"):
@@ -312,7 +360,11 @@ def run_case(c, outroot, force=False):
             args += ["--plant", os.path.join(d, "plant.json")]
         if c.get("clsp"):
             env.update(RIGREDIR_FROM="/Library/Preferences/Audio/CLSPLogs", RIGPREF_clsp_logging_level=str(c.get("clsp_level", CLSP_LEVEL)))
-    signal = os.path.join(SIG, f"{c['signal']}.{nch}ch.f32")
+    else:
+        # atsp: "ID=V" global parameters (the form run.py hands to sgv2-render)
+        for pr in c.get("params", []):
+            args += ["--param", pr if pr.split("=")[0].count(".") == 2 else f"0.0.{pr}"]
+    signal = os.path.join(SIG, f"{c['signal']}.{fch}ch.f32")
     key = capture.inputs_key(args + [json.dumps({k: v for k, v in c.items() if k != "gen"}, sort_keys=True)],
                              signal, runtime_file, cfprops)
     if not force and capture.cached(d, key):
@@ -439,7 +491,11 @@ def write_trace(d, c, meta):
             for r in lines:
                 fo.write(json.dumps(r, separators=(",", ":")) + "\n")
         return
-    x = np.fromfile(os.path.join(SIG, f"{c['signal']}.{nch}ch.f32"), np.float32).reshape(-1, nch)
+    fch = meta.get("file_channels", nch)
+    x = np.fromfile(os.path.join(SIG, f"{c['signal']}.{fch}ch.f32"), np.float32).reshape(-1, fch)
+    x = x[:, [k % fch for k in range(nch)]]
+    if c.get("limit_frames"):
+        x = x[:int(c["limit_frames"])]
     y = f32(os.path.join(d, "run.out.f32"), nch)
     lat = int(round(meta["latency_s"] * meta["sr"]))
     x = np.concatenate([np.zeros((lat, nch), np.float32), x])[:len(y)]
@@ -458,8 +514,19 @@ def write_trace(d, c, meta):
                     s["raw"] = {"sample_gain_min": float(g.min()), "sample_gain_max": float(g.max()),
                                 "sample_gain_last": float(g[-1])}
                 chans.append(s)
+            mode = {"failsafe": None}
+            if c.get("params") or c.get("params_at"):
+                # AU parameter 0 (bypass) as of this slice's first frame
+                bypass = any(p.split("=")[0].split(".")[-1] == "0" and float(p.split("=")[1]) != 0
+                             for p in c.get("params", []))
+                for change in c.get("params_at", []):
+                    frame, assignment = change.split(":", 1)
+                    pid, value = assignment.split("=", 1)
+                    if int(frame) <= prev and int(pid) == 0:
+                        bypass = float(value) != 0
+                mode["bypass"] = bypass
             rec = dict(schema=1, side="macos", unit=unit, case=c["name"], frame=prev, frames=end - prev,
-                       latency=lat, mode={"failsafe": None}, channels=chans, **{"global": {}})
+                       latency=lat, mode=mode, channels=chans, **{"global": {}})
             fo.write(json.dumps(rec, separators=(",", ":")) + "\n")
             prev = end
 
