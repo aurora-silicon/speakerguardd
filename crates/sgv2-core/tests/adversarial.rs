@@ -1787,7 +1787,6 @@ fn failsafe_unit_output_is_finite() {
 /// then differ between slicings (property 3). The cut is on the safe side,
 /// but the trajectory is no longer reproducible against the rig.
 #[test]
-#[ignore = "FINDING 6 (lane B): the non-finite fail-safe region depends on host slicing"]
 fn non_finite_failsafe_region_is_slice_invariant() {
     let mut x = vec![0.5f32; 512];
     x[100] = f32::NAN;

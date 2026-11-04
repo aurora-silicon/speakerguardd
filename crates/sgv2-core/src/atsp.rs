@@ -168,6 +168,8 @@ struct Chan {
     p_model: f64,
     g_target: f64,
     hard: bool,
+    /// A non-finite program sample in the current block.
+    meter_failed: bool,
 }
 
 struct Group {
@@ -281,6 +283,7 @@ impl Run {
                     p_model: 0.0,
                     g_target: 1.0,
                     hard: false,
+                    meter_failed: false,
                 });
             }
         }
@@ -299,6 +302,7 @@ impl Run {
             c.p_model = 0.0;
             c.g_target = 1.0;
             c.hard = false;
+            c.meter_failed = false;
         }
         for g in self.groups.iter_mut() {
             g.gain = 1.0;
@@ -330,9 +334,14 @@ impl Run {
                 ch.acc_in.add_sq(&x[..m], phase + k);
                 k += m;
             }
-            let bad = dsp::mul_bounded_to(inp, curve, out);
+            // meter failure: at most the fail-safe gain from the first
+            // non-finite sample to the end of its block, whatever the host
+            // slicing
+            let bad = dsp::mul_bounded_to(inp, curve, out) || ch.meter_failed;
+            let from = if ch.meter_failed { 0 } else { inp.iter().position(|x| !x.is_finite()).unwrap_or(len) };
             if bad {
-                for ((o, &x), &g) in out.iter_mut().zip(inp).zip(curve) {
+                ch.meter_failed = true;
+                for ((o, &x), &g) in out[from..].iter_mut().zip(&inp[from..]).zip(&curve[from..]) {
                     *o = dsp::bound1(x) * g.min(FAILSAFE_GAIN);
                 }
                 failed = true;
@@ -344,8 +353,10 @@ impl Run {
                 let mut d = [0.0f32; BOUND_CHUNK];
                 dsp::mul_metered_to(&inp[k..k + m], &curve[k..k + m], &mut d[..m]);
                 if bad {
-                    for (dv, (&x, &g)) in d[..m].iter_mut().zip(inp[k..k + m].iter().zip(&curve[k..k + m])) {
-                        *dv = dsp::meter1(x) * g.min(FAILSAFE_GAIN);
+                    for (j, dv) in d[..m].iter_mut().enumerate() {
+                        if k + j >= from {
+                            *dv = dsp::meter1(inp[k + j]) * curve[k + j].min(FAILSAFE_GAIN);
+                        }
                     }
                 }
                 ch.acc.add_sq(&d[..m], phase + k);
@@ -368,6 +379,7 @@ impl Run {
         let mut tgt = [1.0f64; MAX_CHANNELS];
         let mut hard = [false; MAX_CHANNELS];
         for c in self.ch.iter_mut() {
+            c.meter_failed = false;
             let p = c.elec * c.acc.total() / blk;
             c.acc.clear();
             c.p_model = p;

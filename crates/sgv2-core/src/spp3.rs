@@ -42,8 +42,10 @@
 //!   unclamped as the reference meters it, bounded only at
 //!   `dsp::METER_FS` (16 FS) so no finite sample can overflow them, and
 //!   with a non-finite sample as 0. In-range audio is unchanged.
-//! - **Fail-safe.** A channel-count mismatch, or non-finite drive (the
-//!   simple-meter failure), gives 20 dB for the affected frames. A model
+//! - **Fail-safe.** A channel-count mismatch gives 20 dB for the call; a
+//!   non-finite program sample (the simple-meter failure) gives 20 dB from
+//!   that sample to the end of its 256-frame update, whatever the host
+//!   slicing. A model
 //!   state that goes non-finite latches the 20 dB fail-safe
 //!   (`Health::MODEL_FAULT`) until reset; candidate selection propagates
 //!   NaN, so it can never fall back to unity.
@@ -750,6 +752,9 @@ struct Chan {
     scratch: Vec<f32>,
     /// The protected drive of the current segment, as the model meters it.
     drive: Vec<f32>,
+    /// A non-finite program sample in the current thermal update: the rest
+    /// of the update gets the meter-failure 20 dB.
+    meter_failed: bool,
     elec: f64,
     limit: f64,
     hard_on: f64,
@@ -899,6 +904,7 @@ impl Run {
                 delay: Delay::new(look),
                 scratch: vec![0.0; MODEL_SCRATCH],
                 drive: vec![0.0; THERMAL_FRAMES],
+                meter_failed: false,
                 elec: ag * ag * reb / ((reb + series) * (reb + series)),
                 limit: c.temperature_limit as f64,
                 hard_on: c.temperature_limit as f64 + c.hard_temp_limit_headroom as f64,
@@ -955,6 +961,7 @@ impl Run {
             c.ff.theta = 0.0;
             c.p_prev = 0.0;
             c.p_ff_prev = 0.0;
+            c.meter_failed = false;
             c.acc.clear();
             c.delay_in.clear();
             c.acc_in.clear();
@@ -1008,10 +1015,16 @@ impl Run {
                 dsp::scale_in_place(out, c.headroom);
                 dsp::scale_in_place(drive, c.headroom);
             }
-            if non_finite {
-                // simple-meter failure: at most 20 dB below the input on
-                // these frames, non-finite samples muted
-                for (((o, d), &x), &g) in out.iter_mut().zip(drive.iter_mut()).zip(inp).zip(curve) {
+            if c.meter_failed || non_finite {
+                // simple-meter failure: at most 20 dB below the input from
+                // the first non-finite sample to the end of its thermal
+                // update (where the host split its buffers does not move
+                // it), non-finite samples muted
+                let from = if c.meter_failed { 0 } else { inp.iter().position(|x| !x.is_finite()).unwrap_or(len) };
+                c.meter_failed = true;
+                for (((o, d), &x), &g) in
+                    out[from..].iter_mut().zip(drive[from..].iter_mut()).zip(&inp[from..]).zip(&curve[from..])
+                {
                     let gg = (g * c.headroom).min(FAILSAFE_GAIN);
                     *o = dsp::bound1(x) * gg;
                     *d = dsp::meter1(x) * gg;
@@ -1090,6 +1103,7 @@ impl Run {
         let mut ff_t = [1.0f64; MAX_CHANNELS];
         let mut hard_t = [1.0f64; MAX_CHANNELS];
         for c in self.ch.iter_mut() {
+            c.meter_failed = false;
             let p = c.elec * c.acc.total() / n;
             c.acc.clear();
             c.p_model = p;
