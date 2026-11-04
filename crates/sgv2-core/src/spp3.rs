@@ -330,7 +330,9 @@ impl Params {
         Ok(p)
     }
 
-    /// Structural checks only: the model trusts the tuning's values.
+    /// Structural and range checks. Every value `process` uses is checked
+    /// here, so `process` has no panic path and no diverging recurrence for
+    /// any accepted parameter set; anything else is the fail-safe.
     pub fn validate(&self) -> Result<(), InitError> {
         let n = self.channels as usize;
         if n == 0 || n > MAX_CHANNELS {
@@ -353,6 +355,10 @@ impl Params {
         if !self.thermal_ambient_temp.is_finite() {
             return Err(InitError::Invalid("ambient"));
         }
+        // one thermal update: the forward recurrence `1 - dt/tau` goes
+        // negative, and then diverges, below it
+        let dt = THERMAL_FRAMES as f32 / self.sample_rate as f32;
+        let nonneg = |v: f32| v.is_finite() && v >= 0.0;
         let mut seen = 0u32;
         for c in &self.ch[..n] {
             if c.source as usize >= n || seen & (1 << c.source) != 0 {
@@ -363,12 +369,19 @@ impl Params {
             {
                 return Err(InitError::Invalid("thermal constants"));
             }
+            if !(c.tau_tvc >= dt && c.tau_tmg >= dt) {
+                return Err(InitError::Invalid("time constant below one thermal update"));
+            }
             // nonpositive disables the feed-forward candidate (spec 6); NaN
             // or infinity is no setting at all
             if !c.thermal_ff_speedup_factor.is_finite() {
                 return Err(InitError::Invalid("ThermalFFSpeedupFactor"));
             }
-            if !(c.initial_theta_vc.is_finite() && c.initial_theta_mg.is_finite()) {
+            if c.thermal_ff_speedup_factor > 0.0 && c.thermal_ff_speedup_factor * c.tau_tvc < dt {
+                return Err(InitError::Invalid("feed-forward pole below one thermal update"));
+            }
+            // a rise below ambient would allow more drive than a cold start
+            if !(nonneg(c.initial_theta_vc) && nonneg(c.initial_theta_mg)) {
                 return Err(InitError::Invalid("start state"));
             }
             if !(c.rampout.is_finite() && c.rampout >= 0.0) {
@@ -382,6 +395,9 @@ impl Params {
             }
             if !(pos(c.reb_ref) && c.rshunt.is_finite() && c.rshunt >= 0.0 && pos(c.ag)) {
                 return Err(InitError::Invalid("electrical constants"));
+            }
+            if c.cl_thermal_feedback_enabled != 0 {
+                c.validate_closed_loop()?;
             }
         }
         Ok(())
@@ -399,6 +415,44 @@ impl Params {
         }
         p.validate()?;
         Ok(p)
+    }
+}
+
+impl ChannelParams {
+    /// The closed-loop dictionary, when CL feedback is configured: every
+    /// field the window, the resistance smoother and the corrected limit
+    /// use, so the limit can only ever move inside `[Tlim, Tlim + cap]`.
+    /// (The calibration record itself is checked against these ranges when
+    /// the unit is built; one outside them runs that channel open loop.)
+    fn validate_closed_loop(&self) -> Result<(), InitError> {
+        let pos = |v: f32| v.is_finite() && v > 0.0;
+        let nonneg = |v: f32| v.is_finite() && v >= 0.0;
+        if !(pos(self.temp_sense_window_time_s)
+            && pos(self.temp_sense_smoothing_tau_s)
+            && pos(self.tlim_err_decay_time_s)
+            && self.temp_sense_window_time_s <= 60.0)
+        {
+            return Err(InitError::Invalid("closed-loop times"));
+        }
+        if !(pos(self.imon_scale) && pos(self.vmon_scale) && nonneg(self.i_pwr_thres) && nonneg(self.v_pwr_thres)) {
+            return Err(InitError::Invalid("closed-loop sense scales"));
+        }
+        if !(pos(self.rdc_scale) && pos(self.reb_range_min) && self.reb_range_max.is_finite())
+            || self.reb_range_min > self.reb_range_max
+        {
+            return Err(InitError::Invalid("RebRange"));
+        }
+        let (t0, t1) = (self.cal_temp_range_min, self.cal_temp_range_max);
+        if !(t0.is_finite() && t1.is_finite() && t0 <= t1) {
+            return Err(InitError::Invalid("CalTempRange"));
+        }
+        if !(self.a_t_20c.is_finite() && self.a_t_35c.is_finite()) {
+            return Err(InitError::Invalid("temperature coefficients"));
+        }
+        if !nonneg(self.tlim_adj_cap) {
+            return Err(InitError::Invalid("TlimAdjCap"));
+        }
+        Ok(())
     }
 }
 
@@ -609,7 +663,9 @@ impl Cl {
         if self.age > self.window.saturating_add(THERMAL_FRAMES) {
             self.valid = false;
         }
-        let raw = if self.valid { (limit + (t_ol - self.t_cl)).clamp(limit, limit + self.cap) } else { limit };
+        // max/min, not clamp: never a panic on the RT thread, and a NaN
+        // error falls back to the plain limit
+        let raw = if self.valid { (limit + (t_ol - self.t_cl)).max(limit).min(limit + self.cap) } else { limit };
         self.limit_s += self.k_lim * (raw - self.limit_s);
         self.limit_s
     }
