@@ -378,9 +378,13 @@ impl Params {
         {
             return Err(InitError::Invalid("SafeTlim"));
         }
-        // one thermal update: the forward recurrence `1 - dt/tau` goes
-        // negative, and then diverges, below it
+        // the reference's documented minimum for the thermal time constants
+        // (its parameter info gives 0.1 s; the AU accepts less and then
+        // overshoots far above the hard limit at cold start, rig finding
+        // 15), and never below one thermal update (the forward recurrence
+        // `1 - dt/tau` diverges there)
         let dt = THERMAL_FRAMES as f32 / self.sample_rate as f32;
+        let tau_min = TAU_MIN_S.max(dt);
         let mut seen = 0u32;
         for c in &self.ch[..n] {
             if c.source as usize >= n || seen & (1 << c.source) != 0 {
@@ -391,16 +395,16 @@ impl Params {
             {
                 return Err(InitError::Invalid("thermal constants"));
             }
-            if !(c.tau_tvc >= dt && c.tau_tmg >= dt) {
-                return Err(InitError::Invalid("time constant below one thermal update"));
+            if !(c.tau_tvc >= tau_min && c.tau_tmg >= tau_min) {
+                return Err(InitError::Invalid("thermal time constant below 0.1 s"));
             }
             // nonpositive disables the feed-forward candidate (spec 6); NaN
             // or infinity is no setting at all
             if !c.thermal_ff_speedup_factor.is_finite() {
                 return Err(InitError::Invalid("ThermalFFSpeedupFactor"));
             }
-            if c.thermal_ff_speedup_factor > 0.0 && c.thermal_ff_speedup_factor * c.tau_tvc < dt {
-                return Err(InitError::Invalid("feed-forward pole below one thermal update"));
+            if c.thermal_ff_speedup_factor > 0.0 && c.thermal_ff_speedup_factor * c.tau_tvc < tau_min {
+                return Err(InitError::Invalid("feed-forward pole below 0.1 s"));
             }
             if !(c.rampout.is_finite() && c.rampout >= 0.0) {
                 return Err(InitError::Invalid("Rampout"));
@@ -556,6 +560,9 @@ const RATIO_MIN: f64 = 1e-4;
 /// drive meter (rig law (b): Pdrv of a 2 FS sine is that of the clamped
 /// sine; the output never exceeds 1.5 x the gain). The output stays bounded.
 const INPUT_CLAMP: f32 = 1.5;
+/// Shortest accepted thermal time constant (coil, magnet and the
+/// feed-forward pole), s: the reference's documented parameter minimum.
+pub const TAU_MIN_S: f32 = 0.1;
 /// Release hold of the ordinary candidate, s (rig law 5: fixed).
 const HOLD_S: f64 = 1.0;
 /// Dezipper 99 % settling time, s (spec 6).
