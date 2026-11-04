@@ -533,7 +533,7 @@ fn cl_params(rc: f32, tc: f32) -> Params {
 }
 
 #[test]
-fn closed_loop_reads_coil_temperature_from_the_pilot_bin_and_relaxes_the_limit() {
+fn closed_loop_reads_coil_temperature_from_the_pilot_bin_and_never_relaxes() {
     let (rc, tc) = (4.0f32, 25.0f32);
     let p = cl_params(rc, tc);
     let mut u = spp3::Unit::new(p);
@@ -550,11 +550,10 @@ fn closed_loop_reads_coil_temperature_from_the_pilot_bin_and_relaxes_the_limit()
     // and reads R a few 1e-3 low on this signal
     assert!((t.channels[0].cl_temp_c - 60.0).abs() < 1.5, "T_CL {}", t.channels[0].cl_temp_c);
     assert_eq!(u.controller_state(0)[9], 1.0, "window accepted");
-    // the model runs hotter than the sensed 60 C, so the limit relaxes
-    // (capped), never below the base
-    let adj = t.channels[0].tlim_adj_c;
-    assert!(adj > 0.0 && adj <= 30.0 + 1e-3, "TlimAdj {adj}");
-    assert!(u.effective_limit(0) > 120.0);
+    // the model runs hotter than the sensed 60 C, but the correction is
+    // capped at the base (J616s live-test incident, TODO(SPEC))
+    assert_eq!(t.channels[0].tlim_adj_c, 0.0);
+    assert_eq!(u.effective_limit(0), 120.0);
 }
 
 #[test]
