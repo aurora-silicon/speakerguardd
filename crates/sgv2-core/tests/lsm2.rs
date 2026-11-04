@@ -184,3 +184,19 @@ fn slicing_does_not_change_the_audio() {
         assert!(run(&mut Unit::new(p), &[x.clone(), y.clone()], slice) == r, "slice {slice}");
     }
 }
+
+#[test]
+fn runtime_budgets_replace_the_preset_limits() {
+    let mut p = params();
+    p.control_power = 1;
+    p.runtime_budget_present = 1;
+    p.runtime_budget_w = [50.0, 0.4, 50.0, 50.0];
+    let mut u = Unit::new(p);
+    let loud = sine(1000.0, 1.0, 3.0);
+    run(&mut u, &[loud.clone(), loud], 512);
+    let mut t = Telemetry::new();
+    u.telemetry(&mut t);
+    let floor = 10f32.powf(-4.0 / 20.0);
+    // the 0.4 W runtime 200 ms budget binds at the cap
+    assert!((t.channels[0].axis_gain[3] - floor).abs() < 1e-4, "{}", t.channels[0].axis_gain[3]);
+}
