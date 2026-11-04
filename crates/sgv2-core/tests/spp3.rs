@@ -523,7 +523,7 @@ fn cl_params(rc: f32, tc: f32) -> Params {
 }
 
 #[test]
-fn closed_loop_reads_coil_temperature_from_the_pilot_bin_and_relaxes_the_limit() {
+fn closed_loop_reads_coil_temperature_from_the_pilot_bin_and_never_relaxes() {
     let (rc, tc) = (4.0f32, 25.0f32);
     let p = cl_params(rc, tc);
     let mut u = spp3::Unit::new(p);
@@ -535,35 +535,34 @@ fn closed_loop_reads_coil_temperature_from_the_pilot_bin_and_relaxes_the_limit()
     let t = run_cl(&mut u, 0.3, &tele, 0, n);
     assert!(t.channels[0].closed_loop);
     assert!((t.channels[0].cl_temp_c - 60.0).abs() < 0.05, "T_CL {}", t.channels[0].cl_temp_c);
-    // the model runs hotter than the sensed 60 C, so the limit relaxes
-    // (capped), never below the limit
-    let adj = t.channels[0].tlim_adj_c;
-    assert!(adj > 0.0 && adj <= 30.0 + 1e-3, "TlimAdj {adj}");
-    assert!(u.effective_limit(0) > 120.0);
+    assert_eq!(u.controller_state(0)[9], 1.0, "window accepted");
+    // the model runs hotter than the sensed 60 C, but the correction is
+    // capped at the base until the alpha inversion is resolved (t-4663)
+    assert_eq!(t.channels[0].tlim_adj_c, 0.0);
+    assert_eq!(u.effective_limit(0), 120.0);
 }
 
 #[test]
-fn closed_loop_range_is_on_the_window_and_rejection_decays_the_limit() {
+fn closed_loop_range_is_on_the_window_and_rejection_holds_the_published_temperature() {
     let p = cl_params(4.0, 25.0);
     let mut u = spp3::Unit::new(p);
     let alpha = 0.004 + (25.0 - 20.0) * (0.0038 - 0.004) / 15.0;
     let n = 48_000 * 20;
     let tele = pilot_sense(4.0 * (1.0 + alpha * 35.0), n);
     run_cl(&mut u, 0.3, &tele, 0, n);
-    let relaxed = u.effective_limit(0);
-    assert!(relaxed > 121.0);
-    // an implausible window (R above RebRange) is rejected at once: the raw
-    // limit returns to the base and the smoother decays toward it
+    assert_eq!(u.controller_state(0)[9], 1.0);
+    // an implausible window (R above RebRange) is rejected at once; the
+    // published temperature follows the smoothed (rejected) window
     let bad = pilot_sense(20.0, n);
     let t = run_cl(&mut u, 0.3, &bad, 0, 48_000 * 2);
     assert!(t.channels[0].closed_loop);
-    let after = u.effective_limit(0);
-    assert!(after < relaxed && after > 120.0, "{relaxed} -> {after}");
-    // the published temperature follows the (rejected) smoothed window
+    assert_eq!(u.controller_state(0)[9], 0.0);
     assert!(t.channels[0].cl_temp_c > 100.0);
-    // recovery is accepted on the instantaneous window
-    let t = run_cl(&mut u, 0.3, &tele, 0, 48_000 * 2);
-    assert!(u.effective_limit(0) > after - 1e-9 || t.channels[0].tlim_adj_c >= 0.0);
+    assert_eq!(u.effective_limit(0), 120.0);
+    // recovery is accepted on the instantaneous window although the
+    // smoothed resistance is still out of range
+    run_cl(&mut u, 0.3, &tele, 0, 48_000);
+    assert_eq!(u.controller_state(0)[9], 1.0);
 }
 
 #[test]

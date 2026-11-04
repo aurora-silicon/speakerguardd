@@ -40,6 +40,8 @@
 //!   `R` is in `RebRange`. `Tlim_eff` smooths `base + clamp(T_OL - T_CL, 0,
 //!   cap)` (or `base` when the last window was rejected) over
 //!   `TlimErrDecayTime` with the 99 % law.
+//!   TODO(SPEC) t-4663: the relaxation is capped at the base (`CL_RELAXATION`)
+//!   until the alpha inversion matches the goldens; CL never relaxes.
 //! - **Pilot.** With a calibration vector: on in an update iff
 //!   `f32(Pdrv) >= PilotEnableThres`; high above `PilotUpperThres`, low below
 //!   `PilotLowerThres` on `T_OL`, held between.
@@ -505,6 +507,12 @@ pub const THERMAL_STATE_COLD: u32 = 2;
 /// gates the pilot on at exactly that level. The golden wins until the text
 /// is reconciled.
 const PDRV_WITH_HEADROOM: bool = false;
+/// TODO(SPEC) t-4663: the closed-loop correction may relax the limit only
+/// once `invTempCo` matches the goldens (279.18 / 273.04 logged against
+/// 271.57 / 266.49 from the spec formula on the synthetic SpTS). Until then
+/// the corrected limit is capped at the base: never less protective than
+/// macOS.
+const CL_RELAXATION: bool = false;
 /// TODO(SPEC): see the coil-power metering in `Run::segment`.
 const PCOIL_WITH_PILOT: bool = true;
 
@@ -809,8 +817,13 @@ impl Cl {
         if self.age > self.window.saturating_add(THERMAL_FRAMES) {
             self.valid = false;
         }
-        // max/min, not clamp: a NaN error falls back to the plain base
-        let raw = if self.valid { base + (t_ol - self.t_cl).max(0.0).min(self.cap) } else { base };
+        // max/min, not clamp: a NaN error falls back to the plain base.
+        // TODO(SPEC) t-4663: until the alpha inversion matches the goldens,
+        // the spec-formula invTempCo reads the coil cool and would relax the
+        // limit past macOS, so the correction is capped at the base: the
+        // closed loop runs and publishes T_CL but never relaxes.
+        let relax = if CL_RELAXATION { (t_ol - self.t_cl).max(0.0).min(self.cap) } else { 0.0 };
+        let raw = if self.valid { base + relax } else { base };
         self.limit_s += self.k_lim * (raw - self.limit_s);
         self.limit_s
     }
