@@ -1,0 +1,296 @@
+#!/usr/bin/python3 -I
+"""speakerguardd-session: the per-user half of speakerguardd v2.
+
+    speakerguardd-session --machine j316 [--machines /usr/share/speakerguardd/machines.json]
+
+It runs in the user's session, beside PipeWire, and does three things:
+
+1. **Ordering.** It links the speaker amps and the sense to the protect stage
+   only while the kernel grants protection ("Speaker Protection" reads 1), and
+   unlinks them as soon as it does not. The amps' sink is the driver of their
+   group, so it never starts before the grant: the kernel would refuse it.
+2. **Integrity.** It checks the link set: into the protect stage's program
+   ports only the voicing output, channel for channel; into its sense ports
+   only the sense, channel for channel; into the amps only the protect
+   stage's output, channel for channel; out of the sense nothing else. A
+   missing link is silence and is allowed; any other link is a fault. It
+   also checks the carrier: the protect stage's input and the sense at unity
+   volume, unmuted.
+3. **Report.** Every 50 ms it writes `links=<0|1> carrier=<0|1> mono_ns=<t>`
+   to /run/speakerguardd/<uid>/session, which the supervisor reads. A report
+   older than 250 ms counts as absent, and the supervisor then releases.
+
+It reads the graph from `pw-dump --monitor` and makes or removes links with
+`pw-link`. It never touches the amps' volume: the kernel owns it.
+"""
+import argparse
+import fcntl
+import json
+import os
+import select
+import struct
+import subprocess
+import sys
+import time
+
+PERIOD = 0.050
+PROTECT_INPUT = "alsa_output.platform-sound.RawSpeakers"
+
+# ALSA control ioctls (include/uapi/sound/asound.h, 64-bit)
+_ID_FMT = "IiII44sI"
+_VAL_SIZE = 1224
+_ELEM_READ = (3 << 30) | (_VAL_SIZE << 16) | (0x55 << 8) | 0x12
+_IFACE_MIXER = 2
+
+
+def log(*a):
+    print("speakerguardd-session:", *a, file=sys.stderr, flush=True)
+
+
+class Card:
+    """Read-only access to the speaker card's "Speaker Protection" control."""
+
+    def __init__(self, card_id):
+        try:
+            # /proc/asound/<id> is a link to card<N>
+            self.index = int(os.readlink(f"/proc/asound/{card_id}").removeprefix("card"))
+        except (OSError, ValueError):
+            raise SystemExit(f"no ALSA card {card_id}")
+        self.fd = os.open(f"/dev/snd/controlC{self.index}", os.O_RDONLY | os.O_CLOEXEC)
+
+    def granted(self):
+        buf = bytearray(_VAL_SIZE)
+        buf[0:64] = struct.pack(_ID_FMT, 0, _IFACE_MIXER, 0, 0, b"Speaker Protection", 0)
+        try:
+            fcntl.ioctl(self.fd, _ELEM_READ, buf)
+        except OSError:
+            return False
+        return struct.unpack_from("q", buf, 72)[0] == 1
+
+
+class Graph:
+    """The PipeWire objects, kept current from `pw-dump --monitor`."""
+
+    def __init__(self):
+        self.proc = subprocess.Popen(
+            ["pw-dump", "--monitor", "--no-colors"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+        )
+        os.set_blocking(self.proc.stdout.fileno(), False)
+        self.buf = ""
+        self.dec = json.JSONDecoder()
+        self.objs = {}
+
+    def pump(self, timeout):
+        r, _, _ = select.select([self.proc.stdout], [], [], timeout)
+        if r:
+            chunk = self.proc.stdout.read()
+            if chunk is None:
+                return
+            if chunk == b"":
+                raise SystemExit("pw-dump exited")
+            self.buf += chunk.decode(errors="replace")
+        while True:
+            s = self.buf.lstrip()
+            if not s:
+                self.buf = ""
+                return
+            try:
+                arr, end = self.dec.raw_decode(s)
+            except ValueError:
+                self.buf = s
+                return
+            self.buf = s[end:]
+            for o in arr if isinstance(arr, list) else []:
+                if o.get("info") is None:
+                    self.objs.pop(o.get("id"), None)
+                else:
+                    old = self.objs.get(o["id"])
+                    if old is not None and o.get("type") == old.get("type"):
+                        # Updates carry only what changed
+                        for k, v in o["info"].items():
+                            if k == "params" and isinstance(v, dict):
+                                old["info"].setdefault("params", {}).update(v)
+                            else:
+                                old["info"][k] = v
+                    else:
+                        self.objs[o["id"]] = o
+
+    def of_type(self, t):
+        return [o for o in self.objs.values() if o.get("type", "").endswith(":" + t)]
+
+    def node_id(self, name):
+        for o in self.of_type("Node"):
+            if (o["info"].get("props") or {}).get("node.name") == name:
+                return o["id"]
+        return None
+
+    def node_props(self, nid):
+        o = self.objs.get(nid) or {}
+        params = (o.get("info") or {}).get("params") or {}
+        p = params.get("Props") or []
+        return p[0] if p else {}
+
+    def ports(self, nid, direction):
+        """{channel: port id} of a node's ports in one direction (no monitor ports)."""
+        out = {}
+        for o in self.of_type("Port"):
+            p = o["info"].get("props") or {}
+            if p.get("node.id") != nid or p.get("port.direction") != direction or p.get("port.monitor"):
+                continue
+            out[p.get("audio.channel")] = o["id"]
+        return out
+
+    def links(self):
+        return [
+            (o["id"], o["info"].get("output-port-id"), o["info"].get("input-port-id"))
+            for o in self.of_type("Link")
+        ]
+
+
+def unity(props):
+    if not props:
+        return False
+    if props.get("mute", False):
+        return False
+    if abs(props.get("volume", 1.0) - 1.0) > 1e-6:
+        return False
+    return all(abs(v - 1.0) <= 1e-6 for v in props.get("channelVolumes", [1.0]))
+
+
+class Session:
+    def __init__(self, m, c):
+        self.m, self.c = m, c
+        self.amps, self.sense = c["amps"], c["sense"]
+        self.voicing = f"effect_output.{m}-convolver"
+        self.protect_out = f"sgv2.protect.{m}.out"
+        self.speaker = f"sgv2.speaker.{m}"
+        self.sense_name = f"sgv2.sense.{m}"
+        self.last_try = -10.0
+
+    def wanted(self, g):
+        """The links the helper owns: (out port, in port) pairs, or None if a node is missing."""
+        protect = g.node_id(PROTECT_INPUT)
+        pout = g.node_id(self.protect_out)
+        spk = g.node_id(self.speaker)
+        sense = g.node_id(self.sense_name) if self.sense else None
+        if None in (protect, pout, spk) or (self.sense and sense is None):
+            return None
+        pin = g.ports(protect, "in")
+        po = g.ports(pout, "out")
+        si = g.ports(spk, "in")
+        want = []
+        for i in range(self.amps):
+            a = f"AUX{i}"
+            if a not in po or a not in si:
+                return None
+            want.append((po[a], si[a]))
+        if self.sense:
+            so = g.ports(sense, "out")
+            for i in range(self.sense):
+                a, b = f"AUX{i}", f"AUX{self.amps + i}"
+                if a not in so or b not in pin:
+                    return None
+                want.append((so[a], pin[b]))
+        return want
+
+    def check(self, g):
+        """(links_ok, carrier_ok) for the current graph."""
+        protect = g.node_id(PROTECT_INPUT)
+        pout = g.node_id(self.protect_out)
+        spk = g.node_id(self.speaker)
+        voicing = g.node_id(self.voicing)
+        sense = g.node_id(self.sense_name) if self.sense else None
+        if protect is None or pout is None or spk is None:
+            return False, False
+        port_info = {}
+        for o in g.of_type("Port"):
+            p = o["info"].get("props") or {}
+            port_info[o["id"]] = (p.get("node.id"), p.get("audio.channel"))
+        ok = True
+        for _, out_p, in_p in g.links():
+            on, oc = port_info.get(out_p, (None, None))
+            inn, ic = port_info.get(in_p, (None, None))
+            if inn == protect:
+                k = int(ic[3:]) if ic and ic.startswith("AUX") else -1
+                if 0 <= k < self.amps:
+                    ok &= on == voicing and oc == ic
+                else:
+                    ok &= sense is not None and on == sense and oc == f"AUX{k - self.amps}"
+            elif inn == spk:
+                ok &= on == pout and oc == ic
+            elif sense is not None and on == sense:
+                ok = False
+        carrier = unity(g.node_props(protect)) and (sense is None or unity(g.node_props(sense)))
+        return ok, carrier
+
+    def reconcile(self, g, granted):
+        want = self.wanted(g)
+        have = {(o, i): lid for lid, o, i in g.links()}
+        if granted and want:
+            # A link pw-link could not make is tried again once a second
+            now = time.monotonic()
+            if now - self.last_try < 1.0:
+                want = [w for w in want if w in have]
+            else:
+                self.last_try = now
+            for o, i in want:
+                if (o, i) not in have:
+                    subprocess.run(["pw-link", str(o), str(i)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        elif not granted:
+            # Withdrawn: take the amps and the sense out of the graph, so the
+            # amps' sink is not started again until the next grant.
+            spk = g.node_id(self.speaker)
+            sense = g.node_id(self.sense_name) if self.sense else None
+            owners = {o["id"]: (o["info"].get("props") or {}).get("node.id") for o in g.of_type("Port")}
+            for lid, o, i in g.links():
+                if owners.get(i) == spk or (sense is not None and owners.get(o) == sense):
+                    subprocess.run(["pw-link", "-d", str(lid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def write_report(path, links, carrier):
+    line = f"links={int(links)} carrier={int(carrier)} mono_ns={time.monotonic_ns()}\n"
+    try:
+        # The supervisor creates the file for this user: rewrite it in place.
+        fd = os.open(path, os.O_WRONLY | os.O_CLOEXEC)
+        try:
+            os.ftruncate(fd, 0)
+            os.pwrite(fd, line.encode(), 0)
+        finally:
+            os.close(fd)
+        return True
+    except OSError:
+        return False
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--machine", required=True)
+    ap.add_argument("--machines", default="/usr/share/speakerguardd/machines.json")
+    args = ap.parse_args()
+    with open(args.machines) as f:
+        c = json.load(f)[args.machine]
+    card = Card(c["card"])
+    g = Graph()
+    s = Session(args.machine, c)
+    report = f"/run/speakerguardd/{os.getuid()}/session"
+    last = (None, None, None, None)
+    nxt = time.monotonic()
+    while True:
+        g.pump(max(0.0, nxt - time.monotonic()))
+        if time.monotonic() < nxt:
+            continue
+        nxt += PERIOD
+        if nxt < time.monotonic():
+            nxt = time.monotonic() + PERIOD
+        granted = card.granted()
+        s.reconcile(g, granted)
+        links, carrier = s.check(g)
+        wrote = write_report(report, links, carrier)
+        state = (granted, links, carrier, wrote)
+        if state != last:
+            log(f"granted={int(granted)} links={int(links)} carrier={int(carrier)} report={'ok' if wrote else 'unwritable'}")
+            last = state
+
+
+if __name__ == "__main__":
+    main()

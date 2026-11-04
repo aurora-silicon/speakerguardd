@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""Tests of speakerguardd-session's link and carrier checks on synthetic graphs.
+
+    python3 -I packaging/session/test_session.py
+"""
+import importlib.machinery
+import importlib.util
+import json
+import os
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+_loader = importlib.machinery.SourceFileLoader("sgs", os.path.join(HERE, "speakerguardd-session"))
+_spec = importlib.util.spec_from_loader("sgs", _loader)
+sgs = importlib.util.module_from_spec(_spec)
+_loader.exec_module(sgs)
+
+MACHINES = json.load(open(os.path.join(HERE, "machines.json")))
+
+
+class FakeGraph(sgs.Graph):
+    """A Graph without pw-dump: objects are added by the test."""
+
+    def __init__(self):
+        self.objs = {}
+        self.next = 100
+
+    def node(self, name, props=None):
+        nid = self.next
+        self.next += 1
+        info = {"props": {"node.name": name}}
+        if props is not None:
+            info["params"] = {"Props": [props]}
+        self.objs[nid] = {"id": nid, "type": "PipeWire:Interface:Node", "info": info}
+        return nid
+
+    def port(self, nid, direction, channel):
+        pid = self.next
+        self.next += 1
+        self.objs[pid] = {
+            "id": pid,
+            "type": "PipeWire:Interface:Port",
+            "info": {"props": {"node.id": nid, "port.direction": direction, "audio.channel": channel}},
+        }
+        return pid
+
+    def link(self, out_p, in_p):
+        lid = self.next
+        self.next += 1
+        self.objs[lid] = {
+            "id": lid,
+            "type": "PipeWire:Interface:Link",
+            "info": {"output-port-id": out_p, "input-port-id": in_p},
+        }
+        return lid
+
+
+UNITY = {"volume": 1.0, "mute": False, "channelVolumes": [1.0] * 18}
+
+
+def build(m="j316", carrier=UNITY, linked=True):
+    c = MACHINES[m]
+    amps, sense = c["amps"], c["sense"]
+    g = FakeGraph()
+    voicing = g.node(f"effect_output.{m}-convolver")
+    protect = g.node(sgs.PROTECT_INPUT, carrier)
+    pout = g.node(f"sgv2.protect.{m}.out")
+    spk = g.node(f"sgv2.speaker.{m}")
+    sn = g.node(f"sgv2.sense.{m}", UNITY) if sense else None
+    p = {
+        "v": [g.port(voicing, "out", f"AUX{i}") for i in range(amps)],
+        "pin": [g.port(protect, "in", f"AUX{i}") for i in range(amps + sense)],
+        "pout": [g.port(pout, "out", f"AUX{i}") for i in range(amps)],
+        "spk": [g.port(spk, "in", f"AUX{i}") for i in range(amps)],
+        "sense": [g.port(sn, "out", f"AUX{i}") for i in range(sense)] if sense else [],
+    }
+    for i in range(amps):
+        g.link(p["v"][i], p["pin"][i])
+    if linked:
+        for i in range(amps):
+            g.link(p["pout"][i], p["spk"][i])
+        for i in range(sense):
+            g.link(p["sense"][i], p["pin"][amps + i])
+    return g, p, sgs.Session(m, c)
+
+
+class Checks(unittest.TestCase):
+    def test_the_configured_graph_is_clean_on_every_machine(self):
+        for m in MACHINES:
+            g, _, s = build(m)
+            self.assertEqual(s.check(g), (True, True), m)
+
+    def test_missing_links_are_silence_not_a_fault(self):
+        g, _, s = build(linked=False)
+        self.assertEqual(s.check(g), (True, True))
+
+    def test_a_foreign_link_into_the_amps_is_a_fault(self):
+        g, p, s = build()
+        g.link(p["v"][0], p["spk"][0])
+        self.assertFalse(s.check(g)[0])
+
+    def test_crossed_amp_channels_are_a_fault(self):
+        g, p, s = build(linked=False)
+        g.link(p["pout"][0], p["spk"][1])
+        self.assertFalse(s.check(g)[0])
+
+    def test_crossed_or_foreign_sense_is_a_fault(self):
+        g, p, s = build(linked=False)
+        g.link(p["sense"][0], p["pin"][7])
+        self.assertFalse(s.check(g)[0])
+        g, p, s = build(linked=False)
+        g.link(p["v"][0], p["pin"][6])
+        self.assertFalse(s.check(g)[0])
+
+    def test_the_sense_feeding_anything_else_is_a_fault(self):
+        g, p, s = build()
+        other = g.node("some.recorder")
+        g.link(p["sense"][0], g.port(other, "in", "AUX0"))
+        self.assertFalse(s.check(g)[0])
+
+    def test_a_program_link_from_anything_but_the_voicing_is_a_fault(self):
+        g, p, s = build()
+        app = g.node("some.app")
+        g.link(g.port(app, "out", "AUX0"), p["pin"][0])
+        self.assertFalse(s.check(g)[0])
+
+    def test_the_carrier_must_be_unity_and_unmuted(self):
+        for bad in (
+            dict(UNITY, mute=True),
+            dict(UNITY, volume=0.5),
+            dict(UNITY, channelVolumes=[1.0] * 17 + [0.9]),
+            {},
+        ):
+            g, _, s = build(carrier=bad)
+            self.assertEqual(s.check(g), (True, False), bad)
+
+    def test_a_missing_stage_fails_closed(self):
+        g, _, s = build()
+        del g.objs[g.node_id(f"sgv2.speaker.j316")]
+        self.assertEqual(s.check(g), (False, False))
+
+    def test_wanted_links_are_channel_for_channel(self):
+        g, p, s = build(linked=False)
+        want = s.wanted(g)
+        amps = MACHINES["j316"]["amps"]
+        self.assertEqual(want[:amps], list(zip(p["pout"], p["spk"])))
+        self.assertEqual(want[amps:], list(zip(p["sense"], p["pin"][amps:])))
+
+    def test_the_neo_has_no_sense_links(self):
+        g, p, s = build("j700", linked=False)
+        self.assertEqual(s.wanted(g), list(zip(p["pout"], p["spk"])))
+
+
+class Generated(unittest.TestCase):
+    def test_generated_files_are_current(self):
+        import subprocess
+        import sys
+
+        r = subprocess.run([sys.executable, "-I", os.path.join(HERE, "gen.py"), "--check"], capture_output=True)
+        self.assertEqual(r.returncode, 0, r.stdout.decode())
+
+
+if __name__ == "__main__":
+    unittest.main()

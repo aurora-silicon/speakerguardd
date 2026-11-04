@@ -24,3 +24,12 @@ dev_rw_sound(speakerguardd_t)
 
 # PCM ownership from /proc/asound.
 kernel_read_system_state(speakerguardd_t)
+
+# The 10 ms loop: SCHED_FIFO and locked memory.
+allow speakerguardd_t self:capability { sys_nice ipc_lock };
+allow speakerguardd_t self:process { setsched getsched };
+# Hands the engine page and the session report to the session user.
+allow speakerguardd_t self:capability { chown fowner };
+
+# Its configuration.
+files_read_etc_files(speakerguardd_t)
