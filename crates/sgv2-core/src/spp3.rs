@@ -1331,15 +1331,21 @@ impl Unit {
             pilot,
         ]
     }
-    /// `AudioUnitReset` (spec 10): clears only the closed-loop estimator.
-    /// The open-loop coil, magnet and feed-forward temperatures, the gain
-    /// state and the SafeTlim state continue; an open-loop kernel is
-    /// unchanged. Wall-clock idle is never thermal time.
+    /// `AudioUnitReset` (spec 10): clears the closed-loop estimator and the
+    /// pilot generator. The open-loop coil, magnet and feed-forward
+    /// temperatures, the gain state and the SafeTlim state continue; an
+    /// open-loop kernel is unchanged. Wall-clock idle is never thermal time.
     pub fn audio_unit_reset(&mut self) {
         if let Some(r) = self.run.as_mut() {
             for c in r.ch.iter_mut() {
                 if let Some(cl) = c.cl.as_mut() {
                     cl.host_reset();
+                }
+                // and the pilot generator restarts: envelope at zero, phase
+                // from this frame, the low level (rig law-restore-cl-reset:
+                // 5.7e-7 against 0.029 with the generator kept)
+                if let Some(p) = c.pilot.as_mut() {
+                    p.reset();
                 }
                 // the effective limit is the base until reacquisition
                 c.tlim_eff = c.safe.base();

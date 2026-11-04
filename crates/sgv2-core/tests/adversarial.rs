@@ -780,10 +780,13 @@ proptest! {
         }
         // Each render call snaps the output dezipper to the selected target
         // (rig dezipper law, as the reference does), so the output depends
-        // on where calls start. Fixed call sizes that divide the 256-frame
-        // update never cross an update inside a call, hold the gain
+        // on where calls start. Fixed call sizes that divide the thermal
+        // update (256 frames at 48 kHz, scaled with the rate) never cross an
+        // update inside a call, hold the gain
         // constant per update and must agree bit for bit.
-        let pow = |v: u64| vec![1usize << (v % 9)];
+        let upd = spp3::thermal_frames(rate);
+        let sizes = upd.trailing_zeros() as u64 + 1;
+        let pow = |v: u64| vec![1usize << (v % sizes)];
         let mut u1 = spp3::Unit::new(p);
         let mut u2 = spp3::Unit::new(p);
         let r1 = render(&mut u1, &x, Some(&s), &pow(a), &mut no_sense, false);
