@@ -380,7 +380,9 @@ fn feed_forward_onset_is_the_virtual_coil_plus_one_degree() {
         let (tt, _) = drive(&mut u, [x as f32, 0.0, 0.0, 0.0], dt(), U);
         t = tt;
         let predicted = 40.0 + mg + ff + 1.0;
-        if t.channels[0].axis_gain[4] < 1.0 {
+        // the selected target (the published thermal meter is the applied
+        // gain, one call behind)
+        if u.controller_state(0)[1] < 1.0 {
             assert!(predicted > c.temperature_limit as f64, "onset at {predicted}");
             return;
         }
