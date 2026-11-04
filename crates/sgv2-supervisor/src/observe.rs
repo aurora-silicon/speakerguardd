@@ -6,6 +6,14 @@
 //! not advancing, a PCM whose owner is unknown, or a missing, stale or
 //! future-dated session report is a fault, and the lease is not renewed.
 //!
+//! A session report counts only while the helper that wrote it is alive
+//! (its pid and start time, checked against /proc), and only if it was
+//! written after the current engine generation began (the engine page's
+//! process changed, the page became valid, or its sequence restarted). A
+//! stopped helper's last report, or one from before a PipeWire restart,
+//! never grants (lane B6 on the M1 Pro: one 10 ms grant on a stopped
+//! helper's report across a PipeWire restart).
+//!
 //! # Proof that the engine runs
 //!
 //! The heartbeat must be fresh in every PCM state, Closed included: the
@@ -154,6 +162,12 @@ pub struct SessionReport {
     pub links_ok: bool,
     pub carrier_ok: bool,
     pub mono_ns: u64,
+    /// The writer, as the report names it: pid and start time (clock ticks
+    /// since boot, `/proc/<pid>/stat` field 22).
+    pub helper: Option<(u32, u64)>,
+    /// Set by the view: that process is alive, is the one that started at
+    /// that time, and is the session user's.
+    pub helper_alive: bool,
 }
 
 pub trait SessionView {
@@ -191,6 +205,11 @@ pub struct Observer {
     pub rate: u32,
     pub tick_ns: u64,
     last_seq: Option<u64>,
+    last_seq_before: Option<u64>,
+    /// The engine's process and validity, to see a new generation.
+    engine_pid: Option<(u32, bool)>,
+    /// When the current engine generation was first seen.
+    generation_ns: Option<u64>,
     last_frames: u64,
     /// When the sequence was last seen to advance.
     last_advance_ns: Option<u64>,
@@ -208,6 +227,9 @@ impl Observer {
             rate,
             tick_ns,
             last_seq: None,
+            last_seq_before: None,
+            engine_pid: None,
+            generation_ns: None,
             last_frames: 0,
             last_advance_ns: None,
             quantum: None,
@@ -247,6 +269,7 @@ impl Observer {
             && e.health & sgv2_core::Health::NO_PARAMS == 0
             && e.gain_ok();
 
+        self.last_seq_before = self.last_seq;
         match self.last_seq {
             Some(l) if e.seq > l => {
                 let beats = e.seq - l;
@@ -305,7 +328,20 @@ impl Observer {
             None => closed,
         };
         let pcm_state_ok = matches!(p, PcmState::Closed | PcmState::Open { .. } | PcmState::Running { .. });
+        // A new engine generation: another process, a page that became
+        // valid, or a sequence that restarted.
+        let restarted = self.last_seq_before.is_some_and(|l| e.seq < l);
+        if self.engine_pid != Some((e.pid, e.valid)) || restarted || self.generation_ns.is_none() {
+            if self.engine_pid != Some((e.pid, e.valid)) || restarted {
+                self.generation_ns = Some(now_ns);
+            }
+            self.generation_ns.get_or_insert(now_ns);
+            self.engine_pid = Some((e.pid, e.valid));
+        }
+        let generation = self.generation_ns.unwrap_or(now_ns);
         let session_fresh = s.present
+            && s.helper_alive
+            && s.mono_ns >= generation
             && s.mono_ns <= now_ns.saturating_add(SESSION_SKEW_NS)
             && now_ns.saturating_sub(s.mono_ns) <= SESSION_STALE_NS;
         Observation {
@@ -446,19 +482,27 @@ pub fn speaker_pcm_problem(info: &PcmInfo, card: u32, device: u32) -> Option<Str
     None
 }
 
-/// Parse the helper's report, `links=<0|1> carrier=<0|1> mono_ns=<t>\n`.
-/// Anything else, including a report without its final newline, is absent.
+/// Parse the helper's report,
+/// `links=<0|1> carrier=<0|1> mono_ns=<t> pid=<pid> start=<ticks>\n`.
+/// Anything else, including a report without its final newline or without
+/// its writer, is absent.
+///
+/// The view then sets `helper_alive` with [`helper_is`].
 pub fn parse_session(text: &str) -> SessionReport {
     let Some(body) = text.strip_suffix('\n') else { return SessionReport::default() };
     let mut links = None;
     let mut carrier = None;
     let mut mono = None;
+    let mut pid = None;
+    let mut start = None;
     for w in body.split_whitespace() {
         let Some((k, v)) = w.split_once('=') else { return SessionReport::default() };
         let slot = match k {
             "links" => &mut links,
             "carrier" => &mut carrier,
             "mono_ns" => &mut mono,
+            "pid" => &mut pid,
+            "start" => &mut start,
             _ => continue,
         };
         if slot.is_some() {
@@ -467,10 +511,41 @@ pub fn parse_session(text: &str) -> SessionReport {
         *slot = Some(v.parse::<u64>().ok());
     }
     match (links.flatten(), carrier.flatten(), mono.flatten()) {
-        (Some(l @ 0..=1), Some(c @ 0..=1), Some(m)) if m > 0 => {
-            SessionReport { present: true, links_ok: l == 1, carrier_ok: c == 1, mono_ns: m }
-        }
+        (Some(l @ 0..=1), Some(c @ 0..=1), Some(m)) if m > 0 => match (pid.flatten(), start.flatten()) {
+            (Some(p), Some(st)) if p > 0 && p <= u64::from(u32::MAX) => SessionReport {
+                present: true,
+                links_ok: l == 1,
+                carrier_ok: c == 1,
+                mono_ns: m,
+                helper: Some((p as u32, st)),
+                helper_alive: false,
+            },
+            _ => SessionReport::default(),
+        },
         _ => SessionReport::default(),
+    }
+}
+
+/// The start time (clock ticks since boot) in `/proc/<pid>/stat`: field 22,
+/// counted after the command name's closing parenthesis (the name may hold
+/// spaces and parentheses).
+pub fn parse_stat_start(stat: &str) -> Option<u64> {
+    let rest = &stat[stat.rfind(')')? + 1..];
+    // rest starts at field 3 (state)
+    let mut f = rest.split_whitespace();
+    let state = f.next()?;
+    if state == "Z" || state == "X" {
+        return None;
+    }
+    f.nth(18)?.parse().ok()
+}
+
+/// Whether the report's writer is alive: `stat` is `/proc/<pid>/stat` (if
+/// readable), `owner` that directory's uid, and `uid` the session user.
+pub fn helper_is(report: &SessionReport, stat: Option<&str>, owner: Option<u32>, uid: u32) -> bool {
+    match (report.helper, stat, owner) {
+        (Some((_, start)), Some(st), Some(o)) => o == uid && parse_stat_start(st) == Some(start),
+        _ => false,
     }
 }
 
@@ -501,7 +576,14 @@ mod tests {
     const PID: u32 = 4242;
 
     fn session(at: u64) -> SessionReport {
-        SessionReport { present: true, links_ok: true, carrier_ok: true, mono_ns: at }
+        SessionReport {
+            present: true,
+            links_ok: true,
+            carrier_ok: true,
+            mono_ns: at,
+            helper: Some((77, 1234)),
+            helper_alive: true,
+        }
     }
 
     fn beat(seq: u64, quantum: u64, mono_ns: u64) -> EngineState {
@@ -705,6 +787,8 @@ mod tests {
     fn session_reports_must_be_fresh_and_never_from_the_future() {
         let mut o = Observer::new(7, 48_000, TICK);
         let now = 10_000_000_000u64;
+        // the engine generation began well before these reports
+        o.observe(&mut || 1, &mut E(EngineState::default()), &mut P(PcmState::Closed), &mut S(session(1)));
         let mut at = |r: SessionReport| {
             o.observe(&mut || now, &mut E(EngineState::default()), &mut P(PcmState::Closed), &mut S(r)).links_ok
         };
@@ -721,23 +805,141 @@ mod tests {
 
     #[test]
     fn session_parsing_rejects_partial_and_mixed_reports() {
-        let r = parse_session("links=1 carrier=1 mono_ns=123\n");
-        assert_eq!(r, SessionReport { present: true, links_ok: true, carrier_ok: true, mono_ns: 123 });
-        let r = parse_session("links=0 carrier=1 mono_ns=123\n");
+        let w = " pid=77 start=1234";
+        let r = parse_session(&format!("links=1 carrier=1 mono_ns=123{w}\n"));
+        assert_eq!(
+            r,
+            SessionReport {
+                present: true,
+                links_ok: true,
+                carrier_ok: true,
+                mono_ns: 123,
+                helper: Some((77, 1234)),
+                helper_alive: false
+            }
+        );
+        let r = parse_session(&format!("links=0 carrier=1 mono_ns=123{w}\n"));
         assert!(r.present && !r.links_ok);
         for bad in [
-            "",
-            "links=1 carrier=1 mono_ns=123",
-            "links=1 carrier=1 mono_ns=\n",
-            "links=1 carrier=1\n",
-            "links=1 carrier=1 mono_ns=12 mono_ns=13\n",
-            "links=2 carrier=1 mono_ns=12\n",
-            "links=1 carrier=1 mono_ns=0\n",
-            "links=1 carrier=1 mono_ns=12 junk\n",
-            "links=1 carrier=1 mono_ns=12\nlinks=1 carrier=1 mono_ns=13\n",
+            String::new(),
+            format!("links=1 carrier=1 mono_ns=123{w}"),
+            format!("links=1 carrier=1 mono_ns={w}\n"),
+            format!("links=1 carrier=1{w}\n"),
+            format!("links=1 carrier=1 mono_ns=12 mono_ns=13{w}\n"),
+            format!("links=2 carrier=1 mono_ns=12{w}\n"),
+            format!("links=1 carrier=1 mono_ns=0{w}\n"),
+            format!("links=1 carrier=1 mono_ns=12 junk{w}\n"),
+            format!("links=1 carrier=1 mono_ns=12{w}\nlinks=1 carrier=1 mono_ns=13{w}\n"),
+            // no writer: an older helper's report
+            "links=1 carrier=1 mono_ns=12\n".to_string(),
+            "links=1 carrier=1 mono_ns=12 pid=77\n".to_string(),
+            "links=1 carrier=1 mono_ns=12 pid=0 start=5\n".to_string(),
         ] {
-            assert!(!parse_session(bad).present, "{bad:?}");
+            assert!(!parse_session(&bad).present, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn the_helper_must_be_the_live_process_that_wrote_the_report() {
+        let r = parse_session("links=1 carrier=1 mono_ns=12 pid=4321 start=98765\n");
+        // /proc/<pid>/stat: the name may hold spaces and parentheses
+        let stat = |state: &str, start: u64| {
+            let mut f = vec![state.to_string()];
+            f.extend((4..=21).map(|n| n.to_string()));
+            f.push(start.to_string());
+            f.extend(["1000", "2000"].map(String::from));
+            format!("4321 (python3 -I (sgs)) {}\n", f.join(" "))
+        };
+        assert_eq!(parse_stat_start(&stat("S", 98765)), Some(98765));
+        assert!(helper_is(&r, Some(&stat("S", 98765)), Some(1000), 1000));
+        // another process now holds the pid (it started later)
+        assert!(!helper_is(&r, Some(&stat("S", 99999)), Some(1000), 1000));
+        // a zombie or a dead pid
+        assert!(!helper_is(&r, Some(&stat("Z", 98765)), Some(1000), 1000));
+        assert!(!helper_is(&r, None, None, 1000));
+        // another user's process
+        assert!(!helper_is(&r, Some(&stat("S", 98765)), Some(1001), 1000));
+        assert!(!helper_is(&SessionReport::default(), Some(&stat("S", 98765)), Some(1000), 1000));
+    }
+
+    /// Lane B6 on the M1 Pro: the helper is stopped, PipeWire restarts, and
+    /// the supervisor granted once (10 ms) on the stopped helper's last
+    /// report. Neither the dead helper's report nor one written before the
+    /// new engine generation may count.
+    #[test]
+    fn a_stopped_helpers_report_never_grants_across_a_pipewire_restart() {
+        use crate::kernel::Recorder;
+        use crate::supervise::{Event, Expect, Supervisor};
+        let q = 10_666_666u64;
+        let mut o = Observer::new(7, 48_000, TICK);
+        let mut k = Recorder::healthy(6);
+        let mut sup =
+            Supervisor::new(Expect::new(crate::machine::lookup("j316s").unwrap(), vec![11_890; 6], "Secondary"));
+        let tick = |o: &mut Observer,
+                    sup: &mut Supervisor,
+                    k: &mut Recorder,
+                    now: u64,
+                    pid: u32,
+                    seq: u64,
+                    r: SessionReport| {
+            let e = EngineState { pid, ..beat(seq, 512, now - 1_000) };
+            let obs = o.observe(&mut || now, &mut E(e), &mut P(PcmState::Closed), &mut S(r));
+            sup.tick(obs, k).unwrap()
+        };
+        // granted on engine A with a live helper
+        let mut seq = 0;
+        let mut now = 0;
+        let mut granted = false;
+        for _ in 0..10 {
+            seq += 1;
+            now += q;
+            granted |= tick(&mut o, &mut sup, &mut k, now, PID, seq, session(now - 1)) == Event::Granted;
+        }
+        assert!(granted && k.held);
+        // the helper is stopped: its last report stays on disk, fresh by
+        // its stamp, but its process is gone
+        let last = SessionReport { helper_alive: false, ..session(now) };
+        seq += 1;
+        now += q;
+        assert!(matches!(tick(&mut o, &mut sup, &mut k, now, PID, seq, last), Event::Released { .. }));
+        // PipeWire restarts: engine B (another pid) beats within the old
+        // report's 100 ms; whether or not the dead helper's pid passes the
+        // liveness check (pid reuse), nothing grants
+        let restart = now + 5_000_000;
+        let stale_but_alive = SessionReport { helper_alive: true, ..session(now) };
+        for (n, r) in [last, stale_but_alive].into_iter().enumerate() {
+            let mut o = Observer::new(7, 48_000, TICK);
+            let mut t = restart;
+            let mut s2 = 0;
+            for _ in 0..8 {
+                s2 += 1;
+                t += q;
+                if t - now > SESSION_STALE_NS {
+                    break;
+                }
+                let ev = tick(&mut o, &mut sup, &mut k, t, PID + 1, s2, r);
+                assert_ne!(ev, Event::Granted, "case {n} at +{} ms", (t - now) / 1_000_000);
+                assert!(!k.held);
+            }
+        }
+        // a new helper writes after engine B started: grants again
+        let mut t = restart + 10 * q;
+        let mut s2 = 100;
+        let mut granted = false;
+        for _ in 0..4 {
+            s2 += 1;
+            t += q;
+            granted |= tick(
+                &mut o,
+                &mut sup,
+                &mut k,
+                t,
+                PID + 1,
+                s2,
+                SessionReport { helper: Some((88, 5)), ..session(t - 1) },
+            ) == Event::Granted;
+        }
+        assert!(granted);
     }
 
     #[test]
@@ -1028,5 +1230,17 @@ mod tests {
         let nan = at(&mut o, 6, f32::NAN);
         assert!(matches!(s.tick(nan, &mut k), Ok(Event::Released { .. })));
         assert!(!k.held);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_start_time_parses_from_a_real_proc_stat() {
+        let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+        let start = parse_stat_start(&stat).unwrap();
+        let r = parse_session(&format!("links=1 carrier=1 mono_ns=1 pid={} start={start}\n", std::process::id()));
+        // SAFETY: getuid has no preconditions.
+        let uid = unsafe { libc::getuid() };
+        assert!(helper_is(&r, Some(&stat), Some(uid), uid));
+        assert!(!helper_is(&r, Some(&stat), Some(uid), uid + 1));
     }
 }

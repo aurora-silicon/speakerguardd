@@ -56,8 +56,8 @@ mod linux {
     use sgv2_supervisor::kernel::{Kernel, KernelError, Macaudio};
     use sgv2_supervisor::machine::{blob_full_scales, board_from_compatible, lookup, Machine};
     use sgv2_supervisor::observe::{
-        combine, owner_to_tgid, parse_pcm_info, parse_pcm_status, parse_session, parse_tgid, speaker_pcm_problem,
-        EngineState, EngineView, Observer, PcmInfo, PcmState, PcmView, SessionReport, SessionView,
+        combine, helper_is, owner_to_tgid, parse_pcm_info, parse_pcm_status, parse_session, parse_tgid,
+        speaker_pcm_problem, EngineState, EngineView, Observer, PcmInfo, PcmState, PcmView, SessionReport, SessionView,
     };
     use sgv2_supervisor::supervise::{Event, Expect, Fatal, Supervisor};
 
@@ -68,6 +68,8 @@ mod linux {
     const PCM_POLL_NS: u64 = 1_000_000;
     /// A PCM snapshot whose read started longer ago than this is Unknown.
     const PCM_SNAPSHOT_MAX_NS: u64 = 12_000_000;
+    /// A helper liveness check older than this vouches for nothing.
+    const HELPER_CHECK_MAX_NS: u64 = 12_000_000;
     /// Waiting for the card: 50 ms doubling to 2 s.
     const BACKOFF_MIN_MS: u64 = 50;
     const BACKOFF_MAX_MS: u64 = 2_000;
@@ -131,8 +133,17 @@ mod linux {
 
     /// The reader thread: every substream's `/proc` status, owners mapped
     /// from thread to process id, folded into one state.
-    fn spawn_pcm_reader(dir: String, subs: u32, out: Arc<PcmSnapshot>, wake: i32) -> std::io::Result<()> {
+    fn spawn_pcm_reader(
+        dir: String,
+        subs: u32,
+        out: Arc<PcmSnapshot>,
+        wake: i32,
+        report: std::ffi::CString,
+        uid: u32,
+        live: Arc<HelperLive>,
+    ) -> std::io::Result<()> {
         std::thread::Builder::new().name("sgv2-pcm".into()).spawn(move || {
+            let mut hbuf = String::with_capacity(1024);
             let paths: Vec<String> = (0..subs).map(|s| format!("{dir}/sub{s}/status")).collect();
             let mut buf = String::with_capacity(1024);
             let mut tbuf = String::with_capacity(2048);
@@ -157,6 +168,7 @@ mod linux {
                     unsafe { libc::write(wake, (&one as *const u64).cast(), 8) };
                 }
                 last = now;
+                check_helper(&report, uid, &live, &mut hbuf);
                 sleep_until(started + PCM_POLL_NS);
             }
         })?;
@@ -195,16 +207,74 @@ mod linux {
         }
     }
 
+    /// The reader thread's verdict on the report's writer, under a seqlock:
+    /// that `pid`/`start` was alive, the session user's, when checked.
+    #[derive(Default)]
+    struct HelperLive {
+        seq: AtomicU64,
+        pid: AtomicU64,
+        start: AtomicU64,
+        alive: AtomicU64,
+        checked_ns: AtomicU64,
+    }
+
+    impl HelperLive {
+        fn publish(&self, pid: u32, start: u64, alive: bool, at: u64) {
+            self.seq.fetch_add(1, Ordering::AcqRel);
+            self.pid.store(u64::from(pid), Ordering::Release);
+            self.start.store(start, Ordering::Release);
+            self.alive.store(alive as u64, Ordering::Release);
+            self.checked_ns.store(at, Ordering::Release);
+            self.seq.fetch_add(1, Ordering::AcqRel);
+        }
+
+        /// Whether `helper` was checked alive within `HELPER_CHECK_MAX_NS`.
+        fn vouches(&self, helper: Option<(u32, u64)>, now: u64) -> bool {
+            let Some((pid, start)) = helper else { return false };
+            for _ in 0..3 {
+                let s0 = self.seq.load(Ordering::Acquire);
+                if s0 & 1 == 1 {
+                    continue;
+                }
+                let v = (
+                    self.pid.load(Ordering::Acquire),
+                    self.start.load(Ordering::Acquire),
+                    self.alive.load(Ordering::Acquire),
+                    self.checked_ns.load(Ordering::Acquire),
+                );
+                if self.seq.load(Ordering::Acquire) != s0 {
+                    continue;
+                }
+                return v.0 == u64::from(pid)
+                    && v.1 == start
+                    && v.2 == 1
+                    && now.saturating_sub(v.3) <= HELPER_CHECK_MAX_NS;
+            }
+            false
+        }
+    }
+
+    /// The helper's report and its writer's liveness. The report is read on
+    /// the RT path (a tmpfs file, never blocking); the writer is checked
+    /// against /proc by the reader thread.
+    struct Session(std::ffi::CString, Arc<HelperLive>);
+    impl SessionView for Session {
+        fn read(&mut self) -> SessionReport {
+            let mut r = read_report(&self.0);
+            r.helper_alive = self.1.vouches(r.helper, now_ns());
+            r
+        }
+    }
+
     /// The helper's report: opened without following links and without
     /// blocking, a regular file only, at most 255 bytes, read into a stack
     /// buffer. The helper renames each report into place, so a read sees
     /// one whole report or the one before.
-    struct Session(std::ffi::CString);
-    impl SessionView for Session {
-        fn read(&mut self) -> SessionReport {
+    fn read_report(path: &std::ffi::CStr) -> SessionReport {
+        {
             let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
             // SAFETY: a NUL-terminated path.
-            let fd = unsafe { libc::open(self.0.as_ptr(), flags) };
+            let fd = unsafe { libc::open(path.as_ptr(), flags) };
             if fd < 0 {
                 return SessionReport::default();
             }
@@ -226,6 +296,22 @@ mod linux {
             }
             core::str::from_utf8(&buf[..n as usize]).map(parse_session).unwrap_or_default()
         }
+    }
+
+    /// Check the report's writer: alive, started when it says, the user's.
+    fn check_helper(path: &std::ffi::CStr, uid: u32, live: &HelperLive, buf: &mut String) {
+        use std::os::unix::fs::MetadataExt;
+        let r = read_report(path);
+        let at = now_ns();
+        let Some((pid, start)) = r.helper else {
+            live.publish(0, 0, false, at);
+            return;
+        };
+        let dir = format!("/proc/{pid}");
+        let owner = std::fs::metadata(&dir).ok().map(|m| m.uid());
+        let stat = read_small(&format!("{dir}/stat"), buf).then_some(buf.as_str());
+        let alive = helper_is(&r, stat, owner, uid);
+        live.publish(pid, start, alive, at);
     }
 
     fn now_ns() -> u64 {
@@ -500,6 +586,7 @@ mod linux {
         );
 
         let snapshot = Arc::new(PcmSnapshot::default());
+        let live = Arc::new(HelperLive::default());
         // SAFETY: a plain eventfd, non-blocking and close-on-exec.
         let wake = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
         if wake < 0 {
@@ -508,7 +595,9 @@ mod linux {
         }
         // before SCHED_FIFO: the reader runs at normal priority
         let pcm_dir = format!("/proc/asound/card{index}/pcm{pcm}p");
-        if let Err(e) = spawn_pcm_reader(pcm_dir, info.subdevices, snapshot.clone(), wake) {
+        if let Err(e) =
+            spawn_pcm_reader(pcm_dir, info.subdevices, snapshot.clone(), wake, session_path.clone(), uid, live.clone())
+        {
             eprintln!("PCM reader: {e}");
             return EX_UNAVAILABLE;
         }
@@ -524,7 +613,7 @@ mod linux {
         }
         let mut engine = Page(page);
         let mut pcm_view = PcmLatest(snapshot);
-        let mut session = Session(session_path);
+        let mut session = Session(session_path, live);
         let mut observer = Observer::new(header.payload_crc, header.sample_rate, TICK_NS);
         let mut sup = Supervisor::new(Expect::new(machine, full_scales, &info.id));
         let mut deadline = now_ns();
