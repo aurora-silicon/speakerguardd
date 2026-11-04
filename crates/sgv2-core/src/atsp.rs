@@ -15,7 +15,12 @@
 //! - linking: a slot's `Gain link` takes the minimum over its channels, and
 //!   `Gain link all audio channels` the minimum over every active channel;
 //! - the 20 dB panic while `T_vc > T_limit + headroom`, at once;
-//! - reset at ambient and unity gain.
+//! - reset at ambient and unity gain;
+//! - hand-off (`save_state`/`restore_state`) of the coil and magnet rises
+//!   and the slot gain to the next stream or instance, cooled for the gap
+//!   by the continuous two-node solution and the gain released toward
+//!   unity. The reference resets on reinitialisation (spec 5); a speaker
+//!   does not cool because a stream restarted, so here it never does.
 //!
 //! The program is held to digital full scale (`clamp(x, -1, 1)`, a
 //! non-finite sample 0) before the gain and before both power meters, so
@@ -35,7 +40,10 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::blob::{BlobError, Pod};
-use crate::{dsp, ChannelState, Health, Io, ProtectionUnit, Telemetry, UnitKind, FAILSAFE_GAIN, MAX_CHANNELS};
+use crate::{
+    cool_coupled, dsp, gap_or_zero, release_toward_unity, ChannelState, HandOff, Health, Io, ProtectionUnit, Telemetry,
+    UnitKind, FAILSAFE_GAIN, MAX_CHANNELS,
+};
 
 const EPS: f64 = f32::MIN_POSITIVE as f64;
 /// Longest update in host-block mode (`block_frames = 0`), frames.
@@ -480,6 +488,44 @@ impl ProtectionUnit for Unit {
             r.reset();
         }
     }
+
+    fn save_state(&self, out: &mut HandOff) -> bool {
+        let Some(run) = self.run.as_ref().filter(|r| !r.fault) else { return false };
+        *out = HandOff::EMPTY;
+        out.kind = UnitKind::Atsp as u32;
+        out.channels = run.n as u32;
+        out.sample_rate = self.params.sample_rate;
+        for (i, c) in run.ch.iter().enumerate() {
+            out.node[i][..2].copy_from_slice(&[c.theta_vc, c.theta_mg]);
+            out.gain[i] = run.groups[c.group].gain as f64;
+        }
+        true
+    }
+
+    fn restore_state(&mut self, state: &HandOff, gap_s: f64) -> bool {
+        let rate = self.params.sample_rate;
+        let Some(run) = self.run.as_mut() else { return false };
+        if !state.fits(UnitKind::Atsp, run.n, rate) {
+            return false;
+        }
+        let t = gap_or_zero(gap_s);
+        let mut g = [1.0f64; MAX_CHANNELS];
+        let mut hard = [false; MAX_CHANNELS];
+        for (i, c) in run.ch.iter_mut().enumerate() {
+            (c.theta_vc, c.theta_mg) = cool_coupled(state.node[i][0], state.node[i][1], c.tau_vc, c.tau_mg, t);
+            c.hard = c.ambient + c.theta_vc > c.hard_limit;
+            g[c.group] = g[c.group].min(state.gain[i]);
+            hard[c.group] |= c.hard;
+        }
+        // the first block's curve holds the restored gain (and the panic)
+        for (gi, grp) in run.groups.iter_mut().enumerate() {
+            grp.gain = release_toward_unity(g[gi], grp.r_release as f64, t * rate as f64) as f32;
+            grp.hard = hard[gi];
+            let v = if grp.hard { grp.gain * FAILSAFE_GAIN } else { grp.gain };
+            run.curve[gi * run.block..][..run.block].iter_mut().for_each(|c| *c = v);
+        }
+        true
+    }
 }
 
 #[cfg(test)]
@@ -543,6 +589,9 @@ mod fault_tests {
             let mut t = Telemetry::new();
             u.telemetry(&mut t);
             assert!(t.health.0 & Health::MODEL_FAULT != 0 && t.channels[0].gain == FAILSAFE_GAIN);
+            // a state the unit no longer trusts is never handed on
+            let mut rec = HandOff::EMPTY;
+            assert!(!u.save_state(&mut rec));
             u.reset();
             let (o, h) = run(&mut u, 0.01, 512);
             assert_eq!((o[511], h), (0.01, Health::OK));

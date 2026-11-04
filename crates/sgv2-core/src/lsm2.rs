@@ -46,6 +46,13 @@
 //! leave it hot for minutes. A model state that goes non-finite latches the
 //! 20 dB fail-safe (`Health::MODEL_FAULT`) until reset.
 //!
+//! Hand-off: `save_state`/`restore_state` carry the coil and magnet rises,
+//! the four power averages and the slow gain to the next stream or
+//! instance, cooled for the gap (the continuous two-node solution; the
+//! averages decay toward idle) with the slow gain released toward unity.
+//! The reference resets on reinitialisation (spec 8); a speaker does not
+//! cool because a stream restarted, so here it never does.
+//!
 //! Failure: the reference unit fails initialisation outright when neither
 //! estimator can be built. Here an unusable parameter set, or a geometry
 //! mismatch, gives the 20 dB fail-safe, which on the Neo equals the
@@ -75,7 +82,10 @@ use alloc::vec::Vec;
 
 use crate::blob::{BlobError, Pod};
 use crate::delay::Delay;
-use crate::{dsp, ChannelState, Health, Io, ProtectionUnit, Telemetry, UnitKind, FAILSAFE_GAIN, MAX_CHANNELS};
+use crate::{
+    cool_coupled, dsp, gap_or_zero, release_toward_unity, ChannelState, HandOff, Health, Io, ProtectionUnit, Telemetry,
+    UnitKind, FAILSAFE_GAIN, MAX_CHANNELS,
+};
 
 /// Controller update cadence in frames (spec 10: exactly 256).
 pub const CONTROLLER_FRAMES: usize = 256;
@@ -357,6 +367,8 @@ struct Chan {
     rth_mag: f64,
     a_vc: f64,
     a_mag: f64,
+    tau_vc: f64,
+    tau_mag: f64,
     ambient: f64,
     t_vc: f64,
     t_mag: f64,
@@ -466,6 +478,8 @@ impl Run {
                 rth_mag: c.rth_mag as f64,
                 a_vc: dt / (c.tau_vc as f64 + dt),
                 a_mag: dt / (c.tau_mag as f64 + dt),
+                tau_vc: c.tau_vc as f64,
+                tau_mag: c.tau_mag as f64,
                 ambient: c.ambient as f64,
                 t_vc: c.ambient as f64,
                 t_mag: c.ambient as f64,
@@ -745,6 +759,46 @@ impl ProtectionUnit for Unit {
             r.reset();
         }
     }
+
+    fn save_state(&self, out: &mut HandOff) -> bool {
+        let Some(run) = self.run.as_ref().filter(|r| !r.fault) else { return false };
+        *out = HandOff::EMPTY;
+        out.kind = UnitKind::Lsm2 as u32;
+        out.channels = run.n as u32;
+        out.sample_rate = self.params.sample_rate;
+        for (i, c) in run.ch.iter().enumerate() {
+            let n = &mut out.node[i];
+            // rises over ambient; a coil below ambient carries no heat
+            n[0] = (c.t_vc - c.ambient).max(0.0);
+            n[1] = (c.t_mag - c.ambient).max(0.0);
+            n[2..6].copy_from_slice(&c.pbar);
+            out.gain[i] = c.slow as f64;
+        }
+        true
+    }
+
+    fn restore_state(&mut self, state: &HandOff, gap_s: f64) -> bool {
+        let rate = self.params.sample_rate;
+        let Some(run) = self.run.as_mut() else { return false };
+        if !state.fits(UnitKind::Lsm2, run.n, rate) {
+            return false;
+        }
+        let t = gap_or_zero(gap_s);
+        let samples = t * rate as f64;
+        for (i, c) in run.ch.iter_mut().enumerate() {
+            let s = &state.node[i];
+            let (v, m) = cool_coupled(s[0], s[1], c.tau_vc, c.tau_mag, t);
+            c.t_vc = c.ambient + v;
+            c.t_mag = c.ambient + m;
+            for j in 0..4 {
+                c.pbar[j] = run.idle + (s[2 + j] - run.idle) * libm::pow(run.p_pole[j], samples);
+            }
+            let g = release_toward_unity(state.gain[i], run.r_slow as f64, samples) as f32;
+            c.slow = g;
+            c.slow_target = g;
+        }
+        true
+    }
 }
 
 #[cfg(test)]
@@ -834,6 +888,9 @@ mod fault_tests {
             let mut t = Telemetry::new();
             u.telemetry(&mut t);
             assert!(t.health.0 & Health::MODEL_FAULT != 0 && t.channels[0].gain == FAILSAFE_GAIN);
+            // a state the unit no longer trusts is never handed on
+            let mut rec = HandOff::EMPTY;
+            assert!(!u.save_state(&mut rec));
             u.reset();
             let (o, h) = run(&mut u, 0.01, 1024);
             assert_eq!((o[1023], h), (0.01, Health::OK));

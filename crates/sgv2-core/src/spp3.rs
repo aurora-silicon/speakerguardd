@@ -49,6 +49,12 @@
 //! - **Reset.** The parameters' start state (64007 = 2: ambient, the macOS
 //!   configuration), unity gains, model history cleared, CL temperature
 //!   reported as 20 C.
+//! - **Hand-off.** `save_state`/`restore_state` carry the coil, magnet and
+//!   virtual-coil nodes, the hard-path arm flag and the selected gain to
+//!   the next stream or instance (spec 10's process-global state vector):
+//!   each node aged by `exp(-gap/tau)`, the gain advanced toward unity
+//!   with `k_release`, the arm flag kept only while the aged `T_OL` is
+//!   still at or above the limit. The closed loop restarts invalid.
 //!
 //! TODO(SPEC):
 //! - the generated pilot sine and its content-gate envelope (spec 18: the
@@ -104,7 +110,10 @@ use crate::blob::{BlobError, Pod};
 use crate::delay::Delay;
 use crate::dsp;
 use crate::sense::{BlockSums, DelayEstimator};
-use crate::{ChannelState, Health, Io, ProtectionUnit, Telemetry, UnitKind, FAILSAFE_GAIN, MAX_CHANNELS};
+use crate::{
+    gap_or_zero, release_toward_unity, ChannelState, HandOff, Health, Io, ProtectionUnit, Telemetry, UnitKind,
+    FAILSAFE_GAIN, MAX_CHANNELS,
+};
 
 /// CL temperature reported before any valid measurement (spec section 10).
 const T_CL_UNMEASURED: f32 = 20.0;
@@ -487,12 +496,13 @@ pub fn settle99(seconds: f64, rate: f64) -> f64 {
 struct Thermal {
     a: f64,
     b: f64,
+    tau: f64,
     theta: f64,
 }
 
 impl Thermal {
     fn new(r_th: f64, tau: f64, dt: f64, start: f64) -> Self {
-        Thermal { a: 1.0 - dt / tau, b: 0.5 * r_th * dt / tau, theta: start }
+        Thermal { a: 1.0 - dt / tau, b: 0.5 * r_th * dt / tau, tau, theta: start }
     }
     #[inline]
     fn step(&mut self, p: f64, p_prev: f64) {
@@ -1191,6 +1201,46 @@ impl ProtectionUnit for Unit {
             r.reset();
         }
     }
+
+    fn save_state(&self, out: &mut HandOff) -> bool {
+        let Some(run) = self.run.as_ref().filter(|r| !r.fault) else { return false };
+        *out = HandOff::EMPTY;
+        out.kind = UnitKind::Spp3 as u32;
+        out.channels = run.n as u32;
+        out.sample_rate = self.params.sample_rate;
+        for (i, c) in run.ch.iter().enumerate() {
+            out.node[i][..4].copy_from_slice(&[c.vc.theta, c.mg.theta, c.ff.theta, c.armed as u8 as f64]);
+            out.gain[i] = run.groups[c.group].g;
+        }
+        true
+    }
+
+    fn restore_state(&mut self, state: &HandOff, gap_s: f64) -> bool {
+        let rate = self.params.sample_rate;
+        let Some(run) = self.run.as_mut() else { return false };
+        if !state.fits(UnitKind::Spp3, run.n, rate) {
+            return false;
+        }
+        let t = gap_or_zero(gap_s);
+        let updates = t * rate as f64 / THERMAL_FRAMES as f64;
+        let mut g = [1.0f64; MAX_CHANNELS];
+        for (i, c) in run.ch.iter_mut().enumerate() {
+            let s = &state.node[i];
+            c.vc.theta = s[0] * libm::exp(-t / c.vc.tau);
+            c.mg.theta = s[1] * libm::exp(-t / c.mg.tau);
+            c.ff.theta = s[2] * libm::exp(-t / c.ff.tau);
+            // hysteresis: an armed hard path stays armed until T_OL < limit
+            c.armed = s[3] != 0.0 && run.ambient + c.vc.theta + c.mg.theta >= c.limit;
+            g[c.group] = g[c.group].min(state.gain[i]);
+        }
+        let k = 1.0 - run.k_release;
+        for (gi, grp) in run.groups.iter_mut().enumerate() {
+            let v = release_toward_unity(g[gi], k, updates);
+            *grp = Group { g: v, sel: v as f32, z1: v as f32, z2: v as f32 };
+        }
+        run.curve.iter_mut().for_each(|v| *v = 1.0);
+        true
+    }
 }
 
 /// 20 dB on whatever geometry the host gave, never indexing past a buffer,
@@ -1271,6 +1321,9 @@ mod fault_tests {
             let mut t = Telemetry::new();
             u.telemetry(&mut t);
             assert!(t.health.0 & Health::MODEL_FAULT != 0 && t.channels[0].gain == FAILSAFE_GAIN);
+            // a state the unit no longer trusts is never handed on
+            let mut rec = HandOff::EMPTY;
+            assert!(!u.save_state(&mut rec));
             u.reset();
             let (o, h) = run(&mut u, 0.5, 512);
             assert_eq!((o[511], h.0 & Health::FAILSAFE), (0.5, 0));

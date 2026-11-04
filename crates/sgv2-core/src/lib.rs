@@ -116,8 +116,101 @@ pub trait ProtectionUnit {
     fn process(&mut self, io: Io<'_, '_>) -> Health;
     /// Snapshot of the internal state the differential rig compares.
     fn telemetry(&self, out: &mut Telemetry);
-    /// Return to the initial state (stream start).
+    /// Return to the initial state (stream start): the parameters' start
+    /// state, empty histories, unity gains.
     fn reset(&mut self);
+    /// Copy the persistent thermal state for a later stream or instance of
+    /// the same unit. Real-time safe. False when there is nothing to hand
+    /// off (a fail-safe unit, or a latched model fault: never hand off a
+    /// state the unit itself no longer trusts).
+    fn save_state(&self, _out: &mut HandOff) -> bool {
+        false
+    }
+    /// Seed the thermal state from `state` after `gap_s` seconds of
+    /// silence, as the reference restores its hand-off record (spec spp3
+    /// 10: every node aged by the gap, the saved gain advanced toward unity
+    /// with the release coefficient). Call right after [`reset`]; audio
+    /// histories stay empty. A record for another unit kind, geometry or
+    /// rate, or with a non-finite or negative value, is refused (false) and
+    /// leaves the reset state. A non-finite or negative gap counts as 0
+    /// (no cooling). Not real time.
+    ///
+    /// [`reset`]: ProtectionUnit::reset
+    fn restore_state(&mut self, _state: &HandOff, _gap_s: f64) -> bool {
+        false
+    }
+}
+
+/// Thermal nodes per channel in a [`HandOff`] record.
+pub const HANDOFF_NODES: usize = 6;
+
+/// A unit's persistent thermal state, handed from one stream to the next.
+/// A speaker stays hot across a pause, a suspend or a graph rebuild, so a
+/// restarted stream must not start cold: macOS keeps this state vector
+/// process-global and restores it, aged for the gap (spp3 spec 10).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HandOff {
+    /// `UnitKind` as u32.
+    pub kind: u32,
+    pub channels: u32,
+    pub sample_rate: u32,
+    /// Per unit channel, the unit's thermal nodes (layout per unit: spp3
+    /// coil, magnet, virtual-coil rises over ambient in K and the hard-path
+    /// arm flag; atsp coil and magnet rises; lsm2 coil and magnet rises and
+    /// the four power averages in W).
+    pub node: [[f64; HANDOFF_NODES]; MAX_CHANNELS],
+    /// Per unit channel, the slow (thermal) controller gain, linear.
+    pub gain: [f64; MAX_CHANNELS],
+}
+
+impl HandOff {
+    pub const EMPTY: HandOff = HandOff {
+        kind: 0,
+        channels: 0,
+        sample_rate: 0,
+        node: [[0.0; HANDOFF_NODES]; MAX_CHANNELS],
+        gain: [1.0; MAX_CHANNELS],
+    };
+
+    /// Whether this record fits a unit, with every value it carries for its
+    /// channels finite, every node nonnegative and every gain in (0, 1].
+    pub fn fits(&self, kind: UnitKind, channels: usize, sample_rate: u32) -> bool {
+        if self.kind != kind as u32 || self.channels as usize != channels || self.sample_rate != sample_rate {
+            return false;
+        }
+        let n = channels.min(MAX_CHANNELS);
+        self.node[..n].iter().flatten().all(|v| v.is_finite() && *v >= 0.0)
+            && self.gain[..n].iter().all(|g| g.is_finite() && *g > 0.0 && *g <= 1.0)
+    }
+}
+
+/// `gap_s` as a cooling time: a non-finite or negative gap is no cooling.
+pub fn gap_or_zero(gap_s: f64) -> f64 {
+    if gap_s.is_finite() && gap_s > 0.0 {
+        gap_s
+    } else {
+        0.0
+    }
+}
+
+/// Zero-input cooling of a coupled coil/magnet pair over `t` seconds, the
+/// continuous solution of `dm/dt = -m/tau_m`, `dv/dt = (m - v)/tau_v` (the
+/// atsp and lsm2 two-node models: the coil relaxes toward the magnet).
+/// Returns the coil and magnet rises.
+pub fn cool_coupled(v0: f64, m0: f64, tau_v: f64, tau_m: f64, t: f64) -> (f64, f64) {
+    let ev = libm::exp(-t / tau_v);
+    let em = libm::exp(-t / tau_m);
+    let m = m0 * em;
+    let d = tau_m - tau_v;
+    let v =
+        if libm::fabs(d) <= 1e-9 * tau_m { (v0 + m0 * t / tau_v) * ev } else { v0 * ev + m0 * tau_m / d * (em - ev) };
+    (v.max(0.0), m.max(0.0))
+}
+
+/// A gain state `g` after `steps` steps of release toward unity with the
+/// one-pole factor `r` per step (`g <- 1 + r (g - 1)`).
+pub fn release_toward_unity(g: f64, r: f64, steps: f64) -> f64 {
+    1.0 - (1.0 - g) * libm::pow(r, steps)
 }
 
 /// Linear gain of [`FAILSAFE_ATTENUATION_DB`]: 10^(-20/20) = 0.1.
