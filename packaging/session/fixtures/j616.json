@@ -1,0 +1,236 @@
+{
+ "note": "MacBook Pro 14/16-inch (M4 Pro, J616s): the speaker card of arch/arm64/boot/dts/apple/t604x-j614-j616.dtsi and t6040-j616s.dts (public); the AOP audio component is the one back-end, the six SN012776 amps are on i2c1. Tuning lanes: the structure of the graph's input lanes only, with generic box names and no tuning values.",
+ "hw": {
+  "board": "j616s",
+  "compatible": [
+   "apple,j616s",
+   "apple,t6040",
+   "apple,arm-platform"
+  ],
+  "sound": "sound",
+  "model": "MacBook Pro J616",
+  "links": [
+   {
+    "name": "Speakers",
+    "cpus": 1,
+    "codecs": [
+     {
+      "node": "soc/i2c1/codec@38",
+      "prefix": "Left Woofer 1",
+      "compatible": [
+       "ti,sn012776",
+       "ti,tas2764"
+      ],
+      "imon": 0,
+      "vmon": 2
+     },
+     {
+      "node": "soc/i2c1/codec@3b",
+      "prefix": "Right Woofer 1",
+      "compatible": [
+       "ti,sn012776",
+       "ti,tas2764"
+      ],
+      "imon": 4,
+      "vmon": 6
+     },
+     {
+      "node": "soc/i2c1/codec@39",
+      "prefix": "Left Woofer 2",
+      "compatible": [
+       "ti,sn012776",
+       "ti,tas2764"
+      ],
+      "imon": 8,
+      "vmon": 10
+     },
+     {
+      "node": "soc/i2c1/codec@3c",
+      "prefix": "Right Woofer 2",
+      "compatible": [
+       "ti,sn012776",
+       "ti,tas2764"
+      ],
+      "imon": 12,
+      "vmon": 14
+     },
+     {
+      "node": "soc/i2c1/codec@3a",
+      "prefix": "Left Tweeter",
+      "compatible": [
+       "ti,sn012776",
+       "ti,tas2764"
+      ],
+      "imon": 16,
+      "vmon": 18
+     },
+     {
+      "node": "soc/i2c1/codec@3d",
+      "prefix": "Right Tweeter",
+      "compatible": [
+       "ti,sn012776",
+       "ti,tas2764"
+      ],
+      "imon": 20,
+      "vmon": 22
+     }
+    ]
+   }
+  ]
+ },
+ "tuning": {
+  "tuning": {
+   "aid": "synthetic",
+   "protection": {
+    "kind": "spp3",
+    "lanes": [
+     {
+      "origin": {
+       "node": "in",
+       "port": 0,
+       "channel": 0
+      },
+      "hops": [
+       {
+        "join": "Split",
+        "input": 0,
+        "channel": 0
+       },
+       {
+        "join": "XoverLF",
+        "input": 0,
+        "channel": 0
+       },
+       {
+        "join": "Out",
+        "input": 0,
+        "channel": 0
+       }
+      ]
+     },
+     {
+      "origin": {
+       "node": "in",
+       "port": 0,
+       "channel": 1
+      },
+      "hops": [
+       {
+        "join": "Split",
+        "input": 1,
+        "channel": 1
+       },
+       {
+        "join": "XoverLF",
+        "input": 1,
+        "channel": 1
+       },
+       {
+        "join": "Out",
+        "input": 1,
+        "channel": 1
+       }
+      ]
+     },
+     {
+      "origin": {
+       "node": "in",
+       "port": 0,
+       "channel": 0
+      },
+      "hops": [
+       {
+        "join": "Split",
+        "input": 0,
+        "channel": 0
+       },
+       {
+        "join": "XoverLF",
+        "input": 2,
+        "channel": 2
+       },
+       {
+        "join": "Out",
+        "input": 2,
+        "channel": 2
+       }
+      ]
+     },
+     {
+      "origin": {
+       "node": "in",
+       "port": 0,
+       "channel": 1
+      },
+      "hops": [
+       {
+        "join": "Split",
+        "input": 1,
+        "channel": 1
+       },
+       {
+        "join": "XoverLF",
+        "input": 3,
+        "channel": 3
+       },
+       {
+        "join": "Out",
+        "input": 3,
+        "channel": 3
+       }
+      ]
+     },
+     {
+      "origin": {
+       "node": "in",
+       "port": 0,
+       "channel": 0
+      },
+      "hops": [
+       {
+        "join": "Split",
+        "input": 0,
+        "channel": 0
+       },
+       {
+        "join": "XoverHF",
+        "input": 4,
+        "channel": 4
+       },
+       {
+        "join": "Out",
+        "input": 4,
+        "channel": 4
+       }
+      ]
+     },
+     {
+      "origin": {
+       "node": "in",
+       "port": 0,
+       "channel": 1
+      },
+      "hops": [
+       {
+        "join": "Split",
+        "input": 1,
+        "channel": 1
+       },
+       {
+        "join": "XoverHF",
+        "input": 5,
+        "channel": 5
+       },
+       {
+        "join": "Out",
+        "input": 5,
+        "channel": 5
+       }
+      ]
+     }
+    ],
+    "strip_properties": []
+   }
+  }
+ }
+}

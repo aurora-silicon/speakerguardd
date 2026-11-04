@@ -1,0 +1,186 @@
+{
+ "note": "MacBook Air 13-inch (M2, J413): device tree as booted (Linux DT, public); tuning lanes: the structure of the graph's input lanes only, with generic box names and no tuning values.",
+ "hw": {
+  "board": "j413",
+  "compatible": [
+   "apple,j413",
+   "apple,t8112",
+   "apple,arm-platform"
+  ],
+  "sound": "sound",
+  "model": "MacBook Air J413",
+  "links": [
+   {
+    "name": "Speakers",
+    "cpus": 2,
+    "codecs": [
+     {
+      "node": "soc/i2c@235014000/codec@38",
+      "prefix": "Left Woofer",
+      "compatible": [
+       "ti,sn012776",
+       "ti,tas2764"
+      ],
+      "vmon": 2,
+      "imon": 0,
+      "i2c": "3-0038"
+     },
+     {
+      "node": "soc/i2c@235014000/codec@39",
+      "prefix": "Left Tweeter",
+      "compatible": [
+       "ti,sn012776",
+       "ti,tas2764"
+      ],
+      "vmon": 10,
+      "imon": 8,
+      "i2c": "3-0039"
+     },
+     {
+      "node": "soc/i2c@23501c000/codec@3b",
+      "prefix": "Right Woofer",
+      "compatible": [
+       "ti,sn012776",
+       "ti,tas2764"
+      ],
+      "vmon": 6,
+      "imon": 4,
+      "i2c": "0-003b"
+     },
+     {
+      "node": "soc/i2c@23501c000/codec@3c",
+      "prefix": "Right Tweeter",
+      "compatible": [
+       "ti,sn012776",
+       "ti,tas2764"
+      ],
+      "vmon": 14,
+      "imon": 12,
+      "i2c": "0-003c"
+     }
+    ]
+   },
+   {
+    "name": "Headphone Jack",
+    "cpus": 1,
+    "codecs": [
+     {
+      "node": "soc/i2c@23501c000/codec@4b",
+      "prefix": "Jack",
+      "compatible": [
+       "cirrus,cs42l84"
+      ],
+      "i2c": "0-004b"
+     }
+    ]
+   }
+  ]
+ },
+ "tuning": {
+  "tuning": {
+   "aid": "synthetic",
+   "protection": {
+    "kind": "spp3",
+    "lanes": [
+     {
+      "origin": {
+       "node": "in",
+       "port": 0,
+       "channel": 0
+      },
+      "hops": [
+       {
+        "join": "Split",
+        "input": 0,
+        "channel": 0
+       },
+       {
+        "join": "XoverLF",
+        "input": 0,
+        "channel": 0
+       },
+       {
+        "join": "Out",
+        "input": 0,
+        "channel": 0
+       }
+      ]
+     },
+     {
+      "origin": {
+       "node": "in",
+       "port": 0,
+       "channel": 1
+      },
+      "hops": [
+       {
+        "join": "Split",
+        "input": 1,
+        "channel": 1
+       },
+       {
+        "join": "XoverLF",
+        "input": 1,
+        "channel": 1
+       },
+       {
+        "join": "Out",
+        "input": 1,
+        "channel": 1
+       }
+      ]
+     },
+     {
+      "origin": {
+       "node": "in",
+       "port": 0,
+       "channel": 0
+      },
+      "hops": [
+       {
+        "join": "Split",
+        "input": 0,
+        "channel": 0
+       },
+       {
+        "join": "XoverHF",
+        "input": 2,
+        "channel": 2
+       },
+       {
+        "join": "Out",
+        "input": 2,
+        "channel": 2
+       }
+      ]
+     },
+     {
+      "origin": {
+       "node": "in",
+       "port": 0,
+       "channel": 1
+      },
+      "hops": [
+       {
+        "join": "Split",
+        "input": 1,
+        "channel": 1
+       },
+       {
+        "join": "XoverHF",
+        "input": 3,
+        "channel": 3
+       },
+       {
+        "join": "Out",
+        "input": 3,
+        "channel": 3
+       }
+      ]
+     }
+    ],
+    "strip_properties": []
+   }
+  }
+ }
+}
