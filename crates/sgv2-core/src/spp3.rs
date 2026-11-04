@@ -431,6 +431,60 @@ impl Params {
                 c.validate_closed_loop()?;
             }
         }
+        self.validate_physical()
+    }
+
+    /// Physical ranges. A blob can be finite and well-formed and still
+    /// describe a speaker that never heats or a limit no coil has, and then
+    /// full scale passes at unity (`TemperatureLimit = f32::MAX`, a
+    /// smoother that never moves, a kilohm of series resistance). Every
+    /// bound is far outside any laptop speaker yet tight enough that the
+    /// model always heats and the controller always acts:
+    /// - ambient -40..100 C, limits -40..250 C (voice coils are rated well
+    ///   below 250 C; the closed loop can add at most `TlimAdjCap`), hard
+    ///   headroom within +-50 K;
+    /// - gain attack and release at most 600 s, thermal time constants at
+    ///   most 3600 s;
+    /// - thermal resistances 0.01..1000 K/W for the coil, at most 1000 K/W
+    ///   for the magnet;
+    /// - `Reb_ref` 0.1..100 ohm and the series resistance (`Rshunt +
+    ///   Rampout`) at most `Reb_ref`: a sense shunt and an amplifier output
+    ///   are a small fraction of the coil, and with more than the coil in
+    ///   series the modelled power `ag^2 Reb / (Reb + Rs)^2` collapses;
+    /// - amplifier volts at full scale `ag` 0.1..1000 V.
+    fn validate_physical(&self) -> Result<(), InitError> {
+        let within = |v: f32, lo: f32, hi: f32| v.is_finite() && v >= lo && v <= hi;
+        if !within(self.thermal_ambient_temp, -40.0, 100.0) {
+            return Err(InitError::Invalid("ambient outside -40..100 C"));
+        }
+        if !(within(self.thermal_gain_attack_time_s, 0.0, 600.0)
+            && within(self.thermal_gain_release_time_s, 0.0, 600.0))
+        {
+            return Err(InitError::Invalid("gain attack/release above 600 s"));
+        }
+        for c in &self.ch[..self.channels as usize] {
+            if !within(c.temperature_limit, -40.0, 250.0) {
+                return Err(InitError::Invalid("TemperatureLimit outside -40..250 C"));
+            }
+            if !within(c.hard_temp_limit_headroom, -50.0, 50.0) {
+                return Err(InitError::Invalid("HardTempLimitHeadroom outside +-50 K"));
+            }
+            if !(within(c.tau_tvc, 0.0, 3600.0) && within(c.tau_tmg, 0.0, 3600.0)) {
+                return Err(InitError::Invalid("thermal time constant above 3600 s"));
+            }
+            if !(within(c.t_sett_vc, 0.01, 1000.0) && within(c.t_sett_mg, 0.0, 1000.0)) {
+                return Err(InitError::Invalid("thermal resistance outside 0.01..1000 K/W"));
+            }
+            if !within(c.reb_ref, 0.1, 100.0) || !within(c.rshunt + c.rampout, 0.0, c.reb_ref) {
+                return Err(InitError::Invalid("Reb_ref outside 0.1..100 ohm or series resistance above it"));
+            }
+            if !within(c.ag, 0.1, 1000.0) {
+                return Err(InitError::Invalid("ag outside 0.1..1000 V"));
+            }
+            if c.cl_thermal_feedback_enabled != 0 && c.tlim_adj_cap > 100.0 {
+                return Err(InitError::Invalid("TlimAdjCap above 100 K"));
+            }
+        }
         Ok(())
     }
 
@@ -461,7 +515,7 @@ impl ChannelParams {
         if !(pos(self.temp_sense_window_time_s)
             && pos(self.temp_sense_smoothing_tau_s)
             && pos(self.tlim_err_decay_time_s)
-            && self.temp_sense_window_time_s <= 60.0)
+            && self.temp_sense_window_time_s <= 2.0)
         {
             return Err(InitError::Invalid("closed-loop times"));
         }
@@ -987,6 +1041,9 @@ struct Chan {
     group: usize,
     headroom: f32,
     scratch: Vec<f32>,
+    /// A non-finite program sample in the current thermal update: the rest
+    /// of the update gets the meter-failure 20 dB.
+    meter_failed: bool,
     elec: f64,
     headroom2: f64,
     safe: SafeTlim,
@@ -1029,6 +1086,7 @@ impl Chan {
         self.ff.theta = self.seed.2;
         self.p_prev = 0.0;
         self.p_ff_prev = 0.0;
+        self.meter_failed = false;
         self.acc.clear();
         self.acc_in.clear();
         self.acc_vi.clear();
@@ -1141,6 +1199,8 @@ struct Run {
     prefed_until: u64,
     sums: BlockSums,
     sense_ok: bool,
+    /// A non-finite sense sample in the current update: it runs open loop.
+    sense_bad: bool,
     estimator: DelayEstimator,
     /// A model state went non-finite: the fail-safe is latched until reset.
     fault: bool,
@@ -1318,6 +1378,7 @@ impl Run {
                 group: gi,
                 headroom,
                 scratch: vec![0.0; MODEL_SCRATCH],
+                meter_failed: false,
                 elec: ag * ag * reb / ((reb + series) * (reb + series)),
                 headroom2: (headroom as f64) * (headroom as f64),
                 safe: SafeTlim::new(c.temperature_limit, p.thermal_safe_tlim, p.thermal_safe_tlim_offset, safe_init),
@@ -1368,6 +1429,7 @@ impl Run {
             prefed_until: 0,
             sums,
             sense_ok: false,
+            sense_bad: false,
             estimator: DelayEstimator::new(),
             fault: false,
         })
@@ -1388,6 +1450,7 @@ impl Run {
         self.prefed_until = 0;
         self.sums.clear();
         self.sense_ok = false;
+        self.sense_bad = false;
         self.estimator.reset();
         self.fault = false;
     }
@@ -1434,10 +1497,14 @@ impl Run {
             if c.headroom != 1.0 {
                 dsp::scale_in_place(out, c.headroom);
             }
-            if non_finite {
-                // simple-meter failure: at most 20 dB below the input on
-                // these frames, non-finite samples muted
-                for ((o, &x), &g) in out.iter_mut().zip(inp).zip(curve) {
+            if c.meter_failed || non_finite {
+                // simple-meter failure: at most 20 dB below the input from
+                // the first non-finite sample to the end of its thermal
+                // update (where the host split its buffers does not move
+                // it), non-finite samples muted
+                let from = if c.meter_failed { 0 } else { inp.iter().position(|x| !x.is_finite()).unwrap_or(len) };
+                c.meter_failed = true;
+                for ((o, &x), &g) in out[from..].iter_mut().zip(&inp[from..]).zip(&curve[from..]) {
                     *o = dsp::clamp1(x, INPUT_CLAMP) * (g * c.headroom).min(FAILSAFE_GAIN);
                 }
                 *health |= Health::FAILSAFE;
@@ -1480,6 +1547,11 @@ impl Run {
             match (sense.get(si), sense.get(sv)) {
                 (Some(i), Some(v)) if i.len() >= off + len && v.len() >= off + len => {
                     let (i, v) = (&i[off..off + len], &v[off..off + len]);
+                    // non-finite sense is unusable sense: the block runs open
+                    // loop (the closed loop rejects such a window itself)
+                    if dsp::peak_abs(i) == f32::INFINITY || dsp::peak_abs(v) == f32::INFINITY {
+                        self.sense_bad = true;
+                    }
                     c.acc_vi.add_prod(v, i, phase);
                     if let Some(cl) = c.cl.as_mut().filter(|_| self.frame >= self.prefed_until) {
                         cl.feed(i, v);
@@ -1506,6 +1578,8 @@ impl Run {
                         ve += dsp::sum_sq(&sense[sv][kk..kk + m]);
                     }
                 }
+                // (non-finite or overflowing sums restart the estimator's
+                // correlation at the envelope point that holds them)
                 self.estimator.push_sums(oe as f32, ve as f32, m);
                 kk += m;
             }
@@ -1519,6 +1593,7 @@ impl Run {
         let mut ff_t = [1.0f64; MAX_CHANNELS];
         let mut hard_t = [1.0f64; MAX_CHANNELS];
         for c in self.ch.iter_mut() {
+            c.meter_failed = false;
             let p = c.elec * c.acc.total() / n;
             c.acc.clear();
             c.p_model = p;
@@ -1581,7 +1656,10 @@ impl Run {
             g.g = sel;
             g.sel = sel as f32;
         }
-        let complete = self.sums.complete && self.sums.frames == THERMAL_FRAMES;
+        let complete = self.sums.complete
+            && !self.sense_bad
+            && self.sums.frames == THERMAL_FRAMES
+            && self.ch.iter().all(|c| c.sense.is_none() || c.acc_vi.is_finite());
         for c in self.ch.iter_mut() {
             c.vi_power = if c.sense.is_some() && complete && c.acc_vi.is_finite() {
                 c.acc_vi.total() * c.vi_scale / n
@@ -1591,6 +1669,7 @@ impl Run {
             c.acc_vi.clear();
         }
         self.sense_ok = complete;
+        self.sense_bad = false;
         self.estimator.end_block();
         self.sums.clear();
         self.last_frame = self.frame - THERMAL_FRAMES as u64;
