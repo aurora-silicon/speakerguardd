@@ -169,5 +169,32 @@ class Generated(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout.decode())
 
 
+class Report(unittest.TestCase):
+    def test_the_report_is_renamed_into_place_whole_and_group_readable(self):
+        import stat
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "session")
+            # a reader holding the old report keeps it whole
+            self.assertTrue(sgs.write_report(path, True, True))
+            old = open(path, "rb")
+            self.assertTrue(sgs.write_report(path, False, True))
+            first = old.read().decode()
+            self.assertTrue(first.startswith("links=1 carrier=1 mono_ns=") and first.endswith("\n"))
+            now = open(path).read()
+            self.assertTrue(now.startswith("links=0 carrier=1 mono_ns=") and now.endswith("\n"), now)
+            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o640)
+            self.assertEqual(sorted(os.listdir(d)), ["session"])
+            # the stamp is CLOCK_MONOTONIC, the supervisor's clock
+            import time
+
+            t = int(now.split("mono_ns=")[1])
+            self.assertLessEqual(abs(time.monotonic_ns() - t), 1_000_000_000)
+
+    def test_an_unwritable_directory_reports_failure(self):
+        self.assertFalse(sgs.write_report("/nonexistent-dir/session", True, True))
+
+
 if __name__ == "__main__":
     unittest.main()

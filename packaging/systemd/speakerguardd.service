@@ -8,7 +8,9 @@ ConditionPathExists=/proc/device-tree/compatible
 
 [Service]
 Type=notify
-# Per machine: SGV2_ARGS="--card <N> --pcm <D> --uid <UID> --params <blob>"
+# Per machine: SGV2_ARGS="--pcm <D> --uid <UID> --params <blob>" (and
+# --card <N|ID> to override the machine's own card). Without the file the
+# unit does not start, and the kernel's floor holds.
 EnvironmentFile=/etc/speakerguardd/speakerguardd.conf
 ExecStart=/usr/bin/speakerguardd $SGV2_ARGS
 Restart=on-failure
@@ -17,6 +19,10 @@ RestartPreventExitStatus=78
 WatchdogSec=1s
 RuntimeDirectory=speakerguardd
 RuntimeDirectoryMode=0755
+# Kept over a restart: the plugin keeps the engine page mapped, and the
+# supervisor reopens the same file (never truncating it) instead of leaving
+# the plugin on an unlinked page until PipeWire reloads.
+RuntimeDirectoryPreserve=restart
 # The speaker card's control device only: it owns "Speaker Protection"
 # there, and closing it (any exit) withdraws protection at once.
 DevicePolicy=closed

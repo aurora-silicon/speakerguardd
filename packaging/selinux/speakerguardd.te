@@ -28,13 +28,16 @@ fs_read_dos_files(speakerguardd_t)
 dev_read_sound(speakerguardd_t)
 dev_write_sound(speakerguardd_t)
 
-# PCM ownership from /proc/asound.
+# PCM ownership from /proc/asound, and the owning thread's Tgid from
+# /proc/<tid>/status (PipeWire runs in the user's domain).
 kernel_read_system_state(speakerguardd_t)
+domain_read_all_domains_state(speakerguardd_t)
 
 # The 10 ms loop: SCHED_FIFO and locked memory.
 allow speakerguardd_t self:capability { sys_nice ipc_lock };
 allow speakerguardd_t self:process { setsched getsched };
-# Hands the engine page and the session report to the session user.
+# Hands the engine page and the helper's report directory (setgid root) to
+# the session user.
 allow speakerguardd_t self:capability { chown fowner };
 
 # Type=notify: READY=1 and WATCHDOG=1 to systemd.

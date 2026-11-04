@@ -18,8 +18,16 @@ It runs in the user's session, beside PipeWire, and does three things:
    also checks the carrier: the protect stage's input and the sense at unity
    volume, unmuted.
 3. **Report.** Every 50 ms it writes `links=<0|1> carrier=<0|1> mono_ns=<t>`
-   to /run/speakerguardd/<uid>/session, which the supervisor reads. A report
-   older than 250 ms counts as absent, and the supervisor then releases.
+   to /run/speakerguardd/<uid>/helper/session, by a write to a new file and a
+   rename, so the supervisor never reads a partial report. A report older
+   than 100 ms, or dated in the future, counts as absent, and the supervisor
+   then releases.
+4. **The grant-before-start sequence.** The supervisor grants only on a
+   live engine heartbeat (the protect stage runs on PipeWire's dummy driver
+   while the amps are unlinked) and a fresh report; this helper links the
+   amps only once the kernel reads granted; the amps' sink then starts. On
+   any withdrawal it unlinks the amps, the sink stops and closes, and the
+   sequence starts again.
 
 It reads the graph from `pw-dump --monitor` and makes or removes links with
 `pw-link`. It never touches the amps' volume: the kernel owns it.
@@ -261,22 +269,22 @@ class Session:
                     self._spawn(("unlink", lid), ["pw-link", "-d", str(lid)])
 
 
-REPORT_BYTES = 64
-
-
 def write_report(path, links, carrier):
-    line = f"links={int(links)} carrier={int(carrier)} mono_ns={time.monotonic_ns()}"
-    # One fixed-size write over the whole report, never a truncate: the
-    # supervisor reads it every 10 ms, and an empty or shorter file between
-    # a truncate and the write would read as no report and withdraw.
-    rec = line.ljust(REPORT_BYTES - 1).encode() + b"\n"
+    """Write one report atomically: a new file in the helper's own
+    directory, renamed over the last one. The supervisor reads either the
+    whole new report or the whole previous one, never a partial write."""
+    line = f"links={int(links)} carrier={int(carrier)} mono_ns={time.monotonic_ns()}\n".encode()
+    tmp = os.path.join(os.path.dirname(path), f".session.{os.getpid()}")
     try:
-        # The supervisor creates the file for this user: rewrite it in place.
-        fd = os.open(path, os.O_WRONLY | os.O_CLOEXEC)
+        # 0640: the directory is setgid root, so the supervisor reads it
+        # through the group (it runs without CAP_DAC_OVERRIDE)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_CLOEXEC | os.O_NOFOLLOW, 0o640)
         try:
-            os.pwrite(fd, rec, 0)
+            os.fchmod(fd, 0o640)
+            os.write(fd, line)
         finally:
             os.close(fd)
+        os.rename(tmp, path)
         return True
     except OSError:
         return False
@@ -292,7 +300,7 @@ def main():
     card = Card(c["card"])
     g = Graph()
     s = Session(args.machine, c)
-    report = f"/run/speakerguardd/{os.getuid()}/session"
+    report = f"/run/speakerguardd/{os.getuid()}/helper/session"
     last = (None, None, None, None)
     nxt = time.monotonic()
     while True:

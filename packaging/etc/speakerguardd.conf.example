@@ -1,6 +1,8 @@
 # /etc/speakerguardd/speakerguardd.conf (example for the MacBook Pro J316)
 # The machine (packaging/session/machines.json), for the session helper.
 SGV2_MACHINE=j316
-# The supervisor: the speaker card's index, its speaker PCM, the session user's
-# uid and the parameter blob.
-SGV2_ARGS="--card 1 --pcm 1 --uid 1000 --params /var/lib/speakerguardd/params.bin"
+# The supervisor: the speaker card (by id; the machine's own card if left out),
+# its speaker PCM (the front-end "Speaker Playback Mux" selects: 1 =
+# Secondary), the session user's uid and the parameter blob, compiled for this
+# board (the supervisor refuses a blob for another Mac).
+SGV2_ARGS="--card AppleJ316 --pcm 1 --uid 1000 --params /var/lib/speakerguardd/params.bin"
