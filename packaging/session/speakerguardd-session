@@ -37,6 +37,7 @@ import fcntl
 import json
 import os
 import select
+import signal
 import struct
 import subprocess
 import sys
@@ -49,7 +50,18 @@ PROTECT_INPUT = "alsa_output.platform-sound.RawSpeakers"
 _ID_FMT = "IiII44sI"
 _VAL_SIZE = 1224
 _ELEM_READ = (3 << 30) | (_VAL_SIZE << 16) | (0x55 << 8) | 0x12
+_SUBSCRIBE_EVENTS = (3 << 30) | (4 << 16) | (0x55 << 8) | 0x16
+_EVENT_SIZE = 72
 _IFACE_MIXER = 2
+
+
+def own_start():
+    """This process's start time, /proc/self/stat field 22 (clock ticks
+    since boot). With the pid it names the writer of each report, so the
+    supervisor can tell a live helper from a stopped one's leftover report."""
+    with open("/proc/self/stat") as f:
+        stat = f.read()
+    return int(stat[stat.rindex(")") + 1 :].split()[19])
 
 
 def log(*a):
@@ -65,7 +77,28 @@ class Card:
             self.index = int(os.readlink(f"/proc/asound/{card_id}").removeprefix("card"))
         except (OSError, ValueError):
             raise SystemExit(f"no ALSA card {card_id}")
-        self.fd = os.open(f"/dev/snd/controlC{self.index}", os.O_RDONLY | os.O_CLOEXEC)
+        self.fd = os.open(f"/dev/snd/controlC{self.index}", os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK)
+        # Control events: a withdrawal is seen at once, not at the next
+        # 50 ms period, so the amps are unlinked before the sink keeps
+        # retrying a start the kernel refuses.
+        try:
+            fcntl.ioctl(self.fd, _SUBSCRIBE_EVENTS, struct.pack("i", 1))
+            self.events = True
+        except OSError:
+            self.events = False
+
+    def drain(self):
+        """Discard pending control events; True if there were any."""
+        got = False
+        while True:
+            try:
+                if not os.read(self.fd, _EVENT_SIZE * 16):
+                    return got
+                got = True
+            except BlockingIOError:
+                return got
+            except OSError:
+                return got
 
     def granted(self):
         buf = bytearray(_VAL_SIZE)
@@ -89,12 +122,16 @@ class Graph:
         self.dec = json.JSONDecoder()
         self.objs = {}
 
-    def pump(self, timeout):
-        r, _, _ = select.select([self.proc.stdout], [], [], timeout)
+    def pump(self, timeout, extra=()):
+        """Read the monitor's output for up to `timeout`; returns which of
+        the `extra` fds are readable."""
+        r, _, _ = select.select([self.proc.stdout, *extra], [], [], timeout)
+        ready = [fd for fd in extra if fd in r]
+        r = [x for x in r if x is self.proc.stdout]
         if r:
             chunk = self.proc.stdout.read()
             if chunk is None:
-                return
+                return ready
             if chunk == b"":
                 raise SystemExit("pw-dump exited")
             self.buf += chunk.decode(errors="replace")
@@ -102,12 +139,12 @@ class Graph:
             s = self.buf.lstrip()
             if not s:
                 self.buf = ""
-                return
+                return ready
             try:
                 arr, end = self.dec.raw_decode(s)
             except ValueError:
                 self.buf = s
-                return
+                return ready
             self.buf = s[end:]
             for o in arr if isinstance(arr, list) else []:
                 if o.get("info") is None:
@@ -269,11 +306,20 @@ class Session:
                     self._spawn(("unlink", lid), ["pw-link", "-d", str(lid)])
 
 
+_WRITER = None
+
+
 def write_report(path, links, carrier):
     """Write one report atomically: a new file in the helper's own
     directory, renamed over the last one. The supervisor reads either the
-    whole new report or the whole previous one, never a partial write."""
-    line = f"links={int(links)} carrier={int(carrier)} mono_ns={time.monotonic_ns()}\n".encode()
+    whole new report or the whole previous one, never a partial write.
+    It names its writer (pid, start time): the supervisor ignores a report
+    whose writer is not alive."""
+    global _WRITER
+    if _WRITER is None:
+        _WRITER = (os.getpid(), own_start())
+    pid, start = _WRITER
+    line = f"links={int(links)} carrier={int(carrier)} mono_ns={time.monotonic_ns()} pid={pid} start={start}\n".encode()
     tmp = os.path.join(os.path.dirname(path), f".session.{os.getpid()}")
     try:
         # 0640: the directory is setgid root, so the supervisor reads it
@@ -301,10 +347,28 @@ def main():
     g = Graph()
     s = Session(args.machine, c)
     report = f"/run/speakerguardd/{os.getuid()}/helper/session"
+
+    def stop(*_):
+        # a stopped helper leaves no report behind
+        try:
+            os.unlink(report)
+        except OSError:
+            pass
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
     last = (None, None, None, None)
+    was_granted = None
     nxt = time.monotonic()
     while True:
-        g.pump(max(0.0, nxt - time.monotonic()))
+        ready = g.pump(max(0.0, nxt - time.monotonic()), [card.fd] if card.events else [])
+        if ready and card.drain():
+            # a grant or a withdrawal: link or unlink now
+            granted = card.granted()
+            if granted != was_granted:
+                s.reconcile(g, granted)
+                was_granted = granted
         if time.monotonic() < nxt:
             continue
         nxt += PERIOD
@@ -314,6 +378,7 @@ def main():
         links, carrier = s.check(g)
         wrote = write_report(report, links, carrier)
         s.reconcile(g, granted)
+        was_granted = granted
         state = (granted, links, carrier, wrote)
         if state != last:
             log(f"granted={int(granted)} links={int(links)} carrier={int(carrier)} report={'ok' if wrote else 'unwritable'}")

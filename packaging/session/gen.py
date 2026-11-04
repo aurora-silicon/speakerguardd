@@ -52,12 +52,50 @@ def aux(n, base=0):
     return "[ " + " ".join(f"AUX{base + i}" for i in range(n)) + " ]"
 
 
+def channel_map(m, c):
+    """The protect stage's ports, in the card's physical channel order.
+
+    The voicing output, the amps and the sense PCM run in the card's
+    physical (ALSA) order. The unit takes its program in the tuning's own
+    channel order (the graph's input lanes) and its sense bus as
+    [V0, I0, V1, I1, ...] in that same order. machines.json states, per
+    machine:
+
+    - unit_channels: the unit channel of each physical speaker channel
+      (default: the same order);
+    - sense_pairs: the order of each amp's two channels on the sense PCM,
+      "vi" (default) or "iv" (the MCA Macs, whose amps put ISNS in the
+      slot below VSNS). The sense PCM carries the amps in the physical
+      speaker order.
+
+    Returns the unit channel of each physical channel, and the unit's sense
+    port for each sense PCM channel.
+    """
+    amps, sense = c["amps"], c["sense"]
+    unit = c.get("unit_channels", list(range(amps)))
+    if sorted(unit) != list(range(amps)):
+        raise SystemExit(f"{m}: unit_channels {unit} is not a permutation of {amps} channels")
+    pairs = c.get("sense_pairs", "vi")
+    if pairs not in ("vi", "iv"):
+        raise SystemExit(f"{m}: sense_pairs {pairs!r} is neither 'vi' nor 'iv'")
+    if sense not in (0, 2 * amps):
+        raise SystemExit(f"{m}: {sense} sense channels for {amps} amps")
+    ports = []
+    for k in range(sense):
+        is_v = (k % 2 == 0) == (pairs == "vi")
+        ports.append(2 * unit[k // 2] + (0 if is_v else 1))
+    return unit, ports
+
+
 def pipewire_conf(m, c):
     n = names(m)
     amps, sense = c["amps"], c["sense"]
     uri = f"https://aurora-silicon.org/lv2/sgv2#{c['plugin']}"
-    inputs = [f'"sgv2:in_{i}"' for i in range(amps)] + [f'"sgv2:sense_{i}"' for i in range(sense)]
-    outputs = [f'"sgv2:out_{i}"' for i in range(amps)]
+    # filter-chain feeds capture channel i to inputs[i] and playback channel
+    # j from outputs[j]: the lists put each physical channel on its unit port.
+    unit, sense_ports = channel_map(m, c)
+    inputs = [f'"sgv2:in_{unit[p]}"' for p in range(amps)] + [f'"sgv2:sense_{s}"' for s in sense_ports]
+    outputs = [f'"sgv2:out_{unit[p]}"' for p in range(amps)]
     sense_obj = ""
     # A sense PCM whose pointer advances in small chunks (the AOP sense ring:
     # 120 frames) is not period-batched: PipeWire's batch handling would
