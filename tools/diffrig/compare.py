@@ -251,6 +251,11 @@ def compare(ref, got):
         unit_skip = UNIT_NOT_COMPARED.get(r.get("unit"), {})
         for name in sorted(rg):
             rv = rg[name]
+            if rfs:
+                # as for the part meters: in the fail-safe the published
+                # meters keep their model values; only the audio shows it
+                skip("global." + name, "reference slice is in the fail-safe; only audio_gain is compared there")
+                continue
             if "global." + name in unit_skip:
                 skip("global." + name, unit_skip["global." + name])
                 continue
