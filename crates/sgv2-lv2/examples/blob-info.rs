@@ -27,8 +27,10 @@ fn main() {
         );
         for (i, c) in p.ch[..p.channels as usize].iter().enumerate() {
             println!(
-                "ch{i}: src={} grp={} ign={} Tlim={} reb={} rsh={} ag={} imon={} vmon={} ipt={} vpt={} sI={} sV={} \
+                "ch{i}: win={}s tau={}s src={} grp={} ign={} Tlim={} reb={} rsh={} ag={} imon={} vmon={} ipt={} vpt={} sI={} sV={} \
                  clfb={} pilot={} reb_rng={}..{} cal_rng={}..{} a20={} a35={} cal={} R={} T={}",
+                c.temp_sense_window_time_s,
+                c.temp_sense_smoothing_tau_s,
                 c.source,
                 c.group,
                 c.ignore_telemetry,

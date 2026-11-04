@@ -4,7 +4,11 @@
 //! The kernel contract (macaudio, "Speaker Protection"):
 //!
 //! - The owner is the control file that holds `SNDRV_CTL_IOCTL_ELEM_LOCK` on
-//!   the card's "Speaker Protection" control. Only one file can hold it.
+//!   the card's "Speaker Protection" control. Only one file can hold it, and
+//!   taking the lock or writing the control needs CAP_SYS_ADMIN (else
+//!   `EPERM`).
+//! - The first write after a system resume, like the one after a lapse,
+//!   fails with `ETIMEDOUT` and grants nothing.
 //! - Writing a lease length in milliseconds ([`LEASE_MIN_MS`] to
 //!   [`LEASE_MAX_MS`]) grants protection for that long: the kernel puts every
 //!   speaker amp at its fixed operating gain and lets speaker playback start.
@@ -374,6 +378,8 @@ mod alsa {
                     EBUSY => KernelError::Busy,
                     // The card has no "Speaker Protection": not a v2 kernel
                     ENOENT => KernelError::NotV2,
+                    // sgv2k2: the lock needs CAP_SYS_ADMIN
+                    EPERM => KernelError::Control("lock: EPERM (CAP_SYS_ADMIN is required)".into()),
                     e => KernelError::Control(format!("lock: errno {e}")),
                 });
             }

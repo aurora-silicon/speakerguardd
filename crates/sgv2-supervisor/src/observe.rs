@@ -6,6 +6,14 @@
 //! not advancing, a PCM whose owner is unknown, or a missing, stale or
 //! future-dated session report is a fault, and the lease is not renewed.
 //!
+//! A session report counts only while the helper that wrote it is alive
+//! (its pid and start time, checked against /proc), and only if it was
+//! written after the current engine generation began (the engine page's
+//! process changed, the page became valid, or its sequence restarted). A
+//! stopped helper's last report, or one from before a PipeWire restart,
+//! never grants (lane B6 on the M1 Pro: one 10 ms grant on a stopped
+//! helper's report across a PipeWire restart).
+//!
 //! # Proof that the engine runs
 //!
 //! The heartbeat must be fresh in every PCM state, Closed included: the
@@ -24,19 +32,32 @@
 //!    the supervisor grants.
 //! 4. The session helper sees the grant and links the amps; the amps' sink
 //!    opens and prepares the PCM and starts it (the kernel admits the start
-//!    because the grant is live), and the driver moves to the sink.
-//!    - While the PCM is OPEN, SETUP or PREPARED within [`START_GRACE_NS`]
-//!      of the first tick that saw it open, the supervisor holds: it
-//!      neither renews nor releases ([`Observation::pcm_settling`]). The
-//!      30 ms lease covers that; a start slower than the lease lapses, and
-//!      the grant comes back through two clean ticks.
-//!    - The heartbeat may pause across the driver switch: the same window
-//!      adds [`START_GRACE_NS`] to its bound, once per start.
-//! 5. From then on only RUNNING renews. XRUN, PAUSED, SUSPENDED or a
-//!    PREPARED state outside the start window releases at once, as does any
-//!    other fault. The kernel stops the stream, the helper unlinks the amps,
-//!    the protect stage falls back to the dummy driver and beats again, the
-//!    PCM closes, and the sequence resumes at 3.
+//!    because the grant is live), and the driver moves from the dummy driver
+//!    to the sink. The graph reactivates across that switch (the page's
+//!    frame count restarts) and the heartbeat pauses: lane B2 measured up to
+//!    63 ms on the J616s.
+//! 5. From then on the grant is renewed while the engine beats and the PCM
+//!    is Closed, Open (OPEN, SETUP, PREPARED) or RUNNING, owned by the
+//!    engine's process. XRUN, PAUSED, SUSPENDED or an unknown state releases
+//!    at once, as does any other fault. The kernel stops the stream, the
+//!    helper unlinks the amps, the protect stage falls back to the dummy
+//!    driver and beats again; the sink keeps the PCM PREPARED and retries its
+//!    start, and the sequence resumes at 3 from there.
+//!
+//! The heartbeat bound is two quanta plus a tick, plus [`START_GRACE_NS`]
+//! where the driver switch happens and nothing can play:
+//! - Closed: strict. Anyone could open and start the PCM while it is granted.
+//! - Open, owned by the engine's process: + grace. The PCM is not running,
+//!   only that process holds it and can start it, and it can do so only by
+//!   running the graph, which beats.
+//! - RUNNING: + grace for [`START_GRACE_NS`] after it is first seen running,
+//!   strict from then on.
+//! - For [`GRANT_GRACE_WINDOW_NS`] after each grant, in any of those states,
+//!   the grace is [`GRANT_GRACE_NS`]. Each grant is followed by the helper's
+//!   re-link and the driver switch, and lane B2 saw the heartbeat pause there
+//!   more than once in the first 200 ms after a re-grant. The PCM state
+//!   checks (XRUN, owner) are never relaxed, and they are what floors a
+//!   stopped or killed engine (B2: 19.6-31.0 ms).
 //!
 //! A dead or stopped engine therefore releases within one staleness bound,
 //! or sooner when the PCM XRUNs, and nothing renews without it.
@@ -54,6 +75,19 @@ pub struct EngineState {
     pub frames: u64,
     pub mono_ns: u64,
     pub health: u32,
+    /// The most restrictive gain of the active channels in the last record,
+    /// as f32 bits. NaN when an active channel's gain is non-finite (a model
+    /// the unit no longer trusts, v2-B/engine afcd163): a fault, never "no
+    /// attenuation".
+    pub min_gain_bits: u32,
+}
+
+impl EngineState {
+    /// Whether the published gain is a gain: finite and not negative.
+    pub fn gain_ok(&self) -> bool {
+        let g = f32::from_bits(self.min_gain_bits);
+        g.is_finite() && g >= 0.0
+    }
 }
 
 pub trait EngineView {
@@ -128,6 +162,12 @@ pub struct SessionReport {
     pub links_ok: bool,
     pub carrier_ok: bool,
     pub mono_ns: u64,
+    /// The writer, as the report names it: pid and start time (clock ticks
+    /// since boot, `/proc/<pid>/stat` field 22).
+    pub helper: Option<(u32, u64)>,
+    /// Set by the view: that process is alive, is the one that started at
+    /// that time, and is the session user's.
+    pub helper_alive: bool,
 }
 
 pub trait SessionView {
@@ -143,10 +183,16 @@ pub const SESSION_STALE_NS: u64 = 100_000_000;
 /// the supervisor read the same CLOCK_MONOTONIC and the supervisor reads its
 /// clock after the file, so a report is never ahead: 1 ms is slack only.
 pub const SESSION_SKEW_NS: u64 = 1_000_000;
-/// Extra heartbeat age tolerated once, from the tick a speaker PCM start is
-/// first seen (Closed to Open or Running), while PipeWire moves the protect
-/// stage from the dummy driver to the amps' sink. Steady state has none.
+/// Extra heartbeat age tolerated while PipeWire moves the protect stage from
+/// the dummy driver to the amps' sink: while the PCM is open but not
+/// running, and for this long after it starts running. Steady state (RUNNING
+/// after that, or Closed) has none.
 pub const START_GRACE_NS: u64 = 50_000_000;
+/// How long after a grant [`GRANT_GRACE_NS`] applies.
+pub const GRANT_GRACE_WINDOW_NS: u64 = 250_000_000;
+/// Extra heartbeat age tolerated just after a grant (not added to
+/// [`START_GRACE_NS`]: the larger of the two applies).
+pub const GRANT_GRACE_NS: u64 = 100_000_000;
 
 /// Freshness bound while the engine runs: two unit quanta (the
 /// architecture's "at most 2 quanta stale") plus one supervisor tick.
@@ -159,13 +205,19 @@ pub struct Observer {
     pub rate: u32,
     pub tick_ns: u64,
     last_seq: Option<u64>,
+    last_seq_before: Option<u64>,
+    /// The engine's process and validity, to see a new generation.
+    engine_pid: Option<(u32, bool)>,
+    /// When the current engine generation was first seen.
+    generation_ns: Option<u64>,
     last_frames: u64,
     /// When the sequence was last seen to advance.
     last_advance_ns: Option<u64>,
     /// The graph quantum, from frames over beats between two advances.
     quantum: Option<u64>,
-    pcm_was_closed: bool,
+    was_running: bool,
     grace_until: Option<u64>,
+    granted_at: Option<u64>,
 }
 
 impl Observer {
@@ -175,12 +227,22 @@ impl Observer {
             rate,
             tick_ns,
             last_seq: None,
+            last_seq_before: None,
+            engine_pid: None,
+            generation_ns: None,
             last_frames: 0,
             last_advance_ns: None,
             quantum: None,
-            pcm_was_closed: true,
+            was_running: false,
             grace_until: None,
+            granted_at: None,
         }
+    }
+
+    /// The supervisor granted at `now_ns`: the re-link and driver switch
+    /// that follow get [`GRANT_GRACE_NS`].
+    pub fn note_grant(&mut self, now_ns: u64) {
+        self.granted_at = Some(now_ns);
     }
 
     /// The current heartbeat staleness bound, once the quantum is known.
@@ -204,12 +266,18 @@ impl Observer {
         let plugin_ok = e.valid
             && e.params_crc == self.expected_params_crc
             && e.health & sgv2_core::Health::FAILSAFE == 0
-            && e.health & sgv2_core::Health::NO_PARAMS == 0;
+            && e.health & sgv2_core::Health::NO_PARAMS == 0
+            && e.gain_ok();
 
+        self.last_seq_before = self.last_seq;
         match self.last_seq {
             Some(l) if e.seq > l => {
                 let beats = e.seq - l;
-                self.quantum = e.frames.checked_sub(self.last_frames).filter(|f| *f > 0).map(|f| f / beats);
+                // a reactivated graph restarts the frame count: keep the
+                // quantum learnt so far and learn again from the next beat
+                if let Some(q) = e.frames.checked_sub(self.last_frames).filter(|f| *f > 0).map(|f| f / beats) {
+                    self.quantum = Some(q);
+                }
                 self.last_advance_ns = Some(now_ns);
             }
             Some(l) if e.seq < l => {
@@ -223,18 +291,27 @@ impl Observer {
         self.last_frames = e.frames;
 
         let closed = matches!(p, PcmState::Closed);
-        if self.pcm_was_closed && matches!(p, PcmState::Open { .. } | PcmState::Running { .. }) {
+        let running = matches!(p, PcmState::Running { .. });
+        if running && !self.was_running {
             self.grace_until = Some(now_ns + START_GRACE_NS);
         }
-        self.pcm_was_closed = closed;
-        let in_start = match self.grace_until {
-            Some(t) if now_ns < t && matches!(p, PcmState::Open { .. } | PcmState::Running { .. }) => true,
+        if !running {
+            self.grace_until = None;
+        }
+        self.was_running = running;
+        let start_grace = match p {
+            PcmState::Open { .. } => START_GRACE_NS,
+            PcmState::Running { .. } if self.grace_until.is_some_and(|t| now_ns < t) => START_GRACE_NS,
+            _ => 0,
+        };
+        let grant_grace = match self.granted_at {
+            Some(t) if now_ns.saturating_sub(t) < GRANT_GRACE_WINDOW_NS => GRANT_GRACE_NS,
             _ => {
-                self.grace_until = None;
-                false
+                self.granted_at = None;
+                0
             }
         };
-        let grace = if in_start { START_GRACE_NS } else { 0 };
+        let grace = start_grace.max(grant_grace);
 
         let heartbeat_fresh = match self.quantum.filter(|q| (1..=MAX_QUANTUM).contains(q)) {
             Some(q) => {
@@ -250,12 +327,21 @@ impl Observer {
             Some(owner) => owner == e.pid && e.pid != 0,
             None => closed,
         };
-        let (pcm_state_ok, pcm_settling) = match p {
-            PcmState::Closed | PcmState::Running { .. } => (true, false),
-            PcmState::Open { .. } => (in_start, in_start),
-            PcmState::Stopped { .. } | PcmState::Unknown => (false, false),
-        };
+        let pcm_state_ok = matches!(p, PcmState::Closed | PcmState::Open { .. } | PcmState::Running { .. });
+        // A new engine generation: another process, a page that became
+        // valid, or a sequence that restarted.
+        let restarted = self.last_seq_before.is_some_and(|l| e.seq < l);
+        if self.engine_pid != Some((e.pid, e.valid)) || restarted || self.generation_ns.is_none() {
+            if self.engine_pid != Some((e.pid, e.valid)) || restarted {
+                self.generation_ns = Some(now_ns);
+            }
+            self.generation_ns.get_or_insert(now_ns);
+            self.engine_pid = Some((e.pid, e.valid));
+        }
+        let generation = self.generation_ns.unwrap_or(now_ns);
         let session_fresh = s.present
+            && s.helper_alive
+            && s.mono_ns >= generation
             && s.mono_ns <= now_ns.saturating_add(SESSION_SKEW_NS)
             && now_ns.saturating_sub(s.mono_ns) <= SESSION_STALE_NS;
         Observation {
@@ -265,7 +351,6 @@ impl Observer {
             carrier_ok: session_fresh && s.carrier_ok,
             pcm_owner_ok,
             pcm_state_ok,
-            pcm_settling,
             // the supervisor fills these from the kernel
             route_ok: false,
             amps_ok: false,
@@ -397,19 +482,27 @@ pub fn speaker_pcm_problem(info: &PcmInfo, card: u32, device: u32) -> Option<Str
     None
 }
 
-/// Parse the helper's report, `links=<0|1> carrier=<0|1> mono_ns=<t>\n`.
-/// Anything else, including a report without its final newline, is absent.
+/// Parse the helper's report,
+/// `links=<0|1> carrier=<0|1> mono_ns=<t> pid=<pid> start=<ticks>\n`.
+/// Anything else, including a report without its final newline or without
+/// its writer, is absent.
+///
+/// The view then sets `helper_alive` with [`helper_is`].
 pub fn parse_session(text: &str) -> SessionReport {
     let Some(body) = text.strip_suffix('\n') else { return SessionReport::default() };
     let mut links = None;
     let mut carrier = None;
     let mut mono = None;
+    let mut pid = None;
+    let mut start = None;
     for w in body.split_whitespace() {
         let Some((k, v)) = w.split_once('=') else { return SessionReport::default() };
         let slot = match k {
             "links" => &mut links,
             "carrier" => &mut carrier,
             "mono_ns" => &mut mono,
+            "pid" => &mut pid,
+            "start" => &mut start,
             _ => continue,
         };
         if slot.is_some() {
@@ -418,10 +511,41 @@ pub fn parse_session(text: &str) -> SessionReport {
         *slot = Some(v.parse::<u64>().ok());
     }
     match (links.flatten(), carrier.flatten(), mono.flatten()) {
-        (Some(l @ 0..=1), Some(c @ 0..=1), Some(m)) if m > 0 => {
-            SessionReport { present: true, links_ok: l == 1, carrier_ok: c == 1, mono_ns: m }
-        }
+        (Some(l @ 0..=1), Some(c @ 0..=1), Some(m)) if m > 0 => match (pid.flatten(), start.flatten()) {
+            (Some(p), Some(st)) if p > 0 && p <= u64::from(u32::MAX) => SessionReport {
+                present: true,
+                links_ok: l == 1,
+                carrier_ok: c == 1,
+                mono_ns: m,
+                helper: Some((p as u32, st)),
+                helper_alive: false,
+            },
+            _ => SessionReport::default(),
+        },
         _ => SessionReport::default(),
+    }
+}
+
+/// The start time (clock ticks since boot) in `/proc/<pid>/stat`: field 22,
+/// counted after the command name's closing parenthesis (the name may hold
+/// spaces and parentheses).
+pub fn parse_stat_start(stat: &str) -> Option<u64> {
+    let rest = &stat[stat.rfind(')')? + 1..];
+    // rest starts at field 3 (state)
+    let mut f = rest.split_whitespace();
+    let state = f.next()?;
+    if state == "Z" || state == "X" {
+        return None;
+    }
+    f.nth(18)?.parse().ok()
+}
+
+/// Whether the report's writer is alive: `stat` is `/proc/<pid>/stat` (if
+/// readable), `owner` that directory's uid, and `uid` the session user.
+pub fn helper_is(report: &SessionReport, stat: Option<&str>, owner: Option<u32>, uid: u32) -> bool {
+    match (report.helper, stat, owner) {
+        (Some((_, start)), Some(st), Some(o)) => o == uid && parse_stat_start(st) == Some(start),
+        _ => false,
     }
 }
 
@@ -452,11 +576,27 @@ mod tests {
     const PID: u32 = 4242;
 
     fn session(at: u64) -> SessionReport {
-        SessionReport { present: true, links_ok: true, carrier_ok: true, mono_ns: at }
+        SessionReport {
+            present: true,
+            links_ok: true,
+            carrier_ok: true,
+            mono_ns: at,
+            helper: Some((77, 1234)),
+            helper_alive: true,
+        }
     }
 
     fn beat(seq: u64, quantum: u64, mono_ns: u64) -> EngineState {
-        EngineState { valid: true, pid: PID, params_crc: 7, seq, frames: seq * quantum, mono_ns, health: 0 }
+        EngineState {
+            valid: true,
+            pid: PID,
+            params_crc: 7,
+            seq,
+            frames: seq * quantum,
+            mono_ns,
+            health: 0,
+            min_gain_bits: 1.0f32.to_bits(),
+        }
     }
 
     /// A healthy engine beating once per `quantum` frames at 48 kHz from
@@ -647,6 +787,8 @@ mod tests {
     fn session_reports_must_be_fresh_and_never_from_the_future() {
         let mut o = Observer::new(7, 48_000, TICK);
         let now = 10_000_000_000u64;
+        // the engine generation began well before these reports
+        o.observe(&mut || 1, &mut E(EngineState::default()), &mut P(PcmState::Closed), &mut S(session(1)));
         let mut at = |r: SessionReport| {
             o.observe(&mut || now, &mut E(EngineState::default()), &mut P(PcmState::Closed), &mut S(r)).links_ok
         };
@@ -663,23 +805,141 @@ mod tests {
 
     #[test]
     fn session_parsing_rejects_partial_and_mixed_reports() {
-        let r = parse_session("links=1 carrier=1 mono_ns=123\n");
-        assert_eq!(r, SessionReport { present: true, links_ok: true, carrier_ok: true, mono_ns: 123 });
-        let r = parse_session("links=0 carrier=1 mono_ns=123\n");
+        let w = " pid=77 start=1234";
+        let r = parse_session(&format!("links=1 carrier=1 mono_ns=123{w}\n"));
+        assert_eq!(
+            r,
+            SessionReport {
+                present: true,
+                links_ok: true,
+                carrier_ok: true,
+                mono_ns: 123,
+                helper: Some((77, 1234)),
+                helper_alive: false
+            }
+        );
+        let r = parse_session(&format!("links=0 carrier=1 mono_ns=123{w}\n"));
         assert!(r.present && !r.links_ok);
         for bad in [
-            "",
-            "links=1 carrier=1 mono_ns=123",
-            "links=1 carrier=1 mono_ns=\n",
-            "links=1 carrier=1\n",
-            "links=1 carrier=1 mono_ns=12 mono_ns=13\n",
-            "links=2 carrier=1 mono_ns=12\n",
-            "links=1 carrier=1 mono_ns=0\n",
-            "links=1 carrier=1 mono_ns=12 junk\n",
-            "links=1 carrier=1 mono_ns=12\nlinks=1 carrier=1 mono_ns=13\n",
+            String::new(),
+            format!("links=1 carrier=1 mono_ns=123{w}"),
+            format!("links=1 carrier=1 mono_ns={w}\n"),
+            format!("links=1 carrier=1{w}\n"),
+            format!("links=1 carrier=1 mono_ns=12 mono_ns=13{w}\n"),
+            format!("links=2 carrier=1 mono_ns=12{w}\n"),
+            format!("links=1 carrier=1 mono_ns=0{w}\n"),
+            format!("links=1 carrier=1 mono_ns=12 junk{w}\n"),
+            format!("links=1 carrier=1 mono_ns=12{w}\nlinks=1 carrier=1 mono_ns=13{w}\n"),
+            // no writer: an older helper's report
+            "links=1 carrier=1 mono_ns=12\n".to_string(),
+            "links=1 carrier=1 mono_ns=12 pid=77\n".to_string(),
+            "links=1 carrier=1 mono_ns=12 pid=0 start=5\n".to_string(),
         ] {
-            assert!(!parse_session(bad).present, "{bad:?}");
+            assert!(!parse_session(&bad).present, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn the_helper_must_be_the_live_process_that_wrote_the_report() {
+        let r = parse_session("links=1 carrier=1 mono_ns=12 pid=4321 start=98765\n");
+        // /proc/<pid>/stat: the name may hold spaces and parentheses
+        let stat = |state: &str, start: u64| {
+            let mut f = vec![state.to_string()];
+            f.extend((4..=21).map(|n| n.to_string()));
+            f.push(start.to_string());
+            f.extend(["1000", "2000"].map(String::from));
+            format!("4321 (python3 -I (sgs)) {}\n", f.join(" "))
+        };
+        assert_eq!(parse_stat_start(&stat("S", 98765)), Some(98765));
+        assert!(helper_is(&r, Some(&stat("S", 98765)), Some(1000), 1000));
+        // another process now holds the pid (it started later)
+        assert!(!helper_is(&r, Some(&stat("S", 99999)), Some(1000), 1000));
+        // a zombie or a dead pid
+        assert!(!helper_is(&r, Some(&stat("Z", 98765)), Some(1000), 1000));
+        assert!(!helper_is(&r, None, None, 1000));
+        // another user's process
+        assert!(!helper_is(&r, Some(&stat("S", 98765)), Some(1001), 1000));
+        assert!(!helper_is(&SessionReport::default(), Some(&stat("S", 98765)), Some(1000), 1000));
+    }
+
+    /// Lane B6 on the M1 Pro: the helper is stopped, PipeWire restarts, and
+    /// the supervisor granted once (10 ms) on the stopped helper's last
+    /// report. Neither the dead helper's report nor one written before the
+    /// new engine generation may count.
+    #[test]
+    fn a_stopped_helpers_report_never_grants_across_a_pipewire_restart() {
+        use crate::kernel::Recorder;
+        use crate::supervise::{Event, Expect, Supervisor};
+        let q = 10_666_666u64;
+        let mut o = Observer::new(7, 48_000, TICK);
+        let mut k = Recorder::healthy(6);
+        let mut sup =
+            Supervisor::new(Expect::new(crate::machine::lookup("j316s").unwrap(), vec![11_890; 6], "Secondary"));
+        let tick = |o: &mut Observer,
+                    sup: &mut Supervisor,
+                    k: &mut Recorder,
+                    now: u64,
+                    pid: u32,
+                    seq: u64,
+                    r: SessionReport| {
+            let e = EngineState { pid, ..beat(seq, 512, now - 1_000) };
+            let obs = o.observe(&mut || now, &mut E(e), &mut P(PcmState::Closed), &mut S(r));
+            sup.tick(obs, k).unwrap()
+        };
+        // granted on engine A with a live helper
+        let mut seq = 0;
+        let mut now = 0;
+        let mut granted = false;
+        for _ in 0..10 {
+            seq += 1;
+            now += q;
+            granted |= tick(&mut o, &mut sup, &mut k, now, PID, seq, session(now - 1)) == Event::Granted;
+        }
+        assert!(granted && k.held);
+        // the helper is stopped: its last report stays on disk, fresh by
+        // its stamp, but its process is gone
+        let last = SessionReport { helper_alive: false, ..session(now) };
+        seq += 1;
+        now += q;
+        assert!(matches!(tick(&mut o, &mut sup, &mut k, now, PID, seq, last), Event::Released { .. }));
+        // PipeWire restarts: engine B (another pid) beats within the old
+        // report's 100 ms; whether or not the dead helper's pid passes the
+        // liveness check (pid reuse), nothing grants
+        let restart = now + 5_000_000;
+        let stale_but_alive = SessionReport { helper_alive: true, ..session(now) };
+        for (n, r) in [last, stale_but_alive].into_iter().enumerate() {
+            let mut o = Observer::new(7, 48_000, TICK);
+            let mut t = restart;
+            let mut s2 = 0;
+            for _ in 0..8 {
+                s2 += 1;
+                t += q;
+                if t - now > SESSION_STALE_NS {
+                    break;
+                }
+                let ev = tick(&mut o, &mut sup, &mut k, t, PID + 1, s2, r);
+                assert_ne!(ev, Event::Granted, "case {n} at +{} ms", (t - now) / 1_000_000);
+                assert!(!k.held);
+            }
+        }
+        // a new helper writes after engine B started: grants again
+        let mut t = restart + 10 * q;
+        let mut s2 = 100;
+        let mut granted = false;
+        for _ in 0..4 {
+            s2 += 1;
+            t += q;
+            granted |= tick(
+                &mut o,
+                &mut sup,
+                &mut k,
+                t,
+                PID + 1,
+                s2,
+                SessionReport { helper: Some((88, 5)), ..session(t - 1) },
+            ) == Event::Granted;
+        }
+        assert!(granted);
     }
 
     #[test]
@@ -751,42 +1011,106 @@ mod tests {
         assert_eq!(parse_pcm_info("card: 1\n"), None);
     }
 
+    /// Lane B2's J616s cold start (f9d2b08, r3): the protect stage beats at
+    /// 1024 on the dummy driver; after the grant the sink opens and prepares
+    /// the PCM, the heartbeat pauses 63 ms across the driver switch, the
+    /// graph reactivates (frames restart at 768), and it runs at 512.
     #[test]
-    fn any_stopped_state_is_never_renewed_and_prepared_only_settles_at_a_start() {
+    fn the_j616s_cold_start_stays_fresh_and_a_prepared_pcm_can_be_granted() {
+        let q1024 = 21_333_333u64;
+        let q512 = 10_666_666u64;
         let mut o = Observer::new(7, 48_000, TICK);
-        let period = 10_666_666u64;
-        let mut seq = 0;
-        let mut at = |o: &mut Observer, now: u64, pcm: PcmState| {
-            seq = now / period;
-            o.observe(&mut || now, &mut E(beat(seq, 512, seq * period)), &mut P(pcm), &mut S(session(now)))
+        let obs_at = |o: &mut Observer, now: u64, seq: u64, frames: u64, mono: u64, pcm: PcmState| {
+            let e = EngineState { frames, ..beat(seq, 0, mono) };
+            o.observe(&mut || now, &mut E(e), &mut P(pcm), &mut S(session(now)))
         };
-        for k in 0..5 {
-            at(&mut o, k * TICK, PcmState::Closed);
+        let ok = |obs: Observation| obs.heartbeat_fresh && obs.pcm_state_ok && obs.pcm_owner_ok;
+        // idle on the dummy driver, 1024 frames a beat
+        let (mut seq, mut frames, mut mono) = (0u64, 0u64, 0u64);
+        for k in 0..20u64 {
+            let now = k * TICK;
+            let beats = now / q1024;
+            if beats > seq {
+                frames += (beats - seq) * 1024;
+                seq = beats;
+                mono = beats * q1024;
+            }
+            let obs = obs_at(&mut o, now, seq, frames, mono, PcmState::Closed);
+            assert!(ok(obs) || k < 3, "idle tick {k}");
         }
-        // the sink opens and prepares: hold, neither renew nor release
-        let obs = at(&mut o, 50_000_000, PcmState::Open { owner: PID });
-        assert!(obs.pcm_state_ok && obs.pcm_settling);
-        let obs = at(&mut o, 60_000_000, PcmState::Running { owner: PID });
-        assert!(obs.pcm_state_ok && !obs.pcm_settling && obs.heartbeat_fresh);
-        // an XRUN (the engine stopped feeding the amps) is a fault at once,
-        // with the heartbeat still fresh
-        let obs = at(&mut o, 70_000_000, PcmState::Stopped { owner: PID });
-        assert!(!obs.pcm_state_ok && obs.heartbeat_fresh);
-        // re-prepared after an XRUN, outside a start from Closed: a fault
-        let obs = at(&mut o, 80_000_000, PcmState::Open { owner: PID });
-        assert!(!obs.pcm_state_ok && !obs.pcm_settling);
-        // a start that never runs stops settling after the window
+        // granted at 200 ms; the sink prepares, and the engine pauses 63 ms
+        // after its last beat
+        let open = PcmState::Open { owner: PID };
+        let pause_end = mono + 63_000_000;
+        let mut now = 200_000_000;
+        while now < pause_end {
+            assert!(ok(obs_at(&mut o, now, seq, frames, mono, open)), "prepared, paused, at {now}");
+            now += TICK;
+        }
+        // the graph reactivates: frames restart at 768, then 512 a beat, and
+        // the sink starts
+        seq += 1;
+        frames = 768;
+        mono = pause_end;
+        assert!(ok(obs_at(&mut o, now, seq, frames, mono, open)), "reactivated");
+        let run = PcmState::Running { owner: PID };
+        for k in 0..30u64 {
+            let t = now + 1_000 + k * q512;
+            seq += 1;
+            frames += 512;
+            mono = t - 1_000;
+            assert!(ok(obs_at(&mut o, t, seq, frames, mono, run)), "running beat {k}");
+            now = t;
+        }
+        assert_eq!(o.bound_ns(), Some(stale_ns(512, 48_000, TICK)));
+        // steady state is strict: a stall past 2 quanta + a tick is stale
+        assert!(
+            !obs_at(&mut o, mono + stale_ns(512, 48_000, TICK) + 1_000_000, seq, frames, mono, run).heartbeat_fresh
+        );
+        // an XRUN is a fault at once, even with a fresh heartbeat
+        seq += 1;
+        frames += 512;
+        mono += q512;
+        let obs = obs_at(&mut o, mono + 1_000, seq, frames, mono, PcmState::Stopped { owner: PID });
+        assert!(obs.heartbeat_fresh && !obs.pcm_state_ok);
+        // after the release the sink re-prepares and retries; the engine
+        // beats again on the dummy driver: a prepared PCM owned by the engine
+        // can be granted again (B2 r3 waited 5.2 s for a close)
+        let t0 = mono;
+        for k in 1..6u64 {
+            seq += 1;
+            frames += 1024;
+            mono = t0 + k * q1024;
+            assert!(ok(obs_at(&mut o, mono + 1_000, seq, frames, mono, open)), "re-prepared {k}");
+        }
+        // but not owned by anyone else, and not with a dead engine
+        assert!(!obs_at(&mut o, mono + 2_000, seq, frames, mono, PcmState::Open { owner: 1 }).pcm_owner_ok);
+        let bound = stale_ns(1024, 48_000, TICK) + START_GRACE_NS;
+        assert!(!obs_at(&mut o, mono + bound + 1_000_000, seq, frames, mono, open).heartbeat_fresh);
+    }
+
+    #[test]
+    fn closed_is_strict_and_unknown_or_stopped_is_never_ok() {
         let mut o = Observer::new(7, 48_000, TICK);
-        for k in 0..5 {
-            at(&mut o, k * TICK, PcmState::Closed);
+        let q = 10_666_666u64;
+        for k in 0..5u64 {
+            let seq = k * TICK / q;
+            o.observe(
+                &mut || k * TICK,
+                &mut E(beat(seq, 512, seq * q)),
+                &mut P(PcmState::Closed),
+                &mut S(session(k * TICK)),
+            );
         }
-        let open_at = 50_000_000;
-        assert!(at(&mut o, open_at, PcmState::Open { owner: PID }).pcm_settling);
-        assert!(at(&mut o, open_at + START_GRACE_NS - TICK, PcmState::Open { owner: PID }).pcm_settling);
-        let obs = at(&mut o, open_at + START_GRACE_NS, PcmState::Open { owner: PID });
-        assert!(!obs.pcm_state_ok && !obs.pcm_settling);
-        // unknown (unreadable, or a read that did not complete in time)
-        assert!(!at(&mut o, open_at + START_GRACE_NS + TICK, PcmState::Unknown).pcm_state_ok);
+        let seq = 40_000_000 / q;
+        let last = seq * q;
+        let strict = stale_ns(512, 48_000, TICK);
+        let at = |o: &mut Observer, now: u64, pcm: PcmState| {
+            o.observe(&mut || now, &mut E(beat(seq, 512, last)), &mut P(pcm), &mut S(session(now)))
+        };
+        assert!(!at(&mut o, last + strict + 1_000_000, PcmState::Closed).heartbeat_fresh);
+        assert!(!at(&mut o, last + 1_000_000, PcmState::Unknown).pcm_state_ok);
+        assert!(!at(&mut o, last + 1_000_000, PcmState::Stopped { owner: PID }).pcm_state_ok);
     }
 
     #[test]
@@ -819,5 +1143,104 @@ mod tests {
             }
         }
         assert!(fresh_after <= last * period + stale_ns(512, 48_000, TICK));
+    }
+
+    #[test]
+    fn a_regrant_tolerates_the_relink_pauses_and_then_is_strict() {
+        // B2 0d7ee6c: after a re-grant the heartbeat paused twice in the
+        // first 200 ms (the re-link and the driver switch)
+        let q = 10_666_666u64;
+        let mut o = Observer::new(7, 48_000, TICK);
+        let open = PcmState::Open { owner: PID };
+        let run = PcmState::Running { owner: PID };
+        let mut seq = 0u64;
+        let mut mono = 0u64;
+        let mut at = |o: &mut Observer, now: u64, beat_now: bool, pcm: PcmState| {
+            if beat_now {
+                seq += 1;
+                mono = now - 1_000;
+            }
+            o.observe(&mut || now, &mut E(beat(seq, 512, mono)), &mut P(pcm), &mut S(session(now)))
+        };
+        for k in 1..10u64 {
+            at(&mut o, k * q, true, open);
+        }
+        let grant = 10 * q;
+        o.note_grant(grant);
+        // a 90 ms pause while prepared, then a 90 ms pause just after it runs
+        let mut now = grant;
+        while now < grant + 90_000_000 {
+            assert!(at(&mut o, now, false, open).heartbeat_fresh, "first pause at {}", now - grant);
+            now += TICK;
+        }
+        at(&mut o, now, true, run);
+        let resume = now;
+        while now < resume + 90_000_000 {
+            assert!(at(&mut o, now, false, run).heartbeat_fresh, "second pause at {}", now - grant);
+            now += TICK;
+        }
+        // after the window: strict again
+        let t = grant + GRANT_GRACE_WINDOW_NS + q;
+        assert!(at(&mut o, t, true, run).heartbeat_fresh);
+        let strict = stale_ns(512, 48_000, TICK);
+        assert!(at(&mut o, t + strict - 1_000_000, false, run).heartbeat_fresh);
+        assert!(!at(&mut o, t + strict + 1_000_000, false, run).heartbeat_fresh);
+        // and the grace never covers an XRUN
+        o.note_grant(t);
+        assert!(!at(&mut o, t + 1_000_000, true, PcmState::Stopped { owner: PID }).pcm_state_ok);
+    }
+
+    #[test]
+    fn a_nan_or_non_finite_gain_is_a_fault_and_releases() {
+        // v2-B/engine afcd163: an active channel whose gain is non-finite is
+        // published as NaN; it must never read as "no attenuation"
+        let mut o = Observer::new(7, 48_000, TICK);
+        let at = |o: &mut Observer, k: u64, g: f32| {
+            let now = k * 10_666_666;
+            let e = EngineState { min_gain_bits: g.to_bits(), ..beat(k, 512, now) };
+            o.observe(&mut || now + 1_000, &mut E(e), &mut P(PcmState::Running { owner: PID }), &mut S(session(now)))
+        };
+        at(&mut o, 1, 1.0);
+        assert!(at(&mut o, 2, 1.0).plugin_ok);
+        assert!(at(&mut o, 3, 0.25).plugin_ok);
+        assert!(at(&mut o, 4, 0.0).plugin_ok);
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.5, f32::from_bits(0x7fc0_0001)] {
+            let obs = at(&mut o, 5, bad);
+            assert!(!obs.plugin_ok && !obs.clean(), "{bad}");
+        }
+        // through the lease: a granted supervisor releases at once
+        use crate::kernel::Recorder;
+        use crate::lease::Observation;
+        use crate::supervise::{Event, Expect, Supervisor};
+        let mut k = Recorder::healthy(6);
+        let mut s =
+            Supervisor::new(Expect::new(crate::machine::lookup("j316s").unwrap(), vec![11_890; 6], "Secondary"));
+        let clean = Observation {
+            heartbeat_fresh: true,
+            plugin_ok: true,
+            links_ok: true,
+            carrier_ok: true,
+            pcm_owner_ok: true,
+            pcm_state_ok: true,
+            route_ok: false,
+            amps_ok: false,
+        };
+        s.tick(clean, &mut k).unwrap();
+        assert_eq!(s.tick(clean, &mut k), Ok(Event::Granted));
+        let nan = at(&mut o, 6, f32::NAN);
+        assert!(matches!(s.tick(nan, &mut k), Ok(Event::Released { .. })));
+        assert!(!k.held);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_start_time_parses_from_a_real_proc_stat() {
+        let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+        let start = parse_stat_start(&stat).unwrap();
+        let r = parse_session(&format!("links=1 carrier=1 mono_ns=1 pid={} start={start}\n", std::process::id()));
+        // SAFETY: getuid has no preconditions.
+        let uid = unsafe { libc::getuid() };
+        assert!(helper_is(&r, Some(&stat), Some(uid), uid));
+        assert!(!helper_is(&r, Some(&stat), Some(uid), uid + 1));
     }
 }

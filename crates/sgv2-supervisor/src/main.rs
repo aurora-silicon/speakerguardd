@@ -22,7 +22,12 @@
 //!   check holds; any fault releases at once. The PCM's `/proc` status can
 //!   block for tens of ms while a stream closes, so a separate thread reads
 //!   it, and the loop only takes that thread's latest snapshot: a snapshot
-//!   older than `PCM_SNAPSHOT_MAX_NS` is no proof.
+//!   older than `PCM_SNAPSHOT_MAX_NS` is no proof. When the reader sees the
+//!   PCM go to XRUN, paused, suspended, unreadable or a new owner, it wakes
+//!   the loop for an extra tick at once (an eventfd), so a stopped engine is
+//!   released within the reader's 1 ms poll instead of at the next 10 ms
+//!   tick (B2 measured 11.7 ms from XRUN to release, 31.0 ms to the floor,
+//!   on 0d7ee6c).
 //! - Exits on losing ownership or any kernel error: closing the control file
 //!   withdraws protection at once.
 //!
@@ -49,10 +54,10 @@ mod linux {
 
     use sgv2_lv2::page::{EnginePage, LAYOUT, MAGIC, PAGE_BYTES};
     use sgv2_supervisor::kernel::{Kernel, KernelError, Macaudio};
-    use sgv2_supervisor::machine::{board_from_compatible, lookup, Machine};
+    use sgv2_supervisor::machine::{blob_full_scales, board_from_compatible, lookup, Machine};
     use sgv2_supervisor::observe::{
-        combine, owner_to_tgid, parse_pcm_info, parse_pcm_status, parse_session, parse_tgid, speaker_pcm_problem,
-        EngineState, EngineView, Observer, PcmInfo, PcmState, PcmView, SessionReport, SessionView,
+        combine, helper_is, owner_to_tgid, parse_pcm_info, parse_pcm_status, parse_session, parse_tgid,
+        speaker_pcm_problem, EngineState, EngineView, Observer, PcmInfo, PcmState, PcmView, SessionReport, SessionView,
     };
     use sgv2_supervisor::supervise::{Event, Expect, Fatal, Supervisor};
 
@@ -60,9 +65,11 @@ mod linux {
     const EX_CONFIG: i32 = 78;
     const EX_UNAVAILABLE: i32 = 69;
     /// The PCM reader's period.
-    const PCM_POLL_NS: u64 = 2_000_000;
+    const PCM_POLL_NS: u64 = 1_000_000;
     /// A PCM snapshot whose read started longer ago than this is Unknown.
     const PCM_SNAPSHOT_MAX_NS: u64 = 12_000_000;
+    /// A helper liveness check older than this vouches for nothing.
+    const HELPER_CHECK_MAX_NS: u64 = 12_000_000;
     /// Waiting for the card: 50 ms doubling to 2 s.
     const BACKOFF_MIN_MS: u64 = 50;
     const BACKOFF_MAX_MS: u64 = 2_000;
@@ -93,6 +100,7 @@ mod linux {
                 frames,
                 mono_ns,
                 health: h.health.load(Ordering::Relaxed),
+                min_gain_bits: h.min_gain_bits.load(Ordering::Relaxed),
             }
         }
     }
@@ -125,12 +133,22 @@ mod linux {
 
     /// The reader thread: every substream's `/proc` status, owners mapped
     /// from thread to process id, folded into one state.
-    fn spawn_pcm_reader(dir: String, subs: u32, out: Arc<PcmSnapshot>) -> std::io::Result<()> {
+    fn spawn_pcm_reader(
+        dir: String,
+        subs: u32,
+        out: Arc<PcmSnapshot>,
+        wake: i32,
+        report: std::ffi::CString,
+        uid: u32,
+        live: Arc<HelperLive>,
+    ) -> std::io::Result<()> {
         std::thread::Builder::new().name("sgv2-pcm".into()).spawn(move || {
+            let mut hbuf = String::with_capacity(1024);
             let paths: Vec<String> = (0..subs).map(|s| format!("{dir}/sub{s}/status")).collect();
             let mut buf = String::with_capacity(1024);
             let mut tbuf = String::with_capacity(2048);
             let mut states = Vec::with_capacity(paths.len());
+            let mut last = PcmState::Closed;
             loop {
                 let started = now_ns();
                 states.clear();
@@ -141,24 +159,122 @@ mod linux {
                     };
                     states.push(owner_to_tgid(st, &mut tgid));
                 }
-                out.state.store(combine(&states).pack(), Ordering::Release);
+                let now = combine(&states);
+                out.state.store(now.pack(), Ordering::Release);
                 out.taken_ns.store(started, Ordering::Release);
+                if wakes(last, now) {
+                    let one: u64 = 1;
+                    // SAFETY: an eventfd we own; an 8-byte counter write.
+                    unsafe { libc::write(wake, (&one as *const u64).cast(), 8) };
+                }
+                last = now;
+                check_helper(&report, uid, &live, &mut hbuf);
                 sleep_until(started + PCM_POLL_NS);
             }
         })?;
         Ok(())
     }
 
+    /// Whether a change from `a` to `b` is worth a tick now: the PCM
+    /// stopped, became unreadable, or changed hands.
+    fn wakes(a: PcmState, b: PcmState) -> bool {
+        let owner = |s: PcmState| match s {
+            PcmState::Open { owner } | PcmState::Stopped { owner } | PcmState::Running { owner } => Some(owner),
+            _ => None,
+        };
+        let bad = |s: PcmState| matches!(s, PcmState::Stopped { .. } | PcmState::Unknown);
+        (bad(b) && !bad(a)) || (owner(b).is_some() && owner(a).is_some() && owner(a) != owner(b))
+    }
+
+    /// Sleep until `deadline` or a wake from the PCM reader. True if woken.
+    fn wait_until(deadline: u64, wake: i32) -> bool {
+        loop {
+            let now = now_ns();
+            if now >= deadline {
+                return false;
+            }
+            let left = deadline - now;
+            let ts = libc::timespec { tv_sec: (left / 1_000_000_000) as i64, tv_nsec: (left % 1_000_000_000) as i64 };
+            let mut pfd = libc::pollfd { fd: wake, events: libc::POLLIN, revents: 0 };
+            // SAFETY: one live pollfd and a valid timeout.
+            let r = unsafe { libc::ppoll(&mut pfd, 1, &ts, core::ptr::null()) };
+            if r > 0 && pfd.revents & libc::POLLIN != 0 {
+                let mut v: u64 = 0;
+                // SAFETY: clearing our eventfd's counter into a live u64.
+                unsafe { libc::read(wake, (&mut v as *mut u64).cast(), 8) };
+                return true;
+            }
+        }
+    }
+
+    /// The reader thread's verdict on the report's writer, under a seqlock:
+    /// that `pid`/`start` was alive, the session user's, when checked.
+    #[derive(Default)]
+    struct HelperLive {
+        seq: AtomicU64,
+        pid: AtomicU64,
+        start: AtomicU64,
+        alive: AtomicU64,
+        checked_ns: AtomicU64,
+    }
+
+    impl HelperLive {
+        fn publish(&self, pid: u32, start: u64, alive: bool, at: u64) {
+            self.seq.fetch_add(1, Ordering::AcqRel);
+            self.pid.store(u64::from(pid), Ordering::Release);
+            self.start.store(start, Ordering::Release);
+            self.alive.store(alive as u64, Ordering::Release);
+            self.checked_ns.store(at, Ordering::Release);
+            self.seq.fetch_add(1, Ordering::AcqRel);
+        }
+
+        /// Whether `helper` was checked alive within `HELPER_CHECK_MAX_NS`.
+        fn vouches(&self, helper: Option<(u32, u64)>, now: u64) -> bool {
+            let Some((pid, start)) = helper else { return false };
+            for _ in 0..3 {
+                let s0 = self.seq.load(Ordering::Acquire);
+                if s0 & 1 == 1 {
+                    continue;
+                }
+                let v = (
+                    self.pid.load(Ordering::Acquire),
+                    self.start.load(Ordering::Acquire),
+                    self.alive.load(Ordering::Acquire),
+                    self.checked_ns.load(Ordering::Acquire),
+                );
+                if self.seq.load(Ordering::Acquire) != s0 {
+                    continue;
+                }
+                return v.0 == u64::from(pid)
+                    && v.1 == start
+                    && v.2 == 1
+                    && now.saturating_sub(v.3) <= HELPER_CHECK_MAX_NS;
+            }
+            false
+        }
+    }
+
+    /// The helper's report and its writer's liveness. The report is read on
+    /// the RT path (a tmpfs file, never blocking); the writer is checked
+    /// against /proc by the reader thread.
+    struct Session(std::ffi::CString, Arc<HelperLive>);
+    impl SessionView for Session {
+        fn read(&mut self) -> SessionReport {
+            let mut r = read_report(&self.0);
+            r.helper_alive = self.1.vouches(r.helper, now_ns());
+            r
+        }
+    }
+
     /// The helper's report: opened without following links and without
     /// blocking, a regular file only, at most 255 bytes, read into a stack
     /// buffer. The helper renames each report into place, so a read sees
     /// one whole report or the one before.
-    struct Session(std::ffi::CString);
-    impl SessionView for Session {
-        fn read(&mut self) -> SessionReport {
+    fn read_report(path: &std::ffi::CStr) -> SessionReport {
+        {
             let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
             // SAFETY: a NUL-terminated path.
-            let fd = unsafe { libc::open(self.0.as_ptr(), flags) };
+            let fd = unsafe { libc::open(path.as_ptr(), flags) };
             if fd < 0 {
                 return SessionReport::default();
             }
@@ -180,6 +296,22 @@ mod linux {
             }
             core::str::from_utf8(&buf[..n as usize]).map(parse_session).unwrap_or_default()
         }
+    }
+
+    /// Check the report's writer: alive, started when it says, the user's.
+    fn check_helper(path: &std::ffi::CStr, uid: u32, live: &HelperLive, buf: &mut String) {
+        use std::os::unix::fs::MetadataExt;
+        let r = read_report(path);
+        let at = now_ns();
+        let Some((pid, start)) = r.helper else {
+            live.publish(0, 0, false, at);
+            return;
+        };
+        let dir = format!("/proc/{pid}");
+        let owner = std::fs::metadata(&dir).ok().map(|m| m.uid());
+        let stat = read_small(&format!("{dir}/stat"), buf).then_some(buf.as_str());
+        let alive = helper_is(&r, stat, owner, uid);
+        live.publish(pid, start, alive, at);
     }
 
     fn now_ns() -> u64 {
@@ -272,15 +404,35 @@ mod linux {
     /// directory), so a plugin that already maps it keeps writing to the
     /// file the supervisor reads. A file that is not a regular page of the
     /// right size is replaced; a live mapping is never truncated.
-    fn engine_page(path: &Path) -> std::io::Result<EnginePage> {
+    ///
+    /// It is the session user's, group root, 0660: the service has no
+    /// CAP_DAC_OVERRIDE, so a restarted supervisor opens the page it handed
+    /// to the user through the group. Ownership and mode are set (CAP_CHOWN,
+    /// CAP_FOWNER) before the open, so a page left 0600 by an earlier
+    /// version is reopened too (B2: "engine page: Permission denied" after
+    /// every restart on 6b0b0e3).
+    fn engine_page(path: &Path, uid: u32) -> std::io::Result<EnginePage> {
         let s = path.to_string_lossy().into_owned();
+        let hand_over = |p: &Path| -> std::io::Result<()> {
+            std::os::unix::fs::lchown(p, Some(uid), Some(0))?;
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o660))
+        };
         match std::fs::symlink_metadata(path) {
-            Ok(m) if m.file_type().is_file() && m.len() == PAGE_BYTES as u64 => EnginePage::open(&s),
+            Ok(m) if m.file_type().is_file() && m.len() == PAGE_BYTES as u64 => {
+                hand_over(path)?;
+                EnginePage::open(&s)
+            }
             Ok(_) => {
                 std::fs::remove_file(path)?;
-                EnginePage::create(&s)
+                let page = EnginePage::create(&s)?;
+                hand_over(path)?;
+                Ok(page)
             }
-            Err(_) => EnginePage::create(&s),
+            Err(_) => {
+                let page = EnginePage::create(&s)?;
+                hand_over(path)?;
+                Ok(page)
+            }
         }
     }
 
@@ -356,6 +508,10 @@ mod linux {
         if !(8_000..=192_000).contains(&header.sample_rate) {
             return refuse(format!("sample rate {}", header.sample_rate));
         }
+        let full_scales = match blob_full_scales(&blob) {
+            Ok(v) => v,
+            Err(why) => return refuse(why),
+        };
 
         let run_dir = Path::new("/run/speakerguardd");
         let user_dir = run_dir.join(uid.to_string());
@@ -371,20 +527,13 @@ mod linux {
             return EX_UNAVAILABLE;
         }
         let page_path = user_dir.join("engine");
-        let page = match engine_page(&page_path) {
+        let page = match engine_page(&page_path, uid) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("engine page: {e}");
                 return EX_UNAVAILABLE;
             }
         };
-        // to the session user; 0600, the supervisor keeps its own mapping
-        if let Err(e) = std::os::unix::fs::lchown(&page_path, Some(uid), None)
-            .and_then(|()| std::fs::set_permissions(&page_path, std::fs::Permissions::from_mode(0o600)))
-        {
-            eprintln!("engine page: {e}");
-            return EX_UNAVAILABLE;
-        }
         let helper = user_dir.join("helper");
         if let Err(e) = helper_dir(&helper, uid) {
             eprintln!("helper directory: {e}");
@@ -437,9 +586,18 @@ mod linux {
         );
 
         let snapshot = Arc::new(PcmSnapshot::default());
+        let live = Arc::new(HelperLive::default());
+        // SAFETY: a plain eventfd, non-blocking and close-on-exec.
+        let wake = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        if wake < 0 {
+            eprintln!("eventfd: {}", std::io::Error::last_os_error());
+            return EX_UNAVAILABLE;
+        }
         // before SCHED_FIFO: the reader runs at normal priority
         let pcm_dir = format!("/proc/asound/card{index}/pcm{pcm}p");
-        if let Err(e) = spawn_pcm_reader(pcm_dir, info.subdevices, snapshot.clone()) {
+        if let Err(e) =
+            spawn_pcm_reader(pcm_dir, info.subdevices, snapshot.clone(), wake, session_path.clone(), uid, live.clone())
+        {
             eprintln!("PCM reader: {e}");
             return EX_UNAVAILABLE;
         }
@@ -455,18 +613,22 @@ mod linux {
         }
         let mut engine = Page(page);
         let mut pcm_view = PcmLatest(snapshot);
-        let mut session = Session(session_path);
+        let mut session = Session(session_path, live);
         let mut observer = Observer::new(header.payload_crc, header.sample_rate, TICK_NS);
-        let mut sup = Supervisor::new(Expect::new(machine, header.full_scale_mv, &info.id));
+        let mut sup = Supervisor::new(Expect::new(machine, full_scales, &info.id));
         let mut deadline = now_ns();
         let mut ticks = 0u64;
         let mut last_problem: Option<String> = None;
         notify.send("STATUS=supervising");
+        let mut scheduled = true;
         loop {
             let obs = observer.observe(&mut now_ns, &mut engine, &mut pcm_view, &mut session);
             let event = sup.tick(obs, &mut kernel);
             match event {
-                Ok(Event::Granted) => eprintln!("protection granted"),
+                Ok(Event::Granted) => {
+                    observer.note_grant(now_ns());
+                    eprintln!("protection granted");
+                }
                 Ok(Event::Released { why }) => eprintln!("protection released: {why:?}"),
                 Ok(Event::HardFault(f)) => eprintln!("amp fault, protection withdrawn until restart: {f}"),
                 Ok(Event::Lapsed) => eprintln!("lease lapsed; re-qualifying"),
@@ -483,18 +645,22 @@ mod linux {
                 }
                 last_problem = sup.problem().map(str::to_owned);
             }
-            if ticks % 20 == 0 {
-                // every 200 ms, under the unit's WatchdogSec
-                notify.send("WATCHDOG=1");
+            if scheduled {
+                if ticks % 20 == 0 {
+                    // every 200 ms, under the unit's WatchdogSec
+                    notify.send("WATCHDOG=1");
+                }
+                ticks += 1;
+                deadline += TICK_NS;
+                let now = now_ns();
+                if now > deadline + TICK_NS {
+                    // overran by more than a tick: resynchronise, never burst
+                    deadline = now;
+                }
             }
-            ticks += 1;
-            deadline += TICK_NS;
-            let now = now_ns();
-            if now > deadline + TICK_NS {
-                // overran by more than a tick: resynchronise, never burst
-                deadline = now;
-            }
-            sleep_until(deadline);
+            // an extra tick when the PCM reader wakes us; the 10 ms deadlines
+            // are unchanged
+            scheduled = !wait_until(deadline, wake);
         }
     }
 }

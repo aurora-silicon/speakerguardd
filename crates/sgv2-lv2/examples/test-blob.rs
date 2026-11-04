@@ -4,7 +4,9 @@
 //!
 //! The machine defaults to this Mac's board (the device tree's first root
 //! compatible, without "apple,"), and the operating point to an SN012776 at
-//! the kernel's amp gain 15 (18.5 dBV: 8414 mV peak at full scale). The
+//! the kernel's amp gain 15 (18.5 dBV = 8.414 V rms = 11.89 V peak, the ag
+//! AID9, AID13 and AID35 store), written to every channel's `ag` and to the
+//! header. The
 //! supervisor refuses a blob for another board or operating point.
 
 use sgv2_core::blob::{build_for, machine_field, Pod};
@@ -21,7 +23,7 @@ fn main() {
         String::from_utf8_lossy(first).strip_prefix("apple,").unwrap_or_default().to_owned()
     });
     let machine = machine_field(&board).unwrap_or_else(|| panic!("no usable machine name {board:?}: pass one"));
-    let full_scale_mv: u32 = a.get(5).and_then(|v| v.parse().ok()).unwrap_or(8414);
+    let full_scale_mv: u32 = a.get(5).and_then(|v| v.parse().ok()).unwrap_or(11_890);
     let mut p = spp3::Params {
         channels: n as u32,
         sample_rate: 48_000,
@@ -45,7 +47,7 @@ fn main() {
             hard_temp_limit_headroom: 5.0,
             reb_ref: 4.0,
             rshunt: 0.1,
-            ag: 10.0,
+            ag: full_scale_mv as f32 / 1000.0,
             thermal_ff_speedup_factor: 0.5,
             imon_scale: 1.0,
             vmon_scale: 1.0,

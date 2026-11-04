@@ -16,9 +16,11 @@
 //! - a hard amp fault (over-temperature, over-current, group off), or a
 //!   granted card whose amps are not at the operating volume, releases and
 //!   latches released for the life of the process;
-//! - a lapsed lease (`ETIMEDOUT`) is a fault for this tick: the kernel has
-//!   already stopped playback, and the grant comes back only through two
-//!   clean ticks;
+//! - a lapsed lease (`ETIMEDOUT`) grants nothing on this tick: the kernel
+//!   has already stopped playback (a supervisor stall), or the system has
+//!   just resumed (the first write after a resume). This tick's observation
+//!   was clean, so it counts as the first of the two clean ticks, and the
+//!   grant comes back on the next clean tick;
 //! - losing ownership (`EPERM`) or any other kernel error ends the loop, so
 //!   the process exits and the kernel's floor holds (the control file
 //!   closes, which withdraws protection at once).
@@ -31,11 +33,7 @@ use crate::machine::{full_scale_mv, same_operating_point, Amp, Machine};
 pub enum Event {
     Granted,
     Renewed,
-    /// The PCM is starting: the grant stands, unrenewed.
-    Held,
-    Released {
-        why: Observation,
-    },
+    Released { why: Observation },
     StayedReleased,
     HardFault(String),
     Lapsed,
@@ -51,8 +49,9 @@ pub enum Fatal {
 pub struct Expect {
     pub amps: usize,
     pub amp: Amp,
-    /// The blob's operating point: output peak volts at full scale, mV.
-    pub full_scale_mv: u32,
+    /// The blob's operating point, per channel: output peak volts at full
+    /// scale, mV (see `machine::blob_full_scales`).
+    pub full_scale_mv: Vec<u32>,
     /// For amps without a gain control, the chip's own full scale.
     pub fixed_full_scale_mv: u32,
     /// The front-end the speaker mux must select: the watched PCM's id.
@@ -60,7 +59,7 @@ pub struct Expect {
 }
 
 impl Expect {
-    pub fn new(machine: &Machine, full_scale_mv: u32, route: &str) -> Self {
+    pub fn new(machine: &Machine, full_scale_mv: Vec<u32>, route: &str) -> Self {
         Expect {
             amps: machine.amps,
             amp: machine.amp,
@@ -120,10 +119,13 @@ impl Supervisor {
         } else {
             f64::from(x.fixed_full_scale_mv)
         };
-        if !same_operating_point(measured, x.full_scale_mv) {
+        if x.full_scale_mv.len() != x.amps {
+            return Ok(Some(format!("{} channel full scales for {} amps", x.full_scale_mv.len(), x.amps)));
+        }
+        if let Some((c, mv)) = x.full_scale_mv.iter().enumerate().find(|(_, mv)| !same_operating_point(measured, **mv))
+        {
             return Ok(Some(format!(
-                "operating point {measured:.0} mV full scale, the parameters assume {} mV",
-                x.full_scale_mv
+                "operating point {measured:.0} mV full scale, the parameters assume {mv} mV (channel {c})"
             )));
         }
         Ok(None)
@@ -168,8 +170,9 @@ impl Supervisor {
             Action::Renew => match kernel.renew() {
                 Ok(()) => Ok(if was_held { Event::Renewed } else { Event::Granted }),
                 Err(KernelError::Lapsed) => {
-                    // count it as a faulted tick: back through two clean ticks
+                    // released, with this clean tick as the first of two
                     self.lease.tick(Observation::default());
+                    self.lease.tick(obs);
                     Ok(Event::Lapsed)
                 }
                 Err(KernelError::Sleeping) => {
@@ -178,7 +181,6 @@ impl Supervisor {
                 }
                 Err(e) => Err(Fatal::Kernel(e)),
             },
-            Action::Hold => Ok(Event::Held),
             Action::Release => {
                 kernel.release().map_err(Fatal::Kernel)?;
                 Ok(Event::Released { why: obs })
@@ -210,14 +212,13 @@ mod tests {
         carrier_ok: true,
         pcm_owner_ok: true,
         pcm_state_ok: true,
-        pcm_settling: false,
         route_ok: false,
         amps_ok: false,
     };
 
-    /// The J316 with a blob for gain 15 (18.5 dBV, 8414 mV).
+    /// The J316 with a blob for gain 15 (18.5 dBV, 11.89 V peak).
     fn j316() -> Supervisor {
-        Supervisor::new(Expect::new(lookup("j316s").unwrap(), 8414, "Secondary"))
+        Supervisor::new(Expect::new(lookup("j316s").unwrap(), vec![11_890; 6], "Secondary"))
     }
 
     #[test]
@@ -307,13 +308,13 @@ mod tests {
             k
         };
         let mut k = neo_card();
-        let mut s = Supervisor::new(Expect::new(neo, 7300, "Secondary"));
+        let mut s = Supervisor::new(Expect::new(neo, vec![7_300, 7_330], "Secondary"));
         s.tick(CLEAN, &mut k).unwrap();
         assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Granted));
         assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Renewed));
         // a blob for another operating point is refused
         let mut k = neo_card();
-        let mut s = Supervisor::new(Expect::new(neo, 6000, "Secondary"));
+        let mut s = Supervisor::new(Expect::new(neo, vec![7_300, 6_000], "Secondary"));
         for _ in 0..4 {
             assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::StayedReleased));
         }
@@ -375,7 +376,7 @@ mod tests {
         assert_eq!(k.renewals, 0);
         // a blob that states no operating point is refused too
         let mut k = Recorder::healthy(6);
-        let mut s = Supervisor::new(Expect::new(lookup("j316s").unwrap(), 0, "Secondary"));
+        let mut s = Supervisor::new(Expect::new(lookup("j316s").unwrap(), vec![0; 6], "Secondary"));
         for _ in 0..3 {
             assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::StayedReleased));
         }
@@ -430,13 +431,21 @@ mod tests {
     }
 
     #[test]
-    fn a_lapse_goes_back_through_two_clean_ticks() {
+    fn a_lapse_or_a_resume_grants_again_on_the_next_clean_tick() {
         let mut k = Lapsing(Recorder::healthy(6), false);
         let mut s = j316();
         s.tick(CLEAN, &mut k).unwrap();
         assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Granted));
+        // sgv2k2: the first write after a resume (or a lapse) is ETIMEDOUT
         k.1 = true;
         assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Lapsed));
+        assert!(!s.granted());
+        assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Granted));
+        // a fault on the next tick still keeps it released
+        k.1 = true;
+        assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Lapsed));
+        let bad = Observation { heartbeat_fresh: false, ..CLEAN };
+        assert_eq!(s.tick(bad, &mut k), Ok(Event::StayedReleased));
         assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::StayedReleased));
         assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Granted));
     }

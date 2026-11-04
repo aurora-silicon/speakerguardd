@@ -160,6 +160,46 @@ class Checks(unittest.TestCase):
         self.assertEqual(s.wanted(g), list(zip(p["pout"], p["spk"])))
 
 
+class Stop(unittest.TestCase):
+    def test_stopping_unlinks_the_amps_and_the_sense_within_its_bound(self):
+        import time
+
+        g, p, s = build("j616")
+        c = MACHINES["j616"]
+        ran = []
+
+        class Slow:
+            def __init__(self, argv):
+                ran.append(argv)
+                self.t = time.monotonic()
+                self.killed = False
+
+            def poll(self):
+                return -9 if self.killed else None
+
+            def wait(self, timeout):
+                if timeout < 5:
+                    raise sgs.subprocess.TimeoutExpired("pw-link", timeout)
+
+            def kill(self):
+                self.killed = True
+
+        orig = sgs.subprocess.Popen
+        sgs.subprocess.Popen = lambda argv, **kw: Slow(argv)
+        try:
+            t0 = time.monotonic()
+            s.unlink_all(g, 0.2)
+            took = time.monotonic() - t0
+        finally:
+            sgs.subprocess.Popen = orig
+        # every amp link and every sense link, nothing else (the voicing stays)
+        self.assertEqual(len(ran), c["amps"] + c["sense"], ran)
+        self.assertTrue(all(a[:2] == ["pw-link", "-d"] for a in ran), ran)
+        # bounded: a pw-link that does not finish is killed, not waited for
+        self.assertLess(took, 1.0)
+        self.assertEqual(s.pending, {})
+
+
 class Generated(unittest.TestCase):
     def test_generated_files_are_current(self):
         import subprocess
@@ -170,6 +210,23 @@ class Generated(unittest.TestCase):
 
 
 class Report(unittest.TestCase):
+    def setUp(self):
+        if not os.path.exists("/proc/self/stat"):
+            # not Linux: name a writer without /proc
+            sgs._WRITER = (os.getpid(), 4242)
+
+    def test_each_report_names_its_live_writer(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "session")
+            self.assertTrue(sgs.write_report(path, True, True))
+            fields = dict(w.split("=") for w in open(path).read().split())
+            self.assertEqual(int(fields["pid"]), os.getpid())
+            if os.path.exists("/proc/self/stat"):
+                self.assertEqual(int(fields["start"]), sgs.own_start())
+            self.assertEqual(sorted(fields), ["carrier", "links", "mono_ns", "pid", "start"])
+
     def test_the_report_is_renamed_into_place_whole_and_group_readable(self):
         import stat
         import tempfile
@@ -189,7 +246,7 @@ class Report(unittest.TestCase):
             # the stamp is CLOCK_MONOTONIC, the supervisor's clock
             import time
 
-            t = int(now.split("mono_ns=")[1])
+            t = int(now.split("mono_ns=")[1].split()[0])
             self.assertLessEqual(abs(time.monotonic_ns() - t), 1_000_000_000)
 
     def test_an_unwritable_directory_reports_failure(self):

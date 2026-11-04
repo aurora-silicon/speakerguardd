@@ -39,6 +39,9 @@ allow speakerguardd_t self:process { setsched getsched };
 # Hands the engine page and the helper's report directory (setgid root) to
 # the session user.
 allow speakerguardd_t self:capability { chown fowner };
+# The kernel requires CAP_SYS_ADMIN to lock and write "Speaker Protection"
+# (aurora-silicon/linux#922, 865ee493).
+allow speakerguardd_t self:capability sys_admin;
 
 # Type=notify: READY=1 and WATCHDOG=1 to systemd.
 allow speakerguardd_t self:unix_dgram_socket create_socket_perms;

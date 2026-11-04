@@ -37,11 +37,10 @@
 //!   calibration, the SpTS record `spA<k>` when the record file's checksum
 //!   holds.  A record no channel takes is refused.
 //!
-//!   The start state follows `Thermal State Override` (64007) per AID, as
-//!   SPEC-SPP3 section 10 lists it: 2 is the cold state (zero rises); unset,
-//!   0, 1 and any other value take the hot fallback, the steady-state split
-//!   of the channel's `TemperatureLimit` over ambient (there is no hand-off
-//!   record to restore on Linux).  AID8/9/14/15 leave it unset.
+//!   The start state is the engine's, from the global `ThermalStateOverride`:
+//!   the raw 64007 value the AID's strip sets, unset = 0 (SPEC-SPP3 section
+//!   10).  2 is the cold state; any other value the hot fallback.
+//!   AID8/9/14/15 leave it unset.
 //! * **lsm2** reads the saved state by the specification's numeric-ID rule
 //!   (section 9.7), with the model blocks at `3072 + 1024 * (3 * manager +
 //!   type)`, the order the shipped presets use.  Model features the payload
@@ -220,6 +219,7 @@ struct Spp3Lookup<'a> {
     rate: u32,
     /// Physical data source `spA<k>` of each unit channel.
     order: Vec<u32>,
+    thermal_state_override: u32,
 }
 
 /// `spA<k>`, the data-source ID of physical speaker source `k`.
@@ -297,6 +297,7 @@ impl spp3::TuningLookup for Spp3Lookup<'_> {
         }
         let id = match key {
             "ThermalProtectionEnabled" => 0,
+            "ThermalStateOverride" => return Some(f64::from(self.thermal_state_override)),
             _ => return None,
         };
         self.t.protection.state.section(SCOPE_GLOBAL, 0)?.get(id).map(f64::from)
@@ -306,8 +307,6 @@ impl spp3::TuningLookup for Spp3Lookup<'_> {
         match key {
             "SpeakerGroup" => return c.speaker_group.map(|g| g as f64),
             "IgnoreTelemetry" => return c.ignore_telemetry.map(|b| b as u8 as f64),
-            // Seeded after the lookup (see `start_state`).
-            "sgv2.InitialThetaVc" | "sgv2.InitialThetaMg" => return Some(0.0),
             "sgv2.CalPresent" => return Some(self.calibration(ch).is_some() as u8 as f64),
             "sgv2.CalR" => return self.calibration(ch).map(|r| r.r_cal_ohm),
             "sgv2.CalT" => return self.calibration(ch).map(|r| r.t_cal_c),
@@ -345,43 +344,17 @@ impl spp3::TuningLookup for Spp3Lookup<'_> {
     }
 }
 
-/// The start state `Thermal State Override` (64007) selects.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StartState {
-    /// 2: zero rises over ambient.
-    Cold,
-    /// Unset, 0, 1 or any other value: the hot fallback.
-    Hot,
-}
-
-pub fn start_state(t: &Tuning) -> Result<StartState> {
+/// `Thermal State Override` (64007) as the AID's property strip sets it:
+/// the raw value, unset = 0 (SPEC-SPP3 section 10).  The engine applies
+/// it: 2 is the cold start, every other value the hot fallback it computes
+/// from the tuning.  Never synthesised: AID8/9/14/15 leave it unset.
+pub fn thermal_state_override(t: &Tuning) -> Result<u32> {
     match t.protection.strip_properties.iter().find(|p| p.number == PROP_SPP3_THERMAL_STATE_OVERRIDE).map(|p| &p.value)
     {
-        None => Ok(StartState::Hot),
-        Some(PropValue::UInt32(SPP3_COLD_START)) => Ok(StartState::Cold),
-        Some(PropValue::UInt32(_)) => Ok(StartState::Hot),
+        None => Ok(0),
+        Some(PropValue::UInt32(v)) => Ok(*v),
         Some(v) => Err(bad(format!("Thermal State Override is {v:?}, not a UInt32"))),
     }
-}
-
-/// SPEC-SPP3 section 10, the hot fallback: the steady-state split of the
-/// channel's ordinary limit over ambient, `P0 = (TemperatureLimit -
-/// ambient) / (T_sett_vc + T_sett_mg)`, `theta_vc0 = P0 T_sett_vc`,
-/// `theta_mg0 = P0 T_sett_mg` (the engine starts its feed-forward node at
-/// `theta_vc0`).
-fn seed_hot(p: &mut spp3::Params) -> Result<()> {
-    let ambient = f64::from(p.thermal_ambient_temp);
-    for (c, x) in p.ch[..p.channels as usize].iter_mut().enumerate() {
-        let r = f64::from(x.t_sett_vc) + f64::from(x.t_sett_mg);
-        let rise = f64::from(x.temperature_limit) - ambient;
-        if !(r > 0.0 && rise.is_finite() && rise >= 0.0) {
-            return Err(bad(format!("channel {c}: no hot start state (limit {rise} K over ambient, R {r} K/W)")));
-        }
-        let p0 = rise / r;
-        x.initial_theta_vc = (p0 * f64::from(x.t_sett_vc)) as f32;
-        x.initial_theta_mg = (p0 * f64::from(x.t_sett_mg)) as f32;
-    }
-    Ok(())
 }
 
 fn compile_spp3(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compiled> {
@@ -391,7 +364,7 @@ fn compile_spp3(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
         return Err(bad(format!("sidecar has {} channels, the graph feeds {n}", sidecar.num_channels)));
     }
     let rate = sample_rate(t)?;
-    let start = start_state(t)?;
+    let tso = thermal_state_override(t)?;
     let order = source_order(t, n)?;
     // Every valid record must belong to a channel: one that does not means
     // the records and the channels disagree, and a guessed binding would
@@ -403,12 +376,10 @@ fn compile_spp3(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
             }
         }
     }
-    let lk = Spp3Lookup { t, sidecar, rate, order };
-    let mut p = spp3::Params::from_lookup(&lk).map_err(|e| bad(format!("spp3 parameters: {e:?}")))?;
-    if start == StartState::Hot {
-        seed_hot(&mut p)?;
-    }
-    diags.info("compile-start-state", "compile", format!("Thermal State Override selects the {start:?} start state"));
+    let lk = Spp3Lookup { t, sidecar, rate, order, thermal_state_override: tso };
+    let p = spp3::Params::from_lookup(&lk).map_err(|e| bad(format!("spp3 parameters: {e:?}")))?;
+    let start = if tso == SPP3_COLD_START { "cold" } else { "hot fallback" };
+    diags.info("compile-start-state", "compile", format!("Thermal State Override {tso}: the {start} start state"));
     let sense = match &t.protection.telemetry {
         Some(tm) => tm.channels.unwrap_or(0),
         None => 0,

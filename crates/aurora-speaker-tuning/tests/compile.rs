@@ -72,6 +72,8 @@ fn spp3_fields_come_from_the_sidecar_and_state() {
     assert_eq!(p.thermal_gain_attack_time_s, 3.5);
     assert_eq!(p.thermal_lookahead_delay_ms, 1.5);
     assert_eq!(p.thermal_protection_enabled, 1);
+    // The fixture strip sets 64007 = 2: the cold start.
+    assert_eq!(p.thermal_state_override, 2);
     for ch in 0..4 {
         let x = &p.ch[ch];
         assert_eq!(x.source, ch as u32);
@@ -82,7 +84,7 @@ fn spp3_fields_come_from_the_sidecar_and_state() {
         assert_eq!((x.temperature_limit, x.hard_temp_limit_headroom), (121.0, 7.0));
         assert_eq!((x.imon_scale, x.vmon_scale), (2.0, 10.0));
         assert_eq!(x.cl_thermal_feedback_enabled, 1);
-        assert_eq!((x.initial_theta_vc, x.initial_theta_mg), (0.0, 0.0));
+
         // spA<ch> carries raw R 3000+ch (Q6.10) and raw T 3100 (Q9.7).
         assert_eq!(x.cal_present, 1);
         assert_eq!((x.cal_r, x.cal_t), ((3000 + ch) as f32 / 1024.0, 3100.0 / 128.0));
@@ -112,34 +114,16 @@ fn spp3_calibration_needs_a_valid_matching_record() {
 
 #[test]
 fn spp3_start_state_follows_64007_per_aid() {
-    // 2: cold.  Unset (AID8/9/14/15), 0, 1 and other values: the hot
-    // fallback, the steady-state split of TemperatureLimit over ambient.
-    // Fixture: ambient 41, limit 121, T_sett 17/19 K/W: P0 = 80/36 W.
-    let p0 = 80.0f64 / 36.0;
-    for (state, hot) in [(Some(2), false), (None, true), (Some(0), true), (Some(1), true), (Some(7), true)] {
+    // The raw 64007 value reaches the engine; unset (AID8/9/14/15) is 0 and
+    // is never synthesised as 2.  The engine computes the hot fallback.
+    for (state, want) in [(Some(2), 2u32), (None, 0), (Some(0), 0), (Some(1), 1), (Some(7), 7)] {
         let mut f = spp3_files(4);
         f.insert(propstrip_path(), propstrip_with(&sidecar_name(), state));
         let t = tuning(&f, &format!("c-start-{state:?}"));
         let c = compile(&t, &mut Diagnostics::default()).unwrap();
         let p = sgv2_core::spp3::Params::from_blob(&c.blob).unwrap();
-        for x in &p.ch[..4] {
-            let (vc, mg) = if hot { ((p0 * 17.0) as f32, (p0 * 19.0) as f32) } else { (0.0, 0.0) };
-            assert_eq!((x.initial_theta_vc, x.initial_theta_mg), (vc, mg), "{state:?}");
-            // T_OL starts at the limit when hot.
-            if hot {
-                assert!((41.0 + x.initial_theta_vc + x.initial_theta_mg - 121.0).abs() < 1e-4);
-            }
-        }
+        assert_eq!(p.thermal_state_override, want, "{state:?}");
     }
-}
-
-#[test]
-fn spp3_hot_seed_matches_the_spec_family_values() {
-    // SPEC-SPP3 section 10: AID9-family woofer, ambient 50, limit 140,
-    // Rvc/Rmg 26.06/25.55 K/W: 45.444681 K coil, 44.555319 K magnet.
-    let p0 = (140.0f64 - 50.0) / (26.06 + 25.55);
-    assert!((p0 * 26.06 - 45.444681).abs() < 1e-5);
-    assert!((p0 * 25.55 - 44.555319).abs() < 1e-5);
 }
 
 #[test]
@@ -291,8 +275,8 @@ fn lsm2_state(tweak: impl Fn(&mut BTreeMap<u32, f32>)) -> ParamState {
         (id::C_ATTACK, 4.0),
         (id::C_FAST_RELEASE, 150.0),
         (id::C_SLOW_RELEASE, 15000.0),
-        (id::C_FILTERBANK_LATENCY, 2.0),
-        (id::C_LOOKAHEAD, 0.5),
+        (id::C_FILTERBANK_LATENCY, 10.0 / 3.0),
+        (id::C_LOOKAHEAD, 2.0 / 3.0),
         (id::C_UNLINK_TEMPERATURE, 0.0),
         (id::C_COMPENSATE_RESONATORS, 0.0),
         (id::C_USE_FAST_PEAK, 0.0),
@@ -348,7 +332,9 @@ fn lsm2_fields_follow_the_id_rule() {
     let p = sgv2_core::lsm2::Params::from_blob(&c.blob).unwrap();
     assert_eq!((p.channels, p.sample_rate, p.model_only), (4, 48000, 1));
     assert_eq!((p.attack_time_ms, p.fast_release_time_ms, p.slow_release_time_ms), (4.0, 150.0, 15000.0));
-    assert_eq!((p.filterbank_latency_ms, p.speaker_response_lookahead_ms), (2.0, 0.5));
+    // SPEC-LSM2 AID44 values: 2 x 160 + 32 = 352 frames.
+    assert_eq!((p.filterbank_latency_ms, p.speaker_response_lookahead_ms), (10.0 / 3.0, 2.0 / 3.0));
+    assert_eq!(p.latency_frames(), 352);
     assert_eq!(p.power_hard_limit_w, [50.0, 8.0, 3.0, 2.0]);
     assert_eq!((p.low_rail_idle_power_w, p.low_rail_power_ratio, p.other_power_features), (0.02, 1.2, 0));
     let x = &p.ch[1];
