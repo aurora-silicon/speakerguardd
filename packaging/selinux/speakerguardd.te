@@ -7,11 +7,15 @@ policy_module(speakerguardd, 0.1.0)
 type speakerguardd_t;
 type speakerguardd_exec_t;
 init_daemon_domain(speakerguardd_t, speakerguardd_exec_t)
+# The unit runs with NoNewPrivileges=yes.
+init_nnp_daemon_domain(speakerguardd_t)
 
 type speakerguardd_runtime_t;
 files_pid_file(speakerguardd_runtime_t)
 manage_dirs_pattern(speakerguardd_t, speakerguardd_runtime_t, speakerguardd_runtime_t)
 manage_files_pattern(speakerguardd_t, speakerguardd_runtime_t, speakerguardd_runtime_t)
+# The engine page is shared memory.
+allow speakerguardd_t speakerguardd_runtime_t:file map;
 files_pid_filetrans(speakerguardd_t, speakerguardd_runtime_t, { dir file })
 
 # The tuning bundle in the vendor firmware tree, and the ESP fallback.
@@ -20,7 +24,9 @@ dev_read_sysfs(speakerguardd_t)
 fs_read_dos_files(speakerguardd_t)
 
 # The macaudio control device: interlock and amp gain.
-dev_rw_sound(speakerguardd_t)
+# (refpolicy has no dev_rw_sound; read includes ioctl)
+dev_read_sound(speakerguardd_t)
+dev_write_sound(speakerguardd_t)
 
 # PCM ownership from /proc/asound.
 kernel_read_system_state(speakerguardd_t)
@@ -30,6 +36,13 @@ allow speakerguardd_t self:capability { sys_nice ipc_lock };
 allow speakerguardd_t self:process { setsched getsched };
 # Hands the engine page and the session report to the session user.
 allow speakerguardd_t self:capability { chown fowner };
+
+# Type=notify: READY=1 and WATCHDOG=1 to systemd.
+allow speakerguardd_t self:unix_dgram_socket create_socket_perms;
+init_write_pid_socket(speakerguardd_t)
+init_dgram_send(speakerguardd_t)
+# systemd's notify socket is labelled kernel_t on Fedora.
+kernel_dgram_send(speakerguardd_t)
 
 # Its configuration.
 files_read_etc_files(speakerguardd_t)

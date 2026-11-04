@@ -261,14 +261,20 @@ class Session:
                     self._spawn(("unlink", lid), ["pw-link", "-d", str(lid)])
 
 
+REPORT_BYTES = 64
+
+
 def write_report(path, links, carrier):
-    line = f"links={int(links)} carrier={int(carrier)} mono_ns={time.monotonic_ns()}\n"
+    line = f"links={int(links)} carrier={int(carrier)} mono_ns={time.monotonic_ns()}"
+    # One fixed-size write over the whole report, never a truncate: the
+    # supervisor reads it every 10 ms, and an empty or shorter file between
+    # a truncate and the write would read as no report and withdraw.
+    rec = line.ljust(REPORT_BYTES - 1).encode() + b"\n"
     try:
         # The supervisor creates the file for this user: rewrite it in place.
         fd = os.open(path, os.O_WRONLY | os.O_CLOEXEC)
         try:
-            os.ftruncate(fd, 0)
-            os.pwrite(fd, line.encode(), 0)
+            os.pwrite(fd, rec, 0)
         finally:
             os.close(fd)
         return True

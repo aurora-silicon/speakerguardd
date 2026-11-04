@@ -32,6 +32,7 @@ fn main() {
     let (mut last_print, mut last_seq, mut last_frames) = (Instant::now(), 0u64, 0u64);
     let (mut prev, mut gaps, mut records, mut stale_polls) = (None::<u64>, 0u64, 0u64, 0u64);
     let mut health_or = 0u32;
+    let mut step = None::<u64>;
     let mut seq_prev = page.header().seq.load(Ordering::Acquire);
     while start.elapsed() < Duration::from_secs(secs) {
         std::thread::sleep(Duration::from_millis(50));
@@ -49,9 +50,17 @@ fn main() {
         let delay = h.sense_delay.load(Ordering::Relaxed);
         while let Some(t) = rd.poll(page.ring()) {
             records += 1;
+            // one record per host call: consecutive records are one call
+            // apart (512 frames once the speaker sink drives the group)
             if let Some(p) = prev {
-                if t.frame != p + 512 {
-                    gaps += 1;
+                let d = t.frame.wrapping_sub(p);
+                match step {
+                    None => step = Some(d),
+                    Some(s) if d != s => {
+                        gaps += 1;
+                        step = Some(d);
+                    }
+                    _ => {}
                 }
             }
             prev = Some(t.frame);
@@ -85,9 +94,10 @@ fn main() {
             }
             let ch = &t.channels[..6];
             println!(
-                "t={:>3}s pid={} crc={:08x} calls/s={} frames/s={} health={:#x} delay={} records={} lost={} gaps={} \
+                "t={:>3}s step={:?} pid={} crc={:08x} calls/s={} frames/s={} health={:#x} delay={} records={} lost={} gaps={} \
                  stale_polls={} health_or={:#x} gain_db={:?} tol={:?} tcl={:?} r={:?}",
                 start.elapsed().as_secs(),
+                step,
                 h.pid.load(Ordering::Relaxed),
                 h.params_crc.load(Ordering::Relaxed),
                 seq - last_seq,

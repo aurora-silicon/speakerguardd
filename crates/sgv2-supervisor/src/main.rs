@@ -183,12 +183,16 @@ mod linux {
             eprintln!("session file: {e}");
             return EX_UNAVAILABLE;
         }
-        for path in [page_str.clone(), session_path.to_string_lossy().into_owned()] {
+        // Both go to the session user; the group stays root's. The service
+        // runs without CAP_DAC_OVERRIDE, so the session report is 0640: the
+        // supervisor re-opens it every tick and reads it through the group.
+        // The engine page stays 0600: the supervisor keeps its own mapping.
+        for (path, mode) in [(page_str.clone(), 0o600), (session_path.to_string_lossy().into_owned(), 0o640)] {
             if let Ok(c) = std::ffi::CString::new(path) {
                 // SAFETY: paths we created; hand them to the session user.
                 unsafe {
                     libc::chown(c.as_ptr(), uid, u32::MAX);
-                    libc::chmod(c.as_ptr(), 0o600);
+                    libc::chmod(c.as_ptr(), mode);
                 }
             }
         }
