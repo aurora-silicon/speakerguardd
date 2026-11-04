@@ -72,6 +72,13 @@
 //!   between `a_t_20C` and `a_t_35C`, and the corrected limit
 //!   `clamp(Tlim + T_OL - T_CL, Tlim, Tlim + TlimAdjCap)` smoothed with the
 //!   99 % law over `TlimErrDecayTime`, falling back to `Tlim` on rejection.
+//!   A segment the sense bus cannot feed (no bus, a missing port, a port
+//!   shorter than the call) invalidates the window at once and discards
+//!   its partial sums (spec 7: a missing bus invalidates the window), and
+//!   an accepted measurement expires one window plus one update after it
+//!   was taken, so a stale cool `T_CL` can never hold the limit up. The raw
+//!   limit then returns to `Tlim` at once and `TlimAdj` decays over
+//!   `TlimErrDecayTime`, as on rejection.
 //!   A channel runs it only with CL feedback configured and a calibration
 //!   record inside `CalTempRange`/`RebRange`. Still TODO(SPEC): the
 //!   sensor's DC-block/band-limit filter (raw samples are used, exact for a
@@ -462,6 +469,8 @@ struct Cl {
     /// Latest accepted window, until the next update consumes it.
     accepted: Option<f64>,
     valid: bool,
+    /// Frames since the last accepted window.
+    age: usize,
     t_cl: f64,
     limit_s: f64,
 }
@@ -522,6 +531,7 @@ impl Cl {
             k_lim: settle99(c.tlim_err_decay_time_s as f64, r),
             accepted: None,
             valid: false,
+            age: 0,
             t_cl: tc,
             limit_s: c.temperature_limit as f64,
         })
@@ -534,8 +544,19 @@ impl Cl {
         self.r_s = Some(self.cal_r / self.rdc_scale.max(f64::MIN_POSITIVE));
         self.accepted = None;
         self.valid = false;
+        self.age = 0;
         self.t_cl = self.cal_t;
         self.limit_s = limit;
+    }
+
+    /// The sense bus could not feed a segment: the window is invalid and
+    /// its partial sums are discarded (spec 7).
+    fn lose(&mut self) {
+        self.n = 0;
+        self.v_sq = 0.0;
+        self.i_sq = 0.0;
+        self.accepted = None;
+        self.valid = false;
     }
 
     /// Raw telemetry of one segment. TODO(SPEC): the sensor's DC-block /
@@ -567,6 +588,7 @@ impl Cl {
                     if re >= self.reb_min && re <= self.reb_max {
                         self.accepted = Some(self.cal_t + (re / self.cal_r - 1.0) * self.inv_temp_co);
                         self.valid = true;
+                        self.age = 0;
                     } else {
                         self.valid = false;
                     }
@@ -581,6 +603,11 @@ impl Cl {
     fn update(&mut self, t_ol: f64, limit: f64) -> f64 {
         if let Some(t) = self.accepted.take() {
             self.t_cl = t;
+        }
+        // a measurement older than one window (plus this update) is stale
+        self.age = self.age.saturating_add(THERMAL_FRAMES);
+        if self.age > self.window.saturating_add(THERMAL_FRAMES) {
+            self.valid = false;
         }
         let raw = if self.valid { (limit + (t_ol - self.t_cl)).clamp(limit, limit + self.cap) } else { limit };
         self.limit_s += self.k_lim * (raw - self.limit_s);
@@ -883,7 +910,12 @@ impl Run {
                         cl.feed(i, v);
                     }
                 }
-                _ => self.sums.complete = false,
+                _ => {
+                    self.sums.complete = false;
+                    if let Some(cl) = c.cl.as_mut() {
+                        cl.lose();
+                    }
+                }
             }
         }
         self.sums.frames += len;
@@ -1187,5 +1219,46 @@ mod fault_tests {
             let (o, h) = run(&mut u, 0.5, 512);
             assert_eq!((o[511], h.0 & Health::FAILSAFE), (0.5, 0));
         }
+    }
+
+    /// Review finding 3: an accepted measurement expires one window (plus
+    /// one update) after it was taken, even if no segment ever reports the
+    /// bus lost.
+    #[test]
+    fn a_closed_loop_measurement_expires_after_one_window() {
+        let mut c = params().ch[0];
+        c.cl_thermal_feedback_enabled = 1;
+        c.cal_present = 1;
+        c.cal_r = 4.0;
+        c.cal_t = 25.0;
+        c.imon_scale = 1.0;
+        c.vmon_scale = 1.0;
+        c.temp_sense_window_time_s = 0.02;
+        c.temp_sense_smoothing_tau_s = 0.5;
+        c.rdc_scale = 1.0;
+        c.reb_range_min = 2.0;
+        c.reb_range_max = 8.0;
+        c.cal_temp_range_min = 10.0;
+        c.cal_temp_range_max = 50.0;
+        c.a_t_20c = 0.004;
+        c.a_t_35c = 0.004;
+        c.tlim_err_decay_time_s = 1.0;
+        c.tlim_adj_cap = 30.0;
+        let mut cl = Cl::new(&c, 48_000.0, 48_000.0 / THERMAL_FRAMES as f64).unwrap();
+        let w = cl.window;
+        let (i, v) = (vec![0.25f32; w], vec![1.0f32; w]);
+        cl.feed(&i, &v);
+        assert!(cl.valid);
+        let mut updates = 0;
+        while cl.valid {
+            cl.update(200.0, 120.0);
+            updates += 1;
+            assert!(updates * THERMAL_FRAMES <= w + 2 * THERMAL_FRAMES, "still valid after {updates} updates");
+        }
+        // and a lost segment invalidates at once
+        cl.feed(&i, &v);
+        assert!(cl.valid);
+        cl.lose();
+        assert!(!cl.valid && cl.n == 0);
     }
 }
