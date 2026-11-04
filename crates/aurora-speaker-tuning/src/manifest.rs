@@ -3,16 +3,36 @@
 // Copyright (c) 2026 The Aurora Silicon Contributors
 // SPDX-License-Identifier: MIT
 
-//! `manifest.json`, schema 1, as the installer writes it.
+//! Bundle integrity records.
 //!
-//! TODO(lane A): replace the minimal JSON reader below with serde_json once
-//! the crate takes dependencies; keep the same validation.
+//! * `manifest.json`, schema 2, kind `aurora-audio-tuning`: what the Aurora
+//!   installer writes next to the collected folder.  Schema 2 states that
+//!   the set is complete (`complete`, `source_file_count`), names both
+//!   selection files, and may carry the speaker-assembly ID (`speaker_id`).
+//! * `metadata.json`, version 1, kind `aurora-audio-dsp tuning bundle`: what
+//!   aurora-audio-dsp's macOS collector writes (development bundles).
+//!
+//! Both list every file with its size and SHA-256; both are read into one
+//! [`Manifest`].
 
-use crate::{Error, Result};
+use crate::error::{Error, Result};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 pub const NAME: &str = "manifest.json";
+pub const COLLECTOR_NAME: &str = "metadata.json";
+pub const SPTS_NAME: &str = "speaker-thiele-small.bin";
+/// Files a manifest may list outside `AID<n>/`: macOS's DSP database (the
+/// graph and strip selection) and the AID's device configuration.
+pub const DSP_DATABASE: &str = "DeviceDSPDatabase.plist";
+/// Limits the installer applies when collecting; a bundle beyond them is
+/// not one it wrote.
+pub const MAX_FILES: usize = 1024;
+pub const MAX_BYTES: u64 = 64 << 20;
+/// The installer manifest schema this reader knows.
+pub const SCHEMA: u32 = 2;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {
     pub path: String,
     pub bytes: u64,
@@ -22,22 +42,72 @@ pub struct Record {
 impl Record {
     pub fn verify(&self, data: &[u8]) -> Result<()> {
         if data.len() as u64 != self.bytes {
-            return Err(Error::Invalid(format!("{}: size", self.path)));
+            return Err(Error::Integrity {
+                path: self.path.clone(),
+                message: format!("{} bytes, manifest says {}", data.len(), self.bytes),
+            });
         }
-        if crate::manifest::sha256_hex(data) != self.sha256 {
-            return Err(Error::Invalid(format!("{}: sha256", self.path)));
+        let got = sha256_hex(data);
+        if got != self.sha256 {
+            return Err(Error::Integrity {
+                path: self.path.clone(),
+                message: format!("sha256 {got}, manifest says {}", self.sha256),
+            });
         }
         Ok(())
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum Source {
+    Installer,
+    Collector,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Manifest {
+    pub source: Source,
     pub acoustic_id: u32,
+    /// `AID<n>`.
     pub aid: String,
-    pub macos_build: String,
+    /// macOS build the tuning was collected from (`kern.osversion`), if known.
+    pub macos_build: Option<String>,
+    pub machine_model: Option<String>,
+    /// The speaker-assembly ID (macOS `speakerID`, HAL `spid`) the
+    /// installer read on this Mac, if it could.
+    pub speaker_id: Option<u32>,
     pub speaker_thiele_small: Option<Record>,
     pub files: Vec<Record>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InstallerJson {
+    #[serde(rename = "schema")]
+    _schema: u32,
+    kind: String,
+    source_file_count: u64,
+    complete: bool,
+    acoustic_id: u32,
+    aid: String,
+    macos_build: String,
+    speaker_thiele_small: Option<Record>,
+    device_dsp_database: String,
+    config: String,
+    files: Vec<Record>,
+    based_on: Option<String>,
+    /// Python writes `null` when unknown, Swift omits the key.
+    #[serde(default)]
+    speaker_id: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct CollectorJson {
+    kind: String,
+    version: u32,
+    machine_model: Option<String>,
+    acoustic_id_name: String,
+    files: Vec<Record>,
 }
 
 impl Manifest {
@@ -45,10 +115,142 @@ impl Manifest {
         self.files.iter().chain(self.speaker_thiele_small.iter())
     }
 
-    pub fn parse(_bytes: &[u8]) -> Result<Manifest> {
-        // TODO(lane A): JSON parsing (schema 1, kind "aurora-audio-tuning").
-        Err(Error::Invalid("manifest parsing not implemented yet".into()))
+    /// Parses `manifest.json` (installer).
+    pub fn parse(bytes: &[u8]) -> Result<Manifest> {
+        // The schema first, so an older manifest reports its version rather
+        // than a missing field.
+        #[derive(Deserialize)]
+        struct Schema {
+            schema: u32,
+        }
+        let v: Schema =
+            serde_json::from_slice(bytes).map_err(|e| Error::format(NAME, format!("not a manifest: {e}")))?;
+        if v.schema != SCHEMA {
+            return Err(Error::version(NAME, format!("manifest schema {}; known: {SCHEMA}", v.schema)));
+        }
+        let j: InstallerJson = serde_json::from_slice(bytes)
+            .map_err(|e| Error::format(NAME, format!("not a schema-{SCHEMA} manifest: {e}")))?;
+        if j.kind != "aurora-audio-tuning" {
+            return Err(Error::format(NAME, format!("kind {:?}", j.kind)));
+        }
+        let _ = j.based_on;
+        // Completeness: the installer writes only a full set, and says so.
+        if !j.complete {
+            return Err(Error::format(NAME, "the installer marked the set incomplete"));
+        }
+        let config = format!("Config/{}.plist", j.aid);
+        if j.device_dsp_database != DSP_DATABASE || j.config != config {
+            return Err(Error::format(
+                NAME,
+                format!(
+                    "selection files {:?} and {:?}; expected {DSP_DATABASE:?} and {config:?}",
+                    j.device_dsp_database, j.config
+                ),
+            ));
+        }
+        for name in [DSP_DATABASE, config.as_str()] {
+            if !j.files.iter().any(|r| r.path == name) {
+                return Err(Error::format(NAME, format!("{name} is named but not listed")));
+            }
+        }
+        let prefix = format!("{}/", j.aid);
+        let folder = j.files.iter().filter(|r| r.path.starts_with(&prefix)).count() as u64;
+        if j.source_file_count == 0 || j.source_file_count != folder {
+            return Err(Error::format(
+                NAME,
+                format!("source_file_count {} but {folder} {prefix} entries are listed", j.source_file_count),
+            ));
+        }
+        let m = Manifest {
+            source: Source::Installer,
+            acoustic_id: j.acoustic_id,
+            aid: j.aid,
+            macos_build: (j.macos_build != "unknown").then_some(j.macos_build),
+            machine_model: None,
+            speaker_id: j.speaker_id,
+            speaker_thiele_small: j.speaker_thiele_small,
+            files: j.files,
+        };
+        m.check(NAME)?;
+        Ok(m)
     }
+
+    /// Parses aurora-audio-dsp's `metadata.json` (collector).
+    pub fn parse_collector(bytes: &[u8]) -> Result<Manifest> {
+        let j: CollectorJson = serde_json::from_slice(bytes)
+            .map_err(|e| Error::format(COLLECTOR_NAME, format!("not a collector metadata file: {e}")))?;
+        if j.kind != "aurora-audio-dsp tuning bundle" {
+            return Err(Error::format(COLLECTOR_NAME, format!("kind {:?}", j.kind)));
+        }
+        if j.version != 1 {
+            return Err(Error::version(COLLECTOR_NAME, format!("metadata version {}; known: 1", j.version)));
+        }
+        let acoustic_id = aid_number(&j.acoustic_id_name)
+            .ok_or_else(|| Error::format(COLLECTOR_NAME, format!("acoustic_id_name {:?}", j.acoustic_id_name)))?;
+        let (spts, files): (Vec<Record>, Vec<Record>) = j.files.into_iter().partition(|r| r.path == SPTS_NAME);
+        let m = Manifest {
+            source: Source::Collector,
+            acoustic_id,
+            aid: j.acoustic_id_name,
+            macos_build: None,
+            machine_model: j.machine_model,
+            speaker_id: None,
+            speaker_thiele_small: spts.into_iter().next(),
+            files,
+        };
+        m.check(COLLECTOR_NAME)?;
+        Ok(m)
+    }
+
+    fn check(&self, ctx: &str) -> Result<()> {
+        if aid_number(&self.aid) != Some(self.acoustic_id) {
+            return Err(Error::format(
+                ctx,
+                format!("aid {:?} does not match acoustic_id {}", self.aid, self.acoustic_id),
+            ));
+        }
+        if self.files.is_empty() || self.files.len() > MAX_FILES {
+            return Err(Error::format(ctx, format!("{} files (1..={MAX_FILES})", self.files.len())));
+        }
+        let mut total = 0u64;
+        let mut seen = std::collections::BTreeSet::new();
+        for r in self.records() {
+            if !admitted(&r.path) {
+                return Err(Error::format(ctx, format!("inadmissible path {:?}", r.path)));
+            }
+            if r.sha256.len() != 64 || !r.sha256.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f')) {
+                return Err(Error::format(ctx, format!("{}: sha256 is not 64 lowercase hex digits", r.path)));
+            }
+            if !seen.insert(r.path.as_str()) {
+                return Err(Error::format(ctx, format!("{} listed twice", r.path)));
+            }
+            total = total.saturating_add(r.bytes);
+        }
+        if total > MAX_BYTES {
+            return Err(Error::format(ctx, format!("{total} bytes exceeds {MAX_BYTES}")));
+        }
+        let config = format!("Config/{}.plist", self.aid);
+        for r in &self.files {
+            let extra = r.path == DSP_DATABASE || r.path == config;
+            if !extra && !r.path.starts_with(&format!("{}/", self.aid)) {
+                return Err(Error::format(ctx, format!("{} is outside {}/", r.path, self.aid)));
+            }
+        }
+        if let Some(s) = &self.speaker_thiele_small {
+            if s.path != SPTS_NAME {
+                return Err(Error::format(ctx, format!("calibration record path {:?}", s.path)));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn aid_number(aid: &str) -> Option<u32> {
+    let n = aid.strip_prefix("AID")?;
+    if n.is_empty() || n.starts_with('0') || !n.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    n.parse().ok()
 }
 
 /// A manifest path is relative, with no empty, `.` or `..` component and
@@ -61,61 +263,8 @@ pub fn admitted(path: &str) -> bool {
         && path.split('/').all(|p| !p.is_empty() && p != "." && p != ".." && !p.starts_with("._") && p != ".DS_Store")
 }
 
-/// SHA-256 as lowercase hex. TODO(lane A): use the `sha2` crate.
 pub fn sha256_hex(data: &[u8]) -> String {
-    let digest = sha256(data);
-    digest.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-fn sha256(data: &[u8]) -> [u8; 32] {
-    const K: [u32; 64] = [
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98,
-        0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786,
-        0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8,
-        0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
-        0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819,
-        0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a,
-        0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
-        0xc67178f2,
-    ];
-    let mut h: [u32; 8] =
-        [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
-    let mut msg = data.to_vec();
-    let bits = (data.len() as u64).wrapping_mul(8);
-    msg.push(0x80);
-    while msg.len() % 64 != 56 {
-        msg.push(0);
-    }
-    msg.extend_from_slice(&bits.to_be_bytes());
-    for chunk in msg.chunks(64) {
-        let mut w = [0u32; 64];
-        for i in 0..16 {
-            w[i] = u32::from_be_bytes([chunk[4 * i], chunk[4 * i + 1], chunk[4 * i + 2], chunk[4 * i + 3]]);
-        }
-        for i in 16..64 {
-            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
-        }
-        let mut v = h;
-        for i in 0..64 {
-            let s1 = v[4].rotate_right(6) ^ v[4].rotate_right(11) ^ v[4].rotate_right(25);
-            let ch = (v[4] & v[5]) ^ (!v[4] & v[6]);
-            let t1 = v[7].wrapping_add(s1).wrapping_add(ch).wrapping_add(K[i]).wrapping_add(w[i]);
-            let s0 = v[0].rotate_right(2) ^ v[0].rotate_right(13) ^ v[0].rotate_right(22);
-            let maj = (v[0] & v[1]) ^ (v[0] & v[2]) ^ (v[1] & v[2]);
-            let t2 = s0.wrapping_add(maj);
-            v = [t1.wrapping_add(t2), v[0], v[1], v[2], v[3].wrapping_add(t1), v[4], v[5], v[6]];
-        }
-        for (a, b) in h.iter_mut().zip(v) {
-            *a = a.wrapping_add(b);
-        }
-    }
-    let mut out = [0u8; 32];
-    for (i, word) in h.iter().enumerate() {
-        out[4 * i..4 * i + 4].copy_from_slice(&word.to_be_bytes());
-    }
-    out
+    Sha256::digest(data).iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[cfg(test)]
@@ -144,5 +293,96 @@ mod tests {
         assert!(rec.verify(b"abc").is_ok());
         assert!(rec.verify(b"abd").is_err());
         assert!(rec.verify(b"ab").is_err());
+    }
+
+    fn selection() -> String {
+        let sha = sha256_hex(b"x");
+        format!(
+            r#"{{"path":"DeviceDSPDatabase.plist","bytes":1,"sha256":"{sha}"}},{{"path":"Config/AID7.plist","bytes":1,"sha256":"{sha}"}}"#
+        )
+    }
+
+    fn installer_with(files: &str, count: u64, extra: &str) -> String {
+        let sel = selection();
+        let files = if files.is_empty() { sel } else { format!("{files},{sel}") };
+        format!(
+            r#"{{"schema":2,"kind":"aurora-audio-tuning","source_file_count":{count},"complete":true,
+               "acoustic_id":7,"aid":"AID7","macos_build":"25A1","speaker_thiele_small":null,
+               "device_dsp_database":"DeviceDSPDatabase.plist","config":"Config/AID7.plist",
+               "files":[{files}],"based_on":"x"{extra}}}"#
+        )
+    }
+
+    fn installer(files: &str) -> String {
+        installer_with(files, 1, "")
+    }
+
+    #[test]
+    fn installer_manifest() {
+        let sha = sha256_hex(b"x");
+        let m = Manifest::parse(installer(&format!(r#"{{"path":"AID7/a","bytes":1,"sha256":"{sha}"}}"#)).as_bytes())
+            .unwrap();
+        assert_eq!(m.aid, "AID7");
+        assert_eq!(m.macos_build.as_deref(), Some("25A1"));
+        // Outside the AID folder, traversal, duplicates, bad hash.
+        for bad in [
+            format!(r#"{{"path":"AID8/a","bytes":1,"sha256":"{sha}"}}"#),
+            format!(r#"{{"path":"AID7/../a","bytes":1,"sha256":"{sha}"}}"#),
+            format!(r#"{{"path":"AID7/a","bytes":1,"sha256":"{sha}"}},{{"path":"AID7/a","bytes":1,"sha256":"{sha}"}}"#),
+            r#"{"path":"AID7/a","bytes":1,"sha256":"XYZ"}"#.to_string(),
+        ] {
+            assert!(Manifest::parse(installer(&bad).as_bytes()).is_err(), "{bad}");
+        }
+        let wrong_schema = installer("").replace("\"schema\":2", "\"schema\":1");
+        assert!(matches!(Manifest::parse(wrong_schema.as_bytes()), Err(Error::Version { .. })));
+    }
+
+    #[test]
+    fn installer_manifest_completeness() {
+        let sha = sha256_hex(b"x");
+        let one = format!(r#"{{"path":"AID7/a","bytes":1,"sha256":"{sha}"}}"#);
+        assert!(Manifest::parse(installer(&one).as_bytes()).is_ok());
+        // A short or inflated count, an incomplete flag, missing selection.
+        for bad in [
+            installer_with(&one, 2, ""),
+            installer_with(&one, 0, ""),
+            installer(&one).replace("\"complete\":true", "\"complete\":false"),
+            installer(&one).replace(",\"complete\":true", ""),
+            installer(&one).replace(r#","config":"Config/AID7.plist""#, r#","config":"Config/AID8.plist""#),
+            installer(&one).replace(r#",{"path":"Config/AID7.plist""#, r#",{"path":"AID7/Config.plist""#),
+        ] {
+            assert!(Manifest::parse(bad.as_bytes()).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn installer_manifest_speaker_id() {
+        let sha = sha256_hex(b"x");
+        let one = format!(r#"{{"path":"AID7/a","bytes":1,"sha256":"{sha}"}}"#);
+        // Swift omits it, Python writes null.
+        assert_eq!(Manifest::parse(installer(&one).as_bytes()).unwrap().speaker_id, None);
+        let m = Manifest::parse(installer_with(&one, 1, r#","speaker_id":null"#).as_bytes()).unwrap();
+        assert_eq!(m.speaker_id, None);
+        for (v, want) in [("3", 3u32), ("65535", 65535), ("4294967295", u32::MAX)] {
+            let m = Manifest::parse(installer_with(&one, 1, &format!(r#","speaker_id":{v}"#)).as_bytes()).unwrap();
+            assert_eq!(m.speaker_id, Some(want));
+        }
+        for v in ["-1", "4294967296", "3.0", "true", "\"3\"", "[3]"] {
+            let j = installer_with(&one, 1, &format!(r#","speaker_id":{v}"#));
+            assert!(Manifest::parse(j.as_bytes()).is_err(), "{v}");
+        }
+    }
+
+    #[test]
+    fn collector_metadata() {
+        let sha = sha256_hex(b"x");
+        let j = format!(
+            r#"{{"kind":"aurora-audio-dsp tuning bundle","version":1,"machine_model":"MacTest1,1","acoustic_id_name":"AID7",
+               "files":[{{"path":"speaker-thiele-small.bin","bytes":1,"sha256":"{sha}"}},{{"path":"AID7/a","bytes":1,"sha256":"{sha}"}}]}}"#
+        );
+        let m = Manifest::parse_collector(j.as_bytes()).unwrap();
+        assert_eq!(m.acoustic_id, 7);
+        assert!(m.speaker_thiele_small.is_some());
+        assert_eq!(m.files.len(), 1);
     }
 }

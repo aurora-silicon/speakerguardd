@@ -8,3 +8,8 @@
 
 pub mod kernel;
 pub mod lease;
+pub mod machine;
+pub mod observe;
+pub mod selfcheck;
+pub mod supervise;
+pub mod thermal;

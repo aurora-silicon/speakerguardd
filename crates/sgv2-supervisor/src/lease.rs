@@ -18,11 +18,26 @@ pub struct Observation {
     pub carrier_ok: bool,
     /// The speaker PCM is owned by the process hosting the plugin.
     pub pcm_owner_ok: bool,
+    /// The speaker PCM is Closed, Open (setup, prepared) or Running. Stopped
+    /// (XRUN, paused, suspended) or unknown is not.
+    pub pcm_state_ok: bool,
+    /// The speaker mux selects the watched PCM (from the kernel).
+    pub route_ok: bool,
+    /// Every expected amp reports faults, and the amps sit at the operating
+    /// point the parameters assume (from the kernel).
+    pub amps_ok: bool,
 }
 
 impl Observation {
     pub fn clean(&self) -> bool {
-        self.heartbeat_fresh && self.plugin_ok && self.links_ok && self.carrier_ok && self.pcm_owner_ok
+        self.heartbeat_fresh
+            && self.plugin_ok
+            && self.links_ok
+            && self.carrier_ok
+            && self.pcm_owner_ok
+            && self.pcm_state_ok
+            && self.route_ok
+            && self.amps_ok
     }
 }
 
@@ -68,8 +83,16 @@ impl Lease {
 mod tests {
     use super::*;
 
-    const CLEAN: Observation =
-        Observation { heartbeat_fresh: true, plugin_ok: true, links_ok: true, carrier_ok: true, pcm_owner_ok: true };
+    const CLEAN: Observation = Observation {
+        heartbeat_fresh: true,
+        plugin_ok: true,
+        links_ok: true,
+        carrier_ok: true,
+        pcm_owner_ok: true,
+        pcm_state_ok: true,
+        route_ok: true,
+        amps_ok: true,
+    };
 
     #[test]
     fn locks_after_two_clean_ticks_and_releases_on_any_fault() {
@@ -83,6 +106,9 @@ mod tests {
             Observation { links_ok: false, ..CLEAN },
             Observation { carrier_ok: false, ..CLEAN },
             Observation { pcm_owner_ok: false, ..CLEAN },
+            Observation { pcm_state_ok: false, ..CLEAN },
+            Observation { route_ok: false, ..CLEAN },
+            Observation { amps_ok: false, ..CLEAN },
         ] {
             assert_eq!(l.tick(fault), Action::Release);
             assert!(!l.held());

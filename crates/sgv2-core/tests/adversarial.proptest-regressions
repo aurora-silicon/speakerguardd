@@ -1,0 +1,28 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 9d91db9b25b7fd78ddcf82bfdf1e58efc99fba05c364dfc9a3ff610b1d309958 # shrinks to seed = 14306979716237168221, which = 2, n = 1, mutations = 2, fix = false
+cc 2fa7b0f27992a7651421e2c980b15b2d53016c1ad5ef0292715ffe3bbb453fe4 # shrinks to seed = 810215535641484521, n = 2, blk = 512, rate = 48000, ff = On, hot = false, len = 20736, amp = 0.01, h = Clean, sl = 0
+cc 2da34130fd02d1261b3cf4809ca0d6fd3cbd8d19ec32c286ea7bc279f66ebbfc # shrinks to seed = 1502134755928660682, n = 6, rate = 48000, ff = Off, secs = 2.335051794825414, amp = 0.5, h = Wild
+cc 6a60fb0e9c3a005306091b0006144d0f8a9fd9788e4107d5739ca88bd24fb688 # shrinks to seed = 15291783967019007862, n = 1, extra = 0, fewer = 0, frames = 0, short = 0, which = 2
+cc ea6bd85dd6c933aa6a9fb52db075831c43b2c4c6fe357618ca0b2e1a587ebd8b # shrinks to seed = 15066840109198751054, which = 1, n = 1, flip = 0
+cc 0a8a6d0d086152940213c2a8a646d56f7a8cf44a348f3725a35a14c427b97167 # shrinks to seed = 11548933508870852453, which = 1, n = 1, mutations = 1, fix = false
+cc c1abadade47feb64b3a625a2a555cb199f89b03cbb448c749a9fcde759d1e38d # shrinks to seed = 10718724689988528183, n = 3, amp = 1.672197, f = 1997.9778931516043
+cc 6a3625b3dd9e09f357b9287f2e6e99450d26431b649bbe586ccc4183c5085100 # shrinks to seed = 8627404440458320941, n = 2, amp = 0.3, f = 1325.9979589075697
+cc f86873df9f30d7ba583390cb0eab63ed218bac9c8ea5230ee404c5f512bf5c59 # shrinks to seed = 13800447911419971131, n = 1, amp = 0.3, f = 1672.3152530954735
+cc e13d300a1304e0f8a1db5a7b3bea4e91ba36cb05e0f9043404e73f6fa4163c2b # shrinks to seed = 2037991125700493766, n = 4, amp = 1.122032, f = 1012.1427973227097
+cc dc455f184f9eef3f17565bc647e70dc93b00d4c5b2fd770b2e7b6dbb442a01b3 # shrinks to seed = 5806800365313165976, n = 5, blk = 512, rate = 96000, ff = Off, len = 21587, amp = 0.01, h = Clean, a = 316476562485912059, b = 3063256365699115577
+cc 88f82fb8a6be866c9d477ecdf720924cf83e079c654855eab5f63ec7a317f86a # shrinks to seed = 5203223561178449467, n = 1, blk = 512, rate = 48000, ff = Off, hot = false, len = 1025, amp = 0.01, h = Wild, sl = 0
+cc d70d8ec0e8ebdd1d94f65ff9ea1a92de50da7afd9d5446713ab11e6d4e27bd6b # shrinks to seed = 3467628692416746154, which = 0, n = 1, mutations = 1, fix = true
+cc 89f2842a9430087526be73ba4c6cc258e973485b94b89e7cdfee6aa559a134cb # shrinks to seed = 23979567480302, n = 1, blk = 512, rate = 8000, ff = Off, len = 4801, amp = 1.1743827, h = Large, a = 8030099259665470754, b = 3750475902600345512
+cc f159b47cbea3e83015df8596be19cea1b5efbc95c22f434d424dc7610afe5047 # shrinks to seed = 12454083405945159347, n = 5, rate = 48000, ff = On, secs = 6.781198309929527, amp = 2.8513603, h = Large
+cc 49a56602ee1c6c317aa11c5b03966fe447bab5e9a49bfd94ff8fc7d63a8f7f92 # shrinks to seed = 16139987704930525198, n = 3, amp = 1.1400714, f = 798.7860112050939, tvc = 1.8476942, mg_ratio = 10.0, cold = false
+cc 68b992c39ad013a720bc640e3a9268642cdaf015d3769e9beb95bf6051f652b2 # shrinks to seed = 0, n = 1, blk = 512, rate = 8000, ff = Off, len = 129, amp = 0.01, h = Large, a = 258965001613998079, b = 6727371899266967444
+cc 191127d51b387827202a0ac75a2f0af19ffd2164d18088d028a014d0e0e4d9ed # shrinks to seed = 5742363217546372179, n = 3, rate = 9274, ff = On, secs = 4.545817360213377, amp = 0.5, h = Specials
+cc 2365de10a402a2bc4334b2363df3813e36260208fdc816429dbf6c38bddd975e # shrinks to seed = 5766640123818103535, n = 2, amp = 1.2203596, f = 177.0075059145032, tvc = 0.11853888, mg_ratio = 10.0, cold = false
+cc 93c2fbfab9c2c9f48011ee0bd3854f70321b43e6086929b2e20ae92acceb13ca # shrinks to seed = 1943771452814380787, n = 2, amp = 2.3590698, f = 68.0007493780425, tvc = 0.1, mg_ratio = 10.0, cold = false
+cc 4c69f5d32caf3e501b8ac0612c75c6e6a4bfba358b31cd7e75084a75332f1a1d # shrinks to seed = 6630303038198541121, which = 1, n = 3, mutations = 1, fix = true
+cc 54f18330d24211715b220ad41f8fff9ec981d7051aeaf20d21ab7f3fe75a21a6 # shrinks to seed = 14628931790605482143, which = 2, n = 1, mutations = 5, fix = true

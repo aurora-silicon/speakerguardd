@@ -44,6 +44,34 @@ It renews the interlock only while these all hold:
 
 Any failure releases the interlock at once, and the kernel's own safe level applies. That safe level is the hardware floor whenever no protection holds the amplifiers. There is no chaining to other daemons.
 
+## Binding a blob to its machine
+
+The compiler (`aurora-speaker-tuning compile`) refuses, with no blob, any tuning the engine must not run: an error finding from the reader, an unverified bundle (unless `--development`), a channel count other than the board's amp count, or parameters the engine would answer with the fail-safe.
+
+The blob header (`sgv2_core::blob`, version 1, 48 bytes) carries, in what were reserved bytes:
+
+| Offset | Size | Field |
+|---|---|---|
+| 36 | 8 | the board: the first device-tree root `compatible` without `apple,`, ASCII, NUL-padded |
+| 44 | 4 | the operating point: output peak voltage at digital full scale, mV |
+
+The supervisor (`sgv2-supervisor`, `main.rs`) refuses a blob that names another board or no operating point, and grants only while every amp reads back that operating point. The compiler takes the board from the device tree, or from `--board` when compiling for another Mac.
+
+The operating point comes from the tuning, in peak volts at a normalized sample of 1 (Daybreak t-4662): spp3 `ag`, lsm2 `VoltsFullScale`, and atsp `Amplifier sensitivity`. The header holds one value, channel 0's. The payload keeps each channel's own value, and all of them must lie within 0.25 dB of the header's, the supervisor's tolerance. The J700's 7.30 V and 7.33 V are 0.036 dB apart and pass. The machine description (`aurora-speaker-tuning::machine`) is a cross-check. It holds the amp gain the kernel fixes, whose dBV is rms-referenced, so 18.5 dBV is 11.899 V peak against AID35's `ag` of 11.89 V. A disagreement of more than 0.25 dB is reported as a warning. If the supervisor lane settles on per-channel operating points in the header, the compiler will emit them.
+
+The speaker-assembly ID (`spid`) selects the vendor strip. The reader takes it from, in order: an explicit override; the installer manifest's `speaker_id` (read on macOS from the IORegistry `speakerID`); the device tree's `/chosen/asahi,speaker-id`. A manifest value that disagrees with the device tree's is an error. m1n1 does not export `asahi,speaker-id` yet: it would read the strap GPIOs that the Apple device tree names (`function-speaker-id0/1`; AP GPIO 52/53 on the J616s), validate the result against `valid-speaker-ids`, and write it to the FDT. Linux never requests those GPIOs itself, since claiming a line is not a passive read.
+
+Not in the header yet, pending agreement with the supervisor lane:
+- the acoustic-id;
+- the speaker ID.
+
+No byte of the version-1 header is free for them. Proposal for a header version 2:
+- at offset 48, the acoustic-id (u32);
+- at 52, the speaker ID (u32);
+- at 56, flags (u32), bit 0 meaning the speaker ID is present.
+
+With these, the supervisor can compare the acoustic-id with the installed bundle's manifest, and the speaker ID with the device tree export once it exists. Until then, the compiler checks the acoustic-id against an independently known value when the caller has one (`Machine::acoustic_id`). On Linux no such value exists, so the binding rests on the board and the speaker ID used for selection.
+
 ## Rollout
 
 speakerguardd replaces what a machine runs today only once that machine passes the differential qualification:
