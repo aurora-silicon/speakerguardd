@@ -199,17 +199,46 @@ def gz(path):
 
 def decode_clsp(logdir, nch):
     """spp3 closed-loop logs: T_Coil_chN (10 Float32 per 512-frame block) and the
-    'Reb_Data' controller stream (14 Float32 per 256-frame thermal update)."""
+    'Reb_Data' controller stream (14 Float32 per 256-frame thermal update). A rebuilt
+    instance (rig_host newinst events) opens new log files: they are joined in name order."""
     out = {}
     for key, width in (("T_Coil", 10), ("Reb_Data", 14)):
         rows = []
         for c in range(nch):
-            fs = glob.glob(os.path.join(logdir, f"*_{key}_ch{c}_*"))
-            a = np.fromfile(fs[0], np.float32) if fs else np.zeros(0, np.float32)
+            fs = sorted(glob.glob(os.path.join(logdir, f"*_{key}_ch{c}_*")),
+                        key=lambda f: (os.path.basename(f)[:17], os.path.getmtime(f)))
+            a = np.concatenate([np.fromfile(f, np.float32) for f in fs]) if fs else np.zeros(0, np.float32)
             rows.append(a[: a.size // width * width].reshape(-1, width))
         n = min(len(r) for r in rows)
         out[key] = (np.stack([r[:n] for r in rows]), [len(r) for r in rows])
     return out
+
+
+def patch_sidecar(pl, patch):
+    """Apply a sidecar patch. Either {key: value} for every channel's OL_thermal (the original
+    form), or a dict with any of: "global": {key: value} (top level), and "<Section>" or
+    "Channel<N>.<Section>" keys ({key: value}) for every channel or one channel; Section is
+    OL_thermal, CL or OL_disp. A value of None deletes the key."""
+    def put(d, kv):
+        for k, v in kv.items():
+            if v is None:
+                d.pop(k, None)
+            else:
+                d[k] = v
+    sections = ("OL_thermal", "CL", "OL_disp")
+    if not any(k == "global" or k.split(".")[-1] in sections for k in patch):
+        patch = {"OL_thermal": patch}
+    for k, kv in patch.items():
+        if k == "global":
+            put(pl, kv)
+            continue
+        if "." in k:
+            chn, sec = k.split(".", 1)
+            put(pl["ChannelSpecificParams"][chn][sec], kv)
+        else:
+            for ch in pl["ChannelSpecificParams"].values():
+                put(ch[k], kv)
+    return pl
 
 
 def runtime_signal(name, nch):
@@ -245,25 +274,36 @@ def run_case(c, outroot, force=False):
                RIGREDIR_TO=os.path.join(d, "logs"))
     if c["signal"].startswith("rt-"):
         runtime_signal(c["signal"], nch)
+    elif c.get("gen"):
+        c["gen"](os.path.join(SIG, f"{c['signal']}.{nch}ch.f32"), nch)
     # The edge list sets no run-time graph properties: only the case's own fixtures.
     runtime_file, cfprops = capture.resolve_cfprops(c, use_runtime=False)
     args = [os.path.join(BIN, "rig_host"), "--unit", unit, "--strip", strip_path(aid),
             "--in", os.path.join(SIG, f"{c['signal']}.{nch}ch.f32"), "--ch", str(nch),
             "--q", str(q), "--out", os.path.join(d, "run")]
+    if c.get("sr"):
+        args += ["--sr", str(c["sr"])]
     for ev in c.get("events", []):
         args += ["--event", ev]
+    if c.get("dump_params"):
+        args += ["--dump-params"]
     expect_frames = os.path.getsize(os.path.join(SIG, f"{c['signal']}.{nch}ch.f32")) // (4 * nch)
     if unit == "spp3":
         sc = sidecar_path(aid)
         if c.get("sidecar_patch"):
-            patched_sidecar = plistlib.load(open(sc, "rb"))
-            for ch in patched_sidecar["ChannelSpecificParams"].values():
-                ch["OL_thermal"].update(c["sidecar_patch"])
+            patched_sidecar = patch_sidecar(plistlib.load(open(sc, "rb")), c["sidecar_patch"])
             sc = os.path.join(d, "sidecar.plist")
         args += ["--sidecar", sc]
         props, paths = propstrip(unit, aid)
+        # "props": {ID: value or None}: replace or drop propstrip box properties
+        for pid, val in c.get("props", {}).items():
+            props = [p for p in props if p.split("=")[0] != str(pid)]
+            if val is not None:
+                props.append(f"{pid}={val}")
         for pr in props:
             args += ["--prop", pr]
+        for pr in c.get("params", []):
+            args += ["--param", pr]
         for pr in paths:
             args += ["--plistprop", pr]
         for pr in cfprops:
@@ -271,9 +311,10 @@ def run_case(c, outroot, force=False):
         if c.get("plant"):
             args += ["--plant", os.path.join(d, "plant.json")]
         if c.get("clsp"):
-            env.update(RIGREDIR_FROM="/Library/Preferences/Audio/CLSPLogs", RIGPREF_clsp_logging_level=CLSP_LEVEL)
+            env.update(RIGREDIR_FROM="/Library/Preferences/Audio/CLSPLogs", RIGPREF_clsp_logging_level=str(c.get("clsp_level", CLSP_LEVEL)))
     signal = os.path.join(SIG, f"{c['signal']}.{nch}ch.f32")
-    key = capture.inputs_key(args + [json.dumps(c, sort_keys=True)], signal, runtime_file, cfprops)
+    key = capture.inputs_key(args + [json.dumps({k: v for k, v in c.items() if k != "gen"}, sort_keys=True)],
+                             signal, runtime_file, cfprops)
     if not force and capture.cached(d, key):
         return d
     shutil.rmtree(d, ignore_errors=True)
@@ -285,7 +326,7 @@ def run_case(c, outroot, force=False):
     if unit == "spp3" and c.get("plant"):
         json.dump(c["plant"], open(os.path.join(d, "plant.json"), "w"), indent=1)
     t0 = time.time()
-    pace = 25.0 if c.get("clsp") else 0.0
+    pace = c.get("pace", 25.0) if c.get("clsp") else 0.0
     logp = logf = None
     if any(p["id"] == capture.SPTS_PROP for p in cfprops):
         predicate = ('process == "rig_host" AND '
@@ -308,13 +349,28 @@ def run_case(c, outroot, force=False):
                 break
             # every block's controller record must be present, or the timeline has holes
             cl = decode_clsp(os.path.join(d, "logs"), nch)
-            want = (expect_frames // 512, expect_frames // 256)
+            # the thermal cadence is 256 frames at 44.1 and 48 kHz and 512 at 96 kHz (observed)
+            per = 256 * max(1, round(c.get("sr", SR) / SR))
+            want = (int(expect_frames // (2 * per)), int(expect_frames // per))
             got = (cl["T_Coil"][1], cl["Reb_Data"][1])
             if all(n >= want[0] for n in got[0]) and all(n >= want[1] for n in got[1]):
                 break
+            # An instance rebuild (uninit/reinit/newinst events) can drop or restart a log file:
+            # accept 80% after the first pace halving (records lost there are never recovered by a
+            # slower pace); the public meters and audio stay complete, and clsp_records shows the gaps.
+            rebuild = any(e.split(":", 1)[1].split("=")[0] in ("uninit", "reinit", "newinst", "newinst_ci")
+                          for e in c.get("events", []))
+            if rebuild and pace < 25 and all(n >= 0.8 * want[1] for n in got[1]):
+                break
             if pace <= 3:
-                raise RuntimeError(f"{c['name']}: log records lost even at pace {pace}: {got} want {want}")
-            pace /= 2
+                # under host load the unit's log writer drops records at any pace: retry a few
+                # times at the lowest pace before giving up
+                tries = c.setdefault("_low_pace_tries", 0) + 1
+                c["_low_pace_tries"] = tries
+                if tries > 4:
+                    raise RuntimeError(f"{c['name']}: log records lost even at pace {pace}: {got} want {want}")
+            else:
+                pace /= 2
             for f in os.listdir(os.path.join(d, "logs")):
                 os.unlink(os.path.join(d, "logs", f))
     finally:
@@ -332,14 +388,17 @@ def run_case(c, outroot, force=False):
     decisions = {"closed_loop_channels": [], "open_loop_channels": []}
     if logf:
         decisions = capture.parse_decisions(open(os.path.join(d, "au.log")).read(), host_pid)
-    meta.update(case=c, aid=aid, host_pid=host_pid, wall_s=round(time.time() - t0, 2), pace=pace, runtime_file=runtime_file,
+    c.pop("_low_pace_tries", None)
+    meta.update(case={k: v for k, v in c.items() if k != "gen"}, aid=aid, host_pid=host_pid,
+                wall_s=round(time.time() - t0, 2), pace=pace, runtime_file=runtime_file,
                 cfprops=cfprops, inputs_sha256=key, **decisions)
     if c.get("clsp"):
         cl = decode_clsp(os.path.join(d, "logs"), nch)
         np.savez_compressed(os.path.join(d, "clsp.npz"), t_coil=cl["T_Coil"][0], ctl=cl["Reb_Data"][0])
         meta["clsp_records"] = {"t_coil": cl["T_Coil"][1], "ctl": cl["Reb_Data"][1]}
-        shutil.rmtree(os.path.join(d, "logs"))
-        os.makedirs(os.path.join(d, "logs"), mode=0o700)
+        if not c.get("keep_logs"):
+            shutil.rmtree(os.path.join(d, "logs"))
+            os.makedirs(os.path.join(d, "logs"), mode=0o700)
     json.dump(meta, open(os.path.join(d, "run.meta.json"), "w"), indent=1)
     write_trace(d, c, meta)
     for f in ("run.out.f32", "run.tele.f32", "run.state.csv", "trace.jsonl"):
