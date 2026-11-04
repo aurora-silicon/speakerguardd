@@ -797,3 +797,53 @@ fn fast_poles_settle_without_a_limit_cycle() {
     assert!(peak_settle < 92.0, "peak after the onset {peak_settle}");
     assert!(peak_late <= 90.2, "late peak {peak_late}");
 }
+
+/// Rig law 6a, by policy not reproduced: at full-scale drive (49 W) an
+/// AID35-like woofer's feed-forward node passes 1000 K (steady Pdrv x
+/// T_sett_vc is about 1277 K), where the reference re-seeds its nodes and T_OL snaps down to
+/// about the limit. Here the state keeps integrating, T_OL never drops
+/// abruptly under constant drive, and the hard path holds while the node is
+/// out of range, flagged MODEL_RANGE.
+#[test]
+fn full_scale_drive_never_lowers_t_ol_abruptly() {
+    let mut p = params();
+    p.thermal_ambient_temp = 50.0;
+    p.thermal_gain_attack_time_s = 4.6;
+    p.thermal_gain_release_time_s = 20.0;
+    for c in 0..4 {
+        let ch = &mut p.ch[c];
+        (ch.t_sett_vc, ch.t_sett_mg, ch.tau_tvc, ch.tau_tmg) = (26.06, 25.55, 5.532, 197.25);
+        (ch.temperature_limit, ch.hard_temp_limit_headroom) = (140.0, 10.0);
+        (ch.reb_ref, ch.rshunt, ch.ag, ch.thermal_ff_speedup_factor) = (2.7, 0.09, 11.89, 0.25);
+    }
+    let mut u = spp3::Unit::new(p);
+    assert!(!u.is_failsafe());
+    let n = 512;
+    let w = 2.0 * std::f64::consts::PI * 1000.0 / RATE as f64;
+    let mut ob = vec![vec![0.0f32; n]; 4];
+    let (mut prev, mut k, mut flagged, mut worst_drop) = (f32::NAN, 0usize, false, 0.0f32);
+    for _ in 0..(20 * RATE as usize / n) {
+        // a full-scale square: Pdrv = ag^2 Reb / (Reb + Rshunt)^2 = 49 W
+        let x: Vec<f32> = (0..n).map(|j| ((k + j) as f64 * w).sin().signum() as f32).collect();
+        k += n;
+        let ins: Vec<&[f32]> = (0..4).map(|_| &x[..]).collect();
+        let mut outs: Vec<&mut [f32]> = ob.iter_mut().map(|b| &mut b[..]).collect();
+        let h = u.process(Io { frames: n, input: &ins, sense: &[], output: &mut outs });
+        let mut t = Telemetry::new();
+        u.telemetry(&mut t);
+        let tol = t.channels[0].ol_temp_c;
+        if prev.is_finite() {
+            worst_drop = worst_drop.max(prev - tol);
+        }
+        prev = tol;
+        if h.0 & Health::MODEL_RANGE != 0 {
+            flagged = true;
+            // the hard path holds while the node is out of range: its
+            // candidate (the node is huge) keeps the gain well down
+            assert!(u.controller_state(0)[1] < 0.5, "{}", u.controller_state(0)[1]);
+        }
+    }
+    assert!(flagged, "the feed-forward node never left its range");
+    // cooling under constant drive is slow (tau_vc 5.5 s): no snap
+    assert!(worst_drop < 0.5, "T_OL dropped {worst_drop} C in one call");
+}

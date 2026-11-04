@@ -87,6 +87,10 @@ impl Health {
     /// A model state went non-finite. The unit has latched the fail-safe
     /// until `reset`; it never trusts that state again.
     pub const MODEL_FAULT: u32 = 1 << 4;
+    /// A model state left its plausible range (spp3: the feed-forward node
+    /// above 1000 K). The unit holds its hard path while it lasts; the
+    /// state keeps integrating (the reference would re-seed it lower).
+    pub const MODEL_RANGE: u32 = 1 << 5;
 
     pub fn is_failsafe(self) -> bool {
         self.0 & Self::FAILSAFE != 0

@@ -575,6 +575,9 @@ const INPUT_CLAMP: f32 = 1.5;
 /// Shortest accepted thermal time constant (coil, magnet and the
 /// feed-forward pole), s: the reference's documented parameter minimum.
 pub const TAU_MIN_S: f32 = 0.1;
+/// Feed-forward node rise beyond which the reference re-seeds its state
+/// (rig law 6a), K.
+const FF_RANGE_K: f64 = 1000.0;
 /// Release hold of the ordinary candidate, s (rig law 5: fixed).
 const HOLD_S: f64 = 1.0;
 /// Dezipper 99 % settling time, s (spec 6).
@@ -1120,6 +1123,8 @@ struct Chan {
     hold: Hold,
     g_hard: f64,
     armed: bool,
+    /// The feed-forward node is above [`FF_RANGE_K`].
+    out_of_range: bool,
     vi_power: f64,
 }
 
@@ -1150,6 +1155,7 @@ impl Chan {
         self.hold = HOLD_START;
         self.g_hard = 1.0;
         self.armed = false;
+        self.out_of_range = false;
         self.vi_power = f64::NAN;
     }
 }
@@ -1459,6 +1465,7 @@ impl Run {
                 hold: HOLD_START,
                 g_hard: 1.0,
                 armed: false,
+                out_of_range: false,
                 vi_power: f64::NAN,
             };
             chan.seed();
@@ -1685,6 +1692,16 @@ impl Run {
             } else if t_ol < limit {
                 c.armed = false;
             }
+            // Rig law 6a: with the feed-forward node above 1000 K the
+            // reference re-seeds all three nodes to the hot split, which
+            // snaps T_OL down to about TemperatureLimit while the drive
+            // continues (163 -> 140.7 C on law-clip). By policy the engine
+            // keeps integrating the real state and holds the hard path
+            // while the node is out of range, flagged MODEL_RANGE.
+            c.out_of_range = c.ff_on && c.ff.theta > FF_RANGE_K;
+            if c.out_of_range {
+                c.armed = true;
+            }
             // without the feed-forward filter the reference has no working
             // hard path (rig law 6); by policy the fixed 20 dB holds the
             // limit here (module docs)
@@ -1819,6 +1836,9 @@ impl ProtectionUnit for Unit {
         if !run.sense_ok {
             health |= Health::OPEN_LOOP;
         }
+        if run.ch.iter().any(|c| c.out_of_range) {
+            health |= Health::MODEL_RANGE;
+        }
         Health(health)
     }
 
@@ -1835,6 +1855,9 @@ impl ProtectionUnit for Unit {
         out.health = Health(if run.sense_ok { 0 } else { Health::OPEN_LOOP });
         if run.fault {
             out.health = Health(Health::FAILSAFE | Health::MODEL_FAULT);
+        }
+        if run.ch.iter().any(|c| c.out_of_range) {
+            out.health = Health(out.health.0 | Health::MODEL_RANGE);
         }
         for c in run.ch.iter() {
             let g = &run.groups[c.group];
