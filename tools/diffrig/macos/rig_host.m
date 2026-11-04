@@ -91,6 +91,7 @@ typedef struct Plant {
     // time schedule: from frame ev_frame[k], field ev_field[k] takes ev_val[k][c] (NAN = dynamic)
     int nev, nextev; long long nframe;
     long long ev_frame[MAXEV]; int ev_field[MAXEV]; double ev_val[MAXEV][MAXCH];
+    double v_sat[MAXCH], i_sat[MAXCH];  // raw sense full scale (clips there; INFINITY = none)
 } Plant;
 
 // schedulable plant fields
@@ -111,7 +112,8 @@ static void plantLoad(Plant *p, const char *path, int nspk, double sr) {
     // (the old "faults" list) would otherwise silently drop what it asked for.
     static const char *known[] = {"comment", "delay_frames", "order", "t_ambient", "volts_fs", "vmon_scale",
                                   "imon_scale", "re20", "alpha", "rshunt", "rth_vc", "rth_mg", "tau_vc",
-                                  "tau_mg", "fixed_temp", "i_gain", "v_gain", "t_start", "schedule"};
+                                  "tau_mg", "fixed_temp", "i_gain", "v_gain", "t_start", "schedule",
+                                  "v_sat", "i_sat"};
     for (NSString *k in d) {
         int ok = 0;
         for (unsigned j = 0; j < sizeof known / sizeof *known; ++j) ok |= [k isEqual:@(known[j])];
@@ -139,6 +141,9 @@ static void plantLoad(Plant *p, const char *path, int nspk, double sr) {
         p->fixed_temp[c] = jnum(d, @"fixed_temp", c, NAN);
         p->i_gain[c] = jnum(d, @"i_gain", c, 1); p->v_gain[c] = jnum(d, @"v_gain", c, 1);
         p->t_vc[c] = p->t_mg[c] = jnum(d, @"t_start", c, p->t_amb);
+        // the sense converters' own full scale: the raw sample clips there
+        p->v_sat[c] = jnum(d, @"v_sat", c, INFINITY);
+        p->i_sat[c] = jnum(d, @"i_sat", c, INFINITY);
     }
     // "schedule": [{"t": seconds, "i_gain": x | [x per speaker], "v_gain": ..., "fixed_temp": T | null}, ...]
     // A listed field takes the new value from that time on (fault injection and sense steps
@@ -201,8 +206,9 @@ static void plantStep(Plant *p, float *tele, int telech, float out[MAXCH][MAXQ],
                 p->t_vc[c] += dt * ((pw * p->rth_vc[c] - (tvc - tmg)) / p->tau_vc[c]);
                 p->t_mg[c] += dt * ((pw * p->rth_mg[c] - (tmg - p->t_amb)) / p->tau_mg[c]);
             }
-            float iv = (float)(p->i_gain[c] * cur / p->imon_scale[c]);
-            float vv = (float)(p->v_gain[c] * v / p->vmon_scale[c]);
+            double ir = p->i_gain[c] * cur / p->imon_scale[c], vr = p->v_gain[c] * v / p->vmon_scale[c];
+            float iv = (float)fmax(-p->i_sat[c], fmin(p->i_sat[c], ir));
+            float vv = (float)fmax(-p->v_sat[c], fmin(p->v_sat[c], vr));
             tele[i * telech + 2 * c + (p->order_iv ? 0 : 1)] = iv;
             tele[i * telech + 2 * c + (p->order_iv ? 1 : 0)] = vv;
         }
