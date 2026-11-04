@@ -871,7 +871,7 @@ mod tests {
         // missing file passed the refusal half for the wrong reason)
         let conf = std::env::temp_dir().join(format!("speakerguardd-x4-{}", std::process::id()));
         std::fs::create_dir_all(conf.join("apple")).unwrap();
-        for (m, text) in [("j316", include_str!("../conf/apple/j316.conf")), ("j413", include_str!("../conf/apple/j413.conf")), ("j616", include_str!("../conf/apple/j616.conf")), ("j700", include_str!("../conf/apple/j700.conf"))] {
+        for (m, text) in [("j316", include_str!("../conf/apple/j316.conf")), ("j413", include_str!("../conf/apple/j413.conf")), ("j616", include_str!("../conf/apple/j616.conf")), ("j700", include_str!("../conf/apple/j700.conf")), ("j713", include_str!("../conf/apple/j713.conf"))] {
             std::fs::write(conf.join("apple").join(format!("{m}.conf")), text).unwrap();
         }
         for m in ["j316", "j413", "j616"] {
@@ -882,6 +882,7 @@ mod tests {
         let missing = conf.join("apple").join("j000.conf");
         assert_eq!(exit_status(&load_config(&missing, &args(&conf)).unwrap_err()), EXIT_REFUSED);
         assert!(load_config(&conf.join("apple").join("j700.conf"), &args(&conf)).is_ok());
+        assert!(load_config(&conf.join("apple").join("j713.conf"), &args(&conf)).is_ok());
         let other: Box<dyn std::error::Error> = "sense capture: EIO".into();
         assert_eq!(exit_status(other.as_ref()), 1);
         let _ = std::fs::remove_dir_all(&conf);
