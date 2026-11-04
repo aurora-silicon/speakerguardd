@@ -118,6 +118,7 @@ def cases():
     # J616s live-test incident (2026-11-05): music over full scale (about 36 W woofer
     # drive) with the closed loop running; ideal sense, and sense converters that clip
     for g in ("1p6", "2p5"):
+        C.append(dict(name=f"spp3-tokyo-x{g}", unit="spp3", signal=f"tokyo_30s_x{g}"))
         for plant, tag in (("plant-aid35-like.json", ""), ("plant-aid35-like-sat.json", "-vsat")):
             C.append(dict(name=f"spp3-cl-tokyo-x{g}{tag}", unit="spp3", signal=f"tokyo_30s_x{g}",
                           plant=plant, cfprops=["64009=spts-synth-nominal.json"], log_level="2"))
