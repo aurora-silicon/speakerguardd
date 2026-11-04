@@ -221,10 +221,9 @@ fn open_out(p: &Option<String>) -> io::Result<Option<BufWriter<File>>> {
 enum Event {
     /// `AudioUnitReset`: the unit's `host_reset`.
     Reset,
-    /// Wall-clock idle before the next call, s. No thermal time passes in
-    /// the render (the reference ignores it too), but a following rebuild
-    /// ages its hand-off record by it.
-    Sleep(f64),
+    /// Wall-clock idle before the next call, s. No thermal time passes,
+    /// not even across a rebuild (the reference ignores it too).
+    Sleep,
     /// A render-timestamp jump, or a ClassInfo get/set: no effect.
     None,
     /// `uninit`/`reinit`/`newinst`/`newinst_ci` with an optional 64007
@@ -238,7 +237,10 @@ impl Event {
         let (k, v) = what.split_once('=').map_or((what, None), |(k, v)| (k, Some(v)));
         Some(match k {
             "reset" => Event::Reset,
-            "sleep" => Event::Sleep(v?.parse().ok()?),
+            "sleep" => {
+                v?.parse::<f64>().ok()?;
+                Event::Sleep
+            }
             "tsjump" | "classinfo" => Event::None,
             "uninit" | "reinit" | "newinst" | "newinst_ci" => Event::Rebuild(v.map(|v| v.parse()).transpose().ok()?),
             _ => return None,
@@ -277,33 +279,32 @@ fn render(
     let cfprop_ids: Vec<String> = cfprops.iter().map(u32::to_string).collect();
     let cfprop_ids = cfprop_ids.join(",");
     let (mut pos, mut k) = (0usize, 0usize);
-    let mut gap = 0.0f64;
+    let mut next_event = 0usize;
     while pos < frames {
-        for (_, e) in events.iter().filter(|(f, _)| *f == pos) {
+        // rig_host applies an event before the first call that starts at or
+        // after its frame; it never splits a call
+        let due = events[next_event..].iter().take_while(|(f, _)| *f <= pos).count();
+        for (_, e) in &events[next_event..next_event + due] {
             match *e {
                 Event::Reset => unit.host_reset(),
-                Event::Sleep(s) => gap += s,
+                Event::Sleep => {}
                 Event::None => {}
                 Event::Rebuild(p) => {
                     let mut rec = HandOff::EMPTY;
                     let saved = unit.save_state(&mut rec);
                     let new = rebuild(p).ok_or_else(|| io::Error::other("no rebuild model for this unit"))?;
                     *unit = new;
-                    // only 64007 = 0 restores the record (rig law 6)
+                    // only 64007 = 0 restores the record, and with no ageing:
+                    // the rig's newinst=0 after 2 s of idle continues at the
+                    // saved temperature (rig law 6)
                     if p == Some(0) && saved {
-                        unit.restore_state(&rec, gap);
+                        unit.restore_state(&rec, 0.0);
                     }
                 }
             }
         }
-        if events.iter().any(|(f, _)| *f == pos) {
-            gap = 0.0;
-        }
-        let mut n = slices[k % slices.len()].min(frames - pos);
-        // an event inside a slice splits it, as host events fall between calls
-        if let Some(&(r, _)) = events.iter().find(|(r, _)| *r > pos && *r < pos + n) {
-            n = r - pos;
-        }
+        next_event += due;
+        let n = slices[k % slices.len()].min(frames - pos);
         k += 1;
         let ins: Vec<&[f32]> = program.iter().map(|c| &c[pos..pos + n]).collect();
         // Sense shorter than the program reads as silence (dead sense).
@@ -363,6 +364,8 @@ fn run(a: &Args) -> io::Result<()> {
     }
     let cfprop_ids: Vec<u32> = a.cfprops.iter().map(|(id, _)| *id).collect();
     let (mut unit, params) = make_unit(a.unit, blob.as_deref());
+    let mut events = a.events.clone();
+    events.sort_by_key(|(f, _)| *f);
     let kind = a.unit;
     let rebuild = |p: Option<u32>| -> Option<Box<dyn ProtectionUnit>> {
         let b = blob.as_deref()?;
@@ -396,7 +399,7 @@ fn run(a: &Args) -> io::Result<()> {
         &sense,
         &a.slices,
         &cfprop_ids,
-        &a.events,
+        &events,
         &rebuild,
         trace,
         audio.as_mut().map(|w| w as &mut dyn Write),
@@ -513,7 +516,7 @@ mod tests {
     #[test]
     fn host_events_parse() {
         assert_eq!(Event::parse("reset"), Some(Event::Reset));
-        assert_eq!(Event::parse("sleep=2"), Some(Event::Sleep(2.0)));
+        assert_eq!(Event::parse("sleep=2"), Some(Event::Sleep));
         assert_eq!(Event::parse("tsjump=240000"), Some(Event::None));
         assert_eq!(Event::parse("classinfo"), Some(Event::None));
         assert_eq!(Event::parse("newinst=0"), Some(Event::Rebuild(Some(0))));
