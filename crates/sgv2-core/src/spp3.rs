@@ -1803,20 +1803,26 @@ impl ProtectionUnit for Unit {
             s.coil_temp_c = t_ol;
             s.magnet_temp_c = (run.ambient + c.mg.theta) as f32;
             s.ol_temp_c = t_ol;
+            // the effective limit against the ordinary TemperatureLimit, as the
+            // reference's controller record logs it: a latched SafeTlim shows
+            // as SafeTlim - TemperatureLimit, a closed-loop relaxation as the
+            // positive excess
+            s.tlim_adj_c = (c.tlim_eff - c.safe.normal) as f32;
             match c.cl.as_ref() {
                 Some(cl) => {
                     s.cl_temp_c = cl.t_cl as f32;
-                    s.tlim_adj_c = if cl.active { (cl.limit_s - c.safe.base()) as f32 } else { 0.0 };
                     s.closed_loop = true;
                 }
                 None => {
                     s.cl_temp_c = T_CL_UNMEASURED;
-                    s.tlim_adj_c = 0.0;
                     s.closed_loop = false;
                 }
             }
-            // axis 4 is temperature: the selected (pre-dezipper) target
-            s.axis_gain[4] = g.sel;
+            // the part meters (spp3 part 64/65/66): thermal is the applied
+            // gain; displacement and CPMS power are disabled and unity
+            s.axis_gain[1] = 1.0;
+            s.axis_gain[3] = 1.0;
+            s.axis_gain[4] = if run.fault { FAILSAFE_GAIN } else { g.z2 };
             s.gain = if run.fault { FAILSAFE_GAIN } else { g.z2 };
             out.channels[c.src] = s;
         }
