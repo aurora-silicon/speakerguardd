@@ -64,6 +64,14 @@ def main(argv):
                 "--slices", slices or str(meta["quantum"]),
                 "--out", os.path.join(o, "trace.jsonl"), "--audio-out", os.path.join(o, "out.f32")]
         tele = os.path.join(d, "run.tele.f32")
+        if meta.get("tele_bus") and not os.path.isfile(tele) and os.path.isfile(tele + ".gz"):
+            # compact captures keep the recorded sense gzipped; the renderer reads raw Float32
+            import gzip
+            import shutil
+            tele_raw = os.path.join(o, "sense.f32")
+            with gzip.open(tele + ".gz", "rb") as fi, open(tele_raw, "wb") as fo:
+                shutil.copyfileobj(fi, fo)
+            tele = tele_raw
         if meta.get("tele_bus") and os.path.isfile(tele):
             args += ["--sense", tele, "--sense-ch", "12"]
         if unit in blobs:

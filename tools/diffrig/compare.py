@@ -30,6 +30,7 @@ linear audio below limiting. Power and mechanical states are relative.
 TODO(SPEC): tolerances for lsm2 mask and velocity state once its plan fixes them.
 """
 import json
+import os
 import math
 import sys
 
@@ -58,9 +59,18 @@ AUDIO_TOLERANCE = 1e-5
 REL_FLOOR = {"modeled_power_w": 1e-3, "measured_power_w": 1e-3, "displacement_m": 1e-6, "velocity_m_s": 1e-4}
 
 
+def _open(path, mode="r"):
+    """Open path, or its gzipped form (path.gz) when only that exists."""
+    import gzip
+
+    if not os.path.exists(path) and os.path.exists(path + ".gz"):
+        return gzip.open(path + ".gz", mode + "t" if mode == "r" else mode)
+    return open(path, mode)
+
+
 def load(path):
     out = {}
-    with open(path) as fd:
+    with _open(path) as fd:
         for n, line in enumerate(fd, 1):
             if not line.strip():
                 continue
@@ -159,7 +169,7 @@ def read_f32(path):
     import array
 
     a = array.array("f")
-    with open(path, "rb") as fd:
+    with _open(path, "rb") as fd:
         a.frombytes(fd.read())
     if sys.byteorder != "little":
         a.byteswap()

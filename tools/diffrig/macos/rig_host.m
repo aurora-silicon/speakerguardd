@@ -10,7 +10,7 @@
 //   rig_host --unit spp3|lsm2|atsp --strip X.austrip [--sidecar X.plist] [--spts X.bin]
 //            [--prop ID=U32 ...] --in in.f32 --ch N [--q 512] [--sr 48000]
 //            [--tele tele.f32 --tele-ch 12] [--plant plant.json] [--no-tele]
-//            [--every K] --out PREFIX
+//            [--event FRAME:reset|FRAME:sleep=S|FRAME:tsjump=N ...] [--every K] --out PREFIX
 // in.f32 is interleaved float32 with N channels. Outputs: PREFIX.out.f32 (interleaved),
 // PREFIX.state.csv, PREFIX.tele.f32 (telemetry actually fed), PREFIX.meta.json.
 #import <AudioToolbox/AudioToolbox.h>
@@ -21,6 +21,7 @@
 #define MAXCH 8
 #define MAXQ 4096
 #define MAXTELE 16
+#define MAXEV 256
 
 static UInt32 fcc(const char *s) { return ((UInt32)s[0] << 24) | ((UInt32)s[1] << 16) | ((UInt32)s[2] << 8) | (UInt32)s[3]; }
 static void ck(OSStatus s, const char *w) { if (s) { fprintf(stderr, "%s: %d\n", w, (int)s); } }
@@ -45,7 +46,7 @@ static AudioUnit makeUnit(const char *st, UInt32 *version) {
 }
 
 // ---- our speaker plant model (used only to synthesise V/I telemetry) ----
-typedef struct {
+typedef struct Plant {
     int enabled, delay;          // delay in frames between AU output and sense sample
     int order_iv;                // 1: [I,V] per speaker, 0: [V,I]
     int nspk;
@@ -57,7 +58,14 @@ typedef struct {
     double fixed_temp[MAXCH];    // NAN: dynamic thermal plant; else hold coil at this °C
     double i_gain[MAXCH], v_gain[MAXCH]; // fault injection multipliers (0 = dead sense)
     float *ring; int ringlen, ringpos;
+    // time schedule: from frame ev_frame[k], field ev_field[k] takes ev_val[k][c] (NAN = dynamic)
+    int nev, nextev; long long nframe;
+    long long ev_frame[MAXEV]; int ev_field[MAXEV]; double ev_val[MAXEV][MAXCH];
 } Plant;
+
+// schedulable plant fields
+static const char *kSchedField[] = {"i_gain", "v_gain", "fixed_temp"};
+static double *plantField(struct Plant *p, int f);
 
 static double jnum(NSDictionary *d, NSString *k, int c, double def) {
     id v = d[k];
@@ -92,14 +100,54 @@ static void plantLoad(Plant *p, const char *path, int nspk, double sr) {
         p->i_gain[c] = jnum(d, @"i_gain", c, 1); p->v_gain[c] = jnum(d, @"v_gain", c, 1);
         p->t_vc[c] = p->t_mg[c] = jnum(d, @"t_start", c, p->t_amb);
     }
+    // "schedule": [{"t": seconds, "i_gain": x | [x per speaker], "v_gain": ..., "fixed_temp": T | null}, ...]
+    // A listed field takes the new value from that time on (fault injection and sense steps
+    // during a run); null for fixed_temp returns the coil to the dynamic plant.
+    NSArray *sch = d[@"schedule"];
+    if (sch && ![sch isKindOfClass:NSArray.class]) { fprintf(stderr, "plant: schedule must be a list\n"); exit(1); }
+    for (NSDictionary *e in sch) {
+        if (![e isKindOfClass:NSDictionary.class] || ![e[@"t"] isKindOfClass:NSNumber.class]) {
+            fprintf(stderr, "plant: schedule entry needs t\n"); exit(1);
+        }
+        long long fr = llround([e[@"t"] doubleValue] * sr);
+        for (NSString *k in e) {
+            if ([k isEqual:@"t"]) continue;
+            int f = -1;
+            for (int j = 0; j < (int)(sizeof kSchedField / sizeof *kSchedField); ++j)
+                if ([k isEqual:@(kSchedField[j])]) f = j;
+            if (f < 0) { fprintf(stderr, "plant: schedule field %s not schedulable\n", k.UTF8String); exit(1); }
+            if (p->nev >= MAXEV) { fprintf(stderr, "plant: too many schedule events\n"); exit(1); }
+            int k2 = p->nev++;
+            p->ev_frame[k2] = fr; p->ev_field[k2] = f;
+            for (int c = 0; c < nspk; ++c)
+                p->ev_val[k2][c] = [e[k] isKindOfClass:NSNull.class] ? NAN : jnum(e, k, c, NAN);
+        }
+    }
+    // stable sort by frame (events at the same time apply in file order)
+    for (int a = 1; a < p->nev; ++a)
+        for (int b = a; b > 0 && p->ev_frame[b - 1] > p->ev_frame[b]; --b) {
+            long long tf = p->ev_frame[b]; p->ev_frame[b] = p->ev_frame[b - 1]; p->ev_frame[b - 1] = tf;
+            int ti = p->ev_field[b]; p->ev_field[b] = p->ev_field[b - 1]; p->ev_field[b - 1] = ti;
+            double tv[MAXCH]; memcpy(tv, p->ev_val[b], sizeof tv);
+            memcpy(p->ev_val[b], p->ev_val[b - 1], sizeof tv); memcpy(p->ev_val[b - 1], tv, sizeof tv);
+        }
     p->ringlen = p->delay + MAXQ;
     p->ring = calloc((size_t)p->ringlen * nspk, sizeof(float));
+}
+
+static double *plantField(Plant *p, int f) {
+    return f == 0 ? p->i_gain : f == 1 ? p->v_gain : p->fixed_temp;
 }
 
 // Produce telemetry for n frames from what the AU output `delay` frames ago; then push this
 // quantum's output into the ring.
 static void plantStep(Plant *p, float *tele, int telech, float out[MAXCH][MAXQ], int n) {
-    for (int i = 0; i < n; ++i) {
+    for (int i = 0; i < n; ++i, ++p->nframe) {
+        while (p->nextev < p->nev && p->ev_frame[p->nextev] <= p->nframe) {
+            int k = p->nextev++;
+            double *f = plantField(p, p->ev_field[k]);
+            for (int c = 0; c < p->nspk; ++c) f[c] = p->ev_val[k][c];
+        }
         int rp = (p->ringpos + i) % p->ringlen;
         for (int c = 0; c < p->nspk; ++c) {
             double s = p->ring[rp * p->nspk + c];
@@ -164,6 +212,10 @@ int main(int argc, const char **argv) {
         UInt32 propIds[32], propVals[32]; int nprops = 0;
         UInt32 cfIds[16]; const char *cfPaths[16]; int ncf = 0;
         UInt32 plIds[8]; const char *plPaths[8]; int npl = 0;
+        // --event FRAME:reset | FRAME:sleep=SECONDS | FRAME:tsjump=FRAMES, applied before the
+        // first render call that starts at or after FRAME
+        long long evFrame[16]; char evKind[16][16]; double evArg[16]; int nevt = 0, nextevt = 0;
+        Float64 tsOffset = 0;
         for (int i = 1; i < argc; ++i) {
             const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : NULL;
 #define ARG(n) (!strcmp(a, n) && v && ++i)
@@ -175,6 +227,16 @@ int main(int argc, const char **argv) {
             else if (ARG("--prop")) { sscanf(v, "%u=%u", &propIds[nprops], &propVals[nprops]); nprops++; }
             else if (ARG("--plistprop")) { char *eq = strchr(v, '='); plIds[npl] = (UInt32)atoi(v); plPaths[npl++] = eq + 1; }
             else if (ARG("--cfprop")) { char *eq = strchr(v, '='); cfIds[ncf] = (UInt32)atoi(v); cfPaths[ncf++] = eq + 1; }
+            else if (ARG("--event")) {
+                if (nevt >= 16) { fprintf(stderr, "too many --event\n"); return 2; }
+                char kind[16] = {0}; double arg = 0; long long fr = 0;
+                if (sscanf(v, "%lld:%15[a-z]=%lf", &fr, kind, &arg) < 2) { fprintf(stderr, "bad --event %s\n", v); return 2; }
+                if (strcmp(kind, "reset") && strcmp(kind, "sleep") && strcmp(kind, "tsjump")) {
+                    fprintf(stderr, "bad --event kind %s\n", kind); return 2;
+                }
+                if (nevt && fr < evFrame[nevt - 1]) { fprintf(stderr, "--event frames must ascend\n"); return 2; }
+                evFrame[nevt] = fr; strcpy(evKind[nevt], kind); evArg[nevt] = arg; nevt++;
+            }
             else if (!strcmp(a, "--no-tele")) notele = 1;
             else { fprintf(stderr, "bad arg %s\n", a); return 2; }
         }
@@ -299,7 +361,20 @@ int main(int argc, const char **argv) {
                 abl->mBuffers[c].mNumberChannels = 1; abl->mBuffers[c].mData = outb[c];
                 abl->mBuffers[c].mDataByteSize = (UInt32)got * sizeof(float);
             }
-            AudioTimeStamp ts = {.mSampleTime = (Float64)done, .mFlags = kAudioTimeStampSampleTimeValid};
+            while (nextevt < nevt && (long long)done >= evFrame[nextevt]) {
+                int k = nextevt++;
+                if (!strcmp(evKind[k], "reset"))
+                    fprintf(stderr, "event reset at %llu: %d\n", done,
+                            (int)AudioUnitReset(au, kAudioUnitScope_Global, 0));
+                else if (!strcmp(evKind[k], "sleep")) {
+                    fprintf(stderr, "event sleep %g s at %llu\n", evArg[k], done);
+                    usleep((useconds_t)(evArg[k] * 1e6));
+                } else {
+                    tsOffset += evArg[k];
+                    fprintf(stderr, "event tsjump %g frames at %llu\n", evArg[k], done);
+                }
+            }
+            AudioTimeStamp ts = {.mSampleTime = (Float64)done + tsOffset, .mFlags = kAudioTimeStampSampleTimeValid};
             AudioUnitRenderActionFlags fl = 0;
             OSStatus s = AudioUnitRender(au, &fl, &ts, 0, (UInt32)got, abl);
             if (s) { fprintf(stderr, "render %d at %llu\n", (int)s, done); failed = s; break; }
