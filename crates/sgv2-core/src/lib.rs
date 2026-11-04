@@ -32,7 +32,7 @@ pub mod spp3;
 pub mod telemetry;
 
 pub use failsafe::FailSafe;
-pub use telemetry::{ChannelState, Telemetry};
+pub use telemetry::{ChannelState, GlobalState, Telemetry};
 
 /// The most speaker channels any supported Mac has (six on the 14" and 16"
 /// MacBook Pro), rounded up for headroom. Fixed so state is preallocated.

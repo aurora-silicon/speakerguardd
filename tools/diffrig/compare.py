@@ -27,10 +27,17 @@ Exit status 0 only if everything is within tolerance.
 Tolerances are the acceptance bar of the behaviour specification
 (differential-test plan): 0.01 dB gain, 0.02 degC state temperature, 1e-5
 linear audio below limiting. Power and mechanical states are relative.
-TODO(SPEC): tolerances for lsm2 mask and velocity state once its plan fixes them.
+lsm2: axis_gain is compared element by element (peak, displacement, velocity,
+power, temperature), each to 0.01 dB; the velocity limit to 1e-4 relative.
+TODO(SPEC): tolerances for the lsm2 mask state once its plan fixes them.
+
+Inputs may be gzip-compressed (a .gz suffix, or the plain name missing and
+NAME.gz present). The audio comparison uses numpy when it is installed.
 """
+import gzip
 import json
 import math
+import os
 import sys
 
 TOLERANCE = {
@@ -46,11 +53,17 @@ TOLERANCE = {
     "measured_power_w": ("rel", 1e-3),
     "displacement_m": ("rel", 5e-3),
     "velocity_m_s": ("rel", 5e-3),
+    "velocity_limit_m_s": ("rel", 1e-4),
 }
+# Per-element tolerances of the lsm2 axis gains.
+AXES = ("peak", "displacement", "velocity", "power", "temperature")
 GLOBAL_TOLERANCE = {
     "modeled_power_w": ("rel", 1e-3),
     "measured_power_w": ("rel", 1e-3),
     "thermal_gain_db": ("abs", 0.01),
+    "power_gain": ("db", 0.01),
+    "modeled_amp_power_w": ("rel", 1e-3),
+    "amp_input_power_per_speaker_w": ("rel", 1e-3),
 }
 AUDIO_TOLERANCE = 1e-5
 # Relative errors use max(|ref|, floor) so values near zero do not give
@@ -58,9 +71,21 @@ AUDIO_TOLERANCE = 1e-5
 REL_FLOOR = {"modeled_power_w": 1e-3, "measured_power_w": 1e-3, "displacement_m": 1e-6, "velocity_m_s": 1e-4}
 
 
+def resolve(path):
+    """The path itself, or its .gz sibling when only that exists."""
+    if not os.path.exists(path) and os.path.exists(path + ".gz"):
+        return path + ".gz"
+    return path
+
+
+def open_any(path, mode="rt"):
+    path = resolve(path)
+    return gzip.open(path, mode) if path.endswith(".gz") else open(path, mode)
+
+
 def load(path):
     out = {}
-    with open(path) as fd:
+    with open_any(path) as fd:
         for n, line in enumerate(fd, 1):
             if not line.strip():
                 continue
@@ -95,11 +120,14 @@ class Worst:
     def __init__(self):
         self.fields = {}
         self.fail = []
+        self.failed = set()
 
     def add(self, name, err, ok, where):
         w = self.fields.get(name)
         if w is None or err > w["error"]:
             self.fields[name] = {"error": err, "at": where}
+        if not ok:
+            self.failed.add(name)
         if not ok and len(self.fail) < 50:
             self.fail.append({"field": name, "error": err, "at": where})
 
@@ -136,6 +164,12 @@ def compare(ref, got):
             err, ok = error(name, tol, rv, gv)
             worst.add("global." + name, err, ok, where)
             ok_slice &= ok
+        rl, gl = (r.get("global") or {}).get("power_hard_limit_w"), (g.get("global") or {}).get("power_hard_limit_w")
+        if isinstance(rl, list) and isinstance(gl, list):
+            for j, (a, b) in enumerate(zip(rl, gl)):
+                err, ok = error("power_hard_limit_w", ("rel", 1e-6), a, b)
+                worst.add(f"global.power_hard_limit_w[{j}]", err, ok, where)
+                ok_slice &= ok
         if len(g["channels"]) < len(r["channels"]):
             worst.add("channels", math.inf, False, where)
             ok_slice = False
@@ -150,20 +184,35 @@ def compare(ref, got):
                 err, ok = error(name, tol, rc[name], gc[name])
                 worst.add(name, err, ok, dict(where, channel=ch))
                 ok_slice &= ok
+            ra, ga = rc.get("axis_gain"), gc.get("axis_gain")
+            if fields is TOLERANCE and isinstance(ra, list) and isinstance(ga, list):
+                for j, (a, b) in enumerate(zip(ra, ga)):
+                    if a is None:
+                        continue
+                    err, ok = error("gain", ("db", 0.01), a, b)
+                    worst.add(f"axis_gain.{AXES[j]}", err, ok, dict(where, channel=ch))
+                    ok_slice &= ok
         c["pass"] &= ok_slice
     ok = missing == 0 and not worst.fail and all(c["pass"] for c in cases.values())
-    return ok, {"pass": ok, "missing_slices": missing, "cases": cases, "worst": worst.fields, "failures": worst.fail}
+    return ok, {"pass": ok, "missing_slices": missing, "cases": cases, "worst": worst.fields, "failures": worst.fail,
+                "failed_fields": sorted(worst.failed)}
 
 
 def read_f32(path):
-    import array
+    with open_any(path, "rb") as fd:
+        data = fd.read()
+    try:
+        import numpy as np
 
-    a = array.array("f")
-    with open(path, "rb") as fd:
-        a.frombytes(fd.read())
-    if sys.byteorder != "little":
-        a.byteswap()
-    return a
+        return np.frombuffer(data, "<f4")
+    except ImportError:
+        import array
+
+        a = array.array("f")
+        a.frombytes(data)
+        if sys.byteorder != "little":
+            a.byteswap()
+        return a
 
 
 def compare_audio(ref_path, got_path, channels, ref_latency=0, got_latency=0):
@@ -172,14 +221,26 @@ def compare_audio(ref_path, got_path, channels, ref_latency=0, got_latency=0):
         return False, {"pass": False, "error": "file length is not a whole number of frames"}
     na, nb = len(a) // channels, len(b) // channels
     n = min(na - ref_latency, nb - got_latency)
-    worst, at = 0.0, None
-    for i in range(max(n, 0)):
-        for c in range(channels):
-            d = abs(a[(i + ref_latency) * channels + c] - b[(i + got_latency) * channels + c])
-            if d > worst:
-                worst, at = d, {"frame": i, "channel": c}
+    worst, at, rms = 0.0, None, 0.0
+    if n > 0 and hasattr(a, "reshape"):
+        import numpy as np
+
+        d = np.abs(a.reshape(na, channels)[ref_latency:ref_latency + n].astype(np.float64)
+                   - b.reshape(nb, channels)[got_latency:got_latency + n])
+        i = int(np.argmax(d))
+        worst, at = float(d.flat[i]), {"frame": i // channels, "channel": i % channels}
+        rms = float(np.sqrt(np.mean(d * d)))
+    else:
+        for i in range(max(n, 0)):
+            for c in range(channels):
+                e = abs(a[(i + ref_latency) * channels + c] - b[(i + got_latency) * channels + c])
+                rms += e * e
+                if e > worst:
+                    worst, at = e, {"frame": i, "channel": c}
+        rms = math.sqrt(rms / max(n * channels, 1))
     ok = n > 0 and worst <= AUDIO_TOLERANCE and na - ref_latency == nb - got_latency
-    return ok, {"pass": ok, "frames": n, "max_abs_error": worst, "at": at, "tolerance": AUDIO_TOLERANCE}
+    return ok, {"pass": ok, "frames": n, "max_abs_error": worst, "rms_error": rms, "at": at,
+                "tolerance": AUDIO_TOLERANCE}
 
 
 def plot(ref, got, outdir):

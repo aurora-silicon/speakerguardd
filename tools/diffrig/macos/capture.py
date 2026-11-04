@@ -254,15 +254,17 @@ def write_trace(d, c, meta):
                     if k is not None and k >= 0:
                         # thermal record (SPEC-LSM2 §10): theta_vc, theta_mag, ambient, Tvc, Tcontrol
                         t = th[k, ch]
-                        f = ctl[k]  # axis0[2] axis1[2] axis2[2] vel_limit[2] power_limit[4] global final[2]
+                        # ControllerFrameLog (SPEC-LSM2 section 10): peak[2] displacement[2]
+                        # velocity[2] velocity_limit[2] power_limit[4] linked_power temperature[2]
+                        f = ctl[k]
                         s.update(coil_temp_c=float(t[3]), magnet_temp_c=float(t[2] + t[1]),
-                                 control_temp_c=float(t[4]), gain=float(f[13 + ch]),
-                                 velocity_limit_m_s=float(f[6 + ch]),
-                                 raw={"axis0": float(f[ch]), "axis1": float(f[2 + ch]), "axis2": float(f[4 + ch])})
+                                 control_temp_c=float(t[4]), velocity_limit_m_s=float(f[6 + ch]),
+                                 axis_gain=[float(f[ch]), float(f[2 + ch]), float(f[4 + ch]),
+                                            float(f[12]), float(f[13 + ch])])
                     chans.append(s)
                 if k is not None and k >= 0:
                     rec["global"]["power_hard_limit_w"] = [float(x) for x in ctl[k][8:12]]
-                    rec["global"]["global_gain"] = float(ctl[k][12])
+                    rec["global"]["power_gain"] = float(ctl[k][12])
             ag = [audio_gain(x[end - n:end, ch], y[end - n:end, ch]) for ch in range(nchan)]
             for ch, s in enumerate(chans):
                 s["audio_gain"] = ag[ch]

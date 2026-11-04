@@ -9,8 +9,12 @@
 //! sgv2-render --unit spp3|lsm2|atsp [--blob PARAMS.blob] --case NAME
 //!             --in PROGRAM.f32 --ch N [--sense SENSE.f32 --sense-ch M]
 //!             [--slices 512 | --slices 1,7,31,...] [--out TRACE.jsonl]
-//!             [--audio-out OUT.f32]
+//!             [--audio-out OUT.f32] [--prop 64008=CPMS.json]
 //! ```
+//!
+//! `--prop 64008=FILE` applies the runtime CPMS power budgets to an lsm2
+//! unit, as the platform does right after initialisation: a JSON object of
+//! `cpms_ts_i`, `cpms_ts_100`, `cpms_ts_1000`, `cpms_ts_thermal` in mW.
 //!
 //! Signals are raw interleaved little-endian float32, the rig's format. A
 //! slice list is used cyclically. Without `--blob`, or with a blob that does
@@ -36,12 +40,14 @@ struct Args {
     slices: Vec<usize>,
     out: Option<String>,
     audio_out: Option<String>,
+    cpms: Option<String>,
 }
 
 fn usage() -> ExitCode {
     eprintln!(
         "usage: sgv2-render --unit spp3|lsm2|atsp [--blob P] --case NAME --in X.f32 --ch N \
-         [--sense S.f32 --sense-ch M] [--slices 512|1,7,31] [--out T.jsonl] [--audio-out O.f32]"
+         [--sense S.f32 --sense-ch M] [--slices 512|1,7,31] [--out T.jsonl] [--audio-out O.f32] \
+         [--prop 64008=CPMS.json]"
     );
     ExitCode::from(2)
 }
@@ -58,6 +64,7 @@ fn parse_args() -> Option<Args> {
         slices: vec![512],
         out: None,
         audio_out: None,
+        cpms: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -78,6 +85,10 @@ fn parse_args() -> Option<Args> {
             }
             "--out" => a.out = Some(v),
             "--audio-out" => a.audio_out = Some(v),
+            "--prop" => match v.split_once('=') {
+                Some(("64008", f)) => a.cpms = Some(f.to_string()),
+                _ => return None,
+            },
             _ => return None,
         }
     }
@@ -106,24 +117,52 @@ fn deinterleave(bytes: &[u8], channels: usize) -> Vec<Vec<f32>> {
     out
 }
 
+/// The lsm2 runtime power budgets of a CPMS dictionary (property 64008):
+/// keys in mW, mapped in order to the 1 ms, 100 ms, 1 s and 60 s budgets; a
+/// key the dictionary lacks is 50 W.
+fn parse_cpms(text: &str) -> Option<[f32; 4]> {
+    const KEYS: [&str; 4] = ["cpms_ts_i", "cpms_ts_100", "cpms_ts_1000", "cpms_ts_thermal"];
+    let body = text.trim().strip_prefix('{')?.strip_suffix('}')?;
+    let mut w = [50.0f32; 4];
+    for item in body.split(',').filter(|x| !x.trim().is_empty()) {
+        let (k, v) = item.split_once(':')?;
+        let k = k.trim().trim_matches('"');
+        let j = KEYS.iter().position(|&x| x == k)?;
+        let mw: f64 = v.trim().parse().ok()?;
+        w[j] = (mw * 1e-3) as f32;
+    }
+    Some(w)
+}
+
 /// Build the unit. A missing or unusable blob gives the fail-safe, as the
 /// plugin does.
-fn make_unit(kind: UnitKind, blob: Option<&[u8]>) -> (Box<dyn ProtectionUnit>, String) {
-    match blob.map(Header::parse) {
-        Some(Ok((h, _payload))) if h.unit == kind as u32 => {
-            // TODO(lane B): decode the payload into each unit's Params once the
-            // blob layouts land; until then only the header fields are passed.
-            let (channels, sample_rate) = (h.channels, h.sample_rate);
-            let unit: Box<dyn ProtectionUnit> = match kind {
-                UnitKind::Spp3 => Box::new(spp3::Unit::new(spp3::Params { channels, sample_rate })),
-                UnitKind::Lsm2 => Box::new(lsm2::Unit::new(lsm2::Params { channels, sample_rate })),
-                UnitKind::Atsp => Box::new(atsp::Unit::new(atsp::Params { channels, sample_rate })),
-            };
-            (unit, String::from("blob"))
+fn make_unit(kind: UnitKind, blob: Option<&[u8]>, cpms: Option<[f32; 4]>) -> (Box<dyn ProtectionUnit>, String) {
+    let Some(bytes) = blob else {
+        return (Box::new(FailSafe::new(kind, Health::NO_PARAMS)), String::from("none"));
+    };
+    match Header::parse(bytes) {
+        Ok((h, _)) if h.unit != kind as u32 => {
+            return (Box::new(FailSafe::new(kind, Health::NO_PARAMS)), String::from("blob-unit-mismatch"))
         }
-        Some(Ok(_)) => (Box::new(FailSafe::new(kind, Health::NO_PARAMS)), String::from("blob-unit-mismatch")),
-        Some(Err(e)) => (Box::new(FailSafe::new(kind, Health::NO_PARAMS)), format!("blob-{e:?}")),
-        None => (Box::new(FailSafe::new(kind, Health::NO_PARAMS)), String::from("none")),
+        Err(e) => return (Box::new(FailSafe::new(kind, Health::NO_PARAMS)), format!("blob-{e:?}")),
+        Ok(_) => {}
+    }
+    let unit: Result<Box<dyn ProtectionUnit>, String> = match kind {
+        UnitKind::Spp3 => spp3::Params::from_blob(bytes).map(|p| Box::new(spp3::Unit::new(p)) as _).map_err(|e| format!("{e:?}")),
+        UnitKind::Lsm2 => lsm2::Params::from_blob(bytes)
+            .map(|mut p| {
+                if let Some(w) = cpms {
+                    p.runtime_budget_present = 1;
+                    p.runtime_budget_w = w;
+                }
+                Box::new(lsm2::Unit::new(p)) as _
+            })
+            .map_err(|e| format!("{e:?}")),
+        UnitKind::Atsp => atsp::Params::from_blob(bytes).map(|p| Box::new(atsp::Unit::new(p)) as _).map_err(|e| format!("{e:?}")),
+    };
+    match unit {
+        Ok(u) => (u, String::from(if cpms.is_some() { "blob+64008" } else { "blob" })),
+        Err(e) => (Box::new(FailSafe::new(kind, Health::NO_PARAMS)), format!("blob-{}", e.replace(['"', '\\'], ""))),
     }
 }
 
@@ -143,8 +182,8 @@ fn arr(xs: &[f32]) -> String {
 fn channel_json(c: &ChannelState, audio_gain: Option<f32>) -> String {
     format!(
         "{{\"gain\":{},\"audio_gain\":{},\"modeled_power_w\":{},\"measured_power_w\":{},\
-         \"coil_temp_c\":{},\"magnet_temp_c\":{},\"ol_temp_c\":{},\"cl_temp_c\":{},\
-         \"tlim_adj_c\":{},\"displacement_m\":{},\"velocity_m_s\":{},\"mask_db\":{},\
+         \"coil_temp_c\":{},\"magnet_temp_c\":{},\"control_temp_c\":{},\"ol_temp_c\":{},\"cl_temp_c\":{},\
+         \"tlim_adj_c\":{},\"displacement_m\":{},\"velocity_m_s\":{},\"velocity_limit_m_s\":{},\"mask_db\":{},\
          \"axis_gain\":{},\"band_gain\":{}}}",
         num(c.gain),
         audio_gain.map_or(String::from("null"), num),
@@ -152,14 +191,26 @@ fn channel_json(c: &ChannelState, audio_gain: Option<f32>) -> String {
         num(c.measured_power_w),
         num(c.coil_temp_c),
         num(c.magnet_temp_c),
+        num(c.control_temp_c),
         num(c.ol_temp_c),
         num(c.cl_temp_c),
         num(c.tlim_adj_c),
         num(c.displacement_m),
         num(c.velocity_m_s),
+        num(c.velocity_limit_m_s),
         num(c.mask_db),
         arr(&c.axis_gain),
         arr(&c.band_gain)
+    )
+}
+
+fn global_json(g: &sgv2_core::GlobalState) -> String {
+    format!(
+        "{{\"power_hard_limit_w\":{},\"power_gain\":{},\"modeled_amp_power_w\":{},\"amp_input_power_per_speaker_w\":{}}}",
+        arr(&g.power_hard_limit_w),
+        num(g.power_gain),
+        num(g.modeled_amp_power_w),
+        num(g.amp_input_power_w)
     )
 }
 
@@ -231,10 +282,11 @@ fn render(
             trace,
             "{{\"schema\":1,\"side\":\"sgv2\",\"unit\":\"{unit_name}\",\"case\":\"{case}\",\"frame\":{pos},\
              \"frames\":{n},\"latency\":{latency},\"params\":\"{params}\",\"health\":{},\
-             \"mode\":{{\"failsafe\":{},\"closed_loop\":[{}]}},\"channels\":[{}]}}",
+             \"mode\":{{\"failsafe\":{},\"closed_loop\":[{}]}},\"global\":{},\"channels\":[{}]}}",
             health.0,
             health.is_failsafe(),
             cl.join(","),
+            global_json(&t.global),
             ch.join(",")
         )?;
         if let Some(w) = audio.as_deref_mut() {
@@ -262,7 +314,14 @@ fn run(a: &Args) -> io::Result<()> {
         _ => Vec::new(),
     };
     let blob = a.blob.as_ref().map(std::fs::read).transpose()?;
-    let (mut unit, params) = make_unit(a.unit, blob.as_deref());
+    let cpms = match &a.cpms {
+        Some(p) => Some(
+            parse_cpms(&std::fs::read_to_string(p)?)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("{p}: not a CPMS dictionary")))?,
+        ),
+        None => None,
+    };
+    let (mut unit, params) = make_unit(a.unit, blob.as_deref(), cpms);
     let mut stdout_trace;
     let mut file_trace = open_out(&a.out)?;
     let trace: &mut dyn Write = match file_trace.as_mut() {
@@ -327,7 +386,7 @@ mod tests {
     fn no_blob_renders_failsafe_in_any_slicing() {
         let program = vec![vec![0.25f32; 1000], vec![-0.5f32; 1000]];
         for slices in [&[512usize][..], &[1, 7, 31, 96, 127, 160][..]] {
-            let (mut unit, params) = make_unit(UnitKind::Lsm2, None);
+            let (mut unit, params) = make_unit(UnitKind::Lsm2, None, None);
             let mut trace = Vec::new();
             let mut audio = Vec::new();
             render(unit.as_mut(), &params, UnitKind::Lsm2, "t", &program, &[], slices, &mut trace, Some(&mut audio))
@@ -349,7 +408,14 @@ mod tests {
 
     #[test]
     fn blob_errors_fall_back_to_failsafe() {
-        let (_, p) = make_unit(UnitKind::Spp3, Some(b"short"));
+        let (_, p) = make_unit(UnitKind::Spp3, Some(b"short"), None);
         assert_eq!(p, "blob-Short");
+    }
+
+    #[test]
+    fn cpms_dictionary() {
+        assert_eq!(parse_cpms("{\"cpms_ts_100\": 5453}\n"), Some([50.0, 5.453, 50.0, 50.0]));
+        assert_eq!(parse_cpms("{}"), Some([50.0; 4]));
+        assert_eq!(parse_cpms("{\"other\": 1}"), None);
     }
 }
