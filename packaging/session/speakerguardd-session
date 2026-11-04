@@ -278,6 +278,19 @@ class Session:
             return
         self.pending[key] = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
+    def unlink_all(self, g, timeout):
+        """Take the amps and the sense out of the graph and wait for it, at
+        most `timeout` seconds in all, so a stopping helper leaves nothing
+        linked and never hangs shutdown."""
+        deadline = time.monotonic() + timeout
+        self.reconcile(g, False)
+        for p in list(self.pending.values()):
+            try:
+                p.wait(max(0.0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                p.kill()
+        self._reap()
+
     def _reap(self):
         for k, p in list(self.pending.items()):
             if p.poll() is not None:
@@ -349,11 +362,18 @@ def main():
     report = f"/run/speakerguardd/{os.getuid()}/helper/session"
 
     def stop(*_):
-        # a stopped helper leaves no report behind
+        # a stopped helper leaves no report behind (the supervisor releases
+        # at once), and no amps or sense linked, so the sink does not keep
+        # retrying a refused start until PipeWire restarts; the unlink is
+        # bounded to 1 s
         try:
             os.unlink(report)
         except OSError:
             pass
+        try:
+            s.unlink_all(g, 1.0)
+        except Exception as e:  # noqa: BLE001 - shutting down regardless
+            log(f"unlink on stop: {e}")
         raise SystemExit(0)
 
     signal.signal(signal.SIGTERM, stop)
