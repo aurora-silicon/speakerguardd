@@ -182,6 +182,57 @@ pub fn mul_to(a: &[f32], b: &[f32], y: &mut [f32]) {
     }
 }
 
+/// `y[n] = bound1(a[n]) * b[n]`: the program held to digital full scale
+/// (a non-finite sample 0) times the gain. Returns whether any `a[n]` was
+/// non-finite. For `|a[n]| <= 1` the result is bit-identical to `mul_to`.
+#[inline]
+pub fn mul_bounded_to(a: &[f32], b: &[f32], y: &mut [f32]) -> bool {
+    mul_clamped_to(a, b, y, 1.0)
+}
+
+/// `y[n] = meter1(a[n]) * b[n]`: the program as the model meters see it,
+/// times the gain. Returns whether any `a[n]` was non-finite.
+#[inline]
+pub fn mul_metered_to(a: &[f32], b: &[f32], y: &mut [f32]) -> bool {
+    mul_clamped_to(a, b, y, METER_FS)
+}
+
+/// `y[n] = clamp1(a[n], lim) * b[n]`, a non-finite `a[n]` 0; returns
+/// whether any `a[n]` was non-finite. For `|a[n]| <= lim` bit-identical to
+/// `mul_to`.
+#[inline]
+pub fn mul_clamped_to(a: &[f32], b: &[f32], y: &mut [f32], lim: f32) -> bool {
+    let n = a.len().min(b.len()).min(y.len());
+    #[cfg(not(target_arch = "aarch64"))]
+    let (i, mut bad) = (0, false);
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: every access is below `n`, the shortest of the three slices.
+    let (i, mut bad) = unsafe {
+        let mut i = 0;
+        let (pa, pb, py) = (a.as_ptr(), b.as_ptr(), y.as_mut_ptr());
+        let one = vdupq_n_f32(lim);
+        let neg = vdupq_n_f32(-lim);
+        let inf = vdupq_n_f32(f32::INFINITY);
+        let zero = vdupq_n_f32(0.0);
+        let mut nf = vdupq_n_u32(0);
+        while i + 4 <= n {
+            let x = vld1q_f32(pa.add(i));
+            // |x| < inf is false for NaN and for +-inf
+            let fin = vcltq_f32(vabsq_f32(x), inf);
+            let c = vbslq_f32(fin, vminq_f32(vmaxq_f32(x, neg), one), zero);
+            vst1q_f32(py.add(i), vmulq_f32(c, vld1q_f32(pb.add(i))));
+            nf = vorrq_u32(nf, vmvnq_u32(fin));
+            i += 4;
+        }
+        (i, vmaxvq_u32(nf) != 0)
+    };
+    for ((o, &x), &g) in y[i..n].iter_mut().zip(&a[i..n]).zip(&b[i..n]) {
+        bad |= !x.is_finite();
+        *o = if x.abs() < f32::INFINITY { x.clamp(-lim, lim) } else { 0.0 } * g;
+    }
+    bad
+}
+
 /// In-place `x[n] *= g`.
 #[inline]
 pub fn scale_in_place(x: &mut [f32], g: f32) {
@@ -362,6 +413,56 @@ pub fn sanitize(x: &mut [f32]) -> usize {
     bad
 }
 
+/// One sample held to digital full scale: `clamp(x, -1, 1)`, a non-finite
+/// sample 0. Every output sample goes through it, so no unit ever hands
+/// the converter more than full scale or a non-finite value.
+#[inline]
+pub fn bound1(x: f32) -> f32 {
+    if x.abs() < f32::INFINITY {
+        x.clamp(-1.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+/// The bound on what the model meters see, in units of full scale. The
+/// meters follow the reference, which meters the program unclamped (a
+/// tuning's own EQ can peak slightly over full scale, and under-metering is
+/// the less protective direction); 16 FS is far above any real program yet
+/// keeps every square sum finite (16 lanes of at most 1024 samples of
+/// 256 FS^2 per update) and keeps NaN and Inf out of the model.
+pub const METER_FS: f32 = 16.0;
+
+/// One sample as the model meters see it: `clamp(x, -METER_FS, METER_FS)`,
+/// a non-finite sample 0.
+#[inline]
+pub fn meter1(x: f32) -> f32 {
+    if x.abs() < f32::INFINITY {
+        x.clamp(-METER_FS, METER_FS)
+    } else {
+        0.0
+    }
+}
+
+/// [`meter1`] in place.
+#[inline]
+pub fn meter(x: &mut [f32]) {
+    for v in x.iter_mut() {
+        *v = meter1(*v);
+    }
+}
+
+/// [`bound1`] in place; returns how many samples were non-finite.
+#[inline]
+pub fn bound(x: &mut [f32]) -> usize {
+    let mut bad = 0;
+    for v in x.iter_mut() {
+        bad += !v.is_finite() as usize;
+        *v = bound1(*v);
+    }
+    bad
+}
+
 /// Deinterleave `frames` frames of `ch`-channel S16 into per-channel f32
 /// (`out[c][n]`), scaled to [-1, 1). Used by the direct-ALSA sense reader
 /// and by the bench; the LV2 path receives planar f32 from PipeWire.
@@ -374,6 +475,24 @@ pub fn deinterleave_s16(src: &[i16], ch: usize, out: &mut [&mut [f32]]) {
         for (n, s) in o.iter_mut().enumerate() {
             *s = src[n * ch + c] as f32 * K;
         }
+    }
+}
+
+/// One sample held to `±lim` (a non-finite sample 0).
+#[inline]
+pub fn clamp1(x: f32, lim: f32) -> f32 {
+    if x.abs() < f32::INFINITY {
+        x.clamp(-lim, lim)
+    } else {
+        0.0
+    }
+}
+
+/// [`clamp1`] in place.
+#[inline]
+pub fn clamp_in_place(x: &mut [f32], lim: f32) {
+    for v in x.iter_mut() {
+        *v = clamp1(*v, lim);
     }
 }
 

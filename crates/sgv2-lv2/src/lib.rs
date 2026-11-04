@@ -31,13 +31,20 @@
 //! A blob that is missing, corrupt, for another unit kind, or for another
 //! channel/sense geometry or rate gives the fail-safe unit (20 dB), as macOS
 //! does without its essential parameters.
+//!
+//! `activate` clears the audio histories but not the thermal model: `run`
+//! publishes the unit's thermal state after every call and `activate`
+//! restores the latest record that fits, cooled for the time since (see
+//! [`handoff`]). A pause, a suspend or a graph rebuild in the same process
+//! therefore never gives a hot speaker full power back.
 
+pub mod handoff;
 pub mod page;
 pub mod ttl;
 
 use core::ffi::{c_char, c_void};
 use sgv2_core::{
-    atsp, lsm2, placeholder, spp3, FailSafe, Health, Io, ProtectionUnit, Telemetry, UnitKind, MAX_CHANNELS,
+    atsp, lsm2, placeholder, spp3, FailSafe, HandOff, Health, Io, ProtectionUnit, Telemetry, UnitKind, MAX_CHANNELS,
 };
 
 #[repr(C)]
@@ -187,6 +194,10 @@ struct Instance {
     telemetry: Telemetry,
     last_frame: u64,
     frames: u64,
+    /// Scratch for the thermal hand-off record `run` publishes.
+    handoff: HandOff,
+    /// The blob payload CRC the unit runs (0: none).
+    params_crc: u32,
 }
 
 fn env_or(var: &str, default: String) -> String {
@@ -207,6 +218,7 @@ unsafe extern "C" fn instantiate(
     let uid = unsafe { libc::getuid() };
     let blob_path = env_or("SGV2_PARAMS", "/run/speakerguardd/params.bin".into());
     let page_path = env_or("SGV2_ENGINE_PAGE", format!("/run/speakerguardd/{uid}/engine"));
+    handoff::init();
     let blob = std::fs::read(&blob_path).ok();
     let (unit, _err, params_crc) = load_unit(blob.as_deref(), rate, channels, sense, role);
     let page = page::EnginePage::open(&page_path).ok();
@@ -222,6 +234,8 @@ unsafe extern "C" fn instantiate(
         telemetry: Telemetry::new(),
         last_frame: u64::MAX,
         frames: 0,
+        handoff: HandOff::EMPTY,
+        params_crc,
     });
     Box::into_raw(instance).cast()
 }
@@ -237,9 +251,33 @@ unsafe extern "C" fn connect_port(handle: *mut c_void, port: u32, data: *mut c_v
 unsafe extern "C" fn activate(handle: *mut c_void) {
     // SAFETY: the host passes the handle `instantiate` returned.
     let instance = unsafe { &mut *handle.cast::<Instance>() };
-    instance.unit.as_dyn().reset();
+    let provided = instance.page.as_ref().and_then(|p| p.provided_for(instance.params_crc));
+    start_stream(instance.unit.as_dyn(), &handoff::SLOT, provided);
     instance.last_frame = u64::MAX;
     instance.frames = 0;
+}
+
+/// The oldest supervisor-provided record a new process restores; older,
+/// the speakers have long cooled and the parameters' start state applies.
+pub const PROVIDED_MAX_AGE_S: f64 = 600.0;
+
+/// A stream starts: audio histories cleared, the thermal model restored
+/// from the latest hand-off record that fits this unit (cooled for its age
+/// by the unit's own decay), else the parameters' start state. The
+/// process's own record comes first; a new process (its slot empty) takes
+/// the record the supervisor `provided` across the restart, if it is no
+/// older than [`PROVIDED_MAX_AGE_S`]. Not real time.
+pub fn start_stream(unit: &mut dyn ProtectionUnit, slot: &handoff::Slot, provided: Option<(HandOff, f64)>) -> bool {
+    unit.reset();
+    match slot.latest() {
+        Some((record, age_s)) => unit.restore_state(&record, age_s),
+        None => match provided {
+            Some((record, age_s)) if age_s.is_finite() && age_s <= PROVIDED_MAX_AGE_S => {
+                unit.restore_state(&record, age_s)
+            }
+            _ => false,
+        },
+    }
 }
 
 unsafe extern "C" fn run(handle: *mut c_void, frames: u32) {
@@ -251,11 +289,33 @@ unsafe extern "C" fn run(handle: *mut c_void, frames: u32) {
     let mut input = [empty; MAX_CHANNELS];
     let mut sense = [empty; MAX_SENSE];
     let mut out_store: [&mut [f32]; MAX_CHANNELS] = Default::default();
-    for c in 0..n {
-        let (i, o) = (instance.ports[c], instance.ports[n + c]);
-        if i.is_null() || o.is_null() {
-            return;
+    // A missing program port: every connected output gets the 20 dB
+    // fail-safe of its own input (silence without one), never a stale
+    // buffer, and the call still reports and beats.
+    if (0..2 * n).any(|p| instance.ports[p].is_null()) {
+        for c in 0..n {
+            let (i, o) = (instance.ports[c], instance.ports[n + c]);
+            if o.is_null() {
+                continue;
+            }
+            // Raw pointers only: `i` may be `o` itself (in place, each
+            // sample read before it is written); another channel's input
+            // aliasing this output is muted instead.
+            let cross = (0..n).any(|k| k != c && core::ptr::eq(instance.ports[k], o));
+            for k in 0..frames {
+                // SAFETY: connected audio ports hold `frames` samples.
+                unsafe {
+                    let y = if i.is_null() || cross {
+                        0.0
+                    } else {
+                        sgv2_core::dsp::bound1(*i.add(k)) * sgv2_core::FAILSAFE_GAIN
+                    };
+                    *o.add(k) = y;
+                }
+            }
         }
+        finish_call(instance, frames, Health(Health::FAILSAFE | Health::CHANNEL_MISMATCH));
+        return;
     }
     // The core needs distinct input and output buffers. PipeWire's
     // filter-graph gives every port its own buffer; if a host ever connects
@@ -267,6 +327,7 @@ unsafe extern "C" fn run(handle: *mut c_void, frames: u32) {
             // SAFETY: connected audio ports hold `frames` samples.
             unsafe { core::slice::from_raw_parts_mut(instance.ports[n + c], frames) }.fill(0.0);
         }
+        finish_call(instance, frames, Health(Health::FAILSAFE | Health::CHANNEL_MISMATCH));
         return;
     }
     for c in 0..n {
@@ -293,6 +354,19 @@ unsafe extern "C" fn run(handle: *mut c_void, frames: u32) {
     let latency = unit.latency_frames() as f32;
     let health = unit.process(Io { frames, input: &input[..n], sense: sense_slice, output: &mut out_store[..n] });
     instance.frames += frames as u64;
+    if instance.unit.unit().save_state(&mut instance.handoff) {
+        handoff::SLOT.publish(&instance.handoff);
+        // for a later process, through the supervisor; never a record the
+        // unit does not trust (save_state is false then) nor one from a
+        // faulted or fail-safe call
+        if let Some(page) = &instance.page {
+            // MODEL_RANGE still protects: kept
+            let untrusted = Health::FAILSAFE | Health::NO_PARAMS | Health::CHANNEL_MISMATCH | Health::MODEL_FAULT;
+            if health.0 & untrusted == 0 {
+                page.publish_saved(&instance.handoff);
+            }
+        }
+    }
     let delay = instance.unit.sense_delay().map_or(-1, |d| d as i32);
     if let Some(page) = &instance.page {
         instance.unit.unit().telemetry(&mut instance.telemetry);
@@ -303,6 +377,24 @@ unsafe extern "C" fn run(handle: *mut c_void, frames: u32) {
         page.beat(instance.frames, health, delay);
     }
     for (port, value) in [(2 * n + s, latency), (2 * n + s + 1, health.0 as f32), (2 * n + s + 2, delay as f32)] {
+        let p = instance.ports[port];
+        if !p.is_null() {
+            // SAFETY: control ports point at one f32.
+            unsafe { *p = value };
+        }
+    }
+}
+
+/// A call the unit did not run: the frame count, the heartbeat and the
+/// control ports still move, so the supervisor sees the fault.
+fn finish_call(instance: &mut Instance, frames: usize, health: Health) {
+    let (n, s) = (instance.channels, instance.sense);
+    instance.frames += frames as u64;
+    if let Some(page) = &instance.page {
+        page.beat(instance.frames, health, -1);
+    }
+    let latency = instance.unit.unit().latency_frames() as f32;
+    for (port, value) in [(2 * n + s, latency), (2 * n + s + 1, health.0 as f32), (2 * n + s + 2, -1.0)] {
         let p = instance.ports[port];
         if !p.is_null() {
             // SAFETY: control ports point at one f32.
@@ -348,8 +440,13 @@ pub extern "C" fn lv2_descriptor(index: u32) -> *const Lv2Descriptor {
 mod tests {
     use super::*;
 
+    /// The C ABI reads its paths from the environment: tests that set it
+    /// take turns.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn runs_the_failsafe_through_the_c_abi() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("SGV2_PARAMS", "/nonexistent/sgv2-test");
         std::env::set_var("SGV2_ENGINE_PAGE", "/nonexistent/sgv2-test");
         let d = lv2_descriptor(0);
@@ -380,6 +477,87 @@ mod tests {
         }
     }
 
+    /// Review finding 5 on PR #31: `activate` reset the thermal model, so a
+    /// pause or graph rebuild gave a hot speaker full power back.
+    #[test]
+    fn activate_keeps_the_thermal_state_across_streams_and_instances() {
+        use sgv2_core::blob::Pod;
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut p = spp3::Params {
+            channels: 2,
+            sample_rate: 48_000,
+            block_frames: 512,
+            thermal_ambient_temp: 40.0,
+            thermal_gain_attack_time_s: 0.5,
+            thermal_gain_release_time_s: 2.0,
+            thermal_lookahead_delay_ms: 1.0,
+            thermal_protection_enabled: 1,
+            ..Default::default()
+        };
+        for c in 0..2 {
+            p.ch[c] = spp3::ChannelParams {
+                source: c as u32,
+                t_sett_vc: 20.0,
+                t_sett_mg: 10.0,
+                tau_tvc: 0.4,
+                tau_tmg: 3.0,
+                temperature_limit: 120.0,
+                hard_temp_limit_headroom: 8.0,
+                reb_ref: 4.0,
+                rshunt: 0.2,
+                ag: 10.0,
+                thermal_ff_speedup_factor: 0.5,
+                ..Default::default()
+            };
+        }
+        let blob = sgv2_core::blob::build(UnitKind::Spp3, 2, 0, 48_000, p.as_bytes());
+        let path = std::env::temp_dir().join(format!("sgv2-handoff-test-{}.bin", std::process::id()));
+        std::fs::write(&path, blob).unwrap();
+        std::env::set_var("SGV2_PARAMS", &path);
+        std::env::set_var("SGV2_ENGINE_PAGE", "/nonexistent/sgv2-test");
+        let d = lv2_descriptor(0);
+        let l = [1.0f32; 512];
+        let r = [1.0f32; 512];
+        let mut ol = [0.0f32; 512];
+        let mut or = [0.0f32; 512];
+        let mut ctl = [0.0f32; 3];
+        let bufs = [l.as_ptr() as *mut f32, r.as_ptr() as *mut f32, ol.as_mut_ptr(), or.as_mut_ptr()];
+        let ctl_p = ctl.as_mut_ptr();
+        let last = bufs[2];
+        unsafe {
+            let open = || {
+                let h = ((*d).instantiate)(d, 48_000.0, core::ptr::null(), core::ptr::null());
+                for (k, buf) in bufs.into_iter().enumerate() {
+                    ((*d).connect_port)(h, k as u32, buf.cast());
+                }
+                for k in 0..3 {
+                    ((*d).connect_port)(h, 4 + k as u32, ctl_p.add(k).cast());
+                }
+                h
+            };
+            let out = || *last.add(511);
+            let h = open();
+            ((*d).activate.unwrap())(h);
+            for _ in 0..(30 * 48_000 / 512) {
+                ((*d).run)(h, 512);
+            }
+            let hot = out();
+            assert!(hot < 0.5, "{hot}");
+            // pause and resume the same instance
+            ((*d).activate.unwrap())(h);
+            ((*d).run)(h, 512);
+            assert!(out() <= hot + 0.02, "resumed at {}, was {hot}", out());
+            ((*d).cleanup)(h);
+            // a new instance in the same process starts from that state too
+            let h = open();
+            ((*d).activate.unwrap())(h);
+            ((*d).run)(h, 512);
+            assert!(out() <= hot + 0.02, "new instance at {}, was {hot}", out());
+            ((*d).cleanup)(h);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn wrong_geometry_rate_or_parameters_is_the_failsafe() {
         use sgv2_core::blob::Pod;
@@ -404,5 +582,92 @@ mod tests {
         let hint = "regenerate with: cargo run -p sgv2-lv2 --example gen-ttl";
         assert_eq!(std::fs::read_to_string(format!("{dir}manifest.ttl")).unwrap(), manifest, "{hint}");
         assert_eq!(std::fs::read_to_string(format!("{dir}sgv2.ttl")).unwrap(), plugin, "{hint}");
+    }
+
+    /// The J616s incident: a PipeWire restart mid-playback started the model
+    /// cold while the coils were hot. Across processes the record goes
+    /// through the page: `saved` (the plugin), then `provided` (the
+    /// supervisor), then a new process's `start_stream` with its own slot
+    /// empty, aged by the gap.
+    #[test]
+    fn a_new_process_restores_the_hot_state_the_supervisor_provided() {
+        use sgv2_core::blob::Pod;
+        let mut p = spp3::Params {
+            channels: 2,
+            sample_rate: 48_000,
+            block_frames: 512,
+            thermal_ambient_temp: 40.0,
+            thermal_gain_attack_time_s: 0.5,
+            thermal_gain_release_time_s: 2.0,
+            thermal_lookahead_delay_ms: 1.0,
+            thermal_protection_enabled: 1,
+            ..Default::default()
+        };
+        for c in 0..2 {
+            p.ch[c] = spp3::ChannelParams {
+                source: c as u32,
+                t_sett_vc: 20.0,
+                t_sett_mg: 10.0,
+                tau_tvc: 0.4,
+                tau_tmg: 3.0,
+                temperature_limit: 120.0,
+                hard_temp_limit_headroom: 8.0,
+                reb_ref: 4.0,
+                rshunt: 0.2,
+                ag: 10.0,
+                thermal_ff_speedup_factor: 0.5,
+                ..Default::default()
+            };
+        }
+        let blob = sgv2_core::blob::build(UnitKind::Spp3, 2, 0, 48_000, p.as_bytes());
+        let one = [1.0f32; 512];
+        let run = |u: &mut AnyUnit| -> (f32, Health) {
+            let mut a = [0.0f32; 512];
+            let mut b = [0.0f32; 512];
+            let mut out: [&mut [f32]; 2] = [&mut a, &mut b];
+            let h = u.as_dyn().process(Io { frames: 512, input: &[&one, &one], sense: &[], output: &mut out });
+            (a[511], h)
+        };
+        let path = std::env::temp_dir().join(format!("sgv2-xproc-page-{}", std::process::id()));
+        let path = path.to_str().unwrap().to_string();
+        let page = page::EnginePage::create(&path).unwrap();
+        // process A heats the speakers and publishes its record
+        let (mut a, _, crc) = load_unit(Some(&blob), 48_000.0, 2, 0, Role::Protect);
+        assert_ne!(crc, 0);
+        a.as_dyn().reset();
+        let mut hot = 1.0;
+        for _ in 0..(30 * 48_000 / 512) {
+            hot = run(&mut a).0;
+        }
+        assert!(hot < 0.5, "{hot}");
+        let mut rec = HandOff::EMPTY;
+        assert!(a.unit().save_state(&mut rec));
+        page.publish_saved(&rec);
+        // the supervisor reads it and provides it for the blob
+        let (got, stamp) = page.header().saved.read().unwrap();
+        assert_eq!(got, rec);
+        page.provide(&got, stamp, crc);
+        // process B: its own slot is empty, so it restores what was provided
+        let empty = handoff::Slot::new();
+        let (mut b, _, crc_b) = load_unit(Some(&blob), 48_000.0, 2, 0, Role::Protect);
+        assert!(start_stream(b.as_dyn(), &empty, page.provided_for(crc_b)));
+        let restored = run(&mut b).0;
+        assert!(restored <= hot + 0.02, "restored at {restored}, was {hot}");
+        // a cold start, for comparison, plays louder
+        let (mut cold, _, _) = load_unit(Some(&blob), 48_000.0, 2, 0, Role::Protect);
+        assert!(!start_stream(cold.as_dyn(), &empty, None));
+        let cold_out = run(&mut cold).0;
+        assert!(cold_out > restored + 0.1, "cold {cold_out}, restored {restored}");
+        // another blob gets nothing; a record past ten minutes is not restored
+        assert!(page.provided_for(crc ^ 1).is_none());
+        let (mut c, _, _) = load_unit(Some(&blob), 48_000.0, 2, 0, Role::Protect);
+        assert!(!start_stream(c.as_dyn(), &empty, Some((got, PROVIDED_MAX_AGE_S + 1.0))));
+        // the record is aged by the unit's own decay: an older record
+        // restores cooler (this unit's time constants are seconds)
+        let (mut d, _, _) = load_unit(Some(&blob), 48_000.0, 2, 0, Role::Protect);
+        assert!(start_stream(d.as_dyn(), &empty, Some((got, 20.0))));
+        let aged = run(&mut d).0;
+        assert!(aged >= restored - 1e-6, "aged {aged}, restored {restored}");
+        let _ = std::fs::remove_file(&path);
     }
 }
