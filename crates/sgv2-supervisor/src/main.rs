@@ -22,7 +22,12 @@
 //!   check holds; any fault releases at once. The PCM's `/proc` status can
 //!   block for tens of ms while a stream closes, so a separate thread reads
 //!   it, and the loop only takes that thread's latest snapshot: a snapshot
-//!   older than `PCM_SNAPSHOT_MAX_NS` is no proof.
+//!   older than `PCM_SNAPSHOT_MAX_NS` is no proof. When the reader sees the
+//!   PCM go to XRUN, paused, suspended, unreadable or a new owner, it wakes
+//!   the loop for an extra tick at once (an eventfd), so a stopped engine is
+//!   released within the reader's 1 ms poll instead of at the next 10 ms
+//!   tick (B2 measured 11.7 ms from XRUN to release, 31.0 ms to the floor,
+//!   on 0d7ee6c).
 //! - Exits on losing ownership or any kernel error: closing the control file
 //!   withdraws protection at once.
 //!
@@ -49,7 +54,7 @@ mod linux {
 
     use sgv2_lv2::page::{EnginePage, LAYOUT, MAGIC, PAGE_BYTES};
     use sgv2_supervisor::kernel::{Kernel, KernelError, Macaudio};
-    use sgv2_supervisor::machine::{board_from_compatible, lookup, Machine};
+    use sgv2_supervisor::machine::{blob_full_scales, board_from_compatible, lookup, Machine};
     use sgv2_supervisor::observe::{
         combine, owner_to_tgid, parse_pcm_info, parse_pcm_status, parse_session, parse_tgid, speaker_pcm_problem,
         EngineState, EngineView, Observer, PcmInfo, PcmState, PcmView, SessionReport, SessionView,
@@ -60,7 +65,7 @@ mod linux {
     const EX_CONFIG: i32 = 78;
     const EX_UNAVAILABLE: i32 = 69;
     /// The PCM reader's period.
-    const PCM_POLL_NS: u64 = 2_000_000;
+    const PCM_POLL_NS: u64 = 1_000_000;
     /// A PCM snapshot whose read started longer ago than this is Unknown.
     const PCM_SNAPSHOT_MAX_NS: u64 = 12_000_000;
     /// Waiting for the card: 50 ms doubling to 2 s.
@@ -125,12 +130,13 @@ mod linux {
 
     /// The reader thread: every substream's `/proc` status, owners mapped
     /// from thread to process id, folded into one state.
-    fn spawn_pcm_reader(dir: String, subs: u32, out: Arc<PcmSnapshot>) -> std::io::Result<()> {
+    fn spawn_pcm_reader(dir: String, subs: u32, out: Arc<PcmSnapshot>, wake: i32) -> std::io::Result<()> {
         std::thread::Builder::new().name("sgv2-pcm".into()).spawn(move || {
             let paths: Vec<String> = (0..subs).map(|s| format!("{dir}/sub{s}/status")).collect();
             let mut buf = String::with_capacity(1024);
             let mut tbuf = String::with_capacity(2048);
             let mut states = Vec::with_capacity(paths.len());
+            let mut last = PcmState::Closed;
             loop {
                 let started = now_ns();
                 states.clear();
@@ -141,12 +147,51 @@ mod linux {
                     };
                     states.push(owner_to_tgid(st, &mut tgid));
                 }
-                out.state.store(combine(&states).pack(), Ordering::Release);
+                let now = combine(&states);
+                out.state.store(now.pack(), Ordering::Release);
                 out.taken_ns.store(started, Ordering::Release);
+                if wakes(last, now) {
+                    let one: u64 = 1;
+                    // SAFETY: an eventfd we own; an 8-byte counter write.
+                    unsafe { libc::write(wake, (&one as *const u64).cast(), 8) };
+                }
+                last = now;
                 sleep_until(started + PCM_POLL_NS);
             }
         })?;
         Ok(())
+    }
+
+    /// Whether a change from `a` to `b` is worth a tick now: the PCM
+    /// stopped, became unreadable, or changed hands.
+    fn wakes(a: PcmState, b: PcmState) -> bool {
+        let owner = |s: PcmState| match s {
+            PcmState::Open { owner } | PcmState::Stopped { owner } | PcmState::Running { owner } => Some(owner),
+            _ => None,
+        };
+        let bad = |s: PcmState| matches!(s, PcmState::Stopped { .. } | PcmState::Unknown);
+        (bad(b) && !bad(a)) || (owner(b).is_some() && owner(a).is_some() && owner(a) != owner(b))
+    }
+
+    /// Sleep until `deadline` or a wake from the PCM reader. True if woken.
+    fn wait_until(deadline: u64, wake: i32) -> bool {
+        loop {
+            let now = now_ns();
+            if now >= deadline {
+                return false;
+            }
+            let left = deadline - now;
+            let ts = libc::timespec { tv_sec: (left / 1_000_000_000) as i64, tv_nsec: (left % 1_000_000_000) as i64 };
+            let mut pfd = libc::pollfd { fd: wake, events: libc::POLLIN, revents: 0 };
+            // SAFETY: one live pollfd and a valid timeout.
+            let r = unsafe { libc::ppoll(&mut pfd, 1, &ts, core::ptr::null()) };
+            if r > 0 && pfd.revents & libc::POLLIN != 0 {
+                let mut v: u64 = 0;
+                // SAFETY: clearing our eventfd's counter into a live u64.
+                unsafe { libc::read(wake, (&mut v as *mut u64).cast(), 8) };
+                return true;
+            }
+        }
     }
 
     /// The helper's report: opened without following links and without
@@ -356,6 +401,10 @@ mod linux {
         if !(8_000..=192_000).contains(&header.sample_rate) {
             return refuse(format!("sample rate {}", header.sample_rate));
         }
+        let full_scales = match blob_full_scales(&blob) {
+            Ok(v) => v,
+            Err(why) => return refuse(why),
+        };
 
         let run_dir = Path::new("/run/speakerguardd");
         let user_dir = run_dir.join(uid.to_string());
@@ -437,9 +486,15 @@ mod linux {
         );
 
         let snapshot = Arc::new(PcmSnapshot::default());
+        // SAFETY: a plain eventfd, non-blocking and close-on-exec.
+        let wake = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        if wake < 0 {
+            eprintln!("eventfd: {}", std::io::Error::last_os_error());
+            return EX_UNAVAILABLE;
+        }
         // before SCHED_FIFO: the reader runs at normal priority
         let pcm_dir = format!("/proc/asound/card{index}/pcm{pcm}p");
-        if let Err(e) = spawn_pcm_reader(pcm_dir, info.subdevices, snapshot.clone()) {
+        if let Err(e) = spawn_pcm_reader(pcm_dir, info.subdevices, snapshot.clone(), wake) {
             eprintln!("PCM reader: {e}");
             return EX_UNAVAILABLE;
         }
@@ -457,16 +512,20 @@ mod linux {
         let mut pcm_view = PcmLatest(snapshot);
         let mut session = Session(session_path);
         let mut observer = Observer::new(header.payload_crc, header.sample_rate, TICK_NS);
-        let mut sup = Supervisor::new(Expect::new(machine, header.full_scale_mv, &info.id));
+        let mut sup = Supervisor::new(Expect::new(machine, full_scales, &info.id));
         let mut deadline = now_ns();
         let mut ticks = 0u64;
         let mut last_problem: Option<String> = None;
         notify.send("STATUS=supervising");
+        let mut scheduled = true;
         loop {
             let obs = observer.observe(&mut now_ns, &mut engine, &mut pcm_view, &mut session);
             let event = sup.tick(obs, &mut kernel);
             match event {
-                Ok(Event::Granted) => eprintln!("protection granted"),
+                Ok(Event::Granted) => {
+                    observer.note_grant(now_ns());
+                    eprintln!("protection granted");
+                }
                 Ok(Event::Released { why }) => eprintln!("protection released: {why:?}"),
                 Ok(Event::HardFault(f)) => eprintln!("amp fault, protection withdrawn until restart: {f}"),
                 Ok(Event::Lapsed) => eprintln!("lease lapsed; re-qualifying"),
@@ -483,18 +542,22 @@ mod linux {
                 }
                 last_problem = sup.problem().map(str::to_owned);
             }
-            if ticks % 20 == 0 {
-                // every 200 ms, under the unit's WatchdogSec
-                notify.send("WATCHDOG=1");
+            if scheduled {
+                if ticks % 20 == 0 {
+                    // every 200 ms, under the unit's WatchdogSec
+                    notify.send("WATCHDOG=1");
+                }
+                ticks += 1;
+                deadline += TICK_NS;
+                let now = now_ns();
+                if now > deadline + TICK_NS {
+                    // overran by more than a tick: resynchronise, never burst
+                    deadline = now;
+                }
             }
-            ticks += 1;
-            deadline += TICK_NS;
-            let now = now_ns();
-            if now > deadline + TICK_NS {
-                // overran by more than a tick: resynchronise, never burst
-                deadline = now;
-            }
-            sleep_until(deadline);
+            // an extra tick when the PCM reader wakes us; the 10 ms deadlines
+            // are unchanged
+            scheduled = !wait_until(deadline, wake);
         }
     }
 }

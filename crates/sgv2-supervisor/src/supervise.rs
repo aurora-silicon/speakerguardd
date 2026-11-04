@@ -47,8 +47,9 @@ pub enum Fatal {
 pub struct Expect {
     pub amps: usize,
     pub amp: Amp,
-    /// The blob's operating point: output peak volts at full scale, mV.
-    pub full_scale_mv: u32,
+    /// The blob's operating point, per channel: output peak volts at full
+    /// scale, mV (see `machine::blob_full_scales`).
+    pub full_scale_mv: Vec<u32>,
     /// For amps without a gain control, the chip's own full scale.
     pub fixed_full_scale_mv: u32,
     /// The front-end the speaker mux must select: the watched PCM's id.
@@ -56,7 +57,7 @@ pub struct Expect {
 }
 
 impl Expect {
-    pub fn new(machine: &Machine, full_scale_mv: u32, route: &str) -> Self {
+    pub fn new(machine: &Machine, full_scale_mv: Vec<u32>, route: &str) -> Self {
         Expect {
             amps: machine.amps,
             amp: machine.amp,
@@ -116,10 +117,13 @@ impl Supervisor {
         } else {
             f64::from(x.fixed_full_scale_mv)
         };
-        if !same_operating_point(measured, x.full_scale_mv) {
+        if x.full_scale_mv.len() != x.amps {
+            return Ok(Some(format!("{} channel full scales for {} amps", x.full_scale_mv.len(), x.amps)));
+        }
+        if let Some((c, mv)) = x.full_scale_mv.iter().enumerate().find(|(_, mv)| !same_operating_point(measured, **mv))
+        {
             return Ok(Some(format!(
-                "operating point {measured:.0} mV full scale, the parameters assume {} mV",
-                x.full_scale_mv
+                "operating point {measured:.0} mV full scale, the parameters assume {mv} mV (channel {c})"
             )));
         }
         Ok(None)
@@ -209,9 +213,9 @@ mod tests {
         amps_ok: false,
     };
 
-    /// The J316 with a blob for gain 15 (18.5 dBV, 8414 mV).
+    /// The J316 with a blob for gain 15 (18.5 dBV, 11.89 V peak).
     fn j316() -> Supervisor {
-        Supervisor::new(Expect::new(lookup("j316s").unwrap(), 8414, "Secondary"))
+        Supervisor::new(Expect::new(lookup("j316s").unwrap(), vec![11_890; 6], "Secondary"))
     }
 
     #[test]
@@ -301,13 +305,13 @@ mod tests {
             k
         };
         let mut k = neo_card();
-        let mut s = Supervisor::new(Expect::new(neo, 7300, "Secondary"));
+        let mut s = Supervisor::new(Expect::new(neo, vec![7_300, 7_330], "Secondary"));
         s.tick(CLEAN, &mut k).unwrap();
         assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Granted));
         assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Renewed));
         // a blob for another operating point is refused
         let mut k = neo_card();
-        let mut s = Supervisor::new(Expect::new(neo, 6000, "Secondary"));
+        let mut s = Supervisor::new(Expect::new(neo, vec![7_300, 6_000], "Secondary"));
         for _ in 0..4 {
             assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::StayedReleased));
         }
@@ -369,7 +373,7 @@ mod tests {
         assert_eq!(k.renewals, 0);
         // a blob that states no operating point is refused too
         let mut k = Recorder::healthy(6);
-        let mut s = Supervisor::new(Expect::new(lookup("j316s").unwrap(), 0, "Secondary"));
+        let mut s = Supervisor::new(Expect::new(lookup("j316s").unwrap(), vec![0; 6], "Secondary"));
         for _ in 0..3 {
             assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::StayedReleased));
         }
