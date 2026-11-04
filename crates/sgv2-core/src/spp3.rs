@@ -50,9 +50,9 @@
 //!   NORMAL). `host_reset` is `AudioUnitReset`: only the closed-loop
 //!   estimator returns to its calibration; thermal, gain, pilot and SafeTlim
 //!   state continue.
-//! - **Full scale.** The program is held to digital full scale (`clamp(x,
-//!   -1, 1)`) before the gain and before both model meters; in-range audio
-//!   is unchanged.
+//! - **Input clamp.** The program is held to +-1.5 FS (rig law (b)) before
+//!   the gain and before both model meters; in-range audio is unchanged.
+//!   The output samples are then held to +-1 FS after metering (policy).
 //! - **Fail-safe.** A channel-count mismatch, or non-finite drive (the
 //!   simple-meter failure), gives 20 dB for the affected frames. A model
 //!   state that goes non-finite latches the 20 dB fail-safe
@@ -498,6 +498,10 @@ const HARD_TARGET_BELOW: f64 = 5.0;
 /// Clamp of the candidate ratio before the square root (spec 6, 16): a
 /// 0.01 (-40 dB) linear-gain floor.
 const RATIO_MIN: f64 = 1e-4;
+/// The unit clamps its program input to +-1.5 FS before the gain and the
+/// drive meter (rig law (b): Pdrv of a 2 FS sine is that of the clamped
+/// sine; the output never exceeds 1.5 x the gain). The output stays bounded.
+const INPUT_CLAMP: f32 = 1.5;
 /// Release hold of the ordinary candidate, s (rig law 5: fixed).
 const HOLD_S: f64 = 1.0;
 /// Dezipper 99 % settling time, s (spec 6).
@@ -623,13 +627,16 @@ struct Goertzel {
 impl Goertzel {
     #[inline]
     fn push(&mut self, x: f32, a: f32) {
-        let s0 = x + a * self.s1 - self.s2;
+        // fused a*s1 + x, then - s2 (rig law (a))
+        let s0 = libm::fmaf(a, self.s1, x) - self.s2;
         self.s2 = self.s1;
         self.s1 = s0;
     }
     /// `(s1^2 + s2^2 - a s1 s2) / N^2`, then cleared for the next period.
     fn take(&mut self, a: f32, n: f32) -> f32 {
-        let p = (self.s1 * self.s1 + self.s2 * self.s2 - a * self.s1 * self.s2) / (n * n);
+        // fmaf(-(a*s1), s2, fmaf(s1, s1, s2*s2)) / N^2 (rig law (a))
+        let (s1, s2) = (self.s1, self.s2);
+        let p = libm::fmaf(-(a * s1), s2, libm::fmaf(s1, s1, s2 * s2)) / (n * n);
         *self = Goertzel::default();
         p
     }
@@ -1112,6 +1119,10 @@ struct Run {
     pos: usize,
     frame: u64,
     last_frame: u64,
+    /// The graph's render block, frames, and the end of the sense the
+    /// closed loop has already taken ahead for the current block.
+    block: usize,
+    prefed_until: u64,
     sums: BlockSums,
     sense_ok: bool,
     estimator: DelayEstimator,
@@ -1336,6 +1347,8 @@ impl Run {
             pos: 0,
             frame: 0,
             last_frame: 0,
+            block: p.block_frames as usize,
+            prefed_until: 0,
             sums,
             sense_ok: false,
             estimator: DelayEstimator::new(),
@@ -1355,10 +1368,31 @@ impl Run {
         self.pos = 0;
         self.frame = 0;
         self.last_frame = 0;
+        self.prefed_until = 0;
         self.sums.clear();
         self.sense_ok = false;
         self.estimator.reset();
         self.fault = false;
+    }
+
+    /// The reference consumes a whole render block's telemetry before the
+    /// block's first thermal update, so a Goertzel period ending inside the
+    /// block acts from that first update (rig law (a), at the graph's
+    /// 512-frame slices). With the whole block in this call, take its
+    /// sense now; otherwise the segments feed it as they come.
+    fn prefeed(&mut self, io: &Io<'_, '_>, off: usize) {
+        let n = self.block;
+        let sense = io.sense;
+        let fits = |p: usize| sense.get(p).is_some_and(|b| b.len() >= off + n);
+        if !self.ch.iter().all(|c| c.sense.is_none_or(|(si, sv)| fits(si) && fits(sv))) {
+            return;
+        }
+        for c in self.ch.iter_mut() {
+            if let (Some((si, sv)), Some(cl)) = (c.sense, c.cl.as_mut()) {
+                cl.feed(&sense[si][off..off + n], &sense[sv][off..off + n]);
+            }
+        }
+        self.prefed_until = self.frame + n as u64;
     }
 
     /// Frames `off..off+len` of the host buffers, inside one thermal update.
@@ -1379,7 +1413,7 @@ impl Run {
             let out = &mut io.output[c.src][off..off + len];
             let curve = &self.curve[c.group * THERMAL_FRAMES..][..len];
             // the program held to full scale, times the gain
-            let non_finite = dsp::mul_bounded_to(inp, curve, out);
+            let non_finite = dsp::mul_clamped_to(inp, curve, out, INPUT_CLAMP);
             if c.headroom != 1.0 {
                 dsp::scale_in_place(out, c.headroom);
             }
@@ -1387,7 +1421,7 @@ impl Run {
                 // simple-meter failure: at most 20 dB below the input on
                 // these frames, non-finite samples muted
                 for ((o, &x), &g) in out.iter_mut().zip(inp).zip(curve) {
-                    *o = dsp::bound1(x) * (g * c.headroom).min(FAILSAFE_GAIN);
+                    *o = dsp::clamp1(x, INPUT_CLAMP) * (g * c.headroom).min(FAILSAFE_GAIN);
                 }
                 *health |= Health::FAILSAFE;
             }
@@ -1399,13 +1433,17 @@ impl Run {
                 }
             }
             c.acc.add_sq(out, phase);
+            // the meters see the reference's +-1.5 FS drive; the samples that
+            // leave the unit are held to digital full scale (policy: the
+            // output stays bounded; only |y| > 1 differs from the reference)
+            dsp::clamp_in_place(out, 1.0);
             // Pdrv: the unprotected program on the same frames
             let mut m0 = 0;
             while m0 < len {
                 let m = (len - m0).min(c.scratch.len());
                 c.scratch[..m].copy_from_slice(&inp[m0..m0 + m]);
                 // held to full scale like the program the output carries
-                dsp::bound(&mut c.scratch[..m]);
+                dsp::clamp_in_place(&mut c.scratch[..m], INPUT_CLAMP);
                 c.acc_in.add_sq(&c.scratch[..m], phase + m0);
                 m0 += m;
             }
@@ -1426,7 +1464,7 @@ impl Run {
                 (Some(i), Some(v)) if i.len() >= off + len && v.len() >= off + len => {
                     let (i, v) = (&i[off..off + len], &v[off..off + len]);
                     c.acc_vi.add_prod(v, i, phase);
-                    if let Some(cl) = c.cl.as_mut() {
+                    if let Some(cl) = c.cl.as_mut().filter(|_| self.frame >= self.prefed_until) {
                         cl.feed(i, v);
                     }
                 }
@@ -1600,6 +1638,13 @@ impl ProtectionUnit for Unit {
         let mut off = 0;
         while off < frames {
             let len = (THERMAL_FRAMES - run.pos).min(frames - off);
+            if run.frame >= run.prefed_until
+                && run.block > 0
+                && run.frame % run.block as u64 == 0
+                && frames - off >= run.block
+            {
+                run.prefeed(&io, off);
+            }
             run.segment(&mut io, off, len, &mut health);
             off += len;
             run.pos += len;
