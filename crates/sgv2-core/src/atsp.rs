@@ -1,46 +1,91 @@
 //! `atsp`: audio-only two-node thermal protection (13" MacBook Pro M1/M2,
-//! MacBook Air M1), from the behaviour specification:
+//! MacBook Air M1 and the desktop/one-channel presets), from the behaviour
+//! specification (SPEC-ATSP, 25G83):
 //!
-//! - three speaker-type slots, each with its own model and limits and a
-//!   16-bit channel assignment mask (zero disables the slot);
-//! - per channel, `v = AmplifierSensitivity * x`, `p = v^2 / Rdc`, `P` the
-//!   mean over the update interval (the graph's block, as for spp3: the
-//!   unit runs on its own block clock and is split-invariant);
-//! - the coupled two-node backward-Euler model with the old magnet state in
-//!   the coil target;
-//! - the infinite-ratio ceiling: `g = min(1, sqrt(P_allow / P_drive))` with
-//!   `P_allow = (T_limit - ambient - theta_mg) / Rth_vc` from the current
-//!   magnet state;
-//! - attack/release smoothing of the target in linear gain, per sample;
-//! - linking: a slot's `Gain link` takes the minimum over its channels, and
-//!   `Gain link all audio channels` the minimum over every active channel;
-//! - the 20 dB panic while `T_vc > T_limit + headroom`, at once;
-//! - reset at ambient and unity gain.
+//! - **Routing** (spec 4). Each in-range stream channel takes the first of
+//!   slots A, B, C whose 16-bit assignment mask has its bit; a channel no
+//!   mask claims is routed to A. Mask bits at or above the channel count are
+//!   ignored, so wide masks (`0xffff`) and a zero A mask are valid.
+//! - **Thermal model** (spec 3), per channel and per sample, on the signal
+//!   after the channel's controller gain and before the final trim:
+//!   `p = (Vfs g x)^2 / Rdc`, backward Euler with `a = dt / (tau + dt)`.
+//!   The two nodes are in series: `theta_vc` is the coil's rise over the
+//!   magnet (target `p Rvc`), `theta_mg` the magnet's over ambient (target
+//!   `p Rmg`), and `Tvc = Tamb + theta_mg + theta_vc`.
+//! - **Controller** (spec 3). No forecasting: the request is unity until the
+//!   modelled coil is strictly above `Tlim`, and returns to unity once it is
+//!   at or below it. While above,
+//!   `g_req = min(1, sqrt(P_allow / P_drive))`,
+//!   `P_allow = max(0, (Tlim - Tamb - theta_mg) / Rvc)`, `P_drive` the drive
+//!   power estimate of the unattenuated input. Strictly above
+//!   `Tlim + headroom` the request is also capped at the 20 dB panic target
+//!   0.1.
+//! - **Linking.** A slot's `Gain link` replaces the requests of its channels
+//!   by their minimum; then `Gain link all audio channels` (ID 40) replaces
+//!   every request by the global minimum. Each channel smooths the result.
+//! - **Smoothing.** Toward the request with the slot's attack (down) or
+//!   release (up) time, as 99 %-settling times:
+//!   `a = 1 - exp(ln(0.01) / (t * rate))`, per sample.
+//! - **Output.** `y = x * g * d`, where `d` is the output dezipper: zero for
+//!   the first 240 active frames after initialisation or reset, then rising
+//!   to the nominal trim `1.0060076713562012` (+0.052 dB) by about 115 ms,
+//!   then holding it. Zero latency.
+//! - **Bypass** (ID 0, at the next call): a bit-exact copy that freezes all
+//!   thermal, gain, link and startup state; clearing it resumes that state.
 //!
-//! A tuning with the global `Bypass` set is refused (the unit then runs the
-//! fail-safe): bypass is never a protection state. A channel no slot claims
-//! is unconstrained by the specification; it is refused too, since an
-//! unprotected speaker channel is never acceptable here.
+//! Non-finite input contributes zero power and gives a zero output sample,
+//! so it can never poison the thermal state.
 //!
-//! TODO(SPEC): backward Euler versus exact exponential (spec 8), the
-//! smoothing pole formula (`exp(-1/(tau*rate))`), and the panic comparison
-//! at equality (strict here).
+//! The payload's `block_frames` is accepted and ignored: the unit is
+//! sample-continuous for every host slice of two frames or more (spec 6).
+//!
+//! TODO(SPEC):
+//! - **Thermal recurrence.** The specification gives the coupled form
+//!   `theta_vc += a_vc (theta_mg_old + p Rvc - theta_vc)`, `Tvc = Tamb +
+//!   theta_vc`. The 25G83 entry times contradict it: on the 1 kHz ramp the
+//!   first attenuated sample is at 0.788 s (AID4) and 0.875 s (AID3); the
+//!   series form above crosses `Tlim` at 0.789 s and 0.872 s, the coupled
+//!   form at 0.823 s and 0.917 s. Both have the same steady state.
+//! - **Drive estimator.** The specification names `P_drive` as the mean of
+//!   `(Vfs x)^2 / Rdc` "in the controller power estimator" but not its
+//!   window. Bit-identical output for host slices 2..4096 rules out a
+//!   per-call mean. Here it is a one-pole mean of the instantaneous drive
+//!   power with the slot's attack coefficient.
+//! - **Startup dezipper law.** Only the 240-frame mute and "nominal by about
+//!   115 ms" are specified. The measured macOS trajectory is not monotonic
+//!   (it overshoots the trim by about 2.2 % near 44 ms); here the dezipper is
+//!   a linear ramp from frame 240 to frame 5520 (115 ms), never above trim.
+//! - **Q = 1.** macOS takes a distinct path for one-frame host calls; it is
+//!   not specified, and this unit renders Q = 1 like any other slice.
 
-use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::blob::{BlobError, Pod};
-use crate::{dsp, ChannelState, Health, Io, ProtectionUnit, Telemetry, UnitKind, FAILSAFE_GAIN, MAX_CHANNELS};
+use crate::{ChannelState, Health, Io, ProtectionUnit, Telemetry, UnitKind, FAILSAFE_GAIN, MAX_CHANNELS};
 
 const EPS: f64 = f32::MIN_POSITIVE as f64;
-/// Longest update in host-block mode (`block_frames = 0`), frames.
-const HOST_MAX: usize = 4096;
+/// The settled output trim of the active unit (spec 3), as Float32.
+pub const NOMINAL_TRIM: f32 = 1.006_007_7;
+/// Silence after initialisation (spec 5; 240 frames at 48 kHz).
+pub const STARTUP_MUTE_S: f64 = 0.005;
+/// Time by which the output dezipper reaches the trim (spec 5).
+pub const STARTUP_SETTLE_S: f64 = 0.115;
+/// The panic target, 20 dB.
+pub const PANIC_GAIN: f64 = 0.1;
+
+/// AU parameter IDs (spec 2).
+pub mod ids {
+    pub const BYPASS: u32 = 0;
+    /// The first ID of slot `t` is `1 + 13 * t`.
+    pub const SLOT_STRIDE: u32 = 13;
+    pub const GAIN_LINK_ALL: u32 = 40;
+}
 
 /// One speaker-type slot (A, B or C).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Slot {
-    /// `Audio channel assignment`: bit c claims host channel c.
+    /// `Audio channel assignment`: bit c claims stream channel c.
     pub channel_mask: u32,
     pub gain_link: u32,
     pub amplifier_sensitivity: f32,
@@ -61,6 +106,7 @@ pub struct Slot {
 pub struct Params {
     pub channels: u32,
     pub sample_rate: u32,
+    /// Reserved: the unit is sample-continuous (spec 6).
     pub block_frames: u32,
     pub bypass: u32,
     pub gain_link_all: u32,
@@ -83,27 +129,61 @@ pub enum InitError {
 }
 
 impl Params {
+    /// The slot each stream channel is routed to (spec 4).
+    pub fn route(&self) -> [usize; MAX_CHANNELS] {
+        let mut r = [0usize; MAX_CHANNELS];
+        for (c, slot) in r.iter_mut().enumerate().take((self.channels as usize).min(MAX_CHANNELS)) {
+            *slot = (0..3).find(|&s| self.slot[s].channel_mask & (1 << c) != 0).unwrap_or(0);
+        }
+        r
+    }
+
+    /// Set one AU parameter (spec 2) in the payload. False for an unknown ID
+    /// or an unusable mask value.
+    pub fn set(&mut self, id: u32, v: f32) -> bool {
+        let flag = (v != 0.0) as u32;
+        match id {
+            ids::BYPASS => self.bypass = flag,
+            ids::GAIN_LINK_ALL => self.gain_link_all = flag,
+            1..=39 => {
+                let s = &mut self.slot[((id - 1) / ids::SLOT_STRIDE) as usize];
+                match (id - 1) % ids::SLOT_STRIDE {
+                    0 => s.amplifier_sensitivity = v,
+                    1 => s.rdc = v,
+                    2 => s.rth_vc = v,
+                    3 => s.tau_vc = v,
+                    4 => s.rth_mg = v,
+                    5 => s.tau_mg = v,
+                    6 => s.ambient = v,
+                    7 => s.temperature_limit = v,
+                    8 => s.attack_ms = v,
+                    9 => s.release_ms = v,
+                    10 => s.hard_limit_headroom = v,
+                    11 => s.gain_link = flag,
+                    _ => {
+                        if !(v.is_finite() && v >= 0.0) {
+                            return false;
+                        }
+                        s.channel_mask = v as u32 & 0xffff;
+                    }
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
     pub fn validate(&self) -> Result<(), InitError> {
         let n = self.channels as usize;
         if n == 0 || n > MAX_CHANNELS || self.sample_rate == 0 {
             return Err(InitError::Invalid("geometry"));
         }
-        if self.block_frames > 16384 {
-            return Err(InitError::Invalid("block frames"));
-        }
+        let route = self.route();
         let pos = |v: f32| v.is_finite() && v > 0.0;
-        let mut claimed = 0u32;
-        for s in &self.slot {
-            if s.channel_mask == 0 {
+        for (i, s) in self.slot.iter().enumerate() {
+            if !route[..n].contains(&i) {
                 continue;
             }
-            if s.channel_mask >> n != 0 {
-                return Err(InitError::Invalid("channel mask beyond the channel count"));
-            }
-            if claimed & s.channel_mask != 0 {
-                return Err(InitError::Invalid("channel claimed by two slots"));
-            }
-            claimed |= s.channel_mask;
             let positive = [s.amplifier_sensitivity, s.rdc, s.rth_vc, s.tau_vc, s.tau_mg, s.attack_ms, s.release_ms]
                 .iter()
                 .all(|&v| pos(v));
@@ -112,9 +192,6 @@ impl Params {
             if !(positive && finite && magnet) {
                 return Err(InitError::Invalid("slot constants"));
             }
-        }
-        if claimed != (1u32 << n) - 1 {
-            return Err(InitError::Invalid("a channel no slot protects"));
         }
         Ok(())
     }
@@ -133,57 +210,58 @@ impl Params {
     }
 }
 
+/// 99 %-settling smoothing coefficient for a time in ms (spec 3).
+pub fn settle_coeff(rate: f64, ms: f64) -> f64 {
+    1.0 - libm::exp(libm::log(0.01) / (ms * 1e-3 * rate))
+}
+
 struct Chan {
+    slot: usize,
+    /// Vfs^2 / Rdc: watts per unit mean square.
     elec: f64,
-    span: f64,
     rth_vc: f64,
     rth_mg: f64,
     a_vc: f64,
     a_mg: f64,
-    tau_vc: f64,
-    tau_mg: f64,
-    hard_limit: f64,
     ambient: f64,
-    group: usize,
-    acc: dsp::LaneAcc,
-    acc_in: dsp::LaneAcc,
+    limit: f64,
+    hard_limit: f64,
+    a_attack: f64,
+    a_release: f64,
     theta_vc: f64,
     theta_mg: f64,
+    /// Drive power estimate of the unattenuated input, W.
+    p_drive: f64,
+    /// Modelled power of the protected signal, W (the last sample).
     p_model: f64,
-    g_target: f64,
-    hard: bool,
-}
-
-struct Group {
-    r_attack: f32,
-    r_release: f32,
-    gain: f32,
-    hard: bool,
+    limiting: bool,
+    panic: bool,
+    request: f64,
+    gain: f64,
 }
 
 struct Run {
     n: usize,
-    block: usize,
-    dynamic: bool,
-    rate: f64,
+    link_slot: [bool; 3],
+    link_all: bool,
     ch: Vec<Chan>,
-    groups: Vec<Group>,
-    /// Gain of every frame of the current block, per group.
-    curve: Vec<f32>,
-    pos: usize,
+    /// Active (not bypassed) frames since initialisation: the dezipper clock.
+    active: u64,
+    mute: u64,
+    settle: u64,
     frame: u64,
-    last_frame: u64,
 }
 
 pub struct Unit {
     params: Params,
+    bypass: bool,
     run: Option<Run>,
 }
 
 impl Unit {
     pub fn new(params: Params) -> Self {
         let run = Run::new(&params).ok();
-        Unit { params, run }
+        Unit { params, bypass: params.bypass != 0, run }
     }
     pub fn init_error(params: &Params) -> Option<InitError> {
         Run::new(params).err()
@@ -194,176 +272,141 @@ impl Unit {
     pub fn is_failsafe(&self) -> bool {
         self.run.is_none()
     }
-}
-
-fn pole(rate: f64, tau_s: f64) -> f32 {
-    libm::exp(-1.0 / (tau_s * rate)) as f32
+    pub fn bypassed(&self) -> bool {
+        self.bypass
+    }
 }
 
 impl Run {
     fn new(p: &Params) -> Result<Run, InitError> {
         p.validate()?;
-        if p.bypass != 0 {
-            return Err(InitError::Unsupported("Bypass"));
-        }
         let n = p.channels as usize;
         let rate = p.sample_rate as f64;
-        // 0: the graph has no reblocker, so the model updates once per host
-        // call (calls longer than HOST_MAX are split).
-        let dynamic = p.block_frames == 0;
-        let block = if dynamic { HOST_MAX } else { p.block_frames as usize };
-        let dt = block as f64 / rate;
-        let mut groups: Vec<Group> = Vec::new();
-        let mut ch: Vec<Option<Chan>> = (0..n).map(|_| None).collect();
-        // one group for everything when linked globally
-        let all = if p.gain_link_all != 0 { Some(0) } else { None };
-        for s in p.slot.iter().filter(|s| s.channel_mask != 0) {
-            let mk = |groups: &mut Vec<Group>| {
-                groups.push(Group {
-                    r_attack: pole(rate, s.attack_ms as f64 * 1e-3),
-                    r_release: pole(rate, s.release_ms as f64 * 1e-3),
-                    gain: 1.0,
-                    hard: false,
-                });
-                groups.len() - 1
-            };
-            let slot_group = if all.is_some() {
-                if groups.is_empty() {
-                    Some(mk(&mut groups))
-                } else {
-                    Some(0)
-                }
-            } else if s.gain_link != 0 {
-                Some(mk(&mut groups))
-            } else {
-                None
-            };
-            for (c, slot_ch) in ch.iter_mut().enumerate() {
-                if s.channel_mask & (1 << c) == 0 {
-                    continue;
-                }
-                let group = slot_group.unwrap_or_else(|| mk(&mut groups));
-                let v = s.amplifier_sensitivity as f64;
-                *slot_ch = Some(Chan {
-                    elec: v * v / s.rdc as f64,
-                    span: s.temperature_limit as f64 - s.ambient as f64,
-                    rth_vc: s.rth_vc as f64,
-                    rth_mg: s.rth_mg as f64,
-                    a_vc: dt / (s.tau_vc as f64 + dt),
-                    a_mg: dt / (s.tau_mg as f64 + dt),
-                    tau_vc: s.tau_vc as f64,
-                    tau_mg: s.tau_mg as f64,
-                    hard_limit: s.temperature_limit as f64 + s.hard_limit_headroom as f64,
-                    ambient: s.ambient as f64,
-                    group,
-                    acc: dsp::LaneAcc::new(),
-                    acc_in: dsp::LaneAcc::new(),
-                    theta_vc: 0.0,
-                    theta_mg: 0.0,
-                    p_model: 0.0,
-                    g_target: 1.0,
-                    hard: false,
-                });
-            }
+        let dt = 1.0 / rate;
+        let route = p.route();
+        let mut ch = Vec::with_capacity(n);
+        for &si in &route[..n] {
+            let s = &p.slot[si];
+            let v = s.amplifier_sensitivity as f64;
+            ch.push(Chan {
+                slot: si,
+                elec: v * v / s.rdc as f64,
+                rth_vc: s.rth_vc as f64,
+                rth_mg: s.rth_mg as f64,
+                a_vc: dt / (s.tau_vc as f64 + dt),
+                a_mg: dt / (s.tau_mg as f64 + dt),
+                ambient: s.ambient as f64,
+                limit: s.temperature_limit as f64,
+                hard_limit: s.temperature_limit as f64 + s.hard_limit_headroom as f64,
+                a_attack: settle_coeff(rate, s.attack_ms as f64),
+                a_release: settle_coeff(rate, s.release_ms as f64),
+                theta_vc: 0.0,
+                theta_mg: 0.0,
+                p_drive: 0.0,
+                p_model: 0.0,
+                limiting: false,
+                panic: false,
+                request: 1.0,
+                gain: 1.0,
+            });
         }
-        let ch: Vec<Chan> =
-            ch.into_iter().map(|c| c.ok_or(InitError::Invalid("unclaimed channel"))).collect::<Result<_, _>>()?;
-        let curve = vec![1.0; groups.len() * block];
-        Ok(Run { n, block, dynamic, rate, ch, groups, curve, pos: 0, frame: 0, last_frame: 0 })
+        Ok(Run {
+            n,
+            link_slot: [p.slot[0].gain_link != 0, p.slot[1].gain_link != 0, p.slot[2].gain_link != 0],
+            link_all: p.gain_link_all != 0,
+            ch,
+            active: 0,
+            mute: libm::round(STARTUP_MUTE_S * rate) as u64,
+            settle: libm::round(STARTUP_SETTLE_S * rate) as u64,
+            frame: 0,
+        })
     }
 
     fn reset(&mut self) {
         for c in self.ch.iter_mut() {
-            c.acc.clear();
-            c.acc_in.clear();
             c.theta_vc = 0.0;
             c.theta_mg = 0.0;
+            c.p_drive = 0.0;
             c.p_model = 0.0;
-            c.g_target = 1.0;
-            c.hard = false;
+            c.limiting = false;
+            c.panic = false;
+            c.request = 1.0;
+            c.gain = 1.0;
         }
-        for g in self.groups.iter_mut() {
-            g.gain = 1.0;
-            g.hard = false;
-        }
-        self.curve.iter_mut().for_each(|g| *g = 1.0);
-        self.pos = 0;
+        self.active = 0;
         self.frame = 0;
-        self.last_frame = 0;
     }
 
-    fn segment(&mut self, io: &mut Io<'_, '_>, off: usize, len: usize) {
-        let phase = self.pos;
-        for (c, ch) in self.ch.iter_mut().enumerate() {
-            let inp = &io.input[c][off..off + len];
-            let out = &mut io.output[c][off..off + len];
-            let curve = &self.curve[ch.group * self.block + phase..][..len];
-            let mut acc = ch.acc_in;
-            acc.add_sq(inp, phase);
-            if !acc.is_finite() {
-                acc = ch.acc_in;
-                for (k, &v) in inp.iter().enumerate() {
-                    acc.add_sq(&[if v.is_finite() { v } else { 0.0 }], phase + k);
-                }
-            }
-            ch.acc_in = acc;
-            dsp::mul_to(inp, curve, out);
-            if dsp::peak_abs(out) == f32::INFINITY {
-                for ((o, &x), &g) in out.iter_mut().zip(inp).zip(curve) {
-                    *o = if x.is_finite() { x * g.min(FAILSAFE_GAIN) } else { 0.0 };
-                }
-            }
-            // P covers the protected drive x[n]
-            ch.acc.add_sq(out, phase);
+    /// The output dezipper at the current active frame (module docs).
+    #[inline]
+    fn dezipper(&self) -> f64 {
+        if self.active < self.mute {
+            0.0
+        } else if self.active >= self.settle {
+            NOMINAL_TRIM as f64
+        } else {
+            NOMINAL_TRIM as f64 * (self.active - self.mute) as f64 / (self.settle - self.mute) as f64
         }
-        self.frame += len as u64;
     }
 
-    fn end_block(&mut self) {
-        let blk = self.pos as f64;
-        if self.dynamic {
-            let dt = blk / self.rate;
-            for c in self.ch.iter_mut() {
-                c.a_vc = dt / (c.tau_vc + dt);
-                c.a_mg = dt / (c.tau_mg + dt);
+    fn process(&mut self, io: &mut Io<'_, '_>) {
+        let n = self.n;
+        for k in 0..io.frames {
+            // 1. requests from the state before this sample
+            let mut req = [1.0f64; MAX_CHANNELS];
+            for (c, ch) in self.ch.iter_mut().enumerate() {
+                let t_vc = ch.ambient + ch.theta_mg + ch.theta_vc;
+                // `>` enters, `<=` recovers; a NaN state stays restrictive
+                ch.limiting = t_vc > ch.limit || t_vc.is_nan();
+                ch.panic = t_vc > ch.hard_limit || t_vc.is_nan();
+                let mut r = 1.0;
+                if ch.limiting {
+                    let allow = ((ch.limit - ch.ambient - ch.theta_mg) / ch.rth_vc).max(0.0);
+                    r = libm::sqrt(allow / ch.p_drive.max(EPS)).min(1.0);
+                    if !r.is_finite() {
+                        r = PANIC_GAIN;
+                    }
+                }
+                if ch.panic {
+                    r = r.min(PANIC_GAIN);
+                }
+                ch.request = r;
+                req[c] = r;
             }
-        }
-        let mut tgt = [1.0f64; MAX_CHANNELS];
-        let mut hard = [false; MAX_CHANNELS];
-        for c in self.ch.iter_mut() {
-            let p = c.elec * c.acc.total() / blk;
-            c.acc.clear();
-            c.p_model = p;
-            let old = c.theta_mg;
-            c.theta_vc += c.a_vc * (old + p * c.rth_vc - c.theta_vc);
-            c.theta_mg += c.a_mg * (p * c.rth_mg - c.theta_mg);
-            // the ceiling is against the unprotected drive
-            let p_drive = c.elec * c.acc_in.total() / blk;
-            c.acc_in.clear();
-            let allow = (c.span - c.theta_mg) / c.rth_vc;
-            c.g_target = libm::sqrt(allow.max(0.0) / p_drive.max(EPS)).min(1.0);
-            c.hard = c.ambient + c.theta_vc > c.hard_limit;
-            tgt[c.group] = tgt[c.group].min(c.g_target);
-            hard[c.group] |= c.hard;
-        }
-        for (gi, g) in self.groups.iter_mut().enumerate() {
-            let t = tgt[gi] as f32;
-            let r = if t < g.gain { g.r_attack } else { g.r_release };
-            let curve = &mut self.curve[gi * self.block..][..self.block];
-            // (in host-block mode the next call reads this curve from its
-            // first frame, so the full capacity is filled)
-            let mut v = g.gain;
-            for c in curve.iter_mut() {
-                v = t + r * (v - t);
-                *c = v;
+            for s in 0..3 {
+                if self.link_slot[s] {
+                    let m = self.ch.iter().filter(|c| c.slot == s).fold(1.0f64, |m, c| m.min(c.request));
+                    for (c, ch) in self.ch.iter().enumerate() {
+                        if ch.slot == s {
+                            req[c] = m;
+                        }
+                    }
+                }
             }
-            g.gain = v;
-            g.hard = hard[gi];
-            if g.hard {
-                curve.iter_mut().for_each(|c| *c *= FAILSAFE_GAIN);
+            if self.link_all {
+                let m = req[..n].iter().fold(1.0f64, |m, &r| m.min(r));
+                req[..n].iter_mut().for_each(|r| *r = m);
             }
+            // 2. smooth, apply, integrate
+            let d = self.dezipper();
+            for (c, ch) in self.ch.iter_mut().enumerate() {
+                let a = if req[c] < ch.gain { ch.a_attack } else { ch.a_release };
+                ch.gain += a * (req[c] - ch.gain);
+                let x = io.input[c][k];
+                let (x, y) = if x.is_finite() { (x as f64, (x as f64 * ch.gain * d) as f32) } else { (0.0, 0.0) };
+                io.output[c][k] = y;
+                ch.p_drive += ch.a_attack * (ch.elec * x * x - ch.p_drive);
+                let u = ch.gain * x;
+                let p = ch.elec * u * u;
+                ch.p_model = p;
+                // series network: the coil rise over the magnet plus the
+                // magnet rise over ambient (module docs, TODO(SPEC))
+                ch.theta_vc += ch.a_vc * (p * ch.rth_vc - ch.theta_vc);
+                ch.theta_mg += ch.a_mg * (p * ch.rth_mg - ch.theta_mg);
+            }
+            self.active = self.active.saturating_add(1);
         }
-        self.last_frame = self.frame - self.pos as u64;
+        self.frame += io.frames as u64;
     }
 }
 
@@ -389,21 +432,14 @@ impl ProtectionUnit for Unit {
             crate::spp3::failsafe_io(&mut io);
             return Health(Health::FAILSAFE | Health::CHANNEL_MISMATCH);
         }
-        let mut off = 0;
-        while off < frames {
-            let len = (run.block - run.pos).min(frames - off);
-            run.segment(&mut io, off, len);
-            off += len;
-            run.pos += len;
-            if run.pos == run.block {
-                run.end_block();
-                run.pos = 0;
+        if self.bypass {
+            for c in 0..run.n {
+                io.output[c][..frames].copy_from_slice(&io.input[c][..frames]);
             }
+            run.frame += frames as u64;
+            return Health::OK;
         }
-        if run.dynamic && run.pos > 0 {
-            run.end_block();
-            run.pos = 0;
-        }
+        run.process(&mut io);
         Health::OK
     }
     fn telemetry(&self, out: &mut Telemetry) {
@@ -415,16 +451,15 @@ impl ProtectionUnit for Unit {
             }
             return;
         };
-        out.frame = run.last_frame;
+        out.frame = run.frame;
         for (i, c) in run.ch.iter().enumerate() {
-            let g = &run.groups[c.group];
             let mut s = ChannelState::ABSENT;
             s.modeled_power_w = c.p_model as f32;
-            s.coil_temp_c = (c.ambient + c.theta_vc) as f32;
+            s.coil_temp_c = (c.ambient + c.theta_mg + c.theta_vc) as f32;
             s.magnet_temp_c = (c.ambient + c.theta_mg) as f32;
             s.ol_temp_c = s.coil_temp_c;
-            s.axis_gain[4] = c.g_target as f32;
-            s.gain = if g.hard { g.gain * FAILSAFE_GAIN } else { g.gain };
+            s.axis_gain[4] = c.request as f32;
+            s.gain = if self.bypass { 1.0 } else { c.gain as f32 };
             out.channels[i] = s;
         }
     }
@@ -432,5 +467,13 @@ impl ProtectionUnit for Unit {
         if let Some(r) = self.run.as_mut() {
             r.reset();
         }
+    }
+    fn set_parameter(&mut self, id: u32, value: f32) -> bool {
+        if id == ids::BYPASS {
+            self.bypass = value != 0.0;
+            self.params.bypass = self.bypass as u32;
+            return true;
+        }
+        false
     }
 }
