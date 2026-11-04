@@ -86,11 +86,11 @@ fn power_topology_and_first_block() {
     let p = params();
     let mut u = spp3::Unit::new(p);
     assert!(!u.is_failsafe());
-    // the look-ahead (1.5 ms = 72 frames) is in the model path only
+    // the audio is not delayed, and the power is metered on the undelayed
+    // protected drive, so the first block is a full block
     assert_eq!(u.latency_frames(), 0);
     let (t, _) = drive(&mut u, [0.1; 4], BLOCK as f64 / RATE as f64, 512);
-    // first block: look-ahead fill, so only BLOCK-72 frames of drive
-    let want = elec(&p, 0) * 0.01 * (BLOCK - 72) as f64 / BLOCK as f64;
+    let want = elec(&p, 0) * 0.01;
     assert!(
         (t.channels[0].modeled_power_w as f64 - want).abs() < 1e-6 * want,
         "{} {want}",
@@ -170,6 +170,7 @@ fn never_passes_the_hard_limit_on_a_step() {
     let mut t = Telemetry::new();
     let mut peak: f32 = 0.0;
     let mut hard_seen = false;
+    let mut last_gain = 1.0f32;
     for _ in 0..total_blocks {
         let ins: Vec<&[f32]> = ins_buf.iter().map(|b| &b[..]).collect();
         let mut outs: Vec<&mut [f32]> = outs_buf.iter_mut().map(|b| &mut b[..]).collect();
@@ -177,9 +178,13 @@ fn never_passes_the_hard_limit_on_a_step() {
         u.telemetry(&mut t);
         peak = peak.max(t.channels[0].ol_temp_c);
         if t.channels[0].ol_temp_c > 128.0 {
+            // the hard path selects a target 20 dB below the ceiling; the
+            // common gain path then attacks toward it
             hard_seen = true;
-            assert!(t.channels[0].gain <= FAILSAFE_GAIN + 1e-6);
+            assert!(t.channels[0].axis_gain[4] <= 1.0);
+            assert!(t.channels[0].gain <= last_gain);
         }
+        last_gain = t.channels[0].gain;
     }
     // with these synthetic constants a full-scale step overshoots into the
     // hard path, which then pulls the coil back

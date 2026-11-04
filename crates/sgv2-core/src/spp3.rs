@@ -7,23 +7,24 @@
 //!   may call `process` with any frame count: the unit splits each call at
 //!   its block boundaries, so its state trajectory does not depend on the
 //!   host quantum and no reblocking latency is added.
-//! - **Step 2.** The current protected gain is applied to the audio. The
-//!   look-ahead (`Thermal_LookaheadDelay_ms`, rounded to frames) is in the
-//!   gain/model path, not the audio path: the unit adds no audio delay and
-//!   reports latency 0 (black-box reference: output equals input bit-exactly
-//!   at 0 dB). The model meters the protected drive through the look-ahead
-//!   line, so the first block's power covers `block - look` frames.
-//! - **Step 3.** Modelled dissipated power of the protected drive:
-//!   `p = (ag*x)^2 * Reb_ref / (Reb_ref + Rshunt)^2`, the mean over the block.
+//! - **Step 2.** The current protected gain is applied to the audio, which
+//!   is not delayed (the unit reports latency 0; black-box reference: the
+//!   output tracks the input with no delay).
+//! - **Step 3.** Modelled dissipated power of the undelayed protected drive
+//!   (spec 16): `p = (ag*x)^2 * Reb_ref / (Reb_ref + Rshunt)^2`, the mean
+//!   over the block.
 //! - **Step 4.** Coupled two-node thermal model, backward Euler over the
 //!   block (`dt = block_frames / rate`), the coil target using the magnet
 //!   state from before this update.
 //! - **Step 6.** Power ceiling:
 //!   `g = min(1, sqrt(max(0, (TemperatureLimit - ambient - theta_mg) / T_sett_vc) / max(P_drive, eps)))`.
 //! - **Step 7.** Minimum within each `SpeakerGroup`.
-//! - **Step 8.** Attack/release smoothing of the group gain.
+//! - **Step 8.** The group gain is a per-sample first-order one-pole in
+//!   linear gain toward the block's target (spec 16), attack or release by
+//!   the sign of the step, evaluated in closed form per block frame so it
+//!   stays split-invariant.
 //! - **Hard path.** While `T_OL > TemperatureLimit + HardTempLimitHeadroom`
-//!   the channel takes the unit's 20 dB panic attenuation.
+//!   (decided per block) the group takes the unit's 20 dB at once.
 //! - **Fail-safe.** A channel-count mismatch, or a non-finite meter value
 //!   (the "simple-meter processing failure"), gives 20 dB for the affected
 //!   frames.
@@ -36,15 +37,13 @@
 //!   fills.
 //!
 //! TODO(SPEC), each isolated so the rig can pin it, none adding margin:
-//! - the attack/release law. Implemented as a one-pole on the linear gain
-//!   at the block rate, `k = 1 - exp(-dt/tau)` (`smooth_coeff`);
-//! - which samples `P_drive` covers. Implemented as the block's undelayed
-//!   input (the look-ahead content), with the same electrical topology as
-//!   the modelled power;
-//! - the value of `eps`. Implemented as the smallest normal f32, so no
-//!   drive gives the unity cap;
-//! - the gain is held constant across a block ("the current protected
-//!   gain" per call) and the panic factor is evaluated per block;
+//! - the pole formula (`pole`: `exp(-1/(tau*rate))`);
+//! - which samples `P_drive` covers (the block's undelayed input) and `eps`
+//!   (the smallest normal f32);
+//! - whether the hard path's 20 dB rides the thermal attack (it does not
+//!   here: a smoothed panic lets the coil run far past the hard limit);
+//! - the role of `Thermal_LookaheadDelay_ms` now that the audio is not
+//!   delayed (kept as a parameter, `lookahead_frames`);
 //! - how a nonzero `ThermalFFSpeedupFactor` shapes the predictive target,
 //!   and the `Thermal_SafeTlim*` state machine (spec section 15: open). A
 //!   nonzero factor runs the ceiling above unchanged. A factor of zero is
@@ -71,7 +70,6 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::blob::{BlobError, Pod};
-use crate::delay::Delay;
 use crate::dsp;
 use crate::sense::{BlockSums, DelayEstimator};
 use crate::{ChannelState, Health, Io, ProtectionUnit, Telemetry, UnitKind, FAILSAFE_GAIN, MAX_CHANNELS};
@@ -80,8 +78,6 @@ use crate::{ChannelState, Health, Io, ProtectionUnit, Telemetry, UnitKind, FAILS
 const T_CL_UNMEASURED: f32 = 20.0;
 /// Denominator floor of the ceiling target (TODO(SPEC): see module docs).
 const EPS: f64 = f32::MIN_POSITIVE as f64;
-/// Meter-path scratch, frames (any size works; the meter is split-invariant).
-const SCRATCH: usize = 256;
 
 /// Per physical channel, in the unit's channel order. Field names follow
 /// the sidecar's keys.
@@ -333,15 +329,25 @@ impl Params {
 }
 
 /// One-pole smoothing coefficient for time constant `tau` at step `dt`
-/// (TODO(SPEC): the attack/release law).
-pub fn smooth_coeff(dt: f64, tau: f64) -> f64 {
-    1.0 - libm::exp(-dt / tau)
+/// Per-sample one-pole pole for time constant `tau` at `rate` (spec 16:
+/// a first-order one-pole in linear gain, coefficients from the named
+/// seconds and the sample rate). TODO(SPEC): the exact coefficient formula;
+/// this is the exponential form.
+pub fn pole(rate: f64, tau: f64) -> f64 {
+    libm::exp(-1.0 / (tau * rate))
+}
+
+fn powers(r: f64, n: usize) -> Vec<f32> {
+    let mut v = Vec::with_capacity(n);
+    let mut p = 1.0f64;
+    for _ in 0..n {
+        p *= r;
+        v.push(p as f32);
+    }
+    v
 }
 
 struct Chan {
-    /// Look-ahead line of the meter path.
-    delay: Delay,
-    scratch: alloc::boxed::Box<[f32]>,
     init_vc: f64,
     init_mg: f64,
     src: usize,
@@ -398,11 +404,16 @@ struct Run {
     block: usize,
     look: usize,
     ambient: f64,
-    k_attack: f64,
-    k_release: f64,
+    /// `pole^(n+1)` for block frame n, attack and release.
+    pow_attack: Vec<f32>,
+    pow_release: Vec<f32>,
     ch: Vec<Chan>,
     groups: usize,
-    group_gain: [f64; MAX_CHANNELS],
+    /// Smoothed gain per group at the start of the current block.
+    group_gain: [f32; MAX_CHANNELS],
+    /// The gain of every frame of the current block, per group.
+    curve: Vec<f32>,
+    hard_group: [bool; MAX_CHANNELS],
     /// Frames into the current block.
     pos: usize,
     /// Frames processed since reset.
@@ -488,8 +499,6 @@ impl Run {
             };
             let (reb, rs, ag) = (c.reb_ref as f64, c.rshunt as f64, c.ag as f64);
             ch.push(Chan {
-                delay: Delay::new(look),
-                scratch: vec![0.0; SCRATCH].into_boxed_slice(),
                 src: c.source as usize,
                 group: gi,
                 elec: ag * ag * reb / ((reb + rs) * (reb + rs)),
@@ -526,11 +535,13 @@ impl Run {
             block,
             look,
             ambient,
-            k_attack: smooth_coeff(dt, p.thermal_gain_attack_time_s as f64),
-            k_release: smooth_coeff(dt, p.thermal_gain_release_time_s as f64),
+            pow_attack: powers(pole(rate, p.thermal_gain_attack_time_s as f64), block),
+            pow_release: powers(pole(rate, p.thermal_gain_release_time_s as f64), block),
             ch,
             groups,
             group_gain: [1.0; MAX_CHANNELS],
+            curve: vec![1.0; groups * block],
+            hard_group: [false; MAX_CHANNELS],
             pos: 0,
             frame: 0,
             last_block_frame: 0,
@@ -542,7 +553,6 @@ impl Run {
 
     fn reset(&mut self) {
         for c in self.ch.iter_mut() {
-            c.delay.clear();
             c.clear_acc();
             c.theta_vc = c.init_vc;
             c.theta_mg = c.init_mg;
@@ -554,6 +564,8 @@ impl Run {
             c.vi_power = f64::NAN;
         }
         self.group_gain = [1.0; MAX_CHANNELS];
+        self.curve.iter_mut().for_each(|g| *g = 1.0);
+        self.hard_group = [false; MAX_CHANNELS];
         self.pos = 0;
         self.frame = 0;
         self.last_block_frame = 0;
@@ -580,28 +592,20 @@ impl Run {
                 }
             }
             c.acc_in = acc;
-            let g = c.applied;
-            dsp::scale_to(inp, g, out);
+            // step 2: the sample-smoothed group gain on the audio
+            let curve = &self.curve[c.group * self.block + phase..][..len];
+            dsp::mul_to(inp, curve, out);
             if dsp::peak_abs(out) == f32::INFINITY {
                 // Meter failure on these frames: at most 20 dB below the
                 // input, and the model sees the drive that actually leaves
                 // (non-finite samples muted).
-                dsp::sanitize(out);
-                if g > FAILSAFE_GAIN {
-                    dsp::scale_in_place(out, FAILSAFE_GAIN / g);
+                for ((o, &x), &g) in out.iter_mut().zip(inp).zip(curve) {
+                    *o = if x.is_finite() { x * g.min(FAILSAFE_GAIN) } else { 0.0 };
                 }
                 *health |= Health::FAILSAFE;
             }
-            // The protected drive, metered through the look-ahead line in
-            // chunks of the scratch buffer.
-            let mut k = 0;
-            while k < len {
-                let m = (len - k).min(c.scratch.len());
-                // SAFETY: `out[k..k+m]` and `scratch[..m]` are distinct and hold `m` samples.
-                unsafe { c.delay.run(out.as_ptr().add(k), c.scratch.as_mut_ptr(), m) };
-                c.acc_out.add_sq(&c.scratch[..m], phase + k);
-                k += m;
-            }
+            // step 3 input: the undelayed protected drive, as it leaves
+            c.acc_out.add_sq(out, phase);
         }
         // Sense statistics over the same frames.
         let sense = io.sense;
@@ -659,15 +663,34 @@ impl Run {
             c.g_target = if c.ff_active { libm::sqrt(ceiling.max(0.0) / p_drive.max(EPS)).min(1.0) } else { 1.0 };
             c.hard = self.ambient + c.theta_vc > c.hard_limit;
         }
-        // step 7
+        // step 7: the group minimum
         let mut tgt = [1.0f64; MAX_CHANNELS];
+        let mut hard = [false; MAX_CHANNELS];
         for c in &self.ch {
             tgt[c.group] = tgt[c.group].min(c.g_target);
+            hard[c.group] |= c.hard;
         }
-        // step 8
-        for (g, &t) in self.group_gain[..self.groups].iter_mut().zip(&tgt[..self.groups]) {
-            let k = if t < *g { self.k_attack } else { self.k_release };
-            *g += k * (t - *g);
+        // step 8: per-sample one-pole toward the target over the next block,
+        // in closed form g[n] = t + (g0 - t) * pole^(n+1)
+        for gi in 0..self.groups {
+            let g0 = self.group_gain[gi];
+            let t = tgt[gi] as f32;
+            let pw = if t < g0 { &self.pow_attack } else { &self.pow_release };
+            let curve = &mut self.curve[gi * self.block..][..self.block];
+            for (g, &r) in curve.iter_mut().zip(pw.iter()) {
+                *g = t + (g0 - t) * r;
+            }
+            self.group_gain[gi] = curve[self.block - 1];
+            // The hard path: decided at the controller cadence and applied
+            // at once as the unit's 20 dB on the applied gain, not through
+            // the 4.6 s attack (a smoothed panic lets the coil run far past
+            // the hard limit). TODO(SPEC): spec 16 says the panic gain is
+            // "sample-smoothed/applied by the common gain path"; confirm it
+            // is not meant to ride the thermal attack.
+            if hard[gi] {
+                curve.iter_mut().for_each(|g| *g *= FAILSAFE_GAIN);
+            }
+            self.hard_group[gi] = hard[gi];
         }
         let mut complete = self.sums.complete && self.sums.frames == self.block;
         for c in self.ch.iter() {
@@ -677,7 +700,7 @@ impl Run {
         }
         for c in self.ch.iter_mut() {
             let g = self.group_gain[c.group];
-            c.applied = (if c.hard { g * FAILSAFE_GAIN as f64 } else { g }) as f32;
+            c.applied = if self.hard_group[c.group] { g * FAILSAFE_GAIN } else { g };
             // Measured in-phase V/I power, reported only (the closed loop
             // is off). TODO(SPEC): whether the meter is mean(i^2)*Rdc or
             // the in-phase product.

@@ -155,6 +155,33 @@ pub fn scale_to(x: &[f32], g: f32, y: &mut [f32]) {
     }
 }
 
+/// `y[n] = a[n] * b[n]`.
+#[inline]
+pub fn mul_to(a: &[f32], b: &[f32], y: &mut [f32]) {
+    let n = a.len().min(b.len()).min(y.len());
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: every access is below `n`, the shortest of the three slices.
+    unsafe {
+        let (pa, pb, py) = (a.as_ptr(), b.as_ptr(), y.as_mut_ptr());
+        let mut i = 0;
+        while i + 16 <= n {
+            vst1q_f32(py.add(i), vmulq_f32(vld1q_f32(pa.add(i)), vld1q_f32(pb.add(i))));
+            vst1q_f32(py.add(i + 4), vmulq_f32(vld1q_f32(pa.add(i + 4)), vld1q_f32(pb.add(i + 4))));
+            vst1q_f32(py.add(i + 8), vmulq_f32(vld1q_f32(pa.add(i + 8)), vld1q_f32(pb.add(i + 8))));
+            vst1q_f32(py.add(i + 12), vmulq_f32(vld1q_f32(pa.add(i + 12)), vld1q_f32(pb.add(i + 12))));
+            i += 16;
+        }
+        while i < n {
+            *py.add(i) = *pa.add(i) * *pb.add(i);
+            i += 1;
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    for ((o, &x), &g) in y[..n].iter_mut().zip(&a[..n]).zip(&b[..n]) {
+        *o = x * g;
+    }
+}
+
 /// In-place `x[n] *= g`.
 #[inline]
 pub fn scale_in_place(x: &mut [f32], g: f32) {
