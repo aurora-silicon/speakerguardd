@@ -1039,20 +1039,8 @@ impl ProtectionUnit for Unit {
     }
 }
 
-/// 20 dB on whatever geometry the host gave, never indexing past a buffer.
+/// 20 dB on whatever geometry the host gave, never indexing past a buffer,
+/// finite and bounded for any input (see [`crate::failsafe::fill_from`]).
 pub(crate) fn failsafe_io(io: &mut Io<'_, '_>) {
-    let frames = io.frames;
-    for (c, out) in io.output.iter_mut().enumerate() {
-        let n = frames.min(out.len());
-        let out = &mut out[..n];
-        match io.input.get(c) {
-            Some(inp) => {
-                let m = n.min(inp.len());
-                dsp::scale_to(&inp[..m], FAILSAFE_GAIN, &mut out[..m]);
-                dsp::sanitize(&mut out[..m]);
-                out[m..].fill(0.0);
-            }
-            None => out.fill(0.0),
-        }
-    }
+    crate::failsafe::fill_from(io, 0, FAILSAFE_GAIN);
 }

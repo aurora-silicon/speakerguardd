@@ -362,6 +362,31 @@ pub fn sanitize(x: &mut [f32]) -> usize {
     bad
 }
 
+/// One sample held to digital full scale: `clamp(x, -1, 1)`, a non-finite
+/// sample 0. No converter can deliver more than full scale, so this is the
+/// drive a sample can actually produce; every model meter and every output
+/// sample goes through it, which also bounds every square sum (16 lanes of
+/// at most 1024 unit squares per update never approach `f32::MAX`).
+#[inline]
+pub fn bound1(x: f32) -> f32 {
+    if x.abs() < f32::INFINITY {
+        x.clamp(-1.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+/// [`bound1`] in place; returns how many samples were non-finite.
+#[inline]
+pub fn bound(x: &mut [f32]) -> usize {
+    let mut bad = 0;
+    for v in x.iter_mut() {
+        bad += !v.is_finite() as usize;
+        *v = bound1(*v);
+    }
+    bad
+}
+
 /// Deinterleave `frames` frames of `ch`-channel S16 into per-channel f32
 /// (`out[c][n]`), scaled to [-1, 1). Used by the direct-ALSA sense reader
 /// and by the bench; the LV2 path receives planar f32 from PipeWire.
