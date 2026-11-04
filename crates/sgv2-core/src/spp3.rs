@@ -606,19 +606,26 @@ pub fn settle99(seconds: f64, rate: f64) -> f64 {
 /// Trapezoidal-input, linear-decay thermal filter (spec 5).
 #[derive(Clone, Copy, Default)]
 struct Thermal {
-    a: f64,
-    b: f64,
+    a: f32,
+    b: f32,
     tau: f64,
+    /// Float32-valued (kept in an f64 for the controller arithmetic).
     theta: f64,
 }
 
 impl Thermal {
-    fn new(r_th: f64, tau: f64, dt: f64) -> Self {
-        Thermal { a: 1.0 - dt / tau, b: 0.5 * r_th * dt / tau, tau, theta: 0.0 }
+    /// The reference's Float32 coefficients (rig: the controller record's
+    /// nodes are bit-exact on 89-99.99 % of updates with these, against
+    /// 0.1 % for a double-precision recurrence): `a = 1 - dt/tau`,
+    /// `b = 0.5 * R * dt / tau`, left to right, `dt = frames / fs`.
+    fn new(r_th: f32, tau: f32, dt: f32) -> Self {
+        Thermal { a: 1.0 - dt / tau, b: 0.5 * r_th * dt / tau, tau: tau as f64, theta: 0.0 }
     }
+    /// `theta = fmaf(a, theta, b * (P + P_prev))` in Float32.
     #[inline]
     fn step(&mut self, p: f64, p_prev: f64) {
-        self.theta = self.a * self.theta + self.b * (p + p_prev);
+        let sum = p as f32 + p_prev as f32;
+        self.theta = libm::fmaf(self.a, self.theta as f32, self.b * sum) as f64;
     }
 }
 
@@ -1119,9 +1126,10 @@ struct Chan {
 impl Chan {
     /// Kernel construction state of the thermal model and controller.
     fn seed(&mut self) {
-        self.vc.theta = self.seed.0;
-        self.mg.theta = self.seed.1;
-        self.ff.theta = self.seed.2;
+        // the nodes are Float32 state
+        self.vc.theta = self.seed.0 as f32 as f64;
+        self.mg.theta = self.seed.1 as f32 as f64;
+        self.ff.theta = self.seed.2 as f32 as f64;
         self.p_prev = 0.0;
         self.p_ff_prev = 0.0;
         self.meter_failed = false;
@@ -1366,7 +1374,6 @@ impl Run {
         let n = p.channels as usize;
         let rate = p.sample_rate as f64;
         let upd = thermal_frames(p.sample_rate);
-        let dt = upd as f64 / rate;
         let r = rate / upd as f64;
         let look = libm::round(p.thermal_lookahead_delay_ms as f64 * 1e-3 * rate) as usize;
         let ambient = p.thermal_ambient_temp as f64;
@@ -1399,8 +1406,9 @@ impl Run {
             let (reb, series, ag) = (c.reb_ref as f64, c.rshunt as f64 + c.rampout as f64, c.ag as f64);
             let ff_factor = c.thermal_ff_speedup_factor as f64;
             let ff_on = ff_factor > 0.0;
-            let ff_tau = if ff_on { ff_factor * c.tau_tvc as f64 } else { c.tau_tvc as f64 };
-            let ff = Thermal::new(c.t_sett_vc as f64, ff_tau, dt);
+            let ff_tau = if ff_on { c.thermal_ff_speedup_factor * c.tau_tvc } else { c.tau_tvc };
+            let dt32 = upd as f32 / p.sample_rate as f32;
+            let ff = Thermal::new(c.t_sett_vc, ff_tau, dt32);
             let (tvc, tmg) = (c.t_sett_vc as f64, c.t_sett_mg as f64);
             // hot fallback: the steady-state split at the ordinary limit
             let seed = if cold {
@@ -1424,8 +1432,8 @@ impl Run {
                 headroom2: (headroom as f64) * (headroom as f64),
                 safe: SafeTlim::new(c.temperature_limit, p.thermal_safe_tlim, p.thermal_safe_tlim_offset, safe_init),
                 headroom_c: c.hard_temp_limit_headroom as f64,
-                vc: Thermal::new(tvc, c.tau_tvc as f64, dt),
-                mg: Thermal::new(tmg, c.tau_tmg as f64, dt),
+                vc: Thermal::new(c.t_sett_vc, c.tau_tvc, dt32),
+                mg: Thermal::new(c.t_sett_mg, c.tau_tmg, dt32),
                 ff,
                 ff_on,
                 seed,
