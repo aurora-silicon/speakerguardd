@@ -523,7 +523,7 @@ fn cl_params(rc: f32, tc: f32) -> Params {
 }
 
 #[test]
-fn closed_loop_reads_coil_temperature_from_the_pilot_bin_and_never_relaxes() {
+fn closed_loop_reads_coil_temperature_from_the_pilot_bin_and_relaxes_the_limit() {
     let (rc, tc) = (4.0f32, 25.0f32);
     let p = cl_params(rc, tc);
     let mut u = spp3::Unit::new(p);
@@ -536,16 +536,19 @@ fn closed_loop_reads_coil_temperature_from_the_pilot_bin_and_never_relaxes() {
     let tele = pilot_sense(r, n);
     let t = run_cl(&mut u, 0.3, &tele, 0, n);
     assert!(t.channels[0].closed_loop);
-    assert!((t.channels[0].cl_temp_c - 60.0).abs() < 0.05, "T_CL {}", t.channels[0].cl_temp_c);
+    // the reference's Float32 Goertzel (fused, rig law (a)) cancels heavily
+    // and reads R a few 1e-3 low on this signal
+    assert!((t.channels[0].cl_temp_c - 60.0).abs() < 1.5, "T_CL {}", t.channels[0].cl_temp_c);
     assert_eq!(u.controller_state(0)[9], 1.0, "window accepted");
-    // the model runs hotter than the sensed 60 C, but the correction is
-    // capped at the base until the CL goldens match (t-4668)
-    assert_eq!(t.channels[0].tlim_adj_c, 0.0);
-    assert_eq!(u.effective_limit(0), 120.0);
+    // the model runs hotter than the sensed 60 C, so the limit relaxes
+    // (capped), never below the base
+    let adj = t.channels[0].tlim_adj_c;
+    assert!(adj > 0.0 && adj <= 30.0 + 1e-3, "TlimAdj {adj}");
+    assert!(u.effective_limit(0) > 120.0);
 }
 
 #[test]
-fn closed_loop_range_is_on_the_window_and_rejection_holds_the_published_temperature() {
+fn closed_loop_range_is_on_the_smoothed_resistance_and_rejection_holds_the_published_temperature() {
     let p = cl_params(4.0, 25.0);
     let mut u = spp3::Unit::new(p);
     let alpha = 0.004 + (25.0 - 20.0) * (0.0038 - 0.004) / 15.0;
@@ -553,17 +556,17 @@ fn closed_loop_range_is_on_the_window_and_rejection_holds_the_published_temperat
     let tele = pilot_sense(4.0 * (1.0 + alpha * 35.0), n);
     run_cl(&mut u, 0.3, &tele, 0, n);
     assert_eq!(u.controller_state(0)[9], 1.0);
-    // an implausible window (R above RebRange) is rejected at once; the
-    // published temperature follows the smoothed (rejected) window
+    // implausible windows (R above RebRange) drive the smoothed R out of
+    // range and are rejected; the published temperature still follows it
     let bad = pilot_sense(20.0, n);
     let t = run_cl(&mut u, 0.3, &bad, 0, 48_000 * 2);
     assert!(t.channels[0].closed_loop);
     assert_eq!(u.controller_state(0)[9], 0.0);
     assert!(t.channels[0].cl_temp_c > 100.0);
-    assert_eq!(u.effective_limit(0), 120.0);
-    // recovery is accepted on the instantaneous window although the
-    // smoothed resistance is still out of range
-    run_cl(&mut u, 0.3, &tele, 0, 48_000);
+    // the raw limit returns to the base; the smoothed limit decays toward it
+    assert!(u.effective_limit(0) >= 120.0);
+    // recovery is accepted once the smoothed resistance is back in range
+    run_cl(&mut u, 0.3, &tele, 0, 48_000 * 3);
     assert_eq!(u.controller_state(0)[9], 1.0);
 }
 
@@ -730,4 +733,57 @@ fn closed_loop_needs_a_calibration_inside_its_ranges() {
     let mut u = spp3::Unit::new(p);
     let (t, _) = drive(&mut u, [0.1; 4], 0.5, 512);
     assert!(!t.channels[0].closed_loop);
+}
+
+/// Rig finding 15 (b)-like: fast thermal poles, a fast release and a hard
+/// limit close above the limit. After the cold-start onset the reference
+/// settles at or below the limit with no re-arm; the 1 s release hold
+/// (rig law 5, `>=` on the floor tie) is what prevents a limit cycle.
+#[test]
+fn fast_poles_settle_without_a_limit_cycle() {
+    let mut p = params();
+    p.thermal_ambient_temp = 50.0;
+    p.thermal_gain_attack_time_s = 2.0;
+    p.thermal_gain_release_time_s = 5.0;
+    for c in 0..4 {
+        let ch = &mut p.ch[c];
+        ch.tau_tvc = 0.5;
+        ch.tau_tmg = 5.0;
+        ch.t_sett_vc = 26.06;
+        ch.t_sett_mg = 25.55;
+        ch.temperature_limit = 90.0;
+        ch.hard_temp_limit_headroom = 11.9;
+        ch.thermal_ff_speedup_factor = 0.25;
+        ch.reb_ref = 2.7;
+        ch.rshunt = 0.09;
+        ch.ag = 11.89;
+    }
+    let mut u = spp3::Unit::new(p);
+    assert!(!u.is_failsafe());
+    let n = 512;
+    let w = 2.0 * std::f64::consts::PI * 1012.14 / RATE as f64;
+    let mut ob = vec![vec![0.0f32; n]; 4];
+    let mut peak_late = 0.0f32;
+    let mut peak_settle = 0.0f32;
+    let mut k = 0usize;
+    for blk in 0..(30 * RATE as usize / n) {
+        let x: Vec<f32> = (0..n).map(|j| (0.999 * ((k + j) as f64 * w).sin()) as f32).collect();
+        k += n;
+        let ins: Vec<&[f32]> = (0..4).map(|_| &x[..]).collect();
+        let mut outs: Vec<&mut [f32]> = ob.iter_mut().map(|b| &mut b[..]).collect();
+        u.process(Io { frames: n, input: &ins, sense: &[], output: &mut outs });
+        let mut t = Telemetry::new();
+        u.telemetry(&mut t);
+        let tol = t.channels[0].ol_temp_c;
+        if blk * n > 3 * RATE as usize / 2 {
+            peak_settle = peak_settle.max(tol);
+        }
+        if blk * n > 10 * RATE as usize {
+            peak_late = peak_late.max(tol);
+        }
+    }
+    // after the onset it never cycles back toward the hard limit (101.9 C)
+    // and settles at or below the limit
+    assert!(peak_settle < 92.0, "peak after the onset {peak_settle}");
+    assert!(peak_late <= 90.2, "late peak {peak_late}");
 }

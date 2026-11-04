@@ -37,12 +37,10 @@
 //!   Goertzel period `N = next_pow2(round(TempSenseWindowTime fs))` on bin
 //!   `m = round(PilotFreq N / fs)`: band-power gates on scaled V and I, then
 //!   `R = sqrt(Pv / Pi)`, `R_s` e-folding from `R_cal`, `T_CL` from `R_s`
-//!   with `alpha` interpolated at `T_cal`; accepted when the instantaneous
+//!   with `alpha` interpolated at `T_cal`; accepted when the smoothed
 //!   `R` is in `RebRange`. `Tlim_eff` smooths `base + clamp(T_OL - T_CL, 0,
 //!   cap)` (or `base` when the last window was rejected) over
 //!   `TlimErrDecayTime` with the 99 % law.
-//!   TODO(SPEC) t-4668: the relaxation is capped at the base (`CL_RELAXATION`)
-//!   until the alpha inversion matches the goldens; CL never relaxes.
 //! - **Pilot.** With a calibration vector: on in an update iff
 //!   `f32(Pdrv) >= PilotEnableThres`; high above `PilotUpperThres`, low below
 //!   `PilotLowerThres` on `T_OL`, held between.
@@ -50,9 +48,9 @@
 //!   NORMAL). `host_reset` is `AudioUnitReset`: only the closed-loop
 //!   estimator returns to its calibration; thermal, gain, pilot and SafeTlim
 //!   state continue.
-//! - **Full scale.** The program is held to digital full scale (`clamp(x,
-//!   -1, 1)`) before the gain and before both model meters; in-range audio
-//!   is unchanged.
+//! - **Input clamp.** The program is held to +-1.5 FS (rig law (b)) before
+//!   the gain and before both model meters; in-range audio is unchanged.
+//!   The output samples are then held to +-1 FS after metering (policy).
 //! - **Fail-safe.** A channel-count mismatch, or non-finite drive (the
 //!   simple-meter failure), gives 20 dB for the affected frames. A model
 //!   state that goes non-finite latches the 20 dB fail-safe
@@ -498,6 +496,10 @@ const HARD_TARGET_BELOW: f64 = 5.0;
 /// Clamp of the candidate ratio before the square root (spec 6, 16): a
 /// 0.01 (-40 dB) linear-gain floor.
 const RATIO_MIN: f64 = 1e-4;
+/// The unit clamps its program input to +-1.5 FS before the gain and the
+/// drive meter (rig law (b): Pdrv of a 2 FS sine is that of the clamped
+/// sine; the output never exceeds 1.5 x the gain). The output stays bounded.
+const INPUT_CLAMP: f32 = 1.5;
 /// Release hold of the ordinary candidate, s (rig law 5: fixed).
 const HOLD_S: f64 = 1.0;
 /// Dezipper 99 % settling time, s (spec 6).
@@ -511,14 +513,11 @@ pub const THERMAL_STATE_COLD: u32 = 2;
 /// program, without the pilot headroom (rig law 1, against spec 4/16's
 /// text; to 2.6e-7 relative over 180 s, open and closed loop).
 const PDRV_WITH_HEADROOM: bool = false;
-/// TODO(SPEC) t-4668: the closed-loop correction may relax the limit only
-/// once the CL goldens match. Rig laws 3-5 (the Float32 invTempCo and the
-/// Rshunt-net T_CL, the pilot generator, the candidate hold) bring
-/// cl-thermal_ramp_1k from 21 C to 0.5 C worst T_OL error with relaxation
-/// on, but the CL goldens are not yet inside tolerance (the window
-/// resistance, ~0.2 C more relaxed than macOS), so the corrected limit stays
-/// capped at the base: never less protective than macOS.
-const CL_RELAXATION: bool = false;
+/// The closed-loop correction relaxes the limit (spec 7). It was capped at
+/// the base until the window resistance matched the goldens; with rig laws
+/// 3 and (a) T_CL is bit-exact (5e-7 C) on the CL edge set, and
+/// cl-thermal_ramp_1k tracks macOS to 0.08 C / 0.001 dB.
+const CL_RELAXATION: bool = true;
 /// `Pcoil` is the power of the unit's output samples, generated pilot
 /// included (rig law 2, against spec 4's text; to 3e-7 relative).
 const PCOIL_WITH_PILOT: bool = true;
@@ -613,20 +612,26 @@ impl SafeTlim {
 /// Single-bin Goertzel state of one signal (spec 7).
 #[derive(Clone, Copy, Default)]
 struct Goertzel {
-    s1: f64,
-    s2: f64,
+    s1: f32,
+    s2: f32,
 }
 
+/// Single-bin Goertzel in Float32, as the reference accumulates it (rig
+/// law (a): the Float32 recurrence over 16384 samples biases R by about
+/// 1e-3 relative, and the goldens carry that bias).
 impl Goertzel {
     #[inline]
-    fn push(&mut self, x: f64, a: f64) {
-        let s0 = x + a * self.s1 - self.s2;
+    fn push(&mut self, x: f32, a: f32) {
+        // fused a*s1 + x, then - s2 (rig law (a))
+        let s0 = libm::fmaf(a, self.s1, x) - self.s2;
         self.s2 = self.s1;
         self.s1 = s0;
     }
     /// `(s1^2 + s2^2 - a s1 s2) / N^2`, then cleared for the next period.
-    fn take(&mut self, a: f64, n: f64) -> f64 {
-        let p = (self.s1 * self.s1 + self.s2 * self.s2 - a * self.s1 * self.s2) / (n * n);
+    fn take(&mut self, a: f32, n: f32) -> f32 {
+        // fmaf(-(a*s1), s2, fmaf(s1, s1, s2*s2)) / N^2 (rig law (a))
+        let (s1, s2) = (self.s1, self.s2);
+        let p = libm::fmaf(-(a * s1), s2, libm::fmaf(s1, s1, s2 * s2)) / (n * n);
         *self = Goertzel::default();
         p
     }
@@ -637,16 +642,18 @@ impl Goertzel {
 struct Cl {
     /// Goertzel period `N` and its coefficient `2 cos(2 pi m / N)`.
     window: usize,
-    coef: f64,
+    coef: f32,
     n: usize,
     gv: Goertzel,
     gi: Goertzel,
-    v_scale2: f64,
-    i_scale2: f64,
-    v_floor: f64,
-    i_floor: f64,
-    k_r: f64,
-    r_s: f64,
+    /// V and I scales (applied to each sample) and the band-power floors.
+    v_scale: f32,
+    i_scale: f32,
+    v_floor: f32,
+    i_floor: f32,
+    /// Resistance smoother (e-folding per period) and its state.
+    k_r: f32,
+    r_s: f32,
     rdc_scale: f64,
     reb_min: f64,
     reb_max: f64,
@@ -663,10 +670,12 @@ struct Cl {
     /// Frames since the last accepted window.
     age: usize,
     /// Latest window resistance (telemetry).
-    r_window: f64,
+    r_window: f32,
     t_cl: f64,
-    /// Smoothed corrected limit, absolute C (`Tlim_eff`).
+    /// Smoothed corrected limit, absolute C (`Tlim_eff` while active).
     limit_s: f64,
+    /// A window has been accepted since construction or the last reset.
+    active: bool,
 }
 
 /// The Goertzel period `N = next_power_of_two(round(TempSenseWindowTime *
@@ -731,17 +740,17 @@ impl Cl {
         let limit = c.temperature_limit as f64;
         Some(Cl {
             window,
-            coef: 2.0 * libm::cos(2.0 * core::f64::consts::PI * m / window as f64),
+            coef: (2.0 * libm::cos(2.0 * core::f64::consts::PI * m / window as f64)) as f32,
             n: 0,
             gv: Goertzel::default(),
             gi: Goertzel::default(),
-            v_scale2: vs * vs,
-            i_scale2: is * is,
-            v_floor: c.v_pwr_thres as f64,
-            i_floor: c.i_pwr_thres as f64,
+            v_scale: vs as f32,
+            i_scale: is as f32,
+            v_floor: c.v_pwr_thres,
+            i_floor: c.i_pwr_thres,
             // an ordinary e-folding constant per Goertzel period
-            k_r: 1.0 - libm::exp(-(window as f64) / (rate * c.temp_sense_smoothing_tau_s as f64)),
-            r_s: rc,
+            k_r: (1.0 - libm::exp(-(window as f64) / (rate * c.temp_sense_smoothing_tau_s as f64))) as f32,
+            r_s: c.cal_r,
             rdc_scale: c.rdc_scale as f64,
             reb_min: c.reb_range_min as f64,
             reb_max: c.reb_range_max as f64,
@@ -753,9 +762,10 @@ impl Cl {
             k_lim: settle99(c.tlim_err_decay_time_s as f64, r),
             valid: false,
             age: 0,
-            r_window: rc,
+            r_window: c.cal_r,
             t_cl: tc,
             limit_s: limit,
+            active: false,
         })
     }
 
@@ -765,12 +775,27 @@ impl Cl {
         self.n = 0;
         self.gv = Goertzel::default();
         self.gi = Goertzel::default();
-        self.r_s = self.cal_r;
-        self.r_window = self.cal_r;
+        self.r_s = self.cal_r as f32;
+        self.r_window = self.cal_r as f32;
         self.valid = false;
         self.age = 0;
         self.t_cl = self.cal_t;
         self.limit_s = base;
+        self.active = false;
+    }
+
+    /// `AudioUnitReset`: the estimator restarts (the window grid from this
+    /// frame, the partial period discarded, `R = R_cal`, `T_CL = T_cal`) and
+    /// the loop is inactive until its next accepted window, the effective
+    /// limit the base meanwhile. The corrected-limit smoother keeps its
+    /// state and resumes from it on reacquisition (the
+    /// `spp3-cl-edge-reset-midlimit` golden: 140 C while inactive, then
+    /// 177.630 C at the first accepted window, which is the pre-reset
+    /// smoother 177.612 C stepped once toward 200 C).
+    fn host_reset(&mut self) {
+        let keep = self.limit_s;
+        self.reset(keep);
+        self.limit_s = keep;
     }
 
     /// The sense bus could not feed a segment: the window is invalid and
@@ -787,38 +812,42 @@ impl Cl {
     fn feed(&mut self, i: &[f32], v: &[f32]) {
         let a = self.coef;
         for (&ii, &vv) in i.iter().zip(v) {
-            self.gv.push(vv as f64, a);
-            self.gi.push(ii as f64, a);
+            // scaled first, in Float32 (rig law (a))
+            self.gv.push(self.v_scale * vv, a);
+            self.gi.push(self.i_scale * ii, a);
             self.n += 1;
             if self.n == self.window {
                 self.n = 0;
-                let nn = self.window as f64;
-                let pv = self.gv.take(a, nn) * self.v_scale2;
-                let pi = self.gi.take(a, nn) * self.i_scale2;
+                let nn = self.window as f32;
+                let pv = self.gv.take(a, nn);
+                let pi = self.gi.take(a, nn);
                 self.window_done(pv, pi);
             }
         }
     }
 
-    fn window_done(&mut self, pv: f64, pi: f64) {
-        // the band-power gates run before the ratio (spec 16)
+    /// One completed Goertzel period (rig law (a)): the band-power gates,
+    /// then `R_w = sqrt(Pv / Pi)` and the smoother `R_s += k_R (R_w - R_s)`,
+    /// which also takes out-of-range windows; accepted iff the smoothed
+    /// `R_s` lies in `RebRange`.
+    fn window_done(&mut self, pv: f32, pi: f32) {
         if !(pv.is_finite() && pi.is_finite() && pv > self.v_floor && pi > self.i_floor) {
             self.valid = false;
             return;
         }
-        let r = libm::sqrt(pv / pi);
+        let r = libm::sqrtf(pv / pi);
         self.r_window = r;
         self.r_s += self.k_r * (r - self.r_s);
         // T_CL = fmaf(invTempCo, (Rw - Rshunt)/(R_cal - Rshunt) - 1, T_cal) in
-        // Float32, Rw the smoothed window resistance times RdcScale (rig
-        // law 3: bit-exact on 630 accepted windows over 10 configurations)
-        let rw = (self.rdc_scale * self.r_s) as f32;
+        // Float32, Rw = RdcScale * R_s, the logged window resistance (rig
+        // law 3)
+        let rw = self.rdc_scale as f32 * self.r_s;
         let (rc, rs) = (self.cal_r as f32, self.rshunt);
         let x = (rw - rs) / (rc - rs) - 1.0;
         let t = libm::fmaf(self.inv_temp_co, x, self.cal_t as f32) as f64;
-        // a window outside the range still publishes its temperature; the
-        // range test is on the instantaneous window resistance
-        let re = self.rdc_scale * r;
+        // TODO(SPEC): the range is tested on R_s here; the rig confirmed it
+        // at RdcScale 1, so whether RdcScale applies first is open
+        let re = self.r_s as f64;
         if t.is_finite() && self.r_s.is_finite() {
             self.t_cl = t;
             self.valid = re >= self.reb_min && re <= self.reb_max;
@@ -832,15 +861,18 @@ impl Cl {
 
     /// Per thermal update: the smoothed corrected limit for `base`.
     fn update(&mut self, t_ol: f64, base: f64) -> f64 {
+        if self.valid {
+            self.active = true;
+        }
+        if !self.active {
+            return base;
+        }
         // a measurement older than one window (plus this update) is stale
         self.age = self.age.saturating_add(THERMAL_FRAMES);
         if self.age > self.window.saturating_add(THERMAL_FRAMES) {
             self.valid = false;
         }
         // max/min, not clamp: a NaN error falls back to the plain base.
-        // TODO(SPEC) t-4668: capped at the base until the CL goldens match
-        // (see CL_RELAXATION): the closed loop runs and publishes T_CL but
-        // never relaxes.
         let relax = if CL_RELAXATION { (t_ol - self.t_cl).max(0.0).min(self.cap) } else { 0.0 };
         let raw = if self.valid { base + relax } else { base };
         self.limit_s += self.k_lim * (raw - self.limit_s);
@@ -1019,11 +1051,11 @@ impl Chan {
 }
 
 /// The release hold of the ordinary candidate (rig law 5): when the fresh
-/// candidate first rises above the previous selected gain, the previous
-/// candidate is held for `N = ceil(1 s * update rate)` updates (188 at
-/// 48 kHz); a fresh candidate at or below the selected gain cancels it,
-/// and after a completed hold the fresh candidate passes until it falls
-/// to the selected gain again.
+/// candidate first reaches the previous selected gain (`>=`: the hard-path
+/// floor tie starts it), the previous candidate is held for `N = ceil(1 s *
+/// update rate)` updates (188 at 48 kHz); a fresh candidate below the
+/// selected gain cancels it, and after a completed hold the fresh
+/// candidate passes until it falls below the selected gain again.
 #[derive(Clone, Copy)]
 struct Hold {
     state: HoldState,
@@ -1050,7 +1082,7 @@ impl Hold {
     }
     fn decide(&mut self, g: f64, sel_prev: f64, n: u32) -> f64 {
         if self.cnt > 0 {
-            if g > sel_prev {
+            if g >= sel_prev {
                 self.cnt -= 1;
                 if self.cnt == 0 {
                     self.state = HoldState::Released;
@@ -1059,7 +1091,7 @@ impl Hold {
             }
             self.cnt = 0;
         }
-        if g > sel_prev {
+        if g >= sel_prev {
             if self.state == HoldState::Attack {
                 self.held = self.u_prev;
                 self.cnt = n.saturating_sub(1);
@@ -1103,6 +1135,10 @@ struct Run {
     pos: usize,
     frame: u64,
     last_frame: u64,
+    /// The graph's render block, frames, and the end of the sense the
+    /// closed loop has already taken ahead for the current block.
+    block: usize,
+    prefed_until: u64,
     sums: BlockSums,
     sense_ok: bool,
     estimator: DelayEstimator,
@@ -1194,10 +1230,11 @@ impl Unit {
     pub fn audio_unit_reset(&mut self) {
         if let Some(r) = self.run.as_mut() {
             for c in r.ch.iter_mut() {
-                let base = c.safe.base();
                 if let Some(cl) = c.cl.as_mut() {
-                    cl.reset(base);
+                    cl.host_reset();
                 }
+                // the effective limit is the base until reacquisition
+                c.tlim_eff = c.safe.base();
             }
         }
     }
@@ -1327,6 +1364,8 @@ impl Run {
             pos: 0,
             frame: 0,
             last_frame: 0,
+            block: p.block_frames as usize,
+            prefed_until: 0,
             sums,
             sense_ok: false,
             estimator: DelayEstimator::new(),
@@ -1346,10 +1385,31 @@ impl Run {
         self.pos = 0;
         self.frame = 0;
         self.last_frame = 0;
+        self.prefed_until = 0;
         self.sums.clear();
         self.sense_ok = false;
         self.estimator.reset();
         self.fault = false;
+    }
+
+    /// The reference consumes a whole render block's telemetry before the
+    /// block's first thermal update, so a Goertzel period ending inside the
+    /// block acts from that first update (rig law (a), at the graph's
+    /// 512-frame slices). With the whole block in this call, take its
+    /// sense now; otherwise the segments feed it as they come.
+    fn prefeed(&mut self, io: &Io<'_, '_>, off: usize) {
+        let n = self.block;
+        let sense = io.sense;
+        let fits = |p: usize| sense.get(p).is_some_and(|b| b.len() >= off + n);
+        if !self.ch.iter().all(|c| c.sense.is_none_or(|(si, sv)| fits(si) && fits(sv))) {
+            return;
+        }
+        for c in self.ch.iter_mut() {
+            if let (Some((si, sv)), Some(cl)) = (c.sense, c.cl.as_mut()) {
+                cl.feed(&sense[si][off..off + n], &sense[sv][off..off + n]);
+            }
+        }
+        self.prefed_until = self.frame + n as u64;
     }
 
     /// Frames `off..off+len` of the host buffers, inside one thermal update.
@@ -1370,7 +1430,7 @@ impl Run {
             let out = &mut io.output[c.src][off..off + len];
             let curve = &self.curve[c.group * THERMAL_FRAMES..][..len];
             // the program held to full scale, times the gain
-            let non_finite = dsp::mul_bounded_to(inp, curve, out);
+            let non_finite = dsp::mul_clamped_to(inp, curve, out, INPUT_CLAMP);
             if c.headroom != 1.0 {
                 dsp::scale_in_place(out, c.headroom);
             }
@@ -1378,7 +1438,7 @@ impl Run {
                 // simple-meter failure: at most 20 dB below the input on
                 // these frames, non-finite samples muted
                 for ((o, &x), &g) in out.iter_mut().zip(inp).zip(curve) {
-                    *o = dsp::bound1(x) * (g * c.headroom).min(FAILSAFE_GAIN);
+                    *o = dsp::clamp1(x, INPUT_CLAMP) * (g * c.headroom).min(FAILSAFE_GAIN);
                 }
                 *health |= Health::FAILSAFE;
             }
@@ -1390,13 +1450,17 @@ impl Run {
                 }
             }
             c.acc.add_sq(out, phase);
+            // the meters see the reference's +-1.5 FS drive; the samples that
+            // leave the unit are held to digital full scale (policy: the
+            // output stays bounded; only |y| > 1 differs from the reference)
+            dsp::clamp_in_place(out, 1.0);
             // Pdrv: the unprotected program on the same frames
             let mut m0 = 0;
             while m0 < len {
                 let m = (len - m0).min(c.scratch.len());
                 c.scratch[..m].copy_from_slice(&inp[m0..m0 + m]);
                 // held to full scale like the program the output carries
-                dsp::bound(&mut c.scratch[..m]);
+                dsp::clamp_in_place(&mut c.scratch[..m], INPUT_CLAMP);
                 c.acc_in.add_sq(&c.scratch[..m], phase + m0);
                 m0 += m;
             }
@@ -1417,7 +1481,7 @@ impl Run {
                 (Some(i), Some(v)) if i.len() >= off + len && v.len() >= off + len => {
                     let (i, v) = (&i[off..off + len], &v[off..off + len]);
                     c.acc_vi.add_prod(v, i, phase);
-                    if let Some(cl) = c.cl.as_mut() {
+                    if let Some(cl) = c.cl.as_mut().filter(|_| self.frame >= self.prefed_until) {
                         cl.feed(i, v);
                     }
                 }
@@ -1591,6 +1655,13 @@ impl ProtectionUnit for Unit {
         let mut off = 0;
         while off < frames {
             let len = (THERMAL_FRAMES - run.pos).min(frames - off);
+            if run.frame >= run.prefed_until
+                && run.block > 0
+                && run.frame % run.block as u64 == 0
+                && frames - off >= run.block
+            {
+                run.prefeed(&io, off);
+            }
             run.segment(&mut io, off, len, &mut health);
             off += len;
             run.pos += len;
@@ -1636,7 +1707,7 @@ impl ProtectionUnit for Unit {
             match c.cl.as_ref() {
                 Some(cl) => {
                     s.cl_temp_c = cl.t_cl as f32;
-                    s.tlim_adj_c = (cl.limit_s - c.safe.base()) as f32;
+                    s.tlim_adj_c = if cl.active { (cl.limit_s - c.safe.base()) as f32 } else { 0.0 };
                     s.closed_loop = true;
                 }
                 None => {
