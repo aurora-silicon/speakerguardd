@@ -446,6 +446,9 @@ struct Cl {
     valid: bool,
     t_cl: f64,
     limit_s: f64,
+    /// Diagnostics of the last completed window (NaN before the first).
+    last_v_ms: f64,
+    last_i_ms: f64,
 }
 
 impl Cl {
@@ -506,6 +509,8 @@ impl Cl {
             valid: false,
             t_cl: tc,
             limit_s: c.temperature_limit as f64,
+            last_v_ms: f64::NAN,
+            last_i_ms: f64::NAN,
         })
     }
 
@@ -518,6 +523,8 @@ impl Cl {
         self.valid = false;
         self.t_cl = self.cal_t;
         self.limit_s = limit;
+        self.last_v_ms = f64::NAN;
+        self.last_i_ms = f64::NAN;
     }
 
     /// Raw telemetry of one segment. TODO(SPEC): the sensor's DC-block /
@@ -538,6 +545,8 @@ impl Cl {
                 self.n = 0;
                 self.v_sq = 0.0;
                 self.i_sq = 0.0;
+                self.last_v_ms = v_ms;
+                self.last_i_ms = i_ms;
                 if v_ms.is_finite() && i_ms.is_finite() && v_ms > self.v_floor && i_ms > self.i_floor {
                     let r = libm::sqrt(v_ms / i_ms);
                     let rs = match self.r_s {
@@ -704,7 +713,10 @@ impl Run {
             };
             let (reb, series, ag) = (c.reb_ref as f64, (c.rshunt + c.rampout) as f64, c.ag as f64);
             let ff_factor = c.thermal_ff_speedup_factor as f64;
-            let ff = (ff_factor > 0.0).then(|| Thermal::new(c.t_sett_vc as f64, ff_factor * c.tau_tvc as f64, dt, 0.0));
+            // SPEC-SPP3 section 10: the feed-forward node starts equal to the
+            // coil node (zero cold, `theta_vc0` hot).
+            let ff = (ff_factor > 0.0)
+                .then(|| Thermal::new(c.t_sett_vc as f64, ff_factor * c.tau_tvc as f64, dt, c.initial_theta_vc as f64));
             ch.push(Chan {
                 src: c.source as usize,
                 group: gi,
@@ -766,7 +778,7 @@ impl Run {
             c.vc.theta = c.init_vc;
             c.mg.theta = c.init_mg;
             if let Some(f) = c.ff.as_mut() {
-                f.theta = 0.0;
+                f.theta = c.init_vc;
             }
             c.p_prev = 0.0;
             c.p_ff_prev = 0.0;
@@ -1018,6 +1030,9 @@ impl ProtectionUnit for Unit {
                     s.cl_temp_c = cl.t_cl as f32;
                     s.tlim_adj_c = (cl.limit_s - c.limit) as f32;
                     s.closed_loop = true;
+                    s.sense_v_ms = cl.last_v_ms as f32;
+                    s.sense_i_ms = cl.last_i_ms as f32;
+                    s.sense_r_ohm = libm::sqrt(cl.last_v_ms / cl.last_i_ms) as f32;
                 }
                 None => {
                     s.cl_temp_c = T_CL_UNMEASURED;

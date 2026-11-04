@@ -40,6 +40,21 @@ use std::collections::BTreeMap;
 pub mod analysis;
 mod pre;
 
+pub use pre::{MAX_EXPANDED_TOKENS, MAX_NESTING};
+
+/// Largest graph file the reader accepts.  The shipped graphs are a few
+/// kilobytes.
+pub const MAX_GRAPH_BYTES: usize = 1 << 20;
+/// Most boxes and wires a graph may declare.  The shipped graphs have tens.
+pub const MAX_BOXES: usize = 1024;
+pub const MAX_WIRES: usize = 4096;
+/// Widest bus a wire may declare.  The engine's buses are far narrower;
+/// the cap keeps the lane tracer from allocating per-lane state for a
+/// hostile channel count.
+pub const MAX_WIRE_CHANNELS: u32 = 256;
+/// Longest statement text quoted in an error message.
+const MAX_QUOTED: usize = 160;
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub enum Expr {
     Word(String),
@@ -235,7 +250,15 @@ fn exprs(toks: &[Tok], line: usize, ctx: &str) -> Result<Vec<Expr>> {
                 Tok::Word(w) => out.push(Expr::Word(w.clone())),
                 Tok::Str(s) => out.push(Expr::Str(s.clone())),
                 Tok::Unresolved(n) => out.push(Expr::Unresolved(n.clone())),
-                Tok::Open => out.push(Expr::Group(go(toks, i, depth + 1, line, ctx)?)),
+                Tok::Open => {
+                    if depth >= MAX_NESTING {
+                        return Err(Error::format(
+                            ctx,
+                            format!("line {line}: parentheses nested deeper than {MAX_NESTING}"),
+                        ));
+                    }
+                    out.push(Expr::Group(go(toks, i, depth + 1, line, ctx)?))
+                }
                 Tok::Newline => {}
                 Tok::Close => {
                     if depth == 0 {
@@ -319,6 +342,9 @@ fn fourcc(e: &Expr) -> Option<FourCc> {
 /// Parses a graph.  `subst` supplies values for macros the file does not
 /// define (the configuration's `Substitutions`).
 pub fn parse(text: &str, subst: &BTreeMap<String, String>, ctx: &str) -> Result<Graph> {
+    if text.len() > MAX_GRAPH_BYTES {
+        return Err(Error::format(ctx, format!("{} bytes; a graph is at most {MAX_GRAPH_BYTES}", text.len())));
+    }
     let pre = pre::run(text, subst, ctx)?;
     let mut g = Graph::default();
     for (line, toks) in &pre.statements {
@@ -335,6 +361,10 @@ pub fn parse(text: &str, subst: &BTreeMap<String, String>, ctx: &str) -> Result<
             })
             .collect::<Vec<_>>()
             .join(" ");
+        let raw_line = match raw_line.char_indices().nth(MAX_QUOTED) {
+            Some((cut, _)) => format!("{}...", &raw_line[..cut]),
+            None => raw_line,
+        };
         let ex = exprs(toks, line, ctx)?;
         let bad = |what: &str| Error::format(ctx, format!("line {line}: malformed {what}: {}", raw_line.trim()));
         let Some(Expr::Word(kw)) = ex.first() else { return Err(bad("statement")) };
@@ -377,6 +407,9 @@ pub fn parse(text: &str, subst: &BTreeMap<String, String>, ctx: &str) -> Result<
                 if g.find_box(name).is_some() || g.is_port(name) {
                     return Err(bad("box (name already used)"));
                 }
+                if g.boxes.len() >= MAX_BOXES {
+                    return Err(bad(&format!("box (more than {MAX_BOXES})")));
+                }
                 g.boxes.push(GraphBox {
                     name: name.clone(),
                     kind,
@@ -406,6 +439,9 @@ pub fn parse(text: &str, subst: &BTreeMap<String, String>, ctx: &str) -> Result<
                     }
                     Some(_) => return Err(bad("wire format")),
                 };
+                if g.wires.len() >= MAX_WIRES {
+                    return Err(bad(&format!("wire (more than {MAX_WIRES})")));
+                }
                 g.wires.push(Wire {
                     src: endpoint(src).ok_or_else(|| bad("wire source"))?,
                     dst: endpoint(dst).ok_or_else(|| bad("wire destination"))?,

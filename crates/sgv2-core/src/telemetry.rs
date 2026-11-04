@@ -33,6 +33,14 @@ pub struct ChannelState {
     pub band_gain: [f32; 5],
     /// Final linear gain applied this quantum.
     pub gain: f32,
+    // V/I sense diagnostics (spp3): the last completed closed-loop window's
+    // scaled mean squares (V^2, A^2) and its unsmoothed resistance
+    // `sqrt(V_ms / I_ms)` (ohm), whether or not the window passed the power
+    // floors and `RebRange`. Bring-up and rig observables only; nothing in
+    // the protection path reads them.
+    pub sense_v_ms: f32,
+    pub sense_i_ms: f32,
+    pub sense_r_ohm: f32,
 }
 
 impl ChannelState {
@@ -53,6 +61,9 @@ impl ChannelState {
         axis_gain: [f32::NAN; 5],
         band_gain: [f32::NAN; 5],
         gain: f32::NAN,
+        sense_v_ms: f32::NAN,
+        sense_i_ms: f32::NAN,
+        sense_r_ohm: f32::NAN,
     };
 }
 

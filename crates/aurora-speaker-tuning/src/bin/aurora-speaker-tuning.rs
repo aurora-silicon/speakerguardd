@@ -6,7 +6,7 @@
 //! ```text
 //! aurora-speaker-tuning dump     [--json] [--speaker-id N] [SOURCE]
 //! aurora-speaker-tuning validate [--json] [--speaker-id N] [SOURCE]
-//! aurora-speaker-tuning compile  [--speaker-id N] [SOURCE | --bundle PATH] -o BLOB
+//! aurora-speaker-tuning compile  [--speaker-id N] [--board B] [--development] [SOURCE | --bundle PATH] -o BLOB
 //! aurora-speaker-tuning blob     BLOB [BLOB]     (decode; with two, diff field by field)
 //! aurora-speaker-tuning units    [--json]
 //! aurora-speaker-tuning plist    FILE            (any plist as XML)
@@ -18,8 +18,16 @@
 //!
 //! `show` and `verify` are accepted for `dump` and `validate`.  `validate`
 //! exits 0 when there are no errors, 1 when there are, 2 on usage errors.
+//!
+//! The speaker ID is `--speaker-id`, else the manifest's, else the device
+//! tree's `/chosen/asahi,speaker-id`.  `compile` binds the blob to a board:
+//! `--board` (compiling for another Mac), else this Mac's device tree; the
+//! device tree's speaker ID is read only without `--board`.  `compile`
+//! refuses an unverified source (`--tunings-root`) unless `--development`.
 
 use aurora_speaker_tuning::bundle::Bundle;
+use aurora_speaker_tuning::compile::{self, Provenance};
+use aurora_speaker_tuning::machine::{self, Machine};
 use aurora_speaker_tuning::tuning::{Options, Tuning};
 use aurora_speaker_tuning::{plist, units, Diagnostics, Severity};
 use std::path::PathBuf;
@@ -34,12 +42,14 @@ struct Args {
     path: Option<PathBuf>,
     path2: Option<PathBuf>,
     out: Option<PathBuf>,
+    board: Option<String>,
+    development: bool,
 }
 
 fn usage() -> ! {
     eprintln!(
         "usage: aurora-speaker-tuning {{dump|validate}} [--json] [--speaker-id N] [PATH | --tunings-root DIR --aid N]\n       \
-         aurora-speaker-tuning compile [--speaker-id N] [--bundle PATH | --tunings-root DIR --aid N] -o BLOB\n       \
+         aurora-speaker-tuning compile [--speaker-id N] [--board B] [--development] [--bundle PATH | --tunings-root DIR --aid N] -o BLOB\n       \
          aurora-speaker-tuning blob BLOB [BLOB]\n       \
          aurora-speaker-tuning units [--json]\n       aurora-speaker-tuning plist FILE"
     );
@@ -58,8 +68,18 @@ fn parse_args() -> Args {
         _ => usage(),
     }
     .to_string();
-    let mut a =
-        Args { cmd, json: false, speaker_id: None, tunings_root: None, aid: None, path: None, path2: None, out: None };
+    let mut a = Args {
+        cmd,
+        json: false,
+        speaker_id: None,
+        tunings_root: None,
+        aid: None,
+        path: None,
+        path2: None,
+        out: None,
+        board: None,
+        development: false,
+    };
     while let Some(x) = it.next() {
         match x.as_str() {
             "--json" => a.json = true,
@@ -70,6 +90,8 @@ fn parse_args() -> Args {
                     Some(it.next().and_then(|v| v.trim_start_matches("AID").parse().ok()).unwrap_or_else(|| usage()))
             }
             "--bundle" => a.path = Some(it.next().map(PathBuf::from).unwrap_or_else(|| usage())),
+            "--board" => a.board = Some(it.next().unwrap_or_else(|| usage())),
+            "--development" => a.development = true,
             "-o" | "--output" => a.out = Some(it.next().map(PathBuf::from).unwrap_or_else(|| usage())),
             p if !p.starts_with('-') && a.path.is_none() => a.path = Some(PathBuf::from(p)),
             p if !p.starts_with('-') && a.path2.is_none() => a.path2 = Some(PathBuf::from(p)),
@@ -77,6 +99,24 @@ fn parse_args() -> Args {
         }
     }
     a
+}
+
+/// Writes `data` to a temporary file beside `out`, then renames it into
+/// place, so a reader never sees a partial blob.
+fn write_atomic(out: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let name = out.file_name().ok_or_else(|| std::io::Error::other("no file name"))?;
+    let tmp = out.with_file_name(format!(".{}.tmp{}", name.to_string_lossy(), std::process::id()));
+    let r = (|| {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(data)?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, out)
+    })();
+    if r.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    r
 }
 
 fn print_diags(d: &Diagnostics) {
@@ -255,7 +295,7 @@ fn decode_blob(p: &std::path::Path) -> String {
         sgv2_core::atsp::Params::from_blob(&bytes).map(|x| format!("{x:#?}")).map_err(|e| format!("{e:?}"))
     };
     match body {
-        Ok(b) => format!("header: {h:?}\n{b}"),
+        Ok(b) => format!("header: {h:?}\nboard: {:?}, full scale {} mV\n{b}", h.machine(), h.full_scale_mv),
         Err(e) => {
             eprintln!("{}: the engine rejects it: {e}", p.display());
             exit(1)
@@ -355,28 +395,45 @@ fn main() {
         _ => usage(),
     };
     let mut diags = Diagnostics::default();
-    let result = bundle.and_then(|b| Tuning::load(&b, &Options { speaker_id: a.speaker_id }, &mut diags));
+    let dt = std::path::Path::new(machine::DEVICE_TREE);
+    let live = a.board.is_none() && dt.is_dir();
+    let device_tree_speaker_id = if live {
+        machine::speaker_id(dt).unwrap_or_else(|e| {
+            eprintln!("{e}");
+            exit(1)
+        })
+    } else {
+        None
+    };
+    let opts = Options { speaker_id: a.speaker_id, device_tree_speaker_id };
+    let result = bundle.and_then(|b| Tuning::load(&b, &opts, &mut diags));
     match result {
         Ok(t) => {
             if a.cmd == "compile" {
                 let out = a.out.clone().unwrap_or_else(|| usage());
-                match aurora_speaker_tuning::compile::compile(&t, &mut diags) {
-                    Ok(c) if !diags.has_errors() => {
-                        if let Err(e) = std::fs::write(&out, &c.blob) {
+                let m = match &a.board {
+                    Some(b) => Machine::new(b),
+                    None => Machine::from_device_tree(dt),
+                };
+                let provenance = if a.development { Provenance::AllowUnverified } else { Provenance::Verified };
+                match m.and_then(|m| compile::compile_with(&t, &m, provenance, &mut diags)) {
+                    Ok(c) => {
+                        if let Err(e) = write_atomic(&out, &c.blob) {
                             eprintln!("{}: {e}", out.display());
                             exit(1);
                         }
                         eprintln!(
-                            "wrote {} ({} bytes): {:?}, {} channels, {} sense, {} Hz",
+                            "wrote {} ({} bytes): {:?}, {} channels, {} sense, {} Hz, board {}, full scale {} mV",
                             out.display(),
                             c.blob.len(),
                             c.unit,
                             c.channels,
                             c.sense_channels,
-                            c.sample_rate
+                            c.sample_rate,
+                            c.board,
+                            c.full_scale_mv
                         );
                     }
-                    Ok(_) => {}
                     Err(e) => diags.from_error("compile", &e),
                 }
             } else if a.cmd == "dump" {

@@ -165,7 +165,13 @@ pub fn propstrip(sidecar: &str) -> Vec<u8> {
 
 /// The property strip, with `Thermal State Override` (64007) if given.
 pub fn propstrip_with(sidecar: &str, thermal_state: Option<i128>) -> Vec<u8> {
+    propstrip_extra(sidecar, thermal_state, Vec::new())
+}
+
+/// The property strip with further property dictionaries.
+pub fn propstrip_extra(sidecar: &str, thermal_state: Option<i128>, extra: Vec<Value>) -> Vec<u8> {
     let mut props = vec![dict(vec![("Number", i(64004)), ("UInt32", i(1))])];
+    props.extend(extra);
     if let Some(v) = thermal_state {
         props.push(dict(vec![("Number", i(64007)), ("UInt32", i(v))]));
     }
@@ -328,6 +334,7 @@ pub fn spp3_files(channels: usize) -> BTreeMap<String, Vec<u8>> {
     f.insert(format!("{AID}/DSP/Strips/builtin_speaker_out_general.propstrip"), propstrip(&sc));
     f.insert(format!("{AID}/DSP/Strips/{sc}"), binary::write(&sidecar_value(channels)));
     f.insert("DeviceDSPDatabase.plist".into(), database(&[(65535, "builtin_speaker_out_general.austrip")]));
+    f.insert(format!("Config/{AID}.plist"), binary::write(&dict(vec![])));
     let recs: Vec<(FourCc, u16, u16)> =
         (0..channels).map(|c| (FourCc::from_str_exact(&format!("spA{c}")).unwrap(), 3000 + c as u16, 3100)).collect();
     f.insert("speaker-thiele-small.bin".into(), spts::encode(&recs, 0xBEEF));
@@ -335,14 +342,33 @@ pub fn spp3_files(channels: usize) -> BTreeMap<String, Vec<u8>> {
 }
 
 pub fn manifest_json(files: &BTreeMap<String, Vec<u8>>, build: &str) -> String {
+    manifest_json_with(files, build, None)
+}
+
+/// The installer's schema-2 manifest, with `speaker_id` when given.
+pub fn manifest_json_with(files: &BTreeMap<String, Vec<u8>>, build: &str, speaker_id: Option<u32>) -> String {
     let rec = |p: &str, d: &[u8]| format!(r#"{{"path":"{p}","bytes":{},"sha256":"{}"}}"#, d.len(), sha256_hex(d));
     let spts = files.get("speaker-thiele-small.bin").map(|d| rec("speaker-thiele-small.bin", d));
     let list: Vec<String> =
         files.iter().filter(|(p, _)| *p != "speaker-thiele-small.bin").map(|(p, d)| rec(p, d)).collect();
+    let count = files.keys().filter(|p| p.starts_with(&format!("{AID}/"))).count();
+    let spid = speaker_id.map_or(String::new(), |v| format!(r#","speaker_id":{v}"#));
     format!(
-        r#"{{"schema":1,"kind":"aurora-audio-tuning","acoustic_id":{ACOUSTIC_ID},"aid":"{AID}","macos_build":"{build}",
-"speaker_thiele_small":{},"files":[{}],"based_on":"test"}}"#,
+        r#"{{"schema":2,"kind":"aurora-audio-tuning","source_file_count":{count},"complete":true,
+"acoustic_id":{ACOUSTIC_ID},"aid":"{AID}","macos_build":"{build}",
+"speaker_thiele_small":{},"device_dsp_database":"DeviceDSPDatabase.plist","config":"Config/{AID}.plist",
+"files":[{}],"based_on":"test"{spid}}}"#,
         spts.unwrap_or_else(|| "null".into()),
+        list.join(",")
+    )
+}
+
+/// aurora-audio-dsp's collector `metadata.json` (development bundles).
+pub fn collector_json(files: &BTreeMap<String, Vec<u8>>) -> String {
+    let rec = |p: &str, d: &[u8]| format!(r#"{{"path":"{p}","bytes":{},"sha256":"{}"}}"#, d.len(), sha256_hex(d));
+    let list: Vec<String> = files.iter().map(|(p, d)| rec(p, d)).collect();
+    format!(
+        r#"{{"kind":"aurora-audio-dsp tuning bundle","version":1,"machine_model":"MacTest1,1","acoustic_id_name":"{AID}","files":[{}]}}"#,
         list.join(",")
     )
 }

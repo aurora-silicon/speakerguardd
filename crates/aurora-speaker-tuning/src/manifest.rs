@@ -5,8 +5,10 @@
 
 //! Bundle integrity records.
 //!
-//! * `manifest.json`, schema 1, kind `aurora-audio-tuning`: what the Aurora
-//!   installer writes next to the collected folder.
+//! * `manifest.json`, schema 2, kind `aurora-audio-tuning`: what the Aurora
+//!   installer writes next to the collected folder.  Schema 2 states that
+//!   the set is complete (`complete`, `source_file_count`), names both
+//!   selection files, and may carry the speaker-assembly ID (`speaker_id`).
 //! * `metadata.json`, version 1, kind `aurora-audio-dsp tuning bundle`: what
 //!   aurora-audio-dsp's macOS collector writes (development bundles).
 //!
@@ -27,6 +29,8 @@ pub const DSP_DATABASE: &str = "DeviceDSPDatabase.plist";
 /// not one it wrote.
 pub const MAX_FILES: usize = 1024;
 pub const MAX_BYTES: u64 = 64 << 20;
+/// The installer manifest schema this reader knows.
+pub const SCHEMA: u32 = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {
@@ -69,6 +73,9 @@ pub struct Manifest {
     /// macOS build the tuning was collected from (`kern.osversion`), if known.
     pub macos_build: Option<String>,
     pub machine_model: Option<String>,
+    /// The speaker-assembly ID (macOS `speakerID`, HAL `spid`) the
+    /// installer read on this Mac, if it could.
+    pub speaker_id: Option<u32>,
     pub speaker_thiele_small: Option<Record>,
     pub files: Vec<Record>,
 }
@@ -76,14 +83,22 @@ pub struct Manifest {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InstallerJson {
-    schema: u32,
+    #[serde(rename = "schema")]
+    _schema: u32,
     kind: String,
+    source_file_count: u64,
+    complete: bool,
     acoustic_id: u32,
     aid: String,
     macos_build: String,
     speaker_thiele_small: Option<Record>,
+    device_dsp_database: String,
+    config: String,
     files: Vec<Record>,
     based_on: Option<String>,
+    /// Python writes `null` when unknown, Swift omits the key.
+    #[serde(default)]
+    speaker_id: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -102,21 +117,57 @@ impl Manifest {
 
     /// Parses `manifest.json` (installer).
     pub fn parse(bytes: &[u8]) -> Result<Manifest> {
-        let j: InstallerJson =
-            serde_json::from_slice(bytes).map_err(|e| Error::format(NAME, format!("not a schema-1 manifest: {e}")))?;
-        if j.schema != 1 {
-            return Err(Error::version(NAME, format!("manifest schema {}; known: 1", j.schema)));
+        // The schema first, so an older manifest reports its version rather
+        // than a missing field.
+        #[derive(Deserialize)]
+        struct Schema {
+            schema: u32,
         }
+        let v: Schema =
+            serde_json::from_slice(bytes).map_err(|e| Error::format(NAME, format!("not a manifest: {e}")))?;
+        if v.schema != SCHEMA {
+            return Err(Error::version(NAME, format!("manifest schema {}; known: {SCHEMA}", v.schema)));
+        }
+        let j: InstallerJson = serde_json::from_slice(bytes)
+            .map_err(|e| Error::format(NAME, format!("not a schema-{SCHEMA} manifest: {e}")))?;
         if j.kind != "aurora-audio-tuning" {
             return Err(Error::format(NAME, format!("kind {:?}", j.kind)));
         }
         let _ = j.based_on;
+        // Completeness: the installer writes only a full set, and says so.
+        if !j.complete {
+            return Err(Error::format(NAME, "the installer marked the set incomplete"));
+        }
+        let config = format!("Config/{}.plist", j.aid);
+        if j.device_dsp_database != DSP_DATABASE || j.config != config {
+            return Err(Error::format(
+                NAME,
+                format!(
+                    "selection files {:?} and {:?}; expected {DSP_DATABASE:?} and {config:?}",
+                    j.device_dsp_database, j.config
+                ),
+            ));
+        }
+        for name in [DSP_DATABASE, config.as_str()] {
+            if !j.files.iter().any(|r| r.path == name) {
+                return Err(Error::format(NAME, format!("{name} is named but not listed")));
+            }
+        }
+        let prefix = format!("{}/", j.aid);
+        let folder = j.files.iter().filter(|r| r.path.starts_with(&prefix)).count() as u64;
+        if j.source_file_count == 0 || j.source_file_count != folder {
+            return Err(Error::format(
+                NAME,
+                format!("source_file_count {} but {folder} {prefix} entries are listed", j.source_file_count),
+            ));
+        }
         let m = Manifest {
             source: Source::Installer,
             acoustic_id: j.acoustic_id,
             aid: j.aid,
             macos_build: (j.macos_build != "unknown").then_some(j.macos_build),
             machine_model: None,
+            speaker_id: j.speaker_id,
             speaker_thiele_small: j.speaker_thiele_small,
             files: j.files,
         };
@@ -143,6 +194,7 @@ impl Manifest {
             aid: j.acoustic_id_name,
             macos_build: None,
             machine_model: j.machine_model,
+            speaker_id: None,
             speaker_thiele_small: spts.into_iter().next(),
             files,
         };
@@ -243,11 +295,26 @@ mod tests {
         assert!(rec.verify(b"ab").is_err());
     }
 
-    fn installer(files: &str) -> String {
+    fn selection() -> String {
+        let sha = sha256_hex(b"x");
         format!(
-            r#"{{"schema":1,"kind":"aurora-audio-tuning","acoustic_id":7,"aid":"AID7","macos_build":"25A1",
-               "speaker_thiele_small":null,"files":[{files}],"based_on":"x"}}"#
+            r#"{{"path":"DeviceDSPDatabase.plist","bytes":1,"sha256":"{sha}"}},{{"path":"Config/AID7.plist","bytes":1,"sha256":"{sha}"}}"#
         )
+    }
+
+    fn installer_with(files: &str, count: u64, extra: &str) -> String {
+        let sel = selection();
+        let files = if files.is_empty() { sel } else { format!("{files},{sel}") };
+        format!(
+            r#"{{"schema":2,"kind":"aurora-audio-tuning","source_file_count":{count},"complete":true,
+               "acoustic_id":7,"aid":"AID7","macos_build":"25A1","speaker_thiele_small":null,
+               "device_dsp_database":"DeviceDSPDatabase.plist","config":"Config/AID7.plist",
+               "files":[{files}],"based_on":"x"{extra}}}"#
+        )
+    }
+
+    fn installer(files: &str) -> String {
+        installer_with(files, 1, "")
     }
 
     #[test]
@@ -266,11 +333,44 @@ mod tests {
         ] {
             assert!(Manifest::parse(installer(&bad).as_bytes()).is_err(), "{bad}");
         }
-        let wrong_schema = installer("").replace("\"schema\":1", "\"schema\":2");
-        assert!(matches!(
-            Manifest::parse(wrong_schema.as_bytes()),
-            Err(Error::Version { .. }) | Err(Error::Format { .. })
-        ));
+        let wrong_schema = installer("").replace("\"schema\":2", "\"schema\":1");
+        assert!(matches!(Manifest::parse(wrong_schema.as_bytes()), Err(Error::Version { .. })));
+    }
+
+    #[test]
+    fn installer_manifest_completeness() {
+        let sha = sha256_hex(b"x");
+        let one = format!(r#"{{"path":"AID7/a","bytes":1,"sha256":"{sha}"}}"#);
+        assert!(Manifest::parse(installer(&one).as_bytes()).is_ok());
+        // A short or inflated count, an incomplete flag, missing selection.
+        for bad in [
+            installer_with(&one, 2, ""),
+            installer_with(&one, 0, ""),
+            installer(&one).replace("\"complete\":true", "\"complete\":false"),
+            installer(&one).replace(",\"complete\":true", ""),
+            installer(&one).replace(r#","config":"Config/AID7.plist""#, r#","config":"Config/AID8.plist""#),
+            installer(&one).replace(r#",{"path":"Config/AID7.plist""#, r#",{"path":"AID7/Config.plist""#),
+        ] {
+            assert!(Manifest::parse(bad.as_bytes()).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn installer_manifest_speaker_id() {
+        let sha = sha256_hex(b"x");
+        let one = format!(r#"{{"path":"AID7/a","bytes":1,"sha256":"{sha}"}}"#);
+        // Swift omits it, Python writes null.
+        assert_eq!(Manifest::parse(installer(&one).as_bytes()).unwrap().speaker_id, None);
+        let m = Manifest::parse(installer_with(&one, 1, r#","speaker_id":null"#).as_bytes()).unwrap();
+        assert_eq!(m.speaker_id, None);
+        for (v, want) in [("3", 3u32), ("65535", 65535), ("4294967295", u32::MAX)] {
+            let m = Manifest::parse(installer_with(&one, 1, &format!(r#","speaker_id":{v}"#)).as_bytes()).unwrap();
+            assert_eq!(m.speaker_id, Some(want));
+        }
+        for v in ["-1", "4294967296", "3.0", "true", "\"3\"", "[3]"] {
+            let j = installer_with(&one, 1, &format!(r#","speaker_id":{v}"#));
+            assert!(Manifest::parse(j.as_bytes()).is_err(), "{v}");
+        }
     }
 
     #[test]

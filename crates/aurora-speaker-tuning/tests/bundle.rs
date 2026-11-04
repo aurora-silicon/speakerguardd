@@ -14,7 +14,7 @@ use std::io::Write;
 
 fn load(b: &Bundle, spid: Option<i128>) -> (Result<Tuning, Error>, Diagnostics) {
     let mut d = Diagnostics::default();
-    let t = Tuning::load(b, &Options { speaker_id: spid }, &mut d);
+    let t = Tuning::load(b, &Options { speaker_id: spid, ..Options::default() }, &mut d);
     (t, d)
 }
 
@@ -133,12 +133,68 @@ fn selection_by_speaker_id() {
     assert!(load(&b, Some(3)).0.is_err());
 }
 
+/// A bundle with a vendor-neutral and a spid-7 configuration, whose
+/// manifest records `manifest_spid`.
+fn spid_bundle(name: &str, manifest_spid: Option<u32>) -> Bundle {
+    let mut files = spp3_files(2);
+    let alt = files[&format!("{AID}/DSP/Strips/builtin_speaker_out_general.austrip")].clone();
+    files.insert(format!("{AID}/DSP/Strips/builtin_speaker_out_general_7.austrip"), alt);
+    files.insert(
+        "DeviceDSPDatabase.plist".into(),
+        database(&[(65535, "builtin_speaker_out_general.austrip"), (7, "builtin_speaker_out_general_7.austrip")]),
+    );
+    let dir = scratch(name);
+    write_dir(&dir, &files, &manifest_json_with(&files, "25G83", manifest_spid));
+    Bundle::open(&dir).unwrap()
+}
+
+fn load_with(b: &Bundle, opts: Options) -> Result<Tuning, Error> {
+    Tuning::load(b, &opts, &mut Diagnostics::default())
+}
+
+#[test]
+fn speaker_id_comes_from_the_manifest_then_the_device_tree() {
+    // The installer's speaker ID selects the vendor strip.
+    let b = spid_bundle("e2e-spid-manifest", Some(7));
+    assert_eq!(b.manifest.speaker_id, Some(7));
+    let t = load_with(&b, Options::default()).unwrap();
+    assert!(t.selection.strip.ends_with("_7.austrip"));
+    assert_eq!((t.speaker_id, t.speaker_id_source), (Some(7), Some("manifest")));
+    // 65535 (invalid strap) takes the general route.
+    let t = load_with(&spid_bundle("e2e-spid-65535", Some(65535)), Options::default()).unwrap();
+    assert!(t.selection.strip.ends_with("general.austrip"));
+    // An ID the database lacks is an error, not another vendor's strip.
+    assert!(load_with(&spid_bundle("e2e-spid-3", Some(3)), Options::default()).is_err());
+    // Without a manifest value, the device tree's export.
+    let b = spid_bundle("e2e-spid-dt", None);
+    let t = load_with(&b, Options { device_tree_speaker_id: Some(7), ..Options::default() }).unwrap();
+    assert!(t.selection.strip.ends_with("_7.austrip"));
+    assert_eq!(t.speaker_id_source, Some("device-tree"));
+    // Neither: the vendor-neutral fallback, with a warning.
+    let mut d = Diagnostics::default();
+    let t = Tuning::load(&b, &Options::default(), &mut d).unwrap();
+    assert!(t.selection.strip.ends_with("general.austrip"));
+    assert!(d.items.iter().any(|x| x.code == "select-speaker-id-unknown"));
+    assert_eq!(t.speaker_id, None);
+    // The manifest and the device tree disagree: not this Mac's bundle.
+    let b = spid_bundle("e2e-spid-clash", Some(7));
+    assert!(load_with(&b, Options { device_tree_speaker_id: Some(3), ..Options::default() }).is_err());
+    // An explicit override wins.
+    let t = load_with(&b, Options { speaker_id: Some(65535), device_tree_speaker_id: Some(3) }).unwrap();
+    assert_eq!(t.speaker_id_source, Some("override"));
+}
+
 #[test]
 fn no_database_falls_back_with_warning() {
     let mut files = spp3_files(2);
     files.remove("DeviceDSPDatabase.plist");
+    files.remove(&format!("Config/{AID}.plist"));
     let dir = scratch("e2e-nodb");
-    write_dir(&dir, &files, &manifest_json(&files, "25G83"));
+    // The installer never writes a set without its database (schema 2
+    // refuses it); a development collector bundle can lack one.
+    write_dir(&dir, &files, "{}");
+    std::fs::remove_file(dir.join("manifest.json")).unwrap();
+    std::fs::write(dir.join("metadata.json"), collector_json(&files)).unwrap();
     let (t, d) = load(&Bundle::open(&dir).unwrap(), None);
     let t = t.unwrap();
     assert!(t.selection.configuration.is_none());

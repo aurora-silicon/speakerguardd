@@ -8,11 +8,22 @@ mod common;
 
 use aurora_speaker_tuning::aupreset::{ParamSection, ParamState};
 use aurora_speaker_tuning::bundle::Bundle;
-use aurora_speaker_tuning::compile::{compile, lsm2_ids as id};
+use aurora_speaker_tuning::compile::{self as comp, lsm2_ids as id, Provenance};
+use aurora_speaker_tuning::machine::Machine;
+use aurora_speaker_tuning::plist::Value;
 use aurora_speaker_tuning::tuning::{Options, Tuning, UnitKind};
 use aurora_speaker_tuning::Diagnostics;
 use common::*;
 use std::collections::BTreeMap;
+
+/// The synthetic bundles have four channels: a four-amp board.
+fn j413() -> Machine {
+    Machine::new("j413").unwrap()
+}
+
+fn compile(t: &Tuning, d: &mut Diagnostics) -> aurora_speaker_tuning::Result<comp::Compiled> {
+    comp::compile(t, &j413(), d)
+}
 
 fn tuning(files: &BTreeMap<String, Vec<u8>>, name: &str) -> Tuning {
     tuning_allowing(files, name, &[])
@@ -23,9 +34,25 @@ fn tuning_allowing(files: &BTreeMap<String, Vec<u8>>, name: &str, _expected: &[&
     write_dir(&dir, files, &manifest_json(files, "25G83"));
     let b = Bundle::open(&dir).unwrap();
     let mut d = Diagnostics::default();
-    let t = Tuning::load(&b, &Options { speaker_id: None }, &mut d).unwrap();
+    let t = Tuning::load(&b, &Options::default(), &mut d).unwrap();
     assert!(!d.has_errors(), "{:?}", d.items);
     t
+}
+
+/// Loads a bundle that may carry errors (the compiler must refuse it).
+fn tuning_any(files: &BTreeMap<String, Vec<u8>>, name: &str) -> Tuning {
+    let dir = scratch(name);
+    write_dir(&dir, files, &manifest_json(files, "25G83"));
+    let b = Bundle::open(&dir).unwrap();
+    Tuning::load(&b, &Options::default(), &mut Diagnostics::default()).unwrap()
+}
+
+fn sidecar_name() -> String {
+    format!("{}-aufx-spp3-appl.plist", AID.to_lowercase())
+}
+
+fn propstrip_path() -> String {
+    format!("{AID}/DSP/Strips/builtin_speaker_out_general.propstrip")
 }
 
 #[test]
@@ -35,6 +62,10 @@ fn spp3_fields_come_from_the_sidecar_and_state() {
     let c = compile(&t, &mut d).unwrap();
     assert!(!d.has_errors(), "{:?}", d.items);
     assert_eq!((c.unit, c.channels, c.sense_channels, c.sample_rate), (UnitKind::Spp3, 4, 8, 48000));
+    // The header names the board and the machine's operating point.
+    let (h, _) = sgv2_core::blob::Header::parse(&c.blob).unwrap();
+    assert_eq!((h.machine(), h.full_scale_mv), (Some("j413"), 8414));
+    assert_eq!((c.board.as_str(), c.full_scale_mv), ("j413", 8414));
     let p = sgv2_core::spp3::Params::from_blob(&c.blob).unwrap();
     assert_eq!(p.block_frames, 256);
     assert_eq!(p.thermal_ambient_temp, 41.0);
@@ -80,14 +111,145 @@ fn spp3_calibration_needs_a_valid_matching_record() {
 }
 
 #[test]
-fn spp3_start_state_must_be_the_specified_one() {
-    for state in [None, Some(0), Some(1)] {
+fn spp3_start_state_follows_64007_per_aid() {
+    // 2: cold.  Unset (AID8/9/14/15), 0, 1 and other values: the hot
+    // fallback, the steady-state split of TemperatureLimit over ambient.
+    // Fixture: ambient 41, limit 121, T_sett 17/19 K/W: P0 = 80/36 W.
+    let p0 = 80.0f64 / 36.0;
+    for (state, hot) in [(Some(2), false), (None, true), (Some(0), true), (Some(1), true), (Some(7), true)] {
         let mut f = spp3_files(4);
-        let sc = format!("{}-aufx-spp3-appl.plist", AID.to_lowercase());
-        f.insert(format!("{AID}/DSP/Strips/builtin_speaker_out_general.propstrip"), propstrip_with(&sc, state));
+        f.insert(propstrip_path(), propstrip_with(&sidecar_name(), state));
         let t = tuning(&f, &format!("c-start-{state:?}"));
-        assert!(compile(&t, &mut Diagnostics::default()).is_err(), "{state:?}");
+        let c = compile(&t, &mut Diagnostics::default()).unwrap();
+        let p = sgv2_core::spp3::Params::from_blob(&c.blob).unwrap();
+        for x in &p.ch[..4] {
+            let (vc, mg) = if hot { ((p0 * 17.0) as f32, (p0 * 19.0) as f32) } else { (0.0, 0.0) };
+            assert_eq!((x.initial_theta_vc, x.initial_theta_mg), (vc, mg), "{state:?}");
+            // T_OL starts at the limit when hot.
+            if hot {
+                assert!((41.0 + x.initial_theta_vc + x.initial_theta_mg - 121.0).abs() < 1e-4);
+            }
+        }
     }
+}
+
+#[test]
+fn spp3_hot_seed_matches_the_spec_family_values() {
+    // SPEC-SPP3 section 10: AID9-family woofer, ambient 50, limit 140,
+    // Rvc/Rmg 26.06/25.55 K/W: 45.444681 K coil, 44.555319 K magnet.
+    let p0 = (140.0f64 - 50.0) / (26.06 + 25.55);
+    assert!((p0 * 26.06 - 45.444681).abs() < 1e-5);
+    assert!((p0 * 25.55 - 44.555319).abs() < 1e-5);
+}
+
+#[test]
+fn spp3_source_order_binds_sense_and_calibration() {
+    // 64005 reverses the four sources: channel c takes spA<3-c>.
+    let order = Value::Array(["spA3", "spA2", "spA1", "spA0"].iter().map(|x| s(x)).collect());
+    let mut f = spp3_files(4);
+    f.insert(
+        propstrip_path(),
+        propstrip_extra(&sidecar_name(), Some(2), vec![dict(vec![("Number", i(64005)), ("Array", order)])]),
+    );
+    let t = tuning(&f, "c-order");
+    let p = sgv2_core::spp3::Params::from_blob(&compile(&t, &mut Diagnostics::default()).unwrap().blob).unwrap();
+    for c in 0..4u32 {
+        let k = 3 - c;
+        let x = &p.ch[c as usize];
+        assert_eq!((x.sense_i, x.sense_v), (2 * k + 1, 2 * k), "channel {c}");
+        assert_eq!(x.cal_r, (3000 + k) as f32 / 1024.0, "channel {c}");
+    }
+    // Integer FourCCs are the same order.
+    let ints = Value::Array(
+        ["spA3", "spA2", "spA1", "spA0"]
+            .iter()
+            .map(|x| i(u32::from_be_bytes(x.as_bytes().try_into().unwrap()).into()))
+            .collect(),
+    );
+    let mut f = spp3_files(4);
+    f.insert(
+        propstrip_path(),
+        propstrip_extra(&sidecar_name(), Some(2), vec![dict(vec![("Number", i(64005)), ("Array", ints)])]),
+    );
+    let q = sgv2_core::spp3::Params::from_blob(
+        &compile(&tuning(&f, "c-order-int"), &mut Diagnostics::default()).unwrap().blob,
+    )
+    .unwrap();
+    assert_eq!(q.ch[0].sense_v, 6);
+    // Malformed orders are refused, never guessed.
+    for (name, v) in [
+        ("short", Value::Array(vec![s("spA0"), s("spA1")])),
+        ("dup", Value::Array(vec![s("spA0"), s("spA0"), s("spA1"), s("spA2")])),
+        ("range", Value::Array(vec![s("spA0"), s("spA1"), s("spA2"), s("spA9")])),
+        ("name", Value::Array(vec![s("spA0"), s("spA1"), s("spA2"), s("left")])),
+        ("scalar", i(3)),
+    ] {
+        let key = if matches!(v, Value::Integer(_)) { "UInt32" } else { "Array" };
+        let mut f = spp3_files(4);
+        f.insert(
+            propstrip_path(),
+            propstrip_extra(&sidecar_name(), Some(2), vec![dict(vec![("Number", i(64005)), (key, v)])]),
+        );
+        let t = tuning(&f, &format!("c-order-{name}"));
+        assert!(compile(&t, &mut Diagnostics::default()).is_err(), "{name}");
+    }
+}
+
+#[test]
+fn spp3_records_must_belong_to_channels() {
+    // A record for a source no channel takes (spA7 on a four-channel unit).
+    let mut f = spp3_files(4);
+    let recs: Vec<_> = [0u32, 1, 2, 7]
+        .iter()
+        .map(|k| (aurora_speaker_tuning::fourcc::FourCc::from_str_exact(&format!("spA{k}")).unwrap(), 3000, 3100))
+        .collect();
+    f.insert("speaker-thiele-small.bin".into(), aurora_speaker_tuning::spts::encode(&recs, 0));
+    let t = tuning_allowing(&f, "c-cal-stray", &[]);
+    assert!(compile(&t, &mut Diagnostics::default()).is_err());
+}
+
+#[test]
+fn compile_refuses_what_the_engine_must_not_run() {
+    // A channel-count mismatch (SPEC-SPP3: a hard 20 dB fail-safe) loads
+    // with an error finding; the library refuses to compile it.
+    let mut f = spp3_files(4);
+    f.insert(
+        format!("{AID}/DSP/Strips/{}", sidecar_name()),
+        aurora_speaker_tuning::plist::binary::write(&sidecar_value(2)),
+    );
+    let t = tuning_any(&f, "c-refuse-count");
+    assert!(!t.refusals.is_empty());
+    let e = compile(&t, &mut Diagnostics::default()).unwrap_err().to_string();
+    assert!(e.contains("must not run"), "{e}");
+    // A bypassed protection unit.
+    let mut t = tuning(&spp3_files(4), "c-refuse-bypass");
+    t.refusals.push(aurora_speaker_tuning::Diagnostic {
+        severity: aurora_speaker_tuning::Severity::Error,
+        code: "protection-bypassed",
+        context: "strip".into(),
+        message: "the strip bypasses Prot".into(),
+    });
+    assert!(compile(&t, &mut Diagnostics::default()).is_err());
+    // An unverified bundle, unless development is asked for.
+    let mut t = tuning(&spp3_files(4), "c-refuse-unverified");
+    t.verified = false;
+    assert!(compile(&t, &mut Diagnostics::default()).is_err());
+    assert!(comp::compile_with(&t, &j413(), Provenance::AllowUnverified, &mut Diagnostics::default()).is_ok());
+}
+
+#[test]
+fn compile_binds_to_the_machine() {
+    let t = tuning(&spp3_files(4), "c-machine");
+    // Another board's amp count, an unknown board, a board too long.
+    assert!(comp::compile(&t, &Machine::new("j616s").unwrap(), &mut Diagnostics::default()).is_err());
+    assert!(comp::compile(&t, &Machine::new("j274").unwrap(), &mut Diagnostics::default()).is_err());
+    assert!(Machine::new("j616s-too-long").is_err());
+    // A known acoustic-id must match the bundle's.
+    let mut m = j413();
+    m.acoustic_id = Some(ACOUSTIC_ID + 1);
+    assert!(comp::compile(&t, &m, &mut Diagnostics::default()).is_err());
+    m.acoustic_id = Some(ACOUSTIC_ID);
+    assert!(comp::compile(&t, &m, &mut Diagnostics::default()).is_ok());
 }
 
 /// A synthetic lsm2 saved state: one active type-A model, two channels.
@@ -152,7 +314,7 @@ fn lsm2_state(tweak: impl Fn(&mut BTreeMap<u32, f32>)) -> ParamState {
         for k in 0..33 {
             m.insert(id::channel(c, k), 1.0);
         }
-        m.insert(id::channel(c, id::CH_VOLTS_FS), 6.0 + c as f32);
+        m.insert(id::channel(c, id::CH_VOLTS_FS), 8.414);
         m.insert(id::channel(c, id::CH_PARASITIC), 0.2);
         m.insert(id::channel(c, id::CH_DISPLACEMENT_LIMIT), 0.0005);
         m.insert(id::channel(c, id::CH_TEMP_HARD), 130.0);
@@ -181,6 +343,8 @@ fn lsm2_files(tweak: impl Fn(&mut BTreeMap<u32, f32>)) -> BTreeMap<String, Vec<u
 fn lsm2_fields_follow_the_id_rule() {
     let t = tuning(&lsm2_files(|_| {}), "c-lsm2");
     let c = compile(&t, &mut Diagnostics::default()).unwrap();
+    // The operating point is the tuning's VoltsFullScale.
+    assert_eq!(c.full_scale_mv, 8414);
     let p = sgv2_core::lsm2::Params::from_blob(&c.blob).unwrap();
     assert_eq!((p.channels, p.sample_rate, p.model_only), (4, 48000, 1));
     assert_eq!((p.attack_time_ms, p.fast_release_time_ms, p.slow_release_time_ms), (4.0, 150.0, 15000.0));
@@ -188,7 +352,7 @@ fn lsm2_fields_follow_the_id_rule() {
     assert_eq!(p.power_hard_limit_w, [50.0, 8.0, 3.0, 2.0]);
     assert_eq!((p.low_rail_idle_power_w, p.low_rail_power_ratio, p.other_power_features), (0.02, 1.2, 0));
     let x = &p.ch[1];
-    assert_eq!((x.source, x.volts_full_scale, x.parasitic_resistance), (1, 7.0, 0.2));
+    assert_eq!((x.source, x.volts_full_scale, x.parasitic_resistance), (1, 8.414, 0.2));
     // Admittance is manager 1, displacement manager 2 (distinct synthetic Rdc/Kms).
     assert_eq!((x.rdc, x.kms, x.disp_kms), (6.0, 1510.0, 1520.0));
     assert!((x.mms_kg - 0.0003).abs() < 1e-9);
@@ -204,6 +368,8 @@ fn lsm2_refuses_what_the_payload_cannot_carry() {
         ("fastpeak", id::controller(id::C_USE_FAST_PEAK), 1.0),
         ("tuning", id::CH_TUNING + 1, 1.0),
         ("type", id::CH_SPEAKER_TYPE, 3.0),
+        // Channels at different operating points.
+        ("vfs", id::channel(2, id::CH_VOLTS_FS), 6.0),
     ] {
         let t = tuning(
             &lsm2_files(|m| {

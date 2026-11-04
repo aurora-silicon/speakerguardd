@@ -1,0 +1,18 @@
+[Unit]
+Description=Speaker protection session helper (speakerguardd v2)
+Documentation=https://github.com/aurora-silicon/speakerguardd/tree/v2
+# It links the speaker amps into the graph only while the kernel grants
+# protection, and reports the graph to the supervisor. Without it the report
+# goes stale, the supervisor releases, and the kernel's safe level applies.
+After=pipewire.service wireplumber.service
+BindsTo=pipewire.service
+
+[Service]
+# Per machine: SGV2_MACHINE=<j316|j616|j413|j700>
+EnvironmentFile=/etc/speakerguardd/speakerguardd.conf
+ExecStart=/usr/libexec/speakerguardd-session --machine ${SGV2_MACHINE}
+Restart=always
+RestartSec=1s
+
+[Install]
+WantedBy=pipewire.service

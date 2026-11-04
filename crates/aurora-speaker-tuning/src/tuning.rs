@@ -143,6 +143,14 @@ pub struct Tuning {
     pub acoustic_id: u32,
     pub macos_build: Option<String>,
     pub verified: bool,
+    /// The machine's speaker-assembly ID the selection used, and where it
+    /// came from (`override`, `manifest`, `device-tree`), if known.
+    pub speaker_id: Option<u32>,
+    pub speaker_id_source: Option<&'static str>,
+    /// Every error-severity finding of [`Tuning::load`].  These make the
+    /// tuning unsafe to run: [`crate::compile::compile`] refuses a tuning
+    /// that has any.
+    pub refusals: Vec<crate::error::Diagnostic>,
     pub selection: Selection,
     pub graph_name: Option<String>,
     /// Boxes in processing order.
@@ -153,9 +161,32 @@ pub struct Tuning {
     pub graph: Graph,
 }
 
+#[derive(Clone, Debug, Default)]
 pub struct Options {
-    /// The machine's speaker ID (`spid`), if known.
+    /// An explicit speaker ID (`spid`): a test or development override.
+    /// It wins over every other source.
     pub speaker_id: Option<i128>,
+    /// The speaker ID the loader exported into the device tree
+    /// ([`crate::machine::speaker_id`]), used when the manifest has none.
+    pub device_tree_speaker_id: Option<u32>,
+}
+
+/// The speaker ID for selection: the override, then the manifest, then the
+/// device tree.  The manifest and the device tree must agree when both
+/// give one.
+fn resolve_speaker_id(b: &Bundle, opts: &Options) -> Result<(Option<i128>, Option<&'static str>)> {
+    if let Some(v) = opts.speaker_id {
+        return Ok((Some(v), Some("override")));
+    }
+    match (b.manifest.speaker_id, opts.device_tree_speaker_id) {
+        (Some(m), Some(d)) if m != d => Err(Error::format(
+            "bundle",
+            format!("the manifest's speaker ID {m} differs from the device tree's {d}: the bundle is not this Mac's"),
+        )),
+        (Some(m), _) => Ok((Some(m.into()), Some("manifest"))),
+        (None, Some(d)) => Ok((Some(d.into()), Some("device-tree"))),
+        (None, None) => Ok((None, None)),
+    }
 }
 
 fn need<'a>(b: &'a Bundle, path: &str, what: &str) -> Result<&'a [u8]> {
@@ -183,6 +214,14 @@ impl Tuning {
     /// Loads everything; returns the tuning and the validation findings.
     /// An `Err` means the bundle cannot describe a protection chain at all.
     pub fn load(b: &Bundle, opts: &Options, diags: &mut Diagnostics) -> Result<Tuning> {
+        let first = diags.items.len();
+        let mut t = Self::load_inner(b, opts, diags)?;
+        t.refusals =
+            diags.items[first..].iter().filter(|d| d.severity == crate::error::Severity::Error).cloned().collect();
+        Ok(t)
+    }
+
+    fn load_inner(b: &Bundle, opts: &Options, diags: &mut Diagnostics) -> Result<Tuning> {
         if !b.verified {
             diags.warn("bundle-unverified", "bundle", "read in place without a manifest (development only)");
         }
@@ -190,7 +229,8 @@ impl Tuning {
             diags.warn("bundle-unlisted", u, "present in the archive but not in the manifest; ignored");
         }
         versions::check(b.manifest.macos_build.as_deref(), diags);
-        let sel = select::speaker_chain(b, opts.speaker_id, diags)?;
+        let (speaker_id, speaker_id_source) = resolve_speaker_id(b, opts)?;
+        let sel = select::speaker_chain(b, speaker_id, diags)?;
 
         let gtext = std::str::from_utf8(need(b, &sel.graph, "graph")?)
             .map_err(|_| Error::format(&sel.graph, "graph is not UTF-8 text"))?;
@@ -415,7 +455,7 @@ impl Tuning {
             diags.info(
                 "spts-binding",
                 crate::manifest::SPTS_NAME,
-                "records bind to channels through SpeakerInputDataSourceOrder (property 64005), supplied at runtime",
+                "records bind to channels through SpeakerInputDataSourceOrder (property 64005): the strip's, or the default order",
             );
         }
 
@@ -424,6 +464,9 @@ impl Tuning {
             acoustic_id: b.manifest.acoustic_id,
             macos_build: b.manifest.macos_build.clone(),
             verified: b.verified,
+            speaker_id: speaker_id.and_then(|v| u32::try_from(v).ok()),
+            speaker_id_source,
+            refusals: Vec::new(),
             graph_name: graph.name.clone(),
             selection: sel,
             chain,
