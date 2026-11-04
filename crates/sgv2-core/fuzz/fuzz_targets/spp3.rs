@@ -36,7 +36,7 @@ fn run(u: &mut Unstructured) -> Result<()> {
     // only: the corrected limit is internal)
     let f = sgv2_core::spp3::THERMAL_FRAMES;
     let mut ua = Unit::new(p);
-    let mut oracle = (real && !closed).then(|| Spp3HardOracle::new(&p));
+    let mut oracle = (real && !closed && p.thermal_safe_tlim_time_min >= 1e3).then(|| Spp3HardOracle::new(&p));
     let mut last = 0;
     let a = render(&mut ua, &x, &sense, &[f], &[], &mut |d, t, o| {
         if let Some(or) = oracle.as_mut() {

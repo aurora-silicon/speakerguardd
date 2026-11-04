@@ -413,6 +413,10 @@ pub fn spp3_base(n: usize, block: u32, rate: u32, cl: bool) -> sgv2_core::spp3::
         thermal_gain_release_time_s: 2.0,
         thermal_lookahead_delay_ms: 1.5,
         thermal_protection_enabled: 1,
+        // SafeTlim never latches within a fuzz run (the oracle models the
+        // ordinary limit)
+        thermal_safe_tlim: 120.0,
+        thermal_safe_tlim_time_min: 1e3,
         ..Params::default()
     };
     for c in 0..n {
@@ -465,11 +469,12 @@ pub fn spp3_exclusions(p: &mut sgv2_core::spp3::Params) {
         c.tlim_adj_cap = if c.tlim_adj_cap.is_nan() { 0.0 } else { c.tlim_adj_cap.abs() };
         let f = c.thermal_ff_speedup_factor;
         let shortest = if f > 0.0 && f.is_finite() { f.min(1.0) } else { 1.0 };
+        // and the 0.1 s parameter minimum (macOS's documented floor)
         if c.tau_tvc.is_finite() {
-            c.tau_tvc = c.tau_tvc.max(dt / shortest);
+            c.tau_tvc = c.tau_tvc.max(dt / shortest).max(0.1);
         }
         if c.tau_tmg.is_finite() {
-            c.tau_tmg = c.tau_tmg.max(dt);
+            c.tau_tmg = c.tau_tmg.max(dt).max(0.1);
         }
     }
 }
@@ -582,41 +587,61 @@ pub fn block(u: &mut Unstructured) -> Result<u32> {
 // ---------------------------------------------------------------------------
 // The spp3 hard-path oracle (the same as in tests/adversarial.rs).
 
-/// The spp3 hard-path oracle; see `HardOracle` in `tests/adversarial.rs`.
+/// The spp3 controller oracle; see `HardOracle` in `tests/adversarial.rs`.
 pub struct Spp3HardOracle {
     amb: f64,
     k_dez: f64,
+    k_attack: f64,
+    k_release: f64,
+    hold_n: u32,
     ch: Vec<OracleChan>,
-    /// Per group: the largest allowed target and the dezipper stages it drives.
+    /// Per group: smoothed gain, selected target, the dezipper stages.
+    g: Vec<f64>,
+    sel: Vec<f64>,
     allowed: Vec<f64>,
     z1: Vec<f64>,
     z2: Vec<f64>,
+    /// The exact model is still in step with the unit.
+    exact: bool,
     /// Updates at which some channel was certainly armed.
     pub armed_updates: usize,
+    /// Updates checked exactly.
+    pub exact_updates: usize,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum HoldState {
+    Attack,
+    Holding,
+    Released,
 }
 
 struct OracleChan {
     src: usize,
     group: usize,
     elec: f64,
-    /// Virtual-coil filter `(a, b)`, `None` with the feed-forward off.
-    ff: Option<(f64, f64)>,
+    ff_on: bool,
+    a: f64,
+    b: f64,
     theta_ff: f64,
     p_prev: f64,
-    hist: std::collections::VecDeque<f32>,
-    look: usize,
     limit: f64,
     hard_on: f64,
     headroom: f32,
     armed: Option<bool>,
+    hold: (HoldState, u32, f64, f64),
 }
+
+const ORACLE_CLAMP: f32 = 1.5;
 
 impl Spp3HardOracle {
     pub fn new(p: &sgv2_core::spp3::Params) -> Self {
         let n = p.channels as usize;
         let rate = p.sample_rate as f64;
         let dt = sgv2_core::spp3::THERMAL_FRAMES as f64 / rate;
-        let look = (p.thermal_lookahead_delay_ms as f64 * 1e-3 * rate).round() as usize;
+        let r = rate / sgv2_core::spp3::THERMAL_FRAMES as f64;
+        let amb = p.thermal_ambient_temp as f64;
+        let cold = p.thermal_state_override == sgv2_core::spp3::THERMAL_STATE_COLD;
         let mut ids: Vec<u32> = Vec::new();
         let ch = p.ch[..n]
             .iter()
@@ -627,44 +652,92 @@ impl Spp3HardOracle {
                 });
                 let (reb, series, ag) = (c.reb_ref as f64, (c.rshunt + c.rampout) as f64, c.ag as f64);
                 let f = c.thermal_ff_speedup_factor as f64;
-                let tau = f * c.tau_tvc as f64;
+                let ff_on = f > 0.0;
+                let tau = if ff_on { f * c.tau_tvc as f64 } else { c.tau_tvc as f64 };
+                let (tvc, tmg) = (c.t_sett_vc as f64, c.t_sett_mg as f64);
+                let seed = if cold { 0.0 } else { (c.temperature_limit as f64 - amb) / (tvc + tmg) * tvc };
                 OracleChan {
                     src: c.source as usize,
                     group,
                     elec: ag * ag * reb / ((reb + series) * (reb + series)),
-                    ff: (f > 0.0).then(|| (1.0 - dt / tau, 0.5 * c.t_sett_vc as f64 * dt / tau)),
-                    theta_ff: 0.0,
+                    ff_on,
+                    a: 1.0 - dt / tau,
+                    b: 0.5 * tvc * dt / tau,
+                    theta_ff: seed,
                     p_prev: 0.0,
-                    hist: std::collections::VecDeque::from(vec![0.0; look]),
-                    look,
                     limit: c.temperature_limit as f64,
                     hard_on: c.temperature_limit as f64 + c.hard_temp_limit_headroom as f64,
+                    // pilot amplitude capped at 0.3 (rig law 4)
                     headroom: if c.pilot_tone_enabled != 0 {
-                        (1.0 - 10f64.powf(c.pilot_ampl_hi_db as f64 / 20.0)) as f32
+                        1.0 - (10f64.powf(c.pilot_ampl_hi_db as f64 / 20.0) as f32).min(0.3)
                     } else {
                         1.0
                     },
                     armed: Some(false),
+                    hold: (HoldState::Attack, 0, 1.0, 1.0),
                 }
             })
             .collect();
         let g = ids.len();
+        let settle = |s: f64, rate: f64| 1.0 - (0.01f64.ln() / (s * rate)).exp();
         Spp3HardOracle {
-            amb: p.thermal_ambient_temp as f64,
-            k_dez: 1.0 - (0.01f64.ln() / (0.005 * rate)).exp(),
+            amb,
+            k_dez: settle(0.005, rate),
+            k_attack: settle(p.thermal_gain_attack_time_s as f64, r),
+            k_release: settle(p.thermal_gain_release_time_s as f64, r),
+            hold_n: (1.0 * r).ceil() as u32,
             ch,
+            g: vec![1.0; g],
+            sel: vec![1.0; g],
             allowed: vec![1.0; g],
             z1: vec![1.0; g],
             z2: vec![1.0; g],
+            exact: true,
             armed_updates: 0,
+            exact_updates: 0,
         }
+    }
+
+    /// The release hold (rig law 5). Returns the candidate and whether the
+    /// comparison was within rounding.
+    fn hold(h: &mut (HoldState, u32, f64, f64), g: f64, sel_prev: f64, n: u32) -> (f64, bool) {
+        // a comparison within rounding, unless both sides are exact (the
+        // candidate clamped at unity or at the floor, against the same)
+        let exact_sides = (g == 1.0 || g == 0.01) && g == sel_prev;
+        let tie = !exact_sides && (g - sel_prev).abs() <= 1e-6 * sel_prev.abs().max(1e-3);
+        let ge = g >= sel_prev;
+        let (state, cnt, held, u_prev) = h;
+        let u = if *cnt > 0 && ge {
+            *cnt -= 1;
+            if *cnt == 0 {
+                *state = HoldState::Released;
+            }
+            *held
+        } else {
+            *cnt = 0;
+            if ge {
+                if *state == HoldState::Attack {
+                    *held = *u_prev;
+                    *cnt = n.saturating_sub(1);
+                    *state = if *cnt == 0 { HoldState::Released } else { HoldState::Holding };
+                    *held
+                } else {
+                    g
+                }
+            } else {
+                *state = HoldState::Attack;
+                g
+            }
+        };
+        *u_prev = u;
+        (u, tie)
     }
 
     /// One thermal update: `x` and `out` are the update's 256 frames per host
     /// channel, `t` the telemetry after it.
     pub fn step(&mut self, x: &[&[f32]], out: &[&[f32]], t: &Telemetry) {
         let frames = x[0].len();
-        // the audio of this update follows the targets allowed at the last one
+        // the audio of this update follows the target set at the last one
         for k in 0..frames {
             for g in 0..self.allowed.len() {
                 self.z1[g] += self.k_dez * (self.allowed[g] - self.z1[g]);
@@ -675,90 +748,135 @@ impl Spp3HardOracle {
                 if !i.is_finite() {
                     continue; // check_bound: it leaves as 0
                 }
-                // two f32 roundings (gain, headroom), which on a subnormal input
-                // are absolute: allow two subnormal steps
-                let bound = (i.abs() as f64) * (self.z2[c.group] * c.headroom as f64 * (1.0 + 1e-4) + 1e-6)
+                let drive = i.clamp(-ORACLE_CLAMP, ORACLE_CLAMP).abs() as f64;
+                // two f32 roundings, absolute on a subnormal input
+                let bound = (drive * (self.z2[c.group] * c.headroom as f64 * (1.0 + 1e-4) + 1e-6)).min(1.0)
                     + 2.0 * f32::from_bits(1) as f64;
                 let o = out[c.src][k].abs() as f64;
                 assert!(
                     o <= bound,
-                    "hard path: ch{} sample {k} of the update leaves at {:.6} of its input, allowed {:.6}",
+                    "spp3 controller: ch{} sample {k} of the update leaves at {o:e} for input {i:e}, allowed {:.6} x",
                     c.src,
-                    o / i.abs() as f64,
                     self.z2[c.group] * c.headroom as f64
                 );
             }
         }
-        // the virtual coil, on the unprotected drive through the alignment
-        // history
+        // the feed-forward node, on this update's own unprotected frames
         for c in self.ch.iter_mut() {
-            let mut acc = 0.0f64;
-            for &v in x[c.src] {
-                c.hist.push_back(v);
-                let d = if c.look == 0 { c.hist.pop_back().unwrap() } else { c.hist.pop_front().unwrap() };
-                // the program is held to full scale before the meters
-                let d = if d.is_finite() { d.clamp(-1.0, 1.0) as f64 } else { 0.0 };
-                acc += d * d;
-            }
+            let acc: f64 = x[c.src]
+                .iter()
+                .map(|&v| if v.is_finite() { v.clamp(-ORACLE_CLAMP, ORACLE_CLAMP) as f64 } else { 0.0 })
+                .map(|v| v * v)
+                .sum();
             let p = c.elec * acc / frames as f64;
-            if let Some((a, b)) = c.ff {
-                c.theta_ff = a * c.theta_ff + b * (p + c.p_prev);
-            }
+            c.theta_ff = c.a * c.theta_ff + c.b * (p + c.p_prev);
             c.p_prev = p;
         }
-        // arming, from the published temperatures
-        self.allowed.iter_mut().for_each(|a| *a = 1.0);
+        // candidates, hold, arming, from the published temperatures
+        let ng = self.g.len();
+        let mut ff_t = vec![1.0f64; ng];
+        let mut hard_t = vec![1.0f64; ng];
+        let mut hard_bound = vec![1.0f64; ng];
+        let mut certain = true;
         let mut any = false;
+        let ratio = |num: f64, vcff: f64| (num / (vcff + 1.0)).clamp(1e-4, 1.0).sqrt();
         for c in self.ch.iter_mut() {
             let s = &t.channels[c.src];
             let (t_ol, mag) = (s.coil_temp_c as f64, s.magnet_temp_c as f64);
             if !(t_ol.is_finite() && mag.is_finite()) {
                 c.armed = None;
+                certain = false;
                 continue;
             }
             let tol = 1e-4 * t_ol.abs().max(1.0);
-            let prev = c.armed;
-            c.armed = if t_ol > c.hard_on + tol {
-                Some(true)
-            } else if t_ol < c.hard_on - tol {
-                if t_ol < c.limit - tol {
+            // the unit: arm above `hard_on`, else disarm below `limit`, else
+            // keep; a comparison within rounding takes both branches
+            let cmp = |a: f64, b: f64| {
+                if a > b + tol {
+                    Some(true)
+                } else if a < b - tol {
                     Some(false)
-                } else if t_ol > c.limit + tol {
-                    prev
                 } else {
                     None
                 }
-            } else {
-                None
             };
-            if c.armed != Some(true) {
-                continue;
-            }
-            any = true;
-            // without the feed-forward there is no virtual coil: the hard
-            // path holds the fixed 20 dB
-            if c.ff.is_none() {
-                self.allowed[c.group] = self.allowed[c.group].min(FAILSAFE_GAIN as f64);
-                continue;
-            }
+            let keep_or_disarm = |prev: Option<bool>| match cmp(t_ol, c.limit) {
+                // above the limit: keep; below: disarm
+                Some(true) => prev,
+                Some(false) => Some(false),
+                None => (prev == Some(false)).then_some(false),
+            };
+            let prev = c.armed;
+            c.armed = match cmp(t_ol, c.hard_on) {
+                Some(true) => Some(true),
+                Some(false) => keep_or_disarm(prev),
+                None => (keep_or_disarm(prev) == Some(true)).then_some(true),
+            };
             let theta_mg = mag - self.amb;
-            let vcff = c.theta_ff * (1.0 - 1e-4) - 1e-6;
-            if vcff + 1.0 <= 0.0 {
-                continue;
+            let num = c.limit - self.amb - theta_mg;
+            let fresh = if c.ff_on { ratio(num, c.theta_ff) } else { 1.0 };
+            let (g_ff, tie) = Self::hold(&mut c.hold, fresh, self.g[c.group], self.hold_n);
+            if tie {
+                certain = false;
             }
-            let num = c.limit - 5.0 - self.amb - theta_mg + 1e-4 * (c.limit.abs() + mag.abs() + 1.0);
-            // ratio floor 1e-4: a 0.01 (-40 dB) gain floor
-            let g_hard = (num / (vcff + 1.0)).clamp(1e-4, 1.0).sqrt();
-            self.allowed[c.group] = self.allowed[c.group].min(g_hard);
+            ff_t[c.group] = ff_t[c.group].min(g_ff);
+            match c.armed {
+                Some(true) => {
+                    any = true;
+                    let g_hard = if c.ff_on { ratio(num - 5.0, c.theta_ff) } else { FAILSAFE_GAIN as f64 };
+                    hard_t[c.group] = hard_t[c.group].min(g_hard);
+                    // the bound: generous in theta_mg and theta_ff rounding
+                    let slack = 1e-4 * (c.limit.abs() + mag.abs() + 1.0);
+                    let gb = if c.ff_on {
+                        ratio(num - 5.0 + slack, c.theta_ff * (1.0 - 1e-4) - 1e-6)
+                    } else {
+                        FAILSAFE_GAIN as f64
+                    };
+                    hard_bound[c.group] = hard_bound[c.group].min(gb);
+                }
+                Some(false) => {}
+                None => certain = false,
+            }
         }
         if any {
             self.armed_updates += 1;
         }
-        // the unit's own selected target never exceeds what is allowed
+        if !certain {
+            self.exact = false;
+        }
+        for gi in 0..ng {
+            let tg = ff_t[gi];
+            let k = if tg < self.g[gi] { self.k_attack } else { self.k_release };
+            let g = self.g[gi] + k * (tg - self.g[gi]);
+            self.sel[gi] = g.min(hard_t[gi]);
+            self.g[gi] = self.sel[gi];
+        }
+        // the checks, then the targets the next update's audio may follow
         for c in &self.ch {
             let sel = t.channels[c.src].axis_gain[4] as f64;
-            let a = self.allowed[c.group];
-            assert!(sel <= a * (1.0 + 1e-4) + 1e-6, "hard path: group target {sel} above the hard target {a}");
+            let hb = hard_bound[c.group];
+            assert!(sel <= hb * (1.0 + 1e-4) + 1e-6, "spp3 hard path: group target {sel} above the hard target {hb}");
+            if self.exact {
+                let want = self.sel[c.group];
+                assert!(
+                    (sel - want).abs() <= 1e-3 * want + 1e-6,
+                    "spp3 controller: group target {sel}, the specified laws give {want} (update {})",
+                    self.exact_updates
+                );
+            }
+        }
+        if self.exact {
+            self.exact_updates += 1;
+        }
+        for ((a, &sel), &hb) in self.allowed.iter_mut().zip(&self.sel).zip(&hard_bound) {
+            *a = if self.exact { sel * (1.0 + 1e-3) + 1e-6 } else { hb };
+        }
+        if !self.exact {
+            // the smoother and hold states are no longer known: resynchronise
+            // them on the unit's published target (still bounded above)
+            for c in &self.ch {
+                self.g[c.group] = t.channels[c.src].axis_gain[4] as f64;
+            }
         }
     }
 }
