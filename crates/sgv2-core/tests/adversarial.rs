@@ -916,7 +916,8 @@ fn check_hard_path(
 /// - the 1 s release hold of the candidate against the previous selected
 ///   gain, the 99 % attack/release smoother from the selected minimum, the
 ///   group minimum with the hard target;
-/// - the two cascaded 5 ms dezippers, per sample, continuous across calls.
+/// - the two cascaded 5 ms dezippers, per sample, both stages starting each
+///   render call at the selected target (rig dezipper law).
 ///
 /// From the telemetry it takes `T_OL` and the magnet (they depend on the
 /// protected drive, which the unit meters itself), and decides arming with
@@ -1043,10 +1044,11 @@ impl HardOracle {
     /// The release hold (rig law 5). Returns the candidate and whether the
     /// comparison was within rounding.
     fn hold(h: &mut (HoldState, u32, f64, f64), g: f64, sel_prev: f64, n: u32) -> (f64, bool) {
-        // a comparison within rounding, unless both sides are exact (the
-        // candidate clamped at unity or at the floor, against the same)
+        // a comparison within what the published temperatures resolve (the
+        // candidate rests on the f32 magnet temperature), unless both sides
+        // are exact (the candidate clamped at unity or at the floor)
         let exact_sides = (g == 1.0 || g == 0.01) && g == sel_prev;
-        let tie = !exact_sides && (g - sel_prev).abs() <= 1e-6 * sel_prev.abs().max(1e-3);
+        let tie = !exact_sides && (g - sel_prev).abs() <= 1e-3 * sel_prev.abs().max(1e-3);
         let ge = g >= sel_prev;
         let (state, cnt, held, u_prev) = h;
         let u = if *cnt > 0 && ge {
@@ -1079,7 +1081,13 @@ impl HardOracle {
     /// channel, `t` the telemetry after it.
     fn step(&mut self, x: &[&[f32]], out: &[&[f32]], t: &Telemetry) {
         let frames = x[0].len();
-        // the audio of this update follows the target set at the last one
+        // each render call (one per update here) starts both dezipper stages
+        // at the selected target (rig dezipper law); the audio of this update
+        // then glides toward the target set at the last one
+        for g in 0..self.allowed.len() {
+            self.z1[g] = self.allowed[g];
+            self.z2[g] = self.allowed[g];
+        }
         for k in 0..frames {
             for g in 0..self.allowed.len() {
                 self.z1[g] += self.k_dez * (self.allowed[g] - self.z1[g]);
@@ -1224,8 +1232,9 @@ impl HardOracle {
 }
 
 /// Render `x` through spp3 one thermal update per call under the oracle.
-/// Returns (updates certainly armed, updates checked exactly, telemetry).
-fn spp3_hard_render(p: &spp3::Params, x: &[Vec<f32>]) -> (usize, usize, Telemetry) {
+/// Returns (updates certainly armed, updates checked exactly, telemetry,
+/// per host channel the peak `T_OL` over the last third of the run).
+fn spp3_hard_render(p: &spp3::Params, x: &[Vec<f32>]) -> (usize, usize, Telemetry, Vec<f32>) {
     let mut u = spp3::Unit::new(*p);
     assert!(!u.is_failsafe());
     let mut o = HardOracle::new(p);
@@ -1233,6 +1242,7 @@ fn spp3_hard_render(p: &spp3::Params, x: &[Vec<f32>]) -> (usize, usize, Telemetr
     let f = spp3::THERMAL_FRAMES;
     let mut out = vec![vec![0.0f32; f]; n];
     let mut t = Telemetry::new();
+    let mut peak = vec![f32::MIN; n];
     let mut done = 0;
     while done + f <= x[0].len() {
         let ins: Vec<&[f32]> = x.iter().map(|b| &b[done..done + f]).collect();
@@ -1245,8 +1255,13 @@ fn spp3_hard_render(p: &spp3::Params, x: &[Vec<f32>]) -> (usize, usize, Telemetr
         let outs: Vec<&[f32]> = out.iter().map(|b| &b[..]).collect();
         o.step(&ins, &outs, &t);
         done += f;
+        if 3 * done >= 2 * x[0].len() {
+            for (pk, s) in peak.iter_mut().zip(&t.channels) {
+                *pk = pk.max(s.coil_temp_c);
+            }
+        }
     }
-    (o.armed_updates, o.exact_updates, t)
+    (o.armed_updates, o.exact_updates, t, peak)
 }
 
 /// `n` channels of a constant sine for `secs`.
@@ -1285,7 +1300,7 @@ proptest! {
         p.thermal_safe_tlim_time_min = 1e3;
         let len = (secs * rate as f64) as usize;
         let x = signal(seed ^ 1, n, len, amp, h);
-        spp3_hard_render(&p, &x);
+        let _ = spp3_hard_render(&p, &x);
     }
 
     #[test]
@@ -1370,51 +1385,47 @@ proptest! {
 }
 
 proptest! {
-    // 30 s of audio per case: few cases by default
-    #![proptest_config(cfg(8))]
+    // 60 s of audio per case: few cases by default
+    #![proptest_config(cfg(4))]
 
-    /// OBSERVATION 15 (lane B): with the feed-forward on, constant drive
-    /// does not always settle at or below the hard limit. It can limit-cycle
-    /// through the hard path instead (arm above `Tlim + headroom`, release
-    /// from the hard target once below `Tlim`, overshoot again), peaking
-    /// above the hard limit. Repros on 660f33d at `PROPTEST_CASES=4000`:
-    /// `seed = 2037991125700493766, n = 4, amp = 1.122032, f = 1012.14`
-    /// (104.3 C against 101.9 C, in the regime below), and, without the
-    /// magnet/release constraints below, a 4 s cycle peaking at 90.4 C
-    /// against 85.5 C (coil and magnet tau 21/22 ms, attack 1.87 s, release
-    /// 45 ms). Whether this matches macOS is for the rig; ignored until then.
+    /// Finding 15, in the physical regime: with the feed-forward on and
+    /// every thermal time constant at or above the documented 0.1 s minimum
+    /// (now the load-time floor), a magnet at least ten times slower than
+    /// the coil, release no faster than attack and a nonnegative headroom,
+    /// sustained drive never takes the modelled coil above the hard limit
+    /// (+0.5 C) over the last third of a 60 s run, cold or hot start,
+    /// unless the gain sits at the 0.01 candidate floor. The controller laws
+    /// are checked along the way by [`HardOracle`]. Outside this regime (16-
+    /// 21 ms coils) the reference itself limit-cycles above the limit, and
+    /// the engine now refuses those tunings.
     #[test]
-    #[ignore = "OBSERVATION 15 (lane B): constant drive can limit-cycle above the hard limit"]
     fn spp3_feed_forward_settles_below_the_hard_limit(
         seed in any::<u64>(), n in 1usize..=4, amp in 0.3f32..3.0, f in 50.0f64..3000.0,
+        tvc in 0.1f32..2.0, mg_ratio in 10.0f32..30.0, cold in any::<bool>(),
     ) {
         let rate = 48_000u32;
         let mut p = spp3_params(seed, n, 512, rate, Ff::On, true);
-        for c in 0..n {
-            p.ch[c].tau_tvc = p.ch[c].tau_tvc.min(0.5);
-            p.ch[c].tau_tmg = p.ch[c].tau_tmg.min(3.0);
-            p.ch[c].cal_present = 0;
-            // a negative headroom arms the hard path below the limit the
-            // feed-forward settles at: a limit cycle by design
-            p.ch[c].hard_temp_limit_headroom = p.ch[c].hard_temp_limit_headroom.abs();
-            // a magnet at least ten times slower than the coil, as speakers
-            // have: with comparable constants and a release much shorter
-            // than the attack, constant drive limit-cycles through the hard
-            // path (reported to lane B as an observation, not pinned here)
-            p.ch[c].tau_tmg = p.ch[c].tau_tmg.max(10.0 * p.ch[c].tau_tvc);
+        for (k, c) in p.ch[..n].iter_mut().enumerate() {
+            // spread the channels around the drawn coil constant
+            c.tau_tvc = tvc * (1.0 + 0.3 * k as f32);
+            c.tau_tmg = (c.tau_tvc * mg_ratio).min(15.0).max(10.0 * c.tau_tvc);
+            c.cal_present = 0;
+            c.hard_temp_limit_headroom = c.hard_temp_limit_headroom.abs();
         }
         stable_spp3(&mut p);
-        p.thermal_gain_attack_time_s = p.thermal_gain_attack_time_s.min(2.0);
-        p.thermal_gain_release_time_s = p.thermal_gain_release_time_s.min(5.0);
         p.thermal_gain_release_time_s = p.thermal_gain_release_time_s.max(p.thermal_gain_attack_time_s);
-        let x = sine_drive(n, 30.0, rate, amp, f);
-        let (_, _, t) = spp3_hard_render(&p, &x);
+        p.thermal_state_override = if cold { spp3::THERMAL_STATE_COLD } else { 0 };
+        p.thermal_safe_tlim_time_min = 1e3;
+        let x = sine_drive(n, 60.0, rate, amp, f);
+        let (_, _, t, peak) = spp3_hard_render(&p, &x);
         for c in &p.ch[..n] {
             let s = &t.channels[c.source as usize];
             let hard_on = c.temperature_limit + c.hard_temp_limit_headroom;
+            let pk = peak[c.source as usize];
             prop_assert!(
-                s.coil_temp_c <= hard_on + 0.5 || s.axis_gain[4] <= 0.01 + 1e-4,
-                "coil settles at {} C, hard limit {} C, gain {}", s.coil_temp_c, hard_on, s.gain
+                pk <= hard_on + 0.5 || s.axis_gain[4] <= 0.01 + 1e-4,
+                "coil peaks at {} C over the last 20 s, hard limit {} C, limit {} C, gain {}; params {:?}",
+                pk, hard_on, c.temperature_limit, s.gain, p
             );
         }
     }
@@ -1668,7 +1679,7 @@ fn hard_path_anchors_are_reached() {
         p.thermal_state_override = if seed % 4 < 2 { spp3::THERMAL_STATE_COLD } else { 0 };
         p.thermal_safe_tlim_time_min = 1e3;
         let x = signal(seed, n, 48_000 * 4, 2.0, Hostility::Clean);
-        let (a, e, _) = spp3_hard_render(&p, &x);
+        let (a, e, _, _) = spp3_hard_render(&p, &x);
         armed += a;
         exact += e;
     }

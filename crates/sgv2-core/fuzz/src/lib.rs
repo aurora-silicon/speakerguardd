@@ -701,10 +701,11 @@ impl Spp3HardOracle {
     /// The release hold (rig law 5). Returns the candidate and whether the
     /// comparison was within rounding.
     fn hold(h: &mut (HoldState, u32, f64, f64), g: f64, sel_prev: f64, n: u32) -> (f64, bool) {
-        // a comparison within rounding, unless both sides are exact (the
-        // candidate clamped at unity or at the floor, against the same)
+        // a comparison within what the published temperatures resolve (the
+        // candidate rests on the f32 magnet temperature), unless both sides
+        // are exact (the candidate clamped at unity or at the floor)
         let exact_sides = (g == 1.0 || g == 0.01) && g == sel_prev;
-        let tie = !exact_sides && (g - sel_prev).abs() <= 1e-6 * sel_prev.abs().max(1e-3);
+        let tie = !exact_sides && (g - sel_prev).abs() <= 1e-3 * sel_prev.abs().max(1e-3);
         let ge = g >= sel_prev;
         let (state, cnt, held, u_prev) = h;
         let u = if *cnt > 0 && ge {
@@ -737,7 +738,13 @@ impl Spp3HardOracle {
     /// channel, `t` the telemetry after it.
     pub fn step(&mut self, x: &[&[f32]], out: &[&[f32]], t: &Telemetry) {
         let frames = x[0].len();
-        // the audio of this update follows the target set at the last one
+        // each render call (one per update here) starts both dezipper stages
+        // at the selected target (rig dezipper law); the audio of this update
+        // then glides toward the target set at the last one
+        for g in 0..self.allowed.len() {
+            self.z1[g] = self.allowed[g];
+            self.z2[g] = self.allowed[g];
+        }
         for k in 0..frames {
             for g in 0..self.allowed.len() {
                 self.z1[g] += self.k_dez * (self.allowed[g] - self.z1[g]);
