@@ -103,6 +103,18 @@ def cases():
             ("five-entries", "spts-synth-five-entries.json")]:
         C.append(dict(name=f"spp3-cal-{suffix}", unit="spp3", signal="impulse",
                       cfprops=[f"64009={fixture}"]))
+    # SafeTlim latch oracles on shortened test sidecars (cal/spp3-sidecar-safetlim-*,
+    # Daybreak t-4646; every other value as shipped)
+    C.append(dict(name="spp3-safetlim-entry", unit="spp3", signal="safetlim_hold",
+                  plant="plant-deadI.json", sidecar_fixture="spp3-sidecar-safetlim-0.1min.plist",
+                  log_level="18"))
+    C.append(dict(name="spp3-safetlim-min-boundary", unit="spp3", signal="safetlim_boundary",
+                  plant="plant-deadI.json", sidecar_fixture="spp3-sidecar-safetlim-0.02min.plist",
+                  log_level="2"))
+    C.append(dict(name="spp3-safetlim-sense-loss-implausible-recovery", unit="spp3",
+                  signal="safetlim_faults", plant="plant-safetlim-faults-sched.json",
+                  sidecar_fixture="spp3-sidecar-safetlim-0.1min.plist",
+                  cfprops=["64009=spts-synth-nominal.json"], log_level="2"))
     # failure cases
     C.append(dict(name="spp3-nosidecar-pink_steps", unit="spp3", signal="pink_steps", sidecar=False))
     # host slice size: both units' output depends on it; the macOS graphs use 512
@@ -254,7 +266,9 @@ def run_case(c, outroot, force=False):
             "--q", str(q), "--out", os.path.join(d, "run")]
     if unit == "spp3":
         if c.get("sidecar", True):
-            args += ["--sidecar", SIDECAR[unit]]
+            sidecar = (os.path.join(RIG, "cal", c["sidecar_fixture"]) if c.get("sidecar_fixture")
+                       else SIDECAR[unit])
+            args += ["--sidecar", sidecar]
     props, paths = propstrip_props(unit)
     for pr in c.get("props", props):
         args += ["--prop", pr]
@@ -268,7 +282,8 @@ def run_case(c, outroot, force=False):
     if unit == "spp3":
         if c.get("plant"):
             args += ["--plant", os.path.join(RIG, "cal", c["plant"])]
-            env.update(RIGREDIR_FROM="/Library/Preferences/Audio/CLSPLogs", RIGPREF_clsp_logging_level="11")
+            env.update(RIGREDIR_FROM="/Library/Preferences/Audio/CLSPLogs",
+                       RIGPREF_clsp_logging_level=c.get("log_level", "11"))
     if unit == "lsm2" and c.get("logs", True):
         # small host slices outrun the unit's log writer at any pace: audio and meters only
         env.update(RIGREDIR_FROM="/Library/Preferences/Audio/lsm2", RIGPREF_LSMv2EnableLogging="1")
@@ -282,6 +297,11 @@ def run_case(c, outroot, force=False):
     expect_frames = os.path.getsize(signal) // (4 * CH[unit])
     t0 = time.time()
     pace = 50.0 if q >= 64 else 0.0
+    # spp3's CLSP log writer also drops records at full speed: pace the
+    # plant cases so every controller record is kept
+    spp3_logs = unit == "spp3" and bool(c.get("plant"))
+    if spp3_logs:
+        pace = 25.0
     # Capture only spp3's own calibration decision messages.  Starting the
     # stream before rig_host avoids relying on the process after it exits.
     logp = logf = None
@@ -297,13 +317,17 @@ def run_case(c, outroot, force=False):
         time.sleep(0.75)
     try:
         while True:
-            a2 = args + (["--pace", str(pace)] if unit == "lsm2" and c.get("logs", True) else [])
+            a2 = args + (["--pace", str(pace)] if (unit == "lsm2" and c.get("logs", True)) or spp3_logs else [])
             rc, out, err, host_pid = run_host(a2, env, d)
             open(os.path.join(d, "host.log"), "w").write(out + err)
             if rc:
                 raise RuntimeError(f"{c['name']}: rig_host rc={rc}: {err[-400:]}")
             logs = os.listdir(os.path.join(d, "logs"))
-            if not any("OVERWRITE" in f for f in logs):
+            # spp3: one 40-byte T_Coil record per 512-frame block on every channel
+            short = spp3_logs and any(
+                os.path.getsize(os.path.join(d, "logs", f)) < 40 * (expect_frames // 512)
+                for f in logs if "_T_Coil_ch" in f)
+            if not any("OVERWRITE" in f for f in logs) and not short:
                 break
             # the unit's async log writer dropped records: slow down and redo
             if pace == 0.0:
