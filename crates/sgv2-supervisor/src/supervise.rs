@@ -41,6 +41,11 @@ pub struct Supervisor {
 }
 
 impl Supervisor {
+    /// Whether the last tick left protection granted.
+    pub fn granted(&self) -> bool {
+        self.latched.is_none() && self.lease.held()
+    }
+
     pub fn latched_fault(&self) -> Option<&str> {
         self.latched.as_deref()
     }

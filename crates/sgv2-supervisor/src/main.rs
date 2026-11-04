@@ -96,6 +96,34 @@ mod linux {
         unsafe { libc::clock_nanosleep(libc::CLOCK_MONOTONIC, libc::TIMER_ABSTIME, &ts, core::ptr::null_mut()) };
     }
 
+    /// systemd notification (READY=1, WATCHDOG=1) without libsystemd.
+    struct Notify(Option<std::os::unix::net::UnixDatagram>, Option<std::path::PathBuf>, Vec<u8>);
+    impl Notify {
+        fn new() -> Self {
+            let Ok(path) = std::env::var("NOTIFY_SOCKET") else { return Notify(None, None, Vec::new()) };
+            let sock = std::os::unix::net::UnixDatagram::unbound().ok();
+            if let Some(abs) = path.strip_prefix('@') {
+                // abstract namespace: a leading NUL
+                let mut name = vec![0u8];
+                name.extend_from_slice(abs.as_bytes());
+                Notify(sock, None, name)
+            } else {
+                Notify(sock, Some(path.into()), Vec::new())
+            }
+        }
+        fn send(&self, msg: &str) {
+            let Some(s) = &self.0 else { return };
+            if let Some(p) = &self.1 {
+                let _ = s.send_to(msg.as_bytes(), p);
+            } else {
+                use std::os::linux::net::SocketAddrExt;
+                if let Ok(a) = std::os::unix::net::SocketAddr::from_abstract_name(&self.2[1..]) {
+                    let _ = s.send_to_addr(msg.as_bytes(), &a);
+                }
+            }
+        }
+    }
+
     fn arg(args: &[String], name: &str) -> Option<String> {
         args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
     }
@@ -148,13 +176,29 @@ mod linux {
                 return EX_UNAVAILABLE;
             }
         };
-        if let Ok(c) = std::ffi::CString::new(page_str) {
-            // SAFETY: a path we created; hand it to the session user.
-            unsafe {
-                libc::chown(c.as_ptr(), uid, u32::MAX);
-                libc::chmod(c.as_ptr(), 0o600);
+        // the session helper's report: created empty here (the directory is
+        // root's), so the user's helper can only rewrite it in place
+        let session_path = user_dir.join("session");
+        if let Err(e) = std::fs::write(&session_path, b"") {
+            eprintln!("session file: {e}");
+            return EX_UNAVAILABLE;
+        }
+        for path in [page_str.clone(), session_path.to_string_lossy().into_owned()] {
+            if let Ok(c) = std::ffi::CString::new(path) {
+                // SAFETY: paths we created; hand them to the session user.
+                unsafe {
+                    libc::chown(c.as_ptr(), uid, u32::MAX);
+                    libc::chmod(c.as_ptr(), 0o600);
+                }
             }
         }
+        let granted_path = run_dir.join("granted");
+        let granted_tmp = run_dir.join(".granted.new");
+        let write_granted = |on: bool| {
+            let _ = std::fs::write(&granted_tmp, format!("{} {}\n", on as u8, now_ns()));
+            let _ = std::fs::rename(&granted_tmp, &granted_path);
+        };
+        write_granted(false);
         let mut kernel = match Macaudio::open(card) {
             Ok(k) => k,
             Err(KernelError::NoCard) => {
@@ -183,9 +227,15 @@ mod linux {
         let mut observer = Observer::new(crc, stale_ns(512, 48_000, TICK_NS));
         let mut sup = Supervisor::default();
         let mut deadline = now_ns();
+        let notify = Notify::new();
+        let mut ticks = 0u64;
         loop {
             let obs = observer.observe(now_ns(), &mut engine, &mut proc_, &mut session);
-            match sup.tick(obs, &mut kernel) {
+            let event = sup.tick(obs, &mut kernel);
+            // "1 <mono_ns>" while granted, rewritten every tick; readers treat
+            // a file older than 100 ms as 0
+            write_granted(sup.granted());
+            match event {
                 Ok(Event::Granted) => eprintln!("protection granted"),
                 Ok(Event::Released { why }) => eprintln!("protection released: {why:?}"),
                 Ok(Event::HardFault(f)) => eprintln!("amp fault, protection withdrawn until restart: {f}"),
@@ -194,9 +244,18 @@ mod linux {
                 Err(Fatal::Kernel(e)) => {
                     eprintln!("kernel: {e:?}; exiting (the kernel floor holds)");
                     let _ = kernel.release();
+                    let _ = std::fs::remove_file(&granted_path);
                     return EX_UNAVAILABLE;
                 }
             }
+            if ticks == 0 {
+                notify.send("READY=1");
+            }
+            if ticks % 20 == 0 {
+                // every 200 ms, under the unit's WatchdogSec
+                notify.send("WATCHDOG=1");
+            }
+            ticks += 1;
             deadline += TICK_NS;
             let now = now_ns();
             if now > deadline + TICK_NS {
