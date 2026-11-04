@@ -10,10 +10,12 @@
 //! * the board: the device tree's first root `compatible` without its
 //!   `apple,` vendor (`j616s`);
 //! * the operating point: the output peak voltage at digital full scale,
-//!   in millivolts.  The machine description below gives the amp and the
-//!   analog gain the kernel fixes ("Amp Gain Volume", `cfg->amp_gain`;
-//!   KERNEL.md 2.3); [`Description::full_scale_mv`] converts it the way the
-//!   supervisor reads the card back.
+//!   in millivolts, from the tuning (spp3 `ag`, lsm2 `VoltsFullScale`).
+//!   The machine description below gives the amp and the analog gain the
+//!   kernel fixes ("Amp Gain Volume", `cfg->amp_gain`; KERNEL.md 2.3), which
+//!   the compiler uses as a cross-check: [`Description::full_scale_mv`]
+//!   converts the gain's dBV (rms-referenced) to peak volts (Daybreak
+//!   t-4662).
 //!
 //! The speaker-assembly ID (`spid`): macOS publishes it as the IORegistry
 //! `speakerID` of the built-in speaker, read from two board straps (AP
@@ -64,7 +66,8 @@ pub const MACHINES: &[Description] = &[
     sn("j616s", 6, 15),
     sn("j616c", 6, 15),
     sn("j413", 4, 15),
-    // KERNEL.md 1.1: about 7.3 V peak at full scale.  TODO(SPEC): measured.
+    // No gain control: 7.30 V peak at full scale (AID44 VoltsFullScale,
+    // Daybreak t-4662).
     Description { board: "j700", amps: 2, amp: Amp::Fixed { full_scale_mv: 7_300 } },
 ];
 
@@ -81,14 +84,14 @@ impl Description {
         }
     }
 
-    /// The output peak voltage at digital full scale, mV, as the supervisor
-    /// derives it from the amp's gain (`sgv2-supervisor` `full_scale_mv`:
-    /// the TLV's dBV read as a peak).
+    /// The output peak voltage at digital full scale, mV.  The gain's TLV
+    /// is dBV relative to 1 V rms, so the peak is `sqrt(2) 10^(dB/20)`
+    /// (Daybreak t-4662: 18.5 dBV is 11.899 V peak).
     pub fn full_scale_mv(&self) -> u32 {
         match self.amp {
             Amp::Sn012776 { .. } => {
                 let db = f64::from(self.amp_gain_centi_db().unwrap()) / 100.0;
-                (1000.0 * 10f64.powf(db / 20.0)).round() as u32
+                (1000.0 * std::f64::consts::SQRT_2 * 10f64.powf(db / 20.0)).round() as u32
             }
             Amp::Fixed { full_scale_mv } => full_scale_mv,
         }
@@ -173,10 +176,10 @@ mod tests {
 
     #[test]
     fn operating_points() {
-        // J616s: gain 15 = 18.5 dB, 8.41 V peak, as the supervisor reads it.
+        // J616s: gain 15 = 18.5 dBV = 8.414 V rms = 11.899 V peak.
         let j = lookup("j616s").unwrap();
         assert_eq!(j.amp_gain_centi_db(), Some(1850));
-        assert_eq!(j.full_scale_mv(), 8414);
+        assert_eq!(j.full_scale_mv(), 11899);
         assert_eq!(lookup("j700").unwrap().full_scale_mv(), 7300);
         assert!(lookup("j274").is_none());
         for m in MACHINES {

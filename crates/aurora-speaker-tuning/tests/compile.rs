@@ -64,8 +64,8 @@ fn spp3_fields_come_from_the_sidecar_and_state() {
     assert_eq!((c.unit, c.channels, c.sense_channels, c.sample_rate), (UnitKind::Spp3, 4, 8, 48000));
     // The header names the board and the machine's operating point.
     let (h, _) = sgv2_core::blob::Header::parse(&c.blob).unwrap();
-    assert_eq!((h.machine(), h.full_scale_mv), (Some("j413"), 8414));
-    assert_eq!((c.board.as_str(), c.full_scale_mv), ("j413", 8414));
+    assert_eq!((h.machine(), h.full_scale_mv), (Some("j413"), 11890));
+    assert_eq!((c.board.as_str(), c.full_scale_mv), ("j413", 11890));
     let p = sgv2_core::spp3::Params::from_blob(&c.blob).unwrap();
     assert_eq!(p.block_frames, 256);
     assert_eq!(p.thermal_ambient_temp, 41.0);
@@ -78,7 +78,7 @@ fn spp3_fields_come_from_the_sidecar_and_state() {
         assert_eq!(x.group, (ch / 2) as u32);
         assert_eq!((x.sense_i, x.sense_v), (2 * ch as u32 + 1, 2 * ch as u32));
         assert_eq!((x.t_sett_vc, x.t_sett_mg, x.tau_tvc, x.tau_tmg), (17.0, 19.0, 2.5, 90.0));
-        assert_eq!((x.reb_ref, x.rshunt, x.ag), (3.3, 0.05, 9.5));
+        assert_eq!((x.reb_ref, x.rshunt, x.ag), (3.3, 0.05, 11.89));
         assert_eq!((x.temperature_limit, x.hard_temp_limit_headroom), (121.0, 7.0));
         assert_eq!((x.imon_scale, x.vmon_scale), (2.0, 10.0));
         assert_eq!(x.cl_thermal_feedback_enabled, 1);
@@ -314,7 +314,7 @@ fn lsm2_state(tweak: impl Fn(&mut BTreeMap<u32, f32>)) -> ParamState {
         for k in 0..33 {
             m.insert(id::channel(c, k), 1.0);
         }
-        m.insert(id::channel(c, id::CH_VOLTS_FS), 8.414);
+        m.insert(id::channel(c, id::CH_VOLTS_FS), 11.89);
         m.insert(id::channel(c, id::CH_PARASITIC), 0.2);
         m.insert(id::channel(c, id::CH_DISPLACEMENT_LIMIT), 0.0005);
         m.insert(id::channel(c, id::CH_TEMP_HARD), 130.0);
@@ -343,8 +343,8 @@ fn lsm2_files(tweak: impl Fn(&mut BTreeMap<u32, f32>)) -> BTreeMap<String, Vec<u
 fn lsm2_fields_follow_the_id_rule() {
     let t = tuning(&lsm2_files(|_| {}), "c-lsm2");
     let c = compile(&t, &mut Diagnostics::default()).unwrap();
-    // The operating point is the tuning's VoltsFullScale.
-    assert_eq!(c.full_scale_mv, 8414);
+    // The operating point is the tuning's VoltsFullScale (peak).
+    assert_eq!(c.full_scale_mv, 11890);
     let p = sgv2_core::lsm2::Params::from_blob(&c.blob).unwrap();
     assert_eq!((p.channels, p.sample_rate, p.model_only), (4, 48000, 1));
     assert_eq!((p.attack_time_ms, p.fast_release_time_ms, p.slow_release_time_ms), (4.0, 150.0, 15000.0));
@@ -352,12 +352,61 @@ fn lsm2_fields_follow_the_id_rule() {
     assert_eq!(p.power_hard_limit_w, [50.0, 8.0, 3.0, 2.0]);
     assert_eq!((p.low_rail_idle_power_w, p.low_rail_power_ratio, p.other_power_features), (0.02, 1.2, 0));
     let x = &p.ch[1];
-    assert_eq!((x.source, x.volts_full_scale, x.parasitic_resistance), (1, 8.414, 0.2));
+    assert_eq!((x.source, x.volts_full_scale, x.parasitic_resistance), (1, 11.89, 0.2));
     // Admittance is manager 1, displacement manager 2 (distinct synthetic Rdc/Kms).
     assert_eq!((x.rdc, x.kms, x.disp_kms), (6.0, 1510.0, 1520.0));
     assert!((x.mms_kg - 0.0003).abs() < 1e-9);
     assert_eq!((x.rth_vc, x.tau_mag, x.ambient), (30.0, 80.0, 45.0));
     assert_eq!((x.temperature_soft_limit, x.temperature_hard_limit, x.temperature_headroom), (115.0, 130.0, 4.0));
+}
+
+#[test]
+fn lsm2_channels_keep_their_own_full_scale_within_one_operating_point() {
+    // As on the J700 (7.30/7.33 V, 0.036 dB): the header takes channel 0's,
+    // the payload keeps each channel's own.
+    let t = tuning(
+        &lsm2_files(|m| {
+            m.insert(id::channel(1, id::CH_VOLTS_FS), 11.89 * 7.33 / 7.30);
+        }),
+        "c-lsm2-vfs-close",
+    );
+    let c = compile(&t, &mut Diagnostics::default()).unwrap();
+    assert_eq!(c.full_scale_mv, 11890);
+    let p = sgv2_core::lsm2::Params::from_blob(&c.blob).unwrap();
+    assert!((p.ch[1].volts_full_scale - 11.89 * 7.33 / 7.30).abs() < 1e-5);
+    // Past the supervisor's 0.25 dB: refused.
+    let t = tuning(
+        &lsm2_files(|m| {
+            m.insert(id::channel(3, id::CH_VOLTS_FS), 11.89 * 1.04);
+        }),
+        "c-lsm2-vfs-far",
+    );
+    assert!(compile(&t, &mut Diagnostics::default()).is_err());
+}
+
+#[test]
+fn spp3_operating_point_is_the_peak_ag() {
+    // A tuning whose ag disagrees with the amp setting still compiles from
+    // its own ag, with a warning that the supervisor will not grant.
+    let mut f = spp3_files(4);
+    let mut v = sidecar_value(4);
+    if let Value::Dict(d) = &mut v {
+        if let Some(Value::Dict(chs)) = d.get_mut("ChannelSpecificParams") {
+            for c in 0..4 {
+                if let Some(Value::Dict(ch)) = chs.get_mut(&format!("Channel{c}")) {
+                    if let Some(Value::Dict(od)) = ch.get_mut("OL_disp") {
+                        *od.get_mut("ag").unwrap() = Value::Real(9.5);
+                    }
+                }
+            }
+        }
+    }
+    f.insert(format!("{AID}/DSP/Strips/{}", sidecar_name()), aurora_speaker_tuning::plist::binary::write(&v));
+    let t = tuning(&f, "c-spp3-ag");
+    let mut d = Diagnostics::default();
+    let c = compile(&t, &mut d).unwrap();
+    assert_eq!(c.full_scale_mv, 9500);
+    assert!(d.items.iter().any(|x| x.code == "compile-full-scale"), "{:?}", d.items);
 }
 
 #[test]
@@ -387,7 +436,7 @@ fn atsp_slots_from_the_id_map() {
     for s in 0..3u32 {
         let b = 1 + 13 * s;
         let mask = if s == 0 { 15.0 } else { 0.0 };
-        let vals = [10.0, 8.5, 35.0, 2.0, 45.0, 70.0, 40.0, 125.0, 700.0, 18000.0, 9.0, 1.0, mask];
+        let vals = [11.89, 8.5, 35.0, 2.0, 45.0, 70.0, 40.0, 125.0, 700.0, 18000.0, 9.0, 1.0, mask];
         for (k, v) in vals.iter().enumerate() {
             params.push((b + k as u32, *v));
         }
@@ -401,7 +450,7 @@ fn atsp_slots_from_the_id_map() {
     let p = sgv2_core::atsp::Params::from_blob(&c.blob).unwrap();
     assert_eq!((p.channels, p.block_frames, p.bypass, p.gain_link_all), (4, 256, 0, 1));
     let s = &p.slot[0];
-    assert_eq!((s.channel_mask, s.amplifier_sensitivity, s.rdc, s.rth_vc, s.tau_mg), (15, 10.0, 8.5, 35.0, 70.0));
+    assert_eq!((s.channel_mask, s.amplifier_sensitivity, s.rdc, s.rth_vc, s.tau_mg), (15, 11.89, 8.5, 35.0, 70.0));
     assert_eq!((s.temperature_limit, s.attack_ms, s.release_ms, s.hard_limit_headroom), (125.0, 700.0, 18000.0, 9.0));
     assert_eq!(p.slot[1].channel_mask, 0);
 }
