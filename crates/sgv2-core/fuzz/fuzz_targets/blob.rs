@@ -16,6 +16,10 @@ use sgv2_lv2::{load_unit, AnyUnit, Role};
 static GLOBAL: Counting = Counting;
 
 fn probe(unit: &mut dyn ProtectionUnit, n: usize, lat: usize, gain: f32, x: &[Vec<f32>], what: &str) {
+    probe_p(unit, n, lat, gain, 0.0, x, what)
+}
+
+fn probe_p(unit: &mut dyn ProtectionUnit, n: usize, lat: usize, gain: f32, pilot: f32, x: &[Vec<f32>], what: &str) {
     let n = n.clamp(1, 8);
     let mut x: Vec<Vec<f32>> = (0..n).map(|c| x[c % x.len()].clone()).collect();
     if gain < 1.0 {
@@ -23,7 +27,7 @@ fn probe(unit: &mut dyn ProtectionUnit, n: usize, lat: usize, gain: f32, x: &[Ve
     }
     let sense = synth_sense(&x, 2 * n, 0);
     let r = render(unit, &x, &sense, &[1, 4096, 511, 96], &[], &mut nothing);
-    check_bound(&x, &r.out, lat, gain, what);
+    check_bound_pilot(&x, &r.out, lat, gain, pilot, what);
 }
 
 fn run(u: &mut Unstructured) -> Result<()> {
@@ -72,8 +76,8 @@ fn run(u: &mut Unstructured) -> Result<()> {
     let _ = sgv2_core::placeholder::Params::decode(&bytes);
     if let Ok(p) = spp3::Params::from_blob(&bytes) {
         let mut un = spp3::Unit::new(p);
-        let g = if un.is_failsafe() { FAILSAFE_GAIN } else { 1.0 };
-        probe(&mut un, p.channels as usize, 0, g, &x, "spp3 from_blob");
+        let (g, pilot) = if un.is_failsafe() { (FAILSAFE_GAIN, 0.0) } else { (1.0, spp3_pilot(&p)) };
+        probe_p(&mut un, p.channels as usize, 0, g, pilot, &x, "spp3 from_blob");
     }
     if let Ok(p) = lsm2::Params::from_blob(&bytes) {
         let mut un = lsm2::Unit::new(p);
@@ -100,10 +104,14 @@ fn run(u: &mut Unstructured) -> Result<()> {
             (1.0, other.unit().latency_frames() as usize)
         }
     };
+    let pilot = match &unit {
+        AnyUnit::Spp3(u) => spp3_pilot(u.params()),
+        _ => 0.0,
+    };
     if err.is_some() {
         assert!(matches!(unit, AnyUnit::FailSafe(_)), "an error must give the fail-safe");
     }
-    probe(unit.as_dyn(), hn, lat, g, &x, "load_unit");
+    probe_p(unit.as_dyn(), hn, lat, g, pilot, &x, "load_unit");
     Ok(())
 }
 

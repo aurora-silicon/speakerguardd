@@ -32,29 +32,66 @@ fn run(u: &mut Unstructured) -> Result<()> {
     let real = Unit::init_error(&p).is_none() && p.channels as usize == n;
     let gain = if real { 1.0 } else { FAILSAFE_GAIN };
 
-    // A: one thermal update per call, under the hard-path oracle (open loop
-    // only: the corrected limit is internal)
-    let f = sgv2_core::spp3::THERMAL_FRAMES;
+    // A: one thermal update per call, under the controller oracle (open
+    // loop only: the corrected limit is internal). The oracle reads the
+    // unit's controller state between calls, so this loop drives the unit
+    // itself.
+    let f = if real { sgv2_core::spp3::thermal_frames(p.sample_rate) } else { 256 };
     let mut ua = Unit::new(p);
     let mut oracle = (real && !closed).then(|| Spp3HardOracle::new(&p));
-    let mut last = 0;
-    let a = render(&mut ua, &x, &sense, &[f], &[], &mut |d, t, o| {
-        if let Some(or) = oracle.as_mut() {
-            if d - last == f {
-                let ins: Vec<&[f32]> = x.iter().map(|b| &b[last..d]).collect();
-                let outs: Vec<&[f32]> = o.iter().map(|b| &b[last..d]).collect();
-                or.step(&ins, &outs, t);
+    let a = {
+        let len = x[0].len();
+        let mut out = vec![vec![0.0f32; len]; n];
+        let mut t = sgv2_core::Telemetry::new();
+        let mut done = 0;
+        while done < len {
+            let m = f.min(len - done);
+            let ins: Vec<&[f32]> = x.iter().map(|b| &b[done..done + m]).collect();
+            let sns: Vec<&[f32]> = sense.iter().map(|b| &b[done..done + m]).collect();
+            let mut outs: Vec<&mut [f32]> = out.iter_mut().map(|b| &mut b[done..done + m]).collect();
+            let before = allocs();
+            ua.process(sgv2_core::Io { frames: m, input: &ins, sense: &sns, output: &mut outs });
+            ua.telemetry(&mut t);
+            assert_eq!(allocs(), before, "spp3 allocated in process/telemetry");
+            drop(outs);
+            if let Some(or) = oracle.as_mut() {
+                if m == f {
+                    let outs: Vec<&[f32]> = out.iter().map(|b| &b[done..done + m]).collect();
+                    let cs: Vec<[f64; 11]> = (0..n).map(|c| ua.controller_state(c)).collect();
+                    or.step(&ins, &outs, &t, &cs);
+                }
             }
+            done += m;
         }
-        last = d;
-    });
-    check_bound(&x, &a.out, 0, gain, "spp3 A");
+        Render { out, tele: t }
+    };
+    check_bound_pilot(&x, &a.out, 0, gain, if real { spp3_pilot(&p) } else { 0.0 }, "spp3 A");
 
-    // B: the fuzzer's slicing; bit-identical to A on finite input
+    // B: the fuzzer's slicing. Every render call snaps the dezipper to the
+    // selected target (rig dezipper law), so B is bit-identical to A only
+    // when no call crosses a 256-frame update; any slicing is deterministic
+    // (B twice).
     let mut ub = Unit::new(p);
     let b = render(&mut ub, &x, &sense, &cuts, &[], &mut nothing);
-    check_bound(&x, &b.out, 0, gain, "spp3 B");
-    if real && all_finite(&x) {
+    check_bound_pilot(&x, &b.out, 0, gain, if real { spp3_pilot(&p) } else { 0.0 }, "spp3 B");
+    if real {
+        let b2 = render(&mut Unit::new(p), &x, &sense, &cuts, &[], &mut nothing);
+        assert!(bits(&b.out) == bits(&b2.out), "spp3: audio not deterministic for a fixed slicing");
+        assert_eq!(tele_bits(&b.tele), tele_bits(&b2.tele), "spp3: state not deterministic for a fixed slicing");
+    }
+    // no call of the cycled slicing crosses a 256-frame update boundary
+    let divides = {
+        let (f, len) = (sgv2_core::spp3::thermal_frames(p.sample_rate.max(1)), x[0].len());
+        let (mut done, mut k, mut ok) = (0usize, 0usize, true);
+        while done < len && ok {
+            let m = cuts[k % cuts.len()].min(len - done);
+            ok = done % f + m <= f;
+            done += m;
+            k += 1;
+        }
+        ok
+    };
+    if real && all_finite(&x) && divides {
         assert!(bits(&a.out) == bits(&b.out), "spp3: audio depends on host slicing");
         assert_eq!(tele_bits(&a.tele), tele_bits(&b.tele), "spp3: state depends on host slicing");
         for c in 0..n {
@@ -71,7 +108,7 @@ fn run(u: &mut Unstructured) -> Result<()> {
     // C: B's slicing with sense dropouts; D: no sense at all
     let mut uc = Unit::new(p);
     let c = render(&mut uc, &x, &sense, &cuts, &modes, &mut nothing);
-    check_bound(&x, &c.out, 0, gain, "spp3 C");
+    check_bound_pilot(&x, &c.out, 0, gain, if real { spp3_pilot(&p) } else { 0.0 }, "spp3 C");
     let d = render(&mut Unit::new(p), &x, &[], &cuts, &[], &mut nothing);
     if !closed {
         check_not_louder(&c.out, &b.out, "spp3 sense dropout vs valid sense");
