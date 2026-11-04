@@ -115,9 +115,10 @@ fn atsp_a_restarted_stream_keeps_the_heat() {
 
 #[test]
 fn lsm2_a_restarted_stream_keeps_the_heat() {
-    // the thermal axes only: the motion axes limit a cold unit as much
+    // the temperature axis only: the motion and power axes limit a cold
+    // unit as much
     let mut p = lsm2_params();
-    (p.control_sample_peak, p.control_displacement, p.control_velocity) = (0, 0, 0);
+    (p.control_sample_peak, p.control_displacement, p.control_velocity, p.control_power) = (0, 0, 0, 0);
     let tone: Vec<f32> = (0..RATE as usize * 20)
         .map(|k| (2.0 * std::f64::consts::PI * 150.0 * k as f64 / RATE as f64).sin() as f32)
         .collect();

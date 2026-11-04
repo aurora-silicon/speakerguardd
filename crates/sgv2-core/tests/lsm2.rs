@@ -203,18 +203,37 @@ fn velocity_spares_the_ignored_outer_bands() {
 }
 
 #[test]
-fn power_is_capped_and_linked() {
+fn power_is_one_gain_on_the_total_budget_without_a_cap() {
+    // rig law 7: g = sqrt((B - N idle) / sum(Phat - idle)), B the total
+    // budget, Phat the unattenuated average; MaxPowerAttenuation (4 dB
+    // here) does not bound it
     let mut p = only([false, false, false, true, false]);
-    p.power_hard_limit_w[2] = 0.5;
-    let mut u = Unit::new(p);
+    p.control_temperature = 1;
+    p.power_hard_limit_w[2] = 0.3;
+    p.ch[0].temperature_soft_limit = 1000.0;
+    p.ch[1].temperature_soft_limit = 1000.0;
+    p.ch[0].temperature_hard_limit = 1001.0;
+    p.ch[1].temperature_hard_limit = 1001.0;
     let loud = sine(1000.0, 1.0, 6.0);
     let quiet = vec![0.0f32; loud.len()];
+    // the unattenuated 1 s average, from a unit with the power axis off
+    let mut q = p;
+    q.control_power = 0;
+    let mut r = Unit::new(q);
+    run(&mut r, &[loud.clone(), quiet.clone()], 512);
+    let mut rec = HandOff::EMPTY;
+    assert!(r.save_state(&mut rec));
+    let idle = p.low_rail_idle_power_w as f64;
+    let demand = (rec.node[0][4] - idle) + (rec.node[1][4] - idle);
+    let want = ((0.3 - 2.0 * idle) / demand).sqrt();
+    let mut u = Unit::new(p);
     run(&mut u, &[loud, quiet], 512);
     let t = tel(&u);
-    let floor = 10f32.powf(-4.0 / 20.0);
-    assert!((t.channels[0].axis_gain[3] - floor).abs() < 1e-4, "{}", t.channels[0].axis_gain[3]);
-    assert!((t.global.power_gain - floor).abs() < 1e-4);
-    // the quiet channel takes the linked slow gain
+    let got = t.channels[0].axis_gain[3] as f64;
+    assert!(want < 10f64.powf(-4.0 / 20.0), "the case must go past the old cap: {want}");
+    assert!((got - want).abs() < 2e-3 * want, "{got} {want}");
+    assert!((t.global.power_gain as f64 - got).abs() < 1e-6);
+    // the quiet channel takes the same gain
     assert!((t.channels[1].gain - t.channels[0].gain).abs() < 1e-6);
 }
 
@@ -311,9 +330,8 @@ fn runtime_budgets_replace_the_preset_limits() {
     run(&mut u, &[loud.clone(), loud], 512);
     let t = tel(&u);
     assert_eq!(t.global.power_hard_limit_w, [50.0, 0.4, 50.0, 50.0]);
-    let floor = 10f32.powf(-4.0 / 20.0);
-    // the 0.4 W runtime 200 ms budget binds at the cap
-    assert!((t.channels[0].axis_gain[3] - floor).abs() < 1e-4, "{}", t.channels[0].axis_gain[3]);
+    // the 0.4 W runtime 200 ms budget binds (the preset's would not)
+    assert!(t.channels[0].axis_gain[3] < 0.5, "{}", t.channels[0].axis_gain[3]);
 }
 
 #[test]
@@ -399,4 +417,20 @@ fn controller_cadence_is_a_time() {
     assert_eq!(lsm2::controller_frames(48_000), 256);
     assert_eq!(lsm2::controller_frames(96_000), 512);
     assert_eq!(lsm2::controller_frames(44_100), 232);
+}
+
+#[test]
+fn peak_reserves_the_pilot_amplitude() {
+    // rig law 6: (AmplitudeLimit - pilot) / peak; -36 dB on a 1.0012 sine
+    let mut p = only([true, false, false, false, true]);
+    for c in 0..2 {
+        p.ch[c].pilot_reserve = 10f32.powf(-36.0 / 20.0);
+    }
+    let mut u = Unit::new(p);
+    let x: Vec<f32> = sine(1000.0, 1.0012, 0.2);
+    run(&mut u, &[x.clone(), x], 512);
+    let g = tel(&u).channels[0].axis_gain[0];
+    let pk = sine(1000.0, 1.0012, 0.2).iter().fold(0f32, |m, v| m.max(v.abs()));
+    let want = (1.0 - 10f32.powf(-36.0 / 20.0)) / pk;
+    assert!((g - want).abs() < 1e-6, "{g} {want}");
 }

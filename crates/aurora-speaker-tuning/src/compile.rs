@@ -699,6 +699,11 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
             bandwidth: whole(id::channel(c, id::CH_BANDWIDTH), "Bandwidth")?,
             ..lsm2::ChannelParams::default()
         };
+        // rig law 6: the peak axis reserves the bank's pilot amplitude
+        // (PilotToneAmplitude_dB, offset 2 of the bank's pilot block)
+        let bank = whole(id::CH_TUNING + c, "ChTuning")?;
+        let pilot_db = get([1024, 22528, 23552][bank.min(2) as usize] + 2)?;
+        x.pilot_reserve = libm_pow10(f64::from(pilot_db) / 20.0) as f32;
         arr(id::CH_VELOCITY_LIMIT0, &mut x.velocity_limit)?;
         arr(id::CH_MASK_ENERGY0, &mut x.mask_energy_db)?;
         arr(id::CH_BAND_CENTER0, &mut x.band_center_hz)?;
@@ -742,6 +747,10 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
         full_scale_mv,
         blob,
     })
+}
+
+fn libm_pow10(x: f64) -> f64 {
+    10f64.powf(x)
 }
 
 /// Property 6632's `ChannelData[c].PressureResponse` (spec 9.8): 1,024

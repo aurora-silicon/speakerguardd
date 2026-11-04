@@ -39,19 +39,24 @@
 //!   sums to the delay exactly.
 //! - **Candidates** every controller frame (256 frames, spec 10), linear in
 //!   [0, 1], a disabled axis giving 1, combined by `min`:
-//!   - sample peak: `min(1, AmplitudeLimit / max|x|)`;
+//!   - sample peak: `min(1, (AmplitudeLimit - pilot) / max|x|)`, the pilot
+//!     tone's linear amplitude reserved even with the pilot off (rig law 6);
 //!   - displacement and velocity: the models run on the program the bank
 //!     resynthesises, `min(1, limit / max|q|)`, applied as band gains:
 //!     displacement to every band, velocity (floored at
 //!     `-MaxVelocityAttenuation`) to every band but the outer ones when
 //!     `VelocityIgnoreLow/HighBand`; the velocity limit follows the masking
 //!     curve (spec 6.2);
-//!   - power: `max(-MaxPowerAttenuation, min_j sqrt(budget_j / Pbar_j))`,
-//!     the budgets the preset's or property 64008's, times
-//!     `PowerBudgetsScale`;
+//!   - power (rig law 7): one gain for all systems,
+//!     `min_j min(1, sqrt((B_j - N idle) / sum (Phat_j - idle)))`, `B_j` the
+//!     total budget (preset or property 64008, times `PowerBudgetsScale`),
+//!     `Phat_j` each system's largest unattenuated average over the frame;
+//!     `MaxPowerAttenuation` does not bound it;
 //!   - temperature: the linear-in-dB knee of spec 6.1 on the coil
 //!     temperature.
 //!   - Slow gains (power, temperature) are linked across channels.
+//! - **Combination**: each band's applied gain is the minimum of its own
+//!   (displacement/velocity) gain and the broadband peak and slow gains.
 //! - **Smoothing** per sample with the exponential one-pole (spec 6.1):
 //!   attack `AttackTime`; release `LowBandReleaseTime` (band 0),
 //!   `FastReleaseTime` (other bands, peak), `SlowReleaseTime` (slow).
@@ -59,8 +64,11 @@
 //!   TODO(SPEC) list): the power averages and the thermal model run on the
 //!   protected output. `Pamp = idle + ratio * max(mean32(u*i), 0) *
 //!   (Rdc+Rpar)/Rdc` every 32 frames into the four exponential averages;
-//!   the thermal input is `u*i` per sample, backward Euler, the coil node in
-//!   series on the magnet node: `Tvc = Tamb + theta_mag + theta_vc`.
+//!   the thermal input is the substep mean of `u*i` (no load factor), the
+//!   nodes independent matched one-poles per substep with Float32
+//!   coefficients and state, the coil in series on the magnet:
+//!   `Tvc = Tamb + theta_mag + theta_vc` (rig laws 3 and 4: the monitor
+//!   reads `Vfs * output` bit for bit).
 //!
 //! Full scale: the program is held to digital full scale (`clamp(x, -1,
 //! 1)`, a non-finite sample 0) before the bank and every model, so a huge
@@ -77,6 +85,11 @@
 //! unity. The reference resets on reinitialisation (spec 8); a speaker does
 //! not cool because a stream restarted, so here it never does.
 //!
+//! Meters (rig law 11), over the last complete controller frame:
+//! `AmplifierInputPowerPerSpeaker` is the largest 1 ms average of system 0
+//! alone; `ModeledAmplifierPower` the sum over systems of each one's
+//! largest 1 s average.
+//!
 //! Failure: the reference unit fails initialisation outright when neither
 //! estimator can be built. Here an unusable parameter set, or a geometry
 //! mismatch, gives the 20 dB fail-safe, which on the Neo equals the
@@ -90,10 +103,6 @@
 //!   `Rdc, Bl, Mms, Rms, Kms` give (pole Q 1.9225 against 1.9402). The
 //!   bilinear admittance of the block is used: 0.011 dB too much current at
 //!   1 kHz, 0.08 dB at resonance.
-//! - **Thermal input.** Spec 6.1 says `Pcoil = i^2 Rdc`; the logged thermal
-//!   state matches `u*i` (0.00014 degC over 180 s against 0.9 degC), and the
-//!   two nodes in series. The magnet node relaxes with 99.867 s, not the
-//!   100 s field (factor 1/(1+1.3315e-3)); the field is used.
 //! - **Filterbank order rule.** "Lowest even LR order whose adjacent-centre
 //!   stop-band error fits in 159 samples" is not defined; LR4 (plus 2 or 4
 //!   for `Bandwidth` 1/2) is used. The spec's band-0 anchors (centre tap
@@ -116,10 +125,6 @@
 //!   63 degC under the 1 kHz and 200 Hz ramps (0.886 at 63.4 degC) with a
 //!   trajectory that does not depend on the coil temperature, where the
 //!   knee (soft 120 degC, headroom 5) gives unity. The knee is used.
-//! - **Meters.** `ModeledAmplifierPower` matches the sum over channels of
-//!   the 1 s average. `AmplifierInputPowerPerSpeaker` is closest (within
-//!   1.2 %) to the largest 1 ms average over the last controller frame and
-//!   the channels, which is used.
 //! - Mid/high rails, battery input and soft knees below 100 % are refused.
 
 use alloc::vec;
@@ -210,6 +215,9 @@ pub struct ChannelParams {
     pub band_center_hz: [f32; BANDS],
     /// `Bandwidth` enum 0/1/2.
     pub bandwidth: u32,
+    /// The sample-peak reserve: the linear `PilotToneAmplitude_dB` of the
+    /// channel's tuning bank, kept free even with the pilot off (rig law 6).
+    pub pilot_reserve: f32,
     /// Number of pressure-response taps (0 without property 6632, else
     /// [`PRESSURE_TAPS`]).
     pub pressure_taps: u32,
@@ -260,6 +268,7 @@ impl Default for ChannelParams {
             max_temperature_attenuation_db: 0.0,
             band_center_hz: [0.0; BANDS],
             bandwidth: 0,
+            pilot_reserve: 0.0,
             pressure_taps: 0,
             pressure_fir: [0.0; PRESSURE_TAPS],
         }
@@ -310,7 +319,7 @@ unsafe impl Pod for Params {}
 // SAFETY: as above.
 unsafe impl Pod for ChannelParams {}
 
-const CH_WORDS: usize = 52 + PRESSURE_TAPS;
+const CH_WORDS: usize = 53 + PRESSURE_TAPS;
 const _: () = assert!(core::mem::size_of::<ChannelParams>() == CH_WORDS * 4);
 const _: () = assert!(core::mem::size_of::<Params>() == (39 + MAX_CHANNELS * CH_WORDS) * 4);
 
@@ -434,6 +443,9 @@ impl Params {
             }
             if !(pos(c.rth_vc) && pos(c.tau_vc) && pos(c.rth_mag) && pos(c.tau_mag) && c.ambient.is_finite()) {
                 return Err(InitError::Invalid("thermal model"));
+            }
+            if !(nonneg(c.pilot_reserve) && c.pilot_reserve < c.amplitude_limit) {
+                return Err(InitError::Invalid("pilot reserve"));
             }
             if !(pos(c.amplitude_limit) && pos(c.displacement_limit) && c.velocity_limit.iter().all(|&v| pos(v))) {
                 return Err(InitError::Invalid("limits"));
@@ -702,22 +714,37 @@ struct Chan {
     vel_limit_now: f64,
     // Monitor on the output.
     current: Biquad,
+    /// The power path of the unattenuated program (rig law 7): the current
+    /// model on the bank's centre, its substep load and four averages, and
+    /// their largest values over the running controller frame.
+    current_in: Biquad,
+    sub_acc_in: f64,
+    pbar_in: [f64; 4],
+    pbar_in_peak: [f64; 4],
     load_scale: f64,
     rth_vc: f64,
     rth_mag: f64,
-    a_vc: f64,
-    a_mag: f64,
+    /// Matched one-pole of each node per substep, Float32 (rig law 3):
+    /// `b = fl32(exp(-dt/tau))`, `a = fl32(1 - exp(-dt/tau))`; the coil
+    /// updates as `theta += a (P Rvc - theta)`.
+    a_vc: f32,
+    b_mag: f32,
+    a_mag: f32,
     tau_vc: f64,
     tau_mag: f64,
     ambient: f64,
-    th_vc: f64,
-    th_mag: f64,
+    /// Node rises, Float32 state as the reference keeps them.
+    th_vc: f32,
+    th_mag: f32,
     sub_acc: f64,
     pbar: [f64; 4],
     /// Largest 1 ms average over the running controller frame, and over
     /// the last complete one (the per-speaker meter).
     pbar1_peak: f64,
     pbar1_frame: f64,
+    /// The same for the 1 s average (the modeled-power meter).
+    pbar1s_peak: f64,
+    pbar1s_frame: f64,
     // Limits.
     amp_limit: f64,
     disp_limit: f64,
@@ -765,7 +792,6 @@ struct Run {
     unlink_temp: bool,
     p_pole: [f64; 4],
     budget: [f64; 4],
-    power_floor: f64,
     idle: f64,
     ratio: f64,
     r_attack: f32,
@@ -825,6 +851,7 @@ impl Run {
         let ctl_frames = controller_frames(p.sample_rate);
         let sub_frames = ctl_frames / SUBSTEPS;
         let ctl_dt = ctl_frames as f64 / rate;
+        let sub_dt = sub_frames as f64 / rate;
         let mut ch = Vec::with_capacity(n);
         for c in &p.ch[..n] {
             let h = filterbank(rate, &c.band_center_hz, c.bandwidth, stage);
@@ -861,11 +888,16 @@ impl Run {
                 mask_range: c.mask_attack_range_db as f64,
                 vel_limit_now: c.velocity_limit[0] as f64,
                 current,
+                current_in: current,
+                sub_acc_in: 0.0,
+                pbar_in: [0.0; 4],
+                pbar_in_peak: [0.0; 4],
                 load_scale: (c.rdc as f64 + c.parasitic_resistance as f64) / c.rdc as f64,
                 rth_vc: c.rth_vc as f64,
                 rth_mag: c.rth_mag as f64,
-                a_vc: dt / (c.tau_vc as f64 + dt),
-                a_mag: dt / (c.tau_mag as f64 + dt),
+                a_vc: (1.0 - pole(sub_dt, c.tau_vc as f64)) as f32,
+                b_mag: pole(sub_dt, c.tau_mag as f64) as f32,
+                a_mag: (1.0 - pole(sub_dt, c.tau_mag as f64)) as f32,
                 tau_vc: c.tau_vc as f64,
                 tau_mag: c.tau_mag as f64,
                 ambient: c.ambient as f64,
@@ -875,7 +907,9 @@ impl Run {
                 pbar: [0.0; 4],
                 pbar1_peak: 0.0,
                 pbar1_frame: 0.0,
-                amp_limit: c.amplitude_limit as f64,
+                pbar1s_peak: 0.0,
+                pbar1s_frame: 0.0,
+                amp_limit: c.amplitude_limit as f64 - c.pilot_reserve as f64,
                 disp_limit: c.displacement_limit as f64,
                 vel_floor: db_to_lin(c.max_velocity_attenuation_db as f64),
                 ignore_low: c.velocity_ignore_low_band != 0,
@@ -895,7 +929,6 @@ impl Run {
         }
         let mut p_pole = [0.0; 4];
         let mut budget = [0.0; 4];
-        let sub_dt = sub_frames as f64 / rate;
         for j in 0..4 {
             p_pole[j] = pole(sub_dt, p.power_time_scale_s[j] as f64);
             let b = if p.runtime_budget_present != 0 { p.runtime_budget_w[j] } else { p.power_hard_limit_w[j] };
@@ -926,7 +959,6 @@ impl Run {
             unlink_temp: p.unlink_temperature_gains != 0,
             p_pole,
             budget,
-            power_floor: db_to_lin(p.max_power_attenuation_db as f64),
             idle: p.low_rail_idle_power_w as f64,
             ratio: p.low_rail_power_ratio as f64,
             r_attack: sample(p.attack_time_ms),
@@ -954,12 +986,18 @@ impl Run {
             c.mask_init = false;
             c.vel_limit_now = c.vel_lim[0];
             c.current.clear();
+            c.current_in.clear();
+            c.sub_acc_in = 0.0;
+            c.pbar_in = [0.0; 4];
+            c.pbar_in_peak = [0.0; 4];
             c.th_vc = 0.0;
             c.th_mag = 0.0;
             c.sub_acc = 0.0;
             c.pbar = [0.0; 4];
             c.pbar1_peak = 0.0;
             c.pbar1_frame = 0.0;
+            c.pbar1s_peak = 0.0;
+            c.pbar1s_frame = 0.0;
             c.cand = [1.0; 5];
             c.band_target = [1.0; BANDS];
             c.band_g = [1.0; BANDS];
@@ -983,14 +1021,19 @@ impl Run {
         let (mitigate, look, half) = (self.mitigate, self.look, self.half);
         let (r_attack, r_fast, r_low, r_slow) = (self.r_attack, self.r_fast, self.r_low, self.r_slow);
         let c = &mut self.ch[ci];
+        // The peak axis sees the drive as delivered (a sample above full
+        // scale gets the gain that brings it to the limit; a non-finite one
+        // the most restrictive); everything else the program held to full
+        // scale.
+        c.pk_in = c.pk_in.max(if x.is_finite() { x.abs() } else { f32::MAX });
         let x = dsp::bound1(x);
         c.hist.push(x);
-        c.pk_in = c.pk_in.max(x.abs());
         // The program the bands resynthesise, at the bank's centre.
         let centre = c.hist.ago(half);
         let u = c.vfs * centre as f64;
         let xd = c.disp.step(u);
         let v = c.vel.step(u);
+        c.sub_acc_in += u * c.current_in.step(u);
         c.pk_disp = c.pk_disp.max(libm::fabs(xd) as f32);
         c.pk_vel = c.pk_vel.max(libm::fabs(v) as f32);
         // Masking path.
@@ -1000,9 +1043,11 @@ impl Run {
             let m = c.mask_lp.step(c.mask_hp.step(p));
             c.mask_acc += m * m;
         }
-        // Output: the delayed input with the band gains, then broadband.
-        // Bands 0..3 by FIR at the output's window, band 4 the complement:
-        // y = g4 dry + sum_k<4 (g_k - g4) c_k.
+        // Output: the delayed input with one gain per band, each the
+        // minimum of its band gain and the broadband (peak, slow) gains
+        // (spec 2: candidates combine by min, never by product). Bands 0..3
+        // by FIR at the output's window, band 4 the complement:
+        // y = e4 dry + sum_k<4 (e_k - e4) c_k.
         let dry = c.hist.ago(half + look);
         let mut y = dry;
         if mitigate {
@@ -1010,22 +1055,20 @@ impl Run {
                 let r = if k == 0 { r_low } else { r_fast };
                 smooth(&mut c.band_g[k], c.band_target[k], r_attack, r);
             }
-            let g4 = c.band_g[BANDS - 1];
-            if c.band_g.iter().any(|&g| g != 1.0) {
-                let w = c.hist.window();
-                let w = &w[w.len() - look - (2 * half + 1)..w.len() - look];
-                y = g4 * dry;
-                for (taps, &g) in c.taps_rev.iter().zip(&c.band_g) {
-                    if g != g4 {
-                        y += (g - g4) * fir_reversed(taps, w);
-                    }
-                }
-            }
             smooth(&mut c.peak_g, c.peak_target, r_attack, r_fast);
             smooth(&mut c.slow_g, c.slow_target, r_attack, r_slow);
-            let g = c.peak_g.min(c.slow_g);
-            if g != 1.0 {
-                y *= g;
+            let broad = c.peak_g.min(c.slow_g);
+            let e: [f32; BANDS] = core::array::from_fn(|k| c.band_g[k].min(broad));
+            let e4 = e[BANDS - 1];
+            if e.iter().any(|&g| g != 1.0) {
+                let w = c.hist.window();
+                let w = &w[w.len() - look - (2 * half + 1)..w.len() - look];
+                y = e4 * dry;
+                for (taps, &g) in c.taps_rev.iter().zip(&e) {
+                    if g != e4 {
+                        y += (g - e4) * fir_reversed(taps, w);
+                    }
+                }
             }
         }
         // Held to digital full scale on the output too: band corrections on
@@ -1035,8 +1078,6 @@ impl Run {
         let u = c.vfs * y as f64;
         let i = c.current.step(u);
         let p = u * i;
-        c.th_mag += c.a_mag * (p * c.rth_mag - c.th_mag);
-        c.th_vc += c.a_vc * (p * c.rth_vc - c.th_vc);
         c.sub_acc += p;
         y
     }
@@ -1044,22 +1085,56 @@ impl Run {
     /// The 32-frame power substep of every channel.
     fn substep(&mut self) {
         for c in self.ch.iter_mut() {
-            let load = c.sub_acc / self.sub_frames as f64 * c.load_scale;
+            let p = c.sub_acc / self.sub_frames as f64;
             c.sub_acc = 0.0;
+            // Thermal (rig law 3): the substep mean of u*i, two independent
+            // matched one-poles in Float32, the coil in series on the magnet.
+            c.th_mag = c.b_mag * c.th_mag + (c.a_mag as f64 * p * c.rth_mag) as f32;
+            c.th_vc += (c.a_vc as f64 * (p * c.rth_vc - c.th_vc as f64)) as f32;
+            let load = p * c.load_scale;
             let pamp = self.idle + self.ratio * load.max(0.0);
             for j in 0..4 {
                 c.pbar[j] = self.p_pole[j] * c.pbar[j] + (1.0 - self.p_pole[j]) * pamp;
             }
             c.pbar1_peak = c.pbar1_peak.max(c.pbar[0]);
+            c.pbar1s_peak = c.pbar1s_peak.max(c.pbar[2]);
+            let load_in = c.sub_acc_in / self.sub_frames as f64 * c.load_scale;
+            c.sub_acc_in = 0.0;
+            let pin = self.idle + self.ratio * load_in.max(0.0);
+            for j in 0..4 {
+                c.pbar_in[j] = self.p_pole[j] * c.pbar_in[j] + (1.0 - self.p_pole[j]) * pin;
+                c.pbar_in_peak[j] = c.pbar_in_peak[j].max(c.pbar_in[j]);
+            }
         }
     }
 
     /// Controller update.
     fn control(&mut self) {
         let ratio = |limit: f64, q: f32| (limit / (q as f64).max(EPS)).min(1.0);
+        // Power (rig law 7): one gain for all systems. Each budget is the
+        // total over the N systems; the gain scales only the load part of
+        // the affine amplifier power, and each system's demand is the
+        // largest unattenuated average over the frame:
+        //   g_j = min(1, sqrt((B_j - N idle) / sum_ch (Phat_j - idle))).
+        // MaxPowerAttenuation does not bound it.
+        let g_pow = if self.ctl[3] {
+            let mut g = 1.0f64;
+            let nidle = self.n as f64 * self.idle;
+            for j in 0..4 {
+                let demand: f64 = self.ch.iter().map(|c| c.pbar_in_peak[j] - self.idle).sum();
+                if demand > 0.0 {
+                    g = g.min(libm::sqrt((self.budget[j] - nidle).max(0.0) / demand));
+                }
+            }
+            g
+        } else {
+            1.0
+        };
         for c in self.ch.iter_mut() {
             c.pbar1_frame = c.pbar1_peak;
             c.pbar1_peak = 0.0;
+            c.pbar1s_frame = c.pbar1s_peak;
+            c.pbar1s_peak = 0.0;
             // velocity limit from the mask level
             if !c.pressure_rev.is_empty() {
                 let e = 10.0 * libm::log10((c.mask_acc / self.ctl_frames as f64).max(1e-30));
@@ -1091,17 +1166,9 @@ impl Run {
             c.pk_in = 0.0;
             c.pk_disp = 0.0;
             c.pk_vel = 0.0;
-            let g_pow = if self.ctl[3] {
-                let mut g = 1.0f64;
-                for j in 0..4 {
-                    g = g.min(libm::sqrt(self.budget[j] / c.pbar[j].max(EPS)));
-                }
-                g.max(self.power_floor)
-            } else {
-                1.0
-            };
+            c.pbar_in_peak = [0.0; 4];
             let g_temp = if self.ctl[4] {
-                let t = c.ambient + c.th_mag + c.th_vc;
+                let t = c.ambient + c.th_mag as f64 + c.th_vc as f64;
                 temperature_gain(t, c.t_headroom, c.t_soft, c.t_hard, c.t_max_db)
             } else {
                 1.0
@@ -1110,7 +1177,11 @@ impl Run {
             c.peak_target = g_peak as f32;
             c.slow_target = g_pow.min(g_temp) as f32;
             // any non-finite model or controller state latches the fail-safe
-            let model = [c.th_vc, c.th_mag, c.mask_db].iter().chain(&c.pbar).all(|v| v.is_finite());
+            let model = [c.th_vc as f64, c.th_mag as f64, c.mask_db]
+                .iter()
+                .chain(&c.pbar)
+                .chain(&c.pbar_in)
+                .all(|v| v.is_finite());
             let motion = [&c.disp, &c.vel, &c.current].iter().all(|b| b.y[0].is_finite());
             let gains = c.cand.iter().all(|v| v.is_finite())
                 && c.band_g.iter().all(|v| v.is_finite())
@@ -1246,10 +1317,10 @@ impl ProtectionUnit for Unit {
         let (mut amp_1s, mut amp_now) = (0.0f64, 0.0f64);
         for c in &run.ch {
             let mut s = ChannelState::ABSENT;
-            let t = c.ambient + c.th_mag + c.th_vc;
+            let t = c.ambient + c.th_mag as f64 + c.th_vc as f64;
             s.modeled_power_w = c.pbar[2] as f32;
             s.coil_temp_c = t as f32;
-            s.magnet_temp_c = (c.ambient + c.th_mag) as f32;
+            s.magnet_temp_c = (c.ambient + c.th_mag as f64) as f32;
             s.control_temp_c = t as f32;
             s.ol_temp_c = t as f32;
             s.velocity_limit_m_s = c.vel_limit_now as f32;
@@ -1263,8 +1334,10 @@ impl ProtectionUnit for Unit {
             s.band_gain = c.band_g;
             s.gain = if run.fault { FAILSAFE_GAIN } else { c.peak_g.min(c.slow_g) };
             out.channels[c.src] = s;
-            amp_1s += c.pbar[2];
-            amp_now = amp_now.max(c.pbar1_frame);
+            amp_1s += c.pbar1s_frame;
+            if c.src == 0 {
+                amp_now = c.pbar1_frame;
+            }
         }
         let g = &mut out.global;
         g.power_hard_limit_w = run.budget.map(|b| b as f32);
@@ -1288,8 +1361,8 @@ impl ProtectionUnit for Unit {
             let n = &mut out.node[i];
             // rises (coil over magnet, magnet over ambient); a node below
             // its reference carries no heat
-            n[0] = c.th_vc.max(0.0);
-            n[1] = c.th_mag.max(0.0);
+            n[0] = (c.th_vc as f64).max(0.0);
+            n[1] = (c.th_mag as f64).max(0.0);
             n[2..6].copy_from_slice(&c.pbar);
             out.gain[i] = c.slow_g as f64;
         }
@@ -1308,8 +1381,8 @@ impl ProtectionUnit for Unit {
         for (i, c) in run.ch.iter_mut().enumerate() {
             let s = &state.node[i];
             // the series nodes cool independently, each with its own constant
-            c.th_vc = s[0] * libm::exp(-t / c.tau_vc);
-            c.th_mag = s[1] * libm::exp(-t / c.tau_mag);
+            c.th_vc = (s[0] * libm::exp(-t / c.tau_vc)) as f32;
+            c.th_mag = (s[1] * libm::exp(-t / c.tau_mag)) as f32;
             for j in 0..4 {
                 c.pbar[j] = run.idle + (s[2 + j] - run.idle) * libm::pow(run.p_pole[j], substeps);
             }
@@ -1407,7 +1480,7 @@ mod fault_tests {
     #[test]
     fn a_non_finite_model_state_latches_the_failsafe_until_reset() {
         let poisons: [fn(&mut Run); 3] =
-            [|r| r.ch[0].th_mag = f64::NAN, |r| r.ch[1].pbar[2] = f64::INFINITY, |r| r.ch[0].slow_g = f32::NAN];
+            [|r| r.ch[0].th_mag = f32::NAN, |r| r.ch[1].pbar[2] = f64::INFINITY, |r| r.ch[0].slow_g = f32::NAN];
         for poison in poisons {
             let mut u = Unit::new(params());
             let (o, h) = run(&mut u, 0.01, 1024);

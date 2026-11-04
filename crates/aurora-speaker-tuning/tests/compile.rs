@@ -257,6 +257,8 @@ fn lsm2_state(tweak: impl Fn(&mut BTreeMap<u32, f32>)) -> ParamState {
     let mut m: BTreeMap<u32, f32> = BTreeMap::new();
     m.insert(id::ENABLE_CLOSED_LOOP_TEMPERATURE, 0.0);
     m.insert(id::BYPASS_SYS_ID, 1.0);
+    // type-A PilotToneAmplitude_dB: the peak axis reserves it
+    m.insert(1024 + 2, -40.0);
     for c in 0..8 {
         m.insert(id::CH_TUNING + c, 0.0);
         m.insert(id::CH_SPEAKER_TYPE + c, 0.0);
@@ -380,6 +382,7 @@ fn lsm2_fields_follow_the_id_rule() {
     assert_eq!((x.velocity_limit, x.mask_band_hz), ([0.5, 0.6, 0.9], [8000.0, 12000.0]));
     assert!((x.mask_attack_fast_s - 0.005).abs() < 1e-9);
     assert_eq!(x.band_center_hz, [60.0, 300.0, 650.0, 1600.0, 5000.0]);
+    assert!((x.pilot_reserve - 0.01).abs() < 1e-7);
     // no property 6632 in the synthetic bundle: no masking path
     assert_eq!(x.pressure_taps, 0);
 }
