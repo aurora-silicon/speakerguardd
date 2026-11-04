@@ -6,20 +6,28 @@
 //! offset 4096  Ring<Telemetry, RING> (one record per completed unit block)
 //! ```
 //!
-//! The plugin is the only writer. The supervisor reads the header's
-//! `seq`/`frames`/`mono_ns` to judge freshness and drains the ring at its
-//! own pace; a slow reader loses the oldest records and sees the gap in the
-//! sequence numbers, the RT thread never waits.
+//! The plugin writes everything but `provided`. The supervisor reads the
+//! header's `seq`/`frames`/`mono_ns` to judge freshness and drains the ring
+//! at its own pace; a slow reader loses the oldest records and sees the gap
+//! in the sequence numbers, the RT thread never waits.
+//!
+//! Thermal state across processes (layout 3): `run` publishes the unit's
+//! hand-off record into `saved` (CLOCK_BOOTTIME stamps). The supervisor
+//! keeps the last good one under /run and writes it into `provided`, with
+//! the blob CRC it belongs to, so a new PipeWire process starts from the
+//! speakers' real temperature instead of cold.
 
 use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::fs::OpenOptions;
 use std::os::fd::AsRawFd;
 
 use sgv2_core::ring::Ring;
-use sgv2_core::{Health, Telemetry};
+use sgv2_core::{HandOff, Health, Telemetry};
+
+use crate::handoff::{boottime_ns, Slot};
 
 pub const MAGIC: u64 = u64::from_le_bytes(*b"SGV2ENG1");
-pub const LAYOUT: u32 = 2;
+pub const LAYOUT: u32 = 3;
 /// Telemetry records kept: 256 unit blocks, 2.7 s at 512 frames / 48 kHz.
 pub const RING: usize = 256;
 pub const HEADER_BYTES: usize = 4096;
@@ -45,6 +53,12 @@ pub struct PageHeader {
     /// Most restrictive gain of the active channels in the last record, as
     /// f32 bits; NaN when an active channel's gain is non-finite (a fault).
     pub min_gain_bits: AtomicU32,
+    /// The unit's latest hand-off record, written by the plugin.
+    pub saved: Slot,
+    /// The record for a new process to restore, written by the supervisor.
+    pub provided: Slot,
+    /// The blob payload CRC `provided` was saved under (0: none).
+    pub provided_crc: AtomicU32,
 }
 
 const _: () = assert!(core::mem::size_of::<PageHeader>() <= HEADER_BYTES);
@@ -130,6 +144,32 @@ impl EnginePage {
         self.ring().push(t);
         let g = min_gain(t, self.header().channels.load(Ordering::Relaxed) as usize);
         self.header().min_gain_bits.store(g.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Real time: the unit's hand-off record, for a later process.
+    #[inline]
+    pub fn publish_saved(&self, h: &HandOff) {
+        self.header().saved.publish_at(h, boottime_ns());
+    }
+
+    /// Not real time: the supervisor's record for this blob, and its age in
+    /// seconds, if it has one.
+    pub fn provided_for(&self, params_crc: u32) -> Option<(HandOff, f64)> {
+        let h = self.header();
+        let crc = h.provided_crc.load(Ordering::Acquire);
+        if params_crc == 0 || crc != params_crc {
+            return None;
+        }
+        h.provided.latest_at(boottime_ns())
+    }
+
+    /// The supervisor's side: offer `rec` (stamped `t_boottime_ns`) for
+    /// blob `params_crc`.
+    pub fn provide(&self, rec: &HandOff, t_boottime_ns: u64, params_crc: u32) {
+        let h = self.header();
+        h.provided_crc.store(0, Ordering::Release);
+        h.provided.publish_at(rec, t_boottime_ns);
+        h.provided_crc.store(params_crc, Ordering::Release);
     }
 
     /// Real time: the heartbeat, last.

@@ -11,3 +11,4 @@ pub mod lease;
 pub mod machine;
 pub mod observe;
 pub mod supervise;
+pub mod thermal;

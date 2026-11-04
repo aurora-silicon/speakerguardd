@@ -50,5 +50,9 @@ init_dgram_send(speakerguardd_t)
 # systemd's notify socket is labelled kernel_t on Fedora.
 kernel_dgram_send(speakerguardd_t)
 
+# The boot id (/proc/sys/kernel/random/boot_id) binds the persisted thermal
+# state to this boot.
+kernel_read_kernel_sysctls(speakerguardd_t)
+
 # Its configuration.
 files_read_etc_files(speakerguardd_t)

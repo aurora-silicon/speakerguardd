@@ -436,6 +436,75 @@ mod linux {
         }
     }
 
+    /// The thermal hand-off across engine and PipeWire restarts (see the
+    /// `thermal` module): every 100 ms take the engine's `saved` record if it
+    /// is trusted, offer it in the page's `provided` slot, and persist it to
+    /// `<user dir>/thermal` (root's, 0600) at most once a second. At start,
+    /// offer the persisted record if this boot, board, blob and geometry
+    /// match and it is at most ten minutes old. Normal priority, off the RT
+    /// loop.
+    fn spawn_thermal(page_path: PathBuf, file: PathBuf, header: sgv2_core::blob::Header, board: [u8; 8]) {
+        use sgv2_supervisor::thermal::{parse_boot_id, trusted, Persisted};
+        let _ = std::thread::Builder::new().name("sgv2-thermal".into()).spawn(move || {
+            let Ok(page) = EnginePage::open(&page_path.to_string_lossy()) else {
+                eprintln!("thermal: cannot map the engine page; no hand-off across restarts");
+                return;
+            };
+            let boot_id =
+                std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok().and_then(|t| parse_boot_id(&t));
+            let now = sgv2_lv2::handoff::boottime_ns;
+            match (boot_id, std::fs::read(&file).ok().and_then(|b| Persisted::decode(&b))) {
+                (Some(id), Some(p)) => match p.refusal(&id, &board, &header, now()) {
+                    None => {
+                        page.provide(&p.record, p.stamp_boottime_ns, header.payload_crc);
+                        eprintln!(
+                            "thermal: offering the state saved {} s ago",
+                            now().saturating_sub(p.stamp_boottime_ns) / 1_000_000_000
+                        );
+                    }
+                    Some(why) => eprintln!("thermal: not restoring the saved state: {why}"),
+                },
+                (None, _) => eprintln!("thermal: no boot id; the state is not persisted"),
+                _ => {}
+            }
+            let tmp = file.with_extension("new");
+            let mut last_stamp = 0u64;
+            let mut last_write = 0u64;
+            loop {
+                let h = page.header();
+                if let Some((rec, stamp)) = h.saved.read() {
+                    let ok =
+                        trusted(&rec, &header, h.params_crc.load(Ordering::Acquire), h.health.load(Ordering::Acquire));
+                    if ok && stamp != last_stamp {
+                        last_stamp = stamp;
+                        page.provide(&rec, stamp, header.payload_crc);
+                        if let Some(id) = boot_id {
+                            if now().saturating_sub(last_write) >= 1_000_000_000 {
+                                last_write = now();
+                                let p = Persisted {
+                                    boot_id: id,
+                                    board,
+                                    params_crc: header.payload_crc,
+                                    stamp_boottime_ns: stamp,
+                                    record: rec,
+                                };
+                                let written = std::fs::write(&tmp, p.encode())
+                                    .and_then(|()| {
+                                        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+                                    })
+                                    .and_then(|()| std::fs::rename(&tmp, &file));
+                                if let Err(e) = written {
+                                    eprintln!("thermal: {e}");
+                                }
+                            }
+                        }
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        });
+    }
+
     /// The helper's own directory: the user's, group root, setgid, 02750,
     /// so its reports (created 0640) are readable by the supervisor through
     /// the group, without CAP_DAC_OVERRIDE.
@@ -534,6 +603,8 @@ mod linux {
                 return EX_UNAVAILABLE;
             }
         };
+        let board_field = sgv2_core::blob::machine_field(&board).unwrap_or([0; 8]);
+        spawn_thermal(page_path.clone(), user_dir.join("thermal"), header, board_field);
         let helper = user_dir.join("helper");
         if let Err(e) = helper_dir(&helper, uid) {
             eprintln!("helper directory: {e}");
