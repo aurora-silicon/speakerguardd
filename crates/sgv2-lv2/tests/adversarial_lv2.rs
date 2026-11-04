@@ -58,7 +58,6 @@ fn a_null_program_port_mutes_the_connected_outputs() {
 /// the supervisor. Absent channels are NaN by design, so the page needs the
 /// channel count it was started with to tell the two apart.
 #[test]
-#[ignore = "FINDING 14 (lane B): the engine page shows a NaN gain as 1.0"]
 fn the_engine_page_never_reports_a_nan_gain_as_unity() {
     let path = std::env::temp_dir().join(format!("sgv2-adversarial-page-{}", std::process::id()));
     let path = path.to_str().unwrap().to_string();

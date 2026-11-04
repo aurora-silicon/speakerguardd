@@ -42,7 +42,8 @@ pub struct PageHeader {
     pub mono_ns: AtomicU64,
     pub health: AtomicU32,
     pub sense_delay: AtomicI32,
-    /// Most restrictive gain of the last record, as f32 bits.
+    /// Most restrictive gain of the active channels in the last record, as
+    /// f32 bits; NaN when an active channel's gain is non-finite (a fault).
     pub min_gain_bits: AtomicU32,
 }
 
@@ -127,7 +128,7 @@ impl EnginePage {
     #[inline]
     pub fn push(&self, t: &Telemetry) {
         self.ring().push(t);
-        let g = t.channels.iter().map(|c| c.gain).filter(|g| g.is_finite()).fold(1.0f32, f32::min);
+        let g = min_gain(t, self.header().channels.load(Ordering::Relaxed) as usize);
         self.header().min_gain_bits.store(g.to_bits(), Ordering::Relaxed);
     }
 
@@ -141,6 +142,24 @@ impl EnginePage {
         h.mono_ns.store(mono_ns(), Ordering::Relaxed);
         h.seq.fetch_add(1, Ordering::Release);
     }
+}
+
+/// The most restrictive gain of the `channels` active channels. A
+/// non-finite gain on an active channel is a fault and is reported as NaN,
+/// never dropped (absent channels beyond `channels` are NaN by design).
+/// With no channel count (0) only finite gains count, as before.
+pub fn min_gain(t: &Telemetry, channels: usize) -> f32 {
+    if channels == 0 {
+        return t.channels.iter().map(|c| c.gain).filter(|g| g.is_finite()).fold(1.0f32, f32::min);
+    }
+    let mut m = 1.0f32;
+    for c in &t.channels[..channels.min(t.channels.len())] {
+        if !c.gain.is_finite() {
+            return f32::NAN;
+        }
+        m = m.min(c.gain);
+    }
+    m
 }
 
 impl Drop for EnginePage {
