@@ -170,6 +170,23 @@ class Generated(unittest.TestCase):
 
 
 class Report(unittest.TestCase):
+    def setUp(self):
+        if not os.path.exists("/proc/self/stat"):
+            # not Linux: name a writer without /proc
+            sgs._WRITER = (os.getpid(), 4242)
+
+    def test_each_report_names_its_live_writer(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "session")
+            self.assertTrue(sgs.write_report(path, True, True))
+            fields = dict(w.split("=") for w in open(path).read().split())
+            self.assertEqual(int(fields["pid"]), os.getpid())
+            if os.path.exists("/proc/self/stat"):
+                self.assertEqual(int(fields["start"]), sgs.own_start())
+            self.assertEqual(sorted(fields), ["carrier", "links", "mono_ns", "pid", "start"])
+
     def test_the_report_is_renamed_into_place_whole_and_group_readable(self):
         import stat
         import tempfile
@@ -189,7 +206,7 @@ class Report(unittest.TestCase):
             # the stamp is CLOCK_MONOTONIC, the supervisor's clock
             import time
 
-            t = int(now.split("mono_ns=")[1])
+            t = int(now.split("mono_ns=")[1].split()[0])
             self.assertLessEqual(abs(time.monotonic_ns() - t), 1_000_000_000)
 
     def test_an_unwritable_directory_reports_failure(self):
