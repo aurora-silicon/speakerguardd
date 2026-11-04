@@ -19,7 +19,7 @@ use sgv2_core::ring::Ring;
 use sgv2_core::{Health, Telemetry};
 
 pub const MAGIC: u64 = u64::from_le_bytes(*b"SGV2ENG1");
-pub const LAYOUT: u32 = 1;
+pub const LAYOUT: u32 = 2;
 /// Telemetry records kept: 256 unit blocks, 2.7 s at 512 frames / 48 kHz.
 pub const RING: usize = 256;
 pub const HEADER_BYTES: usize = 4096;

@@ -1,9 +1,12 @@
-# PipeWire and WirePlumber templates
+# PipeWire templates
 
-Ownership: lane B. The graph generator emits, per machine, from that Mac's own tuning bundle:
+Generated per machine by `packaging/session/gen.py` from `packaging/session/machines.json`. Do not edit `sgv2-<machine>.conf` by hand.
 
-- `voicing-pre` filter-chain: the user-facing virtual sink and the stages Apple's graph runs before the protection unit;
-- `protect` filter-chain: an internal capture stream with N program ports and S sense ports (`node.autoconnect=false`, `stream.dont-remix=true`, `channelmix.disable=true`), the `sgv2` LV2 node with all channels in one instance, then the stages Apple's graph runs after the unit;
-- a WirePlumber component that puts the sense source in the speaker sink's driver group, makes the exact links, and reports the link set and carrier volume to the supervisor.
+Each file holds:
+- the speaker amps' ALSA sink (`hw:CARD=<card>,DEV=1`);
+- the sense source (`DEV=2`), in one `node.group`, at a 512-frame quantum;
+- the protect filter-chain around one `sgv2` LV2 instance. Its input is named `alsa_output.platform-sound.RawSpeakers`, the name the machine's voicing graph targets.
 
-TODO(lane B): templates and generator.
+See `gen.py` for the whole graph and `../session/speakerguardd-session` for the links and the report.
+
+TODO(lane B): replace the interim voicing (the aurora-audio graph of the machine) with the generated voicing-pre.
