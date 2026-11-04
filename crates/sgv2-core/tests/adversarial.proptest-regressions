@@ -16,3 +16,4 @@ cc f86873df9f30d7ba583390cb0eab63ed218bac9c8ea5230ee404c5f512bf5c59 # shrinks to
 cc e13d300a1304e0f8a1db5a7b3bea4e91ba36cb05e0f9043404e73f6fa4163c2b # shrinks to seed = 2037991125700493766, n = 4, amp = 1.122032, f = 1012.1427973227097
 cc dc455f184f9eef3f17565bc647e70dc93b00d4c5b2fd770b2e7b6dbb442a01b3 # shrinks to seed = 5806800365313165976, n = 5, blk = 512, rate = 96000, ff = Off, len = 21587, amp = 0.01, h = Clean, a = 316476562485912059, b = 3063256365699115577
 cc 4c69f5d32caf3e501b8ac0612c75c6e6a4bfba358b31cd7e75084a75332f1a1d # shrinks to seed = 6630303038198541121, which = 1, n = 3, mutations = 1, fix = true
+cc 54f18330d24211715b220ad41f8fff9ec981d7051aeaf20d21ab7f3fe75a21a6 # shrinks to seed = 14628931790605482143, which = 2, n = 1, mutations = 5, fix = true

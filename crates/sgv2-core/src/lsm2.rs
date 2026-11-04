@@ -70,9 +70,10 @@
 //!   `Tvc = Tamb + theta_mag + theta_vc` (rig laws 3 and 4: the monitor
 //!   reads `Vfs * output` bit for bit).
 //!
-//! Full scale: the program is held to digital full scale (`clamp(x, -1,
-//! 1)`, a non-finite sample 0) before the bank and every model, so a huge
-//! finite sample cannot leave the model hot for minutes. A model state that
+//! Full scale: the output is held to digital full scale (`clamp(x, -1,
+//! 1)`, a non-finite sample 0). The bank and every model see the program
+//! unclamped as the reference does, bounded only at `dsp::METER_FS` (16
+//! FS), so a huge finite sample cannot overflow them. A model state that
 //! goes non-finite latches the 20 dB fail-safe (`Health::MODEL_FAULT`) until
 //! reset. `EnableMitigation = 0` (macOS: model only, no attenuation) and a
 //! tuning with neither thermal axis are refused: either would run the
@@ -1026,12 +1027,12 @@ impl Run {
         let (mitigate, look, half) = (self.mitigate, self.look, self.half);
         let (r_attack, r_fast, r_low, r_slow) = (self.r_attack, self.r_fast, self.r_low, self.r_slow);
         let c = &mut self.ch[ci];
-        // The peak axis sees the drive as delivered (a sample above full
-        // scale gets the gain that brings it to the limit; a non-finite one
-        // the most restrictive); everything else the program held to full
-        // scale.
-        c.pk_in = c.pk_in.max(if x.is_finite() { x.abs() } else { f32::MAX });
-        let x = dsp::bound1(x);
+        // Everything sees the drive as delivered (unclamped: the peak axis
+        // gives a sample above full scale the gain that brings it to the
+        // limit), bounded only at METER_FS; a non-finite sample is 0 to the
+        // models and the most restrictive to the peak axis.
+        c.pk_in = c.pk_in.max(if x.is_finite() { dsp::meter1(x).abs() } else { dsp::METER_FS });
+        let x = dsp::meter1(x);
         c.hist.push(x);
         // The program the bands resynthesise, at the bank's centre.
         let centre = c.hist.ago(half);
@@ -1077,15 +1078,15 @@ impl Run {
                 }
             }
         }
-        // Held to digital full scale on the output too: band corrections on
-        // a full-scale input can ring past it.
-        let y = y.clamp(-1.0, 1.0);
-        // Monitor on the protected output.
+        // Monitor on the protected output as the reference produces it
+        // (unclamped, within METER_FS times the gain) ...
         let u = c.vfs * y as f64;
         let i = c.current.step(u);
         let p = u * i;
         c.sub_acc += p;
-        y
+        // ... and the output held to digital full scale: an over-range
+        // program and band corrections on a full-scale input can exceed it.
+        y.clamp(-1.0, 1.0)
     }
 
     /// The 32-frame power substep of every channel.

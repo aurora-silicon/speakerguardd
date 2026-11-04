@@ -408,7 +408,20 @@ fn run(a: &Args) -> io::Result<()> {
         }
     }
     let cfprop_ids: Vec<u32> = a.cfprops.iter().map(|(id, _)| *id).collect();
-    let (mut unit, params) = make_unit(a.unit, blob.as_deref(), cpms, &a.preset_params);
+    // atsp parameters at frame 0 that the unit cannot change at run time
+    // are the rig's pre-render settings: apply them to the decoded preset
+    let mut preset = a.preset_params.clone();
+    let mut params_at = a.params_at.clone();
+    if a.unit == UnitKind::Atsp {
+        params_at.retain(|&(f, id, v)| {
+            let pre = f == 0 && id != 0;
+            if pre {
+                preset.push((id, v));
+            }
+            !pre
+        });
+    }
+    let (mut unit, params) = make_unit(a.unit, blob.as_deref(), cpms, &preset);
     let mut stdout_trace;
     let mut file_trace = open_out(&a.out)?;
     let trace: &mut dyn Write = match file_trace.as_mut() {
@@ -427,7 +440,7 @@ fn run(a: &Args) -> io::Result<()> {
         &program,
         &sense,
         &a.slices,
-        &a.params_at,
+        &params_at,
         &cfprop_ids,
         trace,
         audio.as_mut().map(|w| w as &mut dyn Write),

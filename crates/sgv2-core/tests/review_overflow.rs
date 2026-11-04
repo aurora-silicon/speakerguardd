@@ -72,7 +72,6 @@ fn atsp_huge_finite_samples_neither_unlock_nor_mute() {
 /// make the unit louder, poison the state, or leave the model hot for
 /// longer than that heat takes to clear.
 #[test]
-#[ignore = "B3 MERGE (lane B3): this lsm2 meters the program held to +-1; port the 16 FS meter guard"]
 fn lsm2_huge_finite_samples_do_not_poison_the_model() {
     let x: Vec<f32> = (0..RATE as usize * 5)
         .map(|k| 0.3 * (2.0 * std::f64::consts::PI * 150.0 * k as f64 / RATE as f64).sin() as f32)
@@ -111,7 +110,6 @@ fn lsm2_huge_finite_samples_do_not_poison_the_model() {
 /// unclamped (a tuning's EQ can peak just over full scale), up to the
 /// 16 FS bound; only the output is held to full scale.
 #[test]
-#[ignore = "B3 MERGE (lane B3): this lsm2 meters the program held to +-1; port the 16 FS meter guard"]
 fn over_range_program_is_metered_unclamped_up_to_sixteen_fs() {
     let temp = |x: f32| {
         let mut u = spp3::Unit::new(spp3_params());

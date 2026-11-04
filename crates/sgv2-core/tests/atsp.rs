@@ -147,7 +147,9 @@ fn bypass_copies_and_freezes() {
         let mut o: Vec<&mut [f32]> = outs.iter_mut().map(|b| &mut b[..]).collect();
         u.process(Io { frames: 512, input: &i, sense: &[], output: &mut o });
     }
-    assert_eq!(outs, ins, "bit-exact copy");
+    // a bit-exact copy of in-range program, held to full scale above it
+    let want: Vec<Vec<f32>> = ins.iter().map(|b| b.iter().map(|v| v.clamp(-1.0, 1.0)).collect()).collect();
+    assert!(outs == want, "bit-exact copy");
     assert!(u.set_parameter(0, 0.0));
     let after = {
         let mut t = Telemetry::new();

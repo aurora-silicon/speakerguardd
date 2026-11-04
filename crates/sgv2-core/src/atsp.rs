@@ -38,9 +38,12 @@
 //!   thermal, gain, link and startup state; clearing it resumes that state.
 //!
 //! Non-finite input contributes zero power and gives a zero output sample,
-//! so it can never poison the thermal state.
+//! so it can never poison the thermal state. The output is the program held
+//! to full scale times the gain; both meters see it unclamped as the
+//! reference does, bounded at `dsp::METER_FS` (16 FS).
 //!
-//! The payload's `block_frames` is accepted and ignored: the unit is
+//! The payload's `block_frames` sets only when a panic may release (below);
+//! otherwise the unit is
 //! sample-continuous for every host slice of two frames or more (spec 6).
 //!
 //! TODO(SPEC):
@@ -65,10 +68,12 @@
 //!   one-pole toward a request near 0.53), holds about 0.5 s before
 //!   releasing and recovers along an S-curve: not the first-order
 //!   99 %-settling law the specification states and this unit implements.
-//! - **Panic transition.** 25G83 falls from 0.95 to 0.086 within about
-//!   30 ms of crossing `Tlim + headroom` (below the 0.1 target), then
-//!   releases from there; through the 800 ms attack the request cap takes
-//!   about 0.8 s.
+//! - **Panic transition.** 25G83 falls 1 -> 0.98 -> 0.66 -> 0.28 -> 0.11 ->
+//!   0.081 over about 40 ms of crossing `Tlim + headroom` (10 ms windows,
+//!   whatever the attack), then settles at 0.1 and releases with the gain
+//!   (0.17 after 0.5 s). Here the 0.1 cap applies at once and holds to the
+//!   next controller block boundary (more restrictive for those 40 ms;
+//!   never less), and the smoothed gain follows the capped request.
 //! - **Q = 1.** macOS takes a distinct path for one-frame host calls (the
 //!   tone-burst gain is 1.0019 to 1.0027 there); it is not specified, and
 //!   this unit renders Q = 1 like any other slice.
@@ -315,6 +320,10 @@ struct Run {
     frame: u64,
     /// A model state went non-finite: the fail-safe is latched until reset.
     fault: bool,
+    /// The controller block (`block_frames`; 0 is the host call) and the
+    /// position in it.
+    block: usize,
+    blk_pos: usize,
 }
 
 pub struct Unit {
@@ -388,6 +397,8 @@ impl Run {
             dez_now: 0.0,
             frame: 0,
             fault: false,
+            block: p.block_frames as usize,
+            blk_pos: 0,
         })
     }
 
@@ -405,6 +416,7 @@ impl Run {
         // the dezipper is not restarted by a reset (rig law)
         self.frame = 0;
         self.fault = false;
+        self.blk_pos = 0;
     }
 
     /// Advance the output dezipper one active frame (module docs).
@@ -421,13 +433,24 @@ impl Run {
         let n = self.n;
         let mut failed = false;
         for k in 0..io.frames {
+            // controller blocks of `block_frames` (0: the host call)
+            let boundary = if self.block == 0 { k == 0 } else { self.blk_pos == 0 };
+            self.blk_pos = if self.block == 0 { 0 } else { (self.blk_pos + 1) % self.block };
             // 1. requests from the state before this sample
             let mut req = [1.0f64; MAX_CHANNELS];
+            let mut pan = [false; MAX_CHANNELS];
             for (c, ch) in self.ch.iter_mut().enumerate() {
                 let t_vc = ch.ambient + ch.theta_mg + ch.theta_vc;
                 // `>` enters, `<=` recovers; a NaN state stays restrictive
                 ch.limiting = t_vc > ch.limit || t_vc.is_nan();
-                ch.panic = t_vc > ch.hard_limit || t_vc.is_nan();
+                // the panic enters at once and releases only at a controller
+                // block boundary with the coil back at the hard limit (the
+                // 25G83 controller is block-wise once it limits)
+                if t_vc > ch.hard_limit || t_vc.is_nan() {
+                    ch.panic = true;
+                } else if boundary {
+                    ch.panic = false;
+                }
                 let mut r = 1.0;
                 if ch.limiting {
                     let allow = ((ch.limit - ch.ambient - ch.theta_mg) / ch.rth_vc).max(0.0);
@@ -441,13 +464,16 @@ impl Run {
                 }
                 ch.request = r;
                 req[c] = r;
+                pan[c] = ch.panic;
             }
             for s in 0..3 {
                 if self.link_slot[s] {
                     let m = self.ch.iter().filter(|c| c.slot == s).fold(1.0f64, |m, c| nan_min(m, c.request));
+                    let any = self.ch.iter().any(|c| c.slot == s && c.panic);
                     for (c, ch) in self.ch.iter().enumerate() {
                         if ch.slot == s {
                             req[c] = m;
+                            pan[c] |= any;
                         }
                     }
                 }
@@ -455,6 +481,8 @@ impl Run {
             if self.link_all {
                 let m = req[..n].iter().fold(1.0f64, |m, &r| nan_min(m, r));
                 req[..n].iter_mut().for_each(|r| *r = m);
+                let any = pan[..n].iter().any(|&p| p);
+                pan[..n].iter_mut().for_each(|p| *p |= any);
             }
             // 2. smooth, apply, integrate
             let d = self.dezipper();
@@ -465,12 +493,22 @@ impl Run {
                 // both meters; a non-finite sample is 0
                 let raw = io.input[c][k];
                 failed |= !raw.is_finite();
+                // the output takes the program held to full scale; the
+                // meters see it unclamped (to METER_FS) as the reference
                 let x = crate::dsp::bound1(raw) as f64;
+                let xm = crate::dsp::meter1(raw) as f64;
                 // never above the input (review_bound): the dezipper's
                 // overshoot and fixed point are capped at unity
-                io.output[c][k] = (x * (ch.gain * d).min(1.0)) as f32;
-                ch.p_drive += ch.a_attack * (ch.elec * x * x - ch.p_drive);
-                let u = ch.gain * x;
+                // the panic is immediate (the 25G83 gain is down 20 dB within
+                // about 50 ms whatever the attack): at most 0.1 at once
+                // (linked like the requests; after the dezipper, so its
+                // overshoot cannot lift the cap)
+                let g = ch.gain * d;
+                let g = if g.is_finite() { g.clamp(0.0, 1.0) } else { 0.0 };
+                let g = if pan[c] { g.min(PANIC_GAIN) } else { g };
+                io.output[c][k] = (x * g) as f32;
+                ch.p_drive += ch.a_attack * (ch.elec * xm * xm - ch.p_drive);
+                let u = ch.gain * xm;
                 let p = ch.elec * u * u;
                 ch.p_model = p;
                 // series network: the coil rise over the magnet plus the
@@ -532,8 +570,12 @@ impl ProtectionUnit for Unit {
             return Health(Health::FAILSAFE | Health::MODEL_FAULT);
         }
         if self.bypass {
+            // a bit-exact copy of in-range program; held to full scale (a
+            // non-finite sample 0) like every engine output
             for c in 0..run.n {
-                io.output[c][..frames].copy_from_slice(&io.input[c][..frames]);
+                for (o, &x) in io.output[c][..frames].iter_mut().zip(&io.input[c][..frames]) {
+                    *o = crate::dsp::bound1(x);
+                }
             }
             run.frame += frames as u64;
             return Health::OK;
