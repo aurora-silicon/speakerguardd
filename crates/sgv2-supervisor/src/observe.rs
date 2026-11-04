@@ -24,19 +24,26 @@
 //!    the supervisor grants.
 //! 4. The session helper sees the grant and links the amps; the amps' sink
 //!    opens and prepares the PCM and starts it (the kernel admits the start
-//!    because the grant is live), and the driver moves to the sink.
-//!    - While the PCM is OPEN, SETUP or PREPARED within [`START_GRACE_NS`]
-//!      of the first tick that saw it open, the supervisor holds: it
-//!      neither renews nor releases ([`Observation::pcm_settling`]). The
-//!      30 ms lease covers that; a start slower than the lease lapses, and
-//!      the grant comes back through two clean ticks.
-//!    - The heartbeat may pause across the driver switch: the same window
-//!      adds [`START_GRACE_NS`] to its bound, once per start.
-//! 5. From then on only RUNNING renews. XRUN, PAUSED, SUSPENDED or a
-//!    PREPARED state outside the start window releases at once, as does any
-//!    other fault. The kernel stops the stream, the helper unlinks the amps,
-//!    the protect stage falls back to the dummy driver and beats again, the
-//!    PCM closes, and the sequence resumes at 3.
+//!    because the grant is live), and the driver moves from the dummy driver
+//!    to the sink. The graph reactivates across that switch (the page's
+//!    frame count restarts) and the heartbeat pauses: lane B2 measured up to
+//!    63 ms on the J616s.
+//! 5. From then on the grant is renewed while the engine beats and the PCM
+//!    is Closed, Open (OPEN, SETUP, PREPARED) or RUNNING, owned by the
+//!    engine's process. XRUN, PAUSED, SUSPENDED or an unknown state releases
+//!    at once, as does any other fault. The kernel stops the stream, the
+//!    helper unlinks the amps, the protect stage falls back to the dummy
+//!    driver and beats again; the sink keeps the PCM PREPARED and retries its
+//!    start, and the sequence resumes at 3 from there.
+//!
+//! The heartbeat bound is two quanta plus a tick, plus [`START_GRACE_NS`]
+//! where the driver switch happens and nothing can play:
+//! - Closed: strict. Anyone could open and start the PCM while it is granted.
+//! - Open, owned by the engine's process: + grace. The PCM is not running,
+//!   only that process holds it and can start it, and it can do so only by
+//!   running the graph, which beats.
+//! - RUNNING: + grace for [`START_GRACE_NS`] after it is first seen running,
+//!   strict from then on.
 //!
 //! A dead or stopped engine therefore releases within one staleness bound,
 //! or sooner when the PCM XRUNs, and nothing renews without it.
@@ -143,9 +150,10 @@ pub const SESSION_STALE_NS: u64 = 100_000_000;
 /// the supervisor read the same CLOCK_MONOTONIC and the supervisor reads its
 /// clock after the file, so a report is never ahead: 1 ms is slack only.
 pub const SESSION_SKEW_NS: u64 = 1_000_000;
-/// Extra heartbeat age tolerated once, from the tick a speaker PCM start is
-/// first seen (Closed to Open or Running), while PipeWire moves the protect
-/// stage from the dummy driver to the amps' sink. Steady state has none.
+/// Extra heartbeat age tolerated while PipeWire moves the protect stage from
+/// the dummy driver to the amps' sink: while the PCM is open but not
+/// running, and for this long after it starts running. Steady state (RUNNING
+/// after that, or Closed) has none.
 pub const START_GRACE_NS: u64 = 50_000_000;
 
 /// Freshness bound while the engine runs: two unit quanta (the
@@ -164,7 +172,7 @@ pub struct Observer {
     last_advance_ns: Option<u64>,
     /// The graph quantum, from frames over beats between two advances.
     quantum: Option<u64>,
-    pcm_was_closed: bool,
+    was_running: bool,
     grace_until: Option<u64>,
 }
 
@@ -178,7 +186,7 @@ impl Observer {
             last_frames: 0,
             last_advance_ns: None,
             quantum: None,
-            pcm_was_closed: true,
+            was_running: false,
             grace_until: None,
         }
     }
@@ -209,7 +217,11 @@ impl Observer {
         match self.last_seq {
             Some(l) if e.seq > l => {
                 let beats = e.seq - l;
-                self.quantum = e.frames.checked_sub(self.last_frames).filter(|f| *f > 0).map(|f| f / beats);
+                // a reactivated graph restarts the frame count: keep the
+                // quantum learnt so far and learn again from the next beat
+                if let Some(q) = e.frames.checked_sub(self.last_frames).filter(|f| *f > 0).map(|f| f / beats) {
+                    self.quantum = Some(q);
+                }
                 self.last_advance_ns = Some(now_ns);
             }
             Some(l) if e.seq < l => {
@@ -223,18 +235,19 @@ impl Observer {
         self.last_frames = e.frames;
 
         let closed = matches!(p, PcmState::Closed);
-        if self.pcm_was_closed && matches!(p, PcmState::Open { .. } | PcmState::Running { .. }) {
+        let running = matches!(p, PcmState::Running { .. });
+        if running && !self.was_running {
             self.grace_until = Some(now_ns + START_GRACE_NS);
         }
-        self.pcm_was_closed = closed;
-        let in_start = match self.grace_until {
-            Some(t) if now_ns < t && matches!(p, PcmState::Open { .. } | PcmState::Running { .. }) => true,
-            _ => {
-                self.grace_until = None;
-                false
-            }
+        if !running {
+            self.grace_until = None;
+        }
+        self.was_running = running;
+        let grace = match p {
+            PcmState::Open { .. } => START_GRACE_NS,
+            PcmState::Running { .. } if self.grace_until.is_some_and(|t| now_ns < t) => START_GRACE_NS,
+            _ => 0,
         };
-        let grace = if in_start { START_GRACE_NS } else { 0 };
 
         let heartbeat_fresh = match self.quantum.filter(|q| (1..=MAX_QUANTUM).contains(q)) {
             Some(q) => {
@@ -250,11 +263,7 @@ impl Observer {
             Some(owner) => owner == e.pid && e.pid != 0,
             None => closed,
         };
-        let (pcm_state_ok, pcm_settling) = match p {
-            PcmState::Closed | PcmState::Running { .. } => (true, false),
-            PcmState::Open { .. } => (in_start, in_start),
-            PcmState::Stopped { .. } | PcmState::Unknown => (false, false),
-        };
+        let pcm_state_ok = matches!(p, PcmState::Closed | PcmState::Open { .. } | PcmState::Running { .. });
         let session_fresh = s.present
             && s.mono_ns <= now_ns.saturating_add(SESSION_SKEW_NS)
             && now_ns.saturating_sub(s.mono_ns) <= SESSION_STALE_NS;
@@ -265,7 +274,6 @@ impl Observer {
             carrier_ok: session_fresh && s.carrier_ok,
             pcm_owner_ok,
             pcm_state_ok,
-            pcm_settling,
             // the supervisor fills these from the kernel
             route_ok: false,
             amps_ok: false,
@@ -751,42 +759,106 @@ mod tests {
         assert_eq!(parse_pcm_info("card: 1\n"), None);
     }
 
+    /// Lane B2's J616s cold start (f9d2b08, r3): the protect stage beats at
+    /// 1024 on the dummy driver; after the grant the sink opens and prepares
+    /// the PCM, the heartbeat pauses 63 ms across the driver switch, the
+    /// graph reactivates (frames restart at 768), and it runs at 512.
     #[test]
-    fn any_stopped_state_is_never_renewed_and_prepared_only_settles_at_a_start() {
+    fn the_j616s_cold_start_stays_fresh_and_a_prepared_pcm_can_be_granted() {
+        let q1024 = 21_333_333u64;
+        let q512 = 10_666_666u64;
         let mut o = Observer::new(7, 48_000, TICK);
-        let period = 10_666_666u64;
-        let mut seq = 0;
-        let mut at = |o: &mut Observer, now: u64, pcm: PcmState| {
-            seq = now / period;
-            o.observe(&mut || now, &mut E(beat(seq, 512, seq * period)), &mut P(pcm), &mut S(session(now)))
+        let obs_at = |o: &mut Observer, now: u64, seq: u64, frames: u64, mono: u64, pcm: PcmState| {
+            let e = EngineState { valid: true, pid: PID, params_crc: 7, seq, frames, mono_ns: mono, health: 0 };
+            o.observe(&mut || now, &mut E(e), &mut P(pcm), &mut S(session(now)))
         };
-        for k in 0..5 {
-            at(&mut o, k * TICK, PcmState::Closed);
+        let ok = |obs: Observation| obs.heartbeat_fresh && obs.pcm_state_ok && obs.pcm_owner_ok;
+        // idle on the dummy driver, 1024 frames a beat
+        let (mut seq, mut frames, mut mono) = (0u64, 0u64, 0u64);
+        for k in 0..20u64 {
+            let now = k * TICK;
+            let beats = now / q1024;
+            if beats > seq {
+                frames += (beats - seq) * 1024;
+                seq = beats;
+                mono = beats * q1024;
+            }
+            let obs = obs_at(&mut o, now, seq, frames, mono, PcmState::Closed);
+            assert!(ok(obs) || k < 3, "idle tick {k}");
         }
-        // the sink opens and prepares: hold, neither renew nor release
-        let obs = at(&mut o, 50_000_000, PcmState::Open { owner: PID });
-        assert!(obs.pcm_state_ok && obs.pcm_settling);
-        let obs = at(&mut o, 60_000_000, PcmState::Running { owner: PID });
-        assert!(obs.pcm_state_ok && !obs.pcm_settling && obs.heartbeat_fresh);
-        // an XRUN (the engine stopped feeding the amps) is a fault at once,
-        // with the heartbeat still fresh
-        let obs = at(&mut o, 70_000_000, PcmState::Stopped { owner: PID });
-        assert!(!obs.pcm_state_ok && obs.heartbeat_fresh);
-        // re-prepared after an XRUN, outside a start from Closed: a fault
-        let obs = at(&mut o, 80_000_000, PcmState::Open { owner: PID });
-        assert!(!obs.pcm_state_ok && !obs.pcm_settling);
-        // a start that never runs stops settling after the window
+        // granted at 200 ms; the sink prepares, and the engine pauses 63 ms
+        // after its last beat
+        let open = PcmState::Open { owner: PID };
+        let pause_end = mono + 63_000_000;
+        let mut now = 200_000_000;
+        while now < pause_end {
+            assert!(ok(obs_at(&mut o, now, seq, frames, mono, open)), "prepared, paused, at {now}");
+            now += TICK;
+        }
+        // the graph reactivates: frames restart at 768, then 512 a beat, and
+        // the sink starts
+        seq += 1;
+        frames = 768;
+        mono = pause_end;
+        assert!(ok(obs_at(&mut o, now, seq, frames, mono, open)), "reactivated");
+        let run = PcmState::Running { owner: PID };
+        for k in 0..30u64 {
+            let t = now + 1_000 + k * q512;
+            seq += 1;
+            frames += 512;
+            mono = t - 1_000;
+            assert!(ok(obs_at(&mut o, t, seq, frames, mono, run)), "running beat {k}");
+            now = t;
+        }
+        assert_eq!(o.bound_ns(), Some(stale_ns(512, 48_000, TICK)));
+        // steady state is strict: a stall past 2 quanta + a tick is stale
+        assert!(
+            !obs_at(&mut o, mono + stale_ns(512, 48_000, TICK) + 1_000_000, seq, frames, mono, run).heartbeat_fresh
+        );
+        // an XRUN is a fault at once, even with a fresh heartbeat
+        seq += 1;
+        frames += 512;
+        mono += q512;
+        let obs = obs_at(&mut o, mono + 1_000, seq, frames, mono, PcmState::Stopped { owner: PID });
+        assert!(obs.heartbeat_fresh && !obs.pcm_state_ok);
+        // after the release the sink re-prepares and retries; the engine
+        // beats again on the dummy driver: a prepared PCM owned by the engine
+        // can be granted again (B2 r3 waited 5.2 s for a close)
+        let t0 = mono;
+        for k in 1..6u64 {
+            seq += 1;
+            frames += 1024;
+            mono = t0 + k * q1024;
+            assert!(ok(obs_at(&mut o, mono + 1_000, seq, frames, mono, open)), "re-prepared {k}");
+        }
+        // but not owned by anyone else, and not with a dead engine
+        assert!(!obs_at(&mut o, mono + 2_000, seq, frames, mono, PcmState::Open { owner: 1 }).pcm_owner_ok);
+        let bound = stale_ns(1024, 48_000, TICK) + START_GRACE_NS;
+        assert!(!obs_at(&mut o, mono + bound + 1_000_000, seq, frames, mono, open).heartbeat_fresh);
+    }
+
+    #[test]
+    fn closed_is_strict_and_unknown_or_stopped_is_never_ok() {
         let mut o = Observer::new(7, 48_000, TICK);
-        for k in 0..5 {
-            at(&mut o, k * TICK, PcmState::Closed);
+        let q = 10_666_666u64;
+        for k in 0..5u64 {
+            let seq = k * TICK / q;
+            o.observe(
+                &mut || k * TICK,
+                &mut E(beat(seq, 512, seq * q)),
+                &mut P(PcmState::Closed),
+                &mut S(session(k * TICK)),
+            );
         }
-        let open_at = 50_000_000;
-        assert!(at(&mut o, open_at, PcmState::Open { owner: PID }).pcm_settling);
-        assert!(at(&mut o, open_at + START_GRACE_NS - TICK, PcmState::Open { owner: PID }).pcm_settling);
-        let obs = at(&mut o, open_at + START_GRACE_NS, PcmState::Open { owner: PID });
-        assert!(!obs.pcm_state_ok && !obs.pcm_settling);
-        // unknown (unreadable, or a read that did not complete in time)
-        assert!(!at(&mut o, open_at + START_GRACE_NS + TICK, PcmState::Unknown).pcm_state_ok);
+        let seq = 40_000_000 / q;
+        let last = seq * q;
+        let strict = stale_ns(512, 48_000, TICK);
+        let at = |o: &mut Observer, now: u64, pcm: PcmState| {
+            o.observe(&mut || now, &mut E(beat(seq, 512, last)), &mut P(pcm), &mut S(session(now)))
+        };
+        assert!(!at(&mut o, last + strict + 1_000_000, PcmState::Closed).heartbeat_fresh);
+        assert!(!at(&mut o, last + 1_000_000, PcmState::Unknown).pcm_state_ok);
+        assert!(!at(&mut o, last + 1_000_000, PcmState::Stopped { owner: PID }).pcm_state_ok);
     }
 
     #[test]

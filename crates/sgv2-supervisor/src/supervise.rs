@@ -31,11 +31,7 @@ use crate::machine::{full_scale_mv, same_operating_point, Amp, Machine};
 pub enum Event {
     Granted,
     Renewed,
-    /// The PCM is starting: the grant stands, unrenewed.
-    Held,
-    Released {
-        why: Observation,
-    },
+    Released { why: Observation },
     StayedReleased,
     HardFault(String),
     Lapsed,
@@ -178,7 +174,6 @@ impl Supervisor {
                 }
                 Err(e) => Err(Fatal::Kernel(e)),
             },
-            Action::Hold => Ok(Event::Held),
             Action::Release => {
                 kernel.release().map_err(Fatal::Kernel)?;
                 Ok(Event::Released { why: obs })
@@ -210,7 +205,6 @@ mod tests {
         carrier_ok: true,
         pcm_owner_ok: true,
         pcm_state_ok: true,
-        pcm_settling: false,
         route_ok: false,
         amps_ok: false,
     };
