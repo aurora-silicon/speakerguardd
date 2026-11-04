@@ -70,8 +70,9 @@ impl ProtectionUnit for Unit {
             let g = if ok { self.gain[c.min(MAX_CHANNELS - 1)] } else { FAILSAFE_GAIN.min(self.gain[0]) };
             match io.input.get(c) {
                 Some(inp) if inp.len() >= n => {
-                    dsp::scale_to(&inp[..n], g, &mut out[..n]);
-                    dsp::sanitize(&mut out[..n]);
+                    for (o, &x) in out[..n].iter_mut().zip(&inp[..n]) {
+                        *o = dsp::bound1(x) * g;
+                    }
                 }
                 _ => out[..n].fill(0.0),
             }
