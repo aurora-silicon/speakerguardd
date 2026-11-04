@@ -91,7 +91,7 @@ impl AnyUnit {
             AnyUnit::FailSafe(u) => u,
         }
     }
-    pub fn as_ref(&self) -> &dyn ProtectionUnit {
+    pub fn unit(&self) -> &dyn ProtectionUnit {
         match self {
             AnyUnit::Spp3(u) => u.as_ref(),
             AnyUnit::Placeholder(u) => u,
@@ -188,7 +188,7 @@ unsafe extern "C" fn instantiate(
     let (unit, _err, params_crc) = load_unit(blob.as_deref(), rate, channels, sense, role);
     let page = page::EnginePage::open(&page_path).ok();
     if let Some(p) = &page {
-        p.start(params_crc, unit.as_ref().latency_frames(), channels as u32, sense as u32);
+        p.start(params_crc, unit.unit().latency_frames(), channels as u32, sense as u32);
     }
     let instance = Box::new(Instance {
         channels,
@@ -272,7 +272,7 @@ unsafe extern "C" fn run(handle: *mut c_void, frames: u32) {
     instance.frames += frames as u64;
     let delay = instance.unit.sense_delay().map_or(-1, |d| d as i32);
     if let Some(page) = &instance.page {
-        instance.unit.as_ref().telemetry(&mut instance.telemetry);
+        instance.unit.unit().telemetry(&mut instance.telemetry);
         if instance.telemetry.frame != instance.last_frame {
             instance.last_frame = instance.telemetry.frame;
             page.push(&instance.telemetry);
