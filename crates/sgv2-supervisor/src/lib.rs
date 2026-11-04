@@ -8,3 +8,5 @@
 
 pub mod kernel;
 pub mod lease;
+pub mod observe;
+pub mod supervise;

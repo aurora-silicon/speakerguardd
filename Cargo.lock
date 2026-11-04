@@ -53,5 +53,7 @@ name = "sgv2-supervisor"
 version = "1.0.0-alpha.1"
 dependencies = [
  "aurora-speaker-tuning",
+ "libc",
  "sgv2-core",
+ "sgv2-lv2",
 ]
