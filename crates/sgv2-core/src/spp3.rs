@@ -410,10 +410,13 @@ impl Params {
                 return Err(InitError::Invalid("Rampout"));
             }
             if c.pilot_tone_enabled != 0 {
-                if !(c.pilot_ampl_hi_db.is_finite() && c.pilot_ampl_hi_db <= 0.0) {
+                // any finite level: the amplitude is clamped to 0.3 (rig law
+                // 4), and the low level may lie above the high one (the rig's
+                // envelope cases)
+                if !c.pilot_ampl_hi_db.is_finite() {
                     return Err(InitError::Invalid("PilotAmplHi_dB"));
                 }
-                if !(c.pilot_ampl_lo_db.is_finite() && c.pilot_ampl_lo_db <= c.pilot_ampl_hi_db) {
+                if !c.pilot_ampl_lo_db.is_finite() {
                     return Err(InitError::Invalid("PilotAmplLo_dB"));
                 }
                 if !(c.pilot_upper_thres.is_finite()
@@ -846,7 +849,7 @@ impl Cl {
         self.r_window = self.cal_r as f32;
         self.valid = false;
         self.age = 0;
-        self.t_cl = self.cal_t;
+        self.t_cl = self.t_of_rs();
         self.limit_s = base;
         self.active = false;
     }
@@ -863,6 +866,19 @@ impl Cl {
         let keep = self.limit_s;
         self.reset(keep);
         self.limit_s = keep;
+    }
+
+    /// `T_CL` of the current smoothed resistance: `fmaf(invTempCo, (Rw -
+    /// Rshunt) / (R_cal - Rshunt) - 1, T_cal)` in Float32 with `Rw =
+    /// RdcScale * R_s`, the logged window resistance (rig law 3). Also the
+    /// start value: with RdcScale != 1 the reference's T_CL starts at this,
+    /// not at `T_cal` (rig, spp3-law-tcl-rdcscale: 3.63 ohm logged from
+    /// block 0 at RdcScale 1.1).
+    fn t_of_rs(&self) -> f64 {
+        let rw = self.rdc_scale as f32 * self.r_s;
+        let (rc, rs) = (self.cal_r as f32, self.rshunt);
+        let x = (rw - rs) / (rc - rs) - 1.0;
+        libm::fmaf(self.inv_temp_co, x, self.cal_t as f32) as f64
     }
 
     /// The sense bus could not feed a segment: the window is invalid and
@@ -908,10 +924,7 @@ impl Cl {
         // T_CL = fmaf(invTempCo, (Rw - Rshunt)/(R_cal - Rshunt) - 1, T_cal) in
         // Float32, Rw = RdcScale * R_s, the logged window resistance (rig
         // law 3)
-        let rw = self.rdc_scale as f32 * self.r_s;
-        let (rc, rs) = (self.cal_r as f32, self.rshunt);
-        let x = (rw - rs) / (rc - rs) - 1.0;
-        let t = libm::fmaf(self.inv_temp_co, x, self.cal_t as f32) as f64;
+        let t = self.t_of_rs();
         // TODO(SPEC): the range is tested on R_s here; the rig confirmed it
         // at RdcScale 1, so whether RdcScale applies first is open
         let re = self.r_s as f64;
