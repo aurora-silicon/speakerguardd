@@ -1,0 +1,31 @@
+name: Recorder integration suite
+on:
+  push:
+    branches:
+      - integration/recording-ring-preservation
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Full Rust suite
+        shell: bash
+        run: |
+          set +e
+          cargo test --locked --release -j8 -- --test-threads=4 > integration-suite.log 2>&1
+          echo "$?" > integration-suite-exit.txt
+          exit 0
+      - name: Recording preservation regressions
+        shell: bash
+        run: python3 tools/test-preserve-recordings.py > retention.log 2>&1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: recorder-integration-logs
+          path: |
+            integration-suite.log
+            integration-suite-exit.txt
+            retention.log

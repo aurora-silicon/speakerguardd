@@ -31,8 +31,18 @@
 //! record for the next boot configured it unlocks only once its /run state
 //! is written (no removal counts instead).  A start that finds the marker
 //! from this boot (or any marker it cannot read) starts latched.  So does
-//! one that finds speakersafetyd's flag, or a kernel override of the
-//! card's safe level (`protection_override`).
+//! one that finds speakersafetyd's flag (guard.rs `FOREIGN_FLAGS`, checked
+//! for every start), or a kernel override of the card's safe level
+//! (`protection_override`).
+//!
+//! **One model.**  The assumption bounds the model an owner governed.  A
+//! model the past owner did not govern has no bound from it: speakersafetyd
+//! governs the asahi model, macOS on the V/I machines its own, with
+//! constants up to three times apart.  So the evidence start runs only
+//! where every owner governs the same model: no V/I sense, the legacy
+//! governor and no guard (the Neo, whose model is macOS's lsm2 static model
+//! with its constants).  Anywhere else `evidence` starts latched
+//! (`one_model`).
 //!
 //! **Residual risks** (accepted, see the 2026-10-31 safety review):
 //! - An RTC set back by another OS by less than the true elapsed time
@@ -96,113 +106,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-
-
-// The two-node thermal model's closed forms (from the release candidate's
-// engine.rs), for the bounds below.
-fn hi(a: f64, b: f64) -> f64 {
-    if a.is_nan() || b.is_nan() {
-        f64::NAN
-    } else {
-        a.max(b)
-    }
-}
-
-/// Two cascaded first-order lags: the coil follows the magnet plus P*Rc,
-/// the magnet follows ambient plus P*Rm (the legacy model's equations).
-#[derive(Debug, Clone, PartialEq)]
-pub struct Thermal {
-    pub tr_coil: f64,
-    pub tau_coil: f64,
-    pub tr_magnet: f64,
-    pub tau_magnet: f64,
-    pub t_coil: f64,
-    pub t_magnet: f64,
-}
-
-impl Thermal {
-    pub fn new(tr_coil: f64, tau_coil: f64, tr_magnet: f64, tau_magnet: f64, t: f64) -> Thermal {
-        Thermal { tr_coil, tau_coil, tr_magnet, tau_magnet, t_coil: t, t_magnet: t }
-    }
-
-    /// The coil after `h` seconds at a constant `power`, in closed form:
-    /// `alpha + beta * power`.
-    pub fn coil_after(&self, h: f64, t_ambient: f64) -> (f64, f64) {
-        if (self.tau_magnet - self.tau_coil).abs() <= 1e-6 * self.tau_coil {
-            return self.coil_after_equal(h, t_ambient);
-        }
-        let e_c = (-h / self.tau_coil).exp();
-        let e_m = (-h / self.tau_magnet).exp();
-        // coil drive A + B e^(-t/tau_m); particular K e^(-t/tau_m), K = B r
-        let r = self.tau_magnet / (self.tau_magnet - self.tau_coil);
-        let alpha = self.t_coil * e_c + t_ambient * (1.0 - e_c) + (self.t_magnet - t_ambient) * r * (e_m - e_c);
-        let beta = (self.tr_magnet + self.tr_coil) * (1.0 - e_c) - self.tr_magnet * r * (e_m - e_c);
-        (alpha, beta)
-    }
-
-    /// Equal time constants: the limit of r (e_m - e_c) is h/tau e^(-h/tau).
-    fn coil_after_equal(&self, h: f64, t_ambient: f64) -> (f64, f64) {
-        let tau = self.tau_coil;
-        let e = (-h / tau).exp();
-        let g = h / tau * e;
-        let alpha = self.t_coil * e + t_ambient * (1.0 - e) + (self.t_magnet - t_ambient) * g;
-        let beta = (self.tr_magnet + self.tr_coil) * (1.0 - e) - self.tr_magnet * g;
-        (alpha, beta)
-    }
-
-    /// `h` seconds at a constant `power`, exactly, for any `h`.  Returns
-    /// bounds of the coil and of the magnet over the interval.  The magnet
-    /// moves monotonically toward its target, so its bound is an end.  The
-    /// coil is a constant plus two exponentials, so it has at most one
-    /// extremum inside the interval: its bound is the larger end or that
-    /// extremum.  (A coil below a falling drive rises until it meets the
-    /// drive; the bound was where the drive started, however short the
-    /// interval, and a sliver of uncovered time at 20 dB then latched a
-    /// model 10 K under its limit: review r2 of speakerguardd#8, found by
-    /// the V/I harness.)
-    pub fn hold(&mut self, power: f64, h: f64, t_ambient: f64) -> (f64, f64) {
-        let (c0, m0) = (self.t_coil, self.t_magnet);
-        if !(h > 0.0) {
-            return (c0, m0);
-        }
-        let (alpha, beta) = self.coil_after(h, t_ambient);
-        let m_inf = t_ambient + power * self.tr_magnet;
-        let inside = self.coil_extremum(power, h, t_ambient);
-        self.t_magnet = m_inf + (m0 - m_inf) * (-h / self.tau_magnet).exp();
-        self.t_coil = alpha + beta * power;
-        (hi(hi(c0, self.t_coil), inside), hi(m0, self.t_magnet))
-    }
-
-    /// The coil at its extremum strictly inside (0, h) at a constant
-    /// `power` from the current state, or -inf when it has none there.
-    /// The coil is c_inf + K e^(-t/tau_m) + C e^(-t/tau_c), whose
-    /// derivative has one zero at most.  Equal time constants keep the
-    /// old bound (where the drive starts, for a coil below a falling
-    /// drive).
-    fn coil_extremum(&self, power: f64, h: f64, t_ambient: f64) -> f64 {
-        let (tc, tm) = (self.tau_coil, self.tau_magnet);
-        let m_inf = t_ambient + power * self.tr_magnet;
-        let c_inf = m_inf + power * self.tr_coil;
-        if (tm - tc).abs() <= 1e-6 * tc {
-            let drive0 = self.t_magnet + power * self.tr_coil;
-            return if !(self.t_coil >= drive0) && !(self.t_magnet <= m_inf) { drive0 } else { f64::NEG_INFINITY };
-        }
-        let k = tm / (tm - tc) * (self.t_magnet - m_inf);
-        let c = self.t_coil - c_inf - k;
-        // c'(t) = -(K / tau_m) e^(-t/tau_m) - (C / tau_c) e^(-t/tau_c) = 0
-        let ratio = -(k * tc) / (c * tm);
-        if !(ratio > 0.0) {
-            return f64::NEG_INFINITY;
-        }
-        let t = ratio.ln() / (1.0 / tm - 1.0 / tc);
-        if !(t > 0.0 && t < h) {
-            return f64::NEG_INFINITY;
-        }
-        let v = c_inf + k * (-t / tm).exp() + c * (-t / tc).exp();
-        // rounding never brings the bound under the coil
-        v + 1e-9 * v.abs().max(1.0)
-    }
-}
+use crate::engine::Thermal;
 
 /// Discretization margin on the magnet bound (K): the daemon's model steps
 /// the magnet before the coil in 10 ms substeps, the proof is continuous.
@@ -383,9 +287,6 @@ pub fn marker_says_unlocked(marker: &Path, now: &Stamp) -> Option<String> {
     }
 }
 
-/// speakersafetyd's flags under /run: it governed this boot.
-pub const FOREIGN_FLAGS: &[&str] = &["/run/speakersafetyd/speakersafetyd.flag", "/run/speakersafetyd.flag"];
-
 /// The kernel parameters that override the card's safe level.
 pub const OVERRIDE_PARAMS: &[&str] = &["/sys/module/snd_soc_macaudio/parameters/please_blow_up_my_speakers"];
 
@@ -557,16 +458,8 @@ pub fn read_stamp() -> Stamp {
         machine_id: read("/etc/machine-id"),
         rtc: read("/sys/class/rtc/rtc0/since_epoch").and_then(|s| s.parse().ok()).filter(|&s| s > 0),
         realtime,
-        synced: synchronized(),
+        synced: crate::wallclock::synchronized_realtime().is_some(),
     }
-}
-
-/// The kernel's clock is synchronized (NTP), not in a leap transition.
-fn synchronized() -> bool {
-    // SAFETY: mode 0 reads the kernel's state without changing it.
-    let mut tx: libc::timex = unsafe { std::mem::zeroed() };
-    let state = unsafe { libc::adjtimex(&mut tx) };
-    state == libc::TIME_OK && tx.status & (libc::STA_UNSYNC | libc::STA_CLOCKERR) == 0
 }
 
 /// Writes checkpoints for the next boot off the protection loop: a durable

@@ -1,0 +1,9 @@
+speakerguardd-state 3
+boottime_ns 100000000000
+covered_ns 100000000000
+armed 0
+released 1
+# speaker name t_coil_C t_magnet_C mean_1s_W mean_60s_W v_rms_V reduction_dB hard t_peak_C
+speaker Left 125.123456 95.123456 0.000000 0.000000 0.000000 6.000 0 131.123456
+speaker Right 126.123456 96.123456 0.000000 0.000000 0.000000 6.000 0 132.123456
+end
