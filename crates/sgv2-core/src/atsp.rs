@@ -55,8 +55,20 @@
 //!   115 ms" are specified. The measured macOS trajectory is not monotonic
 //!   (it overshoots the trim by about 2.2 % near 44 ms); here the dezipper is
 //!   a linear ramp from frame 240 to frame 5520 (115 ms), never above trim.
-//! - **Q = 1.** macOS takes a distinct path for one-frame host calls; it is
-//!   not specified, and this unit renders Q = 1 like any other slice.
+//! - **Smoothing order.** The 25G83 gain leaves unity quadratically (1e-5
+//!   below unity 2 ms after entry, against 1.6e-2 for the specified
+//!   one-pole toward a request near 0.53), holds about 0.5 s before
+//!   releasing and recovers along an S-curve: not the first-order
+//!   99 %-settling law the specification states and this unit implements.
+//! - **Panic transition.** 25G83 falls from 0.95 to 0.086 within about
+//!   30 ms of crossing `Tlim + headroom` (below the 0.1 target), then
+//!   releases from there; through the 800 ms attack the request cap takes
+//!   about 0.8 s.
+//! - **Trim after release.** After a limiting episode the 25G83 gain
+//!   settles at 1.0001, not the startup trim 1.0060077.
+//! - **Q = 1.** macOS takes a distinct path for one-frame host calls (the
+//!   tone-burst gain is 1.0019 to 1.0027 there); it is not specified, and
+//!   this unit renders Q = 1 like any other slice.
 
 use alloc::vec::Vec;
 
