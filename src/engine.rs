@@ -3557,3 +3557,47 @@ mod amplifier_rail_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod zz_reserve_meter {
+    use super::*;
+    use crate::config::Config;
+    #[test]
+    #[ignore]
+    fn zz_reserve_meter() {
+        for name in ["j616", "j316", "j413", "j414", "j314"] {
+            let p = format!("{}/conf/apple/{name}.conf", env!("CARGO_MANIFEST_DIR"));
+            let Ok(text) = std::fs::read_to_string(&p) else { continue };
+            let c = Config::parse(&text).unwrap();
+            for (tc, tm) in [(50.0, 50.0), (60.0, 55.0), (75.0, 60.0), (90.0, 70.0), (120.0, 90.0)] {
+                let mut e = Engine::new(&c, true).unwrap();
+                for a in e.asahi.as_mut().unwrap() { a.th.t_coil = tc; a.th.t_magnet = tm; }
+                for u in e.unified.as_mut().unwrap() { u.ff.t_coil = tc; u.ff.t_magnet = tm; }
+                let pend = vec![120.0; c.speakers.len()];
+                // (label, pending_s, lease_s)
+                for (label, ps, ls) in [
+                    ("double-4096", 0.0853 + 0.25, 0.25 + 0.0853 + 0.1),
+                    ("single-4096-s100", 0.002, 0.0853 + 0.1),
+                    ("single-2048-s43", 0.002, 0.0427 + 0.0427),
+                    ("single-1024-s100", 0.002, 0.0213 + 0.1),
+                    ("single-1024-s43", 0.002, 0.0213 + 0.0427),
+                    ("single-1024-s21", 0.002, 0.0213 + 0.0213),
+                    ("single-1024-s10", 0.002, 0.0213 + 0.010),
+                    ("single-512-s21", 0.002, 0.0107 + 0.0213),
+                    ("single-512-s10", 0.002, 0.0107 + 0.0107),
+                ] {
+                    let per = e.onset_reductions(Governor::Unified, &pend, ps, ls);
+                    let names: Vec<String> = c.speakers.iter().zip(&per).map(|(s, r)| format!("{}={r:.1}", s.name.replace(' ', ""))).collect();
+                    // FF-only (macOS constants) for comparison
+                    let ff: Vec<String> = c.speakers.iter().enumerate().map(|(k, s)| {
+                        let u = &e.unified.as_ref().unwrap()[k];
+                        let r = onset_reduction(&[(&u.ff, u.v_worst.powi(2) / u.r_ff)], s.t_limit - s.t_headroom, c.globals.t_ambient,
+                            10f64.powf(-c.globals.safe_reduction / 10.0), 0.0, ps, ls);
+                        format!("{r:.1}")
+                    }).collect();
+                    eprintln!("METER {name} coil={tc} mag={tm} {label:18} {}  ff-only[{}]", names.join(" "), ff.join(","));
+                }
+            }
+        }
+    }
+}
