@@ -10,7 +10,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "aurora-speaker-tuning"
-version = "2.0.0-dev"
+version = "1.0.0-alpha.1"
 dependencies = [
  "flate2",
  "serde",
@@ -193,25 +193,25 @@ dependencies = [
 
 [[package]]
 name = "sgv2-core"
-version = "2.0.0-dev"
+version = "1.0.0-alpha.1"
 
 [[package]]
 name = "sgv2-lv2"
-version = "2.0.0-dev"
+version = "1.0.0-alpha.1"
 dependencies = [
  "sgv2-core",
 ]
 
 [[package]]
 name = "sgv2-render"
-version = "2.0.0-dev"
+version = "1.0.0-alpha.1"
 dependencies = [
  "sgv2-core",
 ]
 
 [[package]]
 name = "sgv2-supervisor"
-version = "2.0.0-dev"
+version = "1.0.0-alpha.1"
 dependencies = [
  "aurora-speaker-tuning",
  "sgv2-core",

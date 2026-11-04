@@ -1,4 +1,4 @@
-# speakerguardd v2
+# speakerguardd
 
 Speaker protection for Apple Silicon Macs that works the way macOS's does: the same protection unit at the same place in the speaker graph, with the amplifier's voltage and current sense as its second input where the Mac has it, driven by that Mac's own tuning and factory calibration.
 
@@ -8,7 +8,7 @@ Speaker protection for Apple Silicon Macs that works the way macOS's does: the s
 
 The acceptance bar is 1:1 parity: on identical input, the unit's internal state (power, coil and magnet temperatures, closed-loop correction, every constraint and the final gain) matches macOS's own, quantum by quantum, including the failure cases.
 
-**Status:** under development on this branch. Not for use. The v0.1 daemon is archived on `legacy/v0.1` (tags `v0.1.12`, `v0.1.13-rc.2`) and stays deployed on each machine until v2 qualifies there.
+**Status:** 1.0.0-alpha, under development on the `v2` branch. Not for use yet. (The unrelated 0.1.x daemon is archived on `legacy/v0.1`.)
 
 ## Layout
 
