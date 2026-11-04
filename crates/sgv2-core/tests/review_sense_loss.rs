@@ -27,7 +27,7 @@ fn spp3_lost_sense_returns_the_limit_to_tlim() {
             blk_s(&mut u, 0.05, 512, s, 512);
         }
         let t = tel(&u);
-        assert!(t.channels[0].closed_loop && (t.channels[0].cl_temp_c - 25.0).abs() < 1.0);
+        assert!(t.channels[0].closed_loop && (t.channels[0].cl_temp_c - 25.0).abs() < 1.0, "{:?}", t.channels[0]);
         for _ in 0..secs(60.0) {
             if short == 0 {
                 blk(&mut u, 1.0);

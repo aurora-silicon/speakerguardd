@@ -87,6 +87,10 @@ impl Health {
     /// A model state went non-finite. The unit has latched the fail-safe
     /// until `reset`; it never trusts that state again.
     pub const MODEL_FAULT: u32 = 1 << 4;
+    /// A model state left its plausible range (spp3: the feed-forward node
+    /// above 1000 K). The unit holds its hard path while it lasts; the
+    /// state keeps integrating (the reference would re-seed it lower).
+    pub const MODEL_RANGE: u32 = 1 << 5;
 
     pub fn is_failsafe(self) -> bool {
         self.0 & Self::FAILSAFE != 0
@@ -119,6 +123,13 @@ pub trait ProtectionUnit {
     /// Return to the initial state (stream start): the parameters' start
     /// state, empty histories, unity gains.
     fn reset(&mut self);
+    /// The host's in-stream reset (`AudioUnitReset` on macOS). spp3 clears
+    /// only its closed-loop estimator and keeps the thermal state; units
+    /// whose reset semantics are not specified apart from construction
+    /// reconstruct.
+    fn host_reset(&mut self) {
+        self.reset();
+    }
     /// Copy the persistent thermal state for a later stream or instance of
     /// the same unit. Real-time safe. False when there is nothing to hand
     /// off (a fail-safe unit, or a latched model fault: never hand off a

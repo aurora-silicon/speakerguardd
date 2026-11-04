@@ -16,6 +16,10 @@ pub fn spp3_params() -> spp3::Params {
         thermal_gain_release_time_s: 2.0,
         thermal_lookahead_delay_ms: 1.5,
         thermal_protection_enabled: 1,
+        thermal_state_override: spp3::THERMAL_STATE_COLD,
+        thermal_safe_tlim: 100.0,
+        thermal_safe_tlim_offset: -15.0,
+        thermal_safe_tlim_time_min: 10.0,
         ..spp3::Params::default()
     };
     for c in 0..4 {
@@ -41,10 +45,16 @@ pub fn spp3_params() -> spp3::Params {
             v_pwr_thres: 0.0,
             sense_i: 2 * c as u32,
             sense_v: 2 * c as u32 + 1,
-            initial_theta_vc: 0.0,
-            initial_theta_mg: 0.0,
             pilot_tone_enabled: 0,
             pilot_ampl_hi_db: -30.0,
+            pilot_ampl_lo_db: -40.0,
+            pilot_upper_thres: 90.0,
+            pilot_lower_thres: 80.0,
+            pilot_decay_time_s: 0.03,
+            pilot_decay_time_stage2_s: 0.03,
+            pilot_freq: 43.0664,
+            pilot_enable_thres: 0.03,
+            thermal_measurement_method: spp3::METHOD_PILOT_TONE,
             temp_sense_window_time_s: 0.1,
             temp_sense_smoothing_tau_s: 0.5,
             rdc_scale: 1.0,
@@ -77,24 +87,36 @@ pub fn spp3_cl_params(cap: f32) -> spp3::Params {
 }
 
 /// One host call of `n` frames at level `x` on every channel; `sense` is
-/// `(i, v)` on all eight sense ports (alternating sign, so not DC), with
+/// `(i, v)` on all eight sense ports (a sine on the pilot analyser's bin of
+/// `spp3_params`, continuous across calls on one test thread), with
 /// `sense_len` samples per port. Returns channel 0's output.
 pub fn blk_s(u: &mut dyn ProtectionUnit, x: f32, n: usize, sense: Option<(f32, f32)>, sense_len: usize) -> Vec<f32> {
     let input: Vec<Vec<f32>> = (0..4).map(|_| vec![x; n]).collect();
     let mut output = vec![vec![0.0f32; n]; 4];
     let ins: Vec<&[f32]> = input.iter().map(|b| &b[..]).collect();
     let mut outs: Vec<&mut [f32]> = output.iter_mut().map(|b| &mut b[..]).collect();
+    let pos = SENSE_POS.with(|p| p.replace(p.get() + n));
     let sb: Vec<Vec<f32>> = match sense {
         Some((i, v)) => (0..8)
-            .map(|k| {
-                (0..sense_len).map(|j| if k % 2 == 0 { i } else { v } * if j % 2 == 0 { 1.0 } else { -1.0 }).collect()
-            })
+            .map(|k| (0..sense_len).map(|j| if k % 2 == 0 { i } else { v } * pilot_wave(pos + j)).collect())
             .collect(),
         None => vec![],
     };
     let sns: Vec<&[f32]> = sb.iter().map(|b| &b[..]).collect();
     u.process(Io { frames: n, input: &ins, sense: &sns, output: &mut outs });
     output.swap_remove(0)
+}
+
+thread_local! {
+    static SENSE_POS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Unit sine on bin `round(43.0664 * 8192 / 48000)` of the 8192-frame
+/// Goertzel period (`TempSenseWindowTime` 0.1 s).
+pub fn pilot_wave(k: usize) -> f32 {
+    let n = 8192usize;
+    let m = (43.0664f64 * n as f64 / RATE as f64).round();
+    (2.0 * std::f64::consts::PI * m * (k % n) as f64 / n as f64).sin() as f32
 }
 
 pub fn blk(u: &mut dyn ProtectionUnit, x: f32) -> f32 {

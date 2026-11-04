@@ -37,33 +37,48 @@ fn spp3_bad_tlim_adj_cap_is_refused_and_never_panics() {
     }
 }
 
-/// Finding 9: a negative start state allowed more drive than a cold start.
+/// Finding 9: a start state below ambient allowed more drive than a cold
+/// start. The hot fallback (64007 other than 2) seeds the steady-state split
+/// at the ordinary limit, so a limit below ambient is refused.
 #[test]
-fn spp3_negative_start_state_is_refused() {
+fn spp3_a_hot_start_below_ambient_is_refused() {
     let mut p = spp3_params();
-    p.ch[0].initial_theta_vc = -1000.0;
+    p.thermal_state_override = 0;
+    assert!(!spp3::Unit::new(p).is_failsafe());
+    p.ch[0].temperature_limit = 30.0; // ambient 40
     assert!(spp3::Unit::new(p).is_failsafe());
-    let mut p = spp3_params();
-    p.ch[3].initial_theta_mg = -0.5;
-    assert!(spp3::Unit::new(p).is_failsafe());
+    // the cold start never seeds below ambient
+    p.thermal_state_override = spp3::THERMAL_STATE_COLD;
+    assert!(!spp3::Unit::new(p).is_failsafe());
 }
 
 /// Finding 10: time constants below one thermal update made the forward
-/// recurrence diverge.
+/// recurrence diverge; fuzz finding 15: coil poles of 16-21 ms (3-4 updates)
+/// cycle through the hard path above the hard limit under constant drive,
+/// as the reference itself overshoots there. Below the reference's
+/// documented 0.1 s minimum the set is refused.
 #[test]
-fn spp3_time_constants_below_one_update_are_refused() {
-    let dt = spp3::THERMAL_FRAMES as f32 / RATE as f32;
-    let bad: [fn(&mut spp3::ChannelParams); 3] =
-        [|c| c.tau_tvc = 0.001, |c| c.tau_tmg = 0.004, |c| c.thermal_ff_speedup_factor = 0.001];
+fn spp3_time_constants_below_the_documented_minimum_are_refused() {
+    let bad: [fn(&mut spp3::ChannelParams); 6] = [
+        |c| c.tau_tvc = 0.001,
+        |c| c.tau_tmg = 0.004,
+        |c| c.thermal_ff_speedup_factor = 0.001,
+        // the finding-15 sets: 21 / 22 ms and 16 ms coils
+        |c| (c.tau_tvc, c.tau_tmg) = (0.021, 0.022),
+        |c| c.tau_tvc = 0.016,
+        // a 0.4 s coil with a 0.2 speed-up is an 80 ms feed-forward pole
+        |c| c.thermal_ff_speedup_factor = 0.2,
+    ];
     for f in bad {
         let mut p = spp3_params();
         f(&mut p.ch[1]);
         assert!(spp3::Unit::new(p).is_failsafe());
     }
-    // exactly one update is the shortest usable pole
+    // exactly the minimum is accepted, also as the feed-forward pole
     let mut p = spp3_params();
     for c in 0..4 {
-        p.ch[c].tau_tvc = dt;
+        p.ch[c].tau_tvc = spp3::TAU_MIN_S;
+        p.ch[c].tau_tmg = spp3::TAU_MIN_S;
         p.ch[c].thermal_ff_speedup_factor = 1.0;
     }
     assert!(!spp3::Unit::new(p).is_failsafe());

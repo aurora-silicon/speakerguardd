@@ -197,10 +197,11 @@ pub fn mul_metered_to(a: &[f32], b: &[f32], y: &mut [f32]) -> bool {
     mul_clamped_to(a, b, y, METER_FS)
 }
 
-/// `y[n] = clamp(a[n], -lim, lim) * b[n]`, a non-finite `a[n]` 0; returns
-/// whether any `a[n]` was non-finite.
+/// `y[n] = clamp1(a[n], lim) * b[n]`, a non-finite `a[n]` 0; returns
+/// whether any `a[n]` was non-finite. For `|a[n]| <= lim` bit-identical to
+/// `mul_to`.
 #[inline]
-fn mul_clamped_to(a: &[f32], b: &[f32], y: &mut [f32], lim: f32) -> bool {
+pub fn mul_clamped_to(a: &[f32], b: &[f32], y: &mut [f32], lim: f32) -> bool {
     let n = a.len().min(b.len()).min(y.len());
     #[cfg(not(target_arch = "aarch64"))]
     let (i, mut bad) = (0, false);
@@ -474,6 +475,24 @@ pub fn deinterleave_s16(src: &[i16], ch: usize, out: &mut [&mut [f32]]) {
         for (n, s) in o.iter_mut().enumerate() {
             *s = src[n * ch + c] as f32 * K;
         }
+    }
+}
+
+/// One sample held to `±lim` (a non-finite sample 0).
+#[inline]
+pub fn clamp1(x: f32, lim: f32) -> f32 {
+    if x.abs() < f32::INFINITY {
+        x.clamp(-lim, lim)
+    } else {
+        0.0
+    }
+}
+
+/// [`clamp1`] in place.
+#[inline]
+pub fn clamp_in_place(x: &mut [f32], lim: f32) {
+    for v in x.iter_mut() {
+        *v = clamp1(*v, lim);
     }
 }
 
