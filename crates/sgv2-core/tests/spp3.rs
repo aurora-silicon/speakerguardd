@@ -537,7 +537,7 @@ fn closed_loop_reads_coil_temperature_from_the_pilot_bin_and_never_relaxes() {
     assert!((t.channels[0].cl_temp_c - 60.0).abs() < 0.05, "T_CL {}", t.channels[0].cl_temp_c);
     assert_eq!(u.controller_state(0)[9], 1.0, "window accepted");
     // the model runs hotter than the sensed 60 C, but the correction is
-    // capped at the base until the alpha inversion is resolved (t-4663)
+    // capped at the base until the alpha inversion is resolved (t-4668)
     assert_eq!(t.channels[0].tlim_adj_c, 0.0);
     assert_eq!(u.effective_limit(0), 120.0);
 }
