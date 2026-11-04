@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aurora-silicon.org/speakerguardd/diffrig/trace-v1.json",
+  "title": "sgv2 differential rig trace line (one JSON object per rendered slice)",
+  "type": "object",
+  "required": ["schema", "side", "unit", "case", "frame", "frames", "channels"],
+  "properties": {
+    "schema": {"const": 1},
+    "side": {"enum": ["macos", "sgv2"]},
+    "unit": {"enum": ["spp3", "lsm2", "atsp"]},
+    "case": {"type": "string", "description": "case identifier from the rig's case list"},
+    "frame": {"type": "integer", "minimum": 0, "description": "index of the slice's first input frame"},
+    "frames": {"type": "integer", "minimum": 1},
+    "latency": {"type": "integer", "minimum": 0, "description": "the unit's reported latency in frames"},
+    "mode": {
+      "type": "object",
+      "properties": {
+        "failsafe": {"type": "boolean"},
+        "closed_loop": {"type": "array", "items": {"type": "boolean"}}
+      }
+    },
+    "channels": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "gain": {"type": ["number", "null"]},
+          "modeled_power_w": {"type": ["number", "null"]},
+          "measured_power_w": {"type": ["number", "null"]},
+          "coil_temp_c": {"type": ["number", "null"]},
+          "magnet_temp_c": {"type": ["number", "null"]},
+          "ol_temp_c": {"type": ["number", "null"]},
+          "cl_temp_c": {"type": ["number", "null"]},
+          "tlim_adj_c": {"type": ["number", "null"]},
+          "displacement_m": {"type": ["number", "null"]},
+          "velocity_m_s": {"type": ["number", "null"]},
+          "mask_db": {"type": ["number", "null"]},
+          "axis_gain": {"type": "array", "items": {"type": ["number", "null"]}, "maxItems": 5},
+          "band_gain": {"type": "array", "items": {"type": ["number", "null"]}, "maxItems": 5}
+        }
+      }
+    }
+  }
+}

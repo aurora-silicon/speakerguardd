@@ -3,14 +3,31 @@
 version = 4
 
 [[package]]
-name = "libc"
-version = "0.2.189"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
+name = "aurora-speaker-tuning"
+version = "2.0.0-dev"
 
 [[package]]
-name = "speakerguardd"
-version = "0.1.12"
+name = "sgv2-core"
+version = "2.0.0-dev"
+
+[[package]]
+name = "sgv2-lv2"
+version = "2.0.0-dev"
 dependencies = [
- "libc",
+ "sgv2-core",
+]
+
+[[package]]
+name = "sgv2-render"
+version = "2.0.0-dev"
+dependencies = [
+ "sgv2-core",
+]
+
+[[package]]
+name = "sgv2-supervisor"
+version = "2.0.0-dev"
+dependencies = [
+ "aurora-speaker-tuning",
+ "sgv2-core",
 ]

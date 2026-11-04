@@ -1,0 +1,14 @@
+[package]
+name = "sgv2-render"
+description = "Offline renderer for the differential test rig: runs sgv2-core on WAV input and writes per-quantum state"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+sgv2-core = { path = "../sgv2-core" }
+
+[lints]
+workspace = true

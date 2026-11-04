@@ -1,0 +1,26 @@
+policy_module(speakerguardd, 0.1.0)
+
+# TODO(lane D): complete and test in enforcing mode on every machine; the
+# gate is zero AVCs (ausearch -m AVC,USER_AVC -ts boot) after the full
+# qualification suite, including fault injection.
+
+type speakerguardd_t;
+type speakerguardd_exec_t;
+init_daemon_domain(speakerguardd_t, speakerguardd_exec_t)
+
+type speakerguardd_runtime_t;
+files_pid_file(speakerguardd_runtime_t)
+manage_dirs_pattern(speakerguardd_t, speakerguardd_runtime_t, speakerguardd_runtime_t)
+manage_files_pattern(speakerguardd_t, speakerguardd_runtime_t, speakerguardd_runtime_t)
+files_pid_filetrans(speakerguardd_t, speakerguardd_runtime_t, { dir file })
+
+# The tuning bundle in the vendor firmware tree, and the ESP fallback.
+files_read_kernel_modules(speakerguardd_t)
+dev_read_sysfs(speakerguardd_t)
+fs_read_dos_files(speakerguardd_t)
+
+# The macaudio control device: interlock and amp gain.
+dev_rw_sound(speakerguardd_t)
+
+# PCM ownership from /proc/asound.
+kernel_read_system_state(speakerguardd_t)

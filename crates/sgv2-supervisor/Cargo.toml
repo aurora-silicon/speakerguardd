@@ -1,0 +1,19 @@
+[package]
+name = "sgv2-supervisor"
+description = "speakerguardd: path-integrity supervisor and kernel interlock for the in-graph speaker protection"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "speakerguardd"
+path = "src/main.rs"
+
+[dependencies]
+sgv2-core = { path = "../sgv2-core" }
+aurora-speaker-tuning = { path = "../aurora-speaker-tuning" }
+
+[lints]
+workspace = true

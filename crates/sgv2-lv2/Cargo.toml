@@ -1,0 +1,17 @@
+[package]
+name = "sgv2-lv2"
+description = "LV2 host shim for the sgv2 protection core, loaded by the PipeWire filter-chain"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+sgv2-core = { path = "../sgv2-core" }
+
+[lints]
+workspace = true

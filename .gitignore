@@ -1,1 +1,10 @@
 /target
+# Apple tuning data must never be committed (see docs/CONVENTIONS.md).
+*.austrip
+*.dspg
+*.propstrip
+*.aupreset
+AID[0-9]*/
+audio-tuning-AID*
+speaker-thiele-small.bin
+/traces/

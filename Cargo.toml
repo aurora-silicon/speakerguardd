@@ -1,16 +1,23 @@
-[package]
-name = "speakerguardd"
-version = "0.1.12"
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "2.0.0-dev"
 edition = "2021"
 license = "MIT"
-description = "Feed-forward speaker protection daemon for amplifiers without sense lines"
 authors = ["The Aurora Silicon Contributors"]
+repository = "https://github.com/aurora-silicon/speakerguardd"
+rust-version = "1.85"
 
-[dependencies]
-libc = "0.2"
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
 
 [profile.release]
-lto = true
+# Deterministic floating point: no fast-math exists in Rust; keep
+# codegen-units at 1 so inlining (and therefore FMA contraction
+# opportunities, which Rust never takes implicitly) is reproducible.
 codegen-units = 1
+lto = "thin"
 panic = "abort"
-strip = true
+debug = 1

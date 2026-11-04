@@ -1,0 +1,6 @@
+# Provenance
+
+- **Behaviour.** The protection units' behaviour is implemented from a written behaviour specification of macOS's units: equations, state, parameters, timing and failure handling, as facts. No Apple code, and no decompiled or disassembled code, is copied into this repository or used to write it.
+- **Parameters.** All parameters are read at runtime from the tuning bundle the Aurora installer collects, read-only, from the user's own macOS installation onto the user's own disk. The repository contains no parameter values from any Mac.
+- **Formats.** The bundle reader's knowledge of the tuning folder layout, the strip and graph containers and the factory calibration record comes from aurora-audio-dsp by saku (MIT), credited in the code and in `crates/aurora-speaker-tuning/LICENSE-aurora-audio-dsp`.
+- **Verification.** Parity is checked against macOS's own units, through their public AudioUnit interface and macOS's own render logs, on the user's own Mac. The resulting traces stay with the user and are not published. Committed tests use synthetic parameters and signals.

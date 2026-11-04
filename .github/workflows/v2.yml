@@ -1,0 +1,44 @@
+name: v2
+
+on:
+  push:
+    branches: [v2, "v2/**"]
+  pull_request:
+    branches: [v2]
+
+permissions:
+  contents: read
+
+jobs:
+  clean:
+    name: Clean-publish check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: tools/check-clean.sh
+
+  rust:
+    name: Rust (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - run: cargo test --workspace --release
+      - run: cargo build --workspace --release
+
+  diffrig:
+    name: Rig tools
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -m py_compile tools/diffrig/compare.py
+      - run: python3 -I tools/diffrig/compare.py --self-test

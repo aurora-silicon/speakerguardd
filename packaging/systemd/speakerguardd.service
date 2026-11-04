@@ -1,0 +1,25 @@
+[Unit]
+Description=Speaker protection supervisor (in-graph, macOS-parity)
+Documentation=https://github.com/aurora-silicon/speakerguardd/tree/v2
+# Without this service no protection holds the amplifiers, and the kernel's
+# own safe level applies. There is deliberately no OnFailure= chain.
+After=systemd-udev-settle.service
+ConditionPathExists=/proc/device-tree/compatible
+
+[Service]
+Type=notify
+ExecStart=/usr/bin/speakerguardd
+Restart=on-failure
+RestartSec=1s
+RestartPreventExitStatus=78
+WatchdogSec=1s
+RuntimeDirectory=speakerguardd
+RuntimeDirectoryMode=0755
+# TODO(lane D): device access list, capabilities and hardening review.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target
