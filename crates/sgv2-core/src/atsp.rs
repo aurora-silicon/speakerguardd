@@ -27,9 +27,9 @@
 //!   release (up) time, as 99 %-settling times:
 //!   `a = 1 - exp(ln(0.01) / (t * rate))`, per sample.
 //! - **Output.** `y = x * min(1, g * d)`, where `d` is the output dezipper
-//!   (rig-confirmed): zero for the first 5 ms after initialisation, then a
-//!   Float32 second-order low pass (`b0 (1, 2, 1)`, about 19.95 Hz, Q 0.65)
-//!   of a unit step. Its Float32 fixed point is the reference's "+0.052 dB
+//!   (rig-confirmed, bit-exact): zero for the first 5 ms after
+//!   initialisation, then a Float32 RBJ low pass (20 Hz, Q 0.6513333,
+//!   transposed direct form II with fused multiply-adds) of a unit step. Its Float32 fixed point is the reference's "+0.052 dB
 //!   trim" (1.0060077 at 48 kHz, rate dependent): gain state, not a stage.
 //!   An `AudioUnitReset` does not restart it; silence advances it. The
 //!   engine never passes a sample above its input (review_bound), so the
@@ -58,11 +58,6 @@
 //!   window. Bit-identical output for host slices 2..4096 rules out a
 //!   per-call mean. Here it is a one-pole mean of the instantaneous drive
 //!   power with the slot's attack coefficient.
-//! - **Dezipper constants.** The rig gives the poles (0.99799 +-
-//!   0.001662j at 48 kHz) to five digits, not the design; here an RBJ low
-//!   pass at 19.95 Hz, Q 0.65, rounded to Float32, run in direct form I.
-//!   Its fixed point and overshoot depend on the exact Float32 operation
-//!   order, which is open.
 //! - **Smoothing order.** The 25G83 gain leaves unity quadratically (1e-5
 //!   below unity 2 ms after entry, against 1.6e-2 for the specified
 //!   one-pole toward a request near 0.53), holds about 0.5 s before
@@ -90,20 +85,26 @@ const EPS: f64 = f32::MIN_POSITIVE as f64;
 /// The 25G83 dezipper's settled value at 48 kHz (its Float32 fixed point;
 /// rate and path dependent). The engine caps the applied gain at unity.
 pub const NOMINAL_TRIM: f32 = 1.006_007_7;
-/// The output dezipper's low pass (rig law; TODO(SPEC) the exact design).
-const DEZIPPER_HZ: f64 = 19.95;
-const DEZIPPER_Q: f64 = 0.65;
+/// The output dezipper's low pass (rig-confirmed, bit-exact on 25G83): an
+/// RBJ low pass at exactly 20 Hz, Q 0.6513333.
+const DEZIPPER_HZ: f64 = 20.0;
+const DEZIPPER_Q: f64 = 0.651_333_3;
 /// Silence after initialisation (spec 5; 240 frames at 48 kHz).
 pub const STARTUP_MUTE_S: f64 = 0.005;
 
-/// The output dezipper: a Float32 RBJ low pass of the startup step.
+/// The output dezipper (rig-confirmed, bit-exact): the RBJ coefficients
+/// computed in f64 and rounded once to f32 (`b1 = 2 b0`, `b2 = b0`), run as
+/// a transposed direct form II with fused multiply-adds:
+/// `y = fma(b0, x, s1)`, `s1 = fma(-a1, y, fma(b1, x, s2))`,
+/// `s2 = fma(-a2, y, b0 x)`. Its Float32 fixed point on a unit step is the
+/// reference's +0.052 dB "trim" at 48 kHz.
 #[derive(Clone, Copy)]
 struct Dezipper {
     b0: f32,
+    b1: f32,
     a1: f32,
     a2: f32,
-    x: [f32; 2],
-    y: [f32; 2],
+    s: [f32; 2],
 }
 
 impl Dezipper {
@@ -112,25 +113,19 @@ impl Dezipper {
         let al = libm::sin(w) / (2.0 * DEZIPPER_Q);
         let a0 = 1.0 + al;
         let c = libm::cos(w);
-        Dezipper {
-            b0: ((1.0 - c) / 2.0 / a0) as f32,
-            a1: (-2.0 * c / a0) as f32,
-            a2: ((1.0 - al) / a0) as f32,
-            x: [0.0; 2],
-            y: [0.0; 2],
-        }
+        let b0 = ((1.0 - c) / 2.0 / a0) as f32;
+        Dezipper { b0, b1: 2.0 * b0, a1: (-2.0 * c / a0) as f32, a2: ((1.0 - al) / a0) as f32, s: [0.0; 2] }
     }
     #[inline]
     fn step(&mut self, x: f32) -> f32 {
-        let y =
-            self.b0 * x + 2.0 * self.b0 * self.x[0] + self.b0 * self.x[1] - self.a1 * self.y[0] - self.a2 * self.y[1];
-        self.x = [x, self.x[0]];
-        self.y = [y, self.y[0]];
+        let y = libm::fmaf(self.b0, x, self.s[0]);
+        self.s[0] = libm::fmaf(-self.a1, y, libm::fmaf(self.b1, x, self.s[1]));
+        self.s[1] = libm::fmaf(-self.a2, y, self.b0 * x);
         y
     }
     /// Settled on the step (a hand-off: the stream was already running).
     fn settle(&mut self) {
-        for _ in 0..1 << 16 {
+        for _ in 0..1 << 18 {
             self.step(1.0);
         }
     }
@@ -348,6 +343,10 @@ impl Unit {
     }
     pub fn bypassed(&self) -> bool {
         self.bypass
+    }
+    /// The startup dezipper's current value (before the unity cap).
+    pub fn dezipper_gain(&self) -> f32 {
+        self.run.as_ref().map_or(0.0, |r| r.dez_now)
     }
 }
 

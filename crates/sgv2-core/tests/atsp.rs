@@ -197,3 +197,24 @@ fn slicing_invariance() {
         assert_eq!(render(s), r, "slice {s}");
     }
 }
+
+#[test]
+fn dezipper_fixed_point_is_the_reference_trim() {
+    // rig: the dezipper's Float32 fixed point is 1.0060077 at 48 kHz (the
+    // "+0.052 dB trim"); the engine caps the applied gain at unity, so read
+    // the filter itself through a unit whose output we divide out
+    for (rate, want) in [(48_000u32, 1.006_007_7f32), (44_100, 0.999_897_8), (96_000, 1.042_091_8)] {
+        let mut p = params();
+        p.sample_rate = rate;
+        let mut u = Unit::new(p);
+        let n = rate as usize / 4;
+        let ins: Vec<Vec<f32>> = (0..4).map(|_| vec![0.01f32; n]).collect();
+        let mut outs = vec![vec![0.0f32; n]; 4];
+        for _ in 0..12 {
+            let i: Vec<&[f32]> = ins.iter().map(|b| &b[..]).collect();
+            let mut o: Vec<&mut [f32]> = outs.iter_mut().map(|b| &mut b[..]).collect();
+            u.process(Io { frames: n, input: &i, sense: &[], output: &mut o });
+        }
+        assert!((u.dezipper_gain() - want).abs() < 2e-7, "{rate}: {} vs {want}", u.dezipper_gain());
+    }
+}
