@@ -48,6 +48,7 @@ fn spp3_synthetic() -> spp3::Params {
         thermal_gain_attack_time_s: 1.0,
         thermal_gain_release_time_s: 5.0,
         thermal_lookahead_delay_ms: 1.0,
+        thermal_protection_enabled: 1,
         ..spp3::Params::default()
     };
     for c in 0..6 {
@@ -67,6 +68,7 @@ fn spp3_synthetic() -> spp3::Params {
             vmon_scale: 10.0,
             sense_i: 2 * c as u32,
             sense_v: 2 * c as u32 + 1,
+            thermal_ff_speedup_factor: 0.5,
             ..Default::default()
         };
     }

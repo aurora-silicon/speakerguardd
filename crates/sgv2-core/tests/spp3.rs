@@ -18,6 +18,7 @@ fn params() -> Params {
         thermal_gain_attack_time_s: 0.5,
         thermal_gain_release_time_s: 2.0,
         thermal_lookahead_delay_ms: 1.5,
+        thermal_protection_enabled: 1,
         thermal_safe_tlim: 0.0,
         thermal_safe_tlim_offset: 0.0,
         thermal_safe_tlim_time_min: 0.0,
@@ -36,7 +37,8 @@ fn params() -> Params {
             hard_temp_limit_headroom: 8.0,
             reb_ref: 4.0,
             rshunt: 0.2,
-            thermal_ff_speedup_factor: 0.0,
+            thermal_ff_speedup_factor: 0.5,
+            cl_thermal_feedback_enabled: 1,
             rampout: 0.0,
             ag: 10.0,
             imon_scale: 2.0,
@@ -263,8 +265,8 @@ fn failsafe_cases_are_exactly_twenty_db() {
     assert!(spp3::Unit::init_error(&bad).is_some());
     // a controller the implementation does not have
     let mut cl = params();
-    cl.enable_closed_loop = 1;
-    assert_eq!(spp3::Unit::init_error(&cl), Some(spp3::InitError::Unsupported("closed loop")));
+    cl.enable_cpms_control = 1;
+    assert_eq!(spp3::Unit::init_error(&cl), Some(spp3::InitError::Unsupported("EnableCPMSControl")));
     for p in [bad, cl, Params::default()] {
         let mut u = spp3::Unit::new(p);
         assert!(u.is_failsafe());
@@ -332,4 +334,25 @@ fn measured_power_and_sense_geometry() {
     let mut outs: Vec<&mut [f32]> = ob.iter_mut().map(|b| &mut b[..]).collect();
     let h = u.process(Io { frames: 512, input: &ins, sense: &sense[..3], output: &mut outs });
     assert_eq!(h.0, Health::OPEN_LOOP);
+}
+
+#[test]
+fn zero_speedup_factor_holds_the_feed_forward_reduction_at_unity() {
+    let mut p = params();
+    for c in 0..4 {
+        p.ch[c].thermal_ff_speedup_factor = 0.0;
+    }
+    let mut u = spp3::Unit::new(p);
+    // a drive whose steady state sits between the limit and the hard limit
+    let (t, _) = drive(&mut u, [0.355, 0.0, 0.0, 0.0], 40.0, 1024);
+    assert!(t.channels[0].ol_temp_c > 120.0, "{}", t.channels[0].ol_temp_c);
+    assert_eq!(t.channels[0].axis_gain[4], 1.0);
+    assert_eq!(t.channels[0].gain, 1.0);
+}
+
+#[test]
+fn disabled_thermal_protection_is_refused() {
+    let mut p = params();
+    p.thermal_protection_enabled = 0;
+    assert!(spp3::Unit::new(p).is_failsafe());
 }

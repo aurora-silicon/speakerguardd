@@ -37,13 +37,27 @@
 //!   drive gives the unity cap;
 //! - the gain is held constant across a block ("the current protected
 //!   gain" per call) and the panic factor is evaluated per block;
-//! - `ThermalFFSpeedupFactor` in the predictor and the `Thermal_SafeTlim*`
-//!   state machine (spec section 14: open). Not applied;
-//! - the closed loop (`TlimAdj`), pilot tone, displacement and CPMS: the
-//!   spec directs a first release without them. A preset that enables
-//!   displacement control, CPMS or the closed loop is refused at `new`, and
-//!   the unit then runs the fail-safe, rather than silently running
-//!   without a controller the tuning asked for.
+//! - how a nonzero `ThermalFFSpeedupFactor` shapes the predictive target,
+//!   and the `Thermal_SafeTlim*` state machine (spec section 15: open). A
+//!   nonzero factor runs the ceiling above unchanged. A factor of zero is
+//!   specified: it holds the feed-forward thermal reduction at unity while
+//!   the model keeps integrating (the hard path still acts), and that is
+//!   what this unit does;
+//! - the closed loop (`TlimAdj`) and its pilot tone: the spec directs a
+//!   first release with the closed loop disabled, so channels whose tuning
+//!   enables CL thermal feedback run the open-loop kernel (reported as CL
+//!   off, `TlimAdj` 0) and no pilot is generated;
+//! - displacement control and CPMS power control: unspecified, and off in
+//!   every shipped laptop preset. A preset that enables either, or that
+//!   disables thermal protection, is refused at `new` and the unit runs the
+//!   fail-safe, rather than silently running without what the tuning asked
+//!   for.
+//!
+//! Tuning keys ([`TuningLookup`]) are the sidecar names where the sidecar
+//! has the value, otherwise the public AU parameter name with spaces
+//! removed: `ThermalProtectionEnabled` (global 0), `EnableCPMSControl`
+//! (18), `EnableCPMSClosedLoopControl` (19), `CLThermalFeedbackEnabled`
+//! (part 22). TODO(lane A): confirm the reader exposes these.
 
 use alloc::vec::Vec;
 
@@ -79,6 +93,9 @@ pub struct ChannelParams {
     pub reb_ref: f32,
     pub rshunt: f32,
     pub thermal_ff_speedup_factor: f32,
+    /// `CLThermalFeedbackEnabled` (0 or 1). Recorded; the closed loop is
+    /// not run in this release.
+    pub cl_thermal_feedback_enabled: u32,
     pub rampout: f32,
     /// `OL_disp`/`ag`: amplifier volts at digital full scale.
     pub ag: f32,
@@ -109,15 +126,19 @@ pub struct Params {
     pub thermal_safe_tlim_time_min: f32,
     pub enable_displacement_control: u32,
     pub enable_cpms_control: u32,
-    pub enable_closed_loop: u32,
+    pub enable_cpms_closed_loop_control: u32,
+    pub thermal_protection_enabled: u32,
     pub ch: [ChannelParams; MAX_CHANNELS],
 }
 
 // SAFETY: repr(C), only u32/f32 fields and an array of a repr(C) struct of
-// u32/f32 fields: 13 + 8 * 20 four-byte words, no padding.
+// u32/f32 fields: 14 + 8 * 21 four-byte words, no padding.
 unsafe impl Pod for Params {}
-// SAFETY: as above, 20 four-byte words.
+// SAFETY: as above, 21 four-byte words.
 unsafe impl Pod for ChannelParams {}
+
+const _: () = assert!(core::mem::size_of::<ChannelParams>() == 21 * 4);
+const _: () = assert!(core::mem::size_of::<Params>() == (14 + MAX_CHANNELS * 21) * 4);
 
 impl Default for Params {
     fn default() -> Self {
@@ -134,7 +155,8 @@ impl Default for Params {
             thermal_safe_tlim_time_min: 0.0,
             enable_displacement_control: 0,
             enable_cpms_control: 0,
-            enable_closed_loop: 0,
+            enable_cpms_closed_loop_control: 0,
+            thermal_protection_enabled: 0,
             ch: [ChannelParams::default(); MAX_CHANNELS],
         }
     }
@@ -187,7 +209,8 @@ impl Params {
             thermal_safe_tlim_time_min: g("Thermal_SafeTlimTimeMin")?,
             enable_displacement_control: flag("EnableDisplacementControl")?,
             enable_cpms_control: flag("EnableCPMSControl")?,
-            enable_closed_loop: flag("EnableClosedLoop")?,
+            enable_cpms_closed_loop_control: flag("EnableCPMSClosedLoopControl")?,
+            thermal_protection_enabled: flag("ThermalProtectionEnabled")?,
             ch: [ChannelParams::default(); MAX_CHANNELS],
         };
         for c in 0..n {
@@ -210,6 +233,7 @@ impl Params {
                 reb_ref: f("Reb_ref")?,
                 rshunt: f("Rshunt")?,
                 thermal_ff_speedup_factor: f("ThermalFFSpeedupFactor")?,
+                cl_thermal_feedback_enabled: (f("CLThermalFeedbackEnabled")? != 0.0) as u32,
                 rampout: f("Rampout")?,
                 ag: f("ag")?,
                 imon_scale: f("IMONScale")?,
@@ -301,6 +325,8 @@ struct Chan {
     a_vc: f64,
     a_mg: f64,
     hard_limit: f64,
+    /// `ThermalFFSpeedupFactor != 0`: the feed-forward reduction acts.
+    ff_active: bool,
     sense: Option<(usize, usize)>,
     vi_scale: f64,
     // block accumulators (split-invariant)
@@ -393,8 +419,11 @@ impl Run {
         if p.enable_cpms_control != 0 {
             return Err(InitError::Unsupported("EnableCPMSControl"));
         }
-        if p.enable_closed_loop != 0 {
-            return Err(InitError::Unsupported("closed loop"));
+        if p.enable_cpms_closed_loop_control != 0 {
+            return Err(InitError::Unsupported("EnableCPMSClosedLoopControl"));
+        }
+        if p.thermal_protection_enabled == 0 {
+            return Err(InitError::Unsupported("thermal protection disabled"));
         }
         let n = p.channels as usize;
         let rate = p.sample_rate as f64;
@@ -426,6 +455,7 @@ impl Run {
                 a_vc: dt / (c.tau_tvc as f64 + dt),
                 a_mg: dt / (c.tau_tmg as f64 + dt),
                 hard_limit: c.temperature_limit as f64 + c.hard_temp_limit_headroom as f64,
+                ff_active: c.thermal_ff_speedup_factor != 0.0,
                 sense: if c.ignore_telemetry != 0 { None } else { Some((c.sense_i as usize, c.sense_v as usize)) },
                 vi_scale: c.imon_scale as f64 * c.vmon_scale as f64,
                 acc_out: dsp::LaneAcc::new(),
@@ -536,20 +566,21 @@ impl Run {
         self.sums.frames += len;
         if self.sums.complete {
             // Energy envelopes for the delay estimator: protected output
-            // against sensed voltage, each summed over channels.
-            #[allow(clippy::needless_range_loop)]
-            for k in off..off + len {
-                let mut oe = 0.0f32;
-                let mut ve = 0.0f32;
+            // against sensed voltage, each summed over channels, in runs that
+            // end on the estimator's envelope points.
+            let mut k = off;
+            while k < off + len {
+                let m = self.estimator.room().min(off + len - k);
+                let mut oe = 0.0f64;
+                let mut ve = 0.0f64;
                 for c in self.ch.iter() {
-                    let o = io.output[c.src][k];
-                    oe += o * o;
+                    oe += dsp::sum_sq(&io.output[c.src][k..k + m]);
                     if let Some((_, sv)) = c.sense {
-                        let v = sense[sv][k];
-                        ve += v * v;
+                        ve += dsp::sum_sq(&sense[sv][k..k + m]);
                     }
                 }
-                self.estimator.push(oe, ve);
+                self.estimator.push_sums(oe as f32, ve as f32, m);
+                k += m;
             }
         }
         self.frame += len as u64;
@@ -568,7 +599,7 @@ impl Run {
             // step 6
             let p_drive = c.elec * c.acc_in.total() / blk;
             let ceiling = (c.span - c.theta_mg) / c.t_sett_vc;
-            c.g_target = libm::sqrt(ceiling.max(0.0) / p_drive.max(EPS)).min(1.0);
+            c.g_target = if c.ff_active { libm::sqrt(ceiling.max(0.0) / p_drive.max(EPS)).min(1.0) } else { 1.0 };
             c.hard = self.ambient + c.theta_vc > c.hard_limit;
         }
         // step 7

@@ -59,14 +59,16 @@ impl BlockSums {
 }
 
 pub struct DelayEstimator {
-    out_env: [f32; HIST],
-    v_env: [f32; HIST],
+    /// Differenced output envelope, written twice (at `pos` and
+    /// `pos + HIST`) so every lag window is one contiguous slice.
+    out_env: [f32; 2 * HIST],
     pos: usize,
     acc_out: f32,
     acc_v: f32,
     acc_n: usize,
     prev_out: f32,
     prev_v: f32,
+    /// `corr[j]` is the correlation at lag `MAX_LAG - 1 - j`.
     corr: [f32; MAX_LAG],
     filled: usize,
     candidate: Option<usize>,
@@ -83,8 +85,7 @@ impl Default for DelayEstimator {
 impl DelayEstimator {
     pub const fn new() -> Self {
         DelayEstimator {
-            out_env: [0.0; HIST],
-            v_env: [0.0; HIST],
+            out_env: [0.0; 2 * HIST],
             pos: 0,
             acc_out: 0.0,
             acc_v: 0.0,
@@ -108,20 +109,32 @@ impl DelayEstimator {
         self.locked
     }
 
-    /// Feed one frame-aligned run: `out_energy[n]` is the unit output's
-    /// energy summed over channels, `v_energy[n]` the sensed voltage's.
-    /// Called with per-sample energies by the unit (`push_run`).
+    /// Frames still missing from the current envelope point.
     #[inline]
-    pub fn push(&mut self, out_e: f32, v_e: f32) {
+    pub fn room(&self) -> usize {
+        ENV - self.acc_n
+    }
+
+    /// Feed `frames` frames (at most `room()`) whose output energy, summed
+    /// over channels, is `out_e`, and whose sensed voltage energy, summed
+    /// over channels, is `v_e`.
+    #[inline]
+    pub fn push_sums(&mut self, out_e: f32, v_e: f32, frames: usize) {
         self.acc_out += out_e;
         self.acc_v += v_e;
-        self.acc_n += 1;
-        if self.acc_n == ENV {
+        self.acc_n += frames;
+        if self.acc_n >= ENV {
             self.point(self.acc_out, self.acc_v);
             self.acc_out = 0.0;
             self.acc_v = 0.0;
             self.acc_n = 0;
         }
+    }
+
+    /// One frame (tests and scalar callers).
+    #[inline]
+    pub fn push(&mut self, out_e: f32, v_e: f32) {
+        self.push_sums(out_e, v_e, 1);
     }
 
     fn point(&mut self, o_level: f32, v_level: f32) {
@@ -131,12 +144,13 @@ impl DelayEstimator {
         self.prev_v = v_level;
         self.pos = (self.pos + 1) % HIST;
         self.out_env[self.pos] = o;
-        self.v_env[self.pos] = v;
+        self.out_env[self.pos + HIST] = o;
         self.filled = (self.filled + 1).min(HIST);
-        // corr[L] tracks sum over k of v[k] * out[k - L]
-        for (l, c) in self.corr.iter_mut().enumerate() {
-            let k = (self.pos + HIST - l) % HIST;
-            *c = *c * LAMBDA + v * self.out_env[k];
+        // corr at lag L += v[k] * out[k - L]; window[j] = out[k - (MAX_LAG-1-j)]
+        let end = self.pos + HIST + 1;
+        let window = &self.out_env[end - MAX_LAG..end];
+        for (c, &w) in self.corr.iter_mut().zip(window) {
+            *c = *c * LAMBDA + v * w;
         }
     }
 
@@ -145,16 +159,20 @@ impl DelayEstimator {
         if self.filled <= MAX_LAG {
             return;
         }
-        let mut best = 0;
+        let mut best_j = MAX_LAG - 1;
         let mut sum = 0.0f32;
-        for (l, &c) in self.corr.iter().enumerate() {
+        // scan from lag 0 upward so ties resolve to the shortest lag
+        for j in (0..MAX_LAG).rev() {
+            let c = self.corr[j];
             sum += c.abs();
-            if c > self.corr[best] {
-                best = l;
+            if c > self.corr[best_j] {
+                best_j = j;
             }
         }
+        let best = MAX_LAG - 1 - best_j;
         let mean = sum / MAX_LAG as f32;
-        let peaked = self.corr[best] > 0.0 && self.corr[best] > PEAK_RATIO * mean;
+        let peak = self.corr[best_j];
+        let peaked = peak > 0.0 && peak > PEAK_RATIO * mean;
         if peaked && self.candidate == Some(best) {
             self.stable = self.stable.saturating_add(1);
         } else {

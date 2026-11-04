@@ -69,6 +69,7 @@ impl UnitKind {
 }
 
 /// Health of the unit after a `process` call, as bits.
+#[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Health(pub u32);
 
