@@ -46,7 +46,7 @@ Any failure releases the interlock at once, and the kernel's own safe level appl
 
 ## Rollout
 
-v2 replaces the previous daemon on a machine only once that machine passes the differential qualification:
+speakerguardd replaces what a machine runs today only once that machine passes the differential qualification:
 - parity with macOS;
 - fault injection;
 - zero SELinux denials in enforcing mode;
@@ -54,3 +54,19 @@ v2 replaces the previous daemon on a machine only once that machine passes the d
 - loudness and clarity measured against macOS.
 
 Until then that machine keeps what it runs today.
+
+## Versions and the switch to main
+
+speakerguardd starts again at 1.0.0: `1.0.0-alpha.N` while the units are built, then `-beta.N` while machines qualify, then 1.0.0. The 0.1.x daemon is a different program, archived on `legacy/v0.1` with tags `v0.1.12` and `v0.1.13-rc.2`.
+
+When `v2` is ready, it becomes `main` by an ordinary merge that keeps history and replaces the contents. There is no force push:
+
+```
+git switch main
+git merge --no-ff -s ours v2 -m "Merge v2: replace 0.1.x with speakerguardd 1.0"  # record v2 as merged, keep main's tree for a moment
+git read-tree -u --reset v2                                                       # make the tree exactly v2's
+git commit --amend --no-edit                                                       # the merge commit now carries v2's tree
+git push origin main                                                               # fast-forward: main's old history stays reachable
+```
+
+The result is one merge commit whose first parent is the old `main` and second parent is `v2`, and whose tree is exactly `v2`'s. That commit lands as a pull request from a `v2-switch-main` branch, so it is reviewed like any other change, and the `main` push is a fast-forward. Afterwards `v2` is retired, and work continues on `main`.

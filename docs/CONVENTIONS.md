@@ -3,7 +3,7 @@
 ## Branches and merging
 
 - `v2` is the integration branch. Work lands through pull requests into `v2`, as merge commits. Never force-push `v2` or anyone else's branch.
-- Name branches `v2/<lane>/<topic>`, for example `v2/tuning/plist`, `v2/engine/neon-thermal`, `v2/rig/aurender` or `v2/kernel/lease`.
+- Name branches `v2-<lane>/<topic>`, for example `v2-A/plist`, `v2-B/neon-thermal`, `v2-C/rig` or `v2-D/lease` (git cannot hold `v2/...` branches while `v2` exists).
 - Every PR gets a review. A PR that changes behaviour states its parity numbers (rig cases and worst error per field) in its body.
 - PR bodies end with the generator attribution line the project uses.
 

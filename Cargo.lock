@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "aurora-speaker-tuning"
-version = "2.0.0-dev"
+version = "1.0.0-alpha.1"
 
 [[package]]
 name = "libc"
@@ -20,14 +20,14 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "sgv2-bench"
-version = "2.0.0-dev"
+version = "1.0.0-alpha.1"
 dependencies = [
  "sgv2-core",
 ]
 
 [[package]]
 name = "sgv2-core"
-version = "2.0.0-dev"
+version = "1.0.0-alpha.1"
 dependencies = [
  "libm",
  "sgv2-core",
@@ -35,7 +35,7 @@ dependencies = [
 
 [[package]]
 name = "sgv2-lv2"
-version = "2.0.0-dev"
+version = "1.0.0-alpha.1"
 dependencies = [
  "libc",
  "sgv2-core",
@@ -43,14 +43,14 @@ dependencies = [
 
 [[package]]
 name = "sgv2-render"
-version = "2.0.0-dev"
+version = "1.0.0-alpha.1"
 dependencies = [
  "sgv2-core",
 ]
 
 [[package]]
 name = "sgv2-supervisor"
-version = "2.0.0-dev"
+version = "1.0.0-alpha.1"
 dependencies = [
  "aurora-speaker-tuning",
  "sgv2-core",
