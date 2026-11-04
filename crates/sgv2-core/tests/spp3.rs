@@ -846,3 +846,72 @@ fn full_scale_drive_never_lowers_t_ol_abruptly() {
     // cooling under constant drive is slow (tau_vc 5.5 s): no snap
     assert!(worst_drop < 0.5, "T_OL dropped {worst_drop} C in one call");
 }
+
+/// Closed-loop parameters with a slow coil, so the model heats over
+/// seconds as in the live incident.
+fn slow_cl_params() -> Params {
+    let mut p = cl_params(4.0, 25.0);
+    for c in 0..4 {
+        p.ch[c].tau_tvc = 3.0;
+        p.ch[c].tau_tmg = 30.0;
+    }
+    p
+}
+
+/// Pilot-bin sense whose resistance follows `r(frame)` (I = V / R).
+fn pilot_sense_r(r: impl Fn(usize) -> f64, frames: usize) -> Vec<Vec<f32>> {
+    let n = 8192.0;
+    let m = (43.0664f64 * n / RATE as f64).round();
+    let v: Vec<f32> =
+        (0..frames).map(|k| (0.05 * (2.0 * std::f64::consts::PI * m * k as f64 / n).sin()) as f32).collect();
+    let i: Vec<f32> = v.iter().enumerate().map(|(k, &x)| ((x as f64 * 12.0 / r(k)) / 2.0) as f32).collect();
+    (0..8).map(|k| if k % 2 == 0 { i.clone() } else { v.clone() }).collect()
+}
+
+/// The J616s live-test shape: loud drive heats the model by tens of kelvin
+/// while the accepted windows' resistance FALLS (V and I swapped in the
+/// live routing). The guard trips, flags SENSE_IMPLAUSIBLE, and the
+/// correction can no longer relax; AudioUnitReset does not clear it, a
+/// rebuild does.
+#[test]
+fn plausibility_guard_trips_on_resistance_falling_while_heating() {
+    let p = slow_cl_params();
+    let mut u = spp3::Unit::new(p);
+    let n = 48_000 * 12;
+    // 4.6 ohm cold, falling to 4.0 ohm over the run, as the model heats
+    let tele = pilot_sense_r(|k| 4.6 - 0.6 * k as f64 / n as f64, n);
+    let t = run_cl(&mut u, 0.6, &tele, 0, n);
+    assert!(t.channels[0].ol_temp_c > 80.0, "the model heated: {}", t.channels[0].ol_temp_c);
+    assert!(u.sense_implausible(0), "T_OL {} T_CL {}", t.channels[0].ol_temp_c, t.channels[0].cl_temp_c);
+    assert!(t.health.0 & Health::SENSE_IMPLAUSIBLE != 0);
+    assert_eq!(t.channels[0].tlim_adj_c, 0.0);
+    u.host_reset();
+    assert!(u.sense_implausible(0), "AudioUnitReset keeps the verdict");
+    u.reset();
+    assert!(!u.sense_implausible(0), "a rebuild clears it");
+}
+
+#[test]
+fn plausibility_guard_passes_a_heating_coil() {
+    // R rising with the coil (alpha 0.0039, +40 K over the run)
+    let p = slow_cl_params();
+    let mut u = spp3::Unit::new(p);
+    let n = 48_000 * 12;
+    let tele = pilot_sense_r(|k| 4.0 * (1.0 + 0.0039 * (5.0 + 40.0 * k as f64 / n as f64)), n);
+    let t = run_cl(&mut u, 0.6, &tele, 0, n);
+    assert!(t.channels[0].ol_temp_c > 80.0, "{}", t.channels[0].ol_temp_c);
+    assert!(!u.sense_implausible(0));
+    assert_eq!(t.health.0 & Health::SENSE_IMPLAUSIBLE, 0);
+}
+
+#[test]
+fn plausibility_guard_trips_on_a_coil_far_below_its_calibration() {
+    // a constant reading 25 K below T_cal under drive
+    let p = cl_params(4.0, 25.0);
+    let mut u = spp3::Unit::new(p);
+    let n = 48_000 * 6;
+    let alpha = 0.004 + (25.0 - 20.0) * (0.0038 - 0.004) / 15.0;
+    let tele = pilot_sense_r(|_| 0.2 + 3.8 * (1.0 - alpha * 25.0), n);
+    run_cl(&mut u, 0.3, &tele, 0, n);
+    assert!(u.sense_implausible(0));
+}

@@ -20,3 +20,9 @@ signals/gen_signals.py ──► program signals (seeded; regenerate, never comm
 Tolerances: 0.01 dB gain, 0.02 °C temperature, 1e-3 relative power, 1e-5 linear audio below limiting. Mode transitions must land in the same slice.
 
 Golden vectors made with a Mac's tuning are Apple-derived data and stay outside this repository. Only synthetic-parameter vectors may be committed here.
+
+## Case variants and controller dumps (spp3)
+
+- `cargo run --release -p sgv2-render --example blob-patch -- IN OUT key[=value] ...` derives the blob a capture used from a compiled blob. It covers the 64009 SpTS records (`calch=C:R,T`, `nocal`), the shortened SafeTlim test sidecars (`safe_time_min=`), the patched Rampout sidecar (`rampout=`) and property 64007 (`start=`). Like every blob, the outputs carry Mac tuning: keep them out of git.
+- `cargo run --release -p sgv2-render --example spp3-dump -- BLOB PROGRAM.f32 CH[,CH..] [SENSE.f32 [RESETS]]` writes the per-update controller state as f64 values. They line up with the reference `clsp.npz` `ctl` records: smoothed and selected gain, Tlim_eff, the FF, coil and magnet nodes, Pcoil, Pdrv, T_CL, the accepted window and the pilot target.
+- `run.py` passes each case's `events` to `sgv2-render --events`, which replays `FRAME:reset` as `host_reset` (AudioUnitReset).

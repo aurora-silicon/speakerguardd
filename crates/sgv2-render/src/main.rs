@@ -9,7 +9,7 @@
 //! sgv2-render --unit spp3|lsm2|atsp [--blob PARAMS.blob] --case NAME
 //!             --in PROGRAM.f32 --ch N [--sense SENSE.f32 --sense-ch M]
 //!             [--slices 512 | --slices 1,7,31,...] [--out TRACE.jsonl]
-//!             [--audio-out OUT.f32] [--cfprop ID=FILE ...]
+//!             [--audio-out OUT.f32] [--cfprop ID=FILE ...] [--events F:reset,...]
 //! ```
 //!
 //! `--file-ch N` reads a program file of N channels, stream channel c taking
@@ -30,6 +30,10 @@
 //! `cpms_ts_1000`, `cpms_ts_thermal` in mW). Others are listed only; the
 //! spp3 calibration (64009) reaches the unit through its blob.
 //!
+//! `--events` replays the case's host events: `FRAME:reset` calls the unit's
+//! `host_reset` (AudioUnitReset) before that frame; `sleep=`/`tsjump=` are
+//! wall-clock events with no effect offline.
+//!
 //! Signals are raw interleaved little-endian float32, the rig's format. A
 //! slice list is used cyclically. Without `--blob`, or with a blob that does
 //! not parse, the unit is the fail-safe, exactly as in the graph.
@@ -40,7 +44,7 @@ use std::process::ExitCode;
 
 use sgv2_core::blob::Header;
 use sgv2_core::{
-    atsp, lsm2, spp3, ChannelState, FailSafe, Health, Io, ProtectionUnit, Telemetry, UnitKind, MAX_CHANNELS,
+    atsp, lsm2, spp3, ChannelState, FailSafe, HandOff, Health, Io, ProtectionUnit, Telemetry, UnitKind, MAX_CHANNELS,
 };
 
 struct Args {
@@ -59,6 +63,8 @@ struct Args {
     limit_frames: usize,
     preset_params: Vec<(u32, f32)>,
     params_at: Vec<(usize, u32, f32)>,
+    /// Host events by frame (`--events`), in order.
+    events: Vec<(usize, Event)>,
 }
 
 fn usage() -> ExitCode {
@@ -88,6 +94,7 @@ fn parse_args() -> Option<Args> {
         limit_frames: 0,
         preset_params: Vec::new(),
         params_at: Vec::new(),
+        events: Vec::new(),
     };
     let id_val = |v: &str| -> Option<(u32, f32)> {
         let (i, x) = v.split_once('=')?;
@@ -120,6 +127,12 @@ fn parse_args() -> Option<Args> {
                 let (f, rest) = v.split_once(':')?;
                 let (i, x) = id_val(rest)?;
                 a.params_at.push((f.parse().ok()?, i, x));
+            }
+            "--events" => {
+                for e in v.split(',').filter(|e| !e.is_empty()) {
+                    let (f, what) = e.split_once(':')?;
+                    a.events.push((f.parse().ok()?, Event::parse(what)?));
+                }
             }
             "--cfprop" => {
                 let (id, path) = v.split_once('=')?;
@@ -302,10 +315,50 @@ fn open_out(p: &Option<String>) -> io::Result<Option<BufWriter<File>>> {
     p.as_ref().map(|p| File::create(p).map(BufWriter::new)).transpose()
 }
 
+/// A host event of the rig (`rig_host --event FRAME:WHAT`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Event {
+    /// `AudioUnitReset`: the unit's `host_reset`.
+    Reset,
+    /// Wall-clock idle before the next call, s. No thermal time passes,
+    /// not even across a rebuild (the reference ignores it too).
+    Sleep,
+    /// A render-timestamp jump, or a ClassInfo get/set: no effect.
+    None,
+    /// `uninit`/`reinit`/`newinst`/`newinst_ci` with an optional 64007
+    /// value: the kernel is rebuilt with that start state (the strip's when
+    /// absent); under 0 it restores the hand-off record of the last update.
+    /// `in_place` is an Uninitialize + Initialize of the same AU instance.
+    Rebuild { state: Option<u32>, in_place: bool },
+}
+
+impl Event {
+    fn parse(what: &str) -> Option<Event> {
+        let (k, v) = what.split_once('=').map_or((what, None), |(k, v)| (k, Some(v)));
+        Some(match k {
+            "reset" => Event::Reset,
+            "sleep" => {
+                v?.parse::<f64>().ok()?;
+                Event::Sleep
+            }
+            "tsjump" | "classinfo" => Event::None,
+            "uninit" | "reinit" | "newinst" | "newinst_ci" => Event::Rebuild {
+                state: v.map(|v| v.parse()).transpose().ok()?,
+                in_place: matches!(k, "uninit" | "reinit"),
+            },
+            _ => return None,
+        })
+    }
+}
+
+/// Rebuilds the unit for an [`Event::Rebuild`]; `None` when the unit kind
+/// has no rebuild model.
+type Rebuild<'a> = &'a dyn Fn(Option<u32>, bool) -> Option<Box<dyn ProtectionUnit>>;
+
 /// Render the whole program, writing trace lines and audio as it goes.
 #[allow(clippy::too_many_arguments)]
 fn render(
-    unit: &mut dyn ProtectionUnit,
+    unit: &mut Box<dyn ProtectionUnit>,
     params: &str,
     kind: UnitKind,
     case: &str,
@@ -314,6 +367,8 @@ fn render(
     slices: &[usize],
     params_at: &[(usize, u32, f32)],
     cfprops: &[u32],
+    events: &[(usize, Event)],
+    rebuild: Rebuild<'_>,
     trace: &mut dyn Write,
     mut audio: Option<&mut dyn Write>,
 ) -> io::Result<()> {
@@ -328,7 +383,31 @@ fn render(
     let cfprop_ids: Vec<String> = cfprops.iter().map(u32::to_string).collect();
     let cfprop_ids = cfprop_ids.join(",");
     let (mut pos, mut k) = (0usize, 0usize);
+    let mut next_event = 0usize;
     while pos < frames {
+        // rig_host applies an event before the first call that starts at or
+        // after its frame; it never splits a call
+        let due = events[next_event..].iter().take_while(|(f, _)| *f <= pos).count();
+        for (_, e) in &events[next_event..next_event + due] {
+            match *e {
+                Event::Reset => unit.host_reset(),
+                Event::Sleep => {}
+                Event::None => {}
+                Event::Rebuild { state: p, in_place } => {
+                    let mut rec = HandOff::EMPTY;
+                    let saved = unit.save_state(&mut rec);
+                    let new = rebuild(p, in_place).ok_or_else(|| io::Error::other("no rebuild model for this unit"))?;
+                    *unit = new;
+                    // only 64007 = 0 restores the record, and with no ageing:
+                    // the rig's newinst=0 after 2 s of idle continues at the
+                    // saved temperature (rig law 6)
+                    if p == Some(0) && saved {
+                        unit.restore_state(&rec, 0.0);
+                    }
+                }
+            }
+        }
+        next_event += due;
         for &(f, id, v) in params_at {
             if f == pos && !unit.set_parameter(id, v) {
                 return Err(io::Error::new(
@@ -422,6 +501,32 @@ fn run(a: &Args) -> io::Result<()> {
         });
     }
     let (mut unit, params) = make_unit(a.unit, blob.as_deref(), cpms, &preset);
+    let mut events = a.events.clone();
+    events.sort_by_key(|(f, _)| *f);
+    let kind = a.unit;
+    let rebuild = |p: Option<u32>, in_place: bool| -> Option<Box<dyn ProtectionUnit>> {
+        let b = blob.as_deref()?;
+        match kind {
+            UnitKind::Spp3 => {
+                let mut q = spp3::Params::from_blob(b).ok()?;
+                if let Some(v) = p {
+                    q.thermal_state_override = v;
+                }
+                // the reference's in-place re-Initialize takes the pilot's low
+                // level as its high level too (headroom 1 - A_lo, the high
+                // target never selected again; rig, restore-uninit/reinit).
+                // A reference quirk the plugin does not reproduce: the rig
+                // renders it so the comparison is like for like.
+                if in_place {
+                    for c in q.ch.iter_mut() {
+                        c.pilot_ampl_hi_db = c.pilot_ampl_lo_db;
+                    }
+                }
+                Some(Box::new(spp3::Unit::new(q)))
+            }
+            _ => None,
+        }
+    };
     let mut stdout_trace;
     let mut file_trace = open_out(&a.out)?;
     let trace: &mut dyn Write = match file_trace.as_mut() {
@@ -433,7 +538,7 @@ fn run(a: &Args) -> io::Result<()> {
     };
     let mut audio = open_out(&a.audio_out)?;
     render(
-        unit.as_mut(),
+        &mut unit,
         &params,
         a.unit,
         &a.case,
@@ -442,6 +547,8 @@ fn run(a: &Args) -> io::Result<()> {
         &a.slices,
         &params_at,
         &cfprop_ids,
+        &events,
+        &rebuild,
         trace,
         audio.as_mut().map(|w| w as &mut dyn Write),
     )
@@ -492,7 +599,7 @@ mod tests {
             let mut trace = Vec::new();
             let mut audio = Vec::new();
             render(
-                unit.as_mut(),
+                &mut unit,
                 &params,
                 UnitKind::Lsm2,
                 "t",
@@ -501,6 +608,8 @@ mod tests {
                 slices,
                 &[],
                 &[64009, 7],
+                &[],
+                &|_, _| None,
                 &mut trace,
                 Some(&mut audio),
             )
@@ -518,6 +627,55 @@ mod tests {
             assert!(out[0].iter().all(|&x| (x - 0.025).abs() < 1e-7));
             assert!(out[1].iter().all(|&x| (x + 0.05).abs() < 1e-7));
         }
+    }
+
+    #[test]
+    fn cfprop_fixtures_must_exist_and_are_listed() {
+        let dir = std::env::temp_dir().join(format!("sgv2-render-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("in.f32");
+        std::fs::write(&input, [0u8; 4 * 2 * 64]).unwrap();
+        let fixture = dir.join("fx.json");
+        std::fs::write(&fixture, b"{}").unwrap();
+        let out = dir.join("t.jsonl");
+        let mut a = Args {
+            unit: UnitKind::Lsm2,
+            blob: None,
+            case: String::from("t"),
+            input: input.to_string_lossy().into_owned(),
+            channels: 2,
+            sense: None,
+            sense_channels: 0,
+            slices: vec![32],
+            out: Some(out.to_string_lossy().into_owned()),
+            audio_out: None,
+            cfprops: vec![(64009, fixture.to_string_lossy().into_owned())],
+            file_channels: 0,
+            limit_frames: 0,
+            preset_params: Vec::new(),
+            params_at: Vec::new(),
+            events: Vec::new(),
+        };
+        run(&a).unwrap();
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert_eq!(text.lines().count(), 2);
+        assert!(text.lines().all(|l| l.contains("\"cfprops\":[64009]")), "{text}");
+        a.cfprops.push((7, dir.join("absent.json").to_string_lossy().into_owned()));
+        assert!(run(&a).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn host_events_parse() {
+        assert_eq!(Event::parse("reset"), Some(Event::Reset));
+        assert_eq!(Event::parse("sleep=2"), Some(Event::Sleep));
+        assert_eq!(Event::parse("tsjump=240000"), Some(Event::None));
+        assert_eq!(Event::parse("classinfo"), Some(Event::None));
+        assert_eq!(Event::parse("newinst=0"), Some(Event::Rebuild { state: Some(0), in_place: false }));
+        assert_eq!(Event::parse("uninit"), Some(Event::Rebuild { state: None, in_place: true }));
+        assert_eq!(Event::parse("newinst_ci=1"), Some(Event::Rebuild { state: Some(1), in_place: false }));
+        assert_eq!(Event::parse("bogus"), None);
+        assert_eq!(Event::parse("sleep"), None);
     }
 
     #[test]

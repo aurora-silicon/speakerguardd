@@ -103,6 +103,25 @@ def cases():
             ("five-entries", "spts-synth-five-entries.json")]:
         C.append(dict(name=f"spp3-cal-{suffix}", unit="spp3", signal="impulse",
                       cfprops=[f"64009={fixture}"]))
+    # SafeTlim latch oracles on shortened test sidecars (cal/spp3-sidecar-safetlim-*,
+    # Daybreak t-4646; every other value as shipped)
+    C.append(dict(name="spp3-safetlim-entry", unit="spp3", signal="safetlim_hold",
+                  plant="plant-deadI.json", sidecar_fixture="spp3-sidecar-safetlim-0.1min.plist",
+                  log_level="18"))
+    C.append(dict(name="spp3-safetlim-min-boundary", unit="spp3", signal="safetlim_boundary",
+                  plant="plant-deadI.json", sidecar_fixture="spp3-sidecar-safetlim-0.02min.plist",
+                  log_level="2"))
+    C.append(dict(name="spp3-safetlim-sense-loss-implausible-recovery", unit="spp3",
+                  signal="safetlim_faults", plant="plant-safetlim-faults-sched.json",
+                  sidecar_fixture="spp3-sidecar-safetlim-0.1min.plist",
+                  cfprops=["64009=spts-synth-nominal.json"], log_level="2"))
+    # J616s live-test incident (2026-11-05): music over full scale (about 36 W woofer
+    # drive) with the closed loop running; ideal sense, and sense converters that clip
+    for g in ("1p6", "2p5"):
+        C.append(dict(name=f"spp3-tokyo-x{g}", unit="spp3", signal=f"tokyo_30s_x{g}"))
+        for plant, tag in (("plant-aid35-like.json", ""), ("plant-aid35-like-sat.json", "-vsat")):
+            C.append(dict(name=f"spp3-cl-tokyo-x{g}{tag}", unit="spp3", signal=f"tokyo_30s_x{g}",
+                          plant=plant, cfprops=["64009=spts-synth-nominal.json"], log_level="2"))
     # failure cases
     C.append(dict(name="spp3-nosidecar-pink_steps", unit="spp3", signal="pink_steps", sidecar=False))
     # host slice size: both units' output depends on it; the macOS graphs use 512
@@ -182,12 +201,33 @@ def check_host(name, meta, expect_frames):
         raise RuntimeError(f"{name}: rendered {meta.get('frames')} frames of {expect_frames}")
 
 
-def parse_decisions(text):
-    """spp3's per-channel closed/open-loop decisions from its log messages."""
-    return {"closed_loop_channels": sorted({int(x) for x in re.findall(
-                r"Ch (\d+), Using closed loop parameters", text)}),
-            "open_loop_channels": sorted({int(x) for x in re.findall(
-                r"Ch (\d+), Using open loop kernel", text)})}
+def run_host(args, env, cwd):
+    """Run rig_host; return (returncode, stdout, stderr, pid). The pid selects this run's
+    own unit log messages: `log stream` sees every rig_host on the Mac (other lanes and
+    earlier paced retries of the same case)."""
+    p = subprocess.Popen(args, env=env, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    out, err = p.communicate()
+    return p.returncode, out, err, p.pid
+
+
+_DECISION = re.compile(r"(?:rig_host\[(\d+)[:\]].*?)?Ch (\d+), Using (closed loop parameters|open loop kernel)")
+
+
+def parse_decisions(text, pid=None):
+    """spp3's per-channel closed/open-loop decisions from its log messages, in log order.
+    pid: keep only that process's messages (None keeps every message). Each channel's
+    decisions are kept as a sequence (one per Initialize: a reset or a new instance makes
+    a new one), so a channel that goes closed, open, closed in one run is recorded, not
+    rejected."""
+    seq = {}
+    for line in text.splitlines():
+        m = _DECISION.search(line)
+        if not m or (pid is not None and (m.group(1) is None or int(m.group(1)) != pid)):
+            continue
+        seq.setdefault(int(m.group(2)), []).append(m.group(3).startswith("closed"))
+    return {"closed_loop_channels": sorted(c for c, v in seq.items() if any(v)),
+            "open_loop_channels": sorted(c for c, v in seq.items() if not all(v)),
+            "closed_loop_sequence": {str(c): v for c, v in sorted(seq.items())}}
 
 
 def closed_loop_mode(unit, meta, nchan):
@@ -202,6 +242,17 @@ def closed_loop_mode(unit, meta, nchan):
         ids = [int(p.split("=", 1)[0]) for p in meta.get("case", {}).get("cfprops", [])]
     if SPTS_PROP not in ids and not meta.get("spts"):
         return [False] * nchan
+    seq = meta.get("closed_loop_sequence")
+    if seq is not None:  # captures that record the ordered decisions
+        missing = [ch for ch in range(nchan) if not seq.get(str(ch))]
+        if missing:
+            raise ValueError(f"closed-loop decision not recorded for channels {missing}")
+        # A channel whose decision changed during the run has no single per-slice value
+        # without the frame of each re-decision: the trace records null (not compared) and
+        # the meta keeps the sequence.
+        if any(len(set(seq[str(ch)])) > 1 for ch in range(nchan)):
+            return None
+        return [seq[str(ch)][0] for ch in range(nchan)]
     cl, ol = set(meta.get("closed_loop_channels", [])), set(meta.get("open_loop_channels", []))
     both, neither = cl & ol, set(range(nchan)) - cl - ol
     if both or neither:
@@ -222,7 +273,9 @@ def run_case(c, outroot, force=False):
             "--q", str(q), "--out", os.path.join(d, "run")]
     if unit == "spp3":
         if c.get("sidecar", True):
-            args += ["--sidecar", SIDECAR[unit]]
+            sidecar = (os.path.join(RIG, "cal", c["sidecar_fixture"]) if c.get("sidecar_fixture")
+                       else SIDECAR[unit])
+            args += ["--sidecar", sidecar]
     props, paths = propstrip_props(unit)
     for pr in c.get("props", props):
         args += ["--prop", pr]
@@ -236,7 +289,8 @@ def run_case(c, outroot, force=False):
     if unit == "spp3":
         if c.get("plant"):
             args += ["--plant", os.path.join(RIG, "cal", c["plant"])]
-            env.update(RIGREDIR_FROM="/Library/Preferences/Audio/CLSPLogs", RIGPREF_clsp_logging_level="11")
+            env.update(RIGREDIR_FROM="/Library/Preferences/Audio/CLSPLogs",
+                       RIGPREF_clsp_logging_level=c.get("log_level", "11"))
     if unit == "lsm2" and c.get("logs", True):
         # small host slices outrun the unit's log writer at any pace: audio and meters only
         env.update(RIGREDIR_FROM="/Library/Preferences/Audio/lsm2", RIGPREF_LSMv2EnableLogging="1")
@@ -250,6 +304,11 @@ def run_case(c, outroot, force=False):
     expect_frames = os.path.getsize(signal) // (4 * CH[unit])
     t0 = time.time()
     pace = 50.0 if q >= 64 else 0.0
+    # spp3's CLSP log writer also drops records at full speed: pace the
+    # plant cases so every controller record is kept
+    spp3_logs = unit == "spp3" and bool(c.get("plant"))
+    if spp3_logs:
+        pace = 25.0
     # Capture only spp3's own calibration decision messages.  Starting the
     # stream before rig_host avoids relying on the process after it exits.
     logp = logf = None
@@ -265,13 +324,17 @@ def run_case(c, outroot, force=False):
         time.sleep(0.75)
     try:
         while True:
-            a2 = args + (["--pace", str(pace)] if unit == "lsm2" and c.get("logs", True) else [])
-            p = subprocess.run(a2, env=env, capture_output=True, text=True, cwd=d)
-            open(os.path.join(d, "host.log"), "w").write(p.stdout + p.stderr)
-            if p.returncode:
-                raise RuntimeError(f"{c['name']}: rig_host rc={p.returncode}: {p.stderr[-400:]}")
+            a2 = args + (["--pace", str(pace)] if (unit == "lsm2" and c.get("logs", True)) or spp3_logs else [])
+            rc, out, err, host_pid = run_host(a2, env, d)
+            open(os.path.join(d, "host.log"), "w").write(out + err)
+            if rc:
+                raise RuntimeError(f"{c['name']}: rig_host rc={rc}: {err[-400:]}")
             logs = os.listdir(os.path.join(d, "logs"))
-            if not any("OVERWRITE" in f for f in logs):
+            # spp3: one 40-byte T_Coil record per 512-frame block on every channel
+            short = spp3_logs and any(
+                os.path.getsize(os.path.join(d, "logs", f)) < 40 * (expect_frames // 512)
+                for f in logs if "_T_Coil_ch" in f)
+            if not any("OVERWRITE" in f for f in logs) and not short:
                 break
             # the unit's async log writer dropped records: slow down and redo
             if pace == 0.0:
@@ -297,8 +360,8 @@ def run_case(c, outroot, force=False):
     decisions = {"closed_loop_channels": [], "open_loop_channels": []}
     aulog = os.path.join(d, "au.log")
     if os.path.exists(aulog):
-        decisions = parse_decisions(open(aulog).read())
-    meta.update(case=c, wall_s=round(time.time() - t0, 2), runtime_file=runtime_file, cfprops=cfprops,
+        decisions = parse_decisions(open(aulog).read(), host_pid)
+    meta.update(case=c, host_pid=host_pid, wall_s=round(time.time() - t0, 2), runtime_file=runtime_file, cfprops=cfprops,
                 inputs_sha256=key, **decisions)
     json.dump(meta, open(os.path.join(d, "run.meta.json"), "w"), indent=1)
     write_trace(d, c, meta)
@@ -459,7 +522,21 @@ def self_test():
     # Closed-loop decisions: a per-channel list.
     text = "\n".join(["x Ch 0, Using closed loop parameters", "x Ch 1, Using open loop kernel"])
     dec = parse_decisions(text)
-    assert dec == {"closed_loop_channels": [0], "open_loop_channels": [1]}, dec
+    assert dec["closed_loop_channels"] == [0] and dec["open_loop_channels"] == [1], dec
+    spts = [{"id": SPTS_PROP}]
+    # only the named process; a channel that goes closed, open, closed is a sequence
+    text2 = "\n".join(["a rig_host[7:1a] [x] Ch 0, Using closed loop parameters r",
+                        "a rig_host[9:1b] [x] Ch 0, Using open loop kernel",
+                        "a rig_host[7:1a] [x] Ch 1, Using closed loop parameters r",
+                        "a rig_host[7:1a] [x] Ch 0, Using open loop kernel",
+                        "a rig_host[7:1a] [x] Ch 1, Using closed loop parameters r",
+                        "a rig_host[7:1a] [x] Ch 0, Using closed loop parameters r"])
+    d7 = parse_decisions(text2, 7)
+    assert d7["closed_loop_sequence"] == {"0": [True, False, True], "1": [True, True]}, d7
+    assert parse_decisions(text2, 9)["closed_loop_sequence"] == {"0": [False]}
+    assert closed_loop_mode("spp3", dict(cfprops=spts, **d7), 2) is None
+    assert closed_loop_mode("spp3", dict(cfprops=spts, closed_loop_sequence={"0": [True], "1": [False]}), 2) == [True, False]
+    raises(ValueError, closed_loop_mode, "spp3", dict(cfprops=spts, closed_loop_sequence={"0": [True]}), 2)
     spts = [{"id": SPTS_PROP}]
     assert closed_loop_mode("spp3", dict(cfprops=spts, **dec), 2) == [True, False]
     raises(ValueError, closed_loop_mode, "spp3", dict(cfprops=spts, **dec), 3)  # channel 2 undecided

@@ -91,6 +91,11 @@ impl Health {
     /// above 1000 K). The unit holds its hard path while it lasts; the
     /// state keeps integrating (the reference would re-seed it lower).
     pub const MODEL_RANGE: u32 = 1 << 5;
+    /// spp3: a channel's closed-loop readings failed the plausibility guard
+    /// (resistance falling while the model heats, or a coil reading far
+    /// below its calibration temperature under drive). Its correction can no
+    /// longer relax the limit until the kernel is rebuilt.
+    pub const SENSE_IMPLAUSIBLE: u32 = 1 << 6;
 
     pub fn is_failsafe(self) -> bool {
         self.0 & Self::FAILSAFE != 0

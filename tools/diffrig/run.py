@@ -180,6 +180,8 @@ def main(argv):
             args += ["--param", pp]
         for pp in c.get("params_at", []):
             args += ["--param-at", pp]
+        if c.get("events"):
+            args += ["--events", ",".join(c["events"])]
         props, why = render_inputs(meta, cal)
         if why:
             rows.append((case, False, "-", why))
@@ -218,7 +220,8 @@ def main(argv):
         note = "".join([f"; absent on sgv2: {missing}" if missing else "",
                         f"; not compared: {skipped}" if skipped else "",
                         f"; {rep['inputs']}" if rep.get("inputs") else ""])
-        rows.append((case, ok, f"{arep.get('max_abs_error', float('nan')):.3g} / {arep.get('rms_error', float('nan')):.3g}",
+        rows.append((case, ok, f"{arep.get('max_abs_error', float('nan')):.3g} / {arep.get('rms_error', float('nan')):.3g} "
+                     f"(within FS {arep.get('max_abs_error_within_fs', float('nan')):.3g})",
                      f"{worst}{note}"))
         all_ok &= ok
     with open(os.path.join(out, "summary.md"), "w") as fd:
