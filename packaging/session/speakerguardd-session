@@ -2,6 +2,7 @@
 """speakerguardd-session: the per-user half of speakerguardd v2.
 
     speakerguardd-session --machine j316 [--machines /usr/share/speakerguardd/machines.json]
+                          [--selfcheck /var/lib/speakerguardd/selfcheck.json]
 
 It runs in the user's session, beside PipeWire, and does three things:
 
@@ -18,8 +19,11 @@ It runs in the user's session, beside PipeWire, and does three things:
    also checks the carrier: the protect stage's input and the sense at unity
    volume, unmuted.
 3. **Report.** On every link or carrier change, and every 50 ms, it writes
-   `links=<0|1> carrier=<0|1> mono_ns=<t> pid=<pid> start=<ticks>`
-   to /run/speakerguardd/<uid>/helper/session, by a write to a new file and a
+   `links=<0|1> carrier=<0|1> mono_ns=<t> pid=<pid> start=<ticks> wiring=<hash>`
+   to /run/speakerguardd/<uid>/helper/session, where the wiring is the one
+   the protect stage was built with (its `sgv2.wiring` property; the
+   supervisor grants only for the wiring the self-check proved), by a write
+   to a new file and a
    rename, so the supervisor never reads a partial report. A report older
    than 500 ms, dated in the future, or whose writer (pid, start time) is not
    this live process counts as absent, and the supervisor then releases.
@@ -46,6 +50,9 @@ import time
 
 PERIOD = 0.050
 PROTECT_INPUT = "alsa_output.platform-sound.RawSpeakers"
+# While speakerguardd-selfcheck runs its silent check it holds a grant of
+# its own: nothing may be linked to the amps then.
+SELFCHECK_ACTIVE = "/run/speakerguardd-selfcheck/active"
 
 # ALSA control ioctls (include/uapi/sound/asound.h, 64-bit)
 _ID_FMT = "IiII44sI"
@@ -107,6 +114,8 @@ class Card:
         try:
             fcntl.ioctl(self.fd, _ELEM_READ, buf)
         except OSError:
+            return False
+        if os.path.exists(SELFCHECK_ACTIVE):
             return False
         return struct.unpack_from("q", buf, 72)[0] == 1
 
@@ -273,6 +282,13 @@ class Session:
         carrier = unity(g.node_props(protect)) and (sense is None or unity(g.node_props(sense)))
         return ok, carrier
 
+    def wiring(self, g):
+        """The protect stage's `sgv2.wiring` (16 hex digits), or None."""
+        protect = g.node_id(PROTECT_INPUT)
+        props = ((g.objs.get(protect) or {}).get("info") or {}).get("props") or {}
+        w = props.get("sgv2.wiring")
+        return w if isinstance(w, str) and len(w) == 16 and all(ch in "0123456789abcdef" for ch in w) else None
+
     def _spawn(self, key, argv):
         """Run pw-link without waiting: the report must not stall behind it."""
         if key in self.pending:
@@ -342,7 +358,7 @@ def realtime():
         log("normal priority (no RLIMIT_RTPRIO or CAP_SYS_NICE)")
 
 
-def write_report(path, links, carrier):
+def write_report(path, links, carrier, wiring=None):
     """Write one report atomically: a new file in the helper's own
     directory, renamed over the last one. The supervisor reads either the
     whole new report or the whole previous one, never a partial write.
@@ -352,7 +368,8 @@ def write_report(path, links, carrier):
     if _WRITER is None:
         _WRITER = (os.getpid(), own_start())
     pid, start = _WRITER
-    line = f"links={int(links)} carrier={int(carrier)} mono_ns={time.monotonic_ns()} pid={pid} start={start}\n".encode()
+    w = f" wiring={wiring}" if wiring else ""
+    line = f"links={int(links)} carrier={int(carrier)} mono_ns={time.monotonic_ns()} pid={pid} start={start}{w}\n".encode()
     tmp = os.path.join(os.path.dirname(path), f".session.{os.getpid()}")
     try:
         # 0640: the directory is setgid root, so the supervisor reads it
@@ -369,13 +386,33 @@ def write_report(path, links, carrier):
         return False
 
 
+def machine(args):
+    """The machine's card and channel counts: its machines.json entry, or,
+    for a board with none, the self-check's derived record."""
+    try:
+        with open(args.machines) as f:
+            c = json.load(f).get(args.machine)
+    except (OSError, ValueError):
+        c = None
+    if c is not None:
+        return c
+    try:
+        with open(args.selfcheck) as f:
+            rec = json.load(f)["record"]
+    except (OSError, ValueError, KeyError):
+        raise SystemExit(f"{args.machine}: no machines.json entry and no self-check record")
+    if rec.get("key") != args.machine or rec.get("result") != "pass":
+        raise SystemExit(f"{args.machine}: the self-check record is for {rec.get('key')} ({rec.get('result')})")
+    return {"card": rec["card"], "amps": rec["amps"], "sense": rec["sense"]}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--machine", required=True)
     ap.add_argument("--machines", default="/usr/share/speakerguardd/machines.json")
+    ap.add_argument("--selfcheck", default="/var/lib/speakerguardd/selfcheck.json")
     args = ap.parse_args()
-    with open(args.machines) as f:
-        c = json.load(f)[args.machine]
+    c = machine(args)
     card = Card(c["card"])
     g = Graph()
     s = Session(args.machine, c)
@@ -422,7 +459,7 @@ def main():
             nxt = time.monotonic() + PERIOD
         granted = card.granted()
         links, carrier = s.check(g)
-        wrote = write_report(report, links, carrier)
+        wrote = write_report(report, links, carrier, s.wiring(g))
         s.reconcile(g, granted)
         was_granted = granted
         state = (granted, links, carrier, wrote)
