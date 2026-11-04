@@ -140,6 +140,10 @@ context.modules = [
                 priority.driver    = 0
                 node.lock-quantum  = true
                 node.pause-on-idle = false
+                # Runs from the start, on any driver: the plugin is
+                # instantiated and beating before the grant, which waits for
+                # it, and before the amps are linked.
+                node.always-process = true
                 stream.dont-remix  = true
                 channelmix.disable = true
                 resample.disable   = true
@@ -156,6 +160,7 @@ context.modules = [
                 node.dont-reconnect = true
                 node.passive       = true
                 node.pause-on-idle = false
+                node.always-process = true
                 stream.dont-remix  = true
                 channelmix.disable = true
                 resample.disable   = true

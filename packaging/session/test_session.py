@@ -118,10 +118,19 @@ class Checks(unittest.TestCase):
         g.link(p["sense"][0], g.port(other, "in", "AUX0"))
         self.assertFalse(s.check(g)[0])
 
-    def test_a_program_link_from_anything_but_the_voicing_is_a_fault(self):
+    def test_a_second_voicing_into_the_program_is_protected_and_allowed(self):
         g, p, s = build()
-        app = g.node("some.app")
-        g.link(g.port(app, "out", "AUX0"), p["pin"][0])
+        ab = g.node("effect_output.some-ab-sink")
+        g.link(g.port(ab, "out", "AUX0"), p["pin"][0])
+        self.assertTrue(s.check(g)[0])
+
+    def test_a_crossed_program_link_or_the_sense_on_the_program_is_a_fault(self):
+        g, p, s = build()
+        ab = g.node("effect_output.some-ab-sink")
+        g.link(g.port(ab, "out", "AUX1"), p["pin"][0])
+        self.assertFalse(s.check(g)[0])
+        g, p, s = build()
+        g.link(p["sense"][0], p["pin"][0])
         self.assertFalse(s.check(g)[0])
 
     def test_the_carrier_must_be_unity_and_unmuted(self):

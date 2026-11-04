@@ -10,7 +10,8 @@ It runs in the user's session, beside PipeWire, and does three things:
    unlinks them as soon as it does not. The amps' sink is the driver of their
    group, so it never starts before the grant: the kernel would refuse it.
 2. **Integrity.** It checks the link set: into the protect stage's program
-   ports only the voicing output, channel for channel; into its sense ports
+   ports anything but the sense, channel for channel (the voicing, or a
+   second voicing such as a tuning A/B sink); into its sense ports
    only the sense, channel for channel; into the amps only the protect
    stage's output, channel for channel; out of the sense nothing else. A
    missing link is silence and is allowed; any other link is a fault. It
@@ -166,6 +167,7 @@ class Session:
         self.speaker = f"sgv2.speaker.{m}"
         self.sense_name = f"sgv2.sense.{m}"
         self.last_try = -10.0
+        self.pending = {}
 
     def wanted(self, g):
         """The links the helper owns: (out port, in port) pairs, or None if a node is missing."""
@@ -198,7 +200,6 @@ class Session:
         protect = g.node_id(PROTECT_INPUT)
         pout = g.node_id(self.protect_out)
         spk = g.node_id(self.speaker)
-        voicing = g.node_id(self.voicing)
         sense = g.node_id(self.sense_name) if self.sense else None
         if protect is None or pout is None or spk is None:
             return False, False
@@ -213,7 +214,10 @@ class Session:
             if inn == protect:
                 k = int(ic[3:]) if ic and ic.startswith("AUX") else -1
                 if 0 <= k < self.amps:
-                    ok &= on == voicing and oc == ic
+                    # Program: whatever plays into the protect stage is
+                    # protected; only its channel must match, and it must not
+                    # be the sense.
+                    ok &= on != sense and oc == ic
                 else:
                     ok &= sense is not None and on == sense and oc == f"AUX{k - self.amps}"
             elif inn == spk:
@@ -223,19 +227,29 @@ class Session:
         carrier = unity(g.node_props(protect)) and (sense is None or unity(g.node_props(sense)))
         return ok, carrier
 
+    def _spawn(self, key, argv):
+        """Run pw-link without waiting: the report must not stall behind it."""
+        if key in self.pending:
+            return
+        self.pending[key] = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def _reap(self):
+        for k, p in list(self.pending.items()):
+            if p.poll() is not None:
+                del self.pending[k]
+
     def reconcile(self, g, granted):
+        self._reap()
         want = self.wanted(g)
         have = {(o, i): lid for lid, o, i in g.links()}
         if granted and want:
             # A link pw-link could not make is tried again once a second
             now = time.monotonic()
-            if now - self.last_try < 1.0:
-                want = [w for w in want if w in have]
-            else:
+            missing = [w for w in want if w not in have]
+            if missing and now - self.last_try >= 1.0:
                 self.last_try = now
-            for o, i in want:
-                if (o, i) not in have:
-                    subprocess.run(["pw-link", str(o), str(i)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                for o, i in missing:
+                    self._spawn(("link", o, i), ["pw-link", str(o), str(i)])
         elif not granted:
             # Withdrawn: take the amps and the sense out of the graph, so the
             # amps' sink is not started again until the next grant.
@@ -244,7 +258,7 @@ class Session:
             owners = {o["id"]: (o["info"].get("props") or {}).get("node.id") for o in g.of_type("Port")}
             for lid, o, i in g.links():
                 if owners.get(i) == spk or (sense is not None and owners.get(o) == sense):
-                    subprocess.run(["pw-link", "-d", str(lid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    self._spawn(("unlink", lid), ["pw-link", "-d", str(lid)])
 
 
 def write_report(path, links, carrier):
@@ -283,9 +297,9 @@ def main():
         if nxt < time.monotonic():
             nxt = time.monotonic() + PERIOD
         granted = card.granted()
-        s.reconcile(g, granted)
         links, carrier = s.check(g)
         wrote = write_report(report, links, carrier)
+        s.reconcile(g, granted)
         state = (granted, links, carrier, wrote)
         if state != last:
             log(f"granted={int(granted)} links={int(links)} carrier={int(carrier)} report={'ok' if wrote else 'unwritable'}")
