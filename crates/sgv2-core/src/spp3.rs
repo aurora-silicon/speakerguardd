@@ -37,7 +37,7 @@
 //!   Goertzel period `N = next_pow2(round(TempSenseWindowTime fs))` on bin
 //!   `m = round(PilotFreq N / fs)`: band-power gates on scaled V and I, then
 //!   `R = sqrt(Pv / Pi)`, `R_s` e-folding from `R_cal`, `T_CL` from `R_s`
-//!   with `alpha` interpolated at `T_cal`; accepted when the instantaneous
+//!   with `alpha` interpolated at `T_cal`; accepted when the smoothed
 //!   `R` is in `RebRange`. `Tlim_eff` smooths `base + clamp(T_OL - T_CL, 0,
 //!   cap)` (or `base` when the last window was rejected) over
 //!   `TlimErrDecayTime` with the 99 % law.
@@ -613,19 +613,22 @@ impl SafeTlim {
 /// Single-bin Goertzel state of one signal (spec 7).
 #[derive(Clone, Copy, Default)]
 struct Goertzel {
-    s1: f64,
-    s2: f64,
+    s1: f32,
+    s2: f32,
 }
 
+/// Single-bin Goertzel in Float32, as the reference accumulates it (rig
+/// law (a): the Float32 recurrence over 16384 samples biases R by about
+/// 1e-3 relative, and the goldens carry that bias).
 impl Goertzel {
     #[inline]
-    fn push(&mut self, x: f64, a: f64) {
+    fn push(&mut self, x: f32, a: f32) {
         let s0 = x + a * self.s1 - self.s2;
         self.s2 = self.s1;
         self.s1 = s0;
     }
     /// `(s1^2 + s2^2 - a s1 s2) / N^2`, then cleared for the next period.
-    fn take(&mut self, a: f64, n: f64) -> f64 {
+    fn take(&mut self, a: f32, n: f32) -> f32 {
         let p = (self.s1 * self.s1 + self.s2 * self.s2 - a * self.s1 * self.s2) / (n * n);
         *self = Goertzel::default();
         p
@@ -637,16 +640,18 @@ impl Goertzel {
 struct Cl {
     /// Goertzel period `N` and its coefficient `2 cos(2 pi m / N)`.
     window: usize,
-    coef: f64,
+    coef: f32,
     n: usize,
     gv: Goertzel,
     gi: Goertzel,
-    v_scale2: f64,
-    i_scale2: f64,
-    v_floor: f64,
-    i_floor: f64,
-    k_r: f64,
-    r_s: f64,
+    /// V and I scales (applied to each sample) and the band-power floors.
+    v_scale: f32,
+    i_scale: f32,
+    v_floor: f32,
+    i_floor: f32,
+    /// Resistance smoother (e-folding per period) and its state.
+    k_r: f32,
+    r_s: f32,
     rdc_scale: f64,
     reb_min: f64,
     reb_max: f64,
@@ -663,7 +668,7 @@ struct Cl {
     /// Frames since the last accepted window.
     age: usize,
     /// Latest window resistance (telemetry).
-    r_window: f64,
+    r_window: f32,
     t_cl: f64,
     /// Smoothed corrected limit, absolute C (`Tlim_eff`).
     limit_s: f64,
@@ -731,17 +736,17 @@ impl Cl {
         let limit = c.temperature_limit as f64;
         Some(Cl {
             window,
-            coef: 2.0 * libm::cos(2.0 * core::f64::consts::PI * m / window as f64),
+            coef: (2.0 * libm::cos(2.0 * core::f64::consts::PI * m / window as f64)) as f32,
             n: 0,
             gv: Goertzel::default(),
             gi: Goertzel::default(),
-            v_scale2: vs * vs,
-            i_scale2: is * is,
-            v_floor: c.v_pwr_thres as f64,
-            i_floor: c.i_pwr_thres as f64,
+            v_scale: vs as f32,
+            i_scale: is as f32,
+            v_floor: c.v_pwr_thres,
+            i_floor: c.i_pwr_thres,
             // an ordinary e-folding constant per Goertzel period
-            k_r: 1.0 - libm::exp(-(window as f64) / (rate * c.temp_sense_smoothing_tau_s as f64)),
-            r_s: rc,
+            k_r: (1.0 - libm::exp(-(window as f64) / (rate * c.temp_sense_smoothing_tau_s as f64))) as f32,
+            r_s: c.cal_r,
             rdc_scale: c.rdc_scale as f64,
             reb_min: c.reb_range_min as f64,
             reb_max: c.reb_range_max as f64,
@@ -753,7 +758,7 @@ impl Cl {
             k_lim: settle99(c.tlim_err_decay_time_s as f64, r),
             valid: false,
             age: 0,
-            r_window: rc,
+            r_window: c.cal_r,
             t_cl: tc,
             limit_s: limit,
         })
@@ -765,8 +770,8 @@ impl Cl {
         self.n = 0;
         self.gv = Goertzel::default();
         self.gi = Goertzel::default();
-        self.r_s = self.cal_r;
-        self.r_window = self.cal_r;
+        self.r_s = self.cal_r as f32;
+        self.r_window = self.cal_r as f32;
         self.valid = false;
         self.age = 0;
         self.t_cl = self.cal_t;
@@ -787,38 +792,42 @@ impl Cl {
     fn feed(&mut self, i: &[f32], v: &[f32]) {
         let a = self.coef;
         for (&ii, &vv) in i.iter().zip(v) {
-            self.gv.push(vv as f64, a);
-            self.gi.push(ii as f64, a);
+            // scaled first, in Float32 (rig law (a))
+            self.gv.push(self.v_scale * vv, a);
+            self.gi.push(self.i_scale * ii, a);
             self.n += 1;
             if self.n == self.window {
                 self.n = 0;
-                let nn = self.window as f64;
-                let pv = self.gv.take(a, nn) * self.v_scale2;
-                let pi = self.gi.take(a, nn) * self.i_scale2;
+                let nn = self.window as f32;
+                let pv = self.gv.take(a, nn);
+                let pi = self.gi.take(a, nn);
                 self.window_done(pv, pi);
             }
         }
     }
 
-    fn window_done(&mut self, pv: f64, pi: f64) {
-        // the band-power gates run before the ratio (spec 16)
+    /// One completed Goertzel period (rig law (a)): the band-power gates,
+    /// then `R_w = sqrt(Pv / Pi)` and the smoother `R_s += k_R (R_w - R_s)`,
+    /// which also takes out-of-range windows; accepted iff the smoothed
+    /// `R_s` lies in `RebRange`.
+    fn window_done(&mut self, pv: f32, pi: f32) {
         if !(pv.is_finite() && pi.is_finite() && pv > self.v_floor && pi > self.i_floor) {
             self.valid = false;
             return;
         }
-        let r = libm::sqrt(pv / pi);
+        let r = libm::sqrtf(pv / pi);
         self.r_window = r;
         self.r_s += self.k_r * (r - self.r_s);
         // T_CL = fmaf(invTempCo, (Rw - Rshunt)/(R_cal - Rshunt) - 1, T_cal) in
-        // Float32, Rw the smoothed window resistance times RdcScale (rig
-        // law 3: bit-exact on 630 accepted windows over 10 configurations)
-        let rw = (self.rdc_scale * self.r_s) as f32;
+        // Float32, Rw = RdcScale * R_s, the logged window resistance (rig
+        // law 3)
+        let rw = self.rdc_scale as f32 * self.r_s;
         let (rc, rs) = (self.cal_r as f32, self.rshunt);
         let x = (rw - rs) / (rc - rs) - 1.0;
         let t = libm::fmaf(self.inv_temp_co, x, self.cal_t as f32) as f64;
-        // a window outside the range still publishes its temperature; the
-        // range test is on the instantaneous window resistance
-        let re = self.rdc_scale * r;
+        // TODO(SPEC): the range is tested on R_s here; the rig confirmed it
+        // at RdcScale 1, so whether RdcScale applies first is open
+        let re = self.r_s as f64;
         if t.is_finite() && self.r_s.is_finite() {
             self.t_cl = t;
             self.valid = re >= self.reb_min && re <= self.reb_max;
@@ -1019,11 +1028,11 @@ impl Chan {
 }
 
 /// The release hold of the ordinary candidate (rig law 5): when the fresh
-/// candidate first rises above the previous selected gain, the previous
-/// candidate is held for `N = ceil(1 s * update rate)` updates (188 at
-/// 48 kHz); a fresh candidate at or below the selected gain cancels it,
-/// and after a completed hold the fresh candidate passes until it falls
-/// to the selected gain again.
+/// candidate first reaches the previous selected gain (`>=`: the hard-path
+/// floor tie starts it), the previous candidate is held for `N = ceil(1 s *
+/// update rate)` updates (188 at 48 kHz); a fresh candidate below the
+/// selected gain cancels it, and after a completed hold the fresh
+/// candidate passes until it falls below the selected gain again.
 #[derive(Clone, Copy)]
 struct Hold {
     state: HoldState,
@@ -1050,7 +1059,7 @@ impl Hold {
     }
     fn decide(&mut self, g: f64, sel_prev: f64, n: u32) -> f64 {
         if self.cnt > 0 {
-            if g > sel_prev {
+            if g >= sel_prev {
                 self.cnt -= 1;
                 if self.cnt == 0 {
                     self.state = HoldState::Released;
@@ -1059,7 +1068,7 @@ impl Hold {
             }
             self.cnt = 0;
         }
-        if g > sel_prev {
+        if g >= sel_prev {
             if self.state == HoldState::Attack {
                 self.held = self.u_prev;
                 self.cnt = n.saturating_sub(1);
