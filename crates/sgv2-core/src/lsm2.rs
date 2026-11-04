@@ -117,7 +117,14 @@
 //!   of it, smoothed in dB at the controller cadence.
 //! - **Pressure path.** Which modeled signal the 1,024-tap response
 //!   filters; here the normalised input.
-//! - **Temperature gain.** The 25G83 temperature gain falls from about
+//! - **Applied temperature gain** (rig law 8, confirmed part): the linked
+//!   minimum of the temperature candidates is followed by its own law: a
+//!   cut to 0.99 x the candidate over the attack time when it falls below
+//!   the applied gain, else one 99 %-settling `SlowReleaseTime` step per
+//!   controller frame. The larger cuts near `TemperatureHardLimit +
+//!   TemperatureHeadroom` and the candidate itself (the axis's own thermal
+//!   predictor) are still open.
+//! - **Temperature candidate.** The 25G83 temperature gain falls from about
 //!   63 degC under the 1 kHz and 200 Hz ramps (0.886 at 63.4 degC) with a
 //!   trajectory that does not depend on the coil temperature, where the
 //!   knee (soft 120 degC, headroom 5) gives unity. The knee is used.
@@ -777,6 +784,12 @@ struct Chan {
     peak_g: f32,
     slow_target: f32,
     slow_g: f32,
+    /// The applied temperature gain (rig law 8, the confirmed part): cut to
+    /// 0.99 x the linked candidate over the attack time when the candidate
+    /// falls below it, else released toward it once per controller frame.
+    temp_a: f32,
+    temp_ramp: f32,
+    temp_left: u32,
 }
 
 pub struct Unit {
@@ -813,6 +826,9 @@ struct Run {
     r_low: f32,
     r_slow: f32,
     linked_power: f64,
+    /// The temperature law's attack ramp (frames) and per-frame release.
+    attack_frames: u32,
+    temp_release: f32,
     ch: Vec<Chan>,
 }
 
@@ -944,6 +960,9 @@ impl Run {
                 peak_g: 1.0,
                 slow_target: 1.0,
                 slow_g: 1.0,
+                temp_a: 1.0,
+                temp_ramp: 0.0,
+                temp_left: 0,
             });
         }
         let mut p_pole = [0.0; 4];
@@ -985,6 +1004,10 @@ impl Run {
             r_low: sample(p.low_band_release_time_ms),
             r_slow: sample(p.slow_release_time_ms),
             linked_power: 1.0,
+            attack_frames: libm::round(p.attack_time_ms as f64 * 1e-3 * rate) as u32,
+            temp_release: (1.0
+                - libm::exp(-libm::log(100.0) * ctl_frames as f64 / (rate * p.slow_release_time_ms as f64 * 1e-3)))
+                as f32,
             ch,
         })
     }
@@ -1030,6 +1053,9 @@ impl Run {
             c.peak_g = 1.0;
             c.slow_target = 1.0;
             c.slow_g = 1.0;
+            c.temp_a = 1.0;
+            c.temp_ramp = 0.0;
+            c.temp_left = 0;
         }
         self.pos = 0;
         self.sub = 0;
@@ -1095,8 +1121,12 @@ impl Run {
             }
             smooth(&mut c.peak_g, c.peak_target, r_attack, r_fast);
             smooth(&mut c.slow_g, c.slow_target, r_attack, r_slow);
+            if c.temp_left > 0 {
+                c.temp_a += c.temp_ramp;
+                c.temp_left -= 1;
+            }
             let backstop = if c.hard_armed { FAILSAFE_GAIN } else { 1.0 };
-            let broad = c.peak_g.min(c.slow_g).min(backstop);
+            let broad = c.peak_g.min(c.slow_g).min(c.temp_a).min(backstop);
             let e: [f32; BANDS] = core::array::from_fn(|k| c.band_g[k].min(broad));
             let e4 = e[BANDS - 1];
             if e.iter().any(|&g| g != 1.0) {
@@ -1234,7 +1264,8 @@ impl Run {
             }
             c.cand = [g_peak, g_disp, g_vel, g_pow, g_temp];
             c.peak_target = g_peak as f32;
-            c.slow_target = g_pow.min(g_temp) as f32;
+            // the slow smoother carries power; temperature has its own law
+            c.slow_target = g_pow as f32;
             // any non-finite model or controller state latches the fail-safe
             let model = [c.th_vc as f64, c.th_mag as f64, c.mask_db]
                 .iter()
@@ -1245,7 +1276,8 @@ impl Run {
             let gains = c.cand.iter().all(|v| v.is_finite())
                 && c.band_g.iter().all(|v| v.is_finite())
                 && c.peak_g.is_finite()
-                && c.slow_g.is_finite();
+                && c.slow_g.is_finite()
+                && c.temp_a.is_finite();
             if !(model && motion && gains) {
                 self.fault = true;
             }
@@ -1256,12 +1288,28 @@ impl Run {
         }
         self.linked_power = if self.link { pow } else { f64::NAN };
         if self.link && self.n > 1 {
-            let mut slow = 1.0f32;
-            for c in &self.ch {
-                slow = slow.min(c.slow_target);
-            }
             for c in self.ch.iter_mut() {
-                c.slow_target = if self.unlink_temp { (pow.min(c.cand[4])) as f32 } else { slow };
+                c.slow_target = pow as f32;
+            }
+        }
+        // Temperature (rig law 8): the applied gain follows the minimum over
+        // the linked channels of the logged candidates. Below the applied
+        // gain the target is 0.99 x the candidate, reached over the attack
+        // time from this frame boundary; otherwise one 99 %-settling release
+        // step per controller frame toward the candidate.
+        let linked_temp = self.link && !self.unlink_temp;
+        let gm_all = self.ch.iter().map(|c| c.cand[4]).fold(1.0f64, f64::min);
+        for c in self.ch.iter_mut() {
+            let gm = (if linked_temp { gm_all } else { c.cand[4] }) as f32;
+            if gm < c.temp_a {
+                let target = 0.99 * gm;
+                c.temp_left = self.attack_frames.max(1);
+                c.temp_ramp = (target - c.temp_a) / c.temp_left as f32;
+            } else if c.temp_left == 0 {
+                c.temp_a += self.temp_release * (gm - c.temp_a);
+                if (gm - c.temp_a).abs() <= f32::EPSILON * gm {
+                    c.temp_a = gm;
+                }
             }
         }
     }
@@ -1424,7 +1472,7 @@ impl ProtectionUnit for Unit {
             }
             s.band_gain = c.band_g;
             let backstop = if c.hard_armed { FAILSAFE_GAIN } else { 1.0 };
-            s.gain = if run.fault { FAILSAFE_GAIN } else { c.peak_g.min(c.slow_g).min(backstop) };
+            s.gain = if run.fault { FAILSAFE_GAIN } else { c.peak_g.min(c.slow_g).min(c.temp_a).min(backstop) };
             out.channels[c.src] = s;
             amp_1s += c.pbar1s_frame;
             if c.src == 0 {
@@ -1456,7 +1504,7 @@ impl ProtectionUnit for Unit {
             n[0] = (c.th_vc as f64).max(0.0);
             n[1] = (c.th_mag as f64).max(0.0);
             n[2..6].copy_from_slice(&c.pbar);
-            out.gain[i] = c.slow_g as f64;
+            out.gain[i] = c.slow_g.min(c.temp_a) as f64;
         }
         true
     }
@@ -1481,6 +1529,7 @@ impl ProtectionUnit for Unit {
             let g = release_toward_unity(state.gain[i], run.r_slow as f64, samples) as f32;
             c.slow_g = g;
             c.slow_target = g;
+            c.temp_a = g;
         }
         true
     }
