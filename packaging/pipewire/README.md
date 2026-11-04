@@ -1,6 +1,6 @@
 # PipeWire templates
 
-Generated per machine by `packaging/session/gen.py` from `packaging/session/machines.json`. Do not edit `sgv2-<machine>.conf` by hand.
+Generated per machine by `packaging/session/gen.py`. Do not edit `sgv2-<machine>.conf` by hand. Each machine's channel map and V/I order are derived (`packaging/session/wiring.py`) from its device tree and its tuning's graph, recorded in `packaging/session/fixtures/`; `machines.json` holds the rest of the entry, and its `unit_channels`/`sense_pairs`, where present, must agree with the derivation. On a Mac with no entry, `speakerguardd-selfcheck generate` writes these files from its record. The protect stage carries the map's hash as `sgv2.wiring`, which the supervisor requires to equal the self-check's (`docs/NEW-PLATFORM.md`).
 
 Each file holds:
 - the speaker amps' ALSA sink (`hw:CARD=<card>,DEV=1`);

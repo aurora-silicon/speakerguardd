@@ -1,0 +1,630 @@
+#!/usr/bin/python3 -I
+"""speakerguardd-selfcheck: prove this Mac's speaker wiring, silently, before
+speakerguardd may grant.
+
+    speakerguardd-selfcheck run      --params BLOB [--machines F] [--force] [-- TUNING-SOURCE...]
+    speakerguardd-selfcheck check    --params BLOB
+    speakerguardd-selfcheck generate --pipewire-dir D --wireplumber-dir D
+
+It runs as root, before the supervisor (speakerguardd-selfcheck.service),
+while the kernel holds the speakers at its floor.
+
+1. **Derive** the wiring (wiring.py) from the device tree and the tuning's
+   graph (`aurora-speaker-tuning dump --json` on the same source the
+   parameters were compiled from). A machines.json entry, if there is one,
+   overrides it, and every disagreement fails the check.
+2. **Check the map against the tuning**: every physical channel's amp (its
+   device-tree side and role) is the speaker its unit channel models.
+3. **Check the map against the hardware**, silently:
+   - every amp's registers (regmap): its RX slot is its speaker PCM
+     channel, and its V/I sense TX slots are the device tree's;
+   - with a zero-sample stream on the speaker PCM (every sample is 0, so
+     nothing is audible), it turns each amp's VSENSE and then its ISENSE
+     switch off in turn and records the sense PCM: exactly the one sense
+     channel the map gives that amp's V (or I) must go quiet or fixed
+     (an idle pattern), and every other channel must stay live.
+   The kernel admits the stream only under a grant, so the check takes
+   "Speaker Protection" itself, holds a 50 ms lease only while its own
+   zero-sample stream runs, keeps the PCMs to itself, and tells the
+   session helper not to link (/run/speakerguardd-selfcheck/active).
+4. **Bind** the result to the board, the kernel release, the parameter
+   blob's SHA-256 and the wiring hash, in /var/lib/speakerguardd/selfcheck.bind
+   (and a readable report beside it). The supervisor grants only with a
+   passing record for exactly that combination, and only while the graph
+   reports the same wiring. A kernel or tuning change makes the record
+   stale, and the next start runs the check again.
+
+Any failure writes a failing record with every reason, exits 1, and leaves
+the speakers at the kernel's floor.
+"""
+import argparse
+import errno
+import fcntl
+import hashlib
+import json
+import math
+import os
+import re
+import struct
+import subprocess
+import sys
+import threading
+import time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, HERE)
+import wiring  # noqa: E402
+
+VERSION = 1
+STATE = "/var/lib/speakerguardd"
+MARKER = "/run/speakerguardd-selfcheck/active"
+RATE = 48000
+CAPTURE_FRAMES = 19200  # 0.4 s
+LEASE_MS = 50
+TICK_S = 0.010
+PCM_WAIT_S = 15
+# A sense channel is live with at least LIVE distinct values in a capture,
+# quiet (an amp's sense switched off: zeros, or a fixed idle pattern) with
+# at most QUIET. Measured on the J316 and J413 with digital silence: live
+# channels show 40-80 distinct values in 0.4-1 s, switched-off ones 1-3.
+LIVE = 16
+QUIET = 4
+
+# ALSA control ioctls (include/uapi/sound/asound.h, 64-bit)
+_ID_FMT = "IiII44sI"
+_ID_SIZE = 64
+_VAL_SIZE = 1224
+_IFACE_MIXER = 2
+_ELEM_WRITE = (3 << 30) | (_VAL_SIZE << 16) | (0x55 << 8) | 0x13
+_ELEM_LOCK = (1 << 30) | (_ID_SIZE << 16) | (0x55 << 8) | 0x14
+
+# TAS2764/SN012776 registers (page 0): TDM_CFG3 (RX slots), TDM_CFG5 (VSNS
+# slot + enable), TDM_CFG6 (ISNS slot + enable).
+TAS2764_RX = 0x0C
+TAS2764_VSNS = 0x0E
+TAS2764_ISNS = 0x0F
+
+
+def log(*a):
+    print("speakerguardd-selfcheck:", *a, file=sys.stderr, flush=True)
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(1 << 16), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+# ------------------------------------------------------------------ card
+
+
+def find_card(hw, dt="/proc/device-tree"):
+    """(index, id) of the ALSA card whose device is the DT sound node."""
+    want = os.path.realpath(os.path.join(dt, hw["sound"]))
+    for d in sorted(os.listdir("/sys/class/sound")):
+        if not re.fullmatch(r"card\d+", d):
+            continue
+        of = f"/sys/class/sound/{d}/device/of_node"
+        if os.path.exists(of) and os.path.realpath(of) == want:
+            idx = int(d[4:])
+            with open(f"/proc/asound/card{idx}/id") as f:
+                return idx, f.read().strip()
+    raise wiring.Refused(f"no ALSA card for the device tree's {hw['sound']} node (is the kernel's macaudio driver loaded?)")
+
+
+def pcm_ids(idx):
+    out = {}
+    for d in os.listdir(f"/proc/asound/card{idx}"):
+        m = re.fullmatch(r"pcm(\d+)([pc])", d)
+        if m:
+            with open(f"/proc/asound/card{idx}/{d}/info") as f:
+                info = dict(l.split(": ", 1) for l in f.read().splitlines() if ": " in l)
+            # "id: Secondary (*)": the id, then ALSA's marks
+            pid = re.sub(r"\s*\(\*\)$", "", info.get("id", "").strip())
+            out[(pid, m.group(2))] = int(m.group(1))
+    return out
+
+
+def pcm_state(idx, dev, d):
+    try:
+        with open(f"/proc/asound/card{idx}/pcm{dev}{d}/sub0/status") as f:
+            t = f.read()
+    except OSError:
+        return "unknown"
+    if t.strip() == "closed":
+        return "closed"
+    m = re.search(r"state: (\w+)", t)
+    return m.group(1) if m else "open"
+
+
+class Control:
+    """The card's control device: "Speaker Protection" owned by this process."""
+
+    def __init__(self, idx):
+        self.fd = os.open(f"/dev/snd/controlC{idx}", os.O_RDWR | os.O_CLOEXEC)
+        try:
+            fcntl.ioctl(self.fd, _ELEM_LOCK, self._id("Speaker Protection"))
+        except OSError as e:
+            os.close(self.fd)
+            if e.errno == errno.EBUSY:
+                raise wiring.Refused("\"Speaker Protection\" is owned by another process (stop speakerguardd first)")
+            if e.errno == errno.EPERM:
+                raise wiring.Refused("taking \"Speaker Protection\" needs root (CAP_SYS_ADMIN)")
+            if e.errno == errno.ENOENT:
+                raise wiring.Refused("the card has no \"Speaker Protection\" control: not a v2 kernel")
+            raise
+
+    @staticmethod
+    def _id(name):
+        return struct.pack(_ID_FMT, 0, _IFACE_MIXER, 0, 0, name.encode(), 0)
+
+    def write(self, v):
+        buf = bytearray(_VAL_SIZE)
+        buf[0:_ID_SIZE] = self._id("Speaker Protection")
+        struct.pack_into("q", buf, 72, v)
+        fcntl.ioctl(self.fd, _ELEM_WRITE, buf)
+
+    def close(self):
+        # closing the owner's file withdraws any grant at once
+        try:
+            self.write(0)
+        except OSError:
+            pass
+        os.close(self.fd)
+
+
+class Lease(threading.Thread):
+    """Renews a LEASE_MS grant every TICK_S until stopped. A lapse (the
+    kernel's -ETIMEDOUT) is recorded and the run it spans is void."""
+
+    def __init__(self, ctl):
+        super().__init__(daemon=True)
+        self.ctl, self.stop_ev, self.lapsed, self.err = ctl, threading.Event(), False, None
+
+    def run(self):
+        try:
+            os.sched_setscheduler(0, os.SCHED_FIFO, os.sched_param(50))
+        except (OSError, AttributeError):
+            pass
+        while not self.stop_ev.is_set():
+            try:
+                self.ctl.write(LEASE_MS)
+            except OSError as e:
+                if e.errno == errno.ETIMEDOUT:
+                    self.lapsed = True
+                else:
+                    self.err = e
+                    return
+            self.stop_ev.wait(TICK_S)
+
+    def end(self):
+        self.stop_ev.set()
+        self.join(1.0)
+        self.ctl.write(0)
+
+
+def amixer(card, *args):
+    return subprocess.run(["amixer", "-c", card, *args], capture_output=True, text=True, timeout=10)
+
+
+def switch_get(card, name):
+    r = amixer(card, "cget", f"name={name}")
+    m = re.search(r": values=(\w+)", r.stdout)
+    return m.group(1) if m else None
+
+
+def switch_set(card, name, v):
+    r = amixer(card, "-q", "cset", f"name={name}", v)
+    if r.returncode:
+        raise wiring.Refused(f"setting {name!r}: {r.stderr.strip()}")
+
+
+# ---------------------------------------------------------------- checks
+
+
+def regmap_values(i2c, regs):
+    """{reg: value} from the amp's regmap in debugfs."""
+    path = f"/sys/kernel/debug/regmap/{i2c}/registers"
+    try:
+        with open(path) as f:
+            text = f.read()
+    except OSError as e:
+        raise wiring.Refused(f"cannot read {path}: {e.strerror} (debugfs is needed for the slot check)")
+    out = {}
+    for line in text.splitlines():
+        k, _, v = line.partition(":")
+        try:
+            r = int(k, 16)
+        except ValueError:
+            continue
+        if r in regs:
+            out[r] = int(v.strip(), 16)
+    return out
+
+
+def check_registers(w):
+    """Every amp answers on the slots the map gives it."""
+    errs, seen = [], []
+    for p, a in enumerate(w["amps"]):
+        if a["family"] != "sn012776":
+            errs.append(f"{a['prefix']}: no register check for {a['family']} amps")
+            continue
+        if not a.get("i2c"):
+            errs.append(f"{a['prefix']}: not bound to an I2C device")
+            continue
+        r = regmap_values(a["i2c"], {TAS2764_RX, TAS2764_VSNS, TAS2764_ISNS})
+        if len(r) != 3:
+            errs.append(f"{a['prefix']} ({a['i2c']}): registers {sorted(r)} only")
+            continue
+        rx = r[TAS2764_RX] & 0x0F
+        seen.append((a["prefix"], a["i2c"], r[TAS2764_RX], r[TAS2764_VSNS], r[TAS2764_ISNS]))
+        if rx != p:
+            errs.append(f"{a['prefix']} ({a['i2c']}) receives TDM slot {rx}, the map plays it on speaker channel {p}")
+        for reg, ch, what in ((TAS2764_VSNS, a["v_ch"], "V"), (TAS2764_ISNS, a["i_ch"], "I")):
+            v = r[reg]
+            if not v & 0x40:
+                errs.append(f"{a['prefix']}: {what} sense transmit is disabled")
+            elif (v & 0x3F) * 8 // wiring.SENSE_BITS != ch or (v & 0x3F) * 8 % wiring.SENSE_BITS:
+                errs.append(f"{a['prefix']}: {what} sense on TX slot {v & 0x3F}, the device tree gives sense channel {ch}")
+    return errs, seen
+
+
+def stats(raw, n):
+    f = len(raw) // (2 * n)
+    if f == 0:
+        return None
+    x = struct.unpack("<%dh" % (f * n), raw[: f * n * 2])
+    out = []
+    for c in range(n):
+        s = x[c::n]
+        m = sum(s) / f
+        out.append({"distinct": len(set(s)), "rms": round(math.sqrt(sum((v - m) ** 2 for v in s) / f), 2), "mean": round(m, 2)})
+    return {"frames": f, "ch": out}
+
+
+def classify(st):
+    return ["live" if c["distinct"] >= LIVE else "quiet" if c["distinct"] <= QUIET else "unclear" for c in st["ch"]]
+
+
+class Streams:
+    """One silent run: a grant, a zero-sample stream on the speaker PCM, a
+    capture of the sense PCM, then release."""
+
+    def __init__(self, ctl, card, spk_dev, sense_dev, amps):
+        self.ctl, self.card, self.spk, self.sense, self.amps = ctl, card, spk_dev, sense_dev, amps
+        self.fmt = None
+
+    def _play(self, fmt):
+        return subprocess.Popen(
+            ["aplay", "-q", "-D", f"hw:CARD={self.card},DEV={self.spk}", "-f", fmt, "-c", str(self.amps),
+             "-r", str(RATE), "-t", "raw", "/dev/zero"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+        )
+
+    def run(self, idx):
+        lease = Lease(self.ctl)
+        lease.start()
+        play = None
+        try:
+            fmts = [self.fmt] if self.fmt else ["S24_LE", "S32_LE", "S16_LE"]
+            for fmt in fmts:
+                play = self._play(fmt)
+                deadline = time.monotonic() + 1.0
+                while time.monotonic() < deadline and play.poll() is None:
+                    if pcm_state(idx, self.spk, "p") == "RUNNING":
+                        break
+                    time.sleep(0.01)
+                if play.poll() is None and pcm_state(idx, self.spk, "p") == "RUNNING":
+                    self.fmt = fmt
+                    break
+                err = (play.communicate(timeout=2)[1] or "").strip() if play.poll() is not None else "did not start"
+                play.kill() if play.poll() is None else None
+                play = None
+                last = err
+            if play is None:
+                raise wiring.Refused(f"the zero-sample stream does not start on hw:{self.card},{self.spk}: {last}")
+            time.sleep(0.1)
+            rec = subprocess.run(
+                ["arecord", "-q", "-D", f"hw:CARD={self.card},DEV={self.sense}", "-f", "S16_LE", "-c", str(2 * self.amps),
+                 "-r", str(RATE), "-s", str(CAPTURE_FRAMES), "-t", "raw", "-"],
+                capture_output=True, timeout=5,
+            )
+            if rec.returncode:
+                raise wiring.Refused(f"sense capture failed: {rec.stderr.decode(errors='replace').strip()}")
+            if lease.lapsed or lease.err:
+                raise wiring.Refused(f"the self-check's own lease lapsed during a run ({lease.err or 'ETIMEDOUT'})")
+            return stats(rec.stdout, 2 * self.amps)
+        finally:
+            if play is not None and play.poll() is None:
+                play.terminate()
+                try:
+                    play.wait(2)
+                except subprocess.TimeoutExpired:
+                    play.kill()
+            lease.end()
+
+
+def check_sense(ctl, idx, card, devs, w, runs):
+    """The switch test. Returns (errors, speaker format)."""
+    errs = []
+    amps = w["amps"]
+    n = len(amps)
+    claims = {(s["amp"], s["kind"]): s["pcm"] for s in w["sense"]}
+    names = {}
+    for a in amps:
+        for kind in ("V", "I"):
+            names[(a["prefix"], kind)] = f"{a['prefix']} {kind}SENSE Switch"
+    saved = {}
+    for nm in names.values():
+        v = switch_get(card, nm)
+        if v is None:
+            return [f"no {nm!r} control"], None
+        saved[nm] = v
+    st = Streams(ctl, card, devs[0], devs[1], n)
+    try:
+        for nm in saved:
+            switch_set(card, nm, "on")
+        base = st.run(idx)
+        runs["baseline"] = base
+        cls = classify(base)
+        if any(c != "live" for c in cls):
+            return [f"with every sense switch on, sense channels {[k for k, c in enumerate(cls) if c != 'live']} are not live"], st.fmt
+        for p, a in enumerate(amps):
+            for kind in ("V", "I"):
+                nm = names[(a["prefix"], kind)]
+                switch_set(card, nm, "off")
+                try:
+                    s = st.run(idx)
+                finally:
+                    switch_set(card, nm, "on")
+                runs[f"{a['prefix']} {kind}SENSE off"] = s
+                cls = classify(s)
+                quiet = [k for k, c in enumerate(cls) if c == "quiet"]
+                unclear = [k for k, c in enumerate(cls) if c == "unclear"]
+                want = claims.get((p, kind))
+                if unclear:
+                    errs.append(f"{a['prefix']} {kind}SENSE off: sense channels {unclear} neither live nor quiet")
+                elif quiet != [want]:
+                    errs.append(
+                        f"{a['prefix']} {kind}SENSE off quietened sense channel(s) {quiet}; the map has its {kind} on channel {want}"
+                    )
+    finally:
+        for nm, v in saved.items():
+            try:
+                switch_set(card, nm, v)
+            except wiring.Refused as e:
+                log(f"restoring {nm}: {e}")
+    return errs, st.fmt
+
+
+# ------------------------------------------------------------------ record
+
+
+def bind_lines(rec):
+    keys = ["schema", "version", "result", "board", "kernel", "params_sha256", "wiring", "card", "amps", "sense", "family", "key", "method"]
+    out = [f"{k}={rec[k]}" for k in keys]
+    if rec["reasons"]:
+        out.append("reason=" + rec["reasons"][0].replace("\n", " "))
+    return "\n".join(out) + "\n"
+
+
+def read_bind(path):
+    try:
+        with open(path) as f:
+            return dict(l.split("=", 1) for l in f.read().splitlines() if "=" in l)
+    except OSError:
+        return {}
+
+
+def write_atomic(path, text, mode=0o644):
+    tmp = path + ".new"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_CLOEXEC | os.O_NOFOLLOW, mode)
+    try:
+        os.fchmod(fd, mode)
+        os.write(fd, text.encode())
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.rename(tmp, path)
+
+
+def derive_live(args):
+    """(hw, wiring, errors). A board this derivation cannot read (the AOP
+    and MAX98360A paths) falls back to its machines.json hand map, marked
+    "hand": nothing about it is proven, as before the self-check."""
+    hw = wiring.read_dt()
+    machines = {}
+    if args.machines and os.path.exists(args.machines):
+        with open(args.machines) as f:
+            machines = json.load(f)
+    key, entry = wiring.machine_entry(machines, hw["board"])
+    try:
+        dump = wiring.tuning_dump(args.tuning, args.tuning_cli)
+        units = wiring.roles(dump)["channels"]
+        w = wiring.derive(hw, dump)
+        w["method"] = "derived"
+    except wiring.Refused as e:
+        if not entry:
+            raise
+        import gen
+
+        unit, ports, h, _ = gen.wiring_for(key, entry)
+        log(f"{hw['board']}: not derivable ({e}); using the machines.json hand map, unproven")
+        w = {"board": hw["board"], "key": key, "method": "hand", "family": "-", "hash": h,
+             "unit_channels": unit, "sense_ports": ports, "amps": [{}] * entry["amps"], "sense": [{}] * entry["sense"],
+             "why_hand": str(e)}
+        return hw, w, []
+    errs = []
+    if entry:
+        w["key"] = key
+        w, dis = wiring.apply_override(w, entry)
+        w["method"] = "derived"
+        errs += dis
+    errs += wiring.role_errors(w, units)
+    return hw, w, errs
+
+
+def cmd_run(args):
+    os.makedirs(args.state, exist_ok=True)
+    bind_path = os.path.join(args.state, "selfcheck.bind")
+    report_path = os.path.join(args.state, "selfcheck.json")
+    kernel = os.uname().release
+    rec = {
+        "schema": 1, "version": VERSION, "result": "fail", "board": "-", "kernel": kernel,
+        "params_sha256": "-", "wiring": "-", "card": "-", "amps": 0, "sense": 0, "family": "-", "key": "-",
+        "method": "-", "reasons": [], "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    report = {"record": rec}
+    errs = []
+    try:
+        rec["params_sha256"] = sha256(args.params)
+        hw, w, derr = derive_live(args)
+        errs += derr
+        rec.update(board=hw["board"], wiring=w["hash"], amps=len(w["amps"]), sense=len(w["sense"]),
+                   family=w["family"], key=w["key"], method=w["method"])
+        report["wiring"] = w
+        old = read_bind(bind_path)
+        if (
+            not args.force and not errs
+            and old.get("result") == "pass" and old.get("version") == str(VERSION)
+            and all(old.get(k) == str(rec[k]) for k in ("board", "kernel", "params_sha256", "wiring"))
+        ):
+            log(f"a passing self-check is bound to {hw['board']}, {kernel}, params {rec['params_sha256'][:12]}, wiring {w['hash']}: nothing to do")
+            return 0
+        idx, card = find_card(hw)
+        rec["card"] = card
+        if w["method"] == "derived":
+            try:
+                errs += active(idx, card, w, report)
+            finally:
+                try:
+                    os.unlink(MARKER)
+                except OSError:
+                    pass
+    except wiring.Refused as e:
+        errs.append(str(e))
+    except Exception as e:  # noqa: BLE001 - every failure is a failing record
+        errs.append(f"internal error: {type(e).__name__}: {e}")
+    rec["reasons"] = errs
+    rec["result"] = "fail" if errs else "pass"
+    try:
+        write_atomic(report_path, json.dumps(report, indent=1, default=str) + "\n")
+        write_atomic(bind_path, bind_lines(rec))
+    except OSError as e:
+        log(f"writing the record: {e}")
+        return 1
+    if errs:
+        log(f"FAILED on {rec['board']} ({kernel}); the speakers stay at the kernel's floor:")
+        for e in errs:
+            log(f"  - {e}")
+        return 1
+    log(f"passed on {rec['board']} ({kernel}, {rec['method']}): wiring {rec['wiring']}, params {rec['params_sha256'][:12]}")
+    return 0
+
+
+def active(idx, card, w, report):
+    """The hardware half: registers, then the silent switch test."""
+    errs = []
+    ids = pcm_ids(idx)
+    spk, sense = ids.get(("Secondary", "p")), ids.get(("Speaker Sense", "c"))
+    if spk != 1 or (w["sense"] and sense != 2):
+        raise wiring.Refused(f"the speaker PCM is {spk} and the sense PCM {sense}; the graph expects 1 and 2")
+    # The session helper links nothing while the check runs; a speaker sink
+    # PipeWire still holds from before closes once its session manager
+    # suspends it (5 s idle by default).
+    pcms = ((spk, "p"), (sense, "c")) if w["sense"] else ((spk, "p"),)
+    os.makedirs(os.path.dirname(MARKER), exist_ok=True)
+    write_atomic(MARKER, f"{os.getpid()}\n")
+    deadline = time.monotonic() + PCM_WAIT_S
+    while any(pcm_state(idx, dev, d) != "closed" for dev, d in pcms):
+        if time.monotonic() > deadline:
+            busy = [f"pcm{dev}{d}" for dev, d in pcms if pcm_state(idx, dev, d) != "closed"]
+            raise wiring.Refused(f"{', '.join(busy)} stayed in use for {PCM_WAIT_S} s; the self-check needs it to itself")
+        time.sleep(0.2)
+    reg_errs, regs = check_registers(w)
+    errs += reg_errs
+    report["registers"] = regs
+    if not w["sense"]:
+        return errs + ["no V/I sense on this board: the silent sense check does not apply yet"]
+    mux = "Speaker Playback Mux"
+    old_mux = None
+    ctl = None
+    try:
+        ctl = Control(idx)
+        r = amixer(card, "cget", f"name={mux}")
+        if r.returncode == 0:
+            m = re.search(r": values=(\d+)", r.stdout)
+            old_mux = m.group(1) if m else None
+            amixer(card, "-q", "cset", f"name={mux}", "Secondary")
+        runs = {}
+        report["runs"] = runs
+        sense_errs, fmt = check_sense(ctl, idx, card, (spk, sense), w, runs)
+        errs += sense_errs
+        report["speaker_format"] = fmt
+    finally:
+        if ctl is not None:
+            ctl.close()
+        if old_mux is not None:
+            amixer(card, "-q", "cset", f"name={mux}", old_mux)
+    return errs
+
+
+def cmd_check(args):
+    b = read_bind(os.path.join(args.state, "selfcheck.bind"))
+    want = {"kernel": os.uname().release, "params_sha256": sha256(args.params)}
+    bad = [k for k, v in want.items() if b.get(k) != v]
+    if b.get("result") != "pass" or bad:
+        log(f"no passing self-check for this kernel and these parameters (result {b.get('result')}, stale {bad})")
+        return 1
+    log(f"bound: {b.get('board')} {b.get('kernel')} wiring {b.get('wiring')}")
+    return 0
+
+
+def cmd_generate(args):
+    import gen
+
+    with open(os.path.join(args.state, "selfcheck.json")) as f:
+        report = json.load(f)
+    rec, w = report["record"], report["wiring"]
+    if rec["result"] != "pass":
+        raise SystemExit("the self-check has not passed: nothing to generate")
+    entry = {}
+    if args.machines and os.path.exists(args.machines):
+        with open(args.machines) as f:
+            entry = json.load(f).get(rec["key"], {})
+    fmt = {"S24_LE": "S24_32LE", "S32_LE": "S32LE", "S16_LE": "S16LE"}.get(report.get("speaker_format"), "S24_32LE")
+    c = gen.entry_from_wiring(w, rec["card"], fmt, base=entry)
+    m = rec["key"]
+    for d, name, text in (
+        (args.pipewire_dir, f"sgv2-{m}.conf", gen.pipewire_conf(m, c, (w["unit_channels"], w["sense_ports"], w["hash"]))),
+        (args.wireplumber_dir, f"60-sgv2-{m}.conf", gen.wireplumber_conf(m, c)),
+    ):
+        os.makedirs(d, exist_ok=True)
+        write_atomic(os.path.join(d, name), text)
+        log(f"wrote {os.path.join(d, name)}")
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="speakerguardd-selfcheck")
+    ap.add_argument("cmd", choices=["run", "check", "generate"])
+    ap.add_argument("--params")
+    ap.add_argument("--machines", default=os.path.join(HERE, "machines.json"))
+    ap.add_argument("--state", default=STATE)
+    ap.add_argument("--tuning-cli", default="aurora-speaker-tuning")
+    ap.add_argument("--force", action="store_true")
+    ap.add_argument("--pipewire-dir")
+    ap.add_argument("--wireplumber-dir")
+    ap.add_argument("tuning", nargs="*", help="after --: the tuning source, as aurora-speaker-tuning takes it")
+    args = ap.parse_args()
+    if args.cmd in ("run", "check") and not args.params:
+        ap.error("--params is required")
+    if args.cmd == "generate" and not (args.pipewire_dir and args.wireplumber_dir):
+        ap.error("--pipewire-dir and --wireplumber-dir are required")
+    return {"run": cmd_run, "check": cmd_check, "generate": cmd_generate}[args.cmd](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

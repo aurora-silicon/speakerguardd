@@ -168,6 +168,9 @@ pub struct SessionReport {
     /// Set by the view: that process is alive, is the one that started at
     /// that time, and is the session user's.
     pub helper_alive: bool,
+    /// The wiring the protect stage was built with (its `sgv2.wiring`), as
+    /// the helper read it from the graph.
+    pub wiring: Option<u64>,
 }
 
 pub trait SessionView {
@@ -218,6 +221,11 @@ pub struct Observer {
     was_running: bool,
     grace_until: Option<u64>,
     granted_at: Option<u64>,
+    /// The wiring the self-check proved; a graph built with any other is
+    /// not the protected path.
+    expected_wiring: Option<u64>,
+    /// The last fresh report's wiring, when it was not the expected one.
+    wrong_wiring: Option<Option<u64>>,
 }
 
 impl Observer {
@@ -236,7 +244,20 @@ impl Observer {
             was_running: false,
             grace_until: None,
             granted_at: None,
+            expected_wiring: None,
+            wrong_wiring: None,
         }
+    }
+
+    /// The wiring a fresh session report named, when it is not the one the
+    /// self-check proved (`Some(None)`: it named none), for the journal.
+    pub fn wrong_wiring(&self) -> Option<Option<u64>> {
+        self.wrong_wiring
+    }
+
+    /// Links count only while the session helper reports this wiring.
+    pub fn expect_wiring(&mut self, wiring: u64) {
+        self.expected_wiring = Some(wiring);
     }
 
     /// The supervisor granted at `now_ns`: the re-link and driver switch
@@ -344,10 +365,14 @@ impl Observer {
             && s.mono_ns >= generation
             && s.mono_ns <= now_ns.saturating_add(SESSION_SKEW_NS)
             && now_ns.saturating_sub(s.mono_ns) <= SESSION_STALE_NS;
+        let wiring_ok = self.expected_wiring.is_none_or(|w| s.wiring == Some(w));
+        if session_fresh {
+            self.wrong_wiring = (!wiring_ok).then_some(s.wiring);
+        }
         Observation {
             heartbeat_fresh,
             plugin_ok,
-            links_ok: session_fresh && s.links_ok,
+            links_ok: session_fresh && s.links_ok && wiring_ok,
             carrier_ok: session_fresh && s.carrier_ok,
             pcm_owner_ok,
             pcm_state_ok,
@@ -495,6 +520,7 @@ pub fn parse_session(text: &str) -> SessionReport {
     let mut mono = None;
     let mut pid = None;
     let mut start = None;
+    let mut wiring = None;
     for w in body.split_whitespace() {
         let Some((k, v)) = w.split_once('=') else { return SessionReport::default() };
         let slot = match k {
@@ -503,6 +529,13 @@ pub fn parse_session(text: &str) -> SessionReport {
             "mono_ns" => &mut mono,
             "pid" => &mut pid,
             "start" => &mut start,
+            "wiring" => {
+                if wiring.is_some() {
+                    return SessionReport::default();
+                }
+                wiring = Some(crate::selfcheck::parse_wiring(v));
+                continue;
+            }
             _ => continue,
         };
         if slot.is_some() {
@@ -519,6 +552,7 @@ pub fn parse_session(text: &str) -> SessionReport {
                 mono_ns: m,
                 helper: Some((p as u32, st)),
                 helper_alive: false,
+                wiring: wiring.flatten(),
             },
             _ => SessionReport::default(),
         },
@@ -583,6 +617,7 @@ mod tests {
             mono_ns: at,
             helper: Some((77, 1234)),
             helper_alive: true,
+            wiring: Some(0x0979_c55e_d5dd_f377),
         }
     }
 
@@ -804,6 +839,25 @@ mod tests {
     }
 
     #[test]
+    fn links_count_only_for_the_wiring_the_self_check_proved() {
+        let mut o = Observer::new(7, 48_000, TICK);
+        o.expect_wiring(0x0979_c55e_d5dd_f377);
+        o.observe(&mut || 1, &mut E(EngineState::default()), &mut P(PcmState::Closed), &mut S(session(1)));
+        let now = 1_000_000_000u64;
+        let mut at = |r: SessionReport| {
+            o.observe(&mut || now, &mut E(EngineState::default()), &mut P(PcmState::Closed), &mut S(r)).links_ok
+        };
+        assert!(at(session(now)));
+        // the graph was built with another map (an identity channel order,
+        // swapped V/I), or names none
+        assert!(!at(SessionReport { wiring: Some(0x291295bd06c656d0), ..session(now) }));
+        assert!(!at(SessionReport { wiring: None, ..session(now) }));
+        assert_eq!(o.wrong_wiring(), Some(None));
+        o.observe(&mut || now, &mut E(EngineState::default()), &mut P(PcmState::Closed), &mut S(session(now)));
+        assert_eq!(o.wrong_wiring(), None);
+    }
+
+    #[test]
     fn session_parsing_rejects_partial_and_mixed_reports() {
         let w = " pid=77 start=1234";
         let r = parse_session(&format!("links=1 carrier=1 mono_ns=123{w}\n"));
@@ -815,11 +869,17 @@ mod tests {
                 carrier_ok: true,
                 mono_ns: 123,
                 helper: Some((77, 1234)),
-                helper_alive: false
+                helper_alive: false,
+                wiring: None,
             }
         );
         let r = parse_session(&format!("links=0 carrier=1 mono_ns=123{w}\n"));
         assert!(r.present && !r.links_ok);
+        // the protect stage's wiring, when the graph names one
+        let r = parse_session(&format!("links=1 carrier=1 mono_ns=123{w} wiring=0979c55ed5ddf377\n"));
+        assert_eq!(r.wiring, Some(0x0979_c55e_d5dd_f377));
+        assert_eq!(parse_session(&format!("links=1 carrier=1 mono_ns=123{w} wiring=zz\n")).wiring, None);
+        assert!(!parse_session(&format!("links=1 carrier=1 mono_ns=123{w} wiring=1 wiring=2\n")).present);
         for bad in [
             String::new(),
             format!("links=1 carrier=1 mono_ns=123{w}"),
