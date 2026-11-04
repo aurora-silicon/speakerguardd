@@ -1,5 +1,6 @@
-//! spp3 under fuzzed parameters, audio, host slicing and sense: properties
-//! 1-4, 6 and 7 (see the harness and `tests/adversarial.rs`).
+//! spp3 under fuzzed parameters (closed loop on or off), audio, host slicing
+//! and sense: properties 1-4, 6 and 7 (see the harness and
+//! `tests/adversarial.rs`); the hard path is checked by the oracle.
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
@@ -14,10 +15,13 @@ static GLOBAL: Counting = Counting;
 
 fn run(u: &mut Unstructured) -> Result<()> {
     let n = u.int_in_range(1..=8usize)?;
-    let base = spp3_base(n, block(u)?, rate(u)?);
+    let cl = u.arbitrary::<bool>()?;
+    let base = spp3_base(n, block(u)?, rate(u)?, cl);
     let mut bytes = base.as_bytes().to_vec();
     mutate_words(&mut bytes, u)?;
-    let p = Params::from_bytes(&bytes).unwrap();
+    let mut p = Params::from_bytes(&bytes).unwrap();
+    spp3_exclusions(&mut p);
+    let closed = spp3_closed_loop(&p);
     let x = signal(u, n, 96_000)?;
     let ports = 2 * n + u.int_in_range(0..=2usize)?;
     let delay = u.int_in_range(0..=4096usize)?;
@@ -27,22 +31,22 @@ fn run(u: &mut Unstructured) -> Result<()> {
 
     let real = Unit::init_error(&p).is_none() && p.channels as usize == n;
     let gain = if real { 1.0 } else { FAILSAFE_GAIN };
-    let blk = if Unit::init_error(&p).is_none() { p.block_frames as usize } else { 512 };
 
-    // A: one unit block per call, with the hard-path check
-    let mut chans = vec![(0usize, f64::INFINITY); n];
-    if real {
-        for c in &p.ch[..n] {
-            chans[c.source as usize] =
-                (c.group as usize, c.temperature_limit as f64 + c.hard_temp_limit_headroom as f64);
-        }
-    }
-    let mut hard = HardPath { x: &x, chans, armed: Vec::new(), last: 0, hits: 0 };
+    // A: one thermal update per call, under the hard-path oracle (open loop
+    // only: the corrected limit is internal)
+    let f = sgv2_core::spp3::THERMAL_FRAMES;
     let mut ua = Unit::new(p);
-    let a = render(&mut ua, &x, &sense, &[blk], &[], &mut |d, t, o| {
-        if real {
-            hard.step(d, t, o)
+    let mut oracle = (real && !closed).then(|| Spp3HardOracle::new(&p));
+    let mut last = 0;
+    let a = render(&mut ua, &x, &sense, &[f], &[], &mut |d, t, o| {
+        if let Some(or) = oracle.as_mut() {
+            if d - last == f {
+                let ins: Vec<&[f32]> = x.iter().map(|b| &b[last..d]).collect();
+                let outs: Vec<&[f32]> = o.iter().map(|b| &b[last..d]).collect();
+                or.step(&ins, &outs, t);
+            }
         }
+        last = d;
     });
     check_bound(&x, &a.out, 0, gain, "spp3 A");
 
@@ -69,8 +73,10 @@ fn run(u: &mut Unstructured) -> Result<()> {
     let c = render(&mut uc, &x, &sense, &cuts, &modes, &mut nothing);
     check_bound(&x, &c.out, 0, gain, "spp3 C");
     let d = render(&mut Unit::new(p), &x, &[], &cuts, &[], &mut nothing);
-    check_not_louder(&c.out, &b.out, "spp3 sense dropout vs valid sense");
-    check_not_louder(&c.out, &d.out, "spp3 sense dropout vs open loop");
+    if !closed {
+        check_not_louder(&c.out, &b.out, "spp3 sense dropout vs valid sense");
+        check_not_louder(&c.out, &d.out, "spp3 sense dropout vs open loop");
+    }
     for ch in 0..n {
         let v = uc.sense_power(ch);
         assert!(v.is_nan() || v.is_finite());

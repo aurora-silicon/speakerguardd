@@ -34,11 +34,17 @@ fn run(u: &mut Unstructured) -> Result<()> {
         u.bytes(k)?.to_vec()
     } else {
         let (kind, sense, mut payload) = match mode {
-            1 => (UnitKind::Spp3, 2 * n as u32, spp3_base(n, 512, 48_000).as_bytes().to_vec()),
+            1 => (UnitKind::Spp3, 2 * n as u32, spp3_base(n, 512, 48_000, n % 2 == 0).as_bytes().to_vec()),
             2 => (UnitKind::Lsm2, 0, lsm2_base(n, 48_000).as_bytes().to_vec()),
             _ => (UnitKind::Atsp, 0, atsp_base(n, 512, 48_000).as_bytes().to_vec()),
         };
         mutate_words(&mut payload, u)?;
+        if kind == UnitKind::Spp3 {
+            if let Ok(mut p) = spp3::Params::from_bytes(&payload) {
+                spp3_exclusions(&mut p); // FINDING 4
+                payload = p.as_bytes().to_vec();
+            }
+        }
         if u.ratio(1, 8)? {
             let l = u.int_in_range(0..=payload.len())?;
             payload.truncate(l);

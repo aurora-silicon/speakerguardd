@@ -5,16 +5,22 @@
 //! bus and the parameter blob can reach:
 //!
 //! 1. **Output bound.** `|out[n]| <= |in[n - latency]|` for every unit (no
-//!    unit has gain above 0 dB; no unit generates a pilot yet, so there is no
-//!    pilot headroom to allow), and a non-finite input sample leaves as 0.
+//!    unit has gain above 0 dB; the spp3 pilot is not generated yet, only its
+//!    program headroom, so there is no pilot to allow for), and a non-finite
+//!    input sample leaves as 0.
 //! 2. **Finite output.** Any input, including NaN, +-Inf, subnormals and very
 //!    large finite values, gives finite output and finite model state.
 //! 3. **Slice invariance.** Output and state are bit-identical across random
 //!    host slice sequences (1..=4096 frames), and `reset` returns a unit to
 //!    exactly its initial state.
-//! 4. **Hard path.** Once the modelled coil temperature is past the hard
-//!    limit at a block boundary, the whole group's next block leaves at least
-//!    20 dB down (spp3, atsp). lsm2's soft temperature path reaches its floor.
+//! 4. **Hard path.** spp3: while the modelled coil is past the hard limit
+//!    (latched until it is back below the limit), the group's target is at
+//!    most the specified hard target and the audio follows it through the
+//!    5 ms dezippers, checked sample by sample against an independent oracle
+//!    ([`HardOracle`]); with the feed-forward on, sustained drive settles at
+//!    or below the hard limit. atsp: once past the hard limit at a block
+//!    boundary, the group's next block leaves at least 20 dB down. lsm2's
+//!    soft temperature path reaches its floor.
 //! 5. **Parameter blobs.** Truncated, corrupted, wrong-CRC, out-of-range and
 //!    hostile blobs never panic; whatever they build obeys 1 and 2, and a
 //!    rejected blob gives the 20 dB fail-safe.
@@ -29,9 +35,9 @@
 //! targets in `crates/sgv2-core/fuzz` cover the same properties with
 //! coverage guidance.
 //!
-//! Regression tests for the defects these tests found are at the end. They
-//! are `#[ignore]`d so the suite stays green until lane B fixes them; run
-//! them with `cargo test --test adversarial -- --ignored`.
+//! Regression tests for the defects these tests found are at the end (FINDING
+//! 1-8). They are `#[ignore]`d so the suite stays green until lane B fixes
+//! them; run them with `cargo test --test adversarial -- --ignored`.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -136,7 +142,7 @@ fn hostility() -> impl Strategy<Value = Hostility> {
 }
 
 /// Finite input only: spp3 and atsp apply their non-finite fail-safe to the
-/// whole host segment, which is not slice invariant (FINDING 5).
+/// whole host segment, which is not slice invariant (FINDING 6).
 fn finite_hostility() -> impl Strategy<Value = Hostility> {
     prop_oneof![Just(Hostility::Clean), Just(Hostility::Large)]
 }
@@ -260,10 +266,15 @@ fn spp3_params(seed: u64, n: usize, block: u32, rate: u32, ff: Ff, hot: bool) ->
     let src = r.perm(n);
     for (c, &s) in src.iter().enumerate() {
         let limit = ambient + r.uni(5.0, 120.0);
+        let ignore = r.chance(0.2);
+        // closed loop with a synthetic calibration that `synth_sense`'s
+        // 4.2-ohm V/I can satisfy (cap >= 0: FINDING 4)
+        let cl = !ignore && r.chance(0.5);
+        let pilot = r.chance(0.3);
         p.ch[c] = spp3::ChannelParams {
             source: s,
             group: r.below(4) as u32 * 7,
-            ignore_telemetry: r.chance(0.2) as u32,
+            ignore_telemetry: ignore as u32,
             t_sett_vc: if hot { r.log(5.0, 200.0) } else { r.log(0.5, 200.0) },
             t_sett_mg: if r.chance(0.1) { 0.0 } else { r.uni(0.0, 100.0) },
             tau_tvc: if hot { r.log(1e-3, 0.5) } else { r.log(1e-3, 3.0) },
@@ -277,21 +288,51 @@ fn spp3_params(seed: u64, n: usize, block: u32, rate: u32, ff: Ff, hot: bool) ->
                 Ff::On => [0.25, 0.5, 1.0][r.below(3)],
                 Ff::Mixed => [0.0, 0.5, 1.0][r.below(3)],
             },
-            cl_thermal_feedback_enabled: r.chance(0.5) as u32,
-            rampout: 0.0,
+            cl_thermal_feedback_enabled: (cl || r.chance(0.3)) as u32,
+            rampout: if r.chance(0.3) { r.uni(0.0, 0.5) } else { 0.0 },
             ag: if hot { r.log(5.0, 40.0) } else { r.log(1.0, 40.0) },
-            imon_scale: r.uni(0.1, 20.0),
-            vmon_scale: r.uni(0.1, 20.0),
-            i_pwr_thres: r.uni(0.0, 1.0),
-            v_pwr_thres: r.uni(0.0, 1.0),
-            sense_i: r.below(2 * n + 2) as u32,
-            sense_v: r.below(2 * n + 2) as u32,
+            imon_scale: if cl { 1.0 } else { r.uni(0.1, 20.0) },
+            vmon_scale: if cl { 1.0 } else { r.uni(0.1, 20.0) },
+            i_pwr_thres: if cl { r.log(1e-6, 1e-2) } else { r.uni(0.0, 1.0) },
+            v_pwr_thres: if cl { r.log(1e-6, 1e-2) } else { r.uni(0.0, 1.0) },
+            sense_i: if cl { 2 * c as u32 } else { r.below(2 * n + 2) as u32 },
+            sense_v: if cl { 2 * c as u32 + 1 } else { r.below(2 * n + 2) as u32 },
             initial_theta_vc: if r.chance(0.3) { r.uni(0.0, limit as f64 - ambient as f64 + 10.0) } else { 0.0 },
             initial_theta_mg: if r.chance(0.3) { r.uni(0.0, 30.0) } else { 0.0 },
+            pilot_tone_enabled: pilot as u32,
+            pilot_ampl_hi_db: if pilot { r.uni(-40.0, -1.0) } else { r.uni(-60.0, 10.0) },
+            temp_sense_window_time_s: r.log(1e-3, 0.1),
+            temp_sense_smoothing_tau_s: r.log(1e-3, 2.0),
+            rdc_scale: r.uni(0.9, 1.1),
+            reb_range_min: r.uni(1.0, 4.0),
+            reb_range_max: r.uni(4.5, 10.0),
+            cal_temp_range_min: 10.0,
+            cal_temp_range_max: 40.0,
+            a_t_20c: r.uni(0.003, 0.0045),
+            a_t_35c: r.uni(0.003, 0.0045),
+            tlim_err_decay_time_s: r.log(0.05, 10.0),
+            tlim_adj_cap: r.uni(0.0, 40.0),
+            cal_present: cl as u32,
+            cal_r: r.uni(4.0, 4.5),
+            cal_t: r.uni(15.0, 35.0),
         };
     }
+    stable_spp3(&mut p);
     assert_eq!(p.validate(), Ok(()), "generator made an invalid spp3 set: {p:?}");
     p
+}
+
+/// Keep every spp3 thermal filter (coil, magnet, virtual coil) at a time
+/// constant of at least one update: the linear-decay recurrence diverges
+/// below half an update (FINDING 9).
+fn stable_spp3(p: &mut spp3::Params) {
+    let dt = spp3::THERMAL_FRAMES as f32 / p.sample_rate as f32;
+    for c in p.ch[..p.channels as usize].iter_mut() {
+        let f = c.thermal_ff_speedup_factor;
+        let shortest = if f > 0.0 { f.min(1.0) } else { 1.0 };
+        c.tau_tvc = c.tau_tvc.max(dt / shortest);
+        c.tau_tmg = c.tau_tmg.max(dt);
+    }
 }
 
 fn atsp_params(seed: u64, n: usize, block: u32, rate: u32, hot: bool) -> atsp::Params {
@@ -358,6 +399,8 @@ fn lsm2_params(seed: u64, n: usize, rate: u32, hot: bool) -> lsm2::Params {
         low_rail_idle_power_w: r.uni(0.0, 1.0),
         low_rail_power_ratio: r.uni(0.5, 2.0),
         other_power_features: 0,
+        runtime_budget_present: r.chance(0.3) as u32,
+        runtime_budget_w: [r.log(0.1, 50.0), r.log(0.1, 50.0), r.log(0.1, 50.0), r.log(0.1, 50.0)],
         ..lsm2::Params::default()
     };
     let src = r.perm(n);
@@ -825,38 +868,257 @@ fn check_hard_path(
     hard_blocks
 }
 
+/// An independent model of the bound the spp3 hard path puts on the audio,
+/// from the parameters, the input and the published state (spec 6 as the
+/// module documents it): while a channel is armed (`T_OL` above
+/// `Tlim + HardTempLimitHeadroom`, until it is back below `Tlim`), its
+/// group's selected target is at most
+/// `g_hard = sqrt(clamp((Tlim - 5 - ambient - theta_mg) / (theta_ff + 1), 0.01, 1))`,
+/// and the audio follows the target through the two cascaded 5 ms
+/// dezippers. The oracle runs its own virtual coil (`theta_ff`), takes
+/// `theta_mg` and `theta_vc` from the telemetry, drives its own dezippers
+/// with the largest target allowed, and checks every output sample against
+/// them. It needs one call per thermal update (256 frames) and the closed
+/// loop off (the corrected limit is internal).
+struct HardOracle {
+    amb: f64,
+    k_dez: f64,
+    ch: Vec<OracleChan>,
+    /// Per group: the largest allowed target and the dezipper stages it drives.
+    allowed: Vec<f64>,
+    z1: Vec<f64>,
+    z2: Vec<f64>,
+    /// Updates at which some channel was certainly armed.
+    armed_updates: usize,
+}
+
+struct OracleChan {
+    src: usize,
+    group: usize,
+    elec: f64,
+    /// Virtual-coil filter `(a, b)`, `None` with the feed-forward off.
+    ff: Option<(f64, f64)>,
+    theta_ff: f64,
+    p_prev: f64,
+    hist: std::collections::VecDeque<f32>,
+    look: usize,
+    limit: f64,
+    hard_on: f64,
+    headroom: f32,
+    armed: Option<bool>,
+}
+
+impl HardOracle {
+    fn new(p: &spp3::Params) -> Self {
+        let n = p.channels as usize;
+        let rate = p.sample_rate as f64;
+        let dt = spp3::THERMAL_FRAMES as f64 / rate;
+        let look = (p.thermal_lookahead_delay_ms as f64 * 1e-3 * rate).round() as usize;
+        let mut ids: Vec<u32> = Vec::new();
+        let ch = p.ch[..n]
+            .iter()
+            .map(|c| {
+                let group = ids.iter().position(|&g| g == c.group).unwrap_or_else(|| {
+                    ids.push(c.group);
+                    ids.len() - 1
+                });
+                let (reb, series, ag) = (c.reb_ref as f64, (c.rshunt + c.rampout) as f64, c.ag as f64);
+                let f = c.thermal_ff_speedup_factor as f64;
+                let tau = f * c.tau_tvc as f64;
+                OracleChan {
+                    src: c.source as usize,
+                    group,
+                    elec: ag * ag * reb / ((reb + series) * (reb + series)),
+                    ff: (f > 0.0).then(|| (1.0 - dt / tau, 0.5 * c.t_sett_vc as f64 * dt / tau)),
+                    theta_ff: 0.0,
+                    p_prev: 0.0,
+                    hist: std::collections::VecDeque::from(vec![0.0; look]),
+                    look,
+                    limit: c.temperature_limit as f64,
+                    hard_on: c.temperature_limit as f64 + c.hard_temp_limit_headroom as f64,
+                    headroom: if c.pilot_tone_enabled != 0 {
+                        (1.0 - 10f64.powf(c.pilot_ampl_hi_db as f64 / 20.0)) as f32
+                    } else {
+                        1.0
+                    },
+                    armed: Some(false),
+                }
+            })
+            .collect();
+        let g = ids.len();
+        HardOracle {
+            amb: p.thermal_ambient_temp as f64,
+            k_dez: 1.0 - (0.01f64.ln() / (0.005 * rate)).exp(),
+            ch,
+            allowed: vec![1.0; g],
+            z1: vec![1.0; g],
+            z2: vec![1.0; g],
+            armed_updates: 0,
+        }
+    }
+
+    /// One thermal update: `x` and `out` are the update's 256 frames per host
+    /// channel, `t` the telemetry after it.
+    fn step(&mut self, x: &[&[f32]], out: &[&[f32]], t: &Telemetry) {
+        let frames = x[0].len();
+        // the audio of this update follows the targets allowed at the last one
+        for k in 0..frames {
+            for g in 0..self.allowed.len() {
+                self.z1[g] += self.k_dez * (self.allowed[g] - self.z1[g]);
+                self.z2[g] += self.k_dez * (self.z1[g] - self.z2[g]);
+            }
+            for c in &self.ch {
+                let i = x[c.src][k];
+                if !i.is_finite() {
+                    continue; // check_bound: it leaves as 0
+                }
+                // two f32 roundings (gain, headroom), which on a subnormal input
+                // are absolute: allow two subnormal steps
+                let bound = (i.abs() as f64) * (self.z2[c.group] * c.headroom as f64 * (1.0 + 1e-4) + 1e-6)
+                    + 2.0 * f32::from_bits(1) as f64;
+                let o = out[c.src][k].abs() as f64;
+                assert!(
+                    o <= bound,
+                    "hard path: ch{} sample {k} of the update leaves at {:.6} of its input, allowed {:.6}",
+                    c.src,
+                    o / i.abs() as f64,
+                    self.z2[c.group] * c.headroom as f64
+                );
+            }
+        }
+        // the virtual coil, on the unprotected drive through the alignment
+        // history
+        for c in self.ch.iter_mut() {
+            let mut acc = 0.0f64;
+            for &v in x[c.src] {
+                c.hist.push_back(v);
+                let d = if c.look == 0 { c.hist.pop_back().unwrap() } else { c.hist.pop_front().unwrap() };
+                let d = if d.is_finite() { d as f64 } else { 0.0 };
+                acc += d * d;
+            }
+            let p = c.elec * acc / frames as f64;
+            if let Some((a, b)) = c.ff {
+                c.theta_ff = a * c.theta_ff + b * (p + c.p_prev);
+            }
+            c.p_prev = p;
+        }
+        // arming, from the published temperatures
+        self.allowed.iter_mut().for_each(|a| *a = 1.0);
+        let mut any = false;
+        for c in self.ch.iter_mut() {
+            let s = &t.channels[c.src];
+            let (t_ol, mag) = (s.coil_temp_c as f64, s.magnet_temp_c as f64);
+            if !(t_ol.is_finite() && mag.is_finite()) {
+                c.armed = None;
+                continue;
+            }
+            let tol = 1e-4 * t_ol.abs().max(1.0);
+            let prev = c.armed;
+            c.armed = if t_ol > c.hard_on + tol {
+                Some(true)
+            } else if t_ol < c.hard_on - tol {
+                if t_ol < c.limit - tol {
+                    Some(false)
+                } else if t_ol > c.limit + tol {
+                    prev
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if c.armed != Some(true) {
+                continue;
+            }
+            any = true;
+            let theta_mg = mag - self.amb;
+            let vcff = match c.ff {
+                Some(_) => c.theta_ff * (1.0 - 1e-4) - 1e-6,
+                None => (t_ol - mag) - 1e-4 * t_ol.abs().max(1.0),
+            };
+            if vcff + 1.0 <= 0.0 {
+                continue;
+            }
+            let num = c.limit - 5.0 - self.amb - theta_mg + 1e-4 * (c.limit.abs() + mag.abs() + 1.0);
+            let g_hard = (num / (vcff + 1.0)).clamp(0.01, 1.0).sqrt();
+            self.allowed[c.group] = self.allowed[c.group].min(g_hard);
+        }
+        if any {
+            self.armed_updates += 1;
+        }
+        // the unit's own selected target never exceeds what is allowed
+        for c in &self.ch {
+            let sel = t.channels[c.src].axis_gain[4] as f64;
+            let a = self.allowed[c.group];
+            assert!(sel <= a * (1.0 + 1e-4) + 1e-6, "hard path: group target {sel} above the hard target {a}");
+        }
+    }
+}
+
+/// Render `x` through spp3 one thermal update per call under the oracle.
+fn spp3_hard_render(p: &spp3::Params, x: &[Vec<f32>]) -> (usize, Telemetry) {
+    let mut u = spp3::Unit::new(*p);
+    assert!(!u.is_failsafe());
+    let mut o = HardOracle::new(p);
+    let n = x.len();
+    let f = spp3::THERMAL_FRAMES;
+    let mut out = vec![vec![0.0f32; f]; n];
+    let mut t = Telemetry::new();
+    let mut done = 0;
+    while done + f <= x[0].len() {
+        let ins: Vec<&[f32]> = x.iter().map(|b| &b[done..done + f]).collect();
+        let mut outs: Vec<&mut [f32]> = out.iter_mut().map(|b| &mut b[..]).collect();
+        let before = allocs();
+        u.process(Io { frames: f, input: &ins, sense: &[], output: &mut outs });
+        u.telemetry(&mut t);
+        assert_eq!(allocs(), before);
+        drop(outs);
+        let outs: Vec<&[f32]> = out.iter().map(|b| &b[..]).collect();
+        o.step(&ins, &outs, &t);
+        done += f;
+    }
+    (o.armed_updates, t)
+}
+
+/// `n` channels of a constant sine for `secs`.
+fn sine_drive(n: usize, secs: f64, rate: u32, amp: f32, f: f64) -> Vec<Vec<f32>> {
+    let len = (secs * rate as f64) as usize;
+    let w = 2.0 * std::f64::consts::PI * f / rate as f64;
+    let x: Vec<f32> = (0..len).map(|k| amp * (w * k as f64).sin() as f32).collect();
+    vec![x; n]
+}
+
 proptest! {
     #![proptest_config(cfg(32))]
 
+    /// spp3 (property 4, as specified now): while armed, the group target is
+    /// at most the hard target and the audio follows it through the
+    /// dezippers; see [`HardOracle`].
     #[test]
-    fn spp3_hard_path_cuts_20db_within_one_block(
-        seed in any::<u64>(), n in 1usize..=8, blk in prop_oneof![Just(512u32), Just(64), 16u32..=2048],
+    fn spp3_hard_path_holds_the_hard_target(
+        seed in any::<u64>(), n in 1usize..=8, rate in prop_oneof![Just(48_000u32), 8_000u32..=192_000],
         ff in ff(), secs in 1.0f64..8.0, amp in 0.5f32..4.0, h in hostility(),
     ) {
-        let rate = 48_000;
-        let mut p = spp3_params(seed, n, blk, rate, ff, true);
+        let mut p = spp3_params(seed, n, 512, rate, ff, true);
         // short coil constants and low limits so the coil reaches the hard
-        // limit within the run
+        // limit within the run; closed loop off (the corrected limit is
+        // internal)
         for c in 0..n {
             p.ch[c].tau_tvc = p.ch[c].tau_tvc.min(0.2);
             p.ch[c].temperature_limit = p.thermal_ambient_temp + 5.0 + (p.ch[c].temperature_limit - p.thermal_ambient_temp) / 8.0;
             p.ch[c].hard_temp_limit_headroom = p.ch[c].hard_temp_limit_headroom.abs() / 4.0;
+            p.ch[c].cal_present = 0;
         }
+        stable_spp3(&mut p);
         let len = (secs * rate as f64) as usize;
         let x = signal(seed ^ 1, n, len, amp, h);
-        let mut chans = vec![(0, 0.0); n];
-        for c in &p.ch[..n] {
-            chans[c.source as usize] = (c.group as usize, c.temperature_limit as f64 + c.hard_temp_limit_headroom as f64);
-        }
-        let mut u = spp3::Unit::new(p);
-        prop_assert!(!u.is_failsafe());
-        check_hard_path(&mut u, &x, blk as usize, &chans);
+        spp3_hard_render(&p, &x);
     }
 
     #[test]
     fn atsp_hard_path_cuts_20db_within_one_block(
-        seed in any::<u64>(), n in 1usize..=8, blk in prop_oneof![Just(512u32), Just(64), 16u32..=2048],
-        secs in 1.0f64..8.0, amp in 0.5f32..4.0, h in hostility(),
+        seed in any::<u64>(), n in 1usize..=8, blk in prop_oneof![Just(512u32), Just(64), Just(0), 16u32..=2048],
+        call in 16usize..=4096, secs in 1.0f64..8.0, amp in 0.5f32..4.0, h in hostility(),
     ) {
         let rate = 48_000;
         let mut p = atsp_params(seed, n, blk, rate, true);
@@ -880,7 +1142,8 @@ proptest! {
         }
         let mut u = atsp::Unit::new(p);
         prop_assert!(!u.is_failsafe());
-        check_hard_path(&mut u, &x, blk as usize, &chans);
+        // host-block mode (`block_frames = 0`) decides once per host call
+        check_hard_path(&mut u, &x, if blk == 0 { call } else { blk as usize }, &chans);
     }
 
     /// lsm2 has no separate hard path; its temperature axis takes the full
@@ -928,6 +1191,40 @@ proptest! {
     }
 }
 
+proptest! {
+    // 30 s of audio per case: few cases by default
+    #![proptest_config(cfg(8))]
+
+    /// With the feed-forward on, sustained drive settles with the modelled
+    /// coil at or below the hard limit, unless the gain sits at the
+    /// candidate's 20 dB floor.
+    #[test]
+    fn spp3_feed_forward_settles_below_the_hard_limit(
+        seed in any::<u64>(), n in 1usize..=4, amp in 0.3f32..3.0, f in 50.0f64..3000.0,
+    ) {
+        let rate = 48_000u32;
+        let mut p = spp3_params(seed, n, 512, rate, Ff::On, true);
+        for c in 0..n {
+            p.ch[c].tau_tvc = p.ch[c].tau_tvc.min(0.5);
+            p.ch[c].tau_tmg = p.ch[c].tau_tmg.min(3.0);
+            p.ch[c].cal_present = 0;
+        }
+        stable_spp3(&mut p);
+        p.thermal_gain_attack_time_s = p.thermal_gain_attack_time_s.min(2.0);
+        p.thermal_gain_release_time_s = p.thermal_gain_release_time_s.min(5.0);
+        let x = sine_drive(n, 30.0, rate, amp, f);
+        let (_, t) = spp3_hard_render(&p, &x);
+        for c in &p.ch[..n] {
+            let s = &t.channels[c.source as usize];
+            let hard_on = c.temperature_limit + c.hard_temp_limit_headroom;
+            prop_assert!(
+                s.coil_temp_c <= hard_on + 0.5 || s.axis_gain[4] <= 0.1 + 1e-3,
+                "coil settles at {} C, hard limit {} C, gain {}", s.coil_temp_c, hard_on, s.gain
+            );
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Property 5: parameter blobs.
 
@@ -950,7 +1247,7 @@ fn load_and_probe(bytes: &[u8]) {
             let g = if u.is_failsafe() { FAILSAFE_GAIN } else { 1.0 };
             probe(&mut u, p.channels as usize, 0, g, "spp3 blob", Hostility::Wild);
         }
-        // Clean input only: FailSafe passes NaN/Inf through (FINDING 2).
+        // Clean input only: FailSafe passes NaN/Inf through (FINDING 5).
         Err(_) => {
             let mut u = FailSafe::new(UnitKind::Spp3, Health::NO_PARAMS);
             probe(&mut u, n_hint, 0, FAILSAFE_GAIN, "fail-safe", Hostility::Clean)
@@ -1085,6 +1382,7 @@ proptest! {
             p.ch[c].sense_i = 2 * c as u32;
             p.ch[c].sense_v = 2 * c as u32 + 1;
         }
+        let cl = p.ch[..n].iter().any(|c| c.cal_present != 0);
         let x = signal(seed ^ 1, n, len, amp, Hostility::Clean);
         let s = synth_sense(&x, 2 * n, delay);
         let cuts = slices(sl);
@@ -1094,8 +1392,15 @@ proptest! {
         let mut modes = Vec::new();
         let mut u = spp3::Unit::new(p);
         let drop = render(&mut u, &x, Some(&s), &cuts, &mut |_| { let m = sense_mode(&mut r); modes.push(m); m }, false);
+        // With the closed loop configured, a dropout currently keeps the last
+        // correction and can end up above both references (FINDING 3,
+        // pinned by its regression test); the comparison is made for the
+        // open-loop sets, where sense must not matter at all.
         for c in 0..n {
             for k in 0..len {
+                if cl {
+                    break;
+                }
                 let d = drop.out[c][k].abs();
                 prop_assert!(d <= valid.out[c][k].abs() && d <= open.out[c][k].abs(),
                     "sense dropout raised ch{} [{}]: {} vs valid {} open {}", c, k, d, valid.out[c][k], open.out[c][k]);
@@ -1103,13 +1408,14 @@ proptest! {
         }
         // a block whose every frame came without usable sense is reported
         // open loop (health reflects the last completed block)
-        let blk = blk as usize;
+        let _ = blk;
+        let blk = spp3::THERMAL_FRAMES;
         let mut d0 = 0;
         for (call, (h, m)) in drop.health.iter().zip(&modes).enumerate() {
             let d1 = (d0 + cuts[call % cuts.len()]).min(len);
             let last_end = d1 / blk * blk;
-            let unusable = matches!(m, Sense::Empty | Sense::Missing | Sense::Short)
-                || matches!(m, Sense::Fill(f) if !f.is_finite() || f.abs() > 1e20);
+            // (non-finite sense is not reported: FINDING 10)
+            let unusable = matches!(m, Sense::Empty | Sense::Missing | Sense::Short);
             if unusable && last_end >= blk && last_end - blk >= d0 {
                 prop_assert!(h.0 & Health::OPEN_LOOP != 0, "{:?} with {:?}", h, m);
             }
@@ -1150,32 +1456,56 @@ proptest! {
 // generators actually reach the paths they test.
 
 #[test]
-fn hard_path_anchor_is_reached() {
-    let mut hits = 0;
+fn hard_path_anchors_are_reached() {
+    let mut armed = 0;
     for seed in 0..12u64 {
         let n = 2;
-        let mut p = spp3_params(seed, n, 512, 48_000, Ff::Off, true);
+        let mut p = spp3_params(seed, n, 512, 48_000, if seed % 2 == 0 { Ff::Off } else { Ff::On }, true);
         for c in 0..n {
             p.ch[c].tau_tvc = 0.05;
             p.ch[c].temperature_limit = p.thermal_ambient_temp + 10.0;
             p.ch[c].hard_temp_limit_headroom = 2.0;
+            p.ch[c].cal_present = 0;
         }
+        stable_spp3(&mut p);
         let x = signal(seed, n, 48_000 * 4, 2.0, Hostility::Clean);
-        let mut chans = vec![(0, 0.0); n];
-        for c in &p.ch[..n] {
-            chans[c.source as usize] =
-                (c.group as usize, c.temperature_limit as f64 + c.hard_temp_limit_headroom as f64);
-        }
-        hits += check_hard_path(&mut spp3::Unit::new(p), &x, 512, &chans);
+        armed += spp3_hard_render(&p, &x).0;
     }
-    assert!(hits > 100, "the hard-path property never saw the hard path ({hits} blocks)");
+    assert!(armed > 100, "the spp3 hard-path property never saw the hard path ({armed} updates)");
+    let mut hits = 0;
+    for seed in 0..12u64 {
+        let mut p = atsp_params(seed, 2, 512, 48_000, true);
+        for s in p.slot.iter_mut() {
+            s.tau_vc = 0.05;
+            s.temperature_limit = s.ambient + 10.0;
+            s.hard_limit_headroom = 2.0;
+        }
+        let x = signal(seed, 2, 48_000 * 4, 2.0, Hostility::Clean);
+        let mut chans = vec![(0, 0.0); 2];
+        for (si, s) in p.slot.iter().enumerate() {
+            for (c, ch) in chans.iter_mut().enumerate() {
+                if s.channel_mask & (1 << c) != 0 {
+                    let g = if p.gain_link_all != 0 {
+                        0
+                    } else if s.gain_link != 0 {
+                        100 + si
+                    } else {
+                        200 + c
+                    };
+                    *ch = (g, s.temperature_limit as f64 + s.hard_limit_headroom as f64);
+                }
+            }
+        }
+        hits += check_hard_path(&mut atsp::Unit::new(p), &x, 512, &chans);
+    }
+    assert!(hits > 100, "the atsp hard-path property never saw the hard path ({hits} blocks)");
 }
 
 // ---------------------------------------------------------------------------
 // Regression tests for defects found by the tests above (lane B to fix).
+// Each is `#[ignore]`d until fixed; remove the attribute with the fix.
 
-/// Minimal spp3 set for the regressions: one channel, feed-forward off (the
-/// specified `ThermalFFSpeedupFactor = 0` behaviour: only the hard path acts).
+/// Minimal spp3 set for the regressions: one channel, closed loop off.
 fn spp3_minimal(ff: f32) -> spp3::Params {
     let mut p = spp3::Params {
         channels: 1,
@@ -1184,6 +1514,7 @@ fn spp3_minimal(ff: f32) -> spp3::Params {
         thermal_ambient_temp: 40.0,
         thermal_gain_attack_time_s: 0.5,
         thermal_gain_release_time_s: 2.0,
+        thermal_lookahead_delay_ms: 1.5,
         thermal_protection_enabled: 1,
         ..spp3::Params::default()
     };
@@ -1203,50 +1534,82 @@ fn spp3_minimal(ff: f32) -> spp3::Params {
     p
 }
 
-fn one_block(u: &mut dyn ProtectionUnit, x: f32, first: Option<f32>) -> f32 {
-    let mut i = vec![x; 512];
-    if let Some(v) = first {
-        i[0] = v;
+/// The same with the closed loop configured and a synthetic calibration
+/// (4.0 ohm at 25 C, 0.4 %/K, cap 30 K), sense ports (I, V) = (0, 1).
+fn spp3_cl() -> spp3::Params {
+    let mut p = spp3_minimal(0.5);
+    let c = &mut p.ch[0];
+    c.cl_thermal_feedback_enabled = 1;
+    (c.imon_scale, c.vmon_scale, c.i_pwr_thres, c.v_pwr_thres) = (1.0, 1.0, 1e-6, 1e-6);
+    (c.sense_i, c.sense_v) = (0, 1);
+    (c.temp_sense_window_time_s, c.temp_sense_smoothing_tau_s, c.rdc_scale) = (0.01, 0.1, 1.0);
+    (c.reb_range_min, c.reb_range_max, c.cal_temp_range_min, c.cal_temp_range_max) = (2.0, 8.0, 10.0, 50.0);
+    (c.a_t_20c, c.a_t_35c, c.tlim_err_decay_time_s, c.tlim_adj_cap) = (0.004, 0.004, 1.0, 30.0);
+    (c.cal_present, c.cal_r, c.cal_t) = (1, 4.0, 25.0);
+    p
+}
+
+/// Drive one channel with `x` for `frames` in 512-frame calls (`first`
+/// replaces the very first sample). `sense = Some(r)` delivers a V/I pair
+/// with resistance `r`; `None` delivers no sense slices. Returns the last
+/// call's gain and the telemetry.
+fn drive1(
+    u: &mut dyn ProtectionUnit,
+    x: f32,
+    first: Option<f32>,
+    frames: usize,
+    sense: Option<f32>,
+) -> (f32, Telemetry) {
+    let (mut done, mut g, mut t) = (0, 0.0, Telemetry::new());
+    while done < frames {
+        let m = 512.min(frames - done);
+        let mut i = vec![x; m];
+        if done == 0 {
+            if let Some(v) = first {
+                i[0] = v;
+            }
+        }
+        let cur: Vec<f32> = (0..m).map(|j| 0.5 * ((done + j) as f32 * 0.13).sin()).collect();
+        let vol: Vec<f32> = cur.iter().map(|c| c * sense.unwrap_or(0.0)).collect();
+        let s: Vec<&[f32]> = if sense.is_some() { vec![&cur, &vol] } else { Vec::new() };
+        let mut o = vec![0.0f32; m];
+        u.process(Io { frames: m, input: &[&i], sense: &s, output: &mut [&mut o] });
+        g = o[m - 1] / x;
+        done += m;
     }
-    let mut o = vec![0.0f32; 512];
-    u.process(Io { frames: 512, input: &[&i], sense: &[], output: &mut [&mut o] });
-    o[511] / x
-}
-
-/// FINDING 1: a single large finite sample (|x| > ~1.8e19, so x^2 overflows
-/// the f32 block accumulator `LaneAcc`) drives the spp3 thermal state to
-/// +Inf, then to NaN on the next block (`inf - inf`). `NaN > hard_limit` is
-/// false, so the hard path is disarmed for good: with the feed-forward off,
-/// full-scale drive then passes at unity forever while the model reports NaN
-/// (until `reset`). With the feed-forward on, `NaN.max(0.0)` makes the target
-/// 0 and the unit mutes forever instead. atsp has the same accumulator.
-#[test]
-#[ignore = "FINDING 1 (lane B): huge finite input poisons the thermal state with NaN"]
-fn spp3_huge_finite_sample_must_not_disarm_the_hard_path() {
-    // control: full-scale drive reaches the hard path within 4 s
-    let mut fresh = spp3::Unit::new(spp3_minimal(0.0));
-    let mut t = Telemetry::new();
-    // blocks under the hard path, after the first two (the poisoned unit's
-    // +Inf block still trips it once before the state turns NaN)
-    let engaged = |u: &mut spp3::Unit| {
-        (0..400).map(|_| one_block(u, 1.0, None)).skip(2).filter(|&g| g <= FAILSAFE_GAIN * 1.0001).count()
-    };
-    assert!(engaged(&mut fresh) > 0, "control: the hard path engages on a fresh unit");
-    // one block containing one 2e19 sample, then the same full-scale drive
-    let mut u = spp3::Unit::new(spp3_minimal(0.0));
-    one_block(&mut u, 0.0, Some(2e19));
-    let hard_blocks = engaged(&mut u);
     u.telemetry(&mut t);
-    assert!(
-        hard_blocks > 0,
-        "hard path disarmed: 4 s of full-scale drive at unity gain, coil temperature {}",
-        t.channels[0].coil_temp_c
-    );
-    assert!(t.channels[0].coil_temp_c.is_finite(), "coil temperature is {}", t.channels[0].coil_temp_c);
+    (g, t)
 }
 
+/// FINDING 1 (critical): one large finite sample (`abs(x) > ~1.8e19`, so `x^2`
+/// overflows the f32 `LaneAcc` lanes) makes the modelled power +Inf, so
+/// `theta_vc`, `theta_mg` and `theta_ff` go to +Inf for good. The
+/// candidates are then `sqrt(clamp(-inf / inf))` = NaN, and `f64::min`
+/// drops a NaN, so the group target becomes 1. From then on (until `reset`)
+/// spp3 passes full-scale drive at **unity gain** with `T_OL = inf`, whether
+/// the feed-forward is on or off. A fresh unit holds the same drive at about
+/// 0.34 (ff 0.5) or 0.48 (ff 0).
 #[test]
-#[ignore = "FINDING 1 (lane B): huge finite input poisons the thermal state with NaN"]
+#[ignore = "FINDING 1 (lane B): one huge finite sample leaves spp3 at unity gain forever"]
+fn spp3_huge_finite_sample_must_not_unprotect() {
+    for ff in [0.5f32, 0.0] {
+        let (fresh, _) = drive1(&mut spp3::Unit::new(spp3_minimal(ff)), 1.0, None, 48_000 * 10, None);
+        assert!(fresh < 0.9, "control: a fresh unit limits full-scale drive (gain {fresh})");
+        let mut u = spp3::Unit::new(spp3_minimal(ff));
+        drive1(&mut u, 0.0, Some(2e19), 512, None);
+        let (g, t) = drive1(&mut u, 1.0, None, 48_000 * 10, None);
+        assert!(
+            g <= fresh * 1.01 && t.channels[0].coil_temp_c.is_finite(),
+            "ff {ff}: after one 2e19 sample, 10 s of full-scale drive leave at gain {g} (fresh unit {fresh}), T_OL {}",
+            t.channels[0].coil_temp_c
+        );
+    }
+}
+
+/// FINDING 1, atsp: the same accumulator overflow turns the state NaN and
+/// the unit then mutes forever (fail-closed, but never recovers).
+#[test]
+#[ignore = "FINDING 1 (lane B): huge finite input poisons the atsp thermal state with NaN"]
 fn atsp_huge_finite_sample_must_not_poison_the_model() {
     let s = atsp::Slot {
         channel_mask: 1,
@@ -1272,65 +1635,91 @@ fn atsp_huge_finite_sample_must_not_poison_the_model() {
         slot: [s, Default::default(), Default::default()],
     };
     let mut u = atsp::Unit::new(p);
-    one_block(&mut u, 0.0, Some(2e19));
-    for _ in 0..4 {
-        one_block(&mut u, 0.0, None);
-    }
-    let mut t = Telemetry::new();
-    u.telemetry(&mut t);
+    drive1(&mut u, 0.0, Some(2e19), 512 * 5, None);
+    let (g, t) = drive1(&mut u, 1e-3, None, 48_000 * 20, None);
     assert!(t.channels[0].coil_temp_c.is_finite(), "coil temperature is {}", t.channels[0].coil_temp_c);
-    // and the unit recovers from silence instead of muting forever
-    let mut g = 0.0;
-    for _ in 0..2000 {
-        g = one_block(&mut u, 1e-3, None);
-    }
     assert!(g > 0.5, "stuck muted after one huge sample: gain {g}");
 }
 
-/// FINDING 5: spp3 and atsp apply the non-finite ("meter failure") 20 dB
-/// to every frame of the *host segment* that holds the bad sample, so where
-/// the host happened to split its buffers decides which good frames are cut,
-/// and therefore the protected drive the thermal model integrates. Output and
-/// state then differ between slicings (property 3). The cut is on the safe
-/// side, but the trajectory is no longer reproducible against the rig.
+/// FINDING 2 (critical): with `ThermalFFSpeedupFactor = 0` (the feed-forward
+/// off, a specified configuration) only the hard path acts, and its target
+/// takes the real coil as the virtual coil:
+/// `g^2 = (Tlim - 5 - ambient - theta_mg) / (theta_vc + 1)`. The real coil's
+/// rise scales with `g^2` itself, so this does not hold the coil at the
+/// limit: under sustained full-scale drive the unit settles at gain 0.48
+/// with the modelled coil at **194 C against a 128 C hard limit**, for as
+/// long as the drive lasts (the same drive with the feed-forward on settles
+/// at 119.9 C). Module docs: "TODO(SPEC): the hard candidate when the
+/// feed-forward filter is disabled".
 #[test]
-#[ignore = "FINDING 5 (lane B): the non-finite fail-safe region depends on host slicing"]
-fn non_finite_failsafe_region_is_slice_invariant() {
-    let mut x = vec![0.5f32; 512];
-    x[100] = f32::NAN;
-    let x = vec![x];
-    for (name, mk) in [
-        (
-            "spp3",
-            Box::new(|| Box::new(spp3::Unit::new(spp3_minimal(1.0))) as Box<dyn ProtectionUnit>)
-                as Box<dyn Fn() -> Box<dyn ProtectionUnit>>,
-        ),
-        (
-            "atsp",
-            Box::new(|| {
-                let mut p = atsp_params(5, 1, 512, 48_000, false);
-                p.slot[0].channel_mask = 1;
-                (p.slot[1].channel_mask, p.slot[2].channel_mask) = (0, 0);
-                Box::new(atsp::Unit::new(p)) as Box<dyn ProtectionUnit>
-            }),
-        ),
-    ] {
-        let whole = render(mk().as_mut(), &x, None, &[512], &mut no_sense, false);
-        let split = render(mk().as_mut(), &x, None, &[64], &mut no_sense, false);
-        assert_eq!(whole.out[0][0], split.out[0][0], "{name}: frame 0 (far from the NaN) depends on the slicing");
-        assert!(bits(&whole.out) == bits(&split.out), "{name}: output depends on the slicing");
+#[ignore = "FINDING 2 (lane B): with the feed-forward off spp3 settles 66 C above the hard limit"]
+fn spp3_feed_forward_off_still_holds_the_hard_limit() {
+    let p = spp3_minimal(0.0);
+    let hard_on = p.ch[0].temperature_limit + p.ch[0].hard_temp_limit_headroom;
+    let (g, t) = drive1(&mut spp3::Unit::new(p), 1.0, None, 48_000 * 30, None);
+    assert!(
+        t.channels[0].coil_temp_c <= hard_on + 0.5,
+        "after 30 s of full-scale drive the modelled coil is at {} C (hard limit {hard_on} C) with gain {g}",
+        t.channels[0].coil_temp_c
+    );
+}
+
+/// FINDING 3 (high): closed-loop sense loss keeps the last correction. When
+/// the sense slices are absent, short or missing ports, `Cl::feed` is not
+/// called, so `valid` stays true and `T_CL` stays at the last measurement:
+/// the corrected limit keeps (and, as `T_OL` rises, grows) its
+/// `TlimAdjCap` allowance with nothing measured. After 30 s with no sense
+/// bus the correction is still +30 K, the gain 0.669 and `T_OL` 149.6 C,
+/// while the open loop holds the same drive at 0.570 and 119.7 C, and
+/// `health` meanwhile reports `OPEN_LOOP`. NaN-filled sense, by contrast,
+/// is rejected and the limit returns to plain (the specified behaviour).
+#[test]
+#[ignore = "FINDING 3 (lane B): closed-loop sense loss keeps the corrected limit indefinitely"]
+fn spp3_closed_loop_falls_back_when_the_sense_bus_disappears() {
+    let mut u = spp3::Unit::new(spp3_cl());
+    let (g0, t0) = drive1(&mut u, 0.6, None, 48_000 * 10, Some(4.0));
+    assert!(t0.channels[0].closed_loop && t0.channels[0].tlim_adj_c > 1.0, "control: the closed loop corrects");
+    assert!(g0 > 0.0);
+    let (g, t) = drive1(&mut u, 0.6, None, 48_000 * 30, None);
+    let (g_open, _) = drive1(&mut spp3::Unit::new(spp3_minimal(0.5)), 0.6, None, 48_000 * 40, None);
+    assert!(t.health.0 & Health::OPEN_LOOP != 0, "health reports the loss");
+    assert!(
+        t.channels[0].tlim_adj_c < 1.0 && g <= g_open * 1.01,
+        "30 s after the sense bus vanished: limit correction {} K, gain {g} vs open loop {g_open}, T_OL {} C",
+        t.channels[0].tlim_adj_c,
+        t.channels[0].coil_temp_c
+    );
+}
+
+/// FINDING 4 (high): `TlimAdjCap` is not validated, and `Cl::update` calls
+/// `f64::clamp(limit, limit + cap)`, which panics when `cap < 0` or is NaN.
+/// A blob with the closed loop configured and such a cap passes `validate`
+/// and panics in `process` on the first accepted sense window (an abort
+/// inside PipeWire with `panic = "abort"`).
+#[test]
+#[ignore = "FINDING 4 (lane B): a negative or NaN TlimAdjCap panics in process()"]
+fn spp3_hostile_tlim_adj_cap_never_panics() {
+    for cap in [-1.0f32, f32::NAN] {
+        let mut p = spp3_cl();
+        p.ch[0].tlim_adj_cap = cap;
+        let b = blob::build(UnitKind::Spp3, 1, 2, 48_000, p.as_bytes());
+        let p = spp3::Params::from_blob(&b).expect("the blob validates");
+        let r = std::panic::catch_unwind(|| {
+            let mut u = spp3::Unit::new(p);
+            drive1(&mut u, 0.6, None, 48_000, Some(4.0));
+        });
+        assert!(r.is_ok(), "TlimAdjCap {cap}: process() panicked");
     }
 }
 
-/// FINDING 2: `FailSafe::process` (the unit `sgv2-lv2::load_unit` installs
-/// for any unusable blob) is not as hardened as spp3/lsm2/atsp's own fault
-/// path, `failsafe_io`: it slices `out[..frames]` and `input[..frames]`
-/// unchecked, so a host buffer shorter than `Io::frames` panics (an abort
-/// inside PipeWire with `panic = "abort"`), and it does not sanitize, so a
-/// NaN or +-Inf input sample leaves as NaN or +-Inf (Inf * 0.1 = Inf: full
-/// scale at the amplifier).
+/// FINDING 5 (medium): `FailSafe::process` (the unit `sgv2-lv2::load_unit`
+/// installs for any unusable blob) is not as hardened as the units' own
+/// fault path, `failsafe_io`: it slices `out[..frames]` and `input[..frames]`
+/// unchecked, so a host buffer shorter than `Io::frames` panics, and it does
+/// not sanitize, so a NaN or +-Inf input sample leaves as NaN or +-Inf
+/// (`Inf * 0.1 = Inf`: full scale at the amplifier).
 #[test]
-#[ignore = "FINDING 2 (lane B): FailSafe::process panics on a short host buffer"]
+#[ignore = "FINDING 5 (lane B): FailSafe::process panics on a short host buffer"]
 fn failsafe_unit_never_panics_on_short_buffers() {
     let r = std::panic::catch_unwind(|| {
         let x = [0.5f32; 8];
@@ -1342,7 +1731,7 @@ fn failsafe_unit_never_panics_on_short_buffers() {
 }
 
 #[test]
-#[ignore = "FINDING 2 (lane B): FailSafe::process passes NaN/Inf through"]
+#[ignore = "FINDING 5 (lane B): FailSafe::process passes NaN/Inf through"]
 fn failsafe_unit_output_is_finite() {
     let x = [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.5];
     let mut o = [0.0f32; 4];
@@ -1351,15 +1740,49 @@ fn failsafe_unit_output_is_finite() {
     assert!(o.iter().all(|v| v.is_finite()), "fail-safe output {o:?}");
 }
 
-/// FINDING 3: blobs that validate and load as a real unit, yet protect
-/// nothing (property 5's "never pass-through"). spp3 refuses
-/// `ThermalProtectionEnabled = 0` and atsp refuses `Bypass`, but lsm2 accepts
-/// `EnableMitigation = 0`, and all five `Control*` flags off, and the units
-/// accept limits no speaker has (a temperature limit of `f32::MAX`). Whether
-/// these are refused (fail-safe) or allowed as Apple's own semantics is a
-/// lane B / spec decision; until then these tests document the gap.
+/// FINDING 6 (low): spp3 and atsp apply the non-finite ("meter failure")
+/// 20 dB to every frame of the *host segment* that holds the bad sample, so
+/// where the host split its buffers decides which good frames are cut, and
+/// with them the protected drive the model integrates. Output and state
+/// then differ between slicings (property 3). The cut is on the safe side,
+/// but the trajectory is no longer reproducible against the rig.
 #[test]
-#[ignore = "FINDING 3 (decision for lane B): accepted blobs that disable protection"]
+#[ignore = "FINDING 6 (lane B): the non-finite fail-safe region depends on host slicing"]
+fn non_finite_failsafe_region_is_slice_invariant() {
+    let mut x = vec![0.5f32; 512];
+    x[100] = f32::NAN;
+    let x = vec![x];
+    type Make = Box<dyn Fn() -> Box<dyn ProtectionUnit>>;
+    let units: [(&str, Make); 2] = [
+        ("spp3", Box::new(|| Box::new(spp3::Unit::new(spp3_minimal(1.0))))),
+        (
+            "atsp",
+            Box::new(|| {
+                let mut p = atsp_params(5, 1, 512, 48_000, false);
+                p.slot[0].channel_mask = 1;
+                (p.slot[1].channel_mask, p.slot[2].channel_mask) = (0, 0);
+                Box::new(atsp::Unit::new(p))
+            }),
+        ),
+    ];
+    for (name, mk) in units {
+        let whole = render(mk().as_mut(), &x, None, &[512], &mut no_sense, false);
+        let split = render(mk().as_mut(), &x, None, &[64], &mut no_sense, false);
+        assert_eq!(whole.out[0][0], split.out[0][0], "{name}: frame 0 (far from the NaN) depends on the slicing");
+        assert!(bits(&whole.out) == bits(&split.out), "{name}: output depends on the slicing");
+    }
+}
+
+/// FINDING 7 (decision for lane B): blobs that validate and load as a real
+/// unit, yet protect nothing (property 5's "never pass-through"). spp3
+/// refuses `ThermalProtectionEnabled = 0` and atsp refuses `Bypass`, but
+/// lsm2 accepts `EnableMitigation = 0` and all five `Control*` flags off,
+/// and spp3 accepts limits no speaker has (`TemperatureLimit = f32::MAX`)
+/// and smoothing times that never move (`f32::MAX` s). Whether these are
+/// refused (fail-safe) or allowed as Apple's own semantics is a lane B /
+/// spec decision; until then this test documents the gap.
+#[test]
+#[ignore = "FINDING 7 (decision for lane B): accepted blobs that disable protection"]
 fn hostile_but_valid_blobs_do_not_pass_through() {
     let x = vec![vec![1.0f32; 48_000 * 10]; 1];
     let passes = |u: &mut dyn ProtectionUnit, lat: usize| {
@@ -1367,7 +1790,6 @@ fn hostile_but_valid_blobs_do_not_pass_through() {
         rr.out[0][lat + 48_000 * 9..].iter().all(|&v| v == 1.0)
     };
     let mut failures = Vec::new();
-    // lsm2, mitigation off
     let mut p = lsm2_params(1, 1, 48_000, true);
     p.control_temperature = 1;
     p.enable_mitigation = 0;
@@ -1377,7 +1799,6 @@ fn hostile_but_valid_blobs_do_not_pass_through() {
     if !u.is_failsafe() && passes(&mut u, lat) {
         failures.push("lsm2 EnableMitigation=0 loads and passes full scale at unity");
     }
-    // lsm2, every axis off
     let mut p = lsm2_params(1, 1, 48_000, true);
     (p.control_sample_peak, p.control_displacement, p.control_velocity) = (0, 0, 0);
     (p.control_power, p.control_temperature) = (0, 0);
@@ -1386,21 +1807,28 @@ fn hostile_but_valid_blobs_do_not_pass_through() {
     if !u.is_failsafe() && passes(&mut u, lat) {
         failures.push("lsm2 with every Control* flag off loads and passes full scale at unity");
     }
-    // spp3, a limit no speaker has
     let mut p = spp3_minimal(1.0);
     p.ch[0].temperature_limit = f32::MAX;
     let mut u = spp3::Unit::new(p);
     if !u.is_failsafe() && passes(&mut u, 0) {
         failures.push("spp3 TemperatureLimit=f32::MAX loads and passes full scale at unity");
     }
+    let mut p = spp3_minimal(1.0);
+    p.thermal_gain_attack_time_s = f32::MAX;
+    p.ch[0].hard_temp_limit_headroom = 1e30;
+    let mut u = spp3::Unit::new(p);
+    if !u.is_failsafe() && passes(&mut u, 0) {
+        failures.push("spp3 Thermal_GainAttackTime_s=f32::MAX (and a huge headroom) passes full scale at unity");
+    }
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
-/// FINDING 4: lsm2 parses and validates `TemperatureHardLimit` but never
-/// uses it: there is no hard path. With `MaxTemperatureAttenuation = 0 dB`
-/// (accepted) the coil runs past the hard limit at unity gain.
+/// FINDING 8 (decision for lane B): lsm2 parses and validates
+/// `TemperatureHardLimit` but never uses it: there is no hard path. With
+/// `MaxTemperatureAttenuation = 0 dB` (accepted) the coil runs past the hard
+/// limit at unity gain.
 #[test]
-#[ignore = "FINDING 4 (decision for lane B): lsm2 never enforces TemperatureHardLimit"]
+#[ignore = "FINDING 8 (decision for lane B): lsm2 never enforces TemperatureHardLimit"]
 fn lsm2_enforces_the_hard_temperature_limit() {
     let mut p = lsm2_params(3, 1, 48_000, true);
     (p.control_sample_peak, p.control_displacement, p.control_velocity, p.control_power) = (0, 0, 0, 0);
@@ -1422,4 +1850,48 @@ fn lsm2_enforces_the_hard_temperature_limit() {
         p.ch[0].temperature_hard_limit,
         last.channels[0].gain
     );
+}
+
+/// FINDING 9 (high): the thermal filters are the linear-decay recurrence
+/// `theta = (1 - dt/tau) theta + ...` with `dt = 256/fs`, which diverges
+/// (alternating, growing) for `tau < dt/2`: 2.7 ms at 48 kHz, 16 ms at
+/// 8 kHz, for the coil, the magnet and the virtual coil
+/// (`tau_ff = ThermalFFSpeedupFactor * tau_Tvc`). `validate` accepts any
+/// positive `tau`. The model reaches +-Inf within a second; depending on
+/// which filters diverge the unit then sticks at the 20 dB floor or, with
+/// the magnet and virtual coil both gone, releases to unity (0.998 below,
+/// where a stable unit holds 0.68) while `T_OL = -inf`.
+#[test]
+#[ignore = "FINDING 9 (lane B): thermal filters diverge for tau < dt/2 and can release to unity"]
+fn spp3_short_time_constants_stay_stable() {
+    let stable = {
+        let p = spp3_minimal(1.0);
+        drive1(&mut spp3::Unit::new(p), 0.5, None, 48_000 * 10, None).0
+    };
+    let mut p = spp3_minimal(1.0);
+    (p.ch[0].tau_tvc, p.ch[0].tau_tmg) = (0.002, 0.002);
+    assert_eq!(p.validate(), Ok(()));
+    let (g, t) = drive1(&mut spp3::Unit::new(p), 0.5, None, 48_000 * 10, None);
+    assert!(
+        t.channels[0].coil_temp_c.is_finite() && g <= stable.max(0.9),
+        "tau 2 ms: gain {g} with T_OL {} (stable constants: gain {stable})",
+        t.channels[0].coil_temp_c
+    );
+}
+
+/// FINDING 10 (low): non-finite or overflowing sense (NaN, Inf, or 1e30,
+/// whose square is Inf) is not reported as `OPEN_LOOP`: the update's
+/// `complete` no longer checks the sums' finiteness, so `health` reads 0
+/// while `sense_power` is NaN and the closed loop rejects every window.
+#[test]
+#[ignore = "FINDING 10 (lane B): non-finite sense is not reported as OPEN_LOOP"]
+fn spp3_non_finite_sense_is_open_loop() {
+    for v in [f32::NAN, f32::INFINITY, 1e30] {
+        let mut u = spp3::Unit::new(spp3_cl());
+        let i = vec![0.5f32; 512];
+        let s = vec![v; 512];
+        let mut o = vec![0.0f32; 512];
+        let h = u.process(Io { frames: 512, input: &[&i], sense: &[&s, &s], output: &mut [&mut o] });
+        assert!(h.0 & Health::OPEN_LOOP != 0, "sense {v}: health {h:?}");
+    }
 }

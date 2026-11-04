@@ -5,3 +5,5 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 9d91db9b25b7fd78ddcf82bfdf1e58efc99fba05c364dfc9a3ff610b1d309958 # shrinks to seed = 14306979716237168221, which = 2, n = 1, mutations = 2, fix = false
+cc 2fa7b0f27992a7651421e2c980b15b2d53016c1ad5ef0292715ffe3bbb453fe4 # shrinks to seed = 810215535641484521, n = 2, blk = 512, rate = 48000, ff = On, hot = false, len = 20736, amp = 0.01, h = Clean, sl = 0
+cc 2da34130fd02d1261b3cf4809ca0d6fd3cbd8d19ec32c286ea7bc279f66ebbfc # shrinks to seed = 1502134755928660682, n = 6, rate = 48000, ff = Off, secs = 2.335051794825414, amp = 0.5, h = Wild

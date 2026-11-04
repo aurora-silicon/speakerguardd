@@ -14,7 +14,9 @@ static GLOBAL: Counting = Counting;
 
 fn run(u: &mut Unstructured) -> Result<()> {
     let n = u.int_in_range(1..=8usize)?;
-    let mut base = atsp_base(n, block(u)?, rate(u)?);
+    // block_frames = 0 is host-block mode: one update per host call
+    let host_block = u.ratio(1, 5)?;
+    let mut base = atsp_base(n, if host_block { 0 } else { block(u)? }, rate(u)?);
     // split the channels over the three slots
     if u.ratio(1, 2)? {
         let mut masks = [0u32; 3];
@@ -33,14 +35,25 @@ fn run(u: &mut Unstructured) -> Result<()> {
     mutate_words(&mut bytes, u)?;
     let p = Params::from_bytes(&bytes).unwrap();
     let x = signal(u, n, 96_000)?;
-    let cuts = slices(u)?;
+    let mut cuts = slices(u)?;
+    if host_block {
+        // FINDING 11: host-block mode costs O(4096 x groups) per call, so
+        // tiny calls make executions crawl; keep them at 64 frames or more
+        cuts.iter_mut().for_each(|c| *c = (*c).max(64));
+    }
     let junk = synth_sense(&x, u.int_in_range(0..=4usize)?, 3);
     let modes: Vec<u8> = (0..u.int_in_range(1..=8usize)?).map(|_| u.arbitrary().unwrap_or(0)).collect();
 
     let ok = Unit::init_error(&p).is_none();
     let real = ok && p.channels as usize == n;
     let gain = if real { 1.0 } else { FAILSAFE_GAIN };
-    let blk = if ok { p.block_frames as usize } else { 512 };
+    let blk = if !ok {
+        512
+    } else if p.block_frames == 0 {
+        cuts[0]
+    } else {
+        p.block_frames as usize
+    };
 
     let mut chans = vec![(0usize, f64::INFINITY); n];
     if real {
@@ -70,7 +83,8 @@ fn run(u: &mut Unstructured) -> Result<()> {
 
     let b = render(&mut Unit::new(p), &x, &[], &cuts, &[], &mut nothing);
     check_bound(&x, &b.out, 0, gain, "atsp B");
-    if real && all_finite(&x) {
+    // host-block mode depends on the host's calls by design
+    if real && all_finite(&x) && p.block_frames != 0 {
         assert!(bits(&a.out) == bits(&b.out), "atsp: audio depends on host slicing");
         assert_eq!(tele_bits(&a.tele), tele_bits(&b.tele), "atsp: state depends on host slicing");
         ua.reset();
