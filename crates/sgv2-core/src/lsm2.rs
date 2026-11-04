@@ -15,6 +15,14 @@
 //! y ─ u=Vfs·y → current model → u·i → four power averages, two thermal nodes (the monitor)
 //! ```
 //!
+//! - **Models** (confirmed on the 25G83 rig, lsm2 law 1): current,
+//!   displacement and velocity each use their own block's `RdcOhms`
+//!   (`R = Rdc`); `ParasiticResistance` enters no model state, only the
+//!   amplifier load term `(Rdc_adm + Rpar) / Rdc_adm` with the admittance
+//!   block's `Rdc`. Displacement and velocity are plain bilinear
+//!   (unwarped) discretisations of `X/U = Bl/(R(Mms s^2 + Rms s + Kms) +
+//!   Bl^2 s)` and `V = sX` at any rate. The controller cadence is 5.333 ms
+//!   (256 frames at 48 kHz, 512 at 96 kHz), with eight power substeps.
 //! - **Latency** `2*FilterbankLatency + SpeakerResponseLookAhead` (352 frames
 //!   at 48 kHz): the FIR bank's centre (`FilterbankLatency - 1`, 159) plus
 //!   the look-ahead the controller acts in. With every gain at unity the
@@ -76,9 +84,6 @@
 //!
 //! TODO(SPEC), each the most literal reading of the specification or the
 //! measured 25G83 behaviour where the two disagree:
-//! - **Model resistance.** Spec 4.1 puts `R = Rdc + Rpar` in the
-//!   displacement and velocity models; the 25G83 controller signal log
-//!   matches `R = Rdc` (impulse response to 1e-5 relative), so `Rdc` is used.
 //! - **Current model.** The logged current is a second-order filter with
 //!   the physical zeros and `1/Rdc` at DC and Nyquist, but its poles are
 //!   about 0.9 % more damped than the admittance block's
@@ -126,10 +131,22 @@ use crate::{
     FAILSAFE_GAIN, MAX_CHANNELS,
 };
 
-/// Controller update cadence in frames (spec 10: exactly 256).
+/// Controller update cadence in frames at 48 kHz (spec 10: 256). The
+/// cadence is a time, 5.333 ms: 512 frames at 96 kHz (25G83 rig), see
+/// [`controller_frames`].
 pub const CONTROLLER_FRAMES: usize = 256;
-/// Power/thermal substep in frames (spec 6.1).
+/// Power/thermal substep in frames at 48 kHz (spec 6.1: 32, eight per
+/// controller frame).
 pub const SUBSTEP_FRAMES: usize = 32;
+/// Substeps per controller frame.
+pub const SUBSTEPS: usize = CONTROLLER_FRAMES / SUBSTEP_FRAMES;
+
+/// The controller frame at `rate`: 256 frames per 48 kHz, i.e. 5.333 ms.
+pub fn controller_frames(rate: u32) -> usize {
+    let f = libm::round(CONTROLLER_FRAMES as f64 * rate as f64 / 48_000.0) as usize;
+    // whole substeps, at least one frame each
+    (f / SUBSTEPS).max(1) * SUBSTEPS
+}
 /// Filterbank bands.
 pub const BANDS: usize = 5;
 /// Taps of the property-6632 pressure response.
@@ -362,7 +379,7 @@ impl Params {
         if self.filterbank_frames() < 2 || self.latency_frames() > 16384 {
             return Err(InitError::Invalid("latency"));
         }
-        if self.latency_frames() < CONTROLLER_FRAMES {
+        if self.latency_frames() < controller_frames(self.sample_rate) {
             return Err(InitError::Invalid("latency below the controller cadence"));
         }
         if self.enable_mitigation == 0 {
@@ -735,6 +752,9 @@ struct Run {
     look: usize,
     /// A model state went non-finite: the fail-safe is latched until reset.
     fault: bool,
+    /// Controller frame and power substep, frames at this rate.
+    ctl_frames: usize,
+    sub_frames: usize,
     pos: usize,
     sub: usize,
     frame: u64,
@@ -802,7 +822,9 @@ impl Run {
         let half = stage - 1;
         let look = latency - half;
         let dt = 1.0 / rate;
-        let ctl_dt = CONTROLLER_FRAMES as f64 / rate;
+        let ctl_frames = controller_frames(p.sample_rate);
+        let sub_frames = ctl_frames / SUBSTEPS;
+        let ctl_dt = ctl_frames as f64 / rate;
         let mut ch = Vec::with_capacity(n);
         for c in &p.ch[..n] {
             let h = filterbank(rate, &c.band_center_hz, c.bandwidth, stage);
@@ -873,7 +895,7 @@ impl Run {
         }
         let mut p_pole = [0.0; 4];
         let mut budget = [0.0; 4];
-        let sub_dt = SUBSTEP_FRAMES as f64 / rate;
+        let sub_dt = sub_frames as f64 / rate;
         for j in 0..4 {
             p_pole[j] = pole(sub_dt, p.power_time_scale_s[j] as f64);
             let b = if p.runtime_budget_present != 0 { p.runtime_budget_w[j] } else { p.power_hard_limit_w[j] };
@@ -886,6 +908,8 @@ impl Run {
             half,
             look,
             fault: false,
+            ctl_frames,
+            sub_frames,
             pos: 0,
             sub: 0,
             frame: 0,
@@ -1020,7 +1044,7 @@ impl Run {
     /// The 32-frame power substep of every channel.
     fn substep(&mut self) {
         for c in self.ch.iter_mut() {
-            let load = c.sub_acc / SUBSTEP_FRAMES as f64 * c.load_scale;
+            let load = c.sub_acc / self.sub_frames as f64 * c.load_scale;
             c.sub_acc = 0.0;
             let pamp = self.idle + self.ratio * load.max(0.0);
             for j in 0..4 {
@@ -1038,7 +1062,7 @@ impl Run {
             c.pbar1_peak = 0.0;
             // velocity limit from the mask level
             if !c.pressure_rev.is_empty() {
-                let e = 10.0 * libm::log10((c.mask_acc / CONTROLLER_FRAMES as f64).max(1e-30));
+                let e = 10.0 * libm::log10((c.mask_acc / self.ctl_frames as f64).max(1e-30));
                 if !c.mask_init {
                     c.mask_db = e;
                     c.mask_init = true;
@@ -1120,16 +1144,16 @@ impl Run {
                 io.output[src][k] = y;
             }
             self.sub += 1;
-            if self.sub == SUBSTEP_FRAMES {
+            if self.sub == self.sub_frames {
                 self.sub = 0;
                 self.substep();
             }
             self.pos += 1;
             self.frame += 1;
-            if self.pos == CONTROLLER_FRAMES {
+            if self.pos == self.ctl_frames {
                 self.pos = 0;
                 self.control();
-                self.last_frame = self.frame - CONTROLLER_FRAMES as u64;
+                self.last_frame = self.frame - self.ctl_frames as u64;
                 if self.fault {
                     crate::failsafe::fill_from(io, k + 1, FAILSAFE_GAIN);
                     return;
@@ -1280,7 +1304,7 @@ impl ProtectionUnit for Unit {
         }
         let t = gap_or_zero(gap_s);
         let samples = t * rate as f64;
-        let substeps = samples / SUBSTEP_FRAMES as f64;
+        let substeps = samples / run.sub_frames as f64;
         for (i, c) in run.ch.iter_mut().enumerate() {
             let s = &state.node[i];
             // the series nodes cool independently, each with its own constant

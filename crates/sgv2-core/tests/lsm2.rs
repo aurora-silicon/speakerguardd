@@ -392,3 +392,11 @@ fn band_gains_never_raise_any_frequency() {
         }
     }
 }
+
+#[test]
+fn controller_cadence_is_a_time() {
+    // 25G83 rig: 256 frames at 48 kHz, 512 at 96 kHz (5.333 ms)
+    assert_eq!(lsm2::controller_frames(48_000), 256);
+    assert_eq!(lsm2::controller_frames(96_000), 512);
+    assert_eq!(lsm2::controller_frames(44_100), 232);
+}

@@ -637,6 +637,10 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
         }
         let a = |k: u32| get(id::model(id::MANAGER_ADMITTANCE, ty, k));
         let d = |k: u32| get(id::model(id::MANAGER_DISPLACEMENT, ty, k));
+        // TODO(SPEC): with UseGenericModelParameters* = 1 (AID44's Vel-A) the
+        // 25G83 unit takes a "family" set that neither the Vel-A nor the Imp-A
+        // nor the Adm-A fields change (rig law 1). On AID44 it equals the
+        // Vel-A preset values read here; its source on other tunings is open.
         let v = |k: u32| get(id::model(id::MANAGER_VELOCITY, ty, k));
         let th = |k: u32| get(id::thermal(ty, k));
         let ch = |k: u32| get(id::channel(c, k));
