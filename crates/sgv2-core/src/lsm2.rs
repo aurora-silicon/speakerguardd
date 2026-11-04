@@ -131,8 +131,14 @@ pub struct Params {
     pub max_power_attenuation_db: f32,
     pub low_rail_idle_power_w: f32,
     pub low_rail_power_ratio: f32,
-    /// Nonzero when mid/high rails, battery input or CPMS budgets are in use.
+    /// Nonzero when mid/high rails or battery input are in use.
     pub other_power_features: u32,
+    /// Runtime CPMS budgets (property 64008, set by the platform after
+    /// initialisation): when present they replace the four power hard
+    /// limits, a key the platform does not send being 50 W (spec 9.x).
+    /// TODO(SPEC): the Linux source of the value and whether it changes.
+    pub runtime_budget_present: u32,
+    pub runtime_budget_w: [f32; 4],
     pub ch: [ChannelParams; MAX_CHANNELS],
 }
 
@@ -142,7 +148,7 @@ unsafe impl Pod for Params {}
 unsafe impl Pod for ChannelParams {}
 
 const _: () = assert!(core::mem::size_of::<ChannelParams>() == 25 * 4);
-const _: () = assert!(core::mem::size_of::<Params>() == (32 + MAX_CHANNELS * 25) * 4);
+const _: () = assert!(core::mem::size_of::<Params>() == (37 + MAX_CHANNELS * 25) * 4);
 
 impl Default for Params {
     fn default() -> Self {
@@ -170,6 +176,8 @@ impl Default for Params {
             low_rail_idle_power_w: 0.0,
             low_rail_power_ratio: 0.0,
             other_power_features: 0,
+            runtime_budget_present: 0,
+            runtime_budget_w: [0.0; 4],
             ch: [ChannelParams::default(); MAX_CHANNELS],
         }
     }
@@ -209,6 +217,9 @@ impl Params {
             {
                 return Err(InitError::Invalid("power budgets"));
             }
+        }
+        if self.runtime_budget_present != 0 && !self.runtime_budget_w.iter().all(|&v| pos(v)) {
+            return Err(InitError::Invalid("runtime power budgets"));
         }
         if !(nonneg(self.max_power_attenuation_db)
             && nonneg(self.low_rail_idle_power_w)
@@ -394,7 +405,7 @@ impl Run {
             return Err(InitError::Unsupported("system ID or closed-loop temperature"));
         }
         if p.other_power_features != 0 {
-            return Err(InitError::Unsupported("mid/high rail, battery or CPMS power model"));
+            return Err(InitError::Unsupported("mid/high rail or battery power model"));
         }
         if p.power_soft_limit_pct.iter().any(|&v| v != 100.0) {
             return Err(InitError::Unsupported("power soft knee below 100 %"));
@@ -452,7 +463,8 @@ impl Run {
         let mut budget = [0.0; 4];
         for j in 0..4 {
             p_pole[j] = pole(rate, p.power_time_scale_s[j] as f64);
-            budget[j] = p.power_hard_limit_w[j] as f64;
+            budget[j] =
+                if p.runtime_budget_present != 0 { p.runtime_budget_w[j] } else { p.power_hard_limit_w[j] } as f64;
         }
         Ok(Run {
             n,
