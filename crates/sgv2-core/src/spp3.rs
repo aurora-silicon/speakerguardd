@@ -3,8 +3,10 @@
 //! behaviour specification (SPEC-SPP3 sections 3 to 7, 10, 12, 16).
 //!
 //! - **Cadence.** The thermal model and controller update every 256 frames.
-//!   Hosts may call `process` with any frame count; state and audio are
-//!   bit-identical for any slicing.
+//!   Hosts may call `process` with any frame count. As in the reference,
+//!   the output depends on the host slice: each call starts its dezipper at
+//!   the selected target, and the closed loop takes a whole render block's
+//!   telemetry ahead when the call holds it.
 //! - **Audio.** Not delayed (latency 0). `out = in * headroom * g[n] +
 //!   pilot[n]`, `headroom = 1 - 10^(PilotAmplHi_dB/20)` on channels with
 //!   `PilotToneEnabled` (else 1), `g[n]` the group's dezippered gain.
@@ -376,9 +378,13 @@ impl Params {
         {
             return Err(InitError::Invalid("SafeTlim"));
         }
-        // one thermal update: the forward recurrence `1 - dt/tau` goes
-        // negative, and then diverges, below it
+        // the reference's documented minimum for the thermal time constants
+        // (its parameter info gives 0.1 s; the AU accepts less and then
+        // overshoots far above the hard limit at cold start, rig finding
+        // 15), and never below one thermal update (the forward recurrence
+        // `1 - dt/tau` diverges there)
         let dt = THERMAL_FRAMES as f32 / self.sample_rate as f32;
+        let tau_min = TAU_MIN_S.max(dt);
         let mut seen = 0u32;
         for c in &self.ch[..n] {
             if c.source as usize >= n || seen & (1 << c.source) != 0 {
@@ -389,16 +395,16 @@ impl Params {
             {
                 return Err(InitError::Invalid("thermal constants"));
             }
-            if !(c.tau_tvc >= dt && c.tau_tmg >= dt) {
-                return Err(InitError::Invalid("time constant below one thermal update"));
+            if !(c.tau_tvc >= tau_min && c.tau_tmg >= tau_min) {
+                return Err(InitError::Invalid("thermal time constant below 0.1 s"));
             }
             // nonpositive disables the feed-forward candidate (spec 6); NaN
             // or infinity is no setting at all
             if !c.thermal_ff_speedup_factor.is_finite() {
                 return Err(InitError::Invalid("ThermalFFSpeedupFactor"));
             }
-            if c.thermal_ff_speedup_factor > 0.0 && c.thermal_ff_speedup_factor * c.tau_tvc < dt {
-                return Err(InitError::Invalid("feed-forward pole below one thermal update"));
+            if c.thermal_ff_speedup_factor > 0.0 && c.thermal_ff_speedup_factor * c.tau_tvc < tau_min {
+                return Err(InitError::Invalid("feed-forward pole below 0.1 s"));
             }
             if !(c.rampout.is_finite() && c.rampout >= 0.0) {
                 return Err(InitError::Invalid("Rampout"));
@@ -554,6 +560,9 @@ const RATIO_MIN: f64 = 1e-4;
 /// drive meter (rig law (b): Pdrv of a 2 FS sine is that of the clamped
 /// sine; the output never exceeds 1.5 x the gain). The output stays bounded.
 const INPUT_CLAMP: f32 = 1.5;
+/// Shortest accepted thermal time constant (coil, magnet and the
+/// feed-forward pole), s: the reference's documented parameter minimum.
+pub const TAU_MIN_S: f32 = 0.1;
 /// Release hold of the ordinary candidate, s (rig law 5: fixed).
 const HOLD_S: f64 = 1.0;
 /// Dezipper 99 % settling time, s (spec 6).
@@ -1729,6 +1738,13 @@ impl ProtectionUnit for Unit {
         if run.fault {
             failsafe_io(&mut io);
             return Health(Health::FAILSAFE | Health::MODEL_FAULT);
+        }
+        // at the start of every render call both dezipper stages take the
+        // current selected target (rig dezipper law: 1 ulp on every sample
+        // at host slices 128..1024); inside the call they glide per sample
+        for g in run.groups.iter_mut() {
+            g.z1 = g.sel;
+            g.z2 = g.sel;
         }
         let mut health = 0u32;
         let mut off = 0;

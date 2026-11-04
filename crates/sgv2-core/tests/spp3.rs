@@ -125,7 +125,7 @@ fn steady_state_temperature() {
 }
 
 #[test]
-fn host_slicing_does_not_change_anything() {
+fn host_slicing_follows_the_dezipper_snap() {
     let p = params();
     let n = 48_000 * 3;
     let sig: Vec<Vec<f32>> = (0..4)
@@ -157,14 +157,22 @@ fn host_slicing_does_not_change_anything() {
             (0..4).map(|c| (t.channels[c].ol_temp_c, t.channels[c].magnet_temp_c, t.channels[c].gain)).collect();
         (out, (t.frame, state))
     };
-    let (ref_out, ref_t) = render(512);
+    // Each call starts its dezipper at the selected target (rig dezipper
+    // law), so slices that divide the 256-frame update hold the gain
+    // constant per update and all agree; longer slices glide inside the
+    // call and differ, as the reference does.
+    let (ref_out, ref_t) = render(256);
     // the limiter must actually have engaged for this to mean anything
     assert!(ref_t.1[0].2 < 0.999, "{:?}", ref_t);
-    for slice in [1usize, 7, 31, 96, 127, 160, 1024, 4096] {
+    for slice in [1usize, 2, 64, 128] {
         let (o, t) = render(slice);
         assert!(o == ref_out, "audio differs at slice {slice}");
         assert_eq!(t, ref_t, "state differs at slice {slice}");
     }
+    let (o512, _) = render(512);
+    assert!(o512 != ref_out, "a 512-frame call glides inside the call");
+    // and a given slicing is deterministic
+    assert!(render(512).0 == o512);
 }
 
 #[test]
