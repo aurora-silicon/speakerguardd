@@ -471,8 +471,9 @@ pub const THERMAL_FRAMES: usize = 256;
 const PREDICTION_MARGIN: f64 = 1.0;
 /// Hard-path target below the limit, C (spec 6).
 const HARD_TARGET_BELOW: f64 = 5.0;
-/// Clamp of the candidate ratio (spec 6).
-const RATIO_MIN: f64 = 0.01;
+/// Clamp of the candidate ratio (spec 6): 1e-4, a 0.01 linear-gain
+/// (-40 dB) floor, not a 0.1 gain floor.
+const RATIO_MIN: f64 = 1e-4;
 /// Dezipper 99 % settling time, s (spec 6).
 const DEZIPPER_S: f64 = 0.005;
 const MODEL_SCRATCH: usize = 256;
