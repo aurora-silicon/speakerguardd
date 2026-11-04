@@ -95,6 +95,9 @@ pub enum PropValue {
     Other {
         key: String,
         repr: String,
+        /// The value itself, for properties a consumer interprets.
+        #[serde(skip)]
+        value: Value,
     },
 }
 
@@ -149,7 +152,7 @@ impl PropStrip {
                     ("UInt32", o) => return Err(Error::format(&pctx, format!("UInt32 value {o:?}"))),
                     ("Path", Value::String(s)) => PropValue::Path(s.clone()),
                     ("Path", o) => return Err(Error::format(&pctx, format!("Path value is a {}", o.kind()))),
-                    (k, o) => PropValue::Other { key: k.to_string(), repr: format!("{o:?}") },
+                    (k, o) => PropValue::Other { key: k.to_string(), repr: format!("{o:?}"), value: o.clone() },
                 };
                 if properties.iter().any(|q| q.number == number) {
                     return Err(Error::format(&pctx, format!("property {number} set twice")));

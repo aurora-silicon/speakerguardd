@@ -212,6 +212,7 @@ impl Bundle {
             aid,
             macos_build: None,
             machine_model: None,
+            speaker_id: None,
             speaker_thiele_small: None,
             files: Vec::new(),
         };
