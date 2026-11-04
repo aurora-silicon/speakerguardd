@@ -300,10 +300,10 @@ def run_case(c, outroot, force=False):
     try:
         while True:
             a2 = args + (["--pace", str(pace)] if pace else [])
-            p = subprocess.run(a2, env=env, capture_output=True, text=True, cwd=d)
-            open(os.path.join(d, "host.log"), "w").write(p.stdout + p.stderr)
-            if p.returncode:
-                raise RuntimeError(f"{c['name']}: rig_host rc={p.returncode}: {p.stderr[-400:]}")
+            rc, out, err, host_pid = capture.run_host(a2, env, d)
+            open(os.path.join(d, "host.log"), "w").write(out + err)
+            if rc:
+                raise RuntimeError(f"{c['name']}: rig_host rc={rc}: {err[-400:]}")
             if not c.get("clsp"):
                 break
             # every block's controller record must be present, or the timeline has holes
@@ -331,8 +331,8 @@ def run_case(c, outroot, force=False):
     capture.check_host(c["name"], meta, expect_frames)
     decisions = {"closed_loop_channels": [], "open_loop_channels": []}
     if logf:
-        decisions = capture.parse_decisions(open(os.path.join(d, "au.log")).read())
-    meta.update(case=c, aid=aid, wall_s=round(time.time() - t0, 2), pace=pace, runtime_file=runtime_file,
+        decisions = capture.parse_decisions(open(os.path.join(d, "au.log")).read(), host_pid)
+    meta.update(case=c, aid=aid, host_pid=host_pid, wall_s=round(time.time() - t0, 2), pace=pace, runtime_file=runtime_file,
                 cfprops=cfprops, inputs_sha256=key, **decisions)
     if c.get("clsp"):
         cl = decode_clsp(os.path.join(d, "logs"), nch)

@@ -182,12 +182,33 @@ def check_host(name, meta, expect_frames):
         raise RuntimeError(f"{name}: rendered {meta.get('frames')} frames of {expect_frames}")
 
 
-def parse_decisions(text):
-    """spp3's per-channel closed/open-loop decisions from its log messages."""
-    return {"closed_loop_channels": sorted({int(x) for x in re.findall(
-                r"Ch (\d+), Using closed loop parameters", text)}),
-            "open_loop_channels": sorted({int(x) for x in re.findall(
-                r"Ch (\d+), Using open loop kernel", text)})}
+def run_host(args, env, cwd):
+    """Run rig_host; return (returncode, stdout, stderr, pid). The pid selects this run's
+    own unit log messages: `log stream` sees every rig_host on the Mac (other lanes and
+    earlier paced retries of the same case)."""
+    p = subprocess.Popen(args, env=env, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    out, err = p.communicate()
+    return p.returncode, out, err, p.pid
+
+
+_DECISION = re.compile(r"(?:rig_host\[(\d+)[:\]].*?)?Ch (\d+), Using (closed loop parameters|open loop kernel)")
+
+
+def parse_decisions(text, pid=None):
+    """spp3's per-channel closed/open-loop decisions from its log messages, in log order.
+    pid: keep only that process's messages (None keeps every message). Each channel's
+    decisions are kept as a sequence (one per Initialize: a reset or a new instance makes
+    a new one), so a channel that goes closed, open, closed in one run is recorded, not
+    rejected."""
+    seq = {}
+    for line in text.splitlines():
+        m = _DECISION.search(line)
+        if not m or (pid is not None and (m.group(1) is None or int(m.group(1)) != pid)):
+            continue
+        seq.setdefault(int(m.group(2)), []).append(m.group(3).startswith("closed"))
+    return {"closed_loop_channels": sorted(c for c, v in seq.items() if any(v)),
+            "open_loop_channels": sorted(c for c, v in seq.items() if not all(v)),
+            "closed_loop_sequence": {str(c): v for c, v in sorted(seq.items())}}
 
 
 def closed_loop_mode(unit, meta, nchan):
@@ -202,6 +223,17 @@ def closed_loop_mode(unit, meta, nchan):
         ids = [int(p.split("=", 1)[0]) for p in meta.get("case", {}).get("cfprops", [])]
     if SPTS_PROP not in ids and not meta.get("spts"):
         return [False] * nchan
+    seq = meta.get("closed_loop_sequence")
+    if seq is not None:  # captures that record the ordered decisions
+        missing = [ch for ch in range(nchan) if not seq.get(str(ch))]
+        if missing:
+            raise ValueError(f"closed-loop decision not recorded for channels {missing}")
+        # A channel whose decision changed during the run has no single per-slice value
+        # without the frame of each re-decision: the trace records null (not compared) and
+        # the meta keeps the sequence.
+        if any(len(set(seq[str(ch)])) > 1 for ch in range(nchan)):
+            return None
+        return [seq[str(ch)][0] for ch in range(nchan)]
     cl, ol = set(meta.get("closed_loop_channels", [])), set(meta.get("open_loop_channels", []))
     both, neither = cl & ol, set(range(nchan)) - cl - ol
     if both or neither:
@@ -266,10 +298,10 @@ def run_case(c, outroot, force=False):
     try:
         while True:
             a2 = args + (["--pace", str(pace)] if unit == "lsm2" and c.get("logs", True) else [])
-            p = subprocess.run(a2, env=env, capture_output=True, text=True, cwd=d)
-            open(os.path.join(d, "host.log"), "w").write(p.stdout + p.stderr)
-            if p.returncode:
-                raise RuntimeError(f"{c['name']}: rig_host rc={p.returncode}: {p.stderr[-400:]}")
+            rc, out, err, host_pid = run_host(a2, env, d)
+            open(os.path.join(d, "host.log"), "w").write(out + err)
+            if rc:
+                raise RuntimeError(f"{c['name']}: rig_host rc={rc}: {err[-400:]}")
             logs = os.listdir(os.path.join(d, "logs"))
             if not any("OVERWRITE" in f for f in logs):
                 break
@@ -297,8 +329,8 @@ def run_case(c, outroot, force=False):
     decisions = {"closed_loop_channels": [], "open_loop_channels": []}
     aulog = os.path.join(d, "au.log")
     if os.path.exists(aulog):
-        decisions = parse_decisions(open(aulog).read())
-    meta.update(case=c, wall_s=round(time.time() - t0, 2), runtime_file=runtime_file, cfprops=cfprops,
+        decisions = parse_decisions(open(aulog).read(), host_pid)
+    meta.update(case=c, host_pid=host_pid, wall_s=round(time.time() - t0, 2), runtime_file=runtime_file, cfprops=cfprops,
                 inputs_sha256=key, **decisions)
     json.dump(meta, open(os.path.join(d, "run.meta.json"), "w"), indent=1)
     write_trace(d, c, meta)
@@ -457,7 +489,21 @@ def self_test():
     # Closed-loop decisions: a per-channel list.
     text = "\n".join(["x Ch 0, Using closed loop parameters", "x Ch 1, Using open loop kernel"])
     dec = parse_decisions(text)
-    assert dec == {"closed_loop_channels": [0], "open_loop_channels": [1]}, dec
+    assert dec["closed_loop_channels"] == [0] and dec["open_loop_channels"] == [1], dec
+    spts = [{"id": SPTS_PROP}]
+    # only the named process; a channel that goes closed, open, closed is a sequence
+    text2 = "\n".join(["a rig_host[7:1a] [x] Ch 0, Using closed loop parameters r",
+                        "a rig_host[9:1b] [x] Ch 0, Using open loop kernel",
+                        "a rig_host[7:1a] [x] Ch 1, Using closed loop parameters r",
+                        "a rig_host[7:1a] [x] Ch 0, Using open loop kernel",
+                        "a rig_host[7:1a] [x] Ch 1, Using closed loop parameters r",
+                        "a rig_host[7:1a] [x] Ch 0, Using closed loop parameters r"])
+    d7 = parse_decisions(text2, 7)
+    assert d7["closed_loop_sequence"] == {"0": [True, False, True], "1": [True, True]}, d7
+    assert parse_decisions(text2, 9)["closed_loop_sequence"] == {"0": [False]}
+    assert closed_loop_mode("spp3", dict(cfprops=spts, **d7), 2) is None
+    assert closed_loop_mode("spp3", dict(cfprops=spts, closed_loop_sequence={"0": [True], "1": [False]}), 2) == [True, False]
+    raises(ValueError, closed_loop_mode, "spp3", dict(cfprops=spts, closed_loop_sequence={"0": [True]}), 2)
     spts = [{"id": SPTS_PROP}]
     assert closed_loop_mode("spp3", dict(cfprops=spts, **dec), 2) == [True, False]
     raises(ValueError, closed_loop_mode, "spp3", dict(cfprops=spts, **dec), 3)  # channel 2 undecided
