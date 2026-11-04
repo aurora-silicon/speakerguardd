@@ -7,9 +7,12 @@
 //!   may call `process` with any frame count: the unit splits each call at
 //!   its block boundaries, so its state trajectory does not depend on the
 //!   host quantum and no reblocking latency is added.
-//! - **Step 2.** Audio is delayed by the look-ahead
-//!   (`Thermal_LookaheadDelay_ms`, rounded to frames) and the current
-//!   protected gain is applied to the delayed audio.
+//! - **Step 2.** The current protected gain is applied to the audio. The
+//!   look-ahead (`Thermal_LookaheadDelay_ms`, rounded to frames) is in the
+//!   gain/model path, not the audio path: the unit adds no audio delay and
+//!   reports latency 0 (black-box reference: output equals input bit-exactly
+//!   at 0 dB). The model meters the protected drive through the look-ahead
+//!   line, so the first block's power covers `block - look` frames.
 //! - **Step 3.** Modelled dissipated power of the protected drive:
 //!   `p = (ag*x)^2 * Reb_ref / (Reb_ref + Rshunt)^2`, the mean over the block.
 //! - **Step 4.** Coupled two-node thermal model, backward Euler over the
@@ -24,8 +27,13 @@
 //! - **Fail-safe.** A channel-count mismatch, or a non-finite meter value
 //!   (the "simple-meter processing failure"), gives 20 dB for the affected
 //!   frames.
-//! - **Reset.** Temperatures at ambient, unity gain, look-ahead cleared,
-//!   CL temperature reported as 20 degC until measured.
+//! - **Reset.** Thermal state at the parameters' start state, unity gain,
+//!   look-ahead cleared, CL temperature reported as 20 degC until measured.
+//!   The spec's reset state is ambient. The reference unit's default start
+//!   (AU property 64007 unset) is near the limit instead; which one macOS
+//!   uses on a real Mac is TODO(SPEC), so the start rises
+//!   (`initial_theta_vc`/`initial_theta_mg`) are parameters the compiler
+//!   fills.
 //!
 //! TODO(SPEC), each isolated so the rig can pin it, none adding margin:
 //! - the attack/release law. Implemented as a one-pole on the linear gain
@@ -59,6 +67,7 @@
 //! (18), `EnableCPMSClosedLoopControl` (19), `CLThermalFeedbackEnabled`
 //! (part 22). TODO(lane A): confirm the reader exposes these.
 
+use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::blob::{BlobError, Pod};
@@ -71,6 +80,8 @@ use crate::{ChannelState, Health, Io, ProtectionUnit, Telemetry, UnitKind, FAILS
 const T_CL_UNMEASURED: f32 = 20.0;
 /// Denominator floor of the ceiling target (TODO(SPEC): see module docs).
 const EPS: f64 = f32::MIN_POSITIVE as f64;
+/// Meter-path scratch, frames (any size works; the meter is split-invariant).
+const SCRATCH: usize = 256;
 
 /// Per physical channel, in the unit's channel order. Field names follow
 /// the sidecar's keys.
@@ -107,6 +118,10 @@ pub struct ChannelParams {
     /// voltage, from `SpeakerInputDataSourceOrder`.
     pub sense_i: u32,
     pub sense_v: u32,
+    /// Start (and reset) rises over ambient of the coil and magnet, K.
+    /// TODO(SPEC): the reference unit's default start state (property 64007).
+    pub initial_theta_vc: f32,
+    pub initial_theta_mg: f32,
 }
 
 /// The spp3 blob payload.
@@ -132,13 +147,13 @@ pub struct Params {
 }
 
 // SAFETY: repr(C), only u32/f32 fields and an array of a repr(C) struct of
-// u32/f32 fields: 14 + 8 * 21 four-byte words, no padding.
+// u32/f32 fields: 14 + 8 * 23 four-byte words, no padding.
 unsafe impl Pod for Params {}
-// SAFETY: as above, 21 four-byte words.
+// SAFETY: as above, 23 four-byte words.
 unsafe impl Pod for ChannelParams {}
 
-const _: () = assert!(core::mem::size_of::<ChannelParams>() == 21 * 4);
-const _: () = assert!(core::mem::size_of::<Params>() == (14 + MAX_CHANNELS * 21) * 4);
+const _: () = assert!(core::mem::size_of::<ChannelParams>() == 23 * 4);
+const _: () = assert!(core::mem::size_of::<Params>() == (14 + MAX_CHANNELS * 23) * 4);
 
 impl Default for Params {
     fn default() -> Self {
@@ -242,6 +257,10 @@ impl Params {
                 v_pwr_thres: f("VPwrThres")?,
                 sense_i: si,
                 sense_v: sv,
+                // The spec's reset state is ambient (zero rises). TODO(SPEC):
+                // the start state the reference unit uses on a real Mac.
+                initial_theta_vc: t.channel(c, "sgv2.InitialThetaVc").unwrap_or(0.0) as f32,
+                initial_theta_mg: t.channel(c, "sgv2.InitialThetaMg").unwrap_or(0.0) as f32,
             };
         }
         p.validate()?;
@@ -281,6 +300,13 @@ impl Params {
             {
                 return Err(InitError::Invalid("thermal constants"));
             }
+            if !(c.initial_theta_vc.is_finite() && c.initial_theta_mg.is_finite()) {
+                return Err(InitError::Invalid("start state"));
+            }
+            if c.rampout != 0.0 {
+                // TODO(SPEC): Rampout's nonzero behaviour (some AIDs set it).
+                return Err(InitError::Invalid("Rampout"));
+            }
             if !(c.temperature_limit.is_finite() && c.hard_temp_limit_headroom.is_finite()) {
                 return Err(InitError::Invalid("temperature limit"));
             }
@@ -313,7 +339,11 @@ pub fn smooth_coeff(dt: f64, tau: f64) -> f64 {
 }
 
 struct Chan {
+    /// Look-ahead line of the meter path.
     delay: Delay,
+    scratch: alloc::boxed::Box<[f32]>,
+    init_vc: f64,
+    init_mg: f64,
     src: usize,
     group: usize,
     /// ag^2 * Reb_ref / (Reb_ref + Rshunt)^2: watts per FS^2.
@@ -343,6 +373,7 @@ struct Chan {
     hard: bool,
     applied: f32,
     p_meas: f32,
+    vi_power: f64,
 }
 
 impl Chan {
@@ -404,6 +435,18 @@ impl Unit {
         self.run.is_none()
     }
 
+    /// In-phase V/I power of unit channel `c` over the last block, W, with
+    /// the tuning's IMON/VMON scales (NaN without complete sense). For the
+    /// supervisor's plausibility checks; not a macOS meter.
+    pub fn sense_power(&self, c: usize) -> f64 {
+        self.run.as_ref().and_then(|r| r.ch.get(c)).map_or(f64::NAN, |c| c.vi_power)
+    }
+
+    /// The model path's look-ahead, frames (audio is not delayed).
+    pub fn lookahead_frames(&self) -> usize {
+        self.run.as_ref().map_or(0, |r| r.look)
+    }
+
     /// The accepted program-to-sense delay, in frames.
     pub fn sense_delay(&self) -> Option<u32> {
         self.run.as_ref().and_then(|r| r.estimator.delay())
@@ -446,6 +489,7 @@ impl Run {
             let (reb, rs, ag) = (c.reb_ref as f64, c.rshunt as f64, c.ag as f64);
             ch.push(Chan {
                 delay: Delay::new(look),
+                scratch: vec![0.0; SCRATCH].into_boxed_slice(),
                 src: c.source as usize,
                 group: gi,
                 elec: ag * ag * reb / ((reb + rs) * (reb + rs)),
@@ -463,13 +507,16 @@ impl Run {
                 acc_i: dsp::LaneAcc::new(),
                 acc_v: dsp::LaneAcc::new(),
                 acc_vi: dsp::LaneAcc::new(),
-                theta_vc: 0.0,
-                theta_mg: 0.0,
+                init_vc: c.initial_theta_vc as f64,
+                init_mg: c.initial_theta_mg as f64,
+                theta_vc: c.initial_theta_vc as f64,
+                theta_mg: c.initial_theta_mg as f64,
                 p_model: 0.0,
                 g_target: 1.0,
                 hard: false,
                 applied: 1.0,
-                p_meas: f32::NAN,
+                p_meas: 0.0,
+                vi_power: f64::NAN,
             });
         }
         let mut sums = BlockSums::default();
@@ -497,13 +544,14 @@ impl Run {
         for c in self.ch.iter_mut() {
             c.delay.clear();
             c.clear_acc();
-            c.theta_vc = 0.0;
-            c.theta_mg = 0.0;
+            c.theta_vc = c.init_vc;
+            c.theta_mg = c.init_mg;
             c.p_model = 0.0;
             c.g_target = 1.0;
             c.hard = false;
             c.applied = 1.0;
-            c.p_meas = f32::NAN;
+            c.p_meas = 0.0;
+            c.vi_power = f64::NAN;
         }
         self.group_gain = [1.0; MAX_CHANNELS];
         self.pos = 0;
@@ -532,19 +580,28 @@ impl Run {
                 }
             }
             c.acc_in = acc;
-            // SAFETY: `inp` and `out` are distinct slices of `len` samples.
-            unsafe { c.delay.run(inp.as_ptr(), out.as_mut_ptr(), len) };
-            let mut g = c.applied;
+            let g = c.applied;
+            dsp::scale_to(inp, g, out);
             if dsp::peak_abs(out) == f32::INFINITY {
-                // Meter failure on these frames: 20 dB, and the model sees
-                // the drive that actually leaves (non-finite samples muted).
+                // Meter failure on these frames: at most 20 dB below the
+                // input, and the model sees the drive that actually leaves
+                // (non-finite samples muted).
                 dsp::sanitize(out);
-                g = g.min(FAILSAFE_GAIN);
+                if g > FAILSAFE_GAIN {
+                    dsp::scale_in_place(out, FAILSAFE_GAIN / g);
+                }
                 *health |= Health::FAILSAFE;
             }
-            dsp::scale_in_place(out, g);
-            // the protected drive, exactly as it leaves
-            c.acc_out.add_sq(out, phase);
+            // The protected drive, metered through the look-ahead line in
+            // chunks of the scratch buffer.
+            let mut k = 0;
+            while k < len {
+                let m = (len - k).min(c.scratch.len());
+                // SAFETY: `out[k..k+m]` and `scratch[..m]` are distinct and hold `m` samples.
+                unsafe { c.delay.run(out.as_ptr().add(k), c.scratch.as_mut_ptr(), m) };
+                c.acc_out.add_sq(&c.scratch[..m], phase + k);
+                k += m;
+            }
         }
         // Sense statistics over the same frames.
         let sense = io.sense;
@@ -624,10 +681,12 @@ impl Run {
             // Measured in-phase V/I power, reported only (the closed loop
             // is off). TODO(SPEC): whether the meter is mean(i^2)*Rdc or
             // the in-phase product.
-            c.p_meas = match c.sense {
-                Some(_) if complete => (c.acc_vi.total() * c.vi_scale / blk) as f32,
-                _ => f32::NAN,
-            };
+            // Without a calibration overlay the reference unit ignores
+            // telemetry and meters 0 W; this release has no calibration
+            // path, so it meters 0 W too. The in-phase V/I power stays
+            // available through `sense_power`.
+            c.p_meas = 0.0;
+            c.vi_power = if c.sense.is_some() && complete { c.acc_vi.total() * c.vi_scale / blk } else { f64::NAN };
             c.clear_acc();
         }
         self.sense_ok = complete;
@@ -643,7 +702,8 @@ impl ProtectionUnit for Unit {
     }
 
     fn latency_frames(&self) -> u32 {
-        self.run.as_ref().map_or(0, |r| r.look as u32)
+        // The look-ahead is in the model path; audio is not delayed.
+        0
     }
 
     fn process(&mut self, mut io: Io<'_, '_>) -> Health {

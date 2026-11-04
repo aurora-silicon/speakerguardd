@@ -47,6 +47,8 @@ fn params() -> Params {
             v_pwr_thres: 0.0,
             sense_i: 2 * c as u32,
             sense_v: 2 * c as u32 + 1,
+            initial_theta_vc: 0.0,
+            initial_theta_mg: 0.0,
         };
     }
     p
@@ -84,7 +86,8 @@ fn power_topology_and_first_block() {
     let p = params();
     let mut u = spp3::Unit::new(p);
     assert!(!u.is_failsafe());
-    assert_eq!(u.latency_frames(), 72); // 1.5 ms at 48 kHz
+    // the look-ahead (1.5 ms = 72 frames) is in the model path only
+    assert_eq!(u.latency_frames(), 0);
     let (t, _) = drive(&mut u, [0.1; 4], BLOCK as f64 / RATE as f64, 512);
     // first block: look-ahead fill, so only BLOCK-72 frames of drive
     let want = elec(&p, 0) * 0.01 * (BLOCK - 72) as f64 / BLOCK as f64;
@@ -229,20 +232,42 @@ fn host_slicing_does_not_change_anything() {
 }
 
 #[test]
-fn lookahead_delays_an_impulse() {
+fn audio_is_not_delayed_and_unity_is_bit_exact() {
     let p = params();
     let mut u = spp3::Unit::new(p);
     let mut x = vec![0.0f32; 512];
     x[10] = 0.25;
+    x[11] = -0.123_456_79;
     let ins: Vec<&[f32]> = (0..4).map(|_| &x[..]).collect();
     let mut ob = vec![vec![0.0f32; 512]; 4];
     let mut outs: Vec<&mut [f32]> = ob.iter_mut().map(|b| &mut b[..]).collect();
     u.process(Io { frames: 512, input: &ins, sense: &[], output: &mut outs });
     for o in &ob {
-        let k = o.iter().position(|&v| v != 0.0).unwrap();
-        assert_eq!(k, 10 + 72);
-        assert_eq!(o[k], 0.25);
+        assert_eq!(o, &x);
     }
+}
+
+#[test]
+fn start_state_is_a_parameter() {
+    let mut p = params();
+    p.ch[0].initial_theta_vc = 70.0;
+    p.ch[0].initial_theta_mg = 30.0;
+    let mut u = spp3::Unit::new(p);
+    let (t, _) = drive(&mut u, [0.0; 4], BLOCK as f64 / RATE as f64, 512);
+    let dt = BLOCK as f64 / RATE as f64;
+    let a_vc = dt / (p.ch[0].tau_tvc as f64 + dt);
+    let want = 40.0 + 70.0 + a_vc * (30.0 - 70.0);
+    assert!((t.channels[0].ol_temp_c as f64 - want).abs() < 1e-3);
+    u.reset();
+    let (t, _) = drive(&mut u, [0.0; 4], BLOCK as f64 / RATE as f64, 512);
+    assert!((t.channels[0].ol_temp_c as f64 - want).abs() < 1e-3);
+}
+
+#[test]
+fn nonzero_rampout_is_refused() {
+    let mut p = params();
+    p.ch[3].rampout = 0.02;
+    assert!(spp3::Unit::new(p).is_failsafe());
 }
 
 #[test]
@@ -328,8 +353,10 @@ fn measured_power_and_sense_geometry() {
     assert_eq!(h, Health::OK);
     let mut t = Telemetry::new();
     u.telemetry(&mut t);
+    // the published meter reads 0 W without a calibration overlay
+    assert_eq!(t.channels[0].measured_power_w, 0.0);
     let want = 0.05 * 2.0 * 0.2 * 12.0;
-    assert!((t.channels[0].measured_power_w - want).abs() < 1e-6);
+    assert!((u.sense_power(0) - want).abs() < 1e-6);
     // too few sense ports: open loop, never fail-safe
     let mut outs: Vec<&mut [f32]> = ob.iter_mut().map(|b| &mut b[..]).collect();
     let h = u.process(Io { frames: 512, input: &ins, sense: &sense[..3], output: &mut outs });
