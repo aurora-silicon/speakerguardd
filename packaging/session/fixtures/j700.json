@@ -1,0 +1,80 @@
+{
+ "note": "MacBook Neo (J700): the sound node of arch/arm64/boot/dts/apple/t8140-j700.dts (public): one MAX98360A node for the stereo pair on the AOP speaker back-end, and the jack. Tuning lanes: the structure of the graph's input lanes only, with generic box names and no tuning values.",
+ "hw": {
+  "board": "j700",
+  "compatible": [
+   "apple,j700",
+   "apple,t8140",
+   "apple,arm-platform"
+  ],
+  "sound": "sound",
+  "model": "MacBook Neo J700",
+  "links": [
+   {
+    "name": "Headphone Jack",
+    "cpus": 1,
+    "codecs": [
+     {
+      "node": "soc/i2c/codec@48",
+      "prefix": "Jack",
+      "compatible": [
+       "cirrus,cs42l83"
+      ]
+     }
+    ]
+   },
+   {
+    "name": "Speaker",
+    "cpus": 1,
+    "codecs": [
+     {
+      "node": "audio-amplifier",
+      "prefix": "Speaker",
+      "compatible": [
+       "maxim,max98360a"
+      ]
+     }
+    ]
+   }
+  ]
+ },
+ "tuning": {
+  "tuning": {
+   "aid": "synthetic",
+   "protection": {
+    "kind": "lsm2",
+    "strip_properties": [],
+    "lanes": [
+     {
+      "origin": {
+       "node": "in",
+       "port": 0,
+       "channel": 0
+      },
+      "hops": [
+       {
+        "join": "Split",
+        "input": 0,
+        "channel": 0
+       }
+      ]
+     },
+     {
+      "origin": {
+       "node": "in",
+       "port": 0,
+       "channel": 1
+      },
+      "hops": [
+       {
+        "join": "Split",
+        "input": 1,
+        "channel": 1
+       }
+      ]
+     }
+    ]
+   }
+  }
+ }
+}

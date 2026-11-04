@@ -243,11 +243,142 @@ class SenseCheck(unittest.TestCase):
         errs = self.run_check(self.w, truth)
         self.assertTrue(any("Right Tweeter ISENSE" in e for e in errs), errs)
 
+    def test_j616s_aop_sense_check(self):
+        f = fx("j616")
+        w = wiring.derive(f["hw"], f["tuning"])
+        truth = {}
+        for p, a in enumerate(w["amps"]):
+            truth[(a["prefix"], "I")] = 2 * p
+            truth[(a["prefix"], "V")] = 2 * p + 1
+        self.assertEqual(self.run_check(w, truth), [])
+        old = {k: v for k, v in MACHINES["j616"].items() if k != "sense_pairs"}
+        eff, _ = wiring.apply_override(w, old)
+        self.assertEqual(len(self.run_check(eff, truth)), 12)
+
     def test_classifier_on_the_b6_captures(self):
         # live 49-82 distinct values, V off 2-3, I off 1 (B6, J316 and J413)
         self.assertEqual(sgsc.classify({"ch": [{"distinct": 49}, {"distinct": 2}, {"distinct": 3}, {"distinct": 1}]}),
                          ["live", "quiet", "quiet", "quiet"])
         self.assertEqual(sgsc.classify({"ch": [{"distinct": 9}]}), ["unclear"])
+
+
+def fake_dt(root, hw, jack_card=False):
+    """A /proc/device-tree in miniature from a fixture's hardware
+    description: the root compatible, a back-end node per link (one
+    #sound-dai-cells, as the MCA and AOP have), every codec node with its
+    properties and phandle, and the macaudio card(s)."""
+    ph = [0x100]
+
+    def node(path, props):
+        os.makedirs(os.path.join(root, path), exist_ok=True)
+        for k, v in props.items():
+            with open(os.path.join(root, path, k), "wb") as f:
+                f.write(v)
+        ph[0] += 1
+        with open(os.path.join(root, path, "phandle"), "wb") as f:
+            f.write(ph[0].to_bytes(4, "big"))
+        return ph[0]
+
+    def strs(*xs):
+        return b"".join(x.encode() + b"\0" for x in xs)
+
+    def u32(*xs):
+        return b"".join(x.to_bytes(4, "big") for x in xs)
+
+    with open(os.path.join(root, "compatible"), "wb") as f:
+        f.write(strs(*hw["compatible"]))
+    be = node("soc/backend", {"#sound-dai-cells": u32(1)})
+
+    def card(name, links, model):
+        node(name, {"compatible": strs("apple,test-macaudio", "apple,macaudio"), "model": strs(model)})
+        for i, l in enumerate(links):
+            d = f"{name}/dai-link@{i}"
+            node(d, {"link-name": strs(l["name"])})
+            node(d + "/cpu", {"sound-dai": u32(*[w for b in range(l["cpus"]) for w in (be, b)])})
+            phs = []
+            for c in l["codecs"]:
+                props = {"sound-name-prefix": strs(c["prefix"]), "compatible": strs(*c["compatible"]), "#sound-dai-cells": u32(0)}
+                for k in ("vmon", "imon"):
+                    if k in c:
+                        props[f"ti,{k}-slot-no"] = u32(c[k])
+                phs.append(node(c["node"], props))
+            node(d + "/codec", {"sound-dai": u32(*phs)})
+
+    card("sound", hw["links"], hw["model"])
+    if jack_card:
+        jack = {"name": "Headphone Jack", "cpus": 1, "codecs": [{"node": "soc/jack", "prefix": "Jack", "compatible": ["cirrus,cs42l84"]}]}
+        card("sound-jack", [jack], hw["model"] + " Jack")
+
+
+class DeviceTree(unittest.TestCase):
+    def test_read_dt_on_the_aop_and_max98360a_layouts(self):
+        import tempfile
+
+        for m, jack in (("j616", True), ("j700", False), ("j316", False)):
+            want = fx(m)["hw"]
+            with tempfile.TemporaryDirectory() as d:
+                fake_dt(d, want, jack_card=jack)
+                got = wiring.read_dt(d, sysfs=os.path.join(d, "nosysfs"))
+            self.assertEqual(got["board"], want["board"], m)
+            self.assertEqual(got["sound"], "sound", m)
+            strip = lambda links: [[{k: v for k, v in c.items() if k not in ("node", "i2c")} for c in l["codecs"]] + [l["name"], l["cpus"]] for l in links]
+            self.assertEqual(strip(got["links"]), strip(want["links"]), m)
+            self.assertEqual(wiring.hardware(got), wiring.hardware({**want, "links": [
+                {**l, "codecs": [{k: v for k, v in c.items() if k != "i2c"} for c in l["codecs"]]} for l in want["links"]]}), m)
+
+    def test_two_speaker_cards_are_ambiguous(self):
+        import tempfile
+
+        hw = fx("j616")["hw"]
+        with tempfile.TemporaryDirectory() as d:
+            import shutil
+
+            fake_dt(d, hw)
+            shutil.copytree(os.path.join(d, "sound"), os.path.join(d, "sound2"))
+            with self.assertRaises(wiring.Refused):
+                wiring.read_dt(d, sysfs=os.path.join(d, "nosysfs"))
+
+
+class AopAndJ700(unittest.TestCase):
+    def test_j616s_derives_iv_and_the_old_hand_map_is_refused(self):
+        f = fx("j616")
+        w = wiring.derive(f["hw"], f["tuning"])
+        self.assertEqual(w["unit_channels"], [0, 1, 2, 3, 4, 5])
+        # the amps' own TX slots: ISNS below VSNS, passed through by the AOP ring
+        self.assertEqual([s["kind"] for s in w["sense"]], ["I", "V"] * 6)
+        self.assertEqual((w["unit_channels"], w["sense_ports"]), gen.channel_map("j616", MACHINES["j616"]))
+        # the template before 2c16d1c: no sense_pairs, so [V, I]
+        old = {k: v for k, v in MACHINES["j616"].items() if k != "sense_pairs"}
+        _, dis = wiring.apply_override(w, old)
+        self.assertTrue(any("sense_ports" in d for d in dis), dis)
+        with self.assertRaises(SystemExit):
+            gen.wiring_for("j616", old)
+
+    def test_j700_stereo_pair_from_one_node(self):
+        f = fx("j700")
+        w = wiring.derive(f["hw"], f["tuning"])
+        self.assertEqual([(a["prefix"], a["slot"], a["side"]) for a in w["amps"]], [("Speaker L", 0, "L"), ("Speaker R", 1, "R")])
+        self.assertTrue(all(a["by_strap"] for a in w["amps"]))
+        self.assertEqual((w["unit_channels"], w["sense"]), ([0, 1], []))
+        bad = dict(MACHINES["j700"], unit_channels=[1, 0])
+        eff, dis = wiring.apply_override(w, bad)
+        self.assertTrue(dis)
+        self.assertEqual(len(wiring.role_errors(eff, wiring.roles(f["tuning"])["channels"])), 2)
+
+    def test_j700_check_is_static(self):
+        f = fx("j700")
+        w = wiring.derive(f["hw"], f["tuning"])
+        saved = sgsc.pcm_ids
+        sgsc.pcm_ids = lambda idx: {("Primary", "p"): 0, ("Secondary", "p"): 1, ("Speaker Sense", "c"): 2}
+        try:
+            report = {}
+            self.assertEqual(sgsc.static(0, w, report), [])
+            self.assertIn("SD_MODE", report["static"])
+            sgsc.pcm_ids = lambda idx: {("Primary", "p"): 0}
+            with self.assertRaises(wiring.Refused):
+                sgsc.static(0, w, {})
+        finally:
+            sgsc.pcm_ids = saved
 
 
 class Record(unittest.TestCase):

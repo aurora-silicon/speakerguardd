@@ -13,7 +13,7 @@ hand-written template and with nobody at the machine.
 | Kernel driver | no | A `macaudio` match entry and a device tree for the board. |
 | Tuning | yes | The installer collects the Mac's tuning bundle. |
 | Parameter blob | partly | The compiler has a table of boards, so a new board needs an entry. |
-| Channel map and V/I order | yes | Derived from the device tree and the tuning, then checked by the self-check. |
+| Channel map and V/I order | yes | Derived from the device tree and the tuning, then checked by the self-check (MCA and AOP paths; the J700 is derived but cannot be proven silently). |
 | PipeWire and WirePlumber files | yes | Generated from the self-check's record. |
 | Supervisor | yes, for SN012776 amps | Takes its machine description from the self-check's record. |
 | LV2 plugin variant | 2, 4 or 6 amps | Any other amp count needs a new variant. |
@@ -54,8 +54,12 @@ The following works with no code change.
 - The v2 ownership interface ("Speaker Protection"), the floor and the
   quiet refusals. All of these are generic across macaudio boards.
 
-The AOP speaker path (J614s, J616s, J713) and the J700's MAX98360A path are
-not derived yet. Section 5 says why.
+The same holds on the AOP speaker path (J616s, J713): the firmware runs the
+serializer, but macaudio still gives each amp its slot, the amps sit on I2C
+with their own V/I slots, and the AOP sense ring passes the amps' TX slots
+through unchanged. The J700's MAX98360A pair is one device-tree node with
+no side: it is derived as left on slot 0 and right on slot 1, the frame
+order each amp's SD_MODE strap selects from.
 
 ## 3. Tuning collection
 
@@ -91,8 +95,9 @@ supervisor, while the kernel holds the speakers at the floor.
    says why. Examples: an amp with no prefix, two amps with the same side,
    role and ordinal, a slot that leaves gaps, or a tuning that sets
    `SpeakerInputDataSourceOrder`. A `machines.json` entry is only an
-   optional override, and any disagreement with the derivation fails the
-   check.
+   optional override. It states a whole map, with gen.py's defaults
+   (identity order, `vi` pairs), and any disagreement with the derivation
+   fails the check. An entry with `"wiring": "derive"` states no map.
 2. **Check the map against the tuning.** Each physical channel's amp, by its
    device-tree side and role, must be the speaker its unit channel models.
 3. **Check the map against the hardware, silently.** Every sample of the
@@ -133,15 +138,22 @@ For a board with no `machines.json` entry:
 The check takes about 13 s on the J316 (13 captures of 0.4 s) and about 8 s
 on the J413. A boot that has a valid record only checks the binding.
 
-## 5. What is not derived yet
+## 5. What the check can and cannot prove per path
 
-- **J614s, J616s, J713 (the AOP speaker path) and J700 (MAX98360A).** These
-  boards keep their `machines.json` hand maps, and the record marks them
-  `method=hand` (unproven), as they were before the self-check.
-  - The J616s's device-tree layout and AOP sense ring have not been run
-    through the derivation.
-  - The J700 has no V/I. Its silent check would be a test on the
-    SpeakerTap, which does not exist yet.
+- **MCA Macs (J316, J413) and the AOP path (J616s; J713 by the same
+  driver):** derived and proven: regmap slots and the switch test
+  (`method=derived`). On the J616s the derivation gives `[I, V]` per amp
+  from the device tree alone; the template before 2c16d1c (`vi` by default)
+  now fails the check. Its silent switch run on the hardware is still to
+  do.
+- **J700 (MAX98360A, no V/I):** derived, not proven (`method=derived-static`).
+  It has no amp registers and no sense, and each amp's side is its SD_MODE
+  strap, which no software can read. A zero-sample stream shows nothing.
+  The SpeakerTap returns the words on the wire, so a marker on it could
+  prove the PCM-to-frame order (not the strap), but only with non-zero
+  samples. That is not done without an explicit OK.
+- **Fallback:** a board the derivation refuses but `machines.json` names
+  keeps its hand map, marked `method=hand` (unproven).
 - **The voicing graph.** The WirePlumber file still points at the interim
   asahi-audio graph for the machine. A new board has no such graph, so its
   protect stage runs, but nothing feeds it until the voicing is generated

@@ -444,7 +444,7 @@ def derive_live(args):
         dump = wiring.tuning_dump(args.tuning, args.tuning_cli)
         units = wiring.roles(dump)["channels"]
         w = wiring.derive(hw, dump)
-        w["method"] = "derived"
+        w["method"] = "derived" if w["sense"] else "derived-static"
     except wiring.Refused as e:
         if not entry:
             raise
@@ -459,8 +459,9 @@ def derive_live(args):
     errs = []
     if entry:
         w["key"] = key
+        method = w["method"]
         w, dis = wiring.apply_override(w, entry)
-        w["method"] = "derived"
+        w["method"] = method
         errs += dis
     errs += wiring.role_errors(w, units)
     return hw, w, errs
@@ -495,7 +496,9 @@ def cmd_run(args):
             return 0
         idx, card = find_card(hw)
         rec["card"] = card
-        if w["method"] == "derived":
+        if w["method"] == "derived-static":
+            errs += static(idx, w, report)
+        elif w["method"] == "derived":
             try:
                 errs += active(idx, card, w, report)
             finally:
@@ -524,6 +527,21 @@ def cmd_run(args):
     return 0
 
 
+def static(idx, w, report):
+    """A board without V/I sense (the J700's MAX98360As): no register and
+    no sense to read, so nothing about its channel order is observable
+    with zero samples. The map is the device tree's and the tuning's, and
+    the record says "derived-static". Only the PCM is checked."""
+    ids = pcm_ids(idx)
+    if ids.get(("Secondary", "p")) != 1:
+        raise wiring.Refused(f"the speaker PCM is {ids.get(('Secondary', 'p'))}; the graph expects 1")
+    report["static"] = (
+        "no V/I sense and no amp registers: the channel order is derived from the device tree and the tuning, "
+        "and each amp's side is its SD_MODE strap, which no software can read"
+    )
+    return []
+
+
 def active(idx, card, w, report):
     """The hardware half: registers, then the silent switch test."""
     errs = []
@@ -546,8 +564,6 @@ def active(idx, card, w, report):
     reg_errs, regs = check_registers(w)
     errs += reg_errs
     report["registers"] = regs
-    if not w["sense"]:
-        return errs + ["no V/I sense on this board: the silent sense check does not apply yet"]
     mux = "Speaker Playback Mux"
     old_mux = None
     ctl = None

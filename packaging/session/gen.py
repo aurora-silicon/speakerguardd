@@ -6,10 +6,10 @@
 
 The channel map of each machine is derived (wiring.py) from its device tree
 and its tuning's graph, recorded in fixtures/<machine>.json. A machines.json
-entry's unit_channels and sense_pairs are an optional override, and where
-they exist the derivation must agree, or nothing is generated. A machine
-with no fixture uses its hand map (J616s, J700: the AOP and MAX98360A
-paths are not derived yet). On a Mac with no entry at all,
+entry states a hand map (unit_channels, default the identity; sense_pairs,
+default "vi"; none with "wiring": "derive"), and the derivation must agree,
+or nothing is generated. A machine with no fixture uses its hand map. On a
+Mac with no entry at all,
 speakerguardd-selfcheck derives the map live and generates the files.
 
 The graph, per machine (machines.json):

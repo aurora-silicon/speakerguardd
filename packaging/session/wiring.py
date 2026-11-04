@@ -24,6 +24,10 @@ Both come from two independent sources, and nothing is written by hand.
   PCM channel c is TDM slot c (the front-end's mask is every slot).
 - Each amp's `sound-name-prefix` ("Left Woofer 2", "Right Tweeter") gives
   its side, role and ordinal.
+- A lone speaker codec with no side (one node for a stereo pair, the
+  J700's MAX98360As) is two amps, left on slot 0 and right on slot 1: each
+  amp takes its half of the frame by its SD_MODE strap, which no software
+  can observe, so that half of the map rests on the frame convention.
 - Each V/I amp's `ti,vmon-slot-no` / `ti,imon-slot-no` are its sense TX
   slots. The TAS2764/SN012776 and TAS2770 TX slots are 8 bits wide and the
   sense PCM's channels are 16-bit slots, so sense PCM channel = slot / 2.
@@ -42,9 +46,10 @@ Anything missing, unknown or ambiguous is refused with a message saying
 what, never guessed. The self-check (speakerguardd-selfcheck) then proves
 the hardware half on the running Mac, silently.
 
-machines.json is an optional override: an entry's unit_channels and
-sense_pairs ("vi" | "iv"), where present, replace the derived ones, and
-`disagreements()` lists every place the two differ.
+machines.json is an optional override: an entry states a whole hand map
+(unit_channels, default the identity; sense_pairs "vi" | "iv", default
+"vi"), and `disagreements()` lists every place it and the derivation
+differ. An entry with `"wiring": "derive"` states no map.
 """
 import hashlib
 import json
@@ -151,20 +156,7 @@ def _i2c_name(node, sysfs="/sys/bus/i2c/devices"):
     return None
 
 
-def read_dt(root="/proc/device-tree", sysfs="/sys/bus/i2c/devices"):
-    """The hardware description of the running Mac, from its device tree."""
-    root = os.path.realpath(root)
-    compatible = _strs(_read(os.path.join(root, "compatible")))
-    snd = None
-    for d in sorted(os.listdir(root)):
-        p = os.path.join(root, d)
-        if os.path.isdir(p) and os.path.exists(os.path.join(p, "compatible")):
-            if "apple,macaudio" in _strs(_read(os.path.join(p, "compatible"))):
-                snd = p
-                break
-    if snd is None:
-        raise Refused("the device tree has no apple,macaudio sound node")
-    phandles = _phandles(root)
+def _links(snd, root, phandles, sysfs):
     links = []
     for d in sorted(os.listdir(snd)):
         p = os.path.join(snd, d)
@@ -191,6 +183,32 @@ def read_dt(root="/proc/device-tree", sysfs="/sys/bus/i2c/devices"):
                 c["i2c"] = i2c
             codecs.append(c)
         links.append({"name": _str(_read(os.path.join(p, "link-name"))), "cpus": len(cpu), "codecs": codecs})
+    return links
+
+
+def read_dt(root="/proc/device-tree", sysfs="/sys/bus/i2c/devices"):
+    """The hardware description of the running Mac, from its device tree:
+    the apple,macaudio card that has the speaker link (the J614s/J616s/J713
+    also have a jack-only macaudio card)."""
+    root = os.path.realpath(root)
+    compatible = _strs(_read(os.path.join(root, "compatible")))
+    phandles = _phandles(root)
+    found = []
+    for d in sorted(os.listdir(root)):
+        p = os.path.join(root, d)
+        if not (os.path.isdir(p) and os.path.exists(os.path.join(p, "compatible"))):
+            continue
+        if "apple,macaudio" not in _strs(_read(os.path.join(p, "compatible"))):
+            continue
+        status = os.path.join(p, "status")
+        if os.path.exists(status) and _str(_read(status)) not in ("okay", "ok"):
+            continue
+        links = _links(p, root, phandles, sysfs)
+        if any(l["name"] in ("Speaker", "Speakers") for l in links):
+            found.append((p, links))
+    if len(found) != 1:
+        raise Refused(f"{len(found)} apple,macaudio cards with a speaker link in the device tree (want 1)")
+    snd, links = found[0]
     model = os.path.join(snd, "model")
     return {
         "board": board_of(compatible),
@@ -261,6 +279,20 @@ def hardware(hw):
         amps.append(a)
     if len(families) != 1:
         raise Refused(f"mixed amp families on the speaker link: {sorted(f[0] for f in families)}")
+    if len(amps) == 1 and amps[0]["side"] is None:
+        # One device-tree node for a stereo pair (the J700's MAX98360As):
+        # macaudio gives a lone speaker codec two channels, and each amp
+        # takes its frame half by its SD_MODE strap, left on slot 0 and
+        # right on slot 1 (the I2S/DSP_A frame order). Nothing in software
+        # can observe the strap: this half of the map is the frame
+        # convention, and the record says so.
+        if next(iter(families))[1]:
+            raise Refused(f"amp {amps[0]['prefix']} has V/I sense but names no side")
+        one = amps[0]
+        amps = [
+            dict(one, prefix=f"{one['prefix']} {side}", side=side, slot=slot, by_strap=True)
+            for slot, side in ((0, "L"), (1, "R"))
+        ]
     order = sorted(range(len(amps)), key=lambda i: amps[i]["slot"])
     amps = [amps[i] for i in order]
     if [a["slot"] for a in amps] != list(range(len(amps))):
@@ -390,30 +422,32 @@ def sense_ports_from_pairs(unit, pairs, amps):
 
 def apply_override(w, entry):
     """The wiring with a machines.json entry's hand map applied, and the
-    list of every place the hand map and the derivation disagree."""
+    list of every place the hand map and the derivation disagree.
+
+    An entry states a whole map, with the defaults gen.py has always used:
+    unit_channels the identity, sense_pairs "vi". (The J616s template said
+    nothing, so it said [V, I], and that was wrong.) An entry with
+    `"wiring": "derive"` states none, and the derivation stands alone."""
+    if entry.get("wiring") == "derive":
+        out = json.loads(json.dumps(w))
+        out["override"] = []
+        return out, []
     out = json.loads(json.dumps(w))
     n = len(w["amps"])
-    unit = entry.get("unit_channels")
-    if unit is not None:
-        if sorted(unit) != list(range(n)):
-            raise Refused(f"override unit_channels {unit} is not a permutation of {n} channels")
-        out["unit_channels"] = list(unit)
-        for a, u in zip(out["amps"], unit):
-            a["unit"] = u
-    if "sense_pairs" in entry and w["sense"]:
-        ports = sense_ports_from_pairs(out["unit_channels"], entry["sense_pairs"], n)
-    elif w["sense"]:
-        # the derived sense layout, through the (possibly overridden) unit order
-        ports = [2 * out["unit_channels"][s["amp"]] + (0 if s["kind"] == "V" else 1) for s in w["sense"]]
-    else:
-        ports = []
+    unit = entry.get("unit_channels", list(range(n)))
+    if sorted(unit) != list(range(n)):
+        raise Refused(f"override unit_channels {unit} is not a permutation of {n} channels")
+    out["unit_channels"] = list(unit)
+    for a, u in zip(out["amps"], unit):
+        a["unit"] = u
+    ports = sense_ports_from_pairs(out["unit_channels"], entry.get("sense_pairs", "vi"), n) if w["sense"] else []
     out["sense_ports"] = ports
     for s, port in zip(out["sense"], ports):
         s["port"] = port
-        # what the override claims each sense channel carries
+        # what the hand map claims each sense channel carries
         s["amp"] = out["unit_channels"].index(port // 2)
         s["kind"] = "V" if port % 2 == 0 else "I"
-    out["override"] = sorted(k for k in ("unit_channels", "sense_pairs") if k in entry)
+    out["override"] = sorted(k for k in ("unit_channels", "sense_pairs") if k in entry) or ["defaults"]
     out["hash"] = wiring_hash(out)
     return out, disagreements(w, out)
 
