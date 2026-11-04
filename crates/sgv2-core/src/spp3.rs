@@ -3,8 +3,10 @@
 //! behaviour specification (SPEC-SPP3 sections 3 to 7, 10, 12, 16).
 //!
 //! - **Cadence.** The thermal model and controller update every 256 frames.
-//!   Hosts may call `process` with any frame count; state and audio are
-//!   bit-identical for any slicing.
+//!   Hosts may call `process` with any frame count. As in the reference,
+//!   the output depends on the host slice: each call starts its dezipper at
+//!   the selected target, and the closed loop takes a whole render block's
+//!   telemetry ahead when the call holds it.
 //! - **Audio.** Not delayed (latency 0). `out = in * headroom * g[n] +
 //!   pilot[n]`, `headroom = 1 - 10^(PilotAmplHi_dB/20)` on channels with
 //!   `PilotToneEnabled` (else 1), `g[n]` the group's dezippered gain.
@@ -1650,6 +1652,13 @@ impl ProtectionUnit for Unit {
         if run.fault {
             failsafe_io(&mut io);
             return Health(Health::FAILSAFE | Health::MODEL_FAULT);
+        }
+        // at the start of every render call both dezipper stages take the
+        // current selected target (rig dezipper law: 1 ulp on every sample
+        // at host slices 128..1024); inside the call they glide per sample
+        for g in run.groups.iter_mut() {
+            g.z1 = g.sel;
+            g.z2 = g.sel;
         }
         let mut health = 0u32;
         let mut off = 0;
