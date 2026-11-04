@@ -7,7 +7,8 @@
 //! - `calch=C:R,T`: the same on channel C (the SpTS record of a 64009 case);
 //! - `safe_time_min=X`: `Thermal_SafeTlimTimeMin` (the shortened test sidecars);
 //! - `rampout=X`: `Rampout` on every channel (the patched zero-Rampout sidecar);
-//! - `start=N`: property 64007 (`ThermalStateOverride`).
+//! - `start=N`: property 64007 (`ThermalStateOverride`);
+//! - `rate=FS`: the sample rate the capture rendered at.
 use sgv2_core::blob::{build, Header, Pod};
 use sgv2_core::spp3::Params;
 
@@ -49,6 +50,8 @@ fn main() {
                 }
             }
             "start" => p.thermal_state_override = v.parse().unwrap(),
+            // the rate the capture rendered at (the blob carries the database's)
+            "rate" => p.sample_rate = v.parse().unwrap(),
             _ => panic!("unknown key {k}"),
         }
     }
