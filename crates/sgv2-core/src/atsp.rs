@@ -26,10 +26,14 @@
 //! - **Smoothing.** Toward the request with the slot's attack (down) or
 //!   release (up) time, as 99 %-settling times:
 //!   `a = 1 - exp(ln(0.01) / (t * rate))`, per sample.
-//! - **Output.** `y = x * g * d`, where `d` is the output dezipper: zero for
-//!   the first 240 active frames after initialisation or reset, then rising
-//!   to the nominal trim `1.0060076713562012` (+0.052 dB) by about 115 ms,
-//!   then holding it. Zero latency.
+//! - **Output.** `y = x * min(1, g * d)`, where `d` is the output dezipper
+//!   (rig-confirmed): zero for the first 5 ms after initialisation, then a
+//!   Float32 second-order low pass (`b0 (1, 2, 1)`, about 19.95 Hz, Q 0.65)
+//!   of a unit step. Its Float32 fixed point is the reference's "+0.052 dB
+//!   trim" (1.0060077 at 48 kHz, rate dependent): gain state, not a stage.
+//!   An `AudioUnitReset` does not restart it; silence advances it. The
+//!   engine never passes a sample above its input (review_bound), so the
+//!   overshoot and the trim are capped at unity. Zero latency.
 //! - **Bypass** (ID 0, at the next call): a bit-exact copy that freezes all
 //!   thermal, gain, link and startup state; clearing it resumes that state.
 //!
@@ -51,10 +55,11 @@
 //!   window. Bit-identical output for host slices 2..4096 rules out a
 //!   per-call mean. Here it is a one-pole mean of the instantaneous drive
 //!   power with the slot's attack coefficient.
-//! - **Startup dezipper law.** Only the 240-frame mute and "nominal by about
-//!   115 ms" are specified. The measured macOS trajectory is not monotonic
-//!   (it overshoots the trim by about 2.2 % near 44 ms); here the dezipper is
-//!   a linear ramp from frame 240 to frame 5520 (115 ms), never above trim.
+//! - **Dezipper constants.** The rig gives the poles (0.99799 +-
+//!   0.001662j at 48 kHz) to five digits, not the design; here an RBJ low
+//!   pass at 19.95 Hz, Q 0.65, rounded to Float32, run in direct form I.
+//!   Its fixed point and overshoot depend on the exact Float32 operation
+//!   order, which is open.
 //! - **Smoothing order.** The 25G83 gain leaves unity quadratically (1e-5
 //!   below unity 2 ms after entry, against 1.6e-2 for the specified
 //!   one-pole toward a request near 0.53), holds about 0.5 s before
@@ -64,8 +69,6 @@
 //!   30 ms of crossing `Tlim + headroom` (below the 0.1 target), then
 //!   releases from there; through the 800 ms attack the request cap takes
 //!   about 0.8 s.
-//! - **Trim after release.** After a limiting episode the 25G83 gain
-//!   settles at 1.0001, not the startup trim 1.0060077.
 //! - **Q = 1.** macOS takes a distinct path for one-frame host calls (the
 //!   tone-burst gain is 1.0019 to 1.0027 there); it is not specified, and
 //!   this unit renders Q = 1 like any other slice.
@@ -79,12 +82,54 @@ use crate::{
 };
 
 const EPS: f64 = f32::MIN_POSITIVE as f64;
-/// The settled output trim of the active unit (spec 3), as Float32.
+/// The 25G83 dezipper's settled value at 48 kHz (its Float32 fixed point;
+/// rate and path dependent). The engine caps the applied gain at unity.
 pub const NOMINAL_TRIM: f32 = 1.006_007_7;
+/// The output dezipper's low pass (rig law; TODO(SPEC) the exact design).
+const DEZIPPER_HZ: f64 = 19.95;
+const DEZIPPER_Q: f64 = 0.65;
 /// Silence after initialisation (spec 5; 240 frames at 48 kHz).
 pub const STARTUP_MUTE_S: f64 = 0.005;
-/// Time by which the output dezipper reaches the trim (spec 5).
-pub const STARTUP_SETTLE_S: f64 = 0.115;
+
+/// The output dezipper: a Float32 RBJ low pass of the startup step.
+#[derive(Clone, Copy)]
+struct Dezipper {
+    b0: f32,
+    a1: f32,
+    a2: f32,
+    x: [f32; 2],
+    y: [f32; 2],
+}
+
+impl Dezipper {
+    fn new(rate: f64) -> Self {
+        let w = 2.0 * core::f64::consts::PI * DEZIPPER_HZ / rate;
+        let al = libm::sin(w) / (2.0 * DEZIPPER_Q);
+        let a0 = 1.0 + al;
+        let c = libm::cos(w);
+        Dezipper {
+            b0: ((1.0 - c) / 2.0 / a0) as f32,
+            a1: (-2.0 * c / a0) as f32,
+            a2: ((1.0 - al) / a0) as f32,
+            x: [0.0; 2],
+            y: [0.0; 2],
+        }
+    }
+    #[inline]
+    fn step(&mut self, x: f32) -> f32 {
+        let y =
+            self.b0 * x + 2.0 * self.b0 * self.x[0] + self.b0 * self.x[1] - self.a1 * self.y[0] - self.a2 * self.y[1];
+        self.x = [x, self.x[0]];
+        self.y = [y, self.y[0]];
+        y
+    }
+    /// Settled on the step (a hand-off: the stream was already running).
+    fn settle(&mut self) {
+        for _ in 0..1 << 16 {
+            self.step(1.0);
+        }
+    }
+}
 /// The panic target, 20 dB.
 pub const PANIC_GAIN: f64 = 0.1;
 
@@ -265,7 +310,8 @@ struct Run {
     /// Active (not bypassed) frames since initialisation: the dezipper clock.
     active: u64,
     mute: u64,
-    settle: u64,
+    dez: Dezipper,
+    dez_now: f32,
     frame: u64,
     /// A model state went non-finite: the fail-safe is latched until reset.
     fault: bool,
@@ -338,7 +384,8 @@ impl Run {
             ch,
             active: 0,
             mute: libm::round(STARTUP_MUTE_S * rate) as u64,
-            settle: libm::round(STARTUP_SETTLE_S * rate) as u64,
+            dez: Dezipper::new(rate),
+            dez_now: 0.0,
             frame: 0,
             fault: false,
         })
@@ -355,21 +402,17 @@ impl Run {
             c.request = 1.0;
             c.gain = 1.0;
         }
-        self.active = 0;
+        // the dezipper is not restarted by a reset (rig law)
         self.frame = 0;
         self.fault = false;
     }
 
-    /// The output dezipper at the current active frame (module docs).
+    /// Advance the output dezipper one active frame (module docs).
     #[inline]
-    fn dezipper(&self) -> f64 {
-        if self.active < self.mute {
-            0.0
-        } else if self.active >= self.settle {
-            NOMINAL_TRIM as f64
-        } else {
-            NOMINAL_TRIM as f64 * (self.active - self.mute) as f64 / (self.settle - self.mute) as f64
-        }
+    fn dezipper(&mut self) -> f64 {
+        let x = if self.active < self.mute { 0.0 } else { 1.0 };
+        self.dez_now = self.dez.step(x);
+        self.dez_now as f64
     }
 
     /// Returns whether any input sample was non-finite (the meter failure:
@@ -423,10 +466,8 @@ impl Run {
                 let raw = io.input[c][k];
                 failed |= !raw.is_finite();
                 let x = crate::dsp::bound1(raw) as f64;
-                // The engine never passes a sample above its input (the
-                // review_bound invariant), so the +0.052 dB trim is capped
-                // at unity. TODO(SPEC): whether the trim is a fixed output
-                // stage or gain state (it is gone after a release on 25G83).
+                // never above the input (review_bound): the dezipper's
+                // overshoot and fixed point are capped at unity
                 io.output[c][k] = (x * (ch.gain * d).min(1.0)) as f32;
                 ch.p_drive += ch.a_attack * (ch.elec * x * x - ch.p_drive);
                 let u = ch.gain * x;
@@ -571,7 +612,8 @@ impl ProtectionUnit for Unit {
             c.gain = release_toward_unity(state.gain[i], r_release, t * rate as f64);
             c.request = c.gain;
         }
-        run.active = run.settle;
+        run.active = run.active.max(run.mute);
+        run.dez.settle();
         true
     }
 

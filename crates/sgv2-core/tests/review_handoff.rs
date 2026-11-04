@@ -98,8 +98,8 @@ fn atsp_a_restarted_stream_keeps_the_heat() {
     let mut rec = HandOff::EMPTY;
     assert!(u.save_state(&mut rec));
     u.reset();
-    // a reset unit is a fresh one (the spec's startup dezipper included)
-    assert_eq!(blk(&mut u, 1.0), blk(&mut atsp::Unit::new(p), 1.0));
+    // a reset unit is cold at unity (the dezipper does not restart: rig law)
+    assert_eq!(blk(&mut u, 1.0), 1.0);
     let mut v = atsp::Unit::new(p);
     assert!(v.restore_state(&rec, 0.0));
     assert!((tel(&v).channels[0].coil_temp_c - hot.channels[0].coil_temp_c).abs() < 1e-3);
