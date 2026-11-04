@@ -45,6 +45,10 @@
 //!   `TlimErrDecayTime` with the 99 % law.
 //!   TODO(SPEC) safety: the relaxation is capped at the base (`CL_RELAXATION`)
 //!   after the J616s live-test incident; CL never raises the limit.
+//!   Beyond the reference, a plausibility guard (stricter only) stops a
+//!   channel's relaxation for good when its resistance falls while the model
+//!   heats, or it reads far below its calibration temperature under drive
+//!   (`Health::SENSE_IMPLAUSIBLE`; see `Cl::guard`).
 //! - **Pilot.** With a calibration vector: on in an update iff
 //!   `f32(Pdrv) >= PilotEnableThres`; high above `PilotUpperThres`, low below
 //!   `PilotLowerThres` on `T_OL`, held between.
@@ -580,6 +584,13 @@ pub const TAU_MIN_S: f32 = 0.1;
 /// Feed-forward node rise beyond which the reference re-seeds its state
 /// (rig law 6a), K.
 const FF_RANGE_K: f64 = 1000.0;
+/// Closed-loop plausibility guard (beyond the reference, stricter only):
+/// driven windows in the resistance trend, the T_OL span they must cover,
+/// K, and the coldness bound below T_cal, K, held for `COLD_N` windows.
+const TREND_N: usize = 8;
+const TREND_SPAN_K: f64 = 10.0;
+const COLD_MARGIN_K: f64 = 10.0;
+const COLD_N: u32 = 3;
 /// Release hold of the ordinary candidate, s (rig law 5: fixed).
 const HOLD_S: f64 = 1.0;
 /// Dezipper 99 % settling time, s (spec 6).
@@ -773,6 +784,16 @@ struct Cl {
     limit_s: f64,
     /// A window has been accepted since construction or the last reset.
     active: bool,
+    /// Plausibility guard (beyond the reference, stricter only): a window
+    /// accepted since the last update, the recent driven windows' (T_OL,
+    /// R_s) pairs, consecutive driven windows far below T_cal, and the
+    /// sticky verdict.
+    fresh: bool,
+    drive_thres: f32,
+    trend: [(f64, f64); TREND_N],
+    trend_n: usize,
+    cold_n: u32,
+    implausible: bool,
 }
 
 /// The Goertzel period `N = next_power_of_two(round(TempSenseWindowTime *
@@ -864,6 +885,12 @@ impl Cl {
             t_cl: tc,
             limit_s: limit,
             active: false,
+            fresh: false,
+            drive_thres: c.pilot_enable_thres,
+            trend: [(0.0, 0.0); TREND_N],
+            trend_n: 0,
+            cold_n: 0,
+            implausible: false,
         })
     }
 
@@ -880,6 +907,10 @@ impl Cl {
         self.t_cl = self.t_of_rs();
         self.limit_s = base;
         self.active = false;
+        self.fresh = false;
+        self.trend_n = 0;
+        self.cold_n = 0;
+        self.implausible = false;
     }
 
     /// `AudioUnitReset`: the estimator restarts (the window grid from this
@@ -891,9 +922,11 @@ impl Cl {
     /// 177.630 C at the first accepted window, which is the pre-reset
     /// smoother 177.612 C stepped once toward 200 C).
     fn host_reset(&mut self) {
-        let keep = self.limit_s;
+        let (keep, verdict) = (self.limit_s, self.implausible);
         self.reset(keep);
         self.limit_s = keep;
+        // the guard's verdict holds until the kernel is rebuilt
+        self.implausible = verdict;
     }
 
     /// `T_CL` of the current smoothed resistance: `fmaf(invTempCo, (Rw -
@@ -961,16 +994,72 @@ impl Cl {
             self.valid = re >= self.reb_min && re <= self.reb_max;
             if self.valid {
                 self.age = 0;
+                self.fresh = true;
             }
         } else {
             self.valid = false;
         }
     }
 
+    /// The plausibility guard, on each accepted window (beyond the
+    /// reference, stricter only: it can only stop relaxation). A coil's
+    /// resistance rises with its temperature; across the last
+    /// [`TREND_N`] driven windows, while the model's T_OL moves by at least
+    /// [`TREND_SPAN_K`], a negative R_s versus T_OL slope means the sense
+    /// is not reading the coil (the J616s live test: V and I swapped, R
+    /// falling as the coils heated, correlation -0.95). So does a coil read
+    /// [`COLD_MARGIN_K`] below its calibration temperature on
+    /// [`COLD_N`] consecutive driven windows. Either latches `implausible`
+    /// until the kernel is rebuilt.
+    fn guard(&mut self, t_ol: f64, driven: bool) {
+        if !driven {
+            self.trend_n = 0;
+            self.cold_n = 0;
+            return;
+        }
+        if self.trend_n == TREND_N {
+            self.trend.copy_within(1.., 0);
+            self.trend_n -= 1;
+        }
+        self.trend[self.trend_n] = (t_ol, self.r_s as f64);
+        self.trend_n += 1;
+        if self.trend_n == TREND_N {
+            let pts = &self.trend[..];
+            let (lo, hi) = pts.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), p| (a.min(p.0), b.max(p.0)));
+            if hi - lo >= TREND_SPAN_K {
+                let n = TREND_N as f64;
+                let (mt, mr) = (pts.iter().map(|p| p.0).sum::<f64>() / n, pts.iter().map(|p| p.1).sum::<f64>() / n);
+                let cov: f64 = pts.iter().map(|p| (p.0 - mt) * (p.1 - mr)).sum();
+                if cov < 0.0 {
+                    self.implausible = true;
+                }
+            }
+        }
+        self.cold_n = if self.t_cl < self.cal_t - COLD_MARGIN_K { self.cold_n + 1 } else { 0 };
+        if self.cold_n >= COLD_N {
+            self.implausible = true;
+        }
+    }
+
+    /// The correction may relax the limit: never while capped, never after
+    /// the plausibility guard has tripped.
+    fn relax_allowed(&self) -> bool {
+        CL_RELAXATION && !self.implausible
+    }
+
     /// Per thermal update: the smoothed corrected limit for `base`.
-    fn update(&mut self, t_ol: f64, base: f64) -> f64 {
+    fn update(&mut self, t_ol: f64, base: f64, driven: bool) -> f64 {
         if self.valid {
             self.active = true;
+        }
+        if self.fresh {
+            self.fresh = false;
+            self.guard(t_ol, driven);
+        }
+        // a tripped guard drops any relaxation at once (TlimAdj -> 0)
+        if self.implausible {
+            self.limit_s = base;
+            return base;
         }
         if !self.active {
             return base;
@@ -981,7 +1070,7 @@ impl Cl {
             self.valid = false;
         }
         // max/min, not clamp: a NaN error falls back to the plain base.
-        let relax = if CL_RELAXATION { (t_ol - self.t_cl).max(0.0).min(self.cap) } else { 0.0 };
+        let relax = if self.relax_allowed() { (t_ol - self.t_cl).max(0.0).min(self.cap) } else { 0.0 };
         let raw = if self.valid { base + relax } else { base };
         self.limit_s += self.k_lim * (raw - self.limit_s);
         self.limit_s
@@ -1309,6 +1398,10 @@ impl Unit {
     /// update, C.
     pub fn effective_limit(&self, c: usize) -> f64 {
         self.run.as_ref().and_then(|r| r.ch.get(c)).map_or(f64::NAN, |c| c.tlim_eff)
+    }
+    /// Unit channel `c`'s closed-loop plausibility guard has tripped.
+    pub fn sense_implausible(&self, c: usize) -> bool {
+        self.run.as_ref().and_then(|r| r.ch.get(c)).and_then(|c| c.cl.as_ref()).is_some_and(|l| l.implausible)
     }
     /// Pre-gain drive power `Pdrv` of unit channel `c` in its last update, W.
     pub fn drive_power(&self, c: usize) -> f64 {
@@ -1682,7 +1775,11 @@ impl Run {
             // and the closed-loop correction smoothed around it
             let base = c.safe.base();
             let limit = match c.cl.as_mut() {
-                Some(cl) => cl.update(t_ol, base),
+                Some(cl) => {
+                    // driven: the update's drive meets the pilot content gate
+                    let driven = (p_ff as f32) >= cl.drive_thres;
+                    cl.update(t_ol, base, driven)
+                }
                 None => base,
             };
             c.tlim_eff = limit;
@@ -1845,6 +1942,9 @@ impl ProtectionUnit for Unit {
         if run.ch.iter().any(|c| c.out_of_range) {
             health |= Health::MODEL_RANGE;
         }
+        if run.ch.iter().any(|c| c.cl.as_ref().is_some_and(|l| l.implausible)) {
+            health |= Health::SENSE_IMPLAUSIBLE;
+        }
         Health(health)
     }
 
@@ -1864,6 +1964,9 @@ impl ProtectionUnit for Unit {
         }
         if run.ch.iter().any(|c| c.out_of_range) {
             out.health = Health(out.health.0 | Health::MODEL_RANGE);
+        }
+        if run.ch.iter().any(|c| c.cl.as_ref().is_some_and(|l| l.implausible)) {
+            out.health = Health(out.health.0 | Health::SENSE_IMPLAUSIBLE);
         }
         for c in run.ch.iter() {
             let g = &run.groups[c.group];
@@ -2082,7 +2185,7 @@ mod fault_tests {
         assert!(cl.valid);
         let mut updates = 0;
         while cl.valid {
-            cl.update(200.0, 120.0);
+            cl.update(200.0, 120.0, true);
             updates += 1;
             assert!(updates * THERMAL_FRAMES <= w + 2 * THERMAL_FRAMES, "still valid after {updates} updates");
         }
