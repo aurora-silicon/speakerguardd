@@ -523,7 +523,7 @@ fn cl_params(rc: f32, tc: f32) -> Params {
 }
 
 #[test]
-fn closed_loop_reads_coil_temperature_from_the_pilot_bin_and_never_relaxes() {
+fn closed_loop_reads_coil_temperature_from_the_pilot_bin_and_relaxes_the_limit() {
     let (rc, tc) = (4.0f32, 25.0f32);
     let p = cl_params(rc, tc);
     let mut u = spp3::Unit::new(p);
@@ -540,10 +540,11 @@ fn closed_loop_reads_coil_temperature_from_the_pilot_bin_and_never_relaxes() {
     // and reads R a few 1e-3 low on this signal
     assert!((t.channels[0].cl_temp_c - 60.0).abs() < 1.5, "T_CL {}", t.channels[0].cl_temp_c);
     assert_eq!(u.controller_state(0)[9], 1.0, "window accepted");
-    // the model runs hotter than the sensed 60 C, but the correction is
-    // capped at the base until the CL goldens match (t-4668)
-    assert_eq!(t.channels[0].tlim_adj_c, 0.0);
-    assert_eq!(u.effective_limit(0), 120.0);
+    // the model runs hotter than the sensed 60 C, so the limit relaxes
+    // (capped), never below the base
+    let adj = t.channels[0].tlim_adj_c;
+    assert!(adj > 0.0 && adj <= 30.0 + 1e-3, "TlimAdj {adj}");
+    assert!(u.effective_limit(0) > 120.0);
 }
 
 #[test]
@@ -562,7 +563,8 @@ fn closed_loop_range_is_on_the_smoothed_resistance_and_rejection_holds_the_publi
     assert!(t.channels[0].closed_loop);
     assert_eq!(u.controller_state(0)[9], 0.0);
     assert!(t.channels[0].cl_temp_c > 100.0);
-    assert_eq!(u.effective_limit(0), 120.0);
+    // the raw limit returns to the base; the smoothed limit decays toward it
+    assert!(u.effective_limit(0) >= 120.0);
     // recovery is accepted once the smoothed resistance is back in range
     run_cl(&mut u, 0.3, &tele, 0, 48_000 * 3);
     assert_eq!(u.controller_state(0)[9], 1.0);
