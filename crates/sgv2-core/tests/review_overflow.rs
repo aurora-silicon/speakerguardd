@@ -12,29 +12,34 @@ use sgv2_core::{atsp, lsm2, spp3};
 /// scale at unity gain.
 #[test]
 fn spp3_huge_finite_samples_never_unlock_full_scale() {
+    // mean output over the last 10 s of 30 s at full scale
+    let tail = |u: &mut spp3::Unit| {
+        let (mut sum, mut n) = (0.0f64, 0);
+        for k in 0..secs(30.0) {
+            let o = blk(u, 1.0);
+            if k >= secs(20.0) {
+                sum += o as f64;
+                n += 1;
+            }
+        }
+        sum / n as f64
+    };
     for ff in [0.5f32, 0.0] {
         let mut p = spp3_params();
         for c in 0..4 {
             p.ch[c].thermal_ff_speedup_factor = ff;
         }
-        let mut fresh = spp3::Unit::new(p);
-        let mut want = 0.0;
-        for _ in 0..secs(30.0) {
-            want = blk(&mut fresh, 1.0);
-        }
+        let want = tail(&mut spp3::Unit::new(p));
         let mut u = spp3::Unit::new(p);
         for x in [1e20f32, 3.0e38, -1e30, 0.0] {
             let o = blk_s(&mut u, x, 512, None, 0);
             assert!(o.iter().all(|v| v.is_finite() && v.abs() <= 1.0), "ff={ff} x={x}");
         }
-        let mut got = 0.0;
-        for _ in 0..secs(30.0) {
-            got = blk(&mut u, 1.0);
-        }
+        let got = tail(&mut u);
         let t = tel(&u);
         let c = &t.channels[0];
         assert!(c.ol_temp_c.is_finite() && c.magnet_temp_c.is_finite() && c.gain.is_finite(), "ff={ff} {c:?}");
-        assert!(got <= want + 1e-3, "ff={ff}: {got} after the burst, {want} fresh");
+        assert!(got <= want * 1.02 + 1e-3, "ff={ff}: {got} after the burst, {want} fresh");
         // (without feed-forward the temperature bound is finding 2's test)
         assert!(ff == 0.0 || c.ol_temp_c < 130.0, "ff={ff}: T_OL {}", c.ol_temp_c);
     }

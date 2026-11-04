@@ -57,8 +57,14 @@
 //!   from the drive and the model;
 //! - `Thermal_SafeTlim*` (open; never relaxes below the ordinary limit, so
 //!   leaving it out is not less restrictive);
-//! - the hard candidate when the feed-forward filter is disabled (the
-//!   virtual coil is then taken as the real coil);
+//! - the hard candidate when the feed-forward filter is disabled
+//!   (`ThermalFFSpeedupFactor <= 0`). The law needs a virtual coil that
+//!   does not exist then: taking the real coil instead settles about 70 C
+//!   above the limit (the real coil sees the attenuated drive), and a
+//!   physical-pole node on the unprotected drive overshoots the same way.
+//!   The stand-in holds the fixed 20 dB fail-safe gain while armed, which
+//!   holds the limit; the feed-forward candidate stays at unity, as the
+//!   reference shows. A non-finite factor is refused;
 //! - closed loop (spec 7), implemented: V and I mean squares per
 //!   `TempSenseWindowTime` window with the independent mean-square floors,
 //!   `R = RdcScale * smooth(sqrt(V_ms / I_ms))` accepted in `RebRange`,
@@ -350,6 +356,11 @@ impl Params {
             {
                 return Err(InitError::Invalid("thermal constants"));
             }
+            // nonpositive disables the feed-forward candidate (spec 6); NaN
+            // or infinity is no setting at all
+            if !c.thermal_ff_speedup_factor.is_finite() {
+                return Err(InitError::Invalid("ThermalFFSpeedupFactor"));
+            }
             if !(c.initial_theta_vc.is_finite() && c.initial_theta_mg.is_finite()) {
                 return Err(InitError::Invalid("start state"));
             }
@@ -589,7 +600,11 @@ struct Chan {
     hard_on: f64,
     vc: Thermal,
     mg: Thermal,
-    ff: Option<Thermal>,
+    /// The feed-forward virtual coil on the unprotected drive (`tau_ff`).
+    /// With the candidate disabled it runs at the physical `tau_Tvc` and
+    /// nothing reads it.
+    ff: Thermal,
+    ff_on: bool,
     init_vc: f64,
     init_mg: f64,
     p_prev: f64,
@@ -713,7 +728,9 @@ impl Run {
             };
             let (reb, series, ag) = (c.reb_ref as f64, (c.rshunt + c.rampout) as f64, c.ag as f64);
             let ff_factor = c.thermal_ff_speedup_factor as f64;
-            let ff = (ff_factor > 0.0).then(|| Thermal::new(c.t_sett_vc as f64, ff_factor * c.tau_tvc as f64, dt, 0.0));
+            let ff_on = ff_factor > 0.0;
+            let ff_tau = if ff_on { ff_factor * c.tau_tvc as f64 } else { c.tau_tvc as f64 };
+            let ff = Thermal::new(c.t_sett_vc as f64, ff_tau, dt, 0.0);
             ch.push(Chan {
                 src: c.source as usize,
                 group: gi,
@@ -730,6 +747,7 @@ impl Run {
                 vc: Thermal::new(c.t_sett_vc as f64, c.tau_tvc as f64, dt, c.initial_theta_vc as f64),
                 mg: Thermal::new(c.t_sett_mg as f64, c.tau_tmg as f64, dt, c.initial_theta_mg as f64),
                 ff,
+                ff_on,
                 init_vc: c.initial_theta_vc as f64,
                 init_mg: c.initial_theta_mg as f64,
                 p_prev: 0.0,
@@ -775,9 +793,7 @@ impl Run {
             c.delay.clear();
             c.vc.theta = c.init_vc;
             c.mg.theta = c.init_mg;
-            if let Some(f) = c.ff.as_mut() {
-                f.theta = 0.0;
-            }
+            c.ff.theta = 0.0;
             c.p_prev = 0.0;
             c.p_ff_prev = 0.0;
             c.acc.clear();
@@ -903,9 +919,7 @@ impl Run {
             c.mg.step(p, c.p_prev);
             let p_ff = if FF_FROM_UNPROTECTED { c.elec * c.acc_in.total() / n } else { p };
             c.acc_in.clear();
-            if let Some(f) = c.ff.as_mut() {
-                f.step(p_ff, c.p_ff_prev);
-            }
+            c.ff.step(p_ff, c.p_ff_prev);
             c.p_prev = p;
             c.p_ff_prev = p_ff;
             let t_ol = self.ambient + c.vc.theta + c.mg.theta;
@@ -916,11 +930,9 @@ impl Run {
                 None => c.limit,
             };
             let num = limit - self.ambient - c.mg.theta;
-            // TODO(SPEC): with the feed-forward filter disabled the hard
-            // candidate takes the real coil as its virtual coil.
-            let vcff = c.ff.map_or(c.vc.theta, |f| f.theta);
+            let vcff = c.ff.theta;
             let ratio = |num: f64| libm::sqrt((num / (vcff + PREDICTION_MARGIN)).clamp(RATIO_MIN, 1.0));
-            c.g_ff = if c.ff.is_some() { ratio(num) } else { 1.0 };
+            c.g_ff = if c.ff_on { ratio(num) } else { 1.0 };
             // the hard path follows the corrected limit (reference: a
             // closed-loop run holds T_OL far above limit + headroom without
             // the panic)
@@ -929,7 +941,16 @@ impl Run {
             } else if t_ol < limit {
                 c.armed = false;
             }
-            c.g_hard = if c.armed { ratio(num - HARD_TARGET_BELOW) } else { 1.0 };
+            // TODO(SPEC): without the feed-forward filter there is no virtual
+            // coil for the hard law; the fixed 20 dB holds the limit (module
+            // docs)
+            c.g_hard = if !c.armed {
+                1.0
+            } else if c.ff_on {
+                ratio(num - HARD_TARGET_BELOW)
+            } else {
+                FAILSAFE_GAIN as f64
+            };
             ff_t[c.group] = min_nan(ff_t[c.group], c.g_ff);
             hard_t[c.group] = min_nan(hard_t[c.group], c.g_hard);
         }
@@ -962,7 +983,7 @@ impl Run {
         // any non-finite model or controller state latches the fail-safe
         let chans = self.ch.iter().all(|c| {
             let lim = c.cl.as_ref().is_none_or(|cl| cl.limit_s.is_finite() && cl.t_cl.is_finite());
-            let ff = c.ff.is_none_or(|f| f.theta.is_finite());
+            let ff = c.ff.theta.is_finite();
             c.vc.theta.is_finite() && c.mg.theta.is_finite() && ff && lim && c.g_ff.is_finite() && c.g_hard.is_finite()
         });
         let groups = self.groups.iter().all(|g| g.g.is_finite() && g.sel.is_finite());
@@ -1142,7 +1163,7 @@ mod fault_tests {
         let poisons: [fn(&mut Run); 4] = [
             |r| r.ch[0].mg.theta = f64::NAN,
             |r| r.ch[1].vc.theta = f64::INFINITY,
-            |r| r.ch[0].ff.as_mut().unwrap().theta = f64::NAN,
+            |r| r.ch[0].ff.theta = f64::NAN,
             |r| r.groups[0].g = f64::NAN,
         ];
         for poison in poisons {
