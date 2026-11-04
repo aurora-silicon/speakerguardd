@@ -90,7 +90,7 @@ def cases():
                       cfprops=[f"64009={fixture}"]))
     # failure cases
     C.append(dict(name="spp3-nosidecar-pink_steps", unit="spp3", signal="pink_steps", sidecar=False))
-    # host slice-size invariance (lsm2 consumes any count)
+    # host slice size: lsm2 output depends on it (the graph uses 512); spp3 is invariant
     for s in ["pink_steps", "tokyo_30s"]:  # without the runtime properties (preset limits only)
         C.append(dict(name=f"lsm2-noruntime-{s}", unit="lsm2", signal=s, runtime=False))
     for q in (1, 7, 160, 4096):
