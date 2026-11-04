@@ -44,6 +44,12 @@
 //!   running the graph, which beats.
 //! - RUNNING: + grace for [`START_GRACE_NS`] after it is first seen running,
 //!   strict from then on.
+//! - For [`GRANT_GRACE_WINDOW_NS`] after each grant, in any of those states,
+//!   the grace is [`GRANT_GRACE_NS`]. Each grant is followed by the helper's
+//!   re-link and the driver switch, and lane B2 saw the heartbeat pause there
+//!   more than once in the first 200 ms after a re-grant. The PCM state
+//!   checks (XRUN, owner) are never relaxed, and they are what floors a
+//!   stopped or killed engine (B2: 19.6-31.0 ms).
 //!
 //! A dead or stopped engine therefore releases within one staleness bound,
 //! or sooner when the PCM XRUNs, and nothing renews without it.
@@ -155,6 +161,11 @@ pub const SESSION_SKEW_NS: u64 = 1_000_000;
 /// running, and for this long after it starts running. Steady state (RUNNING
 /// after that, or Closed) has none.
 pub const START_GRACE_NS: u64 = 50_000_000;
+/// How long after a grant [`GRANT_GRACE_NS`] applies.
+pub const GRANT_GRACE_WINDOW_NS: u64 = 250_000_000;
+/// Extra heartbeat age tolerated just after a grant (not added to
+/// [`START_GRACE_NS`]: the larger of the two applies).
+pub const GRANT_GRACE_NS: u64 = 100_000_000;
 
 /// Freshness bound while the engine runs: two unit quanta (the
 /// architecture's "at most 2 quanta stale") plus one supervisor tick.
@@ -174,6 +185,7 @@ pub struct Observer {
     quantum: Option<u64>,
     was_running: bool,
     grace_until: Option<u64>,
+    granted_at: Option<u64>,
 }
 
 impl Observer {
@@ -188,7 +200,14 @@ impl Observer {
             quantum: None,
             was_running: false,
             grace_until: None,
+            granted_at: None,
         }
+    }
+
+    /// The supervisor granted at `now_ns`: the re-link and driver switch
+    /// that follow get [`GRANT_GRACE_NS`].
+    pub fn note_grant(&mut self, now_ns: u64) {
+        self.granted_at = Some(now_ns);
     }
 
     /// The current heartbeat staleness bound, once the quantum is known.
@@ -243,11 +262,19 @@ impl Observer {
             self.grace_until = None;
         }
         self.was_running = running;
-        let grace = match p {
+        let start_grace = match p {
             PcmState::Open { .. } => START_GRACE_NS,
             PcmState::Running { .. } if self.grace_until.is_some_and(|t| now_ns < t) => START_GRACE_NS,
             _ => 0,
         };
+        let grant_grace = match self.granted_at {
+            Some(t) if now_ns.saturating_sub(t) < GRANT_GRACE_WINDOW_NS => GRANT_GRACE_NS,
+            _ => {
+                self.granted_at = None;
+                0
+            }
+        };
+        let grace = start_grace.max(grant_grace);
 
         let heartbeat_fresh = match self.quantum.filter(|q| (1..=MAX_QUANTUM).contains(q)) {
             Some(q) => {
@@ -891,5 +918,50 @@ mod tests {
             }
         }
         assert!(fresh_after <= last * period + stale_ns(512, 48_000, TICK));
+    }
+
+    #[test]
+    fn a_regrant_tolerates_the_relink_pauses_and_then_is_strict() {
+        // B2 0d7ee6c: after a re-grant the heartbeat paused twice in the
+        // first 200 ms (the re-link and the driver switch)
+        let q = 10_666_666u64;
+        let mut o = Observer::new(7, 48_000, TICK);
+        let open = PcmState::Open { owner: PID };
+        let run = PcmState::Running { owner: PID };
+        let mut seq = 0u64;
+        let mut mono = 0u64;
+        let mut at = |o: &mut Observer, now: u64, beat_now: bool, pcm: PcmState| {
+            if beat_now {
+                seq += 1;
+                mono = now - 1_000;
+            }
+            o.observe(&mut || now, &mut E(beat(seq, 512, mono)), &mut P(pcm), &mut S(session(now)))
+        };
+        for k in 1..10u64 {
+            at(&mut o, k * q, true, open);
+        }
+        let grant = 10 * q;
+        o.note_grant(grant);
+        // a 90 ms pause while prepared, then a 90 ms pause just after it runs
+        let mut now = grant;
+        while now < grant + 90_000_000 {
+            assert!(at(&mut o, now, false, open).heartbeat_fresh, "first pause at {}", now - grant);
+            now += TICK;
+        }
+        at(&mut o, now, true, run);
+        let resume = now;
+        while now < resume + 90_000_000 {
+            assert!(at(&mut o, now, false, run).heartbeat_fresh, "second pause at {}", now - grant);
+            now += TICK;
+        }
+        // after the window: strict again
+        let t = grant + GRANT_GRACE_WINDOW_NS + q;
+        assert!(at(&mut o, t, true, run).heartbeat_fresh);
+        let strict = stale_ns(512, 48_000, TICK);
+        assert!(at(&mut o, t + strict - 1_000_000, false, run).heartbeat_fresh);
+        assert!(!at(&mut o, t + strict + 1_000_000, false, run).heartbeat_fresh);
+        // and the grace never covers an XRUN
+        o.note_grant(t);
+        assert!(!at(&mut o, t + 1_000_000, true, PcmState::Stopped { owner: PID }).pcm_state_ok);
     }
 }
