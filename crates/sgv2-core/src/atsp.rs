@@ -73,7 +73,10 @@
 use alloc::vec::Vec;
 
 use crate::blob::{BlobError, Pod};
-use crate::{ChannelState, Health, Io, ProtectionUnit, Telemetry, UnitKind, FAILSAFE_GAIN, MAX_CHANNELS};
+use crate::{
+    gap_or_zero, release_toward_unity, ChannelState, HandOff, Health, Io, ProtectionUnit, Telemetry,
+    UnitKind, FAILSAFE_GAIN, MAX_CHANNELS,
+};
 
 const EPS: f64 = f32::MIN_POSITIVE as f64;
 /// The settled output trim of the active unit (spec 3), as Float32.
@@ -235,6 +238,8 @@ struct Chan {
     rth_mg: f64,
     a_vc: f64,
     a_mg: f64,
+    tau_vc: f64,
+    tau_mg: f64,
     ambient: f64,
     limit: f64,
     hard_limit: f64,
@@ -262,6 +267,8 @@ struct Run {
     mute: u64,
     settle: u64,
     frame: u64,
+    /// A model state went non-finite: the fail-safe is latched until reset.
+    fault: bool,
 }
 
 pub struct Unit {
@@ -307,6 +314,8 @@ impl Run {
                 rth_mg: s.rth_mg as f64,
                 a_vc: dt / (s.tau_vc as f64 + dt),
                 a_mg: dt / (s.tau_mg as f64 + dt),
+                tau_vc: s.tau_vc as f64,
+                tau_mg: s.tau_mg as f64,
                 ambient: s.ambient as f64,
                 limit: s.temperature_limit as f64,
                 hard_limit: s.temperature_limit as f64 + s.hard_limit_headroom as f64,
@@ -331,6 +340,7 @@ impl Run {
             mute: libm::round(STARTUP_MUTE_S * rate) as u64,
             settle: libm::round(STARTUP_SETTLE_S * rate) as u64,
             frame: 0,
+            fault: false,
         })
     }
 
@@ -347,6 +357,7 @@ impl Run {
         }
         self.active = 0;
         self.frame = 0;
+        self.fault = false;
     }
 
     /// The output dezipper at the current active frame (module docs).
@@ -361,8 +372,11 @@ impl Run {
         }
     }
 
-    fn process(&mut self, io: &mut Io<'_, '_>) {
+    /// Returns whether any input sample was non-finite (the meter failure:
+    /// those frames are silent, and the call reports the fail-safe).
+    fn process(&mut self, io: &mut Io<'_, '_>) -> bool {
         let n = self.n;
+        let mut failed = false;
         for k in 0..io.frames {
             // 1. requests from the state before this sample
             let mut req = [1.0f64; MAX_CHANNELS];
@@ -387,7 +401,7 @@ impl Run {
             }
             for s in 0..3 {
                 if self.link_slot[s] {
-                    let m = self.ch.iter().filter(|c| c.slot == s).fold(1.0f64, |m, c| m.min(c.request));
+                    let m = self.ch.iter().filter(|c| c.slot == s).fold(1.0f64, |m, c| nan_min(m, c.request));
                     for (c, ch) in self.ch.iter().enumerate() {
                         if ch.slot == s {
                             req[c] = m;
@@ -396,7 +410,7 @@ impl Run {
                 }
             }
             if self.link_all {
-                let m = req[..n].iter().fold(1.0f64, |m, &r| m.min(r));
+                let m = req[..n].iter().fold(1.0f64, |m, &r| nan_min(m, r));
                 req[..n].iter_mut().for_each(|r| *r = m);
             }
             // 2. smooth, apply, integrate
@@ -404,9 +418,16 @@ impl Run {
             for (c, ch) in self.ch.iter_mut().enumerate() {
                 let a = if req[c] < ch.gain { ch.a_attack } else { ch.a_release };
                 ch.gain += a * (req[c] - ch.gain);
-                let x = io.input[c][k];
-                let (x, y) = if x.is_finite() { (x as f64, (x as f64 * ch.gain * d) as f32) } else { (0.0, 0.0) };
-                io.output[c][k] = y;
+                // the program held to digital full scale before the gain and
+                // both meters; a non-finite sample is 0
+                let raw = io.input[c][k];
+                failed |= !raw.is_finite();
+                let x = crate::dsp::bound1(raw) as f64;
+                // The engine never passes a sample above its input (the
+                // review_bound invariant), so the +0.052 dB trim is capped
+                // at unity. TODO(SPEC): whether the trim is a fixed output
+                // stage or gain state (it is gone after a release on 25G83).
+                io.output[c][k] = (x * (ch.gain * d).min(1.0)) as f32;
                 ch.p_drive += ch.a_attack * (ch.elec * x * x - ch.p_drive);
                 let u = ch.gain * x;
                 let p = ch.elec * u * u;
@@ -417,8 +438,29 @@ impl Run {
                 ch.theta_mg += ch.a_mg * (p * ch.rth_mg - ch.theta_mg);
             }
             self.active = self.active.saturating_add(1);
+            // any non-finite model or controller state latches the fail-safe
+            if !self.ch.iter().all(|c| c.theta_vc.is_finite() && c.theta_mg.is_finite() && c.gain.is_finite()) {
+                self.fault = true;
+                self.frame += k as u64 + 1;
+                crate::failsafe::fill_from(io, k + 1, FAILSAFE_GAIN);
+                for c in 0..n {
+                    io.output[c][k] = crate::dsp::bound1(io.input[c][k]) * FAILSAFE_GAIN;
+                }
+                return failed;
+            }
         }
         self.frame += io.frames as u64;
+        failed
+    }
+}
+
+/// `min` that keeps a NaN (a NaN request must never read as unity).
+#[inline]
+fn nan_min(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        f64::NAN
+    } else {
+        a.min(b)
     }
 }
 
@@ -444,6 +486,10 @@ impl ProtectionUnit for Unit {
             crate::spp3::failsafe_io(&mut io);
             return Health(Health::FAILSAFE | Health::CHANNEL_MISMATCH);
         }
+        if run.fault {
+            crate::spp3::failsafe_io(&mut io);
+            return Health(Health::FAILSAFE | Health::MODEL_FAULT);
+        }
         if self.bypass {
             for c in 0..run.n {
                 io.output[c][..frames].copy_from_slice(&io.input[c][..frames]);
@@ -451,8 +497,11 @@ impl ProtectionUnit for Unit {
             run.frame += frames as u64;
             return Health::OK;
         }
-        run.process(&mut io);
-        Health::OK
+        let failed = run.process(&mut io);
+        if run.fault {
+            return Health(Health::FAILSAFE | Health::MODEL_FAULT);
+        }
+        Health(if failed { Health::FAILSAFE } else { 0 })
     }
     fn telemetry(&self, out: &mut Telemetry) {
         out.clear();
@@ -464,6 +513,9 @@ impl ProtectionUnit for Unit {
             return;
         };
         out.frame = run.frame;
+        if run.fault {
+            out.health = Health(Health::FAILSAFE | Health::MODEL_FAULT);
+        }
         for (i, c) in run.ch.iter().enumerate() {
             let mut s = ChannelState::ABSENT;
             s.modeled_power_w = c.p_model as f32;
@@ -471,7 +523,13 @@ impl ProtectionUnit for Unit {
             s.magnet_temp_c = (c.ambient + c.theta_mg) as f32;
             s.ol_temp_c = s.coil_temp_c;
             s.axis_gain[4] = c.request as f32;
-            s.gain = if self.bypass { 1.0 } else { c.gain as f32 };
+            s.gain = if run.fault {
+                FAILSAFE_GAIN
+            } else if self.bypass {
+                1.0
+            } else {
+                c.gain as f32
+            };
             out.channels[i] = s;
         }
     }
@@ -480,6 +538,43 @@ impl ProtectionUnit for Unit {
             r.reset();
         }
     }
+    fn save_state(&self, out: &mut HandOff) -> bool {
+        let Some(run) = self.run.as_ref().filter(|r| !r.fault) else { return false };
+        *out = HandOff::EMPTY;
+        out.kind = UnitKind::Atsp as u32;
+        out.channels = run.n as u32;
+        out.sample_rate = self.params.sample_rate;
+        for (i, c) in run.ch.iter().enumerate() {
+            out.node[i][..2].copy_from_slice(&[c.theta_vc, c.theta_mg]);
+            out.gain[i] = c.gain;
+        }
+        true
+    }
+
+    /// The coil and magnet rises cooled for the gap by the continuous
+    /// solution of the series pair (the coil rise over the magnet decays with
+    /// its own constant), the gain released toward unity. The reference
+    /// resets on reinitialisation (spec 5); a speaker does not cool because a
+    /// stream restarted, so here it never does. The startup dezipper is not
+    /// repeated after a hand-off.
+    fn restore_state(&mut self, state: &HandOff, gap_s: f64) -> bool {
+        let rate = self.params.sample_rate;
+        let Some(run) = self.run.as_mut() else { return false };
+        if !state.fits(UnitKind::Atsp, run.n, rate) {
+            return false;
+        }
+        let t = gap_or_zero(gap_s);
+        for (i, c) in run.ch.iter_mut().enumerate() {
+            c.theta_vc = state.node[i][0] * libm::exp(-t / c.tau_vc);
+            c.theta_mg = state.node[i][1] * libm::exp(-t / c.tau_mg);
+            let r_release = 1.0 - c.a_release;
+            c.gain = release_toward_unity(state.gain[i], r_release, t * rate as f64);
+            c.request = c.gain;
+        }
+        run.active = run.settle;
+        true
+    }
+
     fn set_parameter(&mut self, id: u32, value: f32) -> bool {
         if id == ids::BYPASS {
             self.bypass = value != 0.0;

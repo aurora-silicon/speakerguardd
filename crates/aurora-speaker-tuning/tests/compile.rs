@@ -291,8 +291,9 @@ fn lsm2_state(tweak: impl Fn(&mut BTreeMap<u32, f32>)) -> ParamState {
         (id::C_ATTACK, 4.0),
         (id::C_FAST_RELEASE, 150.0),
         (id::C_SLOW_RELEASE, 15000.0),
-        (id::C_FILTERBANK_LATENCY, 2.0),
-        (id::C_LOOKAHEAD, 0.5),
+        // 2 * 160 + 32 = 352 frames at 48 kHz (the engine refuses < 256)
+        (id::C_FILTERBANK_LATENCY, 10.0 / 3.0),
+        (id::C_LOOKAHEAD, 2.0 / 3.0),
         (id::C_UNLINK_TEMPERATURE, 0.0),
         (id::C_COMPENSATE_RESONATORS, 0.0),
         (id::C_USE_FAST_PEAK, 0.0),
@@ -348,7 +349,7 @@ fn lsm2_fields_follow_the_id_rule() {
     let p = sgv2_core::lsm2::Params::from_blob(&c.blob).unwrap();
     assert_eq!((p.channels, p.sample_rate, p.model_only), (4, 48000, 1));
     assert_eq!((p.attack_time_ms, p.fast_release_time_ms, p.slow_release_time_ms), (4.0, 150.0, 15000.0));
-    assert_eq!((p.filterbank_latency_ms, p.speaker_response_lookahead_ms), (2.0, 0.5));
+    assert_eq!((p.filterbank_latency_ms, p.speaker_response_lookahead_ms), (10.0 / 3.0, 2.0 / 3.0));
     assert_eq!(p.power_hard_limit_w, [50.0, 8.0, 3.0, 2.0]);
     assert_eq!((p.low_rail_idle_power_w, p.low_rail_power_ratio, p.other_power_features), (0.02, 1.2, 0));
     let x = &p.ch[1];

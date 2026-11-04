@@ -159,7 +159,7 @@ fn bypass_copies_and_freezes() {
 }
 
 #[test]
-fn startup_mute_then_nominal_trim() {
+fn startup_mute_then_unity() {
     let mut u = Unit::new(params());
     let n = 48_000 / 4;
     let ins: Vec<Vec<f32>> = (0..4).map(|_| vec![0.01f32; n]).collect();
@@ -169,8 +169,9 @@ fn startup_mute_then_nominal_trim() {
     u.process(Io { frames: n, input: &i, sense: &[], output: &mut o });
     assert!(outs[0][..240].iter().all(|&y| y == 0.0));
     assert!(outs[0][241] > 0.0);
-    assert!(outs[0].iter().all(|&y| y <= 0.01 * sgv2_core::atsp::NOMINAL_TRIM));
-    assert_eq!(outs[0][n - 1], 0.01 * sgv2_core::atsp::NOMINAL_TRIM);
+    // the reference's +0.052 dB trim is capped at unity: never above input
+    assert!(outs[0].iter().all(|&y| y <= 0.01));
+    assert_eq!(outs[0][n - 1], 0.01);
 }
 
 #[test]
