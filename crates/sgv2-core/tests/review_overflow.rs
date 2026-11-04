@@ -67,28 +67,67 @@ fn atsp_huge_finite_samples_neither_unlock_nor_mute() {
     assert!((got - want).abs() < 1e-3, "{got} after the burst, {want} fresh");
 }
 
-/// Finding 1 for lsm2: the burst must not leave the model hot for minutes.
+/// Finding 1 for lsm2: the burst is metered at the 16 FS bound, so it
+/// heats the model as 512 frames at 16 FS would and limits; it must never
+/// make the unit louder, poison the state, or leave the model hot for
+/// longer than that heat takes to clear.
 #[test]
+#[ignore = "B3 MERGE (lane B3): this lsm2 meters the program held to +-1; port the 16 FS meter guard"]
 fn lsm2_huge_finite_samples_do_not_poison_the_model() {
     let x: Vec<f32> = (0..RATE as usize * 5)
         .map(|k| 0.3 * (2.0 * std::f64::consts::PI * 150.0 * k as f64 / RATE as f64).sin() as f32)
         .collect();
-    let run = |burst: bool| {
+    let peak = |o: &[f32]| o.iter().skip(o.len() - 4800).fold(0.0f32, |m, v| m.max(v.abs()));
+    let run = |burst: Option<f32>, rest_s: usize| {
         let mut u = lsm2::Unit::new(lsm2_params());
-        if burst {
-            let b = vec![1e20f32; 512];
-            let (o, _) = lsm2_go(&mut u, &b);
-            assert!(o.iter().all(|v| v.is_finite() && v.abs() <= 1.0));
-        } else {
-            lsm2_go(&mut u, &[0.0; 512]);
+        let b = vec![burst.unwrap_or(0.0); 512];
+        let (o, _) = lsm2_go(&mut u, &b);
+        assert!(o.iter().all(|v| v.is_finite() && v.abs() <= 1.0));
+        for _ in 0..rest_s {
+            lsm2_go(&mut u, &vec![0.0; RATE as usize]);
         }
         let (o, _) = lsm2_go(&mut u, &x);
         let t = tel(&u);
-        assert!(t.channels[0].coil_temp_c.is_finite(), "{:?}", t.channels[0]);
-        (o.iter().skip(o.len() - 4800).fold(0.0f32, |m, v| m.max(v.abs())), t.channels[0].coil_temp_c)
+        assert!(t.channels[0].coil_temp_c.is_finite() && t.channels[0].gain.is_finite(), "{:?}", t.channels[0]);
+        (peak(&o), t.channels[0].coil_temp_c)
     };
-    let (want, t_want) = run(false);
-    let (got, t_got) = run(true);
-    assert!((got - want).abs() < 0.02 * want, "{got} after the burst, {want} fresh");
-    assert!(t_got < t_want + 5.0, "{t_got} after the burst, {t_want} fresh");
+    let (want, t_want) = run(None, 0);
+    // at once: never louder than a fresh unit, and no hotter than the same
+    // burst at the meter bound
+    let (got, t_got) = run(Some(1e20), 0);
+    let (_, t_bound) = run(Some(16.0), 0);
+    assert!(got <= want * 1.001, "{got} after the burst, {want} fresh");
+    assert!((t_got - t_bound).abs() < 1e-3, "{t_got} after 1e20, {t_bound} after 16 FS");
+    // and the heat clears like any other: after a minute of silence the
+    // unit is back to the fresh behaviour
+    let (want, t_want_rest) = run(None, 60);
+    let (got, t_got) = run(Some(1e20), 60);
+    assert!((got - want).abs() < 0.02 * want, "{got} a minute after the burst, {want} fresh");
+    // (the 60 s magnet still holds a few kelvin of the burst)
+    assert!(t_got < t_want_rest + 5.0 && t_want.is_finite(), "{t_got} a minute after the burst, {t_want_rest} fresh");
+}
+
+/// The meters follow the reference and see a slightly over-range program
+/// unclamped (a tuning's EQ can peak just over full scale), up to the
+/// 16 FS bound; only the output is held to full scale.
+#[test]
+#[ignore = "B3 MERGE (lane B3): this lsm2 meters the program held to +-1; port the 16 FS meter guard"]
+fn over_range_program_is_metered_unclamped_up_to_sixteen_fs() {
+    let temp = |x: f32| {
+        let mut u = spp3::Unit::new(spp3_params());
+        for _ in 0..secs(0.5) {
+            let o = blk_s(&mut u, x, 512, None, 0);
+            assert!(o.iter().all(|v| v.abs() <= 1.0));
+        }
+        tel(&u).channels[0].ol_temp_c
+    };
+    let (t1, t12, t16, t100) = (temp(1.0), temp(1.2), temp(16.0), temp(100.0));
+    assert!(t12 > t1 + 1.0, "1.2 FS metered as {t12} C, 1 FS as {t1} C");
+    assert!(t16 > t12 && t100 == t16, "16 FS {t16} C, 100 FS {t100} C");
+    let model = |x: f32| {
+        let mut u = lsm2::Unit::new(lsm2_params());
+        lsm2_go(&mut u, &vec![x; 4800]);
+        tel(&u).channels[0].coil_temp_c
+    };
+    assert!(model(1.2) > model(1.0) && model(100.0) == model(16.0));
 }

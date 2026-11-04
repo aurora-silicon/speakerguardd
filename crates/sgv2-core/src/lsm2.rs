@@ -755,6 +755,9 @@ struct Chan {
     t_hard: f64,
     t_headroom: f64,
     t_max_db: f64,
+    /// The coil passed TemperatureHardLimit (temperature axis enabled): the
+    /// 20 dB fail-safe gain at once until it is back below the soft limit.
+    hard_armed: bool,
     // Candidates and gains.
     cand: [f64; 5],
     band_target: [f32; BANDS],
@@ -918,6 +921,7 @@ impl Run {
                 t_hard: c.temperature_hard_limit as f64,
                 t_headroom: c.temperature_headroom as f64,
                 t_max_db: c.max_temperature_attenuation_db as f64,
+                hard_armed: false,
                 cand: [1.0; 5],
                 band_target: [1.0; BANDS],
                 band_g: [1.0; BANDS],
@@ -999,6 +1003,7 @@ impl Run {
             c.pbar1s_peak = 0.0;
             c.pbar1s_frame = 0.0;
             c.cand = [1.0; 5];
+            c.hard_armed = false;
             c.band_target = [1.0; BANDS];
             c.band_g = [1.0; BANDS];
             c.peak_target = 1.0;
@@ -1057,7 +1062,8 @@ impl Run {
             }
             smooth(&mut c.peak_g, c.peak_target, r_attack, r_fast);
             smooth(&mut c.slow_g, c.slow_target, r_attack, r_slow);
-            let broad = c.peak_g.min(c.slow_g);
+            let backstop = if c.hard_armed { FAILSAFE_GAIN } else { 1.0 };
+            let broad = c.peak_g.min(c.slow_g).min(backstop);
             let e: [f32; BANDS] = core::array::from_fn(|k| c.band_g[k].min(broad));
             let e4 = e[BANDS - 1];
             if e.iter().any(|&g| g != 1.0) {
@@ -1167,12 +1173,19 @@ impl Run {
             c.pk_disp = 0.0;
             c.pk_vel = 0.0;
             c.pbar_in_peak = [0.0; 4];
-            let g_temp = if self.ctl[4] {
-                let t = c.ambient + c.th_mag as f64 + c.th_vc as f64;
-                temperature_gain(t, c.t_headroom, c.t_soft, c.t_hard, c.t_max_db)
-            } else {
-                1.0
-            };
+            let t_coil = c.ambient + c.th_mag as f64 + c.th_vc as f64;
+            let g_temp =
+                if self.ctl[4] { temperature_gain(t_coil, c.t_headroom, c.t_soft, c.t_hard, c.t_max_db) } else { 1.0 };
+            // hard-limit backstop of the temperature axis (beyond the
+            // reference, which stops at the knee's cap), with hysteresis
+            // down to the soft limit
+            if !self.ctl[4] {
+                c.hard_armed = false;
+            } else if t_coil > c.t_hard || t_coil.is_nan() {
+                c.hard_armed = true;
+            } else if t_coil < c.t_soft.min(c.t_hard) {
+                c.hard_armed = false;
+            }
             c.cand = [g_peak, g_disp, g_vel, g_pow, g_temp];
             c.peak_target = g_peak as f32;
             c.slow_target = g_pow.min(g_temp) as f32;
@@ -1332,7 +1345,8 @@ impl ProtectionUnit for Unit {
                 s.axis_gain[3] = run.linked_power as f32;
             }
             s.band_gain = c.band_g;
-            s.gain = if run.fault { FAILSAFE_GAIN } else { c.peak_g.min(c.slow_g) };
+            let backstop = if c.hard_armed { FAILSAFE_GAIN } else { 1.0 };
+            s.gain = if run.fault { FAILSAFE_GAIN } else { c.peak_g.min(c.slow_g).min(backstop) };
             out.channels[c.src] = s;
             amp_1s += c.pbar1s_frame;
             if c.src == 0 {
