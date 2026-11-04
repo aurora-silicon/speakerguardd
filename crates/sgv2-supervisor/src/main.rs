@@ -34,7 +34,7 @@ fn main() {
 mod linux {
     use std::sync::atomic::Ordering;
 
-    use sgv2_lv2::page::{EnginePage, MAGIC};
+    use sgv2_lv2::page::{EnginePage, LAYOUT, MAGIC};
     use sgv2_supervisor::kernel::{Kernel, KernelError, Macaudio};
     use sgv2_supervisor::observe::{
         parse_pcm_status, stale_ns, EngineState, EngineView, Observer, PcmState, PcmView, SessionReport, SessionView,
@@ -50,7 +50,7 @@ mod linux {
         fn read(&mut self) -> EngineState {
             let h = self.0.header();
             EngineState {
-                valid: h.magic.load(Ordering::Acquire) == MAGIC,
+                valid: h.magic.load(Ordering::Acquire) == MAGIC && h.layout.load(Ordering::Relaxed) == LAYOUT,
                 pid: h.pid.load(Ordering::Relaxed),
                 params_crc: h.params_crc.load(Ordering::Relaxed),
                 seq: h.seq.load(Ordering::Acquire),

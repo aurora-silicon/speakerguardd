@@ -446,6 +446,9 @@ struct Cl {
     valid: bool,
     t_cl: f64,
     limit_s: f64,
+    /// Diagnostics of the last completed window (NaN before the first).
+    last_v_ms: f64,
+    last_i_ms: f64,
 }
 
 impl Cl {
@@ -506,6 +509,8 @@ impl Cl {
             valid: false,
             t_cl: tc,
             limit_s: c.temperature_limit as f64,
+            last_v_ms: f64::NAN,
+            last_i_ms: f64::NAN,
         })
     }
 
@@ -518,6 +523,8 @@ impl Cl {
         self.valid = false;
         self.t_cl = self.cal_t;
         self.limit_s = limit;
+        self.last_v_ms = f64::NAN;
+        self.last_i_ms = f64::NAN;
     }
 
     /// Raw telemetry of one segment. TODO(SPEC): the sensor's DC-block /
@@ -538,6 +545,8 @@ impl Cl {
                 self.n = 0;
                 self.v_sq = 0.0;
                 self.i_sq = 0.0;
+                self.last_v_ms = v_ms;
+                self.last_i_ms = i_ms;
                 if v_ms.is_finite() && i_ms.is_finite() && v_ms > self.v_floor && i_ms > self.i_floor {
                     let r = libm::sqrt(v_ms / i_ms);
                     let rs = match self.r_s {
@@ -1018,6 +1027,9 @@ impl ProtectionUnit for Unit {
                     s.cl_temp_c = cl.t_cl as f32;
                     s.tlim_adj_c = (cl.limit_s - c.limit) as f32;
                     s.closed_loop = true;
+                    s.sense_v_ms = cl.last_v_ms as f32;
+                    s.sense_i_ms = cl.last_i_ms as f32;
+                    s.sense_r_ohm = libm::sqrt(cl.last_v_ms / cl.last_i_ms) as f32;
                 }
                 None => {
                     s.cl_temp_c = T_CL_UNMEASURED;
