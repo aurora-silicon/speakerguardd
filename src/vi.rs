@@ -437,60 +437,53 @@ mod tests {
         assert!(g.armed);
     }
     #[test]
-    fn vi_only_matches_201_f32_measured_model_and_ramp() {
+    fn vi_only_matches_unmodified_201_reference_bit_for_bit() {
         let c = config();
-        for spec in &c.speakers {
-            let mut m = Model::new(spec, &c);
-            m.coil = 125.0;
-            m.magnet = 90.0;
-            m.coil_hold = 125.0;
-            m.magnet_hold = 90.0;
-            let mut tc = m.coil;
-            let mut tm = m.magnet;
-            let mut hc = m.coil_hold;
-            let mut hm = m.magnet_hold;
-            let rate = 48000u32;
-            let dt = 1f32 / rate as f32;
-            let ac = (dt / (spec.tau_coil as f32 + dt)) as f64;
-            let am = (dt / (spec.tau_magnet as f32 + dt)) as f64;
-            for amplitude in [100i16, 500, 1000, 2000, 3000, 1000, 0] {
-                let mut words = vec![0; 8 * c.globals.period];
-                for f in words.chunks_exact_mut(8) {
-                    f[spec.vs_chan] = i32::from(amplitude) << 16;
-                    f[spec.is_chan.unwrap()] = i32::from(amplitude) << 16;
-                }
-                // Independent scalar transcription of the 2.0.1 policy.
-                let v = amplitude as f32 / 32768.0 * spec.vs_scale as f32;
-                let i = amplitude as f32 / 32768.0 * spec.is_scale as f32;
-                for _ in 0..c.globals.period {
-                    let drive_c = tm + (v * i * spec.tr_coil as f32) as f64;
-                    let drive_m =
-                        (c.globals.t_ambient as f32 + v * i * spec.tr_magnet as f32) as f64;
-                    tc = drive_c * ac + tc * (1.0 - ac);
-                    tm = drive_m * am + tm * (1.0 - am);
-                }
-                hc = hc
-                    .max(tc as f32)
-                    .min(tc as f32 + c.globals.t_hysteresis as f32);
-                hm = hm
-                    .max(tm as f32)
-                    .min(tm as f32 + c.globals.t_hysteresis as f32);
-                let max_p = (spec.t_limit as f32 - c.globals.t_ambient as f32)
-                    / (spec.tr_coil as f32 + spec.tr_magnet as f32);
-                let peak_p =
-                    10f32.powf(c.globals.amp_gain_dbv as f32 / 10.0) / spec.z_nominal as f32 * 2.0;
-                let min_gain = (10.0 * (max_p / peak_p).log10()).min(0.0);
-                let mut gain = min_gain
-                    * ((hc.max(hm) - (spec.t_limit as f32 - c.globals.t_window as f32))
-                        / c.globals.t_window as f32)
-                        .max(0.0);
-                if gain > -0.01 {
-                    gain = 0.0;
-                }
-                m.period(&c, &words, rate).unwrap();
-                assert_eq!((m.coil, m.magnet, m.gain), (tc, tm, gain));
+        let mut models: Vec<_> = c
+            .speakers
+            .iter()
+            .map(|s| {
+                let mut m = Model::new(s, &c);
+                m.coil = 125.0;
+                m.magnet = 90.0;
+                m.coil_hold = 125.0;
+                m.magnet_hold = 90.0;
+                m
+            })
+            .collect();
+        let csv = include_str!("../tests/data/j613-201-golden.csv");
+        let mut count = 0;
+        for row in csv.lines().skip(1) {
+            let columns: Vec<_> = row.split(',').collect();
+            let m = models
+                .iter_mut()
+                .find(|m| m.spec.name == columns[0])
+                .unwrap();
+            let amplitude = columns[1].parse::<i16>().unwrap();
+            let mut words = vec![0; c.globals.channels * c.globals.period];
+            for frame in words.chunks_exact_mut(c.globals.channels) {
+                frame[m.spec.vs_chan] = i32::from(amplitude) << 16;
+                frame[m.spec.is_chan.unwrap()] = i32::from(amplitude) << 16;
             }
+            m.period(&c, &words, 48000).unwrap();
+            assert_eq!(
+                m.coil.to_bits(),
+                u64::from_str_radix(columns[2], 16).unwrap(),
+                "coil {row}"
+            );
+            assert_eq!(
+                m.magnet.to_bits(),
+                u64::from_str_radix(columns[3], 16).unwrap(),
+                "magnet {row}"
+            );
+            assert_eq!(
+                m.gain.to_bits(),
+                u32::from_str_radix(columns[4], 16).unwrap(),
+                "gain {row}"
+            );
+            count += 1;
         }
+        assert_eq!(count, 28);
     }
 }
 
