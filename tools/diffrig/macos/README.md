@@ -23,6 +23,7 @@ Traces made with Apple tuning are Apple-derived data. They never enter this repo
 | `au_discover.m` | Lists a unit's element counts, custom properties (with CF values) and read-only meters. |
 | `capture.py` | The case list. It runs every case through `rig_host` and writes `trace.jsonl` in `../schema.json`, the per-quantum meter CSV, the audio and the unit's own logs. |
 | `capture_edge.py` | Edge-case list: atsp on each AID's own preset (no meters; the trace carries the audio gain and per-slice sample-gain extremes), spp3 closed-loop sense faults and gates (`spp3-cl-edge-*`), and fractional-Rampout AIDs (`spp3-rampout-*`). Its spp3 closed-loop cases decode the unit's coil-temperature and controller logs into `clsp.npz` and require every record (they rerun at a lower pace otherwise). Outputs are gzipped; `compare.py` and `run.py` read the `.gz` forms. |
+| `test_rig_host.py` | Exit-status tests for `rig_host` and `prefshim` after `make`: argument bounds, refused or unreadable `--cfprop`, render errors (`--test-fail-at`), short renders and whole-component redirects. It renders a short synthetic signal offline into a temporary directory and deletes it. |
 | `lsm2logs.py` | Decoder for the lsm2 native logs (record framing per the lsm2 behaviour specification). |
 
 `rig_host` options used by the edge cases:
@@ -38,7 +39,7 @@ SGV2_RIG_DIR=... SGV2_RIG_BIN=$PWD python3 capture.py "$SGV2_RIG_DIR/traces" [ca
 python3 ../run.py "$SGV2_RIG_DIR/traces" "$SGV2_RIG_DIR/signals" OUT   # the Linux side, then compare
 ```
 
-`capture.py` needs numpy. `capture_edge.py OUT [substring ...]` runs the edge list the same way. A case whose unit log has an `*_OVERWRITE.txt` file is rerun at a lower pace, because records were lost.
+`rig_host` exits nonzero when a `--cfprop` is refused or does not parse, when a render call fails, or when fewer frames were rendered than read; `capture.py` also checks `render_error` and `frames` in the meta. Both refuse to run as root. `capture.py --self-test` checks the case plumbing without a Mac. `capture.py` needs numpy. `capture_edge.py OUT [substring ...]` runs the edge list the same way. A case whose unit log has an `*_OVERWRITE.txt` file is rerun at a lower pace, because records were lost.
 
 ## Observed host facts
 

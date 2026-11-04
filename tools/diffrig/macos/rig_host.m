@@ -13,6 +13,9 @@
 //            [--event FRAME:reset|FRAME:sleep=S|FRAME:tsjump=N ...] [--every K] --out PREFIX
 // in.f32 is interleaved float32 with N channels. Outputs: PREFIX.out.f32 (interleaved),
 // PREFIX.state.csv, PREFIX.tele.f32 (telemetry actually fed), PREFIX.meta.json.
+// Exit status: 0 only when every frame read was rendered. A refused --cfprop or a CF
+// property file that does not parse is fatal (1); a render error or a short render
+// exits 3 after writing the meta (render_error, frames, frames_read).
 #import <AudioToolbox/AudioToolbox.h>
 #import <Foundation/Foundation.h>
 #include <dlfcn.h>
@@ -22,6 +25,10 @@
 #define MAXQ 4096
 #define MAXTELE 16
 #define MAXEV 256
+#define MAXPROP 32
+#define MAXCF 16
+#define MAXPL 8
+#define MAXMETERS 4096
 
 static UInt32 fcc(const char *s) { return ((UInt32)s[0] << 24) | ((UInt32)s[1] << 16) | ((UInt32)s[2] << 8) | (UInt32)s[3]; }
 static void ck(OSStatus s, const char *w) { if (s) { fprintf(stderr, "%s: %d\n", w, (int)s); } }
@@ -203,15 +210,18 @@ static AudioStreamBasicDescription fmt(double sr, UInt32 ch, bool ni) {
 typedef struct { AudioUnitScope sc; AudioUnitElement el; AudioUnitParameterID id; char name[128]; } Meter;
 
 int main(int argc, const char **argv) {
+    int rc = 0;
+    if (geteuid() == 0) { fprintf(stderr, "refusing to run as root: a missed log redirect would write system directories\n"); return 2; }
     @autoreleasepool {
         const char *unit = "spp3", *strip = NULL, *sidecar = NULL, *spts = NULL, *in = NULL, *tele = NULL,
                    *plant = NULL, *out = NULL;
         int nch = 0, q = 512, telech = 12, every = 1, notele = 0;
+        long long failAt = -1; // --test-fail-at FRAME: the rig's own tests; simulates a render error there
         double pace = 0; int maxframes = 0; // >0: render at most pace x real time (lets the units' async log writers keep up)
         double sr = 48000;
-        UInt32 propIds[32], propVals[32]; int nprops = 0;
-        UInt32 cfIds[16]; const char *cfPaths[16]; int ncf = 0;
-        UInt32 plIds[8]; const char *plPaths[8]; int npl = 0;
+        UInt32 propIds[MAXPROP], propVals[MAXPROP]; int nprops = 0;
+        UInt32 cfIds[MAXCF]; const char *cfPaths[MAXCF]; int ncf = 0;
+        UInt32 plIds[MAXPL]; const char *plPaths[MAXPL]; int npl = 0;
         // --event FRAME:reset | FRAME:sleep=SECONDS | FRAME:tsjump=FRAMES, applied before the
         // first render call that starts at or after FRAME
         long long evFrame[16]; char evKind[16][16]; double evArg[16]; int nevt = 0, nextevt = 0;
@@ -224,9 +234,23 @@ int main(int argc, const char **argv) {
             else if (ARG("--q")) q = atoi(v); else if (ARG("--sr")) sr = atof(v); else if (ARG("--tele")) tele = v;
             else if (ARG("--tele-ch")) telech = atoi(v); else if (ARG("--plant")) plant = v;
             else if (ARG("--every")) every = atoi(v); else if (ARG("--pace")) pace = atof(v); else if (ARG("--maxframes")) maxframes = atoi(v); else if (ARG("--out")) out = v;
-            else if (ARG("--prop")) { sscanf(v, "%u=%u", &propIds[nprops], &propVals[nprops]); nprops++; }
-            else if (ARG("--plistprop")) { char *eq = strchr(v, '='); plIds[npl] = (UInt32)atoi(v); plPaths[npl++] = eq + 1; }
-            else if (ARG("--cfprop")) { char *eq = strchr(v, '='); cfIds[ncf] = (UInt32)atoi(v); cfPaths[ncf++] = eq + 1; }
+            else if (ARG("--prop")) {
+                if (nprops >= MAXPROP) { fprintf(stderr, "too many --prop (max %d)\n", MAXPROP); return 2; }
+                if (sscanf(v, "%u=%u", &propIds[nprops], &propVals[nprops]) != 2) { fprintf(stderr, "bad --prop %s\n", v); return 2; }
+                nprops++;
+            }
+            else if (ARG("--plistprop")) {
+                const char *eq = strchr(v, '=');
+                if (npl >= MAXPL) { fprintf(stderr, "too many --plistprop (max %d)\n", MAXPL); return 2; }
+                if (!eq || eq == v || !eq[1]) { fprintf(stderr, "bad --plistprop %s\n", v); return 2; }
+                plIds[npl] = (UInt32)atoi(v); plPaths[npl++] = eq + 1;
+            }
+            else if (ARG("--cfprop")) {
+                const char *eq = strchr(v, '=');
+                if (ncf >= MAXCF) { fprintf(stderr, "too many --cfprop (max %d)\n", MAXCF); return 2; }
+                if (!eq || eq == v || !eq[1]) { fprintf(stderr, "bad --cfprop %s\n", v); return 2; }
+                cfIds[ncf] = (UInt32)atoi(v); cfPaths[ncf++] = eq + 1;
+            }
             else if (ARG("--event")) {
                 if (nevt >= 16) { fprintf(stderr, "too many --event\n"); return 2; }
                 char kind[16] = {0}; double arg = 0; long long fr = 0;
@@ -237,10 +261,13 @@ int main(int argc, const char **argv) {
                 if (nevt && fr < evFrame[nevt - 1]) { fprintf(stderr, "--event frames must ascend\n"); return 2; }
                 evFrame[nevt] = fr; strcpy(evKind[nevt], kind); evArg[nevt] = arg; nevt++;
             }
+            else if (ARG("--test-fail-at")) failAt = atoll(v);
             else if (!strcmp(a, "--no-tele")) notele = 1;
             else { fprintf(stderr, "bad arg %s\n", a); return 2; }
         }
         if (!strip || !in || !nch || !out || q > MAXQ || nch > MAXCH) { fprintf(stderr, "missing args\n"); return 2; }
+        if (q < 1 || nch < 1 || every < 1) { fprintf(stderr, "--q, --ch and --every must be positive\n"); return 2; }
+        if (telech < 1 || telech > MAXTELE) { fprintf(stderr, "--tele-ch must be 1..%d\n", MAXTELE); return 2; }
         B.nch = nch; B.telech = telech;
         UInt32 compVersion = 0;
         AudioUnit au = makeUnit(unit, &compVersion);
@@ -265,7 +292,9 @@ int main(int argc, const char **argv) {
         }
         for (int i = 0; i < ncf; ++i) {
             // JSON -> CF property list; strings of the form "fcc:XXXX" become 4CC UInt32 numbers
-            id obj = [NSJSONSerialization JSONObjectWithData:[NSData dataWithContentsOfFile:@(cfPaths[i])] options:0 error:nil];
+            NSData *raw = [NSData dataWithContentsOfFile:@(cfPaths[i])];
+            id obj = raw ? [NSJSONSerialization JSONObjectWithData:raw options:0 error:nil] : nil;
+            if (!obj) { fprintf(stderr, "FATAL cfprop %u: %s is missing or not JSON\n", cfIds[i], cfPaths[i]); exit(1); }
             id (^__block conv)(id) = nil;
             id (^fix)(id) = ^id(id o) {
                 if ([o isKindOfClass:NSString.class] && [o hasPrefix:@"fcc:"] && [o length] == 8) return @(fcc([[o substringFromIndex:4] UTF8String]));
@@ -278,6 +307,7 @@ int main(int argc, const char **argv) {
             CFTypeRef cf = (__bridge CFTypeRef)obj;
             OSStatus r = AudioUnitSetProperty(au, cfIds[i], 0, 0, &cf, sizeof cf);
             fprintf(stderr, "cfprop %u <- %s : %d\n", cfIds[i], cfPaths[i], (int)r);
+            die(r, "cfprop"); // a refused run-time property would give a reference that only looks valid
         }
         if (spts) {
             CFDataRef d = (__bridge CFDataRef)[NSData dataWithContentsOfFile:@(spts)];
@@ -302,7 +332,7 @@ int main(int argc, const char **argv) {
         AudioUnitGetProperty(au, kAudioUnitProperty_Latency, 0, 0, &lat, &sz);
 
         // meters: every non-writable parameter in global scope and in each Part element
-        Meter *m = calloc(4096, sizeof *m); int nm = 0;
+        Meter *m = calloc(MAXMETERS, sizeof *m); int nm = 0;
         for (AudioUnitScope sc = 0; sc <= 4; ++sc) {
             UInt32 lsz = 0;
             if (AudioUnitGetPropertyInfo(au, kAudioUnitProperty_ParameterList, sc, 0, &lsz, NULL) || !lsz) continue;
@@ -317,6 +347,7 @@ int main(int argc, const char **argv) {
                 char nm0[100] = {0};
                 if (pi.cfNameString) CFStringGetCString(pi.cfNameString, nm0, sizeof nm0, kCFStringEncodingUTF8);
                 for (UInt32 e = 0; e < nel; ++e) {
+                    if (nm >= MAXMETERS) { fprintf(stderr, "FATAL more than %d meters\n", MAXMETERS); exit(1); }
                     m[nm].sc = sc; m[nm].el = e; m[nm].id = ids[k];
                     snprintf(m[nm].name, sizeof m[nm].name, "s%u.e%u.p%u:%s", sc, e, ids[k], nm0);
                     for (char *c = m[nm].name; *c; ++c) if (*c == ',' || *c == ' ') *c = '_';
@@ -342,11 +373,12 @@ int main(int argc, const char **argv) {
         AudioBufferList *abl = calloc(1, offsetof(AudioBufferList, mBuffers) + MAXCH * sizeof(AudioBuffer));
         static float outb[MAXCH][MAXQ], inter[MAXQ * MAXCH];
         abl->mNumberBuffers = nch;
-        UInt64 done = 0; long quanta = 0;
+        UInt64 done = 0, nread = 0; long quanta = 0;
         int failed = 0;
         for (;;) {
             size_t got = fread(inter, sizeof(float) * nch, q, fin);
             if (!got) break;
+            nread += got;
             for (size_t i = 0; i < got; ++i) for (int c = 0; c < nch; ++c) B.audio[c][i] = inter[i * nch + c];
             if (haveTeleBus) {
                 if (ftele) {
@@ -376,7 +408,7 @@ int main(int argc, const char **argv) {
             }
             AudioTimeStamp ts = {.mSampleTime = (Float64)done + tsOffset, .mFlags = kAudioTimeStampSampleTimeValid};
             AudioUnitRenderActionFlags fl = 0;
-            OSStatus s = AudioUnitRender(au, &fl, &ts, 0, (UInt32)got, abl);
+            OSStatus s = failAt >= 0 && (long long)done >= failAt ? -1 : AudioUnitRender(au, &fl, &ts, 0, (UInt32)got, abl);
             if (s) { fprintf(stderr, "render %d at %llu\n", (int)s, done); failed = s; break; }
             for (size_t i = 0; i < got; ++i) for (int c = 0; c < nch; ++c) inter[i * nch + c] = outb[c][i];
             fwrite(inter, sizeof(float) * nch, got, fo);
@@ -393,17 +425,22 @@ int main(int argc, const char **argv) {
             if (pace > 0) usleep((useconds_t)(1e6 * got / sr / pace));
             if (got < (size_t)q) break;
         }
+        if (ferror(fin)) { fprintf(stderr, "input read error after %llu frames\n", nread); if (!failed) failed = -1; }
         if (pace > 0) usleep(500000); // final drain of the units' log writers
         fclose(fo); fclose(fs); if (ft) fclose(ft);
         snprintf(path, sizeof path, "%s.meta.json", out); FILE *fm = fopen(path, "w");
         fprintf(fm, "{\"unit\":\"%s\",\"component_version\":\"0x%x\",\"strip\":\"%s\",\"sidecar\":\"%s\","
                 "\"spts\":%s,\"quantum\":%d,\"sr\":%g,\"channels\":%d,\"tele_bus\":%d,\"tele_source\":\"%s\","
-                "\"pace\":%g,\"latency_s\":%.12g,\"frames\":%llu,\"meters\":%d,\"render_error\":%d}\n",
+                "\"pace\":%g,\"latency_s\":%.12g,\"frames\":%llu,\"frames_read\":%llu,\"meters\":%d,\"render_error\":%d}\n",
                 unit, compVersion, strip, sidecar ? sidecar : "", spts ? "true" : "false", q, sr, nch, haveTeleBus,
-                tele ? tele : plant ? plant : "zeros", pace, lat, done, nm, failed);
+                tele ? tele : plant ? plant : "zeros", pace, lat, done, nread, nm, failed);
         fclose(fm);
         AudioUnitUninitialize(au); AudioComponentInstanceDispose(au);
         fprintf(stderr, "done %llu frames, %d meters, latency %.6f s\n", done, nm, lat);
+        if (failed || done != nread) {
+            fprintf(stderr, "FAILED: render error %d, rendered %llu of %llu frames read\n", failed, done, nread);
+            rc = 3;
+        }
     }
-    return 0;
+    return rc;
 }

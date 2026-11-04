@@ -76,8 +76,14 @@ static const char *redir(const char *p, char *buf, size_t n) {
     const char *f = getenv("RIGREDIR_FROM"), *t = getenv("RIGREDIR_TO");
     if (!p || !f || !t) return p;
     size_t fl = strlen(f);
-    if (strncmp(p, f, fl)) return p;
-    snprintf(buf, n, "%s%s", t, p + fl);
+    while (fl > 1 && f[fl - 1] == '/') --fl;
+    // whole path components only: FROM matches FROM and FROM/..., not FROMsibling
+    if (strncmp(p, f, fl) || (p[fl] && p[fl] != '/')) return p;
+    if ((size_t)snprintf(buf, n, "%s%s", t, p + fl) >= n) {
+        // never fall back to the original path: that would write the real directory
+        fprintf(stderr, "prefshim: redirect of %s does not fit; aborting\n", p);
+        abort();
+    }
     if (getenv("RIGPREF_TRACE")) fprintf(stderr, "prefshim: redirect %s -> %s\n", p, buf);
     return buf;
 }
