@@ -222,11 +222,30 @@ def cases():
     rs = {"none": [], "reset": ["reset"], "classinfo": ["classinfo"], "uninit": ["uninit"],
           "uninit0": ["uninit=0"], "reinit": ["reinit"], "newinst": ["newinst"], "newinst0": ["newinst=0"],
           "newinst1": ["newinst=1"], "newinstci0": ["newinst_ci=0"], "newinstci": ["newinst_ci"]}
+    # The unit's log writer drops its unflushed records when the instance is reset or rebuilt:
+    # 2 s of host idle before the event lets it drain (idle alone is a no-op, FINDINGS-safetlim).
     for k, e in rs.items():
         C.append(case(f"restore-{k}", [tone(12, 0.7)], cl=False, clsp=True, sidecar_patch=st,
-                      events=[f"{ev}:{x}" for x in e]))
+                      events=[f"{ev}:sleep=2"] + [f"{ev}:{x}" for x in e]))
     for k in ("reset", "newinst0"):
-        C.append(case(f"restore-cl-{k}", [tone(12, 0.7)], sidecar_patch=st, events=[f"{ev}:{rs[k][0]}"]))
+        C.append(case(f"restore-cl-{k}", [tone(12, 0.7)], sidecar_patch=st,
+                      events=[f"{ev}:sleep=2", f"{ev}:{rs[k][0]}"]))
+    # ---- output gain dezipper against the host slice (snap at each render call start) ----
+    for q in (128, 256, 160, 1024):
+        C.append(case(f"dz-q{q}", hp, cl=False, clsp=True, q=q))
+    # ---- input clamp: SPP3 clamps its input to +-1.5 before the drive power and the output ----
+    C.append(case("clip", [tone(1, 1.4), tone(1, 2.0), tone(1, 4.0), {"dur": 0.5, "kind": "dc", "a": 1.7},
+                           {"dur": 0.5, "kind": "dc", "a": -3.0}], cl=False, clsp=True))
+    # ---- fuzz finding 15: constant drive with fast taus / fast release (does macOS limit-cycle?) ----
+    f15 = {"b": ({"Thermal_GainAttackTime_s": 1.87, "Thermal_GainReleaseTime_s": 0.045},
+                 {"tau_Tvc": 0.021, "tau_Tmg": 0.022, "TemperatureLimit": 75, "HardTempLimitHeadroom": 10.5}, 0.7, 1000.0),
+           "b-tau01": ({"Thermal_GainAttackTime_s": 1.87, "Thermal_GainReleaseTime_s": 0.045},
+                       {"tau_Tvc": 0.1, "tau_Tmg": 0.105, "TemperatureLimit": 75, "HardTempLimitHeadroom": 10.5}, 0.7, 1000.0),
+           "a": ({"Thermal_GainAttackTime_s": 2.0, "Thermal_GainReleaseTime_s": 5.0},
+                 {"tau_Tvc": 0.5, "tau_Tmg": 5.0, "TemperatureLimit": 90, "HardTempLimitHeadroom": 11.9}, 1.122032, 1012.14)}
+    for k, (g, ot, a, f) in f15.items():
+        C.append(case(f"f15-{k}", [tone(30, a, f)], cl=False, clsp=True, dump_params=True,
+                      sidecar_patch={"global": g, "OL_thermal": ot}))
     return C
 
 
@@ -239,7 +258,11 @@ def main(argv):
             continue
         if mode and (mode == "cl") != bool(c.get("cfprops")):
             continue
-        d = ce.run_case(c, out, force=bool(sel))
+        try:
+            d = ce.run_case(c, out, force=bool(sel))
+        except RuntimeError as e:  # one lossy case must not stop the batch
+            print(f"{c['name']}: FAILED {e}", flush=True)
+            continue
         m = json.load(open(os.path.join(d, "run.meta.json")))
         print(f"{c['name']}: frames={m['frames']} wall={m['wall_s']}s pace={m.get('pace')} "
               f"err={m['render_error']} cl={m.get('closed_loop_channels')} rec={m.get('clsp_records')}", flush=True)
