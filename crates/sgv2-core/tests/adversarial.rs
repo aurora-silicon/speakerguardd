@@ -1817,7 +1817,6 @@ fn non_finite_failsafe_region_is_slice_invariant() {
 /// `ag^2 Reb / (Reb + Rshunt + Rampout)^2` goes to zero, so the model never
 /// heats and full scale passes at unity.
 #[test]
-#[ignore = "FINDING 7 (decision for lane B): accepted blobs that disable protection"]
 fn hostile_but_valid_blobs_do_not_pass_through() {
     let x = vec![vec![1.0f32; 48_000 * 10]; 1];
     // the last second of 10 s of full-scale drive leaves at unity

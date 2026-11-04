@@ -409,6 +409,64 @@ impl Params {
                 c.validate_closed_loop()?;
             }
         }
+        self.validate_physical()
+    }
+
+    /// Physical ranges. A blob can be finite and well-formed and still
+    /// describe a speaker that never heats or a limit no coil has, and then
+    /// full scale passes at unity (`TemperatureLimit = f32::MAX`, a
+    /// smoother that never moves, a kilohm of series resistance). Every
+    /// bound is far outside any laptop speaker yet tight enough that the
+    /// model always heats and the controller always acts:
+    /// - ambient -40..100 C, limits -40..250 C (voice coils are rated well
+    ///   below 250 C; the closed loop can add at most `TlimAdjCap`), hard
+    ///   headroom within +-50 K;
+    /// - gain attack and release at most 600 s, thermal time constants at
+    ///   most 3600 s;
+    /// - thermal resistances 0.01..1000 K/W for the coil, at most 1000 K/W
+    ///   for the magnet;
+    /// - `Reb_ref` 0.1..100 ohm and the series resistance (`Rshunt +
+    ///   Rampout`) at most `Reb_ref`: a sense shunt and an amplifier output
+    ///   are a small fraction of the coil, and with more than the coil in
+    ///   series the modelled power `ag^2 Reb / (Reb + Rs)^2` collapses;
+    /// - amplifier volts at full scale `ag` 0.1..1000 V;
+    /// - start rises at most 500 K.
+    fn validate_physical(&self) -> Result<(), InitError> {
+        let within = |v: f32, lo: f32, hi: f32| v.is_finite() && v >= lo && v <= hi;
+        if !within(self.thermal_ambient_temp, -40.0, 100.0) {
+            return Err(InitError::Invalid("ambient outside -40..100 C"));
+        }
+        if !(within(self.thermal_gain_attack_time_s, 0.0, 600.0)
+            && within(self.thermal_gain_release_time_s, 0.0, 600.0))
+        {
+            return Err(InitError::Invalid("gain attack/release above 600 s"));
+        }
+        for c in &self.ch[..self.channels as usize] {
+            if !within(c.temperature_limit, -40.0, 250.0) {
+                return Err(InitError::Invalid("TemperatureLimit outside -40..250 C"));
+            }
+            if !within(c.hard_temp_limit_headroom, -50.0, 50.0) {
+                return Err(InitError::Invalid("HardTempLimitHeadroom outside +-50 K"));
+            }
+            if !(within(c.tau_tvc, 0.0, 3600.0) && within(c.tau_tmg, 0.0, 3600.0)) {
+                return Err(InitError::Invalid("thermal time constant above 3600 s"));
+            }
+            if !(within(c.t_sett_vc, 0.01, 1000.0) && within(c.t_sett_mg, 0.0, 1000.0)) {
+                return Err(InitError::Invalid("thermal resistance outside 0.01..1000 K/W"));
+            }
+            if !within(c.reb_ref, 0.1, 100.0) || !within(c.rshunt + c.rampout, 0.0, c.reb_ref) {
+                return Err(InitError::Invalid("Reb_ref outside 0.1..100 ohm or series resistance above it"));
+            }
+            if !within(c.ag, 0.1, 1000.0) {
+                return Err(InitError::Invalid("ag outside 0.1..1000 V"));
+            }
+            if !(within(c.initial_theta_vc, 0.0, 500.0) && within(c.initial_theta_mg, 0.0, 500.0)) {
+                return Err(InitError::Invalid("start state above 500 K"));
+            }
+            if c.cl_thermal_feedback_enabled != 0 && c.tlim_adj_cap > 100.0 {
+                return Err(InitError::Invalid("TlimAdjCap above 100 K"));
+            }
+        }
         Ok(())
     }
 
