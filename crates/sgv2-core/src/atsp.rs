@@ -175,7 +175,11 @@ struct Chan {
 struct Group {
     r_attack: f32,
     r_release: f32,
+    /// Smoother state: the gain of the last frame generated.
     gain: f32,
+    /// The current block's target and pole (set at the block end before).
+    target: f32,
+    r: f32,
     hard: bool,
 }
 
@@ -186,7 +190,8 @@ struct Run {
     rate: f64,
     ch: Vec<Chan>,
     groups: Vec<Group>,
-    /// Gain of every frame of the current block, per group.
+    /// Gain of the current segment's frames, per group, generated as the
+    /// frames are processed (never a whole host-block-mode capacity ahead).
     curve: Vec<f32>,
     pos: usize,
     frame: u64,
@@ -243,6 +248,8 @@ impl Run {
                     r_attack: pole(rate, s.attack_ms as f64 * 1e-3),
                     r_release: pole(rate, s.release_ms as f64 * 1e-3),
                     gain: 1.0,
+                    target: 1.0,
+                    r: 0.0,
                     hard: false,
                 });
                 groups.len() - 1
@@ -306,9 +313,10 @@ impl Run {
         }
         for g in self.groups.iter_mut() {
             g.gain = 1.0;
+            g.target = 1.0;
+            g.r = 0.0;
             g.hard = false;
         }
-        self.curve.iter_mut().for_each(|g| *g = 1.0);
         self.pos = 0;
         self.frame = 0;
         self.last_frame = 0;
@@ -320,10 +328,24 @@ impl Run {
     fn segment(&mut self, io: &mut Io<'_, '_>, off: usize, len: usize) -> bool {
         let phase = self.pos;
         let mut failed = false;
+        // per group: the smoother toward this block's target, frame by frame
+        for (gi, g) in self.groups.iter_mut().enumerate() {
+            let curve = &mut self.curve[gi * self.block..][..len];
+            let (t, r) = (g.target, g.r);
+            let mut v = g.gain;
+            for c in curve.iter_mut() {
+                v = t + r * (v - t);
+                *c = v;
+            }
+            g.gain = v;
+            if g.hard {
+                curve.iter_mut().for_each(|c| *c *= FAILSAFE_GAIN);
+            }
+        }
         for (c, ch) in self.ch.iter_mut().enumerate() {
             let inp = &io.input[c][off..off + len];
             let out = &mut io.output[c][off..off + len];
-            let curve = &self.curve[ch.group * self.block + phase..][..len];
+            let curve = &self.curve[ch.group * self.block..][..len];
             // the unprotected and the protected drive as the meters see them
             let mut k = 0;
             while k < len {
@@ -406,23 +428,12 @@ impl Run {
         }
         for (gi, g) in self.groups.iter_mut().enumerate() {
             let t = tgt[gi] as f32;
-            let r = if t < g.gain { g.r_attack } else { g.r_release };
-            let curve = &mut self.curve[gi * self.block..][..self.block];
-            // (in host-block mode the next call reads this curve from its
-            // first frame, so the full capacity is filled)
-            let mut v = g.gain;
-            for c in curve.iter_mut() {
-                v = t + r * (v - t);
-                *c = v;
-            }
-            g.gain = v;
-            if !v.is_finite() {
+            g.r = if t < g.gain { g.r_attack } else { g.r_release };
+            g.target = t;
+            if !(g.gain.is_finite() && t.is_finite()) {
                 self.fault = true;
             }
             g.hard = hard[gi];
-            if g.hard {
-                curve.iter_mut().for_each(|c| *c *= FAILSAFE_GAIN);
-            }
         }
         self.last_frame = self.frame - self.pos as u64;
     }
@@ -543,12 +554,12 @@ impl ProtectionUnit for Unit {
             g[c.group] = g[c.group].min(state.gain[i]);
             hard[c.group] |= c.hard;
         }
-        // the first block's curve holds the restored gain (and the panic)
+        // the first block holds the restored gain (and the panic)
         for (gi, grp) in run.groups.iter_mut().enumerate() {
             grp.gain = release_toward_unity(g[gi], grp.r_release as f64, t * rate as f64) as f32;
+            grp.target = grp.gain;
+            grp.r = 0.0;
             grp.hard = hard[gi];
-            let v = if grp.hard { grp.gain * FAILSAFE_GAIN } else { grp.gain };
-            run.curve[gi * run.block..][..run.block].iter_mut().for_each(|c| *c = v);
         }
         true
     }
