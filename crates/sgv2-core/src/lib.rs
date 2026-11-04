@@ -32,7 +32,7 @@ pub mod spp3;
 pub mod telemetry;
 
 pub use failsafe::FailSafe;
-pub use telemetry::{ChannelState, Telemetry};
+pub use telemetry::{ChannelState, GlobalState, Telemetry};
 
 /// The most speaker channels any supported Mac has (six on the 14" and 16"
 /// MacBook Pro), rounded up for headroom. Fixed so state is preallocated.
@@ -129,6 +129,12 @@ pub trait ProtectionUnit {
     /// reconstruct.
     fn host_reset(&mut self) {
         self.reset();
+    }
+    /// Change one AU parameter at run time (the unit's own ID map), taking
+    /// effect at the next call. False when the unit has no such run-time
+    /// parameter.
+    fn set_parameter(&mut self, _id: u32, _value: f32) -> bool {
+        false
     }
     /// Copy the persistent thermal state for a later stream or instance of
     /// the same unit. Real-time safe. False when there is nothing to hand

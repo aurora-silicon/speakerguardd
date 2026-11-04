@@ -423,6 +423,7 @@ pub mod lsm2_ids {
     /// velocity, acceleration.
     pub const MANAGER_ADMITTANCE: u32 = 1;
     pub const MANAGER_DISPLACEMENT: u32 = 2;
+    pub const MANAGER_VELOCITY: u32 = 3;
     pub fn model(manager: u32, ty: u32, k: u32) -> u32 {
         3072 + 1024 * (3 * manager + ty) + k
     }
@@ -476,6 +477,7 @@ pub mod lsm2_ids {
     pub const C_USE_FAST_PEAK: u32 = 14;
     pub const C_LOOKAHEAD: u32 = 16;
     pub const C_ATTACK: u32 = 17;
+    pub const C_LOW_BAND_RELEASE: u32 = 18;
     pub const C_UNLINK_TEMPERATURE: u32 = 19;
     pub const C_POWER_BUDGETS_SCALE: u32 = 20;
     pub const C_FILTERBANK_LATENCY: u32 = 21;
@@ -495,7 +497,18 @@ pub mod lsm2_ids {
     pub const CH_DISPLACEMENT_LIMIT: u32 = 2;
     pub const CH_TEMP_HARD: u32 = 3;
     pub const CH_TEMP_SOFT: u32 = 4;
+    pub const CH_MASK_BAND_MIN: u32 = 5;
+    pub const CH_MASK_BAND_MAX: u32 = 6;
+    pub const CH_MASK_ATTACK: u32 = 7;
+    pub const CH_MASK_RELEASE: u32 = 8;
     pub const CH_VELOCITY_LIMIT0: u32 = 9;
+    pub const CH_MASK_ENERGY0: u32 = 12;
+    pub const CH_BAND_CENTER0: u32 = 17;
+    pub const CH_VELOCITY_IGNORE_LOW: u32 = 23;
+    pub const CH_VELOCITY_IGNORE_HIGH: u32 = 24;
+    pub const CH_MASK_ATTACK_FAST_MS: u32 = 27;
+    pub const CH_MASK_ATTACK_RANGE: u32 = 28;
+    pub const CH_BANDWIDTH: u32 = 29;
     pub const CH_AMPLITUDE_LIMIT: u32 = 16;
     pub const CH_MAX_VELOCITY_ATTEN: u32 = 22;
     pub const CH_MAX_TEMP_ATTEN: u32 = 25;
@@ -518,9 +531,6 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
         Ok(v as u32)
     };
     let refuse = |what: &str| bad(format!("{what}: the engine's payload cannot represent it (TODO(lane B))"));
-    if get(id::controller(id::C_POWER_BUDGETS_SCALE))? != 1.0 {
-        return Err(refuse("PowerBudgetsScale != 1"));
-    }
     if get(id::controller(id::C_USE_FAST_PEAK))? != 0.0 {
         return Err(refuse("UseFastPeakSampleControl"));
     }
@@ -544,11 +554,14 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
         attack_time_ms: get(id::controller(id::C_ATTACK))?,
         fast_release_time_ms: get(id::controller(id::C_FAST_RELEASE))?,
         slow_release_time_ms: get(id::controller(id::C_SLOW_RELEASE))?,
+        low_band_release_time_ms: get(id::controller(id::C_LOW_BAND_RELEASE))?,
         filterbank_latency_ms: get(id::controller(id::C_FILTERBANK_LATENCY))?,
         speaker_response_lookahead_ms: get(id::controller(id::C_LOOKAHEAD))?,
         power_time_scale_s: [0.0; 4],
         power_hard_limit_w: [0.0; 4],
         power_soft_limit_pct: [0.0; 4],
+        // spec 6.1: a legacy payload without the field maps it to 1
+        power_budgets_scale: g.get(id::controller(id::C_POWER_BUDGETS_SCALE)).unwrap_or(1.0),
         max_power_attenuation_db: get(id::amp0(id::A_MAX_ATTENUATION))?,
         low_rail_idle_power_w: 0.0,
         low_rail_power_ratio: 0.0,
@@ -576,7 +589,7 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
         if get(id::thermal(ty, id::T_ENABLE))? == 0.0 {
             return Err(bad(format!("channel {c}'s thermal type {ty} is disabled")));
         }
-        for m in [id::MANAGER_ADMITTANCE, id::MANAGER_DISPLACEMENT] {
+        for m in [id::MANAGER_ADMITTANCE, id::MANAGER_DISPLACEMENT, id::MANAGER_VELOCITY] {
             let f = |k: u32| get(id::model(m, ty, k));
             if f(id::M_ENABLE_RES1)? == 0.0 {
                 return Err(refuse(&format!("channel {c} model without resonator 1")));
@@ -595,6 +608,11 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
         }
         let a = |k: u32| get(id::model(id::MANAGER_ADMITTANCE, ty, k));
         let d = |k: u32| get(id::model(id::MANAGER_DISPLACEMENT, ty, k));
+        // TODO(SPEC): with UseGenericModelParameters* = 1 (AID44's Vel-A) the
+        // 25G83 unit takes a "family" set that neither the Vel-A nor the Imp-A
+        // nor the Adm-A fields change (rig law 1). On AID44 it equals the
+        // Vel-A preset values read here; its source on other tunings is open.
+        let v = |k: u32| get(id::model(id::MANAGER_VELOCITY, ty, k));
         let th = |k: u32| get(id::thermal(ty, k));
         let ch = |k: u32| get(id::channel(c, k));
         let model = whole(id::channel(c, id::CH_POWER_AMP_MODEL), "PowerAmpModel")?;
@@ -605,7 +623,13 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
             return Err(refuse("channels select different amplifier models"));
         }
         amp_model = Some(model);
-        p.ch[c as usize] = lsm2::ChannelParams {
+        let arr = |k0: u32, out: &mut [f32]| -> Result<()> {
+            for (j, o) in out.iter_mut().enumerate() {
+                *o = ch(k0 + j as u32)?;
+            }
+            Ok(())
+        };
+        let mut x = lsm2::ChannelParams {
             source: c,
             volts_full_scale: ch(id::CH_VOLTS_FS)?,
             parasitic_resistance: ch(id::CH_PARASITIC)?,
@@ -614,10 +638,16 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
             mms_kg: a(id::M_MMS_G)? * 1e-3,
             rms: a(id::M_RMS)?,
             kms: a(id::M_KMS)?,
+            disp_rdc: d(id::M_RDC)?,
             disp_bl: d(id::M_BL)?,
             disp_mms_kg: d(id::M_MMS_G)? * 1e-3,
             disp_rms: d(id::M_RMS)?,
             disp_kms: d(id::M_KMS)?,
+            vel_rdc: v(id::M_RDC)?,
+            vel_bl: v(id::M_BL)?,
+            vel_mms_kg: v(id::M_MMS_G)? * 1e-3,
+            vel_rms: v(id::M_RMS)?,
+            vel_kms: v(id::M_KMS)?,
             rth_vc: th(id::T_RTH_VC)?,
             tau_vc: th(id::T_TAU_VC)?,
             rth_mag: th(id::T_RTH_MG)?,
@@ -625,13 +655,34 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
             ambient: th(id::T_AMBIENT)?,
             amplitude_limit: ch(id::CH_AMPLITUDE_LIMIT)?,
             displacement_limit: ch(id::CH_DISPLACEMENT_LIMIT)?,
-            velocity_limit0: ch(id::CH_VELOCITY_LIMIT0)?,
+            mask_band_hz: [ch(id::CH_MASK_BAND_MIN)?, ch(id::CH_MASK_BAND_MAX)?],
+            mask_attack_s: ch(id::CH_MASK_ATTACK)?,
+            mask_release_s: ch(id::CH_MASK_RELEASE)?,
+            mask_attack_fast_s: ch(id::CH_MASK_ATTACK_FAST_MS)? * 1e-3,
+            mask_attack_range_db: ch(id::CH_MASK_ATTACK_RANGE)?,
             max_velocity_attenuation_db: ch(id::CH_MAX_VELOCITY_ATTEN)?,
+            velocity_ignore_low_band: flag(id::channel(c, id::CH_VELOCITY_IGNORE_LOW))?,
+            velocity_ignore_high_band: flag(id::channel(c, id::CH_VELOCITY_IGNORE_HIGH))?,
             temperature_soft_limit: ch(id::CH_TEMP_SOFT)?,
             temperature_hard_limit: ch(id::CH_TEMP_HARD)?,
             temperature_headroom: ch(id::CH_TEMP_HEADROOM)?,
             max_temperature_attenuation_db: ch(id::CH_MAX_TEMP_ATTEN)?,
+            bandwidth: whole(id::channel(c, id::CH_BANDWIDTH), "Bandwidth")?,
+            ..lsm2::ChannelParams::default()
         };
+        // rig law 6: the peak axis reserves the bank's pilot amplitude
+        // (PilotToneAmplitude_dB, offset 2 of the bank's pilot block)
+        let bank = whole(id::CH_TUNING + c, "ChTuning")?;
+        let pilot_db = get([1024, 22528, 23552][bank.min(2) as usize] + 2)?;
+        x.pilot_reserve = libm_pow10(f64::from(pilot_db) / 20.0) as f32;
+        arr(id::CH_VELOCITY_LIMIT0, &mut x.velocity_limit)?;
+        arr(id::CH_MASK_ENERGY0, &mut x.mask_energy_db)?;
+        arr(id::CH_BAND_CENTER0, &mut x.band_center_hz)?;
+        if let Some(fir) = pressure_response(t, c as usize, diags) {
+            x.pressure_taps = lsm2::PRESSURE_TAPS as u32;
+            x.pressure_fir = fir;
+        }
+        p.ch[c as usize] = x;
     }
     let model = amp_model.unwrap_or(0);
     let (idle, ratio, mid, high) = if model == 0 {
@@ -667,6 +718,60 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
         full_scale_mv,
         blob,
     })
+}
+
+fn libm_pow10(x: f64) -> f64 {
+    10f64.powf(x)
+}
+
+/// Property 6632's `ChannelData[c].PressureResponse` (spec 9.8): 1,024
+/// little-endian Float32 FIR taps. `None` (with a warning) when the strip
+/// sets no 6632 or the entry is missing or malformed: the unit then runs
+/// without the masking path, which the spec calls nonfatal but not
+/// graph-conformant.
+fn pressure_response(t: &Tuning, c: usize, diags: &mut Diagnostics) -> Option<[f32; lsm2::PRESSURE_TAPS]> {
+    let Some(f) = t.protection.property_files.iter().find(|f| f.number == 6632) else {
+        diags.warn(
+            "lsm2-6632-absent",
+            "compile",
+            "the strip sets no property 6632: no pressure response, no masking path (not graph-conformant)",
+        );
+        return None;
+    };
+    let data = f
+        .value
+        .as_dict()
+        .and_then(|d| d.get("ChannelData"))
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.get(c))
+        .and_then(|e| e.as_dict())
+        .and_then(|e| e.get("PressureResponse"))
+        .and_then(|v| v.as_data());
+    match data {
+        Some(b) if b.len() == 4 * lsm2::PRESSURE_TAPS => {
+            let mut fir = [0.0f32; lsm2::PRESSURE_TAPS];
+            for (o, w) in fir.iter_mut().zip(b.chunks_exact(4)) {
+                *o = f32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+            }
+            if fir.iter().all(|v| v.is_finite()) {
+                return Some(fir);
+            }
+            diags.warn(
+                "lsm2-6632-pressure",
+                &f.path,
+                format!("ChannelData[{c}].PressureResponse has a non-finite tap"),
+            );
+            None
+        }
+        _ => {
+            diags.warn(
+                "lsm2-6632-pressure",
+                &f.path,
+                format!("ChannelData[{c}].PressureResponse is missing or not {} taps", lsm2::PRESSURE_TAPS),
+            );
+            None
+        }
+    }
 }
 
 // ------------------------------------------------------------------ atsp

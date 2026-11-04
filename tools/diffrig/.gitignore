@@ -1,0 +1,4 @@
+macos/rig_host
+macos/au_discover
+macos/prefshim.dylib
+__pycache__/

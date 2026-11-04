@@ -402,6 +402,7 @@ fn lsm2_params(seed: u64, n: usize, rate: u32, hot: bool) -> lsm2::Params {
         attack_time_ms: r.log(0.05, 50.0),
         fast_release_time_ms: r.log(1.0, 2000.0),
         slow_release_time_ms: r.log(10.0, 30000.0),
+        low_band_release_time_ms: r.log(1.0, 2000.0),
         filterbank_latency_ms: r.uni(0.0, 5.0),
         speaker_response_lookahead_ms: r.uni(0.0, 3.0),
         power_time_scale_s: ts,
@@ -420,9 +421,11 @@ fn lsm2_params(seed: u64, n: usize, rate: u32, hot: bool) -> lsm2::Params {
     if p.control_power == 0 && p.control_temperature == 0 {
         p.control_temperature = 1;
     }
-    if p.latency_frames() < lsm2::CONTROLLER_FRAMES {
-        p.filterbank_latency_ms = (lsm2::CONTROLLER_FRAMES as f32 / 2.0 + 1.0) * 1e3 / rate as f32;
+    let cadence = lsm2::controller_frames(rate);
+    if p.latency_frames() < cadence || p.filterbank_frames() < 2 {
+        p.filterbank_latency_ms = (cadence as f32 / 2.0 + 2.0) * 1e3 / rate as f32;
     }
+    let nyq = rate as f64 / 2.0;
     let src = r.perm(n);
     for (c, &s) in src.iter().enumerate() {
         let ambient = r.uni(10.0, 45.0);
@@ -436,10 +439,16 @@ fn lsm2_params(seed: u64, n: usize, rate: u32, hot: bool) -> lsm2::Params {
             mms_kg: r.log(5e-5, 5e-3),
             rms: r.uni(0.05, 2.0),
             kms: r.log(200.0, 5000.0),
+            disp_rdc: r.uni(2.0, 8.0),
             disp_bl: r.uni(0.3, 3.0),
             disp_mms_kg: r.log(5e-5, 5e-3),
             disp_rms: r.uni(0.05, 2.0),
             disp_kms: r.log(200.0, 5000.0),
+            vel_rdc: r.uni(2.0, 8.0),
+            vel_bl: r.uni(0.3, 3.0),
+            vel_mms_kg: r.log(5e-5, 5e-3),
+            vel_rms: r.uni(0.05, 2.0),
+            vel_kms: r.log(200.0, 5000.0),
             rth_vc: r.uni(5.0, 60.0),
             tau_vc: if hot { r.log(0.01, 1.0) } else { r.log(0.1, 10.0) },
             rth_mag: r.uni(5.0, 60.0),
@@ -447,15 +456,36 @@ fn lsm2_params(seed: u64, n: usize, rate: u32, hot: bool) -> lsm2::Params {
             ambient,
             amplitude_limit: r.uni(0.1, 1.5),
             displacement_limit: r.log(1e-4, 2e-3),
-            velocity_limit0: r.uni(0.05, 2.0),
+            velocity_limit: {
+                let v0 = r.uni(0.05, 2.0);
+                [v0, v0 * r.uni(1.0, 2.0), v0 * r.uni(2.0, 3.0)]
+            },
+            mask_energy_db: {
+                let e0 = r.uni(-60.0, 40.0);
+                [e0, e0 + r.uni(0.0, 10.0), e0 + r.uni(10.0, 20.0), e0 + r.uni(20.0, 30.0)]
+            },
+            mask_band_hz: [(0.3 * nyq) as f32, (0.45 * nyq) as f32],
+            mask_attack_s: r.log(1e-3, 0.1),
+            mask_release_s: r.log(1e-2, 1.0),
+            mask_attack_fast_s: r.log(1e-3, 0.05),
+            mask_attack_range_db: r.uni(0.0, 80.0),
+            velocity_ignore_low_band: r.chance(0.5) as u32,
+            velocity_ignore_high_band: r.chance(0.5) as u32,
+            band_center_hz: {
+                let f0 = r.log(20.0, 0.01 * nyq);
+                [f0, f0 * 4.0, f0 * 10.0, f0 * 25.0, (f0 * 60.0).min((0.9 * nyq) as f32)]
+            },
+            bandwidth: (r.uni(0.0, 2.99)) as u32,
+            pilot_reserve: r.uni(0.0, 0.05),
             max_velocity_attenuation_db: r.uni(0.0, 30.0),
             temperature_soft_limit: soft,
             temperature_hard_limit: soft + r.uni(0.0, 30.0),
             temperature_headroom: r.uni(0.0, 10.0),
             max_temperature_attenuation_db: r.uni(0.0, 30.0),
+            ..lsm2::ChannelParams::default()
         };
     }
-    assert_eq!(p.validate(), Ok(()), "generator made an invalid lsm2 set: {p:?}");
+    assert_eq!(p.validate(), Ok(()), "generator made an invalid lsm2 set");
     p
 }
 
@@ -602,6 +632,11 @@ fn synth_sense(input: &[Vec<f32>], ports: usize, delay: usize) -> Vec<Vec<f32>> 
 
 /// Properties 1 and 2 on one render: every output sample is finite, and no
 /// louder than the input `latency` frames earlier (0 for a non-finite one).
+///
+/// lsm2 is a five-band limiter: an output sample mixes 319 input samples
+/// with per-band gains, so it is bounded by digital full scale, not by the
+/// one input sample at its delay (its per-frequency bound is in
+/// tests/lsm2.rs; review_bound does the same).
 fn check_bound(input: &[Vec<f32>], out: &[Vec<f32>], latency: usize, gain: f32, what: &str) {
     check_bound_pilot(input, out, latency, gain, &[], what)
 }
@@ -610,6 +645,14 @@ fn check_bound(input: &[Vec<f32>], out: &[Vec<f32>], latency: usize, gain: f32, 
 /// generated pilot tone (`pilot[c]`, missing = 0), and never above full
 /// scale: `|out| <= min(1, |in| * gain + pilot)`.
 fn check_bound_pilot(input: &[Vec<f32>], out: &[Vec<f32>], latency: usize, gain: f32, pilot: &[f32], what: &str) {
+    if what.starts_with("lsm2") {
+        for (c, y) in out.iter().enumerate() {
+            for (k, &o) in y.iter().enumerate() {
+                assert!(o.is_finite() && o.abs() <= 1.0, "{what}: output {o:e} at ch{c}[{k}]");
+            }
+        }
+        return;
+    }
     for (c, (x, y)) in input.iter().zip(out).enumerate() {
         let extra = pilot.get(c).copied().unwrap_or(0.0);
         for (k, &o) in y.iter().enumerate() {
@@ -717,7 +760,8 @@ proptest! {
         prop_assert!(!u.is_failsafe());
         let x = signal(seed ^ 1, n, len, amp, h);
         let rr = render(&mut u, &x, None, &slices(sl), &mut no_sense, false);
-        check_bound(&x, &rr.out, 0, 1.0, "atsp");
+        // the dezipper passes up to its own peak, as the reference's does
+        check_bound(&x, &rr.out, 0, atsp::DEZIPPER_PEAK, "atsp");
         check_state_finite(&rr.tele[0].1, n, "atsp");
     }
 
@@ -852,13 +896,19 @@ proptest! {
         let x = signal(seed ^ 1, n, len, amp, h);
         let mut u1 = atsp::Unit::new(p);
         let r1 = render(&mut u1, &x, None, &slices(a), &mut no_sense, false);
-        let r2 = render(&mut atsp::Unit::new(p), &x, None, &slices(b), &mut no_sense, false);
+        let mut u2 = atsp::Unit::new(p);
+        let r2 = render(&mut u2, &x, None, &slices(b), &mut no_sense, false);
         prop_assert!(bits(&r1.out) == bits(&r2.out), "audio differs between slicings");
         prop_assert_eq!(tele_bits(&r1.tele[0].1), tele_bits(&r2.tele[0].1));
+        // reset returns the thermal and gain state to `new`'s; the output
+        // dezipper is not restarted (25G83 rig), so compare two units that
+        // took the same path
         u1.reset();
+        u2.reset();
         let r3 = render(&mut u1, &x, None, &slices(b), &mut no_sense, false);
-        prop_assert!(bits(&r3.out) == bits(&r2.out), "audio differs after reset");
-        prop_assert_eq!(tele_bits(&r3.tele[0].1), tele_bits(&r2.tele[0].1));
+        let r4 = render(&mut u2, &x, None, &slices(a), &mut no_sense, false);
+        prop_assert!(bits(&r3.out) == bits(&r4.out), "audio differs after reset");
+        prop_assert_eq!(tele_bits(&r3.tele[0].1), tele_bits(&r4.tele[0].1));
     }
 
     #[test]
@@ -941,6 +991,27 @@ fn check_hard_path(
         done += block;
     }
     hard_blocks
+}
+
+/// atsp's channel groups as SPEC-ATSP 4 routes them: the first slot (A, B,
+/// C) whose mask claims the channel, an unclaimed channel to A; one group
+/// when linked globally, one per linked slot, else one per channel. Per
+/// host channel: (group id, hard limit).
+fn atsp_hard_groups(p: &atsp::Params, n: usize) -> Vec<(usize, f64)> {
+    (0..n)
+        .map(|c| {
+            let si = (0..3).find(|&si| p.slot[si].channel_mask & (1 << c) != 0).unwrap_or(0);
+            let s = &p.slot[si];
+            let g = if p.gain_link_all != 0 {
+                0
+            } else if s.gain_link != 0 {
+                100 + si
+            } else {
+                200 + c
+            };
+            (g, s.temperature_limit as f64 + s.hard_limit_headroom as f64)
+        })
+        .collect()
 }
 
 /// An independent model of the spp3 controller (open loop), from the laws
@@ -1558,17 +1629,7 @@ proptest! {
         }
         let len = (secs * rate as f64) as usize;
         let x = signal(seed ^ 1, n, len, amp, h);
-        // atsp's grouping: one group when linked globally, one per linked
-        // slot, else one per channel
-        let mut chans = vec![(0, 0.0); n];
-        for (si, s) in p.slot.iter().enumerate() {
-            for (c, ch) in chans.iter_mut().enumerate() {
-                if s.channel_mask & (1 << c) != 0 {
-                    let g = if p.gain_link_all != 0 { 0 } else if s.gain_link != 0 { 100 + si } else { 200 + c };
-                    *ch = (g, s.temperature_limit as f64 + s.hard_limit_headroom as f64);
-                }
-            }
-        }
+        let chans = atsp_hard_groups(&p, n);
         let mut u = atsp::Unit::new(p);
         prop_assert!(!u.is_failsafe());
         // host-block mode (`block_frames = 0`) decides once per host call
@@ -1719,7 +1780,7 @@ fn load_and_probe(bytes: &[u8]) {
     }
     if let Ok(p) = atsp::Params::from_blob(bytes) {
         let mut u = atsp::Unit::new(p);
-        let g = if u.is_failsafe() { FAILSAFE_GAIN } else { 1.0 };
+        let g = if u.is_failsafe() { FAILSAFE_GAIN } else { atsp::DEZIPPER_PEAK };
         probe(&mut u, p.channels as usize, 0, g, "atsp blob", Hostility::Wild);
     }
 }
@@ -1947,21 +2008,7 @@ fn hard_path_anchors_are_reached() {
             s.hard_limit_headroom = 2.0;
         }
         let x = signal(seed, 2, 48_000 * 4, 2.0, Hostility::Clean);
-        let mut chans = vec![(0, 0.0); 2];
-        for (si, s) in p.slot.iter().enumerate() {
-            for (c, ch) in chans.iter_mut().enumerate() {
-                if s.channel_mask & (1 << c) != 0 {
-                    let g = if p.gain_link_all != 0 {
-                        0
-                    } else if s.gain_link != 0 {
-                        100 + si
-                    } else {
-                        200 + c
-                    };
-                    *ch = (g, s.temperature_limit as f64 + s.hard_limit_headroom as f64);
-                }
-            }
-        }
+        let chans = atsp_hard_groups(&p, 2);
         hits += check_hard_path(&mut atsp::Unit::new(p), &x, 512, &chans);
     }
     assert!(hits > 100, "the atsp hard-path property never saw the hard path ({hits} blocks)");

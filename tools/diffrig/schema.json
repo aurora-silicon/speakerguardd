@@ -2,21 +2,39 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://aurora-silicon.org/speakerguardd/diffrig/trace-v1.json",
   "title": "sgv2 differential rig trace line (one JSON object per rendered slice)",
+  "description": "Both sides write one line per host slice. compare.py matches lines whose slices end on the same input frame (frame + frames). Fields a side cannot observe are omitted or null; null is never zero.",
   "type": "object",
   "required": ["schema", "side", "unit", "case", "frame", "frames", "channels"],
   "properties": {
     "schema": {"const": 1},
     "side": {"enum": ["macos", "sgv2"]},
     "unit": {"enum": ["spp3", "lsm2", "atsp"]},
-    "case": {"type": "string", "description": "case identifier from the rig's case list"},
+    "case": {"type": "string", "pattern": "^[A-Za-z0-9._-]+$", "description": "case identifier from the rig's case list"},
     "frame": {"type": "integer", "minimum": 0, "description": "index of the slice's first input frame"},
     "frames": {"type": "integer", "minimum": 1},
     "latency": {"type": "integer", "minimum": 0, "description": "the unit's reported latency in frames"},
+    "params": {"type": "string", "description": "sgv2: where the unit's parameters came from (blob, none, blob-<error>)"},
+    "cfprops": {"type": "array", "items": {"type": "integer"}, "description": "sgv2: IDs of the run-time and case properties the renderer was given, in order; must equal the reference's resolved list (run.meta.json cfprops)"},
+    "health": {"type": "integer", "description": "sgv2: Health bits after the slice"},
     "mode": {
       "type": "object",
       "properties": {
-        "failsafe": {"type": "boolean"},
-        "closed_loop": {"type": "array", "items": {"type": "boolean"}}
+        "failsafe": {"type": ["boolean", "null"], "description": "fail-safe attenuation applied in this slice; macOS side: measured from the audio (gain 0.1 on every channel)"},
+        "closed_loop": {"type": ["array", "null"], "items": {"type": "boolean"}}
+      }
+    },
+    "global": {
+      "type": "object",
+      "description": "unit-wide state",
+      "properties": {
+        "modeled_power_w": {"type": ["number", "null"]},
+        "measured_power_w": {"type": ["number", "null"]},
+        "thermal_gain_db": {"type": ["number", "null"]},
+        "modeled_amp_power_w": {"type": ["number", "null"]},
+        "amp_input_power_per_speaker_w": {"type": ["number", "null"]},
+        "health_bits": {"type": ["number", "null"]},
+        "power_hard_limit_w": {"type": "array", "items": {"type": "number"}, "maxItems": 4},
+        "global_gain": {"type": ["number", "null"]}
       }
     },
     "channels": {
@@ -24,19 +42,25 @@
       "items": {
         "type": "object",
         "properties": {
-          "gain": {"type": ["number", "null"]},
+          "gain": {"type": ["number", "null"], "description": "final linear gain the unit reports for this slice"},
+          "audio_gain": {"type": ["number", "null"], "description": "broadband gain measured from the audio: sqrt(energy out / energy in), aligned by latency; null below -120 dBFS input"},
           "modeled_power_w": {"type": ["number", "null"]},
           "measured_power_w": {"type": ["number", "null"]},
           "coil_temp_c": {"type": ["number", "null"]},
           "magnet_temp_c": {"type": ["number", "null"]},
+          "control_temp_c": {"type": ["number", "null"]},
           "ol_temp_c": {"type": ["number", "null"]},
           "cl_temp_c": {"type": ["number", "null"]},
           "tlim_adj_c": {"type": ["number", "null"]},
           "displacement_m": {"type": ["number", "null"]},
+          "displacement_rel_max": {"type": ["number", "null"]},
           "velocity_m_s": {"type": ["number", "null"]},
+          "velocity_limit_m_s": {"type": ["number", "null"]},
           "mask_db": {"type": ["number", "null"]},
-          "axis_gain": {"type": "array", "items": {"type": ["number", "null"]}, "maxItems": 5},
-          "band_gain": {"type": "array", "items": {"type": ["number", "null"]}, "maxItems": 5}
+          "axis_gain": {"type": "array", "items": {"type": ["number", "null"]}, "maxItems": 5, "description": "linear: sample peak, displacement, velocity, power, temperature"},
+          "axis_gain_db": {"type": "object", "additionalProperties": {"type": ["number", "null"]}},
+          "band_gain": {"type": "array", "items": {"type": ["number", "null"]}, "maxItems": 5},
+          "raw": {"type": "object", "description": "unit-private state not yet named by the specification; not compared"}
         }
       }
     }
