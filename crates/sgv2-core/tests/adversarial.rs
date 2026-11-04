@@ -45,6 +45,8 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
+mod review_common;
+
 use proptest::prelude::*;
 use proptest::test_runner::Config;
 use sgv2_core::blob::{self, Pod};
@@ -601,14 +603,41 @@ fn synth_sense(input: &[Vec<f32>], ports: usize, delay: usize) -> Vec<Vec<f32>> 
 /// Properties 1 and 2 on one render: every output sample is finite, and no
 /// louder than the input `latency` frames earlier (0 for a non-finite one).
 fn check_bound(input: &[Vec<f32>], out: &[Vec<f32>], latency: usize, gain: f32, what: &str) {
+    check_bound_pilot(input, out, latency, gain, &[], what)
+}
+
+/// [`check_bound`] with a per-host-channel additive allowance for a
+/// generated pilot tone (`pilot[c]`, missing = 0), and never above full
+/// scale: `|out| <= min(1, |in| * gain + pilot)`.
+fn check_bound_pilot(input: &[Vec<f32>], out: &[Vec<f32>], latency: usize, gain: f32, pilot: &[f32], what: &str) {
     for (c, (x, y)) in input.iter().zip(out).enumerate() {
+        let extra = pilot.get(c).copied().unwrap_or(0.0);
         for (k, &o) in y.iter().enumerate() {
             assert!(o.is_finite(), "{what}: non-finite output {o} at ch{c}[{k}]");
             let i = if k >= latency { x[k - latency] } else { 0.0 };
-            let lim = if i.is_finite() { (i * gain).abs() } else { 0.0 };
-            assert!(o.abs() <= lim, "{what}: |out| {o:e} > {lim:e} (in {i:e}, gain {gain}) at ch{c}[{k}]");
+            let prog = if i.is_finite() { (i * gain).abs() } else { 0.0 };
+            // the pilot sum is one more f32 rounding
+            let lim = if extra > 0.0 { (prog + extra) * (1.0 + 1e-6) } else { prog };
+            let lim = if extra > 0.0 { lim.min(1.0) } else { lim };
+            assert!(
+                o.abs() <= lim,
+                "{what}: |out| {o:e} > {lim:e} (in {i:e}, gain {gain}, pilot {extra}) at ch{c}[{k}]"
+            );
         }
     }
+}
+
+/// Per host channel, the largest pilot an spp3 set may generate: the law's
+/// 0.3 cap on any channel with `PilotToneEnabled` (AID35 uses 0.0316).
+fn spp3_pilot_allowance(p: &spp3::Params) -> Vec<f32> {
+    let n = (p.channels as usize).min(MAX_CHANNELS);
+    let mut v = vec![0.0; n];
+    for c in &p.ch[..n] {
+        if c.pilot_tone_enabled != 0 && (c.source as usize) < n {
+            v[c.source as usize] = 0.3;
+        }
+    }
+    v
 }
 
 /// Model state that must stay finite while the input is not huge.
@@ -663,7 +692,6 @@ proptest! {
     #![proptest_config(cfg(48))]
 
     #[test]
-    #[ignore = "B5 MERGE (lane B5/T): B5 generates the pilot tone, so out <= in no longer holds on pilot channels"]
     fn spp3_bounded_finite_no_alloc(
         seed in any::<u64>(), n in 1usize..=8, blk in block(), rate in rate(), ff in ff(),
         hot in any::<bool>(), len in 1usize..40_000, amp in 0.01f32..4.0, h in hostility(), sl in any::<u64>(),
@@ -675,7 +703,7 @@ proptest! {
         let s = synth_sense(&x, 2 * n, 37);
         let mut r = Rng(sl ^ 3);
         let rr = render(&mut u, &x, Some(&s), &slices(sl), &mut |_| sense_mode(&mut r), false);
-        check_bound(&x, &rr.out, 0, 1.0, "spp3");
+        check_bound_pilot(&x, &rr.out, 0, 1.0, &spp3_pilot_allowance(&p), "spp3");
         check_state_finite(&rr.tele[0].1, n, "spp3");
     }
 
@@ -799,6 +827,17 @@ proptest! {
         let r3 = render(&mut u1, &x, Some(&s), &pow(b), &mut no_sense, false);
         prop_assert!(bits(&r3.out) == bits(&r2.out), "audio differs after reset");
         prop_assert_eq!(tele_bits(&r3.tele[0].1), tele_bits(&r2.tele[0].1));
+        // any fixed call size (production: 512) is deterministic: the same
+        // slicing twice, and again after reset, is bit for bit the same
+        let fixed = vec![1 + (a ^ b) as usize % 4096];
+        let mut u4 = spp3::Unit::new(p);
+        let r4 = render(&mut u4, &x, Some(&s), &fixed, &mut no_sense, false);
+        let r5 = render(&mut spp3::Unit::new(p), &x, Some(&s), &fixed, &mut no_sense, false);
+        prop_assert!(bits(&r4.out) == bits(&r5.out), "audio not deterministic at a fixed {:?}-frame call", fixed);
+        prop_assert_eq!(tele_bits(&r4.tele[0].1), tele_bits(&r5.tele[0].1));
+        u4.reset();
+        let r6 = render(&mut u4, &x, Some(&s), &fixed, &mut no_sense, false);
+        prop_assert!(bits(&r6.out) == bits(&r5.out), "audio differs after reset at a fixed call size");
     }
 
     #[test]
@@ -1435,10 +1474,22 @@ proptest! {
 // Property 5: parameter blobs.
 
 fn probe(unit: &mut dyn ProtectionUnit, n: usize, latency: usize, gain: f32, what: &str, h: Hostility) {
+    probe_pilot(unit, n, latency, gain, &[], what, h)
+}
+
+fn probe_pilot(
+    unit: &mut dyn ProtectionUnit,
+    n: usize,
+    latency: usize,
+    gain: f32,
+    pilot: &[f32],
+    what: &str,
+    h: Hostility,
+) {
     let x = signal(0x5eed, n, 6000, 1.5, h);
     let s = synth_sense(&x, 2 * n, 0);
     let rr = render(unit, &x, Some(&s), &[1, 511, 4096, 96], &mut no_sense, false);
-    check_bound(&x, &rr.out, latency, gain, what);
+    check_bound_pilot(&x, &rr.out, latency, gain, pilot, what);
 }
 
 /// Decode `bytes` as every unit kind and as the placeholder; whatever comes
@@ -1451,7 +1502,7 @@ fn load_and_probe(bytes: &[u8]) {
         Ok(p) => {
             let mut u = spp3::Unit::new(p);
             let g = if u.is_failsafe() { FAILSAFE_GAIN } else { 1.0 };
-            probe(&mut u, p.channels as usize, 0, g, "spp3 blob", Hostility::Wild);
+            probe_pilot(&mut u, p.channels as usize, 0, g, &spp3_pilot_allowance(&p), "spp3 blob", Hostility::Wild);
         }
         // Clean input only: FailSafe passes NaN/Inf through (FINDING 5).
         Err(_) => {
@@ -1526,7 +1577,6 @@ proptest! {
     }
 
     #[test]
-    #[ignore = "B5 MERGE (lane B5/T): B5 generates the pilot tone, so out <= in no longer holds on pilot channels"]
     fn mutated_blobs_are_rejected_or_safe(
         seed in any::<u64>(), which in 0usize..3, n in 1usize..=8, mutations in 1usize..6, fix in any::<bool>(),
     ) {
@@ -1760,7 +1810,20 @@ fn spp3_cl() -> spp3::Params {
     (c.reb_range_min, c.reb_range_max, c.cal_temp_range_min, c.cal_temp_range_max) = (2.0, 8.0, 10.0, 50.0);
     (c.a_t_20c, c.a_t_35c, c.tlim_err_decay_time_s, c.tlim_adj_cap) = (0.004, 0.004, 1.0, 30.0);
     (c.cal_present, c.cal_r, c.cal_t) = (1, 4.0, 25.0);
+    // the pilot-tone analyser (method 1): a 0.1 s Goertzel period on the
+    // bin `review_common::pilot_wave` drives
+    c.thermal_measurement_method = spp3::METHOD_PILOT_TONE;
+    c.temp_sense_window_time_s = 0.1;
+    (c.pilot_freq, c.pilot_enable_thres) = (43.0664, 0.03);
+    (c.pilot_ampl_hi_db, c.pilot_ampl_lo_db) = (-30.0, -40.0);
+    (c.pilot_upper_thres, c.pilot_lower_thres) = (90.0, 80.0);
+    (c.pilot_decay_time_s, c.pilot_decay_time_stage2_s) = (0.03, 0.03);
     p
+}
+
+thread_local! {
+    /// Sense phase, continuous across `drive1` calls on one test thread.
+    static SENSE_POS: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Drive one channel with `x` for `frames` in 512-frame calls (`first`
@@ -1783,7 +1846,9 @@ fn drive1(
                 i[0] = v;
             }
         }
-        let cur: Vec<f32> = (0..m).map(|j| 0.5 * ((done + j) as f32 * 0.13).sin()).collect();
+        // sense at the pilot analyser's bin (a V/I pair of resistance `r`)
+        let pos = SENSE_POS.with(|p| p.replace(p.get() + m));
+        let cur: Vec<f32> = (0..m).map(|j| 0.5 * review_common::pilot_wave(pos + j)).collect();
         let vol: Vec<f32> = cur.iter().map(|c| c * sense.unwrap_or(0.0)).collect();
         let s: Vec<&[f32]> = if sense.is_some() { vec![&cur, &vol] } else { Vec::new() };
         let mut o = vec![0.0f32; m];
@@ -1885,7 +1950,6 @@ fn spp3_feed_forward_off_still_holds_the_hard_limit() {
 /// `health` meanwhile reports `OPEN_LOOP`. NaN-filled sense, by contrast,
 /// is rejected and the limit returns to plain (the specified behaviour).
 #[test]
-#[ignore = "B5 MERGE (lane B5/T): broadband synthetic sense cannot drive the B5 pilot-tone Goertzel closed loop"]
 fn spp3_closed_loop_falls_back_when_the_sense_bus_disappears() {
     let mut u = spp3::Unit::new(spp3_cl());
     let (g0, t0) = drive1(&mut u, 0.6, None, 48_000 * 10, Some(4.0));
@@ -2234,28 +2298,32 @@ impl FailSafeUnit for Box<dyn ProtectionUnit> {
     }
 }
 
-/// FINDING 16 (low; aarch64): the closed loop's window sums are not slice
-/// invariant. `Cl::feed` adds `dsp::sum_sq` of each host segment, and the
-/// NEON `sum_sq` rounds differently for different segment lengths (f32
-/// FMA lanes for 16-sample runs, a scalar f64 tail), so `T_CL`, `TlimAdj`
-/// and with them the gain depend on how the host sliced its buffers. CI on
-/// `ubuntu-24.04-arm` showed `tlim_adj_c` one ulp apart between two
-/// slicings; on x86_64 the scalar sums happen to agree here. A `LaneAcc`
-/// window accumulator, as the model meters use, would make it invariant.
+/// FINDING 16 (aarch64, superseded by B5): the closed loop's window sums
+/// depended on the host slicing (NEON `sum_sq` per segment). B5 measures
+/// with a per-sample Float32 Goertzel; as for the open loop, the output
+/// now depends on the slicing by law (the dezipper snaps to the target at
+/// each call, and a call holding a whole 512-frame block takes its sense
+/// ahead). What must hold: call sizes that divide 256 agree bit for bit,
+/// and any fixed call size is deterministic.
 #[test]
-#[ignore = "B5 MERGE (lane B5/T): broadband synthetic sense cannot drive the B5 pilot-tone Goertzel closed loop"]
 fn spp3_closed_loop_is_slice_invariant() {
     let p = spp3_cl();
     let x = signal(31, 1, 48_000 * 4, 0.7, Hostility::Clean);
-    let i: Vec<f32> =
-        (0..x[0].len()).map(|k| 0.5 * (k as f32 * 0.0731).sin() + 0.01 * (k as f32 * 0.91).cos()).collect();
+    let i: Vec<f32> = (0..x[0].len()).map(|k| 0.5 * review_common::pilot_wave(k)).collect();
     let v: Vec<f32> = i.iter().map(|c| c * 4.3).collect();
     let s = vec![i, v];
-    let reference = render(&mut spp3::Unit::new(p), &x, Some(&s), &[512], &mut no_sense, false);
-    for cuts in [vec![333usize], vec![1, 17, 4096], vec![255, 257], vec![96, 7, 1000]] {
+    let reference = render(&mut spp3::Unit::new(p), &x, Some(&s), &[256], &mut no_sense, false);
+    assert!(reference.tele[0].1.channels[0].closed_loop, "control: the closed loop runs");
+    assert!(reference.tele[0].1.channels[0].tlim_adj_c > 0.0, "control: the closed loop corrects");
+    for cuts in [vec![1usize], vec![16], vec![64], vec![128]] {
         let r = render(&mut spp3::Unit::new(p), &x, Some(&s), &cuts, &mut no_sense, false);
-        assert!(r.tele[0].1.channels[0].closed_loop, "control: the closed loop runs");
         assert_eq!(tele_bits(&r.tele[0].1), tele_bits(&reference.tele[0].1), "state differs with slices {cuts:?}");
         assert!(bits(&r.out) == bits(&reference.out), "audio differs with slices {cuts:?}");
+    }
+    for cuts in [vec![512usize], vec![333], vec![4096]] {
+        let a = render(&mut spp3::Unit::new(p), &x, Some(&s), &cuts, &mut no_sense, false);
+        let b = render(&mut spp3::Unit::new(p), &x, Some(&s), &cuts, &mut no_sense, false);
+        assert_eq!(tele_bits(&a.tele[0].1), tele_bits(&b.tele[0].1), "not deterministic at {cuts:?}");
+        assert!(bits(&a.out) == bits(&b.out), "audio not deterministic at {cuts:?}");
     }
 }

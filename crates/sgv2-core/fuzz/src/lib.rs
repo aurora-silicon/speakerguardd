@@ -289,13 +289,31 @@ pub fn nothing(_: usize, _: &Telemetry, _: &[Vec<f32>]) {}
 /// Properties 1 and 2: finite, and never louder than `gain` times the input
 /// `latency` frames earlier (a non-finite input sample leaves as 0).
 pub fn check_bound(x: &[Vec<f32>], out: &[Vec<f32>], latency: usize, gain: f32, what: &str) {
+    check_bound_pilot(x, out, latency, gain, 0.0, what)
+}
+
+/// [`check_bound`] with an additive allowance for a generated pilot tone
+/// (spp3: at most 0.3 by law) and never above full scale when one may play.
+pub fn check_bound_pilot(x: &[Vec<f32>], out: &[Vec<f32>], latency: usize, gain: f32, pilot: f32, what: &str) {
     for (c, (xi, yo)) in x.iter().zip(out).enumerate() {
         for (k, &o) in yo.iter().enumerate() {
             assert!(o.is_finite(), "{what}: non-finite output {o} at ch{c}[{k}]");
             let i = if k >= latency { xi[k - latency] } else { 0.0 };
-            let lim = if i.is_finite() { (i * gain).abs() } else { 0.0 };
-            assert!(o.abs() <= lim, "{what}: |out| {o:e} > {lim:e} (in {i:e}) at ch{c}[{k}]");
+            let prog = if i.is_finite() { (i * gain).abs() } else { 0.0 };
+            let lim = if pilot > 0.0 { ((prog + pilot) * (1.0 + 1e-6)).min(1.0) } else { prog };
+            assert!(o.abs() <= lim, "{what}: |out| {o:e} > {lim:e} (in {i:e}, pilot {pilot}) at ch{c}[{k}]");
         }
+    }
+}
+
+/// The largest pilot an spp3 set may add on any channel: 0.3 by law when
+/// any channel enables the pilot tone.
+pub fn spp3_pilot(p: &sgv2_core::spp3::Params) -> f32 {
+    let n = (p.channels as usize).min(8);
+    if p.ch[..n].iter().any(|c| c.pilot_tone_enabled != 0) {
+        0.3
+    } else {
+        0.0
     }
 }
 

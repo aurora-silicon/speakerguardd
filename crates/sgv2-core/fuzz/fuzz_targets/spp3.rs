@@ -48,13 +48,33 @@ fn run(u: &mut Unstructured) -> Result<()> {
         }
         last = d;
     });
-    check_bound(&x, &a.out, 0, gain, "spp3 A");
+    check_bound_pilot(&x, &a.out, 0, gain, if real { spp3_pilot(&p) } else { 0.0 }, "spp3 A");
 
-    // B: the fuzzer's slicing; bit-identical to A on finite input
+    // B: the fuzzer's slicing. Every render call snaps the dezipper to the
+    // selected target (rig dezipper law), so B is bit-identical to A only
+    // when no call crosses a 256-frame update; any slicing is deterministic
+    // (B twice).
     let mut ub = Unit::new(p);
     let b = render(&mut ub, &x, &sense, &cuts, &[], &mut nothing);
-    check_bound(&x, &b.out, 0, gain, "spp3 B");
-    if real && all_finite(&x) {
+    check_bound_pilot(&x, &b.out, 0, gain, if real { spp3_pilot(&p) } else { 0.0 }, "spp3 B");
+    if real {
+        let b2 = render(&mut Unit::new(p), &x, &sense, &cuts, &[], &mut nothing);
+        assert!(bits(&b.out) == bits(&b2.out), "spp3: audio not deterministic for a fixed slicing");
+        assert_eq!(tele_bits(&b.tele), tele_bits(&b2.tele), "spp3: state not deterministic for a fixed slicing");
+    }
+    // no call of the cycled slicing crosses a 256-frame update boundary
+    let divides = {
+        let (f, len) = (sgv2_core::spp3::THERMAL_FRAMES, x[0].len());
+        let (mut done, mut k, mut ok) = (0usize, 0usize, true);
+        while done < len && ok {
+            let m = cuts[k % cuts.len()].min(len - done);
+            ok = done % f + m <= f;
+            done += m;
+            k += 1;
+        }
+        ok
+    };
+    if real && all_finite(&x) && divides {
         assert!(bits(&a.out) == bits(&b.out), "spp3: audio depends on host slicing");
         assert_eq!(tele_bits(&a.tele), tele_bits(&b.tele), "spp3: state depends on host slicing");
         for c in 0..n {
@@ -71,7 +91,7 @@ fn run(u: &mut Unstructured) -> Result<()> {
     // C: B's slicing with sense dropouts; D: no sense at all
     let mut uc = Unit::new(p);
     let c = render(&mut uc, &x, &sense, &cuts, &modes, &mut nothing);
-    check_bound(&x, &c.out, 0, gain, "spp3 C");
+    check_bound_pilot(&x, &c.out, 0, gain, if real { spp3_pilot(&p) } else { 0.0 }, "spp3 C");
     let d = render(&mut Unit::new(p), &x, &[], &cuts, &[], &mut nothing);
     if !closed {
         check_not_louder(&c.out, &b.out, "spp3 sense dropout vs valid sense");
