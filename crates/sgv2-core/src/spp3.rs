@@ -354,7 +354,7 @@ impl Params {
         if n == 0 || n > MAX_CHANNELS {
             return Err(InitError::Invalid("channel count"));
         }
-        if self.sample_rate == 0 {
+        if self.sample_rate == 0 || thermal_frames(self.sample_rate) > MAX_UPDATE {
             return Err(InitError::Invalid("sample rate"));
         }
         if self.block_frames == 0 || self.block_frames > 16384 {
@@ -383,7 +383,7 @@ impl Params {
         // overshoots far above the hard limit at cold start, rig finding
         // 15), and never below one thermal update (the forward recurrence
         // `1 - dt/tau` diverges there)
-        let dt = THERMAL_FRAMES as f32 / self.sample_rate as f32;
+        let dt = thermal_frames(self.sample_rate) as f32 / self.sample_rate as f32;
         let tau_min = TAU_MIN_S.max(dt);
         let mut seen = 0u32;
         for c in &self.ch[..n] {
@@ -410,10 +410,13 @@ impl Params {
                 return Err(InitError::Invalid("Rampout"));
             }
             if c.pilot_tone_enabled != 0 {
-                if !(c.pilot_ampl_hi_db.is_finite() && c.pilot_ampl_hi_db <= 0.0) {
+                // any finite level: the amplitude is clamped to 0.3 (rig law
+                // 4), and the low level may lie above the high one (the rig's
+                // envelope cases)
+                if !c.pilot_ampl_hi_db.is_finite() {
                     return Err(InitError::Invalid("PilotAmplHi_dB"));
                 }
-                if !(c.pilot_ampl_lo_db.is_finite() && c.pilot_ampl_lo_db <= c.pilot_ampl_hi_db) {
+                if !c.pilot_ampl_lo_db.is_finite() {
                     return Err(InitError::Invalid("PilotAmplLo_dB"));
                 }
                 if !(c.pilot_upper_thres.is_finite()
@@ -549,6 +552,15 @@ impl ChannelParams {
 
 /// Thermal update cadence, frames (spec 6: 256 at 48 kHz).
 pub const THERMAL_FRAMES: usize = 256;
+/// Largest thermal update supported (192 kHz).
+const MAX_UPDATE: usize = 1024;
+
+/// The thermal update cadence at `sample_rate`, frames: 256 at 44.1 and
+/// 48 kHz, 512 at 96 kHz (rig: `next_pow2(round(256 fs / 48000))`).
+pub fn thermal_frames(sample_rate: u32) -> usize {
+    let n = libm::round(THERMAL_FRAMES as f64 * sample_rate as f64 / 48_000.0).max(1.0) as usize;
+    n.next_power_of_two()
+}
 /// Hard-coded prediction margin in the candidate, C (spec 6).
 const PREDICTION_MARGIN: f64 = 1.0;
 /// Hard-path target below the limit, C (spec 6).
@@ -594,26 +606,33 @@ pub fn settle99(seconds: f64, rate: f64) -> f64 {
 /// Trapezoidal-input, linear-decay thermal filter (spec 5).
 #[derive(Clone, Copy, Default)]
 struct Thermal {
-    a: f64,
-    b: f64,
+    a: f32,
+    b: f32,
     tau: f64,
+    /// Float32-valued (kept in an f64 for the controller arithmetic).
     theta: f64,
 }
 
 impl Thermal {
-    fn new(r_th: f64, tau: f64, dt: f64) -> Self {
-        Thermal { a: 1.0 - dt / tau, b: 0.5 * r_th * dt / tau, tau, theta: 0.0 }
+    /// The reference's Float32 coefficients (rig: the controller record's
+    /// nodes are bit-exact on 89-99.99 % of updates with these, against
+    /// 0.1 % for a double-precision recurrence): `a = 1 - dt/tau`,
+    /// `b = 0.5 * R * dt / tau`, left to right, `dt = frames / fs`.
+    fn new(r_th: f32, tau: f32, dt: f32) -> Self {
+        Thermal { a: 1.0 - dt / tau, b: 0.5 * r_th * dt / tau, tau: tau as f64, theta: 0.0 }
     }
+    /// `theta = fmaf(a, theta, b * (P + P_prev))` in Float32.
     #[inline]
     fn step(&mut self, p: f64, p_prev: f64) {
-        self.theta = self.a * self.theta + self.b * (p + p_prev);
+        let sum = p as f32 + p_prev as f32;
+        self.theta = libm::fmaf(self.a, self.theta as f32, self.b * sum) as f64;
     }
 }
 
 /// `ceil(SafeTlimTimeMin * 60 * fs / thermal_period)` in the reference's
 /// Float32 multiply/divide order (spec 6), or `None` past `u32`.
 pub fn safe_count_init(time_min: f32, sample_rate: u32) -> Option<u32> {
-    let n = time_min * 60.0 * sample_rate as f32 / THERMAL_FRAMES as f32;
+    let n = time_min * 60.0 * sample_rate as f32 / thermal_frames(sample_rate) as f32;
     let n = libm::ceilf(n);
     (n.is_finite() && n >= 0.0 && n <= u32::MAX as f32).then_some(n as u32)
 }
@@ -707,6 +726,8 @@ impl Goertzel {
 /// Closed-loop pilot-tone resistance thermometry and the corrected limit
 /// (spec 7).
 struct Cl {
+    /// Thermal update, frames.
+    upd: usize,
     /// Goertzel period `N` and its coefficient `2 cos(2 pi m / N)`.
     window: usize,
     coef: f32,
@@ -806,6 +827,7 @@ impl Cl {
         let (vs, is) = (c.vmon_scale as f64, c.imon_scale as f64);
         let limit = c.temperature_limit as f64;
         Some(Cl {
+            upd: thermal_frames(rate as u32),
             window,
             coef: (2.0 * libm::cos(2.0 * core::f64::consts::PI * m / window as f64)) as f32,
             n: 0,
@@ -846,7 +868,7 @@ impl Cl {
         self.r_window = self.cal_r as f32;
         self.valid = false;
         self.age = 0;
-        self.t_cl = self.cal_t;
+        self.t_cl = self.t_of_rs();
         self.limit_s = base;
         self.active = false;
     }
@@ -863,6 +885,19 @@ impl Cl {
         let keep = self.limit_s;
         self.reset(keep);
         self.limit_s = keep;
+    }
+
+    /// `T_CL` of the current smoothed resistance: `fmaf(invTempCo, (Rw -
+    /// Rshunt) / (R_cal - Rshunt) - 1, T_cal)` in Float32 with `Rw =
+    /// RdcScale * R_s`, the logged window resistance (rig law 3). Also the
+    /// start value: with RdcScale != 1 the reference's T_CL starts at this,
+    /// not at `T_cal` (rig, spp3-law-tcl-rdcscale: 3.63 ohm logged from
+    /// block 0 at RdcScale 1.1).
+    fn t_of_rs(&self) -> f64 {
+        let rw = self.rdc_scale as f32 * self.r_s;
+        let (rc, rs) = (self.cal_r as f32, self.rshunt);
+        let x = (rw - rs) / (rc - rs) - 1.0;
+        libm::fmaf(self.inv_temp_co, x, self.cal_t as f32) as f64
     }
 
     /// The sense bus could not feed a segment: the window is invalid and
@@ -908,10 +943,7 @@ impl Cl {
         // T_CL = fmaf(invTempCo, (Rw - Rshunt)/(R_cal - Rshunt) - 1, T_cal) in
         // Float32, Rw = RdcScale * R_s, the logged window resistance (rig
         // law 3)
-        let rw = self.rdc_scale as f32 * self.r_s;
-        let (rc, rs) = (self.cal_r as f32, self.rshunt);
-        let x = (rw - rs) / (rc - rs) - 1.0;
-        let t = libm::fmaf(self.inv_temp_co, x, self.cal_t as f32) as f64;
+        let t = self.t_of_rs();
         // TODO(SPEC): the range is tested on R_s here; the rig confirmed it
         // at RdcScale 1, so whether RdcScale applies first is open
         let re = self.r_s as f64;
@@ -935,8 +967,8 @@ impl Cl {
             return base;
         }
         // a measurement older than one window (plus this update) is stale
-        self.age = self.age.saturating_add(THERMAL_FRAMES);
-        if self.age > self.window.saturating_add(THERMAL_FRAMES) {
+        self.age = self.age.saturating_add(self.upd);
+        if self.age > self.window.saturating_add(self.upd) {
             self.valid = false;
         }
         // max/min, not clamp: a NaN error falls back to the plain base.
@@ -992,7 +1024,7 @@ impl Pilot {
             upper: c.pilot_upper_thres as f64,
             lower: c.pilot_lower_thres as f64,
             enable: c.pilot_enable_thres,
-            kb: settle99(c.pilot_decay_time_s as f64, rate / THERMAL_FRAMES as f64) as f32,
+            kb: settle99(c.pilot_decay_time_s as f64, rate / thermal_frames(rate as u32) as f64) as f32,
             ks: settle99(c.pilot_decay_time_stage2_s as f64 / 2.0, rate) as f32,
             period,
             bin: libm::round(c.pilot_freq as f64 * period as f64 / rate),
@@ -1094,9 +1126,10 @@ struct Chan {
 impl Chan {
     /// Kernel construction state of the thermal model and controller.
     fn seed(&mut self) {
-        self.vc.theta = self.seed.0;
-        self.mg.theta = self.seed.1;
-        self.ff.theta = self.seed.2;
+        // the nodes are Float32 state
+        self.vc.theta = self.seed.0 as f32 as f64;
+        self.mg.theta = self.seed.1 as f32 as f64;
+        self.ff.theta = self.seed.2 as f32 as f64;
         self.p_prev = 0.0;
         self.p_ff_prev = 0.0;
         self.meter_failed = false;
@@ -1203,6 +1236,8 @@ struct Run {
     groups: Vec<Group>,
     /// Per group, the dezippered gain of the current segment's frames.
     curve: Vec<f32>,
+    /// Thermal update, frames ([`thermal_frames`]).
+    upd: usize,
     pos: usize,
     frame: u64,
     last_frame: u64,
@@ -1338,8 +1373,8 @@ impl Run {
             .ok_or(InitError::Invalid("SafeTlimTimeMin"))?;
         let n = p.channels as usize;
         let rate = p.sample_rate as f64;
-        let dt = THERMAL_FRAMES as f64 / rate;
-        let r = rate / THERMAL_FRAMES as f64;
+        let upd = thermal_frames(p.sample_rate);
+        let r = rate / upd as f64;
         let look = libm::round(p.thermal_lookahead_delay_ms as f64 * 1e-3 * rate) as usize;
         let ambient = p.thermal_ambient_temp as f64;
         let cold = p.thermal_state_override == THERMAL_STATE_COLD;
@@ -1371,8 +1406,9 @@ impl Run {
             let (reb, series, ag) = (c.reb_ref as f64, c.rshunt as f64 + c.rampout as f64, c.ag as f64);
             let ff_factor = c.thermal_ff_speedup_factor as f64;
             let ff_on = ff_factor > 0.0;
-            let ff_tau = if ff_on { ff_factor * c.tau_tvc as f64 } else { c.tau_tvc as f64 };
-            let ff = Thermal::new(c.t_sett_vc as f64, ff_tau, dt);
+            let ff_tau = if ff_on { c.thermal_ff_speedup_factor * c.tau_tvc } else { c.tau_tvc };
+            let dt32 = upd as f32 / p.sample_rate as f32;
+            let ff = Thermal::new(c.t_sett_vc, ff_tau, dt32);
             let (tvc, tmg) = (c.t_sett_vc as f64, c.t_sett_mg as f64);
             // hot fallback: the steady-state split at the ordinary limit
             let seed = if cold {
@@ -1396,8 +1432,8 @@ impl Run {
                 headroom2: (headroom as f64) * (headroom as f64),
                 safe: SafeTlim::new(c.temperature_limit, p.thermal_safe_tlim, p.thermal_safe_tlim_offset, safe_init),
                 headroom_c: c.hard_temp_limit_headroom as f64,
-                vc: Thermal::new(tvc, c.tau_tvc as f64, dt),
-                mg: Thermal::new(tmg, c.tau_tmg as f64, dt),
+                vc: Thermal::new(c.t_sett_vc, c.tau_tvc, dt32),
+                mg: Thermal::new(c.t_sett_mg, c.tau_tmg, dt32),
                 ff,
                 ff_on,
                 seed,
@@ -1434,7 +1470,8 @@ impl Run {
             hold_n: libm::ceil(HOLD_S * r) as u32,
             ch,
             groups: vec![GROUP_START; ngroups],
-            curve: vec![1.0; ngroups * THERMAL_FRAMES],
+            curve: vec![1.0; ngroups * upd],
+            upd,
             pos: 0,
             frame: 0,
             last_frame: 0,
@@ -1494,7 +1531,7 @@ impl Run {
         let k = self.k_dez;
         // per group: the two cascaded per-sample dezipper stages
         for (gi, g) in self.groups.iter_mut().enumerate() {
-            let curve = &mut self.curve[gi * THERMAL_FRAMES..][..len];
+            let curve = &mut self.curve[gi * self.upd..][..len];
             for v in curve.iter_mut() {
                 g.z1 += k * (g.sel - g.z1);
                 g.z2 += k * (g.z1 - g.z2);
@@ -1504,7 +1541,7 @@ impl Run {
         for c in self.ch.iter_mut() {
             let inp = &io.input[c.src][off..off + len];
             let out = &mut io.output[c.src][off..off + len];
-            let curve = &self.curve[c.group * THERMAL_FRAMES..][..len];
+            let curve = &self.curve[c.group * self.upd..][..len];
             // the program held to full scale, times the gain
             let non_finite = dsp::mul_clamped_to(inp, curve, out, INPUT_CLAMP);
             if c.headroom != 1.0 {
@@ -1600,9 +1637,9 @@ impl Run {
         self.frame += len as u64;
     }
 
-    /// One thermal update (every `THERMAL_FRAMES`).
+    /// One thermal update (every [`thermal_frames`]).
     fn update(&mut self) {
-        let n = THERMAL_FRAMES as f64;
+        let n = self.upd as f64;
         let mut ff_t = [1.0f64; MAX_CHANNELS];
         let mut hard_t = [1.0f64; MAX_CHANNELS];
         for c in self.ch.iter_mut() {
@@ -1671,7 +1708,7 @@ impl Run {
         }
         let complete = self.sums.complete
             && !self.sense_bad
-            && self.sums.frames == THERMAL_FRAMES
+            && self.sums.frames == self.upd
             && self.ch.iter().all(|c| c.sense.is_none() || c.acc_vi.is_finite());
         for c in self.ch.iter_mut() {
             c.vi_power = if c.sense.is_some() && complete && c.acc_vi.is_finite() {
@@ -1685,7 +1722,7 @@ impl Run {
         self.sense_bad = false;
         self.estimator.end_block();
         self.sums.clear();
-        self.last_frame = self.frame - THERMAL_FRAMES as u64;
+        self.last_frame = self.frame - self.upd as u64;
         // any non-finite model or controller state latches the fail-safe
         let chans = self.ch.iter().all(|c| {
             let lim = c.cl.as_ref().is_none_or(|cl| cl.limit_s.is_finite() && cl.t_cl.is_finite());
@@ -1753,7 +1790,7 @@ impl ProtectionUnit for Unit {
         let mut health = 0u32;
         let mut off = 0;
         while off < frames {
-            let len = (THERMAL_FRAMES - run.pos).min(frames - off);
+            let len = (run.upd - run.pos).min(frames - off);
             if run.frame >= run.prefed_until
                 && run.block > 0
                 && run.frame % run.block as u64 == 0
@@ -1764,7 +1801,7 @@ impl ProtectionUnit for Unit {
             run.segment(&mut io, off, len, &mut health);
             off += len;
             run.pos += len;
-            if run.pos == THERMAL_FRAMES {
+            if run.pos == run.upd {
                 run.update();
                 run.pos = 0;
                 if run.fault {
@@ -1803,20 +1840,26 @@ impl ProtectionUnit for Unit {
             s.coil_temp_c = t_ol;
             s.magnet_temp_c = (run.ambient + c.mg.theta) as f32;
             s.ol_temp_c = t_ol;
+            // the effective limit against the ordinary TemperatureLimit, as the
+            // reference's controller record logs it: a latched SafeTlim shows
+            // as SafeTlim - TemperatureLimit, a closed-loop relaxation as the
+            // positive excess
+            s.tlim_adj_c = (c.tlim_eff - c.safe.normal) as f32;
             match c.cl.as_ref() {
                 Some(cl) => {
                     s.cl_temp_c = cl.t_cl as f32;
-                    s.tlim_adj_c = if cl.active { (cl.limit_s - c.safe.base()) as f32 } else { 0.0 };
                     s.closed_loop = true;
                 }
                 None => {
                     s.cl_temp_c = T_CL_UNMEASURED;
-                    s.tlim_adj_c = 0.0;
                     s.closed_loop = false;
                 }
             }
-            // axis 4 is temperature: the selected (pre-dezipper) target
-            s.axis_gain[4] = g.sel;
+            // the part meters (spp3 part 64/65/66): thermal is the applied
+            // gain; displacement and CPMS power are disabled and unity
+            s.axis_gain[1] = 1.0;
+            s.axis_gain[3] = 1.0;
+            s.axis_gain[4] = if run.fault { FAILSAFE_GAIN } else { g.z2 };
             s.gain = if run.fault { FAILSAFE_GAIN } else { g.z2 };
             out.channels[c.src] = s;
         }
@@ -1852,7 +1895,7 @@ impl ProtectionUnit for Unit {
             return false;
         }
         let t = gap_or_zero(gap_s);
-        let updates = t * rate as f64 / THERMAL_FRAMES as f64;
+        let updates = t * rate as f64 / run.upd as f64;
         let mut g = [1.0f64; MAX_CHANNELS];
         for (i, c) in run.ch.iter_mut().enumerate() {
             let s = &state.node[i];
