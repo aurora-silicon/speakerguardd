@@ -18,17 +18,37 @@ pub struct Observation {
     pub carrier_ok: bool,
     /// The speaker PCM is owned by the process hosting the plugin.
     pub pcm_owner_ok: bool,
+    /// The speaker PCM is Closed or Running, or being started (see
+    /// `pcm_settling`). Stopped (XRUN, paused, suspended) or unknown is not.
+    pub pcm_state_ok: bool,
+    /// The speaker PCM is being opened and prepared right after a grant:
+    /// hold, neither renewing nor releasing (the lease covers it).
+    pub pcm_settling: bool,
+    /// The speaker mux selects the watched PCM (from the kernel).
+    pub route_ok: bool,
+    /// Every expected amp reports faults, and the amps sit at the operating
+    /// point the parameters assume (from the kernel).
+    pub amps_ok: bool,
 }
 
 impl Observation {
     pub fn clean(&self) -> bool {
-        self.heartbeat_fresh && self.plugin_ok && self.links_ok && self.carrier_ok && self.pcm_owner_ok
+        self.heartbeat_fresh
+            && self.plugin_ok
+            && self.links_ok
+            && self.carrier_ok
+            && self.pcm_owner_ok
+            && self.pcm_state_ok
+            && self.route_ok
+            && self.amps_ok
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
     Renew,
+    /// Keep the grant without renewing it: the PCM is starting.
+    Hold,
     Release,
     StayReleased,
 }
@@ -54,6 +74,15 @@ impl Lease {
             self.held = false;
             return if was { Action::Release } else { Action::StayReleased };
         }
+        if obs.pcm_settling {
+            // never a renewal; a start without a live grant is the
+            // kernel's to refuse, and does not count towards one
+            if self.held {
+                return Action::Hold;
+            }
+            self.clean_run = 0;
+            return Action::StayReleased;
+        }
         self.clean_run = self.clean_run.saturating_add(1);
         if self.held || self.clean_run >= CLEAN_TICKS_TO_LOCK {
             self.held = true;
@@ -68,8 +97,17 @@ impl Lease {
 mod tests {
     use super::*;
 
-    const CLEAN: Observation =
-        Observation { heartbeat_fresh: true, plugin_ok: true, links_ok: true, carrier_ok: true, pcm_owner_ok: true };
+    const CLEAN: Observation = Observation {
+        heartbeat_fresh: true,
+        plugin_ok: true,
+        links_ok: true,
+        carrier_ok: true,
+        pcm_owner_ok: true,
+        pcm_state_ok: true,
+        pcm_settling: false,
+        route_ok: true,
+        amps_ok: true,
+    };
 
     #[test]
     fn locks_after_two_clean_ticks_and_releases_on_any_fault() {
@@ -83,6 +121,9 @@ mod tests {
             Observation { links_ok: false, ..CLEAN },
             Observation { carrier_ok: false, ..CLEAN },
             Observation { pcm_owner_ok: false, ..CLEAN },
+            Observation { pcm_state_ok: false, ..CLEAN },
+            Observation { route_ok: false, ..CLEAN },
+            Observation { amps_ok: false, ..CLEAN },
         ] {
             assert_eq!(l.tick(fault), Action::Release);
             assert!(!l.held());
@@ -100,5 +141,20 @@ mod tests {
         assert_eq!(l.tick(bad), Action::StayReleased);
         assert_eq!(l.tick(CLEAN), Action::StayReleased);
         assert!(!l.held());
+    }
+
+    #[test]
+    fn settling_holds_a_grant_and_never_renews_or_starts_one() {
+        let mut l = Lease::default();
+        let settling = Observation { pcm_settling: true, ..CLEAN };
+        assert_eq!(l.tick(CLEAN), Action::StayReleased);
+        assert_eq!(l.tick(settling), Action::StayReleased);
+        assert_eq!(l.tick(CLEAN), Action::StayReleased);
+        assert_eq!(l.tick(CLEAN), Action::Renew);
+        assert_eq!(l.tick(settling), Action::Hold);
+        assert!(l.held());
+        assert_eq!(l.tick(CLEAN), Action::Renew);
+        // settling with any fault is a fault
+        assert_eq!(l.tick(Observation { heartbeat_fresh: false, ..settling }), Action::Release);
     }
 }
