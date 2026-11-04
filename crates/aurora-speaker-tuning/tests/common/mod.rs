@@ -329,7 +329,7 @@ pub fn spp3_files(channels: usize) -> BTreeMap<String, Vec<u8>> {
     f.insert(format!("{AID}/DSP/Strips/{sc}"), binary::write(&sidecar_value(channels)));
     f.insert("DeviceDSPDatabase.plist".into(), database(&[(65535, "builtin_speaker_out_general.austrip")]));
     let recs: Vec<(FourCc, u16, u16)> =
-        (0..channels).map(|c| (FourCc::from_str_exact(&format!("tsA{c}")).unwrap(), 3000 + c as u16, 3100)).collect();
+        (0..channels).map(|c| (FourCc::from_str_exact(&format!("spA{c}")).unwrap(), 3000 + c as u16, 3100)).collect();
     f.insert("speaker-thiele-small.bin".into(), spts::encode(&recs, 0xBEEF));
     f
 }

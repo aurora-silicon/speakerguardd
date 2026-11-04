@@ -18,6 +18,8 @@
 //!   for a key the sidecar lacks, its one-to-one saved ID.  The sense ports follow the
 //!   unit's default telemetry layout `[V0, I0, V1, I1, ...]` (specification
 //!   section 2: coreaudiod sets no `SpeakerInputDataSourceOrder`).  The
+//!   factory calibration of channel `c` is the SpTS record `spA<c>` (the
+//!   default data-source order), when the record file's checksum holds.  The
 //!   start state is the cold state the property strip selects with
 //!   `Thermal State Override` (64007) = 2; any other value is refused.
 //! * **lsm2** reads the saved state by the specification's numeric-ID rule
@@ -91,6 +93,20 @@ struct Spp3Lookup<'a> {
     initial_theta: Option<f64>,
 }
 
+impl Spp3Lookup<'_> {
+    /// The factory calibration record of unit channel `ch`: the SpTS record
+    /// whose data-source ID is `spA<ch>`, the binding of the unit's default
+    /// data-source order (coreaudiod sets no `SpeakerInputDataSourceOrder`).
+    /// `None` (open loop) without a valid record file or a matching record.
+    fn calibration(&self, ch: usize) -> Option<&crate::spts::Record> {
+        let s = self.t.spts.as_ref().filter(|s| s.checksum_valid)?;
+        if ch > 9 {
+            return None;
+        }
+        s.by_source(crate::fourcc::FourCc::from_bytes([b's', b'p', b'A', b'0' + ch as u8]))
+    }
+}
+
 impl spp3::TuningLookup for Spp3Lookup<'_> {
     fn channels(&self) -> usize {
         self.sidecar.num_channels
@@ -117,6 +133,9 @@ impl spp3::TuningLookup for Spp3Lookup<'_> {
             "SpeakerGroup" => return c.speaker_group.map(|g| g as f64),
             "IgnoreTelemetry" => return c.ignore_telemetry.map(|b| b as u8 as f64),
             "sgv2.InitialThetaVc" | "sgv2.InitialThetaMg" => return self.initial_theta,
+            "sgv2.CalPresent" => return Some(self.calibration(ch).is_some() as u8 as f64),
+            "sgv2.CalR" => return self.calibration(ch).map(|r| r.r_cal_ohm),
+            "sgv2.CalT" => return self.calibration(ch).map(|r| r.t_cal_c),
             _ => {}
         }
         let saved = |id: u32| self.t.protection.state.section(SCOPE_PART, ch as u32)?.get(id).map(f64::from);

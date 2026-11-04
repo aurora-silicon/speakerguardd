@@ -21,9 +21,13 @@
 //! and the graph's `SpeakerInputDataSourceOrder`, never by record position
 //! or speaker name.
 //!
+//! The trailer is a 16-bit additive checksum: the two's complement of the
+//! byte sum of everything before it, little-endian.  A record file whose
+//! checksum fails is decoded (for the dump) but marked unusable.
+//!
 //! TODO(SPEC): the remaining record bytes (0..4, 8..18: the other
-//! Thiele-Small fields of the decoded calibration schema) and the checksum
-//! algorithm.  They are exposed raw and not interpreted.
+//! Thiele-Small fields of the decoded calibration schema).  They are
+//! exposed raw and not interpreted.
 
 use crate::error::{Diagnostics, Error, Result};
 use crate::fourcc::FourCc;
@@ -58,8 +62,15 @@ fn hex<S: serde::Serializer>(b: &[u8; RECORD_LEN], s: S) -> std::result::Result<
 pub struct Spts {
     pub version: u16,
     pub records: Vec<Record>,
-    /// Stored trailer.  TODO(SPEC): algorithm; not verified.
     pub checksum_stored: u16,
+    /// The stored checksum equals the computed one.
+    pub checksum_valid: bool,
+}
+
+/// The two's complement of the 16-bit byte sum of `body`.
+pub fn checksum(body: &[u8]) -> u16 {
+    let sum = body.iter().fold(0u16, |s, b| s.wrapping_add(u16::from(*b)));
+    sum.wrapping_neg()
 }
 
 impl Spts {
@@ -122,12 +133,20 @@ pub fn decode(data: &[u8], ctx: &str, diags: &mut Diagnostics) -> Result<Spts> {
         });
     }
     let checksum_stored = u16::from_le_bytes([data[data.len() - 2], data[data.len() - 1]]);
-    diags.info("spts-checksum-unverified", ctx, "checksum not verified: TODO(SPEC) algorithm");
-    Ok(Spts { version, records, checksum_stored })
+    let checksum_valid = checksum(&data[..data.len() - 2]) == checksum_stored;
+    if !checksum_valid {
+        diags.warn(
+            "spts-checksum",
+            ctx,
+            format!("checksum 0x{checksum_stored:04x} does not match; the calibration is unusable (open loop)"),
+        );
+    }
+    Ok(Spts { version, records, checksum_stored, checksum_valid })
 }
 
-/// Builds a record file, for synthetic fixtures.
-pub fn encode(records: &[(FourCc, u16, u16)], checksum: u16) -> Vec<u8> {
+/// Builds a record file with a valid checksum, for synthetic fixtures.
+/// (`checksum` is ignored; kept for call-site compatibility.)
+pub fn encode(records: &[(FourCc, u16, u16)], _checksum: u16) -> Vec<u8> {
     let mut d = vec![2, 0, RECORD_LEN as u8, records.len() as u8];
     for (id, r, t) in records {
         let mut rec = [0u8; RECORD_LEN];
@@ -136,7 +155,8 @@ pub fn encode(records: &[(FourCc, u16, u16)], checksum: u16) -> Vec<u8> {
         rec[18..22].copy_from_slice(&id.0.to_le_bytes());
         d.extend_from_slice(&rec);
     }
-    d.extend_from_slice(&checksum.to_le_bytes());
+    let c = checksum(&d);
+    d.extend_from_slice(&c.to_le_bytes());
     d
 }
 
@@ -158,7 +178,13 @@ mod tests {
         assert_eq!(s.records[1].r_cal_ohm, 2.0);
         assert_eq!(s.records[1].t_cal_c, 25.0);
         assert_eq!(s.by_source(id("spA1")).unwrap().position, 1);
-        assert_eq!(s.checksum_stored, 0x1234);
+        assert!(s.checksum_valid);
+        let mut bad = encode(&[(id("spA0"), 4096, 3200)], 0);
+        let n = bad.len();
+        bad[n - 1] ^= 1;
+        assert!(!decode(&bad, "t", &mut d).unwrap().checksum_valid);
+        // Additive: 1 + 2 + 3 = 6, stored as -6.
+        assert_eq!(checksum(&[1, 2, 3]), 0xFFFA);
     }
 
     #[test]

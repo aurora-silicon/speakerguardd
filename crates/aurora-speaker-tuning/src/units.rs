@@ -64,7 +64,7 @@ pub fn table() -> Vec<Row> {
     });
     rows.push(Row {
         source: "SpTS record",
-        field: "bytes 0..4, 8..18; checksum".into(),
+        field: "bytes 0..4, 8..18".into(),
         unit: "TODO(SPEC)",
         meaning: "not yet named by the specification; exposed raw".into(),
     });

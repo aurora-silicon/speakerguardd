@@ -219,10 +219,11 @@ fn human(t: &Tuning) {
     }
     if let Some(sp) = &t.spts {
         println!(
-            "\nSpTS v{}: {} records (checksum 0x{:04x} unverified)",
+            "\nSpTS v{}: {} records (checksum 0x{:04x} {})",
             sp.version,
             sp.records.len(),
-            sp.checksum_stored
+            sp.checksum_stored,
+            if sp.checksum_valid { "valid" } else { "INVALID" }
         );
         for r in &sp.records {
             println!("  {} R_cal {:.4} ohm  T_cal {:.3} degC", r.data_source, r.r_cal_ohm, r.t_cal_c);

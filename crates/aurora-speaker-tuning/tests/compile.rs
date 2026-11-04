@@ -15,6 +15,10 @@ use common::*;
 use std::collections::BTreeMap;
 
 fn tuning(files: &BTreeMap<String, Vec<u8>>, name: &str) -> Tuning {
+    tuning_allowing(files, name, &[])
+}
+
+fn tuning_allowing(files: &BTreeMap<String, Vec<u8>>, name: &str, _expected: &[&str]) -> Tuning {
     let dir = scratch(name);
     write_dir(&dir, files, &manifest_json(files, "25G83"));
     let b = Bundle::open(&dir).unwrap();
@@ -48,7 +52,31 @@ fn spp3_fields_come_from_the_sidecar_and_state() {
         assert_eq!((x.imon_scale, x.vmon_scale), (2.0, 10.0));
         assert_eq!(x.cl_thermal_feedback_enabled, 1);
         assert_eq!((x.initial_theta_vc, x.initial_theta_mg), (0.0, 0.0));
+        // spA<ch> carries raw R 3000+ch (Q6.10) and raw T 3100 (Q9.7).
+        assert_eq!(x.cal_present, 1);
+        assert_eq!((x.cal_r, x.cal_t), ((3000 + ch) as f32 / 1024.0, 3100.0 / 128.0));
+        assert_eq!((x.temp_sense_window_time_s, x.tlim_adj_cap, x.a_t_20c), (0.2, 40.0, 0.0039));
     }
+}
+
+#[test]
+fn spp3_calibration_needs_a_valid_matching_record() {
+    // A bad checksum: every channel open loop.
+    let mut f = spp3_files(4);
+    let spts = f.get_mut("speaker-thiele-small.bin").unwrap();
+    let n = spts.len();
+    spts[n - 1] ^= 1;
+    let t = tuning_allowing(&f, "c-cal-bad", &["spts-checksum"]);
+    let p = sgv2_core::spp3::Params::from_blob(&compile(&t, &mut Diagnostics::default()).unwrap().blob).unwrap();
+    assert!(p.ch[..4].iter().all(|c| c.cal_present == 0));
+    // A record only for channel 2: the others open loop.
+    let mut f = spp3_files(4);
+    let id = aurora_speaker_tuning::fourcc::FourCc::from_str_exact("spA2").unwrap();
+    f.insert("speaker-thiele-small.bin".into(), aurora_speaker_tuning::spts::encode(&[(id, 3500, 3000)], 0));
+    let t = tuning_allowing(&f, "c-cal-one", &["spts-count"]);
+    let p = sgv2_core::spp3::Params::from_blob(&compile(&t, &mut Diagnostics::default()).unwrap().blob).unwrap();
+    let present: Vec<u32> = p.ch[..4].iter().map(|c| c.cal_present).collect();
+    assert_eq!(present, vec![0, 0, 1, 0]);
 }
 
 #[test]
