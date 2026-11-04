@@ -23,7 +23,8 @@
 //! - **Candidates.** `g_ff = sqrt(clamp((Tlim_eff - ambient - theta_mg) /
 //!   (theta_ff + 1 C), 1e-4, 1))`, smoothed per update with the 99 % law
 //!   (attack 4.6 s / release 20 s on AID35) from the previous selected
-//!   minimum. The hard path arms when `T_OL > Tlim_eff + headroom`, disarms
+//!   minimum, through a 1 s release hold of the candidate (rig law 5).
+//!   The hard path arms when `T_OL > Tlim_eff + headroom`, disarms
 //!   when `T_OL < Tlim_eff`, and while armed offers the same ratio 5 C lower.
 //!   The group takes the minimum; two 5 ms dezipper stages follow.
 //! - **SafeTlim.** Per channel: after `ceil(TimeMin * 60 * fs / 256)`
@@ -62,13 +63,18 @@
 //!   next stream or instance (spec 10's state vector): each node aged by
 //!   `exp(-gap/tau)`, the gain advanced toward unity with `k_release`, the
 //!   arm flag kept only while the aged `T_OL` is still at or above the
-//!   effective limit. The closed loop restarts invalid; SafeTlim restarts
-//!   NORMAL (TODO(SPEC): whether the hand-off record carries the latch).
+//!   effective limit. The closed loop restarts invalid and SafeTlim restarts
+//!   NORMAL, as the reference's rebuild does (rig law 6: the latch survives
+//!   only AudioUnitReset). Policy divergence: the reference restores the
+//!   record only under 64007 = 0 and cold-seeds under 2; the hand-off is
+//!   restored for every start state here, which never runs cooler.
 //! - **No feed-forward** (`ThermalFFSpeedupFactor <= 0`): the ordinary
-//!   candidate is unity (spec 5, 6). TODO(SPEC): the hard law needs a
-//!   virtual coil that does not exist then, and the text gives none; taking
-//!   the real coil settles about 70 C above the limit, so while armed the
+//!   candidate is unity. The reference leaves such a channel unprotected
+//!   (rig law 6: its FF state is NaN, the thermal state is re-seeded hot
+//!   every update so T_OL sits at the limit, and a NaN hard target means
+//!   unity). By policy this engine does not reproduce that: while armed the
 //!   hard path holds the fixed 20 dB fail-safe gain, which holds the limit.
+//!   No shipped preset sets a nonpositive factor.
 //!
 //! A preset that enables displacement control or CPMS (TODO(SPEC): the
 //! predictor coefficient builder, the feedback integrator and the CPMS
@@ -492,6 +498,8 @@ const HARD_TARGET_BELOW: f64 = 5.0;
 /// Clamp of the candidate ratio before the square root (spec 6, 16): a
 /// 0.01 (-40 dB) linear-gain floor.
 const RATIO_MIN: f64 = 1e-4;
+/// Release hold of the ordinary candidate, s (rig law 5: fixed).
+const HOLD_S: f64 = 1.0;
 /// Dezipper 99 % settling time, s (spec 6).
 const DEZIPPER_S: f64 = 0.005;
 const MODEL_SCRATCH: usize = 256;
@@ -499,21 +507,20 @@ const MODEL_SCRATCH: usize = 256;
 pub const METHOD_PILOT_TONE: u32 = 1;
 /// Property 64007 value of the cold start (spec 10).
 pub const THERMAL_STATE_COLD: u32 = 2;
-/// TODO(SPEC): which program drives `Pdrv` (the feed-forward node and the
-/// pilot content gate). Spec 4/16 say the headroom-reduced program
-/// `(1 - A_hi) * u`; the `spp3-cl-edge-pilot-dc-ulp` golden logs
-/// `Pdrv = (ag*x)^2 Reb/(Reb+Rshunt+Rampout)^2` for the raw DC level `x`
-/// (0.0299999776 W at the level made for 0.03 W without the headroom), and
-/// gates the pilot on at exactly that level. The golden wins until the text
-/// is reconciled.
+/// `Pdrv` (the feed-forward node and the pilot content gate) is the raw
+/// program, without the pilot headroom (rig law 1, against spec 4/16's
+/// text; to 2.6e-7 relative over 180 s, open and closed loop).
 const PDRV_WITH_HEADROOM: bool = false;
 /// TODO(SPEC) t-4668: the closed-loop correction may relax the limit only
-/// once `invTempCo` matches the goldens (279.18 / 273.04 logged against
-/// 271.57 / 266.49 from the spec formula on the synthetic SpTS). Until then
-/// the corrected limit is capped at the base: never less protective than
-/// macOS.
+/// once the CL goldens match. Rig laws 3-5 (the Float32 invTempCo and the
+/// Rshunt-net T_CL, the pilot generator, the candidate hold) bring
+/// cl-thermal_ramp_1k from 21 C to 0.5 C worst T_OL error with relaxation
+/// on, but the CL goldens are not yet inside tolerance (the window
+/// resistance, ~0.2 C more relaxed than macOS), so the corrected limit stays
+/// capped at the base: never less protective than macOS.
 const CL_RELAXATION: bool = false;
-/// TODO(SPEC): see the coil-power metering in `Run::segment`.
+/// `Pcoil` is the power of the unit's output samples, generated pilot
+/// included (rig law 2, against spec 4's text; to 3e-7 relative).
 const PCOIL_WITH_PILOT: bool = true;
 
 /// The reference's coefficient law: a one-pole that settles to 99 % in
@@ -645,7 +652,10 @@ struct Cl {
     reb_max: f64,
     cal_r: f64,
     cal_t: f64,
-    inv_temp_co: f64,
+    /// `invTempCo` and the series resistance, Float32 as the reference
+    /// keeps them.
+    inv_temp_co: f32,
+    rshunt: f32,
     cap: f64,
     k_lim: f64,
     /// The latest completed window passed every gate.
@@ -705,9 +715,16 @@ impl Cl {
         if !(c.temp_sense_smoothing_tau_s > 0.0 && c.tlim_err_decay_time_s > 0.0 && c.rdc_scale > 0.0) {
             return None;
         }
+        // alpha interpolated at T_cal in double from the Float32 inputs,
+        // its reciprocal stored as Float32 (spec 7; rig law 3)
         let (a20, a35) = (c.a_t_20c as f64, c.a_t_35c as f64);
         let alpha = a20 + (tc - 20.0) * (a35 - a20) / 15.0;
         if !(alpha.is_finite() && alpha > 0.0) {
+            return None;
+        }
+        let inv_temp_co = (1.0 / alpha) as f32;
+        // the temperature ratio is of the coil resistance net of Rshunt
+        if !(inv_temp_co.is_finite() && c.cal_r - c.rshunt > 0.0) {
             return None;
         }
         let (vs, is) = (c.vmon_scale as f64, c.imon_scale as f64);
@@ -730,11 +747,8 @@ impl Cl {
             reb_max: c.reb_range_max as f64,
             cal_r: rc,
             cal_t: tc,
-            // TODO(SPEC): the rig's CL goldens (synthetic SpTS 3.3 / 3.75 ohm
-            // at 25 C) log T_CL exactly linear in the logged resistance with
-            // invTempCo 279.18 (woofer) and 273.04 (tweeter); this formula
-            // gives 271.57 and 266.49.
-            inv_temp_co: 1.0 / alpha,
+            inv_temp_co,
+            rshunt: c.rshunt,
             cap: c.tlim_adj_cap.max(0.0) as f64,
             k_lim: settle99(c.tlim_err_decay_time_s as f64, r),
             valid: false,
@@ -795,7 +809,13 @@ impl Cl {
         let r = libm::sqrt(pv / pi);
         self.r_window = r;
         self.r_s += self.k_r * (r - self.r_s);
-        let t = self.cal_t + (self.rdc_scale * self.r_s / self.cal_r - 1.0) * self.inv_temp_co;
+        // T_CL = fmaf(invTempCo, (Rw - Rshunt)/(R_cal - Rshunt) - 1, T_cal) in
+        // Float32, Rw the smoothed window resistance times RdcScale (rig
+        // law 3: bit-exact on 630 accepted windows over 10 configurations)
+        let rw = (self.rdc_scale * self.r_s) as f32;
+        let (rc, rs) = (self.cal_r as f32, self.rshunt);
+        let x = (rw - rs) / (rc - rs) - 1.0;
+        let t = libm::fmaf(self.inv_temp_co, x, self.cal_t as f32) as f64;
         // a window outside the range still publishes its temperature; the
         // range test is on the instantaneous window resistance
         let re = self.rdc_scale * r;
@@ -818,10 +838,9 @@ impl Cl {
             self.valid = false;
         }
         // max/min, not clamp: a NaN error falls back to the plain base.
-        // TODO(SPEC) t-4668: until the alpha inversion matches the goldens,
-        // the spec-formula invTempCo reads the coil cool and would relax the
-        // limit past macOS, so the correction is capped at the base: the
-        // closed loop runs and publishes T_CL but never relaxes.
+        // TODO(SPEC) t-4668: capped at the base until the CL goldens match
+        // (see CL_RELAXATION): the closed loop runs and publishes T_CL but
+        // never relaxes.
         let relax = if CL_RELAXATION { (t_ol - self.t_cl).max(0.0).min(self.cap) } else { 0.0 };
         let raw = if self.valid { base + relax } else { base };
         self.limit_s += self.k_lim * (raw - self.limit_s);
@@ -836,50 +855,67 @@ struct Pilot {
     upper: f64,
     lower: f64,
     enable: f32,
-    k1: f32,
-    k2: f32,
+    /// Block stage (once per thermal update, `PilotDecayTime` at the
+    /// update rate) and the two per-sample stages (`PilotDecayTimeStage2 /
+    /// 2` each), all with the 99 % law.
+    kb: f32,
+    ks: f32,
     /// The sine is `sin(2 pi m n / N)` on the analyser's bin `m` of its
-    /// period `N`, `n` counting frames from construction (the goldens:
-    /// 43.9453125 Hz for `PilotFreq` 43.0664, phase 0 at frame 0).
+    /// period `N`, `n` the absolute frame since construction, running while
+    /// the pilot is off (43.9453125 Hz for `PilotFreq` 43.0664).
     period: usize,
     bin: f64,
     n: usize,
-    /// Selected high/low amplitude (hysteresis on `T_OL`) and whether the
-    /// content gate is on; the target is their product.
+    /// High/low selection (hysteresis on `T_OL`) and the content gate.
     high: bool,
     on: bool,
-    z1: f32,
-    z2: f32,
+    /// Block-stage output, held over the next update's frames, and the two
+    /// per-sample stages.
+    s1: f32,
+    a: f32,
+    b: f32,
 }
+
+/// `min(10^(dB/20), 0.3)`: the pilot amplitude, clamped (rig law 4).
+fn pilot_amplitude(db: f32) -> f32 {
+    (libm::pow(10.0, db as f64 / 20.0) as f32).min(PILOT_AMPLITUDE_MAX)
+}
+
+/// Largest pilot amplitude (rig law 4: -10 and -10.4 dB both give 0.3).
+const PILOT_AMPLITUDE_MAX: f32 = 0.3;
 
 impl Pilot {
     fn new(c: &ChannelParams, rate: f64) -> Pilot {
-        let a = |db: f32| libm::pow(10.0, db as f64 / 20.0) as f32;
+        let period = pilot_period(c, rate);
         Pilot {
-            a_hi: a(c.pilot_ampl_hi_db),
-            a_lo: a(c.pilot_ampl_lo_db),
+            a_hi: pilot_amplitude(c.pilot_ampl_hi_db),
+            a_lo: pilot_amplitude(c.pilot_ampl_lo_db),
             upper: c.pilot_upper_thres as f64,
             lower: c.pilot_lower_thres as f64,
             enable: c.pilot_enable_thres,
-            k1: settle99(c.pilot_decay_time_s as f64, rate) as f32,
-            k2: settle99(c.pilot_decay_time_stage2_s as f64, rate) as f32,
-            period: pilot_period(c, rate),
-            bin: libm::round(c.pilot_freq as f64 * pilot_period(c, rate) as f64 / rate),
+            kb: settle99(c.pilot_decay_time_s as f64, rate / THERMAL_FRAMES as f64) as f32,
+            ks: settle99(c.pilot_decay_time_stage2_s as f64 / 2.0, rate) as f32,
+            period,
+            bin: libm::round(c.pilot_freq as f64 * period as f64 / rate),
             n: 0,
             high: false,
             on: false,
-            z1: 0.0,
-            z2: 0.0,
+            s1: 0.0,
+            a: 0.0,
+            b: 0.0,
         }
     }
     fn reset(&mut self) {
         self.n = 0;
         self.high = false;
         self.on = false;
-        self.z1 = 0.0;
-        self.z2 = 0.0;
+        self.s1 = 0.0;
+        self.a = 0.0;
+        self.b = 0.0;
     }
-    /// Per thermal update, from that update's `Pdrv` and `T_OL`.
+    /// Per thermal update, from that update's `Pdrv` and `T_OL`: the target
+    /// and the block stage, which the next update's frames see (one block
+    /// of latency on and off).
     fn update(&mut self, p_drv: f64, t_ol: f64) {
         self.on = (p_drv as f32) >= self.enable;
         if t_ol > self.upper {
@@ -887,27 +923,25 @@ impl Pilot {
         } else if t_ol < self.lower {
             self.high = false;
         }
+        let tgt = self.target();
+        self.s1 += self.kb * (tgt - self.s1);
     }
-    /// Add the pilot to `out`. TODO(SPEC): the exact form of the two
-    /// "interpolation stages" (two cascaded per-sample 99 % one-poles
-    /// here, as spec 7 words it). The goldens' envelope rises faster: on
-    /// `spp3-cl-edge-deadI-midlimit` ch0 the envelope 0, 1, 2 frames after
-    /// the gate opens is 2.40e-7, 6.58e-7, 1.38e-6 (this model: 1.02e-7,
-    /// 3.05e-7, 6.09e-7) and reaches 9.51e-3 of 0.01 after 1244 frames
-    /// (this model 9.07e-3).
-    fn add(&mut self, out: &mut [f32]) {
-        let target = if !self.on {
+    fn target(&self) -> f32 {
+        if !self.on {
             0.0
         } else if self.high {
             self.a_hi
         } else {
             self.a_lo
-        };
+        }
+    }
+    /// Add the pilot to `out`, unscaled by the protection gain (rig law 4).
+    fn add(&mut self, out: &mut [f32]) {
         let w = 2.0 * core::f64::consts::PI * self.bin / self.period as f64;
         for o in out.iter_mut() {
-            self.z1 += self.k1 * (target - self.z1);
-            self.z2 += self.k2 * (self.z1 - self.z2);
-            *o += self.z2 * libm::sin(w * self.n as f64) as f32;
+            self.a += self.ks * (self.s1 - self.a);
+            self.b += self.ks * (self.a - self.b);
+            *o += self.b * libm::sin(w * self.n as f64) as f32;
             self.n += 1;
             if self.n == self.period {
                 self.n = 0;
@@ -949,6 +983,7 @@ struct Chan {
     p_drv: f64,
     tlim_eff: f64,
     g_ff: f64,
+    hold: Hold,
     g_hard: f64,
     armed: bool,
     vi_power: f64,
@@ -976,9 +1011,67 @@ impl Chan {
         self.p_drv = 0.0;
         self.tlim_eff = self.safe.base();
         self.g_ff = 1.0;
+        self.hold = HOLD_START;
         self.g_hard = 1.0;
         self.armed = false;
         self.vi_power = f64::NAN;
+    }
+}
+
+/// The release hold of the ordinary candidate (rig law 5): when the fresh
+/// candidate first rises above the previous selected gain, the previous
+/// candidate is held for `N = ceil(1 s * update rate)` updates (188 at
+/// 48 kHz); a fresh candidate at or below the selected gain cancels it,
+/// and after a completed hold the fresh candidate passes until it falls
+/// to the selected gain again.
+#[derive(Clone, Copy)]
+struct Hold {
+    state: HoldState,
+    cnt: u32,
+    held: f64,
+    u_prev: f64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HoldState {
+    Attack,
+    Holding,
+    Released,
+}
+
+const HOLD_START: Hold = Hold { state: HoldState::Attack, cnt: 0, held: 1.0, u_prev: 1.0 };
+
+impl Hold {
+    /// The candidate fed to the smoother this update.
+    fn step(&mut self, g: f64, sel_prev: f64, n: u32) -> f64 {
+        let u = self.decide(g, sel_prev, n);
+        self.u_prev = u;
+        u
+    }
+    fn decide(&mut self, g: f64, sel_prev: f64, n: u32) -> f64 {
+        if self.cnt > 0 {
+            if g > sel_prev {
+                self.cnt -= 1;
+                if self.cnt == 0 {
+                    self.state = HoldState::Released;
+                }
+                return self.held;
+            }
+            self.cnt = 0;
+        }
+        if g > sel_prev {
+            if self.state == HoldState::Attack {
+                self.held = self.u_prev;
+                self.cnt = n.saturating_sub(1);
+                self.state = if self.cnt == 0 { HoldState::Released } else { HoldState::Holding };
+                self.held
+            } else {
+                g
+            }
+        } else {
+            self.state = HoldState::Attack;
+            g
+        }
     }
 }
 
@@ -1001,6 +1094,8 @@ struct Run {
     k_attack: f64,
     k_release: f64,
     k_dez: f32,
+    /// Release-hold length, updates (`ceil(1 s * fs / 256)`).
+    hold_n: u32,
     ch: Vec<Chan>,
     groups: Vec<Group>,
     /// Per group, the dezippered gain of the current segment's frames.
@@ -1077,15 +1172,7 @@ impl Unit {
         let Some(r) = self.run.as_ref() else { return [f64::NAN; 11] };
         let Some(ch) = r.ch.get(c) else { return [f64::NAN; 11] };
         let g = &r.groups[ch.group];
-        let pilot = ch.pilot.as_ref().map_or(f64::NAN, |p| {
-            (if !p.on {
-                0.0
-            } else if p.high {
-                p.a_hi
-            } else {
-                p.a_lo
-            }) as f64
-        });
+        let pilot = ch.pilot.as_ref().map_or(f64::NAN, |p| p.target() as f64);
         [
             ch.g_ff,
             g.g,
@@ -1184,11 +1271,7 @@ impl Run {
                 let p0 = (c.temperature_limit as f64 - ambient) / (tvc + tmg);
                 (p0 * tvc, p0 * tmg, p0 * tvc)
             };
-            let headroom = if c.pilot_tone_enabled != 0 {
-                (1.0 - libm::pow(10.0, c.pilot_ampl_hi_db as f64 / 20.0)) as f32
-            } else {
-                1.0
-            };
+            let headroom = if c.pilot_tone_enabled != 0 { 1.0 - pilot_amplitude(c.pilot_ampl_hi_db) } else { 1.0 };
             let pilot_cfg = c.pilot_tone_enabled != 0
                 && c.cl_thermal_feedback_enabled != 0
                 && c.thermal_measurement_method == METHOD_PILOT_TONE
@@ -1220,6 +1303,7 @@ impl Run {
                 p_drv: 0.0,
                 tlim_eff: c.temperature_limit as f64,
                 g_ff: 1.0,
+                hold: HOLD_START,
                 g_hard: 1.0,
                 armed: false,
                 vi_power: f64::NAN,
@@ -1236,6 +1320,7 @@ impl Run {
             k_attack: settle99(p.thermal_gain_attack_time_s as f64, r),
             k_release: settle99(p.thermal_gain_release_time_s as f64, r),
             k_dez: settle99(DEZIPPER_S, rate) as f32,
+            hold_n: libm::ceil(HOLD_S * r) as u32,
             ch,
             groups: vec![GROUP_START; ngroups],
             curve: vec![1.0; ngroups * THERMAL_FRAMES],
@@ -1298,11 +1383,7 @@ impl Run {
                 *health |= Health::FAILSAFE;
             }
             // Pcoil: the protected, headroom-reduced drive on the update's
-            // own frames (spec 4, 16). TODO(SPEC): spec 4 excludes the
-            // generated pilot; the `spp3-cl-edge-*` goldens' `Reb_Data`
-            // coil power carries the program x pilot cross term (update 2
-            // on ch0: 23.426 W logged, 23.410 W without the pilot, 23.422 W
-            // with it), so the drive is metered after the pilot is added.
+            // own frames, metered after the pilot is added (rig law 2).
             if PCOIL_WITH_PILOT {
                 if let Some(p) = c.pilot.as_mut() {
                     p.add(out);
@@ -1400,22 +1481,18 @@ impl Run {
             let num = limit - self.ambient - c.mg.theta;
             let vcff = c.ff.theta;
             let ratio = |num: f64| libm::sqrt((num / (vcff + PREDICTION_MARGIN)).clamp(RATIO_MIN, 1.0));
-            // TODO(SPEC): the goldens' controller record holds the ordinary
-            // candidate for 188 updates (1.0 s) after the hard path arms and
-            // after Pdrv drops to zero (spp3-cl-edge-deadI-midlimit ch4
-            // updates 65..253 and 22499..22687), so the smoother keeps
-            // attacking after a burst; that law is not in the text, so the
-            // candidate is recomputed every update here.
-            c.g_ff = if c.ff_on { ratio(num) } else { 1.0 };
+            let fresh = if c.ff_on { ratio(num) } else { 1.0 };
+            // release hold (rig law 5) against the previous selected gain
+            c.g_ff = c.hold.step(fresh, self.groups[c.group].g, self.hold_n);
             // the hard path follows the effective limit
             if t_ol > limit + c.headroom_c {
                 c.armed = true;
             } else if t_ol < limit {
                 c.armed = false;
             }
-            // TODO(SPEC): without the feed-forward filter there is no virtual
-            // coil for the hard law; the fixed 20 dB holds the limit (module
-            // docs)
+            // without the feed-forward filter the reference has no working
+            // hard path (rig law 6); by policy the fixed 20 dB holds the
+            // limit here (module docs)
             c.g_hard = if !c.armed {
                 1.0
             } else if c.ff_on {
@@ -1614,6 +1691,7 @@ impl ProtectionUnit for Unit {
             c.ff.theta = s[2] * libm::exp(-t / c.ff.tau);
             // hysteresis: an armed hard path stays armed until T_OL < limit
             c.armed = s[3] != 0.0 && run.ambient + c.vc.theta + c.mg.theta >= c.safe.base();
+            c.hold = HOLD_START;
             g[c.group] = g[c.group].min(state.gain[i]);
         }
         let k = 1.0 - run.k_release;

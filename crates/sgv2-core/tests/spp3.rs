@@ -527,9 +527,11 @@ fn closed_loop_reads_coil_temperature_from_the_pilot_bin_and_never_relaxes() {
     let (rc, tc) = (4.0f32, 25.0f32);
     let p = cl_params(rc, tc);
     let mut u = spp3::Unit::new(p);
-    // a resistive plant whose coil sits at 60 C: R = Rc (1 + alpha (T - Tc))
+    // a resistive plant whose coil (net of Rshunt 0.2) sits at 60 C:
+    // T_CL = T_cal + ((R - Rs) / (Rc - Rs) - 1) * invTempCo (rig law 3)
     let alpha = 0.004 + (25.0 - 20.0) * (0.0038 - 0.004) / 15.0;
-    let r = rc as f64 * (1.0 + alpha * (60.0 - 25.0));
+    let rs = 0.2;
+    let r = rs + (rc as f64 - rs) * (1.0 + alpha * (60.0 - 25.0));
     let n = 48_000 * 20;
     let tele = pilot_sense(r, n);
     let t = run_cl(&mut u, 0.3, &tele, 0, n);
@@ -537,7 +539,7 @@ fn closed_loop_reads_coil_temperature_from_the_pilot_bin_and_never_relaxes() {
     assert!((t.channels[0].cl_temp_c - 60.0).abs() < 0.05, "T_CL {}", t.channels[0].cl_temp_c);
     assert_eq!(u.controller_state(0)[9], 1.0, "window accepted");
     // the model runs hotter than the sensed 60 C, but the correction is
-    // capped at the base until the alpha inversion is resolved (t-4668)
+    // capped at the base until the CL goldens match (t-4668)
     assert_eq!(t.channels[0].tlim_adj_c, 0.0);
     assert_eq!(u.effective_limit(0), 120.0);
 }
