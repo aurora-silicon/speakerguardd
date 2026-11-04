@@ -63,16 +63,14 @@
 //!   one-pole toward a request near 0.53), holds about 0.5 s before
 //!   releasing and recovers along an S-curve: not the first-order
 //!   99 %-settling law the specification states and this unit implements.
-//! - **Panic transition.** 25G83 falls 1 -> 0.98 -> 0.66 -> 0.28 -> 0.11 ->
-//!   0.081 over about 40 ms of crossing `Tlim + headroom` (10 ms windows,
-//!   whatever the attack), then settles at 0.1 and releases with the gain
-//!   (0.17 after 0.5 s). Here the 0.1 cap applies at once and holds to the
-//!   next controller block boundary (more restrictive for those 40 ms;
-//!   never less), and the smoothed gain follows the capped request.
+//! - **Panic hold.** The rig (law 4) has the 0.1 target held about
+//!   5000-5750 samples before release; here it holds to the next
+//!   controller block boundary once the coil is back at the hard limit.
 //! - **Q = 1.** macOS takes a distinct path for one-frame host calls (the
 //!   tone-burst gain is 1.0019 to 1.0027 there); it is not specified, and
 //!   this unit renders Q = 1 like any other slice.
 
+use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::blob::{BlobError, Pod};
@@ -314,7 +312,10 @@ struct Run {
     /// Active (not bypassed) frames since initialisation: the dezipper clock.
     active: u64,
     mute: u64,
-    dez: Dezipper,
+    /// Per channel: the output dezipper and its last value. Its input is the
+    /// gain target: 0 during the startup mute, f32(0.1) in a panic, else 1
+    /// (rig laws 4 and 6).
+    dez: Vec<Dezipper>,
     dez_now: f32,
     frame: u64,
     /// A model state went non-finite: the fail-safe is latched until reset.
@@ -396,7 +397,7 @@ impl Run {
             ch,
             active: 0,
             mute: libm::round(STARTUP_MUTE_S * rate) as u64,
-            dez: Dezipper::new(rate),
+            dez: vec![Dezipper::new(rate); n],
             dez_now: 0.0,
             frame: 0,
             fault: false,
@@ -422,12 +423,21 @@ impl Run {
         self.blk_pos = 0;
     }
 
-    /// Advance the output dezipper one active frame (module docs).
+    /// Advance channel `c`'s output dezipper one active frame (module docs).
     #[inline]
-    fn dezipper(&mut self) -> f64 {
-        let x = if self.active < self.mute { 0.0 } else { 1.0 };
-        self.dez_now = self.dez.step(x);
-        self.dez_now as f64
+    fn dezipper(&mut self, c: usize, panic: bool) -> f64 {
+        let x = if self.active < self.mute {
+            0.0
+        } else if panic {
+            PANIC_GAIN as f32
+        } else {
+            1.0
+        };
+        let y = self.dez[c].step(x);
+        if c == 0 {
+            self.dez_now = y;
+        }
+        y as f64
     }
 
     /// Returns whether any input sample was non-finite (the meter failure:
@@ -488,8 +498,12 @@ impl Run {
                 pan[..n].iter_mut().for_each(|p| *p |= any);
             }
             // 2. smooth, apply, integrate
-            let d = self.dezipper();
+            let mut dz = [0.0f64; MAX_CHANNELS];
+            for (c, d) in dz.iter_mut().enumerate().take(n) {
+                *d = self.dezipper(c, pan[c]);
+            }
             for (c, ch) in self.ch.iter_mut().enumerate() {
+                let d = dz[c];
                 let a = if req[c] < ch.gain { ch.a_attack } else { ch.a_release };
                 ch.gain += a * (req[c] - ch.gain);
                 // the program held to digital full scale before the gain and
@@ -500,14 +514,13 @@ impl Run {
                 // meters see it unclamped (to METER_FS) as the reference
                 let x = crate::dsp::bound1(raw) as f64;
                 let xm = crate::dsp::meter1(raw) as f64;
-                // never above the input (review_bound): the dezipper's
                 // The dezipper's own trajectory passes as the reference's
-                // does (its 1.0283 overshoot and its +0.052 dB fixed point:
-                // the thermal model sees the same drive), bounded at its
-                // peak; the output is held to full scale. The panic is
-                // immediate (the 25G83 gain is down 20 dB within about 50 ms
-                // whatever the attack): at most 0.1 at once, linked like the
-                // requests and after the dezipper.
+                // does (its 1.0283 overshoot and its +0.052 dB fixed point),
+                // bounded at its peak; the output is held to full scale.
+                // The panic feeds the dezipper a 0.1 target (rig law 4: the
+                // reference's 1 -> 0.081 -> 0.101 trajectory over about
+                // 40 ms) and, stricter than the reference for those 40 ms,
+                // also caps the gain at 0.1 at once (coordinator decision).
                 let g = ch.gain * d;
                 let g = if g.is_finite() { g.clamp(0.0, DEZIPPER_PEAK as f64) } else { 0.0 };
                 let g = if pan[c] { g.min(PANIC_GAIN) } else { g };
@@ -660,7 +673,7 @@ impl ProtectionUnit for Unit {
             c.request = c.gain;
         }
         run.active = run.active.max(run.mute);
-        run.dez.settle();
+        run.dez.iter_mut().for_each(Dezipper::settle);
         true
     }
 
