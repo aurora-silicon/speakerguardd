@@ -17,11 +17,12 @@ It runs in the user's session, beside PipeWire, and does three things:
    missing link is silence and is allowed; any other link is a fault. It
    also checks the carrier: the protect stage's input and the sense at unity
    volume, unmuted.
-3. **Report.** Every 50 ms it writes `links=<0|1> carrier=<0|1> mono_ns=<t>`
+3. **Report.** On every link or carrier change, and every 50 ms, it writes
+   `links=<0|1> carrier=<0|1> mono_ns=<t> pid=<pid> start=<ticks>`
    to /run/speakerguardd/<uid>/helper/session, by a write to a new file and a
    rename, so the supervisor never reads a partial report. A report older
-   than 100 ms, or dated in the future, counts as absent, and the supervisor
-   then releases.
+   than 500 ms, dated in the future, or whose writer (pid, start time) is not
+   this live process counts as absent, and the supervisor then releases.
 4. **The grant-before-start sequence.** The supervisor grants only on a
    live engine heartbeat (the protect stage runs on PipeWire's dummy driver
    while the amps are unlinked) and a fresh report; this helper links the
@@ -322,6 +323,25 @@ class Session:
 _WRITER = None
 
 
+def realtime():
+    """Best effort: low SCHED_FIFO if RLIMIT_RTPRIO allows it (PipeWire's
+    limits.d grants it to its group), else a higher nice if allowed. Either
+    keeps the report on time under desktop load; without them the
+    supervisor's 500 ms report bound absorbs a late report. The engine,
+    PCM and owner checks never depend on this process's timing."""
+    try:
+        os.sched_setscheduler(0, os.SCHED_FIFO, os.sched_param(5))
+        log("SCHED_FIFO 5")
+        return
+    except (OSError, AttributeError):
+        pass
+    try:
+        os.nice(-10)
+        log("nice -10")
+    except OSError:
+        log("normal priority (no RLIMIT_RTPRIO or CAP_SYS_NICE)")
+
+
 def write_report(path, links, carrier):
     """Write one report atomically: a new file in the helper's own
     directory, renamed over the last one. The supervisor reads either the
@@ -376,6 +396,7 @@ def main():
             log(f"unlink on stop: {e}")
         raise SystemExit(0)
 
+    realtime()
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     last = (None, None, None, None)
@@ -390,7 +411,12 @@ def main():
                 s.reconcile(g, granted)
                 was_granted = granted
         if time.monotonic() < nxt:
-            continue
+            # event-driven: a link or carrier change is reported at once,
+            # not at the next period
+            if ready is not None and s.check(g) != last[1:3]:
+                nxt = time.monotonic()
+            else:
+                continue
         nxt += PERIOD
         if nxt < time.monotonic():
             nxt = time.monotonic() + PERIOD

@@ -177,8 +177,15 @@ pub trait SessionView {
 /// The largest graph quantum the heartbeat bound accepts (PipeWire's
 /// default `clock.max-quantum`). A page claiming more is not fresh.
 pub const MAX_QUANTUM: u64 = 2048;
-/// The helper writes every 50 ms: two periods.
-pub const SESSION_STALE_NS: u64 = 100_000_000;
+/// How old the helper's report may be. It bounds only the links and carrier
+/// checks, which guard against a foreign link in the graph. The writer's
+/// liveness is checked separately and strictly (a dead or replaced helper
+/// counts at once), and so are the engine heartbeat, the PCM state and its
+/// owner, which protect the speakers. The helper writes on every link
+/// change and every 50 ms; 500 ms rides out a helper starved by desktop
+/// load (J616s, full-volume YouTube with a busy browser: a missed 50 ms
+/// window went past the old 100 ms bound and dropped the audio).
+pub const SESSION_STALE_NS: u64 = 500_000_000;
 /// How far in the future a session report may be dated. The helper and
 /// the supervisor read the same CLOCK_MONOTONIC and the supervisor reads its
 /// clock after the file, so a report is never ahead: 1 ms is slack only.
@@ -1242,5 +1249,66 @@ mod tests {
         let uid = unsafe { libc::getuid() };
         assert!(helper_is(&r, Some(&stat), Some(uid), uid));
         assert!(!helper_is(&r, Some(&stat), Some(uid), uid + 1));
+    }
+
+    /// J616s under desktop load: the helper (alive) misses its window and
+    /// its report is 150 ms old while the engine is healthy and the PCM runs.
+    /// No release; a dead helper still releases on the next tick.
+    #[test]
+    fn a_150_ms_helper_stall_with_a_healthy_engine_does_not_release() {
+        use crate::kernel::Recorder;
+        use crate::supervise::{Event, Expect, Supervisor};
+        let q = 10_666_666u64;
+        let mut o = Observer::new(7, 48_000, TICK);
+        let mut k = Recorder::healthy(6);
+        let mut sup =
+            Supervisor::new(Expect::new(crate::machine::lookup("j316s").unwrap(), vec![11_890; 6], "Secondary"));
+        let run = PcmState::Running { owner: PID };
+        let mut seq = 0;
+        let mut now = 1_000_000_000;
+        let mut report = session(now);
+        let step = |o: &mut Observer, sup: &mut Supervisor, k: &mut Recorder, now: u64, seq: u64, r| {
+            let e = beat(seq, 512, now - 1_000);
+            sup.tick(o.observe(&mut || now, &mut E(e), &mut P(run), &mut S(r)), k).unwrap()
+        };
+        // steady: the helper reports every 50 ms
+        for i in 0..30u64 {
+            seq += 1;
+            now += q;
+            if i % 5 == 0 {
+                report = session(now);
+            }
+            step(&mut o, &mut sup, &mut k, now, seq, report);
+        }
+        assert!(k.held);
+        let releases = k.releases;
+        // the helper stalls for 150 ms (its last report ages to 150+ ms)
+        let stall_end = now + 150_000_000;
+        while now < stall_end {
+            seq += 1;
+            now += q;
+            let ev = step(&mut o, &mut sup, &mut k, now, seq, report);
+            assert!(matches!(ev, Event::Renewed), "{ev:?} at report age {} ms", (now - report.mono_ns) / 1_000_000);
+        }
+        assert_eq!(k.releases, releases);
+        // it is still bounded: a report past the bound releases
+        let old = SessionReport { mono_ns: now - SESSION_STALE_NS - 1, ..report };
+        seq += 1;
+        now += q;
+        assert!(matches!(step(&mut o, &mut sup, &mut k, now, seq, old), Event::Released { .. }));
+        // and a dead helper releases at once, whatever its report's age
+        let mut o = Observer::new(7, 48_000, TICK);
+        let mut sup =
+            Supervisor::new(Expect::new(crate::machine::lookup("j316s").unwrap(), vec![11_890; 6], "Secondary"));
+        let mut k = Recorder::healthy(6);
+        let mut t = 0;
+        for s2 in 1..6u64 {
+            t += q;
+            step(&mut o, &mut sup, &mut k, t, s2, session(t));
+        }
+        assert!(k.held);
+        t += q;
+        let dead = SessionReport { helper_alive: false, ..session(t) };
+        assert!(matches!(step(&mut o, &mut sup, &mut k, t, 6, dead), Event::Released { .. }));
     }
 }
