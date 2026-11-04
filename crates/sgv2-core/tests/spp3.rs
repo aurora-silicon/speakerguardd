@@ -51,6 +51,20 @@ fn params() -> Params {
             initial_theta_mg: 0.0,
             pilot_tone_enabled: 0,
             pilot_ampl_hi_db: -30.0,
+            temp_sense_window_time_s: 0.1,
+            temp_sense_smoothing_tau_s: 0.5,
+            rdc_scale: 1.0,
+            reb_range_min: 2.0,
+            reb_range_max: 8.0,
+            cal_temp_range_min: 10.0,
+            cal_temp_range_max: 50.0,
+            a_t_20c: 0.004,
+            a_t_35c: 0.0038,
+            tlim_err_decay_time_s: 5.0,
+            tlim_adj_cap: 30.0,
+            cal_present: 0,
+            cal_r: 0.0,
+            cal_t: 0.0,
         };
     }
     p
@@ -452,4 +466,52 @@ fn start_state_is_a_parameter() {
     u.reset();
     let (t, _) = drive(&mut u, [0.0; 4], dt(), U);
     assert!((t.channels[0].ol_temp_c as f64 - want).abs() < 1e-3);
+}
+
+#[test]
+fn closed_loop_reads_coil_temperature_from_v_over_i_and_relaxes_the_limit() {
+    let mut p = params();
+    let (rc, tc) = (4.0f32, 25.0f32);
+    for c in 0..4 {
+        p.ch[c].cal_present = 1;
+        p.ch[c].cal_r = rc;
+        p.ch[c].cal_t = tc;
+    }
+    let mut u = spp3::Unit::new(p);
+    // a resistive plant whose coil sits at 60 C: R = Rc (1 + alpha (T - Tc))
+    let alpha = 0.004 + (25.0 - 20.0) * (0.0038 - 0.004) / 15.0;
+    let r = rc as f64 * (1.0 + alpha * (60.0 - 25.0));
+    let n = 48_000 * 20;
+    let x = vec![0.3f32; 512];
+    let mut ob = vec![vec![0.0f32; 512]; 4];
+    // telemetry (I on even ports here): V = 0.05 FS of 12 V, I = V / R
+    let v_raw = 0.05f32;
+    let i_raw = ((v_raw as f64 * 12.0 / r) / 2.0) as f32;
+    let tele: Vec<Vec<f32>> = (0..8).map(|k| vec![if k % 2 == 0 { i_raw } else { v_raw }; 512]).collect();
+    let mut t = Telemetry::new();
+    for _ in 0..n / 512 {
+        let ins: Vec<&[f32]> = (0..4).map(|_| &x[..]).collect();
+        let sense: Vec<&[f32]> = tele.iter().map(|b| &b[..]).collect();
+        let mut outs: Vec<&mut [f32]> = ob.iter_mut().map(|b| &mut b[..]).collect();
+        u.process(Io { frames: 512, input: &ins, sense: &sense, output: &mut outs });
+    }
+    u.telemetry(&mut t);
+    assert!(t.channels[0].closed_loop);
+    assert!((t.channels[0].cl_temp_c - 60.0).abs() < 0.05, "T_CL {}", t.channels[0].cl_temp_c);
+    // the model runs hotter than the sensed 60 C, so the limit relaxes
+    // (capped), never below the limit
+    let adj = t.channels[0].tlim_adj_c;
+    assert!(adj > 0.0 && adj <= 30.0 + 1e-3, "TlimAdj {adj}");
+    assert!(!t.channels[2].closed_loop || t.channels[2].tlim_adj_c >= 0.0);
+}
+
+#[test]
+fn closed_loop_needs_a_calibration_inside_its_ranges() {
+    let mut p = params();
+    p.ch[0].cal_present = 1;
+    p.ch[0].cal_r = 4.0;
+    p.ch[0].cal_t = 60.0; // outside 10..50
+    let mut u = spp3::Unit::new(p);
+    let (t, _) = drive(&mut u, [0.1; 4], 0.5, 512);
+    assert!(!t.channels[0].closed_loop);
 }
