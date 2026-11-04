@@ -1,12 +1,19 @@
 //! speakerguardd v2: the supervisor loop.
 //!
 //! ```text
-//! speakerguardd [--card <N|ID>] --pcm <D> --uid <UID> --params <blob>
+//! speakerguardd [--card <N|ID>] --pcm <D> --uid <UID> --params <blob> [--selfcheck <record>]
 //! ```
 //!
 //! - Identifies the Mac from the device tree and refuses a parameter blob
 //!   compiled for another board, for another channel count, or with no
 //!   operating point or CRC (exit 78, not restarted).
+//! - Refuses to run without a passing first-boot self-check
+//!   (speakerguardd-selfcheck, `--selfcheck`, default
+//!   /var/lib/speakerguardd/selfcheck.bind) for exactly this board, kernel
+//!   release and parameter blob, and grants only while the session helper
+//!   reports that the protect stage was built with the wiring it proved. A
+//!   board the supervisor's table does not know runs from the record's
+//!   derived description.
 //! - Publishes the blob for the plugin (`/run/speakerguardd/params.bin`, by
 //!   atomic rename), keeps or creates the plugin's engine page for user
 //!   `UID`, and gives the session helper a directory of its own
@@ -59,6 +66,7 @@ mod linux {
         combine, helper_is, owner_to_tgid, parse_pcm_info, parse_pcm_status, parse_session, parse_tgid,
         speaker_pcm_problem, EngineState, EngineView, Observer, PcmInfo, PcmState, PcmView, SessionReport, SessionView,
     };
+    use sgv2_supervisor::selfcheck;
     use sgv2_supervisor::supervise::{Event, Expect, Fatal, Supervisor};
 
     const TICK_NS: u64 = 10_000_000;
@@ -73,6 +81,32 @@ mod linux {
     /// Waiting for the card: 50 ms doubling to 2 s.
     const BACKOFF_MIN_MS: u64 = 50;
     const BACKOFF_MAX_MS: u64 = 2_000;
+    const SELFCHECK: &str = "/var/lib/speakerguardd/selfcheck.bind";
+
+    /// The kernel release (`uname -r`).
+    fn kernel_release() -> Option<String> {
+        // SAFETY: a zeroed utsname is a valid out-buffer.
+        let mut u: libc::utsname = unsafe { core::mem::zeroed() };
+        // SAFETY: valid out-pointer.
+        if unsafe { libc::uname(&mut u) } != 0 {
+            return None;
+        }
+        // SAFETY: uname NUL-terminates release.
+        let r = unsafe { std::ffi::CStr::from_ptr(u.release.as_ptr()) };
+        r.to_str().ok().map(str::to_owned)
+    }
+
+    /// The self-check record: root's, not writable by anyone else, parsed.
+    fn read_selfcheck(path: &str) -> Result<selfcheck::Bind, String> {
+        use std::os::unix::fs::MetadataExt;
+        let md =
+            std::fs::symlink_metadata(path).map_err(|e| format!("{path}: {e} (has speakerguardd-selfcheck run?)"))?;
+        if !md.file_type().is_file() || md.uid() != 0 || md.mode() & 0o022 != 0 {
+            return Err(format!("{path}: not a regular file of root's, writable by root only"));
+        }
+        let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+        selfcheck::parse(&text).map_err(|e| format!("{path}: {e}"))
+    }
 
     struct Page(EnginePage);
     impl EngineView for Page {
@@ -532,9 +566,19 @@ mod linux {
             eprintln!("no Apple board in /proc/device-tree/compatible");
             return EX_CONFIG;
         };
-        let Some(machine) = lookup(&board) else {
-            eprintln!("{board}: not a machine speakerguardd v2 supports");
-            return EX_CONFIG;
+        let bind = match read_selfcheck(&arg(&args, "--selfcheck").unwrap_or_else(|| SELFCHECK.to_owned())) {
+            Ok(b) => b,
+            Err(why) => {
+                eprintln!("no self-check record: {why}; not granting (the kernel floor stays)");
+                return EX_CONFIG;
+            }
+        };
+        let machine = match selfcheck::machine_for(&board, lookup(&board), &bind) {
+            Ok(m) => m,
+            Err(why) => {
+                eprintln!("{why}; not granting (the kernel floor stays)");
+                return EX_CONFIG;
+            }
         };
         let card = arg(&args, "--card").unwrap_or_else(|| machine.card_id.to_owned());
 
@@ -575,6 +619,23 @@ mod linux {
             Ok(v) => v,
             Err(why) => return refuse(why),
         };
+        let params_sha256 = aurora_speaker_tuning::manifest::sha256_hex(&blob);
+        let Some(kernel_rel) = kernel_release() else {
+            eprintln!("uname failed");
+            return EX_UNAVAILABLE;
+        };
+        if let Err(why) = selfcheck::covers(&bind, &board, &kernel_rel, &params_sha256) {
+            eprintln!("{why}; not granting (the kernel floor stays)");
+            return EX_CONFIG;
+        }
+        eprintln!(
+            "self-check: {} wiring {:016x} ({}), kernel {}, params {}",
+            board,
+            bind.wiring,
+            bind.method,
+            bind.kernel,
+            &params_sha256[..12]
+        );
 
         let run_dir = Path::new("/run/speakerguardd");
         let user_dir = run_dir.join(uid.to_string());
@@ -680,10 +741,12 @@ mod linux {
         let mut pcm_view = PcmLatest(snapshot);
         let mut session = Session(session_path, live);
         let mut observer = Observer::new(header.payload_crc, header.sample_rate, TICK_NS);
+        observer.expect_wiring(bind.wiring);
         let mut sup = Supervisor::new(Expect::new(machine, full_scales, &info.id));
         let mut deadline = now_ns();
         let mut ticks = 0u64;
         let mut last_problem: Option<String> = None;
+        let mut last_wiring: Option<Option<u64>> = None;
         notify.send("STATUS=supervising");
         let mut scheduled = true;
         loop {
@@ -709,6 +772,16 @@ mod linux {
                     let _ = kernel.release();
                     return EX_UNAVAILABLE;
                 }
+            }
+            if observer.wrong_wiring() != last_wiring {
+                if let Some(w) = observer.wrong_wiring() {
+                    let named = w.map_or("no wiring".to_owned(), |w| format!("wiring {w:016x}"));
+                    eprintln!(
+                        "not granting: the protect stage was built with {named}, the self-check proved {:016x}",
+                        bind.wiring
+                    );
+                }
+                last_wiring = observer.wrong_wiring();
             }
             if sup.problem() != last_problem.as_deref() {
                 if let Some(p) = sup.problem() {
