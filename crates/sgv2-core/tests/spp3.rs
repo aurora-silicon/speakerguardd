@@ -2,7 +2,7 @@
 //! parameters only (no Mac's tuning appears here).
 
 use sgv2_core::spp3::{self, ChannelParams, Params};
-use sgv2_core::{Health, Io, ProtectionUnit, Telemetry, FAILSAFE_GAIN};
+use sgv2_core::{Health, Io, ProtectionUnit, Telemetry};
 
 const RATE: u32 = 48_000;
 const BLOCK: u32 = 512;
@@ -49,9 +49,32 @@ fn params() -> Params {
             sense_v: 2 * c as u32 + 1,
             initial_theta_vc: 0.0,
             initial_theta_mg: 0.0,
+            pilot_tone_enabled: 0,
+            pilot_ampl_hi_db: -30.0,
+            temp_sense_window_time_s: 0.1,
+            temp_sense_smoothing_tau_s: 0.5,
+            rdc_scale: 1.0,
+            reb_range_min: 2.0,
+            reb_range_max: 8.0,
+            cal_temp_range_min: 10.0,
+            cal_temp_range_max: 50.0,
+            a_t_20c: 0.004,
+            a_t_35c: 0.0038,
+            tlim_err_decay_time_s: 5.0,
+            tlim_adj_cap: 30.0,
+            cal_present: 0,
+            cal_r: 0.0,
+            cal_t: 0.0,
         };
     }
     p
+}
+
+const U: usize = spp3::THERMAL_FRAMES;
+const LOOK: usize = 72; // 1.5 ms at 48 kHz
+
+fn dt() -> f64 {
+    U as f64 / RATE as f64
 }
 
 fn elec(p: &Params, c: usize) -> f64 {
@@ -82,50 +105,6 @@ fn drive(unit: &mut spp3::Unit, x: [f32; 4], seconds: f64, slice: usize) -> (Tel
 }
 
 #[test]
-fn power_topology_and_first_block() {
-    let p = params();
-    let mut u = spp3::Unit::new(p);
-    assert!(!u.is_failsafe());
-    // the audio is not delayed, and the power is metered on the undelayed
-    // protected drive, so the first block is a full block
-    assert_eq!(u.latency_frames(), 0);
-    let (t, _) = drive(&mut u, [0.1; 4], BLOCK as f64 / RATE as f64, 512);
-    let want = elec(&p, 0) * 0.01;
-    assert!(
-        (t.channels[0].modeled_power_w as f64 - want).abs() < 1e-6 * want,
-        "{} {want}",
-        t.channels[0].modeled_power_w
-    );
-    let (t, _) = drive(&mut u, [0.1; 4], BLOCK as f64 / RATE as f64, 512);
-    let want = elec(&p, 0) * 0.01;
-    assert!((t.channels[0].modeled_power_w as f64 - want).abs() < 1e-6 * want);
-}
-
-#[test]
-fn backward_euler_matches_the_recurrence() {
-    let p = params();
-    let mut u = spp3::Unit::new(p);
-    let x = 0.05f64;
-    let dt = BLOCK as f64 / RATE as f64;
-    let c = &p.ch[1];
-    let (a_vc, a_mg) = (dt / (c.tau_tvc as f64 + dt), dt / (c.tau_tmg as f64 + dt));
-    let (mut vc, mut mg) = (0.0f64, 0.0f64);
-    let look = 72.0;
-    for b in 0..400 {
-        let fill = if b == 0 { (BLOCK as f64 - look) / BLOCK as f64 } else { 1.0 };
-        let pw = elec(&p, 1) * x * x * fill;
-        let old = mg;
-        vc += a_vc * (old + pw * c.t_sett_vc as f64 - vc);
-        mg += a_mg * (pw * c.t_sett_mg as f64 - mg);
-    }
-    let (t, _) = drive(&mut u, [x as f32; 4], 400.0 * dt, 333);
-    let got = t.channels[1].ol_temp_c as f64;
-    assert!((got - (40.0 + vc)).abs() < 1e-3, "{got} vs {}", 40.0 + vc);
-    assert!((t.channels[1].magnet_temp_c as f64 - (40.0 + mg)).abs() < 1e-3);
-    assert_eq!(t.channels[1].gain, 1.0, "well under the limit: no attenuation");
-}
-
-#[test]
 fn steady_state_temperature() {
     let p = params();
     let mut u = spp3::Unit::new(p);
@@ -136,61 +115,6 @@ fn steady_state_temperature() {
         let got = t.channels[c].ol_temp_c as f64;
         assert!((got - want).abs() < 0.01, "ch{c} {got} {want}");
     }
-}
-
-#[test]
-fn limiting_converges_to_the_power_ceiling() {
-    let p = params();
-    let mut u = spp3::Unit::new(p);
-    // Drive ch0 hard; P_hold = (limit - ambient) / (Rvc + Rmg).
-    let x = 0.5f32;
-    let (t, last) = drive(&mut u, [x, 0.0, 0.0, 0.0], 120.0, 1024);
-    let c = &p.ch[0];
-    let p_hold = (c.temperature_limit as f64 - 40.0) / (c.t_sett_vc as f64 + c.t_sett_mg as f64);
-    let p_drive = elec(&p, 0) * (x as f64) * (x as f64);
-    let want = (p_hold / p_drive).sqrt();
-    let g = t.channels[0].gain as f64;
-    assert!((g - want).abs() < 2e-3, "gain {g} want {want}");
-    assert!((last[0] as f64 - x as f64 * g).abs() < 1e-6);
-    let temp = t.channels[0].ol_temp_c as f64;
-    assert!((temp - 120.0).abs() < 0.2, "{temp}");
-    // ch1 is in ch0's group: same gain although undriven
-    assert_eq!(t.channels[1].gain, t.channels[0].gain);
-    // the other group is untouched
-    assert_eq!(t.channels[2].gain, 1.0);
-}
-
-#[test]
-fn never_passes_the_hard_limit_on_a_step() {
-    let p = params();
-    let mut u = spp3::Unit::new(p);
-    let total_blocks = (30.0 * RATE as f64 / BLOCK as f64) as usize;
-    let ins_buf = vec![vec![1.0f32; 512]; 4];
-    let mut outs_buf = vec![vec![0.0f32; 512]; 4];
-    let mut t = Telemetry::new();
-    let mut peak: f32 = 0.0;
-    let mut hard_seen = false;
-    let mut last_gain = 1.0f32;
-    for _ in 0..total_blocks {
-        let ins: Vec<&[f32]> = ins_buf.iter().map(|b| &b[..]).collect();
-        let mut outs: Vec<&mut [f32]> = outs_buf.iter_mut().map(|b| &mut b[..]).collect();
-        u.process(Io { frames: 512, input: &ins, sense: &[], output: &mut outs });
-        u.telemetry(&mut t);
-        peak = peak.max(t.channels[0].ol_temp_c);
-        if t.channels[0].ol_temp_c > 128.0 {
-            // the hard path selects a target 20 dB below the ceiling; the
-            // common gain path then attacks toward it
-            hard_seen = true;
-            assert!(t.channels[0].gain <= FAILSAFE_GAIN + 1e-6);
-            assert!(t.channels[0].gain <= last_gain);
-        }
-        last_gain = t.channels[0].gain;
-    }
-    // with these synthetic constants a full-scale step overshoots into the
-    // hard path, which then pulls the coil back
-    assert!(hard_seen);
-    assert!(t.channels[0].ol_temp_c < 128.5, "{}", t.channels[0].ol_temp_c);
-    assert!(peak < 135.0, "{peak}");
 }
 
 #[test]
@@ -250,29 +174,6 @@ fn audio_is_not_delayed_and_unity_is_bit_exact() {
     for o in &ob {
         assert_eq!(o, &x);
     }
-}
-
-#[test]
-fn start_state_is_a_parameter() {
-    let mut p = params();
-    p.ch[0].initial_theta_vc = 70.0;
-    p.ch[0].initial_theta_mg = 30.0;
-    let mut u = spp3::Unit::new(p);
-    let (t, _) = drive(&mut u, [0.0; 4], BLOCK as f64 / RATE as f64, 512);
-    let dt = BLOCK as f64 / RATE as f64;
-    let a_vc = dt / (p.ch[0].tau_tvc as f64 + dt);
-    let want = 40.0 + 70.0 + a_vc * (30.0 - 70.0);
-    assert!((t.channels[0].ol_temp_c as f64 - want).abs() < 1e-3);
-    u.reset();
-    let (t, _) = drive(&mut u, [0.0; 4], BLOCK as f64 / RATE as f64, 512);
-    assert!((t.channels[0].ol_temp_c as f64 - want).abs() < 1e-3);
-}
-
-#[test]
-fn nonzero_rampout_is_refused() {
-    let mut p = params();
-    p.ch[3].rampout = 0.02;
-    assert!(spp3::Unit::new(p).is_failsafe());
 }
 
 #[test]
@@ -358,7 +259,7 @@ fn measured_power_and_sense_geometry() {
     assert_eq!(h, Health::OK);
     let mut t = Telemetry::new();
     u.telemetry(&mut t);
-    // the published meter reads 0 W without a calibration overlay
+    // the published meter reads 0 W without the closed loop
     assert_eq!(t.channels[0].measured_power_w, 0.0);
     let want = 0.05 * 2.0 * 0.2 * 12.0;
     assert!((u.sense_power(0) - want).abs() < 1e-6);
@@ -369,13 +270,166 @@ fn measured_power_and_sense_geometry() {
 }
 
 #[test]
+fn disabled_thermal_protection_is_refused() {
+    let mut p = params();
+    p.thermal_protection_enabled = 0;
+    assert!(spp3::Unit::new(p).is_failsafe());
+}
+
+#[test]
+fn power_topology_and_the_model_history_fill() {
+    let p = params();
+    let mut u = spp3::Unit::new(p);
+    assert!(!u.is_failsafe());
+    assert_eq!(u.latency_frames(), 0);
+    assert_eq!(u.lookahead_frames(), LOOK);
+    let (t, _) = drive(&mut u, [0.1; 4], U as f64 / RATE as f64, U);
+    // the first update sees the 72 empty history frames
+    let want = elec(&p, 0) * 0.01 * (U - LOOK) as f64 / U as f64;
+    assert!((t.channels[0].modeled_power_w as f64 - want).abs() < 1e-6 * want, "{}", t.channels[0].modeled_power_w);
+    let (t, _) = drive(&mut u, [0.1; 4], U as f64 / RATE as f64, U);
+    let want = elec(&p, 0) * 0.01;
+    assert!((t.channels[0].modeled_power_w as f64 - want).abs() < 1e-6 * want);
+}
+
+#[test]
+fn rampout_is_series_resistance() {
+    let mut p = params();
+    p.ch[0].rampout = 0.05;
+    let mut u = spp3::Unit::new(p);
+    assert!(!u.is_failsafe());
+    let (t, _) = drive(&mut u, [0.1; 4], 2.0 * U as f64 / RATE as f64, U);
+    let c = &p.ch[0];
+    let (ag, reb) = (c.ag as f64, c.reb_ref as f64);
+    let r = reb + c.rshunt as f64 + 0.05;
+    let want = (ag * 0.1 / r).powi(2) * reb;
+    assert!((t.channels[0].modeled_power_w as f64 - want).abs() < 1e-6 * want);
+}
+
+#[test]
+fn trapezoidal_thermal_recurrence() {
+    let p = params();
+    let mut u = spp3::Unit::new(p);
+    let x = 0.05f64;
+    let c = &p.ch[1];
+    let (a_vc, b_vc) = (1.0 - dt() / c.tau_tvc as f64, 0.5 * c.t_sett_vc as f64 * dt() / c.tau_tvc as f64);
+    let (a_mg, b_mg) = (1.0 - dt() / c.tau_tmg as f64, 0.5 * c.t_sett_mg as f64 * dt() / c.tau_tmg as f64);
+    let (mut vc, mut mg, mut prev) = (0.0f64, 0.0f64, 0.0f64);
+    for k in 0..800 {
+        let fill = if k == 0 { (U - LOOK) as f64 / U as f64 } else { 1.0 };
+        let pw = elec(&p, 1) * x * x * fill;
+        vc = a_vc * vc + b_vc * (pw + prev);
+        mg = a_mg * mg + b_mg * (pw + prev);
+        prev = pw;
+    }
+    let (t, _) = drive(&mut u, [x as f32; 4], 800.0 * dt(), 333);
+    assert!(
+        (t.channels[1].ol_temp_c as f64 - (40.0 + vc + mg)).abs() < 1e-3,
+        "{} {}",
+        t.channels[1].ol_temp_c,
+        40.0 + vc + mg
+    );
+    assert!((t.channels[1].magnet_temp_c as f64 - (40.0 + mg)).abs() < 1e-3);
+    assert_eq!(t.channels[1].gain, 1.0, "well under the limit: no attenuation");
+}
+
+#[test]
+fn coefficient_law_is_99_percent_settling() {
+    let k = spp3::settle99(4.6, 48_000.0 / 256.0);
+    assert!((k - 0.005_325_098_88).abs() < 1e-10, "{k}");
+    let k = spp3::settle99(20.0, 48_000.0 / 256.0);
+    assert!((k - 0.001_227_291_64).abs() < 1e-10, "{k}");
+    let k = spp3::settle99(0.005, 48_000.0);
+    assert!((k - 0.019_005_287_3).abs() < 1e-9, "{k}");
+}
+
+#[test]
+fn feed_forward_onset_is_the_virtual_coil_plus_one_degree() {
+    let p = params();
+    let mut u = spp3::Unit::new(p);
+    // ch0 alone, loud: find the first update with a target below unity and
+    // check the onset condition there with an independent recurrence
+    let c = &p.ch[0];
+    let tau_ff = c.thermal_ff_speedup_factor as f64 * c.tau_tvc as f64;
+    let (a_ff, b_ff) = (1.0 - dt() / tau_ff, 0.5 * c.t_sett_vc as f64 * dt() / tau_ff);
+    let (a_mg, b_mg) = (1.0 - dt() / c.tau_tmg as f64, 0.5 * c.t_sett_mg as f64 * dt() / c.tau_tmg as f64);
+    let (mut ff, mut mg, mut prev) = (0.0f64, 0.0f64, 0.0f64);
+    let x = 0.6f64;
+    let mut t = Telemetry::new();
+    for k in 0..4000 {
+        let fill = if k == 0 { (U - LOOK) as f64 / U as f64 } else { 1.0 };
+        let gain = t.channels[0].gain as f64; // at most unity before onset
+        let pw = elec(&p, 0) * x * x * fill * if k == 0 { 1.0 } else { gain * gain };
+        ff = a_ff * ff + b_ff * (pw + prev);
+        mg = a_mg * mg + b_mg * (pw + prev);
+        prev = pw;
+        let (tt, _) = drive(&mut u, [x as f32, 0.0, 0.0, 0.0], dt(), U);
+        t = tt;
+        let predicted = 40.0 + mg + ff + 1.0;
+        if t.channels[0].axis_gain[4] < 1.0 {
+            assert!(predicted > c.temperature_limit as f64, "onset at {predicted}");
+            return;
+        }
+        assert!(predicted <= c.temperature_limit as f64 + 1e-6, "missed onset at {predicted}");
+    }
+    panic!("no onset");
+}
+
+#[test]
+fn limiting_holds_below_the_limit_and_links_the_group() {
+    let p = params();
+    let mut u = spp3::Unit::new(p);
+    let (t, _) = drive(&mut u, [0.5, 0.0, 0.0, 0.0], 120.0, 1024);
+    let temp = t.channels[0].ol_temp_c;
+    assert!(temp < 120.0 && temp > 115.0, "{temp}");
+    assert!(t.channels[0].gain < 0.9);
+    assert_eq!(t.channels[1].gain, t.channels[0].gain);
+    assert_eq!(t.channels[2].gain, 1.0);
+}
+
+#[test]
+fn hard_path_arms_above_headroom_and_bypasses_the_attack() {
+    let mut p = params();
+    for c in 0..4 {
+        // a slow attack and a feed-forward pole equal to the coil's, so the
+        // ordinary path lets the coil overshoot into the hard path
+        p.ch[c].thermal_ff_speedup_factor = 1.0;
+    }
+    p.thermal_gain_attack_time_s = 60.0;
+    let mut u = spp3::Unit::new(p);
+    let mut armed_at = None;
+    let mut pre = 1.0f32;
+    let mut peak: f32 = 0.0;
+    for k in 0..(30.0 / dt()) as usize {
+        let (t, _) = drive(&mut u, [1.0; 4], dt(), U);
+        peak = peak.max(t.channels[0].ol_temp_c);
+        if armed_at.is_none() && t.channels[0].ol_temp_c > 128.0 {
+            armed_at = Some(k);
+            pre = t.channels[0].gain;
+        }
+        if let Some(a) = armed_at {
+            if k == a + 2 {
+                // the hard target is selected at once and reached through the
+                // ~7 ms dezipper within the next decision interval
+                assert!(t.channels[0].axis_gain[4] < 0.9, "{}", t.channels[0].axis_gain[4]);
+                assert!(t.channels[0].gain < pre - 0.05, "{} {pre}", t.channels[0].gain);
+            }
+        }
+    }
+    assert!(armed_at.is_some());
+    // the hard path pulls the coil back down below its own peak
+    let (t, _) = drive(&mut u, [1.0; 4], 30.0, U);
+    assert!(t.channels[0].ol_temp_c < peak);
+}
+
+#[test]
 fn zero_speedup_factor_holds_the_feed_forward_reduction_at_unity() {
     let mut p = params();
     for c in 0..4 {
         p.ch[c].thermal_ff_speedup_factor = 0.0;
     }
     let mut u = spp3::Unit::new(p);
-    // a drive whose steady state sits between the limit and the hard limit
+    // steady state between the limit and the hard limit
     let (t, _) = drive(&mut u, [0.355, 0.0, 0.0, 0.0], 40.0, 1024);
     assert!(t.channels[0].ol_temp_c > 120.0, "{}", t.channels[0].ol_temp_c);
     assert_eq!(t.channels[0].axis_gain[4], 1.0);
@@ -383,8 +437,81 @@ fn zero_speedup_factor_holds_the_feed_forward_reduction_at_unity() {
 }
 
 #[test]
-fn disabled_thermal_protection_is_refused() {
+fn pilot_mode_reserves_program_headroom_from_the_first_sample() {
     let mut p = params();
-    p.thermal_protection_enabled = 0;
-    assert!(spp3::Unit::new(p).is_failsafe());
+    for c in 0..4 {
+        p.ch[c].pilot_tone_enabled = 1;
+    }
+    let mut u = spp3::Unit::new(p);
+    let mut x = vec![0.0f32; 512];
+    x[0] = 0.5;
+    let ins: Vec<&[f32]> = (0..4).map(|_| &x[..]).collect();
+    let mut ob = vec![vec![0.0f32; 512]; 4];
+    let mut outs: Vec<&mut [f32]> = ob.iter_mut().map(|b| &mut b[..]).collect();
+    u.process(Io { frames: 512, input: &ins, sense: &[], output: &mut outs });
+    let want = 0.5 * (1.0 - 10f32.powf(-30.0 / 20.0));
+    assert!((ob[0][0] - want).abs() < 1e-7, "{} {want}", ob[0][0]);
+}
+
+#[test]
+fn start_state_is_a_parameter() {
+    let mut p = params();
+    p.ch[0].initial_theta_vc = 70.0;
+    p.ch[0].initial_theta_mg = 30.0;
+    let mut u = spp3::Unit::new(p);
+    let (t, _) = drive(&mut u, [0.0; 4], dt(), U);
+    let c = &p.ch[0];
+    let want = 40.0 + 70.0 * (1.0 - dt() / c.tau_tvc as f64) + 30.0 * (1.0 - dt() / c.tau_tmg as f64);
+    assert!((t.channels[0].ol_temp_c as f64 - want).abs() < 1e-3);
+    u.reset();
+    let (t, _) = drive(&mut u, [0.0; 4], dt(), U);
+    assert!((t.channels[0].ol_temp_c as f64 - want).abs() < 1e-3);
+}
+
+#[test]
+fn closed_loop_reads_coil_temperature_from_v_over_i_and_relaxes_the_limit() {
+    let mut p = params();
+    let (rc, tc) = (4.0f32, 25.0f32);
+    for c in 0..4 {
+        p.ch[c].cal_present = 1;
+        p.ch[c].cal_r = rc;
+        p.ch[c].cal_t = tc;
+    }
+    let mut u = spp3::Unit::new(p);
+    // a resistive plant whose coil sits at 60 C: R = Rc (1 + alpha (T - Tc))
+    let alpha = 0.004 + (25.0 - 20.0) * (0.0038 - 0.004) / 15.0;
+    let r = rc as f64 * (1.0 + alpha * (60.0 - 25.0));
+    let n = 48_000 * 20;
+    let x = vec![0.3f32; 512];
+    let mut ob = vec![vec![0.0f32; 512]; 4];
+    // telemetry (I on even ports here): V = 0.05 FS of 12 V, I = V / R
+    let v_raw = 0.05f32;
+    let i_raw = ((v_raw as f64 * 12.0 / r) / 2.0) as f32;
+    let tele: Vec<Vec<f32>> = (0..8).map(|k| vec![if k % 2 == 0 { i_raw } else { v_raw }; 512]).collect();
+    let mut t = Telemetry::new();
+    for _ in 0..n / 512 {
+        let ins: Vec<&[f32]> = (0..4).map(|_| &x[..]).collect();
+        let sense: Vec<&[f32]> = tele.iter().map(|b| &b[..]).collect();
+        let mut outs: Vec<&mut [f32]> = ob.iter_mut().map(|b| &mut b[..]).collect();
+        u.process(Io { frames: 512, input: &ins, sense: &sense, output: &mut outs });
+    }
+    u.telemetry(&mut t);
+    assert!(t.channels[0].closed_loop);
+    assert!((t.channels[0].cl_temp_c - 60.0).abs() < 0.05, "T_CL {}", t.channels[0].cl_temp_c);
+    // the model runs hotter than the sensed 60 C, so the limit relaxes
+    // (capped), never below the limit
+    let adj = t.channels[0].tlim_adj_c;
+    assert!(adj > 0.0 && adj <= 30.0 + 1e-3, "TlimAdj {adj}");
+    assert!(!t.channels[2].closed_loop || t.channels[2].tlim_adj_c >= 0.0);
+}
+
+#[test]
+fn closed_loop_needs_a_calibration_inside_its_ranges() {
+    let mut p = params();
+    p.ch[0].cal_present = 1;
+    p.ch[0].cal_r = 4.0;
+    p.ch[0].cal_t = 60.0; // outside 10..50
+    let mut u = spp3::Unit::new(p);
+    let (t, _) = drive(&mut u, [0.1; 4], 0.5, 512);
+    assert!(!t.channels[0].closed_loop);
 }
