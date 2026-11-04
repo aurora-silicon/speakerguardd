@@ -171,6 +171,9 @@ impl ViGuard {
             m.assume_hot();
         }
         warn!("measured V/I capped: {reason}; worst-case thermal admission");
+        // Persistent short/ESTRPIPE/open failures must not spin at FIFO
+        // priority and hit the unit's RT-time limit. The cap is already on.
+        hw.sleep(Duration::from_millis(50));
         Ok(())
     }
     pub fn stop<H: Hw>(&mut self, hw: &mut H) -> Result<(), Box<dyn Error>> {
@@ -430,7 +433,9 @@ mod tests {
             } else {
                 h.capture_errno = Some(libc::ESTRPIPE);
             }
+            let failed_at = h.now();
             g.tick(&mut h).unwrap();
+            assert!(h.now().saturating_duration_since(failed_at) >= Duration::from_millis(50));
             assert!(!g.armed && g.fresh == 0);
             assert!(g
                 .models
