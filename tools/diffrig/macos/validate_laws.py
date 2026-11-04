@@ -4,7 +4,7 @@
 older golden traces as held-out data). Prints one line per case and law; exit status 1 if any
 check fails. Reads private rig data; writes nothing.
 
-  validate_laws.py RIG_TRACES_DIR [law ...]      (laws: pdrv pcoil tcl env hold noff restore)
+  validate_laws.py RIG_TRACES_DIR [law ...]      (laws: pdrv pcoil tcl env hold noff restore dezip)
 """
 import glob, gzip, json, math, os, plistlib, re, sys
 import numpy as np
@@ -60,7 +60,7 @@ class Case:
 def law_power(c, which):
     worst = 0.0
     for i in range(6):
-        sig = c.x[:, i] if which == "pdrv" else c.y[:, i]
+        sig = np.clip(c.x[:, i], -1.5, 1.5) if which == "pdrv" else c.y[:, i]  # input clamp (law 0)
         P, n = c.power(sig, i)
         col = 8 if which == "pdrv" else 7
         m = P > 1e-6
@@ -198,6 +198,30 @@ def law_hold(c):
         f"hold lengths {sorted(set(runs))}")
 
 
+def law_dezip(c):
+    """Output gain: both 5 ms stages snap to the current target at every render-call start."""
+    q = c.meta.get("quantum", 512)
+    head = f32(1) - f32(min(10 ** (c.ch(0)["CL"]["PilotAmplHi_dB"] / 20), 0.3))
+    kd = f32(k99(0.005, SR))
+    worst = 0.0
+    for i in range(6):
+        sel = c.ctl[i, :, 2]
+        n = min(len(c.x), len(c.y), len(sel) * 256)
+        g = np.zeros(n, np.float32)
+        s1 = s2 = tgt = f32(1)
+        for j in range(n):
+            if j % 256 == 0 and j:
+                tgt = f32(sel[j // 256 - 1])
+            if j % q == 0:
+                s1 = s2 = tgt
+            s1 = f32(s1 + kd * f32(tgt - s1))
+            s2 = f32(s2 + kd * f32(s1 - s2))
+            g[j] = s2
+        xc = np.clip(c.x[:n, i], -1.5, 1.5)
+        worst = max(worst, np.abs(c.y[:n, i] - (head * xc).astype(np.float64) * g).max())
+    say(worst < 2e-7, c.name, "dezip", f"q={q}: output model max |error| {worst:.2e}")
+
+
 def law_noff(c):
     amb = c.sc["Thermal_AmbientTemp"]
     dt = 256 / SR
@@ -226,7 +250,10 @@ RESTORE = {"none": (100, "continue"), "reset": (100, "continue"), "classinfo": (
 
 def law_restore(c, key):
     want_lim, want_state = RESTORE[key]
-    K = 6 * SR // 256
+    # rig_host applies an event before the first render call starting at or after its frame,
+    # so the first update after it is the one starting at the next 512-frame slice boundary
+    q = c.meta.get("quantum", 512)
+    K = -(-6 * SR // q) * q // 256
     ok, notes = True, []
     rec = c.meta.get("clsp_records", {}).get("ctl", [c.ctl.shape[1]] * 6)
     for i in range(6):
@@ -265,7 +292,7 @@ def law_restore(c, key):
 def main(argv):
     root = argv[0]
     rig = os.path.dirname(os.path.abspath(root))
-    laws = set(argv[1:]) or {"pdrv", "pcoil", "tcl", "env", "hold", "noff", "restore"}
+    laws = set(argv[1:]) or {"pdrv", "pcoil", "tcl", "env", "hold", "noff", "restore", "dezip"}
     for d in sorted(glob.glob(os.path.join(root, "spp3-law-*"))):
         name = os.path.basename(d)[len("spp3-law-"):]
         if not os.path.exists(os.path.join(d, "clsp.npz")) or not os.path.exists(os.path.join(d, "trace.jsonl.gz")):
@@ -283,6 +310,21 @@ def main(argv):
             law_env(c)
         elif name.startswith("hold") and "hold" in laws:
             law_hold(c)
+        elif (name.startswith("dz-") or name in ("clip", "hold-base", "hold-q128")) and "dezip" in laws:
+            law_dezip(c)
+            if name == "clip":
+                law_power(c, "pdrv")
+        elif name.startswith("f15") and "hold" in laws:
+            law_hold(c)
+            # finding 15: after the onset, constant drive settles at or below TemperatureLimit
+            amb = c.sc["Thermal_AmbientTemp"]
+            worst = []
+            for i in range(6):
+                ot = c.ch(i)["OL_thermal"]
+                T = amb + c.ctl[i, :, 5] + c.ctl[i, :, 6]
+                late = T[len(T) // 3:]
+                worst.append(late.max() - ot["TemperatureLimit"])
+            say(max(worst) <= 0.0, c.name, "f15", f"after 10 s: max T_OL - TemperatureLimit {max(worst):+.2f} K (no limit cycle)")
         elif name.startswith("noff") and "noff" in laws:
             law_noff(c)
         elif name.startswith("restore") and "restore" in laws:

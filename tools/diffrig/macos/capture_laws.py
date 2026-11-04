@@ -230,6 +230,9 @@ def cases():
     for k in ("reset", "newinst0"):
         C.append(case(f"restore-cl-{k}", [tone(12, 0.7)], sidecar_patch=st,
                       events=[f"{ev}:sleep=2", f"{ev}:{rs[k][0]}"]))
+    # ---- output gain dezipper against the host slice (snap at each render call start) ----
+    for q in (128, 256, 160, 1024):
+        C.append(case(f"dz-q{q}", hp, cl=False, clsp=True, q=q))
     # ---- input clamp: SPP3 clamps its input to +-1.5 before the drive power and the output ----
     C.append(case("clip", [tone(1, 1.4), tone(1, 2.0), tone(1, 4.0), {"dur": 0.5, "kind": "dc", "a": 1.7},
                            {"dur": 0.5, "kind": "dc", "a": -3.0}], cl=False, clsp=True))
