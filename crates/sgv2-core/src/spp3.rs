@@ -43,6 +43,8 @@
 //!   `R` is in `RebRange`. `Tlim_eff` smooths `base + clamp(T_OL - T_CL, 0,
 //!   cap)` (or `base` when the last window was rejected) over
 //!   `TlimErrDecayTime` with the 99 % law.
+//!   TODO(SPEC) safety: the relaxation is capped at the base (`CL_RELAXATION`)
+//!   after the J616s live-test incident; CL never raises the limit.
 //! - **Pilot.** With a calibration vector: on in an update iff
 //!   `f32(Pdrv) >= PilotEnableThres`; high above `PilotUpperThres`, low below
 //!   `PilotLowerThres` on `T_OL`, held between.
@@ -591,11 +593,15 @@ pub const THERMAL_STATE_COLD: u32 = 2;
 /// program, without the pilot headroom (rig law 1, against spec 4/16's
 /// text; to 2.6e-7 relative over 180 s, open and closed loop).
 const PDRV_WITH_HEADROOM: bool = false;
-/// The closed-loop correction relaxes the limit (spec 7). It was capped at
-/// the base until the window resistance matched the goldens; with rig laws
-/// 3 and (a) T_CL is bit-exact (5e-7 C) on the CL edge set, and
-/// cl-thermal_ramp_1k tracks macOS to 0.08 C / 0.001 dB.
-const CL_RELAXATION: bool = true;
+/// TODO(SPEC) safety, J616s live test 2026-11-05: with real music over full
+/// scale (Tokyo Drifting at volume 0.99, about 36 W woofer drive, T_OL
+/// 129 C) the accepted windows read the coil COOLER as it heated (T_CL 89 ->
+/// 33 C, window R 3.90 -> 3.46 ohm) and the correction relaxed the limit by
+/// up to +38.9 C. Until that is understood against the reference, the
+/// closed loop runs and publishes T_CL but never raises the limit above the
+/// base. (The CL goldens match bit-for-bit with relaxation on; they carry
+/// no program energy near the pilot bin.)
+const CL_RELAXATION: bool = false;
 /// `Pcoil` is the power of the unit's output samples, generated pilot
 /// included (rig law 2, against spec 4's text; to 3e-7 relative).
 const PCOIL_WITH_PILOT: bool = true;
