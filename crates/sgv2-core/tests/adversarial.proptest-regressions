@@ -19,3 +19,7 @@ cc 88f82fb8a6be866c9d477ecdf720924cf83e079c654855eab5f63ec7a317f86a # shrinks to
 cc d70d8ec0e8ebdd1d94f65ff9ea1a92de50da7afd9d5446713ab11e6d4e27bd6b # shrinks to seed = 3467628692416746154, which = 0, n = 1, mutations = 1, fix = true
 cc f159b47cbea3e83015df8596be19cea1b5efbc95c22f434d424dc7610afe5047 # shrinks to seed = 12454083405945159347, n = 5, rate = 48000, ff = On, secs = 6.781198309929527, amp = 2.8513603, h = Large
 cc 49a56602ee1c6c317aa11c5b03966fe447bab5e9a49bfd94ff8fc7d63a8f7f92 # shrinks to seed = 16139987704930525198, n = 3, amp = 1.1400714, f = 798.7860112050939, tvc = 1.8476942, mg_ratio = 10.0, cold = false
+cc 68b992c39ad013a720bc640e3a9268642cdaf015d3769e9beb95bf6051f652b2 # shrinks to seed = 0, n = 1, blk = 512, rate = 8000, ff = Off, len = 129, amp = 0.01, h = Large, a = 258965001613998079, b = 6727371899266967444
+cc 191127d51b387827202a0ac75a2f0af19ffd2164d18088d028a014d0e0e4d9ed # shrinks to seed = 5742363217546372179, n = 3, rate = 9274, ff = On, secs = 4.545817360213377, amp = 0.5, h = Specials
+cc 2365de10a402a2bc4334b2363df3813e36260208fdc816429dbf6c38bddd975e # shrinks to seed = 5766640123818103535, n = 2, amp = 1.2203596, f = 177.0075059145032, tvc = 0.11853888, mg_ratio = 10.0, cold = false
+cc 93c2fbfab9c2c9f48011ee0bd3854f70321b43e6086929b2e20ae92acceb13ca # shrinks to seed = 1943771452814380787, n = 2, amp = 2.3590698, f = 68.0007493780425, tvc = 0.1, mg_ratio = 10.0, cold = false
