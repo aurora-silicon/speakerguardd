@@ -102,12 +102,12 @@ impl Params {
                 return Err(InitError::Invalid("channel claimed by two slots"));
             }
             claimed |= s.channel_mask;
-            if ![s.amplifier_sensitivity, s.rdc, s.rth_vc, s.tau_vc, s.tau_mg, s.attack_ms, s.release_ms]
+            let positive = [s.amplifier_sensitivity, s.rdc, s.rth_vc, s.tau_vc, s.tau_mg, s.attack_ms, s.release_ms]
                 .iter()
-                .all(|&v| pos(v))
-                || !(s.rth_mg.is_finite() && s.rth_mg >= 0.0)
-                || ![s.ambient, s.temperature_limit, s.hard_limit_headroom].iter().all(|v| v.is_finite())
-            {
+                .all(|&v| pos(v));
+            let finite = [s.ambient, s.temperature_limit, s.hard_limit_headroom].iter().all(|v| v.is_finite());
+            let magnet = s.rth_mg.is_finite() && s.rth_mg >= 0.0;
+            if !(positive && finite && magnet) {
                 return Err(InitError::Invalid("slot constants"));
             }
         }
