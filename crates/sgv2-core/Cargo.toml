@@ -10,6 +10,10 @@ rust-version.workspace = true
 [features]
 # Host-side helpers (blob building); the plugin and the RT path never need it.
 std = []
+# PROVISIONAL (rig law 5, not yet confirmed on held-out cases): velocity
+# band gains water-filled across the bands instead of the full-band
+# candidate on every band. Off by default.
+lsm2-waterfill = []
 
 [dependencies]
 # Pure-Rust, no_std, correctly rounded sqrt and a portable exp: the same

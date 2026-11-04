@@ -703,6 +703,11 @@ struct Chan {
     pk_in: f32,
     pk_disp: f32,
     pk_vel: f32,
+    /// Per-band velocity models and peaks (the provisional water-fill).
+    #[cfg(feature = "lsm2-waterfill")]
+    vel_band: [Biquad; BANDS],
+    #[cfg(feature = "lsm2-waterfill")]
+    pk_vel_band: [f32; BANDS],
     /// Masking path.
     pressure_rev: Vec<f32>,
     p_hist: History,
@@ -882,6 +887,10 @@ impl Run {
                 pk_in: 0.0,
                 pk_disp: 0.0,
                 pk_vel: 0.0,
+                #[cfg(feature = "lsm2-waterfill")]
+                vel_band: [vel; BANDS],
+                #[cfg(feature = "lsm2-waterfill")]
+                pk_vel_band: [0.0; BANDS],
                 pressure_rev,
                 p_hist: History::new(taps.max(1)),
                 mask_hp: Biquad::butter2(c.mask_band_hz[0] as f64, rate, true),
@@ -988,6 +997,11 @@ impl Run {
             c.pk_in = 0.0;
             c.pk_disp = 0.0;
             c.pk_vel = 0.0;
+            #[cfg(feature = "lsm2-waterfill")]
+            {
+                c.vel_band.iter_mut().for_each(Biquad::clear);
+                c.pk_vel_band = [0.0; BANDS];
+            }
             c.p_hist.clear();
             c.mask_hp.clear();
             c.mask_lp.clear();
@@ -1047,6 +1061,19 @@ impl Run {
         c.sub_acc_in += u * c.current_in.step(u);
         c.pk_disp = c.pk_disp.max(libm::fabs(xd) as f32);
         c.pk_vel = c.pk_vel.max(libm::fabs(v) as f32);
+        #[cfg(feature = "lsm2-waterfill")]
+        {
+            // each band's velocity at the bank's centre (band 4 the rest)
+            let w = c.hist.window();
+            let w = &w[w.len() - (2 * half + 1)..];
+            let mut rest = centre;
+            for k in 0..BANDS {
+                let b = if k < BANDS - 1 { fir_reversed(&c.taps_rev[k], w) } else { rest };
+                rest -= b;
+                let vk = c.vel_band[k].step(c.vfs * b as f64);
+                c.pk_vel_band[k] = c.pk_vel_band[k].max(libm::fabs(vk) as f32);
+            }
+        }
         // Masking path.
         if !c.pressure_rev.is_empty() {
             c.p_hist.push(x);
@@ -1171,9 +1198,22 @@ impl Run {
             let g_peak = if self.ctl[0] { ratio(c.amp_limit, c.pk_in) } else { 1.0 };
             let g_disp = if self.ctl[1] { ratio(c.disp_limit, c.pk_disp) } else { 1.0 };
             let g_vel = if self.ctl[2] { ratio(c.vel_limit_now, c.pk_vel).max(c.vel_floor) } else { 1.0 };
+            #[cfg(not(feature = "lsm2-waterfill"))]
             for k in 0..BANDS {
                 let ignored = (k == 0 && c.ignore_low) || (k == BANDS - 1 && c.ignore_high);
                 c.band_target[k] = (if ignored { g_disp } else { g_disp.min(g_vel) }) as f32;
+            }
+            #[cfg(feature = "lsm2-waterfill")]
+            {
+                // PROVISIONAL rig law 5: the attenuable bands are levelled at
+                // a common share s so the band velocities sum to the limit:
+                // sum_k min(p_k, s) + sum_ignored p_k = Vlim, g_k = min(1, s/p_k)
+                let gv = waterfill(&c.pk_vel_band, c.vel_limit_now, c.ignore_low, c.ignore_high, c.vel_floor);
+                for k in 0..BANDS {
+                    let v = if self.ctl[2] && g_vel < 1.0 { gv[k] } else { 1.0 };
+                    c.band_target[k] = g_disp.min(v) as f32;
+                }
+                c.pk_vel_band = [0.0; BANDS];
             }
             c.pk_in = 0.0;
             c.pk_disp = 0.0;
@@ -1251,6 +1291,38 @@ impl Run {
             }
         }
     }
+}
+
+/// PROVISIONAL rig law 5: per-band velocity gains water-filled to the
+/// limit. `p` are the bands' velocity peaks; ignored outer bands keep unity
+/// and their share counts in full.
+#[cfg(feature = "lsm2-waterfill")]
+fn waterfill(p: &[f32; BANDS], vlim: f64, ignore_low: bool, ignore_high: bool, floor: f64) -> [f64; BANDS] {
+    let ign = |k: usize| (k == 0 && ignore_low) || (k == BANDS - 1 && ignore_high);
+    let fixed: f64 = (0..BANDS).filter(|&k| ign(k)).map(|k| p[k] as f64).sum();
+    let budget = (vlim - fixed).max(0.0);
+    let used = |s: f64| (0..BANDS).filter(|&k| !ign(k)).map(|k| (p[k] as f64).min(s)).sum::<f64>();
+    let top = (0..BANDS).filter(|&k| !ign(k)).map(|k| p[k] as f64).fold(0.0, f64::max);
+    let mut g = [1.0f64; BANDS];
+    if used(top) <= budget {
+        return g;
+    }
+    // bisection on the share s in [0, top]
+    let (mut lo, mut hi) = (0.0f64, top);
+    for _ in 0..60 {
+        let mid = 0.5 * (lo + hi);
+        if used(mid) > budget {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    for k in 0..BANDS {
+        if !ign(k) && p[k] as f64 > lo {
+            g[k] = (lo / p[k] as f64).max(floor);
+        }
+    }
+    g
 }
 
 /// The linear-in-dB temperature knee of spec 6.1. Equal limits form a step;
