@@ -672,8 +672,10 @@ struct Cl {
     /// Latest window resistance (telemetry).
     r_window: f32,
     t_cl: f64,
-    /// Smoothed corrected limit, absolute C (`Tlim_eff`).
+    /// Smoothed corrected limit, absolute C (`Tlim_eff` while active).
     limit_s: f64,
+    /// A window has been accepted since construction or the last reset.
+    active: bool,
 }
 
 /// The Goertzel period `N = next_power_of_two(round(TempSenseWindowTime *
@@ -763,6 +765,7 @@ impl Cl {
             r_window: c.cal_r,
             t_cl: tc,
             limit_s: limit,
+            active: false,
         })
     }
 
@@ -778,6 +781,21 @@ impl Cl {
         self.age = 0;
         self.t_cl = self.cal_t;
         self.limit_s = base;
+        self.active = false;
+    }
+
+    /// `AudioUnitReset`: the estimator restarts (the window grid from this
+    /// frame, the partial period discarded, `R = R_cal`, `T_CL = T_cal`) and
+    /// the loop is inactive until its next accepted window, the effective
+    /// limit the base meanwhile. The corrected-limit smoother keeps its
+    /// state and resumes from it on reacquisition (the
+    /// `spp3-cl-edge-reset-midlimit` golden: 140 C while inactive, then
+    /// 177.630 C at the first accepted window, which is the pre-reset
+    /// smoother 177.612 C stepped once toward 200 C).
+    fn host_reset(&mut self) {
+        let keep = self.limit_s;
+        self.reset(keep);
+        self.limit_s = keep;
     }
 
     /// The sense bus could not feed a segment: the window is invalid and
@@ -843,6 +861,12 @@ impl Cl {
 
     /// Per thermal update: the smoothed corrected limit for `base`.
     fn update(&mut self, t_ol: f64, base: f64) -> f64 {
+        if self.valid {
+            self.active = true;
+        }
+        if !self.active {
+            return base;
+        }
         // a measurement older than one window (plus this update) is stale
         self.age = self.age.saturating_add(THERMAL_FRAMES);
         if self.age > self.window.saturating_add(THERMAL_FRAMES) {
@@ -1206,10 +1230,11 @@ impl Unit {
     pub fn audio_unit_reset(&mut self) {
         if let Some(r) = self.run.as_mut() {
             for c in r.ch.iter_mut() {
-                let base = c.safe.base();
                 if let Some(cl) = c.cl.as_mut() {
-                    cl.reset(base);
+                    cl.host_reset();
                 }
+                // the effective limit is the base until reacquisition
+                c.tlim_eff = c.safe.base();
             }
         }
     }
@@ -1682,7 +1707,7 @@ impl ProtectionUnit for Unit {
             match c.cl.as_ref() {
                 Some(cl) => {
                     s.cl_temp_c = cl.t_cl as f32;
-                    s.tlim_adj_c = (cl.limit_s - c.safe.base()) as f32;
+                    s.tlim_adj_c = if cl.active { (cl.limit_s - c.safe.base()) as f32 } else { 0.0 };
                     s.closed_loop = true;
                 }
                 None => {
