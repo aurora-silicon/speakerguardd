@@ -18,7 +18,6 @@ static ENV: Mutex<()> = Mutex::new(());
 /// repeated at full level, and no protection, telemetry or heartbeat runs
 /// for the call. A missing port should mute every connected output.
 #[test]
-#[ignore = "FINDING 13 (lane B): a null program port leaves the other outputs unwritten"]
 fn a_null_program_port_mutes_the_connected_outputs() {
     let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
     std::env::set_var("SGV2_PARAMS", "/nonexistent/sgv2-adversarial");
