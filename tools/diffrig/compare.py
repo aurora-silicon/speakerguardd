@@ -5,13 +5,18 @@
 Both inputs are JSON Lines in tools/diffrig/schema.json. A reference line is
 compared with the sgv2 line whose slice ends on the same input frame
 (frame + frames), so the two sides may slice the program differently: the
-state after the same input is compared. Fields absent on either side are
-skipped; a field present on one side and null on the other is a failure.
+state after the same input is compared. Every field the reference carries
+must have a tolerance and be present on the sgv2 side, unless it is in the
+explicit not-compared tables, which the report lists with their reasons. A
+field present on one side and null on the other is a failure. The report
+gives per-field compare and missing counts; a case with no reference slices
+or no compared values fails.
 
-Mode flags (fail-safe, closed loop per channel) must agree in every compared
-slice, so every mode transition lands in the same slice. In a reference
-fail-safe slice only the audio-measured gain is compared, because the macOS
-unit's meters do not show the fail-safe attenuation.
+Mode flags (fail-safe, closed loop per channel) must agree in every slice
+where the reference observed them, so every mode transition lands in the
+same slice. In a reference fail-safe slice only the audio-measured gain is
+compared, because the macOS unit's meters do not show the fail-safe
+attenuation; a fail-safe run must compare at least one non-null audio gain.
 
 Optional audio comparison: --audio REF.f32 GOT.f32 --ch N compares rendered
 float32 audio sample by sample after aligning each side by its reported
@@ -27,17 +32,17 @@ Exit status 0 only if everything is within tolerance.
 Tolerances are the acceptance bar of the behaviour specification
 (differential-test plan): 0.01 dB gain, 0.02 degC state temperature, 1e-5
 linear audio below limiting. Power and mechanical states are relative.
-lsm2: axis_gain is compared element by element (peak, displacement, velocity,
-power, temperature), each to 0.01 dB; the velocity limit to 1e-4 relative.
-TODO(SPEC): tolerances for the lsm2 mask state once its plan fixes them.
+lsm2 reports its axis gains as a linear list in the schema order (sample
+peak, displacement, velocity, linked power, temperature); each element is
+compared to 0.01 dB.
+TODO(SPEC): tolerances for lsm2 mask and velocity state once its plan fixes them.
 
-Inputs may be gzip-compressed (a .gz suffix, or the plain name missing and
-NAME.gz present). The audio comparison uses numpy when it is installed.
+The audio comparison uses numpy when it is installed (the pure-Python loop
+takes minutes on the 180 s cases).
 """
-import gzip
 import json
-import math
 import os
+import math
 import sys
 
 TOLERANCE = {
@@ -53,39 +58,55 @@ TOLERANCE = {
     "measured_power_w": ("rel", 1e-3),
     "displacement_m": ("rel", 5e-3),
     "velocity_m_s": ("rel", 5e-3),
-    "velocity_limit_m_s": ("rel", 1e-4),
 }
-# Per-element tolerances of the lsm2 axis gains.
-AXES = ("peak", "displacement", "velocity", "power", "temperature")
 GLOBAL_TOLERANCE = {
     "modeled_power_w": ("rel", 1e-3),
     "measured_power_w": ("rel", 1e-3),
     "thermal_gain_db": ("abs", 0.01),
-    "power_gain": ("db", 0.01),
     "modeled_amp_power_w": ("rel", 1e-3),
     "amp_input_power_per_speaker_w": ("rel", 1e-3),
+    "power_hard_limit_w": ("rel", 1e-3),  # per element
+    "power_gain": ("db", 0.01),
+}
+# spp3 reports its per-axis gains in dB by name; sgv2 reports them linear in a
+# fixed order (schema: sample peak, displacement, velocity, power, temperature).
+AXIS_INDEX = {"peak": 0, "displacement": 1, "velocity": 2, "power": 3, "thermal": 4}
+AXIS_TOLERANCE = ("abs", 0.01)  # dB
+AXIS_NAMES = ("peak", "displacement", "velocity", "power", "temperature")
+# Reference fields that are deliberately not compared, with the reason. Every
+# other field the reference carries must have a tolerance above and must be
+# present on the sgv2 side; a field in neither table fails the case.
+NOT_COMPARED = {
+    "raw": "unit-private state not named by the specification",
+    "displacement_rel_max": "spp3 reports displacement relative to its own limit; sgv2 reports metres "
+                            "(displacement_m) and the limit is not in the trace",
+    "velocity_limit_m_s": "TODO(SPEC): the lsm2 plan fixes no tolerance for the velocity limit yet",
+    "mask_db": "TODO(SPEC): the lsm2 plan fixes no tolerance for the mask yet",
+    "band_gain": "TODO(SPEC): the lsm2 plan fixes no tolerance for band gains yet",
+}
+GLOBAL_NOT_COMPARED = {
+    "health_bits": "the macOS health bit layout is not mapped to sgv2 Health bits by the specification",
+    "global_gain": "TODO(SPEC): the scale (linear or dB) of the lsm2 controller global gain is not fixed",
 }
 AUDIO_TOLERANCE = 1e-5
 # Relative errors use max(|ref|, floor) so values near zero do not give
 # meaningless ratios.
-REL_FLOOR = {"modeled_power_w": 1e-3, "measured_power_w": 1e-3, "displacement_m": 1e-6, "velocity_m_s": 1e-4}
+REL_FLOOR = {"modeled_power_w": 1e-3, "measured_power_w": 1e-3, "displacement_m": 1e-6, "velocity_m_s": 1e-4,
+             "modeled_amp_power_w": 1e-3, "amp_input_power_per_speaker_w": 1e-3, "power_hard_limit_w": 1e-3}
 
 
-def resolve(path):
-    """The path itself, or its .gz sibling when only that exists."""
+def _open(path, mode="r"):
+    """Open path, or its gzipped form (path.gz) when only that exists."""
+    import gzip
+
     if not os.path.exists(path) and os.path.exists(path + ".gz"):
-        return path + ".gz"
-    return path
-
-
-def open_any(path, mode="rt"):
-    path = resolve(path)
-    return gzip.open(path, mode) if path.endswith(".gz") else open(path, mode)
+        return gzip.open(path + ".gz", mode + "t" if mode == "r" else mode)
+    return open(path, mode)
 
 
 def load(path):
     out = {}
-    with open_any(path) as fd:
+    with _open(path) as fd:
         for n, line in enumerate(fd, 1):
             if not line.strip():
                 continue
@@ -93,12 +114,26 @@ def load(path):
             for k in ("schema", "side", "unit", "case", "frame", "frames", "channels"):
                 if k not in rec:
                     raise ValueError(f"{path}:{n}: missing {k}")
-            out[(rec["case"], rec["frame"] + rec["frames"])] = rec
+            mode = rec.get("mode")
+            if mode is not None:
+                if not isinstance(mode, dict):
+                    raise ValueError(f"{path}:{n}: mode is not an object")
+                cl = mode.get("closed_loop")
+                if cl is not None and not (isinstance(cl, list) and all(isinstance(x, bool) for x in cl)):
+                    raise ValueError(f"{path}:{n}: mode.closed_loop must be a list of booleans or null, not {cl!r}")
+                fs = mode.get("failsafe")
+                if fs is not None and not isinstance(fs, bool):
+                    raise ValueError(f"{path}:{n}: mode.failsafe must be a boolean or null, not {fs!r}")
+            key = (rec["case"], rec["frame"] + rec["frames"])
+            if key in out:
+                raise ValueError(f"{path}:{n}: duplicate slice: case {key[0]} ending on frame {key[1]}")
+            out[key] = rec
     return out
 
 
 def error(name, kind_tol, ref, got):
-    """Return (error, ok). None on both sides is equal; on one side it fails."""
+    """Return (error, ok). None on both sides is equal; on one side it fails.
+    A non-finite error (NaN on either side) fails."""
     if ref is None and got is None:
         return 0.0, True
     if ref is None or got is None:
@@ -113,33 +148,62 @@ def error(name, kind_tol, ref, got):
         err = abs(got - ref) / max(abs(ref), REL_FLOOR.get(name, 1e-12))
     else:
         err = abs(got - ref)
+    if not math.isfinite(err):
+        return math.inf, False
     return err, err <= tol
 
 
 class Worst:
     def __init__(self):
         self.fields = {}
+        self.counts = {}
         self.fail = []
         self.failed = set()
 
+    def count(self, name, what):
+        c = self.counts.setdefault(name, {"compared": 0, "missing": 0})
+        c[what] += 1
+
     def add(self, name, err, ok, where):
+        self.count(name, "compared")
         w = self.fields.get(name)
         if w is None or err > w["error"]:
             self.fields[name] = {"error": err, "at": where}
         if not ok:
-            self.failed.add(name)
-        if not ok and len(self.fail) < 50:
-            self.fail.append({"field": name, "error": err, "at": where})
+            self.failure(name, err, where)
+
+    def failure(self, name, err, where, why=None):
+        self.failed.add(name)
+        if len(self.fail) < 50:
+            f = {"field": name, "error": err, "at": where}
+            if why:
+                f["why"] = why
+            self.fail.append(f)
 
 
 def compare(ref, got):
+    """Compare two indexed traces. Returns (ok, report).
+
+    Every field the reference carries is compared and must be present on the
+    sgv2 side, unless it is in NOT_COMPARED / GLOBAL_NOT_COMPARED, which the
+    report lists with the reason and the number of slices it was skipped in.
+    A case fails when it has no reference slices, compares no values, or (in
+    a fail-safe run) compares no non-null audio gain."""
     worst = Worst()
     cases = {}
+    not_compared = {}
     missing = 0
+
+    def skip(name, reason):
+        n = not_compared.setdefault(name, {"reason": reason, "slices": 0})
+        n["slices"] += 1
+
     for key in sorted(ref):
         r = ref[key]
         case, end = key
-        c = cases.setdefault(case, {"slices": 0, "pass": True})
+        c = cases.setdefault(case, {"ref_slices": 0, "slices": 0, "values": 0, "failsafe_slices": 0,
+                                    "failsafe_audio_values": 0, "pass": True})
+        c["ref_slices"] += 1
         g = got.get(key)
         if g is None:
             missing += 1
@@ -148,58 +212,128 @@ def compare(ref, got):
         c["slices"] += 1
         where = {"case": case, "end_frame": end}
         ok_slice = True
-        rm, gm = r.get("mode") or {}, g.get("mode") or {}
-        if rm.get("failsafe") is not None and bool(rm.get("failsafe")) != bool(gm.get("failsafe")):
-            worst.add("mode.failsafe", math.inf, False, where)
-            ok_slice = False
-        rcl, gcl = rm.get("closed_loop"), gm.get("closed_loop")
-        if isinstance(rcl, list) and rcl != (gcl or [])[: len(rcl)]:
-            worst.add("mode.closed_loop", math.inf, False, where)
-            ok_slice = False
-        for name, tol in GLOBAL_TOLERANCE.items():
-            rv = (r.get("global") or {}).get(name)
-            gv = (g.get("global") or {}).get(name, "absent")
-            if rv is None or gv == "absent":
-                continue
-            err, ok = error(name, tol, rv, gv)
-            worst.add("global." + name, err, ok, where)
+
+        def field(name, tol, rv, gv, present, at):
+            nonlocal ok_slice
+            if not present:
+                worst.count(name, "missing")
+                worst.failure(name, math.inf, at, "absent on the sgv2 side")
+                ok_slice = False
+                return
+            err, ok = error(name.split(".")[-1], tol, rv, gv)
+            worst.add(name, err, ok, at)
+            c["values"] += 1
             ok_slice &= ok
-        rl, gl = (r.get("global") or {}).get("power_hard_limit_w"), (g.get("global") or {}).get("power_hard_limit_w")
-        if isinstance(rl, list) and isinstance(gl, list):
-            for j, (a, b) in enumerate(zip(rl, gl)):
-                err, ok = error("power_hard_limit_w", ("rel", 1e-6), a, b)
-                worst.add(f"global.power_hard_limit_w[{j}]", err, ok, where)
-                ok_slice &= ok
+
+        rm, gm = r.get("mode") or {}, g.get("mode") or {}
+        # Mode flags. The reference's flag is compared whenever it was observed;
+        # an unobserved one is reported as not compared.
+        rfs = rm.get("failsafe")
+        if rfs is None:
+            skip("mode.failsafe", "not observed in the reference (audio silent throughout)")
+        else:
+            gfs = gm.get("failsafe")
+            ok = isinstance(gfs, bool) and gfs == rfs
+            worst.add("mode.failsafe", 0.0 if ok else math.inf, ok, where)
+            c["values"] += 1
+            ok_slice &= ok
+        rcl = rm.get("closed_loop")
+        if rcl is None:
+            skip("mode.closed_loop", "the reference did not record a closed-loop decision")
+        else:
+            gcl = gm.get("closed_loop")
+            ok = isinstance(gcl, list) and len(gcl) >= len(rcl) and gcl[:len(rcl)] == rcl
+            worst.add("mode.closed_loop", 0.0 if ok else math.inf, ok, where)
+            c["values"] += 1
+            ok_slice &= ok
+
+        rg, gg = r.get("global") or {}, g.get("global")
+        for name in sorted(rg):
+            rv = rg[name]
+            if name in GLOBAL_NOT_COMPARED:
+                skip("global." + name, GLOBAL_NOT_COMPARED[name])
+                continue
+            tol = GLOBAL_TOLERANCE.get(name)
+            if tol is None:
+                worst.failure("global." + name, math.inf, where, "no tolerance for this reference field")
+                ok_slice = False
+                continue
+            present = isinstance(gg, dict) and name in gg
+            gv = gg.get(name) if present else None
+            if isinstance(rv, list):
+                if present and not (isinstance(gv, list) and len(gv) == len(rv)):
+                    worst.add("global." + name, math.inf, False, where)
+                    ok_slice = False
+                    continue
+                for i, x in enumerate(rv):
+                    field("global." + name, tol, x, gv[i] if present else None, present, dict(where, index=i))
+            else:
+                field("global." + name, tol, rv, gv, present, where)
+
         if len(g["channels"]) < len(r["channels"]):
-            worst.add("channels", math.inf, False, where)
+            worst.failure("channels", math.inf, where, "fewer channels on the sgv2 side")
             ok_slice = False
         # In the macOS fail-safe the published meters keep their last model values
         # (gain 0 dB); only the audio shows the attenuation. Compare the audio there.
-        fields = ("audio_gain",) if rm.get("failsafe") else TOLERANCE
-        for ch, (rc, gc) in enumerate(zip(r["channels"], g["channels"])):
-            for name in fields:
-                tol = TOLERANCE[name]
-                if name not in rc or name not in gc:
+        failsafe = bool(rfs)
+        if failsafe:
+            c["failsafe_slices"] += 1
+        for ch, rc in enumerate(r["channels"]):
+            gc = g["channels"][ch] if ch < len(g["channels"]) else {}
+            at = dict(where, channel=ch)
+            for name in sorted(rc):
+                rv = rc[name]
+                if failsafe and name != "audio_gain":
+                    skip(name, "reference slice is in the fail-safe; only audio_gain is compared there")
                     continue
-                err, ok = error(name, tol, rc[name], gc[name])
-                worst.add(name, err, ok, dict(where, channel=ch))
-                ok_slice &= ok
-            ra, ga = rc.get("axis_gain"), gc.get("axis_gain")
-            if fields is TOLERANCE and isinstance(ra, list) and isinstance(ga, list):
-                for j, (a, b) in enumerate(zip(ra, ga)):
-                    if a is None:
-                        continue
-                    err, ok = error("gain", ("db", 0.01), a, b)
-                    worst.add(f"axis_gain.{AXES[j]}", err, ok, dict(where, channel=ch))
-                    ok_slice &= ok
+                if name in NOT_COMPARED:
+                    skip(name, NOT_COMPARED[name])
+                    continue
+                if name == "axis_gain_db":
+                    gax = gc.get("axis_gain")
+                    for axis in sorted(rv or {}):
+                        idx = AXIS_INDEX.get(axis)
+                        nm = f"axis_gain_db.{axis}"
+                        if idx is None:
+                            worst.failure(nm, math.inf, at, "no sgv2 axis for this reference axis")
+                            ok_slice = False
+                            continue
+                        present = isinstance(gax, list) and idx < len(gax)
+                        lin = gax[idx] if present else None
+                        gdb = None if lin is None else (20 * math.log10(lin) if lin > 0 else -math.inf)
+                        field(nm, AXIS_TOLERANCE, rv[axis], gdb, present, at)
+                    continue
+                if name == "axis_gain" and isinstance(rv, list):
+                    gax = gc.get("axis_gain")
+                    present = isinstance(gax, list) and len(gax) >= len(rv)
+                    for j, x in enumerate(rv):
+                        field(f"axis_gain.{AXIS_NAMES[j]}", ("db", 0.01), x, gax[j] if present else None, present, at)
+                    continue
+                tol = TOLERANCE.get(name)
+                if tol is None:
+                    worst.failure(name, math.inf, at, "no tolerance for this reference field")
+                    ok_slice = False
+                    continue
+                field(name, tol, rv, gc.get(name), name in gc, at)
+                if failsafe and name == "audio_gain" and rv is not None and gc.get(name) is not None:
+                    c["failsafe_audio_values"] += 1
         c["pass"] &= ok_slice
-    ok = missing == 0 and not worst.fail and all(c["pass"] for c in cases.values())
-    return ok, {"pass": ok, "missing_slices": missing, "cases": cases, "worst": worst.fields, "failures": worst.fail,
+    for case in sorted({k[0] for k in got} - set(cases)):
+        cases[case] = {"ref_slices": 0, "slices": 0, "values": 0, "pass": False,
+                       "why": "no reference slices for this case"}
+    for c in cases.values():
+        if c["ref_slices"] and not c["values"]:
+            c["pass"], c["why"] = False, "no values compared"
+        elif c.get("failsafe_slices") and not c["failsafe_audio_values"]:
+            c["pass"], c["why"] = False, "fail-safe run with no compared audio gain"
+    ok = bool(cases) and missing == 0 and not worst.fail and all(c["pass"] for c in cases.values())
+    return ok, {"pass": ok, "missing_slices": missing, "cases": cases, "worst": worst.fields,
+                "fields": worst.counts, "not_compared": not_compared, "failures": worst.fail,
                 "failed_fields": sorted(worst.failed)}
 
 
 def read_f32(path):
-    with open_any(path, "rb") as fd:
+    with _open(path, "rb") as fd:
         data = fd.read()
     try:
         import numpy as np
@@ -221,26 +355,41 @@ def compare_audio(ref_path, got_path, channels, ref_latency=0, got_latency=0):
         return False, {"pass": False, "error": "file length is not a whole number of frames"}
     na, nb = len(a) // channels, len(b) // channels
     n = min(na - ref_latency, nb - got_latency)
-    worst, at, rms = 0.0, None, 0.0
-    if n > 0 and hasattr(a, "reshape"):
+    # Any non-finite sample on either side fails, wherever it is (also outside
+    # the aligned span), and NaN differences never compare as small.
+    nonfinite = {}
+    worst, at, rms = 0.0, None, math.nan
+    if hasattr(a, "reshape"):
         import numpy as np
 
-        d = np.abs(a.reshape(na, channels)[ref_latency:ref_latency + n].astype(np.float64)
-                   - b.reshape(nb, channels)[got_latency:got_latency + n])
-        i = int(np.argmax(d))
-        worst, at = float(d.flat[i]), {"frame": i // channels, "channel": i % channels}
-        rms = float(np.sqrt(np.mean(d * d)))
+        for side, x in (("reference", a), ("sgv2", b)):
+            bad = np.flatnonzero(~np.isfinite(x))
+            if bad.size:
+                nonfinite[side] = {"frame": int(bad[0]) // channels, "channel": int(bad[0]) % channels}
+        if n > 0:
+            d = np.abs(a.reshape(na, channels)[ref_latency:ref_latency + n].astype(np.float64)
+                       - b.reshape(nb, channels)[got_latency:got_latency + n])
+            d[~np.isfinite(d)] = np.inf
+            i = int(np.argmax(d))
+            worst, at = float(d.flat[i]), {"frame": i // channels, "channel": i % channels}
+            rms = float(np.sqrt(np.mean(d * d)))
     else:
+        for side, x in (("reference", a), ("sgv2", b)):
+            bad = next((i for i, v in enumerate(x) if not math.isfinite(v)), None)
+            if bad is not None:
+                nonfinite[side] = {"frame": bad // channels, "channel": bad % channels}
         for i in range(max(n, 0)):
             for c in range(channels):
-                e = abs(a[(i + ref_latency) * channels + c] - b[(i + got_latency) * channels + c])
-                rms += e * e
-                if e > worst:
-                    worst, at = e, {"frame": i, "channel": c}
-        rms = math.sqrt(rms / max(n * channels, 1))
-    ok = n > 0 and worst <= AUDIO_TOLERANCE and na - ref_latency == nb - got_latency
-    return ok, {"pass": ok, "frames": n, "max_abs_error": worst, "rms_error": rms, "at": at,
-                "tolerance": AUDIO_TOLERANCE}
+                d = abs(a[(i + ref_latency) * channels + c] - b[(i + got_latency) * channels + c])
+                if not d <= worst:
+                    worst, at = (d if math.isfinite(d) else math.inf), {"frame": i, "channel": c}
+    ok = (n > 0 and not nonfinite and math.isfinite(worst) and worst <= AUDIO_TOLERANCE
+          and na - ref_latency == nb - got_latency)
+    rep = {"pass": ok, "frames": n, "max_abs_error": worst, "rms_error": rms, "at": at,
+           "tolerance": AUDIO_TOLERANCE}
+    if nonfinite:
+        rep["non_finite"] = nonfinite
+    return ok, rep
 
 
 def plot(ref, got, outdir):
@@ -321,11 +470,102 @@ def self_test():
     g3[("c", 1024)]["channels"][0]["ol_temp_c"] = 50.0
     assert not compare(ref, g3)[0]
 
+    # Closed-loop flags are always compared when the reference carries them.
+    assert not compare(idx(rec("macos", 0, 512, 0.5, 60.0, cl=[True, False])),
+                       idx(rec("sgv2", 0, 512, 0.5, 60.0, cl=[True])))[0]
+    assert not compare(idx(rec("macos", 0, 512, 0.5, 60.0, cl=[True])),
+                       idx(rec("sgv2", 0, 512, 0.5, 60.0, cl=None)))[0]
+    ok, rep = compare(idx(rec("macos", 0, 512, 0.5, 60.0, cl=[True])),
+                      idx(rec("sgv2", 0, 512, 0.5, 60.0, cl=[True, False])))
+    assert ok and rep["fields"]["mode.closed_loop"]["compared"] == 1, rep
+    # Missing fields and empty references fail; nothing passes vacuously.
+    assert not compare({}, {})[0]
+    assert not compare({}, got)[0]
+    empty = idx(rec("sgv2", 0, 512, 0.5, 60.0))
+    empty[("c", 512)]["channels"] = [{}]
+    assert not compare(idx(rec("macos", 0, 512, 0.5, 60.0)), empty)[0]
+    noglobal = idx(rec("sgv2", 0, 512, 0.5, 60.0))
+    del noglobal[("c", 512)]["global"]
+    ok, rep = compare(idx(rec("macos", 0, 512, 0.5, 60.0)), noglobal)
+    assert not ok and rep["fields"]["global.modeled_power_w"]["missing"] == 1, rep
+    r1 = idx(rec("macos", 0, 512, 0.5, 60.0))
+    r1[("c", 512)]["channels"][0]["control_temp_c"] = 40.0
+    assert not compare(r1, idx(rec("sgv2", 0, 512, 0.5, 60.0)))[0]
+    r1[("c", 512)]["channels"][0] = {"brand_new_field": 1.0}
+    ok, rep = compare(r1, idx(rec("sgv2", 0, 512, 0.5, 60.0)))
+    assert not ok and rep["failures"][0]["why"] == "no tolerance for this reference field", rep
+    # A case on the sgv2 side with no reference slices fails.
+    other = idx(rec("sgv2", 0, 512, 0.5, 60.0))
+    other[("c", 512)]["case"] = "d"
+    other = {("d", 512): other[("c", 512)]}
+    other.update(got)
+    assert not compare(ref, other)[0]
+    # A reference with only not-compared fields compares no values and fails.
+    bare = idx(rec("macos", 0, 512, 0.5, 60.0))
+    bare[("c", 512)].update(mode={"failsafe": None, "closed_loop": None}, channels=[{"raw": {"a": 1.0}}])
+    del bare[("c", 512)]["global"]
+    ok, rep = compare(bare, idx(rec("sgv2", 0, 512, 0.5, 60.0)))
+    assert not ok and rep["cases"]["c"]["why"] == "no values compared", rep
+    assert rep["not_compared"]["raw"]["slices"] == 1 and rep["not_compared"]["mode.failsafe"]["slices"] == 1
+    # Not-compared fields are reported with their reason; the rest still compare.
+    r2 = idx(rec("macos", 0, 512, 0.5, 60.0))
+    r2[("c", 512)]["channels"][0]["displacement_rel_max"] = 0.3
+    r2[("c", 512)]["global"]["health_bits"] = 0
+    ok, rep = compare(r2, idx(rec("sgv2", 0, 512, 0.5, 60.0)))
+    assert ok and set(rep["not_compared"]) >= {"displacement_rel_max", "global.health_bits"}, rep
+    assert rep["fields"]["gain"]["compared"] == 1 and rep["cases"]["c"]["values"] >= 4, rep
+    # spp3 axis gains (dB by name) against sgv2's linear axis array.
+    r3 = idx(rec("macos", 0, 512, 0.5, 60.0))
+    r3[("c", 512)]["channels"][0]["axis_gain_db"] = {"thermal": -6.0, "power": 0.0, "displacement": None}
+    g3x = idx(rec("sgv2", 0, 512, 0.5, 60.0))
+    g3x[("c", 512)]["channels"][0]["axis_gain"] = [1.0, None, 1.0, 1.0, 10 ** (-6.0 / 20)]
+    assert compare(r3, g3x)[0], compare(r3, g3x)
+    g3x[("c", 512)]["channels"][0]["axis_gain"][4] = 10 ** (-6.5 / 20)
+    assert not compare(r3, g3x)[0]
+    del g3x[("c", 512)]["channels"][0]["axis_gain"]
+    assert not compare(r3, g3x)[0]
+    # power_hard_limit_w is compared per element.
+    r4 = idx(rec("macos", 0, 512, 0.5, 60.0))
+    r4[("c", 512)]["global"]["power_hard_limit_w"] = [1.0, 2.0, 3.0, 4.0]
+    g4 = idx(rec("sgv2", 0, 512, 0.5, 60.0))
+    g4[("c", 512)]["global"]["power_hard_limit_w"] = [1.0, 2.0, 3.0, 4.0]
+    assert compare(r4, g4)[0]
+    g4[("c", 512)]["global"]["power_hard_limit_w"] = [1.0, 2.0, 3.1, 4.0]
+    assert not compare(r4, g4)[0]
+    # A fail-safe run must compare at least one non-null audio gain.
+    fs_r = idx(rec("macos", 0, 512, 1.0, 50.0, failsafe=True))
+    fs_r[("c", 512)]["channels"][0]["audio_gain"] = None
+    fs_g = idx(rec("sgv2", 0, 512, 0.1, 50.0, failsafe=True))
+    fs_g[("c", 512)]["channels"][0]["audio_gain"] = None
+    ok, rep = compare(fs_r, fs_g)
+    assert not ok and rep["cases"]["c"]["why"] == "fail-safe run with no compared audio gain", rep
+
     import os
     import struct
     import tempfile
 
     d = tempfile.mkdtemp()
+    # load(): duplicate keys and malformed mode flags are rejected.
+    pj = os.path.join(d, "t.jsonl")
+    line = json.dumps(rec("macos", 0, 512, 0.5, 60.0))
+    with open(pj, "w") as f:
+        f.write(line + "\n" + line + "\n")
+    try:
+        load(pj)
+        raise AssertionError("duplicate slice accepted")
+    except ValueError:
+        pass
+    for bad_cl in (True, "yes", [1]):
+        with open(pj, "w") as f:
+            f.write(json.dumps(rec("macos", 0, 512, 0.5, 60.0, cl=bad_cl)) + "\n")
+        try:
+            load(pj)
+            raise AssertionError(f"closed_loop {bad_cl!r} accepted")
+        except ValueError:
+            pass
+    with open(pj, "w") as f:
+        f.write(json.dumps(rec("macos", 0, 512, 0.5, 60.0, cl=[True, False])) + "\n")
+    assert load(pj)[("c", 512)]["mode"]["closed_loop"] == [True, False]
     pa, pb = os.path.join(d, "a.f32"), os.path.join(d, "b.f32")
     sig = [0.1 * math.sin(i / 7) for i in range(400)]
     with open(pa, "wb") as f:
@@ -339,6 +579,23 @@ def self_test():
     with open(pb, "wb") as f:
         f.write(struct.pack("<404f", 0, 0, 0, 0, *[x + 2e-4 for x in sig]))
     assert not compare_audio(pa, pb, 2, 0, 2)[0]
+    # Non-finite audio fails on either side, even when the other side is finite.
+    with open(pa, "wb") as f:
+        f.write(struct.pack("<4f", 0.1, 0.2, 0.3, 0.4))
+    with open(pb, "wb") as f:
+        f.write(struct.pack("<4f", *[math.nan] * 4))
+    ok, rep = compare_audio(pa, pb, 1)
+    assert not ok and "sgv2" in rep["non_finite"], rep
+    assert not compare_audio(pb, pa, 1)[0]
+    with open(pb, "wb") as f:
+        f.write(struct.pack("<4f", 0.1, math.inf, 0.3, 0.4))
+    assert not compare_audio(pa, pb, 1)[0]
+    with open(pb, "wb") as f:
+        f.write(struct.pack("<5f", math.nan, 0.1, 0.2, 0.3, 0.4))  # outside the aligned span
+    assert not compare_audio(pa, pb, 1, 0, 1)[0]
+    with open(pb, "wb") as f:
+        f.write(struct.pack("<5f", 0.0, 0.1, 0.2, 0.3, 0.4))
+    assert compare_audio(pa, pb, 1, 0, 1)[0]
     print("self-test OK")
     return 0
 

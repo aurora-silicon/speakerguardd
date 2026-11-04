@@ -9,7 +9,7 @@
 //! sgv2-render --unit spp3|lsm2|atsp [--blob PARAMS.blob] --case NAME
 //!             --in PROGRAM.f32 --ch N [--sense SENSE.f32 --sense-ch M]
 //!             [--slices 512 | --slices 1,7,31,...] [--out TRACE.jsonl]
-//!             [--audio-out OUT.f32] [--prop 64008=CPMS.json]
+//!             [--audio-out OUT.f32] [--cfprop ID=FILE ...]
 //! ```
 //!
 //! `--file-ch N` reads a program file of N channels, stream channel c taking
@@ -21,9 +21,14 @@
 //! after initialisation, `--param-at FRAME:ID=VALUE` at the slice starting
 //! on that frame (the unit's `set_parameter`).
 //!
-//! `--prop 64008=FILE` applies the runtime CPMS power budgets to an lsm2
-//! unit, as the platform does right after initialisation: a JSON object of
-//! `cpms_ts_i`, `cpms_ts_100`, `cpms_ts_1000`, `cpms_ts_thermal` in mW.
+//! `--cfprop ID=FILE` hands the unit the same run-time and case properties
+//! (by ID, from the same fixture files) as the macOS reference got. Every
+//! file must be readable, and each trace line lists the IDs in `cfprops`, so
+//! the rig can check that the inputs reached this side. Consumed: 64008 on
+//! lsm2, the CPMS power budgets the platform sets right after
+//! initialisation (a JSON object of `cpms_ts_i`, `cpms_ts_100`,
+//! `cpms_ts_1000`, `cpms_ts_thermal` in mW). Others are listed only; the
+//! spp3 calibration (64009) reaches the unit through its blob.
 //!
 //! Signals are raw interleaved little-endian float32, the rig's format. A
 //! slice list is used cyclically. Without `--blob`, or with a blob that does
@@ -49,7 +54,7 @@ struct Args {
     slices: Vec<usize>,
     out: Option<String>,
     audio_out: Option<String>,
-    cpms: Option<String>,
+    cfprops: Vec<(u32, String)>,
     file_channels: usize,
     limit_frames: usize,
     preset_params: Vec<(u32, f32)>,
@@ -60,7 +65,7 @@ fn usage() -> ExitCode {
     eprintln!(
         "usage: sgv2-render --unit spp3|lsm2|atsp [--blob P] --case NAME --in X.f32 --ch N \
          [--sense S.f32 --sense-ch M] [--slices 512|1,7,31] [--out T.jsonl] [--audio-out O.f32] \
-         [--prop 64008=CPMS.json] [--file-ch N] [--limit-frames N] [--preset-param ID=V] \
+         [--cfprop ID=FILE ...] [--file-ch N] [--limit-frames N] [--preset-param ID=V] \
          [--param ID=V] [--param-at FRAME:ID=V]"
     );
     ExitCode::from(2)
@@ -78,7 +83,7 @@ fn parse_args() -> Option<Args> {
         slices: vec![512],
         out: None,
         audio_out: None,
-        cpms: None,
+        cfprops: Vec::new(),
         file_channels: 0,
         limit_frames: 0,
         preset_params: Vec::new(),
@@ -116,10 +121,13 @@ fn parse_args() -> Option<Args> {
                 let (i, x) = id_val(rest)?;
                 a.params_at.push((f.parse().ok()?, i, x));
             }
-            "--prop" => match v.split_once('=') {
-                Some(("64008", f)) => a.cpms = Some(f.to_string()),
-                _ => return None,
-            },
+            "--cfprop" => {
+                let (id, path) = v.split_once('=')?;
+                if path.is_empty() {
+                    return None;
+                }
+                a.cfprops.push((id.parse().ok()?, path.to_string()));
+            }
             _ => return None,
         }
     }
@@ -300,6 +308,7 @@ fn render(
     sense: &[Vec<f32>],
     slices: &[usize],
     params_at: &[(usize, u32, f32)],
+    cfprops: &[u32],
     trace: &mut dyn Write,
     mut audio: Option<&mut dyn Write>,
 ) -> io::Result<()> {
@@ -311,6 +320,8 @@ fn render(
     let zeros = vec![0.0f32; max_slice];
     let mut t = Telemetry::new();
     let unit_name = fourcc(kind);
+    let cfprop_ids: Vec<String> = cfprops.iter().map(u32::to_string).collect();
+    let cfprop_ids = cfprop_ids.join(",");
     let (mut pos, mut k) = (0usize, 0usize);
     while pos < frames {
         for &(f, id, v) in params_at {
@@ -341,7 +352,7 @@ fn render(
         writeln!(
             trace,
             "{{\"schema\":1,\"side\":\"sgv2\",\"unit\":\"{unit_name}\",\"case\":\"{case}\",\"frame\":{pos},\
-             \"frames\":{n},\"latency\":{latency},\"params\":\"{params}\",\"health\":{},\
+             \"frames\":{n},\"latency\":{latency},\"params\":\"{params}\",\"cfprops\":[{cfprop_ids}],\"health\":{},\
              \"mode\":{{\"failsafe\":{},\"closed_loop\":[{}]}},\"global\":{},\"channels\":[{}]}}",
             health.0,
             health.is_failsafe(),
@@ -381,16 +392,17 @@ fn run(a: &Args) -> io::Result<()> {
         _ => Vec::new(),
     };
     let blob = a.blob.as_ref().map(std::fs::read).transpose()?;
-    let cpms = match &a.cpms {
-        Some(p) => Some(
-            parse_cpms(&std::fs::read_to_string(p)?)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("{p}: not a CPMS dictionary")))?,
-        ),
-        None => None,
-    };
-    if !a.preset_params.is_empty() && a.unit != UnitKind::Atsp {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "--preset-param is atsp only"));
+    let mut cpms = None;
+    for (id, path) in &a.cfprops {
+        let bytes = std::fs::read(path).map_err(|e| io::Error::new(e.kind(), format!("cfprop {id}: {path}: {e}")))?;
+        if *id == 64008 && a.unit == UnitKind::Lsm2 {
+            let text = String::from_utf8_lossy(&bytes);
+            cpms = Some(parse_cpms(&text).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, format!("cfprop 64008: {path}: not a CPMS dictionary"))
+            })?);
+        }
     }
+    let cfprop_ids: Vec<u32> = a.cfprops.iter().map(|(id, _)| *id).collect();
     let (mut unit, params) = make_unit(a.unit, blob.as_deref(), cpms, &a.preset_params);
     let mut stdout_trace;
     let mut file_trace = open_out(&a.out)?;
@@ -411,6 +423,7 @@ fn run(a: &Args) -> io::Result<()> {
         &sense,
         &a.slices,
         &a.params_at,
+        &cfprop_ids,
         trace,
         audio.as_mut().map(|w| w as &mut dyn Write),
     )
@@ -469,6 +482,7 @@ mod tests {
                 &[],
                 slices,
                 &[],
+                &[64009, 7],
                 &mut trace,
                 Some(&mut audio),
             )
