@@ -181,7 +181,7 @@ fn never_passes_the_hard_limit_on_a_step() {
             // the hard path selects a target 20 dB below the ceiling; the
             // common gain path then attacks toward it
             hard_seen = true;
-            assert!(t.channels[0].axis_gain[4] <= 1.0);
+            assert!(t.channels[0].gain <= FAILSAFE_GAIN + 1e-6);
             assert!(t.channels[0].gain <= last_gain);
         }
         last_gain = t.channels[0].gain;
