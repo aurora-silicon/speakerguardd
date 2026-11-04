@@ -115,14 +115,23 @@ pub fn effect(box_name: &str, sub: &str, preset_v: Value) -> Value {
 }
 
 pub fn spp3_state(channels: u32) -> ParamState {
-    let mut sections = vec![ParamSection { scope: 0, element: 0, params: vec![(2, 3.5), (3, 11.0), (4, 41.0)] }];
+    let mut sections =
+        vec![ParamSection { scope: 0, element: 0, params: vec![(0, 1.0), (2, 3.5), (3, 11.0), (4, 41.0)] }];
     for e in 0..channels {
-        sections.push(ParamSection { scope: 4, element: e, params: vec![(0, 121.0), (2, 17.0), (9, 3.3)] });
+        sections.push(ParamSection {
+            scope: 4,
+            element: e,
+            params: vec![(0, 121.0), (2, 17.0), (9, 3.3), (21, 1.0), (22, 1.0)],
+        });
     }
     ParamState { sections }
 }
 
 pub fn strip(unit: &str, channels: u32) -> Vec<u8> {
+    strip_with_state(unit, &spp3_state(channels))
+}
+
+pub fn strip_with_state(unit: &str, state: &ParamState) -> Vec<u8> {
     let eq = ParamState { sections: vec![ParamSection { scope: 0, element: 0, params: vec![(1, -2.5), (2, 900.0)] }] };
     let builtin = dict(vec![
         ("classname", s("ChannelSplitter")),
@@ -144,28 +153,29 @@ pub fn strip(unit: &str, channels: u32) -> Vec<u8> {
             Value::Array(vec![
                 effect("Eq", "tst1", preset("tst1", "eq_test", &eq)),
                 builtin_effect,
-                effect("Prot", unit, preset(unit, "prot_test", &spp3_state(channels))),
+                effect("Prot", unit, preset(unit, "prot_test", state)),
             ]),
         )])]),
     )]))
 }
 
 pub fn propstrip(sidecar: &str) -> Vec<u8> {
+    propstrip_with(sidecar, Some(2))
+}
+
+/// The property strip, with `Thermal State Override` (64007) if given.
+pub fn propstrip_with(sidecar: &str, thermal_state: Option<i128>) -> Vec<u8> {
+    let mut props = vec![dict(vec![("Number", i(64004)), ("UInt32", i(1))])];
+    if let Some(v) = thermal_state {
+        props.push(dict(vec![("Number", i(64007)), ("UInt32", i(v))]));
+    }
+    props.push(dict(vec![
+        ("Number", i(64003)),
+        ("Path", s(&format!("/System/Library/Audio/Tunings/{AID}/DSP/Strips/{sidecar}"))),
+    ]));
     binary::write(&dict(vec![(
         "Boxes",
-        Value::Array(vec![dict(vec![
-            ("Name", s("Prot")),
-            (
-                "Properties",
-                Value::Array(vec![
-                    dict(vec![("Number", i(64004)), ("UInt32", i(1))]),
-                    dict(vec![
-                        ("Number", i(64003)),
-                        ("Path", s(&format!("/System/Library/Audio/Tunings/{AID}/DSP/Strips/{sidecar}"))),
-                    ]),
-                ]),
-            ),
-        ])]),
+        Value::Array(vec![dict(vec![("Name", s("Prot")), ("Properties", Value::Array(props))])]),
     )]))
 }
 

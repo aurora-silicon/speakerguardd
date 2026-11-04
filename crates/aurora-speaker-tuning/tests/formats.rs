@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 fn param_state_roundtrip_and_rejections() {
     let st = spp3_state(3);
     let blob = st.encode();
-    assert_eq!(blob.len(), 4 * 12 + (3 + 3 * 3) * 8);
+    assert_eq!(blob.len(), 4 * 12 + (4 + 3 * 5) * 8);
     let back = ParamState::decode(&blob, "t").unwrap();
     assert_eq!(back, st);
     assert_eq!(back.elements(4).len(), 3);

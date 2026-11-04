@@ -6,6 +6,8 @@
 //! ```text
 //! aurora-speaker-tuning dump     [--json] [--speaker-id N] [SOURCE]
 //! aurora-speaker-tuning validate [--json] [--speaker-id N] [SOURCE]
+//! aurora-speaker-tuning compile  [--speaker-id N] [SOURCE | --bundle PATH] -o BLOB
+//! aurora-speaker-tuning blob     BLOB [BLOB]     (decode; with two, diff field by field)
 //! aurora-speaker-tuning units    [--json]
 //! aurora-speaker-tuning plist    FILE            (any plist as XML)
 //!
@@ -30,11 +32,15 @@ struct Args {
     tunings_root: Option<PathBuf>,
     aid: Option<u32>,
     path: Option<PathBuf>,
+    path2: Option<PathBuf>,
+    out: Option<PathBuf>,
 }
 
 fn usage() -> ! {
     eprintln!(
         "usage: aurora-speaker-tuning {{dump|validate}} [--json] [--speaker-id N] [PATH | --tunings-root DIR --aid N]\n       \
+         aurora-speaker-tuning compile [--speaker-id N] [--bundle PATH | --tunings-root DIR --aid N] -o BLOB\n       \
+         aurora-speaker-tuning blob BLOB [BLOB]\n       \
          aurora-speaker-tuning units [--json]\n       aurora-speaker-tuning plist FILE"
     );
     exit(2)
@@ -47,10 +53,13 @@ fn parse_args() -> Args {
         Some("validate" | "verify") => "validate",
         Some("units") => "units",
         Some("plist") => "plist",
+        Some("compile") => "compile",
+        Some("blob") => "blob",
         _ => usage(),
     }
     .to_string();
-    let mut a = Args { cmd, json: false, speaker_id: None, tunings_root: None, aid: None, path: None };
+    let mut a =
+        Args { cmd, json: false, speaker_id: None, tunings_root: None, aid: None, path: None, path2: None, out: None };
     while let Some(x) = it.next() {
         match x.as_str() {
             "--json" => a.json = true,
@@ -60,7 +69,10 @@ fn parse_args() -> Args {
                 a.aid =
                     Some(it.next().and_then(|v| v.trim_start_matches("AID").parse().ok()).unwrap_or_else(|| usage()))
             }
-            p if !p.starts_with("--") && a.path.is_none() => a.path = Some(PathBuf::from(p)),
+            "--bundle" => a.path = Some(it.next().map(PathBuf::from).unwrap_or_else(|| usage())),
+            "-o" | "--output" => a.out = Some(it.next().map(PathBuf::from).unwrap_or_else(|| usage())),
+            p if !p.starts_with('-') && a.path.is_none() => a.path = Some(PathBuf::from(p)),
+            p if !p.starts_with('-') && a.path2.is_none() => a.path2 = Some(PathBuf::from(p)),
             _ => usage(),
         }
     }
@@ -218,6 +230,68 @@ fn human(t: &Tuning) {
     }
 }
 
+/// Decodes a blob with the engine's own decoder, one field per line.
+fn decode_blob(p: &std::path::Path) -> String {
+    use sgv2_core::blob::Header;
+    let bytes = std::fs::read(p).unwrap_or_else(|e| {
+        eprintln!("{}: {e}", p.display());
+        exit(1)
+    });
+    let (h, _) = Header::parse(&bytes).unwrap_or_else(|e| {
+        eprintln!("{}: {e:?}", p.display());
+        exit(1)
+    });
+    let unit = h.unit;
+    let body: Result<String, String> = if unit == sgv2_core::UnitKind::Spp3 as u32 {
+        sgv2_core::spp3::Params::from_blob(&bytes)
+            .map(|x| trim(format!("{x:#?}"), x.channels))
+            .map_err(|e| format!("{e:?}"))
+    } else if unit == sgv2_core::UnitKind::Lsm2 as u32 {
+        sgv2_core::lsm2::Params::from_blob(&bytes)
+            .map(|x| trim(format!("{x:#?}"), x.channels))
+            .map_err(|e| format!("{e:?}"))
+    } else {
+        sgv2_core::atsp::Params::from_blob(&bytes).map(|x| format!("{x:#?}")).map_err(|e| format!("{e:?}"))
+    };
+    match body {
+        Ok(b) => format!("header: {h:?}\n{b}"),
+        Err(e) => {
+            eprintln!("{}: the engine rejects it: {e}", p.display());
+            exit(1)
+        }
+    }
+}
+
+/// Drops the unused channel slots after the first `n` from a Debug dump.
+fn trim(s: String, n: u32) -> String {
+    let mut out = Vec::new();
+    let mut depth_ch = None::<usize>;
+    let mut idx = 0u32;
+    for line in s.lines() {
+        if line.trim_start().starts_with("ch: [") {
+            depth_ch = Some(line.len() - line.trim_start().len());
+            out.push(line.to_string());
+            continue;
+        }
+        if let Some(d) = depth_ch {
+            let ind = line.len() - line.trim_start().len();
+            if ind == d && line.trim_start().starts_with(']') {
+                depth_ch = None;
+                out.push(line.to_string());
+                continue;
+            }
+            if ind == d + 4 && line.trim_start().starts_with("ChannelParams") {
+                idx += 1;
+            }
+            if idx > n {
+                continue;
+            }
+        }
+        out.push(line.to_string());
+    }
+    out.join("\n")
+}
+
 fn main() {
     let a = parse_args();
     match a.cmd.as_str() {
@@ -247,6 +321,30 @@ fn main() {
             }
             return;
         }
+        "blob" => {
+            let p = a.path.clone().unwrap_or_else(|| usage());
+            let one = decode_blob(&p);
+            match &a.path2 {
+                None => println!("{one}"),
+                Some(q) => {
+                    let two = decode_blob(q);
+                    let (l1, l2): (Vec<&str>, Vec<&str>) = (one.lines().collect(), two.lines().collect());
+                    let mut diffs = 0;
+                    for k in 0..l1.len().max(l2.len()) {
+                        let (x, y) = (l1.get(k).copied().unwrap_or(""), l2.get(k).copied().unwrap_or(""));
+                        if x != y {
+                            diffs += 1;
+                            println!("- {}\n+ {}", x.trim(), y.trim());
+                        }
+                    }
+                    println!("{} field line(s) differ", diffs);
+                    if diffs > 0 {
+                        exit(1);
+                    }
+                }
+            }
+            return;
+        }
         _ => {}
     }
     let bundle = match (&a.tunings_root, a.aid, &a.path) {
@@ -259,7 +357,28 @@ fn main() {
     let result = bundle.and_then(|b| Tuning::load(&b, &Options { speaker_id: a.speaker_id }, &mut diags));
     match result {
         Ok(t) => {
-            if a.cmd == "dump" {
+            if a.cmd == "compile" {
+                let out = a.out.clone().unwrap_or_else(|| usage());
+                match aurora_speaker_tuning::compile::compile(&t, &mut diags) {
+                    Ok(c) if !diags.has_errors() => {
+                        if let Err(e) = std::fs::write(&out, &c.blob) {
+                            eprintln!("{}: {e}", out.display());
+                            exit(1);
+                        }
+                        eprintln!(
+                            "wrote {} ({} bytes): {:?}, {} channels, {} sense, {} Hz",
+                            out.display(),
+                            c.blob.len(),
+                            c.unit,
+                            c.channels,
+                            c.sense_channels,
+                            c.sample_rate
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => diags.from_error("compile", &e),
+                }
+            } else if a.cmd == "dump" {
                 if a.json {
                     println!(
                         "{}",
