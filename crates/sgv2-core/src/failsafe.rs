@@ -3,7 +3,7 @@
 //! This is what the core does whenever it cannot protect from valid
 //! parameters, and what every unit does until its behaviour is implemented.
 
-use crate::{Health, Io, ProtectionUnit, Telemetry, UnitKind, FAILSAFE_GAIN};
+use crate::{dsp, Health, Io, ProtectionUnit, Telemetry, UnitKind, FAILSAFE_GAIN};
 
 pub struct FailSafe {
     kind: UnitKind,
@@ -18,18 +18,33 @@ impl FailSafe {
 
     /// Apply the fail-safe gain to `io`. Shared by every unit's fault paths.
     #[inline]
-    pub fn apply(gain: f32, io: Io<'_, '_>) {
-        let frames = io.frames;
-        for (ch, out) in io.output.iter_mut().enumerate() {
-            let out = &mut out[..frames];
-            match io.input.get(ch) {
-                Some(input) => {
-                    for (o, i) in out.iter_mut().zip(&input[..frames]) {
-                        *o = *i * gain;
-                    }
+    pub fn apply(gain: f32, mut io: Io<'_, '_>) {
+        fill_from(&mut io, 0, gain);
+    }
+}
+
+/// The fail-safe output for frames `from..io.frames` of every output, on
+/// whatever geometry the host gave and never indexing past a buffer:
+/// `y = gain * clamp(x, -1, 1)`, a non-finite sample muted, an output with
+/// no input silent. The result is finite and at most `gain` (itself held
+/// to [0, 1]) in magnitude for any input, so the converter never sees a
+/// non-finite or over-range fail-safe sample.
+pub fn fill_from(io: &mut Io<'_, '_>, from: usize, gain: f32) {
+    let g = if gain.is_finite() { gain.clamp(0.0, 1.0) } else { 0.0 };
+    let frames = io.frames;
+    for (c, out) in io.output.iter_mut().enumerate() {
+        let n = frames.min(out.len());
+        let s = from.min(n);
+        let out = &mut out[s..n];
+        match io.input.get(c) {
+            Some(inp) => {
+                let src = inp.get(s..n.min(inp.len())).unwrap_or(&[]);
+                for (o, &x) in out.iter_mut().zip(src) {
+                    *o = dsp::bound1(x) * g;
                 }
-                None => out.fill(0.0),
+                out[src.len()..].fill(0.0);
             }
+            None => out.fill(0.0),
         }
     }
 }
