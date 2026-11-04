@@ -325,6 +325,10 @@ fn compile_lsm2(t: &Tuning, _diags: &mut Diagnostics) -> Result<Compiled> {
         low_rail_idle_power_w: 0.0,
         low_rail_power_ratio: 0.0,
         other_power_features: 0,
+        // Platform runtime budgets (property 64008): the supervisor fills
+        // them; the bundle has none.
+        runtime_budget_present: 0,
+        runtime_budget_w: [0.0; 4],
         ch: [lsm2::ChannelParams::default(); MAX_CHANNELS],
     };
     for j in 0..4u32 {
