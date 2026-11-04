@@ -317,15 +317,35 @@ mod linux {
     /// directory), so a plugin that already maps it keeps writing to the
     /// file the supervisor reads. A file that is not a regular page of the
     /// right size is replaced; a live mapping is never truncated.
-    fn engine_page(path: &Path) -> std::io::Result<EnginePage> {
+    ///
+    /// It is the session user's, group root, 0660: the service has no
+    /// CAP_DAC_OVERRIDE, so a restarted supervisor opens the page it handed
+    /// to the user through the group. Ownership and mode are set (CAP_CHOWN,
+    /// CAP_FOWNER) before the open, so a page left 0600 by an earlier
+    /// version is reopened too (B2: "engine page: Permission denied" after
+    /// every restart on 6b0b0e3).
+    fn engine_page(path: &Path, uid: u32) -> std::io::Result<EnginePage> {
         let s = path.to_string_lossy().into_owned();
+        let hand_over = |p: &Path| -> std::io::Result<()> {
+            std::os::unix::fs::lchown(p, Some(uid), Some(0))?;
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o660))
+        };
         match std::fs::symlink_metadata(path) {
-            Ok(m) if m.file_type().is_file() && m.len() == PAGE_BYTES as u64 => EnginePage::open(&s),
+            Ok(m) if m.file_type().is_file() && m.len() == PAGE_BYTES as u64 => {
+                hand_over(path)?;
+                EnginePage::open(&s)
+            }
             Ok(_) => {
                 std::fs::remove_file(path)?;
-                EnginePage::create(&s)
+                let page = EnginePage::create(&s)?;
+                hand_over(path)?;
+                Ok(page)
             }
-            Err(_) => EnginePage::create(&s),
+            Err(_) => {
+                let page = EnginePage::create(&s)?;
+                hand_over(path)?;
+                Ok(page)
+            }
         }
     }
 
@@ -420,20 +440,13 @@ mod linux {
             return EX_UNAVAILABLE;
         }
         let page_path = user_dir.join("engine");
-        let page = match engine_page(&page_path) {
+        let page = match engine_page(&page_path, uid) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("engine page: {e}");
                 return EX_UNAVAILABLE;
             }
         };
-        // to the session user; 0600, the supervisor keeps its own mapping
-        if let Err(e) = std::os::unix::fs::lchown(&page_path, Some(uid), None)
-            .and_then(|()| std::fs::set_permissions(&page_path, std::fs::Permissions::from_mode(0o600)))
-        {
-            eprintln!("engine page: {e}");
-            return EX_UNAVAILABLE;
-        }
         let helper = user_dir.join("helper");
         if let Err(e) = helper_dir(&helper, uid) {
             eprintln!("helper directory: {e}");
