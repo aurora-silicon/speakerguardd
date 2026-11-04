@@ -11,17 +11,41 @@
 //! | 2N .. 2N+S | audio in (sense, in the order the parameters name) |
 //! | 2N+S | control out: latency (frames), `lv2:reportsLatency` |
 //! | 2N+S+1 | control out: health bits |
+//! | 2N+S+2 | control out: accepted program-to-sense delay, frames (-1: none) |
 //!
-//! Ownership: lane B (in-graph engine). TODO(lane B):
-//! - load the parameter blob in `instantiate` (path from the supervisor)
-//!   and pick the unit by its kind; map the heartbeat page;
-//! - variants for every Mac's channel and sense counts;
-//! - heartbeat and telemetry writes from `run` without syscalls.
+//! `instantiate` (not real time) reads the parameter blob, builds the unit
+//! named by its kind, and maps the supervisor's engine page. `run` (real
+//! time) only calls `process`, copies the unit's telemetry into the shared
+//! ring when a unit block completes, and stores the heartbeat with release
+//! ordering: no allocation, locks or system calls (the monotonic clock is
+//! read through the vDSO).
 //!
-//! Until then every variant runs the fail-safe unit.
+//! Paths:
+//! - parameter blob: `$SGV2_PARAMS`, else `/run/speakerguardd/params.bin`
+//!   (the supervisor points it at the current `params-<sha256>.bin`);
+//! - engine page: `$SGV2_ENGINE_PAGE`, else `/run/speakerguardd/<uid>/engine`
+//!   (created and sized by the supervisor; see [`page`]). Without a page the
+//!   plugin still protects, and the supervisor, seeing no heartbeat, never
+//!   takes ownership of the amps.
+//!
+//! A blob that is missing, corrupt, for another unit kind, or for another
+//! channel/sense geometry or rate gives the fail-safe unit (20 dB), as macOS
+//! does without its essential parameters.
+//!
+//! `activate` clears the audio histories but not the thermal model: `run`
+//! publishes the unit's thermal state after every call and `activate`
+//! restores the latest record that fits, cooled for the time since (see
+//! [`handoff`]). A pause, a suspend or a graph rebuild in the same process
+//! therefore never gives a hot speaker full power back.
+
+pub mod handoff;
+pub mod page;
+pub mod ttl;
 
 use core::ffi::{c_char, c_void};
-use sgv2_core::{FailSafe, Health, Io, ProtectionUnit, UnitKind};
+use sgv2_core::{
+    atsp, lsm2, placeholder, spp3, FailSafe, HandOff, Health, Io, ProtectionUnit, Telemetry, UnitKind, MAX_CHANNELS,
+};
 
 #[repr(C)]
 pub struct Lv2Descriptor {
@@ -39,39 +63,176 @@ pub struct Lv2Descriptor {
 // SAFETY: the descriptor holds only static data and function pointers.
 unsafe impl Sync for Lv2Descriptor {}
 
-/// Plugin variants: (URI, channels, sense channels).
-pub const VARIANTS: &[(&str, usize, usize)] = &[
-    ("https://aurora-silicon.org/lv2/sgv2#2ch\0", 2, 0),
-    ("https://aurora-silicon.org/lv2/sgv2#2ch-vi\0", 2, 4),
-    ("https://aurora-silicon.org/lv2/sgv2#4ch-vi\0", 4, 8),
-    ("https://aurora-silicon.org/lv2/sgv2#6ch-vi\0", 6, 12),
+/// What a variant runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    /// The protection unit named by the parameter blob.
+    Protect,
+    /// The test placeholder (fail-safe-level gain), never selected by a
+    /// Mac's tuning; for graph and ingestion tests only.
+    Placeholder,
+}
+
+/// Plugin variants: (URI, channels, sense channels, role).
+pub const VARIANTS: &[(&str, usize, usize, Role)] = &[
+    ("https://aurora-silicon.org/lv2/sgv2#2ch\0", 2, 0, Role::Protect),
+    ("https://aurora-silicon.org/lv2/sgv2#2ch-vi\0", 2, 4, Role::Protect),
+    ("https://aurora-silicon.org/lv2/sgv2#4ch\0", 4, 0, Role::Protect),
+    ("https://aurora-silicon.org/lv2/sgv2#4ch-vi\0", 4, 8, Role::Protect),
+    ("https://aurora-silicon.org/lv2/sgv2#6ch-vi\0", 6, 12, Role::Protect),
+    ("https://aurora-silicon.org/lv2/sgv2#6ch-vi-placeholder\0", 6, 12, Role::Placeholder),
 ];
 
-const MAX_PORTS: usize = 3 * sgv2_core::MAX_CHANNELS + 2;
+const MAX_SENSE: usize = 2 * MAX_CHANNELS;
+const MAX_PORTS: usize = 2 * MAX_CHANNELS + MAX_SENSE + 3;
+
+pub enum AnyUnit {
+    Spp3(Box<spp3::Unit>),
+    Lsm2(Box<lsm2::Unit>),
+    Atsp(Box<atsp::Unit>),
+    Placeholder(placeholder::Unit),
+    FailSafe(FailSafe),
+}
+
+impl AnyUnit {
+    pub fn as_dyn(&mut self) -> &mut dyn ProtectionUnit {
+        match self {
+            AnyUnit::Spp3(u) => u.as_mut(),
+            AnyUnit::Lsm2(u) => u.as_mut(),
+            AnyUnit::Atsp(u) => u.as_mut(),
+            AnyUnit::Placeholder(u) => u,
+            AnyUnit::FailSafe(u) => u,
+        }
+    }
+    pub fn unit(&self) -> &dyn ProtectionUnit {
+        match self {
+            AnyUnit::Spp3(u) => u.as_ref(),
+            AnyUnit::Lsm2(u) => u.as_ref(),
+            AnyUnit::Atsp(u) => u.as_ref(),
+            AnyUnit::Placeholder(u) => u,
+            AnyUnit::FailSafe(u) => u,
+        }
+    }
+    pub fn sense_delay(&self) -> Option<u32> {
+        match self {
+            AnyUnit::Spp3(u) => u.sense_delay(),
+            _ => None,
+        }
+    }
+}
+
+/// Why `load_unit` fell back to the fail-safe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoadError {
+    Read,
+    Blob,
+    Geometry,
+    Rate,
+    Refused,
+    NotImplemented,
+}
+
+/// Build the unit for a variant from blob bytes (or the placeholder), and
+/// the blob's payload CRC as its identity. Not real time.
+pub fn load_unit(
+    blob: Option<&[u8]>,
+    rate: f64,
+    channels: usize,
+    sense: usize,
+    role: Role,
+) -> (AnyUnit, Option<LoadError>, u32) {
+    if role == Role::Placeholder {
+        let p = placeholder::Params { channels: channels as u32, ..Default::default() };
+        return (AnyUnit::Placeholder(placeholder::Unit::new(p)), None, 0);
+    }
+    let fail = |e| (AnyUnit::FailSafe(FailSafe::new(UnitKind::Spp3, Health::NO_PARAMS)), Some(e), 0);
+    let Some(bytes) = blob else { return fail(LoadError::Read) };
+    let Ok((h, _)) = sgv2_core::blob::Header::parse(bytes) else { return fail(LoadError::Blob) };
+    if h.channels as usize != channels || h.sense_channels as usize != sense {
+        return fail(LoadError::Geometry);
+    }
+    if (h.sample_rate as f64 - rate).abs() > 0.5 {
+        // A rate change re-initialises from parameters made for that rate
+        // (no in-place migration); a blob for another rate is unusable.
+        return fail(LoadError::Rate);
+    }
+    if h.unit == UnitKind::Spp3 as u32 {
+        match spp3::Params::from_blob(bytes) {
+            Ok(p) if spp3::Unit::init_error(&p).is_none() => {
+                (AnyUnit::Spp3(Box::new(spp3::Unit::new(p))), None, h.payload_crc)
+            }
+            Ok(_) => fail(LoadError::Refused),
+            Err(_) => fail(LoadError::Blob),
+        }
+    } else if h.unit == UnitKind::Lsm2 as u32 {
+        match lsm2::Params::from_blob(bytes) {
+            Ok(p) if lsm2::Unit::init_error(&p).is_none() => {
+                (AnyUnit::Lsm2(Box::new(lsm2::Unit::new(p))), None, h.payload_crc)
+            }
+            Ok(_) => fail(LoadError::Refused),
+            Err(_) => fail(LoadError::Blob),
+        }
+    } else if h.unit == UnitKind::Atsp as u32 {
+        match atsp::Params::from_blob(bytes) {
+            Ok(p) if atsp::Unit::init_error(&p).is_none() => {
+                (AnyUnit::Atsp(Box::new(atsp::Unit::new(p))), None, h.payload_crc)
+            }
+            Ok(_) => fail(LoadError::Refused),
+            Err(_) => fail(LoadError::Blob),
+        }
+    } else {
+        fail(LoadError::NotImplemented)
+    }
+}
 
 struct Instance {
     channels: usize,
     sense: usize,
     ports: [*mut f32; MAX_PORTS],
-    unit: FailSafe,
+    unit: AnyUnit,
+    page: Option<page::EnginePage>,
+    telemetry: Telemetry,
+    last_frame: u64,
+    frames: u64,
+    /// Scratch for the thermal hand-off record `run` publishes.
+    handoff: HandOff,
+}
+
+fn env_or(var: &str, default: String) -> String {
+    std::env::var(var).unwrap_or(default)
 }
 
 unsafe extern "C" fn instantiate(
     descriptor: *const Lv2Descriptor,
-    _rate: f64,
+    rate: f64,
     _bundle: *const c_char,
     _features: *const *const c_void,
 ) -> *mut c_void {
     let index = DESCRIPTORS.iter().position(|d| core::ptr::eq(d, descriptor));
-    let Some((_, channels, sense)) = index.map(|i| VARIANTS[i]) else {
+    let Some((_, channels, sense, role)) = index.map(|i| VARIANTS[i]) else {
         return core::ptr::null_mut();
     };
+    // SAFETY: getuid has no preconditions.
+    let uid = unsafe { libc::getuid() };
+    let blob_path = env_or("SGV2_PARAMS", "/run/speakerguardd/params.bin".into());
+    let page_path = env_or("SGV2_ENGINE_PAGE", format!("/run/speakerguardd/{uid}/engine"));
+    handoff::init();
+    let blob = std::fs::read(&blob_path).ok();
+    let (unit, _err, params_crc) = load_unit(blob.as_deref(), rate, channels, sense, role);
+    let page = page::EnginePage::open(&page_path).ok();
+    if let Some(p) = &page {
+        p.start(params_crc, unit.unit().latency_frames(), channels as u32, sense as u32);
+    }
     let instance = Box::new(Instance {
         channels,
         sense,
         ports: [core::ptr::null_mut(); MAX_PORTS],
-        // TODO(lane B): the unit from the parameter blob.
-        unit: FailSafe::new(UnitKind::Spp3, Health::NO_PARAMS),
+        unit,
+        page,
+        telemetry: Telemetry::new(),
+        last_frame: u64::MAX,
+        frames: 0,
+        handoff: HandOff::EMPTY,
     });
     Box::into_raw(instance).cast()
 }
@@ -84,37 +245,89 @@ unsafe extern "C" fn connect_port(handle: *mut c_void, port: u32, data: *mut c_v
     }
 }
 
+unsafe extern "C" fn activate(handle: *mut c_void) {
+    // SAFETY: the host passes the handle `instantiate` returned.
+    let instance = unsafe { &mut *handle.cast::<Instance>() };
+    start_stream(instance.unit.as_dyn(), &handoff::SLOT);
+    instance.last_frame = u64::MAX;
+    instance.frames = 0;
+}
+
+/// A stream starts: audio histories cleared, the thermal model restored
+/// from the latest hand-off record that fits this unit (cooled for its
+/// age), else the parameters' start state. Not real time.
+pub fn start_stream(unit: &mut dyn ProtectionUnit, slot: &handoff::Slot) -> bool {
+    unit.reset();
+    match slot.latest() {
+        Some((record, age_s)) => unit.restore_state(&record, age_s),
+        None => false,
+    }
+}
+
 unsafe extern "C" fn run(handle: *mut c_void, frames: u32) {
     // SAFETY: the host passes the handle `instantiate` returned and has
     // connected every port to a buffer of at least `frames` samples.
     let instance = unsafe { &mut *handle.cast::<Instance>() };
     let (n, s, frames) = (instance.channels, instance.sense, frames as usize);
     let empty: &[f32] = &[];
-    let mut input = [empty; sgv2_core::MAX_CHANNELS];
-    let mut sense = [empty; 2 * sgv2_core::MAX_CHANNELS];
-    let mut out_store: [&mut [f32]; sgv2_core::MAX_CHANNELS] = Default::default();
+    let mut input = [empty; MAX_CHANNELS];
+    let mut sense = [empty; MAX_SENSE];
+    let mut out_store: [&mut [f32]; MAX_CHANNELS] = Default::default();
     for c in 0..n {
         let (i, o) = (instance.ports[c], instance.ports[n + c]);
         if i.is_null() || o.is_null() {
             return;
         }
-        // SAFETY: connected audio ports hold `frames` samples.
+    }
+    // The core needs distinct input and output buffers. PipeWire's
+    // filter-graph gives every port its own buffer; if a host ever connects
+    // a channel in place, every output is muted for that call rather than
+    // run on aliased memory.
+    let aliased = (0..n).any(|c| (0..n).any(|k| core::ptr::eq(instance.ports[c], instance.ports[n + k])));
+    if aliased {
+        for c in 0..n {
+            // SAFETY: connected audio ports hold `frames` samples.
+            unsafe { core::slice::from_raw_parts_mut(instance.ports[n + c], frames) }.fill(0.0);
+        }
+        return;
+    }
+    for c in 0..n {
+        // SAFETY: connected audio ports hold `frames` samples and are
+        // distinct buffers (checked above).
         unsafe {
-            input[c] = core::slice::from_raw_parts(i, frames);
-            out_store[c] = core::slice::from_raw_parts_mut(o, frames);
+            input[c] = core::slice::from_raw_parts(instance.ports[c], frames);
+            out_store[c] = core::slice::from_raw_parts_mut(instance.ports[n + c], frames);
         }
     }
+    let mut sense_n = 0;
     for (k, slot) in sense.iter_mut().enumerate().take(s) {
         let p = instance.ports[2 * n + k];
-        if !p.is_null() {
-            // SAFETY: as above.
-            *slot = unsafe { core::slice::from_raw_parts(p, frames) };
+        if p.is_null() {
+            break;
         }
+        // SAFETY: as above.
+        *slot = unsafe { core::slice::from_raw_parts(p, frames) };
+        sense_n = k + 1;
     }
-    let latency = instance.unit.latency_frames() as f32;
-    let health =
-        instance.unit.process(Io { frames, input: &input[..n], sense: &sense[..s], output: &mut out_store[..n] });
-    for (port, value) in [(2 * n + s, latency), (2 * n + s + 1, health.0 as f32)] {
+    // An incomplete sense bus is no bus: the unit runs open loop.
+    let sense_slice = if sense_n == s { &sense[..s] } else { &sense[..0] };
+    let unit = instance.unit.as_dyn();
+    let latency = unit.latency_frames() as f32;
+    let health = unit.process(Io { frames, input: &input[..n], sense: sense_slice, output: &mut out_store[..n] });
+    instance.frames += frames as u64;
+    if instance.unit.unit().save_state(&mut instance.handoff) {
+        handoff::SLOT.publish(&instance.handoff);
+    }
+    let delay = instance.unit.sense_delay().map_or(-1, |d| d as i32);
+    if let Some(page) = &instance.page {
+        instance.unit.unit().telemetry(&mut instance.telemetry);
+        if instance.telemetry.frame != instance.last_frame {
+            instance.last_frame = instance.telemetry.frame;
+            page.push(&instance.telemetry);
+        }
+        page.beat(instance.frames, health, delay);
+    }
+    for (port, value) in [(2 * n + s, latency), (2 * n + s + 1, health.0 as f32), (2 * n + s + 2, delay as f32)] {
         let p = instance.ports[port];
         if !p.is_null() {
             // SAFETY: control ports point at one f32.
@@ -138,7 +351,7 @@ macro_rules! descriptor {
             uri: VARIANTS[$i].0.as_ptr().cast(),
             instantiate,
             connect_port,
-            activate: None,
+            activate: Some(activate),
             run,
             deactivate: None,
             cleanup,
@@ -147,7 +360,8 @@ macro_rules! descriptor {
     };
 }
 
-static DESCRIPTORS: [Lv2Descriptor; 4] = [descriptor!(0), descriptor!(1), descriptor!(2), descriptor!(3)];
+static DESCRIPTORS: [Lv2Descriptor; 6] =
+    [descriptor!(0), descriptor!(1), descriptor!(2), descriptor!(3), descriptor!(4), descriptor!(5)];
 
 /// The LV2 entry point.
 #[no_mangle]
@@ -159,8 +373,15 @@ pub extern "C" fn lv2_descriptor(index: u32) -> *const Lv2Descriptor {
 mod tests {
     use super::*;
 
+    /// The C ABI reads its paths from the environment: tests that set it
+    /// take turns.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn runs_the_failsafe_through_the_c_abi() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("SGV2_PARAMS", "/nonexistent/sgv2-test");
+        std::env::set_var("SGV2_ENGINE_PAGE", "/nonexistent/sgv2-test");
         let d = lv2_descriptor(0);
         assert!(!d.is_null());
         assert!(lv2_descriptor(VARIANTS.len() as u32).is_null());
@@ -172,16 +393,127 @@ mod tests {
             let mut or = [0.0f32; 4];
             let mut latency = -1.0f32;
             let mut health = 0.0f32;
+            let mut delay = 0.0f32;
             for (p, buf) in [(0, l.as_mut_ptr()), (1, r.as_mut_ptr()), (2, ol.as_mut_ptr()), (3, or.as_mut_ptr())] {
                 ((*d).connect_port)(h, p, buf.cast());
             }
             ((*d).connect_port)(h, 4, (&mut latency as *mut f32).cast());
             ((*d).connect_port)(h, 5, (&mut health as *mut f32).cast());
+            ((*d).connect_port)(h, 6, (&mut delay as *mut f32).cast());
+            ((*d).activate.unwrap())(h);
             ((*d).run)(h, 4);
             assert!((ol[0] - 0.1).abs() < 1e-7 && (or[3] + 0.1).abs() < 1e-7);
             assert_eq!(latency, 0.0);
+            assert_eq!(delay, -1.0);
             assert_eq!(health as u32 & Health::FAILSAFE, Health::FAILSAFE);
             ((*d).cleanup)(h);
         }
+    }
+
+    /// Review finding 5 on PR #31: `activate` reset the thermal model, so a
+    /// pause or graph rebuild gave a hot speaker full power back.
+    #[test]
+    fn activate_keeps_the_thermal_state_across_streams_and_instances() {
+        use sgv2_core::blob::Pod;
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut p = spp3::Params {
+            channels: 2,
+            sample_rate: 48_000,
+            block_frames: 512,
+            thermal_ambient_temp: 40.0,
+            thermal_gain_attack_time_s: 0.5,
+            thermal_gain_release_time_s: 2.0,
+            thermal_lookahead_delay_ms: 1.0,
+            thermal_protection_enabled: 1,
+            ..Default::default()
+        };
+        for c in 0..2 {
+            p.ch[c] = spp3::ChannelParams {
+                source: c as u32,
+                t_sett_vc: 20.0,
+                t_sett_mg: 10.0,
+                tau_tvc: 0.4,
+                tau_tmg: 3.0,
+                temperature_limit: 120.0,
+                hard_temp_limit_headroom: 8.0,
+                reb_ref: 4.0,
+                rshunt: 0.2,
+                ag: 10.0,
+                thermal_ff_speedup_factor: 0.5,
+                ..Default::default()
+            };
+        }
+        let blob = sgv2_core::blob::build(UnitKind::Spp3, 2, 0, 48_000, p.as_bytes());
+        let path = std::env::temp_dir().join(format!("sgv2-handoff-test-{}.bin", std::process::id()));
+        std::fs::write(&path, blob).unwrap();
+        std::env::set_var("SGV2_PARAMS", &path);
+        std::env::set_var("SGV2_ENGINE_PAGE", "/nonexistent/sgv2-test");
+        let d = lv2_descriptor(0);
+        let l = [1.0f32; 512];
+        let r = [1.0f32; 512];
+        let mut ol = [0.0f32; 512];
+        let mut or = [0.0f32; 512];
+        let mut ctl = [0.0f32; 3];
+        let bufs = [l.as_ptr() as *mut f32, r.as_ptr() as *mut f32, ol.as_mut_ptr(), or.as_mut_ptr()];
+        let ctl_p = ctl.as_mut_ptr();
+        let last = bufs[2];
+        unsafe {
+            let open = || {
+                let h = ((*d).instantiate)(d, 48_000.0, core::ptr::null(), core::ptr::null());
+                for (k, buf) in bufs.into_iter().enumerate() {
+                    ((*d).connect_port)(h, k as u32, buf.cast());
+                }
+                for k in 0..3 {
+                    ((*d).connect_port)(h, 4 + k as u32, ctl_p.add(k).cast());
+                }
+                h
+            };
+            let out = || *last.add(511);
+            let h = open();
+            ((*d).activate.unwrap())(h);
+            for _ in 0..(30 * 48_000 / 512) {
+                ((*d).run)(h, 512);
+            }
+            let hot = out();
+            assert!(hot < 0.5, "{hot}");
+            // pause and resume the same instance
+            ((*d).activate.unwrap())(h);
+            ((*d).run)(h, 512);
+            assert!(out() <= hot + 0.02, "resumed at {}, was {hot}", out());
+            ((*d).cleanup)(h);
+            // a new instance in the same process starts from that state too
+            let h = open();
+            ((*d).activate.unwrap())(h);
+            ((*d).run)(h, 512);
+            assert!(out() <= hot + 0.02, "new instance at {}, was {hot}", out());
+            ((*d).cleanup)(h);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn wrong_geometry_rate_or_parameters_is_the_failsafe() {
+        use sgv2_core::blob::Pod;
+        let p = sgv2_core::spp3::Params { channels: 2, sample_rate: 48_000, ..Default::default() };
+        let b = sgv2_core::blob::build(UnitKind::Spp3, 2, 4, 48_000, p.as_bytes());
+        let (_, e, _) = load_unit(Some(&b), 48_000.0, 6, 12, Role::Protect);
+        assert_eq!(e, Some(LoadError::Geometry));
+        let (_, e, _) = load_unit(Some(&b), 44_100.0, 2, 4, Role::Protect);
+        assert_eq!(e, Some(LoadError::Rate));
+        // default params are structurally invalid
+        let (u, e, _) = load_unit(Some(&b), 48_000.0, 2, 4, Role::Protect);
+        assert!(e.is_some());
+        assert!(matches!(u, AnyUnit::FailSafe(_)));
+        let (_, e, _) = load_unit(None, 48_000.0, 2, 4, Role::Protect);
+        assert_eq!(e, Some(LoadError::Read));
+    }
+
+    #[test]
+    fn checked_in_ttl_matches_the_variants() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/lv2/sgv2.lv2/");
+        let (manifest, plugin) = ttl::generate();
+        let hint = "regenerate with: cargo run -p sgv2-lv2 --example gen-ttl";
+        assert_eq!(std::fs::read_to_string(format!("{dir}manifest.ttl")).unwrap(), manifest, "{hint}");
+        assert_eq!(std::fs::read_to_string(format!("{dir}sgv2.ttl")).unwrap(), plugin, "{hint}");
     }
 }

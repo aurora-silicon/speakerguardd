@@ -86,6 +86,52 @@ impl Header {
     }
 }
 
+/// Plain-old-data payloads: every field is a 4-byte `f32` or `u32` (or an
+/// array of them), little-endian on every supported target, so the
+/// `#[repr(C)]` struct is its own serialisation.
+///
+/// # Safety
+/// Implement only for `#[repr(C)]` structs made of `f32`/`u32` fields and
+/// arrays thereof, with no padding, for which every bit pattern is valid.
+pub unsafe trait Pod: Copy + Sized {
+    fn as_bytes(&self) -> &[u8] {
+        // SAFETY: Pod contract: no padding, plain 4-byte fields.
+        unsafe { core::slice::from_raw_parts(self as *const Self as *const u8, core::mem::size_of::<Self>()) }
+    }
+    fn from_bytes(b: &[u8]) -> Result<Self, BlobError> {
+        if b.len() != core::mem::size_of::<Self>() {
+            return Err(BlobError::Length);
+        }
+        // SAFETY: Pod contract: every bit pattern is valid; unaligned read.
+        Ok(unsafe { core::ptr::read_unaligned(b.as_ptr() as *const Self) })
+    }
+}
+
+/// Build a complete blob (header and payload) for `unit`.
+#[cfg(any(test, feature = "std"))]
+pub fn build(
+    unit: crate::UnitKind,
+    channels: u32,
+    sense_channels: u32,
+    sample_rate: u32,
+    payload: &[u8],
+) -> std::vec::Vec<u8> {
+    let h = Header {
+        version: VERSION,
+        unit: unit as u32,
+        channels,
+        sense_channels,
+        sample_rate,
+        payload_len: payload.len() as u32,
+        payload_crc: crc32(payload),
+    };
+    let mut head = [0u8; HEADER_LEN];
+    h.write(&mut head);
+    let mut v = head.to_vec();
+    v.extend_from_slice(payload);
+    v
+}
+
 /// CRC-32 (IEEE 802.3, reflected, init and xorout 0xFFFFFFFF).
 pub fn crc32(data: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;
