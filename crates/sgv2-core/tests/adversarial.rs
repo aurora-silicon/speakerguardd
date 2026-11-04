@@ -35,9 +35,12 @@
 //! targets in `crates/sgv2-core/fuzz` cover the same properties with
 //! coverage guidance.
 //!
-//! Regression tests for the defects these tests found are at the end (FINDING
-//! 1-8). They are `#[ignore]`d so the suite stays green until lane B fixes
-//! them; run them with `cargo test --test adversarial -- --ignored`.
+//! Regression tests for the defects these tests found are at the end
+//! (FINDING 1-12). Fixed ones run as ordinary tests; open ones are
+//! `#[ignore]`d so the suite stays green until lane B fixes them: run them
+//! with `cargo test --test adversarial -- --ignored`. The LV2-side checks
+//! (null program port, engine-page gain) are in
+//! `crates/sgv2-lv2/tests/adversarial_lv2.rs`.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -45,7 +48,7 @@ use std::cell::Cell;
 use proptest::prelude::*;
 use proptest::test_runner::Config;
 use sgv2_core::blob::{self, Pod};
-use sgv2_core::{atsp, lsm2, placeholder, spp3, FailSafe, Health, Io, ProtectionUnit, Telemetry, UnitKind};
+use sgv2_core::{atsp, lsm2, placeholder, spp3, FailSafe, HandOff, Health, Io, ProtectionUnit, Telemetry, UnitKind};
 use sgv2_core::{FAILSAFE_GAIN, MAX_CHANNELS};
 
 // ---------------------------------------------------------------------------
@@ -403,6 +406,14 @@ fn lsm2_params(seed: u64, n: usize, rate: u32, hot: bool) -> lsm2::Params {
         runtime_budget_w: [r.log(0.1, 50.0), r.log(0.1, 50.0), r.log(0.1, 50.0), r.log(0.1, 50.0)],
         ..lsm2::Params::default()
     };
+    // refused otherwise: no thermal axis, or a latency below the 256-frame
+    // controller cadence
+    if p.control_power == 0 && p.control_temperature == 0 {
+        p.control_temperature = 1;
+    }
+    if p.latency_frames() < lsm2::CONTROLLER_FRAMES {
+        p.filterbank_latency_ms = (lsm2::CONTROLLER_FRAMES as f32 / 2.0 + 1.0) * 1e3 / rate as f32;
+    }
     let src = r.perm(n);
     for (c, &s) in src.iter().enumerate() {
         let ambient = r.uni(10.0, 45.0);
@@ -505,6 +516,7 @@ fn render(
     let mut health = Vec::new();
     let mut tele = Vec::new();
     let mut t = Telemetry::new();
+    let mut handoff = HandOff::EMPTY;
     let mut done = 0;
     let mut call = 0;
     let mut scratch: Vec<Vec<f32>> = sense.map_or(Vec::new(), |s| s.iter().map(|v| vec![0.0; v.len()]).collect());
@@ -537,7 +549,9 @@ fn render(
         let before = allocs();
         let h = unit.process(Io { frames: m, input: &ins, sense: &sns, output: &mut outs });
         unit.telemetry(&mut t);
-        assert_eq!(allocs(), before, "{:?} allocated in process/telemetry ({m} frames)", unit.kind());
+        // the plugin calls save_state after every process
+        let _ = unit.save_state(&mut handoff);
+        assert_eq!(allocs(), before, "{:?} allocated in process/telemetry/save_state ({m} frames)", unit.kind());
         drop(outs);
         health.push(h);
         done += m;
@@ -993,7 +1007,8 @@ impl HardOracle {
             for &v in x[c.src] {
                 c.hist.push_back(v);
                 let d = if c.look == 0 { c.hist.pop_back().unwrap() } else { c.hist.pop_front().unwrap() };
-                let d = if d.is_finite() { d as f64 } else { 0.0 };
+                // the program is held to full scale before the meters
+                let d = if d.is_finite() { d.clamp(-1.0, 1.0) as f64 } else { 0.0 };
                 acc += d * d;
             }
             let p = c.elec * acc / frames as f64;
@@ -1031,16 +1046,20 @@ impl HardOracle {
                 continue;
             }
             any = true;
+            // without the feed-forward there is no virtual coil: the hard
+            // path holds the fixed 20 dB
+            if c.ff.is_none() {
+                self.allowed[c.group] = self.allowed[c.group].min(FAILSAFE_GAIN as f64);
+                continue;
+            }
             let theta_mg = mag - self.amb;
-            let vcff = match c.ff {
-                Some(_) => c.theta_ff * (1.0 - 1e-4) - 1e-6,
-                None => (t_ol - mag) - 1e-4 * t_ol.abs().max(1.0),
-            };
+            let vcff = c.theta_ff * (1.0 - 1e-4) - 1e-6;
             if vcff + 1.0 <= 0.0 {
                 continue;
             }
             let num = c.limit - 5.0 - self.amb - theta_mg + 1e-4 * (c.limit.abs() + mag.abs() + 1.0);
-            let g_hard = (num / (vcff + 1.0)).clamp(0.01, 1.0).sqrt();
+            // ratio floor 1e-4: a 0.01 (-40 dB) gain floor
+            let g_hard = (num / (vcff + 1.0)).clamp(1e-4, 1.0).sqrt();
             self.allowed[c.group] = self.allowed[c.group].min(g_hard);
         }
         if any {
@@ -1197,7 +1216,7 @@ proptest! {
 
     /// With the feed-forward on, sustained drive settles with the modelled
     /// coil at or below the hard limit, unless the gain sits at the
-    /// candidate's 20 dB floor.
+    /// candidate's 40 dB floor.
     #[test]
     fn spp3_feed_forward_settles_below_the_hard_limit(
         seed in any::<u64>(), n in 1usize..=4, amp in 0.3f32..3.0, f in 50.0f64..3000.0,
@@ -1218,7 +1237,7 @@ proptest! {
             let s = &t.channels[c.source as usize];
             let hard_on = c.temperature_limit + c.hard_temp_limit_headroom;
             prop_assert!(
-                s.coil_temp_c <= hard_on + 0.5 || s.axis_gain[4] <= 0.1 + 1e-3,
+                s.coil_temp_c <= hard_on + 0.5 || s.axis_gain[4] <= 0.01 + 1e-4,
                 "coil settles at {} C, hard limit {} C, gain {}", s.coil_temp_c, hard_on, s.gain
             );
         }
@@ -1503,7 +1522,7 @@ fn hard_path_anchors_are_reached() {
 
 // ---------------------------------------------------------------------------
 // Regression tests for defects found by the tests above (lane B to fix).
-// Each is `#[ignore]`d until fixed; remove the attribute with the fix.
+// Open ones are `#[ignore]`d; remove the attribute with the fix.
 
 /// Minimal spp3 set for the regressions: one channel, closed loop off.
 fn spp3_minimal(ff: f32) -> spp3::Params {
@@ -1590,7 +1609,6 @@ fn drive1(
 /// the feed-forward is on or off. A fresh unit holds the same drive at about
 /// 0.34 (ff 0.5) or 0.48 (ff 0).
 #[test]
-#[ignore = "FINDING 1 (lane B): one huge finite sample leaves spp3 at unity gain forever"]
 fn spp3_huge_finite_sample_must_not_unprotect() {
     for ff in [0.5f32, 0.0] {
         let (fresh, _) = drive1(&mut spp3::Unit::new(spp3_minimal(ff)), 1.0, None, 48_000 * 10, None);
@@ -1609,7 +1627,6 @@ fn spp3_huge_finite_sample_must_not_unprotect() {
 /// FINDING 1, atsp: the same accumulator overflow turns the state NaN and
 /// the unit then mutes forever (fail-closed, but never recovers).
 #[test]
-#[ignore = "FINDING 1 (lane B): huge finite input poisons the atsp thermal state with NaN"]
 fn atsp_huge_finite_sample_must_not_poison_the_model() {
     let s = atsp::Slot {
         channel_mask: 1,
@@ -1652,7 +1669,6 @@ fn atsp_huge_finite_sample_must_not_poison_the_model() {
 /// at 119.9 C). Module docs: "TODO(SPEC): the hard candidate when the
 /// feed-forward filter is disabled".
 #[test]
-#[ignore = "FINDING 2 (lane B): with the feed-forward off spp3 settles 66 C above the hard limit"]
 fn spp3_feed_forward_off_still_holds_the_hard_limit() {
     let p = spp3_minimal(0.0);
     let hard_on = p.ch[0].temperature_limit + p.ch[0].hard_temp_limit_headroom;
@@ -1674,7 +1690,6 @@ fn spp3_feed_forward_off_still_holds_the_hard_limit() {
 /// `health` meanwhile reports `OPEN_LOOP`. NaN-filled sense, by contrast,
 /// is rejected and the limit returns to plain (the specified behaviour).
 #[test]
-#[ignore = "FINDING 3 (lane B): closed-loop sense loss keeps the corrected limit indefinitely"]
 fn spp3_closed_loop_falls_back_when_the_sense_bus_disappears() {
     let mut u = spp3::Unit::new(spp3_cl());
     let (g0, t0) = drive1(&mut u, 0.6, None, 48_000 * 10, Some(4.0));
@@ -1697,13 +1712,13 @@ fn spp3_closed_loop_falls_back_when_the_sense_bus_disappears() {
 /// and panics in `process` on the first accepted sense window (an abort
 /// inside PipeWire with `panic = "abort"`).
 #[test]
-#[ignore = "FINDING 4 (lane B): a negative or NaN TlimAdjCap panics in process()"]
 fn spp3_hostile_tlim_adj_cap_never_panics() {
     for cap in [-1.0f32, f32::NAN] {
         let mut p = spp3_cl();
         p.ch[0].tlim_adj_cap = cap;
         let b = blob::build(UnitKind::Spp3, 1, 2, 48_000, p.as_bytes());
-        let p = spp3::Params::from_blob(&b).expect("the blob validates");
+        // refused at load (the fail-safe) is the fix; accepted must not panic
+        let Ok(p) = spp3::Params::from_blob(&b) else { continue };
         let r = std::panic::catch_unwind(|| {
             let mut u = spp3::Unit::new(p);
             drive1(&mut u, 0.6, None, 48_000, Some(4.0));
@@ -1719,7 +1734,6 @@ fn spp3_hostile_tlim_adj_cap_never_panics() {
 /// not sanitize, so a NaN or +-Inf input sample leaves as NaN or +-Inf
 /// (`Inf * 0.1 = Inf`: full scale at the amplifier).
 #[test]
-#[ignore = "FINDING 5 (lane B): FailSafe::process panics on a short host buffer"]
 fn failsafe_unit_never_panics_on_short_buffers() {
     let r = std::panic::catch_unwind(|| {
         let x = [0.5f32; 8];
@@ -1731,7 +1745,6 @@ fn failsafe_unit_never_panics_on_short_buffers() {
 }
 
 #[test]
-#[ignore = "FINDING 5 (lane B): FailSafe::process passes NaN/Inf through"]
 fn failsafe_unit_output_is_finite() {
     let x = [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.5];
     let mut o = [0.0f32; 4];
@@ -1773,53 +1786,75 @@ fn non_finite_failsafe_region_is_slice_invariant() {
     }
 }
 
-/// FINDING 7 (decision for lane B): blobs that validate and load as a real
-/// unit, yet protect nothing (property 5's "never pass-through"). spp3
-/// refuses `ThermalProtectionEnabled = 0` and atsp refuses `Bypass`, but
-/// lsm2 accepts `EnableMitigation = 0` and all five `Control*` flags off,
-/// and spp3 accepts limits no speaker has (`TemperatureLimit = f32::MAX`)
-/// and smoothing times that never move (`f32::MAX` s). Whether these are
-/// refused (fail-safe) or allowed as Apple's own semantics is a lane B /
-/// spec decision; until then this test documents the gap.
+/// FINDING 7 (lane B): blobs that validate and load as a real unit, yet
+/// protect nothing (property 5's "never pass-through"). lsm2's
+/// `EnableMitigation = 0` and all-axes-off are refused since 660f33d. spp3
+/// still accepts limits no speaker has (`TemperatureLimit = f32::MAX`),
+/// smoothing times that never move (`f32::MAX` s) with a huge headroom, and
+/// unbounded series resistance (`Rshunt`, `Rampout`): the modelled power
+/// `ag^2 Reb / (Reb + Rshunt + Rampout)^2` goes to zero, so the model never
+/// heats and full scale passes at unity.
 #[test]
 #[ignore = "FINDING 7 (decision for lane B): accepted blobs that disable protection"]
 fn hostile_but_valid_blobs_do_not_pass_through() {
     let x = vec![vec![1.0f32; 48_000 * 10]; 1];
+    // the last second of 10 s of full-scale drive leaves at unity
     let passes = |u: &mut dyn ProtectionUnit, lat: usize| {
         let rr = render(u, &x, None, &[512], &mut no_sense, false);
         rr.out[0][lat + 48_000 * 9..].iter().all(|&v| v == 1.0)
     };
-    let mut failures = Vec::new();
+    let mut failures: Vec<&str> = Vec::new();
+    // lsm2: refused at load (`from_blob` Err or a fail-safe unit) is safe
+    let lsm2_case = |p: lsm2::Params, what: &'static str, failures: &mut Vec<&str>| {
+        let b = blob::build(UnitKind::Lsm2, 1, 0, 48_000, p.as_bytes());
+        if let Ok(p) = lsm2::Params::from_blob(&b) {
+            let mut u = lsm2::Unit::new(p);
+            let lat = u.latency_frames() as usize;
+            if !u.is_failsafe() && passes(&mut u, lat) {
+                failures.push(what);
+            }
+        }
+    };
     let mut p = lsm2_params(1, 1, 48_000, true);
     p.control_temperature = 1;
     p.enable_mitigation = 0;
-    let b = blob::build(UnitKind::Lsm2, 1, 0, 48_000, p.as_bytes());
-    let mut u = lsm2::Unit::new(lsm2::Params::from_blob(&b).unwrap());
-    let lat = u.latency_frames() as usize;
-    if !u.is_failsafe() && passes(&mut u, lat) {
-        failures.push("lsm2 EnableMitigation=0 loads and passes full scale at unity");
-    }
+    lsm2_case(p, "lsm2 EnableMitigation=0 loads and passes full scale at unity", &mut failures);
     let mut p = lsm2_params(1, 1, 48_000, true);
     (p.control_sample_peak, p.control_displacement, p.control_velocity) = (0, 0, 0);
     (p.control_power, p.control_temperature) = (0, 0);
-    let mut u = lsm2::Unit::new(p);
-    let lat = u.latency_frames() as usize;
-    if !u.is_failsafe() && passes(&mut u, lat) {
-        failures.push("lsm2 with every Control* flag off loads and passes full scale at unity");
-    }
+    lsm2_case(p, "lsm2 with every Control* flag off loads and passes full scale at unity", &mut failures);
+    let spp3_case = |p: spp3::Params, what: &'static str, failures: &mut Vec<&str>| {
+        let b = blob::build(UnitKind::Spp3, 1, 0, 48_000, p.as_bytes());
+        if let Ok(p) = spp3::Params::from_blob(&b) {
+            let mut u = spp3::Unit::new(p);
+            if !u.is_failsafe() && passes(&mut u, 0) {
+                failures.push(what);
+            }
+        }
+    };
     let mut p = spp3_minimal(1.0);
     p.ch[0].temperature_limit = f32::MAX;
-    let mut u = spp3::Unit::new(p);
-    if !u.is_failsafe() && passes(&mut u, 0) {
-        failures.push("spp3 TemperatureLimit=f32::MAX loads and passes full scale at unity");
-    }
+    spp3_case(p, "spp3 TemperatureLimit=f32::MAX loads and passes full scale at unity", &mut failures);
     let mut p = spp3_minimal(1.0);
     p.thermal_gain_attack_time_s = f32::MAX;
     p.ch[0].hard_temp_limit_headroom = 1e30;
-    let mut u = spp3::Unit::new(p);
-    if !u.is_failsafe() && passes(&mut u, 0) {
-        failures.push("spp3 Thermal_GainAttackTime_s=f32::MAX (and a huge headroom) passes full scale at unity");
-    }
+    spp3_case(
+        p,
+        "spp3 Thermal_GainAttackTime_s=f32::MAX (and a huge headroom) passes full scale at unity",
+        &mut failures,
+    );
+    // no upper bound on the series resistances: the modelled power
+    // `ag^2 Reb / (Reb + Rshunt + Rampout)^2` goes to 0 and the model never
+    // heats
+    let mut p = spp3_minimal(1.0);
+    p.ch[0].rshunt = 1e30;
+    spp3_case(p, "spp3 Rshunt=1e30 loads and passes full scale at unity", &mut failures);
+    let mut p = spp3_minimal(1.0);
+    p.ch[0].rampout = 1e30;
+    spp3_case(p, "spp3 Rampout=1e30 loads and passes full scale at unity", &mut failures);
+    let mut p = spp3_minimal(1.0);
+    p.ch[0].rshunt = 1e3;
+    spp3_case(p, "spp3 Rshunt=1 kohm (finite, implausible) loads and passes full scale at unity", &mut failures);
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
@@ -1862,7 +1897,6 @@ fn lsm2_enforces_the_hard_temperature_limit() {
 /// the magnet and virtual coil both gone, releases to unity (0.998 below,
 /// where a stable unit holds 0.68) while `T_OL = -inf`.
 #[test]
-#[ignore = "FINDING 9 (lane B): thermal filters diverge for tau < dt/2 and can release to unity"]
 fn spp3_short_time_constants_stay_stable() {
     let stable = {
         let p = spp3_minimal(1.0);
@@ -1870,7 +1904,11 @@ fn spp3_short_time_constants_stay_stable() {
     };
     let mut p = spp3_minimal(1.0);
     (p.ch[0].tau_tvc, p.ch[0].tau_tmg) = (0.002, 0.002);
-    assert_eq!(p.validate(), Ok(()));
+    // refused at load is the fix; accepted must stay stable
+    if p.validate().is_err() {
+        assert!(spp3::Unit::new(p).is_failsafe());
+        return;
+    }
     let (g, t) = drive1(&mut spp3::Unit::new(p), 0.5, None, 48_000 * 10, None);
     assert!(
         t.channels[0].coil_temp_c.is_finite() && g <= stable.max(0.9),
@@ -1893,5 +1931,113 @@ fn spp3_non_finite_sense_is_open_loop() {
         let mut o = vec![0.0f32; 512];
         let h = u.process(Io { frames: 512, input: &[&i], sense: &[&s, &s], output: &mut [&mut o] });
         assert!(h.0 & Health::OPEN_LOOP != 0, "sense {v}: health {h:?}");
+    }
+}
+
+/// FINDING 12 (low): one NaN (or Inf) sense frame poisons the sense delay
+/// estimator for good. Its correlations are exponentially forgotten
+/// (`c = c * LAMBDA + v * w`), so a NaN never leaves them, `c > best` is
+/// then always false and no delay ever locks again until reset. spp3 feeds
+/// the estimator non-finite sense because `complete` no longer checks
+/// finiteness (FINDING 10).
+#[test]
+#[ignore = "FINDING 12 (lane B): one NaN sense frame stops the delay estimator for good"]
+fn delay_estimator_recovers_from_a_nan_sense_frame() {
+    use sgv2_core::sense::DelayEstimator;
+    let d = 1536usize;
+    let n = 48_000 * 6;
+    let mut s = 1u32;
+    let prog: Vec<f32> = (0..n)
+        .map(|k| {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            let env = if (k / 2400) % 3 == 0 { 1.0 } else { 0.1 };
+            ((s >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * env
+        })
+        .collect();
+    let run = |poison: Option<f32>| {
+        let mut e = DelayEstimator::new();
+        for k in 0..n {
+            let o = prog[k] * prog[k];
+            let mut v = if k >= d { 0.7 * prog[k - d] * prog[k - d] } else { 0.0 };
+            if k == 1000 {
+                v = poison.unwrap_or(v);
+            }
+            e.push(o, v);
+            if k % 512 == 511 {
+                e.end_block();
+            }
+        }
+        e.delay()
+    };
+    assert_eq!(run(None), Some(d as u32), "control: the estimator locks");
+    for p in [f32::NAN, f32::INFINITY] {
+        assert_eq!(run(Some(p)), Some(d as u32), "one {p} sense frame 5 s earlier");
+    }
+}
+
+/// The spp3 view of FINDING 12: one call of NaN sense, then valid sense
+/// delayed by a fixed amount; the unit should lock the delay as a fresh
+/// unit does.
+#[test]
+#[ignore = "FINDING 12 (lane B): one NaN sense frame stops the delay estimator for good"]
+fn spp3_sense_delay_survives_a_nan_sense_call() {
+    let p = spp3_minimal(1.0);
+    let x = signal(21, 1, 48_000 * 8, 0.8, Hostility::Clean);
+    let s = synth_sense(&x, 2, 1536);
+    let fresh = {
+        let mut u = spp3::Unit::new(p);
+        render(&mut u, &x, Some(&s), &[512], &mut no_sense, false);
+        u.sense_delay()
+    };
+    assert!(fresh.is_some(), "control: a fresh unit locks the sense delay");
+    let mut u = spp3::Unit::new(p);
+    render(
+        &mut u,
+        &x,
+        Some(&s),
+        &[512],
+        &mut |call| if call == 2 { Sense::Fill(f32::NAN) } else { Sense::Valid },
+        false,
+    );
+    assert_eq!(u.sense_delay(), fresh, "after one NaN sense call");
+}
+
+/// Property 7 on the paths added since the first rt_alloc test: atsp
+/// host-block mode, the spp3 closed loop through every sense dropout, lsm2
+/// with runtime budgets, and `save_state` (called by the plugin after every
+/// `process`), at every awkward call size.
+#[test]
+fn rt_alloc_covers_the_new_paths() {
+    let mut a = atsp_params(4, 4, 512, 48_000, true);
+    a.block_frames = 0;
+    let mut cl = spp3_cl();
+    cl.ch[0].tlim_adj_cap = 10.0;
+    let mut l = lsm2_params(4, 2, 48_000, true);
+    l.runtime_budget_present = 1;
+    let units: Vec<(Box<dyn ProtectionUnit>, usize, usize)> = vec![
+        (Box::new(atsp::Unit::new(a)), 4, 0),
+        (Box::new(spp3::Unit::new(cl)), 1, 2),
+        (Box::new(spp3::Unit::new(spp3_params(9, 6, 512, 48_000, Ff::Mixed, true))), 6, 12),
+        (Box::new(lsm2::Unit::new(l)), 2, 0),
+    ];
+    for (mut u, n, ports) in units {
+        assert!(!u.is_failsafe_unit(), "{:?} built as the fail-safe", u.kind());
+        let x = signal(5, n, 48_000 * 2, 1.5, Hostility::Wild);
+        let s = synth_sense(&x, ports, 0);
+        let mut r = Rng(3);
+        // render asserts zero allocations in process, telemetry and save_state
+        render(u.as_mut(), &x, Some(&s), &[1, 7, 64, 255, 256, 257, 4096], &mut |_| sense_mode(&mut r), false);
+    }
+}
+
+trait FailSafeUnit {
+    fn is_failsafe_unit(&self) -> bool;
+}
+
+impl FailSafeUnit for Box<dyn ProtectionUnit> {
+    fn is_failsafe_unit(&self) -> bool {
+        let mut t = Telemetry::new();
+        self.telemetry(&mut t);
+        t.health.0 & Health::NO_PARAMS != 0
     }
 }

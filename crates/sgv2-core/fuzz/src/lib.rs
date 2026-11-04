@@ -35,7 +35,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
 use arbitrary::{Result, Unstructured};
-use sgv2_core::{Health, Io, ProtectionUnit, Telemetry, FAILSAFE_GAIN};
+use sgv2_core::{HandOff, Health, Io, ProtectionUnit, Telemetry, FAILSAFE_GAIN};
 
 pub use arbitrary;
 
@@ -245,6 +245,7 @@ pub fn render(
     let mut out = vec![vec![0.0f32; len]; x.len()];
     let mut t = Telemetry::new();
     let mut scratch: Vec<Vec<f32>> = sense.to_vec();
+    let mut handoff = HandOff::EMPTY;
     let mut done = 0;
     let mut call = 0;
     while done < len {
@@ -266,7 +267,8 @@ pub fn render(
         let before = allocs();
         let _h: Health = unit.process(Io { frames: m, input: &ins, sense: &sns, output: &mut outs });
         unit.telemetry(&mut t);
-        assert_eq!(allocs(), before, "{:?} allocated in process/telemetry ({m} frames)", unit.kind());
+        let _ = unit.save_state(&mut handoff);
+        assert_eq!(allocs(), before, "{:?} allocated in process/telemetry/save_state ({m} frames)", unit.kind());
         drop(outs);
         done += m;
         call += 1;
@@ -580,6 +582,7 @@ pub fn block(u: &mut Unstructured) -> Result<u32> {
 // ---------------------------------------------------------------------------
 // The spp3 hard-path oracle (the same as in tests/adversarial.rs).
 
+/// The spp3 hard-path oracle; see `HardOracle` in `tests/adversarial.rs`.
 pub struct Spp3HardOracle {
     amb: f64,
     k_dez: f64,
@@ -693,7 +696,8 @@ impl Spp3HardOracle {
             for &v in x[c.src] {
                 c.hist.push_back(v);
                 let d = if c.look == 0 { c.hist.pop_back().unwrap() } else { c.hist.pop_front().unwrap() };
-                let d = if d.is_finite() { d as f64 } else { 0.0 };
+                // the program is held to full scale before the meters
+                let d = if d.is_finite() { d.clamp(-1.0, 1.0) as f64 } else { 0.0 };
                 acc += d * d;
             }
             let p = c.elec * acc / frames as f64;
@@ -731,16 +735,20 @@ impl Spp3HardOracle {
                 continue;
             }
             any = true;
+            // without the feed-forward there is no virtual coil: the hard
+            // path holds the fixed 20 dB
+            if c.ff.is_none() {
+                self.allowed[c.group] = self.allowed[c.group].min(FAILSAFE_GAIN as f64);
+                continue;
+            }
             let theta_mg = mag - self.amb;
-            let vcff = match c.ff {
-                Some(_) => c.theta_ff * (1.0 - 1e-4) - 1e-6,
-                None => (t_ol - mag) - 1e-4 * t_ol.abs().max(1.0),
-            };
+            let vcff = c.theta_ff * (1.0 - 1e-4) - 1e-6;
             if vcff + 1.0 <= 0.0 {
                 continue;
             }
             let num = c.limit - 5.0 - self.amb - theta_mg + 1e-4 * (c.limit.abs() + mag.abs() + 1.0);
-            let g_hard = (num / (vcff + 1.0)).clamp(0.01, 1.0).sqrt();
+            // ratio floor 1e-4: a 0.01 (-40 dB) gain floor
+            let g_hard = (num / (vcff + 1.0)).clamp(1e-4, 1.0).sqrt();
             self.allowed[c.group] = self.allowed[c.group].min(g_hard);
         }
         if any {
