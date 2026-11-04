@@ -732,7 +732,7 @@ impl ProtectionUnit for Unit {
     fn process(&mut self, mut io: Io<'_, '_>) -> Health {
         let frames = io.frames;
         let Some(run) = self.run.as_mut() else {
-            failsafe(&mut io);
+            failsafe_io(&mut io);
             return Health(Health::FAILSAFE | Health::NO_PARAMS);
         };
         // The initialised channel count must match the audio.
@@ -742,7 +742,7 @@ impl ProtectionUnit for Unit {
             || !io.input.iter().all(|b| fits(b))
             || !io.output.iter().all(|b| fits(b))
         {
-            failsafe(&mut io);
+            failsafe_io(&mut io);
             return Health(Health::FAILSAFE | Health::CHANNEL_MISMATCH);
         }
         let mut health = 0u32;
@@ -800,7 +800,7 @@ impl ProtectionUnit for Unit {
 }
 
 /// 20 dB on whatever geometry the host gave, never indexing past a buffer.
-fn failsafe(io: &mut Io<'_, '_>) {
+pub(crate) fn failsafe_io(io: &mut Io<'_, '_>) {
     let frames = io.frames;
     for (c, out) in io.output.iter_mut().enumerate() {
         let n = frames.min(out.len());

@@ -9,7 +9,7 @@
 
 use std::time::Instant;
 
-use sgv2_core::{placeholder, spp3, FailSafe, Health, Io, ProtectionUnit, UnitKind};
+use sgv2_core::{lsm2, placeholder, spp3, FailSafe, Health, Io, ProtectionUnit, UnitKind};
 
 const RATE: u32 = 48_000;
 
@@ -44,6 +44,62 @@ fn spp3_params(n: usize) -> spp3::Params {
             sense_i: 2 * c as u32,
             sense_v: 2 * c as u32 + 1,
             ..Default::default()
+        };
+    }
+    p
+}
+
+fn lsm2_params() -> lsm2::Params {
+    let mut p = lsm2::Params {
+        channels: 2,
+        sample_rate: RATE,
+        enable_mitigation: 1,
+        control_sample_peak: 1,
+        control_displacement: 1,
+        control_velocity: 1,
+        control_power: 1,
+        control_temperature: 1,
+        link_slow_gains: 1,
+        model_only: 1,
+        attack_time_ms: 2.0,
+        fast_release_time_ms: 150.0,
+        slow_release_time_ms: 10_000.0,
+        filterbank_latency_ms: 2.5,
+        speaker_response_lookahead_ms: 1.0,
+        power_time_scale_s: [0.002, 0.2, 2.0, 30.0],
+        power_hard_limit_w: [50.0, 20.0, 2.0, 1.5],
+        power_soft_limit_pct: [100.0; 4],
+        max_power_attenuation_db: 4.0,
+        low_rail_power_ratio: 1.0,
+        ..lsm2::Params::default()
+    };
+    for c in 0..2 {
+        p.ch[c] = lsm2::ChannelParams {
+            source: c as u32,
+            volts_full_scale: 6.0,
+            parasitic_resistance: 0.2,
+            rdc: 4.0,
+            bl: 0.8,
+            mms_kg: 0.0002,
+            rms: 0.2,
+            kms: 1500.0,
+            disp_bl: 0.8,
+            disp_mms_kg: 0.00022,
+            disp_rms: 0.25,
+            disp_kms: 1600.0,
+            rth_vc: 30.0,
+            tau_vc: 2.0,
+            rth_mag: 20.0,
+            tau_mag: 60.0,
+            ambient: 40.0,
+            amplitude_limit: 1.0,
+            displacement_limit: 0.0005,
+            velocity_limit0: 0.5,
+            max_velocity_attenuation_db: 18.0,
+            temperature_soft_limit: 110.0,
+            temperature_hard_limit: 125.0,
+            temperature_headroom: 4.0,
+            max_temperature_attenuation_db: 10.0,
         };
     }
     p
@@ -127,6 +183,9 @@ fn main() {
         results.push(bench("spp3-no-sense", &mut u, 6, 0, q, seconds));
         let mut u = spp3::Unit::new(spp3_params(2));
         results.push(bench("spp3", &mut u, 2, 4, q, seconds));
+        let mut u = lsm2::Unit::new(lsm2_params());
+        assert!(!u.is_failsafe());
+        results.push(bench("lsm2", &mut u, 2, 0, q, seconds));
         let mut u = placeholder::Unit::new(placeholder::Params { channels: 6, ..Default::default() });
         results.push(bench("placeholder", &mut u, 6, 12, q, seconds));
         let mut u = FailSafe::new(UnitKind::Spp3, Health::NO_PARAMS);
