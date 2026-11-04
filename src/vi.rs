@@ -26,6 +26,7 @@ pub struct Model {
     magnet_hold: f32,
     pub gain: f32,
     min_gain: f32,
+    within_limit: bool,
     spec: Speaker,
 }
 impl Model {
@@ -41,12 +42,14 @@ impl Model {
             magnet_hold: 0.0,
             gain: 0.0,
             min_gain: (10.0 * (max_power / peak_power).log10()).min(0.0),
+            within_limit: false,
             spec: s.clone(),
         };
         m.assume_hot();
         m
     }
     fn assume_hot(&mut self) {
+        self.within_limit = false;
         let hard = self.spec.t_limit + self.spec.t_headroom;
         self.coil = self.coil.max(hard);
         self.magnet = self.magnet.max(hard);
@@ -63,27 +66,40 @@ impl Model {
         let am = (step / (s.tau_magnet as f32 + step)) as f64;
         let hard = (s.t_limit as f32 + s.t_headroom as f32) as f64;
         let mut power_sum = 0f32;
+        self.within_limit = true;
+        let (mut coil_crossed, mut magnet_crossed, mut negative_after) = (false, false, false);
         for frame in words.chunks_exact(cfg.globals.channels) {
             let v = (frame[s.vs_chan] >> 16) as f32 / 32768.0 * s.vs_scale as f32;
             let i = (frame[s.is_chan.ok_or("missing current sense")?] >> 16) as f32 / 32768.0
                 * s.is_scale as f32;
             let power = v * i;
+            negative_after |= (coil_crossed || magnet_crossed) && power < -1e-3;
             let tc = self.magnet + (power * s.tr_coil as f32) as f64;
             let tm = (cfg.globals.t_ambient as f32 + power * s.tr_magnet as f32) as f64;
             self.coil = tc * ac + self.coil * (1.0 - ac);
             self.magnet = tm * am + self.magnet * (1.0 - am);
-            if !self.coil.is_finite()
-                || !self.magnet.is_finite()
-                || self.coil > hard
-                || self.magnet > hard
-            {
-                return Err("thermal hard limit");
+            if !self.coil.is_finite() || !self.magnet.is_finite() {
+                return Err("nonfinite thermal state");
             }
+            coil_crossed |= self.coil > hard;
+            magnet_crossed |= self.magnet > hard;
+            self.within_limit &= !coil_crossed && !magnet_crossed;
             power_sum += power;
         }
         let mean = power_sum / (words.len() / cfg.globals.channels) as f32;
         if !mean.is_finite() || mean < -0.01 {
             return Err("invalid V/I power");
+        }
+        // After a hard crossing, negative V*I cannot establish recovery:
+        // the original daemon would already have faulted. Preserve the hot
+        // bound rather than crediting reactive negative power after it.
+        if negative_after {
+            if coil_crossed {
+                self.coil = self.coil.max(hard);
+            }
+            if magnet_crossed {
+                self.magnet = self.magnet.max(hard);
+            }
         }
         self.coil_hold = self
             .coil_hold
@@ -253,8 +269,23 @@ impl ViGuard {
             }
         }
         self.models = next;
-        self.fresh = self.fresh.saturating_add(1);
         self.last_data = Some(hw.now());
+        if self.models.iter().any(|m| !m.within_limit) {
+            self.fresh = 0;
+            if self.armed {
+                hw.relinquish()?;
+                hw.set_min()?;
+                self.armed = false;
+                warn!(
+                    "measured V/I capped: thermal hard limit; retaining measured cooling history"
+                );
+            }
+            // Complete valid V/I remains useful while capped. In particular,
+            // positive sensor noise on the first sample at (150,150) must
+            // not discard an otherwise cooling period and reset it forever.
+            return Ok(());
+        }
+        self.fresh = self.fresh.saturating_add(1);
         // Model queued complete periods too, but never grant on a backlog.
         if self.fresh < 2 || queued >= self.cfg.globals.period as u64 {
             return Ok(());
@@ -344,6 +375,43 @@ mod tests {
         advance(&mut h, &mut g, 6);
         assert!(g.armed);
     }
+    #[test]
+    fn vi_only_hot_start_sensor_noise_cools_without_reset_or_early_unlock() {
+        let (mut h, mut g) = fixture();
+        h.tweak = Some(Box::new(|_, w| {
+            for frame in w.chunks_exact_mut(8) {
+                for k in 0..4 {
+                    frame[k * 2] = 9 << 16;
+                    frame[k * 2 + 1] = 7 << 16;
+                }
+            }
+        }));
+        while h.delivered < 1 {
+            g.tick(&mut h).unwrap();
+        }
+        assert!(!g.armed && g.fresh == 0 && h.pings.is_empty());
+        assert!(g.models.iter().all(|m| m.coil < 150.0 && m.magnet < 150.0));
+        advance(&mut h, &mut g, 8);
+        assert!(g.armed);
+    }
+    #[test]
+    fn vi_only_hot_fault_preserves_known_heat_and_does_not_renew() {
+        let (mut h, mut g) = fixture();
+        advance(&mut h, &mut g, 8);
+        assert!(g.armed);
+        for m in &mut g.models {
+            m.coil = 151.0;
+            m.magnet = 151.0;
+        }
+        let pings = h.pings.len();
+        while g.armed {
+            g.tick(&mut h).unwrap();
+        }
+        assert_eq!(h.pings.len(), pings);
+        assert!(g.models.iter().all(|m| m.coil > 150.0 && m.magnet > 150.0));
+        assert_eq!(g.fresh, 0);
+    }
+
     #[test]
     fn vi_only_idle_never_unlocks() {
         let (mut h, mut g) = fixture();
@@ -506,7 +574,8 @@ mod boundaries {
             assert!(m.gain < 0.0 && m.coil < 150.0);
             m.coil = 151.0;
             m.magnet = 151.0;
-            assert!(m.period(&c, &words, 48000).is_err());
+            m.period(&c, &words, 48000).unwrap();
+            assert!(!m.within_limit);
         }
     }
 }

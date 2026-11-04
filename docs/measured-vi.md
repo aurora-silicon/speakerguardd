@@ -14,7 +14,12 @@ The active model uses `tr_*`, `tau_*`, `t_limit`, `t_headroom`, `z_nominal`,
 V/I channels/scales, ambient, window, hysteresis and the actual configured amp
 gain. `z_nominal` enters only the 2.0.1 ramp's minimum-gain formula; it is not
 an impedance validity gate. `r_ff`, `release_s`, and `vi_*` duplicates remain
-source metadata. No feed-forward thermal transfer is used. On J613, the ramp
+source metadata. No feed-forward thermal transfer is used. A complete period with a thermal
+hard crossing revokes the lease and clears admission freshness, while retaining
+its finite, validated V/I thermal history for cooling under the cap. Negative
+power after such a crossing cannot lower the crossed node below its hard bound.
+This avoids a hot-start/sensor-noise admission deadlock without a cold reset.
+Only two subsequent fully safe periods can re-admit. On J613, the ramp
 ends at 140 C and the absolute fault boundary is 150 C. The discrete sample
 math deliberately retains the original f32 coefficients and power conversion.
 The source is MIT speakersafetyd 2.0.1
