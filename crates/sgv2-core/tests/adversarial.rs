@@ -1170,11 +1170,11 @@ proptest! {
         check_hard_path(&mut u, &x, if blk == 0 { call } else { blk as usize }, &chans);
     }
 
-    /// lsm2 has no separate hard path; its temperature axis takes the full
-    /// `MaxTemperatureAttenuation` once the predicted coil temperature reaches
-    /// the soft limit, through `AttackTime`. Check the gain is at most that
-    /// floor (plus what the attack smoother has left) one controller interval
-    /// plus ten attack time constants after every update that engaged it.
+    /// lsm2's temperature axis follows spec 6.1's linear-in-dB knee from
+    /// the soft to the hard limit on the predicted coil temperature, through
+    /// `AttackTime`. Check the gain is at most the most permissive knee value
+    /// over the last controller interval plus ten attack time constants
+    /// (what the attack smoother can still be catching up on).
     #[test]
     fn lsm2_temperature_path_reaches_its_floor(
         seed in any::<u64>(), n in 1usize..=4, secs in 1.0f64..6.0, amp in 0.5f32..2.0,
@@ -1188,28 +1188,33 @@ proptest! {
         let mut u = lsm2::Unit::new(p);
         let settle = 256 + (10.0 * p.attack_time_ms as f64 * 1e-3 * rate as f64) as usize;
         let rr = render(&mut u, &x, None, &[256], &mut no_sense, true);
-        // per host channel: (frame engaged, floor)
-        let mut engaged: Vec<Option<(usize, f32)>> = vec![None; n];
-        for (done, t) in &rr.tele {
+        let knee = |c: &lsm2::ChannelParams, t: f32| -> f64 {
+            let (soft, hard) = (c.temperature_soft_limit as f64, c.temperature_hard_limit as f64);
+            let z = ((t as f64 + c.temperature_headroom as f64 - soft) / (hard - soft)).clamp(0.0, 1.0);
+            10f64.powf(-(c.max_temperature_attenuation_db as f64) * z / 20.0)
+        };
+        let window = settle.div_ceil(256) + 1;
+        for (k, (done, t)) in rr.tele.iter().enumerate() {
+            if *done < settle || k < window {
+                continue;
+            }
             for c in &p.ch[..n] {
-                let s = &t.channels[c.source as usize];
-                let floor = 10f32.powf(-c.max_temperature_attenuation_db / 20.0);
-                let margin = s.coil_temp_c + c.temperature_headroom - c.temperature_soft_limit;
-                let e = &mut engaged[c.source as usize];
-                // f32 telemetry: a boundary within rounding is undecided
-                if margin.abs() < 1e-3 * c.temperature_soft_limit.abs().max(1.0) {
-                    *e = None;
+                // a step knee (equal limits) is undecided within rounding
+                if c.temperature_hard_limit - c.temperature_soft_limit < 1e-3 {
                     continue;
                 }
-                match (*e, margin > 0.0) {
-                    (None, true) => *e = Some((*done, floor)),
-                    (Some(_), false) => *e = None,
-                    (Some((at, f)), true) if *done >= at + settle => {
-                        let tol = f * 1e-4 + (1.0 - f) * 1e-4 + 1e-6;
-                        prop_assert!(s.gain <= f + tol, "lsm2 temperature floor {} not reached: gain {}", f, s.gain);
-                    }
-                    _ => {}
+                let s = &t.channels[c.source as usize];
+                let mut most = 0.0f64;
+                for (_, w) in &rr.tele[k - window..=k] {
+                    let tw = w.channels[c.source as usize].coil_temp_c;
+                    // f32 telemetry: allow the knee's slope over 0.01 K
+                    most = most.max(knee(c, tw + 0.01)).max(knee(c, tw - 0.01));
                 }
+                let tol = 1e-4;
+                prop_assert!(
+                    s.gain as f64 <= most + tol,
+                    "lsm2 temperature knee {} not reached: gain {} at {} C", most, s.gain, s.coil_temp_c
+                );
             }
         }
     }
@@ -1884,7 +1889,6 @@ fn hostile_but_valid_blobs_do_not_pass_through() {
 /// `MaxTemperatureAttenuation = 0 dB` (accepted) the coil runs past the hard
 /// limit at unity gain.
 #[test]
-#[ignore = "FINDING 8 (decision for lane B): lsm2 never enforces TemperatureHardLimit"]
 fn lsm2_enforces_the_hard_temperature_limit() {
     let mut p = lsm2_params(3, 1, 48_000, true);
     (p.control_sample_peak, p.control_displacement, p.control_velocity, p.control_power) = (0, 0, 0, 0);
