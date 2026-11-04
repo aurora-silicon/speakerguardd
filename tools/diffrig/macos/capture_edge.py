@@ -351,7 +351,8 @@ def run_case(c, outroot, force=False):
             cl = decode_clsp(os.path.join(d, "logs"), nch)
             # the thermal cadence is 256 frames at 44.1 and 48 kHz and 512 at 96 kHz (observed)
             per = 256 * max(1, round(c.get("sr", SR) / SR))
-            want = (int(expect_frames // (2 * per)), int(expect_frames // per))
+            # T_Coil is one record per render call (host slice); Reb_Data one per thermal update
+            want = (int(expect_frames // q), int(expect_frames // per))
             got = (cl["T_Coil"][1], cl["Reb_Data"][1])
             if all(n >= want[0] for n in got[0]) and all(n >= want[1] for n in got[1]):
                 break
