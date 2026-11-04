@@ -512,7 +512,7 @@ const PDRV_WITH_HEADROOM: bool = false;
 /// 271.57 / 266.49 from the spec formula on the synthetic SpTS). Until then
 /// the corrected limit is capped at the base: never less protective than
 /// macOS.
-const CL_RELAXATION: bool = false;
+const CL_RELAXATION: bool = true;
 /// TODO(SPEC): see the coil-power metering in `Run::segment`.
 const PCOIL_WITH_PILOT: bool = true;
 
@@ -645,7 +645,10 @@ struct Cl {
     reb_max: f64,
     cal_r: f64,
     cal_t: f64,
-    inv_temp_co: f64,
+    /// `invTempCo` and the series resistance, Float32 as the reference
+    /// keeps them.
+    inv_temp_co: f32,
+    rshunt: f32,
     cap: f64,
     k_lim: f64,
     /// The latest completed window passed every gate.
@@ -705,9 +708,16 @@ impl Cl {
         if !(c.temp_sense_smoothing_tau_s > 0.0 && c.tlim_err_decay_time_s > 0.0 && c.rdc_scale > 0.0) {
             return None;
         }
+        // alpha interpolated at T_cal in double from the Float32 inputs,
+        // its reciprocal stored as Float32 (spec 7; rig law 3)
         let (a20, a35) = (c.a_t_20c as f64, c.a_t_35c as f64);
         let alpha = a20 + (tc - 20.0) * (a35 - a20) / 15.0;
         if !(alpha.is_finite() && alpha > 0.0) {
+            return None;
+        }
+        let inv_temp_co = (1.0 / alpha) as f32;
+        // the temperature ratio is of the coil resistance net of Rshunt
+        if !(inv_temp_co.is_finite() && c.cal_r - c.rshunt > 0.0) {
             return None;
         }
         let (vs, is) = (c.vmon_scale as f64, c.imon_scale as f64);
@@ -730,11 +740,8 @@ impl Cl {
             reb_max: c.reb_range_max as f64,
             cal_r: rc,
             cal_t: tc,
-            // TODO(SPEC): the rig's CL goldens (synthetic SpTS 3.3 / 3.75 ohm
-            // at 25 C) log T_CL exactly linear in the logged resistance with
-            // invTempCo 279.18 (woofer) and 273.04 (tweeter); this formula
-            // gives 271.57 and 266.49.
-            inv_temp_co: 1.0 / alpha,
+            inv_temp_co,
+            rshunt: c.rshunt,
             cap: c.tlim_adj_cap.max(0.0) as f64,
             k_lim: settle99(c.tlim_err_decay_time_s as f64, r),
             valid: false,
@@ -795,7 +802,13 @@ impl Cl {
         let r = libm::sqrt(pv / pi);
         self.r_window = r;
         self.r_s += self.k_r * (r - self.r_s);
-        let t = self.cal_t + (self.rdc_scale * self.r_s / self.cal_r - 1.0) * self.inv_temp_co;
+        // T_CL = fmaf(invTempCo, (Rw - Rshunt)/(R_cal - Rshunt) - 1, T_cal) in
+        // Float32, Rw the smoothed window resistance times RdcScale (rig
+        // law 3: bit-exact on 630 accepted windows over 10 configurations)
+        let rw = (self.rdc_scale * self.r_s) as f32;
+        let (rc, rs) = (self.cal_r as f32, self.rshunt);
+        let x = (rw - rs) / (rc - rs) - 1.0;
+        let t = libm::fmaf(self.inv_temp_co, x, self.cal_t as f32) as f64;
         // a window outside the range still publishes its temperature; the
         // range test is on the instantaneous window resistance
         let re = self.rdc_scale * r;
