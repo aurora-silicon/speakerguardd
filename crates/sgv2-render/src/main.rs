@@ -31,7 +31,7 @@ use std::process::ExitCode;
 
 use sgv2_core::blob::Header;
 use sgv2_core::{
-    atsp, lsm2, spp3, ChannelState, FailSafe, Health, Io, ProtectionUnit, Telemetry, UnitKind, MAX_CHANNELS,
+    atsp, lsm2, spp3, ChannelState, FailSafe, HandOff, Health, Io, ProtectionUnit, Telemetry, UnitKind, MAX_CHANNELS,
 };
 
 struct Args {
@@ -46,8 +46,8 @@ struct Args {
     out: Option<String>,
     audio_out: Option<String>,
     cfprops: Vec<(u32, String)>,
-    /// Frames at which the host calls `host_reset` (AudioUnitReset).
-    resets: Vec<usize>,
+    /// Host events by frame (`--events`), in order.
+    events: Vec<(usize, Event)>,
 }
 
 fn usage() -> ExitCode {
@@ -72,7 +72,7 @@ fn parse_args() -> Option<Args> {
         out: None,
         audio_out: None,
         cfprops: Vec::new(),
-        resets: Vec::new(),
+        events: Vec::new(),
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -96,13 +96,7 @@ fn parse_args() -> Option<Args> {
             "--events" => {
                 for e in v.split(',').filter(|e| !e.is_empty()) {
                     let (f, what) = e.split_once(':')?;
-                    // sleep and tsjump are host wall-clock events: an offline
-                    // render has no wall clock (the reference ignores them too)
-                    if what == "reset" {
-                        a.resets.push(f.parse().ok()?);
-                    } else if !(what.starts_with("sleep=") || what.starts_with("tsjump=")) {
-                        return None;
-                    }
+                    a.events.push((f.parse().ok()?, Event::parse(what)?));
                 }
             }
             "--cfprop" => {
@@ -222,10 +216,44 @@ fn open_out(p: &Option<String>) -> io::Result<Option<BufWriter<File>>> {
     p.as_ref().map(|p| File::create(p).map(BufWriter::new)).transpose()
 }
 
+/// A host event of the rig (`rig_host --event FRAME:WHAT`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Event {
+    /// `AudioUnitReset`: the unit's `host_reset`.
+    Reset,
+    /// Wall-clock idle before the next call, s. No thermal time passes in
+    /// the render (the reference ignores it too), but a following rebuild
+    /// ages its hand-off record by it.
+    Sleep(f64),
+    /// A render-timestamp jump, or a ClassInfo get/set: no effect.
+    None,
+    /// `uninit`/`reinit`/`newinst`/`newinst_ci` with an optional 64007
+    /// value: the kernel is rebuilt with that start state (the strip's when
+    /// absent); under 0 it restores the hand-off record of the last update.
+    Rebuild(Option<u32>),
+}
+
+impl Event {
+    fn parse(what: &str) -> Option<Event> {
+        let (k, v) = what.split_once('=').map_or((what, None), |(k, v)| (k, Some(v)));
+        Some(match k {
+            "reset" => Event::Reset,
+            "sleep" => Event::Sleep(v?.parse().ok()?),
+            "tsjump" | "classinfo" => Event::None,
+            "uninit" | "reinit" | "newinst" | "newinst_ci" => Event::Rebuild(v.map(|v| v.parse()).transpose().ok()?),
+            _ => return None,
+        })
+    }
+}
+
+/// Rebuilds the unit for an [`Event::Rebuild`]; `None` when the unit kind
+/// has no rebuild model.
+type Rebuild<'a> = &'a dyn Fn(Option<u32>) -> Option<Box<dyn ProtectionUnit>>;
+
 /// Render the whole program, writing trace lines and audio as it goes.
 #[allow(clippy::too_many_arguments)]
 fn render(
-    unit: &mut dyn ProtectionUnit,
+    unit: &mut Box<dyn ProtectionUnit>,
     params: &str,
     kind: UnitKind,
     case: &str,
@@ -233,7 +261,8 @@ fn render(
     sense: &[Vec<f32>],
     slices: &[usize],
     cfprops: &[u32],
-    resets: &[usize],
+    events: &[(usize, Event)],
+    rebuild: Rebuild<'_>,
     trace: &mut dyn Write,
     mut audio: Option<&mut dyn Write>,
 ) -> io::Result<()> {
@@ -248,13 +277,31 @@ fn render(
     let cfprop_ids: Vec<String> = cfprops.iter().map(u32::to_string).collect();
     let cfprop_ids = cfprop_ids.join(",");
     let (mut pos, mut k) = (0usize, 0usize);
+    let mut gap = 0.0f64;
     while pos < frames {
-        if resets.contains(&pos) {
-            unit.host_reset();
+        for (_, e) in events.iter().filter(|(f, _)| *f == pos) {
+            match *e {
+                Event::Reset => unit.host_reset(),
+                Event::Sleep(s) => gap += s,
+                Event::None => {}
+                Event::Rebuild(p) => {
+                    let mut rec = HandOff::EMPTY;
+                    let saved = unit.save_state(&mut rec);
+                    let new = rebuild(p).ok_or_else(|| io::Error::other("no rebuild model for this unit"))?;
+                    *unit = new;
+                    // only 64007 = 0 restores the record (rig law 6)
+                    if p == Some(0) && saved {
+                        unit.restore_state(&rec, gap);
+                    }
+                }
+            }
+        }
+        if events.iter().any(|(f, _)| *f == pos) {
+            gap = 0.0;
         }
         let mut n = slices[k % slices.len()].min(frames - pos);
-        // a reset inside a slice splits it, as the host's reset falls between calls
-        if let Some(&r) = resets.iter().find(|&&r| r > pos && r < pos + n) {
+        // an event inside a slice splits it, as host events fall between calls
+        if let Some(&(r, _)) = events.iter().find(|(r, _)| *r > pos && *r < pos + n) {
             n = r - pos;
         }
         k += 1;
@@ -316,6 +363,20 @@ fn run(a: &Args) -> io::Result<()> {
     }
     let cfprop_ids: Vec<u32> = a.cfprops.iter().map(|(id, _)| *id).collect();
     let (mut unit, params) = make_unit(a.unit, blob.as_deref());
+    let kind = a.unit;
+    let rebuild = |p: Option<u32>| -> Option<Box<dyn ProtectionUnit>> {
+        let b = blob.as_deref()?;
+        match kind {
+            UnitKind::Spp3 => {
+                let mut q = spp3::Params::from_blob(b).ok()?;
+                if let Some(v) = p {
+                    q.thermal_state_override = v;
+                }
+                Some(Box::new(spp3::Unit::new(q)))
+            }
+            _ => None,
+        }
+    };
     let mut stdout_trace;
     let mut file_trace = open_out(&a.out)?;
     let trace: &mut dyn Write = match file_trace.as_mut() {
@@ -327,7 +388,7 @@ fn run(a: &Args) -> io::Result<()> {
     };
     let mut audio = open_out(&a.audio_out)?;
     render(
-        unit.as_mut(),
+        &mut unit,
         &params,
         a.unit,
         &a.case,
@@ -335,7 +396,8 @@ fn run(a: &Args) -> io::Result<()> {
         &sense,
         &a.slices,
         &cfprop_ids,
-        &a.resets,
+        &a.events,
+        &rebuild,
         trace,
         audio.as_mut().map(|w| w as &mut dyn Write),
     )
@@ -386,7 +448,7 @@ mod tests {
             let mut trace = Vec::new();
             let mut audio = Vec::new();
             render(
-                unit.as_mut(),
+                &mut unit,
                 &params,
                 UnitKind::Lsm2,
                 "t",
@@ -395,6 +457,7 @@ mod tests {
                 slices,
                 &[64009, 7],
                 &[],
+                &|_| None,
                 &mut trace,
                 Some(&mut audio),
             )
@@ -436,7 +499,7 @@ mod tests {
             out: Some(out.to_string_lossy().into_owned()),
             audio_out: None,
             cfprops: vec![(64009, fixture.to_string_lossy().into_owned())],
-            resets: Vec::new(),
+            events: Vec::new(),
         };
         run(&a).unwrap();
         let text = std::fs::read_to_string(&out).unwrap();
@@ -445,6 +508,19 @@ mod tests {
         a.cfprops.push((7, dir.join("absent.json").to_string_lossy().into_owned()));
         assert!(run(&a).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn host_events_parse() {
+        assert_eq!(Event::parse("reset"), Some(Event::Reset));
+        assert_eq!(Event::parse("sleep=2"), Some(Event::Sleep(2.0)));
+        assert_eq!(Event::parse("tsjump=240000"), Some(Event::None));
+        assert_eq!(Event::parse("classinfo"), Some(Event::None));
+        assert_eq!(Event::parse("newinst=0"), Some(Event::Rebuild(Some(0))));
+        assert_eq!(Event::parse("uninit"), Some(Event::Rebuild(None)));
+        assert_eq!(Event::parse("newinst_ci=1"), Some(Event::Rebuild(Some(1))));
+        assert_eq!(Event::parse("bogus"), None);
+        assert_eq!(Event::parse("sleep"), None);
     }
 
     #[test]
