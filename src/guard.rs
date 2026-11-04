@@ -156,6 +156,8 @@ fn add_candidate(set: &mut Vec<(f64, f64)>, r: (f64, f64)) {
 
 /// What the loop needs from the machine.
 pub trait Hw {
+    fn protection_epoch(&mut self) -> io::Result<Option<u32>> { Ok(None) }
+    fn ping_epoch(&mut self, _epoch:u32) -> io::Result<()> { Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP)) }
     fn now(&self) -> Instant;
     /// Time since boot, suspend included (CLOCK_BOOTTIME).
     fn boottime(&self) -> Duration;
@@ -686,6 +688,7 @@ impl Guard {
         if !max_reduction.is_finite() || max_reduction <= 0.0 {
             return Err("maximum reduction must be finite and positive".into());
         }
+        if cfg.globals.measured_vi {return Err("measured_vi must use ViGuard, never the predictive guard".into());}
         // the unified governor's opt-in, an unqualified machine's, and the
         // asahi governor's sense, before the card is touched
         cfg.check_governor()?;
@@ -2772,6 +2775,8 @@ pub mod fake {
         pub rate_value: Option<i64>,
         pub capture_errno: Option<i32>,
         pub capture_short: bool,
+        pub protection_epoch: u32,
+        pub suspend_on_ping: bool,
         /// Volume writes fail (EIO) at time t, the card keeping its value.
         pub volume_fail: Box<dyn Fn(Duration) -> bool>,
         /// A late read finds only the newest period: the frames before it
@@ -2862,6 +2867,8 @@ pub mod fake {
                 rate_value: None,
                 capture_errno: None,
                 capture_short: false,
+                protection_epoch: 1,
+                suspend_on_ping: false,
                 volume_fail: Box::new(|_| false),
                 lossy: false,
                 last_end: Duration::ZERO,
@@ -3077,6 +3084,15 @@ pub mod fake {
     }
 
     impl Hw for FakeHw {
+        fn protection_epoch(&mut self)->io::Result<Option<u32>> {Ok(Some(self.protection_epoch))}
+        fn ping_epoch(&mut self, epoch:u32)->io::Result<()> {
+            if std::mem::take(&mut self.suspend_on_ping) {
+                self.protection_epoch+=1;
+                self.lease_left=Duration::ZERO;self.last_ok_ping=None;
+            }
+            if epoch!=self.protection_epoch {return Err(io::Error::from_raw_os_error(libc::ESTALE));}
+            self.ping()
+        }
         fn stamp(&self) -> crate::boot::Stamp {
             self.stamp.clone()
         }

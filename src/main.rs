@@ -33,6 +33,7 @@ mod record;
 mod startup;
 mod state;
 mod stats;
+mod vi;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -256,6 +257,7 @@ struct Card {
     /// order, on cards that have them (V/I machines).
     per_speaker: Option<Vec<ElemId>>,
     unlock: ElemId,
+    epoch: Option<ElemId>,
     sample_rate: ElemId,
     energy: Option<ElemId>,
     /// Subscribed to the card's change events: the sample-rate control's
@@ -273,6 +275,10 @@ impl Card {
             return Err(format!("card {name} has no {:?} control", cfg.controls.volume).into());
         }
         let unlock = ctl.find_one(&cfg.controls.unlock)?;
+        let epoch = ctl.find("Speaker Protection Epoch")?.into_iter().next();
+        if cfg.globals.measured_vi && epoch.is_none() {
+            return Err("measured_vi requires the paired kernel Speaker Protection Epoch control".into());
+        }
         let sample_rate = ctl.find_one(&cfg.controls.sample_rate)?;
         let energy = match ctl.find_one("Speaker Energy Grant") {
             Ok(id) => Some(id),
@@ -320,7 +326,7 @@ impl Card {
                 false
             }
         };
-        Ok((Card { ctl, volume, volume_max: None, volume_min: 0, locked_max: None, per_speaker, unlock, sample_rate, energy, events, rate_event: false }, name))
+        Ok((Card { ctl, volume, volume_max: None, volume_min: 0, locked_max: None, per_speaker, unlock, epoch, sample_rate, energy, events, rate_event: false }, name))
     }
 
     /// Take the interlock: every volume control first, then the unlock
@@ -331,6 +337,7 @@ impl Card {
             self.ctl.lock(id)?;
         }
         self.ctl.lock(&self.unlock)?;
+        if let Some(epoch)=&self.epoch {self.ctl.lock(epoch)?;}
         if let Some(id)=&self.energy { self.ctl.lock(id)?; }
         let locked = self.ctl.int_range(&self.volume[0])?;
         for id in &self.volume[1..] {
@@ -364,6 +371,10 @@ impl Card {
     /// lifted the limit.
     fn ping(&mut self) -> std::io::Result<()> {
         self.ctl.write_int(&self.unlock, UNLOCK_MAGIC)?;
+        self.discover_volume_range()
+    }
+
+    fn discover_volume_range(&mut self) -> std::io::Result<()> {
         if self.volume_max.is_none() {
             let range = self.ctl.int_range(&self.volume[0])?;
             if range.0 != self.volume_min || range.1 < range.0 {
@@ -448,6 +459,21 @@ impl RealHw {
 }
 
 impl Hw for RealHw {
+    fn protection_epoch(&mut self) -> std::io::Result<Option<u32>> {
+        self.card.epoch.as_ref().map(|id|self.card.ctl.read_int(id).and_then(|e|
+            u32::try_from(e).ok().filter(|e|*e>0).ok_or_else(||std::io::Error::from_raw_os_error(libc::EPROTO)))).transpose()
+    }
+    fn ping_epoch(&mut self, epoch:u32) -> std::io::Result<()> {
+        let id=*self.card.epoch.as_ref().ok_or_else(||std::io::Error::from_raw_os_error(libc::EOPNOTSUPP))?;
+        self.card.ctl.write_int(&id,i64::from(epoch))?;
+        self.card.discover_volume_range()?;
+        if self.card.ctl.read_int(&id)? != i64::from(epoch)
+            || self.card.ctl.read_int(&self.card.unlock)? != 1 {
+            self.card.volume_max=None;
+            return Err(std::io::Error::from_raw_os_error(libc::ESTALE));
+        }
+        Ok(())
+    }
     fn now(&self) -> Instant {
         Instant::now()
     }
@@ -666,6 +692,13 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let mut cfg = cfg;
     if args.persist_off {
         cfg.globals.boot_resume = config::BootResume::Latched;
+    }
+    if cfg.globals.measured_vi {
+        let mut guard=vi::ViGuard::start(&mut hw,&cfg)?;
+        loop {
+            if STOP.load(Ordering::Relaxed) {guard.stop(&mut hw)?;return Ok(());}
+            if let Err(e)=guard.tick(&mut hw) {let _=guard.stop(&mut hw);return Err(e);}
+        }
     }
     let mut guard = Guard::start_persist(&mut hw, &cfg, max_reduction, args.state.clone(), args.persist.clone())?;
     if let Some(path) = &args.record {

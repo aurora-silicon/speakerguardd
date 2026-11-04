@@ -68,6 +68,8 @@ pub enum SenseFormat {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Globals {
+    /// Closed-loop 2.0.1-compatible V/I runtime; no FF or impedance bound.
+    pub measured_vi: bool,
     /// Require fresh complete sense data before every admission.
     pub strict_admission: bool,
     /// The card's speaker sense PCM device number.
@@ -309,6 +311,7 @@ impl Config {
         let g = sections.get("Globals").ok_or_else(|| ConfigError("missing [Globals]".into()))?;
         let c = sections.get("Controls").ok_or_else(|| ConfigError("missing [Controls]".into()))?;
         let globals = Globals {
+            measured_vi: boolean(g, "Globals", "measured_vi", false)?,
             strict_admission: boolean(g, "Globals", "strict_admission", false)?,
             sense_pcm: num(g, "Globals", "sense_pcm")?,
             t_ambient: num(g, "Globals", "t_ambient")?,
@@ -566,6 +569,11 @@ impl Config {
     /// governor only.
     fn check_hardware(&self) -> Result<(), ConfigError> {
         let g = &self.globals;
+        if g.measured_vi && (g.governor != Governor::Asahi || g.guard.is_some()
+            || g.shadow || !g.strict_admission || g.sense_format != SenseFormat::S16
+            || self.speakers.iter().any(|s|s.z_min_override.is_some() || s.p_limit_1s!=0.0 || s.p_limit_60s!=0.0)) {
+            return Err(ConfigError("measured_vi needs asahi, strict admission, S16, no shadow/guard/z_min/budgets".into()));
+        }
         for (asahi, what) in [(g.governor == Governor::Asahi, "governor asahi"), (g.guard == Some(Governor::Asahi), "guard asahi")] {
             if !asahi {
                 continue;

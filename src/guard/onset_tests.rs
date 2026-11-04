@@ -348,7 +348,7 @@ fn every_vi_profile_bounds_full_scale_after_mute() {
     paths.sort();
     for path in paths {
         let cfg = Config::parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        if !cfg.has_vi() {
+        if !cfg.has_vi() || cfg.globals.measured_vi {
             continue;
         }
         for gov in [Governor::Asahi, Governor::Unified] {
@@ -483,7 +483,7 @@ fn every_vi_profile_bounds_hot_full_scale_onsets() {
     paths.sort();
     for path in paths {
         let cfg = Config::parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        if !cfg.has_vi() { continue; }
+        if !cfg.has_vi() || cfg.globals.measured_vi { continue; }
         let name = path.file_stem().unwrap().to_str().unwrap();
         for gov in [Governor::Asahi, Governor::Unified] {
             let mut cfg = cfg.clone();

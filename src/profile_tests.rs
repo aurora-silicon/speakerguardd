@@ -54,10 +54,10 @@ fn every_public_draft_parses_and_refuses_to_govern_without_opt_in() {
             "{board} was promoted without qualification"
         );
         assert!(!c.allow_unqualified, "{board}");
-        assert_eq!(c.globals.governor, Governor::Unified, "{board}");
-        assert_eq!(c.globals.guard, Some(Governor::Asahi), "{board}");
+        assert_eq!(c.globals.governor, if board=="j613" {Governor::Asahi} else {Governor::Unified}, "{board}");
+        assert_eq!(c.globals.guard, if board=="j613" {None} else {Some(Governor::Asahi)}, "{board}");
         assert!(!c.globals.unified_caps, "{board}");
-        assert_eq!(c.globals.max_reduction, 7.0, "{board}");
+        if board!="j613" {assert_eq!(c.globals.max_reduction, 7.0, "{board}");}
         let fallback = match board {
             "j575" | "j604" | "j614" | "j704" | "j713" | "j714" | "j715" | "j716" | "j773"
             | "j775" | "j813" | "j815" | "j873" => 20.0,
@@ -73,6 +73,13 @@ fn every_public_draft_parses_and_refuses_to_govern_without_opt_in() {
             c.check_governor().is_err(),
             "{board}: experimental bypassed qualification"
         );
+        if board=="j613" {
+            c.allow_unqualified=true;
+            assert!(c.check_governor().is_ok());
+            c.globals.shadow=true;
+            assert!(c.check_governor().is_err());
+            continue;
+        }
         // Opt-in is required even if the caller changes the governor.
         for governor in [Governor::Asahi, Governor::Legacy, Governor::Unified] {
             c.globals.governor = governor;
@@ -127,6 +134,12 @@ fn draft_maps_cover_each_sense_slot_once_and_keep_roles_linked() {
             assert!(seen.insert(i), "{board}: duplicated current slot");
             assert!(seen.insert(sp.vs_chan), "{board}: duplicated voltage slot");
             // This is a pessimistic borrowed resistance, never a qualified measurement.
+            if board=="j613" {
+                assert!(sp.z_min_override.is_none());
+                assert_eq!(sp.r_ff,sp.z_nominal);
+                assert_eq!(sp.p_limit_1s,0.0);assert_eq!(sp.p_limit_60s,0.0);
+                continue;
+            }
             assert_eq!(sp.z_min(), 2.7, "{board}");
             assert_eq!(sp.r_ff, 2.7, "{board}");
             assert_eq!(sp.p_limit_1s, 2.8154, "{board}");
