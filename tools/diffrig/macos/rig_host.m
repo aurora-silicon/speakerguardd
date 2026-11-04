@@ -107,6 +107,16 @@ static double jnum(NSDictionary *d, NSString *k, int c, double def) {
 static void plantLoad(Plant *p, const char *path, int nspk, double sr) {
     NSDictionary *d = [NSJSONSerialization JSONObjectWithData:[NSData dataWithContentsOfFile:@(path)] options:0 error:nil];
     if (!d) { fprintf(stderr, "bad plant json\n"); exit(1); }
+    // An unknown key is an error, never ignored: a misspelled or retired field
+    // (the old "faults" list) would otherwise silently drop what it asked for.
+    static const char *known[] = {"comment", "delay_frames", "order", "t_ambient", "volts_fs", "vmon_scale",
+                                  "imon_scale", "re20", "alpha", "rshunt", "rth_vc", "rth_mg", "tau_vc",
+                                  "tau_mg", "fixed_temp", "i_gain", "v_gain", "t_start", "schedule"};
+    for (NSString *k in d) {
+        int ok = 0;
+        for (unsigned j = 0; j < sizeof known / sizeof *known; ++j) ok |= [k isEqual:@(known[j])];
+        if (!ok) { fprintf(stderr, "plant: unknown key %s\n", k.UTF8String); exit(1); }
+    }
     p->enabled = 1; p->nspk = nspk; p->sr = sr;
     p->delay = (int)jnum(d, @"delay_frames", 0, 512);
     p->order_iv = [d[@"order"] isEqual:@"VI"] ? 0 : 1;

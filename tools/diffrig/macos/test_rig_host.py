@@ -92,6 +92,15 @@ def run(host, strip, d):
     expect("refused cfprop", rc("--cfprop", f"4000000000={good}")[0], 1)
     expect("cfprop not JSON", rc("--cfprop", f"64009={bad}")[0], 1)
     expect("cfprop missing file", rc("--cfprop", f"64009={d}/absent.json")[0], 1)
+    # plant: an unknown key is fatal (a misspelled or retired field must not be ignored)
+    plant = {"delay_frames": 512, "order": "VI", "t_ambient": 50, "volts_fs": 11.89, "vmon_scale": 14,
+             "imon_scale": 3.75, "re20": 3.3, "alpha": 0.0037, "rshunt": 0.0, "rth_vc": 26, "rth_mg": 25.5,
+             "tau_vc": 5.5, "tau_mg": 197}
+    pg, pb = os.path.join(d, "plant.json"), os.path.join(d, "plant-bad.json")
+    json.dump(plant, open(pg, "w"))
+    json.dump(dict(plant, faults=[{"start_s": 0, "end_s": 1, "i_gain": 0}]), open(pb, "w"))
+    expect("plant", rc("--plant", pg, out="plant")[0], 0)
+    expect("plant unknown key", rc("--plant", pb, out="plantbad")[0], 1)
     # argument bounds
     expect("--tele-ch 17", rc("--tele-ch", "17")[0], 2)
     expect("--tele-ch 0", rc("--tele-ch", "0")[0], 2)
