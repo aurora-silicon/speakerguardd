@@ -74,6 +74,8 @@ def main(argv):
             tele = tele_raw
         if meta.get("tele_bus") and os.path.isfile(tele):
             args += ["--sense", tele, "--sense-ch", "12"]
+        if c.get("events"):
+            args += ["--events", ",".join(c["events"])]
         if unit in blobs:
             args += ["--blob", blobs[unit]]
         p = subprocess.run(args, capture_output=True, text=True)
