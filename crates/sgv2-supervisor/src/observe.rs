@@ -67,6 +67,19 @@ pub struct EngineState {
     pub frames: u64,
     pub mono_ns: u64,
     pub health: u32,
+    /// The most restrictive gain of the active channels in the last record,
+    /// as f32 bits. NaN when an active channel's gain is non-finite (a model
+    /// the unit no longer trusts, v2-B/engine afcd163): a fault, never "no
+    /// attenuation".
+    pub min_gain_bits: u32,
+}
+
+impl EngineState {
+    /// Whether the published gain is a gain: finite and not negative.
+    pub fn gain_ok(&self) -> bool {
+        let g = f32::from_bits(self.min_gain_bits);
+        g.is_finite() && g >= 0.0
+    }
 }
 
 pub trait EngineView {
@@ -231,7 +244,8 @@ impl Observer {
         let plugin_ok = e.valid
             && e.params_crc == self.expected_params_crc
             && e.health & sgv2_core::Health::FAILSAFE == 0
-            && e.health & sgv2_core::Health::NO_PARAMS == 0;
+            && e.health & sgv2_core::Health::NO_PARAMS == 0
+            && e.gain_ok();
 
         match self.last_seq {
             Some(l) if e.seq > l => {
@@ -491,7 +505,16 @@ mod tests {
     }
 
     fn beat(seq: u64, quantum: u64, mono_ns: u64) -> EngineState {
-        EngineState { valid: true, pid: PID, params_crc: 7, seq, frames: seq * quantum, mono_ns, health: 0 }
+        EngineState {
+            valid: true,
+            pid: PID,
+            params_crc: 7,
+            seq,
+            frames: seq * quantum,
+            mono_ns,
+            health: 0,
+            min_gain_bits: 1.0f32.to_bits(),
+        }
     }
 
     /// A healthy engine beating once per `quantum` frames at 48 kHz from
@@ -796,7 +819,7 @@ mod tests {
         let q512 = 10_666_666u64;
         let mut o = Observer::new(7, 48_000, TICK);
         let obs_at = |o: &mut Observer, now: u64, seq: u64, frames: u64, mono: u64, pcm: PcmState| {
-            let e = EngineState { valid: true, pid: PID, params_crc: 7, seq, frames, mono_ns: mono, health: 0 };
+            let e = EngineState { frames, ..beat(seq, 0, mono) };
             o.observe(&mut || now, &mut E(e), &mut P(pcm), &mut S(session(now)))
         };
         let ok = |obs: Observation| obs.heartbeat_fresh && obs.pcm_state_ok && obs.pcm_owner_ok;
@@ -963,5 +986,47 @@ mod tests {
         // and the grace never covers an XRUN
         o.note_grant(t);
         assert!(!at(&mut o, t + 1_000_000, true, PcmState::Stopped { owner: PID }).pcm_state_ok);
+    }
+
+    #[test]
+    fn a_nan_or_non_finite_gain_is_a_fault_and_releases() {
+        // v2-B/engine afcd163: an active channel whose gain is non-finite is
+        // published as NaN; it must never read as "no attenuation"
+        let mut o = Observer::new(7, 48_000, TICK);
+        let at = |o: &mut Observer, k: u64, g: f32| {
+            let now = k * 10_666_666;
+            let e = EngineState { min_gain_bits: g.to_bits(), ..beat(k, 512, now) };
+            o.observe(&mut || now + 1_000, &mut E(e), &mut P(PcmState::Running { owner: PID }), &mut S(session(now)))
+        };
+        at(&mut o, 1, 1.0);
+        assert!(at(&mut o, 2, 1.0).plugin_ok);
+        assert!(at(&mut o, 3, 0.25).plugin_ok);
+        assert!(at(&mut o, 4, 0.0).plugin_ok);
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.5, f32::from_bits(0x7fc0_0001)] {
+            let obs = at(&mut o, 5, bad);
+            assert!(!obs.plugin_ok && !obs.clean(), "{bad}");
+        }
+        // through the lease: a granted supervisor releases at once
+        use crate::kernel::Recorder;
+        use crate::lease::Observation;
+        use crate::supervise::{Event, Expect, Supervisor};
+        let mut k = Recorder::healthy(6);
+        let mut s =
+            Supervisor::new(Expect::new(crate::machine::lookup("j316s").unwrap(), vec![11_890; 6], "Secondary"));
+        let clean = Observation {
+            heartbeat_fresh: true,
+            plugin_ok: true,
+            links_ok: true,
+            carrier_ok: true,
+            pcm_owner_ok: true,
+            pcm_state_ok: true,
+            route_ok: false,
+            amps_ok: false,
+        };
+        s.tick(clean, &mut k).unwrap();
+        assert_eq!(s.tick(clean, &mut k), Ok(Event::Granted));
+        let nan = at(&mut o, 6, f32::NAN);
+        assert!(matches!(s.tick(nan, &mut k), Ok(Event::Released { .. })));
+        assert!(!k.held);
     }
 }

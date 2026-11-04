@@ -98,6 +98,7 @@ mod linux {
                 frames,
                 mono_ns,
                 health: h.health.load(Ordering::Relaxed),
+                min_gain_bits: h.min_gain_bits.load(Ordering::Relaxed),
             }
         }
     }
