@@ -71,7 +71,11 @@ fn wire_channels(g: &Graph, w: &Wire) -> Result<u32> {
         Error::format("dspg", format!("line {}: wire {}:{} has no format", w.line, w.src.node, w.src.port))
     })?;
     match f.channels.value() {
-        Some(c) if c >= 0.0 && c.fract() == 0.0 => Ok(c as u32),
+        Some(c) if c >= 0.0 && c.fract() == 0.0 && c <= super::MAX_WIRE_CHANNELS as f64 => Ok(c as u32),
+        Some(c) if c > super::MAX_WIRE_CHANNELS as f64 => Err(Error::format(
+            "dspg",
+            format!("line {}: wire carries {c} channels; at most {}", w.line, super::MAX_WIRE_CHANNELS),
+        )),
         _ => Err(Error::format(
             "dspg",
             format!("line {}: wire channel count is unresolved ({:?}); supply the substitution", w.line, f.channels),
@@ -134,7 +138,7 @@ pub fn lanes_into(g: &Graph, dst: &Endpoint) -> Result<Vec<Lane>> {
         .iter()
         .find(|w| &w.dst == dst)
         .ok_or_else(|| Error::format("dspg", format!("nothing feeds {}:{}", dst.node, dst.port)))?;
-    let lanes = out_lanes(g, &w.src, &mut memo, &mut active)?;
+    let lanes = out_lanes(g, &w.src, &mut memo, &mut active, 0)?;
     let n = wire_channels(g, w)? as usize;
     if lanes.len() != n {
         return Err(Error::format(
@@ -145,6 +149,10 @@ pub fn lanes_into(g: &Graph, dst: &Endpoint) -> Result<Vec<Lane>> {
     Ok(lanes)
 }
 
+/// Longest box chain the lane tracer follows (it recurses once per box).
+/// The shipped graphs chain a few tens of boxes.
+pub const MAX_TRACE_DEPTH: usize = 256;
+
 fn in_wire<'a>(g: &'a Graph, node: &str, port: u32) -> Option<&'a Wire> {
     g.wires.iter().find(|w| w.dst.node == node && w.dst.port == port)
 }
@@ -154,7 +162,14 @@ fn out_lanes(
     src: &Endpoint,
     memo: &mut BTreeMap<Endpoint, Vec<Lane>>,
     active: &mut BTreeSet<String>,
+    depth: usize,
 ) -> Result<Vec<Lane>> {
+    if depth > MAX_TRACE_DEPTH {
+        return Err(Error::format(
+            "dspg",
+            format!("the signal path into {} is longer than {MAX_TRACE_DEPTH} boxes", src.node),
+        ));
+    }
     if let Some(l) = memo.get(src) {
         return Ok(l.clone());
     }
@@ -173,7 +188,7 @@ fn out_lanes(
             g, &b.name, port,
         ) {
             Some(w) => {
-                let l = out_lanes(g, &w.src, memo, active)?;
+                let l = out_lanes(g, &w.src, memo, active, depth + 1)?;
                 let n = wire_channels(g, w)? as usize;
                 if l.len() != n {
                     return Err(Error::format(

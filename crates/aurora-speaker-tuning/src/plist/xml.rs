@@ -325,7 +325,8 @@ fn parse_integer(t: &str) -> Option<i128> {
         _ => (false, t),
     };
     let mag = if let Some(hex) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
-        if hex.is_empty() {
+        // from_str_radix accepts a leading sign; a hex body must not.
+        if hex.is_empty() || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
             return None;
         }
         i128::from_str_radix(hex, 16).ok()?
@@ -335,7 +336,11 @@ fn parse_integer(t: &str) -> Option<i128> {
         }
         body.parse::<i128>().ok()?
     };
-    Some(if neg { -mag } else { mag })
+    if neg {
+        mag.checked_neg()
+    } else {
+        Some(mag)
+    }
 }
 
 fn parse_real(t: &str) -> Option<f64> {

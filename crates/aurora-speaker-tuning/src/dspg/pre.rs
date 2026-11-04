@@ -18,6 +18,15 @@
 use crate::error::{Error, Result};
 use std::collections::BTreeMap;
 
+/// Deepest `[...]` / `{...}` nesting a graph may use.  The shipped graphs
+/// nest a handful of levels; the cap keeps the recursive reader off the
+/// end of the stack on hostile input.
+pub const MAX_NESTING: usize = 64;
+/// Most tokens macro expansion may produce in all, counting every copy.
+/// The shipped graphs expand to a few thousand; the cap stops a small file
+/// from expanding exponentially (nested `[def]`s).
+pub const MAX_EXPANDED_TOKENS: usize = 1 << 18;
+
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum Tok {
     Word(String),
@@ -105,15 +114,19 @@ fn lex(text: &str, ctx: &str) -> Result<Vec<(Lex, usize)>> {
     Ok(out)
 }
 
-fn tree(lx: &[(Lex, usize)], i: &mut usize, close: Option<&Lex>, ctx: &str) -> Result<Vec<Node>> {
+fn tree(lx: &[(Lex, usize)], i: &mut usize, close: Option<&Lex>, depth: usize, ctx: &str) -> Result<Vec<Node>> {
+    if depth > MAX_NESTING {
+        let ln = lx.get(i.saturating_sub(1)).map_or(0, |x| x.1);
+        return Err(Error::format(ctx, format!("line {ln}: brackets nested deeper than {MAX_NESTING}")));
+    }
     let mut out = Vec::new();
     while *i < lx.len() {
         let (t, ln) = &lx[*i];
         *i += 1;
         match t {
             Lex::T(tok) => out.push(Node::Tok(tok.clone(), *ln)),
-            Lex::LBracket => out.push(Node::Bracket(tree(lx, i, Some(&Lex::RBracket), ctx)?, *ln)),
-            Lex::LBrace => out.push(Node::Brace(tree(lx, i, Some(&Lex::RBrace), ctx)?, *ln)),
+            Lex::LBracket => out.push(Node::Bracket(tree(lx, i, Some(&Lex::RBracket), depth + 1, ctx)?, *ln)),
+            Lex::LBrace => out.push(Node::Brace(tree(lx, i, Some(&Lex::RBrace), depth + 1, ctx)?, *ln)),
             Lex::RBracket | Lex::RBrace => {
                 if close == Some(t) {
                     return Ok(out);
@@ -137,6 +150,8 @@ pub(super) struct Pre<'a> {
     pub unresolved: Vec<String>,
     pub notes: Vec<String>,
     ctx: &'a str,
+    /// Tokens expansion may still emit (see [`MAX_EXPANDED_TOKENS`]).
+    budget: usize,
 }
 
 fn significant(nodes: &[Node]) -> Vec<&Node> {
@@ -144,13 +159,29 @@ fn significant(nodes: &[Node]) -> Vec<&Node> {
 }
 
 impl<'a> Pre<'a> {
+    /// Charges `n` emitted tokens against the expansion budget.
+    fn spend(&mut self, n: usize, ln: usize) -> Result<()> {
+        match self.budget.checked_sub(n) {
+            Some(b) => {
+                self.budget = b;
+                Ok(())
+            }
+            None => {
+                Err(Error::format(self.ctx, format!("line {ln}: macro expansion exceeds {MAX_EXPANDED_TOKENS} tokens")))
+            }
+        }
+    }
+
     fn expand(&mut self, nodes: &[Node], out: &mut Vec<(Tok, usize)>, depth: usize) -> Result<()> {
         if depth > 64 {
             return Err(Error::format(self.ctx, "macro expansion deeper than 64 (recursive macro?)"));
         }
         for n in nodes {
             match n {
-                Node::Tok(t, ln) => out.push((t.clone(), *ln)),
+                Node::Tok(t, ln) => {
+                    self.spend(1, *ln)?;
+                    out.push((t.clone(), *ln))
+                }
                 Node::Brace(_, ln) => {
                     return Err(Error::format(self.ctx, format!("line {ln}: braces outside an [if]")));
                 }
@@ -230,6 +261,7 @@ impl<'a> Pre<'a> {
                 if let Some(v) = self.macros.get(name).cloned() {
                     let mut tmp = Vec::new();
                     self.expand(&v, &mut tmp, depth + 1)?;
+                    self.spend(tmp.len(), ln)?;
                     out.extend(tmp.into_iter().map(|(t, _)| (t, ln)));
                 } else if let Some(s) = self.subst.get(name) {
                     let words: Vec<&str> = s.split_whitespace().collect();
@@ -308,8 +340,15 @@ pub(super) struct Output {
 pub(super) fn run(text: &str, subst: &BTreeMap<String, String>, ctx: &str) -> Result<Output> {
     let lx = lex(text, ctx)?;
     let mut i = 0;
-    let nodes = tree(&lx, &mut i, None, ctx)?;
-    let mut pre = Pre { macros: BTreeMap::new(), subst, unresolved: Vec::new(), notes: Vec::new(), ctx };
+    let nodes = tree(&lx, &mut i, None, 0, ctx)?;
+    let mut pre = Pre {
+        macros: BTreeMap::new(),
+        subst,
+        unresolved: Vec::new(),
+        notes: Vec::new(),
+        ctx,
+        budget: MAX_EXPANDED_TOKENS,
+    };
     let mut toks = Vec::new();
     pre.expand(&nodes, &mut toks, 0)?;
     let mut statements = Vec::new();

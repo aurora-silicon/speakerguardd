@@ -8,14 +8,27 @@
 //! follows as an integer object.
 //!
 //! The decoder checks every offset and length against the buffer, rejects
-//! reference cycles, bounds the nesting depth, and bounds the total number of
-//! decoded nodes so a small file with many shared references cannot expand
-//! without limit.
+//! reference cycles, bounds the nesting depth, and bounds both the number of
+//! decoded nodes and the decoded size.  A shared reference decodes to a
+//! fresh copy, so a small file whose arrays all point at one large object
+//! would otherwise expand geometrically; the size budget is a fixed multiple
+//! of the input length (plus a small allowance), so decoding never
+//! allocates more than [`EXPANSION`] times what it was given.
 
 use super::{Dict, Format, PlistError, Value};
 
 const MAX_DEPTH: usize = 256;
-const MAX_NODES: usize = 1 << 22;
+/// Most decoded nodes, whatever the input size.
+pub const MAX_NODES: usize = 1 << 20;
+/// Decoded bytes allowed per input byte.  A file that does not share
+/// references decodes to well under this (each object costs at least one
+/// input byte plus its payload); the shipped plists share only short
+/// strings.
+pub const EXPANSION: usize = 16;
+/// Decoded bytes allowed on top of `EXPANSION * input length`.
+pub const ALLOWANCE: usize = 1 << 20;
+/// What one decoded node costs against the budget, besides its payload.
+const NODE_COST: usize = std::mem::size_of::<Value>();
 
 fn err(at: usize, message: impl Into<String>) -> PlistError {
     PlistError { format: Format::Binary, at, message: message.into() }
@@ -28,6 +41,8 @@ struct Reader<'a> {
     /// Objects currently being decoded (cycle detection).
     active: Vec<bool>,
     nodes: usize,
+    /// Decoded bytes still allowed.
+    budget: usize,
     object_end: usize,
 }
 
@@ -59,6 +74,10 @@ pub fn parse(buf: &[u8]) -> Result<Value, PlistError> {
     if num_objects == 0 {
         return Err(err(t + 8, "no objects"));
     }
+    // Every object takes at least its marker byte in the object area.
+    if num_objects > table.saturating_sub(8) {
+        return Err(err(t + 8, format!("object count {num_objects} exceeds the object area")));
+    }
     if top >= num_objects {
         return Err(err(t + 16, format!("top object {top} >= object count {num_objects}")));
     }
@@ -81,7 +100,8 @@ pub fn parse(buf: &[u8]) -> Result<Value, PlistError> {
         }
         offsets.push(off);
     }
-    let mut r = Reader { buf, offsets, ref_size, active: vec![false; n], nodes: 0, object_end: table };
+    let budget = buf.len().saturating_mul(EXPANSION).saturating_add(ALLOWANCE);
+    let mut r = Reader { buf, offsets, ref_size, active: vec![false; n], nodes: 0, budget, object_end: table };
     r.object(top as usize, 0)
 }
 
@@ -112,6 +132,23 @@ impl<'a> Reader<'a> {
         Ok((count, at + 2 + width))
     }
 
+    /// Charges `bytes` of decoded output against the budget.
+    fn spend(&mut self, at: usize, bytes: usize) -> Result<(), PlistError> {
+        match self.budget.checked_sub(bytes) {
+            Some(b) => {
+                self.budget = b;
+                Ok(())
+            }
+            None => Err(err(
+                at,
+                format!(
+                    "decodes to more than {EXPANSION} times its {} bytes (shared-reference expansion)",
+                    self.buf.len()
+                ),
+            )),
+        }
+    }
+
     fn reference(&self, at: usize) -> Result<usize, PlistError> {
         let raw = be_uint(self.take(at, self.ref_size)?);
         let idx = usize::try_from(raw).map_err(|_| err(at, "reference overflows"))?;
@@ -139,6 +176,7 @@ impl<'a> Reader<'a> {
         if self.nodes > MAX_NODES {
             return Err(err(at, "too many decoded objects (shared-reference expansion)"));
         }
+        self.spend(at, NODE_COST)?;
         let marker = self.take(at, 1)?[0];
         let (high, low) = (marker >> 4, marker & 0x0F);
         let value = match high {
@@ -175,11 +213,14 @@ impl<'a> Reader<'a> {
             }
             0x4 => {
                 let (n, p) = self.count(at, low)?;
-                Value::Data(self.take(p, n)?.to_vec())
+                let b = self.take(p, n)?;
+                self.spend(at, n)?;
+                Value::Data(b.to_vec())
             }
             0x5 => {
                 let (n, p) = self.count(at, low)?;
                 let b = self.take(p, n)?;
+                self.spend(at, n)?;
                 if let Some(pos) = b.iter().position(|c| *c >= 0x80) {
                     return Err(err(p + pos, "non-ASCII byte in an ASCII string"));
                 }
@@ -189,6 +230,8 @@ impl<'a> Reader<'a> {
                 let (n, p) = self.count(at, low)?;
                 let len = n.checked_mul(2).ok_or_else(|| err(at, "UTF-16 length overflows"))?;
                 let b = self.take(p, len)?;
+                // At most three UTF-8 bytes per UTF-16 unit.
+                self.spend(at, n.saturating_mul(3))?;
                 let units: Vec<u16> = b.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
                 Value::String(String::from_utf16(&units).map_err(|_| err(p, "invalid UTF-16 string"))?)
             }
@@ -204,6 +247,7 @@ impl<'a> Reader<'a> {
                 // to an array, which is how Foundation exposes it too.
                 let (n, p) = self.count(at, low)?;
                 let refs = self.refs(p, n)?;
+                self.spend(at, n.saturating_mul(NODE_COST))?;
                 self.active[idx] = true;
                 let mut items = Vec::with_capacity(n.min(4096));
                 for r in refs {
@@ -216,6 +260,7 @@ impl<'a> Reader<'a> {
                 let (n, p) = self.count(at, low)?;
                 let keys = self.refs(p, n)?;
                 let vals = self.refs(p + n * self.ref_size, n)?;
+                self.spend(at, n.saturating_mul(NODE_COST))?;
                 self.active[idx] = true;
                 let mut dict = Dict::new();
                 for (k, v) in keys.into_iter().zip(vals) {
