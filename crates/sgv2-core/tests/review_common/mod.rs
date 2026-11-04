@@ -238,6 +238,19 @@ impl Rng {
 /// may pass is unity gain on in-range input), and silent for non-finite
 /// input.
 pub fn never_above_input(unit: &mut dyn ProtectionUnit, channels: usize, latency: usize, seed: u64, blocks: usize) {
+    never_above_input_sensed(unit, channels, 0, latency, seed, blocks)
+}
+
+/// As [`never_above_input`], with `sense` sense ports fed the same
+/// adversarial mix (a closed loop must never relax the gain above unity).
+pub fn never_above_input_sensed(
+    unit: &mut dyn ProtectionUnit,
+    channels: usize,
+    sense: usize,
+    latency: usize,
+    seed: u64,
+    blocks: usize,
+) {
     let mut rng = Rng(seed);
     let mut hist: Vec<Vec<f32>> = vec![vec![0.0; latency]; channels];
     for b in 0..blocks {
@@ -246,10 +259,14 @@ pub fn never_above_input(unit: &mut dyn ProtectionUnit, channels: usize, latency
         let calm = b % 5 != 0; // mostly in-range audio, with storms between
         let input: Vec<Vec<f32>> =
             (0..channels).map(|_| (0..n).map(|_| if calm { rng.unit() } else { rng.sample(mode) }).collect()).collect();
+        let sense_buf: Vec<Vec<f32>> = (0..sense)
+            .map(|_| (0..n).map(|_| if calm { 0.3 * rng.unit() } else { rng.sample(mode) }).collect())
+            .collect();
         let mut output = vec![vec![0.0f32; n]; channels];
         let ins: Vec<&[f32]> = input.iter().map(|v| &v[..]).collect();
+        let sns: Vec<&[f32]> = sense_buf.iter().map(|v| &v[..]).collect();
         let mut outs: Vec<&mut [f32]> = output.iter_mut().map(|v| &mut v[..]).collect();
-        unit.process(Io { frames: n, input: &ins, sense: &[], output: &mut outs });
+        unit.process(Io { frames: n, input: &ins, sense: &sns, output: &mut outs });
         for c in 0..channels {
             hist[c].extend_from_slice(&input[c]);
             for k in 0..n {
