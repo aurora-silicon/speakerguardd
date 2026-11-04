@@ -799,6 +799,8 @@ struct Cl {
     trend_n: usize,
     cold_n: u32,
     cold_floor: f64,
+    /// [`CL_RELAXATION`], except in an offline [`ClReplay`].
+    relax: bool,
     implausible: bool,
 }
 
@@ -899,6 +901,7 @@ impl Cl {
             // the coldest a coil can honestly read: below both its
             // calibration and the model's ambient by the margin
             cold_floor: tc.min(ambient) - COLD_MARGIN_K,
+            relax: CL_RELAXATION,
             implausible: false,
         })
     }
@@ -1067,7 +1070,7 @@ impl Cl {
     /// The correction may relax the limit: never while capped, never after
     /// the plausibility guard has tripped.
     fn relax_allowed(&self) -> bool {
-        CL_RELAXATION && !self.implausible
+        self.relax && !self.implausible
     }
 
     /// Per thermal update: the smoothed corrected limit for `base`.
@@ -1097,6 +1100,51 @@ impl Cl {
         let raw = if self.valid { base + relax } else { base };
         self.limit_s += self.k_lim * (raw - self.limit_s);
         self.limit_s
+    }
+}
+
+/// Offline replay of one channel's closed-loop estimator, limit smoother
+/// and plausibility guard from logged telemetry (window resistances and
+/// per-update T_OL and drive), with the relaxation chosen by the caller.
+/// For qualifying a relaxed build against live captures; the shipping
+/// unit never constructs it.
+#[doc(hidden)]
+pub struct ClReplay {
+    cl: Cl,
+    base: f64,
+}
+
+impl ClReplay {
+    /// `None` when the channel has no usable calibration (as the unit).
+    pub fn new(p: &Params, ch: usize, relax: bool) -> Option<ClReplay> {
+        let c = p.ch.get(ch)?;
+        let rate = p.sample_rate as f64;
+        let r = rate / thermal_frames(p.sample_rate) as f64;
+        let mut cl = Cl::new(c, rate, r, p.thermal_ambient_temp as f64)?;
+        cl.relax = relax;
+        let base = c.temperature_limit as f64;
+        cl.limit_s = base;
+        Some(ClReplay { cl, base })
+    }
+
+    /// One completed Goertzel period with its scaled pilot-band V and I
+    /// powers, through the unit's own gates, smoother and range test.
+    /// True when the window was accepted.
+    pub fn window(&mut self, pv: f32, pi: f32) -> bool {
+        self.cl.window_done(pv, pi);
+        self.cl.valid
+    }
+
+    /// One thermal update: returns (TlimAdj, T_CL, implausible).
+    pub fn update(&mut self, t_ol: f64, p_drv: f64) -> (f64, f64, bool) {
+        let driven = (p_drv as f32) >= self.cl.drive_thres;
+        let lim = self.cl.update(t_ol, self.base, driven);
+        (lim - self.base, self.cl.t_cl, self.cl.implausible)
+    }
+
+    /// Thermal updates per Goertzel window.
+    pub fn updates_per_window(&self) -> f64 {
+        self.cl.window as f64 / self.cl.upd as f64
     }
 }
 
@@ -1800,9 +1848,6 @@ impl Run {
             let limit = match c.cl.as_mut() {
                 Some(cl) => {
                     // driven: the update's drive meets the pilot content gate
-                    // and the channel is not being limited (a limited coil
-                    // may cool while the model holds; only unlimited
-                    // heating says the coil must be warming)
                     let driven = (p_ff as f32) >= cl.drive_thres;
                     cl.update(t_ol, base, driven)
                 }
