@@ -266,11 +266,15 @@ def write_trace(d, c, meta):
             recs.append(rec)
         # A silent slice shows nothing in the audio: it takes the fail-safe state of the
         # nearest audible slice (the fail-safe is a configuration state, not a level one).
-        known = [i for i, r in enumerate(recs) if r["mode"]["failsafe"] is not None]
-        for i, r in enumerate(recs):
-            if r["mode"]["failsafe"] is None and known:
-                j = min(known, key=lambda k: abs(k - i))
-                r["mode"]["failsafe"] = recs[j]["mode"]["failsafe"]
+        last = None
+        for r in recs:  # forward fill, then fill the leading silent slices backwards
+            if r["mode"]["failsafe"] is None:
+                r["mode"]["failsafe"] = last
+            last = r["mode"]["failsafe"]
+        first = next((r["mode"]["failsafe"] for r in recs if r["mode"]["failsafe"] is not None), None)
+        for r in recs:
+            if r["mode"]["failsafe"] is None:
+                r["mode"]["failsafe"] = first
             fo.write(json.dumps(r, separators=(",", ":")) + "\n")
 
 
