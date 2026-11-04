@@ -90,7 +90,7 @@ struct Spp3Lookup<'a> {
     t: &'a Tuning,
     sidecar: &'a crate::spp3::Sidecar,
     rate: u32,
-    initial_theta: Option<f64>,
+    thermal_state_override: u32,
 }
 
 impl Spp3Lookup<'_> {
@@ -123,6 +123,7 @@ impl spp3::TuningLookup for Spp3Lookup<'_> {
         }
         let id = match key {
             "ThermalProtectionEnabled" => 0,
+            "ThermalStateOverride" => return Some(self.thermal_state_override as f64),
             _ => return None,
         };
         self.t.protection.state.section(SCOPE_GLOBAL, 0)?.get(id).map(f64::from)
@@ -132,7 +133,6 @@ impl spp3::TuningLookup for Spp3Lookup<'_> {
         match key {
             "SpeakerGroup" => return c.speaker_group.map(|g| g as f64),
             "IgnoreTelemetry" => return c.ignore_telemetry.map(|b| b as u8 as f64),
-            "sgv2.InitialThetaVc" | "sgv2.InitialThetaMg" => return self.initial_theta,
             "sgv2.CalPresent" => return Some(self.calibration(ch).is_some() as u8 as f64),
             "sgv2.CalR" => return self.calibration(ch).map(|r| r.r_cal_ohm),
             "sgv2.CalT" => return self.calibration(ch).map(|r| r.t_cal_c),
@@ -177,12 +177,13 @@ fn compile_spp3(t: &Tuning, diags: &mut Diagnostics) -> Result<Compiled> {
     }
     let rate = sample_rate(t)?;
     let override_ = t.protection.strip_properties.iter().find(|p| p.number == PROP_SPP3_THERMAL_STATE_OVERRIDE);
-    let initial_theta = match override_.map(|p| &p.value) {
-        Some(PropValue::UInt32(SPP3_COLD_START)) => Some(0.0),
-        Some(v) => return Err(bad(format!("Thermal State Override {v:?}: TODO(SPEC) the start state it selects"))),
-        None => return Err(bad("the property strip sets no Thermal State Override: TODO(SPEC) the default state")),
+    // 64007 as the strip sets it; unset is 0 (spec 10: AID8/9/14/15 start hot)
+    let thermal_state_override = match override_.map(|p| &p.value) {
+        Some(PropValue::UInt32(v)) => *v,
+        Some(v) => return Err(bad(format!("Thermal State Override {v:?} is not a UInt32"))),
+        None => 0,
     };
-    let lk = Spp3Lookup { t, sidecar, rate, initial_theta };
+    let lk = Spp3Lookup { t, sidecar, rate, thermal_state_override };
     let p = spp3::Params::from_lookup(&lk).map_err(|e| bad(format!("spp3 parameters: {e:?}")))?;
     let sense = match &t.protection.telemetry {
         Some(tm) => tm.channels.unwrap_or(0),

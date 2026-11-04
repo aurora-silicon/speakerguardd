@@ -224,7 +224,7 @@ fn render(
     let (mut pos, mut k) = (0usize, 0usize);
     while pos < frames {
         if resets.contains(&pos) {
-            unit.reset();
+            unit.host_reset();
         }
         let mut n = slices[k % slices.len()].min(frames - pos);
         if let Some(&r) = resets.iter().find(|&&r| r > pos && r < pos + n) {
