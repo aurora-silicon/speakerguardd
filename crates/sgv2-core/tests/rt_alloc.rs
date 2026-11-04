@@ -86,4 +86,28 @@ fn no_unit_allocates_in_process() {
     run(&mut placeholder::Unit::new(placeholder::Params { channels: 6, ..Default::default() }), 6, 12);
     run(&mut lsm2::Unit::new(lsm2::Params::default()), 2, 0);
     run(&mut atsp::Unit::new(atsp::Params::default()), 4, 0);
+    let slot = atsp::Slot {
+        channel_mask: 0b1111,
+        gain_link: 1,
+        amplifier_sensitivity: 10.0,
+        rdc: 8.0,
+        rth_vc: 30.0,
+        tau_vc: 1.0,
+        rth_mg: 40.0,
+        tau_mg: 20.0,
+        ambient: 40.0,
+        temperature_limit: 110.0,
+        hard_limit_headroom: 8.0,
+        attack_ms: 500.0,
+        release_ms: 5000.0,
+    };
+    let mut a = atsp::Unit::new(atsp::Params {
+        channels: 4,
+        sample_rate: 48_000,
+        block_frames: 512,
+        slot: [slot, Default::default(), Default::default()],
+        ..Default::default()
+    });
+    assert!(!a.is_failsafe());
+    run(&mut a, 4, 0);
 }

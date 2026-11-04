@@ -36,7 +36,9 @@ pub mod page;
 pub mod ttl;
 
 use core::ffi::{c_char, c_void};
-use sgv2_core::{lsm2, placeholder, spp3, FailSafe, Health, Io, ProtectionUnit, Telemetry, UnitKind, MAX_CHANNELS};
+use sgv2_core::{
+    atsp, lsm2, placeholder, spp3, FailSafe, Health, Io, ProtectionUnit, Telemetry, UnitKind, MAX_CHANNELS,
+};
 
 #[repr(C)]
 pub struct Lv2Descriptor {
@@ -80,6 +82,7 @@ const MAX_PORTS: usize = 2 * MAX_CHANNELS + MAX_SENSE + 3;
 pub enum AnyUnit {
     Spp3(Box<spp3::Unit>),
     Lsm2(Box<lsm2::Unit>),
+    Atsp(Box<atsp::Unit>),
     Placeholder(placeholder::Unit),
     FailSafe(FailSafe),
 }
@@ -89,6 +92,7 @@ impl AnyUnit {
         match self {
             AnyUnit::Spp3(u) => u.as_mut(),
             AnyUnit::Lsm2(u) => u.as_mut(),
+            AnyUnit::Atsp(u) => u.as_mut(),
             AnyUnit::Placeholder(u) => u,
             AnyUnit::FailSafe(u) => u,
         }
@@ -97,6 +101,7 @@ impl AnyUnit {
         match self {
             AnyUnit::Spp3(u) => u.as_ref(),
             AnyUnit::Lsm2(u) => u.as_ref(),
+            AnyUnit::Atsp(u) => u.as_ref(),
             AnyUnit::Placeholder(u) => u,
             AnyUnit::FailSafe(u) => u,
         }
@@ -160,8 +165,15 @@ pub fn load_unit(
             Ok(_) => fail(LoadError::Refused),
             Err(_) => fail(LoadError::Blob),
         }
+    } else if h.unit == UnitKind::Atsp as u32 {
+        match atsp::Params::from_blob(bytes) {
+            Ok(p) if atsp::Unit::init_error(&p).is_none() => {
+                (AnyUnit::Atsp(Box::new(atsp::Unit::new(p))), None, h.payload_crc)
+            }
+            Ok(_) => fail(LoadError::Refused),
+            Err(_) => fail(LoadError::Blob),
+        }
     } else {
-        // TODO(lane B): atsp payload.
         fail(LoadError::NotImplemented)
     }
 }
