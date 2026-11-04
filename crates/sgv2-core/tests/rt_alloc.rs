@@ -2,17 +2,41 @@
 //! a counting global allocator across the slice sizes the rig uses.
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::cell::Cell;
 
 use sgv2_core::{atsp, lsm2, placeholder, spp3, Io, ProtectionUnit, Telemetry};
 
 struct Counting;
-static ALLOCS: AtomicUsize = AtomicUsize::new(0);
 
+thread_local! {
+    /// Allocations made by this thread only, so the test harness's other
+    /// threads (and any test running in parallel) cannot pollute the count.
+    static ALLOCS: Cell<usize> = const { Cell::new(0) };
+}
+
+fn count() {
+    // `try_with`: an allocation during thread teardown is not ours to count
+    let _ = ALLOCS.try_with(|c| c.set(c.get() + 1));
+}
+
+fn allocs() -> usize {
+    ALLOCS.with(|c| c.get())
+}
+
+// SAFETY: forwards to the system allocator; the counter is a const-
+// initialised thread-local `Cell`, which never allocates.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCS.fetch_add(1, Ordering::SeqCst);
+        count();
         unsafe { System.alloc(layout) }
+    }
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        count();
+        unsafe { System.alloc_zeroed(layout) }
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        count();
+        unsafe { System.realloc(ptr, layout, new_size) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         unsafe { System.dealloc(ptr, layout) }
@@ -31,10 +55,10 @@ fn run(unit: &mut dyn ProtectionUnit, channels: usize, sense: usize) {
         let ins: Vec<&[f32]> = input.iter().map(|b| &b[..frames]).collect();
         let sns: Vec<&[f32]> = sense_buf.iter().map(|b| &b[..frames]).collect();
         let mut outs: Vec<&mut [f32]> = output.iter_mut().map(|b| &mut b[..frames]).collect();
-        let before = ALLOCS.load(Ordering::SeqCst);
+        let before = allocs();
         unit.process(Io { frames, input: &ins, sense: &sns, output: &mut outs });
         unit.telemetry(&mut telemetry);
-        assert_eq!(ALLOCS.load(Ordering::SeqCst), before, "{:?} allocated at {frames} frames", unit.kind());
+        assert_eq!(allocs(), before, "{:?} allocated at {frames} frames", unit.kind());
     }
 }
 
