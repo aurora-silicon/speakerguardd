@@ -8,7 +8,9 @@ ConditionPathExists=/proc/device-tree/compatible
 
 [Service]
 Type=notify
-ExecStart=/usr/bin/speakerguardd
+# Per machine: SGV2_ARGS="--card <N> --pcm <D> --uid <UID> --params <blob>"
+EnvironmentFile=/etc/speakerguardd/speakerguardd.conf
+ExecStart=/usr/bin/speakerguardd $SGV2_ARGS
 Restart=on-failure
 RestartSec=1s
 RestartPreventExitStatus=78
@@ -19,7 +21,11 @@ RuntimeDirectoryMode=0755
 # there, and closing it (any exit) withdraws protection at once.
 DevicePolicy=closed
 DeviceAllow=char-alsa rw
-# TODO(lane D): capabilities and the rest of the hardening review.
+# Real-time scheduling and locked memory for the 10 ms loop; chown hands the
+# engine page and the session report to the session user.
+CapabilityBoundingSet=CAP_SYS_NICE CAP_IPC_LOCK CAP_CHOWN CAP_FOWNER
+LimitRTPRIO=99
+LimitMEMLOCK=infinity
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes

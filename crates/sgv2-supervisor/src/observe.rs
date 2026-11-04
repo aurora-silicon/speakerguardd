@@ -66,11 +66,15 @@ pub struct Observer {
     pub expected_params_crc: u32,
     pub stale_ns: u64,
     last_seq: Option<u64>,
+    /// When the sequence last advanced. The plugin beats once per graph
+    /// quantum (10.7 ms at 512 frames), longer than the 10 ms tick, so some
+    /// ticks see no new beat: freshness is an advance within `stale_ns`.
+    last_advance_ns: Option<u64>,
 }
 
 impl Observer {
     pub fn new(expected_params_crc: u32, stale_ns: u64) -> Self {
-        Observer { expected_params_crc, stale_ns, last_seq: None }
+        Observer { expected_params_crc, stale_ns, last_seq: None, last_advance_ns: None }
     }
 
     pub fn observe(
@@ -87,7 +91,10 @@ impl Observer {
             && e.params_crc == self.expected_params_crc
             && e.health & sgv2_core::Health::FAILSAFE == 0
             && e.health & sgv2_core::Health::NO_PARAMS == 0;
-        let advanced = self.last_seq.is_some_and(|l| e.seq > l);
+        if self.last_seq.is_some_and(|l| e.seq > l) {
+            self.last_advance_ns = Some(now_ns);
+        }
+        let advanced = self.last_advance_ns.is_some_and(|t| now_ns.saturating_sub(t) <= self.stale_ns);
         let recent = now_ns.saturating_sub(e.mono_ns) <= self.stale_ns && e.mono_ns <= now_ns;
         self.last_seq = Some(e.seq);
         let (heartbeat_fresh, pcm_owner_ok) = match p {
@@ -171,8 +178,10 @@ mod tests {
         // first tick: no previous sequence, not yet fresh
         assert!(!o.observe(1_000, &mut E(engine(1, 1_000)), &mut P(run), &mut s).clean());
         assert!(o.observe(11_000_000, &mut E(engine(5, 10_000_000)), &mut P(run), &mut s).clean());
-        // stalled sequence
-        assert!(!o.observe(21_000_000, &mut E(engine(5, 10_000_000)), &mut P(run), &mut s).heartbeat_fresh);
+        // one tick without a new beat (a quantum is longer than a tick) is still fresh
+        assert!(o.observe(21_000_000, &mut E(engine(5, 10_000_000)), &mut P(run), &mut s).heartbeat_fresh);
+        // stalled sequence: no advance for longer than the staleness bound
+        assert!(!o.observe(45_000_000, &mut E(engine(5, 10_000_000)), &mut P(run), &mut s).heartbeat_fresh);
         // advancing but old timestamp
         let obs = o.observe(200_000_000, &mut E(engine(9, 100_000_000)), &mut P(run), &mut s);
         assert!(!obs.heartbeat_fresh);
