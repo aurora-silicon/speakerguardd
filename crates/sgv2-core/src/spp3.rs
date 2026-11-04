@@ -40,7 +40,7 @@
 //!   `R` is in `RebRange`. `Tlim_eff` smooths `base + clamp(T_OL - T_CL, 0,
 //!   cap)` (or `base` when the last window was rejected) over
 //!   `TlimErrDecayTime` with the 99 % law.
-//!   TODO(SPEC) t-4663: the relaxation is capped at the base (`CL_RELAXATION`)
+//!   TODO(SPEC) t-4668: the relaxation is capped at the base (`CL_RELAXATION`)
 //!   until the alpha inversion matches the goldens; CL never relaxes.
 //! - **Pilot.** With a calibration vector: on in an update iff
 //!   `f32(Pdrv) >= PilotEnableThres`; high above `PilotUpperThres`, low below
@@ -507,7 +507,7 @@ pub const THERMAL_STATE_COLD: u32 = 2;
 /// gates the pilot on at exactly that level. The golden wins until the text
 /// is reconciled.
 const PDRV_WITH_HEADROOM: bool = false;
-/// TODO(SPEC) t-4663: the closed-loop correction may relax the limit only
+/// TODO(SPEC) t-4668: the closed-loop correction may relax the limit only
 /// once `invTempCo` matches the goldens (279.18 / 273.04 logged against
 /// 271.57 / 266.49 from the spec formula on the synthetic SpTS). Until then
 /// the corrected limit is capped at the base: never less protective than
@@ -818,7 +818,7 @@ impl Cl {
             self.valid = false;
         }
         // max/min, not clamp: a NaN error falls back to the plain base.
-        // TODO(SPEC) t-4663: until the alpha inversion matches the goldens,
+        // TODO(SPEC) t-4668: until the alpha inversion matches the goldens,
         // the spec-formula invTempCo reads the coil cool and would relax the
         // limit past macOS, so the correction is capped at the base: the
         // closed loop runs and publishes T_CL but never relaxes.
