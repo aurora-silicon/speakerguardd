@@ -22,9 +22,10 @@
 //!   unity. The reference resets on reinitialisation (spec 5); a speaker
 //!   does not cool because a stream restarted, so here it never does.
 //!
-//! The program is held to digital full scale (`clamp(x, -1, 1)`, a
-//! non-finite sample 0) before the gain and before both power meters, so
-//! no finite sample can overflow them. A model state that goes non-finite
+//! The output is the program held to digital full scale (`clamp(x, -1,
+//! 1)`, a non-finite sample 0) times the gain. Both power meters see the
+//! program unclamped as the reference meters it, bounded only at
+//! `dsp::METER_FS` (16 FS) so no finite sample can overflow them. A model state that goes non-finite
 //! latches the 20 dB fail-safe (`Health::MODEL_FAULT`) until reset.
 //!
 //! A tuning with the global `Bypass` set is refused (the unit then runs the
@@ -48,7 +49,7 @@ use crate::{
 const EPS: f64 = f32::MIN_POSITIVE as f64;
 /// Longest update in host-block mode (`block_frames = 0`), frames.
 const HOST_MAX: usize = 4096;
-/// Stack chunk for bounding the unprotected drive before metering.
+/// Stack chunk for the metered drive.
 const BOUND_CHUNK: usize = 64;
 
 /// One speaker-type slot (A, B or C).
@@ -319,24 +320,37 @@ impl Run {
             let inp = &io.input[c][off..off + len];
             let out = &mut io.output[c][off..off + len];
             let curve = &self.curve[ch.group * self.block + phase..][..len];
-            // the unprotected drive, held to full scale
+            // the unprotected and the protected drive as the meters see them
             let mut k = 0;
             while k < len {
                 let m = (len - k).min(BOUND_CHUNK);
                 let mut x = [0.0f32; BOUND_CHUNK];
                 x[..m].copy_from_slice(&inp[k..k + m]);
-                dsp::bound(&mut x[..m]);
+                dsp::meter(&mut x[..m]);
                 ch.acc_in.add_sq(&x[..m], phase + k);
                 k += m;
             }
-            if dsp::mul_bounded_to(inp, curve, out) {
+            let bad = dsp::mul_bounded_to(inp, curve, out);
+            if bad {
                 for ((o, &x), &g) in out.iter_mut().zip(inp).zip(curve) {
                     *o = dsp::bound1(x) * g.min(FAILSAFE_GAIN);
                 }
                 failed = true;
             }
             // P covers the protected drive x[n]
-            ch.acc.add_sq(out, phase);
+            let mut k = 0;
+            while k < len {
+                let m = (len - k).min(BOUND_CHUNK);
+                let mut d = [0.0f32; BOUND_CHUNK];
+                dsp::mul_metered_to(&inp[k..k + m], &curve[k..k + m], &mut d[..m]);
+                if bad {
+                    for (dv, (&x, &g)) in d[..m].iter_mut().zip(inp[k..k + m].iter().zip(&curve[k..k + m])) {
+                        *dv = dsp::meter1(x) * g.min(FAILSAFE_GAIN);
+                    }
+                }
+                ch.acc.add_sq(&d[..m], phase + k);
+                k += m;
+            }
         }
         self.frame += len as u64;
         failed

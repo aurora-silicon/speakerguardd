@@ -37,10 +37,11 @@
 //!   target is `min(smoothed g_ff, group min g_hard)`, bypassing the attack.
 //! - **Dezipper.** The selected target crosses two cascaded per-sample
 //!   one-poles, `k = 1 - exp(ln(0.01) / (0.005 fs))`.
-//! - **Full scale.** The program is held to digital full scale (`clamp(x,
-//!   -1, 1)`, the most any converter delivers) before the gain and before
-//!   both model meters, so the meters see the drive the speaker can get
-//!   and no finite sample can overflow them. In-range audio is unchanged.
+//! - **Full scale.** The output is the program held to digital full scale
+//!   (`clamp(x, -1, 1)`) times the gain. The model meters see the program
+//!   unclamped as the reference meters it, bounded only at
+//!   `dsp::METER_FS` (16 FS) so no finite sample can overflow them, and
+//!   with a non-finite sample as 0. In-range audio is unchanged.
 //! - **Fail-safe.** A channel-count mismatch, or non-finite drive (the
 //!   simple-meter failure), gives 20 dB for the affected frames. A model
 //!   state that goes non-finite latches the 20 dB fail-safe
@@ -747,6 +748,8 @@ struct Chan {
     /// Model-alignment history.
     delay: Delay,
     scratch: Vec<f32>,
+    /// The protected drive of the current segment, as the model meters it.
+    drive: Vec<f32>,
     elec: f64,
     limit: f64,
     hard_on: f64,
@@ -893,6 +896,7 @@ impl Run {
                 },
                 delay: Delay::new(look),
                 scratch: vec![0.0; MODEL_SCRATCH],
+                drive: vec![0.0; THERMAL_FRAMES],
                 elec: ag * ag * reb / ((reb + series) * (reb + series)),
                 limit: c.temperature_limit as f64,
                 hard_on: c.temperature_limit as f64 + c.hard_temp_limit_headroom as f64,
@@ -990,16 +994,23 @@ impl Run {
             let inp = &io.input[c.src][off..off + len];
             let out = &mut io.output[c.src][off..off + len];
             let curve = &self.curve[c.group * THERMAL_FRAMES..][..len];
-            // the program held to full scale, times the gain
+            // output: the program held to full scale, times the gain; the
+            // protected drive the model meters: the metered program, times
+            // the same gain (bit-identical to the output in range)
+            let drive = &mut c.drive[..len];
             let non_finite = dsp::mul_bounded_to(inp, curve, out);
+            dsp::mul_metered_to(inp, curve, drive);
             if c.headroom != 1.0 {
                 dsp::scale_in_place(out, c.headroom);
+                dsp::scale_in_place(drive, c.headroom);
             }
             if non_finite {
                 // simple-meter failure: at most 20 dB below the input on
                 // these frames, non-finite samples muted
-                for ((o, &x), &g) in out.iter_mut().zip(inp).zip(curve) {
-                    *o = dsp::bound1(x) * (g * c.headroom).min(FAILSAFE_GAIN);
+                for (((o, d), &x), &g) in out.iter_mut().zip(drive.iter_mut()).zip(inp).zip(curve) {
+                    let gg = (g * c.headroom).min(FAILSAFE_GAIN);
+                    *o = dsp::bound1(x) * gg;
+                    *d = dsp::meter1(x) * gg;
                 }
                 *health |= Health::FAILSAFE;
             }
@@ -1007,14 +1018,13 @@ impl Run {
             let mut m0 = 0;
             while m0 < len {
                 let m = (len - m0).min(c.scratch.len());
-                // SAFETY: `out[m0..m0+m]` and `scratch[..m]` are distinct and hold `m` samples.
-                unsafe { c.delay.run(out.as_ptr().add(m0), c.scratch.as_mut_ptr(), m) };
+                // SAFETY: `drive[m0..m0+m]` and `scratch[..m]` are distinct and hold `m` samples.
+                unsafe { c.delay.run(drive.as_ptr().add(m0), c.scratch.as_mut_ptr(), m) };
                 c.acc.add_sq(&c.scratch[..m], phase + m0);
                 if FF_FROM_UNPROTECTED {
                     // SAFETY: as above, for the input.
                     unsafe { c.delay_in.run(inp.as_ptr().add(m0), c.scratch.as_mut_ptr(), m) };
-                    // held to full scale like the program the output carries
-                    dsp::bound(&mut c.scratch[..m]);
+                    dsp::meter(&mut c.scratch[..m]);
                     c.acc_in.add_sq(&c.scratch[..m], phase + m0);
                 }
                 m0 += m;

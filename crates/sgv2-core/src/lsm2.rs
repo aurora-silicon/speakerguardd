@@ -40,10 +40,10 @@
 //! - **Controller cadence.** Candidates update every 256 frames over the
 //!   samples still in the delay line (everything that has not yet left).
 //!
-//! Full scale: the program is held to digital full scale (`clamp(x, -1,
-//! 1)`, a non-finite sample 0) before the model and on the output, so the
-//! model sees the drive the speaker can get and a huge finite sample cannot
-//! leave it hot for minutes. A model state that goes non-finite latches the
+//! Full scale: the output is held to digital full scale (`clamp(x, -1,
+//! 1)`, a non-finite sample 0). The model sees the program unclamped as
+//! the reference does, bounded only at `dsp::METER_FS` (16 FS), so a huge
+//! finite sample cannot overflow it or leave it hot for hours. A model state that goes non-finite latches the
 //! 20 dB fail-safe (`Health::MODEL_FAULT`) until reset.
 //!
 //! Hand-off: `save_state`/`restore_state` carry the coil and magnet rises,
@@ -573,7 +573,7 @@ impl Run {
     fn model(&mut self, io: &Io<'_, '_>, k: usize) {
         let hp = self.hist_pos;
         for c in self.ch.iter_mut() {
-            let x = dsp::bound1(io.input[c.src][k]) as f64;
+            let x = dsp::meter1(io.input[c.src][k]) as f64;
             let u = c.vfs * x;
             let i = c.current.step(u);
             let xd = c.disp.step(u);
