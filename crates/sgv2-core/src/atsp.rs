@@ -33,6 +33,8 @@ use crate::blob::{BlobError, Pod};
 use crate::{dsp, ChannelState, Health, Io, ProtectionUnit, Telemetry, UnitKind, FAILSAFE_GAIN, MAX_CHANNELS};
 
 const EPS: f64 = f32::MIN_POSITIVE as f64;
+/// Longest update in host-block mode (`block_frames = 0`), frames.
+const HOST_MAX: usize = 4096;
 
 /// One speaker-type slot (A, B or C).
 #[repr(C)]
@@ -86,7 +88,7 @@ impl Params {
         if n == 0 || n > MAX_CHANNELS || self.sample_rate == 0 {
             return Err(InitError::Invalid("geometry"));
         }
-        if self.block_frames == 0 || self.block_frames > 16384 {
+        if self.block_frames > 16384 {
             return Err(InitError::Invalid("block frames"));
         }
         let pos = |v: f32| v.is_finite() && v > 0.0;
@@ -138,6 +140,8 @@ struct Chan {
     rth_mg: f64,
     a_vc: f64,
     a_mg: f64,
+    tau_vc: f64,
+    tau_mg: f64,
     hard_limit: f64,
     ambient: f64,
     group: usize,
@@ -160,6 +164,8 @@ struct Group {
 struct Run {
     n: usize,
     block: usize,
+    dynamic: bool,
+    rate: f64,
     ch: Vec<Chan>,
     groups: Vec<Group>,
     /// Gain of every frame of the current block, per group.
@@ -202,7 +208,10 @@ impl Run {
         }
         let n = p.channels as usize;
         let rate = p.sample_rate as f64;
-        let block = p.block_frames as usize;
+        // 0: the graph has no reblocker, so the model updates once per host
+        // call (calls longer than HOST_MAX are split).
+        let dynamic = p.block_frames == 0;
+        let block = if dynamic { HOST_MAX } else { p.block_frames as usize };
         let dt = block as f64 / rate;
         let mut groups: Vec<Group> = Vec::new();
         let mut ch: Vec<Option<Chan>> = (0..n).map(|_| None).collect();
@@ -242,6 +251,8 @@ impl Run {
                     rth_mg: s.rth_mg as f64,
                     a_vc: dt / (s.tau_vc as f64 + dt),
                     a_mg: dt / (s.tau_mg as f64 + dt),
+                    tau_vc: s.tau_vc as f64,
+                    tau_mg: s.tau_mg as f64,
                     hard_limit: s.temperature_limit as f64 + s.hard_limit_headroom as f64,
                     ambient: s.ambient as f64,
                     group,
@@ -258,7 +269,7 @@ impl Run {
         let ch: Vec<Chan> =
             ch.into_iter().map(|c| c.ok_or(InitError::Invalid("unclaimed channel"))).collect::<Result<_, _>>()?;
         let curve = vec![1.0; groups.len() * block];
-        Ok(Run { n, block, ch, groups, curve, pos: 0, frame: 0, last_frame: 0 })
+        Ok(Run { n, block, dynamic, rate, ch, groups, curve, pos: 0, frame: 0, last_frame: 0 })
     }
 
     fn reset(&mut self) {
@@ -309,7 +320,14 @@ impl Run {
     }
 
     fn end_block(&mut self) {
-        let blk = self.block as f64;
+        let blk = self.pos as f64;
+        if self.dynamic {
+            let dt = blk / self.rate;
+            for c in self.ch.iter_mut() {
+                c.a_vc = dt / (c.tau_vc + dt);
+                c.a_mg = dt / (c.tau_mg + dt);
+            }
+        }
         let mut tgt = [1.0f64; MAX_CHANNELS];
         let mut hard = [false; MAX_CHANNELS];
         for c in self.ch.iter_mut() {
@@ -332,6 +350,8 @@ impl Run {
             let t = tgt[gi] as f32;
             let r = if t < g.gain { g.r_attack } else { g.r_release };
             let curve = &mut self.curve[gi * self.block..][..self.block];
+            // (in host-block mode the next call reads this curve from its
+            // first frame, so the full capacity is filled)
             let mut v = g.gain;
             for c in curve.iter_mut() {
                 v = t + r * (v - t);
@@ -343,7 +363,7 @@ impl Run {
                 curve.iter_mut().for_each(|c| *c *= FAILSAFE_GAIN);
             }
         }
-        self.last_frame = self.frame - self.block as u64;
+        self.last_frame = self.frame - self.pos as u64;
     }
 }
 
@@ -379,6 +399,10 @@ impl ProtectionUnit for Unit {
                 run.end_block();
                 run.pos = 0;
             }
+        }
+        if run.dynamic && run.pos > 0 {
+            run.end_block();
+            run.pos = 0;
         }
         Health::OK
     }

@@ -112,3 +112,15 @@ fn slicing_invariance() {
         assert_eq!(render(s), r, "slice {s}");
     }
 }
+
+#[test]
+fn host_block_mode_updates_per_call() {
+    let mut p = params();
+    p.block_frames = 0;
+    let mut u = Unit::new(p);
+    assert!(!u.is_failsafe());
+    let t = drive(&mut u, [0.1; 4], 200.0, 480);
+    let pw = 100.0 * 0.01 / 8.0;
+    assert!((t.channels[0].modeled_power_w as f64 - pw).abs() < 1e-6);
+    assert!((t.channels[0].coil_temp_c as f64 - (40.0 + pw * 70.0)).abs() < 0.05);
+}
