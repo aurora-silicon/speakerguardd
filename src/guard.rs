@@ -2296,7 +2296,18 @@ impl Guard {
         // A target write can block while the old lease runs down. Keep
         // that entire allowance and its queue at the old or new gain;
         // a subsequent renewal can grant a fresh lease at the new gain.
-        let pending_s = now.saturating_duration_since(self.account_to).as_secs_f64() + QUEUE_BOUND.as_secs_f64() + KERNEL_LOCK_TIMEOUT.as_secs_f64();
+        // The copy queue is the J700's: it converts on copy, so audio
+        // already queued at an older gain keeps playing. A V/I card's
+        // volume is the amplifier's own control, applied to every sample
+        // as the write lands, so nothing plays at an earlier gain there.
+        // That holds only where the voltage-only feed-forward model
+        // governs. The asahi governor alone cannot see a current line that
+        // reads a steady 0.55 to 0.65 of its current on program with no
+        // low band (recurrent cases 113, 160, 187, 493, 503 and 757 reach
+        // 164 C without this term), so it keeps the term as that margin.
+        let ff_governs = self.governing == Governor::Unified;
+        let queue_s = if self.playback_cfg.has_vi() && ff_governs { 0.0 } else { QUEUE_BOUND.as_secs_f64() };
+        let pending_s = now.saturating_duration_since(self.account_to).as_secs_f64() + queue_s + KERNEL_LOCK_TIMEOUT.as_secs_f64();
         // A renewal can follow a blocking write only while the account is
         // this fresh. Reserve that delay as well as a full new lease.
         let lease_s = KERNEL_LOCK_TIMEOUT.as_secs_f64() + self.dt.unwrap_or(0.0) + BLIND_SLACK.as_secs_f64();
