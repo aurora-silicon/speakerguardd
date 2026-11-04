@@ -68,6 +68,8 @@ pub enum SenseFormat {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Globals {
+    /// Require fresh complete sense data before every admission.
+    pub strict_admission: bool,
     /// The card's speaker sense PCM device number.
     pub sense_pcm: u32,
     /// Ambient temperature assumed at start (°C).
@@ -307,6 +309,7 @@ impl Config {
         let g = sections.get("Globals").ok_or_else(|| ConfigError("missing [Globals]".into()))?;
         let c = sections.get("Controls").ok_or_else(|| ConfigError("missing [Controls]".into()))?;
         let globals = Globals {
+            strict_admission: boolean(g, "Globals", "strict_admission", false)?,
             sense_pcm: num(g, "Globals", "sense_pcm")?,
             t_ambient: num(g, "Globals", "t_ambient")?,
             t_hysteresis: num(g, "Globals", "t_hysteresis")?,

@@ -559,6 +559,7 @@ pub struct Guard {
     /// A change event was seen after the last look's sample-rate read: the
     /// time after that look is not known to be quiet.
     event_pending: bool,
+    admission_clock: Option<(Instant, Duration)>,
     /// This run has invalidated the clean stop it may have resumed (the
     /// state file says released 0, or there is none): needed before any
     /// unlock, so that a later crash cannot resume an older clean stop.
@@ -937,6 +938,7 @@ impl Guard {
             unknown: false,
             events,
             event_pending: false,
+            admission_clock: None,
             invalidated: false,
             invalidate_failed: false,
             unknown_floor,
@@ -1474,6 +1476,8 @@ impl Guard {
     /// Pings the volume lock.  A ping that answers ETIMEDOUT is the card's
     /// one-shot notice that the lock had lapsed, so ping once more.
     fn ping_lock<H: Hw>(&mut self, hw: &mut H) -> Result<bool, Box<dyn Error>> {
+        self.check_admission_clock(hw)?;
+        if self.globals.strict_admission && !self.fresh_enough(hw.now()) { return Ok(false); }
         if !self.issue_playback(hw)? {return Ok(false);}
         // whatever the ping answers, the card may be unlocked from here on
         self.locked_at = None;
@@ -1490,6 +1494,10 @@ impl Guard {
                 // the card held its safe level from the lapse (not before
                 // the lease's length after the last ping) until now
                 self.mark_kernel_since(self.last_ping + KERNEL_LOCK_TIMEOUT);
+                if self.globals.strict_admission {
+                    self.readmit(hw, "expired lease requires fresh sense admission")?;
+                    return Ok(false);
+                }
                 renewed_at = hw.now();
                 hw.ping().map_err(|e| format!("lock ping: {e}"))?;
             }
@@ -1854,6 +1862,35 @@ impl Guard {
         self.disarm(hw, "the sense data is not a measurement")
     }
 
+    /// Lost capture evidence requires a new admission, without resetting heat.
+    fn readmit<H: Hw>(&mut self, hw: &mut H, why: &str) -> Result<(), Box<dyn Error>> {
+        self.fresh = 0;
+        self.good_since_bad = 0;
+        self.recovering = true;
+        self.disarm(hw, why)
+    }
+
+    fn check_admission_clock<H: Hw>(&mut self, hw: &mut H) -> Result<(), Box<dyn Error>> {
+        if self.globals.strict_admission {
+            // CLOCK_BOOTTIME advances in s2idle; CLOCK_MONOTONIC does not.
+            // Read boot first so a suspend between the reads is detected on
+            // this pass or the next. Never restore sense freshness across it.
+            let boot = hw.boottime();
+            let mono = hw.now();
+            if let Some((previous_mono, previous_boot)) = self.admission_clock {
+                if boot.saturating_sub(previous_boot)
+                    > mono.saturating_duration_since(previous_mono) + Duration::from_millis(10)
+                {
+                    self.readmit(hw, "resume requires fresh sense admission")?;
+                    self.stall = None;
+                    hw.close_sense();
+                }
+            }
+            self.admission_clock = Some((mono, boot));
+        }
+        Ok(())
+    }
+
     /// One pass of the loop: idle accounting, or one sense period.
     pub fn tick<H: Hw>(&mut self, hw: &mut H) -> Result<(), Box<dyn Error>> {
         if self.rec.as_ref().is_some_and(Recorder::needs_rotation) {
@@ -1868,6 +1905,7 @@ impl Guard {
                 self.rec_rate = None;
             }
         }
+        self.check_admission_clock(hw)?;
         self.refresh_playback(hw)?;
         let globals = self.globals.clone();
         // before the rate read: a stream it shows was there by then, and the
@@ -1909,6 +1947,10 @@ impl Guard {
             }
             Err(e) => return Err(format!("sample-rate control: {e}").into()),
         };
+        if globals.strict_admission && (changed || rate != self.rate) {
+            self.readmit(hw, "sample-rate transition requires fresh sense admission")?;
+            if self.stall.take().is_some() { hw.close_sense(); }
+        }
         if rate == 0 {
             let now = hw.now();
             if self.playing {
@@ -2010,6 +2052,19 @@ impl Guard {
             self.words = words;
             match read {
                 Ok(Some(true)) => {
+                    if globals.strict_admission {
+                        self.check_admission_clock(hw)?;
+                        // A complete period is admissible only if the rate
+                        // stayed unchanged throughout its capture.
+                        let stable = hw.sample_rate().ok() == Some(i64::from(rate))
+                            && !hw.rate_events() && self.stall.is_some();
+                        if !stable {
+                            self.readmit(hw, "sense period crossed a rate or PM boundary")?;
+                            self.stall = None;
+                            hw.close_sense();
+                            return self.maintain(hw);
+                        }
+                    }
                     let before = hw.now();
                     let queued = match hw.queued() {
                         Ok(q) => q,
@@ -2020,6 +2075,7 @@ impl Guard {
                             rec_now(&mut self.rec, hw, |r, t| r.loss(t, record::LOSS_POSITION, errno));
                             self.fresh = 0;
                             self.good_since_bad = 0;
+                            if globals.strict_admission { self.readmit(hw, "capture position unavailable")?; }
                             return self.maintain(hw);
                         }
                     };
@@ -2075,6 +2131,11 @@ impl Guard {
                     rec_now(&mut self.rec, hw, |r, t| r.loss(t, record::LOSS_SHORT, 0));
                     self.fresh = 0;
                     self.good_since_bad = 0;
+                    if globals.strict_admission {
+                        self.readmit(hw, "incomplete sense period")?;
+                        self.stall = None;
+                        hw.close_sense();
+                    }
                 }
                 Ok(None) => {
                     if self.stall.as_mut().unwrap().silent(hw.now()) {
@@ -2084,6 +2145,7 @@ impl Guard {
                         self.fresh = 0;
                         self.good_since_bad = 0;
                         hw.close_sense();
+                        if globals.strict_admission { self.readmit(hw, "sense stream stalled")?; }
                     }
                 }
                 Err(e) if transient(&e) => {
@@ -2094,6 +2156,7 @@ impl Guard {
                     self.fresh = 0;
                     self.good_since_bad = 0;
                     hw.close_sense();
+                    if globals.strict_admission { self.readmit(hw, "sense capture interrupted")?; }
                     self.maintain(hw)?;
                     hw.sleep(PING_INTERVAL);
                     return Ok(());
@@ -2146,6 +2209,9 @@ impl Guard {
     /// The model is current enough to lift or renew the lock now (checked
     /// again after anything that may block).
     fn fresh_enough(&self, now: Instant) -> bool {
+        if self.globals.strict_admission && (self.fresh < REARM_PERIODS || self.recovering) {
+            return false;
+        }
         if self.playback.is_some() {
             return now.saturating_duration_since(self.account_to)<KERNEL_LOCK_TIMEOUT
                 && !(self.playing && self.overdue(now)>BLIND_LIMIT);
@@ -2422,8 +2488,12 @@ impl Guard {
             // A qualified finite grant already bounds unseen playback. A
             // trustworthy restored model need not wait six capture periods
             // before its first grant; bad-data recovery still requires them.
-            let seeing = !self.playing || (self.fresh >= REARM_PERIODS && blind <= BLIND_SLACK)
-                || (self.playback.is_some() && !self.bad_data && self.fresh_enough(now));
+            let seeing = if self.globals.strict_admission {
+                self.playing && self.fresh >= REARM_PERIODS && blind <= BLIND_SLACK
+            } else {
+                !self.playing || (self.fresh >= REARM_PERIODS && blind <= BLIND_SLACK)
+                    || (self.playback.is_some() && !self.bad_data && self.fresh_enough(now))
+            };
             let retry = self.last_save_try.is_none_or(|t| hw.now().duration_since(t) >= SAVE_INTERVAL);
             if seeing && !self.invalidated && retry {
                 // the clean stop this run may have resumed goes first
@@ -2699,6 +2769,9 @@ pub mod fake {
         pub incomplete: Vec<Duration>,
         /// The sample-rate control fails (EIO) at time t.
         pub rate_fail: Box<dyn Fn(Duration) -> bool>,
+        pub rate_value: Option<i64>,
+        pub capture_errno: Option<i32>,
+        pub capture_short: bool,
         /// Volume writes fail (EIO) at time t, the card keeping its value.
         pub volume_fail: Box<dyn Fn(Duration) -> bool>,
         /// A late read finds only the newest period: the frames before it
@@ -2786,6 +2859,9 @@ pub mod fake {
                 complete: Vec::new(),
                 incomplete: Vec::new(),
                 rate_fail: Box::new(|_| false),
+                rate_value: None,
+                capture_errno: None,
+                capture_short: false,
                 volume_fail: Box::new(|_| false),
                 lossy: false,
                 last_end: Duration::ZERO,
@@ -3154,7 +3230,7 @@ pub mod fake {
             if (self.rate_fail)(self.t) {
                 return Err(io::Error::from_raw_os_error(libc::EIO));
             }
-            Ok(if (self.playing)(self.t) { 48000 } else { 0 })
+            Ok(self.rate_value.unwrap_or_else(|| if (self.playing)(self.t) { 48000 } else { 0 }))
         }
         fn queued(&mut self) -> io::Result<u64> {
             if let Some(reader) = self.pcm.as_mut() {
@@ -3224,6 +3300,12 @@ pub mod fake {
             self.pcm = None;
         }
         fn read_period(&mut self, words: &mut [i32]) -> io::Result<Option<bool>> {
+            if let Some(errno) = self.capture_errno.take() { return Err(io::Error::from_raw_os_error(errno)); }
+            if std::mem::take(&mut self.capture_short) {
+                self.t += self.period;
+                self.incomplete.push(self.t);
+                return Ok(Some(false));
+            }
             assert!(self.sense_open, "read on a closed capture");
             // a sample-rate change ends the wait early, as the card's event does
             let change = if self.events { self.next_change(self.t, self.t + Duration::from_millis(50)) } else { None };
@@ -3318,6 +3400,84 @@ pub(crate) mod tests {
 
     const POLL: Duration = Duration::from_millis(50);
     const J700: &str = include_str!("../conf/apple/j700.conf");
+
+    fn strict_fixture() -> (Config, FakeHw, Guard) {
+        let mut cfg = j413();
+        cfg.globals.strict_admission = true;
+        let mut hw = FakeHw::per_speaker(&cfg);
+        hw.level = Box::new(|_| 0.003);
+        let g = Guard::start(&mut hw, &cfg, cfg.globals.max_reduction,
+            Some(vi_state(&cfg, 55.0, 52.0))).unwrap();
+        (cfg, hw, g)
+    }
+
+    #[test]
+    fn strict_admission_never_unlocks_idle_or_before_complete_sense() {
+        let (_, mut hw, mut g) = strict_fixture();
+        hw.playing = Box::new(|t| t >= secs(1.0));
+        while hw.t < secs(1.0) { g.tick(&mut hw).unwrap(); }
+        assert!(hw.pings.is_empty(), "idle admission unlocked the card");
+        while hw.delivered < REARM_PERIODS { g.tick(&mut hw).unwrap(); }
+        run_until(&mut g, &mut hw, secs(3.0)).unwrap();
+        assert!(g.armed());
+        assert!(hw.first_ping().unwrap() >= secs(1.0) + hw.period * REARM_PERIODS);
+    }
+
+    #[test]
+    fn strict_admission_short_period_releases_and_readmits() {
+        let (_, mut hw, mut g) = strict_fixture();
+        run_until(&mut g, &mut hw, secs(2.0)).unwrap();
+        assert!(g.armed());
+        let pings = hw.pings.len();
+        hw.capture_short = true;
+        g.tick(&mut hw).unwrap();
+        assert!(!g.armed());
+        assert_eq!(hw.pings.len(), pings);
+        assert!(g.recovering && g.fresh == 0);
+        run_until(&mut g, &mut hw, secs(4.0)).unwrap();
+        assert!(g.armed());
+    }
+
+    #[test]
+    fn strict_admission_estrpipe_releases_without_crashing() {
+        let (_, mut hw, mut g) = strict_fixture();
+        run_until(&mut g, &mut hw, secs(2.0)).unwrap();
+        assert!(g.armed());
+        hw.capture_errno = Some(libc::ESTRPIPE);
+        g.tick(&mut hw).unwrap();
+        assert!(!g.armed() && g.recovering && g.fresh == 0);
+        run_until(&mut g, &mut hw, secs(4.0)).unwrap();
+        assert!(g.armed());
+    }
+
+    #[test]
+    fn strict_admission_rate_change_discards_prior_evidence() {
+        let (_, mut hw, mut g) = strict_fixture();
+        run_until(&mut g, &mut hw, secs(2.0)).unwrap();
+        assert!(g.armed());
+        hw.rate_value = Some(44100);
+        hw.capture_errno = Some(libc::EAGAIN);
+        g.tick(&mut hw).unwrap();
+        assert_eq!(g.rate, 44100);
+        assert!(!g.armed() && g.fresh == 0);
+    }
+
+    #[test]
+    fn strict_admission_resume_keeps_heat_and_requires_new_periods() {
+        let (_, mut hw, mut g) = strict_fixture();
+        run_until(&mut g, &mut hw, secs(2.0)).unwrap();
+        assert!(g.armed());
+        let before = g.engine.as_ref().unwrap().asahi.as_ref().unwrap()[0].th.clone();
+        hw.boot += secs(30.0); // s2idle: boottime advances, monotonic stays.
+        hw.capture_errno = Some(libc::ESTRPIPE);
+        g.tick(&mut hw).unwrap();
+        assert!(!g.armed() && g.fresh == 0);
+        let after = &g.engine.as_ref().unwrap().asahi.as_ref().unwrap()[0].th;
+        assert!(after.t_coil >= before.t_coil - 0.1, "model reset on resume");
+        run_until(&mut g, &mut hw, secs(4.0)).unwrap();
+        assert!(g.armed());
+    }
+
 
     #[test]
     fn a_silent_stream_stalls_after_the_timeout() {

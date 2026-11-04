@@ -668,6 +668,7 @@ mod tests {
 
     fn globals() -> Globals {
         Globals {
+            strict_admission: false,
             sense_pcm: 2,
             t_ambient: 35.0,
             t_hysteresis: 5.0,
