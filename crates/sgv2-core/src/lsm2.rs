@@ -30,7 +30,13 @@
 //!   smoothed fast and slow gains. Downward moves use `AttackTime`; recovery
 //!   uses `FastReleaseTime` (fast) and `SlowReleaseTime` (slow).
 //!   `EnableMitigation = 0` keeps the modelling and latency and attenuates
-//!   nothing.
+//!   nothing on macOS; here it is refused (fail-safe), as is a tuning with
+//!   neither thermal axis (power or temperature) enabled: either would run
+//!   the speakers unprotected while health reports OK.
+//! - **Latency floor.** The controller decides every 256 frames over the
+//!   samples still in the delay line, so a latency below 256 frames lets a
+//!   transient leave before any decision has seen it; such a tuning is
+//!   refused. (The Neo's is 352.)
 //! - **Controller cadence.** Candidates update every 256 frames over the
 //!   samples still in the delay line (everything that has not yet left).
 //!
@@ -216,6 +222,15 @@ impl Params {
         if lat > 16384.0 {
             return Err(InitError::Invalid("latency"));
         }
+        if self.latency_frames() < CONTROLLER_FRAMES {
+            return Err(InitError::Invalid("latency below the controller cadence"));
+        }
+        if self.enable_mitigation == 0 {
+            return Err(InitError::Invalid("mitigation disabled"));
+        }
+        if self.control_power == 0 && self.control_temperature == 0 {
+            return Err(InitError::Invalid("no thermal axis enabled"));
+        }
         for j in 0..4 {
             if !(pos(self.power_time_scale_s[j])
                 && pos(self.power_hard_limit_w[j])
@@ -259,6 +274,14 @@ impl Params {
             }
         }
         Ok(())
+    }
+
+    /// The audio latency in frames: two filterbank stages plus the speaker
+    /// response look-ahead, each rounded to frames.
+    pub fn latency_frames(&self) -> usize {
+        let rate = self.sample_rate as f64;
+        let frames = |ms: f32| libm::round(ms as f64 * 1e-3 * rate) as usize;
+        2 * frames(self.filterbank_latency_ms) + frames(self.speaker_response_lookahead_ms)
     }
 
     /// Decode and check a complete blob.
@@ -420,8 +443,7 @@ impl Run {
         }
         let n = p.channels as usize;
         let rate = p.sample_rate as f64;
-        let frames = |ms: f32| libm::round(ms as f64 * 1e-3 * rate) as usize;
-        let latency = 2 * frames(p.filterbank_latency_ms) + frames(p.speaker_response_lookahead_ms);
+        let latency = p.latency_frames();
         let hist_len = latency + 1;
         let dt = 1.0 / rate;
         let mut ch = Vec::with_capacity(n);

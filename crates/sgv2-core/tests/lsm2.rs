@@ -79,8 +79,9 @@ fn sine(freq: f64, amp: f32, secs: f64) -> Vec<f32> {
 
 #[test]
 fn latency_is_two_filterbank_stages_plus_lookahead_for_any_call_size() {
+    // (mitigation off is refused; the temperature axis is unity while cold)
     let mut p = params();
-    p.enable_mitigation = 0;
+    p.control_temperature = 1;
     for slice in [1usize, 7, 31, 32, 33, 96, 127, 160, 256, 512, 4096] {
         let mut u = Unit::new(p);
         assert_eq!(u.latency_frames(), 2 * 120 + 48);
@@ -95,7 +96,9 @@ fn latency_is_two_filterbank_stages_plus_lookahead_for_any_call_size() {
 
 #[test]
 fn disabled_axes_and_quiet_audio_are_unity() {
-    let p = params();
+    // every axis but temperature off (all off is refused), cold and quiet
+    let mut p = params();
+    p.control_temperature = 1;
     let mut u = Unit::new(p);
     let x = sine(1000.0, 0.01, 2.0);
     let out = run(&mut u, &[x.clone(), x.clone()], 512);
@@ -108,6 +111,7 @@ fn disabled_axes_and_quiet_audio_are_unity() {
 fn displacement_candidate_matches_the_transfer_function() {
     let mut p = params();
     p.control_displacement = 1;
+    p.control_temperature = 1;
     let mut u = Unit::new(p);
     let f = 80.0;
     let x = sine(f, 1.0, 1.0);
