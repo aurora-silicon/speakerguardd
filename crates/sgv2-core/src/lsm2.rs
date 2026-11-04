@@ -123,11 +123,17 @@
 //!   the applied gain, else one 99 %-settling `SlowReleaseTime` step per
 //!   controller frame. The larger cuts near `TemperatureHardLimit +
 //!   TemperatureHeadroom` and the candidate itself (the axis's own thermal
-//!   predictor) are still open.
+//!   predictor) are still open: the rig settles the ceiling at
+//!   `0.99 sqrt((C - Tamb - theta_mag) / (Rvc Pin))` with `C = Thard +
+//!   max(0, Headroom)` on the hottest output-referred channel and `Pin` the
+//!   ungained input power (temperature axis alone; other axes untested),
+//!   but the approach transient is unexplained, so neither is implemented.
+//!   Daybreak t-4670.
 //! - **Temperature candidate.** The 25G83 temperature gain falls from about
 //!   63 degC under the 1 kHz and 200 Hz ramps (0.886 at 63.4 degC) with a
 //!   trajectory that does not depend on the coil temperature, where the
 //!   knee (soft 120 degC, headroom 5) gives unity. The knee is used.
+//!   Daybreak t-4670.
 //! - Mid/high rails, battery input and soft knees below 100 % are refused.
 
 use alloc::vec;

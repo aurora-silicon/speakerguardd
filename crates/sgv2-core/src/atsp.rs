@@ -57,15 +57,20 @@
 //!   `(Vfs x)^2 / Rdc` "in the controller power estimator" but not its
 //!   window. Bit-identical output for host slices 2..4096 rules out a
 //!   per-call mean. Here it is a one-pole mean of the instantaneous drive
-//!   power with the slot's attack coefficient.
+//!   power with the slot's attack coefficient. Daybreak t-4670.
 //! - **Smoothing order.** The 25G83 gain leaves unity quadratically (1e-5
 //!   below unity 2 ms after entry, against 1.6e-2 for the specified
 //!   one-pole toward a request near 0.53), holds about 0.5 s before
 //!   releasing and recovers along an S-curve: not the first-order
 //!   99 %-settling law the specification states and this unit implements.
-//! - **Panic hold.** The rig (law 4) has the 0.1 target held about
-//!   5000-5750 samples before release; here it holds to the next
-//!   controller block boundary once the coil is back at the hard limit.
+//!   Daybreak t-4670 (attack/release law).
+//! - **Panic hold and release.** The rig (law 4) has the 0.1 target held
+//!   about 3500-5750 samples from the step, case dependent (perhaps until
+//!   `Tvc <= Tlim + headroom`, untested), then a slow rise (about 0.10 ->
+//!   0.15 over 20k samples); here it holds to the next controller block
+//!   boundary once the coil is back at the hard limit. The thermal input
+//!   during a panic (controller gain only, here) is unverified. Daybreak
+//!   t-4670.
 //! - **Q = 1.** macOS takes a distinct path for one-frame host calls (the
 //!   tone-burst gain is 1.0019 to 1.0027 there); it is not specified, and
 //!   this unit renders Q = 1 like any other slice.
