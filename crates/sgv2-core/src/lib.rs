@@ -113,8 +113,16 @@ pub trait ProtectionUnit {
     fn process(&mut self, io: Io<'_, '_>) -> Health;
     /// Snapshot of the internal state the differential rig compares.
     fn telemetry(&self, out: &mut Telemetry);
-    /// Return to the initial state (stream start).
+    /// Return to the initial state (stream start): the kernel is
+    /// reconstructed from its parameters.
     fn reset(&mut self);
+    /// The host's in-stream reset (`AudioUnitReset` on macOS). spp3 clears
+    /// only its closed-loop estimator and keeps the thermal state; units
+    /// whose reset semantics are not specified apart from construction
+    /// reconstruct.
+    fn host_reset(&mut self) {
+        self.reset();
+    }
 }
 
 /// Linear gain of [`FAILSAFE_ATTENUATION_DB`]: 10^(-20/20) = 0.1.
