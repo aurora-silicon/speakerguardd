@@ -217,6 +217,7 @@ pub struct Observer {
     engine_pid: Option<(u32, bool)>,
     /// When the current engine generation was first seen.
     generation_ns: Option<u64>,
+    session_why: &'static str,
     last_frames: u64,
     /// When the sequence was last seen to advance.
     last_advance_ns: Option<u64>,
@@ -237,6 +238,7 @@ impl Observer {
             last_seq_before: None,
             engine_pid: None,
             generation_ns: None,
+            session_why: "",
             last_frames: 0,
             last_advance_ns: None,
             quantum: None,
@@ -250,6 +252,12 @@ impl Observer {
     /// that follow get [`GRANT_GRACE_NS`].
     pub fn note_grant(&mut self, now_ns: u64) {
         self.granted_at = Some(now_ns);
+    }
+
+    /// Why the last tick's session report did not hold ("" if it did): for
+    /// the release log.
+    pub fn session_why(&self) -> &'static str {
+        self.session_why
     }
 
     /// The current heartbeat staleness bound, once the quantum is known.
@@ -346,6 +354,21 @@ impl Observer {
             self.engine_pid = Some((e.pid, e.valid));
         }
         let generation = self.generation_ns.unwrap_or(now_ns);
+        self.session_why = if !s.present {
+            "no report (missing, unreadable or malformed)"
+        } else if !s.helper_alive {
+            "writer not vouched alive (pid/start check)"
+        } else if s.mono_ns < generation {
+            "written before this engine generation"
+        } else if s.mono_ns > now_ns.saturating_add(SESSION_SKEW_NS) {
+            "dated in the future"
+        } else if now_ns.saturating_sub(s.mono_ns) > SESSION_STALE_NS {
+            "stale"
+        } else if !s.links_ok || !s.carrier_ok {
+            "the helper reports links or carrier not ok"
+        } else {
+            ""
+        };
         let session_fresh = s.present
             && s.helper_alive
             && s.mono_ns >= generation
@@ -1310,5 +1333,22 @@ mod tests {
         t += q;
         let dead = SessionReport { helper_alive: false, ..session(t) };
         assert!(matches!(step(&mut o, &mut sup, &mut k, t, 6, dead), Event::Released { .. }));
+    }
+
+    #[test]
+    fn the_reason_a_report_did_not_hold_is_named() {
+        let mut o = Observer::new(7, 48_000, TICK);
+        let now = 2_000_000_000u64;
+        o.observe(&mut || 1, &mut E(EngineState::default()), &mut P(PcmState::Closed), &mut S(session(1)));
+        let mut why = |r: SessionReport| {
+            o.observe(&mut || now, &mut E(EngineState::default()), &mut P(PcmState::Closed), &mut S(r));
+            o.session_why()
+        };
+        assert_eq!(why(session(now)), "");
+        assert!(why(SessionReport::default()).starts_with("no report"));
+        assert!(why(SessionReport { helper_alive: false, ..session(now) }).starts_with("writer"));
+        assert_eq!(why(session(now - SESSION_STALE_NS - 1)), "stale");
+        assert_eq!(why(session(now + SESSION_SKEW_NS + 1)), "dated in the future");
+        assert!(why(SessionReport { links_ok: false, ..session(now) }).starts_with("the helper reports"));
     }
 }
