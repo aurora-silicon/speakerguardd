@@ -19,9 +19,10 @@ fn params() -> Params {
         thermal_gain_release_time_s: 2.0,
         thermal_lookahead_delay_ms: 1.5,
         thermal_protection_enabled: 1,
-        thermal_safe_tlim: 0.0,
-        thermal_safe_tlim_offset: 0.0,
-        thermal_safe_tlim_time_min: 0.0,
+        thermal_safe_tlim: 100.0,
+        thermal_safe_tlim_offset: -15.0,
+        thermal_safe_tlim_time_min: 10.0,
+        thermal_state_override: spp3::THERMAL_STATE_COLD,
         ..Params::default()
     };
     for c in 0..4 {
@@ -47,10 +48,16 @@ fn params() -> Params {
             v_pwr_thres: 0.0,
             sense_i: 2 * c as u32,
             sense_v: 2 * c as u32 + 1,
-            initial_theta_vc: 0.0,
-            initial_theta_mg: 0.0,
             pilot_tone_enabled: 0,
             pilot_ampl_hi_db: -30.0,
+            pilot_ampl_lo_db: -40.0,
+            pilot_upper_thres: 90.0,
+            pilot_lower_thres: 80.0,
+            pilot_decay_time_s: 0.03,
+            pilot_decay_time_stage2_s: 0.03,
+            pilot_freq: 43.0664,
+            pilot_enable_thres: 0.03,
+            thermal_measurement_method: spp3::METHOD_PILOT_TONE,
             temp_sense_window_time_s: 0.1,
             temp_sense_smoothing_tau_s: 0.5,
             rdc_scale: 1.0,
@@ -454,18 +461,29 @@ fn pilot_mode_reserves_program_headroom_from_the_first_sample() {
 }
 
 #[test]
-fn start_state_is_a_parameter() {
-    let mut p = params();
-    p.ch[0].initial_theta_vc = 70.0;
-    p.ch[0].initial_theta_mg = 30.0;
-    let mut u = spp3::Unit::new(p);
-    let (t, _) = drive(&mut u, [0.0; 4], dt(), U);
-    let c = &p.ch[0];
-    let want = 40.0 + 70.0 * (1.0 - dt() / c.tau_tvc as f64) + 30.0 * (1.0 - dt() / c.tau_tmg as f64);
-    assert!((t.channels[0].ol_temp_c as f64 - want).abs() < 1e-3);
-    u.reset();
-    let (t, _) = drive(&mut u, [0.0; 4], dt(), U);
-    assert!((t.channels[0].ol_temp_c as f64 - want).abs() < 1e-3);
+fn hot_fallback_seeds_the_steady_state_split_at_the_limit() {
+    // 64007 other than 2 (spec 10): theta_vc0 = P0 T_sett_vc, theta_mg0 =
+    // P0 T_sett_mg, theta_ff0 = theta_vc0 with P0 = (Tlim - ambient) /
+    // (T_sett_vc + T_sett_mg); the previous power is zero
+    for ovr in [0u32, 1, 3, 7] {
+        let mut p = params();
+        p.thermal_state_override = ovr;
+        let mut u = spp3::Unit::new(p);
+        for _ in 0..2 {
+            let (t, _) = drive(&mut u, [0.0; 4], dt(), U);
+            for c in 0..4 {
+                let ch = &p.ch[c];
+                let (tvc, tmg) = (ch.t_sett_vc as f64, ch.t_sett_mg as f64);
+                let p0 = (120.0 - 40.0) / (tvc + tmg);
+                let want = 40.0
+                    + p0 * tvc * (1.0 - dt() / ch.tau_tvc as f64)
+                    + p0 * tmg * (1.0 - dt() / ch.tau_tmg as f64);
+                assert!((t.channels[c].ol_temp_c as f64 - want).abs() < 1e-3, "64007={ovr} ch{c}");
+            }
+            // kernel reconstruction reseeds
+            u.reset();
+        }
+    }
 }
 
 #[test]
