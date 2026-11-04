@@ -3,7 +3,10 @@ Description=Speaker protection supervisor (in-graph, macOS-parity)
 Documentation=https://github.com/aurora-silicon/speakerguardd/tree/v2
 # Without this service no protection holds the amplifiers, and the kernel's
 # own safe level applies. There is deliberately no OnFailure= chain.
-After=systemd-udev-settle.service
+After=systemd-udev-settle.service speakerguardd-selfcheck.service
+# The first-boot wiring self-check: the supervisor grants only with its
+# passing record for this board, kernel and parameter blob.
+Requires=speakerguardd-selfcheck.service
 ConditionPathExists=/proc/device-tree/compatible
 
 [Service]
