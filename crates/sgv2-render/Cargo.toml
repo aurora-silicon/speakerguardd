@@ -12,3 +12,6 @@ sgv2-core = { path = "../sgv2-core" }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+sgv2-core = { path = "../sgv2-core", features = ["std"] }

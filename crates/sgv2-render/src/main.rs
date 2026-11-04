@@ -9,8 +9,12 @@
 //! sgv2-render --unit spp3|lsm2|atsp [--blob PARAMS.blob] --case NAME
 //!             --in PROGRAM.f32 --ch N [--sense SENSE.f32 --sense-ch M]
 //!             [--slices 512 | --slices 1,7,31,...] [--out TRACE.jsonl]
-//!             [--audio-out OUT.f32] [--cfprop ID=FILE ...]
+//!             [--audio-out OUT.f32] [--cfprop ID=FILE ...] [--events F:reset,...]
 //! ```
+//!
+//! `--events` replays the case's host events: `FRAME:reset` calls the unit's
+//! `host_reset` (AudioUnitReset) before that frame; `sleep=`/`tsjump=` are
+//! wall-clock events with no effect offline.
 //!
 //! `--cfprop` hands the unit the same run-time and case properties (by ID,
 //! from the same fixture files) as the macOS reference got. Every file must be
@@ -42,6 +46,8 @@ struct Args {
     out: Option<String>,
     audio_out: Option<String>,
     cfprops: Vec<(u32, String)>,
+    /// Frames at which the host calls `host_reset` (AudioUnitReset).
+    resets: Vec<usize>,
 }
 
 fn usage() -> ExitCode {
@@ -66,6 +72,7 @@ fn parse_args() -> Option<Args> {
         out: None,
         audio_out: None,
         cfprops: Vec::new(),
+        resets: Vec::new(),
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -86,6 +93,18 @@ fn parse_args() -> Option<Args> {
             }
             "--out" => a.out = Some(v),
             "--audio-out" => a.audio_out = Some(v),
+            "--events" => {
+                for e in v.split(',').filter(|e| !e.is_empty()) {
+                    let (f, what) = e.split_once(':')?;
+                    // sleep and tsjump are host wall-clock events: an offline
+                    // render has no wall clock (the reference ignores them too)
+                    if what == "reset" {
+                        a.resets.push(f.parse().ok()?);
+                    } else if !(what.starts_with("sleep=") || what.starts_with("tsjump=")) {
+                        return None;
+                    }
+                }
+            }
             "--cfprop" => {
                 let (id, path) = v.split_once('=')?;
                 if path.is_empty() {
@@ -124,20 +143,21 @@ fn deinterleave(bytes: &[u8], channels: usize) -> Vec<Vec<f32>> {
 /// Build the unit. A missing or unusable blob gives the fail-safe, as the
 /// plugin does.
 fn make_unit(kind: UnitKind, blob: Option<&[u8]>) -> (Box<dyn ProtectionUnit>, String) {
-    match blob.map(Header::parse) {
-        Some(Ok((h, _payload))) if h.unit == kind as u32 => {
-            // TODO(lane B): decode the payload into each unit's Params once the
-            // blob layouts land; until then only the header fields are passed.
-            let (channels, sample_rate) = (h.channels, h.sample_rate);
-            let unit: Box<dyn ProtectionUnit> = match kind {
-                UnitKind::Spp3 => Box::new(spp3::Unit::new(spp3::Params { channels, sample_rate })),
-                UnitKind::Lsm2 => Box::new(lsm2::Unit::new(lsm2::Params { channels, sample_rate })),
-                UnitKind::Atsp => Box::new(atsp::Unit::new(atsp::Params { channels, sample_rate })),
+    match blob.map(|b| (b, Header::parse(b))) {
+        Some((b, Ok((h, _payload)))) if h.unit == kind as u32 => {
+            let unit: Option<Box<dyn ProtectionUnit>> = match kind {
+                UnitKind::Spp3 => spp3::Params::from_blob(b).ok().map(|p| Box::new(spp3::Unit::new(p)) as _),
+                UnitKind::Lsm2 => lsm2::Params::from_blob(b).ok().map(|p| Box::new(lsm2::Unit::new(p)) as _),
+                UnitKind::Atsp => atsp::Params::from_blob(b).ok().map(|p| Box::new(atsp::Unit::new(p)) as _),
             };
-            (unit, String::from("blob"))
+            match unit {
+                Some(u) => (u, String::from("blob")),
+                // a payload the unit refuses is the fail-safe, as in the plugin
+                None => (Box::new(FailSafe::new(kind, Health::NO_PARAMS)), String::from("blob-invalid")),
+            }
         }
-        Some(Ok(_)) => (Box::new(FailSafe::new(kind, Health::NO_PARAMS)), String::from("blob-unit-mismatch")),
-        Some(Err(e)) => (Box::new(FailSafe::new(kind, Health::NO_PARAMS)), format!("blob-{e:?}")),
+        Some((_, Ok(_))) => (Box::new(FailSafe::new(kind, Health::NO_PARAMS)), String::from("blob-unit-mismatch")),
+        Some((_, Err(e))) => (Box::new(FailSafe::new(kind, Health::NO_PARAMS)), format!("blob-{e:?}")),
         None => (Box::new(FailSafe::new(kind, Health::NO_PARAMS)), String::from("none")),
     }
 }
@@ -213,6 +233,7 @@ fn render(
     sense: &[Vec<f32>],
     slices: &[usize],
     cfprops: &[u32],
+    resets: &[usize],
     trace: &mut dyn Write,
     mut audio: Option<&mut dyn Write>,
 ) -> io::Result<()> {
@@ -228,7 +249,14 @@ fn render(
     let cfprop_ids = cfprop_ids.join(",");
     let (mut pos, mut k) = (0usize, 0usize);
     while pos < frames {
-        let n = slices[k % slices.len()].min(frames - pos);
+        if resets.contains(&pos) {
+            unit.host_reset();
+        }
+        let mut n = slices[k % slices.len()].min(frames - pos);
+        // a reset inside a slice splits it, as the host's reset falls between calls
+        if let Some(&r) = resets.iter().find(|&&r| r > pos && r < pos + n) {
+            n = r - pos;
+        }
         k += 1;
         let ins: Vec<&[f32]> = program.iter().map(|c| &c[pos..pos + n]).collect();
         // Sense shorter than the program reads as silence (dead sense).
@@ -307,6 +335,7 @@ fn run(a: &Args) -> io::Result<()> {
         &sense,
         &a.slices,
         &cfprop_ids,
+        &a.resets,
         trace,
         audio.as_mut().map(|w| w as &mut dyn Write),
     )
@@ -365,6 +394,7 @@ mod tests {
                 &[],
                 slices,
                 &[64009, 7],
+                &[],
                 &mut trace,
                 Some(&mut audio),
             )
@@ -406,6 +436,7 @@ mod tests {
             out: Some(out.to_string_lossy().into_owned()),
             audio_out: None,
             cfprops: vec![(64009, fixture.to_string_lossy().into_owned())],
+            resets: Vec::new(),
         };
         run(&a).unwrap();
         let text = std::fs::read_to_string(&out).unwrap();
