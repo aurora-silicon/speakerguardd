@@ -52,7 +52,20 @@
 //!   leaving it out is not less restrictive);
 //! - the hard candidate when the feed-forward filter is disabled (the
 //!   virtual coil is then taken as the real coil);
-//! - the closed loop (`TlimAdj`), so `T_CL` stays at its sentinel.
+//! - closed loop (spec 7), implemented: V and I mean squares per
+//!   `TempSenseWindowTime` window with the independent mean-square floors,
+//!   `R = RdcScale * smooth(sqrt(V_ms / I_ms))` accepted in `RebRange`,
+//!   `T_CL = T_cal + (R / R_cal - 1) / alpha(T_cal)` with alpha linear
+//!   between `a_t_20C` and `a_t_35C`, and the corrected limit
+//!   `clamp(Tlim + T_OL - T_CL, Tlim, Tlim + TlimAdjCap)` smoothed with the
+//!   99 % law over `TlimErrDecayTime`, falling back to `Tlim` on rejection.
+//!   A channel runs it only with CL feedback configured and a calibration
+//!   record inside `CalTempRange`/`RebRange`. Still TODO(SPEC): the
+//!   sensor's DC-block/band-limit filter (raw samples are used, exact for a
+//!   resistive load), the resistance smoother's coefficient convention and
+//!   start (99 % law, starting at the calibration), and whether the hard
+//!   path follows the corrected limit (it does here, as the reference's
+//!   closed-loop runs show);
 //!
 //! A preset that enables displacement control or CPMS, or disables thermal
 //! protection, is refused and the unit runs the fail-safe.
@@ -118,6 +131,23 @@ pub struct ChannelParams {
     /// `PilotToneEnabled` (part 21, 0 or 1) and `PilotAmplHi_dB` (part 27).
     pub pilot_tone_enabled: u32,
     pub pilot_ampl_hi_db: f32,
+    /// CL dictionary.
+    pub temp_sense_window_time_s: f32,
+    pub temp_sense_smoothing_tau_s: f32,
+    pub rdc_scale: f32,
+    pub reb_range_min: f32,
+    pub reb_range_max: f32,
+    pub cal_temp_range_min: f32,
+    pub cal_temp_range_max: f32,
+    pub a_t_20c: f32,
+    pub a_t_35c: f32,
+    pub tlim_err_decay_time_s: f32,
+    pub tlim_adj_cap: f32,
+    /// Per-unit calibration (SpTS record bound by data source; 64009):
+    /// present flag, resistance (ohm) and temperature (C).
+    pub cal_present: u32,
+    pub cal_r: f32,
+    pub cal_t: f32,
 }
 
 /// The spp3 blob payload.
@@ -143,13 +173,13 @@ pub struct Params {
 }
 
 // SAFETY: repr(C), only u32/f32 fields and an array of a repr(C) struct of
-// u32/f32 fields: 14 + 8 * 25 four-byte words, no padding.
+// u32/f32 fields: 14 + 8 * 39 four-byte words, no padding.
 unsafe impl Pod for Params {}
-// SAFETY: as above, 25 four-byte words.
+// SAFETY: as above, 39 four-byte words.
 unsafe impl Pod for ChannelParams {}
 
-const _: () = assert!(core::mem::size_of::<ChannelParams>() == 25 * 4);
-const _: () = assert!(core::mem::size_of::<Params>() == (14 + MAX_CHANNELS * 25) * 4);
+const _: () = assert!(core::mem::size_of::<ChannelParams>() == 39 * 4);
+const _: () = assert!(core::mem::size_of::<Params>() == (14 + MAX_CHANNELS * 39) * 4);
 
 impl Default for Params {
     fn default() -> Self {
@@ -259,6 +289,21 @@ impl Params {
                 initial_theta_mg: t.channel(c, "sgv2.InitialThetaMg").unwrap_or(0.0) as f32,
                 pilot_tone_enabled: (f("PilotToneEnabled")? != 0.0) as u32,
                 pilot_ampl_hi_db: f("PilotAmplHi_dB")?,
+                temp_sense_window_time_s: f("TempSenseWindowTime")?,
+                temp_sense_smoothing_tau_s: f("TempSenseSmoothingTau")?,
+                rdc_scale: f("RdcScale")?,
+                reb_range_min: f("RebRangeMin")?,
+                reb_range_max: f("RebRangeMax")?,
+                cal_temp_range_min: f("CalTempRangeMin")?,
+                cal_temp_range_max: f("CalTempRangeMax")?,
+                a_t_20c: f("a_t_20C")?,
+                a_t_35c: f("a_t_35C")?,
+                tlim_err_decay_time_s: f("TlimErrDecayTime")?,
+                tlim_adj_cap: f("TlimAdjCap")?,
+                // runtime calibration overlay; absent means open loop
+                cal_present: t.channel(c, "sgv2.CalPresent").is_some_and(|v| v != 0.0) as u32,
+                cal_r: t.channel(c, "sgv2.CalR").unwrap_or(0.0) as f32,
+                cal_t: t.channel(c, "sgv2.CalT").unwrap_or(0.0) as f32,
             };
         }
         p.validate()?;
@@ -349,6 +394,8 @@ const MODEL_SCRATCH: usize = 256;
 /// the unprotected drive. With the protected drive the equilibrium sits
 /// above the limit whenever the gain is well below unity.
 const FF_FROM_UNPROTECTED: bool = true;
+/// TODO(SPEC): the resistance smoother's coefficient convention.
+const CL_EFOLD: bool = false;
 
 /// The reference's coefficient law: a one-pole that settles to 99 % in
 /// `seconds` at `rate` updates per second.
@@ -371,6 +418,155 @@ impl Thermal {
     #[inline]
     fn step(&mut self, p: f64, p_prev: f64) {
         self.theta = self.a * self.theta + self.b * (p + p_prev);
+    }
+}
+
+/// Closed-loop resistance thermometry and the corrected limit (spec 7).
+struct Cl {
+    window: usize,
+    n: usize,
+    v_sq: f64,
+    i_sq: f64,
+    v_scale2: f64,
+    i_scale2: f64,
+    v_floor: f64,
+    i_floor: f64,
+    k_r: f64,
+    r_s: Option<f64>,
+    rdc_scale: f64,
+    reb_min: f64,
+    reb_max: f64,
+    cal_r: f64,
+    cal_t: f64,
+    inv_temp_co: f64,
+    cap: f64,
+    k_lim: f64,
+    /// Latest accepted window, until the next update consumes it.
+    accepted: Option<f64>,
+    valid: bool,
+    t_cl: f64,
+    limit_s: f64,
+}
+
+impl Cl {
+    /// `None` (open-loop kernel) unless CL thermal feedback is configured
+    /// and a calibration record inside the calibration ranges is present.
+    fn new(c: &ChannelParams, rate: f64, r: f64) -> Option<Cl> {
+        if c.cl_thermal_feedback_enabled == 0 || c.cal_present == 0 || c.ignore_telemetry != 0 {
+            return None;
+        }
+        let (rc, tc) = (c.cal_r as f64, c.cal_t as f64);
+        if !(rc.is_finite() && tc.is_finite() && rc > 0.0) {
+            return None;
+        }
+        if !(tc >= c.cal_temp_range_min as f64 && tc <= c.cal_temp_range_max as f64) {
+            return None;
+        }
+        if !(rc >= c.reb_range_min as f64 && rc <= c.reb_range_max as f64) {
+            return None;
+        }
+        let window = libm::round(c.temp_sense_window_time_s as f64 * rate) as usize;
+        if window == 0 || !(c.temp_sense_smoothing_tau_s > 0.0 && c.tlim_err_decay_time_s > 0.0) {
+            return None;
+        }
+        let (a20, a35) = (c.a_t_20c as f64, c.a_t_35c as f64);
+        let alpha = a20 + (tc - 20.0) * (a35 - a20) / 15.0;
+        if !(alpha.is_finite() && alpha > 0.0) {
+            return None;
+        }
+        let (vs, is) = (c.vmon_scale as f64, c.imon_scale as f64);
+        Some(Cl {
+            window,
+            n: 0,
+            v_sq: 0.0,
+            i_sq: 0.0,
+            v_scale2: vs * vs,
+            i_scale2: is * is,
+            v_floor: c.v_pwr_thres as f64,
+            i_floor: c.i_pwr_thres as f64,
+            // TODO(SPEC): the smoothing coefficient convention; the
+            // reference's 99 %-settling law at the window rate
+            k_r: if CL_EFOLD {
+                1.0 - libm::exp(-(window as f64 / rate) / c.temp_sense_smoothing_tau_s as f64)
+            } else {
+                settle99(c.temp_sense_smoothing_tau_s as f64, rate / window as f64)
+            },
+            // the smoothed resistance starts at the calibration (T_CL starts
+            // at the calibration temperature, as the reference reports)
+            r_s: Some(rc / c.rdc_scale.max(f32::MIN_POSITIVE) as f64),
+            rdc_scale: c.rdc_scale as f64,
+            reb_min: c.reb_range_min as f64,
+            reb_max: c.reb_range_max as f64,
+            cal_r: rc,
+            cal_t: tc,
+            inv_temp_co: 1.0 / alpha,
+            cap: c.tlim_adj_cap as f64,
+            k_lim: settle99(c.tlim_err_decay_time_s as f64, r),
+            accepted: None,
+            valid: false,
+            t_cl: tc,
+            limit_s: c.temperature_limit as f64,
+        })
+    }
+
+    fn reset(&mut self, limit: f64) {
+        self.n = 0;
+        self.v_sq = 0.0;
+        self.i_sq = 0.0;
+        self.r_s = Some(self.cal_r / self.rdc_scale.max(f64::MIN_POSITIVE));
+        self.accepted = None;
+        self.valid = false;
+        self.t_cl = self.cal_t;
+        self.limit_s = limit;
+    }
+
+    /// Raw telemetry of one segment. TODO(SPEC): the sensor's DC-block /
+    /// band-limit filter is not specified; the mean squares are taken on
+    /// the raw scaled samples (exact for a resistive load).
+    fn feed(&mut self, i: &[f32], v: &[f32]) {
+        let mut k = 0;
+        while k < i.len() {
+            let m = (self.window - self.n).min(i.len() - k);
+            self.v_sq += dsp::sum_sq(&v[k..k + m]);
+            self.i_sq += dsp::sum_sq(&i[k..k + m]);
+            self.n += m;
+            k += m;
+            if self.n == self.window {
+                let nn = self.window as f64;
+                let v_ms = self.v_sq * self.v_scale2 / nn;
+                let i_ms = self.i_sq * self.i_scale2 / nn;
+                self.n = 0;
+                self.v_sq = 0.0;
+                self.i_sq = 0.0;
+                if v_ms.is_finite() && i_ms.is_finite() && v_ms > self.v_floor && i_ms > self.i_floor {
+                    let r = libm::sqrt(v_ms / i_ms);
+                    let rs = match self.r_s {
+                        Some(p) => p + self.k_r * (r - p),
+                        None => r,
+                    };
+                    self.r_s = Some(rs);
+                    let re = self.rdc_scale * rs;
+                    if re >= self.reb_min && re <= self.reb_max {
+                        self.accepted = Some(self.cal_t + (re / self.cal_r - 1.0) * self.inv_temp_co);
+                        self.valid = true;
+                    } else {
+                        self.valid = false;
+                    }
+                } else {
+                    self.valid = false;
+                }
+            }
+        }
+    }
+
+    /// Per thermal update: the smoothed corrected limit.
+    fn update(&mut self, t_ol: f64, limit: f64) -> f64 {
+        if let Some(t) = self.accepted.take() {
+            self.t_cl = t;
+        }
+        let raw = if self.valid { (limit + (t_ol - self.t_cl)).clamp(limit, limit + self.cap) } else { limit };
+        self.limit_s += self.k_lim * (raw - self.limit_s);
+        self.limit_s
     }
 }
 
@@ -398,6 +594,7 @@ struct Chan {
     sense: Option<(usize, usize)>,
     vi_scale: f64,
     acc_vi: dsp::LaneAcc,
+    cl: Option<Cl>,
     // published state
     p_model: f64,
     g_ff: f64,
@@ -534,6 +731,7 @@ impl Run {
                 sense: if c.ignore_telemetry != 0 { None } else { Some((c.sense_i as usize, c.sense_v as usize)) },
                 vi_scale: c.imon_scale as f64 * c.vmon_scale as f64,
                 acc_vi: dsp::LaneAcc::new(),
+                cl: Cl::new(c, rate, r),
                 p_model: 0.0,
                 g_ff: 1.0,
                 g_hard: 1.0,
@@ -576,6 +774,9 @@ impl Run {
             c.delay_in.clear();
             c.acc_in.clear();
             c.acc_vi.clear();
+            if let Some(cl) = c.cl.as_mut() {
+                cl.reset(c.limit);
+            }
             c.p_model = 0.0;
             c.g_ff = 1.0;
             c.g_hard = 1.0;
@@ -647,7 +848,11 @@ impl Run {
             let Some((si, sv)) = c.sense else { continue };
             match (sense.get(si), sense.get(sv)) {
                 (Some(i), Some(v)) if i.len() >= off + len && v.len() >= off + len => {
-                    c.acc_vi.add_prod(&v[off..off + len], &i[off..off + len], phase);
+                    let (i, v) = (&i[off..off + len], &v[off..off + len]);
+                    c.acc_vi.add_prod(v, i, phase);
+                    if let Some(cl) = c.cl.as_mut() {
+                        cl.feed(i, v);
+                    }
                 }
                 _ => self.sums.complete = false,
             }
@@ -691,15 +896,24 @@ impl Run {
             c.p_prev = p;
             c.p_ff_prev = p_ff;
             let t_ol = self.ambient + c.vc.theta + c.mg.theta;
-            let num = c.limit - self.ambient - c.mg.theta;
+            // closed loop: windows completed since the last update move the
+            // corrected limit; it is smoothed at the thermal cadence
+            let limit = match c.cl.as_mut() {
+                Some(cl) => cl.update(t_ol, c.limit),
+                None => c.limit,
+            };
+            let num = limit - self.ambient - c.mg.theta;
             // TODO(SPEC): with the feed-forward filter disabled the hard
             // candidate takes the real coil as its virtual coil.
             let vcff = c.ff.map_or(c.vc.theta, |f| f.theta);
             let ratio = |num: f64| libm::sqrt((num / (vcff + PREDICTION_MARGIN)).clamp(RATIO_MIN, 1.0));
             c.g_ff = if c.ff.is_some() { ratio(num) } else { 1.0 };
-            if t_ol > c.hard_on {
+            // the hard path follows the corrected limit (reference: a
+            // closed-loop run holds T_OL far above limit + headroom without
+            // the panic)
+            if t_ol > c.hard_on + (limit - c.limit) {
                 c.armed = true;
-            } else if t_ol < c.limit {
+            } else if t_ol < limit {
                 c.armed = false;
             }
             c.g_hard = if c.armed { ratio(num - HARD_TARGET_BELOW) } else { 1.0 };
@@ -799,9 +1013,18 @@ impl ProtectionUnit for Unit {
             s.coil_temp_c = t_ol;
             s.magnet_temp_c = (run.ambient + c.mg.theta) as f32;
             s.ol_temp_c = t_ol;
-            s.cl_temp_c = T_CL_UNMEASURED;
-            s.tlim_adj_c = 0.0;
-            s.closed_loop = false;
+            match c.cl.as_ref() {
+                Some(cl) => {
+                    s.cl_temp_c = cl.t_cl as f32;
+                    s.tlim_adj_c = (cl.limit_s - c.limit) as f32;
+                    s.closed_loop = true;
+                }
+                None => {
+                    s.cl_temp_c = T_CL_UNMEASURED;
+                    s.tlim_adj_c = 0.0;
+                    s.closed_loop = false;
+                }
+            }
             // axis 4 is temperature: the selected (pre-dezipper) target
             s.axis_gain[4] = g.sel;
             s.gain = g.z2;
