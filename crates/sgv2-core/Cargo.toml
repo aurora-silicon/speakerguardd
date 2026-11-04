@@ -7,5 +7,18 @@ license.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 
+[features]
+# Host-side helpers (blob building); the plugin and the RT path never need it.
+std = []
+
+[dependencies]
+# Pure-Rust, no_std, correctly rounded sqrt and a portable exp: the same
+# results on every target, which the differential rig depends on.
+libm = "0.2"
+
+[dev-dependencies]
+sgv2-core = { path = ".", features = ["std"] }
+proptest = { version = "1", default-features = false, features = ["std"] }
+
 [lints]
 workspace = true

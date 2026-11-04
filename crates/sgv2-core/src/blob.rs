@@ -4,6 +4,17 @@
 //! Layout (little-endian): a fixed header, then a unit-specific payload.
 //! The payload layouts are TODO(SPEC): they are the parameter sets the
 //! behaviour specification names, in the order it fixes.
+//!
+//! ```text
+//! 0   magic "SGV2PRM\0"     24  sample_rate
+//! 8   version               28  payload_len
+//! 12  unit (fourcc)         32  payload_crc
+//! 16  channels              36  machine (8 bytes, ASCII, NUL-padded)
+//! 20  sense_channels        44  full_scale_mv
+//! ```
+//!
+//! `machine` and `full_scale_mv` were reserved zero bytes before; a blob
+//! that leaves them zero names no machine, and the supervisor refuses it.
 
 pub const MAGIC: [u8; 8] = *b"SGV2PRM\0";
 pub const VERSION: u32 = 1;
@@ -20,6 +31,31 @@ pub struct Header {
     pub payload_len: u32,
     /// CRC-32 (IEEE) of the payload.
     pub payload_crc: u32,
+    /// The Mac whose tuning this is: its board, the device tree's first
+    /// root compatible without the vendor ("j316s" for "apple,j316s"),
+    /// ASCII and NUL-padded. All zero: no machine named.
+    pub machine: [u8; MACHINE_LEN],
+    /// The amps' operating point the parameters assume: the output peak
+    /// voltage at digital full scale, in millivolts (lsm2 `VoltsFullScale`;
+    /// spp3's output scaling is TODO(SPEC)). 0: not stated.
+    pub full_scale_mv: u32,
+}
+
+/// Bytes of [`Header::machine`].
+pub const MACHINE_LEN: usize = 8;
+
+/// `name` as a header machine field, or `None` if it does not fit or is not
+/// plain lowercase ASCII.
+pub fn machine_field(name: &str) -> Option<[u8; MACHINE_LEN]> {
+    if name.is_empty()
+        || name.len() > MACHINE_LEN
+        || !name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    {
+        return None;
+    }
+    let mut m = [0u8; MACHINE_LEN];
+    m[..name.len()].copy_from_slice(name.as_bytes());
+    Some(m)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,6 +85,8 @@ impl Header {
             sample_rate: word(24),
             payload_len: word(28),
             payload_crc: word(32),
+            machine: bytes[36..44].try_into().unwrap_or([0; MACHINE_LEN]),
+            full_scale_mv: word(44),
         };
         if header.version != VERSION {
             return Err(BlobError::Version);
@@ -83,7 +121,82 @@ impl Header {
         {
             out[8 + 4 * i..12 + 4 * i].copy_from_slice(&v.to_le_bytes());
         }
+        out[36..44].copy_from_slice(&self.machine);
+        out[44..48].copy_from_slice(&self.full_scale_mv.to_le_bytes());
     }
+
+    /// The machine field as text (`None` when no machine is named or it is
+    /// not ASCII).
+    pub fn machine(&self) -> Option<&str> {
+        let end = self.machine.iter().position(|&b| b == 0).unwrap_or(MACHINE_LEN);
+        if end == 0 || self.machine[end..].iter().any(|&b| b != 0) {
+            return None;
+        }
+        core::str::from_utf8(&self.machine[..end]).ok()
+    }
+}
+
+/// Plain-old-data payloads: every field is a 4-byte `f32` or `u32` (or an
+/// array of them), little-endian on every supported target, so the
+/// `#[repr(C)]` struct is its own serialisation.
+///
+/// # Safety
+/// Implement only for `#[repr(C)]` structs made of `f32`/`u32` fields and
+/// arrays thereof, with no padding, for which every bit pattern is valid.
+pub unsafe trait Pod: Copy + Sized {
+    fn as_bytes(&self) -> &[u8] {
+        // SAFETY: Pod contract: no padding, plain 4-byte fields.
+        unsafe { core::slice::from_raw_parts(self as *const Self as *const u8, core::mem::size_of::<Self>()) }
+    }
+    fn from_bytes(b: &[u8]) -> Result<Self, BlobError> {
+        if b.len() != core::mem::size_of::<Self>() {
+            return Err(BlobError::Length);
+        }
+        // SAFETY: Pod contract: every bit pattern is valid; unaligned read.
+        Ok(unsafe { core::ptr::read_unaligned(b.as_ptr() as *const Self) })
+    }
+}
+
+/// Build a complete blob (header and payload) for `unit`, naming no machine.
+/// The supervisor refuses such a blob; see [`build_for`].
+#[cfg(any(test, feature = "std"))]
+pub fn build(
+    unit: crate::UnitKind,
+    channels: u32,
+    sense_channels: u32,
+    sample_rate: u32,
+    payload: &[u8],
+) -> std::vec::Vec<u8> {
+    build_for(unit, channels, sense_channels, sample_rate, [0; MACHINE_LEN], 0, payload)
+}
+
+/// Build a complete blob for `unit` on one machine and operating point.
+#[cfg(any(test, feature = "std"))]
+pub fn build_for(
+    unit: crate::UnitKind,
+    channels: u32,
+    sense_channels: u32,
+    sample_rate: u32,
+    machine: [u8; MACHINE_LEN],
+    full_scale_mv: u32,
+    payload: &[u8],
+) -> std::vec::Vec<u8> {
+    let h = Header {
+        version: VERSION,
+        unit: unit as u32,
+        channels,
+        sense_channels,
+        sample_rate,
+        payload_len: payload.len() as u32,
+        payload_crc: crc32(payload),
+        machine,
+        full_scale_mv,
+    };
+    let mut head = [0u8; HEADER_LEN];
+    h.write(&mut head);
+    let mut v = head.to_vec();
+    v.extend_from_slice(payload);
+    v
 }
 
 /// CRC-32 (IEEE 802.3, reflected, init and xorout 0xFFFFFFFF).
@@ -118,12 +231,15 @@ mod tests {
             sample_rate: 48_000,
             payload_len: 4,
             payload_crc: crc32(&payload),
+            machine: machine_field("j700").unwrap(),
+            full_scale_mv: 7300,
         };
         let mut head = [0u8; HEADER_LEN];
         h.write(&mut head);
         let mut blob = head.to_vec();
         blob.extend_from_slice(&payload);
         assert_eq!(Header::parse(&blob).unwrap(), (h, &payload[..]));
+        assert_eq!(Header::parse(&blob).unwrap().0.machine(), Some("j700"));
         let mut bad = blob.clone();
         *bad.last_mut().unwrap() ^= 1;
         assert_eq!(Header::parse(&bad), Err(BlobError::Crc));
@@ -131,5 +247,19 @@ mod tests {
         let mut magic = blob.clone();
         magic[0] = b'X';
         assert_eq!(Header::parse(&magic), Err(BlobError::Magic));
+    }
+
+    #[test]
+    fn machine_field_and_unnamed_blobs() {
+        assert_eq!(machine_field("j316s").map(|m| m[..5] == *b"j316s"), Some(true));
+        assert_eq!(machine_field(""), None);
+        assert_eq!(machine_field("j316s-too-long"), None);
+        assert_eq!(machine_field("J316S"), None);
+        let b = build(crate::UnitKind::Lsm2, 2, 0, 48_000, &[0u8; 4]);
+        let (h, _) = Header::parse(&b).unwrap();
+        assert_eq!((h.machine(), h.full_scale_mv), (None, 0));
+        let b = build_for(crate::UnitKind::Lsm2, 2, 0, 48_000, machine_field("j616s").unwrap(), 11_899, &[0u8; 4]);
+        let (h, _) = Header::parse(&b).unwrap();
+        assert_eq!((h.machine(), h.full_scale_mv), (Some("j616s"), 11_899));
     }
 }

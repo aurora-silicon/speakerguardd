@@ -1,0 +1,6 @@
+{
+  "j316": {"card": "AppleJ316", "name": "MacBook Pro J316", "amps": 6, "speaker_format": "S24_32LE", "sense": 12, "plugin": "6ch-vi", "unit_channels": [0, 1, 4, 5, 2, 3], "sense_pairs": "iv", "sense_headroom": 512},
+  "j616": {"card": "AppleJ616", "name": "MacBook Pro J616", "amps": 6, "speaker_format": "S24_32LE", "sense": 12, "plugin": "6ch-vi", "sense_batch": false, "speaker_headroom": 256, "sense_headroom": 512, "sense_pairs": "iv"},
+  "j413": {"card": "AppleJ413", "name": "MacBook Air J413", "amps": 4, "speaker_format": "S24_32LE", "sense": 8, "plugin": "4ch-vi", "sense_pairs": "iv", "sense_headroom": 512},
+  "j700": {"card": "AppleJ700", "name": "MacBook Neo J700", "amps": 2, "speaker_format": "S32LE", "sense": 0, "plugin": "2ch"}
+}

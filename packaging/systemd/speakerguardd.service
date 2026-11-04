@@ -8,14 +8,33 @@ ConditionPathExists=/proc/device-tree/compatible
 
 [Service]
 Type=notify
-ExecStart=/usr/bin/speakerguardd
+# Per machine: SGV2_ARGS="--pcm <D> --uid <UID> --params <blob>" (and
+# --card <N|ID> to override the machine's own card). Without the file the
+# unit does not start, and the kernel's floor holds.
+EnvironmentFile=/etc/speakerguardd/speakerguardd.conf
+ExecStart=/usr/bin/speakerguardd $SGV2_ARGS
 Restart=on-failure
 RestartSec=1s
 RestartPreventExitStatus=78
 WatchdogSec=1s
 RuntimeDirectory=speakerguardd
 RuntimeDirectoryMode=0755
-# TODO(lane D): device access list, capabilities and hardening review.
+# Kept over a restart: the plugin keeps the engine page mapped, and the
+# supervisor reopens the same file (never truncating it) instead of leaving
+# the plugin on an unlinked page until PipeWire reloads.
+RuntimeDirectoryPreserve=restart
+# The speaker card's control device only: it owns "Speaker Protection"
+# there, and closing it (any exit) withdraws protection at once.
+DevicePolicy=closed
+DeviceAllow=char-alsa rw
+# Real-time scheduling and locked memory for the 10 ms loop; chown hands the
+# engine page and the session report to the session user. CAP_SYS_ADMIN: the
+# kernel (sgv2k2) requires it to lock "Speaker Protection" and to write it,
+# so a seat user with the control device's uaccess ACL cannot own the
+# speakers. The service runs as root, so the bounding set is what it keeps.
+CapabilityBoundingSet=CAP_SYS_NICE CAP_IPC_LOCK CAP_CHOWN CAP_FOWNER CAP_SYS_ADMIN
+LimitRTPRIO=99
+LimitMEMLOCK=infinity
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
