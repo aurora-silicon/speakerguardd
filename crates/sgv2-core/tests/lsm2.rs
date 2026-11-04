@@ -79,8 +79,9 @@ fn sine(freq: f64, amp: f32, secs: f64) -> Vec<f32> {
 
 #[test]
 fn latency_is_two_filterbank_stages_plus_lookahead_for_any_call_size() {
+    // (mitigation off is refused; the temperature axis is unity while cold)
     let mut p = params();
-    p.enable_mitigation = 0;
+    p.control_temperature = 1;
     for slice in [1usize, 7, 31, 32, 33, 96, 127, 160, 256, 512, 4096] {
         let mut u = Unit::new(p);
         assert_eq!(u.latency_frames(), 2 * 120 + 48);
@@ -95,7 +96,9 @@ fn latency_is_two_filterbank_stages_plus_lookahead_for_any_call_size() {
 
 #[test]
 fn disabled_axes_and_quiet_audio_are_unity() {
-    let p = params();
+    // every axis but temperature off (all off is refused), cold and quiet
+    let mut p = params();
+    p.control_temperature = 1;
     let mut u = Unit::new(p);
     let x = sine(1000.0, 0.01, 2.0);
     let out = run(&mut u, &[x.clone(), x.clone()], 512);
@@ -108,6 +111,7 @@ fn disabled_axes_and_quiet_audio_are_unity() {
 fn displacement_candidate_matches_the_transfer_function() {
     let mut p = params();
     p.control_displacement = 1;
+    p.control_temperature = 1;
     let mut u = Unit::new(p);
     let f = 80.0;
     let x = sine(f, 1.0, 1.0);
@@ -146,7 +150,7 @@ fn power_candidate_is_capped_and_linked() {
 }
 
 #[test]
-fn temperature_stand_in_takes_the_cap_at_the_soft_limit() {
+fn temperature_knee_reaches_the_cap_at_the_hard_limit() {
     let mut p = params();
     p.control_temperature = 1;
     let mut u = Unit::new(p);
@@ -154,7 +158,7 @@ fn temperature_stand_in_takes_the_cap_at_the_soft_limit() {
     run(&mut u, &[x.clone(), x], 1024);
     let mut t = Telemetry::new();
     u.telemetry(&mut t);
-    assert!(t.channels[0].coil_temp_c + 4.0 >= 110.0, "{}", t.channels[0].coil_temp_c);
+    assert!(t.channels[0].coil_temp_c + 4.0 >= 125.0, "{}", t.channels[0].coil_temp_c);
     assert!((t.channels[0].axis_gain[4] - 10f32.powf(-10.0 / 20.0)).abs() < 1e-6);
 }
 
@@ -199,4 +203,31 @@ fn runtime_budgets_replace_the_preset_limits() {
     let floor = 10f32.powf(-4.0 / 20.0);
     // the 0.4 W runtime 200 ms budget binds at the cap
     assert!((t.channels[0].axis_gain[3] - floor).abs() < 1e-4, "{}", t.channels[0].axis_gain[3]);
+}
+
+/// Spec 6.1: the temperature candidate is linear in dB from the soft to the
+/// hard limit on `Tvc + TemperatureHeadroom`.
+#[test]
+fn temperature_knee_is_linear_in_db() {
+    let mut p = params();
+    p.control_temperature = 1;
+    let mut u = Unit::new(p);
+    let x = sine(150.0, 1.0, 40.0);
+    let mut seen = 0;
+    for k in 0..(x.len() / 256) {
+        let blk = x[k * 256..(k + 1) * 256].to_vec();
+        run(&mut u, &[blk.clone(), blk], 256);
+        let mut t = Telemetry::new();
+        u.telemetry(&mut t);
+        let c = &p.ch[0];
+        let z = ((t.channels[0].coil_temp_c + c.temperature_headroom - c.temperature_soft_limit)
+            / (c.temperature_hard_limit - c.temperature_soft_limit))
+            .clamp(0.0, 1.0);
+        if z > 0.05 && z < 0.95 {
+            seen += 1;
+            let want = 10f32.powf(-c.max_temperature_attenuation_db * z / 20.0);
+            assert!((t.channels[0].axis_gain[4] - want).abs() < 2e-4, "{} {want} z {z}", t.channels[0].axis_gain[4]);
+        }
+    }
+    assert!(seen > 10, "the drive must cross the knee ({seen})");
 }

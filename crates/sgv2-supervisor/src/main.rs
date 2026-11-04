@@ -177,6 +177,14 @@ mod linux {
         live: Arc<HelperLive>,
     ) -> std::io::Result<()> {
         std::thread::Builder::new().name("sgv2-pcm".into()).spawn(move || {
+            // SCHED_FIFO 10, below the loop's 70: desktop load (SCHED_OTHER)
+            // cannot starve the snapshots the loop needs every tick. A
+            // blocked /proc read only sleeps this thread.
+            let sp = libc::sched_param { sched_priority: 10 };
+            // SAFETY: this thread's own policy; failure is tolerated.
+            if unsafe { libc::sched_setscheduler(0, libc::SCHED_FIFO, &sp) } != 0 {
+                eprintln!("PCM reader: SCHED_FIFO unavailable; normal priority");
+            }
             let mut hbuf = String::with_capacity(1024);
             let paths: Vec<String> = (0..subs).map(|s| format!("{dir}/sub{s}/status")).collect();
             let mut buf = String::with_capacity(1024);
@@ -241,50 +249,36 @@ mod linux {
         }
     }
 
-    /// The reader thread's verdict on the report's writer, under a seqlock:
-    /// that `pid`/`start` was alive, the session user's, when checked.
+    /// The reader thread's verdict on the report's writer: one word
+    /// (pid, the low 31 bits of its start time, alive) and the time of the
+    /// check, so the RT loop never sees a half-written verdict. The checker
+    /// stores the verdict before the time and the loop loads the time
+    /// first, so a verdict is never older than its time. (A seqlock here
+    /// failed under desktop load: a checker preempted inside its write left
+    /// the RT loop's three tries all odd, and the report read as absent,
+    /// B2 on the J616s at 2852.451 s.)
     #[derive(Default)]
     struct HelperLive {
-        seq: AtomicU64,
-        pid: AtomicU64,
-        start: AtomicU64,
-        alive: AtomicU64,
+        verdict: AtomicU64,
         checked_ns: AtomicU64,
+    }
+
+    fn verdict_word(pid: u32, start: u64, alive: bool) -> u64 {
+        u64::from(pid) << 32 | (start & 0x7fff_ffff) << 1 | u64::from(alive)
     }
 
     impl HelperLive {
         fn publish(&self, pid: u32, start: u64, alive: bool, at: u64) {
-            self.seq.fetch_add(1, Ordering::AcqRel);
-            self.pid.store(u64::from(pid), Ordering::Release);
-            self.start.store(start, Ordering::Release);
-            self.alive.store(alive as u64, Ordering::Release);
+            self.verdict.store(verdict_word(pid, start, alive), Ordering::Release);
             self.checked_ns.store(at, Ordering::Release);
-            self.seq.fetch_add(1, Ordering::AcqRel);
         }
 
         /// Whether `helper` was checked alive within `HELPER_CHECK_MAX_NS`.
         fn vouches(&self, helper: Option<(u32, u64)>, now: u64) -> bool {
             let Some((pid, start)) = helper else { return false };
-            for _ in 0..3 {
-                let s0 = self.seq.load(Ordering::Acquire);
-                if s0 & 1 == 1 {
-                    continue;
-                }
-                let v = (
-                    self.pid.load(Ordering::Acquire),
-                    self.start.load(Ordering::Acquire),
-                    self.alive.load(Ordering::Acquire),
-                    self.checked_ns.load(Ordering::Acquire),
-                );
-                if self.seq.load(Ordering::Acquire) != s0 {
-                    continue;
-                }
-                return v.0 == u64::from(pid)
-                    && v.1 == start
-                    && v.2 == 1
-                    && now.saturating_sub(v.3) <= HELPER_CHECK_MAX_NS;
-            }
-            false
+            let at = self.checked_ns.load(Ordering::Acquire);
+            let v = self.verdict.load(Ordering::Acquire);
+            v == verdict_word(pid, start, true) && now.saturating_sub(at) <= HELPER_CHECK_MAX_NS
         }
     }
 
@@ -470,6 +464,75 @@ mod linux {
         }
     }
 
+    /// The thermal hand-off across engine and PipeWire restarts (see the
+    /// `thermal` module): every 100 ms take the engine's `saved` record if it
+    /// is trusted, offer it in the page's `provided` slot, and persist it to
+    /// `<user dir>/thermal` (root's, 0600) at most once a second. At start,
+    /// offer the persisted record if this boot, board, blob and geometry
+    /// match and it is at most ten minutes old. Normal priority, off the RT
+    /// loop.
+    fn spawn_thermal(page_path: PathBuf, file: PathBuf, header: sgv2_core::blob::Header, board: [u8; 8]) {
+        use sgv2_supervisor::thermal::{parse_boot_id, trusted, Persisted};
+        let _ = std::thread::Builder::new().name("sgv2-thermal".into()).spawn(move || {
+            let Ok(page) = EnginePage::open(&page_path.to_string_lossy()) else {
+                eprintln!("thermal: cannot map the engine page; no hand-off across restarts");
+                return;
+            };
+            let boot_id =
+                std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok().and_then(|t| parse_boot_id(&t));
+            let now = sgv2_lv2::handoff::boottime_ns;
+            match (boot_id, std::fs::read(&file).ok().and_then(|b| Persisted::decode(&b))) {
+                (Some(id), Some(p)) => match p.refusal(&id, &board, &header, now()) {
+                    None => {
+                        page.provide(&p.record, p.stamp_boottime_ns, header.payload_crc);
+                        eprintln!(
+                            "thermal: offering the state saved {} s ago",
+                            now().saturating_sub(p.stamp_boottime_ns) / 1_000_000_000
+                        );
+                    }
+                    Some(why) => eprintln!("thermal: not restoring the saved state: {why}"),
+                },
+                (None, _) => eprintln!("thermal: no boot id; the state is not persisted"),
+                _ => {}
+            }
+            let tmp = file.with_extension("new");
+            let mut last_stamp = 0u64;
+            let mut last_write = 0u64;
+            loop {
+                let h = page.header();
+                if let Some((rec, stamp)) = h.saved.read() {
+                    let ok =
+                        trusted(&rec, &header, h.params_crc.load(Ordering::Acquire), h.health.load(Ordering::Acquire));
+                    if ok && stamp != last_stamp {
+                        last_stamp = stamp;
+                        page.provide(&rec, stamp, header.payload_crc);
+                        if let Some(id) = boot_id {
+                            if now().saturating_sub(last_write) >= 1_000_000_000 {
+                                last_write = now();
+                                let p = Persisted {
+                                    boot_id: id,
+                                    board,
+                                    params_crc: header.payload_crc,
+                                    stamp_boottime_ns: stamp,
+                                    record: rec,
+                                };
+                                let written = std::fs::write(&tmp, p.encode())
+                                    .and_then(|()| {
+                                        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+                                    })
+                                    .and_then(|()| std::fs::rename(&tmp, &file));
+                                if let Err(e) = written {
+                                    eprintln!("thermal: {e}");
+                                }
+                            }
+                        }
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        });
+    }
+
     /// The helper's own directory: the user's, group root, setgid, 02750,
     /// so its reports (created 0640) are readable by the supervisor through
     /// the group, without CAP_DAC_OVERRIDE.
@@ -595,6 +658,8 @@ mod linux {
                 return EX_UNAVAILABLE;
             }
         };
+        let board_field = sgv2_core::blob::machine_field(&board).unwrap_or([0; 8]);
+        spawn_thermal(page_path.clone(), user_dir.join("thermal"), header, board_field);
         let helper = user_dir.join("helper");
         if let Err(e) = helper_dir(&helper, uid) {
             eprintln!("helper directory: {e}");
@@ -692,7 +757,13 @@ mod linux {
                     observer.note_grant(now_ns());
                     eprintln!("protection granted");
                 }
-                Ok(Event::Released { why }) => eprintln!("protection released: {why:?}"),
+                Ok(Event::Released { why }) => {
+                    let session = observer.session_why();
+                    eprintln!(
+                        "protection released: {why:?}{}{session}",
+                        if session.is_empty() { "" } else { "; session: " }
+                    );
+                }
                 Ok(Event::HardFault(f)) => eprintln!("amp fault, protection withdrawn until restart: {f}"),
                 Ok(Event::Lapsed) => eprintln!("lease lapsed; re-qualifying"),
                 Ok(_) => {}
@@ -734,6 +805,31 @@ mod linux {
             // an extra tick when the PCM reader wakes us; the 10 ms deadlines
             // are unchanged
             scheduled = !wait_until(deadline, wake);
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn the_helper_verdict_is_one_word_and_never_reads_half_written() {
+            let live = HelperLive::default();
+            assert!(!live.vouches(Some((77, 1234)), 10));
+            live.publish(77, 1234, true, 1_000);
+            assert!(live.vouches(Some((77, 1234)), 1_000 + HELPER_CHECK_MAX_NS));
+            // stale, another pid, another start, or dead
+            assert!(!live.vouches(Some((77, 1234)), 1_001 + HELPER_CHECK_MAX_NS));
+            assert!(!live.vouches(Some((78, 1234)), 1_000));
+            assert!(!live.vouches(Some((77, 1235)), 1_000));
+            assert!(!live.vouches(None, 1_000));
+            live.publish(77, 1234, false, 2_000);
+            assert!(!live.vouches(Some((77, 1234)), 2_000));
+            // a checker preempted between its two stores leaves the last
+            // whole verdict, not a torn one
+            live.publish(77, 1234, true, 3_000);
+            live.verdict.store(verdict_word(77, 1234, true), Ordering::Release);
+            assert!(live.vouches(Some((77, 1234)), 3_000));
         }
     }
 }

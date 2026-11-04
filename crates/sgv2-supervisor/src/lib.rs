@@ -12,3 +12,4 @@ pub mod machine;
 pub mod observe;
 pub mod selfcheck;
 pub mod supervise;
+pub mod thermal;

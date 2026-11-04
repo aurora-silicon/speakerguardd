@@ -30,9 +30,28 @@
 //!   smoothed fast and slow gains. Downward moves use `AttackTime`; recovery
 //!   uses `FastReleaseTime` (fast) and `SlowReleaseTime` (slow).
 //!   `EnableMitigation = 0` keeps the modelling and latency and attenuates
-//!   nothing.
+//!   nothing on macOS; here it is refused (fail-safe), as is a tuning with
+//!   neither thermal axis (power or temperature) enabled: either would run
+//!   the speakers unprotected while health reports OK.
+//! - **Latency floor.** The controller decides every 256 frames over the
+//!   samples still in the delay line, so a latency below 256 frames lets a
+//!   transient leave before any decision has seen it; such a tuning is
+//!   refused. (The Neo's is 352.)
 //! - **Controller cadence.** Candidates update every 256 frames over the
 //!   samples still in the delay line (everything that has not yet left).
+//!
+//! Full scale: the output is held to digital full scale (`clamp(x, -1,
+//! 1)`, a non-finite sample 0). The model sees the program unclamped as
+//! the reference does, bounded only at `dsp::METER_FS` (16 FS), so a huge
+//! finite sample cannot overflow it or leave it hot for hours. A model state that goes non-finite latches the
+//! 20 dB fail-safe (`Health::MODEL_FAULT`) until reset.
+//!
+//! Hand-off: `save_state`/`restore_state` carry the coil and magnet rises,
+//! the four power averages and the slow gain to the next stream or
+//! instance, cooled for the gap (the continuous two-node solution; the
+//! averages decay toward idle) with the slow gain released toward unity.
+//! The reference resets on reinitialisation (spec 8); a speaker does not
+//! cool because a stream restarted, so here it never does.
 //!
 //! Failure: the reference unit fails initialisation outright when neither
 //! estimator can be built. Here an unusable parameter set, or a geometry
@@ -47,9 +66,14 @@
 //!   `VelocityIgnoreLowBand/HighBand` therefore have no effect yet.
 //! - **Velocity masking.** The 8-12 kHz detector and knot curve are not
 //!   specified; the limit is the lowest knot, `VelocityLimit0` (unmasked).
-//! - **Temperature knee.** Not specified. The stand-in applies the full
-//!   `MaxTemperatureAttenuation` once the predicted coil temperature
-//!   (`Tvc + TemperatureHeadroom`) reaches the soft limit, unity below.
+//! - **Temperature knee** (spec 6.1, implemented): linear in dB from the
+//!   soft to the hard limit on `Tvc + TemperatureHeadroom`, capped at
+//!   `MaxTemperatureAttenuation`. Beyond the reference, a coil past
+//!   `TemperatureHardLimit` (temperature axis enabled) gets the 20 dB
+//!   fail-safe gain at once (at most;
+//!   the other gains still apply) until it is back below the soft limit: macOS stops at the knee's
+//!   cap, which with a 0 dB cap lets the coil run past the hard limit at
+//!   unity. Never less restrictive than the reference.
 //! - **One-pole convention** (`pole`): `exp(-1/(tau*rate))`, per sample.
 //! - **Amplifier input power.** The budgets apply to the low-rail affine
 //!   model `idle + ratio * max(0, u*i)`; whether the load term is `u*i` or
@@ -63,7 +87,10 @@ use alloc::vec::Vec;
 
 use crate::blob::{BlobError, Pod};
 use crate::delay::Delay;
-use crate::{dsp, ChannelState, Health, Io, ProtectionUnit, Telemetry, UnitKind, FAILSAFE_GAIN, MAX_CHANNELS};
+use crate::{
+    cool_coupled, dsp, gap_or_zero, release_toward_unity, ChannelState, HandOff, Health, Io, ProtectionUnit, Telemetry,
+    UnitKind, FAILSAFE_GAIN, MAX_CHANNELS,
+};
 
 /// Controller update cadence in frames (spec 10: exactly 256).
 pub const CONTROLLER_FRAMES: usize = 256;
@@ -210,6 +237,15 @@ impl Params {
         if lat > 16384.0 {
             return Err(InitError::Invalid("latency"));
         }
+        if self.latency_frames() < CONTROLLER_FRAMES {
+            return Err(InitError::Invalid("latency below the controller cadence"));
+        }
+        if self.enable_mitigation == 0 {
+            return Err(InitError::Invalid("mitigation disabled"));
+        }
+        if self.control_power == 0 && self.control_temperature == 0 {
+            return Err(InitError::Invalid("no thermal axis enabled"));
+        }
         for j in 0..4 {
             if !(pos(self.power_time_scale_s[j])
                 && pos(self.power_hard_limit_w[j])
@@ -253,6 +289,14 @@ impl Params {
             }
         }
         Ok(())
+    }
+
+    /// The audio latency in frames: two filterbank stages plus the speaker
+    /// response look-ahead, each rounded to frames.
+    pub fn latency_frames(&self) -> usize {
+        let rate = self.sample_rate as f64;
+        let frames = |ms: f32| libm::round(ms as f64 * 1e-3 * rate) as usize;
+        2 * frames(self.filterbank_latency_ms) + frames(self.speaker_response_lookahead_ms)
     }
 
     /// Decode and check a complete blob.
@@ -328,6 +372,8 @@ struct Chan {
     rth_mag: f64,
     a_vc: f64,
     a_mag: f64,
+    tau_vc: f64,
+    tau_mag: f64,
     ambient: f64,
     t_vc: f64,
     t_mag: f64,
@@ -341,8 +387,13 @@ struct Chan {
     vel_limit: f64,
     vel_floor: f64,
     t_soft: f64,
+    t_hard: f64,
     t_headroom: f64,
     temp_floor: f64,
+    max_temp_db: f64,
+    /// The coil passed TemperatureHardLimit: 20 dB on the slow gain until
+    /// it is back below the soft limit.
+    hard_armed: bool,
     cand: [f64; 5],
     fast_target: f32,
     slow_target: f32,
@@ -378,6 +429,8 @@ struct Run {
     r_fast: f32,
     r_slow: f32,
     ch: Vec<Chan>,
+    /// A model state went non-finite: the fail-safe is latched until reset.
+    fault: bool,
 }
 
 impl Unit {
@@ -398,6 +451,41 @@ impl Unit {
     }
 }
 
+impl Chan {
+    /// The hard-limit backstop, applied at once (bypassing the attack, as
+    /// spp3's and atsp's hard paths are).
+    #[inline]
+    fn backstop(&self) -> f32 {
+        if self.hard_armed {
+            FAILSAFE_GAIN
+        } else {
+            1.0
+        }
+    }
+
+    /// The temperature candidate, spec 6.1's linear-in-dB knee:
+    /// `z = clamp((Tvc + headroom - soft) / (hard - soft), 0, 1)`,
+    /// `G = 10^(-MaxTemperatureAttenuation z / 20)`. Equal limits form a
+    /// step; reversed or non-finite limits or temperature take the capped
+    /// branch.
+    fn temperature_knee(&self) -> f64 {
+        let t = self.t_vc + self.t_headroom;
+        let (soft, hard) = (self.t_soft, self.t_hard);
+        if !(t.is_finite() && soft.is_finite() && hard.is_finite()) || hard < soft {
+            return self.temp_floor;
+        }
+        if hard == soft {
+            return if t >= soft { self.temp_floor } else { 1.0 };
+        }
+        let z = ((t - soft) / (hard - soft)).clamp(0.0, 1.0);
+        if z == 1.0 {
+            self.temp_floor
+        } else {
+            db_to_lin(self.max_temp_db * z)
+        }
+    }
+}
+
 impl Run {
     fn new(p: &Params) -> Result<Run, InitError> {
         p.validate()?;
@@ -412,8 +500,7 @@ impl Run {
         }
         let n = p.channels as usize;
         let rate = p.sample_rate as f64;
-        let frames = |ms: f32| libm::round(ms as f64 * 1e-3 * rate) as usize;
-        let latency = 2 * frames(p.filterbank_latency_ms) + frames(p.speaker_response_lookahead_ms);
+        let latency = p.latency_frames();
         let hist_len = latency + 1;
         let dt = 1.0 / rate;
         let mut ch = Vec::with_capacity(n);
@@ -436,6 +523,8 @@ impl Run {
                 rth_mag: c.rth_mag as f64,
                 a_vc: dt / (c.tau_vc as f64 + dt),
                 a_mag: dt / (c.tau_mag as f64 + dt),
+                tau_vc: c.tau_vc as f64,
+                tau_mag: c.tau_mag as f64,
                 ambient: c.ambient as f64,
                 t_vc: c.ambient as f64,
                 t_mag: c.ambient as f64,
@@ -448,8 +537,11 @@ impl Run {
                 vel_limit: c.velocity_limit0 as f64,
                 vel_floor: db_to_lin(c.max_velocity_attenuation_db as f64),
                 t_soft: c.temperature_soft_limit as f64,
+                t_hard: c.temperature_hard_limit as f64,
                 t_headroom: c.temperature_headroom as f64,
                 temp_floor: db_to_lin(c.max_temperature_attenuation_db as f64),
+                max_temp_db: c.max_temperature_attenuation_db as f64,
+                hard_armed: false,
                 cand: [1.0; 5],
                 fast_target: 1.0,
                 slow_target: 1.0,
@@ -493,6 +585,7 @@ impl Run {
             r_fast: pole(rate, p.fast_release_time_ms as f64 * 1e-3) as f32,
             r_slow: pole(rate, p.slow_release_time_ms as f64 * 1e-3) as f32,
             ch,
+            fault: false,
         })
     }
 
@@ -509,6 +602,7 @@ impl Run {
             c.hist_disp.iter_mut().for_each(|v| *v = 0.0);
             c.hist_vel.iter_mut().for_each(|v| *v = 0.0);
             c.cand = [1.0; 5];
+            c.hard_armed = false;
             c.fast_target = 1.0;
             c.slow_target = 1.0;
             c.fast = 1.0;
@@ -520,6 +614,7 @@ impl Run {
         self.pos = 0;
         self.frame = 0;
         self.last_frame = 0;
+        self.fault = false;
     }
 
     /// Model one input sample of every channel.
@@ -527,8 +622,7 @@ impl Run {
     fn model(&mut self, io: &Io<'_, '_>, k: usize) {
         let hp = self.hist_pos;
         for c in self.ch.iter_mut() {
-            let x = io.input[c.src][k];
-            let x = if x.is_finite() { x as f64 } else { 0.0 };
+            let x = dsp::meter1(io.input[c.src][k]) as f64;
             let u = c.vfs * x;
             let i = c.current.step(u);
             let xd = c.disp.step(u);
@@ -569,21 +663,25 @@ impl Run {
             } else {
                 1.0
             };
-            let g_temp = if self.ctl[4] {
-                // TODO(SPEC): the knee (restrictive stand-in, module docs)
-                let predicted = c.t_vc + c.t_headroom;
-                // a non-finite temperature takes the restrictive path
-                if predicted >= c.t_soft || predicted.is_nan() {
-                    c.temp_floor
-                } else {
-                    1.0
-                }
-            } else {
-                1.0
-            };
+            let g_temp = if self.ctl[4] { c.temperature_knee() } else { 1.0 };
+            // hard-limit backstop of the temperature axis, with hysteresis
+            // down to the soft limit
+            if !self.ctl[4] {
+                c.hard_armed = false;
+            } else if c.t_vc > c.t_hard || c.t_vc.is_nan() {
+                c.hard_armed = true;
+            } else if c.t_vc < c.t_soft.min(c.t_hard) {
+                c.hard_armed = false;
+            }
             c.cand = [g_peak, g_disp, g_vel, g_pow, g_temp];
             c.fast_target = g_peak.min(g_disp).min(g_vel) as f32;
             c.slow_target = g_pow.min(g_temp) as f32;
+            // any non-finite model or controller state latches the fail-safe
+            let model = [c.t_vc, c.t_mag, c.last_x, c.last_v].iter().chain(&c.pbar).all(|v| v.is_finite());
+            let gains = c.cand.iter().all(|v| v.is_finite()) && c.fast.is_finite() && c.slow.is_finite();
+            if !(model && gains) {
+                self.fault = true;
+            }
         }
         if self.link && self.n > 1 {
             let (mut slow, mut pow) = (1.0f32, 1.0f32);
@@ -610,14 +708,14 @@ impl Run {
                 let out = &mut io.output[c.src][k..k + m];
                 // SAFETY: distinct slices of `m` samples.
                 unsafe { c.delay.run(inp.as_ptr(), out.as_mut_ptr(), m) };
-                dsp::sanitize(out);
+                dsp::bound(out);
                 if self.mitigate {
                     for o in out.iter_mut() {
                         let rf = if c.fast_target < c.fast { self.r_attack } else { self.r_fast };
                         c.fast = c.fast_target + rf * (c.fast - c.fast_target);
                         let rs = if c.slow_target < c.slow { self.r_attack } else { self.r_slow };
                         c.slow = c.slow_target + rs * (c.slow - c.slow_target);
-                        *o *= c.fast.min(c.slow);
+                        *o *= c.fast.min(c.slow).min(c.backstop());
                     }
                 }
             }
@@ -628,6 +726,10 @@ impl Run {
                 self.pos = 0;
                 self.control();
                 self.last_frame = self.frame - CONTROLLER_FRAMES as u64;
+                if self.fault {
+                    crate::failsafe::fill_from(io, k, FAILSAFE_GAIN);
+                    return;
+                }
             }
         }
     }
@@ -655,7 +757,14 @@ impl ProtectionUnit for Unit {
             crate::spp3::failsafe_io(&mut io);
             return Health(Health::FAILSAFE | Health::CHANNEL_MISMATCH);
         }
+        if run.fault {
+            crate::spp3::failsafe_io(&mut io);
+            return Health(Health::FAILSAFE | Health::MODEL_FAULT);
+        }
         run.process(&mut io);
+        if run.fault {
+            return Health(Health::FAILSAFE | Health::MODEL_FAULT);
+        }
         Health::OK
     }
     fn telemetry(&self, out: &mut Telemetry) {
@@ -668,6 +777,9 @@ impl ProtectionUnit for Unit {
             return;
         };
         out.frame = run.last_frame;
+        if run.fault {
+            out.health = Health(Health::FAILSAFE | Health::MODEL_FAULT);
+        }
         for c in &run.ch {
             let mut s = ChannelState::ABSENT;
             s.modeled_power_w = c.pbar[2] as f32;
@@ -679,13 +791,160 @@ impl ProtectionUnit for Unit {
             for (a, &g) in s.axis_gain.iter_mut().zip(&c.cand) {
                 *a = g as f32;
             }
-            s.gain = if run.mitigate { c.fast.min(c.slow) } else { 1.0 };
+            s.gain = if run.fault {
+                FAILSAFE_GAIN
+            } else if run.mitigate {
+                c.fast.min(c.slow).min(c.backstop())
+            } else {
+                1.0
+            };
             out.channels[c.src] = s;
         }
     }
     fn reset(&mut self) {
         if let Some(r) = self.run.as_mut() {
             r.reset();
+        }
+    }
+
+    fn save_state(&self, out: &mut HandOff) -> bool {
+        let Some(run) = self.run.as_ref().filter(|r| !r.fault) else { return false };
+        *out = HandOff::EMPTY;
+        out.kind = UnitKind::Lsm2 as u32;
+        out.channels = run.n as u32;
+        out.sample_rate = self.params.sample_rate;
+        for (i, c) in run.ch.iter().enumerate() {
+            let n = &mut out.node[i];
+            // rises over ambient; a coil below ambient carries no heat
+            n[0] = (c.t_vc - c.ambient).max(0.0);
+            n[1] = (c.t_mag - c.ambient).max(0.0);
+            n[2..6].copy_from_slice(&c.pbar);
+            n[6] = c.hard_armed as u8 as f64;
+            out.gain[i] = c.slow as f64;
+        }
+        true
+    }
+
+    fn restore_state(&mut self, state: &HandOff, gap_s: f64) -> bool {
+        let rate = self.params.sample_rate;
+        let Some(run) = self.run.as_mut() else { return false };
+        if !state.fits(UnitKind::Lsm2, run.n, rate) {
+            return false;
+        }
+        let t = gap_or_zero(gap_s);
+        let samples = t * rate as f64;
+        for (i, c) in run.ch.iter_mut().enumerate() {
+            let s = &state.node[i];
+            let (v, m) = cool_coupled(s[0], s[1], c.tau_vc, c.tau_mag, t);
+            c.t_vc = c.ambient + v;
+            c.t_mag = c.ambient + m;
+            for j in 0..4 {
+                c.pbar[j] = run.idle + (s[2 + j] - run.idle) * libm::pow(run.p_pole[j], samples);
+            }
+            // hysteresis: an armed backstop stays armed while the cooled coil
+            // is still at or above the soft limit
+            c.hard_armed = run.ctl[4] && s[6] != 0.0 && c.t_vc >= c.t_soft.min(c.t_hard);
+            let g = release_toward_unity(state.gain[i], run.r_slow as f64, samples) as f32;
+            c.slow = g;
+            c.slow_target = g;
+        }
+        true
+    }
+}
+
+#[cfg(test)]
+mod fault_tests {
+    use super::*;
+
+    fn params() -> Params {
+        let mut p = Params {
+            channels: 2,
+            sample_rate: 48_000,
+            enable_mitigation: 1,
+            control_power: 1,
+            control_temperature: 1,
+            link_slow_gains: 1,
+            model_only: 1,
+            attack_time_ms: 2.0,
+            fast_release_time_ms: 150.0,
+            slow_release_time_ms: 10_000.0,
+            filterbank_latency_ms: 2.5,
+            speaker_response_lookahead_ms: 1.0,
+            power_time_scale_s: [0.002, 0.2, 2.0, 30.0],
+            power_hard_limit_w: [50.0, 20.0, 2.0, 1.5],
+            power_soft_limit_pct: [100.0; 4],
+            max_power_attenuation_db: 4.0,
+            low_rail_power_ratio: 1.0,
+            ..Params::default()
+        };
+        for c in 0..2 {
+            p.ch[c] = ChannelParams {
+                source: c as u32,
+                volts_full_scale: 6.0,
+                parasitic_resistance: 0.2,
+                rdc: 4.0,
+                bl: 0.8,
+                mms_kg: 0.0002,
+                rms: 0.2,
+                kms: 1500.0,
+                disp_bl: 0.8,
+                disp_mms_kg: 0.00022,
+                disp_rms: 0.25,
+                disp_kms: 1600.0,
+                rth_vc: 30.0,
+                tau_vc: 2.0,
+                rth_mag: 20.0,
+                tau_mag: 60.0,
+                ambient: 40.0,
+                amplitude_limit: 1.0,
+                displacement_limit: 0.0005,
+                velocity_limit0: 0.5,
+                max_velocity_attenuation_db: 18.0,
+                temperature_soft_limit: 110.0,
+                temperature_hard_limit: 125.0,
+                temperature_headroom: 4.0,
+                max_temperature_attenuation_db: 10.0,
+            };
+        }
+        p
+    }
+
+    fn run(u: &mut Unit, x: f32, n: usize) -> (Vec<f32>, Health) {
+        let input = vec![x; n];
+        let ins: [&[f32]; 2] = [&input, &input];
+        let mut o0 = vec![0.0f32; n];
+        let mut o1 = vec![0.0f32; n];
+        let mut outs: [&mut [f32]; 2] = [&mut o0, &mut o1];
+        let h = u.process(Io { frames: n, input: &ins, sense: &[], output: &mut outs });
+        (o0, h)
+    }
+
+    /// Review finding 1: a non-finite state latches 20 dB until reset.
+    #[test]
+    fn a_non_finite_model_state_latches_the_failsafe_until_reset() {
+        let poisons: [fn(&mut Run); 3] =
+            [|r| r.ch[0].t_mag = f64::NAN, |r| r.ch[1].pbar[2] = f64::INFINITY, |r| r.ch[0].slow = f32::NAN];
+        for poison in poisons {
+            let mut u = Unit::new(params());
+            let (o, h) = run(&mut u, 0.01, 1024);
+            assert_eq!((o[1023], h), (0.01, Health::OK));
+            poison(u.run.as_mut().unwrap());
+            let (_, h) = run(&mut u, 0.01, 512);
+            assert!(h.0 & Health::MODEL_FAULT != 0 && h.is_failsafe());
+            for _ in 0..4 {
+                let (o, h) = run(&mut u, 1.0, 300);
+                assert!(h.0 & Health::MODEL_FAULT != 0);
+                assert!(o.iter().all(|&v| (v - FAILSAFE_GAIN).abs() < 1e-7));
+            }
+            let mut t = Telemetry::new();
+            u.telemetry(&mut t);
+            assert!(t.health.0 & Health::MODEL_FAULT != 0 && t.channels[0].gain == FAILSAFE_GAIN);
+            // a state the unit no longer trusts is never handed on
+            let mut rec = HandOff::EMPTY;
+            assert!(!u.save_state(&mut rec));
+            u.reset();
+            let (o, h) = run(&mut u, 0.01, 1024);
+            assert_eq!((o[1023], h), (0.01, Health::OK));
         }
     }
 }
