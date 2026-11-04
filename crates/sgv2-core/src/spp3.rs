@@ -442,6 +442,8 @@ pub const THERMAL_STATE_COLD: u32 = 2;
 /// gates the pilot on at exactly that level. The golden wins until the text
 /// is reconciled.
 const PDRV_WITH_HEADROOM: bool = false;
+/// TODO(SPEC): see the coil-power metering in `Run::segment`.
+const PCOIL_WITH_PILOT: bool = true;
 
 /// The reference's coefficient law: a one-pole that settles to 99 % in
 /// `seconds` at `rate` updates per second.
@@ -583,6 +585,17 @@ struct Cl {
     limit_s: f64,
 }
 
+/// The Goertzel period `N = next_power_of_two(round(TempSenseWindowTime *
+/// fs))` (spec 7), at least 1.
+fn pilot_period(c: &ChannelParams, rate: f64) -> usize {
+    let samples = libm::round(c.temp_sense_window_time_s as f64 * rate);
+    if samples >= 1.0 && samples <= (1u32 << 20) as f64 {
+        (samples as usize).next_power_of_two()
+    } else {
+        1
+    }
+}
+
 /// The calibration record of a channel lies inside its ranges (spec 7).
 fn cal_in_range(c: &ChannelParams) -> bool {
     let (r, t) = (c.cal_r, c.cal_t);
@@ -721,9 +734,12 @@ struct Pilot {
     enable: f32,
     k1: f32,
     k2: f32,
-    /// Phase increment and the running phase, radians.
-    dphi: f64,
-    phi: f64,
+    /// The sine is `sin(2 pi m n / N)` on the analyser's bin `m` of its
+    /// period `N`, `n` counting frames from construction (the goldens:
+    /// 43.9453125 Hz for `PilotFreq` 43.0664, phase 0 at frame 0).
+    period: usize,
+    bin: f64,
+    n: usize,
     /// Selected high/low amplitude (hysteresis on `T_OL`) and whether the
     /// content gate is on; the target is their product.
     high: bool,
@@ -743,8 +759,9 @@ impl Pilot {
             enable: c.pilot_enable_thres,
             k1: settle99(c.pilot_decay_time_s as f64, rate) as f32,
             k2: settle99(c.pilot_decay_time_stage2_s as f64, rate) as f32,
-            dphi: 2.0 * core::f64::consts::PI * c.pilot_freq as f64 / rate,
-            phi: 0.0,
+            period: pilot_period(c, rate),
+            bin: libm::round(c.pilot_freq as f64 * pilot_period(c, rate) as f64 / rate),
+            n: 0,
             high: false,
             on: false,
             z1: 0.0,
@@ -752,7 +769,7 @@ impl Pilot {
         }
     }
     fn reset(&mut self) {
-        self.phi = 0.0;
+        self.n = 0;
         self.high = false;
         self.on = false;
         self.z1 = 0.0;
@@ -767,11 +784,13 @@ impl Pilot {
             self.high = false;
         }
     }
-    /// Add the pilot to `out`. TODO(SPEC): the sine's phase origin, the
-    /// generator frequency (`PilotFreq` here; the analyser uses its bin)
-    /// and the exact form of the two "interpolation stages" (two cascaded
-    /// per-sample 99 % one-poles here). The `spp3-cal-nominal` golden's
-    /// onset is about 2.2x this model's `k1*k2*A` (see the B5 report).
+    /// Add the pilot to `out`. TODO(SPEC): the exact form of the two
+    /// "interpolation stages" (two cascaded per-sample 99 % one-poles
+    /// here, as spec 7 words it). The goldens' envelope rises faster: on
+    /// `spp3-cl-edge-deadI-midlimit` ch0 the envelope 0, 1, 2 frames after
+    /// the gate opens is 2.40e-7, 6.58e-7, 1.38e-6 (this model: 1.02e-7,
+    /// 3.05e-7, 6.09e-7) and reaches 9.51e-3 of 0.01 after 1244 frames
+    /// (this model 9.07e-3).
     fn add(&mut self, out: &mut [f32]) {
         let target = if !self.on {
             0.0
@@ -780,13 +799,14 @@ impl Pilot {
         } else {
             self.a_lo
         };
+        let w = 2.0 * core::f64::consts::PI * self.bin / self.period as f64;
         for o in out.iter_mut() {
             self.z1 += self.k1 * (target - self.z1);
             self.z2 += self.k2 * (self.z1 - self.z2);
-            *o += self.z2 * libm::sin(self.phi) as f32;
-            self.phi += self.dphi;
-            if self.phi >= core::f64::consts::TAU {
-                self.phi -= core::f64::consts::TAU;
+            *o += self.z2 * libm::sin(w * self.n as f64) as f32;
+            self.n += 1;
+            if self.n == self.period {
+                self.n = 0;
             }
         }
     }
@@ -1159,8 +1179,17 @@ impl Run {
                 }
                 *health |= Health::FAILSAFE;
             }
-            // Pcoil: the protected, headroom-reduced drive before the pilot,
-            // on the update's own frames (spec 4, 16)
+            // Pcoil: the protected, headroom-reduced drive on the update's
+            // own frames (spec 4, 16). TODO(SPEC): spec 4 excludes the
+            // generated pilot; the `spp3-cl-edge-*` goldens' `Reb_Data`
+            // coil power carries the program x pilot cross term (update 2
+            // on ch0: 23.426 W logged, 23.410 W without the pilot, 23.422 W
+            // with it), so the drive is metered after the pilot is added.
+            if PCOIL_WITH_PILOT {
+                if let Some(p) = c.pilot.as_mut() {
+                    p.add(out);
+                }
+            }
             c.acc.add_sq(out, phase);
             // Pdrv: the unprotected program on the same frames
             let mut m0 = 0;
@@ -1171,8 +1200,10 @@ impl Run {
                 c.acc_in.add_sq(&c.scratch[..m], phase + m0);
                 m0 += m;
             }
-            if let Some(p) = c.pilot.as_mut() {
-                p.add(out);
+            if !PCOIL_WITH_PILOT {
+                if let Some(p) = c.pilot.as_mut() {
+                    p.add(out);
+                }
             }
         }
         // sense statistics over the same frames
