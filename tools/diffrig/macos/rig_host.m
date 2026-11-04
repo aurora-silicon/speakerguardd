@@ -12,6 +12,12 @@
 //            [--tele tele.f32 --tele-ch 12] [--plant plant.json] [--no-tele]
 //            [--param SCOPE.ELEMENT.ID=VALUE ...]
 //            [--event FRAME:KIND[=ARG] ...] [--every K] --out PREFIX
+//            [--preset-param ID=VALUE ...] [--param-at FRAME:ID=VALUE ...]
+//            [--file-ch N] [--limit-frames N]
+// --preset-param rewrites a stored record of the strip's preset before ClassInfo (the record
+// must exist); --param-at sets a global parameter before the first render call that starts
+// at FRAME; --file-ch: the input file has N channels and stream channel c reads file channel
+// c mod N; --limit-frames renders at most N input frames.
 // Event kinds, applied before the first render call that starts at or after FRAME:
 //   reset          AudioUnitReset (global scope)
 //   sleep=S        idle S wall-clock seconds
@@ -44,6 +50,8 @@
 #define MAXPL 8
 #define MAXMETERS 4096
 #define MAXPAR 32
+#define MAXPRESET 128
+#define MAXPARAT 32
 
 static UInt32 fcc(const char *s) { return ((UInt32)s[0] << 24) | ((UInt32)s[1] << 16) | ((UInt32)s[2] << 8) | (UInt32)s[3]; }
 static void ck(OSStatus s, const char *w) { if (s) { fprintf(stderr, "%s: %d\n", w, (int)s); } }
@@ -207,6 +215,7 @@ typedef struct Config {
     UInt32 cfIds[MAXCF]; const char *cfPaths[MAXCF]; int ncf;
     UInt32 plIds[MAXPL]; const char *plPaths[MAXPL]; int npl;
     UInt32 parScope[MAXPAR], parEl[MAXPAR], parId[MAXPAR]; float parVal[MAXPAR]; int npar;
+    UInt32 presetId[MAXPRESET]; float presetVal[MAXPRESET]; int npreset;
     long long prop64007; // >= -1: replaces any --prop 64007 (-1 omits it); < -1: as given
     int haveTeleBus;
 } Config;
@@ -246,8 +255,33 @@ static void configureUnit(AudioUnit au, Config *cf, CFPropertyListRef classInfo)
         for (NSDictionary *s in sd[@"strips"]) for (NSDictionary *e in s[@"effects"])
             if ([e[@"unit"][@"subtype"] unsignedIntValue] == fcc(unit)) preset = e[@"aupreset"];
         if (!preset) { fprintf(stderr, "no %s preset in strip\n", unit); exit(1); }
+        if (cf->npreset) {
+            NSMutableDictionary *mp = [preset mutableCopy];
+            NSMutableData *pd = [mp[@"data"] mutableCopy];
+            if (!pd || pd.length < 12) { fprintf(stderr, "preset has no parameter data\n"); exit(1); }
+            uint8_t *bytes = pd.mutableBytes;
+            UInt32 count = CFSwapInt32BigToHost(*(UInt32 *)(bytes + 8));
+            if (pd.length != 12 + 8 * (NSUInteger)count) { fprintf(stderr, "unsupported preset parameter data\n"); exit(1); }
+            for (int k = 0; k < cf->npreset; ++k) {
+                bool found = false;
+                for (UInt32 i = 0; i < count && !found; ++i) {
+                    if (CFSwapInt32BigToHost(*(UInt32 *)(bytes + 12 + 8 * i)) != cf->presetId[k]) continue;
+                    union { float f; UInt32 u; } val = {.f = cf->presetVal[k]};
+                    *(UInt32 *)(bytes + 16 + 8 * i) = CFSwapInt32HostToBig(val.u);
+                    found = true;
+                }
+                if (!found) { fprintf(stderr, "FATAL preset parameter %u not found\n", cf->presetId[k]); exit(1); }
+            }
+            mp[@"data"] = pd;
+            preset = mp;
+        }
         CFPropertyListRef ci = (__bridge CFPropertyListRef)preset;
         die(AudioUnitSetProperty(au, kAudioUnitProperty_ClassInfo, 0, 0, &ci, sizeof ci), "ClassInfo");
+        for (int k = 0; k < cf->npreset; ++k) {
+            AudioUnitParameterValue rb = NAN;
+            OSStatus r = AudioUnitGetParameter(au, cf->presetId[k], kAudioUnitScope_Global, 0, &rb);
+            fprintf(stderr, "preset-param %u=%.9g readback %.9g : %d\n", cf->presetId[k], cf->presetVal[k], rb, (int)r);
+        }
         if (sidecar) {
             CFDictionaryRef sc = (__bridge CFDictionaryRef)[NSDictionary dictionaryWithContentsOfFile:@(sidecar)];
             die(AudioUnitSetProperty(au, 64003, 0, 0, &sc, sizeof sc), "sidecar 64003");
@@ -340,7 +374,9 @@ int main(int argc, const char **argv) {
     @autoreleasepool {
         const char *unit = "spp3", *strip = NULL, *sidecar = NULL, *spts = NULL, *in = NULL, *tele = NULL,
                    *plant = NULL, *out = NULL;
-        int nch = 0, q = 512, telech = 12, every = 1, notele = 0;
+        int nch = 0, q = 512, telech = 12, every = 1, notele = 0, filech = 0;
+        long long limitframes = 0;
+        UInt64 patFrame[MAXPARAT]; UInt32 patId[MAXPARAT]; float patVal[MAXPARAT]; int npat = 0;
         long long failAt = -1; // --test-fail-at FRAME: the rig's own tests; simulates a render error there
         double pace = 0; int maxframes = 0; // >0: render at most pace x real time (lets the units' async log writers keep up)
         double sr = 48000;
@@ -386,6 +422,22 @@ int main(int argc, const char **argv) {
                 }
                 npar++;
             }
+            else if (ARG("--preset-param")) {
+                if (C.npreset >= MAXPRESET || sscanf(v, "%u=%f", &C.presetId[C.npreset], &C.presetVal[C.npreset]) != 2) {
+                    fprintf(stderr, "bad --preset-param %s\n", v); return 2;
+                }
+                C.npreset++;
+            }
+            else if (ARG("--param-at")) {
+                unsigned long long fr = 0;
+                if (npat >= MAXPARAT || sscanf(v, "%llu:%u=%f", &fr, &patId[npat], &patVal[npat]) != 3) {
+                    fprintf(stderr, "bad --param-at %s\n", v); return 2;
+                }
+                if (npat && fr < patFrame[npat - 1]) { fprintf(stderr, "--param-at frames must ascend\n"); return 2; }
+                patFrame[npat++] = fr;
+            }
+            else if (ARG("--file-ch")) filech = atoi(v);
+            else if (ARG("--limit-frames")) limitframes = atoll(v);
             else if (ARG("--event")) {
                 if (nevt >= 16) { fprintf(stderr, "too many --event\n"); return 2; }
                 char kind[16] = {0}; double arg = NAN; long long fr = 0;
@@ -404,6 +456,8 @@ int main(int argc, const char **argv) {
             else { fprintf(stderr, "bad arg %s\n", a); return 2; }
         }
         if (!strip || !in || !nch || !out || q > MAXQ || nch > MAXCH) { fprintf(stderr, "missing args\n"); return 2; }
+        if (!filech) filech = nch;
+        if (filech < 1 || filech > MAXCH || limitframes < 0) { fprintf(stderr, "bad --file-ch or --limit-frames\n"); return 2; }
         if (q < 1 || nch < 1 || every < 1) { fprintf(stderr, "--q, --ch and --every must be positive\n"); return 2; }
         if (telech < 1 || telech > MAXTELE) { fprintf(stderr, "--tele-ch must be 1..%d\n", MAXTELE); return 2; }
         B.nch = nch; B.telech = telech;
@@ -460,14 +514,24 @@ int main(int argc, const char **argv) {
 
         AudioBufferList *abl = calloc(1, offsetof(AudioBufferList, mBuffers) + MAXCH * sizeof(AudioBuffer));
         static float outb[MAXCH][MAXQ], inter[MAXQ * MAXCH];
+        int nextpat = 0;
         abl->mNumberBuffers = nch;
         UInt64 done = 0, nread = 0; long quanta = 0;
         int failed = 0;
         for (;;) {
-            size_t got = fread(inter, sizeof(float) * nch, q, fin);
+            while (nextpat < npat && done >= patFrame[nextpat]) {
+                int k = nextpat++;
+                OSStatus r = AudioUnitSetParameter(au, patId[k], kAudioUnitScope_Global, 0, patVal[k], 0);
+                fprintf(stderr, "param-at %llu %u=%.9g : %d\n", done, patId[k], patVal[k], (int)r);
+                die(r, "param-at");
+            }
+            size_t want = (size_t)q;
+            if (limitframes > 0) want = (size_t)MIN((long long)q, MAX(0LL, limitframes - (long long)nread));
+            if (!want) break;
+            size_t got = fread(inter, sizeof(float) * filech, want, fin);
             if (!got) break;
             nread += got;
-            for (size_t i = 0; i < got; ++i) for (int c = 0; c < nch; ++c) B.audio[c][i] = inter[i * nch + c];
+            for (size_t i = 0; i < got; ++i) for (int c = 0; c < nch; ++c) B.audio[c][i] = inter[i * filech + c % filech];
             if (haveTeleBus) {
                 if (ftele) {
                     size_t g2 = fread(B.tele, sizeof(float) * telech, got, ftele);
@@ -547,9 +611,9 @@ int main(int argc, const char **argv) {
         fclose(fo); fclose(fs); if (ft) fclose(ft);
         snprintf(path, sizeof path, "%s.meta.json", out); FILE *fm = fopen(path, "w");
         fprintf(fm, "{\"unit\":\"%s\",\"component_version\":\"0x%x\",\"strip\":\"%s\",\"sidecar\":\"%s\","
-                "\"spts\":%s,\"quantum\":%d,\"sr\":%g,\"channels\":%d,\"tele_bus\":%d,\"tele_source\":\"%s\","
+                "\"spts\":%s,\"quantum\":%d,\"sr\":%g,\"channels\":%d,\"file_channels\":%d,\"tele_bus\":%d,\"tele_source\":\"%s\","
                 "\"pace\":%g,\"latency_s\":%.12g,\"frames\":%llu,\"frames_read\":%llu,\"meters\":%d,\"render_error\":%d}\n",
-                unit, compVersion, strip, sidecar ? sidecar : "", spts ? "true" : "false", q, sr, nch, haveTeleBus,
+                unit, compVersion, strip, sidecar ? sidecar : "", spts ? "true" : "false", q, sr, nch, filech, haveTeleBus,
                 tele ? tele : plant ? plant : "zeros", pace, lat, done, nread, nm, failed);
         fclose(fm);
         AudioUnitUninitialize(au); AudioComponentInstanceDispose(au);
