@@ -22,7 +22,7 @@ coil-temperature and controller records only).
 
   capture_edge.py OUT [case-substring ...]      (SGV2_RIG_DIR, SGV2_RIG_BIN as capture.py)
 """
-import csv, glob, gzip, json, math, os, plistlib, re, shutil, struct, subprocess, sys, time
+import csv, glob, gzip, json, math, os, plistlib, shutil, struct, subprocess, sys, time
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -236,18 +236,17 @@ def runtime_signal(name, nch):
 
 
 def run_case(c, outroot, force=False):
+    if os.geteuid() == 0:
+        raise RuntimeError("refusing to run as root: a missed log redirect would write system directories")
     d = os.path.abspath(os.path.join(outroot, c["name"]))
-    if os.path.exists(os.path.join(d, "trace.jsonl.gz")) and not force:
-        return d
-    shutil.rmtree(d, ignore_errors=True)
-    os.makedirs(os.path.join(d, "logs"), mode=0o700)
-    os.chmod(d, 0o700)
     unit, aid, q = c["unit"], c["aid"], c.get("q", 512)
     nch = atsp_channels(aid) if unit == "atsp" else 6
     env = dict(os.environ, DYLD_INSERT_LIBRARIES=os.path.join(BIN, "prefshim.dylib"),
                RIGREDIR_TO=os.path.join(d, "logs"))
     if c["signal"].startswith("rt-"):
         runtime_signal(c["signal"], nch)
+    # The edge list sets no run-time graph properties: only the case's own fixtures.
+    runtime_file, cfprops = capture.resolve_cfprops(c, use_runtime=False)
     args = [os.path.join(BIN, "rig_host"), "--unit", unit, "--strip", strip_path(aid),
             "--in", os.path.join(SIG, f"{c['signal']}.{nch}ch.f32"), "--ch", str(nch),
             "--q", str(q), "--out", os.path.join(d, "run")]
@@ -257,31 +256,38 @@ def run_case(c, outroot, force=False):
     if unit == "spp3":
         sc = sidecar_path(aid)
         if c.get("sidecar_patch"):
-            pl = plistlib.load(open(sc, "rb"))
-            for ch in pl["ChannelSpecificParams"].values():
+            patched_sidecar = plistlib.load(open(sc, "rb"))
+            for ch in patched_sidecar["ChannelSpecificParams"].values():
                 ch["OL_thermal"].update(c["sidecar_patch"])
             sc = os.path.join(d, "sidecar.plist")
-            plistlib.dump(pl, open(sc, "wb"))
-            os.chmod(sc, 0o600)
         args += ["--sidecar", sc]
         props, paths = propstrip(unit, aid)
         for pr in props:
             args += ["--prop", pr]
         for pr in paths:
             args += ["--plistprop", pr]
-        for pr in c.get("cfprops", []):
-            prop, fixture = pr.split("=", 1)
-            args += ["--cfprop", f"{prop}={os.path.join(RIG, 'cal', fixture)}"]
+        for pr in cfprops:
+            args += ["--cfprop", f"{pr['id']}={pr['path']}"]
         if c.get("plant"):
-            pj = os.path.join(d, "plant.json")
-            json.dump(c["plant"], open(pj, "w"), indent=1)
-            args += ["--plant", pj]
+            args += ["--plant", os.path.join(d, "plant.json")]
         if c.get("clsp"):
             env.update(RIGREDIR_FROM="/Library/Preferences/Audio/CLSPLogs", RIGPREF_clsp_logging_level=CLSP_LEVEL)
+    signal = os.path.join(SIG, f"{c['signal']}.{nch}ch.f32")
+    key = capture.inputs_key(args + [json.dumps(c, sort_keys=True)], signal, runtime_file, cfprops)
+    if not force and capture.cached(d, key):
+        return d
+    shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(os.path.join(d, "logs"), mode=0o700)
+    os.chmod(d, 0o700)
+    if unit == "spp3" and c.get("sidecar_patch"):
+        plistlib.dump(patched_sidecar, open(sc, "wb"))
+        os.chmod(sc, 0o600)
+    if unit == "spp3" and c.get("plant"):
+        json.dump(c["plant"], open(os.path.join(d, "plant.json"), "w"), indent=1)
     t0 = time.time()
     pace = 25.0 if c.get("clsp") else 0.0
     logp = logf = None
-    if c.get("cfprops"):
+    if any(p["id"] == capture.SPTS_PROP for p in cfprops):
         predicate = ('process == "rig_host" AND '
                      '(eventMessage CONTAINS "Using closed loop parameters" OR '
                      'eventMessage CONTAINS "Using open loop kernel" OR '
@@ -322,14 +328,12 @@ def run_case(c, outroot, force=False):
                 logp.wait()
             logf.close()
     meta = json.load(open(os.path.join(d, "run.meta.json")))
+    capture.check_host(c["name"], meta, expect_frames)
     decisions = {"closed_loop_channels": [], "open_loop_channels": []}
     if logf:
-        text = open(os.path.join(d, "au.log")).read()
-        decisions["closed_loop_channels"] = sorted({int(x) for x in re.findall(
-            r"Ch (\d+), Using closed loop parameters", text)})
-        decisions["open_loop_channels"] = sorted({int(x) for x in re.findall(
-            r"Ch (\d+), Using open loop kernel", text)})
-    meta.update(case=c, aid=aid, wall_s=round(time.time() - t0, 2), pace=pace, **decisions)
+        decisions = capture.parse_decisions(open(os.path.join(d, "au.log")).read())
+    meta.update(case=c, aid=aid, wall_s=round(time.time() - t0, 2), pace=pace, runtime_file=runtime_file,
+                cfprops=cfprops, inputs_sha256=key, **decisions)
     if c.get("clsp"):
         cl = decode_clsp(os.path.join(d, "logs"), nch)
         np.savez_compressed(os.path.join(d, "clsp.npz"), t_coil=cl["T_Coil"][0], ctl=cl["Reb_Data"][0])

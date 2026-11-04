@@ -9,9 +9,18 @@ Each case writes, under <out>/<case>/ (mode 700, Apple-derived data):
   trace.jsonl                                               tools/diffrig/schema.json lines
 Nothing here touches the user's defaults (prefshim answers lookups in-process) or any
 audio device.
+
+run.meta.json also records the resolved CF properties (cfprops: id, fixture, sha256,
+source runtime|case), the run-time file used (runtime_file) and inputs_sha256, the hash
+of the host arguments, input signal and fixtures. A cached trace is reused only when
+inputs_sha256 matches. lsm2 cases need cal/runtime-<unit>.json (RUNTIME_REQUIRED)
+unless they set runtime=False. rig_host's render_error and frame count are checked
+before a trace is written. mode.closed_loop is the per-channel list of the schema:
+from the unit's log when the calibration object is set, all open loop otherwise.
+
+  capture.py [OUT [case-substring ...]] | --retrace DIR ... | --self-test
 """
-import csv, json, math, os, re, shutil, subprocess, sys, time
-import numpy as np
+import csv, hashlib, json, math, os, re, shutil, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 # The rig's data directory: generated signals in signals/, plant files in cal/, traces
@@ -25,7 +34,13 @@ STRIP = {"spp3": f"{TUN}/AID35/DSP/Strips/builtin_speaker_out_general.austrip",
 SIDECAR = {"spp3": f"{TUN}/AID35/DSP/Strips/aid35-aufx-spp3-appl.plist"}
 CH = {"spp3": 6, "lsm2": 2}
 sys.path.insert(0, HERE)
-import lsm2logs  # noqa: E402
+# Units whose default cases need the live graph's run-time properties
+# (cal/runtime-<unit>.json). A case of such a unit fails when the file is missing,
+# unless it opts out with runtime=False (the lsm2-noruntime-* cases).
+RUNTIME_REQUIRED = {"lsm2"}
+# The spp3 calibration object (SpTS). Without it spp3 ignores telemetry and runs
+# its open-loop kernel on every channel.
+SPTS_PROP = 64009
 
 
 AID = {"spp3": 35, "lsm2": 44}
@@ -100,13 +115,105 @@ def cases():
     return C
 
 
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fd:
+        for b in iter(lambda: fd.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def resolve_cfprops(c, rig=None, use_runtime=True):
+    """The case's CF properties, resolved: the run-time list from cal/runtime-<unit>.json
+    (when the case uses it) followed by the case's own. Returns (runtime_file, props):
+    runtime_file is {"path", "sha256"} or None; each prop is
+    {"id", "fixture", "path", "sha256", "source"}. Raises when a required runtime
+    file or any fixture is missing."""
+    rig = rig or RIG
+    unit = c["unit"]
+    runtime = os.path.join(rig, "cal", f"runtime-{unit}.json")
+    want = use_runtime and c.get("runtime", True)
+    rt, rtf = [], None
+    if want and os.path.exists(runtime):
+        rt = json.load(open(runtime))
+        if not (isinstance(rt, list) and all(isinstance(x, str) and "=" in x for x in rt)):
+            raise ValueError(f"{runtime}: expected a list of \"ID=fixture.json\" strings")
+        rtf = {"path": runtime, "sha256": sha256(runtime)}
+    elif want and unit in RUNTIME_REQUIRED:
+        raise FileNotFoundError(f"{c['name']}: {runtime} is required for {unit} cases "
+                                f"(without it the case would silently match its noruntime variant)")
+    out = []
+    for source, lst in (("runtime", rt), ("case", c.get("cfprops", []))):
+        for pr in lst:
+            prop, fixture = pr.split("=", 1)
+            path = os.path.join(rig, "cal", fixture)
+            if not os.path.isfile(path):
+                raise FileNotFoundError(f"{c['name']}: fixture {path} for property {prop} is missing")
+            out.append({"id": int(prop), "fixture": fixture, "path": path, "sha256": sha256(path),
+                        "source": source})
+    return rtf, out
+
+
+def inputs_key(args, signal, runtime_file, cfprops):
+    """Hash of everything that determines a reference: the host arguments, the
+    input signal and every fixture. A cached trace is reused only when it matches."""
+    h = hashlib.sha256()
+    h.update(json.dumps({"args": args, "signal": sha256(signal) if os.path.exists(signal) else None,
+                         "runtime_file": runtime_file, "cfprops": cfprops}, sort_keys=True).encode())
+    return h.hexdigest()
+
+
+def cached(d, key):
+    """True when d holds a finished trace made from exactly these inputs."""
+    try:
+        meta = json.load(open(os.path.join(d, "run.meta.json")))
+    except (OSError, ValueError):
+        return False
+    return meta.get("inputs_sha256") == key and (os.path.exists(os.path.join(d, "trace.jsonl")) or
+                                                 os.path.exists(os.path.join(d, "trace.jsonl.gz")))
+
+
+def check_host(name, meta, expect_frames):
+    """rig_host exits nonzero on these too; check the meta as well, so a truncated
+    reference is never written."""
+    if meta.get("render_error"):
+        raise RuntimeError(f"{name}: render error {meta['render_error']} after {meta.get('frames')} frames")
+    if meta.get("frames") != expect_frames:
+        raise RuntimeError(f"{name}: rendered {meta.get('frames')} frames of {expect_frames}")
+
+
+def parse_decisions(text):
+    """spp3's per-channel closed/open-loop decisions from its log messages."""
+    return {"closed_loop_channels": sorted({int(x) for x in re.findall(
+                r"Ch (\d+), Using closed loop parameters", text)}),
+            "open_loop_channels": sorted({int(x) for x in re.findall(
+                r"Ch (\d+), Using open loop kernel", text)})}
+
+
+def closed_loop_mode(unit, meta, nchan):
+    """mode.closed_loop for the trace: a per-channel list (schema), or None when the
+    unit makes no such decision. spp3 without its calibration object runs open loop on
+    every channel; with it, every channel's decision must be in the unit's log."""
+    if unit != "spp3":
+        return None
+    if "cfprops" in meta:
+        ids = [p["id"] for p in meta["cfprops"]]
+    else:  # captures made before the resolved list was recorded
+        ids = [int(p.split("=", 1)[0]) for p in meta.get("case", {}).get("cfprops", [])]
+    if SPTS_PROP not in ids and not meta.get("spts"):
+        return [False] * nchan
+    cl, ol = set(meta.get("closed_loop_channels", [])), set(meta.get("open_loop_channels", []))
+    both, neither = cl & ol, set(range(nchan)) - cl - ol
+    if both or neither:
+        raise ValueError(f"closed-loop decision not recorded unambiguously: channels in both "
+                         f"{sorted(both)}, in neither {sorted(neither)}")
+    return [ch in cl for ch in range(nchan)]
+
+
 def run_case(c, outroot, force=False):
+    if os.geteuid() == 0:
+        raise RuntimeError("refusing to run as root: a missed log redirect would write system directories")
     d = os.path.abspath(os.path.join(outroot, c["name"]))
-    if os.path.exists(os.path.join(d, "trace.jsonl")) and not force:
-        return d
-    shutil.rmtree(d, ignore_errors=True)
-    os.makedirs(os.path.join(d, "logs"), mode=0o700)
-    os.chmod(d, 0o700)
     unit, q = c["unit"], c.get("q", 512)
     env = dict(os.environ, DYLD_INSERT_LIBRARIES=os.path.join(BIN, "prefshim.dylib"),
                RIGREDIR_TO=os.path.join(d, "logs"))
@@ -121,11 +228,9 @@ def run_case(c, outroot, force=False):
         args += ["--prop", pr]
     # Properties the live graph sets at run time (not tuning), as observed on the Mac,
     # from the rig data dir: cal/runtime-<unit>.json = ["ID=fixture.json", ...].
-    runtime = os.path.join(RIG, "cal", f"runtime-{unit}.json")
-    rt = json.load(open(runtime)) if os.path.exists(runtime) and c.get("runtime", True) else []
-    for pr in rt + c.get("cfprops", []):
-        prop, fixture = pr.split("=", 1)
-        args += ["--cfprop", f"{prop}={os.path.join(RIG, 'cal', fixture)}"]
+    runtime_file, cfprops = resolve_cfprops(c)
+    for pr in cfprops:
+        args += ["--cfprop", f"{pr['id']}={pr['path']}"]
     for pr in paths:
         args += ["--plistprop", pr]
     if unit == "spp3":
@@ -135,12 +240,20 @@ def run_case(c, outroot, force=False):
     if unit == "lsm2" and c.get("logs", True):
         # small host slices outrun the unit's log writer at any pace: audio and meters only
         env.update(RIGREDIR_FROM="/Library/Preferences/Audio/lsm2", RIGPREF_LSMv2EnableLogging="1")
+    signal = os.path.join(SIG, f"{c['signal']}.{CH[unit]}ch.f32")
+    key = inputs_key(args, signal, runtime_file, cfprops)
+    if not force and cached(d, key):
+        return d
+    shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(os.path.join(d, "logs"), mode=0o700)
+    os.chmod(d, 0o700)
+    expect_frames = os.path.getsize(signal) // (4 * CH[unit])
     t0 = time.time()
     pace = 50.0 if q >= 64 else 0.0
     # Capture only spp3's own calibration decision messages.  Starting the
     # stream before rig_host avoids relying on the process after it exits.
     logp = logf = None
-    if c.get("cfprops"):
+    if any(p["id"] == SPTS_PROP for p in cfprops):
         predicate = ('process == "rig_host" AND '
                      '(eventMessage CONTAINS "Using closed loop parameters" OR '
                      'eventMessage CONTAINS "Using open loop kernel" OR '
@@ -180,15 +293,13 @@ def run_case(c, outroot, force=False):
                 logp.wait()
             logf.close()
     meta = json.load(open(os.path.join(d, "run.meta.json")))
+    check_host(c["name"], meta, expect_frames)
     decisions = {"closed_loop_channels": [], "open_loop_channels": []}
     aulog = os.path.join(d, "au.log")
     if os.path.exists(aulog):
-        text = open(aulog).read()
-        decisions["closed_loop_channels"] = sorted({int(x) for x in re.findall(
-            r"Ch (\d+), Using closed loop parameters", text)})
-        decisions["open_loop_channels"] = sorted({int(x) for x in re.findall(
-            r"Ch (\d+), Using open loop kernel", text)})
-    meta.update(case=c, wall_s=round(time.time() - t0, 2), **decisions)
+        decisions = parse_decisions(open(aulog).read())
+    meta.update(case=c, wall_s=round(time.time() - t0, 2), runtime_file=runtime_file, cfprops=cfprops,
+                inputs_sha256=key, **decisions)
     json.dump(meta, open(os.path.join(d, "run.meta.json"), "w"), indent=1)
     write_trace(d, c, meta)
     return d
@@ -200,6 +311,9 @@ def fnum(x):
 
 
 def write_trace(d, c, meta):
+    import numpy as np
+    import lsm2logs
+
     unit, q = c["unit"], meta["quantum"]
     rows = list(csv.DictReader(open(os.path.join(d, "run.state.csv"))))
     lat = int(round(meta["latency_s"] * meta["sr"]))
@@ -218,6 +332,7 @@ def write_trace(d, c, meta):
     def audio_gain(a, b):
         ea, eb = float(np.dot(a, a)), float(np.dot(b, b))
         return None if ea < len(a) * 1e-12 else math.sqrt(eb / ea)
+    closed_loop = closed_loop_mode(unit, meta, nchan)
     recs = []
     with open(os.path.join(d, "trace.jsonl"), "w") as fo:
         for r in rows:
@@ -239,9 +354,7 @@ def write_trace(d, c, meta):
                                   "cl_temp_c": fnum(r[f"s4.e{e}.p7:temperature"]),
                                   "axis_gain_db": {"thermal": g[0], "power": g[1], "displacement": g[2]},
                                   "displacement_rel_max": fnum(r[f"s4.e{e}.p40:Max_relative_displacement"])})
-                decided = meta.get("closed_loop_channels", []) or meta.get("open_loop_channels", [])
-                rec["mode"]["closed_loop"] = (meta.get("closed_loop_channels") == list(range(nchan))
-                                                if decided else None)
+                rec["mode"]["closed_loop"] = closed_loop
             else:
                 rec["global"] = {"modeled_amp_power_w": fnum(r["s0.e0.p1073741824:ModeledAmplifierPower"]),
                                  "amp_input_power_per_speaker_w": fnum(r["s0.e0.p1073741826:AmplifierInputPowerPerSpeaker"]),
@@ -284,7 +397,82 @@ def write_trace(d, c, meta):
             fo.write(json.dumps(r, separators=(",", ":")) + "\n")
 
 
+def self_test():
+    """Checks of the case plumbing that need no Mac, no numpy and no Apple data."""
+    import tempfile
+
+    rig = tempfile.mkdtemp()
+    os.makedirs(os.path.join(rig, "cal"))
+
+    def put(name, text):
+        with open(os.path.join(rig, "cal", name), "w") as f:
+            f.write(text)
+
+    def raises(exc, f, *a, **k):
+        try:
+            f(*a, **k)
+        except exc:
+            return True
+        raise AssertionError(f"{f.__name__}{a} did not raise {exc.__name__}")
+
+    lsm = dict(name="lsm2-x", unit="lsm2", signal="s")
+    # A required run-time file that is missing fails the case; opting out does not.
+    raises(FileNotFoundError, resolve_cfprops, lsm, rig)
+    assert resolve_cfprops(dict(lsm, runtime=False), rig) == (None, [])
+    assert resolve_cfprops(dict(name="spp3-x", unit="spp3", signal="s"), rig) == (None, [])
+    put("rt.json", '{"a": 1}')
+    put("runtime-lsm2.json", '["1234=rt.json"]')
+    rtf, props = resolve_cfprops(lsm, rig)
+    assert rtf["sha256"] == sha256(os.path.join(rig, "cal", "runtime-lsm2.json"))
+    assert [(p["id"], p["source"]) for p in props] == [(1234, "runtime")], props
+    assert props[0]["sha256"] == sha256(os.path.join(rig, "cal", "rt.json"))
+    assert resolve_cfprops(dict(lsm, runtime=False), rig) == (None, [])
+    # case fixtures follow the run-time list; a missing fixture fails
+    put("spts.json", "{}")
+    _, props = resolve_cfprops(dict(lsm, cfprops=["64009=spts.json"]), rig)
+    assert [p["id"] for p in props] == [1234, 64009]
+    raises(FileNotFoundError, resolve_cfprops, dict(lsm, cfprops=["64009=absent.json"]), rig)
+    put("runtime-lsm2.json", '{"1234": "rt.json"}')
+    raises(ValueError, resolve_cfprops, lsm, rig)
+    put("runtime-lsm2.json", '["1234=rt.json"]')
+    # The cache key follows the fixture contents, not only the names.
+    sig = os.path.join(rig, "sig.f32")
+    with open(sig, "wb") as f:
+        f.write(b"\0" * 16)
+    k1 = inputs_key(["a"], sig, *resolve_cfprops(lsm, rig))
+    put("rt.json", '{"a": 2}')
+    k2 = inputs_key(["a"], sig, *resolve_cfprops(lsm, rig))
+    assert k1 != k2
+    d = os.path.join(rig, "case")
+    os.makedirs(d)
+    with open(os.path.join(d, "run.meta.json"), "w") as f:
+        json.dump({"inputs_sha256": k1}, f)
+    open(os.path.join(d, "trace.jsonl"), "w").close()
+    assert cached(d, k1) and not cached(d, k2)
+    # Host results: a render error or a short render is fatal.
+    check_host("c", {"render_error": 0, "frames": 1000}, 1000)
+    raises(RuntimeError, check_host, "c", {"render_error": -50, "frames": 512}, 1000)
+    raises(RuntimeError, check_host, "c", {"render_error": 0, "frames": 512}, 1000)
+    raises(RuntimeError, check_host, "c", {"render_error": 0}, 1000)
+    # Closed-loop decisions: a per-channel list.
+    text = "\n".join(["x Ch 0, Using closed loop parameters", "x Ch 1, Using open loop kernel"])
+    dec = parse_decisions(text)
+    assert dec == {"closed_loop_channels": [0], "open_loop_channels": [1]}, dec
+    spts = [{"id": SPTS_PROP}]
+    assert closed_loop_mode("spp3", dict(cfprops=spts, **dec), 2) == [True, False]
+    raises(ValueError, closed_loop_mode, "spp3", dict(cfprops=spts, **dec), 3)  # channel 2 undecided
+    raises(ValueError, closed_loop_mode, "spp3", dict(cfprops=spts, closed_loop_channels=[0, 1],
+                                                       open_loop_channels=[1]), 2)
+    assert closed_loop_mode("spp3", {"cfprops": []}, 3) == [False, False, False]
+    assert closed_loop_mode("spp3", {"case": {"cfprops": ["64009=x"]}, **dec}, 2) == [True, False]
+    assert closed_loop_mode("lsm2", {"cfprops": []}, 2) is None
+    print("self-test OK")
+    return 0
+
+
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["--self-test"]:
+        sys.exit(self_test())
     if sys.argv[1:2] == ["--retrace"]:
         for d in sys.argv[2:]:
             m = json.load(open(os.path.join(d, "run.meta.json")))

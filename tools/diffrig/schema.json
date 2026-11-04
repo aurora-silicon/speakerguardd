@@ -14,6 +14,7 @@
     "frames": {"type": "integer", "minimum": 1},
     "latency": {"type": "integer", "minimum": 0, "description": "the unit's reported latency in frames"},
     "params": {"type": "string", "description": "sgv2: where the unit's parameters came from (blob, none, blob-<error>)"},
+    "cfprops": {"type": "array", "items": {"type": "integer"}, "description": "sgv2: IDs of the run-time and case properties the renderer was given, in order; must equal the reference's resolved list (run.meta.json cfprops)"},
     "health": {"type": "integer", "description": "sgv2: Health bits after the slice"},
     "mode": {
       "type": "object",

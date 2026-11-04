@@ -9,8 +9,13 @@
 //! sgv2-render --unit spp3|lsm2|atsp [--blob PARAMS.blob] --case NAME
 //!             --in PROGRAM.f32 --ch N [--sense SENSE.f32 --sense-ch M]
 //!             [--slices 512 | --slices 1,7,31,...] [--out TRACE.jsonl]
-//!             [--audio-out OUT.f32]
+//!             [--audio-out OUT.f32] [--cfprop ID=FILE ...]
 //! ```
+//!
+//! `--cfprop` hands the unit the same run-time and case properties (by ID,
+//! from the same fixture files) as the macOS reference got. Every file must be
+//! readable, and each trace line lists the IDs in `cfprops`, so the rig can
+//! check that the inputs reached this side.
 //!
 //! Signals are raw interleaved little-endian float32, the rig's format. A
 //! slice list is used cyclically. Without `--blob`, or with a blob that does
@@ -36,12 +41,14 @@ struct Args {
     slices: Vec<usize>,
     out: Option<String>,
     audio_out: Option<String>,
+    cfprops: Vec<(u32, String)>,
 }
 
 fn usage() -> ExitCode {
     eprintln!(
         "usage: sgv2-render --unit spp3|lsm2|atsp [--blob P] --case NAME --in X.f32 --ch N \
-         [--sense S.f32 --sense-ch M] [--slices 512|1,7,31] [--out T.jsonl] [--audio-out O.f32]"
+         [--sense S.f32 --sense-ch M] [--slices 512|1,7,31] [--out T.jsonl] [--audio-out O.f32] \
+         [--cfprop ID=FILE ...]"
     );
     ExitCode::from(2)
 }
@@ -58,6 +65,7 @@ fn parse_args() -> Option<Args> {
         slices: vec![512],
         out: None,
         audio_out: None,
+        cfprops: Vec::new(),
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -78,6 +86,13 @@ fn parse_args() -> Option<Args> {
             }
             "--out" => a.out = Some(v),
             "--audio-out" => a.audio_out = Some(v),
+            "--cfprop" => {
+                let (id, path) = v.split_once('=')?;
+                if path.is_empty() {
+                    return None;
+                }
+                a.cfprops.push((id.parse().ok()?, path.to_string()));
+            }
             _ => return None,
         }
     }
@@ -197,6 +212,7 @@ fn render(
     program: &[Vec<f32>],
     sense: &[Vec<f32>],
     slices: &[usize],
+    cfprops: &[u32],
     trace: &mut dyn Write,
     mut audio: Option<&mut dyn Write>,
 ) -> io::Result<()> {
@@ -208,6 +224,8 @@ fn render(
     let zeros = vec![0.0f32; max_slice];
     let mut t = Telemetry::new();
     let unit_name = fourcc(kind);
+    let cfprop_ids: Vec<String> = cfprops.iter().map(u32::to_string).collect();
+    let cfprop_ids = cfprop_ids.join(",");
     let (mut pos, mut k) = (0usize, 0usize);
     while pos < frames {
         let n = slices[k % slices.len()].min(frames - pos);
@@ -230,7 +248,7 @@ fn render(
         writeln!(
             trace,
             "{{\"schema\":1,\"side\":\"sgv2\",\"unit\":\"{unit_name}\",\"case\":\"{case}\",\"frame\":{pos},\
-             \"frames\":{n},\"latency\":{latency},\"params\":\"{params}\",\"health\":{},\
+             \"frames\":{n},\"latency\":{latency},\"params\":\"{params}\",\"cfprops\":[{cfprop_ids}],\"health\":{},\
              \"mode\":{{\"failsafe\":{},\"closed_loop\":[{}]}},\"channels\":[{}]}}",
             health.0,
             health.is_failsafe(),
@@ -262,6 +280,13 @@ fn run(a: &Args) -> io::Result<()> {
         _ => Vec::new(),
     };
     let blob = a.blob.as_ref().map(std::fs::read).transpose()?;
+    // TODO(lane B): hand the property payloads to the unit once sgv2-core takes
+    // run-time properties; until then they are read (a missing fixture is an
+    // error) and listed in the trace, and compare.py shows what they change.
+    for (id, path) in &a.cfprops {
+        std::fs::read(path).map_err(|e| io::Error::new(e.kind(), format!("cfprop {id}: {path}: {e}")))?;
+    }
+    let cfprop_ids: Vec<u32> = a.cfprops.iter().map(|(id, _)| *id).collect();
     let (mut unit, params) = make_unit(a.unit, blob.as_deref());
     let mut stdout_trace;
     let mut file_trace = open_out(&a.out)?;
@@ -281,6 +306,7 @@ fn run(a: &Args) -> io::Result<()> {
         &program,
         &sense,
         &a.slices,
+        &cfprop_ids,
         trace,
         audio.as_mut().map(|w| w as &mut dyn Write),
     )
@@ -330,13 +356,25 @@ mod tests {
             let (mut unit, params) = make_unit(UnitKind::Lsm2, None);
             let mut trace = Vec::new();
             let mut audio = Vec::new();
-            render(unit.as_mut(), &params, UnitKind::Lsm2, "t", &program, &[], slices, &mut trace, Some(&mut audio))
-                .unwrap();
+            render(
+                unit.as_mut(),
+                &params,
+                UnitKind::Lsm2,
+                "t",
+                &program,
+                &[],
+                slices,
+                &[64009, 7],
+                &mut trace,
+                Some(&mut audio),
+            )
+            .unwrap();
             let text = String::from_utf8(trace).unwrap();
             let lines: Vec<&str> = text.lines().collect();
             let mut frames = 0;
             for l in &lines {
                 assert!(l.contains("\"failsafe\":true"), "{l}");
+                assert!(l.contains("\"cfprops\":[64009,7]"), "{l}");
                 let n: usize = l.split("\"frames\":").nth(1).unwrap().split(',').next().unwrap().parse().unwrap();
                 frames += n;
             }
@@ -345,6 +383,37 @@ mod tests {
             assert!(out[0].iter().all(|&x| (x - 0.025).abs() < 1e-7));
             assert!(out[1].iter().all(|&x| (x + 0.05).abs() < 1e-7));
         }
+    }
+
+    #[test]
+    fn cfprop_fixtures_must_exist_and_are_listed() {
+        let dir = std::env::temp_dir().join(format!("sgv2-render-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("in.f32");
+        std::fs::write(&input, [0u8; 4 * 2 * 64]).unwrap();
+        let fixture = dir.join("fx.json");
+        std::fs::write(&fixture, b"{}").unwrap();
+        let out = dir.join("t.jsonl");
+        let mut a = Args {
+            unit: UnitKind::Lsm2,
+            blob: None,
+            case: String::from("t"),
+            input: input.to_string_lossy().into_owned(),
+            channels: 2,
+            sense: None,
+            sense_channels: 0,
+            slices: vec![32],
+            out: Some(out.to_string_lossy().into_owned()),
+            audio_out: None,
+            cfprops: vec![(64009, fixture.to_string_lossy().into_owned())],
+        };
+        run(&a).unwrap();
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert_eq!(text.lines().count(), 2);
+        assert!(text.lines().all(|l| l.contains("\"cfprops\":[64009]")), "{text}");
+        a.cfprops.push((7, dir.join("absent.json").to_string_lossy().into_owned()));
+        assert!(run(&a).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
