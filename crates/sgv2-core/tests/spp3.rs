@@ -550,10 +550,38 @@ fn closed_loop_reads_coil_temperature_from_the_pilot_bin_and_never_relaxes() {
     // and reads R a few 1e-3 low on this signal
     assert!((t.channels[0].cl_temp_c - 60.0).abs() < 1.5, "T_CL {}", t.channels[0].cl_temp_c);
     assert_eq!(u.controller_state(0)[9], 1.0, "window accepted");
-    // the model runs hotter than the sensed 60 C, but the correction is
-    // capped at the base (J616s live-test incident, TODO(SPEC))
+    // the model runs hotter than the sensed 60 C, but a unit for no proven
+    // board keeps the correction capped at the base
     assert_eq!(t.channels[0].tlim_adj_c, 0.0);
     assert_eq!(u.effective_limit(0), 120.0);
+}
+
+/// The closed loop relaxes the limit only on a board whose relaxed closed
+/// loop is proven live (sgv2_core::machine): on the same signal, every
+/// other board, and a blob naming none, stays capped at the base.
+#[test]
+fn closed_loop_relaxes_only_on_a_proven_board() {
+    let (rc, tc) = (4.0f32, 25.0f32);
+    let alpha = 0.004 + (25.0 - 20.0) * (0.0038 - 0.004) / 15.0;
+    let rs = 0.2;
+    let r = rs + (rc as f64 - rs) * (1.0 + alpha * (60.0 - 25.0));
+    let n = 48_000 * 20;
+    let tele = pilot_sense(r, n);
+    let run = |board: Option<&str>| {
+        let mut u = spp3::Unit::for_machine(cl_params(rc, tc), board);
+        let t = run_cl(&mut u, 0.3, &tele, 0, n);
+        assert!(t.channels[0].closed_loop, "{board:?}: the closed loop runs");
+        assert_eq!(u.controller_state(0)[9], 1.0, "{board:?}: window accepted");
+        (t.channels[0].tlim_adj_c, u.effective_limit(0))
+    };
+    for board in [None, Some("j316s"), Some("j316c"), Some("j413"), Some("j614s"), Some("j700"), Some("j999")] {
+        assert_eq!(run(board), (0.0, 120.0), "{board:?} must never relax");
+    }
+    // the proven J616s: the model runs hotter than the sensed coil, so the
+    // limit relaxes, within the cap
+    let (adj, lim) = run(Some("j616s"));
+    assert!(adj > 0.0 && adj <= 30.0 + 1e-3, "j616s TlimAdj {adj}");
+    assert!(lim > 120.0 && lim <= 150.0 + 1e-3, "j616s limit {lim}");
 }
 
 #[test]

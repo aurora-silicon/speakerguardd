@@ -2346,7 +2346,7 @@ fn spp3_closed_loop_falls_back_when_the_sense_bus_disappears() {
     let mut u = spp3::Unit::new(spp3_cl());
     let (g0, t0) = drive1(&mut u, 0.6, None, 48_000 * 10, Some(4.0));
     // control: the closed loop runs and accepts windows; the correction is
-    // capped at the base (CL_RELAXATION off, J616s live-test incident)
+    // capped at the base (a unit for no proven board, sgv2_core::machine)
     assert!(t0.channels[0].closed_loop, "control: the closed loop runs");
     assert!(t0.channels[0].tlim_adj_c <= 0.0, "control: the closed loop never relaxes the limit");
     assert!(g0 > 0.0);
@@ -2709,7 +2709,7 @@ fn spp3_closed_loop_is_slice_invariant() {
     let s = vec![i, v];
     let reference = render(&mut spp3::Unit::new(p), &x, Some(&s), &[256], &mut no_sense, false);
     assert!(reference.tele[0].1.channels[0].closed_loop, "control: the closed loop runs");
-    // the correction is capped at the base (CL_RELAXATION off)
+    // the correction is capped at the base (no proven board)
     assert!(reference.tele[0].1.channels[0].tlim_adj_c <= 0.0, "control: the closed loop never relaxes the limit");
     for cuts in [vec![1usize], vec![16], vec![64], vec![128]] {
         let r = render(&mut spp3::Unit::new(p), &x, Some(&s), &cuts, &mut no_sense, false);

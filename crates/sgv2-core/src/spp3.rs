@@ -43,8 +43,10 @@
 //!   `R` is in `RebRange`. `Tlim_eff` smooths `base + clamp(T_OL - T_CL, 0,
 //!   cap)` (or `base` when the last window was rejected) over
 //!   `TlimErrDecayTime` with the 99 % law.
-//!   TODO(SPEC) safety: the relaxation is capped at the base (`CL_RELAXATION`)
-//!   after the J616s live-test incident; CL never raises the limit.
+//!   The relaxation is per board: only a board whose relaxed closed loop
+//!   was proven live with its own calibration
+//!   ([`crate::machine::cl_relaxation_proven`]) may raise the limit above
+//!   the base. Every other board runs the closed loop capped at the base.
 //!   Beyond the reference, a plausibility guard (stricter only) stops a
 //!   channel's relaxation for good when its resistance falls while the model
 //!   heats, or it reads far below its calibration temperature under drive
@@ -609,15 +611,6 @@ pub const THERMAL_STATE_COLD: u32 = 2;
 /// program, without the pilot headroom (rig law 1, against spec 4/16's
 /// text; to 2.6e-7 relative over 180 s, open and closed loop).
 const PDRV_WITH_HEADROOM: bool = false;
-/// TODO(SPEC) safety, J616s live test 2026-11-05: with real music over full
-/// scale (Tokyo Drifting at volume 0.99, about 36 W woofer drive, T_OL
-/// 129 C) the accepted windows read the coil COOLER as it heated (T_CL 89 ->
-/// 33 C, window R 3.90 -> 3.46 ohm) and the correction relaxed the limit by
-/// up to +38.9 C. Until that is understood against the reference, the
-/// closed loop runs and publishes T_CL but never raises the limit above the
-/// base. (The CL goldens match bit-for-bit with relaxation on; they carry
-/// no program energy near the pilot bin.)
-const CL_RELAXATION: bool = false;
 /// `Pcoil` is the power of the unit's output samples, generated pilot
 /// included (rig law 2, against spec 4's text; to 3e-7 relative).
 const PCOIL_WITH_PILOT: bool = true;
@@ -803,7 +796,9 @@ struct Cl {
     trend_n: usize,
     cold_n: u32,
     cold_floor: f64,
-    /// [`CL_RELAXATION`], except in an offline [`ClReplay`].
+    /// The correction may relax the limit on this board
+    /// ([`crate::machine::cl_relaxation_proven`]), or as an offline
+    /// [`ClReplay`] chooses. False until the unit says otherwise.
     relax: bool,
     implausible: bool,
 }
@@ -907,7 +902,7 @@ impl Cl {
             // the coldest a coil can honestly read: below both its
             // calibration and the model's ambient by the margin
             cold_floor: tc.min(ambient) - COLD_MARGIN_K,
-            relax: CL_RELAXATION,
+            relax: false,
             implausible: false,
         })
     }
@@ -1441,13 +1436,38 @@ pub struct Unit {
     /// `None` when the parameters could not be used: the unit is then the
     /// fail-safe.
     run: Option<Run>,
+    /// The board's closed loop may relax the limit
+    /// ([`crate::machine::cl_relaxation_proven`]).
+    relax: bool,
 }
 
 impl Unit {
-    /// Build the unit. Allocation happens here, never in `process`.
+    /// Build the unit for no named machine: the closed loop runs, capped at
+    /// the base. Allocation happens here, never in `process`.
     pub fn new(params: Params) -> Self {
-        let run = Run::new(&params).ok();
-        Unit { params, run }
+        Unit::for_machine(params, None)
+    }
+    /// Build the unit for the board the blob names (its header's machine).
+    /// The closed-loop correction may relax the limit only on a board whose
+    /// relaxed closed loop is proven ([`crate::machine::cl_relaxation_proven`]);
+    /// the plausibility guard applies on every board.
+    pub fn for_machine(params: Params, board: Option<&str>) -> Self {
+        let relax = crate::machine::cl_relaxation_proven(board);
+        let mut run = Run::new(&params).ok();
+        if let Some(r) = run.as_mut() {
+            for c in r.ch.iter_mut() {
+                if let Some(cl) = c.cl.as_mut() {
+                    cl.relax = relax;
+                }
+            }
+        }
+        Unit { params, run, relax }
+    }
+    /// Whether this unit's board may let the closed-loop correction raise
+    /// the limit above the base (a proven board). A channel whose
+    /// plausibility guard tripped never relaxes, whatever this says.
+    pub fn closed_loop_may_relax(&self) -> bool {
+        self.relax
     }
     pub fn init_error(params: &Params) -> Option<InitError> {
         Run::new(params).err()
