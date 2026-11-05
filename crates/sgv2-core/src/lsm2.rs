@@ -1141,6 +1141,9 @@ struct Chan {
     disp: Biquad,
     vel: Biquad,
     vel_band: [Biquad; BANDS - 1],
+    /// The velocity model in its zero state (residuals 5: five fresh models
+    /// per decision over the retained window).
+    vel_proto: Biquad,
     /// Per-substep peaks over the window (ring of RING slots).
     pk_x: [f32; RING],
     pk_d: [f32; RING],
@@ -1468,6 +1471,7 @@ impl Run {
                 disp: motion(c.disp_rdc, c.disp_bl, c.disp_mms_kg, c.disp_rms, c.disp_kms, rate, false),
                 vel,
                 vel_band: [vel; BANDS - 1],
+                vel_proto: vel,
                 pk_x: [0.0; RING],
                 pk_d: [0.0; RING],
                 pk_v: [0.0; RING],
@@ -1662,11 +1666,9 @@ impl Run {
             for k in 0..BANDS - 1 {
                 let vk = c.vel_band[k].step(vfs * a[k] as f64);
                 vrest -= vk;
-                c.vb[k][od + i] = vk as f32;
                 pvb[k] = pvb[k].max(libm::fabs(vk) as f32);
             }
             pvb[BANDS - 1] = pvb[BANDS - 1].max(libm::fabs(vrest) as f32);
-            c.vb[BANDS - 1][od + i] = vrest as f32;
             px = px.max(xc.abs());
             pd = pd.max(libm::fabs(d) as f32);
             pv = pv.max(libm::fabs(v) as f32);
@@ -1722,6 +1724,8 @@ impl Run {
         let window_max = |r: &[f32; RING]| r[..ring_len].iter().copied().fold(0.0f32, f32::max);
         let ratio = |limit: f64, q: f32| (limit / (q as f64).max(EPS)).min(1.0);
         let (a_fast, a_low) = (self.a_fast, self.a_low);
+        // the allocator span excludes the first millisecond (t-4719)
+        let vfirst = libm::round(self.ctl as f64 * 3.0 / 16.0) as usize;
         // ---- fast axes: candidates, band requests, the frame's trajectories
         // mask level (residuals 3): each channel's detector, the largest
         // level for every channel's velocity curve
@@ -1745,6 +1749,19 @@ impl Run {
             // whole decision window, the output region and its look-ahead,
             // so every sample these gains will shape holds the limit.
             let sg = (c.slow.g as f64).clamp(EPS, 1.0) as f32;
+            if vel_on {
+                // residuals 5 (t-4719): five fresh zero-state velocity models,
+                // one per band including the complementary fifth, over the
+                // retained bank window (output region and look-ahead), on
+                // the unattenuated bank signals at full-scale volts
+                let vfs = c.vfs as f64;
+                for k in 0..BANDS {
+                    let mut m = c.vel_proto;
+                    for i in 0..c.vb[k].len() {
+                        c.vb[k][i] = m.step(vfs * c.ab[k][i] as f64) as f32;
+                    }
+                }
+            }
             let gv: [f64; BANDS] = if vel_on {
                 // interim safety layer: allocate to 0.99 of the limit so the
                 // attack transient stays within it
@@ -1754,7 +1771,7 @@ impl Run {
                     core::array::from_fn(|k| if rel[k] < 1.0 { (sg * rel[k]).max(floor).min(1.0) } else { 1.0 })
                 };
                 // the ordinary solve, from unity
-                let p = absolute(velocity_band_gains(&c.vb, 0, vlim_g, sg, c.vel_active, [1.0; BANDS]));
+                let p = absolute(velocity_band_gains(&c.vb, vfirst, vlim_g, sg, c.vel_active, [1.0; BANDS]));
                 // residuals 5.2 (t-4713): a lane is upward when its primary
                 // request is above its applied gain; then one second solve,
                 // seeded from the predicted one-frame endpoint of upward lanes
@@ -1772,7 +1789,7 @@ impl Run {
                             1.0
                         }
                     });
-                    let q = absolute(velocity_band_gains(&c.vb, 0, vlim_g, sg, c.vel_active, seed));
+                    let q = absolute(velocity_band_gains(&c.vb, vfirst, vlim_g, sg, c.vel_active, seed));
                     core::array::from_fn(|k| if up[k] { p[k].max(q[k]) as f64 } else { q[k] as f64 })
                 } else {
                     p.map(|v| v as f64)
@@ -1985,7 +2002,7 @@ impl Run {
             c.pbar1_frame = p1;
             c.pbar1s_frame = p1s;
             // shift the bank-stage buffers: keep the look-ahead region
-            for b in c.ab.iter_mut().chain(c.vb.iter_mut()) {
+            for b in c.ab.iter_mut() {
                 b.copy_within(ctl..ctl + od, 0);
             }
             c.xc.copy_within(ctl..ctl + od, 0);
