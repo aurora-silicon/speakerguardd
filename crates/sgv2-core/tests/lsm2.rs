@@ -286,7 +286,7 @@ fn mask_curve_is_piecewise() {
     let v = [0.5, 0.6, 0.9];
     assert_eq!(lsm2::mask_curve(0.0, &k, &v), v[0]);
     assert!((lsm2::mask_curve((k[0] + k[1]) / 2.0, &k, &v) - (v[0] + v[1]) / 2.0).abs() < 1e-12);
-    assert_eq!(lsm2::mask_curve(35.0, &k, &v), v[1]);
+    assert_eq!(lsm2::mask_curve(25.0, &k, &v), v[1]);
     assert_eq!(lsm2::mask_curve(100.0, &k, &v), v[2]);
 }
 

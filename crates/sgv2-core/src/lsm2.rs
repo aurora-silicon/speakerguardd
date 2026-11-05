@@ -666,11 +666,11 @@ impl Params {
         self.latency_frames() + controller_frames(self.sample_rate)
     }
 
-    /// The protection a shipped blob must carry: mitigation on and at least
-    /// one thermal axis. The reference runs any configuration (with
-    /// mitigation off it only delays the program), and so does
-    /// [`Unit::set_parameter`] for the differential rig; a blob the supervisor
-    /// loads is refused without both.
+    /// The protection a unit built from parameters must carry: mitigation on
+    /// and at least one thermal axis (safety review of #31, finding 7). The
+    /// reference runs any configuration (with mitigation off it only delays
+    /// the program), and so does the unit's `set_parameter` for the
+    /// differential rig.
     pub fn check_protects(&self) -> Result<(), InitError> {
         if self.enable_mitigation == 0 {
             return Err(InitError::Invalid("mitigation disabled"));
@@ -1285,11 +1285,13 @@ impl Unit {
     /// Allocation happens here, never in `process`. Unusable parameters
     /// give a unit that is the fail-safe; `init_error` says why.
     pub fn new(params: Params) -> Self {
-        let run = Run::new(&params).ok();
+        let run = params.check_protects().and_then(|()| Run::new(&params)).ok();
         Unit { params, run }
     }
+    /// Why [`Unit::new`] gives the fail-safe for `params`: unprotected
+    /// (mitigation off, or no thermal axis) or unusable.
     pub fn init_error(params: &Params) -> Option<InitError> {
-        Run::new(params).err()
+        params.check_protects().and_then(|()| Run::new(params)).err()
     }
     pub fn params(&self) -> &Params {
         &self.params
@@ -2030,7 +2032,10 @@ impl ProtectionUnit for Unit {
 
     fn set_parameter(&mut self, id: u32, value: f32) -> bool {
         // A change rebuilds the unit, so only before the first frame (the
-        // host's post-initialisation setup, as on macOS).
+        // host's post-initialisation setup, as on macOS). This is the
+        // reference AU's parameter path, which only the differential rig
+        // drives: it may switch axes or mitigation off as the reference
+        // allows. A unit built from a blob (`Unit::new`) always protects.
         if self.run.as_ref().is_some_and(|r| r.frame != 0) {
             return false;
         }
