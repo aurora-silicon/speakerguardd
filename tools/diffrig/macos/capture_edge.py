@@ -298,6 +298,17 @@ def atsp_probe_cases():
     C.append(dict(name="atsp-aid18-run-bypass-resume-thermal15s", unit="atsp", aid=18,
                   signal="thermal_ramp_1k", ch=4, file_ch=2, limit_frames=15 * 48000,
                   params_at=["256000:0=1", "512000:0=0"]))
+    # AudioUnitReset under limiting, in the startup mute, bypassed and at one-frame slices,
+    # on AID12 (the J473's one-channel preset) and the two- and four-channel AID4 and AID18
+    t15 = dict(unit="atsp", signal="thermal_ramp_1k", file_ch=2, limit_frames=15 * 48000)
+    for suffix, kw in (("reset", dict(events=["300000:reset"])),
+                       ("reset2-q7", dict(q=7, events=["300003:reset", "450011:reset"])),
+                       ("reset-startup-q7", dict(q=7, events=["105:reset"])),
+                       ("reset-q1", dict(q=1, events=["300001:reset"])),
+                       ("reset-bypassed", dict(params_at=["256000:0=1", "512000:0=0"], events=["300000:reset"]))):
+        C.append(dict(t15, name=f"atsp-aid12-{suffix}-thermal15s", aid=12, ch=1, **kw))
+    C.append(dict(t15, name="atsp-aid4-reset-thermal15s", aid=4, ch=2, events=["300000:reset"]))
+    C.append(dict(t15, name="atsp-aid18-reset-q160-thermal15s", aid=18, ch=4, q=160, events=["300000:reset"]))
     return C
 
 

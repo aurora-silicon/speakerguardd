@@ -292,3 +292,50 @@ fn input_held_to_twice_full_scale() {
     assert_eq!(run(-40.0), run(2.0));
     assert_ne!(run(1.5), run(2.0));
 }
+
+#[test]
+fn host_reset_changes_nothing() {
+    // AudioUnitReset in the middle of limiting, in the startup mute and while
+    // bypassed: the audio and the state are those of a run without it
+    let run = |resets: &[usize], bypass_at: Option<(usize, usize)>, slice: usize| -> (Vec<u32>, Telemetry) {
+        let mut u = Unit::new(params());
+        let total = 20 * RATE as usize;
+        let ins: Vec<Vec<f32>> =
+            (0..4).map(|c| (0..slice).map(|k| 1.8 * (((k + c) % 37) as f32 / 37.0 - 0.5)).collect()).collect();
+        let mut outs = vec![vec![0.0f32; slice]; 4];
+        let mut audio = Vec::new();
+        let mut f = 0;
+        while f < total {
+            if resets.iter().any(|&r| r >= f && r < f + slice) {
+                u.host_reset();
+            }
+            if let Some((on, off)) = bypass_at {
+                if (on..on + slice).contains(&f) {
+                    assert!(u.set_parameter(0, 1.0));
+                }
+                if (off..off + slice).contains(&f) {
+                    assert!(u.set_parameter(0, 0.0));
+                }
+            }
+            let m = slice.min(total - f);
+            let i: Vec<&[f32]> = ins.iter().map(|b| &b[..m]).collect();
+            let mut o: Vec<&mut [f32]> = outs.iter_mut().map(|b| &mut b[..m]).collect();
+            u.process(Io { frames: m, input: &i, sense: &[], output: &mut o });
+            audio.extend(outs.iter().flat_map(|b| b[..m].iter().map(|v| v.to_bits())));
+            f += m;
+        }
+        let mut t = Telemetry::new();
+        u.telemetry(&mut t);
+        (audio, t)
+    };
+    for (slice, bypass) in [(512, None), (7, None), (1, None), (160, Some((4 * RATE as usize, 8 * RATE as usize)))] {
+        let (a, ta) = run(&[], bypass, slice);
+        let (b, tb) = run(&[3, 100, 6 * RATE as usize + 3, 6 * RATE as usize + 11], bypass, slice);
+        assert!(a == b, "slice {slice}: audio differs after host_reset");
+        assert_eq!(ta.channels[0].coil_temp_c, tb.channels[0].coil_temp_c);
+        assert_eq!(ta.channels[0].gain, tb.channels[0].gain);
+    }
+    // limiting was reached, so the comparison covers a hot speaker
+    let (_, t) = run(&[], None, 512);
+    assert!(t.channels[0].gain < 0.9, "{}", t.channels[0].gain);
+}

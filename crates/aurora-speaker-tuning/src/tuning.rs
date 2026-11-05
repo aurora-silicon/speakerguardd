@@ -142,6 +142,10 @@ pub struct Tuning {
     pub aid: String,
     pub acoustic_id: u32,
     pub macos_build: Option<String>,
+    /// The collecting Mac's board and unit ID, from the manifest
+    /// ([`crate::manifest::Manifest::board`], [`crate::manifest::Manifest::unit_id`]).
+    pub board: Option<String>,
+    pub unit_id: Option<String>,
     pub verified: bool,
     /// The machine's speaker-assembly ID the selection used, and where it
     /// came from (`override`, `manifest`, `device-tree`), if known.
@@ -493,6 +497,8 @@ impl Tuning {
             aid: b.manifest.aid.clone(),
             acoustic_id: b.manifest.acoustic_id,
             macos_build: b.manifest.macos_build.clone(),
+            board: b.manifest.board.clone(),
+            unit_id: b.manifest.unit_id.clone(),
             verified: b.verified,
             speaker_id: speaker_id.and_then(|v| u32::try_from(v).ok()),
             speaker_id_source,

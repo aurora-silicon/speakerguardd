@@ -18,9 +18,10 @@ use aurora_speaker_tuning::Diagnostics;
 use common::*;
 use std::collections::BTreeMap;
 
-/// The synthetic bundles have four channels: a four-amp board.
+/// The synthetic bundles have four channels: a four-amp board, the unit
+/// they were collected on.
 fn j413() -> Machine {
-    Machine::new("j413").unwrap()
+    Machine::with_unit("j413", &test_unit()).unwrap()
 }
 
 fn compile(t: &Tuning, d: &mut Diagnostics) -> aurora_speaker_tuning::Result<comp::Compiled> {
@@ -502,4 +503,26 @@ fn atsp_slots_from_the_id_map() {
     assert_eq!((s.channel_mask, s.amplifier_sensitivity, s.rdc, s.rth_vc, s.tau_mg), (15, 11.89, 8.5, 35.0, 70.0));
     assert_eq!((s.temperature_limit, s.attack_ms, s.release_ms, s.hard_limit_headroom), (125.0, 700.0, 18000.0, 9.0));
     assert_eq!(p.slot[1].channel_mask, 0);
+}
+
+/// atsp parameter 0 bypasses the unit (a bit-exact copy, no protection):
+/// refused like spp3's disabled thermal protection.
+#[test]
+fn a_bypassed_atsp_preset_is_refused() {
+    let mut params: Vec<(u32, f32)> = vec![(0, 1.0), (40, 0.0)];
+    for s in 0..3u32 {
+        let b = 1 + 13 * s;
+        let mask = if s == 0 { 15.0 } else { 0.0 };
+        let vals = [11.89, 8.5, 35.0, 2.0, 45.0, 70.0, 40.0, 125.0, 700.0, 18000.0, 9.0, 1.0, mask];
+        for (k, v) in vals.iter().enumerate() {
+            params.push((b + k as u32, *v));
+        }
+    }
+    let mut f = spp3_files(4);
+    f.insert(format!("{AID}/DSP/Graphs/builtin_speaker_out.dspg"), graph_text("atsp").into_bytes());
+    let st = ParamState { sections: vec![ParamSection { scope: 0, element: 0, params }] };
+    f.insert(format!("{AID}/DSP/Strips/builtin_speaker_out_general.austrip"), strip_with_state("atsp", &st));
+    let t = tuning(&f, "c-atsp-bypass");
+    let e = compile(&t, &mut Diagnostics::default()).unwrap_err();
+    assert!(format!("{e}").contains("bypasses atsp"), "{e}");
 }
