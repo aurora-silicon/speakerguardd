@@ -76,10 +76,11 @@
 //!   raised-cosine attack to 0.99 x the request then hold, or a recovery on
 //!   the 99 % response table realigned each decision).
 //! - **Slow gain** (power, temperature, linked across channels; residuals
-//!   2.4): advanced provisionally toward unity; the output-temperature
+//!   2.4): released provisionally toward the ordinary request; the output-temperature
 //!   ceiling solved once on the retained frame and look-ahead as `B + g L +
 //!   g^2 Q`; a lower result makes a second follower call toward 0.99 x the
-//!   request. The audio applies `min(band, slow)` per band, never a product.
+//!   request. The audio applies the slow trajectory after summing the
+//!   fast-gained bands.
 //! - **Monitor** (rig laws 3, 4, 11): on the protected output, `u = Vfs y`;
 //!   the Float32 substep mean of `u i` drives the two thermal branches
 //!   (residuals 2.1: `theta += alpha (R_eff P - theta)`), and `Pamp = idle + ratio max(mean(u i), 0) (Rdc + Rpar) /
@@ -101,7 +102,7 @@
 //! retained full-band residual), velocity (fresh band models, from 1 ms; the
 //! ignore switches mask only the committed cut), then sample peak (the raw
 //! bank bands). One band follower per band takes the final request; the
-//! audio applies `min(band, slow)`.
+//! audio applies `slow * sum(band * signal)`.
 //!
 //! Velocity fixed term (t-4751, t-4763): the zero-input carry of a
 //! persistent Float32 full-band velocity model that advances on the
@@ -1219,17 +1220,17 @@ struct Chan {
 }
 
 impl Chan {
-    /// Output sample `i` of the frame at slow gain `sg`: each band at the
-    /// minimum of its fast gain and the slow gain.
+    /// Output sample `i` of the frame at slow gain `sg`: the fast-gained
+    /// band sum followed by the scalar slow trajectory.
     #[inline]
     fn out_sample(&self, i: usize, sg: f32) -> f32 {
         // past the frame (the look-ahead) the fast gains hold their last value
         let e = i.min(self.eg[0].len() - 1);
-        let g0 = self.eg[0][e].min(sg);
+        let g0 = self.eg[0][e] * sg;
         let mut same = true;
         let mut g = [0.0f32; BANDS];
         for k in 0..BANDS {
-            g[k] = self.eg[k][e].min(sg);
+            g[k] = self.eg[k][e] * sg;
             same &= g[k] == g0;
         }
         if same {
@@ -1762,7 +1763,7 @@ impl Run {
             // diagnostics only
             // the slow scalar: the decision-local predicted endpoint of the
             // slow follower (t-4758): its current ramp's target, else the
-            // gain with this frame's provisional release toward unity
+            // gain with this frame's provisional recovery estimate
             let sg = {
                 let f = c.slow;
                 let e =
@@ -1826,9 +1827,12 @@ impl Run {
                 }
                 r
             };
-            let absolute = |rel: [f32; BANDS]| -> [f32; BANDS] { core::array::from_fn(|k| (sg * rel[k]).min(1.0)) };
             let req: [f32; BANDS] = if disp_on || vel_on || peak_on {
-                let p = absolute(chain(c, [1.0; BANDS]));
+                // The scalar shapes every allocator trial, but the fast
+                // follower's request stays in the band domain. The output
+                // applies the slow trajectory after the fast-gained sum;
+                // scaling the request by `sg` here would apply it twice.
+                let p = chain(c, [1.0; BANDS]);
                 // residuals 5.2 (t-4713): upward lanes (primary above the
                 // applied gain); one second chain seeded from the predicted
                 // endpoint toward the complete primary request of upward
@@ -1840,12 +1844,12 @@ impl Run {
                     let seed: [f32; BANDS] = core::array::from_fn(|k| {
                         let end = c.band[k].end_after(p[k], ctl, if k == 0 { a_low } else { a_fast });
                         if up[k] && guard * end <= p[k] {
-                            (end / sg).min(1.0)
+                            end
                         } else {
                             1.0
                         }
                     });
-                    let q = absolute(chain(c, seed));
+                    let q = chain(c, seed);
                     core::array::from_fn(|k| if up[k] { p[k] } else { q[k] })
                 } else {
                     p
@@ -1955,13 +1959,15 @@ impl Run {
             let m = req[..n].iter().copied().fold(1.0f64, f64::min);
             req[..n].iter_mut().for_each(|r| *r = m);
         }
-        // residuals 2.4, in its native order: (1) the slow follower is
-        // advanced provisionally toward unity for the frame; (2) the
-        // ordinary request becomes a scalar on that trajectory and the
-        // output-temperature ceiling is solved once from it on the retained
-        // frame and its look-ahead; (3) a lower result makes one second
-        // follower call, from the provisionally advanced value toward 0.99
-        // x the request
+        // residuals 2.4, in its native order: (1) an idle slow follower
+        // releases one decision toward the ordinary power/temperature
+        // request; (2) that request becomes a scalar on the provisional
+        // trajectory and the output-temperature ceiling is solved once on
+        // the retained frame and look-ahead; (3) a lower result makes one
+        // downward follower call from the provisionally advanced value
+        // toward 0.99 x the request. Recovery follows the request, not
+        // unity: otherwise a capped power candidate repeatedly below unity
+        // releases too quickly between program peaks.
         let mut prov = [SlowGain::unity(1); MAX_CHANNELS];
         let mut end = [1.0f32; MAX_CHANNELS];
         let mut want = [1.0f32; MAX_CHANNELS];
@@ -1969,7 +1975,8 @@ impl Run {
             let mut f = c.slow;
             if f.n >= f.len {
                 let a = f.g as f64;
-                f.set((a + self.slow_step * (1.0 - a)).min(1.0) as f32);
+                let target = req[ci].clamp(a, 1.0);
+                f.set((a + self.slow_step * (target - a)).min(1.0) as f32);
             }
             prov[ci] = f;
             let mut e = f;
@@ -2014,11 +2021,11 @@ impl Run {
             let (mut p1, mut p1s) = (0.0f64, 0.0f64);
             for (i, yo) in y.iter_mut().enumerate().take(ctl) {
                 let sg = c.slow.sample();
-                let g0 = c.eg[0][i].min(sg);
+                let g0 = c.eg[0][i] * sg;
                 let mut same = true;
                 let mut g = [0.0f32; BANDS];
                 for k in 0..BANDS {
-                    g[k] = c.eg[k][i].min(sg);
+                    g[k] = c.eg[k][i] * sg;
                     same &= g[k] == g0;
                 }
                 let v = if same {
