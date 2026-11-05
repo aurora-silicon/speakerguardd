@@ -1,10 +1,10 @@
 {
   "_doc": "The fleet gate (speakerguardd-gate): policy only, no hardware. speakerguardd v2 runs on a board only if the protection unit its own tuning names is in units_at_parity and, while require_qualified_board is true, the board is in that unit's qualified list (a passing audible run on the shipped tree). The fleet cutover (option A) adds lsm2 and atsp to units_at_parity once they reach parity and sets require_qualified_board to false: every board with a parity unit. The kernel decides the rest: v2 runs only on a kernel with the Speaker Protection interface, the older daemons only on one without it. Every distribution ships this file unchanged. The atsp list holds the boards whose device tree and tuning derive cleanly (wiring.py) and that pass the synthetic end-to-end tests; none of them has had an audible run (there is no atsp Mac in the lab). atsp is not yet in units_at_parity, so the gate keeps them on the older daemons until it is.",
-  "units_at_parity": ["spp3"],
+  "units_at_parity": ["spp3", "lsm2"],
   "require_qualified_board": true,
   "qualified": {
     "spp3": ["j316s", "j413", "j616s"],
-    "lsm2": [],
+    "lsm2": ["j700"],
     "atsp": ["j274", "j293", "j313", "j375c", "j375d", "j473", "j474s", "j475c", "j475d", "j493"]
   }
 }

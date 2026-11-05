@@ -377,7 +377,8 @@ def speaker_format(t):
 
 def describe(hw, w):
     """Everything the protect stage's graph needs that is not the channel
-    map: derived from the device tree (and the wiring derived from it).
+    map: derived from the device tree (and the wiring derived from it),
+    and the tuning's sample rate.
     The self-check checks the card id and the format against ALSA."""
     t = transport(hw)
     # The graph carries the amps' sense only to a unit that takes it: spp3
@@ -396,6 +397,7 @@ def describe(hw, w):
         "transport": t["transport"],
         "amps": n,
         "sense": s,
+        "rate": w["rate"],
         "plugin": plugin,
         "alsa_format": fmt,
         "speaker_format": PW_FORMAT[fmt],
@@ -536,6 +538,31 @@ def roles(dump):
     return {"kind": p.get("kind"), "aid": t.get("aid"), "channels": out}
 
 
+def tuning_rate(dump):
+    """The speaker graph's sample rate: the tuning's own, as the reader
+    selected it (the DSP database's rate and the graph's `fs`), which is
+    also the rate the parameter blob is compiled for. Refused when the
+    tuning states none, or two that disagree."""
+    t = dump.get("tuning", dump)
+    sel = t.get("selection") or {}
+    found = set()
+    for v in (sel.get("sample_rate"), (sel.get("substitutions") or {}).get("fs")):
+        if v is None:
+            continue
+        try:
+            r = int(str(v))
+        except ValueError:
+            raise Refused(f"the tuning's sample rate {v!r} is not a number")
+        if r <= 0:
+            raise Refused(f"the tuning's sample rate is {r}")
+        found.add(r)
+    if not found:
+        raise Refused("the tuning states no sample rate (no DSP database selection)")
+    if len(found) > 1:
+        raise Refused(f"the tuning's sample rates disagree: {sorted(found)}")
+    return found.pop()
+
+
 # ------------------------------------------------------------------ wiring
 
 
@@ -578,6 +605,7 @@ def derive(hw, dump, key=None):
         "family": amps[0]["family"],
         "aid": rl["aid"],
         "unit_kind": rl["kind"],
+        "rate": tuning_rate(dump),
         "amps": amps,
         "unit_channels": [a["unit"] for a in amps],
         "sense": sense,

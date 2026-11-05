@@ -385,6 +385,7 @@ class Gate(Base):
             json.dump(gate_data or GATE, f)
         self.patch(gate, "kernel_interface", lambda wait: (iface, "AppleX") if iface else (None, None))
         self.patch(gate, "ALLOW", os.path.join(self.t, "allow"))
+        self.patch(gate, "PROVISION_CONF", os.path.join(self.t, "provision.conf"))
         if allow:
             with open(gate.ALLOW, "w") as f:
                 f.write("j413\n")
@@ -425,14 +426,30 @@ class Gate(Base):
         self.ctl({"no_bundle": True, "unit": None})
         self.assertEqual(self.decide("v2", a), (False, False))
 
+    def test_the_bundle_provisioning_compiles_names_the_unit(self):
+        # SGV2_BUNDLE in provisioning's configuration: the gate reads the
+        # same bundle provisioning compiles, not only the installer's copy
+        self.board("j700")
+        self.ctl({"unit": "lsm2"})
+        with open(os.path.join(self.t, "provision.conf"), "w") as f:
+            f.write("SGV2_BUNDLE='/var/lib/speakerguardd-tuning/audio-tuning'\n")
+        self.decide("v2")
+        with open(os.path.join(os.path.dirname(self.cli), "calls")) as f:
+            calls = f.read().splitlines()
+        self.assertEqual(calls[-1], "dump --json /var/lib/speakerguardd-tuning/audio-tuning")
+        os.remove(os.path.join(self.t, "provision.conf"))
+        self.decide("v2")
+        with open(os.path.join(os.path.dirname(self.cli), "calls")) as f:
+            self.assertEqual(f.read().splitlines()[-1], "dump --json")
+
     def test_shipped_data(self):
         with open(os.path.join(HERE, "gate.json")) as f:
             g = json.load(f)
-        self.assertEqual(g["units_at_parity"], ["spp3"])
+        self.assertEqual(g["units_at_parity"], ["spp3", "lsm2"])
         self.assertTrue(g["require_qualified_board"])
         self.assertEqual(sorted(g["qualified"]), ["atsp", "lsm2", "spp3"])
         qualified = sorted(b for u in g["units_at_parity"] for b in g["qualified"].get(u, []))
-        self.assertEqual(qualified, ["j316s", "j413", "j616s"])
+        self.assertEqual(qualified, ["j316s", "j413", "j616s", "j700"])
         # policy only: no hardware in the gate
         self.assertEqual(sorted(k for k in g if not k.startswith("_")), ["qualified", "require_qualified_board", "units_at_parity"])
         self.assertFalse(os.path.exists(os.path.join(HERE, "machines.json")))

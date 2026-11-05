@@ -130,17 +130,22 @@ impl Supervisor {
         Ok(None)
     }
 
-    /// While the kernel grants, every amp must sit at the operating volume.
+    /// While the kernel grants, every amp must sit at the operating volume:
+    /// 0 dB as the control's own dB TLV reads it (the tas2764 DVC, the
+    /// J700 driver's software gain below the wire's full scale). The raw
+    /// value that is 0 dB is the driver's scale, read from the card, not
+    /// a number kept here. A volume without a dB scale is not proven to be
+    /// at the operating point, and latches like a wrong one.
     fn volume_problem(&self, kernel: &mut dyn Kernel) -> Result<Option<String>, KernelError> {
         let x = &self.expect;
         let v = kernel.levels(x.amp.volume_suffix())?;
-        if v.len() != x.amps {
-            return Ok(Some(format!("granted, but {} of {} amp volumes", v.len(), x.amps)));
+        let n = x.amp.volume_controls(x.amps);
+        if v.len() != n {
+            return Ok(Some(format!("granted, but {} of {n} amp volumes", v.len())));
         }
-        let want = x.amp.operating_volume();
         Ok(v.iter()
-            .find(|l| l.value != want || (x.amp.volume_is_db() && l.centi_db != Some(0)))
-            .map(|l| format!("granted, but {} is at {} ({:?} cdB), not {want}", l.amp, l.value, l.centi_db)))
+            .find(|l| l.centi_db != Some(0))
+            .map(|l| format!("granted, but {} is at {} ({:?} cdB), not 0 dB", l.amp, l.value, l.centi_db)))
     }
 
     pub fn tick(&mut self, obs: Observation, kernel: &mut dyn Kernel) -> Result<Event, Fatal> {
@@ -338,7 +343,10 @@ mod tests {
             let mut k = Recorder::healthy(2);
             k.amp_faults.clear();
             k.gain = None;
-            k.volume = Some(("Speaker Playback Volume".into(), (127, None), (87, None)));
+            // one card-level software gain for the pair, no amp prefix
+            k.amps = vec![String::new()];
+            // the driver's TLV: -63.5 dB + 0.5 dB a step, 0 dB at the top
+            k.volume = Some(("Speaker Playback Volume".into(), (127, Some(0)), (87, Some(-2000))));
             k
         };
         let mut k = neo_card();
@@ -346,11 +354,25 @@ mod tests {
         s.tick(CLEAN, &mut k).unwrap();
         assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Granted));
         assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Renewed));
+        // the shared gain away from the operating point while granted latches
+        k.volume = Some(("Speaker Playback Volume".into(), (100, Some(-1350)), (87, Some(-2000))));
+        assert!(matches!(s.tick(CLEAN, &mut k), Ok(Event::HardFault(_))));
         // a blob whose channels are not one operating point is refused
         let mut k = neo_card();
         let mut s = Supervisor::new(Expect::new(neo, vec![7_300, 6_000], "Secondary"));
         for _ in 0..4 {
             assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::StayedReleased));
+        }
+        // granted, the volume must read 0 dB on its own scale: a control
+        // without a dB TLV, or a top that is not 0 dB, latches
+        for held in [(127, None), (127, Some(-50)), (126, Some(-50))] {
+            let mut k = neo_card();
+            k.volume = Some(("Speaker Playback Volume".into(), held, (87, Some(-2000))));
+            let mut s = Supervisor::new(Expect::new(neo, vec![7_300, 7_330], "Secondary"));
+            s.tick(CLEAN, &mut k).unwrap();
+            assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Granted));
+            assert!(matches!(s.tick(CLEAN, &mut k), Ok(Event::HardFault(_))), "{held:?}");
+            assert!(!k.held);
         }
     }
 

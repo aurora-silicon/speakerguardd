@@ -363,108 +363,8 @@ fn compile_spp3(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
 
 // ------------------------------------------------------------------ lsm2
 
-/// Saved-state IDs (specification section 9.7).
-pub mod lsm2_ids {
-    pub const ENABLE_CLOSED_LOOP_TEMPERATURE: u32 = 1;
-    pub const BYPASS_SYS_ID: u32 = 2048 + 3;
-    pub const CH_TUNING: u32 = 2048 + 4;
-    pub const CH_SPEAKER_TYPE: u32 = 21504;
-    /// Model managers within a type: impedance, admittance, displacement,
-    /// velocity, acceleration.
-    pub const MANAGER_ADMITTANCE: u32 = 1;
-    pub const MANAGER_DISPLACEMENT: u32 = 2;
-    pub const MANAGER_VELOCITY: u32 = 3;
-    pub fn model(manager: u32, ty: u32, k: u32) -> u32 {
-        3072 + 1024 * (3 * manager + ty) + k
-    }
-    pub fn thermal(ty: u32, k: u32) -> u32 {
-        18432 + 1024 * ty + k
-    }
-    pub fn controller(k: u32) -> u32 {
-        1048576 + k
-    }
-    pub fn amp0(k: u32) -> u32 {
-        1049600 + k
-    }
-    /// Amplifier models 1 and 2 (no `IgnoreCPMS` slot: offset 0 is the
-    /// low-rail idle power).
-    pub fn amp(model: u32, k: u32) -> u32 {
-        1050624 + 1024 * (model - 1) + k
-    }
-    pub fn channel(c: u32, k: u32) -> u32 {
-        1058816 + 1024 * c + k
-    }
-    // Model-block field offsets.
-    pub const M_RDC: u32 = 1;
-    pub const M_ENABLE_RES1: u32 = 2;
-    pub const M_BL: u32 = 4;
-    pub const M_MMS_G: u32 = 5;
-    pub const M_RMS: u32 = 6;
-    pub const M_KMS: u32 = 7;
-    pub const M_ENABLE_RES2: u32 = 8;
-    pub const M_ENABLE_LR2: u32 = 13;
-    pub const M_CREEP: u32 = 18;
-    pub const M_USE_COMPENSATION: u32 = 24;
-    pub const M_PASSIVE_RADIATOR: u32 = 29;
-    // Thermal-block offsets.
-    pub const T_RTH_VC: u32 = 3;
-    pub const T_TAU_VC: u32 = 4;
-    pub const T_RTH_MG: u32 = 5;
-    pub const T_TAU_MG: u32 = 6;
-    pub const T_AMBIENT: u32 = 7;
-    pub const T_ENABLE: u32 = 15;
-    // Controller-general offsets.
-    pub const C_FAST_RELEASE: u32 = 1;
-    pub const C_SLOW_RELEASE: u32 = 2;
-    pub const C_ENABLE_MITIGATION: u32 = 3;
-    pub const C_CONTROL_SAMPLE_PEAK: u32 = 4;
-    pub const C_CONTROL_DISPLACEMENT: u32 = 5;
-    pub const C_CONTROL_VELOCITY: u32 = 6;
-    pub const C_CONTROL_POWER: u32 = 7;
-    pub const C_CONTROL_TEMPERATURE: u32 = 8;
-    pub const C_LINK_SLOW: u32 = 10;
-    pub const C_COMPENSATE_RESONATORS: u32 = 11;
-    pub const C_USE_FAST_PEAK: u32 = 14;
-    pub const C_LOOKAHEAD: u32 = 16;
-    pub const C_ATTACK: u32 = 17;
-    pub const C_LOW_BAND_RELEASE: u32 = 18;
-    pub const C_UNLINK_TEMPERATURE: u32 = 19;
-    pub const C_POWER_BUDGETS_SCALE: u32 = 20;
-    pub const C_FILTERBANK_LATENCY: u32 = 21;
-    // Amplifier model 0 offsets (1..12 are the model fields).
-    pub const A_LOW_IDLE: u32 = 1;
-    pub const A_LOW_RATIO: u32 = 2;
-    pub const A_ENABLE_MID: u32 = 3;
-    pub const A_ENABLE_HIGH: u32 = 8;
-    pub const A_TIME_SCALE: u32 = 13;
-    pub const A_HARD_LIMIT: u32 = 17;
-    pub const A_SOFT_LIMIT: u32 = 21;
-    pub const A_MAX_ATTENUATION: u32 = 25;
-    pub const A_USE_BATTERY: u32 = 26;
-    // Channel-block offsets.
-    pub const CH_VOLTS_FS: u32 = 0;
-    pub const CH_PARASITIC: u32 = 1;
-    pub const CH_DISPLACEMENT_LIMIT: u32 = 2;
-    pub const CH_TEMP_HARD: u32 = 3;
-    pub const CH_TEMP_SOFT: u32 = 4;
-    pub const CH_MASK_BAND_MIN: u32 = 5;
-    pub const CH_MASK_BAND_MAX: u32 = 6;
-    pub const CH_MASK_ATTACK: u32 = 7;
-    pub const CH_MASK_RELEASE: u32 = 8;
-    pub const CH_VELOCITY_LIMIT0: u32 = 9;
-    pub const CH_MASK_ENERGY0: u32 = 12;
-    pub const CH_BAND_CENTER0: u32 = 17;
-    pub const CH_VELOCITY_IGNORE_LOW: u32 = 23;
-    pub const CH_VELOCITY_IGNORE_HIGH: u32 = 24;
-    pub const CH_MASK_ATTACK_FAST_MS: u32 = 27;
-    pub const CH_MASK_ATTACK_RANGE: u32 = 28;
-    pub const CH_BANDWIDTH: u32 = 29;
-    pub const CH_AMPLITUDE_LIMIT: u32 = 16;
-    pub const CH_MAX_VELOCITY_ATTEN: u32 = 22;
-    pub const CH_MAX_TEMP_ATTEN: u32 = 25;
-    pub const CH_TEMP_HEADROOM: u32 = 26;
-    pub const CH_POWER_AMP_MODEL: u32 = 32;
-}
+/// Saved-state IDs (specification section 9.7): the unit's own map.
+pub use sgv2_core::lsm2::ids as lsm2_ids;
 
 fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compiled> {
     use lsm2_ids as id;
@@ -556,13 +456,35 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
                 }
             }
         }
-        let a = |k: u32| get(id::model(id::MANAGER_ADMITTANCE, ty, k));
-        let d = |k: u32| get(id::model(id::MANAGER_DISPLACEMENT, ty, k));
-        // TODO(SPEC): with UseGenericModelParameters* = 1 (AID44's Vel-A) the
-        // 25G83 unit takes a "family" set that neither the Vel-A nor the Imp-A
-        // nor the Adm-A fields change (rig law 1). On AID44 it equals the
-        // Vel-A preset values read here; its source on other tunings is open.
-        let v = |k: u32| get(id::model(id::MANAGER_VELOCITY, ty, k));
+        // Spec 15.1: a manager whose UseGenericModelParametersRdc or
+        // ...Resonator1 flag is set takes that part from the family row
+        // embedded in the preset, its first mechanical row (the type's
+        // impedance block); later writes of the manager's own fields do not
+        // move it (rig law 1).
+        let row = |m: u32, t: u32| -> Result<[f32; 5]> {
+            let f = |k: u32| get(id::model(m, t, k));
+            Ok([f(id::M_RDC)?, f(id::M_BL)?, f(id::M_MMS_G)? * 1e-3, f(id::M_RMS)?, f(id::M_KMS)?])
+        };
+        let family = row(id::MANAGER_IMPEDANCE, 0)?;
+        let mut model_generic = 0u32;
+        let mut explicit = [[0.0f32; 5]; 3];
+        use sgv2_core::lsm2::generic as gen;
+        for (mi, (m, rdc_bit, res_bit)) in [
+            (id::MANAGER_ADMITTANCE, gen::ADM_RDC, gen::ADM_RES1),
+            (id::MANAGER_DISPLACEMENT, gen::DISP_RDC, gen::DISP_RES1),
+            (id::MANAGER_VELOCITY, gen::VEL_RDC, gen::VEL_RES1),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            explicit[mi] = row(m, ty)?;
+            if get(id::model(m, ty, id::M_USE_GENERIC_RDC))? != 0.0 {
+                model_generic |= rdc_bit;
+            }
+            if get(id::model(m, ty, id::M_USE_GENERIC_RES1))? != 0.0 {
+                model_generic |= res_bit;
+            }
+        }
         let th = |k: u32| get(id::thermal(ty, k));
         let ch = |k: u32| get(id::channel(c, k));
         let model = whole(id::channel(c, id::CH_POWER_AMP_MODEL), "PowerAmpModel")?;
@@ -583,21 +505,9 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
             source: c,
             volts_full_scale: ch(id::CH_VOLTS_FS)?,
             parasitic_resistance: ch(id::CH_PARASITIC)?,
-            rdc: a(id::M_RDC)?,
-            bl: a(id::M_BL)?,
-            mms_kg: a(id::M_MMS_G)? * 1e-3,
-            rms: a(id::M_RMS)?,
-            kms: a(id::M_KMS)?,
-            disp_rdc: d(id::M_RDC)?,
-            disp_bl: d(id::M_BL)?,
-            disp_mms_kg: d(id::M_MMS_G)? * 1e-3,
-            disp_rms: d(id::M_RMS)?,
-            disp_kms: d(id::M_KMS)?,
-            vel_rdc: v(id::M_RDC)?,
-            vel_bl: v(id::M_BL)?,
-            vel_mms_kg: v(id::M_MMS_G)? * 1e-3,
-            vel_rms: v(id::M_RMS)?,
-            vel_kms: v(id::M_KMS)?,
+            model_generic,
+            family,
+            explicit,
             rth_vc: th(id::T_RTH_VC)?,
             tau_vc: th(id::T_TAU_VC)?,
             rth_mag: th(id::T_RTH_MG)?,
@@ -623,8 +533,9 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
         // rig law 6: the peak axis reserves the bank's pilot amplitude
         // (PilotToneAmplitude_dB, offset 2 of the bank's pilot block)
         let bank = whole(id::CH_TUNING + c, "ChTuning")?;
-        let pilot_db = get([1024, 22528, 23552][bank.min(2) as usize] + 2)?;
+        let pilot_db = get(id::PILOT[bank.min(2) as usize] + id::P_AMPLITUDE_DB)?;
         x.pilot_reserve = libm_pow10(f64::from(pilot_db) / 20.0) as f32;
+        x.resolve_models();
         arr(id::CH_VELOCITY_LIMIT0, &mut x.velocity_limit)?;
         arr(id::CH_MASK_ENERGY0, &mut x.mask_energy_db)?;
         arr(id::CH_BAND_CENTER0, &mut x.band_center_hz)?;

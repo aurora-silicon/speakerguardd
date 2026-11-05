@@ -31,10 +31,11 @@
 //!   it, and the loop only takes that thread's latest snapshot: a snapshot
 //!   older than `PCM_SNAPSHOT_MAX_NS` is no proof. When the reader sees the
 //!   PCM go to XRUN, paused, suspended, unreadable or a new owner, it wakes
-//!   the loop for an extra tick at once (an eventfd), so a stopped engine is
-//!   released within the reader's 1 ms poll instead of at the next 10 ms
-//!   tick (B2 measured 11.7 ms from XRUN to release, 31.0 ms to the floor,
-//!   on 0d7ee6c).
+//!   the loop for an extra tick at once (an eventfd), so a paused or
+//!   suspended stream or a new owner is released within the reader's 1 ms
+//!   poll instead of at the next 10 ms tick (B2 measured 11.7 ms from XRUN
+//!   to release, 31.0 ms to the floor, on 0d7ee6c). An XRUN is now held
+//!   for the sink's recovery, up to the heartbeat bound (see `observe`).
 //! - Exits on losing ownership or any kernel error: closing the control file
 //!   withdraws protection at once.
 //!
@@ -220,11 +221,8 @@ mod linux {
     /// Whether a change from `a` to `b` is worth a tick now: the PCM
     /// stopped, became unreadable, or changed hands.
     fn wakes(a: PcmState, b: PcmState) -> bool {
-        let owner = |s: PcmState| match s {
-            PcmState::Open { owner } | PcmState::Stopped { owner } | PcmState::Running { owner } => Some(owner),
-            _ => None,
-        };
-        let bad = |s: PcmState| matches!(s, PcmState::Stopped { .. } | PcmState::Unknown);
+        let owner = |s: PcmState| s.owner();
+        let bad = |s: PcmState| matches!(s, PcmState::Xrun { .. } | PcmState::Stopped { .. } | PcmState::Unknown);
         (bad(b) && !bad(a)) || (owner(b).is_some() && owner(a).is_some() && owner(a) != owner(b))
     }
 

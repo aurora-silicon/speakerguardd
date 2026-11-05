@@ -200,7 +200,7 @@ mod tests {
         let m = machine_for("j293", &tas).unwrap();
         assert_eq!((m.amps, m.amp), (4, Amp::Tas2770));
         assert!(m.amp.has_gain_control() && m.amp.has_sense() && !m.amp.reports_faults());
-        assert_eq!((m.amp.volume_suffix(), m.amp.operating_volume()), ("Speaker Playback Volume", 201));
+        assert_eq!((m.amp.volume_suffix(), m.amp.volume_controls(m.amps)), ("Speaker Playback Volume", m.amps));
         assert!(machine_for("j293", &Bind { sense: 0, method: "derived-static".into(), ..tas }).is_err());
         assert!(machine_for("j999", &Bind { sense: 0, ..new.clone() }).is_err());
         assert!(machine_for("j999", &Bind { amps: 0, sense: 0, ..new.clone() }).is_err());

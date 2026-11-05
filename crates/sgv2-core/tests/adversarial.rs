@@ -424,15 +424,18 @@ fn lsm2_params(seed: u64, n: usize, rate: u32, hot: bool) -> lsm2::Params {
         runtime_budget_w: [r.log(0.1, 50.0), r.log(0.1, 50.0), r.log(0.1, 50.0), r.log(0.1, 50.0)],
         ..lsm2::Params::default()
     };
-    // refused otherwise: no thermal axis, or a latency below the 256-frame
-    // controller cadence
+    // refused otherwise: no thermal axis (a blob must protect), or a
+    // look-ahead region (filterbank stage plus look-ahead) that is not whole
+    // substeps inside one controller frame
     if p.control_power == 0 && p.control_temperature == 0 {
         p.control_temperature = 1;
     }
     let cadence = lsm2::controller_frames(rate);
-    if p.latency_frames() < cadence || p.filterbank_frames() < 2 {
-        p.filterbank_latency_ms = (cadence as f32 / 2.0 + 2.0) * 1e3 / rate as f32;
-    }
+    let sub = cadence / lsm2::SUBSTEPS;
+    let od = sub * (1 + (r.uni(0.0, 6.99) as usize));
+    let fb = (2 + (r.uni(0.0, 1.0) as f64 * (od - 2) as f64) as usize).min(od);
+    p.filterbank_latency_ms = (fb as f64 * 1e3 / rate as f64) as f32;
+    p.speaker_response_lookahead_ms = ((od - fb) as f64 * 1e3 / rate as f64) as f32;
     let nyq = rate as f64 / 2.0;
     let src = r.perm(n);
     for (c, &s) in src.iter().enumerate() {
@@ -1680,11 +1683,10 @@ proptest! {
         check_hard_path(&mut u, &x, if blk == 0 { call } else { blk as usize }, &chans, atsp_glide(rate));
     }
 
-    /// lsm2's temperature axis follows spec 6.1's linear-in-dB knee from
-    /// the soft to the hard limit on the predicted coil temperature, through
-    /// `AttackTime`. Check the gain is at most the most permissive knee value
-    /// over the last controller interval plus ten attack time constants
-    /// (what the attack smoother can still be catching up on).
+    /// lsm2's temperature axis (spec 15.5) reaches the audio: the applied
+    /// gain is at most the most permissive temperature candidate over the
+    /// last controller interval plus ten attack time constants (what the
+    /// attack ramp can still be catching up on).
     #[test]
     fn lsm2_temperature_path_reaches_its_floor(
         seed in any::<u64>(), n in 1usize..=4, secs in 1.0f64..6.0, amp in 0.5f32..2.0,
@@ -1698,32 +1700,23 @@ proptest! {
         let mut u = lsm2::Unit::new(p);
         let settle = 256 + (10.0 * p.attack_time_ms as f64 * 1e-3 * rate as f64) as usize;
         let rr = render(&mut u, &x, None, &[256], &mut no_sense, true);
-        let knee = |c: &lsm2::ChannelParams, t: f32| -> f64 {
-            let (soft, hard) = (c.temperature_soft_limit as f64, c.temperature_hard_limit as f64);
-            let z = ((t as f64 + c.temperature_headroom as f64 - soft) / (hard - soft)).clamp(0.0, 1.0);
-            10f64.powf(-(c.max_temperature_attenuation_db as f64) * z / 20.0)
-        };
+        // spec 15.5: the applied slow gain follows the temperature axis's
+        // candidate (0.99 below it on a cut, at most it on a release)
         let window = settle.div_ceil(256) + 1;
         for (k, (done, t)) in rr.tele.iter().enumerate() {
             if *done < settle || k < window {
                 continue;
             }
             for c in &p.ch[..n] {
-                // a step knee (equal limits) is undecided within rounding
-                if c.temperature_hard_limit - c.temperature_soft_limit < 1e-3 {
-                    continue;
-                }
                 let s = &t.channels[c.source as usize];
                 let mut most = 0.0f64;
                 for (_, w) in &rr.tele[k - window..=k] {
-                    let tw = w.channels[c.source as usize].coil_temp_c;
-                    // f32 telemetry: allow the knee's slope over 0.01 K
-                    most = most.max(knee(c, tw + 0.01)).max(knee(c, tw - 0.01));
+                    most = most.max(w.channels[c.source as usize].axis_gain[4] as f64);
                 }
                 let tol = 1e-4;
                 prop_assert!(
                     s.gain as f64 <= most + tol,
-                    "lsm2 temperature knee {} not reached: gain {} at {} C", most, s.gain, s.coil_temp_c
+                    "lsm2 temperature candidate {} not reached: gain {} at {} C", most, s.gain, s.coil_temp_c
                 );
             }
         }

@@ -62,8 +62,7 @@ import wiring  # noqa: E402
 VERSION = 2
 STATE = "/var/lib/speakerguardd"
 MARKER = "/run/speakerguardd-selfcheck/active"
-RATE = 48000
-CAPTURE_FRAMES = 19200  # 0.4 s
+CAPTURE_S = 0.4
 LEASE_MS = 50
 TICK_S = 0.010
 PCM_WAIT_S = 15
@@ -309,14 +308,16 @@ class Streams:
     """One silent run: a grant, a zero-sample stream on the speaker PCM, a
     capture of the sense PCM, then release."""
 
-    def __init__(self, ctl, card, spk_dev, sense_dev, amps):
+    def __init__(self, ctl, card, spk_dev, sense_dev, amps, rate):
         self.ctl, self.card, self.spk, self.sense, self.amps = ctl, card, spk_dev, sense_dev, amps
+        # the tuning's rate (wiring.tuning_rate), the rate the graph runs at
+        self.rate = rate
         self.fmt = None
 
     def _play(self, fmt):
         return subprocess.Popen(
             ["aplay", "-q", "-D", f"hw:CARD={self.card},DEV={self.spk}", "-f", fmt, "-c", str(self.amps),
-             "-r", str(RATE), "-t", "raw", "/dev/zero"],
+             "-r", str(self.rate), "-t", "raw", "/dev/zero"],
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
         )
 
@@ -345,7 +346,7 @@ class Streams:
             time.sleep(0.1)
             rec = subprocess.run(
                 ["arecord", "-q", "-D", f"hw:CARD={self.card},DEV={self.sense}", "-f", "S16_LE", "-c", str(2 * self.amps),
-                 "-r", str(RATE), "-s", str(CAPTURE_FRAMES), "-t", "raw", "-"],
+                 "-r", str(self.rate), "-s", str(round(self.rate * CAPTURE_S)), "-t", "raw", "-"],
                 capture_output=True, timeout=5,
             )
             if rec.returncode:
@@ -379,7 +380,7 @@ def check_sense(ctl, idx, card, devs, w, runs):
         if v is None:
             return [f"no {nm!r} control"], None
         saved[nm] = v
-    st = Streams(ctl, card, devs[0], devs[1], n)
+    st = Streams(ctl, card, devs[0], devs[1], n, w["rate"])
     try:
         for nm in saved:
             switch_set(card, nm, "on")
@@ -447,6 +448,16 @@ def write_atomic(path, text, mode=0o644):
     os.rename(tmp, path)
 
 
+def blob_rate(path):
+    """The sample rate a parameter blob was compiled for (its header,
+    crates/sgv2-core/src/blob.rs: "SGV2PRM\\0" at 0, sample_rate at 24)."""
+    with open(path, "rb") as f:
+        head = f.read(28)
+    if len(head) < 28 or head[:8] != b"SGV2PRM\0":
+        raise wiring.Refused(f"{path} is not a speakerguardd parameter blob")
+    return int.from_bytes(head[24:28], "little")
+
+
 def derive_live(args):
     """(hw, wiring, machine description, errors), all from this Mac's
     device tree and tuning. A refusal (an unreadable device tree, a missing
@@ -477,6 +488,8 @@ def cmd_run(args):
         rec["params_sha256"] = sha256(args.params)
         hw, w, desc, derr = derive_live(args)
         errs += derr
+        if blob_rate(args.params) != w["rate"]:
+            errs.append(f"the parameters are compiled for {blob_rate(args.params)} Hz, the tuning's graph runs at {w['rate']} Hz")
         report["machine"] = desc
         rec.update(board=hw["board"], wiring=w["hash"], amps=len(w["amps"]), sense=len(w["sense"]),
                    family=w["family"], key=w["key"], method=w["method"])

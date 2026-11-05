@@ -46,7 +46,6 @@ import wiring  # noqa: E402
 HERE = os.path.dirname(os.path.abspath(__file__))
 PKG = os.path.dirname(HERE)
 QUANTUM = 512
-RATE = 48000
 PROTECT_INPUT = "alsa_output.platform-sound.RawSpeakers"
 
 
@@ -128,7 +127,7 @@ def pipewire_conf(m, c, w, source=None):
             media.class            = "Audio/Source/Internal"
             api.alsa.path          = "hw:CARD={c['card']},DEV=2"
             audio.format           = "S16LE"
-            audio.rate             = {RATE}
+            audio.rate             = {c['rate']}
             audio.channels         = {sense}
             audio.position         = {aux(sense)}
             api.alsa.period-size   = {QUANTUM}
@@ -156,7 +155,7 @@ context.objects = [
             media.class            = "Audio/Sink/Internal"
             api.alsa.path          = "hw:CARD={c['card']},DEV=1"
             audio.format           = "{c['speaker_format']}"
-            audio.rate             = {RATE}
+            audio.rate             = {c['rate']}
             audio.channels         = {amps}
             audio.position         = {aux(amps)}
             api.alsa.period-size   = {QUANTUM}
@@ -195,7 +194,7 @@ context.modules = [
                 node.name          = "{n['protect']}"
                 node.description   = "{c['name']} speaker protection input (internal)"
                 media.class        = "Audio/Sink"
-                audio.rate         = {RATE}
+                audio.rate         = {c['rate']}
                 audio.channels     = {amps + sense}
                 audio.position     = {aux(amps + sense)}
                 priority.session   = 0
@@ -219,7 +218,7 @@ context.modules = [
             playback.props = {{
                 node.name          = "{n['protect_out']}"
                 node.description   = "{c['name']} speaker protection output"
-                audio.rate         = {RATE}
+                audio.rate         = {c['rate']}
                 audio.channels     = {amps}
                 audio.position     = {aux(amps)}
                 node.autoconnect   = false

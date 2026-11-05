@@ -31,7 +31,10 @@ impl Amp {
         matches!(self, Amp::Sn012776)
     }
 
-    /// The per-amp volume control the kernel sets on a grant.
+    /// The per-amp volume control the kernel sets on a grant. Granted, it
+    /// reads 0 dB on its own TLV (see `supervise::Supervisor`): the
+    /// operating point is unity on the volume, whatever raw value the
+    /// driver's scale puts there.
     pub fn volume_suffix(self) -> &'static str {
         match self {
             Amp::Sn012776 => "Speaker Volume",
@@ -39,13 +42,14 @@ impl Amp {
         }
     }
 
-    /// The volume's raw value at the operating point: DVC 201 (0 dB on
-    /// both TI amps), or software gain 127 (Q31 0.5, the MAX98360A's full
-    /// scale).
-    pub fn operating_volume(self) -> i64 {
+    /// How many of those volume controls a card with `amps` amps has: one
+    /// per SN012776 or TAS5770L, and one for the whole MAX98360A pair (the J700's
+    /// "Speaker Playback Volume" is a copy-time software gain on the stream,
+    /// KERNEL.md 2.6, with no amp prefix).
+    pub fn volume_controls(self, amps: usize) -> usize {
         match self {
-            Amp::Sn012776 | Amp::Tas2770 => 201,
-            Amp::Max98360a => 127,
+            Amp::Sn012776 | Amp::Tas2770 => amps,
+            Amp::Max98360a => 1,
         }
     }
 
@@ -54,11 +58,6 @@ impl Amp {
     /// can read) the operating point is the tuning's own, and only its
     /// channels' agreement is checked (see `supervise::Expect`).
     pub fn has_gain_control(self) -> bool {
-        matches!(self, Amp::Sn012776 | Amp::Tas2770)
-    }
-
-    /// Whether the DVC has a dB scale whose operating value is 0 dB.
-    pub fn volume_is_db(self) -> bool {
         matches!(self, Amp::Sn012776 | Amp::Tas2770)
     }
 }
@@ -192,8 +191,7 @@ mod tests {
     fn only_sn012776_amps_must_report_faults() {
         assert!(Amp::Sn012776.reports_faults());
         assert!(!Amp::Max98360a.reports_faults());
-        assert_eq!(Amp::Sn012776.operating_volume(), 201);
-        assert_eq!(Amp::Max98360a.operating_volume(), 127);
+        assert_eq!((Amp::Sn012776.volume_controls(6), Amp::Max98360a.volume_controls(2)), (6, 1));
     }
 
     #[test]

@@ -32,6 +32,7 @@ max/RMS). Rendered audio is deleted after the comparison unless --keep-audio.
 Exit status 0 only if every case passes.
 """
 import json
+import math
 import os
 import subprocess
 import sys
@@ -73,6 +74,83 @@ def check_rendered_inputs(got, meta):
     if bad is not None:
         return f"sgv2 slice {bad} was rendered with properties {got[bad].get('cfprops')}, not {want}"
     return None
+
+
+def args_in(args):
+    return args[args.index("--in") + 1]
+
+
+def like_for_like(ref, got, program, file_ch, ch, out_path, ref_lat, got_lat, rate):
+    """Make the lsm2 traces compare the same quantities (lsm2 only).
+
+    1. The reference's audio_gain is sqrt(energy out / energy in) over a
+       slice of output and the input one reference latency earlier
+       (capture.py). sgv2's lsm2 buffers one controller frame more than the
+       reference (it is independent of the host slicing), so its output at
+       t + extra is the reference's output at t. sgv2's audio_gain is
+       recomputed from its rendered audio over the slice shifted by that
+       extra latency, against the same input. A slice whose shifted window runs past the end of the
+       rendered audio has no sgv2 counterpart: its audio_gain is excluded.
+    2. A slice that does not end on a controller frame (only the last slice
+       of a program, at the production slicing) is excluded: the reference
+       processes a partial controller frame at the end of a call there, which
+       this unit by design never does.
+    Returns the exclusion counts with their reasons."""
+    import numpy as np
+
+    excluded = {}
+    extra = got_lat - ref_lat
+    x = np.fromfile(program, "<f4")
+    x = x[: len(x) // file_ch * file_ch].reshape(-1, file_ch).astype(np.float64)
+    y = np.fromfile(out_path, "<f4")
+    y = y[: len(y) // ch * ch].reshape(-1, ch).astype(np.float64)
+    ctl = int(round(256 * rate / 48000))
+
+    def note(what, why):
+        e = excluded.setdefault(what, {"reason": why, "slices": 0})
+        e["slices"] += 1
+
+    for key in sorted(ref):
+        r = ref[key]
+        end = key[1]
+        # The first law captures (rig tools/capture.py before the axis_gain
+        # list) name the frame log's fields differently: "gain" is the
+        # temperature candidate (ControllerFrameLog temperature_gain), "raw"
+        # holds axes 0-2 and the global "global_gain" is the linked power gain.
+        g0 = r.get("global") or {}
+        for rc in r["channels"]:
+            raw = rc.get("raw")
+            if isinstance(raw, dict) and "axis0" in raw and "gain" in rc and "axis_gain" not in rc:
+                rc["axis_gain"] = [raw["axis0"], raw.get("axis1"), raw.get("axis2"), g0.get("global_gain"),
+                                   rc.pop("gain")]
+                rc.pop("raw")
+                note("legacy-fields", "law capture field names mapped to axis_gain (temperature candidate, "
+                     "axes 0-2, linked power)")
+        if "global_gain" in g0 and all("axis_gain" in rc for rc in r["channels"]):
+            g0["power_gain"] = g0.pop("global_gain")
+        start = end - r.get("frames", 0)
+        if end % ctl:
+            del ref[key]
+            got.pop(key, None)
+            note("slice", "ends inside a controller frame: the reference processes a partial frame there")
+            continue
+        g = got.get(key)
+        if g is None:
+            continue
+        for c, (rc, gc) in enumerate(zip(r["channels"], g["channels"])):
+            if "audio_gain" not in rc:
+                continue
+            if extra < 0 or end + extra > len(y):
+                rc.pop("audio_gain")
+                gc.pop("audio_gain", None)
+                note("audio_gain", "the window shifted by sgv2's extra controller frame of latency runs past "
+                     "the rendered audio")
+                continue
+            xi = x[max(start - ref_lat, 0):max(end - ref_lat, 0), c % file_ch]
+            yo = y[start + extra:end + extra, c]
+            ei, eo = float(np.dot(xi, xi)), float(np.dot(yo, yo))
+            gc["audio_gain"] = None if len(xi) == 0 or ei < len(xi) * 1e-12 else math.sqrt(eo / ei)
+    return excluded
 
 
 def fieldok(rep, name):
@@ -196,12 +274,18 @@ def main(argv):
             all_ok = False
             continue
         ref, got = compare.load(os.path.join(d, "trace.jsonl")), compare.load(os.path.join(o, "trace.jsonl"))
+        lat = lambda t: next(iter(t.values())).get("latency", 0) if t else 0  # noqa: E731
+        excluded = {}
+        if unit == "lsm2":
+            excluded = like_for_like(ref, got, args_in(args), fch, ch, os.path.join(o, "out.f32"), lat(ref), lat(got),
+                                     meta.get("sr", 48000))
         ok, rep = compare.compare(ref, got)
+        if excluded:
+            rep["excluded"] = excluded
         why = check_rendered_inputs(got, meta)
         if why:
             ok = False
             rep["inputs"] = why
-        lat = lambda t: next(iter(t.values())).get("latency", 0) if t else 0  # noqa: E731
         aok, arep = compare.compare_audio(os.path.join(d, "run.out.f32"), os.path.join(o, "out.f32"), ch,
                                           lat(ref), lat(got))
         if not keep:
