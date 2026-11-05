@@ -122,10 +122,14 @@ fn over_range_program_is_metered_unclamped_up_to_sixteen_fs() {
     let (t1, t12, t16, t100) = (temp(1.0), temp(1.2), temp(16.0), temp(100.0));
     assert!(t12 > t1 + 1.0, "1.2 FS metered as {t12} C, 1 FS as {t1} C");
     assert!(t16 > t12 && t100 == t16, "16 FS {t16} C, 100 FS {t100} C");
-    let model = |x: f32| {
+    // lsm2's monitor is output-referred (rig law 4) and the output is held
+    // to full scale, so the input-referred candidates carry the over-range
+    // program: the sample-peak candidate sees 1.2 FS as 1.2, and 100 FS as
+    // the meter's 16 FS
+    let peak = |x: f32| {
         let mut u = lsm2::Unit::new(lsm2_params());
         lsm2_go(&mut u, &vec![x; 4800]);
-        tel(&u).channels[0].coil_temp_c
+        tel(&u).channels[0].axis_gain[0]
     };
-    assert!(model(1.2) > model(1.0) && model(100.0) == model(16.0));
+    assert!(peak(1.2) < peak(1.0) && peak(100.0) == peak(16.0));
 }

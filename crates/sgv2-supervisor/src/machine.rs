@@ -38,6 +38,17 @@ impl Amp {
         }
     }
 
+    /// How many of those volume controls a card with `amps` amps has: one
+    /// per SN012776, and one for the whole MAX98360A pair (the J700's
+    /// "Speaker Playback Volume" is a copy-time software gain on the stream,
+    /// KERNEL.md 2.6, with no amp prefix).
+    pub fn volume_controls(self, amps: usize) -> usize {
+        match self {
+            Amp::Sn012776 => amps,
+            Amp::Max98360a => 1,
+        }
+    }
+
     /// Whether the full-scale voltage comes from an "Amp Gain Volume"
     /// readback. Without one (the MAX98360A's gain is a strap no software
     /// can read) the operating point is the tuning's own, and only its
@@ -174,6 +185,7 @@ mod tests {
     fn only_sn012776_amps_must_report_faults() {
         assert!(Amp::Sn012776.reports_faults());
         assert!(!Amp::Max98360a.reports_faults());
+        assert_eq!((Amp::Sn012776.volume_controls(6), Amp::Max98360a.volume_controls(2)), (6, 1));
     }
 
     #[test]

@@ -43,6 +43,9 @@ import time
 HERE = os.path.dirname(os.path.realpath(__file__))
 DT = "/proc/device-tree"
 ALLOW = "/etc/speakerguardd/allow-unqualified"
+# The bundle provisioning compiles when the installer's copy is not where the
+# reader looks first (speakerguardd-provision: SGV2_BUNDLE=<path>).
+PROVISION_CONF = "/etc/speakerguardd/provision.conf"
 CONTROL = "Speaker Protection"
 
 
@@ -59,10 +62,29 @@ def board_of(dt):
     return first[len("apple,"):] if first.startswith("apple,") and len(first) > 6 else None
 
 
-def tuning_unit(cli):
-    """The protection unit this Mac's own tuning names, or None."""
+def bundle_override(path):
+    """SGV2_BUNDLE from provisioning's configuration, or None."""
     try:
-        r = subprocess.run([cli, "dump", "--json"], capture_output=True, text=True, timeout=30)
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("SGV2_BUNDLE="):
+                    v = line.split("=", 1)[1].strip()
+                    if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+                        v = v[1:-1]
+                    return v or None
+    except OSError:
+        pass
+    return None
+
+
+def tuning_unit(cli, conf=None):
+    """The protection unit this Mac's own tuning names, or None: the bundle
+    provisioning compiles (its SGV2_BUNDLE, else the installer's copy)."""
+    bundle = bundle_override(conf or PROVISION_CONF)
+    try:
+        r = subprocess.run([cli, "dump", "--json"] + ([bundle] if bundle else []), capture_output=True, text=True,
+                           timeout=30)
         return json.loads(r.stdout)["tuning"]["protection"]["kind"]
     except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired):
         return None
