@@ -66,6 +66,9 @@ pub const MACHINES: &[Description] = &[
     sn("j616s", 6, 15),
     sn("j616c", 6, 15),
     sn("j413", 4, 15),
+    // 14-inch M2 Pro: six SN012776 (two woofer pairs and two tweeters), gain
+    // 15 (macaudio j314 configuration, DT t602x-j414-j416).
+    sn("j414s", 6, 15),
     // No gain control: 7.30 V peak at full scale (AID44 VoltsFullScale,
     // Daybreak t-4662).
     Description { board: "j700", amps: 2, amp: Amp::Fixed { full_scale_mv: 7_300 } },
