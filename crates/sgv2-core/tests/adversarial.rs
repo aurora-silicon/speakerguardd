@@ -234,6 +234,17 @@ fn slices(seed: u64) -> Vec<usize> {
         .collect()
 }
 
+/// Host slicings of one atsp family (SPEC-ATSP 11.3), whose output is
+/// the same bit for bit: whole multiples of the 512-frame fragment
+/// (`staged`), or fragments of 2 frames up to one tick, which never start
+/// before the window their tick closes. One-frame fragments take the
+/// one-frame dezipper path, a family of their own.
+fn atsp_family_slices(seed: u64, win: usize, staged: bool) -> Vec<usize> {
+    let mut r = Rng(seed ^ 0xa75);
+    let small = win.min(atsp::FRAGMENT);
+    (0..64).map(|_| if staged { atsp::FRAGMENT * (1 + r.below(8)) } else { 2 + r.below(small - 1) }).collect()
+}
+
 // ---------------------------------------------------------------------------
 // Synthetic parameter sets, around the crate's own test builders.
 
@@ -764,7 +775,7 @@ proptest! {
         let x = signal(seed ^ 1, n, len, amp, h);
         let rr = render(&mut u, &x, None, &slices(sl), &mut no_sense, false);
         // the dezipper passes up to its own peak, as the reference's does
-        check_bound(&x, &rr.out, 0, atsp::DEZIPPER_PEAK, "atsp");
+        check_bound(&x, &rr.out, 0, u.gain_peak(), "atsp");
         check_state_finite(&rr.tele[0].1, n, "atsp");
     }
 
@@ -894,13 +905,39 @@ proptest! {
     fn atsp_slice_invariant(
         seed in any::<u64>(), n in 1usize..=8, blk in block(), rate in rate(),
         len in 1usize..30_000, amp in 0.01f32..4.0, h in finite_hostility(), a in any::<u64>(), b in any::<u64>(),
+        staged in any::<bool>(),
     ) {
+        // SPEC-ATSP 11.3: the output depends on the host slice only through
+        // its family; within one family any slicing is the same
         let p = atsp_params(seed, n, blk, rate, true);
+        let win = atsp::window_frames(rate as f64);
         let x = signal(seed ^ 1, n, len, amp, h);
+        // a one-frame last call (the input running out) is a family of its
+        // own: leave the input one frame longer than every slicing's end
+        let (sa, sb) = (atsp_family_slices(a, win, staged), atsp_family_slices(b, win, staged));
+        let len = x[0].len();
+        let ends_on_one = |sl: &[usize]| {
+            let (mut done, mut k) = (0, 0);
+            while done < len {
+                let m = sl[k % sl.len()].min(len - done);
+                if done + m == len {
+                    return m == 1;
+                }
+                done += m;
+                k += 1;
+            }
+            false
+        };
+        let x: Vec<Vec<f32>> = if ends_on_one(&sa) || ends_on_one(&sb) {
+            x.iter().map(|c| c[..len - 1].to_vec()).collect()
+        } else {
+            x
+        };
+        prop_assume!(!x[0].is_empty() && !ends_on_one(&sa) && !ends_on_one(&sb));
         let mut u1 = atsp::Unit::new(p);
-        let r1 = render(&mut u1, &x, None, &slices(a), &mut no_sense, false);
+        let r1 = render(&mut u1, &x, None, &sa, &mut no_sense, false);
         let mut u2 = atsp::Unit::new(p);
-        let r2 = render(&mut u2, &x, None, &slices(b), &mut no_sense, false);
+        let r2 = render(&mut u2, &x, None, &sb, &mut no_sense, false);
         prop_assert!(bits(&r1.out) == bits(&r2.out), "audio differs between slicings");
         prop_assert_eq!(tele_bits(&r1.tele[0].1), tele_bits(&r2.tele[0].1));
         // reset returns the thermal and gain state to `new`'s; the output
@@ -908,8 +945,8 @@ proptest! {
         // took the same path
         u1.reset();
         u2.reset();
-        let r3 = render(&mut u1, &x, None, &slices(b), &mut no_sense, false);
-        let r4 = render(&mut u2, &x, None, &slices(a), &mut no_sense, false);
+        let r3 = render(&mut u1, &x, None, &sb, &mut no_sense, false);
+        let r4 = render(&mut u2, &x, None, &sa, &mut no_sense, false);
         prop_assert!(bits(&r3.out) == bits(&r4.out), "audio differs after reset");
         prop_assert_eq!(tele_bits(&r3.tele[0].1), tele_bits(&r4.tele[0].1));
     }
@@ -940,18 +977,26 @@ proptest! {
 /// boundary at which a group member's coil temperature exceeded its hard
 /// limit leaves at least 20 dB down on every channel of the group. Returns
 /// how many blocks were under the hard path.
+///
+/// `glide`: a unit whose panic is a target step through its output
+/// dezipper (atsp, rig law 4) reaches the 20 dB target, within the
+/// dezipper's fixed point `bound`, once the group has been over its hard
+/// limit for `frames`; the check applies from then on, while it stays over.
 fn check_hard_path(
     unit: &mut dyn ProtectionUnit,
     x: &[Vec<f32>],
     block: usize,
     // per host channel: (group id, hard limit)
     chans: &[(usize, f64)],
+    glide: Option<(usize, f32)>,
 ) -> usize {
     let n = x.len();
     let len = x[0].len();
+    let (settle, bound) = glide.unwrap_or((0, FAILSAFE_GAIN));
     let mut out = vec![vec![0.0f32; block]; n];
     let mut t = Telemetry::new();
-    let mut hard_groups: Vec<usize> = Vec::new();
+    // per group: the frame from which it has been over its hard limit
+    let mut hot_since: Vec<(usize, usize)> = Vec::new();
     let mut hard_blocks = 0;
     let mut done = 0;
     while done + block <= len {
@@ -963,13 +1008,13 @@ fn check_hard_path(
         assert_eq!(allocs(), before);
         drop(outs);
         // the block just rendered was decided at the previous boundary
+        let mut any = false;
         for (c, &(g, _)) in chans.iter().enumerate() {
-            if !hard_groups.contains(&g) {
-                continue;
-            }
-            for k in 0..block {
+            let Some(&(_, since)) = hot_since.iter().find(|h| h.0 == g) else { continue };
+            any = true;
+            for k in since.saturating_add(settle).saturating_sub(done).min(block)..block {
                 let i = x[c][done + k];
-                let lim = if i.is_finite() { (i * FAILSAFE_GAIN).abs() } else { 0.0 };
+                let lim = if i.is_finite() { (i * bound).abs() } else { 0.0 };
                 assert!(
                     out[c][k].abs() <= lim,
                     "hard path missed: ch{c} frame {} out {} in {} (group {g} over its hard limit)",
@@ -979,21 +1024,36 @@ fn check_hard_path(
                 );
             }
         }
-        if !hard_groups.is_empty() {
+        if any {
             hard_blocks += 1;
         }
-        hard_groups.clear();
+        let mut hot: Vec<usize> = Vec::new();
         for (c, &(g, limit)) in chans.iter().enumerate() {
             let temp = t.channels[c].coil_temp_c as f64;
             // telemetry is f32; skip a boundary the rounding could decide
             // either way
-            if temp > limit + 1e-4 * limit.abs().max(1.0) && !hard_groups.contains(&g) {
-                hard_groups.push(g);
+            if temp > limit + 1e-4 * limit.abs().max(1.0) && !hot.contains(&g) {
+                hot.push(g);
             }
         }
         done += block;
+        hot_since.retain(|h| hot.contains(&h.0));
+        for g in hot {
+            if !hot_since.iter().any(|h| h.0 == g) {
+                hot_since.push((g, done));
+            }
+        }
     }
     hard_blocks
+}
+
+/// The atsp panic's glide (rig law 4, SPEC-ATSP 11): the panic target is
+/// scheduled at the first tick after the coil is seen hot (at most 5 ms),
+/// and the dezipper glides from at most its peak to within 3 % of the
+/// 20 dB target (its Float32 fixed point is 0.6 % above it) in about 31 ms
+/// at 48 kHz; 60 ms bounds both.
+fn atsp_glide(rate: u32) -> Option<(usize, f32)> {
+    Some(((0.06 * rate as f64) as usize, FAILSAFE_GAIN * 1.03))
 }
 
 /// atsp's channel groups as SPEC-ATSP 4 routes them: the first slot (A, B,
@@ -1001,6 +1061,8 @@ fn check_hard_path(
 /// when linked globally, one per linked slot, else one per channel. Per
 /// host channel: (group id, hard limit).
 fn atsp_hard_groups(p: &atsp::Params, n: usize) -> Vec<(usize, f64)> {
+    // the unit runs every constant held to its published range
+    let p = &p.clamped();
     (0..n)
         .map(|c| {
             let si = (0..3).find(|&si| p.slot[si].channel_mask & (1 << c) != 0).unwrap_or(0);
@@ -1631,7 +1693,7 @@ proptest! {
     #[test]
     fn atsp_hard_path_cuts_20db_within_one_block(
         seed in any::<u64>(), n in 1usize..=8, blk in prop_oneof![Just(512u32), Just(64), Just(0), 16u32..=2048],
-        call in 16usize..=4096, secs in 1.0f64..8.0, amp in 0.5f32..4.0, h in hostility(),
+        call in 2usize..=240, secs in 1.0f64..8.0, amp in 0.5f32..4.0, h in hostility(),
     ) {
         let rate = 48_000;
         let mut p = atsp_params(seed, n, blk, rate, true);
@@ -1645,8 +1707,13 @@ proptest! {
         let chans = atsp_hard_groups(&p, n);
         let mut u = atsp::Unit::new(p);
         prop_assert!(!u.is_failsafe());
-        // host-block mode (`block_frames = 0`) decides once per host call
-        check_hard_path(&mut u, &x, if blk == 0 { call } else { blk as usize }, &chans);
+        // the panic is decided at every 5 ms tick from the post-gain coil
+        // as it stood at the start of the tick's fragment (SPEC-ATSP 11.3),
+        // and a tick that finds it back under the limit releases at once.
+        // Calls of at most one tick make the telemetry this test reads at
+        // each call boundary exactly what the next tick reads (the reserved
+        // `block_frames` does not change that)
+        check_hard_path(&mut u, &x, call, &chans, atsp_glide(rate));
     }
 
     /// lsm2's temperature axis (spec 15.5) reaches the audio: the applied
@@ -1783,7 +1850,7 @@ fn load_and_probe(bytes: &[u8]) {
     }
     if let Ok(p) = atsp::Params::from_blob(bytes) {
         let mut u = atsp::Unit::new(p);
-        let g = if u.is_failsafe() { FAILSAFE_GAIN } else { atsp::DEZIPPER_PEAK };
+        let g = if u.is_failsafe() { FAILSAFE_GAIN } else { u.gain_peak() };
         probe(&mut u, p.channels as usize, 0, g, "atsp blob", Hostility::Wild);
     }
 }
@@ -2012,7 +2079,8 @@ fn hard_path_anchors_are_reached() {
         }
         let x = signal(seed, 2, 48_000 * 4, 2.0, Hostility::Clean);
         let chans = atsp_hard_groups(&p, 2);
-        hits += check_hard_path(&mut atsp::Unit::new(p), &x, 512, &chans);
+        // one tick per call (see atsp_hard_path_cuts_20db_within_one_block)
+        hits += check_hard_path(&mut atsp::Unit::new(p), &x, atsp::window_frames(48_000.0), &chans, atsp_glide(48_000));
     }
     assert!(hits > 100, "the atsp hard-path property never saw the hard path ({hits} blocks)");
 }

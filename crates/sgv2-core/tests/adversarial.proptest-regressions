@@ -26,3 +26,6 @@ cc 2365de10a402a2bc4334b2363df3813e36260208fdc816429dbf6c38bddd975e # shrinks to
 cc 93c2fbfab9c2c9f48011ee0bd3854f70321b43e6086929b2e20ae92acceb13ca # shrinks to seed = 1943771452814380787, n = 2, amp = 2.3590698, f = 68.0007493780425, tvc = 0.1, mg_ratio = 10.0, cold = false
 cc 4c69f5d32caf3e501b8ac0612c75c6e6a4bfba358b31cd7e75084a75332f1a1d # shrinks to seed = 6630303038198541121, which = 1, n = 3, mutations = 1, fix = true
 cc 54f18330d24211715b220ad41f8fff9ec981d7051aeaf20d21ab7f3fe75a21a6 # shrinks to seed = 14628931790605482143, which = 2, n = 1, mutations = 5, fix = true
+cc 44a8a5832d7cd946c5e62e6e1fbcb11fb28788f63802b0c8d9afd646b7372b2a # shrinks to seed = 1380472128039838, n = 1, blk = 512, rate = 141657, hot = false, len = 6203, amp = 0.01, h = Clean, sl = 44182944025523
+cc c22121d00a1a6944572f5eaa2ba5257cbe9a7f394201f8c76e60679de4a4fe60 # shrinks to seed = 66884580471797230, n = 1, blk = 512, rate = 153635, hot = false, len = 5873, amp = 0.01, h = Specials, sl = 0
+cc 7653692c56ef0eeba79a475ec2072649966d7c1acca06008784e8de3cca68cf2 # shrinks to seed = 10342436200309593071, n = 5, blk = 0, call = 2424, secs = 6.464697722967383, amp = 3.241301, h = Clean

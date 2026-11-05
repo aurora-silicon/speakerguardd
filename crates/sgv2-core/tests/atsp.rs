@@ -54,8 +54,11 @@ fn steady_temperature_and_power() {
     let mut u = Unit::new(params());
     assert!(!u.is_failsafe());
     let t = drive(&mut u, [0.1; 4], 200.0, 1024);
-    let p = 100.0 * 0.01 / 8.0;
-    assert!((t.channels[0].modeled_power_w as f64 - p).abs() < 1e-6);
+    // the post-gain predictor takes the unit's own output, which carries the
+    // dezipper's fixed point (the reference's +0.052 dB trim)
+    let trim = sgv2_core::atsp::NOMINAL_TRIM as f64;
+    let p = 100.0 * 0.01 / 8.0 * trim * trim;
+    assert!((t.channels[0].modeled_power_w as f64 - p).abs() < 1e-5, "{}", t.channels[0].modeled_power_w);
     let want = 40.0 + p * 70.0;
     assert!((t.channels[0].coil_temp_c as f64 - want).abs() < 0.05, "{}", t.channels[0].coil_temp_c);
 }
@@ -68,12 +71,18 @@ fn settle(rate: f64, ms: f64) -> f64 {
 fn ceiling_holds_the_limit_and_links_the_slot() {
     let mut u = Unit::new(params());
     let t = drive(&mut u, [0.4, 0.0, 0.0, 0.0], 300.0, 512);
-    // at equilibrium the coil sits at the limit with P_hold = span / (Rvc + Rmg)
-    let p_hold = 70.0 / 70.0;
+    // SPEC-ATSP 11 at equilibrium: the input-referred coil node is
+    // Rvc Pd, the post-gain magnet node Rmg Pd trim^2 g^2, and the request
+    // g^2 = ((Tlim - Tamb) - theta_mg_post) / (theta_vc_in + 1) is the target
+    // (the post-gain power is the unit's own output's, as it reports it)
     let p_drive: f64 = 100.0 * 0.16 / 8.0;
-    let want = (p_hold / p_drive).sqrt();
-    assert!((t.channels[0].gain as f64 - want).abs() < 3e-3, "{} {want}", t.channels[0].gain);
-    assert!((t.channels[0].coil_temp_c - 110.0).abs() < 0.1);
+    let p_post = t.channels[0].modeled_power_w as f64;
+    let g2 = (70.0 - 40.0 * p_post) / (30.0 * p_drive + 1.0);
+    assert!((t.channels[0].gain as f64 - g2.sqrt()).abs() < 1e-4, "{} {}", t.channels[0].gain, g2.sqrt());
+    // the post-gain coil settles just under the limit
+    let coil = 40.0 + 70.0 * p_post;
+    assert!((t.channels[0].coil_temp_c as f64 - coil).abs() < 0.05, "{} {coil}", t.channels[0].coil_temp_c);
+    assert!(t.channels[0].coil_temp_c < 110.0);
     assert_eq!(t.channels[3].gain, t.channels[0].gain, "slot link");
 }
 
@@ -94,15 +103,21 @@ fn panic_above_limit_plus_headroom() {
     let mut p = params();
     p.slot[0].attack_ms = 30_000.0;
     let mut u = Unit::new(p);
-    let mut seen = false;
-    for _ in 0..400 {
-        let t = drive(&mut u, [1.0; 4], 0.1, 512);
-        if t.channels[0].coil_temp_c > 118.0 {
-            seen = true;
-            assert!(t.channels[0].axis_gain[4] <= FAILSAFE_GAIN + 1e-6);
-        }
+    let (mut low, mut peak) = (1.0f32, 0.0f32);
+    for _ in 0..4000 {
+        let t = drive(&mut u, [1.0; 4], 0.01, 512);
+        peak = peak.max(t.channels[0].coil_temp_c);
+        low = low.min(t.channels[0].gain);
     }
-    assert!(seen);
+    // far slower than the drive heats the coil, the attack alone would let
+    // it run away: the panic takes the target to 20 dB down at the first
+    // tick that sees the coil over 118 C (SPEC-ATSP 11.2). The coil
+    // overshoots by what full drive adds while that is seen and the
+    // dezipper glides down: at about (Rvc P - theta_vc) / tau_vc =
+    // (375 - 70) / 1 s = 305 C/s, one tick, one post-gain window and about
+    // 10 ms of glide energy make at most 25 ms, 7.6 C
+    assert!(low <= FAILSAFE_GAIN * 1.01, "{low}");
+    assert!(peak > 118.0 && peak < 118.0 + 0.025 * 305.0, "{peak}");
 }
 
 #[test]
@@ -195,8 +210,15 @@ fn slicing_invariance() {
         let t = drive(&mut u, [0.5, 0.3, 0.2, 0.0], 4.0, slice);
         (t.channels[0].gain, t.channels[0].coil_temp_c)
     };
+    // SPEC-ATSP 11.3: one trajectory per family; calls of 2 frames up to
+    // one tick, and whole multiples of the 512-frame fragment (one-frame
+    // calls take the one-frame dezipper path, a family of their own)
+    let r = render(2);
+    for s in [3usize, 7, 160, 240] {
+        assert_eq!(render(s), r, "slice {s}");
+    }
     let r = render(512);
-    for s in [1usize, 2, 7, 160, 1000, 4096] {
+    for s in [1024usize, 2048, 4096] {
         assert_eq!(render(s), r, "slice {s}");
     }
 }
@@ -220,4 +242,53 @@ fn dezipper_fixed_point_is_the_reference_trim() {
         }
         assert!((u.dezipper_gain() - want).abs() < 2e-7, "{rate}: {} vs {want}", u.dezipper_gain());
     }
+}
+
+#[test]
+fn tick_and_coefficients_are_the_specified_float32_values() {
+    use sgv2_core::atsp::{tick_coeff, window_frames};
+    // SPEC-ATSP 11: a 5 ms tick, 240 frames at 48 kHz
+    assert_eq!(window_frames(48_000.0), 240);
+    assert_eq!(window_frames(44_100.0), 221);
+    assert_eq!(window_frames(96_000.0), 480);
+    // SPEC-ATSP 11.1's table of one-tick coefficients
+    for (ms, k) in [
+        (100.0f32, 0.205_671_787_3f64),
+        (400.0, 0.055_939_137_94),
+        (800.0, 0.028_372_049_33),
+        (1500.0, 0.015_233_337_88),
+        (2000.0, 0.011_446_893_22),
+        (3000.0, 0.007_645_905_018),
+        (5000.0, 0.004_594_564_438),
+        (20000.0, 0.001_150_608_063),
+    ] {
+        // the table prints each Float32 to ten digits
+        assert_eq!(tick_coeff(ms), k as f32, "{ms} ms");
+    }
+}
+
+#[test]
+fn rms_is_a_float32_root_mean_square() {
+    use sgv2_core::atsp::rms;
+    for n in [1usize, 3, 4, 15, 16, 17, 33, 63, 64, 65, 240, 241, 480] {
+        let x: Vec<f32> = (0..n).map(|i| ((i * 37 % 101) as f32 / 50.0 - 1.0) * 0.7).collect();
+        let want = (x.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>() / n as f64).sqrt();
+        assert!((rms(&x) as f64 - want).abs() <= want * 1e-6, "{n}: {} vs {want}", rms(&x));
+    }
+    assert_eq!(rms(&[0.5; 240]), 0.5);
+    assert_eq!(rms(&[]), 0.0);
+}
+
+#[test]
+fn input_held_to_twice_full_scale() {
+    // the meters and the gain see the program held to 2 FS: 40 FS and
+    // 2 FS heat the coil alike, and 1.5 FS does not
+    let run = |x: f32| {
+        let mut u = Unit::new(params());
+        let t = drive(&mut u, [x; 4], 2.0, 512);
+        (t.channels[0].control_temp_c, t.channels[0].coil_temp_c, t.channels[0].gain)
+    };
+    assert_eq!(run(40.0), run(2.0));
+    assert_eq!(run(-40.0), run(2.0));
+    assert_ne!(run(1.5), run(2.0));
 }

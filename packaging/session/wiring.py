@@ -110,20 +110,32 @@ PW_FORMAT = {"S24_LE": "S24_32LE", "S32_LE": "S32LE", "S16_LE": "S16LE"}
 SENSE_HEADROOM = 512
 # The sgv2 LV2 bundle's variants (crates/sgv2-lv2 VARIANTS):
 # (amps, sense channels) -> URI fragment.
-PLUGINS = {(2, 0): "2ch", (2, 4): "2ch-vi", (4, 0): "4ch", (4, 8): "4ch-vi", (6, 12): "6ch-vi"}
+PLUGINS = {(1, 0): "1ch", (2, 0): "2ch", (2, 4): "2ch-vi", (4, 0): "4ch", (4, 8): "4ch-vi", (6, 12): "6ch-vi"}
+# The protection units that model from the amps' V/I sense.
+SENSE_UNITS = ("spp3",)
 
 _PREFIX = re.compile(r"^(?:(Left|Right)\s+)?(Woofer|Tweeter|Speaker|Full[- ]Range)(?:\s+(\d+))?$")
 _ROLES = {"woofer": "woofer", "tweeter": "tweeter", "speaker": "full", "full-range": "full", "full range": "full"}
+# Full-range speakers named by side and position ("Left Front", "Right
+# Rear": the J293 and J493), or by side alone ("Left": the J313). The
+# position is the speaker's ordinal on its side: the front (upper) one
+# first, the rear (lower) one second, the order of the AID3/AID18 graphs
+# (upper-left, upper-right, lower-left, lower-right).
+_POSITIONAL = re.compile(r"^(Left|Right)(?:\s+(Front|Upper|Rear|Lower))?$")
+_POSITIONS = {None: 1, "Front": 1, "Upper": 1, "Rear": 2, "Lower": 2}
 
 
 def parse_prefix(prefix):
     """(side, role, ordinal) from a sound-name-prefix; side None = centre."""
     m = _PREFIX.match(prefix.strip())
-    if not m:
-        raise Refused(f"amp prefix {prefix!r} names no side and role this derivation knows")
-    side = {"Left": "L", "Right": "R", None: None}[m.group(1)]
-    role = _ROLES[m.group(2).lower()]
-    return side, role, int(m.group(3) or 1)
+    if m:
+        side = {"Left": "L", "Right": "R", None: None}[m.group(1)]
+        role = _ROLES[m.group(2).lower()]
+        return side, role, int(m.group(3) or 1)
+    m = _POSITIONAL.match(prefix.strip())
+    if m:
+        return {"Left": "L", "Right": "R"}[m.group(1)], "full", _POSITIONS[m.group(2)]
+    raise Refused(f"amp prefix {prefix!r} names no side and role this derivation knows")
 
 
 # ---------------------------------------------------------------- hardware
@@ -369,7 +381,11 @@ def describe(hw, w):
     and the tuning's sample rate.
     The self-check checks the card id and the format against ALSA."""
     t = transport(hw)
-    n, s = len(w["amps"]), len(w["sense"])
+    # The graph carries the amps' sense only to a unit that takes it: spp3
+    # models from V/I, lsm2 and atsp from the program alone (their blobs
+    # have no sense channels). The self-check proves the sense map either way.
+    n = len(w["amps"])
+    s = len(w["sense"]) if w.get("unit_kind") in (None, *SENSE_UNITS) else 0
     plugin = PLUGINS.get((n, s))
     if plugin is None:
         raise Refused(f"no sgv2 plugin variant for {n} amps and {s} sense channels")
@@ -426,7 +442,13 @@ def hardware(hw):
         raise Refused("the speaker dai-link lists no amps")
     slots = tdm_slots(len(codecs), link["cpus"])
     amps, families = [], set()
+    # A lone amp with no sound-name-prefix is the one full-range speaker of
+    # a desktop Mac (J274, J375, J473, J474, J475: macaudio's mono speaker
+    # configuration). Any other amp must name itself.
+    mono = len(codecs) == 1 and "prefix" not in codecs[0]
     for c, slot in zip(codecs, slots):
+        if mono:
+            c = dict(c, prefix="Speaker")
         if "prefix" not in c:
             raise Refused(f"amp {c['node']} has no sound-name-prefix")
         fam = next((AMPS[x] for x in c.get("compatible", []) if x in AMPS), None)
@@ -448,7 +470,7 @@ def hardware(hw):
         amps.append(a)
     if len(families) != 1:
         raise Refused(f"mixed amp families on the speaker link: {sorted(f[0] for f in families)}")
-    if len(amps) == 1 and amps[0]["side"] is None:
+    if len(amps) == 1 and amps[0]["side"] is None and not mono:
         # One device-tree node for a stereo pair (the J700's MAX98360As):
         # macaudio gives a lone speaker codec two channels, and each amp
         # takes its frame half by its SD_MODE strap, left on slot 0 and
@@ -508,7 +530,8 @@ def roles(dump):
                 tags.add("tweeter")
         if len(tags) > 1:
             raise Refused(f"unit channel {k} passes both LF and HF branches")
-        out.append(("LR"[ch], tags.pop() if tags else "full"))
+        # a unit with one lane protects the one speaker of a mono Mac
+        out.append((None if len(lanes) == 1 else "LR"[ch], tags.pop() if tags else "full"))
     rs = {r for _, r in out}
     if "full" in rs and len(rs) > 1:
         raise Refused("some unit channels pass a crossover branch and some do not")

@@ -1,0 +1,87 @@
+{
+ "note": "Mac mini (M2 Pro, J474s): the sound node of arch/arm64/boot/dts/apple/t6020-j474s.dts (aurora-silicon/linux integration/aurora, public), as wiring.py reads the compiled tree (no I2C bindings: no booted Mac). Tuning lanes: the structure of the graph's input lanes only, with generic box names and no tuning values.",
+ "hw": {
+  "board": "j474s",
+  "compatible": [
+   "apple,j474s",
+   "apple,t6020",
+   "apple,arm-platform"
+  ],
+  "sound": "sound",
+  "sound_compatible": [
+   "apple,j474-macaudio",
+   "apple,j473-macaudio",
+   "apple,macaudio"
+  ],
+  "model": "Mac mini J474",
+  "links": [
+   {
+    "name": "Speaker",
+    "cpus": 1,
+    "cpu_compatible": [
+     [
+      "apple,t6020-mca",
+      "apple,t8103-mca",
+      "apple,mca"
+     ]
+    ],
+    "codecs": [
+     {
+      "node": "soc/i2c@39b044000/codec@38",
+      "compatible": [
+       "ti,sn012776",
+       "ti,tas2764"
+      ],
+      "vmon": 2,
+      "imon": 0
+     }
+    ]
+   },
+   {
+    "name": "Headphone Jack",
+    "cpus": 1,
+    "cpu_compatible": [
+     [
+      "apple,t6020-mca",
+      "apple,t8103-mca",
+      "apple,mca"
+     ]
+    ],
+    "codecs": [
+     {
+      "node": "soc/i2c@39b048000/codec@4b",
+      "prefix": "Jack",
+      "compatible": [
+       "cirrus,cs42l84"
+      ]
+     }
+    ]
+   }
+  ]
+ },
+ "tuning": {
+  "tuning": {
+   "aid": "synthetic",
+   "selection": {
+    "sample_rate": 48000,
+    "substitutions": {
+     "fs": "48000"
+    }
+   },
+   "protection": {
+    "kind": "atsp",
+    "strip_properties": [],
+    "lanes": [
+     {
+      "origin": {
+       "node": "in",
+       "port": 0,
+       "channel": 0
+      },
+      "hops": []
+     }
+    ]
+   }
+  }
+ }
+}

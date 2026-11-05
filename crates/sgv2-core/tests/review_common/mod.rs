@@ -316,7 +316,7 @@ pub fn never_above_input_sensed(
                     assert_eq!(y, 0.0, "{:?} block {b}: non-finite input passed", unit.kind());
                 } else {
                     // atsp passes its startup dezipper as the reference does
-                    // (up to its own 1.0283 peak); the output stays within
+                    // (up to its own peak at 48 kHz); the output stays within
                     // full scale
                     let over =
                         if unit.kind() == sgv2_core::UnitKind::Atsp { sgv2_core::atsp::DEZIPPER_PEAK } else { 1.0 };

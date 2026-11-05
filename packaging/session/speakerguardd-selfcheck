@@ -86,6 +86,17 @@ _ELEM_LOCK = (1 << 30) | (_ID_SIZE << 16) | (0x55 << 8) | 0x14
 TAS2764_RX = 0x0C
 TAS2764_VSNS = 0x0E
 TAS2764_ISNS = 0x0F
+# TAS2770 (sound/soc/codecs/tas2770.h): TDM_CFG_REG3 holds the left RX
+# slot in bits 3:0 (macaudio gives each amp a one-slot mask, so left is
+# its slot); TDM_CFG_REG5/6 the V and I sense TX slots, enable bit 6.
+TAS2770_RX = 0x0D
+TAS2770_VSNS = 0x0F
+TAS2770_ISNS = 0x10
+# Per amp family: (RX register, RX slot mask, V sense register, I sense register).
+AMP_REGS = {
+    "sn012776": (TAS2764_RX, 0x0F, TAS2764_VSNS, TAS2764_ISNS),
+    "tas2770": (TAS2770_RX, 0x0F, TAS2770_VSNS, TAS2770_ISNS),
+}
 
 
 def log(*a):
@@ -251,21 +262,23 @@ def check_registers(w):
     """Every amp answers on the slots the map gives it."""
     errs, seen = [], []
     for p, a in enumerate(w["amps"]):
-        if a["family"] != "sn012776":
+        regs = AMP_REGS.get(a["family"])
+        if regs is None:
             errs.append(f"{a['prefix']}: no register check for {a['family']} amps")
             continue
+        rx_reg, rx_mask, vsns, isns = regs
         if not a.get("i2c"):
             errs.append(f"{a['prefix']}: not bound to an I2C device")
             continue
-        r = regmap_values(a["i2c"], {TAS2764_RX, TAS2764_VSNS, TAS2764_ISNS})
+        r = regmap_values(a["i2c"], {rx_reg, vsns, isns})
         if len(r) != 3:
             errs.append(f"{a['prefix']} ({a['i2c']}): registers {sorted(r)} only")
             continue
-        rx = r[TAS2764_RX] & 0x0F
-        seen.append((a["prefix"], a["i2c"], r[TAS2764_RX], r[TAS2764_VSNS], r[TAS2764_ISNS]))
+        rx = r[rx_reg] & rx_mask
+        seen.append((a["prefix"], a["i2c"], r[rx_reg], r[vsns], r[isns]))
         if rx != p:
             errs.append(f"{a['prefix']} ({a['i2c']}) receives TDM slot {rx}, the map plays it on speaker channel {p}")
-        for reg, ch, what in ((TAS2764_VSNS, a["v_ch"], "V"), (TAS2764_ISNS, a["i_ch"], "I")):
+        for reg, ch, what in ((vsns, a["v_ch"], "V"), (isns, a["i_ch"], "I")):
             v = r[reg]
             if not v & 0x40:
                 errs.append(f"{a['prefix']}: {what} sense transmit is disabled")

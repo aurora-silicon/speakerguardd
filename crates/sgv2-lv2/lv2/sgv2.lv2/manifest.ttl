@@ -32,3 +32,8 @@
     a lv2:Plugin ;
     lv2:binary <libsgv2_lv2.so> ;
     rdfs:seeAlso <sgv2.ttl> .
+
+<https://aurora-silicon.org/lv2/sgv2#1ch>
+    a lv2:Plugin ;
+    lv2:binary <libsgv2_lv2.so> ;
+    rdfs:seeAlso <sgv2.ttl> .

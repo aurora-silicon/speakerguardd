@@ -16,6 +16,10 @@ pub enum Amp {
     /// TI SN012776 (tas2764): V/I sense, "Amp Gain Volume", a DVC and an
     /// "Amp Fault Status" control per amp.
     Sn012776,
+    /// TI TAS5770L (tas2770: the J274, J293, J313): V/I sense, "Amp Gain
+    /// Volume" (the same AMP_LEVEL scale as the SN012776) and a
+    /// "Speaker Playback Volume" DVC per amp, but no fault-status control.
+    Tas2770,
     /// Maxim MAX98360A (J700): fixed gain, no I2C, no fault line. The
     /// kernel's software gain is the per-amp "Speaker Playback Volume".
     Max98360a,
@@ -34,17 +38,17 @@ impl Amp {
     pub fn volume_suffix(self) -> &'static str {
         match self {
             Amp::Sn012776 => "Speaker Volume",
-            Amp::Max98360a => "Speaker Playback Volume",
+            Amp::Tas2770 | Amp::Max98360a => "Speaker Playback Volume",
         }
     }
 
     /// How many of those volume controls a card with `amps` amps has: one
-    /// per SN012776, and one for the whole MAX98360A pair (the J700's
+    /// per SN012776 or TAS5770L, and one for the whole MAX98360A pair (the J700's
     /// "Speaker Playback Volume" is a copy-time software gain on the stream,
     /// KERNEL.md 2.6, with no amp prefix).
     pub fn volume_controls(self, amps: usize) -> usize {
         match self {
-            Amp::Sn012776 => amps,
+            Amp::Sn012776 | Amp::Tas2770 => amps,
             Amp::Max98360a => 1,
         }
     }
@@ -54,7 +58,7 @@ impl Amp {
     /// can read) the operating point is the tuning's own, and only its
     /// channels' agreement is checked (see `supervise::Expect`).
     pub fn has_gain_control(self) -> bool {
-        matches!(self, Amp::Sn012776)
+        matches!(self, Amp::Sn012776 | Amp::Tas2770)
     }
 }
 
@@ -64,6 +68,7 @@ impl Amp {
     pub fn from_family(family: &str) -> Option<Amp> {
         match family {
             "sn012776" => Some(Amp::Sn012776),
+            "tas2770" => Some(Amp::Tas2770),
             "max98360a" => Some(Amp::Max98360a),
             _ => None,
         }
@@ -71,7 +76,7 @@ impl Amp {
 
     /// Whether every amp returns V/I sense (two sense channels each).
     pub fn has_sense(self) -> bool {
-        matches!(self, Amp::Sn012776)
+        matches!(self, Amp::Sn012776 | Amp::Tas2770)
     }
 }
 
@@ -161,7 +166,8 @@ mod tests {
         assert_eq!(board_from_compatible(b""), None);
         assert_eq!(Amp::from_family("sn012776"), Some(Amp::Sn012776));
         assert_eq!(Amp::from_family("max98360a"), Some(Amp::Max98360a));
-        assert_eq!(Amp::from_family("tas2770"), None);
+        assert_eq!(Amp::from_family("tas2770"), Some(Amp::Tas2770));
+        assert_eq!(Amp::from_family("ssm3515"), None);
     }
 
     #[test]
