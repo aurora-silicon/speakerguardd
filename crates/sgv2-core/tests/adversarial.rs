@@ -949,22 +949,26 @@ proptest! {
 /// boundary at which a group member's coil temperature exceeded its hard
 /// limit leaves at least 20 dB down on every channel of the group. Returns
 /// how many blocks were under the hard path.
+///
+/// `glide`: a unit whose panic is a target step through its output
+/// dezipper (atsp, rig law 4) reaches the 20 dB target, within the
+/// dezipper's fixed point `bound`, once the group has been over its hard
+/// limit for `frames`; the check applies from then on, while it stays over.
 fn check_hard_path(
     unit: &mut dyn ProtectionUnit,
     x: &[Vec<f32>],
     block: usize,
     // per host channel: (group id, hard limit)
     chans: &[(usize, f64)],
-    // a unit that decides on a window grid from frame zero (atsp): the cut
-    // must hold up to the next window boundary, where the unit decides
-    // again; None: for the whole block
-    grid: Option<usize>,
+    glide: Option<(usize, f32)>,
 ) -> usize {
     let n = x.len();
     let len = x[0].len();
+    let (settle, bound) = glide.unwrap_or((0, FAILSAFE_GAIN));
     let mut out = vec![vec![0.0f32; block]; n];
     let mut t = Telemetry::new();
-    let mut hard_groups: Vec<usize> = Vec::new();
+    // per group: the frame from which it has been over its hard limit
+    let mut hot_since: Vec<(usize, usize)> = Vec::new();
     let mut hard_blocks = 0;
     let mut done = 0;
     while done + block <= len {
@@ -976,14 +980,13 @@ fn check_hard_path(
         assert_eq!(allocs(), before);
         drop(outs);
         // the block just rendered was decided at the previous boundary
+        let mut any = false;
         for (c, &(g, _)) in chans.iter().enumerate() {
-            if !hard_groups.contains(&g) {
-                continue;
-            }
-            let upto = grid.map_or(block, |w| (w - done % w).min(block));
-            for k in 0..upto {
+            let Some(&(_, since)) = hot_since.iter().find(|h| h.0 == g) else { continue };
+            any = true;
+            for k in since.saturating_add(settle).saturating_sub(done).min(block)..block {
                 let i = x[c][done + k];
-                let lim = if i.is_finite() { (i * FAILSAFE_GAIN).abs() } else { 0.0 };
+                let lim = if i.is_finite() { (i * bound).abs() } else { 0.0 };
                 assert!(
                     out[c][k].abs() <= lim,
                     "hard path missed: ch{c} frame {} out {} in {} (group {g} over its hard limit)",
@@ -993,21 +996,33 @@ fn check_hard_path(
                 );
             }
         }
-        if !hard_groups.is_empty() {
+        if any {
             hard_blocks += 1;
         }
-        hard_groups.clear();
+        let mut hot: Vec<usize> = Vec::new();
         for (c, &(g, limit)) in chans.iter().enumerate() {
             let temp = t.channels[c].coil_temp_c as f64;
             // telemetry is f32; skip a boundary the rounding could decide
             // either way
-            if temp > limit + 1e-4 * limit.abs().max(1.0) && !hard_groups.contains(&g) {
-                hard_groups.push(g);
+            if temp > limit + 1e-4 * limit.abs().max(1.0) && !hot.contains(&g) {
+                hot.push(g);
             }
         }
         done += block;
+        hot_since.retain(|h| hot.contains(&h.0));
+        for g in hot {
+            if !hot_since.iter().any(|h| h.0 == g) {
+                hot_since.push((g, done));
+            }
+        }
     }
     hard_blocks
+}
+
+/// The atsp panic's glide (rig law 4): the dezipper reaches the 20 dB
+/// target, and its Float32 fixed point just above it, within 60 ms.
+fn atsp_glide(rate: u32) -> Option<(usize, f32)> {
+    Some(((0.06 * rate as f64) as usize, FAILSAFE_GAIN * 1.03))
 }
 
 /// atsp's channel groups as SPEC-ATSP 4 routes them: the first slot (A, B,
@@ -1662,7 +1677,7 @@ proptest! {
         let mut u = atsp::Unit::new(p);
         prop_assert!(!u.is_failsafe());
         // host-block mode (`block_frames = 0`) decides once per host call
-        check_hard_path(&mut u, &x, if blk == 0 { call } else { blk as usize }, &chans, Some(atsp::window_frames(rate as f64)));
+        check_hard_path(&mut u, &x, if blk == 0 { call } else { blk as usize }, &chans, atsp_glide(rate));
     }
 
     /// lsm2's temperature axis follows spec 6.1's linear-in-dB knee from
@@ -2038,7 +2053,7 @@ fn hard_path_anchors_are_reached() {
         }
         let x = signal(seed, 2, 48_000 * 4, 2.0, Hostility::Clean);
         let chans = atsp_hard_groups(&p, 2);
-        hits += check_hard_path(&mut atsp::Unit::new(p), &x, 512, &chans, Some(atsp::window_frames(48_000.0)));
+        hits += check_hard_path(&mut atsp::Unit::new(p), &x, 512, &chans, atsp_glide(48_000));
     }
     assert!(hits > 100, "the atsp hard-path property never saw the hard path ({hits} blocks)");
 }

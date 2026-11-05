@@ -71,7 +71,7 @@ use crate::{
 };
 
 /// The 25G83 dezipper's settled value at 48 kHz (its Float32 fixed point;
-/// rate and path dependent). The engine caps the applied gain at unity.
+/// rate and path dependent).
 pub const NOMINAL_TRIM: f32 = 1.006_007_7;
 /// The output dezipper's low pass (rig-confirmed, bit-exact on 25G83): an
 /// RBJ low pass at exactly 20 Hz, Q 0.6513333.
@@ -452,10 +452,6 @@ struct Chan {
     p_post: f64,
     limiting: bool,
     panic: bool,
-    /// This channel or one linked to it is in the panic: the applied gain is
-    /// held at the panic target at once (stricter than the reference, whose
-    /// dezipper takes about 40 ms to reach it).
-    capped: bool,
     /// The last window's unsmoothed request.
     request: f64,
     /// The smoothed per-channel target.
@@ -481,7 +477,6 @@ impl Chan {
             p_post: 0.0,
             limiting: false,
             panic: false,
-            capped: false,
             request: 1.0,
             target: 1.0,
             linked: 1.0,
@@ -533,6 +528,10 @@ impl Chan {
             self.target += k.ka * (r - self.target);
         } else if r > self.target {
             self.target += k.kr * (r - self.target);
+        }
+        // the panic overrides the follower on every window it holds
+        if t_post > k.hard_limit || t_post.is_nan() {
+            self.target = PANIC_GAIN as f32 as f64;
         }
     }
 
@@ -690,7 +689,6 @@ impl Run {
             let m = lk[..n].iter().fold(1.0f64, |m, &r| nan_min(m, r));
             lk[..n].iter_mut().for_each(|r| *r = m);
         }
-        self.caps();
         for (c, ch) in self.ch.iter_mut().enumerate() {
             let cur = ch.current(self.win);
             ch.ramp_from = cur;
@@ -699,30 +697,6 @@ impl Run {
         }
         if !self.ch.iter().all(Chan::finite) {
             self.fault = true;
-        }
-    }
-
-    /// The panic caps, linked as the targets are: a channel is capped while
-    /// it or a channel linked to it is in the panic, decided at each window
-    /// of the grid (so on no host slicing).
-    fn caps(&mut self) {
-        let n = self.n;
-        let mut pan = [false; MAX_CHANNELS];
-        for (c, ch) in self.ch.iter().enumerate() {
-            pan[c] = ch.panic;
-        }
-        for s in 0..3 {
-            if self.link_slot[s] && self.ch.iter().any(|c| c.k.slot == s && c.panic) {
-                for (c, ch) in self.ch.iter().enumerate() {
-                    pan[c] |= ch.k.slot == s;
-                }
-            }
-        }
-        if self.link_all && pan[..n].iter().any(|&p| p) {
-            pan[..n].iter_mut().for_each(|p| *p = true);
-        }
-        for (c, ch) in self.ch.iter_mut().enumerate() {
-            ch.capped = pan[c];
         }
     }
 
@@ -761,9 +735,7 @@ impl Run {
                     let x = if active < self.mute { 0.0 } else { target };
                     // the dezipper's trajectory passes as the reference's
                     // does, bounded at its startup peak
-                    let y = d.step(x).min(DEZIPPER_PEAK);
-                    let y = if ch.capped { y.min(PANIC_GAIN as f32) } else { y };
-                    let o = io.input[c][k] * y;
+                    let o = io.input[c][k] * d.step(x).min(DEZIPPER_PEAK);
                     let om = crate::dsp::meter1(o) as f64;
                     eo += om * om;
                     io.output[c][k] = crate::dsp::bound1(o);
