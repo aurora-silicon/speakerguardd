@@ -187,7 +187,21 @@ mod tests {
         assert!(machine_for("j316c", &b).is_err());
         assert!(machine_for("j999", &Bind { method: "hand".into(), ..new.clone() }).is_err());
         assert!(machine_for("j999", &Bind { method: "derived-static".into(), ..new.clone() }).is_err());
-        assert!(machine_for("j999", &Bind { family: "tas2770".into(), ..new.clone() }).is_err());
+        assert!(machine_for("j999", &Bind { family: "tas3000".into(), ..new.clone() }).is_err());
+        // the TAS5770L Macs (J274, J293, J313): V/I sense, proven with it
+        let tas = Bind {
+            board: "j293".into(),
+            card: "AppleJ293".into(),
+            amps: 4,
+            sense: 8,
+            family: "tas2770".into(),
+            ..b.clone()
+        };
+        let m = machine_for("j293", &tas).unwrap();
+        assert_eq!((m.amps, m.amp), (4, Amp::Tas2770));
+        assert!(m.amp.has_gain_control() && m.amp.has_sense() && !m.amp.reports_faults());
+        assert_eq!((m.amp.volume_suffix(), m.amp.operating_volume()), ("Speaker Playback Volume", 201));
+        assert!(machine_for("j293", &Bind { sense: 0, method: "derived-static".into(), ..tas }).is_err());
         assert!(machine_for("j999", &Bind { sense: 0, ..new.clone() }).is_err());
         assert!(machine_for("j999", &Bind { amps: 0, sense: 0, ..new.clone() }).is_err());
         // a fixed-gain pair without sense: derived, nothing to prove silently

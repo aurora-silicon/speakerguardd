@@ -104,6 +104,8 @@ def pipewire_conf(m, c, w, source=None):
     # filter-chain feeds capture channel i to inputs[i] and playback channel
     # j from outputs[j]: the lists put each physical channel on its unit port.
     unit, sense_ports, whash = w[:3]
+    # the graph carries sense only to a unit that takes it (wiring.describe)
+    sense_ports = sense_ports if sense else []
     inputs = [f'"sgv2:in_{unit[p]}"' for p in range(amps)] + [f'"sgv2:sense_{s}"' for s in sense_ports]
     outputs = [f'"sgv2:out_{unit[p]}"' for p in range(amps)]
     sense_obj = ""

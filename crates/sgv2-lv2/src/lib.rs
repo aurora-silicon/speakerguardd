@@ -75,6 +75,7 @@ pub enum Role {
 
 /// Plugin variants: (URI, channels, sense channels, role).
 pub const VARIANTS: &[(&str, usize, usize, Role)] = &[
+    ("https://aurora-silicon.org/lv2/sgv2#1ch\0", 1, 0, Role::Protect),
     ("https://aurora-silicon.org/lv2/sgv2#2ch\0", 2, 0, Role::Protect),
     ("https://aurora-silicon.org/lv2/sgv2#2ch-vi\0", 2, 4, Role::Protect),
     ("https://aurora-silicon.org/lv2/sgv2#4ch\0", 4, 0, Role::Protect),
@@ -427,8 +428,9 @@ macro_rules! descriptor {
     };
 }
 
-static DESCRIPTORS: [Lv2Descriptor; 6] =
-    [descriptor!(0), descriptor!(1), descriptor!(2), descriptor!(3), descriptor!(4), descriptor!(5)];
+static DESCRIPTORS: [Lv2Descriptor; 7] =
+    [descriptor!(0), descriptor!(1), descriptor!(2), descriptor!(3), descriptor!(4), descriptor!(5), descriptor!(6)];
+const _: () = assert!(DESCRIPTORS.len() == VARIANTS.len());
 
 /// The LV2 entry point.
 #[no_mangle]

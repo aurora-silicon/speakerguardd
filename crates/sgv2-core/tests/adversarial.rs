@@ -234,6 +234,14 @@ fn slices(seed: u64) -> Vec<usize> {
         .collect()
 }
 
+/// Host slicings within one atsp staging family (SPEC-ATSP 10): calls
+/// shorter than a controller window of `win` frames, or whole multiples of
+/// the two-window staging buffer.
+fn atsp_family_slices(seed: u64, win: usize, staged: bool) -> Vec<usize> {
+    let mut r = Rng(seed ^ 0xa75);
+    (0..64).map(|_| if staged { 2 * win * (1 + r.below(8)) } else { 1 + r.below(win - 1) }).collect()
+}
+
 // ---------------------------------------------------------------------------
 // Synthetic parameter sets, around the crate's own test builders.
 
@@ -891,13 +899,17 @@ proptest! {
     fn atsp_slice_invariant(
         seed in any::<u64>(), n in 1usize..=8, blk in block(), rate in rate(),
         len in 1usize..30_000, amp in 0.01f32..4.0, h in finite_hostility(), a in any::<u64>(), b in any::<u64>(),
+        staged in any::<bool>(),
     ) {
+        // SPEC-ATSP 10: the output depends on the host slice only through
+        // its staging family; within one family any slicing is the same
         let p = atsp_params(seed, n, blk, rate, true);
+        let win = atsp::window_frames(rate as f64);
         let x = signal(seed ^ 1, n, len, amp, h);
         let mut u1 = atsp::Unit::new(p);
-        let r1 = render(&mut u1, &x, None, &slices(a), &mut no_sense, false);
+        let r1 = render(&mut u1, &x, None, &atsp_family_slices(a, win, staged), &mut no_sense, false);
         let mut u2 = atsp::Unit::new(p);
-        let r2 = render(&mut u2, &x, None, &slices(b), &mut no_sense, false);
+        let r2 = render(&mut u2, &x, None, &atsp_family_slices(b, win, staged), &mut no_sense, false);
         prop_assert!(bits(&r1.out) == bits(&r2.out), "audio differs between slicings");
         prop_assert_eq!(tele_bits(&r1.tele[0].1), tele_bits(&r2.tele[0].1));
         // reset returns the thermal and gain state to `new`'s; the output
@@ -905,8 +917,8 @@ proptest! {
         // took the same path
         u1.reset();
         u2.reset();
-        let r3 = render(&mut u1, &x, None, &slices(b), &mut no_sense, false);
-        let r4 = render(&mut u2, &x, None, &slices(a), &mut no_sense, false);
+        let r3 = render(&mut u1, &x, None, &atsp_family_slices(b, win, staged), &mut no_sense, false);
+        let r4 = render(&mut u2, &x, None, &atsp_family_slices(a, win, staged), &mut no_sense, false);
         prop_assert!(bits(&r3.out) == bits(&r4.out), "audio differs after reset");
         prop_assert_eq!(tele_bits(&r3.tele[0].1), tele_bits(&r4.tele[0].1));
     }
@@ -943,6 +955,10 @@ fn check_hard_path(
     block: usize,
     // per host channel: (group id, hard limit)
     chans: &[(usize, f64)],
+    // a unit that decides on a window grid from frame zero (atsp): the cut
+    // must hold up to the next window boundary, where the unit decides
+    // again; None: for the whole block
+    grid: Option<usize>,
 ) -> usize {
     let n = x.len();
     let len = x[0].len();
@@ -964,7 +980,8 @@ fn check_hard_path(
             if !hard_groups.contains(&g) {
                 continue;
             }
-            for k in 0..block {
+            let upto = grid.map_or(block, |w| (w - done % w).min(block));
+            for k in 0..upto {
                 let i = x[c][done + k];
                 let lim = if i.is_finite() { (i * FAILSAFE_GAIN).abs() } else { 0.0 };
                 assert!(
@@ -998,6 +1015,8 @@ fn check_hard_path(
 /// when linked globally, one per linked slot, else one per channel. Per
 /// host channel: (group id, hard limit).
 fn atsp_hard_groups(p: &atsp::Params, n: usize) -> Vec<(usize, f64)> {
+    // the unit runs every constant held to its published range
+    let p = &p.clamped();
     (0..n)
         .map(|c| {
             let si = (0..3).find(|&si| p.slot[si].channel_mask & (1 << c) != 0).unwrap_or(0);
@@ -1643,7 +1662,7 @@ proptest! {
         let mut u = atsp::Unit::new(p);
         prop_assert!(!u.is_failsafe());
         // host-block mode (`block_frames = 0`) decides once per host call
-        check_hard_path(&mut u, &x, if blk == 0 { call } else { blk as usize }, &chans);
+        check_hard_path(&mut u, &x, if blk == 0 { call } else { blk as usize }, &chans, Some(atsp::window_frames(rate as f64)));
     }
 
     /// lsm2's temperature axis follows spec 6.1's linear-in-dB knee from
@@ -2019,7 +2038,7 @@ fn hard_path_anchors_are_reached() {
         }
         let x = signal(seed, 2, 48_000 * 4, 2.0, Hostility::Clean);
         let chans = atsp_hard_groups(&p, 2);
-        hits += check_hard_path(&mut atsp::Unit::new(p), &x, 512, &chans);
+        hits += check_hard_path(&mut atsp::Unit::new(p), &x, 512, &chans, Some(atsp::window_frames(48_000.0)));
     }
     assert!(hits > 100, "the atsp hard-path property never saw the hard path ({hits} blocks)");
 }

@@ -139,7 +139,7 @@ impl Supervisor {
         }
         let want = x.amp.operating_volume();
         Ok(v.iter()
-            .find(|l| l.value != want || (x.amp == Amp::Sn012776 && l.centi_db != Some(0)))
+            .find(|l| l.value != want || (x.amp.volume_is_db() && l.centi_db != Some(0)))
             .map(|l| format!("granted, but {} is at {} ({:?} cdB), not {want}", l.amp, l.value, l.centi_db)))
     }
 
@@ -225,6 +225,34 @@ mod tests {
     /// The J316 with a blob for gain 15 (18.5 dBV, 11.89 V peak).
     fn j316() -> Supervisor {
         Supervisor::new(Expect::new(sn6(), vec![11_890; 6], "Secondary"))
+    }
+
+    /// A four-amp TAS5770L Mac (the J293 shape, atsp): gain 15 read back
+    /// from "Amp Gain Volume", the DVC "Speaker Playback Volume" at 201
+    /// (0 dB) under a grant, and no fault-status controls to require.
+    #[test]
+    fn a_tas2770_mac_grants_without_fault_controls_and_holds_its_volume() {
+        let m = &Machine { board: "t4", card_id: "AppleT4", amps: 4, amp: Amp::Tas2770 };
+        let mut k = Recorder::healthy(4);
+        k.amp_faults.clear();
+        k.volume = Some(("Speaker Playback Volume".into(), (201, Some(0)), (161, Some(-2000))));
+        let mut s = Supervisor::new(Expect::new(m, vec![11_890; 4], "Secondary"));
+        assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::StayedReleased));
+        assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Granted));
+        assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Renewed));
+        // a granted amp off the operating volume releases to the floor
+        k.volume = Some(("Speaker Playback Volume".into(), (200, Some(-50)), (161, Some(-2000))));
+        assert!(matches!(s.tick(CLEAN, &mut k), Ok(Event::Released { .. }) | Ok(Event::HardFault(_))));
+        assert!(!k.held);
+        // a blob for another operating point never grants
+        let mut k = Recorder::healthy(4);
+        k.amp_faults.clear();
+        k.volume = Some(("Speaker Playback Volume".into(), (201, Some(0)), (161, Some(-2000))));
+        let mut s = Supervisor::new(Expect::new(m, vec![8_913; 4], "Secondary"));
+        for _ in 0..4 {
+            assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::StayedReleased));
+        }
+        assert!(s.problem().unwrap().contains("operating point"), "{:?}", s.problem());
     }
 
     #[test]

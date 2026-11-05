@@ -172,6 +172,8 @@ def main(argv):
         blob = blobs.get(f"{unit}-aid{aid}", blobs.get(unit))
         if blob:
             args += ["--blob", blob]
+        if unit == "atsp" and meta.get("sr"):
+            args += ["--rate", str(meta["sr"])]
         if c.get("limit_frames"):
             args += ["--limit-frames", str(c["limit_frames"])]
         for pp in c.get("preset_params", []):

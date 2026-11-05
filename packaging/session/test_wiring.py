@@ -319,7 +319,9 @@ def fake_dt(root, hw, jack_card=False):
             node(d + "/cpu", {"sound-dai": u32(*[w for b, c in enumerate(cpus) for w in (backend(c), b)])})
             phs = []
             for c in l["codecs"]:
-                props = {"sound-name-prefix": strs(c["prefix"]), "compatible": strs(*c["compatible"]), "#sound-dai-cells": u32(0)}
+                props = {"compatible": strs(*c["compatible"]), "#sound-dai-cells": u32(0)}
+                if "prefix" in c:
+                    props["sound-name-prefix"] = strs(c["prefix"])
                 for k in ("vmon", "imon"):
                     if k in c:
                         props[f"ti,{k}-slot-no"] = u32(c[k])
@@ -330,6 +332,107 @@ def fake_dt(root, hw, jack_card=False):
     if jack_card:
         jack = {"name": "Headphone Jack", "cpus": 1, "codecs": [{"node": "soc/jack", "prefix": "Jack", "compatible": ["cirrus,cs42l84"]}]}
         card("sound-jack", [jack], hw["model"] + " Jack", ["apple,test-macaudio-jack", "apple,macaudio"])
+
+
+class Atsp(unittest.TestCase):
+    """The atsp Macs (SPEC-ATSP 7): every one derives from its device tree
+    and tuning alone, with nothing written for the board."""
+
+    BOARDS = {
+        # key: (unit channels by physical channel, plugin, amp family)
+        "j293": ([0, 1, 2, 3], "4ch", "tas2770"),
+        "j493": ([0, 1, 2, 3], "4ch", "sn012776"),
+        "j313": ([0, 1], "2ch", "tas2770"),
+        "j274": ([0], "1ch", "tas2770"),
+        "j375": ([0], "1ch", "sn012776"),
+        "j473": ([0], "1ch", "sn012776"),
+        "j474": ([0], "1ch", "sn012776"),
+        "j475": ([0], "1ch", "sn012776"),
+    }
+
+    def test_every_atsp_board_derives(self):
+        for m, (unit, plugin, family) in self.BOARDS.items():
+            f = fx(m)
+            w = wiring.derive(f["hw"], f["tuning"])
+            c = wiring.describe(f["hw"], w)
+            self.assertEqual((w["unit_kind"], w["unit_channels"], w["family"]), ("atsp", unit, family), m)
+            # atsp takes no V/I: the graph carries none, the plugin has none
+            self.assertEqual((c["plugin"], c["sense"]), (plugin, 0), m)
+            # but the amps have sense, so the self-check can prove the map
+            self.assertEqual(len(w["sense"]), 2 * len(w["amps"]), m)
+            self.assertEqual(wiring.role_errors(w, wiring.roles(f["tuning"])["channels"]), [], m)
+
+    def test_four_channel_order_is_upper_then_lower(self):
+        # AID3/AID18: upper-left, upper-right, lower-left, lower-right
+        for m in ("j293", "j493"):
+            w = wiring.derive(fx(m)["hw"], fx(m)["tuning"])
+            by_unit = {a["unit"]: a["prefix"] for a in w["amps"]}
+            self.assertEqual([by_unit[u] for u in range(4)], ["Left Front", "Right Front", "Left Rear", "Right Rear"], m)
+
+    def test_positional_prefixes(self):
+        self.assertEqual(wiring.parse_prefix("Left Front"), ("L", "full", 1))
+        self.assertEqual(wiring.parse_prefix("Right Rear"), ("R", "full", 2))
+        self.assertEqual(wiring.parse_prefix("Left Upper"), ("L", "full", 1))
+        self.assertEqual(wiring.parse_prefix("Right Lower"), ("R", "full", 2))
+        self.assertEqual(wiring.parse_prefix("Left"), ("L", "full", 1))
+        for bad in ("Front Left", "Front", "Left Middle", "Centre"):
+            with self.assertRaises(wiring.Refused):
+                wiring.parse_prefix(bad)
+
+    def test_mono_needs_one_amp_and_one_lane(self):
+        f = fx("j274")
+        self.assertNotIn("prefix", f["hw"]["links"][0]["codecs"][0])
+        w = wiring.derive(f["hw"], f["tuning"])
+        self.assertEqual((w["amps"][0]["side"], w["amps"][0]["role"]), (None, "full"))
+        # a stereo tuning on a mono desktop is refused, not guessed
+        t = fx("j313")["tuning"]
+        with self.assertRaises(wiring.Refused):
+            wiring.derive(f["hw"], t)
+        # two amps without prefixes are not a mono desktop
+        h = copy.deepcopy(f["hw"])
+        c = copy.deepcopy(h["links"][0]["codecs"][0])
+        c.update(node="x", vmon=6, imon=4)
+        h["links"][0]["codecs"].append(c)
+        with self.assertRaises(wiring.Refused) as cm:
+            wiring.derive(h, fx("j313")["tuning"])
+        self.assertIn("no sound-name-prefix", str(cm.exception))
+
+    def test_tas2770_register_check(self):
+        w = wiring.derive(fx("j313")["hw"], fx("j313")["tuning"])
+        for p, a in enumerate(w["amps"]):
+            a["i2c"] = f"1-003{p}"
+        # TAS2770: TDM_CFG_REG3 0x0D (RX slot), REG5 0x0F (VSNS), REG6 0x10 (ISNS)
+        good = {"1-0030": {0x0D: 0x00, 0x0F: 0x42, 0x10: 0x40}, "1-0031": {0x0D: 0x11, 0x0F: 0x46, 0x10: 0x44}}
+        saved = sgsc.regmap_values
+        try:
+            sgsc.regmap_values = lambda i2c, regs: {r: v for r, v in good[i2c].items() if r in regs}
+            errs, seen = sgsc.check_registers(w)
+            self.assertEqual(errs, [])
+            self.assertEqual(len(seen), 2)
+            bad = copy.deepcopy(good)
+            bad["1-0031"][0x0D] = 0x00
+            bad["1-0030"][0x10] = 0x00
+            sgsc.regmap_values = lambda i2c, regs: {r: v for r, v in bad[i2c].items() if r in regs}
+            errs, _ = sgsc.check_registers(w)
+            self.assertEqual(len(errs), 2, errs)
+            self.assertTrue(any("receives TDM slot 0" in e for e in errs), errs)
+            self.assertTrue(any("I sense transmit is disabled" in e for e in errs), errs)
+        finally:
+            sgsc.regmap_values = saved
+
+    def test_integration_dtbs(self):
+        """With SGV2_DTB_DIR naming a directory of the kernel's compiled
+        device trees, every atsp board derives from its .dtb exactly as its
+        fixture does."""
+        d = os.environ.get("SGV2_DTB_DIR")
+        if not d:
+            self.skipTest("SGV2_DTB_DIR is not set")
+        dtbs = {"j293": "t8103-j293", "j313": "t8103-j313", "j493": "t8112-j493", "j274": "t8103-j274",
+                "j375": "t6001-j375c", "j473": "t8112-j473", "j474": "t6020-j474s", "j475": "t6021-j475c"}
+        for m, name in dtbs.items():
+            hw = wiring.read_dtb(os.path.join(d, name + ".dtb"))
+            w = wiring.derive(hw, fx(m)["tuning"])
+            self.assertEqual(w["hash"], wiring.derive(fx(m)["hw"], fx(m)["tuning"])["hash"], m)
 
 
 class DeviceTree(unittest.TestCase):

@@ -1,0 +1,78 @@
+{
+ "note": "Mac mini (M2, J473): the sound node of arch/arm64/boot/dts/apple/t8112-j473.dts (aurora-silicon/linux integration/aurora, public), as wiring.py reads the compiled tree (no I2C bindings: no booted Mac). Tuning lanes: the structure of the graph's input lanes only, with generic box names and no tuning values.",
+ "hw": {
+  "board": "j473",
+  "compatible": [
+   "apple,j473",
+   "apple,t8112",
+   "apple,arm-platform"
+  ],
+  "sound": "sound",
+  "sound_compatible": [
+   "apple,j473-macaudio",
+   "apple,macaudio"
+  ],
+  "model": "Mac mini J473",
+  "links": [
+   {
+    "name": "Speaker",
+    "cpus": 1,
+    "cpu_compatible": [
+     [
+      "apple,t8112-mca",
+      "apple,mca"
+     ]
+    ],
+    "codecs": [
+     {
+      "node": "soc/i2c@235014000/codec@38",
+      "compatible": [
+       "ti,sn012776",
+       "ti,tas2764"
+      ],
+      "vmon": 2,
+      "imon": 0
+     }
+    ]
+   },
+   {
+    "name": "Headphone Jack",
+    "cpus": 1,
+    "cpu_compatible": [
+     [
+      "apple,t8112-mca",
+      "apple,mca"
+     ]
+    ],
+    "codecs": [
+     {
+      "node": "soc/i2c@235014000/codec@4b",
+      "prefix": "Jack",
+      "compatible": [
+       "cirrus,cs42l84"
+      ]
+     }
+    ]
+   }
+  ]
+ },
+ "tuning": {
+  "tuning": {
+   "aid": "synthetic",
+   "protection": {
+    "kind": "atsp",
+    "strip_properties": [],
+    "lanes": [
+     {
+      "origin": {
+       "node": "in",
+       "port": 0,
+       "channel": 0
+      },
+      "hops": []
+     }
+    ]
+   }
+  }
+ }
+}

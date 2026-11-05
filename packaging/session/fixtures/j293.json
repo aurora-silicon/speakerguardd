@@ -1,0 +1,181 @@
+{
+ "note": "MacBook Pro 13-inch (M1, J293): the sound node of arch/arm64/boot/dts/apple/t8103-j293.dts (aurora-silicon/linux integration/aurora, public), as wiring.py reads the compiled tree (no I2C bindings: no booted Mac). Tuning lanes: the structure of the graph's input lanes only, with generic box names and no tuning values.",
+ "hw": {
+  "board": "j293",
+  "compatible": [
+   "apple,j293",
+   "apple,t8103",
+   "apple,arm-platform"
+  ],
+  "sound": "sound",
+  "sound_compatible": [
+   "apple,j293-macaudio",
+   "apple,macaudio"
+  ],
+  "model": "MacBook Pro J293",
+  "links": [
+   {
+    "name": "Speakers",
+    "cpus": 2,
+    "cpu_compatible": [
+     [
+      "apple,t8103-mca",
+      "apple,mca"
+     ],
+     [
+      "apple,t8103-mca",
+      "apple,mca"
+     ]
+    ],
+    "codecs": [
+     {
+      "node": "soc/i2c@235014000/codec@32",
+      "prefix": "Left Front",
+      "compatible": [
+       "ti,tas5770l",
+       "ti,tas2770"
+      ],
+      "vmon": 2,
+      "imon": 0
+     },
+     {
+      "node": "soc/i2c@235014000/codec@31",
+      "prefix": "Left Rear",
+      "compatible": [
+       "ti,tas5770l",
+       "ti,tas2770"
+      ],
+      "vmon": 10,
+      "imon": 8
+     },
+     {
+      "node": "soc/i2c@23501c000/codec@35",
+      "prefix": "Right Front",
+      "compatible": [
+       "ti,tas5770l",
+       "ti,tas2770"
+      ],
+      "vmon": 6,
+      "imon": 4
+     },
+     {
+      "node": "soc/i2c@23501c000/codec@34",
+      "prefix": "Right Rear",
+      "compatible": [
+       "ti,tas5770l",
+       "ti,tas2770"
+      ],
+      "vmon": 14,
+      "imon": 12
+     }
+    ]
+   },
+   {
+    "name": "Headphone Jack",
+    "cpus": 1,
+    "cpu_compatible": [
+     [
+      "apple,t8103-mca",
+      "apple,mca"
+     ]
+    ],
+    "codecs": [
+     {
+      "node": "soc/i2c@235018000/codec@48",
+      "prefix": "Jack",
+      "compatible": [
+       "cirrus,cs42l83"
+      ]
+     }
+    ]
+   }
+  ]
+ },
+ "tuning": {
+  "tuning": {
+   "aid": "synthetic",
+   "protection": {
+    "kind": "atsp",
+    "strip_properties": [],
+    "lanes": [
+     {
+      "origin": {
+       "node": "in",
+       "port": 0,
+       "channel": 0
+      },
+      "hops": [
+       {
+        "join": "Join",
+        "input": 0,
+        "channel": 0
+       },
+       {
+        "join": "Join",
+        "input": 0,
+        "channel": 0
+       }
+      ]
+     },
+     {
+      "origin": {
+       "node": "in",
+       "port": 0,
+       "channel": 1
+      },
+      "hops": [
+       {
+        "join": "Join",
+        "input": 1,
+        "channel": 1
+       },
+       {
+        "join": "Join",
+        "input": 1,
+        "channel": 1
+       }
+      ]
+     },
+     {
+      "origin": {
+       "node": "in",
+       "port": 0,
+       "channel": 0
+      },
+      "hops": [
+       {
+        "join": "Join",
+        "input": 0,
+        "channel": 0
+       },
+       {
+        "join": "Join",
+        "input": 2,
+        "channel": 2
+       }
+      ]
+     },
+     {
+      "origin": {
+       "node": "in",
+       "port": 0,
+       "channel": 1
+      },
+      "hops": [
+       {
+        "join": "Join",
+        "input": 1,
+        "channel": 1
+       },
+       {
+        "join": "Join",
+        "input": 3,
+        "channel": 3
+       }
+      ]
+     }
+    ]
+   }
+  }
+ }
+}

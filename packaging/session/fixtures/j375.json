@@ -1,0 +1,78 @@
+{
+ "note": "Mac Studio (M1 Max, J375c): the sound node of arch/arm64/boot/dts/apple/t6001-j375c.dts (aurora-silicon/linux integration/aurora, public), as wiring.py reads the compiled tree (no I2C bindings: no booted Mac). Tuning lanes: the structure of the graph's input lanes only, with generic box names and no tuning values.",
+ "hw": {
+  "board": "j375c",
+  "compatible": [
+   "apple,j375c",
+   "apple,t6001",
+   "apple,arm-platform"
+  ],
+  "sound": "sound",
+  "sound_compatible": [
+   "apple,j375-macaudio",
+   "apple,macaudio"
+  ],
+  "model": "Mac Studio J375",
+  "links": [
+   {
+    "name": "Speaker",
+    "cpus": 1,
+    "cpu_compatible": [
+     [
+      "apple,t6000-mca",
+      "apple,mca"
+     ]
+    ],
+    "codecs": [
+     {
+      "node": "soc/i2c@39b044000/codec@38",
+      "compatible": [
+       "ti,sn012776",
+       "ti,tas2764"
+      ],
+      "vmon": 2,
+      "imon": 0
+     }
+    ]
+   },
+   {
+    "name": "Headphone Jack",
+    "cpus": 1,
+    "cpu_compatible": [
+     [
+      "apple,t6000-mca",
+      "apple,mca"
+     ]
+    ],
+    "codecs": [
+     {
+      "node": "soc/i2c@39b048000/codec@4b",
+      "prefix": "Jack",
+      "compatible": [
+       "cirrus,cs42l84"
+      ]
+     }
+    ]
+   }
+  ]
+ },
+ "tuning": {
+  "tuning": {
+   "aid": "synthetic",
+   "protection": {
+    "kind": "atsp",
+    "strip_properties": [],
+    "lanes": [
+     {
+      "origin": {
+       "node": "in",
+       "port": 0,
+       "channel": 0
+      },
+      "hops": []
+     }
+    ]
+   }
+  }
+ }
+}
