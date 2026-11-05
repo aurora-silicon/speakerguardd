@@ -59,6 +59,12 @@
  "tuning": {
   "tuning": {
    "aid": "synthetic",
+   "selection": {
+    "sample_rate": 48000,
+    "substitutions": {
+     "fs": "48000"
+    }
+   },
    "protection": {
     "kind": "atsp",
     "strip_properties": [],

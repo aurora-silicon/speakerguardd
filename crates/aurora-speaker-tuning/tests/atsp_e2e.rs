@@ -141,9 +141,12 @@ fn every_shape_compiles_loads_in_its_plugin_and_protects() {
             }
             last = outs[0][511] / x;
         }
-        // the panic acts once the post-gain coil is over the hard limit
-        // (115 + 8), so it can pass it by what one window adds
-        assert!(peak > 115.0 && peak < 115.0 + 8.0 + 1.0, "{}: peak coil {peak}", s.name);
+        // the panic acts at the first 5 ms tick that sees the post-gain coil
+        // over the hard limit (115 + 8), so it can pass it by what full
+        // drive adds over one tick, one post-gain window and the dezipper's
+        // glide (about 25 ms at most Rvc P / tau_vc = 30 * 13.5 / 1.5 =
+        // 270 C/s)
+        assert!(peak > 115.0 && peak < 115.0 + 8.0 + 0.025 * 270.0, "{}: peak coil {peak}", s.name);
         assert!(last < 0.9, "{}: gain {last} after a minute of a hot program", s.name);
         // linked channels share one gain
         if s.channels > 1 {
