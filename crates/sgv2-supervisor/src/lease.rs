@@ -18,8 +18,9 @@ pub struct Observation {
     pub carrier_ok: bool,
     /// The speaker PCM is owned by the process hosting the plugin.
     pub pcm_owner_ok: bool,
-    /// The speaker PCM is Closed, Open (setup, prepared) or Running. Stopped
-    /// (XRUN, paused, suspended) or unknown is not.
+    /// The speaker PCM is Closed, Open (setup, prepared) or Running, or in
+    /// an XRUN the sink is recovering from (no longer than the heartbeat
+    /// bound). Stopped (paused, suspended), a longer XRUN or unknown is not.
     pub pcm_state_ok: bool,
     /// The speaker mux selects the watched PCM (from the kernel).
     pub route_ok: bool,
