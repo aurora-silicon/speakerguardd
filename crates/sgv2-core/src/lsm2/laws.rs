@@ -169,15 +169,18 @@ pub fn velocity_limit(e: f32, k: &[f32; 4], v: &[f32; 3], vmax: f32) -> f32 {
 /// `s`, find the worst sample, orient every band's contribution to its sign
 /// and water-fill the active bands (`active`) into the room the ignored
 /// bands leave; repeat until the waveform is within `vlim`. Returns each
-/// band's gain relative to `s` (ignored bands 1), before the floor.
+/// band's gain relative to `s` (ignored bands 1), before the floor. The
+/// ordinary solve starts from unity; the post-retarget solve (residuals
+/// 5.2) from a lane-selective `seed`.
 pub fn velocity_band_gains(
     vb: &[alloc::vec::Vec<f32>; 5],
     first: usize,
     vlim: f32,
     s: f32,
     active: (usize, usize),
+    seed: [f32; 5],
 ) -> [f32; 5] {
-    let mut g = [1.0f32; 5];
+    let mut g = seed;
     let n = vb[0].len();
     if first >= n {
         return g;
@@ -262,6 +265,18 @@ pub struct BandGain {
 impl BandGain {
     pub const fn unity(len: u32) -> Self {
         BandGain { g: 1.0, start: 1.0, target: 1.0, request: 1.0, n: len, len }
+    }
+    /// The request the follower keeps (its release target).
+    pub fn requested(&self) -> f32 {
+        self.request
+    }
+    /// The gain after `n` more samples with release `a`, state unchanged.
+    pub fn end_after(&self, n: usize, a: f32) -> f32 {
+        let mut b = *self;
+        for _ in 0..n {
+            b.sample(a);
+        }
+        b.g
     }
     /// A new request at a decision.
     pub fn request(&mut self, req: f32) {

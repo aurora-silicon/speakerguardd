@@ -108,15 +108,15 @@
 //! and the slow gain to the next stream, cooled for the gap.
 //!
 //! Known residuals against 25G83 (rig report):
-//! - velocity (residuals 5): the signed worst-sample allocation holds the
-//!   limit, allocated to 0.99 of it (interim guard for the attack
-//!   transient); on low-frequency tones the reference's onset cut is deeper
-//!   and its 20 s releases keep it, so it settles at 0.64-0.82 x the limit
-//!   where this unit settles at 0.92-1.0 x (Daybreak t-4709);
-//! - output ceiling: held to 0.99 of the ceiling's rise over ambient
-//!   (interim guard until Daybreak t-4704), at or below the reference;
-//! - the masker lattice is an input extracted from the Mac's macOS
-//!   (Daybreak t-4702); without it there is no masking credit;
+//! - velocity (residuals 5, 5.2): the signed allocation with the
+//!   post-retarget seeded solve. Interim safety layer: it allocates to 0.99
+//!   of the limit. On fb3-p30 and fb6-p62 this unit settles at 0.99-1.0 x
+//!   the limit where the reference keeps 0.79-0.82 x;
+//! - output ceiling (residuals 2.4, native order): exact, with an interim
+//!   safety layer holding the coil to 0.99 of the ceiling's rise over
+//!   ambient;
+//! - the masker lattice is an input extracted from the Mac's macOS; without
+//!   it there is no masking credit;
 //! - host slices: at q1, q7 and q160 this unit is slice-independent by
 //!   design.
 
@@ -1093,17 +1093,6 @@ impl SlowGain {
     fn unity(len: u32) -> Self {
         SlowGain { g: 1.0, start: 1.0, target: 1.0, n: len, len }
     }
-    /// A downward decision to `target`: restarts from the gain already
-    /// reached, unless the follower is already on its way to a target at
-    /// least as low (the plan the ceiling checked stays the one applied).
-    fn retarget(&mut self, target: f32) {
-        if self.n < self.len && self.target <= target {
-            return;
-        }
-        self.start = self.g;
-        self.target = target;
-        self.n = 0;
-    }
     /// An upward step: the gain is `g` from now on.
     fn set(&mut self, g: f32) {
         self.g = g;
@@ -1251,12 +1240,10 @@ impl Chan {
     /// the new signal, the new signal alone); multiplicative quadratic-root
     /// corrections at the hottest substep until every substep is within
     /// `TemperatureHardLimit + max(TemperatureHeadroom, 0)`.
-    fn ceiling_scale(&self, mut f: SlowGain, ctl: usize, sub: usize) -> f32 {
-        // the horizon: the frame, its look-ahead (the signal already
-        // known), then one attack window, the time a further cut needs to
-        // land, on the newest controller frame of signal repeated
+    fn ceiling_scale(&self, mut f: SlowGain, g0: f32, ctl: usize, sub: usize) -> f32 {
+        // the retained span: the frame and its known look-ahead
         let od = self.xc.len() - ctl;
-        let horizon = (ctl + od + (f.len as usize).div_ceil(sub) * sub).min(CEIL_FRAMES * ctl);
+        let horizon = ctl + od;
         let subs = horizon / sub;
         let mut base = [0.0f32; CEIL_FRAMES * SUBSTEPS];
         let mut lin = [0.0f32; CEIL_FRAMES * SUBSTEPS];
@@ -1271,8 +1258,7 @@ impl Chan {
         let (mut al, mut aq) = (0.0f32, 0.0f32);
         let amb = self.ambient as f32;
         for i in 0..horizon {
-            let j = if i < ctl + od { i } else { od + (i - ctl - od) % ctl };
-            let u = self.vfs * self.out_sample(j, f.sample());
+            let u = self.vfs * self.out_sample(i, f.sample());
             al += u * zi.step(0.0);
             aq += u * zs.step(u);
             if (i + 1) % sub == 0 {
@@ -1293,41 +1279,19 @@ impl Chan {
                 quad[k] = qv + qm;
             }
         }
-        // interim conservative guard (until Daybreak t-4704 gives the exact
-        // difference): the ceiling's rise over ambient by the 0.99 law, so
-        // the coil is held about 1 % of its rise below the limit, at or
-        // below where the reference lands
+        // interim safety layer until this unit's full audio matches the
+        // reference (the exact solve lands 0.01-0.04 C nearer the ceiling
+        // than the reference on the rig): the ceiling's rise over ambient
+        // by the 0.99 law
         let limit = (self.ambient + CUT * (self.t_hard + self.t_headroom.max(0.0) - self.ambient)) as f32;
-        let mut g = Self::ceiling_solve(&base[..subs], &lin[..subs], &quad[..subs], limit);
-        // the monitor clamps a substep's power at 0, which the affine
-        // decomposition cannot: check the solution on the clamped model and
-        // step it down until it holds
-        let (t0v, t0m) = (self.th_vc, self.th_mg);
-        for _ in 0..64 {
-            let (mut v, mut m) = (t0v, t0m);
-            let mut over = false;
-            for k in 0..subs {
-                let p = (g * plin[k] + (g * g) * pquad[k]).max(0.0);
-                v = self.br_vc.step(v, p);
-                m = self.br_mg.step(m, p);
-                if amb + v + m > limit {
-                    over = true;
-                    break;
-                }
-            }
-            if !over || g == 0.0 {
-                break;
-            }
-            g *= 0.998;
-        }
-        g
+        Self::ceiling_solve(&base[..subs], &lin[..subs], &quad[..subs], limit, g0)
     }
 
     /// The multiplicative quadratic-root solve of residuals 2.4 on the
     /// substep decomposition `base + g lin + g^2 quad`.
-    fn ceiling_solve(base: &[f32], lin: &[f32], quad: &[f32], limit: f32) -> f32 {
+    fn ceiling_solve(base: &[f32], lin: &[f32], quad: &[f32], limit: f32, g0: f32) -> f32 {
         let subs = base.len();
-        let mut g = 1.0f32;
+        let mut g = g0.min(1.0);
         loop {
             let (mut kmax, mut tmax) = (0usize, f32::NEG_INFINITY);
             for k in 0..subs {
@@ -1463,7 +1427,9 @@ impl Run {
         let ring_len = (ctl + od) / sub;
         let sub_dt = sub as f64 / rate;
         let ctl_dt = ctl as f64 / rate;
-        let attack_len = (libm::round(p.attack_time_ms as f64 * 1e-3 * rate) as u32).max(1);
+        // residuals 2.4: AttackTime clamped to 10 ms, the raised-cosine
+        // window at most one controller frame
+        let attack_len = (libm::round((p.attack_time_ms as f64 * 1e-3).min(0.010) * rate) as u32).clamp(1, ctl as u32);
         let mut ch = Vec::with_capacity(n);
         for c in &p.ch[..n] {
             let h = filterbank(rate, &c.band_center_hz, c.bandwidth, fb);
@@ -1780,17 +1746,37 @@ impl Run {
             // so every sample these gains will shape holds the limit.
             let sg = (c.slow.g as f64).clamp(EPS, 1.0) as f32;
             let gv: [f64; BANDS] = if vel_on {
-                // interim guard: allocate to 0.99 of the limit so the attack
-                // transient (time-varying gains through the velocity model's
-                // memory) stays within it
-                let rel = velocity_band_gains(&c.vb, 0, (CUT * c.vel_limit_now) as f32, sg, c.vel_active);
-                core::array::from_fn(|k| {
-                    if rel[k] < 1.0 {
-                        ((sg * rel[k]).max(c.vel_floor as f32) as f64).min(1.0)
-                    } else {
-                        1.0
-                    }
-                })
+                // interim safety layer: allocate to 0.99 of the limit so the
+                // attack transient stays within it
+                let vlim_g = (CUT * c.vel_limit_now) as f32;
+                let floor = c.vel_floor as f32;
+                let absolute = |rel: [f32; BANDS]| -> [f32; BANDS] {
+                    core::array::from_fn(|k| if rel[k] < 1.0 { (sg * rel[k]).max(floor).min(1.0) } else { 1.0 })
+                };
+                // the ordinary solve, from unity
+                let p = absolute(velocity_band_gains(&c.vb, 0, vlim_g, sg, c.vel_active, [1.0; BANDS]));
+                // residuals 5.2: after the followers move toward it, one
+                // post-retarget solve when a lane's request rose, seeded from
+                // the applied endpoints of rising lanes still 3 dB or more
+                // below their request
+                let up: [bool; BANDS] = core::array::from_fn(|k| p[k] > c.band[k].requested());
+                if up.iter().any(|&u| u) {
+                    let guard = libm::pow(10.0, 3.0 / 20.0) as f32;
+                    let seed: [f32; BANDS] = core::array::from_fn(|k| {
+                        let mut b = c.band[k];
+                        b.request((g_disp as f32).min(p[k]));
+                        let end = b.end_after(ctl, if k == 0 { a_low } else { a_fast });
+                        if up[k] && guard * end <= p[k] {
+                            (end / sg).min(1.0)
+                        } else {
+                            1.0
+                        }
+                    });
+                    let q = absolute(velocity_band_gains(&c.vb, 0, vlim_g, sg, c.vel_active, seed));
+                    core::array::from_fn(|k| if up[k] { p[k].min(q[k]) as f64 } else { q[k] as f64 })
+                } else {
+                    p.map(|v| v as f64)
+                }
             } else {
                 [1.0; BANDS]
             };
@@ -1899,86 +1885,53 @@ impl Run {
             let m = req[..n].iter().copied().fold(1.0f64, f64::min);
             req[..n].iter_mut().for_each(|r| *r = m);
         }
-        // the provisional decision (residuals 2.4): a lower request
-        // retargets the follower to 0.99 x it; otherwise one release step
-        let mut down = [false; MAX_CHANNELS];
-        let mut level = [1.0f32; MAX_CHANNELS];
+        // residuals 2.4, in its native order: (1) the slow follower is
+        // advanced provisionally toward unity for the frame; (2) the
+        // ordinary request becomes a scalar on that trajectory and the
+        // output-temperature ceiling is solved once from it on the retained
+        // frame and its look-ahead; (3) a lower result makes one second
+        // follower call, from the provisionally advanced value toward 0.99
+        // x the request
+        let mut prov = [SlowGain::unity(1); MAX_CHANNELS];
+        let mut end = [1.0f32; MAX_CHANNELS];
+        let mut want = [1.0f32; MAX_CHANNELS];
         for (ci, c) in self.ch.iter().enumerate() {
-            let a = c.slow.g as f64;
-            if req[ci] < a {
-                down[ci] = true;
-                level[ci] = (CUT * req[ci]) as f32;
-            } else {
-                level[ci] = (a + self.slow_step * (req[ci] - a)).min(1.0) as f32;
+            let mut f = c.slow;
+            if f.n >= f.len {
+                let a = f.g as f64;
+                f.set((a + self.slow_step * (1.0 - a)).min(1.0) as f32);
             }
+            prov[ci] = f;
+            let mut e = f;
+            for _ in 0..ctl {
+                e.sample();
+            }
+            end[ci] = e.g;
+            want[ci] = (req[ci] as f32 / e.g.max(f32::MIN_POSITIVE)).min(1.0);
         }
-        // the output ceiling on the provisional trajectory: the largest
-        // extra scale keeping every substep of the output model within
-        // `TemperatureHardLimit + max(TemperatureHeadroom, 0)`
         if self.axis[4] {
-            let mut scale = [1.0f32; MAX_CHANNELS];
             for (ci, c) in self.ch.iter().enumerate() {
-                let mut f = c.slow;
-                if down[ci] {
-                    f.retarget(level[ci]);
-                } else {
-                    f.set(level[ci]);
-                }
-                scale[ci] = c.ceiling_scale(f, ctl, sub);
-            }
-            if self.link {
-                let m = scale[..n].iter().copied().fold(1.0f32, f32::min);
-                scale[..n].iter_mut().for_each(|v| *v = m);
-            }
-            for ci in 0..n {
-                if scale[ci] < 1.0 {
-                    level[ci] =
-                        if down[ci] { scale[ci] * level[ci] } else { (CUT * (scale[ci] * level[ci]) as f64) as f32 };
-                    down[ci] = true;
-                }
+                want[ci] = c.ceiling_scale(prov[ci], want[ci], ctl, sub);
             }
         }
-        // the retargeted trajectory itself must hold the ceiling too: the
-        // scale above is solved on the provisional trajectory, and a lower
-        // target reached along the raised cosine from the current gain can
-        // still run a few hundredths of a degree over it
-        if self.axis[4] {
-            for _ in 0..8 {
-                let mut worst = 1.0f32;
-                for (ci, c) in self.ch.iter().enumerate() {
-                    let mut f = c.slow;
-                    if down[ci] {
-                        f.retarget(level[ci]);
-                    } else {
-                        f.set(level[ci]);
-                    }
-                    let s = c.ceiling_scale(f, ctl, sub);
-                    if s < 1.0 {
-                        // a lower request, so the 0.99 law again
-                        level[ci] = (CUT * (s * level[ci]) as f64) as f32;
-                        down[ci] = true;
-                        worst = worst.min(s);
-                    }
-                }
-                if worst >= 1.0 {
-                    break;
-                }
-                if self.link {
-                    let m = level[..n].iter().copied().fold(1.0f32, f32::min);
-                    for ci in 0..n {
-                        if m < level[ci] {
-                            level[ci] = m;
-                            down[ci] = true;
-                        }
-                    }
-                }
-            }
+        if self.link && n > 1 {
+            let m = want[..n].iter().copied().fold(1.0f32, f32::min);
+            want[..n].iter_mut().for_each(|v| *v = m);
         }
         for (ci, c) in self.ch.iter_mut().enumerate() {
-            if down[ci] {
-                c.slow.retarget(level[ci]);
+            let request = want[ci] * end[ci];
+            if request < end[ci] {
+                let mut f = prov[ci];
+                for _ in 0..ctl {
+                    f.sample();
+                }
+                // the second call starts at the provisionally advanced value
+                f.start = f.g;
+                f.target = (CUT * request as f64) as f32;
+                f.n = 0;
+                c.slow = f;
             } else {
-                c.slow.set(level[ci]);
+                c.slow = prov[ci];
             }
         }
         // ---- output region and the monitor
