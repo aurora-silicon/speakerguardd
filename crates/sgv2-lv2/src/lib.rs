@@ -204,7 +204,7 @@ pub fn load_prestage(blob: Option<&[u8]>, rate: f64, channels: usize, unit: &Any
         return Some(PreStage::new(sgv2_core::prestage::Params::identity(channels)));
     }
     let p = sgv2_core::blob::prestage(blob?, rate).ok()?;
-    (p.channels == channels).then(|| PreStage::new(p))
+    (p.channels == channels).then(|| PreStage::with_rate(p, rate))
 }
 
 /// Frames `run` filters at once; a longer host call is run in chunks.
@@ -427,6 +427,12 @@ fn run_chunk(instance: &mut Instance, page: Option<&page::EnginePage>, off: usiz
         for c in 0..n {
             pre.process(c, input[c], &mut scratch[c][..frames]);
         }
+        // the graph's multiband dynamics, linked across every channel
+        let mut bufs: [&mut [f32]; MAX_CHANNELS] = Default::default();
+        for (b, s) in bufs.iter_mut().zip(scratch.iter_mut()).take(n) {
+            *b = &mut s[..frames];
+        }
+        pre.process_dynamics(&mut bufs[..n], frames);
     }
     for (f, buf) in filtered.iter_mut().zip(instance.scratch.iter()).take(n) {
         *f = &buf[..frames];

@@ -40,6 +40,17 @@
 //! Polarity flips are not carried: they change no level. A muted channel
 //! gets gain 0.
 //!
+//! The graph's multiband compressor box (`aufx/mstk`) ahead of the unit is
+//! carried as the pre-stage's dynamics ([`dynamics`]), from its saved
+//! state: input and output gain (1, 2), three fourth-order crossovers
+//! (4, 6, 8; orders 5, 7, 9), per band `b` at `10 + 13 b` enable, bypass,
+//! solo, mute, downward threshold, ratio and range, upward and expander
+//! ratios, makeup; release time (62, ms) and release switch (63); per-band
+//! input gains (65-68) and saturation (71, 73, 75, 77). A compressor the
+//! dynamics cannot carry exactly in the direction that matters (upward or
+//! expanding branches, saturation, solo, per-band input gain, another
+//! crossover order, release switched off) refuses the compile.
+//!
 //! The channel's whole response is then scaled so it never exceeds unity
 //! at any frequency (stricter than macOS only where the tuning boosts): the
 //! pre-stage never adds drive, and its output stays inside the converter's
@@ -48,12 +59,14 @@
 use crate::error::{Diagnostics, Error, Result};
 use crate::fourcc::FourCc;
 use crate::tuning::{Stage, Tuning};
-use sgv2_core::prestage::{Channel, Params, Section, FLAG_FROM_TUNING, MAX_SECTIONS};
+use sgv2_core::prestage::{Band, BandMode, Channel, Dynamics, Params, Section, BANDS, FLAG_FROM_TUNING, MAX_SECTIONS};
 use sgv2_core::MAX_CHANNELS;
 use std::f64::consts::PI;
 
 /// The parametric filter unit's subtype.
 pub const TMST: FourCc = FourCc::from_bytes(*b"tmst");
+/// The multiband compressor unit's subtype.
+pub const MSTK: FourCc = FourCc::from_bytes(*b"mstk");
 pub const SLOTS: u32 = 50;
 const SLOT_BASE: u32 = 14;
 const SLOT_STRIDE: u32 = 10;
@@ -67,144 +80,6 @@ pub const MAX_ORDER: u32 = 10;
 
 fn bad(message: impl Into<String>) -> Error {
     Error::format("prestage", message)
-}
-
-/// Boards whose woofers the pre-stage alone still drives harder at low
-/// frequency than macOS does (its multiband dynamics are not carried yet):
-/// until they are, the pre-stage also caps every channel's cone excursion
-/// at the tuning's own limit ([`excursion_cap`]). Policy, not a hardware
-/// value: each board's numbers come from its tuning.
-///
-/// - `j413`: MacBook Air M2, measured 2026-11-06 (woofers about 1.2x
-///   macOS's peak excursion at 125-400 Hz).
-pub const EXCURSION_CAP_INTERIM: &[&str] = &["j413"];
-
-/// Whether `board` gets the interim excursion cap.
-pub fn excursion_cap_interim(board: &str) -> bool {
-    EXCURSION_CAP_INTERIM.contains(&board)
-}
-
-/// The static excursion cap of one speaker from its tuning's lumped model
-/// (spp3 sidecar `OL_disp`: moving mass, damping, stiffness, force factor,
-/// amp volts at full scale, controller Q and excursion limit; `OL_thermal`
-/// `Reb_ref`).
-///
-/// The cone's excursion per unit of program is `X0 / D(s)`, with
-/// `D(s) = s^2/w0^2 + s/(w0 Q) + 1`, `w0 = sqrt(kt/mt)` and
-/// `X0 = ag phi / (Reb_ref kt)` at full scale. The cap is
-/// `C(s) = k D(s) / (s^2/wp^2 + 2 s/wp + 1)` with `k = x_lim / X0` and
-/// `wp = w0 / sqrt(k)`: excursion becomes `k X0` over a critically damped
-/// second-order low-pass, which never overshoots, so a program no larger
-/// than full scale never drives the cone past `x_lim`. `C` is unity at high
-/// frequency and never above it. `Q` is the larger of the controller Q and
-/// the model's own (the more resonant, the more is taken away). A model
-/// whose full-scale excursion is already within `x_lim` needs no cap.
-pub fn excursion_cap(ch: &crate::spp3::Channel, fs: f64) -> Result<Option<Section>> {
-    let d = &ch.ol_disp;
-    let m = Cone {
-        mt: d.mt,
-        ct: d.ct,
-        kt: d.kt,
-        phi: d.phi,
-        ag: d.ag,
-        q_d: d.q_d,
-        x_lim: d.x_lim,
-        reb: ch.ol_thermal.reb_ref,
-    };
-    cap_section(&m, fs).map_err(|e| bad(format!("Channel{}: {e}", ch.index)))
-}
-
-/// A speaker's lumped model, as the tuning states it.
-#[derive(Clone, Copy, Debug)]
-pub struct Cone {
-    pub mt: f64,
-    pub ct: f64,
-    pub kt: f64,
-    pub phi: f64,
-    pub ag: f64,
-    pub q_d: f64,
-    pub x_lim: f64,
-    pub reb: f64,
-}
-
-impl Cone {
-    pub fn w0(&self) -> f64 {
-        (self.kt / self.mt).sqrt()
-    }
-    pub fn q(&self) -> f64 {
-        self.q_d.max((self.kt * self.mt).sqrt() / (self.ct + self.phi * self.phi / self.reb))
-    }
-    /// Excursion at full scale below resonance, in the unit of `x_lim` (mm).
-    pub fn x0(&self) -> f64 {
-        self.ag * self.phi / (self.reb * self.kt) * 1e3
-    }
-}
-
-fn cap_section(m: &Cone, fs: f64) -> std::result::Result<Option<Section>, String> {
-    let all = [m.mt, m.ct, m.kt, m.phi, m.ag, m.q_d, m.x_lim, m.reb];
-    if all.iter().any(|v| !v.is_finite() || *v <= 0.0) {
-        return Err("the excursion model (OL_disp, Reb_ref) is incomplete or not physical".into());
-    }
-    let (w0, q, x0) = (m.w0(), m.q(), m.x0());
-    let k = m.x_lim / x0;
-    if k >= 1.0 {
-        return Ok(None);
-    }
-    let wp = w0 / k.sqrt();
-    if !wp.is_finite() || wp >= PI * fs {
-        return Err("the excursion cap's corner is past Nyquist".into());
-    }
-    // bilinear transform of (n2 s^2 + n1 s + n0) / (d2 s^2 + d1 s + d0)
-    let (n2, n1, n0) = (k / (w0 * w0), k / (w0 * q), k);
-    let (d2, d1, d0) = (1.0 / (wp * wp), 2.0 / wp, 1.0);
-    let c = 2.0 * fs;
-    let a0 = d2 * c * c + d1 * c + d0;
-    let sec = Section {
-        b0: (n2 * c * c + n1 * c + n0) / a0,
-        b1: (2.0 * n0 - 2.0 * n2 * c * c) / a0,
-        b2: (n2 * c * c - n1 * c + n0) / a0,
-        a1: (2.0 * d0 - 2.0 * d2 * c * c) / a0,
-        a2: (d2 * c * c - d1 * c + d0) / a0,
-    };
-    if !sec.stable() {
-        return Err("the excursion cap is unstable".into());
-    }
-    Ok(Some(sec))
-}
-
-/// Adds the interim excursion cap of every channel to `pre` (see
-/// [`EXCURSION_CAP_INTERIM`]); refuses when the tuning lacks a channel's
-/// model.
-pub fn add_excursion_cap(
-    pre: &mut Params,
-    sidecar: &crate::spp3::Sidecar,
-    fs: f64,
-    diags: &mut Diagnostics,
-) -> Result<()> {
-    for c in 0..pre.channels {
-        let ch = sidecar
-            .channels
-            .iter()
-            .find(|ch| ch.index == c)
-            .ok_or_else(|| bad(format!("the sidecar has no Channel{c} for the excursion cap")))?;
-        let Some(sec) = excursion_cap(ch, fs)? else { continue };
-        let p = &mut pre.channel[c];
-        if p.count >= MAX_SECTIONS {
-            return Err(bad(format!("channel {c}: no room for the excursion cap")));
-        }
-        p.sections[p.count] = sec;
-        p.count += 1;
-        let peak = p.peak(fs);
-        if peak > 1.0 {
-            p.gain /= peak;
-        }
-        diags.info(
-            "prestage-excursion-cap",
-            format!("channel {c}"),
-            "excursion capped at the tuning's limit (interim)",
-        );
-    }
-    Ok(())
 }
 
 /// One filter box's contribution to one of its channels.
@@ -402,6 +277,97 @@ fn part(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics) -> Result<Part
     Ok(p)
 }
 
+/// The multiband dynamics on the unit's lanes: the one compressor box every
+/// lane passes before the unit, or none. Refuses a compressor on some lanes
+/// only, two of them, or one the dynamics cannot carry.
+pub fn dynamics(chain: &[Stage], lanes: &[crate::dspg::analysis::Lane]) -> Result<Option<Dynamics>> {
+    let mut found: Option<&Stage> = None;
+    for s in chain.iter().filter(|s| s.before_protection && s.unit.map(|u| u.subtype) == Some(MSTK)) {
+        let on = lanes.iter().filter(|l| l.through.iter().any(|p| p.node == s.name)).count();
+        if on == 0 {
+            continue;
+        }
+        if on != lanes.len() {
+            return Err(bad(format!("compressor {} is on {on} of the unit's {} lanes", s.name, lanes.len())));
+        }
+        if found.is_some() {
+            return Err(bad("two compressor boxes ahead of the unit"));
+        }
+        found = Some(s);
+    }
+    let Some(st) = found else { return Ok(None) };
+    let ctx = format!("compressor box {}", st.name);
+    if st.bypass {
+        return Ok(None);
+    }
+    let g = st
+        .state
+        .as_ref()
+        .and_then(|s| s.global())
+        .ok_or_else(|| bad(format!("{ctx}: the strip gives it no saved state")))?;
+    let req = |id: u32| -> Result<f64> {
+        g.get(id)
+            .map(f64::from)
+            .filter(|v| v.is_finite())
+            .ok_or_else(|| bad(format!("{ctx}: saved parameter {id} is missing")))
+    };
+    // optional: absent is the unit's off/0 default
+    let opt = |id: u32| g.get(id).map(f64::from).unwrap_or(0.0);
+    if req(0)? != 0.0 {
+        return Ok(None);
+    }
+    for (id, what) in [(5, "crossover 0"), (7, "crossover 1"), (9, "crossover 2")] {
+        if req(id)? != 4.0 {
+            return Err(bad(format!("{ctx}: {what} order {} (only fourth order is carried)", req(id)?)));
+        }
+    }
+    if req(63)? != 1.0 {
+        return Err(bad(format!("{ctx}: release is switched off")));
+    }
+    for id in [65, 66, 67, 68] {
+        if opt(id) != 0.0 {
+            return Err(bad(format!("{ctx}: per-band input gain (parameter {id}) is not carried")));
+        }
+    }
+    for id in [71, 73, 75, 77] {
+        if opt(id) != 0.0 {
+            return Err(bad(format!("{ctx}: saturation (parameter {id}) is not carried")));
+        }
+    }
+    let mut band = [Band::default(); BANDS];
+    for (b, out) in band.iter_mut().enumerate() {
+        let o = 10 + 13 * b as u32;
+        let (enable, bypass, solo, mute) = (req(o)?, req(o + 1)?, req(o + 2)?, req(o + 3)?);
+        if solo != 0.0 {
+            return Err(bad(format!("{ctx}: band {b} is soloed")));
+        }
+        if req(o + 8)? != 1.0 || req(o + 11)? != 1.0 {
+            return Err(bad(format!("{ctx}: band {b} has an upward or expanding branch")));
+        }
+        let mode = if mute != 0.0 {
+            BandMode::Mute
+        } else if enable == 0.0 || bypass != 0.0 {
+            BandMode::Pass
+        } else {
+            BandMode::Compress
+        };
+        *out = Band {
+            threshold_db: req(o + 4)?,
+            ratio: req(o + 5)?,
+            range_db: req(o + 6)?,
+            makeup_db: req(o + 12)?,
+            mode,
+        };
+    }
+    Ok(Some(Dynamics {
+        crossover_hz: [req(4)?, req(6)?, req(8)?],
+        input_gain_db: req(1)?,
+        output_gain_db: req(2)?,
+        release_s: req(62)? / 1000.0,
+        band,
+    }))
+}
+
 /// The pre-stage of every unit channel, from the filter boxes on its lane.
 pub fn derive(t: &Tuning, fs: f64, channels: usize, diags: &mut Diagnostics) -> Result<Params> {
     if channels == 0 || channels > MAX_CHANNELS {
@@ -415,6 +381,7 @@ pub fn derive(t: &Tuning, fs: f64, channels: usize, diags: &mut Diagnostics) -> 
     }
     let mut out = Params::identity(channels);
     out.flags = FLAG_FROM_TUNING;
+    out.dynamics = dynamics(&t.chain, &t.protection.lanes)?;
     for (c, lane) in t.protection.lanes.iter().enumerate() {
         let mut sections = Vec::new();
         let (mut gain_db, mut muted) = (0.0, false);
@@ -488,63 +455,69 @@ mod tests {
         }
     }
 
-    #[test]
-    fn excursion_cap_holds_the_limit() {
-        let fs = 48_000.0;
-        // a small woofer that a full-scale program drives past its limit
-        let m = Cone { mt: 5e-4, ct: 0.6, kt: 4000.0, phi: 0.8, ag: 12.0, q_d: 1.5, x_lim: 0.4, reb: 4.0 };
-        assert!(m.x0() > m.x_lim);
-        let cap = cap_section(&m, fs).unwrap().unwrap();
-        let mut ch = Channel::IDENTITY;
-        ch.sections[0] = cap;
-        ch.count = 1;
-        assert!(ch.peak(fs) <= 1.0 + 1e-9);
-        assert!((ch.magnitude(1.0, fs) - m.x_lim / m.x0()).abs() < 1e-3);
-        assert!((ch.magnitude(23_000.0, fs) - 1.0).abs() < 0.02);
-        // the cone model, as a digital filter (bilinear)
-        let (w0, q, c) = (m.w0(), m.q(), 2.0 * fs);
-        let (n2, n1) = (1.0 / (w0 * w0), 1.0 / (w0 * q));
-        let a0 = n2 * c * c + n1 * c + 1.0;
-        let cone = Section {
-            b0: m.x0() / a0,
-            b1: 2.0 * m.x0() / a0,
-            b2: m.x0() / a0,
-            a1: (2.0 - 2.0 * n2 * c * c) / a0,
-            a2: (n2 * c * c - n1 * c + 1.0) / a0,
-        };
-        let run = |s: &Section, x: &[f64]| -> Vec<f64> {
-            let (mut z1, mut z2) = (0.0, 0.0);
-            x.iter()
-                .map(|&v| {
-                    let o = s.b0 * v + z1;
-                    z1 = s.b1 * v - s.a1 * o + z2;
-                    z2 = s.b2 * v - s.a2 * o;
-                    o
-                })
-                .collect()
-        };
-        // full-scale square bursts at and below resonance: the worst crest
-        for f in [50.0, 120.0, 250.0, 450.0, 900.0] {
-            let x: Vec<f64> = (0..24_000)
-                .map(|i| {
-                    if i < 480 {
-                        0.0
-                    } else if (2.0 * PI * f * i as f64 / fs).sin() >= 0.0 {
-                        1.0
-                    } else {
-                        -1.0
-                    }
-                })
-                .collect();
-            let uncapped = run(&cone, &x).iter().fold(0.0f64, |a, v| a.max(v.abs()));
-            let capped = run(&cone, &run(&cap, &x)).iter().fold(0.0f64, |a, v| a.max(v.abs()));
-            assert!(uncapped > m.x_lim, "{f} Hz: {uncapped}");
-            assert!(capped <= m.x_lim * 1.001, "{f} Hz: {capped} mm against {}", m.x_lim);
+    fn mstk(globals: &[(u32, f32)]) -> Stage {
+        let mut st = tmst(&[], &[]);
+        st.name = "Comp".into();
+        st.unit = Some(UnitId {
+            kind: FourCc::from_bytes(*b"aufx"),
+            subtype: MSTK,
+            manufacturer: FourCc::from_bytes(*b"appl"),
+        });
+        let mut params: Vec<(u32, f32)> = vec![
+            (0, 0.0),
+            (1, -12.0),
+            (2, 14.0),
+            (4, 200.0),
+            (5, 4.0),
+            (6, 1500.0),
+            (7, 4.0),
+            (8, 8000.0),
+            (9, 4.0),
+            (62, 50.0),
+            (63, 1.0),
+        ];
+        for b in 0..4u32 {
+            let o = 10 + 13 * b;
+            params.extend([
+                (o, 1.0),
+                (o + 1, 0.0),
+                (o + 2, 0.0),
+                (o + 3, 0.0),
+                (o + 4, -30.0),
+                (o + 5, 3.0),
+                (o + 6, -20.0),
+            ]);
+            params.extend([(o + 8, 1.0), (o + 11, 1.0), (o + 12, 0.0)]);
         }
-        // a model already inside its limit needs no cap; a broken one is refused
-        assert!(cap_section(&Cone { x_lim: 10.0, ..m }, fs).unwrap().is_none());
-        assert!(cap_section(&Cone { kt: 0.0, ..m }, fs).is_err());
-        assert!(excursion_cap_interim("j413") && !excursion_cap_interim("j316s"));
+        for (id, v) in globals {
+            params.retain(|(i, _)| i != id);
+            params.push((*id, *v));
+        }
+        st.state = Some(ParamState { sections: vec![ParamSection { scope: 0, element: 0, params }] });
+        st
+    }
+
+    #[test]
+    fn compressor_rules() {
+        use crate::dspg::analysis::{Lane, Origin, Pass};
+        let lane = |c| Lane {
+            origin: Origin { node: "in".into(), port: 0, channel: c },
+            hops: Vec::new(),
+            through: vec![Pass { node: "Comp".into(), channel: c }],
+        };
+        let base = |st: Stage| -> Result<Option<Dynamics>> { dynamics(&[st], &[lane(0), lane(1)]) };
+        let d = base(mstk(&[])).unwrap().unwrap();
+        assert_eq!((d.crossover_hz, d.release_s, d.band[0].mode), ([200.0, 1500.0, 8000.0], 0.05, BandMode::Compress));
+        assert!(base(mstk(&[(0, 1.0)])).unwrap().is_none());
+        assert_eq!(base(mstk(&[(10 + 13 + 3, 1.0)])).unwrap().unwrap().band[1].mode, BandMode::Mute);
+        assert_eq!(base(mstk(&[(10 + 1, 1.0)])).unwrap().unwrap().band[0].mode, BandMode::Pass);
+        for refused in [(5, 6.0), (63, 0.0), (65, 3.0), (71, 1.0), (12, 1.0), (18, 2.0), (21, 2.0)] {
+            assert!(base(mstk(&[refused])).is_err(), "{refused:?}");
+        }
+        // on some lanes only: refused
+        let mut other = lane(1);
+        other.through.clear();
+        assert!(dynamics(&[mstk(&[])], &[lane(0), other]).is_err());
     }
 
     #[test]
