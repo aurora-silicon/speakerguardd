@@ -14,10 +14,12 @@
 //! **Refusal.** [`compile`] returns `Err`, and no blob, for any tuning a
 //! protection engine must not run: a finding of error severity from
 //! [`Tuning::load`] (a bypassed unit, a channel-count mismatch, a unit
-//! mismatch, ...), an unverified bundle, a machine the bundle or the
-//! description does not match, a channel count other than the machine's
-//! amp count, or parameters the engine itself would answer with the
-//! fail-safe.  Callers cannot get an unsafe blob by ignoring diagnostics.
+//! mismatch, ...), an unverified bundle, a machine the bundle does not
+//! match, channels that are not one operating point, or parameters the
+//! engine itself would answer with the fail-safe.  Callers cannot get an
+//! unsafe blob by ignoring diagnostics.  The compiler has no table of
+//! boards: the amp count and gain are the running Mac's, checked by the
+//! self-check and the supervisor (see [`crate::machine`]).
 //!
 //! **Header.** The blob names the board and the amps' operating point
 //! (`sgv2_core::blob::build_for`, header bytes 36 to 48), which the
@@ -29,13 +31,16 @@
 //!   `PilotToneEnabled` = part 21, `CLThermalFeedbackEnabled` = part 22), and
 //!   for a key the sidecar lacks, its one-to-one saved ID.
 //!
-//!   Unit channel `c` takes physical data source `spA<k>`, `k` from
-//!   `SpeakerInputDataSourceOrder` (property 64005) when the property strip
-//!   sets it, else `k = c` (the default order; SPEC-SPP3 section 2:
-//!   coreaudiod sets none).  That source gives both the sense pair, ports
-//!   `(2k+1, 2k)` of the `[V0, I0, V1, I1, ...]` bus, and the factory
-//!   calibration, the SpTS record `spA<k>` when the record file's checksum
-//!   holds.  A record no channel takes is refused.
+//!   Unit channel `c` reads the sense pair at ports `(2c+1, 2c)` of the
+//!   `[V0, I0, V1, I1, ...]` telemetry bus, and the factory calibration
+//!   from SpTS record `c`, by position (Daybreak t-4672): the record's
+//!   data-source ID (`spA<n>`) is provenance, never an index, so sparse
+//!   IDs such as the M2's `spA0 spA1 spA4 spA5` bind all four channels.  A
+//!   record file whose checksum holds must have one record per channel, or
+//!   the compile is refused.  `SpeakerInputDataSourceOrder` (property
+//!   64005) permutes only the telemetry streams; its encoding is not
+//!   specified, so a strip that sets it is refused rather than guessed
+//!   (no shipped strip does).
 //!
 //!   The start state is the engine's, from the global `ThermalStateOverride`:
 //!   the raw 64007 value the AID's strip sets, unset = 0 (SPEC-SPP3 section
@@ -53,10 +58,8 @@
 //! which [`crate::tuning::Protection::lanes`] records.
 
 use crate::error::{Diagnostics, Error, Result};
-use crate::fourcc::FourCc;
-use crate::machine::{Description, Machine};
+use crate::machine::Machine;
 use crate::names::{SCOPE_GLOBAL, SCOPE_PART};
-use crate::plist::Value;
 use crate::strip::PropValue;
 use crate::tuning::{Tuning, UnitKind};
 use sgv2_core::blob::{build_for, machine_field, Pod, MACHINE_LEN};
@@ -66,7 +69,8 @@ use sgv2_core::{atsp, lsm2, spp3, MAX_CHANNELS};
 /// state the specification defines (zero rises over ambient).
 pub const SPP3_COLD_START: u32 = 2;
 pub const PROP_SPP3_THERMAL_STATE_OVERRIDE: u32 = 64007;
-/// `SpeakerInputDataSourceOrder` (spp3 property 64005).
+/// `SpeakerInputDataSourceOrder` (spp3 property 64005): the order of the
+/// telemetry streams, not of the calibration records.
 pub const PROP_SPP3_SOURCE_ORDER: u32 = 64005;
 
 /// How a compile may treat the bundle's provenance.
@@ -82,7 +86,7 @@ pub enum Provenance {
 /// What the blob header carries, checked before any payload is built.
 struct Bound {
     machine: [u8; MACHINE_LEN],
-    description: &'static Description,
+    board: String,
 }
 
 fn preflight(t: &Tuning, m: &Machine, provenance: Provenance, diags: &mut Diagnostics) -> Result<Bound> {
@@ -108,12 +112,7 @@ fn preflight(t: &Tuning, m: &Machine, provenance: Provenance, diags: &mut Diagno
         }
     }
     let machine = machine_field(&m.board).ok_or_else(|| bad(format!("board {:?} does not fit the header", m.board)))?;
-    let description = m.description().ok_or_else(|| bad(format!("no machine description for board {}", m.board)))?;
-    let n = t.protection.lanes.len();
-    if n != description.amps {
-        return Err(bad(format!("the unit has {n} channels, the {} has {} amps", m.board, description.amps)));
-    }
-    Ok(Bound { machine, description })
+    Ok(Bound { machine, board: m.board.clone() })
 }
 
 /// Hundredths of a dB between two voltages.
@@ -129,10 +128,9 @@ pub const OPERATING_POINT_TOLERANCE_DB: f64 = 0.25;
 /// sensitivity`; Daybreak t-4662: all peak volts at a normalized sample of
 /// 1).  The header holds one value: the first channel's.  The payload keeps
 /// every channel's own value; they must all lie within one operating point
-/// of the header's (the J700's 7.30/7.33 V do, 0.036 dB apart), or the amps
-/// cannot share the gain the supervisor checks.  The machine description's
-/// amp gain is a cross-check, reported when it disagrees.
-fn operating_point(what: &str, volts: &[f32], d: &Description, diags: &mut Diagnostics) -> Result<u32> {
+/// of the header's (two channels 0.036 dB apart do), or the amps cannot
+/// share the gain the supervisor checks against the card.
+fn operating_point(what: &str, volts: &[f32]) -> Result<u32> {
     let first = *volts.first().ok_or_else(|| bad(format!("no {what}")))?;
     if !volts.iter().all(|v| v.is_finite() && *v > 0.0) {
         return Err(bad(format!("{what} {volts:?} is not a positive voltage on every channel")));
@@ -145,18 +143,6 @@ fn operating_point(what: &str, volts: &[f32], d: &Description, diags: &mut Diagn
                 "channel {c} {what} {v} V is {off:+.3} dB from channel 0's: not one operating point"
             )));
         }
-    }
-    let machine = f64::from(d.full_scale_mv());
-    let off = centi_db(mv, machine) / 100.0;
-    if off.abs() > OPERATING_POINT_TOLERANCE_DB {
-        diags.warn(
-            "compile-full-scale",
-            "compile",
-            format!(
-                "{what} gives {mv} mV peak, the {} amp setting {machine} mV ({off:+.2} dB): the supervisor will not grant",
-                d.board
-            ),
-        );
     }
     Ok(mv as u32)
 }
@@ -207,7 +193,7 @@ pub fn compile_with(t: &Tuning, m: &Machine, provenance: Provenance, diags: &mut
     match t.protection.kind {
         UnitKind::Spp3 => compile_spp3(t, &b, diags),
         UnitKind::Lsm2 => compile_lsm2(t, &b, diags),
-        UnitKind::Atsp => compile_atsp(t, &b, diags),
+        UnitKind::Atsp => compile_atsp(t, &b),
     }
 }
 
@@ -217,67 +203,31 @@ struct Spp3Lookup<'a> {
     t: &'a Tuning,
     sidecar: &'a crate::spp3::Sidecar,
     rate: u32,
-    /// Physical data source `spA<k>` of each unit channel.
-    order: Vec<u32>,
     thermal_state_override: u32,
 }
 
-/// `spA<k>`, the data-source ID of physical speaker source `k`.
-pub fn data_source(k: u32) -> Option<FourCc> {
-    (k < 10).then(|| FourCc::from_bytes([b's', b'p', b'A', b'0' + k as u8]))
-}
-
-fn source_index(id: FourCc) -> Option<u32> {
-    match id.bytes() {
-        [b's', b'p', b'A', d @ b'0'..=b'9'] => Some(u32::from(d - b'0')),
-        _ => None,
+/// Refuses a strip that sets `SpeakerInputDataSourceOrder` (64005).  The
+/// property orders the telemetry streams (`spV<n>`, `spI<n>`), and without
+/// it unit channel `c` reads voltage at bus channel `2c` and current at
+/// `2c + 1`.  Its encoding is not specified and no shipped strip sets it,
+/// so it is refused rather than guessed.  It never reorders calibration.
+/// TODO(SPEC): the property's encoding.
+pub fn check_telemetry_order(t: &Tuning) -> Result<()> {
+    match t.protection.strip_properties.iter().find(|p| p.number == PROP_SPP3_SOURCE_ORDER) {
+        None => Ok(()),
+        Some(p) => Err(bad(format!(
+            "the strip sets SpeakerInputDataSourceOrder (64005) to {:?}; its telemetry order is not specified",
+            p.value
+        ))),
     }
-}
-
-/// The physical source of each of the `n` unit channels: property 64005
-/// when the strip sets it, else the default order `0..n`.  The property is
-/// read as an array of data-source IDs (`spA<k>`, as four-character strings
-/// or integers), one per unit channel in channel order; any other form is
-/// refused rather than guessed.  TODO(SPEC): the property's encoding; no
-/// shipped strip sets it.
-pub fn source_order(t: &Tuning, n: usize) -> Result<Vec<u32>> {
-    let Some(p) = t.protection.strip_properties.iter().find(|p| p.number == PROP_SPP3_SOURCE_ORDER) else {
-        return Ok((0..n as u32).collect());
-    };
-    let what = "SpeakerInputDataSourceOrder (64005)";
-    let items = match &p.value {
-        PropValue::Other { value: Value::Array(a), .. } => a,
-        v => return Err(bad(format!("{what} is {v:?}, not an array of data-source IDs"))),
-    };
-    if items.len() != n {
-        return Err(bad(format!("{what} names {} sources for {n} channels", items.len())));
-    }
-    let mut order = Vec::with_capacity(n);
-    for it in items {
-        let id = match it {
-            Value::String(s) => FourCc::from_str_exact(s),
-            Value::Integer(v) => u32::try_from(*v).ok().map(FourCc),
-            _ => None,
-        };
-        let k = id
-            .and_then(source_index)
-            .filter(|k| (*k as usize) < n)
-            .ok_or_else(|| bad(format!("{what} entry {it:?} is not a data source spA0..spA{}", n - 1)))?;
-        if order.contains(&k) {
-            return Err(bad(format!("{what} names spA{k} twice")));
-        }
-        order.push(k);
-    }
-    Ok(order)
 }
 
 impl Spp3Lookup<'_> {
-    /// The factory calibration record of unit channel `ch`: the SpTS record
-    /// of the channel's data source.  `None` (open loop) without a valid
-    /// record file or a matching record.
+    /// The factory calibration record of unit channel `ch`: SpTS record
+    /// `ch`, by position.  `None` (open loop) without a valid record file;
+    /// a valid file has one record per channel (checked before lookup).
     fn calibration(&self, ch: usize) -> Option<&crate::spts::Record> {
-        let s = self.t.spts.as_ref().filter(|s| s.checksum_valid)?;
-        s.by_source(data_source(*self.order.get(ch)?)?)
+        self.t.spts.as_ref().filter(|s| s.checksum_valid)?.records.get(ch)
     }
 }
 
@@ -339,8 +289,8 @@ impl spp3::TuningLookup for Spp3Lookup<'_> {
         Some(ch as u32)
     }
     fn sense(&self, ch: usize) -> Option<(u32, u32)> {
-        let k = *self.order.get(ch)?;
-        Some((2 * k + 1, 2 * k))
+        let c = ch as u32;
+        Some((2 * c + 1, 2 * c))
     }
 }
 
@@ -365,18 +315,18 @@ fn compile_spp3(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
     }
     let rate = sample_rate(t)?;
     let tso = thermal_state_override(t)?;
-    let order = source_order(t, n)?;
-    // Every valid record must belong to a channel: one that does not means
-    // the records and the channels disagree, and a guessed binding would
-    // seed one speaker's closed loop with another's calibration.
+    check_telemetry_order(t)?;
+    // Records bind by position, so a valid file must have exactly one per
+    // channel: any other count means the records and the channels disagree,
+    // and a guessed binding would seed one speaker's closed loop with
+    // another's calibration.
     if let Some(s) = t.spts.as_ref().filter(|s| s.checksum_valid) {
-        for r in &s.records {
-            if !source_index(r.data_source).is_some_and(|k| order.contains(&k)) {
-                return Err(bad(format!("SpTS record {} belongs to no unit channel", r.data_source)));
-            }
+        if s.records.len() != n {
+            let ids: Vec<String> = s.records.iter().map(|r| r.data_source.to_string()).collect();
+            return Err(bad(format!("SpTS has {} records ({}) for {n} unit channels", s.records.len(), ids.join(" "))));
         }
     }
-    let lk = Spp3Lookup { t, sidecar, rate, order, thermal_state_override: tso };
+    let lk = Spp3Lookup { t, sidecar, rate, thermal_state_override: tso };
     let p = spp3::Params::from_lookup(&lk).map_err(|e| bad(format!("spp3 parameters: {e:?}")))?;
     let start = if tso == SPP3_COLD_START { "cold" } else { "hot fallback" };
     diags.info("compile-start-state", "compile", format!("Thermal State Override {tso}: the {start} start state"));
@@ -393,7 +343,7 @@ fn compile_spp3(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
     // `ag` is the amp's peak volts at digital full scale (SPEC-SPP3 section
     // 4; Daybreak t-4662).
     let ag: Vec<f32> = p.ch[..n].iter().map(|c| c.ag).collect();
-    let full_scale_mv = operating_point("ag", &ag, b.description, diags)?;
+    let full_scale_mv = operating_point("ag", &ag)?;
     let blob =
         build_for(sgv2_core::UnitKind::Spp3, p.channels, sense, p.sample_rate, b.machine, full_scale_mv, p.as_bytes());
     spp3::Params::from_blob(&blob).map_err(|e| bad(format!("the engine rejects the compiled blob: {e:?}")))?;
@@ -405,7 +355,7 @@ fn compile_spp3(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
         channels: p.channels,
         sense_channels: sense,
         sample_rate: p.sample_rate,
-        board: b.description.board.to_string(),
+        board: b.board.clone(),
         full_scale_mv,
         blob,
     })
@@ -702,7 +652,7 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
         | ((get(id::amp0(id::A_USE_BATTERY))? != 0.0) as u32) << 2;
     // VoltsFullScale is peak volts (KERNEL.md 2.3; Daybreak t-4662).
     let vfs: Vec<f32> = p.ch[..n].iter().map(|c| c.volts_full_scale).collect();
-    let full_scale_mv = operating_point("VoltsFullScale", &vfs, b.description, diags)?;
+    let full_scale_mv = operating_point("VoltsFullScale", &vfs)?;
     let blob =
         build_for(sgv2_core::UnitKind::Lsm2, p.channels, 0, p.sample_rate, b.machine, full_scale_mv, p.as_bytes());
     lsm2::Params::from_blob(&blob).map_err(|e| bad(format!("the engine rejects the compiled blob: {e:?}")))?;
@@ -714,7 +664,7 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
         channels: p.channels,
         sense_channels: 0,
         sample_rate: p.sample_rate,
-        board: b.description.board.to_string(),
+        board: b.board.clone(),
         full_scale_mv,
         blob,
     })
@@ -776,7 +726,7 @@ fn pressure_response(t: &Tuning, c: usize, diags: &mut Diagnostics) -> Option<[f
 
 // ------------------------------------------------------------------ atsp
 
-fn compile_atsp(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compiled> {
+fn compile_atsp(t: &Tuning, b: &Bound) -> Result<Compiled> {
     let n = channels(t)?;
     let rate = sample_rate(t)?;
     // A graph without a reblocker runs the unit on the host's block: 0.
@@ -819,7 +769,7 @@ fn compile_atsp(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
     }
     // `Amplifier sensitivity [V/Fs]` of each slot that drives a channel.
     let sens: Vec<f32> = p.slot.iter().filter(|s| s.channel_mask != 0).map(|s| s.amplifier_sensitivity).collect();
-    let full_scale_mv = operating_point("Amplifier sensitivity", &sens, b.description, diags)?;
+    let full_scale_mv = operating_point("Amplifier sensitivity", &sens)?;
     let blob =
         build_for(sgv2_core::UnitKind::Atsp, p.channels, 0, p.sample_rate, b.machine, full_scale_mv, p.as_bytes());
     atsp::Params::from_blob(&blob).map_err(|e| bad(format!("the engine rejects the compiled blob: {e:?}")))?;
@@ -831,7 +781,7 @@ fn compile_atsp(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
         channels: p.channels,
         sense_channels: 0,
         sample_rate: p.sample_rate,
-        board: b.description.board.to_string(),
+        board: b.board.clone(),
         full_scale_mv,
         blob,
     })

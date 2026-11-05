@@ -1,8 +1,9 @@
 #!/usr/bin/python3 -I
 """The speaker wiring of a Mac, derived from its device tree and its tuning.
 
-    wiring.py derive [--dt ROOT | --hw HW.json] (--tuning-json DUMP.json | -- TUNING-CLI-ARGS...)
-                     [--machines machines.json] [--key KEY]
+    wiring.py {derive|describe} [--dt ROOT | --dtb FILE.dtb | --hw HW.json]
+                                (--tuning-json DUMP.json | -- TUNING-CLI-ARGS...) [--key KEY]
+    wiring.py hardware [--dt ROOT | --dtb FILE.dtb | --hw HW.json]
 
 The protect stage needs two maps (packaging/session/gen.py):
 
@@ -46,13 +47,13 @@ Anything missing, unknown or ambiguous is refused with a message saying
 what, never guessed. The self-check (speakerguardd-selfcheck) then proves
 the hardware half on the running Mac, silently.
 
-machines.json is an optional override: an entry states a whole hand map
-(unit_channels, default the identity; sense_pairs "vi" | "iv", default
-"vi"), and `disagreements()` lists every place it and the derivation
-differ. An entry with `"wiring": "derive"` states no map. Only an entry with
-`"wiring": "hand-by-design"` (a board whose wiring cannot be derived by
-design) lets the self-check run on its hand map when the derivation
-refuses; any other board fails instead.
+The rest of the machine description comes from the same device tree
+(`describe()`): the machine key (the card's "apple,<key>-macaudio"
+compatible, which also names its voicing graph), the ALSA card id (macaudio
+names it "Apple" and the model's last word), the model, and the transport
+(the speaker link's CPU DAI driver: its sample formats and how its rings
+advance). Nothing per board is written by hand; the self-check confirms the
+card id and the speaker format against ALSA on the running Mac.
 """
 import hashlib
 import json
@@ -60,6 +61,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 
 SCHEMA = 1
 
@@ -78,6 +80,37 @@ AMPS = {
 }
 # The sense PCM's sample width (macaudio: 16-bit sense slots, S16_LE).
 SENSE_BITS = 16
+
+# The speaker link's CPU DAI drivers, by device-tree compatible (the kernel
+# binds the node's first compatible it knows, so the first match in the
+# node's list wins). Per driver, not per board:
+#
+# - formats: the speaker PCM's sample formats (the driver's hw constraints;
+#   the speaker format is the first of FORMAT_ORDER it takes, the order the
+#   self-check tries on the running card);
+# - sense_batch: whether the sense ring's pointer advances by periods
+#   (PipeWire's batch handling fits it) or in small chunks (the AOP sense
+#   ring's 120 frames, where batch handling makes the follower resync);
+# - speaker_headroom: frames of extra queue on the speaker sink (the AOP
+#   speaker service's DMA cadence underran without 256).
+TRANSPORTS = {
+    # sound/soc/apple/mca.c: S16_LE, S24_LE, S32_LE
+    "apple,mca": {"transport": "mca", "formats": ["S16_LE", "S24_LE", "S32_LE"], "sense_batch": True, "speaker_headroom": 0},
+    # sound/soc/apple/aop_spkr.rs (T6040 speaker service): S24_LE playback, S16_LE sense
+    "apple,t6041-aop-audio": {"transport": "aop-spkr", "formats": ["S24_LE"], "sense_batch": False, "speaker_headroom": 256},
+    # sound/soc/apple/aop_t8140.rs: S32_LE playback, no sense
+    "apple,t8140-aop-audio": {"transport": "aop-t8140", "formats": ["S32_LE"], "sense_batch": True, "speaker_headroom": 0},
+}
+# The self-check's probe order on the speaker PCM.
+FORMAT_ORDER = ["S24_LE", "S32_LE", "S16_LE"]
+# ALSA format -> PipeWire audio.format (the 24-bit samples sit in 32-bit words).
+PW_FORMAT = {"S24_LE": "S24_32LE", "S32_LE": "S32LE", "S16_LE": "S16LE"}
+# Frames of headroom on a V/I sense follower: a graph cycle may run this late
+# before PipeWire resyncs the sense against the program.
+SENSE_HEADROOM = 512
+# The sgv2 LV2 bundle's variants (crates/sgv2-lv2 VARIANTS):
+# (amps, sense channels) -> URI fragment.
+PLUGINS = {(2, 0): "2ch", (2, 4): "2ch-vi", (4, 0): "4ch", (4, 8): "4ch-vi", (6, 12): "6ch-vi"}
 
 _PREFIX = re.compile(r"^(?:(Left|Right)\s+)?(Woofer|Tweeter|Speaker|Full[- ]Range)(?:\s+(\d+))?$")
 _ROLES = {"woofer": "woofer", "tweeter": "tweeter", "speaker": "full", "full-range": "full", "full range": "full"}
@@ -185,7 +218,13 @@ def _links(snd, root, phandles, sysfs):
             if i2c:
                 c["i2c"] = i2c
             codecs.append(c)
-        links.append({"name": _str(_read(os.path.join(p, "link-name"))), "cpus": len(cpu), "codecs": codecs})
+        cpu_compat = []
+        for node in cpu:
+            f = os.path.join(node, "compatible")
+            cpu_compat.append(_strs(_read(f)) if os.path.exists(f) else [])
+        links.append(
+            {"name": _str(_read(os.path.join(p, "link-name"))), "cpus": len(cpu), "cpu_compatible": cpu_compat, "codecs": codecs}
+        )
     return links
 
 
@@ -217,6 +256,7 @@ def read_dt(root="/proc/device-tree", sysfs="/sys/bus/i2c/devices"):
         "board": board_of(compatible),
         "compatible": compatible,
         "sound": os.path.relpath(snd, root),
+        "sound_compatible": _strs(_read(os.path.join(snd, "compatible"))),
         "model": _str(_read(model)) if os.path.exists(model) else None,
         "links": links,
     }
@@ -227,6 +267,133 @@ def board_of(compatible):
     if not first.startswith("apple,") or first == "apple,":
         raise Refused(f"root compatible {first!r} is not an Apple board")
     return first[len("apple,") :]
+
+
+def _fdt_to_dir(blob, out):
+    """Writes a flattened device tree (a .dtb) out as /proc/device-tree
+    does: a directory per node, a file per property."""
+    import struct
+
+    magic, _size, off_struct, off_strings = struct.unpack(">IIII", blob[:16])
+    if magic != 0xD00DFEED:
+        raise Refused("not a flattened device tree (bad magic)")
+    i, path = off_struct, [out]
+    while True:
+        (tok,) = struct.unpack(">I", blob[i : i + 4])
+        i += 4
+        if tok == 1:  # FDT_BEGIN_NODE
+            end = blob.index(b"\0", i)
+            name = blob[i:end].decode()
+            i = (end + 4) & ~3
+            path.append(os.path.join(path[-1], name) if name else path[-1])
+            os.makedirs(path[-1], exist_ok=True)
+        elif tok == 2:  # FDT_END_NODE
+            path.pop()
+        elif tok == 3:  # FDT_PROP
+            ln, nameoff = struct.unpack(">II", blob[i : i + 8])
+            i += 8
+            name = blob[off_strings + nameoff : blob.index(b"\0", off_strings + nameoff)].decode()
+            with open(os.path.join(path[-1], name), "wb") as f:
+                f.write(blob[i : i + ln])
+            i = (i + ln + 3) & ~3
+        elif tok == 4:  # FDT_NOP
+            continue
+        elif tok == 9:  # FDT_END
+            return
+        else:
+            raise Refused(f"device tree token {tok:#x} at {i - 4}")
+
+
+def read_dtb(path):
+    """read_dt() on a compiled device tree (the kernel build's .dtb): the
+    same description, without the I2C bindings only a running Mac has."""
+    with tempfile.TemporaryDirectory() as d:
+        root = os.path.join(d, "dt")
+        os.makedirs(root)
+        _fdt_to_dir(_read(path), root)
+        return read_dt(root, sysfs=os.path.join(d, "no-sysfs"))
+
+
+_KEY = re.compile(r"^apple,([a-z0-9]+)-macaudio$")
+
+
+def machine_key(hw):
+    """The machine key ("j316" for the J316s and J316c): the speaker card's
+    own "apple,<key>-macaudio" compatible, the configuration macaudio runs
+    and the name of the machine's voicing graph."""
+    for c in hw.get("sound_compatible") or []:
+        m = _KEY.match(c)
+        if m:
+            return m.group(1)
+    raise Refused(f"the speaker card's compatible {hw.get('sound_compatible')} names no apple,<machine>-macaudio")
+
+
+def card_id(hw):
+    """The ALSA card id macaudio gives the card: "Apple" and the last word
+    of the device tree's model, in the 15 characters ALSA keeps."""
+    model = (hw.get("model") or "").strip()
+    if not model:
+        raise Refused("the speaker card has no model: macaudio names no card id")
+    return ("Apple" + model.split()[-1])[:15]
+
+
+def transport(hw):
+    """The speaker link's transport (TRANSPORTS), from its CPU DAI nodes'
+    compatibles. Every back-end must be the same driver."""
+    link = _speaker_link(hw)
+    found = []
+    for compat in link.get("cpu_compatible") or []:
+        t = next((TRANSPORTS[c] for c in compat if c in TRANSPORTS), None)
+        if t is None:
+            raise Refused(f"speaker back-end {', '.join(compat) or '(no compatible)'} is not a transport this derivation knows")
+        found.append(t)
+    if not found:
+        raise Refused("the speaker dai-link names no CPU DAI compatible")
+    if any(t is not found[0] for t in found):
+        raise Refused(f"mixed speaker transports: {sorted({t['transport'] for t in found})}")
+    return dict(found[0])
+
+
+def speaker_format(t):
+    """The speaker PCM's ALSA format: the first of FORMAT_ORDER the
+    transport takes."""
+    fmt = next((f for f in FORMAT_ORDER if f in t["formats"]), None)
+    if fmt is None:
+        raise Refused(f"transport {t['transport']} takes none of {FORMAT_ORDER}")
+    return fmt
+
+
+def describe(hw, w):
+    """Everything the protect stage's graph needs that is not the channel
+    map: derived from the device tree (and the wiring derived from it).
+    The self-check checks the card id and the format against ALSA."""
+    t = transport(hw)
+    n, s = len(w["amps"]), len(w["sense"])
+    plugin = PLUGINS.get((n, s))
+    if plugin is None:
+        raise Refused(f"no sgv2 plugin variant for {n} amps and {s} sense channels")
+    fmt = speaker_format(t)
+    return {
+        "key": machine_key(hw),
+        "card": card_id(hw),
+        "name": hw.get("model") or card_id(hw),
+        "transport": t["transport"],
+        "amps": n,
+        "sense": s,
+        "plugin": plugin,
+        "alsa_format": fmt,
+        "speaker_format": PW_FORMAT[fmt],
+        "speaker_headroom": t["speaker_headroom"],
+        "sense_headroom": SENSE_HEADROOM if s else 0,
+        "sense_batch": t["sense_batch"],
+    }
+
+
+def _speaker_link(hw):
+    spk = [l for l in hw["links"] if l["name"] in ("Speaker", "Speakers")]
+    if len(spk) != 1:
+        raise Refused(f"{len(spk)} speaker dai-links in the device tree (want 1)")
+    return spk[0]
 
 
 def tdm_slots(n_codecs, n_bes):
@@ -251,10 +418,7 @@ def tdm_slots(n_codecs, n_bes):
 def hardware(hw):
     """The speaker amps in physical (speaker PCM) order, each with its
     side, role, ordinal, slot and sense channels."""
-    spk = [l for l in hw["links"] if l["name"] in ("Speaker", "Speakers")]
-    if len(spk) != 1:
-        raise Refused(f"{len(spk)} speaker dai-links in the device tree (want 1)")
-    link = spk[0]
+    link = _speaker_link(hw)
     codecs = link["codecs"]
     if not codecs:
         raise Refused("the speaker dai-link lists no amps")
@@ -386,7 +550,7 @@ def derive(hw, dump, key=None):
     w = {
         "schema": SCHEMA,
         "board": hw["board"],
-        "key": key or hw["board"],
+        "key": key or machine_key(hw),
         "model": hw.get("model"),
         "family": amps[0]["family"],
         "aid": rl["aid"],
@@ -411,65 +575,6 @@ def wiring_hash(w):
     return hashlib.sha256(json.dumps(core, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:16]
 
 
-def sense_ports_from_pairs(unit, pairs, amps):
-    """The legacy machines.json form: the sense PCM carries the amps in
-    physical order, two channels each, V first ("vi") or I first ("iv")."""
-    if pairs not in ("vi", "iv"):
-        raise Refused(f"sense_pairs {pairs!r} is neither 'vi' nor 'iv'")
-    ports = []
-    for k in range(2 * amps):
-        is_v = (k % 2 == 0) == (pairs == "vi")
-        ports.append(2 * unit[k // 2] + (0 if is_v else 1))
-    return ports
-
-
-def apply_override(w, entry):
-    """The wiring with a machines.json entry's hand map applied, and the
-    list of every place the hand map and the derivation disagree.
-
-    An entry states a whole map, with the defaults gen.py has always used:
-    unit_channels the identity, sense_pairs "vi". (The J616s template said
-    nothing, so it said [V, I], and that was wrong.) An entry with
-    `"wiring": "derive"` states none, and the derivation stands alone."""
-    if entry.get("wiring") == "derive":
-        out = json.loads(json.dumps(w))
-        out["override"] = []
-        return out, []
-    out = json.loads(json.dumps(w))
-    n = len(w["amps"])
-    unit = entry.get("unit_channels", list(range(n)))
-    if sorted(unit) != list(range(n)):
-        raise Refused(f"override unit_channels {unit} is not a permutation of {n} channels")
-    out["unit_channels"] = list(unit)
-    for a, u in zip(out["amps"], unit):
-        a["unit"] = u
-    ports = sense_ports_from_pairs(out["unit_channels"], entry.get("sense_pairs", "vi"), n) if w["sense"] else []
-    out["sense_ports"] = ports
-    for s, port in zip(out["sense"], ports):
-        s["port"] = port
-        # what the hand map claims each sense channel carries
-        s["amp"] = out["unit_channels"].index(port // 2)
-        s["kind"] = "V" if port % 2 == 0 else "I"
-    out["override"] = sorted(k for k in ("unit_channels", "sense_pairs") if k in entry) or ["defaults"]
-    out["hash"] = wiring_hash(out)
-    return out, disagreements(w, out)
-
-
-def disagreements(derived, effective):
-    out = []
-    if derived["unit_channels"] != effective["unit_channels"]:
-        out.append(
-            "unit_channels: the hand map says %s, the device tree and tuning say %s"
-            % (effective["unit_channels"], derived["unit_channels"])
-        )
-    if derived["sense_ports"] != effective["sense_ports"]:
-        out.append(
-            "sense_ports: the hand map says %s, the device tree says %s"
-            % (effective["sense_ports"], derived["sense_ports"])
-        )
-    return out
-
-
 def role_errors(w, units):
     """Every physical channel whose amp is not the speaker its unit channel
     models (side and role), for any map, derived or not."""
@@ -481,14 +586,6 @@ def role_errors(w, units):
                 f"physical channel {p} ({a['prefix']}) feeds unit channel {a['unit']}, which the tuning models as {side} {role}"
             )
     return errs
-
-
-def machine_entry(machines, board):
-    """The machines.json key and entry for a board ("j316s" -> "j316")."""
-    for k, c in machines.items():
-        if board in c.get("boards", [k]) or board == k:
-            return k, c
-    return None, None
 
 
 def tuning_dump(cli_args, cli="aurora-speaker-tuning"):
@@ -505,30 +602,26 @@ def main(argv):
     import argparse
 
     ap = argparse.ArgumentParser(prog="wiring.py")
-    ap.add_argument("cmd", choices=["derive", "hardware"])
+    ap.add_argument("cmd", choices=["derive", "hardware", "describe"])
     ap.add_argument("--dt", default="/proc/device-tree")
+    ap.add_argument("--dtb", help="a compiled device tree (.dtb) instead of the live one")
     ap.add_argument("--hw", help="a hardware description (JSON) instead of the live device tree")
     ap.add_argument("--tuning-json")
     ap.add_argument("--tuning-cli", default="aurora-speaker-tuning")
-    ap.add_argument("--machines")
     ap.add_argument("--key")
     ap.add_argument("rest", nargs="*", help="after --: the tuning reader's source arguments")
     a = ap.parse_args(argv)
     try:
-        hw = json.load(open(a.hw)) if a.hw else read_dt(a.dt)
+        hw = json.load(open(a.hw)) if a.hw else read_dtb(a.dtb) if a.dtb else read_dt(a.dt)
         if a.cmd == "hardware":
             print(json.dumps({"hw": hw, "amps": hardware(hw)}, indent=1))
             return 0
         dump = json.load(open(a.tuning_json)) if a.tuning_json else tuning_dump(a.rest, a.tuning_cli)
         w = derive(hw, dump, a.key)
-        if a.machines:
-            k, entry = machine_entry(json.load(open(a.machines)), hw["board"])
-            if entry:
-                w["key"] = k
-                w, dis = apply_override(w, entry)
-                w["disagreements"] = dis
+        if a.cmd == "describe":
+            w = {"wiring": w, "machine": describe(hw, w)}
         print(json.dumps(w, indent=1))
-        return 1 if w.get("disagreements") else 0
+        return 0
     except Refused as e:
         print(f"wiring: refused: {e}", file=sys.stderr)
         return 2

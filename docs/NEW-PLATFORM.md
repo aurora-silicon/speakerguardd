@@ -12,12 +12,13 @@ hand-written template and with nobody at the machine.
 | Protection unit | spp3 only | spp3 is at parity. lsm2 and atsp are pending. |
 | Kernel driver | no | A `macaudio` match entry and a device tree for the board. |
 | Tuning | yes | The installer collects the Mac's tuning bundle. |
-| Parameter blob | partly | Compiled and bound at boot by `speakerguardd-provision`. The compiler has a table of boards, so a new board needs an entry. |
+| Parameter blob | yes | Compiled and bound at boot by `speakerguardd-provision`. The compiler has no table of boards. |
 | Configuration and seat user | yes | Written at boot by `speakerguardd-provision`; the seat user is resolved by name. |
-| Fleet gate | data | `gate.json` and the board's `machines.json` entry (`unit`, `qualified`); the kernel's interface picks v2 or the older daemons. |
+| Fleet gate | data | `gate.json` (policy only: `units_at_parity`, and per unit the `qualified` boards); the unit is the one the Mac's own tuning names; the kernel's interface picks v2 or the older daemons. |
 | Channel map and V/I order | yes | Derived from the device tree and the tuning, then checked by the self-check (MCA and AOP paths; the J700 is derived but cannot be proven silently). |
 | PipeWire and WirePlumber files | yes | Generated from the self-check's record. |
-| Supervisor | yes, for SN012776 amps | Takes its machine description from the self-check's record. |
+| Machine description | yes | Derived from the device tree (`wiring.describe`): the machine key, card id, model, amp and sense counts, plugin variant, speaker format and buffering (per transport driver); the self-check confirms the card id and the format against ALSA. There is no `machines.json`. |
+| Supervisor | yes, for SN012776 and MAX98360A amps | Takes its machine description from the self-check's record; there is no table of boards. |
 | LV2 plugin variant | 2, 4 or 6 amps | Any other amp count needs a new variant. |
 | Voicing (the stages before protection) | no | Still the interim asahi-audio graph. A new board has none yet. |
 
@@ -76,10 +77,12 @@ The reader then finds the protection unit and, for each unit channel:
   whose name ends in `LF` or `HF`). With no crossover branch, every channel
   is full-range.
 
-**Code change needed:** the blob compiler (`aurora-speaker-tuning compile`)
-still looks the board up in its own table (`machine.rs`) to get the amp count
-and gain step. A new board needs an entry there, until the compiler takes
-that description from the self-check's record instead.
+The blob compiler (`aurora-speaker-tuning compile`) needs nothing about the
+board but its name, from the device tree. The amp count and the amp gain
+are checked on the running Mac: the self-check refuses a tuning whose unit
+channels are not the device tree's amps, and the supervisor checks the
+blob's channels against the self-check's record and its operating point
+against the amps' "Amp Gain Volume" readback.
 
 ## 4. Provisioning (`speakerguardd-provision`)
 
@@ -131,11 +134,10 @@ Distributions install v2 on every Mac beside the older daemons
 (speakerguardd 0.1 and speakersafetyd). The gate is the `ExecCondition=` of
 both, so exactly one stack runs on a board:
 
-- v2 runs when the board's protection unit is at parity (`gate.json`
-  `units_at_parity`; the unit is the `machines.json` entry's, or the
-  tuning's for a board without one), the board passed an audible run (its
-  entry's `qualified` list, while `require_qualified_board` is true), and
-  the kernel has the v2 interface ("Speaker Protection");
+- v2 runs when the protection unit the Mac's own tuning names is at parity
+  (`gate.json` `units_at_parity`), the board passed an audible run (that
+  unit's `qualified` list in `gate.json`, while `require_qualified_board` is
+  true), and the kernel has the v2 interface ("Speaker Protection");
 - the older daemons run when v2 does not and the kernel has no v2
   interface.
 
@@ -162,10 +164,16 @@ supervisor, while the kernel holds the speakers at the floor.
    If anything is missing, unknown or ambiguous, the derivation refuses and
    says why. Examples: an amp with no prefix, two amps with the same side,
    role and ordinal, a slot that leaves gaps, or a tuning that sets
-   `SpeakerInputDataSourceOrder`. A `machines.json` entry is only an
-   optional override. It states a whole map, with gen.py's defaults
-   (identity order, `vi` pairs), and any disagreement with the derivation
-   fails the check. An entry with `"wiring": "derive"` states no map.
+   `SpeakerInputDataSourceOrder`. There is no hand map to fall back on:
+   a refusal fails the check.
+
+   The rest of the machine description comes from the same device tree
+   (`wiring.describe`): the machine key (`apple,<key>-macaudio`), the ALSA
+   card id macaudio derives from the model ("Apple" and its last word), the
+   amp and sense counts, the LV2 variant, and from the speaker link's CPU
+   DAI driver (MCA, the T6040 AOP speaker service, the T8140 AOP) the
+   speaker format and the PipeWire buffering. The check fails if ALSA's card
+   id or the format the speaker PCM takes disagree.
 2. **Check the map against the tuning.** Each physical channel's amp, by its
    device-tree side and role, must be the speaker its unit channel models.
 3. **Check the map against the hardware, silently.** Every sample of the
@@ -195,13 +203,16 @@ supervisor, while the kernel holds the speakers at the floor.
    runs the check again. A failure logs every reason and leaves the floor in
    place.
 
-For a board with no `machines.json` entry:
+On every Mac, known or new:
 
 - `speakerguardd-selfcheck generate` writes the PipeWire and WirePlumber
   files from the record;
 - the session helper reads the card and channel counts from the record;
-- the supervisor builds its machine description from the record. This works
-  for SN012776 amps only, which have an operating-point check.
+- the supervisor builds its machine description from the record: SN012776
+  amps (proven, `method=derived`, checked against their gain readback) and
+  MAX98360A pairs (`method=derived-static`; their gain is a strap no
+  software can read, so the blob's channels must share the tuning's own
+  full scale).
 
 The check takes about 13 s on the J316 (13 captures of 0.4 s) and about 8 s
 on the J413. A boot that has a valid record only checks the binding.
@@ -220,26 +231,28 @@ on the J413. A boot that has a valid record only checks the binding.
   The SpeakerTap returns the words on the wire, so a marker on it could
   prove the PCM-to-frame order (not the strap), but only with non-zero
   samples. That is not done without an explicit OK.
-- **Fallback:** a board the derivation refuses but `machines.json` names
-  keeps its hand map, marked `method=hand` (unproven).
 - **The voicing graph.** The WirePlumber file still points at the interim
   asahi-audio graph for the machine. A new board has no such graph, so its
   protect stage runs, but nothing feeds it until the voicing is generated
   from the tuning bundle (lane B).
 - **Other amp families.** TAS2770 (M1) has no register check and no
   operating-point check in the supervisor.
+- **Not derivable from the device tree.** The amp gain is macaudio's
+  per-configuration `amp_gain`, not a device-tree property: offline nothing
+  can check it, and the supervisor checks it on the card. A new transport
+  driver (a CPU DAI compatible not in `wiring.py` TRANSPORTS) is refused
+  until its formats and ring behaviour are added there.
 
 ## 8. Checklist for a new Mac
 
 1. Kernel: add the `macaudio` match entry and the board's device tree with
    the amps (section 2).
-2. Compiler: add the board to `aurora-speaker-tuning`'s machine table, until
-   it reads the description from the record.
-3. Confirm the unit is spp3. If it is lsm2 or atsp, wait for that unit's
+2. Confirm the unit is spp3. If it is lsm2 or atsp, wait for that unit's
    parity.
-4. Confirm the amp count has an LV2 variant (2, 4 or 6).
-5. Add its `machines.json` entry (`unit`, `qualified` after its audible
-   run), or, once `require_qualified_board` is false, nothing.
+3. Confirm the amp count has an LV2 variant (2, 4 or 6), and the speaker
+   link's CPU DAI driver is in `wiring.py` TRANSPORTS.
+4. After its audible run, add the board to its unit's `qualified` list in
+   `gate.json`; once `require_qualified_board` is false, nothing.
 6. Everything else is automatic: the installer collects the tuning,
    provisioning compiles and binds it and configures the units, the
    self-check derives and proves the wiring at first boot, and the graph is

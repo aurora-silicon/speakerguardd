@@ -243,6 +243,44 @@ fn units_table_covers_every_sidecar_key() {
     assert!(t.iter().filter(|r| r.unit.contains("TODO(SPEC)")).count() > 0);
 }
 
+#[test]
+fn the_manifest_names_the_dsp_database() {
+    // macOS 27 keeps the database per AID (AID<n>/DSP/DSPDatabase.plist)
+    // and has no shared DeviceDSPDatabase.plist; the installer names which.
+    let mut files = spp3_files(2);
+    let alt = files[&format!("{AID}/DSP/Strips/builtin_speaker_out_general.austrip")].clone();
+    files.insert(format!("{AID}/DSP/Strips/builtin_speaker_out_general_3.austrip"), alt);
+    files.remove("DeviceDSPDatabase.plist").unwrap();
+    let per_aid = format!("{AID}/DSP/DSPDatabase.plist");
+    files.insert(
+        per_aid.clone(),
+        database(&[(65535, "builtin_speaker_out_general.austrip"), (3, "builtin_speaker_out_general_3.austrip")]),
+    );
+    let manifest = manifest_json_with(&files, "26A428", Some(3)).replace(
+        r#""device_dsp_database":"DeviceDSPDatabase.plist""#,
+        &format!(r#""device_dsp_database":"{per_aid}""#),
+    );
+    let dir = scratch("e2e-db-per-aid");
+    write_dir(&dir, &files, &manifest);
+    let b = Bundle::open(&dir).unwrap();
+    assert_eq!(b.manifest.dsp_database.as_deref(), Some(per_aid.as_str()));
+    let t = load_with(&b, Options::default()).unwrap();
+    // The vendor strip for the manifest's speaker ID, not the generic one.
+    assert!(t.selection.strip.ends_with("_3.austrip"), "{}", t.selection.strip);
+    // The manifest names the shared database, which is missing: an error,
+    // never a silent switch to the other file.
+    let manifest_shared = manifest_json_with(&files, "26A428", Some(3)).replace(
+        r#""device_dsp_database":"DeviceDSPDatabase.plist""#,
+        r#""device_dsp_database":"AID1/DSP/DSPDatabase.plist""#,
+    );
+    let dir = scratch("e2e-db-wrong-aid");
+    write_dir(&dir, &files, &manifest_shared);
+    assert!(Bundle::open(&dir).is_err());
+    let dir = scratch("e2e-db-unlisted");
+    write_dir(&dir, &files, &manifest_json_with(&files, "26A428", Some(3)));
+    assert!(Bundle::open(&dir).is_err());
+}
+
 /// The digest provisioning binds a blob to: the same for the same bundle
 /// wherever and however it is stored, different for any change it states.
 #[test]

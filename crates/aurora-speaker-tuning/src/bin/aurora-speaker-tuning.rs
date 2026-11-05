@@ -267,8 +267,9 @@ fn human(t: &Tuning) {
     }
     if let Some(sp) = &t.spts {
         println!(
-            "\nSpTS v{}: {} records (checksum 0x{:04x} {})",
+            "\nSpTS v{} ({:?} header): {} records (checksum 0x{:04x} {}); record i calibrates unit channel i",
             sp.version,
+            sp.form,
             sp.records.len(),
             sp.checksum_stored,
             if sp.checksum_valid { "valid" } else { "INVALID" }

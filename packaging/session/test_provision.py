@@ -54,11 +54,35 @@ elif cmd == "dump":
     print(json.dumps({"tuning": {"protection": {"kind": ctl.get("unit", "spp3")}}}))
 '''
 
-MACHINES = {
-    "j316": {"unit": "spp3", "qualified": ["j316s"], "boards": ["j316s", "j316c"], "card": "AppleJ316"},
-    "j413": {"unit": "spp3", "qualified": [], "boards": ["j413"], "card": "AppleJ413"},
-    "j700": {"unit": "lsm2", "qualified": [], "boards": ["j700"], "card": "AppleJ700"},
-}
+# The test gate: only j316s has qualified.
+GATE = {"units_at_parity": ["spp3"], "require_qualified_board": True, "qualified": {"spp3": ["j316s"]}}
+
+
+def write_dt(root, board):
+    """A synthetic device tree: the root compatible and one macaudio card
+    with a speaker link (one back-end, one amp), whose machine key is the
+    board without its s/c suffix and whose model ends in that key."""
+    key = board.rstrip("sc")
+
+    def node(path, props, phandle=None):
+        d = os.path.join(root, path)
+        os.makedirs(d, exist_ok=True)
+        for k, v in props.items():
+            with open(os.path.join(d, k), "wb") as f:
+                f.write(v)
+        if phandle:
+            with open(os.path.join(d, "phandle"), "wb") as f:
+                f.write(phandle.to_bytes(4, "big"))
+
+    for d in ("sound", "soc"):
+        shutil.rmtree(os.path.join(root, d), ignore_errors=True)
+    node(".", {"compatible": f"apple,{board}\0apple,t6000\0".encode()})
+    node("soc/be", {"compatible": b"apple,mca\0", "#sound-dai-cells": (1).to_bytes(4, "big")}, 0x10)
+    node("soc/amp", {"compatible": b"ti,sn012776\0", "sound-name-prefix": b"Speaker\0"}, 0x11)
+    node("sound", {"compatible": f"apple,{key}-macaudio\0apple,macaudio\0".encode(), "model": f"Test Mac {key.upper()}\0".encode()})
+    node("sound/dai-link@0", {"link-name": b"Speakers\0"})
+    node("sound/dai-link@0/cpu", {"sound-dai": (0x10).to_bytes(4, "big") + (0).to_bytes(4, "big")})
+    node("sound/dai-link@0/codec", {"sound-dai": (0x11).to_bytes(4, "big")})
 
 ME = pwd.getpwuid(os.getuid())
 
@@ -77,13 +101,10 @@ class Base(unittest.TestCase):
             f.write(FAKE_CLI)
         os.chmod(self.cli, 0o755)
         self.ctl({})
-        self.machines = os.path.join(self.t, "machines.json")
-        with open(self.machines, "w") as f:
-            json.dump(MACHINES, f)
         self.p = prov.Paths(self.root)
         self.saved = {}
         # The live machine's card, seat and users are stand-ins.
-        self.patch(prov, "find_card", lambda entry, wait: (0, entry["card"] if entry else "AppleX"))
+        self.patch(prov, "find_card", lambda want, wait: (0, want))
         self.patch(prov, "speaker_pcm", lambda idx: 1)
         self.patch(prov, "seat0_user", lambda rng: None)
         self.patch(prov, "autologin_user", lambda etc: None)
@@ -100,8 +121,7 @@ class Base(unittest.TestCase):
         setattr(mod, name, value)
 
     def board(self, b):
-        with open(os.path.join(self.dt, "compatible"), "wb") as f:
-            f.write(f"apple,{b}\0apple,t6000\0".encode())
+        write_dt(self.dt, b)
 
     def ctl(self, d):
         with open(os.path.join(os.path.dirname(self.cli), "ctl.json"), "w") as f:
@@ -116,7 +136,7 @@ class Base(unittest.TestCase):
 
     def args(self, cmd="run", **kw):
         a = dict(cmd=cmd, bundle=None, force=False, unit="speakerguardd.service", graph_unit="speakerguardd-graph.service", root=self.root,
-                 machines=self.machines, tuning_cli=self.cli, dt=self.dt, etc=os.path.join(self.t, "etc"), card_wait=0)
+                 tuning_cli=self.cli, dt=self.dt, etc=os.path.join(self.t, "etc"), card_wait=0)
         a.update(kw)
         return types.SimpleNamespace(**a)
 
@@ -208,7 +228,7 @@ class Provision(Base):
         self.assert_closed("no seat user: 2 regular users (alice, bob)")
 
     def test_fails_closed_without_a_card(self):
-        def nocard(entry, wait):
+        def nocard(want, wait):
             raise prov.Failed("no speaker card (apple,macaudio) after 0 s")
         self.patch(prov, "find_card", nocard)
         self.assertEqual(self.run_(), 1)
@@ -360,13 +380,13 @@ class Gate(Base):
     def decide(self, iface="v2", gate_data=None, allow=False):
         g = os.path.join(self.t, "gate.json")
         with open(g, "w") as f:
-            json.dump(gate_data or {"units_at_parity": ["spp3"], "require_qualified_board": True}, f)
-        self.patch(gate, "kernel_interface", lambda entry, wait: (iface, "AppleX") if iface else (None, None))
+            json.dump(gate_data or GATE, f)
+        self.patch(gate, "kernel_interface", lambda wait: (iface, "AppleX") if iface else (None, None))
         self.patch(gate, "ALLOW", os.path.join(self.t, "allow"))
         if allow:
             with open(gate.ALLOW, "w") as f:
                 f.write("j413\n")
-        a = types.SimpleNamespace(gate=g, machines=self.machines, dt=self.dt, tuning_cli=self.cli, wait=0)
+        a = types.SimpleNamespace(gate=g, dt=self.dt, tuning_cli=self.cli, wait=0)
         v2, legacy, why = gate.decide(a)
         self.assertFalse(v2 and legacy, why)
         return v2, legacy
@@ -381,34 +401,39 @@ class Gate(Base):
         self.assertEqual(self.decide("legacy"), (False, True))
         self.assertEqual(self.decide("v2"), (False, False))
         self.assertEqual(self.decide("v2", allow=True), (True, False))
-        # lsm2 is not at parity.
+        # The unit is the one this Mac's tuning names: lsm2 is not at parity,
+        # even for a board the spp3 list names.
         self.board("j700")
+        self.ctl({"unit": "lsm2"})
         self.assertEqual(self.decide("legacy"), (False, True))
+        self.assertEqual(self.decide("v2"), (False, False))
+        self.board("j316s")
         self.assertEqual(self.decide("v2"), (False, False))
         # Option A: every unit at parity, no per-board run required.
         a = {"units_at_parity": ["spp3", "lsm2", "atsp"], "require_qualified_board": False}
         self.assertEqual(self.decide("v2", a), (True, False))
         self.board("j413")
-        self.assertEqual(self.decide("v2", a), (True, False))
-        # A board with no description: its tuning names the unit.
-        self.board("j999")
         self.ctl({"unit": "spp3"})
         self.assertEqual(self.decide("v2", a), (True, False))
-        self.ctl({"unit": "lsm2"})
+        # A new board: nothing about it is written anywhere.
+        self.board("j999")
+        self.assertEqual(self.decide("v2", a), (True, False))
         self.assertEqual(self.decide("v2"), (False, False))
+        # No tuning unit: never v2.
+        self.ctl({"no_bundle": True, "unit": None})
+        self.assertEqual(self.decide("v2", a), (False, False))
 
     def test_shipped_data(self):
         with open(os.path.join(HERE, "gate.json")) as f:
             g = json.load(f)
-        with open(os.path.join(HERE, "machines.json")) as f:
-            m = json.load(f)
         self.assertEqual(g["units_at_parity"], ["spp3"])
         self.assertTrue(g["require_qualified_board"])
-        for k, e in m.items():
-            self.assertIn(e["unit"], ("spp3", "lsm2", "atsp"), k)
-            self.assertTrue(set(e["qualified"]) <= set(e["boards"]), k)
-        qualified = sorted(b for e in m.values() if e["unit"] in g["units_at_parity"] for b in e["qualified"])
-        self.assertEqual(qualified, ["j316s", "j616s"])
+        self.assertEqual(sorted(g["qualified"]), ["atsp", "lsm2", "spp3"])
+        qualified = sorted(b for u in g["units_at_parity"] for b in g["qualified"].get(u, []))
+        self.assertEqual(qualified, ["j316s", "j413", "j616s"])
+        # policy only: no hardware in the gate
+        self.assertEqual(sorted(k for k in g if not k.startswith("_")), ["qualified", "require_qualified_board", "units_at_parity"])
+        self.assertFalse(os.path.exists(os.path.join(HERE, "machines.json")))
 
 
 class Units(unittest.TestCase):

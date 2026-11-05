@@ -9,8 +9,10 @@ mod common;
 use aurora_speaker_tuning::aupreset::{ParamSection, ParamState};
 use aurora_speaker_tuning::bundle::Bundle;
 use aurora_speaker_tuning::compile::{self as comp, lsm2_ids as id, Provenance};
+use aurora_speaker_tuning::fourcc::FourCc;
 use aurora_speaker_tuning::machine::Machine;
 use aurora_speaker_tuning::plist::Value;
+use aurora_speaker_tuning::spts::{self, SizeForm};
 use aurora_speaker_tuning::tuning::{Options, Tuning, UnitKind};
 use aurora_speaker_tuning::Diagnostics;
 use common::*;
@@ -85,15 +87,15 @@ fn spp3_fields_come_from_the_sidecar_and_state() {
         assert_eq!((x.imon_scale, x.vmon_scale), (2.0, 10.0));
         assert_eq!(x.cl_thermal_feedback_enabled, 1);
 
-        // spA<ch> carries raw R 3000+ch (Q6.10) and raw T 3100 (Q9.7).
+        // Record ch carries raw R 3000+ch (x0.001 ohm) and raw T 3100 (x0.01 C).
         assert_eq!(x.cal_present, 1);
-        assert_eq!((x.cal_r, x.cal_t), ((3000 + ch) as f32 / 1024.0, 3100.0 / 128.0));
+        assert_eq!((x.cal_r, x.cal_t), ((3000 + ch) as f32 * 0.001, 3100.0 * 0.01));
         assert_eq!((x.temp_sense_window_time_s, x.tlim_adj_cap, x.a_t_20c), (0.2, 40.0, 0.0039));
     }
 }
 
 #[test]
-fn spp3_calibration_needs_a_valid_matching_record() {
+fn spp3_calibration_needs_a_valid_record_per_channel() {
     // A bad checksum: every channel open loop.
     let mut f = spp3_files(4);
     let spts = f.get_mut("speaker-thiele-small.bin").unwrap();
@@ -102,14 +104,15 @@ fn spp3_calibration_needs_a_valid_matching_record() {
     let t = tuning_allowing(&f, "c-cal-bad", &["spts-checksum"]);
     let p = sgv2_core::spp3::Params::from_blob(&compile(&t, &mut Diagnostics::default()).unwrap().blob).unwrap();
     assert!(p.ch[..4].iter().all(|c| c.cal_present == 0));
-    // A record only for channel 2: the others open loop.
-    let mut f = spp3_files(4);
-    let id = aurora_speaker_tuning::fourcc::FourCc::from_str_exact("spA2").unwrap();
-    f.insert("speaker-thiele-small.bin".into(), aurora_speaker_tuning::spts::encode(&[(id, 3500, 3000)], 0));
-    let t = tuning_allowing(&f, "c-cal-one", &["spts-count"]);
-    let p = sgv2_core::spp3::Params::from_blob(&compile(&t, &mut Diagnostics::default()).unwrap().blob).unwrap();
-    let present: Vec<u32> = p.ch[..4].iter().map(|c| c.cal_present).collect();
-    assert_eq!(present, vec![0, 0, 1, 0]);
+    // Records bind by position, so a valid file with fewer (or more) records
+    // than channels is refused: there is no way to tell which is whose.
+    for k in [1usize, 3, 5] {
+        let mut f = spp3_files(4);
+        let recs: Vec<_> = (0..k).map(|i| (fcc(&format!("spA{i}")), 3500, 3000)).collect();
+        f.insert("speaker-thiele-small.bin".into(), spts::encode(&recs, 0));
+        let t = tuning_allowing(&f, &format!("c-cal-count-{k}"), &["spts-count"]);
+        assert!(compile(&t, &mut Diagnostics::default()).is_err(), "{k} records");
+    }
 }
 
 #[test]
@@ -126,49 +129,57 @@ fn spp3_start_state_follows_64007_per_aid() {
     }
 }
 
+fn fcc(s: &str) -> FourCc {
+    FourCc::from_str_exact(s).unwrap()
+}
+
+/// Compiles `spp3_files(4)` with `recs` as the record file in `form`.
+fn compile_records(form: SizeForm, recs: &[(FourCc, u16, u16)], name: &str) -> sgv2_core::spp3::Params {
+    let mut f = spp3_files(4);
+    f.insert("speaker-thiele-small.bin".into(), spts::encode_as(form, recs));
+    let t = tuning(&f, name);
+    sgv2_core::spp3::Params::from_blob(&compile(&t, &mut Diagnostics::default()).unwrap().blob).unwrap()
+}
+
 #[test]
-fn spp3_source_order_binds_sense_and_calibration() {
-    // 64005 reverses the four sources: channel c takes spA<3-c>.
-    let order = Value::Array(["spA3", "spA2", "spA1", "spA0"].iter().map(|x| s(x)).collect());
-    let mut f = spp3_files(4);
-    f.insert(
-        propstrip_path(),
-        propstrip_extra(&sidecar_name(), Some(2), vec![dict(vec![("Number", i(64005)), ("Array", order)])]),
-    );
-    let t = tuning(&f, "c-order");
-    let p = sgv2_core::spp3::Params::from_blob(&compile(&t, &mut Diagnostics::default()).unwrap().blob).unwrap();
-    for c in 0..4u32 {
-        let k = 3 - c;
-        let x = &p.ch[c as usize];
-        assert_eq!((x.sense_i, x.sense_v), (2 * k + 1, 2 * k), "channel {c}");
-        assert_eq!(x.cal_r, (3000 + k) as f32 / 1024.0, "channel {c}");
+fn spp3_records_bind_by_position_not_by_id() {
+    // Shaped like the M2: four records spA0 spA1 spA4 spA5 in the
+    // total-length header.  All four channels take their record in stored
+    // order; nothing is left for absent spA2/spA3.
+    let raw = |i: usize| (3000 + 100 * i as u16, 3000 + i as u16);
+    let sparse: Vec<_> =
+        ["spA0", "spA1", "spA4", "spA5"].iter().enumerate().map(|(i, s)| (fcc(s), raw(i).0, raw(i).1)).collect();
+    let p = compile_records(SizeForm::TotalLength, &sparse, "c-pos-sparse");
+    for c in 0..4 {
+        let x = &p.ch[c];
+        assert_eq!(x.cal_present, 1, "channel {c}");
+        assert_eq!((x.cal_r, x.cal_t), (f32::from(raw(c).0) * 0.001, f32::from(raw(c).1) * 0.01), "channel {c}");
+        // The sense pair follows the channel, never the record's ID.
+        assert_eq!((x.sense_i, x.sense_v), (2 * c as u32 + 1, 2 * c as u32), "channel {c}");
     }
-    // Integer FourCCs are the same order.
-    let ints = Value::Array(
-        ["spA3", "spA2", "spA1", "spA0"]
-            .iter()
-            .map(|x| i(u32::from_be_bytes(x.as_bytes().try_into().unwrap()).into()))
-            .collect(),
-    );
-    let mut f = spp3_files(4);
-    f.insert(
-        propstrip_path(),
-        propstrip_extra(&sidecar_name(), Some(2), vec![dict(vec![("Number", i(64005)), ("Array", ints)])]),
-    );
-    let q = sgv2_core::spp3::Params::from_blob(
-        &compile(&tuning(&f, "c-order-int"), &mut Diagnostics::default()).unwrap().blob,
-    )
-    .unwrap();
-    assert_eq!(q.ch[0].sense_v, 6);
-    // Malformed orders are refused, never guessed.
-    for (name, v) in [
-        ("short", Value::Array(vec![s("spA0"), s("spA1")])),
-        ("dup", Value::Array(vec![s("spA0"), s("spA0"), s("spA1"), s("spA2")])),
-        ("range", Value::Array(vec![s("spA0"), s("spA1"), s("spA2"), s("spA9")])),
-        ("name", Value::Array(vec![s("spA0"), s("spA1"), s("spA2"), s("left")])),
-        ("scalar", i(3)),
+    // The stride header with the same records binds the same.
+    assert_eq!(compile_records(SizeForm::RecordStride, &sparse, "c-pos-stride").ch, p.ch);
+    // Reversed IDs with the same values: the same binding (no sort by ID).
+    let mut rev = sparse.clone();
+    let ids: Vec<FourCc> = rev.iter().rev().map(|r| r.0).collect();
+    for (r, id) in rev.iter_mut().zip(ids) {
+        r.0 = id;
+    }
+    assert_eq!(compile_records(SizeForm::TotalLength, &rev, "c-pos-rev").ch, p.ch);
+    // IDs outside spA0..spA3, or not spA at all: still positional.
+    let odd: Vec<_> = sparse.iter().enumerate().map(|(i, r)| (FourCc(0x1000 + i as u32), r.1, r.2)).collect();
+    assert_eq!(compile_records(SizeForm::RecordStride, &odd, "c-pos-odd").ch, p.ch);
+}
+
+#[test]
+fn spp3_telemetry_order_is_refused() {
+    // 64005 orders the telemetry streams; its encoding is not specified, so
+    // any strip that sets it is refused, never applied to calibration.
+    for (name, key, v) in [
+        ("spa", "Array", Value::Array(["spA3", "spA2", "spA1", "spA0"].iter().map(|x| s(x)).collect())),
+        ("spvi", "Array", Value::Array(["spV0", "spI0", "spV1", "spI1"].iter().map(|x| s(x)).collect())),
+        ("scalar", "UInt32", i(3)),
     ] {
-        let key = if matches!(v, Value::Integer(_)) { "UInt32" } else { "Array" };
         let mut f = spp3_files(4);
         f.insert(
             propstrip_path(),
@@ -177,19 +188,6 @@ fn spp3_source_order_binds_sense_and_calibration() {
         let t = tuning(&f, &format!("c-order-{name}"));
         assert!(compile(&t, &mut Diagnostics::default()).is_err(), "{name}");
     }
-}
-
-#[test]
-fn spp3_records_must_belong_to_channels() {
-    // A record for a source no channel takes (spA7 on a four-channel unit).
-    let mut f = spp3_files(4);
-    let recs: Vec<_> = [0u32, 1, 2, 7]
-        .iter()
-        .map(|k| (aurora_speaker_tuning::fourcc::FourCc::from_str_exact(&format!("spA{k}")).unwrap(), 3000, 3100))
-        .collect();
-    f.insert("speaker-thiele-small.bin".into(), aurora_speaker_tuning::spts::encode(&recs, 0));
-    let t = tuning_allowing(&f, "c-cal-stray", &[]);
-    assert!(compile(&t, &mut Diagnostics::default()).is_err());
 }
 
 #[test]
@@ -224,10 +222,19 @@ fn compile_refuses_what_the_engine_must_not_run() {
 #[test]
 fn compile_binds_to_the_machine() {
     let t = tuning(&spp3_files(4), "c-machine");
-    // Another board's amp count, an unknown board, a board too long.
-    assert!(comp::compile(&t, &Machine::new("j616s").unwrap(), &mut Diagnostics::default()).is_err());
-    assert!(comp::compile(&t, &Machine::new("j274").unwrap(), &mut Diagnostics::default()).is_err());
-    assert!(Machine::new("j616s-too-long").is_err());
+    // No table of boards: any board that fits the header compiles, and the
+    // header names it (the amp count is the running Mac's to check).
+    for b in ["t4", "t999x"] {
+        let c = comp::compile(&t, &Machine::new(b).unwrap(), &mut Diagnostics::default()).unwrap();
+        assert_eq!(c.board, b);
+        assert_eq!(sgv2_core::blob::Header::parse(&c.blob).unwrap().0.machine(), Some(b));
+    }
+    // The board is all that differs.
+    let a = comp::compile(&t, &Machine::new("t4").unwrap(), &mut Diagnostics::default()).unwrap();
+    let b = comp::compile(&t, &Machine::new("t999x").unwrap(), &mut Diagnostics::default()).unwrap();
+    assert_eq!(a.blob.len(), b.blob.len());
+    assert!(a.blob[sgv2_core::blob::HEADER_LEN..] == b.blob[sgv2_core::blob::HEADER_LEN..]);
+    assert!(Machine::new("t4-too-long-board").is_err());
     // A known acoustic-id must match the bundle's.
     let mut m = j413();
     m.acoustic_id = Some(ACOUSTIC_ID + 1);
@@ -398,8 +405,8 @@ fn lsm2_channels_keep_their_own_full_scale_within_one_operating_point() {
 
 #[test]
 fn spp3_operating_point_is_the_peak_ag() {
-    // A tuning whose ag disagrees with the amp setting still compiles from
-    // its own ag, with a warning that the supervisor will not grant.
+    // The operating point is the tuning's own ag; the supervisor checks it
+    // against the amps' gain on the running card.
     let mut f = spp3_files(4);
     let mut v = sidecar_value(4);
     if let Value::Dict(d) = &mut v {
@@ -418,7 +425,6 @@ fn spp3_operating_point_is_the_peak_ag() {
     let mut d = Diagnostics::default();
     let c = compile(&t, &mut d).unwrap();
     assert_eq!(c.full_scale_mv, 9500);
-    assert!(d.items.iter().any(|x| x.code == "compile-full-scale"), "{:?}", d.items);
 }
 
 #[test]

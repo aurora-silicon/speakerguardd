@@ -61,7 +61,7 @@ mod linux {
 
     use sgv2_lv2::page::{EnginePage, LAYOUT, MAGIC, PAGE_BYTES};
     use sgv2_supervisor::kernel::{Kernel, KernelError, Macaudio};
-    use sgv2_supervisor::machine::{blob_full_scales, board_from_compatible, lookup, Machine};
+    use sgv2_supervisor::machine::{blob_full_scales, board_from_compatible, Machine};
     use sgv2_supervisor::observe::{
         combine, helper_is, owner_to_tgid, parse_pcm_info, parse_pcm_status, parse_session, parse_tgid,
         speaker_pcm_problem, EngineState, EngineView, Observer, PcmInfo, PcmState, PcmView, SessionReport, SessionView,
@@ -573,7 +573,7 @@ mod linux {
                 return EX_CONFIG;
             }
         };
-        let machine = match selfcheck::machine_for(&board, lookup(&board), &bind) {
+        let machine = match selfcheck::machine_for(&board, &bind) {
             Ok(m) => m,
             Err(why) => {
                 eprintln!("{why}; not granting (the kernel floor stays)");

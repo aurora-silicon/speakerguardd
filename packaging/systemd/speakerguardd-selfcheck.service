@@ -20,7 +20,7 @@ ExecCondition=/usr/libexec/speakerguardd/speakerguardd-gate v2
 # source the blob was compiled from, as aurora-speaker-tuning takes it
 # (empty: the installer's bundle in the vendor firmware).
 EnvironmentFile=-/etc/speakerguardd/speakerguardd.conf
-ExecStart=/usr/libexec/speakerguardd/speakerguardd-selfcheck run --params ${SGV2_PARAMS} --machines /usr/share/speakerguardd/machines.json -- $SGV2_TUNING
+ExecStart=/usr/libexec/speakerguardd/speakerguardd-selfcheck run --params ${SGV2_PARAMS} -- $SGV2_TUNING
 # Passed: generate the machine's PipeWire and WirePlumber files from the
 # record (/run/speakerguardd-graph) and bring the seat user's session onto
 # them. A failure here fails the check, so the supervisor does not start.

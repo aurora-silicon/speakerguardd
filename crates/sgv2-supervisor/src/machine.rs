@@ -1,9 +1,14 @@
-//! The machines the supervisor knows, and what each one's speaker card must
-//! show before protection is granted (KERNEL.md 2.3 and 2.4).
+//! The machine the supervisor runs on, and what its speaker card must show
+//! before protection is granted (KERNEL.md 2.3 and 2.4).
 //!
-//! The identity is the device tree's first root compatible ("apple,j316s").
-//! The parameter blob names the board it was compiled for, so a blob from
-//! another Mac, even one with the same channel geometry, is refused.
+//! Nothing here is per board. The identity is the device tree's first root
+//! compatible ("apple,j316s"); the parameter blob names the board it was
+//! compiled for, so a blob from another Mac, even one with the same channel
+//! geometry, is refused. The card, the amp count and the amp family come
+//! from the self-check's record ([`crate::selfcheck::machine_for`]), which
+//! derived them from this Mac's device tree and proved them on its card;
+//! the operating point comes from the blob, compiled from this Mac's own
+//! tuning, and is checked against the amps' gain readback.
 
 /// The speaker amp family.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,8 +45,27 @@ impl Amp {
     }
 
     /// Whether the full-scale voltage comes from an "Amp Gain Volume"
-    /// readback (otherwise it is the chip's fixed [`Machine::fixed_full_scale_mv`]).
+    /// readback. Without one (the MAX98360A's gain is a strap no software
+    /// can read) the operating point is the tuning's own, and only its
+    /// channels' agreement is checked (see `supervise::Expect`).
     pub fn has_gain_control(self) -> bool {
+        matches!(self, Amp::Sn012776)
+    }
+}
+
+impl Amp {
+    /// The family the self-check records (`family=` in the record: the
+    /// device-tree compatible's family, `wiring.py` AMPS).
+    pub fn from_family(family: &str) -> Option<Amp> {
+        match family {
+            "sn012776" => Some(Amp::Sn012776),
+            "max98360a" => Some(Amp::Max98360a),
+            _ => None,
+        }
+    }
+
+    /// Whether every amp returns V/I sense (two sense channels each).
+    pub fn has_sense(self) -> bool {
         matches!(self, Amp::Sn012776)
     }
 }
@@ -55,29 +79,6 @@ pub struct Machine {
     pub card_id: &'static str,
     pub amps: usize,
     pub amp: Amp,
-    /// For amps without a gain control: the output peak voltage at digital
-    /// full scale, mV.
-    pub fixed_full_scale_mv: u32,
-}
-
-const fn sn(board: &'static str, card_id: &'static str, amps: usize) -> Machine {
-    Machine { board, card_id, amps, amp: Amp::Sn012776, fixed_full_scale_mv: 0 }
-}
-
-/// The supported machines (packaging/session/machines.json).
-pub const MACHINES: &[Machine] = &[
-    sn("j316s", "AppleJ316", 6),
-    sn("j316c", "AppleJ316", 6),
-    sn("j616s", "AppleJ616", 6),
-    sn("j616c", "AppleJ616", 6),
-    sn("j413", "AppleJ413", 4),
-    // lsm2 VoltsFullScale (peak): 7300 mV left, 7330 mV right; both are
-    // within the tolerance of 7300 (0.04 dB).
-    Machine { board: "j700", card_id: "AppleJ700", amps: 2, amp: Amp::Max98360a, fixed_full_scale_mv: 7_300 },
-];
-
-pub fn lookup(board: &str) -> Option<&'static Machine> {
-    MACHINES.iter().find(|m| m.board == board)
 }
 
 /// The board from `/proc/device-tree/compatible` (NUL-separated): the first
@@ -153,13 +154,9 @@ mod tests {
         assert_eq!(board_from_compatible(b"apple,j616s\0apple,t6040\0").as_deref(), Some("j616s"));
         assert_eq!(board_from_compatible(b"vendor,board\0"), None);
         assert_eq!(board_from_compatible(b""), None);
-        assert_eq!(lookup("j316s").map(|m| (m.card_id, m.amps)), Some(("AppleJ316", 6)));
-        assert_eq!(lookup("j700").map(|m| m.amp), Some(Amp::Max98360a));
-        assert!(lookup("j274").is_none());
-        // every board fits the blob's machine field
-        for m in MACHINES {
-            assert!(sgv2_core::blob::machine_field(m.board).is_some(), "{}", m.board);
-        }
+        assert_eq!(Amp::from_family("sn012776"), Some(Amp::Sn012776));
+        assert_eq!(Amp::from_family("max98360a"), Some(Amp::Max98360a));
+        assert_eq!(Amp::from_family("tas2770"), None);
     }
 
     #[test]
