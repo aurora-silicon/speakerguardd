@@ -422,8 +422,15 @@ class Units(unittest.TestCase):
         for u in (sup, chk, prv, self.unit("speakerguardd-seat.service")):
             self.assertIn("ExecCondition=/usr/libexec/speakerguardd/speakerguardd-gate v2", u)
         self.assertIn("ExecStartPost=/usr/libexec/speakerguardd/speakerguardd-provision activate --graph-unit speakerguardd-graph.service", chk)
-        self.assertIn("ExecCondition=/usr/libexec/speakerguardd/speakerguardd-provision is-seat",
-                      self.unit("speakerguardd-session.service"))
+        ses = self.unit("speakerguardd-session.service")
+        self.assertIn("ExecCondition=/usr/libexec/speakerguardd/speakerguardd-provision is-seat", ses)
+        # Every program a unit runs is in one directory, so a package moves
+        # them all with one rewrite.
+        for name in ("speakerguardd-provision.service", "speakerguardd-selfcheck.service", "speakerguardd-session.service",
+                     "speakerguardd-seat.service", "speakerguardd-graph.service"):
+            for l in self.unit(name):
+                if l.startswith(("ExecStart=", "ExecStartPost=", "ExecCondition=")):
+                    self.assertTrue(l.split("=", 1)[1].startswith("/usr/libexec/speakerguardd/"), l)
         self.assertIn("Before=pipewire.service wireplumber.service", self.unit("speakerguardd-graph.service"))
         self.assertIn("ExecCondition=/usr/libexec/speakerguardd/speakerguardd-gate legacy", self.unit("legacy-gate.conf"))
         for u in (sup, chk, prv):

@@ -13,7 +13,7 @@ BindsTo=pipewire.service
 ExecCondition=/usr/libexec/speakerguardd/speakerguardd-provision is-seat
 # Written by speakerguardd-provision: SGV2_MACHINE, the machine.
 EnvironmentFile=/etc/speakerguardd/speakerguardd.conf
-ExecStart=/usr/libexec/speakerguardd-session --machine ${SGV2_MACHINE}
+ExecStart=/usr/libexec/speakerguardd/speakerguardd-session --machine ${SGV2_MACHINE}
 Restart=always
 RestartSec=1s
 
