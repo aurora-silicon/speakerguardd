@@ -164,6 +164,140 @@ pub fn velocity_limit(e: f32, k: &[f32; 4], v: &[f32; 3], vmax: f32) -> f32 {
     a + (e - lo) * slope
 }
 
+/// The velocity allocation (residuals 5): on the signed sum of the five
+/// band velocities `vb[k][n]` over `first..`, under the applied slow gain
+/// `s`, find the worst sample, orient every band's contribution to its sign
+/// and water-fill the active bands (`active`) into the room the ignored
+/// bands leave; repeat until the waveform is within `vlim`. Returns each
+/// band's gain relative to `s` (ignored bands 1), before the floor.
+pub fn velocity_band_gains(
+    vb: &[alloc::vec::Vec<f32>; 5],
+    first: usize,
+    vlim: f32,
+    s: f32,
+    active: (usize, usize),
+) -> [f32; 5] {
+    let mut g = [1.0f32; 5];
+    let n = vb[0].len();
+    if first >= n {
+        return g;
+    }
+    let is_active = |k: usize| k >= active.0 && k < active.1;
+    for _ in 0..64 {
+        let (mut idx, mut worst) = (first, 0.0f32);
+        for i in first..n {
+            let mut y = 0.0f32;
+            for k in 0..5 {
+                y += (g[k] * s) * vb[k][i];
+            }
+            if y.abs() > worst.abs() {
+                worst = y;
+                idx = i;
+            }
+        }
+        if worst.abs() <= vlim || worst.is_nan() {
+            break;
+        }
+        let sign = if worst >= 0.0 { 1.0f32 } else { -1.0 };
+        let mut fixed = 0.0f32;
+        for k in (0..5).filter(|&k| !is_active(k)) {
+            fixed += (g[k] * s) * vb[k][idx];
+        }
+        let room = vlim - sign * fixed;
+        let mut share = [0.0f32; 5];
+        let mut sorted = [0.0f32; 5];
+        let mut m = 0;
+        for k in (0..5).filter(|&k| is_active(k)) {
+            share[k] = (sign * s) * (g[k] * vb[k][idx]);
+            sorted[m] = share[k];
+            m += 1;
+        }
+        if m == 0 {
+            break;
+        }
+        let sorted = &mut sorted[..m];
+        sorted.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
+        let mut remain = room;
+        let mut level = sorted[m - 1];
+        for (j, &v) in sorted.iter().enumerate() {
+            let count = (m - j) as f32;
+            if v * count >= remain {
+                level = remain / count;
+                break;
+            }
+            remain -= v;
+        }
+        let mut changed = false;
+        for k in (0..5).filter(|&k| is_active(k)) {
+            if share[k] > level {
+                let r = (level / share[k]).clamp(0.0, 1.0);
+                let next = g[k] * r;
+                if next != g[k] {
+                    g[k] = next;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    g
+}
+
+/// A fast band gain (residuals 5.1): a lower request starts a raised-cosine
+/// transition to 0.99 x it over `len` samples from the gain reached
+/// (restartable); otherwise a per-sample release `g += a (request - g)`,
+/// unity above 0.9988494.
+#[derive(Clone, Copy, Debug)]
+pub struct BandGain {
+    pub g: f32,
+    start: f32,
+    target: f32,
+    request: f32,
+    n: u32,
+    len: u32,
+}
+
+impl BandGain {
+    pub const fn unity(len: u32) -> Self {
+        BandGain { g: 1.0, start: 1.0, target: 1.0, request: 1.0, n: len, len }
+    }
+    /// A new request at a decision.
+    pub fn request(&mut self, req: f32) {
+        self.request = req;
+        if req < self.g {
+            self.start = self.g;
+            self.target = 0.99 * req;
+            self.n = 0;
+        }
+    }
+    /// One sample with release coefficient `a`.
+    #[inline]
+    pub fn sample(&mut self, a: f32) -> f32 {
+        if self.n < self.len {
+            self.n += 1;
+            let w = 0.5 * (1.0 + libm::cos(core::f64::consts::PI * self.n as f64 / self.len as f64));
+            self.g = (self.target as f64 + (self.start as f64 - self.target as f64) * w) as f32;
+        } else if self.g < self.request {
+            self.g += a * (self.request - self.g);
+            if self.g > 0.998_849_4 && self.request >= 1.0 {
+                self.g = 1.0;
+            }
+        }
+        self.g
+    }
+    pub fn finite(&self) -> bool {
+        self.g.is_finite() && self.start.is_finite() && self.target.is_finite() && self.request.is_finite()
+    }
+}
+
+/// The release coefficient for a 99 % settling time of `t` seconds at
+/// `rate`: `min(ln(100) / (rate t), 1)` in binary32.
+pub fn release_coefficient(rate: f64, t: f64) -> f32 {
+    (libm::log(100.0) / (rate * t)).min(1.0) as f32
+}
+
 /// Buckets of the masker's spectral lattice.
 pub const MASK_BUCKETS: usize = 100;
 /// The masker window and transform are capped at this many points.

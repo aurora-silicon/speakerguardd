@@ -88,7 +88,8 @@
 //!   within `TemperatureHardLimit + max(TemperatureHeadroom, 0)`. A lower
 //!   result retargets the follower: 0.99 x the request along a raised-cosine
 //!   half-window of `AttackTime`, restartable. The retargeted trajectory is
-//!   checked again over the frame and one attack window beyond it. Each band's
+//!   checked again over the frame and one attack window beyond it. The
+//!   ceiling is held to 0.99 of its rise over ambient (interim). Each band's
 //!   applied gain is the minimum of its fast gain, the peak gain and the
 //!   slow gain (spec 2: never a product).
 //! - **Monitor** (rig laws 3, 4, 11): on the protected output, `u = Vfs y`;
@@ -107,13 +108,15 @@
 //! and the slow gain to the next stream, cooled for the gap.
 //!
 //! Known residuals against 25G83 (rig report):
-//! - the velocity band gains: on low-frequency tones the reference keeps the
-//!   modeled cone velocity at 0.64-0.82 x the active limit where this unit's
-//!   water filling reaches 0.94-1.01 x (Daybreak t-4695; the gate keeps lsm2
-//!   out of `units_at_parity` until it matches);
-//! - the masker's bucket lattice is the reference's literal table, which
-//!   is not redistributed; this unit generates an ERB-uniform partition
-//!   instead, which moves the velocity limit on music;
+//! - velocity (residuals 5): the signed worst-sample allocation holds the
+//!   limit, allocated to 0.99 of it (interim guard for the attack
+//!   transient); on low-frequency tones the reference's onset cut is deeper
+//!   and its 20 s releases keep it, so it settles at 0.64-0.82 x the limit
+//!   where this unit settles at 0.92-1.0 x (Daybreak t-4709);
+//! - output ceiling: held to 0.99 of the ceiling's rise over ambient
+//!   (interim guard until Daybreak t-4704), at or below the reference;
+//! - the masker lattice is an input extracted from the Mac's macOS
+//!   (Daybreak t-4702); without it there is no masking credit;
 //! - host slices: at q1, q7 and q160 this unit is slice-independent by
 //!   design.
 
@@ -126,8 +129,8 @@ use alloc::vec::Vec;
 
 mod laws;
 pub use laws::{
-    current_coefficients, mask_lattice_resized, minimum_phase_triplet, temperature_candidate, transform_len,
-    velocity_limit, Fft, Masker, ThermalBranch,
+    current_coefficients, mask_lattice_resized, minimum_phase_triplet, release_coefficient, temperature_candidate,
+    transform_len, velocity_band_gains, velocity_limit, BandGain, Fft, Masker, ThermalBranch,
 };
 
 use crate::blob::{BlobError, Pod};
@@ -1163,7 +1166,12 @@ struct Chan {
     mask_knots: [f32; 4],
     vel_limit_now: f64,
     // Fast gains.
-    band: [Follower; BANDS],
+    band: [BandGain; BANDS],
+    /// The modeled band velocities over the decision window: the output
+    /// region's look-ahead behind it, then the frame (as `ab`).
+    vb: [Vec<f32>; BANDS],
+    /// Bands the velocity allocation may cut (the others are ignored).
+    vel_active: (usize, usize),
     peak: Follower,
     /// The fast gains over the frame's output region, per sample.
     eg: [Vec<f32>; BANDS],
@@ -1285,7 +1293,11 @@ impl Chan {
                 quad[k] = qv + qm;
             }
         }
-        let limit = (self.t_hard + self.t_headroom.max(0.0)) as f32;
+        // interim conservative guard (until Daybreak t-4704 gives the exact
+        // difference): the ceiling's rise over ambient by the 0.99 law, so
+        // the coil is held about 1 % of its rise below the limit, at or
+        // below where the reference lands
+        let limit = (self.ambient + CUT * (self.t_hard + self.t_headroom.max(0.0) - self.ambient)) as f32;
         let mut g = Self::ceiling_solve(&base[..subs], &lin[..subs], &quad[..subs], limit);
         // the monitor clamps a substep's power at 0, which the affine
         // decomposition cannot: check the solution on the clamped model and
@@ -1390,7 +1402,8 @@ struct Run {
     ratio: f64,
     attack: u32,
     r_fast: f32,
-    r_low: f32,
+    a_fast: f32,
+    a_low: f32,
     slow_step: f64,
     linked_power: f64,
     /// `10^(-MaxPowerAttenuation/20)`.
@@ -1499,7 +1512,12 @@ impl Run {
                 vel_lim: c.velocity_limit,
                 mask_knots: c.mask_energy_db,
                 vel_limit_now: c.velocity_limit[0] as f64,
-                band: [Follower::UNITY; BANDS],
+                band: [BandGain::unity(attack_len); BANDS],
+                vb: core::array::from_fn(|_| vec![0.0; od + ctl]),
+                vel_active: (
+                    (c.velocity_ignore_low_band != 0) as usize,
+                    if c.velocity_ignore_high_band != 0 { BANDS - 1 } else { BANDS },
+                ),
                 peak: Follower::UNITY,
                 eg: core::array::from_fn(|_| vec![1.0; ctl]),
                 cur_in: cur,
@@ -1577,7 +1595,8 @@ impl Run {
             ratio: p.low_rail_power_ratio as f64,
             attack: libm::round(p.attack_time_ms as f64 * 1e-3 * rate) as u32,
             r_fast: sample(p.fast_release_time_ms),
-            r_low: sample(p.low_band_release_time_ms),
+            a_fast: release_coefficient(rate, p.fast_release_time_ms as f64 * 1e-3),
+            a_low: release_coefficient(rate, p.low_band_release_time_ms as f64 * 1e-3),
             slow_step: settle_step(ctl_dt, p.slow_release_time_ms as f64 * 1e-3),
             linked_power: 1.0,
             power_floor: db_to_lin(p.max_power_attenuation_db as f64),
@@ -1606,7 +1625,8 @@ impl Run {
             c.mvel.clear();
             c.vwin.iter_mut().for_each(|v| *v = 0.0);
             c.vel_limit_now = c.vel_lim[0] as f64;
-            c.band = [Follower::UNITY; BANDS];
+            c.band = [BandGain::unity(c.slow.len); BANDS];
+            c.vb.iter_mut().for_each(|b| b.iter_mut().for_each(|v| *v = 0.0));
             c.peak = Follower::UNITY;
             c.eg.iter_mut().for_each(|e| e.iter_mut().for_each(|v| *v = 1.0));
             c.cur_in.clear();
@@ -1676,9 +1696,11 @@ impl Run {
             for k in 0..BANDS - 1 {
                 let vk = c.vel_band[k].step(vfs * a[k] as f64);
                 vrest -= vk;
+                c.vb[k][od + i] = vk as f32;
                 pvb[k] = pvb[k].max(libm::fabs(vk) as f32);
             }
             pvb[BANDS - 1] = pvb[BANDS - 1].max(libm::fabs(vrest) as f32);
+            c.vb[BANDS - 1][od + i] = vrest as f32;
             px = px.max(xc.abs());
             pd = pd.max(libm::fabs(d) as f32);
             pv = pv.max(libm::fabs(v) as f32);
@@ -1720,7 +1742,7 @@ impl Run {
     fn process_frame(&mut self) {
         // a gain state that went non-finite since the last frame is caught
         // before this frame's min/max could turn it into a number
-        if !self.ch.iter().all(|c| c.band.iter().all(Follower::finite) && c.peak.finite() && c.slow.finite()) {
+        if !self.ch.iter().all(|c| c.band.iter().all(BandGain::finite) && c.peak.finite() && c.slow.finite()) {
             self.fault = true;
             return;
         }
@@ -1729,10 +1751,11 @@ impl Run {
         }
         self.ring = (self.ring + SUBSTEPS) % self.ring_len;
         let (ctl, sub, od, attack) = (self.ctl, self.sub, self.od, self.attack);
-        let (r_fast, r_low) = (self.r_fast, self.r_low);
+        let r_fast = self.r_fast;
         let ring_len = self.ring_len;
         let window_max = |r: &[f32; RING]| r[..ring_len].iter().copied().fold(0.0f32, f32::max);
         let ratio = |limit: f64, q: f32| (limit / (q as f64).max(EPS)).min(1.0);
+        let (a_fast, a_low) = (self.a_fast, self.a_low);
         // ---- fast axes: candidates, band requests, the frame's trajectories
         // mask level (residuals 3): each channel's detector, the largest
         // level for every channel's velocity curve
@@ -1750,18 +1773,30 @@ impl Run {
             let g_disp = if self.axis[1] { ratio(c.disp_limit, window_max(&c.pk_d)) } else { 1.0 };
             let vel_on = self.axis[2] && !c.vel_off;
             let g_vel = if self.axis[2] { ratio(c.vel_limit_now, window_max(&c.pk_v)).max(c.vel_floor) } else { 1.0 };
-            // the velocity candidate on every band, as the displacement one:
-            // the full-band modeled velocity held at the active limit. The
-            // water filling of spec 15.4 on the band peaks left the full-band
-            // velocity up to 1.2-1.3x the limit, because the ignored bands
-            // are not counted (25G83 thermal_ramp_200: 1.19x where the
-            // reference holds 0.97x; the Neo's full-volume run: at least
-            // 1.20x). The reference's own band law is not yet specified
-            // (Daybreak t-4695); this one holds the Apple limit.
-            let gv: [f64; BANDS] = core::array::from_fn(|_| if vel_on { g_vel } else { 1.0 });
+            // residuals 5: the signed worst-sample allocation on the band
+            // velocities under the applied slow gain, then the absolute floor
+            // (the logged candidate is only a diagnostic). It runs over the
+            // whole decision window, the output region and its look-ahead,
+            // so every sample these gains will shape holds the limit.
+            let sg = (c.slow.g as f64).clamp(EPS, 1.0) as f32;
+            let gv: [f64; BANDS] = if vel_on {
+                // interim guard: allocate to 0.99 of the limit so the attack
+                // transient (time-varying gains through the velocity model's
+                // memory) stays within it
+                let rel = velocity_band_gains(&c.vb, 0, (CUT * c.vel_limit_now) as f32, sg, c.vel_active);
+                core::array::from_fn(|k| {
+                    if rel[k] < 1.0 {
+                        ((sg * rel[k]).max(c.vel_floor as f32) as f64).min(1.0)
+                    } else {
+                        1.0
+                    }
+                })
+            } else {
+                [1.0; BANDS]
+            };
             for k in 0..BANDS {
                 let req = g_disp.min(gv[k]) as f32;
-                c.band[k].request(req, attack);
+                c.band[k].request(req);
             }
             c.peak.request(g_peak as f32, attack);
             c.cand[0] = g_peak;
@@ -1770,8 +1805,8 @@ impl Run {
             for i in 0..ctl {
                 let pg = c.peak.sample(r_fast);
                 for k in 0..BANDS {
-                    let r = if k == 0 { r_low } else { r_fast };
-                    c.eg[k][i] = c.band[k].sample(r).min(pg);
+                    let a = if k == 0 { a_low } else { a_fast };
+                    c.eg[k][i] = c.band[k].sample(a).min(pg);
                 }
             }
         }
@@ -1997,7 +2032,7 @@ impl Run {
             c.pbar1_frame = p1;
             c.pbar1s_frame = p1s;
             // shift the bank-stage buffers: keep the look-ahead region
-            for b in c.ab.iter_mut() {
+            for b in c.ab.iter_mut().chain(c.vb.iter_mut()) {
                 b.copy_within(ctl..ctl + od, 0);
             }
             c.xc.copy_within(ctl..ctl + od, 0);
@@ -2010,7 +2045,7 @@ impl Run {
                 && c.cur_in.is_finite()
                 && c.cur_out.is_finite();
             let gains = c.cand.iter().all(|v| v.is_finite())
-                && c.band.iter().all(Follower::finite)
+                && c.band.iter().all(BandGain::finite)
                 && c.peak.finite()
                 && c.slow.finite();
             if !(model && motion && gains) {

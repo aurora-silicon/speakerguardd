@@ -188,19 +188,17 @@ fn displacement_candidate_matches_the_transfer_function() {
 }
 
 #[test]
-fn velocity_holds_the_full_band_limit_on_every_band() {
-    // the velocity candidate acts on every band, as the displacement one:
-    // water filling over the non-ignored bands left the full-band velocity
-    // above the limit (25G83 thermal_ramp_200: 1.19x where macOS holds 0.97x)
+fn velocity_allocates_on_the_signed_band_sum() {
+    // residuals 5: the bands carrying a 1 kHz tone are cut so the signed
+    // band sum holds the limit; a band with no content keeps unity
     let p = only([false, false, true, false, true]);
     let mut u = Unit::new(p);
     run(&mut u, &[sine(1000.0, 1.0, 0.5), sine(1000.0, 1.0, 0.5)], 512);
     let t = tel(&u).channels[0];
     assert!(t.axis_gain[2] < 0.9, "{:?}", t.axis_gain);
-    for g in t.band_gain {
-        // the 0.99 law: at or just below the candidate
-        assert!(g <= t.axis_gain[2] + 1e-6 && g >= 0.985 * t.axis_gain[2], "{:?} {:?}", t.band_gain, t.axis_gain);
-    }
+    let low = t.band_gain.iter().copied().fold(1.0f32, f32::min);
+    assert!(low <= t.axis_gain[2] + 1e-3, "{:?} {:?}", t.band_gain, t.axis_gain);
+    assert_eq!((t.band_gain[0], t.band_gain[4]), (1.0, 1.0), "{:?}", t.band_gain);
 }
 
 #[test]
