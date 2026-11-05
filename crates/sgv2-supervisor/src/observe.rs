@@ -38,8 +38,9 @@
 //!    63 ms on the J616s.
 //! 5. From then on the grant is renewed while the engine beats and the PCM
 //!    is Closed, Open (OPEN, SETUP, PREPARED) or RUNNING, owned by the
-//!    engine's process. XRUN, PAUSED, SUSPENDED or an unknown state releases
-//!    at once, as does any other fault. The kernel stops the stream, the
+//!    engine's process, or in an XRUN the sink is recovering from (below).
+//!    PAUSED, SUSPENDED, an unknown state, or an XRUN that outlasts the
+//!    heartbeat bound releases at once, as does any other fault. The kernel stops the stream, the
 //!    helper unlinks the amps, the protect stage falls back to the dummy
 //!    driver and beats again; the sink keeps the PCM PREPARED and retries its
 //!    start, and the sequence resumes at 3 from there.
@@ -55,12 +56,24 @@
 //! - For [`GRANT_GRACE_WINDOW_NS`] after each grant, in any of those states,
 //!   the grace is [`GRANT_GRACE_NS`]. Each grant is followed by the helper's
 //!   re-link and the driver switch, and lane B2 saw the heartbeat pause there
-//!   more than once in the first 200 ms after a re-grant. The PCM state
-//!   checks (XRUN, owner) are never relaxed, and they are what floors a
+//!   more than once in the first 200 ms after a re-grant. The PCM checks
+//!   (owner, a paused or suspended stream, an XRUN past the strict bound)
+//!   are never relaxed by these graces, and with the heartbeat they floor a
 //!   stopped or killed engine (B2: 19.6-31.0 ms).
 //!
+//! An XRUN with the engine's process still the owner is the sink's own
+//! recovery: ALSA has stopped the DMA, so nothing plays, and the sink
+//! prepares and starts the PCM again on its next wake, within a quantum.
+//! Releasing there turned every underrun into a dropout: the kernel refused
+//! the restart, and the grant came back two ticks later (J316s, 9-24 ms).
+//! Only a start can make it play again, and the kernel admits one only
+//! within the lease. So an XRUN is held for at most the heartbeat bound
+//! from when it is first seen, with every other check as strict as ever.
+//! An engine that stopped feeding the sink leaves a stale heartbeat
+//! within the same bound.
+//!
 //! A dead or stopped engine therefore releases within one staleness bound,
-//! or sooner when the PCM XRUNs, and nothing renews without it.
+//! and nothing renews without it.
 
 use crate::lease::Observation;
 
@@ -104,8 +117,13 @@ pub enum PcmState {
     Open {
         owner: u32,
     },
-    /// Open and stopped by anything but a close: XRUN (the kernel's own
-    /// withdrawal, or an engine that stopped feeding it), PAUSED,
+    /// Stopped by an underrun (or by the kernel's own withdrawal, which
+    /// has already ended the lease). The sink recovers from it with a
+    /// prepare and a start; renewed for at most the heartbeat bound.
+    Xrun {
+        owner: u32,
+    },
+    /// Open and stopped by anything but a close or an underrun: PAUSED,
     /// SUSPENDED, DISCONNECTED. Never renewed.
     Stopped {
         owner: u32,
@@ -126,6 +144,7 @@ impl PcmState {
             PcmState::Stopped { owner } => (2, owner),
             PcmState::Running { owner } => (3, owner),
             PcmState::Unknown => (4, 0),
+            PcmState::Xrun { owner } => (5, owner),
         };
         k << 32 | u64::from(o)
     }
@@ -137,13 +156,17 @@ impl PcmState {
             1 => PcmState::Open { owner },
             2 => PcmState::Stopped { owner },
             3 => PcmState::Running { owner },
+            5 => PcmState::Xrun { owner },
             _ => PcmState::Unknown,
         }
     }
 
-    fn owner(self) -> Option<u32> {
+    pub fn owner(self) -> Option<u32> {
         match self {
-            PcmState::Open { owner } | PcmState::Stopped { owner } | PcmState::Running { owner } => Some(owner),
+            PcmState::Open { owner }
+            | PcmState::Xrun { owner }
+            | PcmState::Stopped { owner }
+            | PcmState::Running { owner } => Some(owner),
             _ => None,
         }
     }
@@ -228,6 +251,8 @@ pub struct Observer {
     quantum: Option<u64>,
     was_running: bool,
     grace_until: Option<u64>,
+    /// When the current XRUN was first seen.
+    xrun_since: Option<u64>,
     granted_at: Option<u64>,
     /// The wiring the self-check proved; a graph built with any other is
     /// not the protected path.
@@ -252,6 +277,7 @@ impl Observer {
             quantum: None,
             was_running: false,
             grace_until: None,
+            xrun_since: None,
             granted_at: None,
             expected_wiring: None,
             wrong_wiring: None,
@@ -363,7 +389,18 @@ impl Observer {
             Some(owner) => owner == e.pid && e.pid != 0,
             None => closed,
         };
-        let pcm_state_ok = matches!(p, PcmState::Closed | PcmState::Open { .. } | PcmState::Running { .. });
+        // an underrun the sink recovers from, for at most the heartbeat bound
+        if matches!(p, PcmState::Xrun { .. }) {
+            self.xrun_since.get_or_insert(now_ns);
+        } else {
+            self.xrun_since = None;
+        }
+        let recovering = match (self.xrun_since, self.quantum.filter(|q| (1..=MAX_QUANTUM).contains(q))) {
+            (Some(t), Some(q)) => now_ns.saturating_sub(t) <= stale_ns(q, self.rate, self.tick_ns),
+            _ => false,
+        };
+        let pcm_state_ok =
+            matches!(p, PcmState::Closed | PcmState::Open { .. } | PcmState::Running { .. }) || recovering;
         // A new engine generation: another process, a page that became
         // valid, or a sequence that restarted.
         let restarted = self.last_seq_before.is_some_and(|l| e.seq < l);
@@ -436,6 +473,7 @@ pub fn parse_pcm_status(text: &str) -> PcmState {
     match (state.as_deref(), owner) {
         (Some("RUNNING" | "DRAINING"), Some(o)) => PcmState::Running { owner: o },
         (Some("OPEN" | "SETUP" | "PREPARED"), Some(o)) => PcmState::Open { owner: o },
+        (Some("XRUN"), Some(o)) => PcmState::Xrun { owner: o },
         (Some(_), Some(o)) => PcmState::Stopped { owner: o },
         _ => PcmState::Unknown,
     }
@@ -446,6 +484,7 @@ pub fn parse_pcm_status(text: &str) -> PcmState {
 pub fn owner_to_tgid(state: PcmState, tgid: &mut dyn FnMut(u32) -> Option<u32>) -> PcmState {
     match state {
         PcmState::Open { owner } => tgid(owner).map_or(PcmState::Unknown, |o| PcmState::Open { owner: o }),
+        PcmState::Xrun { owner } => tgid(owner).map_or(PcmState::Unknown, |o| PcmState::Xrun { owner: o }),
         PcmState::Stopped { owner } => tgid(owner).map_or(PcmState::Unknown, |o| PcmState::Stopped { owner: o }),
         PcmState::Running { owner } => tgid(owner).map_or(PcmState::Unknown, |o| PcmState::Running { owner: o }),
         s => s,
@@ -458,7 +497,7 @@ pub fn parse_tgid(status: &str) -> Option<u32> {
 }
 
 /// Fold every substream of the speaker PCM into one state. The worst state
-/// wins (Unknown, then Stopped, Running, Open, Closed), and two different
+/// wins (Unknown, then Stopped, Xrun, Running, Open, Closed), and two different
 /// owners are a foreign opener (owner 0, which never matches the plugin).
 pub fn combine(states: &[PcmState]) -> PcmState {
     fn rank(x: PcmState) -> u8 {
@@ -466,8 +505,9 @@ pub fn combine(states: &[PcmState]) -> PcmState {
             PcmState::Closed => 0,
             PcmState::Open { .. } => 1,
             PcmState::Running { .. } => 2,
-            PcmState::Stopped { .. } => 3,
-            PcmState::Unknown => 4,
+            PcmState::Xrun { .. } => 3,
+            PcmState::Stopped { .. } => 4,
+            PcmState::Unknown => 5,
         }
     }
     let mut out = PcmState::Closed;
@@ -486,6 +526,7 @@ pub fn combine(states: &[PcmState]) -> PcmState {
     let o = owner.unwrap_or(0);
     match out {
         PcmState::Open { .. } => PcmState::Open { owner: o },
+        PcmState::Xrun { .. } => PcmState::Xrun { owner: o },
         PcmState::Stopped { .. } => PcmState::Stopped { owner: o },
         PcmState::Running { .. } => PcmState::Running { owner: o },
         s => s,
@@ -1043,13 +1084,15 @@ mod tests {
         let prep = "state: PREPARED\nowner_pid   : 12\n";
         assert_eq!(parse_pcm_status(prep), PcmState::Open { owner: 12 });
         assert_eq!(parse_pcm_status("garbage"), PcmState::Unknown);
-        for stopped in ["XRUN", "PAUSED", "SUSPENDED", "DISCONNECTED"] {
+        for stopped in ["PAUSED", "SUSPENDED", "DISCONNECTED"] {
             let t = format!("state: {stopped}\nowner_pid   : 12\n");
             assert_eq!(parse_pcm_status(&t), PcmState::Stopped { owner: 12 }, "{stopped}");
         }
+        assert_eq!(parse_pcm_status("state: XRUN\nowner_pid   : 12\n"), PcmState::Xrun { owner: 12 });
         for st in [
             PcmState::Closed,
             PcmState::Open { owner: 7 },
+            PcmState::Xrun { owner: 9 },
             PcmState::Stopped { owner: 8 },
             PcmState::Running { owner: u32::MAX },
             PcmState::Unknown,
@@ -1084,6 +1127,8 @@ mod tests {
         assert_eq!(combine(&[Running { owner: 5 }, Open { owner: 6 }]), Running { owner: 0 });
         assert_eq!(combine(&[Running { owner: 5 }, Unknown]), Unknown);
         assert_eq!(combine(&[Running { owner: 5 }, Stopped { owner: 5 }]), Stopped { owner: 5 });
+        assert_eq!(combine(&[Running { owner: 5 }, Xrun { owner: 5 }]), Xrun { owner: 5 });
+        assert_eq!(combine(&[Xrun { owner: 5 }, Stopped { owner: 5 }]), Stopped { owner: 5 });
         assert_eq!(combine(&[Open { owner: 6 }, Running { owner: 5 }]), Running { owner: 0 });
         assert_eq!(combine(&[]), Closed);
     }
@@ -1160,12 +1205,23 @@ mod tests {
         assert!(
             !obs_at(&mut o, mono + stale_ns(512, 48_000, TICK) + 1_000_000, seq, frames, mono, run).heartbeat_fresh
         );
-        // an XRUN is a fault at once, even with a fresh heartbeat
+        // a paused or suspended PCM is a fault at once, even with a fresh heartbeat
         seq += 1;
         frames += 512;
         mono += q512;
         let obs = obs_at(&mut o, mono + 1_000, seq, frames, mono, PcmState::Stopped { owner: PID });
         assert!(obs.heartbeat_fresh && !obs.pcm_state_ok);
+        // an XRUN is the sink's recovery: held up to the strict bound from
+        // when it is first seen, then a fault (J316s, lad3: 9-24 ms dropouts)
+        let xrun = PcmState::Xrun { owner: PID };
+        let x0 = mono + 2_000;
+        let strict = stale_ns(512, 48_000, TICK);
+        assert!(obs_at(&mut o, x0, seq, frames, mono, xrun).pcm_state_ok);
+        assert!(obs_at(&mut o, x0 + strict, seq, frames, mono, xrun).pcm_state_ok);
+        assert!(!obs_at(&mut o, x0 + strict + 1, seq, frames, mono, xrun).pcm_state_ok);
+        // and never on another owner's stream
+        let foreign = obs_at(&mut o, x0 + 1_000, seq, frames, mono, PcmState::Xrun { owner: PID + 1 });
+        assert!(!foreign.pcm_owner_ok);
         // after the release the sink re-prepares and retries; the engine
         // beats again on the dummy driver: a prepared PCM owned by the engine
         // can be granted again (B2 r3 waited 5.2 s for a close)
@@ -1278,9 +1334,12 @@ mod tests {
         let strict = stale_ns(512, 48_000, TICK);
         assert!(at(&mut o, t + strict - 1_000_000, false, run).heartbeat_fresh);
         assert!(!at(&mut o, t + strict + 1_000_000, false, run).heartbeat_fresh);
-        // and the grace never covers an XRUN
+        // and the grace never covers a paused stream or a long XRUN
         o.note_grant(t);
         assert!(!at(&mut o, t + 1_000_000, true, PcmState::Stopped { owner: PID }).pcm_state_ok);
+        let xrun = PcmState::Xrun { owner: PID };
+        assert!(at(&mut o, t + 2_000_000, true, xrun).pcm_state_ok);
+        assert!(!at(&mut o, t + 2_000_000 + strict + 1_000_000, true, xrun).pcm_state_ok);
     }
 
     #[test]
