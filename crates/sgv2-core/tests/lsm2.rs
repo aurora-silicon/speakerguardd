@@ -5,8 +5,9 @@ use sgv2_core::lsm2::{self, ChannelParams, Params, Unit, BANDS};
 use sgv2_core::{dsp, HandOff, Io, ProtectionUnit, Telemetry};
 
 const RATE: u32 = 48_000;
-/// 2 * 120 + 48 frames: the synthetic filterbank stage and look-ahead.
-const LATENCY: usize = 288;
+/// 2 * 96 + 64 frames (the synthetic filterbank stage and look-ahead) plus
+/// the controller frame the unit buffers.
+const LATENCY: usize = 2 * 96 + 64 + 256;
 
 /// Every axis on, as the Neo ships; tests switch off what they isolate.
 fn params() -> Params {
@@ -25,8 +26,8 @@ fn params() -> Params {
         fast_release_time_ms: 150.0,
         slow_release_time_ms: 10_000.0,
         low_band_release_time_ms: 150.0,
-        filterbank_latency_ms: 2.5,
-        speaker_response_lookahead_ms: 1.0,
+        filterbank_latency_ms: 2.0,
+        speaker_response_lookahead_ms: 4.0 / 3.0,
         power_time_scale_s: [0.002, 0.2, 2.0, 30.0],
         power_hard_limit_w: [50.0, 20.0, 2.0, 1.5],
         power_soft_limit_pct: [100.0; 4],
@@ -187,20 +188,18 @@ fn displacement_candidate_matches_the_transfer_function() {
 }
 
 #[test]
-#[cfg(not(feature = "lsm2-waterfill"))]
 fn velocity_spares_the_ignored_outer_bands() {
+    // spec 15.4: the ignored outer bands stay whole; the active bands water
+    // fill, so the band carrying the tone goes at least as low as the
+    // full-band candidate
     let p = only([false, false, true, false, true]);
     let mut u = Unit::new(p);
     run(&mut u, &[sine(1000.0, 1.0, 0.5), sine(1000.0, 1.0, 0.5)], 512);
     let t = tel(&u).channels[0];
     assert!(t.axis_gain[2] < 0.9, "{:?}", t.axis_gain);
     assert_eq!((t.band_gain[0], t.band_gain[4]), (1.0, 1.0));
-    assert!(
-        t.band_gain[1..4].iter().all(|&g| (g - t.axis_gain[2]).abs() < 1e-2),
-        "{:?} {:?}",
-        t.band_gain,
-        t.axis_gain
-    );
+    let low = t.band_gain[1..4].iter().copied().fold(1.0f32, f32::min);
+    assert!(low <= t.axis_gain[2] + 1e-3, "{:?} {:?}", t.band_gain, t.axis_gain);
 }
 
 #[test]
@@ -240,38 +239,51 @@ fn power_is_one_gain_on_the_total_budget_without_a_cap() {
 
 #[test]
 fn power_averages_are_exponential_from_idle() {
-    // spec 6.1 anchor: silence, idle 0.018 W, one 32-frame substep
+    // spec 6.1: silence, idle 0.018 W; one controller frame is eight 32-frame
+    // substeps of each matched one-pole, starting from 0 W. The first silent
+    // substep's values are the spec's anchors.
     let mut p = only([false, false, false, true, false]);
     p.low_rail_idle_power_w = 0.018;
     p.power_time_scale_s = [0.001, 0.1, 1.0, 60.0];
     let mut u = Unit::new(p);
-    run(&mut u, &[vec![0.0; 32], vec![0.0; 32]], 32);
-    let want = [0.0087584909, 0.00011960088, 0.0000119960005, 0.00000019999888];
+    run(&mut u, &[vec![0.0; 256], vec![0.0; 256]], 256);
+    let first = [0.0087584909, 0.00011960088, 0.0000119960005, 0.00000019999888];
     let mut rec = HandOff::EMPTY;
     assert!(u.save_state(&mut rec));
-    for (j, w) in want.iter().enumerate() {
-        assert!((rec.node[0][2 + j] - w).abs() <= 1e-6 * w, "{j}: {}", rec.node[0][2 + j]);
+    for (j, (&tau, w1)) in p.power_time_scale_s.iter().zip(first).enumerate() {
+        let b = (-32.0 / (48_000.0 * tau as f64)).exp();
+        assert!(((1.0 - b) * 0.018 - w1).abs() <= 1e-6 * w1, "{j}");
+        let want = 0.018 * (1.0 - b.powi(8));
+        assert!((rec.node[0][2 + j] - want).abs() <= 1e-6 * want, "{j}: {} {want}", rec.node[0][2 + j]);
     }
 }
 
 #[test]
-fn temperature_knee_is_linear_in_db() {
-    let g = |t| lsm2::temperature_gain(t, 5.0, 55.0, 70.0, 12.0);
-    assert_eq!(g(40.0), 1.0);
-    // 69 C + 5 headroom is above the 70 C hard limit: the 12 dB cap
-    assert!((20.0 * g(69.0).log10() + 12.0).abs() < 1e-9);
-    assert!((20.0 * g(57.5).log10() + 6.0).abs() < 1e-9);
-    // a step when the limits are equal, the cap when they are reversed
-    assert_eq!(lsm2::temperature_gain(49.0, 5.0, 55.0, 55.0, 12.0), 1.0);
-    assert!(lsm2::temperature_gain(50.0, 5.0, 55.0, 55.0, 12.0) < 0.26);
-    assert!(lsm2::temperature_gain(0.0, 5.0, 70.0, 55.0, 12.0) < 0.26);
-    assert!(lsm2::temperature_gain(f64::NAN, 5.0, 55.0, 70.0, 12.0) < 0.26);
+fn temperature_candidate_engages_only_above_the_soft_limit_and_releases_in_silence() {
+    // spec 15.5: the axis's own predictor; strictly above the soft limit the
+    // candidate regulates toward the hard limit, in silence it releases
+    let p = only([false, false, false, false, true]);
+    let mut u = Unit::new(p);
+    let x = sine(150.0, 0.5, 2.0);
+    run(&mut u, &[x.clone(), x], 512);
+    let t = tel(&u).channels[0];
+    assert!(t.coil_temp_c < 110.0, "{}", t.coil_temp_c);
+    assert_eq!(t.axis_gain[4], 1.0);
+    let x = sine(150.0, 1.0, 40.0);
+    run(&mut u, &[x.clone(), x], 512);
+    let hot = tel(&u).channels[0];
+    assert!(hot.axis_gain[4] < 1.0 && hot.gain < 1.0, "{hot:?}");
+    let z = vec![0.0f32; 48_000 * 20];
+    run(&mut u, &[z.clone(), z], 512);
+    let cool = tel(&u).channels[0];
+    assert!(cool.axis_gain[4] > hot.axis_gain[4], "{} {}", cool.axis_gain[4], hot.axis_gain[4]);
 }
 
 #[test]
 fn mask_curve_is_piecewise() {
-    let k = [17.4817867, 29.8765697, 42.0877037, 45.0321045];
-    let v = [0.600095034, 0.702066243, 1.09745789];
+    // synthetic knots and plateaus
+    let k = [10.0, 20.0, 30.0, 40.0];
+    let v = [0.5, 0.6, 0.9];
     assert_eq!(lsm2::mask_curve(0.0, &k, &v), v[0]);
     assert!((lsm2::mask_curve((k[0] + k[1]) / 2.0, &k, &v) - (v[0] + v[1]) / 2.0).abs() < 1e-12);
     assert_eq!(lsm2::mask_curve(35.0, &k, &v), v[1]);
@@ -279,16 +291,19 @@ fn mask_curve_is_piecewise() {
 }
 
 #[test]
-fn temperature_heats_and_takes_the_knee() {
+fn temperature_holds_the_coil_below_the_hard_ceiling() {
+    // the slow gain's ceiling: the monitor never passes hard + headroom
     let p = only([false, false, false, false, true]);
     let mut u = Unit::new(p);
-    let x = sine(150.0, 1.0, 40.0);
-    run(&mut u, &[x.clone(), x], 1024);
-    let t = tel(&u).channels[0];
-    assert!(t.coil_temp_c + 4.0 >= 110.0, "{}", t.coil_temp_c);
-    let want = lsm2::temperature_gain(t.coil_temp_c as f64, 4.0, 110.0, 125.0, 10.0) as f32;
-    assert!((t.axis_gain[4] - want).abs() < 2e-3, "{} {want}", t.axis_gain[4]);
-    assert!(t.gain < 1.0);
+    let x = sine(150.0, 1.0, 60.0);
+    let mut peak = 0.0f32;
+    for chunk in x.chunks(48_000) {
+        let c = chunk.to_vec();
+        run(&mut u, &[c.clone(), c], 512);
+        peak = peak.max(tel(&u).channels[0].coil_temp_c);
+    }
+    assert!(peak <= 125.0 + 4.0 + 0.05, "{peak}");
+    assert!(tel(&u).channels[0].gain < 1.0);
 }
 
 #[test]
@@ -454,4 +469,86 @@ fn filterbank_matches_the_rig_construction_anchors() {
     for (f, db) in [(107.98, -3.0), (149.88, -6.0), (203.54, -12.0)] {
         assert!((mag(f) - db).abs() < 0.05, "{f} Hz: {} dB", mag(f));
     }
+}
+
+fn with_identity_pressure(mut p: Params) -> Params {
+    for c in 0..2 {
+        p.ch[c].pressure_taps = lsm2::PRESSURE_TAPS as u32;
+        p.ch[c].pressure_fir = [0.0; lsm2::PRESSURE_TAPS];
+        p.ch[c].pressure_fir[0] = 1.0;
+    }
+    p
+}
+
+#[test]
+fn a_tone_below_the_mask_band_does_not_raise_the_velocity_limit() {
+    // spec 15.3: only 8-12 kHz program masks; a loud 1 kHz tone leaves the
+    // limit at its unmasked plateau, a 10 kHz masker lifts it to the top
+    let p = with_identity_pressure(only([false, false, true, false, true]));
+    let mut u = Unit::new(p);
+    run(&mut u, &[sine(1000.0, 1.0, 0.5), sine(1000.0, 1.0, 0.5)], 512);
+    let t = tel(&u).channels;
+    assert_eq!(t[0].velocity_limit_m_s, 0.5, "{}", t[0].mask_db);
+    let mut u = Unit::new(p);
+    let x: Vec<f32> = sine(1000.0, 0.5, 0.5).iter().zip(sine(10_000.0, 0.3, 0.5)).map(|(a, b)| a + b).collect();
+    run(&mut u, &[x.clone(), x], 512);
+    let t = tel(&u).channels;
+    assert!((t[0].velocity_limit_m_s - 0.9).abs() < 1e-6, "{} {}", t[0].velocity_limit_m_s, t[0].mask_db);
+}
+
+#[test]
+fn the_velocity_limit_is_one_for_the_pair() {
+    // the 25G83 frame logs give both channels one active limit: the quieter
+    // channel's masker sets it
+    let p = with_identity_pressure(only([false, false, true, false, true]));
+    let mut u = Unit::new(p);
+    let loud: Vec<f32> = sine(1000.0, 0.5, 0.5).iter().zip(sine(10_000.0, 0.3, 0.5)).map(|(a, b)| a + b).collect();
+    run(&mut u, &[loud, sine(1000.0, 0.5, 0.5)], 512);
+    let t = tel(&u).channels;
+    assert_eq!(t[0].velocity_limit_m_s, t[1].velocity_limit_m_s);
+    assert_eq!(t[0].velocity_limit_m_s, 0.5);
+}
+
+#[test]
+fn the_power_candidate_is_input_referred() {
+    // rig law 4: the velocity axis cutting the audio does not lower the power
+    // the power axis sees
+    let mut a = only([false, false, false, true, true]);
+    a.power_hard_limit_w = [50.0, 0.5, 50.0, 50.0];
+    let mut b = a;
+    b.control_velocity = 1;
+    let x = sine(1000.0, 1.0, 0.5);
+    let mut ua = Unit::new(a);
+    let mut ub = Unit::new(b);
+    run(&mut ua, &[x.clone(), x.clone()], 512);
+    run(&mut ub, &[x.clone(), x], 512);
+    let (ta, tb) = (tel(&ua).channels[0], tel(&ub).channels[0]);
+    assert!(tb.axis_gain[2] < 0.9 && ta.axis_gain[3] < 1.0, "{:?} {:?}", ta.axis_gain, tb.axis_gain);
+    assert_eq!(ta.axis_gain[3], tb.axis_gain[3]);
+}
+
+#[test]
+fn generic_flags_switch_a_model_to_the_family_row_at_run_time() {
+    // spec 15.1: the flag selects the embedded family row; the block's own
+    // field is kept for when the flag is cleared again
+    let mut p = params();
+    for c in 0..2 {
+        p.ch[c].family = [3.0, 0.5, 0.0001, 0.1, 1000.0];
+        p.ch[c].explicit = [
+            [p.ch[c].rdc, p.ch[c].bl, p.ch[c].mms_kg, p.ch[c].rms, p.ch[c].kms],
+            [p.ch[c].disp_rdc, p.ch[c].disp_bl, p.ch[c].disp_mms_kg, p.ch[c].disp_rms, p.ch[c].disp_kms],
+            [p.ch[c].vel_rdc, p.ch[c].vel_bl, p.ch[c].vel_mms_kg, p.ch[c].vel_rms, p.ch[c].vel_kms],
+        ];
+    }
+    let vel = |m: u32, ty: u32, k: u32| 3072 + 1024 * (3 * m + ty) + k;
+    assert!(p.set(vel(3, 0, 0), 1.0));
+    assert_eq!(p.ch[0].vel_rdc, 3.0);
+    assert_eq!(p.ch[1].vel_bl, 0.8, "the resonator flag is separate");
+    assert!(p.set(vel(3, 0, 1), 6.0), "an own-field write while generic");
+    assert_eq!(p.ch[0].vel_rdc, 3.0);
+    assert!(p.set(vel(3, 0, 0), 0.0));
+    assert_eq!(p.ch[0].vel_rdc, 6.0);
+    // the impedance block is accepted and inert
+    assert!(p.set(vel(0, 0, 1), 9.0));
+    assert_eq!(p.ch[0].family[0], 3.0);
 }

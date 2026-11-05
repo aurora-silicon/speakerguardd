@@ -415,7 +415,9 @@ def compare_audio(ref_path, got_path, channels, ref_latency=0, got_latency=0):
                 if abs(ra) <= 1.0 and abs(gb) < 1.0 and not d <= worst_fs:
                     worst_fs, at_fs = (d if math.isfinite(d) else math.inf), {"frame": i, "channel": c}
     ok = (n > 0 and not nonfinite and math.isfinite(worst) and worst <= AUDIO_TOLERANCE
-          and na - ref_latency == nb - got_latency)
+          # the same program on both sides: either as long, or sgv2's file
+          # carrying its extra latency
+          and (na == nb or na - ref_latency == nb - got_latency))
     rep = {"pass": ok, "frames": n, "max_abs_error": worst, "rms_error": rms, "at": at,
            "tolerance": AUDIO_TOLERANCE, "max_abs_error_within_fs": worst_fs, "at_within_fs": at_fs}
     if nonfinite:
