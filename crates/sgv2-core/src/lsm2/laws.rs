@@ -249,6 +249,89 @@ pub fn velocity_band_gains(
     g
 }
 
+/// Signed velocity allocation against the retained full-band bound. The
+/// retained prefix uses `old_limit`; samples from `split` use `new_limit`.
+/// `room_floor` is threshold headroom, but an effective cut still targets
+/// the retained bound (never less than that floor).
+#[allow(clippy::too_many_arguments)]
+pub fn velocity_band_gains_window(
+    vb: &[alloc::vec::Vec<f32>; 5],
+    resid: &[f32],
+    first: usize,
+    old_limit: f32,
+    new_limit: f32,
+    split: usize,
+    room_floor: f32,
+    s: f32,
+    active: (usize, usize),
+    seed: [f32; 5],
+) -> [f32; 5] {
+    let mut g = seed;
+    let n = vb[0].len();
+    if first >= n {
+        return g;
+    }
+    let is_active = |k: usize| k >= active.0 && k < active.1;
+    for _ in 0..64 {
+        let (mut idx, mut worst) = (first, 0.0f32);
+        for i in first..n {
+            let mut y = if resid.is_empty() { 0.0 } else { resid[i] };
+            for k in 0..5 {
+                y += (g[k] * s) * vb[k][i];
+            }
+            if y.abs() > worst.abs() {
+                worst = y;
+                idx = i;
+            }
+        }
+        let limit = if idx < split { old_limit } else { new_limit };
+        if worst.abs() <= limit + room_floor || worst.is_nan() {
+            break;
+        }
+        let sign = if worst >= 0.0 { 1.0 } else { -1.0 };
+        let mut fixed = if resid.is_empty() { 0.0 } else { resid[idx] };
+        for k in (0..5).filter(|&k| !is_active(k)) {
+            fixed += (g[k] * s) * vb[k][idx];
+        }
+        let room = (limit - sign * fixed).max(room_floor);
+        let mut share = [0.0f32; 5];
+        let mut sorted = [0.0f32; 5];
+        let mut m = 0;
+        for k in (0..5).filter(|&k| is_active(k)) {
+            share[k] = (sign * s) * (g[k] * vb[k][idx]);
+            sorted[m] = share[k];
+            m += 1;
+        }
+        if m == 0 {
+            break;
+        }
+        let sorted = &mut sorted[..m];
+        sorted.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
+        let mut remain = room;
+        let mut level = sorted[m - 1];
+        for (j, &v) in sorted.iter().enumerate() {
+            let count = (m - j) as f32;
+            if v * count >= remain {
+                level = remain / count;
+                break;
+            }
+            remain -= v;
+        }
+        let mut changed = false;
+        for k in (0..5).filter(|&k| is_active(k)) {
+            if share[k] > level {
+                let next = g[k] * (level / share[k]).clamp(0.0, 1.0);
+                changed |= next != g[k];
+                g[k] = next;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    g
+}
+
 /// A fast band gain (residuals 5.1, decision-local): at every decision the
 /// boundary gain is the start; a request below it is an attack decision (a
 /// raised-cosine half-window of `len` samples to 0.99 x the request, then
@@ -676,6 +759,13 @@ mod tests {
         assert!((velocity_limit(25.0, &k, &v, 2.0) - 0.8).abs() < 1e-6);
         assert!((velocity_limit(40.0, &k, &v, 2.0) - 2.0).abs() < 1e-6);
         assert!((velocity_limit(50.0, &k, &v, 2.0) - 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn retained_velocity_bounds_switch_at_the_handoff() {
+        let vb = [vec![2.0, 2.0], vec![0.0, 0.0], vec![0.0, 0.0], vec![0.0, 0.0], vec![0.0, 0.0]];
+        let got = velocity_band_gains_window(&vb, &[], 0, 1.0, 2.0, 1, 0.1, 1.0, (0, 5), [1.0; 5]);
+        assert_eq!(got, [0.5, 1.0, 1.0, 1.0, 1.0]);
     }
 
     #[test]
