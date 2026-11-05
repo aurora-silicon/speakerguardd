@@ -159,7 +159,7 @@ pub fn load_unit(
     if h.unit == UnitKind::Spp3 as u32 {
         match spp3::Params::from_blob(bytes) {
             Ok(p) if spp3::Unit::init_error(&p).is_none() => {
-                (AnyUnit::Spp3(Box::new(spp3::Unit::new(p))), None, h.payload_crc)
+                (AnyUnit::Spp3(Box::new(spp3::Unit::for_machine(p, h.machine()))), None, h.payload_crc)
             }
             Ok(_) => fail(LoadError::Refused),
             Err(_) => fail(LoadError::Blob),
@@ -443,6 +443,61 @@ mod tests {
     /// The C ABI reads its paths from the environment: tests that set it
     /// take turns.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The plugin builds spp3 for the board its blob names, so only a board
+    /// proven for the relaxed closed loop may relax; a blob for any other
+    /// board, or naming none, runs capped.
+    #[test]
+    fn the_blob_board_decides_the_closed_loop_relaxation() {
+        use sgv2_core::blob::Pod;
+        let mut p = spp3::Params {
+            channels: 2,
+            sample_rate: 48_000,
+            block_frames: 512,
+            thermal_ambient_temp: 40.0,
+            thermal_gain_attack_time_s: 0.5,
+            thermal_gain_release_time_s: 2.0,
+            thermal_lookahead_delay_ms: 1.0,
+            thermal_protection_enabled: 1,
+            ..Default::default()
+        };
+        for c in 0..2 {
+            p.ch[c] = spp3::ChannelParams {
+                source: c as u32,
+                t_sett_vc: 20.0,
+                t_sett_mg: 10.0,
+                tau_tvc: 0.4,
+                tau_tmg: 3.0,
+                temperature_limit: 120.0,
+                hard_temp_limit_headroom: 8.0,
+                reb_ref: 4.0,
+                rshunt: 0.2,
+                ag: 10.0,
+                thermal_ff_speedup_factor: 0.5,
+                ..Default::default()
+            };
+        }
+        let relaxes = |blob: &[u8]| match load_unit(Some(blob), 48_000.0, 2, 0, Role::Protect) {
+            (AnyUnit::Spp3(u), None, _) => u.closed_loop_may_relax(),
+            _ => panic!("the spp3 blob did not load"),
+        };
+        let for_board = |b: &str| {
+            sgv2_core::blob::build_for(
+                UnitKind::Spp3,
+                2,
+                0,
+                48_000,
+                sgv2_core::blob::machine_field(b).unwrap(),
+                0,
+                p.as_bytes(),
+            )
+        };
+        assert!(relaxes(&for_board("j616s")));
+        for b in ["j316s", "j413", "j614s", "j700"] {
+            assert!(!relaxes(&for_board(b)), "{b}");
+        }
+        assert!(!relaxes(&sgv2_core::blob::build(UnitKind::Spp3, 2, 0, 48_000, p.as_bytes())));
+    }
 
     #[test]
     fn runs_the_failsafe_through_the_c_abi() {
