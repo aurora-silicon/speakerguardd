@@ -420,6 +420,11 @@ class Atsp(unittest.TestCase):
         finally:
             sgsc.regmap_values = saved
 
+    def test_every_plugin_variant_is_in_the_lv2_bundle(self):
+        ttl = open(os.path.join(HERE, "..", "..", "crates", "sgv2-lv2", "lv2", "sgv2.lv2", "manifest.ttl")).read()
+        for v in wiring.PLUGINS.values():
+            self.assertIn(f"<https://aurora-silicon.org/lv2/sgv2#{v}>", ttl, v)
+
     def test_integration_dtbs(self):
         """With SGV2_DTB_DIR naming a directory of the kernel's compiled
         device trees, every atsp board derives from its .dtb exactly as its

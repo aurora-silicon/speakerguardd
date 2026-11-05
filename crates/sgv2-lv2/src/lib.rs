@@ -75,13 +75,14 @@ pub enum Role {
 
 /// Plugin variants: (URI, channels, sense channels, role).
 pub const VARIANTS: &[(&str, usize, usize, Role)] = &[
-    ("https://aurora-silicon.org/lv2/sgv2#1ch\0", 1, 0, Role::Protect),
     ("https://aurora-silicon.org/lv2/sgv2#2ch\0", 2, 0, Role::Protect),
     ("https://aurora-silicon.org/lv2/sgv2#2ch-vi\0", 2, 4, Role::Protect),
     ("https://aurora-silicon.org/lv2/sgv2#4ch\0", 4, 0, Role::Protect),
     ("https://aurora-silicon.org/lv2/sgv2#4ch-vi\0", 4, 8, Role::Protect),
     ("https://aurora-silicon.org/lv2/sgv2#6ch-vi\0", 6, 12, Role::Protect),
     ("https://aurora-silicon.org/lv2/sgv2#6ch-vi-placeholder\0", 6, 12, Role::Placeholder),
+    // appended: the descriptor indexes of the variants before it stay
+    ("https://aurora-silicon.org/lv2/sgv2#1ch\0", 1, 0, Role::Protect),
 ];
 
 const MAX_SENSE: usize = 2 * MAX_CHANNELS;
