@@ -532,11 +532,14 @@ class Gate(Base):
     def test_shipped_data(self):
         with open(os.path.join(HERE, "gate.json")) as f:
             g = json.load(f)
-        self.assertEqual(g["units_at_parity"], ["spp3"])
+        self.assertEqual(g["units_at_parity"], ["spp3", "atsp"])
         self.assertTrue(g["require_qualified_board"])
         self.assertEqual(sorted(g["qualified"]), ["atsp", "lsm2", "spp3"])
         qualified = sorted(b for u in g["units_at_parity"] for b in g["qualified"].get(u, []))
-        self.assertEqual(qualified, ["j316s", "j413", "j616s"])
+        self.assertEqual(
+            qualified,
+            sorted(["j316s", "j413", "j616s", "j274", "j293", "j313", "j375c", "j375d", "j473", "j474s", "j475c", "j475d", "j493"]),
+        )
         # policy only: no hardware in the gate
         self.assertEqual(sorted(k for k in g if not k.startswith("_")), ["qualified", "require_qualified_board", "units_at_parity"])
         self.assertFalse(os.path.exists(os.path.join(HERE, "machines.json")))

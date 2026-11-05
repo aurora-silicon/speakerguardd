@@ -238,11 +238,24 @@ fn slices(seed: u64) -> Vec<usize> {
 /// the same bit for bit: whole multiples of the 512-frame fragment
 /// (`staged`), or fragments of 2 frames up to one tick, which never start
 /// before the window their tick closes. One-frame fragments take the
-/// one-frame dezipper path, a family of their own.
-fn atsp_family_slices(seed: u64, win: usize, staged: bool) -> Vec<usize> {
+/// one-frame dezipper path, a family of their own. A one-channel stream's
+/// dezipper groups each call's frames by eight (SPEC-ATSP 11.4), so its
+/// small family is whole groups of eight up to one tick.
+fn atsp_family_slices(seed: u64, win: usize, staged: bool, mono: bool) -> Vec<usize> {
     let mut r = Rng(seed ^ 0xa75);
     let small = win.min(atsp::FRAGMENT);
-    (0..64).map(|_| if staged { atsp::FRAGMENT * (1 + r.below(8)) } else { 2 + r.below(small - 1) }).collect()
+    let staged = staged || (mono && small < 8);
+    (0..64)
+        .map(|_| {
+            if staged {
+                atsp::FRAGMENT * (1 + r.below(8))
+            } else if mono {
+                8 * (1 + r.below(small / 8))
+            } else {
+                2 + r.below(small - 1)
+            }
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -914,7 +927,11 @@ proptest! {
         let x = signal(seed ^ 1, n, len, amp, h);
         // a one-frame last call (the input running out) is a family of its
         // own: leave the input one frame longer than every slicing's end
-        let (sa, sb) = (atsp_family_slices(a, win, staged), atsp_family_slices(b, win, staged));
+        let mono = n == 1;
+        let (sa, sb) = (atsp_family_slices(a, win, staged, mono), atsp_family_slices(b, win, staged, mono));
+        // one channel: every call, the last too, whole groups of eight
+        let x: Vec<Vec<f32>> = if mono { x.iter().map(|c| c[..c.len() / 8 * 8].to_vec()).collect() } else { x };
+        prop_assume!(!x[0].is_empty());
         let len = x[0].len();
         let ends_on_one = |sl: &[usize]| {
             let (mut done, mut k) = (0, 0);

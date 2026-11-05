@@ -9,7 +9,7 @@ hand-written template and with nobody at the machine.
 
 | Item | Automatic? | What a new Mac needs |
 |---|---|---|
-| Protection unit | spp3 only | spp3 is at parity. lsm2 and atsp are pending. |
+| Protection unit | spp3 and atsp | spp3 and atsp are at parity. lsm2 is pending. |
 | Kernel driver | no | A `macaudio` match entry and a device tree for the board. |
 | Tuning | yes | The installer collects the Mac's tuning bundle. |
 | Parameter blob | yes | Compiled and bound at boot by `speakerguardd-provision`. The compiler has no table of boards. |
@@ -143,8 +143,9 @@ both, so exactly one stack runs on a board:
 
 The kernel is the switch: a fleet kernel without the v2 interface keeps
 every Mac on the older daemons, the kernel with it moves every gated Mac at
-once, and booting the older kernel moves it back. The fleet cutover adds
-lsm2 and atsp to `units_at_parity` once they reach parity and sets
+once, and booting the older kernel moves it back. atsp joined
+`units_at_parity` when all 117 rig cases matched macOS bit for bit. The
+fleet cutover adds lsm2 once it reaches parity and sets
 `require_qualified_board` to false: every board with a parity unit. The data
 is speakerguardd's own; every distribution ships it unchanged.
 `speakerguardd-gate explain` prints the decision.
