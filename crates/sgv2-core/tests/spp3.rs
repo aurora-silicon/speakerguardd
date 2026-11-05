@@ -915,3 +915,60 @@ fn plausibility_guard_trips_on_a_coil_far_below_its_calibration() {
     run_cl(&mut u, 0.3, &tele, 0, n);
     assert!(u.sense_implausible(0));
 }
+
+#[test]
+fn plausibility_guard_allows_a_cold_room() {
+    // a 5 C room: the coil honestly reads 20 K below its 25 C calibration;
+    // the bound is relative to the colder of T_cal and the model's ambient
+    let mut p = cl_params(4.0, 25.0);
+    p.thermal_ambient_temp = 5.0;
+    let mut u = spp3::Unit::new(p);
+    let n = 48_000 * 6;
+    let alpha = 0.004 + (25.0 - 20.0) * (0.0038 - 0.004) / 15.0;
+    let tele = pilot_sense_r(|_| 0.2 + 3.8 * (1.0 - alpha * 20.0), n);
+    let t = run_cl(&mut u, 0.3, &tele, 0, n);
+    assert!(!u.sense_implausible(0), "T_OL {} T_CL {}", t.channels[0].ol_temp_c, t.channels[0].cl_temp_c);
+}
+
+/// The post-stop shape of the J616s relaxed run: the pilot stops, no window
+/// is accepted any more and the published T_CL holds its last value while
+/// the model cools below it. Only a fresh T_CL is used: the relaxation
+/// returns to the base, and the guard never judges the stale value.
+#[test]
+fn stale_closed_loop_after_the_pilot_stops_is_not_used() {
+    for bus_lost in [false, true] {
+        let p = cl_params(4.0, 25.0);
+        let mut r = spp3::ClReplay::new(&p, 0, true).unwrap();
+        let upw = r.updates_per_window().round() as usize;
+        let mut tcl = 0.0;
+        let mut adj = 0.0;
+        for _ in 0..40 {
+            assert!(r.window(4.6 * 4.6, 1.0));
+            for _ in 0..upw {
+                let o = r.update(tcl + 40.0, 10.0);
+                (adj, tcl) = (o.0, o.1);
+            }
+        }
+        assert!(r.t_cl_fresh() && adj > 10.0, "relaxing while fresh: {adj}");
+        // stop: T_OL decays from T_CL + 40 to T_CL - 40 over 30 s
+        let n = (30.0 * 48_000.0 / 256.0) as usize;
+        let mut prev = adj;
+        for k in 0..n {
+            if !bus_lost && k % upw == 0 {
+                assert!(!r.window(0.0, 0.0), "a silent window is rejected");
+            }
+            let t_ol = tcl + 40.0 - 80.0 * k as f64 / n as f64;
+            let (a, t, bad) = r.update(t_ol, 0.0);
+            assert_eq!(t, tcl, "the published T_CL holds");
+            assert!(!bad, "the guard never judges a stale T_CL");
+            if !r.t_cl_fresh() {
+                assert!(a <= prev + 1e-9, "no relaxation from a stale T_CL");
+            }
+            prev = a;
+            if k > upw + 1 {
+                assert!(!r.t_cl_fresh(), "stale after one window plus one update");
+            }
+        }
+        assert!(prev < 1e-3, "back at the base: {prev}");
+    }
+}
