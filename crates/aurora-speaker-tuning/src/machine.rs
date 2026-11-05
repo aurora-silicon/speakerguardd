@@ -43,11 +43,10 @@ pub const SPEAKER_ID_PROPERTY: &str = "asahi,speaker-id";
 pub struct Machine {
     /// The board: the first root compatible without `apple,`.
     pub board: String,
-    /// The acoustic-id known independently of the bundle, if the platform
-    /// exports one; the bundle's own must equal it.  TODO: no loader exports
-    /// it yet and the blob header has no room for it (see docs/DESIGN.md),
-    /// so on Linux this is `None`.
+    /// Independently exported by aura in chosen/asahi,acoustic-id (FDT u32, big endian).
     pub acoustic_id: Option<u32>,
+    /// SHA-256 of the root serial-number, without trailing NULs.
+    pub unit_id_sha256: Option<String>,
 }
 
 impl Machine {
@@ -55,7 +54,7 @@ impl Machine {
         if sgv2_core::blob::machine_field(board).is_none() {
             return Err(Error::format("machine", format!("board {board:?} does not fit the blob header")));
         }
-        Ok(Machine { board: board.to_string(), acoustic_id: None })
+        Ok(Machine { board: board.to_string(), acoustic_id: None, unit_id_sha256: None })
     }
 
     /// Reads the running machine from a device tree directory.
@@ -64,7 +63,53 @@ impl Machine {
         let raw = std::fs::read(&p).map_err(|e| Error::Io { path: p.display().to_string(), message: e.to_string() })?;
         let board = board_from_compatible(&raw)
             .ok_or_else(|| Error::format("device tree", "the first root compatible is not apple,<board>"))?;
-        Machine::new(&board)
+        let mut machine = Machine::new(&board)?;
+        machine.acoustic_id = acoustic_id(root)?;
+        let serial = root.join("serial-number");
+        machine.unit_id_sha256 = match std::fs::read(&serial) {
+            Ok(raw) => Some(unit_id(&raw).ok_or_else(|| Error::format("device tree", "malformed serial-number"))?),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(Error::Io { path: serial.display().to_string(), message: e.to_string() }),
+        };
+        Ok(machine)
+    }
+}
+
+/// Canonical target-type: lowercase board name, without the ADT's AP suffix.
+pub fn valid_board(board: &str) -> bool {
+    !board.is_empty()
+        && board.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        && sgv2_core::blob::machine_field(board).is_some()
+}
+
+/// Same bytes on macOS (ADT) and Linux (aura's root serial-number copy).
+/// No whitespace/case normalization and no raw identifier in diagnostics.
+pub fn unit_id(raw: &[u8]) -> Option<String> {
+    let end = raw.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
+    let serial = &raw[..end];
+    if serial.is_empty() || serial.len() > 128 || !serial.iter().all(|b| (0x21..=0x7e).contains(b)) {
+        return None;
+    }
+    Some(crate::manifest::sha256_hex(serial))
+}
+
+pub const ACOUSTIC_ID_PROPERTY: &str = "asahi,acoustic-id";
+
+/// Missing exports cannot authorize a production compile. Malformed exports
+/// are errors, never inferred from the bundle or a board-to-AID table.
+pub fn acoustic_id(root: &Path) -> Result<Option<u32>> {
+    let p = root.join("chosen").join(ACOUSTIC_ID_PROPERTY);
+    match std::fs::read(&p) {
+        Ok(b) => {
+            let word: [u8; 4] = b.try_into().map_err(|_| Error::format("device tree", "malformed acoustic-id"))?;
+            let value = u32::from_be_bytes(word);
+            if value == 0 || value >= 100000 {
+                return Err(Error::format("device tree", "acoustic-id outside 1..100000"));
+            }
+            Ok(Some(value))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(Error::Io { path: p.display().to_string(), message: e.to_string() }),
     }
 }
 
@@ -101,6 +146,23 @@ mod tests {
         std::fs::write(d.join("compatible"), b"apple,j616s\0apple,t6041\0apple,arm-platform\0").unwrap();
         assert_eq!(Machine::from_device_tree(&d).unwrap().board, "j616s");
         assert_eq!(speaker_id(&d).unwrap(), None);
+        assert_eq!(Machine::from_device_tree(&d).unwrap().acoustic_id, None);
+        std::fs::write(d.join("chosen").join(ACOUSTIC_ID_PROPERTY), 35u32.to_be_bytes()).unwrap();
+        std::fs::write(d.join("serial-number"), b"abc\0\0").unwrap();
+        let m = Machine::from_device_tree(&d).unwrap();
+        assert_eq!(m.acoustic_id, Some(35));
+        assert_eq!(m.unit_id_sha256, Some(crate::manifest::sha256_hex(b"abc")));
+        for raw in [vec![35], 0u32.to_be_bytes().to_vec(), 35u32.to_le_bytes().to_vec()] {
+            std::fs::write(d.join("chosen").join(ACOUSTIC_ID_PROPERTY), raw).unwrap();
+            assert!(Machine::from_device_tree(&d).is_err());
+        }
+        std::fs::write(d.join("chosen").join(ACOUSTIC_ID_PROPERTY), 35u32.to_be_bytes()).unwrap();
+        for raw in [b"".as_slice(), b"abc def", b"a\0b", b"\xff"] {
+            assert_eq!(unit_id(raw), None);
+        }
+        std::fs::write(d.join("serial-number"), b"a\0b").unwrap();
+        assert!(Machine::from_device_tree(&d).is_err());
+        std::fs::remove_file(d.join("serial-number")).unwrap();
         std::fs::write(d.join("chosen").join(SPEAKER_ID_PROPERTY), 3u32.to_be_bytes()).unwrap();
         assert_eq!(speaker_id(&d).unwrap(), Some(3));
         std::fs::write(d.join("chosen").join(SPEAKER_ID_PROPERTY), [0, 3]).unwrap();

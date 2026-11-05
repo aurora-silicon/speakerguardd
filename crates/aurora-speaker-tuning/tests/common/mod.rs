@@ -381,6 +381,7 @@ pub fn manifest_json_with(files: &BTreeMap<String, Vec<u8>>, build: &str, speake
     let spid = speaker_id.map_or(String::new(), |v| format!(r#","speaker_id":{v}"#));
     format!(
         r#"{{"schema":2,"kind":"aurora-audio-tuning","source_file_count":{count},"complete":true,
+"machine_model":"j413","unit_id_sha256":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
 "acoustic_id":{ACOUSTIC_ID},"aid":"{AID}","macos_build":"{build}",
 "speaker_thiele_small":{},"device_dsp_database":"DeviceDSPDatabase.plist","config":"Config/{AID}.plist",
 "files":[{}],"based_on":"test"{spid}{lattice}}}"#,

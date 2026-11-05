@@ -87,6 +87,7 @@ pub enum Provenance {
 struct Bound {
     machine: [u8; MACHINE_LEN],
     board: String,
+    use_calibration: bool,
 }
 
 fn preflight(t: &Tuning, m: &Machine, provenance: Provenance, diags: &mut Diagnostics) -> Result<Bound> {
@@ -106,13 +107,39 @@ fn preflight(t: &Tuning, m: &Machine, provenance: Provenance, diags: &mut Diagno
             }
         }
     }
-    if let Some(a) = m.acoustic_id {
-        if a != t.acoustic_id {
-            return Err(bad(format!("the bundle is {}, this Mac is AID{a}", t.aid)));
+    match t.machine_model.as_deref() {
+        Some(model) if model != m.board => return Err(bad("the bundle model differs from this Mac's device tree")),
+        None if provenance == Provenance::Verified => {
+            return Err(bad("the bundle has no machine_model; collect it again on macOS"))
         }
+        None => diags.warn("compile-model-unknown", "compile", "development compile without a bundle model"),
+        _ => {}
+    }
+    match m.acoustic_id {
+        Some(a) if a != t.acoustic_id => return Err(bad(format!("the bundle is {}, this Mac is AID{a}", t.aid))),
+        None if provenance == Provenance::Verified => {
+            return Err(bad("the device tree has no independent acoustic-id export; update aura"))
+        }
+        None => diags.warn(
+            "compile-acoustic-id-unknown",
+            "compile",
+            "development compile without an independent acoustic-id",
+        ),
+        _ => {}
+    }
+    let use_calibration = t.verified
+        && matches!(
+            (&t.unit_id_sha256, &m.unit_id_sha256), (Some(bundle), Some(live)) if bundle == live
+        );
+    if t.spts.is_some() && !use_calibration {
+        diags.warn(
+            "spts-unit-mismatch",
+            "compile",
+            "unit identity missing or different: SpTS disabled, open loop only",
+        );
     }
     let machine = machine_field(&m.board).ok_or_else(|| bad(format!("board {:?} does not fit the header", m.board)))?;
-    Ok(Bound { machine, board: m.board.clone() })
+    Ok(Bound { machine, board: m.board.clone(), use_calibration })
 }
 
 /// Hundredths of a dB between two voltages.
@@ -204,6 +231,7 @@ struct Spp3Lookup<'a> {
     sidecar: &'a crate::spp3::Sidecar,
     rate: u32,
     thermal_state_override: u32,
+    use_calibration: bool,
 }
 
 /// Refuses a strip that sets `SpeakerInputDataSourceOrder` (64005).  The
@@ -227,6 +255,9 @@ impl Spp3Lookup<'_> {
     /// `ch`, by position.  `None` (open loop) without a valid record file;
     /// a valid file has one record per channel (checked before lookup).
     fn calibration(&self, ch: usize) -> Option<&crate::spts::Record> {
+        if !self.use_calibration {
+            return None;
+        }
         self.t.spts.as_ref().filter(|s| s.checksum_valid)?.records.get(ch)
     }
 }
@@ -320,13 +351,13 @@ fn compile_spp3(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
     // channel: any other count means the records and the channels disagree,
     // and a guessed binding would seed one speaker's closed loop with
     // another's calibration.
-    if let Some(s) = t.spts.as_ref().filter(|s| s.checksum_valid) {
+    if let Some(s) = t.spts.as_ref().filter(|s| b.use_calibration && s.checksum_valid) {
         if s.records.len() != n {
             let ids: Vec<String> = s.records.iter().map(|r| r.data_source.to_string()).collect();
             return Err(bad(format!("SpTS has {} records ({}) for {n} unit channels", s.records.len(), ids.join(" "))));
         }
     }
-    let lk = Spp3Lookup { t, sidecar, rate, thermal_state_override: tso };
+    let lk = Spp3Lookup { t, sidecar, rate, thermal_state_override: tso, use_calibration: b.use_calibration };
     let p = spp3::Params::from_lookup(&lk).map_err(|e| bad(format!("spp3 parameters: {e:?}")))?;
     let start = if tso == SPP3_COLD_START { "cold" } else { "hot fallback" };
     diags.info("compile-start-state", "compile", format!("Thermal State Override {tso}: the {start} start state"));
