@@ -21,6 +21,27 @@
 //! boards: the amp count and gain are the running Mac's, checked by the
 //! self-check and the supervisor (see [`crate::machine`]).
 //!
+//! **Unit binding.** A bundle carries the board and the unit it was
+//! collected on ([`crate::manifest::Manifest::board`],
+//! [`crate::manifest::Manifest::unit_id`]); the machine carries the running
+//! Mac's ([`Machine::from_device_tree`]).  Per [`preflight`]:
+//!
+//! | bundle | this Mac | result |
+//! |---|---|---|
+//! | another board | any | refused |
+//! | another unit | a known unit | refused |
+//! | the same unit | the same unit | SpTS used (closed loop) |
+//! | no unit (collected before the installer recorded it) | any | open loop, warning |
+//! | a unit | no or a malformed `serial-number` | open loop, warning |
+//!
+//! Open loop is the most protective case: the closed loop can only raise
+//! the limit above the base (`clamp(T_OL - T_CL, 0, cap)`), so without
+//! trusted calibration every channel holds the base limit.  A refusal
+//! leaves no blob: no grant, the speakers stay at the kernel's floor.  The
+//! remedy for both is to collect the tuning again on this Mac's macOS.
+//! The manifest is integrity metadata, not a signature: the binding stops a
+//! bundle from the wrong Mac, not a forged one.
+//!
 //! **Header.** The blob names the board and the amps' operating point
 //! (`sgv2_core::blob::build_for`, header bytes 36 to 48), which the
 //! supervisor checks against the running card; see [`crate::machine`].
@@ -87,7 +108,58 @@ pub enum Provenance {
 struct Bound {
     machine: [u8; MACHINE_LEN],
     board: String,
-    use_calibration: bool,
+    /// The bundle's per-unit calibration (SpTS) belongs to this Mac.
+    calibration_trusted: bool,
+}
+
+/// What the compile tells someone fixing a refusal or a warning.
+pub const RECOLLECT: &str = "collect the speaker tuning again on this Mac's macOS \
+(the installer's firmware step, or tools/speaker-tuning/collect-macos.sh then install-linux.sh)";
+
+/// Whether the bundle's per-unit calibration is this Mac's.  `Err` for a
+/// bundle collected on another unit; see the module documentation.
+fn unit_binding(t: &Tuning, m: &Machine, diags: &mut Diagnostics) -> Result<bool> {
+    use crate::machine::Unit;
+    let has_cal = t.spts.is_some();
+    match (&t.unit_id, &m.unit) {
+        (Some(b), Unit::Known(l)) if b == l => Ok(true),
+        (Some(_), Unit::Known(_)) => Err(bad(format!(
+            "the tuning bundle was collected on another Mac (its unit ID is not this Mac's): \
+             its calibration is another unit's, so it must not run here; {RECOLLECT}"
+        ))),
+        (Some(_), unit) => {
+            if has_cal {
+                let why = if *unit == Unit::Malformed {
+                    "its device-tree serial-number is malformed"
+                } else {
+                    "it has no device-tree serial-number (or --board was given without --unit-id)"
+                };
+                diags.warn(
+                    "unit-unverifiable",
+                    "compile",
+                    format!(
+                        "this Mac's unit is unknown ({why}), so the bundle's unit cannot be checked: \
+                         the per-unit calibration (SpTS) is not used and every channel runs open loop at its base limit"
+                    ),
+                );
+            }
+            Ok(false)
+        }
+        (None, _) => {
+            if has_cal {
+                diags.warn(
+                    "unit-unbound",
+                    "compile",
+                    format!(
+                        "the tuning bundle does not name the Mac it was collected on (collected before the \
+                         installer recorded it): its per-unit calibration (SpTS) is not trusted and every \
+                         channel runs open loop at its base limit; {RECOLLECT}"
+                    ),
+                );
+            }
+            Ok(false)
+        }
+    }
 }
 
 fn preflight(t: &Tuning, m: &Machine, provenance: Provenance, diags: &mut Diagnostics) -> Result<Bound> {
@@ -107,39 +179,25 @@ fn preflight(t: &Tuning, m: &Machine, provenance: Provenance, diags: &mut Diagno
             }
         }
     }
-    match t.machine_model.as_deref() {
-        Some(model) if model != m.board => return Err(bad("the bundle model differs from this Mac's device tree")),
-        None if provenance == Provenance::Verified => {
-            return Err(bad("the bundle has no machine_model; collect it again on macOS"))
+    if let Some(a) = m.acoustic_id {
+        if a != t.acoustic_id {
+            return Err(bad(format!("the bundle is {}, this Mac is AID{a}", t.aid)));
         }
-        None => diags.warn("compile-model-unknown", "compile", "development compile without a bundle model"),
-        _ => {}
     }
-    match m.acoustic_id {
-        Some(a) if a != t.acoustic_id => return Err(bad(format!("the bundle is {}, this Mac is AID{a}", t.aid))),
-        None if provenance == Provenance::Verified => {
-            return Err(bad("the device tree has no independent acoustic-id export; update aura"))
+    match &t.board {
+        Some(b) if *b != m.board => {
+            return Err(bad(format!("the tuning bundle was collected on a {b}, this Mac is a {}; {RECOLLECT}", m.board)))
         }
-        None => diags.warn(
-            "compile-acoustic-id-unknown",
+        Some(_) => {}
+        None => diags.info(
+            "board-unbound",
             "compile",
-            "development compile without an independent acoustic-id",
+            "the tuning bundle does not name the board it was collected on (collected before the installer recorded it)",
         ),
-        _ => {}
     }
-    let use_calibration = t.verified
-        && matches!(
-            (&t.unit_id_sha256, &m.unit_id_sha256), (Some(bundle), Some(live)) if bundle == live
-        );
-    if t.spts.is_some() && !use_calibration {
-        diags.warn(
-            "spts-unit-mismatch",
-            "compile",
-            "unit identity missing or different: SpTS disabled, open loop only",
-        );
-    }
+    let calibration_trusted = unit_binding(t, m, diags)?;
     let machine = machine_field(&m.board).ok_or_else(|| bad(format!("board {:?} does not fit the header", m.board)))?;
-    Ok(Bound { machine, board: m.board.clone(), use_calibration })
+    Ok(Bound { machine, board: m.board.clone(), calibration_trusted })
 }
 
 /// Hundredths of a dB between two voltages.
@@ -206,6 +264,9 @@ pub struct Compiled {
     /// Header fields: the board and the operating point.
     pub board: String,
     pub full_scale_mv: u32,
+    /// The bundle's per-unit calibration is this Mac's and was compiled in
+    /// (spp3 closed loop); `false` for open loop and for units without one.
+    pub calibration: bool,
     pub blob: Vec<u8>,
 }
 
@@ -231,7 +292,8 @@ struct Spp3Lookup<'a> {
     sidecar: &'a crate::spp3::Sidecar,
     rate: u32,
     thermal_state_override: u32,
-    use_calibration: bool,
+    /// [`Bound::calibration_trusted`]: without it no record is used.
+    calibration_trusted: bool,
 }
 
 /// Refuses a strip that sets `SpeakerInputDataSourceOrder` (64005).  The
@@ -252,10 +314,11 @@ pub fn check_telemetry_order(t: &Tuning) -> Result<()> {
 
 impl Spp3Lookup<'_> {
     /// The factory calibration record of unit channel `ch`: SpTS record
-    /// `ch`, by position.  `None` (open loop) without a valid record file;
-    /// a valid file has one record per channel (checked before lookup).
+    /// `ch`, by position.  `None` (open loop) without a valid record file
+    /// or when the bundle's unit is not this Mac's; a valid file has one
+    /// record per channel (checked before lookup).
     fn calibration(&self, ch: usize) -> Option<&crate::spts::Record> {
-        if !self.use_calibration {
+        if !self.calibration_trusted {
             return None;
         }
         self.t.spts.as_ref().filter(|s| s.checksum_valid)?.records.get(ch)
@@ -351,14 +414,16 @@ fn compile_spp3(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
     // channel: any other count means the records and the channels disagree,
     // and a guessed binding would seed one speaker's closed loop with
     // another's calibration.
-    if let Some(s) = t.spts.as_ref().filter(|s| b.use_calibration && s.checksum_valid) {
+    // (Only for calibration this Mac may use: another unit's is never read.)
+    if let Some(s) = t.spts.as_ref().filter(|s| b.calibration_trusted && s.checksum_valid) {
         if s.records.len() != n {
             let ids: Vec<String> = s.records.iter().map(|r| r.data_source.to_string()).collect();
             return Err(bad(format!("SpTS has {} records ({}) for {n} unit channels", s.records.len(), ids.join(" "))));
         }
     }
-    let lk = Spp3Lookup { t, sidecar, rate, thermal_state_override: tso, use_calibration: b.use_calibration };
+    let lk = Spp3Lookup { t, sidecar, rate, thermal_state_override: tso, calibration_trusted: b.calibration_trusted };
     let p = spp3::Params::from_lookup(&lk).map_err(|e| bad(format!("spp3 parameters: {e:?}")))?;
+    let calibration = (0..n).all(|c| lk.calibration(c).is_some());
     let start = if tso == SPP3_COLD_START { "cold" } else { "hot fallback" };
     diags.info("compile-start-state", "compile", format!("Thermal State Override {tso}: the {start} start state"));
     let sense = match &t.protection.telemetry {
@@ -388,6 +453,7 @@ fn compile_spp3(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
         sample_rate: p.sample_rate,
         board: b.board.clone(),
         full_scale_mv,
+        calibration,
         blob,
     })
 }
@@ -608,6 +674,7 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
         sample_rate: p.sample_rate,
         board: b.board.clone(),
         full_scale_mv,
+        calibration: false,
         blob,
     })
 }
@@ -732,6 +799,7 @@ fn compile_atsp(t: &Tuning, b: &Bound) -> Result<Compiled> {
         sample_rate: p.sample_rate,
         board: b.board.clone(),
         full_scale_mv,
+        calibration: false,
         blob,
     })
 }

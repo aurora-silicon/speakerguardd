@@ -6,7 +6,7 @@
 //! ```text
 //! aurora-speaker-tuning dump     [--json] [--speaker-id N] [SOURCE]
 //! aurora-speaker-tuning validate [--json] [--speaker-id N] [SOURCE]
-//! aurora-speaker-tuning compile  [--speaker-id N] [--board B --acoustic-id N] [--development] [SOURCE | --bundle PATH] -o BLOB
+//! aurora-speaker-tuning compile  [--speaker-id N] [--board B [--unit-id U]] [--development] [SOURCE | --bundle PATH] -o BLOB
 //! aurora-speaker-tuning identify [--json] [SOURCE]   (the bundle's identity, for provisioning)
 //! aurora-speaker-tuning blob     BLOB [BLOB]     (decode; with two, diff field by field)
 //! aurora-speaker-tuning units    [--json]
@@ -22,9 +22,13 @@
 //!
 //! The speaker ID is `--speaker-id`, else the manifest's, else the device
 //! tree's `/chosen/asahi,speaker-id`.  `compile` binds the blob to a board:
-//! this Mac's live device tree. Offline `--board --acoustic-id` overrides
-//! require `--development` and are refused when a live device tree exists. `compile`
+//! `--board` (compiling for another Mac), else this Mac's device tree; the
+//! device tree's speaker ID is read only without `--board`.  `compile`
 //! refuses an unverified source (`--tunings-root`) unless `--development`.
+//! The unit is this Mac's device tree's (`serial-number`), or with
+//! `--board` the `--unit-id` given (the bundle's own, to compile offline
+//! for the Mac it came from), else unknown: then per-unit calibration is
+//! not used (open loop).  See `compile` for the binding rules.
 //!
 //! `identify` loads and verifies the bundle (nothing is parsed beyond the
 //! manifest) and prints where it was found and its digest
@@ -49,14 +53,14 @@ struct Args {
     path2: Option<PathBuf>,
     out: Option<PathBuf>,
     board: Option<String>,
-    acoustic_id: Option<u32>,
+    unit_id: Option<String>,
     development: bool,
 }
 
 fn usage() -> ! {
     eprintln!(
         "usage: aurora-speaker-tuning {{dump|validate}} [--json] [--speaker-id N] [PATH | --tunings-root DIR --aid N]\n       \
-         aurora-speaker-tuning compile [--speaker-id N] [--board B --acoustic-id N] [--development] [--bundle PATH | --tunings-root DIR --aid N] -o BLOB\n       \
+         aurora-speaker-tuning compile [--speaker-id N] [--board B [--unit-id U]] [--development] [--bundle PATH | --tunings-root DIR --aid N] -o BLOB\n       \
          aurora-speaker-tuning identify [--json] [PATH | --tunings-root DIR --aid N]\n       \
          aurora-speaker-tuning blob BLOB [BLOB]\n       \
          aurora-speaker-tuning units [--json]\n       aurora-speaker-tuning plist FILE"
@@ -87,7 +91,7 @@ fn parse_args() -> Args {
         path2: None,
         out: None,
         board: None,
-        acoustic_id: None,
+        unit_id: None,
         development: false,
     };
     while let Some(x) = it.next() {
@@ -100,8 +104,8 @@ fn parse_args() -> Args {
                     Some(it.next().and_then(|v| v.trim_start_matches("AID").parse().ok()).unwrap_or_else(|| usage()))
             }
             "--bundle" => a.path = Some(it.next().map(PathBuf::from).unwrap_or_else(|| usage())),
-            "--acoustic-id" => a.acoustic_id = Some(it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage())),
             "--board" => a.board = Some(it.next().unwrap_or_else(|| usage())),
+            "--unit-id" => a.unit_id = Some(it.next().unwrap_or_else(|| usage())),
             "--development" => a.development = true,
             "-o" | "--output" => a.out = Some(it.next().map(PathBuf::from).unwrap_or_else(|| usage())),
             p if !p.starts_with('-') && a.path.is_none() => a.path = Some(PathBuf::from(p)),
@@ -109,15 +113,10 @@ fn parse_args() -> Args {
             _ => usage(),
         }
     }
-    if a.cmd == "compile" && (a.board.is_some() || a.acoustic_id.is_some()) {
-        if std::path::Path::new(machine::DEVICE_TREE).is_dir() {
-            eprintln!("compile: live device-tree identity cannot be overridden");
-            exit(2);
-        }
-        if !a.development || a.board.is_none() {
-            eprintln!("compile: offline identity overrides require --development and --board");
-            exit(2);
-        }
+    // A unit ID names the Mac an offline compile is for; it never stands
+    // in for the running Mac's device tree.
+    if a.unit_id.is_some() && (a.board.is_none() || a.cmd != "compile") {
+        usage();
     }
     a
 }
@@ -374,11 +373,11 @@ fn identify(bundle: aurora_speaker_tuning::Result<Bundle>, json: bool) {
         "verified": b.verified,
         "kind": m.source,
         "acoustic_id": m.acoustic_id,
-        "machine_model": m.machine_model,
-        "unit_id_sha256": m.unit_id_sha256,
         "aid": m.aid,
         "macos_build": m.macos_build,
         "speaker_id": m.speaker_id,
+        "board": m.board,
+        "unit_bound": m.unit_id.is_some(),
         "files": m.records().count().max(b.files.len()),
         "digest": b.digest(),
         "reader": env!("CARGO_PKG_VERSION"),
@@ -459,7 +458,7 @@ fn main() {
     }
     let mut diags = Diagnostics::default();
     let dt = std::path::Path::new(machine::DEVICE_TREE);
-    let live = dt.is_dir();
+    let live = a.board.is_none() && dt.is_dir();
     let device_tree_speaker_id = if live {
         machine::speaker_id(dt).unwrap_or_else(|e| {
             eprintln!("{e}");
@@ -474,12 +473,10 @@ fn main() {
         Ok(t) => {
             if a.cmd == "compile" {
                 let out = a.out.clone().unwrap_or_else(|| usage());
-                let m = match &a.board {
-                    Some(b) => Machine::new(b).map(|mut m| {
-                        m.acoustic_id = a.acoustic_id;
-                        m
-                    }),
-                    None => Machine::from_device_tree(dt),
+                let m = match (&a.board, &a.unit_id) {
+                    (Some(b), Some(u)) => Machine::with_unit(b, u),
+                    (Some(b), None) => Machine::new(b),
+                    (None, _) => Machine::from_device_tree(dt),
                 };
                 let provenance = if a.development { Provenance::AllowUnverified } else { Provenance::Verified };
                 match m.and_then(|m| compile::compile_with(&t, &m, provenance, &mut diags)) {
@@ -489,7 +486,7 @@ fn main() {
                             exit(1);
                         }
                         eprintln!(
-                            "wrote {} ({} bytes): {:?}, {} channels, {} sense, {} Hz, board {}, full scale {} mV",
+                            "wrote {} ({} bytes): {:?}, {} channels, {} sense, {} Hz, board {}, full scale {} mV, {}",
                             out.display(),
                             c.blob.len(),
                             c.unit,
@@ -497,7 +494,8 @@ fn main() {
                             c.sense_channels,
                             c.sample_rate,
                             c.board,
-                            c.full_scale_mv
+                            c.full_scale_mv,
+                            if c.calibration { "unit calibration in use" } else { "no unit calibration" }
                         );
                     }
                     Err(e) => diags.from_error("compile", &e),

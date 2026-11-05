@@ -356,12 +356,37 @@ pub fn lattice_bytes(ends: &[u64]) -> Vec<u8> {
     ends.iter().flat_map(|e| e.to_le_bytes()).collect()
 }
 
+/// The synthetic unit the fixtures are collected on: the unit ID of a made-up
+/// serial number, never a real one.
+pub fn test_unit() -> String {
+    aurora_speaker_tuning::machine::unit_id(b"SYNTHETIC0A").unwrap()
+}
+
+/// Another synthetic unit.
+pub fn other_unit() -> String {
+    aurora_speaker_tuning::machine::unit_id(b"SYNTHETIC0B").unwrap()
+}
+
+/// The installer's manifest, collected on [`test_unit`] (no board named).
 pub fn manifest_json(files: &BTreeMap<String, Vec<u8>>, build: &str) -> String {
     manifest_json_with(files, build, None)
 }
 
-/// The installer's schema-2 manifest, with `speaker_id` when given.
+/// The installer's schema-2 manifest, with `speaker_id` when given,
+/// collected on [`test_unit`].
 pub fn manifest_json_with(files: &BTreeMap<String, Vec<u8>>, build: &str, speaker_id: Option<u32>) -> String {
+    manifest_json_ident(files, build, speaker_id, None, Some(&test_unit()))
+}
+
+/// The installer's schema-2 manifest with the collecting Mac's identity as
+/// given (`None`: the key is left out, as in bundles collected before it).
+pub fn manifest_json_ident(
+    files: &BTreeMap<String, Vec<u8>>,
+    build: &str,
+    speaker_id: Option<u32>,
+    board: Option<&str>,
+    unit_id: Option<&str>,
+) -> String {
     let rec = |p: &str, d: &[u8]| format!(r#"{{"path":"{p}","bytes":{},"sha256":"{}"}}"#, d.len(), sha256_hex(d));
     let spts = files.get("speaker-thiele-small.bin").map(|d| rec("speaker-thiele-small.bin", d));
     // The installer's lsm2 masker lattice record, when the files hold one.
@@ -379,12 +404,13 @@ pub fn manifest_json_with(files: &BTreeMap<String, Vec<u8>>, build: &str, speake
         .collect();
     let count = files.keys().filter(|p| p.starts_with(&format!("{AID}/"))).count();
     let spid = speaker_id.map_or(String::new(), |v| format!(r#","speaker_id":{v}"#));
+    let ident = board.map_or(String::new(), |b| format!(r#","board":"{b}""#))
+        + &unit_id.map_or(String::new(), |u| format!(r#","unit_id":"{u}""#));
     format!(
         r#"{{"schema":2,"kind":"aurora-audio-tuning","source_file_count":{count},"complete":true,
-"machine_model":"j413","unit_id_sha256":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
 "acoustic_id":{ACOUSTIC_ID},"aid":"{AID}","macos_build":"{build}",
 "speaker_thiele_small":{},"device_dsp_database":"DeviceDSPDatabase.plist","config":"Config/{AID}.plist",
-"files":[{}],"based_on":"test"{spid}{lattice}}}"#,
+"files":[{}],"based_on":"test"{spid}{ident}{lattice}}}"#,
         spts.unwrap_or_else(|| "null".into()),
         list.join(",")
     )

@@ -321,13 +321,6 @@ fn digest_is_the_bundle_identity() {
     assert_ne!(da, Bundle::open(&c).unwrap().digest());
     let mut changed = files.clone();
     changed.get_mut(&format!("{AID}/DSP/Graphs/builtin_speaker_out.dspg")).unwrap().push(b'\n');
-    for field in ["machine_model", "unit_id_sha256"] {
-        let mut meta: serde_json::Value = serde_json::from_str(&manifest_json(&files, "25G83")).unwrap();
-        meta[field] = if field == "machine_model" { "j616s".into() } else { "a".repeat(64).into() };
-        let changed = scratch(&format!("digest-{field}"));
-        write_dir(&changed, &files, &meta.to_string());
-        assert_ne!(da, Bundle::open(&changed).unwrap().digest());
-    }
     let c = scratch("digest-file");
     write_dir(&c, &changed, &manifest_json(&changed, "25G83"));
     assert_ne!(da, Bundle::open(&c).unwrap().digest());
@@ -403,21 +396,4 @@ fn hard_links_in_the_firmware_archive() {
     assert!(t.is_ok() && !d.has_errors(), "{:?} {:?}", t.err(), d.items);
     let e = Bundle::from_tar(&build("hardlink-dangling", true), Some("apple/audio-tuning/")).unwrap_err();
     assert!(format!("{e}").contains("hard link"), "{e}");
-}
-
-#[test]
-fn production_cli_cannot_override_device_identity() {
-    let files = spp3_files(2);
-    let dir = scratch("compile-identity-cli");
-    write_dir(&dir, &files, &manifest_json(&files, "25G83"));
-    let out = dir.join("out.blob");
-    let result = std::process::Command::new(env!("CARGO_BIN_EXE_aurora-speaker-tuning"))
-        .args(["compile", "--board", "j413", "--acoustic-id", &ACOUSTIC_ID.to_string()])
-        .arg(&dir)
-        .arg("-o")
-        .arg(&out)
-        .output()
-        .unwrap();
-    assert_eq!(result.status.code(), Some(2));
-    assert!(!out.exists());
 }

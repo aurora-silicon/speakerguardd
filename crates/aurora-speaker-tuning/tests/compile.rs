@@ -18,12 +18,10 @@ use aurora_speaker_tuning::Diagnostics;
 use common::*;
 use std::collections::BTreeMap;
 
-/// The synthetic bundles have four channels: a four-amp board.
+/// The synthetic bundles have four channels: a four-amp board, the unit
+/// they were collected on.
 fn j413() -> Machine {
-    let mut m = Machine::new("j413").unwrap();
-    m.acoustic_id = Some(ACOUSTIC_ID);
-    m.unit_id_sha256 = Some(aurora_speaker_tuning::manifest::sha256_hex(b"abc"));
-    m
+    Machine::with_unit("j413", &test_unit()).unwrap()
 }
 
 fn compile(t: &Tuning, d: &mut Diagnostics) -> aurora_speaker_tuning::Result<comp::Compiled> {
@@ -225,13 +223,18 @@ fn compile_refuses_what_the_engine_must_not_run() {
 #[test]
 fn compile_binds_to_the_machine() {
     let t = tuning(&spp3_files(4), "c-machine");
-    // A bundle for one board must not be relabelled for another.
-    for board in ["t4", "t999x"] {
-        let mut m = j413();
-        m.board = board.into();
-        assert!(comp::compile(&t, &m, &mut Diagnostics::default()).is_err());
-        assert!(comp::compile_with(&t, &m, Provenance::AllowUnverified, &mut Diagnostics::default()).is_err());
+    // No table of boards: any board that fits the header compiles, and the
+    // header names it (the amp count is the running Mac's to check).
+    for b in ["t4", "t999x"] {
+        let c = comp::compile(&t, &Machine::new(b).unwrap(), &mut Diagnostics::default()).unwrap();
+        assert_eq!(c.board, b);
+        assert_eq!(sgv2_core::blob::Header::parse(&c.blob).unwrap().0.machine(), Some(b));
     }
+    // The board is all that differs.
+    let a = comp::compile(&t, &Machine::new("t4").unwrap(), &mut Diagnostics::default()).unwrap();
+    let b = comp::compile(&t, &Machine::new("t999x").unwrap(), &mut Diagnostics::default()).unwrap();
+    assert_eq!(a.blob.len(), b.blob.len());
+    assert!(a.blob[sgv2_core::blob::HEADER_LEN..] == b.blob[sgv2_core::blob::HEADER_LEN..]);
     assert!(Machine::new("t4-too-long-board").is_err());
     // A known acoustic-id must match the bundle's.
     let mut m = j413();
@@ -491,28 +494,4 @@ fn a_bypassed_atsp_preset_is_refused() {
     let t = tuning(&f, "c-atsp-bypass");
     let e = compile(&t, &mut Diagnostics::default()).unwrap_err();
     assert!(format!("{e}").contains("bypasses atsp"), "{e}");
-}
-
-#[test]
-fn calibration_is_bound_to_the_collecting_unit() {
-    let t = tuning(&spp3_files(4), "c-unit");
-    for identity in [None, Some(aurora_speaker_tuning::manifest::sha256_hex(b"foreign"))] {
-        let mut m = j413();
-        m.unit_id_sha256 = identity;
-        let mut d = Diagnostics::default();
-        let c = comp::compile(&t, &m, &mut d).unwrap();
-        let p = sgv2_core::spp3::Params::from_blob(&c.blob).unwrap();
-        assert!(p.ch[..4].iter().all(|ch| ch.cal_present == 0));
-        assert!(d.items.iter().any(|d| d.code == "spts-unit-mismatch"));
-    }
-    let mut old = t.clone();
-    old.unit_id_sha256 = None;
-    let c = compile(&old, &mut Diagnostics::default()).unwrap();
-    let p = sgv2_core::spp3::Params::from_blob(&c.blob).unwrap();
-    assert!(p.ch[..4].iter().all(|ch| ch.cal_present == 0));
-    old.machine_model = None;
-    assert!(compile(&old, &mut Diagnostics::default()).is_err());
-    let mut m = j413();
-    m.acoustic_id = None;
-    assert!(comp::compile(&t, &m, &mut Diagnostics::default()).is_err());
 }

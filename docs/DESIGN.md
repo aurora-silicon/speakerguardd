@@ -70,11 +70,26 @@ No byte of the version-1 header is free for them. Proposal for a header version 
 - at 52, the speaker ID (u32);
 - at 56, flags (u32), bit 0 meaning the speaker ID is present.
 
-With these, the supervisor can compare the acoustic-id with the installed bundle's manifest, and the speaker ID with the device tree export once it exists. The compiler requires the installer's `machine_model` (canonical root target-type: `J616sAP` becomes `j616s`) to match Linux's first root compatible (`apple,j616s`). It also requires the manifest's `acoustic_id` to equal aura's `/chosen/asahi,acoustic-id`, a big-endian FDT u32 read independently from exactly one ADT audio node. Missing model or acoustic-ID export refuses production compilation; recollect old bundles and update aura. Development compiles can omit identity, with diagnostics, but cannot override a known mismatch.
+With these, the supervisor can compare the acoustic-id with the installed bundle's manifest, and the speaker ID with the device tree export once it exists. Until then, the compiler checks the acoustic-id against an independently known value when the caller has one (`Machine::acoustic_id`). On Linux no such value exists, so the binding rests on the board, the unit and the speaker ID used for selection.
 
-SpTS calibration is enabled only for a verified bundle whose `unit_id_sha256` equals the hash of Linux's root `serial-number`, which aura copies from the ADT. All three readers hash the ASCII serial bytes after removing trailing NUL bytes only (1–128 printable non-space ASCII bytes; no case or whitespace conversion). An absent or different hash disables every calibration record and compiles open loop, with a diagnostic; other validated model tuning remains usable. The hash and model participate in the bundle digest used by provisioning, so adding/changing identity invalidates a cached compile. Raw serials are never written to a bundle or diagnostic.
+### The bundle belongs to one Mac
 
-These are accidental cross-device-use checks, not authentication: the manifest has no signature. A deliberately rewritten manifest is outside this integrity contract. Land the reader before collectors that emit the optional schema-2 identity fields, because older readers reject unknown fields. Offline `--board` compiles require `--development` and should specify `--acoustic-id`; they have no live unit identity and cannot enable SpTS. CLI identity overrides are refused when a live device tree exists.
+SpTS is one unit's factory calibration. A bundle copied from another Mac of the same model would pass every check above, and its resistances would seed the closed loop: about 8 K of temperature error per 3 % of R, enough on a board that relaxes (J616s) to raise the limit above what this unit's coils allow. So the installer records where it collected the bundle, and the compiler checks it against the running Mac:
+
+- `board` in the manifest: the ADT root `target-type`, lowercased (`J616s` → `j616s`), the name the device tree's first compatible carries.
+- `unit_id` in the manifest: SHA-256 over the tag `aurora-speaker-unit-v1\0` and the root `serial-number` without trailing NULs. macOS has it in the `IODeviceTree` root (32 bytes, NUL-padded); aura copies the same ADT property into the device-tree root (one NUL), where Linux reads it from `/proc/device-tree/serial-number`. Every aura and m1n1 release exports it, so no boot-chain change is needed. Only the hash leaves the collector; the serial number never reaches the bundle, a blob, a diagnostic or the provisioning record.
+
+| bundle | this Mac | compile |
+|---|---|---|
+| another `board` | any | refused: no blob, no grant, speakers at the kernel floor |
+| another `unit_id` | a readable `serial-number` | refused |
+| the same `unit_id` | the same | SpTS in use (closed loop as qualified) |
+| no `unit_id` (collected before the installer recorded it) | any | open loop at the base limits, warning `unit-unbound` |
+| a `unit_id` | no or a malformed `serial-number` | open loop, warning `unit-unverifiable` |
+
+Open loop is the most protective case, not a guess: the closed loop can only raise the limit (`clamp(T_OL - T_CL, 0, cap)`), so without trusted calibration each channel holds its base limit, as M2 and M1 Pro already do. A unit without SpTS (lsm2, atsp, desktops) has nothing per unit, and a bundle without identity compiles for it as before. Provisioning binds the blob to the unit too (`provision.bind` key `unit`, the same hash), so a disk moved to another Mac recompiles and is refused there.
+
+To re-collect, run the installer's firmware step on this Mac's macOS, or `tools/speaker-tuning/collect-macos.sh` there and `install-linux.sh` on Linux (aurora-installer), then restart `speakerguardd-provision.service`. The manifest is integrity metadata, not a signature: the binding stops the wrong Mac's bundle, not a forged one.
 
 ## Rollout
 
