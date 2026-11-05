@@ -2,7 +2,7 @@
 """speakerguardd-selfcheck: prove this Mac's speaker wiring, silently, before
 speakerguardd may grant.
 
-    speakerguardd-selfcheck run      --params BLOB [--machines F] [--force] [-- TUNING-SOURCE...]
+    speakerguardd-selfcheck run      --params BLOB [--force] [-- TUNING-SOURCE...]
     speakerguardd-selfcheck check    --params BLOB
     speakerguardd-selfcheck generate --pipewire-dir D --wireplumber-dir D
 
@@ -11,11 +11,14 @@ while the kernel holds the speakers at its floor.
 
 1. **Derive** the wiring (wiring.py) from the device tree and the tuning's
    graph (`aurora-speaker-tuning dump --json` on the same source the
-   parameters were compiled from). A machines.json entry, if there is one,
-   overrides it, and every disagreement fails the check.
+   parameters were compiled from), and the rest of the machine description
+   (wiring.describe) from the same device tree. Nothing is hand-written per
+   board; a board the derivation cannot place fails.
 2. **Check the map against the tuning**: every physical channel's amp (its
    device-tree side and role) is the speaker its unit channel models.
 3. **Check the map against the hardware**, silently:
+   - the ALSA card is the one the device tree's model names, and (with V/I
+     sense) the speaker PCM takes the format the transport gives;
    - every amp's registers (regmap): its RX slot is its speaker PCM
      channel, and its V/I sense TX slots are the device tree's;
    - with a zero-sample stream on the speaker PCM (every sample is 0, so
@@ -55,7 +58,8 @@ HERE = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, HERE)
 import wiring  # noqa: E402
 
-VERSION = 1
+# 2: the record carries the derived machine description (report "machine").
+VERSION = 2
 STATE = "/var/lib/speakerguardd"
 MARKER = "/run/speakerguardd-selfcheck/active"
 RATE = 48000
@@ -430,49 +434,18 @@ def write_atomic(path, text, mode=0o644):
     os.rename(tmp, path)
 
 
-# A machines.json entry's "wiring" value for a board whose wiring cannot be
-# derived by design: only such a board may run on its hand map.
-HAND_BY_DESIGN = "hand-by-design"
-
-
 def derive_live(args):
-    """(hw, wiring, errors). A board whose machines.json entry says its
-    wiring is "hand-by-design" falls back to that entry's hand map when the
-    derivation cannot read it, marked "hand": nothing about it is proven.
-    Every other board must derive: a refusal (an unreadable device tree, a
-    missing or old tuning reader, a tuning the derivation cannot place) fails
-    the self-check, so a derivable Mac never runs on an unproven hand map."""
+    """(hw, wiring, machine description, errors), all from this Mac's
+    device tree and tuning. A refusal (an unreadable device tree, a missing
+    or old tuning reader, a tuning the derivation cannot place) fails the
+    self-check: nothing runs on an unproven map."""
     hw = wiring.read_dt()
-    machines = {}
-    if args.machines and os.path.exists(args.machines):
-        with open(args.machines) as f:
-            machines = json.load(f)
-    key, entry = wiring.machine_entry(machines, hw["board"])
-    try:
-        dump = wiring.tuning_dump(args.tuning, args.tuning_cli)
-        units = wiring.roles(dump)["channels"]
-        w = wiring.derive(hw, dump)
-        w["method"] = "derived" if w["sense"] else "derived-static"
-    except wiring.Refused as e:
-        if not entry or entry.get("wiring") != HAND_BY_DESIGN:
-            raise
-        import gen
-
-        unit, ports, h, _ = gen.wiring_for(key, entry)
-        log(f"{hw['board']}: not derivable ({e}); using the machines.json hand map, unproven")
-        w = {"board": hw["board"], "key": key, "method": "hand", "family": "-", "hash": h,
-             "unit_channels": unit, "sense_ports": ports, "amps": [{}] * entry["amps"], "sense": [{}] * entry["sense"],
-             "why_hand": str(e)}
-        return hw, w, []
-    errs = []
-    if entry:
-        w["key"] = key
-        method = w["method"]
-        w, dis = wiring.apply_override(w, entry)
-        w["method"] = method
-        errs += dis
-    errs += wiring.role_errors(w, units)
-    return hw, w, errs
+    dump = wiring.tuning_dump(args.tuning, args.tuning_cli)
+    units = wiring.roles(dump)["channels"]
+    w = wiring.derive(hw, dump)
+    w["method"] = "derived" if w["sense"] else "derived-static"
+    desc = wiring.describe(hw, w)
+    return hw, w, desc, wiring.role_errors(w, units)
 
 
 def cmd_run(args):
@@ -489,8 +462,9 @@ def cmd_run(args):
     errs = []
     try:
         rec["params_sha256"] = sha256(args.params)
-        hw, w, derr = derive_live(args)
+        hw, w, desc, derr = derive_live(args)
         errs += derr
+        report["machine"] = desc
         rec.update(board=hw["board"], wiring=w["hash"], amps=len(w["amps"]), sense=len(w["sense"]),
                    family=w["family"], key=w["key"], method=w["method"])
         report["wiring"] = w
@@ -504,6 +478,8 @@ def cmd_run(args):
             return 0
         idx, card = find_card(hw)
         rec["card"] = card
+        if card != desc["card"]:
+            errs.append(f"the speaker card is {card}; macaudio names it {desc['card']} from the device tree's model")
         if w["method"] == "derived-static":
             errs += static(idx, w, report)
         elif w["method"] == "derived":
@@ -587,12 +563,25 @@ def active(idx, card, w, report):
         sense_errs, fmt = check_sense(ctl, idx, card, (spk, sense), w, runs)
         errs += sense_errs
         report["speaker_format"] = fmt
+        errs += format_errors(report.get("machine"), fmt)
     finally:
         if ctl is not None:
             ctl.close()
         if old_mux is not None:
             amixer(card, "-q", "cset", f"name={mux}", old_mux)
     return errs
+
+
+def format_errors(desc, fmt):
+    """The speaker PCM's format, as ALSA took it, against the transport's
+    (wiring.describe), which the generated graph will use."""
+    if not desc:
+        return ["no machine description to check the speaker format against"]
+    if fmt is None:
+        return [f"the speaker PCM took none of {wiring.FORMAT_ORDER}"]
+    if fmt != desc["alsa_format"]:
+        return [f"the speaker PCM took {fmt}; the {desc['transport']} transport gives {desc['alsa_format']}"]
+    return []
 
 
 def cmd_check(args):
@@ -611,19 +600,16 @@ def cmd_generate(args):
 
     with open(os.path.join(args.state, "selfcheck.json")) as f:
         report = json.load(f)
-    rec, w = report["record"], report["wiring"]
+    rec, w, c = report["record"], report["wiring"], report.get("machine")
     if rec["result"] != "pass":
         raise SystemExit("the self-check has not passed: nothing to generate")
-    entry = {}
-    if args.machines and os.path.exists(args.machines):
-        with open(args.machines) as f:
-            entry = json.load(f).get(rec["key"], {})
-    fmt = {"S24_LE": "S24_32LE", "S32_LE": "S32LE", "S16_LE": "S16LE"}.get(report.get("speaker_format"), "S24_32LE")
-    c = gen.entry_from_wiring(w, rec["card"], fmt, base=entry)
+    if not c:
+        raise SystemExit("the self-check record has no machine description: run it again")
     m = rec["key"]
+    src = f"the self-check of {rec['board']} ({rec['kernel']})"
     for d, name, text in (
-        (args.pipewire_dir, f"sgv2-{m}.conf", gen.pipewire_conf(m, c, (w["unit_channels"], w["sense_ports"], w["hash"]))),
-        (args.wireplumber_dir, f"60-sgv2-{m}.conf", gen.wireplumber_conf(m, c)),
+        (args.pipewire_dir, f"sgv2-{m}.conf", gen.pipewire_conf(m, c, (w["unit_channels"], w["sense_ports"], w["hash"]), src)),
+        (args.wireplumber_dir, f"60-sgv2-{m}.conf", gen.wireplumber_conf(m, c, src)),
     ):
         os.makedirs(d, exist_ok=True)
         write_atomic(os.path.join(d, name), text)
@@ -635,7 +621,6 @@ def main():
     ap = argparse.ArgumentParser(prog="speakerguardd-selfcheck")
     ap.add_argument("cmd", choices=["run", "check", "generate"])
     ap.add_argument("--params")
-    ap.add_argument("--machines", default=os.path.join(HERE, "machines.json"))
     ap.add_argument("--state", default=STATE)
     ap.add_argument("--tuning-cli", default="aurora-speaker-tuning")
     ap.add_argument("--force", action="store_true")

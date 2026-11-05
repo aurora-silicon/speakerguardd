@@ -617,6 +617,10 @@ pub fn helper_is(report: &SessionReport, stat: Option<&str>, owner: Option<u32>,
 mod tests {
     use super::*;
 
+    /// A synthetic machine: six SN012776 amps.
+    const SN6: crate::machine::Machine =
+        crate::machine::Machine { board: "t6s", card_id: "AppleT6", amps: 6, amp: crate::machine::Amp::Sn012776 };
+
     struct E(EngineState);
     impl EngineView for E {
         fn read(&mut self) -> EngineState {
@@ -963,8 +967,7 @@ mod tests {
         let q = 10_666_666u64;
         let mut o = Observer::new(7, 48_000, TICK);
         let mut k = Recorder::healthy(6);
-        let mut sup =
-            Supervisor::new(Expect::new(crate::machine::lookup("j316s").unwrap(), vec![11_890; 6], "Secondary"));
+        let mut sup = Supervisor::new(Expect::new(&SN6, vec![11_890; 6], "Secondary"));
         let tick = |o: &mut Observer,
                     sup: &mut Supervisor,
                     k: &mut Recorder,
@@ -1303,8 +1306,7 @@ mod tests {
         use crate::lease::Observation;
         use crate::supervise::{Event, Expect, Supervisor};
         let mut k = Recorder::healthy(6);
-        let mut s =
-            Supervisor::new(Expect::new(crate::machine::lookup("j316s").unwrap(), vec![11_890; 6], "Secondary"));
+        let mut s = Supervisor::new(Expect::new(&SN6, vec![11_890; 6], "Secondary"));
         let clean = Observation {
             heartbeat_fresh: true,
             plugin_ok: true,
@@ -1344,8 +1346,7 @@ mod tests {
         let q = 10_666_666u64;
         let mut o = Observer::new(7, 48_000, TICK);
         let mut k = Recorder::healthy(6);
-        let mut sup =
-            Supervisor::new(Expect::new(crate::machine::lookup("j316s").unwrap(), vec![11_890; 6], "Secondary"));
+        let mut sup = Supervisor::new(Expect::new(&SN6, vec![11_890; 6], "Secondary"));
         let run = PcmState::Running { owner: PID };
         let mut seq = 0;
         let mut now = 1_000_000_000;
@@ -1381,8 +1382,7 @@ mod tests {
         assert!(matches!(step(&mut o, &mut sup, &mut k, now, seq, old), Event::Released { .. }));
         // and a dead helper releases at once, whatever its report's age
         let mut o = Observer::new(7, 48_000, TICK);
-        let mut sup =
-            Supervisor::new(Expect::new(crate::machine::lookup("j316s").unwrap(), vec![11_890; 6], "Secondary"));
+        let mut sup = Supervisor::new(Expect::new(&SN6, vec![11_890; 6], "Secondary"));
         let mut k = Recorder::healthy(6);
         let mut t = 0;
         for s2 in 1..6u64 {

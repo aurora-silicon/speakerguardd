@@ -1,5 +1,5 @@
 {
- "note": "MacBook Neo (J700): the sound node of arch/arm64/boot/dts/apple/t8140-j700.dts (public): one MAX98360A node for the stereo pair on the AOP speaker back-end, and the jack. Tuning lanes: the structure of the graph's input lanes only, with generic box names and no tuning values.",
+ "note": "MacBook Neo (J700): the sound node of arch/arm64/boot/dts/apple/t8140-j700.dts (public): one MAX98360A node for the stereo pair on the AOP speaker back-end, and the jack. Tuning lanes: the structure of the graph's input lanes only, with generic box names and no tuning values. The hardware half is wiring.py's reading of arch/arm64/boot/dts/apple/t8140-j700.dts (aurora-silicon/linux integration/aurora), with the I2C bindings of the booted Mac.",
  "hw": {
   "board": "j700",
   "compatible": [
@@ -8,14 +8,23 @@
    "apple,arm-platform"
   ],
   "sound": "sound",
+  "sound_compatible": [
+   "apple,j700-macaudio",
+   "apple,macaudio"
+  ],
   "model": "MacBook Neo J700",
   "links": [
    {
     "name": "Headphone Jack",
     "cpus": 1,
+    "cpu_compatible": [
+     [
+      "apple,t8140-aop-audio"
+     ]
+    ],
     "codecs": [
      {
-      "node": "soc/i2c/codec@48",
+      "node": "soc/i2c@385010000/codec@48",
       "prefix": "Jack",
       "compatible": [
        "cirrus,cs42l83"
@@ -26,6 +35,11 @@
    {
     "name": "Speaker",
     "cpus": 1,
+    "cpu_compatible": [
+     [
+      "apple,t8140-aop-audio"
+     ]
+    ],
     "codecs": [
      {
       "node": "audio-amplifier",

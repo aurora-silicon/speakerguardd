@@ -3,8 +3,8 @@
 # looks like on the MacBook Pro J316. Do not edit it: overrides go in
 # /etc/speakerguardd/provision.conf (SGV2_SEAT_USER=<name>, SGV2_BUNDLE=<path>).
 #
-# The machine (packaging/session/machines.json, or for a Mac with no entry the
-# board), for the session helper.
+# The machine key, from the device tree's "apple,<key>-macaudio" speaker card
+# (the J316s and J316c are both j316), for the session helper.
 SGV2_MACHINE=j316
 # The seat user, by name, and its uid from the user database.
 SGV2_USER=ryan

@@ -11,11 +11,14 @@
 //!   `apple,` vendor (`j616s`);
 //! * the operating point: the output peak voltage at digital full scale,
 //!   in millivolts, from the tuning (spp3 `ag`, lsm2 `VoltsFullScale`).
-//!   The machine description below gives the amp and the analog gain the
-//!   kernel fixes ("Amp Gain Volume", `cfg->amp_gain`; KERNEL.md 2.3), which
-//!   the compiler uses as a cross-check: [`Description::full_scale_mv`]
-//!   converts the gain's dBV (rms-referenced) to peak volts (Daybreak
-//!   t-4662).
+//!
+//! The compiler knows nothing else about the board, and has no table of
+//! boards: a new Mac compiles on day one. The amp count and the analog gain
+//! are the running Mac's, and are checked there: the self-check refuses a
+//! tuning whose unit has another channel count than the device tree's amps,
+//! and the supervisor checks the blob's channels against the self-check's
+//! record and its operating point against the amps' "Amp Gain Volume"
+//! readback (the gain the kernel fixed, KERNEL.md 2.3).
 //!
 //! The speaker-assembly ID (`spid`): macOS publishes it as the IORegistry
 //! `speakerID` of the built-in speaker, read from two board straps (AP
@@ -34,72 +37,6 @@ use std::path::Path;
 pub const DEVICE_TREE: &str = "/proc/device-tree";
 /// The loader's speaker-ID export, under `chosen`.
 pub const SPEAKER_ID_PROPERTY: &str = "asahi,speaker-id";
-
-/// The speaker amp family.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Amp {
-    /// TI SN012776 (tas2764): "Amp Gain Volume" is 11 dB plus 0.5 dB a
-    /// step, read as the full-scale output peak in dBV.
-    Sn012776 { gain_step: u32 },
-    /// A fixed-gain amp: its full-scale output peak, mV.
-    Fixed { full_scale_mv: u32 },
-}
-
-/// What the compiler needs to know about a board.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Description {
-    pub board: &'static str,
-    pub amps: usize,
-    pub amp: Amp,
-}
-
-const fn sn(board: &'static str, amps: usize, gain_step: u32) -> Description {
-    Description { board, amps, amp: Amp::Sn012776 { gain_step } }
-}
-
-/// The boards the supervisor supports (`sgv2-supervisor` machine table),
-/// with the analog gain the kernel fixes on each: 15 on J3xx/J4xx/J6xx
-/// (KERNEL.md 2.3).
-pub const MACHINES: &[Description] = &[
-    sn("j316s", 6, 15),
-    sn("j316c", 6, 15),
-    sn("j616s", 6, 15),
-    sn("j616c", 6, 15),
-    sn("j413", 4, 15),
-    // 14-inch M2 Pro: six SN012776 (two woofer pairs and two tweeters), gain
-    // 15 (macaudio j314 configuration, DT t602x-j414-j416).
-    sn("j414s", 6, 15),
-    // No gain control: 7.30 V peak at full scale (AID44 VoltsFullScale,
-    // Daybreak t-4662).
-    Description { board: "j700", amps: 2, amp: Amp::Fixed { full_scale_mv: 7_300 } },
-];
-
-pub fn lookup(board: &str) -> Option<&'static Description> {
-    MACHINES.iter().find(|m| m.board == board)
-}
-
-impl Description {
-    /// The amp's analog gain in hundredths of a dB, if it has a control.
-    pub fn amp_gain_centi_db(&self) -> Option<i32> {
-        match self.amp {
-            Amp::Sn012776 { gain_step } => Some(1100 + 50 * gain_step as i32),
-            Amp::Fixed { .. } => None,
-        }
-    }
-
-    /// The output peak voltage at digital full scale, mV.  The gain's TLV
-    /// is dBV relative to 1 V rms, so the peak is `sqrt(2) 10^(dB/20)`
-    /// (Daybreak t-4662: 18.5 dBV is 11.899 V peak).
-    pub fn full_scale_mv(&self) -> u32 {
-        match self.amp {
-            Amp::Sn012776 { .. } => {
-                let db = f64::from(self.amp_gain_centi_db().unwrap()) / 100.0;
-                (1000.0 * std::f64::consts::SQRT_2 * 10f64.powf(db / 20.0)).round() as u32
-            }
-            Amp::Fixed { full_scale_mv } => full_scale_mv,
-        }
-    }
-}
 
 /// The machine a blob is compiled for.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -128,10 +65,6 @@ impl Machine {
         let board = board_from_compatible(&raw)
             .ok_or_else(|| Error::format("device tree", "the first root compatible is not apple,<board>"))?;
         Machine::new(&board)
-    }
-
-    pub fn description(&self) -> Option<&'static Description> {
-        lookup(&self.board)
     }
 }
 
@@ -175,18 +108,5 @@ mod tests {
         std::fs::write(d.join("compatible"), b"vendor,board\0").unwrap();
         assert!(Machine::from_device_tree(&d).is_err());
         let _ = std::fs::remove_dir_all(&d);
-    }
-
-    #[test]
-    fn operating_points() {
-        // J616s: gain 15 = 18.5 dBV = 8.414 V rms = 11.899 V peak.
-        let j = lookup("j616s").unwrap();
-        assert_eq!(j.amp_gain_centi_db(), Some(1850));
-        assert_eq!(j.full_scale_mv(), 11899);
-        assert_eq!(lookup("j700").unwrap().full_scale_mv(), 7300);
-        assert!(lookup("j274").is_none());
-        for m in MACHINES {
-            assert!(sgv2_core::blob::machine_field(m.board).is_some(), "{}", m.board);
-        }
     }
 }

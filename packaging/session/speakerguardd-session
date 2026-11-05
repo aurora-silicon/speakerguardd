@@ -1,8 +1,7 @@
 #!/usr/bin/python3 -I
 """speakerguardd-session: the per-user half of speakerguardd v2.
 
-    speakerguardd-session --machine j316 [--machines /usr/share/speakerguardd/machines.json]
-                          [--selfcheck /var/lib/speakerguardd/selfcheck.json]
+    speakerguardd-session --machine j316 [--selfcheck /var/lib/speakerguardd/selfcheck.json]
 
 It runs in the user's session, beside PipeWire, and does three things:
 
@@ -387,20 +386,13 @@ def write_report(path, links, carrier, wiring=None):
 
 
 def machine(args):
-    """The machine's card and channel counts: its machines.json entry, or,
-    for a board with none, the self-check's derived record."""
-    try:
-        with open(args.machines) as f:
-            c = json.load(f).get(args.machine)
-    except (OSError, ValueError):
-        c = None
-    if c is not None:
-        return c
+    """The machine's card and channel counts, from the self-check's record
+    (derived from this Mac's device tree and proven on it)."""
     try:
         with open(args.selfcheck) as f:
             rec = json.load(f)["record"]
-    except (OSError, ValueError, KeyError):
-        raise SystemExit(f"{args.machine}: no machines.json entry and no self-check record")
+    except (OSError, ValueError, KeyError) as e:
+        raise SystemExit(f"{args.machine}: no self-check record ({e})")
     if rec.get("key") != args.machine or rec.get("result") != "pass":
         raise SystemExit(f"{args.machine}: the self-check record is for {rec.get('key')} ({rec.get('result')})")
     return {"card": rec["card"], "amps": rec["amps"], "sense": rec["sense"]}
@@ -409,7 +401,6 @@ def machine(args):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--machine", required=True)
-    ap.add_argument("--machines", default="/usr/share/speakerguardd/machines.json")
     ap.add_argument("--selfcheck", default="/var/lib/speakerguardd/selfcheck.json")
     args = ap.parse_args()
     c = machine(args)
