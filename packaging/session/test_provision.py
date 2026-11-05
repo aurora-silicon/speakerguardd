@@ -383,6 +383,7 @@ class Gate(Base):
             json.dump(gate_data or GATE, f)
         self.patch(gate, "kernel_interface", lambda wait: (iface, "AppleX") if iface else (None, None))
         self.patch(gate, "ALLOW", os.path.join(self.t, "allow"))
+        self.patch(gate, "PROVISION_CONF", os.path.join(self.t, "provision.conf"))
         if allow:
             with open(gate.ALLOW, "w") as f:
                 f.write("j413\n")
@@ -422,6 +423,22 @@ class Gate(Base):
         # No tuning unit: never v2.
         self.ctl({"no_bundle": True, "unit": None})
         self.assertEqual(self.decide("v2", a), (False, False))
+
+    def test_the_bundle_provisioning_compiles_names_the_unit(self):
+        # SGV2_BUNDLE in provisioning's configuration: the gate reads the
+        # same bundle provisioning compiles, not only the installer's copy
+        self.board("j700")
+        self.ctl({"unit": "lsm2"})
+        with open(os.path.join(self.t, "provision.conf"), "w") as f:
+            f.write("SGV2_BUNDLE='/var/lib/speakerguardd-tuning/audio-tuning'\n")
+        self.decide("v2")
+        with open(os.path.join(os.path.dirname(self.cli), "calls")) as f:
+            calls = f.read().splitlines()
+        self.assertEqual(calls[-1], "dump --json /var/lib/speakerguardd-tuning/audio-tuning")
+        os.remove(os.path.join(self.t, "provision.conf"))
+        self.decide("v2")
+        with open(os.path.join(os.path.dirname(self.cli), "calls")) as f:
+            self.assertEqual(f.read().splitlines()[-1], "dump --json")
 
     def test_shipped_data(self):
         with open(os.path.join(HERE, "gate.json")) as f:
