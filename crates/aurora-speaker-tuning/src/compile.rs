@@ -656,6 +656,13 @@ fn compile_atsp(t: &Tuning, b: &Bound) -> Result<Compiled> {
         gain_link_all: (get(40)? != 0.0) as u32,
         slot: [atsp::Slot::default(); 3],
     };
+    // Parameter 0 bypasses the unit: its output is a bit-exact copy with no
+    // protection at all.  A protection engine must not run so, as spp3
+    // refuses `ThermalProtectionEnabled = 0` and lsm2 `EnableMitigation =
+    // 0`; no shipped preset sets it.
+    if p.bypass != 0 {
+        return Err(bad("the preset bypasses atsp (parameter 0 is set): no protection, so it must not run"));
+    }
     for s in 0..3u32 {
         let b = 1 + 13 * s;
         let mask = get(b + 12)?;
