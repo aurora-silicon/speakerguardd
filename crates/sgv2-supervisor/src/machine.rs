@@ -27,20 +27,14 @@ impl Amp {
         matches!(self, Amp::Sn012776)
     }
 
-    /// The per-amp volume control the kernel sets on a grant.
+    /// The per-amp volume control the kernel sets on a grant. Granted, it
+    /// reads 0 dB on its own TLV (see `supervise::Supervisor`): the
+    /// operating point is unity on the volume, whatever raw value the
+    /// driver's scale puts there.
     pub fn volume_suffix(self) -> &'static str {
         match self {
             Amp::Sn012776 => "Speaker Volume",
             Amp::Max98360a => "Speaker Playback Volume",
-        }
-    }
-
-    /// The volume's raw value at the operating point: DVC 201 (0 dB), or
-    /// software gain 127 (Q31 0.5, the MAX98360A's full scale).
-    pub fn operating_volume(self) -> i64 {
-        match self {
-            Amp::Sn012776 => 201,
-            Amp::Max98360a => 127,
         }
     }
 
@@ -180,8 +174,6 @@ mod tests {
     fn only_sn012776_amps_must_report_faults() {
         assert!(Amp::Sn012776.reports_faults());
         assert!(!Amp::Max98360a.reports_faults());
-        assert_eq!(Amp::Sn012776.operating_volume(), 201);
-        assert_eq!(Amp::Max98360a.operating_volume(), 127);
     }
 
     #[test]
