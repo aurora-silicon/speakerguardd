@@ -216,6 +216,7 @@ impl Bundle {
             dsp_database: None,
             speaker_thiele_small: None,
             files: Vec::new(),
+            shared: Vec::new(),
         };
         Ok(Bundle { manifest, files, source: root.to_owned(), verified: false, unlisted: Vec::new() })
     }
