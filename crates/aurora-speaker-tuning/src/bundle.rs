@@ -106,27 +106,82 @@ impl Bundle {
         let ctx = path.display().to_string();
         let mut members: BTreeMap<String, Vec<u8>> = BTreeMap::new();
         let mut total = 0u64;
+        let norm = |p: &Path| p.to_string_lossy().trim_start_matches("./").to_string();
+        let selected = |name: &str| prefix.is_none_or(|p| name.starts_with(p));
+        // The firmware package stores byte-identical files once and the
+        // rest as hard links to them (the ESP's vendorfw/firmware.tar does
+        // this for AID35's duplicate strips and database).  A link member
+        // takes its target's bytes, which the manifest then verifies like
+        // any other file; a link to a member the archive lacks is an error.
+        let mut links: Vec<(String, String)> = Vec::new();
         let mut ar = tar::Archive::new(&bytes[..]);
         for entry in ar.entries().map_err(|e| io(path, e))? {
             let mut entry = entry.map_err(|e| io(path, e))?;
-            if !entry.header().entry_type().is_file() {
+            let kind = entry.header().entry_type();
+            if !(kind.is_file() || kind.is_hard_link()) {
                 continue;
             }
-            let name = entry.path().map_err(|e| io(path, e))?.to_string_lossy().into_owned();
-            let name = name.trim_start_matches("./").to_string();
-            if let Some(p) = prefix {
-                if !name.starts_with(p) {
-                    continue;
-                }
+            let name = norm(&entry.path().map_err(|e| io(path, e))?);
+            if !selected(&name) {
+                continue;
+            }
+            if kind.is_hard_link() {
+                let target = entry
+                    .link_name()
+                    .map_err(|e| io(path, e))?
+                    .ok_or_else(|| Error::format(&ctx, format!("hard link {name} has no target")))?;
+                links.push((name, norm(&target)));
+                continue;
             }
             total += entry.size();
-            if members.len() >= 4 * manifest::MAX_FILES || total > manifest::MAX_BYTES * 2 {
+            if members.len() + links.len() >= 4 * manifest::MAX_FILES || total > manifest::MAX_BYTES * 2 {
                 return Err(Error::format(&ctx, "archive exceeds the bundle limits"));
             }
             let mut data = Vec::with_capacity(entry.size() as usize);
             entry.read_to_end(&mut data).map_err(|e| io(path, e))?;
             if members.insert(name.clone(), data).is_some() {
                 return Err(Error::format(&ctx, format!("member {name} appears twice")));
+            }
+        }
+        if !links.is_empty() {
+            // Targets outside the selected prefix: one more pass reads only
+            // those, under the same limits.
+            let wanted: std::collections::BTreeSet<&str> =
+                links.iter().map(|(_, t)| t.as_str()).filter(|t| !members.contains_key(*t)).collect();
+            let mut outside: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+            if !wanted.is_empty() {
+                let mut ar = tar::Archive::new(&bytes[..]);
+                for entry in ar.entries().map_err(|e| io(path, e))? {
+                    let mut entry = entry.map_err(|e| io(path, e))?;
+                    if !entry.header().entry_type().is_file() {
+                        continue;
+                    }
+                    let name = norm(&entry.path().map_err(|e| io(path, e))?);
+                    if !wanted.contains(name.as_str()) {
+                        continue;
+                    }
+                    total += entry.size();
+                    if total > manifest::MAX_BYTES * 2 {
+                        return Err(Error::format(&ctx, "archive exceeds the bundle limits"));
+                    }
+                    let mut data = Vec::with_capacity(entry.size() as usize);
+                    entry.read_to_end(&mut data).map_err(|e| io(path, e))?;
+                    if outside.insert(name.clone(), data).is_some() {
+                        return Err(Error::format(&ctx, format!("member {name} appears twice")));
+                    }
+                }
+            }
+            for (name, target) in links {
+                let data = members.get(&target).or_else(|| outside.get(&target)).cloned().ok_or_else(|| {
+                    Error::format(&ctx, format!("hard link {name} names {target}, not a file member"))
+                })?;
+                total += data.len() as u64;
+                if total > manifest::MAX_BYTES * 2 {
+                    return Err(Error::format(&ctx, "archive exceeds the bundle limits"));
+                }
+                if members.insert(name.clone(), data).is_some() {
+                    return Err(Error::format(&ctx, format!("member {name} appears twice")));
+                }
             }
         }
         let root = match prefix {

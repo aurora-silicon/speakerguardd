@@ -345,3 +345,55 @@ fn identify_cli() {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert!(v["error"].as_str().is_some());
 }
+
+/// The ESP's vendorfw/firmware.tar stores byte-identical files once and the
+/// rest as hard links (AID35's duplicate strips and database on the J616s).
+/// A link member takes its target's bytes, inside or outside the selected
+/// prefix, and the manifest verifies them; a dangling link is refused.
+#[test]
+fn hard_links_in_the_firmware_archive() {
+    let files = spp3_files(4);
+    let manifest = manifest_json(&files, "25G83");
+    let names: Vec<&String> = files.keys().collect();
+    let (outside_link, inside_link) = (names[0].clone(), names[1].clone());
+    let build = |name: &str, dangling: bool| {
+        let dir = scratch(name);
+        let path = dir.join("firmware.tar");
+        let mut ar = tar::Builder::new(std::fs::File::create(&path).unwrap());
+        let mut add = |name: &str, data: &[u8]| {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(data.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            ar.append_data(&mut h, name, data).unwrap();
+        };
+        // the stored copy of the first file lies outside the prefix
+        add("brcm/stored-copy.bin", &files[&outside_link]);
+        for (p, d) in &files {
+            if *p != outside_link {
+                add(&format!("apple/audio-tuning/{p}"), d);
+            }
+        }
+        add("apple/audio-tuning/manifest.json", manifest.as_bytes());
+        let mut link = |name: String, target: &str| {
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(tar::EntryType::Link);
+            h.set_size(0);
+            h.set_mode(0o644);
+            ar.append_link(&mut h, name, target).unwrap();
+        };
+        let target = if dangling { "brcm/absent.bin" } else { "brcm/stored-copy.bin" };
+        link(format!("apple/audio-tuning/{outside_link}"), target);
+        // an unlisted duplicate linked to a member inside the prefix
+        link("apple/audio-tuning/dup".into(), &format!("apple/audio-tuning/{inside_link}"));
+        ar.into_inner().unwrap().flush().unwrap();
+        path
+    };
+    let b = Bundle::from_tar(&build("hardlink-ok", false), Some("apple/audio-tuning/")).unwrap();
+    assert!(b.verified);
+    assert_eq!(b.unlisted, vec!["dup".to_string()]);
+    let (t, d) = load(&b, None);
+    assert!(t.is_ok() && !d.has_errors(), "{:?} {:?}", t.err(), d.items);
+    let e = Bundle::from_tar(&build("hardlink-dangling", true), Some("apple/audio-tuning/")).unwrap_err();
+    assert!(format!("{e}").contains("hard link"), "{e}");
+}
