@@ -35,6 +35,17 @@ impl Amp {
         }
     }
 
+    /// How many of those volume controls a card with `amps` amps has: one
+    /// per SN012776, and one for the whole MAX98360A pair (the J700's
+    /// "Speaker Playback Volume" is a copy-time software gain on the stream,
+    /// KERNEL.md 2.6, with no amp prefix).
+    pub fn volume_controls(self, amps: usize) -> usize {
+        match self {
+            Amp::Sn012776 => amps,
+            Amp::Max98360a => 1,
+        }
+    }
+
     /// The volume's raw value at the operating point: DVC 201 (0 dB), or
     /// software gain 127 (Q31 0.5, the MAX98360A's full scale).
     pub fn operating_volume(self) -> i64 {
@@ -182,6 +193,7 @@ mod tests {
         assert!(!Amp::Max98360a.reports_faults());
         assert_eq!(Amp::Sn012776.operating_volume(), 201);
         assert_eq!(Amp::Max98360a.operating_volume(), 127);
+        assert_eq!((Amp::Sn012776.volume_controls(6), Amp::Max98360a.volume_controls(2)), (6, 1));
     }
 
     #[test]

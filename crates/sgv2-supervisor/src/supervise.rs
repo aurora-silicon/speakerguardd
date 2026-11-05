@@ -134,8 +134,9 @@ impl Supervisor {
     fn volume_problem(&self, kernel: &mut dyn Kernel) -> Result<Option<String>, KernelError> {
         let x = &self.expect;
         let v = kernel.levels(x.amp.volume_suffix())?;
-        if v.len() != x.amps {
-            return Ok(Some(format!("granted, but {} of {} amp volumes", v.len(), x.amps)));
+        let n = x.amp.volume_controls(x.amps);
+        if v.len() != n {
+            return Ok(Some(format!("granted, but {} of {n} amp volumes", v.len())));
         }
         let want = x.amp.operating_volume();
         Ok(v.iter()
@@ -310,6 +311,8 @@ mod tests {
             let mut k = Recorder::healthy(2);
             k.amp_faults.clear();
             k.gain = None;
+            // one card-level software gain for the pair, no amp prefix
+            k.amps = vec![String::new()];
             k.volume = Some(("Speaker Playback Volume".into(), (127, None), (87, None)));
             k
         };
@@ -318,6 +321,9 @@ mod tests {
         s.tick(CLEAN, &mut k).unwrap();
         assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Granted));
         assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Renewed));
+        // the shared gain away from the operating point while granted latches
+        k.volume = Some(("Speaker Playback Volume".into(), (100, None), (87, None)));
+        assert!(matches!(s.tick(CLEAN, &mut k), Ok(Event::HardFault(_))));
         // a blob whose channels are not one operating point is refused
         let mut k = neo_card();
         let mut s = Supervisor::new(Expect::new(neo, vec![7_300, 6_000], "Secondary"));
