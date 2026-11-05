@@ -267,6 +267,8 @@ impl Bundle {
             aid,
             macos_build: None,
             machine_model: None,
+            board: None,
+            unit_id: None,
             speaker_id: None,
             dsp_database: None,
             speaker_thiele_small: None,
@@ -278,7 +280,8 @@ impl Bundle {
     }
 
     /// The bundle's identity: a SHA-256 over what the manifest states (the
-    /// AID, the macOS build, the speaker ID and every file's path, size and
+    /// AID, the macOS build, the speaker ID, the collecting board and unit
+    /// when the manifest names them, and every file's path, size and
     /// hash, in path order), independent of where the bundle sits and of its
     /// container (directory or archive).  The files themselves are verified
     /// against the manifest on load, so two bundles with the same digest
@@ -294,6 +297,14 @@ impl Bundle {
             m.macos_build.as_deref().unwrap_or("-"),
             m.speaker_id.map_or("-".to_string(), |v| v.to_string()),
         );
+        // The collecting Mac's identity, when the manifest states it; a
+        // bundle without it keeps the digest it always had.
+        if let Some(b) = &m.board {
+            text.push_str(&format!("board={b}\n"));
+        }
+        if let Some(u) = &m.unit_id {
+            text.push_str(&format!("unit_id={u}\n"));
+        }
         // An unverified bundle has no records: its files stand for them.
         let mut lines: Vec<String> = if self.verified {
             m.records().map(|r| format!("{}\0{}\0{}", r.path, r.bytes, r.sha256)).collect()

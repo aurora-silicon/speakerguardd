@@ -4,8 +4,11 @@ with a stand-in tuning reader, device tree and speaker card.
 
     python3 -I packaging/session/test_provision.py
 """
+import contextlib
+import hashlib
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 import pwd
@@ -50,6 +53,8 @@ elif cmd == "compile":
     out = sys.argv[sys.argv.index("-o") + 1]
     open(out, "wb").write(("blob " + ctl.get("digest", "d1")).encode())
     print("wrote blob", file=sys.stderr)
+    for w in ctl.get("warnings", []):
+        print(w, file=sys.stderr)
 elif cmd == "dump":
     print(json.dumps({"tuning": {"protection": {"kind": ctl.get("unit", "spp3")}}}))
 '''
@@ -177,7 +182,8 @@ class Provision(Base):
         # Another bundle, another macOS build, another kernel, a changed blob.
         for change in (lambda: self.ctl({"digest": "d2"}), lambda: self.ctl({"digest": "d2", "build": "25H1"}),
                        lambda: self.rebind(kernel="7.0.0-other"), lambda: self.rebind(speaker_id="00000001"),
-                       lambda: self.rebind(compiler="0.9:feedface"), self.tamper):
+                       lambda: self.rebind(compiler="0.9:feedface"), lambda: self.rebind(unit="0" * 64),
+                       self.tamper):
             n = self.calls().count("compile")
             change()
             self.assertEqual(self.run_(), 0)
@@ -195,6 +201,37 @@ class Provision(Base):
         b = prov.read_kv(self.p.bind)
         b.update(kw)
         prov.write_atomic(self.p.bind, "".join(f"{k}={v}\n" for k, v in b.items()))
+
+    def test_binds_the_unit_not_the_serial(self):
+        # No serial-number: "-". A synthetic one: its domain-separated hash,
+        # and another unit recompiles (where the compiler refuses the bundle).
+        self.assertEqual(self.run_(), 0)
+        self.assertEqual(prov.read_kv(self.p.bind)["unit"], "-")
+        with open(os.path.join(self.dt, "serial-number"), "wb") as f:
+            f.write(b"SYNTHETIC0A\0")
+        self.assertEqual(self.run_(), 0)
+        want = hashlib.sha256(b"aurora-speaker-unit-v1\0SYNTHETIC0A").hexdigest()
+        self.assertEqual(prov.read_kv(self.p.bind)["unit"], want)
+        self.assertEqual(self.calls().count("compile"), 2)
+        for path in (self.p.bind, self.p.report, self.p.conf):
+            with open(path, "rb") as f:
+                self.assertNotIn(b"SYNTHETIC0A", f.read())
+        with open(os.path.join(self.dt, "serial-number"), "wb") as f:
+            f.write(b"SYNTHETIC0B\0")
+        self.assertEqual(self.run_(), 0)
+        self.assertEqual(self.calls().count("compile"), 3)
+        with open(os.path.join(self.dt, "serial-number"), "wb") as f:
+            f.write(b"NOT ONE\0")
+        self.assertEqual(prov.unit_id(self.dt), "malformed")
+
+    def test_logs_the_compilers_warnings(self):
+        warn = "warning[unit-unbound] compile: the tuning bundle does not name the Mac it was collected on"
+        self.ctl({"warnings": ["note[x] compile: quiet", warn]})
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(self.run_(), 0)
+        self.assertIn(warn, err.getvalue())
+        self.assertNotIn("quiet", err.getvalue())
 
     def test_another_board_recompiles(self):
         self.assertEqual(self.run_(), 0)

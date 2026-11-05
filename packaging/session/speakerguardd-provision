@@ -14,11 +14,21 @@ manual step, before the self-check and the supervisor start.
    the ESP's vendorfw archive; or `--bundle`, or `SGV2_BUNDLE` in
    /etc/speakerguardd/provision.conf) into /var/lib/speakerguardd/params.bin
    with `aurora-speaker-tuning compile`, for this Mac's device tree.
-2. **Bind** the blob to the board, the kernel release, the bundle's digest,
-   the macOS build it was collected from, the device tree's speaker ID and
-   the compiler (/var/lib/speakerguardd/provision.bind). The next run
-   compiles again only if one of those changed, or the blob is not the one
-   bound.
+   The bundle is bound to the Mac it was collected on (aurora-speaker-tuning
+   `compile`): a bundle the installer collected on another board or another
+   unit (its `unit_id` is not this Mac's device-tree `serial-number`'s) does
+   not compile, so provisioning fails closed. A bundle collected before the
+   installer recorded the unit compiles without its per-unit calibration
+   (open loop at the base limits) and the journal says to collect it again.
+   Collecting again: the installer's firmware step on this Mac's macOS, or
+   tools/speaker-tuning/collect-macos.sh there and install-linux.sh here
+   (aurora-installer), then restart speakerguardd-provision.service.
+2. **Bind** the blob to the board, the unit (the unit ID of the device
+   tree's `serial-number`, never the serial itself), the kernel release, the
+   bundle's digest, the macOS build it was collected from, the device tree's
+   speaker ID and the compiler (/var/lib/speakerguardd/provision.bind). The
+   next run compiles again only if one of those changed, or the blob is not
+   the one bound.
 3. **Resolve the seat user by name**, never by a fixed uid: the name in
    provision.conf (`SGV2_SEAT_USER`), else the user of seat0's active
    session, else the last such user, else the display manager's automatic
@@ -171,6 +181,23 @@ def board_of(dt=DT):
     if not first.startswith("apple,") or len(first) <= 6:
         raise Failed(f"the device tree's first compatible is {first!r}, not apple,<board>")
     return first[6:]
+
+
+# aurora-speaker-tuning's machine::unit_id: the same domain tag and rule.
+UNIT_ID_DOMAIN = b"aurora-speaker-unit-v1\0"
+
+
+def unit_id(dt=DT):
+    """The unit ID of the device tree's root serial-number (or "-"): what
+    the compiler binds the bundle to. Never the serial itself."""
+    try:
+        with open(os.path.join(dt, "serial-number"), "rb") as f:
+            serial = f.read().rstrip(b"\0")
+    except OSError:
+        return "-"
+    if not 0 < len(serial) <= 64 or not all(0x21 <= b <= 0x7E for b in serial):
+        return "malformed"
+    return hashlib.sha256(UNIT_ID_DOMAIN + serial).hexdigest()
 
 
 def speaker_id_raw(dt=DT):
@@ -376,16 +403,19 @@ def identify(cli, source):
 
 
 def compile_blob(cli, source, out):
+    """The compiler's summary line and its warnings (an unbound bundle's
+    open loop among them), for the journal."""
     r = subprocess.run([cli, "compile", *source, "-o", out], capture_output=True, text=True, timeout=300)
     if r.returncode != 0:
         lines = [l for l in r.stderr.splitlines() if l.startswith(("error", "fatal"))] or r.stderr.splitlines()[-5:]
         raise Failed("the tuning bundle does not compile for this Mac:\n" + "\n".join(lines))
-    return r.stderr.strip().splitlines()[0] if r.stderr.strip() else ""
+    lines = r.stderr.strip().splitlines()
+    return "\n".join(lines[:1] + [l for l in lines[1:] if l.startswith("warning")])
 
 
 # ------------------------------------------------------------------ run
 
-BIND_KEYS = ["version", "board", "kernel", "bundle_digest", "macos_build", "speaker_id", "compiler", "source", "params_sha256"]
+BIND_KEYS = ["version", "board", "unit", "kernel", "bundle_digest", "macos_build", "speaker_id", "compiler", "source", "params_sha256"]
 
 
 def source_args(args, override):
@@ -445,7 +475,7 @@ def is_generated(path):
 def cmd_run(args, p):
     live = not p.root
     rec = {"version": VERSION, "result": "fail", "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "reasons": [],
-           "board": "-", "kernel": os.uname().release, "bundle_digest": "-", "macos_build": "-", "aid": "-",
+           "board": "-", "unit": unit_id(args.dt), "kernel": os.uname().release, "bundle_digest": "-", "macos_build": "-", "aid": "-",
            "speaker_id": speaker_id_raw(args.dt), "compiler": "-", "source": "-", "params_sha256": "-",
            "compiled": False, "seat_user": "-", "seat_how": "-"}
     try:
@@ -466,7 +496,8 @@ def cmd_run(args, p):
         if args.force or not have or stale or old.get("result") != "pass":
             why = "forced" if args.force else ("no blob" if not have else f"changed: {', '.join(stale) or 'result'}")
             log(f"compiling {rec['aid']} (macOS {rec['macos_build']}) for {rec['board']} on {rec['kernel']} ({why})")
-            log(compile_blob(cli, sargs, p.params))
+            for line in compile_blob(cli, sargs, p.params).splitlines():
+                log(line)
             rec["params_sha256"] = sha256_file(p.params)
             rec["compiled"] = True
         else:

@@ -18,9 +18,10 @@ use aurora_speaker_tuning::Diagnostics;
 use common::*;
 use std::collections::BTreeMap;
 
-/// The synthetic bundles have four channels: a four-amp board.
+/// The synthetic bundles have four channels: a four-amp board, the unit
+/// they were collected on.
 fn j413() -> Machine {
-    Machine::new("j413").unwrap()
+    Machine::with_unit("j413", &test_unit()).unwrap()
 }
 
 fn compile(t: &Tuning, d: &mut Diagnostics) -> aurora_speaker_tuning::Result<comp::Compiled> {

@@ -8,7 +8,8 @@
 //! * `manifest.json`, schema 2, kind `aurora-audio-tuning`: what the Aurora
 //!   installer writes next to the collected folder.  Schema 2 states that
 //!   the set is complete (`complete`, `source_file_count`), names both
-//!   selection files, and may carry the speaker-assembly ID (`speaker_id`).
+//!   selection files, and may carry the speaker-assembly ID (`speaker_id`)
+//!   and the collecting Mac's identity (`board`, `unit_id`).
 //! * `metadata.json`, version 1, kind `aurora-audio-dsp tuning bundle`: what
 //!   aurora-audio-dsp's macOS collector writes (development bundles).
 //!
@@ -86,6 +87,13 @@ pub struct Manifest {
     /// macOS build the tuning was collected from (`kern.osversion`), if known.
     pub macos_build: Option<String>,
     pub machine_model: Option<String>,
+    /// The board the installer collected on (`j616s`, from the ADT root's
+    /// `target-type`); `None` in bundles collected before it recorded it.
+    pub board: Option<String>,
+    /// [`crate::machine::unit_id`] of the collecting Mac's root
+    /// `serial-number`; `None` in bundles collected before it recorded it,
+    /// whose per-unit calibration is then not used.
+    pub unit_id: Option<String>,
     /// The speaker-assembly ID (macOS `speakerID`, HAL `spid`) the
     /// installer read on this Mac, if it could.
     pub speaker_id: Option<u32>,
@@ -128,6 +136,12 @@ struct InstallerJson {
     acoustic_id: u32,
     aid: String,
     macos_build: String,
+    /// Optional: the collecting Mac's identity (see [`Manifest::board`] and
+    /// [`Manifest::unit_id`]); `null` or missing when unknown.
+    #[serde(default)]
+    board: Option<String>,
+    #[serde(default)]
+    unit_id: Option<String>,
     speaker_thiele_small: Option<Record>,
     device_dsp_database: String,
     config: String,
@@ -276,6 +290,8 @@ impl Manifest {
             aid: j.aid,
             macos_build: (j.macos_build != "unknown").then_some(j.macos_build),
             machine_model: None,
+            board: j.board,
+            unit_id: j.unit_id,
             speaker_id: j.speaker_id,
             dsp_database: Some(j.device_dsp_database),
             speaker_thiele_small: j.speaker_thiele_small,
@@ -306,6 +322,8 @@ impl Manifest {
             aid: j.acoustic_id_name,
             macos_build: None,
             machine_model: j.machine_model,
+            board: None,
+            unit_id: None,
             speaker_id: None,
             dsp_database: None,
             speaker_thiele_small: spts.into_iter().next(),
@@ -318,6 +336,16 @@ impl Manifest {
     }
 
     fn check(&self, ctx: &str) -> Result<()> {
+        if let Some(b) = &self.board {
+            if !crate::machine::valid_board(b) {
+                return Err(Error::format(ctx, format!("board {b:?} is not a canonical board name")));
+            }
+        }
+        if let Some(u) = &self.unit_id {
+            if !crate::machine::valid_unit_id(u) {
+                return Err(Error::format(ctx, "unit_id is not 64 lowercase hex digits"));
+            }
+        }
         if aid_number(&self.aid) != Some(self.acoustic_id) {
             return Err(Error::format(
                 ctx,
@@ -531,6 +559,34 @@ mod tests {
             installer_with(&one, 1, r#","unknown_key":1"#),
         ] {
             assert!(Manifest::parse(bad.as_bytes()).is_err(), "{bad}");
+        }
+    }
+
+    /// The collecting Mac's identity: optional, and refused when malformed.
+    #[test]
+    fn installer_manifest_identity() {
+        let sha = sha256_hex(b"x");
+        let one = format!(r#"{{"path":"AID7/a","bytes":1,"sha256":"{sha}"}}"#);
+        let m = Manifest::parse(installer(&one).as_bytes()).unwrap();
+        assert_eq!((m.board.as_deref(), m.unit_id.as_deref()), (None, None));
+        let m = Manifest::parse(installer_with(&one, 1, r#","board":null,"unit_id":null"#).as_bytes()).unwrap();
+        assert_eq!((m.board.as_deref(), m.unit_id.as_deref()), (None, None));
+        let unit = "0123456789abcdef".repeat(4);
+        let m = Manifest::parse(installer_with(&one, 1, &format!(r#","board":"j616s","unit_id":"{unit}""#)).as_bytes())
+            .unwrap();
+        assert_eq!(m.board.as_deref(), Some("j616s"));
+        assert_eq!(m.unit_id.as_deref(), Some(unit.as_str()));
+        for extra in [
+            r#","board":"J616sAP""#.to_string(),
+            r#","board":""#.to_string(),
+            r#","board":"j616s\n""#.to_string(),
+            r#","board":616"#.to_string(),
+            r#","unit_id":"ABC""#.to_string(),
+            format!(r#","unit_id":"{}""#, unit.to_uppercase()),
+            format!(r#","unit_id":"{unit}0""#),
+            r#","unit_id":7"#.to_string(),
+        ] {
+            assert!(Manifest::parse(installer_with(&one, 1, &extra).as_bytes()).is_err(), "{extra}");
         }
     }
 
