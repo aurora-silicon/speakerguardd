@@ -191,9 +191,9 @@ class Control:
     def _id(name):
         return struct.pack(_ID_FMT, 0, _IFACE_MIXER, 0, 0, name.encode(), 0)
 
-    def write(self, v):
+    def write(self, v, name="Speaker Protection"):
         buf = bytearray(_VAL_SIZE)
-        buf[0:_ID_SIZE] = self._id("Speaker Protection")
+        buf[0:_ID_SIZE] = self._id(name)
         struct.pack_into("q", buf, 72, v)
         fcntl.ioctl(self.fd, _ELEM_WRITE, buf)
 
@@ -246,10 +246,15 @@ def switch_get(card, name):
     return m.group(1) if m else None
 
 
-def switch_set(card, name, v):
-    r = amixer(card, "-q", "cset", f"name={name}", v)
-    if r.returncode:
-        raise wiring.Refused(f"setting {name!r}: {r.stderr.strip()}")
+def switch_set(ctl, name, v):
+    # Sense switches are writable only through the protection owner's file.
+    # amixer opens another file and is deliberately refused while we own it.
+    if v not in ("on", "off"):
+        raise wiring.Refused(f"setting {name!r}: invalid switch value {v!r}")
+    try:
+        ctl.write(int(v == "on"), name=name)
+    except OSError as e:
+        raise wiring.Refused(f"setting {name!r}: {e}") from e
 
 
 # ---------------------------------------------------------------- checks
@@ -441,7 +446,7 @@ def check_sense(ctl, idx, card, devs, w, runs):
     st = Streams(ctl, card, devs[0], devs[1], n, w["rate"])
     try:
         for nm in saved:
-            switch_set(card, nm, "on")
+            switch_set(ctl, nm, "on")
         st.start(idx)
         base = st.capture()
         runs["baseline"] = base
@@ -451,11 +456,11 @@ def check_sense(ctl, idx, card, devs, w, runs):
         for p, a in enumerate(amps):
             for kind in ("V", "I"):
                 nm = names[(a["prefix"], kind)]
-                switch_set(card, nm, "off")
+                switch_set(ctl, nm, "off")
                 try:
                     s = st.capture()
                 finally:
-                    switch_set(card, nm, "on")
+                    switch_set(ctl, nm, "on")
                 runs[f"{a['prefix']} {kind}SENSE off"] = s
                 cls = classify(s)
                 quiet = [k for k, c in enumerate(cls) if c == "quiet"]
@@ -471,7 +476,7 @@ def check_sense(ctl, idx, card, devs, w, runs):
         st.stop()
         for nm, v in saved.items():
             try:
-                switch_set(card, nm, v)
+                switch_set(ctl, nm, v)
             except wiring.Refused as e:
                 log(f"restoring {nm}: {e}")
     return errs, st.fmt
