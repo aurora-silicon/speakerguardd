@@ -278,11 +278,19 @@ pub fn compile(t: &Tuning, m: &Machine, diags: &mut Diagnostics) -> Result<Compi
 
 pub fn compile_with(t: &Tuning, m: &Machine, provenance: Provenance, diags: &mut Diagnostics) -> Result<Compiled> {
     let b = preflight(t, m, provenance, diags)?;
-    match t.protection.kind {
+    let mut c = match t.protection.kind {
         UnitKind::Spp3 => compile_spp3(t, &b, diags),
         UnitKind::Lsm2 => compile_lsm2(t, &b, diags),
         UnitKind::Atsp => compile_atsp(t, &b),
-    }
+    }?;
+    // The graph's own filtering ahead of the unit (crate::prestage): no
+    // blob without it.
+    let pre = crate::prestage::derive(t, c.sample_rate as f64, c.channels as usize, diags)?;
+    c.blob = sgv2_core::blob::with_prestage(&c.blob, &pre)
+        .map_err(|e| bad(format!("the pre-stage does not fit the blob: {e:?}")))?;
+    sgv2_core::blob::prestage(&c.blob, c.sample_rate as f64)
+        .map_err(|e| bad(format!("the engine rejects the compiled pre-stage: {e:?}")))?;
+    Ok(c)
 }
 
 // ------------------------------------------------------------------ spp3

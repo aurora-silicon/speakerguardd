@@ -51,10 +51,21 @@ pub struct Hop {
     pub channel: u32,
 }
 
+/// A lane passing through a box that keeps it in place (any box but a
+/// `split` or `join`): the lane's channel on that box.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Pass {
+    pub node: String,
+    pub channel: u32,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Lane {
     pub origin: Origin,
     pub hops: Vec<Hop>,
+    /// The boxes the lane passes through, upstream first, with its channel
+    /// on each.
+    pub through: Vec<Pass>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -177,7 +188,11 @@ fn out_lanes(
         let w = g.wires.iter().find(|w| w.src == *src).expect("source has a wire");
         let n = wire_channels(g, w)?;
         (0..n)
-            .map(|c| Lane { origin: Origin { node: src.node.clone(), port: 0, channel: c }, hops: Vec::new() })
+            .map(|c| Lane {
+                origin: Origin { node: src.node.clone(), port: 0, channel: c },
+                hops: Vec::new(),
+                through: Vec::new(),
+            })
             .collect()
     } else {
         let b = g.find_box(&src.node).ok_or_else(|| Error::format("dspg", format!("unknown node {}", src.node)))?;
@@ -213,7 +228,11 @@ fn out_lanes(
         };
         let fresh = |n: u32| -> Vec<Lane> {
             (0..n)
-                .map(|c| Lane { origin: Origin { node: b.name.clone(), port: src.port, channel: c }, hops: Vec::new() })
+                .map(|c| Lane {
+                    origin: Origin { node: b.name.clone(), port: src.port, channel: c },
+                    hops: Vec::new(),
+                    through: Vec::new(),
+                })
                 .collect()
         };
         let kind = match &b.kind {
@@ -266,7 +285,14 @@ fn out_lanes(
             _ => {
                 let width = out_width(src.port)?.unwrap_or(0) as usize;
                 match (src.port, input(0, memo, active)?) {
-                    (0, Some(inl)) if inl.len() == width => inl,
+                    (0, Some(inl)) if inl.len() == width => inl
+                        .into_iter()
+                        .enumerate()
+                        .map(|(c, mut lane)| {
+                            lane.through.push(Pass { node: b.name.clone(), channel: c as u32 });
+                            lane
+                        })
+                        .collect(),
                     _ => fresh(width as u32),
                 }
             }

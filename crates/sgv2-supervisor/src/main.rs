@@ -613,6 +613,12 @@ mod linux {
         if !(8_000..=192_000).contains(&header.sample_rate) {
             return refuse(format!("sample rate {}", header.sample_rate));
         }
+        // The Mac's own filtering ahead of the unit: the plugin runs it and
+        // refuses a blob whose pre-stage is bad, so the supervisor does too.
+        let crossover = match sgv2_core::blob::prestage(&blob, header.sample_rate as f64) {
+            Ok(p) => p.from_tuning(),
+            Err(e) => return refuse(format!("pre-stage rejected ({e:?})")),
+        };
         let full_scales = match blob_full_scales(&blob) {
             Ok(v) => v,
             Err(why) => return refuse(why),
@@ -679,7 +685,21 @@ mod linux {
         let mut last_why = String::new();
         let (mut kernel, index, info) = loop {
             match try_card(machine, &card, pcm) {
-                Ok(k) => break k,
+                Ok((mut k, index, info)) => {
+                    // Before any grant: the tweeters' amp high-pass opens
+                    // only for an engine that runs the Mac's crossover.
+                    match k.declare_crossover(crossover) {
+                        Ok(true) => eprintln!("crossover declared to the kernel: {crossover}"),
+                        Ok(false) => {
+                            eprintln!("kernel has no crossover declaration; it keeps its own high-pass policy")
+                        }
+                        Err(e) => {
+                            eprintln!("declaring the crossover: {e:?}; exiting (the kernel floor stays)");
+                            return EX_CONFIG;
+                        }
+                    }
+                    break (k, index, info);
+                }
                 Err(Wait::Config(why)) => {
                     eprintln!("{why}; exiting");
                     return EX_CONFIG;

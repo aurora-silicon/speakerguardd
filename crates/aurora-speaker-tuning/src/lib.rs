@@ -42,6 +42,7 @@ pub mod machine;
 pub mod manifest;
 pub mod names;
 pub mod plist;
+pub mod prestage;
 pub mod select;
 pub mod spp3;
 pub mod spts;

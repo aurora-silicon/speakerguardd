@@ -15,9 +15,14 @@
 //!
 //! `machine` and `full_scale_mv` were reserved zero bytes before; a blob
 //! that leaves them zero names no machine, and the supervisor refuses it.
+//!
+//! Version 2 adds the pre-stage ([`crate::prestage`]): `payload_len` bytes
+//! of unit payload, then the pre-stage section, which runs to the end of the
+//! blob and carries its own length and CRC. A version 1 blob has no
+//! pre-stage and is refused.
 
 pub const MAGIC: [u8; 8] = *b"SGV2PRM\0";
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 pub const HEADER_LEN: usize = 48;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,6 +71,8 @@ pub enum BlobError {
     Length,
     Crc,
     Channels,
+    /// A pre-stage section that is unstable, non-finite or gains.
+    Unstable,
 }
 
 impl Header {
@@ -94,13 +101,16 @@ impl Header {
         if header.channels == 0 || header.channels as usize > crate::MAX_CHANNELS {
             return Err(BlobError::Channels);
         }
-        let payload = &bytes[HEADER_LEN..];
-        if payload.len() != header.payload_len as usize {
+        let rest = &bytes[HEADER_LEN..];
+        let n = header.payload_len as usize;
+        if rest.len() < n {
             return Err(BlobError::Length);
         }
+        let (payload, pre) = rest.split_at(n);
         if crc32(payload) != header.payload_crc {
             return Err(BlobError::Crc);
         }
+        check_prestage(pre)?;
         Ok((header, payload))
     }
 
@@ -134,6 +144,42 @@ impl Header {
         }
         core::str::from_utf8(&self.machine[..end]).ok()
     }
+}
+
+/// The structure of a pre-stage section (magic, length, CRC); its filters
+/// are checked by [`crate::prestage::Params::decode`].
+fn check_prestage(pre: &[u8]) -> Result<(), BlobError> {
+    use crate::prestage::{HEAD_LEN, MAGIC};
+    if pre.len() < HEAD_LEN {
+        return Err(BlobError::Short);
+    }
+    if pre[..8] != MAGIC {
+        return Err(BlobError::Magic);
+    }
+    let word = |i: usize| u32::from_le_bytes([pre[i], pre[i + 1], pre[i + 2], pre[i + 3]]);
+    if pre.len() - HEAD_LEN != word(16) as usize {
+        return Err(BlobError::Length);
+    }
+    if crc32(&pre[HEAD_LEN..]) != word(20) {
+        return Err(BlobError::Crc);
+    }
+    Ok(())
+}
+
+/// The pre-stage section of a blob, decoded and checked for `fs`.
+pub fn prestage(bytes: &[u8], fs: f64) -> Result<crate::prestage::Params, BlobError> {
+    let (h, payload) = Header::parse(bytes)?;
+    let at = HEADER_LEN + payload.len();
+    crate::prestage::Params::decode(&bytes[at..], h.channels as usize, fs)
+}
+
+/// `blob` with its pre-stage replaced by `pre` (the header is unchanged).
+#[cfg(any(test, feature = "std"))]
+pub fn with_prestage(blob: &[u8], pre: &crate::prestage::Params) -> Result<std::vec::Vec<u8>, BlobError> {
+    let (_, payload) = Header::parse(blob)?;
+    let mut v = blob[..HEADER_LEN + payload.len()].to_vec();
+    v.extend_from_slice(&pre.encode());
+    Ok(v)
 }
 
 /// Plain-old-data payloads: every field is a 4-byte `f32` or `u32` (or an
@@ -196,6 +242,8 @@ pub fn build_for(
     h.write(&mut head);
     let mut v = head.to_vec();
     v.extend_from_slice(payload);
+    // no pre-stage derived yet: every channel passes, nothing claimed
+    v.extend_from_slice(&crate::prestage::Params::identity(channels as usize).encode());
     v
 }
 
@@ -238,11 +286,20 @@ mod tests {
         h.write(&mut head);
         let mut blob = head.to_vec();
         blob.extend_from_slice(&payload);
+        // a version 2 blob without its pre-stage is refused
+        assert_eq!(Header::parse(&blob), Err(BlobError::Short));
+        blob.extend_from_slice(&crate::prestage::Params::identity(2).encode());
         assert_eq!(Header::parse(&blob).unwrap(), (h, &payload[..]));
         assert_eq!(Header::parse(&blob).unwrap().0.machine(), Some("j700"));
         let mut bad = blob.clone();
+        bad[HEADER_LEN] ^= 1;
+        assert_eq!(Header::parse(&bad), Err(BlobError::Crc));
+        let mut bad = blob.clone();
         *bad.last_mut().unwrap() ^= 1;
         assert_eq!(Header::parse(&bad), Err(BlobError::Crc));
+        let mut old = blob.clone();
+        old[8] = 1;
+        assert_eq!(Header::parse(&old), Err(BlobError::Version));
         assert_eq!(Header::parse(&blob[..10]), Err(BlobError::Short));
         let mut magic = blob.clone();
         magic[0] = b'X';
