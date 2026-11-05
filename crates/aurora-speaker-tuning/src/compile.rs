@@ -416,6 +416,12 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
         low_rail_idle_power_w: 0.0,
         low_rail_power_ratio: 0.0,
         other_power_features: 0,
+        // The masker's bucket lattice is not in the tuning: it comes from
+        // the Mac's own macOS install, extracted at provisioning (Daybreak
+        // t-4702 gives the recipe). Until then the unit gives no masking
+        // credit (the velocity limit stays at VelocityLimit0).
+        mask_lattice_len: 0,
+        mask_lattice: [0; 100],
         // Platform runtime budgets (property 64008): the supervisor fills
         // them; the bundle has none.
         runtime_budget_present: 0,
