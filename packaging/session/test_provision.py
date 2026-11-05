@@ -254,23 +254,33 @@ class Provision(Base):
 
 class Seat(Base):
     def test_order(self):
+        # Stand-in users, so the test means the same as root (a package
+        # build) and as anyone else: root is never a seat user.
+        users = {"alice": 1000, "bob": 1001, "root": 0}
+        self.patch(prov, "by_name", lambda n: pwd.struct_passwd((n, "x", users[n], users[n], "", "/", "/bin/sh"))
+                   if n in users else None)
         p, ov = self.p, {}
         os.makedirs(p.state)
         # The only regular user.
-        self.assertEqual(prov.resolve_seat_user(p, ov, (1000, 60000), self.t), (ME.pw_name, "only regular user"))
+        self.patch(prov, "regular_users", lambda rng: ["alice"])
+        self.assertEqual(prov.resolve_seat_user(p, ov, (1000, 60000), self.t), ("alice", "only regular user"))
         # Several: none, until something names one.
-        self.patch(prov, "regular_users", lambda rng: [ME.pw_name, "zz-other"])
+        self.patch(prov, "regular_users", lambda rng: ["alice", "bob"])
         with self.assertRaises(prov.Failed):
             prov.resolve_seat_user(p, ov, (1000, 60000), self.t)
-        self.patch(prov, "autologin_user", lambda etc: ME.pw_name)
-        self.assertEqual(prov.resolve_seat_user(p, ov, (1000, 60000), self.t)[1], "automatic login")
-        prov.write_atomic(p.seat_last, ME.pw_name + "\n")
-        self.assertEqual(prov.resolve_seat_user(p, ov, (1000, 60000), self.t)[1], "last seat0 user")
-        self.patch(prov, "seat0_user", lambda rng: ME.pw_name)
-        self.assertEqual(prov.resolve_seat_user(p, ov, (1000, 60000), self.t)[1], "seat0")
-        self.assertEqual(prov.resolve_seat_user(p, {"SGV2_SEAT_USER": ME.pw_name}, (1000, 60000), self.t)[1], "provision.conf")
+        self.patch(prov, "autologin_user", lambda etc: "root")
         with self.assertRaises(prov.Failed):
-            prov.resolve_seat_user(p, {"SGV2_SEAT_USER": "no-such-user-sgv2"}, (1000, 60000), self.t)
+            prov.resolve_seat_user(p, ov, (1000, 60000), self.t)
+        self.patch(prov, "autologin_user", lambda etc: "bob")
+        self.assertEqual(prov.resolve_seat_user(p, ov, (1000, 60000), self.t), ("bob", "automatic login"))
+        prov.write_atomic(p.seat_last, "alice\n")
+        self.assertEqual(prov.resolve_seat_user(p, ov, (1000, 60000), self.t), ("alice", "last seat0 user"))
+        self.patch(prov, "seat0_user", lambda rng: "bob")
+        self.assertEqual(prov.resolve_seat_user(p, ov, (1000, 60000), self.t), ("bob", "seat0"))
+        self.assertEqual(prov.resolve_seat_user(p, {"SGV2_SEAT_USER": "alice"}, (1000, 60000), self.t), ("alice", "provision.conf"))
+        for bad in ("no-such-user-sgv2", "root"):
+            with self.assertRaises(prov.Failed):
+                prov.resolve_seat_user(p, {"SGV2_SEAT_USER": bad}, (1000, 60000), self.t)
 
     def test_uid_is_resolved_by_name_never_fixed(self):
         # The name is what is kept; the uid comes from the user database.
@@ -460,6 +470,10 @@ class Units(unittest.TestCase):
         self.assertIn("ExecCondition=/usr/libexec/speakerguardd/speakerguardd-gate legacy", self.unit("legacy-gate.conf"))
         for u in (sup, chk, prv):
             self.assertFalse([l for l in u if l.startswith(("OnFailure=", "OnSuccess="))])
+        # A unit the gate skips must not fail first on the configuration that
+        # only provisioning writes (systemd loads it before ExecCondition=).
+        for u in (sup, chk, ses):
+            self.assertIn("EnvironmentFile=-/etc/speakerguardd/speakerguardd.conf", u)
 
 
 if __name__ == "__main__":
