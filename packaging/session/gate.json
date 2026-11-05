@@ -4,7 +4,7 @@
   "require_qualified_board": true,
   "qualified": {
     "spp3": ["j316s", "j413", "j616s"],
-    "lsm2": [],
+    "lsm2": ["j700"],
     "atsp": []
   }
 }

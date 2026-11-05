@@ -447,7 +447,7 @@ class Gate(Base):
         self.assertTrue(g["require_qualified_board"])
         self.assertEqual(sorted(g["qualified"]), ["atsp", "lsm2", "spp3"])
         qualified = sorted(b for u in g["units_at_parity"] for b in g["qualified"].get(u, []))
-        self.assertEqual(qualified, ["j316s", "j413", "j616s"])
+        self.assertEqual(qualified, ["j316s", "j413", "j616s", "j700"])
         # policy only: no hardware in the gate
         self.assertEqual(sorted(k for k in g if not k.startswith("_")), ["qualified", "require_qualified_board", "units_at_parity"])
         self.assertFalse(os.path.exists(os.path.join(HERE, "machines.json")))
