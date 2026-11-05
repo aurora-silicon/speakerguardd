@@ -378,6 +378,41 @@ class Graph(Base):
         self.assertEqual(os.listdir(os.path.join(self.p.graph, "pipewire")), [])
 
 
+
+class UserManager(unittest.TestCase):
+    """refresh_session reaches the seat user's own manager on the user's bus,
+    as that user, never through machined (which fails from a system unit)."""
+
+    def test_reaches_the_user_bus_as_the_user(self):
+        me = pwd.getpwuid(os.getuid())
+        rt = tempfile.mkdtemp()
+        calls = []
+        real_run, real_exists = prov.subprocess.run, prov.os.path.exists
+        try:
+            prov.subprocess.run = lambda cmd, **kw: calls.append((cmd, kw)) or prov.subprocess.CompletedProcess(cmd, 0, "", "")
+            prov.os.path.exists = lambda p: p == f"/run/user/{me.pw_uid}/bus" or real_exists(p)
+            r = prov.user_systemctl(me.pw_name, "show", "pipewire.service")
+        finally:
+            prov.subprocess.run, prov.os.path.exists = real_run, real_exists
+            shutil.rmtree(rt)
+        self.assertEqual(r.returncode, 0)
+        cmd, kw = calls[0]
+        self.assertNotIn("--machine", " ".join(cmd))
+        self.assertEqual(cmd[:2], ["setpriv", f"--reuid={me.pw_uid}"])
+        self.assertEqual(cmd[-4:], ["systemctl", "--user", "show", "pipewire.service"])
+        self.assertEqual(kw["env"]["XDG_RUNTIME_DIR"], f"/run/user/{me.pw_uid}")
+        self.assertEqual(kw["env"]["DBUS_SESSION_BUS_ADDRESS"], f"unix:path=/run/user/{me.pw_uid}/bus")
+
+    def test_no_user_bus_is_no_session(self):
+        me = pwd.getpwuid(os.getuid())
+        real_exists = prov.os.path.exists
+        try:
+            prov.os.path.exists = lambda p: False if p.startswith("/run/user/") else real_exists(p)
+            r = prov.user_systemctl(me.pw_name, "show", "pipewire.service")
+        finally:
+            prov.os.path.exists = real_exists
+        self.assertNotEqual(r.returncode, 0)
+
 class Gate(Base):
     def decide(self, iface="v2", gate_data=None, allow=False):
         g = os.path.join(self.t, "gate.json")
