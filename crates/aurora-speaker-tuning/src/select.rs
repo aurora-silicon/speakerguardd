@@ -4,8 +4,10 @@
 //! Choosing the speaker graph, strip and property strip, as the DSP
 //! database does on macOS.
 //!
-//! The database (`DeviceDSPDatabase.plist`, key `AID<n>`; aurora-audio-dsp
-//! collector bundles store that subtree as `AID<n>/DSP/DSPDatabase.plist`)
+//! The database (`DeviceDSPDatabase.plist` on macOS 26 and earlier,
+//! `AID<n>/DSP/DSPDatabase.plist` on macOS 27 and in aurora-audio-dsp
+//! collector bundles; key `AID<n>` in both; an installer manifest names
+//! which)
 //! maps each device (`Built-in Speaker`) and configuration to
 //! `Output[].Hardware[]` entries of type `DSPGraph` (with `Substitutions`),
 //! `AUStrip` and `PropertyStrip`, plus `UnderlyingDeviceProperties`
@@ -19,6 +21,7 @@
 
 use crate::bundle::{Bundle, DSP_DATABASE};
 use crate::error::{Diagnostics, Error, Result};
+use crate::manifest::aid_dsp_database;
 use crate::plist::{self, Dict, Value};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -53,12 +56,20 @@ pub struct Selection {
     pub all: Vec<Configuration>,
 }
 
+/// The DSP database the manifest names; without one (collector bundles,
+/// folders read in place), the shared one, else the per-AID one.
 fn database(b: &Bundle, diags: &mut Diagnostics) -> Result<Option<Dict>> {
-    let collector = format!("{}/DSP/DSPDatabase.plist", b.manifest.aid);
-    let (path, bytes) = match (b.file(DSP_DATABASE), b.file(&collector)) {
-        (Some(x), _) => (DSP_DATABASE.to_string(), x),
-        (None, Some(x)) => (collector, x),
-        (None, None) => return Ok(None),
+    let per_aid = aid_dsp_database(&b.manifest.aid);
+    let (path, bytes) = match &b.manifest.dsp_database {
+        Some(p) => (
+            p.clone(),
+            b.file(p).ok_or_else(|| Error::format(p, "the manifest names this DSP database; it is missing"))?,
+        ),
+        None => match (b.file(DSP_DATABASE), b.file(&per_aid)) {
+            (Some(x), _) => (DSP_DATABASE.to_string(), x),
+            (None, Some(x)) => (per_aid, x),
+            (None, None) => return Ok(None),
+        },
     };
     let (v, _) = plist::parse(bytes).map_err(|e| Error::plist(&path, e))?;
     let root = v.as_dict().ok_or_else(|| Error::format(&path, "root is not a dictionary"))?;

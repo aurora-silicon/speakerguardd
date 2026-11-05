@@ -48,25 +48,25 @@ pub fn table() -> Vec<Row> {
         source: "SpTS record",
         field: "R_cal".into(),
         unit: "ohm",
-        meaning: "factory DC resistance, Q6.10 (raw/1024)".into(),
+        meaning: "factory DC resistance, raw * 0.001".into(),
     });
     rows.push(Row {
         source: "SpTS record",
         field: "T_cal".into(),
         unit: "degC",
-        meaning: "calibration temperature, Q9.7 (raw/128)".into(),
+        meaning: "calibration temperature, raw * 0.01".into(),
     });
     rows.push(Row {
         source: "SpTS record",
         field: "data_source".into(),
         unit: "FourCC",
-        meaning: "binds the record through SpeakerInputDataSourceOrder".into(),
+        meaning: "provenance only; record i calibrates unit channel i".into(),
     });
     rows.push(Row {
         source: "SpTS record",
-        field: "bytes 0..4, 8..18".into(),
-        unit: "TODO(SPEC)",
-        meaning: "not yet named by the specification; exposed raw".into(),
+        field: "fs qts le kms mms bl rms".into(),
+        unit: "scaled",
+        meaning: "the other Thiele-Small fields (x0.1, x0.001, x0.01, x1, x0.0001, x0.0001, x0.001); dump only".into(),
     });
     rows.push(Row {
         source: "atsp / lsm2 saved state",

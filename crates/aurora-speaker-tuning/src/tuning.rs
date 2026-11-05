@@ -455,7 +455,7 @@ impl Tuning {
             diags.info(
                 "spts-binding",
                 crate::manifest::SPTS_NAME,
-                "records bind to channels through SpeakerInputDataSourceOrder (property 64005): the strip's, or the default order",
+                "records bind to unit channels by position; the data-source IDs are provenance",
             );
         }
 

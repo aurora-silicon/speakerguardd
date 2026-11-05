@@ -144,7 +144,7 @@ pub struct ChannelParams {
     pub i_pwr_thres: f32,
     pub v_pwr_thres: f32,
     /// Sense port (index into `Io::sense`) of this channel's current and
-    /// voltage, from `SpeakerInputDataSourceOrder`.
+    /// voltage (`2c + 1`, `2c` without a telemetry order).
     pub sense_i: u32,
     pub sense_v: u32,
     /// `PilotToneEnabled` (part 21, 0 or 1) and the pilot dictionary:
@@ -176,7 +176,7 @@ pub struct ChannelParams {
     pub a_t_35c: f32,
     pub tlim_err_decay_time_s: f32,
     pub tlim_adj_cap: f32,
-    /// Per-unit calibration (SpTS record bound by data source; 64009):
+    /// Per-unit calibration (SpTS record of this channel, by position; 64009):
     /// present flag, resistance (ohm) and temperature (C).
     pub cal_present: u32,
     pub cal_r: f32,

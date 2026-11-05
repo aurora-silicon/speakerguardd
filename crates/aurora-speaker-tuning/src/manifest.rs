@@ -23,8 +23,15 @@ pub const NAME: &str = "manifest.json";
 pub const COLLECTOR_NAME: &str = "metadata.json";
 pub const SPTS_NAME: &str = "speaker-thiele-small.bin";
 /// Files a manifest may list outside `AID<n>/`: macOS's DSP database (the
-/// graph and strip selection) and the AID's device configuration.
+/// graph and strip selection) and the AID's device configuration.  This is
+/// the shared database of macOS 26 and earlier; macOS 27 keeps one per AID
+/// instead, [`aid_dsp_database`], inside the folder.
 pub const DSP_DATABASE: &str = "DeviceDSPDatabase.plist";
+
+/// The per-AID DSP database of macOS 27 (`AID<n>/DSP/DSPDatabase.plist`).
+pub fn aid_dsp_database(aid: &str) -> String {
+    format!("{aid}/DSP/DSPDatabase.plist")
+}
 /// Limits the installer applies when collecting; a bundle beyond them is
 /// not one it wrote.
 pub const MAX_FILES: usize = 1024;
@@ -76,6 +83,10 @@ pub struct Manifest {
     /// The speaker-assembly ID (macOS `speakerID`, HAL `spid`) the
     /// installer read on this Mac, if it could.
     pub speaker_id: Option<u32>,
+    /// The DSP database the installer named: [`DSP_DATABASE`] or
+    /// [`aid_dsp_database`].  `None` when the manifest names none (the
+    /// collector), and the reader looks for either.
+    pub dsp_database: Option<String>,
     pub speaker_thiele_small: Option<Record>,
     pub files: Vec<Record>,
 }
@@ -139,16 +150,17 @@ impl Manifest {
             return Err(Error::format(NAME, "the installer marked the set incomplete"));
         }
         let config = format!("Config/{}.plist", j.aid);
-        if j.device_dsp_database != DSP_DATABASE || j.config != config {
+        let per_aid = aid_dsp_database(&j.aid);
+        if (j.device_dsp_database != DSP_DATABASE && j.device_dsp_database != per_aid) || j.config != config {
             return Err(Error::format(
                 NAME,
                 format!(
-                    "selection files {:?} and {:?}; expected {DSP_DATABASE:?} and {config:?}",
+                    "selection files {:?} and {:?}; expected {DSP_DATABASE:?} or {per_aid:?}, and {config:?}",
                     j.device_dsp_database, j.config
                 ),
             ));
         }
-        for name in [DSP_DATABASE, config.as_str()] {
+        for name in [j.device_dsp_database.as_str(), config.as_str()] {
             if !j.files.iter().any(|r| r.path == name) {
                 return Err(Error::format(NAME, format!("{name} is named but not listed")));
             }
@@ -168,6 +180,7 @@ impl Manifest {
             macos_build: (j.macos_build != "unknown").then_some(j.macos_build),
             machine_model: None,
             speaker_id: j.speaker_id,
+            dsp_database: Some(j.device_dsp_database),
             speaker_thiele_small: j.speaker_thiele_small,
             files: j.files,
         };
@@ -195,6 +208,7 @@ impl Manifest {
             macos_build: None,
             machine_model: j.machine_model,
             speaker_id: None,
+            dsp_database: None,
             speaker_thiele_small: spts.into_iter().next(),
             files,
         };

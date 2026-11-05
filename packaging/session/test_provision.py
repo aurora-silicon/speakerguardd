@@ -398,7 +398,7 @@ class Gate(Base):
             self.assertIn(e["unit"], ("spp3", "lsm2", "atsp"), k)
             self.assertTrue(set(e["qualified"]) <= set(e["boards"]), k)
         qualified = sorted(b for e in m.values() if e["unit"] in g["units_at_parity"] for b in e["qualified"])
-        self.assertEqual(qualified, ["j316s", "j616s"])
+        self.assertEqual(qualified, ["j316s", "j413", "j616s"])
 
 
 class Units(unittest.TestCase):

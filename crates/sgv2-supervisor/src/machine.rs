@@ -71,6 +71,9 @@ pub const MACHINES: &[Machine] = &[
     sn("j616s", "AppleJ616", 6),
     sn("j616c", "AppleJ616", 6),
     sn("j413", "AppleJ413", 4),
+    // The card id is "Apple" and the last word of the DT model ("MacBook
+    // Pro J414"); no session template: the self-check derives the wiring.
+    sn("j414s", "AppleJ414", 6),
     // lsm2 VoltsFullScale (peak): 7300 mV left, 7330 mV right; both are
     // within the tolerance of 7300 (0.04 dB).
     Machine { board: "j700", card_id: "AppleJ700", amps: 2, amp: Amp::Max98360a, fixed_full_scale_mv: 7_300 },
