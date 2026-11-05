@@ -1037,3 +1037,114 @@ fn stale_closed_loop_after_the_pilot_stops_is_not_used() {
         assert!(prev < 1e-3, "back at the base: {prev}");
     }
 }
+
+/// Window resistance of the `cl_params(4.0, tc)` coil (Rshunt 0.2) at
+/// `t` C: R_cal (1 + alpha (t - T_cal)) net of the shunt, alpha at T_cal.
+fn coil_r(tc: f64, t: f64) -> f64 {
+    let alpha = 0.004 + (tc - 20.0) * (0.0038 - 0.004) / 15.0;
+    0.2 + 3.8 * (1.0 + alpha * (t - tc))
+}
+
+/// Feed one window of resistance `r` and then its updates at `t_ol`,
+/// driven; returns the last update's (TlimAdj, T_CL, implausible).
+fn replay_window(rp: &mut spp3::ClReplay, upw: usize, r: f64, t_ol: f64) -> (f64, f64, bool) {
+    assert!(rp.window((r * r) as f32, 1.0), "window {r} accepted");
+    let mut o = (0.0, 0.0, false);
+    for _ in 0..upw {
+        o = rp.update(t_ol, 10.0);
+    }
+    o
+}
+
+/// The J616s full-volume ladder shape (lane T, 11-05, volume 1.0): the
+/// model's T_OL runs some 55 K ahead of coils that have levelled off near
+/// 120 C and keeps climbing while the music swings it, and the windows'
+/// resistance carries its ordinary noise. One ring of eight windows
+/// across which T_OL rose 10.8 K ended on a low window: judged on the
+/// single windows it fell at about a quarter of an honest coil's rise and
+/// tripped SENSE_IMPLAUSIBLE 77 s into the step. Judged on the smoothed
+/// R_s, as the reference accepts, the coil is flat: no trip, and the
+/// relaxation stays at its cap.
+#[test]
+fn plausibility_guard_ignores_window_noise_on_a_levelled_coil() {
+    let tc = 25.0;
+    let p = cl_params(4.0, tc as f32);
+    let mut rp = spp3::ClReplay::new(&p, 0, true).unwrap();
+    let upw = rp.updates_per_window().round() as usize;
+    // the coil heats honestly to 120 C, the model ahead of it
+    for k in 0..60 {
+        let t = tc + (120.0 - tc) * k as f64 / 59.0;
+        let (_, _, bad) = replay_window(&mut rp, upw, coil_r(tc, t), t + 55.0 * k as f64 / 59.0);
+        assert!(!bad, "heating, window {k}");
+    }
+    // levelled at 120 C: the model wanders about 175 C, then the ring that
+    // tripped the window rule (T_OL offsets, K, and window noise, ohm)
+    let r0 = coil_r(tc, 120.0);
+    let wander = [0.0, 0.8, -0.6, 0.3, -0.2, 0.5, -0.9, 0.4];
+    let noise = [0.011, -0.025, 0.020, -0.012, 0.016, -0.018, 0.022, -0.014];
+    let ring_t = [0.0, 2.3, -0.2, 3.0, 0.4, 3.7, 7.5, 10.8];
+    let ring_r = [0.032, -0.027, 0.039, 0.021, 0.028, -0.084, 0.146, -0.094];
+    let mut adj = 0.0;
+    for rep in 0..20 {
+        for k in 0..8 {
+            let o = replay_window(&mut rp, upw, r0 + noise[k], 175.0 + wander[k]);
+            assert!(!o.2, "levelled, ring {rep} window {k}");
+            adj = o.0;
+        }
+    }
+    assert!(adj > 25.0, "relaxing on the levelled coil: {adj}");
+    for k in 0..8 {
+        let o = replay_window(&mut rp, upw, r0 + ring_r[k], 175.0 + ring_t[k]);
+        assert!(!o.2, "the noisy rising ring, window {k}: T_CL {}", o.1);
+        adj = o.0;
+    }
+    // the rule judges the ring (T_OL rose by the span) and finds R_s flat
+    for k in 0..40 {
+        let o = replay_window(&mut rp, upw, r0 + noise[k % 8], 186.0 + 0.1 * k as f64);
+        assert!(!o.2, "still levelled, window {k}");
+        adj = o.0;
+    }
+    assert!(adj > 25.0, "the relaxation holds: {adj}");
+}
+
+/// The trend's other side: the [V,I]-swap shape (J616s z1, 11-05), a
+/// sensed resistance falling at half an honest coil's rise while the model
+/// heats, still trips on the smoothed R_s and drops the relaxation.
+#[test]
+fn plausibility_guard_trips_on_a_smoothed_fall_while_heating() {
+    let tc = 25.0;
+    let p = cl_params(4.0, tc as f32);
+    let mut rp = spp3::ClReplay::new(&p, 0, true).unwrap();
+    let upw = rp.updates_per_window().round() as usize;
+    let mut tripped = None;
+    for k in 0..40 {
+        // T_OL +1.5 K per window; the reading 0.5 K-equivalent colder each
+        let o = replay_window(&mut rp, upw, coil_r(tc, tc - 0.5 * k as f64), 50.0 + 1.5 * k as f64);
+        if o.2 {
+            tripped = Some(k);
+            assert_eq!(o.0, 0.0, "a tripped guard drops the relaxation");
+            break;
+        }
+    }
+    let k = tripped.expect("the falling sense trips");
+    // the ring fills (8 windows) and the smoother follows the fall
+    assert!(k <= 20, "tripped late: window {k}");
+}
+
+/// A cold start in a room colder than calibration: R_s e-folds down from
+/// R_cal while the model heats, which the trend must not read as a fall.
+/// The trend smoother starts at the first window, not at R_cal.
+#[test]
+fn plausibility_guard_trend_ignores_the_r_cal_seed_after_a_cold_start() {
+    let tc = 31.0;
+    let mut p = cl_params(4.0, tc as f32);
+    p.thermal_ambient_temp = 50.0;
+    let mut rp = spp3::ClReplay::new(&p, 0, true).unwrap();
+    let upw = rp.updates_per_window().round() as usize;
+    for k in 0..80 {
+        // the coil from 16 C, honestly warming 0.5 K per window; the model
+        // from its 50 C ambient at 1.5 K per window
+        let o = replay_window(&mut rp, upw, coil_r(tc, 16.0 + 0.5 * k as f64), 50.0 + 1.5 * k as f64);
+        assert!(!o.2, "window {k}: T_CL {}", o.1);
+    }
+}
