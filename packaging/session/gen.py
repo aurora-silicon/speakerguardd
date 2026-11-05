@@ -4,15 +4,16 @@
     python3 -I packaging/session/gen.py            # rewrite the files
     python3 -I packaging/session/gen.py --check    # fail if any file is stale
 
-The channel map of each machine is derived (wiring.py) from its device tree
-and its tuning's graph, recorded in fixtures/<machine>.json. A machines.json
-entry states a hand map (unit_channels, default the identity; sense_pairs,
-default "vi"; none with "wiring": "derive"), and the derivation must agree,
-or nothing is generated. A machine with no fixture uses its hand map. On a
-Mac with no entry at all,
-speakerguardd-selfcheck derives the map live and generates the files.
+Every value comes from the machine's own device tree and tuning, recorded in
+fixtures/<machine>.json (public device-tree facts and the lane structure of
+the tuning's graph, no tuning values): the channel map (wiring.derive) and
+the rest of the description (wiring.describe: the card, the model, the amp
+and sense counts, the plugin variant, the speaker format and the
+transport's buffering). Nothing is written by hand per board. On a Mac with
+no fixture, speakerguardd-selfcheck derives the same from the live device
+tree, checks it against ALSA, and generates the files.
 
-The graph, per machine (machines.json):
+The graph, per machine:
 
     voicing sink (the user's speakers) ──► protect stage ──► speaker amps (ALSA)
                                                ▲
@@ -63,40 +64,8 @@ def aux(n, base=0):
     return "[ " + " ".join(f"AUX{base + i}" for i in range(n)) + " ]"
 
 
-# The plugin variants the LV2 bundle provides (crates/sgv2-lv2 VARIANTS):
-# (amps, sense channels) -> URI fragment.
-PLUGINS = {(2, 0): "2ch", (2, 4): "2ch-vi", (4, 0): "4ch", (4, 8): "4ch-vi", (6, 12): "6ch-vi"}
-
-
-def channel_map(m, c):
-    """The hand-written map of a machines.json entry (no derivation).
-
-    - unit_channels: the unit channel of each physical speaker channel
-      (default: the same order);
-    - sense_pairs: the order of each amp's two channels on the sense PCM,
-      "vi" (default) or "iv". The sense PCM carries the amps in the
-      physical speaker order.
-
-    Returns the unit channel of each physical channel, and the unit's sense
-    port for each sense PCM channel.
-    """
-    amps, sense = c["amps"], c["sense"]
-    unit = c.get("unit_channels", list(range(amps)))
-    if sorted(unit) != list(range(amps)):
-        raise SystemExit(f"{m}: unit_channels {unit} is not a permutation of {amps} channels")
-    if sense not in (0, 2 * amps):
-        raise SystemExit(f"{m}: {sense} sense channels for {amps} amps")
-    try:
-        ports = wiring.sense_ports_from_pairs(unit, c.get("sense_pairs", "vi"), amps) if sense else []
-    except wiring.Refused as e:
-        raise SystemExit(f"{m}: {e}")
-    return unit, ports
-
-
 def fixture(m):
-    """The machine's recorded device tree and tuning trace, if any
-    (fixtures/<m>.json: public device-tree facts and the lane structure of
-    the tuning's graph, no tuning values)."""
+    """The machine's recorded device tree and tuning trace, if any."""
     path = os.path.join(HERE, "fixtures", f"{m}.json")
     if not os.path.exists(path):
         return None
@@ -104,60 +73,37 @@ def fixture(m):
         return json.load(f)
 
 
-def wiring_for(m, c):
-    """The protect stage's map for a machines.json entry: derived from the
-    machine's fixture where there is one (the entry's hand map, if any, must
-    agree), else the entry's hand map.
+def machines():
+    """The machines with a fixture, by key."""
+    d = os.path.join(HERE, "fixtures")
+    return sorted(f[: -len(".json")] for f in os.listdir(d) if f.endswith(".json"))
 
-    Returns (unit_channels, sense_ports, wiring hash, source)."""
+
+def machine(m):
+    """(description, (unit_channels, sense_ports, wiring hash)) of a
+    machine, derived from its fixture."""
     fx = fixture(m)
     if fx is None:
-        unit, ports = channel_map(m, c)
-        h = wiring.wiring_hash(
-            {"unit_channels": unit, "sense_ports": ports, "amps": [{"prefix": f"ch{i}", "slot": i} for i in range(c["amps"])]}
-        )
-        return unit, ports, h, "hand"
+        raise SystemExit(f"{m}: no fixture")
     try:
-        w = wiring.derive(fx["hw"], fx["tuning"], key=m)
-        eff, dis = wiring.apply_override(w, c)
+        w = wiring.derive(fx["hw"], fx["tuning"])
+        c = wiring.describe(fx["hw"], w)
     except wiring.Refused as e:
         raise SystemExit(f"{m}: {e}")
-    if dis:
-        raise SystemExit(f"{m}: machines.json disagrees with the derived wiring: " + "; ".join(dis))
-    if (len(eff["amps"]), len(eff["sense"])) != (c["amps"], c["sense"]):
-        raise SystemExit(f"{m}: the derivation has {len(eff['amps'])} amps and {len(eff['sense'])} sense channels")
-    return eff["unit_channels"], eff["sense_ports"], eff["hash"], "derived"
+    if c["key"] != m:
+        raise SystemExit(f"fixtures/{m}.json: its device tree names machine {c['key']}")
+    return c, (w["unit_channels"], w["sense_ports"], w["hash"])
 
 
-def entry_from_wiring(w, card, speaker_format, base=None):
-    """A machines.json-style entry for a board with no entry: everything
-    the graph needs from the derived wiring and the running card."""
-    n, s = len(w["amps"]), len(w["sense"])
-    plugin = PLUGINS.get((n, s))
-    if plugin is None:
-        raise SystemExit(f"{w['board']}: no sgv2 plugin variant for {n} amps and {s} sense channels")
-    c = {
-        "card": card,
-        "name": w.get("model") or card,
-        "amps": n,
-        "speaker_format": speaker_format,
-        "sense": s,
-        "plugin": plugin,
-        "sense_headroom": 512,
-    }
-    c.update(base or {})
-    return c
-
-
-def pipewire_conf(m, c, w=None):
-    """The PipeWire file. `w` is (unit_channels, sense_ports, hash), from
-    wiring_for() when not given."""
+def pipewire_conf(m, c, w, source=None):
+    """The PipeWire file for description `c` (wiring.describe) and map `w`
+    (unit_channels, sense_ports, wiring hash)."""
     n = names(m)
     amps, sense = c["amps"], c["sense"]
     uri = f"https://aurora-silicon.org/lv2/sgv2#{c['plugin']}"
     # filter-chain feeds capture channel i to inputs[i] and playback channel
     # j from outputs[j]: the lists put each physical channel on its unit port.
-    unit, sense_ports, whash = (w or wiring_for(m, c))[:3]
+    unit, sense_ports, whash = w[:3]
     inputs = [f'"sgv2:in_{unit[p]}"' for p in range(amps)] + [f'"sgv2:sense_{s}"' for s in sense_ports]
     outputs = [f'"sgv2:out_{unit[p]}"' for p in range(amps)]
     sense_obj = ""
@@ -165,7 +111,7 @@ def pipewire_conf(m, c, w=None):
     # 120 frames) is not period-batched: PipeWire's batch handling would
     # halve its period to 256 and add 256 frames of headroom, and its
     # follower then resyncs (drops frames) on ordinary chunk jitter.
-    sense_batch = "" if c.get("sense_batch", True) else "\n            api.alsa.disable-batch = true"
+    sense_batch = "" if c["sense_batch"] else "\n            api.alsa.disable-batch = true"
     # The sense is a follower without resampling: PipeWire resyncs it (drops
     # or skips frames, shifting it against the program) when its delay is off
     # target by more than max((quantum + headroom) / 2, 256) frames, so the
@@ -184,7 +130,7 @@ def pipewire_conf(m, c, w=None):
             audio.channels         = {sense}
             audio.position         = {aux(sense)}
             api.alsa.period-size   = {QUANTUM}
-            api.alsa.headroom      = {c.get('sense_headroom', 0)}{sense_batch}
+            api.alsa.headroom      = {c['sense_headroom']}{sense_batch}
             node.group             = "{n['group']}"
             node.passive           = true
             priority.driver        = 0
@@ -196,7 +142,7 @@ def pipewire_conf(m, c, w=None):
             monitor.channel-volumes = false
         }}
     }}"""
-    return f"""# Generated by packaging/session/gen.py from machines.json ({m}); do not edit.
+    return f"""# Generated by packaging/session/gen.py from {source or f'fixtures/{m}.json'}; do not edit.
 # speakerguardd v2: the protect stage, the speaker amps and the sense of the {c['name']}.
 
 context.objects = [
@@ -212,7 +158,7 @@ context.objects = [
             audio.channels         = {amps}
             audio.position         = {aux(amps)}
             api.alsa.period-size   = {QUANTUM}
-            api.alsa.headroom      = {c.get('speaker_headroom', 0)}
+            api.alsa.headroom      = {c['speaker_headroom']}
             node.group             = "{n['group']}"
             node.force-quantum     = {QUANTUM}
             node.lock-quantum      = true
@@ -289,9 +235,9 @@ context.modules = [
 """
 
 
-def wireplumber_conf(m, c):
+def wireplumber_conf(m, c, source=None):
     card = c["card"]
-    return f"""# Generated by packaging/session/gen.py from machines.json ({m}); do not edit.
+    return f"""# Generated by packaging/session/gen.py from {source or f'fixtures/{m}.json'}; do not edit.
 # speakerguardd v2 on the {c['name']}: the only path to the speaker amps is the protect stage.
 
 monitor.alsa.rules = [
@@ -332,10 +278,9 @@ node.software-dsp.rules = [
 
 
 def outputs():
-    with open(os.path.join(HERE, "machines.json")) as f:
-        machines = json.load(f)
-    for m, c in sorted(machines.items()):
-        yield os.path.join(PKG, "pipewire", f"sgv2-{m}.conf"), pipewire_conf(m, c)
+    for m in machines():
+        c, w = machine(m)
+        yield os.path.join(PKG, "pipewire", f"sgv2-{m}.conf"), pipewire_conf(m, c, w)
         yield os.path.join(PKG, "wireplumber", f"60-sgv2-{m}.conf"), wireplumber_conf(m, c)
 
 

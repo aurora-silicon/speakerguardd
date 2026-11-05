@@ -1,5 +1,5 @@
 {
- "note": "MacBook Pro 14/16-inch (M4 Pro, J616s): the speaker card of arch/arm64/boot/dts/apple/t604x-j614-j616.dtsi and t6040-j616s.dts (public); the AOP audio component is the one back-end, the six SN012776 amps are on i2c1. Tuning lanes: the structure of the graph's input lanes only, with generic box names and no tuning values.",
+ "note": "MacBook Pro 14/16-inch (M4 Pro, J616s): the speaker card of arch/arm64/boot/dts/apple/t604x-j614-j616.dtsi and t6040-j616s.dts (public); the AOP audio component is the one back-end, the six SN012776 amps are on i2c1. Tuning lanes: the structure of the graph's input lanes only, with generic box names and no tuning values. The hardware half is wiring.py's reading of arch/arm64/boot/dts/apple/t6040-j616s.dts (aurora-silicon/linux integration/aurora), with the I2C bindings of the booted Mac.",
  "hw": {
   "board": "j616s",
   "compatible": [
@@ -8,71 +8,81 @@
    "apple,arm-platform"
   ],
   "sound": "sound",
+  "sound_compatible": [
+   "apple,j616-macaudio",
+   "apple,macaudio"
+  ],
   "model": "MacBook Pro J616",
   "links": [
    {
     "name": "Speakers",
     "cpus": 1,
+    "cpu_compatible": [
+     [
+      "apple,t6041-aop-audio",
+      "apple,t6030-aop-audio"
+     ]
+    ],
     "codecs": [
      {
-      "node": "soc/i2c1/codec@38",
+      "node": "i2c@429014000/codec@38",
       "prefix": "Left Woofer 1",
       "compatible": [
        "ti,sn012776",
        "ti,tas2764"
       ],
-      "imon": 0,
-      "vmon": 2
+      "vmon": 2,
+      "imon": 0
      },
      {
-      "node": "soc/i2c1/codec@3b",
+      "node": "i2c@42901c000/codec@3b",
       "prefix": "Right Woofer 1",
       "compatible": [
        "ti,sn012776",
        "ti,tas2764"
       ],
-      "imon": 4,
-      "vmon": 6
+      "vmon": 6,
+      "imon": 4
      },
      {
-      "node": "soc/i2c1/codec@39",
+      "node": "i2c@429014000/codec@39",
       "prefix": "Left Woofer 2",
       "compatible": [
        "ti,sn012776",
        "ti,tas2764"
       ],
-      "imon": 8,
-      "vmon": 10
+      "vmon": 10,
+      "imon": 8
      },
      {
-      "node": "soc/i2c1/codec@3c",
+      "node": "i2c@42901c000/codec@3c",
       "prefix": "Right Woofer 2",
       "compatible": [
        "ti,sn012776",
        "ti,tas2764"
       ],
-      "imon": 12,
-      "vmon": 14
+      "vmon": 14,
+      "imon": 12
      },
      {
-      "node": "soc/i2c1/codec@3a",
+      "node": "i2c@429014000/codec@3a",
       "prefix": "Left Tweeter",
       "compatible": [
        "ti,sn012776",
        "ti,tas2764"
       ],
-      "imon": 16,
-      "vmon": 18
+      "vmon": 18,
+      "imon": 16
      },
      {
-      "node": "soc/i2c1/codec@3d",
+      "node": "i2c@42901c000/codec@3d",
       "prefix": "Right Tweeter",
       "compatible": [
        "ti,sn012776",
        "ti,tas2764"
       ],
-      "imon": 20,
-      "vmon": 22
+      "vmon": 22,
+      "imon": 20
      }
     ]
    }

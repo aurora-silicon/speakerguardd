@@ -110,38 +110,32 @@ pub fn covers(bind: &Bind, board: &str, kernel: &str, params_sha256: &str) -> Re
     Ok(())
 }
 
-/// The machine for a board: the supervisor's own table, which the record
-/// must agree with, or, for a board the table does not know, the record's
-/// derived description (a new Mac whose device tree exposes its amps).
-pub fn machine_for(board: &str, known: Option<&'static Machine>, bind: &Bind) -> Result<&'static Machine, String> {
-    if let Some(m) = known {
-        if m.card_id != bind.card || m.amps != bind.amps {
-            return Err(format!(
-                "the self-check found card {} with {} amps, {board} has {} with {}",
-                bind.card, bind.amps, m.card_id, m.amps
-            ));
-        }
-        return Ok(m);
+/// The machine for a board, from its self-check record: the card, the amp
+/// count and the amp family the self-check derived from this Mac's device
+/// tree and proved on its card. There is no table of boards: a new Mac
+/// runs on its own record. A family with V/I sense must have been proven
+/// with it (`method=derived`, two sense channels an amp); one without has
+/// nothing to prove silently (`method=derived-static`, no sense).
+pub fn machine_for(board: &str, bind: &Bind) -> Result<&'static Machine, String> {
+    if bind.board != board {
+        return Err(format!("the self-check ran on {}, this Mac is {board}", bind.board));
     }
-    if bind.method != "derived" {
-        return Err(format!("{board}: not a known machine, and its wiring was not derived"));
-    }
-    let amp = match bind.family.as_str() {
-        "sn012776" => Amp::Sn012776,
-        f => return Err(format!("{board}: amp family {f} has no operating-point check yet")),
+    let Some(amp) = Amp::from_family(&bind.family) else {
+        return Err(format!("{board}: amp family {} has no operating-point check yet", bind.family));
     };
-    if bind.sense != 2 * bind.amps || bind.amps == 0 {
-        return Err(format!("{board}: {} sense channels for {} amps", bind.sense, bind.amps));
+    if bind.amps == 0 {
+        return Err(format!("{board}: the self-check found no amps"));
     }
-    // Leaked once at startup: the machine table is &'static.
+    let (method, sense) = if amp.has_sense() { ("derived", 2 * bind.amps) } else { ("derived-static", 0) };
+    if bind.method != method {
+        return Err(format!("{board}: {} amps need a {method} wiring, the record says {}", bind.family, bind.method));
+    }
+    if bind.sense != sense {
+        return Err(format!("{board}: {} sense channels for {} {} amps", bind.sense, bind.amps, bind.family));
+    }
+    // Leaked once at startup: the machine is &'static.
     let leak = |s: &str| -> &'static str { Box::leak(s.to_owned().into_boxed_str()) };
-    Ok(Box::leak(Box::new(Machine {
-        board: leak(board),
-        card_id: leak(&bind.card),
-        amps: bind.amps,
-        amp,
-        fixed_full_scale_mv: 0,
-    })))
+    Ok(Box::leak(Box::new(Machine { board: leak(board), card_id: leak(&bind.card), amps: bind.amps, amp })))
 }
 
 #[cfg(test)]
@@ -182,18 +176,25 @@ mod tests {
     }
 
     #[test]
-    fn known_boards_must_agree_and_new_boards_come_from_the_record() {
+    fn every_board_comes_from_its_record() {
         let b = parse(GOOD).unwrap();
-        let j316 = crate::machine::lookup("j316s");
-        assert_eq!(machine_for("j316s", j316, &b).unwrap().card_id, "AppleJ316");
-        let wrong = Bind { amps: 4, ..b.clone() };
-        assert!(machine_for("j316s", j316, &wrong).is_err());
-        // a board the table does not know
+        let m = machine_for("j316s", &b).unwrap();
+        assert_eq!((m.board, m.card_id, m.amps, m.amp), ("j316s", "AppleJ316", 6, Amp::Sn012776));
+        // a board nothing was written for
         let new = Bind { board: "j999".into(), card: "AppleJ999".into(), ..b.clone() };
-        let m = machine_for("j999", None, &new).unwrap();
+        let m = machine_for("j999", &new).unwrap();
         assert_eq!((m.board, m.card_id, m.amps, m.amp), ("j999", "AppleJ999", 6, Amp::Sn012776));
-        assert!(machine_for("j999", None, &Bind { method: "hand".into(), ..new.clone() }).is_err());
-        assert!(machine_for("j999", None, &Bind { family: "tas2770".into(), ..new.clone() }).is_err());
-        assert!(machine_for("j999", None, &Bind { sense: 0, ..new }).is_err());
+        assert!(machine_for("j316c", &b).is_err());
+        assert!(machine_for("j999", &Bind { method: "hand".into(), ..new.clone() }).is_err());
+        assert!(machine_for("j999", &Bind { method: "derived-static".into(), ..new.clone() }).is_err());
+        assert!(machine_for("j999", &Bind { family: "tas2770".into(), ..new.clone() }).is_err());
+        assert!(machine_for("j999", &Bind { sense: 0, ..new.clone() }).is_err());
+        assert!(machine_for("j999", &Bind { amps: 0, sense: 0, ..new.clone() }).is_err());
+        // a fixed-gain pair without sense: derived, nothing to prove silently
+        let pair =
+            Bind { amps: 2, sense: 0, family: "max98360a".into(), method: "derived-static".into(), ..new.clone() };
+        assert_eq!(machine_for("j999", &pair).unwrap().amp, Amp::Max98360a);
+        assert!(machine_for("j999", &Bind { sense: 4, ..pair.clone() }).is_err());
+        assert!(machine_for("j999", &Bind { method: "derived".into(), ..pair }).is_err());
     }
 }

@@ -5,8 +5,8 @@
 """
 import importlib.machinery
 import importlib.util
-import json
 import os
+import sys
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -15,7 +15,11 @@ _spec = importlib.util.spec_from_loader("sgs", _loader)
 sgs = importlib.util.module_from_spec(_spec)
 _loader.exec_module(sgs)
 
-MACHINES = json.load(open(os.path.join(HERE, "machines.json")))
+sys.path.insert(0, HERE)
+import gen  # noqa: E402
+
+# Every machine with a fixture, as the derivation describes it.
+MACHINES = {m: gen.machine(m)[0] for m in gen.machines()}
 
 
 class FakeGraph(sgs.Graph):
