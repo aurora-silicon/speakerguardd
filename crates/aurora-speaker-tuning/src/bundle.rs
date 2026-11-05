@@ -219,6 +219,37 @@ impl Bundle {
         Ok(Bundle { manifest, files, source: root.to_owned(), verified: false, unlisted: Vec::new() })
     }
 
+    /// The bundle's identity: a SHA-256 over what the manifest states (the
+    /// AID, the macOS build, the speaker ID and every file's path, size and
+    /// hash, in path order), independent of where the bundle sits and of its
+    /// container (directory or archive).  The files themselves are verified
+    /// against the manifest on load, so two bundles with the same digest
+    /// hold the same data.  Provisioning binds the compiled blob to it.
+    pub fn digest(&self) -> String {
+        let m = &self.manifest;
+        let mut text = format!(
+            "aurora-speaker-tuning bundle v1\nsource={:?}\nverified={}\nacoustic_id={}\naid={}\nmacos_build={}\nspeaker_id={}\n",
+            m.source,
+            self.verified,
+            m.acoustic_id,
+            m.aid,
+            m.macos_build.as_deref().unwrap_or("-"),
+            m.speaker_id.map_or("-".to_string(), |v| v.to_string()),
+        );
+        // An unverified bundle has no records: its files stand for them.
+        let mut lines: Vec<String> = if self.verified {
+            m.records().map(|r| format!("{}\0{}\0{}", r.path, r.bytes, r.sha256)).collect()
+        } else {
+            self.files.iter().map(|(p, d)| format!("{p}\0{}\0{}", d.len(), manifest::sha256_hex(d))).collect()
+        };
+        lines.sort();
+        for l in lines {
+            text.push_str(&l);
+            text.push('\n');
+        }
+        manifest::sha256_hex(text.as_bytes())
+    }
+
     pub fn file(&self, path: &str) -> Option<&[u8]> {
         self.files.get(path).map(Vec::as_slice)
     }
