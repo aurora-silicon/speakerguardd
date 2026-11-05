@@ -157,6 +157,12 @@ pub struct Tuning {
     pub chain: Vec<Stage>,
     pub protection: Protection,
     pub spts: Option<Spts>,
+    /// The lsm2 masker's bucket lattice from the bundle, validated
+    /// ([`crate::lattice`]); `None` when the bundle has none.  Kept out of
+    /// dumps; `mask_lattice_present` says whether it is there.
+    #[serde(skip)]
+    pub mask_lattice: Option<[u32; crate::lattice::ENTRIES]>,
+    pub mask_lattice_present: bool,
     #[serde(skip)]
     pub graph: Graph,
 }
@@ -459,6 +465,30 @@ impl Tuning {
             );
         }
 
+        // The masker lattice: checked again with the installer's rule.  A
+        // listed lattice that fails it makes the tuning unsafe to run; an
+        // absent one leaves lsm2 without masking credit.
+        let mask_lattice = match b.mask_lattice() {
+            Some(bytes) => match crate::lattice::parse(bytes) {
+                Ok(l) => Some(l),
+                Err(e) => {
+                    diags.error("mask-lattice-invalid", crate::lattice::NAME, e.to_string());
+                    None
+                }
+            },
+            None => {
+                if kind == UnitKind::Lsm2 {
+                    diags.warn(
+                        "mask-lattice-absent",
+                        "bundle",
+                        "no lsm2 masker lattice in the bundle (collected before the installer read it): \
+                         no masking credit, the velocity limit stays at VelocityLimit0; collect the tuning again on macOS",
+                    );
+                }
+                None
+            }
+        };
+
         Ok(Tuning {
             aid: b.manifest.aid.clone(),
             acoustic_id: b.manifest.acoustic_id,
@@ -486,6 +516,8 @@ impl Tuning {
                 property_files,
             },
             spts,
+            mask_lattice_present: mask_lattice.is_some(),
+            mask_lattice,
             graph,
         })
     }

@@ -341,6 +341,21 @@ pub fn spp3_files(channels: usize) -> BTreeMap<String, Vec<u8>> {
     f
 }
 
+/// Bundle path of the installer's lsm2 masker lattice.
+pub const LATTICE: &str = "lsm2-mask-lattice.bin";
+
+/// A synthetic lsm2 masker lattice (not the macOS one): the 64 single bins,
+/// then 36 evenly widening ends up to 321, as 100 little-endian u64.
+pub fn synthetic_lattice_ends() -> Vec<u64> {
+    let mut e: Vec<u64> = (1..=64).collect();
+    e.extend((0..36u64).map(|j| 64 + ((j + 1) * 257).div_ceil(36)));
+    e
+}
+
+pub fn lattice_bytes(ends: &[u64]) -> Vec<u8> {
+    ends.iter().flat_map(|e| e.to_le_bytes()).collect()
+}
+
 pub fn manifest_json(files: &BTreeMap<String, Vec<u8>>, build: &str) -> String {
     manifest_json_with(files, build, None)
 }
@@ -349,15 +364,26 @@ pub fn manifest_json(files: &BTreeMap<String, Vec<u8>>, build: &str) -> String {
 pub fn manifest_json_with(files: &BTreeMap<String, Vec<u8>>, build: &str, speaker_id: Option<u32>) -> String {
     let rec = |p: &str, d: &[u8]| format!(r#"{{"path":"{p}","bytes":{},"sha256":"{}"}}"#, d.len(), sha256_hex(d));
     let spts = files.get("speaker-thiele-small.bin").map(|d| rec("speaker-thiele-small.bin", d));
-    let list: Vec<String> =
-        files.iter().filter(|(p, _)| *p != "speaker-thiele-small.bin").map(|(p, d)| rec(p, d)).collect();
+    // The installer's lsm2 masker lattice record, when the files hold one.
+    let lattice = files.get(LATTICE).map_or(String::new(), |d| {
+        format!(
+            r#","lsm2_mask_lattice":{{"path":"{LATTICE}","bytes":{},"sha256":"{}","version":1,"format":"u64le-exclusive-ends","entries":100}}"#,
+            d.len(),
+            sha256_hex(d)
+        )
+    });
+    let list: Vec<String> = files
+        .iter()
+        .filter(|(p, _)| *p != "speaker-thiele-small.bin" && *p != LATTICE)
+        .map(|(p, d)| rec(p, d))
+        .collect();
     let count = files.keys().filter(|p| p.starts_with(&format!("{AID}/"))).count();
     let spid = speaker_id.map_or(String::new(), |v| format!(r#","speaker_id":{v}"#));
     format!(
         r#"{{"schema":2,"kind":"aurora-audio-tuning","source_file_count":{count},"complete":true,
 "acoustic_id":{ACOUSTIC_ID},"aid":"{AID}","macos_build":"{build}",
 "speaker_thiele_small":{},"device_dsp_database":"DeviceDSPDatabase.plist","config":"Config/{AID}.plist",
-"files":[{}],"based_on":"test"{spid}}}"#,
+"files":[{}],"based_on":"test"{spid}{lattice}}}"#,
         spts.unwrap_or_else(|| "null".into()),
         list.join(",")
     )
