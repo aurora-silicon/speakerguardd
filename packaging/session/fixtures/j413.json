@@ -1,5 +1,5 @@
 {
- "note": "MacBook Air 13-inch (M2, J413): device tree as booted (Linux DT, public); tuning lanes: the structure of the graph's input lanes only, with generic box names and no tuning values.",
+ "note": "MacBook Air 13-inch (M2, J413): device tree as booted (Linux DT, public); tuning lanes: the structure of the graph's input lanes only, with generic box names and no tuning values. The hardware half is wiring.py's reading of arch/arm64/boot/dts/apple/t8112-j413.dts (aurora-silicon/linux integration/aurora), with the I2C bindings of the booted Mac.",
  "hw": {
   "board": "j413",
   "compatible": [
@@ -8,11 +8,25 @@
    "apple,arm-platform"
   ],
   "sound": "sound",
+  "sound_compatible": [
+   "apple,j413-macaudio",
+   "apple,macaudio"
+  ],
   "model": "MacBook Air J413",
   "links": [
    {
     "name": "Speakers",
     "cpus": 2,
+    "cpu_compatible": [
+     [
+      "apple,t8112-mca",
+      "apple,mca"
+     ],
+     [
+      "apple,t8112-mca",
+      "apple,mca"
+     ]
+    ],
     "codecs": [
      {
       "node": "soc/i2c@235014000/codec@38",
@@ -63,6 +77,12 @@
    {
     "name": "Headphone Jack",
     "cpus": 1,
+    "cpu_compatible": [
+     [
+      "apple,t8112-mca",
+      "apple,mca"
+     ]
+    ],
     "codecs": [
      {
       "node": "soc/i2c@23501c000/codec@4b",

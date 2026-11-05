@@ -1,5 +1,5 @@
 {
- "note": "MacBook Pro 16-inch (M1 Pro/Max, J316s): device tree as booted (Linux DT, public); tuning lanes: the structure of the graph's input lanes only (side and crossover branch per unit channel), with generic box names and no tuning values.",
+ "note": "MacBook Pro 16-inch (M1 Pro/Max, J316s): device tree as booted (Linux DT, public); tuning lanes: the structure of the graph's input lanes only (side and crossover branch per unit channel), with generic box names and no tuning values. The hardware half is wiring.py's reading of arch/arm64/boot/dts/apple/t6000-j316s.dts (aurora-silicon/linux integration/aurora), with the I2C bindings of the booted Mac.",
  "hw": {
   "board": "j316s",
   "compatible": [
@@ -8,11 +8,25 @@
    "apple,arm-platform"
   ],
   "sound": "sound",
+  "sound_compatible": [
+   "apple,j316-macaudio",
+   "apple,macaudio"
+  ],
   "model": "MacBook Pro J316",
   "links": [
    {
     "name": "Speakers",
     "cpus": 2,
+    "cpu_compatible": [
+     [
+      "apple,t6000-mca",
+      "apple,mca"
+     ],
+     [
+      "apple,t6000-mca",
+      "apple,mca"
+     ]
+    ],
     "codecs": [
      {
       "node": "soc/i2c@39b044000/codec@38",
@@ -85,6 +99,12 @@
    {
     "name": "Headphone Jack",
     "cpus": 1,
+    "cpu_compatible": [
+     [
+      "apple,t6000-mca",
+      "apple,mca"
+     ]
+    ],
     "codecs": [
      {
       "node": "soc/i2c@39b048000/codec@4b",

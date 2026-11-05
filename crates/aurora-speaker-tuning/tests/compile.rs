@@ -222,10 +222,19 @@ fn compile_refuses_what_the_engine_must_not_run() {
 #[test]
 fn compile_binds_to_the_machine() {
     let t = tuning(&spp3_files(4), "c-machine");
-    // Another board's amp count, an unknown board, a board too long.
-    assert!(comp::compile(&t, &Machine::new("j616s").unwrap(), &mut Diagnostics::default()).is_err());
-    assert!(comp::compile(&t, &Machine::new("j274").unwrap(), &mut Diagnostics::default()).is_err());
-    assert!(Machine::new("j616s-too-long").is_err());
+    // No table of boards: any board that fits the header compiles, and the
+    // header names it (the amp count is the running Mac's to check).
+    for b in ["t4", "t999x"] {
+        let c = comp::compile(&t, &Machine::new(b).unwrap(), &mut Diagnostics::default()).unwrap();
+        assert_eq!(c.board, b);
+        assert_eq!(sgv2_core::blob::Header::parse(&c.blob).unwrap().0.machine(), Some(b));
+    }
+    // The board is all that differs.
+    let a = comp::compile(&t, &Machine::new("t4").unwrap(), &mut Diagnostics::default()).unwrap();
+    let b = comp::compile(&t, &Machine::new("t999x").unwrap(), &mut Diagnostics::default()).unwrap();
+    assert_eq!(a.blob.len(), b.blob.len());
+    assert!(a.blob[sgv2_core::blob::HEADER_LEN..] == b.blob[sgv2_core::blob::HEADER_LEN..]);
+    assert!(Machine::new("t4-too-long-board").is_err());
     // A known acoustic-id must match the bundle's.
     let mut m = j413();
     m.acoustic_id = Some(ACOUSTIC_ID + 1);
@@ -396,8 +405,8 @@ fn lsm2_channels_keep_their_own_full_scale_within_one_operating_point() {
 
 #[test]
 fn spp3_operating_point_is_the_peak_ag() {
-    // A tuning whose ag disagrees with the amp setting still compiles from
-    // its own ag, with a warning that the supervisor will not grant.
+    // The operating point is the tuning's own ag; the supervisor checks it
+    // against the amps' gain on the running card.
     let mut f = spp3_files(4);
     let mut v = sidecar_value(4);
     if let Value::Dict(d) = &mut v {
@@ -416,7 +425,6 @@ fn spp3_operating_point_is_the_peak_ag() {
     let mut d = Diagnostics::default();
     let c = compile(&t, &mut d).unwrap();
     assert_eq!(c.full_scale_mv, 9500);
-    assert!(d.items.iter().any(|x| x.code == "compile-full-scale"), "{:?}", d.items);
 }
 
 #[test]

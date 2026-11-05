@@ -52,7 +52,10 @@ pub struct Expect {
     /// The blob's operating point, per channel: output peak volts at full
     /// scale, mV (see `machine::blob_full_scales`).
     pub full_scale_mv: Vec<u32>,
-    /// For amps without a gain control, the chip's own full scale.
+    /// For amps without a gain control, the operating point the card is
+    /// held to: the blob's smallest channel full scale. The amp's gain is a
+    /// strap no software can read, so the tuning's own value is the only
+    /// source, and the check is that every channel shares it.
     pub fixed_full_scale_mv: u32,
     /// The front-end the speaker mux must select: the watched PCM's id.
     pub route: String,
@@ -60,13 +63,9 @@ pub struct Expect {
 
 impl Expect {
     pub fn new(machine: &Machine, full_scale_mv: Vec<u32>, route: &str) -> Self {
-        Expect {
-            amps: machine.amps,
-            amp: machine.amp,
-            full_scale_mv,
-            fixed_full_scale_mv: machine.fixed_full_scale_mv,
-            route: route.to_owned(),
-        }
+        let fixed_full_scale_mv =
+            if machine.amp.has_gain_control() { 0 } else { full_scale_mv.iter().copied().min().unwrap_or(0) };
+        Expect { amps: machine.amps, amp: machine.amp, full_scale_mv, fixed_full_scale_mv, route: route.to_owned() }
     }
 }
 
@@ -201,7 +200,14 @@ impl Supervisor {
 mod tests {
     use super::*;
     use crate::kernel::{AmpFault, AmpLevel, Recorder};
-    use crate::machine::lookup;
+
+    /// Synthetic machines: six SN012776 amps, and a two-amp MAX98360A pair.
+    fn sn6() -> &'static Machine {
+        &Machine { board: "t6s", card_id: "AppleT6", amps: 6, amp: Amp::Sn012776 }
+    }
+    fn fixed2() -> &'static Machine {
+        &Machine { board: "t2", card_id: "AppleT2", amps: 2, amp: Amp::Max98360a }
+    }
 
     /// Clean as far as the observer can tell: it never vouches for the
     /// kernel-side checks.
@@ -218,7 +224,7 @@ mod tests {
 
     /// The J316 with a blob for gain 15 (18.5 dBV, 11.89 V peak).
     fn j316() -> Supervisor {
-        Supervisor::new(Expect::new(lookup("j316s").unwrap(), vec![11_890; 6], "Secondary"))
+        Supervisor::new(Expect::new(sn6(), vec![11_890; 6], "Secondary"))
     }
 
     #[test]
@@ -299,7 +305,7 @@ mod tests {
 
     #[test]
     fn the_neo_has_no_fault_controls_and_a_fixed_full_scale() {
-        let neo = lookup("j700").unwrap();
+        let neo = fixed2();
         let neo_card = || {
             let mut k = Recorder::healthy(2);
             k.amp_faults.clear();
@@ -312,7 +318,7 @@ mod tests {
         s.tick(CLEAN, &mut k).unwrap();
         assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Granted));
         assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Renewed));
-        // a blob for another operating point is refused
+        // a blob whose channels are not one operating point is refused
         let mut k = neo_card();
         let mut s = Supervisor::new(Expect::new(neo, vec![7_300, 6_000], "Secondary"));
         for _ in 0..4 {
@@ -376,7 +382,7 @@ mod tests {
         assert_eq!(k.renewals, 0);
         // a blob that states no operating point is refused too
         let mut k = Recorder::healthy(6);
-        let mut s = Supervisor::new(Expect::new(lookup("j316s").unwrap(), vec![0; 6], "Secondary"));
+        let mut s = Supervisor::new(Expect::new(sn6(), vec![0; 6], "Secondary"));
         for _ in 0..3 {
             assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::StayedReleased));
         }

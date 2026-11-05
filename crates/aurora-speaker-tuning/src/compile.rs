@@ -14,10 +14,12 @@
 //! **Refusal.** [`compile`] returns `Err`, and no blob, for any tuning a
 //! protection engine must not run: a finding of error severity from
 //! [`Tuning::load`] (a bypassed unit, a channel-count mismatch, a unit
-//! mismatch, ...), an unverified bundle, a machine the bundle or the
-//! description does not match, a channel count other than the machine's
-//! amp count, or parameters the engine itself would answer with the
-//! fail-safe.  Callers cannot get an unsafe blob by ignoring diagnostics.
+//! mismatch, ...), an unverified bundle, a machine the bundle does not
+//! match, channels that are not one operating point, or parameters the
+//! engine itself would answer with the fail-safe.  Callers cannot get an
+//! unsafe blob by ignoring diagnostics.  The compiler has no table of
+//! boards: the amp count and gain are the running Mac's, checked by the
+//! self-check and the supervisor (see [`crate::machine`]).
 //!
 //! **Header.** The blob names the board and the amps' operating point
 //! (`sgv2_core::blob::build_for`, header bytes 36 to 48), which the
@@ -56,7 +58,7 @@
 //! which [`crate::tuning::Protection::lanes`] records.
 
 use crate::error::{Diagnostics, Error, Result};
-use crate::machine::{Description, Machine};
+use crate::machine::Machine;
 use crate::names::{SCOPE_GLOBAL, SCOPE_PART};
 use crate::strip::PropValue;
 use crate::tuning::{Tuning, UnitKind};
@@ -84,7 +86,7 @@ pub enum Provenance {
 /// What the blob header carries, checked before any payload is built.
 struct Bound {
     machine: [u8; MACHINE_LEN],
-    description: &'static Description,
+    board: String,
 }
 
 fn preflight(t: &Tuning, m: &Machine, provenance: Provenance, diags: &mut Diagnostics) -> Result<Bound> {
@@ -110,12 +112,7 @@ fn preflight(t: &Tuning, m: &Machine, provenance: Provenance, diags: &mut Diagno
         }
     }
     let machine = machine_field(&m.board).ok_or_else(|| bad(format!("board {:?} does not fit the header", m.board)))?;
-    let description = m.description().ok_or_else(|| bad(format!("no machine description for board {}", m.board)))?;
-    let n = t.protection.lanes.len();
-    if n != description.amps {
-        return Err(bad(format!("the unit has {n} channels, the {} has {} amps", m.board, description.amps)));
-    }
-    Ok(Bound { machine, description })
+    Ok(Bound { machine, board: m.board.clone() })
 }
 
 /// Hundredths of a dB between two voltages.
@@ -131,10 +128,9 @@ pub const OPERATING_POINT_TOLERANCE_DB: f64 = 0.25;
 /// sensitivity`; Daybreak t-4662: all peak volts at a normalized sample of
 /// 1).  The header holds one value: the first channel's.  The payload keeps
 /// every channel's own value; they must all lie within one operating point
-/// of the header's (the J700's 7.30/7.33 V do, 0.036 dB apart), or the amps
-/// cannot share the gain the supervisor checks.  The machine description's
-/// amp gain is a cross-check, reported when it disagrees.
-fn operating_point(what: &str, volts: &[f32], d: &Description, diags: &mut Diagnostics) -> Result<u32> {
+/// of the header's (two channels 0.036 dB apart do), or the amps cannot
+/// share the gain the supervisor checks against the card.
+fn operating_point(what: &str, volts: &[f32]) -> Result<u32> {
     let first = *volts.first().ok_or_else(|| bad(format!("no {what}")))?;
     if !volts.iter().all(|v| v.is_finite() && *v > 0.0) {
         return Err(bad(format!("{what} {volts:?} is not a positive voltage on every channel")));
@@ -147,18 +143,6 @@ fn operating_point(what: &str, volts: &[f32], d: &Description, diags: &mut Diagn
                 "channel {c} {what} {v} V is {off:+.3} dB from channel 0's: not one operating point"
             )));
         }
-    }
-    let machine = f64::from(d.full_scale_mv());
-    let off = centi_db(mv, machine) / 100.0;
-    if off.abs() > OPERATING_POINT_TOLERANCE_DB {
-        diags.warn(
-            "compile-full-scale",
-            "compile",
-            format!(
-                "{what} gives {mv} mV peak, the {} amp setting {machine} mV ({off:+.2} dB): the supervisor will not grant",
-                d.board
-            ),
-        );
     }
     Ok(mv as u32)
 }
@@ -209,7 +193,7 @@ pub fn compile_with(t: &Tuning, m: &Machine, provenance: Provenance, diags: &mut
     match t.protection.kind {
         UnitKind::Spp3 => compile_spp3(t, &b, diags),
         UnitKind::Lsm2 => compile_lsm2(t, &b, diags),
-        UnitKind::Atsp => compile_atsp(t, &b, diags),
+        UnitKind::Atsp => compile_atsp(t, &b),
     }
 }
 
@@ -359,7 +343,7 @@ fn compile_spp3(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
     // `ag` is the amp's peak volts at digital full scale (SPEC-SPP3 section
     // 4; Daybreak t-4662).
     let ag: Vec<f32> = p.ch[..n].iter().map(|c| c.ag).collect();
-    let full_scale_mv = operating_point("ag", &ag, b.description, diags)?;
+    let full_scale_mv = operating_point("ag", &ag)?;
     let blob =
         build_for(sgv2_core::UnitKind::Spp3, p.channels, sense, p.sample_rate, b.machine, full_scale_mv, p.as_bytes());
     spp3::Params::from_blob(&blob).map_err(|e| bad(format!("the engine rejects the compiled blob: {e:?}")))?;
@@ -371,7 +355,7 @@ fn compile_spp3(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
         channels: p.channels,
         sense_channels: sense,
         sample_rate: p.sample_rate,
-        board: b.description.board.to_string(),
+        board: b.board.clone(),
         full_scale_mv,
         blob,
     })
@@ -579,7 +563,7 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
         | ((get(id::amp0(id::A_USE_BATTERY))? != 0.0) as u32) << 2;
     // VoltsFullScale is peak volts (KERNEL.md 2.3; Daybreak t-4662).
     let vfs: Vec<f32> = p.ch[..n].iter().map(|c| c.volts_full_scale).collect();
-    let full_scale_mv = operating_point("VoltsFullScale", &vfs, b.description, diags)?;
+    let full_scale_mv = operating_point("VoltsFullScale", &vfs)?;
     let blob =
         build_for(sgv2_core::UnitKind::Lsm2, p.channels, 0, p.sample_rate, b.machine, full_scale_mv, p.as_bytes());
     lsm2::Params::from_blob(&blob).map_err(|e| bad(format!("the engine rejects the compiled blob: {e:?}")))?;
@@ -591,7 +575,7 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
         channels: p.channels,
         sense_channels: 0,
         sample_rate: p.sample_rate,
-        board: b.description.board.to_string(),
+        board: b.board.clone(),
         full_scale_mv,
         blob,
     })
@@ -653,7 +637,7 @@ fn pressure_response(t: &Tuning, c: usize, diags: &mut Diagnostics) -> Option<[f
 
 // ------------------------------------------------------------------ atsp
 
-fn compile_atsp(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compiled> {
+fn compile_atsp(t: &Tuning, b: &Bound) -> Result<Compiled> {
     let n = channels(t)?;
     let rate = sample_rate(t)?;
     // A graph without a reblocker runs the unit on the host's block: 0.
@@ -696,7 +680,7 @@ fn compile_atsp(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
     }
     // `Amplifier sensitivity [V/Fs]` of each slot that drives a channel.
     let sens: Vec<f32> = p.slot.iter().filter(|s| s.channel_mask != 0).map(|s| s.amplifier_sensitivity).collect();
-    let full_scale_mv = operating_point("Amplifier sensitivity", &sens, b.description, diags)?;
+    let full_scale_mv = operating_point("Amplifier sensitivity", &sens)?;
     let blob =
         build_for(sgv2_core::UnitKind::Atsp, p.channels, 0, p.sample_rate, b.machine, full_scale_mv, p.as_bytes());
     atsp::Params::from_blob(&blob).map_err(|e| bad(format!("the engine rejects the compiled blob: {e:?}")))?;
@@ -708,7 +692,7 @@ fn compile_atsp(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
         channels: p.channels,
         sense_channels: 0,
         sample_rate: p.sample_rate,
-        board: b.description.board.to_string(),
+        board: b.board.clone(),
         full_scale_mv,
         blob,
     })
