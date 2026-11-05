@@ -934,12 +934,49 @@ fn plausibility_guard_passes_a_heating_coil() {
 
 #[test]
 fn plausibility_guard_trips_on_a_coil_far_below_its_calibration() {
-    // a constant reading 25 K below T_cal under drive
+    // a constant reading 35 K below T_cal (-10 C) under drive: past the
+    // margin below the tuning's coldest valid coil temperature (10 C)
     let p = cl_params(4.0, 25.0);
     let mut u = spp3::Unit::new(p);
     let n = 48_000 * 6;
     let alpha = 0.004 + (25.0 - 20.0) * (0.0038 - 0.004) / 15.0;
-    let tele = pilot_sense_r(|_| 0.2 + 3.8 * (1.0 - alpha * 25.0), n);
+    let tele = pilot_sense_r(|_| 0.2 + 3.8 * (1.0 - alpha * 35.0), n);
+    run_cl(&mut u, 0.3, &tele, 0, n);
+    assert!(u.sense_implausible(0));
+}
+
+/// The M2 tweeter shape (11-05 live run): calibrated warm (about 31 C), the
+/// model's ambient above that (50 C), and a cold start in a cooler room
+/// reading about 16 C, 15 K below T_cal. An honest coil: no trip. The old
+/// bound, min(T_cal, ambient) - 10 K = 21 C, tripped it within 2 s of the
+/// pilot starting.
+#[test]
+fn plausibility_guard_allows_a_cold_start_below_a_warm_calibration() {
+    let mut p = cl_params(4.0, 31.0);
+    p.thermal_ambient_temp = 50.0;
+    let mut u = spp3::Unit::new(p);
+    let n = 48_000 * 6;
+    let alpha = 0.004 + (31.0 - 20.0) * (0.0038 - 0.004) / 15.0;
+    let tele = pilot_sense_r(|_| 0.2 + 3.8 * (1.0 - alpha * 15.0), n);
+    let t = run_cl(&mut u, 0.3, &tele, 0, n);
+    assert!(t.channels[0].cl_temp_c < 21.0, "the reading is below the old bound: {}", t.channels[0].cl_temp_c);
+    assert!(!u.sense_implausible(0), "T_OL {} T_CL {}", t.channels[0].ol_temp_c, t.channels[0].cl_temp_c);
+    assert_eq!(t.health.0 & Health::SENSE_IMPLAUSIBLE, 0);
+}
+
+/// The bound follows the tuning's own CalTempRangeMin: the same reading
+/// trips once the tuning says no coil is valid that cold.
+#[test]
+fn plausibility_guard_bound_follows_cal_temp_range_min() {
+    let mut p = cl_params(4.0, 31.0);
+    p.thermal_ambient_temp = 50.0;
+    for c in 0..4 {
+        p.ch[c].cal_temp_range_min = 28.0;
+    }
+    let mut u = spp3::Unit::new(p);
+    let n = 48_000 * 6;
+    let alpha = 0.004 + (31.0 - 20.0) * (0.0038 - 0.004) / 15.0;
+    let tele = pilot_sense_r(|_| 0.2 + 3.8 * (1.0 - alpha * 15.0), n);
     run_cl(&mut u, 0.3, &tele, 0, n);
     assert!(u.sense_implausible(0));
 }
