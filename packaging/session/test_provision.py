@@ -445,6 +445,10 @@ class Units(unittest.TestCase):
         self.assertIn("ExecCondition=/usr/libexec/speakerguardd/speakerguardd-gate legacy", self.unit("legacy-gate.conf"))
         for u in (sup, chk, prv):
             self.assertFalse([l for l in u if l.startswith(("OnFailure=", "OnSuccess="))])
+        # A unit the gate skips must not fail first on the configuration that
+        # only provisioning writes (systemd loads it before ExecCondition=).
+        for u in (sup, chk, ses):
+            self.assertIn("EnvironmentFile=-/etc/speakerguardd/speakerguardd.conf", u)
 
 
 if __name__ == "__main__":
