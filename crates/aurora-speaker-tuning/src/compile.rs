@@ -285,13 +285,7 @@ pub fn compile_with(t: &Tuning, m: &Machine, provenance: Provenance, diags: &mut
     }?;
     // The graph's own filtering ahead of the unit (crate::prestage): no
     // blob without it.
-    let mut pre = crate::prestage::derive(t, c.sample_rate as f64, c.channels as usize, diags)?;
-    if t.protection.kind == UnitKind::Spp3 && crate::prestage::excursion_cap_interim(&c.board) {
-        let sidecar = t.protection.spp3.as_ref().ok_or_else(|| {
-            bad(format!("{} gets the interim excursion cap, which needs the spp3 sidecar's excursion model", c.board))
-        })?;
-        crate::prestage::add_excursion_cap(&mut pre, sidecar, c.sample_rate as f64, diags)?;
-    }
+    let pre = crate::prestage::derive(t, c.sample_rate as f64, c.channels as usize, diags)?;
     c.blob = sgv2_core::blob::with_prestage(&c.blob, &pre)
         .map_err(|e| bad(format!("the pre-stage does not fit the blob: {e:?}")))?;
     sgv2_core::blob::prestage(&c.blob, c.sample_rate as f64)

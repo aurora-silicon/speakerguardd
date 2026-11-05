@@ -26,6 +26,25 @@
 //! ```
 //!
 //! Each section is `H(z) = (b0 + b1 z^-1 + b2 z^-2) / (1 + a1 z^-1 + a2 z^-2)`.
+//!
+//! With [`FLAG_DYNAMICS`], a dynamics block follows the channels: the
+//! graph's multiband compressor ahead of the unit, as the tuning sets it
+//! ([`Dynamics`]), run on every channel after its filters. Layout, f64:
+//! crossovers (3), input gain dB, output gain dB, release s, then per band
+//! (4) threshold dB, ratio, range dB, makeup dB, mode (0 compress, 1 pass,
+//! 2 mute).
+//!
+//! The compressor: a four-band Linkwitz-Riley tree (fourth order, with the
+//! second-order allpass compensation that keeps every band in phase, so the
+//! bands sum to an allpass); per band, the louder channel's power, held
+//! with an instant attack and the tuning's release; the tuning's
+//! downward curve (threshold, ratio, range, makeup) on that level; output
+//! `out_gain + trim` times the sum of the band gains times the bands of
+//! `in_gain` times the input. `trim` takes off the largest small-signal
+//! gain, so the dynamics never add drive at any level or frequency. Its
+//! detector is stricter than macOS's (instant attack, the band's peak power,
+//! a hard knee at or below macOS's soft one at high level): it never
+//! reduces less at full scale.
 
 use crate::blob::{crc32, BlobError};
 use crate::MAX_CHANNELS;
@@ -38,6 +57,121 @@ pub const MAX_SECTIONS: usize = 64;
 /// (its high-pass and crossover included). The supervisor tells the kernel
 /// so, and only then does the kernel open the tweeters' amp high-pass.
 pub const FLAG_FROM_TUNING: u32 = 1 << 0;
+/// `flags` bit: a [`Dynamics`] block follows the channels.
+pub const FLAG_DYNAMICS: u32 = 1 << 1;
+/// Bands of the multiband dynamics.
+pub const BANDS: usize = 4;
+const DYN_WORDS: usize = 6 + 5 * BANDS;
+
+/// How one band of the dynamics treats its signal.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u32)]
+pub enum BandMode {
+    #[default]
+    Compress = 0,
+    /// Unity gain, no compression.
+    Pass = 1,
+    Mute = 2,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Band {
+    pub threshold_db: f64,
+    pub ratio: f64,
+    /// The deepest reduction, dB (0 or below).
+    pub range_db: f64,
+    pub makeup_db: f64,
+    pub mode: BandMode,
+}
+
+/// The graph's multiband compressor ahead of the unit, as the tuning sets it.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Dynamics {
+    pub crossover_hz: [f64; BANDS - 1],
+    pub input_gain_db: f64,
+    pub output_gain_db: f64,
+    pub release_s: f64,
+    pub band: [Band; BANDS],
+}
+
+impl Dynamics {
+    fn valid(&self, fs: f64) -> bool {
+        let x = self.crossover_hz;
+        let finite = |v: f64, lo: f64, hi: f64| v.is_finite() && v >= lo && v <= hi;
+        x[0] > 0.0
+            && x[0] < x[1]
+            && x[1] < x[2]
+            && x[2] < 0.49 * fs
+            && finite(self.input_gain_db, -40.0, 40.0)
+            && finite(self.output_gain_db, -40.0, 40.0)
+            && finite(self.release_s, 1e-4, 10.0)
+            && self.band.iter().all(|b| {
+                finite(b.threshold_db, -120.0, 0.0)
+                    && finite(b.ratio, 1.0, 100.0)
+                    && finite(b.range_db, -60.0, 0.0)
+                    && finite(b.makeup_db, -40.0, 40.0)
+            })
+    }
+
+    /// The small-signal gain of band `b`, dB (`None`: muted).
+    fn rest_db(&self, b: usize) -> Option<f64> {
+        match self.band[b].mode {
+            BandMode::Compress => Some(self.band[b].makeup_db),
+            BandMode::Pass => Some(0.0),
+            BandMode::Mute => None,
+        }
+    }
+
+    /// The trim that keeps the dynamics at or below unity: minus the
+    /// largest small-signal gain through input, band and output gains.
+    pub fn trim_db(&self) -> f64 {
+        let top = (0..BANDS).filter_map(|b| self.rest_db(b)).fold(f64::NEG_INFINITY, f64::max);
+        if top.is_finite() {
+            -(self.input_gain_db + self.output_gain_db + top)
+        } else {
+            0.0
+        }
+    }
+
+    #[cfg(any(test, feature = "std"))]
+    fn words(&self) -> [f64; DYN_WORDS] {
+        let mut w = [0.0; DYN_WORDS];
+        w[..3].copy_from_slice(&self.crossover_hz);
+        w[3] = self.input_gain_db;
+        w[4] = self.output_gain_db;
+        w[5] = self.release_s;
+        for (i, b) in self.band.iter().enumerate() {
+            let o = 6 + 5 * i;
+            w[o..o + 5].copy_from_slice(&[b.threshold_db, b.ratio, b.range_db, b.makeup_db, b.mode as u32 as f64]);
+        }
+        w
+    }
+
+    fn from_words(w: &[f64; DYN_WORDS]) -> Option<Dynamics> {
+        let mut d = Dynamics {
+            crossover_hz: [w[0], w[1], w[2]],
+            input_gain_db: w[3],
+            output_gain_db: w[4],
+            release_s: w[5],
+            ..Default::default()
+        };
+        for (i, b) in d.band.iter_mut().enumerate() {
+            let o = 6 + 5 * i;
+            let m = w[o + 4];
+            let mode = if m == 0.0 {
+                BandMode::Compress
+            } else if m == 1.0 {
+                BandMode::Pass
+            } else if m == 2.0 {
+                BandMode::Mute
+            } else {
+                return None;
+            };
+            *b = Band { threshold_db: w[o], ratio: w[o + 1], range_db: w[o + 2], makeup_db: w[o + 3], mode };
+        }
+        Some(d)
+    }
+}
 /// Largest response the plugin accepts on its check grid (rounding only).
 pub const UNITY_TOLERANCE: f64 = 1.0 + 1e-9;
 /// What the filters see at most: far above any program, it keeps the
@@ -124,12 +258,19 @@ pub struct Params {
     pub channels: usize,
     pub flags: u32,
     pub channel: [Channel; MAX_CHANNELS],
+    /// Present exactly when `flags` has [`FLAG_DYNAMICS`].
+    pub dynamics: Option<Dynamics>,
 }
 
 impl Params {
     /// Every channel passes unchanged; nothing derived from a tuning.
     pub fn identity(channels: usize) -> Params {
-        Params { channels: channels.min(MAX_CHANNELS), flags: 0, channel: [Channel::IDENTITY; MAX_CHANNELS] }
+        Params {
+            channels: channels.min(MAX_CHANNELS),
+            flags: 0,
+            channel: [Channel::IDENTITY; MAX_CHANNELS],
+            dynamics: None,
+        }
     }
 
     pub fn from_tuning(&self) -> bool {
@@ -150,8 +291,15 @@ impl Params {
                 }
             }
         }
+        let mut flags = self.flags & !FLAG_DYNAMICS;
+        if let Some(d) = &self.dynamics {
+            flags |= FLAG_DYNAMICS;
+            for v in d.words() {
+                body.extend_from_slice(&v.to_le_bytes());
+            }
+        }
         let mut out = MAGIC.to_vec();
-        for v in [self.channels as u32, self.flags, body.len() as u32, crc32(&body)] {
+        for v in [self.channels as u32, flags, body.len() as u32, crc32(&body)] {
             out.extend_from_slice(&v.to_le_bytes());
         }
         out.extend_from_slice(&body);
@@ -181,7 +329,7 @@ impl Params {
         if crc32(body) != crc {
             return Err(BlobError::Crc);
         }
-        let mut p = Params { channels: n, flags, channel: [Channel::IDENTITY; MAX_CHANNELS] };
+        let mut p = Params { channels: n, flags, channel: [Channel::IDENTITY; MAX_CHANNELS], dynamics: None };
         let f64_at = |i: usize| -> Result<f64, BlobError> {
             let b: [u8; 8] = body.get(i..i + 8).ok_or(BlobError::Length)?.try_into().map_err(|_| BlobError::Length)?;
             Ok(f64::from_le_bytes(b))
@@ -215,6 +363,21 @@ impl Params {
                 return Err(BlobError::Unstable);
             }
         }
+        if flags & FLAG_DYNAMICS != 0 {
+            let mut w = [0.0; DYN_WORDS];
+            for (k, v) in w.iter_mut().enumerate() {
+                *v = f64_at(at + 8 * k)?;
+            }
+            at += 8 * DYN_WORDS;
+            let d = Dynamics::from_words(&w).ok_or(BlobError::Length)?;
+            if !d.valid(fs) {
+                return Err(BlobError::Unstable);
+            }
+            p.dynamics = Some(d);
+        }
+        if flags & !(FLAG_FROM_TUNING | FLAG_DYNAMICS) != 0 {
+            return Err(BlobError::Length);
+        }
         if at != body.len() {
             return Err(BlobError::Length);
         }
@@ -222,24 +385,180 @@ impl Params {
     }
 }
 
+/// Sections of the dynamics' band tree, per channel.
+const TREE: usize = 15;
+
+fn butter2(high: bool, fc: f64, fs: f64) -> Section {
+    let k = libm::tan(core::f64::consts::PI * fc / fs);
+    let r2 = core::f64::consts::SQRT_2;
+    let n = 1.0 / (1.0 + r2 * k + k * k);
+    let (a1, a2) = (2.0 * (k * k - 1.0) * n, (1.0 - r2 * k + k * k) * n);
+    if high {
+        Section { b0: n, b1: -2.0 * n, b2: n, a1, a2 }
+    } else {
+        Section { b0: k * k * n, b1: 2.0 * k * k * n, b2: k * k * n, a1, a2 }
+    }
+}
+
+/// The allpass a fourth-order Linkwitz-Riley pair sums to.
+fn allpass2(fc: f64, fs: f64) -> Section {
+    let s = butter2(false, fc, fs);
+    Section { b0: s.a2, b1: s.a1, b2: 1.0, a1: s.a1, a2: s.a2 }
+}
+
+struct DynRun {
+    tree: [Section; TREE],
+    in_gain: f64,
+    out_scale: f64,
+    release: f64,
+    band: [Band; BANDS],
+    env: [f64; BANDS],
+    state: [[[f64; 2]; TREE]; MAX_CHANNELS],
+}
+
+impl DynRun {
+    fn new(d: &Dynamics, fs: f64) -> DynRun {
+        let [f0, f1, f2] = d.crossover_hz;
+        let (lp0, hp0, lp1, hp1, lp2, hp2) = (
+            butter2(false, f0, fs),
+            butter2(true, f0, fs),
+            butter2(false, f1, fs),
+            butter2(true, f1, fs),
+            butter2(false, f2, fs),
+            butter2(true, f2, fs),
+        );
+        let (ap1, ap2) = (allpass2(f1, fs), allpass2(f2, fs));
+        DynRun {
+            tree: [lp0, lp0, hp0, hp0, ap1, ap2, lp1, lp1, hp1, hp1, ap2, lp2, lp2, hp2, hp2],
+            in_gain: libm::pow(10.0, d.input_gain_db / 20.0),
+            out_scale: libm::pow(10.0, (d.output_gain_db + d.trim_db()) / 20.0),
+            release: libm::exp(-1.0 / (d.release_s * fs)),
+            band: d.band,
+            env: [0.0; BANDS],
+            state: [[[0.0; 2]; TREE]; MAX_CHANNELS],
+        }
+    }
+
+    fn reset(&mut self) {
+        self.env = [0.0; BANDS];
+        self.state = [[[0.0; 2]; TREE]; MAX_CHANNELS];
+    }
+
+    #[inline]
+    fn step(s: &Section, z: &mut [f64; 2], v: f64) -> f64 {
+        let o = s.b0 * v + z[0];
+        z[0] = s.b1 * v - s.a1 * o + z[1];
+        z[1] = s.b2 * v - s.a2 * o;
+        o
+    }
+
+    /// The four bands of one sample of channel `c`.
+    fn split(&mut self, c: usize, x: f64) -> [f64; BANDS] {
+        let (t, z) = (&self.tree, &mut self.state[c]);
+        let mut lo = Self::step(&t[0], &mut z[0], x);
+        lo = Self::step(&t[1], &mut z[1], lo);
+        let mut hi = Self::step(&t[2], &mut z[2], x);
+        hi = Self::step(&t[3], &mut z[3], hi);
+        let lo_ap = Self::step(&t[4], &mut z[4], lo);
+        let b0 = Self::step(&t[5], &mut z[5], lo_ap);
+        let mut mid = Self::step(&t[6], &mut z[6], hi);
+        mid = Self::step(&t[7], &mut z[7], mid);
+        let mut hh = Self::step(&t[8], &mut z[8], hi);
+        hh = Self::step(&t[9], &mut z[9], hh);
+        let b1 = Self::step(&t[10], &mut z[10], mid);
+        let mut b2 = Self::step(&t[11], &mut z[11], hh);
+        b2 = Self::step(&t[12], &mut z[12], b2);
+        let mut b3 = Self::step(&t[13], &mut z[13], hh);
+        b3 = Self::step(&t[14], &mut z[14], b3);
+        [b0, b1, b2, b3]
+    }
+
+    fn gain(&self, b: usize) -> f64 {
+        let band = &self.band[b];
+        match band.mode {
+            BandMode::Mute => 0.0,
+            BandMode::Pass => 1.0,
+            BandMode::Compress => {
+                let level = 10.0 * libm::log10(self.env[b].max(1e-30));
+                let over = level - band.threshold_db;
+                let gr = if over > 0.0 { (1.0 / band.ratio - 1.0) * over } else { 0.0 };
+                libm::pow(10.0, (band.makeup_db + gr.max(band.range_db)) / 20.0)
+            }
+        }
+    }
+
+    fn process(&mut self, bufs: &mut [&mut [f32]], frames: usize) {
+        let n = bufs.len().min(MAX_CHANNELS);
+        let mut split = [[0.0f64; BANDS]; MAX_CHANNELS];
+        for i in 0..frames {
+            let mut power = [0.0f64; BANDS];
+            for c in 0..n {
+                let x = bufs[c].get(i).copied().unwrap_or(0.0);
+                let x = if x.is_finite() { x.clamp(-INPUT_BOUND, INPUT_BOUND) as f64 } else { 0.0 };
+                split[c] = self.split(c, self.in_gain * x);
+                for (p, v) in power.iter_mut().zip(split[c].iter()) {
+                    *p = p.max(v * v);
+                }
+            }
+            for (e, p) in self.env.iter_mut().zip(power.iter()) {
+                *e = p.max(*e * self.release);
+            }
+            let g = [self.gain(0), self.gain(1), self.gain(2), self.gain(3)];
+            for c in 0..n {
+                let y = self.out_scale * (0..BANDS).map(|b| g[b] * split[c][b]).sum::<f64>();
+                if let Some(o) = bufs[c].get_mut(i) {
+                    *o = if y.is_finite() { y as f32 } else { 0.0 };
+                }
+                if !y.is_finite() {
+                    self.state[c] = [[0.0; 2]; TREE];
+                }
+            }
+            if self.env.iter().any(|e| !e.is_finite()) {
+                self.env = [0.0; BANDS];
+            }
+        }
+    }
+}
+
 /// The running pre-stage: transposed direct form II, f64 state.
 pub struct PreStage {
     params: Params,
     state: [[[f64; 2]; MAX_SECTIONS]; MAX_CHANNELS],
+    dynamics: Option<DynRun>,
 }
 
 impl PreStage {
+    /// At 48 kHz; see [`PreStage::with_rate`].
     pub fn new(params: Params) -> PreStage {
-        PreStage { params, state: [[[0.0; 2]; MAX_SECTIONS]; MAX_CHANNELS] }
+        PreStage::with_rate(params, 48_000.0)
+    }
+
+    /// `fs`: the rate the parameters were checked for (the dynamics'
+    /// filters are built for it).
+    pub fn with_rate(params: Params, fs: f64) -> PreStage {
+        let dynamics = params.dynamics.as_ref().map(|d| DynRun::new(d, fs));
+        PreStage { params, state: [[[0.0; 2]; MAX_SECTIONS]; MAX_CHANNELS], dynamics }
     }
 
     pub fn params(&self) -> &Params {
         &self.params
     }
 
-    /// Clears every filter's history (stream start).
+    /// Clears every filter's history and the dynamics' detectors (stream start).
     pub fn reset(&mut self) {
         self.state = [[[0.0; 2]; MAX_SECTIONS]; MAX_CHANNELS];
+        if let Some(d) = &mut self.dynamics {
+            d.reset();
+        }
+    }
+
+    /// Runs the dynamics on every channel at once (after [`PreStage::process`]
+    /// has filtered each into `bufs`), in place. No dynamics: unchanged.
+    /// Real time.
+    pub fn process_dynamics(&mut self, bufs: &mut [&mut [f32]], frames: usize) {
+        if let Some(d) = &mut self.dynamics {
+            d.process(bufs, frames);
+        }
     }
 
     /// Filters channel `c` from `input` into `output` (equal lengths; the
@@ -331,6 +650,98 @@ mod tests {
         // a channel the pre-stage does not have is muted
         s.process(5, &x, &mut y);
         assert!(y.iter().all(|v| *v == 0.0));
+    }
+
+    fn dyn_params() -> Params {
+        let mut p = Params::identity(2);
+        p.flags = FLAG_FROM_TUNING | FLAG_DYNAMICS;
+        let b = |t: f64, r: f64, rng: f64, mk: f64| Band {
+            threshold_db: t,
+            ratio: r,
+            range_db: rng,
+            makeup_db: mk,
+            mode: BandMode::Compress,
+        };
+        p.dynamics = Some(Dynamics {
+            crossover_hz: [200.0, 1500.0, 8000.0],
+            input_gain_db: -12.0,
+            output_gain_db: 14.0,
+            release_s: 0.05,
+            band: [
+                b(-30.0, 4.0, -20.0, 2.0),
+                b(-25.0, 2.5, -18.0, 0.0),
+                b(-15.0, 1.8, -18.0, 0.0),
+                b(-14.0, 1.5, -16.0, 0.0),
+            ],
+        });
+        p
+    }
+
+    fn tone(f: f64, a: f64, n: usize) -> std::vec::Vec<f32> {
+        (0..n).map(|i| (a * libm::sin(2.0 * core::f64::consts::PI * f * i as f64 / 48_000.0)) as f32).collect()
+    }
+
+    fn run_dyn(p: &Params, x: &[f32]) -> std::vec::Vec<f32> {
+        let mut s = PreStage::with_rate(p.clone(), 48_000.0);
+        let mut a = x.to_vec();
+        let mut b = x.to_vec();
+        for k in (0..x.len()).step_by(512) {
+            let e = (k + 512).min(x.len());
+            let mut bufs: [&mut [f32]; 2] = [&mut a[k..e], &mut b[k..e]];
+            s.process_dynamics(&mut bufs, e - k);
+        }
+        a
+    }
+
+    fn level(y: &[f32], f: f64) -> f64 {
+        let n = y.len() / 2;
+        let (mut re, mut im) = (0.0, 0.0);
+        for (i, v) in y[n..].iter().enumerate() {
+            let w = 2.0 * core::f64::consts::PI * f * (i + n) as f64 / 48_000.0;
+            re += *v as f64 * libm::cos(w);
+            im += *v as f64 * libm::sin(w);
+        }
+        20.0 * libm::log10(2.0 * libm::sqrt(re * re + im * im) / n as f64)
+    }
+
+    #[test]
+    fn dynamics_roundtrip_and_refusals() {
+        let p = dyn_params();
+        let b = p.encode();
+        let d = Params::decode(&b, 2, 48_000.0).unwrap();
+        assert_eq!(d, p);
+        let mut bad = p.clone();
+        bad.dynamics.as_mut().unwrap().crossover_hz = [2000.0, 1500.0, 8000.0];
+        assert_eq!(Params::decode(&bad.encode(), 2, 48_000.0), Err(BlobError::Unstable));
+        let mut bad = p.clone();
+        bad.dynamics.as_mut().unwrap().band[0].ratio = 0.5;
+        assert_eq!(Params::decode(&bad.encode(), 2, 48_000.0), Err(BlobError::Unstable));
+    }
+
+    #[test]
+    fn dynamics_never_add_drive_and_reduce_at_full_scale() {
+        let p = dyn_params();
+        let n = 24_000;
+        // quiet: at or below unity at every frequency (bands sum in phase)
+        for f in [30.0, 100.0, 200.0, 400.0, 1500.0, 3000.0, 8000.0, 15_000.0] {
+            let y = run_dyn(&p, &tone(f, 1e-3, n));
+            let g = level(&y, f) - 20.0 * libm::log10(1e-3);
+            assert!(g <= 0.01, "{f} Hz: {g} dB");
+            assert!(g > -3.0, "{f} Hz: {g} dB");
+        }
+        // full scale in band 0: the hard-knee curve, from the band level
+        let y = run_dyn(&p, &tone(80.0, 1.0, n));
+        let d = p.dynamics.unwrap();
+        let lvl = d.input_gain_db; // band 0 carries the whole 80 Hz tone (to within 0.1 dB)
+        let gr = ((1.0 / 4.0 - 1.0) * (lvl - (-30.0))).max(-20.0);
+        let want = d.input_gain_db + d.output_gain_db + d.trim_db() + 2.0 + gr;
+        // within 1 dB: the held power droops between the tone's peaks with
+        // the release, so the mean reduction is a little under the curve's
+        assert!((level(&y, 80.0) - want).abs() < 1.0, "{} vs {want}", level(&y, 80.0));
+        // a muted band takes its range away
+        let mut m = dyn_params();
+        m.dynamics.as_mut().unwrap().band[0].mode = BandMode::Mute;
+        assert!(level(&run_dyn(&m, &tone(50.0, 0.1, n)), 50.0) < -40.0);
     }
 
     #[test]
