@@ -381,6 +381,54 @@ class AopAndJ700(unittest.TestCase):
             sgsc.pcm_ids = saved
 
 
+class HandMapFallback(unittest.TestCase):
+    """A board that can derive must fail when it does not; only an entry
+    marked "hand-by-design" may run on its hand map."""
+
+    def run_derive(self, entry):
+        import argparse
+        import json as _json
+        import tempfile
+
+        refusal = wiring.Refused("aurora-speaker-tuning dump --json gave no JSON (exit 2): usage")
+        saved = (wiring.read_dt, wiring.tuning_dump)
+        wiring.read_dt = lambda *a, **k: {"board": "j316s"}
+
+        def no_dump(*a, **k):
+            raise refusal
+
+        wiring.tuning_dump = no_dump
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            _json.dump({"j316": entry} if entry is not None else {}, f)
+        try:
+            args = argparse.Namespace(machines=f.name, tuning=[], tuning_cli="aurora-speaker-tuning")
+            return sgsc.derive_live(args)
+        finally:
+            wiring.read_dt, wiring.tuning_dump = saved
+            os.unlink(f.name)
+
+    def test_a_derivable_board_with_an_old_tuning_reader_fails(self):
+        entry = dict(MACHINES["j316"])
+        self.assertNotEqual(entry.get("wiring"), sgsc.HAND_BY_DESIGN)
+        with self.assertRaises(wiring.Refused):
+            self.run_derive(entry)
+
+    def test_a_board_with_no_entry_fails(self):
+        with self.assertRaises(wiring.Refused):
+            self.run_derive(None)
+
+    def test_only_hand_by_design_takes_the_hand_map(self):
+        entry = dict(MACHINES["j316"], wiring=sgsc.HAND_BY_DESIGN)
+        _, w, errs = self.run_derive(entry)
+        self.assertEqual((w["method"], errs), ("hand", []))
+
+    def test_no_shipped_machine_is_hand_by_design(self):
+        # J316, J413, J616s and J700 all derive; none may fall back.
+        for m, entry in MACHINES.items():
+            if not m.startswith("_"):
+                self.assertNotEqual(entry.get("wiring"), sgsc.HAND_BY_DESIGN, m)
+
+
 class Record(unittest.TestCase):
     def test_bind_lines_are_what_the_supervisor_parses(self):
         rec = {"schema": 1, "version": 1, "result": "fail", "board": "j316s", "kernel": "k", "params_sha256": "ab",

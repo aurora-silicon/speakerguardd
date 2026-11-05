@@ -49,7 +49,10 @@ the hardware half on the running Mac, silently.
 machines.json is an optional override: an entry states a whole hand map
 (unit_channels, default the identity; sense_pairs "vi" | "iv", default
 "vi"), and `disagreements()` lists every place it and the derivation
-differ. An entry with `"wiring": "derive"` states no map.
+differ. An entry with `"wiring": "derive"` states no map. Only an entry with
+`"wiring": "hand-by-design"` (a board whose wiring cannot be derived by
+design) lets the self-check run on its hand map when the derivation
+refuses; any other board fails instead.
 """
 import hashlib
 import json

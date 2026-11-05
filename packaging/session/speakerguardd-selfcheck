@@ -430,10 +430,18 @@ def write_atomic(path, text, mode=0o644):
     os.rename(tmp, path)
 
 
+# A machines.json entry's "wiring" value for a board whose wiring cannot be
+# derived by design: only such a board may run on its hand map.
+HAND_BY_DESIGN = "hand-by-design"
+
+
 def derive_live(args):
-    """(hw, wiring, errors). A board this derivation cannot read (the AOP
-    and MAX98360A paths) falls back to its machines.json hand map, marked
-    "hand": nothing about it is proven, as before the self-check."""
+    """(hw, wiring, errors). A board whose machines.json entry says its
+    wiring is "hand-by-design" falls back to that entry's hand map when the
+    derivation cannot read it, marked "hand": nothing about it is proven.
+    Every other board must derive: a refusal (an unreadable device tree, a
+    missing or old tuning reader, a tuning the derivation cannot place) fails
+    the self-check, so a derivable Mac never runs on an unproven hand map."""
     hw = wiring.read_dt()
     machines = {}
     if args.machines and os.path.exists(args.machines):
@@ -446,7 +454,7 @@ def derive_live(args):
         w = wiring.derive(hw, dump)
         w["method"] = "derived" if w["sense"] else "derived-static"
     except wiring.Refused as e:
-        if not entry:
+        if not entry or entry.get("wiring") != HAND_BY_DESIGN:
             raise
         import gen
 
