@@ -99,6 +99,22 @@ pub struct Manifest {
     /// `shared_files` (under [`SHARED_ROOTS`]) and its `loudness_manager`.
     /// Verified like every other record; the compiler does not read them.
     pub shared: Vec<Record>,
+    /// The lsm2 masker's bucket lattice the installer extracted from the
+    /// Mac's AudioDSP ([`crate::lattice`]); `None` in bundles collected
+    /// before it.
+    pub mask_lattice: Option<Record>,
+}
+
+/// The installer's `lsm2_mask_lattice` record.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LatticeJson {
+    path: String,
+    bytes: u64,
+    sha256: String,
+    version: u32,
+    format: String,
+    entries: u32,
 }
 
 #[derive(Deserialize)]
@@ -130,6 +146,9 @@ struct InstallerJson {
     shared_files: Option<Vec<Record>>,
     #[serde(default)]
     loudness_manager: Option<Record>,
+    /// Optional: bundles collected before the installer read it have none.
+    #[serde(default)]
+    lsm2_mask_lattice: Option<LatticeJson>,
 }
 
 #[derive(Deserialize)]
@@ -143,7 +162,11 @@ struct CollectorJson {
 
 impl Manifest {
     pub fn records(&self) -> impl Iterator<Item = &Record> {
-        self.files.iter().chain(self.speaker_thiele_small.iter()).chain(self.shared.iter())
+        self.files
+            .iter()
+            .chain(self.speaker_thiele_small.iter())
+            .chain(self.shared.iter())
+            .chain(self.mask_lattice.iter())
     }
 
     /// Parses `manifest.json` (installer).
@@ -209,6 +232,36 @@ impl Manifest {
                 return Err(Error::format(NAME, format!("{name} is named but not listed")));
             }
         }
+        let mask_lattice = match j.lsm2_mask_lattice {
+            None => None,
+            Some(l) => {
+                use crate::lattice;
+                if l.path != lattice::NAME
+                    || l.bytes != lattice::SIZE as u64
+                    || l.version != lattice::VERSION
+                    || l.format != lattice::FORMAT
+                    || l.entries as usize != lattice::ENTRIES
+                {
+                    return Err(Error::format(
+                        NAME,
+                        format!(
+                            "lsm2_mask_lattice is {:?}, {} bytes, version {}, format {:?}, {} entries; expected {:?}, {}, {}, {:?}, {}",
+                            l.path,
+                            l.bytes,
+                            l.version,
+                            l.format,
+                            l.entries,
+                            lattice::NAME,
+                            lattice::SIZE,
+                            lattice::VERSION,
+                            lattice::FORMAT,
+                            lattice::ENTRIES
+                        ),
+                    ));
+                }
+                Some(Record { path: l.path, bytes: l.bytes, sha256: l.sha256 })
+            }
+        };
         let prefix = format!("{}/", j.aid);
         let folder = j.files.iter().filter(|r| r.path.starts_with(&prefix)).count() as u64;
         if j.source_file_count == 0 || j.source_file_count != folder {
@@ -228,6 +281,7 @@ impl Manifest {
             speaker_thiele_small: j.speaker_thiele_small,
             files: j.files,
             shared,
+            mask_lattice,
         };
         m.check(NAME)?;
         Ok(m)
@@ -257,6 +311,7 @@ impl Manifest {
             speaker_thiele_small: spts.into_iter().next(),
             files,
             shared: Vec::new(),
+            mask_lattice: None,
         };
         m.check(COLLECTOR_NAME)?;
         Ok(m)

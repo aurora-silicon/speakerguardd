@@ -26,7 +26,9 @@
 //! - engine page: `$SGV2_ENGINE_PAGE`, else `/run/speakerguardd/<uid>/engine`
 //!   (created and sized by the supervisor; see [`page`]). Without a page the
 //!   plugin still protects, and the supervisor, seeing no heartbeat, never
-//!   takes ownership of the amps.
+//!   takes ownership of the amps. A watcher thread re-attaches when the file
+//!   is replaced or appears later ([`attach`]), so a restarted supervisor
+//!   sees the heartbeat without a PipeWire restart.
 //!
 //! A blob that is missing, corrupt, for another unit kind, or for another
 //! channel/sense geometry or rate gives the fail-safe unit (20 dB), as macOS
@@ -38,6 +40,7 @@
 //! [`handoff`]). A pause, a suspend or a graph rebuild in the same process
 //! therefore never gives a hot speaker full power back.
 
+pub mod attach;
 pub mod handoff;
 pub mod page;
 pub mod ttl;
@@ -192,7 +195,8 @@ struct Instance {
     sense: usize,
     ports: [*mut f32; MAX_PORTS],
     unit: AnyUnit,
-    page: Option<page::EnginePage>,
+    /// The supervisor's engine page, re-attached when the file is replaced.
+    attach: attach::Attach,
     telemetry: Telemetry,
     last_frame: u64,
     frames: u64,
@@ -223,16 +227,21 @@ unsafe extern "C" fn instantiate(
     handoff::init();
     let blob = std::fs::read(&blob_path).ok();
     let (unit, _err, params_crc) = load_unit(blob.as_deref(), rate, channels, sense, role);
-    let page = page::EnginePage::open(&page_path).ok();
-    if let Some(p) = &page {
-        p.start(params_crc, unit.unit().latency_frames(), channels as u32, sense as u32);
-    }
+    let attach = attach::Attach::new(
+        page_path,
+        attach::Header {
+            params_crc,
+            latency: unit.unit().latency_frames(),
+            channels: channels as u32,
+            sense: sense as u32,
+        },
+    );
     let instance = Box::new(Instance {
         channels,
         sense,
         ports: [core::ptr::null_mut(); MAX_PORTS],
         unit,
-        page,
+        attach,
         telemetry: Telemetry::new(),
         last_frame: u64::MAX,
         frames: 0,
@@ -253,7 +262,8 @@ unsafe extern "C" fn connect_port(handle: *mut c_void, port: u32, data: *mut c_v
 unsafe extern "C" fn activate(handle: *mut c_void) {
     // SAFETY: the host passes the handle `instantiate` returned.
     let instance = unsafe { &mut *handle.cast::<Instance>() };
-    let provided = instance.page.as_ref().and_then(|p| p.provided_for(instance.params_crc));
+    let provided = instance.attach.enter().and_then(|p| p.provided_for(instance.params_crc));
+    instance.attach.leave();
     start_stream(instance.unit.as_dyn(), &handoff::SLOT, provided);
     instance.last_frame = u64::MAX;
     instance.frames = 0;
@@ -286,6 +296,16 @@ unsafe extern "C" fn run(handle: *mut c_void, frames: u32) {
     // SAFETY: the host passes the handle `instantiate` returned and has
     // connected every port to a buffer of at least `frames` samples.
     let instance = unsafe { &mut *handle.cast::<Instance>() };
+    let attach: *const attach::Attach = &instance.attach;
+    // SAFETY: `attach` lives as long as the instance and is not touched
+    // by `run_call`; the page stays mapped until `leave`.
+    let page = unsafe { (*attach).enter() };
+    run_call(instance, page, frames);
+    // SAFETY: as above.
+    unsafe { (*attach).leave() };
+}
+
+fn run_call(instance: &mut Instance, page: Option<&page::EnginePage>, frames: u32) {
     let (n, s, frames) = (instance.channels, instance.sense, frames as usize);
     let empty: &[f32] = &[];
     let mut input = [empty; MAX_CHANNELS];
@@ -316,7 +336,7 @@ unsafe extern "C" fn run(handle: *mut c_void, frames: u32) {
                 }
             }
         }
-        finish_call(instance, frames, Health(Health::FAILSAFE | Health::CHANNEL_MISMATCH));
+        finish_call(instance, page, frames, Health(Health::FAILSAFE | Health::CHANNEL_MISMATCH));
         return;
     }
     // The core needs distinct input and output buffers. PipeWire's
@@ -329,7 +349,7 @@ unsafe extern "C" fn run(handle: *mut c_void, frames: u32) {
             // SAFETY: connected audio ports hold `frames` samples.
             unsafe { core::slice::from_raw_parts_mut(instance.ports[n + c], frames) }.fill(0.0);
         }
-        finish_call(instance, frames, Health(Health::FAILSAFE | Health::CHANNEL_MISMATCH));
+        finish_call(instance, page, frames, Health(Health::FAILSAFE | Health::CHANNEL_MISMATCH));
         return;
     }
     for c in 0..n {
@@ -361,7 +381,7 @@ unsafe extern "C" fn run(handle: *mut c_void, frames: u32) {
         // for a later process, through the supervisor; never a record the
         // unit does not trust (save_state is false then) nor one from a
         // faulted or fail-safe call
-        if let Some(page) = &instance.page {
+        if let Some(page) = page {
             // MODEL_RANGE still protects: kept
             let untrusted = Health::FAILSAFE | Health::NO_PARAMS | Health::CHANNEL_MISMATCH | Health::MODEL_FAULT;
             if health.0 & untrusted == 0 {
@@ -370,7 +390,7 @@ unsafe extern "C" fn run(handle: *mut c_void, frames: u32) {
         }
     }
     let delay = instance.unit.sense_delay().map_or(-1, |d| d as i32);
-    if let Some(page) = &instance.page {
+    if let Some(page) = page {
         instance.unit.unit().telemetry(&mut instance.telemetry);
         if instance.telemetry.frame != instance.last_frame {
             instance.last_frame = instance.telemetry.frame;
@@ -389,10 +409,10 @@ unsafe extern "C" fn run(handle: *mut c_void, frames: u32) {
 
 /// A call the unit did not run: the frame count, the heartbeat and the
 /// control ports still move, so the supervisor sees the fault.
-fn finish_call(instance: &mut Instance, frames: usize, health: Health) {
+fn finish_call(instance: &mut Instance, page: Option<&page::EnginePage>, frames: usize, health: Health) {
     let (n, s) = (instance.channels, instance.sense);
     instance.frames += frames as u64;
-    if let Some(page) = &instance.page {
+    if let Some(page) = page {
         page.beat(instance.frames, health, -1);
     }
     let latency = instance.unit.unit().latency_frames() as f32;

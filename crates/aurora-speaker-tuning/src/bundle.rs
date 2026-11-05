@@ -217,6 +217,7 @@ impl Bundle {
             speaker_thiele_small: None,
             files: Vec::new(),
             shared: Vec::new(),
+            mask_lattice: None,
         };
         Ok(Bundle { manifest, files, source: root.to_owned(), verified: false, unlisted: Vec::new() })
     }
@@ -263,5 +264,10 @@ impl Bundle {
 
     pub fn spts(&self) -> Option<&[u8]> {
         self.file(manifest::SPTS_NAME)
+    }
+
+    /// The lsm2 masker lattice's bytes, when the manifest lists it.
+    pub fn mask_lattice(&self) -> Option<&[u8]> {
+        self.manifest.mask_lattice.as_ref().and_then(|r| self.file(&r.path))
     }
 }
