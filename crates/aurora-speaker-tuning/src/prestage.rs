@@ -69,6 +69,144 @@ fn bad(message: impl Into<String>) -> Error {
     Error::format("prestage", message)
 }
 
+/// Boards whose woofers the pre-stage alone still drives harder at low
+/// frequency than macOS does (its multiband dynamics are not carried yet):
+/// until they are, the pre-stage also caps every channel's cone excursion
+/// at the tuning's own limit ([`excursion_cap`]). Policy, not a hardware
+/// value: each board's numbers come from its tuning.
+///
+/// - `j413`: MacBook Air M2, measured 2026-11-06 (woofers about 1.2x
+///   macOS's peak excursion at 125-400 Hz).
+pub const EXCURSION_CAP_INTERIM: &[&str] = &["j413"];
+
+/// Whether `board` gets the interim excursion cap.
+pub fn excursion_cap_interim(board: &str) -> bool {
+    EXCURSION_CAP_INTERIM.contains(&board)
+}
+
+/// The static excursion cap of one speaker from its tuning's lumped model
+/// (spp3 sidecar `OL_disp`: moving mass, damping, stiffness, force factor,
+/// amp volts at full scale, controller Q and excursion limit; `OL_thermal`
+/// `Reb_ref`).
+///
+/// The cone's excursion per unit of program is `X0 / D(s)`, with
+/// `D(s) = s^2/w0^2 + s/(w0 Q) + 1`, `w0 = sqrt(kt/mt)` and
+/// `X0 = ag phi / (Reb_ref kt)` at full scale. The cap is
+/// `C(s) = k D(s) / (s^2/wp^2 + 2 s/wp + 1)` with `k = x_lim / X0` and
+/// `wp = w0 / sqrt(k)`: excursion becomes `k X0` over a critically damped
+/// second-order low-pass, which never overshoots, so a program no larger
+/// than full scale never drives the cone past `x_lim`. `C` is unity at high
+/// frequency and never above it. `Q` is the larger of the controller Q and
+/// the model's own (the more resonant, the more is taken away). A model
+/// whose full-scale excursion is already within `x_lim` needs no cap.
+pub fn excursion_cap(ch: &crate::spp3::Channel, fs: f64) -> Result<Option<Section>> {
+    let d = &ch.ol_disp;
+    let m = Cone {
+        mt: d.mt,
+        ct: d.ct,
+        kt: d.kt,
+        phi: d.phi,
+        ag: d.ag,
+        q_d: d.q_d,
+        x_lim: d.x_lim,
+        reb: ch.ol_thermal.reb_ref,
+    };
+    cap_section(&m, fs).map_err(|e| bad(format!("Channel{}: {e}", ch.index)))
+}
+
+/// A speaker's lumped model, as the tuning states it.
+#[derive(Clone, Copy, Debug)]
+pub struct Cone {
+    pub mt: f64,
+    pub ct: f64,
+    pub kt: f64,
+    pub phi: f64,
+    pub ag: f64,
+    pub q_d: f64,
+    pub x_lim: f64,
+    pub reb: f64,
+}
+
+impl Cone {
+    pub fn w0(&self) -> f64 {
+        (self.kt / self.mt).sqrt()
+    }
+    pub fn q(&self) -> f64 {
+        self.q_d.max((self.kt * self.mt).sqrt() / (self.ct + self.phi * self.phi / self.reb))
+    }
+    /// Excursion at full scale below resonance, in the unit of `x_lim` (mm).
+    pub fn x0(&self) -> f64 {
+        self.ag * self.phi / (self.reb * self.kt) * 1e3
+    }
+}
+
+fn cap_section(m: &Cone, fs: f64) -> std::result::Result<Option<Section>, String> {
+    let all = [m.mt, m.ct, m.kt, m.phi, m.ag, m.q_d, m.x_lim, m.reb];
+    if all.iter().any(|v| !v.is_finite() || *v <= 0.0) {
+        return Err("the excursion model (OL_disp, Reb_ref) is incomplete or not physical".into());
+    }
+    let (w0, q, x0) = (m.w0(), m.q(), m.x0());
+    let k = m.x_lim / x0;
+    if k >= 1.0 {
+        return Ok(None);
+    }
+    let wp = w0 / k.sqrt();
+    if !wp.is_finite() || wp >= PI * fs {
+        return Err("the excursion cap's corner is past Nyquist".into());
+    }
+    // bilinear transform of (n2 s^2 + n1 s + n0) / (d2 s^2 + d1 s + d0)
+    let (n2, n1, n0) = (k / (w0 * w0), k / (w0 * q), k);
+    let (d2, d1, d0) = (1.0 / (wp * wp), 2.0 / wp, 1.0);
+    let c = 2.0 * fs;
+    let a0 = d2 * c * c + d1 * c + d0;
+    let sec = Section {
+        b0: (n2 * c * c + n1 * c + n0) / a0,
+        b1: (2.0 * n0 - 2.0 * n2 * c * c) / a0,
+        b2: (n2 * c * c - n1 * c + n0) / a0,
+        a1: (2.0 * d0 - 2.0 * d2 * c * c) / a0,
+        a2: (d2 * c * c - d1 * c + d0) / a0,
+    };
+    if !sec.stable() {
+        return Err("the excursion cap is unstable".into());
+    }
+    Ok(Some(sec))
+}
+
+/// Adds the interim excursion cap of every channel to `pre` (see
+/// [`EXCURSION_CAP_INTERIM`]); refuses when the tuning lacks a channel's
+/// model.
+pub fn add_excursion_cap(
+    pre: &mut Params,
+    sidecar: &crate::spp3::Sidecar,
+    fs: f64,
+    diags: &mut Diagnostics,
+) -> Result<()> {
+    for c in 0..pre.channels {
+        let ch = sidecar
+            .channels
+            .iter()
+            .find(|ch| ch.index == c)
+            .ok_or_else(|| bad(format!("the sidecar has no Channel{c} for the excursion cap")))?;
+        let Some(sec) = excursion_cap(ch, fs)? else { continue };
+        let p = &mut pre.channel[c];
+        if p.count >= MAX_SECTIONS {
+            return Err(bad(format!("channel {c}: no room for the excursion cap")));
+        }
+        p.sections[p.count] = sec;
+        p.count += 1;
+        let peak = p.peak(fs);
+        if peak > 1.0 {
+            p.gain /= peak;
+        }
+        diags.info(
+            "prestage-excursion-cap",
+            format!("channel {c}"),
+            "excursion capped at the tuning's limit (interim)",
+        );
+    }
+    Ok(())
+}
+
 /// One filter box's contribution to one of its channels.
 #[derive(Debug, Default)]
 struct Part {
@@ -348,6 +486,65 @@ mod tests {
             preset_extra_keys: Vec::new(),
             before_protection: true,
         }
+    }
+
+    #[test]
+    fn excursion_cap_holds_the_limit() {
+        let fs = 48_000.0;
+        // a small woofer that a full-scale program drives past its limit
+        let m = Cone { mt: 5e-4, ct: 0.6, kt: 4000.0, phi: 0.8, ag: 12.0, q_d: 1.5, x_lim: 0.4, reb: 4.0 };
+        assert!(m.x0() > m.x_lim);
+        let cap = cap_section(&m, fs).unwrap().unwrap();
+        let mut ch = Channel::IDENTITY;
+        ch.sections[0] = cap;
+        ch.count = 1;
+        assert!(ch.peak(fs) <= 1.0 + 1e-9);
+        assert!((ch.magnitude(1.0, fs) - m.x_lim / m.x0()).abs() < 1e-3);
+        assert!((ch.magnitude(23_000.0, fs) - 1.0).abs() < 0.02);
+        // the cone model, as a digital filter (bilinear)
+        let (w0, q, c) = (m.w0(), m.q(), 2.0 * fs);
+        let (n2, n1) = (1.0 / (w0 * w0), 1.0 / (w0 * q));
+        let a0 = n2 * c * c + n1 * c + 1.0;
+        let cone = Section {
+            b0: m.x0() / a0,
+            b1: 2.0 * m.x0() / a0,
+            b2: m.x0() / a0,
+            a1: (2.0 - 2.0 * n2 * c * c) / a0,
+            a2: (n2 * c * c - n1 * c + 1.0) / a0,
+        };
+        let run = |s: &Section, x: &[f64]| -> Vec<f64> {
+            let (mut z1, mut z2) = (0.0, 0.0);
+            x.iter()
+                .map(|&v| {
+                    let o = s.b0 * v + z1;
+                    z1 = s.b1 * v - s.a1 * o + z2;
+                    z2 = s.b2 * v - s.a2 * o;
+                    o
+                })
+                .collect()
+        };
+        // full-scale square bursts at and below resonance: the worst crest
+        for f in [50.0, 120.0, 250.0, 450.0, 900.0] {
+            let x: Vec<f64> = (0..24_000)
+                .map(|i| {
+                    if i < 480 {
+                        0.0
+                    } else if (2.0 * PI * f * i as f64 / fs).sin() >= 0.0 {
+                        1.0
+                    } else {
+                        -1.0
+                    }
+                })
+                .collect();
+            let uncapped = run(&cone, &x).iter().fold(0.0f64, |a, v| a.max(v.abs()));
+            let capped = run(&cone, &run(&cap, &x)).iter().fold(0.0f64, |a, v| a.max(v.abs()));
+            assert!(uncapped > m.x_lim, "{f} Hz: {uncapped}");
+            assert!(capped <= m.x_lim * 1.001, "{f} Hz: {capped} mm against {}", m.x_lim);
+        }
+        // a model already inside its limit needs no cap; a broken one is refused
+        assert!(cap_section(&Cone { x_lim: 10.0, ..m }, fs).unwrap().is_none());
+        assert!(cap_section(&Cone { kt: 0.0, ..m }, fs).is_err());
+        assert!(excursion_cap_interim("j413") && !excursion_cap_interim("j316s"));
     }
 
     #[test]
