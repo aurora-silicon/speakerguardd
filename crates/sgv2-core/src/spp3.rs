@@ -1095,7 +1095,10 @@ impl Cl {
         if !self.active {
             return base;
         }
-        // a measurement older than one window (plus this update) is stale
+        // a measurement older than one window (plus this update) is stale:
+        // only a fresh T_CL relaxes (the raw target returns to the base at
+        // once; the smoother then decays with TlimErrDecayTime, the
+        // reference law), and the guard only runs on accepted windows
         self.age = self.age.saturating_add(self.upd);
         if self.age > self.window.saturating_add(self.upd) {
             self.valid = false;
@@ -1137,6 +1140,11 @@ impl ClReplay {
     /// True when the window was accepted.
     pub fn window(&mut self, pv: f32, pi: f32) -> bool {
         self.cl.window_done(pv, pi);
+        self.cl.valid
+    }
+
+    /// The T_CL is fresh (see [`Unit::cl_fresh`]).
+    pub fn t_cl_fresh(&self) -> bool {
         self.cl.valid
     }
 
@@ -1503,6 +1511,14 @@ impl Unit {
     /// Unit channel `c`'s closed-loop plausibility guard has tripped.
     pub fn sense_implausible(&self, c: usize) -> bool {
         self.run.as_ref().and_then(|r| r.ch.get(c)).and_then(|c| c.cl.as_ref()).is_some_and(|l| l.implausible)
+    }
+    /// The closed-loop T_CL of unit channel `c` is fresh: an accepted
+    /// window no older than one window plus one update. Only a fresh T_CL
+    /// is used (relaxation, plausibility guard); the published `cl_temp_c`
+    /// holds the last value once the pilot stops, so external watchers must
+    /// gate on this too.
+    pub fn cl_fresh(&self, c: usize) -> bool {
+        self.run.as_ref().and_then(|r| r.ch.get(c)).and_then(|c| c.cl.as_ref()).is_some_and(|l| l.valid)
     }
     /// Pre-gain drive power `Pdrv` of unit channel `c` in its last update, W.
     pub fn drive_power(&self, c: usize) -> f64 {
