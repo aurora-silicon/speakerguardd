@@ -588,8 +588,8 @@ pub const TAU_MIN_S: f32 = 0.1;
 const FF_RANGE_K: f64 = 1000.0;
 /// Closed-loop plausibility guard (beyond the reference, stricter only):
 /// driven windows in the resistance trend, the T_OL span they must cover,
-/// K, and the coldness bound below min(T_cal, ambient), K, held for
-/// `COLD_N` windows.
+/// K, and the coldness bound below min(CalTempRangeMin, ambient), K, held
+/// for `COLD_N` windows.
 const TREND_N: usize = 8;
 const TREND_SPAN_K: f64 = 10.0;
 /// A trend trips only when R_s falls by at least this fraction of the
@@ -899,9 +899,12 @@ impl Cl {
             trend: [(0.0, 0.0); TREND_N],
             trend_n: 0,
             cold_n: 0,
-            // the coldest a coil can honestly read: below both its
-            // calibration and the model's ambient by the margin
-            cold_floor: tc.min(ambient) - COLD_MARGIN_K,
+            // the coldest a coil can honestly read: below both the
+            // tuning's coldest valid coil temperature (CalTempRangeMin) and
+            // the model's ambient by the margin. Not T_cal: that is where
+            // the coil happened to be at calibration (a warm Mac), and a
+            // cold start in a cooler room honestly reads well below it.
+            cold_floor: (c.cal_temp_range_min as f64).min(ambient) - COLD_MARGIN_K,
             relax: false,
             implausible: false,
         })
@@ -1026,8 +1029,8 @@ impl Cl {
     /// than [`TREND_SLOPE_FRAC`] of an honest coil's rise means the sense
     /// is not reading the coil (the J616s live test: V and I swapped, R
     /// falling as the coils heated, correlation -0.95). So does a coil read
-    /// [`COLD_MARGIN_K`] below both its calibration temperature and the
-    /// model's ambient on [`COLD_N`] consecutive driven windows (a driven
+    /// [`COLD_MARGIN_K`] below both the tuning's coldest valid coil
+    /// temperature (`CalTempRangeMin`) and the model's ambient on [`COLD_N`] consecutive driven windows (a driven
     /// coil cannot sit below its surroundings). The trend test only judges
     /// rings across which T_OL rose by the span (first to last window), so
     /// music that lets the model and the coil wander in opposite
