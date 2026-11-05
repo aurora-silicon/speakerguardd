@@ -103,11 +103,19 @@
 //! bank bands). One band follower per band takes the final request; the
 //! audio applies `min(band, slow)`.
 //!
+//! Velocity fixed term (t-4751, t-4763): the zero-input carry of a
+//! persistent Float32 full-band velocity model that advances on the
+//! protected output; displacement keeps the retained full-band residual
+//! (t-4731). Motion models share one Float32 biquad with the measured fused
+//! order.
+//!
 //! Known residuals against 25G83 (rig report):
-//! - interim safety layers: velocity allocated to 0.99 of its limit, and the
-//!   output ceiling held to 0.99 of its rise over ambient;
-//! - at 96 kHz the steady velocity margin on some law cases is shallower
-//!   than the reference's (Daybreak t-4733);
+//! - interim safety layer: the output ceiling held to 0.99 of its rise over
+//!   ambient;
+//! - 96 kHz: the steady velocity margin on the fb8-sr96 law cases is
+//!   shallower than the reference's (Daybreak t-4769);
+//! - 48 kHz mid-band law cases and two programs sit within 0.02 x of the
+//!   reference's velocity peak, some above it (Daybreak follow-up);
 //! - the masker lattice is an input extracted from the Mac's macOS; without
 //!   it there is no masking credit;
 //! - host slices: at q1, q7 and q160 this unit is slice-independent by
@@ -967,6 +975,46 @@ impl Biquad {
     }
 }
 
+/// A Float32 direct-form-I biquad: the persistent motion models whose
+/// zero-input carry the fast allocations take (t-4751).
+#[derive(Clone, Copy, Default)]
+struct Biquad32 {
+    b: [f32; 3],
+    a: [f32; 2],
+    x: [f32; 2],
+    y: [f32; 2],
+}
+
+impl Biquad32 {
+    fn from(q: &Biquad) -> Self {
+        Biquad32 { b: q.b.map(|v| v as f32), a: q.a.map(|v| v as f32), x: [0.0; 2], y: [0.0; 2] }
+    }
+    #[inline]
+    fn step(&mut self, x: f32) -> f32 {
+        // the measured fused contraction order (t-4763)
+        let mut acc = self.b[2] * self.x[1];
+        acc = libm::fmaf(-self.a[1], self.y[1], acc);
+        acc = libm::fmaf(self.b[1], self.x[0], acc);
+        acc = libm::fmaf(-self.a[0], self.y[0], acc);
+        let y = libm::fmaf(self.b[0], x, acc);
+        self.x = [x, self.x[0]];
+        self.y = [y, self.y[0]];
+        y
+    }
+    /// The zero-input response from the current state into `out[..n]`,
+    /// zeros after; the state is unchanged.
+    fn carry(&self, out: &mut [f32], n: usize) {
+        let mut m = *self;
+        for (i, o) in out.iter_mut().enumerate() {
+            *o = if i < n { m.step(0.0) } else { 0.0 };
+        }
+    }
+    fn clear(&mut self) {
+        self.x = [0.0; 2];
+        self.y = [0.0; 2];
+    }
+}
+
 /// The current model of spec 15.2: a Float32 biquad, every output rounded
 /// to f32, `i[n] = f32(b0 u[n] + b1 u[n-1] + b2 u[n-2] - a1 i[n-1] - a2
 /// i[n-2])`.
@@ -1091,14 +1139,19 @@ struct Chan {
     vel_band: [Biquad; BANDS - 1],
     /// The velocity model in its zero state (residuals 5: five fresh models
     /// per decision over the retained window).
-    vel_proto: Biquad,
+    vel_proto: Biquad32,
     /// The displacement model in its zero state, the five band displacement
     /// buffers, the retained full-band displacement over the window (as
     /// `ab`) and the fixed residual (residuals 5.2).
     disp_proto: Biquad,
-    db: [Vec<f32>; BANDS],
     dfull: Vec<f32>,
     rd: Vec<f32>,
+    db: [Vec<f32>; BANDS],
+    /// The persistent full-band displacement and velocity models at the
+    /// window start (Float32), and their zero-input carries over the first
+    /// filterbank latency of the window (t-4751).
+    vcar_m: Biquad32,
+    vcar: Vec<f32>,
     /// Per-substep peaks over the window (ring of RING slots).
     pk_x: [f32; RING],
     pk_d: [f32; RING],
@@ -1423,11 +1476,13 @@ impl Run {
                 disp: motion(c.disp_rdc, c.disp_bl, c.disp_mms_kg, c.disp_rms, c.disp_kms, rate, false),
                 vel,
                 vel_band: [vel; BANDS - 1],
-                vel_proto: vel,
+                vel_proto: Biquad32::from(&vel),
                 disp_proto: motion(c.disp_rdc, c.disp_bl, c.disp_mms_kg, c.disp_rms, c.disp_kms, rate, false),
                 db: core::array::from_fn(|_| vec![0.0; od + ctl]),
+                vcar_m: Biquad32::from(&vel),
                 dfull: vec![0.0; od + ctl],
                 rd: vec![0.0; od + ctl],
+                vcar: vec![0.0; od + ctl],
                 pk_x: [0.0; RING],
                 pk_d: [0.0; RING],
                 pk_v: [0.0; RING],
@@ -1551,7 +1606,8 @@ impl Run {
             for b in c.vb.iter_mut().chain(c.db.iter_mut()) {
                 b.iter_mut().for_each(|v| *v = 0.0);
             }
-            c.dfull.iter_mut().chain(c.rd.iter_mut()).for_each(|v| *v = 0.0);
+            c.vcar_m.clear();
+            c.vcar.iter_mut().chain(c.dfull.iter_mut()).chain(c.rd.iter_mut()).for_each(|v| *v = 0.0);
             c.eg.iter_mut().for_each(|e| e.iter_mut().for_each(|v| *v = 1.0));
             c.cur_in.clear();
             c.pbar_in = [0.0; 4];
@@ -1674,6 +1730,8 @@ impl Run {
         }
         self.ring = (self.ring + SUBSTEPS) % self.ring_len;
         let (ctl, sub, od) = (self.ctl, self.sub, self.od);
+        let fbl = self.fb;
+        let slow_step = self.slow_step;
         let ring_len = self.ring_len;
         let window_max = |r: &[f32; RING]| r[..ring_len].iter().copied().fold(0.0f32, f32::max);
         let ratio = |limit: f64, q: f32| (limit / (q as f64).max(EPS)).min(1.0);
@@ -1702,7 +1760,15 @@ impl Run {
             // displacement, then velocity, then sample peak, each starting
             // from the preceding stage's requests; the logged candidates are
             // diagnostics only
-            let sg = (c.slow.g as f64).clamp(EPS, 1.0) as f32;
+            // the slow scalar: the decision-local predicted endpoint of the
+            // slow follower (t-4758): its current ramp's target, else the
+            // gain with this frame's provisional release toward unity
+            let sg = {
+                let f = c.slow;
+                let e =
+                    if f.n < f.len { f.target } else { (f.g as f64 + slow_step * (1.0 - f.g as f64)).min(1.0) as f32 };
+                (e as f64).clamp(EPS, 1.0) as f32
+            };
             let disp_on = self.axis[1];
             let peak_on = self.axis[0];
             let vfs = c.vfs as f64;
@@ -1712,7 +1778,7 @@ impl Run {
                 for k in 0..BANDS {
                     let mut m = c.vel_proto;
                     for i in 0..c.vb[k].len() {
-                        c.vb[k][i] = m.step(vfs * c.ab[k][i] as f64) as f32;
+                        c.vb[k][i] = m.step(c.vfs * c.ab[k][i]);
                     }
                 }
             }
@@ -1725,6 +1791,8 @@ impl Run {
                         c.db[k][i] = m.step(vfs * c.ab[k][i] as f64) as f32;
                     }
                 }
+                // t-4731 / t-4758: displacement keeps the retained
+                // full-band residual over the whole window
                 for i in 0..c.rd.len() {
                     let mut sum = 0.0f32;
                     for k in 0..BANDS {
@@ -1734,7 +1802,12 @@ impl Run {
                 }
             }
             // interim safety layer: velocity allocated to 0.99 of its limit
-            let vlim_g = (CUT * c.vel_limit_now) as f32;
+            let vlim_g = c.vel_limit_now as f32;
+            // the velocity fixed term (t-4751, t-4763): the zero-input carry
+            // of the persistent full-band velocity model, over one
+            // filterbank latency, zeros after; the model itself advances on
+            // the protected output, below
+            c.vcar_m.carry(&mut c.vcar, fbl);
             let chain = |c: &Chan, seed: [f32; BANDS]| -> [f32; BANDS] {
                 let all = (0, BANDS);
                 let mut r = seed;
@@ -1742,7 +1815,7 @@ impl Run {
                     r = velocity_band_gains(&c.db, &c.rd, 0, c.disp_limit as f32, sg, all, r);
                 }
                 if vel_on {
-                    let q = velocity_band_gains(&c.vb, &[], vfirst, vlim_g, sg, all, r);
+                    let q = velocity_band_gains(&c.vb, &c.vcar, vfirst, vlim_g, sg, all, r);
                     for k in c.vel_active.0..c.vel_active.1 {
                         let v = (sg * q[k]).max(c.vel_floor as f32) / sg;
                         r[k] = r[k].min(v);
@@ -1962,6 +2035,8 @@ impl Run {
                 acc += u as f64 * iv as f64;
                 acc32 += u * iv;
                 *yo = v.clamp(-1.0, 1.0);
+                // the persistent velocity model follows the protected output
+                c.vcar_m.step(c.vfs * *yo);
                 if (i + 1) % sub == 0 {
                     let p = acc / sub as f64;
                     acc = 0.0;
