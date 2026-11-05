@@ -41,6 +41,8 @@
 //!   point is the reference's "+0.052 dB trim" (1.0060077 at 48 kHz, rate
 //!   dependent): gain state, not a stage. An `AudioUnitReset` does not
 //!   restart it; silence advances it. Zero latency.
+//! - **Host reset** (`AudioUnitReset`): changes nothing. The thermal models,
+//!   targets, grid and dezipper carry on as if the call had not happened.
 //! - **Bypass** (ID 0, at the next call): a bit-exact copy that freezes all
 //!   thermal, gain, link and startup state; clearing it resumes that state.
 //!   The controller grid keeps its place; the audio of the partial input
@@ -1186,6 +1188,14 @@ impl ProtectionUnit for Unit {
             r.reset();
         }
     }
+    /// `AudioUnitReset` leaves every processing state as it is: the thermal
+    /// models, the targets, the controller grid, the startup and output
+    /// dezipper, bypass and a latched fault. The reference's audio is
+    /// bit-identical with and without the call, in limiting, in the startup
+    /// mute, bypassed, at one-frame host slices and for one-, two- and
+    /// four-channel presets. A stream start ([`ProtectionUnit::reset`]) is
+    /// not this call.
+    fn host_reset(&mut self) {}
     fn save_state(&self, out: &mut HandOff) -> bool {
         let Some(run) = self.run.as_ref().filter(|r| !r.fault) else { return false };
         *out = HandOff::EMPTY;
