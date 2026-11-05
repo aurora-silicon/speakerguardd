@@ -29,13 +29,16 @@
 //!   `PilotToneEnabled` = part 21, `CLThermalFeedbackEnabled` = part 22), and
 //!   for a key the sidecar lacks, its one-to-one saved ID.
 //!
-//!   Unit channel `c` takes physical data source `spA<k>`, `k` from
-//!   `SpeakerInputDataSourceOrder` (property 64005) when the property strip
-//!   sets it, else `k = c` (the default order; SPEC-SPP3 section 2:
-//!   coreaudiod sets none).  That source gives both the sense pair, ports
-//!   `(2k+1, 2k)` of the `[V0, I0, V1, I1, ...]` bus, and the factory
-//!   calibration, the SpTS record `spA<k>` when the record file's checksum
-//!   holds.  A record no channel takes is refused.
+//!   Unit channel `c` reads the sense pair at ports `(2c+1, 2c)` of the
+//!   `[V0, I0, V1, I1, ...]` telemetry bus, and the factory calibration
+//!   from SpTS record `c`, by position (Daybreak t-4672): the record's
+//!   data-source ID (`spA<n>`) is provenance, never an index, so sparse
+//!   IDs such as the M2's `spA0 spA1 spA4 spA5` bind all four channels.  A
+//!   record file whose checksum holds must have one record per channel, or
+//!   the compile is refused.  `SpeakerInputDataSourceOrder` (property
+//!   64005) permutes only the telemetry streams; its encoding is not
+//!   specified, so a strip that sets it is refused rather than guessed
+//!   (no shipped strip does).
 //!
 //!   The start state is the engine's, from the global `ThermalStateOverride`:
 //!   the raw 64007 value the AID's strip sets, unset = 0 (SPEC-SPP3 section
@@ -53,10 +56,8 @@
 //! which [`crate::tuning::Protection::lanes`] records.
 
 use crate::error::{Diagnostics, Error, Result};
-use crate::fourcc::FourCc;
 use crate::machine::{Description, Machine};
 use crate::names::{SCOPE_GLOBAL, SCOPE_PART};
-use crate::plist::Value;
 use crate::strip::PropValue;
 use crate::tuning::{Tuning, UnitKind};
 use sgv2_core::blob::{build_for, machine_field, Pod, MACHINE_LEN};
@@ -66,7 +67,8 @@ use sgv2_core::{atsp, lsm2, spp3, MAX_CHANNELS};
 /// state the specification defines (zero rises over ambient).
 pub const SPP3_COLD_START: u32 = 2;
 pub const PROP_SPP3_THERMAL_STATE_OVERRIDE: u32 = 64007;
-/// `SpeakerInputDataSourceOrder` (spp3 property 64005).
+/// `SpeakerInputDataSourceOrder` (spp3 property 64005): the order of the
+/// telemetry streams, not of the calibration records.
 pub const PROP_SPP3_SOURCE_ORDER: u32 = 64005;
 
 /// How a compile may treat the bundle's provenance.
@@ -217,67 +219,31 @@ struct Spp3Lookup<'a> {
     t: &'a Tuning,
     sidecar: &'a crate::spp3::Sidecar,
     rate: u32,
-    /// Physical data source `spA<k>` of each unit channel.
-    order: Vec<u32>,
     thermal_state_override: u32,
 }
 
-/// `spA<k>`, the data-source ID of physical speaker source `k`.
-pub fn data_source(k: u32) -> Option<FourCc> {
-    (k < 10).then(|| FourCc::from_bytes([b's', b'p', b'A', b'0' + k as u8]))
-}
-
-fn source_index(id: FourCc) -> Option<u32> {
-    match id.bytes() {
-        [b's', b'p', b'A', d @ b'0'..=b'9'] => Some(u32::from(d - b'0')),
-        _ => None,
+/// Refuses a strip that sets `SpeakerInputDataSourceOrder` (64005).  The
+/// property orders the telemetry streams (`spV<n>`, `spI<n>`), and without
+/// it unit channel `c` reads voltage at bus channel `2c` and current at
+/// `2c + 1`.  Its encoding is not specified and no shipped strip sets it,
+/// so it is refused rather than guessed.  It never reorders calibration.
+/// TODO(SPEC): the property's encoding.
+pub fn check_telemetry_order(t: &Tuning) -> Result<()> {
+    match t.protection.strip_properties.iter().find(|p| p.number == PROP_SPP3_SOURCE_ORDER) {
+        None => Ok(()),
+        Some(p) => Err(bad(format!(
+            "the strip sets SpeakerInputDataSourceOrder (64005) to {:?}; its telemetry order is not specified",
+            p.value
+        ))),
     }
-}
-
-/// The physical source of each of the `n` unit channels: property 64005
-/// when the strip sets it, else the default order `0..n`.  The property is
-/// read as an array of data-source IDs (`spA<k>`, as four-character strings
-/// or integers), one per unit channel in channel order; any other form is
-/// refused rather than guessed.  TODO(SPEC): the property's encoding; no
-/// shipped strip sets it.
-pub fn source_order(t: &Tuning, n: usize) -> Result<Vec<u32>> {
-    let Some(p) = t.protection.strip_properties.iter().find(|p| p.number == PROP_SPP3_SOURCE_ORDER) else {
-        return Ok((0..n as u32).collect());
-    };
-    let what = "SpeakerInputDataSourceOrder (64005)";
-    let items = match &p.value {
-        PropValue::Other { value: Value::Array(a), .. } => a,
-        v => return Err(bad(format!("{what} is {v:?}, not an array of data-source IDs"))),
-    };
-    if items.len() != n {
-        return Err(bad(format!("{what} names {} sources for {n} channels", items.len())));
-    }
-    let mut order = Vec::with_capacity(n);
-    for it in items {
-        let id = match it {
-            Value::String(s) => FourCc::from_str_exact(s),
-            Value::Integer(v) => u32::try_from(*v).ok().map(FourCc),
-            _ => None,
-        };
-        let k = id
-            .and_then(source_index)
-            .filter(|k| (*k as usize) < n)
-            .ok_or_else(|| bad(format!("{what} entry {it:?} is not a data source spA0..spA{}", n - 1)))?;
-        if order.contains(&k) {
-            return Err(bad(format!("{what} names spA{k} twice")));
-        }
-        order.push(k);
-    }
-    Ok(order)
 }
 
 impl Spp3Lookup<'_> {
-    /// The factory calibration record of unit channel `ch`: the SpTS record
-    /// of the channel's data source.  `None` (open loop) without a valid
-    /// record file or a matching record.
+    /// The factory calibration record of unit channel `ch`: SpTS record
+    /// `ch`, by position.  `None` (open loop) without a valid record file;
+    /// a valid file has one record per channel (checked before lookup).
     fn calibration(&self, ch: usize) -> Option<&crate::spts::Record> {
-        let s = self.t.spts.as_ref().filter(|s| s.checksum_valid)?;
-        s.by_source(data_source(*self.order.get(ch)?)?)
+        self.t.spts.as_ref().filter(|s| s.checksum_valid)?.records.get(ch)
     }
 }
 
@@ -339,8 +305,8 @@ impl spp3::TuningLookup for Spp3Lookup<'_> {
         Some(ch as u32)
     }
     fn sense(&self, ch: usize) -> Option<(u32, u32)> {
-        let k = *self.order.get(ch)?;
-        Some((2 * k + 1, 2 * k))
+        let c = ch as u32;
+        Some((2 * c + 1, 2 * c))
     }
 }
 
@@ -365,18 +331,18 @@ fn compile_spp3(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
     }
     let rate = sample_rate(t)?;
     let tso = thermal_state_override(t)?;
-    let order = source_order(t, n)?;
-    // Every valid record must belong to a channel: one that does not means
-    // the records and the channels disagree, and a guessed binding would
-    // seed one speaker's closed loop with another's calibration.
+    check_telemetry_order(t)?;
+    // Records bind by position, so a valid file must have exactly one per
+    // channel: any other count means the records and the channels disagree,
+    // and a guessed binding would seed one speaker's closed loop with
+    // another's calibration.
     if let Some(s) = t.spts.as_ref().filter(|s| s.checksum_valid) {
-        for r in &s.records {
-            if !source_index(r.data_source).is_some_and(|k| order.contains(&k)) {
-                return Err(bad(format!("SpTS record {} belongs to no unit channel", r.data_source)));
-            }
+        if s.records.len() != n {
+            let ids: Vec<String> = s.records.iter().map(|r| r.data_source.to_string()).collect();
+            return Err(bad(format!("SpTS has {} records ({}) for {n} unit channels", s.records.len(), ids.join(" "))));
         }
     }
-    let lk = Spp3Lookup { t, sidecar, rate, order, thermal_state_override: tso };
+    let lk = Spp3Lookup { t, sidecar, rate, thermal_state_override: tso };
     let p = spp3::Params::from_lookup(&lk).map_err(|e| bad(format!("spp3 parameters: {e:?}")))?;
     let start = if tso == SPP3_COLD_START { "cold" } else { "hot fallback" };
     diags.info("compile-start-state", "compile", format!("Thermal State Override {tso}: the {start} start state"));
