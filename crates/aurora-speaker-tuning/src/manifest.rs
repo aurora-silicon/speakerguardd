@@ -32,6 +32,12 @@ pub const DSP_DATABASE: &str = "DeviceDSPDatabase.plist";
 pub fn aid_dsp_database(aid: &str) -> String {
     format!("{aid}/DSP/DSPDatabase.plist")
 }
+/// The roots of the files outside `AID<n>/` that an AID's speaker modes
+/// reference (the installer's `shared_files`).
+pub const SHARED_ROOTS: &[&str] = &["Common"];
+/// The loudness manager (the installer's `loudness_manager`), when it lists
+/// the AID.
+pub const LOUDNESS_MANAGER: &str = "DRC/loudness-manager.plist";
 /// Limits the installer applies when collecting; a bundle beyond them is
 /// not one it wrote.
 pub const MAX_FILES: usize = 1024;
@@ -89,6 +95,10 @@ pub struct Manifest {
     pub dsp_database: Option<String>,
     pub speaker_thiele_small: Option<Record>,
     pub files: Vec<Record>,
+    /// Files outside `AID<n>/` the installer lists apart from `files`: its
+    /// `shared_files` (under [`SHARED_ROOTS`]) and its `loudness_manager`.
+    /// Verified like every other record; the compiler does not read them.
+    pub shared: Vec<Record>,
 }
 
 #[derive(Deserialize)]
@@ -110,6 +120,16 @@ struct InstallerJson {
     /// Python writes `null` when unknown, Swift omits the key.
     #[serde(default)]
     speaker_id: Option<u32>,
+    /// Where the installer read the DSP database entry: the shared
+    /// database (macOS 26 and earlier) or the AID's own (macOS 27).
+    /// Optional; missing means the shared database.
+    #[serde(default)]
+    device_dsp_database_source: Option<String>,
+    /// Optional, kept apart from `files` (see [`Manifest::shared`]).
+    #[serde(default)]
+    shared_files: Option<Vec<Record>>,
+    #[serde(default)]
+    loudness_manager: Option<Record>,
 }
 
 #[derive(Deserialize)]
@@ -123,7 +143,7 @@ struct CollectorJson {
 
 impl Manifest {
     pub fn records(&self) -> impl Iterator<Item = &Record> {
-        self.files.iter().chain(self.speaker_thiele_small.iter())
+        self.files.iter().chain(self.speaker_thiele_small.iter()).chain(self.shared.iter())
     }
 
     /// Parses `manifest.json` (installer).
@@ -160,6 +180,30 @@ impl Manifest {
                 ),
             ));
         }
+        if let Some(src) = &j.device_dsp_database_source {
+            if src != DSP_DATABASE && *src != per_aid {
+                return Err(Error::format(
+                    NAME,
+                    format!("device_dsp_database_source {src:?}; expected {DSP_DATABASE:?} or {per_aid:?}"),
+                ));
+            }
+            if !j.files.iter().any(|r| r.path == *src) {
+                return Err(Error::format(NAME, format!("{src} is the database source but not listed")));
+            }
+        }
+        let mut shared = j.shared_files.unwrap_or_default();
+        if let Some(l) = j.loudness_manager {
+            if l.path != LOUDNESS_MANAGER {
+                return Err(Error::format(NAME, format!("loudness manager path {:?}", l.path)));
+            }
+            shared.push(l);
+        }
+        for r in &shared {
+            let root = r.path.split('/').next().unwrap_or("");
+            if r.path != LOUDNESS_MANAGER && (!SHARED_ROOTS.contains(&root) || !r.path.contains('/')) {
+                return Err(Error::format(NAME, format!("shared file {:?} is outside {SHARED_ROOTS:?}", r.path)));
+            }
+        }
         for name in [j.device_dsp_database.as_str(), config.as_str()] {
             if !j.files.iter().any(|r| r.path == name) {
                 return Err(Error::format(NAME, format!("{name} is named but not listed")));
@@ -183,6 +227,7 @@ impl Manifest {
             dsp_database: Some(j.device_dsp_database),
             speaker_thiele_small: j.speaker_thiele_small,
             files: j.files,
+            shared,
         };
         m.check(NAME)?;
         Ok(m)
@@ -211,6 +256,7 @@ impl Manifest {
             dsp_database: None,
             speaker_thiele_small: spts.into_iter().next(),
             files,
+            shared: Vec::new(),
         };
         m.check(COLLECTOR_NAME)?;
         Ok(m)
@@ -384,6 +430,52 @@ mod tests {
         for v in ["-1", "4294967296", "3.0", "true", "\"3\"", "[3]"] {
             let j = installer_with(&one, 1, &format!(r#","speaker_id":{v}"#));
             assert!(Manifest::parse(j.as_bytes()).is_err(), "{v}");
+        }
+    }
+
+    /// What the installer writes since its macOS 27 collector (#100): the
+    /// database source, shared files and the loudness manager, all optional.
+    #[test]
+    fn installer_manifest_macos27_fields() {
+        let sha = sha256_hex(b"x");
+        let rec = |p: &str| format!(r#"{{"path":"{p}","bytes":1,"sha256":"{sha}"}}"#);
+        let one = rec("AID7/a");
+        let db = format!("{one},{}", rec("AID7/DSP/DSPDatabase.plist"));
+        // The J616s macOS 27 shape: a per-AID source, no shared files, no loudness manager.
+        let m = Manifest::parse(
+            installer_with(
+                &db,
+                2,
+                r#","device_dsp_database_source":"AID7/DSP/DSPDatabase.plist","shared_files":[],"loudness_manager":null"#,
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        assert!(m.shared.is_empty());
+        let m = Manifest::parse(
+            installer_with(&one, 1, r#","device_dsp_database_source":"DeviceDSPDatabase.plist""#).as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(m.records().count(), 3);
+        // Shared files and the loudness manager are records, verified and counted.
+        let extra =
+            format!(r#","shared_files":[{}],"loudness_manager":{}"#, rec("Common/x.plist"), rec(LOUDNESS_MANAGER));
+        let m = Manifest::parse(installer_with(&one, 1, &extra).as_bytes()).unwrap();
+        assert_eq!(m.shared.len(), 2);
+        assert_eq!(m.records().count(), 5);
+        for bad in [
+            // an unknown source, or one that is not listed
+            installer_with(&one, 1, r#","device_dsp_database_source":"AID8/DSP/DSPDatabase.plist""#),
+            installer_with(&one, 1, r#","device_dsp_database_source":"AID7/DSP/DSPDatabase.plist""#),
+            // a shared file outside Common/, a bare root, a duplicate, a bad loudness path
+            installer_with(&one, 1, &format!(r#","shared_files":[{}]"#, rec("Other/x"))),
+            installer_with(&one, 1, &format!(r#","shared_files":[{}]"#, rec("Common"))),
+            installer_with(&one, 1, &format!(r#","shared_files":[{}]"#, rec("AID7/a"))),
+            installer_with(&one, 1, &format!(r#","loudness_manager":{}"#, rec("DRC/other.plist"))),
+            // still no unknown keys
+            installer_with(&one, 1, r#","unknown_key":1"#),
+        ] {
+            assert!(Manifest::parse(bad.as_bytes()).is_err(), "{bad}");
         }
     }
 

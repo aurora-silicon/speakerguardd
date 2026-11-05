@@ -17,8 +17,11 @@ Type=notify
 ExecCondition=/usr/libexec/speakerguardd/speakerguardd-gate v2
 # Written by speakerguardd-provision: SGV2_ARGS="--card <ID> --pcm <D>
 # --uid <UID> --params <blob>", the seat user's uid resolved by name.
-# Without the file the unit does not start, and the kernel's floor holds.
-EnvironmentFile=/etc/speakerguardd/speakerguardd.conf
+# Optional ("-"), so that on a board or kernel the gate skips, the unit is
+# skipped cleanly rather than failed. Here it always exists: provisioning,
+# which this unit requires, writes it or fails, and without it the
+# supervisor exits with EX_CONFIG (no restart) and the kernel's floor holds.
+EnvironmentFile=-/etc/speakerguardd/speakerguardd.conf
 ExecStart=/usr/bin/speakerguardd $SGV2_ARGS
 Restart=on-failure
 RestartSec=1s
