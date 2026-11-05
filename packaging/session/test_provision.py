@@ -98,7 +98,9 @@ class Base(unittest.TestCase):
         os.makedirs(bindir)
         self.cli = os.path.join(bindir, "aurora-speaker-tuning")
         with open(self.cli, "w") as f:
-            f.write(FAKE_CLI)
+            # Run by this test's own interpreter: a package build's sandbox
+            # (Nix) has no /usr/bin/env.
+            f.write(FAKE_CLI.replace("#!/usr/bin/env python3", "#!" + sys.executable, 1))
         os.chmod(self.cli, 0o755)
         self.ctl({})
         self.p = prov.Paths(self.root)

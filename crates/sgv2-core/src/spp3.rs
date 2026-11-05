@@ -794,6 +794,10 @@ struct Cl {
     drive_thres: f32,
     trend: [(f64, f64); TREND_N],
     trend_n: usize,
+    /// The trend's resistance: R_s's own smoother (`k_R` per period, the
+    /// same gated windows) seeded at the first window after a (re)start
+    /// instead of at R_cal (NaN until then).
+    r_trend: f32,
     cold_n: u32,
     cold_floor: f64,
     /// The correction may relax the limit on this board
@@ -898,6 +902,7 @@ impl Cl {
             drive_thres: c.pilot_enable_thres,
             trend: [(0.0, 0.0); TREND_N],
             trend_n: 0,
+            r_trend: f32::NAN,
             cold_n: 0,
             // the coldest a coil can honestly read: below both the
             // tuning's coldest valid coil temperature (CalTempRangeMin) and
@@ -927,6 +932,7 @@ impl Cl {
         self.active = false;
         self.fresh = false;
         self.trend_n = 0;
+        self.r_trend = f32::NAN;
         self.cold_n = 0;
         self.implausible = false;
     }
@@ -1002,6 +1008,7 @@ impl Cl {
         let r = libm::sqrtf(pv / pi);
         self.r_window = r;
         self.r_s += self.k_r * (r - self.r_s);
+        self.r_trend = if self.r_trend.is_finite() { self.r_trend + self.k_r * (r - self.r_trend) } else { r };
         // T_CL = fmaf(invTempCo, (Rw - Rshunt)/(R_cal - Rshunt) - 1, T_cal) in
         // Float32, Rw = RdcScale * R_s, the logged window resistance (rig
         // law 3)
@@ -1025,9 +1032,9 @@ impl Cl {
     /// reference, stricter only: it can only stop relaxation). A coil's
     /// resistance rises with its temperature; across the last
     /// [`TREND_N`] driven windows, while the model's T_OL rises by at least
-    /// [`TREND_SPAN_K`], a window resistance falling against T_OL faster
-    /// than [`TREND_SLOPE_FRAC`] of an honest coil's rise means the sense
-    /// is not reading the coil (the J616s live test: V and I swapped, R
+    /// [`TREND_SPAN_K`], the smoothed resistance (R_s's smoother, see
+    /// `r_trend`) falling against T_OL faster than [`TREND_SLOPE_FRAC`] of
+    /// an honest coil's rise means the sense is not reading the coil (the J616s live test: V and I swapped, R
     /// falling as the coils heated, correlation -0.95). So does a coil read
     /// [`COLD_MARGIN_K`] below both the tuning's coldest valid coil
     /// temperature (`CalTempRangeMin`) and the model's ambient on [`COLD_N`] consecutive driven windows (a driven
@@ -1042,14 +1049,19 @@ impl Cl {
             self.cold_n = 0;
             return;
         }
+        // smoothed as R_s, the resistance the reference itself accepts on
+        // (rig law 3a), not the single window's: one noisy window over a
+        // ring where the model runs ahead of a coil that has levelled off
+        // reads as a fall (J616s ladder at volume 1.0: T_OL 175 -> 185 C,
+        // T_CL flat near 120 C, a false trip). Not R_s itself: it e-folds
+        // from R_cal after every (re)start, which falls in a cold room
+        // while the model heats and rises toward a hot reading, masking a
+        // fall; r_trend starts at the first window.
         if self.trend_n == TREND_N {
             self.trend.copy_within(1.., 0);
             self.trend_n -= 1;
         }
-        // the window's own resistance, not the smoother: R_s e-folds from
-        // R_cal after every (re)start, which falls in a cold room while the
-        // model heats
-        self.trend[self.trend_n] = (t_ol, self.r_window as f64);
+        self.trend[self.trend_n] = (t_ol, self.r_trend as f64);
         self.trend_n += 1;
         if self.trend_n == TREND_N {
             let pts = &self.trend[..];
