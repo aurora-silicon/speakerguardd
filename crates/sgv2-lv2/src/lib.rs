@@ -32,7 +32,10 @@
 //!
 //! A blob that is missing, corrupt, for another unit kind, or for another
 //! channel/sense geometry or rate gives the fail-safe unit (20 dB), as macOS
-//! does without its essential parameters.
+//! does without its essential parameters. So does a blob whose pre-stage
+//! ([`sgv2_core::prestage`]: the Mac's own filtering ahead of the unit,
+//! which `run` applies to the program before the unit sees it) is unstable
+//! or would add drive.
 //!
 //! `activate` clears the audio histories but not the thermal model: `run`
 //! publishes the unit's thermal state after every call and `activate`
@@ -46,6 +49,7 @@ pub mod page;
 pub mod ttl;
 
 use core::ffi::{c_char, c_void};
+use sgv2_core::prestage::PreStage;
 use sgv2_core::{
     atsp, lsm2, placeholder, spp3, FailSafe, HandOff, Health, Io, ProtectionUnit, Telemetry, UnitKind, MAX_CHANNELS,
 };
@@ -190,6 +194,22 @@ pub fn load_unit(
     }
 }
 
+/// The pre-stage for a unit `load_unit` built from `blob`: the blob's own,
+/// checked; `None` when it fails its checks (the caller then runs the
+/// fail-safe). A unit not built from a blob (the fail-safe, the
+/// placeholder) runs without one. Not real time.
+pub fn load_prestage(blob: Option<&[u8]>, rate: f64, channels: usize, unit: &AnyUnit) -> Option<PreStage> {
+    let from_blob = matches!(unit, AnyUnit::Spp3(_) | AnyUnit::Lsm2(_) | AnyUnit::Atsp(_));
+    if !from_blob {
+        return Some(PreStage::new(sgv2_core::prestage::Params::identity(channels)));
+    }
+    let p = sgv2_core::blob::prestage(blob?, rate).ok()?;
+    (p.channels == channels).then(|| PreStage::new(p))
+}
+
+/// Frames `run` filters at once; a longer host call is run in chunks.
+pub const SCRATCH_FRAMES: usize = 4096;
+
 struct Instance {
     channels: usize,
     sense: usize,
@@ -204,6 +224,9 @@ struct Instance {
     handoff: HandOff,
     /// The blob payload CRC the unit runs (0: none).
     params_crc: u32,
+    /// The Mac's filtering ahead of the unit, and its output.
+    pre: Box<PreStage>,
+    scratch: Box<[[f32; SCRATCH_FRAMES]; MAX_CHANNELS]>,
 }
 
 fn env_or(var: &str, default: String) -> String {
@@ -226,7 +249,15 @@ unsafe extern "C" fn instantiate(
     let page_path = env_or("SGV2_ENGINE_PAGE", format!("/run/speakerguardd/{uid}/engine"));
     handoff::init();
     let blob = std::fs::read(&blob_path).ok();
-    let (unit, _err, params_crc) = load_unit(blob.as_deref(), rate, channels, sense, role);
+    let (mut unit, _err, mut params_crc) = load_unit(blob.as_deref(), rate, channels, sense, role);
+    let pre = match load_prestage(blob.as_deref(), rate, channels, &unit) {
+        Some(p) => p,
+        None => {
+            unit = AnyUnit::FailSafe(FailSafe::new(UnitKind::Spp3, Health::NO_PARAMS));
+            params_crc = 0;
+            PreStage::new(sgv2_core::prestage::Params::identity(channels))
+        }
+    };
     let attach = attach::Attach::new(
         page_path,
         attach::Header {
@@ -247,6 +278,8 @@ unsafe extern "C" fn instantiate(
         frames: 0,
         handoff: HandOff::EMPTY,
         params_crc,
+        pre: Box::new(pre),
+        scratch: Box::new([[0.0; SCRATCH_FRAMES]; MAX_CHANNELS]),
     });
     Box::into_raw(instance).cast()
 }
@@ -265,6 +298,7 @@ unsafe extern "C" fn activate(handle: *mut c_void) {
     let provided = instance.attach.enter().and_then(|p| p.provided_for(instance.params_crc));
     instance.attach.leave();
     start_stream(instance.unit.as_dyn(), &handoff::SLOT, provided);
+    instance.pre.reset();
     instance.last_frame = u64::MAX;
     instance.frames = 0;
 }
@@ -306,7 +340,32 @@ unsafe extern "C" fn run(handle: *mut c_void, frames: u32) {
 }
 
 fn run_call(instance: &mut Instance, page: Option<&page::EnginePage>, frames: u32) {
-    let (n, s, frames) = (instance.channels, instance.sense, frames as usize);
+    let frames = frames as usize;
+    if frames == 0 {
+        return run_chunk(instance, page, 0, 0);
+    }
+    let mut off = 0;
+    while off < frames {
+        let k = (frames - off).min(SCRATCH_FRAMES);
+        run_chunk(instance, page, off, k);
+        off += k;
+    }
+}
+
+/// `ports[p]`, `off` samples in (null stays null).
+fn at(ports: &[*mut f32; MAX_PORTS], p: usize, off: usize) -> *mut f32 {
+    let q = ports[p];
+    if q.is_null() {
+        q
+    } else {
+        // SAFETY: connected audio ports hold the call's frames; `off` is
+        // inside the call.
+        unsafe { q.add(off) }
+    }
+}
+
+fn run_chunk(instance: &mut Instance, page: Option<&page::EnginePage>, off: usize, frames: usize) {
+    let (n, s) = (instance.channels, instance.sense);
     let empty: &[f32] = &[];
     let mut input = [empty; MAX_CHANNELS];
     let mut sense = [empty; MAX_SENSE];
@@ -316,7 +375,7 @@ fn run_call(instance: &mut Instance, page: Option<&page::EnginePage>, frames: u3
     // buffer, and the call still reports and beats.
     if (0..2 * n).any(|p| instance.ports[p].is_null()) {
         for c in 0..n {
-            let (i, o) = (instance.ports[c], instance.ports[n + c]);
+            let (i, o) = (at(&instance.ports, c, off), at(&instance.ports, n + c, off));
             if o.is_null() {
                 continue;
             }
@@ -347,7 +406,7 @@ fn run_call(instance: &mut Instance, page: Option<&page::EnginePage>, frames: u3
     if aliased {
         for c in 0..n {
             // SAFETY: connected audio ports hold `frames` samples.
-            unsafe { core::slice::from_raw_parts_mut(instance.ports[n + c], frames) }.fill(0.0);
+            unsafe { core::slice::from_raw_parts_mut(at(&instance.ports, n + c, off), frames) }.fill(0.0);
         }
         finish_call(instance, page, frames, Health(Health::FAILSAFE | Health::CHANNEL_MISMATCH));
         return;
@@ -356,13 +415,25 @@ fn run_call(instance: &mut Instance, page: Option<&page::EnginePage>, frames: u3
         // SAFETY: connected audio ports hold `frames` samples and are
         // distinct buffers (checked above).
         unsafe {
-            input[c] = core::slice::from_raw_parts(instance.ports[c], frames);
-            out_store[c] = core::slice::from_raw_parts_mut(instance.ports[n + c], frames);
+            input[c] = core::slice::from_raw_parts(at(&instance.ports, c, off), frames);
+            out_store[c] = core::slice::from_raw_parts_mut(at(&instance.ports, n + c, off), frames);
         }
+    }
+    // The Mac's own filtering ahead of the unit (the pre-stage): the unit
+    // protects what the speakers will actually be driven with.
+    let mut filtered = [empty; MAX_CHANNELS];
+    {
+        let (pre, scratch) = (&mut instance.pre, &mut instance.scratch);
+        for c in 0..n {
+            pre.process(c, input[c], &mut scratch[c][..frames]);
+        }
+    }
+    for (f, buf) in filtered.iter_mut().zip(instance.scratch.iter()).take(n) {
+        *f = &buf[..frames];
     }
     let mut sense_n = 0;
     for (k, slot) in sense.iter_mut().enumerate().take(s) {
-        let p = instance.ports[2 * n + k];
+        let p = at(&instance.ports, 2 * n + k, off);
         if p.is_null() {
             break;
         }
@@ -374,7 +445,7 @@ fn run_call(instance: &mut Instance, page: Option<&page::EnginePage>, frames: u3
     let sense_slice = if sense_n == s { &sense[..s] } else { &sense[..0] };
     let unit = instance.unit.as_dyn();
     let latency = unit.latency_frames() as f32;
-    let health = unit.process(Io { frames, input: &input[..n], sense: sense_slice, output: &mut out_store[..n] });
+    let health = unit.process(Io { frames, input: &filtered[..n], sense: sense_slice, output: &mut out_store[..n] });
     instance.frames += frames as u64;
     if instance.unit.unit().save_state(&mut instance.handoff) {
         handoff::SLOT.publish(&instance.handoff);
@@ -633,6 +704,120 @@ mod tests {
             assert!(out() <= hot + 0.02, "new instance at {}, was {hot}", out());
             ((*d).cleanup)(h);
         }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The pre-stage runs ahead of the unit: a high-pass on channel 0 takes
+    /// a low tone away there and leaves channel 1 alone; a pre-stage that
+    /// would add drive is the fail-safe.
+    #[test]
+    fn the_prestage_filters_the_program_ahead_of_the_unit() {
+        use sgv2_core::blob::Pod;
+        use sgv2_core::prestage::{Params as Pre, Section, FLAG_FROM_TUNING};
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut p = spp3::Params {
+            channels: 2,
+            sample_rate: 48_000,
+            block_frames: 512,
+            thermal_ambient_temp: 25.0,
+            thermal_gain_attack_time_s: 0.5,
+            thermal_gain_release_time_s: 2.0,
+            thermal_lookahead_delay_ms: 1.0,
+            thermal_protection_enabled: 1,
+            ..Default::default()
+        };
+        for c in 0..2 {
+            p.ch[c] = spp3::ChannelParams {
+                source: c as u32,
+                t_sett_vc: 20.0,
+                t_sett_mg: 10.0,
+                tau_tvc: 0.4,
+                tau_tmg: 3.0,
+                temperature_limit: 120.0,
+                hard_temp_limit_headroom: 8.0,
+                reb_ref: 4.0,
+                rshunt: 0.2,
+                ag: 1.0,
+                thermal_ff_speedup_factor: 0.5,
+                ..Default::default()
+            };
+        }
+        // fourth-order Butterworth high-pass at 1 kHz (two sections)
+        let fs = 48_000.0f64;
+        let k = (core::f64::consts::PI * 1000.0 / fs).tan();
+        let mut pre = Pre::identity(2);
+        pre.flags = FLAG_FROM_TUNING;
+        for (i, q2) in [0.765_366_864_730_18f64, 1.847_759_065_022_57].into_iter().enumerate() {
+            let n = 1.0 + q2 * k + k * k;
+            pre.channel[0].sections[i] = Section {
+                b0: 1.0 / n,
+                b1: -2.0 / n,
+                b2: 1.0 / n,
+                a1: 2.0 * (k * k - 1.0) / n,
+                a2: (1.0 - q2 * k + k * k) / n,
+            };
+        }
+        pre.channel[0].count = 2;
+        let blob = sgv2_core::blob::build(UnitKind::Spp3, 2, 0, 48_000, p.as_bytes());
+        let blob = sgv2_core::blob::with_prestage(&blob, &pre).unwrap();
+        let (u, e, _) = load_unit(Some(&blob), 48_000.0, 2, 0, Role::Protect);
+        assert_eq!(e, None);
+        assert!(load_prestage(Some(&blob), 48_000.0, 2, &u).unwrap().params().from_tuning());
+        // a gain over unity is refused, and the plugin runs the fail-safe
+        let mut loud = pre.clone();
+        loud.channel[1].gain = 2.0;
+        let bad = sgv2_core::blob::with_prestage(&blob, &loud).unwrap();
+        let (u_bad, e, _) = load_unit(Some(&bad), 48_000.0, 2, 0, Role::Protect);
+        assert_eq!(e, None);
+        assert!(load_prestage(Some(&bad), 48_000.0, 2, &u_bad).is_none());
+
+        let path = std::env::temp_dir().join(format!("sgv2-prestage-test-{}.bin", std::process::id()));
+        let run = |blob: &[u8]| -> (f32, f32, u32) {
+            std::fs::write(&path, blob).unwrap();
+            std::env::set_var("SGV2_PARAMS", &path);
+            std::env::set_var("SGV2_ENGINE_PAGE", "/nonexistent/sgv2-test");
+            let d = lv2_descriptor(0);
+            let n = 48_000usize;
+            let tone: std::vec::Vec<f32> =
+                (0..n).map(|i| (0.25 * (2.0 * core::f64::consts::PI * 100.0 * i as f64 / fs).sin()) as f32).collect();
+            let mut ol = std::vec![0.0f32; n];
+            let mut or = std::vec![0.0f32; n];
+            let mut ctl = [0.0f32; 3];
+            unsafe {
+                let h = ((*d).instantiate)(d, 48_000.0, core::ptr::null(), core::ptr::null());
+                ((*d).connect_port)(h, 0, tone.as_ptr() as *mut c_void);
+                ((*d).connect_port)(h, 1, tone.as_ptr() as *mut c_void);
+                ((*d).connect_port)(h, 2, ol.as_mut_ptr().cast());
+                ((*d).connect_port)(h, 3, or.as_mut_ptr().cast());
+                for k in 0..3 {
+                    ((*d).connect_port)(h, 4 + k as u32, ctl.as_mut_ptr().add(k).cast());
+                }
+                ((*d).activate.unwrap())(h);
+                // one long host call: the plugin runs it in scratch-sized chunks
+                ((*d).run)(h, n as u32);
+                ((*d).cleanup)(h);
+            }
+            // the 100 Hz component (spp3 may add its pilot tone)
+            let amp = |v: &[f32]| {
+                let (mut re, mut im) = (0.0f64, 0.0f64);
+                for (i, x) in v[n / 2..].iter().enumerate() {
+                    let w = 2.0 * core::f64::consts::PI * 100.0 * (i + n / 2) as f64 / fs;
+                    re += *x as f64 * w.cos();
+                    im += *x as f64 * w.sin();
+                }
+                (2.0 * (re * re + im * im).sqrt() / (n / 2) as f64) as f32
+            };
+            (amp(&ol), amp(&or), ctl[1] as u32)
+        };
+        let (l, r, health) = run(&blob);
+        assert_eq!(health & Health::FAILSAFE, 0);
+        // the unit treats both channels alike; the pre-stage takes channel
+        // 0 down by 80 dB (a decade under its fourth-order corner)
+        assert!(r > 1e-3, "{r}");
+        assert!(l < r * 1.2e-4 && l > r * 0.8e-4, "{l} vs {r}");
+        let (_, r, health) = run(&bad);
+        assert_eq!(health & Health::FAILSAFE, Health::FAILSAFE);
+        assert!(r <= 0.025 + 1e-6, "{r}");
         let _ = std::fs::remove_file(&path);
     }
 

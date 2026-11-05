@@ -29,6 +29,15 @@
 //! - "Speaker Playback Mux" names the front-end ("Primary" or "Secondary")
 //!   that drives the speakers: the supervisor watches that PCM only, so it
 //!   checks the mux every tick.
+//! - "Speaker Protection Crossover" (boolean): the owner declares, before a
+//!   grant, that the engine runs the Mac's own crossover and high-pass ahead
+//!   of the amps (the plugin's pre-stage, compiled from the tuning). The
+//!   owner takes the control's lock after "Speaker Protection" and writes it
+//!   while not granted; the grant latches it. Only with it set does the
+//!   kernel open the tweeters' amp high-pass on machines that open it under
+//!   a grant; without it they stay at the safe corner. Unlocking or closing
+//!   clears it. A kernel without the control opens the high-pass itself
+//!   (no declaration possible or needed).
 
 /// The lease the supervisor asks for: three 10 ms ticks.
 pub const LEASE_MS: u32 = 30;
@@ -38,6 +47,8 @@ pub const LEASE_MAX_MS: u32 = 100;
 
 /// The protection control on the speaker card.
 pub const PROTECTION_CONTROL: &str = "Speaker Protection";
+/// The owner's declaration that the engine runs the Mac's crossover.
+pub const CROSSOVER_CONTROL: &str = "Speaker Protection Crossover";
 /// The per-amp fault control's name suffix.
 pub const FAULT_CONTROL_SUFFIX: &str = "Amp Fault Status";
 /// The per-amp analog gain control's name suffix.
@@ -384,6 +395,37 @@ mod alsa {
                 });
             }
             Ok(k)
+        }
+
+        /// Declare whether the engine runs the Mac's own crossover ahead of
+        /// the amps (see the module documentation). Call after `open` and
+        /// before the first grant. `Ok(false)` on a kernel without the
+        /// control.
+        pub fn declare_crossover(&mut self, on: bool) -> Result<bool, KernelError> {
+            let id = elem_id(CROSSOVER_CONTROL);
+            // SAFETY: a valid fd and a pointer to a live, correctly sized ElemId.
+            if unsafe { ioctl(self.fd(), ELEM_LOCK, &id as *const ElemId) } < 0 {
+                return match errno() {
+                    ENOENT => Ok(false),
+                    EPERM => Err(KernelError::NotOwner),
+                    EBUSY => Err(KernelError::Busy),
+                    e => Err(KernelError::Control(format!("lock crossover: errno {e}"))),
+                };
+            }
+            let mut v = Self::value(id);
+            v.value[0] = i64::from(on);
+            // SAFETY: a valid fd and a live, correctly sized ElemValue.
+            if unsafe { ioctl(self.fd(), ELEM_WRITE, &mut *v as *mut ElemValue) } < 0 {
+                return Err(match errno() {
+                    EPERM => KernelError::NotOwner,
+                    EBUSY => KernelError::Control("crossover: written while granted".into()),
+                    e => KernelError::Control(format!("write crossover: errno {e}")),
+                });
+            }
+            if self.read(id)?.value[0] != i64::from(on) {
+                return Err(KernelError::Control("crossover: the kernel kept another value".into()));
+            }
+            Ok(true)
         }
 
         /// Open the control device without taking ownership: reads only

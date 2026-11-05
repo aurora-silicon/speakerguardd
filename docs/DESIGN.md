@@ -11,12 +11,14 @@
 
 ```
 apps → voicing-pre filter-chain (user volume, the stages before the unit)
-     → protect filter-chain: sgv2 LV2 (all channels, one instance) → the stages after the unit
-     → speaker PCM
+     → protect filter-chain: sgv2 LV2 (all channels, one instance):
+         pre-stage (the speaker graph's own filters per speaker) → unit
+     → the stages after the unit → speaker PCM
 sense PCM (same card, same clock, same cycle) → protect filter-chain sense ports
 ```
 
 - The unit sits where the Mac's own speaker graph places it, and the stages around it come from the same bundle.
+- **Pre-stage.** spp3 limits coil temperature; how hard each cone is driven at low frequency is set by the filtering macOS's graph applies ahead of the unit: the program's high-pass and, per speaker, the crossover (tweeter high-pass, woofer low-pass), shelves, gains and cuts. The compiler reads those filter boxes along each unit channel's lane (`aurora-speaker-tuning::prestage`) into second-order sections that the plugin runs right before the unit (`sgv2-core::prestage`). A filter it cannot carry exactly is left out only when it is a boost; otherwise the compile is refused. The whole response is scaled to never exceed unity, so the pre-stage only takes drive away. The supervisor declares it to the kernel ("Speaker Protection Crossover"), and only then does the kernel open the tweeters' amp high-pass to the Mac's own corner.
 - The core is host-agnostic. The LV2 shim is the host for the PipeWire filter-chain, which every supported distribution ships.
 
 ## Sense
