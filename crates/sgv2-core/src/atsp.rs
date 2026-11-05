@@ -52,11 +52,11 @@
 //! a non-finite model state latches the fail-safe until reset, so neither
 //! can poison the thermal state.
 //!
-//! TODO(SPEC): one-channel streams. The reference renders a one-channel
-//! stream's dezipper on a different (eight-frame block) Float32 path whose
-//! fixed point is about 1.0135, not 1.0060; this unit renders every stream
-//! on the multichannel path (Daybreak t-4688). The thermal model sees the
-//! unit's own output either way.
+//! One-channel streams take the reference's one-channel dezipper path
+//! (SPEC-ATSP 11.4): the same low pass, computed per call as eight-frame
+//! blocks, then a four-frame group, then scalar transitions, with only the
+//! transposed state crossing calls. Its Float32 rounding settles about
+//! 0.7 % above the multichannel path's at 48 kHz.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -74,9 +74,11 @@ pub const NOMINAL_TRIM: f32 = 1.006_007_7;
 /// RBJ low pass at exactly 20 Hz, Q 0.6513333.
 const DEZIPPER_HZ: f64 = 20.0;
 /// The most the dezipper can put out at 48 kHz for targets in `[0, 1]`
-/// ([`dezipper_peak`]): the reference does not cap it, and its startup
-/// step peaks at 1.02834, 1886 frames after the unmute.
-pub const DEZIPPER_PEAK: f32 = 1.0299;
+/// ([`dezipper_peak`]): about 1.030 on the multichannel path and 1.037 on
+/// the one-channel path, whose rounding settles higher. The reference does
+/// not cap it; its multichannel startup step peaks at 1.02834, 1886
+/// frames after the unmute.
+pub const DEZIPPER_PEAK: f32 = 1.04;
 
 /// The most the dezipper can put out for targets in `[0, 1]` at `rate`:
 /// the sum of the positive part of its Float32-coefficient impulse
@@ -103,7 +105,14 @@ pub fn dezipper_peak(rate: f64) -> f32 {
     let dc = (b0 + b1 + b0) / (1.0 + a1 + a2);
     let mut f = Dezipper::new(rate);
     f.settle(1.0);
-    let drift = (f.last() as f64 / dc).max(1.0);
+    // the one-channel path settles on its own rounding
+    let mut m = Dezipper::new(rate);
+    let mut ones = [1.0f32; FRAGMENT];
+    for _ in 0..(1usize << 18) / FRAGMENT {
+        ones.fill(1.0);
+        m.mono_call(&mut ones);
+    }
+    let drift = (f.last().max(m.last()) as f64 / dc).max(1.0);
     (pos * drift * (1.0 + 3e-2)) as f32
 }
 const DEZIPPER_Q: f64 = 0.651_333_3;
@@ -118,7 +127,9 @@ pub const STARTUP_MUTE_S: f64 = 0.005;
 /// `s2 = fma(-a2, y, b0 x)`. Its Float32 fixed point on a unit step is the
 /// reference's +0.052 dB "trim" at 48 kHz.
 ///
-/// A one-frame fragment takes the reference's one-frame path instead
+/// A one-channel stream takes the one-channel path ([`Dezipper::mono_call`])
+/// for every fragment. On more channels, a one-frame fragment takes the
+/// reference's one-frame path instead
 /// (SPEC-ATSP 11.3), a direct form I on the last two inputs and outputs:
 /// `y = fma(b0, x, fma(-a1, y1, fma(b1, x1, fma(b2, x2, -a2 y2))))`. Both
 /// keep both histories, so a stream may mix the two.
@@ -132,6 +143,11 @@ struct Dezipper {
     /// The last two inputs and outputs (`x[n-1], x[n-2], y[n-1], y[n-2]`).
     h: [f32; 4],
     y: f32,
+    /// The one-channel block path's tables (SPEC-ATSP 11.4): the expanded
+    /// numerator response and the all-pole response, each formed in
+    /// binary64 and rounded once.
+    nh: [f32; 8],
+    pg: [f32; 8],
 }
 
 impl Dezipper {
@@ -141,15 +157,141 @@ impl Dezipper {
         let a0 = 1.0 + al;
         let c = libm::cos(w);
         let b0 = ((1.0 - c) / 2.0 / a0) as f32;
-        Dezipper {
-            b0,
-            b1: 2.0 * b0,
-            a1: (-2.0 * c / a0) as f32,
-            a2: ((1.0 - al) / a0) as f32,
-            s: [0.0; 2],
-            h: [0.0; 4],
-            y: 0.0,
+        let (b1, a1, a2) = (2.0 * b0, (-2.0 * c / a0) as f32, ((1.0 - al) / a0) as f32);
+        let (fb0, fb1, fa1, fa2) = (b0 as f64, b1 as f64, a1 as f64, a2 as f64);
+        let (mut h, mut g) = ([0.0f64; 8], [0.0f64; 8]);
+        h[0] = fb0;
+        h[1] = fb1 - fa1 * h[0];
+        h[2] = fb0 - fa1 * h[1] - fa2 * h[0];
+        g[0] = 1.0;
+        g[1] = -fa1;
+        for k in 2..8 {
+            if k >= 3 {
+                h[k] = -fa1 * h[k - 1] - fa2 * h[k - 2];
+            }
+            g[k] = -fa1 * g[k - 1] - fa2 * g[k - 2];
         }
+        Dezipper { b0, b1, a1, a2, s: [0.0; 2], h: [0.0; 4], y: 0.0, nh: h.map(|v| v as f32), pg: g.map(|v| v as f32) }
+    }
+
+    /// `H(i)`: the numerator response, zero out of range.
+    #[inline]
+    fn hh(&self, i: isize) -> f32 {
+        if (0..8).contains(&i) {
+            self.nh[i as usize]
+        } else {
+            0.0
+        }
+    }
+
+    /// `G(i)`: the all-pole response, zero out of range.
+    #[inline]
+    fn gg(&self, i: isize) -> f32 {
+        if (0..8).contains(&i) {
+            self.pg[i as usize]
+        } else {
+            0.0
+        }
+    }
+
+    /// One call's targets through the one-channel path, in place (SPEC-ATSP
+    /// 11.4): complete groups of eight on the block kernel, then a group of
+    /// four if four or more remain, then one scalar transition per frame
+    /// left. Grouping starts at every call; only the transposed state
+    /// crosses calls.
+    fn mono_call(&mut self, buf: &mut [f32]) {
+        let mut i = 0;
+        while buf.len() - i >= 8 {
+            self.mono8(&mut buf[i..i + 8]);
+            i += 8;
+        }
+        if buf.len() - i >= 4 {
+            self.mono4(&mut buf[i..i + 4]);
+            i += 4;
+        }
+        for v in &mut buf[i..] {
+            *v = self.mono1(*v);
+        }
+        if let Some(&y) = buf.last() {
+            self.y = y;
+        }
+    }
+
+    /// Output `k` (0..=3) of a group from its first four inputs and the
+    /// state: one fused chain.
+    #[inline]
+    fn mono_lane(&self, x: &[f32], k: isize) -> f32 {
+        let [s1, s2] = self.s;
+        let mut z = self.hh(k) * x[0];
+        z = libm::fmaf(self.hh(k - 1), x[1], z);
+        z = libm::fmaf(self.hh(k - 2), x[2], z);
+        z = libm::fmaf(self.hh(k - 3), x[3], z);
+        z = libm::fmaf(self.gg(k), s1, z);
+        libm::fmaf(self.gg(k - 1), s2, z)
+    }
+
+    /// The state a group leaves, from its last two inputs and outputs.
+    #[inline]
+    fn mono_state(&mut self, x6: f32, x7: f32, y6: f32, y7: f32) {
+        let mut n1 = self.b0 * x6;
+        n1 = libm::fmaf(self.b1, x7, n1);
+        n1 = libm::fmaf(-self.a2, y6, n1);
+        n1 = libm::fmaf(-self.a1, y7, n1);
+        let mut n2 = 0.0f32 * x6;
+        n2 = libm::fmaf(self.b0, x7, n2);
+        n2 = libm::fmaf(0.0, y6, n2);
+        n2 = libm::fmaf(-self.a2, y7, n2);
+        self.s = [n1, n2];
+    }
+
+    /// A complete eight-frame group: lanes 0-3 one chain each, lanes 4-7
+    /// a chain on the first four inputs and the first state, a chain on
+    /// the second state and the last four inputs, and one rounded add.
+    fn mono8(&mut self, b: &mut [f32]) {
+        let x: [f32; 8] = [b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]];
+        let [s1, s2] = self.s;
+        let mut y = [0.0f32; 8];
+        for (k, yk) in y.iter_mut().enumerate().take(4) {
+            *yk = self.mono_lane(&x, k as isize);
+        }
+        for (k, yk) in y.iter_mut().enumerate().skip(4) {
+            let k = k as isize;
+            let mut lo = self.hh(k) * x[0];
+            lo = libm::fmaf(self.hh(k - 1), x[1], lo);
+            lo = libm::fmaf(self.hh(k - 2), x[2], lo);
+            lo = libm::fmaf(self.hh(k - 3), x[3], lo);
+            lo = libm::fmaf(self.gg(k), s1, lo);
+            let mut hi = self.hh(k - 4) * x[4];
+            hi = libm::fmaf(self.gg(k - 1), s2, hi);
+            hi = libm::fmaf(self.hh(k - 5), x[5], hi);
+            hi = libm::fmaf(self.hh(k - 6), x[6], hi);
+            hi = libm::fmaf(self.hh(k - 7), x[7], hi);
+            *yk = lo + hi;
+        }
+        self.mono_state(x[6], x[7], y[6], y[7]);
+        b.copy_from_slice(&y);
+    }
+
+    /// A four-frame group: the lane 0-3 chains, the state from frames 2, 3.
+    fn mono4(&mut self, b: &mut [f32]) {
+        let x: [f32; 4] = [b[0], b[1], b[2], b[3]];
+        let mut y = [0.0f32; 4];
+        for (k, yk) in y.iter_mut().enumerate() {
+            *yk = self.mono_lane(&x, k as isize);
+        }
+        self.mono_state(x[2], x[3], y[2], y[3]);
+        b.copy_from_slice(&y);
+    }
+
+    /// One scalar transition (calls and remainders of one to three frames).
+    #[inline]
+    fn mono1(&mut self, x: f32) -> f32 {
+        let [s1, s2] = self.s;
+        let y = libm::fmaf(self.b0, x, s1);
+        let n1 = libm::fmaf(-self.a1, y, libm::fmaf(self.b1, x, s2));
+        let n2 = libm::fmaf(self.b0, x, -self.a2 * y);
+        self.s = [n1, n2];
+        y
     }
     #[inline]
     fn step(&mut self, x: f32) -> f32 {
@@ -888,10 +1030,17 @@ impl Run {
         for c in 0..self.n {
             let ch = &mut self.ch[c];
             let d = &mut self.dez[c];
-            let sched = &self.sched[c * FRAGMENT..c * FRAGMENT + m];
+            let sched = &mut self.sched[c * FRAGMENT..c * FRAGMENT + m];
+            // the targets become the gains in place
+            if self.n == 1 {
+                d.mono_call(sched);
+            } else {
+                for t in sched.iter_mut() {
+                    *t = if m == 1 { d.step1(*t) } else { d.step(*t) };
+                }
+            }
             let mut op = self.out_pos;
-            for (j, &t) in sched.iter().enumerate() {
-                let g = if m == 1 { d.step1(t) } else { d.step(t) };
+            for (j, &g) in sched.iter().enumerate() {
                 let y = held(io.input[c][f + j]) * g;
                 io.output[c][f + j] = crate::dsp::bound1(y);
                 ch.win_out[op] = crate::dsp::meter1(y);
@@ -1096,5 +1245,175 @@ impl ProtectionUnit for Unit {
             r.retune(&p);
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod mono_tests {
+    //! The one-channel dezipper path against SPEC-ATSP 11.4's call rules.
+    extern crate std;
+    use super::Dezipper;
+    use alloc::vec::Vec;
+    use proptest::prelude::*;
+
+    /// Run `x` through a fresh one-channel dezipper as calls of `sizes`
+    /// (cycled), returning the output bits.
+    fn run(rate: f64, x: &[f32], sizes: &[usize]) -> Vec<u32> {
+        let mut d = Dezipper::new(rate);
+        let mut buf = x.to_vec();
+        let (mut i, mut k) = (0, 0);
+        while i < buf.len() {
+            let m = sizes[k % sizes.len()].min(buf.len() - i);
+            d.mono_call(&mut buf[i..i + m]);
+            i += m;
+            k += 1;
+        }
+        buf.iter().map(|v| v.to_bits()).collect()
+    }
+
+    /// An independent reading of the law, written as the spec states it:
+    /// one call's frames as groups of eight, then four, then one.
+    fn reference(rate: f64, x: &[f32], sizes: &[usize]) -> Vec<u32> {
+        let d = Dezipper::new(rate);
+        let (b0, b1, a1, a2) = (d.b0, d.b1, d.a1, d.a2);
+        let hh = |i: isize| if (0..8).contains(&i) { d.nh[i as usize] } else { 0.0 };
+        let gg = |i: isize| if (0..8).contains(&i) { d.pg[i as usize] } else { 0.0 };
+        let fma = libm::fmaf;
+        let (mut s1, mut s2) = (0.0f32, 0.0f32);
+        let mut out = Vec::new();
+        let (mut i, mut k) = (0, 0);
+        while i < x.len() {
+            let m = sizes[k % sizes.len()].min(x.len() - i);
+            let call = &x[i..i + m];
+            let mut j = 0;
+            while j < m {
+                let group = if m - j >= 8 {
+                    8
+                } else if m - j >= 4 {
+                    4
+                } else {
+                    1
+                };
+                let xs = &call[j..j + group];
+                let mut y = [0.0f32; 8];
+                if group == 1 {
+                    let yy = fma(b0, xs[0], s1);
+                    let n1 = fma(-a1, yy, fma(b1, xs[0], s2));
+                    let n2 = fma(b0, xs[0], -a2 * yy);
+                    (s1, s2) = (n1, n2);
+                    out.push(yy.to_bits());
+                    j += 1;
+                    continue;
+                }
+                for (kk, yk) in y.iter_mut().enumerate().take(group) {
+                    let kk = kk as isize;
+                    let mut lo = hh(kk) * xs[0];
+                    for t in 1..4 {
+                        lo = fma(hh(kk - t), xs[t as usize], lo);
+                    }
+                    lo = fma(gg(kk), s1, lo);
+                    *yk = if kk < 4 {
+                        fma(gg(kk - 1), s2, lo)
+                    } else {
+                        let mut hi = hh(kk - 4) * xs[4];
+                        hi = fma(gg(kk - 1), s2, hi);
+                        for t in 5..8 {
+                            hi = fma(hh(kk - t), xs[t as usize], hi);
+                        }
+                        lo + hi
+                    };
+                }
+                let (p, q) = (group - 2, group - 1);
+                let n1 = fma(-a1, y[q], fma(-a2, y[p], fma(b1, xs[q], b0 * xs[p])));
+                let n2 = fma(-a2, y[q], fma(0.0, y[p], fma(b0, xs[q], 0.0 * xs[p])));
+                (s1, s2) = (n1, n2);
+                out.extend(y[..group].iter().map(|v| v.to_bits()));
+                j += group;
+            }
+            i += m;
+            k += 1;
+        }
+        out
+    }
+
+    fn program(seed: u64, len: usize) -> Vec<f32> {
+        // piecewise-constant targets in [0, 1], as the controller holds them,
+        // with some per-frame noise to reach every lane's arithmetic
+        let mut s = seed | 1;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s >> 40) as f32 / (1u64 << 24) as f32
+        };
+        let mut v = Vec::with_capacity(len);
+        let mut level = 0.0;
+        for i in 0..len {
+            if i % 240 == 0 {
+                level = next();
+            }
+            v.push(if i % 3 == 0 { next() } else { level });
+        }
+        v
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// Any partition into calls follows the 8 / 4 / scalar call law.
+        #[test]
+        fn any_call_partition_follows_the_law(
+            seed in any::<u64>(), len in 1usize..3000,
+            sizes in proptest::collection::vec(1usize..600, 1..12),
+            rate in prop_oneof![Just(48_000.0f64), Just(44_100.0), Just(96_000.0)],
+        ) {
+            let x = program(seed, len);
+            prop_assert_eq!(run(rate, &x, &sizes), reference(rate, &x, &sizes));
+        }
+
+        /// A call of `m` frames is calls of eight, then one call of the rest:
+        /// grouping restarts at every call and only the state crosses it.
+        #[test]
+        fn a_call_is_its_eights_then_its_rest(seed in any::<u64>(), m in 1usize..=512, reps in 1usize..6) {
+            let x = program(seed, m * reps);
+            let mut split = alloc::vec![8usize; m / 8];
+            if m % 8 != 0 {
+                split.push(m % 8);
+            }
+            prop_assert_eq!(run(48_000.0, &x, &[m]), run(48_000.0, &x, &split));
+        }
+
+        /// The residual: a call of five to seven frames is a four-frame call
+        /// and one-frame calls; one to three frames are one-frame calls.
+        #[test]
+        fn short_calls_are_a_group_of_four_and_scalars(seed in any::<u64>(), m in 1usize..=7, reps in 1usize..200) {
+            let x = program(seed, m * reps);
+            let split: Vec<usize> = if m >= 4 { core::iter::once(4).chain(core::iter::repeat_n(1, m - 4)).collect() } else { alloc::vec![1; m] };
+            prop_assert_eq!(run(48_000.0, &x, &[m]), run(48_000.0, &x, &split));
+        }
+
+        /// Calls of whole groups of eight agree with one another.
+        #[test]
+        fn multiples_of_eight_agree(seed in any::<u64>(), len in 1usize..4000, a in 1usize..64, b in 1usize..64) {
+            let x = program(seed, len);
+            prop_assert_eq!(run(48_000.0, &x, &[8 * a]), run(48_000.0, &x, &[8 * b]));
+        }
+    }
+
+    /// It is the same low pass as the multichannel path: a step settles to
+    /// within 1 % of the filter's gain, as the transposed form does.
+    #[test]
+    fn same_filter_as_the_multichannel_path() {
+        let x = alloc::vec![0.5f32; 48_000];
+        let mut d = Dezipper::new(48_000.0);
+        let mut buf = x.clone();
+        for c in buf.chunks_mut(512) {
+            d.mono_call(c);
+        }
+        let mut t = Dezipper::new(48_000.0);
+        let want: Vec<f32> = x.iter().map(|&v| t.step(v)).collect();
+        for (k, (a, b)) in buf.iter().zip(&want).enumerate().skip(4800) {
+            assert!((a - b).abs() < 0.01 * 0.5, "{k}: {a} vs {b}");
+        }
     }
 }
