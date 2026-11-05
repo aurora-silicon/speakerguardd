@@ -3,17 +3,21 @@ Description=Speaker protection supervisor (in-graph, macOS-parity)
 Documentation=https://github.com/aurora-silicon/speakerguardd/tree/v2
 # Without this service no protection holds the amplifiers, and the kernel's
 # own safe level applies. There is deliberately no OnFailure= chain.
-After=systemd-udev-settle.service speakerguardd-selfcheck.service
-# The first-boot wiring self-check: the supervisor grants only with its
-# passing record for this board, kernel and parameter blob.
-Requires=speakerguardd-selfcheck.service
+After=systemd-udev-settle.service speakerguardd-provision.service speakerguardd-selfcheck.service
+# Provisioning (the parameter blob from this Mac's tuning, the seat user,
+# this unit's configuration) and the first-boot wiring self-check: the
+# supervisor grants only with a passing record of both for this board,
+# kernel and parameter blob.
+Requires=speakerguardd-provision.service speakerguardd-selfcheck.service
 ConditionPathExists=/proc/device-tree/compatible
 
 [Service]
 Type=notify
-# Per machine: SGV2_ARGS="--pcm <D> --uid <UID> --params <blob>" (and
-# --card <N|ID> to override the machine's own card). Without the file the
-# unit does not start, and the kernel's floor holds.
+# Only on a board the fleet gate places on v2, with the v2 kernel interface.
+ExecCondition=/usr/libexec/speakerguardd/speakerguardd-gate v2
+# Written by speakerguardd-provision: SGV2_ARGS="--card <ID> --pcm <D>
+# --uid <UID> --params <blob>", the seat user's uid resolved by name.
+# Without the file the unit does not start, and the kernel's floor holds.
 EnvironmentFile=/etc/speakerguardd/speakerguardd.conf
 ExecStart=/usr/bin/speakerguardd $SGV2_ARGS
 Restart=on-failure

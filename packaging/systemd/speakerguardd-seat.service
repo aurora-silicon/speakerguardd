@@ -1,0 +1,11 @@
+[Unit]
+Description=Provision speaker protection for seat0's user (speakerguardd v2)
+Documentation=https://github.com/aurora-silicon/speakerguardd/blob/v2/docs/NEW-PLATFORM.md
+# A regular user other than the provisioned one is active on seat0 (or
+# nobody was provisioned, as on a Mac with several users before the first
+# login): restart the supervisor, which provisions again for that user.
+
+[Service]
+Type=oneshot
+ExecCondition=/usr/libexec/speakerguardd/speakerguardd-gate v2
+ExecStart=/usr/libexec/speakerguardd/speakerguardd-provision seat --unit speakerguardd.service

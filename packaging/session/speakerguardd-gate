@@ -1,0 +1,184 @@
+#!/usr/bin/python3 -I
+"""speakerguardd-gate: which speaker protection runs on this Mac.
+
+    speakerguardd-gate v2      [--machines F] [--gate F] [--wait S]
+    speakerguardd-gate legacy  [--machines F] [--gate F] [--wait S]
+    speakerguardd-gate explain [--machines F] [--gate F] [--wait S]
+
+Every Mac carries both stacks: speakerguardd v2, and the older daemons
+(speakerguardd 0.1, speakersafetyd). This program is the ExecCondition of
+both, so exactly one of them runs on a board, chosen at boot:
+
+- v2 runs (`v2` exits 0) when
+  1. the board's protection unit is at parity (gate.json units_at_parity;
+     the unit is the machines.json entry's, or for a board without one, the
+     one its tuning names);
+  2. while gate.json require_qualified_board is true, the board is in its
+     entry's qualified list (a passing audible run on the shipped tree), or
+     /etc/speakerguardd/allow-unqualified names it (qualification itself);
+  3. the kernel has the v2 interface: the speaker card has a "Speaker
+     Protection" control.
+- the older daemons run (`legacy` exits 0) when v2 does not and the kernel
+  does not have that interface: on a v2 kernel they have nothing to own.
+  A board on a v2 kernel that does not pass 1 and 2 runs neither, and the
+  kernel holds its speakers at the floor.
+
+So the kernel is the switch. A fleet kernel without the v2 interface keeps
+every Mac on the older daemons; the kernel that brings the interface moves
+every gated Mac to v2 at once, and booting the older kernel again moves it
+back. The data (machines.json, gate.json) comes from speakerguardd itself
+and is the same in every distribution.
+
+Exit 0: start the unit. Exit 1: skip it (systemd logs the condition).
+The reason goes to stderr, so the journal says why.
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+DT = "/proc/device-tree"
+ALLOW = "/etc/speakerguardd/allow-unqualified"
+CONTROL = "Speaker Protection"
+
+
+def log(*a):
+    print("speakerguardd-gate:", *a, file=sys.stderr, flush=True)
+
+
+def board_of(dt):
+    try:
+        with open(os.path.join(dt, "compatible"), "rb") as f:
+            first = f.read().split(b"\0", 1)[0].decode()
+    except (OSError, UnicodeDecodeError):
+        return None
+    return first[len("apple,"):] if first.startswith("apple,") and len(first) > 6 else None
+
+
+def machine_entry(machines, board):
+    for k, c in machines.items():
+        if board in c.get("boards", [k]) or board == k:
+            return k, c
+    return None, None
+
+
+def tuning_unit(cli):
+    """The protection unit this Mac's own tuning names, or None."""
+    try:
+        r = subprocess.run([cli, "dump", "--json"], capture_output=True, text=True, timeout=30)
+        return json.loads(r.stdout)["tuning"]["protection"]["kind"]
+    except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired):
+        return None
+
+
+def speaker_card(entry, sysfs="/sys/class/sound"):
+    """The speaker card's ALSA id: the entry's, else the card whose device
+    tree node is the macaudio sound node."""
+    if entry and entry.get("card"):
+        return entry["card"] if os.path.exists(f"/proc/asound/{entry['card']}") else None
+    try:
+        names = sorted(os.listdir(sysfs))
+    except OSError:
+        return None
+    for d in names:
+        if not re.fullmatch(r"card\d+", d):
+            continue
+        try:
+            with open(f"{sysfs}/{d}/device/of_node/compatible", "rb") as f:
+                compat = f.read().split(b"\0")
+            if b"apple,macaudio" in compat:
+                with open(f"/proc/asound/{d}/id") as f:
+                    return f.read().strip()
+        except OSError:
+            continue
+    return None
+
+
+def kernel_interface(entry, wait):
+    """'v2' (the card has "Speaker Protection"), 'legacy' (a speaker card
+    without it) or None (no speaker card within the wait)."""
+    deadline = time.monotonic() + wait
+    while True:
+        card = speaker_card(entry)
+        if card:
+            break
+        if time.monotonic() >= deadline:
+            return None, None
+        time.sleep(0.25)
+    try:
+        r = subprocess.run(["amixer", "-c", card, "cget", f"name={CONTROL}"], capture_output=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log(f"amixer: {e}")
+        return None, card
+    return ("v2" if r.returncode == 0 else "legacy"), card
+
+
+def decide(args):
+    """(v2 runs, legacy runs, reason)."""
+    with open(args.gate) as f:
+        gate = json.load(f)
+    with open(args.machines) as f:
+        machines = json.load(f)
+    board = board_of(args.dt)
+    if board is None:
+        return False, True, "no Apple device tree: not an Apple Silicon Mac"
+    key, entry = machine_entry(machines, board)
+    unit = entry.get("unit") if entry else tuning_unit(args.tuning_cli)
+    parity = gate.get("units_at_parity", [])
+    why_not = None
+    if unit is None:
+        why_not = f"{board} has no machine description and its tuning names no protection unit"
+    elif unit not in parity:
+        why_not = f"{board}'s protection unit {unit} is not at parity yet (at parity: {' '.join(parity) or 'none'})"
+    elif gate.get("require_qualified_board", True) and board not in (entry or {}).get("qualified", []):
+        allowed = False
+        try:
+            with open(ALLOW) as f:
+                allowed = board in f.read().split()
+        except OSError:
+            pass
+        if not allowed:
+            why_not = f"{board} has not qualified on speakerguardd v2 (no passing audible run on the shipped tree)"
+        else:
+            log(f"{board} has not qualified; {ALLOW} names it, so v2 may start")
+    iface, card = kernel_interface(entry, args.wait)
+    if iface is None:
+        return False, True, (why_not or f"{board} is gated") + "; no speaker card: the older daemons decide for themselves"
+    if why_not:
+        if iface == "v2":
+            return False, False, f"{why_not}; the kernel has the v2 interface ({card}), so the older daemons have nothing to own: the kernel holds the speakers at its floor"
+        return False, True, f"{why_not}; the older daemons protect the speakers"
+    if iface == "legacy":
+        return False, True, f"{board} is gated for v2, but this kernel has no \"{CONTROL}\" control on {card}: the older daemons protect the speakers"
+    return True, False, f"{board} ({unit}) is gated for v2 and the kernel has the v2 interface on {card}: speakerguardd v2 protects the speakers"
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="speakerguardd-gate")
+    ap.add_argument("cmd", choices=["v2", "legacy", "explain"])
+    ap.add_argument("--machines", default="/usr/share/speakerguardd/machines.json")
+    ap.add_argument("--gate", default="/usr/share/speakerguardd/gate.json")
+    ap.add_argument("--dt", default=DT)
+    ap.add_argument("--tuning-cli", default="aurora-speaker-tuning")
+    ap.add_argument("--wait", type=float, default=15.0, help="seconds to wait for the speaker card")
+    args = ap.parse_args()
+    try:
+        v2, legacy, why = decide(args)
+    except (OSError, ValueError) as e:
+        # Without its data the gate cannot place v2: the older daemons keep
+        # the speakers, as before v2 was installed.
+        v2, legacy, why = False, True, f"cannot read the gate data: {e}"
+    if args.cmd == "explain":
+        print(f"v2={int(v2)} legacy={int(legacy)}: {why}")
+        return 0
+    run = v2 if args.cmd == "v2" else legacy
+    log(("starting: " if run else "not starting: ") + why)
+    return 0 if run else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

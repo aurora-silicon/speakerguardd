@@ -1,13 +1,20 @@
-# /etc/speakerguardd/speakerguardd.conf (example for the MacBook Pro J316)
+# /etc/speakerguardd/speakerguardd.conf is generated at every boot by
+# speakerguardd-provision (docs/NEW-PLATFORM.md, section 4); this is what it
+# looks like on the MacBook Pro J316. Do not edit it: overrides go in
+# /etc/speakerguardd/provision.conf (SGV2_SEAT_USER=<name>, SGV2_BUNDLE=<path>).
+#
 # The machine (packaging/session/machines.json, or for a Mac with no entry the
-# board, as the self-check's record names it), for the session helper.
+# board), for the session helper.
 SGV2_MACHINE=j316
-# The supervisor: the speaker card (by id; the machine's own card if left out),
-# its speaker PCM (the front-end "Speaker Playback Mux" selects: 1 =
-# Secondary), the session user's uid and the parameter blob, compiled for this
-# board (the supervisor refuses a blob for another Mac).
+# The seat user, by name, and its uid from the user database.
+SGV2_USER=ryan
+SGV2_UID=1000
+# The supervisor: the speaker card, its speaker PCM (the front-end
+# "Secondary"), the seat user's uid and the parameter blob, compiled for this
+# board from this Mac's own tuning (the supervisor refuses a blob for another
+# Mac).
 SGV2_ARGS="--card AppleJ316 --pcm 1 --uid 1000 --params /var/lib/speakerguardd/params.bin"
-# The self-check (speakerguardd-selfcheck.service): the same blob, and the
-# tuning source it was compiled from (empty: the installer's bundle).
+# The self-check: the same blob, and the tuning source it was compiled from
+# (empty: the installer's bundle).
 SGV2_PARAMS=/var/lib/speakerguardd/params.bin
 SGV2_TUNING=

@@ -1,0 +1,5 @@
+{
+  "_doc": "The fleet gate (speakerguardd-gate). speakerguardd v2 runs on a board only if its protection unit is in units_at_parity and, while require_qualified_board is true, the board is in its machines.json entry's qualified list (a passing audible run on the shipped tree). The fleet cutover (option A) adds lsm2 and atsp here once they reach parity and sets require_qualified_board to false: every board with a parity unit. The kernel decides the rest: v2 runs only on a kernel with the Speaker Protection interface, the older daemons only on one without it. Every distribution ships this file unchanged.",
+  "units_at_parity": ["spp3"],
+  "require_qualified_board": true
+}
