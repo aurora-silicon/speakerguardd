@@ -70,7 +70,11 @@ No byte of the version-1 header is free for them. Proposal for a header version 
 - at 52, the speaker ID (u32);
 - at 56, flags (u32), bit 0 meaning the speaker ID is present.
 
-With these, the supervisor can compare the acoustic-id with the installed bundle's manifest, and the speaker ID with the device tree export once it exists. Until then, the compiler checks the acoustic-id against an independently known value when the caller has one (`Machine::acoustic_id`). On Linux no such value exists, so the binding rests on the board and the speaker ID used for selection.
+With these, the supervisor can compare the acoustic-id with the installed bundle's manifest, and the speaker ID with the device tree export once it exists. The compiler requires the installer's `machine_model` (canonical root target-type: `J616sAP` becomes `j616s`) to match Linux's first root compatible (`apple,j616s`). It also requires the manifest's `acoustic_id` to equal aura's `/chosen/asahi,acoustic-id`, a big-endian FDT u32 read independently from exactly one ADT audio node. Missing model or acoustic-ID export refuses production compilation; recollect old bundles and update aura. Development compiles can omit identity, with diagnostics, but cannot override a known mismatch.
+
+SpTS calibration is enabled only for a verified bundle whose `unit_id_sha256` equals the hash of Linux's root `serial-number`, which aura copies from the ADT. All three readers hash the ASCII serial bytes after removing trailing NUL bytes only (1–128 printable non-space ASCII bytes; no case or whitespace conversion). An absent or different hash disables every calibration record and compiles open loop, with a diagnostic; other validated model tuning remains usable. The hash and model participate in the bundle digest used by provisioning, so adding/changing identity invalidates a cached compile. Raw serials are never written to a bundle or diagnostic.
+
+These are accidental cross-device-use checks, not authentication: the manifest has no signature. A deliberately rewritten manifest is outside this integrity contract. Land the reader before collectors that emit the optional schema-2 identity fields, because older readers reject unknown fields. Offline `--board` compiles require `--development` and should specify `--acoustic-id`; they have no live unit identity and cannot enable SpTS. CLI identity overrides are refused when a live device tree exists.
 
 ## Rollout
 

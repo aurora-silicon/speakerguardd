@@ -86,6 +86,8 @@ pub struct Manifest {
     /// macOS build the tuning was collected from (`kern.osversion`), if known.
     pub macos_build: Option<String>,
     pub machine_model: Option<String>,
+    /// SHA-256 of the collecting Mac's root serial-number, without trailing NULs.
+    pub unit_id_sha256: Option<String>,
     /// The speaker-assembly ID (macOS `speakerID`, HAL `spid`) the
     /// installer read on this Mac, if it could.
     pub speaker_id: Option<u32>,
@@ -128,6 +130,8 @@ struct InstallerJson {
     acoustic_id: u32,
     aid: String,
     macos_build: String,
+    machine_model: Option<String>,
+    unit_id_sha256: Option<String>,
     speaker_thiele_small: Option<Record>,
     device_dsp_database: String,
     config: String,
@@ -275,7 +279,8 @@ impl Manifest {
             acoustic_id: j.acoustic_id,
             aid: j.aid,
             macos_build: (j.macos_build != "unknown").then_some(j.macos_build),
-            machine_model: None,
+            machine_model: j.machine_model,
+            unit_id_sha256: j.unit_id_sha256,
             speaker_id: j.speaker_id,
             dsp_database: Some(j.device_dsp_database),
             speaker_thiele_small: j.speaker_thiele_small,
@@ -306,6 +311,7 @@ impl Manifest {
             aid: j.acoustic_id_name,
             macos_build: None,
             machine_model: j.machine_model,
+            unit_id_sha256: None,
             speaker_id: None,
             dsp_database: None,
             speaker_thiele_small: spts.into_iter().next(),
@@ -318,6 +324,18 @@ impl Manifest {
     }
 
     fn check(&self, ctx: &str) -> Result<()> {
+        if self.source == Source::Installer {
+            if let Some(model) = &self.machine_model {
+                if !crate::machine::valid_board(model) {
+                    return Err(Error::format(ctx, "machine_model is not a canonical board name"));
+                }
+            }
+        }
+        if let Some(unit) = &self.unit_id_sha256 {
+            if unit.len() != 64 || !unit.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+                return Err(Error::format(ctx, "unit_id_sha256 is not 64 lowercase hex digits"));
+            }
+        }
         if aid_number(&self.aid) != Some(self.acoustic_id) {
             return Err(Error::format(
                 ctx,
@@ -531,6 +549,25 @@ mod tests {
             installer_with(&one, 1, r#","unknown_key":1"#),
         ] {
             assert!(Manifest::parse(bad.as_bytes()).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn installer_identity() {
+        let sha = sha256_hex(b"x");
+        let one = format!(r#"{{"path":"AID7/a","bytes":1,"sha256":"{sha}"}}"#);
+        let extra = format!(r#","machine_model":"j616s","unit_id_sha256":"{sha}""#);
+        let m = Manifest::parse(installer_with(&one, 1, &extra).as_bytes()).unwrap();
+        assert_eq!(m.machine_model.as_deref(), Some("j616s"));
+        assert_eq!(m.unit_id_sha256, Some(sha.clone()));
+        for extra in [
+            r#","machine_model":"J616sAP""#,
+            r#","machine_model":"""#,
+            r#","machine_model":"j616s\n""#,
+            r#","unit_id_sha256":"ABC""#,
+            r#","unit_id_sha256":3"#,
+        ] {
+            assert!(Manifest::parse(installer_with(&one, 1, extra).as_bytes()).is_err());
         }
     }
 

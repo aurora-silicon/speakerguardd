@@ -106,9 +106,12 @@ fn load(files: &BTreeMap<String, Vec<u8>>, name: &str) -> Tuning {
 #[test]
 fn every_shape_compiles_loads_in_its_plugin_and_protects() {
     for s in shapes() {
-        let t = load(&bundle(&s), &format!("atsp-e2e-{}", s.name));
-        let c = compile::compile(&t, &Machine::new(s.board).unwrap(), &mut Diagnostics::default())
-            .unwrap_or_else(|e| panic!("{}: {e:?}", s.name));
+        let mut t = load(&bundle(&s), &format!("atsp-e2e-{}", s.name));
+        t.machine_model = Some(s.board.into());
+        let mut machine = Machine::new(s.board).unwrap();
+        machine.acoustic_id = Some(ACOUSTIC_ID);
+        let c =
+            compile::compile(&t, &machine, &mut Diagnostics::default()).unwrap_or_else(|e| panic!("{}: {e:?}", s.name));
         assert_eq!((c.channels as usize, c.sense_channels), (s.channels, 0), "{}", s.name);
         assert_eq!(c.board, s.board);
 

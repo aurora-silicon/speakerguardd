@@ -267,6 +267,7 @@ impl Bundle {
             aid,
             macos_build: None,
             machine_model: None,
+            unit_id_sha256: None,
             speaker_id: None,
             dsp_database: None,
             speaker_thiele_small: None,
@@ -294,6 +295,14 @@ impl Bundle {
             m.macos_build.as_deref().unwrap_or("-"),
             m.speaker_id.map_or("-".to_string(), |v| v.to_string()),
         );
+        // Include identity in the provisioning digest; old identity-free
+        // bundles retain their digest, but cannot compile for production.
+        if let Some(model) = &m.machine_model {
+            text.push_str(&format!("machine_model={model}\n"));
+        }
+        if let Some(unit) = &m.unit_id_sha256 {
+            text.push_str(&format!("unit_id_sha256={unit}\n"));
+        }
         // An unverified bundle has no records: its files stand for them.
         let mut lines: Vec<String> = if self.verified {
             m.records().map(|r| format!("{}\0{}\0{}", r.path, r.bytes, r.sha256)).collect()
