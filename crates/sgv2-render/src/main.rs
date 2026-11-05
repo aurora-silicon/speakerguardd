@@ -62,7 +62,7 @@ struct Args {
     file_channels: usize,
     limit_frames: usize,
     preset_params: Vec<(u32, f32)>,
-    /// atsp: the stream rate the reference ran (`--rate`), 0 for the blob's.
+    /// atsp and lsm2: the stream rate the reference ran (`--rate`), 0 for the blob's.
     rate: u32,
     params_at: Vec<(usize, u32, f32)>,
     /// Host events by frame (`--events`), in order.
@@ -220,6 +220,11 @@ fn make_unit(
         }
         UnitKind::Lsm2 => lsm2::Params::from_blob(bytes)
             .map(|mut p| {
+                // the stream rate the reference ran (t-4769): the blob's
+                // compilation rate otherwise
+                if rate != 0 {
+                    p.sample_rate = rate;
+                }
                 if let Some(w) = cpms {
                     p.runtime_budget_present = 1;
                     p.runtime_budget_w = w;
