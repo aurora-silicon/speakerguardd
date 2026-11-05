@@ -413,6 +413,58 @@ class UserManager(unittest.TestCase):
             prov.os.path.exists = real_exists
         self.assertNotEqual(r.returncode, 0)
 
+
+class LV2Shadow(unittest.TestCase):
+    """The self-check fails on any sgv2 plugin a session could load instead
+    of the packaged one."""
+
+    def setUp(self):
+        self.sc = load("selfcheck", "speakerguardd-selfcheck")
+        self.root = tempfile.mkdtemp()
+        self.home = os.path.join(self.root, "home", "u")
+        self.etc = os.path.join(self.root, "etc")
+        os.makedirs(self.home); os.makedirs(self.etc)
+
+    def tearDown(self):
+        shutil.rmtree(self.root)
+
+    def bundle(self, d, uri="https://aurora-silicon.org/lv2/sgv2#4ch-vi"):
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "manifest.ttl"), "w") as f:
+            f.write(f"<{uri}> a lv2:Plugin .\n")
+
+    def scan(self, environ=None):
+        return self.sc.lv2_shadows(users=[("u", self.home)], etc=self.etc, environ=environ or {})
+
+    def test_clean(self):
+        self.bundle(os.path.join(self.home, ".lv2", "other.lv2"), "urn:other#x")
+        self.assertEqual(self.scan(), [])
+
+    def test_user_lv2(self):
+        self.bundle(os.path.join(self.home, ".lv2", "sgv2.lv2"))
+        found = self.scan()
+        self.assertEqual(len(found), 1)
+        self.assertIn("~/.lv2", found[0][1])
+
+    def test_renamed_bundle_is_found_by_uri(self):
+        self.bundle(os.path.join(self.home, ".lv2", "old-copy.lv2"))
+        self.assertEqual(len(self.scan()), 1)
+
+    def test_lv2_path_overrides(self):
+        d = os.path.join(self.root, "opt", "lv2")
+        self.bundle(os.path.join(d, "sgv2.lv2"))
+        os.makedirs(os.path.join(self.home, ".config", "environment.d"))
+        with open(os.path.join(self.home, ".config", "environment.d", "50-lv2.conf"), "w") as f:
+            f.write(f"LV2_PATH={d}:/usr/lib64/lv2\n")
+        self.assertEqual([w for _, w in self.scan()], [f"LV2_PATH in {self.home}/.config/environment.d/50-lv2.conf"])
+        with open(os.path.join(self.etc, "environment"), "w") as f:
+            f.write(f'export LV2_PATH="{d}"\n')
+        self.assertEqual(len(self.scan()), 1)
+        self.assertEqual(len(self.scan(environ={"LV2_PATH": d})), 1)
+
+    def test_system_dirs_are_the_packaged_ones(self):
+        self.assertEqual(self.scan(environ={"LV2_PATH": "/usr/lib64/lv2:/usr/lib/lv2"}), [])
+
 class Gate(Base):
     def decide(self, iface="v2", gate_data=None, allow=False):
         g = os.path.join(self.t, "gate.json")
