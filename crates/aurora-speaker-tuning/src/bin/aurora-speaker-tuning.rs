@@ -7,6 +7,7 @@
 //! aurora-speaker-tuning dump     [--json] [--speaker-id N] [SOURCE]
 //! aurora-speaker-tuning validate [--json] [--speaker-id N] [SOURCE]
 //! aurora-speaker-tuning compile  [--speaker-id N] [--board B] [--development] [SOURCE | --bundle PATH] -o BLOB
+//! aurora-speaker-tuning identify [--json] [SOURCE]   (the bundle's identity, for provisioning)
 //! aurora-speaker-tuning blob     BLOB [BLOB]     (decode; with two, diff field by field)
 //! aurora-speaker-tuning units    [--json]
 //! aurora-speaker-tuning plist    FILE            (any plist as XML)
@@ -24,6 +25,11 @@
 //! `--board` (compiling for another Mac), else this Mac's device tree; the
 //! device tree's speaker ID is read only without `--board`.  `compile`
 //! refuses an unverified source (`--tunings-root`) unless `--development`.
+//!
+//! `identify` loads and verifies the bundle (nothing is parsed beyond the
+//! manifest) and prints where it was found and its digest
+//! ([`Bundle::digest`]), its AID, macOS build and speaker ID, and the
+//! reader's version: what a compiled blob is bound to.
 
 use aurora_speaker_tuning::bundle::Bundle;
 use aurora_speaker_tuning::compile::{self, Provenance};
@@ -50,6 +56,7 @@ fn usage() -> ! {
     eprintln!(
         "usage: aurora-speaker-tuning {{dump|validate}} [--json] [--speaker-id N] [PATH | --tunings-root DIR --aid N]\n       \
          aurora-speaker-tuning compile [--speaker-id N] [--board B] [--development] [--bundle PATH | --tunings-root DIR --aid N] -o BLOB\n       \
+         aurora-speaker-tuning identify [--json] [PATH | --tunings-root DIR --aid N]\n       \
          aurora-speaker-tuning blob BLOB [BLOB]\n       \
          aurora-speaker-tuning units [--json]\n       aurora-speaker-tuning plist FILE"
     );
@@ -65,6 +72,7 @@ fn parse_args() -> Args {
         Some("plist") => "plist",
         Some("compile") => "compile",
         Some("blob") => "blob",
+        Some("identify") => "identify",
         _ => usage(),
     }
     .to_string();
@@ -333,6 +341,41 @@ fn trim(s: String, n: u32) -> String {
     out.join("\n")
 }
 
+/// `identify`: the bundle's source and identity, or why there is none.
+fn identify(bundle: aurora_speaker_tuning::Result<Bundle>, json: bool) {
+    let b = match bundle {
+        Ok(b) => b,
+        Err(e) => {
+            if json {
+                println!("{}", serde_json::json!({ "error": e.to_string() }));
+            } else {
+                eprintln!("{e}");
+            }
+            exit(1)
+        }
+    };
+    let m = &b.manifest;
+    let v = serde_json::json!({
+        "source": b.source.display().to_string(),
+        "verified": b.verified,
+        "kind": m.source,
+        "acoustic_id": m.acoustic_id,
+        "aid": m.aid,
+        "macos_build": m.macos_build,
+        "speaker_id": m.speaker_id,
+        "files": m.records().count().max(b.files.len()),
+        "digest": b.digest(),
+        "reader": env!("CARGO_PKG_VERSION"),
+    });
+    if json {
+        println!("{}", serde_json::to_string_pretty(&v).unwrap());
+    } else {
+        for (k, x) in v.as_object().unwrap() {
+            println!("{k}={}", x.as_str().map_or_else(|| x.to_string(), str::to_owned));
+        }
+    }
+}
+
 fn main() {
     let a = parse_args();
     match a.cmd.as_str() {
@@ -394,6 +437,10 @@ fn main() {
         (None, None, None) => Bundle::discover(),
         _ => usage(),
     };
+    if a.cmd == "identify" {
+        identify(bundle, a.json);
+        return;
+    }
     let mut diags = Diagnostics::default();
     let dt = std::path::Path::new(machine::DEVICE_TREE);
     let live = a.board.is_none() && dt.is_dir();

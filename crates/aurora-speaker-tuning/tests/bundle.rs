@@ -242,3 +242,68 @@ fn units_table_covers_every_sidecar_key() {
     }
     assert!(t.iter().filter(|r| r.unit.contains("TODO(SPEC)")).count() > 0);
 }
+
+/// The digest provisioning binds a blob to: the same for the same bundle
+/// wherever and however it is stored, different for any change it states.
+#[test]
+fn digest_is_the_bundle_identity() {
+    let files = spp3_files(2);
+    let manifest = manifest_json(&files, "25G83");
+    let a = scratch("digest-a");
+    write_dir(&a, &files, &manifest);
+    let b = scratch("digest-b");
+    write_dir(&b, &files, &manifest);
+    let da = Bundle::open(&a).unwrap().digest();
+    assert_eq!(da.len(), 64);
+    assert_eq!(da, Bundle::open(&b).unwrap().digest());
+    // As an archive, under a top directory.
+    let path = scratch("digest-tar").join("bundle.tar");
+    {
+        let mut ar = tar::Builder::new(std::fs::File::create(&path).unwrap());
+        let mut add = |name: &str, data: &[u8]| {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(data.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            ar.append_data(&mut h, format!("top/{name}"), data).unwrap();
+        };
+        for (p, d) in &files {
+            add(p, d);
+        }
+        add("manifest.json", manifest.as_bytes());
+        ar.into_inner().unwrap().flush().unwrap();
+    }
+    assert_eq!(da, Bundle::open(&path).unwrap().digest());
+    // Another macOS build, speaker ID or file content is another bundle.
+    let c = scratch("digest-build");
+    write_dir(&c, &files, &manifest_json(&files, "25G84"));
+    assert_ne!(da, Bundle::open(&c).unwrap().digest());
+    let c = scratch("digest-spid");
+    write_dir(&c, &files, &manifest_json_with(&files, "25G83", Some(7)));
+    assert_ne!(da, Bundle::open(&c).unwrap().digest());
+    let mut changed = files.clone();
+    changed.get_mut(&format!("{AID}/DSP/Graphs/builtin_speaker_out.dspg")).unwrap().push(b'\n');
+    let c = scratch("digest-file");
+    write_dir(&c, &changed, &manifest_json(&changed, "25G83"));
+    assert_ne!(da, Bundle::open(&c).unwrap().digest());
+}
+
+/// `identify --json` on a bundle, and on a missing one.
+#[test]
+fn identify_cli() {
+    let files = spp3_files(2);
+    let dir = scratch("identify-cli");
+    write_dir(&dir, &files, &manifest_json(&files, "25G83"));
+    let exe = env!("CARGO_BIN_EXE_aurora-speaker-tuning");
+    let out = std::process::Command::new(exe).args(["identify", "--json"]).arg(&dir).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["digest"].as_str().unwrap(), Bundle::open(&dir).unwrap().digest());
+    assert_eq!(v["macos_build"], "25G83");
+    assert_eq!(v["aid"], AID);
+    assert_eq!(v["verified"], true);
+    let out = std::process::Command::new(exe).args(["identify", "--json"]).arg(dir.join("absent")).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(v["error"].as_str().is_some());
+}

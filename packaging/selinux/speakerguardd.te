@@ -57,8 +57,14 @@ kernel_read_kernel_sysctls(speakerguardd_t)
 # Its configuration.
 files_read_etc_files(speakerguardd_t)
 
-# The first-boot self-check's record (/var/lib/speakerguardd), written by
-# speakerguardd-selfcheck.service and read before any grant.
+# The first-boot self-check's record and the parameter blob
+# (/var/lib/speakerguardd), written by speakerguardd-selfcheck.service and
+# speakerguardd-provision.service and read before any grant. Both run as
+# ordinary system services (unconfined_service_t on Fedora); systemd creates
+# the directory with this label (StateDirectory=), and their files inherit
+# it, so the supervisor reads them with the rules below and nothing else. The
+# configuration provisioning writes (/etc/speakerguardd) is read by systemd
+# (EnvironmentFile=), not by this domain.
 type speakerguardd_var_lib_t;
 files_type(speakerguardd_var_lib_t)
 files_search_var_lib(speakerguardd_t)

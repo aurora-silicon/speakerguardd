@@ -1,0 +1,13 @@
+[Unit]
+Description=Follow seat0's user for speaker protection (speakerguardd v2)
+Documentation=https://github.com/aurora-silicon/speakerguardd/blob/v2/docs/NEW-PLATFORM.md
+ConditionPathExists=/proc/device-tree/compatible
+
+[Path]
+# logind's seat state; it changes when a session on seat0 starts, ends or
+# becomes active. Only the trigger is used: the service asks loginctl.
+PathChanged=/run/systemd/seats/seat0
+Unit=speakerguardd-seat.service
+
+[Install]
+WantedBy=multi-user.target

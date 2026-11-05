@@ -8,16 +8,23 @@ Documentation=https://github.com/aurora-silicon/speakerguardd/blob/v2/docs/NEW-P
 # record for exactly this combination is kept, so a boot without a kernel
 # or tuning change only checks the binding. A failure leaves the floor.
 Before=speakerguardd.service
-After=systemd-udev-settle.service
+After=systemd-udev-settle.service speakerguardd-provision.service
+# Its parameter blob and configuration come from provisioning.
+Requires=speakerguardd-provision.service
 ConditionPathExists=/proc/device-tree/compatible
 
 [Service]
 Type=oneshot
+ExecCondition=/usr/libexec/speakerguardd/speakerguardd-gate v2
 # SGV2_PARAMS: the parameter blob (as in SGV2_ARGS); SGV2_TUNING: the tuning
 # source the blob was compiled from, as aurora-speaker-tuning takes it
 # (empty: the installer's bundle in the vendor firmware).
 EnvironmentFile=/etc/speakerguardd/speakerguardd.conf
-ExecStart=/usr/libexec/speakerguardd/speakerguardd-selfcheck run --params ${SGV2_PARAMS} -- $SGV2_TUNING
+ExecStart=/usr/libexec/speakerguardd/speakerguardd-selfcheck run --params ${SGV2_PARAMS} --machines /usr/share/speakerguardd/machines.json -- $SGV2_TUNING
+# Passed: generate the machine's PipeWire and WirePlumber files from the
+# record (/run/speakerguardd-graph) and bring the seat user's session onto
+# them. A failure here fails the check, so the supervisor does not start.
+ExecStartPost=/usr/libexec/speakerguardd/speakerguardd-provision activate --graph-unit speakerguardd-graph.service
 StateDirectory=speakerguardd
 StateDirectoryMode=0755
 RuntimeDirectory=speakerguardd-selfcheck

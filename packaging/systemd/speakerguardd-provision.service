@@ -1,0 +1,33 @@
+[Unit]
+Description=Speaker protection provisioning (speakerguardd v2)
+Documentation=https://github.com/aurora-silicon/speakerguardd/blob/v2/docs/NEW-PLATFORM.md
+# Before the self-check and the supervisor, which both require it. It
+# compiles this Mac's own tuning bundle (collected by the installer) into
+# the parameter blob, binds the blob to the board, the kernel, the bundle
+# and its macOS build (recompiling only when one changes), resolves the
+# seat user by name, and writes /etc/speakerguardd/speakerguardd.conf. Any
+# failure fails closed: no blob, no configuration, the supervisor does not
+# start, the kernel's floor holds, and the journal says why.
+Before=speakerguardd-selfcheck.service speakerguardd.service
+# The speaker card (its PCM), and the ESP, where the tuning may only be in
+# the vendor firmware archive.
+After=systemd-udev-settle.service local-fs.target boot.mount boot-efi.mount efi.mount
+ConditionPathExists=/proc/device-tree/compatible
+
+[Service]
+Type=oneshot
+ExecCondition=/usr/libexec/speakerguardd/speakerguardd-gate v2
+ExecStart=/usr/libexec/speakerguardd/speakerguardd-provision run
+StateDirectory=speakerguardd
+StateDirectoryMode=0755
+ConfigurationDirectory=speakerguardd
+ConfigurationDirectoryMode=0755
+# The generated speaker graph, which the seat user's PipeWire loads; kept
+# until shutdown, so a boot without v2 leaves none behind.
+RuntimeDirectory=speakerguardd-graph
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+TimeoutStartSec=300
+
+[Install]
+RequiredBy=speakerguardd-selfcheck.service speakerguardd.service
