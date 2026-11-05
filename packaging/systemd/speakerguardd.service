@@ -24,15 +24,18 @@ ExecCondition=/usr/libexec/speakerguardd/speakerguardd-gate v2
 EnvironmentFile=-/etc/speakerguardd/speakerguardd.conf
 ExecStart=/usr/bin/speakerguardd $SGV2_ARGS
 Restart=on-failure
-RestartSec=1s
+# The kernel's floor holds while it is down: come back quickly. A crash
+# loop still ends in the unit's start limit, at the floor.
+RestartSec=100ms
 RestartPreventExitStatus=78
 WatchdogSec=1s
 RuntimeDirectory=speakerguardd
 RuntimeDirectoryMode=0755
-# Kept over a restart: the plugin keeps the engine page mapped, and the
-# supervisor reopens the same file (never truncating it) instead of leaving
-# the plugin on an unlinked page until PipeWire reloads.
-RuntimeDirectoryPreserve=restart
+# Kept over every stop and start, not only an automatic restart: the plugin
+# keeps the engine page mapped, and the supervisor reopens the same file
+# (never truncating it). If the file is replaced anyway, the plugin's page
+# watcher re-attaches to the new one (crates/sgv2-lv2/src/attach.rs).
+RuntimeDirectoryPreserve=yes
 # The speaker card's control device only: it owns "Speaker Protection"
 # there, and closing it (any exit) withdraws protection at once.
 DevicePolicy=closed
