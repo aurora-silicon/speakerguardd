@@ -229,17 +229,26 @@ class SenseCheck(unittest.TestCase):
         switches = {}
         n = len(w["amps"])
 
+        calls = self.calls = []
+
         class FakeStreams:
             def __init__(self, *a):
                 self.fmt = "S24_LE"
 
-            def run(self, idx):
+            def start(self, idx):
+                calls.append("start")
+
+            def capture(self):
+                calls.append("capture")
                 quiet, pattern = [], []
                 for (prefix, kind), on in switches.items():
                     if on == "off":
                         ch = truth[(prefix, kind)]
                         (pattern if kind == "V" else quiet).append(ch)
                 return capture(2 * n, quiet, pattern)
+
+            def stop(self):
+                calls.append("stop")
 
         def get(card, name):
             prefix, kind = name.rsplit(" ", 2)[0], name.rsplit(" ", 2)[1][0]
@@ -270,6 +279,46 @@ class SenseCheck(unittest.TestCase):
     def test_the_derived_map_passes(self):
         self.assertEqual(self.run_check(self.w, self.truth), [])
 
+    def test_one_grant_for_the_whole_switch_test(self):
+        # one stream (one grant) for the baseline and every switch, not a
+        # grant per step: 1 + 2 x amps grants at first boot read like the
+        # protection flapping
+        self.assertEqual(self.run_check(self.w, self.truth), [])
+        n = len(self.w["amps"])
+        self.assertEqual(self.calls, ["start"] + ["capture"] * (1 + 2 * n) + ["stop"])
+
+    def test_a_failed_step_still_ends_the_stream_and_the_grant(self):
+        calls, switches = [], {}
+
+        class Dying:
+            def __init__(self, *a):
+                self.fmt = "S24_LE"
+
+            def start(self, idx):
+                calls.append("start")
+
+            def capture(self):
+                calls.append("capture")
+                if calls.count("capture") == 3:
+                    raise sgsc.wiring.Refused("the zero-sample stream stopped during the switch test")
+                return capture(2 * len(self_w["amps"]), [], [])
+
+            def stop(self):
+                calls.append("stop")
+
+        self_w = self.w
+        saved = sgsc.Streams, sgsc.switch_get, sgsc.switch_set
+        sgsc.Streams = Dying
+        sgsc.switch_get = lambda card, name: switches.setdefault(name, "on")
+        sgsc.switch_set = lambda card, name, v: switches.__setitem__(name, v)
+        try:
+            with self.assertRaises(sgsc.wiring.Refused):
+                sgsc.check_sense(None, 1, "AppleJ413", (1, 2), self.w, {})
+        finally:
+            sgsc.Streams, sgsc.switch_get, sgsc.switch_set = saved
+        self.assertEqual(calls, ["start", "capture", "capture", "capture", "stop"])
+        self.assertTrue(all(v == "on" for v in switches.values()), "switches restored")
+
     def test_a_vi_override_fails_on_every_channel(self):
         errs = self.run_check(remap(self.w, swap_vi=True), self.truth)
         self.assertEqual(len(errs), 8, errs)
@@ -291,6 +340,34 @@ class SenseCheck(unittest.TestCase):
         self.assertEqual(self.run_check(w, truth), [])
         # the template before 2c16d1c: [V, I]
         self.assertEqual(len(self.run_check(remap(w, swap_vi=True), truth)), 12)
+
+    def test_pcm_status_reads_state_and_owner(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "card1", "pcm1p", "sub0"))
+            f = os.path.join(d, "card1", "pcm1p", "sub0", "status")
+            saved = sgsc.open if hasattr(sgsc, "open") else None
+            real_open = open
+
+            def fake_open(path, *a, **k):
+                return real_open(path.replace("/proc/asound", d), *a, **k)
+
+            sgsc.open = fake_open
+            try:
+                with real_open(f, "w") as fh:
+                    fh.write("state: RUNNING\nowner_pid   : 4242\ntrigger_time: 12.000000000\n")
+                st = sgsc.pcm_status(1, 1, "p")
+                self.assertEqual((st["state"], st["owner_pid"]), ("RUNNING", "4242"))
+                self.assertEqual(sgsc.pcm_state(1, 1, "p"), "RUNNING")
+                with real_open(f, "w") as fh:
+                    fh.write("closed\n")
+                self.assertEqual(sgsc.pcm_state(1, 1, "p"), "closed")
+                self.assertEqual(sgsc.pcm_state(1, 2, "c"), "unknown")
+            finally:
+                if saved is None:
+                    del sgsc.open
+                else:
+                    sgsc.open = saved
 
     def test_the_format_alsa_takes_is_the_transports(self):
         c = gen.machine("j616")[0]

@@ -186,9 +186,10 @@ supervisor, while the kernel holds the speakers at the floor.
      map assigns must go quiet (zeros) or fall to its idle pattern, and every
      other channel must stay live.
    - The kernel admits a stream only under a grant. So the check takes
-     "Speaker Protection" itself, holds a 50 ms lease only while its own
-     stream runs, keeps both PCMs to itself, and tells the session helper
-     not to link.
+     "Speaker Protection" itself: one grant for the whole switch test,
+     renewed as a 50 ms lease only while its own stream owns the speaker
+     PCM. The kernel logs one grant and one release for the check. It keeps
+     both PCMs to itself and tells the session helper not to link.
 4. **Bind.** The result goes to `/var/lib/speakerguardd/selfcheck.bind`, with
    a readable `selfcheck.json` beside it. The record names:
    - the board;
