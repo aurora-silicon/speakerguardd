@@ -129,7 +129,7 @@ use alloc::vec::Vec;
 
 mod laws;
 pub use laws::{
-    current_coefficients, mask_lattice_resized, minimum_phase_triplet, release_coefficient, temperature_candidate,
+    current_coefficients, mask_lattice_resized, minimum_phase_triplet, release_lambda, temperature_candidate,
     transform_len, velocity_band_gains, velocity_limit, BandGain, Fft, Masker, ThermalBranch,
 };
 
@@ -1366,8 +1366,8 @@ struct Run {
     ratio: f64,
     attack: u32,
     r_fast: f32,
-    a_fast: f32,
-    a_low: f32,
+    a_fast: f64,
+    a_low: f64,
     slow_step: f64,
     linked_power: f64,
     /// `10^(-MaxPowerAttenuation/20)`.
@@ -1561,8 +1561,8 @@ impl Run {
             ratio: p.low_rail_power_ratio as f64,
             attack: libm::round(p.attack_time_ms as f64 * 1e-3 * rate) as u32,
             r_fast: sample(p.fast_release_time_ms),
-            a_fast: release_coefficient(rate, p.fast_release_time_ms as f64 * 1e-3),
-            a_low: release_coefficient(rate, p.low_band_release_time_ms as f64 * 1e-3),
+            a_fast: release_lambda(rate, p.fast_release_time_ms as f64 * 1e-3),
+            a_low: release_lambda(rate, p.low_band_release_time_ms as f64 * 1e-3),
             slow_step: settle_step(ctl_dt, p.slow_release_time_ms as f64 * 1e-3),
             linked_power: 1.0,
             power_floor: db_to_lin(p.max_power_attenuation_db as f64),
@@ -1764,9 +1764,8 @@ impl Run {
                 if up.iter().any(|&u| u) {
                     let guard = libm::pow(10.0, 3.0 / 20.0) as f32;
                     let seed: [f32; BANDS] = core::array::from_fn(|k| {
-                        let mut b = c.band[k];
-                        b.request((g_disp as f32).min(p[k]));
-                        let end = b.end_after(ctl, if k == 0 { a_low } else { a_fast });
+                        let end =
+                            c.band[k].end_after((g_disp as f32).min(p[k]), ctl, if k == 0 { a_low } else { a_fast });
                         if up[k] && guard * end <= p[k] {
                             (end / sg).min(1.0)
                         } else {
@@ -1783,7 +1782,7 @@ impl Run {
             };
             for k in 0..BANDS {
                 let req = g_disp.min(gv[k]) as f32;
-                c.band[k].request(req);
+                c.band[k].decide(req);
             }
             c.peak.request(g_peak as f32, attack);
             c.cand[0] = g_peak;

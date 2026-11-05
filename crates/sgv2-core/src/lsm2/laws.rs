@@ -248,10 +248,13 @@ pub fn velocity_band_gains(
     g
 }
 
-/// A fast band gain (residuals 5.1): a lower request starts a raised-cosine
-/// transition to 0.99 x it over `len` samples from the gain reached
-/// (restartable); otherwise a per-sample release `g += a (request - g)`,
-/// unity above 0.9988494.
+/// A fast band gain (residuals 5.1, decision-local): at every decision the
+/// boundary gain is the start; a request below it is an attack decision (a
+/// raised-cosine half-window of `len` samples to 0.99 x the request, then
+/// hold for the rest of the decision); otherwise a recovery decision on the
+/// 99 % exponential response table realigned to the boundary,
+/// `g[n] = start + r[n] (request - start)`, `r[n] = 1 - exp(-(n+1) lambda)`.
+/// Above 0.9988494 the gain snaps to unity when the request is unity.
 #[derive(Clone, Copy, Debug)]
 pub struct BandGain {
     pub g: f32,
@@ -260,43 +263,53 @@ pub struct BandGain {
     request: f32,
     n: u32,
     len: u32,
+    attack: bool,
 }
 
 impl BandGain {
     pub const fn unity(len: u32) -> Self {
-        BandGain { g: 1.0, start: 1.0, target: 1.0, request: 1.0, n: len, len }
+        BandGain { g: 1.0, start: 1.0, target: 1.0, request: 1.0, n: 0, len, attack: false }
     }
-    /// The request the follower keeps (its release target).
+    /// The request of the current decision.
     pub fn requested(&self) -> f32 {
         self.request
     }
-    /// The gain after `n` more samples with release `a`, state unchanged.
-    pub fn end_after(&self, n: usize, a: f32) -> f32 {
+    /// The gain after `n` samples of a decision with request `req` and
+    /// release `lambda`, state unchanged.
+    pub fn end_after(&self, req: f32, n: usize, lambda: f64) -> f32 {
         let mut b = *self;
+        b.decide(req);
         for _ in 0..n {
-            b.sample(a);
+            b.sample(lambda);
         }
         b.g
     }
-    /// A new request at a decision.
-    pub fn request(&mut self, req: f32) {
+    /// A decision with final request `req`.
+    pub fn decide(&mut self, req: f32) {
         self.request = req;
-        if req < self.g {
-            self.start = self.g;
+        self.start = self.g;
+        self.n = 0;
+        self.attack = req < self.g;
+        if self.attack {
             self.target = 0.99 * req;
-            self.n = 0;
         }
     }
-    /// One sample with release coefficient `a`.
+    /// One sample; `lambda = ln(100) / (Fs T)` of the band's release time.
     #[inline]
-    pub fn sample(&mut self, a: f32) -> f32 {
-        if self.n < self.len {
+    pub fn sample(&mut self, lambda: f64) -> f32 {
+        if self.attack {
+            if self.n < self.len {
+                self.n += 1;
+                let w = 0.5 * (1.0 + libm::cos(core::f64::consts::PI * self.n as f64 / self.len as f64));
+                self.g = (self.target as f64 + (self.start as f64 - self.target as f64) * w) as f32;
+            } else {
+                self.g = self.target;
+            }
+        } else if self.start != self.request {
             self.n += 1;
-            let w = 0.5 * (1.0 + libm::cos(core::f64::consts::PI * self.n as f64 / self.len as f64));
-            self.g = (self.target as f64 + (self.start as f64 - self.target as f64) * w) as f32;
-        } else if self.g < self.request {
-            self.g += a * (self.request - self.g);
-            if self.g > 0.998_849_4 && self.request >= 1.0 {
+            let r = (1.0 - libm::exp(-(self.n as f64) * lambda)).min(1.0) as f32;
+            self.g = self.start + r * (self.request - self.start);
+            if self.request >= 1.0 && self.g > 0.998_849_4 {
                 self.g = 1.0;
             }
         }
@@ -307,10 +320,10 @@ impl BandGain {
     }
 }
 
-/// The release coefficient for a 99 % settling time of `t` seconds at
-/// `rate`: `min(ln(100) / (rate t), 1)` in binary32.
-pub fn release_coefficient(rate: f64, t: f64) -> f32 {
-    (libm::log(100.0) / (rate * t)).min(1.0) as f32
+/// The release rate of a 99 % settling time of `t` seconds at `rate`:
+/// `ln(100) / (rate t)`.
+pub fn release_lambda(rate: f64, t: f64) -> f64 {
+    libm::log(100.0) / (rate * t)
 }
 
 /// Buckets of the masker's spectral lattice.
