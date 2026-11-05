@@ -4,11 +4,14 @@ Documentation=https://github.com/aurora-silicon/speakerguardd/tree/v2
 # It links the speaker amps into the graph only while the kernel grants
 # protection, and reports the graph to the supervisor. Without it the report
 # goes stale, the supervisor releases, and the kernel's safe level applies.
-After=pipewire.service wireplumber.service
+After=pipewire.service wireplumber.service speakerguardd-graph.service
 BindsTo=pipewire.service
 
 [Service]
-# Per machine: SGV2_MACHINE=<j316|j616|j413|j700>
+# Only for the seat user, and only once provisioning and the self-check
+# passed in this boot (the graph is in place).
+ExecCondition=/usr/libexec/speakerguardd/speakerguardd-provision is-seat
+# Written by speakerguardd-provision: SGV2_MACHINE, the machine.
 EnvironmentFile=/etc/speakerguardd/speakerguardd.conf
 ExecStart=/usr/libexec/speakerguardd-session --machine ${SGV2_MACHINE}
 Restart=always

@@ -12,7 +12,9 @@ hand-written template and with nobody at the machine.
 | Protection unit | spp3 only | spp3 is at parity. lsm2 and atsp are pending. |
 | Kernel driver | no | A `macaudio` match entry and a device tree for the board. |
 | Tuning | yes | The installer collects the Mac's tuning bundle. |
-| Parameter blob | partly | The compiler has a table of boards, so a new board needs an entry. |
+| Parameter blob | partly | Compiled and bound at boot by `speakerguardd-provision`. The compiler has a table of boards, so a new board needs an entry. |
+| Configuration and seat user | yes | Written at boot by `speakerguardd-provision`; the seat user is resolved by name. |
+| Fleet gate | data | `gate.json` and the board's `machines.json` entry (`unit`, `qualified`); the kernel's interface picks v2 or the older daemons. |
 | Channel map and V/I order | yes | Derived from the device tree and the tuning, then checked by the self-check (MCA and AOP paths; the J700 is derived but cannot be proven silently). |
 | PipeWire and WirePlumber files | yes | Generated from the self-check's record. |
 | Supervisor | yes, for SN012776 amps | Takes its machine description from the self-check's record. |
@@ -79,7 +81,73 @@ still looks the board up in its own table (`machine.rs`) to get the amp count
 and gain step. A new board needs an entry there, until the compiler takes
 that description from the self-check's record instead.
 
-## 4. The self-check (`speakerguardd-selfcheck`)
+## 4. Provisioning (`speakerguardd-provision`)
+
+This is automatic. `speakerguardd-provision.service` runs at boot, before the
+self-check and the supervisor, which both require it.
+
+1. **Compile.** It finds the installer's bundle (the vendor firmware tree,
+   then the ESP's `vendorfw/firmware.tar`) and compiles it into
+   `/var/lib/speakerguardd/params.bin` with `aurora-speaker-tuning compile`,
+   for this Mac's device tree.
+2. **Bind.** `provision.bind` records what the blob was compiled from: the
+   board, the kernel release, the bundle's digest
+   (`aurora-speaker-tuning identify`: the manifest's files, sizes and hashes,
+   wherever the bundle is stored), the macOS build it was collected from,
+   the device tree's speaker ID and the compiler. The next boot compiles
+   again only if one of those changed, or the blob on disk is not the one
+   bound.
+3. **Seat user.** It resolves the seat user by name, and the uid from the
+   user database, never a fixed uid (on a Mac with several users, uid 1000
+   can be someone else). In order: `SGV2_SEAT_USER` in
+   `/etc/speakerguardd/provision.conf`; the user of seat0's active session;
+   the last such user; the display manager's automatic login; the only
+   regular user. With several users and none of those, there is no seat
+   user until the first login on seat0: `speakerguardd-seat.path` follows
+   seat0 and restarts the supervisor, which provisions again, whenever a
+   different regular user becomes active there.
+4. **Configure.** It writes `/etc/speakerguardd/speakerguardd.conf` (the
+   machine, the seat user's name and uid, the supervisor's arguments with
+   the speaker card and its PCM, and the self-check's). The file is
+   generated; overrides go in `provision.conf`.
+5. **Graph.** After the self-check passes, `speakerguardd-provision activate`
+   generates the machine's PipeWire and WirePlumber files from the record
+   into `/run/speakerguardd-graph`. The user unit `speakerguardd-graph.service`,
+   ordered before PipeWire, links them into the seat user's
+   `pipewire.conf.d` and `wireplumber.conf.d`, and removes them for every
+   other user. If the seat user's PipeWire was already running, it is
+   restarted on the new graph. The links lead into `/run`, so after a boot
+   without v2 they lead nowhere, and PipeWire skips them.
+
+Any failure fails closed: the blob, the configuration and the graph are
+removed, the self-check and the supervisor do not start, the kernel holds
+the speakers at its floor, and the journal lists every reason. For tests,
+`--root DIR` (or `SGV2_PROVISION_ROOT`) moves every file it writes under a
+test root, and `--bundle` names another tuning source.
+
+## 5. The fleet gate (`speakerguardd-gate`)
+
+Distributions install v2 on every Mac beside the older daemons
+(speakerguardd 0.1 and speakersafetyd). The gate is the `ExecCondition=` of
+both, so exactly one stack runs on a board:
+
+- v2 runs when the board's protection unit is at parity (`gate.json`
+  `units_at_parity`; the unit is the `machines.json` entry's, or the
+  tuning's for a board without one), the board passed an audible run (its
+  entry's `qualified` list, while `require_qualified_board` is true), and
+  the kernel has the v2 interface ("Speaker Protection");
+- the older daemons run when v2 does not and the kernel has no v2
+  interface.
+
+The kernel is the switch: a fleet kernel without the v2 interface keeps
+every Mac on the older daemons, the kernel with it moves every gated Mac at
+once, and booting the older kernel moves it back. The fleet cutover adds
+lsm2 and atsp to `units_at_parity` once they reach parity and sets
+`require_qualified_board` to false: every board with a parity unit. The data
+is speakerguardd's own; every distribution ships it unchanged.
+`speakerguardd-gate explain` prints the decision.
+
+## 6. The self-check (`speakerguardd-selfcheck`)
 
 This is automatic. It runs as `speakerguardd-selfcheck.service` before the
 supervisor, while the kernel holds the speakers at the floor.
@@ -138,7 +206,7 @@ For a board with no `machines.json` entry:
 The check takes about 13 s on the J316 (13 captures of 0.4 s) and about 8 s
 on the J413. A boot that has a valid record only checks the binding.
 
-## 5. What the check can and cannot prove per path
+## 7. What the check can and cannot prove per path
 
 - **MCA Macs (J316, J413) and the AOP path (J616s; J713 by the same
   driver):** derived and proven: regmap slots and the switch test
@@ -161,7 +229,7 @@ on the J413. A boot that has a valid record only checks the binding.
 - **Other amp families.** TAS2770 (M1) has no register check and no
   operating-point check in the supervisor.
 
-## 6. Checklist for a new Mac
+## 8. Checklist for a new Mac
 
 1. Kernel: add the `macaudio` match entry and the board's device tree with
    the amps (section 2).
@@ -170,6 +238,9 @@ on the J413. A boot that has a valid record only checks the binding.
 3. Confirm the unit is spp3. If it is lsm2 or atsp, wait for that unit's
    parity.
 4. Confirm the amp count has an LV2 variant (2, 4 or 6).
-5. Everything else is automatic: the installer collects the tuning, the
+5. Add its `machines.json` entry (`unit`, `qualified` after its audible
+   run), or, once `require_qualified_board` is false, nothing.
+6. Everything else is automatic: the installer collects the tuning,
+   provisioning compiles and binds it and configures the units, the
    self-check derives and proves the wiring at first boot, and the graph is
    generated from the self-check's record.
