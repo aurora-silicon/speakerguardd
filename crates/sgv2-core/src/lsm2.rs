@@ -1755,11 +1755,12 @@ impl Run {
                 };
                 // the ordinary solve, from unity
                 let p = absolute(velocity_band_gains(&c.vb, 0, vlim_g, sg, c.vel_active, [1.0; BANDS]));
-                // residuals 5.2: after the followers move toward it, one
-                // post-retarget solve when a lane's request rose, seeded from
-                // the applied endpoints of rising lanes still 3 dB or more
-                // below their request
-                let up: [bool; BANDS] = core::array::from_fn(|k| p[k] > c.band[k].requested());
+                // residuals 5.2 (t-4713): a lane is upward when its primary
+                // request is above its applied gain; then one second solve,
+                // seeded from the predicted one-frame endpoint of upward lanes
+                // still 3 dB or more below their request; upward lanes take the
+                // larger of the two results, the others the second
+                let up: [bool; BANDS] = core::array::from_fn(|k| p[k] > c.band[k].g);
                 if up.iter().any(|&u| u) {
                     let guard = libm::pow(10.0, 3.0 / 20.0) as f32;
                     let seed: [f32; BANDS] = core::array::from_fn(|k| {
@@ -1773,7 +1774,7 @@ impl Run {
                         }
                     });
                     let q = absolute(velocity_band_gains(&c.vb, 0, vlim_g, sg, c.vel_active, seed));
-                    core::array::from_fn(|k| if up[k] { p[k].min(q[k]) as f64 } else { q[k] as f64 })
+                    core::array::from_fn(|k| if up[k] { p[k].max(q[k]) as f64 } else { q[k] as f64 })
                 } else {
                     p.map(|v| v as f64)
                 }
