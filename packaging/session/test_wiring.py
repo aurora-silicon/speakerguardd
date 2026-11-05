@@ -154,11 +154,40 @@ class Derivation(unittest.TestCase):
             ],
         }
         lanes = [{"origin": {"node": "in", "port": 0, "channel": c}, "hops": [{"join": "j"}]} for c in (0, 1)]
-        w = wiring.derive(hw, {"tuning": {"protection": {"kind": "lsm2", "lanes": lanes}}})
+        sel = {"sample_rate": 48000, "substitutions": {"fs": "48000"}}
+        w = wiring.derive(hw, {"tuning": {"selection": sel, "protection": {"kind": "lsm2", "lanes": lanes}}})
+        self.assertEqual(w["rate"], 48000)
         # one back-end: slots in dai-link order, so channel 0 is the right amp
         self.assertEqual([a["prefix"] for a in w["amps"]], ["Right Speaker", "Left Speaker"])
         self.assertEqual(w["unit_channels"], [1, 0])
         self.assertEqual(w["sense"], [])
+
+    def test_the_rate_is_the_tunings(self):
+        t = fx("j413")["tuning"]
+        self.assertEqual(wiring.tuning_rate(t), 48000)
+        for sel, ok in (
+            ({"sample_rate": 96000}, 96000),
+            ({"substitutions": {"fs": "44100"}}, 44100),
+            ({"sample_rate": 96000, "substitutions": {"fs": "96000"}}, 96000),
+            ({"sample_rate": 48000, "substitutions": {"fs": "96000"}}, None),
+            ({}, None),
+            ({"sample_rate": 0}, None),
+            ({"substitutions": {"fs": "x"}}, None),
+        ):
+            t2 = copy.deepcopy(t)
+            t2["tuning"]["selection"] = sel
+            if ok is None:
+                with self.assertRaises(wiring.Refused):
+                    wiring.tuning_rate(t2)
+            else:
+                self.assertEqual(wiring.tuning_rate(t2), ok)
+                hw = fx("j413")["hw"]
+                self.assertEqual(wiring.describe(hw, wiring.derive(hw, t2))["rate"], ok)
+        # a rate is not part of the wiring: the hash is the map's alone
+        t2 = copy.deepcopy(t)
+        t2["tuning"]["selection"] = {"sample_rate": 96000}
+        hw = fx("j413")["hw"]
+        self.assertEqual(wiring.derive(hw, t2)["hash"], wiring.derive(hw, t)["hash"])
 
     def test_macaudio_slot_rule(self):
         self.assertEqual(wiring.tdm_slots(6, 2), [0, 2, 4, 1, 3, 5])
@@ -428,6 +457,20 @@ class NoHandMap(unittest.TestCase):
             wiring.read_dt, wiring.tuning_dump = saved
         self.assertEqual((w["method"], errs), ("derived", []))
         self.assertEqual(c, gen.machine("j616")[0])
+
+    def test_the_blob_header_names_its_rate(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "params.bin")
+            head = b"SGV2PRM\0" + (1).to_bytes(4, "little") + b"SPP3" + bytes(8) + (96000).to_bytes(4, "little")
+            with open(p, "wb") as f:
+                f.write(head + bytes(20))
+            self.assertEqual(sgsc.blob_rate(p), 96000)
+            with open(p, "wb") as f:
+                f.write(b"NOTABLOB" + bytes(40))
+            with self.assertRaises(wiring.Refused):
+                sgsc.blob_rate(p)
 
     def test_no_machine_table_is_shipped(self):
         self.assertFalse(os.path.exists(os.path.join(HERE, "machines.json")))

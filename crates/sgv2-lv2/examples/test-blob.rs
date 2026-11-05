@@ -1,12 +1,13 @@
 //! Write a parameter blob with SYNTHETIC spp3 values (no Mac's tuning), for
 //! exercising the plugin in a graph that plays digital silence only.
-//! Usage: `test-blob <path> [channels] [sense] [machine] [full_scale_mv]`.
+//! Usage: `test-blob <path> <channels> <sense> <machine|-> <full_scale_mv>`.
 //!
-//! The machine defaults to this Mac's board (the device tree's first root
-//! compatible, without "apple,"), and the operating point to an SN012776 at
-//! the kernel's amp gain 15 (18.5 dBV = 8.414 V rms = 11.89 V peak, the ag
-//! AID9, AID13 and AID35 store), written to every channel's `ag` and to the
-//! header. The
+//! The operating point has no default: pass the one the supervisor will
+//! read back on the card under test (the peak volts at digital full scale
+//! of its amps' "Amp Gain Volume" TLV, `sgv2_supervisor::machine::
+//! full_scale_mv`), or the blob is refused there. It is written to every
+//! channel's `ag` and to the header. The machine "-" is this Mac's board
+//! (the device tree's first root compatible, without "apple,"); the
 //! supervisor refuses a blob for another board or operating point.
 
 use sgv2_core::blob::{build_for, machine_field, Pod};
@@ -14,16 +15,17 @@ use sgv2_core::{spp3, UnitKind};
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();
-    let path = a.get(1).expect("usage: test-blob <path> [channels] [sense] [machine] [full_scale_mv]");
-    let n: usize = a.get(2).and_then(|v| v.parse().ok()).unwrap_or(6);
-    let s: usize = a.get(3).and_then(|v| v.parse().ok()).unwrap_or(2 * n);
-    let board = a.get(4).cloned().unwrap_or_else(|| {
+    const USAGE: &str = "usage: test-blob <path> <channels> <sense> <machine|-> <full_scale_mv>";
+    let path = a.get(1).expect(USAGE);
+    let n: usize = a.get(2).and_then(|v| v.parse().ok()).expect(USAGE);
+    let s: usize = a.get(3).and_then(|v| v.parse().ok()).expect(USAGE);
+    let board = a.get(4).filter(|b| b.as_str() != "-").cloned().unwrap_or_else(|| {
         let dt = std::fs::read("/proc/device-tree/compatible").unwrap_or_default();
         let first = dt.split(|&b| b == 0).next().unwrap_or_default();
         String::from_utf8_lossy(first).strip_prefix("apple,").unwrap_or_default().to_owned()
     });
     let machine = machine_field(&board).unwrap_or_else(|| panic!("no usable machine name {board:?}: pass one"));
-    let full_scale_mv: u32 = a.get(5).and_then(|v| v.parse().ok()).unwrap_or(11_890);
+    let full_scale_mv: u32 = a.get(5).and_then(|v| v.parse().ok()).filter(|&v| v > 0).expect(USAGE);
     let mut p = spp3::Params {
         channels: n as u32,
         sample_rate: 48_000,
