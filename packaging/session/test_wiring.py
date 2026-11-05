@@ -11,6 +11,7 @@ import json
 import os
 import sys
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -43,6 +44,28 @@ def remap(w, unit=None, swap_vi=False):
     out["sense_ports"] = [s["port"] for s in out["sense"]]
     out["hash"] = wiring.wiring_hash(out)
     return out
+
+
+class OwnerSenseWrites(unittest.TestCase):
+    def test_switches_use_the_grant_holding_file(self):
+        ctl = object.__new__(sgsc.Control)
+        ctl.fd = 73
+        with mock.patch.object(sgsc.fcntl, "ioctl") as ioctl:
+            for value, expected in (("on", 1), ("off", 0)):
+                sgsc.switch_set(ctl, "Left Tweeter VSENSE Switch", value)
+                fd, op, buf = ioctl.call_args.args
+                self.assertEqual(fd, 73)
+                self.assertEqual(op, sgsc._ELEM_WRITE)
+                self.assertEqual(bytes(buf[:sgsc._ID_SIZE]), ctl._id("Left Tweeter VSENSE Switch"))
+                self.assertEqual(sgsc.struct.unpack_from("q", buf, 72)[0], expected)
+            ctl.write(50)
+            self.assertEqual(bytes(ioctl.call_args.args[2][:sgsc._ID_SIZE]), ctl._id("Speaker Protection"))
+
+    def test_denied_switch_write_is_reported(self):
+        ctl = mock.Mock()
+        ctl.write.side_effect = PermissionError("not the owner")
+        with self.assertRaisesRegex(wiring.Refused, "not the owner"):
+            sgsc.switch_set(ctl, "Left Tweeter ISENSE Switch", "off")
 
 
 class Derivation(unittest.TestCase):
