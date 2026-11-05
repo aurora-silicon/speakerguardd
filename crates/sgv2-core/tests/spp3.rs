@@ -915,3 +915,17 @@ fn plausibility_guard_trips_on_a_coil_far_below_its_calibration() {
     run_cl(&mut u, 0.3, &tele, 0, n);
     assert!(u.sense_implausible(0));
 }
+
+#[test]
+fn plausibility_guard_allows_a_cold_room() {
+    // a 5 C room: the coil honestly reads 20 K below its 25 C calibration;
+    // the bound is relative to the colder of T_cal and the model's ambient
+    let mut p = cl_params(4.0, 25.0);
+    p.thermal_ambient_temp = 5.0;
+    let mut u = spp3::Unit::new(p);
+    let n = 48_000 * 6;
+    let alpha = 0.004 + (25.0 - 20.0) * (0.0038 - 0.004) / 15.0;
+    let tele = pilot_sense_r(|_| 0.2 + 3.8 * (1.0 - alpha * 20.0), n);
+    let t = run_cl(&mut u, 0.3, &tele, 0, n);
+    assert!(!u.sense_implausible(0), "T_OL {} T_CL {}", t.channels[0].ol_temp_c, t.channels[0].cl_temp_c);
+}
