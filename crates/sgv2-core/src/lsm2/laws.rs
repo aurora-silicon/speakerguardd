@@ -174,6 +174,7 @@ pub fn velocity_limit(e: f32, k: &[f32; 4], v: &[f32; 3], vmax: f32) -> f32 {
 /// 5.2) from a lane-selective `seed`.
 pub fn velocity_band_gains(
     vb: &[alloc::vec::Vec<f32>; 5],
+    resid: &[f32],
     first: usize,
     vlim: f32,
     s: f32,
@@ -189,7 +190,7 @@ pub fn velocity_band_gains(
     for _ in 0..64 {
         let (mut idx, mut worst) = (first, 0.0f32);
         for i in first..n {
-            let mut y = 0.0f32;
+            let mut y = if resid.is_empty() { 0.0f32 } else { resid[i] };
             for k in 0..5 {
                 y += (g[k] * s) * vb[k][i];
             }
@@ -202,7 +203,7 @@ pub fn velocity_band_gains(
             break;
         }
         let sign = if worst >= 0.0 { 1.0f32 } else { -1.0 };
-        let mut fixed = 0.0f32;
+        let mut fixed = if resid.is_empty() { 0.0f32 } else { resid[idx] };
         for k in (0..5).filter(|&k| !is_active(k)) {
             fixed += (g[k] * s) * vb[k][idx];
         }

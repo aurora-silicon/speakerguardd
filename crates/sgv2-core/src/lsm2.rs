@@ -51,47 +51,35 @@
 //!   the bank-stage stream over the `W = 448` frames that end with the
 //!   frame, i.e. the output region of the frame (`N` frames) plus the `OD`
 //!   frames of look-ahead behind it, in 32-frame substeps.
-//! - **Candidates**, linear in [0, 1], a disabled axis giving 1:
-//!   - sample peak (rig law 6): `min(1, (AmplitudeLimit - pilot) / max|x|)`;
-//!   - displacement: `min(1, DisplacementLimit / max|x_d|)` on the
-//!     full-band model, applied to every band;
-//!   - velocity (spec 15.3, 15.4): the logged candidate is the full-band
-//!     `Vlim / max|v|`; the band gains water-fill the five band velocities'
-//!     frame peaks scaled by the applied slow gain, `sum min(s pk, L) =
-//!     Vlim` over the active bands, floored at `-MaxVelocityAttenuation`, so
-//!     the output velocity stays at the limit while a thermal gain falls;
-//!     the limit follows the four-anchor velocity curve (residuals 4,
+//! - **Candidates** (logged diagnostics, linear in [0, 1], a disabled axis
+//!   giving 1): sample peak `min(1, (AmplitudeLimit - pilot) / max|x|)`,
+//!   displacement and velocity on the full-band models. The applied fast
+//!   requests come from the band chain below.
+//!   - The velocity limit follows the four-anchor curve (residuals 4,
 //!     extrapolated past the last anchor) of the mask level: each channel's
 //!     modeled input velocity over the retained window, energy-normalised
 //!     Hann, real DFT, pressure-response weighting, the median bucket power
 //!     of the mask band, a spectral-shape penalty, the level tracker and the
-//!     three-state follower (residuals 3); the largest level of the pair;
-//!   - power (rig law 7): one gain for all systems, `min_j min(1, sqrt((B_j -
-//!     N idle) / sum (Phat_j - idle)))`, `Phat_j` each system's largest
+//!     three-state follower (residuals 3); the largest level of the pair.
+//!   - Power (rig law 7): one gain for all systems,
+//!     `min_j min(1, sqrt((B_j - N idle) / sum (Phat_j - idle)))`, `Phat_j` each system's largest
 //!     average over the window of the bank-stage program before any gain
-//!     (input-referred, rig law 4);
-//!   - temperature (residuals 2): the input thermal model, unattenuated,
-//!     on the input's own current model; its peak over the selected span of
-//!     the temperature buffer, an exponential knee from the soft toward the
-//!     hard limit, and the room partitioned between the coil and body rises,
+//!     (input-referred, rig law 4).
+//!   - Temperature (residuals 2): the input thermal model, unattenuated, on
+//!     the input's own current model; its peak over the selected span of the
+//!     temperature buffer, an exponential knee from the soft toward the hard
+//!     limit, and the room partitioned between the coil and body rises,
 //!     moving toward the DC split as the output body heats.
-//! - **Gains.** Fast (band, peak): below the applied gain the target is 0.99
-//!   x the request, ramped linearly over `AttackTime`; otherwise a
-//!   per-sample release toward it (99 % settling over `FastReleaseTime`,
-//!   `LowBandReleaseTime` for band 0). Slow (power, temperature, linked
-//!   across channels): the same 0.99 attack; otherwise one 99 %-settling
-//!   `SlowReleaseTime` step per frame (rig law 8). Before committing, the
-//!   slow gain is checked against the output-referred monitor (residuals
-//!   2.4): on the provisional trajectory the monitor at each substep is
-//!   `B + g L + g^2 Q` under an extra gain `g`, and multiplicative
-//!   quadratic-root corrections at the hottest substep bring every substep
-//!   within `TemperatureHardLimit + max(TemperatureHeadroom, 0)`. A lower
-//!   result retargets the follower: 0.99 x the request along a raised-cosine
-//!   half-window of `AttackTime`, restartable. The retargeted trajectory is
-//!   checked again over the frame and one attack window beyond it. The
-//!   ceiling is held to 0.99 of its rise over ambient (interim). Each band's
-//!   applied gain is the minimum of its fast gain, the peak gain and the
-//!   slow gain (spec 2: never a product).
+//! - **Band gains** (residuals 5): the displacement, velocity and sample-peak
+//!   chain of signed worst-sample allocations, a post-retarget second chain
+//!   when a lane rises, and one decision-local follower per band (a
+//!   raised-cosine attack to 0.99 x the request then hold, or a recovery on
+//!   the 99 % response table realigned each decision).
+//! - **Slow gain** (power, temperature, linked across channels; residuals
+//!   2.4): advanced provisionally toward unity; the output-temperature
+//!   ceiling solved once on the retained frame and look-ahead as `B + g L +
+//!   g^2 Q`; a lower result makes a second follower call toward 0.99 x the
+//!   request. The audio applies `min(band, slow)` per band, never a product.
 //! - **Monitor** (rig laws 3, 4, 11): on the protected output, `u = Vfs y`;
 //!   the Float32 substep mean of `u i` drives the two thermal branches
 //!   (residuals 2.1: `theta += alpha (R_eff P - theta)`), and `Pamp = idle + ratio max(mean(u i), 0) (Rdc + Rpar) /
@@ -107,14 +95,19 @@
 //! temperature predictor's coil and magnet rises, the four power averages
 //! and the slow gain to the next stream, cooled for the gap.
 //!
+//! Fast axes (residuals 5, Daybreak t-4731): one sequential chain of
+//! signed worst-sample allocations per decision on five band buffers:
+//! displacement (fresh band models over the retained window, with the
+//! retained full-band residual), velocity (fresh band models, from 1 ms; the
+//! ignore switches mask only the committed cut), then sample peak (the raw
+//! bank bands). One band follower per band takes the final request; the
+//! audio applies `min(band, slow)`.
+//!
 //! Known residuals against 25G83 (rig report):
-//! - velocity (residuals 5, 5.2): the signed allocation with the
-//!   post-retarget seeded solve. Interim safety layer: it allocates to 0.99
-//!   of the limit. On fb3-p30 and fb6-p62 this unit settles at 0.99-1.0 x
-//!   the limit where the reference keeps 0.79-0.82 x;
-//! - output ceiling (residuals 2.4, native order): exact, with an interim
-//!   safety layer holding the coil to 0.99 of the ceiling's rise over
-//!   ambient;
+//! - interim safety layers: velocity allocated to 0.99 of its limit, and the
+//!   output ceiling held to 0.99 of its rise over ambient;
+//! - at 96 kHz the steady velocity margin on some law cases is shallower
+//!   than the reference's (Daybreak t-4733);
 //! - the masker lattice is an input extracted from the Mac's macOS; without
 //!   it there is no masking credit;
 //! - host slices: at q1, q7 and q160 this unit is slice-independent by
@@ -1031,51 +1024,6 @@ pub fn fir_reversed(rev_taps: &[f32], window: &[f32]) -> f32 {
     crate::dsp::dot_f32(rev_taps, window)
 }
 
-/// One gain follower of the fast or slow law: a linear ramp toward 0.99 x
-/// a lower request, else a follower toward the request.
-#[derive(Clone, Copy)]
-struct Follower {
-    g: f32,
-    step: f32,
-    left: u32,
-    target: f32,
-}
-
-impl Follower {
-    const UNITY: Follower = Follower { g: 1.0, step: 0.0, left: 0, target: 1.0 };
-    /// A new request at a frame boundary: below the gain, ramp to 0.99 x
-    /// the request over `attack` samples.
-    #[inline]
-    fn request(&mut self, req: f32, attack: u32) {
-        if req < self.g {
-            let to = (CUT * req as f64) as f32;
-            self.left = attack.max(1);
-            self.step = (to - self.g) / self.left as f32;
-            self.target = req;
-        } else {
-            self.target = req;
-        }
-    }
-    /// One sample: the ramp, else the per-sample release `r` toward the
-    /// request (fast gains).
-    #[inline]
-    fn sample(&mut self, r: f32) -> f32 {
-        if self.left > 0 {
-            self.g += self.step;
-            self.left -= 1;
-        } else if self.g < self.target {
-            self.g += r * (self.target - self.g);
-            if self.target - self.g <= f32::EPSILON * self.target {
-                self.g = self.target;
-            }
-        }
-        self.g
-    }
-    fn finite(&self) -> bool {
-        self.g.is_finite() && self.step.is_finite() && self.target.is_finite()
-    }
-}
-
 /// The applied slow gain (residuals 2.4): a downward decision targets 0.99
 /// x the request along the first half of a periodic raised cosine of `len`
 /// samples from the gain already reached, then holds; restartable. An
@@ -1144,6 +1092,13 @@ struct Chan {
     /// The velocity model in its zero state (residuals 5: five fresh models
     /// per decision over the retained window).
     vel_proto: Biquad,
+    /// The displacement model in its zero state, the five band displacement
+    /// buffers, the retained full-band displacement over the window (as
+    /// `ab`) and the fixed residual (residuals 5.2).
+    disp_proto: Biquad,
+    db: [Vec<f32>; BANDS],
+    dfull: Vec<f32>,
+    rd: Vec<f32>,
     /// Per-substep peaks over the window (ring of RING slots).
     pk_x: [f32; RING],
     pk_d: [f32; RING],
@@ -1164,7 +1119,6 @@ struct Chan {
     vb: [Vec<f32>; BANDS],
     /// Bands the velocity allocation may cut (the others are ignored).
     vel_active: (usize, usize),
-    peak: Follower,
     /// The fast gains over the frame's output region, per sample.
     eg: [Vec<f32>; BANDS],
     // Power path (fast-gained bank stage): the committed state at the
@@ -1367,8 +1321,6 @@ struct Run {
     budget: [f64; 4],
     idle: f64,
     ratio: f64,
-    attack: u32,
-    r_fast: f32,
     a_fast: f64,
     a_low: f64,
     slow_step: f64,
@@ -1472,6 +1424,10 @@ impl Run {
                 vel,
                 vel_band: [vel; BANDS - 1],
                 vel_proto: vel,
+                disp_proto: motion(c.disp_rdc, c.disp_bl, c.disp_mms_kg, c.disp_rms, c.disp_kms, rate, false),
+                db: core::array::from_fn(|_| vec![0.0; od + ctl]),
+                dfull: vec![0.0; od + ctl],
+                rd: vec![0.0; od + ctl],
                 pk_x: [0.0; RING],
                 pk_d: [0.0; RING],
                 pk_v: [0.0; RING],
@@ -1488,7 +1444,6 @@ impl Run {
                     (c.velocity_ignore_low_band != 0) as usize,
                     if c.velocity_ignore_high_band != 0 { BANDS - 1 } else { BANDS },
                 ),
-                peak: Follower::UNITY,
                 eg: core::array::from_fn(|_| vec![1.0; ctl]),
                 cur_in: cur,
                 pbar_in: [0.0; 4],
@@ -1531,7 +1486,6 @@ impl Run {
             let b = if p.runtime_budget_present != 0 { p.runtime_budget_w[j] } else { p.power_hard_limit_w[j] };
             budget[j] = b as f64 * p.power_budgets_scale as f64;
         }
-        let sample = |ms: f32| settle_step(1.0 / rate, ms as f64 * 1e-3) as f32;
         Ok(Run {
             n,
             ctl,
@@ -1563,8 +1517,6 @@ impl Run {
             budget,
             idle: p.low_rail_idle_power_w as f64,
             ratio: p.low_rail_power_ratio as f64,
-            attack: libm::round(p.attack_time_ms as f64 * 1e-3 * rate) as u32,
-            r_fast: sample(p.fast_release_time_ms),
             a_fast: release_lambda(rate, p.fast_release_time_ms as f64 * 1e-3),
             a_low: release_lambda(rate, p.low_band_release_time_ms as f64 * 1e-3),
             slow_step: settle_step(ctl_dt, p.slow_release_time_ms as f64 * 1e-3),
@@ -1596,8 +1548,10 @@ impl Run {
             c.vwin.iter_mut().for_each(|v| *v = 0.0);
             c.vel_limit_now = c.vel_lim[0] as f64;
             c.band = [BandGain::unity(c.slow.len); BANDS];
-            c.vb.iter_mut().for_each(|b| b.iter_mut().for_each(|v| *v = 0.0));
-            c.peak = Follower::UNITY;
+            for b in c.vb.iter_mut().chain(c.db.iter_mut()) {
+                b.iter_mut().for_each(|v| *v = 0.0);
+            }
+            c.dfull.iter_mut().chain(c.rd.iter_mut()).for_each(|v| *v = 0.0);
             c.eg.iter_mut().for_each(|e| e.iter_mut().for_each(|v| *v = 1.0));
             c.cur_in.clear();
             c.pbar_in = [0.0; 4];
@@ -1661,6 +1615,7 @@ impl Run {
             c.xc[od + i] = xc;
             let u = vfs * xc as f64;
             let d = c.disp.step(u);
+            c.dfull[od + i] = d as f32;
             let v = c.vel.step(u);
             let mut vrest = v;
             for k in 0..BANDS - 1 {
@@ -1710,7 +1665,7 @@ impl Run {
     fn process_frame(&mut self) {
         // a gain state that went non-finite since the last frame is caught
         // before this frame's min/max could turn it into a number
-        if !self.ch.iter().all(|c| c.band.iter().all(BandGain::finite) && c.peak.finite() && c.slow.finite()) {
+        if !self.ch.iter().all(|c| c.band.iter().all(BandGain::finite) && c.slow.finite()) {
             self.fault = true;
             return;
         }
@@ -1718,8 +1673,7 @@ impl Run {
             self.analyse(ci);
         }
         self.ring = (self.ring + SUBSTEPS) % self.ring_len;
-        let (ctl, sub, od, attack) = (self.ctl, self.sub, self.od, self.attack);
-        let r_fast = self.r_fast;
+        let (ctl, sub, od) = (self.ctl, self.sub, self.od);
         let ring_len = self.ring_len;
         let window_max = |r: &[f32; RING]| r[..ring_len].iter().copied().fold(0.0f32, f32::max);
         let ratio = |limit: f64, q: f32| (limit / (q as f64).max(EPS)).min(1.0);
@@ -1743,18 +1697,18 @@ impl Run {
             let g_disp = if self.axis[1] { ratio(c.disp_limit, window_max(&c.pk_d)) } else { 1.0 };
             let vel_on = self.axis[2] && !c.vel_off;
             let g_vel = if self.axis[2] { ratio(c.vel_limit_now, window_max(&c.pk_v)).max(c.vel_floor) } else { 1.0 };
-            // residuals 5: the signed worst-sample allocation on the band
-            // velocities under the applied slow gain, then the absolute floor
-            // (the logged candidate is only a diagnostic). It runs over the
-            // whole decision window, the output region and its look-ahead,
-            // so every sample these gains will shape holds the limit.
+            // residuals 5 (t-4731): one sequential fast-request chain of
+            // signed worst-sample allocations on five band buffers each:
+            // displacement, then velocity, then sample peak, each starting
+            // from the preceding stage's requests; the logged candidates are
+            // diagnostics only
             let sg = (c.slow.g as f64).clamp(EPS, 1.0) as f32;
+            let disp_on = self.axis[1];
+            let peak_on = self.axis[0];
+            let vfs = c.vfs as f64;
             if vel_on {
-                // residuals 5 (t-4719): five fresh zero-state velocity models,
-                // one per band including the complementary fifth, over the
-                // retained bank window (output region and look-ahead), on
-                // the unattenuated bank signals at full-scale volts
-                let vfs = c.vfs as f64;
+                // five fresh zero-state velocity models over the retained
+                // window on the unattenuated bank signals (t-4719)
                 for k in 0..BANDS {
                     let mut m = c.vel_proto;
                     for i in 0..c.vb[k].len() {
@@ -1762,54 +1716,80 @@ impl Run {
                     }
                 }
             }
-            let gv: [f64; BANDS] = if vel_on {
-                // interim safety layer: allocate to 0.99 of the limit so the
-                // attack transient stays within it
-                let vlim_g = (CUT * c.vel_limit_now) as f32;
-                let floor = c.vel_floor as f32;
-                let absolute = |rel: [f32; BANDS]| -> [f32; BANDS] {
-                    core::array::from_fn(|k| if rel[k] < 1.0 { (sg * rel[k]).max(floor).min(1.0) } else { 1.0 })
-                };
-                // the ordinary solve, from unity
-                let p = absolute(velocity_band_gains(&c.vb, vfirst, vlim_g, sg, c.vel_active, [1.0; BANDS]));
-                // residuals 5.2 (t-4713): a lane is upward when its primary
-                // request is above its applied gain; then one second solve,
-                // seeded from the predicted one-frame endpoint of upward lanes
-                // still 3 dB or more below their request; upward lanes take the
-                // larger of the two results, the others the second
+            if disp_on {
+                // five fresh displacement models, and the fixed residual of
+                // the retained full-band trajectory
+                for k in 0..BANDS {
+                    let mut m = c.disp_proto;
+                    for i in 0..c.db[k].len() {
+                        c.db[k][i] = m.step(vfs * c.ab[k][i] as f64) as f32;
+                    }
+                }
+                for i in 0..c.rd.len() {
+                    let mut sum = 0.0f32;
+                    for k in 0..BANDS {
+                        sum += c.db[k][i];
+                    }
+                    c.rd[i] = c.dfull[i] - sum;
+                }
+            }
+            // interim safety layer: velocity allocated to 0.99 of its limit
+            let vlim_g = (CUT * c.vel_limit_now) as f32;
+            let chain = |c: &Chan, seed: [f32; BANDS]| -> [f32; BANDS] {
+                let all = (0, BANDS);
+                let mut r = seed;
+                if disp_on {
+                    r = velocity_band_gains(&c.db, &c.rd, 0, c.disp_limit as f32, sg, all, r);
+                }
+                if vel_on {
+                    let q = velocity_band_gains(&c.vb, &[], vfirst, vlim_g, sg, all, r);
+                    for k in c.vel_active.0..c.vel_active.1 {
+                        let v = (sg * q[k]).max(c.vel_floor as f32) / sg;
+                        r[k] = r[k].min(v);
+                    }
+                }
+                if peak_on {
+                    r = velocity_band_gains(&c.ab, &[], 0, c.amp_limit as f32, sg, all, r);
+                }
+                r
+            };
+            let absolute = |rel: [f32; BANDS]| -> [f32; BANDS] { core::array::from_fn(|k| (sg * rel[k]).min(1.0)) };
+            let req: [f32; BANDS] = if disp_on || vel_on || peak_on {
+                let p = absolute(chain(c, [1.0; BANDS]));
+                // residuals 5.2 (t-4713): upward lanes (primary above the
+                // applied gain); one second chain seeded from the predicted
+                // endpoint toward the complete primary request of upward
+                // lanes still 3 dB or more below it; upward lanes take the
+                // larger result, the others the second
                 let up: [bool; BANDS] = core::array::from_fn(|k| p[k] > c.band[k].g);
                 if up.iter().any(|&u| u) {
                     let guard = libm::pow(10.0, 3.0 / 20.0) as f32;
                     let seed: [f32; BANDS] = core::array::from_fn(|k| {
-                        let end =
-                            c.band[k].end_after((g_disp as f32).min(p[k]), ctl, if k == 0 { a_low } else { a_fast });
+                        let end = c.band[k].end_after(p[k], ctl, if k == 0 { a_low } else { a_fast });
                         if up[k] && guard * end <= p[k] {
                             (end / sg).min(1.0)
                         } else {
                             1.0
                         }
                     });
-                    let q = absolute(velocity_band_gains(&c.vb, vfirst, vlim_g, sg, c.vel_active, seed));
-                    core::array::from_fn(|k| if up[k] { p[k].max(q[k]) as f64 } else { q[k] as f64 })
+                    let q = absolute(chain(c, seed));
+                    core::array::from_fn(|k| if up[k] { p[k].max(q[k]) } else { q[k] })
                 } else {
-                    p.map(|v| v as f64)
+                    p
                 }
             } else {
                 [1.0; BANDS]
             };
             for k in 0..BANDS {
-                let req = g_disp.min(gv[k]) as f32;
-                c.band[k].decide(req);
+                c.band[k].decide(req[k]);
             }
-            c.peak.request(g_peak as f32, attack);
             c.cand[0] = g_peak;
             c.cand[1] = g_disp;
             c.cand[2] = g_vel;
             for i in 0..ctl {
-                let pg = c.peak.sample(r_fast);
                 for k in 0..BANDS {
                     let a = if k == 0 { a_low } else { a_fast };
-                    c.eg[k][i] = c.band[k].sample(a).min(pg);
+                    c.eg[k][i] = c.band[k].sample(a);
                 }
             }
         }
@@ -2005,6 +1985,7 @@ impl Run {
             for b in c.ab.iter_mut() {
                 b.copy_within(ctl..ctl + od, 0);
             }
+            c.dfull.copy_within(ctl..ctl + od, 0);
             c.xc.copy_within(ctl..ctl + od, 0);
             let model = [c.th_vc, c.th_mg, c.tp_vc, c.tp_mg].iter().all(|v| v.is_finite())
                 && c.masker.as_ref().is_none_or(Masker::is_finite)
@@ -2014,10 +1995,7 @@ impl Run {
                 && c.vel_band.iter().all(|b| b.y[0].is_finite())
                 && c.cur_in.is_finite()
                 && c.cur_out.is_finite();
-            let gains = c.cand.iter().all(|v| v.is_finite())
-                && c.band.iter().all(BandGain::finite)
-                && c.peak.finite()
-                && c.slow.finite();
+            let gains = c.cand.iter().all(|v| v.is_finite()) && c.band.iter().all(BandGain::finite) && c.slow.finite();
             if !(model && motion && gains) {
                 self.fault = true;
             }
@@ -2169,7 +2147,7 @@ impl ProtectionUnit for Unit {
                 *a = g as f32;
             }
             s.band_gain = core::array::from_fn(|k| c.band[k].g);
-            s.gain = if run.fault { FAILSAFE_GAIN } else { c.slow.g.min(c.peak.g) };
+            s.gain = if run.fault { FAILSAFE_GAIN } else { c.slow.g };
             out.channels[c.src] = s;
             amp_1s += c.pbar1s_frame;
             if c.src == 0 {

@@ -182,9 +182,12 @@ fn displacement_candidate_matches_the_transfer_function() {
     let t = tel(&u);
     let got = t.channels[0].axis_gain[1] as f64;
     assert!((got - want).abs() < 2e-3 * want, "{got} {want}");
-    // displacement acts on every band
+    // residuals 5 (t-4731): displacement is a signed allocation over the
+    // band displacements, so the bands carrying the tone take the cut, at
+    // least as deep as the broadband candidate, and no band is raised
     let bg = t.channels[0].band_gain;
-    assert!(bg.iter().all(|&g| (g as f64 - want).abs() < 2e-3), "{bg:?}");
+    let low = bg.iter().copied().fold(1.0f32, f32::min) as f64;
+    assert!(low <= want + 2e-3 && bg.iter().all(|&g| g <= 1.0), "{bg:?} {want}");
 }
 
 #[test]
