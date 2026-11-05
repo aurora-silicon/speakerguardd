@@ -27,9 +27,11 @@ while the kernel holds the speakers at its floor.
      channel the map gives that amp's V (or I) must go quiet or fixed
      (an idle pattern), and every other channel must stay live.
    The kernel admits the stream only under a grant, so the check takes
-   "Speaker Protection" itself, holds a 50 ms lease only while its own
-   zero-sample stream runs, keeps the PCMs to itself, and tells the
-   session helper not to link (/run/speakerguardd-selfcheck/active).
+   "Speaker Protection" itself: one grant, renewed as a 50 ms lease only
+   while its own zero-sample stream owns the speaker PCM, for the whole
+   switch test (the kernel logs one grant and one release). It keeps the
+   PCMs to itself and tells the session helper not to link
+   (/run/speakerguardd-selfcheck/active).
 4. **Bind** the result to the board, the kernel release, the parameter
    blob's SHA-256 and the wiring hash, in /var/lib/speakerguardd/selfcheck.bind
    (and a readable report beside it). The supervisor grants only with a
@@ -63,6 +65,8 @@ VERSION = 2
 STATE = "/var/lib/speakerguardd"
 MARKER = "/run/speakerguardd-selfcheck/active"
 CAPTURE_S = 0.4
+# After a sense switch turns, before the next capture opens.
+SETTLE_S = 0.05
 LEASE_MS = 50
 TICK_S = 0.010
 PCM_WAIT_S = 15
@@ -141,16 +145,29 @@ def pcm_ids(idx):
     return out
 
 
-def pcm_state(idx, dev, d):
+def pcm_status(idx, dev, d):
+    """The substream's /proc status as a dict ({"state": "closed"} when
+    closed, {} when unreadable)."""
     try:
         with open(f"/proc/asound/card{idx}/pcm{dev}{d}/sub0/status") as f:
             t = f.read()
     except OSError:
-        return "unknown"
+        return {}
     if t.strip() == "closed":
-        return "closed"
-    m = re.search(r"state: (\w+)", t)
-    return m.group(1) if m else "open"
+        return {"state": "closed"}
+    out = {}
+    for line in t.splitlines():
+        k, sep, v = line.partition(":")
+        if sep:
+            out.setdefault(k.strip(), v.strip())
+    return out
+
+
+def pcm_state(idx, dev, d):
+    st = pcm_status(idx, dev, d)
+    if not st:
+        return "unknown"
+    return st.get("state", "open")
 
 
 class Control:
@@ -305,14 +322,26 @@ def classify(st):
 
 
 class Streams:
-    """One silent run: a grant, a zero-sample stream on the speaker PCM, a
-    capture of the sense PCM, then release."""
+    """The silent session: one grant and one zero-sample stream on the
+    speaker PCM for the whole switch test, and a capture of the sense PCM
+    for each step.
+
+    The grant is taken once and held only while the check's own stream
+    owns the speaker PCM, so the kernel logs one grant and one release for
+    the whole check, not one per step (a run per step logged 1 + 2 x amps
+    of them at first boot, which read like the protection flapping), and
+    the PCM is never left closed under a grant between steps. The switches
+    are DAPM switches that change the amps' sense power only, so they are
+    turned while the stream runs; every sample is 0 throughout."""
 
     def __init__(self, ctl, card, spk_dev, sense_dev, amps, rate):
         self.ctl, self.card, self.spk, self.sense, self.amps = ctl, card, spk_dev, sense_dev, amps
         # the tuning's rate (wiring.tuning_rate), the rate the graph runs at
         self.rate = rate
         self.fmt = None
+        self.idx = None
+        self.lease = None
+        self.play = None
 
     def _play(self, fmt):
         return subprocess.Popen(
@@ -321,47 +350,76 @@ class Streams:
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
         )
 
-    def run(self, idx):
-        lease = Lease(self.ctl)
-        lease.start()
-        play = None
-        try:
-            fmts = [self.fmt] if self.fmt else ["S24_LE", "S32_LE", "S16_LE"]
-            for fmt in fmts:
-                play = self._play(fmt)
-                deadline = time.monotonic() + 1.0
-                while time.monotonic() < deadline and play.poll() is None:
-                    if pcm_state(idx, self.spk, "p") == "RUNNING":
-                        break
-                    time.sleep(0.01)
-                if play.poll() is None and pcm_state(idx, self.spk, "p") == "RUNNING":
-                    self.fmt = fmt
+    def _ours(self):
+        """The speaker PCM runs, and runs for the check's own stream."""
+        if self.play is None or self.play.poll() is not None:
+            return False
+        st = pcm_status(self.idx, self.spk, "p")
+        return st.get("state") == "RUNNING" and st.get("owner_pid") == str(self.play.pid)
+
+    def start(self, idx):
+        self.idx = idx
+        self.lease = Lease(self.ctl)
+        self.lease.start()
+        log("holding \"Speaker Protection\" for the silent switch test (zero samples only)")
+        last = None
+        for fmt in [self.fmt] if self.fmt else ["S24_LE", "S32_LE", "S16_LE"]:
+            self.play = self._play(fmt)
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline and self.play.poll() is None:
+                if pcm_state(idx, self.spk, "p") == "RUNNING":
                     break
-                err = (play.communicate(timeout=2)[1] or "").strip() if play.poll() is not None else "did not start"
-                play.kill() if play.poll() is None else None
-                play = None
-                last = err
-            if play is None:
-                raise wiring.Refused(f"the zero-sample stream does not start on hw:{self.card},{self.spk}: {last}")
-            time.sleep(0.1)
-            rec = subprocess.run(
-                ["arecord", "-q", "-D", f"hw:CARD={self.card},DEV={self.sense}", "-f", "S16_LE", "-c", str(2 * self.amps),
-                 "-r", str(self.rate), "-s", str(round(self.rate * CAPTURE_S)), "-t", "raw", "-"],
-                capture_output=True, timeout=5,
-            )
-            if rec.returncode:
-                raise wiring.Refused(f"sense capture failed: {rec.stderr.decode(errors='replace').strip()}")
-            if lease.lapsed or lease.err:
-                raise wiring.Refused(f"the self-check's own lease lapsed during a run ({lease.err or 'ETIMEDOUT'})")
-            return stats(rec.stdout, 2 * self.amps)
-        finally:
-            if play is not None and play.poll() is None:
-                play.terminate()
+                time.sleep(0.01)
+            if self._ours():
+                self.fmt = fmt
+                break
+            if self.play.poll() is None and pcm_state(idx, self.spk, "p") == "RUNNING":
+                raise wiring.Refused(f"hw:{self.card},{self.spk} runs, but not for the self-check's own stream")
+            err = (self.play.communicate(timeout=2)[1] or "").strip() if self.play.poll() is not None else "did not start"
+            if self.play.poll() is None:
+                self.play.kill()
+                self.play.wait(2)
+            self.play = None
+            last = err
+        if self.play is None:
+            raise wiring.Refused(f"the zero-sample stream does not start on hw:{self.card},{self.spk}: {last}")
+        time.sleep(0.1)
+
+    def capture(self):
+        """One step: the sense PCM, recorded while the stream runs."""
+        time.sleep(SETTLE_S)
+        if not self._ours():
+            raise wiring.Refused(f"the zero-sample stream on hw:{self.card},{self.spk} stopped during the switch test")
+        rec = subprocess.run(
+            ["arecord", "-q", "-D", f"hw:CARD={self.card},DEV={self.sense}", "-f", "S16_LE", "-c", str(2 * self.amps),
+             "-r", str(self.rate), "-s", str(round(self.rate * CAPTURE_S)), "-t", "raw", "-"],
+            capture_output=True, timeout=5,
+        )
+        if rec.returncode:
+            raise wiring.Refused(f"sense capture failed: {rec.stderr.decode(errors='replace').strip()}")
+        if self.lease.lapsed or self.lease.err:
+            raise wiring.Refused(f"the self-check's own lease lapsed during the switch test ({self.lease.err or 'ETIMEDOUT'})")
+        if not self._ours():
+            raise wiring.Refused(f"the zero-sample stream on hw:{self.card},{self.spk} stopped during a capture")
+        return stats(rec.stdout, 2 * self.amps)
+
+    def stop(self):
+        """Stream first, then the grant: the PCM closes under the grant only
+        for the one renewal tick the lease thread takes to stop."""
+        try:
+            if self.play is not None and self.play.poll() is None:
+                self.play.terminate()
                 try:
-                    play.wait(2)
+                    self.play.wait(2)
                 except subprocess.TimeoutExpired:
-                    play.kill()
-            lease.end()
+                    self.play.kill()
+                    self.play.wait(2)
+        finally:
+            self.play = None
+            if self.lease is not None:
+                self.lease.end()
+                self.lease = None
+                log("released \"Speaker Protection\" after the switch test")
 
 
 def check_sense(ctl, idx, card, devs, w, runs):
@@ -384,7 +442,8 @@ def check_sense(ctl, idx, card, devs, w, runs):
     try:
         for nm in saved:
             switch_set(card, nm, "on")
-        base = st.run(idx)
+        st.start(idx)
+        base = st.capture()
         runs["baseline"] = base
         cls = classify(base)
         if any(c != "live" for c in cls):
@@ -394,7 +453,7 @@ def check_sense(ctl, idx, card, devs, w, runs):
                 nm = names[(a["prefix"], kind)]
                 switch_set(card, nm, "off")
                 try:
-                    s = st.run(idx)
+                    s = st.capture()
                 finally:
                     switch_set(card, nm, "on")
                 runs[f"{a['prefix']} {kind}SENSE off"] = s
@@ -409,6 +468,7 @@ def check_sense(ctl, idx, card, devs, w, runs):
                         f"{a['prefix']} {kind}SENSE off quietened sense channel(s) {quiet}; the map has its {kind} on channel {want}"
                     )
     finally:
+        st.stop()
         for nm, v in saved.items():
             try:
                 switch_set(card, nm, v)
