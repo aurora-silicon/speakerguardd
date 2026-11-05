@@ -420,6 +420,72 @@ def check_sense(ctl, idx, card, devs, w, runs):
 # ------------------------------------------------------------------ record
 
 
+
+# ------------------------------------------------------------------ plugin
+
+PLUGIN_URI = "https://aurora-silicon.org/lv2/sgv2#"
+# Where distributions install LV2 bundles; the packaged sgv2.lv2 lives in one.
+SYSTEM_LV2 = ("/usr/lib64/lv2", "/usr/lib/lv2", "/usr/local/lib64/lv2", "/usr/local/lib/lv2",
+              "/run/current-system/sw/lib/lv2", "/nix/var/nix/profiles/default/lib/lv2")
+
+
+def _env_lv2_paths(files):
+    """LV2_PATH values set in environment files (KEY=VALUE lines)."""
+    out = []
+    for f in files:
+        try:
+            with open(f, errors="replace") as fh:
+                for line in fh:
+                    m = re.match(r"\s*(?:export\s+)?LV2_PATH\s*=\s*['\"]?([^'\"\n]*)", line)
+                    if m:
+                        out.append((m.group(1), f))
+        except OSError:
+            pass
+    return out
+
+
+def lv2_shadows(users=None, etc="/etc", environ=None):
+    """Every copy of the sgv2 plugin that a user's PipeWire could load
+    instead of the packaged one: a bundle in any user's ~/.lv2 (lilv searches
+    it before the system directories), or in a directory an LV2_PATH names
+    (system-wide, in a user's environment.d, or in this environment) that
+    is not a system LV2 directory. Hand installs from bring-up leave such
+    copies behind, and an old plugin there runs the speakers with code no
+    package shipped. Returns (path, why) pairs."""
+    import glob as _glob
+    import pwd as _pwd
+    environ = os.environ if environ is None else environ
+    if users is None:
+        users = [(u.pw_name, u.pw_dir) for u in _pwd.getpwall() if u.pw_dir and u.pw_dir not in ("/", "")]
+    dirs = []
+    for name, home in users:
+        dirs.append((os.path.join(home, ".lv2"), f"{name}'s ~/.lv2"))
+        envd = sorted(_glob.glob(os.path.join(home, ".config", "environment.d", "*.conf")))
+        dirs += [(d, f"LV2_PATH in {f}") for v, f in _env_lv2_paths(envd) for d in v.split(":")]
+    etcf = [os.path.join(etc, "environment")] + sorted(_glob.glob(os.path.join(etc, "environment.d", "*.conf")))
+    dirs += [(d, f"LV2_PATH in {f}") for v, f in _env_lv2_paths(etcf) for d in v.split(":")]
+    if environ.get("LV2_PATH"):
+        dirs += [(d, "LV2_PATH in this environment") for d in environ["LV2_PATH"].split(":")]
+    system = {os.path.realpath(d) for d in SYSTEM_LV2}
+    found, seen = [], set()
+    for d, why in dirs:
+        if not d or "$" in d or os.path.realpath(d) in system:
+            continue
+        for man in sorted(_glob.glob(os.path.join(d, "*", "manifest.ttl"))):
+            real = os.path.realpath(os.path.dirname(man))
+            if real in seen or os.path.dirname(real) in system:
+                continue
+            try:
+                with open(man, errors="replace") as fh:
+                    if PLUGIN_URI not in fh.read():
+                        continue
+            except OSError:
+                continue
+            seen.add(real)
+            found.append((os.path.dirname(man), why))
+    return found
+
+
 def bind_lines(rec):
     keys = ["schema", "version", "result", "board", "kernel", "params_sha256", "wiring", "card", "amps", "sense", "family", "key", "method"]
     out = [f"{k}={rec[k]}" for k in keys]
@@ -485,6 +551,11 @@ def cmd_run(args):
     report = {"record": rec}
     errs = []
     try:
+        # Checked on every boot, before a bound pass is reused: the plugin a
+        # session loads must be the packaged one.
+        for path, why in lv2_shadows():
+            errs.append(f"an unpackaged sgv2 LV2 plugin is at {path} ({why}); PipeWire would load it instead of "
+                        f"the packaged one. Remove it (a leftover hand install) and reboot")
         rec["params_sha256"] = sha256(args.params)
         hw, w, desc, derr = derive_live(args)
         errs += derr
