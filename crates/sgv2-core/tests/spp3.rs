@@ -949,7 +949,7 @@ fn stale_closed_loop_after_the_pilot_stops_is_not_used() {
                 (adj, tcl) = (o.0, o.1);
             }
         }
-        assert!(r.fresh() && adj > 10.0, "relaxing while fresh: {adj}");
+        assert!(r.t_cl_fresh() && adj > 10.0, "relaxing while fresh: {adj}");
         // stop: T_OL decays from T_CL + 40 to T_CL - 40 over 30 s
         let n = (30.0 * 48_000.0 / 256.0) as usize;
         let mut prev = adj;
@@ -961,12 +961,12 @@ fn stale_closed_loop_after_the_pilot_stops_is_not_used() {
             let (a, t, bad) = r.update(t_ol, 0.0);
             assert_eq!(t, tcl, "the published T_CL holds");
             assert!(!bad, "the guard never judges a stale T_CL");
-            if !r.fresh() {
+            if !r.t_cl_fresh() {
                 assert!(a <= prev + 1e-9, "no relaxation from a stale T_CL");
             }
             prev = a;
             if k > upw + 1 {
-                assert!(!r.fresh(), "stale after one window plus one update");
+                assert!(!r.t_cl_fresh(), "stale after one window plus one update");
             }
         }
         assert!(prev < 1e-3, "back at the base: {prev}");

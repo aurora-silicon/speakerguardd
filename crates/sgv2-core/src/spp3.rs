@@ -1139,7 +1139,7 @@ impl ClReplay {
     }
 
     /// The T_CL is fresh (see [`Unit::cl_fresh`]).
-    pub fn fresh(&self) -> bool {
+    pub fn t_cl_fresh(&self) -> bool {
         self.cl.valid
     }
 
