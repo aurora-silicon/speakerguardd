@@ -544,7 +544,13 @@ impl Run {
         let mut detector_bandwidth = [1.0; BANDS];
         if q.bandwidth_compensation {
             for b in 0..BANDS {
-                detector_bandwidth[b] = (reference_edges[b + 1] - reference_edges[b]) / (edges[b + 1] - edges[b]);
+                // The control normalises detector power for the width of
+                // each band.  The detector itself carries amplitude, so the
+                // multiplier is the square root of the bandwidth ratio.
+                // Applying the power ratio directly under-detects wide
+                // installed bands and delays their downward gain action.
+                detector_bandwidth[b] =
+                    libm::sqrt((reference_edges[b + 1] - reference_edges[b]) / (edges[b + 1] - edges[b]));
             }
         }
         let detector_window = [10.0, 8.0, 2.0, 1.0]
@@ -885,6 +891,26 @@ mod tests {
     }
 
     #[test]
+    fn bandwidth_compensation_converts_power_width_to_amplitude() {
+        let mut p = params();
+        p.crossover_hz = [400.0, 1600.0, 8000.0];
+        p.bandwidth_compensation = true;
+        let run = Run::new(&p, 48_000.0, 1);
+        let expected = [
+            libm::sqrt(100.0 / 400.0),
+            libm::sqrt(900.0 / 1200.0),
+            libm::sqrt(9000.0 / 6400.0),
+            libm::sqrt(10_000.0 / 12_000.0),
+        ];
+        for (got, expected) in run.detector_bandwidth.into_iter().zip(expected) {
+            assert!((got - expected).abs() < 1e-12, "got {got}, expected {expected}");
+        }
+
+        p.bandwidth_compensation = false;
+        assert_eq!(Run::new(&p, 48_000.0, 1).detector_bandwidth, [1.0; BANDS]);
+    }
+
+    #[test]
     fn detector_windows_are_exact_sample_counts_and_keep_the_next_peak() {
         let run = Run::new(&params(), 48_000.0, 1);
         assert_eq!(run.detector_window, [481, 385, 97, 49]);
@@ -962,7 +988,7 @@ mod tests {
         let mut r = Run::new(&p, 48_000.0, 2);
         r.process(&mut [&mut left, &mut right], 24_000);
         // The loud channel's detector prevents an upward boost on either.
-        assert!((level(&right, 80.0) - before).abs() < 0.1);
+        assert!(level(&right, 80.0) - before < 0.1);
         assert!(Run::saturate(Some(4), 1.0).abs() <= 1.0);
     }
 
