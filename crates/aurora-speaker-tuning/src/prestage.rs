@@ -451,6 +451,7 @@ mod tests {
             preset_name: None,
             state: Some(ParamState { sections: vec![ParamSection { scope: 0, element: 0, params }] }),
             preset_extra_keys: Vec::new(),
+            preset_extra: Default::default(),
             before_protection: true,
         }
     }
