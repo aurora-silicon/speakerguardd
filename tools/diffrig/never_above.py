@@ -44,25 +44,25 @@ Each audio file is interleaved little-endian float32, one channel per driver
 in the "drivers" order, in full-scale units at the amplifier input. Relative
 paths resolve against the manifest's directory.
 
-Driver models (models.json, one object per driver name; every key required):
-  ag      amplifier output, volts peak at digital full scale
-  reb     voice-coil DC resistance, ohm
-  rshunt  current-sense shunt, ohm
-  rampout amplifier output resistance, ohm
-  phi     force factor Bl, T*m
-  mt      moving mass, kg
-  kt      suspension stiffness, N/m
-  rt      mechanical resistance, N*s/m
-  rth_vc, tau_vc  coil thermal resistance K/W and time constant s
-  rth_mg, tau_mg  magnet thermal resistance K/W and time constant s
-  ambient         degC
-The tuning's own fields fill these (the sidecar's open-loop displacement and
-thermal dictionaries); the gate refuses a model with a missing or non-finite
-key rather than guess one.
+Driver models (models.json, one object per driver name; every key required),
+named as the tuning sidecar names them:
+  ag                   amplifier output, volts peak at digital full scale
+  Reb_ref              voice-coil DC resistance, ohm
+  Rshunt, Rampout      current-sense shunt and amplifier output resistance, ohm
+  phi, mt, kt, ct      force factor T*m, moving mass kg, stiffness N/m,
+                       mechanical damping N*s/m
+  T_sett_vc, tau_Tvc   coil thermal resistance K/W (above the magnet), time s
+  T_sett_mg, tau_Tmg   magnet thermal resistance K/W, time s
+  Thermal_AmbientTemp  degC
+`never_above.py models SIDECAR.plist OUT.json` writes them from the sidecar,
+driver "chN" = ChannelSpecificParams/ChannelN = unit channel N (the unit
+indexes its channel tuning by part element, not by SpeakerName). The gate
+refuses a model with a missing or non-finite key rather than guess one.
 
 Usage:
   never_above.py gate MANIFEST [--report OUT.json]
   never_above.py signals OUT_DIR [--fs 48000]   write the required case set
+  never_above.py models SIDECAR.plist OUT.json  per-driver models from a tuning
   never_above.py --self-test
 Exit status 0 only if every check passes.
 """
@@ -80,8 +80,10 @@ except ImportError:  # CI's self-test runs without numpy
 
 DEFAULT_TOL = {"db": 0.05, "rel": 1e-3, "temp_c": 0.02, "floor_db": -150.0}
 WINDOWS_S = (0.01, 0.1, 1.0, 10.0)
-MODEL_KEYS = ("ag", "reb", "rshunt", "rampout", "phi", "mt", "kt", "rt",
-              "rth_vc", "tau_vc", "rth_mg", "tau_mg", "ambient")
+# The tuning sidecar's own field names (open-loop displacement and thermal
+# dictionaries of ChannelSpecificParams/ChannelN, ambient from the globals).
+MODEL_KEYS = ("ag", "Reb_ref", "Rshunt", "Rampout", "phi", "mt", "kt", "ct",
+              "T_sett_vc", "tau_Tvc", "T_sett_mg", "tau_Tmg", "Thermal_AmbientTemp")
 THERMAL_STEP_S = 0.001
 
 # Required case set. Levels in dBFS at the program input; the voicing chain
@@ -212,19 +214,19 @@ def window_rms(x, fs):
 
 def mechanics(x, fs, m):
     """Peak excursion and velocity of the linear moving-coil model."""
-    rtot = m["reb"] + m["rshunt"] + m["rampout"]
-    tail = int(fs * 8 * m["mt"] / max(m["rt"] + m["phi"] ** 2 / rtot, 1e-12)) + 1
+    rtot = m["Reb_ref"] + m["Rshunt"] + m["Rampout"]
+    tail = int(fs * 8 * m["mt"] / max(m["ct"] + m["phi"] ** 2 / rtot, 1e-12)) + 1
     n = pow2(len(x) + min(tail, 4 * len(x) + fs))
     if np is not None:
         sp = np.fft.rfft(np.asarray(x, dtype=np.float64) * m["ag"], n)
         w = 2 * np.pi * np.arange(len(sp)) * fs / n
-        h = (m["phi"] / rtot) / ((m["kt"] - m["mt"] * w * w) + 1j * w * (m["rt"] + m["phi"] ** 2 / rtot))
+        h = (m["phi"] / rtot) / ((m["kt"] - m["mt"] * w * w) + 1j * w * (m["ct"] + m["phi"] ** 2 / rtot))
         return (float(np.abs(np.fft.irfft(sp * h, n)).max()), float(np.abs(np.fft.irfft(sp * h * 1j * w, n)).max()))
     spec = rfft([v * m["ag"] for v in x], n)
     xs, vs = [], []
     for k, s in enumerate(spec):
         w = 2 * math.pi * k * fs / n
-        h = (m["phi"] / rtot) / complex(m["kt"] - m["mt"] * w * w, w * (m["rt"] + m["phi"] ** 2 / rtot))
+        h = (m["phi"] / rtot) / complex(m["kt"] - m["mt"] * w * w, w * (m["ct"] + m["phi"] ** 2 / rtot))
         xs.append(s * h)
         vs.append(s * h * 1j * w)
     return (max(abs(v) for v in irfft(xs, n)), max(abs(v) for v in irfft(vs, n)))
@@ -232,14 +234,14 @@ def mechanics(x, fs, m):
 
 def thermal(x, fs, m):
     """Peak coil and magnet temperature: coil power through two first-order nodes."""
-    rtot = m["reb"] + m["rshunt"] + m["rampout"]
-    scale = m["ag"] ** 2 * m["reb"] / rtot ** 2
+    rtot = m["Reb_ref"] + m["Rshunt"] + m["Rampout"]
+    scale = m["ag"] ** 2 * m["Reb_ref"] / rtot ** 2
     step = max(1, int(round(THERMAL_STEP_S * fs)))
     dt = step / fs
-    avc = math.exp(-dt / m["tau_vc"])
-    amg = math.exp(-dt / m["tau_mg"])
+    avc = math.exp(-dt / m["tau_Tvc"])
+    amg = math.exp(-dt / m["tau_Tmg"])
     tvc = tmg = 0.0
-    pk_vc = pk_mg = m["ambient"]
+    pk_vc = pk_mg = m["Thermal_AmbientTemp"]
     if np is not None:
         a = np.asarray(x, dtype=np.float64) ** 2
         pad = (-len(a)) % step
@@ -250,10 +252,10 @@ def thermal(x, fs, m):
     else:
         powers = [scale * sum(v * v for v in x[i:i + step]) / len(x[i:i + step]) for i in range(0, len(x), step)]
     for p in powers:
-        tvc = avc * tvc + (1 - avc) * m["rth_vc"] * p
-        tmg = amg * tmg + (1 - amg) * m["rth_mg"] * p
-        pk_mg = max(pk_mg, m["ambient"] + tmg)
-        pk_vc = max(pk_vc, m["ambient"] + tmg + tvc)
+        tvc = avc * tvc + (1 - avc) * m["T_sett_vc"] * p
+        tmg = amg * tmg + (1 - amg) * m["T_sett_mg"] * p
+        pk_mg = max(pk_mg, m["Thermal_AmbientTemp"] + tmg)
+        pk_vc = max(pk_vc, m["Thermal_AmbientTemp"] + tmg + tvc)
     return pk_vc, pk_mg
 
 
@@ -322,8 +324,8 @@ def check_model(name, m):
     bad = [k for k in MODEL_KEYS if not isinstance(m.get(k), (int, float)) or not math.isfinite(m[k])]
     if bad:
         return f"driver {name}: model missing or non-finite {', '.join(bad)}"
-    if min(m[k] for k in ("reb", "mt", "kt", "tau_vc", "tau_mg")) <= 0:
-        return f"driver {name}: model has a non-positive reb/mt/kt/tau"
+    if min(m[k] for k in ("Reb_ref", "mt", "kt", "tau_Tvc", "tau_Tmg")) <= 0:
+        return f"driver {name}: model has a non-positive Reb_ref/mt/kt/tau"
     return None
 
 
@@ -517,9 +519,48 @@ def write_signals(out, fs):
 
 def _synthetic_model():
     # Synthetic driver, not any Mac's: round numbers of a small woofer.
-    return {"ag": 10.0, "reb": 4.0, "rshunt": 0.1, "rampout": 0.1, "phi": 3.0, "mt": 0.003,
-            "kt": 2000.0, "rt": 0.5, "rth_vc": 20.0, "tau_vc": 0.5, "rth_mg": 10.0, "tau_mg": 5.0,
-            "ambient": 25.0}
+    return {"ag": 10.0, "Reb_ref": 4.0, "Rshunt": 0.1, "Rampout": 0.1, "phi": 3.0, "mt": 0.003,
+            "kt": 2000.0, "ct": 0.5, "T_sett_vc": 20.0, "tau_Tvc": 0.5, "T_sett_mg": 10.0,
+            "tau_Tmg": 5.0, "Thermal_AmbientTemp": 25.0}
+
+
+def _find(d, key):
+    """The value of key anywhere under d (dicts and lists), or None."""
+    if isinstance(d, dict):
+        if key in d:
+            return d[key]
+        vals = d.values()
+    elif isinstance(d, list):
+        vals = d
+    else:
+        return None
+    for v in vals:
+        r = _find(v, key)
+        if r is not None:
+            return r
+    return None
+
+
+def sidecar_models(plist):
+    """Per-unit-channel driver models from a parsed sidecar; raises on any gap."""
+    chans = _find(plist, "ChannelSpecificParams")
+    if not isinstance(chans, dict) or not chans:
+        raise ValueError("sidecar has no ChannelSpecificParams")
+    glob = {k: v for k, v in plist.items() if k != "ChannelSpecificParams"}
+    out = {}
+    for name in sorted(chans, key=lambda k: int(k[7:]) if k.startswith("Channel") and k[7:].isdigit() else -1):
+        if not (name.startswith("Channel") and name[7:].isdigit()):
+            raise ValueError(f"unexpected channel entry {name}")
+        m = {}
+        for k in MODEL_KEYS:
+            v = _find(chans[name], k)
+            if v is None:
+                v = _find(glob, k)
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise ValueError(f"{name}: no numeric {k}")
+            m[k] = float(v)
+        out[f"ch{name[7:]}"] = m
+    return out
 
 
 def self_test():
@@ -569,7 +610,7 @@ def self_test():
     run("v2 below the floor", [w, [0.0] * n], [w, tone(40, 1e-9, n)], True)
     run("missing model", [w, t], [w, t], False, models={"w": _synthetic_model()})
     bad = dict(_synthetic_model())
-    del bad["rth_vc"]
+    del bad["T_sett_vc"]
     run("model key missing", [w, t], [w, t], False, models={"w": _synthetic_model(), "t": bad})
     run("missing case", [w, t], [w, t], False, cases=["c", "d"])
 
@@ -584,9 +625,26 @@ def self_test():
     hot = [v * (1.0 if i < n // 2 else 1.02) for i, v in enumerate(w)]
     run("hotter late", [w, t], [hot, t], False)
 
+    syn = {"Thermal_AmbientTemp": 25.0, "ChannelSpecificParams": {
+        "Channel1": {"OL_disp": {k: _synthetic_model()[k] for k in ("ag", "phi", "mt", "kt", "ct")},
+                     "OL_thermal": {k: _synthetic_model()[k] for k in
+                                    ("Reb_ref", "Rshunt", "Rampout", "T_sett_vc", "tau_Tvc", "T_sett_mg", "tau_Tmg")}},
+        "Channel0": {"OL_disp": {}, "OL_thermal": {}}}}
+    try:
+        sidecar_models(syn)
+        ok = False
+        print("self-test models: accepted a channel with no fields")
+    except ValueError:
+        syn["ChannelSpecificParams"]["Channel0"] = syn["ChannelSpecificParams"]["Channel1"]
+        got = sidecar_models(syn)
+        if list(got) != ["ch0", "ch1"] or got["ch1"] != _synthetic_model():
+            ok = False
+            print(f"self-test models: wrong extraction {got}")
+        else:
+            print("self-test models: ok")
     m = _synthetic_model()
     x0, v0 = mechanics(tone(10, 1.0, 4 * fs), fs, m)
-    static = m["ag"] * m["phi"] / ((m["reb"] + m["rshunt"] + m["rampout"]) * m["kt"])
+    static = m["ag"] * m["phi"] / ((m["Reb_ref"] + m["Rshunt"] + m["Rampout"]) * m["kt"])
     if not 0.9 < x0 / static < 1.15:
         ok = False
         print(f"self-test mechanics: below resonance x {x0:.4g} vs static {static:.4g}")
@@ -606,6 +664,14 @@ def main(argv):
     if len(argv) >= 3 and argv[1] == "gate":
         rep = argv[argv.index("--report") + 1] if "--report" in argv else None
         return 0 if gate(argv[2], rep) else 1
+    if len(argv) == 4 and argv[1] == "models":
+        import plistlib
+        with open(argv[2], "rb") as f:
+            models = sidecar_models(plistlib.load(f))
+        with open(argv[3], "w") as f:
+            json.dump(models, f, indent=1)
+        print(f"{len(models)} driver models in {argv[3]}")
+        return 0
     if len(argv) >= 3 and argv[1] == "signals":
         fs = int(argv[argv.index("--fs") + 1]) if "--fs" in argv else 48000
         write_signals(argv[2], fs)
