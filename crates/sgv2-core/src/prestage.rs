@@ -882,6 +882,18 @@ impl DynamicRun {
         }
     }
 
+    /// Rebuild the coefficient sets for volume automation without resetting
+    /// any detector, controller or carrier history. These ToneMeister shapes
+    /// update one fixed parallel carrier in place.
+    fn reconfigure(&mut self, params: &DynamicFilter, fs: f64) {
+        let fresh = Self::new(params, fs);
+        self.fs = fs;
+        self.detector = fresh.detector;
+        self.component = fresh.component;
+        self.quadrature = fresh.quadrature;
+        self.reconstruction = fresh.reconstruction;
+    }
+
     fn reset(&mut self) {
         self.detector_state = [0.0; 2];
         self.component_state = [[0.0; 2]; MAX_CHANNELS];
@@ -1058,7 +1070,11 @@ impl PreStage {
     pub(crate) fn set_dynamic_filter(&mut self, index: usize, params: DynamicFilter, fs: f64) {
         if index < self.params.dynamic_count.min(MAX_DYNAMIC_FILTERS) && params.valid(fs) {
             self.params.dynamic[index].params = params;
-            self.dynamic[index] = Some(DynamicRun::new(&params, fs));
+            if let Some(run) = &mut self.dynamic[index] {
+                run.reconfigure(&params, fs);
+            } else {
+                self.dynamic[index] = Some(DynamicRun::new(&params, fs));
+            }
         }
     }
 
@@ -1516,6 +1532,32 @@ mod tests {
         let shelf = dynamic_filter_params(DynamicKind::HighShelf);
         assert!(run_filter(shelf.clone(), 1_000.0, 1.0).abs() < 0.15);
         assert!(run_filter(shelf, 12_000.0, 1.0) < -3.0);
+    }
+
+    #[test]
+    fn dynamic_filter_automation_retains_running_state() {
+        let p = dynamic_filter_params(DynamicKind::Notch);
+        let at = p.dynamic[0];
+        let mut run = DynamicRun::new(&at.params, 48_000.0);
+        let mut signal = tone(1_000.0, 1.0, 512);
+        run.process(&at, &mut [&mut signal], 512);
+
+        let detector_state = run.detector_state;
+        let component_state = run.component_state;
+        let quadrature_state = run.quadrature_state;
+        let reconstruction_state = run.reconstruction_state;
+        let phase = run.control_phase;
+        let envelope = run.envelope;
+
+        let mut moved = at.params;
+        moved.frequency_hz = 1_200.0;
+        run.reconfigure(&moved, 48_000.0);
+        assert_eq!(run.detector_state, detector_state);
+        assert_eq!(run.component_state, component_state);
+        assert_eq!(run.quadrature_state, quadrature_state);
+        assert_eq!(run.reconstruction_state, reconstruction_state);
+        assert_eq!(run.control_phase, phase);
+        assert_eq!(run.envelope, envelope);
     }
 
     #[test]
