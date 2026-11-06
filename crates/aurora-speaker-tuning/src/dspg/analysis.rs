@@ -77,7 +77,7 @@ pub struct Analysis {
     pub unreached: Vec<String>,
 }
 
-fn wire_channels(g: &Graph, w: &Wire) -> Result<u32> {
+pub fn wire_channels(g: &Graph, w: &Wire) -> Result<u32> {
     let f = g.wire_format(w).ok_or_else(|| {
         Error::format("dspg", format!("line {}: wire {}:{} has no format", w.line, w.src.node, w.src.port))
     })?;

@@ -61,6 +61,7 @@ fn usage() -> ! {
     eprintln!(
         "usage: aurora-speaker-tuning {{dump|validate}} [--json] [--speaker-id N] [PATH | --tunings-root DIR --aid N]\n       \
          aurora-speaker-tuning compile [--speaker-id N] [--board B [--unit-id U]] [--development] [--bundle PATH | --tunings-root DIR --aid N] -o BLOB\n       \
+         aurora-speaker-tuning plan [--speaker-id N] [PATH | --tunings-root DIR --aid N]\n       \
          aurora-speaker-tuning identify [--json] [PATH | --tunings-root DIR --aid N]\n       \
          aurora-speaker-tuning blob BLOB [BLOB]\n       \
          aurora-speaker-tuning units [--json]\n       aurora-speaker-tuning plist FILE"
@@ -78,6 +79,7 @@ fn parse_args() -> Args {
         Some("compile") => "compile",
         Some("blob") => "blob",
         Some("identify") => "identify",
+        Some("plan") => "plan",
         _ => usage(),
     }
     .to_string();
@@ -499,6 +501,11 @@ fn main() {
                         );
                     }
                     Err(e) => diags.from_error("compile", &e),
+                }
+            } else if a.cmd == "plan" {
+                match aurora_speaker_tuning::voicing::topology::plan(&t) {
+                    Ok(p) => println!("{}", serde_json::to_string_pretty(&p).unwrap()),
+                    Err(e) => diags.from_error("plan", &e),
                 }
             } else if a.cmd == "dump" {
                 if a.json {
