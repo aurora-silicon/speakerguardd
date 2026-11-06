@@ -34,6 +34,7 @@ fn params() -> Params {
         max_power_attenuation_db: 4.0,
         low_rail_idle_power_w: 0.01,
         low_rail_power_ratio: 1.1,
+        velocity_parameter_max: 1.25,
         ..Params::default()
     };
     for c in 0..2 {
@@ -335,6 +336,20 @@ fn slicing_does_not_change_the_audio() {
     let r = run(&mut Unit::new(params()), &[x.clone(), y.clone()], 256);
     for slice in [1usize, 7, 160, 1000, 4096] {
         assert!(run(&mut Unit::new(params()), &[x.clone(), y.clone()], slice) == r, "slice {slice}");
+    }
+}
+
+#[test]
+fn ordinary_synthetic_axes_do_not_trip_the_allocator_failsafe() {
+    for (name, axes) in [
+        ("peak", [true, false, false, false, true]),
+        ("displacement", [false, true, false, false, true]),
+        ("velocity", [false, false, true, false, true]),
+    ] {
+        let mut unit = Unit::new(only(axes));
+        let input = sine(150.0, 1.0, 2.0);
+        run(&mut unit, &[input.clone(), input], 512);
+        assert_eq!(tel(&unit).health, sgv2_core::Health::OK, "{name}");
     }
 }
 

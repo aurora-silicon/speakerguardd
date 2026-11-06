@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 
 fn lsm2_bundle(lattice: Option<Vec<u8>>) -> BTreeMap<String, Vec<u8>> {
     let mut files = spp3_files(4);
+    files.insert(LSM2_METADATA.into(), lsm2_metadata_bytes(1.75));
     files.insert(format!("{AID}/DSP/Graphs/builtin_speaker_out.dspg"), graph_text("lsm2").into_bytes());
     files.insert(format!("{AID}/DSP/Strips/builtin_speaker_out_general.austrip"), strip("lsm2", 4));
     if let Some(l) = lattice {

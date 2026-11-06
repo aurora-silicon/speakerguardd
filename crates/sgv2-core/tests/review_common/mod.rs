@@ -183,6 +183,7 @@ pub fn lsm2_params() -> lsm2::Params {
         max_power_attenuation_db: 4.0,
         low_rail_idle_power_w: 0.0,
         low_rail_power_ratio: 1.0,
+        velocity_parameter_max: 1.25,
         ..lsm2::Params::default()
     };
     for c in 0..2 {

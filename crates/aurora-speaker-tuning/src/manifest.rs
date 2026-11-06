@@ -111,6 +111,9 @@ pub struct Manifest {
     /// Mac's AudioDSP ([`crate::lattice`]); `None` in bundles collected
     /// before it.
     pub mask_lattice: Option<Record>,
+    /// Public lsm2 parameter metadata collected without initializing or
+    /// rendering the unit, and covered by this manifest's identity.
+    pub lsm2_metadata: Option<Record>,
 }
 
 /// The installer's `lsm2_mask_lattice` record.
@@ -163,6 +166,8 @@ struct InstallerJson {
     /// Optional: bundles collected before the installer read it have none.
     #[serde(default)]
     lsm2_mask_lattice: Option<LatticeJson>,
+    #[serde(default)]
+    lsm2_metadata: Option<Record>,
 }
 
 #[derive(Deserialize)]
@@ -181,6 +186,7 @@ impl Manifest {
             .chain(self.speaker_thiele_small.iter())
             .chain(self.shared.iter())
             .chain(self.mask_lattice.iter())
+            .chain(self.lsm2_metadata.iter())
     }
 
     /// Parses `manifest.json` (installer).
@@ -276,6 +282,18 @@ impl Manifest {
                 Some(Record { path: l.path, bytes: l.bytes, sha256: l.sha256 })
             }
         };
+        let lsm2_metadata = match j.lsm2_metadata {
+            None => None,
+            Some(record) => {
+                if record.path != crate::lsm2_metadata::NAME || record.bytes > crate::lsm2_metadata::MAX_BYTES {
+                    return Err(Error::format(
+                        NAME,
+                        format!("invalid lsm2 metadata record path or size: {:?}", record.path),
+                    ));
+                }
+                Some(record)
+            }
+        };
         let prefix = format!("{}/", j.aid);
         let folder = j.files.iter().filter(|r| r.path.starts_with(&prefix)).count() as u64;
         if j.source_file_count == 0 || j.source_file_count != folder {
@@ -298,6 +316,7 @@ impl Manifest {
             files: j.files,
             shared,
             mask_lattice,
+            lsm2_metadata,
         };
         m.check(NAME)?;
         Ok(m)
@@ -330,6 +349,7 @@ impl Manifest {
             files,
             shared: Vec::new(),
             mask_lattice: None,
+            lsm2_metadata: None,
         };
         m.check(COLLECTOR_NAME)?;
         Ok(m)
