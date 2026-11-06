@@ -2031,9 +2031,9 @@ impl Run {
             // the protected output, below
             c.vcar_m.carry(&mut c.vcar, fbl);
             let velocity_cut = core::cell::Cell::new(false);
-            let velocity_floor_limited = core::cell::Cell::new(false);
+            let primary_floor_limited = core::cell::Cell::new(false);
             let retained_episode = core::cell::Cell::new(c.vel_episode && c.vel_episode_retained);
-            let chain = |c: &Chan, seed: [f32; BANDS], floor_velocity: bool| -> [f32; BANDS] {
+            let chain = |c: &Chan, seed: [f32; BANDS]| -> [f32; BANDS] {
                 let all = (0, BANDS);
                 let mut r = seed;
                 if disp_on {
@@ -2074,23 +2074,12 @@ impl Run {
                         ordinary
                     };
                     for k in c.vel_active.0..c.vel_active.1 {
-                        // MaxVelocityAttenuation constrains the primary
-                        // request. Native's retarget solve may preserve its
-                        // no-progress result below that floor; reapplying the
-                        // floor there makes a floor-limited tone recover to
-                        // the floor every decision and produces a sawtooth
-                        // that the native gain does not have.
                         let raw = q[k];
-                        let v = if floor_velocity {
-                            let floored = (sg * raw).max(c.vel_floor as f32) / sg;
-                            velocity_floor_limited.set(
-                                velocity_floor_limited.get()
-                                    || (sg * raw < c.vel_floor as f32 && floored < r[k]),
-                            );
-                            floored
-                        } else {
-                            raw
-                        };
+                        let v = (sg * raw).max(c.vel_floor as f32) / sg;
+                        primary_floor_limited.set(
+                            primary_floor_limited.get()
+                                || (sg * raw < c.vel_floor as f32 && v < r[k]),
+                        );
                         velocity_cut.set(velocity_cut.get() || v < r[k]);
                         r[k] = r[k].min(v);
                     }
@@ -2105,7 +2094,7 @@ impl Run {
                 // follower's request stays in the band domain. The output
                 // applies the slow trajectory after the fast-gained sum;
                 // scaling the request by `sg` here would apply it twice.
-                let p = chain(c, [1.0; BANDS], true);
+                let p = chain(c, [1.0; BANDS]);
                 // residuals 5.2 (t-4713): upward lanes (primary above the
                 // applied gain); one second chain seeded from the predicted
                 // endpoint toward the complete primary request of upward
@@ -2116,7 +2105,12 @@ impl Run {
                 // the second request too (a lane the second solve leaves at
                 // its seed, unity included, is not a request of that solve)
                 let up: [bool; BANDS] = core::array::from_fn(|k| p[k] > c.band[k].g);
-                if up.iter().any(|&u| u) {
+                // Once the primary allocation is pinned at
+                // MaxVelocityAttenuation, native leaves the retarget path
+                // idle. The ordinary solve may still re-cut a recovering
+                // neighbour on a later decision; running the retarget solve
+                // here instead re-cuts it at the regular follower cadence.
+                if up.iter().any(|&u| u) && !primary_floor_limited.get() {
                     let guard = libm::pow(10.0, 3.0 / 20.0) as f32;
                     let seed: [f32; BANDS] = core::array::from_fn(|k| {
                         let end = c.band[k].end_after(p[k], ctl, if k == 0 { a_low } else { a_fast });
@@ -2126,7 +2120,7 @@ impl Run {
                             1.0
                         }
                     });
-                    let q = chain(c, seed, !velocity_floor_limited.get());
+                    let q = chain(c, seed);
                     core::array::from_fn(|k| if up[k] && q[k] >= seed[k] { p[k] } else { q[k] })
                 } else {
                     p
