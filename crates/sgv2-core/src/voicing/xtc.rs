@@ -78,7 +78,7 @@ impl Params {
             return None;
         }
         let integer = |x: f64| -> Option<usize> {
-            if x.is_finite() && x >= 0.0 && x <= MAX_TAPS as f64 && x.fract() == 0.0 {
+            if x.is_finite() && x >= 0.0 && x <= MAX_TAPS as f64 && libm::trunc(x) == x {
                 Some(x as usize)
             } else {
                 None

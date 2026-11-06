@@ -356,7 +356,7 @@ const STRIDE_MAX: usize = 24;
 /// the selected rate.
 pub fn sub_stride(fs: f64) -> Option<usize> {
     let r = fs / law::SUB_RATE_HZ;
-    (r >= 1.0 && r.fract() == 0.0 && r as usize <= STRIDE_MAX).then_some(r as usize)
+    (r >= 1.0 && libm::trunc(r) == r && r as usize <= STRIDE_MAX).then_some(r as usize)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -404,7 +404,7 @@ impl Params {
             return None;
         }
         let order = |v: f64| -> Option<usize> {
-            (v >= 2.0 && v <= (2 * MAX_SECTIONS) as f64 && v.fract() == 0.0 && (v as usize) % 2 == 0)
+            (v >= 2.0 && v <= (2 * MAX_SECTIONS) as f64 && libm::trunc(v) == v && (v as usize) % 2 == 0)
                 .then_some(v as usize)
         };
         let corner = |v: f64| (v > 0.0 && v < 20_000.0).then_some(v);
