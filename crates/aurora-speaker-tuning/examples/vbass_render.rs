@@ -1,12 +1,13 @@
 //! Offline render of the virtual bass box for the differential rig.
 //!
-//! `vbass_render (--tunings-root DIR --aid N | --bundle DIR) [--set ID=VALUE..] < in.f32 > out.f32`
+//! `vbass_render (--tunings-root DIR --aid N | --bundle DIR | --strip FILE) [--set ID=VALUE..] < in.f32 > out.f32`
 //!
 //! Input and output are interleaved stereo f32 at 48 kHz. `--set` overrides
 //! one saved parameter before compiling, as the rig does on macOS.
 use aurora_speaker_tuning::bundle::Bundle;
 use aurora_speaker_tuning::error::Diagnostics;
-use aurora_speaker_tuning::tuning::{Options, Tuning};
+use aurora_speaker_tuning::strip::AuStrip;
+use aurora_speaker_tuning::tuning::{Options, Stage, Tuning};
 use aurora_speaker_tuning::voicing::vbass;
 use sgv2_core::voicing::vbass::Run;
 use std::io::{Read, Write};
@@ -14,13 +15,14 @@ use std::path::PathBuf;
 
 fn main() {
     let mut it = std::env::args().skip(1);
-    let (mut root, mut aid, mut dir, mut sets) = (None, None, None, Vec::new());
+    let (mut root, mut aid, mut dir, mut strip, mut sets) = (None, None, None, None, Vec::new());
     while let Some(a) = it.next() {
         let v = it.next().expect("value");
         match a.as_str() {
             "--tunings-root" => root = Some(PathBuf::from(v)),
             "--aid" => aid = Some(v.parse::<u32>().expect("aid")),
             "--bundle" => dir = Some(PathBuf::from(v)),
+            "--strip" => strip = Some(PathBuf::from(v)),
             "--set" => {
                 let (k, x) = v.split_once('=').expect("ID=VALUE");
                 sets.push((k.parse::<u32>().expect("id"), x.parse::<f32>().expect("value")));
@@ -28,16 +30,38 @@ fn main() {
             _ => panic!("bad arg {a}"),
         }
     }
-    let bundle = match (root, aid, dir) {
-        (Some(r), Some(a), None) => Bundle::from_tunings_root(&r, a),
-        (None, None, Some(d)) if d.is_file() => Bundle::from_tar(&d, None),
-        (None, None, Some(d)) => Bundle::from_dir(&d),
-        _ => panic!("give --tunings-root and --aid, or --bundle"),
-    }
-    .expect("bundle");
     let mut diags = Diagnostics::default();
-    let mut t = Tuning::load(&bundle, &Options::default(), &mut diags).expect("tuning");
-    let stage = t.chain.iter_mut().find(|s| s.kind == "aufx/vben/appl").expect("no vben box");
+    let mut stage = match (root, aid, dir, strip) {
+        (Some(r), Some(a), None, None) => {
+            let bundle = Bundle::from_tunings_root(&r, a).expect("bundle");
+            let t = Tuning::load(&bundle, &Options::default(), &mut diags).expect("tuning");
+            t.chain.into_iter().find(|s| s.kind == "aufx/vben/appl").expect("no vben box")
+        }
+        (None, None, Some(d), None) => {
+            let bundle = if d.is_file() { Bundle::from_tar(&d, None) } else { Bundle::from_dir(&d) }.expect("bundle");
+            let t = Tuning::load(&bundle, &Options::default(), &mut diags).expect("tuning");
+            t.chain.into_iter().find(|s| s.kind == "aufx/vben/appl").expect("no vben box")
+        }
+        (None, None, None, Some(path)) => {
+            let bytes = std::fs::read(&path).expect("read strip");
+            let strip = AuStrip::parse(&bytes, &path.display().to_string()).expect("strip");
+            let effect = strip.effects().find(|e| e.unit.subtype.bytes() == *b"vben").expect("no vben box");
+            Stage {
+                name: effect.box_name.clone(),
+                kind: effect.unit.to_string(),
+                unit: Some(effect.unit),
+                inputs: 1,
+                outputs: 1,
+                channels: Some(2),
+                bypass: effect.bypass,
+                preset_name: effect.preset.name.clone(),
+                state: Some(effect.preset.state.clone()),
+                preset_extra_keys: effect.preset.extra_keys(),
+                before_protection: true,
+            }
+        }
+        _ => panic!("give --tunings-root and --aid, --bundle, or --strip"),
+    };
     if let Some(g) = stage.state.as_mut().and_then(|s| s.sections.iter_mut().find(|x| x.scope == 0 && x.element == 0)) {
         for (k, x) in &sets {
             match g.params.iter_mut().find(|(id, _)| id == k) {
@@ -47,7 +71,7 @@ fn main() {
         }
     }
     let fs = 48_000.0;
-    let p = vbass::compile(stage, fs, &mut diags).expect("compile").expect("bypassed");
+    let p = vbass::compile(&stage, fs, &mut diags).expect("compile").expect("bypassed");
     let mut run = Run::new(&p, fs, 2);
     let mut raw = Vec::new();
     std::io::stdin().read_to_end(&mut raw).expect("read");

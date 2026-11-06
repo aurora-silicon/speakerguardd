@@ -16,5 +16,5 @@
 //! `mvsc` = 1, `mvol` = 0 dB); a box whose saved state depends on another
 //! volume refuses rather than guesses.
 pub mod pchr;
-pub mod volt;
 pub mod vbass;
+pub mod volt;
