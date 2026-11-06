@@ -544,13 +544,12 @@ impl Run {
         let mut detector_bandwidth = [1.0; BANDS];
         if q.bandwidth_compensation {
             for b in 0..BANDS {
-                // The control normalises detector power for the width of
-                // each band.  The detector itself carries amplitude, so the
-                // multiplier is the square root of the bandwidth ratio.
-                // Applying the power ratio directly under-detects wide
-                // installed bands and delays their downward gain action.
-                detector_bandwidth[b] =
-                    libm::sqrt((reference_edges[b + 1] - reference_edges[b]) / (edges[b + 1] - edges[b]));
+                // The component applies the normalized reference-band width
+                // directly to its detector magnitude.  This is deliberately
+                // not converted through sqrt: doing so raises the detector in
+                // wide low bands and lowers it in narrow upper bands, tilting
+                // the multiband gain away from the saved curve.
+                detector_bandwidth[b] = (reference_edges[b + 1] - reference_edges[b]) / (edges[b + 1] - edges[b]);
             }
         }
         let detector_window = [10.0, 8.0, 2.0, 1.0]
@@ -896,17 +895,12 @@ mod tests {
     }
 
     #[test]
-    fn bandwidth_compensation_converts_power_width_to_amplitude() {
+    fn bandwidth_compensation_applies_the_normalized_band_width() {
         let mut p = params();
         p.crossover_hz = [400.0, 1600.0, 8000.0];
         p.bandwidth_compensation = true;
         let run = Run::new(&p, 48_000.0, 1);
-        let expected = [
-            libm::sqrt(100.0 / 400.0),
-            libm::sqrt(900.0 / 1200.0),
-            libm::sqrt(9000.0 / 6400.0),
-            libm::sqrt(10_000.0 / 12_000.0),
-        ];
+        let expected = [100.0 / 400.0, 900.0 / 1200.0, 9000.0 / 6400.0, 10_000.0 / 12_000.0];
         for (got, expected) in run.detector_bandwidth.into_iter().zip(expected) {
             assert!((got - expected).abs() < 1e-12, "got {got}, expected {expected}");
         }
