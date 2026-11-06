@@ -17,8 +17,7 @@
 //! histogram works in loudness units, that minus 0.691):
 //! - fast: the loudest 64-frame level of the call, less a fixed store, held
 //!   and released only once the call sits more than a dead band under it,
-//!   slowly while it is under the slower paths' highest reading and with a
-//!   release that speeds up over the first seconds of audible program;
+//!   with a release that speeds up over the first seconds of audible program;
 //! - median: the lower median of the last 96 512-frame levels, less a fixed
 //!   store, behind a release limiter that only lets go once the median sits
 //!   more than its dead band under it;
@@ -301,16 +300,12 @@ const MID_DEADBAND_DB: f64 = 5.0;
 const MID_RELEASE_S: f32 = 2.316;
 /// Fast-path release. The held fast level glides down with pole
 /// `exp(-1000 / (k * span))`, `span` the frames per 64-frame event of the
-/// call's rate (`fs` over the call's event count). `k` is the larger of a
-/// history weight and `1 + FAST_SPAN * x^2`, where `x` is 1 while the held
-/// level sits under the slower paths' highest reading so far and falls to 0
-/// once it leads that reading by `FAST_LEAD_DB`. The history weight starts
-/// at `FAST_HISTORY` and relaxes toward 1 by `FAST_HISTORY_STEP / span` of
-/// the remaining distance per call whose fast level is above `VALID_DB`.
+/// call's rate (`fs` over the call's event count). `k` is a history weight
+/// that starts at `FAST_HISTORY` and relaxes toward 1 by
+/// `FAST_HISTORY_STEP / span` of the remaining distance per call whose fast
+/// level is above `VALID_DB`.
 const FAST_HISTORY: f64 = 1000.0;
 const FAST_HISTORY_STEP: f64 = 100.0;
-const FAST_SPAN: f64 = 99.0;
-const FAST_LEAD_DB: f64 = 12.0;
 /// Time constant of the long path's preconditioner glide, s. In single
 /// precision its pole rounds to exactly 1, so the glide holds.
 const PRECOND_S: f32 = 1e7;
@@ -465,9 +460,6 @@ pub struct Run {
     /// The held fast level and its release weight.
     fast: f64,
     history: f64,
-    /// Highest median and conditioned-long readings since the reset.
-    mid_max: f64,
-    long_max: f64,
     /// This call's 512-frame event: level, limited median, long reading.
     pending: Option<(f64, f64, f64)>,
     /// The 512-frame candidate: limited median against the conditioned
@@ -506,8 +498,6 @@ impl Run {
             events: 0,
             fast: 0.0,
             history: FAST_HISTORY,
-            mid_max: 0.0,
-            long_max: 0.0,
             pending: None,
             held: 0.0,
             candidate: 0.0,
@@ -538,8 +528,6 @@ impl Run {
         self.events = 0;
         self.fast = e;
         self.history = FAST_HISTORY;
-        self.mid_max = -100.0;
-        self.long_max = -100.0;
         self.pending = None;
         self.held = e;
         self.candidate = e;
@@ -592,7 +580,6 @@ impl Run {
         self.window.push(ema);
         if self.steps == 0 {
             let mid = self.median.push(db);
-            self.mid_max = self.mid_max.max(mid);
             self.pending = Some((db, mid, long));
             self.blocks = (self.blocks + 1) % PER_LONG;
         }
@@ -607,18 +594,18 @@ impl Run {
         if fast > VALID_DB {
             self.history += (1.0 - self.history) * FAST_HISTORY_STEP / span;
         }
-        let lead = self.fast - self.mid_max.max(self.long_max);
-        let x = if lead < 0.0 { 1.0 } else { 1.0 - lead.min(FAST_LEAD_DB) / FAST_LEAD_DB };
-        let k = (1.0 + FAST_SPAN * x * x).max(self.history);
+        let k = self.history.max(1.0);
         let pole = libm::exp(-1000.0 / (k * span));
         if fast > self.fast {
             self.fast = fast;
         } else if self.fast > fast + self.p.fast_deadband_db {
-            self.fast += (1.0 - pole) * (fast - self.fast);
+            // The dead-band edge is both the strict engagement threshold and
+            // the release target. The held level approaches that edge, not
+            // the colder call target below it.
+            self.fast += (1.0 - pole) * (fast + self.p.fast_deadband_db - self.fast);
         }
         if let Some((db, mid, long)) = self.pending.take() {
             let long = self.pre.update(db + COMPETITOR_STORE_DB, long);
-            self.long_max = self.long_max.max(long);
             self.held = mid.max(long);
         }
         self.candidate = self.held.max(self.fast);
@@ -846,6 +833,28 @@ mod tests {
         // it follows the reading down, and again once the competitor is above
         assert_eq!(p.update(-12.0, -12.5), -12.5);
         assert_eq!(p.update(-5.0, -11.0), -11.0);
+    }
+
+    #[test]
+    fn fast_release_approaches_the_dead_band_edge_at_the_history_rate() {
+        let p = Params { expected_db: -20.0, fast_deadband_db: 7.0, ..params(0) };
+        let mut fast = Run::new(&p, 48_000.0, 1);
+        fast.peak = -42.0; // call target: -50; release edge: -43
+        fast.events = 8;
+        fast.history = 1.0;
+        fast.arbitrate();
+
+        let span = 48_000.0 / 8.0;
+        let pole = libm::exp(-1000.0 / span);
+        let expected = -20.0 + (1.0 - pole) * (-43.0 - -20.0);
+        assert!((fast.fast - expected).abs() < 1e-12, "{} vs {}", fast.fast, expected);
+
+        let mut slow = Run::new(&p, 48_000.0, 1);
+        slow.peak = -42.0;
+        slow.events = 8;
+        slow.history = FAST_HISTORY;
+        slow.arbitrate();
+        assert!(fast.fast < slow.fast, "{} vs {}", fast.fast, slow.fast);
     }
 
     #[test]
