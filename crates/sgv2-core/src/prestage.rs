@@ -837,6 +837,12 @@ struct DynamicRun {
 }
 
 impl DynamicRun {
+    // The fixed carrier remains present at the response curve's nominal
+    // neutral point. This is applied after control reconstruction: it is a
+    // carrier baseline, not part of the level-dependent target.
+    const CARRIER_NEUTRAL: f32 = 0.013_660_6;
+    const CONTROL_TAIL_FLOOR: f32 = 1e-4;
+
     fn new(params: &DynamicFilter, fs: f64) -> DynamicRun {
         let detector = match params.kind {
             DynamicKind::Notch => {
@@ -1032,11 +1038,16 @@ impl DynamicRun {
             // second-order reconstruction filter is not post-clamped. Its
             // small step-response overshoot is part of the release
             // trajectory (and can briefly put the carrier gain above one).
-            let gain = Self::step_df1_f32(
+            let reconstructed = Self::step_df1_f32(
                 &self.reconstruction,
                 &mut self.reconstruction_state,
                 self.reconstructed_gain as f32,
             );
+            // Do not snap a still-moving release to the neutral carrier. The
+            // installed path declares it idle only once the reconstruction
+            // residual is below its -80 dBFS control floor.
+            let idle = self.reconstructed_gain == 1.0 && (reconstructed - 1.0).abs() < Self::CONTROL_TAIL_FLOOR;
+            let gain = reconstructed + if idle { Self::CARRIER_NEUTRAL } else { 0.0 };
             for (c, buf) in bufs.iter_mut().enumerate().take(n) {
                 if at.active_mask >> c & 1 == 0 {
                     continue;
@@ -1559,7 +1570,8 @@ mod tests {
             assert_eq!(Params::decode(&p.encode(), 1, 48_000.0).unwrap(), p);
         }
         let notch = dynamic_filter_params(DynamicKind::Notch);
-        assert!(run_filter(notch.clone(), 1_000.0, 1e-3).abs() < 0.01);
+        let neutral_db = 20.0 * libm::log10(1.0 + f64::from(DynamicRun::CARRIER_NEUTRAL));
+        assert!((run_filter(notch.clone(), 1_000.0, 1e-3) - neutral_db).abs() < 0.01);
         assert!(run_filter(notch, 1_000.0, 1.0) < -11.5);
         let shelf = dynamic_filter_params(DynamicKind::HighShelf);
         assert!(run_filter(shelf.clone(), 1_000.0, 1.0).abs() < 0.15);

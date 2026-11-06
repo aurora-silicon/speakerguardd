@@ -66,7 +66,7 @@ fn tone(
     if !tone.dynamic.is_empty() {
         gaps.push((
             stage.name.clone(),
-            "level-dependent filters carry the native multirate reconstruction; exact neutral/tail parity is pending"
+            "level-dependent filters carry native multirate reconstruction and the settled-idle carrier; active/tail parity is pending"
                 .into(),
         ));
     }

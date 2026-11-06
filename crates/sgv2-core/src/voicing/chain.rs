@@ -877,7 +877,8 @@ mod tests {
 
     #[test]
     fn tone_chain_runs_level_dependent_slots() {
-        assert!(run_dynamic_tone(1e-3).abs() < 0.02);
+        let neutral = run_dynamic_tone(1e-3);
+        assert!(neutral > 0.10 && neutral < 0.13, "{neutral}");
         assert!(run_dynamic_tone(1.0) < -11.5);
 
         let mut bad = dynamic_tone();

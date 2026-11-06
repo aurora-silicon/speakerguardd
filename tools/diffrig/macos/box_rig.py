@@ -87,7 +87,7 @@ def split_v2(a):
             wd = -1e9
             for at in range(0, frames - window_frames + 1, window_frames):
                 mwr, vwr = rms(mac, at, at + window_frames), rms(v2, at, at + window_frames)
-                if mwr >= 1e-4:
+                if mwr >= 10 ** (a.window_floor_db / 20):
                     wd = max(wd, 20 * math.log10((vwr + 1e-15) / (mwr + 1e-15)))
             window.append(wd if name.startswith(("step_", "burst_")) else v[-1] - m[-1])
         diff = [vv - mm for vv, mm in zip(v, m)]
@@ -123,13 +123,13 @@ def rms_db(y):
     return [float(20 * np.log10(np.sqrt(np.mean(h[:, c] ** 2)) + 1e-15)) for c in range(y.shape[1])]
 
 
-def window_diff_db(v2, mac, frames):
+def window_diff_db(v2, mac, frames, floor_db):
     worst = [-1e9] * mac.shape[1]
     for at in range(0, len(mac) - frames + 1, frames):
         for c in range(mac.shape[1]):
             mr = np.sqrt(np.mean(mac[at:at + frames, c] ** 2)) + 1e-15
             vr = np.sqrt(np.mean(v2[at:at + frames, c] ** 2)) + 1e-15
-            if mr >= 1e-4:  # ignore inaudible filter tails below -80 dBFS
+            if mr >= 10 ** (floor_db / 20):
                 worst[c] = max(worst[c], float(20 * np.log10(vr / mr)))
     return worst
 
@@ -172,6 +172,8 @@ def main():
     ap.add_argument("--frequencies", help="comma-separated sine frequencies (default: third-octave grid)")
     ap.add_argument("--dynamic-programs", action="store_true", help="add low/high steps, release steps and tone bursts")
     ap.add_argument("--window-ms", type=float, default=10.0)
+    ap.add_argument("--window-floor-db", type=float, default=-80.0,
+                    help="ignore transient windows whose macOS RMS is below this dBFS floor")
     ap.add_argument("--seconds", type=float, default=1.0)
     ap.add_argument("--tol", type=float, default=0.05)
     a = ap.parse_args()
@@ -261,7 +263,7 @@ def main():
         m = rms_db(mac)
         v = rms_db(v2)
         d = [vv - mm for vv, mm in zip(v, m)]
-        window = (window_diff_db(v2, mac, max(1, int(a.window_ms * FS / 1000)))
+        window = (window_diff_db(v2, mac, max(1, int(a.window_ms * FS / 1000)), a.window_floor_db)
                   if name.startswith(("step_", "burst_")) else d.copy())
         worst = max(worst, max(d), max(window))
         rows.append({"case": name, "mac_db": m, "v2_db": v, "diff_db": d, "window_diff_db": window,
