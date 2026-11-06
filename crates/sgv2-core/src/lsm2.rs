@@ -130,8 +130,7 @@ use alloc::vec::Vec;
 mod laws;
 pub use laws::{
     current_coefficients, mask_lattice_resized, minimum_phase_triplet, release_lambda, temperature_candidate,
-    transform_len, velocity_band_gains, velocity_band_gains_window, velocity_limit, BandGain, Fft, Masker,
-    ThermalBranch,
+    transform_len, velocity_band_gains, velocity_limit, BandGain, Fft, Masker, ThermalBranch,
 };
 
 use crate::blob::{BlobError, Pod};
@@ -162,6 +161,13 @@ pub const PRESSURE_TAPS: usize = 1024;
 const EPS: f64 = f32::MIN_POSITIVE as f64;
 /// The 0.99 downward target of every gain law (rig laws 5, 8; spec 15.4).
 const CUT: f64 = 0.99;
+
+/// Merge the post-retarget solve. A non-unity seed marks an upward lane
+/// admitted by the 3 dB endpoint guard; only those lanes preserve the
+/// primary request. Every unseeded lane takes the second solve.
+fn merge_retarget(primary: [f32; BANDS], secondary: [f32; BANDS], seed: [f32; BANDS]) -> [f32; BANDS] {
+    core::array::from_fn(|k| if seed[k] != 1.0 { primary[k] } else { secondary[k] })
+}
 /// The declared maximum of the `VelocityLimit*` parameters, m/s: the
 /// velocity curve's last anchor (residuals section 4), not a runtime cap.
 const VELOCITY_PARAM_MAX: f32 = 2.0;
@@ -1015,76 +1021,6 @@ impl Biquad32 {
     }
 }
 
-/// The protected-model peak stream's one-second moving mean. The decoded
-/// object is a sample-rate-sized Float32 ring with a rolling sum and a
-/// separately retained partial-traversal sum/count. At the ring boundary
-/// the rolling sum is rebuilt from that partial sum instead of accumulating
-/// an indefinitely long add/sub chain.
-struct ProtectedPeak {
-    ring: Vec<f32>,
-    pos: usize,
-    sum: f32,
-    partial_sum: f32,
-    partial_len: usize,
-    samples: usize,
-    scale: f32,
-}
-
-impl ProtectedPeak {
-    fn new(rate: usize) -> Self {
-        Self {
-            ring: vec![0.0; rate],
-            pos: 0,
-            sum: 0.0,
-            partial_sum: 0.0,
-            partial_len: 0,
-            samples: 0,
-            scale: 1.0 / rate as f32,
-        }
-    }
-
-    fn clear(&mut self) {
-        self.ring.iter_mut().for_each(|v| *v = 0.0);
-        self.pos = 0;
-        self.sum = 0.0;
-        self.partial_sum = 0.0;
-        self.partial_len = 0;
-        self.samples = 0;
-    }
-
-    /// Advance one controller frame. This reconstruction holds the frame's
-    /// protected-model peak, so the chunk sum is the Float32 product below.
-    fn update(&mut self, peak: f32, mut count: usize) -> f32 {
-        let window = self.ring.len();
-        self.samples = self.samples.saturating_add(count);
-        while count != 0 {
-            let take = count.min(window - self.partial_len);
-            let new_sum = peak * take as f32;
-            if self.partial_len + take == window {
-                self.sum = self.partial_sum + new_sum;
-                self.partial_sum = 0.0;
-                self.partial_len = 0;
-            } else {
-                let old_sum = self.ring[self.pos..self.pos + take].iter().copied().sum::<f32>();
-                self.sum += new_sum - old_sum;
-                self.partial_sum += new_sum;
-                self.partial_len += take;
-            }
-            self.ring[self.pos..self.pos + take].fill(peak);
-            self.pos += take;
-            if self.pos == window {
-                self.pos = 0;
-            }
-            count -= take;
-        }
-        self.sum * self.scale
-    }
-
-    fn ready(&self) -> bool {
-        self.samples >= self.ring.len()
-    }
-}
-
 /// The current model of spec 15.2: a Float32 biquad, every output rounded
 /// to f32, `i[n] = f32(b0 u[n] + b1 u[n-1] + b2 u[n-2] - a1 i[n-1] - a2
 /// i[n-2])`.
@@ -1222,10 +1158,6 @@ struct Chan {
     /// filterbank latency of the window (t-4751).
     vcar_m: Biquad32,
     vcar: Vec<f32>,
-    /// Streaming one-second mean of the protected full-band model's
-    /// controller-frame peak.
-    protected_peak: ProtectedPeak,
-    protected_peak_now: f32,
     /// Per-substep peaks over the window (ring of RING slots).
     pk_x: [f32; RING],
     pk_d: [f32; RING],
@@ -1239,17 +1171,6 @@ struct Chan {
     vel_lim: [f32; 3],
     mask_knots: [f32; 4],
     vel_limit_now: f64,
-    /// Retained protected full-band velocity peaks on the two sides of the
-    /// bank/output channel handoff.
-    vel_bound_old: f32,
-    vel_bound_new: f32,
-    vel_bound_ready: bool,
-    vel_bound_release: bool,
-    /// A velocity episode chooses its solve topology on its first ordinary
-    /// cut. An onset before the streaming peak has a complete window stays
-    /// ordinary; an onset with retained history adds the retained solve.
-    vel_episode: bool,
-    vel_episode_retained: bool,
     // Fast gains.
     band: [BandGain; BANDS],
     /// The modeled band velocities over the decision window: the output
@@ -1564,8 +1485,6 @@ impl Run {
                 dcar_m: Biquad32::from(&disp),
                 db: core::array::from_fn(|_| vec![0.0; od + ctl]),
                 vcar_m: Biquad32::from(&vel),
-                protected_peak: ProtectedPeak::new(rate as usize),
-                protected_peak_now: 0.0,
                 rd: vec![0.0; od + ctl],
                 vcar: vec![0.0; od + ctl],
                 pk_x: [0.0; RING],
@@ -1578,12 +1497,6 @@ impl Run {
                 vel_lim: c.velocity_limit,
                 mask_knots: c.mask_energy_db,
                 vel_limit_now: c.velocity_limit[0] as f64,
-                vel_bound_old: 0.0,
-                vel_bound_new: 0.0,
-                vel_bound_ready: false,
-                vel_bound_release: false,
-                vel_episode: false,
-                vel_episode_retained: false,
                 band: [BandGain::unity(attack_len); BANDS],
                 vb: core::array::from_fn(|_| vec![0.0; od + ctl]),
                 vel_active: (
@@ -1694,19 +1607,11 @@ impl Run {
             c.mvel.clear();
             c.vwin.iter_mut().for_each(|v| *v = 0.0);
             c.vel_limit_now = c.vel_lim[0] as f64;
-            c.vel_bound_old = 0.0;
-            c.vel_bound_new = 0.0;
-            c.vel_bound_ready = false;
-            c.vel_bound_release = false;
-            c.vel_episode = false;
-            c.vel_episode_retained = false;
             c.band = [BandGain::unity(c.slow.len); BANDS];
             for b in c.vb.iter_mut().chain(c.db.iter_mut()) {
                 b.iter_mut().for_each(|v| *v = 0.0);
             }
             c.vcar_m.clear();
-            c.protected_peak.clear();
-            c.protected_peak_now = 0.0;
             c.vcar.iter_mut().chain(c.rd.iter_mut()).for_each(|v| *v = 0.0);
             c.eg.iter_mut().for_each(|e| e.iter_mut().for_each(|v| *v = 1.0));
             c.cur_in.clear();
@@ -1835,7 +1740,6 @@ impl Run {
         let window_max = |r: &[f32; RING]| r[..ring_len].iter().copied().fold(0.0f32, f32::max);
         let ratio = |limit: f64, q: f32| (limit / (q as f64).max(EPS)).min(1.0);
         let (a_fast, a_low) = (self.a_fast, self.a_low);
-        let velocity_release = 1.0 - libm::exp(-(ctl as f64) * a_fast);
         // the allocator span excludes the first millisecond (t-4719)
         let vfirst = libm::round(self.ctl as f64 * 3.0 / 16.0) as usize;
         // ---- fast axes: candidates, band requests, the frame's trajectories
@@ -1894,31 +1798,11 @@ impl Run {
                 c.dcar_m.carry(&mut c.rd, fbl);
             }
             let vlim_g = c.vel_limit_now as f32;
-            let stream_ready = c.protected_peak.ready();
-            let next_bound = if c.vel_bound_release && c.vel_bound_ready {
-                (c.vel_bound_new as f64 + velocity_release * (c.vel_limit_now - c.vel_bound_new as f64)) as f32
-            } else {
-                c.protected_peak_now
-            }
-            .min(vlim_g);
-            if c.vel_bound_ready && stream_ready {
-                c.vel_bound_old = c.vel_bound_new;
-                c.vel_bound_new = next_bound;
-            } else if stream_ready {
-                c.vel_bound_old = next_bound;
-                c.vel_bound_new = next_bound;
-                c.vel_bound_ready = true;
-            }
-            let bound_old = c.vel_bound_old;
-            let bound_new = c.vel_bound_new;
-            let velocity_room = 0.25 * (vlim_g - bound_new).max(0.0);
             // the velocity fixed term (t-4751, t-4763): the zero-input carry
             // of the persistent full-band velocity model, over one
             // filterbank latency, zeros after; the model itself advances on
             // the protected output, below
             c.vcar_m.carry(&mut c.vcar, fbl);
-            let velocity_cut = core::cell::Cell::new(false);
-            let retained_episode = core::cell::Cell::new(c.vel_episode && c.vel_episode_retained);
             let chain = |c: &Chan, seed: [f32; BANDS]| -> [f32; BANDS] {
                 let all = (0, BANDS);
                 let mut r = seed;
@@ -1926,30 +1810,9 @@ impl Run {
                     r = velocity_band_gains(&c.db, &c.rd, 0, c.disp_limit as f32, sg, all, r);
                 }
                 if vel_on {
-                    let ordinary = velocity_band_gains(&c.vb, &c.vcar, vfirst, vlim_g, sg, all, r);
-                    let ordinary_cut = (c.vel_active.0..c.vel_active.1).any(|k| ordinary[k] < r[k]);
-                    if !c.vel_episode && ordinary_cut && stream_ready {
-                        retained_episode.set(true);
-                    }
-                    let q = if retained_episode.get() && c.vel_bound_ready {
-                        velocity_band_gains_window(
-                            &c.vb,
-                            &c.vcar,
-                            vfirst,
-                            bound_old,
-                            bound_new,
-                            od,
-                            velocity_room,
-                            sg,
-                            all,
-                            ordinary,
-                        )
-                    } else {
-                        ordinary
-                    };
+                    let q = velocity_band_gains(&c.vb, &c.vcar, vfirst, vlim_g, sg, all, r);
                     for k in c.vel_active.0..c.vel_active.1 {
                         let v = (sg * q[k]).max(c.vel_floor as f32) / sg;
-                        velocity_cut.set(velocity_cut.get() || v < r[k]);
                         r[k] = r[k].min(v);
                     }
                 }
@@ -1967,8 +1830,9 @@ impl Run {
                 // residuals 5.2 (t-4713): upward lanes (primary above the
                 // applied gain); one second chain seeded from the predicted
                 // endpoint toward the complete primary request of upward
-                // lanes still 3 dB or more below it; upward lanes keep the
-                // primary, the others take the second (t-4772)
+                // lanes still 3 dB or more below it. Only lanes admitted to
+                // that retarget seed preserve the primary; unseeded upward
+                // lanes and ordinary lanes take the second result.
                 let up: [bool; BANDS] = core::array::from_fn(|k| p[k] > c.band[k].g);
                 if up.iter().any(|&u| u) {
                     let guard = libm::pow(10.0, 3.0 / 20.0) as f32;
@@ -1981,23 +1845,13 @@ impl Run {
                         }
                     });
                     let q = chain(c, seed);
-                    core::array::from_fn(|k| if up[k] { p[k] } else { q[k] })
+                    merge_retarget(p, q, seed)
                 } else {
                     p
                 }
             } else {
                 [1.0; BANDS]
             };
-            if velocity_cut.get() {
-                if !c.vel_episode {
-                    c.vel_episode = true;
-                    c.vel_episode_retained = retained_episode.get();
-                }
-            } else {
-                c.vel_episode = false;
-                c.vel_episode_retained = false;
-            }
-            c.vel_bound_release = c.vel_episode && c.vel_episode_retained;
             for k in 0..BANDS {
                 c.band[k].decide(req[k]);
             }
@@ -2162,7 +2016,6 @@ impl Run {
             let mut acc = 0.0f64;
             let mut acc32 = 0.0f32;
             let mut s = 0;
-            let mut protected_model_peak = 0.0f32;
             let (mut p1, mut p1s) = (0.0f64, 0.0f64);
             for (i, yo) in y.iter_mut().enumerate().take(ctl) {
                 let sg = c.slow.sample();
@@ -2189,8 +2042,7 @@ impl Run {
                 *yo = v.clamp(-1.0, 1.0);
                 // The persistent motion models follow the protected output.
                 c.dcar_m.step(c.vfs * *yo);
-                let modeled_velocity = c.vcar_m.step(c.vfs * *yo);
-                protected_model_peak = protected_model_peak.max(modeled_velocity.abs());
+                c.vcar_m.step(c.vfs * *yo);
                 if (i + 1) % sub == 0 {
                     let p = acc / sub as f64;
                     acc = 0.0;
@@ -2208,7 +2060,6 @@ impl Run {
                     s += 1;
                 }
             }
-            c.protected_peak_now = c.protected_peak.update(protected_model_peak, ctl);
             c.pbar1_frame = p1;
             c.pbar1s_frame = p1s;
             // shift the bank-stage buffers: keep the look-ahead region
@@ -2615,6 +2466,14 @@ mod fault_tests {
             want.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
         );
         assert!(r.ch[0].rd[r.fb..].iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn retarget_merge_preserves_only_guard_admitted_lanes() {
+        let primary = [0.34, 1.0, 1.0, 0.8, 0.6];
+        let secondary = [0.31, 0.9, 0.66, 0.7, 0.5];
+        let seed = [1.0, 1.0, 0.55, 1.0, 0.4];
+        assert_eq!(merge_retarget(primary, secondary, seed), [0.31, 0.9, 1.0, 0.7, 0.6]);
     }
 
     #[test]
