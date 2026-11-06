@@ -145,9 +145,9 @@ The kernel is the switch: a fleet kernel without the v2 interface keeps
 every Mac on the older daemons, the kernel with it moves every gated Mac at
 once, and booting the older kernel moves it back. atsp joined
 `units_at_parity` when all 117 rig cases matched macOS bit for bit. At the
-fleet cutover lsm2 joined too (strict rig 340/340) and
-`require_qualified_board` became false: every board with a parity unit
-runs v2 from its own tuning. The data
+fleet cutover `require_qualified_board` became false: every board with a
+parity unit runs v2 from its own tuning. lsm2 joins once it holds every
+Apple limit on every rig case. The data
 is speakerguardd's own; every distribution ships it unchanged.
 `speakerguardd-gate explain` prints the decision.
 
