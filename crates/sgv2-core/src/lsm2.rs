@@ -2027,7 +2027,6 @@ impl Run {
             }
             let bound_old = c.vel_bound_old;
             let bound_new = c.vel_bound_new;
-            let velocity_room = 0.25 * (vlim_g - bound_new).max(0.0);
             // the velocity fixed term (t-4751, t-4763): the zero-input carry
             // of the persistent full-band velocity model, over one
             // filterbank latency, zeros after; the model itself advances on
@@ -2035,6 +2034,7 @@ impl Run {
             c.vcar_m.carry(&mut c.vcar, fbl);
             let velocity_cut = core::cell::Cell::new(false);
             let retained_episode = core::cell::Cell::new(c.vel_episode && c.vel_episode_retained);
+            let protected_bound = core::cell::Cell::new(None::<f32>);
             let chain = |c: &Chan, seed: [f32; BANDS]| -> [f32; BANDS] {
                 let all = (0, BANDS);
                 let mut r = seed;
@@ -2054,20 +2054,36 @@ impl Run {
                     );
                 }
                 if vel_on {
+                    if stream_ready && protected_bound.get().is_none() && !c.vel_bound_release {
+                        // The retained producer is the peak of the trial
+                        // after the preceding protection axes and before the
+                        // velocity solve.  It runs even before an ordinary
+                        // velocity cut enters a retained episode.
+                        let mut peak = 0.0f32;
+                        for i in 0..c.vb[0].len() {
+                            let mut y = c.vcar[i];
+                            for k in 0..BANDS {
+                                y += (r[k] * sg) * c.vb[k][i];
+                            }
+                            peak = peak.max(y.abs());
+                        }
+                        protected_bound.set(Some(peak.max(0.25 * vlim_g).min(vlim_g)));
+                    }
                     let ordinary = velocity_band_gains(&c.vb, &c.vcar, vfirst, vlim_g, sg, all, r);
                     let ordinary_cut = (c.vel_active.0..c.vel_active.1).any(|k| ordinary[k] < r[k]);
                     if !c.vel_episode && ordinary_cut && stream_ready {
                         retained_episode.set(true);
                     }
+                    let retained_new = protected_bound.get().unwrap_or(bound_new);
                     let q = if retained_episode.get() && c.vel_bound_ready {
                         velocity_band_gains_window(
                             &c.vb,
                             &c.vcar,
                             vfirst,
                             bound_old,
-                            bound_new,
+                            retained_new,
                             od,
-                            velocity_room,
+                            0.25 * (vlim_g - retained_new).max(0.0),
                             sg,
                             all,
                             ordinary,
@@ -2120,6 +2136,9 @@ impl Run {
             } else {
                 [1.0; BANDS]
             };
+            if let Some(bound) = protected_bound.get() {
+                c.vel_bound_new = bound;
+            }
             if velocity_cut.get() {
                 if !c.vel_episode {
                     c.vel_episode = true;
