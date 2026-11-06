@@ -3,8 +3,10 @@
 """Black-box decoder for the lsm2 debug logs the rig captures (LSMv2EnableLogging).
 
 File layout: little-endian float32. Word 0 is the system (channel) count N. Then
-records, each `n` (frames covered) followed by a payload whose size depends on the
-log, N and n (the lsm2 behaviour specification, native logging contract).
+records, each `n` followed by a payload whose size depends on the log, N and n
+(the lsm2 behaviour specification, native logging contract). Signal/frame logs
+use frames covered. Power/thermal logs use complete 32-frame substeps admitted
+by this host fragment, which is validly zero for a short call.
 """
 import glob, os, sys
 import numpy as np
@@ -21,6 +23,7 @@ LAYOUT = {
 
 # per channel in ControllerThermalLog
 THERMAL_FIELDS = ["theta_vc", "theta_mag", "ambient_c", "t_vc_c", "t_control_c"]
+ADMISSION_LOGS = {"ControllerThermalLog", "ControllerPowerLog"}
 
 
 def parse(path, name):
@@ -32,7 +35,7 @@ def parse(path, name):
     i, out = 1, []
     while i < a.size:
         n = a[i]
-        if not np.isfinite(n) or n <= 0 or n != int(n):
+        if not np.isfinite(n) or n < 0 or (n == 0 and name not in ADMISSION_LOGS) or n != int(n):
             raise ValueError(f"{name}: bad record length {n} at word {i}")
         n = int(n)
         sz = f(nch, n)

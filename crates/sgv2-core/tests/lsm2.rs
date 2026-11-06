@@ -5,9 +5,8 @@ use sgv2_core::lsm2::{self, ChannelParams, Params, Unit, BANDS};
 use sgv2_core::{dsp, HandOff, Io, ProtectionUnit, Telemetry};
 
 const RATE: u32 = 48_000;
-/// 2 * 96 + 64 frames (the synthetic filterbank stage and look-ahead) plus
-/// the controller frame the unit buffers.
-const LATENCY: usize = 2 * 96 + 64 + 256;
+/// 2 * 96 + 64 frames (the synthetic filterbank stages and look-ahead).
+const LATENCY: usize = 2 * 96 + 64;
 
 /// Every axis on, as the Neo ships; tests switch off what they isolate.
 fn params() -> Params {
@@ -329,12 +328,58 @@ fn refused_configurations_are_the_failsafe() {
 }
 
 #[test]
-fn slicing_does_not_change_the_audio() {
+fn full_controller_fragments_share_the_native_cadence() {
     let x = sine(200.0, 1.2, 3.0);
     let y = sine(3000.0, 0.7, 3.0);
-    let r = run(&mut Unit::new(params()), &[x.clone(), y.clone()], 256);
-    for slice in [1usize, 7, 160, 1000, 4096] {
+    let r = run(&mut Unit::new(params()), &[x.clone(), y.clone()], 512);
+    for slice in [256usize, 1024, 4096] {
         assert!(run(&mut Unit::new(params()), &[x.clone(), y.clone()], slice) == r, "slice {slice}");
+    }
+    for slice in [1usize, 7, 160] {
+        assert!(run(&mut Unit::new(params()), &[x.clone(), y.clone()], slice) != r, "slice {slice}");
+    }
+}
+
+#[test]
+fn short_calls_decide_per_call_but_publish_power_on_substep_admission() {
+    for slice in [1usize, 7] {
+        let mut p = only([false, false, false, true, false]);
+        p.power_hard_limit_w = [0.03; 4];
+        let mut u = Unit::new(p);
+        let mut last_candidate = tel(&u).channels[0].axis_gain[3];
+        let mut last_meter = tel(&u).global.amp_input_power_w;
+        let mut end = 0usize;
+        let mut meter_changes = 0;
+        let mut zero_admission_candidate_changes = 0;
+        for _ in 0..256 {
+            let x0 = vec![0.8; slice];
+            let x1 = vec![0.8; slice];
+            let ins = [&x0[..], &x1[..]];
+            let mut y0 = vec![0.0; slice];
+            let mut y1 = vec![0.0; slice];
+            let mut outs = [&mut y0[..], &mut y1[..]];
+            let start = end;
+            end += slice;
+            assert_eq!(
+                u.process(Io { frames: slice, input: &ins, sense: &[], output: &mut outs }),
+                sgv2_core::Health::OK
+            );
+            let t = tel(&u);
+            let candidate = t.channels[0].axis_gain[3];
+            let meter = t.global.amp_input_power_w;
+            let admitted = start / lsm2::SUBSTEP_FRAMES != end / lsm2::SUBSTEP_FRAMES;
+            if meter != last_meter {
+                assert_ne!(start / lsm2::SUBSTEP_FRAMES, end / lsm2::SUBSTEP_FRAMES, "slice {slice}, end {end}");
+                meter_changes += 1;
+                last_meter = meter;
+            }
+            if candidate != last_candidate {
+                zero_admission_candidate_changes += usize::from(!admitted);
+                last_candidate = candidate;
+            }
+        }
+        assert!(meter_changes > 0, "slice {slice}");
+        assert!(zero_admission_candidate_changes > 0, "slice {slice}");
     }
 }
 
@@ -425,10 +470,10 @@ fn band_gains_never_raise_any_frequency() {
 
 #[test]
 fn controller_cadence_is_a_time() {
-    // 25G83 rig: 256 frames at 48 kHz, 512 at 96 kHz (5.333 ms)
+    // 25G83 rig: rates below 48 kHz keep the 256-frame minimum.
     assert_eq!(lsm2::controller_frames(48_000), 256);
     assert_eq!(lsm2::controller_frames(96_000), 512);
-    assert_eq!(lsm2::controller_frames(44_100), 232);
+    assert_eq!(lsm2::controller_frames(44_100), 256);
 }
 
 #[test]
