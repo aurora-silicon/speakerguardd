@@ -37,3 +37,4 @@
 //! Box modules are added one per box type (`norm`, `vbass`, `xtc`,
 //! `vareq`, `cfreak`, `buzz`, `cdelay`, ...).
 pub mod chain;
+pub mod xtc;

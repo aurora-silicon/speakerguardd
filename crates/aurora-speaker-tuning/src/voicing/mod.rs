@@ -17,3 +17,4 @@
 //! volume refuses rather than guesses.
 pub mod chain;
 pub mod topology;
+pub mod xtc;

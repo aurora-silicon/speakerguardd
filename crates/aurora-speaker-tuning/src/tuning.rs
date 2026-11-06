@@ -66,6 +66,10 @@ pub struct Stage {
     pub state: Option<ParamState>,
     /// Preset keys beyond the saved state (unit-specific dictionaries).
     pub preset_extra_keys: Vec<String>,
+    /// Unit-specific ClassInfo values. Kept out of dumps: consumers expose
+    /// only fields they have validated and interpreted.
+    #[serde(skip)]
+    pub preset_extra: crate::plist::Dict,
     pub before_protection: bool,
 }
 
@@ -321,6 +325,7 @@ impl Tuning {
                 preset_name: effect.and_then(|e| e.preset.name.clone()),
                 state: effect.map(|e| e.preset.state.clone()),
                 preset_extra_keys: effect.map(|e| e.preset.extra_keys()).unwrap_or_default(),
+                preset_extra: effect.map(|e| e.preset.extra.clone()).unwrap_or_default(),
                 before_protection: i < ppos,
             });
         }

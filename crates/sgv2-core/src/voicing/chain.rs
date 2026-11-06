@@ -83,6 +83,8 @@ pub enum Kind {
     /// One entry per box channel.
     Tone(Vec<Channel>),
     Comp(Dynamics),
+    /// Crosstalk cancellation (`axtc`).
+    Xtc(alloc::boxed::Box<super::xtc::Params>),
     /// The box's four-character subtype.
     Stub([u8; 4]),
     Bypass,
@@ -157,6 +159,7 @@ enum Run {
     Gain { gain_db: f64, mute: bool, scale: f32 },
     Filters(PreStage),
     Comp(PreStage),
+    Xtc(alloc::boxed::Box<super::xtc::Run>),
     Through,
 }
 
@@ -176,6 +179,7 @@ impl Run {
                 p.flags |= crate::prestage::FLAG_DYNAMICS;
                 Run::Comp(PreStage::with_rate(p, fs))
             }
+            Kind::Xtc(p) => Run::Xtc(alloc::boxed::Box::new(super::xtc::Run::new(p, fs, width))),
             Kind::Stub(_) | Kind::Bypass => Run::Through,
         }
     }
@@ -193,8 +197,10 @@ impl Run {
     }
 
     fn reset(&mut self) {
-        if let Run::Filters(p) | Run::Comp(p) = self {
-            p.reset();
+        match self {
+            Run::Filters(p) | Run::Comp(p) => p.reset(),
+            Run::Xtc(r) => r.reset(),
+            _ => {}
         }
     }
 
@@ -229,6 +235,15 @@ impl Run {
                     core::array::from_fn(|_| it.next().map(|v| &mut v[..frames]).unwrap_or(&mut []));
                 let w = x.len().min(MAX_CHANNELS);
                 p.process_dynamics(&mut refs[..w], frames);
+            }
+            Run::Xtc(r) => {
+                for (i, o) in x.iter().zip(y.iter_mut()) {
+                    o[..frames].copy_from_slice(&i[..frames]);
+                }
+                let mut it = y.iter_mut();
+                let mut refs: [&mut [f32]; MAX_CHANNELS] =
+                    core::array::from_fn(|_| it.next().map(|v| &mut v[..frames]).unwrap_or(&mut []));
+                r.process(&mut refs[..x.len().min(MAX_CHANNELS)], frames);
             }
             Run::Through => {
                 for (i, o) in x.iter().zip(y.iter_mut()) {
