@@ -227,13 +227,17 @@ mod law {
     /// the band-limited harmonics never peak above that envelope.
     pub const LC_MAX_DRIVE: f64 = 20.0;
     /// Drive detector: instant attack, hold, then a fixed release in dB/s.
-    pub const LC_DRIVE_HOLD_S: f64 = 0.95;
+    pub const LC_DRIVE_HOLD_S: f64 = 0.7;
     pub const LC_DRIVE_RELEASE_DB_S: f64 = 11.6;
     /// Envelope and limiter detectors: instant attack, hold, then a release
     /// in dB/s eased in with a one-pole of `LC_EASE_S`.
     pub const LC_ENV_HOLD_S: f64 = 0.55;
     pub const LC_ENV_RELEASE_DB_S: f64 = 10.8;
     pub const LC_EASE_S: f64 = 0.25;
+    /// Above the drive's knee the envelope rises only after a hold, at a
+    /// rate in dB/s.
+    pub const LC_ENV_UP_HOLD_S: f64 = 0.55;
+    pub const LC_ENV_ATTACK_DB_S: f64 = 9.3;
     /// The mid branches are band-limited by a Chebyshev type I low pass
     /// working at a quarter-rate design.
     pub const SUB_RATE_HZ: f64 = 12_000.0;
@@ -332,8 +336,10 @@ impl Params {
     }
 }
 
-/// Peak follower: instant attack; after a hold, the level falls at a fixed
-/// rate in dB, eased in by a one-pole on the rate.
+/// Peak follower. Attack is instant up to `knee`; above it the level
+/// rises only after `up_hold`, at a rate in dB eased in by a one-pole.
+/// Release: after `hold`, the level falls at a rate in dB, eased in the
+/// same way.
 #[derive(Clone, Copy, Debug)]
 struct Peak {
     v: f64,
@@ -342,30 +348,57 @@ struct Peak {
     fall: f64,
     rate: f64,
     ease: f64,
+    knee: f64,
+    up_held: usize,
+    up_hold: usize,
+    rise: f64,
+    up_rate: f64,
 }
 
 impl Peak {
-    fn new(fs: f64, hold_s: f64, release_db_s: f64, ease_s: f64) -> Peak {
+    #[allow(clippy::too_many_arguments)]
+    fn new(fs: f64, hold_s: f64, release_db_s: f64, ease_s: f64, knee: f64, up_hold_s: f64, attack_db_s: f64) -> Peak {
+        let per = |db_s: f64| db_s / (20.0 * fs) * core::f64::consts::LN_10;
         Peak {
             v: 0.0,
             held: 0,
             hold: (hold_s * fs) as usize,
-            // per-sample log-gain of the full release rate
-            fall: release_db_s / (20.0 * fs) * core::f64::consts::LN_10,
+            fall: per(release_db_s),
             rate: 0.0,
             ease: if ease_s > 0.0 { 1.0 - libm::exp(-1.0 / (ease_s * fs)) } else { 1.0 },
+            knee,
+            up_held: 0,
+            up_hold: (up_hold_s * fs) as usize,
+            rise: per(attack_db_s),
+            up_rate: 0.0,
         }
     }
     #[inline]
     fn run(&mut self, x: f64) -> f64 {
         let a = libm::fabs(x);
         if a >= self.v {
-            self.v = a;
             self.held = 0;
             self.rate = 0.0;
+            let fast = a.min(self.v.max(self.knee));
+            if fast > self.v {
+                self.v = fast;
+            }
+            if a > self.v {
+                if self.up_held < self.up_hold {
+                    self.up_held += 1;
+                } else {
+                    self.up_rate += (self.rise - self.up_rate) * self.ease;
+                    self.v = (self.v * libm::exp(self.up_rate)).min(a);
+                }
+            } else {
+                self.up_held = 0;
+                self.up_rate = 0.0;
+            }
         } else if self.held < self.hold {
             self.held += 1;
         } else {
+            self.up_held = 0;
+            self.up_rate = 0.0;
             self.rate += (self.fall - self.rate) * self.ease;
             self.v = (self.v * libm::exp(-self.rate)).max(a);
         }
@@ -373,20 +406,69 @@ impl Peak {
     }
 }
 
+/// The level control's time and gain constants (the box's own law; see
+/// [`law`]). Exposed only so the differential rig can probe them.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LcLaw {
+    pub max_drive: f64,
+    pub drive_hold_s: f64,
+    pub drive_release_db_s: f64,
+    pub drive_ease_s: f64,
+    pub env_hold_s: f64,
+    pub env_release_db_s: f64,
+    pub env_ease_s: f64,
+    pub harm_hold_s: f64,
+    pub harm_release_db_s: f64,
+    pub harm_ease_s: f64,
+    /// The envelope's slow attack above `1 / max_drive`.
+    pub env_up_hold_s: f64,
+    pub env_attack_db_s: f64,
+}
+
+impl Default for LcLaw {
+    fn default() -> LcLaw {
+        LcLaw {
+            max_drive: law::LC_MAX_DRIVE,
+            drive_hold_s: law::LC_DRIVE_HOLD_S,
+            drive_release_db_s: law::LC_DRIVE_RELEASE_DB_S,
+            drive_ease_s: 0.0,
+            env_hold_s: law::LC_ENV_HOLD_S,
+            env_release_db_s: law::LC_ENV_RELEASE_DB_S,
+            env_ease_s: law::LC_EASE_S,
+            harm_hold_s: law::LC_ENV_HOLD_S,
+            harm_release_db_s: law::LC_ENV_RELEASE_DB_S,
+            harm_ease_s: law::LC_EASE_S,
+            env_up_hold_s: law::LC_ENV_UP_HOLD_S,
+            env_attack_db_s: law::LC_ENV_ATTACK_DB_S,
+        }
+    }
+}
+
 /// Level control state (only used when the saved state switches it on).
 #[derive(Clone, Copy, Debug)]
 struct LevelControl {
+    law: LcLaw,
     drive: Peak,
     env: Peak,
     harm: Peak,
 }
 
 impl LevelControl {
-    fn new(fs: f64) -> LevelControl {
+    fn new(fs: f64, l: LcLaw) -> LevelControl {
         LevelControl {
-            drive: Peak::new(fs, law::LC_DRIVE_HOLD_S, law::LC_DRIVE_RELEASE_DB_S, 0.0),
-            env: Peak::new(fs, law::LC_ENV_HOLD_S, law::LC_ENV_RELEASE_DB_S, law::LC_EASE_S),
-            harm: Peak::new(fs, law::LC_ENV_HOLD_S, law::LC_ENV_RELEASE_DB_S, law::LC_EASE_S),
+            law: l,
+            drive: Peak::new(fs, l.drive_hold_s, l.drive_release_db_s, l.drive_ease_s, f64::INFINITY, 0.0, 0.0),
+            env: Peak::new(
+                fs,
+                l.env_hold_s,
+                l.env_release_db_s,
+                l.env_ease_s,
+                1.0 / l.max_drive,
+                l.env_up_hold_s,
+                l.env_attack_db_s,
+            ),
+            harm: Peak::new(fs, l.harm_hold_s, l.harm_release_db_s, l.harm_ease_s, f64::INFINITY, 0.0, 0.0),
         }
     }
 }
@@ -400,13 +482,19 @@ pub struct Run {
     hp_st: Vec<CascadeState>,
     lp: Cascade,
     lp_st: CascadeState,
-    /// The low pass of an odd-order crossover is taken inverted, so that
-    /// low pass and high pass still sum to an all-pass.
+    /// The low-end blend of an odd-order crossover is taken inverted, so
+    /// that low pass and high pass still sum to an all-pass (the harmonic
+    /// branch is not).
     lp_sign: f64,
     ap: Cascade,
     ap_st: CascadeState,
-    band: Cascade,
-    band_st: CascadeState,
+    /// Harmonic band: the lower edge's high pass with the first half of the
+    /// upper edge's low pass, then the second half (the level control's
+    /// limiter looks between the two).
+    band_hp: Cascade,
+    band_hp_st: CascadeState,
+    band_lp: Cascade,
+    band_lp_st: CascadeState,
     sub: Cascade,
     sub_st: StridedState,
     stride: usize,
@@ -433,8 +521,11 @@ impl Run {
         let mut hp = linkwitz_riley(p.hp_order, p.fc_hz, fs, Kind::High);
         hp.extend(&ap);
         let lp = linkwitz_riley(p.hp_order, p.fc_hz, fs, Kind::Low);
-        let mut band = linkwitz_riley(p.lower_order, p.fc_hz, fs, Kind::High);
-        band.extend(&linkwitz_riley(p.upper_order, p.fu_hz, fs, Kind::Low));
+        // the upper edge's Linkwitz-Riley low pass is two Butterworths: the
+        // limiter's detector sits between them
+        let mut band_hp = linkwitz_riley(p.lower_order, p.fc_hz, fs, Kind::High);
+        band_hp.extend(&butterworth(p.upper_order / 2, p.fu_hz, fs, Kind::Low));
+        let band_lp = butterworth(p.upper_order / 2, p.fu_hz, fs, Kind::Low);
         let stride = sub_stride(fs).unwrap_or(1);
         let sub = chebyshev1(law::SUB_LP_ORDER, law::SUB_LP_RIPPLE_DB, law::SUB_LP_EDGE_HZ, fs / stride as f64);
         let latency = nu % 2 + nl % 2;
@@ -459,8 +550,10 @@ impl Run {
             lp_sign: if (p.hp_order / 2) % 2 == 1 { -1.0 } else { 1.0 },
             ap,
             ap_st: CascadeState::default(),
-            band,
-            band_st: CascadeState::default(),
+            band_hp,
+            band_hp_st: CascadeState::default(),
+            band_lp,
+            band_lp_st: CascadeState::default(),
             sub,
             sub_st: StridedState::default(),
             stride,
@@ -470,7 +563,7 @@ impl Run {
             frac_a: if frac == 0.0 { f64::NAN } else { frac_a },
             frac_x: 0.0,
             frac_y: 0.0,
-            lc: LevelControl::new(fs),
+            lc: LevelControl::new(fs, LcLaw::default()),
             latency,
             oline: vec![[0.0; OUT_LINE]; channels],
             opos: 0,
@@ -483,12 +576,13 @@ impl Run {
         }
         self.lp_st = CascadeState::default();
         self.ap_st = CascadeState::default();
-        self.band_st = CascadeState::default();
+        self.band_hp_st = CascadeState::default();
+        self.band_lp_st = CascadeState::default();
         self.sub_st = StridedState::default();
         self.bline = [0.0; BRANCH_LINE];
         self.frac_x = 0.0;
         self.frac_y = 0.0;
-        self.lc = LevelControl::new(self.fs);
+        self.lc = LevelControl::new(self.fs, self.lc.law);
         for l in &mut self.oline {
             *l = [0.0; OUT_LINE];
         }
@@ -496,6 +590,12 @@ impl Run {
 
     pub fn latency(&self) -> usize {
         self.latency
+    }
+
+    /// Replaces the level-control law (differential rig only).
+    #[doc(hidden)]
+    pub fn set_lc_law(&mut self, l: LcLaw) {
+        self.lc = LevelControl::new(self.fs, l);
     }
 
     pub fn sample_rate(&self) -> f64 {
@@ -542,20 +642,22 @@ impl Run {
                 mid += if v.is_finite() { v * ig } else { 0.0 };
             }
             mid /= ch as f64;
-            let lo = self.lp_sign * self.lp.run(&mut self.lp_st, mid);
-            let low = self.p.blend_gain * self.ap.run(&mut self.ap_st, lo);
+            let lo = self.lp.run(&mut self.lp_st, mid);
+            let low = self.lp_sign * self.p.blend_gain * self.ap.run(&mut self.ap_st, lo);
             let harm = if self.p.level_control {
                 let pk = self.lc.drive.run(lo);
-                let drive = if pk * law::LC_MAX_DRIVE > 1.0 { 1.0 / pk } else { law::LC_MAX_DRIVE };
+                let dmax = self.lc.law.max_drive;
+                let drive = if pk * dmax > 1.0 { 1.0 / pk } else { dmax };
                 let env = self.lc.env.run(lo);
                 let dev = self.device(drive * lo);
-                let raw = self.band.run(&mut self.band_st, law::LC_MAX_DRIVE * env * dev);
-                let ph = self.lc.harm.run(raw);
+                let hp = self.band_hp.run(&mut self.band_hp_st, dmax * env * dev);
+                let ph = self.lc.harm.run(hp);
                 let g = if ph > env { env / ph } else { 1.0 };
-                self.p.harmonic_gain * g * raw
+                self.p.harmonic_gain * g * self.band_lp.run(&mut self.band_lp_st, hp)
             } else {
                 let dev = self.device(lo);
-                self.p.harmonic_gain * self.band.run(&mut self.band_st, dev)
+                let hp = self.band_hp.run(&mut self.band_hp_st, dev);
+                self.p.harmonic_gain * self.band_lp.run(&mut self.band_lp_st, hp)
             };
             let delayed = self.branch_delay(low + harm);
             let common = run_strided(&self.sub, self.stride, &mut self.sub_st, delayed);

@@ -49,6 +49,25 @@ fn main() {
     let fs = 48_000.0;
     let p = vbass::compile(stage, fs, &mut diags).expect("compile").expect("bypassed");
     let mut run = Run::new(&p, fs, 2);
+    // differential rig: VBASS_LC="max_drive,drive_hold,drive_rel,drive_ease,env_hold,env_rel,env_ease,harm_hold,harm_rel,harm_ease,env_up_hold,env_attack"
+    if let Ok(v) = std::env::var("VBASS_LC") {
+        let f: Vec<f64> = v.split(',').map(|x| x.parse().expect("VBASS_LC")).collect();
+        assert_eq!(f.len(), 12, "VBASS_LC takes 12 values");
+        run.set_lc_law(sgv2_core::voicing::vbass::LcLaw {
+            max_drive: f[0],
+            drive_hold_s: f[1],
+            drive_release_db_s: f[2],
+            drive_ease_s: f[3],
+            env_hold_s: f[4],
+            env_release_db_s: f[5],
+            env_ease_s: f[6],
+            harm_hold_s: f[7],
+            harm_release_db_s: f[8],
+            harm_ease_s: f[9],
+            env_up_hold_s: f[10],
+            env_attack_db_s: f[11],
+        });
+    }
     let mut raw = Vec::new();
     std::io::stdin().read_to_end(&mut raw).expect("read");
     let x: Vec<f32> = raw.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
