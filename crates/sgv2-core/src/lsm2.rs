@@ -79,8 +79,8 @@
 //!   2.4): the output-temperature ceiling solves the absolute ordinary
 //!   request on the fast-gained retained frame and look-ahead as
 //!   `B + g L + g^2 Q`. Runtime attack/look-ahead writes move the retained
-//!   start inside the fixed initial latency allocation, and every substep
-//!   uses the native Float32 vector-sum tree. The idle follower releases toward that solved request,
+//!   start inside the fixed initial latency allocation, and every
+//!   ceiling substep uses the native Float32 vector-sum tree. The idle follower releases toward that solved request,
 //!   and a result below its provisional endpoint makes a second follower call
 //!   toward 0.99 x the request. The audio applies the slow trajectory after
 //!   summing the fast-gained bands.
@@ -579,6 +579,17 @@ pub mod ids {
 }
 
 impl Params {
+    /// A runtime look-ahead write: finite and non-negative. Its window
+    /// position is checked by the unit against the fixed geometry.
+    fn validate_runtime_lookahead(&self) -> Result<(), InitError> {
+        let v = self.speaker_response_lookahead_ms;
+        if v.is_finite() && v >= 0.0 {
+            Ok(())
+        } else {
+            Err(InitError::Invalid("latency"))
+        }
+    }
+
     /// Structural checks only: the model trusts the tuning's values.
     pub fn validate(&self) -> Result<(), InitError> {
         let n = self.channels as usize;
@@ -1003,6 +1014,7 @@ fn vdsp_sve<const K: usize>(n: usize, mut next: impl FnMut() -> [f32; K]) -> [f3
     sum
 }
 
+#[cfg(test)]
 fn vdsp_sve_slice(x: &[f32]) -> f32 {
     let mut i = 0;
     vdsp_sve(x.len(), || {
@@ -1010,6 +1022,14 @@ fn vdsp_sve_slice(x: &[f32]) -> f32 {
         i += 1;
         [v]
     })[0]
+}
+
+/// The monitor's substep power total: a left-to-right Float32 sum. The
+/// vDSP_sve tree here moved the long ceiling trajectories away from macOS
+/// (t3-a085 +0.023 C, t3-a10 +0.018 C on the arm64 rig), so only the
+/// ceiling predictor uses it.
+fn seq_sum(x: &[f32]) -> f32 {
+    x.iter().fold(0.0f32, |a, &v| a + v)
 }
 
 fn db_to_lin(db: f64) -> f64 {
@@ -1427,7 +1447,7 @@ struct Chan {
     // the input's own current model; its temperature points by global
     // substep (ring), the newest at `tn - 1`.
     tin_cur: Current,
-    /// One native thermal substep of `u*i` products, reduced by `vDSP_sve`.
+    /// One thermal substep of `u*i` products (monitor sum).
     power_work: Vec<f32>,
     tp_vc: f32,
     tp_mg: f32,
@@ -1703,7 +1723,13 @@ impl Run {
         attack_runtime_written: bool,
         telemetry_ambient: &[f32; MAX_CHANNELS],
     ) -> Result<Run, InitError> {
-        p.validate()?;
+        // The geometry (latency floor, look-ahead region) is the one built at
+        // initialisation; a runtime look-ahead write only moves the ceiling
+        // window inside it (checked below against the substep grid).
+        let mut geometry = *p;
+        geometry.speaker_response_lookahead_ms = geometry_lookahead_ms;
+        geometry.validate()?;
+        p.validate_runtime_lookahead()?;
         if p.model_only == 0 {
             return Err(InitError::Unsupported("system ID or closed-loop temperature"));
         }
@@ -2037,7 +2063,7 @@ impl Run {
             let it = c.tin_cur.step(ut);
             c.power_work[i % sub] = ut * it;
             if (i + 1) % sub == 0 {
-                let p = (vdsp_sve_slice(&c.power_work) / sub as f32).max(0.0);
+                let p = (seq_sum(&c.power_work) / sub as f32).max(0.0);
                 c.tp_vc = c.br_vc.step(c.tp_vc, p);
                 c.tp_mg = c.br_mg.step(c.tp_mg, p);
                 c.tring[c.tn % TRING] = c.ambient as f32 + c.tp_vc + c.tp_mg;
@@ -2573,7 +2599,7 @@ impl Run {
                     let p = acc / sub as f64;
                     acc = 0.0;
                     // the output thermal model (residuals 2.1)
-                    let pp = (vdsp_sve_slice(&c.power_work) / sub as f32).max(0.0);
+                    let pp = (seq_sum(&c.power_work) / sub as f32).max(0.0);
                     c.th_vc = c.br_vc.step(c.th_vc, pp);
                     c.th_mg = c.br_mg.step(c.th_mg, pp);
                     let pamp = idle + ratio_p * (p * c.load_scale).max(0.0);
