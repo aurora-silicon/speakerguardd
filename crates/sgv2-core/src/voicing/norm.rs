@@ -185,12 +185,14 @@ impl LongTerm {
         self.reading = expected;
     }
 
-    fn update(&mut self, l: f64) {
+    /// Add one window level; the gate sits `GATE_DB` under `reference`,
+    /// the arbitrated loudness.
+    fn update(&mut self, l: f64, reference: f64) {
         if l <= BIN_LO_DB {
             return;
         }
         self.hist[bin_of(l)] += 1.0;
-        let start = bin_of(self.reading - GATE_DB);
+        let start = bin_of(reference - GATE_DB);
         let (mut n, mut e) = (0.0, 0.0);
         for (h, en) in self.hist[start..].iter().zip(&self.energy[start..]) {
             n += h;
@@ -202,16 +204,109 @@ impl LongTerm {
     }
 }
 
-/// The transient paths. TODO(SPEC): arbitration pending the t-4859 decode;
-/// until then the target follows the long-term meter only.
-struct Fast;
+/// Per-sample smoothing of the summed detector power, s.
+const EMA_S: f64 = 0.030;
+/// Energy scale of the fast (64-frame) path and of the median (512) path.
+const FAST_SCALE: f64 = 0.25;
+const MID_SCALE: f64 = 0.5;
+/// The median path: this many 512-frame observations, read at this sorted
+/// index (the lower median).
+const MEDIAN_LEN: usize = 94;
+const MEDIAN_AT: usize = 46;
+/// The long path: a sliding mean of this many 64-frame samples, emitted
+/// to the histogram every eight blocks.
+const WINDOW_LEN: usize = 600;
+/// Release dead band of the median path, dB, and its time constant, s.
+const MID_DEADBAND_DB: f64 = 5.0;
+const MID_RELEASE_S: f64 = 2.316;
 
-impl Fast {
-    fn new() -> Self {
-        Fast
-    }
-    fn reset(&mut self) {}
+/// The 512-frame median path with its release limiter.
+struct Median {
+    ring: [f64; MEDIAN_LEN],
+    sorted: [f64; MEDIAN_LEN],
+    at: usize,
+    limited: f64,
+    coef: f64,
 }
+
+impl Median {
+    fn new() -> Self {
+        let rate = 48_000.0 / (STEP * PER_BLOCK) as f64;
+        Median {
+            ring: [0.0; MEDIAN_LEN],
+            sorted: [0.0; MEDIAN_LEN],
+            at: 0,
+            limited: 0.0,
+            coef: 1.0 - libm::exp(-1.0 / (MID_RELEASE_S * rate)),
+        }
+    }
+
+    fn reset(&mut self, seed: f64) {
+        self.ring = [seed; MEDIAN_LEN];
+        self.sorted = [seed; MEDIAN_LEN];
+        self.at = 0;
+        self.limited = seed;
+    }
+
+    /// Replace the oldest observation with `v`; the limited median.
+    fn push(&mut self, v: f64) -> f64 {
+        let old = core::mem::replace(&mut self.ring[self.at], v);
+        self.at = (self.at + 1) % MEDIAN_LEN;
+        // remove `old` from the sorted copy and insert `v`
+        let mut k = self.sorted.iter().position(|x| *x == old).unwrap_or(0);
+        self.sorted[k] = v;
+        while k > 0 && self.sorted[k - 1] > self.sorted[k] {
+            self.sorted.swap(k - 1, k);
+            k -= 1;
+        }
+        while k + 1 < MEDIAN_LEN && self.sorted[k + 1] < self.sorted[k] {
+            self.sorted.swap(k + 1, k);
+            k += 1;
+        }
+        let m = self.sorted[MEDIAN_AT];
+        if m > self.limited {
+            self.limited = m;
+        } else if m + MID_DEADBAND_DB < self.limited {
+            self.limited += self.coef * (m + MID_DEADBAND_DB - self.limited);
+        }
+        self.limited
+    }
+}
+
+/// The long path's input: the sliding mean of the last 600 smoothed
+/// powers, kept as a running sum.
+struct Window {
+    ring: Box<[f64]>,
+    at: usize,
+    sum: f64,
+}
+
+impl Window {
+    fn new() -> Self {
+        Window { ring: vec![0.0; WINDOW_LEN].into_boxed_slice(), at: 0, sum: 0.0 }
+    }
+    fn reset(&mut self, seed: f64) {
+        self.ring.iter_mut().for_each(|v| *v = seed);
+        self.at = 0;
+        self.sum = seed * WINDOW_LEN as f64;
+    }
+    fn push(&mut self, v: f64) {
+        let old = core::mem::replace(&mut self.ring[self.at], v);
+        self.at = (self.at + 1) % WINDOW_LEN;
+        self.sum += v - old;
+    }
+    fn mean(&self) -> f64 {
+        // recomputed exactly once per pass so the running sum cannot drift
+        self.sum / WINDOW_LEN as f64
+    }
+    fn resum(&mut self) {
+        self.sum = self.ring.iter().sum();
+    }
+}
+
+/// Meter level offset, dB. TODO(SPEC): rig-measured, origin pending the
+/// t-4929 decode (one of the unit's two normalization stores).
+const METER_OFFSET_DB: f64 = -1.352;
 
 pub struct Run {
     p: Params,
@@ -225,20 +320,24 @@ pub struct Run {
     fill: usize,
     // detector state, per channel and section
     z: [[[f64; 2]; MAX_SECTIONS]; MAX_CHANNELS],
-    acc: f64,
+    ema: f64,
+    ema_a: f64,
+    meter_scale: f64,
     in_step: usize,
     steps: usize,
     blocks: usize,
-    block_acc: f64,
-    long_acc: f64,
+    window: Window,
+    median: Median,
     long: LongTerm,
-    fast: Fast,
+    mid: f64,
+    slow: f64,
+    candidate: f64,
     target_db: f64,
     gain_db: f64,
 }
 
 impl Run {
-    pub fn new(p: &Params, _fs: f64, channels: usize) -> Run {
+    pub fn new(p: &Params, fs: f64, channels: usize) -> Run {
         let channels = channels.clamp(1, MAX_CHANNELS);
         let mut r = Run {
             p: p.clone(),
@@ -249,14 +348,18 @@ impl Run {
             call_out: vec![0.0; channels * CALL].into_boxed_slice(),
             fill: 0,
             z: [[[0.0; 2]; MAX_SECTIONS]; MAX_CHANNELS],
-            acc: 0.0,
+            ema: 0.0,
+            ema_a: libm::exp(-1.0 / (EMA_S * fs)),
+            meter_scale: libm::pow(10.0, METER_OFFSET_DB / 10.0),
             in_step: 0,
             steps: 0,
             blocks: 0,
-            block_acc: 0.0,
-            long_acc: 0.0,
+            window: Window::new(),
+            median: Median::new(),
             long: LongTerm::new(),
-            fast: Fast::new(),
+            mid: 0.0,
+            slow: 0.0,
+            candidate: 0.0,
             target_db: 0.0,
             gain_db: 0.0,
         };
@@ -265,21 +368,24 @@ impl Run {
     }
 
     pub fn reset(&mut self) {
+        let e = self.p.expected_db;
         self.ring.iter_mut().for_each(|v| *v = 0.0);
         self.pos = 0;
         self.call_in.iter_mut().for_each(|v| *v = 0.0);
         self.call_out.iter_mut().for_each(|v| *v = 0.0);
         self.fill = 0;
         self.z = [[[0.0; 2]; MAX_SECTIONS]; MAX_CHANNELS];
-        self.acc = 0.0;
+        self.ema = power_of(e);
         self.in_step = 0;
         self.steps = 0;
         self.blocks = 0;
-        self.block_acc = 0.0;
-        self.long_acc = 0.0;
-        self.long.reset(self.p.expected_db);
-        self.fast.reset();
-        self.target_db = self.p.gain_db(self.p.expected_db);
+        self.window.reset(power_of(e));
+        self.median.reset(e);
+        self.long.reset(e);
+        self.mid = e;
+        self.slow = e;
+        self.candidate = e;
+        self.target_db = self.p.gain_db(e);
         self.gain_db = self.target_db;
     }
 
@@ -305,25 +411,32 @@ impl Run {
         v * v
     }
 
+    /// Every 64 frames: the fast path, the window, and on their own
+    /// boundaries the median (512) and long (4096) paths.
     fn on_step(&mut self) {
-        let step_power = self.acc / STEP as f64;
-        self.acc = 0.0;
-        self.block_acc += step_power;
+        let ema = self.ema;
+        self.window.push(ema);
+        let fast = loudness(ema * FAST_SCALE);
         self.steps += 1;
         if self.steps == PER_BLOCK {
             self.steps = 0;
-            let block_power = self.block_acc / PER_BLOCK as f64;
-            self.block_acc = 0.0;
-            self.long_acc += block_power;
+            self.mid = self.median.push(loudness(ema * MID_SCALE));
             self.blocks += 1;
             if self.blocks == PER_LONG {
                 self.blocks = 0;
-                let long_power = self.long_acc / PER_LONG as f64;
-                self.long_acc = 0.0;
-                self.long.update(loudness(long_power));
-                self.target_db = self.p.gain_db(self.long.reading);
+                self.window.resum();
+                self.long.update(loudness(self.window.mean()), self.candidate);
             }
+            self.slow = self.arbitrate_slow();
         }
+        self.candidate = self.slow.max(fast);
+        self.target_db = self.p.gain_db(self.candidate);
+    }
+
+    /// The 512-frame candidate from the median and long paths.
+    /// TODO(SPEC): the long path's preconditioner and release (t-4929).
+    fn arbitrate_slow(&mut self) -> f64 {
+        self.mid.max(self.long.reading)
     }
 
     /// One call: meter all of it, then move the gain across it.
@@ -336,7 +449,7 @@ impl Run {
                 let x = self.call_in[ch * CALL + n];
                 power += self.detect(ch, f64::from(x));
             }
-            self.acc += power;
+            self.ema = self.ema_a * self.ema + (1.0 - self.ema_a) * power * self.meter_scale;
             self.in_step += 1;
             if self.in_step == STEP {
                 self.in_step = 0;
@@ -494,7 +607,7 @@ mod tests {
         let p = params(0);
         let mut r = Run::new(&p, 48_000.0, 1);
         let amp = 0.1f32; // power 0.01
-        let level = 10.0 * libm::log10(0.01) + LOUDNESS_OFFSET;
+        let level = 10.0 * libm::log10(0.01) + LOUDNESS_OFFSET + METER_OFFSET_DB;
         let mut buf = vec![0.0f32; 4096];
         for _ in 0..(120 * 48_000 / 4096) {
             buf.iter_mut().enumerate().for_each(|(i, v)| *v = if i % 2 == 0 { amp } else { -amp });

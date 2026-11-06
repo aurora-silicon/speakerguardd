@@ -95,10 +95,22 @@ fn highpass(f0: f64, fs: f64) -> [f64; 5] {
     [(1.0 + c) / (2.0 * a0), -(1.0 + c) / a0, (1.0 + c) / (2.0 * a0), -2.0 * c / a0, (1.0 - alpha) / a0]
 }
 
-/// The loudness weighting of weighting mode 0.
-/// TODO(SPEC): exact design pending the t-4859 decode.
-fn weighting(_fs: f64) -> Vec<[f64; 5]> {
-    Vec::new()
+/// The loudness weighting of weighting mode 0: the two-section K weighting
+/// of ITU-R BS.1770 (its published 48 kHz coefficients, as single-precision
+/// values like the unit's).
+fn weighting(fs: f64) -> Vec<[f64; 5]> {
+    debug_assert_eq!(fs, SUPPORTED_FS);
+    let f = |v: f64| f64::from(v as f32);
+    vec![
+        [
+            f(1.535_124_859_586_97),
+            f(-2.691_696_189_406_38),
+            f(1.198_392_810_852_85),
+            f(-1.690_659_293_182_41),
+            f(0.732_480_774_215_85),
+        ],
+        [1.0, -2.0, 1.0, f(-1.990_047_454_833_98), f(0.990_072_250_366_21)],
+    ]
 }
 
 pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option<Params>> {
