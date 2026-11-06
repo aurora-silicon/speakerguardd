@@ -1008,7 +1008,7 @@ impl Complex32 {
     fn mul(self, rhs: Self) -> Self {
         let real_product = self.re * rhs.re;
         let imag_product = self.re * rhs.im;
-        Self { re: (-self.im).mul_add(rhs.im, real_product), im: self.im.mul_add(rhs.re, imag_product) }
+        Self { re: libm::fmaf(-self.im, rhs.im, real_product), im: libm::fmaf(self.im, rhs.re, imag_product) }
     }
 
     #[inline]
@@ -1196,15 +1196,15 @@ fn radix5(a: [Complex32; 5], inverse: bool, roots: [f32; 4]) -> [Complex32; 5] {
     let d14 = a[1].sub(a[4]);
     let d23 = a[2].sub(a[3]);
     let b1 = Complex32 {
-        re: s23.re.mul_add(c2, s14.re.mul_add(c1, a[0].re)),
-        im: s23.im.mul_add(c2, s14.im.mul_add(c1, a[0].im)),
+        re: libm::fmaf(s23.re, c2, libm::fmaf(s14.re, c1, a[0].re)),
+        im: libm::fmaf(s23.im, c2, libm::fmaf(s14.im, c1, a[0].im)),
     };
     let b2 = Complex32 {
-        re: s23.re.mul_add(c1, s14.re.mul_add(c2, a[0].re)),
-        im: s23.im.mul_add(c1, s14.im.mul_add(c2, a[0].im)),
+        re: libm::fmaf(s23.re, c1, libm::fmaf(s14.re, c2, a[0].re)),
+        im: libm::fmaf(s23.im, c1, libm::fmaf(s14.im, c2, a[0].im)),
     };
-    let r1 = Complex32 { re: d23.im.mul_add(-s2, d14.im * -s1), im: d23.re.mul_add(s2, d14.re * s1) };
-    let r2 = Complex32 { re: d23.im.mul_add(s1, d14.im * -s2), im: d23.re.mul_add(-s1, d14.re * s2) };
+    let r1 = Complex32 { re: libm::fmaf(d23.im, -s2, d14.im * -s1), im: libm::fmaf(d23.re, s2, d14.re * s1) };
+    let r2 = Complex32 { re: libm::fmaf(d23.im, s1, d14.im * -s2), im: libm::fmaf(d23.re, -s1, d14.re * s2) };
     let mut y = [Complex32::default(); 5];
     y[0] = a[0].add(s14).add(s23);
     y[1] = b1.add(r1);
