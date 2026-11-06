@@ -1971,7 +1971,7 @@ impl Run {
                 // or more below it. The others take the
                 // second (t-4772). An upward lane keeps the primary unless
                 // the second solve cut it below its own seed: then it takes
-                // the larger of the two (a lane the second solve leaves at
+                // the second request too (a lane the second solve leaves at
                 // its seed, unity included, is not a request of that solve)
                 let up: [bool; BANDS] = core::array::from_fn(|k| p[k] > c.band[k].g);
                 if up.iter().any(|&u| u) {
@@ -1985,15 +1985,7 @@ impl Run {
                         }
                     });
                     let q = chain(c, seed);
-                    core::array::from_fn(|k| {
-                        if !up[k] {
-                            q[k]
-                        } else if q[k] < seed[k] {
-                            p[k].max(q[k])
-                        } else {
-                            p[k]
-                        }
-                    })
+                    core::array::from_fn(|k| if up[k] && q[k] >= seed[k] { p[k] } else { q[k] })
                 } else {
                     p
                 }
