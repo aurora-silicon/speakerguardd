@@ -12,15 +12,25 @@
 //! eight blocks a 4096-frame block. The counters run on the stream, not on
 //! the host's calls.
 //!
-//! Meters, all in loudness units `10 log10(power) - 0.691`:
-//! - the long-term meter: a 1001-bin histogram of 4096-frame block levels
-//!   over -100..0 in 0.1 dB bins, read as the power mean of the bins at or
-//!   above its previous reading minus 10 dB (the relative gate). A reset
-//!   clears it and seeds the eleven bins around the expected loudness with
-//!   one count each, which is why a fresh unit starts at that loudness and
-//!   why the start-up seed fades only as program accumulates.
-//! - the transient meters ([`Fast`]): the short-window paths that let the
-//!   gain come down on a rise before the long-term meter has moved.
+//! Meters (levels are `10 log10(power)` of the smoothed detector power; the
+//! histogram works in loudness units, that minus 0.691):
+//! - fast: the loudest 64-frame level of the call, less a fixed store;
+//! - median: the lower median of the last 94 512-frame levels, less a fixed
+//!   store, behind a release limiter that only lets go once the median sits
+//!   more than its dead band under it;
+//! - long: a 1001-bin histogram of 4096-frame window levels over -100..0 in
+//!   0.1 dB bins, read as the power mean of the bins above a relative gate
+//!   that trails the histogram's own smoothed energy. Every admitted window
+//!   fades all counts by a factor whose time constant shortens as the counts
+//!   lean below the reading, so the history spans seconds, not the whole
+//!   program. A reset clears it and seeds the eleven bins around the
+//!   expected loudness with one count each.
+//! - the long reading passes a preconditioner against the 512-frame level
+//!   (less its own store): it follows the reading while that level is above
+//!   it and, once the reading overtakes it, holds the level it overtook.
+//!
+//! The call's candidate is the larger of fast and of median against the
+//! conditioned long path; it is read once per call.
 //!
 //! Gain law: a 21-node table over -100..+10 in 5.5 dB steps, compiled from
 //! the tuning (target, maximum gain, upward and downward ranges, ratio),
@@ -52,7 +62,6 @@ const PER_LONG: usize = 8;
 const BINS: usize = 1001;
 const BIN_LO_DB: f64 = -100.0;
 const BIN_DB: f64 = 0.1;
-const GATE_DB: f64 = 10.0;
 const SEED_HALF: usize = 5;
 const GLIDE: f64 = 0.1;
 /// macOS renders the speaker graph in calls of this many frames; the unit
@@ -111,10 +120,10 @@ impl Params {
         p.reset_timeout_s = w[NODES + 1];
         let la = w[NODES + 2];
         let ns = w[NODES + 3];
-        if la < 0.0 || la > MAX_LOOKAHEAD as f64 || la.fract() != 0.0 {
+        if la < 0.0 || la > MAX_LOOKAHEAD as f64 || la != libm::trunc(la) {
             return None;
         }
-        if ns < 0.0 || ns > MAX_SECTIONS as f64 || ns.fract() != 0.0 {
+        if ns < 0.0 || ns > MAX_SECTIONS as f64 || ns != libm::trunc(ns) {
             return None;
         }
         p.lookahead = la as usize;
@@ -150,8 +159,13 @@ impl Params {
     }
 }
 
+/// Detector level, dB, before the loudness offset.
+fn level(power: f64) -> f64 {
+    10.0 * libm::log10(libm::fabs(power).max(1e-20))
+}
+
 fn loudness(power: f64) -> f64 {
-    10.0 * libm::log10(libm::fabs(power).max(1e-20)) + LOUDNESS_OFFSET
+    level(power) + LOUDNESS_OFFSET
 }
 
 fn power_of(l: f64) -> f64 {
@@ -163,17 +177,49 @@ fn bin_of(l: f64) -> usize {
     (b as usize).min(BINS - 1)
 }
 
-/// The long-term gated histogram meter.
+/// `exp(-1 / (tau * rate))` in single precision, as the unit forms it.
+fn pole(tau_s: f32, rate: f32) -> f32 {
+    libm::expf(-1.0 / (tau_s * rate))
+}
+
+/// The power every smoothed store starts from after a reset (-70 dB).
+const SEED_POWER: f64 = 1e-7;
+/// Long-path validity floor, loudness dB: a quieter window neither counts
+/// nor ages the history.
+const VALID_DB: f64 = -70.0;
+/// The histogram is integrated from this far under its own smoothed
+/// program energy, dB (the relative gate).
+const GATE_DB: f64 = 20.0;
+/// History and gate time constants, s. A balanced histogram (or one
+/// weighted above its reading) keeps `HIST_LONG_S` of history; one weighted
+/// `IMBALANCE_DB` or more below its reading keeps `HIST_SHORT_S`. The gate's
+/// smoothing runs from `GATE_S` to twice that on the same measure.
+const HIST_LONG_S: f32 = 5.0;
+const HIST_SHORT_S: f32 = 2.0;
+const GATE_S: f32 = 1.0;
+const IMBALANCE_DB: f32 = 10.0;
+
+/// The long-term gated histogram meter with its adaptive history.
 struct LongTerm {
     hist: Box<[f64]>,
     energy: Box<[f64]>,
     reading: f64,
+    gate_energy: f64,
+    gate_a: f32,
+    rate: f32,
 }
 
 impl LongTerm {
-    fn new() -> Self {
+    fn new(rate: f32) -> Self {
         let energy: Box<[f64]> = (0..BINS).map(|i| power_of(BIN_LO_DB + BIN_DB * i as f64)).collect();
-        LongTerm { hist: vec![0.0; BINS].into_boxed_slice(), energy, reading: 0.0 }
+        LongTerm {
+            hist: vec![0.0; BINS].into_boxed_slice(),
+            energy,
+            reading: 0.0,
+            gate_energy: SEED_POWER,
+            gate_a: 0.0,
+            rate,
+        }
     }
 
     fn reset(&mut self, expected: f64) {
@@ -183,16 +229,21 @@ impl LongTerm {
             *h = 1.0;
         }
         self.reading = expected;
+        self.gate_energy = SEED_POWER;
+        self.gate_a = pole(GATE_S, self.rate);
     }
 
-    /// Add one window level; the gate sits `GATE_DB` under `reference`,
-    /// the arbitrated loudness.
-    fn update(&mut self, l: f64, reference: f64) {
-        if l <= BIN_LO_DB {
-            return;
+    /// One window's mean power; the new reading.
+    fn update(&mut self, power: f64) -> f64 {
+        let l = loudness(power);
+        if l <= VALID_DB {
+            return self.reading;
         }
+        let a = f64::from(self.gate_a);
+        self.gate_energy = a * self.gate_energy + (1.0 - a) * power;
+        let floor = loudness(self.gate_energy) - GATE_DB;
         self.hist[bin_of(l)] += 1.0;
-        let start = bin_of(reference - GATE_DB);
+        let start = bin_of(floor);
         let (mut n, mut e) = (0.0, 0.0);
         for (h, en) in self.hist[start..].iter().zip(&self.energy[start..]) {
             n += h;
@@ -201,24 +252,41 @@ impl LongTerm {
         if n > 1e-20 {
             self.reading = loudness(e / n);
         }
+        // History: how far the counts lean below the new reading (the
+        // reading's own bin excluded) sets how fast every count fades.
+        let pivot = bin_of(self.reading);
+        let above = (self.hist[pivot + 1..].iter().sum::<f64>() + 1e-20) as f32;
+        let below = (self.hist[..pivot].iter().sum::<f64>() + 1e-20) as f32;
+        let lean = 20.0 * libm::log10f(libm::fabsf(above / below) + 1e-6) / -IMBALANCE_DB;
+        let x2 = lean.clamp(0.0, 1.0) * lean.clamp(0.0, 1.0);
+        self.gate_a = pole(GATE_S * (1.0 + x2), self.rate);
+        let fade = f64::from(pole(HIST_LONG_S - (HIST_LONG_S - HIST_SHORT_S) * x2, self.rate));
+        self.hist.iter_mut().for_each(|h| *h *= fade);
+        self.reading
     }
 }
 
 /// Per-sample smoothing of the summed detector power, s.
 const EMA_S: f64 = 0.030;
-/// Energy scale of the fast (64-frame) path and of the median (512) path.
-const FAST_SCALE: f64 = 0.25;
-const MID_SCALE: f64 = 0.5;
-/// The median path: this many 512-frame observations, read at this sorted
-/// index (the lower median).
+/// The unit's level stores, dB: added to the call's loudest 64-frame level
+/// (the fast path), to the lower median (the median path), and to the
+/// 512-frame level that competes with the long path.
+const FAST_STORE_DB: f64 = -8.0;
+const MEDIAN_STORE_DB: f64 = -5.0;
+const COMPETITOR_STORE_DB: f64 = -2.0;
+/// The median path: this many 512-frame levels, read at this sorted index
+/// (the lower median).
 const MEDIAN_LEN: usize = 94;
 const MEDIAN_AT: usize = 46;
-/// The long path: a sliding mean of this many 64-frame samples, emitted
-/// to the histogram every eight blocks.
+/// The long path: a sliding mean of this many 64-frame powers, emitted to
+/// the histogram every eight blocks.
 const WINDOW_LEN: usize = 600;
 /// Release dead band of the median path, dB, and its time constant, s.
 const MID_DEADBAND_DB: f64 = 5.0;
-const MID_RELEASE_S: f64 = 2.316;
+const MID_RELEASE_S: f32 = 2.316;
+/// Time constant of the long path's preconditioner glide, s. In single
+/// precision its pole rounds to exactly 1, so the glide holds.
+const PRECOND_S: f32 = 1e7;
 
 /// The 512-frame median path with its release limiter.
 struct Median {
@@ -230,14 +298,13 @@ struct Median {
 }
 
 impl Median {
-    fn new() -> Self {
-        let rate = 48_000.0 / (STEP * PER_BLOCK) as f64;
+    fn new(rate: f32) -> Self {
         Median {
             ring: [0.0; MEDIAN_LEN],
             sorted: [0.0; MEDIAN_LEN],
             at: 0,
             limited: 0.0,
-            coef: 1.0 - libm::exp(-1.0 / (MID_RELEASE_S * rate)),
+            coef: f64::from(1.0 - pole(MID_RELEASE_S, rate)),
         }
     }
 
@@ -248,7 +315,7 @@ impl Median {
         self.limited = seed;
     }
 
-    /// Replace the oldest observation with `v`; the limited median.
+    /// Replace the oldest level with `v`; the limited median.
     fn push(&mut self, v: f64) -> f64 {
         let old = core::mem::replace(&mut self.ring[self.at], v);
         self.at = (self.at + 1) % MEDIAN_LEN;
@@ -263,13 +330,52 @@ impl Median {
             self.sorted.swap(k + 1, k);
             k += 1;
         }
-        let m = self.sorted[MEDIAN_AT];
+        let m = self.sorted[MEDIAN_AT] + MEDIAN_STORE_DB;
         if m > self.limited {
             self.limited = m;
         } else if m + MID_DEADBAND_DB < self.limited {
             self.limited += self.coef * (m + MID_DEADBAND_DB - self.limited);
         }
         self.limited
+    }
+}
+
+/// The long path's preconditioner: passes the histogram reading while the
+/// competing 512-frame level is above it; once the reading overtakes the
+/// competitor it clamps to the competitor's last level and then glides
+/// (here: holds) until the competitor rises above the reading again.
+struct Precondition {
+    out: f64,
+    rising: bool,
+    source: f64,
+    coef: f64,
+}
+
+impl Precondition {
+    fn new(rate: f32) -> Self {
+        Precondition { out: 0.0, rising: false, source: 0.0, coef: f64::from(1.0 - pole(PRECOND_S, rate)) }
+    }
+
+    fn reset(&mut self) {
+        self.out = 0.0;
+        self.rising = false;
+        self.source = 0.0;
+    }
+
+    fn update(&mut self, source: f64, reading: f64) -> f64 {
+        let out = if source <= reading && self.out <= reading {
+            if self.rising {
+                reading.min(self.source)
+            } else {
+                self.out + self.coef * (reading - self.out)
+            }
+        } else {
+            reading
+        };
+        self.out = out;
+        self.source = source;
+        self.rising = source > reading;
+        out
     }
 }
 
@@ -296,17 +402,13 @@ impl Window {
         self.sum += v - old;
     }
     fn mean(&self) -> f64 {
-        // recomputed exactly once per pass so the running sum cannot drift
         self.sum / WINDOW_LEN as f64
     }
     fn resum(&mut self) {
+        // recomputed exactly once per pass so the running sum cannot drift
         self.sum = self.ring.iter().sum();
     }
 }
-
-/// Meter level offset, dB. TODO(SPEC): rig-measured, origin pending the
-/// t-4929 decode (one of the unit's two normalization stores).
-const METER_OFFSET_DB: f64 = -1.352;
 
 pub struct Run {
     p: Params,
@@ -322,15 +424,18 @@ pub struct Run {
     z: [[[f64; 2]; MAX_SECTIONS]; MAX_CHANNELS],
     ema: f64,
     ema_a: f64,
-    meter_scale: f64,
     in_step: usize,
     steps: usize,
     blocks: usize,
     window: Window,
     median: Median,
     long: LongTerm,
-    mid: f64,
-    slow: f64,
+    pre: Precondition,
+    /// The call's loudest 64-frame level, dB.
+    peak: f64,
+    /// The 512-frame candidate: limited median against the conditioned
+    /// long path.
+    held: f64,
     candidate: f64,
     target_db: f64,
     gain_db: f64,
@@ -339,6 +444,8 @@ pub struct Run {
 impl Run {
     pub fn new(p: &Params, fs: f64, channels: usize) -> Run {
         let channels = channels.clamp(1, MAX_CHANNELS);
+        let block_rate = (fs / (STEP * PER_BLOCK) as f64) as f32;
+        let long_rate = (fs / (STEP * PER_BLOCK * PER_LONG) as f64) as f32;
         let mut r = Run {
             p: p.clone(),
             channels,
@@ -350,15 +457,15 @@ impl Run {
             z: [[[0.0; 2]; MAX_SECTIONS]; MAX_CHANNELS],
             ema: 0.0,
             ema_a: libm::exp(-1.0 / (EMA_S * fs)),
-            meter_scale: libm::pow(10.0, METER_OFFSET_DB / 10.0),
             in_step: 0,
             steps: 0,
             blocks: 0,
             window: Window::new(),
-            median: Median::new(),
-            long: LongTerm::new(),
-            mid: 0.0,
-            slow: 0.0,
+            median: Median::new(block_rate),
+            long: LongTerm::new(long_rate),
+            pre: Precondition::new(fs as f32 / STEP as f32),
+            peak: f64::NEG_INFINITY,
+            held: 0.0,
             candidate: 0.0,
             target_db: 0.0,
             gain_db: 0.0,
@@ -375,15 +482,16 @@ impl Run {
         self.call_out.iter_mut().for_each(|v| *v = 0.0);
         self.fill = 0;
         self.z = [[[0.0; 2]; MAX_SECTIONS]; MAX_CHANNELS];
-        self.ema = power_of(e);
+        self.ema = SEED_POWER;
         self.in_step = 0;
         self.steps = 0;
         self.blocks = 0;
-        self.window.reset(power_of(e));
+        self.window.reset(SEED_POWER);
         self.median.reset(e);
         self.long.reset(e);
-        self.mid = e;
-        self.slow = e;
+        self.pre.reset();
+        self.peak = f64::NEG_INFINITY;
+        self.held = e;
         self.candidate = e;
         self.target_db = self.p.gain_db(e);
         self.gain_db = self.target_db;
@@ -400,6 +508,11 @@ impl Run {
         self.gain_db
     }
 
+    /// The loudness the last whole call's gain was read for, dB.
+    pub fn candidate_db(&self) -> f64 {
+        self.candidate
+    }
+
     fn detect(&mut self, ch: usize, x: f64) -> f64 {
         let mut v = x;
         for (s, z) in self.p.sos[..self.p.sections].iter().zip(self.z[ch].iter_mut()) {
@@ -411,32 +524,26 @@ impl Run {
         v * v
     }
 
-    /// Every 64 frames: the fast path, the window, and on their own
-    /// boundaries the median (512) and long (4096) paths.
+    /// Every 64 frames: the call's peak level and the window, and on their
+    /// own boundaries the median (512) and long (4096) paths.
     fn on_step(&mut self) {
         let ema = self.ema;
         self.window.push(ema);
-        let fast = loudness(ema * FAST_SCALE);
+        let db = level(ema);
+        self.peak = self.peak.max(db);
         self.steps += 1;
         if self.steps == PER_BLOCK {
             self.steps = 0;
-            self.mid = self.median.push(loudness(ema * MID_SCALE));
+            let mid = self.median.push(db);
             self.blocks += 1;
             if self.blocks == PER_LONG {
                 self.blocks = 0;
                 self.window.resum();
-                self.long.update(loudness(self.window.mean()), self.candidate);
+                self.long.update(self.window.mean());
             }
-            self.slow = self.arbitrate_slow();
+            let long = self.pre.update(db + COMPETITOR_STORE_DB, self.long.reading);
+            self.held = mid.max(long);
         }
-        self.candidate = self.slow.max(fast);
-        self.target_db = self.p.gain_db(self.candidate);
-    }
-
-    /// The 512-frame candidate from the median and long paths.
-    /// TODO(SPEC): the long path's preconditioner and release (t-4929).
-    fn arbitrate_slow(&mut self) -> f64 {
-        self.mid.max(self.long.reading)
     }
 
     /// One call: meter all of it, then move the gain across it.
@@ -449,12 +556,17 @@ impl Run {
                 let x = self.call_in[ch * CALL + n];
                 power += self.detect(ch, f64::from(x));
             }
-            self.ema = self.ema_a * self.ema + (1.0 - self.ema_a) * power * self.meter_scale;
+            self.ema = self.ema_a * self.ema + (1.0 - self.ema_a) * power.max(1e-12);
             self.in_step += 1;
             if self.in_step == STEP {
                 self.in_step = 0;
                 self.on_step();
             }
+        }
+        if self.peak > f64::NEG_INFINITY {
+            self.candidate = self.held.max(self.peak + FAST_STORE_DB);
+            self.target_db = self.p.gain_db(self.candidate);
+            self.peak = f64::NEG_INFINITY;
         }
         for n in 0..CALL {
             self.gain_db += GLIDE * (self.target_db - self.gain_db);
@@ -607,7 +719,7 @@ mod tests {
         let p = params(0);
         let mut r = Run::new(&p, 48_000.0, 1);
         let amp = 0.1f32; // power 0.01
-        let level = 10.0 * libm::log10(0.01) + LOUDNESS_OFFSET + METER_OFFSET_DB;
+        let level = 10.0 * libm::log10(0.01) + COMPETITOR_STORE_DB;
         let mut buf = vec![0.0f32; 4096];
         for _ in 0..(120 * 48_000 / 4096) {
             buf.iter_mut().enumerate().for_each(|(i, v)| *v = if i % 2 == 0 { amp } else { -amp });
@@ -615,6 +727,47 @@ mod tests {
         }
         // the seed fades as program accumulates; two minutes leave < 0.1 dB
         assert!((r.gain_db() - p.gain_db(level)).abs() < 0.1, "{} vs {}", r.gain_db(), p.gain_db(level));
+    }
+
+    #[test]
+    fn the_long_meter_forgets_old_program() {
+        // A minute loud, then quiet: a cumulative histogram would still read
+        // between the two; the fading one follows the quiet program within
+        // a few of its time constants.
+        let rate = (48_000.0 / 4096.0) as f32;
+        let mut m = LongTerm::new(rate);
+        m.reset(-20.0);
+        let loud = power_of(-10.0);
+        let quiet = power_of(-30.0);
+        for _ in 0..(60.0 * rate) as usize {
+            m.update(loud);
+        }
+        assert!((m.reading + 10.0).abs() < 0.15, "{}", m.reading);
+        for _ in 0..(20.0 * rate) as usize {
+            m.update(quiet);
+        }
+        assert!((m.reading + 30.0).abs() < 0.3, "{}", m.reading);
+        // windows under the validity floor neither count nor age it
+        let before = m.reading;
+        for _ in 0..(20.0 * rate) as usize {
+            m.update(power_of(-80.0));
+        }
+        assert_eq!(m.reading, before);
+    }
+
+    #[test]
+    fn the_preconditioner_holds_the_level_it_was_overtaken_at() {
+        let mut p = Precondition::new(750.0);
+        assert_eq!(p.coef, 0.0);
+        // the reading climbs past a steady competitor at -12
+        let mut out = 0.0;
+        for r in [-20.0, -16.0, -13.0, -11.0, -10.5, -10.4] {
+            out = p.update(-12.0, r);
+        }
+        assert_eq!(out, -12.0);
+        // it follows the reading down, and again once the competitor is above
+        assert_eq!(p.update(-12.0, -12.5), -12.5);
+        assert_eq!(p.update(-5.0, -11.0), -11.0);
     }
 
     #[test]
