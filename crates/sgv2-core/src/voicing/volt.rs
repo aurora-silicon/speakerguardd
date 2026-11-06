@@ -7,27 +7,35 @@
 //! offset curve. The gain points are linearly interpolated. The offsets use
 //! the unit's uniform cubic B-spline. [`Run::set_volume`] is RT-safe and the
 //! box has no latency or tail.
+//!
+//! Graph construction first loads the saved slider, then applies the graph's
+//! declared volume scalar before the first slice. [`Run::new`] mirrors the
+//! first step. The chain must call [`Run::prime_volume`] for the second and
+//! use its returned ID-100 value to prime any downstream parameter relay.
 
 pub const CURVE_POINTS: usize = 17;
 pub const OFFSET_POINTS: usize = 5;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Params {
+    /// Slider restored by the box's saved state before graph controls apply.
+    pub saved_scalar: f64,
     pub pre_gain_db: f64,
     pub curve_db: [f64; CURVE_POINTS],
     pub offset_db: [f64; OFFSET_POINTS],
 }
 
 impl Params {
-    pub const WORDS: usize = 1 + CURVE_POINTS + OFFSET_POINTS;
+    pub const WORDS: usize = 2 + CURVE_POINTS + OFFSET_POINTS;
 
     pub fn to_words(&self, out: &mut [f64]) {
         if out.len() < Self::WORDS {
             return;
         }
-        out[0] = self.pre_gain_db;
-        out[1..1 + CURVE_POINTS].copy_from_slice(&self.curve_db);
-        out[1 + CURVE_POINTS..Self::WORDS].copy_from_slice(&self.offset_db);
+        out[0] = self.saved_scalar;
+        out[1] = self.pre_gain_db;
+        out[2..2 + CURVE_POINTS].copy_from_slice(&self.curve_db);
+        out[2 + CURVE_POINTS..Self::WORDS].copy_from_slice(&self.offset_db);
     }
 
     pub fn from_words(words: &[f64]) -> Option<Self> {
@@ -36,14 +44,15 @@ impl Params {
         }
         let mut curve_db = [0.0; CURVE_POINTS];
         let mut offset_db = [0.0; OFFSET_POINTS];
-        curve_db.copy_from_slice(&words[1..1 + CURVE_POINTS]);
-        offset_db.copy_from_slice(&words[1 + CURVE_POINTS..]);
-        let p = Self { pre_gain_db: words[0], curve_db, offset_db };
+        curve_db.copy_from_slice(&words[2..2 + CURVE_POINTS]);
+        offset_db.copy_from_slice(&words[2 + CURVE_POINTS..]);
+        let p = Self { saved_scalar: words[0], pre_gain_db: words[1], curve_db, offset_db };
         p.valid().then_some(p)
     }
 
     fn valid(&self) -> bool {
-        (-120.0..=20.0).contains(&self.pre_gain_db)
+        (0.0..=1.0).contains(&self.saved_scalar)
+            && (-120.0..=20.0).contains(&self.pre_gain_db)
             && self.curve_db.iter().all(|v| (-120.0..=20.0).contains(v))
             && self.offset_db.iter().all(|v| (-120.0..=20.0).contains(v))
     }
@@ -93,7 +102,7 @@ pub struct Run {
 impl Run {
     pub fn new(params: &Params, _fs: f64, channels: usize) -> Self {
         let mut run = Self { params: *params, channels, gain_db: 0.0, gain: 1.0 };
-        run.set_volume(1.0);
+        run.set_volume(params.saved_scalar);
         run
     }
 
@@ -110,6 +119,16 @@ impl Run {
         if !self.gain.is_finite() {
             self.gain = 0.0;
         }
+    }
+
+    /// Applies the graph's declared initial control before the first slice.
+    ///
+    /// The returned value is the box's published Gain (ID 100). A graph
+    /// relay uses it to initialize the compressor automation input before
+    /// either box processes audio. No silent pre-roll is needed.
+    pub fn prime_volume(&mut self, scalar: f64) -> f64 {
+        self.set_volume(scalar);
+        self.gain_db
     }
 
     /// The unit's read-only Gain parameter (ID 100), used by graph relays.
@@ -137,7 +156,7 @@ mod tests {
         for (i, value) in curve.iter_mut().enumerate() {
             *value = i as f64 - 16.0;
         }
-        Params { pre_gain_db: -1.0, curve_db: curve, offset_db: [0.0, 0.0, 0.0, 6.0, 6.0] }
+        Params { saved_scalar: 0.25, pre_gain_db: -1.0, curve_db: curve, offset_db: [0.0, 0.0, 0.0, 6.0, 6.0] }
     }
 
     #[test]
@@ -162,7 +181,12 @@ mod tests {
 
     #[test]
     fn process_is_broadband_and_silences_non_finite_input() {
-        let p = Params { pre_gain_db: 0.0, curve_db: [-6.0; CURVE_POINTS], offset_db: [0.0; OFFSET_POINTS] };
+        let p = Params {
+            saved_scalar: 0.25,
+            pre_gain_db: 0.0,
+            curve_db: [-6.0; CURVE_POINTS],
+            offset_db: [0.0; OFFSET_POINTS],
+        };
         let mut run = Run::new(&p, 48_000.0, 2);
         run.set_volume(0.37);
         let mut left = [1.0, f32::NAN];
@@ -181,5 +205,22 @@ mod tests {
         let mut run = Run::new(&p, 48_000.0, 1);
         run.set_volume(f64::NAN);
         assert_eq!(run.gain_db(), p.db_at(0.0));
+    }
+
+    #[test]
+    fn startup_loads_saved_then_primes_declared_control_and_relay() {
+        let p = params();
+        let mut run = Run::new(&p, 48_000.0, 1);
+        assert_eq!(run.gain_db(), p.db_at(p.saved_scalar));
+
+        let relay = run.prime_volume(0.75);
+        assert_eq!(relay, p.db_at(0.75));
+        let mut audio = [1.0f32; 2];
+        run.process(&mut [&mut audio], 2);
+        let want = libm::pow(10.0, relay / 20.0) as f32;
+        assert_eq!(audio, [want; 2]);
+
+        run.reset();
+        assert_eq!(run.gain_db(), relay);
     }
 }

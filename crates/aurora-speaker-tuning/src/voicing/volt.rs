@@ -73,7 +73,7 @@ pub fn compile(stage: &Stage, _fs: f64, _diags: &mut Diagnostics) -> Result<Opti
     }
     in_range(section, stage, 2, 0.01, 60_000.0)?;
     in_range(section, stage, 3, 0.01, 60_000.0)?;
-    in_range(section, stage, 4, 0.0, 1.0)?;
+    let saved_scalar = in_range(section, stage, 4, 0.0, 1.0)?;
     let pre_gain_db = in_range(section, stage, 5, -120.0, 20.0)?;
     let auto_mute_db = in_range(section, stage, 6, -240.0, 0.0)?;
     match parameter(section, stage, 7)? {
@@ -107,7 +107,7 @@ pub fn compile(stage: &Stage, _fs: f64, _diags: &mut Diagnostics) -> Result<Opti
             format!("AutoMuteThreshold {auto_mute_db} dB can engage (carried curve lower bound {lower_bound} dB)"),
         ));
     }
-    Ok(Some(Params { pre_gain_db, curve_db, offset_db }))
+    Ok(Some(Params { saved_scalar, pre_gain_db, curve_db, offset_db }))
 }
 
 #[cfg(test)]
@@ -116,7 +116,7 @@ mod tests {
     use crate::aupreset::{ParamSection, ParamState, UnitId};
 
     fn stage() -> Stage {
-        let mut params = vec![(0, 0.0), (1, 0.0), (2, 1.0), (3, 1.0), (4, 1.0), (5, 0.0), (6, -99.0), (7, 0.0)];
+        let mut params = vec![(0, 0.0), (1, 0.0), (2, 1.0), (3, 1.0), (4, 0.375), (5, 0.0), (6, -99.0), (7, 0.0)];
         for i in 0..CURVE_POINTS {
             params.push((1024 + i as u32, -60.0 + 60.0 * i as f32 / 16.0));
         }
@@ -142,7 +142,7 @@ mod tests {
     #[test]
     fn compiles_complete_custom_state() {
         let p = compile(&stage(), 48_000.0, &mut Diagnostics::default()).unwrap().unwrap();
-        assert_eq!((p.curve_db[0], p.curve_db[16]), (-60.0, 0.0));
+        assert_eq!((p.saved_scalar, p.curve_db[0], p.curve_db[16]), (0.375, -60.0, 0.0));
         let mut mono = stage();
         mono.channels = Some(1);
         assert!(compile(&mono, 48_000.0, &mut Diagnostics::default()).unwrap().is_some());
