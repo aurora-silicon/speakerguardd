@@ -1967,7 +1967,8 @@ impl Run {
                 // residuals 5.2 (t-4713): upward lanes (primary above the
                 // applied gain); one second chain seeded from the predicted
                 // endpoint toward the complete primary request of upward
-                // lanes still 3 dB or more below it. The others take the
+                // lanes whose applied gain at the decision boundary is 3 dB
+                // or more below it. The others take the
                 // second (t-4772). An upward lane keeps the primary unless
                 // the second solve cut it below its own seed: then it takes
                 // the larger of the two (a lane the second solve leaves at
@@ -1977,7 +1978,7 @@ impl Run {
                     let guard = libm::pow(10.0, 3.0 / 20.0) as f32;
                     let seed: [f32; BANDS] = core::array::from_fn(|k| {
                         let end = c.band[k].end_after(p[k], ctl, if k == 0 { a_low } else { a_fast });
-                        if up[k] && guard * end <= p[k] {
+                        if up[k] && guard * c.band[k].g <= p[k] {
                             end
                         } else {
                             1.0
