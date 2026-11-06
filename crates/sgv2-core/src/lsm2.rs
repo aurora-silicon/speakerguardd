@@ -23,7 +23,7 @@
 //! SpeakerResponseLookAhead` (192) and `W = N + OD` (448):
 //!
 //! ```text
-//! x ─┬─ analysis bank (319 centred taps, delay FB) ─ a[k] ─┬─ delay OD ─ Σ g[k]·a[k] ─ y
+//! x ─┬─ real-DFT overlap-save bank (319 centred taps, delay FB) ─ a[k] ─┬─ delay OD ─ Σ g[k]·a[k] ─ y
 //!    │                                                     ├─ x/v models per band ─ frame peaks ─ candidates
 //!    │                                                     └─ Σ a[k] (before any gain) ─ u·i ─ power, temperature axes
 //!    ├─ velocity model ─ Hann window ─ DFT ─ pressure weighting ─ median bucket power ─ level ─ limit
@@ -45,8 +45,12 @@
 //! - **Filterbank** (rig law 10): the raised-cosine crossfade bank on the
 //!   design grid of `M = 2 FB` points, each centre snapped to a bin, the
 //!   `M/2` tap dropped (319 taps), generated in f64 and rounded once to f32.
-//!   Band 4 is the delayed input minus the other four, so the bank sums to
-//!   the delay exactly and unity gains give the input back bit for bit.
+//!   The taps are transformed once and applied by a packed Float32 real-DFT
+//!   overlap-save convolution. At 48 kHz this is a 640-point transform with
+//!   384 retained and 256 new samples; output 0..255 is the valid region.
+//!   Band 4 is the delayed input minus the other four in Float32 order, so
+//!   the bank sums to the delay exactly and unity gains give the input back
+//!   bit for bit.
 //! - **Window** (25G83 rig, exact on the frame logs): frame `j` evaluates
 //!   the bank-stage stream over the `W = 448` frames that end with the
 //!   frame, i.e. the output region of the frame (`N` frames) plus the `OD`
@@ -983,6 +987,367 @@ pub fn filterbank(rate: f64, centers: &[f32; BANDS], bandwidth: u32, stage: usiz
     })
 }
 
+#[derive(Clone, Copy, Default)]
+struct Complex32 {
+    re: f32,
+    im: f32,
+}
+
+impl Complex32 {
+    #[inline]
+    fn add(self, rhs: Self) -> Self {
+        Self { re: self.re + rhs.re, im: self.im + rhs.im }
+    }
+
+    #[inline]
+    fn sub(self, rhs: Self) -> Self {
+        Self { re: self.re - rhs.re, im: self.im - rhs.im }
+    }
+
+    #[inline]
+    fn mul(self, rhs: Self) -> Self {
+        Self { re: self.re.mul_add(rhs.re, -(self.im * rhs.im)), im: self.re.mul_add(rhs.im, self.im * rhs.re) }
+    }
+
+    #[inline]
+    fn mul_separate(self, rhs: Self) -> Self {
+        Self { re: self.re * rhs.re - self.im * rhs.im, im: self.re * rhs.im + self.im * rhs.re }
+    }
+
+    #[inline]
+    fn conj(self) -> Self {
+        Self { re: self.re, im: -self.im }
+    }
+
+    #[inline]
+    fn scale(self, scale: f32) -> Self {
+        Self { re: self.re * scale, im: self.im * scale }
+    }
+}
+
+/// Portable mixed-radix plan for the native real transform's packed complex
+/// half. The factor order is the one used by the 640-point vDSP real DFT:
+/// radix five outside radix-four stages (and a final radix two at doubled
+/// rate families). Twiddles are derived from the transform length.
+struct MixedRadixPlan {
+    n: usize,
+    stages: Vec<(usize, usize)>,
+    permutation: Vec<usize>,
+    twiddles: Vec<Vec<Complex32>>,
+    radix3_sine: f32,
+    radix5_roots: [f32; 4],
+}
+
+impl MixedRadixPlan {
+    fn new(n: usize) -> Self {
+        let mut left = n;
+        let mut outer = Vec::new();
+        if left % 3 == 0 {
+            outer.push(3);
+            left /= 3;
+        }
+        if left % 5 == 0 {
+            outer.push(5);
+            left /= 5;
+        }
+        while left % 4 == 0 {
+            outer.push(4);
+            left /= 4;
+        }
+        if left == 2 {
+            outer.push(2);
+            left = 1;
+        }
+        assert_eq!(left, 1, "unsupported filterbank DFT length");
+
+        let mut permutation = Vec::with_capacity(n);
+        fn leaves(factors: &[usize], stride: usize, base: usize, out: &mut Vec<usize>) {
+            if let Some((&radix, rest)) = factors.split_first() {
+                for q in 0..radix {
+                    leaves(rest, stride * radix, base + q * stride, out);
+                }
+            } else {
+                out.push(base);
+            }
+        }
+        leaves(&outer, 1, 0, &mut permutation);
+
+        let mut span = 1;
+        let mut stages = Vec::with_capacity(outer.len());
+        let mut twiddles = Vec::with_capacity(outer.len());
+        for &radix in outer.iter().rev() {
+            let prior = span;
+            span *= radix;
+            stages.push((radix, prior));
+            let mut stage = Vec::with_capacity(radix * prior);
+            for q in 0..radix {
+                for k in 0..prior {
+                    let angle = -2.0 * core::f64::consts::PI * (q * k) as f64 / span as f64;
+                    stage.push(Complex32 { re: libm::cos(angle) as f32, im: libm::sin(angle) as f32 });
+                }
+            }
+            twiddles.push(stage);
+        }
+        let angle5 = 2.0 * core::f64::consts::PI / 5.0;
+        Self {
+            n,
+            stages,
+            permutation,
+            twiddles,
+            radix3_sine: libm::sin(2.0 * core::f64::consts::PI / 3.0) as f32,
+            radix5_roots: [
+                libm::cos(angle5) as f32,
+                libm::cos(2.0 * angle5) as f32,
+                libm::sin(angle5) as f32,
+                libm::sin(2.0 * angle5) as f32,
+            ],
+        }
+    }
+
+    fn transform(&self, input: &[Complex32], output: &mut [Complex32], inverse: bool) {
+        debug_assert_eq!(input.len(), self.n);
+        debug_assert_eq!(output.len(), self.n);
+        for (dst, &src) in output.iter_mut().zip(&self.permutation) {
+            *dst = input[src];
+        }
+        let mut span = 1;
+        for (si, &(radix, prior)) in self.stages.iter().enumerate() {
+            span *= radix;
+            for base in (0..self.n).step_by(span) {
+                for k in 0..prior {
+                    let mut a = [Complex32::default(); 5];
+                    for q in 0..radix {
+                        let mut w = self.twiddles[si][q * prior + k];
+                        if inverse {
+                            w.im = -w.im;
+                        }
+                        a[q] = output[base + q * prior + k].mul(w);
+                    }
+                    let y = match radix {
+                        2 => radix2(a),
+                        3 => radix3(a, inverse, self.radix3_sine),
+                        4 => radix4(a, inverse),
+                        5 => radix5(a, inverse, self.radix5_roots),
+                        _ => unreachable!(),
+                    };
+                    for q in 0..radix {
+                        output[base + q * prior + k] = y[q];
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[inline]
+fn radix2(a: [Complex32; 5]) -> [Complex32; 5] {
+    let mut y = [Complex32::default(); 5];
+    y[0] = a[0].add(a[1]);
+    y[1] = a[0].sub(a[1]);
+    y
+}
+
+#[inline]
+fn radix3(a: [Complex32; 5], inverse: bool, mut sine: f32) -> [Complex32; 5] {
+    let mut y = [Complex32::default(); 5];
+    let sum = a[1].add(a[2]);
+    let diff = a[1].sub(a[2]);
+    let half = sum.scale(-0.5);
+    if !inverse {
+        sine = -sine;
+    }
+    let rot = Complex32 { re: -sine * diff.im, im: sine * diff.re };
+    y[0] = a[0].add(sum);
+    y[1] = a[0].add(half).add(rot);
+    y[2] = a[0].add(half).sub(rot);
+    y
+}
+
+#[inline]
+fn radix4(a: [Complex32; 5], inverse: bool) -> [Complex32; 5] {
+    let mut y = [Complex32::default(); 5];
+    let even_sum = a[0].add(a[2]);
+    let even_diff = a[0].sub(a[2]);
+    let odd_sum = a[1].add(a[3]);
+    let odd_diff = a[1].sub(a[3]);
+    y[0] = even_sum.add(odd_sum);
+    y[2] = even_sum.sub(odd_sum);
+    if inverse {
+        y[1] = Complex32 { re: even_diff.re - odd_diff.im, im: even_diff.im + odd_diff.re };
+        y[3] = Complex32 { re: even_diff.re + odd_diff.im, im: even_diff.im - odd_diff.re };
+    } else {
+        y[1] = Complex32 { re: even_diff.re + odd_diff.im, im: even_diff.im - odd_diff.re };
+        y[3] = Complex32 { re: even_diff.re - odd_diff.im, im: even_diff.im + odd_diff.re };
+    }
+    y
+}
+
+#[inline]
+fn radix5(a: [Complex32; 5], inverse: bool, roots: [f32; 4]) -> [Complex32; 5] {
+    let [c1, c2, mut s1, mut s2] = roots;
+    if !inverse {
+        s1 = -s1;
+        s2 = -s2;
+    }
+    let s14 = a[1].add(a[4]);
+    let s23 = a[2].add(a[3]);
+    let d14 = a[1].sub(a[4]);
+    let d23 = a[2].sub(a[3]);
+    let b1 = Complex32 {
+        re: s23.re.mul_add(c2, s14.re.mul_add(c1, a[0].re)),
+        im: s23.im.mul_add(c2, s14.im.mul_add(c1, a[0].im)),
+    };
+    let b2 = Complex32 {
+        re: s23.re.mul_add(c1, s14.re.mul_add(c2, a[0].re)),
+        im: s23.im.mul_add(c1, s14.im.mul_add(c2, a[0].im)),
+    };
+    let r1 = Complex32 { re: d23.im.mul_add(-s2, d14.im * -s1), im: d23.re.mul_add(s2, d14.re * s1) };
+    let r2 = Complex32 { re: d23.im.mul_add(s1, d14.im * -s2), im: d23.re.mul_add(-s1, d14.re * s2) };
+    let mut y = [Complex32::default(); 5];
+    y[0] = a[0].add(s14).add(s23);
+    y[1] = b1.add(r1);
+    y[4] = b1.sub(r1);
+    y[2] = b2.add(r2);
+    y[3] = b2.sub(r2);
+    y
+}
+
+/// The native bank is a real, 4x-stage overlap-save convolution. A 160-frame
+/// stage therefore uses a 640-point transform and retains 384 old samples
+/// before each 256-frame controller hop. Four bands are transformed; the
+/// fifth is the delayed full band minus those four, in Float32 order.
+struct DftFilterbank {
+    n: usize,
+    hop: usize,
+    stage: usize,
+    plan: MixedRadixPlan,
+    real_twiddles: Vec<Complex32>,
+    input: Vec<f32>,
+    filters: [Vec<Complex32>; BANDS - 1],
+    packed: Vec<Complex32>,
+    product: Vec<Complex32>,
+    complex: Vec<Complex32>,
+    work: Vec<Complex32>,
+}
+
+impl DftFilterbank {
+    fn new(filters: &[Vec<f32>; BANDS], stage: usize, hop: usize) -> Self {
+        let needed = hop + 2 * stage - 1;
+        let n = [1usize, 3, 5, 15]
+            .into_iter()
+            .map(|odd| odd * needed.div_ceil(odd).next_power_of_two())
+            .filter(|&size| size % 2 == 0)
+            .min()
+            .expect("a real DFT length");
+        let half = n / 2;
+        let plan = MixedRadixPlan::new(half);
+        let real_twiddles: Vec<Complex32> = (0..half)
+            .map(|k| {
+                let angle = -core::f64::consts::PI * k as f64 / half as f64;
+                Complex32 { re: libm::cos(angle) as f32, im: libm::sin(angle) as f32 }
+            })
+            .collect();
+        let mut complex = vec![Complex32::default(); half];
+        let mut work = vec![Complex32::default(); half];
+        let mut packed = vec![Complex32::default(); half];
+        let mut spectra: [Vec<Complex32>; BANDS - 1] = core::array::from_fn(|_| vec![Complex32::default(); half]);
+        for k in 0..BANDS - 1 {
+            let mut time = vec![0.0f32; n];
+            let offset = hop + 1;
+            time[offset..offset + filters[k].len()].copy_from_slice(&filters[k]);
+            for j in 0..half {
+                complex[j] = Complex32 { re: time[2 * j], im: time[2 * j + 1] };
+            }
+            plan.transform(&complex, &mut work, false);
+            real_forward_finish(&work, &mut packed, &real_twiddles);
+            let scale = 0.25f32 / n as f32;
+            for (dst, &v) in spectra[k].iter_mut().zip(&packed) {
+                *dst = v.scale(scale);
+            }
+        }
+        Self {
+            n,
+            hop,
+            stage,
+            plan,
+            real_twiddles,
+            input: vec![0.0; n],
+            filters: spectra,
+            packed: vec![Complex32::default(); half],
+            product: vec![Complex32::default(); half],
+            complex,
+            work,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.input.fill(0.0);
+    }
+
+    fn process(&mut self, input: &[f32], bands: &mut [Vec<f32>; BANDS], offset: usize, full: &mut [f32]) {
+        debug_assert_eq!(input.len(), self.hop);
+        self.input.copy_within(self.hop.., 0);
+        self.input[self.n - self.hop..].copy_from_slice(input);
+        for j in 0..self.n / 2 {
+            self.complex[j] = Complex32 { re: self.input[2 * j], im: self.input[2 * j + 1] };
+        }
+        self.plan.transform(&self.complex, &mut self.work, false);
+        real_forward_finish(&self.work, &mut self.packed, &self.real_twiddles);
+
+        for k in 0..BANDS - 1 {
+            self.product[0] = Complex32 {
+                re: self.packed[0].re * self.filters[k][0].re,
+                im: self.packed[0].im * self.filters[k][0].im,
+            };
+            for j in 1..self.n / 2 {
+                self.product[j] = self.packed[j].mul(self.filters[k][j]);
+            }
+            real_inverse_start(&self.product, &mut self.complex, &self.real_twiddles);
+            self.plan.transform(&self.complex, &mut self.work, true);
+            for i in 0..self.hop {
+                bands[k][offset + i] = if i & 1 == 0 { self.work[i / 2].re } else { self.work[i / 2].im };
+            }
+        }
+
+        let delayed = self.n - self.hop - self.stage;
+        for i in 0..self.hop {
+            let x = self.input[delayed + i];
+            full[offset + i] = x;
+            let mut rest = x;
+            for band in bands.iter().take(BANDS - 1) {
+                rest -= band[offset + i];
+            }
+            bands[BANDS - 1][offset + i] = rest;
+        }
+    }
+}
+
+fn real_forward_finish(z: &[Complex32], packed: &mut [Complex32], twiddles: &[Complex32]) {
+    let m = z.len();
+    packed[0] = Complex32 { re: 2.0 * (z[0].re + z[0].im), im: 2.0 * (z[0].re - z[0].im) };
+    for k in 1..m {
+        let a = z[k];
+        let b = z[m - k].conj();
+        let sum = a.add(b);
+        let diff = a.sub(b);
+        let t = twiddles[k].mul_separate(diff);
+        packed[k] = Complex32 { re: sum.re + t.im, im: sum.im - t.re };
+    }
+}
+
+fn real_inverse_start(packed: &[Complex32], z: &mut [Complex32], twiddles: &[Complex32]) {
+    let m = packed.len();
+    z[0] = Complex32 { re: packed[0].re + packed[0].im, im: packed[0].re - packed[0].im };
+    for k in 1..m {
+        let a = packed[k];
+        let b = packed[m - k].conj();
+        let sum = a.add(b);
+        let diff = a.sub(b);
+        let t = twiddles[k].conj().mul_separate(diff);
+        z[k] = Complex32 { re: sum.re - t.im, im: sum.im + t.re };
+    }
+}
+
 /// Direct-form-I biquad in f64 (the motion states are small and stiff).
 #[derive(Clone, Copy, Default)]
 struct Biquad {
@@ -1258,10 +1623,8 @@ const CEIL_FRAMES: usize = 16;
 struct Chan {
     src: usize,
     vfs: f32,
-    /// Input history: the bank's 2 FB - 1 previous samples, then the frame.
-    xb: Vec<f32>,
-    /// Centred bank taps, bands 0..3 (symmetric, so in dot-product order).
-    bank: [Vec<f32>; BANDS - 1],
+    /// Native 4x-stage real-DFT overlap-save bank.
+    bank: DftFilterbank,
     /// Bank-stage bands: the OD frames before the frame, then the frame.
     ab: [Vec<f32>; BANDS],
     /// The ordinary sample-peak allocator's one-sample-earlier realization
@@ -1600,7 +1963,7 @@ impl Run {
         let mut ch = Vec::with_capacity(n);
         for c in &p.ch[..n] {
             let h = filterbank(rate, &c.band_center_hz, c.bandwidth, fb);
-            let bank: [Vec<f32>; BANDS - 1] = core::array::from_fn(|k| h[k].clone());
+            let bank = DftFilterbank::new(&h, fb, ctl);
             let taps = c.pressure_taps as usize;
             let mwin = (ctl + p.latency_frames()).min(laws::MASK_MAX_POINTS);
             // no extracted lattice (or no pressure response): no masking
@@ -1629,7 +1992,6 @@ impl Run {
             ch.push(Chan {
                 src: c.source as usize,
                 vfs: c.volts_full_scale,
-                xb: vec![0.0; 2 * fb - 1 + ctl],
                 bank,
                 ab: core::array::from_fn(|_| vec![0.0; od + ctl]),
                 peak_ab: core::array::from_fn(|_| vec![0.0; od + ctl]),
@@ -1761,7 +2123,7 @@ impl Run {
     fn reset(&mut self) {
         let ctl = self.ctl;
         for c in self.ch.iter_mut() {
-            c.xb.iter_mut().for_each(|v| *v = 0.0);
+            c.bank.clear();
             c.ab.iter_mut().for_each(|b| b.iter_mut().for_each(|v| *v = 0.0));
             c.peak_ab.iter_mut().for_each(|b| b.iter_mut().for_each(|v| *v = 0.0));
             c.peak_previous = [0.0; BANDS];
@@ -1832,32 +2194,20 @@ impl Run {
     /// Analysis of one channel's frame: the bank stage, the motion models,
     /// the per-substep peaks and the mask energy.
     fn analyse(&mut self, ci: usize) {
-        let (ctl, sub, fb, od, ring_len) = (self.ctl, self.sub, self.fb, self.od, self.ring_len);
+        let (ctl, sub, od, ring_len) = (self.ctl, self.sub, self.od, self.ring_len);
         let mut slot = self.ring;
         let c = &mut self.ch[ci];
         let xin = &self.xin[ci];
-        let hist = 2 * fb - 1;
         if c.masker.is_some() {
             c.vwin.copy_within(ctl.., 0);
         }
-        c.xb[hist..hist + ctl].copy_from_slice(&xin[..ctl]);
+        c.bank.process(&xin[..ctl], &mut c.ab, od, &mut c.xc);
         let vfs = c.vfs as f64;
         let (mut px, mut pd, mut pv) = (0.0f32, 0.0f32, 0.0f32);
         let mut pvb = [0.0f32; BANDS];
         for i in 0..ctl {
-            let w = &c.xb[i..i + hist];
-            let xc = w[fb - 1];
-            let mut rest = xc;
-            let mut a = [0.0f32; BANDS];
-            for k in 0..BANDS - 1 {
-                a[k] = fir_reversed(&c.bank[k], w);
-                rest -= a[k];
-            }
-            a[BANDS - 1] = rest;
-            for k in 0..BANDS {
-                c.ab[k][od + i] = a[k];
-            }
-            c.xc[od + i] = xc;
+            let xc = c.xc[od + i];
+            let a: [f32; BANDS] = core::array::from_fn(|k| c.ab[k][od + i]);
             let u = vfs * xc as f64;
             let d = c.disp.step(u);
             let v = c.vel.step(u);
@@ -1903,8 +2253,6 @@ impl Run {
         for k in 0..BANDS {
             realize_peak_window(&mut c.peak_ab[k], c.peak_previous[k], &c.ab[k]);
         }
-        // keep the bank's history
-        c.xb.copy_within(ctl..ctl + hist, 0);
     }
 
     /// One controller frame: every channel's input in `xin`, its output to
@@ -2607,6 +2955,30 @@ mod fault_tests {
         let mut peak = [0.0; 4];
         realize_peak_window(&mut peak, 9.0, &bank);
         assert_eq!(peak, [9.0, 10.0, 11.0, 12.0]);
+    }
+
+    #[test]
+    fn dft_overlap_save_keeps_the_centered_filter_response() {
+        let stage = 160;
+        let hop = 256;
+        let centers = [62.23778, 292.82724, 649.9541, 1634.0066, 4953.1763];
+        let filters = filterbank(48_000.0, &centers, 0, stage);
+        let mut bank = DftFilterbank::new(&filters, stage, hop);
+        assert_eq!(bank.n, 640);
+        let mut input = vec![0.0; hop];
+        input[0] = 1.0;
+        let mut bands: [Vec<f32>; BANDS] = core::array::from_fn(|_| vec![0.0; hop]);
+        let mut full = vec![0.0; hop];
+        bank.process(&input, &mut bands, 0, &mut full);
+
+        for k in 0..BANDS - 1 {
+            assert!(bands[k][0].abs() < 2e-6, "band {k} leading sample {}", bands[k][0]);
+            for i in 1..hop {
+                assert!((bands[k][i] - filters[k][i - 1]).abs() < 2e-5, "band {k} sample {i}");
+            }
+        }
+        assert_eq!(full[stage], 1.0);
+        assert!(full.iter().enumerate().all(|(i, &v)| i == stage || v == 0.0));
     }
 
     fn params() -> Params {
