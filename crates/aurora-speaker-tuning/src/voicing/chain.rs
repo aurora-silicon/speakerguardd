@@ -149,6 +149,24 @@ fn compile_node(
                 Ok(None) => Kind::Bypass,
                 Err(e) => uncarried(n, subtype, e, gaps),
             },
+            // the taper's slider follows the system volume only where the
+            // graph wires `mvsc` to the box; otherwise it would sit at full
+            // volume, not at its saved value
+            "volt" => match super::volt::compile(stage, fs, diags) {
+                Ok(Some(p)) => {
+                    if !volume_wired {
+                        gaps.push((n.name.clone(), "volt slider not wired to the system volume".into()));
+                    }
+                    Kind::Volt(Box::new(p))
+                }
+                Ok(None) => Kind::Bypass,
+                Err(e) => uncarried(n, subtype, e, gaps),
+            },
+            "pchr" => match super::pchr::compile(stage, fs, diags) {
+                Ok(Some(p)) => Kind::Pchr(Box::new(p)),
+                Ok(None) => Kind::Bypass,
+                Err(e) => uncarried(n, subtype, e, gaps),
+            },
             other => {
                 let b = other.as_bytes();
                 if b.len() != 4 {

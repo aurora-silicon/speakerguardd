@@ -147,6 +147,11 @@ pub enum Kind {
     Lowflow(alloc::boxed::Box<super::lowflow::Params>),
     /// Virtual bass (`vben`).
     Vbass(alloc::boxed::Box<super::vbass::Params>),
+    /// Volume taper (`volt`), custom-curve non-ramping subset; its slider
+    /// (parameter 4) follows the system-volume scalar.
+    Volt(alloc::boxed::Box<super::volt::Params>),
+    /// Channel matrix (`pchr`).
+    Pchr(alloc::boxed::Box<super::pchr::Params>),
     /// The box's four-character subtype.
     Stub([u8; 4]),
     Bypass,
@@ -371,6 +376,8 @@ enum Run {
     Cdelay(alloc::boxed::Box<super::cdelay::Run>),
     Lowflow(alloc::boxed::Box<super::lowflow::Run>),
     Vbass(alloc::boxed::Box<super::vbass::Run>),
+    Volt(alloc::boxed::Box<super::volt::Run>),
+    Pchr(alloc::boxed::Box<super::pchr::Run>),
     Through,
 }
 
@@ -402,6 +409,8 @@ impl Run {
             Kind::Cdelay(p) => Run::Cdelay(alloc::boxed::Box::new(super::cdelay::Run::new(p, fs, width))),
             Kind::Lowflow(p) => Run::Lowflow(alloc::boxed::Box::new(super::lowflow::Run::new(p, fs, width))),
             Kind::Vbass(p) => Run::Vbass(alloc::boxed::Box::new(super::vbass::Run::new(p, fs, width))),
+            Kind::Volt(p) => Run::Volt(alloc::boxed::Box::new(super::volt::Run::new(p, fs, width))),
+            Kind::Pchr(p) => Run::Pchr(alloc::boxed::Box::new(super::pchr::Run::new(p, fs, width))),
             Kind::Stub(_) | Kind::Bypass => Run::Through,
         }
     }
@@ -420,6 +429,8 @@ impl Run {
             Run::Filters { stage, base, automation, fs } if id == 3 && v.is_finite() => {
                 apply_tone_automation(stage, base, automation, *fs, v);
             }
+            // the volume taper's slider; a non-finite value is its quiet end
+            Run::Volt(r) if id == 4 => r.set_volume(v),
             _ => {}
         }
     }
@@ -434,6 +445,8 @@ impl Run {
             Run::Buzz(r) => r.reset(),
             Run::Cdelay(r) => r.reset(),
             Run::Lowflow(r) => r.reset(),
+            Run::Volt(r) => r.reset(),
+            Run::Pchr(r) => r.reset(),
             _ => {}
         }
     }
@@ -476,7 +489,9 @@ impl Run {
             | Run::Buzz(_)
             | Run::Cdelay(_)
             | Run::Lowflow(_)
-            | Run::Vbass(_) => {
+            | Run::Vbass(_)
+            | Run::Volt(_)
+            | Run::Pchr(_) => {
                 for (i, o) in x.iter().zip(y.iter_mut()) {
                     o[..frames].copy_from_slice(&i[..frames]);
                 }
@@ -492,6 +507,8 @@ impl Run {
                     Run::Cdelay(r) => r.process(refs, frames),
                     Run::Lowflow(r) => r.process(refs, frames),
                     Run::Vbass(r) => r.process(refs, frames),
+                    Run::Volt(r) => r.process(refs, frames),
+                    Run::Pchr(r) => r.process(refs, frames),
                     _ => {}
                 }
             }

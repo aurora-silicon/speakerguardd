@@ -43,6 +43,8 @@ pub mod cfreak;
 pub mod chain;
 pub mod lowflow;
 pub mod mstk;
+pub mod pchr;
 pub mod vbass;
+pub mod volt;
 pub mod volume;
 pub mod xtc;
