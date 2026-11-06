@@ -121,6 +121,11 @@ fn compile_node(
                 Ok(None) => Kind::Bypass,
                 Err(e) => uncarried(n, subtype, e, gaps),
             },
+            "axtc" => match super::xtc::compile(stage, fs, diags) {
+                Ok(Some(p)) => Kind::Xtc(Box::new(p)),
+                Ok(None) => Kind::Bypass,
+                Err(e) => uncarried(n, subtype, e, gaps),
+            },
             other => {
                 let b = other.as_bytes();
                 if b.len() != 4 {
