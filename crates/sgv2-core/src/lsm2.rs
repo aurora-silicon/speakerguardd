@@ -1300,7 +1300,7 @@ struct Chan {
     protected_peak_now: f32,
     protected_peak_advanced: bool,
     input_centroid_previous: f32,
-    protected_peak_previous: f32,
+    protected_trial_previous: f32,
     /// Per-substep peaks over the window (ring of RING slots).
     pk_x: [f32; RING],
     pk_d: [f32; RING],
@@ -1657,7 +1657,7 @@ impl Run {
                 protected_peak_now: 0.0,
                 protected_peak_advanced: false,
                 input_centroid_previous: 0.0,
-                protected_peak_previous: 0.0,
+                protected_trial_previous: 0.0,
                 rd: vec![0.0; od + ctl],
                 vcar: vec![0.0; od + ctl],
                 pk_x: [0.0; RING],
@@ -1808,7 +1808,7 @@ impl Run {
             c.protected_peak_now = 0.0;
             c.protected_peak_advanced = false;
             c.input_centroid_previous = 0.0;
-            c.protected_peak_previous = 0.0;
+            c.protected_trial_previous = 0.0;
             c.vcar.iter_mut().chain(c.rd.iter_mut()).for_each(|v| *v = 0.0);
             c.eg.iter_mut().for_each(|e| e.iter_mut().for_each(|v| *v = 1.0));
             c.cur_in.clear();
@@ -2032,11 +2032,6 @@ impl Run {
             let vlim_g = c.vel_limit_now as f32;
             let stream_ready = c.protected_peak.ready();
             c.protected_peak_advanced = false;
-            let stream_rising = c.protected_peak_now > c.protected_peak_previous;
-            let ramp_source = complete_host_frame && centroid > c.input_centroid_previous && stream_rising;
-            let ramp_entry = complete_host_frame && stream_rising && c.protected_peak_now < vlim_g;
-            c.input_centroid_previous = centroid;
-            c.protected_peak_previous = c.protected_peak_now;
             let prior_bound = c.vel_bound_window.last().copied().unwrap_or(0.0);
             let next_bound = if c.vel_bound_release && c.vel_bound_ready {
                 (prior_bound as f64 + velocity_release * (c.vel_limit_now - prior_bound as f64)) as f32
@@ -2055,32 +2050,42 @@ impl Run {
             // filterbank latency, zeros after; the model itself advances on
             // the protected output, below
             c.vcar_m.carry(&mut c.vcar, fbl);
+            let all = (0, BANDS);
+            let mut producer_r = [1.0; BANDS];
+            if disp_on {
+                let room = 0.25 * (c.disp_limit as f32 - c.disp_bound_new).max(0.0);
+                producer_r = velocity_band_gains_window(
+                    &c.db,
+                    &c.rd,
+                    0,
+                    c.disp_bound_old,
+                    c.disp_bound_new,
+                    od,
+                    room,
+                    sg,
+                    all,
+                    producer_r,
+                );
+            }
+            let protected_trial = (od..od + ctl).fold(0.0f32, |peak, i| {
+                let y = (0..BANDS).fold(c.vcar[i], |y, k| y + (producer_r[k] * sg) * c.vb[k][i]);
+                peak.max(y.abs())
+            });
+            let streaming_ramp = complete_host_frame
+                && centroid > c.input_centroid_previous
+                && protected_trial > c.protected_trial_previous
+                && protected_trial < vlim_g;
+            c.input_centroid_previous = centroid;
+            c.protected_trial_previous = protected_trial;
             // Native arbitrates each newly admitted segment while shifted
             // samples keep their source. The greater of the streaming
             // protected envelope and the decision-local protected trial owns
             // the segment. This compares existing producer states, not signal
             // levels, spectra, case identities, or fitted thresholds.
             if vel_on && complete_host_frame && stream_ready && !c.vel_bound_release {
-                let all = (0, BANDS);
-                let mut producer_r = [1.0; BANDS];
-                if disp_on {
-                    let room = 0.25 * (c.disp_limit as f32 - c.disp_bound_new).max(0.0);
-                    producer_r = velocity_band_gains_window(
-                        &c.db,
-                        &c.rd,
-                        0,
-                        c.disp_bound_old,
-                        c.disp_bound_new,
-                        od,
-                        room,
-                        sg,
-                        all,
-                        producer_r,
-                    );
-                }
                 let ordinary_onset = velocity_band_gains(&c.vb, &c.vcar, vfirst, vlim_g, sg, all, producer_r);
                 let onset_admitted = (c.vel_active.0..c.vel_active.1).any(|k| ordinary_onset[k] < producer_r[k]);
-                if !ramp_source || onset_admitted {
+                if !streaming_ramp || onset_admitted {
                     let mut offset = 0;
                     let mut boundary = c.vel_bound_window[od - 1];
                     for &len in fragments {
@@ -2156,7 +2161,7 @@ impl Run {
                     } else {
                         ordinary
                     };
-                    if !c.vel_episode && (ordinary_cut || ramp_entry) && stream_ready {
+                    if !c.vel_episode && (ordinary_cut || streaming_ramp) && stream_ready {
                         retained_episode.set(true);
                     }
                     let q = if retained_episode.get() { retained } else { ordinary };
