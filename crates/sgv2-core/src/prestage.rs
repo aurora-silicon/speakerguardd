@@ -44,6 +44,16 @@
 //! included, as macOS applies it. Its detector is stricter than macOS's
 //! (instant attack, the band's peak power, a hard knee at or below macOS's
 //! soft one at high level): it never reduces less at full scale.
+//!
+//! With [`FLAG_MID_SIDE`], a mid/side block follows (after the dynamics
+//! block, when there is one): a pair of two-channel matrix boxes around a
+//! filter box, as a graph that equalizes mid and side apart sets them.
+//! Layout: the matrix into the mid/side domain
+//! (4 f64, row-major), the matrix back (4 f64), then the mid and the side
+//! channel as in the body above. It runs on channels 0 and 1 after the
+//! dynamics: `out = from * diag(mid, side) * to * in`. Each output's worst
+//! case over in-phase inputs (the sum of its row's magnitudes) stays at or
+//! under unity at every frequency, so the block never adds drive either.
 
 use crate::blob::{crc32, BlobError};
 use crate::MAX_CHANNELS;
@@ -58,6 +68,8 @@ pub const MAX_SECTIONS: usize = 64;
 pub const FLAG_FROM_TUNING: u32 = 1 << 0;
 /// `flags` bit: a [`Dynamics`] block follows the channels.
 pub const FLAG_DYNAMICS: u32 = 1 << 1;
+/// `flags` bit: a [`MidSide`] block follows (after the dynamics block).
+pub const FLAG_MID_SIDE: u32 = 1 << 2;
 /// Bands of the multiband dynamics.
 pub const BANDS: usize = 4;
 const DYN_WORDS: usize = 6 + 5 * BANDS;
@@ -178,6 +190,17 @@ impl Section {
         self.finite() && self.a2.abs() < 1.0 && self.a1.abs() < 1.0 + self.a2
     }
 
+    /// `H` at `f` Hz for sample rate `fs`, as (re, im).
+    pub fn response(&self, f: f64, fs: f64) -> (f64, f64) {
+        let w = 2.0 * core::f64::consts::PI * f / fs;
+        let (c1, s1) = (libm::cos(w), -libm::sin(w));
+        let (c2, s2) = (libm::cos(2.0 * w), -libm::sin(2.0 * w));
+        let (nr, ni) = (self.b0 + self.b1 * c1 + self.b2 * c2, self.b1 * s1 + self.b2 * s2);
+        let (dr, di) = (1.0 + self.a1 * c1 + self.a2 * c2, self.a1 * s1 + self.a2 * s2);
+        let d = dr * dr + di * di;
+        ((nr * dr + ni * di) / d, (ni * dr - nr * di) / d)
+    }
+
     /// `|H|` at `f` Hz for sample rate `fs`.
     pub fn magnitude(&self, f: f64, fs: f64) -> f64 {
         let w = 2.0 * core::f64::consts::PI * f / fs;
@@ -211,6 +234,14 @@ impl Channel {
         self.sections().iter().fold(self.gain.abs(), |m, s| m * s.magnitude(f, fs))
     }
 
+    /// `H` of the whole channel at `f` Hz, as (re, im).
+    pub fn response(&self, f: f64, fs: f64) -> (f64, f64) {
+        self.sections().iter().fold((self.gain, 0.0), |(ar, ai), s| {
+            let (br, bi) = s.response(f, fs);
+            (ar * br - ai * bi, ar * bi + ai * br)
+        })
+    }
+
     /// The largest `|H|` on [`check_grid`] for `fs`.
     pub fn peak(&self, fs: f64) -> f64 {
         let mut peak = 0.0f64;
@@ -231,6 +262,52 @@ pub fn check_grid(fs: f64, mut visit: impl FnMut(f64)) {
     visit(0.5 * fs);
 }
 
+/// A mid/side section: `out = from * diag(mid, side) * to * in` on
+/// channels 0 and 1, matrices row-major.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MidSide {
+    pub to: [f64; 4],
+    pub from: [f64; 4],
+    pub mid: Channel,
+    pub side: Channel,
+}
+
+impl MidSide {
+    /// The block's two outputs at `f` Hz: for each, the sum of the
+    /// magnitudes of its row of `from * diag(mid, side) * to` (the largest
+    /// output any pair of inputs with magnitude 1 can make).
+    pub fn row_gain(&self, f: f64, fs: f64) -> [f64; 2] {
+        let (m, s) = (self.mid.response(f, fs), self.side.response(f, fs));
+        let (t, b) = (self.to, self.from);
+        let mut out = [0.0; 2];
+        for (r, o) in out.iter_mut().enumerate() {
+            for c in 0..2 {
+                // from[r][0] * mid * to[0][c] + from[r][1] * side * to[1][c]
+                let (km, ks) = (b[2 * r] * t[c], b[2 * r + 1] * t[2 + c]);
+                let (re, im) = (km * m.0 + ks * s.0, km * m.1 + ks * s.1);
+                *o += libm::sqrt(re * re + im * im);
+            }
+        }
+        out
+    }
+
+    /// The larger output's worst case on [`check_grid`].
+    pub fn peak(&self, fs: f64) -> f64 {
+        let mut peak = 0.0f64;
+        check_grid(fs, |f| {
+            let [a, b] = self.row_gain(f, fs);
+            peak = peak.max(a).max(b);
+        });
+        peak
+    }
+
+    fn valid(&self, fs: f64) -> bool {
+        self.to.iter().chain(self.from.iter()).all(|v| v.is_finite())
+            && [&self.mid, &self.side].iter().all(|c| c.gain.is_finite() && c.sections().iter().all(|s| s.stable()))
+            && self.peak(fs) <= UNITY_TOLERANCE
+    }
+}
+
 /// A decoded pre-stage section of a blob.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Params {
@@ -239,6 +316,8 @@ pub struct Params {
     pub channel: [Channel; MAX_CHANNELS],
     /// Present exactly when `flags` has [`FLAG_DYNAMICS`].
     pub dynamics: Option<Dynamics>,
+    /// Present exactly when `flags` has [`FLAG_MID_SIDE`].
+    pub mid_side: Option<MidSide>,
 }
 
 impl Params {
@@ -249,6 +328,7 @@ impl Params {
             flags: 0,
             channel: [Channel::IDENTITY; MAX_CHANNELS],
             dynamics: None,
+            mid_side: None,
         }
     }
 
@@ -260,7 +340,7 @@ impl Params {
     #[cfg(any(test, feature = "std"))]
     pub fn encode(&self) -> std::vec::Vec<u8> {
         let mut body = std::vec::Vec::new();
-        for ch in &self.channel[..self.channels] {
+        let put = |body: &mut std::vec::Vec<u8>, ch: &Channel| {
             body.extend_from_slice(&(ch.count as u32).to_le_bytes());
             body.extend_from_slice(&0u32.to_le_bytes());
             body.extend_from_slice(&ch.gain.to_le_bytes());
@@ -269,13 +349,24 @@ impl Params {
                     body.extend_from_slice(&v.to_le_bytes());
                 }
             }
+        };
+        for ch in &self.channel[..self.channels] {
+            put(&mut body, ch);
         }
-        let mut flags = self.flags & !FLAG_DYNAMICS;
+        let mut flags = self.flags & !(FLAG_DYNAMICS | FLAG_MID_SIDE);
         if let Some(d) = &self.dynamics {
             flags |= FLAG_DYNAMICS;
             for v in d.words() {
                 body.extend_from_slice(&v.to_le_bytes());
             }
+        }
+        if let Some(ms) = &self.mid_side {
+            flags |= FLAG_MID_SIDE;
+            for v in ms.to.iter().chain(ms.from.iter()) {
+                body.extend_from_slice(&v.to_le_bytes());
+            }
+            put(&mut body, &ms.mid);
+            put(&mut body, &ms.side);
         }
         let mut out = MAGIC.to_vec();
         for v in [self.channels as u32, flags, body.len() as u32, crc32(&body)] {
@@ -308,37 +399,46 @@ impl Params {
         if crc32(body) != crc {
             return Err(BlobError::Crc);
         }
-        let mut p = Params { channels: n, flags, channel: [Channel::IDENTITY; MAX_CHANNELS], dynamics: None };
+        let mut p =
+            Params { channels: n, flags, channel: [Channel::IDENTITY; MAX_CHANNELS], dynamics: None, mid_side: None };
         let f64_at = |i: usize| -> Result<f64, BlobError> {
             let b: [u8; 8] = body.get(i..i + 8).ok_or(BlobError::Length)?.try_into().map_err(|_| BlobError::Length)?;
             Ok(f64::from_le_bytes(b))
         };
         let mut at = 0usize;
-        for ch in p.channel.iter_mut().take(n) {
-            if body.len() < at + 16 {
+        // one channel's filters at `at`; stable sections, finite gain
+        let get = |at: &mut usize, ch: &mut Channel| -> Result<(), BlobError> {
+            if body.len() < *at + 16 {
                 return Err(BlobError::Length);
             }
-            let count = word(body, at) as usize;
-            if count > MAX_SECTIONS || word(body, at + 4) != 0 {
+            let count = word(body, *at) as usize;
+            if count > MAX_SECTIONS || word(body, *at + 4) != 0 {
                 return Err(BlobError::Length);
             }
             ch.count = count;
-            ch.gain = f64_at(at + 8)?;
-            at += 16;
+            ch.gain = f64_at(*at + 8)?;
+            *at += 16;
             for s in ch.sections.iter_mut().take(count) {
                 *s = Section {
-                    b0: f64_at(at)?,
-                    b1: f64_at(at + 8)?,
-                    b2: f64_at(at + 16)?,
-                    a1: f64_at(at + 24)?,
-                    a2: f64_at(at + 32)?,
+                    b0: f64_at(*at)?,
+                    b1: f64_at(*at + 8)?,
+                    b2: f64_at(*at + 16)?,
+                    a1: f64_at(*at + 24)?,
+                    a2: f64_at(*at + 32)?,
                 };
-                at += 40;
+                *at += 40;
                 if !s.stable() {
                     return Err(BlobError::Unstable);
                 }
             }
-            if !ch.gain.is_finite() || ch.peak(fs) > UNITY_TOLERANCE {
+            if !ch.gain.is_finite() {
+                return Err(BlobError::Unstable);
+            }
+            Ok(())
+        };
+        for ch in p.channel.iter_mut().take(n) {
+            get(&mut at, ch)?;
+            if ch.peak(fs) > UNITY_TOLERANCE {
                 return Err(BlobError::Unstable);
             }
         }
@@ -354,7 +454,29 @@ impl Params {
             }
             p.dynamics = Some(d);
         }
-        if flags & !(FLAG_FROM_TUNING | FLAG_DYNAMICS) != 0 {
+        if flags & FLAG_MID_SIDE != 0 {
+            if n < 2 {
+                return Err(BlobError::Channels);
+            }
+            let mut m = [0.0; 8];
+            for (k, v) in m.iter_mut().enumerate() {
+                *v = f64_at(at + 8 * k)?;
+            }
+            at += 64;
+            let mut ms = MidSide {
+                to: [m[0], m[1], m[2], m[3]],
+                from: [m[4], m[5], m[6], m[7]],
+                mid: Channel::IDENTITY,
+                side: Channel::IDENTITY,
+            };
+            get(&mut at, &mut ms.mid)?;
+            get(&mut at, &mut ms.side)?;
+            if !ms.valid(fs) {
+                return Err(BlobError::Unstable);
+            }
+            p.mid_side = Some(ms);
+        }
+        if flags & !(FLAG_FROM_TUNING | FLAG_DYNAMICS | FLAG_MID_SIDE) != 0 {
             return Err(BlobError::Length);
         }
         if at != body.len() {
@@ -504,6 +626,8 @@ pub struct PreStage {
     params: Params,
     state: [[[f64; 2]; MAX_SECTIONS]; MAX_CHANNELS],
     dynamics: Option<DynRun>,
+    /// Mid and side filter histories of the [`MidSide`] block.
+    ms_state: [[[f64; 2]; MAX_SECTIONS]; 2],
 }
 
 impl PreStage {
@@ -516,7 +640,12 @@ impl PreStage {
     /// filters are built for it).
     pub fn with_rate(params: Params, fs: f64) -> PreStage {
         let dynamics = params.dynamics.as_ref().map(|d| DynRun::new(d, fs));
-        PreStage { params, state: [[[0.0; 2]; MAX_SECTIONS]; MAX_CHANNELS], dynamics }
+        PreStage {
+            params,
+            state: [[[0.0; 2]; MAX_SECTIONS]; MAX_CHANNELS],
+            dynamics,
+            ms_state: [[[0.0; 2]; MAX_SECTIONS]; 2],
+        }
     }
 
     pub fn params(&self) -> &Params {
@@ -526,17 +655,48 @@ impl PreStage {
     /// Clears every filter's history and the dynamics' detectors (stream start).
     pub fn reset(&mut self) {
         self.state = [[[0.0; 2]; MAX_SECTIONS]; MAX_CHANNELS];
+        self.ms_state = [[[0.0; 2]; MAX_SECTIONS]; 2];
         if let Some(d) = &mut self.dynamics {
             d.reset();
         }
     }
 
     /// Runs the dynamics on every channel at once (after [`PreStage::process`]
-    /// has filtered each into `bufs`), in place. No dynamics: unchanged.
-    /// Real time.
+    /// has filtered each into `bufs`), then the mid/side block on channels 0
+    /// and 1, in place. Neither: unchanged. Real time.
     pub fn process_dynamics(&mut self, bufs: &mut [&mut [f32]], frames: usize) {
         if let Some(d) = &mut self.dynamics {
             d.process(bufs, frames);
+        }
+        let Some(ms) = &self.params.mid_side else { return };
+        let [l, r, ..] = bufs else { return };
+        let n = frames.min(l.len()).min(r.len());
+        let run = |ch: &Channel, z: &mut [[f64; 2]; MAX_SECTIONS], x: f64| -> f64 {
+            let mut v = x;
+            for (s, st) in ch.sections().iter().zip(z.iter_mut()) {
+                let out = s.b0 * v + st[0];
+                st[0] = s.b1 * v - s.a1 * out + st[1];
+                st[1] = s.b2 * v - s.a2 * out;
+                v = out;
+            }
+            v * ch.gain
+        };
+        let (t, f) = (ms.to, ms.from);
+        for i in 0..n {
+            let x = |v: f32| if v.is_finite() { v.clamp(-INPUT_BOUND, INPUT_BOUND) as f64 } else { 0.0 };
+            let (a, b) = (x(l[i]), x(r[i]));
+            let [zm, zs] = &mut self.ms_state;
+            let m = run(&ms.mid, zm, t[0] * a + t[1] * b);
+            let s = run(&ms.side, zs, t[2] * a + t[3] * b);
+            let (ya, yb) = (f[0] * m + f[1] * s, f[2] * m + f[3] * s);
+            if ya.is_finite() && yb.is_finite() {
+                l[i] = ya as f32;
+                r[i] = yb as f32;
+            } else {
+                self.ms_state = [[[0.0; 2]; MAX_SECTIONS]; 2];
+                l[i] = 0.0;
+                r[i] = 0.0;
+            }
         }
     }
 
@@ -629,6 +789,95 @@ mod tests {
         // a channel the pre-stage does not have is muted
         s.process(5, &x, &mut y);
         assert!(y.iter().all(|v| *v == 0.0));
+    }
+
+    fn ms_params(mid_gain: f64, side: &[Section], side_gain: f64) -> Params {
+        let mut p = Params::identity(2);
+        p.flags = FLAG_FROM_TUNING | FLAG_MID_SIDE;
+        let mut ms = MidSide {
+            to: [1.0, 1.0, 1.0, -1.0],
+            from: [1.0, 1.0, 1.0, -1.0],
+            mid: Channel::IDENTITY,
+            side: Channel::IDENTITY,
+        };
+        ms.mid.gain = mid_gain;
+        ms.side.count = side.len();
+        ms.side.sections[..side.len()].copy_from_slice(side);
+        ms.side.gain = side_gain;
+        p.mid_side = Some(ms);
+        p
+    }
+
+    fn shelf_cut(fs: f64) -> Section {
+        // RBJ high shelf, -3 dB at 2.2 kHz, Q 0.8
+        let a = libm::pow(10.0, -3.0 / 40.0);
+        let w = 2.0 * core::f64::consts::PI * 2200.0 / fs;
+        let (c, s) = (libm::cos(w), libm::sin(w));
+        let sa = 2.0 * libm::sqrt(a) * s / (2.0 * 0.8);
+        let b = [
+            a * ((a + 1.0) + (a - 1.0) * c + sa),
+            -2.0 * a * ((a - 1.0) + (a + 1.0) * c),
+            a * ((a + 1.0) + (a - 1.0) * c - sa),
+        ];
+        let d = [(a + 1.0) - (a - 1.0) * c + sa, 2.0 * ((a - 1.0) - (a + 1.0) * c), (a + 1.0) - (a - 1.0) * c - sa];
+        Section { b0: b[0] / d[0], b1: b[1] / d[0], b2: b[2] / d[0], a1: d[1] / d[0], a2: d[2] / d[0] }
+    }
+
+    #[test]
+    fn mid_side_roundtrip_and_unity_check() {
+        let fs = 48_000.0;
+        let side = 0.5 * libm::pow(10.0, -1.5 / 20.0);
+        let p = ms_params(0.5, &[], side);
+        let b = p.encode();
+        assert_eq!(Params::decode(&b, 2, fs).unwrap(), p);
+        // the unscaled pair at a mid gain over one half sums above unity: refused
+        let loud = ms_params(0.51, &[], side).encode();
+        assert_eq!(Params::decode(&loud, 2, fs), Err(BlobError::Unstable));
+        // a side filter whose phase turns against the mid's: some pair of
+        // inputs sums above unity at its transition, so it is refused until
+        // scaled by its peak
+        let mut shelf = ms_params(0.5, &[shelf_cut(fs)], side);
+        assert_eq!(Params::decode(&shelf.encode(), 2, fs), Err(BlobError::Unstable));
+        let ms = shelf.mid_side.as_mut().unwrap();
+        let peak = ms.peak(fs);
+        assert!(peak > 1.0 && peak < 1.05, "{peak}");
+        ms.mid.gain /= peak;
+        ms.side.gain /= peak;
+        assert_eq!(Params::decode(&shelf.encode(), 2, fs).unwrap(), shelf);
+        // an in-phase pair (L = R) sees the mid path: 2 * 0.5 = unity
+        let ms = p.mid_side.unwrap();
+        let [g0, g1] = ms.row_gain(100.0, fs);
+        assert!((g0 - 1.0).abs() < 1e-9 && (g1 - 1.0).abs() < 1e-9, "{g0} {g1}");
+        // a mid/side block needs two channels
+        let mut one = p.clone();
+        one.channels = 1;
+        assert_eq!(Params::decode(&one.encode(), 1, fs), Err(BlobError::Channels));
+    }
+
+    #[test]
+    fn mid_side_keeps_mid_and_cuts_side() {
+        let fs = 48_000.0;
+        let side_gain = 0.5 * libm::pow(10.0, -1.5 / 20.0);
+        let mut s = PreStage::with_rate(ms_params(0.5, &[], side_gain), fs);
+        let x = tone(1000.0, 0.5, 4096);
+        let (mut a, mut b) = (x.clone(), x.clone());
+        s.process_dynamics(&mut [&mut a[..], &mut b[..]], 4096);
+        // L = R: mid only, unchanged
+        assert!(a.iter().zip(&x).all(|(y, v)| (y - v).abs() < 1e-6));
+        // L = -R: side only, -1.5 dB
+        s.reset();
+        let (mut a, mut b): (std::vec::Vec<f32>, std::vec::Vec<f32>) = (x.clone(), x.iter().map(|v| -v).collect());
+        s.process_dynamics(&mut [&mut a[..], &mut b[..]], 4096);
+        let want = libm::pow(10.0, -1.5 / 20.0) as f32;
+        assert!(a.iter().zip(&x).all(|(y, v)| (y - want * v).abs() < 1e-6));
+        assert!(b.iter().zip(&x).all(|(y, v)| (y + want * v).abs() < 1e-6));
+        // non-finite input is silence; one channel only: unchanged
+        let (mut a, mut b) = (std::vec![f32::NAN; 8], std::vec![0.0f32; 8]);
+        s.process_dynamics(&mut [&mut a[..], &mut b[..]], 8);
+        assert!(a.iter().chain(b.iter()).all(|v| *v == 0.0));
+        let mut only = x.clone();
+        s.process_dynamics(&mut [&mut only[..]], 4096);
+        assert_eq!(only, x);
     }
 
     fn dyn_params() -> Params {
