@@ -406,9 +406,14 @@ impl BandGain {
     pub fn sample(&mut self, lambda: f64) -> f32 {
         if self.attack {
             if self.n < self.len {
-                self.n += 1;
-                let w = 0.5 * (1.0 + libm::cos(core::f64::consts::PI * self.n as f64 / self.len as f64));
+                // Both ends are inclusive: the first sample of the attack
+                // keeps the decision-boundary gain and its last reaches the
+                // attack target. Advancing before evaluating shifts the
+                // complete onset one sample early.
+                let phase = if self.len > 1 { self.n as f64 / (self.len - 1) as f64 } else { 1.0 };
+                let w = 0.5 * (1.0 + libm::cos(core::f64::consts::PI * phase));
                 self.g = (self.target as f64 + (self.start as f64 - self.target as f64) * w) as f32;
+                self.n += 1;
             } else {
                 self.g = self.target;
             }
@@ -836,6 +841,20 @@ mod tests {
         gain.decide(0.8);
         let first = (lambda as f32) * (1.0 - 0.0f32);
         assert_eq!(gain.sample(lambda).to_bits(), (start + first * (0.8 - start)).to_bits());
+    }
+
+    #[test]
+    fn band_attack_includes_both_endpoints() {
+        let mut gain = BandGain::unity(160);
+        gain.g = 0.8;
+        gain.decide(0.5);
+        let target = 0.99 * 0.5;
+
+        assert_eq!(gain.sample(0.0).to_bits(), 0.8f32.to_bits());
+        for _ in 1..159 {
+            gain.sample(0.0);
+        }
+        assert_eq!(gain.sample(0.0).to_bits(), target.to_bits());
     }
 
     #[test]
