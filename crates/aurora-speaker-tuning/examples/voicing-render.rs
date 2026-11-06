@@ -4,8 +4,11 @@
 //! ```text
 //! voicing-render (--bundle PATH | --tunings-root DIR --aid N)
 //!     --in PROGRAM.f32 --out LANES.f32 [--mvsc S] [--mvol DB]
-//!     [--tap NODE=FILE.f32 ...] [--info FILE.json] [--block N]
+//!     [--tap NODE=FILE.f32 ...] [--info FILE.json] [--block N] [--only NODE]
 //! ```
+//!
+//! `--only NODE` runs that one box alone: the input has the box's width and
+//! the output is the box's output (the per-box gate of the rig).
 //!
 //! Interleaved float32 at 48 kHz. `--tap` writes a box's output (all its
 //! channels, interleaved). `--info` writes the plan, the stubs and the
@@ -15,7 +18,7 @@ use aurora_speaker_tuning::bundle::Bundle;
 use aurora_speaker_tuning::tuning::{Options, Tuning};
 use aurora_speaker_tuning::voicing::chain::compile;
 use aurora_speaker_tuning::Diagnostics;
-use sgv2_core::voicing::chain::{Chain, GraphParam};
+use sgv2_core::voicing::chain::{Chain, GraphParam, Link, Source, Spec};
 use std::io::Write;
 
 fn rd(p: &str) -> Vec<f32> {
@@ -31,6 +34,7 @@ fn main() {
     let (mut root, mut aid, mut bundle, mut input, mut output, mut info) = (None, None, None, None, None, None);
     let (mut mvsc, mut mvol, mut block) = (1.0f64, 0.0f64, 512usize);
     let mut taps: Vec<(String, String)> = Vec::new();
+    let mut only: Option<String> = None;
     while let Some(a) = args.next() {
         let mut v = || args.next().expect("value");
         match a.as_str() {
@@ -43,6 +47,7 @@ fn main() {
             "--mvsc" => mvsc = v().parse().expect("mvsc"),
             "--mvol" => mvol = v().parse().expect("mvol"),
             "--block" => block = v().parse().expect("block"),
+            "--only" => only = Some(v()),
             "--tap" => {
                 let s = v();
                 let (n, f) = s.split_once('=').expect("--tap NODE=FILE");
@@ -73,6 +78,21 @@ fn main() {
         std::fs::write(p, serde_json::to_vec_pretty(&j).unwrap()).unwrap();
     }
     let (Some(input), Some(output)) = (input, output) else { return };
+    let mut c = c;
+    if let Some(name) = &only {
+        // one box alone: its channels are the input, its output the lanes
+        let n = c.plan.node(name).unwrap_or_else(|| panic!("no node {name}"));
+        let mut node = c.spec.nodes[n].clone();
+        let w = node.inputs.len();
+        node.inputs = (0..w).map(Source::Program).collect();
+        c.spec = Spec {
+            program_channels: w,
+            nodes: vec![node],
+            outputs: (0..w).map(|k| Source::Node(0, k)).collect(),
+            links: c.spec.links.iter().filter(|l| l.node == n).map(|l| Link { node: 0, ..*l }).collect(),
+        };
+        assert!(taps.is_empty(), "--only takes no --tap");
+    }
     let pc = c.spec.program_channels;
     let lanes = c.spec.outputs.len();
     let tap_nodes: Vec<(usize, String)> =
