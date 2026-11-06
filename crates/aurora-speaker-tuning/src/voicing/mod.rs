@@ -23,5 +23,6 @@ pub mod chain;
 pub mod lowflow;
 pub mod mstk;
 pub mod topology;
+pub mod vbass;
 pub mod volume;
 pub mod xtc;
