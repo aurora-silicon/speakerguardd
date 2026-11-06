@@ -5,7 +5,8 @@
 //! look-ahead delay and that gain; everything else is the side chain.
 //!
 //! Side chain, per frame: each channel through the detector cascade (the
-//! tuning's side-chain high-pass, then the loudness weighting), squared, and
+//! loudness weighting; the unit's side-chain high-pass only feeds its
+//! loudness meters, not this detector), squared, and
 //! the channels summed (a full and a silent channel read the same as the
 //! full one alone; two equal channels read 3 dB louder). The sum is
 //! accumulated over 64-frame steps; eight steps make a 512-frame block and
@@ -14,8 +15,11 @@
 //!
 //! Meters (levels are `10 log10(power)` of the smoothed detector power; the
 //! histogram works in loudness units, that minus 0.691):
-//! - fast: the loudest 64-frame level of the call, less a fixed store;
-//! - median: the lower median of the last 94 512-frame levels, less a fixed
+//! - fast: the loudest 64-frame level of the call, less a fixed store, held
+//!   and released only once the call sits more than a dead band under it,
+//!   slowly while it is under the slower paths' highest reading and with a
+//!   release that speeds up over the first seconds of audible program;
+//! - median: the lower median of the last 96 512-frame levels, less a fixed
 //!   store, behind a release limiter that only lets go once the median sits
 //!   more than its dead band under it;
 //! - long: a 1001-bin histogram of 4096-frame window levels over -100..0 in
@@ -81,6 +85,9 @@ pub struct Params {
     /// Detector cascade, `[b0, b1, b2, a1, a2]` per section.
     pub sections: usize,
     pub sos: [[f64; 5]; MAX_SECTIONS],
+    /// Dead band of the fast path's release, dB: the held fast level only
+    /// releases once the call's level is this far under it.
+    pub fast_deadband_db: f64,
 }
 
 impl Default for Params {
@@ -92,12 +99,13 @@ impl Default for Params {
             lookahead: 0,
             sections: 0,
             sos: [[0.0; 5]; MAX_SECTIONS],
+            fast_deadband_db: 7.0,
         }
     }
 }
 
 impl Params {
-    pub const WORDS: usize = NODES + 4 + 5 * MAX_SECTIONS;
+    pub const WORDS: usize = NODES + 5 + 5 * MAX_SECTIONS;
 
     pub fn to_words(&self, out: &mut [f64]) {
         out[..NODES].copy_from_slice(&self.table);
@@ -108,6 +116,7 @@ impl Params {
         for (i, s) in self.sos.iter().enumerate() {
             out[NODES + 4 + 5 * i..NODES + 9 + 5 * i].copy_from_slice(s);
         }
+        out[NODES + 4 + 5 * MAX_SECTIONS] = self.fast_deadband_db;
     }
 
     pub fn from_words(w: &[f64]) -> Option<Params> {
@@ -131,6 +140,7 @@ impl Params {
         for (i, s) in p.sos.iter_mut().enumerate() {
             s.copy_from_slice(&w[NODES + 4 + 5 * i..NODES + 9 + 5 * i]);
         }
+        p.fast_deadband_db = w[NODES + 4 + 5 * MAX_SECTIONS];
         p.valid().then_some(p)
     }
 
@@ -138,13 +148,14 @@ impl Params {
         let table_ok = self.table.iter().all(|g| (-60.0..=60.0).contains(g));
         let expected_ok = (-100.0..=0.0).contains(&self.expected_db);
         let timeout_ok = (0.0..=3600.0).contains(&self.reset_timeout_s);
+        let deadband_ok = (0.0..=40.0).contains(&self.fast_deadband_db);
         // every section stable (poles inside the unit circle)
         let stable = self.sos[..self.sections].iter().all(|s| {
             let (a1, a2) = (s[3], s[4]);
             a2.abs() < 1.0 && a1.abs() < 1.0 + a2
         });
         let unused_zero = self.sos[self.sections..].iter().all(|s| s.iter().all(|v| *v == 0.0));
-        table_ok && expected_ok && timeout_ok && stable && unused_zero
+        table_ok && expected_ok && timeout_ok && deadband_ok && stable && unused_zero
     }
 
     /// The table's gain for loudness `l`, dB.
@@ -274,16 +285,29 @@ const EMA_S: f64 = 0.030;
 const FAST_STORE_DB: f64 = -8.0;
 const MEDIAN_STORE_DB: f64 = -5.0;
 const COMPETITOR_STORE_DB: f64 = -2.0;
-/// The median path: this many 512-frame levels, read at this sorted index
+/// The median path (the unit asks for 0.5 s of 512-frame levels and rounds
+/// its backing store up to an even length): this many 512-frame levels, read at this sorted index
 /// (the lower median).
-const MEDIAN_LEN: usize = 94;
-const MEDIAN_AT: usize = 46;
+const MEDIAN_LEN: usize = 96;
+const MEDIAN_AT: usize = 47;
 /// The long path: a sliding mean of this many 64-frame powers, emitted to
 /// the histogram every eight blocks.
 const WINDOW_LEN: usize = 600;
 /// Release dead band of the median path, dB, and its time constant, s.
 const MID_DEADBAND_DB: f64 = 5.0;
 const MID_RELEASE_S: f32 = 2.316;
+/// Fast-path release. The held fast level glides down with pole
+/// `exp(-1000 / (k * span))`, `span` the frames per 64-frame event of the
+/// call's rate (`fs` over the call's event count). `k` is the larger of a
+/// history weight and `1 + FAST_SPAN * x^2`, where `x` is 1 while the held
+/// level sits under the slower paths' highest reading so far and falls to 0
+/// once it leads that reading by `FAST_LEAD_DB`. The history weight starts
+/// at `FAST_HISTORY` and relaxes toward 1 by `FAST_HISTORY_STEP / span` of
+/// the remaining distance per call whose fast level is above `VALID_DB`.
+const FAST_HISTORY: f64 = 1000.0;
+const FAST_HISTORY_STEP: f64 = 100.0;
+const FAST_SPAN: f64 = 99.0;
+const FAST_LEAD_DB: f64 = 12.0;
 /// Time constant of the long path's preconditioner glide, s. In single
 /// precision its pole rounds to exactly 1, so the glide holds.
 const PRECOND_S: f32 = 1e7;
@@ -431,8 +455,18 @@ pub struct Run {
     median: Median,
     long: LongTerm,
     pre: Precondition,
-    /// The call's loudest 64-frame level, dB.
+    fs: f64,
+    /// The call's loudest 64-frame level, dB, and its 64-frame events.
     peak: f64,
+    events: usize,
+    /// The held fast level and its release weight.
+    fast: f64,
+    history: f64,
+    /// Highest median and conditioned-long readings since the reset.
+    mid_max: f64,
+    long_max: f64,
+    /// This call's 512-frame event: level, limited median, long reading.
+    pending: Option<(f64, f64, f64)>,
     /// The 512-frame candidate: limited median against the conditioned
     /// long path.
     held: f64,
@@ -464,7 +498,14 @@ impl Run {
             median: Median::new(block_rate),
             long: LongTerm::new(long_rate),
             pre: Precondition::new(fs as f32 / STEP as f32),
+            fs,
             peak: f64::NEG_INFINITY,
+            events: 0,
+            fast: 0.0,
+            history: FAST_HISTORY,
+            mid_max: 0.0,
+            long_max: 0.0,
+            pending: None,
             held: 0.0,
             candidate: 0.0,
             target_db: 0.0,
@@ -491,6 +532,12 @@ impl Run {
         self.long.reset(e);
         self.pre.reset();
         self.peak = f64::NEG_INFINITY;
+        self.events = 0;
+        self.fast = e;
+        self.history = FAST_HISTORY;
+        self.mid_max = -100.0;
+        self.long_max = -100.0;
+        self.pending = None;
         self.held = e;
         self.candidate = e;
         self.target_db = self.p.gain_db(e);
@@ -524,26 +571,54 @@ impl Run {
         v * v
     }
 
-    /// Every 64 frames: the call's peak level and the window, and on their
-    /// own boundaries the median (512) and long (4096) paths.
+    /// On the first frame of every 64: the call's peak level and the
+    /// window, and on their own boundaries the long (4096) and median (512)
+    /// paths. Every stage takes its first input, so the paths sample frames
+    /// 0, 64, ...; 0, 512, ...; 0, 4096, ... of the stream. The long path
+    /// reads the window before the current power joins it.
     fn on_step(&mut self) {
         let ema = self.ema;
-        self.window.push(ema);
         let db = level(ema);
         self.peak = self.peak.max(db);
-        self.steps += 1;
-        if self.steps == PER_BLOCK {
-            self.steps = 0;
+        self.events += 1;
+        if self.steps == 0 && self.blocks == 0 {
+            self.window.resum();
+            self.long.update(self.window.mean());
+        }
+        self.window.push(ema);
+        if self.steps == 0 {
             let mid = self.median.push(db);
-            self.blocks += 1;
-            if self.blocks == PER_LONG {
-                self.blocks = 0;
-                self.window.resum();
-                self.long.update(self.window.mean());
-            }
-            let long = self.pre.update(db + COMPETITOR_STORE_DB, self.long.reading);
+            self.mid_max = self.mid_max.max(mid);
+            self.pending = Some((db, mid, self.long.reading));
+            self.blocks = (self.blocks + 1) % PER_LONG;
+        }
+        self.steps = (self.steps + 1) % PER_BLOCK;
+    }
+
+    /// End of a call: the fast path's held level, then the long path's
+    /// preconditioner and the two maxima.
+    fn arbitrate(&mut self) {
+        let fast = self.peak + FAST_STORE_DB;
+        let span = self.fs / self.events as f64;
+        if fast > VALID_DB {
+            self.history += (1.0 - self.history) * FAST_HISTORY_STEP / span;
+        }
+        let lead = self.fast - self.mid_max.max(self.long_max);
+        let x = if lead < 0.0 { 1.0 } else { 1.0 - lead.min(FAST_LEAD_DB) / FAST_LEAD_DB };
+        let k = (1.0 + FAST_SPAN * x * x).max(self.history);
+        let pole = libm::exp(-1000.0 / (k * span));
+        if fast > self.fast {
+            self.fast = fast;
+        } else if self.fast > fast + self.p.fast_deadband_db {
+            self.fast += (1.0 - pole) * (fast - self.fast);
+        }
+        if let Some((db, mid, long)) = self.pending.take() {
+            let long = self.pre.update(db + COMPETITOR_STORE_DB, long);
+            self.long_max = self.long_max.max(long);
             self.held = mid.max(long);
         }
+        self.candidate = self.held.max(self.fast);
+        self.target_db = self.p.gain_db(self.candidate);
     }
 
     /// One call: meter all of it, then move the gain across it.
@@ -557,16 +632,15 @@ impl Run {
                 power += self.detect(ch, f64::from(x));
             }
             self.ema = self.ema_a * self.ema + (1.0 - self.ema_a) * power.max(1e-12);
-            self.in_step += 1;
-            if self.in_step == STEP {
-                self.in_step = 0;
+            if self.in_step == 0 {
                 self.on_step();
             }
+            self.in_step = (self.in_step + 1) % STEP;
         }
-        if self.peak > f64::NEG_INFINITY {
-            self.candidate = self.held.max(self.peak + FAST_STORE_DB);
-            self.target_db = self.p.gain_db(self.candidate);
+        if self.events != 0 {
+            self.arbitrate();
             self.peak = f64::NEG_INFINITY;
+            self.events = 0;
         }
         for n in 0..CALL {
             self.gain_db += GLIDE * (self.target_db - self.gain_db);
