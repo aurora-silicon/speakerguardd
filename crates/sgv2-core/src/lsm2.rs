@@ -184,6 +184,17 @@ const EPS: f64 = f32::MIN_POSITIVE as f64;
 /// The 0.99 downward target of every gain law (rig laws 5, 8; spec 15.4).
 const CUT: f64 = 0.99;
 
+/// Native realizes the ordinary sample-peak request window one bank sample
+/// before the retained audio/model window; the span stays unchanged.
+fn realize_peak_window(dst: &mut [f32], previous: f32, bank: &[f32]) {
+    debug_assert_eq!(dst.len(), bank.len());
+    if let Some((first, rest)) = dst.split_first_mut() {
+        *first = previous;
+        let n = rest.len();
+        rest.copy_from_slice(&bank[..n]);
+    }
+}
+
 /// The declared maximum of the `VelocityLimit*` parameters, m/s: the
 /// velocity curve's last anchor (residuals section 4), not a runtime cap.
 const VELOCITY_PARAM_MAX: f32 = 2.0;
@@ -1253,6 +1264,10 @@ struct Chan {
     bank: [Vec<f32>; BANDS - 1],
     /// Bank-stage bands: the OD frames before the frame, then the frame.
     ab: [Vec<f32>; BANDS],
+    /// The ordinary sample-peak allocator's one-sample-earlier realization
+    /// of `ab`, with the same W-sample span (Daybreak t-4876).
+    peak_ab: [Vec<f32>; BANDS],
+    peak_previous: [f32; BANDS],
     /// Bank-stage full band (the delayed input), same layout.
     xc: Vec<f32>,
     // Motion models on the bank stage.
@@ -1617,6 +1632,8 @@ impl Run {
                 xb: vec![0.0; 2 * fb - 1 + ctl],
                 bank,
                 ab: core::array::from_fn(|_| vec![0.0; od + ctl]),
+                peak_ab: core::array::from_fn(|_| vec![0.0; od + ctl]),
+                peak_previous: [0.0; BANDS],
                 xc: vec![0.0; od + ctl],
                 disp,
                 vel,
@@ -1746,6 +1763,8 @@ impl Run {
         for c in self.ch.iter_mut() {
             c.xb.iter_mut().for_each(|v| *v = 0.0);
             c.ab.iter_mut().for_each(|b| b.iter_mut().for_each(|v| *v = 0.0));
+            c.peak_ab.iter_mut().for_each(|b| b.iter_mut().for_each(|v| *v = 0.0));
+            c.peak_previous = [0.0; BANDS];
             c.xc.iter_mut().for_each(|v| *v = 0.0);
             c.disp.clear();
             c.dcar_m.clear();
@@ -1880,6 +1899,9 @@ impl Run {
                 pvb = [0.0; BANDS];
                 slot = (slot + 1) % ring_len;
             }
+        }
+        for k in 0..BANDS {
+            realize_peak_window(&mut c.peak_ab[k], c.peak_previous[k], &c.ab[k]);
         }
         // keep the bank's history
         c.xb.copy_within(ctl..ctl + hist, 0);
@@ -2057,7 +2079,7 @@ impl Run {
                     }
                 }
                 if peak_on {
-                    r = velocity_band_gains(&c.ab, &[], 0, c.amp_limit as f32, sg, all, r);
+                    r = velocity_band_gains(&c.peak_ab, &[], 0, c.amp_limit as f32, sg, all, r);
                 }
                 r
             };
@@ -2316,7 +2338,8 @@ impl Run {
             c.pbar1_frame = p1;
             c.pbar1s_frame = p1s;
             // shift the bank-stage buffers: keep the look-ahead region
-            for b in c.ab.iter_mut() {
+            for (k, b) in c.ab.iter_mut().enumerate() {
+                c.peak_previous[k] = b[ctl - 1];
                 b.copy_within(ctl..ctl + od, 0);
             }
             c.xc.copy_within(ctl..ctl + od, 0);
@@ -2577,6 +2600,14 @@ impl ProtectionUnit for Unit {
 #[cfg(test)]
 mod fault_tests {
     use super::*;
+
+    #[test]
+    fn sample_peak_window_keeps_the_span_and_prepends_the_previous_sample() {
+        let bank = [10.0, 11.0, 12.0, 13.0];
+        let mut peak = [0.0; 4];
+        realize_peak_window(&mut peak, 9.0, &bank);
+        assert_eq!(peak, [9.0, 10.0, 11.0, 12.0]);
+    }
 
     fn params() -> Params {
         let mut p = Params {
