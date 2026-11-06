@@ -1562,7 +1562,6 @@ impl Chan {
             (self.ceil_vc_prev[hist_sub], self.ceil_mg_prev[hist_sub], self.ceil_power_prev[hist_sub])
         };
         let (mut lv, mut lm, mut qv, mut qm) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
-        let (mut lp, mut qp) = (0.0f32, 0.0f32);
         let amb = self.ambient as f32;
         let mut i = 0;
         for raw_k in 0..full / sub {
@@ -1574,13 +1573,13 @@ impl Chan {
                 [u * retained, u * zs.step(u)]
             });
             let (pl, pq) = (sl / sub as f32, sq / sub as f32);
-            bv = self.br_vc.predict_step(bv, 0.0, bp);
-            bm = self.br_mg.predict_step(bm, 0.0, bp);
-            lv = self.br_vc.predict_step(lv, pl, lp);
-            lm = self.br_mg.predict_step(lm, pl, lp);
-            qv = self.br_vc.predict_step(qv, pq, qp);
-            qm = self.br_mg.predict_step(qm, pq, qp);
-            (bp, lp, qp) = (0.0, pl, pq);
+            bv = self.br_vc.step(bv, 0.0);
+            bm = if bp != 0.0 { self.br_mg.predict_step(bm, 0.0, bp) } else { self.br_mg.step(bm, 0.0) };
+            lv = self.br_vc.step(lv, pl);
+            lm = self.br_mg.step(lm, pl);
+            qv = self.br_vc.step(qv, pq);
+            qm = self.br_mg.step(qm, pq);
+            bp = 0.0;
             if raw_k >= discard {
                 let k = raw_k - discard;
                 base[k] = amb + bv + bm;
