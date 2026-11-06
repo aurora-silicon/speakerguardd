@@ -74,6 +74,7 @@ fn lsm2_params() -> lsm2::Params {
         power_soft_limit_pct: [100.0; 4],
         max_power_attenuation_db: 4.0,
         low_rail_power_ratio: 1.0,
+        velocity_parameter_max: 1.25,
         ..lsm2::Params::default()
     };
     let mut fir = [0.0f32; lsm2::PRESSURE_TAPS];

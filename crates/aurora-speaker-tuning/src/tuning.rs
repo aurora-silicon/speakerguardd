@@ -167,6 +167,9 @@ pub struct Tuning {
     #[serde(skip)]
     pub mask_lattice: Option<[u32; crate::lattice::ENTRIES]>,
     pub mask_lattice_present: bool,
+    /// Public maximum of the lsm2 `VelocityLimit*` parameters, collected
+    /// from this Mac's AudioUnit metadata and covered by the manifest.
+    pub velocity_parameter_max: Option<f32>,
     #[serde(skip)]
     pub graph: Graph,
 }
@@ -493,6 +496,26 @@ impl Tuning {
             }
         };
 
+        let velocity_parameter_max = match b.lsm2_metadata() {
+            Some(bytes) => match crate::lsm2_metadata::parse(bytes) {
+                Ok(metadata) => Some(metadata.velocity_parameter_max),
+                Err(e) => {
+                    diags.error("lsm2-metadata-invalid", crate::lsm2_metadata::NAME, e.to_string());
+                    None
+                }
+            },
+            None => {
+                if kind == UnitKind::Lsm2 {
+                    diags.error(
+                        "lsm2-metadata-absent",
+                        "bundle",
+                        "no collected VelocityLimit parameter maximum; collect the tuning again on macOS",
+                    );
+                }
+                None
+            }
+        };
+
         Ok(Tuning {
             aid: b.manifest.aid.clone(),
             acoustic_id: b.manifest.acoustic_id,
@@ -524,6 +547,7 @@ impl Tuning {
             spts,
             mask_lattice_present: mask_lattice.is_some(),
             mask_lattice,
+            velocity_parameter_max,
             graph,
         })
     }

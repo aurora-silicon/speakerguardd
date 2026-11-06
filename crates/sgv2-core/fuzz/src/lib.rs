@@ -551,6 +551,7 @@ pub fn lsm2_base(n: usize, rate: u32) -> sgv2_core::lsm2::Params {
         max_power_attenuation_db: 4.0,
         low_rail_idle_power_w: 0.0,
         low_rail_power_ratio: 1.0,
+        velocity_parameter_max: 1.25,
         ..Params::default()
     };
     for c in 0..n {

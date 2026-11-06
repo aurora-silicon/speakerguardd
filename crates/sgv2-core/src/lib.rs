@@ -85,8 +85,9 @@ impl Health {
     /// Sense data was expected and is unusable; affected channels run
     /// open loop. This is a normal state, not a fault.
     pub const OPEN_LOOP: u32 = 1 << 3;
-    /// A model state went non-finite. The unit has latched the fail-safe
-    /// until `reset`; it never trusts that state again.
+    /// A model state went non-finite or a protective allocation remained
+    /// unsafe after closing every controllable band. The unit has latched
+    /// the fail-safe until `reset`; it never trusts that state again.
     pub const MODEL_FAULT: u32 = 1 << 4;
     /// A model state left its plausible range (spp3: the feed-forward node
     /// above 1000 K). The unit holds its hard path while it lasts; the

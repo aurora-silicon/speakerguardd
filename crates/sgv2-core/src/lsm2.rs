@@ -89,9 +89,11 @@
 //!
 //! Full scale: the output is held to digital full scale, a non-finite input
 //! sample is 0 to the audio and the models and the most restrictive to the
-//! peak axis. A model state that goes non-finite latches the 20 dB
-//! fail-safe (`Health::MODEL_FAULT`) until reset. `EnableMitigation = 0` and
-//! a tuning with neither thermal axis are refused.
+//! peak axis. A model state that goes non-finite, or an allocation whose
+//! zero-gain fallback is still unsafe, latches the 20 dB fail-safe
+//! (`Health::MODEL_FAULT`) until reset. A verified zero-gain fallback is
+//! applied protectively without a fault. `EnableMitigation = 0` and a tuning
+//! with neither thermal axis are refused.
 //!
 //! Hand-off: `save_state`/`restore_state` carry the monitor's and the
 //! temperature predictor's coil and magnet rises, the four power averages
@@ -132,8 +134,8 @@ use alloc::vec::Vec;
 mod laws;
 pub use laws::{
     current_coefficients, mask_lattice_resized, minimum_phase_triplet, release_lambda, temperature_candidate,
-    transform_len, velocity_band_gains, velocity_band_gains_window, velocity_limit, BandGain, Fft, Masker,
-    ThermalBranch,
+    transform_len, velocity_band_gains, velocity_band_gains_window, velocity_limit, AllocationStatus, BandAllocation,
+    BandGain, Fft, Masker, ThermalBranch,
 };
 
 use crate::blob::{BlobError, Pod};
@@ -183,11 +185,6 @@ pub const PRESSURE_TAPS: usize = 1024;
 const EPS: f64 = f32::MIN_POSITIVE as f64;
 /// The 0.99 downward target of every gain law (rig laws 5, 8; spec 15.4).
 const CUT: f64 = 0.99;
-
-/// The declared maximum of the `VelocityLimit*` parameters, m/s: the
-/// velocity curve's last anchor (residuals section 4), not a runtime cap.
-const VELOCITY_PARAM_MAX: f32 = 2.0;
-
 /// Bits of [`ChannelParams::model_generic`]: the manager's
 /// `UseGenericModelParametersRdc` and `...Resonator1` flags. A generic field
 /// takes the tuning's embedded family row (resolved by the compiler) and
@@ -388,6 +385,10 @@ pub struct Params {
     /// limits, a key the platform does not send being 50 W (spec 6.1, 8).
     pub runtime_budget_present: u32,
     pub runtime_budget_w: [f32; 4],
+    /// Public `AudioUnitParameterInfo.maxValue` shared by every collected
+    /// `VelocityLimit0..2` family. This is the velocity curve's last anchor,
+    /// collected from this Mac's lsm2 unit; it is not a runtime cap.
+    pub velocity_parameter_max: f32,
     /// The masker's bucket lattice for the 640-point transform (residuals
     /// 3): 100 exclusive end bins, extracted from the Mac's own macOS at
     /// provisioning. `mask_lattice_len` is 100 when present, else 0; without
@@ -405,7 +406,7 @@ unsafe impl Pod for ChannelParams {}
 
 const CH_WORDS: usize = 74 + PRESSURE_TAPS;
 const _: () = assert!(core::mem::size_of::<ChannelParams>() == CH_WORDS * 4);
-const _: () = assert!(core::mem::size_of::<Params>() == (40 + laws::MASK_BUCKETS + MAX_CHANNELS * CH_WORDS) * 4);
+const _: () = assert!(core::mem::size_of::<Params>() == (41 + laws::MASK_BUCKETS + MAX_CHANNELS * CH_WORDS) * 4);
 
 impl Default for Params {
     fn default() -> Self {
@@ -437,6 +438,7 @@ impl Default for Params {
             other_power_features: 0,
             runtime_budget_present: 0,
             runtime_budget_w: [0.0; 4],
+            velocity_parameter_max: 0.0,
             mask_lattice_len: 0,
             mask_lattice: [0; laws::MASK_BUCKETS],
             ch: [ChannelParams::default(); MAX_CHANNELS],
@@ -613,6 +615,9 @@ impl Params {
         {
             return Err(InitError::Invalid("amplifier model"));
         }
+        if !pos(self.velocity_parameter_max) {
+            return Err(InitError::Invalid("velocity parameter maximum"));
+        }
         let mut seen = 0u32;
         for c in &self.ch[..n] {
             if c.source as usize >= n || seen & (1 << c.source) != 0 {
@@ -675,6 +680,9 @@ impl Params {
                 || !c.pressure_fir.iter().all(|v| v.is_finite())
             {
                 return Err(InitError::Invalid("pressure response"));
+            }
+            if c.velocity_limit[2] > self.velocity_parameter_max {
+                return Err(InitError::Invalid("velocity parameter maximum"));
             }
             if !(c.temperature_soft_limit.is_finite()
                 && c.temperature_hard_limit.is_finite()
@@ -1522,6 +1530,7 @@ struct Run {
     slow_lambda: f64,
     slow_step: f64,
     linked_power: f64,
+    velocity_parameter_max: f32,
     /// `10^(-MaxPowerAttenuation/20)`.
     power_floor: f64,
     /// Per channel: the frame's input and output (FIFO).
@@ -1734,6 +1743,7 @@ impl Run {
             slow_lambda: release_lambda(rate, p.slow_release_time_ms as f64 * 1e-3),
             slow_step: settle_step(ctl_dt, p.slow_release_time_ms as f64 * 1e-3),
             linked_power: 1.0,
+            velocity_parameter_max: p.velocity_parameter_max,
             power_floor: db_to_lin(p.max_power_attenuation_db as f64),
             xin: vec![vec![0.0; ctl]; n],
             yout: vec![vec![0.0; ctl]; n],
@@ -1919,7 +1929,7 @@ impl Run {
         }
         for c in self.ch.iter_mut() {
             if c.masker.is_some() {
-                c.vel_limit_now = velocity_limit(level, &c.mask_knots, &c.vel_lim, VELOCITY_PARAM_MAX) as f64;
+                c.vel_limit_now = velocity_limit(level, &c.mask_knots, &c.vel_lim, self.velocity_parameter_max) as f64;
             }
             let g_peak = if self.axis[0] { ratio(c.amp_limit, window_max(&c.pk_x)) } else { 1.0 };
             let g_disp = if self.axis[1] { ratio(c.disp_limit, window_max(&c.pk_d)) } else { 1.0 };
@@ -2010,12 +2020,17 @@ impl Run {
             c.vcar_m.carry(&mut c.vcar, fbl);
             let velocity_cut = core::cell::Cell::new(false);
             let retained_episode = core::cell::Cell::new(c.vel_episode && c.vel_episode_retained);
+            let allocation_failed = core::cell::Cell::new(false);
             let chain = |c: &Chan, seed: [f32; BANDS]| -> [f32; BANDS] {
                 let all = (0, BANDS);
                 let mut r = seed;
+                let apply = |a: BandAllocation| {
+                    allocation_failed.set(allocation_failed.get() || !a.converged());
+                    a.gains
+                };
                 if disp_on {
                     let room = 0.25 * (c.disp_limit as f32 - c.disp_bound_new).max(0.0);
-                    r = velocity_band_gains_window(
+                    r = apply(velocity_band_gains_window(
                         &c.db,
                         &c.rd,
                         0,
@@ -2026,16 +2041,16 @@ impl Run {
                         sg,
                         all,
                         r,
-                    );
+                    ));
                 }
                 if vel_on {
-                    let ordinary = velocity_band_gains(&c.vb, &c.vcar, vfirst, vlim_g, sg, all, r);
+                    let ordinary = apply(velocity_band_gains(&c.vb, &c.vcar, vfirst, vlim_g, sg, all, r));
                     let ordinary_cut = (c.vel_active.0..c.vel_active.1).any(|k| ordinary[k] < r[k]);
                     if !c.vel_episode && ordinary_cut && stream_ready {
                         retained_episode.set(true);
                     }
                     let q = if retained_episode.get() && c.vel_bound_ready {
-                        velocity_band_gains_window(
+                        apply(velocity_band_gains_window(
                             &c.vb,
                             &c.vcar,
                             vfirst,
@@ -2046,7 +2061,7 @@ impl Run {
                             sg,
                             all,
                             ordinary,
-                        )
+                        ))
                     } else {
                         ordinary
                     };
@@ -2057,7 +2072,7 @@ impl Run {
                     }
                 }
                 if peak_on {
-                    r = velocity_band_gains(&c.ab, &[], 0, c.amp_limit as f32, sg, all, r);
+                    r = apply(velocity_band_gains(&c.ab, &[], 0, c.amp_limit as f32, sg, all, r));
                 }
                 r
             };
@@ -2107,6 +2122,9 @@ impl Run {
             c.vel_bound_release = c.vel_episode && c.vel_episode_retained;
             for k in 0..BANDS {
                 c.band[k].decide(req[k]);
+            }
+            if allocation_failed.get() {
+                self.fault = true;
             }
             c.cand[0] = g_peak;
             c.cand[1] = g_disp;
@@ -2591,6 +2609,7 @@ mod fault_tests {
             fast_release_time_ms: 150.0,
             slow_release_time_ms: 10_000.0,
             low_band_release_time_ms: 150.0,
+            velocity_parameter_max: 1.25,
             filterbank_latency_ms: 2.0,
             speaker_response_lookahead_ms: 4.0 / 3.0,
             power_time_scale_s: [0.002, 0.2, 2.0, 30.0],
@@ -2748,6 +2767,25 @@ mod fault_tests {
         let mut lower = f.released_toward(0.3);
         lower.sample(lambda);
         assert_eq!(lower.g, f.g);
+    }
+
+    #[test]
+    fn allocator_failure_propagates_to_health_and_telemetry() {
+        let mut p = params();
+        p.control_displacement = 1;
+        let mut u = Unit::new(p);
+        // This decision-local model is not one of the persistent states in
+        // the end-of-frame finite check. The allocator itself must reject
+        // its NaN waveform and latch the model fault.
+        u.run.as_mut().unwrap().ch[0].disp_proto.b[0] = f64::NAN;
+        let (out, health) = run(&mut u, 0.25, CONTROLLER_FRAMES);
+        assert!(health.is_failsafe());
+        assert_ne!(health.0 & Health::MODEL_FAULT, 0);
+        assert!(out.iter().all(|&sample| sample == 0.0 || sample == FAILSAFE_GAIN));
+        let mut telemetry = Telemetry::new();
+        u.telemetry(&mut telemetry);
+        assert!(telemetry.health.is_failsafe());
+        assert_ne!(telemetry.health.0 & Health::MODEL_FAULT, 0);
     }
 
     #[test]

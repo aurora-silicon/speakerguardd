@@ -343,6 +343,12 @@ pub fn spp3_files(channels: usize) -> BTreeMap<String, Vec<u8>> {
 
 /// Bundle path of the installer's lsm2 masker lattice.
 pub const LATTICE: &str = "lsm2-mask-lattice.bin";
+pub const LSM2_METADATA: &str = "lsm2-metadata.json";
+
+pub fn lsm2_metadata_bytes(maximum: f32) -> Vec<u8> {
+    format!(r#"{{"kind":"aurora-lsm2-parameter-metadata","version":1,"velocity_parameter_max":{maximum}}}"#)
+        .into_bytes()
+}
 
 /// A synthetic lsm2 masker lattice (not the macOS one): the 64 single bins,
 /// then 36 evenly widening ends up to 321, as 100 little-endian u64.
@@ -397,9 +403,12 @@ pub fn manifest_json_ident(
             sha256_hex(d)
         )
     });
+    let lsm2_metadata = files.get(LSM2_METADATA).map_or(String::new(), |d| {
+        format!(r#","lsm2_metadata":{{"path":"{LSM2_METADATA}","bytes":{},"sha256":"{}"}}"#, d.len(), sha256_hex(d))
+    });
     let list: Vec<String> = files
         .iter()
-        .filter(|(p, _)| *p != "speaker-thiele-small.bin" && *p != LATTICE)
+        .filter(|(p, _)| *p != "speaker-thiele-small.bin" && *p != LATTICE && *p != LSM2_METADATA)
         .map(|(p, d)| rec(p, d))
         .collect();
     let count = files.keys().filter(|p| p.starts_with(&format!("{AID}/"))).count();
@@ -410,7 +419,7 @@ pub fn manifest_json_ident(
         r#"{{"schema":2,"kind":"aurora-audio-tuning","source_file_count":{count},"complete":true,
 "acoustic_id":{ACOUSTIC_ID},"aid":"{AID}","macos_build":"{build}",
 "speaker_thiele_small":{},"device_dsp_database":"DeviceDSPDatabase.plist","config":"Config/{AID}.plist",
-"files":[{}],"based_on":"test"{spid}{ident}{lattice}}}"#,
+"files":[{}],"based_on":"test"{spid}{ident}{lattice}{lsm2_metadata}}}"#,
         spts.unwrap_or_else(|| "null".into()),
         list.join(",")
     )

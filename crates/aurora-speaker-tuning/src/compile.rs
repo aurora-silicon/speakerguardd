@@ -524,6 +524,9 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
         // them; the bundle has none.
         runtime_budget_present: 0,
         runtime_budget_w: [0.0; 4],
+        velocity_parameter_max: t.velocity_parameter_max.ok_or_else(|| {
+            bad("the bundle has no valid collected VelocityLimit parameter maximum; no literal fallback is permitted")
+        })?,
         ch: [lsm2::ChannelParams::default(); MAX_CHANNELS],
     };
     for j in 0..4u32 {

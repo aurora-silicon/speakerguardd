@@ -341,6 +341,7 @@ fn lsm2_state(tweak: impl Fn(&mut BTreeMap<u32, f32>)) -> ParamState {
 
 fn lsm2_files(tweak: impl Fn(&mut BTreeMap<u32, f32>)) -> BTreeMap<String, Vec<u8>> {
     let mut f = spp3_files(4);
+    f.insert(LSM2_METADATA.into(), lsm2_metadata_bytes(1.75));
     f.insert(format!("{AID}/DSP/Graphs/builtin_speaker_out.dspg"), graph_text("lsm2").into_bytes());
     f.insert(
         format!("{AID}/DSP/Strips/builtin_speaker_out_general.austrip"),
@@ -357,6 +358,7 @@ fn lsm2_fields_follow_the_id_rule() {
     assert_eq!(c.full_scale_mv, 11890);
     let p = sgv2_core::lsm2::Params::from_blob(&c.blob).unwrap();
     assert_eq!((p.channels, p.sample_rate, p.model_only), (4, 48000, 1));
+    assert_eq!(p.velocity_parameter_max, 1.75);
     assert_eq!((p.attack_time_ms, p.fast_release_time_ms, p.slow_release_time_ms), (4.0, 150.0, 15000.0));
     // SPEC-LSM2 AID44 values: 2 x 160 + 32 = 352 frames.
     assert_eq!((p.filterbank_latency_ms, p.speaker_response_lookahead_ms), (10.0 / 3.0, 2.0 / 3.0));
@@ -378,6 +380,26 @@ fn lsm2_fields_follow_the_id_rule() {
     assert!((x.pilot_reserve - 0.01).abs() < 1e-7);
     // no property 6632 in the synthetic bundle: no masking path
     assert_eq!(x.pressure_taps, 0);
+}
+
+#[test]
+fn lsm2_refuses_missing_invalid_or_too_small_velocity_metadata() {
+    let files = lsm2_files(|_| {});
+    let mut missing = files.clone();
+    missing.remove(LSM2_METADATA);
+    let dir = scratch("c-lsm2-no-metadata");
+    write_dir(&dir, &missing, &manifest_json(&missing, "25G83"));
+    let mut diagnostics = Diagnostics::default();
+    let tuning = Tuning::load(&Bundle::open(&dir).unwrap(), &Options::default(), &mut diagnostics).unwrap();
+    assert!(diagnostics.items.iter().any(|d| d.code == "lsm2-metadata-absent"));
+    assert!(compile(&tuning, &mut Diagnostics::default()).is_err());
+
+    for (name, bytes) in [("zero", lsm2_metadata_bytes(0.0)), ("too-small", lsm2_metadata_bytes(0.75))] {
+        let mut changed = files.clone();
+        changed.insert(LSM2_METADATA.into(), bytes);
+        let tuning = tuning_any(&changed, &format!("c-lsm2-metadata-{name}"));
+        assert!(compile(&tuning, &mut Diagnostics::default()).is_err(), "{name}");
+    }
 }
 
 #[test]

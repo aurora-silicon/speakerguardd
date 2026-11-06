@@ -435,6 +435,7 @@ fn lsm2_params(seed: u64, n: usize, rate: u32, hot: bool) -> lsm2::Params {
         max_power_attenuation_db: r.uni(0.0, 20.0),
         low_rail_idle_power_w: r.uni(0.0, 1.0),
         low_rail_power_ratio: r.uni(0.5, 2.0),
+        velocity_parameter_max: 64.0,
         other_power_features: 0,
         runtime_budget_present: r.chance(0.3) as u32,
         runtime_budget_w: [r.log(0.1, 50.0), r.log(0.1, 50.0), r.log(0.1, 50.0), r.log(0.1, 50.0)],

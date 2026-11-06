@@ -176,7 +176,176 @@ pub fn velocity_limit(e: f32, k: &[f32; 4], v: &[f32; 3], vmax: f32) -> f32 {
 /// bands leave; repeat until the waveform is within `vlim`. Returns each
 /// band's gain relative to `s` (ignored bands 1), before the floor. The
 /// ordinary solve starts from unity; the post-retarget solve (residuals
-/// 5.2) from a lane-selective `seed`.
+/// 5.2) from a lane-selective `seed`. A non-finite input or a violating
+/// no-progress terminal returns a verified zero-gain protective fallback
+/// for every active band. A fallback that still violates the limit, or any
+/// non-finite state, returns an explicit failure status for the caller to
+/// latch into the fail-safe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AllocationStatus {
+    Converged,
+    /// The remaining excess is one binary32 ULP and the water-fill update
+    /// cannot change a gain, while closing the active bands verifies that
+    /// the fixed contribution is safe.
+    ConvergedAtResolution,
+    /// The active bands could not make another representable reduction, but
+    /// closing them produced a verified within-limit result.
+    ProtectiveFallback,
+    /// The fixed residual or inactive bands violate the limit even after
+    /// every active band is closed.
+    Uncontrollable,
+    /// A waveform, limit, scale or gain was not finite.
+    NonFinite,
+    /// Buffer geometry, the active range or a finite scalar was invalid.
+    Invalid,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BandAllocation {
+    pub gains: [f32; 5],
+    pub status: AllocationStatus,
+    passes: usize,
+}
+
+impl BandAllocation {
+    #[inline]
+    pub fn converged(self) -> bool {
+        matches!(
+            self.status,
+            AllocationStatus::Converged
+                | AllocationStatus::ConvergedAtResolution
+                | AllocationStatus::ProtectiveFallback
+        )
+    }
+
+    /// Effective water-fill passes. Exposed for synthetic termination tests
+    /// and diagnostics; it is not a pass budget.
+    pub fn passes(self) -> usize {
+        self.passes
+    }
+}
+
+fn invalid_allocation(
+    mut gains: [f32; 5],
+    active: (usize, usize),
+    status: AllocationStatus,
+    passes: usize,
+) -> BandAllocation {
+    if active.0 > active.1 || active.1 > 5 {
+        gains.fill(0.0);
+        return BandAllocation { gains, status, passes };
+    }
+    let end = active.1.min(5);
+    for gain in gains.iter_mut().take(end).skip(active.0.min(end)) {
+        *gain = 0.0;
+    }
+    BandAllocation { gains, status, passes }
+}
+
+fn allocation_geometry(
+    vb: &[alloc::vec::Vec<f32>; 5],
+    resid: &[f32],
+    first: usize,
+    s: f32,
+    active: (usize, usize),
+    seed: [f32; 5],
+) -> Result<usize, AllocationStatus> {
+    let n = vb[0].len();
+    if !s.is_finite() || seed.iter().any(|g| !g.is_finite()) {
+        return Err(AllocationStatus::NonFinite);
+    }
+    if vb.iter().any(|b| b.len() != n)
+        || (!resid.is_empty() && resid.len() != n)
+        || first > n
+        || active.0 > active.1
+        || active.1 > 5
+        || s < 0.0
+    {
+        return Err(AllocationStatus::Invalid);
+    }
+    Ok(n)
+}
+
+/// The least-index sample having the largest absolute trial value, when it
+/// exceeds the bound selected for that sample. The full waveform is rebuilt
+/// on every call so a non-finite sample cannot hide outside the selected
+/// index. Selecting before looking up the retained bound is the native rule.
+fn violation(
+    vb: &[alloc::vec::Vec<f32>; 5],
+    resid: &[f32],
+    first: usize,
+    s: f32,
+    gains: &[f32; 5],
+    limit: &impl Fn(usize) -> f32,
+) -> Result<Option<(usize, f32)>, AllocationStatus> {
+    let mut peak: Option<(usize, f32)> = None;
+    for i in first..vb[0].len() {
+        let mut y = if resid.is_empty() { 0.0 } else { resid[i] };
+        for k in 0..5 {
+            y += (gains[k] * s) * vb[k][i];
+        }
+        if !y.is_finite() {
+            return Err(AllocationStatus::NonFinite);
+        }
+        if match peak {
+            Some((_, prior)) => y.abs() > prior.abs(),
+            None => true,
+        } {
+            peak = Some((i, y));
+        }
+    }
+    let Some((idx, y)) = peak else {
+        return Ok(None);
+    };
+    let l = limit(idx);
+    if !l.is_finite() || l < 0.0 {
+        return Err(if l.is_finite() { AllocationStatus::Invalid } else { AllocationStatus::NonFinite });
+    }
+    Ok((y.abs() > l).then_some((idx, y)))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn protective_fallback(
+    vb: &[alloc::vec::Vec<f32>; 5],
+    resid: &[f32],
+    first: usize,
+    s: f32,
+    active: (usize, usize),
+    gains: [f32; 5],
+    limit: &impl Fn(usize) -> f32,
+    status: AllocationStatus,
+    passes: usize,
+) -> BandAllocation {
+    let mut failed = invalid_allocation(gains, active, status, passes);
+    failed.status = match violation(vb, resid, first, s, &failed.gains, limit) {
+        Ok(None) => status,
+        Ok(Some(_)) => AllocationStatus::Uncontrollable,
+        Err(e) => e,
+    };
+    failed
+}
+
+fn within_binary32_resolution(
+    vb: &[alloc::vec::Vec<f32>; 5],
+    resid: &[f32],
+    idx: usize,
+    s: f32,
+    gains: &[f32; 5],
+    worst: f32,
+    limit: f32,
+) -> bool {
+    // `violation` sums one residual and five products in binary32. Bound
+    // their accumulated rounding (with two guard operations) rather than
+    // treating an unrepresentable last ULP as an unsafe real excess.
+    let mut magnitude = if resid.is_empty() { 0.0 } else { resid[idx].abs() };
+    for k in 0..5 {
+        magnitude += ((gains[k] * s) * vb[k][idx]).abs();
+    }
+    magnitude.is_finite()
+        && (worst.abs() as f64)
+            <= limit as f64 + 8.0 * f32::EPSILON as f64 * magnitude.max(limit).max(f32::MIN_POSITIVE) as f64
+}
+
 pub fn velocity_band_gains(
     vb: &[alloc::vec::Vec<f32>; 5],
     resid: &[f32],
@@ -185,28 +354,36 @@ pub fn velocity_band_gains(
     s: f32,
     active: (usize, usize),
     seed: [f32; 5],
-) -> [f32; 5] {
+) -> BandAllocation {
     let mut g = seed;
-    let n = vb[0].len();
+    let n = match allocation_geometry(vb, resid, first, s, active, seed) {
+        Ok(n) => n,
+        Err(e) => return invalid_allocation(g, active, e, 0),
+    };
+    if !vlim.is_finite() {
+        return invalid_allocation(g, active, AllocationStatus::NonFinite, 0);
+    }
+    if vlim < 0.0 {
+        return invalid_allocation(g, active, AllocationStatus::Invalid, 0);
+    }
+    let limit = |_: usize| vlim;
     if first >= n {
-        return g;
+        return match violation(vb, resid, first, s, &g, &limit) {
+            Ok(None) => BandAllocation { gains: g, status: AllocationStatus::Converged, passes: 0 },
+            Ok(Some(_)) => {
+                protective_fallback(vb, resid, first, s, active, g, &limit, AllocationStatus::ProtectiveFallback, 0)
+            }
+            Err(e) => invalid_allocation(g, active, e, 0),
+        };
     }
     let is_active = |k: usize| k >= active.0 && k < active.1;
+    let mut passes = 0;
     loop {
-        let (mut idx, mut worst) = (first, 0.0f32);
-        for i in first..n {
-            let mut y = if resid.is_empty() { 0.0f32 } else { resid[i] };
-            for k in 0..5 {
-                y += (g[k] * s) * vb[k][i];
-            }
-            if y.abs() > worst.abs() {
-                worst = y;
-                idx = i;
-            }
-        }
-        if worst.abs() <= vlim || worst.is_nan() {
-            break;
-        }
+        let (idx, worst) = match violation(vb, resid, first, s, &g, &limit) {
+            Ok(None) => return BandAllocation { gains: g, status: AllocationStatus::Converged, passes },
+            Ok(Some(v)) => v,
+            Err(e) => return protective_fallback(vb, resid, first, s, active, g, &limit, e, passes),
+        };
         let sign = if worst >= 0.0 { 1.0f32 } else { -1.0 };
         let mut fixed = if resid.is_empty() { 0.0f32 } else { resid[idx] };
         for k in (0..5).filter(|&k| !is_active(k)) {
@@ -222,7 +399,17 @@ pub fn velocity_band_gains(
             m += 1;
         }
         if m == 0 {
-            break;
+            return protective_fallback(
+                vb,
+                resid,
+                first,
+                s,
+                active,
+                g,
+                &limit,
+                AllocationStatus::ProtectiveFallback,
+                passes,
+            );
         }
         let sorted = &mut sorted[..m];
         sorted.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
@@ -248,10 +435,26 @@ pub fn velocity_band_gains(
             }
         }
         if !changed {
-            break;
+            let fallback = protective_fallback(
+                vb,
+                resid,
+                first,
+                s,
+                active,
+                g,
+                &limit,
+                AllocationStatus::ProtectiveFallback,
+                passes,
+            );
+            if fallback.status == AllocationStatus::ProtectiveFallback
+                && within_binary32_resolution(vb, resid, idx, s, &g, worst, vlim)
+            {
+                return BandAllocation { gains: g, status: AllocationStatus::ConvergedAtResolution, passes };
+            }
+            return fallback;
         }
+        passes = passes.saturating_add(1);
     }
-    g
 }
 
 /// Signed velocity allocation against the retained full-band bound. The
@@ -274,14 +477,19 @@ pub fn velocity_band_gains_window(
     s: f32,
     active: (usize, usize),
     seed: [f32; 5],
-) -> [f32; 5] {
+) -> BandAllocation {
     let mut g = seed;
-    let n = vb[0].len();
-    if first >= n {
-        return g;
+    let n = match allocation_geometry(vb, resid, first, s, active, seed) {
+        Ok(n) => n,
+        Err(e) => return invalid_allocation(g, active, e, 0),
+    };
+    if [old_limit, new_limit, room_floor].iter().any(|v| !v.is_finite()) {
+        return invalid_allocation(g, active, AllocationStatus::NonFinite, 0);
     }
-    let is_active = |k: usize| k >= active.0 && k < active.1;
-    let limit_at = |i: usize| {
+    if old_limit < 0.0 || new_limit < 0.0 || room_floor < 0.0 || split > n {
+        return invalid_allocation(g, active, AllocationStatus::Invalid, 0);
+    }
+    let base_limit = |i: usize| {
         if i < split {
             old_limit
         } else if new_limit >= old_limit {
@@ -292,28 +500,30 @@ pub fn velocity_band_gains_window(
             old_limit + step * (i - split + 1) as f32
         }
     };
+    let limit = |i: usize| base_limit(i) + room_floor;
+    if first >= n {
+        return match violation(vb, resid, first, s, &g, &limit) {
+            Ok(None) => BandAllocation { gains: g, status: AllocationStatus::Converged, passes: 0 },
+            Ok(Some(_)) => {
+                protective_fallback(vb, resid, first, s, active, g, &limit, AllocationStatus::ProtectiveFallback, 0)
+            }
+            Err(e) => invalid_allocation(g, active, e, 0),
+        };
+    }
+    let is_active = |k: usize| k >= active.0 && k < active.1;
+    let mut passes = 0;
     loop {
-        let (mut idx, mut worst) = (first, 0.0f32);
-        for i in first..n {
-            let mut y = if resid.is_empty() { 0.0 } else { resid[i] };
-            for k in 0..5 {
-                y += (g[k] * s) * vb[k][i];
-            }
-            if y.abs() > worst.abs() {
-                worst = y;
-                idx = i;
-            }
-        }
-        let limit = limit_at(idx);
-        if worst.abs() <= limit + room_floor || worst.is_nan() {
-            break;
-        }
+        let (idx, worst) = match violation(vb, resid, first, s, &g, &limit) {
+            Ok(None) => return BandAllocation { gains: g, status: AllocationStatus::Converged, passes },
+            Ok(Some(v)) => v,
+            Err(e) => return protective_fallback(vb, resid, first, s, active, g, &limit, e, passes),
+        };
         let sign = if worst >= 0.0 { 1.0 } else { -1.0 };
         let mut fixed = if resid.is_empty() { 0.0 } else { resid[idx] };
         for k in (0..5).filter(|&k| !is_active(k)) {
             fixed += (g[k] * s) * vb[k][idx];
         }
-        let room = (limit - sign * fixed).max(room_floor);
+        let room = (base_limit(idx) - sign * fixed).max(room_floor);
         let mut share = [0.0f32; 5];
         let mut sorted = [0.0f32; 5];
         let mut m = 0;
@@ -323,7 +533,17 @@ pub fn velocity_band_gains_window(
             m += 1;
         }
         if m == 0 {
-            break;
+            return protective_fallback(
+                vb,
+                resid,
+                first,
+                s,
+                active,
+                g,
+                &limit,
+                AllocationStatus::ProtectiveFallback,
+                passes,
+            );
         }
         let sorted = &mut sorted[..m];
         sorted.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
@@ -346,10 +566,26 @@ pub fn velocity_band_gains_window(
             }
         }
         if !changed {
-            break;
+            let fallback = protective_fallback(
+                vb,
+                resid,
+                first,
+                s,
+                active,
+                g,
+                &limit,
+                AllocationStatus::ProtectiveFallback,
+                passes,
+            );
+            if fallback.status == AllocationStatus::ProtectiveFallback
+                && within_binary32_resolution(vb, resid, idx, s, &g, worst, limit(idx))
+            {
+                return BandAllocation { gains: g, status: AllocationStatus::ConvergedAtResolution, passes };
+            }
+            return fallback;
         }
+        passes = passes.saturating_add(1);
     }
-    g
 }
 
 /// A fast band gain (residuals 5.1, decision-local): at every decision the
@@ -785,17 +1021,72 @@ mod tests {
     fn the_velocity_curve_extrapolates_past_the_last_anchor() {
         let k = [10.0, 20.0, 30.0, 40.0];
         let v = [0.5, 0.6, 1.0];
-        assert_eq!(velocity_limit(0.0, &k, &v, 2.0), 0.5);
-        assert!((velocity_limit(25.0, &k, &v, 2.0) - 0.8).abs() < 1e-6);
-        assert!((velocity_limit(40.0, &k, &v, 2.0) - 2.0).abs() < 1e-6);
-        assert!((velocity_limit(50.0, &k, &v, 2.0) - 3.0).abs() < 1e-6);
+        let metadata_max = 1.75;
+        assert_eq!(velocity_limit(0.0, &k, &v, metadata_max), 0.5);
+        assert!((velocity_limit(25.0, &k, &v, metadata_max) - 0.8).abs() < 1e-6);
+        assert!((velocity_limit(40.0, &k, &v, metadata_max) - metadata_max).abs() < 1e-6);
+        assert!((velocity_limit(50.0, &k, &v, metadata_max) - 2.5).abs() < 1e-6);
+        let changed_max = 2.25;
+        assert_eq!(velocity_limit(25.0, &k, &v, metadata_max), velocity_limit(25.0, &k, &v, changed_max));
+        assert_ne!(velocity_limit(35.0, &k, &v, metadata_max), velocity_limit(35.0, &k, &v, changed_max));
     }
 
     #[test]
     fn retained_velocity_bounds_switch_at_the_handoff() {
         let vb = [vec![2.0, 2.0], vec![0.0, 0.0], vec![0.0, 0.0], vec![0.0, 0.0], vec![0.0, 0.0]];
         let got = velocity_band_gains_window(&vb, &[], 0, 1.0, 2.0, 1, 0.1, 1.0, (0, 5), [1.0; 5]);
-        assert_eq!(got, [0.5, 1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(got.status, AllocationStatus::Converged);
+        assert_eq!(got.gains, [0.5, 1.0, 1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn non_finite_and_pathological_allocations_close_every_active_band() {
+        let mut vb = [vec![1.0], vec![0.0], vec![0.0], vec![0.0], vec![0.0]];
+        vb[0][0] = f32::NAN;
+        let bad = velocity_band_gains(&vb, &[], 0, 0.5, 1.0, (0, 5), [1.0; 5]);
+        assert_eq!(bad.status, AllocationStatus::NonFinite);
+        assert_eq!(bad.gains, [0.0; 5]);
+
+        vb[0][0] = f32::MAX;
+        let overflow = velocity_band_gains(&vb, &[], 0, 0.5, f32::MAX, (0, 5), [1.0; 5]);
+        assert_eq!(overflow.status, AllocationStatus::NonFinite);
+        assert_eq!(overflow.gains, [0.0; 5]);
+
+        let zero = [vec![0.0], vec![0.0], vec![0.0], vec![0.0], vec![0.0]];
+        let fixed = velocity_band_gains(&zero, &[1.0], 0, 0.5, 1.0, (0, 5), [1.0; 5]);
+        assert_eq!(fixed.status, AllocationStatus::Uncontrollable);
+        assert_eq!(fixed.gains, [0.0; 5]);
+
+        let ignored = [vec![1.0], vec![0.0], vec![0.0], vec![0.0], vec![0.0]];
+        let fixed_band = velocity_band_gains(&ignored, &[], 0, 0.5, 1.0, (1, 5), [1.0; 5]);
+        assert_eq!(fixed_band.status, AllocationStatus::Uncontrollable);
+        assert_eq!(fixed_band.gains, [1.0, 0.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn maximum_length_synthetic_allocation_terminates_safely() {
+        let n = MASK_MAX_POINTS;
+        let vb: [Vec<f32>; 5] = core::array::from_fn(|band| {
+            (0..n)
+                .map(|i| {
+                    let sign = if (i + band) & 1 == 0 { 1.0 } else { -1.0 };
+                    sign * (0.25 + ((i * (band + 3)) % 29) as f32 / 31.0)
+                })
+                .collect()
+        });
+        let a = velocity_band_gains(&vb, &[], 0, 0.4, 1.0, (0, 5), [1.0; 5]);
+        assert!(a.passes() > 0);
+        match a.status {
+            AllocationStatus::Converged => {
+                assert!(violation(&vb, &[], 0, 1.0, &a.gains, &|_| 0.4).unwrap().is_none());
+            }
+            AllocationStatus::ConvergedAtResolution => {
+                let (idx, worst) = violation(&vb, &[], 0, 1.0, &a.gains, &|_| 0.4).unwrap().unwrap();
+                assert!(within_binary32_resolution(&vb, &[], idx, 1.0, &a.gains, worst, 0.4));
+            }
+            AllocationStatus::ProtectiveFallback => assert_eq!(a.gains, [0.0; 5]),
+            _ => assert_eq!(a.gains, [0.0; 5]),
+        }
     }
 
     #[test]
@@ -803,7 +1094,8 @@ mod tests {
         let vb = [vec![0.0, 0.0, 1.6, 0.0], vec![0.0; 4], vec![0.0; 4], vec![0.0; 4], vec![0.0; 4]];
         let got = velocity_band_gains_window(&vb, &[], 0, 2.0, 1.0, 2, 0.0, 1.0, (0, 5), [1.0; 5]);
         // The first post-split sample uses old + (new - old) / 2 = 1.5.
-        assert_eq!(got, [0.9375, 1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(got.status, AllocationStatus::Converged);
+        assert_eq!(got.gains, [0.9375, 1.0, 1.0, 1.0, 1.0]);
     }
 
     #[test]
@@ -815,7 +1107,8 @@ mod tests {
         // same equal-magnitude sample and stops at its limit; native does not
         // instead maximize excess or ratio and therefore does not cut to
         // sample 3's 1.0 limit.
-        assert_eq!(got, [0.9375, 1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(got.status, AllocationStatus::Converged);
+        assert_eq!(got.gains, [0.9375, 1.0, 1.0, 1.0, 1.0]);
     }
 
     #[test]
