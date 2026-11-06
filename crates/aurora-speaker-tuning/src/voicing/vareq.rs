@@ -65,7 +65,11 @@ pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option
     let pre_gain_db = match g.get(PRE_GAIN) {
         Some(v) => num(Some(v), "pre-gain parameter 7".into())?,
         None => {
-            diags.info("vareq-pre-gain-default", "VarEQ", "pre-gain not saved: the unit's published default (0 dB) applies");
+            diags.info(
+                "vareq-pre-gain-default",
+                "VarEQ",
+                "pre-gain not saved: the unit's published default (0 dB) applies",
+            );
             PRE_GAIN_DEFAULT_DB
         }
     };

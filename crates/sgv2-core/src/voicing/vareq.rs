@@ -26,18 +26,22 @@
 //!   value (even one that keeps the setting); a volume change during a fade waits
 //!   for the fade's end and then fades to the latest volume. A change before
 //!   the first processed frame applies at once.
-//!
-//! TODO(SPEC): during a crossfade the unit's new-setting filters start from a
-//! state that is not a copy of the old filters' state (the difference decays
-//! within the 20 ms fade); this box copies the old state. Steady state and
-//! the fade law are exact.
+//! - The new filter bank starts from zero state, then is primed with the whole
+//!   previous host slice (its output is discarded) before it processes the
+//!   first crossfade slice. This makes the handoff depend on host slice size.
 
+use alloc::vec;
+use alloc::vec::Vec;
 use libm::{cos, pow, sin, sinh, sqrt};
 
 pub const BANDS: usize = 8;
 pub const ELEMENTS: usize = 5;
 pub const BREAKPOINTS: usize = ELEMENTS - 1;
 pub const MAX_CHANNELS: usize = 8;
+/// Maximum host slice retained to prime a newly selected filter bank.
+///
+/// The plugin and differential hosts cap their real-time slices at this size.
+pub const MAX_SLICE_FRAMES: usize = 4096;
 /// Crossfade time between two settings.
 pub const FADE_S: f64 = 0.020;
 /// Lowest high-pass frequency while a high pass fades in or out.
@@ -335,6 +339,9 @@ pub struct Run {
     /// The volume scalar of the current (or, while fading, the next) setting.
     volume: f64,
     started: bool,
+    /// Previous host slice, channel-major. A new bank is primed from it.
+    previous_input: Vec<f32>,
+    previous_frames: usize,
 }
 
 impl Run {
@@ -358,6 +365,8 @@ impl Run {
             pending: None,
             volume: 1.0,
             started: false,
+            previous_input: vec![0.0; MAX_CHANNELS * MAX_SLICE_FRAMES],
+            previous_frames: 0,
         }
     }
 
@@ -379,6 +388,7 @@ impl Run {
         self.cur_state = [[[0.0; 4]; BANDS]; MAX_CHANNELS];
         self.next_state = self.cur_state;
         self.started = false;
+        self.previous_frames = 0;
         self.take_pending();
     }
 
@@ -398,7 +408,13 @@ impl Run {
             // that resolves to the same setting; that fade still holds off
             // the next change until it ends.
             self.next = s;
-            self.next_state = self.cur_state;
+            self.next_state = [[[0.0; 4]; BANDS]; MAX_CHANNELS];
+            for c in 0..self.channels {
+                let history = &self.previous_input[c * MAX_SLICE_FRAMES..c * MAX_SLICE_FRAMES + self.previous_frames];
+                for &x in history {
+                    let _ = run_setting(&self.next, &mut self.next_state[c], x as f64);
+                }
+            }
             self.fade = Some(0);
         }
         self.volume = v;
@@ -410,15 +426,22 @@ impl Run {
         }
         let ch = self.channels.min(bufs.len());
         let frames = bufs[..ch].iter().fold(frames, |n, b| n.min(b.len()));
+        // Parameter changes are consumed only at render-call boundaries. A
+        // change held during a fade therefore starts on the call after that
+        // fade finishes, matching the unit's slice-based handoff.
+        if self.fade.is_none() && self.pending.is_some() {
+            self.take_pending();
+        }
+        let keep_from = frames.saturating_sub(MAX_SLICE_FRAMES);
         for i in 0..frames {
-            if self.fade.is_none() && self.pending.is_some() {
-                self.take_pending();
-            }
             self.started = true;
             match self.fade {
                 None => {
                     for (c, b) in bufs[..ch].iter_mut().enumerate() {
                         let x = if b[i].is_finite() { b[i] as f64 } else { 0.0 };
+                        if i >= keep_from {
+                            self.previous_input[c * MAX_SLICE_FRAMES + i - keep_from] = x as f32;
+                        }
                         b[i] = run_setting(&self.cur, &mut self.cur_state[c], x) as f32;
                     }
                 }
@@ -426,6 +449,9 @@ impl Run {
                     let r = k as f64 / self.fade_len as f64;
                     for (c, b) in bufs[..ch].iter_mut().enumerate() {
                         let x = if b[i].is_finite() { b[i] as f64 } else { 0.0 };
+                        if i >= keep_from {
+                            self.previous_input[c * MAX_SLICE_FRAMES + i - keep_from] = x as f32;
+                        }
                         let yo = run_setting(&self.cur, &mut self.cur_state[c], x);
                         let yn = run_setting(&self.next, &mut self.next_state[c], x);
                         b[i] = ((1.0 - r) * yo + r * yn) as f32;
@@ -440,6 +466,7 @@ impl Run {
                 }
             }
         }
+        self.previous_frames = frames.min(MAX_SLICE_FRAMES);
     }
 }
 
@@ -524,10 +551,33 @@ mod tests {
         r.set_volume_scalar(0.1); // same setting: a silent fade
         r.process(&mut [&mut a], 64);
         r.set_volume_scalar(1.0); // waits for that fade
-        let mut b = [0.5f32; 1000];
-        r.process(&mut [&mut b], 1000);
+        let mut b = [0.5f32; 896];
+        r.process(&mut [&mut b], 896);
         assert_eq!(b[895], 0.5);
-        assert!(b[897] < 0.5);
+        let mut c = [0.5f32; 4];
+        r.process(&mut [&mut c], 4);
+        assert_eq!(c[0], 0.5);
+        assert!(c[1] < 0.5);
+    }
+
+    #[test]
+    fn new_bank_is_primed_from_the_previous_host_slice() {
+        let p = synthetic();
+        let mut r = Run::new(&p, 48_000.0, 1);
+        let input: [f32; 64] = core::array::from_fn(|i| i as f32 / 64.0 - 0.5);
+        let mut rendered = input;
+        r.process(&mut [&mut rendered], input.len());
+
+        r.set_volume_scalar(0.8);
+        r.take_pending();
+
+        let next = resolve(&p, 0.8, 48_000.0);
+        let mut expected = [[0.0; 4]; BANDS];
+        for x in input {
+            let _ = run_setting(&next, &mut expected, x as f64);
+        }
+        assert_eq!(r.next_state[0], expected);
+        assert_ne!(r.next_state[0], r.cur_state[0]);
     }
 
     #[test]
