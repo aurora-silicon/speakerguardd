@@ -23,19 +23,17 @@ fn main() {
     let mut pre = PreStage::with_rate(p, fs);
     let mut out = vec![0.0f32; x.len()];
     const Q: usize = 512;
-    let mut ins = vec![vec![0.0f32; Q]; n];
     let mut outs = vec![vec![0.0f32; Q]; n];
     let mut at = 0;
     while at < frames {
         let k = (frames - at).min(Q);
         for c in 0..n {
             for i in 0..k {
-                ins[c][i] = x[(at + i) * n + c];
+                outs[c][i] = x[(at + i) * n + c];
             }
-            pre.process(c, &ins[c][..k], &mut outs[c][..k]);
         }
         let mut bufs: Vec<&mut [f32]> = outs.iter_mut().map(|o| &mut o[..k]).collect();
-        pre.process_dynamics(&mut bufs, k);
+        pre.process_block(&mut bufs, k);
         for c in 0..n {
             for i in 0..k {
                 out[(at + i) * n + c] = outs[c][i];
