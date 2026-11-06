@@ -99,16 +99,16 @@
 //! Fast axes (residuals 5, Daybreak t-4731): one sequential chain of
 //! signed worst-sample allocations per decision on five band buffers:
 //! displacement (fresh band models over the retained window, with the
-//! retained full-band residual), velocity (fresh band models, from 1 ms; the
-//! ignore switches mask only the committed cut), then sample peak (the raw
-//! bank bands). One band follower per band takes the final request; the
-//! audio applies `slow * sum(band * signal)`.
+//! protected-output model's state carry), velocity (fresh band models, from
+//! 1 ms; the ignore switches mask only the committed cut), then sample peak
+//! (the raw bank bands). One band follower per band takes the final request;
+//! the audio applies `slow * sum(band * signal)`.
 //!
 //! Velocity fixed term (t-4751, t-4763): the zero-input carry of a
 //! persistent Float32 full-band velocity model that advances on the
-//! protected output; displacement keeps the retained full-band residual
-//! (t-4731). Motion models share one Float32 biquad with the measured fused
-//! order.
+//! protected output. Displacement uses the corresponding protected-output
+//! displacement carry (t-4800). Motion carries share one Float32 biquad with
+//! the measured fused order.
 //!
 //! Known residuals against 25G83 (rig report):
 //! - interim safety layer: the output ceiling held to 0.99 of its rise over
@@ -1212,11 +1212,11 @@ struct Chan {
     /// The velocity model in its zero state (residuals 5: five fresh models
     /// per decision over the retained window).
     vel_proto: Biquad32,
-    /// The displacement model in its zero state, the five band displacement
-    /// buffers, the retained full-band displacement over the window (as
-    /// `ab`) and the fixed residual (residuals 5.2).
+    /// The displacement model in its zero state and five band displacement
+    /// buffers. The fixed term comes from `dcar_m`.
     disp_proto: Biquad,
-    dfull: Vec<f32>,
+    /// Persistent full-band displacement state driven by protected output.
+    dcar_m: Biquad32,
     rd: Vec<f32>,
     db: [Vec<f32>; BANDS],
     /// The persistent full-band displacement and velocity models at the
@@ -1550,6 +1550,7 @@ impl Run {
                 None
             };
             let vel = motion(c.vel_rdc, c.vel_bl, c.vel_mms_kg, c.vel_rms, c.vel_kms, rate, true);
+            let disp = motion(c.disp_rdc, c.disp_bl, c.disp_mms_kg, c.disp_rms, c.disp_kms, rate, false);
             let cur = Current::new(c.rdc as f64, c.bl as f64, c.mms_kg as f64, c.rms as f64, c.kms as f64, rate);
             let br_vc = ThermalBranch::new(c.rth_vc as f64, c.tau_vc as f64, sub_dt);
             let br_mg = ThermalBranch::new(c.rth_mag as f64, c.tau_mag as f64, sub_dt);
@@ -1560,16 +1561,16 @@ impl Run {
                 bank,
                 ab: core::array::from_fn(|_| vec![0.0; od + ctl]),
                 xc: vec![0.0; od + ctl],
-                disp: motion(c.disp_rdc, c.disp_bl, c.disp_mms_kg, c.disp_rms, c.disp_kms, rate, false),
+                disp,
                 vel,
                 vel_band: [vel; BANDS - 1],
                 vel_proto: Biquad32::from(&vel),
-                disp_proto: motion(c.disp_rdc, c.disp_bl, c.disp_mms_kg, c.disp_rms, c.disp_kms, rate, false),
+                disp_proto: disp,
+                dcar_m: Biquad32::from(&disp),
                 db: core::array::from_fn(|_| vec![0.0; od + ctl]),
                 vcar_m: Biquad32::from(&vel),
                 protected_peak: ProtectedPeak::new(rate as usize),
                 protected_peak_now: 0.0,
-                dfull: vec![0.0; od + ctl],
                 rd: vec![0.0; od + ctl],
                 vcar: vec![0.0; od + ctl],
                 pk_x: [0.0; RING],
@@ -1685,6 +1686,7 @@ impl Run {
             c.ab.iter_mut().for_each(|b| b.iter_mut().for_each(|v| *v = 0.0));
             c.xc.iter_mut().for_each(|v| *v = 0.0);
             c.disp.clear();
+            c.dcar_m.clear();
             c.vel.clear();
             c.vel_band.iter_mut().for_each(Biquad::clear);
             c.pk_x = [0.0; RING];
@@ -1710,7 +1712,7 @@ impl Run {
             c.vcar_m.clear();
             c.protected_peak.clear();
             c.protected_peak_now = 0.0;
-            c.vcar.iter_mut().chain(c.dfull.iter_mut()).chain(c.rd.iter_mut()).for_each(|v| *v = 0.0);
+            c.vcar.iter_mut().chain(c.rd.iter_mut()).for_each(|v| *v = 0.0);
             c.eg.iter_mut().for_each(|e| e.iter_mut().for_each(|v| *v = 1.0));
             c.cur_in.clear();
             c.pbar_in = [0.0; 4];
@@ -1774,7 +1776,6 @@ impl Run {
             c.xc[od + i] = xc;
             let u = vfs * xc as f64;
             let d = c.disp.step(u);
-            c.dfull[od + i] = d as f32;
             let v = c.vel.step(u);
             let mut vrest = v;
             for k in 0..BANDS - 1 {
@@ -1895,15 +1896,7 @@ impl Run {
                         c.db[k][i] = m.step(vfs * c.ab[k][i] as f64) as f32;
                     }
                 }
-                // t-4731 / t-4758: displacement keeps the retained
-                // full-band residual over the whole window
-                for i in 0..c.rd.len() {
-                    let mut sum = 0.0f32;
-                    for k in 0..BANDS {
-                        sum += c.db[k][i];
-                    }
-                    c.rd[i] = c.dfull[i] - sum;
-                }
+                c.dcar_m.carry(&mut c.rd, fbl);
             }
             let vlim_g = c.vel_limit_now as f32;
             let stream_ready = c.protected_peak.ready();
@@ -2196,7 +2189,8 @@ impl Run {
                 acc += u as f64 * iv as f64;
                 acc32 += u * iv;
                 *yo = v.clamp(-1.0, 1.0);
-                // the persistent velocity model follows the protected output
+                // The persistent motion models follow the protected output.
+                c.dcar_m.step(c.vfs * *yo);
                 let modeled_velocity = c.vcar_m.step(c.vfs * *yo);
                 protected_model_peak = protected_model_peak.max(modeled_velocity.abs());
                 if (i + 1) % sub == 0 {
@@ -2223,13 +2217,14 @@ impl Run {
             for b in c.ab.iter_mut() {
                 b.copy_within(ctl..ctl + od, 0);
             }
-            c.dfull.copy_within(ctl..ctl + od, 0);
             c.xc.copy_within(ctl..ctl + od, 0);
             let model = [c.th_vc, c.th_mg, c.tp_vc, c.tp_mg].iter().all(|v| v.is_finite())
                 && c.masker.as_ref().is_none_or(Masker::is_finite)
                 && c.pbar.iter().chain(&c.pbar_in).all(|v| v.is_finite())
                 && c.gt.is_finite();
-            let motion = [&c.disp, &c.vel].iter().all(|b| b.y[0].is_finite())
+            let motion = c.disp.y[0].is_finite()
+                && c.dcar_m.y[0].is_finite()
+                && c.vel.y[0].is_finite()
                 && c.vel_band.iter().all(|b| b.y[0].is_finite())
                 && c.cur_in.is_finite()
                 && c.cur_out.is_finite();
@@ -2585,6 +2580,43 @@ mod fault_tests {
             let (o, h) = run(&mut u, 0.01, 2048);
             assert_eq!((o[2047], h), (0.01, Health::OK));
         }
+    }
+
+    #[test]
+    fn displacement_fixed_term_is_the_truncated_protected_output_carry() {
+        let mut p = params();
+        p.control_displacement = 1;
+        let mut u = Unit::new(p);
+        run(&mut u, 1.0, CONTROLLER_FRAMES);
+
+        let r = u.run.as_ref().unwrap();
+        let c = &r.ch[0];
+        let q = motion(
+            p.ch[0].disp_rdc,
+            p.ch[0].disp_bl,
+            p.ch[0].disp_mms_kg,
+            p.ch[0].disp_rms,
+            p.ch[0].disp_kms,
+            p.sample_rate as f64,
+            false,
+        );
+        let mut replay = Biquad32::from(&q);
+        for &y in &r.yout[0] {
+            replay.step(p.ch[0].volts_full_scale * y);
+        }
+        assert_eq!(c.dcar_m.x.map(f32::to_bits), replay.x.map(f32::to_bits));
+        assert_eq!(c.dcar_m.y.map(f32::to_bits), replay.y.map(f32::to_bits));
+
+        let mut want = vec![0.0; c.rd.len()];
+        c.dcar_m.carry(&mut want, r.fb);
+        assert!(want[..r.fb].iter().any(|&v| v != 0.0));
+        run(&mut u, 1.0, CONTROLLER_FRAMES);
+        let r = u.run.as_ref().unwrap();
+        assert_eq!(
+            r.ch[0].rd.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            want.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+        assert!(r.ch[0].rd[r.fb..].iter().all(|&v| v == 0.0));
     }
 
     #[test]
