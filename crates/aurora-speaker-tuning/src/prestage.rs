@@ -270,7 +270,7 @@ pub(crate) fn voicing_tone(
         channels.push(ch);
     }
     if !volume_wired || stage.bypass {
-        return Ok(Tone { channels, automation: Vec::new() });
+        return Ok(Tone { channels, automation: Vec::new(), dynamic: tone_dynamic(&parts, &ctx)? });
     }
     let g = stage
         .state
@@ -351,7 +351,41 @@ pub(crate) fn voicing_tone(
         });
         automated_slots.push(target);
     }
-    Ok(Tone { channels, automation: out })
+    Ok(Tone { channels, automation: out, dynamic: tone_dynamic(&parts, &ctx)? })
+}
+
+/// Merge the per-channel records of a Tone box into linked runtime slots.
+fn tone_dynamic(parts: &[Part], ctx: &str) -> Result<Vec<DynamicAt>> {
+    let Some(first_part) = parts.first() else { return Ok(Vec::new()) };
+    let order: Vec<u32> = first_part.dynamics.iter().map(|d| d.slot).collect();
+    for (channel, part) in parts.iter().enumerate().skip(1) {
+        let lane_order: Vec<u32> = part.dynamics.iter().map(|d| d.slot).collect();
+        if lane_order != order {
+            return Err(bad(format!("{ctx}: channel {channel} passes dynamic slots {lane_order:?}, not {order:?}")));
+        }
+    }
+    if order.len() > MAX_DYNAMIC_FILTERS {
+        return Err(bad(format!("{ctx}: {} dynamic slots; at most {MAX_DYNAMIC_FILTERS}", order.len())));
+    }
+    let mut out = Vec::with_capacity(order.len());
+    for k in 0..order.len() {
+        let first = first_part.dynamics[k];
+        let mut at = DynamicAt { params: first.params, ..Default::default() };
+        for (channel, part) in parts.iter().enumerate() {
+            let d = part.dynamics[k];
+            if d.params != first.params {
+                return Err(bad(format!("{ctx}: dynamic slot {} differs between channels", first.slot)));
+            }
+            at.split[channel] = d.split;
+            at.active_mask |= (d.active as u32) << channel;
+            at.sidechain_mask |= (d.sidechain as u32) << channel;
+        }
+        if at.active_mask == 0 || at.sidechain_mask == 0 {
+            return Err(bad(format!("{ctx}: dynamic slot {} has no output or sidechain channels", first.slot)));
+        }
+        out.push(at);
+    }
+    Ok(out)
 }
 
 /// The volume automation entries of a filter box that move something: on
@@ -684,7 +718,7 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics, exact_vol
             }
         };
         if let Some(dynamic_kind) = dynamic_kind {
-            if automated {
+            if has_automation {
                 return Err(bad(format!("{ctx}: slot {i}: volume automation on a level-dependent filter")));
             }
             let threshold = at(6)?;
@@ -1615,6 +1649,9 @@ mod tests {
         let pd = part(&dynamic, 0, fs, &mut d).unwrap();
         assert_eq!((pd.sections.len(), pd.dynamics.len()), (0, 1));
         assert_eq!(pd.dynamics[0].params.kind, DynamicKind::Notch);
+        let tone = voicing_tone(&dynamic, 2, false, fs, &mut d).unwrap();
+        assert_eq!(tone.dynamic.len(), 1);
+        assert_eq!((tone.dynamic[0].active_mask, tone.dynamic[0].sidechain_mask), (3, 3));
         let tilt = tmst(&[], &[(0, [3.0, 7.0, 12.0, 300.0, 9.0, 8.0, 3.0, 0.0])]);
         let pt = part(&tilt, 0, fs, &mut d).unwrap();
         assert_eq!((pt.sections.len(), pt.gain_db), (4, -12.0));
@@ -1856,6 +1893,12 @@ mod tests {
         let st = tmst(&equal, &[(0, [3.0, 11.0, 12.0, 100.0, core::f32::consts::FRAC_1_SQRT_2, 2.0, 3.0, 0.0])]);
         assert!(voicing_tone(&st, 2, true, fs, &mut d).unwrap().automation.is_empty());
         assert!(voicing_tone(&st, 2, false, fs, &mut d).unwrap().automation.is_empty());
+
+        let dynamic = tmst(
+            &auto(0, 0.0, 0.2, (0.8, -12.0, 1000.0), None),
+            &[(0, [3.0, 15.0, -6.0, 800.0, 2.0, 4.0, -20.0, 0.0])],
+        );
+        assert!(voicing_tone(&dynamic, 2, true, fs, &mut d).is_err());
     }
 
     #[test]

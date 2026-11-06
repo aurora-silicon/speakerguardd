@@ -133,7 +133,7 @@ impl Default for DynamicFilter {
 }
 
 impl DynamicFilter {
-    fn valid(&self, fs: f64) -> bool {
+    pub(crate) fn valid(&self, fs: f64) -> bool {
         let finite = |v: f64, lo: f64, hi: f64| v.is_finite() && v >= lo && v <= hi;
         finite(self.range_db, -30.0, 0.0)
             && finite(self.frequency_hz, 1.0, 0.49 * fs)
@@ -1061,6 +1061,36 @@ impl PreStage {
         }
     }
 
+    /// Float-coefficient counterpart of [`Self::run_sections`] for a
+    /// ToneMeister box. Its static cascade rounds after every section.
+    fn run_sections_float(&mut self, c: usize, from: usize, to: usize, gain: f64, buf: &mut [f32]) {
+        let (Some(ch), Some(z)) = (self.params.channel.get(c), self.state.get_mut(c)) else {
+            buf.fill(0.0);
+            return;
+        };
+        let to = to.min(ch.count).min(MAX_SECTIONS);
+        let from = from.min(to);
+        for y in buf.iter_mut() {
+            let mut v = if y.is_finite() { y.clamp(-INPUT_BOUND, INPUT_BOUND) } else { 0.0 };
+            for (s, st) in ch.sections[from..to].iter().zip(z[from..to].iter_mut()) {
+                let out = s.b0 as f32 * v + st[0] as f32;
+                let z0 = s.b1 as f32 * v - s.a1 as f32 * out + st[1] as f32;
+                let z1 = s.b2 as f32 * v - s.a2 as f32 * out;
+                *st = [z0 as f64, z1 as f64];
+                v = out;
+            }
+            v *= gain as f32;
+            if v.is_finite() {
+                *y = v;
+            } else {
+                for st in z[from..to].iter_mut() {
+                    *st = [0.0; 2];
+                }
+                *y = 0.0;
+            }
+        }
+    }
+
     /// The whole pre-stage in place on every channel (`bufs[c]` holds
     /// channel `c`'s input and gets its output): each channel's sections
     /// and gains up to the first box, the box (linked), the next sections,
@@ -1100,6 +1130,55 @@ impl PreStage {
                     (self.params.channel[c].count, self.params.channel[c].gain)
                 };
                 self.run_sections(c, from[c], to, gain, &mut bufs[c][..len]);
+                from[c] = to;
+            }
+            if k < count {
+                if let Some(run) = &mut self.boxes[k] {
+                    run.process(&mut bufs[..n], frames);
+                }
+            }
+        }
+        if let Some(d) = &mut self.dynamics {
+            d.process(&mut bufs[..n], frames);
+        }
+    }
+
+    /// [`Self::process_block`] with the installed Tone box's float static
+    /// cascade. Dynamic slots remain linked and ordered across channels.
+    pub(crate) fn process_block_float(&mut self, bufs: &mut [&mut [f32]], frames: usize) {
+        let n = bufs.len().min(MAX_CHANNELS);
+        for (c, b) in bufs.iter_mut().enumerate().take(n) {
+            if c >= self.params.channels {
+                b.fill(0.0);
+            }
+        }
+        let n = n.min(self.params.channels);
+        let count = self.params.box_count.min(MAX_BOXES);
+        let mut from = [0usize; MAX_CHANNELS];
+        let mut dynamic_index = 0usize;
+        for k in 0..=count {
+            while dynamic_index < self.params.dynamic_count.min(MAX_DYNAMIC_FILTERS)
+                && self.params.dynamic[dynamic_index].before_box == k
+            {
+                let at = self.params.dynamic[dynamic_index];
+                for c in 0..n {
+                    let len = frames.min(bufs[c].len());
+                    self.run_sections_float(c, from[c], at.split[c], 1.0, &mut bufs[c][..len]);
+                    from[c] = at.split[c];
+                }
+                if let Some(run) = &mut self.dynamic[dynamic_index] {
+                    run.process(&at, &mut bufs[..n], frames);
+                }
+                dynamic_index += 1;
+            }
+            for c in 0..n {
+                let len = frames.min(bufs[c].len());
+                let (to, gain) = if k < count {
+                    (self.params.boxes[k].split[c], self.params.boxes[k].gain[c])
+                } else {
+                    (self.params.channel[c].count, self.params.channel[c].gain)
+                };
+                self.run_sections_float(c, from[c], to, gain, &mut bufs[c][..len]);
                 from[c] = to;
             }
             if k < count {

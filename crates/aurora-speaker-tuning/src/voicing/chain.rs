@@ -60,9 +60,17 @@ fn tone(
     volume_wired: bool,
     fs: f64,
     diags: &mut Diagnostics,
-    _gaps: &mut Vec<(String, String)>,
+    gaps: &mut Vec<(String, String)>,
 ) -> Result<Kind> {
-    Ok(Kind::Tone(crate::prestage::voicing_tone(stage, width, volume_wired, fs, diags)?))
+    let tone = crate::prestage::voicing_tone(stage, width, volume_wired, fs, diags)?;
+    if !tone.dynamic.is_empty() {
+        gaps.push((
+            stage.name.clone(),
+            "level-dependent filters use the conservative direct detector; spectral reconstruction parity is pending"
+                .into(),
+        ));
+    }
+    Ok(Kind::Tone(tone))
 }
 
 /// A box of a carried type whose saved state the module cannot carry: a
