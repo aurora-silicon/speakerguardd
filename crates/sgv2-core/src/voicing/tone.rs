@@ -55,7 +55,8 @@ fn denominator_magnitude(a: [f64; 2], w: f64) -> f64 {
     let s1 = libm::sin(w);
     let c2 = libm::cos(2.0 * w);
     let s2 = libm::sin(2.0 * w);
-    libm::sqrt((1.0 + a[0] * c1 + a[1] * c2).powi(2) + (a[0] * s1 + a[1] * s2).powi(2))
+    let (re, im) = (1.0 + a[0] * c1 + a[1] * c2, a[0] * s1 + a[1] * s2);
+    libm::sqrt(re * re + im * im)
 }
 
 /// Minimum-phase real FIR of order two from its magnitudes at DC,
@@ -243,10 +244,11 @@ pub fn butterworth_shelf(gain_db: f64, f3: f64, f4: f64, max_order: u32, fs: f64
         return out;
     }
 
-    let fraction = n.fract();
+    // f64::fract and floor are std-only; the core builds without std
+    let fraction = n - libm::trunc(n);
     let easing = (0.6 - 0.04 * n).max(0.2);
     let shape = n - easing * fraction * (1.0 - fraction);
-    let pairs = (n / 2.0).floor() as u32;
+    let pairs = libm::floor(n / 2.0) as u32;
     let boost = gain_db > 0.0;
     let g = libm::pow(10.0, -gain_db.abs() / 20.0);
     let a = libm::pow(g, 1.0 / (2.0 * shape));

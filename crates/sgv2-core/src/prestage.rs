@@ -795,7 +795,7 @@ impl PreStage {
         }
         let secs = &ch.sections[..ch.count.min(MAX_SECTIONS)];
         for (x, y) in input.iter().zip(output.iter_mut()) {
-            let mut v = if x.is_finite() { x.clamp(-INPUT_BOUND as f32, INPUT_BOUND as f32) } else { 0.0 };
+            let mut v = if x.is_finite() { x.clamp(-INPUT_BOUND, INPUT_BOUND) } else { 0.0 };
             for (s, st) in secs.iter().zip(z.iter_mut()) {
                 let out = s.b0 as f32 * v + st[0] as f32;
                 let z0 = s.b1 as f32 * v - s.a1 as f32 * out + st[1] as f32;
