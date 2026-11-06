@@ -34,6 +34,18 @@
 //! (4) threshold dB, ratio, range dB, makeup dB, mode (0 compress, 1 pass,
 //! 2 mute).
 //!
+//! With [`FLAG_BOXES`], the graph's compressor boxes follow instead (they
+//! replace the dynamics block), each run at its own place in the lane:
+//! `boxes` u32, 0 u32, then per box, per channel: `split` u32 (how many of
+//! the channel's sections run before this box), 0 u32, `gain` f64 (the
+//! channel's gain applied right before this box), then the box's
+//! [`crate::voicing::mstk::Params`] words (f64). Splits never decrease from
+//! box to box. The channel's own `gain` is applied after its last section.
+//! [`PreStage::process_block`] runs sections, gains and boxes in that order;
+//! a box links its detection across every channel, which is the graph's
+//! own linking because channels that share a box channel carry identical
+//! filtering up to it (the compiler checks that).
+//!
 //! The compressor: a four-band Linkwitz-Riley tree (fourth order, with the
 //! second-order allpass compensation that keeps every band in phase, so the
 //! bands sum to an allpass); per band, the louder channel's power, held
@@ -58,8 +70,31 @@ pub const MAX_SECTIONS: usize = 64;
 pub const FLAG_FROM_TUNING: u32 = 1 << 0;
 /// `flags` bit: a [`Dynamics`] block follows the channels.
 pub const FLAG_DYNAMICS: u32 = 1 << 1;
+/// `flags` bit: compressor boxes at their graph places follow the channels
+/// (see the module documentation); they replace [`FLAG_DYNAMICS`].
+pub const FLAG_BOXES: u32 = 1 << 2;
+/// Most compressor boxes a lane passes ahead of the unit.
+pub const MAX_BOXES: usize = 4;
 /// Bands of the multiband dynamics.
 pub const BANDS: usize = 4;
+
+use crate::voicing::mstk;
+
+/// One compressor box of the graph, at its place in every lane.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BoxAt {
+    /// Per channel: how many of its sections run before the box.
+    pub split: [usize; MAX_CHANNELS],
+    /// Per channel: the gain applied right before the box.
+    pub gain: [f64; MAX_CHANNELS],
+    pub params: mstk::Params,
+}
+
+impl Default for BoxAt {
+    fn default() -> Self {
+        BoxAt { split: [0; MAX_CHANNELS], gain: [1.0; MAX_CHANNELS], params: mstk::Params::default() }
+    }
+}
 const DYN_WORDS: usize = 6 + 5 * BANDS;
 
 /// How one band of the dynamics treats its signal.
@@ -239,6 +274,10 @@ pub struct Params {
     pub channel: [Channel; MAX_CHANNELS],
     /// Present exactly when `flags` has [`FLAG_DYNAMICS`].
     pub dynamics: Option<Dynamics>,
+    /// The first `box_count` are present exactly when `flags` has
+    /// [`FLAG_BOXES`], in graph order.
+    pub boxes: [BoxAt; MAX_BOXES],
+    pub box_count: usize,
 }
 
 impl Params {
@@ -249,7 +288,26 @@ impl Params {
             flags: 0,
             channel: [Channel::IDENTITY; MAX_CHANNELS],
             dynamics: None,
+            boxes: [BoxAt::default(); MAX_BOXES],
+            box_count: 0,
         }
+    }
+
+    /// The compressor boxes, in graph order.
+    pub fn boxes(&self) -> &[BoxAt] {
+        &self.boxes[..self.box_count.min(MAX_BOXES)]
+    }
+
+    /// `|H|` of channel `c`'s filters and gains at `f` Hz, the boxes left out.
+    pub fn linear_magnitude(&self, c: usize, f: f64, fs: f64) -> f64 {
+        self.boxes().iter().fold(self.channel[c].magnitude(f, fs), |m, b| m * b.gain[c].abs())
+    }
+
+    /// The largest [`Params::linear_magnitude`] of channel `c` on [`check_grid`].
+    pub fn linear_peak(&self, c: usize, fs: f64) -> f64 {
+        let mut peak = 0.0f64;
+        check_grid(fs, |f| peak = peak.max(self.linear_magnitude(c, f, fs)));
+        peak
     }
 
     pub fn from_tuning(&self) -> bool {
@@ -270,11 +328,28 @@ impl Params {
                 }
             }
         }
-        let mut flags = self.flags & !FLAG_DYNAMICS;
+        let mut flags = self.flags & !(FLAG_DYNAMICS | FLAG_BOXES);
         if let Some(d) = &self.dynamics {
             flags |= FLAG_DYNAMICS;
             for v in d.words() {
                 body.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        if self.box_count > 0 {
+            flags |= FLAG_BOXES;
+            body.extend_from_slice(&(self.box_count as u32).to_le_bytes());
+            body.extend_from_slice(&0u32.to_le_bytes());
+            for b in self.boxes() {
+                for c in 0..self.channels {
+                    body.extend_from_slice(&(b.split[c] as u32).to_le_bytes());
+                    body.extend_from_slice(&0u32.to_le_bytes());
+                    body.extend_from_slice(&b.gain[c].to_le_bytes());
+                }
+                let mut w = [0.0f64; mstk::Params::WORDS];
+                b.params.to_words(&mut w);
+                for v in w {
+                    body.extend_from_slice(&v.to_le_bytes());
+                }
             }
         }
         let mut out = MAGIC.to_vec();
@@ -308,7 +383,8 @@ impl Params {
         if crc32(body) != crc {
             return Err(BlobError::Crc);
         }
-        let mut p = Params { channels: n, flags, channel: [Channel::IDENTITY; MAX_CHANNELS], dynamics: None };
+        let mut p = Params::identity(n);
+        p.flags = flags;
         let f64_at = |i: usize| -> Result<f64, BlobError> {
             let b: [u8; 8] = body.get(i..i + 8).ok_or(BlobError::Length)?.try_into().map_err(|_| BlobError::Length)?;
             Ok(f64::from_le_bytes(b))
@@ -338,7 +414,7 @@ impl Params {
                     return Err(BlobError::Unstable);
                 }
             }
-            if !ch.gain.is_finite() || ch.peak(fs) > UNITY_TOLERANCE {
+            if !ch.gain.is_finite() {
                 return Err(BlobError::Unstable);
             }
         }
@@ -354,7 +430,50 @@ impl Params {
             }
             p.dynamics = Some(d);
         }
-        if flags & !(FLAG_FROM_TUNING | FLAG_DYNAMICS) != 0 {
+        if flags & FLAG_BOXES != 0 {
+            if flags & FLAG_DYNAMICS != 0 || body.len() < at + 8 {
+                return Err(BlobError::Length);
+            }
+            let count = word(body, at) as usize;
+            if count == 0 || count > MAX_BOXES || word(body, at + 4) != 0 {
+                return Err(BlobError::Length);
+            }
+            at += 8;
+            p.box_count = count;
+            for k in 0..count {
+                let mut b = BoxAt::default();
+                for c in 0..n {
+                    if body.len() < at + 16 || word(body, at + 4) != 0 {
+                        return Err(BlobError::Length);
+                    }
+                    b.split[c] = word(body, at) as usize;
+                    b.gain[c] = f64_at(at + 8)?;
+                    at += 16;
+                    let floor = if k == 0 { 0 } else { p.boxes[k - 1].split[c] };
+                    if b.split[c] < floor || b.split[c] > p.channel[c].count || !b.gain[c].is_finite() {
+                        return Err(BlobError::Length);
+                    }
+                }
+                let mut w = [0.0f64; mstk::Params::WORDS];
+                for (i, v) in w.iter_mut().enumerate() {
+                    *v = f64_at(at + 8 * i)?;
+                }
+                at += 8 * mstk::Params::WORDS;
+                b.params = mstk::Params::from_words(&w).ok_or(BlobError::Length)?;
+                if !b.params.valid(fs) {
+                    return Err(BlobError::Unstable);
+                }
+                p.boxes[k] = b;
+            }
+        }
+        // filters and gains together never exceed unity (the boxes are the
+        // graph's own dynamics, carried as macOS stages them)
+        for c in 0..n {
+            if p.linear_peak(c, fs) > UNITY_TOLERANCE {
+                return Err(BlobError::Unstable);
+            }
+        }
+        if flags & !(FLAG_FROM_TUNING | FLAG_DYNAMICS | FLAG_BOXES) != 0 {
             return Err(BlobError::Length);
         }
         if at != body.len() {
@@ -504,6 +623,7 @@ pub struct PreStage {
     params: Params,
     state: [[[f64; 2]; MAX_SECTIONS]; MAX_CHANNELS],
     dynamics: Option<DynRun>,
+    boxes: [Option<mstk::Run>; MAX_BOXES],
 }
 
 impl PreStage {
@@ -516,7 +636,10 @@ impl PreStage {
     /// filters are built for it).
     pub fn with_rate(params: Params, fs: f64) -> PreStage {
         let dynamics = params.dynamics.as_ref().map(|d| DynRun::new(d, fs));
-        PreStage { params, state: [[[0.0; 2]; MAX_SECTIONS]; MAX_CHANNELS], dynamics }
+        let boxes = core::array::from_fn(|k| {
+            (k < params.box_count.min(MAX_BOXES)).then(|| mstk::Run::new(&params.boxes[k].params, fs, params.channels))
+        });
+        PreStage { params, state: [[[0.0; 2]; MAX_SECTIONS]; MAX_CHANNELS], dynamics, boxes }
     }
 
     pub fn params(&self) -> &Params {
@@ -528,6 +651,74 @@ impl PreStage {
         self.state = [[[0.0; 2]; MAX_SECTIONS]; MAX_CHANNELS];
         if let Some(d) = &mut self.dynamics {
             d.reset();
+        }
+        for b in self.boxes.iter_mut().flatten() {
+            b.reset();
+        }
+    }
+
+    /// Runs channel `c`'s sections `from..to` in place on `buf`, then `gain`.
+    fn run_sections(&mut self, c: usize, from: usize, to: usize, gain: f64, buf: &mut [f32]) {
+        let (Some(ch), Some(z)) = (self.params.channel.get(c), self.state.get_mut(c)) else {
+            buf.fill(0.0);
+            return;
+        };
+        let to = to.min(ch.count).min(MAX_SECTIONS);
+        let from = from.min(to);
+        for y in buf.iter_mut() {
+            let mut v = if y.is_finite() { y.clamp(-INPUT_BOUND, INPUT_BOUND) as f64 } else { 0.0 };
+            for (s, st) in ch.sections[from..to].iter().zip(z[from..to].iter_mut()) {
+                let out = s.b0 * v + st[0];
+                st[0] = s.b1 * v - s.a1 * out + st[1];
+                st[1] = s.b2 * v - s.a2 * out;
+                v = out;
+            }
+            v *= gain;
+            if v.is_finite() {
+                *y = v as f32;
+            } else {
+                for st in z[from..to].iter_mut() {
+                    *st = [0.0; 2];
+                }
+                *y = 0.0;
+            }
+        }
+    }
+
+    /// The whole pre-stage in place on every channel (`bufs[c]` holds
+    /// channel `c`'s input and gets its output): each channel's sections
+    /// and gains up to the first box, the box (linked), the next sections,
+    /// and so on, then the channel's own gain; the dynamics block, if any,
+    /// last. Channels the pre-stage does not have are muted. Real time.
+    pub fn process_block(&mut self, bufs: &mut [&mut [f32]], frames: usize) {
+        let n = bufs.len().min(MAX_CHANNELS);
+        for (c, b) in bufs.iter_mut().enumerate().take(n) {
+            if c >= self.params.channels {
+                b.fill(0.0);
+            }
+        }
+        let n = n.min(self.params.channels);
+        let count = self.params.box_count.min(MAX_BOXES);
+        let mut from = [0usize; MAX_CHANNELS];
+        for k in 0..=count {
+            for c in 0..n {
+                let len = frames.min(bufs[c].len());
+                let (to, gain) = if k < count {
+                    (self.params.boxes[k].split[c], self.params.boxes[k].gain[c])
+                } else {
+                    (self.params.channel[c].count, self.params.channel[c].gain)
+                };
+                self.run_sections(c, from[c], to, gain, &mut bufs[c][..len]);
+                from[c] = to;
+            }
+            if k < count {
+                if let Some(run) = &mut self.boxes[k] {
+                    run.process(&mut bufs[..n], frames);
+                }
+            }
+        }
+        if let Some(d) = &mut self.dynamics {
+            d.process(&mut bufs[..n], frames);
         }
     }
 

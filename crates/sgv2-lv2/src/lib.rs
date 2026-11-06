@@ -425,14 +425,15 @@ fn run_chunk(instance: &mut Instance, page: Option<&page::EnginePage>, off: usiz
     {
         let (pre, scratch) = (&mut instance.pre, &mut instance.scratch);
         for c in 0..n {
-            pre.process(c, input[c], &mut scratch[c][..frames]);
+            scratch[c][..frames].copy_from_slice(&input[c][..frames]);
         }
-        // the graph's multiband dynamics, linked across every channel
+        // filters, gains and the graph's compressor boxes in graph order
+        // (each box linked across every channel)
         let mut bufs: [&mut [f32]; MAX_CHANNELS] = Default::default();
         for (b, s) in bufs.iter_mut().zip(scratch.iter_mut()).take(n) {
             *b = &mut s[..frames];
         }
-        pre.process_dynamics(&mut bufs[..n], frames);
+        pre.process_block(&mut bufs[..n], frames);
     }
     for (f, buf) in filtered.iter_mut().zip(instance.scratch.iter()).take(n) {
         *f = &buf[..frames];
