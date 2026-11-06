@@ -18,7 +18,10 @@ device tree and that machine's own tuning bundle. It preserves the physical
 order left woofer, right woofer, left tweeter, right tweeter, with a voltage
 and current pair for each. The existing wiring, provisioning and session
 checks also pass. These results establish transport recognition and wiring
-derivation, not protected playback or PipeWire timing on hardware.
+derivation. The subsequent physical silent check passed all nine phases
+(baseline and eight individual sense-switch checks) with the existing
+classification thresholds and S24_LE playback. This does not establish
+protected playback or PipeWire timing.
 
 J813's native tuning selects LSM2 and requests mechanisms that the live
 engine cannot yet represent. The compiler must continue refusing that
@@ -35,6 +38,22 @@ Linux [#922](https://github.com/aurora-silicon/linux/pull/922) supplies the
 `Speaker Volume Unlock` kernel is not interchangeable with it. Kernel
 ownership tests and a successful silent wiring check are necessary but do
 not establish LSM2 parity or authorize an unqualified tuning.
+
+## Keep sensing aligned during the silent check
+
+Arm one continuous sense capture before starting the zero-sample speaker
+stream, and keep it open across every switch step and playback format
+fallback. On J813, reopening capture while the speaker serializer is
+running can start at a different channel slot. The original per-step
+capture check failed on hardware; the continuous capture passed without
+reordering samples or relaxing the live/quiet thresholds.
+
+The self-check bounds its capture buffer and refuses EOF, lost ownership,
+lease expiry, overwritten windows or missing data. Cleanup stops both
+owned streams, releases the lease and restores the sense switches. This
+qualifies the capture-first lifecycle only. The kernel's late-capture
+behavior remains unqualified; a graph must not infer that arbitrary
+startup or restart ordering is safe from this check.
 
 ## Reproduce the offline wiring check
 
@@ -60,5 +79,6 @@ compiler refusals when reporting a result.
 Thomas Glanzmann (`sithglan`) authored the J813 Linux audio support.
 Ryan Murray and the Aurora contributors authored the existing v2 wiring,
 self-check and kernel ownership design. Acelogic performed the J813
-integration checks and added the T8142 transport description. The tuning
+integration checks and added the T8142 transport description and continuous
+capture lifecycle fix. The tuning
 reader retains its existing aurora-audio-dsp and saku attribution.

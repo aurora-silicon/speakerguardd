@@ -327,43 +327,107 @@ def classify(st):
 
 
 class Streams:
-    """The silent session: one grant and one zero-sample stream on the
-    speaker PCM for the whole switch test, and a capture of the sense PCM
-    for each step.
+    """One capture, armed before playback, spans the entire silent test.
 
-    The grant is taken once and held only while the check's own stream
-    owns the speaker PCM, so the kernel logs one grant and one release for
-    the whole check, not one per step (a run per step logged 1 + 2 x amps
-    of them at first boot, which read like the protection flapping), and
-    the PCM is never left closed under a grant between steps. The switches
-    are DAPM switches that change the amps' sense power only, so they are
-    turned while the stream runs; every sample is 0 throughout."""
+    A new capture cannot assume a frame boundary in an already running AOP
+    serializer. Keep the capture across all switch steps and playback format
+    fallbacks. This proves this lifecycle only, not arbitrary graph reopen
+    order. Every playback sample is zero and the grant is held once.
+    """
 
     def __init__(self, ctl, card, spk_dev, sense_dev, amps, rate):
         self.ctl, self.card, self.spk, self.sense, self.amps = ctl, card, spk_dev, sense_dev, amps
-        # the tuning's rate (wiring.tuning_rate), the rate the graph runs at
         self.rate = rate
         self.fmt = None
         self.idx = None
         self.lease = None
         self.play = None
+        self.rec = None
+        self.reader = None
+        self.capture_cv = threading.Condition()
+        self.capture_data = bytearray()
+        self.capture_total = 0
+        self.capture_error = None
+        self.frame_bytes = 4 * amps  # V/I, S16_LE
+        self.capture_limit = 2 * rate * self.frame_bytes
+        self.capture_deadline = None
 
     def _play(self, fmt):
         return subprocess.Popen(
-            ["aplay", "-q", "-D", f"hw:CARD={self.card},DEV={self.spk}", "-f", fmt, "-c", str(self.amps),
+            ["aplay", "--fatal-errors", "-q", "-D", f"hw:CARD={self.card},DEV={self.spk}", "-f", fmt, "-c", str(self.amps),
              "-r", str(self.rate), "-t", "raw", "/dev/zero"],
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
         )
 
-    def _ours(self):
-        """The speaker PCM runs, and runs for the check's own stream."""
-        if self.play is None or self.play.poll() is not None:
+    def _owned(self, proc, dev, direction):
+        if proc is None or proc.poll() is not None:
             return False
-        st = pcm_status(self.idx, self.spk, "p")
-        return st.get("state") == "RUNNING" and st.get("owner_pid") == str(self.play.pid)
+        st = pcm_status(self.idx, dev, direction)
+        return st.get("state") == "RUNNING" and st.get("owner_pid") == str(proc.pid)
+
+    def _ours(self):
+        return self._owned(self.play, self.spk, "p")
+
+    def _drain(self):
+        try:
+            while True:
+                chunk = os.read(self.rec.stdout.fileno(), 65536)
+                if not chunk:
+                    raise EOFError("sense capture ended")
+                with self.capture_cv:
+                    self.capture_total += len(chunk)
+                    self.capture_data.extend(chunk)
+                    if len(self.capture_data) > self.capture_limit:
+                        del self.capture_data[:-self.capture_limit]
+                    self.capture_cv.notify_all()
+        except Exception as e:
+            with self.capture_cv:
+                self.capture_error = str(e)
+                self.capture_cv.notify_all()
+
+    def _health(self):
+        if self.capture_error:
+            raise wiring.Refused(f"sense capture failed: {self.capture_error}")
+        if time.monotonic() >= self.capture_deadline:
+            raise wiring.Refused("silent switch test exceeded its 30-second capture deadline")
+        if not self._owned(self.rec, self.sense, "c"):
+            raise wiring.Refused("sense capture stopped or is not owned by the self-check")
+        if not self._ours():
+            raise wiring.Refused(f"the zero-sample stream on hw:{self.card},{self.spk} stopped during the switch test")
+        if self.lease.lapsed or self.lease.err:
+            raise wiring.Refused(f"the self-check's own lease lapsed during the switch test ({self.lease.err or 'ETIMEDOUT'})")
+
+    @staticmethod
+    def _stop_process(proc):
+        if proc is None:
+            return
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(2)
 
     def start(self, idx):
         self.idx = idx
+        self.capture_deadline = time.monotonic() + 30
+        self.rec = subprocess.Popen(
+            ["arecord", "--fatal-errors", "-q", "-D", f"hw:CARD={self.card},DEV={self.sense}",
+             "-f", "S16_LE", "-c", str(2 * self.amps), "-r", str(self.rate),
+             "--period-time=10000", "--buffer-time=80000", "-t", "raw", "-"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.reader = threading.Thread(target=self._drain, daemon=True)
+        self.reader.start()
+        deadline = time.monotonic() + 2
+        while not self._owned(self.rec, self.sense, "c"):
+            if self.rec.poll() is not None:
+                err = self.rec.stderr.read().decode(errors="replace").strip()
+                raise wiring.Refused(f"sense capture could not start before playback: {err}")
+            if time.monotonic() >= deadline:
+                raise wiring.Refused("sense capture did not become owned/RUNNING before playback")
+            time.sleep(0.01)
         self.lease = Lease(self.ctl)
         self.lease.start()
         log("holding \"Speaker Protection\" for the silent switch test (zero samples only)")
@@ -381,50 +445,68 @@ class Streams:
             if self.play.poll() is None and pcm_state(idx, self.spk, "p") == "RUNNING":
                 raise wiring.Refused(f"hw:{self.card},{self.spk} runs, but not for the self-check's own stream")
             err = (self.play.communicate(timeout=2)[1] or "").strip() if self.play.poll() is not None else "did not start"
-            if self.play.poll() is None:
-                self.play.kill()
-                self.play.wait(2)
+            self._stop_process(self.play)
+            self.play.stderr.close()
             self.play = None
             last = err
         if self.play is None:
             raise wiring.Refused(f"the zero-sample stream does not start on hw:{self.card},{self.spk}: {last}")
         time.sleep(0.1)
+        self._health()
 
     def capture(self):
-        """One step: the sense PCM, recorded while the stream runs."""
+        """Take a fresh, complete-frame window from the continuous capture."""
         time.sleep(SETTLE_S)
-        if not self._ours():
-            raise wiring.Refused(f"the zero-sample stream on hw:{self.card},{self.spk} stopped during the switch test")
-        rec = subprocess.run(
-            ["arecord", "-q", "-D", f"hw:CARD={self.card},DEV={self.sense}", "-f", "S16_LE", "-c", str(2 * self.amps),
-             "-r", str(self.rate), "-s", str(round(self.rate * CAPTURE_S)), "-t", "raw", "-"],
-            capture_output=True, timeout=5,
-        )
-        if rec.returncode:
-            raise wiring.Refused(f"sense capture failed: {rec.stderr.decode(errors='replace').strip()}")
-        if self.lease.lapsed or self.lease.err:
-            raise wiring.Refused(f"the self-check's own lease lapsed during the switch test ({self.lease.err or 'ETIMEDOUT'})")
-        if not self._ours():
-            raise wiring.Refused(f"the zero-sample stream on hw:{self.card},{self.spk} stopped during a capture")
-        return stats(rec.stdout, 2 * self.amps)
+        self._health()
+        with self.capture_cv:
+            start = ((self.capture_total + self.frame_bytes - 1) // self.frame_bytes) * self.frame_bytes
+        end = start + round(self.rate * CAPTURE_S) * self.frame_bytes
+        deadline = time.monotonic() + 5
+        while True:
+            self._health()
+            with self.capture_cv:
+                base = self.capture_total - len(self.capture_data)
+                if start < base:
+                    raise wiring.Refused("sense capture window was overwritten before it could be checked")
+                if self.capture_total >= end:
+                    raw = bytes(self.capture_data[start - base:end - base])
+                    break
+                if time.monotonic() >= deadline:
+                    raise wiring.Refused("sense capture did not deliver a complete window within five seconds")
+                self.capture_cv.wait(0.05)
+        self._health()
+        return stats(raw, 2 * self.amps)
 
     def stop(self):
-        """Stream first, then the grant: the PCM closes under the grant only
-        for the one renewal tick the lease thread takes to stop."""
+        """Release both streams and the grant, including partial startup."""
+        errors = []
         try:
-            if self.play is not None and self.play.poll() is None:
-                self.play.terminate()
-                try:
-                    self.play.wait(2)
-                except subprocess.TimeoutExpired:
-                    self.play.kill()
-                    self.play.wait(2)
-        finally:
-            self.play = None
+            self._stop_process(self.play)
+        except Exception as e:
+            errors.append(str(e))
+        try:
             if self.lease is not None:
                 self.lease.end()
                 self.lease = None
                 log("released \"Speaker Protection\" after the switch test")
+        except Exception as e:
+            errors.append(str(e))
+        try:
+            self._stop_process(self.rec)
+            if self.reader is not None:
+                self.reader.join(2)
+                if self.reader.is_alive():
+                    raise wiring.Refused("sense capture drain did not stop")
+        except Exception as e:
+            errors.append(str(e))
+        for proc in (self.play, self.rec):
+            if proc is not None:
+                for stream in (proc.stdout, proc.stderr):
+                    if stream is not None:
+                        stream.close()
+        self.play = self.rec = None
+        if errors:
+            raise wiring.Refused("silent stream cleanup failed: " + "; ".join(errors))
 
 
 def check_sense(ctl, idx, card, devs, w, runs):
@@ -473,12 +555,14 @@ def check_sense(ctl, idx, card, devs, w, runs):
                         f"{a['prefix']} {kind}SENSE off quietened sense channel(s) {quiet}; the map has its {kind} on channel {want}"
                     )
     finally:
-        st.stop()
-        for nm, v in saved.items():
-            try:
-                switch_set(ctl, nm, v)
-            except wiring.Refused as e:
-                log(f"restoring {nm}: {e}")
+        try:
+            st.stop()
+        finally:
+            for nm, v in saved.items():
+                try:
+                    switch_set(ctl, nm, v)
+                except wiring.Refused as e:
+                    log(f"restoring {nm}: {e}")
     return errs, st.fmt
 
 
