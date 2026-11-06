@@ -169,12 +169,19 @@ pub fn velocity_limit(e: f32, k: &[f32; 4], v: &[f32; 3], vmax: f32) -> f32 {
     a + (e - lo) * slope
 }
 
-/// The largest common factor `r` in `0..=1` for the active bands' gains that
-/// keeps every sample `i` in `first..` within `limit(i)`, the inactive bands
-/// and `resid` held; 0 when those alone exceed a sample's limit. Applied when
-/// the allocation stalls (a pass that changes no gain) with a sample still
-/// above its limit,
-/// so the decision never ends above the limit the active bands can meet.
+/// How far past its limit a sample may sit at the allocation's no-progress
+/// exit before [`fit_active`] acts, in units of the f32 rounding of that
+/// sample's own sum (`EPSILON` times the sum of the absolute terms). Native
+/// accepts the allocation's rounding at the limit; this keeps that.
+const STALL_ROUNDING_ULPS: f32 = 16.0;
+
+/// When the allocation stalls (a pass that changes no gain) with a sample
+/// past its limit by more than the rounding of its own sum, the largest
+/// common factor `r` in `0..=1` for the active bands' gains that keeps every
+/// sample `i` in `first..` within `limit(i)`, the inactive bands and `resid`
+/// held, applied; 0 when those alone are past a sample's limit by more than
+/// rounding. A stall that only rounds at the limit (native's exit) is left
+/// as it is.
 fn fit_active(
     vb: &[alloc::vec::Vec<f32>; 5],
     resid: &[f32],
@@ -185,12 +192,29 @@ fn fit_active(
     limit: impl Fn(usize) -> f32,
 ) {
     let is_active = |k: usize| k >= active.0 && k < active.1;
+    let tol = |mag: f32| STALL_ROUNDING_ULPS * f32::EPSILON * mag;
+    // the allocation's own sum, in its order: a real excess, or rounding?
+    let over = (first..vb[0].len()).any(|i| {
+        let r0 = if resid.is_empty() { 0.0f32 } else { resid[i] };
+        let (mut y, mut mag) = (r0, r0.abs());
+        for k in 0..5 {
+            let v = (g[k] * s) * vb[k][i];
+            y += v;
+            mag += v.abs();
+        }
+        let (e, l) = (y.abs() - limit(i), limit(i));
+        e.is_nan() || l.is_nan() || e > tol(mag)
+    });
+    if !over {
+        return;
+    }
     let mut r = 1.0f32;
     for i in first..vb[0].len() {
         let mut f = if resid.is_empty() { 0.0f32 } else { resid[i] };
-        let mut a = 0.0f32;
+        let (mut a, mut mag) = (0.0f32, f.abs());
         for k in 0..5 {
             let v = (g[k] * s) * vb[k][i];
+            mag += v.abs();
             if is_active(k) {
                 a += v;
             } else {
@@ -198,11 +222,11 @@ fn fit_active(
             }
         }
         let l = limit(i);
-        if f.is_nan() || l.is_nan() || f.abs() > l {
+        if f.is_nan() || l.is_nan() || f.abs() - l > tol(mag) {
             r = 0.0;
             break;
         }
-        if (f + a).abs() > l {
+        if (f + a).abs() - l > tol(mag) && a != 0.0 {
             // |f + r a| <= l holds on [0, u]; u is where it reaches the limit
             let u = if a > 0.0 { (l - f) / a } else { (l + f) / -a };
             r = r.min(u.max(0.0));
@@ -841,6 +865,22 @@ mod tests {
                 (r + (0..5).map(|k| g[k] * s * vb[k][i]).sum::<f32>()).abs()
             })
             .fold(0.0, f32::max)
+    }
+
+    #[test]
+    fn a_stall_that_only_rounds_at_the_limit_is_left_alone() {
+        // a sample a few ulps past the limit: native's own exit, unchanged
+        let l = 1.0f32;
+        let x = l * (1.0 + 4.0 * f32::EPSILON);
+        let vb = [vec![x, 0.5], vec![0.0; 2], vec![0.0; 2], vec![0.0; 2], vec![0.0; 2]];
+        let mut g = [1.0; 5];
+        fit_active(&vb, &[], 0, 1.0, (0, 5), &mut g, |_| l);
+        assert_eq!(g, [1.0; 5]);
+        // inactive bands a few ulps past the limit do not close the active ones
+        let vb = [vec![0.1, 0.0], vec![x, 0.0], vec![0.0; 2], vec![0.0; 2], vec![0.0; 2]];
+        let mut g = [1.0; 5];
+        fit_active(&vb, &[], 0, 1.0, (0, 1), &mut g, |_| l + 0.1);
+        assert_eq!(g, [1.0; 5]);
     }
 
     #[test]
