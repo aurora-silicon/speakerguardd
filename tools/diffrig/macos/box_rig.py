@@ -72,6 +72,7 @@ def main():
     parser.add_argument("--seconds", type=float, default=1.0)
     parser.add_argument("--tol", type=float, default=0.05)
     parser.add_argument("--dynamic", action="store_true", help="also run bursts and level steps; compare 10 ms windows")
+    parser.add_argument("--dynamic-only", action="store_true", help="run only the burst and level-step cases")
     args = parser.parse_args()
 
     os.makedirs(args.work, exist_ok=True)
@@ -79,11 +80,13 @@ def main():
     n = int(FS * args.seconds)
     time = np.arange(n) / FS
     levels = [float(value) for value in args.levels.split(",")]
-    cases = [("steady", f"sine_{freq:g}_{-level:g}", 10 ** (level / 20) * np.sin(2 * np.pi * freq * time))
-             for freq in FREQS for level in levels]
-    noise = pink(n)
-    cases += [("steady", f"pink_{-level:g}", 10 ** (level / 20) * noise) for level in levels]
-    if args.dynamic:
+    cases = []
+    if not args.dynamic_only:
+        cases = [("steady", f"sine_{freq:g}_{-level:g}", 10 ** (level / 20) * np.sin(2 * np.pi * freq * time))
+                 for freq in FREQS for level in levels]
+        noise = pink(n)
+        cases += [("steady", f"pink_{-level:g}", 10 ** (level / 20) * noise) for level in levels]
+    if args.dynamic or args.dynamic_only:
         for freq in (80, 500, 2500, 10000):
             carrier = np.sin(2 * np.pi * freq * time)
             burst = ((np.arange(n) // (FS // 10)) % 2 == 0).astype(float)
