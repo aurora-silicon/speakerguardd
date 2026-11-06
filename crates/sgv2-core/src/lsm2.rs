@@ -2118,10 +2118,11 @@ impl Run {
                             1.0
                         }
                     });
-                    // A primary request below MaxVelocityAttenuation has
-                    // already established the floor-limited episode. Native
-                    // preserves the retarget solve's no-progress result
-                    // there instead of applying the floor a second time.
+                    // A primary request below MaxVelocityAttenuation proves
+                    // that the configured floor cannot meet the modeled
+                    // bound. Keep the retarget solve's lower no-progress
+                    // result instead of applying the insufficient floor a
+                    // second time: a conservative clean-room fallback.
                     let q = chain(c, seed, !primary_floor_limited.get());
                     core::array::from_fn(|k| if up[k] && q[k] >= seed[k] { p[k] } else { q[k] })
                 } else {
