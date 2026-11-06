@@ -191,6 +191,7 @@ fn butterworth(high: bool, order: u32, f0: f64, fs: f64) -> Vec<Section> {
     made.sections[..made.count].to_vec()
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy)]
 enum Rbj {
     Peak,
@@ -198,6 +199,7 @@ enum Rbj {
     HighShelf,
 }
 
+#[cfg(test)]
 fn rbj(kind: Rbj, gain_db: f64, f0: f64, q: f64, fs: f64) -> Section {
     let a = 10f64.powf(gain_db / 40.0);
     let w = 2.0 * PI * f0 / fs;

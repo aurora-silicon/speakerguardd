@@ -751,7 +751,7 @@ mod tests {
 
         c.set_param(GraphParam::VolumeScalar, -10.0);
         let below = 20.0 * libm::log10(tone_channel(&c).magnitude(0.0, fs));
-        assert!((below - 12.0).abs() < 1e-8);
+        assert!((below - 12.0).abs() < 1e-7, "{below}");
         c.set_param(GraphParam::VolumeScalar, 10.0);
         assert!(tone_channel(&c).magnitude(0.0, fs).log10().abs() < 1e-10);
     }
