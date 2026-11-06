@@ -308,16 +308,11 @@ pub fn velocity_band_gains_limit_window(
 
 /// Choose the producer for a newly admitted retained-window segment.
 ///
-/// Shifted history already fixes the segment's left boundary. The producer
-/// whose candidate continues that boundary owns the whole new segment. A
-/// zero onset trial carries no admission and therefore leaves the streaming
-/// producer in control.
-pub fn arbitrate_producer_segment(boundary: f32, onset: f32, streaming: f32) -> f32 {
-    if onset != 0.0 && (onset - boundary).abs() <= (streaming - boundary).abs() {
-        onset
-    } else {
-        streaming
-    }
+/// Native retains the greater of the streaming protected envelope and the
+/// decision-local protected trial. This is a producer comparison: shifted
+/// history and a zero trial naturally leave the streaming source in control.
+pub fn arbitrate_producer_segment(onset: f32, streaming: f32) -> f32 {
+    onset.max(streaming)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -851,11 +846,11 @@ mod tests {
     }
 
     #[test]
-    fn producer_arbitration_continues_the_retained_segment_boundary() {
-        assert_eq!(arbitrate_producer_segment(0.55, 0.20, 0.56), 0.56);
-        assert_eq!(arbitrate_producer_segment(0.15, 0.59, 0.62), 0.59);
-        assert_eq!(arbitrate_producer_segment(0.15, 0.0, 0.15), 0.15);
-        assert_eq!(arbitrate_producer_segment(0.15, 0.20, 0.20), 0.20);
+    fn producer_arbitration_retains_the_greater_source() {
+        assert_eq!(arbitrate_producer_segment(0.20, 0.56), 0.56);
+        assert_eq!(arbitrate_producer_segment(0.62, 0.59), 0.62);
+        assert_eq!(arbitrate_producer_segment(0.0, 0.15), 0.15);
+        assert_eq!(arbitrate_producer_segment(0.20, 0.20), 0.20);
     }
 
     #[test]

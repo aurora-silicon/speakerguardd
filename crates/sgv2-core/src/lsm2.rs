@@ -2034,11 +2034,10 @@ impl Run {
             // the protected output, below
             c.vcar_m.carry(&mut c.vcar, fbl);
             // Native arbitrates each newly admitted segment while shifted
-            // samples keep their source. The candidate that continues the
-            // retained boundary owns the segment: ramps keep the streaming
-            // protected peak, while an onset takes its decision-local trial.
-            // This compares existing producer states, not signal levels,
-            // spectra, case identities, or fitted thresholds.
+            // samples keep their source. The greater of the streaming
+            // protected envelope and the decision-local protected trial owns
+            // the segment. This compares existing producer states, not signal
+            // levels, spectra, case identities, or fitted thresholds.
             if vel_on && stream_ready && !c.vel_bound_release {
                 let all = (0, BANDS);
                 let mut producer_r = [1.0; BANDS];
@@ -2069,8 +2068,16 @@ impl Run {
                         peak = peak.max(y.abs());
                     }
                     let onset_bound = peak.min(vlim_g);
-                    let admitted = arbitrate_producer_segment(boundary, onset_bound, stream_bound);
-                    c.vel_bound_window[od + offset..od + offset + len].fill(admitted);
+                    let admitted = arbitrate_producer_segment(onset_bound, stream_bound);
+                    let segment = &mut c.vel_bound_window[od + offset..od + offset + len];
+                    if admitted >= boundary {
+                        segment.fill(admitted);
+                    } else {
+                        let step = (admitted - boundary) / len as f32;
+                        for (i, value) in segment.iter_mut().enumerate() {
+                            *value = boundary + step * (i + 1) as f32;
+                        }
+                    }
                     boundary = admitted;
                     offset += len;
                 }
