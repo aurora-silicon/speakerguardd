@@ -191,19 +191,26 @@ def one(job):
         if inf is None:
             return {"tuning": name, "error": f"v2 compile refused: {err}"}
         plan = inf["plan"]
+        extra = []
+        if a.get("box"):
+            plan, extra = one_box(plan, a["box"])
+            if plan is None:
+                return {"tuning": name, "skipped": f"no box {a['box']}"}
         bands = third_octaves()
         x, index = program(bands, a["levels"], a["seg"], a["gap"])
+        if x.shape[1] != plan["program_channels"]:
+            x = np.tile(x[:, :1], (1, plan["program_channels"]))
         law, _ = law_from(a["law"])
         lanes_n = len(plan["outputs"])
         res = {"tuning": name, "stubs": inf["stubs"], "gaps": inf.get("gaps", []), "unwired": inf["unwired"],
                "lanes": lanes_n,
                "volumes": []}
-        if a["check_plan"]:
+        if a["check_plan"] and not a.get("box"):
             res["plan_check"] = check_plan(plan, strip, propstrip, work, a["host"])
         for s in a["volumes"]:
             mvol = law(s)
             mac, _ = macos_chain(plan, strip, propstrip, x, s, mvol, work, a["host"])
-            v2 = v2_chain(a["render"], src_args, x, s, mvol, work).reshape(-1, lanes_n)
+            v2 = v2_chain(a["render"], src_args + extra, x, s, mvol, work).reshape(-1, lanes_n)
             rows = []
             for (L, f, i0, i1) in index:
                 for ln in range(lanes_n):
@@ -220,6 +227,21 @@ def one(job):
         for f in os.listdir(work):
             os.remove(os.path.join(work, f))
         os.rmdir(work)
+
+
+def one_box(plan, name):
+    """A plan of one box alone: its channels are the program, its output
+    the lanes (the per-box gate; v2 runs it with `--only`)."""
+    idx = next((i for i, n in enumerate(plan["nodes"]) if n["name"] == name), None)
+    if idx is None:
+        return None, []
+    n = dict(plan["nodes"][idx])
+    w = len(n["inputs"])
+    n["inputs"] = [{"from": "program", "channel": c} for c in range(w)]
+    links = [dict(l, node=0) for l in plan["params"] if l["node"] == idx]
+    one = {"program_channels": w, "nodes": [n], "params": links,
+           "outputs": [{"from": "node", "node": 0, "channel": c} for c in range(w)]}
+    return one, ["--only", name]
 
 
 def check_plan(plan, strip, propstrip, work, host):
@@ -260,6 +282,10 @@ def summarise(results, tol, law_name, out_md):
     flagged = 0
     for r in results:
         lines.append(f"## {r['tuning']}")
+        if "skipped" in r:
+            lines.append(r["skipped"])
+            lines.append("")
+            continue
         if "error" in r:
             lines.append(f"ERROR: {r['error']}")
             flagged += 1
@@ -273,17 +299,20 @@ def summarise(results, tol, law_name, out_md):
         if r["unwired"]:
             lines.append("graph params not driven by v2: " + "; ".join(r["unwired"]))
         lines.append("")
-        lines.append("| volume | mvol dB | level dBFS | worst excess dB (lane @ Hz) | bands above | lanes above |")
-        lines.append("|---|---|---|---|---|---|")
+        lines.append("| volume | mvol dB | level dBFS | worst excess dB (lane @ Hz) | bands above | lanes above "
+                     "| worst abs diff dB |")
+        lines.append("|---|---|---|---|---|---|---|")
         for v in r["volumes"]:
             for L in sorted({x["level"] for x in v["rows"]}):
                 rows = [x for x in v["rows"] if x["level"] == L and x["macos_db"] > -120]
                 w = max(rows, key=lambda x: x["excess_db"])
                 above = [x for x in rows if x["excess_db"] > tol]
                 flagged += len(above)
+                inb = [x for x in rows if x["macos_db"] > L - 60]
+                ad = max((abs(x["excess_db"]) for x in inb), default=0.0)
                 lines.append(f"| {v['scalar']} | {v['mvol_db']} | {L} | {w['excess_db']:+.2f} "
                              f"(L{w['lane']} @ {w['hz']}) | {len({x['hz'] for x in above})} "
-                             f"| {sorted({x['lane'] for x in above})} |")
+                             f"| {sorted({x['lane'] for x in above})} | {ad:.3f} |")
         lines.append("")
     lines.insert(4, f"FLAGGED (v2 above macOS beyond tolerance, or errors): {flagged}")
     lines.insert(5, "")
@@ -331,6 +360,7 @@ def main():
     ap.add_argument("--tol", type=float, default=0.1)
     ap.add_argument("--jobs", type=int, default=6)
     ap.add_argument("--check-plan", action="store_true")
+    ap.add_argument("--box", default=None, help="per-box gate: this box alone, same input, both sides")
     ap.add_argument("--out", required=True, help="private output directory (Apple-derived results)")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
@@ -342,7 +372,7 @@ def main():
     os.makedirs(tmp, exist_ok=True)
     common = {"host": host, "render": a.render, "volumes": [float(v) for v in a.volumes.split(",")],
               "law": a.law, "levels": [float(v) for v in a.levels.split(",")], "seg": a.seg, "gap": a.gap,
-              "check_plan": a.check_plan, "tmp": tmp}
+              "check_plan": a.check_plan, "tmp": tmp, "box": a.box}
     jobs = []
     aids = [x for x in a.aids.split(",") if x]
     if not aids and not a.bundle:
