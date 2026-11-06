@@ -2782,7 +2782,6 @@ mod fault_tests {
         assert!(r.ch[0].rd[r.fb..].iter().all(|&v| v == 0.0));
     }
 
-
     #[test]
     fn waterfill_levels_the_active_peaks() {
         let all = [true; BANDS];

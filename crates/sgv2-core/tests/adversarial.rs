@@ -441,16 +441,19 @@ fn lsm2_params(seed: u64, n: usize, rate: u32, hot: bool) -> lsm2::Params {
         ..lsm2::Params::default()
     };
     // refused otherwise: no thermal axis (a blob must protect), or a
-    // look-ahead region (filterbank stage plus look-ahead) that is not whole
-    // substeps inside one controller frame
+    // look-ahead region (filterbank stage plus look-ahead) that does not fit
+    // inside one controller frame. The geometry sits on the native rate
+    // family's vectors: 16F-frame filterbank stages, 8F-frame look-ahead.
     if p.control_power == 0 && p.control_temperature == 0 {
         p.control_temperature = 1;
     }
     let cadence = lsm2::controller_frames(rate);
-    let sub = cadence / lsm2::SUBSTEPS;
-    let od = sub * (1 + (r.uni(0.0, 6.99) as usize));
-    let fb = (2 + (r.uni(0.0, 1.0) as f64 * (od - 2) as f64) as usize).min(od);
-    p.filterbank_latency_ms = (fb as f64 * 1e3 / rate as f64) as f32;
+    let family = ((rate as f64 / 48_000.0).round() as usize).max(1);
+    let (fbv, lav) = (2 * lsm2::SUBSTEPS * family, lsm2::SUBSTEPS * family);
+    let fb = fbv * (1 + r.uni(0.0, ((cadence - lav - 1) / fbv) as f64 - 0.01) as usize);
+    let od = fb + lav * (1 + r.uni(0.0, ((cadence - 1 - fb) / lav) as f64 - 0.01) as usize);
+    // a quarter frame over the stage so a floor-rounded family (32 kHz) keeps it
+    p.filterbank_latency_ms = ((fb as f64 + 0.25) * 1e3 / rate as f64) as f32;
     p.speaker_response_lookahead_ms = ((od - fb) as f64 * 1e3 / rate as f64) as f32;
     let nyq = rate as f64 / 2.0;
     let src = r.perm(n);
