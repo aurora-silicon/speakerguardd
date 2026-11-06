@@ -10,6 +10,10 @@
 //! shaping filter, other gain curves and weightings, adaptation hold) is
 //! refused when switched on, so a state this module cannot carry exactly
 //! never compiles.
+//!
+//! The system-volume parameter (ID 1, `svol`) is read only by volume
+//! automation; with automation off (the only mode carried) the unit's
+//! output does not depend on it, so the box has no volume input.
 
 use crate::error::{Diagnostics, Error, Result};
 use crate::fourcc::FourCc;
@@ -21,7 +25,6 @@ pub const LDNM: FourCc = FourCc::from_bytes(*b"ldnm");
 
 // Saved-state parameter IDs (the unit's public parameter list).
 const ENABLE: u32 = 0;
-const SYSTEM_VOLUME: u32 = 1;
 const TARGET: u32 = 2;
 const RENDER_QUALITY: u32 = 3;
 const MAX_GAIN: u32 = 4;
@@ -132,7 +135,6 @@ pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option
         return Err(bad(format!("sample rate {fs} Hz: only {SUPPORTED_FS} Hz is carried")));
     }
     for (id, what) in [
-        (SYSTEM_VOLUME, "system volume gain (below full volume)"),
         (AUTOMATION, "volume automation"),
         (AGC, "AGC"),
         (GAIN_CURVE, "gain curve other than the plain curve"),
