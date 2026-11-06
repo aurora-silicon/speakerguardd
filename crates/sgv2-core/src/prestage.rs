@@ -9,10 +9,10 @@
 //! gain, compiled from the Mac's tuning (`aurora-speaker-tuning`'s
 //! `prestage`) and run in the plugin right before the unit.
 //!
-//! The compiled response never exceeds unity at any frequency, so the
-//! pre-stage only ever takes drive away. The plugin checks that again when
-//! it loads the blob and refuses a section that is unstable or a response
-//! that gains.
+//! The filters' compiled response never exceeds unity at any frequency;
+//! the plugin checks that again when it loads the blob and refuses a
+//! section that is unstable or a filter response that gains. The dynamics
+//! carry the compressor's own gain staging, as macOS applies it.
 //!
 //! Section layout, little-endian, after the unit payload of a version 2
 //! blob ([`crate::blob`]):
@@ -29,7 +29,12 @@
 //!
 //! With [`FLAG_DYNAMICS`], a dynamics block follows the channels: the
 //! graph's multiband compressor ahead of the unit, as the tuning sets it
-//! ([`Dynamics`]), run on every channel after its filters. Layout, f64:
+//! ([`Dynamics`]). Without [`FLAG_ORDERED`] it runs on every channel after
+//! all of its filters. With [`FLAG_ORDERED`] it runs where the graph has it:
+//! each channel's header carries in its second word the number of its
+//! sections that come before the compressor, and after its gain a second
+//! f64, the gain of the boxes before the compressor; the remaining sections
+//! and the first gain run after it. Layout, f64:
 //! crossovers (3), input gain dB, output gain dB, release s, then per band
 //! (4) threshold dB, ratio, range dB, makeup dB, mode (0 compress, 1 pass,
 //! 2 mute).
@@ -58,6 +63,10 @@ pub const MAX_SECTIONS: usize = 64;
 pub const FLAG_FROM_TUNING: u32 = 1 << 0;
 /// `flags` bit: a [`Dynamics`] block follows the channels.
 pub const FLAG_DYNAMICS: u32 = 1 << 1;
+/// `flags` bit (with [`FLAG_DYNAMICS`] only): each channel splits its
+/// sections and gain around the dynamics, at the compressor's place in the
+/// graph.
+pub const FLAG_ORDERED: u32 = 1 << 3;
 /// Bands of the multiband dynamics.
 pub const BANDS: usize = 4;
 const DYN_WORDS: usize = 6 + 5 * BANDS;
@@ -196,11 +205,17 @@ impl Section {
 pub struct Channel {
     pub sections: [Section; MAX_SECTIONS],
     pub count: usize,
+    /// Gain after the dynamics (of every box without [`FLAG_ORDERED`]).
     pub gain: f64,
+    /// With [`FLAG_ORDERED`]: the first `pre` sections and `pre_gain` run
+    /// before the dynamics. Otherwise 0 and 1.
+    pub pre: usize,
+    pub pre_gain: f64,
 }
 
 impl Channel {
-    pub const IDENTITY: Channel = Channel { sections: [Section::IDENTITY; MAX_SECTIONS], count: 0, gain: 1.0 };
+    pub const IDENTITY: Channel =
+        Channel { sections: [Section::IDENTITY; MAX_SECTIONS], count: 0, gain: 1.0, pre: 0, pre_gain: 1.0 };
 
     pub fn sections(&self) -> &[Section] {
         &self.sections[..self.count]
@@ -208,7 +223,7 @@ impl Channel {
 
     /// `|H|` of the whole channel at `f` Hz.
     pub fn magnitude(&self, f: f64, fs: f64) -> f64 {
-        self.sections().iter().fold(self.gain.abs(), |m, s| m * s.magnitude(f, fs))
+        self.sections().iter().fold((self.gain * self.pre_gain).abs(), |m, s| m * s.magnitude(f, fs))
     }
 
     /// The largest `|H|` on [`check_grid`] for `fs`.
@@ -256,21 +271,34 @@ impl Params {
         self.flags & FLAG_FROM_TUNING != 0
     }
 
+    /// The dynamics run at their place in the graph, between each channel's
+    /// `pre` and remaining sections.
+    pub fn ordered(&self) -> bool {
+        self.flags & FLAG_ORDERED != 0 && self.dynamics.is_some()
+    }
+
     /// Encoded section, ready to follow a unit payload.
     #[cfg(any(test, feature = "std"))]
     pub fn encode(&self) -> std::vec::Vec<u8> {
         let mut body = std::vec::Vec::new();
+        let ordered = self.ordered();
         for ch in &self.channel[..self.channels] {
             body.extend_from_slice(&(ch.count as u32).to_le_bytes());
-            body.extend_from_slice(&0u32.to_le_bytes());
+            body.extend_from_slice(&(if ordered { ch.pre as u32 } else { 0 }).to_le_bytes());
             body.extend_from_slice(&ch.gain.to_le_bytes());
+            if ordered {
+                body.extend_from_slice(&ch.pre_gain.to_le_bytes());
+            }
             for s in ch.sections() {
                 for v in [s.b0, s.b1, s.b2, s.a1, s.a2] {
                     body.extend_from_slice(&v.to_le_bytes());
                 }
             }
         }
-        let mut flags = self.flags & !FLAG_DYNAMICS;
+        let mut flags = self.flags & !(FLAG_DYNAMICS | FLAG_ORDERED);
+        if ordered {
+            flags |= FLAG_ORDERED;
+        }
         if let Some(d) = &self.dynamics {
             flags |= FLAG_DYNAMICS;
             for v in d.words() {
@@ -313,18 +341,30 @@ impl Params {
             let b: [u8; 8] = body.get(i..i + 8).ok_or(BlobError::Length)?.try_into().map_err(|_| BlobError::Length)?;
             Ok(f64::from_le_bytes(b))
         };
+        if flags & FLAG_ORDERED != 0 && flags & FLAG_DYNAMICS == 0 {
+            return Err(BlobError::Length);
+        }
+        let ordered = flags & FLAG_ORDERED != 0;
         let mut at = 0usize;
         for ch in p.channel.iter_mut().take(n) {
             if body.len() < at + 16 {
                 return Err(BlobError::Length);
             }
-            let count = word(body, at) as usize;
-            if count > MAX_SECTIONS || word(body, at + 4) != 0 {
+            let (count, pre) = (word(body, at) as usize, word(body, at + 4) as usize);
+            if count > MAX_SECTIONS || pre > count || (!ordered && pre != 0) {
                 return Err(BlobError::Length);
             }
             ch.count = count;
+            ch.pre = pre;
             ch.gain = f64_at(at + 8)?;
             at += 16;
+            if ordered {
+                ch.pre_gain = f64_at(at)?;
+                at += 8;
+                if !ch.pre_gain.is_finite() || ch.pre_gain < 0.0 {
+                    return Err(BlobError::Unstable);
+                }
+            }
             for s in ch.sections.iter_mut().take(count) {
                 *s = Section {
                     b0: f64_at(at)?,
@@ -354,7 +394,7 @@ impl Params {
             }
             p.dynamics = Some(d);
         }
-        if flags & !(FLAG_FROM_TUNING | FLAG_DYNAMICS) != 0 {
+        if flags & !(FLAG_FROM_TUNING | FLAG_DYNAMICS | FLAG_ORDERED) != 0 {
             return Err(BlobError::Length);
         }
         if at != body.len() {
@@ -532,11 +572,21 @@ impl PreStage {
     }
 
     /// Runs the dynamics on every channel at once (after [`PreStage::process`]
-    /// has filtered each into `bufs`), in place. No dynamics: unchanged.
-    /// Real time.
+    /// has filtered each into `bufs`), in place, then, when they run at
+    /// their place in the graph, each channel's filters after them. No
+    /// dynamics: unchanged. Real time.
     pub fn process_dynamics(&mut self, bufs: &mut [&mut [f32]], frames: usize) {
-        if let Some(d) = &mut self.dynamics {
-            d.process(bufs, frames);
+        let Some(d) = &mut self.dynamics else { return };
+        d.process(bufs, frames);
+        if !self.params.ordered() {
+            return;
+        }
+        let n = bufs.len().min(self.params.channels);
+        for (c, buf) in bufs.iter_mut().take(n).enumerate() {
+            let ch = &self.params.channel[c];
+            let (lo, hi) = (ch.pre.min(MAX_SECTIONS), ch.count.min(MAX_SECTIONS));
+            let k = frames.min(buf.len());
+            run_sections(&ch.sections[lo..hi], &mut self.state[c][lo..hi], ch.gain, &mut buf[..k]);
         }
     }
 
@@ -552,24 +602,37 @@ impl PreStage {
             output.fill(0.0);
             return;
         }
-        let secs = &ch.sections[..ch.count.min(MAX_SECTIONS)];
-        for (x, y) in input.iter().zip(output.iter_mut()) {
-            let mut v = if x.is_finite() { x.clamp(-INPUT_BOUND, INPUT_BOUND) as f64 } else { 0.0 };
-            for (s, st) in secs.iter().zip(z.iter_mut()) {
-                let out = s.b0 * v + st[0];
-                st[0] = s.b1 * v - s.a1 * out + st[1];
-                st[1] = s.b2 * v - s.a2 * out;
-                v = out;
-            }
-            v *= ch.gain;
-            if v.is_finite() {
-                *y = v as f32;
-            } else {
-                // never reached with stable sections and bounded input;
-                // a poisoned history is cleared rather than kept
-                *z = [[0.0; 2]; MAX_SECTIONS];
-                *y = 0.0;
-            }
+        // ordered: only the filters ahead of the dynamics run here
+        let (end, gain) = if self.params.ordered() {
+            (ch.pre.min(MAX_SECTIONS), ch.pre_gain)
+        } else {
+            (ch.count.min(MAX_SECTIONS), ch.gain * ch.pre_gain)
+        };
+        let k = input.len().min(output.len());
+        output[..k].copy_from_slice(&input[..k]);
+        run_sections(&ch.sections[..end], &mut z[..end], gain, &mut output[..k]);
+    }
+}
+
+/// Runs `secs` and then `gain` over `buf` in place, transposed direct form
+/// II with f64 state. Real time.
+fn run_sections(secs: &[Section], z: &mut [[f64; 2]], gain: f64, buf: &mut [f32]) {
+    for y in buf.iter_mut() {
+        let mut v = if y.is_finite() { y.clamp(-INPUT_BOUND, INPUT_BOUND) as f64 } else { 0.0 };
+        for (s, st) in secs.iter().zip(z.iter_mut()) {
+            let out = s.b0 * v + st[0];
+            st[0] = s.b1 * v - s.a1 * out + st[1];
+            st[1] = s.b2 * v - s.a2 * out;
+            v = out;
+        }
+        v *= gain;
+        if v.is_finite() {
+            *y = v as f32;
+        } else {
+            // never reached with stable sections and bounded input;
+            // a poisoned history is cleared rather than kept
+            z.iter_mut().for_each(|st| *st = [0.0; 2]);
+            *y = 0.0;
         }
     }
 }
@@ -729,6 +792,62 @@ mod tests {
         let mut m = dyn_params();
         m.dynamics.as_mut().unwrap().band[0].mode = BandMode::Mute;
         assert!(level(&run_dyn(&m, &tone(50.0, 0.1, n)), 50.0) < -40.0);
+    }
+
+    /// Runs the whole pre-stage (filters, then dynamics) over two equal channels.
+    fn run_all(p: &Params, x: &[f32]) -> std::vec::Vec<f32> {
+        let mut s = PreStage::with_rate(p.clone(), 48_000.0);
+        let (mut a, mut b) = (x.to_vec(), x.to_vec());
+        for k in (0..x.len()).step_by(512) {
+            let e = (k + 512).min(x.len());
+            let (xa, xb) = (a[k..e].to_vec(), b[k..e].to_vec());
+            s.process(0, &xa, &mut a[k..e]);
+            s.process(1, &xb, &mut b[k..e]);
+            let mut bufs: [&mut [f32]; 2] = [&mut a[k..e], &mut b[k..e]];
+            s.process_dynamics(&mut bufs, e - k);
+        }
+        a
+    }
+
+    #[test]
+    fn ordered_dynamics_run_at_the_compressors_place() {
+        let fs = 48_000.0;
+        let hp = [hp2(100.0, fs), hp2(100.0, fs)];
+        let mut after = dyn_params();
+        for c in 0..2 {
+            let ch = &mut after.channel[c];
+            ch.count = 2;
+            ch.sections[..2].copy_from_slice(&hp);
+            ch.gain = 0.5;
+            ch.pre_gain = 0.8;
+        }
+        let mut before = after.clone();
+        after.flags |= FLAG_ORDERED;
+        for c in 0..2 {
+            before.channel[c].pre = 0;
+            after.channel[c].pre = 0;
+        }
+        // round trip, and the legacy layout refuses a split
+        assert_eq!(Params::decode(&after.encode(), 2, fs).unwrap(), after);
+        let mut torn = before.clone();
+        torn.channel[0].pre = 1;
+        assert_eq!(Params::decode(&torn.encode(), 2, fs).unwrap().channel[0].pre, 0);
+        // full-scale sub-bass under a quiet tone in the same band: with the
+        // high-pass after the compressor (macOS's order) the detector sees
+        // the sub-bass and the tone comes out lower than with it before
+        let n = 48_000;
+        let x: std::vec::Vec<f32> =
+            tone(30.0, 0.8, n).iter().zip(tone(150.0, 0.05, n).iter()).map(|(a, b)| a + b).collect();
+        let (y_after, y_before) = (run_all(&after, &x), run_all(&before, &x));
+        assert!(
+            level(&y_after, 150.0) < level(&y_before, 150.0) - 3.0,
+            "{} vs {}",
+            level(&y_after, 150.0),
+            level(&y_before, 150.0)
+        );
+        // the same small-signal response either way
+        let q = tone(1000.0, 1e-3, n);
+        assert!((level(&run_all(&after, &q), 1000.0) - level(&run_all(&before, &q), 1000.0)).abs() < 0.01);
     }
 
     #[test]

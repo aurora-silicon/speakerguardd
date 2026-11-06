@@ -51,15 +51,29 @@
 //! expanding branches, saturation, solo, per-band input gain, another
 //! crossover order, release switched off) refuses the compile.
 //!
-//! The channel's whole response is then scaled so it never exceeds unity
-//! at any frequency (stricter than macOS only where the tuning boosts): the
-//! pre-stage never adds drive, and its output stays inside the converter's
-//! range whenever its input does.
+//! The compressor runs at its place in the graph: on each lane the filters
+//! of the boxes before it run ahead of the dynamics and the rest after
+//! (`FLAG_ORDERED`), so its detector sees what macOS's sees (the sub-bass a
+//! later crossover removes included).
+//!
+//! The channel's filter response is then scaled so it never exceeds unity
+//! at any frequency (stricter than macOS only where the tuning boosts). The
+//! dynamics carry the compressor's own gain staging, as macOS applies it.
+//!
+//! Every value read must be in the saved state: a field left out refuses
+//! the compile rather than reading as "off" or 0 dB. A filter box the strip
+//! gives no preset refuses, as does any box ahead of the unit other than the
+//! filter and compressor boxes, the voicing boxes the voicing graph stands
+//! in for ([`NOT_CARRIED`]) and the built-ins that never add drive
+//! ([`BUILTIN_PASS`]): the crossover the supervisor declares to the kernel
+//! is then the graph's whole filtering, never a partial one.
 
 use crate::error::{Diagnostics, Error, Result};
 use crate::fourcc::FourCc;
 use crate::tuning::{Stage, Tuning};
-use sgv2_core::prestage::{Band, BandMode, Channel, Dynamics, Params, Section, BANDS, FLAG_FROM_TUNING, MAX_SECTIONS};
+use sgv2_core::prestage::{
+    Band, BandMode, Channel, Dynamics, Params, Section, BANDS, FLAG_FROM_TUNING, FLAG_ORDERED, MAX_SECTIONS,
+};
 use sgv2_core::MAX_CHANNELS;
 use std::f64::consts::PI;
 
@@ -67,6 +81,22 @@ use std::f64::consts::PI;
 pub const TMST: FourCc = FourCc::from_bytes(*b"tmst");
 /// The multiband compressor unit's subtype.
 pub const MSTK: FourCc = FourCc::from_bytes(*b"mstk");
+/// The other boxes a speaker graph may run ahead of its protection unit,
+/// which the pre-stage does not carry: the voicing graph that feeds the
+/// unit stands in for them (loudness normaliser, virtual bass, crosstalk
+/// canceller, variable EQ, peak limiter, buzz and delay, low-flow limiter,
+/// volume taper, channel matrix). A box of any other kind ahead of the
+/// unit refuses the compile: what it does to the drive is unknown.
+pub const NOT_CARRIED: [&str; 10] = ["ldnm", "vben", "axtc", "vrq2", "cfrk", "buzk", "cdly", "flow", "volt", "pchr"];
+/// The graph's own built-in boxes (manufacturer `abox`) the pre-stage passes:
+/// routing and block-format boxes that do not change a channel's level
+/// (channel split and join, reblocker, serial converter), non-finite samples
+/// to zero, the dB gain that carries the system volume and balance (0 dB at
+/// most at full volume, where the pre-stage runs), and the channel sum of a
+/// downmixing graph, which the voicing graph stands in for like the boxes in
+/// [`NOT_CARRIED`]. Any other built-in ahead of the unit refuses.
+pub const BUILTIN_PASS: [&str; 7] = ["chsp", "chjn", "rebl", "srlc", "nfnp", "dbgn", "summ"];
+const ABOX: FourCc = FourCc::from_bytes(*b"abox");
 pub const SLOTS: u32 = 50;
 const SLOT_BASE: u32 = 14;
 const SLOT_STRIDE: u32 = 10;
@@ -190,17 +220,21 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics, strict_au
         .as_ref()
         .and_then(|s| s.global())
         .ok_or_else(|| bad(format!("{ctx}: the strip gives it no saved state")))?;
-    // A value the saved state leaves out is the unit's default; the
-    // defaults that matter here are all "off" or 0 dB.
+    // Every value this reads must be in the saved state: a field left out
+    // would be read as "off" or 0 dB, which drops a cut, a filter or a mute.
+    let req = |id: u32| -> Result<f64> {
+        g.get(id).map(f64::from).ok_or_else(|| bad(format!("{ctx}: saved parameter {id} is missing")))
+    };
+    // automation entries past the ones the unit saves are off
     let get = |id: u32| g.get(id).map(f64::from).unwrap_or(0.0);
     let bits = |id: u32| -> Result<u32> {
-        let v = get(id);
+        let v = req(id)?;
         if !(0.0..=65535.0).contains(&v) || v.fract() != 0.0 {
             return Err(bad(format!("{ctx}: parameter {id} is {v}, not a bit mask")));
         }
         Ok(v as u32)
     };
-    if get(0) != 0.0 {
+    if req(0)? != 0.0 {
         return Ok(p);
     }
     if bits(11)? >> ch & 1 != 0 {
@@ -212,34 +246,34 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics, strict_au
         Some(v) => return Err(bad(format!("{ctx}: highest filter order {v}"))),
         None => MAX_ORDER,
     };
-    p.gain_db = get(4) + get(13);
+    p.gain_db = req(4)? + req(13)?;
     let group_bypass = bits(1)?;
     let nyquist = fs / 2.0;
     let mut kept = Vec::new();
     for i in 0..SLOTS {
-        let at = |k: u32| get(SLOT_BASE + SLOT_STRIDE * i + k);
-        let state = at(0);
+        let at = |k: u32| req(SLOT_BASE + SLOT_STRIDE * i + k);
+        let state = at(0)?;
         if !(0.0..=7.0).contains(&state) || state.fract() != 0.0 {
             return Err(bad(format!("{ctx}: slot {i} state {state}")));
         }
         if (state as u32) & 2 == 0 {
             continue;
         }
-        let mask = at(7);
+        let mask = at(7)?;
         if !(0.0..=65535.0).contains(&mask) || mask.fract() != 0.0 {
             return Err(bad(format!("{ctx}: slot {i} channel mask {mask}")));
         }
         if (mask as u32) >> ch & 1 == 0 {
             continue;
         }
-        let group = at(9);
+        let group = at(9)?;
         if !(0.0..=9.0).contains(&group) || group.fract() != 0.0 {
             return Err(bad(format!("{ctx}: slot {i} group {group}")));
         }
         if group_bypass >> group as u32 & 1 != 0 {
             return Err(bad(format!("{ctx}: slot {i} runs in bypassed group {group}; group bypass is not settled")));
         }
-        let (kind, gain, f0, q, order) = (at(1), at(2), at(3), at(4), at(5));
+        let (kind, gain, f0, q, order) = (at(1)?, at(2)?, at(3)?, at(4)?, at(5)?);
         if kind.fract() != 0.0 || !gain.is_finite() || !q.is_finite() || !order.is_finite() {
             return Err(bad(format!("{ctx}: slot {i} has a non-numeric field")));
         }
@@ -410,26 +444,91 @@ pub fn compressor(st: &Stage) -> Result<Option<Dynamics>> {
 
 /// The pre-stage of every unit channel, from the filter boxes on its lane.
 pub fn derive(t: &Tuning, fs: f64, channels: usize, diags: &mut Diagnostics) -> Result<Params> {
+    derive_lanes(&t.chain, &t.protection.lanes, fs, channels, diags)
+}
+
+/// [`derive`] from the chain and the lanes into the unit.
+fn derive_lanes(
+    chain: &[Stage],
+    lanes: &[crate::dspg::analysis::Lane],
+    fs: f64,
+    channels: usize,
+    diags: &mut Diagnostics,
+) -> Result<Params> {
     if channels == 0 || channels > MAX_CHANNELS {
         return Err(bad(format!("{channels} unit channels")));
     }
-    if t.protection.lanes.len() != channels {
+    if lanes.len() != channels {
         return Err(bad(format!(
             "the unit takes {channels} channels but the graph traces {} lanes into it",
-            t.protection.lanes.len()
+            lanes.len()
         )));
     }
     let mut out = Params::identity(channels);
-    out.flags = FLAG_FROM_TUNING;
-    out.dynamics = dynamics(&t.chain, &t.protection.lanes)?;
-    for (c, lane) in t.protection.lanes.iter().enumerate() {
+    out.dynamics = dynamics(chain, lanes)?;
+    // the compressor runs where the graph has it: filters ahead of it on
+    // the lane run before the dynamics, the rest after
+    let comp = out.dynamics.as_ref().and_then(|_| {
+        chain
+            .iter()
+            .find(|s| {
+                s.before_protection
+                    && s.unit.map(|u| u.subtype) == Some(MSTK)
+                    && lanes.iter().all(|l| l.through.iter().any(|p| p.node == s.name))
+            })
+            .map(|s| s.name.clone())
+    });
+    out.flags = FLAG_FROM_TUNING | if comp.is_some() { FLAG_ORDERED } else { 0 };
+    let mut skipped: Vec<String> = Vec::new();
+    for (c, lane) in lanes.iter().enumerate() {
         let mut sections = Vec::new();
         let (mut gain_db, mut muted) = (0.0, false);
+        let (mut pre, mut pre_gain_db) = (0usize, 0.0);
         for pass in &lane.through {
-            let Some(stage) = t.chain.iter().find(|s| s.name == pass.node) else {
+            let Some(stage) = chain.iter().find(|s| s.name == pass.node) else {
                 return Err(bad(format!("lane {c} passes {}, which is not in the chain", pass.node)));
             };
-            if !stage.before_protection || stage.unit.map(|u| u.subtype) != Some(TMST) {
+            if !stage.before_protection {
+                continue;
+            }
+            if comp.as_deref() == Some(stage.name.as_str()) {
+                (pre, pre_gain_db) = (sections.len(), gain_db);
+                gain_db = 0.0;
+                continue;
+            }
+            let Some(sub) = box_subtype(stage) else { continue };
+            if stage.unit.is_some_and(|u| u.manufacturer == ABOX) {
+                if BUILTIN_PASS.contains(&sub.as_str()) {
+                    continue;
+                }
+                return Err(bad(format!(
+                    "built-in box {} ({sub}) ahead of the unit is of a kind the pre-stage does not know",
+                    stage.name
+                )));
+            }
+            if sub == "tmst" {
+                if stage.unit.is_none() && !stage.bypass {
+                    return Err(bad(format!(
+                        "filter box {} has no preset in the strip; without its filters the speakers \
+                         would be driven harder than macOS drives them",
+                        stage.name
+                    )));
+                }
+            } else if sub == "mstk" {
+                // carried as the dynamics; a bypassed one passes
+                continue;
+            } else if NOT_CARRIED.contains(&sub.as_str()) {
+                if !skipped.contains(&stage.name) {
+                    skipped.push(stage.name.clone());
+                }
+                continue;
+            } else {
+                return Err(bad(format!(
+                    "box {} ({}) ahead of the unit is of a kind the pre-stage does not know",
+                    stage.name, stage.kind
+                )));
+            }
+            if stage.unit.is_none() {
                 continue;
             }
             let p = part(stage, pass.channel, fs, diags)?;
@@ -443,11 +542,18 @@ pub fn derive(t: &Tuning, fs: f64, channels: usize, diags: &mut Diagnostics) -> 
         let mut ch = Channel::IDENTITY;
         ch.count = sections.len();
         ch.sections[..sections.len()].copy_from_slice(&sections);
-        ch.gain = if muted { 0.0 } else { 10f64.powf(gain_db / 20.0) };
-        if !ch.gain.is_finite() {
-            return Err(bad(format!("channel {c}: gain {gain_db} dB")));
+        if comp.is_some() {
+            ch.pre = pre;
+            ch.pre_gain = if muted { 0.0 } else { 10f64.powf(pre_gain_db / 20.0) };
+        } else {
+            gain_db += pre_gain_db;
         }
-        // Never more than unity anywhere: the pre-stage only takes drive away.
+        ch.gain = if muted { 0.0 } else { 10f64.powf(gain_db / 20.0) };
+        if !ch.gain.is_finite() || !ch.pre_gain.is_finite() {
+            return Err(bad(format!("channel {c}: gain {} dB", gain_db + pre_gain_db)));
+        }
+        // The filters never exceed unity anywhere (the gain after them
+        // takes the excess).
         let peak = ch.peak(fs);
         if peak > 1.0 {
             ch.gain /= peak;
@@ -459,7 +565,27 @@ pub fn derive(t: &Tuning, fs: f64, channels: usize, diags: &mut Diagnostics) -> 
         }
         out.channel[c] = ch;
     }
+    if !skipped.is_empty() {
+        diags.info(
+            "prestage-not-carried",
+            "pre-stage".to_string(),
+            format!("boxes ahead of the unit left to the voicing graph: {}", skipped.join(", ")),
+        );
+    }
     Ok(out)
+}
+
+/// The four-letter subtype of an AudioUnit box (from the strip's unit, else
+/// the graph's `aufx/xxxx/...` kind), or `None` for a built-in box.
+fn box_subtype(stage: &Stage) -> Option<String> {
+    if let Some(u) = stage.unit {
+        return Some(u.subtype.to_string());
+    }
+    let mut it = stage.kind.split('/');
+    match (it.next(), it.next()) {
+        (Some(k), Some(sub)) if k.len() == 4 && sub.len() == 4 => Some(sub.to_string()),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -468,14 +594,25 @@ mod tests {
     use crate::aupreset::{ParamSection, ParamState, UnitId};
 
     /// A filter box with the given global values and slots (state, type,
-    /// gain, frequency, quality, order, channel mask, group).
+    /// gain, frequency, quality, order, channel mask, group), over a
+    /// complete saved state of zeros (every global and slot present, as the
+    /// unit saves them).
     fn tmst(globals: &[(u32, f32)], slots: &[(u32, [f32; 8])]) -> Stage {
-        let mut params: Vec<(u32, f32)> = globals.to_vec();
+        let mut full: std::collections::BTreeMap<u32, f32> =
+            (0..SLOT_BASE + SLOT_STRIDE * SLOTS).map(|id| (id, 0.0)).collect();
+        full.insert(5, MAX_ORDER as f32);
+        for (id, v) in globals {
+            full.insert(*id, *v);
+        }
         for (i, [state, kind, gain, f0, q, order, mask, group]) in slots {
             let b = SLOT_BASE + SLOT_STRIDE * i;
-            params.extend([(b, *state), (b + 1, *kind), (b + 2, *gain), (b + 3, *f0), (b + 4, *q), (b + 5, *order)]);
-            params.extend([(b + 7, *mask), (b + 9, *group)]);
+            for (id, v) in [(b, *state), (b + 1, *kind), (b + 2, *gain), (b + 3, *f0), (b + 4, *q), (b + 5, *order)] {
+                full.insert(id, v);
+            }
+            full.insert(b + 7, *mask);
+            full.insert(b + 9, *group);
         }
+        let params: Vec<(u32, f32)> = full.into_iter().collect();
         Stage {
             name: "Tone".into(),
             kind: "aufx/tmst/appl".into(),
@@ -605,6 +742,68 @@ mod tests {
         // a bypassed box contributes nothing
         let off = tmst(&[(0, 1.0)], &[(0, [3.0, 4.0, 0.0, 200.0, 0.7, 2.0, 3.0, 0.0])]);
         assert_eq!(part(&off, 0, fs, &mut d).unwrap().sections.len(), 0);
+        // a field the saved state leaves out refuses, never reads as 0: a
+        // global gain, the mute bits, a running slot's gain or the state of
+        // any slot
+        let full = tmst(&[], &[(0, [3.0, 9.0, -6.0, 1000.0, 1.0, 2.0, 3.0, 0.0])]);
+        for id in [4, 11, 13, 1, SLOT_BASE + 2, SLOT_BASE + SLOT_STRIDE * 7] {
+            let mut st = full.clone();
+            st.state.as_mut().unwrap().sections[0].params.retain(|(i, _)| *i != id);
+            assert!(part(&st, 0, fs, &mut d).is_err(), "parameter {id} left out");
+        }
+        assert_eq!(part(&full, 0, fs, &mut d).unwrap().gain_db, -6.0);
+    }
+
+    /// The pre-stage of `chain` with every one of `n` lanes passing every box.
+    fn derive_chain(chain: Vec<Stage>, n: usize, fs: f64, d: &mut Diagnostics) -> Result<Params> {
+        use crate::dspg::analysis::{Lane, Origin, Pass};
+        let lanes: Vec<Lane> = (0..n as u32)
+            .map(|c| Lane {
+                origin: Origin { node: "in".into(), port: 0, channel: c },
+                hops: Vec::new(),
+                through: chain.iter().map(|s| Pass { node: s.name.clone(), channel: c }).collect(),
+            })
+            .collect();
+        derive_lanes(&chain, &lanes, fs, n, d)
+    }
+
+    #[test]
+    fn compressor_runs_where_the_graph_has_it() {
+        let fs = 48_000.0;
+        let hp = |name: &str, f0: f32, gain: f32| {
+            let mut st = tmst(&[(4, gain)], &[(0, [3.0, 4.0, 0.0, f0, 0.7, 2.0, 3.0, 0.0])]);
+            st.name = name.into();
+            st
+        };
+        let mut d = Diagnostics::default();
+        let p =
+            derive_chain(vec![hp("Tone1", 30.0, -2.0), mstk(&[]), hp("Tone3", 100.0, -3.0)], 2, fs, &mut d).unwrap();
+        assert!(p.ordered() && p.from_tuning());
+        let ch = p.channel[0];
+        assert_eq!((ch.count, ch.pre), (2, 1));
+        assert!((20.0 * ch.pre_gain.log10() + 2.0).abs() < 1e-9 && (20.0 * ch.gain.log10() + 3.0).abs() < 1e-9);
+        // no compressor: everything before, nothing ordered
+        let p = derive_chain(vec![hp("Tone1", 30.0, -2.0), hp("Tone3", 100.0, -3.0)], 2, fs, &mut d).unwrap();
+        assert!(!p.ordered() && p.channel[0].pre == 0 && (20.0 * p.channel[0].gain.log10() + 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn boxes_the_prestage_cannot_account_for_refuse() {
+        let fs = 48_000.0;
+        let mut d = Diagnostics::default();
+        let hp = tmst(&[], &[(0, [3.0, 4.0, 0.0, 100.0, 0.7, 2.0, 3.0, 0.0])]);
+        assert!(derive_chain(vec![hp.clone()], 2, fs, &mut d).is_ok());
+        // a filter box the strip gives no preset: its filters would be lost
+        let mut lost = hp.clone();
+        (lost.unit, lost.state) = (None, None);
+        assert!(derive_chain(vec![lost], 2, fs, &mut d).is_err());
+        // a known voicing box is left to the voicing graph; an unknown one refuses
+        let mut vb = hp.clone();
+        (vb.name, vb.kind, vb.unit) = ("VirtBass".into(), "aufx/vben/appl".into(), None);
+        assert!(derive_chain(vec![hp.clone(), vb], 2, fs, &mut d).is_ok());
+        let mut odd = hp.clone();
+        (odd.name, odd.kind, odd.unit) = ("Odd".into(), "aufx/zzzz/appl".into(), None);
+        assert!(derive_chain(vec![hp, odd], 2, fs, &mut d).is_err());
     }
 
     #[test]
