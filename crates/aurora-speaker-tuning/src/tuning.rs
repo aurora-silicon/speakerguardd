@@ -66,6 +66,10 @@ pub struct Stage {
     pub state: Option<ParamState>,
     /// Preset keys beyond the saved state (unit-specific dictionaries).
     pub preset_extra_keys: Vec<String>,
+    /// Properties the property strip sets on this box.
+    pub strip_properties: Vec<crate::strip::Property>,
+    /// Parsed files named by `Path` properties on this box.
+    pub property_files: Vec<PropertyFile>,
     pub before_protection: bool,
 }
 
@@ -216,6 +220,28 @@ fn out_channels(g: &Graph, node: &str) -> Option<u32> {
         .map(|c| c as u32)
 }
 
+fn property_files(
+    b: &Bundle,
+    properties: &[crate::strip::Property],
+    box_name: &str,
+    diags: &mut Diagnostics,
+) -> Result<Vec<PropertyFile>> {
+    let mut files = Vec::new();
+    for sp in properties {
+        if let PropValue::Path(p) = &sp.value {
+            let rel = bundle_path(b, p)?;
+            let bytes = need(b, &rel, &format!("{box_name} property {} file", sp.number))?;
+            let (value, _) = crate::plist::parse(bytes).map_err(|e| Error::plist(&rel, e))?;
+            let keys = value.as_dict().map(|d| d.keys().map(str::to_string).collect()).unwrap_or_default();
+            files.push(PropertyFile { number: sp.number, path: rel, keys, value });
+        }
+    }
+    if !files.is_empty() {
+        diags.info("box-property-files", box_name, format!("loaded {} property-list sidecar(s)", files.len()));
+    }
+    Ok(files)
+}
+
 fn link(l: &dspg::Link) -> GraphLink {
     GraphLink { name: l.name.clone(), id: l.target.id.value(), rest: l.target.rest.clone() }
 }
@@ -310,6 +336,9 @@ impl Tuning {
                     format!("{name}: AudioUnit box has no preset in the strip"),
                 );
             }
+            let stage_properties =
+                props.as_ref().and_then(|p| p.get(name)).map(|p| p.properties.clone()).unwrap_or_default();
+            let stage_property_files = property_files(b, &stage_properties, name, diags)?;
             chain.push(Stage {
                 name: name.clone(),
                 kind: kindtxt,
@@ -321,6 +350,8 @@ impl Tuning {
                 preset_name: effect.and_then(|e| e.preset.name.clone()),
                 state: effect.map(|e| e.preset.state.clone()),
                 preset_extra_keys: effect.map(|e| e.preset.extra_keys()).unwrap_or_default(),
+                strip_properties: stage_properties,
+                property_files: stage_property_files,
                 before_protection: i < ppos,
             });
         }
@@ -359,7 +390,7 @@ impl Tuning {
         let params = graph.param_links.iter().filter(|l| l.target.node == pbox.name).map(link).collect();
         let properties = graph.property_links.iter().filter(|l| l.target.node == pbox.name).map(link).collect();
         let pprops = props.as_ref().and_then(|p| p.get(&pbox.name));
-        let strip_properties = pprops.map(|p| p.properties.clone()).unwrap_or_default();
+        let strip_properties = chain[ppos].strip_properties.clone();
 
         let spp3 = if kind == UnitKind::Spp3 {
             let path = match pprops.and_then(|p| p.property(PROP_SPP3_SIDECAR)) {
@@ -423,23 +454,7 @@ impl Tuning {
             None
         };
 
-        let mut property_files = Vec::new();
-        for sp in &strip_properties {
-            if let PropValue::Path(p) = &sp.value {
-                let rel = bundle_path(b, p)?;
-                let bytes = need(b, &rel, &format!("property {} file", sp.number))?;
-                let (value, _) = crate::plist::parse(bytes).map_err(|e| Error::plist(&rel, e))?;
-                let keys = value.as_dict().map(|d| d.keys().map(str::to_string).collect()).unwrap_or_default();
-                if sp.number != PROP_SPP3_SIDECAR {
-                    diags.info(
-                        "protection-property-file",
-                        &rel,
-                        format!("property {} names this file; TODO(SPEC) its meaning", sp.number),
-                    );
-                }
-                property_files.push(PropertyFile { number: sp.number, path: rel, keys, value });
-            }
-        }
+        let property_files = chain[ppos].property_files.clone();
 
         let spts = match b.spts() {
             Some(bytes) => Some(spts::decode(bytes, crate::manifest::SPTS_NAME, diags)?),

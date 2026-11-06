@@ -12,6 +12,9 @@
 //! ```
 //!
 //! `Ok(None)` means the box is bypassed in the saved state (it contributes
-//! nothing). Graph-level parameters are taken at full system volume (graph
-//! `mvsc` = 1, `mvol` = 0 dB); a box whose saved state depends on another
-//! volume refuses rather than guesses.
+//! nothing). Dynamic graph parameters are explicit run-time inputs. In
+//! particular AULowFlow parameter 4 is driven by graph `mvol` through its
+//! RT-safe `Run::set_volume(db)` method; it is not frozen to the saved state.
+//! A box whose graph parameter has no implemented run-time input refuses.
+
+pub mod lowflow;
