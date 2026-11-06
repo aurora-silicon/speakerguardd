@@ -57,6 +57,7 @@ def main():
     ap.add_argument("--aid", type=int, required=True)
     ap.add_argument("--box", required=True)
     ap.add_argument("--subtype", default="mstk")
+    ap.add_argument("--slot", type=int, help="render only this tmst slot (all box gains and other slots off)")
     ap.add_argument("--ch", type=int, required=True)
     ap.add_argument("--v2", required=True)
     ap.add_argument("--work", required=True)
@@ -80,14 +81,23 @@ def main():
     fin, fmac, fv2 = (os.path.join(a.work, x) for x in ("in.f32", "mac.f32", "v2.f32"))
     for name, x in cases:
         np.repeat(x[:, None], a.ch, axis=1).astype("<f4").tofile(fin)
-        r = subprocess.run([os.path.join(HERE, "box_host"), "--strip", strip, "--stage", a.box,
-                            "--subtype", a.subtype, "--factory", FACTORY[a.subtype], "--channels", str(a.ch),
-                            "--in", fin, "--out", fmac, "--meta", os.path.join(a.work, "meta.json")],
+        mac_cmd = [os.path.join(HERE, "box_host"), "--strip", strip, "--stage", a.box,
+                   "--subtype", a.subtype, "--factory", FACTORY[a.subtype], "--channels", str(a.ch),
+                   "--in", fin, "--out", fmac, "--meta", os.path.join(a.work, "meta.json")]
+        if a.slot is not None:
+            for pid in (0, 1, 4, 11, 13):
+                mac_cmd += ["--set", f"{pid}=0"]
+            for slot in range(50):
+                if slot != a.slot:
+                    mac_cmd += ["--set", f"{14 + 10 * slot}=0"]
+        r = subprocess.run(mac_cmd,
                            capture_output=True, text=True)
         if r.returncode:
             sys.exit(f"box_host: {r.stderr.strip()}")
-        r = subprocess.run([a.v2, "--tunings-root", a.tunings, "--aid", str(a.aid), "--box", a.box,
-                            "--ch", str(a.ch), fin, fv2], capture_output=True, text=True)
+        v2_cmd = [a.v2, "--tunings-root", a.tunings, "--aid", str(a.aid), "--box", a.box, "--ch", str(a.ch)]
+        if a.slot is not None:
+            v2_cmd += ["--only-slot", str(a.slot)]
+        r = subprocess.run(v2_cmd + [fin, fv2], capture_output=True, text=True)
         if r.returncode:
             print(json.dumps({"aid": a.aid, "box": a.box, "refused": r.stderr.strip()}))
             return 1
@@ -100,7 +110,7 @@ def main():
         if os.path.exists(f):
             os.unlink(f)
     over = [r for r in rows if max(r["diff_db"]) > a.tol]
-    summary = {"aid": a.aid, "box": a.box, "cases": len(rows), "worst_over_db": worst,
+    summary = {"aid": a.aid, "box": a.box, "slot": a.slot, "cases": len(rows), "worst_over_db": worst,
                "min_diff_db": min(min(r["diff_db"]) for r in rows), "over": len(over),
                "worst_cases": sorted(rows, key=lambda r: -max(r["diff_db"]))[:5]}
     if a.json:
