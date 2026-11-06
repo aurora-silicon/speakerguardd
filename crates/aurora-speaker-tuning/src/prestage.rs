@@ -1768,8 +1768,10 @@ mod tests {
         assert_eq!(tone.channels[0].sections[0], rbj(Rbj::LowShelf, 12.0, 100.0, shelf[4] as f64, fs));
         assert_ne!(part(&st, 0, fs, &mut d).unwrap().sections, vec![tone.channels[0].sections[0]]);
 
+        // A = B (M off, as the set points must stay in order) moves nothing
         let mut equal = globals;
         equal[3].1 = equal[2].1;
+        equal[6].1 = 0.0;
         let st = tmst(&equal, &[(0, shelf)]);
         assert!(voicing_tone(&st, 2, true, fs, &mut d).unwrap().0.automation.is_empty());
         assert!(voicing_tone(&st, 2, false, fs, &mut d).unwrap().0.automation.is_empty());
