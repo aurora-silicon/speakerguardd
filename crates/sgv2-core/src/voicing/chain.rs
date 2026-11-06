@@ -15,7 +15,8 @@
 //!   dB, 1 the mute; the graph's volume and balance parameters drive them
 //!   ([`Chain::set_param`]);
 //! * [`Kind::Tone`]: a filter box, as second-order sections and a gain per
-//!   channel ([`crate::prestage::Channel`]);
+//!   channel ([`crate::prestage::Channel`]), plus its system-volume-driven
+//!   slot gain/frequency automation;
 //! * [`Kind::Comp`]: the multiband compressor, linked over the box's
 //!   channels ([`crate::prestage::Dynamics`]);
 //! * [`Kind::Stub`]: a box type whose module has not landed yet. It passes
@@ -39,10 +40,11 @@
 //!
 //! `process` is real-time code: all storage is made in [`Chain::new`].
 
-use crate::prestage::{Channel, Dynamics, Params as PreParams, PreStage};
+use crate::prestage::{Channel, Dynamics, Params as PreParams, PreStage, Section, MAX_SECTIONS};
 use crate::MAX_CHANNELS;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::f64::consts::PI;
 
 /// Most boxes a chain may have; the shipped graphs have under 24 on the
 /// unit's lanes.
@@ -76,12 +78,60 @@ pub struct Link {
     pub id: u32,
 }
 
+/// The part of one ToneMeister slot that volume automation may move.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToneShape {
+    Peak,
+    LowPass(u32),
+    HighPass(u32),
+    Gain,
+    LowShelf,
+    HighShelf,
+}
+
+/// One channel copy of an automated slot in a [`Tone`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ToneTarget {
+    pub channel: usize,
+    /// First section occupied by the slot. Ignored for [`ToneShape::Gain`].
+    pub section: usize,
+}
+
+/// Gain and frequency at one volume set point.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TonePoint {
+    pub scalar: f64,
+    pub gain_db: f64,
+    pub frequency_hz: f64,
+}
+
+/// One slot's volume automation. The slot's saved gain/frequency are the A
+/// point; B is explicit, and M optionally splits the interpolation in two.
+/// Gain is linear in dB and frequency is logarithmic in Hz. Outside A..B,
+/// the nearest endpoint is held.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToneAutomation {
+    pub shape: ToneShape,
+    pub quality: f64,
+    pub a: TonePoint,
+    pub b: TonePoint,
+    pub midpoint: Option<TonePoint>,
+    pub targets: Vec<ToneTarget>,
+}
+
+/// A filter box at its saved state plus the slots driven by system volume.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Tone {
+    pub channels: Vec<Channel>,
+    pub automation: Vec<ToneAutomation>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Kind {
     NonFinite,
     Gain,
     /// One entry per box channel.
-    Tone(Vec<Channel>),
+    Tone(Tone),
     Comp(Dynamics),
     /// The box's four-character subtype.
     Stub([u8; 4]),
@@ -133,8 +183,11 @@ impl Spec {
             if w == 0 || w > MAX_CHANNELS {
                 return Err(SpecError::BadWidth { node: n });
             }
-            if let Kind::Tone(ch) = &node.kind {
-                if ch.len() != w || ch.iter().any(|c| !c.sections().iter().all(|s| s.stable()) || !c.gain.is_finite()) {
+            if let Kind::Tone(tone) = &node.kind {
+                if tone.channels.len() != w
+                    || tone.channels.iter().any(|c| !c.sections().iter().all(|s| s.stable()) || !c.gain.is_finite())
+                    || tone.automation.iter().any(|a| !automation_valid(a, &tone.channels))
+                {
                     return Err(SpecError::BadParams { node: n });
                 }
             }
@@ -152,10 +205,150 @@ impl Spec {
     }
 }
 
+fn shape_sections(shape: ToneShape) -> usize {
+    match shape {
+        ToneShape::LowPass(n) | ToneShape::HighPass(n) => (n as usize).div_ceil(2),
+        ToneShape::Gain => 0,
+        _ => 1,
+    }
+}
+
+fn point_valid(p: TonePoint) -> bool {
+    p.scalar.is_finite() && p.gain_db.is_finite() && p.frequency_hz.is_finite() && p.frequency_hz > 0.0
+}
+
+fn automation_valid(a: &ToneAutomation, channels: &[Channel]) -> bool {
+    let order_ok = match a.shape {
+        ToneShape::LowPass(n) | ToneShape::HighPass(n) => (1..=10).contains(&n),
+        _ => true,
+    };
+    let quality_ok = matches!(a.shape, ToneShape::Gain | ToneShape::LowPass(_) | ToneShape::HighPass(_))
+        || a.quality.is_finite() && a.quality > 0.0;
+    let midpoint_ok =
+        a.midpoint.map(|m| point_valid(m) && m.scalar > a.a.scalar && m.scalar < a.b.scalar).unwrap_or(true);
+    order_ok
+        && quality_ok
+        && point_valid(a.a)
+        && point_valid(a.b)
+        && a.a.scalar < a.b.scalar
+        && midpoint_ok
+        && !a.targets.is_empty()
+        && a.targets.iter().all(|t| {
+            channels.get(t.channel).is_some_and(|c| {
+                t.section <= MAX_SECTIONS && shape_sections(a.shape) <= c.count.saturating_sub(t.section)
+            })
+        })
+}
+
+fn interpolate(a: TonePoint, b: TonePoint, scalar: f64) -> (f64, f64) {
+    let t = ((scalar - a.scalar) / (b.scalar - a.scalar)).clamp(0.0, 1.0);
+    let gain = a.gain_db + t * (b.gain_db - a.gain_db);
+    let frequency = libm::exp(libm::log(a.frequency_hz) + t * (libm::log(b.frequency_hz) - libm::log(a.frequency_hz)));
+    (gain, frequency)
+}
+
+fn automated_values(a: &ToneAutomation, scalar: f64) -> (f64, f64) {
+    match a.midpoint {
+        Some(m) if scalar <= m.scalar => interpolate(a.a, m, scalar),
+        Some(m) => interpolate(m, a.b, scalar),
+        None => interpolate(a.a, a.b, scalar),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Rbj {
+    Peak,
+    LowShelf,
+    HighShelf,
+}
+
+fn rbj(kind: Rbj, gain_db: f64, f0: f64, q: f64, fs: f64) -> Section {
+    let a = libm::pow(10.0, gain_db / 40.0);
+    let w = 2.0 * PI * f0 / fs;
+    let (c, s) = (libm::cos(w), libm::sin(w));
+    let al = s / (2.0 * q);
+    let sa = 2.0 * libm::sqrt(a) * al;
+    let (b, d) = match kind {
+        Rbj::Peak => ([1.0 + al * a, -2.0 * c, 1.0 - al * a], [1.0 + al / a, -2.0 * c, 1.0 - al / a]),
+        Rbj::LowShelf => (
+            [
+                a * ((a + 1.0) - (a - 1.0) * c + sa),
+                2.0 * a * ((a - 1.0) - (a + 1.0) * c),
+                a * ((a + 1.0) - (a - 1.0) * c - sa),
+            ],
+            [(a + 1.0) + (a - 1.0) * c + sa, -2.0 * ((a - 1.0) + (a + 1.0) * c), (a + 1.0) + (a - 1.0) * c - sa],
+        ),
+        Rbj::HighShelf => (
+            [
+                a * ((a + 1.0) + (a - 1.0) * c + sa),
+                -2.0 * a * ((a - 1.0) + (a + 1.0) * c),
+                a * ((a + 1.0) + (a - 1.0) * c - sa),
+            ],
+            [(a + 1.0) - (a - 1.0) * c + sa, 2.0 * ((a - 1.0) - (a + 1.0) * c), (a + 1.0) - (a - 1.0) * c - sa],
+        ),
+    };
+    Section { b0: b[0] / d[0], b1: b[1] / d[0], b2: b[2] / d[0], a1: d[1] / d[0], a2: d[2] / d[0] }
+}
+
+fn butterworth(high: bool, order: u32, f0: f64, fs: f64, out: &mut [Section]) {
+    let k = libm::tan(PI * f0 / fs);
+    let mut at = 0;
+    for i in 0..order / 2 {
+        let q2 = 2.0 * libm::sin(PI * (2 * i + 1) as f64 / (2 * order) as f64);
+        let n = 1.0 + q2 * k + k * k;
+        let (a1, a2) = (2.0 * (k * k - 1.0) / n, (1.0 - q2 * k + k * k) / n);
+        let (b0, b1, b2) = if high { (1.0 / n, -2.0 / n, 1.0 / n) } else { (k * k / n, 2.0 * k * k / n, k * k / n) };
+        out[at] = Section { b0, b1, b2, a1, a2 };
+        at += 1;
+    }
+    if order % 2 == 1 {
+        let n = 1.0 + k;
+        let a1 = (k - 1.0) / n;
+        let (b0, b1) = if high { (1.0 / n, -1.0 / n) } else { (k / n, k / n) };
+        out[at] = Section { b0, b1, b2: 0.0, a1, a2: 0.0 };
+    }
+}
+
+fn apply_tone_automation(stage: &mut PreStage, base: &[Channel], automation: &[ToneAutomation], fs: f64, scalar: f64) {
+    for (c, channel) in base.iter().copied().enumerate() {
+        stage.set_channel(c, channel);
+    }
+    for a in automation {
+        let (gain_db, frequency_hz) = automated_values(a, scalar);
+        for target in &a.targets {
+            let Some(channel) = stage.channel_mut(target.channel) else { continue };
+            match a.shape {
+                ToneShape::Gain => {
+                    channel.gain *= libm::pow(10.0, (gain_db - a.a.gain_db) / 20.0);
+                }
+                ToneShape::Peak | ToneShape::LowShelf | ToneShape::HighShelf => {
+                    let kind = match a.shape {
+                        ToneShape::Peak => Rbj::Peak,
+                        ToneShape::LowShelf => Rbj::LowShelf,
+                        _ => Rbj::HighShelf,
+                    };
+                    let section = rbj(kind, gain_db, frequency_hz, a.quality, fs);
+                    if section.stable() {
+                        channel.sections[target.section] = section;
+                    }
+                }
+                ToneShape::LowPass(order) | ToneShape::HighPass(order) => {
+                    let n = shape_sections(a.shape);
+                    let sections = &mut channel.sections[target.section..target.section + n];
+                    butterworth(matches!(a.shape, ToneShape::HighPass(_)), order, frequency_hz, fs, sections);
+                    if sections.iter().any(|s| !s.stable()) {
+                        sections.copy_from_slice(&base[target.channel].sections[target.section..target.section + n]);
+                    }
+                }
+            }
+        }
+    }
+}
+
 enum Run {
     NonFinite,
     Gain { gain_db: f64, mute: bool, scale: f32 },
-    Filters(PreStage),
+    Filters { stage: PreStage, base: Vec<Channel>, automation: Vec<ToneAutomation>, fs: f64 },
     Comp(PreStage),
     Through,
 }
@@ -165,10 +358,15 @@ impl Run {
         match kind {
             Kind::NonFinite => Run::NonFinite,
             Kind::Gain => Run::Gain { gain_db: 0.0, mute: false, scale: 1.0 },
-            Kind::Tone(ch) => {
+            Kind::Tone(tone) => {
                 let mut p = PreParams::identity(width);
-                p.channel[..width].copy_from_slice(&ch[..width]);
-                Run::Filters(PreStage::with_rate(p, fs))
+                p.channel[..width].copy_from_slice(&tone.channels[..width]);
+                Run::Filters {
+                    stage: PreStage::with_rate(p, fs),
+                    base: tone.channels.clone(),
+                    automation: tone.automation.clone(),
+                    fs,
+                }
             }
             Kind::Comp(d) => {
                 let mut p = PreParams::identity(width);
@@ -181,20 +379,27 @@ impl Run {
     }
 
     fn set(&mut self, id: u32, v: f64) {
-        if let Run::Gain { gain_db, mute, scale } = self {
-            match id {
-                // a gain box only ever attenuates: it never adds drive
-                0 if v.is_finite() => *gain_db = v.min(0.0),
-                1 => *mute = v != 0.0,
-                _ => {}
+        match self {
+            Run::Gain { gain_db, mute, scale } => {
+                match id {
+                    // a gain box only ever attenuates: it never adds drive
+                    0 if v.is_finite() => *gain_db = v.min(0.0),
+                    1 => *mute = v != 0.0,
+                    _ => {}
+                }
+                *scale = if *mute { 0.0 } else { libm::pow(10.0, *gain_db / 20.0) as f32 };
             }
-            *scale = if *mute { 0.0 } else { libm::pow(10.0, *gain_db / 20.0) as f32 };
+            Run::Filters { stage, base, automation, fs } if id == 3 && v.is_finite() => {
+                apply_tone_automation(stage, base, automation, *fs, v);
+            }
+            _ => {}
         }
     }
 
     fn reset(&mut self) {
-        if let Run::Filters(p) | Run::Comp(p) = self {
-            p.reset();
+        match self {
+            Run::Filters { stage, .. } | Run::Comp(stage) => stage.reset(),
+            _ => {}
         }
     }
 
@@ -215,9 +420,9 @@ impl Run {
                     }
                 }
             }
-            Run::Filters(p) => {
+            Run::Filters { stage, .. } => {
                 for (c, (i, o)) in x.iter().zip(y.iter_mut()).enumerate() {
-                    p.process(c, &i[..frames], &mut o[..frames]);
+                    stage.process(c, &i[..frames], &mut o[..frames]);
                 }
             }
             Run::Comp(p) => {
@@ -405,5 +610,74 @@ mod tests {
         let mut s = fanout_spec();
         s.nodes[0].inputs[0] = Source::Node(2, 0);
         assert_eq!(s.check(), Err(SpecError::BadSource { node: 0, channel: 0 }));
+    }
+
+    fn automated_tone() -> Spec {
+        let fs = 48_000.0;
+        let mut channel = Channel::IDENTITY;
+        channel.count = 1;
+        channel.sections[0] = rbj(Rbj::LowShelf, 12.0, 100.0, core::f64::consts::FRAC_1_SQRT_2, fs);
+        Spec {
+            program_channels: 1,
+            nodes: vec![NodeSpec {
+                kind: Kind::Tone(Tone {
+                    channels: vec![channel],
+                    automation: vec![ToneAutomation {
+                        shape: ToneShape::LowShelf,
+                        quality: core::f64::consts::FRAC_1_SQRT_2,
+                        a: TonePoint { scalar: 0.2, gain_db: 12.0, frequency_hz: 100.0 },
+                        b: TonePoint { scalar: 0.8, gain_db: 0.0, frequency_hz: 1600.0 },
+                        midpoint: Some(TonePoint { scalar: 0.5, gain_db: 9.0, frequency_hz: 200.0 }),
+                        targets: vec![ToneTarget { channel: 0, section: 0 }],
+                    }],
+                }),
+                inputs: vec![Source::Program(0)],
+            }],
+            outputs: vec![Source::Node(0, 0)],
+            links: vec![Link { param: GraphParam::VolumeScalar, node: 0, id: 3 }],
+        }
+    }
+
+    fn tone_channel(chain: &Chain) -> &Channel {
+        match &chain.runs[0] {
+            Run::Filters { stage, .. } => &stage.params().channel[0],
+            _ => panic!("not a filter run"),
+        }
+    }
+
+    #[test]
+    fn tone_automation_is_piecewise_db_and_log_hz_and_clamps() {
+        let fs = 48_000.0;
+        let mut c = Chain::new(automated_tone(), fs, 8).unwrap();
+        // Chain construction applies the graph's full-volume default: B.
+        assert!(tone_channel(&c).magnitude(0.0, fs).log10().abs() < 1e-10);
+
+        c.set_param(GraphParam::VolumeScalar, 0.35);
+        let ch = tone_channel(&c);
+        let dc_db = 20.0 * libm::log10(ch.magnitude(0.0, fs));
+        assert!((dc_db - 10.5).abs() < 1e-9, "{dc_db}");
+        // Halfway from A to M: gain is halfway in dB, frequency is the
+        // geometric mean. A Butterworth-shaped shelf is half its gain there.
+        let f = libm::sqrt(100.0 * 200.0);
+        let at_f = 20.0 * libm::log10(ch.magnitude(f, fs));
+        assert!((at_f - 5.25).abs() < 0.01, "{at_f}");
+
+        c.set_param(GraphParam::VolumeScalar, -10.0);
+        let below = 20.0 * libm::log10(tone_channel(&c).magnitude(0.0, fs));
+        assert!((below - 12.0).abs() < 1e-9);
+        c.set_param(GraphParam::VolumeScalar, 10.0);
+        assert!(tone_channel(&c).magnitude(0.0, fs).log10().abs() < 1e-10);
+    }
+
+    #[test]
+    fn tone_automation_spec_rejects_bad_midpoint_and_target() {
+        let mut s = automated_tone();
+        let Kind::Tone(tone) = &mut s.nodes[0].kind else { unreachable!() };
+        tone.automation[0].midpoint.as_mut().unwrap().scalar = 0.9;
+        assert_eq!(s.check(), Err(SpecError::BadParams { node: 0 }));
+        let Kind::Tone(tone) = &mut s.nodes[0].kind else { unreachable!() };
+        tone.automation[0].midpoint.as_mut().unwrap().scalar = 0.5;
+        tone.automation[0].targets[0].section = 1;
+        assert_eq!(s.check(), Err(SpecError::BadParams { node: 0 }));
     }
 }

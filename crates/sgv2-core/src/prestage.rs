@@ -523,6 +523,19 @@ impl PreStage {
         &self.params
     }
 
+    /// Replaces one channel's coefficients without touching its history.
+    /// The caller must supply a checked channel. This is bounded and does
+    /// not allocate, so graph-parameter updates may use it in real time.
+    pub(crate) fn set_channel(&mut self, c: usize, channel: Channel) {
+        if c < self.params.channels {
+            self.params.channel[c] = channel;
+        }
+    }
+
+    pub(crate) fn channel_mut(&mut self, c: usize) -> Option<&mut Channel> {
+        (c < self.params.channels).then(|| &mut self.params.channel[c])
+    }
+
     /// Clears every filter's history and the dynamics' detectors (stream start).
     pub fn reset(&mut self) {
         self.state = [[[0.0; 2]; MAX_SECTIONS]; MAX_CHANNELS];
