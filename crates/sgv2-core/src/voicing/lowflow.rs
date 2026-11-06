@@ -8,6 +8,15 @@
 //! and an acoustic masking detector. Only low-frequency lanes are gained;
 //! every lane receives the fixed delay. `SystemVolume` changes only the
 //! saved attenuation ceiling; [`Run::set_volume`] is RT-safe.
+//!
+//! The optional `lowflow-conservative` compile feature is deliberately not an
+//! exact-law claim. It applies a fixed ceiling 6 dB below the saved
+//! volume-dependent ceiling to every enabled low-frequency lane. This makes
+//! the fallback independent of the unresolved detector transition and release
+//! history while retaining the saved volume law and the exact lane delay.
+//! Since the unit's instantaneous gain is bounded below by its saved ceiling,
+//! `g_fallback <= 10^(-6/20) * g_unit` sample by sample. Disabled and HF lanes
+//! remain exact delays, while muted lanes remain silent.
 
 use crate::MAX_CHANNELS;
 use alloc::{boxed::Box, vec, vec::Vec};
@@ -18,10 +27,14 @@ pub const MAX_MODELS: usize = MAX_CHANNELS / 2;
 const MODEL_SCALARS: usize = 28;
 const MAX_FS: f64 = 192_000.0;
 // Unit-family behavior, independent of any tuning's saved values.
+#[cfg(not(feature = "lowflow-conservative"))]
 const LEGACY_VELOCITY_SCALE: f64 = 1.04;
+#[cfg(not(feature = "lowflow-conservative"))]
 const MODERN_VELOCITY_SCALE: f64 = 1.22;
 const INVARIANT_TRANSITION_DB: f64 = 1.3;
 const MODERN_TRANSITION_DB: f64 = 2.0;
+#[cfg(feature = "lowflow-conservative")]
+const CONSERVATIVE_GUARD_DB: f64 = 6.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Model {
@@ -347,6 +360,9 @@ struct State {
     gain: f64,
     gain_release: f64,
     floor: f64,
+    #[cfg(feature = "lowflow-conservative")]
+    conservative_floor: f64,
+    #[cfg(not(feature = "lowflow-conservative"))]
     velocity_scale: f64,
 }
 
@@ -397,6 +413,9 @@ impl Run {
                 gain: 1.0,
                 gain_release: gain_release_coefficient(m.release_s, fs),
                 floor: 1.0,
+                #[cfg(feature = "lowflow-conservative")]
+                conservative_floor: 1.0,
+                #[cfg(not(feature = "lowflow-conservative"))]
                 velocity_scale: if params.latency_frames > LATENCY_FRAMES {
                     MODERN_VELOCITY_SCALE
                 } else {
@@ -434,6 +453,10 @@ impl Run {
                 0.0
             };
             state.floor = db_gain(-(attenuation + transition));
+            #[cfg(feature = "lowflow-conservative")]
+            {
+                state.conservative_floor = db_gain(-(attenuation + CONSERVATIVE_GUARD_DB));
+            }
         }
     }
 
@@ -467,6 +490,7 @@ impl Run {
         let frames = bufs[..channels].iter().fold(frames, |n, b| n.min(b.len()));
         for frame in 0..frames {
             let mut energies = [0.0; MAX_MODELS];
+            #[cfg(not(feature = "lowflow-conservative"))]
             let mut velocities = [0.0; MAX_MODELS];
             for c in 0..self.models {
                 let woofer = f64::from(finite(bufs[c][frame]));
@@ -480,9 +504,12 @@ impl Run {
                 state.history_at = (state.history_at + 1) % RESPONSE_TAPS;
                 let mask_band = state.mask_lp2.run(state.mask_lp.run(state.mask_hp2.run(state.mask_hp.run(pressure))));
                 energies[c] = mask_band * mask_band;
-                let band = state.detector_lp.run(state.detector_hp.run(woofer));
-                let velocity = state.cone.run(band) + state.front.run(band);
-                velocities[c] = state.velocity_scale * libm::fabs(velocity);
+                #[cfg(not(feature = "lowflow-conservative"))]
+                {
+                    let band = state.detector_lp.run(state.detector_hp.run(woofer));
+                    let velocity = state.cone.run(band) + state.front.run(band);
+                    velocities[c] = state.velocity_scale * libm::fabs(velocity);
+                }
             }
             if self.link_energies && self.models > 1 {
                 let total: f64 = energies[..self.models].iter().sum();
@@ -493,8 +520,20 @@ impl Run {
                 let state = &mut self.state[c];
                 let alpha = if energies[c] > state.mask_energy { state.mask_attack } else { state.mask_release };
                 state.mask_energy += alpha * (energies[c] - state.mask_energy);
-                let energy_db = 10.0 * libm::log10(state.mask_energy.max(1.0e-30));
-                let limit = velocity_limit(model, energy_db);
+                #[cfg(not(feature = "lowflow-conservative"))]
+                let limit = {
+                    let energy_db = 10.0 * libm::log10(state.mask_energy.max(1.0e-30));
+                    velocity_limit(model, energy_db)
+                };
+                #[cfg(feature = "lowflow-conservative")]
+                let target = if !model.enabled {
+                    1.0
+                } else if model.mute {
+                    0.0
+                } else {
+                    state.conservative_floor
+                };
+                #[cfg(not(feature = "lowflow-conservative"))]
                 let target = if !model.enabled {
                     1.0
                 } else if model.mute {
@@ -530,11 +569,7 @@ fn coefficient(seconds: f64, fs: f64) -> f64 {
     }
 }
 fn gain_release_coefficient(seconds: f64, fs: f64) -> f64 {
-    if seconds <= 0.0 {
-        coefficient(0.05, fs)
-    } else {
-        coefficient(seconds, fs)
-    }
+    coefficient(seconds, fs)
 }
 fn fir(taps: &[f64], history: &[f64], newest: usize) -> f64 {
     let mut sum = 0.0;
@@ -545,6 +580,7 @@ fn fir(taps: &[f64], history: &[f64], newest: usize) -> f64 {
     }
     sum
 }
+#[cfg(not(feature = "lowflow-conservative"))]
 fn velocity_limit(m: &Model, energy_db: f64) -> f64 {
     if energy_db <= m.min_mask_energy_db {
         return m.min_velocity;
@@ -565,6 +601,7 @@ fn velocity_limit(m: &Model, energy_db: f64) -> f64 {
     }
     m.high_velocity
 }
+#[cfg(not(feature = "lowflow-conservative"))]
 fn lerp(a: f64, b: f64, t: f64) -> f64 {
     a + t.clamp(0.0, 1.0) * (b - a)
 }
@@ -667,6 +704,25 @@ mod tests {
         assert!((run.state[0].floor - db_gain(-6.0)).abs() < 1.0e-12);
         run.set_volume(-30.0);
         assert!((run.state[0].floor - 1.0).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn zero_release_is_immediate() {
+        assert_eq!(gain_release_coefficient(0.0, 48_000.0), 1.0);
+        assert!(gain_release_coefficient(0.05, 48_000.0) < 1.0);
+    }
+
+    #[cfg(feature = "lowflow-conservative")]
+    #[test]
+    fn conservative_mode_uses_guarded_fixed_ceiling() {
+        let p = synthetic();
+        let mut run = Run::new(&p, 48_000.0, 4);
+        assert!((run.state[0].conservative_floor - db_gain(-18.0)).abs() < 1.0e-12);
+        run.set_volume(-15.0);
+        assert!((run.state[0].conservative_floor - db_gain(-12.0)).abs() < 1.0e-12);
+        run.set_volume(-30.0);
+        assert!((run.state[0].conservative_floor - db_gain(-6.0)).abs() < 1.0e-12);
+        assert!(run.state[0].conservative_floor <= run.state[0].floor * db_gain(-CONSERVATIVE_GUARD_DB) + 1.0e-12);
     }
 
     #[test]

@@ -30,6 +30,15 @@ cargo test --workspace
 cargo build --release --target aarch64-unknown-linux-musl   # static, for the Macs
 ```
 
+LowFlow exact-law parity remains the default build. A deliberately quieter,
+separately flagged fallback is available with
+`--features sgv2-core/lowflow-conservative`. It retains the saved volume law
+and exact lane delay, but fixes enabled LF lanes 6 dB below the saved
+attenuation ceiling instead of using the provisional detector/state model.
+For the unit's gain bound `g_au >= g_floor`, the fallback therefore guarantees
+`g_fallback <= 10^(-6/20) * g_au` sample by sample on enabled LF lanes; disabled
+and HF lanes remain exact delays, and muted lanes remain silent.
+
 ## Credits
 
 The tuning reader and the installer's collection of the tuning bundle are based on aurora-audio-dsp by saku (MIT). See `crates/aurora-speaker-tuning/LICENSE-aurora-audio-dsp`.
