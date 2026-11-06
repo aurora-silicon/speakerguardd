@@ -346,6 +346,24 @@ fn within_binary32_resolution(
             <= limit as f64 + 8.0 * f32::EPSILON as f64 * magnitude.max(limit).max(f32::MIN_POSITIVE) as f64
 }
 
+#[allow(clippy::too_many_arguments)]
+fn closed_bands_within_binary32_resolution(
+    vb: &[alloc::vec::Vec<f32>; 5],
+    resid: &[f32],
+    first: usize,
+    s: f32,
+    closed: &BandAllocation,
+    limit: &impl Fn(usize) -> f32,
+) -> bool {
+    match violation(vb, resid, first, s, &closed.gains, limit) {
+        Ok(None) => true,
+        Ok(Some((idx, worst))) => {
+            within_binary32_resolution(vb, resid, idx, s, &closed.gains, worst, limit(idx))
+        }
+        Err(_) => false,
+    }
+}
+
 pub fn velocity_band_gains(
     vb: &[alloc::vec::Vec<f32>; 5],
     resid: &[f32],
@@ -446,8 +464,9 @@ pub fn velocity_band_gains(
                 AllocationStatus::ProtectiveFallback,
                 passes,
             );
-            if fallback.status == AllocationStatus::ProtectiveFallback
+            if matches!(fallback.status, AllocationStatus::ProtectiveFallback | AllocationStatus::Uncontrollable)
                 && within_binary32_resolution(vb, resid, idx, s, &g, worst, vlim)
+                && closed_bands_within_binary32_resolution(vb, resid, first, s, &fallback, &limit)
             {
                 return BandAllocation { gains: g, status: AllocationStatus::ConvergedAtResolution, passes };
             }
@@ -577,8 +596,9 @@ pub fn velocity_band_gains_window(
                 AllocationStatus::ProtectiveFallback,
                 passes,
             );
-            if fallback.status == AllocationStatus::ProtectiveFallback
+            if matches!(fallback.status, AllocationStatus::ProtectiveFallback | AllocationStatus::Uncontrollable)
                 && within_binary32_resolution(vb, resid, idx, s, &g, worst, limit(idx))
+                && closed_bands_within_binary32_resolution(vb, resid, first, s, &fallback, &limit)
             {
                 return BandAllocation { gains: g, status: AllocationStatus::ConvergedAtResolution, passes };
             }
