@@ -357,9 +357,7 @@ fn closed_bands_within_binary32_resolution(
 ) -> bool {
     match violation(vb, resid, first, s, &closed.gains, limit) {
         Ok(None) => true,
-        Ok(Some((idx, worst))) => {
-            within_binary32_resolution(vb, resid, idx, s, &closed.gains, worst, limit(idx))
-        }
+        Ok(Some((idx, worst))) => within_binary32_resolution(vb, resid, idx, s, &closed.gains, worst, limit(idx)),
         Err(_) => false,
     }
 }
