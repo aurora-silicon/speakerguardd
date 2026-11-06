@@ -144,9 +144,13 @@ both, so exactly one stack runs on a board:
 The kernel is the switch: a fleet kernel without the v2 interface keeps
 every Mac on the older daemons, the kernel with it moves every gated Mac at
 once, and booting the older kernel moves it back. atsp joined
-`units_at_parity` when all 117 rig cases matched macOS bit for bit. The
-fleet cutover adds lsm2 once it reaches parity and sets
-`require_qualified_board` to false: every board with a parity unit. The data
+`units_at_parity` when all 117 rig cases matched macOS bit for bit. At the
+fleet cutover `require_qualified_board` stays true: v2 runs on the boards in
+their unit's `qualified` list. A spp3 board that is not on it joins after
+the per-band rig against macOS's own graph. Setting the flag to false runs
+v2 on every board with a parity unit, from its own tuning, and waits for
+that rig coverage. lsm2 joins once it holds every
+Apple limit on every rig case. The data
 is speakerguardd's own; every distribution ships it unchanged.
 `speakerguardd-gate explain` prints the decision.
 
@@ -253,8 +257,9 @@ on the J413. A boot that has a valid record only checks the binding.
    parity.
 3. Confirm the amp count has an LV2 variant (2, 4 or 6), and the speaker
    link's CPU DAI driver is in `wiring.py` TRANSPORTS.
-4. After its audible run, add the board to its unit's `qualified` list in
-   `gate.json`; once `require_qualified_board` is false, nothing.
+4. `gate.json`: while `require_qualified_board` is true, add the board to
+   its unit's `qualified` list after its per-band rig against macOS and its
+   silent hardware run. Until then it stays on the older daemons.
 6. Everything else is automatic: the installer collects the tuning,
    provisioning compiles and binds it and configures the units, the
    self-check derives and proves the wiring at first boot, and the graph is

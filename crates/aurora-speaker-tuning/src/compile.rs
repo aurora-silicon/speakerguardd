@@ -283,9 +283,30 @@ pub fn compile_with(t: &Tuning, m: &Machine, provenance: Provenance, diags: &mut
         UnitKind::Lsm2 => compile_lsm2(t, &b, diags),
         UnitKind::Atsp => compile_atsp(t, &b),
     }?;
-    // The graph's own filtering ahead of the unit (crate::prestage): no
-    // blob without it.
-    let pre = crate::prestage::derive(t, c.sample_rate as f64, c.channels as usize, diags)?;
+    // The graph's own filtering ahead of the unit (crate::prestage). spp3
+    // and lsm2 get no blob without it: it is how hard their cones are driven.
+    // atsp limits coil temperature and reached parity with the voicing graph
+    // feeding the unit directly, so it runs protection-only (identity
+    // pre-stage, no crossover declared to the kernel) until the voicing
+    // chain carries the whole graph: the voicing graph already shapes its
+    // feed, and a second copy of the graph's filters would apply them twice.
+    let pre = if t.protection.kind == UnitKind::Atsp {
+        match crate::prestage::derive(t, c.sample_rate as f64, c.channels as usize, &mut Diagnostics::default()) {
+            Ok(_) => diags.info(
+                "prestage-atsp-protection-only",
+                "pre-stage",
+                "atsp runs protection-only: the voicing graph feeds the unit (the graph's pre-stage compiles but is not used)",
+            ),
+            Err(e) => diags.info(
+                "prestage-atsp-protection-only",
+                "pre-stage",
+                format!("atsp runs protection-only: the voicing graph feeds the unit (the graph's pre-stage would refuse: {e})"),
+            ),
+        }
+        sgv2_core::prestage::Params::identity(c.channels as usize)
+    } else {
+        crate::prestage::derive(t, c.sample_rate as f64, c.channels as usize, diags)?
+    };
     c.blob = sgv2_core::blob::with_prestage(&c.blob, &pre)
         .map_err(|e| bad(format!("the pre-stage does not fit the blob: {e:?}")))?;
     sgv2_core::blob::prestage(&c.blob, c.sample_rate as f64)
