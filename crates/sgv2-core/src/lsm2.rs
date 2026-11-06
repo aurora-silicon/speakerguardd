@@ -161,7 +161,7 @@ pub fn controller_frames(rate: u32) -> usize {
 /// native eight-sample vector cadence.
 fn vector_frames(ms: f32, rate: u32) -> usize {
     let f = ms as f64 * 1e-3 * rate as f64;
-    libm::round(f / SUBSTEPS as f64) as usize * SUBSTEPS
+    (libm::round(f / SUBSTEPS as f64) as usize * SUBSTEPS).max(SUBSTEPS)
 }
 /// Filterbank bands.
 pub const BANDS: usize = 5;
