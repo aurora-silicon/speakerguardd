@@ -169,6 +169,56 @@ pub fn velocity_limit(e: f32, k: &[f32; 4], v: &[f32; 3], vmax: f32) -> f32 {
     a + (e - lo) * slope
 }
 
+/// Passes of the band allocation per decision: a real-time budget. Each pass
+/// brings the worst sample to the limit; a window with more separate peaks
+/// than passes ends in [`fit_active`].
+pub const ALLOCATION_PASSES: usize = 64;
+
+/// The largest common factor `r` in `0..=1` for the active bands' gains that
+/// keeps every sample `i` in `first..` within `limit(i)`, the inactive bands
+/// and `resid` held; 0 when those alone exceed a sample's limit. Applied when
+/// the allocation leaves a sample above its limit (budget spent or stalled),
+/// so the decision never ends above the limit the active bands can meet.
+fn fit_active(
+    vb: &[alloc::vec::Vec<f32>; 5],
+    resid: &[f32],
+    first: usize,
+    s: f32,
+    active: (usize, usize),
+    g: &mut [f32; 5],
+    limit: impl Fn(usize) -> f32,
+) {
+    let is_active = |k: usize| k >= active.0 && k < active.1;
+    let mut r = 1.0f32;
+    for i in first..vb[0].len() {
+        let mut f = if resid.is_empty() { 0.0f32 } else { resid[i] };
+        let mut a = 0.0f32;
+        for k in 0..5 {
+            let v = (g[k] * s) * vb[k][i];
+            if is_active(k) {
+                a += v;
+            } else {
+                f += v;
+            }
+        }
+        let l = limit(i);
+        if f.is_nan() || l.is_nan() || f.abs() > l {
+            r = 0.0;
+            break;
+        }
+        if (f + a).abs() > l {
+            // |f + r a| <= l holds on [0, u]; u is where it reaches the limit
+            let u = if a > 0.0 { (l - f) / a } else { (l + f) / -a };
+            r = r.min(u.max(0.0));
+        }
+    }
+    if r < 1.0 {
+        for k in (0..5).filter(|&k| is_active(k)) {
+            g[k] *= r;
+        }
+    }
+}
+
 /// The velocity allocation (residuals 5): on the signed sum of the five
 /// band velocities `vb[k][n]` over `first..`, under the applied slow gain
 /// `s`, find the worst sample, orient every band's contribution to its sign
@@ -186,13 +236,28 @@ pub fn velocity_band_gains(
     active: (usize, usize),
     seed: [f32; 5],
 ) -> [f32; 5] {
+    band_gains_budget(vb, resid, first, vlim, s, active, seed, ALLOCATION_PASSES)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn band_gains_budget(
+    vb: &[alloc::vec::Vec<f32>; 5],
+    resid: &[f32],
+    first: usize,
+    vlim: f32,
+    s: f32,
+    active: (usize, usize),
+    seed: [f32; 5],
+    passes: usize,
+) -> [f32; 5] {
     let mut g = seed;
     let n = vb[0].len();
     if first >= n {
         return g;
     }
     let is_active = |k: usize| k >= active.0 && k < active.1;
-    for _ in 0..64 {
+    let mut within = false;
+    for _ in 0..passes {
         let (mut idx, mut worst) = (first, 0.0f32);
         for i in first..n {
             let mut y = if resid.is_empty() { 0.0f32 } else { resid[i] };
@@ -205,6 +270,7 @@ pub fn velocity_band_gains(
             }
         }
         if worst.abs() <= vlim || worst.is_nan() {
+            within = true;
             break;
         }
         let sign = if worst >= 0.0 { 1.0f32 } else { -1.0 };
@@ -251,6 +317,9 @@ pub fn velocity_band_gains(
             break;
         }
     }
+    if !within {
+        fit_active(vb, resid, first, s, active, &mut g, |_| vlim);
+    }
     g
 }
 
@@ -271,13 +340,29 @@ pub fn velocity_band_gains_window(
     active: (usize, usize),
     seed: [f32; 5],
 ) -> [f32; 5] {
+    let limits = (old_limit, new_limit, split, room_floor);
+    window_gains_budget(vb, resid, first, limits, s, active, seed, ALLOCATION_PASSES)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn window_gains_budget(
+    vb: &[alloc::vec::Vec<f32>; 5],
+    resid: &[f32],
+    first: usize,
+    (old_limit, new_limit, split, room_floor): (f32, f32, usize, f32),
+    s: f32,
+    active: (usize, usize),
+    seed: [f32; 5],
+    passes: usize,
+) -> [f32; 5] {
     let mut g = seed;
     let n = vb[0].len();
     if first >= n {
         return g;
     }
     let is_active = |k: usize| k >= active.0 && k < active.1;
-    for _ in 0..64 {
+    let mut within = false;
+    for _ in 0..passes {
         let (mut idx, mut worst) = (first, 0.0f32);
         for i in first..n {
             let mut y = if resid.is_empty() { 0.0 } else { resid[i] };
@@ -291,6 +376,7 @@ pub fn velocity_band_gains_window(
         }
         let limit = if idx < split { old_limit } else { new_limit };
         if worst.abs() <= limit + room_floor || worst.is_nan() {
+            within = true;
             break;
         }
         let sign = if worst >= 0.0 { 1.0 } else { -1.0 };
@@ -333,6 +419,10 @@ pub fn velocity_band_gains_window(
         if !changed {
             break;
         }
+    }
+    if !within {
+        let bound = |i: usize| if i < split { old_limit } else { new_limit } + room_floor;
+        fit_active(vb, resid, first, s, active, &mut g, bound);
     }
     g
 }
@@ -766,6 +856,63 @@ mod tests {
         assert!((velocity_limit(25.0, &k, &v, 2.0) - 0.8).abs() < 1e-6);
         assert!((velocity_limit(40.0, &k, &v, 2.0) - 2.0).abs() < 1e-6);
         assert!((velocity_limit(50.0, &k, &v, 2.0) - 3.0).abs() < 1e-6);
+    }
+
+    /// Peak of the signed band sum under `g` over `first..`.
+    fn band_sum_peak(vb: &[alloc::vec::Vec<f32>; 5], resid: &[f32], g: &[f32; 5], s: f32) -> f32 {
+        (0..vb[0].len())
+            .map(|i| {
+                let r = if resid.is_empty() { 0.0 } else { resid[i] };
+                (r + (0..5).map(|k| g[k] * s * vb[k][i]).sum::<f32>()).abs()
+            })
+            .fold(0.0, f32::max)
+    }
+
+    #[test]
+    fn a_spent_allocation_ends_within_the_limit() {
+        // the active bands scale down together until every sample fits
+        let vb = [vec![2.0, -1.0, 0.5], vec![1.0, 1.0, 0.0], vec![0.0; 3], vec![0.0; 3], vec![0.2, 0.0, 0.0]];
+        let mut g = [1.0; 5];
+        fit_active(&vb, &[], 0, 1.0, (0, 2), &mut g, |_| 1.5);
+        assert!(band_sum_peak(&vb, &[], &g, 1.0) <= 1.5 + 1e-6, "{g:?}");
+        assert!(g[0] == g[1] && g[0] < 1.0 && g[4] == 1.0);
+        // inactive bands alone over the limit: the active ones go to zero
+        let mut g = [1.0; 5];
+        fit_active(&vb, &[], 0, 1.0, (0, 2), &mut g, |_| 0.1);
+        assert_eq!(g, [0.0, 0.0, 1.0, 1.0, 1.0]);
+        // already within: unchanged
+        let mut g = [1.0; 5];
+        fit_active(&vb, &[], 0, 1.0, (0, 5), &mut g, |_| 10.0);
+        assert_eq!(g, [1.0; 5]);
+    }
+
+    #[test]
+    fn the_allocation_never_leaves_a_sample_above_the_limit() {
+        // many separate peaks with every band mix: more than the pass budget
+        let mut x = 0x2545_f491u32;
+        let mut rnd = || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            (x as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+        for case in 0..40 {
+            let n = 400;
+            let vb: [alloc::vec::Vec<f32>; 5] = core::array::from_fn(|_| (0..n).map(|_| rnd()).collect());
+            let resid: alloc::vec::Vec<f32> = (0..n).map(|_| 0.05 * rnd()).collect();
+            let vlim = 0.3 + 0.2 * (case % 3) as f32;
+            // the full budget, and a budget spent after one or two passes
+            for passes in [ALLOCATION_PASSES, 1, 2] {
+                let g = band_gains_budget(&vb, &resid, 0, vlim, 1.0, (0, 5), [1.0; 5], passes);
+                assert!(band_sum_peak(&vb, &resid, &g, 1.0) <= vlim * (1.0 + 1e-5), "case {case}/{passes}: {g:?}");
+                let lim = (vlim, vlim * 1.5, n / 2, 0.0);
+                let g = window_gains_budget(&vb, &resid, 0, lim, 1.0, (0, 5), [1.0; 5], passes);
+                assert!(
+                    band_sum_peak(&vb, &resid, &g, 1.0) <= vlim * 1.5 * (1.0 + 1e-5),
+                    "window {case}/{passes}: {g:?}"
+                );
+            }
+        }
     }
 
     #[test]
