@@ -36,9 +36,14 @@ LIM = {'velocity': 1.001, 'displacement': 1.001, 'power': 1.001, 'coil_temp': 0.
        'steady': 0.05, 'transient': 0.05, 'tweeter_lf': 0.05}
 # tweeter low-frequency gate (orchestrator 11-06 ~22:30, HARD): per tweeter, 1/3-octave band level
 # 20-200 Hz of the protected output, v2 minus max(macOS, TW_LF_FLOOR_DBFS). The floor keeps
-# float-noise ratios at -150 dBFS from counting; anything above it must not exceed macOS.
+# float-noise ratios from counting; anything above it must not exceed macOS.
+# Floor -90 dBFS (orchestrator decision 11-07, was -120): tweeter content below -90 dBFS is
+# far below audibility and has no excursion or thermal relevance.
 TW_LF_BANDS = [20, 25, 31.5, 40, 50, 63, 80, 100, 125, 160, 200]
-TW_LF_FLOOR_DBFS = -120.0
+TW_LF_FLOOR_DBFS = -90.0
+# steady/transient margin floors (orchestrator decision 11-07), see steps below
+MARGIN_FLOOR_WOOFER_DBFS = -80.0
+MARGIN_FLOOR_TWEETER_DBFS = -90.0
 
 
 def lf_bands(y):
@@ -195,10 +200,17 @@ def main():
         if prog == 'steps':
             meta = json.load(open(os.path.join(A.progs, 'steps.json')))
             sv, tv = steps_levels(yv, meta, max(sh, 0)); sm, tm = steps_levels(ym, meta, 0)
-            ok = sm > -100
+            # Absolute floor (orchestrator decision 11-07): a tone whose macOS drive on that lane is
+            # below -80 dBFS (woofers) or -90 dBFS (tweeters, as the tweeter-LF floor) cannot fail
+            # the steady/transient margins: crossover/high-pass stopband residue there has no
+            # excursion, thermal or audible relevance.
+            floor = np.array([MARGIN_FLOOR_TWEETER_DBFS if ('T' in r['drivers'][e]['driver'] and 'W' not in r['drivers'][e]['driver'])
+                              else MARGIN_FLOOR_WOOFER_DBFS for e in range(nd)])
+            ok = sm > floor[None, :]
             for e in range(nd):
-                r['drivers'][e]['steady'] = float(np.max((sv - sm)[:, e][ok[:, e]]))
-                r['drivers'][e]['transient'] = float(np.max((tv - tm)[:, e][ok[:, e]]))
+                # a lane with every tone under the floor has nothing to fail
+                r['drivers'][e]['steady'] = float(np.max((sv - sm)[:, e][ok[:, e]], initial=-99.0))
+                r['drivers'][e]['transient'] = float(np.max((tv - tm)[:, e][ok[:, e]], initial=-99.0))
         rows.append(r)
         os.remove(feeds)
     stubs = json.load(open(info)).get('stubs', []) if os.path.exists(info) else []

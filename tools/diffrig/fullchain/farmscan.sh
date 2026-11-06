@@ -8,7 +8,7 @@ N=$1; REF=$2; shift 2; MERGES="$*"
 R=/Volumes/AuroraS500/work/speakerguardd/BVB-research
 OUT=/Volumes/AuroraS500/traces/tainted/audio/20261106-spp3-fullchain-scan/$N
 SSH="timeout 900 ssh -o ConnectTimeout=10"
-NODE=m1pro; RD=bvb-scan
+NODE=${NODE:-m1pro}; RD=bvb-scan
 # 1. aarch64 binaries of REF
 timeout 1800 ssh -o ConnectTimeout=10 -n buildbox "/srv/aurora/fast/o/bvb-scan/a64build.sh $N $REF $MERGES" | tail -2
 # 2. stage the node (refs/progs/ts/bundles once; bins + scanner every run)
