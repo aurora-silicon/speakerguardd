@@ -1299,6 +1299,8 @@ struct Chan {
     protected_peak: ProtectedPeak,
     protected_peak_now: f32,
     protected_peak_advanced: bool,
+    input_centroid_previous: f32,
+    protected_peak_previous: f32,
     /// Per-substep peaks over the window (ring of RING slots).
     pk_x: [f32; RING],
     pk_d: [f32; RING],
@@ -1654,6 +1656,8 @@ impl Run {
                 protected_peak: ProtectedPeak::new(rate as usize),
                 protected_peak_now: 0.0,
                 protected_peak_advanced: false,
+                input_centroid_previous: 0.0,
+                protected_peak_previous: 0.0,
                 rd: vec![0.0; od + ctl],
                 vcar: vec![0.0; od + ctl],
                 pk_x: [0.0; RING],
@@ -1803,6 +1807,8 @@ impl Run {
             c.protected_peak.clear();
             c.protected_peak_now = 0.0;
             c.protected_peak_advanced = false;
+            c.input_centroid_previous = 0.0;
+            c.protected_peak_previous = 0.0;
             c.vcar.iter_mut().chain(c.rd.iter_mut()).for_each(|v| *v = 0.0);
             c.eg.iter_mut().for_each(|e| e.iter_mut().for_each(|v| *v = 1.0));
             c.cur_in.clear();
@@ -1953,6 +1959,13 @@ impl Run {
             if c.masker.is_some() {
                 c.vel_limit_now = velocity_limit(level, &c.mask_knots, &c.vel_lim, VELOCITY_PARAM_MAX) as f64;
             }
+            let (mut energy, mut weighted_energy) = (0.0f64, 0.0f64);
+            for k in 0..BANDS {
+                let band_energy = c.ab[k][od..od + ctl].iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>();
+                energy += band_energy;
+                weighted_energy += (k + 1) as f64 * band_energy;
+            }
+            let centroid = if energy > 0.0 { (weighted_energy / energy) as f32 } else { 0.0 };
             let g_peak = if self.axis[0] { ratio(c.amp_limit, window_max(&c.pk_x)) } else { 1.0 };
             let g_disp = if self.axis[1] { ratio(c.disp_limit, window_max(&c.pk_d)) } else { 1.0 };
             let vel_on = self.axis[2] && !c.vel_off;
@@ -2019,6 +2032,12 @@ impl Run {
             let vlim_g = c.vel_limit_now as f32;
             let stream_ready = c.protected_peak.ready();
             c.protected_peak_advanced = false;
+            let ramp_entry = complete_host_frame
+                && centroid > c.input_centroid_previous
+                && c.protected_peak_now > c.protected_peak_previous
+                && c.protected_peak_now < vlim_g;
+            c.input_centroid_previous = centroid;
+            c.protected_peak_previous = c.protected_peak_now;
             let prior_bound = c.vel_bound_window.last().copied().unwrap_or(0.0);
             let next_bound = if c.vel_bound_release && c.vel_bound_ready {
                 (prior_bound as f64 + velocity_release * (c.vel_limit_now - prior_bound as f64)) as f32
@@ -2042,7 +2061,7 @@ impl Run {
             // protected envelope and the decision-local protected trial owns
             // the segment. This compares existing producer states, not signal
             // levels, spectra, case identities, or fitted thresholds.
-            if vel_on && stream_ready && !c.vel_bound_release {
+            if vel_on && complete_host_frame && stream_ready && !c.vel_bound_release {
                 let all = (0, BANDS);
                 let mut producer_r = [1.0; BANDS];
                 if disp_on {
@@ -2096,8 +2115,6 @@ impl Run {
                 debug_assert_eq!(offset, ctl);
             }
             let retained_room_bound = c.vel_bound_window[od..].iter().copied().fold(0.0f32, f32::max);
-            let producer_rising =
-                complete_host_frame && retained_room_bound > c.vel_bound_window[od - 1] && retained_room_bound < vlim_g;
             let velocity_cut = core::cell::Cell::new(false);
             let primary_floor_limited = core::cell::Cell::new(false);
             let retained_episode = core::cell::Cell::new(c.vel_episode && c.vel_episode_retained);
@@ -2136,7 +2153,7 @@ impl Run {
                     } else {
                         ordinary
                     };
-                    if !c.vel_episode && complete_host_frame && (ordinary_cut || producer_rising) && stream_ready {
+                    if !c.vel_episode && (ordinary_cut || ramp_entry) && stream_ready {
                         retained_episode.set(true);
                     }
                     let q = if retained_episode.get() { retained } else { ordinary };
