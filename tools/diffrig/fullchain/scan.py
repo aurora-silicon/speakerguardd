@@ -33,7 +33,19 @@ TS_KEY = {'m2': ['Channel0', 'Channel1', 'Channel2', 'Channel3'],
           'm1pro': ['Channel0', 'Channel2', 'Channel1', 'Channel3', 'Channel4', 'Channel5'],
           'j616s': ['Channel0', 'Channel2', 'Channel1', 'Channel3', 'Channel4', 'Channel5']}
 LIM = {'velocity': 1.001, 'displacement': 1.001, 'power': 1.001, 'coil_temp': 0.01,
-       'steady': 0.05, 'transient': 0.05}
+       'steady': 0.05, 'transient': 0.05, 'tweeter_lf': 0.05}
+# tweeter low-frequency gate (orchestrator 11-06 ~22:30, HARD): per tweeter, 1/3-octave band level
+# 20-200 Hz of the protected output, v2 minus max(macOS, TW_LF_FLOOR_DBFS). The floor keeps
+# float-noise ratios at -150 dBFS from counting; anything above it must not exceed macOS.
+TW_LF_BANDS = [20, 25, 31.5, 40, 50, 63, 80, 100, 125, 160, 200]
+TW_LF_FLOOR_DBFS = -120.0
+
+
+def lf_bands(y):
+    X = np.abs(np.fft.rfft(y)) ** 2 * 2 / (len(y) ** 2 * 0.5)  # band power re a full-scale sine
+    f = np.fft.rfftfreq(len(y), 1 / SR)
+    return np.array([10 * np.log10(X[(f >= c / 2 ** (1 / 6)) & (f < c * 2 ** (1 / 6))].sum() + 1e-30)
+                     for c in TW_LF_BANDS])
 
 
 def run(cmd, **kw):
@@ -167,6 +179,12 @@ def main():
                 d[ax] = {'v2': av[e][ax], 'macos': am[e][ax], 'ratio': av[e][ax] / max(am[e][ax], 1e-30)}
             d['coil_temp'] = {'v2': av[e]['coil_temp'], 'macos': am[e]['coil_temp'],
                               'delta': av[e]['coil_temp'] - am[e]['coil_temp']}
+            if 'T' in d['driver'] and 'W' not in d['driver']:
+                bv, bm = lf_bands(yv[:, e]), lf_bands(ym[:, e])
+                ex = bv - np.maximum(bm, TW_LF_FLOOR_DBFS)
+                k = int(np.argmax(ex))
+                d['tweeter_lf'] = float(ex[k]); d['tweeter_lf_at'] = TW_LF_BANDS[k]
+                d['tweeter_lf_levels'] = {'v2': float(bv[k]), 'macos': float(bm[k])}
             r['drivers'].append(d)
         if prog == 'steps':
             meta = json.load(open(os.path.join(A.progs, 'steps.json')))
@@ -193,6 +211,8 @@ def main():
             for ax in ('steady', 'transient'):
                 if ax in d:
                     worst[(d['driver'], ax)] = (d[ax], r['program'])
+            if 'tweeter_lf' in d and d['tweeter_lf'] > worst.get((d['driver'], 'tweeter_lf'), (-1e9, ''))[0]:
+                worst[(d['driver'], 'tweeter_lf')] = (d['tweeter_lf'], f"{r['program']} @{d['tweeter_lf_at']} Hz")
     lines = [f'# spp3 full-chain safety scan: {A.name}', '',
              ('INFORMATIONAL ONLY: the chain still stubs ' + ', '.join(f'{a} ({b})' for a, b in stubs)
               if informational else 'Chain complete (no stubs).'), '',
@@ -201,7 +221,7 @@ def main():
     for (drv, ax), (v, prog) in sorted(worst.items()):
         ok = v <= LIM[ax]
         allpass &= ok
-        unit = {'velocity': 'x', 'displacement': 'x', 'power': 'x', 'coil_temp': ' C', 'steady': ' dB', 'transient': ' dB'}[ax]
+        unit = {'velocity': 'x', 'displacement': 'x', 'power': 'x', 'coil_temp': ' C', 'steady': ' dB', 'transient': ' dB', 'tweeter_lf': ' dB'}[ax]
         lines.append(f'| {drv} | {ax} | {v:.4f}{unit} | {LIM[ax]}{unit} | {prog} | {"PASS" if ok else "FAIL"} |')
     lines += ['', f'RESULT {A.name}: {"PASS" if allpass else "FAIL"}' + (' (informational: stubbed chain)' if informational else '')]
     open(os.path.join(A.out, 'report.md'), 'w').write('\n'.join(lines) + '\n')
