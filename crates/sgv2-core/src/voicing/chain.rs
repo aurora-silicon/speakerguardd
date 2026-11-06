@@ -95,6 +95,8 @@ pub enum Kind {
     Cdelay(alloc::boxed::Box<super::cdelay::Params>),
     /// AULowFlow (`flow`), exact subset.
     Lowflow(alloc::boxed::Box<super::lowflow::Params>),
+    /// Virtual bass (`vben`).
+    Vbass(alloc::boxed::Box<super::vbass::Params>),
     /// The box's four-character subtype.
     Stub([u8; 4]),
     Bypass,
@@ -175,6 +177,7 @@ enum Run {
     Buzz(alloc::boxed::Box<super::buzz::Run>),
     Cdelay(alloc::boxed::Box<super::cdelay::Run>),
     Lowflow(alloc::boxed::Box<super::lowflow::Run>),
+    Vbass(alloc::boxed::Box<super::vbass::Run>),
     Through,
 }
 
@@ -200,6 +203,7 @@ impl Run {
             Kind::Buzz(p) => Run::Buzz(alloc::boxed::Box::new(super::buzz::Run::new(p, fs, width))),
             Kind::Cdelay(p) => Run::Cdelay(alloc::boxed::Box::new(super::cdelay::Run::new(p, fs, width))),
             Kind::Lowflow(p) => Run::Lowflow(alloc::boxed::Box::new(super::lowflow::Run::new(p, fs, width))),
+            Kind::Vbass(p) => Run::Vbass(alloc::boxed::Box::new(super::vbass::Run::new(p, fs, width))),
             Kind::Stub(_) | Kind::Bypass => Run::Through,
         }
     }
@@ -220,6 +224,7 @@ impl Run {
         match self {
             Run::Filters(p) | Run::Comp(p) => p.reset(),
             Run::Xtc(r) => r.reset(),
+            Run::Vbass(r) => r.reset(),
             Run::Cfreak(r) => r.reset(),
             Run::Mstk(r) => r.reset(),
             Run::Buzz(r) => r.reset(),
@@ -261,7 +266,7 @@ impl Run {
                 let w = x.len().min(MAX_CHANNELS);
                 p.process_dynamics(&mut refs[..w], frames);
             }
-            Run::Xtc(_) | Run::Cfreak(_) | Run::Mstk(_) | Run::Buzz(_) | Run::Cdelay(_) | Run::Lowflow(_) => {
+            Run::Xtc(_) | Run::Cfreak(_) | Run::Mstk(_) | Run::Buzz(_) | Run::Cdelay(_) | Run::Lowflow(_) | Run::Vbass(_) => {
                 for (i, o) in x.iter().zip(y.iter_mut()) {
                     o[..frames].copy_from_slice(&i[..frames]);
                 }
@@ -276,6 +281,7 @@ impl Run {
                     Run::Buzz(r) => r.process(refs, frames),
                     Run::Cdelay(r) => r.process(refs, frames),
                     Run::Lowflow(r) => r.process(refs, frames),
+                    Run::Vbass(r) => r.process(refs, frames),
                     _ => {}
                 }
             }
