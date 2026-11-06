@@ -6,18 +6,18 @@
 //! its saved state.
 //!
 //! Boxes carried today: the non-finite guard and gain builtins, the filter
-//! boxes (`tmst`, through [`crate::prestage::tone`], unscaled) and the
+//! boxes (`tmst`, through [`crate::prestage::voicing_tone`], unscaled) and the
 //! multiband compressor (`mstk`, [`crate::prestage::compressor`]). Every
 //! other box type compiles to a stub until its module lands; a box module
 //! adds its arm to [`compile_node`]. [`Compiled::stubs`] lists what is
 //! still stubbed and [`Compiled::gaps`] what is carried only in part (a
-//! filter box's volume automation); the rig marks every result that depends
-//! on either, and a Mac with any stays on the interim voicing.
+//! filter box's volume automation the chain cannot follow exactly); the rig
+//! marks every result that depends on either, and a Mac with any stays on the
+//! interim voicing.
 
 use super::topology::{self, NodeKind, Plan, Source as PSource};
 use crate::error::{Diagnostics, Error, Result};
 use crate::tuning::{Stage, Tuning};
-use sgv2_core::prestage::{Channel, MAX_SECTIONS};
 use sgv2_core::voicing::chain::{GraphParam, Kind, Link, NodeSpec, Source, Spec};
 
 pub struct Compiled {
@@ -53,10 +53,12 @@ fn graph_param(name: &str) -> Option<GraphParam> {
     })
 }
 
-/// A filter box at its saved state. Its volume automation is not carried
-/// yet: a box with automation switched on is reported as a gap (`gaps`),
-/// which keeps the Mac on the interim voicing (the rig measures what the
-/// automation does).
+/// A filter box at its saved state and, when the graph wires `mvsc` to its
+/// SystemVolume parameter, its gain/frequency volume automation, which the
+/// chain applies exactly at every volume. An automated slot whose law the
+/// chain does not apply exactly is carried at the setting that passes least
+/// over every volume and reported as a gap (`gaps`), which keeps the Mac on
+/// the interim voicing.
 fn tone(
     stage: &Stage,
     width: usize,
@@ -65,27 +67,14 @@ fn tone(
     diags: &mut Diagnostics,
     gaps: &mut Vec<(String, String)>,
 ) -> Result<Kind> {
-    let mut chans = Vec::with_capacity(width);
-    // the automation moves only if the graph drives the box's volume input
-    let auto = if volume_wired { crate::prestage::automation(stage) } else { Vec::new() };
-    if !auto.is_empty() {
-        gaps.push((stage.name.clone(), format!("tmst volume automation (entries {auto:?})")));
+    let (tone, partial) = crate::prestage::voicing_tone(stage, width, volume_wired, fs, diags)?;
+    if !partial.is_empty() {
+        gaps.push((
+            stage.name.clone(),
+            format!("tmst volume automation carried at its least-passing setting (entries {partial:?})"),
+        ));
     }
-    for c in 0..width {
-        let (sections, gain_db, muted, _) = crate::prestage::tone(stage, c as u32, fs, diags)?;
-        if sections.len() > MAX_SECTIONS {
-            return Err(bad(format!("box {} channel {c}: {} sections", stage.name, sections.len())));
-        }
-        let mut ch = Channel::IDENTITY;
-        ch.count = sections.len();
-        ch.sections[..sections.len()].copy_from_slice(&sections);
-        ch.gain = if muted { 0.0 } else { 10f64.powf(gain_db / 20.0) };
-        if !ch.gain.is_finite() {
-            return Err(bad(format!("box {} channel {c}: gain {gain_db} dB", stage.name)));
-        }
-        chans.push(ch);
-    }
-    Ok(Kind::Tone(chans))
+    Ok(Kind::Tone(tone))
 }
 
 /// A box of a carried type whose saved state the module cannot carry: a
