@@ -569,9 +569,9 @@ class Gate(Base):
     def test_shipped_data(self):
         with open(os.path.join(HERE, "gate.json")) as f:
             g = json.load(f)
-        # fleet cutover (option A, lsm2 still out): every board with a parity unit runs v2
+        # fleet cutover (lsm2 still out): only the qualified boards of a parity unit run v2
         self.assertEqual(g["units_at_parity"], ["spp3", "atsp"])
-        self.assertFalse(g["require_qualified_board"])
+        self.assertTrue(g["require_qualified_board"])
         self.assertEqual(sorted(g["qualified"]), ["atsp", "lsm2", "spp3"])
         # the qualified lists stay as the record of audible runs
         qualified = sorted(b for u in g["units_at_parity"] for b in g["qualified"].get(u, []))
