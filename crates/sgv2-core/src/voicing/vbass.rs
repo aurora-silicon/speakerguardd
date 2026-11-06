@@ -221,12 +221,19 @@ mod law {
     /// Type 3 device: `-AMP * tanh(SLOPE * u)`.
     pub const DEVICE3_AMP: f64 = 3.79488;
     pub const DEVICE3_SLOPE: f64 = 0.79967;
-    /// Level control: envelope the drive normalises to (linear peak),
-    /// envelope attack/release (s) and the largest drive.
-    pub const LC_TARGET: f64 = 1.0;
-    pub const LC_ATTACK_S: f64 = 0.010;
-    pub const LC_RELEASE_S: f64 = 0.100;
-    pub const LC_MAX_DRIVE: f64 = 1000.0;
+    /// Level control. The device input is normalised to a unit peak with
+    /// at most `LC_MAX_DRIVE` of gain; its output is scaled by
+    /// `LC_MAX_DRIVE` times the input's peak envelope and limited so that
+    /// the band-limited harmonics never peak above that envelope.
+    pub const LC_MAX_DRIVE: f64 = 20.0;
+    /// Drive detector: instant attack, hold, then a fixed release in dB/s.
+    pub const LC_DRIVE_HOLD_S: f64 = 0.95;
+    pub const LC_DRIVE_RELEASE_DB_S: f64 = 11.6;
+    /// Envelope and limiter detectors: instant attack, hold, then a release
+    /// in dB/s eased in with a one-pole of `LC_EASE_S`.
+    pub const LC_ENV_HOLD_S: f64 = 0.55;
+    pub const LC_ENV_RELEASE_DB_S: f64 = 10.8;
+    pub const LC_EASE_S: f64 = 0.25;
     /// The mid branches are band-limited by a Chebyshev type I low pass
     /// working at a quarter-rate design.
     pub const SUB_RATE_HZ: f64 = 12_000.0;
@@ -325,6 +332,65 @@ impl Params {
     }
 }
 
+/// Peak follower: instant attack; after a hold, the level falls at a fixed
+/// rate in dB, eased in by a one-pole on the rate.
+#[derive(Clone, Copy, Debug)]
+struct Peak {
+    v: f64,
+    held: usize,
+    hold: usize,
+    fall: f64,
+    rate: f64,
+    ease: f64,
+}
+
+impl Peak {
+    fn new(fs: f64, hold_s: f64, release_db_s: f64, ease_s: f64) -> Peak {
+        Peak {
+            v: 0.0,
+            held: 0,
+            hold: (hold_s * fs) as usize,
+            // per-sample log-gain of the full release rate
+            fall: release_db_s / (20.0 * fs) * core::f64::consts::LN_10,
+            rate: 0.0,
+            ease: if ease_s > 0.0 { 1.0 - libm::exp(-1.0 / (ease_s * fs)) } else { 1.0 },
+        }
+    }
+    #[inline]
+    fn run(&mut self, x: f64) -> f64 {
+        let a = libm::fabs(x);
+        if a >= self.v {
+            self.v = a;
+            self.held = 0;
+            self.rate = 0.0;
+        } else if self.held < self.hold {
+            self.held += 1;
+        } else {
+            self.rate += (self.fall - self.rate) * self.ease;
+            self.v = (self.v * libm::exp(-self.rate)).max(a);
+        }
+        self.v
+    }
+}
+
+/// Level control state (only used when the saved state switches it on).
+#[derive(Clone, Copy, Debug)]
+struct LevelControl {
+    drive: Peak,
+    env: Peak,
+    harm: Peak,
+}
+
+impl LevelControl {
+    fn new(fs: f64) -> LevelControl {
+        LevelControl {
+            drive: Peak::new(fs, law::LC_DRIVE_HOLD_S, law::LC_DRIVE_RELEASE_DB_S, 0.0),
+            env: Peak::new(fs, law::LC_ENV_HOLD_S, law::LC_ENV_RELEASE_DB_S, law::LC_EASE_S),
+            harm: Peak::new(fs, law::LC_ENV_HOLD_S, law::LC_ENV_RELEASE_DB_S, law::LC_EASE_S),
+        }
+    }
+}
+
 pub struct Run {
     p: Params,
     fs: f64,
@@ -352,9 +418,7 @@ pub struct Run {
     frac_a: f64,
     frac_x: f64,
     frac_y: f64,
-    env: f64,
-    att: f64,
-    rel: f64,
+    lc: LevelControl,
     /// Output delay, `latency` frames per channel.
     latency: usize,
     oline: Vec<[f64; OUT_LINE]>,
@@ -371,7 +435,6 @@ impl Run {
         let lp = linkwitz_riley(p.hp_order, p.fc_hz, fs, Kind::Low);
         let mut band = linkwitz_riley(p.lower_order, p.fc_hz, fs, Kind::High);
         band.extend(&linkwitz_riley(p.upper_order, p.fu_hz, fs, Kind::Low));
-        let (att, rel) = (libm::exp(-1.0 / (law::LC_ATTACK_S * fs)), libm::exp(-1.0 / (law::LC_RELEASE_S * fs)));
         let stride = sub_stride(fs).unwrap_or(1);
         let sub = chebyshev1(law::SUB_LP_ORDER, law::SUB_LP_RIPPLE_DB, law::SUB_LP_EDGE_HZ, fs / stride as f64);
         let latency = nu % 2 + nl % 2;
@@ -407,9 +470,7 @@ impl Run {
             frac_a: if frac == 0.0 { f64::NAN } else { frac_a },
             frac_x: 0.0,
             frac_y: 0.0,
-            env: 0.0,
-            att,
-            rel,
+            lc: LevelControl::new(fs),
             latency,
             oline: vec![[0.0; OUT_LINE]; channels],
             opos: 0,
@@ -427,7 +488,7 @@ impl Run {
         self.bline = [0.0; BRANCH_LINE];
         self.frac_x = 0.0;
         self.frac_y = 0.0;
-        self.env = 0.0;
+        self.lc = LevelControl::new(self.fs);
         for l in &mut self.oline {
             *l = [0.0; OUT_LINE];
         }
@@ -483,16 +544,19 @@ impl Run {
             mid /= ch as f64;
             let lo = self.lp_sign * self.lp.run(&mut self.lp_st, mid);
             let low = self.p.blend_gain * self.ap.run(&mut self.ap_st, lo);
-            let drive = if self.p.level_control {
-                let a = libm::fabs(lo);
-                let c = if a > self.env { self.att } else { self.rel };
-                self.env = a + c * (self.env - a);
-                (law::LC_TARGET / self.env.max(1e-30)).min(law::LC_MAX_DRIVE)
+            let harm = if self.p.level_control {
+                let pk = self.lc.drive.run(lo);
+                let drive = if pk * law::LC_MAX_DRIVE > 1.0 { 1.0 / pk } else { law::LC_MAX_DRIVE };
+                let env = self.lc.env.run(lo);
+                let dev = self.device(drive * lo);
+                let raw = self.band.run(&mut self.band_st, law::LC_MAX_DRIVE * env * dev);
+                let ph = self.lc.harm.run(raw);
+                let g = if ph > env { env / ph } else { 1.0 };
+                self.p.harmonic_gain * g * raw
             } else {
-                1.0
+                let dev = self.device(lo);
+                self.p.harmonic_gain * self.band.run(&mut self.band_st, dev)
             };
-            let d = self.device(drive * lo) / drive;
-            let harm = self.p.harmonic_gain * self.band.run(&mut self.band_st, d);
             let delayed = self.branch_delay(low + harm);
             let common = run_strided(&self.sub, self.stride, &mut self.sub_st, delayed);
             let (l, pos) = (self.latency, self.opos);
