@@ -27,6 +27,10 @@ const GLOBAL: u32 = 0;
 const GROUP: u32 = 4;
 const CURRENT_VOLUME: u32 = 5;
 const PRE_GAIN: u32 = 7;
+/// The unit's published default for its pre-gain parameter (its
+/// `kAudioUnitProperty_ParameterInfo` default; range -96..12 dB). Saved
+/// states that leave the parameter out run at this value.
+const PRE_GAIN_DEFAULT_DB: f64 = 0.0;
 
 fn bad(message: impl Into<String>) -> Error {
     Error::format("VarEQ", message)
@@ -58,7 +62,14 @@ pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option
     let num = |v: Option<f32>, what: String| -> Result<f64> {
         v.map(f64::from).filter(|x| x.is_finite()).ok_or_else(|| bad(format!("{what} is missing or not finite")))
     };
-    let mut p = Params { pre_gain_db: g.get(PRE_GAIN).map(f64::from).unwrap_or(0.0), ..Params::default() };
+    let pre_gain_db = match g.get(PRE_GAIN) {
+        Some(v) => num(Some(v), "pre-gain parameter 7".into())?,
+        None => {
+            diags.info("vareq-pre-gain-default", "VarEQ", "pre-gain not saved: the unit's published default (0 dB) applies");
+            PRE_GAIN_DEFAULT_DB
+        }
+    };
+    let mut p = Params { pre_gain_db, ..Params::default() };
     for (i, b) in p.breakpoints.iter_mut().enumerate() {
         *b = num(g.get(i as u32 + 1), format!("breakpoint parameter {}", i + 1))?;
     }

@@ -47,6 +47,8 @@ const BAND_WORDS: usize = 5;
 const ELEMENT_WORDS: usize = 1 + BANDS * BAND_WORDS;
 const GAIN_MIN_DB: f64 = -96.0;
 const GAIN_MAX_DB: f64 = 24.0;
+/// The unit's pre-gain range tops out at +12 dB.
+const PRE_GAIN_MAX_DB: f64 = 12.0;
 const BW_MIN: f64 = 0.01;
 const BW_MAX: f64 = 10.0;
 const FREQ_MAX_HZ: f64 = 1.0e6;
@@ -116,7 +118,7 @@ impl Params {
 
     fn valid(&self) -> bool {
         let gain_ok = |g: f64| g.is_finite() && (GAIN_MIN_DB..=GAIN_MAX_DB).contains(&g);
-        if !gain_ok(self.pre_gain_db) {
+        if !(gain_ok(self.pre_gain_db) && self.pre_gain_db <= PRE_GAIN_MAX_DB) {
             return false;
         }
         let mut prev = 0.0;
