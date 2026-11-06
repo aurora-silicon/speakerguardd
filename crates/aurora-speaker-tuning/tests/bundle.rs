@@ -8,7 +8,7 @@ mod common;
 
 use aurora_speaker_tuning::bundle::Bundle;
 use aurora_speaker_tuning::tuning::{Options, Tuning, UnitKind};
-use aurora_speaker_tuning::{Diagnostics, Error};
+use aurora_speaker_tuning::{Diagnostics, Error, Severity};
 use common::*;
 use std::io::Write;
 
@@ -28,8 +28,10 @@ fn directory_bundle_end_to_end() {
     let (t, d) = load(&b, None);
     let t = t.unwrap();
     assert!(!d.has_errors(), "{:?}", d.items);
-    // Only the speaker-ID warning: the build is a validated one.
-    assert!(d.items.iter().any(|x| x.code == "select-speaker-id-unknown"));
+    // No warnings: the build is a validated one, and a database with one
+    // configuration for every speaker vendor needs no speaker ID.
+    assert!(!d.items.iter().any(|x| x.code == "select-speaker-id-unknown"));
+    assert_eq!(d.count(Severity::Warning), 0, "{:?}", d.items);
     assert!(!d.items.iter().any(|x| x.code.starts_with("macos-build")));
 
     assert_eq!(t.aid, AID);
@@ -396,4 +398,23 @@ fn hard_links_in_the_firmware_archive() {
     assert!(t.is_ok() && !d.has_errors(), "{:?} {:?}", t.err(), d.items);
     let e = Bundle::from_tar(&build("hardlink-dangling", true), Some("apple/audio-tuning/")).unwrap_err();
     assert!(format!("{e}").contains("hard link"), "{e}");
+}
+
+/// A database with one General configuration for every speaker vendor (no
+/// `spid` but the generic one): any speaker ID, or none, selects it, with no
+/// warning. A device tree that exports a speaker ID must not make such a
+/// Mac fail to provision.
+#[test]
+fn single_vendor_database_needs_no_speaker_id() {
+    let files = spp3_files(2);
+    let dir = scratch("e2e-one-vendor");
+    write_dir(&dir, &files, &manifest_json(&files, "25G83"));
+    let b = Bundle::open(&dir).unwrap();
+    for spid in [None, Some(0), Some(3), Some(65535)] {
+        let (t, d) = load(&b, spid);
+        let t = t.unwrap_or_else(|e| panic!("spid {spid:?}: {e}"));
+        assert!(t.selection.strip.ends_with("general.austrip"));
+        assert_eq!(d.count(Severity::Warning), 0, "spid {spid:?}: {:?}", d.items);
+        assert_eq!(d.items.iter().any(|x| x.code == "select-speaker-id-unused"), spid.is_some());
+    }
 }
