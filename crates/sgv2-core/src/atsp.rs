@@ -84,7 +84,6 @@ use crate::{
     FAILSAFE_GAIN, MAX_CHANNELS,
 };
 
-const EPS: f64 = f32::MIN_POSITIVE as f64;
 /// The 25G83 dezipper's settled value at 48 kHz (its Float32 fixed point;
 /// rate and path dependent). The engine caps the applied gain at unity.
 pub const NOMINAL_TRIM: f32 = 1.006_007_7;
@@ -112,6 +111,7 @@ struct Dezipper {
     a1: f32,
     a2: f32,
     s: [f32; 2],
+    y: f32,
 }
 
 impl Dezipper {
@@ -121,19 +121,25 @@ impl Dezipper {
         let a0 = 1.0 + al;
         let c = libm::cos(w);
         let b0 = ((1.0 - c) / 2.0 / a0) as f32;
-        Dezipper { b0, b1: 2.0 * b0, a1: (-2.0 * c / a0) as f32, a2: ((1.0 - al) / a0) as f32, s: [0.0; 2] }
+        Dezipper { b0, b1: 2.0 * b0, a1: (-2.0 * c / a0) as f32, a2: ((1.0 - al) / a0) as f32, s: [0.0; 2], y: 0.0 }
     }
     #[inline]
     fn step(&mut self, x: f32) -> f32 {
         let y = libm::fmaf(self.b0, x, self.s[0]);
         self.s[0] = libm::fmaf(-self.a1, y, libm::fmaf(self.b1, x, self.s[1]));
         self.s[1] = libm::fmaf(-self.a2, y, self.b0 * x);
+        self.y = y;
         y
     }
-    /// Settled on the step (a hand-off: the stream was already running).
-    fn settle(&mut self) {
+    /// The last output.
+    fn last(&self) -> f32 {
+        self.y
+    }
+    /// Settled on a constant input (a hand-off: the stream was already
+    /// running).
+    fn settle(&mut self, x: f32) {
         for _ in 0..1 << 18 {
-            self.step(1.0);
+            self.step(x);
         }
     }
 }
@@ -167,6 +173,59 @@ pub struct Slot {
     pub attack_ms: f32,
     pub release_ms: f32,
 }
+
+impl Slot {
+    /// The eleven continuous constants in AU parameter order (spec 2).
+    fn fields(&self) -> [f32; 11] {
+        [
+            self.amplifier_sensitivity,
+            self.rdc,
+            self.rth_vc,
+            self.tau_vc,
+            self.rth_mg,
+            self.tau_mg,
+            self.ambient,
+            self.temperature_limit,
+            self.attack_ms,
+            self.release_ms,
+            self.hard_limit_headroom,
+        ]
+    }
+    fn set_fields(&mut self, f: [f32; 11]) {
+        [
+            self.amplifier_sensitivity,
+            self.rdc,
+            self.rth_vc,
+            self.tau_vc,
+            self.rth_mg,
+            self.tau_mg,
+            self.ambient,
+            self.temperature_limit,
+            self.attack_ms,
+            self.release_ms,
+            self.hard_limit_headroom,
+        ] = f;
+    }
+}
+
+/// The published range of each slot constant, in AU parameter order
+/// (sensitivity V/FS, Rdc, Rvc, tau_vc s, Rmg, tau_mg s, ambient degC,
+/// limit degC, attack ms, release ms, headroom degC): the unit's own
+/// `AudioUnitParameterInfo` minimum and maximum, which it holds every
+/// value to.
+pub const SLOT_RANGES: [(f32, f32); 11] = [
+    (1.0, 100.0),
+    (1.0, 100.0),
+    (1.0, 100.0),
+    (1.0, 10_000.0),
+    (1.0, 100.0),
+    (1.0, 10_000.0),
+    (0.0, 100.0),
+    (50.0, 200.0),
+    (10.0, 10_000.0),
+    (1_000.0, 100_000.0),
+    (0.0, 100.0),
+];
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -205,16 +264,25 @@ impl Params {
         r
     }
 
-    /// Set one AU parameter (spec 2) in the payload. False for an unknown ID
-    /// or an unusable mask value.
+    /// Set one AU parameter (spec 2) in the payload, held to the unit's
+    /// published range as the reference holds it ([`SLOT_RANGES`]). False
+    /// for an unknown ID or a non-finite value.
     pub fn set(&mut self, id: u32, v: f32) -> bool {
+        if !v.is_finite() {
+            return false;
+        }
         let flag = (v != 0.0) as u32;
         match id {
             ids::BYPASS => self.bypass = flag,
             ids::GAIN_LINK_ALL => self.gain_link_all = flag,
             1..=39 => {
                 let s = &mut self.slot[((id - 1) / ids::SLOT_STRIDE) as usize];
-                match (id - 1) % ids::SLOT_STRIDE {
+                let f = ((id - 1) % ids::SLOT_STRIDE) as usize;
+                let v = match SLOT_RANGES.get(f) {
+                    Some(&(lo, hi)) => v.clamp(lo, hi),
+                    None => v,
+                };
+                match f {
                     0 => s.amplifier_sensitivity = v,
                     1 => s.rdc = v,
                     2 => s.rth_vc = v,
@@ -227,17 +295,30 @@ impl Params {
                     9 => s.release_ms = v,
                     10 => s.hard_limit_headroom = v,
                     11 => s.gain_link = flag,
-                    _ => {
-                        if !(v.is_finite() && v >= 0.0) {
-                            return false;
-                        }
-                        s.channel_mask = v as u32 & 0xffff;
-                    }
+                    _ => s.channel_mask = v.clamp(0.0, 65535.0) as u32,
                 }
             }
             _ => return false,
         }
         true
+    }
+
+    /// Every slot constant held to the unit's published range
+    /// ([`SLOT_RANGES`]): the reference runs a value outside it at the
+    /// nearest bound (25G83: a 0.3 s voice-coil time constant behaves as
+    /// 1 s). A non-finite value is left for [`Params::validate`] to refuse.
+    pub fn clamped(&self) -> Params {
+        let mut p = *self;
+        for s in p.slot.iter_mut() {
+            let mut f = s.fields();
+            for (v, &(lo, hi)) in f.iter_mut().zip(SLOT_RANGES.iter()) {
+                if v.is_finite() {
+                    *v = v.clamp(lo, hi);
+                }
+            }
+            s.set_fields(f);
+        }
+        p
     }
 
     pub fn validate(&self) -> Result<(), InitError> {
@@ -277,58 +358,279 @@ impl Params {
     }
 }
 
-/// 99 %-settling smoothing coefficient for a time in ms (spec 3).
+/// 99 %-settling smoothing coefficient for a time in ms, per sample
+/// (`1 - exp(ln(0.01) / (t rate))`).
 pub fn settle_coeff(rate: f64, ms: f64) -> f64 {
-    1.0 - libm::exp(libm::log(0.01) / (ms * 1e-3 * rate))
+    window_coeff(rate, ms, 1)
 }
 
-struct Chan {
+/// The same 99 %-settling coefficient for one controller window of `n`
+/// frames (SPEC-ATSP 10): `1 - exp(ln(0.01) n / (t rate / 1000))`.
+pub fn window_coeff(rate: f64, ms: f64, n: usize) -> f64 {
+    1.0 - libm::exp(libm::log(0.01) * n as f64 / (ms * 1e-3 * rate))
+}
+
+/// The controller window in frames: `ceil(rate * 5.333333333 ms)`, 256 at
+/// 48 kHz (SPEC-ATSP 10).
+pub fn window_frames(rate: f64) -> usize {
+    libm::ceil(rate * WINDOW_MS * 1e-3) as usize
+}
+
+/// The window's length in ms (SPEC-ATSP 10).
+const WINDOW_MS: f64 = 5.333_333_333;
+
+/// Experiment: the post-gain predictor's substep.
+fn sub_frames(n: usize) -> usize {
+    [16, 32, 64, 8][((variant() >> 10) & 3) as usize].min(n)
+}
+
+/// Temporary experiment switch (lane A); removed before merge.
+pub static VARIANT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+fn variant() -> u32 {
+    VARIANT.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// One two-node series model (SPEC-ATSP 10): the coil's rise over the
+/// magnet and the magnet's over ambient, each a matched exponential per
+/// window toward its share of the window's power.
+#[derive(Clone, Copy, Default)]
+struct Nodes {
+    vc: f64,
+    mg: f64,
+}
+
+impl Nodes {
+    #[inline]
+    fn step(&mut self, c: &Coeffs, p: f64) {
+        self.vc = c.bvc * self.vc + (1.0 - c.bvc) * (c.rth_vc * p);
+        self.mg = c.bmg * self.mg + (1.0 - c.bmg) * (c.rth_mg * p);
+    }
+    #[inline]
+    fn finite(&self) -> bool {
+        self.vc.is_finite() && self.mg.is_finite()
+    }
+}
+
+/// Per channel constants, from the routed slot.
+#[derive(Clone, Copy)]
+struct Coeffs {
     slot: usize,
     /// Vfs^2 / Rdc: watts per unit mean square.
     elec: f64,
     rth_vc: f64,
     rth_mg: f64,
-    a_vc: f64,
-    a_mg: f64,
     tau_vc: f64,
     tau_mg: f64,
+    bvc: f64,
+    bmg: f64,
+    /// The post-gain predictor's per-substep factors.
+    sub_bvc: f64,
+    sub_bmg: f64,
     ambient: f64,
     limit: f64,
     hard_limit: f64,
-    a_attack: f64,
-    a_release: f64,
-    theta_vc: f64,
-    theta_mg: f64,
-    /// Drive power estimate of the unattenuated input, W.
+    ka: f64,
+    kr: f64,
+    /// Per-sample release coefficient (the hand-off's gap ageing).
+    kr_sample: f64,
+}
+
+impl Coeffs {
+    fn new(p: &Params, slot: usize, rate: f64, n: usize) -> Coeffs {
+        let s = &p.slot[slot];
+        let v = s.amplifier_sensitivity as f64;
+        let w = n as f64 / rate;
+        let tvc = s.tau_vc as f64;
+        let tmg = s.tau_mg as f64;
+        Coeffs {
+            slot,
+            elec: v * v / s.rdc as f64,
+            rth_vc: s.rth_vc as f64,
+            rth_mg: s.rth_mg as f64,
+            tau_vc: s.tau_vc as f64,
+            tau_mg: s.tau_mg as f64,
+            bvc: libm::exp(-w / tvc),
+            bmg: libm::exp(-w / tmg),
+            sub_bvc: libm::exp(-(sub_frames(n) as f64 / rate) / tvc),
+            sub_bmg: libm::exp(-(sub_frames(n) as f64 / rate) / tmg),
+            ambient: s.ambient as f64,
+            limit: s.temperature_limit as f64,
+            hard_limit: s.temperature_limit as f64 + s.hard_limit_headroom as f64,
+            ka: window_coeff(rate, s.attack_ms as f64, n),
+            kr: window_coeff(rate, s.release_ms as f64, n),
+            kr_sample: settle_coeff(rate, s.release_ms as f64),
+        }
+    }
+}
+
+struct Chan {
+    k: Coeffs,
+    /// The current window's sum of squares of the program (metered, as
+    /// the reference's input-referred estimator sees it).
+    acc: f64,
+    acc_out: f64,
+    acc_tgt: f64,
+    acc_mon: f64,
+    mon: Nodes,
+    /// The input-referred predictor (driven by the unattenuated program).
+    input: Nodes,
+    /// The post-gain predictor (driven by the program at the applied
+    /// target).
+    post: Nodes,
+    /// The last window's drive power, W.
     p_drive: f64,
-    /// Modelled power of the protected signal, W (the last sample).
-    p_model: f64,
+    /// The last window's post-gain power, W.
+    p_post: f64,
     limiting: bool,
     panic: bool,
+    /// The last window's unsmoothed request.
     request: f64,
-    gain: f64,
+    /// The smoothed per-channel target.
+    target: f64,
+    /// The linked target: the dezipper's input after the startup mute.
+    linked: f32,
+    /// Experiment: the ramp from the previous linked target.
+    ramp_from: f32,
+    ramp_pos: usize,
+}
+
+impl Chan {
+    fn new(k: Coeffs) -> Chan {
+        Chan {
+            k,
+            acc: 0.0,
+            acc_out: 0.0,
+            acc_tgt: 0.0,
+            acc_mon: 0.0,
+            mon: Nodes::default(),
+            input: Nodes::default(),
+            post: Nodes::default(),
+            p_drive: 0.0,
+            p_post: 0.0,
+            limiting: false,
+            panic: false,
+            request: 1.0,
+            target: 1.0,
+            linked: 1.0,
+            ramp_from: 1.0,
+            ramp_pos: usize::MAX,
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Chan::new(self.k);
+    }
+
+    /// The output of one window is complete: the post-gain predictor
+    /// takes its power.
+    fn post_window(&mut self, n: usize) -> bool {
+        let k = self.k;
+        let e = if variant() & 4096 != 0 { self.acc_tgt } else { self.acc_out };
+        let pp = k.elec * e / n as f64;
+        self.acc_out = 0.0;
+        self.acc_tgt = 0.0;
+        self.p_post = pp;
+        self.post.step(&k, pp);
+        if variant() & 8192 != 0 {
+            return false;
+        }
+        let t_post = k.ambient + self.post.mg + self.post.vc;
+        self.panic = t_post > k.hard_limit || t_post.is_nan();
+        if self.panic {
+            self.target = PANIC_GAIN as f32 as f64;
+        }
+        self.panic
+    }
+
+    /// A monitor substep of the output is complete.
+    fn mon_sub(&mut self, n: usize) -> bool {
+        let k = self.k;
+        let pm = k.elec * self.acc_mon / n as f64;
+        self.acc_mon = 0.0;
+        self.mon.vc = k.sub_bvc * self.mon.vc + (1.0 - k.sub_bvc) * (k.rth_vc * pm);
+        self.mon.mg = k.sub_bmg * self.mon.mg + (1.0 - k.sub_bmg) * (k.rth_mg * pm);
+        if variant() & 8192 == 0 {
+            return false;
+        }
+        let t = k.ambient + self.mon.mg + self.mon.vc;
+        self.panic = t > k.hard_limit || t.is_nan();
+        if self.panic {
+            self.target = PANIC_GAIN as f32 as f64;
+        }
+        self.panic
+    }
+
+    /// One completed input window (SPEC-ATSP 10).
+    fn window(&mut self, n: usize) {
+        let k = self.k;
+        let pd = k.elec * self.acc / n as f64;
+        self.acc = 0.0;
+        self.p_drive = pd;
+        self.input.step(&k, pd);
+        let t_in = k.ambient + self.input.mg + self.input.vc;
+        let t_post = k.ambient + self.post.mg + self.post.vc;
+        let t_mon = k.ambient + self.mon.mg + self.mon.vc;
+        // `>` enters, `<=` recovers; a NaN state stays restrictive
+        let t = match (variant() >> 14) & 3 {
+            0 => t_in.max(t_post),
+            1 => t_in,
+            2 => t_in.max(t_mon),
+            _ => t_in.max(t_post).max(t_mon),
+        };
+        let t = if t_in.is_nan() || t_post.is_nan() { f64::NAN } else { t };
+        self.limiting = t > k.limit || t.is_nan();
+        let mut r = 1.0;
+        if self.limiting {
+            let ratio = ((k.limit - k.ambient) - self.post.mg) / (self.input.vc + 1.0);
+            r = libm::sqrt(if ratio.is_nan() { 0.0 } else { ratio.clamp(0.0, 1.0) });
+        }
+        self.request = r;
+        if r < self.target {
+            self.target += k.ka * (r - self.target);
+        } else if r > self.target {
+            self.target += k.kr * (r - self.target);
+        }
+    }
+
+    /// Experiment: the dezipper input now.
+    fn current(&self) -> f32 {
+        let w = [0usize, 256, 128, 512][((variant() >> 8) & 3) as usize];
+        if w == 0 || self.ramp_pos >= w {
+            self.linked
+        } else {
+            self.ramp_from + (self.linked - self.ramp_from) * ((self.ramp_pos + 1) as f32 / w as f32)
+        }
+    }
+
+    fn finite(&self) -> bool {
+        self.input.finite() && self.post.finite() && self.target.is_finite() && self.acc.is_finite()
+    }
 }
 
 struct Run {
     n: usize,
+    /// The controller window, frames.
+    win: usize,
+    /// Frames into the current input window (the grid runs on active
+    /// frames).
+    pos: usize,
+    /// Frames into the current output window.
+    out_pos: usize,
+    /// Frames into the current monitor substep.
+    sub_pos: usize,
     link_slot: [bool; 3],
     link_all: bool,
     ch: Vec<Chan>,
     /// Active (not bypassed) frames since initialisation: the dezipper clock.
     active: u64,
     mute: u64,
-    /// Per channel: the output dezipper and its last value. Its input is the
-    /// gain target: 0 during the startup mute, f32(0.1) in a panic, else 1
-    /// (rig laws 4 and 6).
+    /// Per channel: the output dezipper. Its input is 0 during the startup
+    /// mute, then the linked window target (rig laws 4 and 6).
     dez: Vec<Dezipper>,
     dez_now: f32,
     frame: u64,
     /// A model state went non-finite: the fail-safe is latched until reset.
     fault: bool,
-    /// The controller block (`block_frames`; 0 is the host call) and the
-    /// position in it.
-    block: usize,
-    blk_pos: usize,
 }
 
 pub struct Unit {
@@ -358,45 +660,30 @@ impl Unit {
     pub fn dezipper_gain(&self) -> f32 {
         self.run.as_ref().map_or(0.0, |r| r.dez_now)
     }
+    /// The controller window, frames.
+    pub fn window_frames(&self) -> usize {
+        self.run.as_ref().map_or(0, |r| r.win)
+    }
 }
 
 impl Run {
     fn new(p: &Params) -> Result<Run, InitError> {
         p.validate()?;
+        let p = &p.clamped();
         let n = p.channels as usize;
         let rate = p.sample_rate as f64;
-        let dt = 1.0 / rate;
-        let route = p.route();
-        let mut ch = Vec::with_capacity(n);
-        for &si in &route[..n] {
-            let s = &p.slot[si];
-            let v = s.amplifier_sensitivity as f64;
-            ch.push(Chan {
-                slot: si,
-                elec: v * v / s.rdc as f64,
-                rth_vc: s.rth_vc as f64,
-                rth_mg: s.rth_mg as f64,
-                a_vc: dt / (s.tau_vc as f64 + dt),
-                a_mg: dt / (s.tau_mg as f64 + dt),
-                tau_vc: s.tau_vc as f64,
-                tau_mg: s.tau_mg as f64,
-                ambient: s.ambient as f64,
-                limit: s.temperature_limit as f64,
-                hard_limit: s.temperature_limit as f64 + s.hard_limit_headroom as f64,
-                a_attack: settle_coeff(rate, s.attack_ms as f64),
-                a_release: settle_coeff(rate, s.release_ms as f64),
-                theta_vc: 0.0,
-                theta_mg: 0.0,
-                p_drive: 0.0,
-                p_model: 0.0,
-                limiting: false,
-                panic: false,
-                request: 1.0,
-                gain: 1.0,
-            });
+        let win = window_frames(rate);
+        if win == 0 {
+            return Err(InitError::Invalid("geometry"));
         }
+        let route = p.route();
+        let ch = route[..n].iter().map(|&s| Chan::new(Coeffs::new(p, s, rate, win))).collect();
         Ok(Run {
             n,
+            win,
+            pos: 0,
+            out_pos: 0,
+            sub_pos: 0,
             link_slot: [p.slot[0].gain_link != 0, p.slot[1].gain_link != 0, p.slot[2].gain_link != 0],
             link_all: p.gain_link_all != 0,
             ch,
@@ -406,152 +693,191 @@ impl Run {
             dez_now: 0.0,
             frame: 0,
             fault: false,
-            block: p.block_frames as usize,
-            blk_pos: 0,
         })
     }
 
-    fn reset(&mut self) {
-        for c in self.ch.iter_mut() {
-            c.theta_vc = 0.0;
-            c.theta_mg = 0.0;
-            c.p_drive = 0.0;
-            c.p_model = 0.0;
-            c.limiting = false;
-            c.panic = false;
-            c.request = 1.0;
-            c.gain = 1.0;
+    /// New constants from changed parameters, keeping every state
+    /// (an AU parameter change at run time).
+    fn retune(&mut self, p: &Params) {
+        let p = &p.clamped();
+        let rate = p.sample_rate as f64;
+        let route = p.route();
+        for (c, ch) in self.ch.iter_mut().enumerate() {
+            ch.k = Coeffs::new(p, route[c], rate, self.win);
         }
-        // the dezipper is not restarted by a reset (rig law)
-        self.frame = 0;
-        self.fault = false;
-        self.blk_pos = 0;
+        self.link_slot = [p.slot[0].gain_link != 0, p.slot[1].gain_link != 0, p.slot[2].gain_link != 0];
+        self.link_all = p.gain_link_all != 0;
     }
 
-    /// Advance channel `c`'s output dezipper one active frame (module docs).
-    #[inline]
-    fn dezipper(&mut self, c: usize, panic: bool) -> f64 {
-        let x = if self.active < self.mute {
-            0.0
-        } else if panic {
-            PANIC_GAIN as f32
-        } else {
-            1.0
-        };
-        let y = self.dez[c].step(x);
-        if c == 0 {
-            self.dez_now = y;
+    fn reset(&mut self) {
+        self.ch.iter_mut().for_each(Chan::reset);
+        // the dezipper is not restarted by a reset (rig law 5)
+        self.pos = 0;
+        self.out_pos = 0;
+        self.sub_pos = 0;
+        self.frame = 0;
+        self.fault = false;
+    }
+
+    /// Every channel's window is complete: update the targets, then link.
+    fn windows(&mut self) {
+        let win = self.win;
+        for ch in self.ch.iter_mut() {
+            ch.window(win);
         }
-        y as f64
+        self.link();
+    }
+
+    /// The linked targets from the per-channel targets.
+    fn link(&mut self) {
+        let n = self.n;
+        let mut lk = [1.0f64; MAX_CHANNELS];
+        for (c, ch) in self.ch.iter().enumerate() {
+            lk[c] = ch.target;
+        }
+        for s in 0..3 {
+            if self.link_slot[s] {
+                let m = self.ch.iter().filter(|c| c.k.slot == s).fold(1.0f64, |m, c| nan_min(m, c.target));
+                for (c, ch) in self.ch.iter().enumerate() {
+                    if ch.k.slot == s {
+                        lk[c] = m;
+                    }
+                }
+            }
+        }
+        if self.link_all {
+            let m = lk[..n].iter().fold(1.0f64, |m, &r| nan_min(m, r));
+            lk[..n].iter_mut().for_each(|r| *r = m);
+        }
+        for (c, ch) in self.ch.iter_mut().enumerate() {
+            let cur = ch.current();
+            ch.ramp_from = cur;
+            ch.ramp_pos = 0;
+            ch.linked = if lk[c].is_finite() { lk[c] as f32 } else { 0.0 };
+        }
+        if !self.ch.iter().all(Chan::finite) {
+            self.fault = true;
+        }
+    }
+
+    /// Accumulate frames `a..b` of the program into the current window.
+    #[inline]
+    fn accumulate(&mut self, io: &Io<'_, '_>, a: usize, b: usize) -> bool {
+        let mut failed = false;
+        for (c, ch) in self.ch.iter_mut().enumerate() {
+            let x = &io.input[c][a..b];
+            failed |= !x.iter().all(|v| v.is_finite());
+            let mut s = 0.0f64;
+            for &v in x {
+                let m = crate::dsp::meter1(v) as f64;
+                s += m * m;
+            }
+            ch.acc += s;
+        }
+        self.pos += b - a;
+        failed
+    }
+
+    /// Frames `a..b` of the output through each channel's dezipper. Each
+    /// output window completed feeds the post-gain predictor, each substep
+    /// the output monitor.
+    fn emit(&mut self, io: &mut Io<'_, '_>, a: usize, b: usize) {
+        let sub = sub_frames(self.win);
+        let mut f = a;
+        while f < b {
+            let m = (sub - self.sub_pos).min(self.win - self.out_pos).min(b - f);
+            for c in 0..self.n {
+                let ch = &mut self.ch[c];
+                let d = &mut self.dez[c];
+                let mut active = self.active;
+                let (mut eo, mut et) = (0.0f64, 0.0f64);
+                for k in f..f + m {
+                    let target = ch.current();
+                    ch.ramp_pos = ch.ramp_pos.saturating_add(1);
+                    let x = if active < self.mute { 0.0 } else { target };
+                    let o = io.input[c][k] * d.step(x);
+                    let om = crate::dsp::meter1(o) as f64;
+                    let xt = crate::dsp::meter1(io.input[c][k]) as f64 * x as f64;
+                    eo += om * om;
+                    et += xt * xt;
+                    io.output[c][k] = crate::dsp::bound1(o);
+                    active += 1;
+                }
+                ch.acc_out += eo;
+                ch.acc_mon += eo;
+                ch.acc_tgt += et;
+            }
+            self.active = self.active.saturating_add(m as u64);
+            self.out_pos += m;
+            self.sub_pos += m;
+            f += m;
+            let mut any = false;
+            if self.sub_pos == sub {
+                self.sub_pos = 0;
+                for c in self.ch.iter_mut() {
+                    any |= c.mon_sub(sub);
+                }
+            }
+            if self.out_pos == self.win {
+                self.out_pos = 0;
+                let win = self.win;
+                for c in self.ch.iter_mut() {
+                    any |= c.post_window(win);
+                }
+            }
+            if any {
+                self.link();
+            }
+        }
+        if let Some(d) = self.dez.first() {
+            self.dez_now = d.last();
+        }
     }
 
     /// Returns whether any input sample was non-finite (the meter failure:
     /// those frames are silent, and the call reports the fail-safe).
     fn process(&mut self, io: &mut Io<'_, '_>) -> bool {
-        let n = self.n;
+        let frames = io.frames;
         let mut failed = false;
-        for k in 0..io.frames {
-            // controller blocks of `block_frames` (0: the host call)
-            let boundary = if self.block == 0 { k == 0 } else { self.blk_pos == 0 };
-            self.blk_pos = if self.block == 0 { 0 } else { (self.blk_pos + 1) % self.block };
-            // 1. requests from the state before this sample
-            let mut req = [1.0f64; MAX_CHANNELS];
-            let mut pan = [false; MAX_CHANNELS];
-            for (c, ch) in self.ch.iter_mut().enumerate() {
-                let t_vc = ch.ambient + ch.theta_mg + ch.theta_vc;
-                // `>` enters, `<=` recovers; a NaN state stays restrictive
-                ch.limiting = t_vc > ch.limit || t_vc.is_nan();
-                // the panic enters at once and releases only at a controller
-                // block boundary with the coil back at the hard limit (the
-                // 25G83 controller is block-wise once it limits)
-                if t_vc > ch.hard_limit || t_vc.is_nan() {
-                    ch.panic = true;
-                } else if boundary {
-                    ch.panic = false;
+        let v = variant();
+        let stage = [2 * self.win, self.win, 4 * self.win, 512][((v >> 6) & 3) as usize];
+        let mut f = 0;
+        if frames < self.win {
+            // fragments: each window is evaluated once its last frame is
+            // in, after that frame's output
+            while f < frames {
+                let m = (self.win - self.pos).min(frames - f);
+                failed |= self.accumulate(io, f, f + m);
+                self.emit(io, f, f + m);
+                f += m;
+                if self.pos == self.win {
+                    self.pos = 0;
+                    self.windows();
                 }
-                let mut r = 1.0;
-                if ch.limiting {
-                    let allow = ((ch.limit - ch.ambient - ch.theta_mg) / ch.rth_vc).max(0.0);
-                    r = libm::sqrt(allow / ch.p_drive.max(EPS)).min(1.0);
-                    if !r.is_finite() {
-                        r = PANIC_GAIN;
+            }
+        } else {
+            // staged: every window completed in a stage is evaluated
+            // before the stage's output
+            while f < frames {
+                let m = stage.min(frames - f);
+                let mut g = f;
+                while g < f + m {
+                    let k = (self.win - self.pos).min(f + m - g);
+                    failed |= self.accumulate(io, g, g + k);
+                    g += k;
+                    if self.pos == self.win {
+                        self.pos = 0;
+                        self.windows();
                     }
                 }
-                if ch.panic {
-                    r = r.min(PANIC_GAIN);
-                }
-                ch.request = r;
-                req[c] = r;
-                pan[c] = ch.panic;
-            }
-            for s in 0..3 {
-                if self.link_slot[s] {
-                    let m = self.ch.iter().filter(|c| c.slot == s).fold(1.0f64, |m, c| nan_min(m, c.request));
-                    let any = self.ch.iter().any(|c| c.slot == s && c.panic);
-                    for (c, ch) in self.ch.iter().enumerate() {
-                        if ch.slot == s {
-                            req[c] = m;
-                            pan[c] |= any;
-                        }
-                    }
-                }
-            }
-            if self.link_all {
-                let m = req[..n].iter().fold(1.0f64, |m, &r| nan_min(m, r));
-                req[..n].iter_mut().for_each(|r| *r = m);
-                let any = pan[..n].iter().any(|&p| p);
-                pan[..n].iter_mut().for_each(|p| *p |= any);
-            }
-            // 2. smooth, apply, integrate
-            let mut dz = [0.0f64; MAX_CHANNELS];
-            for (c, d) in dz.iter_mut().enumerate().take(n) {
-                *d = self.dezipper(c, pan[c]);
-            }
-            for (c, ch) in self.ch.iter_mut().enumerate() {
-                let d = dz[c];
-                let a = if req[c] < ch.gain { ch.a_attack } else { ch.a_release };
-                ch.gain += a * (req[c] - ch.gain);
-                // the program held to digital full scale before the gain and
-                // both meters; a non-finite sample is 0
-                let raw = io.input[c][k];
-                failed |= !raw.is_finite();
-                // the output takes the program held to full scale; the
-                // meters see it unclamped (to METER_FS) as the reference
-                let x = crate::dsp::bound1(raw) as f64;
-                let xm = crate::dsp::meter1(raw) as f64;
-                // The dezipper's own trajectory passes as the reference's
-                // does (its 1.0283 overshoot and its +0.052 dB fixed point),
-                // bounded at its peak; the output is held to full scale.
-                // The panic feeds the dezipper a 0.1 target (rig law 4: the
-                // reference's 1 -> 0.081 -> 0.101 trajectory over about
-                // 40 ms) and, stricter than the reference for those 40 ms,
-                // also caps the gain at 0.1 at once (coordinator decision).
-                let g = ch.gain * d;
-                let g = if g.is_finite() { g.clamp(0.0, DEZIPPER_PEAK as f64) } else { 0.0 };
-                let g = if pan[c] { g.min(PANIC_GAIN) } else { g };
-                io.output[c][k] = ((x * g) as f32).clamp(-1.0, 1.0);
-                ch.p_drive += ch.a_attack * (ch.elec * xm * xm - ch.p_drive);
-                let u = ch.gain * xm;
-                let p = ch.elec * u * u;
-                ch.p_model = p;
-                // series network: the coil rise over the magnet plus the
-                // magnet rise over ambient (module docs, TODO(SPEC))
-                ch.theta_vc += ch.a_vc * (p * ch.rth_vc - ch.theta_vc);
-                ch.theta_mg += ch.a_mg * (p * ch.rth_mg - ch.theta_mg);
-            }
-            self.active = self.active.saturating_add(1);
-            // any non-finite model or controller state latches the fail-safe
-            if !self.ch.iter().all(|c| c.theta_vc.is_finite() && c.theta_mg.is_finite() && c.gain.is_finite()) {
-                self.fault = true;
-                self.frame += k as u64 + 1;
-                crate::failsafe::fill_from(io, k + 1, FAILSAFE_GAIN);
-                for c in 0..n {
-                    io.output[c][k] = crate::dsp::bound1(io.input[c][k]) * FAILSAFE_GAIN;
-                }
-                return failed;
+                self.emit(io, f, f + m);
+                f += m;
             }
         }
-        self.frame += io.frames as u64;
+        self.frame += frames as u64;
+        if self.fault {
+            crate::failsafe::fill_from(io, 0, FAILSAFE_GAIN);
+        }
         failed
     }
 }
@@ -624,17 +950,19 @@ impl ProtectionUnit for Unit {
         }
         for (i, c) in run.ch.iter().enumerate() {
             let mut s = ChannelState::ABSENT;
-            s.modeled_power_w = c.p_model as f32;
-            s.coil_temp_c = (c.ambient + c.theta_mg + c.theta_vc) as f32;
-            s.magnet_temp_c = (c.ambient + c.theta_mg) as f32;
+            s.modeled_power_w = c.p_post as f32;
+            s.coil_temp_c = (c.k.ambient + c.post.mg + c.post.vc) as f32;
+            s.magnet_temp_c = (c.k.ambient + c.post.mg) as f32;
             s.ol_temp_c = s.coil_temp_c;
+            s.control_temp_c = (c.k.ambient + c.input.mg + c.input.vc) as f32;
+            s.cl_temp_c = (c.k.ambient + c.mon.mg + c.mon.vc) as f32;
             s.axis_gain[4] = c.request as f32;
             s.gain = if run.fault {
                 FAILSAFE_GAIN
             } else if self.bypass {
                 1.0
             } else {
-                c.gain as f32
+                c.linked
             };
             out.channels[i] = s;
         }
@@ -651,18 +979,17 @@ impl ProtectionUnit for Unit {
         out.channels = run.n as u32;
         out.sample_rate = self.params.sample_rate;
         for (i, c) in run.ch.iter().enumerate() {
-            out.node[i][..2].copy_from_slice(&[c.theta_vc, c.theta_mg]);
-            out.gain[i] = c.gain;
+            out.node[i][..4].copy_from_slice(&[c.input.vc, c.input.mg, c.post.vc, c.post.mg]);
+            out.gain[i] = (c.target as f32).clamp(f32::MIN_POSITIVE, 1.0) as f64;
         }
         true
     }
 
-    /// The coil and magnet rises cooled for the gap by the continuous
-    /// solution of the series pair (the coil rise over the magnet decays with
-    /// its own constant), the gain released toward unity. The reference
-    /// resets on reinitialisation (spec 5); a speaker does not cool because a
-    /// stream restarted, so here it never does. The startup dezipper is not
-    /// repeated after a hand-off.
+    /// Both predictors' nodes cooled for the gap (each series node decays
+    /// with its own constant), the target released toward unity. The
+    /// reference resets on reinitialisation (spec 5); a speaker does not
+    /// cool because a stream restarted, so here it never does. The startup
+    /// dezipper is not repeated after a hand-off.
     fn restore_state(&mut self, state: &HandOff, gap_s: f64) -> bool {
         let rate = self.params.sample_rate;
         let Some(run) = self.run.as_mut() else { return false };
@@ -671,14 +998,19 @@ impl ProtectionUnit for Unit {
         }
         let t = gap_or_zero(gap_s);
         for (i, c) in run.ch.iter_mut().enumerate() {
-            c.theta_vc = state.node[i][0] * libm::exp(-t / c.tau_vc);
-            c.theta_mg = state.node[i][1] * libm::exp(-t / c.tau_mg);
-            let r_release = 1.0 - c.a_release;
-            c.gain = release_toward_unity(state.gain[i], r_release, t * rate as f64);
-            c.request = c.gain;
+            let ev = libm::exp(-t / c.k.tau_vc);
+            let em = libm::exp(-t / c.k.tau_mg);
+            let s = &state.node[i];
+            c.input = Nodes { vc: s[0] * ev, mg: s[1] * em };
+            c.post = Nodes { vc: s[2] * ev, mg: s[3] * em };
+            c.target = release_toward_unity(state.gain[i], 1.0 - c.k.kr_sample, t * rate as f64);
+            c.request = c.target;
+            c.linked = c.target as f32;
         }
         run.active = run.active.max(run.mute);
-        run.dez.iter_mut().for_each(Dezipper::settle);
+        for (c, d) in run.dez.iter_mut().enumerate() {
+            d.settle(run.ch[c].linked);
+        }
         true
     }
 
@@ -688,6 +1020,14 @@ impl ProtectionUnit for Unit {
             self.params.bypass = self.bypass as u32;
             return true;
         }
-        false
+        let mut p = self.params;
+        if !p.set(id, value) || p.validate().is_err() {
+            return false;
+        }
+        self.params = p;
+        if let Some(r) = self.run.as_mut() {
+            r.retune(&p);
+        }
+        true
     }
 }

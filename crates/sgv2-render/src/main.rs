@@ -62,6 +62,8 @@ struct Args {
     file_channels: usize,
     limit_frames: usize,
     preset_params: Vec<(u32, f32)>,
+    /// atsp: the stream rate the reference ran (`--rate`), 0 for the blob's.
+    rate: u32,
     params_at: Vec<(usize, u32, f32)>,
     /// Host events by frame (`--events`), in order.
     events: Vec<(usize, Event)>,
@@ -93,6 +95,7 @@ fn parse_args() -> Option<Args> {
         file_channels: 0,
         limit_frames: 0,
         preset_params: Vec::new(),
+        rate: 0,
         params_at: Vec::new(),
         events: Vec::new(),
     };
@@ -122,6 +125,7 @@ fn parse_args() -> Option<Args> {
             "--file-ch" => a.file_channels = v.parse().ok()?,
             "--limit-frames" => a.limit_frames = v.parse().ok()?,
             "--preset-param" => a.preset_params.push(id_val(&v)?),
+            "--rate" => a.rate = v.parse().ok()?,
             "--param" => a.params_at.push((0, id_val(&v)?.0, id_val(&v)?.1)),
             "--param-at" => {
                 let (f, rest) = v.split_once(':')?;
@@ -198,6 +202,7 @@ fn make_unit(
     blob: Option<&[u8]>,
     cpms: Option<[f32; 4]>,
     preset: &[(u32, f32)],
+    rate: u32,
 ) -> (Box<dyn ProtectionUnit>, String) {
     let Some(bytes) = blob else {
         return (Box::new(FailSafe::new(kind, Health::NO_PARAMS)), String::from("none"));
@@ -223,6 +228,9 @@ fn make_unit(
             })
             .map_err(|e| format!("{e:?}")),
         UnitKind::Atsp => atsp::Params::from_blob(bytes).map_err(|e| format!("{e:?}")).and_then(|mut p| {
+            if rate != 0 {
+                p.sample_rate = rate;
+            }
             for &(id, v) in preset {
                 if !p.set(id, v) {
                     return Err(format!("preset parameter {id}"));
@@ -500,7 +508,7 @@ fn run(a: &Args) -> io::Result<()> {
             !pre
         });
     }
-    let (mut unit, params) = make_unit(a.unit, blob.as_deref(), cpms, &preset);
+    let (mut unit, params) = make_unit(a.unit, blob.as_deref(), cpms, &preset, a.rate);
     let mut events = a.events.clone();
     events.sort_by_key(|(f, _)| *f);
     let kind = a.unit;
@@ -555,6 +563,9 @@ fn run(a: &Args) -> io::Result<()> {
 }
 
 fn main() -> ExitCode {
+    if let Ok(v) = std::env::var("SGV2_ATSP_VARIANT") {
+        atsp::VARIANT.store(v.parse().unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+    }
     let Some(a) = parse_args() else { return usage() };
     match run(&a) {
         Ok(()) => ExitCode::SUCCESS,
@@ -595,7 +606,7 @@ mod tests {
     fn no_blob_renders_failsafe_in_any_slicing() {
         let program = vec![vec![0.25f32; 1000], vec![-0.5f32; 1000]];
         for slices in [&[512usize][..], &[1, 7, 31, 96, 127, 160][..]] {
-            let (mut unit, params) = make_unit(UnitKind::Lsm2, None, None, &[]);
+            let (mut unit, params) = make_unit(UnitKind::Lsm2, None, None, &[], 0);
             let mut trace = Vec::new();
             let mut audio = Vec::new();
             render(
@@ -653,6 +664,7 @@ mod tests {
             file_channels: 0,
             limit_frames: 0,
             preset_params: Vec::new(),
+            rate: 0,
             params_at: Vec::new(),
             events: Vec::new(),
         };
@@ -680,7 +692,7 @@ mod tests {
 
     #[test]
     fn blob_errors_fall_back_to_failsafe() {
-        let (_, p) = make_unit(UnitKind::Spp3, Some(b"short"), None, &[]);
+        let (_, p) = make_unit(UnitKind::Spp3, Some(b"short"), None, &[], 0);
         assert_eq!(p, "blob-Short");
     }
 

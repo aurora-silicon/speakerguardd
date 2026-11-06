@@ -10,7 +10,8 @@
 //! * the board: the device tree's first root `compatible` without its
 //!   `apple,` vendor (`j616s`);
 //! * the operating point: the output peak voltage at digital full scale,
-//!   in millivolts, from the tuning (spp3 `ag`, lsm2 `VoltsFullScale`).
+//!   in millivolts, from the tuning (spp3 `ag`, lsm2 `VoltsFullScale`,
+//!   atsp `Amplifier sensitivity [V/Fs]`).
 //!   The machine description below gives the amp and the analog gain the
 //!   kernel fixes ("Amp Gain Volume", `cfg->amp_gain`; KERNEL.md 2.3), which
 //!   the compiler uses as a cross-check: [`Description::full_scale_mv`]
@@ -41,6 +42,9 @@ pub enum Amp {
     /// TI SN012776 (tas2764): "Amp Gain Volume" is 11 dB plus 0.5 dB a
     /// step, read as the full-scale output peak in dBV.
     Sn012776 { gain_step: u32 },
+    /// TI TAS5770L (tas2770, the M1 Macs): the same "Amp Gain Volume" TLV,
+    /// 11 dB plus 0.5 dB a step, full-scale peak in dBV.
+    Tas2770 { gain_step: u32 },
     /// A fixed-gain amp: its full-scale output peak, mV.
     Fixed { full_scale_mv: u32 },
 }
@@ -57,15 +61,32 @@ const fn sn(board: &'static str, amps: usize, gain_step: u32) -> Description {
     Description { board, amps, amp: Amp::Sn012776 { gain_step } }
 }
 
+const fn tas(board: &'static str, amps: usize, gain_step: u32) -> Description {
+    Description { board, amps, amp: Amp::Tas2770 { gain_step } }
+}
+
 /// The boards the supervisor supports (`sgv2-supervisor` machine table),
-/// with the analog gain the kernel fixes on each: 15 on J3xx/J4xx/J6xx
-/// (KERNEL.md 2.3).
+/// with the analog gain the kernel fixes on each (macaudio's per-board
+/// `amp_gain`, KERNEL.md 2.3): 15 on J293/J3xx/J4xx/J6xx, 10 on J313, 20
+/// on J274/J37x/J47x.
 pub const MACHINES: &[Description] = &[
     sn("j316s", 6, 15),
     sn("j316c", 6, 15),
     sn("j616s", 6, 15),
     sn("j616c", 6, 15),
     sn("j413", 4, 15),
+    // atsp (audio only): the 13-inch MacBook Pro M1/M2 and the MacBook Air
+    // M1, then the one-speaker desktops whose kernel drives their speaker.
+    tas("j293", 4, 15),
+    tas("j313", 2, 10),
+    sn("j493", 4, 15),
+    tas("j274", 1, 20),
+    sn("j375c", 1, 20),
+    sn("j375d", 1, 20),
+    sn("j473", 1, 20),
+    sn("j474s", 1, 20),
+    sn("j475c", 1, 20),
+    sn("j475d", 1, 20),
     // No gain control: 7.30 V peak at full scale (AID44 VoltsFullScale,
     // Daybreak t-4662).
     Description { board: "j700", amps: 2, amp: Amp::Fixed { full_scale_mv: 7_300 } },
@@ -79,7 +100,7 @@ impl Description {
     /// The amp's analog gain in hundredths of a dB, if it has a control.
     pub fn amp_gain_centi_db(&self) -> Option<i32> {
         match self.amp {
-            Amp::Sn012776 { gain_step } => Some(1100 + 50 * gain_step as i32),
+            Amp::Sn012776 { gain_step } | Amp::Tas2770 { gain_step } => Some(1100 + 50 * gain_step as i32),
             Amp::Fixed { .. } => None,
         }
     }
@@ -89,7 +110,7 @@ impl Description {
     /// (Daybreak t-4662: 18.5 dBV is 11.899 V peak).
     pub fn full_scale_mv(&self) -> u32 {
         match self.amp {
-            Amp::Sn012776 { .. } => {
+            Amp::Sn012776 { .. } | Amp::Tas2770 { .. } => {
                 let db = f64::from(self.amp_gain_centi_db().unwrap()) / 100.0;
                 (1000.0 * std::f64::consts::SQRT_2 * 10f64.powf(db / 20.0)).round() as u32
             }
@@ -181,7 +202,11 @@ mod tests {
         assert_eq!(j.amp_gain_centi_db(), Some(1850));
         assert_eq!(j.full_scale_mv(), 11899);
         assert_eq!(lookup("j700").unwrap().full_scale_mv(), 7300);
-        assert!(lookup("j274").is_none());
+        // J313: gain 10 = 16 dBV = 8.913 V peak; J274/J37x: gain 20 = 21 dBV
+        assert_eq!(lookup("j313").unwrap().full_scale_mv(), 8913);
+        assert_eq!(lookup("j274").unwrap().full_scale_mv(), 15870);
+        assert_eq!(lookup("j293").unwrap().full_scale_mv(), 11899);
+        assert!(lookup("j180d").is_none());
         for m in MACHINES {
             assert!(sgv2_core::blob::machine_field(m.board).is_some(), "{}", m.board);
         }
