@@ -40,10 +40,22 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python3 -m pip install numpy==2.2.6
       - run: python3 -m py_compile tools/diffrig/compare.py
       - run: python3 -I tools/diffrig/compare.py --self-test
       - run: python3 -I tools/diffrig/run.py --self-test
       - run: python3 -I tools/diffrig/macos/capture.py --self-test
+      - name: Replay synthetic native logs
+        run: python3 -I tools/diffrig/macos/test_lsm2logs.py --out "$RUNNER_TEMP/lsm2-log-replay"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lsm2-log-replay
+          path: ${{ runner.temp }}/lsm2-log-replay
+          if-no-files-found: error
 
   session:
     name: Session side (wiring derivation, self-check verdicts, helper)

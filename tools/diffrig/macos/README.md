@@ -24,7 +24,8 @@ Traces made with Apple tuning are Apple-derived data. They never enter this repo
 | `capture.py` | The case list. It runs every case through `rig_host` and writes `trace.jsonl` in `../schema.json`, the per-quantum meter CSV, the audio and the unit's own logs. |
 | `capture_edge.py` | Edge-case list: atsp on each AID's own preset (no meters; the trace carries the audio gain and per-slice sample-gain extremes), spp3 closed-loop sense faults and gates (`spp3-cl-edge-*`), and fractional-Rampout AIDs (`spp3-rampout-*`). Its spp3 closed-loop cases decode the unit's coil-temperature and controller logs into `clsp.npz` and require every record (they rerun at a lower pace otherwise). Outputs are gzipped; `compare.py` and `run.py` read the `.gz` forms. |
 | `test_rig_host.py` | Exit-status tests for `rig_host` and `prefshim` after `make`: argument bounds, refused or unreadable `--cfprop`, render errors (`--test-fail-at`), short renders and whole-component redirects. It renders a short synthetic signal offline into a temporary directory and deletes it. |
-| `lsm2logs.py` | Decoder for the lsm2 native logs (record framing per the lsm2 behaviour specification). |
+| `lsm2logs.py` | Decoder for the lsm2 native logs, with explicit signal layout, strict framing checks and optional JSON/NPZ artifacts. |
+| `test_lsm2logs.py` | Command-level replay of synthetic log files, including malformed inputs; retains inputs, commands, results and decoded artifacts. |
 
 `rig_host` options used by the edge cases:
 - the plant's `"schedule"`: `[{"t": s, "i_gain"|"v_gain": x or [x per speaker], "fixed_temp": T or null}, ...]` changes a sense field from that time on (dead, scaled or implausible V/I; a fixed sensed coil temperature; null returns to the dynamic plant);
@@ -68,11 +69,58 @@ telemetry formats both initialized. Distinct test signals appeared in the
 native signal log as one output and one telemetry signal per audio channel;
 only the first four supplied telemetry channels appeared in that log. This
 observation does not establish physical units or a contract for other builds.
-The current `lsm2logs.py` decoder does not support that signal-log layout.
+Use the explicit `output-telemetry` signal-log layout to decode those captures.
 
 Callback delivery alone does not establish that every supplied channel was
 used internally or that the native estimator accepted the samples. Verify an estimator response before using a capture as a system-identification or closed-loop reference.
 This option does not change the engine or board qualification gates.
+
+### Decoding native signal logs
+
+For the observed output-plus-telemetry format, each `LsmSignalLog` record is
+channel-major: output channel 0's `n` samples, telemetry channel 0's `n` samples,
+then the same pair for each remaining channel. Its payload is `2 * N * n`
+float32 words. Select it explicitly:
+
+```sh
+python3 -I tools/diffrig/macos/lsm2logs.py PRIVATE_LOG_DIR \
+  --signal-layout output-telemetry --strict \
+  --summary PRIVATE_SUMMARY.json --signals PRIVATE_SIGNALS.npz
+```
+
+The NPZ contains `output` and `telemetry` arrays shaped `(frames, channels)` and
+`record_start` frame offsets. JSON records input hashes, channel/record/frame
+counts, nonfinite payload counts, decoder hash and NumPy version. These files
+contain native data; keep them private whenever the input uses Apple tuning.
+
+The default `output` layout preserves the original `N * n` payload format.
+Neither mode guesses the layout: plausible sample values can make an incorrect
+selection appear well-framed. Establish the format with independently tagged
+inputs before drawing conclusions. Logged telemetry proves which samples were
+logged, not their physical units or acceptance by an estimator.
+
+`--strict` rejects partial float words, truncated records, empty/header-only
+logs, invalid channel/frame counts and multiple files for one log type. All
+recognized logs are checked before artifacts are written. Signal export also
+requires a complete `LsmSignalLog`. The default Python API and CLI still allow a
+trailing partial record for existing capture workflows. Nonfinite payload
+samples are preserved and counted; framing success is not model validation.
+Complete frame counts must fit signed 64-bit offsets in either mode; oversized
+or cumulatively overflowing counts are rejected before NumPy conversion.
+Check the reported overwrite-marker count separately before treating a capture
+as complete.
+
+The synthetic command-level replay uses NumPy 2.2.6 in CI:
+
+```sh
+python3 -I tools/diffrig/macos/test_lsm2logs.py --out NEW_REPLAY_DIRECTORY
+```
+
+Its failure model covers channel/block-order mistakes, explicit-layout misuse,
+partial/empty/ambiguous inputs, invalid or overflowing counts, missing signal data, loss of
+nonfinite samples and legacy trailing-record compatibility. Every case retains
+its exact input, command, stdout/stderr and verdict in `RESULT.json`; CI uploads
+that directory. The fixtures are invented and contain no native tuning.
 
 ## Observed host facts
 
