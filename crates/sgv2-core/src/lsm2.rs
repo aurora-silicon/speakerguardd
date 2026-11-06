@@ -1967,8 +1967,11 @@ impl Run {
                 // residuals 5.2 (t-4713): upward lanes (primary above the
                 // applied gain); one second chain seeded from the predicted
                 // endpoint toward the complete primary request of upward
-                // lanes still 3 dB or more below it; upward lanes keep the
-                // primary, the others take the second (t-4772)
+                // lanes still 3 dB or more below it. The others take the
+                // second (t-4772). An upward lane keeps the primary unless
+                // the second solve cut it below its own seed: then it takes
+                // the larger of the two (a lane the second solve leaves at
+                // its seed, unity included, is not a request of that solve)
                 let up: [bool; BANDS] = core::array::from_fn(|k| p[k] > c.band[k].g);
                 if up.iter().any(|&u| u) {
                     let guard = libm::pow(10.0, 3.0 / 20.0) as f32;
@@ -1981,7 +1984,15 @@ impl Run {
                         }
                     });
                     let q = chain(c, seed);
-                    core::array::from_fn(|k| if up[k] { p[k] } else { q[k] })
+                    core::array::from_fn(|k| {
+                        if !up[k] {
+                            q[k]
+                        } else if q[k] < seed[k] {
+                            p[k].max(q[k])
+                        } else {
+                            p[k]
+                        }
+                    })
                 } else {
                     p
                 }
