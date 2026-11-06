@@ -20,9 +20,6 @@ const MAX_DETECTOR_WINDOW: usize = 1921;
 const MAX_GAIN_SRC_TAPS: usize = 225;
 const INPUT_BOUND: f32 = 16.0;
 const CURVE_POINTS: usize = 11;
-// Fourth-order notched crossover prototype from US 6,854,005, eqs. 5--9.
-// The legacy algorithms use this fixed notch ratio.
-const NTM_NOTCH_RATIO_SQ: f64 = 32.0 / 375.0;
 
 /// Processing selected for one analysis band.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -368,58 +365,6 @@ fn push_lr_allpass(path: &mut Path, n: usize, fc: f64, fs: f64) {
     }
 }
 
-/// Bilinear transform of `(c0 + c1*s + c2*s^2) /
-/// (1 + damping*s + s^2)`, prewarped at `fc`.
-fn prototype_section(fc: f64, fs: f64, damping: f64, c0: f64, c1: f64, c2: f64) -> Section {
-    let k = libm::tan(core::f64::consts::PI * fc / fs);
-    let d = k * k + damping * k + 1.0;
-    Section {
-        b0: (c0 * k * k + c1 * k + c2) / d,
-        b1: 2.0 * (c0 * k * k - c2) / d,
-        b2: (c0 * k * k - c1 * k + c2) / d,
-        a1: 2.0 * (k * k - 1.0) / d,
-        a2: (k * k - damping * k + 1.0) / d,
-    }
-}
-
-/// Fourth-order Neville-Thiele notched crossover:
-///
-/// `LP=(1+k^2*s^2)/(1+x*s+s^2)^2`
-/// `HP=s^2*(k^2+s^2)/(1+x*s+s^2)^2`,
-///
-/// where `x=sqrt(2*(1-k^2))`. Its outputs add to a second-order allpass.
-fn push_ntm4(path: &mut Path, high: bool, fc: f64, fs: f64) {
-    let x = libm::sqrt(2.0 * (1.0 - NTM_NOTCH_RATIO_SQ));
-    if high {
-        path.push(prototype_section(fc, fs, x, 0.0, 0.0, 1.0));
-        path.push(prototype_section(fc, fs, x, NTM_NOTCH_RATIO_SQ, 0.0, 1.0));
-    } else {
-        path.push(prototype_section(fc, fs, x, 1.0, 0.0, NTM_NOTCH_RATIO_SQ));
-        path.push(prototype_section(fc, fs, x, 1.0, 0.0, 0.0));
-    }
-}
-
-fn push_ntm4_allpass(path: &mut Path, fc: f64, fs: f64) {
-    let x = libm::sqrt(2.0 * (1.0 - NTM_NOTCH_RATIO_SQ));
-    path.push(prototype_section(fc, fs, x, 1.0, -x, 1.0));
-}
-
-fn push_crossover(path: &mut Path, algorithm: u32, high: bool, n: usize, fc: f64, fs: f64) {
-    if algorithm < 3 && n == 4 {
-        push_ntm4(path, high, fc, fs);
-    } else {
-        push_lr(path, high, n, fc, fs);
-    }
-}
-
-fn push_crossover_allpass(path: &mut Path, algorithm: u32, n: usize, fc: f64, fs: f64) {
-    if algorithm < 3 && n == 4 {
-        push_ntm4_allpass(path, fc, fs);
-    } else {
-        push_lr_allpass(path, n, fc, fs);
-    }
-}
-
 /// The unit's band tree, measured: the program splits at the middle
 /// crossover first; the low side splits at the lowest crossover and passes
 /// the highest crossover's allpass, the high side splits at the highest and
@@ -429,18 +374,18 @@ fn paths(p: &Params, fs: f64) -> [Path; BANDS] {
     let mut v = [Path::EMPTY; BANDS];
     let n = p.crossover_order.map(effective_order);
     let f = p.crossover_hz;
-    push_crossover(&mut v[0], p.algorithm, false, n[1], f[1], fs);
-    push_crossover(&mut v[0], p.algorithm, false, n[0], f[0], fs);
-    push_crossover_allpass(&mut v[0], p.algorithm, n[2], f[2], fs);
-    push_crossover(&mut v[1], p.algorithm, false, n[1], f[1], fs);
-    push_crossover(&mut v[1], p.algorithm, true, n[0], f[0], fs);
-    push_crossover_allpass(&mut v[1], p.algorithm, n[2], f[2], fs);
-    push_crossover(&mut v[2], p.algorithm, true, n[1], f[1], fs);
-    push_crossover(&mut v[2], p.algorithm, false, n[2], f[2], fs);
-    push_crossover_allpass(&mut v[2], p.algorithm, n[0], f[0], fs);
-    push_crossover(&mut v[3], p.algorithm, true, n[1], f[1], fs);
-    push_crossover(&mut v[3], p.algorithm, true, n[2], f[2], fs);
-    push_crossover_allpass(&mut v[3], p.algorithm, n[0], f[0], fs);
+    push_lr(&mut v[0], false, n[1], f[1], fs);
+    push_lr(&mut v[0], false, n[0], f[0], fs);
+    push_lr_allpass(&mut v[0], n[2], f[2], fs);
+    push_lr(&mut v[1], false, n[1], f[1], fs);
+    push_lr(&mut v[1], true, n[0], f[0], fs);
+    push_lr_allpass(&mut v[1], n[2], f[2], fs);
+    push_lr(&mut v[2], true, n[1], f[1], fs);
+    push_lr(&mut v[2], false, n[2], f[2], fs);
+    push_lr_allpass(&mut v[2], n[0], f[0], fs);
+    push_lr(&mut v[3], true, n[1], f[1], fs);
+    push_lr(&mut v[3], true, n[2], f[2], fs);
+    push_lr_allpass(&mut v[3], n[0], f[0], fs);
     v
 }
 
@@ -1059,23 +1004,6 @@ mod tests {
                 assert!((level(&x, f) - 20.0 * libm::log10(0.25)).abs() < 0.01, "order {order} at {f} Hz");
             }
         }
-    }
-
-    #[test]
-    fn legacy_fourth_order_crossover_has_complementary_notches() {
-        let fc = 1000.0;
-        let mut low = Path::EMPTY;
-        let mut high = Path::EMPTY;
-        push_ntm4(&mut low, false, fc, 48_000.0);
-        push_ntm4(&mut high, true, fc, 48_000.0);
-        let k = libm::sqrt(NTM_NOTCH_RATIO_SQ);
-        let warped = libm::tan(core::f64::consts::PI * fc / 48_000.0);
-        let low_notch = 48_000.0 / core::f64::consts::PI * libm::atan(warped / k);
-        let high_notch = 48_000.0 / core::f64::consts::PI * libm::atan(warped * k);
-        assert!((20.0 * libm::log10(band_magnitude(&low, fc)) + 6.020_6).abs() < 1e-4);
-        assert!((20.0 * libm::log10(band_magnitude(&high, fc)) + 6.020_6).abs() < 1e-4);
-        assert!(band_magnitude(&low, low_notch) < 1e-12);
-        assert!(band_magnitude(&high, high_notch) < 1e-12);
     }
 
     #[test]
