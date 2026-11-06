@@ -1936,6 +1936,7 @@ impl Run {
         let ratio = |limit: f64, q: f32| (limit / (q as f64).max(EPS)).min(1.0);
         let (a_fast, a_low) = (self.a_fast, self.a_low);
         let fragments = &self.fragment_lens[..self.fragment_count];
+        let complete_host_frame = fragments == [ctl];
         let velocity_release = 1.0 - libm::exp(-(ctl as f64) * a_fast);
         // the allocator span excludes the first millisecond (t-4719)
         let vfirst = libm::round(self.ctl as f64 * 3.0 / 16.0) as usize;
@@ -2095,6 +2096,8 @@ impl Run {
                 debug_assert_eq!(offset, ctl);
             }
             let retained_room_bound = c.vel_bound_window[od..].iter().copied().fold(0.0f32, f32::max);
+            let producer_rising =
+                complete_host_frame && retained_room_bound > c.vel_bound_window[od - 1] && retained_room_bound < vlim_g;
             let velocity_cut = core::cell::Cell::new(false);
             let primary_floor_limited = core::cell::Cell::new(false);
             let retained_episode = core::cell::Cell::new(c.vel_episode && c.vel_episode_retained);
@@ -2118,6 +2121,7 @@ impl Run {
                 }
                 if vel_on {
                     let ordinary = velocity_band_gains(&c.vb, &c.vcar, vfirst, vlim_g, sg, all, r);
+                    let ordinary_cut = (c.vel_active.0..c.vel_active.1).any(|k| ordinary[k] < r[k]);
                     let retained = if stream_ready && c.vel_bound_ready {
                         velocity_band_gains_limit_window(
                             &c.vb,
@@ -2132,12 +2136,7 @@ impl Run {
                     } else {
                         ordinary
                     };
-                    let retained_cut = (c.vel_active.0..c.vel_active.1).any(|k| {
-                        let v =
-                            if floor_velocity { (sg * retained[k]).max(c.vel_floor as f32) / sg } else { retained[k] };
-                        v < r[k]
-                    });
-                    if !c.vel_episode && retained_cut && stream_ready {
+                    if !c.vel_episode && complete_host_frame && (ordinary_cut || producer_rising) && stream_ready {
                         retained_episode.set(true);
                     }
                     let q = if retained_episode.get() { retained } else { ordinary };
