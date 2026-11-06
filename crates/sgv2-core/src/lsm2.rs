@@ -36,12 +36,14 @@
 //!   Rms s + Kms) + Bl^2 s)` and `V = s X`, each block with its own `RdcOhms`
 //!   (`ParasiticResistance` enters no model). A block whose
 //!   `UseGenericModelParameters*` flag is set takes the tuning's embedded
-//!   family row (the compiler resolves it). The current model is a Float32
-//!   biquad whose zeros are the exponentially mapped mechanical roots and
-//!   whose denominator is the minimum-phase quadratic matching the analog
-//!   section's magnitude at 0, Fs/6 and Fs/3, with `1/Rdc` on the numerator
-//!   (residuals section 1; the extra pole damping is an output of this
-//!   construction, not a fitted loss).
+//!   family row (the compiler resolves it). The current model has binary32
+//!   coefficients and a binary64 direct-form-I state. Its power product is
+//!   rounded to binary32 before the sequential substep reduction. Its zeros
+//!   are the exponentially mapped mechanical roots and its denominator is
+//!   the minimum-phase quadratic matching the analog section's magnitude at
+//!   0, Fs/6 and Fs/3, with `1/Rdc` on the numerator (residuals section 1;
+//!   the extra pole damping is an output of this construction, not a fitted
+//!   loss).
 //! - **Filterbank** (rig law 10): the raised-cosine crossfade bank on the
 //!   design grid of `M = 2 FB` points, each centre snapped to a bin, the
 //!   `M/2` tap dropped (319 taps), generated in f64 and rounded once to f32.
@@ -1234,15 +1236,15 @@ impl ProtectedPeak {
     }
 }
 
-/// The current model of spec 15.2: a Float32 biquad, every output rounded
-/// to f32, `i[n] = f32(b0 u[n] + b1 u[n-1] + b2 u[n-2] - a1 i[n-1] - a2
-/// i[n-2])`.
+/// The current model of residuals section 1: binary32 coefficients in a
+/// binary64 direct-form-I state and output. Each `u*i` thermal-power sample
+/// is then rounded to binary32 before the Float32 substep reduction.
 #[derive(Clone, Copy, Default)]
 struct Current {
-    b: [f32; 3],
-    a: [f32; 2],
-    u: [f32; 2],
-    i: [f32; 2],
+    b: [f64; 3],
+    a: [f64; 2],
+    u: [f64; 2],
+    i: [f64; 2],
 }
 
 impl Current {
@@ -1250,15 +1252,14 @@ impl Current {
     /// by the generative builder of residuals section 1.
     fn new(rdc: f64, bl: f64, m: f64, rms: f64, k: f64, rate: f64) -> Self {
         let (b, a) = current_coefficients(rdc, bl, m, rms, k, rate);
-        Current { b, a, u: [0.0; 2], i: [0.0; 2] }
+        Current { b: b.map(f64::from), a: a.map(f64::from), u: [0.0; 2], i: [0.0; 2] }
     }
     #[inline]
-    fn step(&mut self, u: f32) -> f32 {
-        let b = self.b.map(|v| v as f64);
-        let a = self.a.map(|v| v as f64);
-        let i = (b[0] * u as f64 + b[1] * self.u[0] as f64 + b[2] * self.u[1] as f64
-            - a[0] * self.i[0] as f64
-            - a[1] * self.i[1] as f64) as f32;
+    fn step(&mut self, u: f32) -> f64 {
+        let u = f64::from(u);
+        let i = self.b[0] * u + self.b[1] * self.u[0] + self.b[2] * self.u[1]
+            - self.a[0] * self.i[0]
+            - self.a[1] * self.i[1];
         self.u = [u, self.u[0]];
         self.i = [i, self.i[0]];
         i
@@ -1270,6 +1271,13 @@ impl Current {
     fn is_finite(&self) -> bool {
         self.i[0].is_finite() && self.i[1].is_finite()
     }
+}
+
+/// One current-model power product, rounded once before the monitor's
+/// binary32 reduction.
+#[inline]
+fn current_power(u: f32, i: f64) -> f32 {
+    (f64::from(u) * i) as f32
 }
 
 /// FIR dot product `sum taps[j] * x[n - j]` over a window whose newest
@@ -1549,7 +1557,7 @@ impl Chan {
                 let y = if i < extra { self.ceil_fast_prev[ctl - extra + i] } else { self.out_sample(i - extra, 1.0) };
                 i += 1;
                 let u = self.vfs * y;
-                [u * zi.step(0.0), u * zs.step(u)]
+                [current_power(u, zi.step(0.0)), current_power(u, zs.step(u))]
             });
             let (pl, pq) = (sl / sub as f32, sq / sub as f32);
             bv = self.br_vc.step(bv, 0.0);
@@ -2035,7 +2043,7 @@ impl Run {
             // the input temperature model, unattenuated (residuals 2)
             let ut = c.vfs * xin[i];
             let it = c.tin_cur.step(ut);
-            c.power_work[i % sub] = ut * it;
+            c.power_work[i % sub] = current_power(ut, it);
             if (i + 1) % sub == 0 {
                 let p = (seq_sum(&c.power_work) / sub as f32).max(0.0);
                 c.tp_vc = c.br_vc.step(c.tp_vc, p);
@@ -2231,9 +2239,7 @@ impl Run {
                     for k in c.vel_active.0..c.vel_active.1 {
                         let raw = q[k];
                         let v = if floor_velocity {
-                            primary_floor_limited.set(
-                                primary_floor_limited.get() || sg * raw < c.vel_floor as f32,
-                            );
+                            primary_floor_limited.set(primary_floor_limited.get() || sg * raw < c.vel_floor as f32);
                             (sg * raw).max(c.vel_floor as f32) / sg
                         } else {
                             raw
@@ -2322,7 +2328,7 @@ impl Run {
                 // candidates see the bank stage before any gain
                 let u = vfs * c.xc[idx];
                 let i = cur.step(u);
-                acc += u as f64 * i as f64;
+                acc += f64::from(u) * i;
                 if (idx + 1) % sub == 0 {
                     let p = acc / sub as f64;
                     acc = 0.0;
@@ -2486,8 +2492,8 @@ impl Run {
                 };
                 let u = c.vfs * v;
                 let iv = c.cur_out.step(u);
-                acc += u as f64 * iv as f64;
-                c.power_work[i % sub] = u * iv;
+                acc += f64::from(u) * iv;
+                c.power_work[i % sub] = current_power(u, iv);
                 *yo = v.clamp(-1.0, 1.0);
                 // The persistent motion models follow the protected output.
                 c.dcar_m.step(c.vfs * *yo);
@@ -2958,7 +2964,27 @@ mod fault_tests {
     }
 
     #[test]
-    fn thermal_substeps_use_the_vdsp_sum_tree() {
+    fn current_keeps_binary64_state_until_the_power_product() {
+        let b0 = f64::from(0.1f32);
+        let u = 0.3f32;
+        let mut current = Current { b: [b0, 0.0, 0.0], ..Current::default() };
+
+        let i = current.step(u);
+        assert_eq!(i, b0 * f64::from(u));
+        assert_eq!(current.i, [i, 0.0]);
+        assert_ne!(i, f64::from(i as f32));
+        assert_eq!(current_power(u, i), (f64::from(u) * i) as f32);
+    }
+
+    #[test]
+    fn current_and_monitor_start_with_exact_zero_state() {
+        let current = Current::new(4.0, 0.8, 0.0002, 0.2, 1500.0, 48_000.0);
+        assert_eq!((current.u, current.i), ([0.0; 2], [0.0; 2]));
+        assert_eq!(seq_sum(&[1.0e20, 1.0, -1.0e20, 1.0]), 1.0);
+    }
+
+    #[test]
+    fn ceiling_substeps_use_the_vdsp_sum_tree() {
         let x: [f32; 32] = core::array::from_fn(|i| (i + 1) as f32 * 0.1);
         assert_eq!(vdsp_sve_slice(&x).to_bits(), 0x4253_3334);
     }
