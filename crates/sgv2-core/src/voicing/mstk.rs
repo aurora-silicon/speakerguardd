@@ -557,42 +557,11 @@ impl GainSrc {
     }
 }
 
-/// First-order anti-alias section after reduced-rate gain interpolation.
-/// The saved release control also selects this section's corner: its value in
-/// milliseconds is used numerically as hertz. Both delay elements start at
-/// zero, like the interpolator history.
-#[derive(Clone, Copy)]
-struct GainAntiAlias {
-    b: f32,
-    a1: f32,
-    x1: f32,
-    y1: f32,
-}
-
-impl GainAntiAlias {
-    fn new(release_s: f64, fs: f64) -> Self {
-        let cutoff = (release_s * 1000.0).clamp(1.0, 0.49 * fs);
-        let k = libm::tan(core::f64::consts::PI * cutoff / fs);
-        let b = (k / (1.0 + k)) as f32;
-        Self { b, a1: ((k - 1.0) / (k + 1.0)) as f32, x1: 0.0, y1: 0.0 }
-    }
-
-    fn reset(&mut self) {
-        self.x1 = 0.0;
-        self.y1 = 0.0;
-    }
-
-    #[inline]
-    fn step(&mut self, input: f64) -> f64 {
-        let input = input as f32;
-        let output = self.b * (input + self.x1) - self.a1 * self.y1;
-        self.x1 = input;
-        self.y1 = output;
-        output as f64
-    }
-}
-
 fn detector_factors(_p: &Params) -> [usize; BANDS] {
+    // MeisterStueck's outer cadence adapter selects every Nth detector-band
+    // sample without a prefilter. The embedded compressor, including its
+    // window and release state, then runs at fs / N; its gain vector is sent
+    // through the separate causal outer SRC above.
     [1, 2, 4, 4]
 }
 
@@ -650,7 +619,6 @@ pub struct Run {
     detector_max: [SlidingMax; BANDS],
     detector_rms: [f64; BANDS],
     gain_src: [GainSrc; BANDS],
-    gain_anti_alias: [GainAntiAlias; BANDS],
     state: [[[[f64; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS],
     legacy_high_state: [[[[f64; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
     legacy_split_allpass_state: [[[[f64; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
@@ -717,7 +685,6 @@ impl Run {
             detector_max: [SlidingMax::EMPTY; BANDS],
             detector_rms: [0.0; BANDS],
             gain_src: core::array::from_fn(|b| GainSrc::new(detector_factor[b], fs)),
-            gain_anti_alias: core::array::from_fn(|_| GainAntiAlias::new(q.release_s, fs)),
             state: [[[[0.0; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS],
             legacy_high_state: [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
             legacy_split_allpass_state: [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
@@ -734,9 +701,6 @@ impl Run {
         self.detector_rms = [0.0; BANDS];
         for src in &mut self.gain_src {
             src.reset();
-        }
-        for filter in &mut self.gain_anti_alias {
-            filter.reset();
         }
         self.state = [[[[0.0; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS];
         self.legacy_high_state = [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS];
@@ -905,10 +869,7 @@ impl Run {
                     None
                 };
                 gain[b] = match self.band[b].mode {
-                    BandMode::Active => {
-                        let interpolated = self.gain_src[b].step(input);
-                        self.gain_anti_alias[b].step(interpolated)
-                    }
+                    BandMode::Active => self.gain_src[b].step(input),
                     BandMode::Pass => 1.0,
                     BandMode::Mute => 0.0,
                 };
@@ -1156,6 +1117,10 @@ mod tests {
         let run = Run::new(&params(), 48_000.0, 1);
         assert_eq!(run.detector_factor, [1, 2, 4, 4]);
         assert_eq!(run.detector_window, [481, 193, 25, 13]);
+        for b in 0..BANDS {
+            let embedded_fs = 48_000.0 / run.detector_factor[b] as f64;
+            assert!((run.release[b] - libm::exp(-1.0 / (params().release_s * embedded_fs))).abs() < 1e-12);
+        }
         let run = Run::new(&params(), 96_000.0, 1);
         assert_eq!(run.detector_window, [961, 385, 49, 25]);
 
@@ -1182,24 +1147,6 @@ mod tests {
             assert!((output - 1.0).abs() < 2e-6, "factor {factor}: {output}");
             src.reset();
             assert_eq!(src.step(None), 0.0);
-        }
-    }
-
-    #[test]
-    fn gain_anti_alias_has_zero_startup_near_unity_dc_and_release_selected_corner() {
-        for release_s in [0.0, 0.05, 0.4] {
-            let mut filter = GainAntiAlias::new(release_s, 48_000.0);
-            assert_eq!(filter.step(0.0), 0.0);
-            let cutoff = (release_s * 1000.0f64).clamp(1.0, 0.49 * 48_000.0);
-            let expected_k = libm::tan(core::f64::consts::PI * cutoff / 48_000.0);
-            assert!((filter.b as f64 - expected_k / (1.0 + expected_k)).abs() < 1e-8);
-            let mut output = 0.0;
-            for _ in 0..131_072 {
-                output = filter.step(1.0);
-            }
-            assert!(output > 0.999, "release {release_s}: {output}");
-            filter.reset();
-            assert_eq!(filter.step(0.0), 0.0);
         }
     }
 
