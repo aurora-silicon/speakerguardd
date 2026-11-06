@@ -147,7 +147,7 @@ const AUTOMATION_ENTRIES: u32 = 10;
 pub const MAX_ORDER: u32 = 10;
 
 fn automation_on(state: f64) -> bool {
-    state == 2.0 || state == 1000.0
+    state != 0.0
 }
 
 fn bad(message: impl Into<String>) -> Error {
@@ -347,7 +347,7 @@ pub(crate) fn voicing_tone(
 }
 
 /// The volume automation entries of a filter box that move something: on
-/// (state 2 or the legacy active value 1000), aimed at a slot, with two distinct volume set points
+/// (state nonzero, including 2 and the legacy value 1000), aimed at a slot, with two distinct volume set points
 /// (entry words 2 and 3). An entry whose set points coincide was measured
 /// to change nothing at any volume (black-box renders of the unit), so it
 /// is not counted.
