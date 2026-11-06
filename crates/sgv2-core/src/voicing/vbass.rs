@@ -326,6 +326,13 @@ pub mod law {
     pub const LC_HOLD_S: f64 = 0.5;
     pub const LC_HOLD_RATIO: f64 = 0.9;
     pub const LC_SMOOTH_S: f64 = 0.5;
+    /// Never-louder margin on the hold-restart test (not part of macOS's
+    /// law): this box's arithmetic is not bit-identical to macOS's, so a
+    /// near-tie restart could fall either way. The input follower restarts
+    /// its hold only clearly above the ratio (it then releases no later than
+    /// macOS's), the output follower already slightly below it (it then
+    /// releases no earlier): a tie always resolves to the quieter output.
+    pub const LC_HOLD_MARGIN: f64 = 1e-3;
     /// The mid branches run at the selected rate (SPEC-vben §3): the
     /// crossover low pass at the stream rate, every `fs / SUB_RATE_HZ`-th
     /// frame taken, the
@@ -428,23 +435,27 @@ impl Params {
 /// Peak follower of the level control.
 #[derive(Clone, Copy, Debug)]
 struct Follower {
-    e: f64,
-    s: f64,
+    // single precision, as the box's own follower state
+    ratio: f32,
+    e: f32,
+    s: f32,
     held: usize,
     hold: usize,
-    a_att: f64,
-    a_rel: f64,
-    a_smo: f64,
+    a_att: f32,
+    a_rel: f32,
+    a_smo: f32,
 }
 
 impl Follower {
-    fn new(fs: f64) -> Follower {
-        let pole = |t: f64| libm::exp(-1.0 / (t * fs));
+    fn new(fs: f64, ratio: f64) -> Follower {
+        let fs = fs as f32;
+        let pole = |t: f64| libm::expf(-1.0 / (t as f32 * fs));
         Follower {
+            ratio: ratio as f32,
             e: 0.0,
             s: 0.0,
             held: 0,
-            hold: (law::LC_HOLD_S * fs) as usize + 1,
+            hold: (law::LC_HOLD_S as f32 * fs) as usize + 1,
             a_att: pole(law::LC_ATTACK_S),
             a_rel: pole(law::LC_RELEASE_S),
             a_smo: pole(law::LC_SMOOTH_S),
@@ -452,22 +463,26 @@ impl Follower {
     }
     #[inline]
     fn run(&mut self, x: f64) -> f64 {
-        let u = libm::fabs(x);
+        let u = libm::fabsf(x as f32);
         let (a, b) = if u > self.e {
             self.held = 0;
             (self.a_att, if self.e > self.s { self.a_att } else { self.a_smo })
-        } else if self.held < self.hold {
-            self.held += 1;
-            if u >= law::LC_HOLD_RATIO * self.e {
-                self.held = 0;
+        } else if u < self.e {
+            if self.held < self.hold {
+                self.held += 1;
+                if u >= self.ratio * self.e {
+                    self.held = 0;
+                }
+                (1.0, self.a_smo)
+            } else {
+                (self.a_rel, self.a_smo)
             }
-            (1.0, self.a_smo)
         } else {
             (self.a_rel, self.a_smo)
         };
         self.e = a * self.e + (1.0 - a) * u;
         self.s = b * self.s + (1.0 - b) * self.e;
-        self.s
+        self.s as f64
     }
 }
 
@@ -480,7 +495,10 @@ struct LevelControl {
 
 impl LevelControl {
     fn new(fs: f64) -> LevelControl {
-        LevelControl { input: Follower::new(fs), output: Follower::new(fs) }
+        LevelControl {
+            input: Follower::new(fs, law::LC_HOLD_RATIO * (1.0 + law::LC_HOLD_MARGIN)),
+            output: Follower::new(fs, law::LC_HOLD_RATIO * (1.0 - law::LC_HOLD_MARGIN)),
+        }
     }
 }
 
@@ -786,7 +804,7 @@ mod tests {
 
     #[test]
     fn level_control_holds_then_releases() {
-        let mut f = Follower::new(48_000.0);
+        let mut f = Follower::new(48_000.0, law::LC_HOLD_RATIO);
         for _ in 0..4_800 {
             f.run(1.0);
         }
