@@ -486,11 +486,51 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
         Ok(v as u32)
     };
     let refuse = |what: &str| bad(format!("{what}: the engine's payload cannot represent it (TODO(lane B))"));
-    if get(id::controller(id::C_USE_FAST_PEAK))? != 0.0 {
-        return Err(refuse("UseFastPeakSampleControl"));
+    // Report the independent missing mechanisms together. Returning only
+    // the first one made a new board appear to need just a prefilter when
+    // its own tuning also requested an estimator and a different current
+    // model. Nothing here substitutes model-only operation or drops a flag.
+    let mut unsupported = Vec::new();
+    for (key, name) in [
+        (id::controller(id::C_USE_FAST_PEAK), "UseFastPeakSampleControl"),
+        (id::controller(id::C_COMPENSATE_RESONATORS), "CompensateResonators integration"),
+        (id::ENABLE_CLOSED_LOOP_TEMPERATURE, "closed-loop temperature"),
+    ] {
+        if get(key)? != 0.0 {
+            unsupported.push(name.to_owned());
+        }
     }
-    if get(id::controller(id::C_COMPENSATE_RESONATORS))? != 0.0 {
-        return Err(refuse("CompensateResonators"));
+    if get(id::BYPASS_SYS_ID)? != 1.0 {
+        unsupported.push("system identification".to_owned());
+    }
+    for c in 0..n as u32 {
+        let ty = whole(id::CH_SPEAKER_TYPE + c, "ChSpeakerType")?;
+        if ty > 2 {
+            return Err(bad(format!("Ch{c}SpeakerType {ty} is not a type A/B/C")));
+        }
+        for (m, manager) in [
+            (id::MANAGER_ADMITTANCE, "admittance"),
+            (id::MANAGER_DISPLACEMENT, "displacement"),
+            (id::MANAGER_VELOCITY, "velocity"),
+        ] {
+            for (k, name) in [
+                (id::M_ENABLE_RES2, "resonator 2"),
+                (id::M_ENABLE_LR2, "LR2 inductance"),
+                (id::M_CREEP, "creep model"),
+                (id::M_USE_COMPENSATION, "model compensation"),
+                (id::M_PASSIVE_RADIATOR, "passive radiator"),
+            ] {
+                if get(id::model(m, ty, k))? != 0.0 {
+                    let feature = format!("type {ty} {manager} {name}");
+                    if !unsupported.contains(&feature) {
+                        unsupported.push(feature);
+                    }
+                }
+            }
+        }
+    }
+    if !unsupported.is_empty() {
+        return Err(refuse(&unsupported.join("; ")));
     }
     let model_only = (get(id::BYPASS_SYS_ID)? == 1.0 && get(id::ENABLE_CLOSED_LOOP_TEMPERATURE)? == 0.0) as u32;
 
