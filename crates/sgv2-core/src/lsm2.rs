@@ -108,8 +108,9 @@
 //! Velocity fixed term (t-4751, t-4763): the zero-input carry of a
 //! persistent Float32 full-band velocity model that advances on the
 //! protected output. Displacement uses the corresponding protected-output
-//! displacement carry (t-4800). Motion carries share one Float32 biquad with
-//! the measured fused order.
+//! displacement carry (t-4800); the retained full-band displacement peak
+//! supplies its old/new two-level bound. Motion carries share one Float32
+//! biquad with the measured fused order.
 //!
 //! Known residuals against 25G83 (rig report):
 //! - 96 kHz: the steady velocity margin on the fb8-sr96 law cases is
@@ -171,6 +172,7 @@ pub const PRESSURE_TAPS: usize = 1024;
 const EPS: f64 = f32::MIN_POSITIVE as f64;
 /// The 0.99 downward target of every gain law (rig laws 5, 8; spec 15.4).
 const CUT: f64 = 0.99;
+
 /// The declared maximum of the `VelocityLimit*` parameters, m/s: the
 /// velocity curve's last anchor (residuals section 4), not a runtime cap.
 const VELOCITY_PARAM_MAX: f32 = 2.0;
@@ -1244,6 +1246,11 @@ struct Chan {
     dcar_m: Biquad32,
     rd: Vec<f32>,
     db: [Vec<f32>; BANDS],
+    /// Retained full-band displacement peaks on the two sides of the
+    /// bank/output handoff.
+    disp_bound_old: f32,
+    disp_bound_new: f32,
+    disp_bound_ready: bool,
     /// The persistent full-band displacement and velocity models at the
     /// window start (Float32), and their zero-input carries over the first
     /// filterbank latency of the window (t-4751).
@@ -1595,6 +1602,9 @@ impl Run {
                 disp_proto: disp,
                 dcar_m: Biquad32::from(&disp),
                 db: core::array::from_fn(|_| vec![0.0; od + ctl]),
+                disp_bound_old: 0.0,
+                disp_bound_new: 0.0,
+                disp_bound_ready: false,
                 vcar_m: Biquad32::from(&vel),
                 protected_peak: ProtectedPeak::new(rate as usize),
                 protected_peak_now: 0.0,
@@ -1716,6 +1726,9 @@ impl Run {
             c.xc.iter_mut().for_each(|v| *v = 0.0);
             c.disp.clear();
             c.dcar_m.clear();
+            c.disp_bound_old = 0.0;
+            c.disp_bound_new = 0.0;
+            c.disp_bound_ready = false;
             c.vel.clear();
             c.vel_band.iter_mut().for_each(Biquad::clear);
             c.pk_x = [0.0; RING];
@@ -1938,6 +1951,15 @@ impl Run {
                     }
                 }
                 c.dcar_m.carry(&mut c.rd, fbl);
+                let next = window_max(&c.pk_d).min(c.disp_limit as f32);
+                if c.disp_bound_ready {
+                    c.disp_bound_old = c.disp_bound_new;
+                    c.disp_bound_new = next;
+                } else {
+                    c.disp_bound_old = next;
+                    c.disp_bound_new = next;
+                    c.disp_bound_ready = true;
+                }
             }
             let vlim_g = c.vel_limit_now as f32;
             let stream_ready = c.protected_peak.ready();
@@ -1969,7 +1991,19 @@ impl Run {
                 let all = (0, BANDS);
                 let mut r = seed;
                 if disp_on {
-                    r = velocity_band_gains(&c.db, &c.rd, 0, c.disp_limit as f32, sg, all, r);
+                    let room = 0.25 * (c.disp_limit as f32 - c.disp_bound_new).max(0.0);
+                    r = velocity_band_gains_window(
+                        &c.db,
+                        &c.rd,
+                        0,
+                        c.disp_bound_old,
+                        c.disp_bound_new,
+                        od,
+                        room,
+                        sg,
+                        all,
+                        r,
+                    );
                 }
                 if vel_on {
                     let ordinary = velocity_band_gains(&c.vb, &c.vcar, vfirst, vlim_g, sg, all, r);
@@ -2689,12 +2723,14 @@ mod fault_tests {
         assert!(want[..r.fb].iter().any(|&v| v != 0.0));
         run(&mut u, 1.0, CONTROLLER_FRAMES);
         let r = u.run.as_ref().unwrap();
+        assert!(r.ch[0].disp_bound_ready);
         assert_eq!(
             r.ch[0].rd.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
             want.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
         );
         assert!(r.ch[0].rd[r.fb..].iter().all(|&v| v == 0.0));
     }
+
 
     #[test]
     fn waterfill_levels_the_active_peaks() {
