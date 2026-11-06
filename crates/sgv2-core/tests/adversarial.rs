@@ -440,9 +440,9 @@ fn lsm2_params(seed: u64, n: usize, rate: u32, hot: bool) -> lsm2::Params {
         runtime_budget_w: [r.log(0.1, 50.0), r.log(0.1, 50.0), r.log(0.1, 50.0), r.log(0.1, 50.0)],
         ..lsm2::Params::default()
     };
-    // refused otherwise: no thermal axis (a blob must protect), or a
-    // look-ahead region (filterbank stage plus look-ahead) that does not fit
-    // inside one controller frame. The geometry sits on the native rate
+    // refused otherwise: no thermal axis (a blob must protect), a look-ahead
+    // region (filterbank stage plus look-ahead) that does not fit inside one
+    // controller frame, or a latency shorter than one controller frame. The geometry sits on the native rate
     // family's vectors: 16F-frame filterbank stages, 8F-frame look-ahead.
     if p.control_power == 0 && p.control_temperature == 0 {
         p.control_temperature = 1;
@@ -451,7 +451,11 @@ fn lsm2_params(seed: u64, n: usize, rate: u32, hot: bool) -> lsm2::Params {
     let family = ((rate as f64 / 48_000.0).round() as usize).max(1);
     let (fbv, lav) = (2 * lsm2::SUBSTEPS * family, lsm2::SUBSTEPS * family);
     let fb = fbv * (1 + r.uni(0.0, ((cadence - lav - 1) / fbv) as f64 - 0.01) as usize);
-    let od = fb + lav * (1 + r.uni(0.0, ((cadence - 1 - fb) / lav) as f64 - 0.01) as usize);
+    // and the latency (two filterbank stages plus the look-ahead) is at least
+    // one controller frame, or the unit refuses it
+    let lo = (cadence.saturating_sub(2 * fb)).div_ceil(lav).max(1);
+    let hi = (cadence - 1 - fb) / lav;
+    let od = fb + lav * (lo + r.uni(0.0, (hi - lo) as f64 + 0.99) as usize).min(hi);
     // a quarter frame over the stage so a floor-rounded family (32 kHz) keeps it
     p.filterbank_latency_ms = ((fb as f64 + 0.25) * 1e3 / rate as f64) as f32;
     p.speaker_response_lookahead_ms = ((od - fb) as f64 * 1e3 / rate as f64) as f32;
