@@ -90,6 +90,7 @@ fn main() {
             nodes: vec![node],
             outputs: (0..w).map(|k| Source::Node(0, k)).collect(),
             links: c.spec.links.iter().filter(|l| l.node == n).map(|l| Link { node: 0, ..*l }).collect(),
+            relays: vec![],
         };
         assert!(taps.is_empty(), "--only takes no --tap");
     }

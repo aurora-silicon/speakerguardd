@@ -73,7 +73,7 @@ pub fn compile(stage: &Stage, _fs: f64, _diags: &mut Diagnostics) -> Result<Opti
     }
     in_range(section, stage, 2, 0.01, 60_000.0)?;
     in_range(section, stage, 3, 0.01, 60_000.0)?;
-    in_range(section, stage, 4, 0.0, 1.0)?;
+    let saved_scalar = in_range(section, stage, 4, 0.0, 1.0)?;
     let pre_gain_db = in_range(section, stage, 5, -120.0, 20.0)?;
     let auto_mute_db = in_range(section, stage, 6, -240.0, 0.0)?;
     match parameter(section, stage, 7)? {
@@ -107,7 +107,7 @@ pub fn compile(stage: &Stage, _fs: f64, _diags: &mut Diagnostics) -> Result<Opti
             format!("AutoMuteThreshold {auto_mute_db} dB can engage (carried curve lower bound {lower_bound} dB)"),
         ));
     }
-    Ok(Some(Params { pre_gain_db, curve_db, offset_db }))
+    Ok(Some(Params { saved_scalar, pre_gain_db, curve_db, offset_db }))
 }
 
 #[cfg(test)]

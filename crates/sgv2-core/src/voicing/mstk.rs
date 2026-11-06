@@ -14,6 +14,7 @@ use crate::MAX_CHANNELS;
 
 pub const BANDS: usize = 4;
 const XOVERS: usize = BANDS - 1;
+pub const MAX_AUTOMATION_POINTS: usize = 16;
 const MAX_FILTERS: usize = 32;
 const MAX_DETECTOR_FILTERS: usize = 10;
 const MAX_DETECTOR_WINDOW: usize = 1921;
@@ -48,6 +49,56 @@ pub struct Band {
     pub input_gain_db: f64,
     /// `None` disables the band waveshaper; otherwise the saved flavor.
     pub saturation: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct AutomationPoint {
+    pub input: f64,
+    pub value: f64,
+}
+
+/// A piecewise-linear automation curve for one band's downward threshold.
+/// An empty curve leaves the saved threshold unchanged.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ThresholdAutomation {
+    pub points: [AutomationPoint; MAX_AUTOMATION_POINTS],
+    pub count: usize,
+}
+
+impl Default for ThresholdAutomation {
+    fn default() -> Self {
+        Self { points: [AutomationPoint::default(); MAX_AUTOMATION_POINTS], count: 0 }
+    }
+}
+
+impl ThresholdAutomation {
+    fn valid(&self, input_min: f64, input_max: f64) -> bool {
+        self.count <= MAX_AUTOMATION_POINTS
+            && (self.count == 0 || self.count >= 2)
+            && self.points[..self.count].iter().enumerate().all(|(i, p)| {
+                p.input.is_finite()
+                    && p.value.is_finite()
+                    && (input_min..=input_max).contains(&p.input)
+                    && (-120.0..=0.0).contains(&p.value)
+                    && (i == 0 || p.input > self.points[i - 1].input)
+            })
+    }
+
+    fn value(&self, input: f64) -> Option<f64> {
+        let points = &self.points[..self.count];
+        let first = *points.first()?;
+        if input <= first.input {
+            return Some(first.value);
+        }
+        for pair in points.windows(2) {
+            let (a, b) = (pair[0], pair[1]);
+            if input <= b.input {
+                let t = (input - a.input) / (b.input - a.input);
+                return Some(a.value + t * (b.value - a.value));
+            }
+        }
+        Some(points[points.len() - 1].value)
+    }
 }
 
 impl Default for Band {
@@ -88,6 +139,7 @@ pub struct Params {
     pub automation_input: f64,
     pub automation_min: f64,
     pub automation_max: f64,
+    pub threshold_automation: [ThresholdAutomation; BANDS],
     pub band: [Band; BANDS],
 }
 
@@ -107,6 +159,7 @@ impl Default for Params {
             automation_input: 0.0,
             automation_min: -100.0,
             automation_max: 0.0,
+            threshold_automation: [ThresholdAutomation::default(); BANDS],
             band: [Band::default(); BANDS],
         }
     }
@@ -115,7 +168,8 @@ impl Default for Params {
 impl Params {
     const HEAD_WORDS: usize = 17;
     const BAND_WORDS: usize = 13;
-    pub const WORDS: usize = Self::HEAD_WORDS + BANDS * Self::BAND_WORDS;
+    const AUTOMATION_WORDS: usize = 1 + 2 * MAX_AUTOMATION_POINTS;
+    pub const WORDS: usize = Self::HEAD_WORDS + BANDS * (Self::BAND_WORDS + Self::AUTOMATION_WORDS);
 
     pub fn to_words(&self, out: &mut [f64]) {
         if out.len() < Self::WORDS {
@@ -152,6 +206,15 @@ impl Params {
                 b.saturation.is_some() as u8 as f64,
                 b.saturation.unwrap_or(0) as f64,
             ]);
+        }
+        let base = Self::HEAD_WORDS + BANDS * Self::BAND_WORDS;
+        for (band, curve) in self.threshold_automation.iter().enumerate() {
+            let o = base + band * Self::AUTOMATION_WORDS;
+            out[o] = curve.count as f64;
+            for (i, point) in curve.points.iter().enumerate() {
+                out[o + 1 + 2 * i] = point.input;
+                out[o + 2 + 2 * i] = point.value;
+            }
         }
     }
 
@@ -215,6 +278,16 @@ impl Params {
                 saturation: sat.then_some(flavor),
             };
         }
+        let base = Self::HEAD_WORDS + BANDS * Self::BAND_WORDS;
+        for (band, curve) in p.threshold_automation.iter_mut().enumerate() {
+            let o = base + band * Self::AUTOMATION_WORDS;
+            let count = integer(w[o], MAX_AUTOMATION_POINTS as u32)? as usize;
+            curve.count = count;
+            for (i, point) in curve.points.iter_mut().enumerate() {
+                point.input = w[o + 1 + 2 * i];
+                point.value = w[o + 2 + 2 * i];
+            }
+        }
         p.valid(48_000.0).then_some(p)
     }
 
@@ -233,6 +306,7 @@ impl Params {
             && finite(self.automation_min, -1000.0, 1000.0)
             && finite(self.automation_max, -1000.0, 1000.0)
             && self.automation_min <= self.automation_max
+            && self.threshold_automation.iter().all(|curve| curve.valid(self.automation_min, self.automation_max))
             && self.band.iter().all(|b| {
                 finite(b.down_threshold_db, -120.0, 0.0)
                     && finite(b.down_ratio, 1.0, 20.0)
@@ -510,6 +584,8 @@ pub struct Run {
     path: [Path; BANDS],
     detector_path: [DetectorPath; BANDS],
     band: [Band; BANDS],
+    base_band: [Band; BANDS],
+    threshold_automation: [ThresholdAutomation; BANDS],
     in_gain: f64,
     out_gain: f64,
     band_in: [f64; BANDS],
@@ -554,10 +630,12 @@ impl Run {
         }
         let detector_window = [10.0, 8.0, 2.0, 1.0]
             .map(|ms| ((libm::round(ms * fs / 1000.0) as usize) | 1).clamp(1, MAX_DETECTOR_WINDOW));
-        Run {
+        let mut run = Run {
             path: paths(q, fs),
             detector_path: detector_paths(q, fs),
             band: q.band,
+            base_band: q.band,
+            threshold_automation: q.threshold_automation,
             in_gain: db_amp(q.input_gain_db),
             out_gain: db_amp(q.output_gain_db),
             band_in: q.band.map(|b| db_amp(b.input_gain_db)),
@@ -579,7 +657,9 @@ impl Run {
             compensation_state: [[0.0; 2]; MAX_CHANNELS],
             state: [[[[0.0; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS],
             detector_state: [[[[0.0; 2]; MAX_DETECTOR_FILTERS]; BANDS]; MAX_CHANNELS],
-        }
+        };
+        run.set_automation_input(q.automation_input);
+        run
     }
 
     pub fn reset(&mut self) {
@@ -594,6 +674,27 @@ impl Run {
 
     pub fn latency(&self) -> usize {
         0
+    }
+
+    /// Sets the box automation input (AU parameter 79). Curves are clamped
+    /// at their endpoints and update only the four downward thresholds.
+    pub fn set_automation_input(&mut self, input: f64) {
+        if !input.is_finite() {
+            return;
+        }
+        for band in 0..BANDS {
+            let mut next = self.base_band[band];
+            if let Some(threshold) = self.threshold_automation[band].value(input) {
+                next.down_threshold_db = threshold;
+            }
+            self.band[band] = next;
+            self.curve[band] = curve_points(next, self.curve_top_db);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn down_threshold_db(&self, band: usize) -> Option<f64> {
+        self.band.get(band).map(|state| state.down_threshold_db)
     }
 
     #[inline]
@@ -782,6 +883,27 @@ mod tests {
         assert_eq!(Params::from_words(&w), Some(p));
         w[3] = 21.0;
         assert!(Params::from_words(&w).is_none());
+    }
+
+    #[test]
+    fn threshold_automation_interpolates_and_clamps() {
+        let mut p = params();
+        p.automation_input = -15.0;
+        p.automation_min = -30.0;
+        p.automation_max = 0.0;
+        p.threshold_automation[0].count = 3;
+        p.threshold_automation[0].points[..3].copy_from_slice(&[
+            AutomationPoint { input: -30.0, value: -10.0 },
+            AutomationPoint { input: -10.0, value: -20.0 },
+            AutomationPoint { input: 0.0, value: -24.0 },
+        ]);
+        let mut run = Run::new(&p, 48_000.0, 1);
+        assert_eq!(run.band[0].down_threshold_db, -17.5);
+        run.set_automation_input(-100.0);
+        assert_eq!(run.band[0].down_threshold_db, -10.0);
+        run.set_automation_input(10.0);
+        assert_eq!(run.band[0].down_threshold_db, -24.0);
+        assert_eq!(run.band[1].down_threshold_db, p.band[1].down_threshold_db);
     }
 
     #[test]
