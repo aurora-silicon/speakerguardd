@@ -64,6 +64,9 @@ const RESET_SEEDED: f64 = 13.0;
 /// The render quality carried: full-rate side chain.
 const QUALITY_FULL: f64 = 3.0;
 const SUPPORTED_FS: f64 = 48_000.0;
+/// Fast-path release dead band by algorithm version, dB.
+const FAST_DEADBAND_V2_DB: f64 = 10.0;
+const FAST_DEADBAND_V3_DB: f64 = 7.0;
 
 fn bad(message: impl Into<String>) -> Error {
     Error::format("Norm", message)
@@ -166,9 +169,16 @@ pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option
             return Err(bad(format!("{}: {what} {v} is not carried", stage.name)));
         }
     }
-    if req(VERSION)? < 2.0 {
-        return Err(bad(format!("{}: algorithm version {} is not carried", stage.name, req(VERSION)?)));
-    }
+    // the fast path's release dead band is the one law that differs between
+    // the algorithm versions the speaker strips use
+    let version = req(VERSION)?;
+    let fast_deadband_db = if version == 2.0 {
+        FAST_DEADBAND_V2_DB
+    } else if version == 3.0 {
+        FAST_DEADBAND_V3_DB
+    } else {
+        return Err(bad(format!("{}: algorithm version {version} is not carried", stage.name)));
+    };
     let target = req(TARGET)?;
     let max_gain = req(MAX_GAIN)?;
     let up = req(UP_RANGE)?;
@@ -206,6 +216,7 @@ pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option
         reset_timeout_s: timeout,
         lookahead: lookahead.max(0.0) as usize,
         sections: sos.len(),
+        fast_deadband_db,
         ..Params::default()
     };
     for (d, s) in p.sos.iter_mut().zip(&sos) {
