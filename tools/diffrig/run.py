@@ -104,7 +104,7 @@ def like_for_like(ref, got, program, file_ch, ch, out_path, ref_lat, got_lat, ra
     x = x[: len(x) // file_ch * file_ch].reshape(-1, file_ch).astype(np.float64)
     y = np.fromfile(out_path, "<f4")
     y = y[: len(y) // ch * ch].reshape(-1, ch).astype(np.float64)
-    ctl = max(256, int(round((256 * rate / 48000) / 8)) * 8)
+    ctl = 192 if rate == 32000 else min(512, 256 * max(1, int(round(rate / 48000))))
 
     def note(what, why):
         e = excluded.setdefault(what, {"reason": why, "slices": 0})

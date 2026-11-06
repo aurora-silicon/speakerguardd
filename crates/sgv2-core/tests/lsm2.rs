@@ -474,6 +474,7 @@ fn controller_cadence_is_a_time() {
     assert_eq!(lsm2::controller_frames(48_000), 256);
     assert_eq!(lsm2::controller_frames(96_000), 512);
     assert_eq!(lsm2::controller_frames(44_100), 256);
+    assert_eq!(lsm2::controller_frames(88_200), 512);
 }
 
 #[test]

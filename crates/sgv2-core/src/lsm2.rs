@@ -149,19 +149,30 @@ pub const SUBSTEP_FRAMES: usize = 32;
 /// Substeps per controller frame.
 pub const SUBSTEPS: usize = CONTROLLER_FRAMES / SUBSTEP_FRAMES;
 
-/// The controller frame at `rate`: 256 frames per 48 kHz, i.e. 5.333 ms,
-/// rounded to the controller's eight-way vector cadence. Rates below 48 kHz
-/// retain the 256-frame minimum used by the native unit.
+/// The native rate-family multiplier: one at 32/44.1/48 kHz, two at
+/// 88.2/96 kHz and four at 176.4/192 kHz. Geometry is quantised by this
+/// multiplier; it is not a continuously scaled time.
+fn rate_family(rate: u32) -> usize {
+    (libm::round(rate as f64 / 48_000.0) as usize).max(1)
+}
+
+/// The controller frame at `rate`: 256 frames in the 44.1/48 kHz family and
+/// 512 in the 88.2/96 kHz family. The native controller caps there at the
+/// 176.4/192 kHz family (four 128-frame substeps); 32 kHz uses 192 frames.
 pub fn controller_frames(rate: u32) -> usize {
-    let f = libm::round(CONTROLLER_FRAMES as f64 * rate as f64 / 48_000.0 / SUBSTEPS as f64) as usize * SUBSTEPS;
-    f.max(CONTROLLER_FRAMES)
+    if rate == 32_000 {
+        192
+    } else {
+        (CONTROLLER_FRAMES * rate_family(rate)).min(2 * CONTROLLER_FRAMES)
+    }
 }
 
 /// A millisecond geometry field converted to frames and rounded to the
-/// native eight-sample vector cadence.
+/// native rate family's eight-frame vector cadence.
 fn vector_frames(ms: f32, rate: u32) -> usize {
     let f = ms as f64 * 1e-3 * rate as f64;
-    (libm::round(f / SUBSTEPS as f64) as usize * SUBSTEPS).max(SUBSTEPS)
+    let vector = SUBSTEPS * rate_family(rate);
+    (libm::round(f / vector as f64) as usize * vector).max(vector)
 }
 /// Filterbank bands.
 pub const BANDS: usize = 5;
@@ -671,7 +682,13 @@ impl Params {
 
     /// One filterbank stage in frames.
     pub fn filterbank_frames(&self) -> usize {
-        vector_frames(self.filterbank_latency_ms, self.sample_rate)
+        let f = self.filterbank_latency_ms as f64 * 1e-3 * self.sample_rate as f64;
+        let vector = 2 * SUBSTEPS * rate_family(self.sample_rate);
+        if self.sample_rate == 32_000 {
+            libm::floor(f / vector as f64) as usize * vector
+        } else {
+            libm::round(f / vector as f64) as usize * vector
+        }
     }
 
     /// The speaker-response look-ahead in frames.
@@ -2715,6 +2732,40 @@ mod fault_tests {
         assert_eq!(p.latency_frames(), 320);
         assert_eq!(p.unit_latency_frames(), 320);
         assert!(Run::new(&p).is_ok());
+    }
+
+    #[test]
+    fn eighty_eight_khz_geometry_uses_the_two_x_rate_family() {
+        let mut p = params();
+        p.sample_rate = 88_200;
+        p.filterbank_latency_ms = 10.0 / 3.0;
+        p.speaker_response_lookahead_ms = 2.0 / 3.0;
+        assert_eq!(controller_frames(p.sample_rate), 512);
+        assert_eq!(p.filterbank_frames(), 288);
+        assert_eq!(p.lookahead_frames(), 64);
+        assert_eq!(p.latency_frames(), 640);
+        assert_eq!(p.unit_latency_frames(), 1152);
+        assert!(Run::new(&p).is_ok());
+    }
+
+    #[test]
+    fn other_native_rate_families_keep_their_geometry() {
+        let mut p = params();
+        p.filterbank_latency_ms = 10.0 / 3.0;
+        p.speaker_response_lookahead_ms = 2.0 / 3.0;
+
+        p.sample_rate = 32_000;
+        assert_eq!(controller_frames(p.sample_rate), 192);
+        assert_eq!((p.filterbank_frames(), p.lookahead_frames(), p.latency_frames()), (96, 24, 216));
+        assert!(Run::new(&p).is_ok());
+
+        p.sample_rate = 176_400;
+        assert_eq!(controller_frames(p.sample_rate), 512);
+        assert_eq!((p.filterbank_frames(), p.lookahead_frames(), p.latency_frames()), (576, 128, 1280));
+
+        p.sample_rate = 192_000;
+        assert_eq!(controller_frames(p.sample_rate), 512);
+        assert_eq!((p.filterbank_frames(), p.lookahead_frames(), p.latency_frames()), (640, 128, 1408));
     }
 
     /// A non-finite state latches 20 dB until reset.
