@@ -32,7 +32,10 @@
 //! | 9 | flat gain | gain |
 //! | 11 | low shelf | RBJ low shelf |
 //! | 12 | high shelf | RBJ high shelf |
-//! | 0, 2 | band and high shelves that stay between 0 dB and their gain | left out when the gain is 0 dB or more (leaving out a boost only takes drive away); a cut is carried as a flat gain of its depth (the shelf never passes less than its gain) |
+//! | 0 | a Butterworth band shelf; four frequencies set its two edges | two Butterworth shelves and the compensating flat gain |
+//! | 2 | a Butterworth shelf; the first two frequencies set its direction, midpoint and slope | bilinear, prewarped Butterworth shelf sections |
+//! | 7 | a four-section constant tilt, from `-gain` to `+gain` around the slot frequency | four bilinear first-order shelves and a flat `-gain` |
+//! | 18 | a level-dependent high cut, at most its full-scale response | the measured full-scale two-shelf envelope (never less cut at lower levels) |
 //!
 //! | 15 | a peaking cut whose depth follows the level, at most its gain | a fixed RBJ peaking cut of its gain (cuts at least as much at every level) |
 //!
@@ -379,6 +382,141 @@ pub fn automation(stage: &Stage) -> Vec<u32> {
         .collect()
 }
 
+/// Bilinear-transform one real analog factor. Coefficients are in descending
+/// powers (`c2 s^2 + c1 s + c0`); a first-order factor has `c2 == 0`.
+fn bilinear_factor(num: [f64; 3], den: [f64; 3], k: f64) -> Section {
+    let transform = |c: [f64; 3]| {
+        if c[0] == 0.0 {
+            let c1 = c[1] / k;
+            return [c1 + c[2], -c1 + c[2], 0.0];
+        }
+        let c2 = c[0] / (k * k);
+        let c1 = c[1] / k;
+        [c2 + c1 + c[2], -2.0 * c2 + 2.0 * c[2], c2 - c1 + c[2]]
+    };
+    let b = transform(num);
+    let a = transform(den);
+    Section { b0: b[0] / a[0], b1: b[1] / a[0], b2: b[2] / a[0], a1: a[1] / a[0], a2: a[2] / a[0] }
+}
+
+/// One real factor of a high- or low-shelf cut. `a` is the pole/zero
+/// radius ratio and `q2` is the coefficient of a complex Butterworth pair;
+/// `None` selects the real first-order factor. A boost is the exact inverse.
+fn shelf_factor(high: bool, boost: bool, a: f64, q2: Option<f64>, k: f64) -> Section {
+    let (mut num, mut den) = match (high, q2) {
+        (true, Some(q)) => ([a * a, q * a, 1.0], [1.0 / (a * a), q / a, 1.0]),
+        (false, Some(q)) => ([1.0, q * a, a * a], [1.0, q / a, 1.0 / (a * a)]),
+        (true, None) => ([0.0, a, 1.0], [0.0, 1.0 / a, 1.0]),
+        (false, None) => ([0.0, 1.0, a], [0.0, 1.0, 1.0 / a]),
+    };
+    if boost {
+        std::mem::swap(&mut num, &mut den);
+    }
+    bilinear_factor(num, den, k)
+}
+
+fn integer_shelf(high: bool, order: u32, gain_db: f64, fm: f64, fs: f64) -> Vec<Section> {
+    if gain_db == 0.0 {
+        return Vec::new();
+    }
+    let boost = gain_db > 0.0;
+    let g = 10f64.powf(-gain_db.abs() / 20.0);
+    let a = g.powf(1.0 / (2.0 * order as f64));
+    let k = (PI * fm / fs).tan();
+    let mut out = Vec::new();
+    for i in 0..order / 2 {
+        let q2 = 2.0 * (PI * (2 * i + 1) as f64 / (2 * order) as f64).sin();
+        out.push(shelf_factor(high, boost, a, Some(q2), k));
+    }
+    if order % 2 != 0 {
+        out.push(shelf_factor(high, boost, a, None, k));
+    }
+    out
+}
+
+/// ToneMeister's type-2 shelf. At integer order this is the exact
+/// Butterworth shelf
+///
+/// `|H|^2 = (1 + g^2 r) / (1 + r)`, `r = x^(2N) / g`,
+///
+/// with a bilinear-prewarped `x` and midpoint `sqrt(f3*f4)`. The unit caps
+/// the order at its global maximum. Between integer orders it rounds the
+/// Butterworth factors gently; the real-factor construction below follows
+/// that measured response to within the pre-stage's 0.05 dB rig tolerance.
+fn butterworth_shelf(gain_db: f64, f3: f64, f4: f64, max_order: u32, fs: f64) -> Vec<Section> {
+    if gain_db == 0.0 || f3 == f4 {
+        return Vec::new();
+    }
+    let high = f3 > f4;
+    let fm = (f3 * f4).sqrt();
+    let octaves = (f3.max(f4) / f3.min(f4)).log2();
+    let n = (gain_db.abs() / (3.010_299_956_64 * octaves)).max(1.0).min(max_order as f64);
+    if n == 1.0 {
+        return integer_shelf(high, 1, gain_db, fm, fs);
+    }
+    if n < 2.0 {
+        // The unit's fractional first-to-second-order transition is one
+        // conjugate pair whose angle has this measured easing.
+        let f = n - 1.0;
+        let shape = n - 0.4 * f * (1.0 - f);
+        let boost = gain_db > 0.0;
+        let g = 10f64.powf(-gain_db.abs() / 20.0);
+        let a = g.powf(0.25);
+        let q2 = 2.0 * (PI / (2.0 * shape)).sin();
+        let k = (PI * fm / fs).tan();
+        return vec![shelf_factor(high, boost, a, Some(q2), k)];
+    }
+
+    // Fractional higher orders retain every complete complex pair, move
+    // its Butterworth angle by the fractional order, and finish the
+    // remaining asymptotic gain with a real factor.
+    let fraction = n.fract();
+    let easing = (0.6 - 0.04 * n).max(0.2);
+    let shape = n - easing * fraction * (1.0 - fraction);
+    let pairs = (n / 2.0).floor() as u32;
+    let boost = gain_db > 0.0;
+    let g = 10f64.powf(-gain_db.abs() / 20.0);
+    let a = g.powf(1.0 / (2.0 * shape));
+    let k = (PI * fm / fs).tan();
+    let mut out = Vec::new();
+    for i in 0..pairs {
+        let q2 = 2.0 * (PI * (2 * i + 1) as f64 / (2.0 * shape)).sin();
+        out.push(shelf_factor(high, boost, a, Some(q2), k));
+    }
+    let used = 2.0 * pairs as f64 / shape;
+    let remainder_db = gain_db * (1.0 - used);
+    if remainder_db.abs() > 1e-12 {
+        let ar = 10f64.powf(-remainder_db.abs() / 40.0);
+        out.push(shelf_factor(high, remainder_db > 0.0, ar, None, k));
+    }
+    out
+}
+
+/// ToneMeister's type-7 constant tilt. Four equal first-order shelves are
+/// spaced symmetrically in octaves around the pivot; the small gain-squared
+/// spreading is the unit's measured constant-slope law. Q and the remaining
+/// slot fields do not participate.
+fn constant_tilt(gain_db: f64, f0: f64, fs: f64) -> Vec<Section> {
+    let g2 = gain_db * gain_db;
+    let outer = 3.110 + 0.001_305 * g2;
+    let inner = 1.214 + 0.000_345 * g2;
+    let mut out = Vec::new();
+    for octaves in [-outer, -inner, inner, outer] {
+        out.extend(integer_shelf(true, 1, gain_db / 2.0, f0 * 2f64.powf(octaves), fs));
+    }
+    out
+}
+
+/// Full-scale envelope of ToneMeister's type-18 level-dependent high cut.
+/// The unit relaxes this curve as the signal falls; carrying the full-scale
+/// curve is conservative at lower levels. The small flat bias closes the
+/// measured two-shelf approximation on the safe side.
+fn dynamic_high_cut(gain_db: f64, f0: f64, fs: f64) -> (Vec<Section>, f64) {
+    let first = rbj(Rbj::HighShelf, gain_db * 1.097_73, f0 * 0.550_514, 0.466_579, fs);
+    let second = rbj(Rbj::HighShelf, gain_db * -0.097_73, f0 * 0.138_814, 2.283_76, fs);
+    (vec![first, second], -gain_db.abs() * 0.014_48)
+}
+
 /// A slot's gain and frequency at one volume.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Point {
@@ -680,6 +818,19 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics, mode: Rea
             // A peak or shelf of 0 dB at every point is the identity at
             // any frequency and quality.
             1 | 11 | 12 if points.iter().all(|pt| pt.gain == 0.0) => {}
+            7 => {
+                if automated {
+                    return Err(bad(format!("{ctx}: slot {i}: volume automation on a constant tilt")));
+                }
+                need_freq("constant tilt", f0)?;
+                if !(-30.0..=30.0).contains(&gain) {
+                    return Err(bad(format!("{ctx}: slot {i} tilt gain {gain} dB")));
+                }
+                if !(in_bypassed_group && gain > 0.0) {
+                    p.sections.extend(constant_tilt(gain, f0, fs));
+                    p.gain_db -= gain;
+                }
+            }
             // A level-dependent peaking cut: it cuts at most its gain, never
             // more than a fixed peaking cut of that gain does (measured at
             // full scale). Carried as that fixed cut; a boost is left out.
@@ -699,6 +850,23 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics, mode: Rea
                         format!("slot {i}: the level-dependent cut is carried at its full depth, {gain} dB at {f0} Hz"),
                     );
                 }
+            }
+            18 => {
+                if automated {
+                    return Err(bad(format!("{ctx}: slot {i}: volume automation on a level-dependent high cut")));
+                }
+                need_freq("level-dependent high cut", f0)?;
+                if !(-30.0..=0.0).contains(&gain) {
+                    return Err(bad(format!("{ctx}: slot {i} high-cut gain {gain} dB")));
+                }
+                let (sections, bias) = dynamic_high_cut(gain, f0, fs);
+                p.sections.extend(sections);
+                p.gain_db += bias;
+                diags.info(
+                    "prestage-dynamic-cut",
+                    ctx.clone(),
+                    format!("slot {i}: the level-dependent high cut is carried at its full-scale envelope"),
+                );
             }
             1 | 11 | 12 => {
                 for pt in &points {
@@ -731,27 +899,46 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics, mode: Rea
                     );
                 }
             }
-            // These stay between 0 dB and their gain: a boost is left out
-            // (that only takes drive away), a cut is carried as a flat cut
-            // of its depth (never more than the shelf passes).
             0 | 2 => {
-                let lo = points.iter().map(|pt| pt.gain).fold(0.0, f64::min);
-                if points.iter().any(|pt| !(-30.0..=30.0).contains(&pt.gain)) {
-                    return Err(bad(format!("{ctx}: slot {i} gain out of range: {points:?}")));
+                if automated {
+                    // Automation supplies only one frequency, not the full
+                    // two-/four-frequency shape. Preserve the established
+                    // safe envelope: the deepest automated cut is below
+                    // every shelf setting at every frequency.
+                    let lo = points.iter().map(|pt| pt.gain).fold(0.0, f64::min);
+                    p.gain_db += lo;
+                    diags.info(
+                        "prestage-volume-automation",
+                        ctx.clone(),
+                        format!("slot {i}: the volume-automated shelf is carried as a flat {lo} dB"),
+                    );
+                    continue;
                 }
-                p.gain_db += lo;
-                if lo < 0.0 || automated {
-                    diags.info(
-                        "prestage-shelf-flat",
-                        ctx.clone(),
-                        format!("slot {i}: a shelf of {gain} dB (volume-automated: {automated}) is carried as a flat {lo} dB"),
-                    );
-                } else if gain > 0.0 {
-                    diags.info(
-                        "prestage-boost-left-out",
-                        ctx.clone(),
-                        format!("slot {i}: a shelf boost of {gain} dB is left out (it would only add drive)"),
-                    );
+                if !(-30.0..=30.0).contains(&gain) {
+                    return Err(bad(format!("{ctx}: slot {i} gain {gain} dB")));
+                }
+                // A boost in a bypassed group is left out; a cut is still
+                // carried so this path cannot drive harder than either
+                // interpretation of the group bit.
+                if in_bypassed_group && gain > 0.0 {
+                    continue;
+                }
+                if kind == 2 {
+                    need_freq("Butterworth shelf", f0)?;
+                    need_freq("Butterworth shelf", q)?;
+                    p.sections.extend(butterworth_shelf(gain, f0, q, max_order, fs));
+                } else {
+                    let f5 = order;
+                    let f6 = at(6)?;
+                    for f in [f0, q, f5, f6] {
+                        need_freq("Butterworth band shelf", f)?;
+                    }
+                    // Type 0 is exactly a rising shelf over f3..f4 and a
+                    // falling shelf over f5..f6, with a compensating flat
+                    // gain so both outer asymptotes are 0 dB.
+                    p.sections.extend(butterworth_shelf(gain, q, f0, max_order, fs));
+                    p.sections.extend(butterworth_shelf(gain, f5, f6, max_order, fs));
+                    p.gain_db -= gain;
                 }
             }
             t => {
@@ -1325,13 +1512,15 @@ mod tests {
         assert_eq!((p0.sections.len(), p0.gain_db), (0, -7.0));
         let p1 = part(&st, 1, fs, &mut d).unwrap();
         assert_eq!((p1.sections.len(), p1.gain_db), (2, -7.0));
-        // a band-shelf boost is left out; its cut is carried as a flat cut
-        let boost = tmst(&[], &[(0, [3.0, 0.0, 2.0, 700.0, 800.0, 1800.0, 3.0, 0.0])]);
+        // Type-0 band shelves are carried as their two exact edges plus the
+        // flat compensation (offset 6 is supplied separately by this terse
+        // synthetic-slot helper).
+        let boost = tmst(&[(20, 3000.0)], &[(0, [3.0, 0.0, 2.0, 700.0, 800.0, 1800.0, 3.0, 0.0])]);
         let pb = part(&boost, 0, fs, &mut d).unwrap();
-        assert_eq!((pb.sections.len(), pb.gain_db), (0, 0.0));
-        let cut = tmst(&[], &[(0, [3.0, 0.0, -2.0, 700.0, 800.0, 1800.0, 3.0, 0.0])]);
+        assert_eq!((pb.sections.len(), pb.gain_db), (3, -2.0));
+        let cut = tmst(&[(20, 3000.0)], &[(0, [3.0, 0.0, -2.0, 700.0, 800.0, 1800.0, 3.0, 0.0])]);
         let pc = part(&cut, 0, fs, &mut d).unwrap();
-        assert_eq!((pc.sections.len(), pc.gain_db), (0, -2.0));
+        assert_eq!((pc.sections.len(), pc.gain_db), (3, 2.0));
         // a 0 dB peak at 0 Hz is the identity; a level-dependent cut is a fixed cut
         let flat = tmst(&[], &[(0, [3.0, 1.0, 0.0, 0.0, 0.1, 2.0, 3.0, 0.0])]);
         assert_eq!(part(&flat, 0, fs, &mut d).unwrap().sections.len(), 0);
@@ -1339,6 +1528,14 @@ mod tests {
         let pd = part(&dynamic, 0, fs, &mut d).unwrap();
         assert_eq!(pd.sections.len(), 1);
         assert!((20.0 * pd.sections[0].magnitude(200.0, fs).log10() + 9.0).abs() < 0.01);
+        let tilt = tmst(&[], &[(0, [3.0, 7.0, 12.0, 300.0, 9.0, 8.0, 3.0, 0.0])]);
+        let pt = part(&tilt, 0, fs, &mut d).unwrap();
+        assert_eq!((pt.sections.len(), pt.gain_db), (4, -12.0));
+        assert!(pt.sections.iter().all(Section::stable));
+        let high_cut = tmst(&[], &[(0, [3.0, 18.0, -4.0, 8000.0, 2.0, 3.0, 3.0, 0.0])]);
+        let ph = part(&high_cut, 0, fs, &mut d).unwrap();
+        assert_eq!(ph.sections.len(), 2);
+        assert!(ph.gain_db < 0.0 && ph.sections.iter().all(Section::stable));
         let odd = tmst(&[], &[(0, [3.0, 13.0, 0.0, 700.0, 0.7, 2.0, 3.0, 0.0])]);
         assert!(part(&odd, 0, fs, &mut d).is_err());
         // a running slot in a bypassed group is carried only as a cut
@@ -1655,5 +1852,22 @@ mod tests {
         assert!((mag(rbj(Rbj::LowShelf, 12.0, 300.0, 0.707, fs), 5.0) - 12.0).abs() < 0.01);
         assert!(mag(rbj(Rbj::LowShelf, 12.0, 300.0, 0.707, fs), 20_000.0).abs() < 0.01);
         assert!((mag(rbj(Rbj::HighShelf, -4.0, 3000.0, 0.707, fs), 23_000.0) + 4.0).abs() < 0.05);
+    }
+
+    #[test]
+    fn butterworth_shelf_has_the_requested_asymptotes_and_midpoint() {
+        let fs = 48_000.0;
+        for gain in [-6.0, 6.0] {
+            for (f3, f4, low, high) in [(8000.0, 2000.0, 0.0, gain), (2000.0, 8000.0, gain, 0.0)] {
+                let sections = butterworth_shelf(gain, f3, f4, MAX_ORDER, fs);
+                let mut ch = Channel::IDENTITY;
+                ch.count = sections.len();
+                ch.sections[..sections.len()].copy_from_slice(&sections);
+                let db = |f| 20.0 * ch.magnitude(f, fs).log10();
+                assert!((db(1.0) - low).abs() < 0.01, "gain {gain}, {f3}/{f4}: low {}", db(1.0));
+                assert!((db(23_900.0) - high).abs() < 0.01, "gain {gain}, {f3}/{f4}: high {}", db(23_900.0));
+                assert!((db(4000.0) - gain / 2.0).abs() < 0.01, "gain {gain}, {f3}/{f4}: mid {}", db(4000.0));
+            }
+        }
     }
 }
