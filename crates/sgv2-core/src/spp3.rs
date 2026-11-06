@@ -595,7 +595,7 @@ const PDRV_WITH_HEADROOM: bool = false;
 /// the base until the window resistance matched the goldens; with rig laws
 /// 3 and (a) T_CL is bit-exact (5e-7 C) on the CL edge set, and
 /// cl-thermal_ramp_1k tracks macOS to 0.08 C / 0.001 dB.
-const CL_RELAXATION: bool = true;
+const CL_RELAXATION: bool = false;
 /// `Pcoil` is the power of the unit's output samples, generated pilot
 /// included (rig law 2, against spec 4's text; to 3e-7 relative).
 const PCOIL_WITH_PILOT: bool = true;
