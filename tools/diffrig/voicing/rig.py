@@ -93,6 +93,100 @@ def tone_db(y, f, a, b):
     return 20 * math.log10(max(amp, 1e-12))
 
 
+def read_wav(path, start_s=0.0, dur_s=None):
+    """A WAV file (PCM 16/24/32-bit or IEEE float) as float frames x channels."""
+    import struct
+    raw = open(path, "rb").read()
+    if raw[:4] != b"RIFF" or raw[8:12] != b"WAVE":
+        raise SystemExit(f"{path}: not a WAV file")
+    pos, fmt, data = 12, None, None
+    while pos + 8 <= len(raw):
+        cid, size = raw[pos:pos + 4], struct.unpack("<I", raw[pos + 4:pos + 8])[0]
+        body = raw[pos + 8:pos + 8 + size]
+        if cid == b"fmt ":
+            fmt = struct.unpack("<HHIIHH", body[:16])
+        elif cid == b"data":
+            data = body
+        pos += 8 + size + (size & 1)
+    tag, ch, rate, _, _, bits = fmt
+    if rate != FS:
+        raise SystemExit(f"{path}: {rate} Hz (the rig runs at {FS})")
+    if tag == 3:
+        x = np.frombuffer(data, "<f4" if bits == 32 else "<f8").astype(np.float64)
+    elif bits == 16:
+        x = np.frombuffer(data, "<i2") / 32768.0
+    elif bits == 24:
+        b = np.frombuffer(data, np.uint8).reshape(-1, 3).astype(np.int32)
+        v = b[:, 0] | (b[:, 1] << 8) | (b[:, 2] << 16)
+        x = np.where(v >= 1 << 23, v - (1 << 24), v) / float(1 << 23)
+    elif bits == 32:
+        x = np.frombuffer(data, "<i4") / float(1 << 31)
+    else:
+        raise SystemExit(f"{path}: {bits}-bit format {tag}")
+    x = x[: len(x) // ch * ch].reshape(-1, ch)
+    a = int(start_s * FS)
+    b = len(x) if dur_s is None else a + int(dur_s * FS)
+    return x[a:b]
+
+
+def pink(seconds, seed=7):
+    """Pink noise (1/f power), stereo, independent channels, unit RMS."""
+    n = int(seconds * FS)
+    rng = np.random.default_rng(seed)
+    out = []
+    for _ in range(2):
+        spec = np.fft.rfft(rng.standard_normal(n))
+        f = np.fft.rfftfreq(n, 1 / FS)
+        spec[1:] /= np.sqrt(f[1:])
+        spec[0] = 0
+        v = np.fft.irfft(spec, n)
+        out.append(v / np.sqrt(np.mean(v ** 2)))
+    return np.stack(out, 1)
+
+
+def band_levels(y, bands):
+    """Energy (dB) of y in each 1/3-octave band, from its spectrum."""
+    Y = np.abs(np.fft.rfft(y.astype(np.float64))) ** 2
+    f = np.fft.rfftfreq(len(y), 1 / FS)
+    out = []
+    for c in bands:
+        lo, hi = c * 2 ** (-1 / 6), c * 2 ** (1 / 6)
+        e = Y[(f >= lo) & (f < hi)].sum()
+        out.append(10 * math.log10(max(e, 1e-30)))
+    return out
+
+
+def window_levels(y, win_s=0.05):
+    """RMS level (dB) of y in consecutive windows."""
+    w = int(win_s * FS)
+    n = len(y) // w
+    if n == 0:
+        return np.array([])
+    r = np.sqrt(np.mean(y[: n * w].astype(np.float64).reshape(n, w) ** 2, 1))
+    return 20 * np.log10(np.maximum(r, 1e-12))
+
+
+def program_rows(name, mac, v2, lanes_n, bands):
+    """Per lane: band energy excess and the worst 50 ms window excess
+    (windows where macOS is within 60 dB of its loudest)."""
+    rows = []
+    for ln in range(lanes_n):
+        m, v = band_levels(mac[:, ln], bands), band_levels(v2[:, ln], bands)
+        top = max(m)
+        for f, a, b in zip(bands, m, v):
+            if a > top - 60:
+                rows.append({"program": name, "lane": ln, "hz": f, "macos_db": round(a, 3), "v2_db": round(b, 3),
+                             "excess_db": round(b - a, 3)})
+        wm, wv = window_levels(mac[:, ln]), window_levels(v2[:, ln])
+        k = min(len(wm), len(wv))
+        if k:
+            keep = wm[:k] > wm[:k].max() - 60
+            ex = (wv[:k] - wm[:k])[keep]
+            rows.append({"program": name, "lane": ln, "hz": "50ms-window", "macos_db": round(float(wm[:k].max()), 3),
+                         "v2_db": round(float(wv[:k].max()), 3), "excess_db": round(float(ex.max()), 3)})
+    return rows
+
+
 def law_from(spec):
     if spec.startswith("linear-db:"):
         r = float(spec.split(":", 1)[1])
@@ -207,6 +301,8 @@ def one(job):
                "volumes": []}
         if a["check_plan"] and not a.get("box"):
             res["plan_check"] = check_plan(plan, strip, propstrip, work, a["host"])
+        prog_rows = []
+        res["programs"] = prog_rows
         for s in a["volumes"]:
             mvol = law(s)
             mac, _ = macos_chain(plan, strip, propstrip, x, s, mvol, work, a["host"])
@@ -217,6 +313,12 @@ def one(job):
                     m, v = tone_db(mac[:, ln], f, i0, i1), tone_db(v2[:, ln], f, i0, i1)
                     rows.append({"level": L, "hz": f, "lane": ln, "macos_db": round(m, 3),
                                  "v2_db": round(v, 3), "excess_db": round(v - m, 3)})
+            for pname, px in a.get("programs_data", []):
+                if px.shape[1] != plan["program_channels"]:
+                    px = np.tile(px[:, :1], (1, plan["program_channels"]))
+                mp, _ = macos_chain(plan, strip, propstrip, px.astype(np.float32), s, mvol, work, a["host"])
+                vp = v2_chain(a["render"], src_args + extra, px, s, mvol, work).reshape(-1, lanes_n)
+                prog_rows.extend(dict(r, scalar=s) for r in program_rows(pname, mp, vp, lanes_n, bands))
             res["volumes"].append({"scalar": s, "mvol_db": round(mvol, 3), "rows": rows,
                                    "macos_peak": float(np.max(np.abs(mac))),
                                    "v2_peak": float(np.max(np.abs(v2)))})
@@ -313,6 +415,22 @@ def summarise(results, tol, law_name, out_md):
                 lines.append(f"| {v['scalar']} | {v['mvol_db']} | {L} | {w['excess_db']:+.2f} "
                              f"(L{w['lane']} @ {w['hz']}) | {len({x['hz'] for x in above})} "
                              f"| {sorted({x['lane'] for x in above})} | {ad:.3f} |")
+        if r.get("programs"):
+            lines.append("")
+            lines.append("| program | volume | worst band excess dB (lane @ Hz) | bands above | worst 50 ms window excess dB (lane) |")
+            lines.append("|---|---|---|---|---|")
+            keys = sorted({(x["program"], x["scalar"]) for x in r["programs"]}, key=lambda k: (k[0], -k[1]))
+            for pn, sc in keys:
+                rows = [x for x in r["programs"] if x["program"] == pn and x["scalar"] == sc]
+                bandr = [x for x in rows if x["hz"] != "50ms-window"]
+                winr = [x for x in rows if x["hz"] == "50ms-window"]
+                wb = max(bandr, key=lambda x: x["excess_db"])
+                ww = max(winr, key=lambda x: x["excess_db"]) if winr else None
+                above = [x for x in bandr if x["excess_db"] > tol] + [x for x in winr if x["excess_db"] > tol]
+                flagged += len(above)
+                lines.append(f"| {pn} | {sc} | {wb['excess_db']:+.2f} (L{wb['lane']} @ {wb['hz']}) "
+                             f"| {len({(x['lane'], x['hz']) for x in bandr if x['excess_db'] > tol})} "
+                             f"| {ww['excess_db']:+.2f} (L{ww['lane']}) |" if ww else "| |")
         lines.append("")
     lines.insert(4, f"FLAGGED (v2 above macOS beyond tolerance, or errors): {flagged}")
     lines.insert(5, "")
@@ -340,6 +458,20 @@ def self_test():
         n = summarise(res, 0.1, "linear-db:60", os.path.join(d, "r.md"))
         txt = open(os.path.join(d, "r.md")).read()
     assert n == 2 and "+0.50 (L0 @ 100.0)" in txt and "ERROR: refused" in txt, txt
+    p = pink(1.0)
+    lv = band_levels(p[:, 0], [125.0, 1000.0, 8000.0])
+    assert max(lv) - min(lv) < 1.5, lv  # pink: equal energy per 1/3 octave
+    y = np.stack([p[:, 0], p[:, 0]], 1)
+    rows = program_rows("p", y, y * np.float32(10 ** (0.5 / 20)), 2, [125.0, 1000.0])
+    assert all(abs(r["excess_db"] - 0.5) < 1e-3 for r in rows), rows
+    with tempfile.TemporaryDirectory() as d:
+        import wave
+        w = wave.open(os.path.join(d, "t.wav"), "wb")
+        w.setnchannels(2), w.setsampwidth(2), w.setframerate(FS)
+        w.writeframes((np.stack([np.arange(100), -np.arange(100)], 1) * 100).astype("<i2").tobytes())
+        w.close()
+        x = read_wav(os.path.join(d, "t.wav"))
+        assert x.shape == (100, 2) and abs(x[10, 1] + 1000 / 32768) < 1e-9
     print("rig self-test ok")
 
 
@@ -362,6 +494,10 @@ def main():
     ap.add_argument("--jobs", type=int, default=6)
     ap.add_argument("--check-plan", action="store_true")
     ap.add_argument("--box", default=None, help="per-box gate: this box alone, same input, both sides")
+    ap.add_argument("--music", action="append", default=[],
+                    help="NAME=FILE.wav[@START:SECONDS[:GAIN_DB]] program item (repeat); per-band energy and 50 ms windows")
+    ap.add_argument("--pink", type=float, default=0.0, help="also a pink-noise program of this many seconds")
+    ap.add_argument("--pink-levels", default="-20,-6", help="pink-noise RMS levels, dBFS")
     ap.add_argument("--out", required=True, help="private output directory (Apple-derived results)")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
@@ -373,7 +509,7 @@ def main():
     os.makedirs(tmp, exist_ok=True)
     common = {"host": host, "render": a.render, "volumes": [float(v) for v in a.volumes.split(",")],
               "law": a.law, "levels": [float(v) for v in a.levels.split(",")], "seg": a.seg, "gap": a.gap,
-              "check_plan": a.check_plan, "tmp": tmp, "box": a.box}
+              "check_plan": a.check_plan, "tmp": tmp, "box": a.box, "programs_data": programs_from(a)}
     jobs = []
     aids = [x for x in a.aids.split(",") if x]
     if not aids and not a.bundle:
@@ -394,6 +530,27 @@ def main():
     flagged = summarise(results, a.tol, a.law, os.path.join(a.out, "report.md"))
     print(open(os.path.join(a.out, "report.md")).read())
     sys.exit(1 if flagged else 0)
+
+
+def programs_from(a):
+    out = []
+    for m in a.music:
+        name, rest = m.split("=", 1)
+        path, start, dur, gain = rest, 0.0, None, 0.0
+        if "@" in rest:
+            path, span = rest.rsplit("@", 1)
+            parts = span.split(":")
+            start, dur = float(parts[0]), float(parts[1])
+            gain = float(parts[2]) if len(parts) > 2 else 0.0
+        x = read_wav(path, start, dur) * 10 ** (gain / 20)
+        if x.shape[1] == 1:
+            x = np.tile(x, (1, 2))
+        out.append((name, x[:, :2].astype(np.float32)))
+    if a.pink > 0:
+        p = pink(a.pink)
+        for L in [float(v) for v in a.pink_levels.split(",")]:
+            out.append((f"pink{L:+g}", (p * 10 ** (L / 20)).astype(np.float32)))
+    return out
 
 
 def spp3(aid_dir):
