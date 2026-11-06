@@ -150,6 +150,11 @@ fn compile_node(
                 Ok(None) => Kind::Bypass,
                 Err(e) => uncarried(n, subtype, e, gaps),
             },
+            "vben" => match super::vbass::compile(stage, fs, diags) {
+                Ok(Some(p)) => Kind::Vbass(Box::new(p)),
+                Ok(None) => Kind::Bypass,
+                Err(e) => uncarried(n, subtype, e, gaps),
+            },
             "axtc" => match super::xtc::compile(stage, fs, diags) {
                 Ok(Some(p)) => Kind::Xtc(Box::new(p)),
                 Ok(None) => Kind::Bypass,
