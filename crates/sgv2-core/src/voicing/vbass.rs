@@ -1,28 +1,35 @@
 //! Virtual bass (`aufx/vben`): a mid/side bass box.
 //!
-//! Behaviour (clean-room, from the box's observed input/output only):
+//! Behaviour (clean-room, from the box's behaviour specification):
 //!
 //! ```text
 //!  per channel c:  hp_c  = AP_u(AP_l(HP(x_c)))
 //!  mid M = (L+R)/2: lo    = LP(M)
-//!                   low   = blend * AP_u(AP_l(lo))
-//!                   harm  = gain  * BP(nld(drive(lo)))
-//!  y_c = out_gain * (hp_c + low + harm), one frame late
+//!                   low   = s_b * blend * AP_u(AP_l(lo))
+//!                   harm  = s_h * gain * LP_u(LC(nld, HP_l, lo))
+//!                   mid   = SUB(delay(low + harm))
+//!  y_c = out_gain * (hp_c + mid), `latency` frames late
 //! ```
 //!
-//! - `HP`/`LP` are a Linkwitz-Riley pair at the crossover `fc` (each a
-//!   Butterworth of half the order, squared). `AP_u` and `AP_l` are the
-//!   all-pass sections of the upper (`fu`) and lower (`fc`) band edges of
-//!   the harmonic band, so every path has the same phase as the high pass.
-//! - `BP` is the harmonic band: Linkwitz-Riley high pass at `fc` (lower
-//!   order) times Linkwitz-Riley low pass at `fu` (upper order).
-//! - `nld` is the memoryless odd device of the saved type; `drive` is the
-//!   level control (unity when the level control is off).
+//! - `HP`/`LP` are a Linkwitz-Riley pair at the crossover `fc`; `AP_u` and
+//!   `AP_l` are the all-pass sections of the harmonic band's upper (`fu`)
+//!   and lower (`fc`) edges; `HP_l`/`LP_u` are that band's Linkwitz-Riley
+//!   edges. Order parameters round to the nearest integer, then up to even.
+//! - `s_b` inverts the blend for an odd-order crossover; `s_h` inverts the
+//!   harmonics when the crossover and the lower band edge have Butterworth
+//!   orders of the same parity.
+//! - `nld` is the odd saturating device of the saved type. `LC` is the
+//!   level control: off, it is `HP_l(nld(lo))`; on, the device input is
+//!   normalised by a peak follower and its band-limited output rescaled by
+//!   a second one (see [`law`]).
+//! - `SUB` band-limits the mid branches (a low pass designed at a quarter
+//!   of the rate); each odd-order band-edge all-pass adds one frame of
+//!   output latency and a further branch delay.
 //! - The side signal only ever takes the high-pass path: stereo width is
 //!   untouched, and the bass is folded to the mid.
 //!
 //! No tuning value lives here: corners, orders and gains come in [`Params`]
-//! from the Mac's own saved state.
+//! from the Mac's own saved state; [`law`] holds the box's own constants.
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -217,23 +224,24 @@ impl Device {
 }
 
 /// The box's own laws: the same on every Mac, never from a tuning.
-mod law {
+pub mod law {
     /// Type 3 device: `-AMP * tanh(SLOPE * u)`.
-    pub const DEVICE3_AMP: f64 = 3.79488;
-    pub const DEVICE3_SLOPE: f64 = 0.79967;
-    /// Level control. The device input is normalised to a unit peak with
-    /// at most `LC_MAX_DRIVE` of gain; its output is scaled by
-    /// `LC_MAX_DRIVE` times the input's peak envelope and limited so that
-    /// the band-limited harmonics never peak above that envelope.
-    pub const LC_MAX_DRIVE: f64 = 20.0;
-    /// Drive detector: instant attack, hold, then a fixed release in dB/s.
-    pub const LC_DRIVE_HOLD_S: f64 = 0.95;
-    pub const LC_DRIVE_RELEASE_DB_S: f64 = 11.6;
-    /// Envelope and limiter detectors: instant attack, hold, then a release
-    /// in dB/s eased in with a one-pole of `LC_EASE_S`.
-    pub const LC_ENV_HOLD_S: f64 = 0.55;
-    pub const LC_ENV_RELEASE_DB_S: f64 = 10.8;
-    pub const LC_EASE_S: f64 = 0.25;
+    pub const DEVICE3_AMP: f64 = 3.8;
+    pub const DEVICE3_SLOPE: f64 = 0.8;
+    /// Level control: one peak follower on the device input sets the
+    /// drive `1 / max(peak, LC_FLOOR)` (input clipped to `LC_CLIP`); a
+    /// second one on the band-limited device output rescales it by
+    /// `peak_in / max(peak_out, LC_FLOOR)`.
+    pub const LC_FLOOR: f64 = 0.05;
+    pub const LC_CLIP: f64 = 1.2;
+    /// Follower: attack and release one-poles, a hold that restarts while
+    /// the input stays within `LC_HOLD_RATIO` of the level, and a smoothing
+    /// one-pole that follows a rising level at the attack rate.
+    pub const LC_ATTACK_S: f64 = 50e-6;
+    pub const LC_RELEASE_S: f64 = 0.5;
+    pub const LC_HOLD_S: f64 = 0.5;
+    pub const LC_HOLD_RATIO: f64 = 0.9;
+    pub const LC_SMOOTH_S: f64 = 0.5;
     /// The mid branches are band-limited by a Chebyshev type I low pass
     /// working at a quarter-rate design.
     pub const SUB_RATE_HZ: f64 = 12_000.0;
@@ -332,62 +340,62 @@ impl Params {
     }
 }
 
-/// Peak follower: instant attack; after a hold, the level falls at a fixed
-/// rate in dB, eased in by a one-pole on the rate.
+/// Peak follower of the level control.
 #[derive(Clone, Copy, Debug)]
-struct Peak {
-    v: f64,
+struct Follower {
+    e: f64,
+    s: f64,
     held: usize,
     hold: usize,
-    fall: f64,
-    rate: f64,
-    ease: f64,
+    a_att: f64,
+    a_rel: f64,
+    a_smo: f64,
 }
 
-impl Peak {
-    fn new(fs: f64, hold_s: f64, release_db_s: f64, ease_s: f64) -> Peak {
-        Peak {
-            v: 0.0,
+impl Follower {
+    fn new(fs: f64) -> Follower {
+        let pole = |t: f64| libm::exp(-1.0 / (t * fs));
+        Follower {
+            e: 0.0,
+            s: 0.0,
             held: 0,
-            hold: (hold_s * fs) as usize,
-            // per-sample log-gain of the full release rate
-            fall: release_db_s / (20.0 * fs) * core::f64::consts::LN_10,
-            rate: 0.0,
-            ease: if ease_s > 0.0 { 1.0 - libm::exp(-1.0 / (ease_s * fs)) } else { 1.0 },
+            hold: (law::LC_HOLD_S * fs) as usize + 1,
+            a_att: pole(law::LC_ATTACK_S),
+            a_rel: pole(law::LC_RELEASE_S),
+            a_smo: pole(law::LC_SMOOTH_S),
         }
     }
     #[inline]
     fn run(&mut self, x: f64) -> f64 {
-        let a = libm::fabs(x);
-        if a >= self.v {
-            self.v = a;
+        let u = libm::fabs(x);
+        let (a, b) = if u > self.e {
             self.held = 0;
-            self.rate = 0.0;
+            (self.a_att, if self.e > self.s { self.a_att } else { self.a_smo })
         } else if self.held < self.hold {
             self.held += 1;
+            if u >= law::LC_HOLD_RATIO * self.e {
+                self.held = 0;
+            }
+            (1.0, self.a_smo)
         } else {
-            self.rate += (self.fall - self.rate) * self.ease;
-            self.v = (self.v * libm::exp(-self.rate)).max(a);
-        }
-        self.v
+            (self.a_rel, self.a_smo)
+        };
+        self.e = a * self.e + (1.0 - a) * u;
+        self.s = b * self.s + (1.0 - b) * self.e;
+        self.s
     }
 }
 
 /// Level control state (only used when the saved state switches it on).
 #[derive(Clone, Copy, Debug)]
 struct LevelControl {
-    drive: Peak,
-    env: Peak,
-    harm: Peak,
+    input: Follower,
+    output: Follower,
 }
 
 impl LevelControl {
     fn new(fs: f64) -> LevelControl {
-        LevelControl {
-            drive: Peak::new(fs, law::LC_DRIVE_HOLD_S, law::LC_DRIVE_RELEASE_DB_S, 0.0),
-            env: Peak::new(fs, law::LC_ENV_HOLD_S, law::LC_ENV_RELEASE_DB_S, law::LC_EASE_S),
-            harm: Peak::new(fs, law::LC_ENV_HOLD_S, law::LC_ENV_RELEASE_DB_S, law::LC_EASE_S),
-        }
+        LevelControl { input: Follower::new(fs), output: Follower::new(fs) }
     }
 }
 
@@ -400,13 +408,22 @@ pub struct Run {
     hp_st: Vec<CascadeState>,
     lp: Cascade,
     lp_st: CascadeState,
-    /// The low pass of an odd-order crossover is taken inverted, so that
-    /// low pass and high pass still sum to an all-pass.
+    /// The low-end blend of an odd-order crossover is taken inverted, so
+    /// that low pass and high pass still sum to an all-pass (the harmonic
+    /// branch is not).
     lp_sign: f64,
+    /// The harmonic branch is inverted when the crossover and the band's
+    /// lower edge are both of even or both of odd Butterworth order.
+    harm_sign: f64,
     ap: Cascade,
     ap_st: CascadeState,
-    band: Cascade,
-    band_st: CascadeState,
+    /// Harmonic band: the lower edge's high pass with the first half of the
+    /// upper edge's low pass, then the second half (the level control's
+    /// limiter looks between the two).
+    band_hp: Cascade,
+    band_hp_st: CascadeState,
+    band_lp: Cascade,
+    band_lp_st: CascadeState,
     sub: Cascade,
     sub_st: StridedState,
     stride: usize,
@@ -433,8 +450,11 @@ impl Run {
         let mut hp = linkwitz_riley(p.hp_order, p.fc_hz, fs, Kind::High);
         hp.extend(&ap);
         let lp = linkwitz_riley(p.hp_order, p.fc_hz, fs, Kind::Low);
-        let mut band = linkwitz_riley(p.lower_order, p.fc_hz, fs, Kind::High);
-        band.extend(&linkwitz_riley(p.upper_order, p.fu_hz, fs, Kind::Low));
+        // the upper edge's Linkwitz-Riley low pass is two Butterworths: the
+        // limiter's detector sits between them
+        let mut band_hp = linkwitz_riley(p.lower_order, p.fc_hz, fs, Kind::High);
+        band_hp.extend(&butterworth(p.upper_order / 2, p.fu_hz, fs, Kind::Low));
+        let band_lp = butterworth(p.upper_order / 2, p.fu_hz, fs, Kind::Low);
         let stride = sub_stride(fs).unwrap_or(1);
         let sub = chebyshev1(law::SUB_LP_ORDER, law::SUB_LP_RIPPLE_DB, law::SUB_LP_EDGE_HZ, fs / stride as f64);
         let latency = nu % 2 + nl % 2;
@@ -457,10 +477,13 @@ impl Run {
             lp,
             lp_st: CascadeState::default(),
             lp_sign: if (p.hp_order / 2) % 2 == 1 { -1.0 } else { 1.0 },
+            harm_sign: if (p.hp_order / 2) % 2 == nl % 2 { -1.0 } else { 1.0 },
             ap,
             ap_st: CascadeState::default(),
-            band,
-            band_st: CascadeState::default(),
+            band_hp,
+            band_hp_st: CascadeState::default(),
+            band_lp,
+            band_lp_st: CascadeState::default(),
             sub,
             sub_st: StridedState::default(),
             stride,
@@ -483,7 +506,8 @@ impl Run {
         }
         self.lp_st = CascadeState::default();
         self.ap_st = CascadeState::default();
-        self.band_st = CascadeState::default();
+        self.band_hp_st = CascadeState::default();
+        self.band_lp_st = CascadeState::default();
         self.sub_st = StridedState::default();
         self.bline = [0.0; BRANCH_LINE];
         self.frac_x = 0.0;
@@ -542,22 +566,22 @@ impl Run {
                 mid += if v.is_finite() { v * ig } else { 0.0 };
             }
             mid /= ch as f64;
-            let lo = self.lp_sign * self.lp.run(&mut self.lp_st, mid);
-            let low = self.p.blend_gain * self.ap.run(&mut self.ap_st, lo);
+            let lo = self.lp.run(&mut self.lp_st, mid);
+            let low = self.lp_sign * self.p.blend_gain * self.ap.run(&mut self.ap_st, lo);
             let harm = if self.p.level_control {
-                let pk = self.lc.drive.run(lo);
-                let drive = if pk * law::LC_MAX_DRIVE > 1.0 { 1.0 / pk } else { law::LC_MAX_DRIVE };
-                let env = self.lc.env.run(lo);
-                let dev = self.device(drive * lo);
-                let raw = self.band.run(&mut self.band_st, law::LC_MAX_DRIVE * env * dev);
-                let ph = self.lc.harm.run(raw);
-                let g = if ph > env { env / ph } else { 1.0 };
-                self.p.harmonic_gain * g * raw
+                let p_in = self.lc.input.run(lo);
+                let z = (lo / p_in.max(law::LC_FLOOR)).clamp(-law::LC_CLIP, law::LC_CLIP);
+                let dev = self.device(z);
+                let hp = self.band_hp.run(&mut self.band_hp_st, dev);
+                let p_out = self.lc.output.run(hp);
+                let y = hp * p_in / p_out.max(law::LC_FLOOR);
+                self.p.harmonic_gain * self.band_lp.run(&mut self.band_lp_st, y)
             } else {
                 let dev = self.device(lo);
-                self.p.harmonic_gain * self.band.run(&mut self.band_st, dev)
+                let hp = self.band_hp.run(&mut self.band_hp_st, dev);
+                self.p.harmonic_gain * self.band_lp.run(&mut self.band_lp_st, hp)
             };
-            let delayed = self.branch_delay(low + harm);
+            let delayed = self.branch_delay(low + self.harm_sign * harm);
             let common = run_strided(&self.sub, self.stride, &mut self.sub_st, delayed);
             let (l, pos) = (self.latency, self.opos);
             for (c, b) in bufs[..ch].iter_mut().enumerate() {
@@ -672,5 +696,44 @@ mod tests {
         let mut rr = [f32::INFINITY; 64];
         r.process(&mut [&mut l, &mut rr], 64);
         assert!(l.iter().chain(rr.iter()).all(|v| *v == 0.0));
+    }
+
+    #[test]
+    fn level_control_normalises_and_tracks_the_input() {
+        // Steady 40 Hz on the mid: the harmonic output follows the input
+        // level 1:1 above the follower floor (same harmonic structure at
+        // -20 and -10 dBFS), and stays finite and bounded.
+        let level = |a: f64| {
+            let mut p = params(true);
+            p.blend_gain = 0.0;
+            let mut r = Run::new(&p, 48_000.0, 2);
+            let n = 4 * 48_000;
+            let mut l = tone(40.0, a, n);
+            let mut rr = l.clone();
+            r.process(&mut [&mut l, &mut rr], n);
+            assert!(l.iter().all(|v| v.is_finite() && v.abs() < 4.0));
+            amp(&l[3 * 48_000..], 120.0)
+        };
+        let (lo, hi) = (level(0.1), level(0.316_227_766));
+        let step = 20.0 * libm::log10(hi / lo);
+        assert!((step - 10.0).abs() < 0.2, "{step}");
+    }
+
+    #[test]
+    fn level_control_holds_then_releases() {
+        let mut f = Follower::new(48_000.0);
+        for _ in 0..4_800 {
+            f.run(1.0);
+        }
+        let top = f.run(0.0);
+        // hold: no fall for most of the hold time
+        for _ in 0..20_000 {
+            f.run(0.0);
+        }
+        assert!(f.run(0.0) > 0.95 * top);
+        for _ in 0..96_000 {
+            f.run(0.0);
+        }
+        assert!(f.run(0.0) < 0.2 * top);
     }
 }
