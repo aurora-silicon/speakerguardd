@@ -623,7 +623,9 @@ pub struct PreStage {
     params: Params,
     state: [[[f64; 2]; MAX_SECTIONS]; MAX_CHANNELS],
     dynamics: Option<DynRun>,
-    boxes: [Option<mstk::Run>; MAX_BOXES],
+    /// Each box's run state (filters and detectors for every channel) is
+    /// allocated once here, never in the real-time path.
+    boxes: [Option<alloc::boxed::Box<mstk::Run>>; MAX_BOXES],
 }
 
 impl PreStage {
@@ -637,7 +639,8 @@ impl PreStage {
     pub fn with_rate(params: Params, fs: f64) -> PreStage {
         let dynamics = params.dynamics.as_ref().map(|d| DynRun::new(d, fs));
         let boxes = core::array::from_fn(|k| {
-            (k < params.box_count.min(MAX_BOXES)).then(|| mstk::Run::new(&params.boxes[k].params, fs, params.channels))
+            (k < params.box_count.min(MAX_BOXES))
+                .then(|| alloc::boxed::Box::new(mstk::Run::new(&params.boxes[k].params, fs, params.channels)))
         });
         PreStage { params, state: [[[0.0; 2]; MAX_SECTIONS]; MAX_CHANNELS], dynamics, boxes }
     }

@@ -54,7 +54,7 @@ in in
 in sense
 out out
 box Guard nfnp 1 1
-box Eq (aufx tst1) 1 1
+box Eq (aufx vrq2) 1 1
 box Spl split 1 2
 box Up join 4 1
 box Mid split 1 4
@@ -151,7 +151,7 @@ pub fn strip_with_state(unit: &str, state: &ParamState) -> Vec<u8> {
         Value::Array(vec![dict(vec![(
             "effects",
             Value::Array(vec![
-                effect("Eq", "tst1", preset("tst1", "eq_test", &eq)),
+                effect("Eq", "vrq2", preset("vrq2", "eq_test", &eq)),
                 builtin_effect,
                 effect("Prot", unit, preset(unit, "prot_test", state)),
             ]),
