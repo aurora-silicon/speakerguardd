@@ -166,6 +166,15 @@ def window_levels(y, win_s=0.05):
     return 20 * np.log10(np.maximum(r, 1e-12))
 
 
+def best_lag(a, b, max_lag=4096):
+    """The shift (frames) of b that best matches a: b[n + lag] ~ a[n]."""
+    n = 1 << int(math.ceil(math.log2(len(a) + len(b))))
+    c = np.fft.irfft(np.conj(np.fft.rfft(a.astype(np.float64), n)) * np.fft.rfft(b.astype(np.float64), n), n)
+    cand = np.concatenate([c[: max_lag + 1], c[-max_lag:]])
+    i = int(np.argmax(np.abs(cand)))
+    return i if i <= max_lag else i - len(cand)
+
+
 def program_rows(name, mac, v2, lanes_n, bands):
     """Per lane: band energy excess and the worst 50 ms window excess
     (windows where macOS is within 60 dB of its loudest)."""
@@ -177,7 +186,15 @@ def program_rows(name, mac, v2, lanes_n, bands):
             if a > top - 60:
                 rows.append({"program": name, "lane": ln, "hz": f, "macos_db": round(a, 3), "v2_db": round(b, 3),
                              "excess_db": round(b - a, 3)})
-        wm, wv = window_levels(mac[:, ln]), window_levels(v2[:, ln])
+        # the chains may differ in latency (a stubbed box reports none):
+        # align v2 to macOS before comparing windows
+        lag = best_lag(mac[:, ln], v2[:, ln])
+        a, b = mac[:, ln], v2[:, ln]
+        if lag > 0:
+            a, b = a[: len(a) - lag], b[lag:]
+        elif lag < 0:
+            a, b = a[-lag:], b[: len(b) + lag]
+        wm, wv = window_levels(a), window_levels(b)
         k = min(len(wm), len(wv))
         if k:
             keep = wm[:k] > wm[:k].max() - 60
@@ -464,6 +481,10 @@ def self_test():
     y = np.stack([p[:, 0], p[:, 0]], 1)
     rows = program_rows("p", y, y * np.float32(10 ** (0.5 / 20)), 2, [125.0, 1000.0])
     assert all(abs(r["excess_db"] - 0.5) < 1e-3 for r in rows), rows
+    d = np.concatenate([np.zeros((256, 2), np.float32), y[:-256]])
+    assert best_lag(y[:, 0], d[:, 0]) == 256
+    rows = program_rows("p", y, d, 2, [125.0, 1000.0])
+    assert all(abs(r["excess_db"]) < 0.05 for r in rows if r["hz"] == "50ms-window"), rows
     with tempfile.TemporaryDirectory() as d:
         import wave
         w = wave.open(os.path.join(d, "t.wav"), "wb")
