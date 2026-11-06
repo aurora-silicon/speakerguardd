@@ -535,9 +535,10 @@ impl Chain {
         spec.check().ok()?;
         if !fs.is_finite()
             || fs <= 0.0
-            || spec.nodes.iter().any(|node| {
-                matches!(&node.kind, Kind::Tone(tone) if tone.dynamic.iter().any(|d| !d.params.valid(fs)))
-            })
+            || spec
+                .nodes
+                .iter()
+                .any(|node| matches!(&node.kind, Kind::Tone(tone) if tone.dynamic.iter().any(|d| !d.params.valid(fs))))
         {
             return None;
         }
@@ -812,8 +813,7 @@ mod tests {
             let mut lanes = [&mut output[at..end]];
             chain.process(&[&input[at..end]], &mut lanes, end - at);
         }
-        let power = output[n / 2..].iter().map(|v| f64::from(*v) * f64::from(*v)).sum::<f64>()
-            / (n / 2) as f64;
+        let power = output[n / 2..].iter().map(|v| f64::from(*v) * f64::from(*v)).sum::<f64>() / (n / 2) as f64;
         20.0 * libm::log10(libm::sqrt(2.0 * power) / amplitude)
     }
 
