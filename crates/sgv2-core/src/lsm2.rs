@@ -132,8 +132,8 @@ use alloc::vec::Vec;
 mod laws;
 pub use laws::{
     current_coefficients, mask_lattice_resized, minimum_phase_triplet, release_lambda, temperature_candidate,
-    transform_len, velocity_band_gains, velocity_band_gains_window, velocity_limit, BandGain, Fft, Masker,
-    ThermalBranch,
+    transform_len, velocity_band_gains, velocity_band_gains_limit_window, velocity_band_gains_window, velocity_limit,
+    BandGain, Fft, Masker, ThermalBranch,
 };
 
 use crate::blob::{BlobError, Pod};
@@ -1311,12 +1311,14 @@ struct Chan {
     vel_lim: [f32; 3],
     mask_knots: [f32; 4],
     vel_limit_now: f64,
-    /// Retained protected full-band velocity peaks on the two sides of the
-    /// bank/output channel handoff.
-    vel_bound_old: f32,
-    vel_bound_new: f32,
+    /// Current scalar state of the streaming protected-peak producer. The
+    /// retained per-sample handoff itself lives in `vel_bound_window`.
+    vel_stream_bound: f32,
     vel_bound_ready: bool,
     vel_bound_release: bool,
+    /// Native's one retained producer window. Host fragments shift it by
+    /// their admitted length and append one protected peak per fragment.
+    vel_bound_window: Vec<f32>,
     /// A velocity episode chooses its solve topology on its first ordinary
     /// cut. An onset before the streaming peak has a complete window stays
     /// ordinary; an onset with retained history adds the retained solve.
@@ -1511,6 +1513,11 @@ struct Run {
     fault: bool,
     /// Frames into the current controller frame (input FIFO fill).
     pos: usize,
+    /// Host-fragment geometry admitted into the current buffered frame.
+    /// The largest native controller frame is 512 samples, hence q1 needs at
+    /// most 512 entries and longer calls collapse to controller-sized pieces.
+    fragment_lens: [usize; 2 * CONTROLLER_FRAMES],
+    fragment_count: usize,
     frame: u64,
     last_frame: u64,
     frames_done: u64,
@@ -1660,10 +1667,10 @@ impl Run {
                 vel_lim: c.velocity_limit,
                 mask_knots: c.mask_energy_db,
                 vel_limit_now: c.velocity_limit[0] as f64,
-                vel_bound_old: 0.0,
-                vel_bound_new: 0.0,
+                vel_stream_bound: 0.0,
                 vel_bound_ready: false,
                 vel_bound_release: false,
+                vel_bound_window: vec![0.0; od + ctl],
                 vel_episode: false,
                 vel_episode_retained: false,
                 band: [BandGain::unity(attack_len); BANDS],
@@ -1723,6 +1730,8 @@ impl Run {
             latency: p.unit_latency_frames(),
             fault: false,
             pos: 0,
+            fragment_lens: [0; 2 * CONTROLLER_FRAMES],
+            fragment_count: 0,
             frame: 0,
             last_frame: 0,
             frames_done: 0,
@@ -1783,10 +1792,10 @@ impl Run {
             c.mvel.clear();
             c.vwin.iter_mut().for_each(|v| *v = 0.0);
             c.vel_limit_now = c.vel_lim[0] as f64;
-            c.vel_bound_old = 0.0;
-            c.vel_bound_new = 0.0;
+            c.vel_stream_bound = 0.0;
             c.vel_bound_ready = false;
             c.vel_bound_release = false;
+            c.vel_bound_window.iter_mut().for_each(|v| *v = 0.0);
             c.vel_episode = false;
             c.vel_episode_retained = false;
             c.band = [BandGain::unity(c.slow.len); BANDS];
@@ -1821,6 +1830,7 @@ impl Run {
             b[..ctl].iter_mut().for_each(|v| *v = 0.0);
         }
         self.pos = 0;
+        self.fragment_count = 0;
         self.frame = 0;
         self.last_frame = 0;
         self.frames_done = 0;
@@ -1927,6 +1937,7 @@ impl Run {
         let window_max = |r: &[f32; RING]| r[..ring_len].iter().copied().fold(0.0f32, f32::max);
         let ratio = |limit: f64, q: f32| (limit / (q as f64).max(EPS)).min(1.0);
         let (a_fast, a_low) = (self.a_fast, self.a_low);
+        let fragments = &self.fragment_lens[..self.fragment_count];
         let velocity_release = 1.0 - libm::exp(-(ctl as f64) * a_fast);
         // the allocator span excludes the first millisecond (t-4719)
         let vfirst = libm::round(self.ctl as f64 * 3.0 / 16.0) as usize;
@@ -2009,27 +2020,80 @@ impl Run {
             let vlim_g = c.vel_limit_now as f32;
             let stream_ready = c.protected_peak.ready();
             let next_bound = if c.vel_bound_release && c.vel_bound_ready {
-                (c.vel_bound_new as f64 + velocity_release * (c.vel_limit_now - c.vel_bound_new as f64)) as f32
+                (c.vel_stream_bound as f64 + velocity_release * (c.vel_limit_now - c.vel_stream_bound as f64)) as f32
             } else {
                 c.protected_peak_now
             }
             .min(vlim_g);
+            let floor_bound = 0.25 * vlim_g;
+            let quiet_producer = c.vel_bound_ready && c.vel_bound_window.iter().all(|&v| v == floor_bound);
             if c.vel_bound_ready && stream_ready {
-                c.vel_bound_old = c.vel_bound_new;
-                c.vel_bound_new = next_bound;
+                c.vel_stream_bound = next_bound;
+                c.vel_bound_window.copy_within(ctl.., 0);
+                c.vel_bound_window[od..].fill(next_bound);
             } else if stream_ready {
-                c.vel_bound_old = next_bound;
-                c.vel_bound_new = next_bound;
+                c.vel_stream_bound = next_bound;
                 c.vel_bound_ready = true;
+                c.vel_bound_window.fill(next_bound);
             }
-            let bound_old = c.vel_bound_old;
-            let bound_new = c.vel_bound_new;
-            let velocity_room = 0.25 * (vlim_g - bound_new).max(0.0);
             // the velocity fixed term (t-4751, t-4763): the zero-input carry
             // of the persistent full-band velocity model, over one
             // filterbank latency, zeros after; the model itself advances on
             // the protected output, below
             c.vcar_m.carry(&mut c.vcar, fbl);
+            // Native has one producer window, not an onset scalar replacing
+            // the streaming state. A quiet-window onset owns only the newly
+            // admitted host fragments; ramps retain the streaming producer.
+            // Each fragment appends its protected trial peak, repeated for
+            // that fragment's samples (q1/q7/q160 included).
+            let mut onset_producer = false;
+            if vel_on && stream_ready && quiet_producer && !c.vel_bound_release {
+                let all = (0, BANDS);
+                let mut producer_r = [1.0; BANDS];
+                if disp_on {
+                    let room = 0.25 * (c.disp_limit as f32 - c.disp_bound_new).max(0.0);
+                    producer_r = velocity_band_gains_window(
+                        &c.db,
+                        &c.rd,
+                        0,
+                        c.disp_bound_old,
+                        c.disp_bound_new,
+                        od,
+                        room,
+                        sg,
+                        all,
+                        producer_r,
+                    );
+                }
+                let mut offset = 0;
+                let mut signal = false;
+                for &len in fragments {
+                    let mut peak = 0.0f32;
+                    for i in od + offset..od + offset + len {
+                        let mut y = c.vcar[i];
+                        for k in 0..BANDS {
+                            y += (producer_r[k] * sg) * c.vb[k][i];
+                        }
+                        peak = peak.max(y.abs());
+                    }
+                    signal |= peak != 0.0;
+                    c.vel_bound_window[od + offset..od + offset + len].fill(peak.min(vlim_g));
+                    offset += len;
+                }
+                debug_assert_eq!(offset, ctl);
+                if !signal {
+                    c.vel_bound_window[od..].fill(next_bound);
+                } else {
+                    onset_producer = true;
+                }
+            }
+            let retained_room_bound = c.vel_bound_window[od..].iter().copied().fold(0.0f32, f32::max);
+            if onset_producer {
+                // The following decision releases from the completed onset
+                // segment, while the streaming object itself remains the
+                // source that arbitrates later ramp windows.
+                c.vel_stream_bound = retained_room_bound;
+            }
             let velocity_cut = core::cell::Cell::new(false);
             let primary_floor_limited = core::cell::Cell::new(false);
             let retained_episode = core::cell::Cell::new(c.vel_episode && c.vel_episode_retained);
@@ -2058,14 +2122,12 @@ impl Run {
                         retained_episode.set(true);
                     }
                     let q = if retained_episode.get() && c.vel_bound_ready {
-                        velocity_band_gains_window(
+                        velocity_band_gains_limit_window(
                             &c.vb,
                             &c.vcar,
                             vfirst,
-                            bound_old,
-                            bound_new,
-                            od,
-                            velocity_room,
+                            &c.vel_bound_window,
+                            0.25 * (vlim_g - retained_room_bound).max(0.0),
                             sg,
                             all,
                             ordinary,
@@ -2378,26 +2440,35 @@ impl Run {
     }
 
     fn process(&mut self, io: &mut Io<'_, '_>) {
-        for k in 0..io.frames {
-            let pos = self.pos;
-            for ci in 0..self.n {
-                let src = self.ch[ci].src;
-                let x = io.input[src][k];
-                // a non-finite sample is 0 to the audio and the models; the
-                // peak axis sees it as the most restrictive
-                self.xin[ci][pos] = if x.is_finite() { dsp::meter1(x) } else { dsp::METER_FS };
-                io.output[src][k] = self.yout[ci][pos];
+        let mut start = 0;
+        while start < io.frames {
+            let take = (io.frames - start).min(self.ctl - self.pos);
+            debug_assert!(self.fragment_count < self.fragment_lens.len());
+            self.fragment_lens[self.fragment_count] = take;
+            self.fragment_count += 1;
+            for k in start..start + take {
+                let pos = self.pos + k - start;
+                for ci in 0..self.n {
+                    let src = self.ch[ci].src;
+                    let x = io.input[src][k];
+                    // a non-finite sample is 0 to the audio and the models;
+                    // the peak axis sees it as the most restrictive
+                    self.xin[ci][pos] = if x.is_finite() { dsp::meter1(x) } else { dsp::METER_FS };
+                    io.output[src][k] = self.yout[ci][pos];
+                }
             }
-            self.pos += 1;
-            self.frame += 1;
+            self.pos += take;
+            self.frame += take as u64;
             if self.pos == self.ctl {
                 self.pos = 0;
                 self.process_frame();
+                self.fragment_count = 0;
                 if self.fault {
-                    crate::failsafe::fill_from(io, k + 1, FAILSAFE_GAIN);
+                    crate::failsafe::fill_from(io, start + take, FAILSAFE_GAIN);
                     return;
                 }
             }
+            start += take;
         }
     }
 }

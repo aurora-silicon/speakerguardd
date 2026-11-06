@@ -275,13 +275,8 @@ pub fn velocity_band_gains_window(
     active: (usize, usize),
     seed: [f32; 5],
 ) -> [f32; 5] {
-    let mut g = seed;
     let n = vb[0].len();
-    if first >= n {
-        return g;
-    }
-    let is_active = |k: usize| k >= active.0 && k < active.1;
-    let limit_at = |i: usize| {
+    velocity_band_gains_with_limits(vb, resid, first, room_floor, s, active, seed, |i| {
         if i < split {
             old_limit
         } else if new_limit >= old_limit {
@@ -291,7 +286,43 @@ pub fn velocity_band_gains_window(
             let step = (new_limit - old_limit) / count as f32;
             old_limit + step * (i - split + 1) as f32
         }
-    };
+    })
+}
+
+/// Signed velocity allocation against a producer window containing one
+/// retained limit for every modeled sample.
+#[allow(clippy::too_many_arguments)]
+pub fn velocity_band_gains_limit_window(
+    vb: &[alloc::vec::Vec<f32>; 5],
+    resid: &[f32],
+    first: usize,
+    limits: &[f32],
+    room_floor: f32,
+    s: f32,
+    active: (usize, usize),
+    seed: [f32; 5],
+) -> [f32; 5] {
+    debug_assert_eq!(limits.len(), vb[0].len());
+    velocity_band_gains_with_limits(vb, resid, first, room_floor, s, active, seed, |i| limits[i])
+}
+
+#[allow(clippy::too_many_arguments)]
+fn velocity_band_gains_with_limits(
+    vb: &[alloc::vec::Vec<f32>; 5],
+    resid: &[f32],
+    first: usize,
+    room_floor: f32,
+    s: f32,
+    active: (usize, usize),
+    seed: [f32; 5],
+    limit_at: impl Fn(usize) -> f32,
+) -> [f32; 5] {
+    let mut g = seed;
+    let n = vb[0].len();
+    if first >= n {
+        return g;
+    }
+    let is_active = |k: usize| k >= active.0 && k < active.1;
     loop {
         let (mut idx, mut worst) = (first, 0.0f32);
         for i in first..n {
@@ -795,6 +826,13 @@ mod tests {
     fn retained_velocity_bounds_switch_at_the_handoff() {
         let vb = [vec![2.0, 2.0], vec![0.0, 0.0], vec![0.0, 0.0], vec![0.0, 0.0], vec![0.0, 0.0]];
         let got = velocity_band_gains_window(&vb, &[], 0, 1.0, 2.0, 1, 0.1, 1.0, (0, 5), [1.0; 5]);
+        assert_eq!(got, [0.5, 1.0, 1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn retained_velocity_uses_the_limit_at_the_selected_window_sample() {
+        let vb = [vec![1.0, 2.0, 1.5], vec![0.0; 3], vec![0.0; 3], vec![0.0; 3], vec![0.0; 3]];
+        let got = velocity_band_gains_limit_window(&vb, &[], 0, &[0.2, 1.0, 0.3], 0.0, 1.0, (0, 5), [1.0; 5]);
         assert_eq!(got, [0.5, 1.0, 1.0, 1.0, 1.0]);
     }
 
