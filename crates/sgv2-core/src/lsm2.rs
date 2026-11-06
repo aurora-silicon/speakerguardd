@@ -1358,6 +1358,9 @@ const TRING: usize = 4 * SUBSTEPS;
 /// The ceiling's longest horizon in controller frames (an attack of up to
 /// about 80 ms at 48 kHz).
 const CEIL_FRAMES: usize = 16;
+/// Substeps the conservative ceiling hold adds past the retained window:
+/// one controller decision.
+const CEIL_HOLD_SUBSTEPS: usize = SUBSTEPS;
 
 struct Chan {
     src: usize,
@@ -1544,6 +1547,7 @@ impl Chan {
         let (mut lv, mut lm, mut qv, mut qm) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
         let amb = self.ambient as f32;
         let mut i = 0;
+        let (mut pl_last, mut pq_last) = (0.0f32, 0.0f32);
         for raw_k in 0..full / sub {
             let [sl, sq] = vdsp_sve(sub, || {
                 let y = if i < extra { self.ceil_fast_prev[ctl - extra + i] } else { self.out_sample(i - extra, 1.0) };
@@ -1552,6 +1556,7 @@ impl Chan {
                 [u * zi.step(0.0), u * zs.step(u)]
             });
             let (pl, pq) = (sl / sub as f32, sq / sub as f32);
+            (pl_last, pq_last) = (pl, pq);
             bv = self.br_vc.step(bv, 0.0);
             bm = self.br_mg.step(bm, 0.0);
             lv = self.br_vc.step(lv, pl);
@@ -1564,6 +1569,25 @@ impl Chan {
                 lin[k] = lv + lm;
                 quad[k] = qv + qm;
             }
+        }
+        // Conservative hold (not a native law): the solve also covers one
+        // more controller decision, with the newest substep's power held at
+        // the same slow gain. It can only lower the gain, so the ceiling
+        // never cuts later than the retained-window solve alone; on the rig
+        // it keeps the coil at or below macOS, whose ceiling engages up to
+        // one decision ahead of the retained-window solve (LSC2, temp-1k).
+        let mut subs = subs;
+        for _ in 0..CEIL_HOLD_SUBSTEPS {
+            bv = self.br_vc.step(bv, 0.0);
+            bm = self.br_mg.step(bm, 0.0);
+            lv = self.br_vc.step(lv, pl_last);
+            lm = self.br_mg.step(lm, pl_last);
+            qv = self.br_vc.step(qv, pq_last);
+            qm = self.br_mg.step(qm, pq_last);
+            base[subs] = amb + bv + bm;
+            lin[subs] = lv + lm;
+            quad[subs] = qv + qm;
+            subs += 1;
         }
         let limit = (self.t_hard + self.t_headroom.max(0.0)) as f32;
         Self::ceiling_solve(&base[..subs], &lin[..subs], &quad[..subs], limit, g0)
