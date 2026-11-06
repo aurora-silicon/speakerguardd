@@ -7,7 +7,7 @@
 //!
 //! Boxes carried today: the non-finite guard and gain builtins, the filter
 //! boxes (`tmst`, through [`crate::prestage::voicing_tone`], unscaled) and the
-//! multiband compressor (`mstk`, [`crate::prestage::compressor`]). Every
+//! multiband compressor (`mstk`, [`super::mstk`]). Every
 //! other box type compiles to a stub until its module lands; a box module
 //! adds its arm to [`compile_node`]. [`Compiled::stubs`] lists what is
 //! still stubbed and [`Compiled::gaps`] what is carried only in part (a
@@ -105,19 +105,14 @@ fn compile_node(
                 Ok(k) => k,
                 Err(e) => uncarried(n, subtype, e, gaps),
             },
-            // the pre-stage dynamics are proven against macOS on the spp3 states
-            // (t-4752); the full box module covers the rest, conformance pending
-            "mstk" => match crate::prestage::compressor(stage) {
-                Ok(Some(d)) => Kind::Comp(d),
+            // the box module runs the unit's own gain law (soft knee, level
+            // detector, bandwidth behaviour); the pre-stage's interim
+            // peak/hard-knee law tilted the whole chain against macOS
+            // (2-3.5 dB under at 50-200 Hz, 0.5-2.5 dB over above 300 Hz)
+            "mstk" => match super::mstk::compile(stage, fs, diags) {
+                Ok(Some(p)) => Kind::Mstk(Box::new(p)),
                 Ok(None) => Kind::Bypass,
-                Err(e0) => match super::mstk::compile(stage, fs, diags) {
-                    Ok(Some(p)) => {
-                        gaps.push((n.name.clone(), format!("mstk box module (rig conformance pending): {e0}")));
-                        Kind::Mstk(Box::new(p))
-                    }
-                    Ok(None) => Kind::Bypass,
-                    Err(e) => uncarried(n, subtype, e, gaps),
-                },
+                Err(e) => uncarried(n, subtype, e, gaps),
             },
             "cfrk" => match super::cfreak::compile(stage, fs, diags) {
                 Ok(Some(p)) => Kind::Cfreak(Box::new(p)),
