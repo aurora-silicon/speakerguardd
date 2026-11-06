@@ -924,7 +924,7 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics, exact_vol
                 }
                 p.slots.push(SlotPart {
                     index: i,
-                    shape: match kind as i64 {
+                    shape: match kind {
                         1 => ToneShape::Peak,
                         11 => ToneShape::LowShelf,
                         _ => ToneShape::HighShelf,
