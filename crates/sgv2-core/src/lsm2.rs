@@ -1237,9 +1237,7 @@ impl ProtectedPeak {
     }
 }
 
-/// The current model of spec 15.2: a Float32 biquad, every output rounded
-/// to f32, `i[n] = f32(b0 u[n] + b1 u[n-1] + b2 u[n-2] - a1 i[n-1] - a2
-/// i[n-2])`.
+/// The input power/temperature current model: binary32 state and output.
 #[derive(Clone, Copy, Default)]
 struct Current {
     b: [f32; 3],
@@ -1249,8 +1247,6 @@ struct Current {
 }
 
 impl Current {
-    /// `I/U = (Mms s^2 + Rms s + Kms) / (R Mms s^2 + (R Rms + Bl^2) s + R Kms)`
-    /// by the generative builder of residuals section 1.
     fn new(rdc: f64, bl: f64, m: f64, rms: f64, k: f64, rate: f64) -> Self {
         let (b, a) = current_coefficients(rdc, bl, m, rms, k, rate);
         Current { b, a, u: [0.0; 2], i: [0.0; 2] }
@@ -1266,10 +1262,46 @@ impl Current {
         self.i = [i, self.i[0]];
         i
     }
+    fn clear(&mut self) {
+        self.u = [0.0; 2];
+        self.i = [0.0; 2];
+    }
+    fn is_finite(&self) -> bool {
+        self.i[0].is_finite() && self.i[1].is_finite()
+    }
+}
+
+/// The output monitor and ceiling current model: the same binary32
+/// coefficients in the native binary64 direct-form-I state and output.
+#[derive(Clone, Copy, Default)]
+struct MonitorCurrent {
+    b: [f64; 3],
+    a: [f64; 2],
+    u: [f64; 2],
+    i: [f64; 2],
+}
+
+impl MonitorCurrent {
+    /// `I/U = (Mms s^2 + Rms s + Kms) / (R Mms s^2 + (R Rms + Bl^2) s + R Kms)`
+    /// by the generative builder of residuals section 1.
+    fn new(rdc: f64, bl: f64, m: f64, rms: f64, k: f64, rate: f64) -> Self {
+        let (b, a) = current_coefficients(rdc, bl, m, rms, k, rate);
+        MonitorCurrent { b: b.map(f64::from), a: a.map(f64::from), u: [0.0; 2], i: [0.0; 2] }
+    }
+    #[inline]
+    fn step(&mut self, u: f32) -> f64 {
+        let u = f64::from(u);
+        let i = self.b[0] * u + self.b[1] * self.u[0] + self.b[2] * self.u[1]
+            - self.a[0] * self.i[0]
+            - self.a[1] * self.i[1];
+        self.u = [u, self.u[0]];
+        self.i = [i, self.i[0]];
+        i
+    }
     /// The retained response used by the ceiling's linear term exists for
     /// one filterbank stage. The remaining predictor window is zero-state.
     #[inline]
-    fn retained_step(&mut self, sample: usize, stage: usize) -> f32 {
+    fn retained_step(&mut self, sample: usize, stage: usize) -> f64 {
         if sample < stage {
             self.step(0.0)
         } else {
@@ -1468,14 +1500,14 @@ struct Chan {
     // Slow gain.
     slow: SlowGain,
     // Monitor on the output.
-    cur_out: Current,
+    cur_out: MonitorCurrent,
     th_vc: f32,
     th_mg: f32,
     /// The preceding output frame before slow gain, and the output-model
     /// state at each of its substep starts. Runtime attack changes move the
     /// native ceiling window's start within this retained frame.
     ceil_fast_prev: Vec<f32>,
-    ceil_cur_prev: [Current; SUBSTEPS],
+    ceil_cur_prev: [MonitorCurrent; SUBSTEPS],
     ceil_vc_prev: [f32; SUBSTEPS],
     ceil_mg_prev: [f32; SUBSTEPS],
     pbar: [f64; 4],
@@ -1563,7 +1595,7 @@ impl Chan {
                 let retained = zi.retained_step(i, fb);
                 i += 1;
                 let u = self.vfs * y;
-                [u * retained, u * zs.step(u)]
+                [(f64::from(u) * retained) as f32, (f64::from(u) * zs.step(u)) as f32]
             });
             let (pl, pq) = (sl / sub as f32, sq / sub as f32);
             bv = self.br_vc.step(bv, 0.0);
@@ -1784,6 +1816,8 @@ impl Run {
             let vel = motion(c.vel_rdc, c.vel_bl, c.vel_mms_kg, c.vel_rms, c.vel_kms, rate, true);
             let disp = motion(c.disp_rdc, c.disp_bl, c.disp_mms_kg, c.disp_rms, c.disp_kms, rate, false);
             let cur = Current::new(c.rdc as f64, c.bl as f64, c.mms_kg as f64, c.rms as f64, c.kms as f64, rate);
+            let monitor_cur =
+                MonitorCurrent::new(c.rdc as f64, c.bl as f64, c.mms_kg as f64, c.rms as f64, c.kms as f64, rate);
             let br_vc = ThermalBranch::new(c.rth_vc as f64, c.tau_vc as f64, sub_dt);
             let br_mg = ThermalBranch::new(c.rth_mag as f64, c.tau_mag as f64, sub_dt);
             ch.push(Chan {
@@ -1844,11 +1878,11 @@ impl Run {
                 tn: 0,
                 gt: 1.0,
                 slow: SlowGain::unity(attack_len),
-                cur_out: cur,
+                cur_out: monitor_cur,
                 th_vc: 0.0,
                 th_mg: 0.0,
                 ceil_fast_prev: vec![0.0; ctl],
-                ceil_cur_prev: [cur; SUBSTEPS],
+                ceil_cur_prev: [monitor_cur; SUBSTEPS],
                 ceil_vc_prev: [0.0; SUBSTEPS],
                 ceil_mg_prev: [0.0; SUBSTEPS],
                 pbar: [0.0; 4],
@@ -2498,8 +2532,8 @@ impl Run {
                 };
                 let u = c.vfs * v;
                 let iv = c.cur_out.step(u);
-                acc += u as f64 * iv as f64;
-                c.power_work[i % sub] = u * iv;
+                acc += f64::from(u) * iv;
+                c.power_work[i % sub] = (f64::from(u) * iv) as f32;
                 *yo = v.clamp(-1.0, 1.0);
                 // The persistent motion models follow the protected output.
                 c.dcar_m.step(c.vfs * *yo);
@@ -2790,8 +2824,20 @@ mod fault_tests {
     use super::*;
 
     #[test]
+    fn output_monitor_keeps_the_unrounded_current_state() {
+        let args = (4.0, 0.8, 0.2e-3, 0.2, 1500.0, 48_000.0);
+        let mut input = Current::new(args.0, args.1, args.2, args.3, args.4, args.5);
+        let mut monitor = MonitorCurrent::new(args.0, args.1, args.2, args.3, args.4, args.5);
+        let input_i = input.step(0.123_456_7);
+        let monitor_i = monitor.step(0.123_456_7);
+        assert_eq!(f64::from(input_i), f64::from(input.i[0]));
+        assert_ne!(monitor_i, f64::from(monitor_i as f32));
+        assert_eq!(monitor_i, monitor.i[0]);
+    }
+
+    #[test]
     fn ceiling_retained_current_ends_after_one_filterbank_stage() {
-        let mut current = Current { a: [-0.5, 0.25], i: [1.0, 0.5], ..Current::default() };
+        let mut current = MonitorCurrent { a: [-0.5, 0.25], i: [1.0, 0.5], ..MonitorCurrent::default() };
         assert_ne!(current.retained_step(0, 1), 0.0);
         let retained = current;
         assert_eq!(current.retained_step(1, 1), 0.0);
