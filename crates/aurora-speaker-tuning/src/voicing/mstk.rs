@@ -75,9 +75,6 @@ pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option
         if flavor.fract() != 0.0 || !(0.0..=4.0).contains(&flavor) {
             return Err(bad(stage, format!("band {b} saturation flavor {flavor}")));
         }
-        if sat_on && flavor != 1.0 {
-            return Err(bad(stage, format!("band {b} enables uncarried saturation flavor {flavor}")));
-        }
         let mode = if mute || (any_solo && !solo[b]) {
             BandMode::Mute
         } else if !enabled || bypass {
@@ -206,14 +203,14 @@ mod tests {
             (69, 1.0),
             (70, 3.0),
             (71, 1.0),
-            (72, 1.0),
+            (72, 4.0),
             (79, -16.0),
             (80, -100.0),
             (81, 0.0),
         ]);
         let p = compile(&s, 48_000.0, &mut Diagnostics::default()).unwrap().unwrap();
         assert_eq!((p.band[0].up_ratio, p.band[0].exp_ratio, p.band[0].input_gain_db), (2.0, 1.5, -3.0));
-        assert_eq!(p.band[0].saturation, Some(1));
+        assert_eq!(p.band[0].saturation, Some(4));
         assert!(p.overshoot_compensation);
     }
 

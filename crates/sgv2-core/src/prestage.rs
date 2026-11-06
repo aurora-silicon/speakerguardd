@@ -73,8 +73,8 @@ pub const FLAG_DYNAMICS: u32 = 1 << 1;
 /// `flags` bit: compressor boxes at their graph places follow the channels
 /// (see the module documentation); they replace [`FLAG_DYNAMICS`].
 pub const FLAG_BOXES: u32 = 1 << 2;
-/// Most compressor boxes a lane passes ahead of the unit.
-pub const MAX_BOXES: usize = 4;
+/// Most compressor boxes a shipped lane passes ahead of the unit.
+pub const MAX_BOXES: usize = 2;
 /// Bands of the multiband dynamics.
 pub const BANDS: usize = 4;
 

@@ -4,9 +4,10 @@
 //! The linked four-band dynamics box used ahead of speaker protection.
 //!
 //! The parameter compiler supplies the Audio Unit's saved controls.  This
-//! module contains no machine tuning.  Detection is linked by taking the
-//! largest per-channel band power, while filtering and saturation remain
-//! per channel.  Construction owns all storage; [`Run::process`] allocates
+//! module contains no machine tuning.  Detection uses the Butterworth half
+//! of each Linkwitz-Riley band and is linked by taking the largest channel
+//! magnitude, while audio filtering and saturation remain per channel.
+//! Construction owns all storage; [`Run::process`] allocates
 //! nothing and accepts arbitrary frame counts.
 
 use crate::MAX_CHANNELS;
@@ -14,7 +15,9 @@ use crate::MAX_CHANNELS;
 pub const BANDS: usize = 4;
 const XOVERS: usize = BANDS - 1;
 const MAX_FILTERS: usize = 32;
+const MAX_DETECTOR_FILTERS: usize = 10;
 const INPUT_BOUND: f32 = 16.0;
+const CURVE_POINTS: usize = 11;
 
 /// Processing selected for one analysis band.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -264,6 +267,23 @@ struct Path {
     count: usize,
 }
 
+#[derive(Clone, Copy)]
+struct DetectorPath {
+    section: [Section; MAX_DETECTOR_FILTERS],
+    count: usize,
+}
+
+impl DetectorPath {
+    const EMPTY: Self = Self { section: [Section::ID; MAX_DETECTOR_FILTERS], count: 0 };
+
+    fn push(&mut self, s: Section) {
+        if let Some(slot) = self.section.get_mut(self.count) {
+            *slot = s;
+            self.count += 1;
+        }
+    }
+}
+
 impl Path {
     const EMPTY: Self = Self { section: [Section::ID; MAX_FILTERS], count: 0 };
 
@@ -297,6 +317,17 @@ fn push_butter(path: &mut Path, high: bool, n: usize, fc: f64, fs: f64) {
         let d = 1.0 + k;
         let (b0, b1) = if high { (1.0 / d, -1.0 / d) } else { (k / d, k / d) };
         path.push(Section { b0, b1, b2: 0.0, a1: (k - 1.0) / d, a2: 0.0 });
+    }
+}
+
+fn push_detector_butter(path: &mut DetectorPath, high: bool, n: usize, fc: f64, fs: f64) {
+    let k = libm::tan(core::f64::consts::PI * fc / fs);
+    for i in 0..n / 2 {
+        let q2 = 2.0 * libm::sin(core::f64::consts::PI * (2 * i + 1) as f64 / (2 * n) as f64);
+        let d = 1.0 + q2 * k + k * k;
+        let (a1, a2) = (2.0 * (k * k - 1.0) / d, (1.0 - q2 * k + k * k) / d);
+        let (b0, b1, b2) = if high { (1.0 / d, -2.0 / d, 1.0 / d) } else { (k * k / d, 2.0 * k * k / d, k * k / d) };
+        path.push(Section { b0, b1, b2, a1, a2 });
     }
 }
 
@@ -356,18 +387,111 @@ fn paths(p: &Params, fs: f64) -> [Path; BANDS] {
     v
 }
 
+/// Detector paths use one Butterworth half of each Linkwitz-Riley branch.
+/// Their magnitudes are consequently the square root of the audio bands'
+/// magnitudes.  Phase-equalising allpasses are unnecessary before magnitude
+/// detection.
+fn detector_paths(p: &Params, fs: f64) -> [DetectorPath; BANDS] {
+    let mut v = [DetectorPath::EMPTY; BANDS];
+    let n = p.crossover_order.map(effective_order);
+    let f = p.crossover_hz;
+    push_detector_butter(&mut v[0], false, n[1] / 2, f[1], fs);
+    push_detector_butter(&mut v[0], false, n[0] / 2, f[0], fs);
+    push_detector_butter(&mut v[1], false, n[1] / 2, f[1], fs);
+    push_detector_butter(&mut v[1], true, n[0] / 2, f[0], fs);
+    push_detector_butter(&mut v[2], true, n[1] / 2, f[1], fs);
+    push_detector_butter(&mut v[2], false, n[2] / 2, f[2], fs);
+    push_detector_butter(&mut v[3], true, n[1] / 2, f[1], fs);
+    push_detector_butter(&mut v[3], true, n[2] / 2, f[2], fs);
+    v
+}
+
+#[inline]
+fn db_amp(db: f64) -> f64 {
+    libm::pow(10.0, db / 20.0)
+}
+
+fn curve_points(p: Band, top_db: f64) -> [f64; CURVE_POINTS] {
+    let mut out = [1.0; CURVE_POINTS];
+    let step = (100.0 + top_db) / (CURVE_POINTS - 1) as f64;
+    let makeup = db_amp(p.makeup_db);
+    for (i, gain) in out.iter_mut().enumerate() {
+        let level = -100.0 + i as f64 * step;
+        let change = if level < p.up_threshold_db {
+            ((1.0 - 1.0 / p.up_ratio) * (p.up_threshold_db - level)).min(p.up_range_db)
+        } else if level >= p.down_threshold_db {
+            ((1.0 / p.down_ratio - 1.0) * (level - p.down_threshold_db)).max(p.down_range_db)
+        } else {
+            0.0
+        };
+        let mut v = db_amp(p.makeup_db + change);
+        if level < p.exp_threshold_db {
+            let exp = db_amp((level - p.exp_threshold_db) * (p.exp_ratio - 1.0));
+            v = (v * exp).max(makeup);
+        }
+        *gain = v;
+    }
+    out
+}
+
+#[inline]
+fn spline_gain(points: &[f64; CURVE_POINTS], level_db: f64, top_db: f64) -> f64 {
+    let z = ((level_db.clamp(-100.0, top_db) + 100.0) * 10.0 / (100.0 + top_db)).clamp(0.0, 10.0);
+    let i = libm::floor(z) as usize;
+    let t = z - i as f64;
+    let p0 = points[i.saturating_sub(1)];
+    let p1 = points[i];
+    let p2 = points[(i + 1).min(CURVE_POINTS - 1)];
+    let p3 = points[(i + 2).min(CURVE_POINTS - 1)];
+    let c3 = (-p0 + 3.0 * p1 - 3.0 * p2 + p3) / 6.0;
+    let c2 = (p0 - 2.0 * p1 + p2) / 2.0;
+    let c1 = (-p0 + p2) / 2.0;
+    let c0 = (p0 + 4.0 * p1 + p2) / 6.0;
+    ((c3 * t + c2) * t + c1) * t + c0
+}
+
+/// Algorithm 0's very-low-frequency bandwidth correction. It is unity in
+/// the audio band and approaches about +2.9 dB at DC.
+fn algorithm0_compensation(fs: f64) -> Section {
+    let k = libm::tan(core::f64::consts::PI * 13.194_19 / fs);
+    let (num_damping, den_damping, dc) = (2.077_078, 1.944_442, db_amp(2.89));
+    let d = 1.0 + den_damping * k + k * k;
+    Section {
+        b0: (1.0 + num_damping * k + dc * k * k) / d,
+        b1: 2.0 * (dc * k * k - 1.0) / d,
+        b2: (1.0 - num_damping * k + dc * k * k) / d,
+        a1: 2.0 * (k * k - 1.0) / d,
+        a2: (1.0 - den_damping * k + k * k) / d,
+    }
+}
+
 /// The real-time state of one linked compressor instance.
 pub struct Run {
     path: [Path; BANDS],
+    detector_path: [DetectorPath; BANDS],
     band: [Band; BANDS],
     in_gain: f64,
     out_gain: f64,
     band_in: [f64; BANDS],
+    detector_bandwidth: [f64; BANDS],
+    curve: [[f64; CURVE_POINTS]; BANDS],
+    curve_top_db: f64,
     release: f64,
+    recovery: f64,
     release_on: bool,
+    algorithm0: bool,
+    overshoot_compensation: bool,
+    output_compensation: Section,
     channels: usize,
     env: [f64; BANDS],
+    smoothed_gain: [f64; BANDS],
+    detector_window: [usize; BANDS],
+    detector_hold: [f64; BANDS],
+    detector_hold_remaining: [usize; BANDS],
+    detector_rms: [f64; BANDS],
+    compensation_state: [[f64; 2]; MAX_CHANNELS],
     state: [[[[f64; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS],
+    detector_state: [[[[f32; 2]; MAX_DETECTOR_FILTERS]; BANDS]; MAX_CHANNELS],
 }
 
 impl Run {
@@ -375,23 +499,57 @@ impl Run {
         let fs = if fs.is_finite() && fs > 1.0 { fs } else { 48_000.0 };
         let valid = p.valid(fs);
         let q = if valid { p } else { &Params::default() };
+        let curve_top_db = if q.algorithm >= 2 { 20.0 } else { 0.0 };
+        let edges = [0.0, q.crossover_hz[0], q.crossover_hz[1], q.crossover_hz[2], 20_000.0];
+        let reference_edges = [0.0, 100.0, 1000.0, 10_000.0, 20_000.0];
+        let mut detector_bandwidth = [1.0; BANDS];
+        if q.bandwidth_compensation {
+            for b in 0..BANDS {
+                detector_bandwidth[b] = (reference_edges[b + 1] - reference_edges[b]) / (edges[b + 1] - edges[b]);
+            }
+        }
+        let detector_window = [10.0, 8.0, 2.0, 1.0].map(|ms| {
+            let n = libm::round(ms * fs / 1000.0) as usize | 1;
+            n.max(1)
+        });
         Run {
             path: paths(q, fs),
+            detector_path: detector_paths(q, fs),
             band: q.band,
-            in_gain: libm::pow(10.0, q.input_gain_db / 20.0),
-            out_gain: libm::pow(10.0, q.output_gain_db / 20.0),
-            band_in: q.band.map(|b| libm::pow(10.0, b.input_gain_db / 20.0)),
+            in_gain: db_amp(q.input_gain_db),
+            out_gain: db_amp(q.output_gain_db),
+            band_in: q.band.map(|b| db_amp(b.input_gain_db)),
+            detector_bandwidth,
+            curve: q.band.map(|b| curve_points(b, curve_top_db)),
+            curve_top_db,
             release: if q.release_s > 0.0 { libm::exp(-1.0 / (q.release_s * fs)) } else { 0.0 },
+            recovery: if q.release_s > 0.0 { 1.0 - libm::exp(-1.0 / (q.release_s * fs)) } else { 1.0 },
             release_on: q.release_on,
+            algorithm0: q.algorithm == 0,
+            overshoot_compensation: q.overshoot_compensation,
+            output_compensation: if q.algorithm == 0 { algorithm0_compensation(fs) } else { Section::ID },
             channels: channels.min(MAX_CHANNELS),
             env: [0.0; BANDS],
+            smoothed_gain: [1.0; BANDS],
+            detector_window,
+            detector_hold: [0.0; BANDS],
+            detector_hold_remaining: [0; BANDS],
+            detector_rms: [0.0; BANDS],
+            compensation_state: [[0.0; 2]; MAX_CHANNELS],
             state: [[[[0.0; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS],
+            detector_state: [[[[0.0; 2]; MAX_DETECTOR_FILTERS]; BANDS]; MAX_CHANNELS],
         }
     }
 
     pub fn reset(&mut self) {
         self.env = [0.0; BANDS];
+        self.smoothed_gain = [1.0; BANDS];
+        self.detector_hold = [0.0; BANDS];
+        self.detector_hold_remaining = [0; BANDS];
+        self.detector_rms = [0.0; BANDS];
+        self.compensation_state = [[0.0; 2]; MAX_CHANNELS];
         self.state = [[[[0.0; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS];
+        self.detector_state = [[[[0.0; 2]; MAX_DETECTOR_FILTERS]; BANDS]; MAX_CHANNELS];
     }
 
     pub fn latency(&self) -> usize {
@@ -416,7 +574,25 @@ impl Run {
         out
     }
 
-    fn gain(&self, b: usize) -> f64 {
+    #[inline]
+    fn detect(&mut self, c: usize, x: f64) -> [f64; BANDS] {
+        let mut out = [0.0; BANDS];
+        for (b, y) in out.iter_mut().enumerate() {
+            let mut v = x;
+            for i in 0..self.detector_path[b].count {
+                let s = self.detector_path[b].section[i];
+                let z = &mut self.detector_state[c][b][i];
+                let o = s.b0 * v + z[0] as f64;
+                z[0] = (s.b1 * v - s.a1 * o + z[1] as f64) as f32;
+                z[1] = (s.b2 * v - s.a2 * o) as f32;
+                v = o;
+            }
+            *y = (v * self.band_in[b] * self.detector_bandwidth[b]).abs();
+        }
+        out
+    }
+
+    fn gain(&mut self, b: usize) -> f64 {
         let p = self.band[b];
         if p.mode == BandMode::Mute {
             return 0.0;
@@ -424,50 +600,69 @@ impl Run {
         if p.mode == BandMode::Pass {
             return 1.0;
         }
-        let level = 10.0 * libm::log10(self.env[b].max(1e-30));
-        let change = if level < p.exp_threshold_db && p.exp_ratio > 1.0 {
-            ((p.exp_ratio - 1.0) * (level - p.exp_threshold_db)).max(-60.0)
-        } else if level < p.up_threshold_db && p.up_ratio > 1.0 {
-            ((1.0 - 1.0 / p.up_ratio) * (p.up_threshold_db - level)).min(p.up_range_db)
-        } else if level > p.down_threshold_db && p.down_ratio > 1.0 {
-            ((1.0 / p.down_ratio - 1.0) * (level - p.down_threshold_db)).max(p.down_range_db)
+        let level = 20.0 * libm::log10(self.env[b].max(1e-5));
+        let target = spline_gain(&self.curve[b], level, self.curve_top_db);
+        if self.overshoot_compensation && target > self.smoothed_gain[b] {
+            self.smoothed_gain[b] += (target - self.smoothed_gain[b]) * self.recovery;
         } else {
-            0.0
-        };
-        libm::pow(10.0, (p.makeup_db + change) / 20.0)
+            self.smoothed_gain[b] = target;
+        }
+        self.smoothed_gain[b]
+    }
+
+    #[inline]
+    fn window_max(&mut self, b: usize, value: f64) -> f64 {
+        if value >= self.detector_hold[b] || self.detector_hold_remaining[b] == 0 {
+            self.detector_hold[b] = value;
+            self.detector_hold_remaining[b] = self.detector_window[b];
+        } else {
+            self.detector_hold_remaining[b] -= 1;
+        }
+        self.detector_hold[b]
     }
 
     #[inline]
     fn saturate(flavor: Option<u32>, x: f64) -> f64 {
         let Some(f) = flavor else { return x };
-        if f == 1 {
-            // The enabled speaker state uses the smooth, odd flavor: a small
-            // linear lift followed by a cubic-like soft bend.  The rational
-            // form remains finite for every bounded input and reproduces its
-            // low-level slope and third-harmonic growth.
-            return 1.011_73 * x / (1.0 + 0.154 * x * x);
+        match f {
+            0 => x.clamp(-1.0, 1.0),
+            1 => {
+                let v = x.clamp(-2.965, 2.965);
+                1.011_726_737 * v - 0.153_421_387 * v * v * v
+            }
+            2 => libm::sin(x),
+            3 => libm::sin(x.clamp(-core::f64::consts::FRAC_PI_2, core::f64::consts::FRAC_PI_2)),
+            4 => 0.5 * (x + libm::sin(x)),
+            _ => x,
         }
-        // Other public flavors are retained on the wire but use a
-        // conservative magnitude-reducing curve until a compiler admits one.
-        let strength = 0.125 * (f + 1) as f64;
-        x / (1.0 + strength * x.abs())
     }
 
     pub fn process(&mut self, bufs: &mut [&mut [f32]], frames: usize) {
         let n = bufs.len().min(self.channels).min(MAX_CHANNELS);
         let mut bands = [[0.0; BANDS]; MAX_CHANNELS];
         for i in 0..frames {
-            let mut power = [0.0f64; BANDS];
+            let mut detector = [0.0f64; BANDS];
             for c in 0..n {
                 let x = bufs[c].get(i).copied().unwrap_or(0.0);
                 let x = if x.is_finite() { x.clamp(-INPUT_BOUND, INPUT_BOUND) as f64 } else { 0.0 };
-                bands[c] = self.split(c, self.in_gain * x);
+                let input = self.in_gain * x;
+                bands[c] = self.split(c, input);
+                let detected = self.detect(c, input);
                 for b in 0..BANDS {
-                    power[b] = power[b].max(bands[c][b] * bands[c][b]);
+                    detector[b] = detector[b].max(detected[b]);
                 }
             }
-            for (e, p) in self.env.iter_mut().zip(power) {
-                *e = if self.release_on { p.max(*e * self.release) } else { p };
+            for (b, p) in detector.into_iter().enumerate() {
+                let mut held = self.window_max(b, p);
+                if self.algorithm0 {
+                    let alpha = 1.0 / self.detector_window[b] as f64;
+                    self.detector_rms[b] += alpha * (p * p - self.detector_rms[b]);
+                    let rms = libm::sqrt(2.0 * self.detector_rms[b]).max(1e-12);
+                    let crest_db = (20.0 * libm::log10(held / rms)).clamp(0.0, 6.0);
+                    let crest_weight = if b == 0 { 0.52 } else { 0.49 };
+                    held *= db_amp(crest_weight * crest_db);
+                }
+                self.env[b] = if self.release_on { held.max(self.env[b] * self.release) } else { held };
             }
             let gain = [self.gain(0), self.gain(1), self.gain(2), self.gain(3)];
             for c in 0..n {
@@ -476,6 +671,12 @@ impl Run {
                     y += Self::saturate(self.band[b].saturation, gain[b] * bands[c][b]);
                 }
                 y *= self.out_gain;
+                let s = self.output_compensation;
+                let z = &mut self.compensation_state[c];
+                let corrected = s.b0 * y + z[0];
+                z[0] = s.b1 * y - s.a1 * corrected + z[1];
+                z[1] = s.b2 * y - s.a2 * corrected;
+                y = corrected;
                 if let Some(out) = bufs[c].get_mut(i) {
                     *out = if y.is_finite() { y as f32 } else { 0.0 };
                 }
@@ -567,10 +768,18 @@ mod tests {
 
     /// Response of one band path at `f`, as a magnitude.
     fn band_magnitude(path: &Path, f: f64) -> f64 {
+        sections_magnitude(&path.section[..path.count], f)
+    }
+
+    fn detector_band_magnitude(path: &DetectorPath, f: f64) -> f64 {
+        sections_magnitude(&path.section[..path.count], f)
+    }
+
+    fn sections_magnitude(sections: &[Section], f: f64) -> f64 {
         let w = 2.0 * core::f64::consts::PI * f / 48_000.0;
         let (c1, s1, c2, s2) = (libm::cos(w), libm::sin(w), libm::cos(2.0 * w), libm::sin(2.0 * w));
         let mut m = 1.0;
-        for s in &path.section[..path.count] {
+        for s in sections {
             let (nr, ni) = (s.b0 + s.b1 * c1 + s.b2 * c2, -s.b1 * s1 - s.b2 * s2);
             let (dr, di) = (1.0 + s.a1 * c1 + s.a2 * c2, -s.a1 * s1 - s.a2 * s2);
             m *= libm::sqrt((nr * nr + ni * ni) / (dr * dr + di * di));
@@ -610,6 +819,7 @@ mod tests {
             p.crossover_order = [order; 3];
             p.input_gain_db = 0.0;
             p.output_gain_db = 0.0;
+            p.algorithm = 1;
             p.release_on = false;
             for b in p.band.iter_mut() {
                 b.mode = BandMode::Pass;
@@ -627,6 +837,56 @@ mod tests {
                 let mut run = Run::new(&p, 48_000.0, 1);
                 run.process(&mut [&mut x], 24_000);
                 assert!((level(&x, f) - 20.0 * libm::log10(0.25)).abs() < 0.01, "order {order} at {f} Hz");
+            }
+        }
+    }
+
+    #[test]
+    fn detector_is_the_butterworth_half_of_each_audio_band() {
+        let p = params();
+        let audio = paths(&p, 48_000.0);
+        let detector = detector_paths(&p, 48_000.0);
+        for b in 0..BANDS {
+            for f in [40.0, 200.0, 1000.0, 5000.0, 16_000.0] {
+                let a = band_magnitude(&audio[b], f);
+                let d = detector_band_magnitude(&detector[b], f);
+                assert!((a - d * d).abs() < 1e-10, "band {b} at {f} Hz: audio {a}, detector {d}");
+            }
+        }
+    }
+
+    #[test]
+    fn spline_curve_softens_the_knee_range_and_expander() {
+        let band = Band { down_threshold_db: -20.0, down_ratio: 4.0, down_range_db: -6.0, ..Band::default() };
+        let legacy = curve_points(band, 0.0);
+        let modern = curve_points(band, 20.0);
+        assert!((spline_gain(&legacy, -32.0, 0.0) - 1.0).abs() < 1e-12);
+        assert!(spline_gain(&modern, -32.0, 20.0) < 1.0);
+        assert!(20.0 * libm::log10(spline_gain(&modern, 0.0, 20.0)) > -6.0);
+
+        // Expansion only removes upward gain and stops at makeup.
+        let expanded = curve_points(
+            Band {
+                up_threshold_db: -30.0,
+                up_ratio: 2.0,
+                up_range_db: 10.0,
+                exp_threshold_db: -60.0,
+                exp_ratio: 2.0,
+                ..Band::default()
+            },
+            20.0,
+        );
+        assert!((expanded[0] - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn every_saturation_flavor_is_odd_and_bounded_on_program_input() {
+        for flavor in 0..=4 {
+            for x in [-1.0, -0.25, 0.0, 0.25, 1.0] {
+                let y = Run::saturate(Some(flavor), x);
+                assert!(y.is_finite());
+                assert!((y + Run::saturate(Some(flavor), -x)).abs() < 1e-12);
+                assert!(y.abs() <= 1.1);
             }
         }
     }
