@@ -101,7 +101,9 @@
 use crate::error::{Diagnostics, Error, Result};
 use crate::fourcc::FourCc;
 use crate::tuning::{Stage, Tuning};
-use sgv2_core::prestage::{BoxAt, Channel, Params, Section, FLAG_FROM_TUNING, MAX_BOXES, MAX_SECTIONS};
+use sgv2_core::prestage::{
+    Band, BandMode, BoxAt, Channel, Dynamics, Params, Section, BANDS, FLAG_FROM_TUNING, MAX_BOXES, MAX_SECTIONS,
+};
 use sgv2_core::MAX_CHANNELS;
 use std::f64::consts::PI;
 
