@@ -10,7 +10,7 @@
 //! | ID | meaning | carried |
 //! |---:|---|---|
 //! | 0 | bypass [0] | 1: the box is left out |
-//! | 1, 10, 17 | saturation oversampling, flavour, amount [0] | only matter with 16 |
+//! | 1, 10, 17 | saturation oversampling, flavour, amount [0] | mode 3 / sine / wet percent |
 //! | 2, 11 | input gain (dB) [0], its stage enabled [1] | only 0 dB or disabled |
 //! | 3 | threshold (dB) [0] | yes |
 //! | 4 | MinFastGain (dB) [3] | yes |
@@ -21,9 +21,9 @@
 //! | 9 | parameter ramp time [0] | not needed: the state is fixed |
 //! | 12, 13, 21, 22 | high-pass enable [0], corner, order, placement | refused when enabled |
 //! | 14 | limiter enabled [1] | refused when off |
-//! | 16 | output saturation [0] | refused when on |
-//! | 18-20 | de-esser frequency, strength, quality | no effect while saturation is off |
-//! | 23 | algorithm version [0] | only 0 |
+//! | 16 | output saturation [0] | off, or the mode-3 sine subset |
+//! | 18-21 | de-esser controls | dormant for the carried sine flavor, but required |
+//! | 23 | algorithm version [0] | 0 without saturation, 1 with the carried subset |
 //!
 //! The group-scope sections the strips also save do not change the unit's
 //! output; the global values are used.
@@ -71,22 +71,52 @@ pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option
     if get(14)? == 0.0 {
         return Err(bad("the limiter is switched off (not carried)".into()));
     }
-    if get(16)? != 0.0 {
-        return Err(bad("output saturation is on (not carried)".into()));
-    }
+    let saturation = get(16)? != 0.0;
     if get(12)? != 0.0 {
         return Err(bad("the high-pass is on (not carried)".into()));
     }
-    if get(23)? != 0.0 {
-        return Err(bad(format!("algorithm version {} (only 0 is carried)", get(23)?)));
-    }
+    let (saturation_mode, saturation_flavor, saturation_mix) = if saturation {
+        if get(1)? != 3.0 || get(10)? != 2.0 || get(23)? != 1.0 {
+            return Err(bad(format!(
+                "output saturation mode/flavor/version {}/{}/{} (only 3/2/1 is carried)",
+                get(1)?,
+                get(10)?,
+                get(23)?
+            )));
+        }
+        let amount = get(17)?;
+        if !(0.0..=100.0).contains(&amount) {
+            return Err(bad(format!("output saturation amount {amount}%")));
+        }
+        // These controls are part of the version-1 state but dormant for
+        // sine flavor 2. Require their complete finite saved values rather
+        // than silently defaulting an unknown state.
+        for id in [18, 19, 20, 21] {
+            get(id)?;
+        }
+        (3.0, 2.0, amount / 100.0)
+    } else {
+        if get(23)? != 0.0 {
+            return Err(bad(format!("algorithm version {} (only 0 without saturation is carried)", get(23)?)));
+        }
+        (0.0, 0.0, 0.0)
+    };
     if get(11)? != 0.0 && get(2)? != 0.0 {
         return Err(bad(format!("input gain {} dB (not carried)", get(2)?)));
     }
     if get(15)? != 0.0 && get(8)? != 0.0 {
         return Err(bad(format!("output gain {} dB (not carried)", get(8)?)));
     }
-    let words = [get(7)? / 1000.0, get(5)? / 1000.0, get(3)?, get(4)?, get(6)?];
+    let words = [
+        get(7)? / 1000.0,
+        get(5)? / 1000.0,
+        get(3)?,
+        get(4)?,
+        get(6)?,
+        saturation_mode,
+        saturation_flavor,
+        saturation_mix,
+    ];
     let p = Params::from_words(&words).ok_or_else(|| bad(format!("values out of range: {words:?}")))?;
     let frames = |s: f64| s * fs;
     if (frames(p.lookahead_s) - frames(p.lookahead_s).round()).abs() > 1e-6
@@ -138,7 +168,16 @@ mod tests {
         let p = compile_of(&[(3, -1.5), (4, 12.0), (5, 2.0), (6, 1.0), (7, 0.25)]).unwrap().unwrap();
         assert_eq!(
             p,
-            Params { lookahead_s: 0.00025, hold_s: 0.002, threshold_db: -1.5, min_fast_gain_db: 12.0, true_peak: true }
+            Params {
+                lookahead_s: 0.00025,
+                hold_s: 0.002,
+                threshold_db: -1.5,
+                min_fast_gain_db: 12.0,
+                true_peak: true,
+                saturation_mode: 0,
+                saturation_flavor: 0,
+                saturation_mix: 0.0,
+            }
         );
         let d = compile_of(&[]).unwrap().unwrap();
         assert_eq!(
@@ -166,6 +205,20 @@ mod tests {
             assert!(compile_of(&refused).is_err(), "{refused:?}");
         }
         assert!(compile_of(&[(2, 3.0), (11, 0.0), (8, -2.0), (15, 0.0)]).unwrap().is_some());
+        let saturated = compile_of(&[
+            (1, 3.0),
+            (10, 2.0),
+            (16, 1.0),
+            (17, 30.0),
+            (18, 10_000.0),
+            (19, 10.0),
+            (20, 1.0),
+            (21, 2.0),
+            (23, 1.0),
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!((saturated.saturation_mode, saturated.saturation_flavor, saturated.saturation_mix), (3, 2, 0.3));
         assert!(compile_of(&[(99, 1.0)]).unwrap().is_some());
         let mut st = stage(&[]);
         st.state = None;
