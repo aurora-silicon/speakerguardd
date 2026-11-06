@@ -349,7 +349,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--tunings-root", default="/System/Library/Audio/Tunings")
     ap.add_argument("--aids", default="", help="comma list; default: every spp3 AID the root has")
-    ap.add_argument("--bundle", action="append", default=[], help="NAME=PATH of a collected bundle (repeat)")
+    ap.add_argument("--bundle", action="append", default=[],
+                    help="NAME=PATH of a collected bundle, its audio-tuning directory (repeat)")
     ap.add_argument("--host", default=None, help="box_host binary (built from box_host.m)")
     ap.add_argument("--render", required=True, help="voicing-render example binary")
     ap.add_argument("--volumes", default="1,0.75,0.5,0.25,0.1")
