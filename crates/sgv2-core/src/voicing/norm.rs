@@ -5,8 +5,8 @@
 //! look-ahead delay and that gain; everything else is the side chain.
 //!
 //! Side chain, per frame: each channel through the detector cascade (the
-//! loudness weighting; the unit's side-chain high-pass only feeds its
-//! loudness meters, not this detector), squared, and
+//! loudness weighting, its high-pass section replaced by the tuning's
+//! side-chain high-pass when that is on), squared, and
 //! the channels summed (a full and a silent channel read the same as the
 //! full one alone; two equal channels read 3 dB louder). The sum is
 //! accumulated over 64-frame steps; eight steps make a 512-frame block and
