@@ -2031,6 +2031,7 @@ impl Run {
             // the protected output, below
             c.vcar_m.carry(&mut c.vcar, fbl);
             let velocity_cut = core::cell::Cell::new(false);
+            let primary_floor_limited = core::cell::Cell::new(false);
             let retained_episode = core::cell::Cell::new(c.vel_episode && c.vel_episode_retained);
             let chain = |c: &Chan, seed: [f32; BANDS]| -> [f32; BANDS] {
                 let all = (0, BANDS);
@@ -2073,7 +2074,12 @@ impl Run {
                         ordinary
                     };
                     for k in c.vel_active.0..c.vel_active.1 {
-                        let v = (sg * q[k]).max(c.vel_floor as f32) / sg;
+                        let raw = q[k];
+                        let v = (sg * raw).max(c.vel_floor as f32) / sg;
+                        primary_floor_limited.set(
+                            primary_floor_limited.get()
+                                || (sg * raw < c.vel_floor as f32 && v < r[k]),
+                        );
                         velocity_cut.set(velocity_cut.get() || v < r[k]);
                         r[k] = r[k].min(v);
                     }
@@ -2099,7 +2105,12 @@ impl Run {
                 // the second request too (a lane the second solve leaves at
                 // its seed, unity included, is not a request of that solve)
                 let up: [bool; BANDS] = core::array::from_fn(|k| p[k] > c.band[k].g);
-                if up.iter().any(|&u| u) {
+                // Once the primary allocation is pinned at
+                // MaxVelocityAttenuation, native leaves the retarget path
+                // idle. The ordinary solve may still re-cut a recovering
+                // neighbour on a later decision; running the retarget solve
+                // here instead re-cuts it at the regular follower cadence.
+                if up.iter().any(|&u| u) && !primary_floor_limited.get() {
                     let guard = libm::pow(10.0, 3.0 / 20.0) as f32;
                     let seed: [f32; BANDS] = core::array::from_fn(|k| {
                         let end = c.band[k].end_after(p[k], ctl, if k == 0 { a_low } else { a_fast });
