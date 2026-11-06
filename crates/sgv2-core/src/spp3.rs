@@ -617,7 +617,7 @@ const PDRV_WITH_HEADROOM: bool = false;
 /// closed loop runs and publishes T_CL but never raises the limit above the
 /// base. (The CL goldens match bit-for-bit with relaxation on; they carry
 /// no program energy near the pilot bin.)
-const CL_RELAXATION: bool = false;
+const CL_RELAXATION: bool = true;
 /// `Pcoil` is the power of the unit's output samples, generated pilot
 /// included (rig law 2, against spec 4's text; to 3e-7 relative).
 const PCOIL_WITH_PILOT: bool = true;
