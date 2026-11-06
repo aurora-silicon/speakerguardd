@@ -30,6 +30,7 @@ fn main() {
     }
     let bundle = match (root, aid, dir) {
         (Some(r), Some(a), None) => Bundle::from_tunings_root(&r, a),
+        (None, None, Some(d)) if d.is_file() => Bundle::from_tar(&d, None),
         (None, None, Some(d)) => Bundle::from_dir(&d),
         _ => panic!("give --tunings-root and --aid, or --bundle"),
     }

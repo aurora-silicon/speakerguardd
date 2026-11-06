@@ -140,6 +140,60 @@ fn linkwitz_riley(order: usize, fc: f64, fs: f64, kind: Kind) -> Cascade {
     c
 }
 
+/// Chebyshev type I low pass of order `n`, pass-band ripple `rp_db`, edge
+/// `fp`, by the bilinear transform at `fs` with the edge pre-warped. Unity
+/// gain at DC for odd `n` (the only orders used).
+fn chebyshev1(n: usize, rp_db: f64, fp: f64, fs: f64) -> Cascade {
+    let mut c = Cascade::default();
+    let eps = libm::sqrt(libm::pow(10.0, rp_db / 10.0) - 1.0);
+    let mu = libm::asinh(1.0 / eps) / n as f64;
+    let k = libm::tan(core::f64::consts::PI * fp / fs);
+    for i in 0..n / 2 {
+        let theta = core::f64::consts::PI * (2 * i + 1) as f64 / (2 * n) as f64;
+        // analogue pole -sigma ± j omega (unit edge), scaled by k
+        let sigma = libm::sinh(mu) * libm::sin(theta) * k;
+        let omega = libm::cosh(mu) * libm::cos(theta) * k;
+        let w2 = sigma * sigma + omega * omega;
+        // H(s) = w2 / (s^2 + 2 sigma s + w2), s = (1 - z^-1) / (1 + z^-1)
+        let a0 = 1.0 + 2.0 * sigma + w2;
+        let g = w2 / a0;
+        c.push(Bq { b: [g, 2.0 * g, g], a: [2.0 * (w2 - 1.0) / a0, (1.0 - 2.0 * sigma + w2) / a0] });
+    }
+    if n % 2 == 1 {
+        let sigma = libm::sinh(mu) * k;
+        let a0 = 1.0 + sigma;
+        let g = sigma / a0;
+        c.push(Bq { b: [g, g, 0.0], a: [(sigma - 1.0) / a0, 0.0] });
+    }
+    c
+}
+
+/// A cascade designed at `fs / STRIDE` run at `fs` with every delay
+/// `STRIDE` frames long: the same response below `fs / (2 * STRIDE)`.
+const STRIDE_MAX: usize = 8;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct StridedState {
+    x: [[f64; 2 * STRIDE_MAX]; MAX_SECTIONS],
+    y: [[f64; 2 * STRIDE_MAX]; MAX_SECTIONS],
+    pos: usize,
+}
+
+fn run_strided(c: &Cascade, stride: usize, st: &mut StridedState, mut x: f64) -> f64 {
+    let len = 2 * stride;
+    let p = st.pos;
+    let d1 = (p + len - stride) % len;
+    for i in 0..c.n {
+        let q = &c.s[i];
+        let y = q.b[0] * x + q.b[1] * st.x[i][d1] + q.b[2] * st.x[i][p] - q.a[0] * st.y[i][d1] - q.a[1] * st.y[i][p];
+        st.x[i][p] = x;
+        st.y[i][p] = y;
+        x = y;
+    }
+    st.pos = (p + 1) % len;
+    x
+}
+
 /// The nonlinear devices carried. The compiler refuses the other types.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Device {
@@ -165,14 +219,37 @@ impl Device {
 /// The box's own laws: the same on every Mac, never from a tuning.
 mod law {
     /// Type 3 device: `-AMP * tanh(SLOPE * u)`.
-    pub const DEVICE3_AMP: f64 = 3.92134;
-    pub const DEVICE3_SLOPE: f64 = 0.78597;
+    pub const DEVICE3_AMP: f64 = 3.79488;
+    pub const DEVICE3_SLOPE: f64 = 0.79967;
     /// Level control: envelope the drive normalises to (linear peak),
     /// envelope attack/release (s) and the largest drive.
     pub const LC_TARGET: f64 = 1.0;
     pub const LC_ATTACK_S: f64 = 0.010;
     pub const LC_RELEASE_S: f64 = 0.100;
     pub const LC_MAX_DRIVE: f64 = 1000.0;
+    /// The mid branches are band-limited by a Chebyshev type I low pass
+    /// working at a quarter-rate design.
+    pub const SUB_RATE_HZ: f64 = 12_000.0;
+    pub const SUB_LP_ORDER: usize = 7;
+    pub const SUB_LP_RIPPLE_DB: f64 = 1.0;
+    pub const SUB_LP_EDGE_HZ: f64 = 2_000.0;
+    /// Each odd-order all-pass section of the harmonic band edges delays
+    /// the whole output by one frame and the mid branches by this many
+    /// sub-rate frames.
+    pub const ODD_AP_BRANCH_DELAY_SUB: f64 = 1.1625;
+}
+
+/// Branch delay line length (frames); covers two odd sections at the
+/// largest stride.
+const BRANCH_LINE: usize = 32;
+/// Output delay line length (frames): at most two odd sections.
+const OUT_LINE: usize = 3;
+
+/// Frames per sub-rate frame at `fs`, if `fs` is a whole multiple of the
+/// sub rate.
+pub fn sub_stride(fs: f64) -> Option<usize> {
+    let r = fs / law::SUB_RATE_HZ;
+    (r >= 1.0 && r.fract() == 0.0 && r as usize <= STRIDE_MAX).then_some(r as usize)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -257,27 +334,57 @@ pub struct Run {
     hp_st: Vec<CascadeState>,
     lp: Cascade,
     lp_st: CascadeState,
+    /// The low pass of an odd-order crossover is taken inverted, so that
+    /// low pass and high pass still sum to an all-pass.
+    lp_sign: f64,
     ap: Cascade,
     ap_st: CascadeState,
     band: Cascade,
     band_st: CascadeState,
+    sub: Cascade,
+    sub_st: StridedState,
+    stride: usize,
+    /// Mid-branch delay: whole frames in a ring, the fraction by a
+    /// first-order all-pass (coefficient `frac_a`).
+    bline: [f64; BRANCH_LINE],
+    bpos: usize,
+    bdelay: usize,
+    frac_a: f64,
+    frac_x: f64,
+    frac_y: f64,
     env: f64,
     att: f64,
     rel: f64,
-    /// One frame of output latency per channel.
-    held: Vec<f64>,
+    /// Output delay, `latency` frames per channel.
+    latency: usize,
+    oline: Vec<[f64; OUT_LINE]>,
+    opos: usize,
 }
 
 impl Run {
     pub fn new(p: &Params, fs: f64, channels: usize) -> Run {
-        let mut ap = butterworth(p.upper_order / 2, p.fu_hz, fs, Kind::AllPass);
-        ap.extend(&butterworth(p.lower_order / 2, p.fc_hz, fs, Kind::AllPass));
+        let (nu, nl) = (p.upper_order / 2, p.lower_order / 2);
+        let mut ap = butterworth(nu, p.fu_hz, fs, Kind::AllPass);
+        ap.extend(&butterworth(nl, p.fc_hz, fs, Kind::AllPass));
         let mut hp = linkwitz_riley(p.hp_order, p.fc_hz, fs, Kind::High);
         hp.extend(&ap);
         let lp = linkwitz_riley(p.hp_order, p.fc_hz, fs, Kind::Low);
         let mut band = linkwitz_riley(p.lower_order, p.fc_hz, fs, Kind::High);
         band.extend(&linkwitz_riley(p.upper_order, p.fu_hz, fs, Kind::Low));
         let (att, rel) = (libm::exp(-1.0 / (law::LC_ATTACK_S * fs)), libm::exp(-1.0 / (law::LC_RELEASE_S * fs)));
+        let stride = sub_stride(fs).unwrap_or(1);
+        let sub = chebyshev1(law::SUB_LP_ORDER, law::SUB_LP_RIPPLE_DB, law::SUB_LP_EDGE_HZ, fs / stride as f64);
+        let latency = nu % 2 + nl % 2;
+        let d = latency as f64 * law::ODD_AP_BRANCH_DELAY_SUB * stride as f64;
+        // whole part such that the fraction lies in [0.5, 1.5): the
+        // first-order all-pass delay approximation is accurate there
+        let (bdelay, frac) = if d < 0.5 {
+            (0, 0.0)
+        } else {
+            let n = libm::floor(d - 0.5);
+            ((n as usize).min(BRANCH_LINE - 1), d - n)
+        };
+        let frac_a = if frac == 0.0 { 0.0 } else { (1.0 - frac) / (1.0 + frac) };
         Run {
             p: p.clone(),
             fs,
@@ -286,14 +393,26 @@ impl Run {
             hp_st: vec![CascadeState::default(); channels],
             lp,
             lp_st: CascadeState::default(),
+            lp_sign: if (p.hp_order / 2) % 2 == 1 { -1.0 } else { 1.0 },
             ap,
             ap_st: CascadeState::default(),
             band,
             band_st: CascadeState::default(),
+            sub,
+            sub_st: StridedState::default(),
+            stride,
+            bline: [0.0; BRANCH_LINE],
+            bpos: 0,
+            bdelay,
+            frac_a: if frac == 0.0 { f64::NAN } else { frac_a },
+            frac_x: 0.0,
+            frac_y: 0.0,
             env: 0.0,
             att,
             rel,
-            held: vec![0.0; channels],
+            latency,
+            oline: vec![[0.0; OUT_LINE]; channels],
+            opos: 0,
         }
     }
 
@@ -304,14 +423,18 @@ impl Run {
         self.lp_st = CascadeState::default();
         self.ap_st = CascadeState::default();
         self.band_st = CascadeState::default();
+        self.sub_st = StridedState::default();
+        self.bline = [0.0; BRANCH_LINE];
+        self.frac_x = 0.0;
+        self.frac_y = 0.0;
         self.env = 0.0;
-        for h in &mut self.held {
-            *h = 0.0;
+        for l in &mut self.oline {
+            *l = [0.0; OUT_LINE];
         }
     }
 
     pub fn latency(&self) -> usize {
-        1
+        self.latency
     }
 
     pub fn sample_rate(&self) -> f64 {
@@ -323,6 +446,25 @@ impl Run {
         match self.p.device {
             Device::Saturator3 => -law::DEVICE3_AMP * libm::tanh(law::DEVICE3_SLOPE * u),
         }
+    }
+
+    #[inline]
+    fn branch_delay(&mut self, v: f64) -> f64 {
+        let mut x = v;
+        if self.bdelay > 0 {
+            self.bline[self.bpos] = v;
+            let r = (self.bpos + BRANCH_LINE - self.bdelay) % BRANCH_LINE;
+            x = self.bline[r];
+            self.bpos = (self.bpos + 1) % BRANCH_LINE;
+        }
+        if self.frac_a.is_nan() {
+            return x;
+        }
+        // first-order all-pass fractional delay
+        let y = self.frac_a * x + self.frac_x - self.frac_a * self.frac_y;
+        self.frac_x = x;
+        self.frac_y = y;
+        y
     }
 
     pub fn process(&mut self, bufs: &mut [&mut [f32]], frames: usize) {
@@ -339,7 +481,7 @@ impl Run {
                 mid += if v.is_finite() { v * ig } else { 0.0 };
             }
             mid /= ch as f64;
-            let lo = self.lp.run(&mut self.lp_st, mid);
+            let lo = self.lp_sign * self.lp.run(&mut self.lp_st, mid);
             let low = self.p.blend_gain * self.ap.run(&mut self.ap_st, lo);
             let drive = if self.p.level_control {
                 let a = libm::fabs(lo);
@@ -351,14 +493,18 @@ impl Run {
             };
             let d = self.device(drive * lo) / drive;
             let harm = self.p.harmonic_gain * self.band.run(&mut self.band_st, d);
-            let common = low + harm;
+            let delayed = self.branch_delay(low + harm);
+            let common = run_strided(&self.sub, self.stride, &mut self.sub_st, delayed);
+            let (l, pos) = (self.latency, self.opos);
             for (c, b) in bufs[..ch].iter_mut().enumerate() {
                 let v = b[i] as f64;
                 let x = if v.is_finite() { v * ig } else { 0.0 };
-                let y = self.hp.run(&mut self.hp_st[c], x) + common;
-                let out = core::mem::replace(&mut self.held[c], y * self.p.output_gain);
-                b[i] = out as f32;
+                let y = (self.hp.run(&mut self.hp_st[c], x) + common) * self.p.output_gain;
+                let line = &mut self.oline[c];
+                line[pos] = y;
+                b[i] = line[(pos + OUT_LINE - l) % OUT_LINE] as f32;
             }
+            self.opos = (pos + 1) % OUT_LINE;
         }
     }
 }
@@ -417,6 +563,7 @@ mod tests {
     #[test]
     fn one_frame_latency_and_unity_above_the_band() {
         let mut r = Run::new(&params(false), 48_000.0, 2);
+        // upper band edge order 4 (even sections), lower 6 (odd): one frame
         assert_eq!(r.latency(), 1);
         let n = 48_000;
         let mut l = tone(5_000.0, 0.5, n);

@@ -7,10 +7,10 @@
 //! | 0  | level control in front of the device      | on / off |
 //! | 1  | monitor (1 = the full processed sum)      | only 1 |
 //! | 2  | crossover corner, Hz                      | `fc_hz` |
-//! | 3  | crossover order (any real)                | Linkwitz-Riley order, next even |
+//! | 3  | crossover order (any real)                | Linkwitz-Riley order: round, then up to even |
 //! | 4  | harmonic band upper corner, Hz            | `fu_hz` |
-//! | 5  | harmonic band upper order                 | next even |
-//! | 6  | harmonic band lower order                 | next even |
+//! | 5  | harmonic band upper order                 | round, then up to even |
+//! | 6  | harmonic band lower order                 | round, then up to even |
 //! | 7  | harmonic gain, dB                         | linear |
 //! | 8  | low-end blend gain, dB                    | linear |
 //! | 9  | nonlinear device type                     | only the types carried |
@@ -31,13 +31,13 @@ fn db(v: f64) -> f64 {
 }
 
 /// A real order parameter becomes the Linkwitz-Riley order that carries it:
-/// the next even integer at or above it.
+/// the nearest integer (halves up), raised to even.
 fn lr_order(v: f64) -> Option<usize> {
-    if !(1.0..=20.0).contains(&v) {
+    if !(2.0..=20.0).contains(&v) {
         return None;
     }
-    let n = 2.0 * (v / 2.0).ceil();
-    Some(n as usize)
+    let n = (v + 0.5).floor() as usize;
+    Some(n + n % 2)
 }
 
 pub fn compile(stage: &Stage, fs: f64, _diags: &mut Diagnostics) -> Result<Option<Params>> {
@@ -47,6 +47,9 @@ pub fn compile(stage: &Stage, fs: f64, _diags: &mut Diagnostics) -> Result<Optio
     }
     if stage.bypass {
         return Ok(None);
+    }
+    if sgv2_core::voicing::vbass::sub_stride(fs).is_none() {
+        return Err(bad(format!("{ctx}: rate {fs} Hz is not a whole multiple of the box's sub rate")));
     }
     let g = stage
         .state
@@ -122,13 +125,15 @@ mod tests {
     use super::lr_order;
 
     #[test]
-    fn orders_round_up_to_even() {
+    fn orders_round_then_go_even() {
         assert_eq!(lr_order(4.0), Some(4));
+        assert_eq!(lr_order(4.4), Some(4));
+        assert_eq!(lr_order(4.5), Some(6));
         assert_eq!(lr_order(5.0), Some(6));
-        assert_eq!(lr_order(6.0), Some(6));
-        assert_eq!(lr_order(7.25), Some(8));
+        assert_eq!(lr_order(6.4), Some(6));
+        assert_eq!(lr_order(6.6), Some(8));
         assert_eq!(lr_order(2.0), Some(2));
-        assert_eq!(lr_order(0.5), None);
+        assert_eq!(lr_order(1.5), None);
         assert_eq!(lr_order(21.0), None);
     }
 }
