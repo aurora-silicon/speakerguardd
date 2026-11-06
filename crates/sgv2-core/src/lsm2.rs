@@ -2031,8 +2031,9 @@ impl Run {
             // the protected output, below
             c.vcar_m.carry(&mut c.vcar, fbl);
             let velocity_cut = core::cell::Cell::new(false);
+            let primary_floor_limited = core::cell::Cell::new(false);
             let retained_episode = core::cell::Cell::new(c.vel_episode && c.vel_episode_retained);
-            let chain = |c: &Chan, seed: [f32; BANDS]| -> [f32; BANDS] {
+            let chain = |c: &Chan, seed: [f32; BANDS], floor_velocity: bool| -> [f32; BANDS] {
                 let all = (0, BANDS);
                 let mut r = seed;
                 if disp_on {
@@ -2073,7 +2074,15 @@ impl Run {
                         ordinary
                     };
                     for k in c.vel_active.0..c.vel_active.1 {
-                        let v = (sg * q[k]).max(c.vel_floor as f32) / sg;
+                        let raw = q[k];
+                        let v = if floor_velocity {
+                            primary_floor_limited.set(
+                                primary_floor_limited.get() || sg * raw < c.vel_floor as f32,
+                            );
+                            (sg * raw).max(c.vel_floor as f32) / sg
+                        } else {
+                            raw
+                        };
                         velocity_cut.set(velocity_cut.get() || v < r[k]);
                         r[k] = r[k].min(v);
                     }
@@ -2088,7 +2097,7 @@ impl Run {
                 // follower's request stays in the band domain. The output
                 // applies the slow trajectory after the fast-gained sum;
                 // scaling the request by `sg` here would apply it twice.
-                let p = chain(c, [1.0; BANDS]);
+                let p = chain(c, [1.0; BANDS], true);
                 // residuals 5.2 (t-4713): upward lanes (primary above the
                 // applied gain); one second chain seeded from the predicted
                 // endpoint toward the complete primary request of upward
@@ -2109,7 +2118,11 @@ impl Run {
                             1.0
                         }
                     });
-                    let q = chain(c, seed);
+                    // A primary request below MaxVelocityAttenuation has
+                    // already established the floor-limited episode. Native
+                    // preserves the retarget solve's no-progress result
+                    // there instead of applying the floor a second time.
+                    let q = chain(c, seed, !primary_floor_limited.get());
                     core::array::from_fn(|k| if up[k] && q[k] >= seed[k] { p[k] } else { q[k] })
                 } else {
                     p
