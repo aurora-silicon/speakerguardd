@@ -46,6 +46,7 @@ pub mod cfreak;
 pub mod chain;
 pub mod lowflow;
 pub mod mstk;
+pub mod norm;
 pub mod pchr;
 pub mod tone;
 pub mod vareq;
