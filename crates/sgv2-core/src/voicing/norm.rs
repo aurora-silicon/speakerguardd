@@ -29,6 +29,8 @@
 //!   lean below the reading, so the history spans seconds, not the whole
 //!   program. A reset clears it and seeds the eleven bins around the
 //!   expected loudness with one count each.
+//!   A window below the validity floor still emits one slot containing the
+//!   retained reading; the following hold does not skip or reset that slot.
 //! - the long reading passes a preconditioner against the 512-frame level
 //!   (less its own store): it follows the reading while that level is above
 //!   it and, once the reading overtakes it, holds the level it overtook.
@@ -244,7 +246,8 @@ impl LongTerm {
         self.gate_a = pole(GATE_S, self.rate);
     }
 
-    /// One window's mean power; the new reading.
+    /// One window's mean power; the output slot. An invalid window returns
+    /// the retained reading without changing or aging the histogram.
     fn update(&mut self, power: f64) -> f64 {
         let l = loudness(power);
         if l <= VALID_DB {
@@ -581,15 +584,16 @@ impl Run {
         let db = level(ema);
         self.peak = self.peak.max(db);
         self.events += 1;
+        let mut long = self.long.reading;
         if self.steps == 0 && self.blocks == 0 {
             self.window.resum();
-            self.long.update(self.window.mean());
+            long = self.long.update(self.window.mean());
         }
         self.window.push(ema);
         if self.steps == 0 {
             let mid = self.median.push(db);
             self.mid_max = self.mid_max.max(mid);
-            self.pending = Some((db, mid, self.long.reading));
+            self.pending = Some((db, mid, long));
             self.blocks = (self.blocks + 1) % PER_LONG;
         }
         self.steps = (self.steps + 1) % PER_BLOCK;
@@ -824,7 +828,7 @@ mod tests {
         // windows under the validity floor neither count nor age it
         let before = m.reading;
         for _ in 0..(20.0 * rate) as usize {
-            m.update(power_of(-80.0));
+            assert_eq!(m.update(power_of(-80.0)), before);
         }
         assert_eq!(m.reading, before);
     }
