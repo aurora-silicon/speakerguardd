@@ -486,6 +486,9 @@ pub struct Run {
     /// that low pass and high pass still sum to an all-pass (the harmonic
     /// branch is not).
     lp_sign: f64,
+    /// The harmonic branch is inverted when the crossover and the band's
+    /// lower edge are both of even or both of odd Butterworth order.
+    harm_sign: f64,
     ap: Cascade,
     ap_st: CascadeState,
     /// Harmonic band: the lower edge's high pass with the first half of the
@@ -548,6 +551,7 @@ impl Run {
             lp,
             lp_st: CascadeState::default(),
             lp_sign: if (p.hp_order / 2) % 2 == 1 { -1.0 } else { 1.0 },
+            harm_sign: if (p.hp_order / 2) % 2 == nl % 2 { -1.0 } else { 1.0 },
             ap,
             ap_st: CascadeState::default(),
             band_hp,
@@ -659,7 +663,7 @@ impl Run {
                 let hp = self.band_hp.run(&mut self.band_hp_st, dev);
                 self.p.harmonic_gain * self.band_lp.run(&mut self.band_lp_st, hp)
             };
-            let delayed = self.branch_delay(low + harm);
+            let delayed = self.branch_delay(low + self.harm_sign * harm);
             let common = run_strided(&self.sub, self.stride, &mut self.sub_st, delayed);
             let (l, pos) = (self.latency, self.opos);
             for (c, b) in bufs[..ch].iter_mut().enumerate() {
