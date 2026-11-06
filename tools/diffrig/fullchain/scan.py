@@ -151,8 +151,14 @@ def main():
     ts = json.load(open(A.ts))[A.name]; keys = TS_KEY[A.name]; nd = len(keys)
     man = json.loads(tarfile.open(A.bundle).extractfile('audio-tuning/manifest.json').read())
     blob = os.path.join(A.out, 'unit.blob')
+    # Same unit configuration on both sides: the macOS reference (mac_refs.py) runs
+    # SpeakerProtect without the unit's speaker calibration (no 64009), so the v2 blob is
+    # compiled without the unit binding too. A calibrated v2 unit adds its sense pilot
+    # (a DC/sub-20 Hz term) on every lane, which the driver model reads as static cone
+    # displacement; comparing that against an uncalibrated macOS run is a false alarm
+    # (lane BVB, 2026-11-06 M2 tweeter finding, withdrawn).
     run([os.path.join(A.bins, 'aurora-speaker-tuning'), 'compile', '--board', man['board'],
-         '--unit-id', man['unit_id'], '--bundle', A.bundle, '-o', blob])
+         '--bundle', A.bundle, '-o', blob])
     info = os.path.join(A.out, 'chain-info.json')
     rows, informational = [], False
     for prog in sorted(f[:-4] for f in os.listdir(A.progs) if f.endswith('.f32')):
