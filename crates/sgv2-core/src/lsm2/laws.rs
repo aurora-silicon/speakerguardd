@@ -89,18 +89,12 @@ pub struct ThermalBranch {
 }
 
 impl ThermalBranch {
-    /// The first-order bilinear section at the substep rate. The analog
-    /// numerator and pole are quantized before the transform, then the
-    /// generated numerator and feedback coefficient are retained
-    /// independently.
+    /// The matched pole of `tau` for an update every `dt` seconds and the
+    /// numerator `Rth (1 - exp(-dt/tau)) / 2`.
     pub fn new(rth: f64, tau: f64, dt: f64) -> Self {
-        let rate = r32(1.0 / dt) as f64;
-        let analog_num = r32(rth / tau) as f64;
-        let analog_pole = r32(1.0 / tau) as f64;
-        let den = 2.0 * rate + analog_pole;
-        let a1 = r32((analog_pole - 2.0 * rate) / den);
-        let b0 = r32(analog_num / den);
-        let alpha = 1.0f32 + a1;
+        let ideal = 1.0 - libm::exp(-dt / tau);
+        let alpha = 1.0f32 - r32(1.0 - ideal);
+        let b0 = r32(rth * ideal / 2.0);
         ThermalBranch { alpha, r_eff: (b0 + b0) / alpha }
     }
     /// `theta + alpha (R_eff P - theta)`.
@@ -785,13 +779,6 @@ mod tests {
         let dc = (b[0] + b[1] + b[2]) as f64 / (1.0 + a[0] as f64 + a[1] as f64);
         assert!((dc * 4.0 - 1.0).abs() < 1e-4, "{dc}");
         assert!((a[1] as f64) < 1.0 && (a[1] as f64) > 0.0);
-    }
-
-    #[test]
-    fn thermal_branch_quantizes_the_analog_section_before_transforming() {
-        let branch = ThermalBranch::new(3.0, 0.75, 1.0 / 1500.0);
-        assert_eq!(branch.alpha.to_bits(), 0x3a68_e800);
-        assert_eq!(branch.r_eff.to_bits(), 0x4040_0181);
     }
 
     #[test]
