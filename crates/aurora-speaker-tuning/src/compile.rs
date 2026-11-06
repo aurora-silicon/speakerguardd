@@ -503,16 +503,58 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
     if get(id::BYPASS_SYS_ID)? != 1.0 {
         unsupported.push("system identification".to_owned());
     }
+    if get(id::amp0(id::A_USE_BATTERY))? != 0.0 {
+        unsupported.push("battery power model".to_owned());
+    }
+    if (0..4).any(|j| g.get(id::amp0(id::A_SOFT_LIMIT + j)).is_some_and(|v| v != 100.0)) {
+        unsupported.push("power soft limits other than 100 %".to_owned());
+    }
+    let mut selected_amp_model = None;
     for c in 0..n as u32 {
+        let bank = whole(id::CH_TUNING + c, "ChTuning")?;
+        if bank != 0 {
+            unsupported.push(format!("Ch{c}Tuning selects bank {bank} instead of 0"));
+        }
         let ty = whole(id::CH_SPEAKER_TYPE + c, "ChSpeakerType")?;
         if ty > 2 {
             return Err(bad(format!("Ch{c}SpeakerType {ty} is not a type A/B/C")));
+        }
+        let model_key = id::channel(c, id::CH_POWER_AMP_MODEL);
+        if g.get(model_key).is_none() {
+            unsupported.push(format!("channel {c} lacks saved PowerAmpModel"));
+        } else {
+            let model = whole(model_key, "PowerAmpModel")?;
+            if model > 2 {
+                return Err(bad(format!("channel {c} PowerAmpModel {model}")));
+            }
+            if selected_amp_model.is_some_and(|m| m != model) {
+                let feature = "channels select different amplifier models".to_owned();
+                if !unsupported.contains(&feature) {
+                    unsupported.push(feature);
+                }
+            }
+            selected_amp_model = Some(model);
+            for (field, rail) in [(id::A_ENABLE_MID, "mid"), (id::A_ENABLE_HIGH, "high")] {
+                let key = if model == 0 { id::amp0(field) } else { id::amp(model, field - 1) };
+                if get(key)? != 0.0 {
+                    let feature = format!("amplifier model {model} enables its {rail} rail");
+                    if !unsupported.contains(&feature) {
+                        unsupported.push(feature);
+                    }
+                }
+            }
         }
         for (m, manager) in [
             (id::MANAGER_ADMITTANCE, "admittance"),
             (id::MANAGER_DISPLACEMENT, "displacement"),
             (id::MANAGER_VELOCITY, "velocity"),
         ] {
+            if get(id::model(m, ty, id::M_ENABLE_RES1))? == 0.0 {
+                let feature = format!("type {ty} {manager} model without resonator 1");
+                if !unsupported.contains(&feature) {
+                    unsupported.push(feature);
+                }
+            }
             for (k, name) in [
                 (id::M_ENABLE_RES2, "resonator 2"),
                 (id::M_ENABLE_LR2, "LR2 inductance"),
@@ -530,7 +572,7 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
         }
     }
     if !unsupported.is_empty() {
-        return Err(refuse(&unsupported.join("; ")));
+        return Err(bad(format!("unsupported or incomplete LSM2 configuration: {}", unsupported.join("; "))));
     }
     let model_only = (get(id::BYPASS_SYS_ID)? == 1.0 && get(id::ENABLE_CLOSED_LOOP_TEMPERATURE)? == 0.0) as u32;
 
