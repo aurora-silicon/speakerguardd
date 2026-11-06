@@ -381,9 +381,20 @@ impl Run {
         let l = self.lookahead;
         for k in 0..frames {
             let mut peak = 0.0f64;
+            let mut frame = [0.0f64; MAX_CHANNELS];
             self.hist_at = (self.hist_at + 1) % TAPS;
             for (c, b) in bufs[..ch].iter().enumerate() {
-                let x = if b[k].is_finite() { f64::from(b[k]) } else { 0.0 };
+                let mut x = if b[k].is_finite() { f64::from(b[k]) } else { 0.0 };
+                if self.saturation_mix > 0.0 {
+                    x = (1.0 - self.saturation_mix) * x + self.saturation_mix * libm::sin(x);
+                    for section in 0..SATURATION_SECTIONS {
+                        x = self.saturation_filter[section].run(&mut self.saturation_state[c][section], x);
+                    }
+                    let held = self.saturation_line[c][self.saturation_at];
+                    self.saturation_line[c][self.saturation_at] = x as f32;
+                    x = f64::from(held);
+                }
+                frame[c] = x;
                 let hist = &mut self.hist[c * TAPS..(c + 1) * TAPS];
                 hist[self.hist_at] = x;
                 let mut a = libm::fabs(x);
@@ -404,20 +415,9 @@ impl Run {
             let g = self.gain(peak);
             for (c, b) in bufs[..ch].iter_mut().enumerate() {
                 let slot = c * l + self.line_at;
-                let x = if b[k].is_finite() { b[k] } else { 0.0 };
                 let delayed = self.line[slot];
-                self.line[slot] = x;
-                let mut output = f64::from(delayed) * g;
-                if self.saturation_mix > 0.0 {
-                    output = (1.0 - self.saturation_mix) * output + self.saturation_mix * libm::sin(output);
-                    for section in 0..SATURATION_SECTIONS {
-                        output = self.saturation_filter[section].run(&mut self.saturation_state[c][section], output);
-                    }
-                    let held = self.saturation_line[c][self.saturation_at];
-                    self.saturation_line[c][self.saturation_at] = output as f32;
-                    output = f64::from(held);
-                }
-                b[k] = output as f32;
+                self.line[slot] = frame[c] as f32;
+                b[k] = (f64::from(delayed) * g) as f32;
             }
             self.line_at = (self.line_at + 1) % l;
             if self.saturation_mix > 0.0 {
