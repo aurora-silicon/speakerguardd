@@ -2032,10 +2032,9 @@ impl Run {
             let vlim_g = c.vel_limit_now as f32;
             let stream_ready = c.protected_peak.ready();
             c.protected_peak_advanced = false;
-            let ramp_entry = complete_host_frame
-                && centroid > c.input_centroid_previous
-                && c.protected_peak_now > c.protected_peak_previous
-                && c.protected_peak_now < vlim_g;
+            let stream_rising = c.protected_peak_now > c.protected_peak_previous;
+            let ramp_source = complete_host_frame && centroid > c.input_centroid_previous && stream_rising;
+            let ramp_entry = complete_host_frame && stream_rising && c.protected_peak_now < vlim_g;
             c.input_centroid_previous = centroid;
             c.protected_peak_previous = c.protected_peak_now;
             let prior_bound = c.vel_bound_window.last().copied().unwrap_or(0.0);
@@ -2061,7 +2060,7 @@ impl Run {
             // protected envelope and the decision-local protected trial owns
             // the segment. This compares existing producer states, not signal
             // levels, spectra, case identities, or fitted thresholds.
-            if vel_on && complete_host_frame && stream_ready && !ramp_entry && !c.vel_bound_release {
+            if vel_on && complete_host_frame && stream_ready && !c.vel_bound_release {
                 let all = (0, BANDS);
                 let mut producer_r = [1.0; BANDS];
                 if disp_on {
@@ -2079,40 +2078,44 @@ impl Run {
                         producer_r,
                     );
                 }
-                let mut offset = 0;
-                let mut boundary = c.vel_bound_window[od - 1];
-                for &len in fragments {
-                    let mut peak = 0.0f32;
-                    for i in od + offset..od + offset + len {
-                        let mut y = c.vcar[i];
-                        for k in 0..BANDS {
-                            y += (producer_r[k] * sg) * c.vb[k][i];
+                let ordinary_onset = velocity_band_gains(&c.vb, &c.vcar, vfirst, vlim_g, sg, all, producer_r);
+                let onset_admitted = (c.vel_active.0..c.vel_active.1).any(|k| ordinary_onset[k] < producer_r[k]);
+                if !ramp_source || onset_admitted {
+                    let mut offset = 0;
+                    let mut boundary = c.vel_bound_window[od - 1];
+                    for &len in fragments {
+                        let mut peak = 0.0f32;
+                        for i in od + offset..od + offset + len {
+                            let mut y = c.vcar[i];
+                            for k in 0..BANDS {
+                                y += (producer_r[k] * sg) * c.vb[k][i];
+                            }
+                            peak = peak.max(y.abs());
                         }
-                        peak = peak.max(y.abs());
-                    }
-                    let onset_bound = peak.min(vlim_g);
-                    // The streaming producer is the moving protected trial
-                    // envelope advanced by the admitted host fragment. Quiet
-                    // history is seeded at the structural floor; a nonzero
-                    // trial, including one below that floor, is admitted.
-                    let stream_source = if onset_bound == 0.0 { 0.25 * vlim_g } else { onset_bound };
-                    let stream_bound = c.protected_peak.update(stream_source, len).min(vlim_g);
-                    c.protected_peak_now = stream_bound;
-                    c.protected_peak_advanced = true;
-                    let admitted = arbitrate_producer_segment(onset_bound, stream_bound);
-                    let segment = &mut c.vel_bound_window[od + offset..od + offset + len];
-                    if admitted >= boundary {
-                        segment.fill(admitted);
-                    } else {
-                        let step = (admitted - boundary) / len as f32;
-                        for (i, value) in segment.iter_mut().enumerate() {
-                            *value = boundary + step * (i + 1) as f32;
+                        let onset_bound = peak.min(vlim_g);
+                        // The streaming producer is the moving protected trial
+                        // envelope advanced by the admitted host fragment. Quiet
+                        // history is seeded at the structural floor; a nonzero
+                        // trial, including one below that floor, is admitted.
+                        let stream_source = if onset_bound == 0.0 { 0.25 * vlim_g } else { onset_bound };
+                        let stream_bound = c.protected_peak.update(stream_source, len).min(vlim_g);
+                        c.protected_peak_now = stream_bound;
+                        c.protected_peak_advanced = true;
+                        let admitted = arbitrate_producer_segment(onset_bound, stream_bound);
+                        let segment = &mut c.vel_bound_window[od + offset..od + offset + len];
+                        if admitted >= boundary {
+                            segment.fill(admitted);
+                        } else {
+                            let step = (admitted - boundary) / len as f32;
+                            for (i, value) in segment.iter_mut().enumerate() {
+                                *value = boundary + step * (i + 1) as f32;
+                            }
                         }
+                        boundary = admitted;
+                        offset += len;
                     }
-                    boundary = admitted;
-                    offset += len;
+                    debug_assert_eq!(offset, ctl);
                 }
-                debug_assert_eq!(offset, ctl);
             }
             let retained_room_bound = c.vel_bound_window[od..].iter().copied().fold(0.0f32, f32::max);
             let velocity_cut = core::cell::Cell::new(false);
