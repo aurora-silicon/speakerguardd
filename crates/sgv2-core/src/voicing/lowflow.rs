@@ -24,16 +24,10 @@ use alloc::{boxed::Box, vec, vec::Vec};
 pub const LATENCY_FRAMES: usize = 256;
 pub const RESPONSE_TAPS: usize = 1024;
 pub const MAX_MODELS: usize = MAX_CHANNELS / 2;
+#[cfg(not(feature = "lowflow-conservative"))]
+const SPECTRAL_HOP: usize = 128;
 const MODEL_SCALARS: usize = 28;
 const MAX_FS: f64 = 192_000.0;
-// Unit-family behavior, independent of any tuning's saved values.
-#[cfg(not(feature = "lowflow-conservative"))]
-const LEGACY_VELOCITY_SCALE: f64 = 1.04;
-#[cfg(not(feature = "lowflow-conservative"))]
-const MODERN_VELOCITY_SCALE: f64 = 1.22;
-const INVARIANT_TRANSITION_DB: f64 = 1.3;
-const MODERN_TRANSITION_DB: f64 = 2.0;
-#[cfg(feature = "lowflow-conservative")]
 const CONSERVATIVE_GUARD_DB: f64 = 6.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -114,12 +108,14 @@ pub struct Params {
     pub model_count: usize,
     pub link_channel_energies: bool,
     pub latency_frames: usize,
+    /// Use the guarded whole-lane fallback because the exact sidecar model is incomplete.
+    pub conservative_fallback: bool,
     pub models: [Model; MAX_MODELS],
 }
 
 impl Params {
     const MODEL_WORDS: usize = MODEL_SCALARS + 2 * RESPONSE_TAPS;
-    pub const WORDS: usize = 3 + MAX_MODELS * Self::MODEL_WORDS;
+    pub const WORDS: usize = 4 + MAX_MODELS * Self::MODEL_WORDS;
 
     pub fn to_words(&self, out: &mut [f64]) {
         if out.len() < Self::WORDS {
@@ -129,8 +125,9 @@ impl Params {
         out[0] = self.model_count as f64;
         out[1] = f64::from(self.link_channel_energies);
         out[2] = self.latency_frames as f64;
+        out[3] = f64::from(self.conservative_fallback);
         for (i, model) in self.models.iter().enumerate() {
-            let at = 3 + i * Self::MODEL_WORDS;
+            let at = 4 + i * Self::MODEL_WORDS;
             out[at..at + MODEL_SCALARS].copy_from_slice(&scalars(model));
             out[at + MODEL_SCALARS..at + MODEL_SCALARS + RESPONSE_TAPS].copy_from_slice(&model.pressure_response);
             out[at + MODEL_SCALARS + RESPONSE_TAPS..at + Self::MODEL_WORDS].copy_from_slice(&model.tweeter_response);
@@ -150,15 +147,16 @@ impl Params {
         if words[2] != latency_frames as f64 || !(1..=4096).contains(&latency_frames) {
             return None;
         }
+        let conservative_fallback = bool_word(words[3])?;
         let mut models = [Model::default(); MAX_MODELS];
         for (i, model) in models.iter_mut().enumerate() {
-            let at = 3 + i * Self::MODEL_WORDS;
+            let at = 4 + i * Self::MODEL_WORDS;
             *model = from_scalars(&words[at..at + MODEL_SCALARS])?;
             model.pressure_response.copy_from_slice(&words[at + MODEL_SCALARS..at + MODEL_SCALARS + RESPONSE_TAPS]);
             model.tweeter_response.copy_from_slice(&words[at + MODEL_SCALARS + RESPONSE_TAPS..at + Self::MODEL_WORDS]);
         }
         (models[..model_count].iter().all(valid_model) && models[model_count..].iter().all(|m| *m == Model::default()))
-            .then_some(Self { model_count, link_channel_energies, latency_frames, models })
+            .then_some(Self { model_count, link_channel_energies, latency_frames, conservative_fallback, models })
     }
 }
 
@@ -341,8 +339,6 @@ impl Biquad {
 }
 
 struct State {
-    detector_hp: Biquad,
-    detector_lp: Biquad,
     mask_hp: Biquad,
     mask_lp: Biquad,
     mask_hp2: Biquad,
@@ -357,13 +353,252 @@ struct State {
     mask_energy: f64,
     mask_attack: f64,
     mask_release: f64,
+    #[cfg(feature = "lowflow-conservative")]
     gain: f64,
+    #[cfg(feature = "lowflow-conservative")]
     gain_release: f64,
     floor: f64,
     #[cfg(feature = "lowflow-conservative")]
     conservative_floor: f64,
     #[cfg(not(feature = "lowflow-conservative"))]
-    velocity_scale: f64,
+    velocity_block_energy: f64,
+    #[cfg(not(feature = "lowflow-conservative"))]
+    velocity_block_frames: usize,
+    #[cfg(not(feature = "lowflow-conservative"))]
+    hop_velocity: f64,
+    #[cfg(not(feature = "lowflow-conservative"))]
+    velocity_history: [f64; 2],
+    #[cfg(not(feature = "lowflow-conservative"))]
+    spectral: Spectral,
+}
+
+#[cfg(not(feature = "lowflow-conservative"))]
+#[derive(Clone, Copy, Default)]
+struct Complex {
+    re: f64,
+    im: f64,
+}
+
+#[cfg(not(feature = "lowflow-conservative"))]
+impl Complex {
+    fn mul(self, other: Self) -> Self {
+        Self { re: self.re * other.re - self.im * other.im, im: self.re * other.im + self.im * other.re }
+    }
+}
+
+/// Fixed-hop frequency-selective gain application. Construction allocates all
+/// scratch; [`Spectral::run_hop`] is allocation-free.
+#[cfg(not(feature = "lowflow-conservative"))]
+struct Spectral {
+    n: usize,
+    min_bin: usize,
+    max_bin: usize,
+    history: Box<[f64]>,
+    overlap: Box<[f64]>,
+    window: Box<[f64]>,
+    bins: Box<[Complex]>,
+    scratch: Box<[Complex]>,
+    twiddles: Box<[Complex]>,
+    gains: Box<[f64]>,
+    target: f64,
+    release: f64,
+}
+
+#[cfg(not(feature = "lowflow-conservative"))]
+impl Spectral {
+    fn new(model: &Model, fs: f64, latency: usize) -> Self {
+        let n = latency.saturating_add(SPECTRAL_HOP).clamp(2 * SPECTRAL_HOP, 4 * SPECTRAL_HOP);
+        let mut window = vec![0.0; n];
+        for (i, value) in window.iter_mut().enumerate() {
+            let phase = 2.0 * core::f64::consts::PI * i as f64 / n as f64;
+            let hann = 0.5 - 0.5 * libm::cos(phase);
+            *value = libm::sqrt((hann * SPECTRAL_HOP as f64 / n as f64).max(0.0));
+        }
+        let mut twiddles = vec![Complex::default(); n];
+        for (i, value) in twiddles.iter_mut().enumerate() {
+            let phase = -2.0 * core::f64::consts::PI * i as f64 / n as f64;
+            *value = Complex { re: libm::cos(phase), im: libm::sin(phase) };
+        }
+        let min_bin = libm::round(model.min_frequency_hz * n as f64 / fs) as usize;
+        let max_bin = libm::round(model.max_frequency_hz * n as f64 / fs) as usize;
+        let bin_count = n / 2 + 1;
+        Self {
+            n,
+            min_bin: min_bin.min(bin_count - 1),
+            max_bin: max_bin.clamp(1, bin_count),
+            history: vec![0.0; n].into_boxed_slice(),
+            overlap: vec![0.0; n].into_boxed_slice(),
+            window: window.into_boxed_slice(),
+            bins: vec![Complex::default(); n].into_boxed_slice(),
+            scratch: vec![Complex::default(); n].into_boxed_slice(),
+            twiddles: twiddles.into_boxed_slice(),
+            gains: vec![1.0; bin_count].into_boxed_slice(),
+            target: 1.0,
+            release: hop_coefficient(model.release_s, fs),
+        }
+    }
+
+    fn reset(&mut self) {
+        self.history.fill(0.0);
+        self.overlap.fill(0.0);
+        self.bins.fill(Complex::default());
+        self.scratch.fill(Complex::default());
+        self.gains.fill(1.0);
+        self.target = 1.0;
+    }
+
+    fn set_target(&mut self, target: f64) {
+        self.target = target.clamp(0.0, 1.0);
+    }
+
+    fn run_hop(&mut self, io: &mut [f32]) {
+        debug_assert_eq!(io.len(), SPECTRAL_HOP);
+        self.history.copy_within(SPECTRAL_HOP.., 0);
+        let tail = self.n - SPECTRAL_HOP;
+        for (dst, src) in self.history[tail..].iter_mut().zip(io.iter()) {
+            *dst = f64::from(finite(*src));
+        }
+        for i in 0..self.n {
+            self.bins[i] = Complex { re: self.history[i] * self.window[i], im: 0.0 };
+        }
+        transform(&mut self.bins, &mut self.scratch, &self.twiddles, false);
+        self.update_gains();
+        for i in 0..self.n {
+            let bin = if i <= self.n / 2 { i } else { self.n - i };
+            self.bins[i].re *= self.gains[bin];
+            self.bins[i].im *= self.gains[bin];
+        }
+        transform(&mut self.bins, &mut self.scratch, &self.twiddles, true);
+        for i in 0..self.n {
+            self.overlap[i] += 2.0 * self.window[i] * self.bins[i].re;
+        }
+        for (dst, value) in io.iter_mut().zip(&self.overlap[..SPECTRAL_HOP]) {
+            *dst = if value.is_finite() { *value as f32 } else { 0.0 };
+        }
+        self.overlap.copy_within(SPECTRAL_HOP.., 0);
+        self.overlap[self.n - SPECTRAL_HOP..].fill(0.0);
+        self.target = 1.0;
+    }
+
+    fn update_gains(&mut self) {
+        let start = self.min_bin.min(self.gains.len());
+        let end = self.max_bin.max(start).min(self.gains.len());
+        let mut cap = f64::INFINITY;
+        if self.target < 1.0 && start < end {
+            let mut sum = 0.0;
+            for value in &self.bins[start..end] {
+                sum += value.re * value.re + value.im * value.im;
+            }
+            let wanted = self.target * libm::sqrt(sum / (end - start) as f64);
+            if wanted > 0.0 {
+                let mut lo = 0.0;
+                let mut hi =
+                    self.bins[start..end].iter().map(|v| libm::sqrt(v.re * v.re + v.im * v.im)).fold(0.0_f64, f64::max);
+                for _ in 0..32 {
+                    let cap = 0.5 * (lo + hi);
+                    let mut clipped = 0.0;
+                    for value in &self.bins[start..end] {
+                        let magnitude = libm::sqrt(value.re * value.re + value.im * value.im);
+                        let limited = magnitude.min(cap);
+                        clipped += limited * limited;
+                    }
+                    if libm::sqrt(clipped / (end - start) as f64) > wanted {
+                        hi = cap;
+                    } else {
+                        lo = cap;
+                    }
+                }
+                cap = 0.5 * (lo + hi);
+            }
+        }
+        for (bin, gain) in self.gains.iter_mut().enumerate() {
+            let target = if (start..end).contains(&bin) && cap.is_finite() {
+                let value = self.bins[bin];
+                let magnitude = libm::sqrt(value.re * value.re + value.im * value.im);
+                if magnitude > 0.0 {
+                    (cap / magnitude).clamp(0.0, 1.0)
+                } else {
+                    1.0
+                }
+            } else {
+                1.0
+            };
+            let released = *gain + self.release * (target - *gain);
+            *gain = target.min(released).clamp(0.0, 1.0);
+        }
+    }
+}
+
+#[cfg(not(feature = "lowflow-conservative"))]
+fn transform(values: &mut [Complex], scratch: &mut [Complex], twiddles: &[Complex], inverse: bool) {
+    let n = values.len();
+    if n.is_power_of_two() {
+        fft_pow2(values, twiddles, inverse);
+    } else {
+        debug_assert_eq!(n, 3 * SPECTRAL_HOP);
+        for r in 0..3 {
+            for k in 0..SPECTRAL_HOP {
+                scratch[r * SPECTRAL_HOP + k] = values[3 * k + r];
+            }
+            fft_pow2(&mut scratch[r * SPECTRAL_HOP..(r + 1) * SPECTRAL_HOP], twiddles, inverse);
+        }
+        for q in 0..3 {
+            for k in 0..SPECTRAL_HOP {
+                let index = k + q * SPECTRAL_HOP;
+                let mut sum = Complex::default();
+                for r in 0..3 {
+                    let mut twiddle = twiddles[index * r % n];
+                    if inverse {
+                        twiddle.im = -twiddle.im;
+                    }
+                    let value = scratch[r * SPECTRAL_HOP + k].mul(twiddle);
+                    sum.re += value.re;
+                    sum.im += value.im;
+                }
+                values[index] = sum;
+            }
+        }
+    }
+    if inverse {
+        for value in values {
+            value.re /= n as f64;
+            value.im /= n as f64;
+        }
+    }
+}
+
+#[cfg(not(feature = "lowflow-conservative"))]
+fn fft_pow2(values: &mut [Complex], twiddles: &[Complex], inverse: bool) {
+    let n = values.len();
+    let table_n = twiddles.len();
+    let mut j = 0;
+    for i in 1..n {
+        let mut bit = n >> 1;
+        while j & bit != 0 {
+            j ^= bit;
+            bit >>= 1;
+        }
+        j ^= bit;
+        if i < j {
+            values.swap(i, j);
+        }
+    }
+    let mut len = 2;
+    while len <= n {
+        for base in (0..n).step_by(len) {
+            for k in 0..len / 2 {
+                let mut twiddle = twiddles[k * table_n / len];
+                if inverse {
+                    twiddle.im = -twiddle.im;
+                }
+                let even = values[base + k];
+                let odd = values[base + k + len / 2].mul(twiddle);
+                values[base + k] = Complex { re: even.re + odd.re, im: even.im + odd.im };
+                values[base + k + len / 2] = Complex { re: even.re - odd.re, im: even.im - odd.im };
+            }
+        }
+        len <<= 1;
+    }
 }
 
 pub struct Run {
@@ -375,6 +610,8 @@ pub struct Run {
     line: Box<[f32]>,
     line_at: usize,
     latency_frames: usize,
+    #[cfg(not(feature = "lowflow-conservative"))]
+    conservative_fallback: bool,
     volume_db: f64,
 }
 
@@ -388,8 +625,6 @@ impl Run {
             let electrical_damping = m.bl * m.bl / m.reb;
             let force = m.bl / m.reb * m.analog_gain;
             state.push(State {
-                detector_hp: Biquad::butterworth(fs, m.min_frequency_hz * 0.8, true),
-                detector_lp: Biquad::butterworth(fs, m.max_frequency_hz, false),
                 mask_hp: Biquad::butterworth(fs, m.mask_band_min_hz, true),
                 mask_lp: Biquad::butterworth(fs, m.mask_band_max_hz, false),
                 mask_hp2: Biquad::butterworth(fs, m.mask_band_min_hz, true),
@@ -410,17 +645,23 @@ impl Run {
                 mask_energy: 0.0,
                 mask_attack: coefficient(m.mask_attack_s, fs),
                 mask_release: coefficient(m.mask_release_s, fs),
+                #[cfg(feature = "lowflow-conservative")]
                 gain: 1.0,
+                #[cfg(feature = "lowflow-conservative")]
                 gain_release: gain_release_coefficient(m.release_s, fs),
                 floor: 1.0,
                 #[cfg(feature = "lowflow-conservative")]
                 conservative_floor: 1.0,
                 #[cfg(not(feature = "lowflow-conservative"))]
-                velocity_scale: if params.latency_frames > LATENCY_FRAMES {
-                    MODERN_VELOCITY_SCALE
-                } else {
-                    LEGACY_VELOCITY_SCALE
-                },
+                velocity_block_energy: 0.0,
+                #[cfg(not(feature = "lowflow-conservative"))]
+                velocity_block_frames: 0,
+                #[cfg(not(feature = "lowflow-conservative"))]
+                hop_velocity: 0.0,
+                #[cfg(not(feature = "lowflow-conservative"))]
+                velocity_history: [0.0; 2],
+                #[cfg(not(feature = "lowflow-conservative"))]
+                spectral: Spectral::new(m, fs, params.latency_frames),
             });
         }
         let mut run = Self {
@@ -432,6 +673,8 @@ impl Run {
             line: vec![0.0; channels * params.latency_frames].into_boxed_slice(),
             line_at: 0,
             latency_frames: params.latency_frames,
+            #[cfg(not(feature = "lowflow-conservative"))]
+            conservative_fallback: params.conservative_fallback,
             volume_db: 0.0,
         };
         run.set_volume(0.0);
@@ -444,15 +687,7 @@ impl Run {
         for (state, model) in self.state.iter_mut().zip(self.params.iter()) {
             let t = ((self.volume_db - model.mid_level_db) / -model.mid_level_db).clamp(0.0, 1.0);
             let attenuation = model.mid_attenuation_db + t * (model.max_attenuation_db - model.mid_attenuation_db);
-            let invariant = libm::fabs(model.max_attenuation_db - model.mid_attenuation_db) < 0.01;
-            let transition = if invariant {
-                INVARIANT_TRANSITION_DB
-            } else if self.latency_frames > LATENCY_FRAMES {
-                MODERN_TRANSITION_DB * t
-            } else {
-                0.0
-            };
-            state.floor = db_gain(-(attenuation + transition));
+            state.floor = db_gain(-attenuation);
             #[cfg(feature = "lowflow-conservative")]
             {
                 state.conservative_floor = db_gain(-(attenuation + CONSERVATIVE_GUARD_DB));
@@ -464,8 +699,6 @@ impl Run {
         self.line.fill(0.0);
         self.line_at = 0;
         for state in self.state.iter_mut() {
-            state.detector_hp.reset();
-            state.detector_lp.reset();
             state.mask_hp.reset();
             state.mask_lp.reset();
             state.mask_hp2.reset();
@@ -476,7 +709,18 @@ impl Run {
             state.tweeter_history.fill(0.0);
             state.history_at = 0;
             state.mask_energy = 0.0;
-            state.gain = 1.0;
+            #[cfg(feature = "lowflow-conservative")]
+            {
+                state.gain = 1.0;
+            }
+            #[cfg(not(feature = "lowflow-conservative"))]
+            {
+                state.velocity_block_energy = 0.0;
+                state.velocity_block_frames = 0;
+                state.hop_velocity = 0.0;
+                state.velocity_history = [0.0; 2];
+                state.spectral.reset();
+            }
         }
     }
 
@@ -485,6 +729,7 @@ impl Run {
     }
 
     #[allow(clippy::needless_range_loop)] // one frame across planar buffers
+    #[cfg(feature = "lowflow-conservative")]
     pub fn process(&mut self, bufs: &mut [&mut [f32]], frames: usize) {
         let channels = self.channels.min(bufs.len());
         let frames = bufs[..channels].iter().fold(frames, |n, b| n.min(b.len()));
@@ -559,6 +804,110 @@ impl Run {
             self.line_at = (self.line_at + 1) % self.latency_frames;
         }
     }
+
+    #[allow(clippy::needless_range_loop)] // one frame across planar buffers
+    #[cfg(not(feature = "lowflow-conservative"))]
+    pub fn process(&mut self, bufs: &mut [&mut [f32]], frames: usize) {
+        let channels = self.channels.min(bufs.len());
+        let frames = bufs[..channels].iter().fold(frames, |n, b| n.min(b.len()));
+        let mut chunk_at = 0;
+        while chunk_at < frames {
+            let chunk_frames = SPECTRAL_HOP.min(frames - chunk_at);
+            let full_hop = chunk_frames == SPECTRAL_HOP;
+            for frame in chunk_at..chunk_at + chunk_frames {
+                let mut energies = [0.0; MAX_MODELS];
+                for c in 0..self.models {
+                    let woofer = f64::from(finite(bufs[c][frame]));
+                    let tweeter = f64::from(finite(bufs[c + self.models][frame]));
+                    let state = &mut self.state[c];
+                    state.woofer_history[state.history_at] = woofer;
+                    state.tweeter_history[state.history_at] = tweeter;
+                    let pressure = fir(&state.pressure_taps, &state.woofer_history, state.history_at)
+                        * self.params[c].analog_gain
+                        + fir(&state.tweeter_taps, &state.tweeter_history, state.history_at)
+                            * self.params[c].tweeter_gain;
+                    state.history_at = (state.history_at + 1) % RESPONSE_TAPS;
+                    let mask_band =
+                        state.mask_lp2.run(state.mask_lp.run(state.mask_hp2.run(state.mask_hp.run(pressure))));
+                    energies[c] = mask_band * mask_band;
+                    let velocity = state.cone.run(woofer) + state.front.run(woofer);
+                    state.velocity_block_energy += velocity * velocity;
+                    state.velocity_block_frames += 1;
+                    // The physical detector reports the largest 8-frame RMS
+                    // in each spectral hop, preserving the signed cone/front
+                    // cancellation before energy is measured.
+                    if state.velocity_block_frames == 8 {
+                        let rms = libm::sqrt(state.velocity_block_energy / 8.0);
+                        state.hop_velocity = state.hop_velocity.max(rms);
+                        state.velocity_block_energy = 0.0;
+                        state.velocity_block_frames = 0;
+                    }
+                }
+                if self.link_energies && self.models > 1 {
+                    let total: f64 = energies[..self.models].iter().sum();
+                    energies[..self.models].fill(total);
+                }
+                for c in 0..self.models {
+                    let state = &mut self.state[c];
+                    let alpha = if energies[c] > state.mask_energy { state.mask_attack } else { state.mask_release };
+                    state.mask_energy += alpha * (energies[c] - state.mask_energy);
+                }
+                for c in 0..channels {
+                    let slot = c * self.latency_frames + self.line_at;
+                    let delayed = self.line[slot];
+                    self.line[slot] = finite(bufs[c][frame]);
+                    if c >= self.models {
+                        bufs[c][frame] = delayed;
+                    } else if self.conservative_fallback || !full_hop {
+                        let fallback = self.state[c].floor * db_gain(-CONSERVATIVE_GUARD_DB);
+                        bufs[c][frame] = (f64::from(delayed) * fallback) as f32;
+                    }
+                }
+                self.line_at = (self.line_at + 1) % self.latency_frames;
+            }
+            if full_hop && !self.conservative_fallback {
+                for c in 0..self.models {
+                    let model = &self.params[c];
+                    let state = &mut self.state[c];
+                    let energy_db = 10.0 * libm::log10(state.mask_energy.max(1.0e-30));
+                    let limit = velocity_limit(model, energy_db);
+                    let target = detector_target(model.enabled, model.mute, state.floor, limit, state.velocity_history);
+                    state.spectral.set_target(target);
+                    // The target controls the frame already in flight, so the
+                    // just-completed detector hop becomes history afterwards.
+                    state.velocity_history = [state.hop_velocity, state.velocity_history[0]];
+                    state.hop_velocity = 0.0;
+                    if model.mute {
+                        bufs[c][chunk_at..chunk_at + chunk_frames].fill(0.0);
+                        state.spectral.reset();
+                    } else {
+                        state.spectral.run_hop(&mut bufs[c][chunk_at..chunk_at + chunk_frames]);
+                    }
+                }
+            } else {
+                for state in self.state.iter_mut() {
+                    state.spectral.reset();
+                }
+            }
+            chunk_at += chunk_frames;
+        }
+    }
+}
+
+#[cfg(not(feature = "lowflow-conservative"))]
+fn detector_target(enabled: bool, mute: bool, floor: f64, limit: f64, velocity_history: [f64; 2]) -> f64 {
+    if !enabled {
+        return 1.0;
+    }
+    if mute {
+        return 0.0;
+    }
+    let velocity = limit.max(velocity_history[0]).max(velocity_history[1]);
+    if velocity > 0.0 {
+        (limit / velocity).clamp(floor, 1.0)
+    } else {
+        1.0
+    }
 }
 
 fn coefficient(seconds: f64, fs: f64) -> f64 {
@@ -568,8 +917,17 @@ fn coefficient(seconds: f64, fs: f64) -> f64 {
         1.0 - libm::exp(-1.0 / (seconds * fs))
     }
 }
+#[cfg(feature = "lowflow-conservative")]
 fn gain_release_coefficient(seconds: f64, fs: f64) -> f64 {
     coefficient(seconds, fs)
+}
+#[cfg(not(feature = "lowflow-conservative"))]
+fn hop_coefficient(seconds: f64, fs: f64) -> f64 {
+    if seconds <= 0.0 {
+        1.0
+    } else {
+        1.0 - libm::exp(-(SPECTRAL_HOP as f64) / (seconds * fs))
+    }
 }
 fn fir(taps: &[f64], history: &[f64], newest: usize) -> f64 {
     let mut sum = 0.0;
@@ -666,7 +1024,13 @@ mod tests {
                 },
             };
         }
-        Params { model_count: 2, link_channel_energies: true, latency_frames: LATENCY_FRAMES, models }
+        Params {
+            model_count: 2,
+            link_channel_energies: true,
+            latency_frames: LATENCY_FRAMES,
+            conservative_fallback: false,
+            models,
+        }
     }
 
     fn sine(hz: f64, amp: f32, n: usize) -> Vec<f32> {
@@ -695,6 +1059,98 @@ mod tests {
         assert_eq!(&b[3][LATENCY_FRAMES..], &original[3][..1024 - LATENCY_FRAMES]);
     }
 
+    #[cfg(not(feature = "lowflow-conservative"))]
+    #[test]
+    fn mixed_radix_transforms_round_trip() {
+        for n in [384, 512] {
+            let mut values: Vec<_> =
+                (0..n).map(|i| Complex { re: libm::sin(0.031 * i as f64), im: libm::cos(0.017 * i as f64) }).collect();
+            let original = values.clone();
+            let mut scratch = vec![Complex::default(); n];
+            let twiddles: Vec<_> = (0..n)
+                .map(|i| {
+                    let phase = -2.0 * core::f64::consts::PI * i as f64 / n as f64;
+                    Complex { re: libm::cos(phase), im: libm::sin(phase) }
+                })
+                .collect();
+            transform(&mut values, &mut scratch, &twiddles, false);
+            transform(&mut values, &mut scratch, &twiddles, true);
+            for (actual, expected) in values.iter().zip(original) {
+                assert!((actual.re - expected.re).abs() < 1.0e-9);
+                assert!((actual.im - expected.im).abs() < 1.0e-9);
+            }
+        }
+    }
+
+    #[cfg(not(feature = "lowflow-conservative"))]
+    #[test]
+    fn disabled_lower_lane_is_unity_with_reported_latency() {
+        let mut p = synthetic();
+        p.models[0].enabled = false;
+        p.models[1].enabled = false;
+        let mut run = Run::new(&p, 48_000.0, 4);
+        let mut b = [sine(400.0, 0.7, 2048), vec![0.0; 2048], vec![0.0; 2048], vec![0.0; 2048]];
+        let original = b[0].clone();
+        let mut refs: Vec<&mut [f32]> = b.iter_mut().map(Vec::as_mut_slice).collect();
+        run.process(&mut refs, 2048);
+        for (actual, expected) in b[0][LATENCY_FRAMES..].iter().zip(&original[..2048 - LATENCY_FRAMES]) {
+            assert!((actual - expected).abs() < 2.0e-5, "{actual} != {expected}");
+        }
+    }
+
+    #[cfg(not(feature = "lowflow-conservative"))]
+    #[test]
+    fn waterfill_hits_band_rms_target() {
+        let p = synthetic();
+        let mut spectral = Spectral::new(&p.models[0], 48_000.0, LATENCY_FRAMES);
+        spectral.min_bin = 2;
+        spectral.max_bin = 7;
+        spectral.release = 1.0;
+        for (i, magnitude) in [1.0, 2.0, 4.0, 8.0, 16.0].into_iter().enumerate() {
+            spectral.bins[2 + i].re = magnitude;
+        }
+        spectral.target = 0.4;
+        spectral.update_gains();
+        let before = [1.0_f64, 2.0, 4.0, 8.0, 16.0];
+        let input_rms = libm::sqrt(before.iter().map(|v| v * v).sum::<f64>() / before.len() as f64);
+        let output_rms = libm::sqrt(
+            before
+                .iter()
+                .enumerate()
+                .map(|(i, value)| (value * spectral.gains[2 + i]) * (value * spectral.gains[2 + i]))
+                .sum::<f64>()
+                / before.len() as f64,
+        );
+        assert!((output_rms / input_rms - 0.4).abs() < 1.0e-8);
+        assert!(spectral.gains[0] == 1.0 && spectral.gains[8] == 1.0);
+    }
+
+    #[cfg(not(feature = "lowflow-conservative"))]
+    #[test]
+    fn detector_target_uses_two_completed_hops() {
+        assert_eq!(detector_target(false, false, 0.25, 0.5, [2.0, 4.0]), 1.0);
+        assert_eq!(detector_target(true, true, 0.25, 0.5, [2.0, 4.0]), 0.0);
+        assert_eq!(detector_target(true, false, 0.25, 0.5, [0.2, 0.4]), 1.0);
+        assert_eq!(detector_target(true, false, 0.1, 0.5, [2.0, 4.0]), 0.125);
+        assert_eq!(detector_target(true, false, 0.25, 0.5, [2.0, 4.0]), 0.25);
+    }
+
+    #[cfg(not(feature = "lowflow-conservative"))]
+    #[test]
+    fn flagged_fallback_uses_guarded_ceiling() {
+        let mut p = synthetic();
+        p.conservative_fallback = true;
+        let mut run = Run::new(&p, 48_000.0, 4);
+        let source = sine(400.0, 0.7, 1024);
+        let mut b = [source.clone(), vec![0.0; 1024], vec![0.0; 1024], vec![0.0; 1024]];
+        let mut refs: Vec<&mut [f32]> = b.iter_mut().map(Vec::as_mut_slice).collect();
+        run.process(&mut refs, 1024);
+        let ceiling = db_gain(-(12.0 + CONSERVATIVE_GUARD_DB));
+        for (actual, input) in b[0][LATENCY_FRAMES..].iter().zip(&source[..1024 - LATENCY_FRAMES]) {
+            assert!(f64::from(actual.abs()) <= f64::from(input.abs()) * ceiling + 1.0e-6);
+        }
+    }
+
     #[test]
     fn volume_interpolates_only_attenuation_floor() {
         let p = synthetic();
@@ -708,8 +1164,8 @@ mod tests {
 
     #[test]
     fn zero_release_is_immediate() {
-        assert_eq!(gain_release_coefficient(0.0, 48_000.0), 1.0);
-        assert!(gain_release_coefficient(0.05, 48_000.0) < 1.0);
+        assert_eq!(coefficient(0.0, 48_000.0), 1.0);
+        assert!(coefficient(0.05, 48_000.0) < 1.0);
     }
 
     #[cfg(feature = "lowflow-conservative")]
@@ -734,6 +1190,10 @@ mod tests {
         run.process(&mut refs, 512);
         run.reset();
         assert!(run.line.iter().all(|v| *v == 0.0));
-        assert!(run.state.iter().all(|s| s.gain == 1.0 && s.mask_energy == 0.0));
+        assert!(run.state.iter().all(|s| s.mask_energy == 0.0));
+        #[cfg(feature = "lowflow-conservative")]
+        {
+            assert!(run.state.iter().all(|s| s.gain == 1.0));
+        }
     }
 }
