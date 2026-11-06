@@ -14,7 +14,9 @@
 //! | 7  | harmonic gain, dB                         | linear |
 //! | 8  | low-end blend gain, dB                    | linear |
 //! | 9  | nonlinear device type                     | only the types carried |
-//! | 10 | harmonic compressor on                    | refused if on |
+//! | 10 | harmonic compressor on                    | on / off |
+//! | 11 | harmonic compressor threshold, dB         | linear |
+//! | 12 | harmonic compressor ratio                 | ratio |
 //! | 13 | input gain, dB                            | linear |
 //! | 14 | output gain, dB                           | linear |
 //! | 15 | bypass                                    | `Ok(None)` |
@@ -71,11 +73,14 @@ pub fn compile(stage: &Stage, fs: f64, _diags: &mut Diagnostics) -> Result<Optio
     if monitor != 1.0 {
         return Err(bad(format!("{ctx}: monitor {monitor} (only the full sum, 1, is carried)")));
     }
-    // every value that can change the level must be in the saved state
-    // (AUD: a missing negative gain must not read as 0 dB)
-    if req(10)? != 0.0 {
-        return Err(bad(format!("{ctx}: the harmonic compressor is on (not carried)")));
-    }
+    // Every value that can change the level must be in the saved state
+    // (AUD: a missing negative gain must not read as 0 dB).  Compressor
+    // threshold and ratio matter only when the saved switch enables it.
+    let harmonic_compressor = match req(10)? {
+        0.0 => false,
+        1.0 => true,
+        v => return Err(bad(format!("{ctx}: harmonic compressor {v}"))),
+    };
     let level_control = match req(0)? {
         0.0 => false,
         1.0 => true,
@@ -114,6 +119,9 @@ pub fn compile(stage: &Stage, fs: f64, _diags: &mut Diagnostics) -> Result<Optio
         output_gain: db(req(14)?),
         device,
         level_control,
+        harmonic_compressor,
+        compressor_threshold: if harmonic_compressor { db(req(11)?) } else { 1.0 },
+        compressor_ratio: if harmonic_compressor { req(12)? } else { 1.0 },
     };
     let mut w = [0.0; Params::WORDS];
     p.to_words(&mut w);
