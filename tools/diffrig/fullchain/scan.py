@@ -97,7 +97,17 @@ def power_1s(y, p):
 
 
 def comp(y, f):
-    n = np.arange(len(y)); return 2 * abs(np.sum(y * np.exp(-2j * np.pi * f * n / SR))) / len(y)
+    """Amplitude of the tone f in y (Hann-windowed single-bin DFT, coherent-gain normalised).
+
+    A rectangular window leaks every other component into the tone's bin. Under a woofer
+    high-pass the tone itself is 50-60 dB down while its 3rd harmonic (virtual bass) is
+    30-40 dB stronger than it, and over a 0.25 s segment (6.2 cycles at 24.8 Hz) the
+    rectangular sidelobe at that offset is only ~-26 dB: the measured "tone" was mostly
+    harmonic leakage, with a phase-dependent sign (M1 Pro/J616s woofer steady +3.4..+3.5 dB
+    at 24.8 Hz on 7d5d5ba, +0.02 dB windowed). Hann sidelobes fall at 18 dB/octave.
+    """
+    n = np.arange(len(y)); w = np.hanning(len(y))
+    return 2 * abs(np.sum(y * w * np.exp(-2j * np.pi * f * n / SR))) / np.sum(w)
 
 
 def lag(a, b, maxlag=4000):
