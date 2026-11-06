@@ -82,8 +82,10 @@
 //!   start inside the fixed initial latency allocation, and every
 //!   ceiling substep uses the native Float32 vector-sum tree. The idle follower releases toward that solved request,
 //!   and a result below its provisional endpoint makes a second follower call
-//!   toward 0.99 x the request. The audio applies the slow trajectory after
-//!   summing the fast-gained bands.
+//!   toward 0.99 x the request. A binding ceiling result restarts that attack
+//!   in the same logical output decision; the extra controller frame is only
+//!   transport delay after gain application. The audio applies the slow
+//!   trajectory after summing the fast-gained bands.
 //! - **Monitor** (rig laws 3, 4, 11): on the protected output, `u = Vfs y`;
 //!   the Float32 substep mean of `u i` drives the two thermal branches
 //!   (residuals 2.1: `theta += alpha (R_eff P - theta)`), and `Pamp = idle + ratio max(mean(u i), 0) (Rdc + Rpar) /
@@ -1025,9 +1027,9 @@ fn vdsp_sve_slice(x: &[f32]) -> f32 {
 }
 
 /// The monitor's substep power total: a left-to-right Float32 sum. The
-/// vDSP_sve tree here moved the long ceiling trajectories away from macOS
-/// (t3-a085 +0.023 C, t3-a10 +0.018 C on the arm64 rig), so only the
-/// ceiling predictor uses it.
+/// vector tree is confined to the ceiling predictor; applying it to the live
+/// monitor changes the retained thermal trajectory and fails the safety
+/// matrix.
 fn seq_sum(x: &[f32]) -> f32 {
     x.iter().fold(0.0f32, |a, &v| a + v)
 }
@@ -1325,6 +1327,13 @@ impl SlowGain {
             self.n = 0;
             self.attack = false;
         }
+        self
+    }
+    fn attacked_toward(mut self, request: f32) -> Self {
+        self.start = self.g;
+        self.target = (CUT * request as f64) as f32;
+        self.n = 0;
+        self.attack = true;
         self
     }
     #[inline]
@@ -2231,9 +2240,7 @@ impl Run {
                     for k in c.vel_active.0..c.vel_active.1 {
                         let raw = q[k];
                         let v = if floor_velocity {
-                            primary_floor_limited.set(
-                                primary_floor_limited.get() || sg * raw < c.vel_floor as f32,
-                            );
+                            primary_floor_limited.set(primary_floor_limited.get() || sg * raw < c.vel_floor as f32);
                             (sg * raw).max(c.vel_floor as f32) / sg
                         } else {
                             raw
@@ -2404,16 +2411,20 @@ impl Run {
         // look-ahead; (2) an idle slow follower releases one decision toward
         // that solved request; (3) a result below the provisionally advanced
         // endpoint makes one downward follower call toward 0.99 x the solved
-        // request. Thus recovery follows the ceiling while it binds, and the
-        // ordinary request otherwise. The provisional trajectory is follower
-        // state only: baking it into B/L/Q and normalizing the proposal by its
-        // endpoint is not equivalent because the ceiling's root corrections
-        // multiply the proposal.
+        // request. A binding ceiling call restarts at the current logical
+        // decision boundary; the buffered controller frame is pure output
+        // transport after this gain. Thus recovery follows the ceiling while
+        // it binds, and the ordinary request otherwise. The provisional
+        // trajectory is follower state only: baking it into B/L/Q and
+        // normalizing the proposal by its endpoint is not equivalent because
+        // the ceiling's root corrections multiply the proposal.
         let mut prov = [SlowGain::unity(1); MAX_CHANNELS];
         let mut end = [1.0f32; MAX_CHANNELS];
         let mut want = [1.0f32; MAX_CHANNELS];
+        let mut ordinary = [1.0f32; MAX_CHANNELS];
         for ci in 0..n {
             want[ci] = req[ci] as f32;
+            ordinary[ci] = want[ci];
         }
         if self.axis[4] {
             for (ci, c) in self.ch.iter().enumerate() {
@@ -2424,6 +2435,7 @@ impl Run {
             let m = want[..n].iter().copied().fold(1.0f32, f32::min);
             want[..n].iter_mut().for_each(|v| *v = m);
         }
+        let ceiling_cut: [bool; MAX_CHANNELS] = core::array::from_fn(|ci| ci < n && want[ci] < ordinary[ci]);
         for (ci, c) in self.ch.iter().enumerate() {
             let f = c.slow.released_toward(want[ci]);
             prov[ci] = f;
@@ -2437,15 +2449,18 @@ impl Run {
             let request = want[ci];
             if request < end[ci] {
                 let mut f = prov[ci];
-                for _ in 0..ctl {
-                    f.sample(slow_lambda);
+                // Native associates a binding ceiling solve with this
+                // logical output decision. The extra controller frame is a
+                // transport FIFO after gain application, so a ceiling cut
+                // restarts at the present boundary. Ordinary power/soft-
+                // temperature decisions retain the provisional one-decision
+                // advance recovered by t-4823.
+                if !ceiling_cut[ci] {
+                    for _ in 0..ctl {
+                        f.sample(slow_lambda);
+                    }
                 }
-                // the second call starts at the provisionally advanced value
-                f.start = f.g;
-                f.target = (CUT * request as f64) as f32;
-                f.n = 0;
-                f.attack = true;
-                c.slow = f;
+                c.slow = f.attacked_toward(request);
             } else {
                 c.slow = prov[ci];
             }
@@ -2955,6 +2970,17 @@ mod fault_tests {
         let mut lower = f.released_toward(0.3);
         lower.sample(lambda);
         assert_eq!(lower.g, f.g);
+
+        // A binding ceiling restart belongs to this decision. It starts at
+        // the present boundary, not after a controller decision of recovery.
+        let immediate = f.released_toward(ceiling).attacked_toward(0.3);
+        let mut delayed = f.released_toward(ceiling);
+        for _ in 0..256 {
+            delayed.sample(lambda);
+        }
+        let delayed = delayed.attacked_toward(0.3);
+        assert_eq!(immediate.start, f.g);
+        assert!(delayed.start > immediate.start);
     }
 
     #[test]
