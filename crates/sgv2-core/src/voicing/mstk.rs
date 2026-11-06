@@ -16,6 +16,7 @@ pub const BANDS: usize = 4;
 const XOVERS: usize = BANDS - 1;
 const MAX_FILTERS: usize = 32;
 const MAX_DETECTOR_FILTERS: usize = 10;
+const MAX_DETECTOR_WINDOW: usize = 1921;
 const INPUT_BOUND: f32 = 16.0;
 const CURVE_POINTS: usize = 11;
 
@@ -465,6 +466,45 @@ fn algorithm0_compensation(fs: f64) -> Section {
     }
 }
 
+/// Allocation-free monotonic queue for an exact trailing-window maximum.
+/// The largest installed window is 10 ms; storage covers rates through
+/// 192 kHz, while construction clamps hostile rates to the fixed bound.
+#[derive(Clone, Copy)]
+struct SlidingMax {
+    value: [f64; MAX_DETECTOR_WINDOW],
+    index: [u64; MAX_DETECTOR_WINDOW],
+    head: usize,
+    len: usize,
+    next: u64,
+}
+
+impl SlidingMax {
+    const EMPTY: Self =
+        Self { value: [0.0; MAX_DETECTOR_WINDOW], index: [0; MAX_DETECTOR_WINDOW], head: 0, len: 0, next: 0 };
+
+    #[inline]
+    fn push(&mut self, value: f64, window: usize) -> f64 {
+        let now = self.next;
+        self.next = self.next.wrapping_add(1);
+        while self.len != 0 && now.wrapping_sub(self.index[self.head]) >= window as u64 {
+            self.head = (self.head + 1) % MAX_DETECTOR_WINDOW;
+            self.len -= 1;
+        }
+        while self.len != 0 {
+            let back = (self.head + self.len - 1) % MAX_DETECTOR_WINDOW;
+            if self.value[back] > value {
+                break;
+            }
+            self.len -= 1;
+        }
+        let back = (self.head + self.len) % MAX_DETECTOR_WINDOW;
+        self.value[back] = value;
+        self.index[back] = now;
+        self.len += 1;
+        self.value[self.head]
+    }
+}
+
 /// The real-time state of one linked compressor instance.
 pub struct Run {
     path: [Path; BANDS],
@@ -486,8 +526,7 @@ pub struct Run {
     env: [f64; BANDS],
     smoothed_gain: [f64; BANDS],
     detector_window: [usize; BANDS],
-    detector_hold: [f64; BANDS],
-    detector_hold_remaining: [usize; BANDS],
+    detector_max: [SlidingMax; BANDS],
     detector_rms: [f64; BANDS],
     compensation_state: [[f64; 2]; MAX_CHANNELS],
     state: [[[[f64; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS],
@@ -508,10 +547,8 @@ impl Run {
                 detector_bandwidth[b] = (reference_edges[b + 1] - reference_edges[b]) / (edges[b + 1] - edges[b]);
             }
         }
-        let detector_window = [10.0, 8.0, 2.0, 1.0].map(|ms| {
-            let n = libm::round(ms * fs / 1000.0) as usize | 1;
-            n.max(1)
-        });
+        let detector_window = [10.0, 8.0, 2.0, 1.0]
+            .map(|ms| ((libm::round(ms * fs / 1000.0) as usize) | 1).clamp(1, MAX_DETECTOR_WINDOW));
         Run {
             path: paths(q, fs),
             detector_path: detector_paths(q, fs),
@@ -532,8 +569,7 @@ impl Run {
             env: [0.0; BANDS],
             smoothed_gain: [1.0; BANDS],
             detector_window,
-            detector_hold: [0.0; BANDS],
-            detector_hold_remaining: [0; BANDS],
+            detector_max: [SlidingMax::EMPTY; BANDS],
             detector_rms: [0.0; BANDS],
             compensation_state: [[0.0; 2]; MAX_CHANNELS],
             state: [[[[0.0; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS],
@@ -544,8 +580,7 @@ impl Run {
     pub fn reset(&mut self) {
         self.env = [0.0; BANDS];
         self.smoothed_gain = [1.0; BANDS];
-        self.detector_hold = [0.0; BANDS];
-        self.detector_hold_remaining = [0; BANDS];
+        self.detector_max = [SlidingMax::EMPTY; BANDS];
         self.detector_rms = [0.0; BANDS];
         self.compensation_state = [[0.0; 2]; MAX_CHANNELS];
         self.state = [[[[0.0; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS];
@@ -587,7 +622,7 @@ impl Run {
                 z[1] = (s.b2 * v - s.a2 * o) as f32;
                 v = o;
             }
-            *y = (v * self.band_in[b] * self.detector_bandwidth[b]).abs();
+            *y = (v * self.band_in[b] * self.detector_bandwidth[b]).abs() as f32 as f64;
         }
         out
     }
@@ -612,13 +647,7 @@ impl Run {
 
     #[inline]
     fn window_max(&mut self, b: usize, value: f64) -> f64 {
-        if value >= self.detector_hold[b] || self.detector_hold_remaining[b] == 0 {
-            self.detector_hold[b] = value;
-            self.detector_hold_remaining[b] = self.detector_window[b];
-        } else {
-            self.detector_hold_remaining[b] -= 1;
-        }
-        self.detector_hold[b]
+        self.detector_max[b].push(value, self.detector_window[b])
     }
 
     #[inline]
@@ -635,6 +664,11 @@ impl Run {
             4 => 0.5 * (x + libm::sin(x)),
             _ => x,
         }
+    }
+
+    #[inline]
+    fn band_output(flavor: Option<u32>, gain: f64, x: f64) -> f64 {
+        gain * Self::saturate(flavor, x)
     }
 
     pub fn process(&mut self, bufs: &mut [&mut [f32]], frames: usize) {
@@ -668,7 +702,7 @@ impl Run {
             for c in 0..n {
                 let mut y = 0.0;
                 for b in 0..BANDS {
-                    y += Self::saturate(self.band[b].saturation, gain[b] * bands[c][b]);
+                    y += Self::band_output(self.band[b].saturation, gain[b], bands[c][b]);
                 }
                 y *= self.out_gain;
                 let s = self.output_compensation;
@@ -856,6 +890,33 @@ mod tests {
     }
 
     #[test]
+    fn full_rate_detector_windows_keep_the_next_peak() {
+        let run = Run::new(&params(), 48_000.0, 1);
+        assert_eq!(run.detector_window, [481, 385, 97, 49]);
+        let run = Run::new(&params(), 96_000.0, 1);
+        assert_eq!(run.detector_window, [961, 769, 193, 97]);
+
+        let mut max = SlidingMax::EMPTY;
+        assert_eq!(max.push(9.0, 3), 9.0);
+        assert_eq!(max.push(7.0, 3), 9.0);
+        assert_eq!(max.push(8.0, 3), 9.0);
+        // The 9 has left, but the lower 8 is still in the trailing window.
+        assert_eq!(max.push(1.0, 3), 8.0);
+        assert_eq!(max.push(2.0, 3), 8.0);
+        assert_eq!(max.push(3.0, 3), 3.0);
+    }
+
+    #[test]
+    fn reset_clears_the_detector_and_restores_unity_smoothed_gain() {
+        let mut run = Run::new(&params(), 48_000.0, 1);
+        run.env = [0.25; BANDS];
+        run.smoothed_gain = [0.25; BANDS];
+        run.reset();
+        assert_eq!(run.env, [0.0; BANDS]);
+        assert_eq!(run.smoothed_gain, [1.0; BANDS]);
+    }
+
+    #[test]
     fn spline_curve_softens_the_knee_range_and_expander() {
         let band = Band { down_threshold_db: -20.0, down_ratio: 4.0, down_range_db: -6.0, ..Band::default() };
         let legacy = curve_points(band, 0.0);
@@ -889,6 +950,12 @@ mod tests {
                 assert!(y.abs() <= 1.1);
             }
         }
+    }
+
+    #[test]
+    fn saturation_precedes_detector_gain() {
+        assert_eq!(Run::band_output(Some(0), 0.25, 2.0), 0.25);
+        assert_eq!(Run::band_output(None, 0.25, 2.0), 0.5);
     }
 
     #[test]
