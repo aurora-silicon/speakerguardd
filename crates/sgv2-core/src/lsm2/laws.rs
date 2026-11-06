@@ -257,8 +257,11 @@ pub fn velocity_band_gains(
 /// Signed velocity allocation against the retained full-band bound. The
 /// retained prefix uses `old_limit`. A rising bound switches to `new_limit`
 /// at `split`; a falling bound linearly hands off from old to new over the
-/// remaining samples. `room_floor` is threshold headroom, but an effective
-/// cut still targets the retained bound (never less than that floor).
+/// remaining samples, with the first sample at `split` taking the first
+/// interpolation step. Each pass selects the least index having the greatest
+/// absolute trial value, then evaluates the bound only at that index.
+/// `room_floor` is threshold headroom, but an effective cut still targets the
+/// retained bound (never less than that floor).
 #[allow(clippy::too_many_arguments)]
 pub fn velocity_band_gains_window(
     vb: &[alloc::vec::Vec<f32>; 5],
@@ -278,6 +281,17 @@ pub fn velocity_band_gains_window(
         return g;
     }
     let is_active = |k: usize| k >= active.0 && k < active.1;
+    let limit_at = |i: usize| {
+        if i < split {
+            old_limit
+        } else if new_limit >= old_limit {
+            new_limit
+        } else {
+            let count = n - split;
+            let step = (new_limit - old_limit) / count as f32;
+            old_limit + step * (i - split + 1) as f32
+        }
+    };
     loop {
         let (mut idx, mut worst) = (first, 0.0f32);
         for i in first..n {
@@ -290,15 +304,7 @@ pub fn velocity_band_gains_window(
                 idx = i;
             }
         }
-        let limit = if idx < split {
-            old_limit
-        } else if new_limit >= old_limit {
-            new_limit
-        } else {
-            let count = n - split;
-            let step = (new_limit - old_limit) / count as f32;
-            old_limit + step * (idx - split + 1) as f32
-        };
+        let limit = limit_at(idx);
         if worst.abs() <= limit + room_floor || worst.is_nan() {
             break;
         }
@@ -793,12 +799,23 @@ mod tests {
     }
 
     #[test]
-    fn a_falling_retained_bound_interpolates_after_the_handoff() {
+    fn a_falling_retained_bound_starts_interpolation_one_sample_after_the_handoff() {
+        let vb = [vec![0.0, 0.0, 1.6, 0.0], vec![0.0; 4], vec![0.0; 4], vec![0.0; 4], vec![0.0; 4]];
+        let got = velocity_band_gains_window(&vb, &[], 0, 2.0, 1.0, 2, 0.0, 1.0, (0, 5), [1.0; 5]);
+        // The first post-split sample uses old + (new - old) / 2 = 1.5.
+        assert_eq!(got, [0.9375, 1.0, 1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn a_varying_bound_is_checked_at_the_first_largest_magnitude() {
         let vb = [vec![0.0, 0.0, 1.6, 1.6], vec![0.0; 4], vec![0.0; 4], vec![0.0; 4], vec![0.0; 4]];
         let got = velocity_band_gains_window(&vb, &[], 0, 2.0, 1.0, 2, 0.0, 1.0, (0, 5), [1.0; 5]);
-        // The limits after the split are 1.5 then 1.0, so the final sample
-        // is the binding one.
-        assert_eq!(got, [0.625, 1.0, 1.0, 1.0, 1.0]);
+        // The limits are 1.5 then 1.0. The first pass selects sample 2 by
+        // least-index tie handling and cuts to 1.5. The next pass selects the
+        // same equal-magnitude sample and stops at its limit; native does not
+        // instead maximize excess or ratio and therefore does not cut to
+        // sample 3's 1.0 limit.
+        assert_eq!(got, [0.9375, 1.0, 1.0, 1.0, 1.0]);
     }
 
     #[test]
