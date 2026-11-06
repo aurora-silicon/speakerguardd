@@ -534,7 +534,8 @@ def check_sense(ctl, idx, card, devs, w, runs):
         runs["baseline"] = base
         cls = classify(base)
         if any(c != "live" for c in cls):
-            return [f"with every sense switch on, sense channels {[k for k, c in enumerate(cls) if c != 'live']} are not live"], st.fmt
+            errs.append(f"with every sense switch on, sense channels {[k for k, c in enumerate(cls) if c != 'live']} are not live")
+            return errs, st.fmt
         for p, a in enumerate(amps):
             for kind in ("V", "I"):
                 nm = names[(a["prefix"], kind)]
@@ -561,8 +562,13 @@ def check_sense(ctl, idx, card, devs, w, runs):
             for nm, v in saved.items():
                 try:
                     switch_set(ctl, nm, v)
-                except wiring.Refused as e:
-                    log(f"restoring {nm}: {e}")
+                    actual = switch_get(card, nm)
+                    if actual != v:
+                        raise wiring.Refused(f"read back {actual!r}, expected {v!r}")
+                except Exception as e:  # every restoration must still be attempted
+                    reason = f"restoring {nm}: {e}"
+                    log(reason)
+                    errs.append(reason)
     return errs, st.fmt
 
 

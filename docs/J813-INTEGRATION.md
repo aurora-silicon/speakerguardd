@@ -50,7 +50,9 @@ reordering samples or relaxing the live/quiet thresholds.
 
 The self-check bounds its capture buffer and refuses EOF, lost ownership,
 lease expiry, overwritten windows or missing data. Cleanup stops both
-owned streams, releases the lease and restores the sense switches. This
+owned streams, releases the lease and restores the sense switches. Every
+restored switch is read back; a refused write or mismatched/unreadable value
+fails qualification while cleanup still attempts the remaining switches. This
 qualifies the capture-first lifecycle only. The kernel's late-capture
 behavior remains unqualified; a graph must not infer that arbitrary
 startup or restart ordering is safe from this check.
