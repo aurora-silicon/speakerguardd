@@ -570,13 +570,10 @@ pub struct Masker {
     amp: Vec<f32>,
     pow: Vec<f32>,
     sel: Vec<f32>,
-    /// Sample rate and follower times. Native forms the coefficients from
-    /// each host fragment (at most one 256-frame controller quantum),
-    /// including a fragment with no complete power/thermal substep.
-    rate: f64,
-    attack: f32,
-    release: f32,
-    fast_attack: f32,
+    /// Coefficients per controller frame: attack, release, fast attack.
+    ca: f32,
+    cr: f32,
+    cf: f32,
     range: f32,
     shape: f32,
     clip: f32,
@@ -600,7 +597,7 @@ impl Masker {
         release: f32,
         fast: f32,
         range: f32,
-        _frames: usize,
+        frames: usize,
     ) -> Option<Self> {
         let m = transform_len(window);
         let bins = m / 2 + 1;
@@ -631,6 +628,7 @@ impl Masker {
         let lo = nearest(&mut (0..MASK_BUCKETS).map(|i| (i, if i == 0 { 0 } else { ends[i - 1] })), band_hz[0] as f64);
         let hi = nearest(&mut (0..MASK_BUCKETS - 1).map(|i| (i, ends[i])), band_hz[1] as f64);
         let band = (lo, hi.max(lo + 1));
+        let coef = |t: f32| 1.0 - r32(libm::exp(r32(-(frames as f64) / (rate * t as f64)) as f64));
         Some(Masker {
             win,
             weight,
@@ -642,10 +640,9 @@ impl Masker {
             amp: vec![0.0; bins],
             pow: vec![0.0; MASK_BUCKETS],
             sel: vec![0.0; MASK_BUCKETS],
-            rate,
-            attack,
-            release,
-            fast_attack: fast,
+            ca: coef(attack),
+            cr: coef(release),
+            cf: coef(fast),
             range,
             shape: 1.0,
             clip: 0.0,
@@ -669,7 +666,7 @@ impl Masker {
 
     /// One update on the velocity window `v` (oldest first, the window's
     /// length): the new smoothed level in dB.
-    pub fn update(&mut self, v: &[f32], frames: usize) -> f32 {
+    pub fn update(&mut self, v: &[f32]) -> f32 {
         for (j, x) in self.xin.iter_mut().enumerate() {
             *x = if j < self.win.len() { ((v[j] * self.win[j]) as f64, 0.0) } else { (0.0, 0.0) };
         }
@@ -704,13 +701,11 @@ impl Masker {
         } else if self.clip > raw + 12.0 {
             self.clip = raw + 12.0;
         }
-        let coef = |t: f32| 1.0 - r32(libm::exp(r32(-(frames as f64) / (self.rate * t as f64)) as f64));
-        let (ca, cr, cf) = (coef(self.attack), coef(self.release), coef(self.fast_attack));
         let c = self.clip;
-        self.slow += (if c > self.slow { ca } else { cr }) * (c - self.slow);
-        self.fast += cf * (c - self.fast);
+        self.slow += (if c > self.slow { self.ca } else { self.cr }) * (c - self.slow);
+        self.fast += self.cf * (c - self.fast);
         let mix = ((self.fast - self.slow) / self.range).clamp(0.0, 1.0);
-        let alpha = if c <= self.level { cr } else { ca * (1.0 - mix) + cf * mix };
+        let alpha = if c <= self.level { self.cr } else { self.ca * (1.0 - mix) + self.cf * mix };
         self.level += alpha * (c - self.level);
         self.level
     }

@@ -7,17 +7,17 @@
 //! closed-loop temperature); a tuning that asks for the DSP estimator or
 //! closed-loop temperature is refused.
 //!
-//! Controller logs establish that the reference admits
-//! `min(frames left in this host call, N)` and makes a signal/gain decision
-//! for every fragment.  Power and thermal model state, however, is admitted
-//! only in complete 32-frame substeps.  Short calls carry their unfinished
-//! power, temperature and peak state while still exposing the growing partial
-//! peaks to the per-call signal candidates.  Thus q1 admits a substep every
-//! 32 calls, q7 on the alternating four/five-call boundary crossings, q160
-//! admits five per call, and q512/q4096 use 256-frame fragments with eight.
-//! Public power/thermal meters hold between admissions. The reported latency
-//! is the native
-//! `2 * FilterbankLatency + SpeakerResponseLookAhead` (352 frames at 48 kHz).
+//! The unit is frame-synchronous, as the reference is: every controller
+//! frame `j` (`N = 256` frames at 48 kHz, 5.333 ms) takes the frame's whole
+//! input, decides, and produces output frame `j`. The reference does this
+//! inside the host's render call, so its output depends on the host slice
+//! (25G83 rig: slices of 512, 1024 and 4096 frames are bit-identical; 1, 7
+//! and 160 differ). This unit buffers one controller frame instead, so its
+//! output never depends on how the host slices the stream, and equals the
+//! reference rendered at its production slicing, delayed by exactly one
+//! controller frame. The reported latency is therefore
+//! `2 * FilterbankLatency + SpeakerResponseLookAhead + N` (352 + 256 = 608
+//! frames at 48 kHz), and PipeWire compensates it.
 //!
 //! Per channel, with `FB = FilterbankLatency` (160 frames), `OD = FB +
 //! SpeakerResponseLookAhead` (192) and `W = N + OD` (448):
@@ -119,6 +119,8 @@
 //!   reference's velocity peak, some above it (Daybreak follow-up);
 //! - the masker lattice is an input extracted from the Mac's macOS; without
 //!   it there is no masking credit;
+//! - host slices: at q1, q7 and q160 this unit is slice-independent by
+//!   design.
 
 // The DSP loops index several parallel per-band and per-channel arrays at
 // once; an index reads better there than zipped iterators.
@@ -708,9 +710,10 @@ impl Params {
         2 * self.filterbank_frames() + self.lookahead_frames()
     }
 
-    /// This unit's latency is the reference's native pipeline latency.
+    /// This unit's latency: the reference's plus the one controller frame
+    /// it buffers to be independent of the host slicing (608 at 48 kHz).
     pub fn unit_latency_frames(&self) -> usize {
-        self.latency_frames()
+        self.latency_frames() + controller_frames(self.sample_rate)
     }
 
     /// The protection a unit built from parameters must carry: mitigation on
@@ -1279,12 +1282,6 @@ struct Chan {
     pk_d: [f32; RING],
     pk_v: [f32; RING],
     pk_vb: [[f32; RING]; BANDS],
-    /// Incomplete power/thermal-substep peaks. Short calls expose the growing
-    /// maxima to each decision and carry them until 32-frame admission.
-    pk_x_acc: f32,
-    pk_d_acc: f32,
-    pk_v_acc: f32,
-    pk_vb_acc: [f32; BANDS],
     // Masking path (residuals 3): the velocity model on the input, its
     // retained window (oldest first) and the spectral detector.
     masker: Option<Masker>,
@@ -1317,8 +1314,6 @@ struct Chan {
     // start of the frame's output region.
     cur_in: Current,
     pbar_in: [f64; 4],
-    pin_acc: f64,
-    pin_len: usize,
     /// Per-substep `u i` of the fast-gained bank stage, output region.
     p_sub: [f64; SUBSTEPS],
     // Temperature axis (residuals 2): the input model, unattenuated, on
@@ -1326,7 +1321,6 @@ struct Chan {
     // substep (ring), the newest at `tn - 1`.
     tin_cur: Current,
     tin_acc: f32,
-    tin_len: usize,
     tp_vc: f32,
     tp_mg: f32,
     tring: [f32; TRING],
@@ -1336,9 +1330,6 @@ struct Chan {
     slow: SlowGain,
     // Monitor on the output.
     cur_out: Current,
-    pout_acc: f64,
-    pout_acc32: f32,
-    pout_len: usize,
     th_vc: f32,
     th_mg: f32,
     pbar: [f64; 4],
@@ -1497,14 +1488,18 @@ struct Run {
     latency: usize,
     /// A model state went non-finite: the fail-safe is latched until reset.
     fault: bool,
+    /// Frames into the current controller frame (input FIFO fill).
+    pos: usize,
     frame: u64,
     last_frame: u64,
     frames_done: u64,
     /// Ring slot of the next substep.
     ring: usize,
-    /// The temperature buffer (residuals 2.3): retained history points; the
-    /// selected length adds this decision's completed substeps.
+    ring_len: usize,
+    /// The temperature buffer (residuals 2.3): `tb_hist` retained points,
+    /// the peak over its oldest `tb_sel` points with the frame's.
     tb_hist: usize,
+    tb_sel: usize,
     axis: [bool; 5],
     /// ControlVelocity alone: the published velocity candidate is computed
     /// whenever the axis is configured, also with EnableMitigation = 0
@@ -1575,7 +1570,9 @@ impl Run {
         let sub = ctl / SUBSTEPS;
         let fb = p.filterbank_frames();
         let od = p.output_offset_frames();
+        let ring_len = (ctl + od) / sub;
         let sub_dt = sub as f64 / rate;
+        let ctl_dt = ctl as f64 / rate;
         // residuals 2.4: AttackTime clamped to 10 ms, the raised-cosine
         // window at most one controller frame
         let attack_len = (libm::round((p.attack_time_ms as f64 * 1e-3).min(0.010) * rate) as u32).clamp(1, ctl as u32);
@@ -1634,10 +1631,6 @@ impl Run {
                 pk_d: [0.0; RING],
                 pk_v: [0.0; RING],
                 pk_vb: [[0.0; RING]; BANDS],
-                pk_x_acc: 0.0,
-                pk_d_acc: 0.0,
-                pk_v_acc: 0.0,
-                pk_vb_acc: [0.0; BANDS],
                 masker,
                 mvel: vel,
                 vwin: vec![0.0; mwin],
@@ -1659,12 +1652,9 @@ impl Run {
                 eg: core::array::from_fn(|_| vec![1.0; ctl]),
                 cur_in: cur,
                 pbar_in: [0.0; 4],
-                pin_acc: 0.0,
-                pin_len: 0,
                 p_sub: [0.0; SUBSTEPS],
                 tin_cur: cur,
                 tin_acc: 0.0,
-                tin_len: 0,
                 tp_vc: 0.0,
                 tp_mg: 0.0,
                 tring: [c.ambient; TRING],
@@ -1672,9 +1662,6 @@ impl Run {
                 gt: 1.0,
                 slow: SlowGain::unity(attack_len),
                 cur_out: cur,
-                pout_acc: 0.0,
-                pout_acc32: 0.0,
-                pout_len: 0,
                 th_vc: 0.0,
                 th_mg: 0.0,
                 pbar: [0.0; 4],
@@ -1712,11 +1699,14 @@ impl Run {
             od,
             latency: p.unit_latency_frames(),
             fault: false,
+            pos: 0,
             frame: 0,
             last_frame: 0,
             frames_done: 0,
             ring: 0,
+            ring_len,
             tb_hist: p.latency_frames() / sub,
+            tb_sel: p.latency_frames() / sub + SUBSTEPS - fb / sub,
             // EnableMitigation = 0: every axis off, the models and meters run
             axis: [
                 p.control_sample_peak,
@@ -1762,10 +1752,6 @@ impl Run {
             c.pk_d = [0.0; RING];
             c.pk_v = [0.0; RING];
             c.pk_vb = [[0.0; RING]; BANDS];
-            c.pk_x_acc = 0.0;
-            c.pk_d_acc = 0.0;
-            c.pk_v_acc = 0.0;
-            c.pk_vb_acc = [0.0; BANDS];
             if let Some(m) = c.masker.as_mut() {
                 m.clear();
             }
@@ -1789,12 +1775,9 @@ impl Run {
             c.eg.iter_mut().for_each(|e| e.iter_mut().for_each(|v| *v = 1.0));
             c.cur_in.clear();
             c.pbar_in = [0.0; 4];
-            c.pin_acc = 0.0;
-            c.pin_len = 0;
             c.p_sub = [0.0; SUBSTEPS];
             c.tin_cur.clear();
             c.tin_acc = 0.0;
-            c.tin_len = 0;
             c.tp_vc = 0.0;
             c.tp_mg = 0.0;
             c.tring = [c.ambient as f32; TRING];
@@ -1802,9 +1785,6 @@ impl Run {
             c.gt = 1.0;
             c.slow = SlowGain::unity(c.slow.len);
             c.cur_out.clear();
-            c.pout_acc = 0.0;
-            c.pout_acc32 = 0.0;
-            c.pout_len = 0;
             c.th_vc = 0.0;
             c.th_mg = 0.0;
             c.pbar = [0.0; 4];
@@ -1815,6 +1795,7 @@ impl Run {
         for b in self.xin.iter_mut().chain(self.yout.iter_mut()) {
             b[..ctl].iter_mut().for_each(|v| *v = 0.0);
         }
+        self.pos = 0;
         self.frame = 0;
         self.last_frame = 0;
         self.frames_done = 0;
@@ -1825,20 +1806,20 @@ impl Run {
 
     /// Analysis of one channel's frame: the bank stage, the motion models,
     /// the per-substep peaks and the mask energy.
-    fn analyse(&mut self, ci: usize, frames: usize) {
-        let (sub, fb, od) = (self.sub, self.fb, self.od);
+    fn analyse(&mut self, ci: usize) {
+        let (ctl, sub, fb, od, ring_len) = (self.ctl, self.sub, self.fb, self.od, self.ring_len);
         let mut slot = self.ring;
         let c = &mut self.ch[ci];
         let xin = &self.xin[ci];
         let hist = 2 * fb - 1;
         if c.masker.is_some() {
-            c.vwin.copy_within(frames.., 0);
+            c.vwin.copy_within(ctl.., 0);
         }
-        c.xb[hist..hist + frames].copy_from_slice(&xin[..frames]);
+        c.xb[hist..hist + ctl].copy_from_slice(&xin[..ctl]);
         let vfs = c.vfs as f64;
-        let (mut px, mut pd, mut pv) = (c.pk_x_acc, c.pk_d_acc, c.pk_v_acc);
-        let mut pvb = c.pk_vb_acc;
-        for i in 0..frames {
+        let (mut px, mut pd, mut pv) = (0.0f32, 0.0f32, 0.0f32);
+        let mut pvb = [0.0f32; BANDS];
+        for i in 0..ctl {
             let w = &c.xb[i..i + hist];
             let xc = w[fb - 1];
             let mut rest = xc;
@@ -1868,17 +1849,15 @@ impl Run {
             // the masker's modeled velocity of the input (residuals 3)
             if c.masker.is_some() {
                 let mw = c.vwin.len();
-                c.vwin[mw - frames + i] = c.mvel.step(vfs * xin[i] as f64) as f32;
+                c.vwin[mw - ctl + i] = c.mvel.step(vfs * xin[i] as f64) as f32;
             }
             // the input temperature model, unattenuated (residuals 2)
             let ut = c.vfs * xin[i];
             let it = c.tin_cur.step(ut);
             c.tin_acc += ut * it;
-            c.tin_len += 1;
-            if c.tin_len == sub {
+            if (i + 1) % sub == 0 {
                 let p = (c.tin_acc / sub as f32).max(0.0);
                 c.tin_acc = 0.0;
-                c.tin_len = 0;
                 c.tp_vc = c.br_vc.step(c.tp_vc, p);
                 c.tp_mg = c.br_mg.step(c.tp_mg, p);
                 c.tring[c.tn % TRING] = c.ambient as f32 + c.tp_vc + c.tp_mg;
@@ -1893,100 +1872,33 @@ impl Run {
                 pd = 0.0;
                 pv = 0.0;
                 pvb = [0.0; BANDS];
-                slot = (slot + 1) % RING;
+                slot = (slot + 1) % ring_len;
             }
         }
-        c.pk_x_acc = px;
-        c.pk_d_acc = pd;
-        c.pk_v_acc = pv;
-        c.pk_vb_acc = pvb;
         // keep the bank's history
-        c.xb.copy_within(frames..frames + hist, 0);
+        c.xb.copy_within(ctl..ctl + hist, 0);
     }
 
-    /// Advance the input-referred power monitor through this host fragment.
-    /// The committed state stops at `frames`; the output-offset tail is a
-    /// decision look-ahead only.
-    fn analyse_power(&mut self, frames: usize) -> [[f64; 4]; MAX_CHANNELS] {
-        let mut phat = [[0.0f64; 4]; MAX_CHANNELS];
-        let (sub, od) = (self.sub, self.od);
-        for (ci, c) in self.ch.iter_mut().enumerate() {
-            let mut cur = c.cur_in;
-            let mut pb = c.pbar_in;
-            let mut acc = c.pin_acc;
-            let mut plen = c.pin_len;
-            let mut first = true;
-            let vfs = c.vfs;
-            c.p_sub = [0.0; SUBSTEPS];
-            for idx in 0..frames + od {
-                // Input-referred (rig law 4): the power and temperature
-                // candidates see the bank stage before any gain.
-                let u = vfs * c.xc[idx];
-                let i = cur.step(u);
-                acc += u as f64 * i as f64;
-                plen += 1;
-                if plen == sub {
-                    let p = acc / sub as f64;
-                    acc = 0.0;
-                    plen = 0;
-                    let s = idx / sub;
-                    if idx < frames && s < SUBSTEPS {
-                        c.p_sub[s] = p;
-                    }
-                    let pamp = self.idle + self.ratio * (p * c.load_scale).max(0.0);
-                    for j in 0..4 {
-                        pb[j] = self.p_pole[j] * pb[j] + (1.0 - self.p_pole[j]) * pamp;
-                        phat[ci][j] = if first { pb[j] } else { phat[ci][j].max(pb[j]) };
-                    }
-                    first = false;
-                }
-                if idx + 1 == frames {
-                    c.cur_in = cur;
-                    c.pbar_in = pb;
-                    c.pin_acc = acc;
-                    c.pin_len = plen;
-                }
-            }
-        }
-        phat
-    }
-
-    /// One host fragment: every channel's input in `xin`, its output to
-    /// `yout`; fragments are never longer than one controller frame.
-    fn process_quantum(&mut self, frames: usize) {
+    /// One controller frame: every channel's input in `xin`, its output to
+    /// `yout`.
+    fn process_frame(&mut self) {
         // a gain state that went non-finite since the last frame is caught
         // before this frame's min/max could turn it into a number
         if !self.ch.iter().all(|c| c.band.iter().all(BandGain::finite) && c.slow.finite()) {
             self.fault = true;
             return;
         }
-        let horizon = frames + self.od;
-        for c in self.ch.iter_mut() {
-            for b in c.ab.iter_mut().chain(c.db.iter_mut()).chain(c.vb.iter_mut()) {
-                b.resize(horizon, 0.0);
-            }
-            c.xc.resize(horizon, 0.0);
-            c.rd.resize(horizon, 0.0);
-            c.vcar.resize(horizon, 0.0);
-            for e in c.eg.iter_mut() {
-                e.resize(frames, 1.0);
-            }
-        }
         for ci in 0..self.n {
-            self.analyse(ci, frames);
+            self.analyse(ci);
         }
-        let completed_substeps = (self.frames_done as usize % self.sub + frames) / self.sub;
-        self.ring = (self.ring + completed_substeps) % RING;
-        let (ctl, sub, od) = (frames, self.sub, self.od);
-        let phat = self.analyse_power(ctl);
-        let (a_fast, a_low) = (self.a_fast, self.a_low);
-        let slow_lambda = self.slow_lambda;
+        self.ring = (self.ring + SUBSTEPS) % self.ring_len;
+        let (ctl, sub, od) = (self.ctl, self.sub, self.od);
         let fbl = self.fb;
-        let window_substeps = (ctl + od).div_ceil(sub).min(RING);
-        let ring = self.ring;
-        let window_max =
-            |r: &[f32; RING]| (0..window_substeps).map(|j| r[(ring + RING - 1 - j) % RING]).fold(0.0f32, f32::max);
+        let slow_lambda = self.slow_lambda;
+        let ring_len = self.ring_len;
+        let window_max = |r: &[f32; RING]| r[..ring_len].iter().copied().fold(0.0f32, f32::max);
         let ratio = |limit: f64, q: f32| (limit / (q as f64).max(EPS)).min(1.0);
+        let (a_fast, a_low) = (self.a_fast, self.a_low);
         let velocity_release = 1.0 - libm::exp(-(ctl as f64) * a_fast);
         // the allocator span excludes the first millisecond (t-4719)
         let vfirst = libm::round(self.ctl as f64 * 3.0 / 16.0) as usize;
@@ -1996,23 +1908,22 @@ impl Run {
         let mut level = f32::NEG_INFINITY;
         for c in self.ch.iter_mut() {
             if let Some(m) = c.masker.as_mut() {
-                level = level.max(m.update(&c.vwin, ctl));
+                level = level.max(m.update(&c.vwin));
             }
         }
         for c in self.ch.iter_mut() {
             if c.masker.is_some() {
                 c.vel_limit_now = velocity_limit(level, &c.mask_knots, &c.vel_lim, VELOCITY_PARAM_MAX) as f64;
             }
-            let g_peak = if self.axis[0] { ratio(c.amp_limit, window_max(&c.pk_x).max(c.pk_x_acc)) } else { 1.0 };
-            let g_disp = if self.axis[1] { ratio(c.disp_limit, window_max(&c.pk_d).max(c.pk_d_acc)) } else { 1.0 };
+            let g_peak = if self.axis[0] { ratio(c.amp_limit, window_max(&c.pk_x)) } else { 1.0 };
+            let g_disp = if self.axis[1] { ratio(c.disp_limit, window_max(&c.pk_d)) } else { 1.0 };
             let vel_on = self.axis[2] && !c.vel_off;
             // the published velocity candidate: the full-band ratio before
             // the MaxVelocityAttenuation floor (the floor caps the applied
             // band gains only), unity when Bandwidth 2 turns the axis off,
             // and computed with mitigation off (rig law cases fb5, fb8-bw2,
             // fb-vel-ignlow-bw2, therm, meter)
-            // (t-4893: a short host call carries its incomplete peak window)
-            let g_vel = if self.vel_logged && !c.vel_off { ratio(c.vel_limit_now, window_max(&c.pk_v).max(c.pk_v_acc)) } else { 1.0 };
+            let g_vel = if self.vel_logged && !c.vel_off { ratio(c.vel_limit_now, window_max(&c.pk_v)) } else { 1.0 };
             // residuals 5 (t-4731): one sequential fast-request chain of
             // signed worst-sample allocations on five band buffers each:
             // displacement, then velocity, then sample peak, each starting
@@ -2201,7 +2112,40 @@ impl Run {
                 }
             }
         }
-        // Power (rig law 7): one gain for all systems.
+        // ---- power path on the fast-gained bank stage, from the committed
+        // state at the start of the output region through the look-ahead
+        let mut phat = [[0.0f64; 4]; MAX_CHANNELS];
+        for (ci, c) in self.ch.iter_mut().enumerate() {
+            let mut cur = c.cur_in;
+            let mut pb = c.pbar_in;
+            let mut acc = 0.0f64;
+            let vfs = c.vfs;
+            for idx in 0..ctl + od {
+                // input-referred (rig law 4): the power and temperature
+                // candidates see the bank stage before any gain
+                let u = vfs * c.xc[idx];
+                let i = cur.step(u);
+                acc += u as f64 * i as f64;
+                if (idx + 1) % sub == 0 {
+                    let p = acc / sub as f64;
+                    acc = 0.0;
+                    let s = idx / sub;
+                    if s < SUBSTEPS {
+                        c.p_sub[s] = p;
+                    }
+                    let pamp = self.idle + self.ratio * (p * c.load_scale).max(0.0);
+                    for j in 0..4 {
+                        pb[j] = self.p_pole[j] * pb[j] + (1.0 - self.p_pole[j]) * pamp;
+                        phat[ci][j] = if idx + 1 == sub { pb[j] } else { phat[ci][j].max(pb[j]) };
+                    }
+                    if idx + 1 == ctl {
+                        c.cur_in = cur;
+                        c.pbar_in = pb;
+                    }
+                }
+            }
+        }
+        // power (rig law 7): one gain for all systems
         let g_pow = if self.axis[3] {
             let mut g = 1.0f64;
             let nidle = self.n as f64 * self.idle;
@@ -2218,12 +2162,11 @@ impl Run {
         self.linked_power = g_pow;
         // ---- temperature axis (residuals 2): the input model's selected
         // peak, its current rises and the output body rise before this frame
-        let hist = self.tb_hist;
-        let sel = (hist + completed_substeps).saturating_sub(self.fb / sub).min(TRING);
+        let (hist, sel) = (self.tb_hist, self.tb_sel);
         for c in self.ch.iter_mut() {
             // buffer: the `hist` retained points then the frame's, oldest
             // first; the peak over its first `sel`
-            let start = c.tn + TRING - hist - completed_substeps;
+            let start = c.tn + TRING - hist - SUBSTEPS;
             let tpk = (0..sel).map(|j| c.tring[(start + j) % TRING]).fold(f32::NEG_INFINITY, f32::max);
             c.gt = if self.axis[4] {
                 temperature_candidate(
@@ -2314,10 +2257,9 @@ impl Run {
         let (idle, ratio_p) = (self.idle, self.ratio);
         for (ci, c) in self.ch.iter_mut().enumerate() {
             let y = &mut self.yout[ci];
-            let mut acc = c.pout_acc;
-            let mut acc32 = c.pout_acc32;
-            let mut plen = c.pout_len;
-            let mut have_power = false;
+            let mut acc = 0.0f64;
+            let mut acc32 = 0.0f32;
+            let mut s = 0;
             let mut protected_model_peak = 0.0f32;
             let (mut p1, mut p1s) = (0.0f64, 0.0f64);
             for (i, yo) in y.iter_mut().enumerate().take(ctl) {
@@ -2342,16 +2284,14 @@ impl Run {
                 let iv = c.cur_out.step(u);
                 acc += u as f64 * iv as f64;
                 acc32 += u * iv;
-                plen += 1;
                 *yo = v.clamp(-1.0, 1.0);
                 // The persistent motion models follow the protected output.
                 c.dcar_m.step(c.vfs * *yo);
                 let modeled_velocity = c.vcar_m.step(c.vfs * *yo);
                 protected_model_peak = protected_model_peak.max(modeled_velocity.abs());
-                if plen == sub {
+                if (i + 1) % sub == 0 {
                     let p = acc / sub as f64;
                     acc = 0.0;
-                    plen = 0;
                     // the output thermal model (residuals 2.1)
                     let pp = (acc32 / sub as f32).max(0.0);
                     acc32 = 0.0;
@@ -2361,19 +2301,14 @@ impl Run {
                     for j in 0..4 {
                         c.pbar[j] = self.p_pole[j] * c.pbar[j] + (1.0 - self.p_pole[j]) * pamp;
                     }
-                    p1 = if have_power { p1.max(c.pbar[0]) } else { c.pbar[0] };
-                    p1s = if have_power { p1s.max(c.pbar[2]) } else { c.pbar[2] };
-                    have_power = true;
+                    p1 = if s == 0 { c.pbar[0] } else { p1.max(c.pbar[0]) };
+                    p1s = if s == 0 { c.pbar[2] } else { p1s.max(c.pbar[2]) };
+                    s += 1;
                 }
             }
-            c.pout_acc = acc;
-            c.pout_acc32 = acc32;
-            c.pout_len = plen;
             c.protected_peak_now = c.protected_peak.update(protected_model_peak, ctl);
-            if have_power {
-                c.pbar1_frame = p1;
-                c.pbar1s_frame = p1s;
-            }
+            c.pbar1_frame = p1;
+            c.pbar1s_frame = p1s;
             // shift the bank-stage buffers: keep the look-ahead region
             for b in c.ab.iter_mut() {
                 b.copy_within(ctl..ctl + od, 0);
@@ -2394,35 +2329,31 @@ impl Run {
                 self.fault = true;
             }
         }
+        let _ = sub;
         self.last_frame = self.frames_done;
         self.frames_done += ctl as u64;
     }
 
     fn process(&mut self, io: &mut Io<'_, '_>) {
-        let mut first = 0;
-        while first < io.frames {
-            let frames = self.ctl.min(io.frames - first);
+        for k in 0..io.frames {
+            let pos = self.pos;
             for ci in 0..self.n {
                 let src = self.ch[ci].src;
-                for i in 0..frames {
-                    let x = io.input[src][first + i];
-                    // A non-finite sample is 0 to the audio and models; the
-                    // peak axis sees it as the most restrictive.
-                    self.xin[ci][i] = if x.is_finite() { dsp::meter1(x) } else { dsp::METER_FS };
-                }
+                let x = io.input[src][k];
+                // a non-finite sample is 0 to the audio and the models; the
+                // peak axis sees it as the most restrictive
+                self.xin[ci][pos] = if x.is_finite() { dsp::meter1(x) } else { dsp::METER_FS };
+                io.output[src][k] = self.yout[ci][pos];
             }
-            self.process_quantum(frames);
-            for ci in 0..self.n {
-                let src = self.ch[ci].src;
-                for i in 0..frames {
-                    io.output[src][first + i] = self.yout[ci][i];
+            self.pos += 1;
+            self.frame += 1;
+            if self.pos == self.ctl {
+                self.pos = 0;
+                self.process_frame();
+                if self.fault {
+                    crate::failsafe::fill_from(io, k + 1, FAILSAFE_GAIN);
+                    return;
                 }
-            }
-            self.frame += frames as u64;
-            first += frames;
-            if self.fault {
-                crate::failsafe::fill_from(io, first, FAILSAFE_GAIN);
-                return;
             }
         }
     }
@@ -2609,6 +2540,7 @@ impl ProtectionUnit for Unit {
             return false;
         }
         let t = gap_or_zero(gap_s);
+        let frames = t * rate as f64 / run.ctl as f64;
         let substeps = t * rate as f64 / run.sub as f64;
         for (i, c) in run.ch.iter_mut().enumerate() {
             let s = &state.node[i];
@@ -2728,7 +2660,7 @@ mod fault_tests {
         assert_eq!(p.filterbank_frames(), 144);
         assert_eq!(p.lookahead_frames(), 32);
         assert_eq!(p.latency_frames(), 320);
-        assert_eq!(p.unit_latency_frames(), 320);
+        assert_eq!(p.unit_latency_frames(), 576);
         assert!(Run::new(&p).is_ok());
     }
 
