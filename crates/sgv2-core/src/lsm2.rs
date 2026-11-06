@@ -1559,6 +1559,7 @@ impl Run {
         let fb = p.filterbank_frames();
         let od = p.output_offset_frames();
         let sub_dt = sub as f64 / rate;
+        let ctl_dt = ctl as f64 / rate;
         // residuals 2.4: AttackTime clamped to 10 ms, the raised-cosine
         // window at most one controller frame
         let attack_len = (libm::round((p.attack_time_ms as f64 * 1e-3).min(0.010) * rate) as u32).clamp(1, ctl as u32);
@@ -2593,6 +2594,7 @@ impl ProtectionUnit for Unit {
         }
         let t = gap_or_zero(gap_s);
         let substeps = t * rate as f64 / run.sub as f64;
+        let frames = t * rate as f64 / run.ctl as f64;
         for (i, c) in run.ch.iter_mut().enumerate() {
             let s = &state.node[i];
             // the series nodes cool independently, each with its own constant
