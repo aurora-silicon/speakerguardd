@@ -22,7 +22,8 @@
 //!   its frequency; a high pass takes `s` times the upper element's
 //!   frequency, never below [`HP_FADE_FLOOR_HZ`].
 //! - A new setting is reached by a linear crossfade of the outputs of the old
-//!   and the new setting over [`FADE_S`]; a volume change during a fade waits
+//!   and the new setting over [`FADE_S`], started by any change of the volume
+//!   value (even one that keeps the setting); a volume change during a fade waits
 //!   for the fade's end and then fades to the latest volume. A change before
 //!   the first processed frame applies at once.
 //!
@@ -329,6 +330,8 @@ pub struct Run {
     /// Frames into the running crossfade, `None` when not fading.
     fade: Option<usize>,
     pending: Option<f64>,
+    /// The volume scalar of the current (or, while fading, the next) setting.
+    volume: f64,
     started: bool,
 }
 
@@ -351,6 +354,7 @@ impl Run {
             fade_len,
             fade: None,
             pending: None,
+            volume: 1.0,
             started: false,
         }
     }
@@ -382,15 +386,20 @@ impl Run {
 
     fn take_pending(&mut self) {
         let Some(v) = self.pending.take() else { return };
+        let v = v.clamp(0.0, 1.0);
         let s = resolve(&self.params, v, self.fs);
         if !self.started {
             self.cur = s;
             self.next = s;
-        } else if s != self.cur {
+        } else if v != self.volume {
+            // The unit fades on every change of the volume value, even one
+            // that resolves to the same setting; that fade still holds off
+            // the next change until it ends.
             self.next = s;
             self.next_state = self.cur_state;
             self.fade = Some(0);
         }
+        self.volume = v;
     }
 
     pub fn process(&mut self, bufs: &mut [&mut [f32]], frames: usize) {
@@ -500,6 +509,23 @@ mod tests {
         assert_eq!(b[0], 0.5);
         assert!(((b[480] as f64) - 0.5 * (0.5 + 0.5 * g)).abs() < 1e-6);
         assert!(((b[960] as f64) - 0.5 * g).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_volume_change_within_one_setting_still_holds_off_the_next() {
+        let mut p = Params { breakpoints: [0.2, 0.4, 0.6, 0.8], ..Params::default() };
+        p.elements[4].gain_db = -12.0;
+        let mut r = Run::new(&p, 48_000.0, 1);
+        r.set_volume_scalar(0.05);
+        let mut a = [0.5f32; 64];
+        r.process(&mut [&mut a], 64);
+        r.set_volume_scalar(0.1); // same setting: a silent fade
+        r.process(&mut [&mut a], 64);
+        r.set_volume_scalar(1.0); // waits for that fade
+        let mut b = [0.5f32; 1000];
+        r.process(&mut [&mut b], 1000);
+        assert_eq!(b[895], 0.5);
+        assert!(b[897] < 0.5);
     }
 
     #[test]
