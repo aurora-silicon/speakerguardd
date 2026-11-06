@@ -1985,6 +1985,9 @@ impl Run {
             } else {
                 c.protected_peak_now
             }
+            // The retained producer has a structural quarter-limit floor;
+            // silence must not turn a later episode into a zero-bound onset.
+            .max(0.25 * vlim_g)
             .min(vlim_g);
             if c.vel_bound_ready && stream_ready {
                 c.vel_bound_old = c.vel_bound_new;
