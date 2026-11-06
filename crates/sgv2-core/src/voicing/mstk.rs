@@ -275,6 +275,16 @@ struct DetectorPath {
     count: usize,
 }
 
+#[derive(Clone, Copy)]
+struct LegacyStage {
+    high: Path,
+    allpass: Path,
+}
+
+impl LegacyStage {
+    const EMPTY: Self = Self { high: Path::EMPTY, allpass: Path::EMPTY };
+}
+
 impl DetectorPath {
     const EMPTY: Self = Self { section: [Section::ID; MAX_DETECTOR_FILTERS], count: 0 };
 
@@ -387,6 +397,22 @@ fn paths(p: &Params, fs: f64) -> [Path; BANDS] {
     push_lr(&mut v[3], true, n[2], f[2], fs);
     push_lr_allpass(&mut v[3], n[0], f[0], fs);
     v
+}
+
+/// Split/merge stages used by the quality-1 algorithms.  Each stage keeps the
+/// Linkwitz-Riley high branch and obtains the low branch as `allpass - high`.
+/// Recombination phase-corrects the running low-band sum before adding the
+/// next band.  This is the split/merge realization described by Google's
+/// Apache-2.0 `MultiCrossoverFilter`, specialized here to four bands and the
+/// saved independent crossover orders.
+fn legacy_stages(p: &Params, fs: f64) -> [LegacyStage; XOVERS] {
+    let mut out = [LegacyStage::EMPTY; XOVERS];
+    for (stage, item) in out.iter_mut().enumerate() {
+        let n = effective_order(p.crossover_order[stage]);
+        push_lr(&mut item.high, true, n, p.crossover_hz[stage], fs);
+        push_lr_allpass(&mut item.allpass, n, p.crossover_hz[stage], fs);
+    }
+    out
 }
 
 /// Detector paths use one Butterworth half of each Linkwitz-Riley branch.
@@ -599,6 +625,7 @@ impl SlidingMax {
 /// The real-time state of one linked compressor instance.
 pub struct Run {
     path: [Path; BANDS],
+    legacy_stage: [LegacyStage; XOVERS],
     detector_path: [DetectorPath; BANDS],
     band: [Band; BANDS],
     in_gain: f64,
@@ -611,6 +638,7 @@ pub struct Run {
     recovery: [f64; BANDS],
     release_on: bool,
     algorithm0: bool,
+    legacy_recombination: bool,
     overshoot_compensation: bool,
     channels: usize,
     env: [f64; BANDS],
@@ -623,6 +651,9 @@ pub struct Run {
     gain_src: [GainSrc; BANDS],
     gain_anti_alias: [GainAntiAlias; BANDS],
     state: [[[[f64; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS],
+    legacy_high_state: [[[[f64; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
+    legacy_split_allpass_state: [[[[f64; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
+    legacy_merge_allpass_state: [[[[f64; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
     detector_state: [[[[f32; 2]; MAX_DETECTOR_FILTERS]; BANDS]; MAX_CHANNELS],
 }
 
@@ -661,6 +692,7 @@ impl Run {
         let recovery = release.map(|coefficient| 1.0 - coefficient);
         Run {
             path: paths(q, fs),
+            legacy_stage: legacy_stages(q, fs),
             detector_path: detector_paths(q, fs),
             band: q.band,
             in_gain: db_amp(q.input_gain_db),
@@ -673,6 +705,7 @@ impl Run {
             recovery,
             release_on: q.release_on,
             algorithm0: q.algorithm == 0,
+            legacy_recombination: q.render_quality == 1 && q.algorithm < 3,
             overshoot_compensation: q.overshoot_compensation,
             channels: channels.min(MAX_CHANNELS),
             env: [0.0; BANDS],
@@ -685,6 +718,9 @@ impl Run {
             gain_src: core::array::from_fn(|b| GainSrc::new(detector_factor[b], fs)),
             gain_anti_alias: core::array::from_fn(|b| GainAntiAlias::new(detector_factor[b], fs)),
             state: [[[[0.0; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS],
+            legacy_high_state: [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
+            legacy_split_allpass_state: [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
+            legacy_merge_allpass_state: [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
             detector_state: [[[[0.0; 2]; MAX_DETECTOR_FILTERS]; BANDS]; MAX_CHANNELS],
         }
     }
@@ -702,6 +738,9 @@ impl Run {
             filter.reset();
         }
         self.state = [[[[0.0; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS];
+        self.legacy_high_state = [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS];
+        self.legacy_split_allpass_state = [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS];
+        self.legacy_merge_allpass_state = [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS];
         self.detector_state = [[[[0.0; 2]; MAX_DETECTOR_FILTERS]; BANDS]; MAX_CHANNELS];
     }
 
@@ -711,6 +750,9 @@ impl Run {
 
     #[inline]
     fn split(&mut self, c: usize, x: f64) -> [f64; BANDS] {
+        if self.legacy_recombination {
+            return self.legacy_split(c, x);
+        }
         let mut out = [0.0; BANDS];
         for (b, y) in out.iter_mut().enumerate() {
             let mut v = x;
@@ -725,6 +767,45 @@ impl Run {
             *y = v * self.band_in[b];
         }
         out
+    }
+
+    #[inline]
+    fn run_path(path: Path, state: &mut [[f64; 2]; MAX_FILTERS], mut value: f64) -> f64 {
+        for (s, z) in path.section[..path.count].iter().zip(state.iter_mut()) {
+            let output = s.b0 * value + z[0];
+            z[0] = s.b1 * value - s.a1 * output + z[1];
+            z[1] = s.b2 * value - s.a2 * output;
+            value = output;
+        }
+        value
+    }
+
+    #[inline]
+    fn legacy_split(&mut self, c: usize, x: f64) -> [f64; BANDS] {
+        let mut out = [0.0; BANDS];
+        let mut remaining = x;
+        for stage in 0..XOVERS {
+            let filters = self.legacy_stage[stage];
+            let high = Self::run_path(filters.high, &mut self.legacy_high_state[c][stage], remaining);
+            let allpass = Self::run_path(filters.allpass, &mut self.legacy_split_allpass_state[c][stage], remaining);
+            out[stage] = (allpass - high) * self.band_in[stage];
+            remaining = high;
+        }
+        out[BANDS - 1] = remaining * self.band_in[BANDS - 1];
+        out
+    }
+
+    #[inline]
+    fn legacy_recombine(&mut self, c: usize, bands: [f64; BANDS]) -> f64 {
+        let mut output = bands[0];
+        for stage in 1..XOVERS {
+            output = Self::run_path(
+                self.legacy_stage[stage].allpass,
+                &mut self.legacy_merge_allpass_state[c][stage],
+                output,
+            ) + bands[stage];
+        }
+        output + bands[BANDS - 1]
     }
 
     #[inline]
@@ -836,16 +917,24 @@ impl Run {
                 }
             }
             for c in 0..n {
-                let mut y = 0.0;
+                let mut processed = [0.0; BANDS];
                 for b in 0..BANDS {
-                    y += Self::band_output(self.band[b].saturation, gain[b], bands[c][b]);
+                    processed[b] = Self::band_output(self.band[b].saturation, gain[b], bands[c][b]);
                 }
+                let mut y = if self.legacy_recombination {
+                    self.legacy_recombine(c, processed)
+                } else {
+                    processed.into_iter().sum()
+                };
                 y *= self.out_gain;
                 if let Some(out) = bufs[c].get_mut(i) {
                     *out = if y.is_finite() { y as f32 } else { 0.0 };
                 }
                 if !y.is_finite() {
                     self.state[c] = [[[0.0; 2]; MAX_FILTERS]; BANDS];
+                    self.legacy_high_state[c] = [[[0.0; 2]; MAX_FILTERS]; XOVERS];
+                    self.legacy_split_allpass_state[c] = [[[0.0; 2]; MAX_FILTERS]; XOVERS];
+                    self.legacy_merge_allpass_state[c] = [[[0.0; 2]; MAX_FILTERS]; XOVERS];
                 }
             }
             if self.env.iter().any(|v| !v.is_finite()) {
@@ -985,6 +1074,7 @@ mod tests {
             p.input_gain_db = 0.0;
             p.output_gain_db = 0.0;
             p.algorithm = 1;
+            p.render_quality = 1;
             p.release_on = false;
             for b in p.band.iter_mut() {
                 b.mode = BandMode::Pass;
@@ -1012,6 +1102,7 @@ mod tests {
         for algorithm in 0..=2 {
             let mut p = params();
             p.algorithm = algorithm;
+            p.render_quality = 1;
             p.input_gain_db = 0.0;
             p.output_gain_db = 0.0;
             for band in &mut p.band {
