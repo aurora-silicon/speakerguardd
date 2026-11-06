@@ -1237,83 +1237,159 @@ impl ProtectedPeak {
     }
 }
 
-/// The input power/temperature current model: binary32 state and output.
-#[derive(Clone, Copy, Default)]
-struct Current {
+/// Largest native power/thermal substep (64 frames at 88.2/96/176.4/192 kHz).
+const MAX_SUBSTEP_FRAMES: usize = 2 * SUBSTEP_FRAMES;
+
+/// The output-monitor current model in the optimized vDSP bulk form.
+///
+/// The multichannel API documents a direct-form-II filter but its optimized
+/// single-channel path does not iterate that recurrence one sample at a time.
+/// It precalculates the first eight input and state responses in binary64,
+/// rounds the table to binary32, evaluates two groups of four outputs, and
+/// updates the two transposed states once per eight samples.  This portable
+/// expression preserves that arithmetic order without depending on
+/// Accelerate or an architecture-specific vector ISA.
+#[derive(Clone, Copy)]
+struct MonitorCurrent {
     b: [f32; 3],
     a: [f32; 2],
-    u: [f32; 2],
-    i: [f32; 2],
+    table: [f32; 56],
+    z: [f32; 2],
 }
 
-impl Current {
-    fn new(rdc: f64, bl: f64, m: f64, rms: f64, k: f64, rate: f64) -> Self {
-        let (b, a) = current_coefficients(rdc, bl, m, rms, k, rate);
-        Current { b, a, u: [0.0; 2], i: [0.0; 2] }
+impl Default for MonitorCurrent {
+    fn default() -> Self {
+        Self { b: [0.0; 3], a: [0.0; 2], table: [0.0; 56], z: [0.0; 2] }
     }
-    #[inline]
-    fn step(&mut self, u: f32) -> f32 {
-        let b = self.b.map(|v| v as f64);
-        let a = self.a.map(|v| v as f64);
-        let i = (b[0] * u as f64 + b[1] * self.u[0] as f64 + b[2] * self.u[1] as f64
-            - a[0] * self.i[0] as f64
-            - a[1] * self.i[1] as f64) as f32;
-        self.u = [u, self.u[0]];
-        self.i = [i, self.i[0]];
-        i
-    }
-    fn clear(&mut self) {
-        self.u = [0.0; 2];
-        self.i = [0.0; 2];
-    }
-    fn is_finite(&self) -> bool {
-        self.i[0].is_finite() && self.i[1].is_finite()
-    }
-}
-
-/// The output monitor and ceiling current model: the same binary32
-/// coefficients in the native binary64 direct-form-I state and output.
-#[derive(Clone, Copy, Default)]
-struct MonitorCurrent {
-    b: [f64; 3],
-    a: [f64; 2],
-    u: [f64; 2],
-    i: [f64; 2],
 }
 
 impl MonitorCurrent {
-    /// `I/U = (Mms s^2 + Rms s + Kms) / (R Mms s^2 + (R Rms + Bl^2) s + R Kms)`
-    /// by the generative builder of residuals section 1.
     fn new(rdc: f64, bl: f64, m: f64, rms: f64, k: f64, rate: f64) -> Self {
         let (b, a) = current_coefficients(rdc, bl, m, rms, k, rate);
-        MonitorCurrent { b: b.map(f64::from), a: a.map(f64::from), u: [0.0; 2], i: [0.0; 2] }
+        MonitorCurrent { b, a, table: Self::bulk_table(b, a), z: [0.0; 2] }
     }
-    #[inline]
-    fn step(&mut self, u: f32) -> f64 {
-        let u = f64::from(u);
-        let i = self.b[0] * u + self.b[1] * self.u[0] + self.b[2] * self.u[1]
-            - self.a[0] * self.i[0]
-            - self.a[1] * self.i[1];
-        self.u = [u, self.u[0]];
-        self.i = [i, self.i[0]];
-        i
+
+    fn bulk_table(b: [f32; 3], a: [f32; 2]) -> [f32; 56] {
+        let (b0, b1, b2) = (f64::from(b[0]), f64::from(b[1]), f64::from(b[2]));
+        let (a1, a2) = (f64::from(a[0]), f64::from(a[1]));
+        let mut h = [0.0f64; 8];
+        let mut p = [0.0f64; 8];
+        let mut q = [0.0f64; 8];
+        h[0] = b0;
+        h[1] = b1 - a1 * h[0];
+        h[2] = (b2 - a1 * h[1]) - a2 * h[0];
+        p[0] = 1.0;
+        p[1] = -a1;
+        q[1] = 1.0;
+        for i in 2..8 {
+            if i >= 3 {
+                h[i] = -a1 * h[i - 1] - a2 * h[i - 2];
+            }
+            p[i] = -a1 * p[i - 1] - a2 * p[i - 2];
+            q[i] = -a1 * q[i - 1] - a2 * q[i - 2];
+        }
+
+        let mut t = [0.0f32; 56];
+        for row in 0..4 {
+            for column in 0..4 {
+                if row >= column {
+                    t[4 * column + row] = h[row - column] as f32;
+                }
+            }
+        }
+        for i in 0..4 {
+            t[16 + i] = p[i] as f32;
+            t[20 + i] = q[i] as f32;
+        }
+        t[24..32].copy_from_slice(&[b[2], 0.0, b[1], b[2], a[1], 0.0, a[0], a[1]]);
+        for i in 0..4 {
+            t[32 + i] = h[4 + i] as f32;
+            t[36 + i] = h[3 + i] as f32;
+            t[40 + i] = h[2 + i] as f32;
+            t[44 + i] = h[1 + i] as f32;
+            t[48 + i] = p[4 + i] as f32;
+            t[52 + i] = q[4 + i] as f32;
+        }
+        t
     }
-    /// The retained response used by the ceiling's linear term exists for
-    /// one filterbank stage. The remaining predictor window is zero-state.
-    #[inline]
-    fn retained_step(&mut self, sample: usize, stage: usize) -> f64 {
-        if sample < stage {
-            self.step(0.0)
-        } else {
-            0.0
+
+    fn process(&mut self, input: &[f32], output: &mut [f32]) {
+        debug_assert_eq!(input.len(), output.len());
+        let bulk = input.len() / 8 * 8;
+        for base in (0..bulk).step_by(8) {
+            let x = &input[base..base + 8];
+            let y = &mut output[base..base + 8];
+            for lane in 0..4 {
+                let mut low = self.table[lane] * x[0];
+                low = libm::fmaf(self.table[4 + lane], x[1], low);
+                low = libm::fmaf(self.table[8 + lane], x[2], low);
+                low = libm::fmaf(self.table[12 + lane], x[3], low);
+                low = libm::fmaf(self.table[16 + lane], self.z[0], low);
+                y[lane] = libm::fmaf(self.table[20 + lane], self.z[1], low);
+
+                let mut upper = self.table[32 + lane] * x[0];
+                upper = libm::fmaf(self.table[36 + lane], x[1], upper);
+                upper = libm::fmaf(self.table[40 + lane], x[2], upper);
+                upper = libm::fmaf(self.table[44 + lane], x[3], upper);
+                upper = libm::fmaf(self.table[48 + lane], self.z[0], upper);
+                let mut lower = self.table[lane] * x[4];
+                lower = libm::fmaf(self.table[52 + lane], self.z[1], lower);
+                lower = libm::fmaf(self.table[4 + lane], x[5], lower);
+                lower = libm::fmaf(self.table[8 + lane], x[6], lower);
+                lower = libm::fmaf(self.table[12 + lane], x[7], lower);
+                y[4 + lane] = upper + lower;
+            }
+            let mut next = [0.0f32; 2];
+            for lane in 0..2 {
+                let mut state = self.table[24 + lane] * x[6];
+                state = libm::fmaf(self.table[26 + lane], x[7], state);
+                state = libm::fmaf(-self.table[28 + lane], y[6], state);
+                next[lane] = libm::fmaf(-self.table[30 + lane], y[7], state);
+            }
+            self.z = next;
+        }
+        for i in bulk..input.len() {
+            let x = input[i];
+            let y = libm::fmaf(self.b[0], x, self.z[0]);
+            let z1 = libm::fmaf(-self.a[0], y, libm::fmaf(self.b[1], x, self.z[1]));
+            let z2 = libm::fmaf(self.b[2], x, -self.a[1] * y);
+            output[i] = y;
+            self.z = [z1, z2];
         }
     }
+
+    /// Replace voltages with their binary32 `u*i` products and return the
+    /// corresponding unrounded binary64 sum used by the amplifier monitor.
+    fn power_products_in_place(&mut self, voltage: &mut [f32]) -> f64 {
+        debug_assert!(voltage.len() <= MAX_SUBSTEP_FRAMES);
+        let mut current = [0.0f32; MAX_SUBSTEP_FRAMES];
+        self.process(voltage, &mut current[..voltage.len()]);
+        let mut sum = 0.0;
+        for i in 0..voltage.len() {
+            let product = f64::from(voltage[i]) * f64::from(current[i]);
+            sum += product;
+            voltage[i] = product as f32;
+        }
+        sum
+    }
+
+    fn power_sum(&mut self, voltage: &[f32]) -> f64 {
+        let mut current = [0.0f32; MAX_SUBSTEP_FRAMES];
+        let mut sum = 0.0;
+        for input in voltage.chunks(MAX_SUBSTEP_FRAMES) {
+            self.process(input, &mut current[..input.len()]);
+            for i in 0..input.len() {
+                sum += f64::from(input[i]) * f64::from(current[i]);
+            }
+        }
+        sum
+    }
+
     fn clear(&mut self) {
-        self.u = [0.0; 2];
-        self.i = [0.0; 2];
+        self.z = [0.0; 2];
     }
     fn is_finite(&self) -> bool {
-        self.i[0].is_finite() && self.i[1].is_finite()
+        self.z[0].is_finite() && self.z[1].is_finite()
     }
 }
 
@@ -1482,14 +1558,14 @@ struct Chan {
     eg: [Vec<f32>; BANDS],
     // Power path (fast-gained bank stage): the committed state at the
     // start of the frame's output region.
-    cur_in: Current,
+    cur_in: MonitorCurrent,
     pbar_in: [f64; 4],
     /// Per-substep `u i` of the fast-gained bank stage, output region.
     p_sub: [f64; SUBSTEPS],
     // Temperature axis (residuals 2): the input model, unattenuated, on
     // the input's own current model; its temperature points by global
     // substep (ring), the newest at `tn - 1`.
-    tin_cur: Current,
+    tin_cur: MonitorCurrent,
     /// One thermal substep of `u*i` products (monitor sum).
     power_work: Vec<f32>,
     tp_vc: f32,
@@ -1590,13 +1666,31 @@ impl Chan {
         let amb = self.ambient as f32;
         let mut i = 0;
         for raw_k in 0..full / sub {
+            let mut voltage = [0.0f32; MAX_SUBSTEP_FRAMES];
+            for j in 0..sub {
+                let y = if i + j < extra {
+                    self.ceil_fast_prev[ctl - extra + i + j]
+                } else {
+                    self.out_sample(i + j - extra, 1.0)
+                };
+                voltage[j] = self.vfs * y;
+            }
+            let mut retained = [0.0f32; MAX_SUBSTEP_FRAMES];
+            let keep = fb.saturating_sub(i).min(sub);
+            if keep != 0 {
+                zi.process(&[0.0; MAX_SUBSTEP_FRAMES][..keep], &mut retained[..keep]);
+            }
+            let mut zero = [0.0f32; MAX_SUBSTEP_FRAMES];
+            zs.process(&voltage[..sub], &mut zero[..sub]);
+            let mut j = 0;
             let [sl, sq] = vdsp_sve(sub, || {
-                let y = if i < extra { self.ceil_fast_prev[ctl - extra + i] } else { self.out_sample(i - extra, 1.0) };
-                let retained = zi.retained_step(i, fb);
-                i += 1;
-                let u = self.vfs * y;
-                [(f64::from(u) * retained) as f32, (f64::from(u) * zs.step(u)) as f32]
+                let u = voltage[j];
+                let products =
+                    [(f64::from(u) * f64::from(retained[j])) as f32, (f64::from(u) * f64::from(zero[j])) as f32];
+                j += 1;
+                products
             });
+            i += sub;
             let (pl, pq) = (sl / sub as f32, sq / sub as f32);
             bv = self.br_vc.step(bv, 0.0);
             bm = self.br_mg.step(bm, 0.0);
@@ -1815,7 +1909,7 @@ impl Run {
             };
             let vel = motion(c.vel_rdc, c.vel_bl, c.vel_mms_kg, c.vel_rms, c.vel_kms, rate, true);
             let disp = motion(c.disp_rdc, c.disp_bl, c.disp_mms_kg, c.disp_rms, c.disp_kms, rate, false);
-            let cur = Current::new(c.rdc as f64, c.bl as f64, c.mms_kg as f64, c.rms as f64, c.kms as f64, rate);
+            let cur = MonitorCurrent::new(c.rdc as f64, c.bl as f64, c.mms_kg as f64, c.rms as f64, c.kms as f64, rate);
             let monitor_cur =
                 MonitorCurrent::new(c.rdc as f64, c.bl as f64, c.mms_kg as f64, c.rms as f64, c.kms as f64, rate);
             let br_vc = ThermalBranch::new(c.rth_vc as f64, c.tau_vc as f64, sub_dt);
@@ -2082,9 +2176,9 @@ impl Run {
             }
             // the input temperature model, unattenuated (residuals 2)
             let ut = c.vfs * xin[i];
-            let it = c.tin_cur.step(ut);
-            c.power_work[i % sub] = ut * it;
+            c.power_work[i % sub] = ut;
             if (i + 1) % sub == 0 {
+                c.tin_cur.power_products_in_place(&mut c.power_work);
                 let p = (seq_sum(&c.power_work) / sub as f32).max(0.0);
                 c.tp_vc = c.br_vc.step(c.tp_vc, p);
                 c.tp_mg = c.br_mg.step(c.tp_mg, p);
@@ -2361,30 +2455,31 @@ impl Run {
         for (ci, c) in self.ch.iter_mut().enumerate() {
             let mut cur = c.cur_in;
             let mut pb = c.pbar_in;
-            let mut acc = 0.0f64;
             let vfs = c.vfs;
-            for idx in 0..ctl + od {
+            for start in (0..ctl + od).step_by(sub) {
+                let take = sub.min(ctl + od - start);
                 // input-referred (rig law 4): the power and temperature
                 // candidates see the bank stage before any gain
-                let u = vfs * c.xc[idx];
-                let i = cur.step(u);
-                acc += u as f64 * i as f64;
-                if (idx + 1) % sub == 0 {
-                    let p = acc / sub as f64;
-                    acc = 0.0;
-                    let s = idx / sub;
-                    if s < SUBSTEPS {
-                        c.p_sub[s] = p;
-                    }
-                    let pamp = self.idle + self.ratio * (p * c.load_scale).max(0.0);
-                    for j in 0..4 {
-                        pb[j] = self.p_pole[j] * pb[j] + (1.0 - self.p_pole[j]) * pamp;
-                        phat[ci][j] = if idx + 1 == sub { pb[j] } else { phat[ci][j].max(pb[j]) };
-                    }
-                    if idx + 1 == ctl {
-                        c.cur_in = cur;
-                        c.pbar_in = pb;
-                    }
+                for i in 0..take {
+                    c.power_work[i] = vfs * c.xc[start + i];
+                }
+                let sum = cur.power_sum(&c.power_work[..take]);
+                if take != sub {
+                    continue;
+                }
+                let p = sum / sub as f64;
+                let s = start / sub;
+                if s < SUBSTEPS {
+                    c.p_sub[s] = p;
+                }
+                let pamp = self.idle + self.ratio * (p * c.load_scale).max(0.0);
+                for j in 0..4 {
+                    pb[j] = self.p_pole[j] * pb[j] + (1.0 - self.p_pole[j]) * pamp;
+                    phat[ci][j] = if start == 0 { pb[j] } else { phat[ci][j].max(pb[j]) };
+                }
+                if start + sub == ctl {
+                    c.cur_in = cur;
+                    c.pbar_in = pb;
                 }
             }
         }
@@ -2500,7 +2595,6 @@ impl Run {
         let (idle, ratio_p) = (self.idle, self.ratio);
         for (ci, c) in self.ch.iter_mut().enumerate() {
             let y = &mut self.yout[ci];
-            let mut acc = 0.0f64;
             let mut s = 0;
             let mut protected_model_peak = 0.0f32;
             let (mut p1, mut p1s) = (0.0f64, 0.0f64);
@@ -2531,17 +2625,14 @@ impl Run {
                     v
                 };
                 let u = c.vfs * v;
-                let iv = c.cur_out.step(u);
-                acc += f64::from(u) * iv;
-                c.power_work[i % sub] = (f64::from(u) * iv) as f32;
+                c.power_work[i % sub] = u;
                 *yo = v.clamp(-1.0, 1.0);
                 // The persistent motion models follow the protected output.
                 c.dcar_m.step(c.vfs * *yo);
                 let modeled_velocity = c.vcar_m.step(c.vfs * *yo);
                 protected_model_peak = protected_model_peak.max(modeled_velocity.abs());
                 if (i + 1) % sub == 0 {
-                    let p = acc / sub as f64;
-                    acc = 0.0;
+                    let p = c.cur_out.power_products_in_place(&mut c.power_work) / sub as f64;
                     // the output thermal model (residuals 2.1)
                     let pp = (seq_sum(&c.power_work) / sub as f32).max(0.0);
                     c.th_vc = c.br_vc.step(c.th_vc, pp);
@@ -2824,24 +2915,24 @@ mod fault_tests {
     use super::*;
 
     #[test]
-    fn output_monitor_keeps_the_unrounded_current_state() {
-        let args = (4.0, 0.8, 0.2e-3, 0.2, 1500.0, 48_000.0);
-        let mut input = Current::new(args.0, args.1, args.2, args.3, args.4, args.5);
-        let mut monitor = MonitorCurrent::new(args.0, args.1, args.2, args.3, args.4, args.5);
-        let input_i = input.step(0.123_456_7);
-        let monitor_i = monitor.step(0.123_456_7);
-        assert_eq!(f64::from(input_i), f64::from(input.i[0]));
-        assert_ne!(monitor_i, f64::from(monitor_i as f32));
-        assert_eq!(monitor_i, monitor.i[0]);
-    }
+    fn current_bulk_table_and_state_are_chunk_stable() {
+        let b = [0.75, -0.25, 0.125];
+        let a = [-0.5, 0.25];
+        let table = MonitorCurrent::bulk_table(b, a);
+        assert_eq!(&table[..4], &[0.75, 0.125, 0.0, -0.03125]);
+        assert_eq!(&table[16..20], &[1.0, 0.5, 0.0, -0.125]);
+        assert_eq!(&table[24..32], &[0.125, 0.0, -0.25, 0.125, 0.25, 0.0, -0.5, 0.25]);
 
-    #[test]
-    fn ceiling_retained_current_ends_after_one_filterbank_stage() {
-        let mut current = MonitorCurrent { a: [-0.5, 0.25], i: [1.0, 0.5], ..MonitorCurrent::default() };
-        assert_ne!(current.retained_step(0, 1), 0.0);
-        let retained = current;
-        assert_eq!(current.retained_step(1, 1), 0.0);
-        assert_eq!((current.u, current.i), (retained.u, retained.i));
+        let input: [f32; 16] = core::array::from_fn(|i| (i as f32 - 7.0) / 13.0);
+        let mut whole = MonitorCurrent { b, a, table, z: [0.0; 2] };
+        let mut split = whole;
+        let mut whole_output = [0.0; 16];
+        let mut split_output = [0.0; 16];
+        whole.process(&input, &mut whole_output);
+        split.process(&input[..8], &mut split_output[..8]);
+        split.process(&input[8..], &mut split_output[8..]);
+        assert_eq!(whole_output.map(f32::to_bits), split_output.map(f32::to_bits));
+        assert_eq!(whole.z.map(f32::to_bits), split.z.map(f32::to_bits));
     }
 
     #[test]
