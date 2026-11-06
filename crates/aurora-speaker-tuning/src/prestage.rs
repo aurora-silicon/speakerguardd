@@ -107,6 +107,7 @@ use crate::tuning::{Stage, Tuning};
 use sgv2_core::prestage::{
     Band, BandMode, BoxAt, Channel, Dynamics, Params, Section, BANDS, FLAG_FROM_TUNING, MAX_BOXES, MAX_SECTIONS,
 };
+use sgv2_core::voicing::tone as tone_filter;
 use sgv2_core::MAX_CHANNELS;
 use std::f64::consts::PI;
 
@@ -417,7 +418,7 @@ impl Automation {
         let mut pts = vec![self.b];
         pts.extend(self.middle.map(|(_, p)| p));
         // a flat gain or a shelf boost never reads the frequency
-        let reads_freq = matches!(kind, 1 | 3 | 4 | 11 | 12);
+        let reads_freq = matches!(kind, 1 | 3 | 4 | 11 | 12 | 14);
         if pts.iter().any(|p| !p.gain.is_finite() || (reads_freq && !p.f0.is_finite())) {
             return fail("a set point is not numeric");
         }
@@ -635,6 +636,26 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics) -> Result
                     );
                 }
             }
+            // A resonant second-order high-pass. Its gain, order and fourth
+            // frequency fields do not participate. The quality uses the
+            // unit's analog decay convention rather than the bilinear Q.
+            14 => {
+                if q <= 0.0 {
+                    return Err(bad(format!("{ctx}: slot {i} resonant high-pass quality {q}")));
+                }
+                for pt in &points {
+                    need_freq("resonant high-pass", pt.f0)?;
+                }
+                let corner = points.iter().map(|pt| pt.f0).fold(f0, f64::max);
+                p.sections.push(tone_filter::resonant_high_pass(corner, q, fs));
+                if automated {
+                    diags.info(
+                        "prestage-volume-automation",
+                        ctx.clone(),
+                        format!("slot {i}: the volume-automated resonant high-pass corner is carried at {corner} Hz"),
+                    );
+                }
+            }
             // A peak or shelf of 0 dB at every point is the identity at
             // any frequency and quality.
             1 | 11 | 12 if points.iter().all(|pt| pt.gain == 0.0) => {}
@@ -702,7 +723,11 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics) -> Result
                 };
                 match carried(&points, &spans) {
                     Carry::Exact(k) if in_bypassed_group && points[k].gain > 0.0 => {}
-                    Carry::Exact(k) => p.sections.push(rbj(r, points[k].gain, points[k].f0, q, fs)),
+                    Carry::Exact(k) => p.sections.push(match r {
+                        Rbj::Peak => tone_filter::peak(points[k].gain, points[k].f0, q, fs),
+                        Rbj::LowShelf => tone_filter::low_shelf(points[k].gain, points[k].f0, q, fs),
+                        Rbj::HighShelf => tone_filter::high_shelf(points[k].gain, points[k].f0, q, fs),
+                    }),
                     Carry::Flat(g) => p.gain_db += g,
                 }
                 if automated {
