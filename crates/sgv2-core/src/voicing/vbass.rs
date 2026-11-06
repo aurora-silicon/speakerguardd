@@ -6,7 +6,7 @@
 //!  per channel c:  hp_c  = AP_u(AP_l(HP(x_c)))
 //!  mid M = (L+R)/2: lo    = LP(M)
 //!                   low   = s_b * blend * AP_u(AP_l(lo))
-//!                   harm  = s_h * gain * LP_u(LC(nld, HP_l, lo))
+//!                   harm  = s_h * gain * COMP(LP_u(LC(nld, HP_l, lo)))
 //!                   mid   = SUB(delay(low + harm))
 //!  y_c = out_gain * (hp_c + mid), `latency` frames late
 //! ```
@@ -22,6 +22,9 @@
 //!   level control: off, it is `HP_l(nld(lo))`; on, the device input is
 //!   normalised by a peak follower and its band-limited output rescaled by
 //!   a second one (see [`law`]).
+//! - `COMP` is the optional memoryless hard-knee harmonic compressor. Below
+//!   its threshold it is identity; above it, output dB over the threshold is
+//!   input dB over the threshold divided by the saved ratio.
 //! - `SUB` band-limits the mid branches (a low pass designed at a quarter
 //!   of the rate); each odd-order band-edge all-pass adds one frame of
 //!   output latency and a further branch delay.
@@ -377,10 +380,14 @@ pub struct Params {
     pub device: Device,
     /// Level control in front of the device.
     pub level_control: bool,
+    /// Optional hard-knee compressor on the completed harmonic branch.
+    pub harmonic_compressor: bool,
+    pub compressor_threshold: f64,
+    pub compressor_ratio: f64,
 }
 
 impl Params {
-    pub const WORDS: usize = 11;
+    pub const WORDS: usize = 14;
 
     pub fn to_words(&self, out: &mut [f64]) {
         let w = [
@@ -395,6 +402,9 @@ impl Params {
             self.output_gain,
             self.device.code(),
             if self.level_control { 1.0 } else { 0.0 },
+            if self.harmonic_compressor { 1.0 } else { 0.0 },
+            self.compressor_threshold,
+            self.compressor_ratio,
         ];
         out[..Self::WORDS].copy_from_slice(&w);
     }
@@ -416,6 +426,18 @@ impl Params {
         } else {
             return None;
         };
+        let harmonic_compressor = if w[11] == 0.0 {
+            false
+        } else if w[11] == 1.0 {
+            true
+        } else {
+            return None;
+        };
+        let compressor_threshold = w[12];
+        let compressor_ratio = w[13];
+        if !(1e-5..=100_000.0).contains(&compressor_threshold) || !(1.0..=100.0).contains(&compressor_ratio) {
+            return None;
+        }
         Some(Params {
             fc_hz: corner(w[0])?,
             hp_order: order(w[1])?,
@@ -428,6 +450,9 @@ impl Params {
             output_gain: gain(w[8])?,
             device: Device::from_code(w[9])?,
             level_control,
+            harmonic_compressor,
+            compressor_threshold,
+            compressor_ratio,
         })
     }
 }
@@ -640,6 +665,20 @@ impl Run {
         }
     }
 
+    #[inline]
+    fn compress_harmonic(&self, x: f64) -> f64 {
+        if !self.p.harmonic_compressor {
+            return x;
+        }
+        let a = libm::fabs(x);
+        let t = self.p.compressor_threshold;
+        if a <= t {
+            x
+        } else {
+            libm::copysign(t * libm::pow(a / t, 1.0 / self.p.compressor_ratio), x)
+        }
+    }
+
     /// One selected-rate frame of both mid branches.
     #[inline]
     fn sub_frame(&mut self, lo: f64) -> f64 {
@@ -657,6 +696,7 @@ impl Run {
             let hp = self.band_hp.run(&mut self.band_hp_st, dev);
             self.band_lp.run(&mut self.band_lp_st, hp)
         };
+        let harm = self.compress_harmonic(harm);
         let v = low + self.harm_sign * self.p.harmonic_gain * harm;
         if self.sdelay == 0 {
             return v;
@@ -717,6 +757,9 @@ mod tests {
             output_gain: 1.0,
             device: Device::Saturator3,
             level_control,
+            harmonic_compressor: false,
+            compressor_threshold: 1.0,
+            compressor_ratio: 1.0,
         }
     }
 
@@ -737,10 +780,15 @@ mod tests {
     #[test]
     fn words_round_trip() {
         for lc in [false, true] {
-            let p = params(lc);
-            let mut w = [0.0; Params::WORDS];
-            p.to_words(&mut w);
-            assert_eq!(Params::from_words(&w), Some(p));
+            for compressor in [false, true] {
+                let mut p = params(lc);
+                p.harmonic_compressor = compressor;
+                p.compressor_threshold = 0.75;
+                p.compressor_ratio = 3.5;
+                let mut w = [0.0; Params::WORDS];
+                p.to_words(&mut w);
+                assert_eq!(Params::from_words(&w), Some(p));
+            }
         }
         let mut w = [0.0; Params::WORDS];
         params(false).to_words(&mut w);
@@ -748,6 +796,17 @@ mod tests {
         assert_eq!(Params::from_words(&w), None);
         w[1] = f64::NAN;
         assert_eq!(Params::from_words(&w), None);
+    }
+
+    #[test]
+    fn harmonic_compressor_is_identity_below_its_knee_and_divides_db_above() {
+        let mut p = params(true);
+        p.harmonic_compressor = true;
+        p.compressor_threshold = 0.5;
+        p.compressor_ratio = 4.0;
+        let r = Run::new(&p, 48_000.0, 2);
+        assert_eq!(r.compress_harmonic(-0.25), -0.25);
+        assert!((r.compress_harmonic(8.0) - 1.0).abs() < 1e-12);
     }
 
     #[test]
