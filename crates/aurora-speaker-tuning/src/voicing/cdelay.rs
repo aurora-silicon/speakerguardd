@@ -101,6 +101,7 @@ mod tests {
             preset_name: Some("synthetic".into()),
             state: Some(ParamState { sections }),
             preset_extra_keys: Vec::new(),
+            preset_extra: Default::default(),
             before_protection: true,
         }
     }
