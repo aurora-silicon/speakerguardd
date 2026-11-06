@@ -56,19 +56,24 @@ pub fn current_coefficients(r: f64, bl: f64, m: f64, d: f64, k: f64, rate: f64) 
 
 /// The stable real quadratic `d0 + d1 z^-1 + d2 z^-2` with magnitudes `q`
 /// at `0, pi/3, 2pi/3`, by spectral factorization, every step in binary32.
+/// The four contractions are explicit: native's ARM64 builder uses FMA,
+/// while expanding them into separate operations reproduces its inactive
+/// x86 slice but moves the running current model and thermal power.
 pub fn minimum_phase_triplet(q: [f32; 3]) -> (f32, f32, f32) {
     let [q0, q1, q2] = q;
     let omega = r32(PI / 3.0);
     let c = r32(libm::cos(omega as f64));
     let c2 = r32(libm::cos((omega + omega) as f64));
-    let v = (q1 * q1 - q2 * q2) / (4.0 * c);
-    let disc = q0 * q0 - 4.0 * v;
+    let v = libm::fmaf(q1, q1, -(q2 * q2)) / (4.0 * c);
+    let disc = libm::fmaf(q0, q0, -(4.0 * v));
     let middle = if disc >= 0.0 { (q0 - libm::sqrtf(disc)) * 0.5 } else { libm::sqrtf(q0 * q0 - disc) * 0.5 };
     let total = q0 - middle;
     let aa = (1.0 - c2) * 2.0;
     let bb = (c2 - 1.0) * (total + total);
-    let cc = ((total * total + middle * middle) + ((total + total) * middle) * c) - q1 * q1;
-    let det = bb * bb - (4.0 * aa) * cc;
+    let cc = libm::fmaf(total, total, middle * middle);
+    let cc = libm::fmaf((total + total) * middle, c, cc);
+    let cc = libm::fmaf(-q1, q1, cc);
+    let det = libm::fmaf(bb, bb, -((4.0 * aa) * cc));
     let num = if det >= 0.0 { -bb - libm::sqrtf(det) } else { libm::sqrtf(bb * bb - det) };
     let last = num / (aa + aa);
     (total - last, middle, last)
@@ -746,6 +751,8 @@ mod tests {
     #[test]
     fn the_current_builder_keeps_one_over_r_at_dc_and_is_stable() {
         let (b, a) = current_coefficients(4.0, 0.8, 0.2e-3, 0.2, 1500.0, 48_000.0);
+        assert_eq!(b.map(f32::to_bits), [0x3e7d_d90c, 0xbefa_d279, 0x3e78_9d32]);
+        assert_eq!(a.map(f32::to_bits), [0xbffa_d6ed, 0x3f76_7f25]);
         let dc = (b[0] + b[1] + b[2]) as f64 / (1.0 + a[0] as f64 + a[1] as f64);
         assert!((dc * 4.0 - 1.0).abs() < 1e-4, "{dc}");
         assert!((a[1] as f64) < 1.0 && (a[1] as f64) > 0.0);
