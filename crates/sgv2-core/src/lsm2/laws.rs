@@ -275,13 +275,8 @@ pub fn velocity_band_gains_window(
     active: (usize, usize),
     seed: [f32; 5],
 ) -> [f32; 5] {
-    let mut g = seed;
     let n = vb[0].len();
-    if first >= n {
-        return g;
-    }
-    let is_active = |k: usize| k >= active.0 && k < active.1;
-    let limit_at = |i: usize| {
+    velocity_band_gains_with_limits(vb, resid, first, room_floor, s, active, seed, |i| {
         if i < split {
             old_limit
         } else if new_limit >= old_limit {
@@ -291,7 +286,52 @@ pub fn velocity_band_gains_window(
             let step = (new_limit - old_limit) / count as f32;
             old_limit + step * (i - split + 1) as f32
         }
-    };
+    })
+}
+
+/// Signed velocity allocation against a producer window containing one
+/// retained limit for every modeled sample.
+#[allow(clippy::too_many_arguments)]
+pub fn velocity_band_gains_limit_window(
+    vb: &[alloc::vec::Vec<f32>; 5],
+    resid: &[f32],
+    first: usize,
+    limits: &[f32],
+    room_floor: f32,
+    s: f32,
+    active: (usize, usize),
+    seed: [f32; 5],
+) -> [f32; 5] {
+    debug_assert_eq!(limits.len(), vb[0].len());
+    velocity_band_gains_with_limits(vb, resid, first, room_floor, s, active, seed, |i| limits[i])
+}
+
+/// Choose the producer for a newly admitted retained-window segment.
+///
+/// Native retains the greater of the streaming protected envelope and the
+/// decision-local protected trial. This is a producer comparison: shifted
+/// history and a zero trial naturally leave the streaming source in control.
+pub fn arbitrate_producer_segment(onset: f32, streaming: f32) -> f32 {
+    onset.max(streaming)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn velocity_band_gains_with_limits(
+    vb: &[alloc::vec::Vec<f32>; 5],
+    resid: &[f32],
+    first: usize,
+    room_floor: f32,
+    s: f32,
+    active: (usize, usize),
+    seed: [f32; 5],
+    limit_at: impl Fn(usize) -> f32,
+) -> [f32; 5] {
+    let mut g = seed;
+    let n = vb[0].len();
+    if first >= n {
+        return g;
+    }
+    let is_active = |k: usize| k >= active.0 && k < active.1;
     loop {
         let (mut idx, mut worst) = (first, 0.0f32);
         for i in first..n {
@@ -796,6 +836,21 @@ mod tests {
         let vb = [vec![2.0, 2.0], vec![0.0, 0.0], vec![0.0, 0.0], vec![0.0, 0.0], vec![0.0, 0.0]];
         let got = velocity_band_gains_window(&vb, &[], 0, 1.0, 2.0, 1, 0.1, 1.0, (0, 5), [1.0; 5]);
         assert_eq!(got, [0.5, 1.0, 1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn retained_velocity_uses_the_limit_at_the_selected_window_sample() {
+        let vb = [vec![1.0, 2.0, 1.5], vec![0.0; 3], vec![0.0; 3], vec![0.0; 3], vec![0.0; 3]];
+        let got = velocity_band_gains_limit_window(&vb, &[], 0, &[0.2, 1.0, 0.3], 0.0, 1.0, (0, 5), [1.0; 5]);
+        assert_eq!(got, [0.5, 1.0, 1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn producer_arbitration_retains_the_greater_source() {
+        assert_eq!(arbitrate_producer_segment(0.20, 0.56), 0.56);
+        assert_eq!(arbitrate_producer_segment(0.62, 0.59), 0.62);
+        assert_eq!(arbitrate_producer_segment(0.0, 0.15), 0.15);
+        assert_eq!(arbitrate_producer_segment(0.20, 0.20), 0.20);
     }
 
     #[test]
