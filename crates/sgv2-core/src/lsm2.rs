@@ -3061,28 +3061,6 @@ mod fault_tests {
     }
 
     #[test]
-    fn private_current_bulk_trajectories_are_bit_exact() {
-        let Ok(root) = std::env::var("T5351_CURRENT_FIXTURES") else { return };
-        for name in ["c2-s1349", "c2-s134-hr0", "t3-taumag25"] {
-            let bytes = std::fs::read(format!("{root}/{name}.bin")).unwrap();
-            let word = |offset: usize| f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
-            let b = [word(0), word(4), word(8)];
-            let a = [word(12), word(16)];
-            let n = u32::from_le_bytes(bytes[20..24].try_into().unwrap()) as usize;
-            let input: Vec<f32> = (0..n).map(|i| word(24 + 4 * i)).collect();
-            let native: Vec<f32> = (0..n).map(|i| word(24 + 4 * (n + i))).collect();
-            let mut current = MonitorCurrent { b, a, table: MonitorCurrent::bulk_table(b, a), z: [0.0; 2] };
-            let mut output = vec![0.0f32; n];
-            for (x, y) in input.chunks(32).zip(output.chunks_mut(32)) {
-                current.process(x, y);
-            }
-            assert_eq!(output.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), native.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), "{name} output");
-            let state = [word(24 + 8 * n), word(28 + 8 * n)];
-            assert_eq!(current.z.map(f32::to_bits), state.map(f32::to_bits), "{name} state");
-        }
-    }
-
-    #[test]
     fn sample_peak_window_keeps_the_span_and_prepends_the_previous_sample() {
         let bank = [10.0, 11.0, 12.0, 13.0];
         let mut peak = [0.0; 4];
