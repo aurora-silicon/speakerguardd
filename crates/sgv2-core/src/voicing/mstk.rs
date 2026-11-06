@@ -17,6 +17,7 @@ const XOVERS: usize = BANDS - 1;
 const MAX_FILTERS: usize = 32;
 const MAX_DETECTOR_FILTERS: usize = 10;
 const MAX_DETECTOR_WINDOW: usize = 1921;
+const MAX_GAIN_SRC_TAPS: usize = 225;
 const INPUT_BOUND: f32 = 16.0;
 const CURVE_POINTS: usize = 11;
 
@@ -478,6 +479,77 @@ struct SlidingMax {
     next: u64,
 }
 
+/// Causal polyphase-equivalent interpolator used for a reduced-rate gain
+/// vector. The reference algorithm constructs the FIR by convolving a normalized
+/// one-millisecond sine window with the linear interpolation kernel. Running
+/// the zero-stuffed convolution one audio frame at a time makes slice phase
+/// explicit and keeps arbitrary process block sizes bit-for-bit continuous.
+#[derive(Clone, Copy)]
+struct GainSrc {
+    taps: [f32; MAX_GAIN_SRC_TAPS],
+    ring: [f32; MAX_GAIN_SRC_TAPS],
+    len: usize,
+    cursor: usize,
+}
+
+impl GainSrc {
+    const EMPTY: Self = Self { taps: [0.0; MAX_GAIN_SRC_TAPS], ring: [0.0; MAX_GAIN_SRC_TAPS], len: 1, cursor: 0 };
+
+    fn new(factor: usize, fs: f64) -> Self {
+        let factor = factor.clamp(1, 8);
+        let window_len = (libm::round(fs / 1000.0) as usize).clamp(1, 192);
+        let triangle_len = 2 * factor - 1;
+        let len = (window_len + triangle_len - 1).min(MAX_GAIN_SRC_TAPS);
+        let mut window = [0.0f32; 192];
+        let mut sum = 0.0f32;
+        for (i, value) in window[..window_len].iter_mut().enumerate() {
+            *value = libm::sin(core::f64::consts::PI * (i + 1) as f64 / (window_len + 1) as f64) as f32;
+            sum += *value;
+        }
+        for value in &mut window[..window_len] {
+            *value /= sum;
+        }
+        let mut out = Self { len, ..Self::EMPTY };
+        for i in 0..len {
+            let mut value = 0.0f32;
+            let first = i.saturating_sub(triangle_len - 1);
+            let last = i.min(window_len - 1);
+            for (j, window_value) in window.iter().enumerate().take(last + 1).skip(first) {
+                let k = i - j;
+                let triangle = if k < factor { (k + 1) as f32 } else { (triangle_len - k) as f32 } / factor as f32;
+                value += *window_value * triangle;
+            }
+            out.taps[i] = value;
+        }
+        out
+    }
+
+    fn reset(&mut self) {
+        self.ring = [0.0; MAX_GAIN_SRC_TAPS];
+        self.cursor = 0;
+    }
+
+    #[inline]
+    fn step(&mut self, input: Option<f64>) -> f64 {
+        self.ring[self.cursor] = input.unwrap_or(0.0) as f32;
+        let mut output = 0.0f32;
+        let mut index = self.cursor;
+        for tap in &self.taps[..self.len] {
+            output += *tap * self.ring[index];
+            index = if index == 0 { self.len - 1 } else { index - 1 };
+        }
+        self.cursor += 1;
+        if self.cursor == self.len {
+            self.cursor = 0;
+        }
+        output as f64
+    }
+}
+
+fn detector_factors(_p: &Params) -> [usize; BANDS] {
+    [1, 2, 4, 4]
+}
+
 impl SlidingMax {
     const EMPTY: Self =
         Self { value: [0.0; MAX_DETECTOR_WINDOW], index: [0; MAX_DETECTOR_WINDOW], head: 0, len: 0, next: 0 };
@@ -516,8 +588,8 @@ pub struct Run {
     detector_bandwidth: [f64; BANDS],
     curve: [[f64; CURVE_POINTS]; BANDS],
     curve_top_db: f64,
-    release: f64,
-    recovery: f64,
+    release: [f64; BANDS],
+    recovery: [f64; BANDS],
     release_on: bool,
     algorithm0: bool,
     overshoot_compensation: bool,
@@ -526,8 +598,11 @@ pub struct Run {
     env: [f64; BANDS],
     smoothed_gain: [f64; BANDS],
     detector_window: [usize; BANDS],
+    detector_factor: [usize; BANDS],
+    detector_phase: [usize; BANDS],
     detector_max: [SlidingMax; BANDS],
     detector_rms: [f64; BANDS],
+    gain_src: [GainSrc; BANDS],
     compensation_state: [[f64; 2]; MAX_CHANNELS],
     state: [[[[f64; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS],
     detector_state: [[[[f32; 2]; MAX_DETECTOR_FILTERS]; BANDS]; MAX_CHANNELS],
@@ -552,8 +627,20 @@ impl Run {
                 detector_bandwidth[b] = (reference_edges[b + 1] - reference_edges[b]) / (edges[b + 1] - edges[b]);
             }
         }
-        let detector_window = [10.0, 8.0, 2.0, 1.0]
-            .map(|ms| ((libm::round(ms * fs / 1000.0) as usize) | 1).clamp(1, MAX_DETECTOR_WINDOW));
+        let detector_factor = detector_factors(q);
+        let window_ms = [10.0, 8.0, 2.0, 1.0];
+        let detector_window = core::array::from_fn(|b| {
+            ((libm::round(window_ms[b] * fs / (1000.0 * detector_factor[b] as f64)) as usize) | 1)
+                .clamp(1, MAX_DETECTOR_WINDOW)
+        });
+        let release = core::array::from_fn(|b| {
+            if q.release_s > 0.0 {
+                libm::exp(-(detector_factor[b] as f64) / (q.release_s * fs))
+            } else {
+                0.0
+            }
+        });
+        let recovery = release.map(|coefficient| 1.0 - coefficient);
         Run {
             path: paths(q, fs),
             detector_path: detector_paths(q, fs),
@@ -564,8 +651,8 @@ impl Run {
             detector_bandwidth,
             curve: q.band.map(|b| curve_points(b, curve_top_db)),
             curve_top_db,
-            release: if q.release_s > 0.0 { libm::exp(-1.0 / (q.release_s * fs)) } else { 0.0 },
-            recovery: if q.release_s > 0.0 { 1.0 - libm::exp(-1.0 / (q.release_s * fs)) } else { 1.0 },
+            release,
+            recovery,
             release_on: q.release_on,
             algorithm0: q.algorithm == 0,
             overshoot_compensation: q.overshoot_compensation,
@@ -574,8 +661,11 @@ impl Run {
             env: [0.0; BANDS],
             smoothed_gain: [1.0; BANDS],
             detector_window,
+            detector_factor,
+            detector_phase: [0; BANDS],
             detector_max: [SlidingMax::EMPTY; BANDS],
             detector_rms: [0.0; BANDS],
+            gain_src: core::array::from_fn(|b| GainSrc::new(detector_factor[b], fs)),
             compensation_state: [[0.0; 2]; MAX_CHANNELS],
             state: [[[[0.0; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS],
             detector_state: [[[[0.0; 2]; MAX_DETECTOR_FILTERS]; BANDS]; MAX_CHANNELS],
@@ -586,7 +676,11 @@ impl Run {
         self.env = [0.0; BANDS];
         self.smoothed_gain = [1.0; BANDS];
         self.detector_max = [SlidingMax::EMPTY; BANDS];
+        self.detector_phase = [0; BANDS];
         self.detector_rms = [0.0; BANDS];
+        for src in &mut self.gain_src {
+            src.reset();
+        }
         self.compensation_state = [[0.0; 2]; MAX_CHANNELS];
         self.state = [[[[0.0; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS];
         self.detector_state = [[[[0.0; 2]; MAX_DETECTOR_FILTERS]; BANDS]; MAX_CHANNELS];
@@ -643,7 +737,7 @@ impl Run {
         let level = 20.0 * libm::log10(self.env[b].max(1e-5));
         let target = spline_gain(&self.curve[b], level, self.curve_top_db);
         if self.overshoot_compensation && target > self.smoothed_gain[b] {
-            self.smoothed_gain[b] += (target - self.smoothed_gain[b]) * self.recovery;
+            self.smoothed_gain[b] += (target - self.smoothed_gain[b]) * self.recovery[b];
         } else {
             self.smoothed_gain[b] = target;
         }
@@ -691,19 +785,34 @@ impl Run {
                     detector[b] = detector[b].max(detected[b]);
                 }
             }
+            let mut gain = [0.0; BANDS];
             for (b, p) in detector.into_iter().enumerate() {
-                let mut held = self.window_max(b, p);
-                if self.algorithm0 {
-                    let alpha = 1.0 / self.detector_window[b] as f64;
-                    self.detector_rms[b] += alpha * (p * p - self.detector_rms[b]);
-                    let rms = libm::sqrt(2.0 * self.detector_rms[b]).max(1e-12);
-                    let crest_db = (20.0 * libm::log10(held / rms)).clamp(0.0, 6.0);
-                    let crest_weight = if b == 0 { 0.52 } else { 0.49 };
-                    held *= db_amp(crest_weight * crest_db);
+                let update = self.detector_phase[b] == 0;
+                let input = if update {
+                    let mut held = self.window_max(b, p);
+                    if self.algorithm0 {
+                        let alpha = 1.0 / self.detector_window[b] as f64;
+                        self.detector_rms[b] += alpha * (p * p - self.detector_rms[b]);
+                        let rms = libm::sqrt(2.0 * self.detector_rms[b]).max(1e-12);
+                        let crest_db = (20.0 * libm::log10(held / rms)).clamp(0.0, 6.0);
+                        let crest_weight = if b == 0 { 0.52 } else { 0.49 };
+                        held *= db_amp(crest_weight * crest_db);
+                    }
+                    self.env[b] = if self.release_on { held.max(self.env[b] * self.release[b]) } else { held };
+                    Some(self.gain(b))
+                } else {
+                    None
+                };
+                gain[b] = match self.band[b].mode {
+                    BandMode::Active => self.gain_src[b].step(input),
+                    BandMode::Pass => 1.0,
+                    BandMode::Mute => 0.0,
+                };
+                self.detector_phase[b] += 1;
+                if self.detector_phase[b] == self.detector_factor[b] {
+                    self.detector_phase[b] = 0;
                 }
-                self.env[b] = if self.release_on { held.max(self.env[b] * self.release) } else { held };
             }
-            let gain = [self.gain(0), self.gain(1), self.gain(2), self.gain(3)];
             for c in 0..n {
                 let mut y = 0.0;
                 for b in 0..BANDS {
@@ -910,11 +1019,12 @@ mod tests {
     }
 
     #[test]
-    fn detector_windows_are_exact_sample_counts_and_keep_the_next_peak() {
+    fn decimated_detector_windows_keep_the_next_peak() {
         let run = Run::new(&params(), 48_000.0, 1);
-        assert_eq!(run.detector_window, [481, 385, 97, 49]);
+        assert_eq!(run.detector_factor, [1, 2, 4, 4]);
+        assert_eq!(run.detector_window, [481, 193, 25, 13]);
         let run = Run::new(&params(), 96_000.0, 1);
-        assert_eq!(run.detector_window, [961, 769, 193, 97]);
+        assert_eq!(run.detector_window, [961, 385, 49, 25]);
 
         let mut max = SlidingMax::EMPTY;
         assert_eq!(max.push(9.0, 3), 9.0);
@@ -924,6 +1034,39 @@ mod tests {
         assert_eq!(max.push(1.0, 3), 8.0);
         assert_eq!(max.push(2.0, 3), 8.0);
         assert_eq!(max.push(3.0, 3), 3.0);
+    }
+
+    #[test]
+    fn gain_src_has_zero_startup_and_unity_dc() {
+        for factor in [1, 2, 4] {
+            let mut src = GainSrc::new(factor, 48_000.0);
+            let first = src.step(Some(1.0));
+            assert!(first > 0.0 && first < 0.01, "factor {factor}: {first}");
+            let mut output = first;
+            for i in 1..512 {
+                output = src.step((i % factor == 0).then_some(1.0));
+            }
+            assert!((output - 1.0).abs() < 2e-6, "factor {factor}: {output}");
+            src.reset();
+            assert_eq!(src.step(None), 0.0);
+        }
+    }
+
+    #[test]
+    fn detector_and_gain_src_are_slice_invariant() {
+        let p = params();
+        let mut whole = tone(2500.0, 0.8, 4096);
+        let mut split = whole.clone();
+        let mut run = Run::new(&p, 48_000.0, 1);
+        run.process(&mut [&mut whole], 4096);
+        let mut run = Run::new(&p, 48_000.0, 1);
+        let (a, rest) = split.split_at_mut(333);
+        run.process(&mut [a], 333);
+        let (b, rest) = rest.split_at_mut(1789);
+        run.process(&mut [b], 1789);
+        let rest_len = rest.len();
+        run.process(&mut [rest], rest_len);
+        assert_eq!(whole, split);
     }
 
     #[test]
