@@ -486,7 +486,7 @@ impl SlidingMax {
     fn push(&mut self, value: f64, window: usize) -> f64 {
         let now = self.next;
         self.next = self.next.wrapping_add(1);
-        while self.len != 0 && self.index[self.head].wrapping_add(window as u64) <= now {
+        while self.len != 0 && now.wrapping_sub(self.index[self.head]) >= window as u64 {
             self.head = (self.head + 1) % MAX_DETECTOR_WINDOW;
             self.len -= 1;
         }
@@ -672,6 +672,11 @@ impl Run {
         }
     }
 
+    #[inline]
+    fn band_output(flavor: Option<u32>, gain: f64, x: f64) -> f64 {
+        gain * Self::saturate(flavor, x)
+    }
+
     pub fn process(&mut self, bufs: &mut [&mut [f32]], frames: usize) {
         let n = bufs.len().min(self.channels).min(MAX_CHANNELS);
         let mut bands = [[0.0; BANDS]; MAX_CHANNELS];
@@ -703,7 +708,7 @@ impl Run {
             for c in 0..n {
                 let mut y = 0.0;
                 for b in 0..BANDS {
-                    y += Self::saturate(self.band[b].saturation, gain[b] * bands[c][b]);
+                    y += Self::band_output(self.band[b].saturation, gain[b], bands[c][b]);
                 }
                 y *= self.out_gain;
                 let s = self.output_compensation;
@@ -971,6 +976,12 @@ mod tests {
                 assert!(y.abs() <= 1.1);
             }
         }
+    }
+
+    #[test]
+    fn saturation_precedes_detector_gain() {
+        assert_eq!(Run::band_output(Some(0), 0.25, 2.0), 0.25);
+        assert_eq!(Run::band_output(None, 0.25, 2.0), 0.5);
     }
 
     #[test]
