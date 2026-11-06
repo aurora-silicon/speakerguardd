@@ -76,11 +76,11 @@
 //!   raised-cosine attack to 0.99 x the request then hold, or a recovery on
 //!   the 99 % response table realigned each decision).
 //! - **Slow gain** (power, temperature, linked across channels; residuals
-//!   2.4): released provisionally toward the ordinary request; the output-temperature
-//!   ceiling solved once on the retained frame and look-ahead as `B + g L +
-//!   g^2 Q`; a lower result makes a second follower call toward 0.99 x the
-//!   request. The audio applies the slow trajectory after summing the
-//!   fast-gained bands.
+//!   2.4): released provisionally toward the ordinary request; the
+//!   output-temperature ceiling solves the absolute ordinary request on the
+//!   fast-gained retained frame and look-ahead as `B + g L + g^2 Q`; a lower
+//!   result makes a second follower call toward 0.99 x the request. The audio
+//!   applies the slow trajectory after summing the fast-gained bands.
 //! - **Monitor** (rig laws 3, 4, 11): on the protected output, `u = Vfs y`;
 //!   the Float32 substep mean of `u i` drives the two thermal branches
 //!   (residuals 2.1: `theta += alpha (R_eff P - theta)`), and `Pamp = idle + ratio max(mean(u i), 0) (Rdc + Rpar) /
@@ -111,8 +111,6 @@
 //! order.
 //!
 //! Known residuals against 25G83 (rig report):
-//! - interim safety layer: the output ceiling held to 0.99 of its rise over
-//!   ambient;
 //! - 96 kHz: the steady velocity margin on the fb8-sr96 law cases is
 //!   shallower than the reference's (Daybreak t-4769);
 //! - 48 kHz mid-band law cases and two programs sit within 0.02 x of the
@@ -1331,13 +1329,14 @@ impl Chan {
     }
 
     /// The output-temperature ceiling (residuals 2.4): on the frame's
-    /// provisional output under the slow trajectory `f`, the output model at
-    /// substep `k` under an extra gain `g` is `B_k + g L_k + g^2 Q_k` (the
-    /// retained state, the current model's retained response crossed with
-    /// the new signal, the new signal alone); multiplicative quadratic-root
-    /// corrections at the hottest substep until every substep is within
+    /// fast-gained output at slow unity, the output model at substep `k` under
+    /// the absolute slow gain `g` is `B_k + g L_k + g^2 Q_k` (the retained
+    /// state, the current model's retained response crossed with the new
+    /// signal, the new signal alone); multiplicative quadratic-root
+    /// corrections start at the absolute ordinary request and continue at
+    /// the hottest substep until every substep is within
     /// `TemperatureHardLimit + max(TemperatureHeadroom, 0)`.
-    fn ceiling_scale(&self, mut f: SlowGain, g0: f32, ctl: usize, sub: usize) -> f32 {
+    fn ceiling_scale(&self, g0: f32, ctl: usize, sub: usize) -> f32 {
         // the retained span: the frame and its known look-ahead
         let od = self.xc.len() - ctl;
         let horizon = ctl + od;
@@ -1355,7 +1354,7 @@ impl Chan {
         let (mut al, mut aq) = (0.0f32, 0.0f32);
         let amb = self.ambient as f32;
         for i in 0..horizon {
-            let u = self.vfs * self.out_sample(i, f.sample());
+            let u = self.vfs * self.out_sample(i, 1.0);
             al += u * zi.step(0.0);
             aq += u * zs.step(u);
             if (i + 1) % sub == 0 {
@@ -1376,11 +1375,7 @@ impl Chan {
                 quad[k] = qv + qm;
             }
         }
-        // interim safety layer until this unit's full audio matches the
-        // reference (the exact solve lands 0.01-0.04 C nearer the ceiling
-        // than the reference on the rig): the ceiling's rise over ambient
-        // by the 0.99 law
-        let limit = (self.ambient + CUT * (self.t_hard + self.t_headroom.max(0.0) - self.ambient)) as f32;
+        let limit = (self.t_hard + self.t_headroom.max(0.0)) as f32;
         Self::ceiling_solve(&base[..subs], &lin[..subs], &quad[..subs], limit, g0)
     }
 
@@ -2114,13 +2109,16 @@ impl Run {
         }
         // residuals 2.4, in its native order: (1) an idle slow follower
         // releases one decision toward the ordinary power/temperature
-        // request; (2) that request becomes a scalar on the provisional
-        // trajectory and the output-temperature ceiling is solved once on
-        // the retained frame and look-ahead; (3) a lower result makes one
+        // request; (2) the output-temperature ceiling solves that absolute
+        // request on the fast-gained waveform at slow unity, over the
+        // retained frame and look-ahead; (3) a lower result makes one
         // downward follower call from the provisionally advanced value
-        // toward 0.99 x the request. Recovery follows the request, not
-        // unity: otherwise a capped power candidate repeatedly below unity
-        // releases too quickly between program peaks.
+        // toward 0.99 x the absolute request. The provisional trajectory is
+        // follower state only: baking it into B/L/Q and normalizing the
+        // proposal by its endpoint is not equivalent because the ceiling's
+        // root corrections multiply the proposal. Recovery follows the
+        // ordinary request, not unity: otherwise a capped power candidate
+        // repeatedly below unity releases too quickly between program peaks.
         let mut prov = [SlowGain::unity(1); MAX_CHANNELS];
         let mut end = [1.0f32; MAX_CHANNELS];
         let mut want = [1.0f32; MAX_CHANNELS];
@@ -2137,11 +2135,11 @@ impl Run {
                 e.sample();
             }
             end[ci] = e.g;
-            want[ci] = (req[ci] as f32 / e.g.max(f32::MIN_POSITIVE)).min(1.0);
+            want[ci] = req[ci] as f32;
         }
         if self.axis[4] {
             for (ci, c) in self.ch.iter().enumerate() {
-                want[ci] = c.ceiling_scale(prov[ci], want[ci], ctl, sub);
+                want[ci] = c.ceiling_scale(want[ci], ctl, sub);
             }
         }
         if self.link && n > 1 {
@@ -2149,7 +2147,7 @@ impl Run {
             want[..n].iter_mut().for_each(|v| *v = m);
         }
         for (ci, c) in self.ch.iter_mut().enumerate() {
-            let request = want[ci] * end[ci];
+            let request = want[ci];
             if request < end[ci] {
                 let mut f = prov[ci];
                 for _ in 0..ctl {
