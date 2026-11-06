@@ -106,7 +106,12 @@ def parse_dspg(text):
         elif tok[0] == "param":
             params[tok[1]] = float(tok[2])
         elif tok[0] == "wireGraphParam":
-            m = re.match(r"wireGraphParam\s+(\S+)\s+\((\S+)\s+(\d+)\)", line)
+            # (Box id) or (Box id scope element); only global scope 0 element 0
+            m = re.match(r"wireGraphParam\s+(\S+)\s+\((\S+)\s+(\d+)(?:\s+(\d+)\s+(\d+))?\)", line)
+            if not m:
+                raise SystemExit(f"bad wireGraphParam line: {line}")
+            if (m.group(4) or "0") != "0" or (m.group(5) or "0") != "0":
+                raise SystemExit(f"graph parameter on a non-global scope/element: {line}")
             gparam.append((m.group(1), m.group(2), int(m.group(3))))
     return defs, boxes, wires, params, gparam
 
