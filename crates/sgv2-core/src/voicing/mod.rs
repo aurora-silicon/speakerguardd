@@ -44,6 +44,7 @@ pub mod chain;
 pub mod lowflow;
 pub mod mstk;
 pub mod pchr;
+pub mod vareq;
 pub mod vbass;
 pub mod volt;
 pub mod volume;

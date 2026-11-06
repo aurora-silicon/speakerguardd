@@ -144,6 +144,11 @@ fn compile_node(
                 Ok(None) => Kind::Bypass,
                 Err(e) => uncarried(n, subtype, e, gaps),
             },
+            "vrq2" => match super::vareq::compile(stage, fs, diags) {
+                Ok(Some(p)) => Kind::Vareq(Box::new(p)),
+                Ok(None) => Kind::Bypass,
+                Err(e) => uncarried(n, subtype, e, gaps),
+            },
             "axtc" => match super::xtc::compile(stage, fs, diags) {
                 Ok(Some(p)) => Kind::Xtc(Box::new(p)),
                 Ok(None) => Kind::Bypass,
