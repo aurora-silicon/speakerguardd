@@ -20,6 +20,9 @@ const MAX_DETECTOR_WINDOW: usize = 1921;
 const MAX_GAIN_SRC_TAPS: usize = 225;
 const INPUT_BOUND: f32 = 16.0;
 const CURVE_POINTS: usize = 11;
+// Fourth-order notched crossover prototype from US 6,854,005, eqs. 5--9.
+// The legacy algorithms use this fixed notch ratio.
+const NTM_NOTCH_RATIO_SQ: f64 = 32.0 / 375.0;
 
 /// Processing selected for one analysis band.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -365,6 +368,58 @@ fn push_lr_allpass(path: &mut Path, n: usize, fc: f64, fs: f64) {
     }
 }
 
+/// Bilinear transform of `(c0 + c1*s + c2*s^2) /
+/// (1 + damping*s + s^2)`, prewarped at `fc`.
+fn prototype_section(fc: f64, fs: f64, damping: f64, c0: f64, c1: f64, c2: f64) -> Section {
+    let k = libm::tan(core::f64::consts::PI * fc / fs);
+    let d = k * k + damping * k + 1.0;
+    Section {
+        b0: (c0 * k * k + c1 * k + c2) / d,
+        b1: 2.0 * (c0 * k * k - c2) / d,
+        b2: (c0 * k * k - c1 * k + c2) / d,
+        a1: 2.0 * (k * k - 1.0) / d,
+        a2: (k * k - damping * k + 1.0) / d,
+    }
+}
+
+/// Fourth-order Neville-Thiele notched crossover:
+///
+/// `LP=(1+k^2*s^2)/(1+x*s+s^2)^2`
+/// `HP=s^2*(k^2+s^2)/(1+x*s+s^2)^2`,
+///
+/// where `x=sqrt(2*(1-k^2))`. Its outputs add to a second-order allpass.
+fn push_ntm4(path: &mut Path, high: bool, fc: f64, fs: f64) {
+    let x = libm::sqrt(2.0 * (1.0 - NTM_NOTCH_RATIO_SQ));
+    if high {
+        path.push(prototype_section(fc, fs, x, 0.0, 0.0, 1.0));
+        path.push(prototype_section(fc, fs, x, NTM_NOTCH_RATIO_SQ, 0.0, 1.0));
+    } else {
+        path.push(prototype_section(fc, fs, x, 1.0, 0.0, NTM_NOTCH_RATIO_SQ));
+        path.push(prototype_section(fc, fs, x, 1.0, 0.0, 0.0));
+    }
+}
+
+fn push_ntm4_allpass(path: &mut Path, fc: f64, fs: f64) {
+    let x = libm::sqrt(2.0 * (1.0 - NTM_NOTCH_RATIO_SQ));
+    path.push(prototype_section(fc, fs, x, 1.0, -x, 1.0));
+}
+
+fn push_crossover(path: &mut Path, algorithm: u32, high: bool, n: usize, fc: f64, fs: f64) {
+    if algorithm < 3 && n == 4 {
+        push_ntm4(path, high, fc, fs);
+    } else {
+        push_lr(path, high, n, fc, fs);
+    }
+}
+
+fn push_crossover_allpass(path: &mut Path, algorithm: u32, n: usize, fc: f64, fs: f64) {
+    if algorithm < 3 && n == 4 {
+        push_ntm4_allpass(path, fc, fs);
+    } else {
+        push_lr_allpass(path, n, fc, fs);
+    }
+}
+
 /// The unit's band tree, measured: the program splits at the middle
 /// crossover first; the low side splits at the lowest crossover and passes
 /// the highest crossover's allpass, the high side splits at the highest and
@@ -374,18 +429,18 @@ fn paths(p: &Params, fs: f64) -> [Path; BANDS] {
     let mut v = [Path::EMPTY; BANDS];
     let n = p.crossover_order.map(effective_order);
     let f = p.crossover_hz;
-    push_lr(&mut v[0], false, n[1], f[1], fs);
-    push_lr(&mut v[0], false, n[0], f[0], fs);
-    push_lr_allpass(&mut v[0], n[2], f[2], fs);
-    push_lr(&mut v[1], false, n[1], f[1], fs);
-    push_lr(&mut v[1], true, n[0], f[0], fs);
-    push_lr_allpass(&mut v[1], n[2], f[2], fs);
-    push_lr(&mut v[2], true, n[1], f[1], fs);
-    push_lr(&mut v[2], false, n[2], f[2], fs);
-    push_lr_allpass(&mut v[2], n[0], f[0], fs);
-    push_lr(&mut v[3], true, n[1], f[1], fs);
-    push_lr(&mut v[3], true, n[2], f[2], fs);
-    push_lr_allpass(&mut v[3], n[0], f[0], fs);
+    push_crossover(&mut v[0], p.algorithm, false, n[1], f[1], fs);
+    push_crossover(&mut v[0], p.algorithm, false, n[0], f[0], fs);
+    push_crossover_allpass(&mut v[0], p.algorithm, n[2], f[2], fs);
+    push_crossover(&mut v[1], p.algorithm, false, n[1], f[1], fs);
+    push_crossover(&mut v[1], p.algorithm, true, n[0], f[0], fs);
+    push_crossover_allpass(&mut v[1], p.algorithm, n[2], f[2], fs);
+    push_crossover(&mut v[2], p.algorithm, true, n[1], f[1], fs);
+    push_crossover(&mut v[2], p.algorithm, false, n[2], f[2], fs);
+    push_crossover_allpass(&mut v[2], p.algorithm, n[0], f[0], fs);
+    push_crossover(&mut v[3], p.algorithm, true, n[1], f[1], fs);
+    push_crossover(&mut v[3], p.algorithm, true, n[2], f[2], fs);
+    push_crossover_allpass(&mut v[3], p.algorithm, n[0], f[0], fs);
     v
 }
 
@@ -450,21 +505,6 @@ fn spline_gain(points: &[f64; CURVE_POINTS], level_db: f64, top_db: f64) -> f64 
     let c1 = (-p0 + p2) / 2.0;
     let c0 = (p0 + 4.0 * p1 + p2) / 6.0;
     ((c3 * t + c2) * t + c1) * t + c0
-}
-
-/// Algorithm 0's very-low-frequency bandwidth correction. It is unity in
-/// the audio band and approaches about +2.9 dB at DC.
-fn algorithm0_compensation(fs: f64) -> Section {
-    let k = libm::tan(core::f64::consts::PI * 13.194_19 / fs);
-    let (num_damping, den_damping, dc) = (2.077_078, 1.944_442, db_amp(2.89));
-    let d = 1.0 + den_damping * k + k * k;
-    Section {
-        b0: (1.0 + num_damping * k + dc * k * k) / d,
-        b1: 2.0 * (dc * k * k - 1.0) / d,
-        b2: (1.0 - num_damping * k + dc * k * k) / d,
-        a1: 2.0 * (k * k - 1.0) / d,
-        a2: (1.0 - den_damping * k + k * k) / d,
-    }
 }
 
 /// Allocation-free monotonic queue for an exact trailing-window maximum.
@@ -546,6 +586,40 @@ impl GainSrc {
     }
 }
 
+/// First-order anti-alias section after reduced-rate gain interpolation.
+/// Its corner follows the detector-rate ratio from a 1 kHz full-rate corner;
+/// both delay elements start at zero, like the interpolator history.
+#[derive(Clone, Copy)]
+struct GainAntiAlias {
+    b: f32,
+    a1: f32,
+    x1: f32,
+    y1: f32,
+}
+
+impl GainAntiAlias {
+    fn new(factor: usize, fs: f64) -> Self {
+        let cutoff = 1000.0 / factor.clamp(1, 8) as f64;
+        let k = libm::tan(core::f64::consts::PI * cutoff / fs);
+        let b = (k / (1.0 + k)) as f32;
+        Self { b, a1: ((k - 1.0) / (k + 1.0)) as f32, x1: 0.0, y1: 0.0 }
+    }
+
+    fn reset(&mut self) {
+        self.x1 = 0.0;
+        self.y1 = 0.0;
+    }
+
+    #[inline]
+    fn step(&mut self, input: f64) -> f64 {
+        let input = input as f32;
+        let output = self.b * (input + self.x1) - self.a1 * self.y1;
+        self.x1 = input;
+        self.y1 = output;
+        output as f64
+    }
+}
+
 fn detector_factors(_p: &Params) -> [usize; BANDS] {
     [1, 2, 4, 4]
 }
@@ -593,7 +667,6 @@ pub struct Run {
     release_on: bool,
     algorithm0: bool,
     overshoot_compensation: bool,
-    output_compensation: Section,
     channels: usize,
     env: [f64; BANDS],
     smoothed_gain: [f64; BANDS],
@@ -603,7 +676,7 @@ pub struct Run {
     detector_max: [SlidingMax; BANDS],
     detector_rms: [f64; BANDS],
     gain_src: [GainSrc; BANDS],
-    compensation_state: [[f64; 2]; MAX_CHANNELS],
+    gain_anti_alias: [GainAntiAlias; BANDS],
     state: [[[[f64; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS],
     detector_state: [[[[f32; 2]; MAX_DETECTOR_FILTERS]; BANDS]; MAX_CHANNELS],
 }
@@ -656,7 +729,6 @@ impl Run {
             release_on: q.release_on,
             algorithm0: q.algorithm == 0,
             overshoot_compensation: q.overshoot_compensation,
-            output_compensation: if q.algorithm == 0 { algorithm0_compensation(fs) } else { Section::ID },
             channels: channels.min(MAX_CHANNELS),
             env: [0.0; BANDS],
             smoothed_gain: [1.0; BANDS],
@@ -666,7 +738,7 @@ impl Run {
             detector_max: [SlidingMax::EMPTY; BANDS],
             detector_rms: [0.0; BANDS],
             gain_src: core::array::from_fn(|b| GainSrc::new(detector_factor[b], fs)),
-            compensation_state: [[0.0; 2]; MAX_CHANNELS],
+            gain_anti_alias: core::array::from_fn(|b| GainAntiAlias::new(detector_factor[b], fs)),
             state: [[[[0.0; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS],
             detector_state: [[[[0.0; 2]; MAX_DETECTOR_FILTERS]; BANDS]; MAX_CHANNELS],
         }
@@ -681,7 +753,9 @@ impl Run {
         for src in &mut self.gain_src {
             src.reset();
         }
-        self.compensation_state = [[0.0; 2]; MAX_CHANNELS];
+        for filter in &mut self.gain_anti_alias {
+            filter.reset();
+        }
         self.state = [[[[0.0; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS];
         self.detector_state = [[[[0.0; 2]; MAX_DETECTOR_FILTERS]; BANDS]; MAX_CHANNELS];
     }
@@ -804,7 +878,10 @@ impl Run {
                     None
                 };
                 gain[b] = match self.band[b].mode {
-                    BandMode::Active => self.gain_src[b].step(input),
+                    BandMode::Active => {
+                        let interpolated = self.gain_src[b].step(input);
+                        self.gain_anti_alias[b].step(interpolated)
+                    }
                     BandMode::Pass => 1.0,
                     BandMode::Mute => 0.0,
                 };
@@ -819,12 +896,6 @@ impl Run {
                     y += Self::band_output(self.band[b].saturation, gain[b], bands[c][b]);
                 }
                 y *= self.out_gain;
-                let s = self.output_compensation;
-                let z = &mut self.compensation_state[c];
-                let corrected = s.b0 * y + z[0];
-                z[0] = s.b1 * y - s.a1 * corrected + z[1];
-                z[1] = s.b2 * y - s.a2 * corrected;
-                y = corrected;
                 if let Some(out) = bufs[c].get_mut(i) {
                     *out = if y.is_finite() { y as f32 } else { 0.0 };
                 }
@@ -954,6 +1025,7 @@ mod tests {
             let mut p = params();
             p.crossover_hz = [300.0, 1500.0, 6000.0];
             p.crossover_order = [order; 3];
+            p.algorithm = 3;
             let v = paths(&p, 48_000.0);
             let got = 20.0 * libm::log10(band_magnitude(&v[band], f));
             assert!((got - db).abs() < 0.1, "order {order} band {band} at {f} Hz: {got} dB, unit {db} dB");
@@ -990,8 +1062,49 @@ mod tests {
     }
 
     #[test]
+    fn legacy_fourth_order_crossover_has_complementary_notches() {
+        let fc = 1000.0;
+        let mut low = Path::EMPTY;
+        let mut high = Path::EMPTY;
+        push_ntm4(&mut low, false, fc, 48_000.0);
+        push_ntm4(&mut high, true, fc, 48_000.0);
+        let k = libm::sqrt(NTM_NOTCH_RATIO_SQ);
+        let warped = libm::tan(core::f64::consts::PI * fc / 48_000.0);
+        let low_notch = 48_000.0 / core::f64::consts::PI * libm::atan(warped / k);
+        let high_notch = 48_000.0 / core::f64::consts::PI * libm::atan(warped * k);
+        assert!((20.0 * libm::log10(band_magnitude(&low, fc)) + 6.020_6).abs() < 1e-4);
+        assert!((20.0 * libm::log10(band_magnitude(&high, fc)) + 6.020_6).abs() < 1e-4);
+        assert!(band_magnitude(&low, low_notch) < 1e-12);
+        assert!(band_magnitude(&high, high_notch) < 1e-12);
+    }
+
+    #[test]
+    fn algorithms_zero_through_two_share_the_fixed_recombination_path() {
+        let mut expected = None;
+        for algorithm in 0..=2 {
+            let mut p = params();
+            p.algorithm = algorithm;
+            p.input_gain_db = 0.0;
+            p.output_gain_db = 0.0;
+            for band in &mut p.band {
+                band.mode = BandMode::Pass;
+                band.saturation = None;
+            }
+            let mut impulse = std::vec![0.0; 4096];
+            impulse[0] = 1.0;
+            Run::new(&p, 48_000.0, 1).process(&mut [&mut impulse], 4096);
+            if let Some(expected) = &expected {
+                assert_eq!(&impulse, expected);
+            } else {
+                expected = Some(impulse);
+            }
+        }
+    }
+
+    #[test]
     fn detector_is_the_butterworth_half_of_each_audio_band() {
-        let p = params();
+        let mut p = params();
+        p.algorithm = 3;
         let audio = paths(&p, 48_000.0);
         let detector = detector_paths(&p, 48_000.0);
         for b in 0..BANDS {
@@ -1049,6 +1162,23 @@ mod tests {
             assert!((output - 1.0).abs() < 2e-6, "factor {factor}: {output}");
             src.reset();
             assert_eq!(src.step(None), 0.0);
+        }
+    }
+
+    #[test]
+    fn gain_anti_alias_has_zero_startup_unity_dc_and_rate_scaled_corner() {
+        for factor in [1, 2, 4] {
+            let mut filter = GainAntiAlias::new(factor, 48_000.0);
+            assert_eq!(filter.step(0.0), 0.0);
+            let expected_k = libm::tan(core::f64::consts::PI * (1000.0 / factor as f64) / 48_000.0);
+            assert!((filter.b as f64 - expected_k / (1.0 + expected_k)).abs() < 1e-8);
+            let mut output = 0.0;
+            for _ in 0..4096 {
+                output = filter.step(1.0);
+            }
+            assert!((output - 1.0).abs() < 2e-6, "factor {factor}: {output}");
+            filter.reset();
+            assert_eq!(filter.step(0.0), 0.0);
         }
     }
 
