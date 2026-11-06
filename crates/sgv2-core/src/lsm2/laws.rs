@@ -86,8 +86,6 @@ pub fn minimum_phase_triplet(q: [f32; 3]) -> (f32, f32, f32) {
 pub struct ThermalBranch {
     pub alpha: f32,
     pub r_eff: f32,
-    /// Either of the generated section's equal numerator coefficients.
-    pub b0: f32,
 }
 
 impl ThermalBranch {
@@ -97,21 +95,12 @@ impl ThermalBranch {
         let ideal = 1.0 - libm::exp(-dt / tau);
         let alpha = 1.0f32 - r32(1.0 - ideal);
         let b0 = r32(rth * ideal / 2.0);
-        ThermalBranch { alpha, r_eff: (b0 + b0) / alpha, b0 }
+        ThermalBranch { alpha, r_eff: (b0 + b0) / alpha }
     }
     /// `theta + alpha (R_eff P - theta)`.
     #[inline]
     pub fn step(&self, theta: f32, p: f32) -> f32 {
         theta + self.alpha * (self.r_eff * p - theta)
-    }
-    /// One predictor step of the generated equal-numerator section.
-    ///
-    /// Unlike the live monitor's collapsed update, a projection must retain
-    /// the input on the far side of the decision boundary. `previous_p` is
-    /// that preceding substep's power component.
-    #[inline]
-    pub fn predict_step(&self, theta: f32, p: f32, previous_p: f32) -> f32 {
-        ((1.0 - self.alpha) * theta + self.b0 * previous_p) + self.b0 * p
     }
     /// The rise after `n` updates at no power (the gap's cooling).
     pub fn cool(&self, theta: f64, n: f64) -> f64 {
@@ -790,16 +779,6 @@ mod tests {
         let dc = (b[0] + b[1] + b[2]) as f64 / (1.0 + a[0] as f64 + a[1] as f64);
         assert!((dc * 4.0 - 1.0).abs() < 1e-4, "{dc}");
         assert!((a[1] as f64) < 1.0 && (a[1] as f64) > 0.0);
-    }
-
-    #[test]
-    fn thermal_prediction_retains_the_preceding_input_once() {
-        let branch = ThermalBranch::new(3.0, 0.75, 1.0 / 1500.0);
-        let (theta, previous_p) = (20.0, 0.25);
-        let first = branch.predict_step(theta, 0.0, previous_p);
-        assert_eq!(first, (1.0 - branch.alpha) * theta + branch.b0 * previous_p);
-        assert!(first > branch.step(theta, 0.0));
-        assert_eq!(branch.predict_step(first, 0.0, 0.0), (1.0 - branch.alpha) * first);
     }
 
     #[test]

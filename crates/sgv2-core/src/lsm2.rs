@@ -83,12 +83,10 @@
 //!   ceiling substep uses the native Float32 vector-sum tree. The retained
 //!   current response contributes to the linear term for one filterbank
 //!   stage; the zero-state quadratic response spans the complete window. The
-//!   thermal projection keeps the equal-numerator section's preceding power
-//!   input at the decision boundary without changing the live monitor. The
-//!   idle follower releases toward that solved request, and a result below its
-//!   provisional endpoint makes a second follower call toward 0.99 x the
-//!   request. The audio applies the slow trajectory after summing the fast-gained
-//!   bands.
+//!   idle follower releases toward that solved request, and a result below
+//!   its provisional endpoint makes a second follower call toward 0.99 x the
+//!   request. The audio applies the slow trajectory after summing the
+//!   fast-gained bands.
 //! - **Monitor** (rig laws 3, 4, 11): on the protected output, `u = Vfs y`;
 //!   the Float32 substep mean of `u i` drives the two thermal branches
 //!   (residuals 2.1: `theta += alpha (R_eff P - theta)`), and `Pamp = idle + ratio max(mean(u i), 0) (Rdc + Rpar) /
@@ -1473,10 +1471,6 @@ struct Chan {
     cur_out: Current,
     th_vc: f32,
     th_mg: f32,
-    /// Power in the monitor's preceding thermal substep. The live monitor
-    /// keeps its established recurrence; the ceiling predictor retains this
-    /// input across its equal-numerator section's decision boundary.
-    th_power: f32,
     /// The preceding output frame before slow gain, and the output-model
     /// state at each of its substep starts. Runtime attack changes move the
     /// native ceiling window's start within this retained frame.
@@ -1484,7 +1478,6 @@ struct Chan {
     ceil_cur_prev: [Current; SUBSTEPS],
     ceil_vc_prev: [f32; SUBSTEPS],
     ceil_mg_prev: [f32; SUBSTEPS],
-    ceil_power_prev: [f32; SUBSTEPS],
     pbar: [f64; 4],
     pbar1_frame: f64,
     pbar1s_frame: f64,
@@ -1556,10 +1549,10 @@ impl Chan {
         let mut zi = if extra == 0 { self.cur_out } else { self.ceil_cur_prev[hist_sub] };
         let mut zs = self.cur_out;
         zs.clear();
-        let (mut bv, mut bm, mut bp) = if extra == 0 {
-            (self.th_vc, self.th_mg, self.th_power)
+        let (mut bv, mut bm) = if extra == 0 {
+            (self.th_vc, self.th_mg)
         } else {
-            (self.ceil_vc_prev[hist_sub], self.ceil_mg_prev[hist_sub], self.ceil_power_prev[hist_sub])
+            (self.ceil_vc_prev[hist_sub], self.ceil_mg_prev[hist_sub])
         };
         let (mut lv, mut lm, mut qv, mut qm) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
         let amb = self.ambient as f32;
@@ -1574,12 +1567,11 @@ impl Chan {
             });
             let (pl, pq) = (sl / sub as f32, sq / sub as f32);
             bv = self.br_vc.step(bv, 0.0);
-            bm = if bp != 0.0 { self.br_mg.predict_step(bm, 0.0, bp) } else { self.br_mg.step(bm, 0.0) };
+            bm = self.br_mg.step(bm, 0.0);
             lv = self.br_vc.step(lv, pl);
             lm = self.br_mg.step(lm, pl);
             qv = self.br_vc.step(qv, pq);
             qm = self.br_mg.step(qm, pq);
-            bp = 0.0;
             if raw_k >= discard {
                 let k = raw_k - discard;
                 base[k] = amb + bv + bm;
@@ -1855,12 +1847,10 @@ impl Run {
                 cur_out: cur,
                 th_vc: 0.0,
                 th_mg: 0.0,
-                th_power: 0.0,
                 ceil_fast_prev: vec![0.0; ctl],
                 ceil_cur_prev: [cur; SUBSTEPS],
                 ceil_vc_prev: [0.0; SUBSTEPS],
                 ceil_mg_prev: [0.0; SUBSTEPS],
-                ceil_power_prev: [0.0; SUBSTEPS],
                 pbar: [0.0; 4],
                 pbar1_frame: 0.0,
                 pbar1s_frame: 0.0,
@@ -1988,12 +1978,10 @@ impl Run {
             c.cur_out.clear();
             c.th_vc = 0.0;
             c.th_mg = 0.0;
-            c.th_power = 0.0;
             c.ceil_fast_prev.fill(0.0);
             c.ceil_cur_prev = [c.cur_out; SUBSTEPS];
             c.ceil_vc_prev = [0.0; SUBSTEPS];
             c.ceil_mg_prev = [0.0; SUBSTEPS];
-            c.ceil_power_prev = [0.0; SUBSTEPS];
             c.pbar = [0.0; 4];
             c.pbar1_frame = 0.0;
             c.pbar1s_frame = 0.0;
@@ -2488,7 +2476,6 @@ impl Run {
                     c.ceil_cur_prev[k] = c.cur_out;
                     c.ceil_vc_prev[k] = c.th_vc;
                     c.ceil_mg_prev[k] = c.th_mg;
-                    c.ceil_power_prev[k] = c.th_power;
                 }
                 let fast = c.out_sample(i, 1.0);
                 c.ceil_fast_prev[i] = fast;
@@ -2525,7 +2512,6 @@ impl Run {
                     let pp = (seq_sum(&c.power_work) / sub as f32).max(0.0);
                     c.th_vc = c.br_vc.step(c.th_vc, pp);
                     c.th_mg = c.br_mg.step(c.th_mg, pp);
-                    c.th_power = pp;
                     let pamp = idle + ratio_p * (p * c.load_scale).max(0.0);
                     for j in 0..4 {
                         c.pbar[j] = self.p_pole[j] * c.pbar[j] + (1.0 - self.p_pole[j]) * pamp;
@@ -2779,7 +2765,6 @@ impl ProtectionUnit for Unit {
             let (ev, em) = (libm::exp(-t / c.tau_vc), libm::exp(-t / c.tau_mag));
             c.th_vc = (s[0] * ev) as f32;
             c.th_mg = (s[1] * em) as f32;
-            c.th_power = 0.0;
             c.tp_vc = (s[6] * ev) as f32;
             c.tp_mg = (s[7] * em) as f32;
             // the input model's buffer holds the cooled temperature
