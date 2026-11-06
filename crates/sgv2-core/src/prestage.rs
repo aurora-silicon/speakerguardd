@@ -825,11 +825,16 @@ struct DynamicRun {
     fs: f64,
     detector: Section,
     component: Section,
-    detector_state: [f64; 2],
+    detector_state: [f32; 2],
     component_state: [[f32; 2]; MAX_CHANNELS],
     quadrature: [Section; 2],
-    quadrature_state: [[f64; 2]; 2],
+    quadrature_state: [[f32; 2]; 2],
     control_phase: usize,
+    response_gain: f64,
+    carrier_handoff: bool,
+    previous_reconstruction: f32,
+    carrier_settle_frames: usize,
+    carrier_settled: bool,
     reconstructed_gain: f64,
     reconstruction: Section,
     reconstruction_state: [f32; 4],
@@ -838,10 +843,11 @@ struct DynamicRun {
 
 impl DynamicRun {
     // The fixed carrier remains present at the response curve's nominal
-    // neutral point. This is applied after control reconstruction: it is a
-    // carrier baseline, not part of the level-dependent target.
+    // neutral point. Attack stays on the active response; release hands the
+    // carrier back to this target through the control reconstruction.
     const CARRIER_NEUTRAL: f32 = 0.013_660_6;
-    const CONTROL_TAIL_FLOOR: f32 = 1e-4;
+    const CARRIER_SETTLE_DELTA: f32 = 1e-7;
+    const CARRIER_SETTLE_FRAMES: usize = 256;
 
     fn new(params: &DynamicFilter, fs: f64) -> DynamicRun {
         let detector = match params.kind {
@@ -884,6 +890,11 @@ impl DynamicRun {
             quadrature,
             quadrature_state: [[0.0; 2]; 2],
             control_phase: 0,
+            response_gain: 1.0,
+            carrier_handoff: false,
+            previous_reconstruction: 1.0,
+            carrier_settle_frames: 0,
+            carrier_settled: false,
             reconstructed_gain: 1.0,
             reconstruction,
             reconstruction_state: [1.0; 4],
@@ -908,6 +919,11 @@ impl DynamicRun {
         self.component_state = [[0.0; 2]; MAX_CHANNELS];
         self.quadrature_state = [[0.0; 2]; 2];
         self.control_phase = 0;
+        self.response_gain = 1.0;
+        self.carrier_handoff = false;
+        self.previous_reconstruction = 1.0;
+        self.carrier_settle_frames = 0;
+        self.carrier_settled = false;
         self.reconstructed_gain = 1.0;
         self.reconstruction_state = [1.0; 4];
         self.envelope = 0.0;
@@ -937,14 +953,6 @@ impl DynamicRun {
         let output = b0 * input + state[0];
         state[0] = b1 * input - a1 * output + state[1];
         state[1] = b2 * input - a2 * output;
-        output
-    }
-
-    #[inline]
-    fn step_f64(section: &Section, state: &mut [f64; 2], input: f64) -> f64 {
-        let output = section.b0 * input + state[0];
-        state[0] = section.b1 * input - section.a1 * output + state[1];
-        state[1] = section.b2 * input - section.a2 * output;
         output
     }
 
@@ -984,6 +992,21 @@ impl DynamicRun {
         (((a * t + b) * t + c) * t + d).clamp(libm::exp(lo * core::f64::consts::LN_10 / 20.0), 1.0)
     }
 
+    fn set_response_gain(&mut self, gain: f64) {
+        if gain != self.response_gain {
+            self.carrier_settle_frames = 0;
+            self.carrier_settled = false;
+        }
+        if gain < self.response_gain {
+            self.carrier_handoff = false;
+        } else if gain > self.response_gain || gain == 1.0 {
+            self.carrier_handoff = true;
+        }
+        self.response_gain = gain;
+        self.reconstructed_gain =
+            gain * if self.carrier_handoff { 1.0 + f64::from(Self::CARRIER_NEUTRAL) } else { 1.0 };
+    }
+
     fn process(&mut self, at: &DynamicAt, bufs: &mut [&mut [f32]], frames: usize) {
         let n = bufs.len().min(MAX_CHANNELS);
         let frames = frames.min(bufs.iter().take(n).map(|b| b.len()).min().unwrap_or(0));
@@ -1005,15 +1028,15 @@ impl DynamicRun {
                     }
                 }
                 input /= sidechains as f64;
-                let detected = Self::step_f64(&self.detector, &mut self.detector_state, input);
-                sum_sq += detected * detected;
+                let detected = Self::step_f32(&self.detector, &mut self.detector_state, input as f32);
+                sum_sq += f64::from(detected) * f64::from(detected);
             }
             let measured = core::f64::consts::SQRT_2 * libm::sqrt(sum_sq / frames as f64);
             let time_ms = if measured > self.envelope { at.params.attack_ms } else { at.params.release_ms };
             let coefficient =
                 if time_ms <= 0.0 { 0.0 } else { libm::exp(-(frames as f64) / (time_ms * self.fs / 1_000.0)) };
             self.envelope += (1.0 - coefficient) * (measured - self.envelope);
-            self.reconstructed_gain = Self::curve(&at.params, self.envelope);
+            self.set_response_gain(Self::curve(&at.params, self.envelope));
         }
         for i in 0..frames {
             if !at.params.smooth {
@@ -1025,12 +1048,12 @@ impl DynamicRun {
                     }
                 }
                 input /= sidechains as f64;
-                let detected = Self::step_f64(&self.detector, &mut self.detector_state, input);
-                let a = Self::step_f64(&self.quadrature[0], &mut self.quadrature_state[0], detected);
-                let b = Self::step_f64(&self.quadrature[1], &mut self.quadrature_state[1], detected);
+                let detected = Self::step_f32(&self.detector, &mut self.detector_state, input as f32);
+                let a = Self::step_f32(&self.quadrature[0], &mut self.quadrature_state[0], detected);
+                let b = Self::step_f32(&self.quadrature[1], &mut self.quadrature_state[1], detected);
                 if self.control_phase == 0 {
-                    self.envelope = libm::sqrt(a * a + b * b);
-                    self.reconstructed_gain = Self::curve(&at.params, self.envelope);
+                    self.envelope = f64::from(libm::sqrtf(a * a + b * b));
+                    self.set_response_gain(Self::curve(&at.params, self.envelope));
                 }
                 self.control_phase = (self.control_phase + 1) & 15;
             }
@@ -1043,11 +1066,18 @@ impl DynamicRun {
                 &mut self.reconstruction_state,
                 self.reconstructed_gain as f32,
             );
-            // Do not snap a still-moving release to the neutral carrier. The
-            // installed path declares it idle only once the reconstruction
-            // residual is below its -80 dBFS control floor.
-            let idle = self.reconstructed_gain == 1.0 && (reconstructed - 1.0).abs() < Self::CONTROL_TAIL_FLOOR;
-            let gain = reconstructed + if idle { Self::CARRIER_NEUTRAL } else { 0.0 };
+            if self.carrier_handoff
+                && self.response_gain == 1.0
+                && (reconstructed - self.previous_reconstruction).abs() < Self::CARRIER_SETTLE_DELTA
+            {
+                self.carrier_settle_frames += 1;
+                self.carrier_settled |= self.carrier_settle_frames >= Self::CARRIER_SETTLE_FRAMES;
+            } else {
+                self.carrier_settle_frames = 0;
+                self.carrier_settled = false;
+            }
+            self.previous_reconstruction = reconstructed;
+            let gain = if self.carrier_settled { 1.0 + Self::CARRIER_NEUTRAL } else { reconstructed };
             for (c, buf) in bufs.iter_mut().enumerate().take(n) {
                 if at.active_mask >> c & 1 == 0 {
                     continue;
@@ -1579,6 +1609,25 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_filter_hands_release_back_to_neutral_carrier() {
+        let p = dynamic_filter_params(DynamicKind::Notch);
+        let mut run = DynamicRun::new(&p.dynamic[0].params, 48_000.0);
+
+        run.set_response_gain(0.5);
+        assert!(!run.carrier_handoff);
+        assert_eq!(run.reconstructed_gain, 0.5);
+
+        run.set_response_gain(0.6);
+        assert!(run.carrier_handoff);
+        assert_eq!(run.reconstructed_gain, 0.6 * (1.0 + f64::from(DynamicRun::CARRIER_NEUTRAL)));
+
+        run.set_response_gain(0.55);
+        assert!(!run.carrier_handoff);
+        run.set_response_gain(1.0);
+        assert!(run.carrier_handoff);
+    }
+
+    #[test]
     fn dynamic_filter_automation_retains_running_state() {
         let p = dynamic_filter_params(DynamicKind::Notch);
         let at = p.dynamic[0];
@@ -1591,6 +1640,11 @@ mod tests {
         let quadrature_state = run.quadrature_state;
         let reconstruction_state = run.reconstruction_state;
         let phase = run.control_phase;
+        let response_gain = run.response_gain;
+        let carrier_handoff = run.carrier_handoff;
+        let previous_reconstruction = run.previous_reconstruction;
+        let carrier_settle_frames = run.carrier_settle_frames;
+        let carrier_settled = run.carrier_settled;
         let envelope = run.envelope;
 
         let mut moved = at.params;
@@ -1601,6 +1655,11 @@ mod tests {
         assert_eq!(run.quadrature_state, quadrature_state);
         assert_eq!(run.reconstruction_state, reconstruction_state);
         assert_eq!(run.control_phase, phase);
+        assert_eq!(run.response_gain, response_gain);
+        assert_eq!(run.carrier_handoff, carrier_handoff);
+        assert_eq!(run.previous_reconstruction, previous_reconstruction);
+        assert_eq!(run.carrier_settle_frames, carrier_settle_frames);
+        assert_eq!(run.carrier_settled, carrier_settled);
         assert_eq!(run.envelope, envelope);
     }
 
