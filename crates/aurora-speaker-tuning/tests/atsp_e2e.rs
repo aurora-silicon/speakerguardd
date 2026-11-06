@@ -111,6 +111,11 @@ fn every_shape_compiles_loads_in_its_plugin_and_protects() {
             .unwrap_or_else(|e| panic!("{}: {e:?}", s.name));
         assert_eq!((c.channels as usize, c.sense_channels), (s.channels, 0), "{}", s.name);
         assert_eq!(c.board, s.board);
+        // atsp runs protection-only: an identity pre-stage that declares no
+        // crossover to the kernel
+        let pre = sgv2_core::blob::prestage(&c.blob, 48_000.0).unwrap();
+        assert!(!pre.from_tuning() && pre.box_count == 0, "{}", s.name);
+        assert!(pre.channel[..s.channels].iter().all(|ch| ch.count == 0 && ch.gain == 1.0), "{}", s.name);
 
         // the board's plugin variant carries no sense (wiring.describe):
         // the plugin takes the blob; a variant with sense refuses it
