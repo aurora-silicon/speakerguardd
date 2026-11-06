@@ -32,13 +32,46 @@
 //! | 9 | flat gain | gain |
 //! | 11 | low shelf | RBJ low shelf |
 //! | 12 | high shelf | RBJ high shelf |
-//! | 0, 2 | band and high shelves that stay between 0 dB and their gain | left out when the gain is 0 dB or more (leaving out a boost only takes drive away); refused for a cut |
+//! | 0, 2 | band and high shelves that stay between 0 dB and their gain | left out when the gain is 0 dB or more (leaving out a boost only takes drive away); a cut is carried as a flat gain of its depth (the shelf never passes less than its gain) |
 //!
-//! Every other type is refused, as are a group bypass on a running slot
-//! (its meaning is not settled), a slot whose values are out of range, and
-//! a volume automation aimed at a high-pass, low-pass, gain or shelf slot.
+//! | 15 | a peaking cut whose depth follows the level, at most its gain | a fixed RBJ peaking cut of its gain (cuts at least as much at every level) |
+//!
+//! A peak or shelf of 0 dB is left out (the identity). Every other type is
+//! refused, as is a slot whose values are out of range.
 //! Polarity flips are not carried: they change no level. A muted channel
 //! gets gain 0.
+//!
+//! Group bypass (parameter 1, a bit per group): whether the unit runs a
+//! slot of a bypassed group is not settled, so such a slot is carried only
+//! where it takes drive away (a band limit, a cut) and left out where it
+//! would add drive (a boost). Either way the pre-stage passes no more than
+//! macOS does.
+//!
+//! Volume automation (`AUTOMATION_BASE`, ten entries) moves a slot's gain
+//! and frequency with the system volume: below set point A the slot keeps
+//! its own values, from A it glides to set point B's (through M's when M is
+//! enabled), and from B up it holds B's. The order, quality and type stay.
+//! The system volume is the unit's parameter 3 (0 to 1). This reading is
+//! from the unit's measured response on test signals at volumes 0 to 1; a
+//! set point's gain does not act on a Butterworth slot, as the slot's own
+//! gain does not.
+//! The pre-stage does not follow the volume; it carries, for every slot an
+//! entry moves, the one setting that passes no more than any setting the
+//! slot can take, at every frequency:
+//!
+//! * high-pass: its highest corner; low-pass: its lowest (a Butterworth
+//!   response falls as its corner moves into the band), plus the deepest
+//!   cut a set point gives (stricter than the unit, which ignores it);
+//! * flat gain: its lowest;
+//! * peak or shelf: the lowest setting when the frequency does not move;
+//!   otherwise nothing when no setting cuts, the one cut exactly when no
+//!   glide reaches it, and else a flat gain of the deepest cut (a peak or
+//!   shelf stays between 0 dB and its gain).
+//!
+//! On a Mac whose tuning raises a high-pass and fades boosts as the volume
+//! rises, that is the setting macOS runs at full volume. An entry aimed at
+//! a running slot with a state other than 1 or 2, or with set points out of
+//! order, refuses the compile.
 //!
 //! The graph's multiband compressor boxes (`aufx/mstk`) ahead of the unit
 //! are carried at their places in the lanes ([`boxes`]): each compiled by
@@ -68,11 +101,14 @@ pub const MSTK: FourCc = FourCc::from_bytes(*b"mstk");
 pub const SLOTS: u32 = 50;
 const SLOT_BASE: u32 = 14;
 const SLOT_STRIDE: u32 = 10;
-/// Volume automation entries after the slots (514 and 515 are the range):
-/// `target filter` then `state`, then the entry's set points.
+/// Volume automation entries after the slots (514 and 515 are the range of
+/// the system volume they follow): target filter, state, set point A, set
+/// point B with its gain and frequency, set point M's enable, M, its gain
+/// and frequency. Ten entries; the slots' attack and release follow (616
+/// on).
 const AUTOMATION_BASE: u32 = 516;
 const AUTOMATION_STRIDE: u32 = 10;
-const AUTOMATION_ENTRIES: u32 = 24;
+const AUTOMATION_ENTRIES: u32 = 10;
 /// The highest Butterworth order the unit offers.
 pub const MAX_ORDER: u32 = 10;
 
@@ -142,6 +178,116 @@ fn rbj(kind: Rbj, gain_db: f64, f0: f64, q: f64, fs: f64) -> Section {
     Section { b0: b[0] / d[0], b1: b[1] / d[0], b2: b[2] / d[0], a1: d[1] / d[0], a2: d[2] / d[0] }
 }
 
+/// A slot's gain and frequency at one volume.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Point {
+    gain: f64,
+    f0: f64,
+}
+
+/// One volume automation entry: below set point A the slot keeps its own
+/// values, from A it glides to B's (through M's when M is enabled), and at
+/// B and above it holds B's.
+#[derive(Clone, Copy, Debug)]
+struct Automation {
+    target: u32,
+    state: f64,
+    a: f64,
+    b_at: f64,
+    b: Point,
+    middle: Option<(f64, Point)>,
+    m_enable: f64,
+}
+
+impl Automation {
+    /// The entry is aimed at a running slot of type `kind`: its values must
+    /// be ones whose meaning is settled.
+    fn check(&self, ctx: &str, e: u32, kind: i64) -> Result<()> {
+        let fail = |why: &str| Err(bad(format!("{ctx}: volume automation {e} on slot {}: {why}", self.target)));
+        if self.state != 1.0 && self.state != 2.0 {
+            return fail(&format!("state {}", self.state));
+        }
+        if self.m_enable != 0.0 && self.m_enable != 1.0 {
+            return fail(&format!("set point M enable {}", self.m_enable));
+        }
+        let mut at = vec![self.a];
+        at.extend(self.middle.map(|(v, _)| v));
+        at.push(self.b_at);
+        if at.iter().any(|v| !v.is_finite() || !(-100.0..=1.0).contains(v)) || at.windows(2).any(|w| w[0] > w[1]) {
+            return fail(&format!("set points {at:?} are not in order inside the volume range"));
+        }
+        let mut pts = vec![self.b];
+        pts.extend(self.middle.map(|(_, p)| p));
+        // a flat gain or a shelf boost never reads the frequency
+        let reads_freq = matches!(kind, 1 | 3 | 4 | 11 | 12);
+        if pts.iter().any(|p| !p.gain.is_finite() || (reads_freq && !p.f0.is_finite())) {
+            return fail("a set point is not numeric");
+        }
+        Ok(())
+    }
+}
+
+/// The box's volume automation entries that are switched on, by entry.
+fn automation(get: &dyn Fn(u32) -> f64, ctx: &str) -> Result<Vec<(u32, Automation)>> {
+    let mut v = Vec::new();
+    for e in 0..AUTOMATION_ENTRIES {
+        let at = |k: u32| get(AUTOMATION_BASE + AUTOMATION_STRIDE * e + k);
+        let (target, state) = (at(0), at(1));
+        if state == 0.0 {
+            continue;
+        }
+        if !(0.0..SLOTS as f64).contains(&target) || target.fract() != 0.0 {
+            return Err(bad(format!("{ctx}: volume automation {e} is aimed at slot {target}")));
+        }
+        let m_enable = at(6);
+        v.push((
+            e,
+            Automation {
+                target: target as u32,
+                state,
+                a: at(2),
+                b_at: at(3),
+                b: Point { gain: at(4), f0: at(5) },
+                middle: (m_enable != 0.0).then(|| (at(7), Point { gain: at(8), f0: at(9) })),
+                m_enable,
+            },
+        ));
+    }
+    Ok(v)
+}
+
+/// How a peak or shelf whose gain and frequency move is carried.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Carry {
+    /// The filter at this point: it passes no more than any other point, or
+    /// any setting gliding between two of them, at every frequency.
+    Exact(usize),
+    /// A flat gain (dB): the deepest cut of any point. A peak or shelf stays
+    /// between 0 dB and its gain, so no setting passes less.
+    Flat(f64),
+}
+
+/// `points[0]` is the slot's own setting; `spans` are the glides between
+/// points `(from, to, the glide covers some volumes)`.
+fn carried(points: &[Point], spans: &[(usize, usize, bool)]) -> Carry {
+    let lowest = (0..points.len()).min_by(|&x, &y| points[x].gain.total_cmp(&points[y].gain)).unwrap_or(0);
+    if points.iter().all(|p| p.f0 == points[0].f0) {
+        // same frequency and quality: the response falls with the gain
+        return Carry::Exact(lowest);
+    }
+    let lo = points[lowest].gain;
+    if lo >= 0.0 {
+        return Carry::Flat(0.0);
+    }
+    let cuts: Vec<usize> = (0..points.len()).filter(|&k| points[k].gain < 0.0).collect();
+    // A single cut that nothing glides into or out of: every other setting
+    // is a boost, which passes at least 0 dB everywhere.
+    if cuts.len() == 1 && spans.iter().all(|&(u, v, glides)| !glides || (u != cuts[0] && v != cuts[0])) {
+        return Carry::Exact(cuts[0]);
+    }
+    Carry::Flat(lo)
+}
+
 /// The filters box `stage` applies to its channel `ch`.
 fn part(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics) -> Result<Part> {
     let ctx = format!("filter box {}", stage.name);
@@ -179,7 +325,7 @@ fn part(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics) -> Result<Part
     p.gain_db = get(4) + get(13);
     let group_bypass = bits(1)?;
     let nyquist = fs / 2.0;
-    let mut kept = Vec::new();
+    let automation = automation(&get, &ctx)?;
     for i in 0..SLOTS {
         let at = |k: u32| get(SLOT_BASE + SLOT_STRIDE * i + k);
         let state = at(0);
@@ -200,51 +346,159 @@ fn part(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics) -> Result<Part
         if !(0.0..=9.0).contains(&group) || group.fract() != 0.0 {
             return Err(bad(format!("{ctx}: slot {i} group {group}")));
         }
-        if group_bypass >> group as u32 & 1 != 0 {
-            return Err(bad(format!("{ctx}: slot {i} runs in bypassed group {group}; group bypass is not settled")));
+        // Whether the unit runs a slot of a bypassed group is not settled:
+        // such a slot is carried only where it takes drive away (a cut, a
+        // band limit), and left out where it would add drive (a boost), so
+        // the pre-stage passes no more than macOS either way.
+        let in_bypassed_group = group_bypass >> group as u32 & 1 != 0;
+        if in_bypassed_group {
+            diags.info(
+                "prestage-group-bypass",
+                ctx.clone(),
+                format!("slot {i} is in bypassed group {group}: carried only as far as it cuts"),
+            );
         }
         let (kind, gain, f0, q, order) = (at(1), at(2), at(3), at(4), at(5));
         if kind.fract() != 0.0 || !gain.is_finite() || !q.is_finite() || !order.is_finite() {
             return Err(bad(format!("{ctx}: slot {i} has a non-numeric field")));
         }
-        let freq_ok = f0.is_finite() && f0 > 0.0 && f0 < nyquist;
-        let need_freq = |what: &str| -> Result<()> {
-            if freq_ok {
+        let kind = kind as i64;
+        // The slot's own values, then every set point a volume automation
+        // moves it to.
+        let mut points = vec![Point { gain, f0 }];
+        let mut spans = Vec::new();
+        for (e, a) in automation.iter().filter(|(_, a)| a.target == i) {
+            a.check(&ctx, *e, kind)?;
+            let base = points.len();
+            points.extend(a.middle.map(|(_, m)| m));
+            points.push(a.b);
+            // gliding spans: own values -> M -> B, or own values -> B
+            let mut from = (0usize, a.a);
+            for (k, v) in a.middle.map(|(v, _)| v).into_iter().chain([a.b_at]).enumerate() {
+                spans.push((from.0, base + k, v > from.1));
+                from = (base + k, v);
+            }
+        }
+        let automated = points.len() > 1;
+        let need_freq = |what: &str, f: f64| -> Result<()> {
+            if f.is_finite() && f > 0.0 && f < nyquist {
                 Ok(())
             } else {
-                Err(bad(format!("{ctx}: slot {i} ({what}) frequency {f0} Hz is outside 0 to {nyquist} Hz")))
+                Err(bad(format!("{ctx}: slot {i} ({what}) frequency {f} Hz is outside 0 to {nyquist} Hz")))
             }
         };
-        match kind as i64 {
+        match kind {
             3 | 4 => {
-                need_freq("Butterworth")?;
+                let high = kind == 4;
                 if order.fract() != 0.0 || order < 1.0 || order as u32 > max_order {
                     return Err(bad(format!("{ctx}: slot {i} order {order} (1 to {max_order})")));
                 }
-                p.sections.extend(butterworth(kind as i64 == 4, order as u32, f0, fs));
-                kept.push(i);
+                for pt in &points {
+                    need_freq("Butterworth", pt.f0)?;
+                }
+                // The corner glides between its set points: the highest
+                // high-pass corner (lowest low-pass corner) passes the least
+                // at every frequency. The slot's own gain does not act on a
+                // Butterworth slot; a set point's cut is carried.
+                let corner = points.iter().map(|pt| pt.f0).fold(f0, |c, f| if high == (f > c) { f } else { c });
+                let cut = points[1..].iter().map(|pt| pt.gain).fold(0.0, f64::min);
+                p.sections.extend(butterworth(high, order as u32, corner, fs));
+                p.gain_db += cut;
+                if automated {
+                    diags.info(
+                        "prestage-volume-automation",
+                        ctx.clone(),
+                        format!(
+                            "slot {i}: the volume-automated {} corner is carried at {corner} Hz (own {f0} Hz), cut {cut} dB",
+                            if high { "high-pass" } else { "low-pass" }
+                        ),
+                    );
+                }
             }
             9 => {
-                p.gain_db += gain;
-                kept.push(i);
+                let mut g = points.iter().map(|pt| pt.gain).fold(f64::INFINITY, f64::min);
+                if in_bypassed_group {
+                    g = g.min(0.0);
+                }
+                p.gain_db += g;
+                if automated {
+                    diags.info(
+                        "prestage-volume-automation",
+                        ctx.clone(),
+                        format!("slot {i}: the volume-automated gain is carried at its lowest, {g} dB"),
+                    );
+                }
             }
-            1 | 11 | 12 => {
-                need_freq("peak or shelf")?;
+            // A peak or shelf of 0 dB at every point is the identity at
+            // any frequency and quality.
+            1 | 11 | 12 if points.iter().all(|pt| pt.gain == 0.0) => {}
+            // A level-dependent peaking cut: it cuts at most its gain, never
+            // more than a fixed peaking cut of that gain does (measured at
+            // full scale). Carried as that fixed cut; a boost is left out.
+            15 => {
+                if automated {
+                    return Err(bad(format!("{ctx}: slot {i}: volume automation on a level-dependent cut")));
+                }
+                need_freq("level-dependent cut", f0)?;
                 if q <= 0.0 || !(-30.0..=30.0).contains(&gain) {
                     return Err(bad(format!("{ctx}: slot {i} quality {q}, gain {gain} dB")));
                 }
-                let r = match kind as i64 {
+                if gain < 0.0 {
+                    p.sections.push(rbj(Rbj::Peak, gain, f0, q, fs));
+                    diags.info(
+                        "prestage-dynamic-cut",
+                        ctx.clone(),
+                        format!("slot {i}: the level-dependent cut is carried at its full depth, {gain} dB at {f0} Hz"),
+                    );
+                }
+            }
+            1 | 11 | 12 => {
+                for pt in &points {
+                    need_freq("peak or shelf", pt.f0)?;
+                    if q <= 0.0 || !(-30.0..=30.0).contains(&pt.gain) {
+                        return Err(bad(format!("{ctx}: slot {i} quality {q}, gain {} dB", pt.gain)));
+                    }
+                }
+                let r = match kind {
                     1 => Rbj::Peak,
                     11 => Rbj::LowShelf,
                     _ => Rbj::HighShelf,
                 };
-                p.sections.push(rbj(r, gain, f0, q, fs));
-                if !matches!(r, Rbj::Peak) {
-                    kept.push(i);
+                match carried(&points, &spans) {
+                    Carry::Exact(k) if in_bypassed_group && points[k].gain > 0.0 => {}
+                    Carry::Exact(k) => p.sections.push(rbj(r, points[k].gain, points[k].f0, q, fs)),
+                    Carry::Flat(g) => p.gain_db += g,
+                }
+                if automated {
+                    diags.info(
+                        "prestage-volume-automation",
+                        ctx.clone(),
+                        match carried(&points, &spans) {
+                            Carry::Exact(k) => format!(
+                                "slot {i}: the volume-automated filter is carried at {} dB, {} Hz (it passes the least)",
+                                points[k].gain, points[k].f0
+                            ),
+                            Carry::Flat(g) => format!("slot {i}: the volume-automated filter is carried as a flat {g} dB"),
+                        },
+                    );
                 }
             }
-            0 | 2 if gain >= 0.0 => {
-                if gain > 0.0 {
+            // These stay between 0 dB and their gain: a boost is left out
+            // (that only takes drive away), a cut is carried as a flat cut
+            // of its depth (never more than the shelf passes).
+            0 | 2 => {
+                let lo = points.iter().map(|pt| pt.gain).fold(0.0, f64::min);
+                if points.iter().any(|pt| !(-30.0..=30.0).contains(&pt.gain)) {
+                    return Err(bad(format!("{ctx}: slot {i} gain out of range: {points:?}")));
+                }
+                p.gain_db += lo;
+                if lo < 0.0 || automated {
+                    diags.info(
+                        "prestage-shelf-flat",
+                        ctx.clone(),
+                        format!("slot {i}: a shelf of {gain} dB (volume-automated: {automated}) is carried as a flat {lo} dB"),
+                    );
+                } else if gain > 0.0 {
                     diags.info(
                         "prestage-boost-left-out",
                         ctx.clone(),
@@ -258,15 +512,6 @@ fn part(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics) -> Result<Part
                      without it the speaker would be driven harder than macOS drives it"
                 )))
             }
-        }
-    }
-    // Volume automation moves a slot with the system volume. One aimed at
-    // a slot that sets the band limits is refused rather than frozen.
-    for e in 0..AUTOMATION_ENTRIES {
-        let entry = AUTOMATION_BASE + AUTOMATION_STRIDE * e;
-        let (target, state) = (get(entry), get(entry + 1));
-        if state != 0.0 && target >= 0.0 && kept.contains(&(target as u32)) {
-            return Err(bad(format!("{ctx}: volume automation {e} moves slot {target}, which sets a band limit")));
         }
     }
     if p.sections.iter().any(|s| !s.stable()) {
@@ -564,16 +809,36 @@ mod tests {
         assert_eq!((p0.sections.len(), p0.gain_db), (0, -7.0));
         let p1 = part(&st, 1, fs, &mut d).unwrap();
         assert_eq!((p1.sections.len(), p1.gain_db), (2, -7.0));
-        // a band-shelf boost is left out; a cut of a type not carried is refused
+        // a band-shelf boost is left out; its cut is carried as a flat cut
         let boost = tmst(&[], &[(0, [3.0, 0.0, 2.0, 700.0, 800.0, 1800.0, 3.0, 0.0])]);
-        assert_eq!(part(&boost, 0, fs, &mut d).unwrap().sections.len(), 0);
+        let pb = part(&boost, 0, fs, &mut d).unwrap();
+        assert_eq!((pb.sections.len(), pb.gain_db), (0, 0.0));
         let cut = tmst(&[], &[(0, [3.0, 0.0, -2.0, 700.0, 800.0, 1800.0, 3.0, 0.0])]);
-        assert!(part(&cut, 0, fs, &mut d).is_err());
+        let pc = part(&cut, 0, fs, &mut d).unwrap();
+        assert_eq!((pc.sections.len(), pc.gain_db), (0, -2.0));
+        // a 0 dB peak at 0 Hz is the identity; a level-dependent cut is a fixed cut
+        let flat = tmst(&[], &[(0, [3.0, 1.0, 0.0, 0.0, 0.1, 2.0, 3.0, 0.0])]);
+        assert_eq!(part(&flat, 0, fs, &mut d).unwrap().sections.len(), 0);
+        let dynamic = tmst(&[], &[(0, [3.0, 15.0, -9.0, 200.0, 3.0, 3.0, 3.0, 0.0])]);
+        let pd = part(&dynamic, 0, fs, &mut d).unwrap();
+        assert_eq!(pd.sections.len(), 1);
+        assert!((20.0 * pd.sections[0].magnitude(200.0, fs).log10() + 9.0).abs() < 0.01);
         let odd = tmst(&[], &[(0, [3.0, 13.0, 0.0, 700.0, 0.7, 2.0, 3.0, 0.0])]);
         assert!(part(&odd, 0, fs, &mut d).is_err());
-        // a running slot in a bypassed group is refused; a muted channel is muted
-        let grouped = tmst(&[(1, 2.0)], &[(0, [3.0, 4.0, 0.0, 200.0, 0.7, 2.0, 3.0, 1.0])]);
-        assert!(part(&grouped, 0, fs, &mut d).is_err());
+        // a running slot in a bypassed group is carried only as a cut
+        let grouped = tmst(
+            &[(1, 2.0)],
+            &[
+                (0, [3.0, 4.0, 0.0, 200.0, 0.7, 2.0, 3.0, 1.0]),
+                (1, [3.0, 1.0, 6.0, 2000.0, 1.0, 2.0, 3.0, 1.0]),
+                (2, [3.0, 1.0, -6.0, 3000.0, 1.0, 2.0, 3.0, 1.0]),
+                (3, [3.0, 9.0, 3.0, 1000.0, 1.0, 2.0, 3.0, 1.0]),
+                (4, [3.0, 9.0, -3.0, 1000.0, 1.0, 2.0, 3.0, 1.0]),
+            ],
+        );
+        let pg = part(&grouped, 0, fs, &mut d).unwrap();
+        assert_eq!((pg.sections.len(), pg.gain_db), (2, -3.0));
+        // a muted channel is muted
         let muted = tmst(&[(11, 1.0)], &[]);
         assert!(part(&muted, 0, fs, &mut d).unwrap().muted);
         assert!(!part(&muted, 1, fs, &mut d).unwrap().muted);
@@ -582,15 +847,115 @@ mod tests {
         assert!(part(&deep, 0, fs, &mut d).is_err());
         let high = tmst(&[], &[(0, [3.0, 3.0, 0.0, 30_000.0, 0.7, 2.0, 3.0, 0.0])]);
         assert!(part(&high, 0, fs, &mut d).is_err());
-        // a volume automation aimed at a band-limiting slot is refused
+        // volume automation: see `volume_automation`; one with values whose
+        // meaning is not settled is refused
         let auto = tmst(
-            &[(AUTOMATION_BASE, 0.0), (AUTOMATION_BASE + 1, 1.0)],
+            &[
+                (AUTOMATION_BASE, 0.0),
+                (AUTOMATION_BASE + 1, 1.0),
+                (AUTOMATION_BASE + 2, 0.8),
+                (AUTOMATION_BASE + 3, 0.2),
+            ],
             &[(0, [3.0, 4.0, 0.0, 200.0, 0.7, 2.0, 3.0, 0.0])],
         );
         assert!(part(&auto, 0, fs, &mut d).is_err());
+        let state = tmst(
+            &[(AUTOMATION_BASE, 0.0), (AUTOMATION_BASE + 1, 5.0), (AUTOMATION_BASE + 3, 1.0)],
+            &[(0, [3.0, 4.0, 0.0, 200.0, 0.7, 2.0, 3.0, 0.0])],
+        );
+        assert!(part(&state, 0, fs, &mut d).is_err());
         // a bypassed box contributes nothing
         let off = tmst(&[(0, 1.0)], &[(0, [3.0, 4.0, 0.0, 200.0, 0.7, 2.0, 3.0, 0.0])]);
         assert_eq!(part(&off, 0, fs, &mut d).unwrap().sections.len(), 0);
+    }
+
+    /// One automation entry on `slot`: A, B and B's gain and frequency, and
+    /// optionally M, its gain and frequency.
+    fn auto(e: u32, slot: f32, a: f32, b: (f32, f32, f32), m: Option<(f32, f32, f32)>) -> Vec<(u32, f32)> {
+        let o = AUTOMATION_BASE + AUTOMATION_STRIDE * e;
+        let mut v = vec![(o, slot), (o + 1, 2.0), (o + 2, a), (o + 3, b.0), (o + 4, b.1), (o + 5, b.2)];
+        if let Some((at, g, f)) = m {
+            v.extend([(o + 6, 1.0), (o + 7, at), (o + 8, g), (o + 9, f)]);
+        }
+        v
+    }
+
+    #[test]
+    fn volume_automation() {
+        let fs = 48_000.0;
+        let mut d = Diagnostics::default();
+        let mag = |p: &Part, f: f64| {
+            let mut ch = Channel::IDENTITY;
+            ch.count = p.sections.len();
+            ch.sections[..p.sections.len()].copy_from_slice(&p.sections);
+            20.0 * ch.magnitude(f, fs).log10() + p.gain_db
+        };
+        // a high-pass whose corner rises with the volume: the highest corner
+        // is carried, with the set points' cut
+        let hp = |entries: Vec<(u32, f32)>| tmst(&entries, &[(1, [3.0, 4.0, 0.0, 45.0, 15.0, 4.0, 3.0, 0.0])]);
+        let p = part(&hp(auto(0, 1.0, 0.2, (1.0, -0.1, 100.0), Some((0.8, -0.05, 80.0)))), 0, fs, &mut d).unwrap();
+        assert_eq!(p.sections, butterworth(true, 4, 100.0f32 as f64, fs));
+        assert!((p.gain_db + 0.1).abs() < 1e-6);
+        // one falling with the volume: the slot's own corner is the highest
+        let p = part(&hp(auto(0, 1.0, 0.2, (1.0, 0.0, 30.0), None)), 0, fs, &mut d).unwrap();
+        assert_eq!(p.sections, butterworth(true, 4, 45.0, fs));
+        // a low-pass: the lowest corner
+        let lp = tmst(&auto(3, 0.0, 0.0, (1.0, 0.0, 300.0), None), &[(0, [3.0, 3.0, 0.0, 900.0, 0.7, 2.0, 3.0, 0.0])]);
+        assert_eq!(part(&lp, 0, fs, &mut d).unwrap().sections, butterworth(false, 2, 300.0, fs));
+        // a flat gain: its lowest
+        let flat =
+            tmst(&auto(0, 0.0, 0.1, (1.0, -4.0, 1000.0), None), &[(0, [3.0, 9.0, -1.0, 1000.0, 1.0, 2.0, 3.0, 0.0])]);
+        assert!((part(&flat, 0, fs, &mut d).unwrap().gain_db + 4.0).abs() < 1e-6);
+        // a peak whose boost fades to a small cut as the frequency moves: a
+        // flat cut of that depth, never more than any setting passes
+        let pk = |b: (f32, f32, f32)| {
+            tmst(&auto(0, 2.0, 0.16, b, Some((0.6, 2.0, 9200.0))), &[(2, [3.0, 1.0, 3.3, 9300.0, 0.4, 2.0, 3.0, 0.0])])
+        };
+        let p = part(&pk((0.85, -0.5, 9190.0)), 0, fs, &mut d).unwrap();
+        assert_eq!((p.sections.len(), p.gain_db), (0, -0.5f32 as f64));
+        // that fades to 0 dB: nothing
+        let p = part(&pk((0.85, 0.0, 9190.0)), 0, fs, &mut d).unwrap();
+        assert_eq!((p.sections.len(), p.gain_db), (0, 0.0));
+        // at one frequency: the lowest setting, exactly
+        let same = tmst(
+            &auto(0, 2.0, 0.16, (0.85, -1.0, 9300.0), Some((0.6, 2.0, 9300.0))),
+            &[(2, [3.0, 1.0, 3.3, 9300.0, 0.4, 2.0, 3.0, 0.0])],
+        );
+        let p = part(&same, 0, fs, &mut d).unwrap();
+        assert_eq!(p.sections.len(), 1);
+        assert!((mag(&p, 9300.0) + 1.0).abs() < 1e-4);
+        // a cut that nothing glides into (A = B): it is carried exactly
+        let still =
+            tmst(&auto(0, 0.0, 0.0, (0.0, 0.0, 20.0), None), &[(0, [3.0, 1.0, -2.0, 11200.0, 2.0, 2.0, 3.0, 0.0])]);
+        let p = part(&still, 0, fs, &mut d).unwrap();
+        assert_eq!((p.sections.len(), p.gain_db), (1, 0.0));
+        // a band shelf whose boost fades to a cut: a flat cut
+        let shelf = tmst(
+            &auto(1, 0.0, 0.1, (1.0, -0.07, 193.0), Some((0.56, 4.3, 193.0))),
+            &[(0, [7.0, 2.0, 8.4, 189.0, 300.0, 1000.0, 3.0, 0.0])],
+        );
+        let p = part(&shelf, 0, fs, &mut d).unwrap();
+        assert_eq!((p.sections.len(), p.gain_db), (0, -0.07f32 as f64));
+        // the carried response never passes more than any set point does
+        for f in [20.0, 50.0, 100.0, 200.0, 1000.0, 9200.0] {
+            let carried = mag(&part(&pk((0.85, -0.5, 9190.0)), 0, fs, &mut d).unwrap(), f);
+            for (g, f0) in [(3.3, 9300.0), (2.0, 9200.0), (-0.5, 9190.0)] {
+                let s = rbj(Rbj::Peak, g, f0, 0.4f32 as f64, fs);
+                assert!(carried <= 20.0 * s.magnitude(f, fs).log10() + 1e-9, "{f} Hz vs {g} dB at {f0}");
+            }
+        }
+        // an entry aimed at a slot that does not run is not read
+        let idle = tmst(
+            &[(AUTOMATION_BASE, 0.0), (AUTOMATION_BASE + 1, 1000.0)],
+            &[(0, [1.0, 4.0, 0.0, 200.0, 0.7, 2.0, 3.0, 0.0])],
+        );
+        assert_eq!(part(&idle, 0, fs, &mut d).unwrap().sections.len(), 0);
+        // the slots' attack and release after the ten entries are not entries
+        let ramps = tmst(
+            &[(AUTOMATION_BASE + AUTOMATION_STRIDE * AUTOMATION_ENTRIES + 1, 29.0)],
+            &[(0, [3.0, 4.0, 0.0, 200.0, 0.7, 2.0, 3.0, 0.0])],
+        );
+        assert_eq!(part(&ramps, 0, fs, &mut d).unwrap().sections.len(), 1);
     }
 
     #[test]
