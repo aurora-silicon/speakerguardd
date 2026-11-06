@@ -1033,6 +1033,7 @@ impl Complex32 {
 /// rate families). Twiddles are derived from the transform length.
 struct MixedRadixPlan {
     n: usize,
+    fused_320: Option<Fused320Plan>,
     stages: Vec<(usize, usize)>,
     permutation: Vec<usize>,
     twiddles: Vec<Vec<Complex32>>,
@@ -1093,6 +1094,7 @@ impl MixedRadixPlan {
         let angle5 = 2.0 * core::f64::consts::PI / 5.0;
         Self {
             n,
+            fused_320: (n == 320).then(Fused320Plan::new),
             stages,
             permutation,
             twiddles,
@@ -1109,6 +1111,10 @@ impl MixedRadixPlan {
     fn transform(&self, input: &[Complex32], output: &mut [Complex32], inverse: bool) {
         debug_assert_eq!(input.len(), self.n);
         debug_assert_eq!(output.len(), self.n);
+        if let Some(plan) = &self.fused_320 {
+            plan.transform(input, output, inverse);
+            return;
+        }
         for (dst, &src) in output.iter_mut().zip(&self.permutation) {
             *dst = input[src];
         }
@@ -1139,6 +1145,93 @@ impl MixedRadixPlan {
             }
         }
     }
+}
+
+/// Formula-derived expression of the fused 20-by-16 Float32 tile schedule
+/// used for the complex half of the 640-point real transform. The symmetric
+/// order is significant: each sine product initializes or advances the
+/// accumulator before its paired cosine product.
+struct Fused320Plan {
+    roots_16: [[Complex32; 16]; 7],
+    twiddles: [[Complex32; 16]; 20],
+    roots_20: [[Complex32; 20]; 9],
+}
+
+impl Fused320Plan {
+    fn new() -> Self {
+        Self {
+            roots_16: core::array::from_fn(|n| core::array::from_fn(|k| formula_root(16, n + 1, k))),
+            twiddles: core::array::from_fn(|q| core::array::from_fn(|k| formula_root(320, q, k))),
+            roots_20: core::array::from_fn(|n| core::array::from_fn(|k| formula_root(20, n + 1, k))),
+        }
+    }
+
+    fn transform(&self, input: &[Complex32], output: &mut [Complex32], inverse: bool) {
+        debug_assert_eq!(input.len(), 320);
+        debug_assert_eq!(output.len(), 320);
+
+        // Twenty strided 16-point transforms. The inverse entry point uses
+        // the same arithmetic kernel with the split components exchanged.
+        for q in 0..20 {
+            let sample = |n: usize| {
+                let value = input[q + 20 * n];
+                if inverse {
+                    Complex32 { re: value.im, im: value.re }
+                } else {
+                    value
+                }
+            };
+            let mut values = [Complex32::default(); 16];
+            for (n, value) in values.iter_mut().enumerate() {
+                *value = sample(n);
+            }
+            for k in 0..16 {
+                let mut value = fused_symmetric_bin(&values, k, &self.roots_16);
+                let root = self.twiddles[q][k];
+                value = Complex32 {
+                    re: libm::fmaf(value.re, root.re, value.im * root.im),
+                    im: libm::fmaf(-value.re, root.im, value.im * root.re),
+                };
+                output[q * 16 + k] = value;
+            }
+        }
+
+        // Sixteen 20-point columns. Copying a column first makes the
+        // transposed natural-order write safe without another work buffer.
+        for k in 0..16 {
+            let values: [Complex32; 20] = core::array::from_fn(|q| output[q * 16 + k]);
+            for q in 0..20 {
+                let value = fused_symmetric_bin(&values, q, &self.roots_20);
+                output[q * 16 + k] = if inverse { Complex32 { re: value.im, im: value.re } } else { value };
+            }
+        }
+    }
+}
+
+fn formula_root(length: usize, minor: usize, major: usize) -> Complex32 {
+    let angle = 2.0 * core::f64::consts::PI * (minor * major) as f64 / length as f64;
+    Complex32 { re: libm::cos(angle) as f32, im: libm::sin(angle) as f32 }
+}
+
+fn fused_symmetric_bin<const N: usize>(values: &[Complex32; N], k: usize, roots: &[[Complex32; N]]) -> Complex32 {
+    debug_assert_eq!(N & 1, 0);
+    let half = N / 2;
+    debug_assert_eq!(roots.len(), half - 1);
+    let mut re = values[0].re;
+    let mut im = values[0].im;
+    let sign = if k & 1 == 0 { 1.0 } else { -1.0 };
+    re = libm::fmaf(values[half].re, sign, re);
+    im = libm::fmaf(values[half].im, sign, im);
+    for n in 1..half {
+        let root = roots[n - 1][k];
+        for (q, sine) in [(n, root.im), (N - n, -root.im)] {
+            re = libm::fmaf(values[q].im, sine, re);
+            re = libm::fmaf(values[q].re, root.re, re);
+            im = libm::fmaf(values[q].im, root.re, im);
+            im = libm::fmaf(-values[q].re, sine, im);
+        }
+    }
+    Complex32 { re, im }
 }
 
 #[inline]
@@ -1245,8 +1338,12 @@ impl DftFilterbank {
         let plan = MixedRadixPlan::new(half);
         let real_twiddles: Vec<Complex32> = (0..half)
             .map(|k| {
-                let angle = -core::f64::consts::PI * k as f64 / half as f64;
-                Complex32 { re: libm::cos(angle) as f32, im: libm::sin(angle) as f32 }
+                if half == 320 {
+                    fused_real_root(k)
+                } else {
+                    let angle = -core::f64::consts::PI * k as f64 / half as f64;
+                    Complex32 { re: libm::cos(angle) as f32, im: libm::sin(angle) as f32 }
+                }
             })
             .collect();
         let mut complex = vec![Complex32::default(); half];
@@ -1326,6 +1423,10 @@ impl DftFilterbank {
 
 fn real_forward_finish(z: &[Complex32], packed: &mut [Complex32], twiddles: &[Complex32]) {
     let m = z.len();
+    if m == 320 {
+        fused_real_forward_finish(z, packed, twiddles);
+        return;
+    }
     packed[0] = Complex32 { re: 2.0 * (z[0].re + z[0].im), im: 2.0 * (z[0].re - z[0].im) };
     for k in 1..m {
         let a = z[k];
@@ -1339,6 +1440,10 @@ fn real_forward_finish(z: &[Complex32], packed: &mut [Complex32], twiddles: &[Co
 
 fn real_inverse_start(packed: &[Complex32], z: &mut [Complex32], twiddles: &[Complex32]) {
     let m = packed.len();
+    if m == 320 {
+        fused_real_inverse_start(packed, z, twiddles);
+        return;
+    }
     z[0] = Complex32 { re: packed[0].re + packed[0].im, im: packed[0].re - packed[0].im };
     for k in 1..m {
         let a = packed[k];
@@ -1348,6 +1453,157 @@ fn real_inverse_start(packed: &[Complex32], z: &mut [Complex32], twiddles: &[Com
         let t = twiddles[k].conj().mul_separate(diff);
         z[k] = Complex32 { re: sum.re - t.im, im: sum.im + t.re };
     }
+}
+
+fn fused_real_root(k: usize) -> Complex32 {
+    if k == 0 {
+        return Complex32 { re: 1.0, im: -0.0 };
+    }
+    let minor = k.min(320 - k);
+    // The packed-real wrapper builds its roots from a Float32 phase. Using
+    // the public libm functions retains that derivation without a table.
+    let angle = (core::f32::consts::PI as f64 * minor as f64 / 320.0) as f32;
+    let cosine = libm::cosf(angle);
+    let sine = libm::sin(angle as f64) as f32;
+    Complex32 { re: if k <= 160 { cosine } else { -cosine }, im: -sine }
+}
+
+fn fused_real_forward_finish(z: &[Complex32], packed: &mut [Complex32], twiddles: &[Complex32]) {
+    packed[0] = Complex32 { re: 2.0 * (z[0].re + z[0].im), im: 2.0 * (z[0].re - z[0].im) };
+
+    for k in (1..=128).chain(192..320) {
+        let a = z[k];
+        let b = z[320 - k];
+        let sum_re = a.re + b.re;
+        let sum_im = a.im - b.im;
+        let diff_re = a.re - b.re;
+        let diff_im = a.im + b.im;
+        let root = twiddles[k];
+        packed[k] = Complex32 {
+            re: libm::fmaf(root.re, diff_im, libm::fmaf(root.im, diff_re, sum_re)),
+            im: libm::fmaf(-root.re, diff_re, libm::fmaf(root.im, diff_im, sum_im)),
+        };
+    }
+
+    for k in 129..160 {
+        let a = z[k];
+        let b = z[320 - k];
+        let cosine = twiddles[k].re;
+        let sine = -twiddles[k].im;
+
+        let mut low_re = a.re;
+        low_re = libm::fmaf(a.im, cosine, low_re);
+        low_re = libm::fmaf(-a.re, sine, low_re);
+        low_re += b.re;
+        low_re = libm::fmaf(b.im, cosine, low_re);
+        low_re = libm::fmaf(b.re, sine, low_re);
+        let mut low_im = a.im;
+        low_im = libm::fmaf(-a.re, cosine, low_im);
+        low_im = libm::fmaf(-a.im, sine, low_im);
+        low_im -= b.im;
+        low_im = libm::fmaf(b.re, cosine, low_im);
+        low_im = libm::fmaf(-b.im, sine, low_im);
+        packed[k] = Complex32 { re: low_re, im: low_im };
+
+        let mut high_re = a.re;
+        high_re = libm::fmaf(-a.im, cosine, high_re);
+        high_re = libm::fmaf(a.re, sine, high_re);
+        high_re += b.re;
+        high_re = libm::fmaf(-b.im, cosine, high_re);
+        high_re = libm::fmaf(-b.re, sine, high_re);
+        let mut high_im = -a.im;
+        high_im = libm::fmaf(-a.re, cosine, high_im);
+        high_im = libm::fmaf(-a.im, sine, high_im);
+        high_im += b.im;
+        high_im = libm::fmaf(b.re, cosine, high_im);
+        high_im = libm::fmaf(-b.im, sine, high_im);
+        packed[320 - k] = Complex32 { re: high_re, im: high_im };
+    }
+
+    let a = z[160];
+    let cosine = twiddles[160].re;
+    let sine = -twiddles[160].im;
+    let mut re = a.re;
+    re = libm::fmaf(-a.im, cosine, re);
+    re = libm::fmaf(a.re, sine, re);
+    re += a.re;
+    re = libm::fmaf(-a.re, sine, re);
+    let mut im = a.im;
+    im = libm::fmaf(-a.re, cosine, im);
+    im = libm::fmaf(-a.im, sine, im);
+    im -= a.im;
+    im = libm::fmaf(a.re, cosine, im);
+    im = libm::fmaf(-a.im, sine, im);
+    packed[160] = Complex32 { re, im };
+}
+
+fn fused_real_inverse_start(packed: &[Complex32], z: &mut [Complex32], twiddles: &[Complex32]) {
+    z[0] = Complex32 { re: packed[0].re + packed[0].im, im: packed[0].re - packed[0].im };
+
+    for k in (1..=128).chain(192..320) {
+        let a = packed[k];
+        let b = packed[320 - k];
+        let sum_re = a.re + b.re;
+        let sum_im = a.im - b.im;
+        let diff_re = a.re - b.re;
+        let diff_im = a.im + b.im;
+        let root = twiddles[k];
+        let sine = -root.im;
+        z[k] = Complex32 {
+            re: libm::fmaf(-root.re, diff_im, libm::fmaf(-sine, diff_re, sum_re)),
+            im: libm::fmaf(root.re, diff_re, libm::fmaf(-sine, diff_im, sum_im)),
+        };
+    }
+
+    for k in 129..160 {
+        let a = packed[k];
+        let b = packed[320 - k];
+        let cosine = twiddles[k].re;
+        let sine = -twiddles[k].im;
+
+        let mut low_re = a.re;
+        low_re = libm::fmaf(-a.im, cosine, low_re);
+        low_re = libm::fmaf(-a.re, sine, low_re);
+        low_re += b.re;
+        low_re = libm::fmaf(-b.im, cosine, low_re);
+        low_re = libm::fmaf(b.re, sine, low_re);
+        let mut low_im = a.im;
+        low_im = libm::fmaf(a.re, cosine, low_im);
+        low_im = libm::fmaf(-a.im, sine, low_im);
+        low_im -= b.im;
+        low_im = libm::fmaf(-b.re, cosine, low_im);
+        low_im = libm::fmaf(-b.im, sine, low_im);
+        z[k] = Complex32 { re: low_re, im: low_im };
+
+        let mut high_re = a.re;
+        high_re = libm::fmaf(a.im, cosine, high_re);
+        high_re = libm::fmaf(a.re, sine, high_re);
+        high_re += b.re;
+        high_re = libm::fmaf(b.im, cosine, high_re);
+        high_re = libm::fmaf(-b.re, sine, high_re);
+        let mut high_im = -a.im;
+        high_im = libm::fmaf(a.re, cosine, high_im);
+        high_im = libm::fmaf(-a.im, sine, high_im);
+        high_im += b.im;
+        high_im = libm::fmaf(-b.re, cosine, high_im);
+        high_im = libm::fmaf(-b.im, sine, high_im);
+        z[320 - k] = Complex32 { re: high_re, im: high_im };
+    }
+
+    let a = packed[160];
+    let cosine = twiddles[160].re;
+    let sine = -twiddles[160].im;
+    let mut re = a.re;
+    re = libm::fmaf(a.re, sine, re);
+    re += a.re;
+    re = libm::fmaf(-a.re, sine, re);
+    let mut im = a.im;
+    im = libm::fmaf(a.re, cosine, im);
+    im = libm::fmaf(-a.im, sine, im);
+    im -= a.im;
+    im = libm::fmaf(-a.re, cosine, im);
+    im = libm::fmaf(-a.im, sine, im);
+    z[160] = Complex32 { re, im };
 }
 
 /// Direct-form-I biquad in f64 (the motion states are small and stiff).
