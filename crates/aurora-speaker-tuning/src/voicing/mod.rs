@@ -19,4 +19,5 @@
 pub mod buzz;
 pub mod cdelay;
 pub mod lowflow;
+pub mod mstk;
 pub mod xtc;
