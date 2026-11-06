@@ -72,9 +72,9 @@ impl Default for Band {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Params {
     pub crossover_hz: [f64; XOVERS],
-    /// The unit accepts continuous order controls.  Exact fourth-order
-    /// states use the measured phase-equalised Linkwitz-Riley path; other
-    /// values remain continuous here and are not discarded by encoding.
+    /// The unit accepts continuous order controls. Processing truncates each
+    /// value and rounds odd orders up to the next even Linkwitz-Riley order;
+    /// the original control is retained by encoding.
     pub crossover_order: [f64; XOVERS],
     pub input_gain_db: f64,
     pub output_gain_db: f64,
