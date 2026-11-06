@@ -2,17 +2,19 @@
 //! state.
 //!
 //! Carried: target loudness, maximum gain, upward and downward ranges, the
-//! downward ratio (when the state enables it), the compressor clamp,
-//! look-ahead, the expected loudness after a reset and the reset timeout. Everything the speaker strips leave switched off
+//! downward ratio (when the state enables it), the compressor clamp, the
+//! side-chain high-pass, look-ahead, the expected loudness after a reset and
+//! the reset timeout. Everything the speaker strips leave switched off
 //! (AGC, voice activity, environmental-noise adaptation, personalization,
 //! volume automation, the output ceiling, the side-chain low-pass, the
 //! shaping filter, other gain curves and weightings, adaptation hold) is
 //! refused when switched on, so a state this module cannot carry exactly
 //! never compiles.
 //!
-//! The side-chain high-pass (IDs 10 and 11) sets up the unit's input and
-//! output loudness meters only; the gain-control detector is the loudness
-//! weighting alone, so the high-pass is not part of the box.
+//! With the side-chain high-pass enabled (IDs 10 and 11), its Butterworth
+//! section takes the place of the loudness weighting's own high-pass
+//! section: the detector is the weighting's shelf, then the configured
+//! high-pass, not a third section in cascade.
 //!
 //! The system-volume parameter (ID 1, `svol`) is read only by volume
 //! automation; with automation off (the only mode carried) the unit's
@@ -22,6 +24,7 @@ use crate::error::{Diagnostics, Error, Result};
 use crate::fourcc::FourCc;
 use crate::tuning::Stage;
 use sgv2_core::voicing::norm::{Params, MAX_SECTIONS, NODES, NODE_LO_DB, NODE_STEP_DB};
+use std::f64::consts::PI;
 
 pub const LDNM: FourCc = FourCc::from_bytes(*b"ldnm");
 
@@ -35,6 +38,8 @@ const LOOKAHEAD_MS: u32 = 6;
 const METER_IN: u32 = 7;
 const METER_OUT: u32 = 8;
 const UP_RANGE: u32 = 9;
+const HP_ENABLE: u32 = 10;
+const HP_HZ: u32 = 11;
 const RESET_MODE: u32 = 12;
 const VERSION: u32 = 13;
 const AUTOMATION: u32 = 15;
@@ -87,6 +92,17 @@ pub fn node_gain(l: f64, target: f64, max_gain: f64, up: f64, down: f64, ratio: 
         g = g.min(max_gain - l);
     }
     g
+}
+
+/// Second-order Butterworth high-pass (bilinear, prewarped), in single
+/// precision like the weighting.
+fn highpass(f0: f64, fs: f64) -> [f64; 5] {
+    let w = 2.0 * PI * f0 / fs;
+    let (s, c) = w.sin_cos();
+    let alpha = s / (2.0 * std::f64::consts::FRAC_1_SQRT_2);
+    let a0 = 1.0 + alpha;
+    let f = |v: f64| f64::from(v as f32);
+    [f((1.0 + c) / (2.0 * a0)), f(-(1.0 + c) / a0), f((1.0 + c) / (2.0 * a0)), f(-2.0 * c / a0), f((1.0 - alpha) / a0)]
 }
 
 /// The loudness weighting of weighting mode 0: the two-section K weighting
@@ -203,7 +219,15 @@ pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option
     for (i, t) in table.iter_mut().enumerate() {
         *t = node_gain(NODE_LO_DB + NODE_STEP_DB * i as f64, target, max_gain, up, down, ratio, clamp);
     }
-    let sos = weighting(fs);
+    let mut sos = weighting(fs);
+    if req(HP_ENABLE)? != 0.0 {
+        let hz = req(HP_HZ)?;
+        if !(10.0..fs / 2.0).contains(&hz) {
+            return Err(bad(format!("{}: side-chain high-pass at {hz} Hz", stage.name)));
+        }
+        // replaces the weighting's high-pass section
+        sos[1] = highpass(hz, fs);
+    }
     if sos.len() > MAX_SECTIONS {
         return Err(bad("detector needs more sections than carried"));
     }
@@ -241,5 +265,15 @@ mod tests {
         assert!((g(0.0) - (-14.0)).abs() < 1e-12);
         let r = |l| node_gain(l, -20.0, 4.0, 8.0, 6.0, Some(4.0), false);
         assert!((r(-8.0) - (-9.0)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn highpass_is_minus_3_db_at_its_corner() {
+        let s = highpass(100.0, 48_000.0);
+        let w = 2.0 * PI * 100.0 / 48_000.0;
+        let (c1, s1, c2, s2) = (w.cos(), -w.sin(), (2.0 * w).cos(), -(2.0 * w).sin());
+        let num = ((s[0] + s[1] * c1 + s[2] * c2).powi(2) + (s[1] * s1 + s[2] * s2).powi(2)).sqrt();
+        let den = ((1.0 + s[3] * c1 + s[4] * c2).powi(2) + (s[3] * s1 + s[4] * s2).powi(2)).sqrt();
+        assert!((20.0 * (num / den).log10() + 3.0103).abs() < 0.01);
     }
 }
