@@ -15,7 +15,8 @@
 //! nothing). Graph-level parameters are taken at full system volume (graph
 //! `mvsc` = 1, `mvol` = 0 dB); a box whose saved state depends on another
 //! volume refuses rather than guesses, unless its runner takes the volume at
-//! run time (VarEQ: `Run::set_volume_scalar`).
+//! run time (VarEQ: `Run::set_volume_scalar` from `mvsc`; AULowFlow:
+//! `Run::set_volume(db)` from `mvol` on its parameter 4).
 
 pub mod buzz;
 pub mod cdelay;

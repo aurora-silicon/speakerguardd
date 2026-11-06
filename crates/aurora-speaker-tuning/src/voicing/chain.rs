@@ -135,7 +135,19 @@ fn compile_node(
                 Err(e) => uncarried(n, subtype, e, gaps),
             },
             "flow" => match super::lowflow::compile(stage, fs, diags) {
-                Ok(Some(p)) => Kind::Lowflow(Box::new(p)),
+                Ok(Some(p)) => {
+                    // An active lane runs the detector/state law, which is
+                    // proven never louder only in the conservative build.
+                    let active = p.models[..p.model_count].iter().any(|m| m.enabled && !m.mute);
+                    if active && !sgv2_core::voicing::lowflow::CONSERVATIVE {
+                        gaps.push((
+                            n.name.clone(),
+                            "AULowFlow active law not proven never louder; needs the lowflow-conservative build"
+                                .to_string(),
+                        ));
+                    }
+                    Kind::Lowflow(Box::new(p))
+                }
                 Ok(None) => Kind::Bypass,
                 Err(e) => uncarried(n, subtype, e, gaps),
             },

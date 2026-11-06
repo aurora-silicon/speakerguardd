@@ -390,6 +390,8 @@ mod tests {
             state: Some(ParamState { sections: vec![ParamSection { scope: 0, element: 0, params }] }),
             preset_extra_keys: vec!["DspLibXTC_customFilterDictionary".into()],
             preset_extra: extra,
+            strip_properties: Vec::new(),
+            property_files: Vec::new(),
             before_protection: true,
         }
     }

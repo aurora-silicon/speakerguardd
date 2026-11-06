@@ -438,6 +438,8 @@ impl Run {
             Run::Volt(r) if id == 4 => r.set_volume(v),
             // VarEQ's volume scalar; the box ignores a non-finite value
             Run::Vareq(r) if id == 5 => r.set_volume_scalar(v),
+            // AULowFlow's attenuation ceiling follows the system volume in dB
+            Run::Lowflow(r) if id == 4 => r.set_volume(v),
             _ => {}
         }
     }

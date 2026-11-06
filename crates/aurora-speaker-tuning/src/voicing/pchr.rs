@@ -76,6 +76,8 @@ mod tests {
             }),
             preset_extra_keys: Vec::new(),
             preset_extra: Default::default(),
+            strip_properties: Vec::new(),
+            property_files: Vec::new(),
             before_protection: true,
         }
     }
