@@ -50,6 +50,7 @@ pub mod strip;
 pub mod tuning;
 pub mod units;
 pub mod versions;
+pub mod voicing;
 
 pub use error::{Diagnostic, Diagnostics, Error, Result, Severity};
 pub use tuning::{Options, Tuning, UnitKind};
