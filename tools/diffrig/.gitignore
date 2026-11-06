@@ -2,3 +2,4 @@ macos/rig_host
 macos/au_discover
 macos/prefshim.dylib
 __pycache__/
+macos/box_host
