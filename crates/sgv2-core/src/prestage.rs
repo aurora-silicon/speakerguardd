@@ -39,12 +39,11 @@
 //! bands sum to an allpass); per band, the louder channel's power, held
 //! with an instant attack and the tuning's release; the tuning's
 //! downward curve (threshold, ratio, range, makeup) on that level; output
-//! `out_gain + trim` times the sum of the band gains times the bands of
-//! `in_gain` times the input. `trim` takes off the largest small-signal
-//! gain, so the dynamics never add drive at any level or frequency. Its
-//! detector is stricter than macOS's (instant attack, the band's peak power,
-//! a hard knee at or below macOS's soft one at high level): it never
-//! reduces less at full scale.
+//! `out_gain` times the sum of the band gains times the bands of `in_gain`
+//! times the input: the unit's own gain staging, makeup and output gain
+//! included, as macOS applies it. Its detector is stricter than macOS's
+//! (instant attack, the band's peak power, a hard knee at or below macOS's
+//! soft one at high level): it never reduces less at full scale.
 
 use crate::blob::{crc32, BlobError};
 use crate::MAX_CHANNELS;
@@ -111,26 +110,6 @@ impl Dynamics {
                     && finite(b.range_db, -60.0, 0.0)
                     && finite(b.makeup_db, -40.0, 40.0)
             })
-    }
-
-    /// The small-signal gain of band `b`, dB (`None`: muted).
-    fn rest_db(&self, b: usize) -> Option<f64> {
-        match self.band[b].mode {
-            BandMode::Compress => Some(self.band[b].makeup_db),
-            BandMode::Pass => Some(0.0),
-            BandMode::Mute => None,
-        }
-    }
-
-    /// The trim that keeps the dynamics at or below unity: minus the
-    /// largest small-signal gain through input, band and output gains.
-    pub fn trim_db(&self) -> f64 {
-        let top = (0..BANDS).filter_map(|b| self.rest_db(b)).fold(f64::NEG_INFINITY, f64::max);
-        if top.is_finite() {
-            -(self.input_gain_db + self.output_gain_db + top)
-        } else {
-            0.0
-        }
     }
 
     #[cfg(any(test, feature = "std"))]
@@ -431,7 +410,7 @@ impl DynRun {
         DynRun {
             tree: [lp0, lp0, hp0, hp0, ap1, ap2, lp1, lp1, hp1, hp1, ap2, lp2, lp2, hp2, hp2],
             in_gain: libm::pow(10.0, d.input_gain_db / 20.0),
-            out_scale: libm::pow(10.0, (d.output_gain_db + d.trim_db()) / 20.0),
+            out_scale: libm::pow(10.0, d.output_gain_db / 20.0),
             release: libm::exp(-1.0 / (d.release_s * fs)),
             band: d.band,
             env: [0.0; BANDS],
@@ -719,22 +698,30 @@ mod tests {
     }
 
     #[test]
-    fn dynamics_never_add_drive_and_reduce_at_full_scale() {
+    fn dynamics_carry_the_units_gain_and_reduce_at_full_scale() {
         let p = dyn_params();
         let n = 24_000;
-        // quiet: at or below unity at every frequency (bands sum in phase)
-        for f in [30.0, 100.0, 200.0, 400.0, 1500.0, 3000.0, 8000.0, 15_000.0] {
+        // quiet: the unit's own small-signal gain, input + output + the band's
+        // makeup (bands sum in phase), never more than the largest of them
+        let d = p.dynamics.unwrap();
+        let net = d.input_gain_db + d.output_gain_db;
+        for (f, band) in [(30.0, 0), (50.0, 0), (500.0, 1), (3500.0, 2), (16_000.0, 3)] {
             let y = run_dyn(&p, &tone(f, 1e-3, n));
             let g = level(&y, f) - 20.0 * libm::log10(1e-3);
-            assert!(g <= 0.01, "{f} Hz: {g} dB");
-            assert!(g > -3.0, "{f} Hz: {g} dB");
+            let want = net + d.band[band].makeup_db;
+            assert!((g - want).abs() < 0.1, "{f} Hz: {g} dB, want {want}");
+        }
+        let top = net + d.band.iter().map(|b| b.makeup_db).fold(f64::NEG_INFINITY, f64::max);
+        for f in [200.0, 1500.0, 8000.0] {
+            let y = run_dyn(&p, &tone(f, 1e-3, n));
+            let g = level(&y, f) - 20.0 * libm::log10(1e-3);
+            assert!(g <= top + 0.01 && g > net - 0.5, "{f} Hz: {g} dB");
         }
         // full scale in band 0: the hard-knee curve, from the band level
         let y = run_dyn(&p, &tone(80.0, 1.0, n));
-        let d = p.dynamics.unwrap();
         let lvl = d.input_gain_db; // band 0 carries the whole 80 Hz tone (to within 0.1 dB)
         let gr = ((1.0 / 4.0 - 1.0) * (lvl - (-30.0))).max(-20.0);
-        let want = d.input_gain_db + d.output_gain_db + d.trim_db() + 2.0 + gr;
+        let want = d.input_gain_db + d.output_gain_db + 2.0 + gr;
         // within 1 dB: the held power droops between the tone's peaks with
         // the release, so the mean reduction is a little under the curve's
         assert!((level(&y, 80.0) - want).abs() < 1.0, "{} vs {want}", level(&y, 80.0));
