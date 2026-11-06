@@ -116,8 +116,37 @@ fn compile_node(
                 Ok(k) => k,
                 Err(e) => uncarried(n, subtype, e, gaps),
             },
+            // the pre-stage dynamics are proven against macOS on the spp3 states
+            // (t-4752); the full box module covers the rest, conformance pending
             "mstk" => match crate::prestage::compressor(stage) {
                 Ok(Some(d)) => Kind::Comp(d),
+                Ok(None) => Kind::Bypass,
+                Err(e0) => match super::mstk::compile(stage, fs, diags) {
+                    Ok(Some(p)) => {
+                        gaps.push((n.name.clone(), format!("mstk box module (rig conformance pending): {e0}")));
+                        Kind::Mstk(Box::new(p))
+                    }
+                    Ok(None) => Kind::Bypass,
+                    Err(e) => uncarried(n, subtype, e, gaps),
+                },
+            },
+            "cfrk" => match super::cfreak::compile(stage, fs, diags) {
+                Ok(Some(p)) => Kind::Cfreak(Box::new(p)),
+                Ok(None) => Kind::Bypass,
+                Err(e) => uncarried(n, subtype, e, gaps),
+            },
+            "buzk" => match super::buzz::compile(stage, fs, diags) {
+                Ok(Some(p)) => Kind::Buzz(Box::new(p)),
+                Ok(None) => Kind::Bypass,
+                Err(e) => uncarried(n, subtype, e, gaps),
+            },
+            "cdly" => match super::cdelay::compile(stage, fs, diags) {
+                Ok(Some(p)) => Kind::Cdelay(Box::new(p)),
+                Ok(None) => Kind::Bypass,
+                Err(e) => uncarried(n, subtype, e, gaps),
+            },
+            "flow" => match super::lowflow::compile(stage, fs, diags) {
+                Ok(Some(p)) => Kind::Lowflow(Box::new(p)),
                 Ok(None) => Kind::Bypass,
                 Err(e) => uncarried(n, subtype, e, gaps),
             },

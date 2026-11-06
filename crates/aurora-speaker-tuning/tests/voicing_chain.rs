@@ -14,9 +14,10 @@ use aurora_speaker_tuning::Diagnostics;
 use common::*;
 use sgv2_core::voicing::chain::{Chain, Kind, Source};
 
-fn tuning() -> Tuning {
+fn tuning(tag: &str) -> Tuning {
     let files = spp3_files(4);
-    let dir = scratch("voicing-chain");
+    // one directory per test: the tests run in parallel in one process
+    let dir = scratch(&format!("voicing-chain-{tag}"));
     write_dir(&dir, &files, &manifest_json(&files, "25G83"));
     let b = Bundle::open(&dir).unwrap();
     let mut d = Diagnostics::default();
@@ -25,7 +26,7 @@ fn tuning() -> Tuning {
 
 #[test]
 fn plan_traces_the_fanout() {
-    let t = tuning();
+    let t = tuning("t1");
     let p = topology::plan(&t).unwrap();
     assert_eq!(p.program_channels, 2);
     let names: Vec<&str> = p.nodes.iter().map(|n| n.name.as_str()).collect();
@@ -40,7 +41,7 @@ fn plan_traces_the_fanout() {
 
 #[test]
 fn compile_stubs_unknown_boxes_and_runs() {
-    let t = tuning();
+    let t = tuning("t2");
     let mut d = Diagnostics::default();
     let c = chain::compile(&t, 48_000.0, &mut d).unwrap();
     assert_eq!(c.stubs, [("Eq".to_string(), "tst1".to_string())]);

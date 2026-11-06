@@ -85,6 +85,16 @@ pub enum Kind {
     Comp(Dynamics),
     /// Crosstalk cancellation (`axtc`).
     Xtc(alloc::boxed::Box<super::xtc::Params>),
+    /// Linked group peak limiter (`cfrk`).
+    Cfreak(alloc::boxed::Box<super::cfreak::Params>),
+    /// Multiband compressor, full (`mstk` box module), for states the pre-stage dynamics refuse.
+    Mstk(alloc::boxed::Box<super::mstk::Params>),
+    /// Buzz (`buzk`), exact subset.
+    Buzz(alloc::boxed::Box<super::buzz::Params>),
+    /// Channel delay (`cdly`).
+    Cdelay(alloc::boxed::Box<super::cdelay::Params>),
+    /// AULowFlow (`flow`), exact subset.
+    Lowflow(alloc::boxed::Box<super::lowflow::Params>),
     /// The box's four-character subtype.
     Stub([u8; 4]),
     Bypass,
@@ -160,6 +170,11 @@ enum Run {
     Filters(PreStage),
     Comp(PreStage),
     Xtc(alloc::boxed::Box<super::xtc::Run>),
+    Cfreak(alloc::boxed::Box<super::cfreak::Run>),
+    Mstk(alloc::boxed::Box<super::mstk::Run>),
+    Buzz(alloc::boxed::Box<super::buzz::Run>),
+    Cdelay(alloc::boxed::Box<super::cdelay::Run>),
+    Lowflow(alloc::boxed::Box<super::lowflow::Run>),
     Through,
 }
 
@@ -180,6 +195,11 @@ impl Run {
                 Run::Comp(PreStage::with_rate(p, fs))
             }
             Kind::Xtc(p) => Run::Xtc(alloc::boxed::Box::new(super::xtc::Run::new(p, fs, width))),
+            Kind::Cfreak(p) => Run::Cfreak(alloc::boxed::Box::new(super::cfreak::Run::new(p, fs, width))),
+            Kind::Mstk(p) => Run::Mstk(alloc::boxed::Box::new(super::mstk::Run::new(p, fs, width))),
+            Kind::Buzz(p) => Run::Buzz(alloc::boxed::Box::new(super::buzz::Run::new(p, fs, width))),
+            Kind::Cdelay(p) => Run::Cdelay(alloc::boxed::Box::new(super::cdelay::Run::new(p, fs, width))),
+            Kind::Lowflow(p) => Run::Lowflow(alloc::boxed::Box::new(super::lowflow::Run::new(p, fs, width))),
             Kind::Stub(_) | Kind::Bypass => Run::Through,
         }
     }
@@ -200,6 +220,11 @@ impl Run {
         match self {
             Run::Filters(p) | Run::Comp(p) => p.reset(),
             Run::Xtc(r) => r.reset(),
+            Run::Cfreak(r) => r.reset(),
+            Run::Mstk(r) => r.reset(),
+            Run::Buzz(r) => r.reset(),
+            Run::Cdelay(r) => r.reset(),
+            Run::Lowflow(r) => r.reset(),
             _ => {}
         }
     }
@@ -236,14 +261,23 @@ impl Run {
                 let w = x.len().min(MAX_CHANNELS);
                 p.process_dynamics(&mut refs[..w], frames);
             }
-            Run::Xtc(r) => {
+            Run::Xtc(_) | Run::Cfreak(_) | Run::Mstk(_) | Run::Buzz(_) | Run::Cdelay(_) | Run::Lowflow(_) => {
                 for (i, o) in x.iter().zip(y.iter_mut()) {
                     o[..frames].copy_from_slice(&i[..frames]);
                 }
                 let mut it = y.iter_mut();
                 let mut refs: [&mut [f32]; MAX_CHANNELS] =
                     core::array::from_fn(|_| it.next().map(|v| &mut v[..frames]).unwrap_or(&mut []));
-                r.process(&mut refs[..x.len().min(MAX_CHANNELS)], frames);
+                let refs = &mut refs[..x.len().min(MAX_CHANNELS)];
+                match self {
+                    Run::Xtc(r) => r.process(refs, frames),
+                    Run::Cfreak(r) => r.process(refs, frames),
+                    Run::Mstk(r) => r.process(refs, frames),
+                    Run::Buzz(r) => r.process(refs, frames),
+                    Run::Cdelay(r) => r.process(refs, frames),
+                    Run::Lowflow(r) => r.process(refs, frames),
+                    _ => {}
+                }
             }
             Run::Through => {
                 for (i, o) in x.iter().zip(y.iter_mut()) {
