@@ -2965,7 +2965,7 @@ mod fault_tests {
         assert_eq!(p.lookahead_frames(), 32);
         assert_eq!(p.latency_frames(), 320);
         assert_eq!(p.unit_latency_frames(), 576);
-        assert!(Run::new(&p).is_ok());
+        assert!(Unit::init_error(&p).is_none());
     }
 
     #[test]
@@ -2979,7 +2979,7 @@ mod fault_tests {
         assert_eq!(p.lookahead_frames(), 64);
         assert_eq!(p.latency_frames(), 640);
         assert_eq!(p.unit_latency_frames(), 1152);
-        assert!(Run::new(&p).is_ok());
+        assert!(Unit::init_error(&p).is_none());
     }
 
     #[test]
@@ -2991,7 +2991,7 @@ mod fault_tests {
         p.sample_rate = 32_000;
         assert_eq!(controller_frames(p.sample_rate), 192);
         assert_eq!((p.filterbank_frames(), p.lookahead_frames(), p.latency_frames()), (96, 24, 216));
-        assert!(Run::new(&p).is_ok());
+        assert!(Unit::init_error(&p).is_none());
 
         p.sample_rate = 176_400;
         assert_eq!(controller_frames(p.sample_rate), 512);
