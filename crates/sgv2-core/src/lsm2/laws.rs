@@ -192,7 +192,7 @@ pub fn velocity_band_gains(
         return g;
     }
     let is_active = |k: usize| k >= active.0 && k < active.1;
-    for _ in 0..64 {
+    loop {
         let (mut idx, mut worst) = (first, 0.0f32);
         for i in first..n {
             let mut y = if resid.is_empty() { 0.0f32 } else { resid[i] };
@@ -277,7 +277,7 @@ pub fn velocity_band_gains_window(
         return g;
     }
     let is_active = |k: usize| k >= active.0 && k < active.1;
-    for _ in 0..64 {
+    loop {
         let (mut idx, mut worst) = (first, 0.0f32);
         for i in first..n {
             let mut y = if resid.is_empty() { 0.0 } else { resid[i] };
