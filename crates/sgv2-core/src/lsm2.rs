@@ -589,6 +589,12 @@ impl Params {
         if self.output_offset_frames() >= ctl {
             return Err(InitError::Invalid("look-ahead region against the controller cadence"));
         }
+        // review of #31, finding 8: the controller decides once per frame
+        // over the samples still in the delay line, so a latency shorter
+        // than one controller frame lets a transient leave undecided
+        if self.latency_frames() < ctl {
+            return Err(InitError::Invalid("latency below the controller cadence"));
+        }
         for j in 0..4 {
             if !(pos(self.power_time_scale_s[j])
                 && pos(self.power_hard_limit_w[j])
