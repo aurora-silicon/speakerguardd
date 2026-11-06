@@ -22,9 +22,10 @@
 //!   unity. The reference resets on reinitialisation (spec 5); a speaker
 //!   does not cool because a stream restarted, so here it never does.
 //!
-//! The program is held to digital full scale (`clamp(x, -1, 1)`, a
-//! non-finite sample 0) before the gain and before both power meters, so
-//! no finite sample can overflow them. A model state that goes non-finite
+//! The output is the program held to digital full scale (`clamp(x, -1,
+//! 1)`, a non-finite sample 0) times the gain. Both power meters see the
+//! program unclamped as the reference meters it, bounded only at
+//! `dsp::METER_FS` (16 FS) so no finite sample can overflow them. A model state that goes non-finite
 //! latches the 20 dB fail-safe (`Health::MODEL_FAULT`) until reset.
 //!
 //! A tuning with the global `Bypass` set is refused (the unit then runs the
@@ -48,7 +49,7 @@ use crate::{
 const EPS: f64 = f32::MIN_POSITIVE as f64;
 /// Longest update in host-block mode (`block_frames = 0`), frames.
 const HOST_MAX: usize = 4096;
-/// Stack chunk for bounding the unprotected drive before metering.
+/// Stack chunk for the metered drive.
 const BOUND_CHUNK: usize = 64;
 
 /// One speaker-type slot (A, B or C).
@@ -167,12 +168,18 @@ struct Chan {
     p_model: f64,
     g_target: f64,
     hard: bool,
+    /// A non-finite program sample in the current block.
+    meter_failed: bool,
 }
 
 struct Group {
     r_attack: f32,
     r_release: f32,
+    /// Smoother state: the gain of the last frame generated.
     gain: f32,
+    /// The current block's target and pole (set at the block end before).
+    target: f32,
+    r: f32,
     hard: bool,
 }
 
@@ -183,7 +190,8 @@ struct Run {
     rate: f64,
     ch: Vec<Chan>,
     groups: Vec<Group>,
-    /// Gain of every frame of the current block, per group.
+    /// Gain of the current segment's frames, per group, generated as the
+    /// frames are processed (never a whole host-block-mode capacity ahead).
     curve: Vec<f32>,
     pos: usize,
     frame: u64,
@@ -240,6 +248,8 @@ impl Run {
                     r_attack: pole(rate, s.attack_ms as f64 * 1e-3),
                     r_release: pole(rate, s.release_ms as f64 * 1e-3),
                     gain: 1.0,
+                    target: 1.0,
+                    r: 0.0,
                     hard: false,
                 });
                 groups.len() - 1
@@ -280,6 +290,7 @@ impl Run {
                     p_model: 0.0,
                     g_target: 1.0,
                     hard: false,
+                    meter_failed: false,
                 });
             }
         }
@@ -298,12 +309,14 @@ impl Run {
             c.p_model = 0.0;
             c.g_target = 1.0;
             c.hard = false;
+            c.meter_failed = false;
         }
         for g in self.groups.iter_mut() {
             g.gain = 1.0;
+            g.target = 1.0;
+            g.r = 0.0;
             g.hard = false;
         }
-        self.curve.iter_mut().for_each(|g| *g = 1.0);
         self.pos = 0;
         self.frame = 0;
         self.last_frame = 0;
@@ -315,28 +328,62 @@ impl Run {
     fn segment(&mut self, io: &mut Io<'_, '_>, off: usize, len: usize) -> bool {
         let phase = self.pos;
         let mut failed = false;
+        // per group: the smoother toward this block's target, frame by frame
+        for (gi, g) in self.groups.iter_mut().enumerate() {
+            let curve = &mut self.curve[gi * self.block..][..len];
+            let (t, r) = (g.target, g.r);
+            let mut v = g.gain;
+            for c in curve.iter_mut() {
+                v = t + r * (v - t);
+                *c = v;
+            }
+            g.gain = v;
+            if g.hard {
+                curve.iter_mut().for_each(|c| *c *= FAILSAFE_GAIN);
+            }
+        }
         for (c, ch) in self.ch.iter_mut().enumerate() {
             let inp = &io.input[c][off..off + len];
             let out = &mut io.output[c][off..off + len];
-            let curve = &self.curve[ch.group * self.block + phase..][..len];
-            // the unprotected drive, held to full scale
+            let curve = &self.curve[ch.group * self.block..][..len];
+            // the unprotected and the protected drive as the meters see them
             let mut k = 0;
             while k < len {
                 let m = (len - k).min(BOUND_CHUNK);
                 let mut x = [0.0f32; BOUND_CHUNK];
                 x[..m].copy_from_slice(&inp[k..k + m]);
-                dsp::bound(&mut x[..m]);
+                dsp::meter(&mut x[..m]);
                 ch.acc_in.add_sq(&x[..m], phase + k);
                 k += m;
             }
-            if dsp::mul_bounded_to(inp, curve, out) {
-                for ((o, &x), &g) in out.iter_mut().zip(inp).zip(curve) {
+            // meter failure: at most the fail-safe gain from the first
+            // non-finite sample to the end of its block, whatever the host
+            // slicing
+            let bad = dsp::mul_bounded_to(inp, curve, out) || ch.meter_failed;
+            let from = if ch.meter_failed { 0 } else { inp.iter().position(|x| !x.is_finite()).unwrap_or(len) };
+            if bad {
+                ch.meter_failed = true;
+                for ((o, &x), &g) in out[from..].iter_mut().zip(&inp[from..]).zip(&curve[from..]) {
                     *o = dsp::bound1(x) * g.min(FAILSAFE_GAIN);
                 }
                 failed = true;
             }
             // P covers the protected drive x[n]
-            ch.acc.add_sq(out, phase);
+            let mut k = 0;
+            while k < len {
+                let m = (len - k).min(BOUND_CHUNK);
+                let mut d = [0.0f32; BOUND_CHUNK];
+                dsp::mul_metered_to(&inp[k..k + m], &curve[k..k + m], &mut d[..m]);
+                if bad {
+                    for (j, dv) in d[..m].iter_mut().enumerate() {
+                        if k + j >= from {
+                            *dv = dsp::meter1(inp[k + j]) * curve[k + j].min(FAILSAFE_GAIN);
+                        }
+                    }
+                }
+                ch.acc.add_sq(&d[..m], phase + k);
+                k += m;
+            }
         }
         self.frame += len as u64;
         failed
@@ -354,6 +401,7 @@ impl Run {
         let mut tgt = [1.0f64; MAX_CHANNELS];
         let mut hard = [false; MAX_CHANNELS];
         for c in self.ch.iter_mut() {
+            c.meter_failed = false;
             let p = c.elec * c.acc.total() / blk;
             c.acc.clear();
             c.p_model = p;
@@ -380,23 +428,12 @@ impl Run {
         }
         for (gi, g) in self.groups.iter_mut().enumerate() {
             let t = tgt[gi] as f32;
-            let r = if t < g.gain { g.r_attack } else { g.r_release };
-            let curve = &mut self.curve[gi * self.block..][..self.block];
-            // (in host-block mode the next call reads this curve from its
-            // first frame, so the full capacity is filled)
-            let mut v = g.gain;
-            for c in curve.iter_mut() {
-                v = t + r * (v - t);
-                *c = v;
-            }
-            g.gain = v;
-            if !v.is_finite() {
+            g.r = if t < g.gain { g.r_attack } else { g.r_release };
+            g.target = t;
+            if !(g.gain.is_finite() && t.is_finite()) {
                 self.fault = true;
             }
             g.hard = hard[gi];
-            if g.hard {
-                curve.iter_mut().for_each(|c| *c *= FAILSAFE_GAIN);
-            }
         }
         self.last_frame = self.frame - self.pos as u64;
     }
@@ -517,12 +554,12 @@ impl ProtectionUnit for Unit {
             g[c.group] = g[c.group].min(state.gain[i]);
             hard[c.group] |= c.hard;
         }
-        // the first block's curve holds the restored gain (and the panic)
+        // the first block holds the restored gain (and the panic)
         for (gi, grp) in run.groups.iter_mut().enumerate() {
             grp.gain = release_toward_unity(g[gi], grp.r_release as f64, t * rate as f64) as f32;
+            grp.target = grp.gain;
+            grp.r = 0.0;
             grp.hard = hard[gi];
-            let v = if grp.hard { grp.gain * FAILSAFE_GAIN } else { grp.gain };
-            run.curve[gi * run.block..][..run.block].iter_mut().for_each(|c| *c = v);
         }
         true
     }
