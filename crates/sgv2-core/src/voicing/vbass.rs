@@ -1,28 +1,35 @@
 //! Virtual bass (`aufx/vben`): a mid/side bass box.
 //!
-//! Behaviour (clean-room, from the box's observed input/output only):
+//! Behaviour (clean-room, from the box's behaviour specification):
 //!
 //! ```text
 //!  per channel c:  hp_c  = AP_u(AP_l(HP(x_c)))
 //!  mid M = (L+R)/2: lo    = LP(M)
-//!                   low   = blend * AP_u(AP_l(lo))
-//!                   harm  = gain  * BP(nld(drive(lo)))
-//!  y_c = out_gain * (hp_c + low + harm), one frame late
+//!                   low   = s_b * blend * AP_u(AP_l(lo))
+//!                   harm  = s_h * gain * LP_u(LC(nld, HP_l, lo))
+//!                   mid   = SUB(delay(low + harm))
+//!  y_c = out_gain * (hp_c + mid), `latency` frames late
 //! ```
 //!
-//! - `HP`/`LP` are a Linkwitz-Riley pair at the crossover `fc` (each a
-//!   Butterworth of half the order, squared). `AP_u` and `AP_l` are the
-//!   all-pass sections of the upper (`fu`) and lower (`fc`) band edges of
-//!   the harmonic band, so every path has the same phase as the high pass.
-//! - `BP` is the harmonic band: Linkwitz-Riley high pass at `fc` (lower
-//!   order) times Linkwitz-Riley low pass at `fu` (upper order).
-//! - `nld` is the memoryless odd device of the saved type; `drive` is the
-//!   level control (unity when the level control is off).
+//! - `HP`/`LP` are a Linkwitz-Riley pair at the crossover `fc`; `AP_u` and
+//!   `AP_l` are the all-pass sections of the harmonic band's upper (`fu`)
+//!   and lower (`fc`) edges; `HP_l`/`LP_u` are that band's Linkwitz-Riley
+//!   edges. Order parameters round to the nearest integer, then up to even.
+//! - `s_b` inverts the blend for an odd-order crossover; `s_h` inverts the
+//!   harmonics when the crossover and the lower band edge have Butterworth
+//!   orders of the same parity.
+//! - `nld` is the odd saturating device of the saved type. `LC` is the
+//!   level control: off, it is `HP_l(nld(lo))`; on, the device input is
+//!   normalised by a peak follower and its band-limited output rescaled by
+//!   a second one (see [`law`]).
+//! - `SUB` band-limits the mid branches (a low pass designed at a quarter
+//!   of the rate); each odd-order band-edge all-pass adds one frame of
+//!   output latency and a further branch delay.
 //! - The side signal only ever takes the high-pass path: stereo width is
 //!   untouched, and the bass is folded to the mid.
 //!
 //! No tuning value lives here: corners, orders and gains come in [`Params`]
-//! from the Mac's own saved state.
+//! from the Mac's own saved state; [`law`] holds the box's own constants.
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -217,7 +224,7 @@ impl Device {
 }
 
 /// The box's own laws: the same on every Mac, never from a tuning.
-mod law {
+pub mod law {
     /// Type 3 device: `-AMP * tanh(SLOPE * u)`.
     pub const DEVICE3_AMP: f64 = 3.8;
     pub const DEVICE3_SLOPE: f64 = 0.8;
@@ -689,5 +696,44 @@ mod tests {
         let mut rr = [f32::INFINITY; 64];
         r.process(&mut [&mut l, &mut rr], 64);
         assert!(l.iter().chain(rr.iter()).all(|v| *v == 0.0));
+    }
+
+    #[test]
+    fn level_control_normalises_and_tracks_the_input() {
+        // Steady 40 Hz on the mid: the harmonic output follows the input
+        // level 1:1 above the follower floor (same harmonic structure at
+        // -20 and -10 dBFS), and stays finite and bounded.
+        let level = |a: f64| {
+            let mut p = params(true);
+            p.blend_gain = 0.0;
+            let mut r = Run::new(&p, 48_000.0, 2);
+            let n = 4 * 48_000;
+            let mut l = tone(40.0, a, n);
+            let mut rr = l.clone();
+            r.process(&mut [&mut l, &mut rr], n);
+            assert!(l.iter().all(|v| v.is_finite() && v.abs() < 4.0));
+            amp(&l[3 * 48_000..], 120.0)
+        };
+        let (lo, hi) = (level(0.1), level(0.316_227_766));
+        let step = 20.0 * libm::log10(hi / lo);
+        assert!((step - 10.0).abs() < 0.2, "{step}");
+    }
+
+    #[test]
+    fn level_control_holds_then_releases() {
+        let mut f = Follower::new(48_000.0);
+        for _ in 0..4_800 {
+            f.run(1.0);
+        }
+        let top = f.run(0.0);
+        // hold: no fall for most of the hold time
+        for _ in 0..20_000 {
+            f.run(0.0);
+        }
+        assert!(f.run(0.0) > 0.95 * top);
+        for _ in 0..96_000 {
+            f.run(0.0);
+        }
+        assert!(f.run(0.0) < 0.2 * top);
     }
 }
