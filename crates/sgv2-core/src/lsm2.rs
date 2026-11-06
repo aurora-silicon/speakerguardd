@@ -2744,7 +2744,7 @@ mod fault_tests {
         assert_eq!(p.filterbank_frames(), 288);
         assert_eq!(p.lookahead_frames(), 64);
         assert_eq!(p.latency_frames(), 640);
-        assert_eq!(p.unit_latency_frames(), 640);
+        assert_eq!(p.unit_latency_frames(), 1152);
         assert!(Run::new(&p).is_ok());
     }
 
