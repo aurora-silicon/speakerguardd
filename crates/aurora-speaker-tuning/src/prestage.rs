@@ -51,6 +51,19 @@
 //! expanding branches, saturation, solo, per-band input gain, another
 //! crossover order, release switched off) refuses the compile.
 //!
+//! A pair of channel-matrix boxes (`aufx/pchr`) on the unit's two lanes
+//! with filter boxes between them is a mid/side section: the first box
+//! takes the pair into its mid/side domain, the filter boxes between run on
+//! mid (box channel 0) and side (box channel 1), the second box takes it
+//! back. The lane trace keeps lane positions through a matrix box, so these
+//! filters are not per lane; they are carried as the pre-stage's mid/side
+//! block ([`mid_side`]), run after the dynamics as the graph runs them. A
+//! matrix box's saved state is its four coefficients (0-3), row-major; its
+//! layout is only settled for symmetric matrices, and anything else (a
+//! single matrix box, three, a non-filter box between the pair, filters or
+//! the compressor after it) refuses the compile. The section is scaled so
+//! neither output's worst case exceeds unity.
+//!
 //! The channel's whole response is then scaled so it never exceeds unity
 //! at any frequency (stricter than macOS only where the tuning boosts): the
 //! pre-stage never adds drive, and its output stays inside the converter's
@@ -59,7 +72,9 @@
 use crate::error::{Diagnostics, Error, Result};
 use crate::fourcc::FourCc;
 use crate::tuning::{Stage, Tuning};
-use sgv2_core::prestage::{Band, BandMode, Channel, Dynamics, Params, Section, BANDS, FLAG_FROM_TUNING, MAX_SECTIONS};
+use sgv2_core::prestage::{
+    Band, BandMode, Channel, Dynamics, MidSide, Params, Section, BANDS, FLAG_FROM_TUNING, FLAG_MID_SIDE, MAX_SECTIONS,
+};
 use sgv2_core::MAX_CHANNELS;
 use std::f64::consts::PI;
 
@@ -67,6 +82,8 @@ use std::f64::consts::PI;
 pub const TMST: FourCc = FourCc::from_bytes(*b"tmst");
 /// The multiband compressor unit's subtype.
 pub const MSTK: FourCc = FourCc::from_bytes(*b"mstk");
+/// The channel-matrix unit's subtype.
+pub const PCHR: FourCc = FourCc::from_bytes(*b"pchr");
 pub const SLOTS: u32 = 50;
 const SLOT_BASE: u32 = 14;
 const SLOT_STRIDE: u32 = 10;
@@ -368,6 +385,129 @@ pub fn dynamics(chain: &[Stage], lanes: &[crate::dspg::analysis::Lane]) -> Resul
     }))
 }
 
+fn subtype(s: &Stage) -> Option<FourCc> {
+    s.unit.map(|u| u.subtype)
+}
+
+fn is_matrix(chain: &[Stage], node: &str) -> bool {
+    chain.iter().any(|s| s.name == node && s.before_protection && subtype(s) == Some(PCHR))
+}
+
+/// A matrix box's 2x2 matrix, row-major. A bypassed box is the identity.
+fn matrix(stage: &Stage) -> Result<[f64; 4]> {
+    let ctx = format!("matrix box {}", stage.name);
+    if stage.bypass {
+        return Ok([1.0, 0.0, 0.0, 1.0]);
+    }
+    if let Some(c) = stage.channels.filter(|c| *c != 2) {
+        return Err(bad(format!("{ctx}: {c} channels; only a two-channel matrix is carried")));
+    }
+    let g = stage
+        .state
+        .as_ref()
+        .and_then(|s| s.global())
+        .ok_or_else(|| bad(format!("{ctx}: the strip gives it no saved state")))?;
+    let mut m = [0.0; 4];
+    for (id, v) in m.iter_mut().enumerate() {
+        *v = g
+            .get(id as u32)
+            .map(f64::from)
+            .filter(|v| v.is_finite() && v.abs() <= 16.0)
+            .ok_or_else(|| bad(format!("{ctx}: coefficient {id} is missing or out of range")))?;
+    }
+    if m[1] != m[2] {
+        return Err(bad(format!("{ctx}: an asymmetric matrix; its coefficient layout is not settled")));
+    }
+    Ok(m)
+}
+
+/// The mid/side section on the unit's lanes, if there is one (see the
+/// module notes). Refuses what [`MidSide`] cannot carry exactly.
+pub fn mid_side(
+    chain: &[Stage],
+    lanes: &[crate::dspg::analysis::Lane],
+    fs: f64,
+    diags: &mut Diagnostics,
+) -> Result<Option<MidSide>> {
+    use crate::dspg::analysis::Lane;
+    let stage = |name: &str| chain.iter().find(|s| s.name == name && s.before_protection);
+    let at = |l: &Lane| -> Vec<usize> {
+        l.through.iter().enumerate().filter(|(_, p)| is_matrix(chain, &p.node)).map(|(i, _)| i).collect()
+    };
+    if lanes.iter().all(|l| at(l).is_empty()) {
+        return Ok(None);
+    }
+    if lanes.len() != 2 {
+        return Err(bad(format!("a channel-matrix box on a unit with {} lanes; only two are carried", lanes.len())));
+    }
+    let (a, b) = (at(&lanes[0]), at(&lanes[1]));
+    if a.len() != 2 || b.len() != 2 {
+        return Err(bad("the unit's lanes do not both pass exactly one pair of channel-matrix boxes"));
+    }
+    let names = |l: &Lane, from: usize, to: usize| -> Vec<String> {
+        l.through[from..=to].iter().map(|p| p.node.clone()).collect()
+    };
+    if names(&lanes[0], a[0], a[1]) != names(&lanes[1], b[0], b[1]) {
+        return Err(bad("the unit's lanes pass different boxes inside the mid/side section"));
+    }
+    for (c, (l, (i, j))) in lanes.iter().zip([(a[0], a[1]), (b[0], b[1])]).enumerate() {
+        if l.through[i..=j].iter().any(|p| p.channel != c as u32) {
+            return Err(bad(format!("lane {c} changes position inside the mid/side section")));
+        }
+        // the pre-stage runs every lane filter and the compressor ahead of
+        // the section: one after it would run in the wrong place
+        for p in &l.through[j + 1..] {
+            if let Some(s) = stage(&p.node).filter(|s| matches!(subtype(s), Some(st) if st == TMST || st == MSTK)) {
+                return Err(bad(format!("{} follows the mid/side section; the pre-stage would run it ahead", s.name)));
+            }
+        }
+    }
+    let box_at = |i: usize| stage(&lanes[0].through[i].node).ok_or_else(|| bad("a matrix box is not in the chain"));
+    let mut ms = MidSide {
+        to: matrix(box_at(a[0])?)?,
+        from: matrix(box_at(a[1])?)?,
+        mid: Channel::IDENTITY,
+        side: Channel::IDENTITY,
+    };
+    for (k, out) in [&mut ms.mid, &mut ms.side].into_iter().enumerate() {
+        let (mut sections, mut gain_db, mut muted) = (Vec::new(), 0.0, false);
+        for p in &lanes[0].through[a[0] + 1..a[1]] {
+            let st = stage(&p.node).ok_or_else(|| bad(format!("{} is not in the chain", p.node)))?;
+            if subtype(st) != Some(TMST) {
+                return Err(bad(format!(
+                    "{} sits inside the mid/side section; only filter boxes are carried there",
+                    st.name
+                )));
+            }
+            let part = part(st, k as u32, fs, diags)?;
+            sections.extend(part.sections);
+            gain_db += part.gain_db;
+            muted |= part.muted;
+        }
+        if sections.len() > MAX_SECTIONS {
+            return Err(bad(format!("mid/side channel {k} needs {} filter sections", sections.len())));
+        }
+        out.count = sections.len();
+        out.sections[..sections.len()].copy_from_slice(&sections);
+        out.gain = if muted { 0.0 } else { 10f64.powf(gain_db / 20.0) };
+        if !out.gain.is_finite() {
+            return Err(bad(format!("mid/side channel {k}: gain {gain_db} dB")));
+        }
+    }
+    // Never more than unity on either output, for any pair of inputs.
+    let peak = ms.peak(fs);
+    if peak > 1.0 {
+        ms.mid.gain /= peak;
+        ms.side.gain /= peak;
+        diags.info(
+            "prestage-scaled",
+            "mid/side section",
+            format!("its worst case peaks at {:+.3} dB; scaled to 0 dB", 20.0 * peak.log10()),
+        );
+    }
+    Ok(Some(ms))
+}
+
 /// The pre-stage of every unit channel, from the filter boxes on its lane.
 pub fn derive(t: &Tuning, fs: f64, channels: usize, diags: &mut Diagnostics) -> Result<Params> {
     if channels == 0 || channels > MAX_CHANNELS {
@@ -382,10 +522,16 @@ pub fn derive(t: &Tuning, fs: f64, channels: usize, diags: &mut Diagnostics) -> 
     let mut out = Params::identity(channels);
     out.flags = FLAG_FROM_TUNING;
     out.dynamics = dynamics(&t.chain, &t.protection.lanes)?;
+    out.mid_side = mid_side(&t.chain, &t.protection.lanes, fs, diags)?;
+    if out.mid_side.is_some() {
+        out.flags |= FLAG_MID_SIDE;
+    }
     for (c, lane) in t.protection.lanes.iter().enumerate() {
         let mut sections = Vec::new();
         let (mut gain_db, mut muted) = (0.0, false);
-        for pass in &lane.through {
+        // filters inside the mid/side section belong to it, not to the lane
+        let ms_start = lane.through.iter().position(|p| is_matrix(&t.chain, &p.node));
+        for pass in &lane.through[..ms_start.unwrap_or(lane.through.len())] {
             let Some(stage) = t.chain.iter().find(|s| s.name == pass.node) else {
                 return Err(bad(format!("lane {c} passes {}, which is not in the chain", pass.node)));
             };
@@ -495,6 +641,95 @@ mod tests {
         }
         st.state = Some(ParamState { sections: vec![ParamSection { scope: 0, element: 0, params }] });
         st
+    }
+
+    fn pchr(name: &str, m: [f32; 4]) -> Stage {
+        let mut st = tmst(&[], &[]);
+        st.name = name.into();
+        st.unit = Some(UnitId {
+            kind: FourCc::from_bytes(*b"aufx"),
+            subtype: PCHR,
+            manufacturer: FourCc::from_bytes(*b"appl"),
+        });
+        let params = (0..4).map(|i| (i as u32, m[i])).collect();
+        st.state = Some(ParamState { sections: vec![ParamSection { scope: 0, element: 0, params }] });
+        st
+    }
+
+    /// A mid/side shape: a filter box, then matrix, filter, matrix on two lanes.
+    fn ms_graph(eq: Stage) -> (Vec<Stage>, Vec<crate::dspg::analysis::Lane>) {
+        use crate::dspg::analysis::{Lane, Origin, Pass};
+        let mut tone = tmst(&[(4, -1.0)], &[]);
+        tone.name = "Tone".into();
+        let chain = vec![tone, pchr("ToMid", [1.0, 1.0, 1.0, -1.0]), eq, pchr("FromMid", [1.0, 1.0, 1.0, -1.0])];
+        let lane = |c| Lane {
+            origin: Origin { node: "in".into(), port: 0, channel: c },
+            hops: Vec::new(),
+            through: chain.iter().map(|s| Pass { node: s.name.clone(), channel: c }).collect(),
+        };
+        let lanes = vec![lane(0), lane(1)];
+        (chain, lanes)
+    }
+
+    fn ms_eq(side_slots: &[(u32, [f32; 8])]) -> Stage {
+        let mut eq = tmst(&[(4, -5.0)], side_slots);
+        eq.name = "MidEq".into();
+        eq
+    }
+
+    #[test]
+    fn mid_side_section_is_carried_and_kept_under_unity() {
+        let fs = 48_000.0;
+        let mut d = Diagnostics::default();
+        // side: -3.5 dB flat (mask 2 = box channel 1)
+        let (chain, lanes) = ms_graph(ms_eq(&[(0, [3.0, 9.0, -3.5, 700.0, 0.7, 2.0, 2.0, 0.0])]));
+        let ms = mid_side(&chain, &lanes, fs, &mut d).unwrap().unwrap();
+        assert_eq!((ms.to, ms.from), ([1.0, 1.0, 1.0, -1.0], [1.0, 1.0, 1.0, -1.0]));
+        // 2 x -5 dB is over unity: scaled to exactly 0 dB on the mid path
+        assert!((2.0 * ms.mid.gain - 1.0).abs() < 1e-12, "{}", ms.mid.gain);
+        assert!(ms.peak(fs) <= 1.0 + 1e-12);
+        let side_db = 20.0 * (ms.side.gain / ms.mid.gain).log10();
+        assert!((side_db + 3.5).abs() < 1e-9, "{side_db}");
+        // lanes that pass no matrix box: no section
+        let (chain, mut lanes) = ms_graph(ms_eq(&[]));
+        for l in &mut lanes {
+            l.through.truncate(1);
+        }
+        assert!(mid_side(&chain, &lanes, fs, &mut d).unwrap().is_none());
+    }
+
+    #[test]
+    fn mid_side_refusals() {
+        let fs = 48_000.0;
+        let mut d = Diagnostics::default();
+        // an asymmetric matrix: layout not settled
+        let (mut chain, lanes) = ms_graph(ms_eq(&[]));
+        chain[1] = pchr("ToMid", [1.0, 0.5, 1.0, -1.0]);
+        assert!(mid_side(&chain, &lanes, fs, &mut d).is_err());
+        // a single matrix box
+        let (chain, mut lanes) = ms_graph(ms_eq(&[]));
+        for l in &mut lanes {
+            l.through.pop();
+        }
+        assert!(mid_side(&chain, &lanes, fs, &mut d).is_err());
+        // a non-filter box inside the section
+        let (mut chain, lanes) = ms_graph(ms_eq(&[]));
+        chain[2] = mstk(&[]);
+        chain[2].name = "MidEq".into();
+        assert!(mid_side(&chain, &lanes, fs, &mut d).is_err());
+        // a filter after the section
+        let (mut chain, mut lanes) = ms_graph(ms_eq(&[]));
+        let mut after = tmst(&[], &[]);
+        after.name = "After".into();
+        chain.push(after);
+        for (c, l) in lanes.iter_mut().enumerate() {
+            l.through.push(crate::dspg::analysis::Pass { node: "After".into(), channel: c as u32 });
+        }
+        assert!(mid_side(&chain, &lanes, fs, &mut d).is_err());
+        // lanes swapped inside the section
+        let (chain, mut lanes) = ms_graph(ms_eq(&[]));
+        lanes[0].through[2].channel = 1;
+        assert!(mid_side(&chain, &lanes, fs, &mut d).is_err());
     }
 
     #[test]
