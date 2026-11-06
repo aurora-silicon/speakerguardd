@@ -784,11 +784,11 @@ impl Run {
     fn legacy_split(&mut self, c: usize, x: f64) -> [f64; BANDS] {
         let mut out = [0.0; BANDS];
         let mut remaining = x;
-        for stage in 0..XOVERS {
+        for (stage, band) in out.iter_mut().enumerate().take(XOVERS) {
             let filters = self.legacy_stage[stage];
             let high = Self::run_path(filters.high, &mut self.legacy_high_state[c][stage], remaining);
             let allpass = Self::run_path(filters.allpass, &mut self.legacy_split_allpass_state[c][stage], remaining);
-            out[stage] = (allpass - high) * self.band_in[stage];
+            *band = (allpass - high) * self.band_in[stage];
             remaining = high;
         }
         out[BANDS - 1] = remaining * self.band_in[BANDS - 1];
@@ -798,12 +798,12 @@ impl Run {
     #[inline]
     fn legacy_recombine(&mut self, c: usize, bands: [f64; BANDS]) -> f64 {
         let mut output = bands[0];
-        for stage in 1..XOVERS {
+        for (stage, band) in bands.iter().enumerate().take(XOVERS).skip(1) {
             output = Self::run_path(
                 self.legacy_stage[stage].allpass,
                 &mut self.legacy_merge_allpass_state[c][stage],
                 output,
-            ) + bands[stage];
+            ) + *band;
         }
         output + bands[BANDS - 1]
     }
