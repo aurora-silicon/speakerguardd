@@ -147,58 +147,139 @@ fn linkwitz_riley(order: usize, fc: f64, fs: f64, kind: Kind) -> Cascade {
     c
 }
 
-/// Chebyshev type I low pass of order `n`, pass-band ripple `rp_db`, edge
-/// `fp`, by the bilinear transform at `fs` with the edge pre-warped. Unity
-/// gain at DC for odd `n` (the only orders used).
-fn chebyshev1(n: usize, rp_db: f64, fp: f64, fs: f64) -> Cascade {
+/// Minimal complex arithmetic for the elliptic design (setup only).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct C {
+    re: f64,
+    im: f64,
+}
+
+impl C {
+    const fn new(re: f64, im: f64) -> C {
+        C { re, im }
+    }
+    fn add(self, o: C) -> C {
+        C::new(self.re + o.re, self.im + o.im)
+    }
+    fn sub(self, o: C) -> C {
+        C::new(self.re - o.re, self.im - o.im)
+    }
+    fn mul(self, o: C) -> C {
+        C::new(self.re * o.re - self.im * o.im, self.re * o.im + self.im * o.re)
+    }
+    fn div(self, o: C) -> C {
+        let d = o.re * o.re + o.im * o.im;
+        C::new((self.re * o.re + self.im * o.im) / d, (self.im * o.re - self.re * o.im) / d)
+    }
+    fn scale(self, k: f64) -> C {
+        C::new(self.re * k, self.im * k)
+    }
+    fn abs(self) -> f64 {
+        libm::hypot(self.re, self.im)
+    }
+    fn sqrt(self) -> C {
+        let r = libm::sqrt(self.abs());
+        let t = libm::atan2(self.im, self.re) / 2.0;
+        C::new(r * libm::cos(t), r * libm::sin(t))
+    }
+    fn sin(self) -> C {
+        C::new(libm::sin(self.re) * libm::cosh(self.im), libm::cos(self.re) * libm::sinh(self.im))
+    }
+    fn cos(self) -> C {
+        C::new(libm::cos(self.re) * libm::cosh(self.im), -libm::sin(self.re) * libm::sinh(self.im))
+    }
+    fn ln(self) -> C {
+        C::new(libm::log(self.abs()), libm::atan2(self.im, self.re))
+    }
+    /// acos z = -i ln(z + i sqrt(1 - z^2))
+    fn acos(self) -> C {
+        let one = C::new(1.0, 0.0);
+        let i = C::new(0.0, 1.0);
+        let w = self.add(i.mul(one.sub(self.mul(self)).sqrt())).ln();
+        C::new(w.im, -w.re)
+    }
+}
+
+/// Descending Landen moduli of `k`.
+const LANDEN: usize = 8;
+fn landen(k: f64) -> [f64; LANDEN] {
+    let mut v = [0.0; LANDEN];
+    let mut prev = k;
+    for x in v.iter_mut() {
+        let t = prev / (1.0 + libm::sqrt(1.0 - prev * prev));
+        *x = t * t;
+        prev = *x;
+    }
+    v
+}
+
+/// Jacobi `cd(u K, k)` (or `sn` with `sine`) by descending Landen steps.
+fn jacobi(u: C, k: f64, sine: bool) -> C {
+    let v = landen(k);
+    let half = u.scale(core::f64::consts::FRAC_PI_2);
+    let mut w = if sine { half.sin() } else { half.cos() };
+    let one = C::new(1.0, 0.0);
+    for &vn in v.iter().rev() {
+        w = w.scale(1.0 + vn).div(one.add(w.mul(w).scale(vn)));
+    }
+    w
+}
+
+/// Inverse of `sn(u K, k)`: the `u`.
+fn asne(w: C, k: f64) -> C {
+    let v = landen(k);
+    let one = C::new(1.0, 0.0);
+    let mut w = w;
+    let mut prev = k;
+    for &vn in v.iter() {
+        w = w.div(one.add(one.sub(w.mul(w).scale(prev * prev)).sqrt())).scale(2.0 / (1.0 + vn));
+        prev = vn;
+    }
+    // u = 1 - (2/pi) acos(w)
+    one.sub(w.acos().scale(2.0 / core::f64::consts::PI))
+}
+
+/// Elliptic (Cauer) low pass of odd order `n` (unity gain at DC), pass-band
+/// ripple `rp_db`, stop-band attenuation `rs_db`, edge `fp`, by the bilinear
+/// transform at `fs` with the edge pre-warped.
+fn elliptic(n: usize, rp_db: f64, rs_db: f64, fp: f64, fs: f64) -> Cascade {
+    let ep = libm::sqrt(libm::pow(10.0, rp_db / 10.0) - 1.0);
+    let es = libm::sqrt(libm::pow(10.0, rs_db / 10.0) - 1.0);
+    let k1 = ep / es;
+    let pairs = n / 2;
+    // degree equation
+    let kp1 = libm::sqrt(1.0 - k1 * k1);
+    let mut prod = 1.0;
+    for i in 1..=pairs {
+        let ui = (2 * i - 1) as f64 / n as f64;
+        prod *= jacobi(C::new(ui, 0.0), kp1, true).re;
+    }
+    let kp = libm::pow(kp1, n as f64) * libm::pow(prod, 4.0);
+    let k = libm::sqrt(1.0 - kp * kp);
+    let wp = libm::tan(core::f64::consts::PI * fp / fs);
+    let j = C::new(0.0, 1.0);
+    let v0 = j.mul(asne(j.scale(1.0 / ep), k1)).scale(-1.0 / n as f64);
     let mut c = Cascade::default();
-    let eps = libm::sqrt(libm::pow(10.0, rp_db / 10.0) - 1.0);
-    let mu = libm::asinh(1.0 / eps) / n as f64;
-    let k = libm::tan(core::f64::consts::PI * fp / fs);
-    for i in 0..n / 2 {
-        let theta = core::f64::consts::PI * (2 * i + 1) as f64 / (2 * n) as f64;
-        // analogue pole -sigma ± j omega (unit edge), scaled by k
-        let sigma = libm::sinh(mu) * libm::sin(theta) * k;
-        let omega = libm::cosh(mu) * libm::cos(theta) * k;
-        let w2 = sigma * sigma + omega * omega;
-        // H(s) = w2 / (s^2 + 2 sigma s + w2), s = (1 - z^-1) / (1 + z^-1)
-        let a0 = 1.0 + 2.0 * sigma + w2;
-        let g = w2 / a0;
-        c.push(Bq { b: [g, 2.0 * g, g], a: [2.0 * (w2 - 1.0) / a0, (1.0 - 2.0 * sigma + w2) / a0] });
+    for i in 1..=pairs {
+        let ui = C::new((2 * i - 1) as f64 / n as f64, 0.0);
+        let zeta = jacobi(ui, k, false).re;
+        let wz = wp / (k * zeta); // zeros at +-j wz
+        let pole = j.mul(jacobi(ui.sub(j.mul(v0)), k, false)).scale(wp);
+        let (a, cc) = (wz * wz, pole.re * pole.re + pole.im * pole.im);
+        let b = -2.0 * pole.re;
+        let g = cc / a;
+        let d0 = 1.0 + b + cc;
+        c.push(Bq {
+            b: [g * (1.0 + a) / d0, g * 2.0 * (a - 1.0) / d0, g * (1.0 + a) / d0],
+            a: [2.0 * (cc - 1.0) / d0, (1.0 - b + cc) / d0],
+        });
     }
     if n % 2 == 1 {
-        let sigma = libm::sinh(mu) * k;
-        let a0 = 1.0 + sigma;
-        let g = sigma / a0;
-        c.push(Bq { b: [g, g, 0.0], a: [(sigma - 1.0) / a0, 0.0] });
+        let p0 = j.mul(jacobi(j.mul(v0), k, true)).scale(wp).re;
+        let d0 = 1.0 - p0;
+        c.push(Bq { b: [-p0 / d0, -p0 / d0, 0.0], a: [-(1.0 + p0) / d0, 0.0] });
     }
     c
-}
-
-/// A cascade designed at `fs / STRIDE` run at `fs` with every delay
-/// `STRIDE` frames long: the same response below `fs / (2 * STRIDE)`.
-const STRIDE_MAX: usize = 8;
-
-#[derive(Clone, Copy, Debug, Default)]
-struct StridedState {
-    x: [[f64; 2 * STRIDE_MAX]; MAX_SECTIONS],
-    y: [[f64; 2 * STRIDE_MAX]; MAX_SECTIONS],
-    pos: usize,
-}
-
-fn run_strided(c: &Cascade, stride: usize, st: &mut StridedState, mut x: f64) -> f64 {
-    let len = 2 * stride;
-    let p = st.pos;
-    let d1 = (p + len - stride) % len;
-    for i in 0..c.n {
-        let q = &c.s[i];
-        let y = q.b[0] * x + q.b[1] * st.x[i][d1] + q.b[2] * st.x[i][p] - q.a[0] * st.y[i][d1] - q.a[1] * st.y[i][p];
-        st.x[i][p] = x;
-        st.y[i][p] = y;
-        x = y;
-    }
-    st.pos = (p + 1) % len;
-    x
 }
 
 /// The nonlinear devices carried. The compiler refuses the other types.
@@ -225,43 +306,54 @@ impl Device {
 
 /// The box's own laws: the same on every Mac, never from a tuning.
 pub mod law {
-    /// Type 3 device: `-AMP * tanh(SLOPE * u)`.
+    /// Type 3 device: `-AMP * tanh(SLOPE * u)` (SPEC-vben §2, type 3; the
+    /// sign is carried by the branch polarity rule).
     pub const DEVICE3_AMP: f64 = 3.8;
     pub const DEVICE3_SLOPE: f64 = 0.8;
     /// Level control: one peak follower on the device input sets the
     /// drive `1 / max(peak, LC_FLOOR)` (input clipped to `LC_CLIP`); a
     /// second one on the band-limited device output rescales it by
     /// `peak_in / max(peak_out, LC_FLOOR)`.
+    /// SPEC-vben §1 (floor, clip).
     pub const LC_FLOOR: f64 = 0.05;
     pub const LC_CLIP: f64 = 1.2;
     /// Follower: attack and release one-poles, a hold that restarts while
     /// the input stays within `LC_HOLD_RATIO` of the level, and a smoothing
     /// one-pole that follows a rising level at the attack rate.
+    /// SPEC-vben §1 (follower constants).
     pub const LC_ATTACK_S: f64 = 50e-6;
     pub const LC_RELEASE_S: f64 = 0.5;
     pub const LC_HOLD_S: f64 = 0.5;
     pub const LC_HOLD_RATIO: f64 = 0.9;
     pub const LC_SMOOTH_S: f64 = 0.5;
-    /// The mid branches are band-limited by a Chebyshev type I low pass
-    /// working at a quarter-rate design.
-    pub const SUB_RATE_HZ: f64 = 12_000.0;
-    pub const SUB_LP_ORDER: usize = 7;
-    pub const SUB_LP_RIPPLE_DB: f64 = 1.0;
-    pub const SUB_LP_EDGE_HZ: f64 = 2_000.0;
-    /// Each odd-order all-pass section of the harmonic band edges delays
-    /// the whole output by one frame and the mid branches by this many
-    /// sub-rate frames.
-    pub const ODD_AP_BRANCH_DELAY_SUB: f64 = 1.1625;
+    /// Never-louder margin on the hold-restart test (not part of macOS's
+    /// law): this box's arithmetic is not bit-identical to macOS's, so a
+    /// near-tie restart could fall either way. The input follower restarts
+    /// its hold only clearly above the ratio (it then releases no later than
+    /// macOS's), the output follower already slightly below it (it then
+    /// releases no earlier): a tie always resolves to the quieter output.
+    pub const LC_HOLD_MARGIN: f64 = 1e-3;
+    /// The mid branches run at the selected rate (SPEC-vben §3): the
+    /// crossover low pass at the stream rate, every `fs / SUB_RATE_HZ`-th
+    /// frame taken, the
+    /// rest at the selected rate, then zero insertion and an elliptic
+    /// reconstruction low pass at the stream rate.
+    pub const SUB_RATE_HZ: f64 = 8_000.0;
+    pub const RECON_ORDER: usize = 7;
+    pub const RECON_RIPPLE_DB: f64 = 1.0;
+    pub const RECON_STOP_DB: f64 = 100.0;
+    pub const RECON_EDGE_HZ: f64 = 2_000.0;
 }
 
-/// Branch delay line length (frames); covers two odd sections at the
-/// largest stride.
-const BRANCH_LINE: usize = 32;
+/// Selected-rate delay line (sub-rate frames): at most two odd sections.
+const SUB_LINE: usize = 3;
 /// Output delay line length (frames): at most two odd sections.
 const OUT_LINE: usize = 3;
+/// Largest stream-to-selected rate ratio carried.
+const STRIDE_MAX: usize = 24;
 
-/// Frames per sub-rate frame at `fs`, if `fs` is a whole multiple of the
-/// sub rate.
+/// Frames per selected-rate frame at `fs`, if `fs` is a whole multiple of
+/// the selected rate.
 pub fn sub_stride(fs: f64) -> Option<usize> {
     let r = fs / law::SUB_RATE_HZ;
     (r >= 1.0 && r.fract() == 0.0 && r as usize <= STRIDE_MAX).then_some(r as usize)
@@ -343,23 +435,27 @@ impl Params {
 /// Peak follower of the level control.
 #[derive(Clone, Copy, Debug)]
 struct Follower {
-    e: f64,
-    s: f64,
+    // single precision, as the box's own follower state
+    ratio: f32,
+    e: f32,
+    s: f32,
     held: usize,
     hold: usize,
-    a_att: f64,
-    a_rel: f64,
-    a_smo: f64,
+    a_att: f32,
+    a_rel: f32,
+    a_smo: f32,
 }
 
 impl Follower {
-    fn new(fs: f64) -> Follower {
-        let pole = |t: f64| libm::exp(-1.0 / (t * fs));
+    fn new(fs: f64, ratio: f64) -> Follower {
+        let fs = fs as f32;
+        let pole = |t: f64| libm::expf(-1.0 / (t as f32 * fs));
         Follower {
+            ratio: ratio as f32,
             e: 0.0,
             s: 0.0,
             held: 0,
-            hold: (law::LC_HOLD_S * fs) as usize + 1,
+            hold: (law::LC_HOLD_S as f32 * fs) as usize + 1,
             a_att: pole(law::LC_ATTACK_S),
             a_rel: pole(law::LC_RELEASE_S),
             a_smo: pole(law::LC_SMOOTH_S),
@@ -367,22 +463,26 @@ impl Follower {
     }
     #[inline]
     fn run(&mut self, x: f64) -> f64 {
-        let u = libm::fabs(x);
+        let u = libm::fabsf(x as f32);
         let (a, b) = if u > self.e {
             self.held = 0;
             (self.a_att, if self.e > self.s { self.a_att } else { self.a_smo })
-        } else if self.held < self.hold {
-            self.held += 1;
-            if u >= law::LC_HOLD_RATIO * self.e {
-                self.held = 0;
+        } else if u < self.e {
+            if self.held < self.hold {
+                self.held += 1;
+                if u >= self.ratio * self.e {
+                    self.held = 0;
+                }
+                (1.0, self.a_smo)
+            } else {
+                (self.a_rel, self.a_smo)
             }
-            (1.0, self.a_smo)
         } else {
             (self.a_rel, self.a_smo)
         };
         self.e = a * self.e + (1.0 - a) * u;
         self.s = b * self.s + (1.0 - b) * self.e;
-        self.s
+        self.s as f64
     }
 }
 
@@ -395,7 +495,10 @@ struct LevelControl {
 
 impl LevelControl {
     fn new(fs: f64) -> LevelControl {
-        LevelControl { input: Follower::new(fs), output: Follower::new(fs) }
+        LevelControl {
+            input: Follower::new(fs, law::LC_HOLD_RATIO * (1.0 + law::LC_HOLD_MARGIN)),
+            output: Follower::new(fs, law::LC_HOLD_RATIO * (1.0 - law::LC_HOLD_MARGIN)),
+        }
     }
 }
 
@@ -403,40 +506,38 @@ pub struct Run {
     p: Params,
     fs: f64,
     channels: usize,
-    /// Per channel: high pass then both all-passes.
+    /// Per channel at the stream rate: high pass then both all-passes.
     hp: Cascade,
     hp_st: Vec<CascadeState>,
+    /// Crossover low pass of the mid, at the stream rate.
     lp: Cascade,
     lp_st: CascadeState,
-    /// The low-end blend of an odd-order crossover is taken inverted, so
-    /// that low pass and high pass still sum to an all-pass (the harmonic
-    /// branch is not).
-    lp_sign: f64,
-    /// The harmonic branch is inverted when the crossover and the band's
-    /// lower edge are both of even or both of odd Butterworth order.
-    harm_sign: f64,
+    /// Selected rate: both band-edge all-passes (blend), the band's lower
+    /// edge with the first half of its upper edge, then the second half.
     ap: Cascade,
     ap_st: CascadeState,
-    /// Harmonic band: the lower edge's high pass with the first half of the
-    /// upper edge's low pass, then the second half (the level control's
-    /// limiter looks between the two).
     band_hp: Cascade,
     band_hp_st: CascadeState,
     band_lp: Cascade,
     band_lp_st: CascadeState,
-    sub: Cascade,
-    sub_st: StridedState,
-    stride: usize,
-    /// Mid-branch delay: whole frames in a ring, the fraction by a
-    /// first-order all-pass (coefficient `frac_a`).
-    bline: [f64; BRANCH_LINE],
-    bpos: usize,
-    bdelay: usize,
-    frac_a: f64,
-    frac_x: f64,
-    frac_y: f64,
+    /// Polarities: blend inverted for an odd-order crossover; harmonics
+    /// inverted when the crossover and the band's lower edge differ in
+    /// Butterworth-order parity.
+    lp_sign: f64,
+    harm_sign: f64,
     lc: LevelControl,
-    /// Output delay, `latency` frames per channel.
+    stride: usize,
+    /// Selected-rate delay: one sub-rate frame per odd band-edge section.
+    sline: [f64; SUB_LINE],
+    spos: usize,
+    sdelay: usize,
+    /// Position in the selected-rate grid (carried across blocks).
+    phase: usize,
+    /// Reconstruction low pass (stream rate).
+    recon: Cascade,
+    recon_st: CascadeState,
+    /// High-pass path delay, `latency` frames per channel (the mid
+    /// branches carry theirs at the selected rate).
     latency: usize,
     oline: Vec<[f64; OUT_LINE]>,
     opos: usize,
@@ -444,30 +545,20 @@ pub struct Run {
 
 impl Run {
     pub fn new(p: &Params, fs: f64, channels: usize) -> Run {
-        let (nu, nl) = (p.upper_order / 2, p.lower_order / 2);
-        let mut ap = butterworth(nu, p.fu_hz, fs, Kind::AllPass);
-        ap.extend(&butterworth(nl, p.fc_hz, fs, Kind::AllPass));
-        let mut hp = linkwitz_riley(p.hp_order, p.fc_hz, fs, Kind::High);
-        hp.extend(&ap);
-        let lp = linkwitz_riley(p.hp_order, p.fc_hz, fs, Kind::Low);
-        // the upper edge's Linkwitz-Riley low pass is two Butterworths: the
-        // limiter's detector sits between them
-        let mut band_hp = linkwitz_riley(p.lower_order, p.fc_hz, fs, Kind::High);
-        band_hp.extend(&butterworth(p.upper_order / 2, p.fu_hz, fs, Kind::Low));
-        let band_lp = butterworth(p.upper_order / 2, p.fu_hz, fs, Kind::Low);
         let stride = sub_stride(fs).unwrap_or(1);
-        let sub = chebyshev1(law::SUB_LP_ORDER, law::SUB_LP_RIPPLE_DB, law::SUB_LP_EDGE_HZ, fs / stride as f64);
+        let fs8 = fs / stride as f64;
+        let (nh, nu, nl) = (p.hp_order / 2, p.upper_order / 2, p.lower_order / 2);
+        let mut ap48 = butterworth(nu, p.fu_hz, fs, Kind::AllPass);
+        ap48.extend(&butterworth(nl, p.fc_hz, fs, Kind::AllPass));
+        let mut hp = linkwitz_riley(p.hp_order, p.fc_hz, fs, Kind::High);
+        hp.extend(&ap48);
+        let lp = linkwitz_riley(p.hp_order, p.fc_hz, fs, Kind::Low);
+        let mut ap = butterworth(nu, p.fu_hz, fs8, Kind::AllPass);
+        ap.extend(&butterworth(nl, p.fc_hz, fs8, Kind::AllPass));
+        let mut band_hp = linkwitz_riley(p.lower_order, p.fc_hz, fs8, Kind::High);
+        band_hp.extend(&butterworth(nu, p.fu_hz, fs8, Kind::Low));
+        let band_lp = butterworth(nu, p.fu_hz, fs8, Kind::Low);
         let latency = nu % 2 + nl % 2;
-        let d = latency as f64 * law::ODD_AP_BRANCH_DELAY_SUB * stride as f64;
-        // whole part such that the fraction lies in [0.5, 1.5): the
-        // first-order all-pass delay approximation is accurate there
-        let (bdelay, frac) = if d < 0.5 {
-            (0, 0.0)
-        } else {
-            let n = libm::floor(d - 0.5);
-            ((n as usize).min(BRANCH_LINE - 1), d - n)
-        };
-        let frac_a = if frac == 0.0 { 0.0 } else { (1.0 - frac) / (1.0 + frac) };
         Run {
             p: p.clone(),
             fs,
@@ -476,24 +567,22 @@ impl Run {
             hp_st: vec![CascadeState::default(); channels],
             lp,
             lp_st: CascadeState::default(),
-            lp_sign: if (p.hp_order / 2) % 2 == 1 { -1.0 } else { 1.0 },
-            harm_sign: if (p.hp_order / 2) % 2 == nl % 2 { -1.0 } else { 1.0 },
             ap,
             ap_st: CascadeState::default(),
             band_hp,
             band_hp_st: CascadeState::default(),
             band_lp,
             band_lp_st: CascadeState::default(),
-            sub,
-            sub_st: StridedState::default(),
+            lp_sign: if nh % 2 == 1 { -1.0 } else { 1.0 },
+            harm_sign: if nh % 2 == nl % 2 { 1.0 } else { -1.0 },
+            lc: LevelControl::new(fs8),
             stride,
-            bline: [0.0; BRANCH_LINE],
-            bpos: 0,
-            bdelay,
-            frac_a: if frac == 0.0 { f64::NAN } else { frac_a },
-            frac_x: 0.0,
-            frac_y: 0.0,
-            lc: LevelControl::new(fs),
+            sline: [0.0; SUB_LINE],
+            spos: 0,
+            sdelay: latency,
+            phase: 0,
+            recon: elliptic(law::RECON_ORDER, law::RECON_RIPPLE_DB, law::RECON_STOP_DB, law::RECON_EDGE_HZ, fs),
+            recon_st: CascadeState::default(),
             latency,
             oline: vec![[0.0; OUT_LINE]; channels],
             opos: 0,
@@ -508,11 +597,10 @@ impl Run {
         self.ap_st = CascadeState::default();
         self.band_hp_st = CascadeState::default();
         self.band_lp_st = CascadeState::default();
-        self.sub_st = StridedState::default();
-        self.bline = [0.0; BRANCH_LINE];
-        self.frac_x = 0.0;
-        self.frac_y = 0.0;
-        self.lc = LevelControl::new(self.fs);
+        self.lc = LevelControl::new(self.fs / self.stride as f64);
+        self.sline = [0.0; SUB_LINE];
+        self.phase = 0;
+        self.recon_st = CascadeState::default();
         for l in &mut self.oline {
             *l = [0.0; OUT_LINE];
         }
@@ -529,27 +617,35 @@ impl Run {
     #[inline]
     fn device(&self, u: f64) -> f64 {
         match self.p.device {
-            Device::Saturator3 => -law::DEVICE3_AMP * libm::tanh(law::DEVICE3_SLOPE * u),
+            Device::Saturator3 => law::DEVICE3_AMP * libm::tanh(law::DEVICE3_SLOPE * u),
         }
     }
 
+    /// One selected-rate frame of both mid branches.
     #[inline]
-    fn branch_delay(&mut self, v: f64) -> f64 {
-        let mut x = v;
-        if self.bdelay > 0 {
-            self.bline[self.bpos] = v;
-            let r = (self.bpos + BRANCH_LINE - self.bdelay) % BRANCH_LINE;
-            x = self.bline[r];
-            self.bpos = (self.bpos + 1) % BRANCH_LINE;
+    fn sub_frame(&mut self, lo: f64) -> f64 {
+        let low = self.lp_sign * self.p.blend_gain * self.ap.run(&mut self.ap_st, lo);
+        let harm = if self.p.level_control {
+            let p_in = self.lc.input.run(lo);
+            let z = (lo / p_in.max(law::LC_FLOOR)).clamp(-law::LC_CLIP, law::LC_CLIP);
+            let dev = self.device(z);
+            let hp = self.band_hp.run(&mut self.band_hp_st, dev);
+            let p_out = self.lc.output.run(hp);
+            let y = hp * p_in / p_out.max(law::LC_FLOOR);
+            self.band_lp.run(&mut self.band_lp_st, y)
+        } else {
+            let dev = self.device(lo);
+            let hp = self.band_hp.run(&mut self.band_hp_st, dev);
+            self.band_lp.run(&mut self.band_lp_st, hp)
+        };
+        let v = low + self.harm_sign * self.p.harmonic_gain * harm;
+        if self.sdelay == 0 {
+            return v;
         }
-        if self.frac_a.is_nan() {
-            return x;
-        }
-        // first-order all-pass fractional delay
-        let y = self.frac_a * x + self.frac_x - self.frac_a * self.frac_y;
-        self.frac_x = x;
-        self.frac_y = y;
-        y
+        self.sline[self.spos] = v;
+        let out = self.sline[(self.spos + SUB_LINE - self.sdelay) % SUB_LINE];
+        self.spos = (self.spos + 1) % SUB_LINE;
+        out
     }
 
     pub fn process(&mut self, bufs: &mut [&mut [f32]], frames: usize) {
@@ -567,30 +663,17 @@ impl Run {
             }
             mid /= ch as f64;
             let lo = self.lp.run(&mut self.lp_st, mid);
-            let low = self.lp_sign * self.p.blend_gain * self.ap.run(&mut self.ap_st, lo);
-            let harm = if self.p.level_control {
-                let p_in = self.lc.input.run(lo);
-                let z = (lo / p_in.max(law::LC_FLOOR)).clamp(-law::LC_CLIP, law::LC_CLIP);
-                let dev = self.device(z);
-                let hp = self.band_hp.run(&mut self.band_hp_st, dev);
-                let p_out = self.lc.output.run(hp);
-                let y = hp * p_in / p_out.max(law::LC_FLOOR);
-                self.p.harmonic_gain * self.band_lp.run(&mut self.band_lp_st, y)
-            } else {
-                let dev = self.device(lo);
-                let hp = self.band_hp.run(&mut self.band_hp_st, dev);
-                self.p.harmonic_gain * self.band_lp.run(&mut self.band_lp_st, hp)
-            };
-            let delayed = self.branch_delay(low + self.harm_sign * harm);
-            let common = run_strided(&self.sub, self.stride, &mut self.sub_st, delayed);
+            let up = if self.phase == 0 { self.sub_frame(lo) * self.stride as f64 } else { 0.0 };
+            self.phase = (self.phase + 1) % self.stride;
+            let common = self.recon.run(&mut self.recon_st, up);
             let (l, pos) = (self.latency, self.opos);
             for (c, b) in bufs[..ch].iter_mut().enumerate() {
                 let v = b[i] as f64;
                 let x = if v.is_finite() { v * ig } else { 0.0 };
-                let y = (self.hp.run(&mut self.hp_st[c], x) + common) * self.p.output_gain;
                 let line = &mut self.oline[c];
-                line[pos] = y;
-                b[i] = line[(pos + OUT_LINE - l) % OUT_LINE] as f32;
+                line[pos] = self.hp.run(&mut self.hp_st[c], x);
+                let y = (line[(pos + OUT_LINE - l) % OUT_LINE] + common) * self.p.output_gain;
+                b[i] = y as f32;
             }
             self.opos = (pos + 1) % OUT_LINE;
         }
@@ -721,7 +804,7 @@ mod tests {
 
     #[test]
     fn level_control_holds_then_releases() {
-        let mut f = Follower::new(48_000.0);
+        let mut f = Follower::new(48_000.0, law::LC_HOLD_RATIO);
         for _ in 0..4_800 {
             f.run(1.0);
         }
@@ -735,5 +818,32 @@ mod tests {
             f.run(0.0);
         }
         assert!(f.run(0.0) < 0.2 * top);
+    }
+
+    fn gain_db(c: &Cascade, f: f64, fs: f64) -> f64 {
+        let w = 2.0 * core::f64::consts::PI * f / fs;
+        let z1 = C::new(libm::cos(w), -libm::sin(w));
+        let z2 = z1.mul(z1);
+        let mut h = C::new(1.0, 0.0);
+        for q in &c.s[..c.n] {
+            let num = C::new(q.b[0], 0.0).add(z1.scale(q.b[1])).add(z2.scale(q.b[2]));
+            let den = C::new(1.0, 0.0).add(z1.scale(q.a[0])).add(z2.scale(q.a[1]));
+            h = h.mul(num.div(den));
+        }
+        20.0 * libm::log10(h.abs())
+    }
+
+    #[test]
+    fn elliptic_meets_its_specification() {
+        let c = elliptic(7, 1.0, 100.0, 2_000.0, 48_000.0);
+        assert!(gain_db(&c, 0.0, 48_000.0).abs() < 1e-6);
+        for f in [100.0, 500.0, 1_000.0, 1_500.0, 1_999.0] {
+            let g = gain_db(&c, f, 48_000.0);
+            assert!((-1.0 - 1e-6..=1e-6).contains(&g), "{f} {g}");
+        }
+        assert!((gain_db(&c, 2_000.0, 48_000.0) + 1.0).abs() < 1e-3);
+        for f in [4_000.0, 8_000.0, 16_000.0, 23_000.0] {
+            assert!(gain_db(&c, f, 48_000.0) < -99.9, "{f}");
+        }
     }
 }
