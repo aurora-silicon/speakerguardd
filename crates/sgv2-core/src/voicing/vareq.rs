@@ -69,7 +69,7 @@ pub enum Kind {
 
 impl Kind {
     pub fn from_code(code: f64) -> Option<Kind> {
-        if code.fract() != 0.0 {
+        if !code.is_finite() || libm::trunc(code) != code {
             return None;
         }
         match code as i64 {
