@@ -44,8 +44,11 @@ Each audio file is interleaved little-endian float32, one channel per driver
 in the "drivers" order, in full-scale units at the amplifier input. Relative
 paths resolve against the manifest's directory.
 
-Driver models (models.json, one object per driver name; every key required),
-named as the tuning sidecar names them:
+Driver models (models.json, one object per driver name), each with "kind"
+(spp3, atsp or lsm2; default spp3) and that unit's own field names
+(MODEL_KINDS). Every thermal field is required. atsp tunings carry no cone
+model: for them excursion and velocity are listed as NOT GATED in the
+verdict, never filled in. spp3 fields, as the tuning sidecar names them:
   ag                   amplifier output, volts peak at digital full scale
   Reb_ref              voice-coil DC resistance, ohm
   Rshunt, Rampout      current-sense shunt and amplifier output resistance, ohm
@@ -80,10 +83,30 @@ except ImportError:  # CI's self-test runs without numpy
 
 DEFAULT_TOL = {"db": 0.05, "rel": 1e-3, "temp_c": 0.02, "floor_db": -150.0}
 WINDOWS_S = (0.01, 0.1, 1.0, 10.0)
-# The tuning sidecar's own field names (open-loop displacement and thermal
-# dictionaries of ChannelSpecificParams/ChannelN, ambient from the globals).
-MODEL_KEYS = ("ag", "Reb_ref", "Rshunt", "Rampout", "phi", "mt", "kt", "ct",
-              "T_sett_vc", "tau_Tvc", "T_sett_mg", "tau_Tmg", "Thermal_AmbientTemp")
+# Each unit's own field names for the same physical model, mapped to the
+# canonical ones the gate computes with:
+#   vfs volts at full scale, rser series resistance the current sees, rcoil
+#   resistance that dissipates, phi/mt/kt/ct force factor, moving mass,
+#   stiffness, mechanical damping, rth_vc/tau_vc coil above magnet,
+#   rth_mg/tau_mg magnet above ambient, amb ambient.
+# A canonical value listed as a tuple is the sum of those fields.
+MODEL_KINDS = {
+    # tuning sidecar, ChannelSpecificParams/ChannelN (OL_disp, OL_thermal)
+    "spp3": {"vfs": "ag", "rser": ("Reb_ref", "Rshunt", "Rampout"), "rcoil": "Reb_ref",
+             "phi": "phi", "mt": "mt", "kt": "kt", "ct": "ct",
+             "rth_vc": "T_sett_vc", "tau_vc": "tau_Tvc", "rth_mg": "T_sett_mg", "tau_mg": "tau_Tmg",
+             "amb": "Thermal_AmbientTemp"},
+    # atsp slot parameters; atsp carries no cone model
+    "atsp": {"vfs": "Vfs", "rser": "Rdc", "rcoil": "Rdc",
+             "rth_vc": "Rvc", "tau_vc": "tau_vc", "rth_mg": "Rmg", "tau_mg": "tau_mg", "amb": "Tamb"},
+    # lsm2 channel V_FS, displacement model block, thermal type block
+    "lsm2": {"vfs": "VoltsFullScale", "rser": ("Rdc", "Rpar"), "rcoil": "Rdc",
+             "phi": "Bl", "mt": "Mms", "kt": "Kms", "ct": "Rms",
+             "rth_vc": "Rth_vc", "tau_vc": "tau_vc", "rth_mg": "Rth_mag", "tau_mg": "tau_mag", "amb": "Tamb"},
+}
+MECH = ("phi", "mt", "kt", "ct")
+MODEL_KEYS = tuple(dict.fromkeys(
+    f for f in sum((list(v) if isinstance(v, tuple) else [v] for v in MODEL_KINDS["spp3"].values()), [])))
 THERMAL_STEP_S = 0.001
 
 # Required case set. Levels in dBFS at the program input; the voicing chain
@@ -214,15 +237,15 @@ def window_rms(x, fs):
 
 def mechanics(x, fs, m):
     """Peak excursion and velocity of the linear moving-coil model."""
-    rtot = m["Reb_ref"] + m["Rshunt"] + m["Rampout"]
+    rtot = m["rser"]
     tail = int(fs * 8 * m["mt"] / max(m["ct"] + m["phi"] ** 2 / rtot, 1e-12)) + 1
     n = pow2(len(x) + min(tail, 4 * len(x) + fs))
     if np is not None:
-        sp = np.fft.rfft(np.asarray(x, dtype=np.float64) * m["ag"], n)
+        sp = np.fft.rfft(np.asarray(x, dtype=np.float64) * m["vfs"], n)
         w = 2 * np.pi * np.arange(len(sp)) * fs / n
         h = (m["phi"] / rtot) / ((m["kt"] - m["mt"] * w * w) + 1j * w * (m["ct"] + m["phi"] ** 2 / rtot))
         return (float(np.abs(np.fft.irfft(sp * h, n)).max()), float(np.abs(np.fft.irfft(sp * h * 1j * w, n)).max()))
-    spec = rfft([v * m["ag"] for v in x], n)
+    spec = rfft([v * m["vfs"] for v in x], n)
     xs, vs = [], []
     for k, s in enumerate(spec):
         w = 2 * math.pi * k * fs / n
@@ -234,14 +257,14 @@ def mechanics(x, fs, m):
 
 def thermal(x, fs, m):
     """Peak coil and magnet temperature: coil power through two first-order nodes."""
-    rtot = m["Reb_ref"] + m["Rshunt"] + m["Rampout"]
-    scale = m["ag"] ** 2 * m["Reb_ref"] / rtot ** 2
+    rtot = m["rser"]
+    scale = m["vfs"] ** 2 * m["rcoil"] / rtot ** 2
     step = max(1, int(round(THERMAL_STEP_S * fs)))
     dt = step / fs
-    avc = math.exp(-dt / m["tau_Tvc"])
-    amg = math.exp(-dt / m["tau_Tmg"])
+    avc = math.exp(-dt / m["tau_vc"])
+    amg = math.exp(-dt / m["tau_mg"])
     tvc = tmg = 0.0
-    pk_vc = pk_mg = m["Thermal_AmbientTemp"]
+    pk_vc = pk_mg = m["amb"]
     if np is not None:
         a = np.asarray(x, dtype=np.float64) ** 2
         pad = (-len(a)) % step
@@ -252,10 +275,10 @@ def thermal(x, fs, m):
     else:
         powers = [scale * sum(v * v for v in x[i:i + step]) / len(x[i:i + step]) for i in range(0, len(x), step)]
     for p in powers:
-        tvc = avc * tvc + (1 - avc) * m["T_sett_vc"] * p
-        tmg = amg * tmg + (1 - amg) * m["T_sett_mg"] * p
-        pk_mg = max(pk_mg, m["Thermal_AmbientTemp"] + tmg)
-        pk_vc = max(pk_vc, m["Thermal_AmbientTemp"] + tmg + tvc)
+        tvc = avc * tvc + (1 - avc) * m["rth_vc"] * p
+        tmg = amg * tmg + (1 - amg) * m["rth_mg"] * p
+        pk_mg = max(pk_mg, m["amb"] + tmg)
+        pk_vc = max(pk_vc, m["amb"] + tmg + tvc)
     return pk_vc, pk_mg
 
 
@@ -295,7 +318,8 @@ def _driver_metrics_np(x, fs, model):
     out = {"band_rms_db": rms, "band_peak_db": [db(float(p)) for p in fpk],
            "peak_db": db(float((x * x).max())), "win_rms_db": wr}
     if model is not None:
-        out["excursion_m"], out["velocity_m_s"] = mechanics(x, fs, model)
+        if model["mechanics"]:
+            out["excursion_m"], out["velocity_m_s"] = mechanics(x, fs, model)
         out["coil_temp_c"], out["magnet_temp_c"] = thermal(x, fs, model)
     return out
 
@@ -311,22 +335,47 @@ def driver_metrics(x, fs, model):
         "win_rms_db": window_rms(x, fs),
     }
     if model is not None:
-        out["excursion_m"], out["velocity_m_s"] = mechanics(x, fs, model)
+        if model["mechanics"]:
+            out["excursion_m"], out["velocity_m_s"] = mechanics(x, fs, model)
         out["coil_temp_c"], out["magnet_temp_c"] = thermal(x, fs, model)
     return out
 
 
 # --------------------------------------------------------------------- gate
 
-def check_model(name, m):
+def canonical(name, m):
+    """(model, error): the canonical model of a driver, or why there is none.
+
+    A model names its unit ("kind", default spp3) and carries that unit's own
+    field names. Every thermal field is required. The cone fields are
+    required for a unit whose tuning has them (spp3, lsm2); for atsp, whose
+    tuning has none, excursion and velocity are reported as not gated.
+    """
     if not isinstance(m, dict):
-        return f"driver {name}: no model"
-    bad = [k for k in MODEL_KEYS if not isinstance(m.get(k), (int, float)) or not math.isfinite(m[k])]
+        return None, f"driver {name}: no model"
+    kind = m.get("kind", "spp3")
+    if kind not in MODEL_KINDS:
+        return None, f"driver {name}: unknown model kind {kind}"
+    out, bad = {}, []
+    for key, src in MODEL_KINDS[kind].items():
+        srcs = src if isinstance(src, tuple) else (src,)
+        vals = [m.get(f) for f in srcs]
+        if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in vals):
+            bad += [f for f, v in zip(srcs, vals) if not isinstance(v, (int, float)) or isinstance(v, bool)
+                    or not math.isfinite(v)]
+            continue
+        out[key] = float(sum(vals))
     if bad:
-        return f"driver {name}: model missing or non-finite {', '.join(bad)}"
-    if min(m[k] for k in ("Reb_ref", "mt", "kt", "tau_Tvc", "tau_Tmg")) <= 0:
-        return f"driver {name}: model has a non-positive Reb_ref/mt/kt/tau"
-    return None
+        return None, f"driver {name}: {kind} model missing or non-finite {', '.join(bad)}"
+    need = ["rser", "rcoil", "tau_vc", "tau_mg"] + (["mt", "kt"] if "mt" in out else [])
+    if min(out[k] for k in need) <= 0:
+        return None, f"driver {name}: model has a non-positive resistance, mass, stiffness or time constant"
+    out["mechanics"] = all(k in out for k in MECH)
+    return out, None
+
+
+def check_model(name, m):
+    return canonical(name, m)[1]
 
 
 def read_f32(path, channels):
@@ -392,10 +441,13 @@ def gate(manifest_path, report_path=None, log=print):
         if isinstance(models, str):
             models = json.load(open(os.path.join(base, models)))
         models = models or {}
+        tr["not_gated"] = []
         for d in drivers:
-            err = check_model(d, models.get(d))
+            cm, err = canonical(d, models.get(d))
             if err:
                 failures.append(f"{name}: {err}")
+            elif not cm["mechanics"]:
+                tr["not_gated"].append(f"{d}: excursion, velocity (the tuning has no cone model)")
         have = {(c.get("case"), float(c.get("volume", -1))) for c in t.get("cases", [])}
         for c in req_cases:
             for v in req_vols:
@@ -414,7 +466,7 @@ def gate(manifest_path, report_path=None, log=print):
                 continue
             cr = {"case": c.get("case"), "volume": c.get("volume"), "over": {}}
             for d, a, b in zip(drivers, mac, got):
-                model = models.get(d) if check_model(d, models.get(d)) is None else None
+                model = canonical(d, models.get(d))[0]
                 over = compare(driver_metrics(a, fs, model), driver_metrics(b, fs, model), tol)
                 if over:
                     cr["over"][d] = [list(o) for o in over]
@@ -427,6 +479,9 @@ def gate(manifest_path, report_path=None, log=print):
                             tr["worst"][k] = [label] + list(o[1:])
             tr["cases"].append(cr)
     report["pass"] = not failures
+    for t in report["tunings"]:
+        for msg in t.get("not_gated", []):
+            log(f"NOT GATED {t['name']} {msg}")
     report["failures"] = failures
     if report_path:
         with open(report_path, "w") as f:
@@ -559,6 +614,7 @@ def sidecar_models(plist):
             if isinstance(v, bool) or not isinstance(v, (int, float)):
                 raise ValueError(f"{name}: no numeric {k}")
             m[k] = float(v)
+        m["kind"] = "spp3"
         out[f"ch{name[7:]}"] = m
     return out
 
@@ -637,14 +693,20 @@ def self_test():
     except ValueError:
         syn["ChannelSpecificParams"]["Channel0"] = syn["ChannelSpecificParams"]["Channel1"]
         got = sidecar_models(syn)
-        if list(got) != ["ch0", "ch1"] or got["ch1"] != _synthetic_model():
+        if list(got) != ["ch0", "ch1"] or got["ch1"] != dict(_synthetic_model(), kind="spp3"):
             ok = False
             print(f"self-test models: wrong extraction {got}")
         else:
             print("self-test models: ok")
-    m = _synthetic_model()
+    atsp = {"kind": "atsp", "Vfs": 10.0, "Rdc": 4.0, "Rvc": 20.0, "tau_vc": 0.5, "Rmg": 10.0,
+            "tau_mg": 5.0, "Tamb": 25.0}
+    run("atsp thermal only", [w, t], [w, t], True, models={"w": atsp, "t": atsp})
+    run("atsp hotter", [w, t], [[v * 1.003 for v in w], t], False, models={"w": atsp, "t": atsp})
+    run("atsp missing field", [w, t], [w, t], False, models={"w": atsp, "t": {k: v for k, v in atsp.items() if k != "Rmg"}})
+    run("unknown kind", [w, t], [w, t], False, models={"w": dict(atsp, kind="x"), "t": atsp})
+    m = canonical("syn", _synthetic_model())[0]
     x0, v0 = mechanics(tone(10, 1.0, 4 * fs), fs, m)
-    static = m["ag"] * m["phi"] / ((m["Reb_ref"] + m["Rshunt"] + m["Rampout"]) * m["kt"])
+    static = m["vfs"] * m["phi"] / (m["rser"] * m["kt"])
     if not 0.9 < x0 / static < 1.15:
         ok = False
         print(f"self-test mechanics: below resonance x {x0:.4g} vs static {static:.4g}")
