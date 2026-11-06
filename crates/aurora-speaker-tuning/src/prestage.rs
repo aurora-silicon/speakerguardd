@@ -191,7 +191,6 @@ fn butterworth(high: bool, order: u32, f0: f64, fs: f64) -> Vec<Section> {
     made.sections[..made.count].to_vec()
 }
 
-#[cfg(test)]
 #[derive(Clone, Copy)]
 enum Rbj {
     Peak,
