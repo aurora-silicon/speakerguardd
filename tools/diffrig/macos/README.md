@@ -41,6 +41,32 @@ python3 ../run.py "$SGV2_RIG_DIR/traces" "$SGV2_RIG_DIR/signals" OUT   # the Lin
 
 `rig_host` exits nonzero when a `--cfprop` is refused or does not parse, when a render call fails, or when fewer frames were rendered than read; `capture.py` also checks `render_error` and `frames` in the meta. Both refuse to run as root. `capture.py --self-test` checks the case plumbing without a Mac. `capture.py` needs numpy. `capture_edge.py OUT [substring ...]` runs the edge list the same way. A case whose unit log has an `*_OVERWRITE.txt` file is rerun at a lower pace, because records were lost.
 
+### LSM2 telemetry input
+
+For an LSM2 reference that needs V/I, add `--lsm2-tele` and set `--tele-ch`
+to twice `--ch`. The host explicitly configures two input buses and verifies
+the count and the second bus's format. LSM2 receives planar float32 telemetry
+at the program sample rate; the `--tele` file and the recorded `.tele.f32`
+remain interleaved. Existing runs without this option keep their original
+bus configuration and format.
+
+For example, append `--lsm2-tele --tele-ch 8 --tele feedback.f32` to a
+four-channel LSM2 invocation with its matching strip and property files.
+The option cannot be combined with `--no-tele` or another protection unit.
+
+This mode requires one complete telemetry pull for every render call, with
+the matching frame count and timestamp. A missing, repeated or malformed
+pull, a short telemetry file, or a failed lifecycle/configuration operation
+fails the run. Metadata records `tele_layout`, `tele_callbacks`,
+`tele_frames_consumed` and `tele_rejected_callbacks` so input delivery can be
+checked independently. Bus and format readbacks also run after lifecycle
+events.
+
+Input delivery alone does not establish that the native estimator accepted
+the samples, their units or their channel order. Verify an estimator response
+before using a capture as a system-identification or closed-loop reference.
+This option does not change the engine or board qualification gates.
+
 ## Observed host facts
 
 - spp3 and lsm2 instantiate and render offline from their factories; no device is needed.

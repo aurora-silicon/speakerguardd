@@ -10,6 +10,7 @@
 //   rig_host --unit spp3|lsm2|atsp --strip X.austrip [--sidecar X.plist] [--spts X.bin]
 //            [--prop ID=U32 ...] --in in.f32 --ch N [--q 512] [--sr 48000]
 //            [--tele tele.f32 --tele-ch 12] [--plant plant.json] [--no-tele]
+//            [--lsm2-tele]  # explicit planar V/I bus: --tele-ch must be 2 * --ch
 //            [--param SCOPE.ELEMENT.ID=VALUE ...]
 //            [--event FRAME:KIND[=ARG] ...] [--every K] --out PREFIX
 //            [--preset-param ID=VALUE ...] [--param-at FRAME:ID=VALUE ...]
@@ -222,11 +223,16 @@ static void plantStep(Plant *p, float *tele, int telech, float out[MAXCH][MAXQ],
 }
 
 // ---- host buffers ----
-typedef struct { float audio[MAXCH][MAXQ]; float tele[MAXQ * MAXTELE]; int nch, telech; } Bufs;
+typedef struct {
+    float audio[MAXCH][MAXQ], tele[MAXQ * MAXTELE], telePlanar[MAXTELE][MAXQ];
+    int nch, telech, planarTele;
+    UInt32 teleAvailable, telePulls; int teleInvalid; Float64 teleSampleTime;
+    UInt64 teleCallbacks, teleFrames, teleRejected;
+} Bufs;
 
 // ---- unit configuration (also used to rebuild the unit for newinst events) ----
 typedef struct Config {
-    const char *unit, *strip, *sidecar, *spts; int nch, telech, notele, q, maxframes; double sr;
+    const char *unit, *strip, *sidecar, *spts; int nch, telech, notele, lsm2tele, q, maxframes; double sr;
     UInt32 propIds[MAXPROP], propVals[MAXPROP]; int nprops;
     UInt32 cfIds[MAXCF]; const char *cfPaths[MAXCF]; int ncf;
     UInt32 plIds[MAXPL]; const char *plPaths[MAXPL]; int npl;
@@ -245,8 +251,26 @@ static OSStatus cbAudio(void *r, AudioUnitRenderActionFlags *f, const AudioTimeS
     return noErr;
 }
 static OSStatus cbTele(void *r, AudioUnitRenderActionFlags *f, const AudioTimeStamp *t, UInt32 bus, UInt32 n, AudioBufferList *io) {
-    io->mBuffers[0].mData = B.tele; io->mBuffers[0].mDataByteSize = n * B.telech * sizeof(float);
-    io->mBuffers[0].mNumberChannels = B.telech;
+    if (B.planarTele) {
+        // The LSM2 telemetry bus is planar. Keep the recorded/file format
+        // interleaved, and expose exactly this render's samples to the AU.
+        // A second or partial pull is not silently served from offset zero.
+        if (!io || !t || !(t->mFlags & kAudioTimeStampSampleTimeValid) || t->mSampleTime != B.teleSampleTime ||
+            n != B.teleAvailable || n > MAXQ || B.telePulls || io->mNumberBuffers != (UInt32)B.telech) {
+            B.teleInvalid = 1; B.teleRejected++;
+            return kAudio_ParamError;
+        }
+        for (int c = 0; c < B.telech; ++c) {
+            for (UInt32 i = 0; i < n; ++i) B.telePlanar[c][i] = B.tele[i * B.telech + c];
+            io->mBuffers[c].mData = B.telePlanar[c];
+            io->mBuffers[c].mDataByteSize = n * sizeof(float);
+            io->mBuffers[c].mNumberChannels = 1;
+        }
+    } else {
+        io->mBuffers[0].mData = B.tele; io->mBuffers[0].mDataByteSize = n * B.telech * sizeof(float);
+        io->mBuffers[0].mNumberChannels = B.telech;
+    }
+    B.telePulls++; B.teleCallbacks++; B.teleFrames += n;
     return noErr;
 }
 
@@ -257,6 +281,23 @@ static AudioStreamBasicDescription fmt(double sr, UInt32 ch, bool ni) {
     f.mBytesPerPacket = f.mBytesPerFrame = sizeof(float) * (ni ? 1 : ch);
     f.mFramesPerPacket = 1; f.mChannelsPerFrame = ch; f.mBitsPerChannel = 32;
     return f;
+}
+
+// Strict telemetry must remain configured across ClassInfo and lifecycle changes.
+static OSStatus checkLsm2Tele(AudioUnit au, const Config *cf) {
+    UInt32 inputs = 0, size = sizeof inputs;
+    OSStatus r = AudioUnitGetProperty(au, kAudioUnitProperty_ElementCount, kAudioUnitScope_Input, 0, &inputs, &size);
+    if (r) return r;
+    if (size != sizeof inputs || inputs != 2) return kAudio_ParamError;
+    AudioStreamBasicDescription expected = fmt(cf->sr, cf->telech, true), got = {0}; size = sizeof got;
+    r = AudioUnitGetProperty(au, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 1, &got, &size);
+    if (r) return r;
+    if (size != sizeof got || got.mSampleRate != expected.mSampleRate ||
+        got.mChannelsPerFrame != expected.mChannelsPerFrame || got.mFormatID != expected.mFormatID ||
+        got.mFormatFlags != expected.mFormatFlags || got.mBitsPerChannel != expected.mBitsPerChannel ||
+        got.mBytesPerFrame != expected.mBytesPerFrame || got.mBytesPerPacket != expected.mBytesPerPacket ||
+        got.mFramesPerPacket != expected.mFramesPerPacket) return kAudio_ParamError;
+    return noErr;
 }
 
 // Apply the whole configuration and initialize. classInfo, when given, is set after the
@@ -337,25 +378,63 @@ static void configureUnit(AudioUnit au, Config *cf, CFPropertyListRef classInfo)
         }
         UInt32 mx = maxframes > q ? (UInt32)maxframes : (UInt32)q;
         die(AudioUnitSetProperty(au, kAudioUnitProperty_MaximumFramesPerSlice, 0, 0, &mx, 4), "maxframes");
-        AudioStreamBasicDescription af = fmt(sr, nch, true), tf = fmt(sr, telech, false);
+        if (cf->lsm2tele) {
+            UInt32 bytes = 0, inputs = 0, size = sizeof inputs; Boolean writable = false;
+            die(AudioUnitGetPropertyInfo(au, kAudioUnitProperty_ElementCount, kAudioUnitScope_Input, 0,
+                                        &bytes, &writable), "LSM2 input count info");
+            die(AudioUnitGetProperty(au, kAudioUnitProperty_ElementCount, kAudioUnitScope_Input, 0,
+                                    &inputs, &size), "LSM2 input count");
+            if (bytes != sizeof inputs || size != sizeof inputs || (inputs != 2 && !writable)) {
+                fprintf(stderr, "FATAL LSM2 input bus count is not configurable\n"); exit(1);
+            }
+            if (inputs != 2) {
+                inputs = 2;
+                die(AudioUnitSetProperty(au, kAudioUnitProperty_ElementCount, kAudioUnitScope_Input, 0,
+                                        &inputs, sizeof inputs), "LSM2 input count set");
+            }
+            inputs = 0; size = sizeof inputs;
+            die(AudioUnitGetProperty(au, kAudioUnitProperty_ElementCount, kAudioUnitScope_Input, 0,
+                                    &inputs, &size), "LSM2 input count readback");
+            if (inputs != 2 || size != sizeof inputs) {
+                fprintf(stderr, "FATAL LSM2 input bus count readback is not 2\n"); exit(1);
+            }
+        }
+        AudioStreamBasicDescription af = fmt(sr, nch, true), tf = fmt(sr, telech, cf->lsm2tele);
         die(AudioUnitSetProperty(au, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0, &af, sizeof af), "in fmt");
         die(AudioUnitSetProperty(au, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 0, &af, sizeof af), "out fmt");
         UInt32 nin = 0, sz = 4;
-        AudioUnitGetProperty(au, kAudioUnitProperty_ElementCount, kAudioUnitScope_Input, 0, &nin, &sz);
+        OSStatus countStatus = AudioUnitGetProperty(au, kAudioUnitProperty_ElementCount, kAudioUnitScope_Input, 0, &nin, &sz);
+        if (cf->lsm2tele) die(countStatus, "LSM2 configured input count");
         int haveTeleBus = nin > 1 && !notele;
         cf->haveTeleBus = haveTeleBus;
         AURenderCallbackStruct ca = {cbAudio, NULL}, ct = {cbTele, NULL};
         die(AudioUnitSetProperty(au, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Input, 0, &ca, sizeof ca), "cb0");
         if (haveTeleBus) {
             die(AudioUnitSetProperty(au, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 1, &tf, sizeof tf), "tele fmt");
+            if (cf->lsm2tele) {
+                AudioStreamBasicDescription got = {0}; UInt32 size = sizeof got;
+                die(AudioUnitGetProperty(au, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 1,
+                                        &got, &size), "LSM2 tele format readback");
+                if (size != sizeof got || got.mSampleRate != tf.mSampleRate ||
+                    got.mChannelsPerFrame != tf.mChannelsPerFrame || got.mFormatID != tf.mFormatID ||
+                    got.mFormatFlags != tf.mFormatFlags || got.mBitsPerChannel != tf.mBitsPerChannel ||
+                    got.mBytesPerFrame != tf.mBytesPerFrame || got.mBytesPerPacket != tf.mBytesPerPacket ||
+                    got.mFramesPerPacket != tf.mFramesPerPacket) {
+                    fprintf(stderr, "FATAL LSM2 tele format readback differs\n"); exit(1);
+                }
+            }
             die(AudioUnitSetProperty(au, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Input, 1, &ct, sizeof ct), "cb1");
         }
         for (int i = 0; i < cf->npar; ++i)
             die(AudioUnitSetParameter(au, cf->parId[i], cf->parScope[i], cf->parEl[i], cf->parVal[i], 0), "param");
-        if (classInfo) ck(AudioUnitSetProperty(au, kAudioUnitProperty_ClassInfo, 0, 0, &classInfo, sizeof classInfo), "restore ClassInfo");
+        if (classInfo) {
+            OSStatus r = AudioUnitSetProperty(au, kAudioUnitProperty_ClassInfo, 0, 0, &classInfo, sizeof classInfo);
+            if (cf->lsm2tele) die(r, "LSM2 restore ClassInfo"); else ck(r, "restore ClassInfo");
+        }
         die(AudioUnitInitialize(au), "Initialize");
         for (int i = 0; i < cf->npar; ++i) // again after Initialize, in case setup rebuilt them
             die(AudioUnitSetParameter(au, cf->parId[i], cf->parScope[i], cf->parEl[i], cf->parVal[i], 0), "param");
+        if (cf->lsm2tele) die(checkLsm2Tele(au, cf), "LSM2 initialized telemetry readback");
 }
 
 typedef struct { AudioUnitScope sc; AudioUnitElement el; AudioUnitParameterID id; char name[128]; } Meter;
@@ -390,7 +469,7 @@ int main(int argc, const char **argv) {
     @autoreleasepool {
         const char *unit = "spp3", *strip = NULL, *sidecar = NULL, *spts = NULL, *in = NULL, *tele = NULL,
                    *plant = NULL, *out = NULL;
-        int nch = 0, q = 512, telech = 12, every = 1, notele = 0, filech = 0;
+        int nch = 0, q = 512, telech = 12, every = 1, notele = 0, lsm2tele = 0, filech = 0;
         long long limitframes = 0;
         UInt64 patFrame[MAXPARAT]; UInt32 patId[MAXPARAT]; float patVal[MAXPARAT]; int npat = 0;
         long long failAt = -1; // --test-fail-at FRAME: the rig's own tests; simulates a render error there
@@ -468,6 +547,7 @@ int main(int argc, const char **argv) {
             }
             else if (ARG("--test-fail-at")) failAt = atoll(v);
             else if (!strcmp(a, "--no-tele")) notele = 1;
+            else if (!strcmp(a, "--lsm2-tele")) lsm2tele = 1;
             else if (!strcmp(a, "--dump-params")) dumpp = 1;
             else { fprintf(stderr, "bad arg %s\n", a); return 2; }
         }
@@ -476,9 +556,12 @@ int main(int argc, const char **argv) {
         if (filech < 1 || filech > MAXCH || limitframes < 0) { fprintf(stderr, "bad --file-ch or --limit-frames\n"); return 2; }
         if (q < 1 || nch < 1 || every < 1) { fprintf(stderr, "--q, --ch and --every must be positive\n"); return 2; }
         if (telech < 1 || telech > MAXTELE) { fprintf(stderr, "--tele-ch must be 1..%d\n", MAXTELE); return 2; }
-        B.nch = nch; B.telech = telech;
+        if (lsm2tele && (strcmp(unit, "lsm2") || notele || telech != 2 * nch || !isfinite(sr) || sr <= 0)) {
+            fprintf(stderr, "--lsm2-tele needs lsm2, positive finite --sr, 2 * --ch telemetry channels, and no --no-tele\n"); return 2;
+        }
+        B.nch = nch; B.telech = telech; B.planarTele = lsm2tele;
         C.unit = unit; C.strip = strip; C.sidecar = sidecar; C.spts = spts; C.nch = nch; C.telech = telech;
-        C.notele = notele; C.q = q; C.maxframes = maxframes; C.sr = sr;
+        C.notele = notele; C.lsm2tele = lsm2tele; C.q = q; C.maxframes = maxframes; C.sr = sr;
         C.nprops = nprops; C.ncf = ncf; C.npl = npl; C.npar = npar;
         UInt32 compVersion = 0;
         AudioUnit au = makeUnit(unit, &compVersion);
@@ -551,6 +634,10 @@ int main(int argc, const char **argv) {
             if (haveTeleBus) {
                 if (ftele) {
                     size_t g2 = fread(B.tele, sizeof(float) * telech, got, ftele);
+                    if (g2 < got && lsm2tele) {
+                        fprintf(stderr, "short LSM2 telemetry at %llu: got %zu of %zu frames\n", done, g2, got);
+                        failed = -1; break;
+                    }
                     if (g2 < got) memset(B.tele + g2 * telech, 0, (got - g2) * telech * sizeof(float));
                 } else if (P.enabled) {
                     plantStep(&P, B.tele, telech, outb, (int)got); // uses the previous quantum's output
@@ -563,10 +650,11 @@ int main(int argc, const char **argv) {
             }
             while (nextevt < nevt && (long long)done >= evFrame[nextevt]) {
                 int k = nextevt++;
-                if (!strcmp(evKind[k], "reset"))
-                    fprintf(stderr, "event reset at %llu: %d\n", done,
-                            (int)AudioUnitReset(au, kAudioUnitScope_Global, 0));
-                else if (!strcmp(evKind[k], "sleep")) {
+                if (!strcmp(evKind[k], "reset")) {
+                    OSStatus r = AudioUnitReset(au, kAudioUnitScope_Global, 0);
+                    fprintf(stderr, "event reset at %llu: %d\n", done, (int)r);
+                    if (lsm2tele) die(r, "LSM2 event reset");
+                } else if (!strcmp(evKind[k], "sleep")) {
                     fprintf(stderr, "event sleep %g s at %llu\n", evArg[k], done);
                     usleep((useconds_t)(evArg[k] * 1e6));
                 } else if (!strcmp(evKind[k], "uninit")) {
@@ -574,6 +662,7 @@ int main(int argc, const char **argv) {
                     if (!isnan(evArg[k])) { UInt32 pv = (UInt32)evArg[k]; rp = AudioUnitSetProperty(au, 64007, 0, 0, &pv, 4); }
                     OSStatus r2 = AudioUnitInitialize(au);
                     fprintf(stderr, "event uninit/init at %llu: %d %d (64007 %g: %d)\n", done, (int)r1, (int)r2, evArg[k], (int)rp);
+                    if (lsm2tele) { die(r1, "LSM2 event uninitialize"); die(rp, "LSM2 event property"); die(r2, "LSM2 event initialize"); }
                 } else if (!strcmp(evKind[k], "classinfo") || !strcmp(evKind[k], "reinit")) {
                     CFPropertyListRef ci = NULL; UInt32 cs = sizeof ci;
                     OSStatus r0 = AudioUnitGetProperty(au, kAudioUnitProperty_ClassInfo, 0, 0, &ci, &cs), r1 = 0, r3 = 0;
@@ -583,11 +672,16 @@ int main(int argc, const char **argv) {
                     if (re) r3 = AudioUnitInitialize(au);
                     fprintf(stderr, "event %s at %llu: get %d uninit %d set %d init %d\n", evKind[k], done, (int)r0, (int)r1, (int)r2, (int)r3);
                     if (ci) CFRelease(ci);
+                    if (lsm2tele) { die(r0, "LSM2 event ClassInfo get"); die(r1, "LSM2 event uninitialize"); die(r2, "LSM2 event ClassInfo set"); die(r3, "LSM2 event initialize"); }
                 } else if (!strcmp(evKind[k], "newinst") || !strcmp(evKind[k], "newinst_ci")) {
                     CFPropertyListRef ci = NULL; UInt32 cs = sizeof ci;
                     int withci = !strcmp(evKind[k], "newinst_ci");
-                    if (withci) AudioUnitGetProperty(au, kAudioUnitProperty_ClassInfo, 0, 0, &ci, &cs);
-                    AudioUnitUninitialize(au); AudioComponentInstanceDispose(au);
+                    OSStatus r0 = withci ? AudioUnitGetProperty(au, kAudioUnitProperty_ClassInfo, 0, 0, &ci, &cs) : 0;
+                    if (lsm2tele) { die(r0, "LSM2 newinst ClassInfo get"); if (withci && !ci) die(kAudio_ParamError, "LSM2 missing ClassInfo"); }
+                    OSStatus r1 = AudioUnitUninitialize(au);
+                    if (lsm2tele) die(r1, "LSM2 newinst uninitialize");
+                    OSStatus r2 = AudioComponentInstanceDispose(au);
+                    if (lsm2tele) die(r2, "LSM2 newinst dispose");
                     if (!isnan(evArg[k])) C.prop64007 = (long long)evArg[k];
                     au = makeUnit(unit, &compVersion);
                     configureUnit(au, &C, ci);
@@ -598,6 +692,7 @@ int main(int argc, const char **argv) {
                     tsOffset += evArg[k];
                     fprintf(stderr, "event tsjump %g frames at %llu\n", evArg[k], done);
                 }
+                if (lsm2tele) die(checkLsm2Tele(au, &C), "LSM2 event telemetry readback");
                 if (dumpp && strcmp(evKind[k], "sleep") && strcmp(evKind[k], "tsjump")) {
                     char tag[48]; snprintf(tag, sizeof tag, "%s@%llu", evKind[k], done);
                     dumpParams(au, stderr, tag);
@@ -605,7 +700,12 @@ int main(int argc, const char **argv) {
             }
             AudioTimeStamp ts = {.mSampleTime = (Float64)done + tsOffset, .mFlags = kAudioTimeStampSampleTimeValid};
             AudioUnitRenderActionFlags fl = 0;
+            B.teleAvailable = (UInt32)got; B.telePulls = 0; B.teleInvalid = 0; B.teleSampleTime = ts.mSampleTime;
             OSStatus s = failAt >= 0 && (long long)done >= failAt ? -1 : AudioUnitRender(au, &fl, &ts, 0, (UInt32)got, abl);
+            if (!s && lsm2tele && (B.telePulls != 1 || B.teleInvalid)) {
+                fprintf(stderr, "LSM2 telemetry was not consumed exactly once at %llu\n", done);
+                s = kAudio_ParamError;
+            }
             if (s) { fprintf(stderr, "render %d at %llu\n", (int)s, done); failed = s; break; }
             for (size_t i = 0; i < got; ++i) for (int c = 0; c < nch; ++c) inter[i * nch + c] = outb[c][i];
             fwrite(inter, sizeof(float) * nch, got, fo);
@@ -628,9 +728,11 @@ int main(int argc, const char **argv) {
         snprintf(path, sizeof path, "%s.meta.json", out); FILE *fm = fopen(path, "w");
         fprintf(fm, "{\"unit\":\"%s\",\"component_version\":\"0x%x\",\"strip\":\"%s\",\"sidecar\":\"%s\","
                 "\"spts\":%s,\"quantum\":%d,\"sr\":%g,\"channels\":%d,\"file_channels\":%d,\"tele_bus\":%d,\"tele_source\":\"%s\","
-                "\"pace\":%g,\"latency_s\":%.12g,\"frames\":%llu,\"frames_read\":%llu,\"meters\":%d,\"render_error\":%d}\n",
+                "\"pace\":%g,\"latency_s\":%.12g,\"frames\":%llu,\"frames_read\":%llu,\"meters\":%d,\"render_error\":%d,"
+                "\"lsm2_tele\":%s,\"tele_layout\":\"%s\",\"tele_callbacks\":%llu,\"tele_frames_consumed\":%llu,\"tele_rejected_callbacks\":%llu}\n",
                 unit, compVersion, strip, sidecar ? sidecar : "", spts ? "true" : "false", q, sr, nch, filech, haveTeleBus,
-                tele ? tele : plant ? plant : "zeros", pace, lat, done, nread, nm, failed);
+                tele ? tele : plant ? plant : "zeros", pace, lat, done, nread, nm, failed,
+                lsm2tele ? "true" : "false", lsm2tele ? "planar" : "interleaved", B.teleCallbacks, B.teleFrames, B.teleRejected);
         fclose(fm);
         AudioUnitUninitialize(au); AudioComponentInstanceDispose(au);
         fprintf(stderr, "done %llu frames, %d meters, latency %.6f s\n", done, nm, lat);
