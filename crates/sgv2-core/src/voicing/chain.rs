@@ -266,7 +266,13 @@ impl Run {
                 let w = x.len().min(MAX_CHANNELS);
                 p.process_dynamics(&mut refs[..w], frames);
             }
-            Run::Xtc(_) | Run::Cfreak(_) | Run::Mstk(_) | Run::Buzz(_) | Run::Cdelay(_) | Run::Lowflow(_) | Run::Vbass(_) => {
+            Run::Xtc(_)
+            | Run::Cfreak(_)
+            | Run::Mstk(_)
+            | Run::Buzz(_)
+            | Run::Cdelay(_)
+            | Run::Lowflow(_)
+            | Run::Vbass(_) => {
                 for (i, o) in x.iter().zip(y.iter_mut()) {
                     o[..frames].copy_from_slice(&i[..frames]);
                 }
