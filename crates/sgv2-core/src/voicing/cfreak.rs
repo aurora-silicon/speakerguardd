@@ -50,7 +50,7 @@ pub const CEILING_TRIM_DB: f64 = -0.00002;
 pub const TAU_SLOW_S: f64 = 10.0;
 /// Mode-3 output-saturation reconstruction: a ninth-order Butterworth low
 /// pass followed by the unit's 24-frame reported-latency alignment.
-pub const SATURATION_FILTER_HZ: f64 = 13_950.0;
+pub const SATURATION_FILTER_HZ: f64 = 14_100.0;
 pub const SATURATION_FILTER_ORDER: usize = 5;
 pub const SATURATION_DELAY: usize = 24;
 
