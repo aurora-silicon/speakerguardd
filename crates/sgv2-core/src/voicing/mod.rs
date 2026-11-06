@@ -40,6 +40,7 @@
 pub mod buzz;
 pub mod cdelay;
 pub mod cfreak;
+pub mod chain;
 pub mod lowflow;
 pub mod mstk;
 pub mod volume;

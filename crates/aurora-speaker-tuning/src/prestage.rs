@@ -144,8 +144,42 @@ fn rbj(kind: Rbj, gain_db: f64, f0: f64, q: f64, fs: f64) -> Section {
     Section { b0: b[0] / d[0], b1: b[1] / d[0], b2: b[2] / d[0], a1: d[1] / d[0], a2: d[2] / d[0] }
 }
 
+/// The filters a filter box (`aufx/tmst`) applies to its channel `ch`, as
+/// the box runs them: sections, flat gain (dB) and mute, with no scaling
+/// to unity (the pre-stage scales its whole lane; the voicing chain runs
+/// each box as macOS does).
+///
+/// The box's volume automation is not applied: the filters are its saved
+/// state. The last value is the automation entries that are switched on
+/// (whatever slot they aim at), so the caller can treat the box as not yet
+/// carried at other volumes.
+pub fn tone(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics) -> Result<(Vec<Section>, f64, bool, Vec<u32>)> {
+    let p = part_with(stage, ch, fs, diags, false)?;
+    Ok((p.sections, p.gain_db, p.muted, automation(stage)))
+}
+
+/// The volume automation entries of a filter box that move something: on
+/// (state not 0), aimed at a slot, with two distinct volume set points
+/// (entry words 2 and 3). An entry whose set points coincide was measured
+/// to change nothing at any volume (black-box renders of the unit), so it
+/// is not counted.
+pub fn automation(stage: &Stage) -> Vec<u32> {
+    let Some(g) = stage.state.as_ref().and_then(|s| s.global()) else { return Vec::new() };
+    let get = |id: u32| g.get(id).map(f64::from).unwrap_or(0.0);
+    (0..AUTOMATION_ENTRIES)
+        .filter(|e| {
+            let entry = AUTOMATION_BASE + AUTOMATION_STRIDE * e;
+            get(entry + 1) != 0.0 && get(entry) >= 0.0 && get(entry + 2) != get(entry + 3)
+        })
+        .collect()
+}
+
 /// The filters box `stage` applies to its channel `ch`.
 fn part(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics) -> Result<Part> {
+    part_with(stage, ch, fs, diags, true)
+}
+
+fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics, strict_automation: bool) -> Result<Part> {
     let ctx = format!("filter box {}", stage.name);
     let mut p = Part::default();
     if stage.bypass {
@@ -267,7 +301,7 @@ fn part(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics) -> Result<Part
     for e in 0..AUTOMATION_ENTRIES {
         let entry = AUTOMATION_BASE + AUTOMATION_STRIDE * e;
         let (target, state) = (get(entry), get(entry + 1));
-        if state != 0.0 && target >= 0.0 && kept.contains(&(target as u32)) {
+        if strict_automation && state != 0.0 && target >= 0.0 && kept.contains(&(target as u32)) {
             return Err(bad(format!("{ctx}: volume automation {e} moves slot {target}, which sets a band limit")));
         }
     }
@@ -296,6 +330,12 @@ pub fn dynamics(chain: &[Stage], lanes: &[crate::dspg::analysis::Lane]) -> Resul
         found = Some(s);
     }
     let Some(st) = found else { return Ok(None) };
+    compressor(st)
+}
+
+/// One multiband compressor box's dynamics, or none when it is bypassed;
+/// refuses one the dynamics cannot carry.
+pub fn compressor(st: &Stage) -> Result<Option<Dynamics>> {
     let ctx = format!("compressor box {}", st.name);
     if st.bypass {
         return Ok(None);
