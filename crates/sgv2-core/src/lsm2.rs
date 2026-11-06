@@ -149,11 +149,19 @@ pub const SUBSTEP_FRAMES: usize = 32;
 /// Substeps per controller frame.
 pub const SUBSTEPS: usize = CONTROLLER_FRAMES / SUBSTEP_FRAMES;
 
-/// The controller frame at `rate`: 256 frames per 48 kHz, i.e. 5.333 ms.
+/// The controller frame at `rate`: 256 frames per 48 kHz, i.e. 5.333 ms,
+/// rounded to the controller's eight-way vector cadence. Rates below 48 kHz
+/// retain the 256-frame minimum used by the native unit.
 pub fn controller_frames(rate: u32) -> usize {
-    let f = libm::round(CONTROLLER_FRAMES as f64 * rate as f64 / 48_000.0) as usize;
-    // whole substeps, at least one frame each
-    (f / SUBSTEPS).max(1) * SUBSTEPS
+    let f = libm::round(CONTROLLER_FRAMES as f64 * rate as f64 / 48_000.0 / SUBSTEPS as f64) as usize * SUBSTEPS;
+    f.max(CONTROLLER_FRAMES)
+}
+
+/// A millisecond geometry field converted to frames and rounded to the
+/// native eight-sample vector cadence.
+fn vector_frames(ms: f32, rate: u32) -> usize {
+    let f = ms as f64 * 1e-3 * rate as f64;
+    libm::round(f / SUBSTEPS as f64) as usize * SUBSTEPS
 }
 /// Filterbank bands.
 pub const BANDS: usize = 5;
@@ -564,7 +572,7 @@ impl Params {
         if self.filterbank_frames() < 2 || self.latency_frames() > 16384 {
             return Err(InitError::Invalid("latency"));
         }
-        if self.output_offset_frames() >= ctl || self.output_offset_frames() % (ctl / SUBSTEPS) != 0 {
+        if self.output_offset_frames() >= ctl {
             return Err(InitError::Invalid("look-ahead region against the controller cadence"));
         }
         for j in 0..4 {
@@ -662,12 +670,12 @@ impl Params {
 
     /// One filterbank stage in frames.
     pub fn filterbank_frames(&self) -> usize {
-        libm::round(self.filterbank_latency_ms as f64 * 1e-3 * self.sample_rate as f64) as usize
+        vector_frames(self.filterbank_latency_ms, self.sample_rate)
     }
 
     /// The speaker-response look-ahead in frames.
     pub fn lookahead_frames(&self) -> usize {
-        libm::round(self.speaker_response_lookahead_ms as f64 * 1e-3 * self.sample_rate as f64) as usize
+        vector_frames(self.speaker_response_lookahead_ms, self.sample_rate)
     }
 
     /// Frames between the bank stage and the output: one more filterbank
@@ -2550,6 +2558,20 @@ mod fault_tests {
         let mut outs: [&mut [f32]; 2] = [&mut o0, &mut o1];
         let h = u.process(Io { frames: n, input: &ins, sense: &[], output: &mut outs });
         (o0, h)
+    }
+
+    #[test]
+    fn forty_four_khz_geometry_keeps_the_native_vector_cadence() {
+        let mut p = params();
+        p.sample_rate = 44_100;
+        p.filterbank_latency_ms = 10.0 / 3.0;
+        p.speaker_response_lookahead_ms = 2.0 / 3.0;
+        assert_eq!(controller_frames(p.sample_rate), 256);
+        assert_eq!(p.filterbank_frames(), 144);
+        assert_eq!(p.lookahead_frames(), 32);
+        assert_eq!(p.latency_frames(), 320);
+        assert_eq!(p.unit_latency_frames(), 576);
+        assert!(Run::new(&p).is_ok());
     }
 
     /// A non-finite state latches 20 dB until reset.
