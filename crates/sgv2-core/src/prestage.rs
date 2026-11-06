@@ -779,6 +779,40 @@ impl PreStage {
             }
         }
     }
+
+    /// The filter-only float path used by a ToneMeister box. The installed
+    /// box runs its biquad cascade in float, whose rounding is observable
+    /// when many low-frequency sections are cascaded. The protection
+    /// pre-stage deliberately keeps the f64 path above.
+    pub(crate) fn process_float(&mut self, c: usize, input: &[f32], output: &mut [f32]) {
+        let (Some(ch), Some(z)) = (self.params.channel.get(c), self.state.get_mut(c)) else {
+            output.fill(0.0);
+            return;
+        };
+        if c >= self.params.channels {
+            output.fill(0.0);
+            return;
+        }
+        let secs = &ch.sections[..ch.count.min(MAX_SECTIONS)];
+        for (x, y) in input.iter().zip(output.iter_mut()) {
+            let mut v = if x.is_finite() { x.clamp(-INPUT_BOUND as f32, INPUT_BOUND as f32) } else { 0.0 };
+            for (s, st) in secs.iter().zip(z.iter_mut()) {
+                let out = s.b0 as f32 * v + st[0] as f32;
+                let z0 = s.b1 as f32 * v - s.a1 as f32 * out + st[1] as f32;
+                let z1 = s.b2 as f32 * v - s.a2 as f32 * out;
+                st[0] = z0 as f64;
+                st[1] = z1 as f64;
+                v = out;
+            }
+            v *= ch.gain as f32;
+            if v.is_finite() {
+                *y = v;
+            } else {
+                *z = [[0.0; 2]; MAX_SECTIONS];
+                *y = 0.0;
+            }
+        }
+    }
 }
 
 #[cfg(test)]

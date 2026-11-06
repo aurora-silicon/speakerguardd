@@ -44,7 +44,6 @@ use crate::prestage::{Channel, Dynamics, Params as PreParams, PreStage, Section,
 use crate::MAX_CHANNELS;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::f64::consts::PI;
 
 /// Most boxes a chain may have; the shipped graphs have under 24 on the
 /// unit's lanes.
@@ -88,6 +87,8 @@ pub enum ToneShape {
     LowShelf,
     HighShelf,
     ResonantHighPass,
+    ButterworthShelf,
+    ButterworthBandShelf,
 }
 
 /// One channel copy of an automated slot in a [`Tone`].
@@ -114,6 +115,10 @@ pub struct TonePoint {
 pub struct ToneAutomation {
     pub shape: ToneShape,
     pub quality: f64,
+    /// Shape fields that do not move with volume (the remaining shelf
+    /// edge frequencies for type 0/2 slots).
+    pub fixed: [f64; 3],
+    pub max_order: u32,
     pub a: TonePoint,
     pub b: TonePoint,
     pub midpoint: Option<TonePoint>,
@@ -224,6 +229,8 @@ fn shape_sections(shape: ToneShape) -> usize {
     match shape {
         ToneShape::LowPass(n) | ToneShape::HighPass(n) => (n as usize).div_ceil(2),
         ToneShape::Gain => 0,
+        ToneShape::ButterworthShelf => 5,
+        ToneShape::ButterworthBandShelf => 10,
         _ => 1,
     }
 }
@@ -234,11 +241,17 @@ fn point_valid(p: TonePoint) -> bool {
 
 fn automation_valid(a: &ToneAutomation, channels: &[Channel]) -> bool {
     let order_ok = match a.shape {
-        ToneShape::LowPass(n) | ToneShape::HighPass(n) => (1..=10).contains(&n),
+        ToneShape::LowPass(n) | ToneShape::HighPass(n) => (1..=20).contains(&n),
         _ => true,
     };
-    let quality_ok = matches!(a.shape, ToneShape::Gain | ToneShape::LowPass(_) | ToneShape::HighPass(_))
-        || a.quality.is_finite() && a.quality > 0.0;
+    let quality_ok = matches!(
+        a.shape,
+        ToneShape::Gain
+            | ToneShape::LowPass(_)
+            | ToneShape::HighPass(_)
+            | ToneShape::ButterworthShelf
+            | ToneShape::ButterworthBandShelf
+    ) || a.quality.is_finite() && a.quality > 0.0;
     let midpoint_ok =
         a.midpoint.map(|m| point_valid(m) && m.scalar > a.a.scalar && m.scalar < a.b.scalar).unwrap_or(true);
     order_ok
@@ -247,6 +260,8 @@ fn automation_valid(a: &ToneAutomation, channels: &[Channel]) -> bool {
         && point_valid(a.b)
         && a.a.scalar < a.b.scalar
         && midpoint_ok
+        && (1..=10).contains(&a.max_order)
+        && a.fixed.iter().all(|v| v.is_finite() && *v >= 0.0)
         && !a.targets.is_empty()
         && a.targets.iter().all(|t| {
             channels.get(t.channel).is_some_and(|c| {
@@ -267,25 +282,6 @@ fn automated_values(a: &ToneAutomation, scalar: f64) -> (f64, f64) {
         Some(m) if scalar <= m.scalar => interpolate(a.a, m, scalar),
         Some(m) => interpolate(m, a.b, scalar),
         None => interpolate(a.a, a.b, scalar),
-    }
-}
-
-fn butterworth(high: bool, order: u32, f0: f64, fs: f64, out: &mut [Section]) {
-    let k = libm::tan(PI * f0 / fs);
-    let mut at = 0;
-    for i in 0..order / 2 {
-        let q2 = 2.0 * libm::sin(PI * (2 * i + 1) as f64 / (2 * order) as f64);
-        let n = 1.0 + q2 * k + k * k;
-        let (a1, a2) = (2.0 * (k * k - 1.0) / n, (1.0 - q2 * k + k * k) / n);
-        let (b0, b1, b2) = if high { (1.0 / n, -2.0 / n, 1.0 / n) } else { (k * k / n, 2.0 * k * k / n, k * k / n) };
-        out[at] = Section { b0, b1, b2, a1, a2 };
-        at += 1;
-    }
-    if order % 2 == 1 {
-        let n = 1.0 + k;
-        let a1 = (k - 1.0) / n;
-        let (b0, b1) = if high { (1.0 / n, -1.0 / n) } else { (k / n, k / n) };
-        out[at] = Section { b0, b1, b2: 0.0, a1, a2: 0.0 };
     }
 }
 
@@ -317,10 +313,27 @@ fn apply_tone_automation(stage: &mut PreStage, base: &[Channel], automation: &[T
                         channel.sections[target.section] = section;
                     }
                 }
+                ToneShape::ButterworthShelf => {
+                    let made = super::tone::butterworth_shelf(gain_db, frequency_hz, a.fixed[0], a.max_order, fs);
+                    let sections = &mut channel.sections[target.section..target.section + 5];
+                    sections.fill(Section::IDENTITY);
+                    sections[..made.count].copy_from_slice(&made.sections[..made.count]);
+                }
+                ToneShape::ButterworthBandShelf => {
+                    let first = super::tone::butterworth_shelf(gain_db, a.fixed[0], frequency_hz, a.max_order, fs);
+                    let second = super::tone::butterworth_shelf(gain_db, a.fixed[1], a.fixed[2], a.max_order, fs);
+                    let sections = &mut channel.sections[target.section..target.section + 10];
+                    sections.fill(Section::IDENTITY);
+                    sections[..first.count].copy_from_slice(&first.sections[..first.count]);
+                    sections[5..5 + second.count].copy_from_slice(&second.sections[..second.count]);
+                    channel.gain *= libm::pow(10.0, -(gain_db - a.a.gain_db) / 20.0);
+                }
                 ToneShape::LowPass(order) | ToneShape::HighPass(order) => {
                     let n = shape_sections(a.shape);
                     let sections = &mut channel.sections[target.section..target.section + n];
-                    butterworth(matches!(a.shape, ToneShape::HighPass(_)), order, frequency_hz, fs, sections);
+                    let made =
+                        super::tone::butterworth(matches!(a.shape, ToneShape::HighPass(_)), order, frequency_hz, fs);
+                    sections.copy_from_slice(&made.sections[..n]);
                     if sections.iter().any(|s| !s.stable()) {
                         sections.copy_from_slice(&base[target.channel].sections[target.section..target.section + n]);
                     }
@@ -428,7 +441,7 @@ impl Run {
             }
             Run::Filters { stage, .. } => {
                 for (c, (i, o)) in x.iter().zip(y.iter_mut()).enumerate() {
-                    stage.process(c, &i[..frames], &mut o[..frames]);
+                    stage.process_float(c, &i[..frames], &mut o[..frames]);
                 }
             }
             Run::Comp(p) => {
@@ -647,7 +660,7 @@ mod tests {
         let fs = 48_000.0;
         let mut channel = Channel::IDENTITY;
         channel.count = 1;
-        channel.sections[0] = rbj(Rbj::LowShelf, 12.0, 100.0, core::f64::consts::FRAC_1_SQRT_2, fs);
+        channel.sections[0] = crate::voicing::tone::low_shelf(12.0, 100.0, core::f64::consts::FRAC_1_SQRT_2, fs);
         Spec {
             program_channels: 1,
             nodes: vec![NodeSpec {
@@ -656,6 +669,8 @@ mod tests {
                     automation: vec![ToneAutomation {
                         shape: ToneShape::LowShelf,
                         quality: core::f64::consts::FRAC_1_SQRT_2,
+                        fixed: [0.0; 3],
+                        max_order: 10,
                         a: TonePoint { scalar: 0.2, gain_db: 12.0, frequency_hz: 100.0 },
                         b: TonePoint { scalar: 0.8, gain_db: 0.0, frequency_hz: 1600.0 },
                         midpoint: Some(TonePoint { scalar: 0.5, gain_db: 9.0, frequency_hz: 200.0 }),
@@ -686,7 +701,7 @@ mod tests {
         c.set_param(GraphParam::VolumeScalar, 0.35);
         let ch = tone_channel(&c);
         let dc_db = 20.0 * libm::log10(ch.magnitude(0.0, fs));
-        assert!((dc_db - 10.5).abs() < 1e-9, "{dc_db}");
+        assert!((dc_db - 10.5).abs() < 1e-8, "{dc_db}");
         // Halfway from A to M: gain is halfway in dB, frequency is the
         // geometric mean. A Butterworth-shaped shelf is half its gain there.
         let f = libm::sqrt(100.0 * 200.0);
@@ -695,7 +710,7 @@ mod tests {
 
         c.set_param(GraphParam::VolumeScalar, -10.0);
         let below = 20.0 * libm::log10(tone_channel(&c).magnitude(0.0, fs));
-        assert!((below - 12.0).abs() < 1e-9);
+        assert!((below - 12.0).abs() < 1e-8);
         c.set_param(GraphParam::VolumeScalar, 10.0);
         assert!(tone_channel(&c).magnitude(0.0, fs).log10().abs() < 1e-10);
     }

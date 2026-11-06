@@ -135,6 +135,137 @@ pub fn resonant_high_pass(f0: f64, q: f64, fs: f64) -> Section {
     }
 }
 
+/// A fixed-capacity static cascade returned by [`butterworth_shelf`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Cascade {
+    pub sections: [Section; 10],
+    pub count: usize,
+}
+
+/// A bilinear-prewarped Butterworth low- or high-pass of integer order.
+pub fn butterworth(high: bool, order: u32, f0: f64, fs: f64) -> Cascade {
+    let mut out = Cascade { sections: [Section::IDENTITY; 10], count: 0 };
+    let order = order.clamp(1, 20);
+    let k = libm::tan(PI * f0 / fs);
+    for i in 0..order / 2 {
+        let q2 = 2.0 * libm::sin(PI * (2 * i + 1) as f64 / (2 * order) as f64);
+        let n = 1.0 + q2 * k + k * k;
+        let (a1, a2) = (2.0 * (k * k - 1.0) / n, (1.0 - q2 * k + k * k) / n);
+        let (b0, b1, b2) = if high { (1.0 / n, -2.0 / n, 1.0 / n) } else { (k * k / n, 2.0 * k * k / n, k * k / n) };
+        out.sections[out.count] = Section { b0, b1, b2, a1, a2 };
+        out.count += 1;
+    }
+    if order % 2 == 1 {
+        let n = 1.0 + k;
+        let a1 = (k - 1.0) / n;
+        let (b0, b1) = if high { (1.0 / n, -1.0 / n) } else { (k / n, k / n) };
+        out.sections[out.count] = Section { b0, b1, b2: 0.0, a1, a2: 0.0 };
+        out.count += 1;
+    }
+    out
+}
+
+fn bilinear_factor(num: [f64; 3], den: [f64; 3], k: f64) -> Section {
+    let transform = |c: [f64; 3]| {
+        if c[0] == 0.0 {
+            let c1 = c[1] / k;
+            return [c1 + c[2], -c1 + c[2], 0.0];
+        }
+        let c2 = c[0] / (k * k);
+        let c1 = c[1] / k;
+        [c2 + c1 + c[2], -2.0 * c2 + 2.0 * c[2], c2 - c1 + c[2]]
+    };
+    let b = transform(num);
+    let a = transform(den);
+    Section { b0: b[0] / a[0], b1: b[1] / a[0], b2: b[2] / a[0], a1: a[1] / a[0], a2: a[2] / a[0] }
+}
+
+fn shelf_factor(high: bool, boost: bool, a: f64, q2: Option<f64>, k: f64) -> Section {
+    let (mut num, mut den) = match (high, q2) {
+        (true, Some(q)) => ([a * a, q * a, 1.0], [1.0 / (a * a), q / a, 1.0]),
+        (false, Some(q)) => ([1.0, q * a, a * a], [1.0, q / a, 1.0 / (a * a)]),
+        (true, None) => ([0.0, a, 1.0], [0.0, 1.0 / a, 1.0]),
+        (false, None) => ([0.0, 1.0, a], [0.0, 1.0, 1.0 / a]),
+    };
+    if boost {
+        core::mem::swap(&mut num, &mut den);
+    }
+    bilinear_factor(num, den, k)
+}
+
+fn integer_shelf(high: bool, order: u32, gain_db: f64, fm: f64, fs: f64) -> Cascade {
+    let mut out = Cascade { sections: [Section::IDENTITY; 10], count: 0 };
+    if gain_db == 0.0 {
+        return out;
+    }
+    let boost = gain_db > 0.0;
+    let g = libm::pow(10.0, -gain_db.abs() / 20.0);
+    let a = libm::pow(g, 1.0 / (2.0 * order as f64));
+    let k = libm::tan(PI * fm / fs);
+    for i in 0..order / 2 {
+        let q2 = 2.0 * libm::sin(PI * (2 * i + 1) as f64 / (2 * order) as f64);
+        out.sections[out.count] = shelf_factor(high, boost, a, Some(q2), k);
+        out.count += 1;
+    }
+    if order % 2 != 0 {
+        out.sections[out.count] = shelf_factor(high, boost, a, None, k);
+        out.count += 1;
+    }
+    out
+}
+
+/// ToneMeister's type-2 Butterworth shelf. The two frequencies determine
+/// direction, midpoint and the fractional order; at most five sections are
+/// returned because the box caps the order at ten.
+pub fn butterworth_shelf(gain_db: f64, f3: f64, f4: f64, max_order: u32, fs: f64) -> Cascade {
+    if gain_db == 0.0 || f3 == f4 {
+        return Cascade { sections: [Section::IDENTITY; 10], count: 0 };
+    }
+    let high = f3 > f4;
+    let fm = libm::sqrt(f3 * f4);
+    let octaves = libm::log2(f3.max(f4) / f3.min(f4));
+    let n = (gain_db.abs() / (3.010_299_956_64 * octaves)).max(1.0).min(max_order.clamp(1, 10) as f64);
+    if n == 1.0 {
+        return integer_shelf(high, 1, gain_db, fm, fs);
+    }
+
+    let mut out = Cascade { sections: [Section::IDENTITY; 10], count: 0 };
+    if n < 2.0 {
+        let fraction = n - 1.0;
+        let shape = n - 0.4 * fraction * (1.0 - fraction);
+        let boost = gain_db > 0.0;
+        let g = libm::pow(10.0, -gain_db.abs() / 20.0);
+        let a = libm::pow(g, 0.25);
+        let q2 = 2.0 * libm::sin(PI / (2.0 * shape));
+        let k = libm::tan(PI * fm / fs);
+        out.sections[0] = shelf_factor(high, boost, a, Some(q2), k);
+        out.count = 1;
+        return out;
+    }
+
+    let fraction = n.fract();
+    let easing = (0.6 - 0.04 * n).max(0.2);
+    let shape = n - easing * fraction * (1.0 - fraction);
+    let pairs = (n / 2.0).floor() as u32;
+    let boost = gain_db > 0.0;
+    let g = libm::pow(10.0, -gain_db.abs() / 20.0);
+    let a = libm::pow(g, 1.0 / (2.0 * shape));
+    let k = libm::tan(PI * fm / fs);
+    for i in 0..pairs {
+        let q2 = 2.0 * libm::sin(PI * (2 * i + 1) as f64 / (2.0 * shape));
+        out.sections[out.count] = shelf_factor(high, boost, a, Some(q2), k);
+        out.count += 1;
+    }
+    let used = 2.0 * pairs as f64 / shape;
+    let remainder_db = gain_db * (1.0 - used);
+    if remainder_db.abs() > 1e-12 {
+        let ar = libm::pow(10.0, -remainder_db.abs() / 40.0);
+        out.sections[out.count] = shelf_factor(high, remainder_db > 0.0, ar, None, k);
+        out.count += 1;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

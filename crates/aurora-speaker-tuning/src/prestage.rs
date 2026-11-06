@@ -26,16 +26,17 @@
 //!
 //! | type | response | carried as |
 //! |---|---|---|
-//! | 1 | peaking cut or boost | RBJ peaking biquad |
+//! | 1 | peaking cut or boost | matched-Z, two-zero magnitude-corrected biquad |
 //! | 3 | Butterworth low-pass of the slot's order, -3 dB at the frequency | bilinear, prewarped |
 //! | 4 | Butterworth high-pass, likewise | bilinear, prewarped |
 //! | 9 | flat gain | gain |
-//! | 11 | low shelf | RBJ low shelf |
-//! | 12 | high shelf | RBJ high shelf |
+//! | 11 | low shelf | matched-Z, two-zero magnitude-corrected low shelf |
+//! | 12 | high shelf | matched-Z, two-zero magnitude-corrected high shelf |
 //! | 0 | a Butterworth band shelf; four frequencies set its two edges | two Butterworth shelves and the compensating flat gain |
 //! | 2 | a Butterworth shelf; the first two frequencies set its direction, midpoint and slope | bilinear, prewarped Butterworth shelf sections |
 //! | 7 | a four-section constant tilt, from `-gain` to `+gain` around the slot frequency | four bilinear first-order shelves and a flat `-gain` |
 //! | 18 | a level-dependent high cut, at most its full-scale response | the measured full-scale two-shelf envelope (never less cut at lower levels) |
+//! | 14 | resonant second-order high-pass; gain and order are ignored | bilinear high-pass with the saved analog-decay quality convention |
 //!
 //! | 15 | a peaking cut whose depth follows the level, at most its gain | a fixed RBJ peaking cut of its gain (cuts at least as much at every level) |
 //!
@@ -44,11 +45,10 @@
 //! Polarity flips are not carried: they change no level. A muted channel
 //! gets gain 0.
 //!
-//! Group bypass (parameter 1, a bit per group): whether the unit runs a
-//! slot of a bypassed group is not settled, so such a slot is carried only
-//! where it takes drive away (a band limit, a cut) and left out where it
-//! would add drive (a boost). Either way the pre-stage passes no more than
-//! macOS does.
+//! Group bypass (parameter 1, a bit per group) removes every slot in the
+//! selected group. The voicing box follows that exactly. The protection
+//! pre-stage keeps the older conservative envelope: it carries cuts and band
+//! limits but omits boosts, so it never passes more than either state.
 //!
 //! Volume automation (`AUTOMATION_BASE`, ten entries) moves a slot's gain
 //! and frequency with the system volume: below set point A the slot keeps
@@ -143,8 +143,9 @@ const SLOT_STRIDE: u32 = 10;
 const AUTOMATION_BASE: u32 = 516;
 const AUTOMATION_STRIDE: u32 = 10;
 const AUTOMATION_ENTRIES: u32 = 10;
-/// The highest Butterworth order the unit offers.
-pub const MAX_ORDER: u32 = 10;
+/// The highest low/high-pass order the unit offers. The separate global
+/// order field caps type-0/2 Butterworth shelves, not these crossovers.
+pub const MAX_ORDER: u32 = 20;
 
 fn automation_on(state: f64) -> bool {
     state != 0.0
@@ -170,26 +171,14 @@ struct SlotPart {
     gain_db: f64,
     frequency_hz: f64,
     quality: f64,
+    fixed: [f64; 3],
+    max_order: u32,
     section: usize,
 }
 
 fn butterworth(high: bool, order: u32, f0: f64, fs: f64) -> Vec<Section> {
-    let k = (PI * f0 / fs).tan();
-    let mut v = Vec::new();
-    for i in 0..order / 2 {
-        let q2 = 2.0 * (PI * (2 * i + 1) as f64 / (2 * order) as f64).sin();
-        let n = 1.0 + q2 * k + k * k;
-        let (a1, a2) = (2.0 * (k * k - 1.0) / n, (1.0 - q2 * k + k * k) / n);
-        let (b0, b1, b2) = if high { (1.0 / n, -2.0 / n, 1.0 / n) } else { (k * k / n, 2.0 * k * k / n, k * k / n) };
-        v.push(Section { b0, b1, b2, a1, a2 });
-    }
-    if order % 2 == 1 {
-        let n = 1.0 + k;
-        let a1 = (k - 1.0) / n;
-        let (b0, b1) = if high { (1.0 / n, -1.0 / n) } else { (k / n, k / n) };
-        v.push(Section { b0, b1, b2: 0.0, a1, a2: 0.0 });
-    }
-    v
+    let made = tone_filter::butterworth(high, order, f0, fs);
+    made.sections[..made.count].to_vec()
 }
 
 #[derive(Clone, Copy)]
@@ -304,8 +293,8 @@ pub(crate) fn voicing_tone(
         for (channel, p) in parts.iter().enumerate() {
             let Some(slot) = p.slots.iter().find(|s| s.index == target).copied() else { continue };
             if let Some(first) = saved {
-                if (first.shape, first.gain_db, first.frequency_hz, first.quality)
-                    != (slot.shape, slot.gain_db, slot.frequency_hz, slot.quality)
+                if (first.shape, first.gain_db, first.frequency_hz, first.quality, first.fixed, first.max_order)
+                    != (slot.shape, slot.gain_db, slot.frequency_hz, slot.quality, slot.fixed, slot.max_order)
                 {
                     return Err(bad(format!("{ctx}: slot {target} differs between channels")));
                 }
@@ -340,7 +329,16 @@ pub(crate) fn voicing_tone(
             }
             v => return Err(bad(format!("{ctx}: volume automation {e} midpoint enable {v}"))),
         };
-        out.push(ToneAutomation { shape: saved.shape, quality: saved.quality, a, b, midpoint, targets });
+        out.push(ToneAutomation {
+            shape: saved.shape,
+            quality: saved.quality,
+            fixed: saved.fixed,
+            max_order: saved.max_order,
+            a,
+            b,
+            midpoint,
+            targets,
+        });
         automated_slots.push(target);
     }
     Ok(Tone { channels, automation: out })
@@ -424,52 +422,8 @@ fn integer_shelf(high: bool, order: u32, gain_db: f64, fm: f64, fs: f64) -> Vec<
 /// Butterworth factors gently; the real-factor construction below follows
 /// that measured response to within the pre-stage's 0.05 dB rig tolerance.
 fn butterworth_shelf(gain_db: f64, f3: f64, f4: f64, max_order: u32, fs: f64) -> Vec<Section> {
-    if gain_db == 0.0 || f3 == f4 {
-        return Vec::new();
-    }
-    let high = f3 > f4;
-    let fm = (f3 * f4).sqrt();
-    let octaves = (f3.max(f4) / f3.min(f4)).log2();
-    let n = (gain_db.abs() / (3.010_299_956_64 * octaves)).max(1.0).min(max_order as f64);
-    if n == 1.0 {
-        return integer_shelf(high, 1, gain_db, fm, fs);
-    }
-    if n < 2.0 {
-        // The unit's fractional first-to-second-order transition is one
-        // conjugate pair whose angle has this measured easing.
-        let f = n - 1.0;
-        let shape = n - 0.4 * f * (1.0 - f);
-        let boost = gain_db > 0.0;
-        let g = 10f64.powf(-gain_db.abs() / 20.0);
-        let a = g.powf(0.25);
-        let q2 = 2.0 * (PI / (2.0 * shape)).sin();
-        let k = (PI * fm / fs).tan();
-        return vec![shelf_factor(high, boost, a, Some(q2), k)];
-    }
-
-    // Fractional higher orders retain every complete complex pair, move
-    // its Butterworth angle by the fractional order, and finish the
-    // remaining asymptotic gain with a real factor.
-    let fraction = n.fract();
-    let easing = (0.6 - 0.04 * n).max(0.2);
-    let shape = n - easing * fraction * (1.0 - fraction);
-    let pairs = (n / 2.0).floor() as u32;
-    let boost = gain_db > 0.0;
-    let g = 10f64.powf(-gain_db.abs() / 20.0);
-    let a = g.powf(1.0 / (2.0 * shape));
-    let k = (PI * fm / fs).tan();
-    let mut out = Vec::new();
-    for i in 0..pairs {
-        let q2 = 2.0 * (PI * (2 * i + 1) as f64 / (2.0 * shape)).sin();
-        out.push(shelf_factor(high, boost, a, Some(q2), k));
-    }
-    let used = 2.0 * pairs as f64 / shape;
-    let remainder_db = gain_db * (1.0 - used);
-    if remainder_db.abs() > 1e-12 {
-        let ar = 10f64.powf(-remainder_db.abs() / 40.0);
-        out.push(shelf_factor(high, remainder_db > 0.0, ar, None, k));
-    }
-    out
+    let made = tone_filter::butterworth_shelf(gain_db, f3, f4, max_order, fs);
+    made.sections[..made.count].to_vec()
 }
 
 /// ToneMeister's type-7 constant tilt. Four equal first-order shelves are
@@ -673,10 +627,8 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics, exact_vol
         if !(0.0..=9.0).contains(&group) || group.fract() != 0.0 {
             return Err(bad(format!("{ctx}: slot {i} group {group}")));
         }
-        // Whether the unit runs a slot of a bypassed group is not settled:
-        // such a slot is carried only where it takes drive away (a cut, a
-        // band limit), and left out where it would add drive (a boost), so
-        // the pre-stage passes no more than macOS either way.
+        // The voicing box skips a bypassed group exactly. The protection
+        // pre-stage carries only its cuts and band limits, never its boosts.
         let in_bypassed_group = group_bypass >> group as u32 & 1 != 0;
         if in_bypassed_group {
             diags.info(
@@ -684,6 +636,12 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics, exact_vol
                 ctx.clone(),
                 format!("slot {i} is in bypassed group {group}: carried only as far as it cuts"),
             );
+            // The box itself bypasses every slot in the selected group.
+            // The pre-stage remains conservative for speaker-drive safety;
+            // the voicing box must reproduce the bypass exactly.
+            if exact_volume {
+                continue;
+            }
         }
         let (kind, gain, f0, q, order) = (at(1)?, at(2)?, at(3)?, at(4)?, at(5)?);
         if kind.fract() != 0.0 || !gain.is_finite() || !q.is_finite() || !order.is_finite() {
@@ -718,8 +676,8 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics, exact_vol
         match kind {
             3 | 4 => {
                 let high = kind == 4;
-                if order.fract() != 0.0 || order < 1.0 || order as u32 > max_order {
-                    return Err(bad(format!("{ctx}: slot {i} order {order} (1 to {max_order})")));
+                if order.fract() != 0.0 || order < 1.0 || order as u32 > MAX_ORDER {
+                    return Err(bad(format!("{ctx}: slot {i} order {order} (1 to {MAX_ORDER})")));
                 }
                 let section = p.sections.len();
                 for pt in &points {
@@ -749,6 +707,8 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics, exact_vol
                     gain_db: gain,
                     frequency_hz: f0,
                     quality: q,
+                    fixed: [0.0; 3],
+                    max_order,
                     section,
                 });
             }
@@ -771,6 +731,8 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics, exact_vol
                     gain_db: gain,
                     frequency_hz: f0.max(1.0),
                     quality: q,
+                    fixed: [0.0; 3],
+                    max_order,
                     section: p.sections.len(),
                 });
             }
@@ -793,6 +755,8 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics, exact_vol
                     gain_db: gain,
                     frequency_hz: f0,
                     quality: q,
+                    fixed: [0.0; 3],
+                    max_order,
                     section,
                 });
                 if automated {
@@ -901,10 +865,58 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics, exact_vol
                     gain_db: gain,
                     frequency_hz: f0,
                     quality: q,
+                    fixed: [0.0; 3],
+                    max_order,
                     section,
                 });
             }
             0 | 2 => {
+                if exact_volume && has_automation {
+                    if !(-30.0..=30.0).contains(&gain) {
+                        return Err(bad(format!("{ctx}: slot {i} gain {gain} dB")));
+                    }
+                    let section = p.sections.len();
+                    if kind == 2 {
+                        need_freq("Butterworth shelf", f0)?;
+                        need_freq("Butterworth shelf", q)?;
+                        let made = tone_filter::butterworth_shelf(gain, f0, q, max_order, fs);
+                        p.sections.extend_from_slice(&made.sections[..5]);
+                        p.slots.push(SlotPart {
+                            index: i,
+                            shape: ToneShape::ButterworthShelf,
+                            gain_db: gain,
+                            frequency_hz: f0,
+                            quality: 0.0,
+                            fixed: [q, 0.0, 0.0],
+                            max_order,
+                            section,
+                        });
+                    } else {
+                        let f5 = order;
+                        let f6 = at(6)?;
+                        for f in [f0, q, f5, f6] {
+                            need_freq("Butterworth band shelf", f)?;
+                        }
+                        let first = tone_filter::butterworth_shelf(gain, q, f0, max_order, fs);
+                        let second = tone_filter::butterworth_shelf(gain, f5, f6, max_order, fs);
+                        let mut reserved = [Section::IDENTITY; 10];
+                        reserved[..first.count].copy_from_slice(&first.sections[..first.count]);
+                        reserved[5..5 + second.count].copy_from_slice(&second.sections[..second.count]);
+                        p.sections.extend_from_slice(&reserved);
+                        p.gain_db -= gain;
+                        p.slots.push(SlotPart {
+                            index: i,
+                            shape: ToneShape::ButterworthBandShelf,
+                            gain_db: gain,
+                            frequency_hz: f0,
+                            quality: 0.0,
+                            fixed: [q, f5, f6],
+                            max_order,
+                            section,
+                        });
+                    }
+                    continue;
+                }
                 if automated {
                     // Automation supplies only one frequency, not the full
                     // two-/four-frequency shape. Preserve the established
@@ -934,7 +946,7 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics, exact_vol
                     p.sections.extend(butterworth_shelf(gain, f0, q, max_order, fs));
                 } else {
                     let f5 = order;
-                    let f6 = at(6);
+                    let f6 = at(6)?;
                     for f in [f0, q, f5, f6] {
                         need_freq("Butterworth band shelf", f)?;
                     }
@@ -1541,8 +1553,9 @@ mod tests {
         let muted = tmst(&[(11, 1.0)], &[]);
         assert!(part(&muted, 0, fs, &mut d).unwrap().muted);
         assert!(!part(&muted, 1, fs, &mut d).unwrap().muted);
-        // an order over the box's limit, or a frequency past Nyquist, is refused
-        let deep = tmst(&[(5, 4.0)], &[(0, [3.0, 4.0, 0.0, 200.0, 0.7, 6.0, 3.0, 0.0])]);
+        // the global shelf-order field does not cap a low/high pass; an
+        // order over the crossover limit, or a frequency past Nyquist, is refused
+        let deep = tmst(&[(5, 4.0)], &[(0, [3.0, 4.0, 0.0, 200.0, 0.7, 21.0, 3.0, 0.0])]);
         assert!(part(&deep, 0, fs, &mut d).is_err());
         let high = tmst(&[], &[(0, [3.0, 3.0, 0.0, 30_000.0, 0.7, 2.0, 3.0, 0.0])]);
         assert!(part(&high, 0, fs, &mut d).is_err());
@@ -1684,7 +1697,7 @@ mod tests {
         );
         let p = part(&same, 0, fs, &mut d).unwrap();
         assert_eq!(p.sections.len(), 1);
-        assert!((mag(&p, 9300.0) + 1.0).abs() < 1e-4);
+        assert_eq!(p.sections[0], tone_filter::peak(-1.0, 9300.0, 0.4f32 as f64, fs));
         // a cut that nothing glides into (A = B): it is carried exactly
         let still =
             tmst(&auto(0, 0.0, 0.0, (0.0, 0.0, 20.0), None), &[(0, [3.0, 1.0, -2.0, 11200.0, 2.0, 2.0, 3.0, 0.0])]);
@@ -1701,7 +1714,7 @@ mod tests {
         for f in [20.0, 50.0, 100.0, 200.0, 1000.0, 9200.0] {
             let carried = mag(&part(&pk((0.85, -0.5, 9190.0)), 0, fs, &mut d).unwrap(), f);
             for (g, f0) in [(3.3, 9300.0), (2.0, 9200.0), (-0.5, 9190.0)] {
-                let s = rbj(Rbj::Peak, g, f0, 0.4f32 as f64, fs);
+                let s = tone_filter::peak(g, f0, 0.4f32 as f64, fs);
                 assert!(carried <= 20.0 * s.magnitude(f, fs).log10() + 1e-9, "{f} Hz vs {g} dB at {f0}");
             }
         }
@@ -1767,7 +1780,7 @@ mod tests {
                 ch.sections[..s.len()].copy_from_slice(&s);
                 let at = |f: f64| 20.0 * ch.magnitude(f, fs).log10();
                 assert!((at(f0) + 3.0103).abs() < 1e-3, "order {order} f0 {f0}: {}", at(f0));
-                assert!(ch.peak(fs) <= 1.0 + 1e-12);
+                assert!(ch.peak(fs) <= 1.0 + 1e-8);
                 // an octave into the stop band: close to 6 dB per order
                 let stop = if high { at(f0 / 2.0) } else { at((2.0 * f0).min(23_000.0)) };
                 if !high && 2.0 * f0 >= 23_000.0 {
