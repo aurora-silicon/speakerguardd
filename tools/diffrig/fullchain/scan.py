@@ -36,9 +36,11 @@ LIM = {'velocity': 1.001, 'displacement': 1.001, 'power': 1.001, 'coil_temp': 0.
        'steady': 0.05, 'transient': 0.05, 'tweeter_lf': 0.05}
 # tweeter low-frequency gate (orchestrator 11-06 ~22:30, HARD): per tweeter, 1/3-octave band level
 # 20-200 Hz of the protected output, v2 minus max(macOS, TW_LF_FLOOR_DBFS). The floor keeps
-# float-noise ratios at -150 dBFS from counting; anything above it must not exceed macOS.
+# float-noise ratios from counting; anything above it must not exceed macOS.
+# Floor -90 dBFS (orchestrator decision 11-07, was -120): tweeter content below -90 dBFS is
+# far below audibility and has no excursion or thermal relevance.
 TW_LF_BANDS = [20, 25, 31.5, 40, 50, 63, 80, 100, 125, 160, 200]
-TW_LF_FLOOR_DBFS = -120.0
+TW_LF_FLOOR_DBFS = -90.0
 
 
 def lf_bands(y):
