@@ -92,6 +92,11 @@ SINE_HZ = (20, 25, 31.5, 40, 50, 63, 80, 100, 125, 160, 200, 250, 315, 400,
 SINE_DBFS = (0, -12)
 PHASE_HZ_MAX = 500  # low tones also run with the channels in anti-phase
 BURST_HZ = (63, 125, 250, 1000)
+# Two tones: full-scale sub-bass under a tone near woofer resonance. A
+# multiband compressor's detector placed after the driver filters no longer
+# sees the sub-bass, so single tones cannot show a chain-order difference.
+DUO_SUB_HZ = (25, 31.5, 40)
+DUO_TONE_HZ = (100, 125, 160, 200, 250)
 DEFAULT_VOLUMES = (1.0, 0.5, 0.25)
 
 
@@ -442,6 +447,7 @@ def default_cases():
             if f <= PHASE_HZ_MAX:
                 cases.append(f"sineanti_{f:g}_{-lv}")
     cases += [f"burst_{f:g}" for f in BURST_HZ]
+    cases += [f"duo_{a:g}_{b:g}" for a in DUO_SUB_HZ for b in DUO_TONE_HZ]
     cases += ["square_100_1", "sweep_log_0", "pink_6", "pink_long_0"]
     return cases
 
@@ -455,6 +461,11 @@ def make_signal(case, fs, rng_seed=20261106):
         a = 10 ** (-float(lv) / 20)
         l = [a * math.sin(2 * math.pi * float(f) * i / fs) for i in range(n2)]
         return l, ([-v for v in l] if kind == "sineanti" else list(l))
+    if kind == "duo":
+        fa, fb = (float(v) for v in rest.split("_"))
+        a, b = 10 ** (-1 / 20) / 1.5, 10 ** (-1 / 20) * 0.5 / 1.5
+        l = [a * math.sin(2 * math.pi * fa * i / fs) + b * math.sin(2 * math.pi * fb * i / fs) for i in range(2 * fs)]
+        return l, list(l)
     if kind == "burst":
         f = float(rest)
         on, period = int(0.1 * fs), int(0.5 * fs)

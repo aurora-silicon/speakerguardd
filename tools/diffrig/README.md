@@ -33,6 +33,6 @@ Golden vectors made with a Mac's tuning are Apple-derived data and stay outside 
 
 It fails closed: a tuning missing a required case or volume, a driver without a complete model, a torn or non-finite render, or renders of different lengths all fail.
 
-- `never_above.py signals OUT` writes the required stereo case set (third-octave sines at 0 and -12 dBFS, anti-phase low tones, bursts, a square, a log sweep, pink noise, a 60 s pink thermal case).
+- `never_above.py signals OUT` writes the required stereo case set (third-octave sines at 0 and -12 dBFS, anti-phase low tones, bursts, sub-bass plus resonance-band two-tones, a square, a log sweep, pink noise, a 60 s pink thermal case).
 - Each side's renderer runs every case through the full chain at each required volume and writes the per-driver amplifier-input audio; the manifest (format in the script's docstring) pairs them with the per-driver models. Renders, models and manifests made with a Mac's tuning are Apple-derived and stay outside this repository.
 - `never_above.py gate MANIFEST --report OUT.json` gives the verdict. Integrators run it on every Mac's tuning before merging a change to the voicing chain, the pre-stage or a protection unit; CI runs `--self-test` on synthetic data.
