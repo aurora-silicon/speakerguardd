@@ -76,11 +76,12 @@
 //!   raised-cosine attack to 0.99 x the request then hold, or a recovery on
 //!   the 99 % response table realigned each decision).
 //! - **Slow gain** (power, temperature, linked across channels; residuals
-//!   2.4): released provisionally toward the ordinary request; the
-//!   output-temperature ceiling solves the absolute ordinary request on the
-//!   fast-gained retained frame and look-ahead as `B + g L + g^2 Q`; a lower
-//!   result makes a second follower call toward 0.99 x the request. The audio
-//!   applies the slow trajectory after summing the fast-gained bands.
+//!   2.4): the output-temperature ceiling solves the absolute ordinary
+//!   request on the fast-gained retained frame and look-ahead as
+//!   `B + g L + g^2 Q`; the idle follower releases toward that solved request,
+//!   and a result below its provisional endpoint makes a second follower call
+//!   toward 0.99 x the request. The audio applies the slow trajectory after
+//!   summing the fast-gained bands.
 //! - **Monitor** (rig laws 3, 4, 11): on the protected output, `u = Vfs y`;
 //!   the Float32 substep mean of `u i` drives the two thermal branches
 //!   (residuals 2.1: `theta += alpha (R_eff P - theta)`), and `Pamp = idle + ratio max(mean(u i), 0) (Rdc + Rpar) /
@@ -1152,8 +1153,9 @@ pub fn fir_reversed(rev_taps: &[f32], window: &[f32]) -> f32 {
 
 /// The applied slow gain (residuals 2.4): a downward decision targets 0.99
 /// x the request along the first half of a periodic raised cosine of `len`
-/// samples from the gain already reached, then holds; restartable. An
-/// upward decision sets the frame's provisionally advanced gain.
+/// samples from the gain already reached, then holds; restartable. An idle
+/// follower realigns its exponential recovery toward the solved request on
+/// every decision.
 #[derive(Clone, Copy)]
 struct SlowGain {
     g: f32,
@@ -1161,27 +1163,44 @@ struct SlowGain {
     target: f32,
     n: u32,
     len: u32,
+    attack: bool,
 }
 
 impl SlowGain {
     fn unity(len: u32) -> Self {
-        SlowGain { g: 1.0, start: 1.0, target: 1.0, n: len, len }
+        SlowGain { g: 1.0, start: 1.0, target: 1.0, n: 0, len, attack: false }
     }
-    /// An upward step: the gain is `g` from now on.
+    /// A held gain, used at reset and hand-off.
     fn set(&mut self, g: f32) {
         self.g = g;
         self.start = g;
         self.target = g;
-        self.n = self.len;
+        self.n = 0;
+        self.attack = false;
+    }
+    fn released_toward(mut self, request: f32) -> Self {
+        if !self.attack || self.n >= self.len {
+            self.start = self.g;
+            self.target = request.clamp(self.g, 1.0);
+            self.n = 0;
+            self.attack = false;
+        }
+        self
     }
     #[inline]
-    fn sample(&mut self) -> f32 {
-        if self.n < self.len {
+    fn sample(&mut self, release_lambda: f64) -> f32 {
+        if self.attack {
+            if self.n < self.len {
+                self.n += 1;
+                let w = 0.5 * (1.0 + libm::cos(core::f64::consts::PI * self.n as f64 / self.len as f64));
+                self.g = (self.target as f64 + (self.start as f64 - self.target as f64) * w) as f32;
+            } else {
+                self.g = self.target;
+            }
+        } else if self.start != self.target {
             self.n += 1;
-            let w = 0.5 * (1.0 + libm::cos(core::f64::consts::PI * self.n as f64 / self.len as f64));
-            self.g = (self.target as f64 + (self.start as f64 - self.target as f64) * w) as f32;
-        } else {
-            self.g = self.target;
+            let r = (1.0 - libm::exp(-(self.n as f64) * release_lambda)).min(1.0) as f32;
+            self.g = self.start + r * (self.target - self.start);
         }
         self.g
     }
@@ -1466,6 +1485,7 @@ struct Run {
     ratio: f64,
     a_fast: f64,
     a_low: f64,
+    slow_lambda: f64,
     slow_step: f64,
     linked_power: f64,
     /// `10^(-MaxPowerAttenuation/20)`.
@@ -1673,6 +1693,7 @@ impl Run {
             ratio: p.low_rail_power_ratio as f64,
             a_fast: release_lambda(rate, p.fast_release_time_ms as f64 * 1e-3),
             a_low: release_lambda(rate, p.low_band_release_time_ms as f64 * 1e-3),
+            slow_lambda: release_lambda(rate, p.slow_release_time_ms as f64 * 1e-3),
             slow_step: settle_step(ctl_dt, p.slow_release_time_ms as f64 * 1e-3),
             linked_power: 1.0,
             power_floor: db_to_lin(p.max_power_attenuation_db as f64),
@@ -1838,7 +1859,7 @@ impl Run {
         self.ring = (self.ring + SUBSTEPS) % self.ring_len;
         let (ctl, sub, od) = (self.ctl, self.sub, self.od);
         let fbl = self.fb;
-        let slow_step = self.slow_step;
+        let slow_lambda = self.slow_lambda;
         let ring_len = self.ring_len;
         let window_max = |r: &[f32; RING]| r[..ring_len].iter().copied().fold(0.0f32, f32::max);
         let ratio = |limit: f64, q: f32| (limit / (q as f64).max(EPS)).min(1.0);
@@ -1873,8 +1894,15 @@ impl Run {
             // gain with this frame's provisional recovery estimate
             let sg = {
                 let f = c.slow;
-                let e =
-                    if f.n < f.len { f.target } else { (f.g as f64 + slow_step * (1.0 - f.g as f64)).min(1.0) as f32 };
+                let e = if f.attack && f.n < f.len {
+                    f.target
+                } else {
+                    let mut e = f.released_toward(1.0);
+                    for _ in 0..ctl {
+                        e.sample(slow_lambda);
+                    }
+                    e.g
+                };
                 (e as f64).clamp(EPS, 1.0) as f32
             };
             let disp_on = self.axis[1];
@@ -2108,34 +2136,21 @@ impl Run {
             let m = req[..n].iter().copied().fold(1.0f64, f64::min);
             req[..n].iter_mut().for_each(|r| *r = m);
         }
-        // residuals 2.4, in its native order: (1) an idle slow follower
-        // releases one decision toward the ordinary power/temperature
-        // request; (2) the output-temperature ceiling solves that absolute
-        // request on the fast-gained waveform at slow unity, over the
-        // retained frame and look-ahead; (3) a lower result makes one
-        // downward follower call from the provisionally advanced value
-        // toward 0.99 x the absolute request. The provisional trajectory is
-        // follower state only: baking it into B/L/Q and normalizing the
-        // proposal by its endpoint is not equivalent because the ceiling's
-        // root corrections multiply the proposal. Recovery follows the
-        // ordinary request, not unity: otherwise a capped power candidate
-        // repeatedly below unity releases too quickly between program peaks.
+        // residuals 2.4, in its native order: (1) the output-temperature
+        // ceiling solves the absolute ordinary power/temperature request on
+        // the fast-gained waveform at slow unity, over the retained frame and
+        // look-ahead; (2) an idle slow follower releases one decision toward
+        // that solved request; (3) a result below the provisionally advanced
+        // endpoint makes one downward follower call toward 0.99 x the solved
+        // request. Thus recovery follows the ceiling while it binds, and the
+        // ordinary request otherwise. The provisional trajectory is follower
+        // state only: baking it into B/L/Q and normalizing the proposal by its
+        // endpoint is not equivalent because the ceiling's root corrections
+        // multiply the proposal.
         let mut prov = [SlowGain::unity(1); MAX_CHANNELS];
         let mut end = [1.0f32; MAX_CHANNELS];
         let mut want = [1.0f32; MAX_CHANNELS];
-        for (ci, c) in self.ch.iter().enumerate() {
-            let mut f = c.slow;
-            if f.n >= f.len {
-                let a = f.g as f64;
-                let target = req[ci].clamp(a, 1.0);
-                f.set((a + self.slow_step * (target - a)).min(1.0) as f32);
-            }
-            prov[ci] = f;
-            let mut e = f;
-            for _ in 0..ctl {
-                e.sample();
-            }
-            end[ci] = e.g;
+        for ci in 0..n {
             want[ci] = req[ci] as f32;
         }
         if self.axis[4] {
@@ -2147,17 +2162,27 @@ impl Run {
             let m = want[..n].iter().copied().fold(1.0f32, f32::min);
             want[..n].iter_mut().for_each(|v| *v = m);
         }
+        for (ci, c) in self.ch.iter().enumerate() {
+            let f = c.slow.released_toward(want[ci]);
+            prov[ci] = f;
+            let mut e = f;
+            for _ in 0..ctl {
+                e.sample(slow_lambda);
+            }
+            end[ci] = e.g;
+        }
         for (ci, c) in self.ch.iter_mut().enumerate() {
             let request = want[ci];
             if request < end[ci] {
                 let mut f = prov[ci];
                 for _ in 0..ctl {
-                    f.sample();
+                    f.sample(slow_lambda);
                 }
                 // the second call starts at the provisionally advanced value
                 f.start = f.g;
                 f.target = (CUT * request as f64) as f32;
                 f.n = 0;
+                f.attack = true;
                 c.slow = f;
             } else {
                 c.slow = prov[ci];
@@ -2173,7 +2198,7 @@ impl Run {
             let mut protected_model_peak = 0.0f32;
             let (mut p1, mut p1s) = (0.0f64, 0.0f64);
             for (i, yo) in y.iter_mut().enumerate().take(ctl) {
-                let sg = c.slow.sample();
+                let sg = c.slow.sample(slow_lambda);
                 let g0 = c.eg[0][i] * sg;
                 let mut same = true;
                 let mut g = [0.0f32; BANDS];
@@ -2600,6 +2625,24 @@ mod fault_tests {
             let (o, h) = run(&mut u, 0.01, 2048);
             assert_eq!((o[2047], h), (0.01, Health::OK));
         }
+    }
+
+    #[test]
+    fn slow_recovery_follows_the_solved_ceiling_request() {
+        let mut f = SlowGain::unity(256);
+        f.set(0.4);
+        let step = 0.125;
+        let ceiling = 0.6;
+        let lambda = -libm::log(1.0 - step);
+        let mut got = f.released_toward(ceiling);
+        assert_eq!(got.g, 0.4);
+        got.sample(lambda);
+        assert_eq!(got.g, 0.425);
+
+        // A lower solve is an attack request, not a provisional release.
+        let mut lower = f.released_toward(0.3);
+        lower.sample(lambda);
+        assert_eq!(lower.g, f.g);
     }
 
     #[test]
