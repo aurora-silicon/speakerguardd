@@ -1298,6 +1298,7 @@ struct Chan {
     /// controller-frame peak.
     protected_peak: ProtectedPeak,
     protected_peak_now: f32,
+    protected_peak_advanced: bool,
     /// Per-substep peaks over the window (ring of RING slots).
     pk_x: [f32; RING],
     pk_d: [f32; RING],
@@ -1652,6 +1653,7 @@ impl Run {
                 vcar_m: Biquad32::from(&vel),
                 protected_peak: ProtectedPeak::new(rate as usize),
                 protected_peak_now: 0.0,
+                protected_peak_advanced: false,
                 rd: vec![0.0; od + ctl],
                 vcar: vec![0.0; od + ctl],
                 pk_x: [0.0; RING],
@@ -1800,6 +1802,7 @@ impl Run {
             c.vcar_m.clear();
             c.protected_peak.clear();
             c.protected_peak_now = 0.0;
+            c.protected_peak_advanced = false;
             c.vcar.iter_mut().chain(c.rd.iter_mut()).for_each(|v| *v = 0.0);
             c.eg.iter_mut().for_each(|e| e.iter_mut().for_each(|v| *v = 1.0));
             c.cur_in.clear();
@@ -2014,6 +2017,7 @@ impl Run {
             }
             let vlim_g = c.vel_limit_now as f32;
             let stream_ready = c.protected_peak.ready();
+            c.protected_peak_advanced = false;
             let prior_bound = c.vel_bound_window.last().copied().unwrap_or(0.0);
             let next_bound = if c.vel_bound_release && c.vel_bound_ready {
                 (prior_bound as f64 + velocity_release * (c.vel_limit_now - prior_bound as f64)) as f32
@@ -2037,7 +2041,6 @@ impl Run {
             // protected envelope and the decision-local protected trial owns
             // the segment. This compares existing producer states, not signal
             // levels, spectra, case identities, or fitted thresholds.
-            let mut producer_stream_advanced = false;
             if vel_on && stream_ready && !c.vel_bound_release {
                 let all = (0, BANDS);
                 let mut producer_r = [1.0; BANDS];
@@ -2075,7 +2078,7 @@ impl Run {
                     let stream_source = if onset_bound == 0.0 { 0.25 * vlim_g } else { onset_bound };
                     let stream_bound = c.protected_peak.update(stream_source, len).min(vlim_g);
                     c.protected_peak_now = stream_bound;
-                    producer_stream_advanced = true;
+                    c.protected_peak_advanced = true;
                     let admitted = arbitrate_producer_segment(onset_bound, stream_bound);
                     let segment = &mut c.vel_bound_window[od + offset..od + offset + len];
                     if admitted >= boundary {
@@ -2411,7 +2414,7 @@ impl Run {
                     s += 1;
                 }
             }
-            if !producer_stream_advanced {
+            if !c.protected_peak_advanced {
                 let stream_source = protected_model_peak.max(0.25 * c.vel_limit_now as f32);
                 c.protected_peak_now = c.protected_peak.update(stream_source, ctl);
             }
