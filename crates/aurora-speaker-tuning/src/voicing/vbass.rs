@@ -120,7 +120,7 @@ pub fn compile(stage: &Stage, fs: f64, _diags: &mut Diagnostics) -> Result<Optio
         device,
         level_control,
         harmonic_compressor,
-        compressor_threshold: if harmonic_compressor { db(req(11)?) } else { 1.0 },
+        compressor_threshold_db: if harmonic_compressor { req(11)? } else { 0.0 },
         compressor_ratio: if harmonic_compressor { req(12)? } else { 1.0 },
     };
     let mut w = [0.0; Params::WORDS];
