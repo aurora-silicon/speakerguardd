@@ -219,25 +219,22 @@ impl Device {
 /// The box's own laws: the same on every Mac, never from a tuning.
 mod law {
     /// Type 3 device: `-AMP * tanh(SLOPE * u)`.
-    pub const DEVICE3_AMP: f64 = 3.79488;
-    pub const DEVICE3_SLOPE: f64 = 0.79967;
-    /// Level control. The device input is normalised to a unit peak with
-    /// at most `LC_MAX_DRIVE` of gain; its output is scaled by
-    /// `LC_MAX_DRIVE` times the input's peak envelope and limited so that
-    /// the band-limited harmonics never peak above that envelope.
-    pub const LC_MAX_DRIVE: f64 = 20.0;
-    /// Drive detector: instant attack, hold, then a fixed release in dB/s.
-    pub const LC_DRIVE_HOLD_S: f64 = 0.7;
-    pub const LC_DRIVE_RELEASE_DB_S: f64 = 11.6;
-    /// Envelope and limiter detectors: instant attack, hold, then a release
-    /// in dB/s eased in with a one-pole of `LC_EASE_S`.
-    pub const LC_ENV_HOLD_S: f64 = 0.55;
-    pub const LC_ENV_RELEASE_DB_S: f64 = 10.8;
-    pub const LC_EASE_S: f64 = 0.25;
-    /// Above the drive's knee the envelope rises only after a hold, at a
-    /// rate in dB/s.
-    pub const LC_ENV_UP_HOLD_S: f64 = 0.55;
-    pub const LC_ENV_ATTACK_DB_S: f64 = 9.3;
+    pub const DEVICE3_AMP: f64 = 3.8;
+    pub const DEVICE3_SLOPE: f64 = 0.8;
+    /// Level control: one peak follower on the device input sets the
+    /// drive `1 / max(peak, LC_FLOOR)` (input clipped to `LC_CLIP`); a
+    /// second one on the band-limited device output rescales it by
+    /// `peak_in / max(peak_out, LC_FLOOR)`.
+    pub const LC_FLOOR: f64 = 0.05;
+    pub const LC_CLIP: f64 = 1.2;
+    /// Follower: attack and release one-poles, a hold that restarts while
+    /// the input stays within `LC_HOLD_RATIO` of the level, and a smoothing
+    /// one-pole that follows a rising level at the attack rate.
+    pub const LC_ATTACK_S: f64 = 50e-6;
+    pub const LC_RELEASE_S: f64 = 0.5;
+    pub const LC_HOLD_S: f64 = 0.5;
+    pub const LC_HOLD_RATIO: f64 = 0.9;
+    pub const LC_SMOOTH_S: f64 = 0.5;
     /// The mid branches are band-limited by a Chebyshev type I low pass
     /// working at a quarter-rate design.
     pub const SUB_RATE_HZ: f64 = 12_000.0;
@@ -336,140 +333,62 @@ impl Params {
     }
 }
 
-/// Peak follower. Attack is instant up to `knee`; above it the level
-/// rises only after `up_hold`, at a rate in dB eased in by a one-pole.
-/// Release: after `hold`, the level falls at a rate in dB, eased in the
-/// same way.
+/// Peak follower of the level control.
 #[derive(Clone, Copy, Debug)]
-struct Peak {
-    v: f64,
+struct Follower {
+    e: f64,
+    s: f64,
     held: usize,
     hold: usize,
-    fall: f64,
-    rate: f64,
-    ease: f64,
-    knee: f64,
-    up_held: usize,
-    up_hold: usize,
-    rise: f64,
-    up_rate: f64,
+    a_att: f64,
+    a_rel: f64,
+    a_smo: f64,
 }
 
-impl Peak {
-    #[allow(clippy::too_many_arguments)]
-    fn new(fs: f64, hold_s: f64, release_db_s: f64, ease_s: f64, knee: f64, up_hold_s: f64, attack_db_s: f64) -> Peak {
-        let per = |db_s: f64| db_s / (20.0 * fs) * core::f64::consts::LN_10;
-        Peak {
-            v: 0.0,
+impl Follower {
+    fn new(fs: f64) -> Follower {
+        let pole = |t: f64| libm::exp(-1.0 / (t * fs));
+        Follower {
+            e: 0.0,
+            s: 0.0,
             held: 0,
-            hold: (hold_s * fs) as usize,
-            fall: per(release_db_s),
-            rate: 0.0,
-            ease: if ease_s > 0.0 { 1.0 - libm::exp(-1.0 / (ease_s * fs)) } else { 1.0 },
-            knee,
-            up_held: 0,
-            up_hold: (up_hold_s * fs) as usize,
-            rise: per(attack_db_s),
-            up_rate: 0.0,
+            hold: (law::LC_HOLD_S * fs) as usize + 1,
+            a_att: pole(law::LC_ATTACK_S),
+            a_rel: pole(law::LC_RELEASE_S),
+            a_smo: pole(law::LC_SMOOTH_S),
         }
     }
     #[inline]
     fn run(&mut self, x: f64) -> f64 {
-        let a = libm::fabs(x);
-        if a >= self.v {
+        let u = libm::fabs(x);
+        let (a, b) = if u > self.e {
             self.held = 0;
-            self.rate = 0.0;
-            let fast = a.min(self.v.max(self.knee));
-            if fast > self.v {
-                self.v = fast;
-            }
-            if a > self.v {
-                if self.up_held < self.up_hold {
-                    self.up_held += 1;
-                } else {
-                    self.up_rate += (self.rise - self.up_rate) * self.ease;
-                    self.v = (self.v * libm::exp(self.up_rate)).min(a);
-                }
-            } else {
-                self.up_held = 0;
-                self.up_rate = 0.0;
-            }
+            (self.a_att, if self.e > self.s { self.a_att } else { self.a_smo })
         } else if self.held < self.hold {
             self.held += 1;
+            if u >= law::LC_HOLD_RATIO * self.e {
+                self.held = 0;
+            }
+            (1.0, self.a_smo)
         } else {
-            self.up_held = 0;
-            self.up_rate = 0.0;
-            self.rate += (self.fall - self.rate) * self.ease;
-            self.v = (self.v * libm::exp(-self.rate)).max(a);
-        }
-        self.v
-    }
-}
-
-/// The level control's time and gain constants (the box's own law; see
-/// [`law`]). Exposed only so the differential rig can probe them.
-#[doc(hidden)]
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct LcLaw {
-    pub max_drive: f64,
-    pub drive_hold_s: f64,
-    pub drive_release_db_s: f64,
-    pub drive_ease_s: f64,
-    pub env_hold_s: f64,
-    pub env_release_db_s: f64,
-    pub env_ease_s: f64,
-    pub harm_hold_s: f64,
-    pub harm_release_db_s: f64,
-    pub harm_ease_s: f64,
-    /// The envelope's slow attack above `1 / max_drive`.
-    pub env_up_hold_s: f64,
-    pub env_attack_db_s: f64,
-}
-
-impl Default for LcLaw {
-    fn default() -> LcLaw {
-        LcLaw {
-            max_drive: law::LC_MAX_DRIVE,
-            drive_hold_s: law::LC_DRIVE_HOLD_S,
-            drive_release_db_s: law::LC_DRIVE_RELEASE_DB_S,
-            drive_ease_s: 0.0,
-            env_hold_s: law::LC_ENV_HOLD_S,
-            env_release_db_s: law::LC_ENV_RELEASE_DB_S,
-            env_ease_s: law::LC_EASE_S,
-            harm_hold_s: law::LC_ENV_HOLD_S,
-            harm_release_db_s: law::LC_ENV_RELEASE_DB_S,
-            harm_ease_s: law::LC_EASE_S,
-            env_up_hold_s: law::LC_ENV_UP_HOLD_S,
-            env_attack_db_s: law::LC_ENV_ATTACK_DB_S,
-        }
+            (self.a_rel, self.a_smo)
+        };
+        self.e = a * self.e + (1.0 - a) * u;
+        self.s = b * self.s + (1.0 - b) * self.e;
+        self.s
     }
 }
 
 /// Level control state (only used when the saved state switches it on).
 #[derive(Clone, Copy, Debug)]
 struct LevelControl {
-    law: LcLaw,
-    drive: Peak,
-    env: Peak,
-    harm: Peak,
+    input: Follower,
+    output: Follower,
 }
 
 impl LevelControl {
-    fn new(fs: f64, l: LcLaw) -> LevelControl {
-        LevelControl {
-            law: l,
-            drive: Peak::new(fs, l.drive_hold_s, l.drive_release_db_s, l.drive_ease_s, f64::INFINITY, 0.0, 0.0),
-            env: Peak::new(
-                fs,
-                l.env_hold_s,
-                l.env_release_db_s,
-                l.env_ease_s,
-                1.0 / l.max_drive,
-                l.env_up_hold_s,
-                l.env_attack_db_s,
-            ),
-            harm: Peak::new(fs, l.harm_hold_s, l.harm_release_db_s, l.harm_ease_s, f64::INFINITY, 0.0, 0.0),
-        }
+    fn new(fs: f64) -> LevelControl {
+        LevelControl { input: Follower::new(fs), output: Follower::new(fs) }
     }
 }
 
@@ -567,7 +486,7 @@ impl Run {
             frac_a: if frac == 0.0 { f64::NAN } else { frac_a },
             frac_x: 0.0,
             frac_y: 0.0,
-            lc: LevelControl::new(fs, LcLaw::default()),
+            lc: LevelControl::new(fs),
             latency,
             oline: vec![[0.0; OUT_LINE]; channels],
             opos: 0,
@@ -586,7 +505,7 @@ impl Run {
         self.bline = [0.0; BRANCH_LINE];
         self.frac_x = 0.0;
         self.frac_y = 0.0;
-        self.lc = LevelControl::new(self.fs, self.lc.law);
+        self.lc = LevelControl::new(self.fs);
         for l in &mut self.oline {
             *l = [0.0; OUT_LINE];
         }
@@ -594,12 +513,6 @@ impl Run {
 
     pub fn latency(&self) -> usize {
         self.latency
-    }
-
-    /// Replaces the level-control law (differential rig only).
-    #[doc(hidden)]
-    pub fn set_lc_law(&mut self, l: LcLaw) {
-        self.lc = LevelControl::new(self.fs, l);
     }
 
     pub fn sample_rate(&self) -> f64 {
@@ -649,15 +562,13 @@ impl Run {
             let lo = self.lp.run(&mut self.lp_st, mid);
             let low = self.lp_sign * self.p.blend_gain * self.ap.run(&mut self.ap_st, lo);
             let harm = if self.p.level_control {
-                let pk = self.lc.drive.run(lo);
-                let dmax = self.lc.law.max_drive;
-                let drive = if pk * dmax > 1.0 { 1.0 / pk } else { dmax };
-                let env = self.lc.env.run(lo);
-                let dev = self.device(drive * lo);
-                let hp = self.band_hp.run(&mut self.band_hp_st, dmax * env * dev);
-                let ph = self.lc.harm.run(hp);
-                let g = if ph > env { env / ph } else { 1.0 };
-                self.p.harmonic_gain * g * self.band_lp.run(&mut self.band_lp_st, hp)
+                let p_in = self.lc.input.run(lo);
+                let z = (lo / p_in.max(law::LC_FLOOR)).clamp(-law::LC_CLIP, law::LC_CLIP);
+                let dev = self.device(z);
+                let hp = self.band_hp.run(&mut self.band_hp_st, dev);
+                let p_out = self.lc.output.run(hp);
+                let y = hp * p_in / p_out.max(law::LC_FLOOR);
+                self.p.harmonic_gain * self.band_lp.run(&mut self.band_lp_st, y)
             } else {
                 let dev = self.device(lo);
                 let hp = self.band_hp.run(&mut self.band_hp_st, dev);
