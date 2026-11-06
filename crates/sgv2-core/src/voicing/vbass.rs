@@ -437,6 +437,9 @@ impl Params {
 struct Follower {
     // single precision, as the box's own follower state
     ratio: f32,
+    /// Closest hold-restart test to macOS's own threshold since last
+    /// drained (relative margin), for the differential rig.
+    tie: f32,
     e: f32,
     s: f32,
     held: usize,
@@ -452,6 +455,7 @@ impl Follower {
         let pole = |t: f64| libm::expf(-1.0 / (t as f32 * fs));
         Follower {
             ratio: ratio as f32,
+            tie: f32::INFINITY,
             e: 0.0,
             s: 0.0,
             held: 0,
@@ -470,6 +474,10 @@ impl Follower {
         } else if u < self.e {
             if self.held < self.hold {
                 self.held += 1;
+                let nominal = law::LC_HOLD_RATIO as f32 * self.e;
+                if nominal > 0.0 {
+                    self.tie = self.tie.min(libm::fabsf(u - nominal) / nominal);
+                }
                 if u >= self.ratio * self.e {
                     self.held = 0;
                 }
@@ -608,6 +616,17 @@ impl Run {
 
     pub fn latency(&self) -> usize {
         self.latency
+    }
+
+    /// Closest level-control hold-restart test to macOS's threshold since
+    /// the last call (relative margin; infinity if none). Differential rig
+    /// only: it shows where a near tie may resolve differently from macOS.
+    #[doc(hidden)]
+    pub fn take_tie_margin(&mut self) -> f64 {
+        let m = self.lc.input.tie.min(self.lc.output.tie);
+        self.lc.input.tie = f32::INFINITY;
+        self.lc.output.tie = f32::INFINITY;
+        m as f64
     }
 
     pub fn sample_rate(&self) -> f64 {

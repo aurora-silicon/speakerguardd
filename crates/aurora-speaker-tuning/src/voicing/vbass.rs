@@ -63,6 +63,7 @@ pub fn compile(stage: &Stage, fs: f64, _diags: &mut Diagnostics) -> Result<Optio
             .ok_or_else(|| bad(format!("{ctx}: saved parameter {id} is missing")))
     };
     let opt = |id: u32| g.get(id).map(f64::from).unwrap_or(0.0);
+    // absent bypass = active (the unit's default; it can only add processing)
     if opt(15) != 0.0 {
         return Ok(None);
     }
@@ -70,10 +71,12 @@ pub fn compile(stage: &Stage, fs: f64, _diags: &mut Diagnostics) -> Result<Optio
     if monitor != 1.0 {
         return Err(bad(format!("{ctx}: monitor {monitor} (only the full sum, 1, is carried)")));
     }
-    if opt(10) != 0.0 {
+    // every value that can change the level must be in the saved state
+    // (AUD: a missing negative gain must not read as 0 dB)
+    if req(10)? != 0.0 {
         return Err(bad(format!("{ctx}: the harmonic compressor is on (not carried)")));
     }
-    let level_control = match opt(0) {
+    let level_control = match req(0)? {
         0.0 => false,
         1.0 => true,
         v => return Err(bad(format!("{ctx}: level control {v}"))),
@@ -107,8 +110,8 @@ pub fn compile(stage: &Stage, fs: f64, _diags: &mut Diagnostics) -> Result<Optio
         lower_order: order(6)?,
         harmonic_gain: db(req(7)?),
         blend_gain: db(req(8)?),
-        input_gain: db(opt(13)),
-        output_gain: db(opt(14)),
+        input_gain: db(req(13)?),
+        output_gain: db(req(14)?),
         device,
         level_control,
     };

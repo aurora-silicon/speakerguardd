@@ -55,10 +55,19 @@ fn main() {
     let n = x.len() / 2;
     let mut l: Vec<f32> = (0..n).map(|i| x[2 * i]).collect();
     let mut r: Vec<f32> = (0..n).map(|i| x[2 * i + 1]).collect();
+    // VBASS_TIES=FILE: per 512-frame block, the closest level-control
+    // hold-restart test to macOS's threshold ("seconds margin").
+    let mut ties = std::env::var("VBASS_TIES").ok().map(|f| std::fs::File::create(f).expect("ties"));
     for start in (0..n).step_by(512) {
         let end = (start + 512).min(n);
         let mut bufs = [&mut l[start..end], &mut r[start..end]];
         run.process(&mut bufs, end - start);
+        let m = run.take_tie_margin();
+        if let Some(f) = ties.as_mut() {
+            if m < 0.01 {
+                writeln!(f, "{:.6} {:.3e}", start as f64 / fs, m).expect("ties");
+            }
+        }
     }
     let mut out = Vec::with_capacity(n * 8);
     for i in 0..n {
