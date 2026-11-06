@@ -18,7 +18,7 @@ Traces made with Apple tuning are Apple-derived data. They never enter this repo
 
 | File | Purpose |
 |---|---|
-| `rig_host.m` | Offline host. It sets the preset, `--sidecar`, `--prop ID=u32`, `--plistprop ID=plist` and `--cfprop ID=json`. V/I comes from a file (`--tele`) or from the rig's speaker plant (`--plant plant.json`; every constant is required). `--pace X` keeps rendering at or below X times real time so the units' asynchronous log writers keep up. |
+| `rig_host.m` | Offline host. It sets the preset, `--sidecar`, `--prop ID=u32`, `--plistprop ID=plist` and `--cfprop ID=json`. Telemetry comes from a file (`--tele`) or, for the existing SPP3 V/I path, the rig's speaker plant (`--plant plant.json`; every constant is required). `--pace X` keeps rendering at or below X times real time so the units' asynchronous log writers keep up. |
 | `prefshim.c` | `DYLD_INSERT_LIBRARIES` shim, for this unsigned host process only. It answers the units' CoreFoundation preference lookups from `RIGPREF_<key>` environment variables, so their debug logging can be switched on without writing the user's defaults. It also redirects the log directory (`RIGREDIR_FROM` to `RIGREDIR_TO`). With `RIGPREF_TRACE=1` it reports every key looked up. |
 | `au_discover.m` | Lists a unit's element counts, custom properties (with CF values) and read-only meters. |
 | `capture.py` | The case list. It runs every case through `rig_host` and writes `trace.jsonl` in `../schema.json`, the per-quantum meter CSV, the audio and the unit's own logs. |
@@ -43,28 +43,35 @@ python3 ../run.py "$SGV2_RIG_DIR/traces" "$SGV2_RIG_DIR/signals" OUT   # the Lin
 
 ### LSM2 telemetry input
 
-For an LSM2 reference that needs V/I, add `--lsm2-tele` and set `--tele-ch`
-to twice `--ch`. The host explicitly configures two input buses and verifies
-the count and the second bus's format. LSM2 receives planar float32 telemetry
-at the program sample rate; the `--tele` file and the recorded `.tele.f32`
+For an LSM2 reference with a telemetry input, add `--lsm2-tele` and explicitly
+set `--tele-ch` to the channel count under investigation. The native unit must
+accept that format and initialize successfully. The host configures two input
+buses and verifies the count and the second bus's format. LSM2 receives planar float32 telemetry at the program sample rate; the `--tele` file and the recorded `.tele.f32`
 remain interleaved. Existing runs without this option keep their original
 bus configuration and format.
 
-For example, append `--lsm2-tele --tele-ch 8 --tele feedback.f32` to a
+For example, append `--lsm2-tele --tele-ch 4 --tele feedback.f32` to a
 four-channel LSM2 invocation with its matching strip and property files.
-The option cannot be combined with `--no-tele` or another protection unit.
+The option cannot be combined with `--no-tele`, another protection unit, or
+`--plant`: the plant's V/I pair layout is not established for LSM2.
 
 This mode requires one complete telemetry pull for every render call, with
 the matching frame count and timestamp. A missing, repeated or malformed
 pull, a short telemetry file, or a failed lifecycle/configuration operation
-fails the run. Metadata records `tele_layout`, `tele_callbacks`,
-`tele_frames_consumed` and `tele_rejected_callbacks` so input delivery can be
-checked independently. Bus and format readbacks also run after lifecycle
+fails the run. Metadata records `tele_layout`, `tele_channels_supplied`,
+`tele_callbacks`, `tele_frames_delivered` and `tele_rejected_callbacks` so
+input delivery can be checked independently. Bus and format readbacks also run after lifecycle
 events.
 
-Input delivery alone does not establish that the native estimator accepted
-the samples, their units or their channel order. Verify an estimator response
-before using a capture as a system-identification or closed-loop reference.
+On a macOS 27.2 (26B123) host with J813 tuning, four-channel and eight-channel
+telemetry formats both initialized. Distinct test signals appeared in the
+native signal log as one output and one telemetry signal per audio channel;
+only the first four supplied telemetry channels appeared in that log. This
+observation does not establish physical units or a contract for other builds.
+The current `lsm2logs.py` decoder does not support that signal-log layout.
+
+Callback delivery alone does not establish that every supplied channel was
+used internally or that the native estimator accepted the samples. Verify an estimator response before using a capture as a system-identification or closed-loop reference.
 This option does not change the engine or board qualification gates.
 
 ## Observed host facts

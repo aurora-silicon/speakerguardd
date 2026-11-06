@@ -10,7 +10,7 @@
 //   rig_host --unit spp3|lsm2|atsp --strip X.austrip [--sidecar X.plist] [--spts X.bin]
 //            [--prop ID=U32 ...] --in in.f32 --ch N [--q 512] [--sr 48000]
 //            [--tele tele.f32 --tele-ch 12] [--plant plant.json] [--no-tele]
-//            [--lsm2-tele]  # explicit planar V/I bus: --tele-ch must be 2 * --ch
+//            [--lsm2-tele]  # planar telemetry bus; requires explicit --tele-ch
 //            [--param SCOPE.ELEMENT.ID=VALUE ...]
 //            [--event FRAME:KIND[=ARG] ...] [--every K] --out PREFIX
 //            [--preset-param ID=VALUE ...] [--param-at FRAME:ID=VALUE ...]
@@ -469,7 +469,7 @@ int main(int argc, const char **argv) {
     @autoreleasepool {
         const char *unit = "spp3", *strip = NULL, *sidecar = NULL, *spts = NULL, *in = NULL, *tele = NULL,
                    *plant = NULL, *out = NULL;
-        int nch = 0, q = 512, telech = 12, every = 1, notele = 0, lsm2tele = 0, filech = 0;
+        int nch = 0, q = 512, telech = 12, telechExplicit = 0, every = 1, notele = 0, lsm2tele = 0, filech = 0;
         long long limitframes = 0;
         UInt64 patFrame[MAXPARAT]; UInt32 patId[MAXPARAT]; float patVal[MAXPARAT]; int npat = 0;
         long long failAt = -1; // --test-fail-at FRAME: the rig's own tests; simulates a render error there
@@ -490,7 +490,7 @@ int main(int argc, const char **argv) {
             if (ARG("--unit")) unit = v; else if (ARG("--strip")) strip = v; else if (ARG("--sidecar")) sidecar = v;
             else if (ARG("--spts")) spts = v; else if (ARG("--in")) in = v; else if (ARG("--ch")) nch = atoi(v);
             else if (ARG("--q")) q = atoi(v); else if (ARG("--sr")) sr = atof(v); else if (ARG("--tele")) tele = v;
-            else if (ARG("--tele-ch")) telech = atoi(v); else if (ARG("--plant")) plant = v;
+            else if (ARG("--tele-ch")) { telech = atoi(v); telechExplicit = 1; } else if (ARG("--plant")) plant = v;
             else if (ARG("--every")) every = atoi(v); else if (ARG("--pace")) pace = atof(v); else if (ARG("--maxframes")) maxframes = atoi(v); else if (ARG("--out")) out = v;
             else if (ARG("--prop")) {
                 if (nprops >= MAXPROP) { fprintf(stderr, "too many --prop (max %d)\n", MAXPROP); return 2; }
@@ -556,8 +556,8 @@ int main(int argc, const char **argv) {
         if (filech < 1 || filech > MAXCH || limitframes < 0) { fprintf(stderr, "bad --file-ch or --limit-frames\n"); return 2; }
         if (q < 1 || nch < 1 || every < 1) { fprintf(stderr, "--q, --ch and --every must be positive\n"); return 2; }
         if (telech < 1 || telech > MAXTELE) { fprintf(stderr, "--tele-ch must be 1..%d\n", MAXTELE); return 2; }
-        if (lsm2tele && (strcmp(unit, "lsm2") || notele || telech != 2 * nch || !isfinite(sr) || sr <= 0)) {
-            fprintf(stderr, "--lsm2-tele needs lsm2, positive finite --sr, 2 * --ch telemetry channels, and no --no-tele\n"); return 2;
+        if (lsm2tele && (strcmp(unit, "lsm2") || notele || plant || !telechExplicit || !isfinite(sr) || sr <= 0)) {
+            fprintf(stderr, "--lsm2-tele needs lsm2, positive finite --sr, explicit --tele-ch, and no --no-tele or --plant\n"); return 2;
         }
         B.nch = nch; B.telech = telech; B.planarTele = lsm2tele;
         C.unit = unit; C.strip = strip; C.sidecar = sidecar; C.spts = spts; C.nch = nch; C.telech = telech;
@@ -729,10 +729,10 @@ int main(int argc, const char **argv) {
         fprintf(fm, "{\"unit\":\"%s\",\"component_version\":\"0x%x\",\"strip\":\"%s\",\"sidecar\":\"%s\","
                 "\"spts\":%s,\"quantum\":%d,\"sr\":%g,\"channels\":%d,\"file_channels\":%d,\"tele_bus\":%d,\"tele_source\":\"%s\","
                 "\"pace\":%g,\"latency_s\":%.12g,\"frames\":%llu,\"frames_read\":%llu,\"meters\":%d,\"render_error\":%d,"
-                "\"lsm2_tele\":%s,\"tele_layout\":\"%s\",\"tele_callbacks\":%llu,\"tele_frames_consumed\":%llu,\"tele_rejected_callbacks\":%llu}\n",
+                "\"lsm2_tele\":%s,\"tele_layout\":\"%s\",\"tele_channels_supplied\":%d,\"tele_callbacks\":%llu,\"tele_frames_delivered\":%llu,\"tele_rejected_callbacks\":%llu}\n",
                 unit, compVersion, strip, sidecar ? sidecar : "", spts ? "true" : "false", q, sr, nch, filech, haveTeleBus,
                 tele ? tele : plant ? plant : "zeros", pace, lat, done, nread, nm, failed,
-                lsm2tele ? "true" : "false", lsm2tele ? "planar" : "interleaved", B.teleCallbacks, B.teleFrames, B.teleRejected);
+                lsm2tele ? "true" : "false", lsm2tele ? "planar" : "interleaved", haveTeleBus ? telech : 0, B.teleCallbacks, B.teleFrames, B.teleRejected);
         fclose(fm);
         AudioUnitUninitialize(au); AudioComponentInstanceDispose(au);
         fprintf(stderr, "done %llu frames, %d meters, latency %.6f s\n", done, nm, lat);
