@@ -38,6 +38,25 @@ def rms_db(y):
     return [float(20 * np.log10(np.sqrt(np.mean(steady[:, c] ** 2)) + 1e-15)) for c in range(y.shape[1])]
 
 
+def window_metrics(mac, v2, frames=480):
+    """Per-channel worst v2-minus-reference over non-overlapping windows."""
+    out = []
+    for channel in range(mac.shape[1]):
+        best = (-1e9, 0.0, 0.0, 0)
+        minimum = 1e9
+        for start in range(0, len(mac) - frames + 1, frames):
+            left = float(20 * np.log10(np.sqrt(np.mean(mac[start:start + frames, channel] ** 2)) + 1e-15))
+            right = float(20 * np.log10(np.sqrt(np.mean(v2[start:start + frames, channel] ** 2)) + 1e-15))
+            if left <= -100.0:
+                continue
+            diff = right - left
+            minimum = min(minimum, diff)
+            if diff > best[0]:
+                best = (diff, left, right, start)
+        out.append({"diff_db": best[0], "mac_db": best[1], "v2_db": best[2], "frame": best[3], "min_diff_db": minimum})
+    return out
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--tunings", required=True)
@@ -52,6 +71,7 @@ def main():
     parser.add_argument("--levels", default="0,-6,-12,-24,-40")
     parser.add_argument("--seconds", type=float, default=1.0)
     parser.add_argument("--tol", type=float, default=0.05)
+    parser.add_argument("--dynamic", action="store_true", help="also run bursts and level steps; compare 10 ms windows")
     args = parser.parse_args()
 
     os.makedirs(args.work, exist_ok=True)
@@ -59,15 +79,27 @@ def main():
     n = int(FS * args.seconds)
     time = np.arange(n) / FS
     levels = [float(value) for value in args.levels.split(",")]
-    cases = [(f"sine_{freq:g}_{-level:g}", 10 ** (level / 20) * np.sin(2 * np.pi * freq * time))
+    cases = [("steady", f"sine_{freq:g}_{-level:g}", 10 ** (level / 20) * np.sin(2 * np.pi * freq * time))
              for freq in FREQS for level in levels]
     noise = pink(n)
-    cases += [(f"pink_{-level:g}", 10 ** (level / 20) * noise) for level in levels]
+    cases += [("steady", f"pink_{-level:g}", 10 ** (level / 20) * noise) for level in levels]
+    if args.dynamic:
+        for freq in (80, 500, 2500, 10000):
+            carrier = np.sin(2 * np.pi * freq * time)
+            burst = ((np.arange(n) // (FS // 10)) % 2 == 0).astype(float)
+            cases.append(("transient", f"burst_{freq:g}", burst * carrier))
+            step = np.empty(n)
+            step_levels = (-40.0, -12.0, 0.0, -24.0)
+            for index, level in enumerate(step_levels):
+                begin = index * n // len(step_levels)
+                end = (index + 1) * n // len(step_levels)
+                step[begin:end] = 10 ** (level / 20)
+            cases.append(("level_step", f"step_{freq:g}", step * carrier))
 
     rows = []
     paths = [os.path.join(args.work, name) for name in ("in.f32", "mac.f32", "v2.f32")]
     fin, fmac, fv2 = paths
-    for name, signal in cases:
+    for kind, name, signal in cases:
         np.repeat(signal[:, None], args.ch, axis=1).astype("<f4").tofile(fin)
         result = subprocess.run(
             [os.path.join(HERE, "box_host"), "--strip", strip, "--stage", args.box,
@@ -84,9 +116,21 @@ def main():
         if result.returncode:
             print(json.dumps({"aid": args.aid, "box": args.box, "refused": result.stderr.strip()}))
             return 1
-        mac = rms_db(np.fromfile(fmac, "<f4").reshape(-1, args.ch))
-        v2 = rms_db(np.fromfile(fv2, "<f4").reshape(-1, args.ch))
-        rows.append({"case": name, "mac_db": mac, "v2_db": v2, "diff_db": [right - left for right, left in zip(v2, mac)]})
+        mac_audio = np.fromfile(fmac, "<f4").reshape(-1, args.ch).astype(float)
+        v2_audio = np.fromfile(fv2, "<f4").reshape(-1, args.ch).astype(float)
+        if kind == "steady":
+            mac = rms_db(mac_audio)
+            v2 = rms_db(v2_audio)
+            rows.append({"kind": kind, "case": name, "mac_db": mac, "v2_db": v2,
+                         "diff_db": [right - left for right, left in zip(v2, mac)]})
+        else:
+            windows = window_metrics(mac_audio, v2_audio)
+            rows.append({"kind": kind, "case": name,
+                         "mac_db": [row["mac_db"] for row in windows],
+                         "v2_db": [row["v2_db"] for row in windows],
+                         "diff_db": [row["diff_db"] for row in windows],
+                         "min_diff_db": min(row["min_diff_db"] for row in windows),
+                         "worst_frame": [row["frame"] for row in windows]})
 
     for path in paths:
         if os.path.exists(path):
@@ -100,6 +144,10 @@ def main():
         "min_diff_db": min(min(row["diff_db"]) for row in rows),
         "over": len(over),
         "worst_cases": sorted(rows, key=lambda row: -max(row["diff_db"]))[:5],
+        "worst_by_kind_db": {
+            kind: max(max(row["diff_db"]) for row in rows if row["kind"] == kind)
+            for kind in sorted({row["kind"] for row in rows})
+        },
     }
     if args.json:
         with open(args.json, "w", encoding="utf-8") as stream:
