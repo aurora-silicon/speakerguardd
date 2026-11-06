@@ -989,7 +989,9 @@ impl Complex32 {
 
     #[inline]
     fn mul(self, rhs: Self) -> Self {
-        Self { re: self.re.mul_add(rhs.re, -(self.im * rhs.im)), im: self.re.mul_add(rhs.im, self.im * rhs.re) }
+        let real_product = self.re * rhs.re;
+        let imag_product = self.re * rhs.im;
+        Self { re: (-self.im).mul_add(rhs.im, real_product), im: self.im.mul_add(rhs.re, imag_product) }
     }
 
     #[inline]
