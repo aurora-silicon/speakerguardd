@@ -111,6 +111,8 @@ pub struct Manifest {
     /// Mac's AudioDSP ([`crate::lattice`]); `None` in bundles collected
     /// before it.
     pub mask_lattice: Option<Record>,
+    /// Optional native canonical state used only for missing LSM2 amp selectors.
+    pub lsm2_native_state: Option<Record>,
 }
 
 /// The installer's `lsm2_mask_lattice` record.
@@ -163,6 +165,8 @@ struct InstallerJson {
     /// Optional: bundles collected before the installer read it have none.
     #[serde(default)]
     lsm2_mask_lattice: Option<LatticeJson>,
+    #[serde(default)]
+    lsm2_native_state: Option<Record>,
 }
 
 #[derive(Deserialize)]
@@ -181,6 +185,7 @@ impl Manifest {
             .chain(self.speaker_thiele_small.iter())
             .chain(self.shared.iter())
             .chain(self.mask_lattice.iter())
+            .chain(self.lsm2_native_state.iter())
     }
 
     /// Parses `manifest.json` (installer).
@@ -298,6 +303,7 @@ impl Manifest {
             files: j.files,
             shared,
             mask_lattice,
+            lsm2_native_state: j.lsm2_native_state,
         };
         m.check(NAME)?;
         Ok(m)
@@ -330,6 +336,7 @@ impl Manifest {
             files,
             shared: Vec::new(),
             mask_lattice: None,
+            lsm2_native_state: None,
         };
         m.check(COLLECTOR_NAME)?;
         Ok(m)
@@ -382,6 +389,11 @@ impl Manifest {
         if let Some(s) = &self.speaker_thiele_small {
             if s.path != SPTS_NAME {
                 return Err(Error::format(ctx, format!("calibration record path {:?}", s.path)));
+            }
+        }
+        if let Some(s) = &self.lsm2_native_state {
+            if s.path != crate::native_lsm2::NAME || s.bytes == 0 || s.bytes > crate::native_lsm2::MAX_BYTES as u64 {
+                return Err(Error::format(ctx, "invalid native LSM2 state path or size"));
             }
         }
         Ok(())

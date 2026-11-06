@@ -275,6 +275,7 @@ impl Bundle {
             files: Vec::new(),
             shared: Vec::new(),
             mask_lattice: None,
+            lsm2_native_state: None,
         };
         Ok(Bundle { manifest, files, source: root.to_owned(), verified: false, unlisted: Vec::new() })
     }

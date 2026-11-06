@@ -34,6 +34,13 @@ jobs:
       - run: cargo test --workspace
       - run: cargo test --workspace --release
       - run: cargo build --workspace --release
+      - name: Retain native LSM2 CLI evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-lsm2-cli-${{ matrix.runner }}
+          path: target/tmp/native-lsm2-e2e-*
+          if-no-files-found: warn
 
   diffrig:
     name: Rig tools

@@ -167,6 +167,10 @@ pub struct Tuning {
     #[serde(skip)]
     pub mask_lattice: Option<[u32; crate::lattice::ENTRIES]>,
     pub mask_lattice_present: bool,
+    /// Number of missing amp selectors supplied by a validated native snapshot.
+    pub native_lsm2_selectors: usize,
+    /// Captured native stream rate, present whenever a native snapshot is used.
+    pub native_lsm2_sample_rate: Option<u32>,
     #[serde(skip)]
     pub graph: Graph,
 }
@@ -493,6 +497,25 @@ impl Tuning {
             }
         };
 
+        let (state, native_lsm2_selectors, native_lsm2_sample_rate) = if b.manifest.lsm2_native_state.is_some() {
+            if kind != UnitKind::Lsm2 {
+                return Err(Error::format(crate::native_lsm2::NAME, "native LSM2 state on another protection unit"));
+            }
+            let (state, count, rate) = crate::native_lsm2::supplement(b, &peffect.preset, lanes.len())?;
+            (state, count, Some(rate))
+        } else {
+            (peffect.preset.state.clone(), 0, None)
+        };
+        if native_lsm2_selectors != 0 {
+            diags.info(
+                "native-lsm2-selectors",
+                crate::native_lsm2::NAME,
+                format!(
+                    "supplied {native_lsm2_selectors} missing amplifier selectors; all original parameters preserved"
+                ),
+            );
+        }
+
         Ok(Tuning {
             aid: b.manifest.aid.clone(),
             acoustic_id: b.manifest.acoustic_id,
@@ -517,13 +540,15 @@ impl Tuning {
                 params,
                 properties,
                 strip_properties,
-                state: peffect.preset.state.clone(),
+                state,
                 spp3,
                 property_files,
             },
             spts,
             mask_lattice_present: mask_lattice.is_some(),
             mask_lattice,
+            native_lsm2_selectors,
+            native_lsm2_sample_rate,
             graph,
         })
     }
