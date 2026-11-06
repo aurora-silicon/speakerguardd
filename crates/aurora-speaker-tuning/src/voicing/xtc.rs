@@ -30,6 +30,11 @@ const CACHED_HP_HZ: f64 = 900.0;
 const CACHED_HP_ORDER: u32 = 2;
 const CACHED_LP_HZ: f64 = 10_000.0;
 const CACHED_LP_ORDER: u32 = 4;
+/// The unit's construction-default effect mixer (both wet/dry taper points).
+/// The cached filter is built before the saved parameters are restored, so
+/// it carries this mix, not the saved one; likewise the saved gain trim does
+/// not reach the cached filter (its construction default is 0 dB).
+const CACHED_EFFECT_MIX_PERCENT: f64 = 75.0;
 
 #[derive(Clone, Copy, Debug, Default)]
 struct Complex {
@@ -97,25 +102,6 @@ fn spectrum(w: &Dict, name: &str) -> Result<[Complex; BINS]> {
         out[i] = Complex { re: re[i], im: im[i] };
     }
     Ok(out)
-}
-
-fn taper_at(volume: f64, v0: f64, w0: f64, v1: f64, w1: f64) -> Result<f64> {
-    if !(-100.0..=0.0).contains(&v0)
-        || !(-100.0..=0.0).contains(&v1)
-        || !(0.0..=100.0).contains(&w0)
-        || !(0.0..=100.0).contains(&w1)
-        || v0 > v1
-    {
-        return Err(bad(format!("invalid wet/dry taper ({v0}, {w0}) to ({v1}, {w1})")));
-    }
-    if v0 == v1 {
-        if w0 != w1 {
-            return Err(bad("wet/dry taper has two different mixers at one volume"));
-        }
-        return Ok(w0 / 100.0);
-    }
-    let t = ((volume - v0) / (v1 - v0)).clamp(0.0, 1.0);
-    Ok((w0 + t * (w1 - w0)) / 100.0)
 }
 
 fn band_weight(f: f64, hp: f64, hp_order: u32, lp: f64, lp_order: u32) -> f64 {
@@ -228,42 +214,15 @@ pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option
         exact(id, 0.0, "reserved parameter")?;
     }
 
-    let hp = req(6)?;
-    let lp = req(4)?;
-    let order = |id: u32, what: &str| -> Result<u32> {
-        let v = req(id)?;
-        if (1.0..=10.0).contains(&v) && v.fract() == 0.0 {
-            Ok(v as u32)
-        } else {
-            Err(bad(format!("{what} order {v}")))
-        }
-    };
-    let _lp_order = order(5, "low-pass")?;
-    let _hp_order = order(7, "high-pass")?;
-    if !(0.0 < hp && hp < lp && lp < fs / 2.0) {
-        return Err(bad(format!("crossover {hp}..{lp} Hz is invalid at {fs} Hz")));
-    }
+    // Saved crossover, orders, window, wet/dry taper and trim are restored
+    // after the cached filter exists and do not change it (black-box: a
+    // ClassInfo state with each of them altered renders bit-identically).
+    // Only the saved FIR length and group delay set the reported latency.
     let length_ms = req(12)?;
-    if length_ms != CACHED_LENGTH_MS {
-        return Err(bad(format!("saved FIR length is {length_ms} ms; only the exact 2 ms ClassInfo cache is carried")));
-    }
-    let saved_alpha = req(13)?;
     let saved_delay_pct = req(14)?;
-    if !(0.0..=1.0).contains(&saved_alpha) || !(0.0..=50.0).contains(&saved_delay_pct) {
-        return Err(bad(format!("Tukey {saved_alpha}, group delay {saved_delay_pct}%")));
+    if !(1.0..=20.0).contains(&length_ms) || !(0.0..=50.0).contains(&saved_delay_pct) {
+        return Err(bad(format!("FIR length {length_ms} ms, group delay {saved_delay_pct}%")));
     }
-    let (v0, w0, v1, w1) = (req(17)?, req(18)?, req(19)?, req(20)?);
-    let wet = taper_at(0.0, v0, w0, v1, w1)?;
-    if w0 != w1 {
-        return Err(bad(format!(
-            "wet/dry snapshot changes from {w0}% to {w1}%; only a constant saved taper is identified exactly"
-        )));
-    }
-    let trim = req(21)?;
-    if !(-6.0..=6.0).contains(&trim) {
-        return Err(bad(format!("gain trim {trim} dB")));
-    }
-    let trim_gain = 10f64.powf(trim / 20.0);
 
     let custom = dict(&stage.preset_extra, "DspLibXTC_customFilterDictionary")?;
     let setup = dict(custom, "Setup_0")?;
@@ -310,18 +269,27 @@ pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option
         }
     }
 
-    let snapshot_gain = if v0 == v1 { 1.5 } else { 1.875 };
+    let wet = CACHED_EFFECT_MIX_PERCENT / 100.0;
     let mut freq = [[Complex::default(); BINS]; 4];
     for (m, destination) in freq.iter_mut().enumerate() {
         let identity = if m == 0 || m == 3 { 1.0 } else { 0.0 };
         for (k, bin) in destination.iter_mut().enumerate() {
-            let mixed = remapped[m][k].scale(wet).add_real((1.0 - wet) * identity);
-            *bin = mixed.sub_real(identity).scale(snapshot_gain).add_real(identity).scale(trim_gain);
+            *bin = remapped[m][k].scale(wet).add_real((1.0 - wet) * identity);
         }
     }
 
-    // DC and Nyquist are exact direct-only endpoints.
-    let nyquist = [trim_gain, 0.0, 0.0, trim_gain];
+    // DC is the exact direct-only endpoint (the crossover is zero there).
+    // The destination Nyquist bin is remapped like every other bin; only its
+    // real part survives a real transform.
+    let mut nyquist = [0.0; 4];
+    for (m, value) in nyquist.iter_mut().enumerate() {
+        let identity = if m == 0 || m == 3 { 1.0 } else { 0.0 };
+        let x = BINS as f64 * CONSTRUCTION_RATE / state_rate;
+        let lo = x.floor() as usize;
+        let t = x - lo as f64;
+        let re = if lo + 1 >= BINS { raw[m][BINS - 1].re } else { raw[m][lo].re * (1.0 - t) + raw[m][lo + 1].re * t };
+        *value = re * wet + (1.0 - wet) * identity;
+    }
 
     // floor(2 ms * 44.1 kHz) minus the duplicated endpoint: 87 stored taps.
     // The cached optimizer is at its default 50% delay and Tukey=1 (Hann),
@@ -333,7 +301,7 @@ pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option
     // The optimizer restores each matrix entry's exact DC after windowing by
     // spreading the residual uniformly across its finite record.
     for (m, vector) in taps.iter_mut().enumerate() {
-        let target = if m == 0 || m == 3 { trim_gain } else { 0.0 };
+        let target = if m == 0 || m == 3 { 1.0 } else { 0.0 };
         let correction = (target - vector[..count].iter().sum::<f64>()) / count as f64;
         for x in &mut vector[..count] {
             *x += correction;
@@ -344,7 +312,7 @@ pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option
         "xtc-setup",
         stage.name.clone(),
         format!(
-            "Setup_0, {count}-tap cached stereo FIR, {wet:.3} wet at svol 0 dB, reported delay {:.3}%",
+            "Setup_0, {count}-tap cached stereo FIR, {wet:.3} construction wet, reported delay {:.3}%",
             saved_delay_pct
         ),
     );
@@ -435,6 +403,61 @@ mod tests {
         assert!(p.taps[1][..p.count].iter().all(|x| x.abs() < 1e-12));
         assert!(p.taps[2][..p.count].iter().all(|x| x.abs() < 1e-12));
         assert!((p.taps[0][..p.count].iter().sum::<f64>() - 1.0).abs() < 1e-12);
+    }
+
+    fn with_params(mut s: Stage, changes: &[(u32, f32)]) -> Stage {
+        let params = &mut s.state.as_mut().unwrap().sections[0].params;
+        for &(id, v) in changes {
+            params.iter_mut().find(|(i, _)| *i == id).unwrap().1 = v;
+        }
+        s
+    }
+
+    fn effect_stage(cross: f32) -> Stage {
+        let mut s = stage(0.0);
+        let custom = match s.preset_extra.get_mut("DspLibXTC_customFilterDictionary") {
+            Some(Value::Dict(d)) => d,
+            _ => unreachable!(),
+        };
+        let setup = match custom.get_mut("Setup_0") {
+            Some(Value::Dict(d)) => d,
+            _ => unreachable!(),
+        };
+        let w = match setup.get_mut("W") {
+            Some(Value::Dict(d)) => d,
+            _ => unreachable!(),
+        };
+        *w.get_mut("W12real").unwrap() = Value::Data(data(cross));
+        *w.get_mut("W21real").unwrap() = Value::Data(data(cross));
+        s
+    }
+
+    #[test]
+    fn saved_mix_trim_and_crossover_do_not_reach_the_cached_filter() {
+        let base = compile(&effect_stage(-0.5), 48_000.0, &mut Diagnostics::default()).unwrap().unwrap();
+        assert!(base.taps[1][..base.count].iter().any(|x| x.abs() > 1e-6));
+        for changes in [
+            &[(18, 65.0), (20, 65.0)][..],
+            &[(17, -50.0), (18, 45.0), (20, 45.0)][..],
+            &[(21, 3.0)][..],
+            &[(4, 9_000.0), (5, 5.99), (6, 2_000.0), (7, 2.0), (13, 1.0)][..],
+        ] {
+            let s = with_params(effect_stage(-0.5), changes);
+            let p = compile(&s, 48_000.0, &mut Diagnostics::default()).unwrap().unwrap();
+            assert_eq!(p.taps, base.taps, "{changes:?}");
+        }
+    }
+
+    #[test]
+    fn cached_cross_term_uses_the_construction_mix() {
+        // A flat cross spectrum c inside the crossover band reaches the
+        // filter scaled by the construction mix (75 %) and the crossover.
+        let p = compile(&effect_stage(-0.5), 48_000.0, &mut Diagnostics::default()).unwrap().unwrap();
+        let peak = p.taps[1][..p.count].iter().fold(0.0f64, |m, x| m.max(x.abs()));
+        let q = compile(&effect_stage(-1.0), 48_000.0, &mut Diagnostics::default()).unwrap().unwrap();
+        let peak2 = q.taps[1][..q.count].iter().fold(0.0f64, |m, x| m.max(x.abs()));
+        assert!((peak2 / peak - 2.0).abs() < 1e-9);
+        assert!(p.taps[1][..p.count].iter().sum::<f64>().abs() < 1e-12);
     }
 
     #[test]
