@@ -52,8 +52,10 @@
 //! seven f64 saved-law values (range, frequency, quality, ratio, threshold,
 //! attack and release). [`PreStage::process_block`] runs each slot at that
 //! recorded position. Its gain computer is the unit's 44-point linear-gain
-//! B-spline; the direct-form detector and longer release are conservative
-//! substitutes for the unit's private overlap-add reconstruction.
+//! B-spline. With time smoothing disabled, a quadrature-envelope controller
+//! samples two all-pass branches at a fixed cadence, holds the control value,
+//! and low-pass reconstructs it. The audio carrier remains causal and has no
+//! added latency.
 //!
 //! The compressor: a four-band Linkwitz-Riley tree (fourth order, with the
 //! second-order allpass compensation that keeps every band in phase, so the
@@ -814,18 +816,23 @@ impl DynRun {
     }
 }
 
-/// Running state for one level-dependent ToneMeister slot. ToneMeister's
-/// attack/release-disabled path is spectral; these two shapes reduce to a
-/// band-limited detector and `dry + (gain - 1) * component`. The detector
-/// below uses the same steady-state weighting and a peak-conservative block
-/// statistic, so a transient cannot ask for less cut than its sine-equivalent
-/// level.
+/// Running state for one level-dependent ToneMeister slot. The two shapes use
+/// a band-limited detector and `dry + (gain - 1) * component`. With explicit
+/// attack/release disabled, two all-pass branches supply a quadrature
+/// magnitude at the control cadence and a low-pass reconstructs the held
+/// gain. The carrier itself is never delayed.
 struct DynamicRun {
     fs: f64,
     detector: Section,
     component: Section,
     detector_state: [f64; 2],
     component_state: [[f64; 2]; MAX_CHANNELS],
+    quadrature: [Section; 2],
+    quadrature_state: [[f64; 2]; 2],
+    control_phase: usize,
+    reconstructed_gain: f64,
+    reconstruction: Section,
+    reconstruction_state: [f64; 2],
     envelope: f64,
 }
 
@@ -853,12 +860,24 @@ impl DynamicRun {
                 Section { b0: n, b1: -n, b2: 0.0, a1: (k - 1.0) * n, a2: 0.0 }
             }
         };
+        let analysis_hz = match params.kind {
+            DynamicKind::Notch => params.frequency_hz,
+            DynamicKind::HighShelf => libm::sqrt(params.frequency_hz * 20_000.0),
+        };
+        let quadrature = [Self::allpass(0.5 * analysis_hz, 0.37, fs), Self::allpass(2.0 * analysis_hz, 0.37, fs)];
+        let reconstruction = Self::lowpass(20.0, 0.707, fs);
         DynamicRun {
             fs,
             detector,
             component,
             detector_state: [0.0; 2],
             component_state: [[0.0; 2]; MAX_CHANNELS],
+            quadrature,
+            quadrature_state: [[0.0; 2]; 2],
+            control_phase: 0,
+            reconstructed_gain: 1.0,
+            reconstruction,
+            reconstruction_state: [1.0 - reconstruction.b0, reconstruction.b2 - reconstruction.a2],
             envelope: 0.0,
         }
     }
@@ -866,7 +885,28 @@ impl DynamicRun {
     fn reset(&mut self) {
         self.detector_state = [0.0; 2];
         self.component_state = [[0.0; 2]; MAX_CHANNELS];
+        self.quadrature_state = [[0.0; 2]; 2];
+        self.control_phase = 0;
+        self.reconstructed_gain = 1.0;
+        self.reconstruction_state = [1.0 - self.reconstruction.b0, self.reconstruction.b2 - self.reconstruction.a2];
         self.envelope = 0.0;
+    }
+
+    fn allpass(frequency_hz: f64, quality: f64, fs: f64) -> Section {
+        let w = 2.0 * core::f64::consts::PI * frequency_hz.clamp(1.0, 0.49 * fs) / fs;
+        let alpha = libm::sin(w) * libm::sinh(0.5 / quality);
+        let n = 1.0 / (1.0 + alpha);
+        let a1 = -2.0 * libm::cos(w) * n;
+        let a2 = (1.0 - alpha) * n;
+        Section { b0: a2, b1: a1, b2: 1.0, a1, a2 }
+    }
+
+    fn lowpass(frequency_hz: f64, quality: f64, fs: f64) -> Section {
+        let w = 2.0 * core::f64::consts::PI * frequency_hz.clamp(1.0, 0.49 * fs) / fs;
+        let alpha = libm::sin(w) * libm::sinh(0.5 / quality);
+        let n = 1.0 / (1.0 + alpha);
+        let b0 = 0.5 * (1.0 - libm::cos(w)) * n;
+        Section { b0, b1: 2.0 * b0, b2: b0, a1: -2.0 * libm::cos(w) * n, a2: (1.0 - alpha) * n }
     }
 
     #[inline]
@@ -911,57 +951,53 @@ impl DynamicRun {
         if sidechains == 0 {
             return;
         }
-        let mut sum_sq = 0.0;
-        let mut peak = 0.0f64;
-        let mut input_peak = 0.0f64;
-        for i in 0..frames {
-            let mut input = 0.0;
-            for (c, buf) in bufs.iter().enumerate().take(n) {
-                if at.sidechain_mask >> c & 1 != 0 {
-                    let v = buf[i];
-                    input += if v.is_finite() { f64::from(v.clamp(-INPUT_BOUND, INPUT_BOUND)) } else { 0.0 };
-                }
-            }
-            input /= sidechains as f64;
-            input_peak = input_peak.max(input.abs());
-            let detected = Self::step(&self.detector, &mut self.detector_state, input);
-            sum_sq += detected * detected;
-            peak = peak.max(detected.abs());
-        }
-        let rms = libm::sqrt(sum_sq / frames as f64);
-        let measured = match at.params.kind {
-            DynamicKind::Notch => (core::f64::consts::SQRT_2 * rms).max(peak).max(input_peak),
-            DynamicKind::HighShelf => (core::f64::consts::SQRT_2 * rms).max(peak).max(input_peak),
-        };
         if at.params.smooth {
-            // The direct-form carrier has no overlap-add tail. An instant
-            // attack and a two-constant release retain at least as much cut
-            // as the unit while its spectral frames overlap.
-            let time_ms = if measured > self.envelope { 0.0 } else { 2.0 * at.params.release_ms };
+            let mut sum_sq = 0.0;
+            for i in 0..frames {
+                let mut input = 0.0;
+                for (c, buf) in bufs.iter().enumerate().take(n) {
+                    if at.sidechain_mask >> c & 1 != 0 {
+                        let v = buf[i];
+                        input += if v.is_finite() { f64::from(v.clamp(-INPUT_BOUND, INPUT_BOUND)) } else { 0.0 };
+                    }
+                }
+                input /= sidechains as f64;
+                let detected = Self::step(&self.detector, &mut self.detector_state, input);
+                sum_sq += detected * detected;
+            }
+            let measured = core::f64::consts::SQRT_2 * libm::sqrt(sum_sq / frames as f64);
+            let time_ms = if measured > self.envelope { at.params.attack_ms } else { at.params.release_ms };
             let coefficient =
                 if time_ms <= 0.0 { 0.0 } else { libm::exp(-(frames as f64) / (time_ms * self.fs / 1_000.0)) };
             self.envelope += (1.0 - coefficient) * (measured - self.envelope);
-        } else {
-            let coefficient =
-                if measured >= self.envelope { 0.0 } else { libm::exp(-(frames as f64) / (500.0 * self.fs / 1_000.0)) };
-            self.envelope += (1.0 - coefficient) * (measured - self.envelope);
+            self.reconstructed_gain = Self::curve(&at.params, self.envelope);
         }
-        let mut curve = at.params;
-        if curve.kind == DynamicKind::HighShelf && !curve.smooth {
-            // The unit's overlap-add spectral path spreads a high-shelf
-            // transition across neighboring bins. A scalar detector with
-            // the raw curve can consequently relax by up to 2 dB too much
-            // on a level step. Use its peak-equivalent threshold and the
-            // gentlest compressor ratio that bounds that reconstruction.
-            curve.threshold_db -= 20.0 * libm::log10(core::f64::consts::SQRT_2);
-            curve.ratio = curve.ratio.min(core::f64::consts::SQRT_2);
-        }
-        let gain = Self::curve(&curve, self.envelope);
-        for (c, buf) in bufs.iter_mut().enumerate().take(n) {
-            if at.active_mask >> c & 1 == 0 {
-                continue;
+        for i in 0..frames {
+            if !at.params.smooth {
+                let mut input = 0.0;
+                for (c, buf) in bufs.iter().enumerate().take(n) {
+                    if at.sidechain_mask >> c & 1 != 0 {
+                        let v = buf[i];
+                        input += if v.is_finite() { f64::from(v.clamp(-INPUT_BOUND, INPUT_BOUND)) } else { 0.0 };
+                    }
+                }
+                input /= sidechains as f64;
+                let detected = Self::step(&self.detector, &mut self.detector_state, input);
+                let a = Self::step(&self.quadrature[0], &mut self.quadrature_state[0], detected);
+                let b = Self::step(&self.quadrature[1], &mut self.quadrature_state[1], detected);
+                if self.control_phase == 0 {
+                    self.envelope = libm::sqrt(a * a + b * b);
+                    self.reconstructed_gain = Self::curve(&at.params, self.envelope);
+                }
+                self.control_phase = (self.control_phase + 1) & 15;
             }
-            for sample in buf.iter_mut().take(frames) {
+            let gain = Self::step(&self.reconstruction, &mut self.reconstruction_state, self.reconstructed_gain)
+                .clamp(0.0, 1.0);
+            for (c, buf) in bufs.iter_mut().enumerate().take(n) {
+                if at.active_mask >> c & 1 == 0 {
+                    continue;
+                }
+                let sample = &mut buf[i];
                 let input = if sample.is_finite() { f64::from(sample.clamp(-INPUT_BOUND, INPUT_BOUND)) } else { 0.0 };
                 let component = Self::step(&self.component, &mut self.component_state[c], input);
                 let output = input + (gain - 1.0) * component;
@@ -1017,6 +1053,13 @@ impl PreStage {
 
     pub(crate) fn channel_mut(&mut self, c: usize) -> Option<&mut Channel> {
         (c < self.params.channels).then(|| &mut self.params.channel[c])
+    }
+
+    pub(crate) fn set_dynamic_filter(&mut self, index: usize, params: DynamicFilter, fs: f64) {
+        if index < self.params.dynamic_count.min(MAX_DYNAMIC_FILTERS) && params.valid(fs) {
+            self.params.dynamic[index].params = params;
+            self.dynamic[index] = Some(DynamicRun::new(&params, fs));
+        }
     }
 
     /// Clears every filter's history and the dynamics' detectors (stream start).

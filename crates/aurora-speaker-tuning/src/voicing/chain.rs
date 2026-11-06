@@ -66,8 +66,7 @@ fn tone(
     if !tone.dynamic.is_empty() {
         gaps.push((
             stage.name.clone(),
-            "level-dependent filters use the conservative direct detector; spectral reconstruction parity is pending"
-                .into(),
+            "level-dependent filters carry the quadrature controller; exact carrier crossfade parity is pending".into(),
         ));
     }
     Ok(Kind::Tone(tone))

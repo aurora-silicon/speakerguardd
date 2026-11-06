@@ -107,7 +107,7 @@ use sgv2_core::prestage::{
     Band, BandMode, BoxAt, Channel, DynamicAt, DynamicFilter, DynamicKind, Dynamics, Params, Section, BANDS,
     FLAG_FROM_TUNING, MAX_BOXES, MAX_DYNAMIC_FILTERS, MAX_SECTIONS,
 };
-use sgv2_core::voicing::chain::{Tone, ToneAutomation, TonePoint, ToneShape, ToneTarget};
+use sgv2_core::voicing::chain::{DynamicToneAutomation, Tone, ToneAutomation, TonePoint, ToneShape, ToneTarget};
 use sgv2_core::voicing::tone as tone_filter;
 use sgv2_core::MAX_CHANNELS;
 use std::f64::consts::PI;
@@ -271,7 +271,12 @@ pub(crate) fn voicing_tone(
         channels.push(ch);
     }
     if !volume_wired || stage.bypass {
-        return Ok(Tone { channels, automation: Vec::new(), dynamic: tone_dynamic(&parts, &ctx)? });
+        return Ok(Tone {
+            channels,
+            automation: Vec::new(),
+            dynamic: tone_dynamic(&parts, &ctx)?,
+            dynamic_automation: Vec::new(),
+        });
     }
     let g = stage
         .state
@@ -280,6 +285,7 @@ pub(crate) fn voicing_tone(
         .ok_or_else(|| bad(format!("{ctx}: the strip gives it no saved state")))?;
     let get = |id: u32| g.get(id).map(f64::from).unwrap_or(0.0);
     let mut out: Vec<ToneAutomation> = Vec::new();
+    let mut dynamic_automation = Vec::new();
     let mut automated_slots = Vec::new();
     for e in 0..AUTOMATION_ENTRIES {
         let entry = AUTOMATION_BASE + AUTOMATION_STRIDE * e;
@@ -315,7 +321,38 @@ pub(crate) fn voicing_tone(
             targets.push(ToneTarget { channel, section: slot.section });
         }
         let Some(saved) = saved else {
-            return Err(bad(format!("{ctx}: volume automation {e} targets inactive or uncarried slot {target}")));
+            let Some((index, dynamic)) = parts[0].dynamics.iter().enumerate().find(|(_, d)| d.slot == target) else {
+                return Err(bad(format!("{ctx}: volume automation {e} targets inactive or uncarried slot {target}")));
+            };
+            let point = |scalar: f64, gain_db: f64, frequency_hz: f64, which: &str| -> Result<TonePoint> {
+                if !gain_db.is_finite()
+                    || !(-30.0..=0.0).contains(&gain_db)
+                    || !frequency_hz.is_finite()
+                    || frequency_hz <= 0.0
+                    || frequency_hz >= fs / 2.0
+                {
+                    return Err(bad(format!(
+                        "{ctx}: volume automation {e} {which}: range {gain_db} dB, frequency {frequency_hz} Hz"
+                    )));
+                }
+                Ok(TonePoint { scalar, gain_db, frequency_hz })
+            };
+            let a = point(a_scalar, dynamic.params.range_db, dynamic.params.frequency_hz, "A")?;
+            let b = point(b_scalar, get(entry + 4), get(entry + 5), "B")?;
+            let midpoint = match get(entry + 6) {
+                0.0 => None,
+                1.0 => {
+                    let scalar = get(entry + 7);
+                    if scalar <= a_scalar || scalar >= b_scalar {
+                        return Err(bad(format!("{ctx}: volume automation {e} midpoint {scalar}")));
+                    }
+                    Some(point(scalar, get(entry + 8), get(entry + 9), "midpoint")?)
+                }
+                v => return Err(bad(format!("{ctx}: volume automation {e} midpoint enable {v}"))),
+            };
+            dynamic_automation.push(DynamicToneAutomation { index, a, b, midpoint });
+            automated_slots.push(target);
+            continue;
         };
         let point = |scalar: f64, gain_db: f64, frequency_hz: f64, which: &str| -> Result<TonePoint> {
             let freq_ok = matches!(saved.shape, ToneShape::Gain)
@@ -352,7 +389,7 @@ pub(crate) fn voicing_tone(
         });
         automated_slots.push(target);
     }
-    Ok(Tone { channels, automation: out, dynamic: tone_dynamic(&parts, &ctx)? })
+    Ok(Tone { channels, automation: out, dynamic: tone_dynamic(&parts, &ctx)?, dynamic_automation })
 }
 
 /// Merge the per-channel records of a Tone box into linked runtime slots.
@@ -719,9 +756,6 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics, exact_vol
             }
         };
         if let Some(dynamic_kind) = dynamic_kind {
-            if has_automation {
-                return Err(bad(format!("{ctx}: slot {i}: volume automation on a level-dependent filter")));
-            }
             let threshold = at(6)?;
             let sidechain_mask = at(8)?;
             let attack = get(616 + 3 * i);

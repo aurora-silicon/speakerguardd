@@ -128,6 +128,15 @@ pub struct ToneAutomation {
     pub targets: Vec<ToneTarget>,
 }
 
+/// Volume automation for one level-dependent Tone slot.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DynamicToneAutomation {
+    pub index: usize,
+    pub a: TonePoint,
+    pub b: TonePoint,
+    pub midpoint: Option<TonePoint>,
+}
+
 /// A filter box at its saved state plus the slots driven by system volume.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Tone {
@@ -136,6 +145,7 @@ pub struct Tone {
     /// Level-dependent slots in graph order. They have no compressor-box
     /// boundary inside a single Tone box, so every `before_box` is zero.
     pub dynamic: Vec<DynamicAt>,
+    pub dynamic_automation: Vec<DynamicToneAutomation>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -223,6 +233,14 @@ impl Spec {
                             || d.sidechain_mask & !all_channels != 0
                             || (0..w).any(|c| d.split[c] > tone.channels[c].count)
                     })
+                    || tone.dynamic_automation.iter().any(|a| {
+                        a.index >= tone.dynamic.len()
+                            || !point_valid(a.a)
+                            || !point_valid(a.b)
+                            || a.a.scalar >= a.b.scalar
+                            || a.midpoint
+                                .is_some_and(|m| !point_valid(m) || m.scalar <= a.a.scalar || m.scalar >= a.b.scalar)
+                    })
                 {
                     return Err(SpecError::BadParams { node: n });
                 }
@@ -294,10 +312,14 @@ fn interpolate(a: TonePoint, b: TonePoint, scalar: f64) -> (f64, f64) {
 }
 
 fn automated_values(a: &ToneAutomation, scalar: f64) -> (f64, f64) {
-    match a.midpoint {
-        Some(m) if scalar <= m.scalar => interpolate(a.a, m, scalar),
-        Some(m) => interpolate(m, a.b, scalar),
-        None => interpolate(a.a, a.b, scalar),
+    automated_point_values(a.a, a.b, a.midpoint, scalar)
+}
+
+fn automated_point_values(a: TonePoint, b: TonePoint, midpoint: Option<TonePoint>, scalar: f64) -> (f64, f64) {
+    match midpoint {
+        Some(m) if scalar <= m.scalar => interpolate(a, m, scalar),
+        Some(m) => interpolate(m, b, scalar),
+        None => interpolate(a, b, scalar),
     }
 }
 
@@ -359,10 +381,39 @@ fn apply_tone_automation(stage: &mut PreStage, base: &[Channel], automation: &[T
     }
 }
 
+fn apply_dynamic_tone_automation(
+    stage: &mut PreStage,
+    base: &[DynamicAt],
+    automation: &[DynamicToneAutomation],
+    fs: f64,
+    scalar: f64,
+) {
+    for a in automation {
+        let Some(at) = base.get(a.index) else { continue };
+        let (range_db, frequency_hz) = automated_point_values(a.a, a.b, a.midpoint, scalar);
+        let mut params = at.params;
+        params.range_db = range_db;
+        params.frequency_hz = frequency_hz;
+        stage.set_dynamic_filter(a.index, params, fs);
+    }
+}
+
 enum Run {
     NonFinite,
-    Gain { gain_db: f64, mute: bool, scale: f32 },
-    Filters { stage: PreStage, base: Vec<Channel>, automation: Vec<ToneAutomation>, fs: f64, dynamic: bool },
+    Gain {
+        gain_db: f64,
+        mute: bool,
+        scale: f32,
+    },
+    Filters {
+        stage: PreStage,
+        base: Vec<Channel>,
+        automation: Vec<ToneAutomation>,
+        dynamic_base: Vec<DynamicAt>,
+        dynamic_automation: Vec<DynamicToneAutomation>,
+        fs: f64,
+        dynamic: bool,
+    },
     Comp(PreStage),
     Xtc(alloc::boxed::Box<super::xtc::Run>),
     Cfreak(alloc::boxed::Box<super::cfreak::Run>),
@@ -391,6 +442,8 @@ impl Run {
                     stage: PreStage::with_rate(p, fs),
                     base: tone.channels.clone(),
                     automation: tone.automation.clone(),
+                    dynamic_base: tone.dynamic.clone(),
+                    dynamic_automation: tone.dynamic_automation.clone(),
                     fs,
                     dynamic: !tone.dynamic.is_empty(),
                 }
@@ -423,8 +476,11 @@ impl Run {
                 }
                 *scale = if *mute { 0.0 } else { libm::pow(10.0, *gain_db / 20.0) as f32 };
             }
-            Run::Filters { stage, base, automation, fs, .. } if id == 3 && v.is_finite() => {
+            Run::Filters { stage, base, automation, dynamic_base, dynamic_automation, fs, .. }
+                if id == 3 && v.is_finite() =>
+            {
                 apply_tone_automation(stage, base, automation, *fs, v);
+                apply_dynamic_tone_automation(stage, dynamic_base, dynamic_automation, *fs, v);
             }
             _ => {}
         }
@@ -708,6 +764,7 @@ mod tests {
                 kind: Kind::Tone(Tone {
                     channels: vec![channel],
                     dynamic: Vec::new(),
+                    dynamic_automation: Vec::new(),
                     automation: vec![ToneAutomation {
                         shape: ToneShape::LowShelf,
                         quality: core::f64::consts::FRAC_1_SQRT_2,
@@ -776,6 +833,7 @@ mod tests {
                 kind: Kind::Tone(Tone {
                     channels: vec![Channel::IDENTITY],
                     automation: Vec::new(),
+                    dynamic_automation: Vec::new(),
                     dynamic: vec![DynamicAt {
                         active_mask: 1,
                         sidechain_mask: 1,
@@ -826,5 +884,28 @@ mod tests {
         let Kind::Tone(tone) = &mut bad.nodes[0].kind else { unreachable!() };
         tone.dynamic[0].split[0] = 1;
         assert_eq!(bad.check(), Err(SpecError::BadParams { node: 0 }));
+    }
+
+    #[test]
+    fn dynamic_tone_volume_automation_updates_range_and_frequency() {
+        let mut spec = dynamic_tone();
+        let Kind::Tone(tone) = &mut spec.nodes[0].kind else { unreachable!() };
+        tone.dynamic_automation.push(DynamicToneAutomation {
+            index: 0,
+            a: TonePoint { scalar: 0.2, gain_db: -6.0, frequency_hz: 500.0 },
+            b: TonePoint { scalar: 0.8, gain_db: -12.0, frequency_hz: 2_000.0 },
+            midpoint: None,
+        });
+        spec.links.push(Link { param: GraphParam::VolumeScalar, node: 0, id: 3 });
+        let mut chain = Chain::new(spec, 48_000.0, 8).unwrap();
+        let params = |chain: &Chain| match &chain.runs[0] {
+            Run::Filters { stage, .. } => stage.params().dynamic[0].params,
+            _ => panic!("not a filter run"),
+        };
+        assert_eq!(params(&chain).range_db, -12.0);
+        assert!((params(&chain).frequency_hz - 2_000.0).abs() < 1e-9);
+        chain.set_param(GraphParam::VolumeScalar, 0.2);
+        assert_eq!(params(&chain).range_db, -6.0);
+        assert!((params(&chain).frequency_hz - 500.0).abs() < 1e-9);
     }
 }
