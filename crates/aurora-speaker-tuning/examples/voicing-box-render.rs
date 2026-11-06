@@ -16,8 +16,9 @@
 //! never part of the plugin.
 
 use aurora_speaker_tuning::bundle::Bundle;
+use aurora_speaker_tuning::dspg::analysis::{Lane, Origin, Pass};
 use aurora_speaker_tuning::tuning::{Options, Tuning};
-use aurora_speaker_tuning::{voicing, Diagnostics};
+use aurora_speaker_tuning::{prestage, voicing, Diagnostics};
 use std::path::PathBuf;
 use std::process::exit;
 
@@ -28,7 +29,7 @@ fn die(msg: impl std::fmt::Display) -> ! {
 
 fn main() {
     let mut root = None;
-    let (mut aid, mut name, mut ch) = (None, None, None);
+    let (mut aid, mut name, mut ch, mut only_slot) = (None, None, None, None);
     let mut files = Vec::new();
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -37,6 +38,7 @@ fn main() {
             "--aid" => aid = it.next().and_then(|v| v.parse::<u32>().ok()),
             "--box" => name = it.next(),
             "--ch" => ch = it.next().and_then(|v| v.parse::<usize>().ok()),
+            "--only-slot" => only_slot = it.next().and_then(|v| v.parse::<u32>().ok()),
             _ => files.push(a),
         }
     }
@@ -48,7 +50,30 @@ fn main() {
     let bundle = Bundle::from_tunings_root(&root, aid).unwrap_or_else(|e| die(format!("{e:?}")));
     let t = Tuning::load(&bundle, &Options::default(), &mut diags).unwrap_or_else(|e| die(format!("{e:?}")));
     let fs = t.selection.sample_rate.unwrap_or(48_000) as f64;
-    let stage = t.chain.iter().find(|s| s.name == name).unwrap_or_else(|| die(format!("no box {name}")));
+    let mut stage = t.chain.iter().find(|s| s.name == name).cloned().unwrap_or_else(|| die(format!("no box {name}")));
+    if let Some(slot) = only_slot {
+        let global = stage
+            .state
+            .as_mut()
+            .and_then(|s| s.sections.iter_mut().find(|s| s.scope == 0 && s.element == 0))
+            .unwrap_or_else(|| die(format!("box {name} has no global saved state")));
+        let mut set = |id: u32, value: f32| {
+            if let Some((_, v)) = global.params.iter_mut().find(|(i, _)| *i == id) {
+                *v = value;
+            } else {
+                global.params.push((id, value));
+            }
+        };
+        for id in [0, 1, 4, 11, 13] {
+            set(id, 0.0);
+        }
+        for i in 0..prestage::SLOTS {
+            if i != slot {
+                set(14 + 10 * i, 0.0);
+            }
+        }
+    }
+    let stage = &stage;
 
     let raw = std::fs::read(inp).unwrap_or_else(|e| die(e));
     let mut x: Vec<f32> = raw.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
@@ -68,6 +93,44 @@ fn main() {
                     run.process(&mut bufs, k);
                     at += k;
                 }
+            }
+        }
+        "tmst" => {
+            let lanes: Vec<Lane> = (0..ch)
+                .map(|c| Lane {
+                    origin: Origin { node: "in".into(), port: 0, channel: c as u32 },
+                    hops: Vec::new(),
+                    through: vec![Pass { node: stage.name.clone(), channel: c as u32 }],
+                })
+                .collect();
+            let mut p = prestage::derive_lanes(std::slice::from_ref(stage), &lanes, fs, ch, &mut diags)
+                .unwrap_or_else(|e| die(format!("{e:?}")));
+            // The production pre-stage applies one final whole-lane unity
+            // envelope after every box. Slot-isolation rigs compare the
+            // slot's sections themselves, before that envelope; restore a
+            // target boost that derive_lanes deliberately scaled away.
+            if let Some(slot) = only_slot {
+                let global = stage.state.as_ref().and_then(|s| s.global());
+                let kind = global.and_then(|g| g.get(14 + 10 * slot + 1)).unwrap_or(0.0) as u32;
+                let gain = f64::from(global.and_then(|g| g.get(14 + 10 * slot + 2)).unwrap_or(0.0));
+                let raw_gain = match kind {
+                    0 | 7 => Some(10f64.powf(-gain / 20.0)),
+                    2 => Some(1.0),
+                    _ => None,
+                };
+                if let Some(raw_gain) = raw_gain {
+                    for channel in &mut p.channel[..ch] {
+                        channel.gain = raw_gain;
+                    }
+                }
+            }
+            let mut run = sgv2_core::prestage::PreStage::with_rate(p, fs);
+            let mut at = 0;
+            while at < frames {
+                let k = (frames - at).min(512);
+                let mut bufs: Vec<&mut [f32]> = planar.iter_mut().map(|v| &mut v[at..at + k]).collect();
+                run.process_block(&mut bufs, k);
+                at += k;
             }
         }
         other => die(format!("box {name} is aufx/{other}: no v2 implementation in this renderer yet")),
