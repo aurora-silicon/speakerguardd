@@ -306,6 +306,20 @@ pub fn velocity_band_gains_limit_window(
     velocity_band_gains_with_limits(vb, resid, first, room_floor, s, active, seed, |i| limits[i])
 }
 
+/// Choose the producer for a newly admitted retained-window segment.
+///
+/// Shifted history already fixes the segment's left boundary. The producer
+/// whose candidate continues that boundary owns the whole new segment. A
+/// zero onset trial carries no admission and therefore leaves the streaming
+/// producer in control.
+pub fn arbitrate_producer_segment(boundary: f32, onset: f32, streaming: f32) -> f32 {
+    if onset != 0.0 && (onset - boundary).abs() <= (streaming - boundary).abs() {
+        onset
+    } else {
+        streaming
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn velocity_band_gains_with_limits(
     vb: &[alloc::vec::Vec<f32>; 5],
@@ -834,6 +848,14 @@ mod tests {
         let vb = [vec![1.0, 2.0, 1.5], vec![0.0; 3], vec![0.0; 3], vec![0.0; 3], vec![0.0; 3]];
         let got = velocity_band_gains_limit_window(&vb, &[], 0, &[0.2, 1.0, 0.3], 0.0, 1.0, (0, 5), [1.0; 5]);
         assert_eq!(got, [0.5, 1.0, 1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn producer_arbitration_continues_the_retained_segment_boundary() {
+        assert_eq!(arbitrate_producer_segment(0.55, 0.20, 0.56), 0.56);
+        assert_eq!(arbitrate_producer_segment(0.15, 0.59, 0.62), 0.59);
+        assert_eq!(arbitrate_producer_segment(0.15, 0.0, 0.15), 0.15);
+        assert_eq!(arbitrate_producer_segment(0.15, 0.20, 0.20), 0.20);
     }
 
     #[test]

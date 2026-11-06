@@ -131,9 +131,9 @@ use alloc::vec::Vec;
 
 mod laws;
 pub use laws::{
-    current_coefficients, mask_lattice_resized, minimum_phase_triplet, release_lambda, temperature_candidate,
-    transform_len, velocity_band_gains, velocity_band_gains_limit_window, velocity_band_gains_window, velocity_limit,
-    BandGain, Fft, Masker, ThermalBranch,
+    arbitrate_producer_segment, current_coefficients, mask_lattice_resized, minimum_phase_triplet, release_lambda,
+    temperature_candidate, transform_len, velocity_band_gains, velocity_band_gains_limit_window,
+    velocity_band_gains_window, velocity_limit, BandGain, Fft, Masker, ThermalBranch,
 };
 
 use crate::blob::{BlobError, Pod};
@@ -1311,9 +1311,6 @@ struct Chan {
     vel_lim: [f32; 3],
     mask_knots: [f32; 4],
     vel_limit_now: f64,
-    /// Current scalar state of the streaming protected-peak producer. The
-    /// retained per-sample handoff itself lives in `vel_bound_window`.
-    vel_stream_bound: f32,
     vel_bound_ready: bool,
     vel_bound_release: bool,
     /// Native's one retained producer window. Host fragments shift it by
@@ -1667,7 +1664,6 @@ impl Run {
                 vel_lim: c.velocity_limit,
                 mask_knots: c.mask_energy_db,
                 vel_limit_now: c.velocity_limit[0] as f64,
-                vel_stream_bound: 0.0,
                 vel_bound_ready: false,
                 vel_bound_release: false,
                 vel_bound_window: vec![0.0; od + ctl],
@@ -1792,7 +1788,6 @@ impl Run {
             c.mvel.clear();
             c.vwin.iter_mut().for_each(|v| *v = 0.0);
             c.vel_limit_now = c.vel_lim[0] as f64;
-            c.vel_stream_bound = 0.0;
             c.vel_bound_ready = false;
             c.vel_bound_release = false;
             c.vel_bound_window.iter_mut().for_each(|v| *v = 0.0);
@@ -2019,20 +2014,17 @@ impl Run {
             }
             let vlim_g = c.vel_limit_now as f32;
             let stream_ready = c.protected_peak.ready();
+            let prior_bound = c.vel_bound_window.last().copied().unwrap_or(0.0);
+            let stream_bound = c.protected_peak_now.max(0.25 * vlim_g).min(vlim_g);
             let next_bound = if c.vel_bound_release && c.vel_bound_ready {
-                (c.vel_stream_bound as f64 + velocity_release * (c.vel_limit_now - c.vel_stream_bound as f64)) as f32
+                (prior_bound as f64 + velocity_release * (c.vel_limit_now - prior_bound as f64)) as f32
             } else {
-                c.protected_peak_now
-            }
-            .min(vlim_g);
-            let floor_bound = 0.25 * vlim_g;
-            let quiet_producer = c.vel_bound_ready && c.vel_bound_window.iter().all(|&v| v == floor_bound);
+                stream_bound
+            };
             if c.vel_bound_ready && stream_ready {
-                c.vel_stream_bound = next_bound;
                 c.vel_bound_window.copy_within(ctl.., 0);
                 c.vel_bound_window[od..].fill(next_bound);
             } else if stream_ready {
-                c.vel_stream_bound = next_bound;
                 c.vel_bound_ready = true;
                 c.vel_bound_window.fill(next_bound);
             }
@@ -2041,13 +2033,13 @@ impl Run {
             // filterbank latency, zeros after; the model itself advances on
             // the protected output, below
             c.vcar_m.carry(&mut c.vcar, fbl);
-            // Native has one producer window, not an onset scalar replacing
-            // the streaming state. A quiet-window onset owns only the newly
-            // admitted host fragments; ramps retain the streaming producer.
-            // Each fragment appends its protected trial peak, repeated for
-            // that fragment's samples (q1/q7/q160 included).
-            let mut onset_producer = false;
-            if vel_on && stream_ready && quiet_producer && !c.vel_bound_release {
+            // Native arbitrates each newly admitted segment while shifted
+            // samples keep their source. The candidate that continues the
+            // retained boundary owns the segment: ramps keep the streaming
+            // protected peak, while an onset takes its decision-local trial.
+            // This compares existing producer states, not signal levels,
+            // spectra, case identities, or fitted thresholds.
+            if vel_on && stream_ready && !c.vel_bound_release {
                 let all = (0, BANDS);
                 let mut producer_r = [1.0; BANDS];
                 if disp_on {
@@ -2066,7 +2058,7 @@ impl Run {
                     );
                 }
                 let mut offset = 0;
-                let mut signal = false;
+                let mut boundary = c.vel_bound_window[od - 1];
                 for &len in fragments {
                     let mut peak = 0.0f32;
                     for i in od + offset..od + offset + len {
@@ -2076,24 +2068,15 @@ impl Run {
                         }
                         peak = peak.max(y.abs());
                     }
-                    signal |= peak != 0.0;
-                    c.vel_bound_window[od + offset..od + offset + len].fill(peak.min(vlim_g));
+                    let onset_bound = peak.min(vlim_g);
+                    let admitted = arbitrate_producer_segment(boundary, onset_bound, stream_bound);
+                    c.vel_bound_window[od + offset..od + offset + len].fill(admitted);
+                    boundary = admitted;
                     offset += len;
                 }
                 debug_assert_eq!(offset, ctl);
-                if !signal {
-                    c.vel_bound_window[od..].fill(next_bound);
-                } else {
-                    onset_producer = true;
-                }
             }
             let retained_room_bound = c.vel_bound_window[od..].iter().copied().fold(0.0f32, f32::max);
-            if onset_producer {
-                // The following decision releases from the completed onset
-                // segment, while the streaming object itself remains the
-                // source that arbitrates later ramp windows.
-                c.vel_stream_bound = retained_room_bound;
-            }
             let velocity_cut = core::cell::Cell::new(false);
             let primary_floor_limited = core::cell::Cell::new(false);
             let retained_episode = core::cell::Cell::new(c.vel_episode && c.vel_episode_retained);
@@ -2117,11 +2100,7 @@ impl Run {
                 }
                 if vel_on {
                     let ordinary = velocity_band_gains(&c.vb, &c.vcar, vfirst, vlim_g, sg, all, r);
-                    let ordinary_cut = (c.vel_active.0..c.vel_active.1).any(|k| ordinary[k] < r[k]);
-                    if !c.vel_episode && ordinary_cut && stream_ready {
-                        retained_episode.set(true);
-                    }
-                    let q = if retained_episode.get() && c.vel_bound_ready {
+                    let retained = if stream_ready && c.vel_bound_ready {
                         velocity_band_gains_limit_window(
                             &c.vb,
                             &c.vcar,
@@ -2135,12 +2114,19 @@ impl Run {
                     } else {
                         ordinary
                     };
+                    let retained_cut = (c.vel_active.0..c.vel_active.1).any(|k| {
+                        let v =
+                            if floor_velocity { (sg * retained[k]).max(c.vel_floor as f32) / sg } else { retained[k] };
+                        v < r[k]
+                    });
+                    if !c.vel_episode && retained_cut && stream_ready {
+                        retained_episode.set(true);
+                    }
+                    let q = if retained_episode.get() { retained } else { ordinary };
                     for k in c.vel_active.0..c.vel_active.1 {
                         let raw = q[k];
                         let v = if floor_velocity {
-                            primary_floor_limited.set(
-                                primary_floor_limited.get() || sg * raw < c.vel_floor as f32,
-                            );
+                            primary_floor_limited.set(primary_floor_limited.get() || sg * raw < c.vel_floor as f32);
                             (sg * raw).max(c.vel_floor as f32) / sg
                         } else {
                             raw
