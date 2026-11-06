@@ -57,6 +57,9 @@ fn main() {
                 preset_name: effect.preset.name.clone(),
                 state: Some(effect.preset.state.clone()),
                 preset_extra_keys: effect.preset.extra_keys(),
+                preset_extra: effect.preset.extra.clone(),
+                strip_properties: Vec::new(),
+                property_files: Vec::new(),
                 before_protection: true,
             }
         }
