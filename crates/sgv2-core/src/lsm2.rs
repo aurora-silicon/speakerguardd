@@ -80,10 +80,13 @@
 //!   request on the fast-gained retained frame and look-ahead as
 //!   `B + g L + g^2 Q`. Runtime look-ahead writes move the retained
 //!   start inside the fixed initial latency allocation, and every
-//!   ceiling substep uses the native Float32 vector-sum tree. The idle follower releases toward that solved request,
-//!   and a result below its provisional endpoint makes a second follower call
-//!   toward 0.99 x the request. The audio applies the slow trajectory after
-//!   summing the fast-gained bands.
+//!   ceiling substep uses the native Float32 vector-sum tree. The retained
+//!   current response contributes to the linear term for one filterbank
+//!   stage; the zero-state quadratic response spans the complete window. The
+//!   idle follower releases toward that solved request, and a result below
+//!   its provisional endpoint makes a second follower call toward 0.99 x the
+//!   request. The audio applies the slow trajectory after summing the
+//!   fast-gained bands.
 //! - **Monitor** (rig laws 3, 4, 11): on the protected output, `u = Vfs y`;
 //!   the Float32 substep mean of `u i` drives the two thermal branches
 //!   (residuals 2.1: `theta += alpha (R_eff P - theta)`), and `Pamp = idle + ratio max(mean(u i), 0) (Rdc + Rpar) /
@@ -1263,6 +1266,16 @@ impl Current {
         self.i = [i, self.i[0]];
         i
     }
+    /// The retained response used by the ceiling's linear term exists for
+    /// one filterbank stage. The remaining predictor window is zero-state.
+    #[inline]
+    fn retained_step(&mut self, sample: usize, stage: usize) -> f32 {
+        if sample < stage {
+            self.step(0.0)
+        } else {
+            0.0
+        }
+    }
     fn clear(&mut self) {
         self.u = [0.0; 2];
         self.i = [0.0; 2];
@@ -1525,7 +1538,7 @@ impl Chan {
     /// corrections start at the absolute ordinary request and continue at
     /// the hottest substep until every substep is within
     /// `TemperatureHardLimit + max(TemperatureHeadroom, 0)`.
-    fn ceiling_scale(&self, g0: f32, ctl: usize, sub: usize, shift: isize) -> f32 {
+    fn ceiling_scale(&self, g0: f32, ctl: usize, sub: usize, fb: usize, shift: isize) -> f32 {
         let extra = shift.max(0) as usize;
         let skip = (-shift).max(0) as usize;
         let full = extra + self.xc.len();
@@ -1549,9 +1562,10 @@ impl Chan {
         for raw_k in 0..full / sub {
             let [sl, sq] = vdsp_sve(sub, || {
                 let y = if i < extra { self.ceil_fast_prev[ctl - extra + i] } else { self.out_sample(i - extra, 1.0) };
+                let retained = zi.retained_step(i, fb);
                 i += 1;
                 let u = self.vfs * y;
-                [u * zi.step(0.0), u * zs.step(u)]
+                [u * retained, u * zs.step(u)]
             });
             let (pl, pq) = (sl / sub as f32, sq / sub as f32);
             bv = self.br_vc.step(bv, 0.0);
@@ -2502,7 +2516,7 @@ impl Run {
         }
         if self.axis[4] {
             for (ci, c) in self.ch.iter().enumerate() {
-                want[ci] = c.ceiling_scale(want[ci], ctl, sub, self.ceiling_shift);
+                want[ci] = c.ceiling_scale(want[ci], ctl, sub, self.fb, self.ceiling_shift);
             }
         }
         if self.link && n > 1 {
@@ -2873,6 +2887,15 @@ impl ProtectionUnit for Unit {
 #[cfg(test)]
 mod fault_tests {
     use super::*;
+
+    #[test]
+    fn ceiling_retained_current_ends_after_one_filterbank_stage() {
+        let mut current = Current { a: [-0.5, 0.25], i: [1.0, 0.5], ..Current::default() };
+        assert_ne!(current.retained_step(0, 1), 0.0);
+        let retained = current;
+        assert_eq!(current.retained_step(1, 1), 0.0);
+        assert_eq!((current.u, current.i), (retained.u, retained.i));
+    }
 
     #[test]
     fn sample_peak_window_keeps_the_span_and_prepends_the_previous_sample() {
