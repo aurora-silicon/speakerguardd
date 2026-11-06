@@ -23,13 +23,7 @@ enum Shape {
 }
 
 fn inverse(s: Section) -> Section {
-    Section {
-        b0: 1.0 / s.b0,
-        b1: s.a1 / s.b0,
-        b2: s.a2 / s.b0,
-        a1: s.b1 / s.b0,
-        a2: s.b2 / s.b0,
-    }
+    Section { b0: 1.0 / s.b0, b1: s.a1 / s.b0, b2: s.a2 / s.b0, a1: s.b1 / s.b0, a2: s.b2 / s.b0 }
 }
 
 /// The denominator obtained by mapping the roots of

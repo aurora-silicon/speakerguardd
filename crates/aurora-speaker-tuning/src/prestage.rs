@@ -107,6 +107,7 @@ use crate::tuning::{Stage, Tuning};
 use sgv2_core::prestage::{
     Band, BandMode, BoxAt, Channel, Dynamics, Params, Section, BANDS, FLAG_FROM_TUNING, MAX_BOXES, MAX_SECTIONS,
 };
+use sgv2_core::voicing::chain::{Tone, ToneAutomation, TonePoint, ToneShape, ToneTarget};
 use sgv2_core::voicing::tone as tone_filter;
 use sgv2_core::MAX_CHANNELS;
 use std::f64::consts::PI;
@@ -145,6 +146,10 @@ const AUTOMATION_ENTRIES: u32 = 10;
 /// The highest Butterworth order the unit offers.
 pub const MAX_ORDER: u32 = 10;
 
+fn automation_on(state: f64) -> bool {
+    state == 2.0 || state == 1000.0
+}
+
 fn bad(message: impl Into<String>) -> Error {
     Error::format("prestage", message)
 }
@@ -155,6 +160,17 @@ struct Part {
     sections: Vec<Section>,
     gain_db: f64,
     muted: bool,
+    slots: Vec<SlotPart>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SlotPart {
+    index: u32,
+    shape: ToneShape,
+    gain_db: f64,
+    frequency_hz: f64,
+    quality: f64,
+    section: usize,
 }
 
 fn butterworth(high: bool, order: u32, f0: f64, fs: f64) -> Vec<Section> {
@@ -222,12 +238,116 @@ fn rbj(kind: Rbj, gain_db: f64, f0: f64, q: f64, fs: f64) -> Section {
 /// the automation entries that are switched on, so the caller can report
 /// the box as not yet exact at every volume.
 pub fn tone(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics) -> Result<(Vec<Section>, f64, bool, Vec<u32>)> {
-    let p = part_with(stage, ch, fs, diags)?;
+    let p = part_with(stage, ch, fs, diags, false)?;
     Ok((p.sections, p.gain_db, p.muted, automation(stage)))
 }
 
+/// A filter box for the whole-chain runner, including the slot gain/frequency
+/// automation driven by the box's SystemVolume parameter. Entries with equal
+/// set points do not move the shipped unit and are omitted.
+pub(crate) fn voicing_tone(
+    stage: &Stage,
+    width: usize,
+    volume_wired: bool,
+    fs: f64,
+    diags: &mut Diagnostics,
+) -> Result<Tone> {
+    let ctx = format!("filter box {}", stage.name);
+    let mut parts = Vec::with_capacity(width);
+    let mut channels = Vec::with_capacity(width);
+    for c in 0..width {
+        let p = part_with(stage, c as u32, fs, diags, true)?;
+        if p.sections.len() > MAX_SECTIONS {
+            return Err(bad(format!("{ctx} channel {c}: {} sections", p.sections.len())));
+        }
+        let mut ch = Channel::IDENTITY;
+        ch.count = p.sections.len();
+        ch.sections[..p.sections.len()].copy_from_slice(&p.sections);
+        ch.gain = if p.muted { 0.0 } else { 10f64.powf(p.gain_db / 20.0) };
+        if !ch.gain.is_finite() {
+            return Err(bad(format!("{ctx} channel {c}: gain {} dB", p.gain_db)));
+        }
+        parts.push(p);
+        channels.push(ch);
+    }
+    if !volume_wired || stage.bypass {
+        return Ok(Tone { channels, automation: Vec::new() });
+    }
+    let g = stage
+        .state
+        .as_ref()
+        .and_then(|s| s.global())
+        .ok_or_else(|| bad(format!("{ctx}: the strip gives it no saved state")))?;
+    let get = |id: u32| g.get(id).map(f64::from).unwrap_or(0.0);
+    let mut out: Vec<ToneAutomation> = Vec::new();
+    let mut automated_slots = Vec::new();
+    for e in 0..AUTOMATION_ENTRIES {
+        let entry = AUTOMATION_BASE + AUTOMATION_STRIDE * e;
+        let state = get(entry + 1);
+        let (a_scalar, b_scalar) = (get(entry + 2), get(entry + 3));
+        if !automation_on(state) || a_scalar == b_scalar {
+            continue;
+        }
+        let target = get(entry);
+        if target.fract() != 0.0 || !(0.0..SLOTS as f64).contains(&target) {
+            return Err(bad(format!("{ctx}: volume automation {e} target {target}")));
+        }
+        if !a_scalar.is_finite() || !b_scalar.is_finite() || a_scalar >= b_scalar {
+            return Err(bad(format!("{ctx}: volume automation {e} set points {a_scalar}, {b_scalar}")));
+        }
+        let target = target as u32;
+        if automated_slots.contains(&target) {
+            return Err(bad(format!("{ctx}: two active volume automations target slot {target}")));
+        }
+        let mut saved: Option<SlotPart> = None;
+        let mut targets = Vec::new();
+        for (channel, p) in parts.iter().enumerate() {
+            let Some(slot) = p.slots.iter().find(|s| s.index == target).copied() else { continue };
+            if let Some(first) = saved {
+                if (first.shape, first.gain_db, first.frequency_hz, first.quality)
+                    != (slot.shape, slot.gain_db, slot.frequency_hz, slot.quality)
+                {
+                    return Err(bad(format!("{ctx}: slot {target} differs between channels")));
+                }
+            } else {
+                saved = Some(slot);
+            }
+            targets.push(ToneTarget { channel, section: slot.section });
+        }
+        let Some(saved) = saved else {
+            return Err(bad(format!("{ctx}: volume automation {e} targets inactive or uncarried slot {target}")));
+        };
+        let point = |scalar: f64, gain_db: f64, frequency_hz: f64, which: &str| -> Result<TonePoint> {
+            let freq_ok = matches!(saved.shape, ToneShape::Gain)
+                || frequency_hz.is_finite() && frequency_hz > 0.0 && frequency_hz < fs / 2.0;
+            if !gain_db.is_finite() || !(-30.0..=30.0).contains(&gain_db) || !freq_ok {
+                return Err(bad(format!(
+                    "{ctx}: volume automation {e} {which}: gain {gain_db} dB, frequency {frequency_hz} Hz"
+                )));
+            }
+            Ok(TonePoint { scalar, gain_db, frequency_hz: frequency_hz.max(1.0) })
+        };
+        let a = point(a_scalar, saved.gain_db, saved.frequency_hz, "A")?;
+        let b = point(b_scalar, get(entry + 4), get(entry + 5), "B")?;
+        let midpoint = match get(entry + 6) {
+            0.0 => None,
+            1.0 => {
+                let scalar = get(entry + 7);
+                if scalar <= a_scalar || scalar >= b_scalar {
+                    return Err(bad(format!("{ctx}: volume automation {e} midpoint {scalar}")));
+                }
+                Some(point(scalar, get(entry + 8), get(entry + 9), "midpoint")?)
+            }
+            v => return Err(bad(format!("{ctx}: volume automation {e} midpoint enable {v}"))),
+        };
+        out.push(ToneAutomation { shape: saved.shape, quality: saved.quality, a, b, midpoint, targets });
+        automated_slots.push(target);
+    }
+    Ok(Tone { channels, automation: out })
+}
+
 /// The volume automation entries of a filter box that move something: on
-/// (state not 0), aimed at a slot, with two distinct volume set points
+/// (state 2 or the legacy active value 1000), aimed at a slot, with two distinct volume set points
 /// (entry words 2 and 3). An entry whose set points coincide was measured
 /// to change nothing at any volume (black-box renders of the unit), so it
 /// is not counted.
@@ -237,7 +357,7 @@ pub fn automation(stage: &Stage) -> Vec<u32> {
     (0..AUTOMATION_ENTRIES)
         .filter(|e| {
             let entry = AUTOMATION_BASE + AUTOMATION_STRIDE * e;
-            get(entry + 1) != 0.0 && get(entry) >= 0.0 && get(entry + 2) != get(entry + 3)
+            automation_on(get(entry + 1)) && get(entry) >= 0.0 && get(entry + 2) != get(entry + 3)
         })
         .collect()
 }
@@ -489,10 +609,10 @@ fn carried(points: &[Point], spans: &[(usize, usize, bool)]) -> Carry {
 
 /// The filters box `stage` applies to its channel `ch`.
 fn part(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics) -> Result<Part> {
-    part_with(stage, ch, fs, diags)
+    part_with(stage, ch, fs, diags, false)
 }
 
-fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics) -> Result<Part> {
+fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics, exact_volume: bool) -> Result<Part> {
     let ctx = format!("filter box {}", stage.name);
     let mut p = Part::default();
     if stage.bypass {
@@ -572,9 +692,10 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics) -> Result
         let kind = kind as i64;
         // The slot's own values, then every set point a volume automation
         // moves it to.
+        let has_automation = automation.iter().any(|(_, a)| a.target == i);
         let mut points = vec![Point { gain, f0 }];
         let mut spans = Vec::new();
-        for (e, a) in automation.iter().filter(|(_, a)| a.target == i) {
+        for (e, a) in automation.iter().filter(|(_, a)| a.target == i && !exact_volume) {
             a.check(&ctx, *e, kind)?;
             let base = points.len();
             points.extend(a.middle.map(|(_, m)| m));
@@ -600,6 +721,7 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics) -> Result
                 if order.fract() != 0.0 || order < 1.0 || order as u32 > max_order {
                     return Err(bad(format!("{ctx}: slot {i} order {order} (1 to {max_order})")));
                 }
+                let section = p.sections.len();
                 for pt in &points {
                     need_freq("Butterworth", pt.f0)?;
                 }
@@ -621,6 +743,14 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics) -> Result
                         ),
                     );
                 }
+                p.slots.push(SlotPart {
+                    index: i,
+                    shape: if high { ToneShape::HighPass(order as u32) } else { ToneShape::LowPass(order as u32) },
+                    gain_db: gain,
+                    frequency_hz: f0,
+                    quality: q,
+                    section,
+                });
             }
             9 => {
                 let mut g = points.iter().map(|pt| pt.gain).fold(f64::INFINITY, f64::min);
@@ -635,6 +765,14 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics) -> Result
                         format!("slot {i}: the volume-automated gain is carried at its lowest, {g} dB"),
                     );
                 }
+                p.slots.push(SlotPart {
+                    index: i,
+                    shape: ToneShape::Gain,
+                    gain_db: gain,
+                    frequency_hz: f0.max(1.0),
+                    quality: q,
+                    section: p.sections.len(),
+                });
             }
             // A resonant second-order high-pass. Its gain, order and fourth
             // frequency fields do not participate. The quality uses the
@@ -647,7 +785,16 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics) -> Result
                     need_freq("resonant high-pass", pt.f0)?;
                 }
                 let corner = points.iter().map(|pt| pt.f0).fold(f0, f64::max);
+                let section = p.sections.len();
                 p.sections.push(tone_filter::resonant_high_pass(corner, q, fs));
+                p.slots.push(SlotPart {
+                    index: i,
+                    shape: ToneShape::ResonantHighPass,
+                    gain_db: gain,
+                    frequency_hz: f0,
+                    quality: q,
+                    section,
+                });
                 if automated {
                     diags.info(
                         "prestage-volume-automation",
@@ -658,7 +805,7 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics) -> Result
             }
             // A peak or shelf of 0 dB at every point is the identity at
             // any frequency and quality.
-            1 | 11 | 12 if points.iter().all(|pt| pt.gain == 0.0) => {}
+            1 | 11 | 12 if points.iter().all(|pt| pt.gain == 0.0) && !(exact_volume && has_automation) => {}
             7 => {
                 if automated {
                     return Err(bad(format!("{ctx}: slot {i}: volume automation on a constant tilt")));
@@ -721,6 +868,7 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics) -> Result
                     11 => Rbj::LowShelf,
                     _ => Rbj::HighShelf,
                 };
+                let section = p.sections.len();
                 match carried(&points, &spans) {
                     Carry::Exact(k) if in_bypassed_group && points[k].gain > 0.0 => {}
                     Carry::Exact(k) => p.sections.push(match r {
@@ -743,6 +891,18 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics) -> Result
                         },
                     );
                 }
+                p.slots.push(SlotPart {
+                    index: i,
+                    shape: match kind as i64 {
+                        1 => ToneShape::Peak,
+                        11 => ToneShape::LowShelf,
+                        _ => ToneShape::HighShelf,
+                    },
+                    gain_db: gain,
+                    frequency_hz: f0,
+                    quality: q,
+                    section,
+                });
             }
             0 | 2 => {
                 if automated {
@@ -1557,6 +1717,43 @@ mod tests {
             &[(0, [3.0, 4.0, 0.0, 200.0, 0.7, 2.0, 3.0, 0.0])],
         );
         assert_eq!(part(&ramps, 0, fs, &mut d).unwrap().sections.len(), 1);
+    }
+
+    #[test]
+    fn voicing_compiles_volume_automation_and_skips_equal_points() {
+        let fs = 48_000.0;
+        let b = AUTOMATION_BASE;
+        let globals = [
+            (b, 0.0),
+            (b + 1, 1000.0), // legacy nonzero state is active, like state 2
+            (b + 2, 0.2),
+            (b + 3, 0.8),
+            (b + 4, 0.0),
+            (b + 5, 1600.0),
+            (b + 6, 1.0),
+            (b + 7, 0.5),
+            (b + 8, 9.0),
+            (b + 9, 200.0),
+        ];
+        let st = tmst(&globals, &[(0, [3.0, 11.0, 12.0, 100.0, core::f32::consts::FRAC_1_SQRT_2, 2.0, 3.0, 0.0])]);
+        let mut d = Diagnostics::default();
+        let tone = voicing_tone(&st, 2, true, fs, &mut d).unwrap();
+        assert_eq!(tone.channels.len(), 2);
+        assert_eq!(tone.automation.len(), 1);
+        let a = &tone.automation[0];
+        assert_eq!(a.shape, ToneShape::LowShelf);
+        assert!((a.a.scalar - 0.2).abs() < 1e-6);
+        assert_eq!((a.a.gain_db, a.a.frequency_hz), (12.0, 100.0));
+        assert!((a.b.scalar - 0.8).abs() < 1e-6);
+        assert_eq!((a.b.gain_db, a.b.frequency_hz), (0.0, 1600.0));
+        assert!((a.midpoint.unwrap().scalar - 0.5).abs() < 1e-6);
+        assert_eq!(a.targets, vec![ToneTarget { channel: 0, section: 0 }, ToneTarget { channel: 1, section: 0 }]);
+
+        let mut equal = globals;
+        equal[3].1 = equal[2].1;
+        let st = tmst(&equal, &[(0, [3.0, 11.0, 12.0, 100.0, core::f32::consts::FRAC_1_SQRT_2, 2.0, 3.0, 0.0])]);
+        assert!(voicing_tone(&st, 2, true, fs, &mut d).unwrap().automation.is_empty());
+        assert!(voicing_tone(&st, 2, false, fs, &mut d).unwrap().automation.is_empty());
     }
 
     #[test]
