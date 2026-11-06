@@ -558,8 +558,9 @@ impl GainSrc {
 }
 
 /// First-order anti-alias section after reduced-rate gain interpolation.
-/// Its corner follows the detector-rate ratio from a 1 kHz full-rate corner;
-/// both delay elements start at zero, like the interpolator history.
+/// The saved release control also selects this section's corner: its value in
+/// milliseconds is used numerically as hertz. Both delay elements start at
+/// zero, like the interpolator history.
 #[derive(Clone, Copy)]
 struct GainAntiAlias {
     b: f32,
@@ -569,8 +570,8 @@ struct GainAntiAlias {
 }
 
 impl GainAntiAlias {
-    fn new(factor: usize, fs: f64) -> Self {
-        let cutoff = 1000.0 / factor.clamp(1, 8) as f64;
+    fn new(release_s: f64, fs: f64) -> Self {
+        let cutoff = (release_s * 1000.0).clamp(1.0, 0.49 * fs);
         let k = libm::tan(core::f64::consts::PI * cutoff / fs);
         let b = (k / (1.0 + k)) as f32;
         Self { b, a1: ((k - 1.0) / (k + 1.0)) as f32, x1: 0.0, y1: 0.0 }
@@ -716,7 +717,7 @@ impl Run {
             detector_max: [SlidingMax::EMPTY; BANDS],
             detector_rms: [0.0; BANDS],
             gain_src: core::array::from_fn(|b| GainSrc::new(detector_factor[b], fs)),
-            gain_anti_alias: core::array::from_fn(|b| GainAntiAlias::new(detector_factor[b], fs)),
+            gain_anti_alias: core::array::from_fn(|_| GainAntiAlias::new(q.release_s, fs)),
             state: [[[[0.0; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS],
             legacy_high_state: [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
             legacy_split_allpass_state: [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
@@ -1185,17 +1186,18 @@ mod tests {
     }
 
     #[test]
-    fn gain_anti_alias_has_zero_startup_unity_dc_and_rate_scaled_corner() {
-        for factor in [1, 2, 4] {
-            let mut filter = GainAntiAlias::new(factor, 48_000.0);
+    fn gain_anti_alias_has_zero_startup_near_unity_dc_and_release_selected_corner() {
+        for release_s in [0.0, 0.05, 0.4] {
+            let mut filter = GainAntiAlias::new(release_s, 48_000.0);
             assert_eq!(filter.step(0.0), 0.0);
-            let expected_k = libm::tan(core::f64::consts::PI * (1000.0 / factor as f64) / 48_000.0);
+            let cutoff = (release_s * 1000.0f64).clamp(1.0, 0.49 * 48_000.0);
+            let expected_k = libm::tan(core::f64::consts::PI * cutoff / 48_000.0);
             assert!((filter.b as f64 - expected_k / (1.0 + expected_k)).abs() < 1e-8);
             let mut output = 0.0;
-            for _ in 0..4096 {
+            for _ in 0..131_072 {
                 output = filter.step(1.0);
             }
-            assert!((output - 1.0).abs() < 2e-6, "factor {factor}: {output}");
+            assert!(output > 0.999, "release {release_s}: {output}");
             filter.reset();
             assert_eq!(filter.step(0.0), 0.0);
         }
