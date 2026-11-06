@@ -16,4 +16,7 @@
 //! `mvsc` = 1, `mvol` = 0 dB); a box whose saved state depends on another
 //! volume refuses rather than guesses.
 
+pub mod buzz;
+pub mod cdelay;
+pub mod lowflow;
 pub mod xtc;
