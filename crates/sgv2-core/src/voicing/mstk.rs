@@ -214,7 +214,8 @@ impl Params {
         p.valid(48_000.0).then_some(p)
     }
 
-    fn valid(&self, fs: f64) -> bool {
+    /// Every control is in range for sample rate `fs`.
+    pub fn valid(&self, fs: f64) -> bool {
         let finite = |v: f64, lo: f64, hi: f64| v.is_finite() && v >= lo && v <= hi;
         self.crossover_hz[0] > 0.0
             && self.crossover_hz[0] < self.crossover_hz[1]
@@ -274,38 +275,18 @@ impl Path {
     }
 }
 
-fn butter2(high: bool, fc: f64, fs: f64) -> Section {
-    let k = libm::tan(core::f64::consts::PI * fc / fs);
-    let n = 1.0 / (1.0 + core::f64::consts::SQRT_2 * k + k * k);
-    let (a1, a2) = (2.0 * (k * k - 1.0) * n, (1.0 - core::f64::consts::SQRT_2 * k + k * k) * n);
-    if high {
-        Section { b0: n, b1: -2.0 * n, b2: n, a1, a2 }
-    } else {
-        Section { b0: k * k * n, b1: 2.0 * k * k * n, b2: k * k * n, a1, a2 }
-    }
+/// The Linkwitz-Riley order selected by the continuous public control.
+///
+/// The unit truncates to an integer and then rounds odd orders up to the next
+/// even order. Thus 3 selects LR4, 4.5 selects LR4, and 5 selects LR6.
+pub fn effective_order(control: f64) -> usize {
+    let n = libm::floor(control).clamp(2.0, 20.0) as usize;
+    n + (n & 1)
 }
 
-fn allpass2(fc: f64, fs: f64) -> Section {
-    let s = butter2(false, fc, fs);
-    Section { b0: s.a2, b1: s.a1, b2: 1.0, a1: s.a1, a2: s.a2 }
-}
-
-fn append_butter(path: &mut Path, high: bool, order: f64, fc: f64, fs: f64) {
-    // Fourth order is the unit's common Linkwitz-Riley case: two identical
-    // Butterworth-2 sections.  Other continuous controls select the stable
-    // Butterworth realization described by the unit's truncated order while
-    // the original public control remains in Params and on the wire.
-    if (order - 4.0).abs() < 1e-6 {
-        let s = butter2(high, fc, fs);
-        path.push(s);
-        path.push(s);
-        return;
-    }
-    // The public control is floating point, but the unit selects its filter
-    // count by truncating it (states just above an integer render identically
-    // to that integer).  Keep the original control in Params and mirror that
-    // selection only while constructing sections.
-    let n = libm::floor(order).clamp(2.0, 20.0) as usize;
+/// Append one Butterworth filter of order `n`, bilinear and prewarped at
+/// `fc`. Odd orders end in one first-order section.
+fn push_butter(path: &mut Path, high: bool, n: usize, fc: f64, fs: f64) {
     let k = libm::tan(core::f64::consts::PI * fc / fs);
     for i in 0..n / 2 {
         let q2 = 2.0 * libm::sin(core::f64::consts::PI * (2 * i + 1) as f64 / (2 * n) as f64);
@@ -321,22 +302,54 @@ fn append_butter(path: &mut Path, high: bool, order: f64, fc: f64, fs: f64) {
     }
 }
 
+/// Append one side of an even-order Linkwitz-Riley crossover. The high side
+/// is inverted when its Butterworth half-order is odd, keeping the low/high
+/// sum allpass.
+fn push_lr(path: &mut Path, high: bool, n: usize, fc: f64, fs: f64) {
+    push_butter(path, high, n / 2, fc, fs);
+    push_butter(path, high, n / 2, fc, fs);
+    if high && (n / 2) % 2 == 1 {
+        path.push(Section { b0: -1.0, b1: 0.0, b2: 0.0, a1: 0.0, a2: 0.0 });
+    }
+}
+
+/// Append the allpass response produced by an LR low/high pair.
+fn push_lr_allpass(path: &mut Path, n: usize, fc: f64, fs: f64) {
+    let m = n / 2;
+    let k = libm::tan(core::f64::consts::PI * fc / fs);
+    for i in 0..m / 2 {
+        let q2 = 2.0 * libm::sin(core::f64::consts::PI * (2 * i + 1) as f64 / (2 * m) as f64);
+        let d = 1.0 + q2 * k + k * k;
+        let (a1, a2) = (2.0 * (k * k - 1.0) / d, (1.0 - q2 * k + k * k) / d);
+        path.push(Section { b0: a2, b1: a1, b2: 1.0, a1, a2 });
+    }
+    if m % 2 != 0 {
+        let d = 1.0 + k;
+        let a1 = (k - 1.0) / d;
+        path.push(Section { b0: a1, b1: 1.0, b2: 0.0, a1, a2: 0.0 });
+    }
+}
+
+/// The measured band tree splits at the middle crossover first. The low side
+/// then splits at the lowest crossover and the high side at the highest; the
+/// unused crossover on each side is phase-equalised so all four bands sum to
+/// one allpass.
 fn paths(p: &Params, fs: f64) -> [Path; BANDS] {
     let mut v = [Path::EMPTY; BANDS];
-    append_butter(&mut v[0], false, p.crossover_order[0], p.crossover_hz[0], fs);
-    append_butter(&mut v[1], true, p.crossover_order[0], p.crossover_hz[0], fs);
-    append_butter(&mut v[1], false, p.crossover_order[1], p.crossover_hz[1], fs);
-    append_butter(&mut v[2], true, p.crossover_order[0], p.crossover_hz[0], fs);
-    append_butter(&mut v[2], true, p.crossover_order[1], p.crossover_hz[1], fs);
-    append_butter(&mut v[2], false, p.crossover_order[2], p.crossover_hz[2], fs);
-    append_butter(&mut v[3], true, p.crossover_order[0], p.crossover_hz[0], fs);
-    append_butter(&mut v[3], true, p.crossover_order[1], p.crossover_hz[1], fs);
-    append_butter(&mut v[3], true, p.crossover_order[2], p.crossover_hz[2], fs);
-    if p.crossover_order.iter().all(|o| (*o - 4.0).abs() < 1e-6) {
-        v[0].push(allpass2(p.crossover_hz[1], fs));
-        v[0].push(allpass2(p.crossover_hz[2], fs));
-        v[1].push(allpass2(p.crossover_hz[2], fs));
-    }
+    let n = p.crossover_order.map(effective_order);
+    let f = p.crossover_hz;
+    push_lr(&mut v[0], false, n[1], f[1], fs);
+    push_lr(&mut v[0], false, n[0], f[0], fs);
+    push_lr_allpass(&mut v[0], n[2], f[2], fs);
+    push_lr(&mut v[1], false, n[1], f[1], fs);
+    push_lr(&mut v[1], true, n[0], f[0], fs);
+    push_lr_allpass(&mut v[1], n[2], f[2], fs);
+    push_lr(&mut v[2], true, n[1], f[1], fs);
+    push_lr(&mut v[2], false, n[2], f[2], fs);
+    push_lr_allpass(&mut v[2], n[0], f[0], fs);
+    push_lr(&mut v[3], true, n[1], f[1], fs);
+    push_lr(&mut v[3], true, n[2], f[2], fs);
+    push_lr_allpass(&mut v[3], n[0], f[0], fs);
     v
 }
 
@@ -542,42 +555,50 @@ mod tests {
         assert!(level(&loud, 80.0) < 1.0);
     }
 
+    fn band_magnitude(path: &Path, f: f64) -> f64 {
+        let w = 2.0 * core::f64::consts::PI * f / 48_000.0;
+        let (c1, s1, c2, s2) = (libm::cos(w), libm::sin(w), libm::cos(2.0 * w), libm::sin(2.0 * w));
+        let mut m = 1.0;
+        for s in &path.section[..path.count] {
+            let (nr, ni) = (s.b0 + s.b1 * c1 + s.b2 * c2, -s.b1 * s1 - s.b2 * s2);
+            let (dr, di) = (1.0 + s.a1 * c1 + s.a2 * c2, -s.a1 * s1 - s.a2 * s2);
+            m *= libm::sqrt((nr * nr + ni * ni) / (dr * dr + di * di));
+        }
+        m
+    }
+
     #[test]
-    fn downward_fourth_order_state_matches_legacy_dynamics() {
-        use crate::prestage as legacy;
+    fn order_controls_select_even_linkwitz_riley_orders() {
+        for (control, order) in [(2.0, 2), (3.0, 4), (4.0, 4), (4.5, 4), (5.0, 6), (6.0, 6), (7.0, 8), (20.0, 20)] {
+            assert_eq!(effective_order(control), order, "control {control}");
+        }
+    }
 
-        let p = params();
-        let mut old_params = legacy::Params::identity(2);
-        old_params.dynamics = Some(legacy::Dynamics {
-            crossover_hz: p.crossover_hz,
-            input_gain_db: p.input_gain_db,
-            output_gain_db: p.output_gain_db,
-            release_s: p.release_s,
-            band: p.band.map(|b| legacy::Band {
-                threshold_db: b.down_threshold_db,
-                ratio: b.down_ratio,
-                range_db: b.down_range_db,
-                makeup_db: b.makeup_db,
-                mode: match b.mode {
-                    BandMode::Active => legacy::BandMode::Compress,
-                    BandMode::Pass => legacy::BandMode::Pass,
-                    BandMode::Mute => legacy::BandMode::Mute,
-                },
-            }),
-        });
-        let input = tone(997.0, 0.7, 24_000);
-        let mut old_l = input.clone();
-        let mut old_r = tone(220.0, 0.4, input.len());
-        let mut old = legacy::PreStage::with_rate(old_params, 48_000.0);
-        old.process_dynamics(&mut [&mut old_l, &mut old_r], input.len());
-
-        let mut new_l = input;
-        let mut new_r = tone(220.0, 0.4, new_l.len());
-        let mut new = Run::new(&p, 48_000.0, 2);
-        new.process(&mut [&mut new_l, &mut new_r], old_l.len());
-        let error =
-            old_l.iter().chain(&old_r).zip(new_l.iter().chain(&new_r)).fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
-        assert!(error < 2e-6, "maximum sample error {error}");
+    #[test]
+    fn bands_cross_at_minus_six_db_and_reconstruct() {
+        for order in [2.0, 3.0, 4.0, 6.0, 8.0] {
+            let mut p = params();
+            p.crossover_order = [order; 3];
+            p.input_gain_db = 0.0;
+            p.output_gain_db = 0.0;
+            p.release_on = false;
+            for b in p.band.iter_mut() {
+                b.mode = BandMode::Pass;
+                b.saturation = None;
+            }
+            let v = paths(&p, 48_000.0);
+            for (i, fc) in p.crossover_hz.iter().enumerate() {
+                let (lo, hi) = (band_magnitude(&v[i], *fc), band_magnitude(&v[i + 1], *fc));
+                assert!((20.0 * libm::log10(lo) + 6.02).abs() < 0.3, "order {order} xo {i} low {lo}");
+                assert!((20.0 * libm::log10(hi) + 6.02).abs() < 0.3, "order {order} xo {i} high {hi}");
+            }
+            for f in [40.0, 300.0, 1000.0, 3000.0, 12_000.0] {
+                let mut x = tone(f, 0.25, 24_000);
+                let mut run = Run::new(&p, 48_000.0, 1);
+                run.process(&mut [&mut x], 24_000);
+                assert!((level(&x, f) - 20.0 * libm::log10(0.25)).abs() < 0.01, "order {order} at {f} Hz");
+            }
+        }
     }
 
     #[test]
