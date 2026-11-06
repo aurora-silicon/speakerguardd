@@ -78,7 +78,7 @@
 //! - **Slow gain** (power, temperature, linked across channels; residuals
 //!   2.4): the output-temperature ceiling solves the absolute ordinary
 //!   request on the fast-gained retained frame and look-ahead as
-//!   `B + g L + g^2 Q`. Runtime attack/look-ahead writes move the retained
+//!   `B + g L + g^2 Q`. Runtime look-ahead writes move the retained
 //!   start inside the fixed initial latency allocation, and every
 //!   ceiling substep uses the native Float32 vector-sum tree. The idle follower releases toward that solved request,
 //!   and a result below its provisional endpoint makes a second follower call
@@ -1618,7 +1618,6 @@ pub struct Unit {
     /// Geometry is fixed by AU initialisation. Runtime parameter writes may
     /// move the ceiling window inside it, but do not rebuild the audio delay.
     geometry_lookahead_ms: f32,
-    attack_runtime_written: bool,
     telemetry_ambient: [f32; MAX_CHANNELS],
 }
 
@@ -1678,20 +1677,15 @@ impl Unit {
     pub fn new(params: Params) -> Self {
         let geometry_lookahead_ms = params.speaker_response_lookahead_ms;
         let telemetry_ambient = core::array::from_fn(|i| params.ch[i].ambient);
-        let run = params
-            .check_protects()
-            .and_then(|()| Run::new(&params, geometry_lookahead_ms, false, &telemetry_ambient))
-            .ok();
-        Unit { params, run, geometry_lookahead_ms, attack_runtime_written: false, telemetry_ambient }
+        let run =
+            params.check_protects().and_then(|()| Run::new(&params, geometry_lookahead_ms, &telemetry_ambient)).ok();
+        Unit { params, run, geometry_lookahead_ms, telemetry_ambient }
     }
     /// Why [`Unit::new`] gives the fail-safe for `params`: unprotected
     /// (mitigation off, or no thermal axis) or unusable.
     pub fn init_error(params: &Params) -> Option<InitError> {
         let ambient = core::array::from_fn(|i| params.ch[i].ambient);
-        params
-            .check_protects()
-            .and_then(|()| Run::new(params, params.speaker_response_lookahead_ms, false, &ambient))
-            .err()
+        params.check_protects().and_then(|()| Run::new(params, params.speaker_response_lookahead_ms, &ambient)).err()
     }
     pub fn params(&self) -> &Params {
         &self.params
@@ -1710,12 +1704,7 @@ fn motion(rdc: f32, bl: f32, mms: f32, rms: f32, kms: f32, rate: f64, vel: bool)
 }
 
 impl Run {
-    fn new(
-        p: &Params,
-        geometry_lookahead_ms: f32,
-        attack_runtime_written: bool,
-        telemetry_ambient: &[f32; MAX_CHANNELS],
-    ) -> Result<Run, InitError> {
+    fn new(p: &Params, geometry_lookahead_ms: f32, telemetry_ambient: &[f32; MAX_CHANNELS]) -> Result<Run, InitError> {
         // The geometry (latency floor, look-ahead region) is the one built at
         // initialisation; a runtime look-ahead write only moves the ceiling
         // window inside it (checked below against the substep grid).
@@ -1745,13 +1734,12 @@ impl Run {
         // residuals 2.4: AttackTime clamped to 10 ms, the raised-cosine
         // window at most one controller frame
         let attack_len = (libm::round((p.attack_time_ms as f64 * 1e-3).min(0.010) * rate) as u32).clamp(1, ctl as u32);
-        // Native keeps the AU's initial latency allocation fixed. Attack and
-        // look-ahead writes move the retained ceiling window's start: its
-        // prefix is max(one substep, controller - bounded attack), and the
-        // window still ends at the newest retained sample.
-        let prefix = (ctl - attack_len as usize).max(sub);
-        let attack_shift = if attack_runtime_written { fb as isize - prefix as isize } else { 0 };
-        let ceiling_shift = attack_shift + p.lookahead_frames() as isize - geometry_lookahead as isize;
+        // Native keeps the AU's initial latency allocation fixed. A runtime
+        // look-ahead write moves the retained ceiling window's start; the
+        // window still ends at the newest retained sample. (t-4870 also moved
+        // it on a runtime attack write; on the arm64 rig that took t3-att50's
+        // displacement over macOS, so the attack write keeps the window.)
+        let ceiling_shift = p.lookahead_frames() as isize - geometry_lookahead as isize;
         if ceiling_shift > (ctl - sub) as isize || ceiling_shift.unsigned_abs() % sub != 0 {
             return Err(InitError::Invalid("ceiling window against the controller cadence"));
         }
@@ -2712,10 +2700,7 @@ impl ProtectionUnit for Unit {
             return false;
         }
         self.params = p;
-        self.attack_runtime_written |= id == ids::controller(ids::C_ATTACK);
-        self.run =
-            Run::new(&self.params, self.geometry_lookahead_ms, self.attack_runtime_written, &self.telemetry_ambient)
-                .ok();
+        self.run = Run::new(&self.params, self.geometry_lookahead_ms, &self.telemetry_ambient).ok();
         true
     }
 
@@ -2974,7 +2959,7 @@ mod fault_tests {
         let mut long_attack = Unit::new(params());
         assert!(long_attack.set_parameter(ids::controller(ids::C_ATTACK), 50.0));
         let r = long_attack.run.as_ref().unwrap();
-        assert_eq!((r.latency, r.ceiling_shift), (512, 64));
+        assert_eq!((r.latency, r.ceiling_shift), (512, 0));
     }
 
     #[test]
