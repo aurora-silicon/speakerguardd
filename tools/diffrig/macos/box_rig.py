@@ -51,6 +51,34 @@ def rms_db(y):
     return [float(20 * np.log10(np.sqrt(np.mean(h[:, c] ** 2)) + 1e-15)) for c in range(y.shape[1])]
 
 
+def window_diff_db(v2, mac, frames):
+    worst = [-1e9] * mac.shape[1]
+    for at in range(0, len(mac) - frames + 1, frames):
+        for c in range(mac.shape[1]):
+            mr = np.sqrt(np.mean(mac[at:at + frames, c] ** 2)) + 1e-15
+            vr = np.sqrt(np.mean(v2[at:at + frames, c] ** 2)) + 1e-15
+            if mr >= 1e-4:  # ignore inaudible filter tails below -80 dBFS
+                worst[c] = max(worst[c], float(20 * np.log10(vr / mr)))
+    return worst
+
+
+def align_envelopes(v2, mac, hop=48, max_lag_ms=30):
+    count = min(len(v2), len(mac)) // hop
+    ve = np.mean(v2[:count * hop, 0].reshape(count, hop) ** 2, axis=1)
+    me = np.mean(mac[:count * hop, 0].reshape(count, hop) ** 2, axis=1)
+    best = (float("-inf"), 0)
+    for lag in range(-max_lag_ms, max_lag_ms + 1):
+        a, b = (me[lag:], ve[:len(ve) - lag]) if lag >= 0 else (me[:len(me) + lag], ve[-lag:])
+        score = float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-30))
+        best = max(best, (score, lag))
+    lag = best[1] * hop
+    if lag > 0:
+        return v2[:-lag], mac[lag:], lag
+    if lag < 0:
+        return v2[-lag:], mac[:lag], lag
+    return v2, mac, 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tunings", required=True)
@@ -64,6 +92,9 @@ def main():
     ap.add_argument("--json")
     ap.add_argument("--strip", default="builtin_speaker_out_general.austrip")
     ap.add_argument("--levels", default="0,-6,-12,-24,-40")
+    ap.add_argument("--frequencies", help="comma-separated sine frequencies (default: third-octave grid)")
+    ap.add_argument("--dynamic-programs", action="store_true", help="add low/high steps, release steps and tone bursts")
+    ap.add_argument("--window-ms", type=float, default=10.0)
     ap.add_argument("--seconds", type=float, default=1.0)
     ap.add_argument("--tol", type=float, default=0.05)
     a = ap.parse_args()
@@ -73,9 +104,19 @@ def main():
     n = int(FS * a.seconds)
     t = np.arange(n) / FS
     levels = [float(v) for v in a.levels.split(",")]
-    cases = [(f"sine_{f:g}_{-l:g}", 10 ** (l / 20) * np.sin(2 * np.pi * f * t)) for f in FREQS for l in levels]
+    frequencies = FREQS if a.frequencies is None else [float(v) for v in a.frequencies.split(",")]
+    cases = [(f"sine_{f:g}_{-l:g}", 10 ** (l / 20) * np.sin(2 * np.pi * f * t)) for f in frequencies for l in levels]
     pk = pink(n)
     cases += [(f"pink_{-l:g}", 10 ** (l / 20) * pk) for l in levels]
+    if a.dynamic_programs:
+        half = n // 2
+        for f in frequencies:
+            carrier = np.sin(2 * np.pi * f * t)
+            attack = np.r_[np.full(half, 0.01), np.ones(n - half)]
+            release = np.r_[np.ones(half), np.full(n - half, 0.01)]
+            burst = ((np.arange(n) // max(1, int(0.02 * FS))) % 4 == 0).astype(float)
+            cases += [(f"step_up_{f:g}", attack * carrier), (f"step_down_{f:g}", release * carrier),
+                      (f"burst_{f:g}", burst * carrier)]
 
     rows, worst = [], -1e9
     fin, fmac, fv2 = (os.path.join(a.work, x) for x in ("in.f32", "mac.f32", "v2.f32"))
@@ -101,23 +142,32 @@ def main():
         if r.returncode:
             print(json.dumps({"aid": a.aid, "box": a.box, "refused": r.stderr.strip()}))
             return 1
-        m = rms_db(np.fromfile(fmac, "<f4").reshape(-1, a.ch))
-        v = rms_db(np.fromfile(fv2, "<f4").reshape(-1, a.ch))
+        mac = np.fromfile(fmac, "<f4").reshape(-1, a.ch)
+        v2 = np.fromfile(fv2, "<f4").reshape(-1, a.ch)
+        latency = 0
+        if name.startswith("burst_"):
+            v2, mac, latency = align_envelopes(v2, mac)
+        m = rms_db(mac)
+        v = rms_db(v2)
         d = [vv - mm for vv, mm in zip(v, m)]
-        worst = max(worst, max(d))
-        rows.append({"case": name, "mac_db": m, "v2_db": v, "diff_db": d})
+        window = (window_diff_db(v2, mac, max(1, int(a.window_ms * FS / 1000)))
+                  if name.startswith(("step_", "burst_")) else d.copy())
+        worst = max(worst, max(d), max(window))
+        rows.append({"case": name, "mac_db": m, "v2_db": v, "diff_db": d, "window_diff_db": window,
+                     "latency_frames": latency})
     for f in (fin, fmac, fv2):
         if os.path.exists(f):
             os.unlink(f)
-    over = [r for r in rows if max(r["diff_db"]) > a.tol]
+    over = [r for r in rows if max(max(r["diff_db"]), max(r["window_diff_db"])) > a.tol]
     summary = {"aid": a.aid, "box": a.box, "slot": a.slot, "cases": len(rows), "worst_over_db": worst,
-               "min_diff_db": min(min(r["diff_db"]) for r in rows), "over": len(over),
-               "worst_cases": sorted(rows, key=lambda r: -max(r["diff_db"]))[:5]}
+               "min_diff_db": min(min(min(r["diff_db"]), min(r["window_diff_db"])) for r in rows), "over": len(over),
+               "worst_cases": sorted(rows, key=lambda r: -max(max(r["diff_db"]), max(r["window_diff_db"])))[:5]}
     if a.json:
         json.dump({"summary": summary, "rows": rows}, open(a.json, "w"), indent=1)
     print(json.dumps({k: summary[k] for k in ("aid", "box", "cases", "worst_over_db", "min_diff_db", "over")}))
     for r in summary["worst_cases"][:3]:
-        print("   ", r["case"], "mac", [round(x, 2) for x in r["mac_db"]], "v2-mac", [round(x, 2) for x in r["diff_db"]])
+        print("   ", r["case"], "mac", [round(x, 2) for x in r["mac_db"]], "v2-mac", [round(x, 2) for x in r["diff_db"]],
+              "window", [round(x, 2) for x in r["window_diff_db"]])
     return 0 if not over else 1
 
 

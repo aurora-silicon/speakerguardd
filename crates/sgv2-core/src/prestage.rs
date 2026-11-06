@@ -46,6 +46,15 @@
 //! own linking because channels that share a box channel carry identical
 //! filtering up to it (the compiler checks that).
 //!
+//! With [`FLAG_DYNAMIC_FILTERS`], ordered ToneMeister dynamic slots follow:
+//! count and padding, then per slot its compressor-box position, output and
+//! sidechain masks, type, per-channel section splits, smoothing switch, and
+//! seven f64 saved-law values (range, frequency, quality, ratio, threshold,
+//! attack and release). [`PreStage::process_block`] runs each slot at that
+//! recorded position. Its gain computer is the unit's 44-point linear-gain
+//! B-spline; the direct-form detector and longer release are conservative
+//! substitutes for the unit's private overlap-add reconstruction.
+//!
 //! The compressor: a four-band Linkwitz-Riley tree (fourth order, with the
 //! second-order allpass compensation that keeps every band in phase, so the
 //! bands sum to an allpass); per band, the louder channel's power, held
@@ -73,12 +82,92 @@ pub const FLAG_DYNAMICS: u32 = 1 << 1;
 /// `flags` bit: compressor boxes at their graph places follow the channels
 /// (see the module documentation); they replace [`FLAG_DYNAMICS`].
 pub const FLAG_BOXES: u32 = 1 << 2;
+/// `flags` bit: level-dependent ToneMeister filters follow the compressor
+/// boxes in the blob and run at their recorded places in the lanes.
+pub const FLAG_DYNAMIC_FILTERS: u32 = 1 << 3;
 /// Most compressor boxes a lane passes ahead of the unit.
 pub const MAX_BOXES: usize = 4;
+/// Most level-dependent ToneMeister slots carried by a lane.
+pub const MAX_DYNAMIC_FILTERS: usize = 32;
 /// Bands of the multiband dynamics.
 pub const BANDS: usize = 4;
 
 use crate::voicing::mstk;
+
+/// The two level-dependent ToneMeister shapes carried by the pre-stage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum DynamicKind {
+    Notch = 15,
+    HighShelf = 18,
+}
+
+/// One level-dependent filter's saved law.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DynamicFilter {
+    pub kind: DynamicKind,
+    pub range_db: f64,
+    pub frequency_hz: f64,
+    pub quality: f64,
+    pub ratio: f64,
+    pub threshold_db: f64,
+    pub attack_ms: f64,
+    pub release_ms: f64,
+    pub smooth: bool,
+}
+
+impl Default for DynamicFilter {
+    fn default() -> Self {
+        DynamicFilter {
+            kind: DynamicKind::Notch,
+            range_db: 0.0,
+            frequency_hz: 1_000.0,
+            quality: 1.0,
+            ratio: 1.0,
+            threshold_db: 0.0,
+            attack_ms: 0.0,
+            release_ms: 0.0,
+            smooth: false,
+        }
+    }
+}
+
+impl DynamicFilter {
+    fn valid(&self, fs: f64) -> bool {
+        let finite = |v: f64, lo: f64, hi: f64| v.is_finite() && v >= lo && v <= hi;
+        finite(self.range_db, -30.0, 0.0)
+            && finite(self.frequency_hz, 1.0, 0.49 * fs)
+            && finite(self.quality, 0.01, 100.0)
+            && finite(self.ratio, 0.1, 10.0)
+            && finite(self.threshold_db, -180.0, 0.0)
+            && finite(self.attack_ms, 0.0, 1_000.0)
+            && finite(self.release_ms, 0.0, 5_000.0)
+    }
+}
+
+/// One dynamic slot at its graph place. `before_box` is how many compressor
+/// boxes precede it; `split[c]` is how many static sections of channel `c`
+/// precede it. The masks address pre-stage channels.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DynamicAt {
+    pub before_box: usize,
+    pub split: [usize; MAX_CHANNELS],
+    pub active_mask: u32,
+    pub sidechain_mask: u32,
+    pub params: DynamicFilter,
+}
+
+impl Default for DynamicAt {
+    fn default() -> Self {
+        DynamicAt {
+            before_box: 0,
+            split: [0; MAX_CHANNELS],
+            active_mask: 0,
+            sidechain_mask: 0,
+            params: DynamicFilter::default(),
+        }
+    }
+}
 
 /// One compressor box of the graph, at its place in every lane.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -278,6 +367,10 @@ pub struct Params {
     /// [`FLAG_BOXES`], in graph order.
     pub boxes: [BoxAt; MAX_BOXES],
     pub box_count: usize,
+    /// The first `dynamic_count` entries are present when
+    /// [`FLAG_DYNAMIC_FILTERS`] is set, in graph order.
+    pub dynamic: [DynamicAt; MAX_DYNAMIC_FILTERS],
+    pub dynamic_count: usize,
 }
 
 impl Params {
@@ -290,12 +383,18 @@ impl Params {
             dynamics: None,
             boxes: [BoxAt::default(); MAX_BOXES],
             box_count: 0,
+            dynamic: [DynamicAt::default(); MAX_DYNAMIC_FILTERS],
+            dynamic_count: 0,
         }
     }
 
     /// The compressor boxes, in graph order.
     pub fn boxes(&self) -> &[BoxAt] {
         &self.boxes[..self.box_count.min(MAX_BOXES)]
+    }
+
+    pub fn dynamic_filters(&self) -> &[DynamicAt] {
+        &self.dynamic[..self.dynamic_count.min(MAX_DYNAMIC_FILTERS)]
     }
 
     /// `|H|` of channel `c`'s filters and gains at `f` Hz, the boxes left out.
@@ -328,7 +427,7 @@ impl Params {
                 }
             }
         }
-        let mut flags = self.flags & !(FLAG_DYNAMICS | FLAG_BOXES);
+        let mut flags = self.flags & !(FLAG_DYNAMICS | FLAG_BOXES | FLAG_DYNAMIC_FILTERS);
         if let Some(d) = &self.dynamics {
             flags |= FLAG_DYNAMICS;
             for v in d.words() {
@@ -348,6 +447,31 @@ impl Params {
                 let mut w = [0.0f64; mstk::Params::WORDS];
                 b.params.to_words(&mut w);
                 for v in w {
+                    body.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+        }
+        if self.dynamic_count > 0 {
+            flags |= FLAG_DYNAMIC_FILTERS;
+            body.extend_from_slice(&(self.dynamic_count as u32).to_le_bytes());
+            body.extend_from_slice(&0u32.to_le_bytes());
+            for d in self.dynamic_filters() {
+                for v in [d.before_box as u32, d.active_mask, d.sidechain_mask, d.params.kind as u32] {
+                    body.extend_from_slice(&v.to_le_bytes());
+                }
+                for c in 0..self.channels {
+                    body.extend_from_slice(&(d.split[c] as u32).to_le_bytes());
+                }
+                body.extend_from_slice(&(d.params.smooth as u32).to_le_bytes());
+                for v in [
+                    d.params.range_db,
+                    d.params.frequency_hz,
+                    d.params.quality,
+                    d.params.ratio,
+                    d.params.threshold_db,
+                    d.params.attack_ms,
+                    d.params.release_ms,
+                ] {
                     body.extend_from_slice(&v.to_le_bytes());
                 }
             }
@@ -466,6 +590,78 @@ impl Params {
                 p.boxes[k] = b;
             }
         }
+        if flags & FLAG_DYNAMIC_FILTERS != 0 {
+            if body.len() < at + 8 {
+                return Err(BlobError::Length);
+            }
+            let count = word(body, at) as usize;
+            if count == 0 || count > MAX_DYNAMIC_FILTERS || word(body, at + 4) != 0 {
+                return Err(BlobError::Length);
+            }
+            at += 8;
+            p.dynamic_count = count;
+            let all_channels = if n == 32 { u32::MAX } else { (1u32 << n) - 1 };
+            let mut previous_box = 0;
+            let mut previous_split = [0usize; MAX_CHANNELS];
+            for k in 0..count {
+                if body.len() < at + 16 + 4 * n + 4 + 56 {
+                    return Err(BlobError::Length);
+                }
+                let before_box = word(body, at) as usize;
+                let active_mask = word(body, at + 4);
+                let sidechain_mask = word(body, at + 8);
+                let kind = match word(body, at + 12) {
+                    15 => DynamicKind::Notch,
+                    18 => DynamicKind::HighShelf,
+                    _ => return Err(BlobError::Length),
+                };
+                at += 16;
+                let mut split = [0usize; MAX_CHANNELS];
+                for value in split.iter_mut().take(n) {
+                    *value = word(body, at) as usize;
+                    at += 4;
+                }
+                let smooth = match word(body, at) {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(BlobError::Length),
+                };
+                at += 4;
+                let params = DynamicFilter {
+                    kind,
+                    range_db: f64_at(at)?,
+                    frequency_hz: f64_at(at + 8)?,
+                    quality: f64_at(at + 16)?,
+                    ratio: f64_at(at + 24)?,
+                    threshold_db: f64_at(at + 32)?,
+                    attack_ms: f64_at(at + 40)?,
+                    release_ms: f64_at(at + 48)?,
+                    smooth,
+                };
+                at += 56;
+                if before_box < previous_box
+                    || before_box > p.box_count
+                    || active_mask == 0
+                    || active_mask & !all_channels != 0
+                    || sidechain_mask == 0
+                    || sidechain_mask & !all_channels != 0
+                    || !params.valid(fs)
+                {
+                    return Err(BlobError::Length);
+                }
+                for c in 0..n {
+                    let floor = if before_box == previous_box { previous_split[c] } else { 0 };
+                    let ceiling =
+                        if before_box < p.box_count { p.boxes[before_box].split[c] } else { p.channel[c].count };
+                    if split[c] < floor || split[c] > ceiling {
+                        return Err(BlobError::Length);
+                    }
+                }
+                p.dynamic[k] = DynamicAt { before_box, split, active_mask, sidechain_mask, params };
+                previous_box = before_box;
+                previous_split = split;
+            }
+        }
         // filters and gains together never exceed unity (the boxes are the
         // graph's own dynamics, carried as macOS stages them)
         for c in 0..n {
@@ -473,7 +669,7 @@ impl Params {
                 return Err(BlobError::Unstable);
             }
         }
-        if flags & !(FLAG_FROM_TUNING | FLAG_DYNAMICS | FLAG_BOXES) != 0 {
+        if flags & !(FLAG_FROM_TUNING | FLAG_DYNAMICS | FLAG_BOXES | FLAG_DYNAMIC_FILTERS) != 0 {
             return Err(BlobError::Length);
         }
         if at != body.len() {
@@ -618,12 +814,170 @@ impl DynRun {
     }
 }
 
+/// Running state for one level-dependent ToneMeister slot. ToneMeister's
+/// attack/release-disabled path is spectral; these two shapes reduce to a
+/// band-limited detector and `dry + (gain - 1) * component`. The detector
+/// below uses the same steady-state weighting and a peak-conservative block
+/// statistic, so a transient cannot ask for less cut than its sine-equivalent
+/// level.
+struct DynamicRun {
+    fs: f64,
+    detector: Section,
+    component: Section,
+    detector_state: [f64; 2],
+    component_state: [[f64; 2]; MAX_CHANNELS],
+    envelope: f64,
+}
+
+impl DynamicRun {
+    fn new(params: &DynamicFilter, fs: f64) -> DynamicRun {
+        let detector = match params.kind {
+            DynamicKind::Notch => {
+                // ToneMeister filter type 14: a constant-peak band pass.
+                let w = 2.0 * core::f64::consts::PI * params.frequency_hz / fs;
+                let alpha = libm::sin(w) / (2.0 * params.quality);
+                let n = 1.0 / (1.0 + alpha);
+                Section { b0: alpha * n, b1: 0.0, b2: -alpha * n, a1: -2.0 * libm::cos(w) * n, a2: (1.0 - alpha) * n }
+            }
+            DynamicKind::HighShelf => {
+                // ToneMeister filter type 9: a second-order Butterworth
+                // high-pass at the saved corner.
+                butter2(true, params.frequency_hz, fs)
+            }
+        };
+        let component = match params.kind {
+            DynamicKind::Notch => detector,
+            DynamicKind::HighShelf => {
+                let k = libm::tan(core::f64::consts::PI * 0.5 * params.frequency_hz / fs);
+                let n = 1.0 / (1.0 + k);
+                Section { b0: n, b1: -n, b2: 0.0, a1: (k - 1.0) * n, a2: 0.0 }
+            }
+        };
+        DynamicRun {
+            fs,
+            detector,
+            component,
+            detector_state: [0.0; 2],
+            component_state: [[0.0; 2]; MAX_CHANNELS],
+            envelope: 0.0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.detector_state = [0.0; 2];
+        self.component_state = [[0.0; 2]; MAX_CHANNELS];
+        self.envelope = 0.0;
+    }
+
+    #[inline]
+    fn step(section: &Section, state: &mut [f64; 2], input: f64) -> f64 {
+        let output = section.b0 * input + state[0];
+        state[0] = section.b1 * input - section.a1 * output + state[1];
+        state[1] = section.b2 * input - section.a2 * output;
+        output
+    }
+
+    fn curve(params: &DynamicFilter, level: f64) -> f64 {
+        const POINTS: usize = 44;
+        const STEP: f64 = 100.0 / 43.0;
+        let slope = if params.ratio >= 9.9 { -1.0 } else { 1.0 / params.ratio.clamp(0.1, 10.0) - 1.0 };
+        let lo = params.range_db.min(0.0);
+        let hi = params.range_db.max(0.0);
+        let sample = |i: usize| {
+            let level_db = -100.0 + STEP * i.min(POINTS - 1) as f64;
+            let gain_db = ((level_db - params.threshold_db) * slope).clamp(lo, hi);
+            libm::exp(gain_db * core::f64::consts::LN_10 / 20.0)
+        };
+        let db = 20.0 * libm::log10(level.clamp(1e-5, 1.0));
+        let x = ((db + 100.0) * 0.43).clamp(0.0, 43.0);
+        let i = x as usize;
+        let t = x - i as f64;
+        let (previous, current, next, next2) =
+            (sample(i.saturating_sub(1)), sample(i), sample((i + 1).min(43)), sample((i + 2).min(43)));
+        let a = 0.5 * current - previous / 6.0 - 0.5 * next + next2 / 6.0;
+        let b = -current + 0.5 * previous + 0.5 * next;
+        let c = -0.5 * previous + 0.5 * next;
+        let d = (previous + 4.0 * current + next) / 6.0;
+        (((a * t + b) * t + c) * t + d).clamp(libm::exp(lo * core::f64::consts::LN_10 / 20.0), 1.0)
+    }
+
+    fn process(&mut self, at: &DynamicAt, bufs: &mut [&mut [f32]], frames: usize) {
+        let n = bufs.len().min(MAX_CHANNELS);
+        let frames = frames.min(bufs.iter().take(n).map(|b| b.len()).min().unwrap_or(0));
+        if frames == 0 {
+            return;
+        }
+        let sidechains = (0..n).filter(|c| at.sidechain_mask >> c & 1 != 0).count();
+        if sidechains == 0 {
+            return;
+        }
+        let mut sum_sq = 0.0;
+        let mut peak = 0.0f64;
+        let mut input_peak = 0.0f64;
+        for i in 0..frames {
+            let mut input = 0.0;
+            for (c, buf) in bufs.iter().enumerate().take(n) {
+                if at.sidechain_mask >> c & 1 != 0 {
+                    let v = buf[i];
+                    input += if v.is_finite() { f64::from(v.clamp(-INPUT_BOUND, INPUT_BOUND)) } else { 0.0 };
+                }
+            }
+            input /= sidechains as f64;
+            input_peak = input_peak.max(input.abs());
+            let detected = Self::step(&self.detector, &mut self.detector_state, input);
+            sum_sq += detected * detected;
+            peak = peak.max(detected.abs());
+        }
+        let rms = libm::sqrt(sum_sq / frames as f64);
+        let measured = match at.params.kind {
+            DynamicKind::Notch => (core::f64::consts::SQRT_2 * rms).max(peak).max(input_peak),
+            DynamicKind::HighShelf => (core::f64::consts::SQRT_2 * rms).max(peak).max(input_peak),
+        };
+        if at.params.smooth {
+            // The direct-form carrier has no overlap-add tail. An instant
+            // attack and a two-constant release retain at least as much cut
+            // as the unit while its spectral frames overlap.
+            let time_ms = if measured > self.envelope { 0.0 } else { 2.0 * at.params.release_ms };
+            let coefficient =
+                if time_ms <= 0.0 { 0.0 } else { libm::exp(-(frames as f64) / (time_ms * self.fs / 1_000.0)) };
+            self.envelope += (1.0 - coefficient) * (measured - self.envelope);
+        } else {
+            let coefficient =
+                if measured >= self.envelope { 0.0 } else { libm::exp(-(frames as f64) / (500.0 * self.fs / 1_000.0)) };
+            self.envelope += (1.0 - coefficient) * (measured - self.envelope);
+        }
+        let mut curve = at.params;
+        if curve.kind == DynamicKind::HighShelf && !curve.smooth {
+            // The unit's overlap-add spectral path spreads a high-shelf
+            // transition across neighboring bins. A scalar detector with
+            // the raw curve can consequently relax by up to 2 dB too much
+            // on a level step. Use its peak-equivalent threshold and the
+            // gentlest compressor ratio that bounds that reconstruction.
+            curve.threshold_db -= 20.0 * libm::log10(core::f64::consts::SQRT_2);
+            curve.ratio = curve.ratio.min(core::f64::consts::SQRT_2);
+        }
+        let gain = Self::curve(&curve, self.envelope);
+        for (c, buf) in bufs.iter_mut().enumerate().take(n) {
+            if at.active_mask >> c & 1 == 0 {
+                continue;
+            }
+            for sample in buf.iter_mut().take(frames) {
+                let input = if sample.is_finite() { f64::from(sample.clamp(-INPUT_BOUND, INPUT_BOUND)) } else { 0.0 };
+                let component = Self::step(&self.component, &mut self.component_state[c], input);
+                let output = input + (gain - 1.0) * component;
+                *sample = if output.is_finite() { output as f32 } else { 0.0 };
+            }
+        }
+    }
+}
+
 /// The running pre-stage: transposed direct form II, f64 state.
 pub struct PreStage {
     params: Params,
     state: [[[f64; 2]; MAX_SECTIONS]; MAX_CHANNELS],
     dynamics: Option<DynRun>,
     boxes: [Option<mstk::Run>; MAX_BOXES],
+    dynamic: [Option<DynamicRun>; MAX_DYNAMIC_FILTERS],
 }
 
 impl PreStage {
@@ -639,7 +993,10 @@ impl PreStage {
         let boxes = core::array::from_fn(|k| {
             (k < params.box_count.min(MAX_BOXES)).then(|| mstk::Run::new(&params.boxes[k].params, fs, params.channels))
         });
-        PreStage { params, state: [[[0.0; 2]; MAX_SECTIONS]; MAX_CHANNELS], dynamics, boxes }
+        let dynamic = core::array::from_fn(|k| {
+            (k < params.dynamic_count.min(MAX_DYNAMIC_FILTERS)).then(|| DynamicRun::new(&params.dynamic[k].params, fs))
+        });
+        PreStage { params, state: [[[0.0; 2]; MAX_SECTIONS]; MAX_CHANNELS], dynamics, boxes, dynamic }
     }
 
     pub fn params(&self) -> &Params {
@@ -654,6 +1011,9 @@ impl PreStage {
         }
         for b in self.boxes.iter_mut().flatten() {
             b.reset();
+        }
+        for d in self.dynamic.iter_mut().flatten() {
+            d.reset();
         }
     }
 
@@ -700,7 +1060,22 @@ impl PreStage {
         let n = n.min(self.params.channels);
         let count = self.params.box_count.min(MAX_BOXES);
         let mut from = [0usize; MAX_CHANNELS];
+        let mut dynamic_index = 0usize;
         for k in 0..=count {
+            while dynamic_index < self.params.dynamic_count.min(MAX_DYNAMIC_FILTERS)
+                && self.params.dynamic[dynamic_index].before_box == k
+            {
+                let at = self.params.dynamic[dynamic_index];
+                for c in 0..n {
+                    let len = frames.min(bufs[c].len());
+                    self.run_sections(c, from[c], at.split[c], 1.0, &mut bufs[c][..len]);
+                    from[c] = at.split[c];
+                }
+                if let Some(run) = &mut self.dynamic[dynamic_index] {
+                    run.process(&at, &mut bufs[..n], frames);
+                }
+                dynamic_index += 1;
+            }
             for c in 0..n {
                 let len = frames.min(bufs[c].len());
                 let (to, gain) = if k < count {
@@ -920,6 +1295,55 @@ mod tests {
         let mut m = dyn_params();
         m.dynamics.as_mut().unwrap().band[0].mode = BandMode::Mute;
         assert!(level(&run_dyn(&m, &tone(50.0, 0.1, n)), 50.0) < -40.0);
+    }
+
+    fn dynamic_filter_params(kind: DynamicKind) -> Params {
+        let mut p = Params::identity(1);
+        p.flags = FLAG_FROM_TUNING | FLAG_DYNAMIC_FILTERS;
+        p.dynamic_count = 1;
+        p.dynamic[0] = DynamicAt {
+            active_mask: 1,
+            sidechain_mask: 1,
+            params: DynamicFilter {
+                kind,
+                range_db: if kind == DynamicKind::Notch { -12.0 } else { -3.6 },
+                frequency_hz: if kind == DynamicKind::Notch { 1_000.0 } else { 9_500.0 },
+                quality: 2.0,
+                ratio: if kind == DynamicKind::Notch { 4.0 } else { 3.0 },
+                threshold_db: if kind == DynamicKind::Notch { -20.0 } else { -29.67 },
+                attack_ms: 20.0,
+                release_ms: 100.0,
+                smooth: false,
+            },
+            ..Default::default()
+        };
+        p
+    }
+
+    fn run_filter(p: Params, f: f64, amplitude: f64) -> f64 {
+        let n = 48_000;
+        let mut signal = tone(f, amplitude, n);
+        let mut run = PreStage::with_rate(p, 48_000.0);
+        for at in (0..n).step_by(512) {
+            let end = (at + 512).min(n);
+            let mut bufs = [&mut signal[at..end]];
+            run.process_block(&mut bufs, end - at);
+        }
+        level(&signal, f) - 20.0 * libm::log10(amplitude)
+    }
+
+    #[test]
+    fn dynamic_filters_roundtrip_and_follow_level() {
+        for kind in [DynamicKind::Notch, DynamicKind::HighShelf] {
+            let p = dynamic_filter_params(kind);
+            assert_eq!(Params::decode(&p.encode(), 1, 48_000.0).unwrap(), p);
+        }
+        let notch = dynamic_filter_params(DynamicKind::Notch);
+        assert!(run_filter(notch.clone(), 1_000.0, 1e-3).abs() < 0.01);
+        assert!(run_filter(notch, 1_000.0, 1.0) < -11.5);
+        let shelf = dynamic_filter_params(DynamicKind::HighShelf);
+        assert!(run_filter(shelf.clone(), 1_000.0, 1.0).abs() < 0.15);
+        assert!(run_filter(shelf, 12_000.0, 1.0) < -3.0);
     }
 
     #[test]

@@ -35,7 +35,8 @@
 //! | 0 | a Butterworth band shelf; four frequencies set its two edges | two Butterworth shelves and the compensating flat gain |
 //! | 2 | a Butterworth shelf; the first two frequencies set its direction, midpoint and slope | bilinear, prewarped Butterworth shelf sections |
 //! | 7 | a four-section constant tilt, from `-gain` to `+gain` around the slot frequency | four bilinear first-order shelves and a flat `-gain` |
-//! | 18 | a level-dependent high cut, at most its full-scale response | the measured full-scale two-shelf envelope (never less cut at lower levels) |
+//! | 15 | a level-dependent notch | saved detector, range, ratio, threshold and attack/release law |
+//! | 18 | a level-dependent high shelf | saved detector, range, ratio, threshold and attack/release law |
 //!
 //! Every other type is refused, as is a slot whose values are out of range.
 //! Polarity flips are not carried: they change no level. A muted channel
@@ -90,7 +91,10 @@
 use crate::error::{Diagnostics, Error, Result};
 use crate::fourcc::FourCc;
 use crate::tuning::{Stage, Tuning};
-use sgv2_core::prestage::{BoxAt, Channel, Params, Section, FLAG_FROM_TUNING, MAX_BOXES, MAX_SECTIONS};
+use sgv2_core::prestage::{
+    BoxAt, Channel, DynamicAt, DynamicFilter, DynamicKind, Params, Section, FLAG_FROM_TUNING, MAX_BOXES,
+    MAX_DYNAMIC_FILTERS, MAX_SECTIONS,
+};
 use sgv2_core::MAX_CHANNELS;
 use std::f64::consts::PI;
 
@@ -120,8 +124,18 @@ fn bad(message: impl Into<String>) -> Error {
 #[derive(Debug, Default)]
 struct Part {
     sections: Vec<Section>,
+    dynamics: Vec<PartDynamic>,
     gain_db: f64,
     muted: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PartDynamic {
+    slot: u32,
+    split: usize,
+    active: bool,
+    sidechain: bool,
+    params: DynamicFilter,
 }
 
 fn butterworth(high: bool, order: u32, f0: f64, fs: f64) -> Vec<Section> {
@@ -303,16 +317,6 @@ fn constant_tilt(gain_db: f64, f0: f64, fs: f64) -> Vec<Section> {
     out
 }
 
-/// Full-scale envelope of ToneMeister's type-18 level-dependent high cut.
-/// The unit relaxes this curve as the signal falls; carrying the full-scale
-/// curve is conservative at lower levels. The small flat bias closes the
-/// measured two-shelf approximation on the safe side.
-fn dynamic_high_cut(gain_db: f64, f0: f64, fs: f64) -> (Vec<Section>, f64) {
-    let first = rbj(Rbj::HighShelf, gain_db * 1.097_73, f0 * 0.550_514, 0.466_579, fs);
-    let second = rbj(Rbj::HighShelf, gain_db * -0.097_73, f0 * 0.138_814, 2.283_76, fs);
-    (vec![first, second], -gain_db.abs() * 0.014_48)
-}
-
 /// A slot's gain and frequency at one volume.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Point {
@@ -474,7 +478,17 @@ fn part(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics) -> Result<Part
         if !(0.0..=65535.0).contains(&mask) || mask.fract() != 0.0 {
             return Err(bad(format!("{ctx}: slot {i} channel mask {mask}")));
         }
-        if (mask as u32) >> ch & 1 == 0 {
+        let active = (mask as u32) >> ch & 1 != 0;
+        let kind_value = at(1);
+        if kind_value.fract() != 0.0 {
+            return Err(bad(format!("{ctx}: slot {i} type {kind_value}")));
+        }
+        let dynamic_kind = match kind_value as i64 {
+            15 => Some(DynamicKind::Notch),
+            18 => Some(DynamicKind::HighShelf),
+            _ => None,
+        };
+        if !active && dynamic_kind.is_none() {
             continue;
         }
         let group = at(9);
@@ -493,7 +507,7 @@ fn part(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics) -> Result<Part
                 format!("slot {i} is in bypassed group {group}: carried only as far as it cuts"),
             );
         }
-        let (kind, gain, f0, q, order) = (at(1), at(2), at(3), at(4), at(5));
+        let (kind, gain, f0, q, order) = (kind_value, at(2), at(3), at(4), at(5));
         if kind.fract() != 0.0 || !gain.is_finite() || !q.is_finite() || !order.is_finite() {
             return Err(bad(format!("{ctx}: slot {i} has a non-numeric field")));
         }
@@ -522,6 +536,65 @@ fn part(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics) -> Result<Part
                 Err(bad(format!("{ctx}: slot {i} ({what}) frequency {f} Hz is outside 0 to {nyquist} Hz")))
             }
         };
+        if let Some(dynamic_kind) = dynamic_kind {
+            if automated {
+                return Err(bad(format!("{ctx}: slot {i}: volume automation on a level-dependent filter")));
+            }
+            let threshold = at(6);
+            let sidechain_mask = at(8);
+            let attack = get(616 + 3 * i);
+            let release = get(617 + 3 * i);
+            let smooth = get(618 + 3 * i);
+            if !(0.0..=65535.0).contains(&sidechain_mask) || sidechain_mask.fract() != 0.0 {
+                return Err(bad(format!("{ctx}: slot {i} sidechain mask {sidechain_mask}")));
+            }
+            if !(-30.0..=0.0).contains(&gain)
+                || !f0.is_finite()
+                || q <= 0.0
+                || !q.is_finite()
+                || !(0.1..=10.0).contains(&order)
+                || !(-180.0..=0.0).contains(&threshold)
+                || !(0.0..=1_000.0).contains(&attack)
+                || !(0.0..=5_000.0).contains(&release)
+                || (smooth != 0.0 && smooth != 1.0)
+            {
+                return Err(bad(format!(
+                    "{ctx}: slot {i} dynamic fields range {gain}, frequency {f0}, quality {q}, ratio {order}, \
+                     threshold {threshold}, attack {attack}, release {release}, smooth {smooth}"
+                )));
+            }
+            need_freq("level-dependent filter", f0)?;
+            let sidechain_bits = sidechain_mask as u32;
+            p.dynamics.push(PartDynamic {
+                slot: i,
+                split: p.sections.len(),
+                active,
+                sidechain: (if sidechain_bits == 0 { mask as u32 } else { sidechain_bits }) >> ch & 1 != 0,
+                params: DynamicFilter {
+                    kind: dynamic_kind,
+                    range_db: gain,
+                    frequency_hz: f0,
+                    quality: q,
+                    ratio: order,
+                    threshold_db: threshold,
+                    attack_ms: attack,
+                    release_ms: release,
+                    smooth: smooth != 0.0,
+                },
+            });
+            diags.info(
+                "prestage-dynamic-filter",
+                ctx.clone(),
+                format!(
+                    "slot {i}: carried as a level-dependent {:?} with its saved detector and time law",
+                    dynamic_kind
+                ),
+            );
+            continue;
+        }
+        if !active {
+            continue;
+        }
         match kind {
             3 | 4 => {
                 let high = kind == 4;
@@ -579,43 +652,6 @@ fn part(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics) -> Result<Part
                     p.sections.extend(constant_tilt(gain, f0, fs));
                     p.gain_db -= gain;
                 }
-            }
-            // A level-dependent peaking cut: it cuts at most its gain, never
-            // more than a fixed peaking cut of that gain does (measured at
-            // full scale). Carried as that fixed cut; a boost is left out.
-            15 => {
-                if automated {
-                    return Err(bad(format!("{ctx}: slot {i}: volume automation on a level-dependent cut")));
-                }
-                need_freq("level-dependent cut", f0)?;
-                if q <= 0.0 || !(-30.0..=30.0).contains(&gain) {
-                    return Err(bad(format!("{ctx}: slot {i} quality {q}, gain {gain} dB")));
-                }
-                if gain < 0.0 {
-                    p.sections.push(rbj(Rbj::Peak, gain, f0, q, fs));
-                    diags.info(
-                        "prestage-dynamic-cut",
-                        ctx.clone(),
-                        format!("slot {i}: the level-dependent cut is carried at its full depth, {gain} dB at {f0} Hz"),
-                    );
-                }
-            }
-            18 => {
-                if automated {
-                    return Err(bad(format!("{ctx}: slot {i}: volume automation on a level-dependent high cut")));
-                }
-                need_freq("level-dependent high cut", f0)?;
-                if !(-30.0..=0.0).contains(&gain) {
-                    return Err(bad(format!("{ctx}: slot {i} high-cut gain {gain} dB")));
-                }
-                let (sections, bias) = dynamic_high_cut(gain, f0, fs);
-                p.sections.extend(sections);
-                p.gain_db += bias;
-                diags.info(
-                    "prestage-dynamic-cut",
-                    ctx.clone(),
-                    format!("slot {i}: the level-dependent high cut is carried at its full-scale envelope"),
-                );
             }
             1 | 11 | 12 => {
                 for pt in &points {
@@ -713,8 +749,19 @@ fn part(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics) -> Result<Part
 struct Walk {
     sections: Vec<Section>,
     boxes: Vec<(String, u32, usize, f64)>,
+    dynamics: Vec<WalkDynamic>,
     tail_gain_db: f64,
     muted: bool,
+}
+
+#[derive(Clone, Debug)]
+struct WalkDynamic {
+    key: (String, u32),
+    split: usize,
+    before_box: usize,
+    active: bool,
+    sidechain: bool,
+    params: DynamicFilter,
 }
 
 /// The pre-stage of every unit channel, from the filter and compressor boxes
@@ -743,7 +790,8 @@ pub fn derive_lanes(
     let mut compiled: Vec<(String, Option<sgv2_core::voicing::mstk::Params>)> = Vec::new();
     let mut walks = Vec::new();
     for (c, lane) in lanes.iter().enumerate() {
-        let mut w = Walk { sections: Vec::new(), boxes: Vec::new(), tail_gain_db: 0.0, muted: false };
+        let mut w =
+            Walk { sections: Vec::new(), boxes: Vec::new(), dynamics: Vec::new(), tail_gain_db: 0.0, muted: false };
         for pass in &lane.through {
             let Some(stage) = chain.iter().find(|s| s.name == pass.node) else {
                 return Err(bad(format!("lane {c} passes {}, which is not in the chain", pass.node)));
@@ -754,6 +802,17 @@ pub fn derive_lanes(
             match stage.unit.map(|u| u.subtype) {
                 Some(TMST) => {
                     let p = part(stage, pass.channel, fs, diags)?;
+                    let base = w.sections.len();
+                    for d in &p.dynamics {
+                        w.dynamics.push(WalkDynamic {
+                            key: (stage.name.clone(), d.slot),
+                            split: base + d.split,
+                            before_box: w.boxes.len(),
+                            active: d.active,
+                            sidechain: d.sidechain,
+                            params: d.params,
+                        });
+                    }
                     w.sections.extend(p.sections);
                     w.tail_gain_db += p.gain_db;
                     w.muted |= p.muted;
@@ -790,6 +849,21 @@ pub fn derive_lanes(
     if order.len() > MAX_BOXES {
         return Err(bad(format!("{} compressor boxes ahead of the unit; at most {MAX_BOXES}", order.len())));
     }
+    let dynamic_order: Vec<&(String, u32)> = walks[0].dynamics.iter().map(|d| &d.key).collect();
+    for (c, w) in walks.iter().enumerate() {
+        let lane_order: Vec<&(String, u32)> = w.dynamics.iter().map(|d| &d.key).collect();
+        if lane_order != dynamic_order {
+            return Err(bad(format!(
+                "lane {c} passes the dynamic filters {lane_order:?} but lane 0 passes {dynamic_order:?}"
+            )));
+        }
+    }
+    if dynamic_order.len() > MAX_DYNAMIC_FILTERS {
+        return Err(bad(format!(
+            "{} level-dependent filters ahead of the unit; at most {MAX_DYNAMIC_FILTERS}",
+            dynamic_order.len()
+        )));
+    }
     // lanes that share a box channel carry the same signal into it (the
     // linked detection then equals the box's own)
     for (k, name) in order.iter().enumerate() {
@@ -813,6 +887,24 @@ pub fn derive_lanes(
     let mut out = Params::identity(channels);
     out.flags = FLAG_FROM_TUNING;
     out.box_count = order.len();
+    out.dynamic_count = dynamic_order.len();
+    for k in 0..dynamic_order.len() {
+        let first = &walks[0].dynamics[k];
+        let mut d = DynamicAt { before_box: first.before_box, params: first.params, ..Default::default() };
+        for (c, w) in walks.iter().enumerate() {
+            let lane = &w.dynamics[k];
+            if lane.before_box != first.before_box || lane.params != first.params {
+                return Err(bad(format!("dynamic filter {:?} differs between lanes", first.key)));
+            }
+            d.split[c] = lane.split;
+            d.active_mask |= (lane.active as u32) << c;
+            d.sidechain_mask |= (lane.sidechain as u32) << c;
+        }
+        if d.active_mask == 0 || d.sidechain_mask == 0 {
+            return Err(bad(format!("dynamic filter {:?} has no output or sidechain lanes", first.key)));
+        }
+        out.dynamic[k] = d;
+    }
     for (k, name) in order.iter().enumerate() {
         let params = compiled.iter().find(|(n, _)| n == name).and_then(|(_, p)| *p).expect("compiled above");
         let mut b = BoxAt { params, ..Default::default() };
@@ -1002,21 +1094,22 @@ mod tests {
         let cut = tmst(&[(20, 3000.0)], &[(0, [3.0, 0.0, -2.0, 700.0, 800.0, 1800.0, 3.0, 0.0])]);
         let pc = part(&cut, 0, fs, &mut d).unwrap();
         assert_eq!((pc.sections.len(), pc.gain_db), (3, 2.0));
-        // a 0 dB peak at 0 Hz is the identity; a level-dependent cut is a fixed cut
+        // a 0 dB peak at 0 Hz is the identity; a level-dependent cut is a
+        // runtime dynamic slot rather than a fixed full-depth section
         let flat = tmst(&[], &[(0, [3.0, 1.0, 0.0, 0.0, 0.1, 2.0, 3.0, 0.0])]);
         assert_eq!(part(&flat, 0, fs, &mut d).unwrap().sections.len(), 0);
         let dynamic = tmst(&[], &[(0, [3.0, 15.0, -9.0, 200.0, 3.0, 3.0, 3.0, 0.0])]);
         let pd = part(&dynamic, 0, fs, &mut d).unwrap();
-        assert_eq!(pd.sections.len(), 1);
-        assert!((20.0 * pd.sections[0].magnitude(200.0, fs).log10() + 9.0).abs() < 0.01);
+        assert_eq!((pd.sections.len(), pd.dynamics.len()), (0, 1));
+        assert_eq!(pd.dynamics[0].params.kind, DynamicKind::Notch);
         let tilt = tmst(&[], &[(0, [3.0, 7.0, 12.0, 300.0, 9.0, 8.0, 3.0, 0.0])]);
         let pt = part(&tilt, 0, fs, &mut d).unwrap();
         assert_eq!((pt.sections.len(), pt.gain_db), (4, -12.0));
         assert!(pt.sections.iter().all(Section::stable));
         let high_cut = tmst(&[], &[(0, [3.0, 18.0, -4.0, 8000.0, 2.0, 3.0, 3.0, 0.0])]);
         let ph = part(&high_cut, 0, fs, &mut d).unwrap();
-        assert_eq!(ph.sections.len(), 2);
-        assert!(ph.gain_db < 0.0 && ph.sections.iter().all(Section::stable));
+        assert_eq!((ph.sections.len(), ph.dynamics.len()), (0, 1));
+        assert_eq!(ph.dynamics[0].params.kind, DynamicKind::HighShelf);
         let odd = tmst(&[], &[(0, [3.0, 13.0, 0.0, 700.0, 0.7, 2.0, 3.0, 0.0])]);
         assert!(part(&odd, 0, fs, &mut d).is_err());
         // a running slot in a bypassed group is carried only as a cut
