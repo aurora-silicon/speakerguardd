@@ -848,7 +848,7 @@ mod tests {
         let mut gain = BandGain::unity(160);
         gain.g = 0.8;
         gain.decide(0.5);
-        let target = 0.99 * 0.5;
+        let target: f32 = 0.99 * 0.5;
 
         assert_eq!(gain.sample(0.0).to_bits(), 0.8f32.to_bits());
         for _ in 1..159 {
