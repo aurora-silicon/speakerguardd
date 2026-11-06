@@ -6,7 +6,7 @@
 
 #define MAXCH 8
 #define MAXQ 4096
-#define MAXSET 64
+#define MAXSET 512
 
 static UInt32 fcc(const char *s) {
     return ((UInt32)s[0] << 24) | ((UInt32)s[1] << 16) |
@@ -85,10 +85,12 @@ static AudioUnit instantiate(NSString *stage, NSDictionary *effect,
 
     AudioUnit au = NULL;
     fail_status(AudioComponentInstanceNew(component, &au), "AudioComponentInstanceNew");
-    CFPropertyListRef preset = (__bridge CFPropertyListRef)effect[@"aupreset"];
-    fail_status(AudioUnitSetProperty(au, kAudioUnitProperty_ClassInfo,
-                                    kAudioUnitScope_Global, 0,
-                                    &preset, sizeof(preset)), "set class info");
+    if (effect) {
+        CFPropertyListRef preset = (__bridge CFPropertyListRef)effect[@"aupreset"];
+        fail_status(AudioUnitSetProperty(au, kAudioUnitProperty_ClassInfo,
+                                        kAudioUnitScope_Global, 0,
+                                        &preset, sizeof(preset)), "set class info");
+    }
     UInt32 max_frames = quantum;
     fail_status(AudioUnitSetProperty(au, kAudioUnitProperty_MaximumFramesPerSlice,
                                     kAudioUnitScope_Global, 0,
@@ -154,7 +156,7 @@ int main(int argc, const char **argv) {
         const char *sets[MAXSET] = {0};
         int set_count = 0, channels = 0, quantum = 512;
         double sample_rate = 48000.0;
-        bool inventory_only = false;
+        bool inventory_only = false, no_preset = false;
         for (int i = 1; i < argc; ++i) {
             const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : NULL;
 #define ARG(x) (!strcmp(a, x) && v && ++i)
@@ -170,6 +172,7 @@ int main(int argc, const char **argv) {
             else if (ARG("--sr")) sample_rate = atof(v);
             else if (ARG("--set") && set_count < MAXSET) sets[set_count++] = v;
             else if (!strcmp(a, "--inventory")) inventory_only = true;
+            else if (!strcmp(a, "--no-preset")) no_preset = true;
             else { fprintf(stderr, "bad arg: %s\n", a); return 2; }
         }
         if (!strip_path || !stage_c || !meta_path || channels < 1 ||
@@ -185,6 +188,7 @@ int main(int argc, const char **argv) {
         NSString *stage = @(stage_c);
         NSDictionary *effect = strip ? effect_named(strip, stage) : nil;
         if (!effect) { fprintf(stderr, "stage not present in strip\n"); return 1; }
+        if (no_preset) effect = nil; // the unit's own defaults (black-box probing)
         AudioUnit au = instantiate(stage, effect, subtype_c, factory_c, sample_rate, channels, quantum);
         for (int i = 0; i < set_count; ++i) {
             char *end = NULL;
@@ -248,7 +252,7 @@ int main(int argc, const char **argv) {
 
         NSDictionary *meta = @{
             @"stage": stage,
-            @"preset": effect[@"aupreset"][@"name"] ?: @"",
+            @"preset": (effect ? effect[@"aupreset"][@"name"] : nil) ?: @"",
             @"sample_rate": @(sample_rate), @"channels": @(channels),
             @"quantum": @(quantum), @"frames": @(frame_count),
             @"latency_s": @(latency), @"tail_s": @(tail),
