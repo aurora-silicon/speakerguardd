@@ -826,13 +826,13 @@ struct DynamicRun {
     detector: Section,
     component: Section,
     detector_state: [f64; 2],
-    component_state: [[f64; 2]; MAX_CHANNELS],
+    component_state: [[f32; 2]; MAX_CHANNELS],
     quadrature: [Section; 2],
     quadrature_state: [[f64; 2]; 2],
     control_phase: usize,
     reconstructed_gain: f64,
     reconstruction: Section,
-    reconstruction_state: [f64; 2],
+    reconstruction_state: [f32; 4],
     envelope: f64,
 }
 
@@ -840,11 +840,14 @@ impl DynamicRun {
     fn new(params: &DynamicFilter, fs: f64) -> DynamicRun {
         let detector = match params.kind {
             DynamicKind::Notch => {
-                // ToneMeister filter type 14: a constant-peak band pass.
-                let w = 2.0 * core::f64::consts::PI * params.frequency_hz / fs;
-                let alpha = libm::sin(w) / (2.0 * params.quality);
-                let n = 1.0 / (1.0 + alpha);
-                Section { b0: alpha * n, b1: 0.0, b2: -alpha * n, a1: -2.0 * libm::cos(w) * n, a2: (1.0 - alpha) * n }
+                // ToneMeister filter type 14: the prewarped bilinear
+                // constant-peak band pass used by both the detector and
+                // the fixed parallel carrier.
+                let k = libm::tan(core::f64::consts::PI * params.frequency_hz / fs);
+                let kq = k / params.quality;
+                let k2 = k * k;
+                let n = 1.0 / (1.0 + kq + k2);
+                Section { b0: kq * n, b1: 0.0, b2: -kq * n, a1: 2.0 * (k2 - 1.0) * n, a2: (1.0 - kq + k2) * n }
             }
             DynamicKind::HighShelf => {
                 // ToneMeister filter type 9: a second-order Butterworth
@@ -877,7 +880,7 @@ impl DynamicRun {
             control_phase: 0,
             reconstructed_gain: 1.0,
             reconstruction,
-            reconstruction_state: [1.0 - reconstruction.b0, reconstruction.b2 - reconstruction.a2],
+            reconstruction_state: [1.0; 4],
             envelope: 0.0,
         }
     }
@@ -900,7 +903,7 @@ impl DynamicRun {
         self.quadrature_state = [[0.0; 2]; 2];
         self.control_phase = 0;
         self.reconstructed_gain = 1.0;
-        self.reconstruction_state = [1.0 - self.reconstruction.b0, self.reconstruction.b2 - self.reconstruction.a2];
+        self.reconstruction_state = [1.0; 4];
         self.envelope = 0.0;
     }
 
@@ -922,10 +925,32 @@ impl DynamicRun {
     }
 
     #[inline]
-    fn step(section: &Section, state: &mut [f64; 2], input: f64) -> f64 {
+    fn step_f32(section: &Section, state: &mut [f32; 2], input: f32) -> f32 {
+        let (b0, b1, b2, a1, a2) =
+            (section.b0 as f32, section.b1 as f32, section.b2 as f32, section.a1 as f32, section.a2 as f32);
+        let output = b0 * input + state[0];
+        state[0] = b1 * input - a1 * output + state[1];
+        state[1] = b2 * input - a2 * output;
+        output
+    }
+
+    #[inline]
+    fn step_f64(section: &Section, state: &mut [f64; 2], input: f64) -> f64 {
         let output = section.b0 * input + state[0];
         state[0] = section.b1 * input - section.a1 * output + state[1];
         state[1] = section.b2 * input - section.a2 * output;
+        output
+    }
+
+    #[inline]
+    fn step_df1_f32(section: &Section, state: &mut [f32; 4], input: f32) -> f32 {
+        let (b0, b1, b2, a1, a2) =
+            (section.b0 as f32, section.b1 as f32, section.b2 as f32, section.a1 as f32, section.a2 as f32);
+        let output = b0 * input + b1 * state[0] + b2 * state[1] - a1 * state[2] - a2 * state[3];
+        state[1] = state[0];
+        state[0] = input;
+        state[3] = state[2];
+        state[2] = output;
         output
     }
 
@@ -974,7 +999,7 @@ impl DynamicRun {
                     }
                 }
                 input /= sidechains as f64;
-                let detected = Self::step(&self.detector, &mut self.detector_state, input);
+                let detected = Self::step_f64(&self.detector, &mut self.detector_state, input);
                 sum_sq += detected * detected;
             }
             let measured = core::f64::consts::SQRT_2 * libm::sqrt(sum_sq / frames as f64);
@@ -994,26 +1019,33 @@ impl DynamicRun {
                     }
                 }
                 input /= sidechains as f64;
-                let detected = Self::step(&self.detector, &mut self.detector_state, input);
-                let a = Self::step(&self.quadrature[0], &mut self.quadrature_state[0], detected);
-                let b = Self::step(&self.quadrature[1], &mut self.quadrature_state[1], detected);
+                let detected = Self::step_f64(&self.detector, &mut self.detector_state, input);
+                let a = Self::step_f64(&self.quadrature[0], &mut self.quadrature_state[0], detected);
+                let b = Self::step_f64(&self.quadrature[1], &mut self.quadrature_state[1], detected);
                 if self.control_phase == 0 {
                     self.envelope = libm::sqrt(a * a + b * b);
                     self.reconstructed_gain = Self::curve(&at.params, self.envelope);
                 }
                 self.control_phase = (self.control_phase + 1) & 15;
             }
-            let gain = Self::step(&self.reconstruction, &mut self.reconstruction_state, self.reconstructed_gain)
-                .clamp(0.0, 1.0);
+            // The response-table target is bounded, but the installed
+            // second-order reconstruction filter is not post-clamped. Its
+            // small step-response overshoot is part of the release
+            // trajectory (and can briefly put the carrier gain above one).
+            let gain = Self::step_df1_f32(
+                &self.reconstruction,
+                &mut self.reconstruction_state,
+                self.reconstructed_gain as f32,
+            );
             for (c, buf) in bufs.iter_mut().enumerate().take(n) {
                 if at.active_mask >> c & 1 == 0 {
                     continue;
                 }
                 let sample = &mut buf[i];
-                let input = if sample.is_finite() { f64::from(sample.clamp(-INPUT_BOUND, INPUT_BOUND)) } else { 0.0 };
-                let component = Self::step(&self.component, &mut self.component_state[c], input);
+                let input = if sample.is_finite() { sample.clamp(-INPUT_BOUND, INPUT_BOUND) } else { 0.0 };
+                let component = Self::step_f32(&self.component, &mut self.component_state[c], input);
                 let output = input + (gain - 1.0) * component;
-                *sample = if output.is_finite() { output as f32 } else { 0.0 };
+                *sample = if output.is_finite() { output } else { 0.0 };
             }
         }
     }
