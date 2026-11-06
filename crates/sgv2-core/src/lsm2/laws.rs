@@ -255,9 +255,10 @@ pub fn velocity_band_gains(
 }
 
 /// Signed velocity allocation against the retained full-band bound. The
-/// retained prefix uses `old_limit`; samples from `split` use `new_limit`.
-/// `room_floor` is threshold headroom, but an effective cut still targets
-/// the retained bound (never less than that floor).
+/// retained prefix uses `old_limit`. A rising bound switches to `new_limit`
+/// at `split`; a falling bound linearly hands off from old to new over the
+/// remaining samples. `room_floor` is threshold headroom, but an effective
+/// cut still targets the retained bound (never less than that floor).
 #[allow(clippy::too_many_arguments)]
 pub fn velocity_band_gains_window(
     vb: &[alloc::vec::Vec<f32>; 5],
@@ -289,7 +290,15 @@ pub fn velocity_band_gains_window(
                 idx = i;
             }
         }
-        let limit = if idx < split { old_limit } else { new_limit };
+        let limit = if idx < split {
+            old_limit
+        } else if new_limit >= old_limit {
+            new_limit
+        } else {
+            let count = n - split;
+            let step = (new_limit - old_limit) / count as f32;
+            old_limit + step * (idx - split + 1) as f32
+        };
         if worst.abs() <= limit + room_floor || worst.is_nan() {
             break;
         }
@@ -781,6 +790,15 @@ mod tests {
         let vb = [vec![2.0, 2.0], vec![0.0, 0.0], vec![0.0, 0.0], vec![0.0, 0.0], vec![0.0, 0.0]];
         let got = velocity_band_gains_window(&vb, &[], 0, 1.0, 2.0, 1, 0.1, 1.0, (0, 5), [1.0; 5]);
         assert_eq!(got, [0.5, 1.0, 1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn a_falling_retained_bound_interpolates_after_the_handoff() {
+        let vb = [vec![0.0, 0.0, 1.6, 1.6], vec![0.0; 4], vec![0.0; 4], vec![0.0; 4], vec![0.0; 4]];
+        let got = velocity_band_gains_window(&vb, &[], 0, 2.0, 1.0, 2, 0.0, 1.0, (0, 5), [1.0; 5]);
+        // The limits after the split are 1.5 then 1.0, so the final sample
+        // is the binding one.
+        assert_eq!(got, [0.625, 1.0, 1.0, 1.0, 1.0]);
     }
 
     #[test]
