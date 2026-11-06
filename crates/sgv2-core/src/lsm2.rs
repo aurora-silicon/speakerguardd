@@ -1477,6 +1477,10 @@ struct Run {
     tb_hist: usize,
     tb_sel: usize,
     axis: [bool; 5],
+    /// ControlVelocity alone: the published velocity candidate is computed
+    /// whenever the axis is configured, also with EnableMitigation = 0
+    /// (rig: the therm/meter law cases log it with unity audio).
+    vel_logged: bool,
     link: bool,
     unlink_temp: bool,
     p_pole: [f64; 4],
@@ -1685,6 +1689,7 @@ impl Run {
                 p.control_temperature,
             ]
             .map(|f| f != 0 && p.enable_mitigation != 0),
+            vel_logged: p.control_velocity != 0,
             link: p.link_slow_gains != 0,
             unlink_temp: p.unlink_temperature_gains != 0,
             p_pole,
@@ -1883,7 +1888,12 @@ impl Run {
             let g_peak = if self.axis[0] { ratio(c.amp_limit, window_max(&c.pk_x)) } else { 1.0 };
             let g_disp = if self.axis[1] { ratio(c.disp_limit, window_max(&c.pk_d)) } else { 1.0 };
             let vel_on = self.axis[2] && !c.vel_off;
-            let g_vel = if self.axis[2] { ratio(c.vel_limit_now, window_max(&c.pk_v)).max(c.vel_floor) } else { 1.0 };
+            // the published velocity candidate: the full-band ratio before
+            // the MaxVelocityAttenuation floor (the floor caps the applied
+            // band gains only), unity when Bandwidth 2 turns the axis off,
+            // and computed with mitigation off (rig law cases fb5, fb8-bw2,
+            // fb-vel-ignlow-bw2, therm, meter)
+            let g_vel = if self.vel_logged && !c.vel_off { ratio(c.vel_limit_now, window_max(&c.pk_v)) } else { 1.0 };
             // residuals 5 (t-4731): one sequential fast-request chain of
             // signed worst-sample allocations on five band buffers each:
             // displacement, then velocity, then sample peak, each starting
