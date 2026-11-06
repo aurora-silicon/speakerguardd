@@ -2061,7 +2061,7 @@ impl Run {
             // protected envelope and the decision-local protected trial owns
             // the segment. This compares existing producer states, not signal
             // levels, spectra, case identities, or fitted thresholds.
-            if vel_on && complete_host_frame && stream_ready && !c.vel_bound_release {
+            if vel_on && complete_host_frame && stream_ready && !ramp_entry && !c.vel_bound_release {
                 let all = (0, BANDS);
                 let mut producer_r = [1.0; BANDS];
                 if disp_on {
