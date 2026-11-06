@@ -1376,7 +1376,13 @@ impl Chan {
             }
         }
         let limit = (self.t_hard + self.t_headroom.max(0.0)) as f32;
-        Self::ceiling_solve(&base[..subs], &lin[..subs], &quad[..subs], limit, g0)
+        let r = Self::ceiling_solve(&base[..subs], &lin[..subs], &quad[..subs], limit, g0);
+        #[cfg(feature = "std")]
+        if std::env::var_os("LSC_DBG").is_some() && r < g0 {
+            let k = (0..subs).max_by(|&a, &b| (base[a] + g0 * lin[a] + g0 * g0 * quad[a]).total_cmp(&(base[b] + g0 * lin[b] + g0 * g0 * quad[b]))).unwrap();
+            eprintln!("CEIL g0={g0} r={r} lim={limit} subs={subs} k={k} B={} L={} Q={} thvc={} thmg={} amb={} B0={} Bend={} T0={}", base[k], lin[k], quad[k], self.th_vc, self.th_mg, self.ambient, base[0], base[subs-1], base[0]+g0*lin[0]+g0*g0*quad[0]);
+        }
+        r
     }
 
     /// The multiplicative quadratic-root solve of residuals 2.4 on the
@@ -2132,6 +2138,8 @@ impl Run {
         }
         if self.axis[4] {
             for (ci, c) in self.ch.iter().enumerate() {
+                #[cfg(feature = "std")]
+                if std::env::var_os("LSC_DBG").is_some() { eprint!("F{} ch{} ", self.frame, ci); }
                 want[ci] = c.ceiling_scale(want[ci], ctl, sub);
             }
         }
