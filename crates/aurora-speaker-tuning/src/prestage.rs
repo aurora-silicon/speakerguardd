@@ -567,7 +567,80 @@ struct Walk {
 /// The pre-stage of every unit channel, from the filter and compressor boxes
 /// on its lane.
 pub fn derive(t: &Tuning, fs: f64, channels: usize, diags: &mut Diagnostics) -> Result<Params> {
+    if t.protection.kind != crate::tuning::UnitKind::Atsp {
+        interim_compressor_rules(&t.chain, &t.protection.lanes)?;
+    }
     derive_lanes(&t.chain, &t.protection.lanes, fs, channels, diags)
+}
+
+/// Until the compressor box's gain law is the unit's own, the speakers whose
+/// cones the pre-stage protects (spp3, lsm2) run only the compressor states
+/// its interim law was verified on against macOS: one compressor box on the
+/// lanes, fourth-order crossovers, release on, no per-band input gain, no
+/// saturation, no solo, no upward or expanding branch. Any other state
+/// refuses the compile (the interim law can drive harder than macOS there).
+pub fn interim_compressor_rules(chain: &[Stage], lanes: &[crate::dspg::analysis::Lane]) -> Result<()> {
+    let mut found = 0;
+    for st in chain.iter().filter(|s| s.before_protection && !s.bypass && s.unit.map(|u| u.subtype) == Some(MSTK)) {
+        if !lanes.iter().any(|l| l.through.iter().any(|p| p.node == st.name)) {
+            continue;
+        }
+        let ctx = format!("compressor box {}", st.name);
+        let g = st
+            .state
+            .as_ref()
+            .and_then(|s| s.global())
+            .ok_or_else(|| bad(format!("{ctx}: the strip gives it no saved state")))?;
+        let req = |id: u32| -> Result<f64> {
+            g.get(id)
+                .map(f64::from)
+                .filter(|v| v.is_finite())
+                .ok_or_else(|| bad(format!("{ctx}: saved parameter {id} is missing")))
+        };
+        let opt = |id: u32| g.get(id).map(f64::from).unwrap_or(0.0);
+        if req(0)? != 0.0 {
+            continue;
+        }
+        found += 1;
+        if found > 1 {
+            return Err(bad("two compressor boxes ahead of the unit (not carried until the compressor law is exact)"));
+        }
+        for (id, what) in [(5, "crossover 0"), (7, "crossover 1"), (9, "crossover 2")] {
+            if req(id)? != 4.0 {
+                return Err(bad(format!(
+                    "{ctx}: {what} order {} (only fourth order is carried until the compressor law is exact)",
+                    req(id)?
+                )));
+            }
+        }
+        if req(63)? != 1.0 {
+            return Err(bad(format!("{ctx}: release is switched off")));
+        }
+        for id in [65, 66, 67, 68] {
+            if opt(id) != 0.0 {
+                return Err(bad(format!(
+                    "{ctx}: per-band input gain (parameter {id}) is not carried until the compressor law is exact"
+                )));
+            }
+        }
+        for id in [71, 73, 75, 77] {
+            if opt(id) != 0.0 {
+                return Err(bad(format!(
+                    "{ctx}: saturation (parameter {id}) is not carried until the compressor law is exact"
+                )));
+            }
+        }
+        for b in 0..4u32 {
+            let o = 10 + 13 * b;
+            if req(o + 2)? != 0.0 {
+                return Err(bad(format!("{ctx}: band {b} is soloed")));
+            }
+            if req(o + 8)? != 1.0 || req(o + 11)? != 1.0 {
+                return Err(bad(format!("{ctx}: band {b} has an upward or expanding branch")));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// [`derive`] from the graph's stages and the unit's lanes.
@@ -882,6 +955,26 @@ mod tests {
         let off = mstk(&[(0, 1.0)]);
         let t4 = tuning(vec![off], vec![lane(0, &[("Comp", 0)])]);
         assert_eq!(derive(&t4, fs, 1, &mut d).unwrap().box_count, 0);
+    }
+
+    #[test]
+    fn interim_compressor_rules_keep_the_verified_states() {
+        let comp = mstk(&[]);
+        let l = |c| lane(c, &[("Comp", c)]);
+        assert!(interim_compressor_rules(std::slice::from_ref(&comp), &[l(0), l(1)]).is_ok());
+        for refused in [(5, 3.0), (7, 6.0), (63, 0.0), (66, -6.0), (71, 1.0), (12, 1.0), (18, 2.0), (21, 2.0)] {
+            let mut st = mstk(&[refused]);
+            st.name = "Comp".into();
+            assert!(interim_compressor_rules(&[st], &[l(0)]).is_err(), "{refused:?}");
+        }
+        let mut up = mstk(&[]);
+        up.name = "UpComp".into();
+        let two = [lane(0, &[("UpComp", 0), ("Comp", 0)])];
+        assert!(interim_compressor_rules(&[up, comp.clone()], &two).is_err());
+        // bypassed: no compressor
+        let mut off = mstk(&[(0, 1.0), (5, 3.0)]);
+        off.name = "Comp".into();
+        assert!(interim_compressor_rules(&[off], &[l(0)]).is_ok());
     }
 
     #[test]
