@@ -2015,11 +2015,10 @@ impl Run {
             let vlim_g = c.vel_limit_now as f32;
             let stream_ready = c.protected_peak.ready();
             let prior_bound = c.vel_bound_window.last().copied().unwrap_or(0.0);
-            let stream_bound = c.protected_peak_now.max(0.25 * vlim_g).min(vlim_g);
             let next_bound = if c.vel_bound_release && c.vel_bound_ready {
                 (prior_bound as f64 + velocity_release * (c.vel_limit_now - prior_bound as f64)) as f32
             } else {
-                stream_bound
+                c.protected_peak_now.max(0.25 * vlim_g).min(vlim_g)
             };
             if c.vel_bound_ready && stream_ready {
                 c.vel_bound_window.copy_within(ctl.., 0);
@@ -2038,6 +2037,7 @@ impl Run {
             // protected envelope and the decision-local protected trial owns
             // the segment. This compares existing producer states, not signal
             // levels, spectra, case identities, or fitted thresholds.
+            let mut producer_stream_advanced = false;
             if vel_on && stream_ready && !c.vel_bound_release {
                 let all = (0, BANDS);
                 let mut producer_r = [1.0; BANDS];
@@ -2068,6 +2068,14 @@ impl Run {
                         peak = peak.max(y.abs());
                     }
                     let onset_bound = peak.min(vlim_g);
+                    // The streaming producer is the moving protected trial
+                    // envelope advanced by the admitted host fragment. Quiet
+                    // history is seeded at the structural floor; a nonzero
+                    // trial, including one below that floor, is admitted.
+                    let stream_source = if onset_bound == 0.0 { 0.25 * vlim_g } else { onset_bound };
+                    let stream_bound = c.protected_peak.update(stream_source, len).min(vlim_g);
+                    c.protected_peak_now = stream_bound;
+                    producer_stream_advanced = true;
                     let admitted = arbitrate_producer_segment(onset_bound, stream_bound);
                     let segment = &mut c.vel_bound_window[od + offset..od + offset + len];
                     if admitted >= boundary {
@@ -2403,7 +2411,10 @@ impl Run {
                     s += 1;
                 }
             }
-            c.protected_peak_now = c.protected_peak.update(protected_model_peak, ctl);
+            if !producer_stream_advanced {
+                let stream_source = protected_model_peak.max(0.25 * c.vel_limit_now as f32);
+                c.protected_peak_now = c.protected_peak.update(stream_source, ctl);
+            }
             c.pbar1_frame = p1;
             c.pbar1s_frame = p1s;
             // shift the bank-stage buffers: keep the look-ahead region
