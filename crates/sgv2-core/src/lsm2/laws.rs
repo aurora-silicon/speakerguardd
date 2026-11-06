@@ -169,52 +169,6 @@ pub fn velocity_limit(e: f32, k: &[f32; 4], v: &[f32; 3], vmax: f32) -> f32 {
     a + (e - lo) * slope
 }
 
-/// The largest common factor `r` in `0..=1` for the active bands' gains that
-/// keeps every sample `i` in `first..` within `limit(i)`, the inactive bands
-/// and `resid` held; 0 when those alone exceed a sample's limit. Applied when
-/// the allocation stalls (a pass that changes no gain) with a sample still
-/// above its limit,
-/// so the decision never ends above the limit the active bands can meet.
-fn fit_active(
-    vb: &[alloc::vec::Vec<f32>; 5],
-    resid: &[f32],
-    first: usize,
-    s: f32,
-    active: (usize, usize),
-    g: &mut [f32; 5],
-    limit: impl Fn(usize) -> f32,
-) {
-    let is_active = |k: usize| k >= active.0 && k < active.1;
-    let mut r = 1.0f32;
-    for i in first..vb[0].len() {
-        let mut f = if resid.is_empty() { 0.0f32 } else { resid[i] };
-        let mut a = 0.0f32;
-        for k in 0..5 {
-            let v = (g[k] * s) * vb[k][i];
-            if is_active(k) {
-                a += v;
-            } else {
-                f += v;
-            }
-        }
-        let l = limit(i);
-        if f.is_nan() || l.is_nan() || f.abs() > l {
-            r = 0.0;
-            break;
-        }
-        if (f + a).abs() > l {
-            // |f + r a| <= l holds on [0, u]; u is where it reaches the limit
-            let u = if a > 0.0 { (l - f) / a } else { (l + f) / -a };
-            r = r.min(u.max(0.0));
-        }
-    }
-    if r < 1.0 {
-        for k in (0..5).filter(|&k| is_active(k)) {
-            g[k] *= r;
-        }
-    }
-}
-
 /// The velocity allocation (residuals 5): on the signed sum of the five
 /// band velocities `vb[k][n]` over `first..`, under the applied slow gain
 /// `s`, find the worst sample, orient every band's contribution to its sign
@@ -238,7 +192,6 @@ pub fn velocity_band_gains(
         return g;
     }
     let is_active = |k: usize| k >= active.0 && k < active.1;
-    let mut within = false;
     loop {
         let (mut idx, mut worst) = (first, 0.0f32);
         for i in first..n {
@@ -252,7 +205,6 @@ pub fn velocity_band_gains(
             }
         }
         if worst.abs() <= vlim || worst.is_nan() {
-            within = true;
             break;
         }
         let sign = if worst >= 0.0 { 1.0f32 } else { -1.0 };
@@ -299,9 +251,6 @@ pub fn velocity_band_gains(
             break;
         }
     }
-    if !within {
-        fit_active(vb, resid, first, s, active, &mut g, |_| vlim);
-    }
     g
 }
 
@@ -328,7 +277,6 @@ pub fn velocity_band_gains_window(
         return g;
     }
     let is_active = |k: usize| k >= active.0 && k < active.1;
-    let mut within = false;
     loop {
         let (mut idx, mut worst) = (first, 0.0f32);
         for i in first..n {
@@ -343,7 +291,6 @@ pub fn velocity_band_gains_window(
         }
         let limit = if idx < split { old_limit } else { new_limit };
         if worst.abs() <= limit + room_floor || worst.is_nan() {
-            within = true;
             break;
         }
         let sign = if worst >= 0.0 { 1.0 } else { -1.0 };
@@ -386,10 +333,6 @@ pub fn velocity_band_gains_window(
         if !changed {
             break;
         }
-    }
-    if !within {
-        let bound = |i: usize| if i < split { old_limit } else { new_limit } + room_floor;
-        fit_active(vb, resid, first, s, active, &mut g, bound);
     }
     g
 }
@@ -831,34 +774,6 @@ mod tests {
         assert!((velocity_limit(25.0, &k, &v, 2.0) - 0.8).abs() < 1e-6);
         assert!((velocity_limit(40.0, &k, &v, 2.0) - 2.0).abs() < 1e-6);
         assert!((velocity_limit(50.0, &k, &v, 2.0) - 3.0).abs() < 1e-6);
-    }
-
-    /// Peak of the signed band sum under `g` over `first..`.
-    fn band_sum_peak(vb: &[alloc::vec::Vec<f32>; 5], resid: &[f32], g: &[f32; 5], s: f32) -> f32 {
-        (0..vb[0].len())
-            .map(|i| {
-                let r = if resid.is_empty() { 0.0 } else { resid[i] };
-                (r + (0..5).map(|k| g[k] * s * vb[k][i]).sum::<f32>()).abs()
-            })
-            .fold(0.0, f32::max)
-    }
-
-    #[test]
-    fn a_stalled_allocation_ends_within_the_limit() {
-        // the end step: the active bands scale down together until every sample fits
-        let vb = [vec![2.0, -1.0, 0.5], vec![1.0, 1.0, 0.0], vec![0.0; 3], vec![0.0; 3], vec![0.2, 0.0, 0.0]];
-        let mut g = [1.0; 5];
-        fit_active(&vb, &[], 0, 1.0, (0, 2), &mut g, |_| 1.5);
-        assert!(band_sum_peak(&vb, &[], &g, 1.0) <= 1.5 + 1e-6, "{g:?}");
-        assert!(g[0] == g[1] && g[0] < 1.0 && g[4] == 1.0);
-        // inactive bands alone over the limit: the active ones go to zero
-        let mut g = [1.0; 5];
-        fit_active(&vb, &[], 0, 1.0, (0, 2), &mut g, |_| 0.1);
-        assert_eq!(g, [0.0, 0.0, 1.0, 1.0, 1.0]);
-        // already within: unchanged
-        let mut g = [1.0; 5];
-        fit_active(&vb, &[], 0, 1.0, (0, 5), &mut g, |_| 10.0);
-        assert_eq!(g, [1.0; 5]);
     }
 
     #[test]
