@@ -90,6 +90,9 @@ import time
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, HERE)
+# The modules beside this program are the package's: never write a __pycache__
+# into the package's directory, where nothing owns it and it outlives the package.
+sys.dont_write_bytecode = True
 
 VERSION = 1
 DT = "/proc/device-tree"
