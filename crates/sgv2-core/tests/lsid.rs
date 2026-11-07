@@ -300,9 +300,12 @@ fn synthetic_resistive_windows_update_fast_slow_rdc_and_power() {
     }
     let mut voltage = current;
     voltage.iter_mut().for_each(|x| *x *= 6.0);
+    // The graph delays lane 1 by one frame before fitting. Its raw current
+    // must therefore lead voltage by one frame for this resistive plant.
+    let leading_current: [f32; 65] = core::array::from_fn(|n| current[(n + 1) % 64]);
     let sense = [
         &voltage[..],
-        &current[..],
+        &leading_current[..],
         &voltage[..],
         &current[..],
         &voltage[..],
@@ -318,10 +321,10 @@ fn synthetic_resistive_windows_update_fast_slow_rdc_and_power() {
     assert_eq!(e.state(), State::Tracking);
     assert_eq!(e.model().generation(), 2);
     assert_eq!(e.model().accepted_bank_mask(), 0b111);
-    for bank in e.model().banks() {
-        assert!((bank.fast_rdc - 6.0).abs() < 0.05, "{}", bank.fast_rdc);
-        assert!((bank.slow_rdc - 6.0).abs() < 0.05, "{}", bank.slow_rdc);
-        assert!(bank.confidence > 0.9);
+    for (index, bank) in e.model().banks().iter().enumerate() {
+        assert!((bank.fast_rdc - 6.0).abs() < 0.05, "bank {index}: {}", bank.fast_rdc);
+        assert!((bank.slow_rdc - 6.0).abs() < 0.05, "bank {index}: {}", bank.slow_rdc);
+        assert!(bank.confidence > 0.9, "bank {index}: {}", bank.confidence);
     }
     assert!(e.measured_power().is_some_and(|p| p > 0.0));
     assert!(e.model().measured_power_w().is_some_and(|p| p > 0.0));
