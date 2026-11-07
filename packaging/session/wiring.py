@@ -100,6 +100,9 @@ TRANSPORTS = {
     "apple,t6041-aop-audio": {"transport": "aop-spkr", "formats": ["S24_LE"], "sense_batch": False, "speaker_headroom": 256},
     # sound/soc/apple/aop_t8140.rs: S32_LE playback, no sense
     "apple,t8140-aop-audio": {"transport": "aop-t8140", "formats": ["S32_LE"], "sense_batch": True, "speaker_headroom": 0},
+    # t8152_aop_audio.rs, T8142 configuration: ADMAC burst-residue DMA,
+    # S24_LE playback and S16_LE sense, not the T6041 firmware ring above.
+    "apple,t8142-aop-audio": {"transport": "aop-dma", "formats": ["S24_LE"], "sense_batch": False, "speaker_headroom": 0},
 }
 # The self-check's probe order on the speaker PCM.
 FORMAT_ORDER = ["S24_LE", "S32_LE", "S16_LE"]

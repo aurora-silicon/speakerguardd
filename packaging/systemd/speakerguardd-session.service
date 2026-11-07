@@ -6,6 +6,10 @@ Documentation=https://github.com/aurora-silicon/speakerguardd/tree/v2
 # goes stale, the supervisor releases, and the kernel's safe level applies.
 After=pipewire.service wireplumber.service speakerguardd-graph.service
 BindsTo=pipewire.service
+# As PipeWire itself: never for root (an ssh login as root starts root's
+# user manager, where pipewire.service is skipped and this unit's BindsTo
+# reported 'Dependency failed').
+ConditionUser=!root
 
 [Service]
 # Only for the seat user, and only once provisioning and the self-check

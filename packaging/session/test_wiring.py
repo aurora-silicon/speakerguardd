@@ -406,6 +406,110 @@ class SenseCheck(unittest.TestCase):
         self.assertEqual(sgsc.classify({"ch": [{"distinct": 9}]}), ["unclear"])
 
 
+
+class RestoreCommand(unittest.TestCase):
+    """Real command/report/binding path; only physical hardware is replaced.
+
+    Force faults that a physical smoke cannot safely inject after all wiring
+    phases passed. Cleanup must fail admission and still visit every switch.
+    """
+
+    def run_restore(self, fault):
+        import tempfile
+        import types
+        from contextlib import ExitStack
+
+        f = fx("j413")
+        w = wiring.derive(f["hw"], f["tuning"])
+        w["method"] = "derived"
+        hw = dict(f["hw"], board="j413")
+        desc = wiring.describe(hw, w)
+        switches = {a["prefix"] + " " + kind + "SENSE Switch": "off"
+                    for a in w["amps"] for kind in ("V", "I")}
+        names = list(switches)
+        state = {"stopped": False, "restored": [], "closed": False}
+        truth = {a["prefix"] + " " + kind + "SENSE Switch": 2 * p + offset
+                 for p, a in enumerate(w["amps"]) for kind, offset in (("I", 0), ("V", 1))}
+
+        class Streams:
+            def __init__(self, *args):
+                self.fmt = "S24_LE"
+
+            def start(self, idx):
+                pass
+
+            def capture(self):
+                quiet = [truth[n] for n, value in switches.items() if value == "off"]
+                return capture(2 * len(w["amps"]), quiet, [])
+
+            def stop(self):
+                state["stopped"] = True
+
+        class Control:
+            def __init__(self, idx):
+                pass
+
+            def close(self):
+                state["closed"] = True
+
+        def put(ctl, name, value):
+            if state["stopped"]:
+                state["restored"].append(name)
+                if fault == "write" and name == names[0]:
+                    raise wiring.Refused("injected restore write failure")
+            switches[name] = value
+
+        def get(card, name):
+            if state["stopped"] and name == names[0]:
+                if fault == "readback":
+                    return "on"
+                if fault == "unreadable":
+                    return None
+            return switches[name]
+
+        with tempfile.TemporaryDirectory() as tmp, ExitStack() as stack:
+            params = os.path.join(tmp, "params")
+            with open(params, "wb") as stream:
+                stream.write(b"synthetic test parameters")
+            args = types.SimpleNamespace(state=tmp, params=params, force=True)
+            patches = {
+                "lv2_shadows": lambda: [], "derive_live": lambda args: (hw, w, desc, []),
+                "blob_rate": lambda path: w["rate"], "find_card": lambda hw: (1, desc["card"]),
+                "pcm_ids": lambda idx: {("Secondary", "p"): 1, ("Speaker Sense", "c"): 2},
+                "pcm_state": lambda *args: "closed", "check_registers": lambda w: ([], {}),
+                "Control": Control, "Streams": Streams, "switch_get": get, "switch_set": put,
+                "amixer": lambda *args: types.SimpleNamespace(returncode=1, stdout=""),
+                "MARKER": os.path.join(tmp, "active"),
+            }
+            for name, value in patches.items():
+                stack.enter_context(mock.patch.object(sgsc, name, value))
+            status = sgsc.cmd_run(args)
+            with open(os.path.join(tmp, "selfcheck.json")) as stream:
+                report = json.load(stream)
+            binding = sgsc.read_bind(os.path.join(tmp, "selfcheck.bind"))
+            # Check cleanup independently before checking admission, so faults
+            # cannot pass just by skipping the hardware portion of the command.
+            self.assertTrue(state["stopped"])
+            self.assertTrue(state["closed"])
+            self.assertEqual(state["restored"], names)
+            self.assertFalse(os.path.exists(sgsc.MARKER))
+            self.assertEqual(len(report["runs"]), 1 + len(names))
+            if fault:
+                self.assertEqual(status, 1, (fault, report))
+                self.assertEqual(binding["result"], "fail")
+                self.assertTrue(any("restoring " + names[0] in r for r in report["record"]["reasons"]))
+            else:
+                self.assertEqual(status, 0, report)
+                self.assertEqual(binding["result"], "pass")
+
+    def test_restore_failures_cannot_persist_a_pass_binding(self):
+        for fault in ("write", "readback", "unreadable"):
+            with self.subTest(fault=fault):
+                self.run_restore(fault)
+
+    def test_verified_cleanup_can_persist_a_pass_binding(self):
+        self.run_restore(None)
+
 def fake_dt(root, hw, jack_card=False):
     """A /proc/device-tree in miniature from a fixture's hardware
     description: the root compatible, a back-end node per link (one
@@ -826,6 +930,31 @@ class Record(unittest.TestCase):
         self.assertIn("reason=first line", lines)
         self.assertEqual(len([l for l in lines if l.startswith("reason=")]), 1)
         self.assertTrue(all("=" in l for l in lines))
+
+
+class BoundRecord(unittest.TestCase):
+    """A bound pass is reused only with its record (the graph is generated
+    from it): a bind without one is checked again (11-07: a removed
+    selfcheck.json with selfcheck.bind left crashed 'generate')."""
+
+    def test_report_matches(self):
+        import tempfile
+        bind = {"result": "pass", "board": "j616s", "kernel": "7.3.0-aurora-fleet19", "params_sha256": "ab" * 32,
+                "wiring": "164e7a0d23003bab"}
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "selfcheck.json")
+            self.assertFalse(sgsc.report_matches(path, bind))
+            rec = {k: v for k, v in bind.items()}
+            with open(path, "w") as f:
+                json.dump({"record": rec}, f)
+            self.assertTrue(sgsc.report_matches(path, bind))
+            rec["params_sha256"] = "cd" * 32
+            with open(path, "w") as f:
+                json.dump({"record": rec}, f)
+            self.assertFalse(sgsc.report_matches(path, bind))
+            with open(path, "w") as f:
+                f.write("{")
+            self.assertFalse(sgsc.report_matches(path, bind))
 
 
 if __name__ == "__main__":

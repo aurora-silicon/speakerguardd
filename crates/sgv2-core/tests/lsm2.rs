@@ -64,7 +64,7 @@ fn params() -> Params {
             amplitude_limit: 1.0,
             displacement_limit: 0.0005,
             velocity_limit: [0.5, 0.6, 0.9],
-            mask_energy_db: [-40.0, -30.0, -20.0, -10.0],
+            mask_energy_db: [0.0, 10.0, 20.0, 30.0],
             mask_band_hz: [8000.0, 12000.0],
             mask_attack_s: 0.01,
             mask_release_s: 0.1,
@@ -182,24 +182,26 @@ fn displacement_candidate_matches_the_transfer_function() {
     let t = tel(&u);
     let got = t.channels[0].axis_gain[1] as f64;
     assert!((got - want).abs() < 2e-3 * want, "{got} {want}");
-    // displacement acts on every band
+    // residuals 5 (t-4731): displacement is a signed allocation over the
+    // band displacements, so the bands carrying the tone take the cut, at
+    // least as deep as the broadband candidate, and no band is raised
     let bg = t.channels[0].band_gain;
-    assert!(bg.iter().all(|&g| (g as f64 - want).abs() < 2e-3), "{bg:?}");
+    let low = bg.iter().copied().fold(1.0f32, f32::min) as f64;
+    assert!(low <= want + 2e-3 && bg.iter().all(|&g| g <= 1.0), "{bg:?} {want}");
 }
 
 #[test]
-fn velocity_spares_the_ignored_outer_bands() {
-    // spec 15.4: the ignored outer bands stay whole; the active bands water
-    // fill, so the band carrying the tone goes at least as low as the
-    // full-band candidate
+fn velocity_allocates_on_the_signed_band_sum() {
+    // residuals 5: the bands carrying a 1 kHz tone are cut so the signed
+    // band sum holds the limit; a band with no content keeps unity
     let p = only([false, false, true, false, true]);
     let mut u = Unit::new(p);
     run(&mut u, &[sine(1000.0, 1.0, 0.5), sine(1000.0, 1.0, 0.5)], 512);
     let t = tel(&u).channels[0];
     assert!(t.axis_gain[2] < 0.9, "{:?}", t.axis_gain);
-    assert_eq!((t.band_gain[0], t.band_gain[4]), (1.0, 1.0));
-    let low = t.band_gain[1..4].iter().copied().fold(1.0f32, f32::min);
+    let low = t.band_gain.iter().copied().fold(1.0f32, f32::min);
     assert!(low <= t.axis_gain[2] + 1e-3, "{:?} {:?}", t.band_gain, t.axis_gain);
+    assert_eq!((t.band_gain[0], t.band_gain[4]), (1.0, 1.0), "{:?}", t.band_gain);
 }
 
 #[test]
@@ -352,13 +354,7 @@ fn runtime_budgets_replace_the_preset_limits() {
 
 #[test]
 fn masking_raises_the_velocity_limit() {
-    let mut p = only([false, false, true, false, true]);
-    let mut fir = [0.0f32; lsm2::PRESSURE_TAPS];
-    fir[0] = 1.0;
-    for c in 0..2 {
-        p.ch[c].pressure_taps = lsm2::PRESSURE_TAPS as u32;
-        p.ch[c].pressure_fir = fir;
-    }
+    let p = with_identity_pressure(only([false, false, true, false, true]));
     let quiet: Vec<f32> = sine(1000.0, 0.5, 0.5);
     let masked: Vec<f32> = quiet.iter().zip(sine(10_000.0, 0.3, 0.5)).map(|(a, b)| a + b).collect();
     let mut u = Unit::new(p);
@@ -432,7 +428,8 @@ fn controller_cadence_is_a_time() {
     // 25G83 rig: 256 frames at 48 kHz, 512 at 96 kHz (5.333 ms)
     assert_eq!(lsm2::controller_frames(48_000), 256);
     assert_eq!(lsm2::controller_frames(96_000), 512);
-    assert_eq!(lsm2::controller_frames(44_100), 232);
+    assert_eq!(lsm2::controller_frames(44_100), 256);
+    assert_eq!(lsm2::controller_frames(88_200), 512);
 }
 
 #[test]
@@ -471,19 +468,45 @@ fn filterbank_matches_the_rig_construction_anchors() {
     }
 }
 
+/// A synthetic masker lattice (not the macOS one): 64 single bins, then
+/// widening buckets to bin 321.
+fn synthetic_lattice() -> [u32; 100] {
+    let mut l = [0u32; 100];
+    for (i, b) in l.iter_mut().enumerate() {
+        *b = if i < 64 { i as u32 + 1 } else { 64 + ((i as u32 - 63) * 257).div_ceil(36) };
+    }
+    l[99] = 321;
+    l
+}
+
 fn with_identity_pressure(mut p: Params) -> Params {
     for c in 0..2 {
         p.ch[c].pressure_taps = lsm2::PRESSURE_TAPS as u32;
         p.ch[c].pressure_fir = [0.0; lsm2::PRESSURE_TAPS];
         p.ch[c].pressure_fir[0] = 1.0;
     }
+    p.mask_lattice_len = 100;
+    p.mask_lattice = synthetic_lattice();
     p
 }
 
 #[test]
+fn without_an_extracted_lattice_there_is_no_masking_credit() {
+    // the fallback is at least as protective as any lattice: the limit stays
+    // at its lowest anchor however loud the mask band is
+    let mut p = with_identity_pressure(only([false, false, true, false, true]));
+    p.mask_lattice_len = 0;
+    let mut u = Unit::new(p);
+    let x: Vec<f32> = sine(1000.0, 0.5, 0.5).iter().zip(sine(10_000.0, 0.3, 0.5)).map(|(a, b)| a + b).collect();
+    run(&mut u, &[x.clone(), x], 512);
+    let t = tel(&u).channels;
+    assert_eq!(t[0].velocity_limit_m_s, 0.5);
+}
+
+#[test]
 fn a_tone_below_the_mask_band_does_not_raise_the_velocity_limit() {
-    // spec 15.3: only 8-12 kHz program masks; a loud 1 kHz tone leaves the
-    // limit at its unmasked plateau, a 10 kHz masker lifts it to the top
+    // residuals 3: only the mask band's spectral median masks; a loud 1 kHz
+    // tone leaves the limit at its unmasked anchor, a 10 kHz masker lifts it
     let p = with_identity_pressure(only([false, false, true, false, true]));
     let mut u = Unit::new(p);
     run(&mut u, &[sine(1000.0, 1.0, 0.5), sine(1000.0, 1.0, 0.5)], 512);
@@ -493,20 +516,19 @@ fn a_tone_below_the_mask_band_does_not_raise_the_velocity_limit() {
     let x: Vec<f32> = sine(1000.0, 0.5, 0.5).iter().zip(sine(10_000.0, 0.3, 0.5)).map(|(a, b)| a + b).collect();
     run(&mut u, &[x.clone(), x], 512);
     let t = tel(&u).channels;
-    assert!((t[0].velocity_limit_m_s - 0.9).abs() < 1e-6, "{} {}", t[0].velocity_limit_m_s, t[0].mask_db);
+    assert!(t[0].velocity_limit_m_s > 0.6, "{} {}", t[0].velocity_limit_m_s, t[0].mask_db);
 }
 
 #[test]
 fn the_velocity_limit_is_one_for_the_pair() {
-    // the 25G83 frame logs give both channels one active limit: the quieter
-    // channel's masker sets it
+    // residuals 3: both channels' curves take the largest level of the pair
     let p = with_identity_pressure(only([false, false, true, false, true]));
     let mut u = Unit::new(p);
     let loud: Vec<f32> = sine(1000.0, 0.5, 0.5).iter().zip(sine(10_000.0, 0.3, 0.5)).map(|(a, b)| a + b).collect();
     run(&mut u, &[loud, sine(1000.0, 0.5, 0.5)], 512);
     let t = tel(&u).channels;
     assert_eq!(t[0].velocity_limit_m_s, t[1].velocity_limit_m_s);
-    assert_eq!(t[0].velocity_limit_m_s, 0.5);
+    assert!(t[0].velocity_limit_m_s > 0.6, "{}", t[0].velocity_limit_m_s);
 }
 
 #[test]
