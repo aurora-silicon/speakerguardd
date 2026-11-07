@@ -248,12 +248,14 @@ impl Run {
         let (ss, cc) = (libm::sin(step), libm::cos(step));
         let (mut s, mut c, mut re, mut im) = (0.0, 1.0, 0.0, 0.0);
         for n in 0..FFT {
-            let x = self.history[(self.history_at + n) % FFT] as f64;
+            let window =
+                0.5 * (1.0 - libm::cos(2.0 * core::f64::consts::PI * n as f64 / (FFT - 1) as f64)) / (FFT - 1) as f64;
+            let x = self.history[(self.history_at + n) % FFT] as f64 * window;
             re += x * c;
             im -= x * s;
             (s, c) = (s * cc + c * ss, c * cc - s * ss);
         }
-        2.0 * libm::sqrt(re * re + im * im) / FFT as f64
+        2.0 * libm::sqrt(re * re + im * im)
     }
 
     fn redesign(&mut self, index: usize) {
