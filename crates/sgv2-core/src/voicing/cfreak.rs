@@ -45,10 +45,11 @@
 //!   `g = 10^(-S/20)`, bilinear at the oversampled rate) runs before the
 //!   shaper and its exact inverse after it, so it only shapes how hard each
 //!   band is driven;
-//! * the shaper is `sin(k u) / k`, unity slope at zero; `k` is a per
-//!   channel drive between [`K_MIN`] (no high-band content) and 1 set once
-//!   per [`DRIVE_BLOCK`] frames from the ratio of the block's RMS through a
-//!   fixed high-band weighting to its plain RMS (`k^2 = DRIVE_C * ratio`),
+//! * the shaper is `sin(k u) / k`, unity slope at zero; `k` is a
+//!   drive between [`K_MIN`] (no high-band content) and 1, linked over the
+//!   channels, set once per [`DRIVE_BLOCK`] frames from the ratio of the
+//!   block's RMS (all channels) through a fixed high-band weighting to its
+//!   plain RMS (`k^2 = DRIVE_C * ratio`),
 //!   smoothed in dB ([`DRIVE_SMOOTH`] of the way per block);
 //! * the same low pass `h` reconstructs and decimates: a low-level impulse
 //!   comes out as `h * h` sampled at the base rate, centred
@@ -371,12 +372,6 @@ struct Saturator {
     pre: BiquadState,
     post: BiquadState,
     det: [BiquadState; 3],
-    /// Block energies of the input and of the weighted input.
-    ex: f64,
-    eg: f64,
-    /// Smoothed drive, dB.
-    drive_db: f64,
-    k: f64,
 }
 
 const PHASE_TAPS: usize = FIR_TAPS.div_ceil(OVERSAMPLE);
@@ -393,10 +388,6 @@ impl Saturator {
             pre: BiquadState::default(),
             post: BiquadState::default(),
             det: [BiquadState::default(); 3],
-            ex: 0.0,
-            eg: 0.0,
-            drive_db: DRIVE_START_DB,
-            k: 1.0,
         }
     }
 }
@@ -410,6 +401,13 @@ struct Saturation {
     pos: usize,
     /// Drive blocks completed since the start or a reset.
     blocks: usize,
+    /// The block's energies, summed over the channels, of the input and of
+    /// the weighted input (the drive is linked).
+    ex: f64,
+    eg: f64,
+    /// Smoothed drive (dB) and the drive in use.
+    drive_db: f64,
+    k: f64,
     ch: Vec<Saturator>,
 }
 
@@ -426,6 +424,10 @@ impl Saturation {
             det: [hp, hp, lp],
             pos: 0,
             blocks: 0,
+            ex: 0.0,
+            eg: 0.0,
+            drive_db: DRIVE_START_DB,
+            k: 1.0,
             ch: vec![Saturator::new(); channels],
         }
     }
@@ -433,10 +435,14 @@ impl Saturation {
     fn reset(&mut self) {
         self.pos = 0;
         self.blocks = 0;
+        self.ex = 0.0;
+        self.eg = 0.0;
+        self.drive_db = DRIVE_START_DB;
+        self.k = 1.0;
         self.ch.iter_mut().for_each(|c| *c = Saturator::new());
     }
 
-    /// Ends a drive block: each channel's drive moves towards the block's
+    /// Ends a drive block: the linked drive moves towards the block's
     /// target (the first [`DRIVE_WARMUP_BLOCKS`] after a start leave it).
     ///
     /// The unit sets a block's drive from that block's own input before
@@ -445,16 +451,14 @@ impl Saturation {
     fn end_block(&mut self) {
         let warm = self.blocks >= DRIVE_WARMUP_BLOCKS;
         self.blocks = self.blocks.saturating_add(1);
-        for c in &mut self.ch {
-            if warm && c.ex > 0.0 {
-                let k2 = DRIVE_C * libm::sqrt(c.eg / c.ex);
-                let target = 10.0 * libm::log10(k2.max(1e-30));
-                c.drive_db += DRIVE_SMOOTH * (target - c.drive_db);
-                c.k = libm::pow(10.0, c.drive_db / 20.0).clamp(K_MIN, 1.0);
-            }
-            c.ex = 0.0;
-            c.eg = 0.0;
+        if warm && self.ex > 0.0 {
+            let k2 = DRIVE_C * libm::sqrt(self.eg / self.ex);
+            let target = 10.0 * libm::log10(k2.max(1e-30));
+            self.drive_db += DRIVE_SMOOTH * (target - self.drive_db);
+            self.k = libm::pow(10.0, self.drive_db / 20.0).clamp(K_MIN, 1.0);
         }
+        self.ex = 0.0;
+        self.eg = 0.0;
         self.pos = 0;
     }
 
@@ -467,11 +471,11 @@ impl Saturation {
         for (bq, st) in self.det.iter().zip(s.det.iter_mut()) {
             g = bq.run(st, g);
         }
-        s.ex += x * x;
-        s.eg += g * g;
+        self.ex += x * x;
+        self.eg += g * g;
         s.x_at = (s.x_at + 1) % PHASE_TAPS;
         s.x[s.x_at] = x;
-        let k = s.k;
+        let k = self.k;
         for phase in 0..OVERSAMPLE {
             // u[3n + phase] = 3 * sum_j h[phase + 3 j] x[n - j]
             let mut u = 0.0;
@@ -917,7 +921,7 @@ mod tests {
             s.pos += 1;
             s.run(0, 0.5 * libm::sin(2.0 * core::f64::consts::PI * 5_000.0 * k as f64 / 48_000.0));
         }
-        assert_eq!(s.ch[0].k, 1.0);
+        assert_eq!(s.k, 1.0);
     }
 
     #[test]
