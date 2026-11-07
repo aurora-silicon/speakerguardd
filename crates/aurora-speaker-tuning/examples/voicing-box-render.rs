@@ -385,7 +385,16 @@ fn main() {
                 };
             }
             let kind = match subtype.as_str() {
-                "cfrk" => kind!(cfreak, Cfreak),
+                "cfrk" => match voicing::cfreak::compile_for(
+                    stage,
+                    fs,
+                    std::env::var("SGV2_MACOS_BUILD").ok().as_deref(),
+                    &mut diags,
+                ) {
+                    Ok(Some(p)) => Kind::Cfreak(Box::new(p)),
+                    Ok(None) => Kind::Bypass,
+                    Err(e) => die(e),
+                },
                 "vben" => kind!(vbass, Vbass),
                 "axtc" => kind!(xtc, Xtc),
                 "vrq2" => kind!(vareq, Vareq),
