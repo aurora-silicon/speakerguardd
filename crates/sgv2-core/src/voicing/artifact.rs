@@ -490,7 +490,8 @@ fn validate(spec: &Spec, fs: f64, lanes: usize) -> Result<()> {
         }
         match &node.kind {
             Kind::Xtc(p) if !p.valid() => return Err(BlobError::Unstable),
-            Kind::Xtc(_) | Kind::Vbass(_) if width != 2 => return Err(BlobError::Channels),
+            Kind::Xtc(_) if width != 2 => return Err(BlobError::Channels),
+            Kind::Vbass(_) if !(1..=2).contains(&width) => return Err(BlobError::Channels),
             Kind::Norm(_) if width > super::norm::MAX_CHANNELS => return Err(BlobError::Channels),
             Kind::Vareq(p) if !p.transitions_valid_at(fs) => return Err(BlobError::Unstable),
             Kind::Cdelay(p) if p.channels != width => return Err(BlobError::Channels),
