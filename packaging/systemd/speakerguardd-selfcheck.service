@@ -23,7 +23,7 @@ ConditionPathExists=/proc/device-tree/compatible
 
 [Service]
 Type=oneshot
-ExecCondition=/usr/libexec/speakerguardd/speakerguardd-gate v2
+ExecCondition=/usr/libexec/speakerguardd/speakerguardd-gate prepare
 # SGV2_PARAMS: the parameter blob (as in SGV2_ARGS); SGV2_TUNING: the tuning
 # source the blob was compiled from, as aurora-speaker-tuning takes it
 # (empty: the installer's bundle in the vendor firmware).
