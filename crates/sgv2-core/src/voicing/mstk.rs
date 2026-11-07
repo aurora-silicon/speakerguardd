@@ -944,6 +944,21 @@ fn detector_factors(p: &Params) -> [usize; BANDS] {
     }
 }
 
+/// Algorithm zero runs its first mode-4 arm at a reduced band rate. The
+/// factor keeps the first image beyond the Butterworth stop-band budget:
+/// quality 0 uses 40 dB, quality 1 uses 50 dB, and an order-N Linkwitz-Riley
+/// edge has N/2 Butterworth poles at six dB per octave. The outer factor is
+/// the integral part of `fs / (2 * edge * 2^(budget / (6 * poles)))`.
+fn mode4_band0_factor(p: &Params, fs: f64) -> usize {
+    if p.algorithm != 0 || p.render_quality >= 2 || p.band[0].mode != BandMode::Active {
+        return 1;
+    }
+    let poles = (effective_order(p.crossover_order[0]) / 2).max(1) as f64;
+    let budget_db = if p.render_quality == 0 { 40.0 } else { 50.0 };
+    let separation = 2.0 * libm::pow(2.0, budget_db / (6.0 * poles));
+    libm::floor(fs / (separation * p.crossover_hz[0])).max(1.0) as usize
+}
+
 impl SlidingMax {
     const EMPTY: Self =
         Self { value: [0.0; MAX_DETECTOR_WINDOW], index: [0; MAX_DETECTOR_WINDOW], head: 0, len: 0, next: 0 };
@@ -1009,6 +1024,7 @@ pub struct Run {
     mode4_gain: [Mode4Gain; BANDS],
     mode4_old: [(f32, f32); BANDS],
     mode4_new: [(f32, f32); BANDS],
+    mode4_band0_factor: usize,
     mode4_phase: usize,
     hop_peak: bool,
     detector_hop: [f64; BANDS],
@@ -1063,6 +1079,7 @@ impl Run {
         });
         let hop_peak = cadence(q) == Cadence::HopPeak;
         let (analytic_band_path, detector_reference_path) = analytic_detector_paths(q, fs);
+        let mode4_band0_factor = mode4_band0_factor(q, fs);
         let mut run = Run {
             path: paths(q, fs),
             legacy_stage: legacy_stages(q, fs),
@@ -1098,11 +1115,12 @@ impl Run {
             overshoot_quadrature: [[[QuadratureEnvelope::default(); BANDS]; BANDS]; MAX_CHANNELS],
             audio_quadrature: [QuadratureEnvelope::default(); MAX_CHANNELS],
             mode4_gain: core::array::from_fn(|b| {
-                let rate = if q.algorithm == 0 && b == 0 && q.band[b].mode == BandMode::Active { fs * 0.5 } else { fs };
+                let rate = if b == 0 { fs / mode4_band0_factor as f64 } else { fs };
                 Mode4Gain::new(rate)
             }),
             mode4_old: [(1.0, 1.0); BANDS],
             mode4_new: [(1.0, 1.0); BANDS],
+            mode4_band0_factor,
             mode4_phase: 0,
             hop_peak,
             detector_hop: [0.0; BANDS],
@@ -1471,10 +1489,13 @@ impl Run {
             let mut mode4 = [Mode4Mix::default(); BANDS];
             if self.hop_peak {
                 let phase = self.mode4_phase;
-                self.mode4_phase ^= 1;
+                self.mode4_phase += 1;
+                if self.mode4_phase == self.mode4_band0_factor {
+                    self.mode4_phase = 0;
+                }
                 for b in 0..BANDS {
-                    if self.algorithm == 0 && b == 0 && self.band[b].mode == BandMode::Active {
-                        if phase == 1 {
+                    if b == 0 && self.mode4_band0_factor > 1 {
+                        if phase + 1 == self.mode4_band0_factor {
                             let mix = self.mode4_gain[b].step(gain[b]);
                             let direct = mix.correction_weight;
                             let corrected = 1.0 - direct;
@@ -1484,12 +1505,13 @@ impl Run {
                                 corrected * (mix.lowpass + mix.arm_b) + direct * mix.gain,
                             );
                         }
-                        let (arm_a, arm_b) = if phase == 1 {
+                        let (arm_a, arm_b) = if phase + 1 == self.mode4_band0_factor {
                             self.mode4_old[b]
                         } else {
+                            let fraction = (phase + 1) as f32 / self.mode4_band0_factor as f32;
                             (
-                                0.5 * (self.mode4_old[b].0 + self.mode4_new[b].0),
-                                0.5 * (self.mode4_old[b].1 + self.mode4_new[b].1),
+                                self.mode4_old[b].0 + fraction * (self.mode4_new[b].0 - self.mode4_old[b].0),
+                                self.mode4_old[b].1 + fraction * (self.mode4_new[b].1 - self.mode4_old[b].1),
                             )
                         };
                         mode4[b] = Mode4Mix { arm_a, arm_b, ..Mode4Mix::default() };
@@ -2000,15 +2022,26 @@ mod tests {
     }
 
     #[test]
-    fn algorithm_zero_band_zero_uses_half_rate_gain_synthesis() {
+    fn algorithm_zero_band_zero_uses_the_stopband_rate_factor() {
         let mut p = params();
         p.algorithm = 0;
+        p.render_quality = 1;
+        p.crossover_hz[0] = 221.030_853_271_484_38;
         p.band[0].mode = BandMode::Active;
         let run = Run::new(&p, 48_000.0, 1);
-        let k = libm::tan(core::f64::consts::PI * 50.0 / 24_000.0);
+        assert_eq!(run.mode4_band0_factor, 6);
+        let k = libm::tan(core::f64::consts::PI * 50.0 / 8_000.0);
         assert_eq!(run.mode4_gain[0].b, (k / (1.0 + k)) as f32);
         let full_rate = libm::tan(core::f64::consts::PI * 50.0 / 48_000.0);
         assert_eq!(run.mode4_gain[1].b, (full_rate / (1.0 + full_rate)) as f32);
+
+        p.render_quality = 0;
+        p.crossover_hz[0] = 100.0;
+        assert_eq!(Run::new(&p, 48_000.0, 1).mode4_band0_factor, 23);
+        p.crossover_hz[0] = 200.0;
+        assert_eq!(Run::new(&p, 96_000.0, 1).mode4_band0_factor, 23);
+        p.algorithm = 2;
+        assert_eq!(Run::new(&p, 48_000.0, 1).mode4_band0_factor, 1);
     }
 
     #[test]
