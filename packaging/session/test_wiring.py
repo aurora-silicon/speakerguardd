@@ -932,5 +932,30 @@ class Record(unittest.TestCase):
         self.assertTrue(all("=" in l for l in lines))
 
 
+class BoundRecord(unittest.TestCase):
+    """A bound pass is reused only with its record (the graph is generated
+    from it): a bind without one is checked again (11-07: a removed
+    selfcheck.json with selfcheck.bind left crashed 'generate')."""
+
+    def test_report_matches(self):
+        import tempfile
+        bind = {"result": "pass", "board": "j616s", "kernel": "7.3.0-aurora-fleet19", "params_sha256": "ab" * 32,
+                "wiring": "164e7a0d23003bab"}
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "selfcheck.json")
+            self.assertFalse(sgsc.report_matches(path, bind))
+            rec = {k: v for k, v in bind.items()}
+            with open(path, "w") as f:
+                json.dump({"record": rec}, f)
+            self.assertTrue(sgsc.report_matches(path, bind))
+            rec["params_sha256"] = "cd" * 32
+            with open(path, "w") as f:
+                json.dump({"record": rec}, f)
+            self.assertFalse(sgsc.report_matches(path, bind))
+            with open(path, "w") as f:
+                f.write("{")
+            self.assertFalse(sgsc.report_matches(path, bind))
+
+
 if __name__ == "__main__":
     unittest.main()
