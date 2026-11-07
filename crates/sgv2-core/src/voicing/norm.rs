@@ -18,8 +18,8 @@
 //! - fast: the loudest 64-frame level of the call, less a fixed store, held
 //!   and released only once the call sits more than a dead band under it,
 //!   with a release that speeds up over the first seconds of audible program;
-//! - median: the upper median of the last 96 512-frame levels (the first
-//!   one after a reset is frame 512's), less a fixed store, behind a
+//! - median: the middle of the last 95 512-frame levels (every block from
+//!   the reset on, frame 0's included), less a fixed store, behind a
 //!   release limiter that only lets go once the median sits more than its
 //!   dead band under it;
 //! - long: a 1001-bin histogram of 4096-frame window levels over -100..0 in
@@ -61,8 +61,8 @@
 //! Gain law: a 21-node table over -100..+10 in 5.5 dB steps, compiled from
 //! the tuning (target, maximum gain, upward and downward ranges, ratio),
 //! read as a uniform cubic B-spline over the nodes (not by linear
-//! interpolation: the unit rounds the table's knees). The gain glides toward its target by a
-//! tenth of the remaining distance per frame, in dB.
+//! interpolation: the unit rounds the table's knees). The gain glides toward its target in dB
+//! with a 0.8 ms one-pole (the same time at every sample rate).
 //!
 //! No tuning value lives here; `aurora-speaker-tuning`'s `voicing::norm`
 //! compiles [`Params`] from the Mac's saved state.
@@ -90,7 +90,8 @@ const BINS: usize = 1001;
 const BIN_LO_DB: f64 = -100.0;
 const BIN_DB: f64 = 0.1;
 const SEED_HALF: usize = 5;
-const GLIDE: f64 = 0.1;
+/// Time constant of the gain's glide toward each call's target, in dB, s.
+const GLIDE_S: f64 = 0.0008;
 /// macOS renders the speaker graph in calls of this many frames; the unit
 /// meters a whole call before it moves its gain across that call.
 pub const CALL: usize = 512;
@@ -326,12 +327,13 @@ const EMA_S: f64 = 0.030;
 const FAST_STORE_DB: f64 = -8.0;
 const MEDIAN_STORE_DB: f64 = -5.0;
 const COMPETITOR_STORE_DB: f64 = -2.0;
-/// The median path (the unit asks for 0.5 s of 512-frame levels and rounds
-/// its backing store up to an even length): this many 512-frame levels, read at this sorted index
-/// (the upper median: after a short burst the unit's median sits one rank
-/// higher on the burst's decay than the lower median would).
-const MEDIAN_LEN: usize = 96;
-const MEDIAN_AT: usize = 48;
+/// The median path: the true median of this many 512-frame levels (an odd
+/// count, read at its middle sorted index). Measured on the unit: after a
+/// step it flips on the 48th new level, and its rank moves through a
+/// random program exactly as a 95-level window does (96 levels read at
+/// either middle rank miss it by up to 0.4 dB).
+const MEDIAN_LEN: usize = 95;
+const MEDIAN_AT: usize = MEDIAN_LEN / 2;
 /// The long path: a sliding mean of this many 64-frame powers, emitted to
 /// the histogram every eight blocks.
 const WINDOW_LEN: usize = 600;
@@ -566,8 +568,6 @@ pub struct Run {
     long_line: [f64; LONG_DELAY],
     long_at: usize,
     long_out: f64,
-    /// Whether the median has passed its first block since the reset.
-    median_live: bool,
     /// The 512-frame candidate: limited median against the conditioned
     /// long path.
     held: f64,
@@ -577,6 +577,8 @@ pub struct Run {
     candidate: f64,
     target_db: f64,
     gain_db: f64,
+    /// Per-frame share of the remaining distance the gain covers.
+    glide: f64,
 }
 
 impl Run {
@@ -612,12 +614,12 @@ impl Run {
             long_line: [p.expected_db; LONG_DELAY],
             long_at: 0,
             long_out: p.expected_db,
-            median_live: false,
             held: 0.0,
             clear_due: false,
             candidate: 0.0,
             target_db: 0.0,
             gain_db: 0.0,
+            glide: 1.0 - libm::exp(-1.0 / (GLIDE_S * fs)),
         };
         r.reset();
         r
@@ -648,7 +650,6 @@ impl Run {
         self.long_line = [e; LONG_DELAY];
         self.long_at = 0;
         self.long_out = e;
-        self.median_live = false;
         self.held = e;
         self.clear_due = true;
         self.candidate = e;
@@ -705,10 +706,7 @@ impl Run {
         let long = self.long_out;
         self.window.push(ema);
         if self.steps == 0 {
-            // the median's first level is the block at frame 512; the one at
-            // frame 0 (the reset seed's) never joins it
-            let mid = if self.median_live { self.median.push(db) } else { self.median.limited };
-            self.median_live = true;
+            let mid = self.median.push(db);
             self.pending = Some((db, mid, long));
             self.blocks = (self.blocks + 1) % PER_LONG;
         }
@@ -779,7 +777,7 @@ impl Run {
             self.z = [[[0.0; 2]; MAX_SECTIONS]; MAX_CHANNELS];
         }
         for n in 0..CALL {
-            self.gain_db += GLIDE * (self.target_db - self.gain_db);
+            self.gain_db += self.glide * (self.target_db - self.gain_db);
             let g = libm::pow(10.0, self.gain_db / 20.0) as f32;
             for ch in 0..nch {
                 let x = self.call_in[ch * CALL + n];
@@ -992,17 +990,20 @@ mod tests {
     }
 
     #[test]
-    fn the_median_starts_at_the_second_block() {
+    fn the_median_takes_every_block_and_flips_at_its_middle() {
         let p = params(0);
         let mut r = Run::new(&p, 48_000.0, 1);
         let mut buf = vec![0.3f32; CALL];
         r.process(&mut [&mut buf], CALL);
-        assert!(r.median.ring.iter().all(|v| *v == p.expected_db));
-        r.process(&mut [&mut buf], CALL);
+        // frame 0's block joins as well
         assert_eq!(r.median.ring.iter().filter(|v| **v != p.expected_db).count(), 1);
-        r.reset();
-        r.process(&mut [&mut buf], CALL);
-        assert!(r.median.ring.iter().all(|v| *v == p.expected_db));
+        let mut m = Median::new(93.75);
+        m.reset(-20.0);
+        for _ in 0..MEDIAN_AT {
+            assert_eq!(m.push(-10.0), -20.0);
+        }
+        // the 48th louder level of 95 moves the middle
+        assert_eq!(m.push(-10.0), -15.0);
     }
 
     #[test]
