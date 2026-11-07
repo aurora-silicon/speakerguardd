@@ -592,6 +592,9 @@ struct MaskDetector {
     high_history: Box<[f64]>,
     low: Box<[Complex]>,
     high: Box<[Complex]>,
+    /// Unweighted LF (velocity) magnitudes of the latest hop; the limiter's
+    /// water-fill detector.
+    low_magnitude: Box<[f64]>,
     scratch: Box<[Complex]>,
     twiddles: Box<[Complex]>,
     window: Box<[f64]>,
@@ -651,6 +654,7 @@ impl MaskDetector {
             high_history: vec![0.0; n].into_boxed_slice(),
             low: vec![Complex::default(); n].into_boxed_slice(),
             high: vec![Complex::default(); n].into_boxed_slice(),
+            low_magnitude: vec![0.0; n / 2 + 1].into_boxed_slice(),
             scratch: vec![Complex::default(); n].into_boxed_slice(),
             twiddles: twiddles.into_boxed_slice(),
             window: window.into_boxed_slice(),
@@ -674,6 +678,7 @@ impl MaskDetector {
         self.high_history.fill(0.0);
         self.low.fill(Complex::default());
         self.high.fill(Complex::default());
+        self.low_magnitude.fill(0.0);
         self.scratch.fill(Complex::default());
         self.band_energy.fill(0.0);
         self.concentration = 1.0;
@@ -708,7 +713,8 @@ impl MaskDetector {
         for bin in 0..bin_count {
             // vDSP's real forward DFT has a factor of two. The response path
             // removes its own factor with 0.5; the program path retains it.
-            let low = 2.0 * complex_magnitude(self.low[bin]) * self.pressure_magnitude[bin];
+            self.low_magnitude[bin] = complex_magnitude(self.low[bin]);
+            let low = 2.0 * self.low_magnitude[bin] * self.pressure_magnitude[bin];
             let high = 2.0 * complex_magnitude(self.high[bin]) * self.tweeter_magnitude[bin];
             let magnitude = low + high;
             sum += magnitude;
@@ -831,13 +837,13 @@ fn bark_hz(bark: f64) -> f64 {
 /// scratch; [`Spectral::prepare_hop`] and [`Spectral::render_hop`] are
 /// allocation-free.
 ///
-/// Each hop transforms the newest `n` low-lane frames twice: once through the
-/// square-root Hann analysis window that is also the overlap-add synthesis
-/// window, and once through the plain Hann window. The water-fill cap is
-/// solved on the Hann-window magnitudes and the resulting per-bin gains scale
-/// the analysis spectrum. The Hann window confines a steady tone to its own
-/// and the two neighbouring bins, so tones outside the affected interval do
-/// not leak into the capped bins.
+/// Each hop transforms the newest `n` low-lane frames through the square-root
+/// Hann analysis window that is also the overlap-add synthesis window. The
+/// water-fill cap is found on the mask detector's Hann-window magnitudes of
+/// the velocity-filtered low lane, and the resulting per-bin gains scale the
+/// analysis spectrum. The Hann window confines a steady tone to its own and
+/// the two neighbouring bins, so tones outside the affected interval do not
+/// leak into the capped bins.
 #[cfg(not(feature = "lowflow-conservative"))]
 struct Spectral {
     n: usize,
@@ -846,9 +852,7 @@ struct Spectral {
     history: Box<[f64]>,
     overlap: Box<[f64]>,
     window: Box<[f64]>,
-    detector_window: Box<[f64]>,
     bins: Box<[Complex]>,
-    detector_bins: Box<[Complex]>,
     detector_magnitude: Box<[f64]>,
     scratch: Box<[Complex]>,
     twiddles: Box<[Complex]>,
@@ -862,12 +866,10 @@ impl Spectral {
     fn new(model: &Model, fs: f64, latency: usize) -> Self {
         let n = latency.saturating_add(SPECTRAL_HOP).clamp(2 * SPECTRAL_HOP, 4 * SPECTRAL_HOP);
         let mut window = vec![0.0; n];
-        let mut detector_window = vec![0.0; n];
-        for (i, (value, detector)) in window.iter_mut().zip(detector_window.iter_mut()).enumerate() {
+        for (i, value) in window.iter_mut().enumerate() {
             let phase = 2.0 * core::f64::consts::PI * i as f64 / n as f64;
             let hann = 0.5 - 0.5 * libm::cos(phase);
             *value = libm::sqrt((hann * SPECTRAL_HOP as f64 / n as f64).max(0.0));
-            *detector = hann;
         }
         let mut twiddles = vec![Complex::default(); n];
         for (i, value) in twiddles.iter_mut().enumerate() {
@@ -884,9 +886,7 @@ impl Spectral {
             history: vec![0.0; n].into_boxed_slice(),
             overlap: vec![0.0; n].into_boxed_slice(),
             window: window.into_boxed_slice(),
-            detector_window: detector_window.into_boxed_slice(),
             bins: vec![Complex::default(); n].into_boxed_slice(),
-            detector_bins: vec![Complex::default(); n].into_boxed_slice(),
             detector_magnitude: vec![0.0; bin_count].into_boxed_slice(),
             scratch: vec![Complex::default(); n].into_boxed_slice(),
             twiddles: twiddles.into_boxed_slice(),
@@ -900,7 +900,6 @@ impl Spectral {
         self.history.fill(0.0);
         self.overlap.fill(0.0);
         self.bins.fill(Complex::default());
-        self.detector_bins.fill(Complex::default());
         self.detector_magnitude.fill(0.0);
         self.scratch.fill(Complex::default());
         self.gains.fill(1.0);
@@ -911,8 +910,15 @@ impl Spectral {
         self.target = target.clamp(0.0, 1.0);
     }
 
+    /// Takes the water-fill detector magnitudes for the current hop.
+    fn set_detector(&mut self, magnitude: &[f64]) {
+        for (dst, src) in self.detector_magnitude.iter_mut().zip(magnitude) {
+            *dst = *src;
+        }
+    }
+
     /// Shifts one completed low-lane hop into the analysis history and
-    /// transforms it through both windows.
+    /// transforms it through the analysis window.
     fn prepare_hop(&mut self, low: &[f32]) {
         debug_assert_eq!(low.len(), SPECTRAL_HOP);
         self.history.copy_within(SPECTRAL_HOP.., 0);
@@ -922,13 +928,8 @@ impl Spectral {
         }
         for i in 0..self.n {
             self.bins[i] = Complex { re: self.history[i] * self.window[i], im: 0.0 };
-            self.detector_bins[i] = Complex { re: self.history[i] * self.detector_window[i], im: 0.0 };
         }
         transform(&mut self.bins, &mut self.scratch, &self.twiddles, false);
-        transform(&mut self.detector_bins, &mut self.scratch, &self.twiddles, false);
-        for (magnitude, value) in self.detector_magnitude.iter_mut().zip(self.detector_bins.iter()) {
-            *magnitude = libm::sqrt(value.re * value.re + value.im * value.im);
-        }
     }
 
     fn render_hop(&mut self, io: &mut [f32]) {
@@ -950,33 +951,17 @@ impl Spectral {
         self.target = 1.0;
     }
 
-    /// Water-fill on the detector magnitudes `a[k]` of the affected bins:
-    /// solve `rms(min(a, C)) = target * rms(a)`, then per bin
+    /// Water-fill on the detector magnitudes `a[k]` of the affected bins: a
+    /// cap `C` with `rms(min(a, C)) ~= target * rms(a)`, then per bin
     /// `min(C / a, 1)`, with immediate attack and the saved per-bin release.
     fn update_gains(&mut self) {
         let start = self.min_bin.min(self.gains.len());
         let end = self.max_bin.max(start).min(self.gains.len());
-        let affected = &self.detector_magnitude[start..end];
-        let mut cap = f64::INFINITY;
-        if self.target < 1.0 && start < end {
-            let count = (end - start) as f64;
-            let sum: f64 = affected.iter().map(|a| a * a).sum();
-            let wanted = self.target * libm::sqrt(sum / count);
-            if wanted > 0.0 {
-                let mut lo = 0.0;
-                let mut hi = affected.iter().copied().fold(0.0_f64, f64::max);
-                for _ in 0..48 {
-                    let cap = 0.5 * (lo + hi);
-                    let clipped: f64 = affected.iter().map(|a| a.min(cap) * a.min(cap)).sum();
-                    if libm::sqrt(clipped / count) > wanted {
-                        hi = cap;
-                    } else {
-                        lo = cap;
-                    }
-                }
-                cap = 0.5 * (lo + hi);
-            }
-        }
+        let cap = if self.target < 1.0 && start < end {
+            waterfill_cap(&self.detector_magnitude[start..end], self.target)
+        } else {
+            f64::INFINITY
+        };
         for (bin, gain) in self.gains.iter_mut().enumerate() {
             let target = if (start..end).contains(&bin) && cap.is_finite() {
                 let magnitude = self.detector_magnitude[bin];
@@ -1378,6 +1363,7 @@ impl Run {
                     let limit = velocity_limit(model, state.mask_output_db);
                     let target = detector_target(model.enabled, model.mute, state.floor, limit, state.velocity_history);
                     state.spectral.set_target(target);
+                    state.spectral.set_detector(&state.mask.low_magnitude);
                     // The mask runtime has already transformed the current
                     // detector hop. Target/water-fill and gain release run
                     // before the current output transform consumes that
@@ -1432,6 +1418,41 @@ fn coefficient(seconds: f64, fs: f64) -> f64 {
 fn gain_release_coefficient(seconds: f64, fs: f64) -> f64 {
     coefficient(seconds, fs)
 }
+/// The water-fill cap search: regula falsi on `rms(min(a, C)) - target *
+/// rms(a)` from the bracket `[0, max(a)]`, stopping at the first iterate whose
+/// clipped-to-reference RMS ratio is within 0.01 of the target. The stop is
+/// part of the law: the cap is not refined further.
+#[cfg(not(feature = "lowflow-conservative"))]
+fn waterfill_cap(magnitude: &[f64], target: f64) -> f64 {
+    const RATIO_TOLERANCE: f64 = 0.01;
+    const MAX_STEPS: usize = 64;
+    let count = magnitude.len() as f64;
+    let reference = libm::sqrt(magnitude.iter().map(|a| a * a).sum::<f64>() / count);
+    let wanted = target * reference;
+    if wanted.is_nan() || wanted <= 0.0 {
+        return f64::INFINITY;
+    }
+    let clipped_rms = |cap: f64| libm::sqrt(magnitude.iter().map(|a| a.min(cap) * a.min(cap)).sum::<f64>() / count);
+    let (mut lo, mut hi) = (0.0, magnitude.iter().copied().fold(0.0_f64, f64::max));
+    let (mut below, mut above) = (-wanted, reference - wanted);
+    let mut step = 0;
+    loop {
+        let cap = lo + (hi - lo) * -below / (above - below);
+        let error = clipped_rms(cap) - wanted;
+        step += 1;
+        if libm::fabs(error) < RATIO_TOLERANCE * reference || step == MAX_STEPS {
+            return cap;
+        }
+        if error > 0.0 {
+            hi = cap;
+            above = error;
+        } else {
+            lo = cap;
+            below = error;
+        }
+    }
+}
+
 #[cfg(not(feature = "lowflow-conservative"))]
 fn hop_coefficient(seconds: f64, fs: f64) -> f64 {
     if seconds <= 0.0 {
@@ -1639,8 +1660,28 @@ mod tests {
                 .sum::<f64>()
                 / before.len() as f64,
         );
-        assert!((output_rms / input_rms - 0.4).abs() < 1.0e-8);
+        assert!((output_rms / input_rms - 0.4).abs() < 0.01);
         assert!(spectral.gains[0] == 1.0 && spectral.gains[8] == 1.0);
+    }
+
+    #[cfg(not(feature = "lowflow-conservative"))]
+    #[test]
+    fn waterfill_cap_stops_at_the_first_iterate_within_tolerance() {
+        // Two nearly equal bins: the first regula-falsi iterate `target * max`
+        // clips both and lands within 0.01 of the ratio, so it is kept.
+        let magnitude = [1.0, 0.9747];
+        let reference = libm::sqrt((1.0 + 0.9747 * 0.9747) / 2.0);
+        assert!((waterfill_cap(&magnitude, 0.3) - 0.3).abs() < 1.0e-12);
+        assert!((0.3 / reference - 0.3) > 0.003);
+        // A spread spectrum needs several iterates; the result honours the
+        // tolerance but is not the exact solution.
+        let magnitude = [0.1346, 0.8751, 1.0, 0.25];
+        let reference = libm::sqrt(magnitude.iter().map(|a| a * a).sum::<f64>() / 4.0);
+        let cap = waterfill_cap(&magnitude, 0.3);
+        let clipped = libm::sqrt(magnitude.iter().map(|a: &f64| a.min(cap) * a.min(cap)).sum::<f64>() / 4.0);
+        assert!((clipped / reference - 0.3).abs() < 0.01);
+        assert!((clipped / reference - 0.3).abs() > 1.0e-4);
+        assert_eq!(waterfill_cap(&[0.0, 0.0], 0.5), f64::INFINITY);
     }
 
     #[cfg(not(feature = "lowflow-conservative"))]
