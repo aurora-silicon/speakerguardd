@@ -13,7 +13,6 @@
 //! nothing and accepts arbitrary frame counts.
 
 use crate::MAX_CHANNELS;
-use alloc::{boxed::Box, vec};
 
 pub const BANDS: usize = 4;
 const XOVERS: usize = BANDS - 1;
@@ -618,7 +617,7 @@ pub struct Run {
     detector_factor: [usize; BANDS],
     detector_phase: [usize; BANDS],
     detector_max: [SlidingMax; BANDS],
-    overshoot_max: Box<[SlidingMax]>,
+    overshoot_max: [[SlidingMax; BANDS]; BANDS],
     detector_rms: [f64; BANDS],
     gain_src: [GainSrc; BANDS],
     state: [[[[f64; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS],
@@ -626,7 +625,7 @@ pub struct Run {
     legacy_split_allpass_state: [[[[f64; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
     legacy_merge_allpass_state: [[[[f64; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
     detector_state: [[[[f32; 2]; MAX_DETECTOR_FILTERS]; BANDS]; MAX_CHANNELS],
-    overshoot_state: Box<[f32]>,
+    overshoot_state: [[[[[f32; 2]; MAX_DETECTOR_FILTERS]; BANDS]; BANDS]; MAX_CHANNELS],
 }
 
 impl Run {
@@ -683,7 +682,7 @@ impl Run {
             detector_factor,
             detector_phase: [0; BANDS],
             detector_max: [SlidingMax::EMPTY; BANDS],
-            overshoot_max: vec![SlidingMax::EMPTY; BANDS * BANDS].into_boxed_slice(),
+            overshoot_max: [[SlidingMax::EMPTY; BANDS]; BANDS],
             detector_rms: [0.0; BANDS],
             gain_src: core::array::from_fn(|b| GainSrc::new(detector_factor[b], fs)),
             state: [[[[0.0; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS],
@@ -691,15 +690,14 @@ impl Run {
             legacy_split_allpass_state: [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
             legacy_merge_allpass_state: [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
             detector_state: [[[[0.0; 2]; MAX_DETECTOR_FILTERS]; BANDS]; MAX_CHANNELS],
-            overshoot_state: vec![0.0; MAX_CHANNELS * BANDS * BANDS * MAX_DETECTOR_FILTERS * 2]
-                .into_boxed_slice(),
+            overshoot_state: [[[[[0.0; 2]; MAX_DETECTOR_FILTERS]; BANDS]; BANDS]; MAX_CHANNELS],
         }
     }
 
     pub fn reset(&mut self) {
         self.env = [0.0; BANDS];
         self.detector_max = [SlidingMax::EMPTY; BANDS];
-        self.overshoot_max.fill(SlidingMax::EMPTY);
+        self.overshoot_max = [[SlidingMax::EMPTY; BANDS]; BANDS];
         self.detector_phase = [0; BANDS];
         self.detector_rms = [0.0; BANDS];
         for src in &mut self.gain_src {
@@ -710,7 +708,7 @@ impl Run {
         self.legacy_split_allpass_state = [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS];
         self.legacy_merge_allpass_state = [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS];
         self.detector_state = [[[[0.0; 2]; MAX_DETECTOR_FILTERS]; BANDS]; MAX_CHANNELS];
-        self.overshoot_state.fill(0.0);
+        self.overshoot_state = [[[[[0.0; 2]; MAX_DETECTOR_FILTERS]; BANDS]; BANDS]; MAX_CHANNELS];
     }
 
     pub fn latency(&self) -> usize {
@@ -798,11 +796,10 @@ impl Run {
                     let mut branch = v;
                     for i in 0..self.detector_path[analysis_band].count {
                         let s = self.detector_path[analysis_band].section[i];
-                        let z = (((c * BANDS + b) * BANDS + analysis_band) * MAX_DETECTOR_FILTERS + i) * 2;
-                        let o = s.b0 * branch + self.overshoot_state[z] as f64;
-                        let z1 = self.overshoot_state[z + 1];
-                        self.overshoot_state[z] = (s.b1 * branch - s.a1 * o + z1 as f64) as f32;
-                        self.overshoot_state[z + 1] = (s.b2 * branch - s.a2 * o) as f32;
+                        let z = &mut self.overshoot_state[c][b][analysis_band][i];
+                        let o = s.b0 * branch + z[0] as f64;
+                        z[0] = (s.b1 * branch - s.a1 * o + z[1] as f64) as f32;
+                        z[1] = (s.b2 * branch - s.a2 * o) as f32;
                         branch = o;
                     }
                     overshoot[b][analysis_band] = (branch.abs() * scale) as f32 as f64;
@@ -877,7 +874,7 @@ impl Run {
                     let mut held = if self.overshoot_compensation {
                         let mut sum = 0.0;
                         for analysis_band in 0..BANDS {
-                            sum += self.overshoot_max[b * BANDS + analysis_band]
+                            sum += self.overshoot_max[b][analysis_band]
                                 .push(overshoot[b][analysis_band], self.detector_window[b]);
                         }
                         sum
@@ -1200,12 +1197,12 @@ mod tests {
     fn reset_clears_the_detector_and_overshoot_bank() {
         let mut run = Run::new(&params(), 48_000.0, 1);
         run.env = [0.25; BANDS];
-        run.overshoot_state[0..2].fill(0.25);
-        run.overshoot_max[0].push(0.25, 8);
+        run.overshoot_state[0][0][0][0] = [0.25; 2];
+        run.overshoot_max[0][0].push(0.25, 8);
         run.reset();
         assert_eq!(run.env, [0.0; BANDS]);
-        assert_eq!(run.overshoot_state[0..2], [0.0; 2]);
-        assert_eq!(run.overshoot_max[0].len, 0);
+        assert_eq!(run.overshoot_state[0][0][0][0], [0.0; 2]);
+        assert_eq!(run.overshoot_max[0][0].len, 0);
     }
 
     #[test]
