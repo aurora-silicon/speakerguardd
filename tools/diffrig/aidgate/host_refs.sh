@@ -8,7 +8,7 @@ set -u
 SLOT=${1:?slot dir}; shift
 [ -f "$SLOT/owner" ] && grep -q '^SW-SWEEP' "$SLOT/owner" || { echo "need a host-heavy slot owned by SW-SWEEP"; exit 2; }
 G=$(cd "$(dirname "$0")" && pwd)
-BOXHOST=${BOXHOST:-/Volumes/AuroraS500/work/speakerguardd/VAT/tools/diffrig/macos/box_host}
+BOXHOST=${BOXHOST:-$G/macos/box_host}
 T27=${TUNINGS_NEW:-/Volumes/AuroraS500/reference/tunings/macos-27.2-26B8125}
 T25=${TUNINGS_HOST:-/System/Library/Audio/Tunings}
 SCR=${SWSWEEP_SCRATCH:?scratch}

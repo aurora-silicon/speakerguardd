@@ -134,6 +134,25 @@ def strip_bypassed(strip_path):
     return {e.get("displayname") for st in strip["strips"] for e in st["effects"] if e.get("bypass") in (1, True)}
 
 
+def propstrip(strip_path, tunings, aid):
+    """Property-strip properties per box: (kind, id, value); Path values point at this AID's
+    own DSP folder in the tree being rendered."""
+    p = strip_path[: -len(".austrip")] + ".propstrip"
+    out = {}
+    if not os.path.exists(p):
+        return out
+    for b in plistlib.load(open(p, "rb")).get("Boxes", []):
+        for pr in b.get("Properties", []):
+            if "Number" not in pr:
+                continue
+            if "UInt32" in pr:
+                out.setdefault(b["Name"], []).append(("--prop", pr["Number"], pr["UInt32"]))
+            elif "Path" in pr:
+                path = os.path.join(tunings, f"AID{aid}", "DSP", pr["Path"].split("/DSP/", 1)[1])
+                out.setdefault(b["Name"], []).append(("--plistprop", pr["Number"], path))
+    return out
+
+
 def preset_params(strip_path, name):
     """Global (scope 0, element 0) saved parameters of a strip effect's aupreset data blob."""
     strip = plistlib.load(open(strip_path, "rb"))
@@ -174,7 +193,7 @@ class Renderer:
     def __init__(self, args, strip, work):
         self.args, self.strip, self.work = args, strip, work
 
-    def box_host(self, name, sub, chans, sets, tag="run"):
+    def box_host(self, name, sub, chans, sets, tag="run", props=()):
         n = len(chans)
         fi, fo, fm = (os.path.join(self.work, f"{name}.{tag}.{e}") for e in ("in.f32", "out.f32", "json"))
         write_f32(fi, chans)
@@ -183,6 +202,8 @@ class Renderer:
                "--in", fi, "--out", fo, "--meta", fm, "--q", str(self.args.q), "--sr", str(self.args.sr)]
         for pid, val in sets:
             cmd += ["--set", f"{pid}={val!r}"]
+        for flag, pid, val in props:
+            cmd += [flag, f"{pid}={val}"]
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         if r.returncode:
             raise SystemExit(f"box_host {name}: rc={r.returncode} {r.stderr.strip()[-400:]}")
@@ -229,6 +250,7 @@ def main():
     os.makedirs(work, exist_ok=True)
     R = Renderer(args, strip, work)
     bypassed = strip_bypassed(strip)
+    props = propstrip(strip, args.tunings, args.aid)
 
     box_sets, padd_in = {}, {}
     for gname, bname, pid, rest in gparam:
@@ -309,7 +331,10 @@ def main():
                      array("f", (m[2] * a + m[3] * b for a, b in zip(x0, x1)))]
                 notes.append({"modelled_box": name, "law": "pchr 2x2 matrix (no installed AU)"})
             elif box.get("au"):
-                y, meta = R.box_host(name, t, [c for p in ports for c in p], box_sets.get(name, []))
+                y, meta = R.box_host(name, t, [c for p in ports for c in p], box_sets.get(name, []),
+                                     props=props.get(name, ()))
+                if props.get(name):
+                    notes.append({"propstrip": name, "props": [[f, i, str(v)] for f, i, v in props[name]]})
                 metas.append({"box": name, "subtype": t, "latency_s": meta["latency_s"],
                               "tail_s": meta["tail_s"], "sets": box_sets.get(name, [])})
             elif t == "nfnp" or t in WIRE_BUILTINS:

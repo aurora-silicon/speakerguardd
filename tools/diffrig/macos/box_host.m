@@ -154,6 +154,7 @@ int main(int argc, const char **argv) {
                    *meta_path = NULL, *stage_c = NULL,
                    *subtype_c = NULL, *factory_c = NULL;
         const char *sets[MAXSET] = {0};
+        UInt32 propIds[MAXSET], propVals[MAXSET], plistIds[MAXSET]; const char *plistPaths[MAXSET]; int nprop = 0, nplist = 0;
         int set_count = 0, channels = 0, quantum = 512;
         double sample_rate = 48000.0;
         bool inventory_only = false, no_preset = false;
@@ -171,6 +172,16 @@ int main(int argc, const char **argv) {
             else if (ARG("--q")) quantum = atoi(v);
             else if (ARG("--sr")) sample_rate = atof(v);
             else if (ARG("--set") && set_count < MAXSET) sets[set_count++] = v;
+            else if (ARG("--prop") && nprop < MAXSET) {
+                const char *eq = strchr(v, '=');
+                if (!eq) { fprintf(stderr, "bad --prop %s\n", v); return 2; }
+                propIds[nprop] = (UInt32)strtoul(v, NULL, 0); propVals[nprop++] = (UInt32)strtoul(eq + 1, NULL, 0);
+            }
+            else if (ARG("--plistprop") && nplist < MAXSET) {
+                const char *eq = strchr(v, '=');
+                if (!eq || !eq[1]) { fprintf(stderr, "bad --plistprop %s\n", v); return 2; }
+                plistIds[nplist] = (UInt32)strtoul(v, NULL, 0); plistPaths[nplist++] = eq + 1;
+            }
             else if (!strcmp(a, "--inventory")) inventory_only = true;
             else if (!strcmp(a, "--no-preset")) no_preset = true;
             else { fprintf(stderr, "bad arg: %s\n", a); return 2; }
@@ -198,6 +209,18 @@ int main(int argc, const char **argv) {
             fail_status(AudioUnitSetParameter(au, (AudioUnitParameterID)pid,
                                               kAudioUnitScope_Global, 0,
                                               value, 0), "set parameter");
+        }
+        // Property-strip properties of this box (the graph applies them before
+        // initialisation): --prop ID=U32 and --plistprop ID=PATH (plist contents).
+        for (int i = 0; i < nprop; ++i) {
+            UInt32 v = propVals[i];
+            fail_status(AudioUnitSetProperty(au, propIds[i], kAudioUnitScope_Global, 0, &v, sizeof v), "set --prop");
+        }
+        for (int i = 0; i < nplist; ++i) {
+            NSDictionary *pd = [NSDictionary dictionaryWithContentsOfFile:@(plistPaths[i])];
+            if (!pd) { fprintf(stderr, "bad --plistprop file %s\n", plistPaths[i]); return 2; }
+            CFDictionaryRef cd = (__bridge CFDictionaryRef)pd;
+            fail_status(AudioUnitSetProperty(au, plistIds[i], kAudioUnitScope_Global, 0, &cd, sizeof cd), "set --plistprop");
         }
         fail_status(AudioUnitInitialize(au), "AudioUnitInitialize");
 
