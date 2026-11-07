@@ -21,7 +21,7 @@ pub const BANDS: usize = 4;
 const XOVERS: usize = BANDS - 1;
 pub const MAX_AUTOMATION_POINTS: usize = 16;
 const MAX_FILTERS: usize = 32;
-const MAX_DETECTOR_FILTERS: usize = 32;
+const MAX_DETECTOR_FILTERS: usize = 10;
 const MAX_DETECTOR_WINDOW: usize = 1921;
 const QUADRATURE_STAGES: usize = 4;
 const MAX_GAIN_SRC_TAPS: usize = 225;
@@ -514,58 +514,6 @@ fn detector_paths(p: &Params, fs: f64) -> [DetectorPath; BANDS] {
     v
 }
 
-fn push_detector_lr(path: &mut DetectorPath, high: bool, n: usize, fc: f64, fs: f64) {
-    push_detector_butter(path, high, n / 2, fc, fs);
-    push_detector_butter(path, high, n / 2, fc, fs);
-    if high && (n / 2) % 2 == 1 {
-        path.push(Section { b0: -1.0, b1: 0.0, b2: 0.0, a1: 0.0, a2: 0.0 });
-    }
-}
-
-fn push_detector_allpass(path: &mut DetectorPath, n: usize, fc: f64, fs: f64) {
-    let mut allpass = Path::EMPTY;
-    push_lr_allpass(&mut allpass, n, fc, fs);
-    for section in &allpass.section[..allpass.count] {
-        path.push(*section);
-    }
-}
-
-/// Mode 4 measures the full Linkwitz-Riley band with its band timing, then
-/// takes the geometric mean with the matching allpass envelope. Magnitude is
-/// therefore one Butterworth half while the detector retains the full audio
-/// band's group delay. Quality 1 uses the sequential split/merge bank;
-/// quality 0 uses the middle-first tree.
-fn analytic_detector_paths(p: &Params, fs: f64) -> ([DetectorPath; BANDS], [DetectorPath; BANDS]) {
-    let mut band = [DetectorPath::EMPTY; BANDS];
-    let mut reference = [DetectorPath::EMPTY; BANDS];
-    let n = p.crossover_order.map(effective_order);
-    let f = p.crossover_hz;
-    if p.render_quality == 1 {
-        for b in 0..BANDS {
-            for stage in 0..b {
-                push_detector_lr(&mut band[b], true, n[stage], f[stage], fs);
-                push_detector_allpass(&mut reference[b], n[stage], f[stage], fs);
-            }
-            if b < XOVERS {
-                push_detector_lr(&mut band[b], false, n[b], f[b], fs);
-                push_detector_allpass(&mut reference[b], n[b], f[b], fs);
-            }
-        }
-    } else {
-        let tree = [[(1, false), (0, false)], [(1, false), (0, true)], [(1, true), (2, false)], [(1, true), (2, true)]];
-        for b in 0..BANDS {
-            for &(stage, high) in &tree[b] {
-                push_detector_lr(&mut band[b], high, n[stage], f[stage], fs);
-                push_detector_allpass(&mut reference[b], n[stage], f[stage], fs);
-            }
-            let phase_stage = if b < 2 { 2 } else { 0 };
-            push_detector_allpass(&mut band[b], n[phase_stage], f[phase_stage], fs);
-            push_detector_allpass(&mut reference[b], n[phase_stage], f[phase_stage], fs);
-        }
-    }
-    (band, reference)
-}
-
 #[inline]
 fn db_amp(db: f64) -> f64 {
     libm::pow(10.0, db / 20.0)
@@ -944,21 +892,6 @@ fn detector_factors(p: &Params) -> [usize; BANDS] {
     }
 }
 
-/// Algorithm zero runs its first mode-4 arm at a reduced band rate. The
-/// factor keeps the first image beyond the Butterworth stop-band budget:
-/// quality 0 uses 40 dB, quality 1 uses 50 dB, and an order-N Linkwitz-Riley
-/// edge has N/2 Butterworth poles at six dB per octave. The outer factor is
-/// the integral part of `fs / (2 * edge * 2^(budget / (6 * poles)))`.
-fn mode4_band0_factor(p: &Params, fs: f64) -> usize {
-    if p.algorithm != 0 || p.render_quality >= 2 || p.band[0].mode != BandMode::Active {
-        return 1;
-    }
-    let poles = (effective_order(p.crossover_order[0]) / 2).max(1) as f64;
-    let budget_db = if p.render_quality == 0 { 40.0 } else { 50.0 };
-    let separation = 2.0 * libm::pow(2.0, budget_db / (6.0 * poles));
-    libm::floor(fs / (separation * p.crossover_hz[0])).max(1.0) as usize
-}
-
 impl SlidingMax {
     const EMPTY: Self =
         Self { value: [0.0; MAX_DETECTOR_WINDOW], index: [0; MAX_DETECTOR_WINDOW], head: 0, len: 0, next: 0 };
@@ -1014,18 +947,9 @@ pub struct Run {
     detector_phase: [usize; BANDS],
     detector_max: [SlidingMax; BANDS],
     quadrature: [[QuadratureEnvelope; BANDS]; MAX_CHANNELS],
-    analytic_band_path: [DetectorPath; BANDS],
-    analytic_band_state: [[[[f32; 2]; MAX_DETECTOR_FILTERS]; BANDS]; MAX_CHANNELS],
-    detector_reference_path: [DetectorPath; BANDS],
-    detector_reference_state: [[[[f32; 2]; MAX_DETECTOR_FILTERS]; BANDS]; MAX_CHANNELS],
-    detector_reference_quadrature: [[QuadratureEnvelope; BANDS]; MAX_CHANNELS],
     overshoot_quadrature: [[[QuadratureEnvelope; BANDS]; BANDS]; MAX_CHANNELS],
     audio_quadrature: [QuadratureEnvelope; MAX_CHANNELS],
     mode4_gain: [Mode4Gain; BANDS],
-    mode4_old: [(f32, f32); BANDS],
-    mode4_new: [(f32, f32); BANDS],
-    mode4_band0_factor: usize,
-    mode4_phase: usize,
     hop_peak: bool,
     detector_hop: [f64; BANDS],
     gain_src: [GainSrc; BANDS],
@@ -1077,9 +1001,6 @@ impl Run {
                 0.0
             }
         });
-        let hop_peak = cadence(q) == Cadence::HopPeak;
-        let (analytic_band_path, detector_reference_path) = analytic_detector_paths(q, fs);
-        let mode4_band0_factor = mode4_band0_factor(q, fs);
         let mut run = Run {
             path: paths(q, fs),
             legacy_stage: legacy_stages(q, fs),
@@ -1107,22 +1028,10 @@ impl Run {
             detector_phase: [0; BANDS],
             detector_max: [SlidingMax::EMPTY; BANDS],
             quadrature: [[QuadratureEnvelope::default(); BANDS]; MAX_CHANNELS],
-            analytic_band_path,
-            analytic_band_state: [[[[0.0; 2]; MAX_DETECTOR_FILTERS]; BANDS]; MAX_CHANNELS],
-            detector_reference_path,
-            detector_reference_state: [[[[0.0; 2]; MAX_DETECTOR_FILTERS]; BANDS]; MAX_CHANNELS],
-            detector_reference_quadrature: [[QuadratureEnvelope::default(); BANDS]; MAX_CHANNELS],
             overshoot_quadrature: [[[QuadratureEnvelope::default(); BANDS]; BANDS]; MAX_CHANNELS],
             audio_quadrature: [QuadratureEnvelope::default(); MAX_CHANNELS],
-            mode4_gain: core::array::from_fn(|b| {
-                let rate = if b == 0 { fs / mode4_band0_factor as f64 } else { fs };
-                Mode4Gain::new(rate)
-            }),
-            mode4_old: [(1.0, 1.0); BANDS],
-            mode4_new: [(1.0, 1.0); BANDS],
-            mode4_band0_factor,
-            mode4_phase: 0,
-            hop_peak,
+            mode4_gain: core::array::from_fn(|_| Mode4Gain::new(fs)),
+            hop_peak: cadence(q) == Cadence::HopPeak,
             detector_hop: [0.0; BANDS],
             gain_src: core::array::from_fn(|b| GainSrc::new(detector_factor[b], fs)),
             state: [[[[0.0; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS],
@@ -1152,13 +1061,6 @@ impl Run {
                 envelope.reset();
             }
         }
-        self.analytic_band_state = [[[[0.0; 2]; MAX_DETECTOR_FILTERS]; BANDS]; MAX_CHANNELS];
-        self.detector_reference_state = [[[[0.0; 2]; MAX_DETECTOR_FILTERS]; BANDS]; MAX_CHANNELS];
-        for channel in &mut self.detector_reference_quadrature {
-            for envelope in channel {
-                envelope.reset();
-            }
-        }
         for channel in &mut self.overshoot_quadrature {
             for band in channel {
                 for envelope in band {
@@ -1173,9 +1075,6 @@ impl Run {
         for gain in &mut self.mode4_gain {
             gain.reset();
         }
-        self.mode4_old = [(1.0, 1.0); BANDS];
-        self.mode4_new = [(1.0, 1.0); BANDS];
-        self.mode4_phase = 0;
         self.state = [[[[0.0; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS];
         self.state_b = [[[[0.0; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS];
         self.legacy_high_state = [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS];
@@ -1323,31 +1222,7 @@ impl Run {
                 v = o;
             }
             let scale = self.band_in[b] * self.detector_bandwidth[b];
-            let magnitude = if self.hop_peak {
-                let mut band = x;
-                for i in 0..self.analytic_band_path[b].count {
-                    let s = self.analytic_band_path[b].section[i];
-                    let z = &mut self.analytic_band_state[c][b][i];
-                    let output = s.b0 * band + z[0] as f64;
-                    z[0] = (s.b1 * band - s.a1 * output + z[1] as f64) as f32;
-                    z[1] = (s.b2 * band - s.a2 * output) as f32;
-                    band = output;
-                }
-                let band_envelope = self.quadrature[c][b].push(band);
-                let mut reference = x;
-                for i in 0..self.detector_reference_path[b].count {
-                    let s = self.detector_reference_path[b].section[i];
-                    let z = &mut self.detector_reference_state[c][b][i];
-                    let output = s.b0 * reference + z[0] as f64;
-                    z[0] = (s.b1 * reference - s.a1 * output + z[1] as f64) as f32;
-                    z[1] = (s.b2 * reference - s.a2 * output) as f32;
-                    reference = output;
-                }
-                let reference_envelope = self.detector_reference_quadrature[c][b].push(reference);
-                libm::sqrt(band_envelope * reference_envelope)
-            } else {
-                v.abs()
-            };
+            let magnitude = if self.hop_peak { self.quadrature[c][b].push(v) } else { v.abs() };
             base[b] = (magnitude * scale) as f32 as f64;
             if self.overshoot_compensation {
                 let mut sum = 0.0;
@@ -1486,40 +1361,11 @@ impl Run {
                     self.detector_phase[b] = 0;
                 }
             }
-            let mut mode4 = [Mode4Mix::default(); BANDS];
-            if self.hop_peak {
-                let phase = self.mode4_phase;
-                self.mode4_phase += 1;
-                if self.mode4_phase == self.mode4_band0_factor {
-                    self.mode4_phase = 0;
-                }
-                for b in 0..BANDS {
-                    if b == 0 && self.mode4_band0_factor > 1 {
-                        if phase + 1 == self.mode4_band0_factor {
-                            let mix = self.mode4_gain[b].step(gain[b]);
-                            let direct = mix.correction_weight;
-                            let corrected = 1.0 - direct;
-                            self.mode4_old[b] = self.mode4_new[b];
-                            self.mode4_new[b] = (
-                                corrected * (mix.lowpass + mix.arm_a) + direct * mix.gain,
-                                corrected * (mix.lowpass + mix.arm_b) + direct * mix.gain,
-                            );
-                        }
-                        let (arm_a, arm_b) = if phase + 1 == self.mode4_band0_factor {
-                            self.mode4_old[b]
-                        } else {
-                            let fraction = (phase + 1) as f32 / self.mode4_band0_factor as f32;
-                            (
-                                self.mode4_old[b].0 + fraction * (self.mode4_new[b].0 - self.mode4_old[b].0),
-                                self.mode4_old[b].1 + fraction * (self.mode4_new[b].1 - self.mode4_old[b].1),
-                            )
-                        };
-                        mode4[b] = Mode4Mix { arm_a, arm_b, ..Mode4Mix::default() };
-                    } else {
-                        mode4[b] = self.mode4_gain[b].step(gain[b]);
-                    }
-                }
-            }
+            let mode4 = if self.hop_peak {
+                core::array::from_fn(|b| self.mode4_gain[b].step(gain[b]))
+            } else {
+                [Mode4Mix::default(); BANDS]
+            };
             for c in 0..n {
                 let mut processed = [0.0; BANDS];
                 for b in 0..BANDS {
@@ -1777,22 +1623,6 @@ mod tests {
     }
 
     #[test]
-    fn analytic_detector_keeps_full_band_timing_and_half_magnitude() {
-        let mut p = params();
-        p.algorithm = 0;
-        p.render_quality = 0;
-        let audio = paths(&p, 48_000.0);
-        let (band, reference) = analytic_detector_paths(&p, 48_000.0);
-        for b in 0..BANDS {
-            for f in [40.0, 200.0, 1000.0, 5000.0, 16_000.0] {
-                let expected = band_magnitude(&audio[b], f);
-                let measured = detector_band_magnitude(&band[b], f) * detector_band_magnitude(&reference[b], f);
-                assert!((expected - measured).abs() < 1e-10, "band {b} at {f} Hz: {expected} vs {measured}");
-            }
-        }
-    }
-
-    #[test]
     fn bandwidth_compensation_applies_the_normalized_band_width() {
         let mut p = params();
         p.crossover_hz = [400.0, 1600.0, 8000.0];
@@ -2019,29 +1849,6 @@ mod tests {
             }
             assert!((state.previous_output - 1.0).abs() < 2e-5);
         }
-    }
-
-    #[test]
-    fn algorithm_zero_band_zero_uses_the_stopband_rate_factor() {
-        let mut p = params();
-        p.algorithm = 0;
-        p.render_quality = 1;
-        p.crossover_hz[0] = 221.030_853_271_484_38;
-        p.band[0].mode = BandMode::Active;
-        let run = Run::new(&p, 48_000.0, 1);
-        assert_eq!(run.mode4_band0_factor, 6);
-        let k = libm::tan(core::f64::consts::PI * 50.0 / 8_000.0);
-        assert_eq!(run.mode4_gain[0].b, (k / (1.0 + k)) as f32);
-        let full_rate = libm::tan(core::f64::consts::PI * 50.0 / 48_000.0);
-        assert_eq!(run.mode4_gain[1].b, (full_rate / (1.0 + full_rate)) as f32);
-
-        p.render_quality = 0;
-        p.crossover_hz[0] = 100.0;
-        assert_eq!(Run::new(&p, 48_000.0, 1).mode4_band0_factor, 23);
-        p.crossover_hz[0] = 200.0;
-        assert_eq!(Run::new(&p, 96_000.0, 1).mode4_band0_factor, 23);
-        p.algorithm = 2;
-        assert_eq!(Run::new(&p, 48_000.0, 1).mode4_band0_factor, 1);
     }
 
     #[test]
