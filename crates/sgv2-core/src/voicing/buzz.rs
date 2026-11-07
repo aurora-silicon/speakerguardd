@@ -16,12 +16,116 @@ const TRACKS: usize = 50;
 const HOST_HOP: usize = 128;
 const ANALYSIS_RATE: f64 = 12_000.0;
 const DECIMATION: usize = 4;
-const FIR: usize = 33;
+const FIR: usize = 97;
 const MIN_HZ: f64 = 50.0;
 const MAX_HZ: [f64; 5] = [2500.0, 3000.0, 4000.0, 6000.0, 20_000.0];
 const MATCH_RELATIVE: f64 = 0.035_264_92;
 const REPLACE_GAIN: f64 = 0.82;
 const NOTCH_BANDWIDTH_HZ: f64 = 6.0;
+
+// The analysis path is a 4:1, 97-tap low-pass resampler. Its gain of two is
+// intentional: the transformed-spectrum thresholds use this amplitude domain.
+// Normalising these coefficients to unity leaves full-level lines below the
+// saved threshold and prevents the tracker from engaging.
+const FIR_COEFFICIENTS: [f64; FIR] = [
+    1.72128143e-20,
+    1.13013757e-05,
+    2.97373317e-05,
+    4.88926635e-05,
+    5.23911403e-05,
+    2.08011879e-05,
+    -5.71931487e-05,
+    -0.000170382104,
+    -0.000275706348,
+    -0.000303400098,
+    -0.000182146425,
+    0.000119562086,
+    0.000551495876,
+    0.000963210419,
+    0.00113146496,
+    0.00084096007,
+    -1.36345804e-18,
+    -0.00125418056,
+    -0.00251949672,
+    -0.00320996833,
+    -0.00276050158,
+    -0.000903327367,
+    0.0020905328,
+    0.00533255469,
+    0.00749515882,
+    0.00725257676,
+    0.00386968628,
+    -0.00227897777,
+    -0.00951246265,
+    -0.015152527,
+    -0.0163532551,
+    -0.0112452758,
+    8.49141844e-18,
+    0.0146492897,
+    0.027784884,
+    0.0336582139,
+    0.0277282801,
+    0.00876332633,
+    -0.019767249,
+    -0.049669344,
+    -0.0696450695,
+    -0.068290472,
+    -0.0376776122,
+    0.0235835277,
+    0.108866006,
+    0.204281732,
+    0.291651368,
+    0.352952898,
+    0.374997437,
+    0.352952898,
+    0.291651368,
+    0.204281732,
+    0.108866006,
+    0.0235835258,
+    -0.0376776122,
+    -0.0682904795,
+    -0.0696450546,
+    -0.049669344,
+    -0.0197672509,
+    0.0087633254,
+    0.0277282801,
+    0.0336582251,
+    0.0277848784,
+    0.0146492915,
+    8.49142009e-18,
+    -0.011245274,
+    -0.0163532551,
+    -0.0151525298,
+    -0.00951245985,
+    -0.00227897801,
+    0.00386968697,
+    0.00725257582,
+    0.00749515928,
+    0.00533255469,
+    0.0020905328,
+    -0.000903327425,
+    -0.00276050158,
+    -0.00320996833,
+    -0.00251949672,
+    -0.00125418056,
+    -1.36345804e-18,
+    0.00084096007,
+    0.00113146461,
+    0.000963210594,
+    0.000551495876,
+    0.000119562086,
+    -0.00018214641,
+    -0.000303400069,
+    -0.000275706407,
+    -0.000170382074,
+    -5.71931487e-05,
+    2.08011879e-05,
+    5.23911403e-05,
+    4.88926635e-05,
+    2.97373335e-05,
+    1.13013757e-05,
+    1.72128159e-20,
+];
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Band {
@@ -174,19 +278,6 @@ impl Run {
         let channels = channels.clamp(1, MAX_CHANNELS);
         let lookahead = libm::round(p.lookahead_s * fs).clamp(1.0, 2880.0) as usize;
         let release = 1.0 - libm::exp(-(HOST_HOP as f64) / (0.050 * fs));
-        let mut fir = core::array::from_fn(|n| {
-            let m = n as f64 - (FIR - 1) as f64 * 0.5;
-            let sinc = if m == 0.0 {
-                0.225
-            } else {
-                libm::sin(2.0 * core::f64::consts::PI * 0.1125 * m) / (core::f64::consts::PI * m)
-            };
-            sinc * (0.54 - 0.46 * libm::cos(2.0 * core::f64::consts::PI * n as f64 / (FIR - 1) as f64))
-        });
-        let fir_sum: f64 = fir.iter().sum();
-        for coefficient in &mut fir {
-            *coefficient /= fir_sum;
-        }
         Run {
             channels,
             fs,
@@ -199,7 +290,7 @@ impl Run {
             history_len: 0,
             hop: HOST_HOP,
             decimation_at: 0,
-            fir,
+            fir: FIR_COEFFICIENTS,
             fir_state: [0.0; FIR],
             fir_at: 0,
             threshold_db: p.threshold_db,
@@ -265,7 +356,10 @@ impl Run {
         let q = libm::sqrt(dre * dre + dim * dim) / (magnitude + 1.0e-20);
         let denominator = libm::sqrt(2.0 * (1.0 - libm::cos(q))).max(1.0e-20);
         let frequency_hz = ANALYSIS_RATE / (2.0 * core::f64::consts::PI) * q * q / denominator;
-        (core::f64::consts::FRAC_1_SQRT_2 * magnitude, frequency_hz)
+        // A real-input transform publishes twice the positive-frequency
+        // complex magnitude. Converting that convention to line RMS leaves
+        // sqrt(2) times the direct complex sum used here.
+        (core::f64::consts::SQRT_2 * magnitude, frequency_hz)
     }
 
     fn redesign(&mut self, index: usize) {
@@ -404,5 +498,17 @@ mod tests {
         r.process(&mut [&mut z], 512);
         assert!(z.iter().all(|v| *v == 0.0));
         assert_eq!(r.latency(), 384);
+    }
+
+    #[test]
+    fn a_full_level_line_crosses_the_analysis_threshold() {
+        let p = Params { threshold_db: -9.75, ..Default::default() };
+        let mut r = Run::new(&p, 48_000.0, 1);
+        let mut x = [0.0; 4096];
+        for (frame, sample) in x.iter_mut().enumerate() {
+            *sample = libm::sin(2.0 * core::f64::consts::PI * 1600.0 * frame as f64 / 48_000.0) as f32;
+        }
+        r.process(&mut [&mut x], 4096);
+        assert!(r.tracks.iter().any(|track| track.gain < 0.7));
     }
 }
