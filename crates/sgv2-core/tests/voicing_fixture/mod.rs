@@ -99,7 +99,7 @@ pub fn spec(lanes: usize) -> Spec {
             highpass_hz: 0.0,
             highpass_location: 0,
         })),
-        Kind::Buzz(Box::new(voicing::buzz::Params)),
+        Kind::Buzz(Box::default()),
         Kind::Cdelay(Box::new(voicing::cdelay::Params { channels: 2, delay_frames: [0; MAX_CHANNELS] })),
         Kind::Pchr(Box::new(voicing::pchr::Params {
             channels: 2.0,
