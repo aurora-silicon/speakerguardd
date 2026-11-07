@@ -176,9 +176,9 @@ pub fn load_unit(
             Err(_) => fail(LoadError::Blob),
         }
     } else if h.unit == UnitKind::Lsm2 as u32 {
-        match lsm2::Params::from_blob(bytes) {
-            Ok(p) if lsm2::Unit::init_error(&p).is_none() => {
-                (AnyUnit::Lsm2(Box::new(lsm2::Unit::new(p))), None, engine_crc)
+        match lsm2::Unit::from_blob(bytes) {
+            Ok(unit) if unit.companion().is_some() || !unit.is_failsafe() => {
+                (AnyUnit::Lsm2(Box::new(unit)), None, engine_crc)
             }
             Ok(_) => fail(LoadError::Refused),
             Err(_) => fail(LoadError::Blob),

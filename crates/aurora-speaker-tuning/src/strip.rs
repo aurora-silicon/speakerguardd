@@ -104,6 +104,8 @@ pub enum PropValue {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Property {
     pub number: u32,
+    pub scope: u32,
+    pub element: u32,
     pub value: PropValue,
 }
 
@@ -115,7 +117,7 @@ pub struct PropBox {
 
 impl PropBox {
     pub fn property(&self, number: u32) -> Option<&PropValue> {
-        self.properties.iter().find(|p| p.number == number).map(|p| &p.value)
+        self.properties.iter().find(|p| p.number == number && p.scope == 0 && p.element == 0).map(|p| &p.value)
     }
 }
 
@@ -137,12 +139,24 @@ impl PropStrip {
             for (pi, p) in array(b, "Properties", &ctx)?.iter().enumerate() {
                 let pctx = format!("{ctx} ({name}).Properties[{pi}]");
                 let p = p.as_dict().ok_or_else(|| Error::format(&pctx, "property is not a dictionary"))?;
-                let number = match p.get("Number") {
-                    Some(Value::Integer(n)) if (0..=u32::MAX as i128).contains(n) => *n as u32,
-                    Some(o) => return Err(Error::format(&pctx, format!("Number is {o:?}"))),
-                    None => return Err(Error::missing(&pctx, "Number")),
+                if p.get("Number").is_some() && p.get("PropertyID").is_some() {
+                    return Err(Error::format(&pctx, "both Number and PropertyID are present"));
+                }
+                let selector = |key: &str, default: Option<u32>| -> Result<u32> {
+                    match p.get(key) {
+                        None => default.ok_or_else(|| Error::missing(&pctx, key)),
+                        Some(v) => match v.as_number() {
+                            Some(n) if n.is_finite() && n >= 0.0 && n <= u32::MAX as f64 && n.fract() == 0.0 => {
+                                Ok(n as u32)
+                            }
+                            _ => Err(Error::format(&pctx, format!("{key} is not an unsigned selector"))),
+                        },
+                    }
                 };
-                let mut reprs = p.iter().filter(|(k, _)| *k != "Number");
+                let number = selector(if p.get("Number").is_some() { "Number" } else { "PropertyID" }, None)?;
+                let scope = selector("Scope", Some(0))?;
+                let element = selector("Element", Some(0))?;
+                let mut reprs = p.iter().filter(|(k, _)| !matches!(*k, "Number" | "PropertyID" | "Scope" | "Element"));
                 let (key, v) = reprs.next().ok_or_else(|| Error::format(&pctx, "property has no value"))?;
                 if reprs.next().is_some() {
                     return Err(Error::format(&pctx, "property has more than one value"));
@@ -154,10 +168,10 @@ impl PropStrip {
                     ("Path", o) => return Err(Error::format(&pctx, format!("Path value is a {}", o.kind()))),
                     (k, o) => PropValue::Other { key: k.to_string(), repr: format!("{o:?}"), value: o.clone() },
                 };
-                if properties.iter().any(|q| q.number == number) {
+                if properties.iter().any(|q| q.number == number && q.scope == scope && q.element == element) {
                     return Err(Error::format(&pctx, format!("property {number} set twice")));
                 }
-                properties.push(Property { number, value });
+                properties.push(Property { number, scope, element, value });
             }
             if boxes.iter().any(|x| x.name == name) {
                 return Err(Error::format(&ctx, format!("box {name} listed twice")));

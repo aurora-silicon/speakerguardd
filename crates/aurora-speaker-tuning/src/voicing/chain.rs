@@ -105,6 +105,7 @@ fn compile_node(
         t.chain.iter().find(|s| s.name == n.name).ok_or_else(|| bad(format!("box {} is not in the chain", n.name)))?;
     Ok(match &n.kind {
         NodeKind::NonFinite => Kind::NonFinite,
+        NodeKind::Sum { .. } => Kind::Sum(n.out_width()),
         NodeKind::Gain => Kind::Gain,
         NodeKind::Unit { .. } if n.bypass => Kind::Bypass,
         NodeKind::Unit { subtype } => match subtype.as_str() {
