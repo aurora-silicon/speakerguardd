@@ -198,7 +198,7 @@ impl Run {
         for start in (0..n).step_by(512) {
             let end = (start + 512).min(n);
             if let Some(startup) = &self.params.startup {
-                if self.phase < 2 && self.fade_at >= startup.crossfade_frames {
+                if self.phase < 2 && self.fade_at > startup.crossfade_frames {
                     self.phase += 1;
                     self.fade_at = 0;
                 }
@@ -315,6 +315,21 @@ mod tests {
         let (mut l, mut r) = ([1.0; 6], [1.0; 6]);
         run.process(&mut [&mut l, &mut r], 6);
         assert_eq!(l, [0.5; 6]);
+    }
+
+    #[test]
+    fn a_fade_endpoint_on_a_boundary_is_rendered_before_queue_handoff() {
+        let p = scaled_identity(0.25).with_startup(scaled_identity(1.0), scaled_identity(0.5), 4).unwrap();
+        let mut run = Run::new(&p, 48_000.0, 2);
+        let (mut l, mut r) = ([1.0; 4], [1.0; 4]);
+        run.process(&mut [&mut l, &mut r], 4);
+        assert_eq!(l, [1.0, 0.875, 0.75, 0.625]);
+        let (mut l, mut r) = ([1.0; 4], [1.0; 4]);
+        run.process(&mut [&mut l, &mut r], 4);
+        assert_eq!(l, [0.5; 4]);
+        let (mut l, mut r) = ([1.0; 4], [1.0; 4]);
+        run.process(&mut [&mut l, &mut r], 4);
+        assert_eq!(l, [0.5, 0.4375, 0.375, 0.3125]);
     }
 
     #[test]
