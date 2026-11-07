@@ -938,7 +938,8 @@ impl Run {
                 v = o;
             }
             let scale = self.band_in[b] * self.detector_bandwidth[b];
-            let magnitude = if matches!(self.algorithm, 0 | 2) { self.analytic[c][b].push(v) } else { v.abs() };
+            let magnitude =
+                if matches!(self.algorithm, 0 | 2) { v.abs().max(self.analytic[c][b].push(v)) } else { v.abs() };
             base[b] = (magnitude * scale) as f32 as f64;
             if self.overshoot_compensation {
                 let mut sum = 0.0;
@@ -953,7 +954,7 @@ impl Run {
                         branch = o;
                     }
                     sum += if matches!(self.algorithm, 0 | 2) {
-                        self.overshoot_analytic[c][b][analysis_band].push(branch)
+                        branch.abs().max(self.overshoot_analytic[c][b][analysis_band].push(branch))
                     } else {
                         branch.abs()
                     };
