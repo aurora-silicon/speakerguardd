@@ -363,6 +363,11 @@ context.objects = [
             node.group             = "{n['group']}"
             node.force-quantum     = {QUANTUM}
             node.lock-quantum      = true
+            # The PCM runs at audio.rate only, and resampling is off. A
+            # node's allowed rates do not hold the graph rate: when this
+            # driver (re)starts, PipeWire takes the highest rate of its
+            # followers, so a lone 44.1 kHz client moves the graph to 44.1 kHz.
+            node.force-rate        = {c['rate']}
             priority.driver        = 2000
             priority.session       = 0
             node.autoconnect       = false

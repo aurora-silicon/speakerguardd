@@ -329,6 +329,15 @@ class Generated(unittest.TestCase):
             self.assertIn("node.disabled = true", wp_new)
 
 
+    def test_the_amps_sink_holds_the_graph_at_its_pcm_rate(self):
+        for m in gen.machines():
+            c, w = gen.machine(m)
+            for voicing_pre in (False, True):
+                text = gen.pipewire_conf(m, c, w, voicing_pre=voicing_pre)
+                sink = text.split("factory.name           = api.alsa.pcm.sink", 1)[1].split("}", 1)[0]
+                self.assertIn(f"audio.rate             = {c['rate']}", sink)
+                self.assertIn(f"node.force-rate        = {c['rate']}", sink)
+
     def test_generated_files_are_current(self):
         import subprocess
         import sys
