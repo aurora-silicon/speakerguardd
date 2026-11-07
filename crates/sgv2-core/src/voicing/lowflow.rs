@@ -9,15 +9,15 @@
 //! every lane receives the fixed delay. `SystemVolume` changes only the
 //! saved attenuation ceiling; [`Run::set_volume`] is RT-safe.
 //!
-//! The default (exact) build is a fixed-hop STFT gain shaper: each 128-frame
+//! The default (exact) build is a fixed-hop STFT gain shaper. Each 128-frame
 //! hop, the velocity target from the two previously completed hops sets a
 //! water-fill cap on the Hann-window magnitudes of the affected bins, and the
 //! per-bin gains (immediate attack, saved release) scale the square-root Hann
-//! analysis spectrum before overlap-add. The acoustic mask is held at its
-//! 0 dB floor: the velocity limit is non-decreasing in the mask and the
-//! unit's mask never reads below that floor, so this build never takes more
-//! masking credit than the unit. HF masking credit (a higher limit while the
-//! saved mask band carries content) is not taken yet.
+//! analysis spectrum before overlap-add. A separate non-overlapping detector
+//! transforms `latency + 128` input frames through a unit-energy Hann. It
+//! applies the saved LF/HF response magnitudes, reduces squared magnitudes on
+//! the unit's 99-band grid, and smooths the resulting linked mask level. The
+//! detector reads the input lanes before the fixed output delay.
 //!
 //! The optional `lowflow-conservative` compile feature is deliberately not an
 //! exact-law claim. It applies a fixed ceiling 6 dB below the saved
@@ -36,12 +36,15 @@ pub const RESPONSE_TAPS: usize = 1024;
 pub const MAX_MODELS: usize = MAX_CHANNELS / 2;
 #[cfg(not(feature = "lowflow-conservative"))]
 const SPECTRAL_HOP: usize = 128;
+#[cfg(not(feature = "lowflow-conservative"))]
+const MASK_BANDS: usize = 99;
+#[cfg(not(feature = "lowflow-conservative"))]
+const MASK_DIRECT_BANDS: usize = 74;
+#[cfg(not(feature = "lowflow-conservative"))]
+const MASK_REFERENCE_FS: f64 = 48_000.0;
 const MODEL_SCALARS: usize = 28;
 const MAX_FS: f64 = 192_000.0;
 const CONSERVATIVE_GUARD_DB: f64 = 6.0;
-/// Floor of the unit's acoustic-mask level (dB); the mask never reads lower.
-#[cfg(not(feature = "lowflow-conservative"))]
-const MASK_FLOOR_DB: f64 = 0.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Model {
@@ -396,6 +399,10 @@ struct State {
     #[cfg(not(feature = "lowflow-conservative"))]
     velocity_history: [f64; 2],
     #[cfg(not(feature = "lowflow-conservative"))]
+    mask: MaskDetector,
+    #[cfg(not(feature = "lowflow-conservative"))]
+    mask_output_db: f64,
+    #[cfg(not(feature = "lowflow-conservative"))]
     spectral: Spectral,
 }
 
@@ -411,6 +418,217 @@ impl Complex {
     fn mul(self, other: Self) -> Self {
         Self { re: self.re * other.re - self.im * other.im, im: self.re * other.im + self.im * other.re }
     }
+}
+
+/// Non-overlapping acoustic-mask analyzer. The transform is intentionally
+/// independent of the 128-frame limiter STFT: a completed `n`-frame detector
+/// block updates one held mask value, while limiter hops between updates use
+/// that value unchanged.
+#[cfg(not(feature = "lowflow-conservative"))]
+struct MaskDetector {
+    n: usize,
+    at: usize,
+    low: Box<[Complex]>,
+    high: Box<[Complex]>,
+    scratch: Box<[Complex]>,
+    twiddles: Box<[Complex]>,
+    window: Box<[f64]>,
+    pressure_magnitude: Box<[f64]>,
+    tweeter_magnitude: Box<[f64]>,
+    boundaries: [usize; MASK_BANDS],
+    band_energy: [f64; MASK_BANDS],
+    mask_start: usize,
+    mask_end: usize,
+    concentration: f64,
+    peak_db: f64,
+    db: f64,
+    attack: f64,
+    release: f64,
+}
+
+#[cfg(not(feature = "lowflow-conservative"))]
+impl MaskDetector {
+    fn new(model: &Model, fs: f64, latency: usize) -> Self {
+        let n = latency.saturating_add(SPECTRAL_HOP).clamp(2 * SPECTRAL_HOP, 4 * SPECTRAL_HOP);
+        let mut window = vec![0.0; n];
+        for (i, value) in window.iter_mut().enumerate() {
+            let phase = 2.0 * core::f64::consts::PI * i as f64 / n as f64;
+            *value = 0.5 - 0.5 * libm::cos(phase);
+        }
+        let norm = libm::sqrt(window.iter().map(|value| value * value).sum::<f64>()).max(1.0e-30);
+        for value in &mut window {
+            *value /= norm;
+        }
+        let mut twiddles = vec![Complex::default(); n];
+        for (i, value) in twiddles.iter_mut().enumerate() {
+            let phase = -2.0 * core::f64::consts::PI * i as f64 / n as f64;
+            *value = Complex { re: libm::cos(phase), im: libm::sin(phase) };
+        }
+        let pressure_magnitude = response_magnitude(&model.pressure_response, n, model.analog_gain, &twiddles);
+        let tweeter_magnitude = response_magnitude(&model.tweeter_response, n, model.tweeter_gain, &twiddles);
+        let boundaries = mask_boundaries(n);
+        let lower_hz = |band: usize| {
+            if band == 0 {
+                0.0
+            } else {
+                boundaries[band - 1] as f64 * MASK_REFERENCE_FS / n as f64
+            }
+        };
+        let upper_hz = |band: usize| boundaries[band] as f64 * MASK_REFERENCE_FS / n as f64;
+        let closest = |hz: f64, edge: &dyn Fn(usize) -> f64| {
+            (0..MASK_BANDS).min_by(|a, b| (edge(*a) - hz).abs().total_cmp(&(edge(*b) - hz).abs())).unwrap_or(0)
+        };
+        let mask_start = closest(model.mask_band_min_hz, &lower_hz);
+        let mask_end = closest(model.mask_band_max_hz, &upper_hz).max(mask_start + 1).min(MASK_BANDS);
+        Self {
+            n,
+            at: 0,
+            low: vec![Complex::default(); n].into_boxed_slice(),
+            high: vec![Complex::default(); n].into_boxed_slice(),
+            scratch: vec![Complex::default(); n].into_boxed_slice(),
+            twiddles: twiddles.into_boxed_slice(),
+            window: window.into_boxed_slice(),
+            pressure_magnitude,
+            tweeter_magnitude,
+            boundaries,
+            band_energy: [0.0; MASK_BANDS],
+            mask_start,
+            mask_end,
+            concentration: 1.0,
+            peak_db: 0.0,
+            db: 0.0,
+            attack: hop_coefficient(model.mask_attack_s, fs),
+            release: hop_coefficient(model.mask_release_s, fs),
+        }
+    }
+
+    fn reset(&mut self) {
+        self.at = 0;
+        self.low.fill(Complex::default());
+        self.high.fill(Complex::default());
+        self.scratch.fill(Complex::default());
+        self.band_energy.fill(0.0);
+        self.concentration = 1.0;
+        self.peak_db = 0.0;
+        self.db = 0.0;
+    }
+
+    /// Adds one pre-delay LF/HF frame and returns a new smoothed level when a
+    /// complete detector transform has been reduced.
+    fn push(&mut self, low: f32, high: f32) -> Option<f64> {
+        self.low[self.at] = Complex { re: f64::from(finite(low)) * self.window[self.at], im: 0.0 };
+        self.high[self.at] = Complex { re: f64::from(finite(high)) * self.window[self.at], im: 0.0 };
+        self.at += 1;
+        if self.at != self.n {
+            return None;
+        }
+        self.at = 0;
+        transform(&mut self.low, &mut self.scratch, &self.twiddles, false);
+        transform(&mut self.high, &mut self.scratch, &self.twiddles, false);
+        let bin_count = self.n / 2 + 1;
+        let mut sum = 0.0;
+        let mut square_sum = 0.0;
+        for bin in 0..bin_count {
+            // vDSP's real forward DFT has a factor of two. The response path
+            // removes its own factor with 0.5; the program path retains it.
+            let low = 2.0 * complex_magnitude(self.low[bin]) * self.pressure_magnitude[bin];
+            let high = 2.0 * complex_magnitude(self.high[bin]) * self.tweeter_magnitude[bin];
+            let magnitude = low + high;
+            sum += magnitude;
+            square_sum += magnitude * magnitude;
+            if bin < MASK_DIRECT_BANDS {
+                self.band_energy[bin] = magnitude * magnitude;
+            } else if bin < self.band_energy.len() {
+                self.band_energy[bin] = 0.0;
+            }
+            self.scratch[bin].re = magnitude * magnitude;
+        }
+        let concentration = libm::sqrt(bin_count as f64 * square_sum) / (sum + 1.0e-9);
+        self.concentration = 0.1 * self.concentration + 0.9 * concentration;
+        for band in MASK_DIRECT_BANDS..MASK_BANDS {
+            let start = self.boundaries[band - 1].min(bin_count);
+            let end = self.boundaries[band].clamp(start + 1, bin_count);
+            self.band_energy[band] =
+                self.scratch[start..end].iter().map(|value| value.re).sum::<f64>() / (end - start) as f64;
+        }
+        let region = &mut self.band_energy[self.mask_start..self.mask_end];
+        region.sort_by(f64::total_cmp);
+        let middle = region.len() / 2;
+        let median = if region.len() % 2 == 0 { 0.5 * (region[middle - 1] + region[middle]) } else { region[middle] };
+        let raw_db = 10.0 * libm::log10(libm::fabs(median + 1.0e-30) + 1.0e-20) + 97.0
+            - 4.0 * (self.concentration.clamp(1.0, 4.0) - 1.0);
+        if raw_db > self.peak_db + 3.0 || raw_db < self.peak_db - 12.0 {
+            self.peak_db = raw_db;
+        }
+        let alpha = if self.peak_db > self.db { self.attack } else { self.release };
+        self.db += alpha * (self.peak_db - self.db);
+        self.low.fill(Complex::default());
+        self.high.fill(Complex::default());
+        Some(self.db)
+    }
+}
+
+#[cfg(not(feature = "lowflow-conservative"))]
+fn complex_magnitude(value: Complex) -> f64 {
+    libm::sqrt(value.re * value.re + value.im * value.im)
+}
+
+#[cfg(not(feature = "lowflow-conservative"))]
+fn response_magnitude(taps: &[f64], n: usize, gain: f64, twiddles: &[Complex]) -> Box<[f64]> {
+    let mut bins = vec![Complex::default(); n];
+    for (dst, tap) in bins.iter_mut().zip(taps) {
+        dst.re = *tap;
+    }
+    let mut scratch = vec![Complex::default(); n];
+    transform(&mut bins, &mut scratch, twiddles, false);
+    bins[..n / 2 + 1]
+        .iter()
+        .copied()
+        .map(|value| complex_magnitude(value) * gain)
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
+}
+
+#[cfg(not(feature = "lowflow-conservative"))]
+fn mask_boundaries(n: usize) -> [usize; MASK_BANDS] {
+    let mut centres = [0.0; MASK_BANDS];
+    for (index, centre) in centres.iter_mut().enumerate() {
+        *centre = bark_hz(index as f64 * 0.25) * n as f64 / MASK_REFERENCE_FS;
+    }
+    let mut cumulative = [0; MASK_BANDS];
+    cumulative[0] = (libm::round(centres[0]) as usize).max(1);
+    for index in 1..MASK_BANDS {
+        let width = (libm::round(centres[index] - centres[index - 1]) as usize).max(1);
+        cumulative[index] = cumulative[index - 1] + width;
+    }
+    let mut provisional = [0; MASK_BANDS];
+    provisional[0] = 1;
+    for index in 1..MASK_BANDS {
+        provisional[index] = (cumulative[index - 1] + 1).max(libm::round(centres[index]) as usize);
+    }
+    let mut widths = [0; MASK_BANDS - 1];
+    for (index, width) in widths.iter_mut().enumerate() {
+        *width = provisional[index + 1] - provisional[index];
+    }
+    widths.sort_unstable();
+    let mut boundaries = [0; MASK_BANDS];
+    boundaries[0] = 1;
+    for index in 1..MASK_BANDS {
+        boundaries[index] = boundaries[index - 1] + widths[index - 1];
+    }
+    boundaries
+}
+
+#[cfg(not(feature = "lowflow-conservative"))]
+fn bark_hz(bark: f64) -> f64 {
+    let adjusted = if bark < 2.0 {
+        (bark - 0.3) / 0.85
+    } else if bark > 20.1 {
+        (bark + 4.422) / 1.22
+    } else {
+        bark
+    };
+    1960.0 * (adjusted + 0.53) / (26.28 - adjusted)
 }
 
 /// Fixed-hop frequency-selective gain application. Construction allocates all
@@ -519,7 +737,6 @@ impl Spectral {
 
     fn render_hop(&mut self, io: &mut [f32]) {
         debug_assert_eq!(io.len(), SPECTRAL_HOP);
-        self.update_gains();
         for i in 0..self.n {
             let bin = if i <= self.n / 2 { i } else { self.n - i };
             self.bins[i].re *= self.gains[bin];
@@ -656,8 +873,7 @@ fn fft_pow2(values: &mut [Complex], twiddles: &[Complex], inverse: bool) {
 pub struct Run {
     channels: usize,
     models: usize,
-    #[cfg(feature = "lowflow-conservative")]
-    link_energies: bool,
+    link_masks: bool,
     params: [Model; MAX_MODELS],
     state: Box<[State]>,
     line: Box<[f32]>,
@@ -726,14 +942,17 @@ impl Run {
                 #[cfg(not(feature = "lowflow-conservative"))]
                 velocity_history: [0.0; 2],
                 #[cfg(not(feature = "lowflow-conservative"))]
+                mask: MaskDetector::new(m, fs, params.latency_frames),
+                #[cfg(not(feature = "lowflow-conservative"))]
+                mask_output_db: 0.0,
+                #[cfg(not(feature = "lowflow-conservative"))]
                 spectral: Spectral::new(m, fs, params.latency_frames),
             });
         }
         let mut run = Self {
             channels,
             models,
-            #[cfg(feature = "lowflow-conservative")]
-            link_energies: params.link_channel_energies,
+            link_masks: params.link_channel_energies,
             params: params.models,
             state: state.into_boxed_slice(),
             line: vec![0.0; channels * params.latency_frames].into_boxed_slice(),
@@ -788,6 +1007,8 @@ impl Run {
                 state.velocity_block_frames = 0;
                 state.hop_velocity = 0.0;
                 state.velocity_history = [0.0; 2];
+                state.mask.reset();
+                state.mask_output_db = 0.0;
                 state.spectral.reset();
             }
         }
@@ -825,7 +1046,7 @@ impl Run {
                     velocities[c] = state.velocity_scale * libm::fabs(velocity);
                 }
             }
-            if self.link_energies && self.models > 1 {
+            if self.link_masks && self.models > 1 {
                 let total: f64 = energies[..self.models].iter().sum();
                 energies[..self.models].fill(total);
             }
@@ -885,8 +1106,12 @@ impl Run {
             let full_hop = chunk_frames == SPECTRAL_HOP;
             for frame in chunk_at..chunk_at + chunk_frames {
                 for c in 0..self.models {
-                    let woofer = f64::from(finite(bufs[c][frame]));
+                    let woofer_sample = finite(bufs[c][frame]);
+                    let tweeter_sample =
+                        if c + self.models < channels { finite(bufs[c + self.models][frame]) } else { 0.0 };
+                    let woofer = f64::from(woofer_sample);
                     let state = &mut self.state[c];
+                    state.mask.push(woofer_sample, tweeter_sample);
                     let velocity = state.cone.run(woofer) + state.front.run(woofer);
                     state.velocity_block_energy += velocity * velocity;
                     state.velocity_block_frames += 1;
@@ -898,6 +1123,16 @@ impl Run {
                         state.hop_velocity = state.hop_velocity.max(rms);
                         state.velocity_block_energy = 0.0;
                         state.velocity_block_frames = 0;
+                    }
+                }
+                if self.link_masks && self.models > 1 {
+                    let linked = self.state[..self.models].iter().map(|state| state.mask.db).fold(0.0_f64, f64::max);
+                    for state in &mut self.state[..self.models] {
+                        state.mask_output_db = linked;
+                    }
+                } else {
+                    for state in &mut self.state[..self.models] {
+                        state.mask_output_db = state.mask.db.max(0.0);
                     }
                 }
                 for c in 0..channels {
@@ -915,23 +1150,27 @@ impl Run {
             }
             if full_hop && !self.conservative_fallback {
                 for c in 0..self.models {
+                    let model = &self.params[c];
+                    let state = &mut self.state[c];
+                    let limit = velocity_limit(model, state.mask_output_db);
+                    let target = detector_target(model.enabled, model.mute, state.floor, limit, state.velocity_history);
+                    state.spectral.set_target(target);
+                    // The unit solves and releases the gain vector from the
+                    // preceding detector spectrum before it transforms the
+                    // current input hop. The released vector is then applied
+                    // to the current complex spectrum.
+                    state.spectral.update_gains();
+                    // The target controls the frame already in flight, so the
+                    // just-completed detector hop becomes history afterwards.
+                    state.velocity_history = [state.hop_velocity, state.velocity_history[0]];
+                    state.hop_velocity = 0.0;
+                }
+                for c in 0..self.models {
                     self.state[c].spectral.prepare_hop(&bufs[c][chunk_at..chunk_at + chunk_frames]);
                 }
                 for c in 0..self.models {
                     let model = &self.params[c];
                     let state = &mut self.state[c];
-                    // The unit's acoustic mask is a dB level clamped at
-                    // MASK_FLOOR_DB, and the velocity limit is non-decreasing
-                    // in it. Holding the mask at its floor therefore never
-                    // allows more velocity than the unit does; HF masking
-                    // credit is not taken until its producer is carried.
-                    let limit = velocity_limit(model, MASK_FLOOR_DB);
-                    let target = detector_target(model.enabled, model.mute, state.floor, limit, state.velocity_history);
-                    state.spectral.set_target(target);
-                    // The target controls the frame already in flight, so the
-                    // just-completed detector hop becomes history afterwards.
-                    state.velocity_history = [state.hop_velocity, state.velocity_history[0]];
-                    state.hop_velocity = 0.0;
                     if model.mute {
                         bufs[c][chunk_at..chunk_at + chunk_frames].fill(0.0);
                         state.spectral.reset();
@@ -1194,6 +1433,34 @@ mod tests {
 
     #[cfg(not(feature = "lowflow-conservative"))]
     #[test]
+    fn mask_grid_has_the_recovered_384_point_boundaries() {
+        let boundaries = mask_boundaries(384);
+        for (index, boundary) in boundaries[..MASK_DIRECT_BANDS].iter().enumerate() {
+            assert_eq!(*boundary, index + 1);
+        }
+        assert_eq!(
+            &boundaries[MASK_DIRECT_BANDS..],
+            &[
+                76, 78, 80, 82, 84, 86, 88, 90, 92, 95, 98, 101, 104, 107, 111, 115, 119, 124, 129, 135, 141, 148, 156,
+                165, 175
+            ]
+        );
+    }
+
+    #[cfg(not(feature = "lowflow-conservative"))]
+    #[test]
+    fn mask_reads_high_lane_before_its_output_delay() {
+        let p = synthetic();
+        let mut run = Run::new(&p, 48_000.0, 4);
+        let mut b = [vec![0.0; 384], vec![0.0; 384], sine(8_000.0, 0.7, 384), vec![0.0; 384]];
+        let mut refs: Vec<&mut [f32]> = b.iter_mut().map(Vec::as_mut_slice).collect();
+        run.process(&mut refs, 384);
+        assert!(run.state[0].mask.db > 0.0);
+        assert!(run.state[0].mask_output_db > 0.0);
+    }
+
+    #[cfg(not(feature = "lowflow-conservative"))]
+    #[test]
     fn flagged_fallback_uses_guarded_ceiling() {
         let mut p = synthetic();
         p.conservative_fallback = true;
@@ -1265,6 +1532,7 @@ mod tests {
             assert!(run.state.iter().all(|s| s.spectral.gains.iter().all(|g| *g == 1.0)));
             assert!(run.state.iter().all(|s| s.spectral.history.iter().all(|v| *v == 0.0)));
             assert!(run.state.iter().all(|s| s.velocity_history == [0.0; 2]));
+            assert!(run.state.iter().all(|s| s.mask.db == 0.0 && s.mask.at == 0));
         }
     }
 }
