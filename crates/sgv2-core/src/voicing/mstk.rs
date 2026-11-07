@@ -617,6 +617,7 @@ pub struct Run {
     detector_factor: [usize; BANDS],
     detector_phase: [usize; BANDS],
     detector_max: [SlidingMax; BANDS],
+    overshoot_max: [[SlidingMax; BANDS]; BANDS],
     detector_rms: [f64; BANDS],
     gain_src: [GainSrc; BANDS],
     state: [[[[f64; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS],
@@ -681,6 +682,7 @@ impl Run {
             detector_factor,
             detector_phase: [0; BANDS],
             detector_max: [SlidingMax::EMPTY; BANDS],
+            overshoot_max: [[SlidingMax::EMPTY; BANDS]; BANDS],
             detector_rms: [0.0; BANDS],
             gain_src: core::array::from_fn(|b| GainSrc::new(detector_factor[b], fs)),
             state: [[[[0.0; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS],
@@ -695,6 +697,7 @@ impl Run {
     pub fn reset(&mut self) {
         self.env = [0.0; BANDS];
         self.detector_max = [SlidingMax::EMPTY; BANDS];
+        self.overshoot_max = [[SlidingMax::EMPTY; BANDS]; BANDS];
         self.detector_phase = [0; BANDS];
         self.detector_rms = [0.0; BANDS];
         for src in &mut self.gain_src {
@@ -773,9 +776,10 @@ impl Run {
     }
 
     #[inline]
-    fn detect(&mut self, c: usize, x: f64) -> [f64; BANDS] {
-        let mut out = [0.0; BANDS];
-        for (b, y) in out.iter_mut().enumerate() {
+    fn detect(&mut self, c: usize, x: f64) -> ([f64; BANDS], [[f64; BANDS]; BANDS]) {
+        let mut direct = [0.0; BANDS];
+        let mut overshoot = [[0.0; BANDS]; BANDS];
+        for b in 0..BANDS {
             let mut v = x;
             for i in 0..self.detector_path[b].count {
                 let s = self.detector_path[b].section[i];
@@ -785,8 +789,9 @@ impl Run {
                 z[1] = (s.b2 * v - s.a2 * o) as f32;
                 v = o;
             }
-            let magnitude = if self.overshoot_compensation {
-                let mut sum = 0.0;
+            let scale = self.band_in[b] * self.detector_bandwidth[b];
+            direct[b] = (v.abs() * scale) as f32 as f64;
+            if self.overshoot_compensation {
                 for analysis_band in 0..BANDS {
                     let mut branch = v;
                     for i in 0..self.detector_path[analysis_band].count {
@@ -797,15 +802,11 @@ impl Run {
                         z[1] = (s.b2 * branch - s.a2 * o) as f32;
                         branch = o;
                     }
-                    sum += branch.abs();
+                    overshoot[b][analysis_band] = (branch.abs() * scale) as f32 as f64;
                 }
-                sum
-            } else {
-                v.abs()
-            };
-            *y = (magnitude * self.band_in[b] * self.detector_bandwidth[b]) as f32 as f64;
+            }
         }
-        out
+        (direct, overshoot)
     }
 
     fn gain(&mut self, b: usize) -> f64 {
@@ -851,21 +852,35 @@ impl Run {
         let mut bands = [[0.0; BANDS]; MAX_CHANNELS];
         for i in 0..frames {
             let mut detector = [0.0f64; BANDS];
+            let mut overshoot = [[0.0f64; BANDS]; BANDS];
             for c in 0..n {
                 let x = bufs[c].get(i).copied().unwrap_or(0.0);
                 let x = if x.is_finite() { x.clamp(-INPUT_BOUND, INPUT_BOUND) as f64 } else { 0.0 };
                 let input = self.in_gain * x;
                 bands[c] = self.split(c, input);
-                let detected = self.detect(c, input);
+                let (detected, detected_overshoot) = self.detect(c, input);
                 for b in 0..BANDS {
                     detector[b] = detector[b].max(detected[b]);
+                    for analysis_band in 0..BANDS {
+                        overshoot[b][analysis_band] =
+                            overshoot[b][analysis_band].max(detected_overshoot[b][analysis_band]);
+                    }
                 }
             }
             let mut gain = [0.0; BANDS];
             for (b, p) in detector.into_iter().enumerate() {
                 let update = self.detector_phase[b] == 0;
                 let input = if update {
-                    let mut held = self.window_max(b, p);
+                    let mut held = if self.overshoot_compensation {
+                        let mut sum = 0.0;
+                        for analysis_band in 0..BANDS {
+                            sum += self.overshoot_max[b][analysis_band]
+                                .push(overshoot[b][analysis_band], self.detector_window[b]);
+                        }
+                        sum
+                    } else {
+                        self.window_max(b, p)
+                    };
                     if self.algorithm0 {
                         let alpha = 1.0 / self.detector_window[b] as f64;
                         self.detector_rms[b] += alpha * (p * p - self.detector_rms[b]);
@@ -1183,9 +1198,11 @@ mod tests {
         let mut run = Run::new(&params(), 48_000.0, 1);
         run.env = [0.25; BANDS];
         run.overshoot_state[0][0][0][0] = [0.25; 2];
+        run.overshoot_max[0][0].push(0.25, 8);
         run.reset();
         assert_eq!(run.env, [0.0; BANDS]);
         assert_eq!(run.overshoot_state[0][0][0][0], [0.0; 2]);
+        assert_eq!(run.overshoot_max[0][0].len, 0);
     }
 
     #[test]
