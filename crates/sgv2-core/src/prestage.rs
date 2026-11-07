@@ -827,6 +827,8 @@ struct DynamicRun {
     component: Section,
     detector_state: [f32; 2],
     component_state: [[f32; 2]; MAX_CHANNELS],
+    conservative_detector_state: [f64; 2],
+    conservative_component_state: [[f64; 2]; MAX_CHANNELS],
     quadrature: [Section; 2],
     quadrature_state: [[f32; 2]; 2],
     control_phase: usize,
@@ -896,6 +898,8 @@ impl DynamicRun {
             component,
             detector_state: [0.0; 2],
             component_state: [[0.0; 2]; MAX_CHANNELS],
+            conservative_detector_state: [0.0; 2],
+            conservative_component_state: [[0.0; 2]; MAX_CHANNELS],
             quadrature,
             quadrature_state: [[0.0; 2]; 2],
             control_phase: 0,
@@ -928,6 +932,8 @@ impl DynamicRun {
     fn reset(&mut self) {
         self.detector_state = [0.0; 2];
         self.component_state = [[0.0; 2]; MAX_CHANNELS];
+        self.conservative_detector_state = [0.0; 2];
+        self.conservative_component_state = [[0.0; 2]; MAX_CHANNELS];
         self.quadrature_state = [[0.0; 2]; 2];
         self.control_phase = 0;
         self.response_gain = 1.0;
@@ -970,6 +976,14 @@ impl DynamicRun {
     }
 
     #[inline]
+    fn step_conservative_f64(section: &Section, state: &mut [f64; 2], input: f64) -> f64 {
+        let output = section.b0 * input + state[0];
+        state[0] = section.b1 * input - section.a1 * output + state[1];
+        state[1] = section.b2 * input - section.a2 * output;
+        output
+    }
+
+    #[inline]
     fn step_df1_f32(section: &Section, state: &mut [f32; 4], input: f32) -> f32 {
         let (b0, b1, b2, a1, a2) =
             (section.b0 as f32, section.b1 as f32, section.b2 as f32, section.a1 as f32, section.a2 as f32);
@@ -1005,6 +1019,53 @@ impl DynamicRun {
         (((a * t + b) * t + c) * t + d).clamp(libm::exp(lo * core::f64::consts::LN_10 / 20.0), 1.0)
     }
 
+    /// Conservative substitute for the installed type-18 spectral
+    /// controller. Its peak-equivalent detector, gentle ratio bound and
+    /// retained release never ask for less cut than the installed unit on
+    /// the qualification matrix, while the exact spectral reconstruction
+    /// remains unavailable.
+    // TODO(SPEC): replace this bound only after the type-18 spectral control
+    // reconstruction is decoded and independently qualified.
+    fn process_conservative_high_shelf(&mut self, at: &DynamicAt, bufs: &mut [&mut [f32]], frames: usize, n: usize) {
+        let sidechains = (0..n).filter(|c| at.sidechain_mask >> c & 1 != 0).count();
+        let mut sum_sq = 0.0;
+        let mut peak = 0.0f64;
+        for i in 0..frames {
+            let mut input = 0.0;
+            for (c, buf) in bufs.iter().enumerate().take(n) {
+                if at.sidechain_mask >> c & 1 != 0 {
+                    let v = buf[i];
+                    input += if v.is_finite() { f64::from(v.clamp(-INPUT_BOUND, INPUT_BOUND)) } else { 0.0 };
+                }
+            }
+            input /= sidechains as f64;
+            let detected = Self::step_conservative_f64(&self.detector, &mut self.conservative_detector_state, input);
+            sum_sq += detected * detected;
+            peak = peak.max(detected.abs());
+        }
+        let rms = libm::sqrt(sum_sq / frames as f64);
+        let measured = (core::f64::consts::SQRT_2 * rms).max(peak);
+        let coefficient =
+            if measured >= self.envelope { 0.0 } else { libm::exp(-(frames as f64) / (500.0 * self.fs / 1_000.0)) };
+        self.envelope += (1.0 - coefficient) * (measured - self.envelope);
+        let mut curve = at.params;
+        curve.threshold_db -= 20.0 * libm::log10(core::f64::consts::SQRT_2);
+        curve.ratio = curve.ratio.min(core::f64::consts::SQRT_2);
+        let gain = Self::curve(&curve, self.envelope);
+        for (c, buf) in bufs.iter_mut().enumerate().take(n) {
+            if at.active_mask >> c & 1 == 0 {
+                continue;
+            }
+            for sample in buf.iter_mut().take(frames) {
+                let input = if sample.is_finite() { f64::from(sample.clamp(-INPUT_BOUND, INPUT_BOUND)) } else { 0.0 };
+                let component =
+                    Self::step_conservative_f64(&self.component, &mut self.conservative_component_state[c], input);
+                let output = input + (gain - 1.0) * component;
+                *sample = if output.is_finite() { output as f32 } else { 0.0 };
+            }
+        }
+    }
+
     fn set_response_gain(&mut self, gain: f64) {
         if gain != self.response_gain {
             self.carrier_settle_frames = 0;
@@ -1029,6 +1090,10 @@ impl DynamicRun {
         }
         let sidechains = (0..n).filter(|c| at.sidechain_mask >> c & 1 != 0).count();
         if sidechains == 0 {
+            return;
+        }
+        if at.params.kind == DynamicKind::HighShelf && !at.params.smooth {
+            self.process_conservative_high_shelf(at, bufs, frames, n);
             return;
         }
         if at.params.smooth {
@@ -1667,6 +1732,8 @@ mod tests {
 
         let detector_state = run.detector_state;
         let component_state = run.component_state;
+        let conservative_detector_state = run.conservative_detector_state;
+        let conservative_component_state = run.conservative_component_state;
         let quadrature_state = run.quadrature_state;
         let reconstruction_state = run.reconstruction_state;
         let phase = run.control_phase;
@@ -1684,6 +1751,8 @@ mod tests {
         run.reconfigure(&moved, 48_000.0);
         assert_eq!(run.detector_state, detector_state);
         assert_eq!(run.component_state, component_state);
+        assert_eq!(run.conservative_detector_state, conservative_detector_state);
+        assert_eq!(run.conservative_component_state, conservative_component_state);
         assert_eq!(run.quadrature_state, quadrature_state);
         assert_eq!(run.reconstruction_state, reconstruction_state);
         assert_eq!(run.control_phase, phase);

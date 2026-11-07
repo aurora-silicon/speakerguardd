@@ -1,13 +1,22 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026 The Aurora Silicon Contributors
 # SPDX-License-Identifier: MIT
-"""Offline per-box differential rig: installed Audio Unit versus v2.
+"""Per-box differential rig: one box of a Mac's speaker graph, macOS vs v2.
 
-The same interleaved f32 programs are rendered by ``box_host`` with the
-tuning's saved state and by ``voicing-box-render``. Output derived from an
-installed tuning belongs in an ignored work directory, never in the source
-tree. Steady cases compare the second-half RMS; burst and level-step cases
-compare every non-silent 10 ms window.
+macOS side: the installed unit through `box_host` with the strip's saved
+state. v2 side: `voicing-box-render` (aurora-speaker-tuning example), which
+compiles the same saved state as provisioning does and runs v2's box.
+Both render the same signals offline: steady sines on a third-octave grid
+at several input levels and pink noise at several levels, identical on
+every box channel. Per case and channel it reports the steady-state RMS of
+each side (second half of the render) and v2 minus macOS in dB.
+
+    box_rig.py --tunings DIR --aid N --box NAME --ch C --v2 PATH/voicing-box-render \
+        --work DIR [--json OUT] [--levels 0,-6,-12,-24,-40] [--tol 0.05]
+
+Exit 0 when v2 is at or below macOS + tol on every case and channel. Nothing
+is played; outputs made with Apple tuning are Apple-derived (keep them out
+of the repository; --work is deleted case by case).
 """
 
 import argparse
@@ -27,19 +36,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 FS = 48000
 FREQS = [25, 31.5, 40, 50, 63, 80, 100, 125, 160, 200, 250, 315, 400, 500, 630, 800, 1000, 1250,
          1600, 2000, 2500, 3150, 4000, 5000, 6300, 8000, 10000, 12500, 16000]
-FACTORY = {
-    "mstk": "AUMeisterStueckFactory",
-    "tmst": "AUToneMeisterFactory",
-    "vben": "AUVirtualBassFactory",
-    "ldnm": "AULoudnessNormalizerFactory",
-    "vrq2": "AUVariableEQV2Factory",
-    "axtc": "AUXTCFactory",
-    "cfrk": "AUControlFreakFactory",
-    "buzk": "AUBuzzKillFactory",
-    "cdly": "AUChannelSpecificDelayFactory",
-    "volt": "AUVolumeTaperFactory",
-    "flow": "AULowFlowFactory",
-}
+FACTORY = {"mstk": "AUMeisterStueckFactory", "tmst": "AUToneMeisterFactory", "vben": "AUVirtualBassFactory",
+           "ldnm": "AULoudnessNormalizerFactory", "vrq2": "AUVariableEQV2Factory", "axtc": "AUXTCFactory",
+           "cfrk": "AUControlFreakFactory", "buzk": "AUBuzzKillFactory", "cdly": "AUChannelSpecificDelayFactory",
+           "volt": "AUVolumeTaperFactory", "flow": "AULowFlowFactory"}
 
 
 def floats(path):
@@ -111,35 +111,16 @@ def split_v2(a):
 
 def pink(n, seed=1):
     rng = np.random.default_rng(seed)
-    spectrum = np.fft.rfft(rng.standard_normal(n))
-    bins = np.arange(len(spectrum), dtype=float)
-    bins[0] = 1.0
-    out = np.fft.irfft(spectrum / np.sqrt(bins), n)
-    return out / np.max(np.abs(out))
+    f = np.fft.rfft(rng.standard_normal(n))
+    k = np.arange(len(f), dtype=float)
+    k[0] = 1.0
+    p = np.fft.irfft(f / np.sqrt(k), n)
+    return p / np.max(np.abs(p))
 
 
 def rms_db(y):
-    steady = y[len(y) // 2:]
-    return [float(20 * np.log10(np.sqrt(np.mean(steady[:, c] ** 2)) + 1e-15)) for c in range(y.shape[1])]
-
-
-def window_metrics(mac, v2, frames=480):
-    """Per-channel worst v2-minus-reference over non-overlapping windows."""
-    out = []
-    for channel in range(mac.shape[1]):
-        best = (-1e9, 0.0, 0.0, 0)
-        minimum = 1e9
-        for start in range(0, len(mac) - frames + 1, frames):
-            left = float(20 * np.log10(np.sqrt(np.mean(mac[start:start + frames, channel] ** 2)) + 1e-15))
-            right = float(20 * np.log10(np.sqrt(np.mean(v2[start:start + frames, channel] ** 2)) + 1e-15))
-            if left <= -100.0:
-                continue
-            diff = right - left
-            minimum = min(minimum, diff)
-            if diff > best[0]:
-                best = (diff, left, right, start)
-        out.append({"diff_db": best[0], "mac_db": best[1], "v2_db": best[2], "frame": best[3], "min_diff_db": minimum})
-    return out
+    h = y[len(y) // 2:]
+    return [float(20 * np.log10(np.sqrt(np.mean(h[:, c] ** 2)) + 1e-15)) for c in range(y.shape[1])]
 
 
 def window_diff_db(v2, mac, frames, floor_db):
@@ -280,7 +261,7 @@ def main():
             for pid in (0, 1, 4, 11, 13):
                 mac_cmd += ["--set", f"{pid}=0"]
             for slot in range(50):
-                if slot != args.slot:
+                if slot != a.slot:
                     mac_cmd += ["--set", f"{14 + 10 * slot}=0"]
         r = subprocess.run(mac_cmd, capture_output=True, text=True)
         if r.returncode:

@@ -74,7 +74,7 @@ fn tone(
             format!("tmst volume automation carried at its least-passing setting (entries {partial:?})"),
         ));
     }
-    if !tone.dynamic.is_empty() {
+    if tone.dynamic.iter().any(|d| d.params.kind == sgv2_core::prestage::DynamicKind::Notch) {
         gaps.push((
             stage.name.clone(),
             "level-dependent filters carry native multirate reconstruction and a knee-qualified release-to-idle carrier handoff; active-floor and release-tracking parity are pending"
