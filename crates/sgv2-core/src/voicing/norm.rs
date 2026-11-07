@@ -699,7 +699,11 @@ impl Run {
             pos: 0,
             z: [[[0.0; 2]; MAX_SECTIONS]; MAX_CHANNELS],
             ema: 0.0,
-            ema_a: libm::exp(-1.0 / (p.detector_ema_s * fs)),
+            ema_a: if p.algorithm1 {
+                f64::from(libm::expf(-1.0 / (p.detector_ema_s as f32 * fs as f32)))
+            } else {
+                libm::exp(-1.0 / (p.detector_ema_s * fs))
+            },
             in_step: 0,
             steps: 0,
             blocks: 0,
@@ -945,7 +949,13 @@ impl Run {
                 let x = b.get(n).copied().filter(|v| v.is_finite()).unwrap_or(0.0);
                 power += self.detect(ch, f64::from(x));
             }
-            self.ema = self.ema_a * self.ema + (1.0 - self.ema_a) * power.max(1e-12);
+            if self.p.algorithm1 {
+                let y = self.ema as f32;
+                let x = power.max(1e-12) as f32;
+                self.ema = f64::from(y + (1.0 - self.ema_a as f32) * (x - y));
+            } else {
+                self.ema = self.ema_a * self.ema + (1.0 - self.ema_a) * power.max(1e-12);
+            }
             if self.in_step == 0 {
                 self.on_step();
                 if self.p.algorithm1 && self.steps_in_call < self.step_target.len() {
