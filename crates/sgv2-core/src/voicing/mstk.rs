@@ -6,9 +6,12 @@
 //! The parameter compiler supplies the Audio Unit's saved controls.  This
 //! module contains no machine tuning.  Detection uses the Butterworth half
 //! of each Linkwitz-Riley band and is linked by taking the largest channel
-//! magnitude.  Overshoot compensation sends each band-local detector signal
-//! through the same four-band analysis bank once more and sums the four
-//! magnitudes.  Audio filtering and saturation remain per channel.
+//! magnitude.  Algorithms zero and two measure a phase-invariant complex
+//! envelope; algorithm three retains the real-waveform estimator.  Overshoot
+//! compensation sends each band-local detector signal through the same
+//! four-band analysis bank once more and max-links that separate magnitude
+//! arm into the ordinary detector state.  Audio filtering and saturation
+//! remain per channel.
 //! Construction owns all storage; [`Run::process`] allocates
 //! nothing and accepts arbitrary frame counts.
 
@@ -19,6 +22,7 @@ const XOVERS: usize = BANDS - 1;
 const MAX_FILTERS: usize = 32;
 const MAX_DETECTOR_FILTERS: usize = 10;
 const MAX_DETECTOR_WINDOW: usize = 1921;
+const ANALYTIC_ORDER: usize = 12;
 const MAX_GAIN_SRC_TAPS: usize = 225;
 const INPUT_BOUND: f32 = 16.0;
 const CURVE_POINTS: usize = 11;
@@ -492,6 +496,103 @@ struct SlidingMax {
     next: u64,
 }
 
+/// Streaming analytic-signal producer used by detector algorithms 0 and 2.
+///
+/// This is a Rust translation of Signalsmith's 0BSD `hilbert-iir` realization
+/// (<https://github.com/Signalsmith-Audio/hilbert-iir>): a continuous-time
+/// design expressed as twelve parallel complex one-pole
+/// filters and converted to the render rate by impulse invariance.  The public
+/// design constants are independent of any captured response or machine
+/// tuning.  Its real component has unity passband gain; the complex magnitude
+/// is consequently the phase-invariant envelope used by the peak hold.
+#[derive(Clone, Copy)]
+struct AnalyticEnvelope {
+    coeff_real: [f32; ANALYTIC_ORDER],
+    coeff_imag: [f32; ANALYTIC_ORDER],
+    pole_real: [f32; ANALYTIC_ORDER],
+    pole_imag: [f32; ANALYTIC_ORDER],
+    state_real: [f32; ANALYTIC_ORDER],
+    state_imag: [f32; ANALYTIC_ORDER],
+    direct: f32,
+}
+
+impl AnalyticEnvelope {
+    const COEFFICIENT: [(f64, f64); ANALYTIC_ORDER] = [
+        (-0.000_224_352_093_802, 0.005_434_990_182_01),
+        (0.010_750_055_781_5, -0.017_389_068_568_1),
+        (-0.045_679_587_391_7, 0.022_916_693_142_9),
+        (0.112_825_005_82, 0.002_784_136_612_37),
+        (-0.208_067_578_452, -0.104_628_958_675),
+        (0.287_178_375_01, 0.336_192_397_19),
+        (-0.254_675_294_431, -0.683_033_899_655),
+        (0.048_108_183_502_6, 0.954_061_589_374),
+        (0.227_861_357_867, -0.891_273_574_569),
+        (-0.365_411_839_137, 0.525_088_317_271),
+        (0.280_729_061_131, -0.155_131_206_606),
+        (-0.093_506_178_772_8, 0.005_122_458_554_04),
+    ];
+    const POLE: [(f64, f64); ANALYTIC_ORDER] = [
+        (-0.004_953_359_764_78, 0.009_257_987_687_2),
+        (-0.017_859_491_302, 0.027_349_372_554_3),
+        (-0.041_371_437_315_5, 0.074_475_691_028_7),
+        (-0.088_214_840_888_5, 0.178_349_677_457),
+        (-0.179_229_658_12, 0.396_013_402_23),
+        (-0.338_261_800_753, 0.829_229_533_354),
+        (-0.557_688_699_732, 1.612_985_383_28),
+        (-0.735_157_736_148, 2.799_873_986_82),
+        (-0.719_057_381_172, 4.163_961_661_28),
+        (-0.517_871_025_209, 5.297_248_268_04),
+        (-0.280_197_469_471, 5.995_986_023_88),
+        (-0.085_275_135_453_1, 6.304_849_237_7),
+    ];
+
+    fn new(fs: f64) -> Self {
+        let frequency_factor = (20_000.0 / fs).min(0.46);
+        let passband_gain = 2.0;
+        let mut out = Self {
+            coeff_real: [0.0; ANALYTIC_ORDER],
+            coeff_imag: [0.0; ANALYTIC_ORDER],
+            pole_real: [0.0; ANALYTIC_ORDER],
+            pole_imag: [0.0; ANALYTIC_ORDER],
+            state_real: [0.0; ANALYTIC_ORDER],
+            state_imag: [0.0; ANALYTIC_ORDER],
+            direct: (0.000_262_057_212_648 * 2.0 * passband_gain * frequency_factor) as f32,
+        };
+        for i in 0..ANALYTIC_ORDER {
+            out.coeff_real[i] = (Self::COEFFICIENT[i].0 * frequency_factor * passband_gain) as f32;
+            out.coeff_imag[i] = (Self::COEFFICIENT[i].1 * frequency_factor * passband_gain) as f32;
+            let magnitude = libm::exp(Self::POLE[i].0 * frequency_factor);
+            let phase = Self::POLE[i].1 * frequency_factor;
+            out.pole_real[i] = (magnitude * libm::cos(phase)) as f32;
+            out.pole_imag[i] = (magnitude * libm::sin(phase)) as f32;
+        }
+        out
+    }
+
+    fn reset(&mut self) {
+        self.state_real = [0.0; ANALYTIC_ORDER];
+        self.state_imag = [0.0; ANALYTIC_ORDER];
+    }
+
+    #[inline]
+    fn push(&mut self, input: f64) -> f64 {
+        let input = input as f32;
+        let mut real = input * self.direct;
+        let mut imag = 0.0f32;
+        for i in 0..ANALYTIC_ORDER {
+            let old_real = self.state_real[i];
+            let old_imag = self.state_imag[i];
+            let new_real = old_real * self.pole_real[i] - old_imag * self.pole_imag[i] + input * self.coeff_real[i];
+            let new_imag = old_real * self.pole_imag[i] + old_imag * self.pole_real[i] + input * self.coeff_imag[i];
+            self.state_real[i] = new_real;
+            self.state_imag[i] = new_imag;
+            real += new_real;
+            imag += new_imag;
+        }
+        libm::sqrt((real * real + imag * imag) as f64)
+    }
+}
+
 /// Causal polyphase-equivalent interpolator used for a reduced-rate gain
 /// vector. The reference algorithm constructs the FIR by convolving a normalized
 /// one-millisecond sine window with the linear interpolation kernel. Running
@@ -608,7 +709,7 @@ pub struct Run {
     curve_top_db: f64,
     release: [f64; BANDS],
     release_on: bool,
-    algorithm0: bool,
+    algorithm: u32,
     legacy_recombination: bool,
     overshoot_compensation: bool,
     channels: usize,
@@ -617,7 +718,8 @@ pub struct Run {
     detector_factor: [usize; BANDS],
     detector_phase: [usize; BANDS],
     detector_max: [SlidingMax; BANDS],
-    detector_rms: [f64; BANDS],
+    analytic: [[AnalyticEnvelope; BANDS]; MAX_CHANNELS],
+    overshoot_analytic: [[[AnalyticEnvelope; BANDS]; BANDS]; MAX_CHANNELS],
     gain_src: [GainSrc; BANDS],
     state: [[[[f64; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS],
     legacy_high_state: [[[[f64; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
@@ -672,7 +774,7 @@ impl Run {
             curve_top_db,
             release,
             release_on: q.release_on,
-            algorithm0: q.algorithm == 0,
+            algorithm: q.algorithm,
             legacy_recombination: q.render_quality == 1 && q.algorithm < 3,
             overshoot_compensation: q.overshoot_compensation,
             channels: channels.min(MAX_CHANNELS),
@@ -681,7 +783,10 @@ impl Run {
             detector_factor,
             detector_phase: [0; BANDS],
             detector_max: [SlidingMax::EMPTY; BANDS],
-            detector_rms: [0.0; BANDS],
+            analytic: core::array::from_fn(|_| core::array::from_fn(|_| AnalyticEnvelope::new(fs))),
+            overshoot_analytic: core::array::from_fn(|_| {
+                core::array::from_fn(|_| core::array::from_fn(|_| AnalyticEnvelope::new(fs)))
+            }),
             gain_src: core::array::from_fn(|b| GainSrc::new(detector_factor[b], fs)),
             state: [[[[0.0; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS],
             legacy_high_state: [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
@@ -696,7 +801,18 @@ impl Run {
         self.env = [0.0; BANDS];
         self.detector_max = [SlidingMax::EMPTY; BANDS];
         self.detector_phase = [0; BANDS];
-        self.detector_rms = [0.0; BANDS];
+        for channel in &mut self.analytic {
+            for envelope in channel {
+                envelope.reset();
+            }
+        }
+        for channel in &mut self.overshoot_analytic {
+            for band in channel {
+                for envelope in band {
+                    envelope.reset();
+                }
+            }
+        }
         for src in &mut self.gain_src {
             src.reset();
         }
@@ -773,9 +889,10 @@ impl Run {
     }
 
     #[inline]
-    fn detect(&mut self, c: usize, x: f64) -> [f64; BANDS] {
-        let mut out = [0.0; BANDS];
-        for (b, y) in out.iter_mut().enumerate() {
+    fn detect(&mut self, c: usize, x: f64) -> ([f64; BANDS], [f64; BANDS]) {
+        let mut base = [0.0; BANDS];
+        let mut overshoot = [0.0; BANDS];
+        for b in 0..BANDS {
             let mut v = x;
             for i in 0..self.detector_path[b].count {
                 let s = self.detector_path[b].section[i];
@@ -785,7 +902,10 @@ impl Run {
                 z[1] = (s.b2 * v - s.a2 * o) as f32;
                 v = o;
             }
-            let magnitude = if self.overshoot_compensation {
+            let scale = self.band_in[b] * self.detector_bandwidth[b];
+            let magnitude = if matches!(self.algorithm, 0 | 2) { self.analytic[c][b].push(v) } else { v.abs() };
+            base[b] = (magnitude * scale) as f32 as f64;
+            if self.overshoot_compensation {
                 let mut sum = 0.0;
                 for analysis_band in 0..BANDS {
                     let mut branch = v;
@@ -797,15 +917,16 @@ impl Run {
                         z[1] = (s.b2 * branch - s.a2 * o) as f32;
                         branch = o;
                     }
-                    sum += branch.abs();
+                    sum += if matches!(self.algorithm, 0 | 2) {
+                        self.overshoot_analytic[c][b][analysis_band].push(branch)
+                    } else {
+                        branch.abs()
+                    };
                 }
-                sum
-            } else {
-                v.abs()
-            };
-            *y = (magnitude * self.band_in[b] * self.detector_bandwidth[b]) as f32 as f64;
+                overshoot[b] = (sum * scale) as f32 as f64;
+            }
         }
-        out
+        (base, overshoot)
     }
 
     fn gain(&mut self, b: usize) -> f64 {
@@ -851,29 +972,30 @@ impl Run {
         let mut bands = [[0.0; BANDS]; MAX_CHANNELS];
         for i in 0..frames {
             let mut detector = [0.0f64; BANDS];
+            let mut overshoot = [0.0f64; BANDS];
             for c in 0..n {
                 let x = bufs[c].get(i).copied().unwrap_or(0.0);
                 let x = if x.is_finite() { x.clamp(-INPUT_BOUND, INPUT_BOUND) as f64 } else { 0.0 };
                 let input = self.in_gain * x;
                 bands[c] = self.split(c, input);
-                let detected = self.detect(c, input);
+                let (detected, overshoot_arm) = self.detect(c, input);
                 for b in 0..BANDS {
                     detector[b] = detector[b].max(detected[b]);
+                    overshoot[b] = overshoot[b].max(overshoot_arm[b]);
                 }
             }
             let mut gain = [0.0; BANDS];
-            for (b, p) in detector.into_iter().enumerate() {
+            for (b, mut p) in detector.into_iter().enumerate() {
                 let update = self.detector_phase[b] == 0;
                 let input = if update {
-                    let mut held = self.window_max(b, p);
-                    if self.algorithm0 {
-                        let alpha = 1.0 / self.detector_window[b] as f64;
-                        self.detector_rms[b] += alpha * (p * p - self.detector_rms[b]);
-                        let rms = libm::sqrt(2.0 * self.detector_rms[b]).max(1e-12);
-                        let crest_db = (20.0 * libm::log10(held / rms)).clamp(0.0, 6.0);
-                        let crest_weight = if b == 0 { 0.52 } else { 0.49 };
-                        held *= db_amp(crest_weight * crest_db);
+                    if self.overshoot_compensation && self.algorithm < 3 {
+                        p = p.max(overshoot[b]);
+                    } else if self.overshoot_compensation && self.algorithm == 3 {
+                        // Algorithm 3 stays on its inherited real-waveform
+                        // detector; its exact estimator belongs to t-5368.
+                        p = overshoot[b];
                     }
+                    let held = self.window_max(b, p);
                     self.env[b] = if self.release_on { held.max(self.env[b] * self.release[b]) } else { held };
                     Some(self.gain(b))
                 } else {
@@ -1146,6 +1268,43 @@ mod tests {
     }
 
     #[test]
+    fn analytic_envelope_is_phase_invariant_and_sums_tones() {
+        let single = |frequency: f64, phase: f64| {
+            let mut envelope = AnalyticEnvelope::new(48_000.0);
+            let mut maximum = 0.0f64;
+            for i in 0..48_000 {
+                let angle = 2.0 * core::f64::consts::PI * frequency * i as f64 / 48_000.0 + phase;
+                let value = envelope.push(0.5 * libm::sin(angle));
+                if i >= 47_520 {
+                    maximum = maximum.max(value);
+                }
+            }
+            maximum
+        };
+        for frequency in [50.0, 400.0, 2500.0, 15_000.0] {
+            let a = single(frequency, 0.0);
+            let b = single(frequency, 1.3);
+            assert!((a - b).abs() < 2e-3, "{frequency} Hz phase spread: {a} vs {b}");
+            assert!((a - 0.5).abs() < 0.04, "{frequency} Hz magnitude: {a}");
+        }
+
+        for phase in [0.0, core::f64::consts::FRAC_PI_2] {
+            let mut envelope = AnalyticEnvelope::new(48_000.0);
+            let mut maximum = 0.0f64;
+            for i in 0..48_000 {
+                let t = i as f64 / 48_000.0;
+                let input = 0.2 * libm::sin(2.0 * core::f64::consts::PI * 50.0 * t)
+                    + 0.2 * libm::sin(2.0 * core::f64::consts::PI * 150.0 * t + phase);
+                let value = envelope.push(input);
+                if i >= 47_520 {
+                    maximum = maximum.max(value);
+                }
+            }
+            assert!((maximum - 0.4).abs() < 0.03, "two-tone phase {phase}: {maximum}");
+        }
+    }
+
+    #[test]
     fn gain_src_has_zero_startup_and_unity_dc() {
         for factor in [1, 2, 4] {
             let mut src = GainSrc::new(factor, 48_000.0);
@@ -1183,9 +1342,11 @@ mod tests {
         let mut run = Run::new(&params(), 48_000.0, 1);
         run.env = [0.25; BANDS];
         run.overshoot_state[0][0][0][0] = [0.25; 2];
+        run.analytic[0][0].state_real[0] = 0.25;
         run.reset();
         assert_eq!(run.env, [0.0; BANDS]);
         assert_eq!(run.overshoot_state[0][0][0][0], [0.0; 2]);
+        assert_eq!(run.analytic[0][0].state_real, [0.0; ANALYTIC_ORDER]);
     }
 
     #[test]
