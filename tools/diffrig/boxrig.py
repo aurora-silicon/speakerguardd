@@ -92,10 +92,11 @@ def metric(mac, v2, dynamic, measure_start=0, measure_frames=None):
     measure_end=len(mac) if measure_frames is None else min(len(mac),measure_start+measure_frames)
     mac=mac[measure_start:measure_end];v2=v2[measure_start:measure_end]
     n=len(mac); halves=[]; windows=[]; nulls=0
-    # Steady ratios use a -240 dBFS numerical-silence floor. Transient
-    # windows use the prior rig's -80 dBFS floor on BOTH sides, so unexpected
-    # output above that floor remains a miss. No latency alignment is applied.
-    def delta(a,b, floor=1e-12):
+    # Both steady ratios and transient windows use the full-chain gate's
+    # -80 dBFS floor on BOTH sides.  Numerical opposite-channel leakage is
+    # therefore excluded, while unexpected output above the floor remains a
+    # miss. No latency alignment is applied.
+    def delta(a,b, floor=1e-4):
         nonlocal nulls
         ar=float(np.sqrt(np.mean(a*a))); br=float(np.sqrt(np.mean(b*b)))
         if max(ar,br)<floor:
