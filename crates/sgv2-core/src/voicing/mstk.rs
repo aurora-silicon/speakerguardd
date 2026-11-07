@@ -414,6 +414,12 @@ fn push_butter(path: &mut Path, high: bool, n: usize, fc: f64, fs: f64) {
     }
 }
 
+/// The complete Butterworth half of order `n` for the real-waveform
+/// detector, including the first-order section of an odd `n`.  Black-box
+/// (installed unit, steady tones, algorithm 3 and quality 2): an edge whose
+/// Linkwitz-Riley half is odd (order controls 2, 5-6, 9-10) compresses like
+/// the full Butterworth half; dropping its first-order section read up to
+/// 1.4 dB too much compression at that edge, an order-2 edge none at all.
 fn push_detector_butter(path: &mut DetectorPath, high: bool, n: usize, fc: f64, fs: f64) {
     let k = libm::tan(core::f64::consts::PI * fc / fs);
     for i in 0..n / 2 {
@@ -422,6 +428,11 @@ fn push_detector_butter(path: &mut DetectorPath, high: bool, n: usize, fc: f64, 
         let (a1, a2) = (2.0 * (k * k - 1.0) / d, (1.0 - q2 * k + k * k) / d);
         let (b0, b1, b2) = if high { (1.0 / d, -2.0 / d, 1.0 / d) } else { (k * k / d, 2.0 * k * k / d, k * k / d) };
         path.push(Section { b0, b1, b2, a1, a2 });
+    }
+    if n % 2 != 0 {
+        let d = 1.0 + k;
+        let (b0, b1) = if high { (1.0 / d, -1.0 / d) } else { (k / d, k / d) };
+        path.push(Section { b0, b1, b2: 0.0, a1: (k - 1.0) / d, a2: 0.0 });
     }
 }
 
@@ -1786,15 +1797,33 @@ mod tests {
 
     #[test]
     fn detector_is_the_butterworth_half_of_each_audio_band() {
-        let mut p = params();
-        p.algorithm = 3;
-        let audio = paths(&p, 48_000.0);
-        let detector = detector_paths(&p, 48_000.0);
-        for b in 0..BANDS {
-            for f in [40.0, 200.0, 1000.0, 5000.0, 16_000.0] {
-                let a = band_magnitude(&audio[b], f);
-                let d = detector_band_magnitude(&detector[b], f);
-                assert!((a - d * d).abs() < 1e-10, "band {b} at {f} Hz: audio {a}, detector {d}");
+        // Odd Linkwitz-Riley halves (controls 2, 5, 6, 9, 10) included, and
+        // the mixed orders of saved tunings.
+        let orders: [[f64; XOVERS]; 11] = [
+            [4.0; 3],
+            [2.0; 3],
+            [3.0; 3],
+            [5.0; 3],
+            [6.0; 3],
+            [8.0; 3],
+            [9.0; 3],
+            [10.0; 3],
+            [20.0; 3],
+            [9.0, 5.0, 6.0],
+            [8.5, 9.0, 8.0],
+        ];
+        for order in orders {
+            let mut p = params();
+            p.algorithm = 3;
+            p.crossover_order = order;
+            let audio = paths(&p, 48_000.0);
+            let detector = detector_paths(&p, 48_000.0);
+            for b in 0..BANDS {
+                for f in [40.0, 200.0, 1000.0, 1500.0, 5000.0, 8000.0, 16_000.0] {
+                    let a = band_magnitude(&audio[b], f);
+                    let d = detector_band_magnitude(&detector[b], f);
+                    assert!((a - d * d).abs() < 1e-10, "orders {order:?} band {b} at {f} Hz: audio {a}, detector {d}");
+                }
             }
         }
     }
