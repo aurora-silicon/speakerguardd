@@ -1462,12 +1462,13 @@ mod tests {
     fn mask_reads_high_lane_before_its_output_delay() {
         let p = synthetic();
         let mut run = Run::new(&p, 48_000.0, 4);
-        let mut b = [vec![0.0; 384], vec![0.0; 384], vec![0.0; 384], vec![0.0; 384]];
-        b[2][192] = 0.7;
+        let mut b = [vec![0.0; 128], vec![0.0; 128], vec![0.0; 128], vec![0.0; 128]];
+        b[2][64] = 0.7;
         let mut refs: Vec<&mut [f32]> = b.iter_mut().map(Vec::as_mut_slice).collect();
-        run.process(&mut refs, 384);
+        run.process(&mut refs, 128);
         assert!(run.state[0].mask.db > 0.0);
         assert!(run.state[0].mask_output_db > 0.0);
+        assert!(b[2].iter().all(|value| *value == 0.0));
     }
 
     #[cfg(not(feature = "lowflow-conservative"))]
