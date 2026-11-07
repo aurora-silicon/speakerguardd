@@ -995,6 +995,42 @@ impl DynamicRun {
         output
     }
 
+    /// The installed reconstruction setup publishes Float32 coefficients to
+    /// a single-precision multichannel vDSP filter through the double-
+    /// coefficient API. Samples and the four histories remain Float32.
+    #[inline]
+    fn step_vdsp_df1_f32(section: &Section, state: &mut [f32; 4], input: f32) -> f32 {
+        // AudioDSP's designer publishes five Float32 coefficients. Its vDSP
+        // wrapper then widens those exact values for SetCoefficientsDouble.
+        let (b0, b1, b2, a1, a2) = (
+            f64::from(section.b0 as f32),
+            f64::from(section.b1 as f32),
+            f64::from(section.b2 as f32),
+            f64::from(section.a1 as f32),
+            f64::from(section.a2 as f32),
+        );
+        let mut output = b1 * f64::from(state[0]);
+        output = b0.mul_add(f64::from(input), output);
+        output = b2.mul_add(f64::from(state[1]), output);
+        output = (-a1).mul_add(f64::from(state[2]), output);
+        output = (-a2).mul_add(f64::from(state[3]), output);
+        let output = output as f32;
+        state[1] = state[0];
+        state[0] = input;
+        state[3] = state[2];
+        state[2] = output;
+        output
+    }
+
+    #[inline]
+    fn step_reconstruction(&mut self, kind: DynamicKind, input: f32) -> f32 {
+        if kind == DynamicKind::Notch && !self.carrier_handoff {
+            Self::step_vdsp_df1_f32(&self.reconstruction, &mut self.reconstruction_state, input)
+        } else {
+            Self::step_df1_f32(&self.reconstruction, &mut self.reconstruction_state, input)
+        }
+    }
+
     fn curve(params: &DynamicFilter, level: f64) -> f64 {
         const POINTS: usize = 44;
         const STEP: f64 = 100.0 / 43.0;
@@ -1144,11 +1180,11 @@ impl DynamicRun {
             // second-order reconstruction filter is not post-clamped. Its
             // small step-response overshoot is part of the release
             // trajectory (and can briefly put the carrier gain above one).
-            let reconstructed = Self::step_df1_f32(
-                &self.reconstruction,
-                &mut self.reconstruction_state,
-                self.reconstructed_gain as f32,
-            );
+            // Type 15's materially active setup uses the exact vDSP
+            // coefficient/history boundary. Its release handoff remains a
+            // separate state: it continues from the already recovered
+            // Float32 trajectory instead of re-publishing the active setup.
+            let reconstructed = self.step_reconstruction(at.params.kind, self.reconstructed_gain as f32);
             if (self.carrier_handoff || self.idle_below_knee)
                 && self.response_gain == 1.0
                 && (reconstructed - self.previous_reconstruction).abs() < Self::CARRIER_SETTLE_DELTA
@@ -1728,6 +1764,35 @@ mod tests {
         assert!(!run.carrier_handoff);
         run.set_response_gain(1.0);
         assert!(run.carrier_handoff);
+    }
+
+    #[test]
+    fn type15_reconstruction_keeps_active_and_release_state_boundaries() {
+        let p = dynamic_filter_params(DynamicKind::Notch);
+        let mut run = DynamicRun::new(&p.dynamic[0].params, 48_000.0);
+        run.reconstruction = Section { b0: -0.9, b1: -0.9, b2: -0.9, a1: -0.9, a2: -0.9 };
+        let state = [0.7, -0.7, 0.3, 0.9];
+        let input = 0.1;
+
+        let mut active_state = state;
+        let active = DynamicRun::step_vdsp_df1_f32(&run.reconstruction, &mut active_state, input);
+        run.reconstruction_state = state;
+        assert!(!run.carrier_handoff);
+        assert_eq!(run.step_reconstruction(DynamicKind::Notch, input), active);
+        assert_eq!(run.reconstruction_state, active_state);
+
+        let mut release_state = state;
+        let release = DynamicRun::step_df1_f32(&run.reconstruction, &mut release_state, input);
+        run.reconstruction_state = state;
+        run.carrier_handoff = true;
+        assert_eq!(run.step_reconstruction(DynamicKind::Notch, input), release);
+        assert_eq!(run.reconstruction_state, release_state);
+        assert_ne!(active.to_bits(), release.to_bits());
+
+        // Type 18 retains its existing Float32 reconstruction path.
+        run.reconstruction_state = state;
+        run.carrier_handoff = false;
+        assert_eq!(run.step_reconstruction(DynamicKind::HighShelf, input), release);
     }
 
     #[test]
