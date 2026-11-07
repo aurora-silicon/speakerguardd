@@ -142,9 +142,16 @@ pub fn temperature_candidate(
     let body_ceiling = (1.0 - rho) * hard;
     let mix = if om >= body_ceiling { 1.0 } else { (om / body_ceiling).max(0.0) };
     let mix = mix * mix;
-    let split = phi + mix * (rho - phi);
-    let allowed_vc = room * split;
-    let allowed_mg = room * (1.0 - split);
+    // The native arm64 path does not form an interpolated split and then
+    // multiply it by the room.  It first scales both endpoint splits by the
+    // room, then interpolates each allowance with one binary32 FMA.  The two
+    // forms are algebraically equal but differ by a ULP near the first bite.
+    let phi_vc = room * phi;
+    let phi_mg = room - phi_vc;
+    let rho_vc = room * rho;
+    let rho_mg = room - rho_vc;
+    let allowed_vc = libm::fmaf(mix, rho_vc - phi_vc, phi_vc);
+    let allowed_mg = libm::fmaf(mix, rho_mg - phi_mg, phi_mg);
     let mut g = 1.0f32;
     for (allowed, present) in [(allowed_vc, vc), (allowed_mg, mg)] {
         if allowed < present {

@@ -1468,15 +1468,22 @@ impl SlowGain {
         if self.attack {
             if self.n < self.len {
                 self.n += 1;
-                let w = 0.5 * (1.0 + libm::cos(core::f64::consts::PI * self.n as f64 / self.len as f64));
-                self.g = (self.target as f64 + (self.start as f64 - self.target as f64) * w) as f32;
+                // The arm64 implementation builds its raised-cosine table as
+                // Float32 from a binary64 sincos: angle is (pi / len) * n and
+                // the stored ordinate is Float32(1 + cos(angle)).  A fresh
+                // segment normalizes the start ordinate by Float32(1 / 2),
+                // then vDSP applies the segment with a fused multiply-add.
+                let angle = (core::f64::consts::PI / self.len as f64) * self.n as f64;
+                let ordinate = (1.0 + libm::cos(angle)) as f32;
+                let scale = (self.start - self.target) * 0.5;
+                self.g = libm::fmaf(scale, ordinate, self.target);
             } else {
                 self.g = self.target;
             }
         } else if self.start != self.target {
             self.n += 1;
             let r = (1.0 - libm::exp(-(self.n as f64) * release_lambda)).min(1.0) as f32;
-            self.g = self.start + r * (self.target - self.start);
+            self.g = libm::fmaf(r, self.target - self.start, self.start);
         }
         self.g
     }
