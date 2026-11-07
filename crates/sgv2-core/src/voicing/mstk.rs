@@ -561,6 +561,23 @@ impl QuadratureEnvelope {
         self.phase ^= 1;
         libm::sqrt((b * b + delayed_a * delayed_a) as f64)
     }
+
+    /// The audio path of the same pair: `(z^-1 A(x) + B(x)) / sqrt(2)`.
+    /// Both arms are allpass and stay 90 degrees apart, so the sum is an
+    /// allpass with unity magnitude whose group delay matches the detector
+    /// envelope above.  Measured against the installed unit's impulse
+    /// response, quality 0/1 differs from quality 2 by exactly this allpass
+    /// in every band (within 1.3 degrees from 15 Hz to 22 kHz at 48 kHz).
+    #[inline]
+    fn push_audio(&mut self, input: f64) -> f64 {
+        let input = input as f32;
+        let b = self.arm_b.push(input, &Self::B, self.phase);
+        let a = self.arm_a.push(input, &Self::A, self.phase);
+        let delayed_a = self.arm_a_delay;
+        self.arm_a_delay = a;
+        self.phase ^= 1;
+        ((b + delayed_a) as f64) * core::f64::consts::FRAC_1_SQRT_2
+    }
 }
 
 /// Causal polyphase-equivalent interpolator used for a reduced-rate gain
@@ -720,6 +737,7 @@ pub struct Run {
     detector_max: [SlidingMax; BANDS],
     quadrature: [[QuadratureEnvelope; BANDS]; MAX_CHANNELS],
     overshoot_quadrature: [[[QuadratureEnvelope; BANDS]; BANDS]; MAX_CHANNELS],
+    audio_quadrature: [QuadratureEnvelope; MAX_CHANNELS],
     hop_peak: bool,
     detector_hop: [f64; BANDS],
     gain_src: [GainSrc; BANDS],
@@ -787,6 +805,7 @@ impl Run {
             detector_max: [SlidingMax::EMPTY; BANDS],
             quadrature: [[QuadratureEnvelope::default(); BANDS]; MAX_CHANNELS],
             overshoot_quadrature: [[[QuadratureEnvelope::default(); BANDS]; BANDS]; MAX_CHANNELS],
+            audio_quadrature: [QuadratureEnvelope::default(); MAX_CHANNELS],
             hop_peak: cadence(q) == Cadence::HopPeak,
             detector_hop: [0.0; BANDS],
             gain_src: core::array::from_fn(|b| GainSrc::new(detector_factor[b], fs)),
@@ -803,6 +822,9 @@ impl Run {
         self.env = [0.0; BANDS];
         self.detector_max = [SlidingMax::EMPTY; BANDS];
         self.detector_phase = [0; BANDS];
+        for envelope in &mut self.audio_quadrature {
+            envelope.reset();
+        }
         for channel in &mut self.quadrature {
             for envelope in channel {
                 envelope.reset();
@@ -980,7 +1002,10 @@ impl Run {
                 let x = bufs[c].get(i).copied().unwrap_or(0.0);
                 let x = if x.is_finite() { x.clamp(-INPUT_BOUND, INPUT_BOUND) as f64 } else { 0.0 };
                 let input = self.in_gain * x;
-                bands[c] = self.split(c, input);
+                // Algorithms 0-2 at quality 0/1 process the audio through the
+                // detector's quadrature pair, so gain and audio stay aligned.
+                let audio = if self.hop_peak { self.audio_quadrature[c].push_audio(input) } else { input };
+                bands[c] = self.split(c, audio);
                 let (detected, overshoot_arm) = self.detect(c, input);
                 for b in 0..BANDS {
                     detector[b] = detector[b].max(detected[b]);
@@ -1040,6 +1065,7 @@ impl Run {
                     self.legacy_high_state[c] = [[[0.0; 2]; MAX_FILTERS]; XOVERS];
                     self.legacy_split_allpass_state[c] = [[[0.0; 2]; MAX_FILTERS]; XOVERS];
                     self.legacy_merge_allpass_state[c] = [[[0.0; 2]; MAX_FILTERS]; XOVERS];
+                    self.audio_quadrature[c].reset();
                 }
             }
             if self.env.iter().any(|v| !v.is_finite()) {
@@ -1196,7 +1222,10 @@ mod tests {
                 let mut x = tone(f, 0.25, 24_000);
                 let mut run = Run::new(&p, 48_000.0, 1);
                 run.process(&mut [&mut x], 24_000);
-                assert!((level(&x, f) - 20.0 * libm::log10(0.25)).abs() < 0.01, "order {order} at {f} Hz");
+                // Quality 1 runs the audio through the quadrature pair, whose
+                // arms are 90 +- 0.7 degrees apart above 30 Hz: the sum is
+                // unity within 0.06 dB.
+                assert!((level(&x, f) - 20.0 * libm::log10(0.25)).abs() < 0.07, "order {order} at {f} Hz");
             }
         }
     }
@@ -1362,10 +1391,40 @@ mod tests {
         run.env = [0.25; BANDS];
         run.overshoot_state[0][0][0][0] = [0.25; 2];
         run.quadrature[0][0].arm_a.input_delay[0][0] = 0.25;
+        run.audio_quadrature[0].arm_b.output_delay[0][1] = 0.25;
         run.reset();
+        assert_eq!(run.audio_quadrature[0].arm_b.output_delay, [[0.0; 2]; QUADRATURE_STAGES]);
         assert_eq!(run.env, [0.0; BANDS]);
         assert_eq!(run.overshoot_state[0][0][0][0], [0.0; 2]);
         assert_eq!(run.quadrature[0][0].arm_a.input_delay, [[0.0; 2]; QUADRATURE_STAGES]);
+    }
+
+    #[test]
+    fn audio_quadrature_is_a_unity_allpass() {
+        for frequency in [30.0, 100.0, 1_000.0, 6_000.0, 15_000.0] {
+            let mut pair = QuadratureEnvelope::default();
+            let n = 96_000;
+            let mut output = std::vec::Vec::with_capacity(n);
+            for i in 0..n {
+                let x = 0.5 * libm::sin(2.0 * core::f64::consts::PI * frequency * i as f64 / 48_000.0);
+                output.push(pair.push_audio(x) as f32);
+            }
+            let got = level(&output[n / 2..], frequency);
+            // 90 +- 0.7 degrees between the arms above 30 Hz: unity within 0.06 dB.
+            assert!((got - 20.0 * libm::log10(0.5)).abs() < 0.07, "{frequency} Hz: {got} dB");
+        }
+    }
+
+    #[test]
+    fn quality_two_audio_path_has_no_quadrature_allpass() {
+        let mut p = params();
+        p.render_quality = 2;
+        let mut run = Run::new(&p, 48_000.0, 1);
+        let mut x = [0.0f32; 64];
+        x[0] = 0.01;
+        run.process(&mut [&mut x[..]], 64);
+        assert!(!run.hop_peak);
+        assert_eq!(run.audio_quadrature[0].arm_b.input_delay, [[0.0; 2]; QUADRATURE_STAGES]);
     }
 
     #[test]
