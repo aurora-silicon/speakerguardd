@@ -92,6 +92,7 @@ pub const CHEB_REFERENCE_TAPS: usize = 100;
 pub const CHEB_ATTENUATION_DB: f64 = 90.0;
 /// Saturation latency (up plus down low pass), base frames.
 pub const SATURATION_DELAY: usize = 2 * FIR_HALF_BASE;
+const MAKEUP_DELAY: usize = SATURATION_DELAY;
 /// The cubic (flavour 1) shaper: `f(CUBIC_SCALE k u) / k` with
 /// `f(v) = 1.5 v - 0.5 v^3` (clamped to +-1 past the knee), small-signal
 /// slope `1.5 CUBIC_SCALE` (+0.10 dB). Black-box: base-rate (mode 0) ramps,
@@ -674,6 +675,11 @@ struct Saturation {
     /// Smoothed drive (dB) and the drive in use (ceiling scale included).
     drive_db: f64,
     k: f64,
+    /// Drive scalars in the same streaming coordinate as the delayed FIR
+    /// output.  The reciprocal applied to a returned sample belongs to the
+    /// base-rate carrier sample that entered the FIR pair 24 frames earlier.
+    makeup: [f64; MAKEUP_DELAY],
+    makeup_at: usize,
     ch: Vec<Saturator>,
 }
 
@@ -698,6 +704,8 @@ impl Saturation {
             tau_frames: DRIVE_TAU_S * fs,
             drive_db: start_db(),
             k: 1.0,
+            makeup: [1.0; MAKEUP_DELAY],
+            makeup_at: 0,
             ch: vec![Saturator::new(); channels],
         }
     }
@@ -710,6 +718,8 @@ impl Saturation {
         self.peak = 0.0;
         self.drive_db = start_db();
         self.k = 1.0;
+        self.makeup.fill(1.0);
+        self.makeup_at = 0;
         self.ch.iter_mut().for_each(|c| *c = Saturator::new());
     }
 
@@ -749,6 +759,15 @@ impl Saturation {
         } else {
             0
         }
+    }
+
+    /// Associates the reciprocal with the FIR pair's returned carrier.  The
+    /// history is continuous across short host pieces and render calls.
+    fn delayed_makeup(&mut self, k: f64) -> f64 {
+        let makeup = self.makeup[self.makeup_at];
+        self.makeup[self.makeup_at] = k;
+        self.makeup_at = (self.makeup_at + 1) % MAKEUP_DELAY;
+        makeup
     }
 
     /// The shaper on an already driven value `v` (`k` times the signal).
@@ -792,7 +811,7 @@ impl Saturation {
     /// first at base rate, `k` scales the value entering the interpolation
     /// delay, the shaper runs at 2fs, and `1/k` precedes the base-rate inverse.
     /// At the base rate (mode 0), the sample is shaped directly.
-    fn run(&mut self, c: usize, x: f64, k: f64) -> f64 {
+    fn run(&mut self, c: usize, x: f64, k: f64, makeup: f64) -> f64 {
         let h = &self.h;
         let flavor = self.flavor;
         if !self.oversampled {
@@ -824,7 +843,7 @@ impl Saturation {
         for (i, hv) in h.iter().enumerate() {
             y += *hv * s.v[(newest_2n + V_RING - i) % V_RING];
         }
-        let made_up = f64::from(y * (1.0f32 / k as f32));
+        let made_up = f64::from(y * (1.0f32 / makeup as f32));
         self.post.run(&mut s.post, made_up)
     }
 }
@@ -1159,6 +1178,15 @@ impl Run {
         }
         let l = self.lookahead;
         for i in 0..n {
+            let makeup = if let Some(s) = &mut self.saturation {
+                if s.oversampled {
+                    s.delayed_makeup(k)
+                } else {
+                    k
+                }
+            } else {
+                1.0
+            };
             let mut peak = 0.0f64;
             let mut linked = 0.0f32;
             let mut frame = [0.0f64; MAX_CHANNELS];
@@ -1166,7 +1194,7 @@ impl Run {
             for (c, slot) in frame[..ch].iter_mut().enumerate() {
                 let mut x = self.piece[c * DRIVE_BLOCK + i];
                 if let Some(s) = &mut self.saturation {
-                    x = s.run(c, x, k);
+                    x = s.run(c, x, k, makeup);
                     if s.started < s.delay() {
                         x = 0.0;
                     }
@@ -1480,7 +1508,7 @@ mod tests {
     fn a_new_block_drive_starts_at_its_first_base_sample_without_state_mapping() {
         let p = saturating(3);
         let mut sat = Saturation::new(&p, 48_000.0, 1);
-        sat.run(0, 0.25, 0.7);
+        sat.run(0, 0.25, 0.7, 0.7);
         let old_at = sat.ch[0].x_at;
         let old_driven = sat.ch[0].x[old_at];
         let pre_before = sat.ch[0].pre;
@@ -1488,7 +1516,7 @@ mod tests {
         let cut = sat.pre.run(&mut expected_pre, -0.2);
         let expected_driven = cut as f32 * 0.9f32;
 
-        sat.run(0, -0.2, 0.9);
+        sat.run(0, -0.2, 0.9, 0.7);
 
         assert_eq!(sat.ch[0].x[old_at], old_driven);
         assert_eq!(sat.ch[0].x[sat.ch[0].x_at], expected_driven);
@@ -1496,21 +1524,20 @@ mod tests {
     }
 
     #[test]
-    fn new_block_reciprocal_starts_at_its_first_output_sample() {
+    fn makeup_follows_the_streaming_output_buffer_across_short_pieces() {
         let p = saturating(3);
-        let mut a = Saturation::new(&p, 48_000.0, 1);
-        let mut b = Saturation::new(&p, 48_000.0, 1);
-        for _ in 0..SATURATION_DELAY {
-            a.run(0, 0.3, 0.7);
-            b.run(0, 0.3, 0.7);
-        }
+        let mut sat = Saturation::new(&p, 48_000.0, 1);
 
-        // The two states and delayed carrier are identical.  Changing k on
-        // this output frame must change its reciprocal immediately; there is
-        // no 24-frame make-up history or state transform.
-        let old = a.run(0, 0.3, 0.7);
-        let new = b.run(0, 0.3, 0.9);
-        assert_ne!(old, new);
+        for (frames, k) in [(7, 0.7), (5, 0.8), (12, 0.9)] {
+            for _ in 0..frames {
+                assert_eq!(sat.delayed_makeup(k), 1.0);
+            }
+        }
+        assert_eq!(sat.delayed_makeup(0.6), 0.7);
+
+        sat.reset();
+        assert_eq!(sat.delayed_makeup(0.5), 1.0);
+        assert_eq!(sat.makeup_at, 1);
     }
 
     #[test]
