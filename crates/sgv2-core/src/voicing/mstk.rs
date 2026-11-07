@@ -1076,11 +1076,10 @@ impl Run {
             }
         }
         let detector_factor = detector_factors(q);
-        // Mode 4 shares one two-millisecond odd trailing maximum across its
-        // first three arms. The direct fourth band keeps its one-millisecond
-        // window. At the fixed eight-frame cadence this is 11/13/25 updates
-        // at 44.1/48/96 kHz for bands zero through two.
-        let window_ms = if cadence(q) == Cadence::AnalyticPick { [2.0, 2.0, 2.0, 1.0] } else { [10.0, 8.0, 2.0, 1.0] };
+        // Mode 4 shares one two-millisecond odd trailing maximum across all
+        // four arms. At the fixed eight-frame cadence this is 11/13/25
+        // updates at 44.1/48/96 kHz before any outer band-rate reduction.
+        let window_ms = if cadence(q) == Cadence::AnalyticPick { [2.0; BANDS] } else { [10.0, 8.0, 2.0, 1.0] };
         let mut detector_window = core::array::from_fn(|b| {
             ((libm::round(window_ms[b] * fs / (1000.0 * detector_factor[b] as f64)) as usize) | 1)
                 .clamp(1, MAX_DETECTOR_WINDOW)
@@ -1812,7 +1811,7 @@ mod tests {
         let (factor, window, release, band_zero_factor, _) = cadence(&p0, 48_000.0);
         assert_eq!(factor, [8; BANDS]);
         assert_eq!(band_zero_factor, 11);
-        assert_eq!(window, [1, 13, 13, 7]);
+        assert_eq!(window, [1, 13, 13, 13]);
         for b in 0..BANDS {
             let rate = if b == 0 { 48_000.0 / band_zero_factor as f64 } else { 48_000.0 };
             let embedded_fs = rate / factor[b] as f64;
@@ -1820,7 +1819,7 @@ mod tests {
         }
         let (_, window, _, band_zero_factor, _) = cadence(&p0, 96_000.0);
         assert_eq!(band_zero_factor, 23);
-        assert_eq!(window, [1, 25, 25, 13]);
+        assert_eq!(window, [1, 25, 25, 25]);
 
         let mut p = params();
         p.algorithm = 3;
