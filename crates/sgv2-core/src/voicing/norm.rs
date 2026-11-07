@@ -82,9 +82,10 @@
 //!   (`V1_DETECTOR_SEED_DB`) that fades with the detector's own time
 //!   constant; there is no deferred second clear of the detector state;
 //! - the applied gain starts its glide from `V1_START_GAIN_DB`;
-//! - the fast level is a two-sided hysteresis on every 64-frame level, less
-//!   a 4 dB store: it rises only when the stored level clears it by 3 dB and
-//!   falls to 8 dB above the stored level once that edge is under it;
+//! - the fast level is a two-sided hysteresis on the maximum smoothed
+//!   detector level in each completed 64-frame step, less a 4 dB store: it
+//!   rises only when that stored maximum strictly clears it by 3 dB and
+//!   falls to 8 dB above the stored maximum once that edge is under it;
 //! - the median store is 1.691 dB and the median moves straight to its
 //!   five-dB release edge; the competitor of the long path has no store and
 //!   there is no low-level coordinate move;
@@ -630,6 +631,10 @@ pub struct Run {
     z: [[[f64; 2]; MAX_SECTIONS]; MAX_CHANNELS],
     ema: f64,
     ema_a: f64,
+    /// Algorithm 1: maximum smoothed detector level in the current
+    /// 64-frame step. The first partial step starts at the detector reset
+    /// level; later steps contain only their own samples.
+    step_peak: f64,
     in_step: usize,
     steps: usize,
     blocks: usize,
@@ -685,6 +690,7 @@ impl Run {
             z: [[[0.0; 2]; MAX_SECTIONS]; MAX_CHANNELS],
             ema: 0.0,
             ema_a: libm::exp(-1.0 / (p.detector_ema_s * fs)),
+            step_peak: f64::NEG_INFINITY,
             in_step: 0,
             steps: 0,
             blocks: 0,
@@ -722,6 +728,7 @@ impl Run {
         self.pos = 0;
         self.z = [[[0.0; 2]; MAX_SECTIONS]; MAX_CHANNELS];
         self.ema = SEED_POWER;
+        self.step_peak = f64::NEG_INFINITY;
         self.in_step = 0;
         self.steps = 0;
         self.blocks = 0;
@@ -754,6 +761,7 @@ impl Run {
     fn reset_algorithm1(&mut self) {
         let s = V1_SILENT_DB;
         self.ema = libm::pow(10.0, V1_DETECTOR_SEED_DB / 10.0);
+        self.step_peak = level(self.ema);
         self.window.reset(0.0);
         self.median.reset(s);
         self.long.reset(s);
@@ -797,16 +805,15 @@ impl Run {
         v * v
     }
 
-    /// On the first frame of every 64: the call's peak level and the
-    /// window, and on their own boundaries the long (4096) and median (512)
-    /// paths. Every stage takes its first input, so the paths sample frames
-    /// 0, 64, ...; 0, 512, ...; 0, 4096, ... of the stream. The long path
-    /// reads the window before the current power joins it, and its reading
-    /// joins the 512-frame event on the boundary `LONG_DELAY` windows later.
-    fn on_step(&mut self) {
+    /// One completed 64-frame step. `fast_db` is the maximum smoothed
+    /// detector level in that step for algorithm 1; the other meters read
+    /// the step-end detector state. The long path reads the window before
+    /// the current power joins it, and its reading joins the 512-frame event
+    /// on the boundary `LONG_DELAY` windows later.
+    fn on_step(&mut self, fast_db: f64) {
         let ema = self.ema;
         let db = level(ema);
-        self.peak = self.peak.max(db);
+        self.peak = self.peak.max(fast_db);
         self.events += 1;
         if self.steps == 0 && self.blocks == 0 {
             self.window.resum();
@@ -825,7 +832,7 @@ impl Run {
         }
         self.steps = (self.steps + 1) % PER_BLOCK;
         if self.p.algorithm1 {
-            self.arbitrate_step(db);
+            self.arbitrate_step(fast_db);
         }
     }
 
@@ -929,12 +936,25 @@ impl Run {
                 power += self.detect(ch, f64::from(x));
             }
             self.ema = self.ema_a * self.ema + (1.0 - self.ema_a) * power.max(1e-12);
-            if self.in_step == 0 {
-                self.on_step();
-                if self.p.algorithm1 && self.steps_in_call < self.step_target.len() {
-                    self.step_target[self.steps_in_call] = (n, self.target);
+            if self.p.algorithm1 {
+                self.step_peak = self.step_peak.max(level(self.ema));
+            }
+            let step_done = self.p.algorithm1 && self.in_step + 1 == STEP;
+            if step_done {
+                self.on_step(self.step_peak);
+                self.step_peak = f64::NEG_INFINITY;
+                if self.steps_in_call < self.step_target.len() {
+                    // Meter the whole step first, then apply its target from
+                    // that same step's first frame: the audio pass follows
+                    // the side-chain pass for the complete render call. A
+                    // step carried across a short call starts at frame zero
+                    // of this call as far as its audio pass is concerned.
+                    let start = (n + 1).saturating_sub(STEP);
+                    self.step_target[self.steps_in_call] = (start, self.target);
                     self.steps_in_call += 1;
                 }
+            } else if !self.p.algorithm1 && self.in_step == 0 {
+                self.on_step(level(self.ema));
             }
             self.in_step = (self.in_step + 1) % STEP;
         }
@@ -1028,6 +1048,22 @@ mod tests {
         // the target follows the step, not the call boundary
         assert_eq!(r.candidate, -26.0);
         assert!((r.target_db - p.gain_db(-26.0)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn algorithm1_fast_uses_the_completed_step_maximum() {
+        let p = Params { algorithm1: true, detector_ema_s: 0.040, ..params(0) };
+        let mut r = Run::new(&p, 48_000.0, 1);
+        // Make the detector state equal each sample's power so the reducer
+        // is isolated from its time constant. A step-start sampler sees
+        // silence; the completed-step maximum sees the final sample.
+        r.ema_a = 0.0;
+        r.fast = V1_SILENT_DB;
+        let mut buf = [0.0f32; STEP];
+        buf[STEP - 1] = 1.0;
+        r.process(&mut [&mut buf], STEP);
+        assert_eq!(r.fast, V1_FAST_STORE_DB);
+        assert_eq!(r.step_peak, f64::NEG_INFINITY);
     }
 
     #[test]
