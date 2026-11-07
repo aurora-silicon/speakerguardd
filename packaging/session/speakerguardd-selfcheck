@@ -693,6 +693,17 @@ def derive_live(args):
     return hw, w, desc, wiring.role_errors(w, units)
 
 
+def report_matches(path, bind):
+    """The self-check record at `path` is a pass for the same board,
+    kernel, parameters and wiring as `bind`."""
+    try:
+        with open(path) as f:
+            r = json.load(f)["record"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    return r.get("result") == "pass" and all(str(r.get(k)) == bind.get(k) for k in ("board", "kernel", "params_sha256", "wiring"))
+
+
 def cmd_run(args):
     os.makedirs(args.state, exist_ok=True)
     bind_path = os.path.join(args.state, "selfcheck.bind")
@@ -725,6 +736,9 @@ def cmd_run(args):
             not args.force and not errs
             and old.get("result") == "pass" and old.get("version") == str(VERSION)
             and all(old.get(k) == str(rec[k]) for k in ("board", "kernel", "params_sha256", "wiring"))
+            # the graph is generated from the record: a bind without its
+            # record (lost or removed) is checked again, not reused
+            and report_matches(report_path, old)
         ):
             log(f"a passing self-check is bound to {hw['board']}, {kernel}, params {rec['params_sha256'][:12]}, wiring {w['hash']}: nothing to do")
             return 0
