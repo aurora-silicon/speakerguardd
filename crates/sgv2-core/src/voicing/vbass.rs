@@ -429,7 +429,7 @@ impl Params {
             return None;
         }
         let order = |v: f64| -> Option<usize> {
-            (v >= 2.0 && v <= 20.0 && libm::trunc(v) == v && (v as usize) % 2 == 0).then_some(v as usize)
+            ((2.0..=20.0).contains(&v) && libm::trunc(v) == v && (v as usize) % 2 == 0).then_some(v as usize)
         };
         let corner = |v: f64| (v > 0.0 && v < 20_000.0).then_some(v);
         let gain = |v: f64| (0.0..=100.0).contains(&v).then_some(v);
@@ -489,8 +489,14 @@ struct Follower {
 }
 
 impl Follower {
+    /// A level-control follower: its stores start at the level-control
+    /// seed. The harmonic compressor's follower starts from zero.
     fn new(fs: f64, ratio: f64) -> Follower {
-        Follower::with_times(fs, ratio, law::LC_ATTACK_S, law::LC_RELEASE_S, law::LC_HOLD_S, law::LC_SMOOTH_S)
+        let mut f =
+            Follower::with_times(fs, ratio, law::LC_ATTACK_S, law::LC_RELEASE_S, law::LC_HOLD_S, law::LC_SMOOTH_S);
+        f.e = law::LC_SEED as f32;
+        f.s = law::LC_SEED as f32;
+        f
     }
 
     fn with_times(fs: f64, ratio: f64, attack_s: f64, release_s: f64, hold_s: f64, smooth_s: f64) -> Follower {
@@ -499,8 +505,8 @@ impl Follower {
         Follower {
             ratio: ratio as f32,
             tie: f32::INFINITY,
-            e: law::LC_SEED as f32,
-            s: law::LC_SEED as f32,
+            e: 0.0,
+            s: 0.0,
             held: 0,
             hold: (hold_s as f32 * fs) as usize + 1,
             a_att: pole(attack_s),
