@@ -316,12 +316,10 @@ pub(crate) fn voicing_tone(
         parts.push(p);
         channels.push(ch);
     }
-    let (mut out, mut partial) = (Vec::new(), Vec::new());
+    let (mut out, mut partial, mut dynamic_automation) = (Vec::new(), Vec::new(), Vec::new());
+    let dynamic = tone_dynamic(&parts, &ctx)?;
     if mode == Realise::LeastPassing || stage.bypass {
-        return Ok((
-            Tone { channels, automation: out, dynamic: tone_dynamic(&parts, &ctx)?, dynamic_automation: Vec::new() },
-            partial,
-        ));
+        return Ok((Tone { channels, automation: out, dynamic, dynamic_automation }, partial));
     }
     let g = stage
         .state
@@ -329,7 +327,6 @@ pub(crate) fn voicing_tone(
         .and_then(|s| s.global())
         .ok_or_else(|| bad(format!("{ctx}: the strip gives it no saved state")))?;
     let get = |id: u32| g.get(id).map(f64::from).unwrap_or(0.0);
-    let mut dynamic_automation = Vec::new();
     for (e, a) in automation_entries(&get, &ctx)? {
         if !a.moves() {
             continue;
@@ -359,32 +356,32 @@ pub(crate) fn voicing_tone(
             continue;
         }
         let Some(saved) = saved else {
-            // a level-dependent slot: the runtime dynamic filter moves its
-            // range and frequency with the volume
-            if let Some((index, dynamic)) = parts[0].dynamics.iter().enumerate().find(|(_, d)| d.slot == a.target) {
-                let point = |scalar: f64, gain_db: f64, frequency_hz: f64, which: &str| -> Result<TonePoint> {
-                    if !gain_db.is_finite()
-                        || !(-30.0..=0.0).contains(&gain_db)
-                        || !frequency_hz.is_finite()
-                        || frequency_hz <= 0.0
-                        || frequency_hz >= fs / 2.0
-                    {
-                        return Err(bad(format!(
-                            "{ctx}: volume automation {e} {which}: range {gain_db} dB, frequency {frequency_hz} Hz"
-                        )));
-                    }
-                    Ok(TonePoint { scalar, gain_db, frequency_hz })
-                };
-                let pa = point(a.a, dynamic.params.range_db, dynamic.params.frequency_hz, "A")?;
-                let pb = point(a.b_at, a.b.gain, a.b.f0, "B")?;
-                let midpoint = match a.middle {
-                    Some((at, m)) => Some(point(at, m.gain, m.f0, "midpoint")?),
-                    None => None,
-                };
-                dynamic_automation.push(DynamicToneAutomation { index, a: pa, b: pb, midpoint });
-            }
-            // otherwise the slot runs on none of the box's channels, or is
-            // the identity at every point: the entry moves nothing
+            let Some((index, dynamic_slot)) = parts[0].dynamics.iter().enumerate().find(|(_, d)| d.slot == a.target)
+            else {
+                // The slot runs on none of the box's channels, or is the
+                // identity at every point: the entry moves nothing.
+                continue;
+            };
+            let point = |scalar: f64, gain_db: f64, frequency_hz: f64, which: &str| -> Result<TonePoint> {
+                if !gain_db.is_finite()
+                    || !(-30.0..=0.0).contains(&gain_db)
+                    || !frequency_hz.is_finite()
+                    || frequency_hz <= 0.0
+                    || frequency_hz >= fs / 2.0
+                {
+                    return Err(bad(format!(
+                        "{ctx}: volume automation {e} {which}: range {gain_db} dB, frequency {frequency_hz} Hz"
+                    )));
+                }
+                Ok(TonePoint { scalar, gain_db, frequency_hz })
+            };
+            let pa = point(a.a, dynamic_slot.params.range_db, dynamic_slot.params.frequency_hz, "A")?;
+            let pb = point(a.b_at, a.b.gain, a.b.f0, "B")?;
+            let midpoint = match a.middle {
+                Some((at, m)) => Some(point(at, m.gain, m.f0, "M")?),
+                None => None,
+            };
+            dynamic_automation.push(DynamicToneAutomation { index, a: pa, b: pb, midpoint });
             continue;
         };
         let point = |scalar: f64, gain_db: f64, frequency_hz: f64, which: &str| -> Result<TonePoint> {
@@ -416,7 +413,7 @@ pub(crate) fn voicing_tone(
             targets,
         });
     }
-    Ok((Tone { channels, automation: out, dynamic: tone_dynamic(&parts, &ctx)?, dynamic_automation }, partial))
+    Ok((Tone { channels, automation: out, dynamic, dynamic_automation }, partial))
 }
 
 /// Merge the per-channel records of a Tone box into linked runtime slots.
@@ -806,7 +803,12 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics, mode: Rea
             && !in_bypassed_group
             && moving.len() == 1
             && moving[0].chain_exact(points[0]);
-        if mode == Realise::Saved && !moving.is_empty() && !exact && dynamic_kind.is_none() {
+        let dynamic_exact = mode == Realise::Saved
+            && dynamic_kind.is_some()
+            && !in_bypassed_group
+            && moving.len() == 1
+            && moving[0].chain_exact(points[0]);
+        if mode == Realise::Saved && !moving.is_empty() && !exact && !dynamic_exact {
             p.conservative.push(i);
         }
         let (carry, carry_spans): (&[Point], &[(usize, usize, bool)]) =
@@ -1713,7 +1715,8 @@ mod tests {
         let pd = part(&dynamic, 0, fs, &mut d).unwrap();
         assert_eq!((pd.sections.len(), pd.dynamics.len()), (0, 1));
         assert_eq!(pd.dynamics[0].params.kind, DynamicKind::Notch);
-        let (tone, _) = voicing_tone(&dynamic, 2, false, fs, &mut d).unwrap();
+        let (tone, partial) = voicing_tone(&dynamic, 2, false, fs, &mut d).unwrap();
+        assert!(partial.is_empty());
         assert_eq!(tone.dynamic.len(), 1);
         assert_eq!((tone.dynamic[0].active_mask, tone.dynamic[0].sidechain_mask), (3, 3));
         let tilt = tmst(&[], &[(0, [3.0, 7.0, 12.0, 300.0, 9.0, 8.0, 3.0, 0.0])]);
@@ -1972,6 +1975,22 @@ mod tests {
     }
 
     #[test]
+    fn voicing_compiles_dynamic_volume_automation() {
+        let fs = 48_000.0;
+        let mut d = Diagnostics::default();
+        let mut globals = auto(0, 0.0, 0.2, (0.8, -6.0, 9_000.0), None);
+        globals.push((20, -29.67));
+        let stage = tmst(&globals, &[(0, [3.0, 18.0, -3.6, 9_500.0, 3.0, 3.0, 3.0, 0.0])]);
+        let (tone, partial) = voicing_tone(&stage, 2, true, fs, &mut d).unwrap();
+        assert!(partial.is_empty());
+        assert_eq!(tone.dynamic.len(), 1);
+        assert_eq!(tone.dynamic_automation.len(), 1);
+        assert_eq!(tone.dynamic_automation[0].index, 0);
+        assert_eq!(tone.dynamic_automation[0].a.frequency_hz, 9_500.0);
+        assert_eq!(tone.dynamic_automation[0].b.frequency_hz, 9_000.0);
+    }
+
+    #[test]
     fn voicing_keeps_inexact_automation_conservative() {
         let fs = 48_000.0;
         let mut d = Diagnostics::default();
@@ -2022,12 +2041,6 @@ mod tests {
         assert_eq!(tone.channels[0].sections()[..made.len()], made[..]);
         let legacy = part(&st, 0, fs, &mut d).unwrap();
         assert!(legacy.sections.is_empty() && legacy.gain_db < 0.0);
-
-        let dynamic = tmst(
-            &auto(0, 0.0, 0.2, (0.8, -12.0, 1000.0), None),
-            &[(0, [3.0, 15.0, -6.0, 800.0, 2.0, 4.0, -20.0, 0.0])],
-        );
-        assert!(voicing_tone(&dynamic, 2, true, fs, &mut d).is_err());
     }
 
     #[test]
