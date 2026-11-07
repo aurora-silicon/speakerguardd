@@ -1010,10 +1010,10 @@ impl DynamicRun {
             f64::from(section.a2 as f32),
         );
         let mut output = b1 * f64::from(state[0]);
-        output = b0.mul_add(f64::from(input), output);
-        output = b2.mul_add(f64::from(state[1]), output);
-        output = (-a1).mul_add(f64::from(state[2]), output);
-        output = (-a2).mul_add(f64::from(state[3]), output);
+        output = libm::fma(b0, f64::from(input), output);
+        output = libm::fma(b2, f64::from(state[1]), output);
+        output = libm::fma(-a1, f64::from(state[2]), output);
+        output = libm::fma(-a2, f64::from(state[3]), output);
         let output = output as f32;
         state[1] = state[0];
         state[0] = input;
