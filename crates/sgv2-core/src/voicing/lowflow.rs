@@ -571,8 +571,10 @@ impl MaskDetector {
         let median = if region.len() % 2 == 0 { 0.5 * (region[middle - 1] + region[middle]) } else { region[middle] };
         let raw_db = 10.0 * libm::log10(libm::fabs(median + 1.0e-30) + 1.0e-20) + 97.0
             - 4.0 * (self.concentration.clamp(1.0, 4.0) - 1.0);
-        if raw_db > self.peak_db + 3.0 || raw_db < self.peak_db - 12.0 {
+        if raw_db > self.peak_db + 3.0 {
             self.peak_db = raw_db;
+        } else if raw_db + 12.0 < self.peak_db {
+            self.peak_db = raw_db + 12.0;
         }
         let alpha = if self.peak_db > self.db { self.attack } else { self.release };
         self.db += alpha * (self.peak_db - self.db);
