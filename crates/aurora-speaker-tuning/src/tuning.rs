@@ -464,7 +464,7 @@ impl Tuning {
             }
             Some(s)
         } else {
-            if kind == UnitKind::Atsp || kind == UnitKind::Lsm2 {
+            if kind == UnitKind::Lsm2 {
                 diags.info(
                     "params-raw-ids",
                     &pbox.name,
