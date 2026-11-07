@@ -45,9 +45,9 @@ const MASK_REFERENCE_FS: f64 = 48_000.0;
 const MODEL_SCALARS: usize = 28;
 const MAX_FS: f64 = 192_000.0;
 const CONSERVATIVE_GUARD_DB: f64 = 6.0;
-/// Velocity limit reached at the saved max mask point (black-box, SW-LOWFLOW2).
+/// Velocity limit of the fourth mapper point, at the saved max mask point.
 #[cfg(not(feature = "lowflow-conservative"))]
-const MASK_CEILING_VELOCITY: f64 = 1.2111;
+const MASK_CEILING_VELOCITY: f64 = 1.2;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Model {
