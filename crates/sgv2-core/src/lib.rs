@@ -34,6 +34,7 @@ pub mod ring;
 pub mod sense;
 pub mod spp3;
 pub mod telemetry;
+pub mod vdsp;
 pub mod voicing;
 
 pub use failsafe::FailSafe;
