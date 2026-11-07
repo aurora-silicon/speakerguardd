@@ -193,7 +193,7 @@ fn main() {
                     Kind::NonFinite => ("nonfinite", vec![]),
                     Kind::Mstk(_) => ("mstk", vec!["input-amplitude-bound"]),
                     Kind::Cfreak(p) => {
-                        let mut bounds = vec!["cfrk-slow-release-TODO(SPEC)", "cfrk-ceiling-trim"];
+                        let mut bounds = vec!["cfrk-ceiling-trim"];
                         if p.true_peak {
                             bounds.push("cfrk-true-peak-scale");
                         }

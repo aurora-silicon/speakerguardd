@@ -9,18 +9,18 @@ hand-written template and with nobody at the machine.
 
 | Item | Automatic? | What a new Mac needs |
 |---|---|---|
-| Protection unit | spp3 and atsp | spp3 and atsp are at parity. lsm2 is pending. |
+| Protection unit | per type | spp3, atsp and lsm2 are at parity in the shipped policy; LSID is pending. |
 | Kernel driver | no | A `macaudio` match entry and a device tree for the board. |
 | Tuning | yes | The installer collects the Mac's tuning bundle. |
 | Parameter blob | yes | Compiled and bound at boot by `speakerguardd-provision`. The compiler has no table of boards. |
 | Configuration and seat user | yes | Written at boot by `speakerguardd-provision`; the seat user is resolved by name. |
-| Fleet gate | data | `gate.json` (policy only: `units_at_parity`, and per unit the `qualified` boards); the unit is the one the Mac's own tuning names; the kernel's interface picks v2 or the older daemons. |
+| Fleet gate | derived | `gate.json` supplies build-wide `units_at_parity` and deny/override policy; current compilation, own-Mac provenance and silent self-check records qualify the board automatically. |
 | Channel map and V/I order | yes | Derived from the device tree and the tuning, then checked by the self-check (MCA and AOP paths; the J700 is derived but cannot be proven silently). |
 | PipeWire and WirePlumber files | yes | Generated from the self-check's record. |
 | Machine description | yes | Derived from the device tree (`wiring.describe`): the machine key, card id, model, amp and sense counts, plugin variant, speaker format and buffering (per transport driver); the self-check confirms the card id and the format against ALSA. There is no `machines.json`. |
 | Supervisor | yes, for SN012776 and MAX98360A amps | Takes its machine description from the self-check's record; there is no table of boards. |
 | LV2 plugin variant | 2, 4 or 6 amps | Any other amp count needs a new variant. |
-| Voicing (the stages before protection) | no | Still the interim asahi-audio graph. A new board has none yet. |
+| Voicing (the stages before protection) | yes | A new board compiles its own full chain; an unsupported graph fails closed. |
 
 ## 1. The protection unit
 
@@ -29,8 +29,8 @@ records which one it is.
 
 - **spp3** is at parity. It covers the V/I Macs with TAS2764/SN012776 amps:
   the J3xx, J4xx and J6xx families.
-- **lsm2** is pending. It covers the J700 Neo (no V/I) and J713/J813 (V/I).
-- **atsp** is pending. It covers the audio-only Macs.
+- **lsm2** is at parity in the shipped policy. It covers the J700 Neo (no V/I) and J713/J813 (V/I).
+- **atsp** is at parity in the shipped policy. It covers the audio-only Macs.
 
 Until a Mac's unit is at parity, its speakers stay at the kernel's floor.
 
@@ -149,25 +149,30 @@ Distributions install v2 on every Mac beside the older daemons
 (speakerguardd 0.1 and speakersafetyd). The gate is the `ExecCondition=` of
 both, so exactly one stack runs on a board:
 
-- v2 runs when the protection unit the Mac's own tuning names is at parity
-  (`gate.json` `units_at_parity`), the board passed an audible run (that
-  unit's `qualified` list in `gate.json`, while `require_qualified_board` is
-  true), and the kernel has the v2 interface ("Speaker Protection");
-- the older daemons run when v2 does not and the kernel has no v2
-  interface.
+- v2 runs when every protection type in the Mac's own tuning graph compiles
+  without refusals and appears in this build's `units_at_parity`, the silent
+  self-check passes for the board, blob SHA-256 and kernel release, and the
+  verified installer extraction names this board and this individual Mac's
+  unit ID from its own macOS. A new blob or kernel requires a fresh check.
+  The kernel must expose the v2 interface ("Speaker Protection").
+- the older daemons run only on kernels without that interface. On a v2
+  kernel, an unqualified board stays muted at the kernel's floor.
 
-The kernel is the switch: a fleet kernel without the v2 interface keeps
-every Mac on the older daemons, the kernel with it moves every gated Mac at
-once, and booting the older kernel moves it back. atsp joined
-`units_at_parity` when all 117 rig cases matched macOS bit for bit. At the
-fleet cutover `require_qualified_board` stays true: v2 runs on the boards in
-their unit's `qualified` list. A spp3 board that is not on it joins after
-the per-band rig against macOS's own graph. Setting the flag to false runs
-v2 on every board with a parity unit, from its own tuning, and waits for
-that rig coverage. lsm2 joins once it holds every
-Apple limit on every rig case. The data
-is speakerguardd's own; every distribution ships it unchanged.
-`speakerguardd-gate explain` prints the decision.
+The primary unit and any LSID companion are checked separately: `lsid` is
+not at parity, so K114/K116 (AID49/50) remain muted. Parity is a property of
+the unit implementation in the build, never of a board. There is no board
+allowlist. `denied_boards` and `board_overrides` (`allow` or `deny`) are
+policy data; deny wins, and an explicit allow cannot bypass any proof.
+The former `qualified`, `require_qualified_board` and `allow-unqualified`
+mechanisms cannot admit a board.
+
+The provisioning and self-check services use the gate's `prepare` mode,
+which checks graph types, refusals, parity and deny policy without requiring
+records that they have yet to produce. The supervisor's `v2` condition
+requires all current records, matching both reports and bindings. Missing,
+failed or stale records fail closed. Older unbound extraction records must
+be recollected on the Mac's macOS. Every distribution ships the same policy.
+`speakerguardd-gate explain` prints the final decision.
 
 ## 6. The self-check (`speakerguardd-selfcheck`)
 
@@ -268,22 +273,22 @@ on the J413. A boot that has a valid record only checks the binding.
 
 1. Kernel: add the `macaudio` match entry and the board's device tree with
    the amps (section 2).
-2. Confirm the unit is spp3. If it is lsm2 or atsp, wait for that unit's
-   parity.
-3. Confirm the amp count has an LV2 variant (2, 4 or 6), and the speaker
+2. Confirm every protection type in the tuning graph is at parity in this
+   build (including LSID when present).
+3. Confirm the amp count has an LV2 variant (1, 2, 4 or 6), and the speaker
    link's CPU DAI driver is in `wiring.py` TRANSPORTS.
-4. `gate.json`: while `require_qualified_board` is true, add the board to
-   its unit's `qualified` list after its per-band rig against macOS and its
-   silent hardware run. Until then it stays on the older daemons.
-6. Everything else is automatic: the installer collects the tuning,
-   provisioning compiles and binds it and configures the units, the
-   self-check derives and proves the wiring at first boot, and the graph is
-   generated from the self-check's record.
+4. The installer collects the tuning on this Mac's own macOS with board and
+   unit provenance. Provisioning compiles and binds it, the first-boot
+   silent self-check derives and proves the wiring, and the graph is
+   generated from its record. No board-list update or hands-on qualification
+   is required. A failure at any stage keeps the speakers muted.
 
 ## Generated full-chain voicing deployment
 
-`packaging/session/gate.json` has an independent default-off `voicing_pre`
-map keyed by the physical board. A literal `true` compiles the user's bundle
+`packaging/session/gate.json` has a `voicing_pre` deployment-override
+map keyed by the physical board. A new board without an override compiles
+its full chain automatically. Explicit choices retain the existing mode;
+offline fixture artifacts retain their recorded mode for reproducibility. A literal `true` compiles the user's bundle
 with `aurora-speaker-tuning compile --voicing-pre` and generates a stereo
 voicing sink ahead of `RawSpeakers`. Every source parameter comes from that
 bundle at provisioning time. The chain artifact and protection parameters

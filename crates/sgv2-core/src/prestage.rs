@@ -834,10 +834,11 @@ impl DynRun {
 }
 
 /// Running state for one level-dependent ToneMeister slot. The shapes run
-/// `dry + (gain - 1) * carrier` with a fixed carrier (type 15: the detector's
+/// `dry + (gain - 1) * carrier` (type 15: a fixed carrier, the detector's
 /// constant-peak band pass; type 17: a first-order low-pass at twice the
-/// corner; type 18: a first-order high-pass at half the corner). The control
-/// law:
+/// corner divided by the current linear gain, so the shelf keeps its zero at
+/// twice the corner and moves its pole with the gain; type 18: a fixed
+/// first-order high-pass at half the corner). The control law:
 ///
 /// - the side chain passes the detector (type 15: the band pass; type 17/18:
 ///   a second-order Butterworth low/high-pass at the corner);
@@ -857,6 +858,9 @@ struct DynamicRun {
     fs: f64,
     detector: Section,
     component: Section,
+    /// Type 17: the shelf's zero (twice the corner), Hz; its carrier
+    /// follows the gain frame by frame.
+    shelf_zero_hz: Option<f64>,
     detector_filter: ControlFilter,
     component_state: [[f32; 2]; MAX_CHANNELS],
     quadrature: [Section; 2],
@@ -916,6 +920,7 @@ impl DynamicRun {
             fs,
             detector,
             component,
+            shelf_zero_hz: matches!(params.kind, DynamicKind::LowShelf).then_some(2.0 * params.frequency_hz),
             detector_filter: ControlFilter::zeroed(&detector),
             component_state: [[0.0; 2]; MAX_CHANNELS],
             quadrature,
@@ -937,6 +942,7 @@ impl DynamicRun {
         self.detector = fresh.detector;
         self.detector_filter.set(&fresh.detector);
         self.component = fresh.component;
+        self.shelf_zero_hz = fresh.shelf_zero_hz;
         self.curve_samples = fresh.curve_samples;
         self.quadrature = fresh.quadrature;
         self.quadrature_filter[0].set(&fresh.quadrature[0]);
@@ -973,6 +979,18 @@ impl DynamicRun {
     }
 
     #[inline]
+    /// Type 17's carrier at linear gain `g`: the prewarped first-order
+    /// low-pass at `zero_hz / g` (none outside the representable range).
+    fn moving_shelf_carrier(zero_hz: f64, g: f64, fs: f64) -> Option<Section> {
+        let corner = zero_hz / g;
+        if !(g > 0.0 && corner.is_finite() && corner > 0.0 && corner < 0.5 * fs) {
+            return None;
+        }
+        let k = libm::tan(core::f64::consts::PI * corner / fs);
+        let n = 1.0 / (1.0 + k);
+        Some(Section { b0: k * n, b1: k * n, b2: 0.0, a1: (k - 1.0) * n, a2: 0.0 })
+    }
+
     fn step_f32(section: &Section, state: &mut [f32; 2], input: f32) -> f32 {
         let (b0, b1, b2, a1, a2) =
             (section.b0 as f32, section.b1 as f32, section.b2 as f32, section.a1 as f32, section.a2 as f32);
@@ -1093,13 +1111,19 @@ impl DynamicRun {
                 gain[..len].fill(self.held);
             }
             self.control.run(&mut gain[..len]);
+            let mut carriers = [self.component; CONTROL_CHUNK];
+            if let Some(zero_hz) = self.shelf_zero_hz {
+                for (carrier, g) in carriers.iter_mut().zip(gain.iter()).take(len) {
+                    *carrier = Self::moving_shelf_carrier(zero_hz, f64::from(*g), self.fs).unwrap_or(self.component);
+                }
+            }
             for (c, buf) in bufs.iter_mut().enumerate().take(n) {
                 if at.active_mask >> c & 1 == 0 {
                     continue;
                 }
-                for (sample, g) in buf[from..from + len].iter_mut().zip(gain.iter()) {
+                for ((sample, g), carrier) in buf[from..from + len].iter_mut().zip(gain.iter()).zip(carriers.iter()) {
                     let input = if sample.is_finite() { sample.clamp(-INPUT_BOUND, INPUT_BOUND) } else { 0.0 };
-                    let component = Self::step_f32(&self.component, &mut self.component_state[c], input);
+                    let component = Self::step_f32(carrier, &mut self.component_state[c], input);
                     let output = input + (g - 1.0) * component;
                     *sample = if output.is_finite() { output } else { 0.0 };
                 }
@@ -1464,7 +1488,13 @@ impl PreStage {
     }
 
     /// Float-coefficient counterpart of [`Self::run_sections`] for a
-    /// ToneMeister box. Its static cascade rounds after every section.
+    /// ToneMeister box. Its static cascade rounds after every section and
+    /// steps each frame as a fused transposed direct form II, the way the
+    /// platform's single-precision multichannel biquad steps a setup of two
+    /// or more channels (black-box renders of the installed unit: a
+    /// 2-channel box's automated peak matches it bit for bit; the unfused
+    /// form leaves a rounding floor up to 8 dB louder, e.g. under a 16 kHz
+    /// tone through 80-100 Hz sections).
     fn run_sections_float(&mut self, c: usize, from: usize, to: usize, gain: f64, buf: &mut [f32]) {
         let (Some(ch), Some(z)) = (self.params.channel.get(c), self.state.get_mut(c)) else {
             buf.fill(0.0);
@@ -1475,9 +1505,10 @@ impl PreStage {
         for y in buf.iter_mut() {
             let mut v = if y.is_finite() { y.clamp(-INPUT_BOUND, INPUT_BOUND) } else { 0.0 };
             for (s, st) in ch.sections[from..to].iter().zip(z[from..to].iter_mut()) {
-                let out = s.b0 as f32 * v + st[0] as f32;
-                let z0 = s.b1 as f32 * v - s.a1 as f32 * out + st[1] as f32;
-                let z1 = s.b2 as f32 * v - s.a2 as f32 * out;
+                let (b0, b1, b2, a1, a2) = (s.b0 as f32, s.b1 as f32, s.b2 as f32, s.a1 as f32, s.a2 as f32);
+                let out = libm::fmaf(b0, v, st[0] as f32);
+                let z0 = libm::fmaf(-a1, out, libm::fmaf(b1, v, st[1] as f32));
+                let z1 = libm::fmaf(-a2, out, b2 * v);
                 *st = [z0 as f64, z1 as f64];
                 v = out;
             }
@@ -1638,8 +1669,9 @@ impl PreStage {
 
     /// The filter-only float path used by a ToneMeister box. The installed
     /// box runs its biquad cascade in float, whose rounding is observable
-    /// when many low-frequency sections are cascaded. The protection
-    /// pre-stage deliberately keeps the f64 path above.
+    /// when many low-frequency sections are cascaded; each frame steps as
+    /// in [`Self::run_sections_float`]. The protection pre-stage
+    /// deliberately keeps the f64 path above.
     pub(crate) fn process_float(&mut self, c: usize, input: &[f32], output: &mut [f32]) {
         let (Some(ch), Some(z)) = (self.params.channel.get(c), self.state.get_mut(c)) else {
             output.fill(0.0);
@@ -1653,9 +1685,10 @@ impl PreStage {
         for (x, y) in input.iter().zip(output.iter_mut()) {
             let mut v = if x.is_finite() { x.clamp(-INPUT_BOUND, INPUT_BOUND) } else { 0.0 };
             for (s, st) in secs.iter().zip(z.iter_mut()) {
-                let out = s.b0 as f32 * v + st[0] as f32;
-                let z0 = s.b1 as f32 * v - s.a1 as f32 * out + st[1] as f32;
-                let z1 = s.b2 as f32 * v - s.a2 as f32 * out;
+                let (b0, b1, b2, a1, a2) = (s.b0 as f32, s.b1 as f32, s.b2 as f32, s.a1 as f32, s.a2 as f32);
+                let out = libm::fmaf(b0, v, st[0] as f32);
+                let z0 = libm::fmaf(-a1, out, libm::fmaf(b1, v, st[1] as f32));
+                let z1 = libm::fmaf(-a2, out, b2 * v);
                 st[0] = z0 as f64;
                 st[1] = z1 as f64;
                 v = out;
@@ -1674,6 +1707,23 @@ impl PreStage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn type_17_shelf_keeps_its_zero_and_moves_its_pole_with_the_gain() {
+        // Synthetic corner, not any Mac's.
+        let (zero_hz, fs) = (720.0, 48_000.0);
+        for g in [0.5, 1.0, 1.5, 3.0] {
+            let carrier = DynamicRun::moving_shelf_carrier(zero_hz, g, fs).unwrap();
+            // The carrier's corner sits at zero / g (prewarped, so exact).
+            let at_corner = carrier.magnitude(zero_hz / g, fs);
+            assert!((at_corner - core::f64::consts::FRAC_1_SQRT_2).abs() < 1e-12, "{g} {at_corner}");
+            // dry + (g - 1) * carrier: gain g at DC, unity at Nyquist.
+            let dc = 1.0 + (g - 1.0) * carrier.magnitude(0.0, fs);
+            assert!((dc - g).abs() < 1e-12, "{g} {dc}");
+        }
+        assert!(DynamicRun::moving_shelf_carrier(zero_hz, 0.0, fs).is_none());
+        assert!(DynamicRun::moving_shelf_carrier(zero_hz, 0.01, fs).is_none());
+    }
 
     fn hp2(f0: f64, fs: f64) -> Section {
         // Butterworth high-pass, bilinear with prewarping
@@ -1726,6 +1776,24 @@ mod tests {
         // a channel the pre-stage does not have is muted
         s.process(5, &x, &mut y);
         assert!(y.iter().all(|v| *v == 0.0));
+    }
+
+    #[test]
+    fn tone_float_cascade_steps_fused() {
+        // Synthetic section, not any Mac's: a 0 dB 100 Hz peak's poles.
+        let s = Section { b0: 1.000_01, b1: -1.998_7, b2: 0.998_72, a1: -1.998_7, a2: 0.998_73 };
+        let mut stage = PreStage::new(params(&[s], 1.0));
+        let x: std::vec::Vec<f32> = (0..256).map(|i| (0.37 * i as f32).sin() * 0.5).collect();
+        let mut y = std::vec![0.0f32; x.len()];
+        stage.process_float(0, &x, &mut y);
+        let (b0, b1, b2, a1, a2) = (s.b0 as f32, s.b1 as f32, s.b2 as f32, s.a1 as f32, s.a2 as f32);
+        let (mut z1, mut z2) = (0.0f32, 0.0f32);
+        for (v, out) in x.iter().zip(&y) {
+            let o = libm::fmaf(b0, *v, z1);
+            z1 = libm::fmaf(-a1, o, libm::fmaf(b1, *v, z2));
+            z2 = libm::fmaf(-a2, o, b2 * v);
+            assert_eq!(o.to_bits(), out.to_bits());
+        }
     }
 
     fn dyn_params() -> Params {
