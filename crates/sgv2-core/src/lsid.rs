@@ -72,7 +72,7 @@ impl Bank {
     }
     fn window_length(&self) -> Option<usize> {
         let saved = self.fft_length();
-        if !saved.is_finite() || saved != saved.round() || saved <= 0.0 {
+        if !saved.is_finite() || saved != libm::roundf(saved) || saved <= 0.0 {
             return None;
         }
         let raw = saved as usize;
@@ -82,7 +82,7 @@ impl Bank {
     fn desired_rate(&self, fallback: u32) -> u32 {
         let v = self.impedance[5];
         if v.is_finite() && v >= 1.0 && v <= fallback as f32 {
-            v.round() as u32
+            libm::roundf(v) as u32
         } else {
             fallback
         }
@@ -706,7 +706,7 @@ impl Estimator {
         }
         let coherence = (cross.norm2() / (vv * ii)).clamp(0.0, 1.0) as f32;
         let threshold = bank.rdc[2].clamp(0.0, 1.0);
-        let parallel = if bank.rdc[31].is_finite() && bank.rdc[31] >= 1.0 { bank.rdc[31].round() } else { 1.0 };
+        let parallel = if bank.rdc[31].is_finite() && bank.rdc[31] >= 1.0 { libm::roundf(bank.rdc[31]) } else { 1.0 };
         let raw_rdc = (r_num / r_den) as f32 * parallel;
         let (rmin, rmax) = positive_bounds(bank.rdc[4], bank.rdc[5])?;
         if coherence < threshold || !raw_rdc.is_finite() || !(rmin..=rmax).contains(&raw_rdc) {
@@ -775,7 +775,7 @@ fn seconds_to_frames(seconds: f32, rate: u32) -> u64 {
     if !seconds.is_finite() || seconds <= 0.0 {
         0
     } else {
-        (seconds as f64 * rate as f64).round() as u64
+        libm::round(seconds as f64 * rate as f64) as u64
     }
 }
 fn smooth_alpha(frames: u64, rate: u32, tau: f32) -> f32 {
@@ -949,7 +949,7 @@ fn coordinate_fit_masked<const N: usize>(
     objective: impl Fn([f32; N]) -> f32,
     best: &mut f32,
 ) {
-    let rounds = if iterations.is_finite() { iterations.round().clamp(1.0, 24.0) as usize } else { 1 };
+    let rounds = if iterations.is_finite() { libm::roundf(iterations).clamp(1.0, 24.0) as usize } else { 1 };
     let mut step = 0.5f32;
     for _ in 0..rounds {
         for k in 0..N {
@@ -1007,7 +1007,7 @@ fn fit_geometry(bank: &Bank, rate: u32) -> (f64, f64, usize) {
     if bank.lr2[21] != 0.0 {
         low = low.min(bank.lr2[5].max(1.0) as f64);
         high = high.max(bank.lr2[6] as f64);
-        stride = stride.min(bank.lr2[17].round().max(1.0) as usize);
+        stride = stride.min(libm::roundf(bank.lr2[17]).max(1.0) as usize);
     }
     for branch in &bank.resonance {
         if branch[0] == 0.0 {
@@ -1015,7 +1015,7 @@ fn fit_geometry(bank: &Bank, rate: u32) -> (f64, f64, usize) {
         }
         low = low.min(branch[7].max(1.0) as f64);
         high = high.max(branch[8] as f64);
-        stride = stride.min(branch[26].round().max(1.0) as usize);
+        stride = stride.min(libm::roundf(branch[26]).max(1.0) as usize);
     }
     if !low.is_finite() || high <= low {
         (1.0, rate as f64 * 0.45, 1)
