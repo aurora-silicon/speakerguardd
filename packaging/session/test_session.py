@@ -211,7 +211,22 @@ class Generated(unittest.TestCase):
         self.assertFalse(gen.voicing_enabled("j616c", {"voicing_pre": {"j616s": True}}))
         for value in (False, "true", 1, None):
             self.assertFalse(gen.voicing_enabled("j616s", {"voicing_pre": {"j616s": value}}))
-        self.assertFalse(any(gen.voicing_enabled(gen.fixture(m)["hw"]["board"]) for m in gen.machines()))
+        # Shipped gate (Ryan 2026-11-07, Plan A tonight): the four qualified test
+        # boards together, every other board keeps the interim graph.
+        on = sorted(gen.fixture(m)["hw"]["board"] for m in gen.machines() if gen.voicing_enabled(gen.fixture(m)["hw"]["board"]))
+        self.assertEqual(on, ["j316s", "j413", "j616s", "j700"])
+
+    def test_voicing_bound_is_validated_and_never_positive(self):
+        self.assertIsNone(gen.voicing_bound("j616s", {}))
+        self.assertEqual(gen.voicing_bound("j616s", {"voicing_pre_bound_db": {"j616s": [0, -1.5]}}), [0.0, -1.5])
+        for bad in ([0.1], ["-1"], [True], -1.0, [-13.0], [float("nan")]):
+            with self.assertRaises(ValueError):
+                gen.voicing_bound("j616s", {"voicing_pre_bound_db": {"j616s": bad}})
+        for m in gen.machines():
+            c, w = gen.machine(m)
+            b = gen.voicing_bound(c.get("board", m))
+            if gen.voicing_enabled(c.get("board", m)) and b is not None:
+                self.assertEqual(len(b), c["amps"])
 
     def test_both_modes_target_the_same_protect_input_and_only_generated_mode_owns_volume(self):
         for m in gen.machines():
@@ -224,7 +239,8 @@ class Generated(unittest.TestCase):
             self.assertIn('audio.position = [ FL FR ]', generated)
             self.assertIn('capture.volumes = [ { control = "voicing:volume"', generated)
             self.assertIn('scale = cubic', generated)
-            ports = " ".join(f'"voicing:out_{lane}"' for lane in w[0])
+            b = gen.voicing_bound(c.get("board", m)) or []
+            ports = " ".join(f'"b{lane}:Out"' if lane < len(b) and b[lane] < 0 else f'"voicing:out_{lane}"' for lane in w[0])
             self.assertIn(f'outputs = [ {ports} ]', generated)
             wp_old = gen.wireplumber_conf(m, c, voicing_pre=False)
             wp_new = gen.wireplumber_conf(m, c, voicing_pre=True)
