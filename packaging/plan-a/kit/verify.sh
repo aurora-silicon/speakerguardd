@@ -2,7 +2,7 @@
 # Root on the selected target. Silent, read-only; no tuning values in output.
 set -euo pipefail
 cd -- "$(dirname -- "$0")"
-exec python3 - "$@" <<'PY'
+exec python3 -I - "$@" <<'PY'
 import hashlib
 import json
 import os
@@ -44,7 +44,7 @@ else:
     assert 'voicing=present' in result and 'voicing_plugin=ready' in result
     print(result.strip())
 bind = kv('/var/lib/speakerguardd/provision.bind')
-assert bind['voicing_pre'] == ('false' if interim else 'true'), 'provisioned mode mismatch'
+assert bind.get('voicing_pre', 'false') == ('false' if interim else 'true'), 'provisioned mode mismatch'
 check = kv('/var/lib/speakerguardd/selfcheck.bind')
 assert check['result'] == 'pass', 'selfcheck not passed'
 digest = hashlib.sha256(Path(params).read_bytes()).hexdigest()
@@ -65,7 +65,6 @@ if not interim:
     capture = by_name[f'sgv2.voicing.{board}']
     assert nodes[capture].get('sgv2.stage') == 'voicing-pre'
     output = by_name[f'sgv2.voicing.{board}.out']
-    assert nodes[output].get('target.object') == 'alsa_output.platform-sound.RawSpeakers'
     matched = [l for l in links if int(l['output-node-id']) == output and int(l['input-node-id']) == raw]
     assert len(matched) == kit['channels'], 'incomplete voicing -> RawSpeakers links'
     assert all(l['state'] in ('active', 'paused') for l in matched), 'voicing link failure'

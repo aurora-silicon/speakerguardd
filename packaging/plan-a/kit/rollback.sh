@@ -3,7 +3,7 @@
 set -euo pipefail
 cd -- "$(dirname -- "$0")"
 [[ $EUID == 0 ]]
-python3 - <<'PY'
+python3 -I - <<'PY'
 import json
 from pathlib import Path
 k=json.loads(Path('kit.json').read_text())
