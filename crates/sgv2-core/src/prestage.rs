@@ -1138,7 +1138,8 @@ impl DynamicRun {
                         *sample = Self::step_f32_fused(&self.component, &mut self.component_state[c], *sample);
                     }
                 }
-                for ((sample, g), component) in buf[from..from + len].iter_mut().zip(gain.iter()).zip(component.iter()) {
+                for ((sample, g), component) in buf[from..from + len].iter_mut().zip(gain.iter()).zip(component.iter())
+                {
                     let input = if sample.is_finite() { sample.clamp(-INPUT_BOUND, INPUT_BOUND) } else { 0.0 };
                     // The installed vector path subtracts one from the
                     // control, multiplies the carrier, then adds the dry
