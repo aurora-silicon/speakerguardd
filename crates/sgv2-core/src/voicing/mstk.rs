@@ -144,6 +144,10 @@ pub struct Params {
     pub render_quality: u32,
     pub overshoot_compensation: bool,
     pub algorithm: u32,
+    /// Whether automated algorithm-3 band zero uses the 25G83 selected-rate
+    /// detector producer. macOS 27 uses the host-rate producer instead.
+    /// Unknown source builds deliberately retain the established 25G83 law.
+    pub selected_rate_band_zero: bool,
     pub automation_input: f64,
     pub automation_min: f64,
     pub automation_max: f64,
@@ -164,6 +168,7 @@ impl Default for Params {
             render_quality: 0,
             overshoot_compensation: false,
             algorithm: 0,
+            selected_rate_band_zero: true,
             automation_input: 0.0,
             automation_min: -100.0,
             automation_max: 0.0,
@@ -174,9 +179,12 @@ impl Default for Params {
 }
 
 impl Params {
-    const HEAD_WORDS: usize = 17;
+    const LEGACY_HEAD_WORDS: usize = 17;
+    const HEAD_WORDS: usize = 18;
     const BAND_WORDS: usize = 13;
     const AUTOMATION_WORDS: usize = 1 + 2 * MAX_AUTOMATION_POINTS;
+    /// The original word count. Decoding it selects the 25G83 law.
+    pub const LEGACY_WORDS: usize = Self::LEGACY_HEAD_WORDS + BANDS * (Self::BAND_WORDS + Self::AUTOMATION_WORDS);
     pub const WORDS: usize = Self::HEAD_WORDS + BANDS * (Self::BAND_WORDS + Self::AUTOMATION_WORDS);
 
     pub fn to_words(&self, out: &mut [f64]) {
@@ -197,6 +205,7 @@ impl Params {
         out[14] = self.automation_input;
         out[15] = self.automation_min;
         out[16] = self.automation_max;
+        out[17] = self.selected_rate_band_zero as u8 as f64;
         for (i, b) in self.band.iter().enumerate() {
             let o = Self::HEAD_WORDS + i * Self::BAND_WORDS;
             out[o..o + Self::BAND_WORDS].copy_from_slice(&[
@@ -227,7 +236,7 @@ impl Params {
     }
 
     pub fn from_words(w: &[f64]) -> Option<Params> {
-        if w.len() != Self::WORDS || w.iter().any(|v| !v.is_finite()) {
+        if !matches!(w.len(), Self::LEGACY_WORDS | Self::WORDS) || w.iter().any(|v| !v.is_finite()) {
             return None;
         }
         let boolean = |v: f64| {
@@ -246,6 +255,7 @@ impl Params {
                 None
             }
         };
+        let head_words = if w.len() == Self::WORDS { Self::HEAD_WORDS } else { Self::LEGACY_HEAD_WORDS };
         let mut p = Params {
             crossover_hz: [w[0], w[1], w[2]],
             crossover_order: [w[3], w[4], w[5]],
@@ -257,13 +267,14 @@ impl Params {
             render_quality: integer(w[11], 2)?,
             overshoot_compensation: boolean(w[12])?,
             algorithm: integer(w[13], 3)?,
+            selected_rate_band_zero: if head_words == Self::HEAD_WORDS { boolean(w[17])? } else { true },
             automation_input: w[14],
             automation_min: w[15],
             automation_max: w[16],
             ..Default::default()
         };
         for (i, b) in p.band.iter_mut().enumerate() {
-            let o = Self::HEAD_WORDS + i * Self::BAND_WORDS;
+            let o = head_words + i * Self::BAND_WORDS;
             let mode = match integer(w[o], 2)? {
                 0 => BandMode::Active,
                 1 => BandMode::Pass,
@@ -286,7 +297,7 @@ impl Params {
                 saturation: sat.then_some(flavor),
             };
         }
-        let base = Self::HEAD_WORDS + BANDS * Self::BAND_WORDS;
+        let base = head_words + BANDS * Self::BAND_WORDS;
         for (band, curve) in p.threshold_automation.iter_mut().enumerate() {
             let o = base + band * Self::AUTOMATION_WORDS;
             let count = integer(w[o], MAX_AUTOMATION_POINTS as u32)? as usize;
@@ -1032,7 +1043,7 @@ fn detector_factors(p: &Params) -> [usize; BANDS] {
 /// 4/8/10/12. The transition to factor 15 is exactly where the Butterworth
 /// half first needs section index 2.
 fn band_zero_factor(p: &Params, fs: f64) -> usize {
-    let automated_pick = cadence(p) == Cadence::PickEight && p.algorithm >= 3;
+    let automated_pick = p.selected_rate_band_zero && cadence(p) == Cadence::PickEight && p.algorithm >= 3;
     if (!automated_pick && p.algorithm != 0) || p.band[0].mode != BandMode::Active {
         return 1;
     }
@@ -1678,6 +1689,11 @@ mod tests {
         let mut w = [0.0; Params::WORDS];
         p.to_words(&mut w);
         assert_eq!(Params::from_words(&w), Some(p));
+        let legacy = [&w[..17], &w[18..]].concat();
+        let mut expected = p;
+        expected.selected_rate_band_zero = true;
+        assert_eq!(legacy.len(), Params::LEGACY_WORDS);
+        assert_eq!(Params::from_words(&legacy), Some(expected));
         w[3] = 21.0;
         assert!(Params::from_words(&w).is_none());
     }
@@ -1972,6 +1988,11 @@ mod tests {
             assert_eq!(band_zero_factor(&p, 48_000.0), expected, "order {order}");
             assert_eq!(Run::new(&p, 48_000.0, 1).band_zero_pick_lag, expected == 1, "order {order}");
         }
+
+        p.selected_rate_band_zero = false;
+        assert_eq!(band_zero_factor(&p, 48_000.0), 1);
+        assert!(Run::new(&p, 48_000.0, 1).band_zero_pick_lag);
+        p.selected_rate_band_zero = true;
 
         p.render_quality = 2;
         p.crossover_hz.copy_from_slice(&[250.0, 1500.0, 8000.0]);

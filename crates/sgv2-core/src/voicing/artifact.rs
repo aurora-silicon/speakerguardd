@@ -276,7 +276,7 @@ impl Wire for Kind {
                 }
             }
             Self::Mstk(p) => {
-                8u32.put(o);
+                28u32.put(o);
                 let mut w = vec![0.0; super::mstk::Params::WORDS];
                 p.to_words(&mut w);
                 for v in w {
@@ -386,8 +386,9 @@ impl Wire for Kind {
                 let w: Vec<f64> = (0..words).map(|_| f64::get(r)).collect::<Result<_>>()?;
                 Self::Cfreak(Box::new(super::cfreak::Params::from_words(&w).ok_or(BlobError::Unstable)?))
             }
-            8 => {
-                let w: Vec<f64> = (0..super::mstk::Params::WORDS).map(|_| f64::get(r)).collect::<Result<_>>()?;
+            tag @ (8 | 28) => {
+                let words = if tag == 8 { super::mstk::Params::LEGACY_WORDS } else { super::mstk::Params::WORDS };
+                let w: Vec<f64> = (0..words).map(|_| f64::get(r)).collect::<Result<_>>()?;
                 Self::Mstk(Box::new(super::mstk::Params::from_words(&w).ok_or(BlobError::Unstable)?))
             }
             9 => {

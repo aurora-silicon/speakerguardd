@@ -78,6 +78,17 @@ fn threshold_automation(stage: &Stage, input_min: f64, input_max: f64) -> Result
 /// element defaults; a non-identical part section is refused rather than
 /// mistaken for an active volume/channel curve.
 pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option<Params>> {
+    compile_for(stage, fs, None, diags)
+}
+
+/// [`compile`] for a tuning extracted from macOS build `source_build`.
+/// Unknown builds retain the established 25G83 selected-rate law.
+pub fn compile_for(
+    stage: &Stage,
+    fs: f64,
+    source_build: Option<&str>,
+    diags: &mut Diagnostics,
+) -> Result<Option<Params>> {
     if stage.unit.map(|u| u.subtype) != Some(MSTK) {
         return Err(bad(stage, "is not aufx/mstk"));
     }
@@ -169,6 +180,7 @@ pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option
         render_quality: integer(64, 0.0, 2)?,
         overshoot_compensation: flag(stage, 69, opt(69, 0.0))?,
         algorithm: integer(70, 0.0, 3)?,
+        selected_rate_band_zero: !super::cfreak::macos27(source_build),
         automation_input,
         automation_min,
         automation_max,
@@ -270,6 +282,15 @@ mod tests {
         assert_eq!((p.band[0].up_ratio, p.band[0].exp_ratio, p.band[0].input_gain_db), (2.0, 1.5, -3.0));
         assert_eq!(p.band[0].saturation, Some(4));
         assert!(p.overshoot_compensation);
+    }
+
+    #[test]
+    fn source_build_selects_the_band_zero_producer() {
+        let s = stage(&[(69, 1.0), (70, 3.0)]);
+        for (build, selected) in [(None, true), (Some("25G83"), true), (Some("26B8125"), false)] {
+            let p = compile_for(&s, 48_000.0, build, &mut Diagnostics::default()).unwrap().unwrap();
+            assert_eq!(p.selected_rate_band_zero, selected, "build {build:?}");
+        }
     }
 
     #[test]
