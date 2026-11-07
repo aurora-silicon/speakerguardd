@@ -9,11 +9,13 @@
 //! The poles of a boost are the analog prototype's poles mapped by
 //! `z = exp(sT)`. Its minimum-phase numerator is the real second-order FIR
 //! whose magnitude matches the analog target at DC, one-third Nyquist and
-//! two-thirds Nyquist. A peak or low-shelf cut is the exact inverse of its
-//! complementary boost; a high-shelf cut is designed directly, the same way
-//! as a boost (black-box renders of the installed unit: the inverse misses
-//! it by 0.003, 0.018 and 0.034 dB at -6, -12 and -15 dB, the direct design
-//! matches). This avoids the high-frequency cramping of a bilinear biquad.
+//! two-thirds Nyquist. A peak cut is the exact inverse of its complementary
+//! boost; a shelf cut, low or high, is designed directly, the same way as a
+//! boost (black-box: the unit's exact coefficients, read back from 300
+//! single-slot impulse renders, carry the cut's own poles; the inverse of
+//! the boost misses a high-shelf cut by 0.003, 0.018 and 0.034 dB at -6, -12
+//! and -15 dB). A 0 dB low shelf is no filter at all. This avoids the
+//! high-frequency cramping of a bilinear biquad.
 //!
 //! The peak is computed in the unit's own Float32 order. Its exact Float32
 //! coefficients were read back from single-slot impulse renders of the
@@ -33,6 +35,7 @@ enum Shape {
     HighShelf,
 }
 
+#[cfg(test)]
 fn inverse(s: Section) -> Section {
     Section { b0: 1.0 / s.b0, b1: s.a1 / s.b0, b2: s.a2 / s.b0, a1: s.b1 / s.b0, a2: s.b2 / s.b0 }
 }
@@ -203,9 +206,37 @@ fn peak_magnitudes(gain_db: f64, f0: f64, q: f64, fs: f64, den_z: [f64; 2]) -> [
     [d0, peak_analog_magnitude(x1, gain, q) * d1, peak_analog_magnitude(x2, gain, q) * d2]
 }
 
+/// An ordinary shelf's pole pair, mapped in Float32 as the unit maps it:
+/// the prototype `s^2 + s/Q + 1` at the shelf's natural frequency (`w`
+/// scaled by `1/sqrt(A)` for a low shelf, `sqrt(A)` for a high shelf, with
+/// `A` one Float32 exponential), its roots mapped by `exp`. An overdamped
+/// prototype keeps its two real roots.
+fn shelf_den(shape: Shape, gain_db: f64, f0: f64, q: f64, fs: f64) -> [f64; 2] {
+    let a = peak_amplitude(gain_db);
+    let root = libm::sqrtf(a);
+    let natural = match shape {
+        Shape::LowShelf => 1.0 / root,
+        Shape::HighShelf => root,
+    };
+    let damping = 1.0 / (2.0 * q as f32);
+    let w = natural * (2.0 * PI * f0 / fs) as f32;
+    let dw = damping * w;
+    let a2 = exp32(-2.0 * dw);
+    if damping >= 1.0 {
+        let spread = libm::sqrtf(damping * damping - 1.0);
+        let p0 = exp32(-((damping - spread) * w));
+        let p1 = exp32(-((damping + spread) * w));
+        [f64::from(-(p0 + p1)), f64::from(a2)]
+    } else {
+        let radius = exp32(-dw);
+        let angle = libm::sqrtf(1.0 - damping * damping) * w;
+        [f64::from(-2.0 * (radius * cos32(angle))), f64::from(a2)]
+    }
+}
+
 fn matched(shape: Shape, gain_db: f64, f0: f64, q: f64, fs: f64) -> Section {
-    if gain_db < 0.0 && !matches!(shape, Shape::HighShelf) {
-        return inverse(matched(shape, -gain_db, f0, q, fs));
+    if gain_db == 0.0 && matches!(shape, Shape::LowShelf) {
+        return Section::IDENTITY;
     }
 
     let a = libm::pow(10.0, gain_db / 40.0);
@@ -216,7 +247,7 @@ fn matched(shape: Shape, gain_db: f64, f0: f64, q: f64, fs: f64) -> Section {
         // A * N/D gives unity at DC and A^2 at high frequency.
         Shape::HighShelf => ([a, root_a / q, 1.0], [1.0, root_a / q, a], a),
     };
-    let den_z = matched_den(den, f0, fs);
+    let den_z = shelf_den(shape, gain_db, f0, q, fs);
     let mut magnitude = [0.0; 3];
     for (i, w) in [0.0, PI / 3.0, 2.0 * PI / 3.0].into_iter().enumerate() {
         let x = if w == 0.0 { 0.0 } else { w * fs / (2.0 * PI * f0) };
@@ -716,6 +747,32 @@ mod tests {
         assert!((20.0 * libm::log10(magnitude(cut, 16_000.0, fs)) + 12.0).abs() < 0.5);
         let inverse_boost = inverse(high_shelf(12.0, 6000.0, core::f64::consts::FRAC_1_SQRT_2, fs));
         assert!((magnitude(cut, 4000.0, fs) - magnitude(inverse_boost, 4000.0, fs)).abs() > 1e-4);
+        // so is a low-shelf cut: it keeps its own poles
+        let low_cut = low_shelf(-9.0, 300.0, 0.8, fs);
+        let low_inverse = inverse(low_shelf(9.0, 300.0, 0.8, fs));
+        assert!((20.0 * libm::log10(magnitude(low_cut, 0.0, fs)) + 9.0).abs() < 1e-9);
+        assert_ne!((low_cut.a1, low_cut.a2), (low_inverse.a1, low_inverse.a2));
+        // a 0 dB low shelf is no filter; a 0 dB high shelf still is one
+        assert_eq!(low_shelf(0.0, 300.0, 0.8, fs), Section::IDENTITY);
+        assert_ne!(high_shelf(0.0, 300.0, 0.8, fs).a1, 0.0);
+    }
+
+    #[test]
+    fn shelf_poles_are_the_scaled_prototype_roots_in_float32() {
+        // Synthetic shelf, not any Mac's: the poles sit at the shelf's
+        // natural frequency f0/sqrt(A) (low) or f0*sqrt(A) (high).
+        let fs = 48_000.0;
+        for (shelf, natural) in
+            [(low_shelf as fn(f64, f64, f64, f64) -> Section, 500.0 / 2.0), (high_shelf, 500.0 * 2.0)]
+        {
+            let s = shelf(24.082_4, 500.0, 0.6, fs);
+            let w = 2.0 * PI * natural / fs;
+            let (d, root) = (1.0 / 1.2, libm::sqrt(1.0 - 1.0 / 1.44));
+            let r = libm::exp(-d * w);
+            assert!((s.a2 - r * r).abs() < 1e-6, "{} {}", s.a2, r * r);
+            assert!((s.a1 + 2.0 * r * libm::cos(root * w)).abs() < 1e-6);
+            assert_eq!(s.a1, s.a1 as f32 as f64);
+        }
     }
 
     #[test]
