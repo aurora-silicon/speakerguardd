@@ -820,50 +820,43 @@ impl DynRun {
     }
 }
 
-/// Running state for one level-dependent ToneMeister slot. The two shapes use
-/// a band-limited detector and `dry + (gain - 1) * component`. With explicit
-/// attack/release disabled, two all-pass branches supply a quadrature
-/// magnitude at the control cadence and a low-pass reconstructs the held
-/// gain. The carrier itself is never delayed.
+/// Running state for one level-dependent ToneMeister slot. Both shapes run
+/// `dry + (gain - 1) * carrier` with a fixed carrier (type 15: the detector's
+/// constant-peak band pass; type 18: a first-order high-pass at half the
+/// corner). The control law:
+///
+/// - the side chain passes the detector (type 15: the band pass; type 18: a
+///   second-order Butterworth high-pass at the corner);
+/// - two all-pass branches at half and twice the analysis centre form a
+///   quadrature pair; their magnitude is taken on the first frame of every
+///   16 (the phase carries across render calls) and mapped through the
+///   44-point response curve; the Float32 result is held for 16 frames;
+/// - the held gain passes a 20 Hz second-order low-pass whose Float32
+///   coefficients and histories follow the platform's single-precision
+///   multichannel biquad ([`ControlFilter`]), primed at unity.
+///
+/// The low-pass's near-unity poles make its Float32 arithmetic part of the
+/// response: it settles the idle carrier slightly above unity and every
+/// held floor a little away from the curve. That is the installed unit's
+/// behaviour and is reproduced, not corrected.
 struct DynamicRun {
     fs: f64,
     detector: Section,
     component: Section,
     detector_state: [f32; 2],
     component_state: [[f32; 2]; MAX_CHANNELS],
-    conservative_detector_state: [f64; 2],
-    conservative_component_state: [[f64; 2]; MAX_CHANNELS],
     quadrature: [Section; 2],
     quadrature_state: [[f32; 2]; 2],
     control_phase: usize,
-    response_gain: f64,
-    idle_below_knee: bool,
-    release_armed: bool,
-    carrier_handoff: bool,
-    previous_reconstruction: f32,
-    carrier_settle_frames: usize,
-    carrier_settled: bool,
-    reconstructed_gain: f64,
-    reconstruction: Section,
-    reconstruction_state: [f32; 4],
+    held: f32,
+    control: ControlFilter,
     envelope: f64,
 }
 
-impl DynamicRun {
-    // The fixed carrier remains present at the response curve's nominal
-    // neutral point. Attack stays on the active response; release hands the
-    // carrier back to this target through the control reconstruction.
-    const CARRIER_NEUTRAL: f32 = 0.013_660_6;
-    const CURVE_STEP_DB: f64 = 100.0 / 43.0;
-    // Do not mistake the response table's small near-knee ripple for a
-    // release. The installed controller stays on its active path until it
-    // has made a material reduction; only that path can subsequently hand
-    // the carrier back to neutral. Two neutral-carrier steps are the first
-    // unambiguous reduction beyond the shaped idle response.
-    const RELEASE_ARM_GAIN: f64 = 1.0 / ((1.0 + Self::CARRIER_NEUTRAL as f64) * (1.0 + Self::CARRIER_NEUTRAL as f64));
-    const CARRIER_SETTLE_DELTA: f32 = 1e-7;
-    const CARRIER_SETTLE_FRAMES: usize = 256;
+/// Frames per control-filter call; a multiple of the filter's group.
+const CONTROL_CHUNK: usize = 64;
 
+impl DynamicRun {
     fn new(params: &DynamicFilter, fs: f64) -> DynamicRun {
         let detector = match params.kind {
             DynamicKind::Notch => {
@@ -895,28 +888,17 @@ impl DynamicRun {
             DynamicKind::HighShelf => libm::sqrt(params.frequency_hz * 20_000.0).clamp(40.0, 10_000.0),
         };
         let quadrature = [Self::allpass(0.5 * analysis_hz, 0.37, fs), Self::allpass(2.0 * analysis_hz, 0.37, fs)];
-        let reconstruction = Self::lowpass(20.0, 0.707, fs);
         DynamicRun {
             fs,
             detector,
             component,
             detector_state: [0.0; 2],
             component_state: [[0.0; 2]; MAX_CHANNELS],
-            conservative_detector_state: [0.0; 2],
-            conservative_component_state: [[0.0; 2]; MAX_CHANNELS],
             quadrature,
             quadrature_state: [[0.0; 2]; 2],
             control_phase: 0,
-            response_gain: 1.0,
-            idle_below_knee: true,
-            release_armed: false,
-            carrier_handoff: false,
-            previous_reconstruction: 1.0,
-            carrier_settle_frames: 0,
-            carrier_settled: false,
-            reconstructed_gain: 1.0,
-            reconstruction,
-            reconstruction_state: [1.0; 4],
+            held: 1.0,
+            control: ControlFilter::new(&Self::lowpass(20.0, f64::from(0.707f32), fs)),
             envelope: 0.0,
         }
     }
@@ -930,25 +912,16 @@ impl DynamicRun {
         self.detector = fresh.detector;
         self.component = fresh.component;
         self.quadrature = fresh.quadrature;
-        self.reconstruction = fresh.reconstruction;
+        self.control.set(&Self::lowpass(20.0, f64::from(0.707f32), fs));
     }
 
     fn reset(&mut self) {
         self.detector_state = [0.0; 2];
         self.component_state = [[0.0; 2]; MAX_CHANNELS];
-        self.conservative_detector_state = [0.0; 2];
-        self.conservative_component_state = [[0.0; 2]; MAX_CHANNELS];
         self.quadrature_state = [[0.0; 2]; 2];
         self.control_phase = 0;
-        self.response_gain = 1.0;
-        self.idle_below_knee = true;
-        self.release_armed = false;
-        self.carrier_handoff = false;
-        self.previous_reconstruction = 1.0;
-        self.carrier_settle_frames = 0;
-        self.carrier_settled = false;
-        self.reconstructed_gain = 1.0;
-        self.reconstruction_state = [1.0; 4];
+        self.held = 1.0;
+        self.control.prime(&Self::lowpass(20.0, f64::from(0.707f32), self.fs), 1.0);
         self.envelope = 0.0;
     }
 
@@ -979,62 +952,6 @@ impl DynamicRun {
         output
     }
 
-    #[inline]
-    fn step_conservative_f64(section: &Section, state: &mut [f64; 2], input: f64) -> f64 {
-        let output = section.b0 * input + state[0];
-        state[0] = section.b1 * input - section.a1 * output + state[1];
-        state[1] = section.b2 * input - section.a2 * output;
-        output
-    }
-
-    #[inline]
-    fn step_df1_f32(section: &Section, state: &mut [f32; 4], input: f32) -> f32 {
-        let (b0, b1, b2, a1, a2) =
-            (section.b0 as f32, section.b1 as f32, section.b2 as f32, section.a1 as f32, section.a2 as f32);
-        let output = b0 * input + b1 * state[0] + b2 * state[1] - a1 * state[2] - a2 * state[3];
-        state[1] = state[0];
-        state[0] = input;
-        state[3] = state[2];
-        state[2] = output;
-        output
-    }
-
-    /// The installed reconstruction setup publishes Float32 coefficients to
-    /// a single-precision multichannel vDSP filter through the double-
-    /// coefficient API. Samples and the four histories remain Float32.
-    #[inline]
-    fn step_vdsp_df1_f32(section: &Section, state: &mut [f32; 4], input: f32) -> f32 {
-        // AudioDSP's designer publishes five Float32 coefficients. Its vDSP
-        // wrapper then widens those exact values for SetCoefficientsDouble.
-        let (b0, b1, b2, a1, a2) = (
-            f64::from(section.b0 as f32),
-            f64::from(section.b1 as f32),
-            f64::from(section.b2 as f32),
-            f64::from(section.a1 as f32),
-            f64::from(section.a2 as f32),
-        );
-        let mut output = b1 * f64::from(state[0]);
-        output = libm::fma(b0, f64::from(input), output);
-        output = libm::fma(b2, f64::from(state[1]), output);
-        output = libm::fma(-a1, f64::from(state[2]), output);
-        output = libm::fma(-a2, f64::from(state[3]), output);
-        let output = output as f32;
-        state[1] = state[0];
-        state[0] = input;
-        state[3] = state[2];
-        state[2] = output;
-        output
-    }
-
-    #[inline]
-    fn step_reconstruction(&mut self, kind: DynamicKind, input: f32) -> f32 {
-        if kind == DynamicKind::Notch && !self.carrier_handoff {
-            Self::step_vdsp_df1_f32(&self.reconstruction, &mut self.reconstruction_state, input)
-        } else {
-            Self::step_df1_f32(&self.reconstruction, &mut self.reconstruction_state, input)
-        }
-    }
-
     fn curve(params: &DynamicFilter, level: f64) -> f64 {
         const POINTS: usize = 44;
         const STEP: f64 = 100.0 / 43.0;
@@ -1059,67 +976,17 @@ impl DynamicRun {
         (((a * t + b) * t + c) * t + d).clamp(libm::exp(lo * core::f64::consts::LN_10 / 20.0), 1.0)
     }
 
-    /// Conservative substitute for the installed type-18 spectral
-    /// controller. Its peak-equivalent detector, gentle ratio bound and
-    /// retained release never ask for less cut than the installed unit on
-    /// the qualification matrix, while the exact spectral reconstruction
-    /// remains unavailable.
-    // TODO(SPEC): replace this bound only after the type-18 spectral control
-    // reconstruction is decoded and independently qualified.
-    fn process_conservative_high_shelf(&mut self, at: &DynamicAt, bufs: &mut [&mut [f32]], frames: usize, n: usize) {
-        let sidechains = (0..n).filter(|c| at.sidechain_mask >> c & 1 != 0).count();
-        let mut sum_sq = 0.0;
-        let mut peak = 0.0f64;
-        for i in 0..frames {
-            let mut input = 0.0;
-            for (c, buf) in bufs.iter().enumerate().take(n) {
-                if at.sidechain_mask >> c & 1 != 0 {
-                    let v = buf[i];
-                    input += if v.is_finite() { f64::from(v.clamp(-INPUT_BOUND, INPUT_BOUND)) } else { 0.0 };
-                }
-            }
-            input /= sidechains as f64;
-            let detected = Self::step_conservative_f64(&self.detector, &mut self.conservative_detector_state, input);
-            sum_sq += detected * detected;
-            peak = peak.max(detected.abs());
-        }
-        let rms = libm::sqrt(sum_sq / frames as f64);
-        let measured = (core::f64::consts::SQRT_2 * rms).max(peak);
-        let coefficient =
-            if measured >= self.envelope { 0.0 } else { libm::exp(-(frames as f64) / (500.0 * self.fs / 1_000.0)) };
-        self.envelope += (1.0 - coefficient) * (measured - self.envelope);
-        let mut curve = at.params;
-        curve.threshold_db -= 20.0 * libm::log10(core::f64::consts::SQRT_2);
-        curve.ratio = curve.ratio.min(core::f64::consts::SQRT_2);
-        let gain = Self::curve(&curve, self.envelope);
-        for (c, buf) in bufs.iter_mut().enumerate().take(n) {
-            if at.active_mask >> c & 1 == 0 {
-                continue;
-            }
-            for sample in buf.iter_mut().take(frames) {
-                let input = if sample.is_finite() { f64::from(sample.clamp(-INPUT_BOUND, INPUT_BOUND)) } else { 0.0 };
-                let component =
-                    Self::step_conservative_f64(&self.component, &mut self.conservative_component_state[c], input);
-                let output = input + (gain - 1.0) * component;
-                *sample = if output.is_finite() { output as f32 } else { 0.0 };
+    /// The side-chain sample: the mean of the selected channels.
+    #[inline]
+    fn sidechain(at: &DynamicAt, bufs: &[&mut [f32]], n: usize, sidechains: usize, i: usize) -> f64 {
+        let mut input = 0.0;
+        for (c, buf) in bufs.iter().enumerate().take(n) {
+            if at.sidechain_mask >> c & 1 != 0 {
+                let v = buf[i];
+                input += if v.is_finite() { f64::from(v.clamp(-INPUT_BOUND, INPUT_BOUND)) } else { 0.0 };
             }
         }
-    }
-
-    fn set_response_gain(&mut self, gain: f64) {
-        if gain != self.response_gain {
-            self.carrier_settle_frames = 0;
-            self.carrier_settled = false;
-        }
-        if gain < self.response_gain {
-            self.carrier_handoff = false;
-            self.release_armed |= gain <= Self::RELEASE_ARM_GAIN;
-        } else if gain > self.response_gain {
-            self.carrier_handoff = self.release_armed;
-        }
-        self.response_gain = gain;
-        self.reconstructed_gain =
-            gain * if self.carrier_handoff { 1.0 + f64::from(Self::CARRIER_NEUTRAL) } else { 1.0 };
+        input / sidechains as f64
     }
 
     fn process(&mut self, at: &DynamicAt, bufs: &mut [&mut [f32]], frames: usize) {
@@ -1132,21 +999,11 @@ impl DynamicRun {
         if sidechains == 0 {
             return;
         }
-        if at.params.kind == DynamicKind::HighShelf && !at.params.smooth {
-            self.process_conservative_high_shelf(at, bufs, frames, n);
-            return;
-        }
         if at.params.smooth {
+            // Explicit attack/release: a block envelope on the detector.
             let mut sum_sq = 0.0;
             for i in 0..frames {
-                let mut input = 0.0;
-                for (c, buf) in bufs.iter().enumerate().take(n) {
-                    if at.sidechain_mask >> c & 1 != 0 {
-                        let v = buf[i];
-                        input += if v.is_finite() { f64::from(v.clamp(-INPUT_BOUND, INPUT_BOUND)) } else { 0.0 };
-                    }
-                }
-                input /= sidechains as f64;
+                let input = Self::sidechain(at, bufs, n, sidechains, i);
                 let detected = Self::step_f32(&self.detector, &mut self.detector_state, input as f32);
                 sum_sq += f64::from(detected) * f64::from(detected);
             }
@@ -1155,66 +1012,272 @@ impl DynamicRun {
             let coefficient =
                 if time_ms <= 0.0 { 0.0 } else { libm::exp(-(frames as f64) / (time_ms * self.fs / 1_000.0)) };
             self.envelope += (1.0 - coefficient) * (measured - self.envelope);
-            self.set_response_gain(Self::curve(&at.params, self.envelope));
-            self.idle_below_knee = self.envelope
-                <= libm::exp((at.params.threshold_db - Self::CURVE_STEP_DB) * core::f64::consts::LN_10 / 20.0);
+            self.held = Self::curve(&at.params, self.envelope) as f32;
         }
-        for i in 0..frames {
-            if !at.params.smooth {
-                let mut input = 0.0;
-                for (c, buf) in bufs.iter().enumerate().take(n) {
-                    if at.sidechain_mask >> c & 1 != 0 {
-                        let v = buf[i];
-                        input += if v.is_finite() { f64::from(v.clamp(-INPUT_BOUND, INPUT_BOUND)) } else { 0.0 };
+        let mut gain = [0.0f32; CONTROL_CHUNK];
+        let mut from = 0;
+        while from < frames {
+            let len = (frames - from).min(CONTROL_CHUNK);
+            for (k, held) in gain.iter_mut().enumerate().take(len) {
+                if !at.params.smooth {
+                    let input = Self::sidechain(at, bufs, n, sidechains, from + k);
+                    let detected = Self::step_f32(&self.detector, &mut self.detector_state, input as f32);
+                    let a = Self::step_f32(&self.quadrature[0], &mut self.quadrature_state[0], detected);
+                    let b = Self::step_f32(&self.quadrature[1], &mut self.quadrature_state[1], detected);
+                    if self.control_phase == 0 {
+                        self.envelope = f64::from(libm::sqrtf(a * a + b * b));
+                        self.held = Self::curve(&at.params, self.envelope) as f32;
                     }
+                    self.control_phase = (self.control_phase + 1) & 15;
                 }
-                input /= sidechains as f64;
-                let detected = Self::step_f32(&self.detector, &mut self.detector_state, input as f32);
-                let a = Self::step_f32(&self.quadrature[0], &mut self.quadrature_state[0], detected);
-                let b = Self::step_f32(&self.quadrature[1], &mut self.quadrature_state[1], detected);
-                if self.control_phase == 0 {
-                    self.envelope = f64::from(libm::sqrtf(a * a + b * b));
-                    self.set_response_gain(Self::curve(&at.params, self.envelope));
-                    self.idle_below_knee = self.envelope
-                        <= libm::exp((at.params.threshold_db - Self::CURVE_STEP_DB) * core::f64::consts::LN_10 / 20.0);
-                }
-                self.control_phase = (self.control_phase + 1) & 15;
+                *held = self.held;
             }
-            // The response-table target is bounded, but the installed
-            // second-order reconstruction filter is not post-clamped. Its
-            // small step-response overshoot is part of the release
-            // trajectory (and can briefly put the carrier gain above one).
-            // Type 15's materially active setup uses the exact vDSP
-            // coefficient/history boundary. Its release handoff remains a
-            // separate state: it continues from the already recovered
-            // Float32 trajectory instead of re-publishing the active setup.
-            let reconstructed = self.step_reconstruction(at.params.kind, self.reconstructed_gain as f32);
-            if (self.carrier_handoff || self.idle_below_knee)
-                && self.response_gain == 1.0
-                && (reconstructed - self.previous_reconstruction).abs() < Self::CARRIER_SETTLE_DELTA
-            {
-                self.carrier_settle_frames += 1;
-                self.carrier_settled |= self.carrier_settle_frames >= Self::CARRIER_SETTLE_FRAMES;
-                if self.carrier_settled {
-                    self.release_armed = false;
-                }
-            } else {
-                self.carrier_settle_frames = 0;
-                self.carrier_settled = false;
-            }
-            self.previous_reconstruction = reconstructed;
-            let gain = if self.carrier_settled { 1.0 + Self::CARRIER_NEUTRAL } else { reconstructed };
+            self.control.run(&mut gain[..len]);
             for (c, buf) in bufs.iter_mut().enumerate().take(n) {
                 if at.active_mask >> c & 1 == 0 {
                     continue;
                 }
-                let sample = &mut buf[i];
-                let input = if sample.is_finite() { sample.clamp(-INPUT_BOUND, INPUT_BOUND) } else { 0.0 };
-                let component = Self::step_f32(&self.component, &mut self.component_state[c], input);
-                let output = input + (gain - 1.0) * component;
-                *sample = if output.is_finite() { output } else { 0.0 };
+                for (sample, g) in buf[from..from + len].iter_mut().zip(gain.iter()) {
+                    let input = if sample.is_finite() { sample.clamp(-INPUT_BOUND, INPUT_BOUND) } else { 0.0 };
+                    let component = Self::step_f32(&self.component, &mut self.component_state[c], input);
+                    let output = input + (g - 1.0) * component;
+                    *sample = if output.is_finite() { output } else { 0.0 };
+                }
             }
+            from += len;
         }
+    }
+}
+
+/// The ToneMeister control low-pass, computed the way the platform's
+/// single-precision multichannel biquad computes one section on one channel.
+///
+/// The unit designs the section in double, rounds the five coefficients to
+/// Float32 and hands those (widened) to the platform filter, which:
+///
+/// - prepares, in double, the first eight terms of the denominator response
+///   `D` and of the complete impulse response `H`, each rounded once to
+///   Float32;
+/// - keeps a transposed state `z1, z2` plus the last two inputs and outputs;
+/// - runs every call as whole eight-frame groups, then one four-frame group
+///   if four or more frames remain, then single frames; a call boundary
+///   restarts that schedule but keeps the state;
+/// - evaluates a group as a triangular matrix of `H` over the group's inputs
+///   plus `D` over the entry state, lane by lane as one rounded product and
+///   a chain of Float32 fused multiply-adds; lanes 4 to 7 of an eight-frame
+///   group sum two partial chains (first half of the inputs with `z1`;
+///   second half with `z2`) with a final plain addition;
+/// - republishes `z1, z2` after a group from its last two inputs and
+///   outputs, and steps single frames as fused transposed direct form II.
+///
+/// With poles this close to unity the Float32 rounding is part of the
+/// response (the idle carrier settles at about 1.01366, not at the
+/// coefficients' DC gain). The unit primes the filter by running a constant
+/// through an identity section before installing the low-pass.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ControlFilter {
+    /// Direct coefficients as supplied (Float32 values, widened).
+    coefficients: [f64; 5],
+    b: [f32; 3],
+    a: [f32; 2],
+    d: [f32; 8],
+    h: [f32; 8],
+    z: [f32; 2],
+    /// x[n-2], x[n-1], y[n-2], y[n-1]
+    history: [f32; 4],
+}
+
+impl ControlFilter {
+    const IDENTITY: [f64; 5] = [1.0, 0.0, 0.0, 0.0, 0.0];
+
+    fn new(section: &Section) -> ControlFilter {
+        let mut filter = ControlFilter {
+            coefficients: [0.0; 5],
+            b: [0.0; 3],
+            a: [0.0; 2],
+            d: [0.0; 8],
+            h: [0.0; 8],
+            z: [0.0; 2],
+            history: [0.0; 4],
+        };
+        filter.prime(section, 1.0);
+        filter
+    }
+
+    fn rounded(section: &Section) -> [f64; 5] {
+        [section.b0, section.b1, section.b2, section.a1, section.a2].map(|v| f64::from(v as f32))
+    }
+
+    /// Reset, run `value` twice through an identity section, then install
+    /// the section.
+    fn prime(&mut self, section: &Section, value: f32) {
+        self.z = [0.0; 2];
+        self.history = [0.0; 4];
+        self.install(Self::IDENTITY);
+        let mut constant = [value; 2];
+        self.run(&mut constant);
+        self.install(Self::rounded(section));
+    }
+
+    /// Install new coefficients: rebuild the group terms and convert the
+    /// published histories to the new transposed state.
+    fn set(&mut self, section: &Section) {
+        let c = Self::rounded(section);
+        if c != self.coefficients {
+            self.install(c);
+        }
+    }
+
+    fn install(&mut self, c: [f64; 5]) {
+        let [b0, b1, b2, a1, a2] = c;
+        let mut g = [0.0f64; 8];
+        let mut h = [0.0f64; 8];
+        g[0] = 1.0;
+        g[1] = -a1;
+        for i in 2..8 {
+            g[i] = libm::fma(-a1, g[i - 1], (-a2) * g[i - 2]);
+        }
+        h[0] = b0;
+        h[1] = libm::fma(g[1], b0, b1);
+        for i in 2..8 {
+            h[i] = libm::fma(g[i], b0, libm::fma(g[i - 1], b1, b2 * g[i - 2]));
+        }
+        self.coefficients = c;
+        self.d = g.map(|v| v as f32);
+        self.h = h.map(|v| v as f32);
+        self.b = [b0 as f32, b1 as f32, b2 as f32];
+        self.a = [a1 as f32, a2 as f32];
+        let [x2, x1, y2, y1] = self.history.map(f64::from);
+        let mut z1 = b1 * x1;
+        z1 = libm::fma(b2, x2, z1);
+        z1 = libm::fma(-a2, y2, z1);
+        z1 = libm::fma(-a1, y1, z1);
+        let z2 = libm::fma(b2, x1, (-a2) * y1);
+        self.z = [z1 as f32, z2 as f32];
+    }
+
+    #[inline]
+    fn d(&self, k: isize) -> f32 {
+        if k < 0 {
+            0.0
+        } else {
+            self.d[k as usize]
+        }
+    }
+
+    #[inline]
+    fn h(&self, k: isize) -> f32 {
+        if k < 0 {
+            0.0
+        } else {
+            self.h[k as usize]
+        }
+    }
+
+    /// One lane's chain: a rounded product, then fused multiply-adds.
+    #[inline]
+    fn chain(terms: &[(f32, f32)]) -> f32 {
+        let mut acc = terms[0].0 * terms[0].1;
+        for &(c, v) in &terms[1..] {
+            acc = libm::fmaf(c, v, acc);
+        }
+        acc
+    }
+
+    fn group4(&self, x: &[f32; 4], y: &mut [f32]) {
+        let [z1, z2] = self.z;
+        for (i, out) in y.iter_mut().enumerate().take(4) {
+            let i = i as isize;
+            *out = Self::chain(&[
+                (self.h(i), x[0]),
+                (self.h(i - 1), x[1]),
+                (self.h(i - 2), x[2]),
+                (self.h(i - 3), x[3]),
+                (self.d(i), z1),
+                (self.d(i - 1), z2),
+            ]);
+        }
+    }
+
+    fn group8(&self, x: &[f32; 8], y: &mut [f32]) {
+        let [z1, z2] = self.z;
+        self.group4(&[x[0], x[1], x[2], x[3]], &mut y[..4]);
+        for i in 4..8isize {
+            let first = Self::chain(&[
+                (self.h(i), x[0]),
+                (self.h(i - 1), x[1]),
+                (self.h(i - 2), x[2]),
+                (self.h(i - 3), x[3]),
+                (self.d(i), z1),
+            ]);
+            let second = Self::chain(&[
+                (self.h(i - 4), x[4]),
+                (self.d(i - 1), z2),
+                (self.h(i - 5), x[5]),
+                (self.h(i - 6), x[6]),
+                (self.h(i - 7), x[7]),
+            ]);
+            y[i as usize] = first + second;
+        }
+    }
+
+    /// The transposed state after a group, from its last two inputs and
+    /// outputs (Float32; the zero terms are kept for signed-zero parity).
+    fn publish(&mut self, x: (f32, f32), y: (f32, f32)) {
+        let [_, b1, b2] = self.b;
+        let [a1, a2] = self.a;
+        let mut n1 = b2 * x.0;
+        let mut n2 = 0.0 * x.0;
+        n1 = libm::fmaf(b1, x.1, n1);
+        n2 = libm::fmaf(b2, x.1, n2);
+        n1 = libm::fmaf(-a2, y.0, n1);
+        n2 = libm::fmaf(-0.0, y.0, n2);
+        n1 = libm::fmaf(-a1, y.1, n1);
+        n2 = libm::fmaf(-a2, y.1, n2);
+        self.z = [n1, n2];
+    }
+
+    /// Filters one call's frames in place.
+    fn run(&mut self, buf: &mut [f32]) {
+        let n = buf.len();
+        if n == 0 {
+            return;
+        }
+        let (old_x1, old_y1) = (self.history[1], self.history[3]);
+        let (mut last_x, mut prev_x) = (0.0f32, 0.0f32);
+        let mut at = 0;
+        while n - at >= 8 {
+            let mut x = [0.0f32; 8];
+            x.copy_from_slice(&buf[at..at + 8]);
+            self.group8(&x, &mut buf[at..at + 8]);
+            self.publish((x[6], x[7]), (buf[at + 6], buf[at + 7]));
+            (prev_x, last_x) = (x[6], x[7]);
+            at += 8;
+        }
+        if n - at >= 4 {
+            let mut x = [0.0f32; 4];
+            x.copy_from_slice(&buf[at..at + 4]);
+            self.group4(&x, &mut buf[at..at + 4]);
+            self.publish((x[2], x[3]), (buf[at + 2], buf[at + 3]));
+            (prev_x, last_x) = (x[2], x[3]);
+            at += 4;
+        }
+        let [b0, b1, b2] = self.b;
+        let [a1, a2] = self.a;
+        while at < n {
+            let x = buf[at];
+            let [z1, z2] = self.z;
+            let y = libm::fmaf(b0, x, z1);
+            let t = libm::fmaf(b1, x, z2);
+            let next1 = libm::fmaf(-a1, y, t);
+            let p = (-a2) * y;
+            let next2 = libm::fmaf(b2, x, p);
+            self.z = [next1, next2];
+            buf[at] = y;
+            (prev_x, last_x) = (last_x, x);
+            at += 1;
+        }
+        self.history = if n == 1 { [old_x1, last_x, old_y1, buf[0]] } else { [prev_x, last_x, buf[n - 2], buf[n - 1]] };
     }
 }
 
@@ -1726,8 +1789,10 @@ mod tests {
             assert_eq!(Params::decode(&p.encode(), 1, 48_000.0).unwrap(), p);
         }
         let notch = dynamic_filter_params(DynamicKind::Notch);
-        let neutral_db = 20.0 * libm::log10(1.0 + f64::from(DynamicRun::CARRIER_NEUTRAL));
-        assert!((run_filter(notch.clone(), 1_000.0, 1e-3) - neutral_db).abs() < 0.01);
+        // Quiet input leaves the carrier at the control filter's idle
+        // point: unity or a fraction of a decibel above it.
+        let quiet = run_filter(notch.clone(), 1_000.0, 1e-3);
+        assert!((-0.001..0.15).contains(&quiet), "{quiet}");
         assert!(run_filter(notch, 1_000.0, 1.0) < -11.5);
         let shelf = dynamic_filter_params(DynamicKind::HighShelf);
         assert!(run_filter(shelf.clone(), 1_000.0, 1.0).abs() < 0.15);
@@ -1743,60 +1808,32 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_filter_hands_release_back_to_neutral_carrier() {
-        let p = dynamic_filter_params(DynamicKind::Notch);
-        let mut run = DynamicRun::new(&p.dynamic[0].params, 48_000.0);
-
-        // A small knee excursion is active tracking, not a release. It must
-        // not alternate between the active and neutral carrier targets.
-        run.set_response_gain(0.99);
-        run.set_response_gain(1.0);
-        assert!(!run.release_armed);
-        assert!(!run.carrier_handoff);
-        assert_eq!(run.reconstructed_gain, 1.0);
-
-        run.set_response_gain(0.5);
-        assert!(run.release_armed);
-        assert!(!run.carrier_handoff);
-        assert_eq!(run.reconstructed_gain, 0.5);
-
-        run.set_response_gain(0.6);
-        assert!(run.carrier_handoff);
-        assert_eq!(run.reconstructed_gain, 0.6 * (1.0 + f64::from(DynamicRun::CARRIER_NEUTRAL)));
-
-        run.set_response_gain(0.55);
-        assert!(!run.carrier_handoff);
-        run.set_response_gain(1.0);
-        assert!(run.carrier_handoff);
+    fn control_filter_starts_settled_at_its_primed_value() {
+        let mut filter = ControlFilter::new(&DynamicRun::lowpass(20.0, f64::from(0.707f32), 48_000.0));
+        let mut ones = [1.0f32; 64];
+        filter.run(&mut ones);
+        assert!(ones.iter().all(|v| (v - 1.0).abs() < 1e-3));
+        let mut floor = [0.5f32; 64];
+        filter.run(&mut floor);
+        // Second-order low-pass: the first frames barely move.
+        assert!(floor[0] > 0.999 && floor[63] < floor[0]);
     }
 
     #[test]
-    fn type15_reconstruction_keeps_active_and_release_state_boundaries() {
+    fn dynamic_filter_control_is_sampled_every_16_frames_across_calls() {
         let p = dynamic_filter_params(DynamicKind::Notch);
-        let mut run = DynamicRun::new(&p.dynamic[0].params, 48_000.0);
-        run.reconstruction = Section { b0: -0.9, b1: -0.9, b2: -0.9, a1: -0.9, a2: -0.9 };
-        let state = [0.7, -0.7, 0.3, 0.9];
-        let input = 0.1;
-
-        let mut active_state = state;
-        let active = DynamicRun::step_vdsp_df1_f32(&run.reconstruction, &mut active_state, input);
-        run.reconstruction_state = state;
-        assert!(!run.carrier_handoff);
-        assert_eq!(run.step_reconstruction(DynamicKind::Notch, input), active);
-        assert_eq!(run.reconstruction_state, active_state);
-
-        let mut release_state = state;
-        let release = DynamicRun::step_df1_f32(&run.reconstruction, &mut release_state, input);
-        run.reconstruction_state = state;
-        run.carrier_handoff = true;
-        assert_eq!(run.step_reconstruction(DynamicKind::Notch, input), release);
-        assert_eq!(run.reconstruction_state, release_state);
-        assert_ne!(active.to_bits(), release.to_bits());
-
-        // Type 18 retains its existing Float32 reconstruction path.
-        run.reconstruction_state = state;
-        run.carrier_handoff = false;
-        assert_eq!(run.step_reconstruction(DynamicKind::HighShelf, input), release);
+        let at = p.dynamic[0];
+        let mut whole = DynamicRun::new(&at.params, 48_000.0);
+        let mut split = DynamicRun::new(&at.params, 48_000.0);
+        let x = tone(1_000.0, 1.0, 1024);
+        let mut a = x.clone();
+        whole.process(&at, &mut [&mut a], 1024);
+        let mut b = x.clone();
+        let (left, right) = b.split_at_mut(512);
+        split.process(&at, &mut [left], 512);
+        split.process(&at, &mut [right], 512);
+        assert_eq!(a, b);
+        assert_eq!(whole.control_phase, split.control_phase);
     }
 
     #[test]
@@ -1809,18 +1846,10 @@ mod tests {
 
         let detector_state = run.detector_state;
         let component_state = run.component_state;
-        let conservative_detector_state = run.conservative_detector_state;
-        let conservative_component_state = run.conservative_component_state;
         let quadrature_state = run.quadrature_state;
-        let reconstruction_state = run.reconstruction_state;
+        let control = run.control.history;
         let phase = run.control_phase;
-        let response_gain = run.response_gain;
-        let idle_below_knee = run.idle_below_knee;
-        let release_armed = run.release_armed;
-        let carrier_handoff = run.carrier_handoff;
-        let previous_reconstruction = run.previous_reconstruction;
-        let carrier_settle_frames = run.carrier_settle_frames;
-        let carrier_settled = run.carrier_settled;
+        let held = run.held;
         let envelope = run.envelope;
 
         let mut moved = at.params;
@@ -1828,18 +1857,10 @@ mod tests {
         run.reconfigure(&moved, 48_000.0);
         assert_eq!(run.detector_state, detector_state);
         assert_eq!(run.component_state, component_state);
-        assert_eq!(run.conservative_detector_state, conservative_detector_state);
-        assert_eq!(run.conservative_component_state, conservative_component_state);
         assert_eq!(run.quadrature_state, quadrature_state);
-        assert_eq!(run.reconstruction_state, reconstruction_state);
+        assert_eq!(run.control.history, control);
         assert_eq!(run.control_phase, phase);
-        assert_eq!(run.response_gain, response_gain);
-        assert_eq!(run.idle_below_knee, idle_below_knee);
-        assert_eq!(run.release_armed, release_armed);
-        assert_eq!(run.carrier_handoff, carrier_handoff);
-        assert_eq!(run.previous_reconstruction, previous_reconstruction);
-        assert_eq!(run.carrier_settle_frames, carrier_settle_frames);
-        assert_eq!(run.carrier_settled, carrier_settled);
+        assert_eq!(run.held, held);
         assert_eq!(run.envelope, envelope);
     }
 
