@@ -1652,13 +1652,19 @@ impl Run {
             let ff_tau = if ff_on { c.thermal_ff_speedup_factor * c.tau_tvc } else { c.tau_tvc };
             let dt32 = upd as f32 / p.sample_rate as f32;
             let ff = Thermal::new(c.t_sett_vc, ff_tau, dt32);
-            let (tvc, tmg) = (c.t_sett_vc as f64, c.t_sett_mg as f64);
-            // hot fallback: the steady-state split at the ordinary limit
+            // hot fallback: the steady-state split at the ordinary limit, in
+            // the reference's Float32 arithmetic, left to right: `(Tlim -
+            // ambient) * T_sett / (T_sett_vc + T_sett_mg)` per node (the
+            // macOS bit-8 controller record of an AID9 hot start: coil and
+            // feed-forward nodes exact from the first update with this
+            // order, one ulp high on every update with the f64 split)
             let seed = if cold {
                 (0.0, 0.0, 0.0)
             } else {
-                let p0 = (c.temperature_limit as f64 - ambient) / (tvc + tmg);
-                (p0 * tvc, p0 * tmg, p0 * tvc)
+                let rise = c.temperature_limit - p.thermal_ambient_temp;
+                let sum = c.t_sett_vc + c.t_sett_mg;
+                let vc = rise * c.t_sett_vc / sum;
+                (vc as f64, (rise * c.t_sett_mg / sum) as f64, vc as f64)
             };
             let headroom = if c.pilot_tone_enabled != 0 { 1.0 - pilot_amplitude(c.pilot_ampl_hi_db) } else { 1.0 };
             let pilot_cfg = c.pilot_tone_enabled != 0
@@ -1956,13 +1962,19 @@ impl Run {
             }
         }
         for (gi, g) in self.groups.iter_mut().enumerate() {
-            let t = ff_t[gi];
-            let k = if t < g.g { self.k_attack } else { self.k_release };
-            g.g += k * (t - g.g);
+            // Float32 state and arithmetic, `g + k * (t - g)` (the macOS
+            // bit-8 controller record: this law reproduces every selected
+            // gain from the previous one and the candidates, 10461/10461
+            // updates on both AID9 groups; the f64 state it replaces drifts
+            // off by an ulp within seconds whenever the gain moves)
+            let t = ff_t[gi] as f32;
+            let g32 = g.g as f32;
+            let k = (if t < g32 { self.k_attack } else { self.k_release }) as f32;
+            let next = g32 + k * (t - g32);
             // the smoother's state is the selected minimum (spec 6)
-            let sel = min_nan(g.g, hard_t[gi]);
-            g.g = sel;
-            g.sel = sel as f32;
+            let sel = min_nan(next as f64, hard_t[gi]) as f32;
+            g.g = sel as f64;
+            g.sel = sel;
         }
         let complete = self.sums.complete
             && !self.sense_bad
@@ -2185,8 +2197,8 @@ impl ProtectionUnit for Unit {
         }
         let k = 1.0 - run.k_release;
         for (gi, grp) in run.groups.iter_mut().enumerate() {
-            let v = release_toward_unity(g[gi], k, updates);
-            *grp = Group { g: v, sel: v as f32, z1: v as f32, z2: v as f32 };
+            let v = release_toward_unity(g[gi], k, updates) as f32;
+            *grp = Group { g: v as f64, sel: v, z1: v, z2: v };
         }
         run.curve.iter_mut().for_each(|v| *v = 1.0);
         true
