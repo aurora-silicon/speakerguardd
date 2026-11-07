@@ -25,9 +25,9 @@ A case is the worst absolute RMS difference across its channels, steady
 second half and 10 ms transient windows. The 0.05 dB gate is two-sided.
 Transient windows with both outputs below -80 dBFS are ignored; the steady
 numerical-silence floor is -240 dBFS. Refusals and missing output are separate
-from measured failures. Norm flushes and removes its streaming runner's fixed 512-frame transport
-call, matching the existing `norm-render` tool; its intrinsic look-ahead is
-retained. There is no fitted latency alignment or fitted gain.
+from measured failures. Norm meters and applies gain inside each render call; its intrinsic
+look-ahead is retained. Neither renderer flushes or crops a transport call.
+There is no latency compensation, fitted alignment or fitted gain.
 Amplitude parity alone does not establish phase or sample identity.
 
 Controls, run on buildbox:
