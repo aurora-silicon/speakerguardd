@@ -63,6 +63,12 @@ def main():
     rollup = defaultdict(set, {law: set(aids) for law, aids in data["per_law"].items()})
     for row in catalogue.get("known_unimplemented", []):
         rollup[row["kind"] + "-unimplemented"].add(row["aid"])
+    for row in unexecuted:
+        for box in (row.get("saved_control_metadata") or {}).get("boxes", []):
+            types = box.get("tmst", {}).get("state_and_group_enabled_type_counts", {})
+            for kind in ("15", "18"):
+                if types.get(kind, 0):
+                    rollup["tmst-type" + kind + "-coverage-unverified"].add(row["aid"])
     data.update({"schema_version": 2, "status": "partial" if unexecuted else "completed",
                  "reference_membership": membership, "unexecuted_aids": unexecuted,
                  "coverage": {"reference_aids": len(reference), "measured_reference_aids": len(reference & executed),
@@ -70,7 +76,9 @@ def main():
                               "newer_only_aids": sorted(newer_only), "missing_newer_aids": missing_newer},
                  "per_law": {law: sorted(aids) for law, aids in sorted(rollup.items())},
                  "input_report_sha256": {p.name + ":" + str(i): hashlib.sha256(p.read_bytes()).hexdigest()
-                                         for i, p in enumerate(args.measured)}})
+                                         for i, p in enumerate(args.measured)},
+                 "catalogue_sha256": hashlib.sha256(args.catalogue.read_bytes()).hexdigest(),
+                 "assembler_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest()})
     data["limitations"] += [
         "Measured counts cover only executed reference AIDs; source availability is not an AID refusal.",
         "Unexecuted rows retain structural facts and explicit implementation gaps; no renderer execution is inferred.",
@@ -94,6 +102,16 @@ def main():
     for row in unexecuted:
         for box in row["boxes"]:
             lines.append(f'| {row["aid"]} | {box["name"]} | {box["subtype"]} | {box["status"]}; declaration only |')
+    lines += ["", "### Unexecuted saved controls", "",
+              "These are saved general-strip enums and state/group checks. They do not establish renderer execution.", "",
+              "| AID | Box | Saved mstk algorithm/quality/ovs | tmst state/group-enabled types |",
+              "|---|---|---|---|"]
+    for row in unexecuted:
+        for box in (row.get("saved_control_metadata") or {}).get("boxes", []):
+            control = box.get("saved_mstk")
+            saved = "/".join(str(control[k]) for k in ("algorithm", "quality", "ovs")) if control else ""
+            types = box.get("tmst", {}).get("state_and_group_enabled_type_counts", {})
+            lines.append(f'| {row["aid"]} | {box["name"]} | {saved} | ' + json.dumps(types, sort_keys=True) + " |")
     lines += ["", "## Measured inventory and complete per-law rollup", "",
               inventory.markdown(data).replace("# AID exact-parity inventory", "### Measured report", 1)]
     args.out_dir.mkdir(parents=True, exist_ok=True)
