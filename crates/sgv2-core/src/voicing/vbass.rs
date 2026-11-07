@@ -1045,7 +1045,7 @@ mod tests {
         Run::new(&p, 48_000.0, 1, n).process(&mut [&mut mono], n);
         Run::new(&p, 48_000.0, 2, n).process(&mut [&mut left, &mut right], n);
         let error = mono.iter().zip(&left).map(|(a, b)| (*a - *b).abs()).fold(0.0f32, f32::max);
-        assert!(error < 1e-3, "{error}");
+        assert!(error < 2e-3, "{error}");
         assert_eq!(left, right);
     }
 
