@@ -952,13 +952,10 @@ impl Run {
                 self.on_step(self.step_peak);
                 self.step_peak = f64::NEG_INFINITY;
                 if self.steps_in_call < self.step_target.len() {
-                    // Meter the whole step first, then apply its target from
-                    // that same step's first frame: the audio pass follows
-                    // the side-chain pass for the complete render call. A
-                    // step carried across a short call starts at frame zero
-                    // of this call as far as its audio pass is concerned.
-                    let start = (n + 1).saturating_sub(STEP);
-                    self.step_target[self.steps_in_call] = (start, self.target);
+                    // A completed step changes the causal target of the
+                    // following frame. A boundary at the end of this call is
+                    // retained as the next call's starting target.
+                    self.step_target[self.steps_in_call] = (n + 1, self.target);
                     self.steps_in_call += 1;
                 }
             } else if !self.p.algorithm1 && self.in_step == 0 {
@@ -978,6 +975,7 @@ impl Run {
             self.z = [[[0.0; 2]; MAX_SECTIONS]; MAX_CHANNELS];
         }
         let mut next = 0;
+        let end_target = self.target;
         if self.p.algorithm1 {
             self.target = start_target;
         }
@@ -1002,6 +1000,9 @@ impl Run {
             if la != 0 {
                 self.pos = (self.pos + 1) % la;
             }
+        }
+        if self.p.algorithm1 {
+            self.target = end_target;
         }
     }
 }
