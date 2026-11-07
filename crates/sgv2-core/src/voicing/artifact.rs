@@ -324,9 +324,12 @@ impl Wire for Kind {
                 }
             }
             Self::Norm(p) => {
-                14u32.put(o);
+                (if p.algorithm1 { 23u32 } else { 14u32 }).put(o);
                 let mut w = vec![0.0; super::norm::Params::WORDS];
                 p.to_words(&mut w);
+                if !p.algorithm1 {
+                    w.truncate(super::norm::Params::LEGACY_WORDS);
+                }
                 for v in w {
                     v.put(o);
                 }
@@ -407,8 +410,9 @@ impl Wire for Kind {
                 let w: Vec<f64> = (0..super::vareq::Params::WORDS).map(|_| f64::get(r)).collect::<Result<_>>()?;
                 Self::Vareq(Box::new(super::vareq::Params::from_words(&w).ok_or(BlobError::Unstable)?))
             }
-            14 => {
-                let w: Vec<f64> = (0..super::norm::Params::WORDS).map(|_| f64::get(r)).collect::<Result<_>>()?;
+            tag @ (14 | 23) => {
+                let words = if tag == 14 { super::norm::Params::LEGACY_WORDS } else { super::norm::Params::WORDS };
+                let w: Vec<f64> = (0..words).map(|_| f64::get(r)).collect::<Result<_>>()?;
                 Self::Norm(Box::new(super::norm::Params::from_words(&w).ok_or(BlobError::Unstable)?))
             }
             15 => {
@@ -490,7 +494,8 @@ fn validate(spec: &Spec, fs: f64, lanes: usize) -> Result<()> {
         }
         match &node.kind {
             Kind::Xtc(p) if !p.valid() => return Err(BlobError::Unstable),
-            Kind::Xtc(_) | Kind::Vbass(_) if width != 2 => return Err(BlobError::Channels),
+            Kind::Xtc(_) if width != 2 => return Err(BlobError::Channels),
+            Kind::Vbass(_) if !(1..=2).contains(&width) => return Err(BlobError::Channels),
             Kind::Norm(_) if width > super::norm::MAX_CHANNELS => return Err(BlobError::Channels),
             Kind::Vareq(p) if !p.transitions_valid_at(fs) => return Err(BlobError::Unstable),
             Kind::Cdelay(p) if p.channels != width => return Err(BlobError::Channels),
