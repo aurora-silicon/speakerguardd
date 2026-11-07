@@ -18,11 +18,12 @@ base-rate DF1 de-esser cut
   -> base-rate DF1 inverse de-esser
 ```
 
-The new `k` and `1/k` apply at base frame zero of the piece.  There is no
-within-piece interpolation.  The interpolation delay retains samples scaled by
-the drive active when they entered, while both FIR delays and both independent
-DF1 states continue without scaling, exchange or coefficient changes.  The FIR
-pair adds 24 base frames of latency.
+The new `k` applies at base frame zero of the piece.  There is no within-piece
+interpolation.  The interpolation delay retains samples scaled by the drive
+active when they entered.  The returned delayed carrier keeps the preceding
+piece's `1/k` for the pair's first 24 output frames, then uses the new scalar.
+Both FIR delays and both independent DF1 states continue without scaling,
+exchange or coefficient changes.  The FIR pair adds 24 base frames of latency.
 
 The de-esser recurrence is single precision:
 
@@ -69,7 +70,6 @@ scale = f32(1 / sum(double(q[j])))
 h[j] = f32(q[j] * scale)
 ```
 
-The interpolator uses `f32(2*h)` and the decimator uses `h`; their samples,
-accumulators and persistent polyphase histories are single precision and are
-not reset at drive-block boundaries.  Both saturation flavours share this
-path.
+The interpolator uses `f32(2*h)` and the decimator uses `h`; their persistent
+polyphase histories are not reset at drive-block boundaries.  Both saturation
+flavours share this path.

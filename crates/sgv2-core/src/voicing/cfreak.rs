@@ -613,10 +613,10 @@ fn saturation_fir(mode: u32, fs: f64) -> [f32; FIR_TAPS] {
 #[derive(Clone)]
 struct Saturator {
     /// Base-rate input history (newest at `x_at`).
-    x: [f32; PHASE_TAPS],
+    x: [f64; PHASE_TAPS],
     x_at: usize,
     /// Oversampled shaper output history (newest at `v_at`).
-    v: [f32; V_RING],
+    v: [f64; V_RING],
     v_at: usize,
     pre: Df1State,
     post: Df1State,
@@ -767,22 +767,6 @@ impl Saturation {
         }
     }
 
-    /// The single-precision shaper used between the two f32 polyphase FIRs.
-    fn shape_driven_f32(flavor: u32, v: f32) -> f32 {
-        if flavor == 1 {
-            let u = CUBIC_SCALE as f32 * v;
-            if u > 1.0 {
-                1.0
-            } else if u < -1.0 {
-                -1.0
-            } else {
-                1.5 * u - 0.5 * u * u * u
-            }
-        } else {
-            libm::sinf(v)
-        }
-    }
-
     /// The memoryless shaper with its make-up, `f(k d) / k`.
     fn shape(flavor: u32, k: f64, d: f64) -> f64 {
         Self::shape_driven(flavor, k * d) / k
@@ -792,7 +776,7 @@ impl Saturation {
     /// first at base rate, `k` scales the value entering the interpolation
     /// delay, the shaper runs at 2fs, and `1/k` precedes the base-rate inverse.
     /// At the base rate (mode 0), the sample is shaped directly.
-    fn run(&mut self, c: usize, x: f64, k: f64) -> f64 {
+    fn run(&mut self, c: usize, x: f64, k: f64, makeup: f64) -> f64 {
         let h = &self.h;
         let flavor = self.flavor;
         if !self.oversampled {
@@ -800,31 +784,31 @@ impl Saturation {
         }
         let s = &mut self.ch[c];
         let cut = self.pre.run(&mut s.pre, x);
-        let driven = cut as f32 * k as f32;
+        let driven = f64::from(cut as f32 * k as f32);
         s.x_at = (s.x_at + 1) % PHASE_TAPS;
         s.x[s.x_at] = driven;
         for phase in 0..OVERSAMPLE {
             // u[2n + phase] = sum_j (2 h[phase + 2 j]) (k d[n - j])
-            let mut u = 0.0f32;
+            let mut u = 0.0;
             let mut i = phase;
             let mut j = 0;
             while i < FIR_TAPS {
                 let up = h[i] * OVERSAMPLE as f32;
-                u += up * s.x[(s.x_at + PHASE_TAPS - j) % PHASE_TAPS];
+                u += f64::from(up) * s.x[(s.x_at + PHASE_TAPS - j) % PHASE_TAPS];
                 i += OVERSAMPLE;
                 j += 1;
             }
             s.v_at = (s.v_at + 1) % V_RING;
-            s.v[s.v_at] = Self::shape_driven_f32(flavor, u);
+            s.v[s.v_at] = Self::shape_driven(flavor, u);
         }
         // y[n] = sum_i h[i] v[2n - i]; v[2n] was pushed OVERSAMPLE - 1
         // samples before the newest.
         let newest_2n = (s.v_at + V_RING - (OVERSAMPLE - 1)) % V_RING;
-        let mut y = 0.0f32;
+        let mut y = 0.0;
         for (i, hv) in h.iter().enumerate() {
-            y += *hv * s.v[(newest_2n + V_RING - i) % V_RING];
+            y += f64::from(*hv) * s.v[(newest_2n + V_RING - i) % V_RING];
         }
-        let made_up = f64::from(y * (1.0f32 / k as f32));
+        let made_up = f64::from(y as f32 * (1.0f32 / makeup as f32));
         self.post.run(&mut s.post, made_up)
     }
 }
@@ -1146,13 +1130,14 @@ impl Run {
         }
         // This block is measured before it is shaped.  Its new scalar applies
         // from sample zero; the FIR delay itself retains prior driven samples.
-        let mut k = 1.0;
+        let (mut k_before, mut k) = (1.0, 1.0);
         if let Some(s) = &mut self.saturation {
             for i in 0..n {
                 for c in 0..ch {
                     s.measure(c, self.piece[c * DRIVE_BLOCK + i]);
                 }
             }
+            k_before = s.k;
             s.pos = n;
             s.end_block();
             k = s.k;
@@ -1166,7 +1151,8 @@ impl Run {
             for (c, slot) in frame[..ch].iter_mut().enumerate() {
                 let mut x = self.piece[c * DRIVE_BLOCK + i];
                 if let Some(s) = &mut self.saturation {
-                    x = s.run(c, x, k);
+                    let makeup = if s.oversampled && i < SATURATION_DELAY { k_before } else { k };
+                    x = s.run(c, x, k, makeup);
                     if s.started < s.delay() {
                         x = 0.0;
                     }
@@ -1480,15 +1466,15 @@ mod tests {
     fn a_new_block_drive_starts_at_its_first_base_sample_without_state_mapping() {
         let p = saturating(3);
         let mut sat = Saturation::new(&p, 48_000.0, 1);
-        sat.run(0, 0.25, 0.7);
+        sat.run(0, 0.25, 0.7, 0.7);
         let old_at = sat.ch[0].x_at;
         let old_driven = sat.ch[0].x[old_at];
         let pre_before = sat.ch[0].pre;
         let mut expected_pre = pre_before;
         let cut = sat.pre.run(&mut expected_pre, -0.2);
-        let expected_driven = cut as f32 * 0.9f32;
+        let expected_driven = f64::from(cut as f32 * 0.9f32);
 
-        sat.run(0, -0.2, 0.9);
+        sat.run(0, -0.2, 0.9, 0.7);
 
         assert_eq!(sat.ch[0].x[old_at], old_driven);
         assert_eq!(sat.ch[0].x[sat.ch[0].x_at], expected_driven);
