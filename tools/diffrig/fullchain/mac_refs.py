@@ -2,7 +2,8 @@
 """macOS side of the spp3 full-chain safety scan (host only; run under a host-heavy slot).
 
 For each Mac (AID) and program: the Mac's own pre-protection chain (preprotect_host:
-Norm..ControlFreak (+AULowFlow), full volume) gives the driver feeds; those feeds go
+Norm..ControlFreak (+AULowFlow), full volume, with every graph property from the
+matching property strip) gives the driver feeds; those feeds go
 through the Mac's own SpeakerProtect (spp3) offline (rig_host, open loop: no V/I
 telemetry, the same configuration capture.py uses: property strip + sidecar).
 Writes OUT/<mac>/<prog>/{feeds.f32, run.out.f32, run.state.csv, run.meta.json, pre.json}.
@@ -10,10 +11,11 @@ Everything here is Apple-derived: OUT must be a tainted directory.
 
   mac_refs.py PROGS_DIR OUT_DIR [mac ...]
 """
-import glob, json, os, plistlib, subprocess, sys
+import json, os, plistlib, subprocess, sys
 
 TUN = '/System/Library/Audio/Tunings'
-PRE = glob.glob('/Volumes/AuroraS500/aurora-ctl/scratch/t-4727-*/preprotect_host')[0]
+HERE = os.path.dirname(os.path.abspath(__file__))
+PRE_SOURCE = os.path.join(HERE, 'preprotect_host.m')
 RIGBIN = '/Volumes/AuroraS500/aurora-ctl/reports/speakerguardd-v2/rig/tools'
 MACS = {'m2': (13, 4), 'm1pro': (9, 6), 'j616s': (35, 6)}
 
@@ -42,11 +44,19 @@ def propstrip_props(aid):
 
 def main():
     progs, out = sys.argv[1], sys.argv[2]
+    os.makedirs(out, exist_ok=True)
+    pre = os.environ.get('SGV2_PREPROTECT_HOST', os.path.join(out, 'preprotect_host'))
+    if 'SGV2_PREPROTECT_HOST' not in os.environ and (
+            not os.path.exists(pre) or os.path.getmtime(pre) < os.path.getmtime(PRE_SOURCE)):
+        subprocess.run(['clang', '-fobjc-arc', '-framework', 'AudioToolbox', '-framework', 'Foundation',
+                        PRE_SOURCE, '-o', pre], check=True)
     macs = sys.argv[3:] or list(MACS)
     names = sorted(f[:-4] for f in os.listdir(progs) if f.endswith('.f32'))
     for mac in macs:
         aid, nd = MACS[mac]
-        strip = f'{TUN}/AID{aid}/DSP/Strips/builtin_speaker_out_general.austrip'
+        base = f'{TUN}/AID{aid}/DSP/Strips/builtin_speaker_out_general'
+        strip = base + '.austrip'
+        propstrip = base + '.propstrip'
         sidecar = f'{TUN}/AID{aid}/DSP/Strips/aid{aid}-aufx-spp3-appl.plist'
         props, paths = propstrip_props(aid)
         for name in names:
@@ -56,7 +66,8 @@ def main():
             os.makedirs(d + '/logs', exist_ok=True)
             os.chmod(os.path.join(out, mac), 0o700)
             feeds = os.path.join(d, 'feeds.f32')
-            subprocess.run([PRE, '--strip', strip, '--in', os.path.join(progs, name + '.f32'),
+            subprocess.run([pre, '--strip', strip, '--propstrip', propstrip,
+                            '--in', os.path.join(progs, name + '.f32'),
                             '--out', feeds, '--meta', os.path.join(d, 'pre.json'),
                             '--drivers', str(nd), '--q', '512'], check=True)
             args = [os.path.join(RIGBIN, 'rig_host'), '--unit', 'spp3', '--strip', strip,
