@@ -66,7 +66,13 @@ fn main() {
     }
     .expect("bundle");
     let mut diags = Diagnostics::default();
-    let t = Tuning::load(&b, &Options::default(), &mut diags).unwrap_or_else(|e| panic!("load: {e}"));
+    let mut t = Tuning::load(&b, &Options::default(), &mut diags).unwrap_or_else(|e| panic!("load: {e}"));
+    // Raw tuning roots have no installer manifest. Offline cross-OS rigs
+    // supply the source build explicitly; production bundles carry it in
+    // their manifest and therefore never consult this harness override.
+    if t.macos_build.is_none() {
+        t.macos_build = std::env::var("SGV2_MACOS_BUILD").ok();
+    }
     let c = compile(&t, 48_000.0, &mut diags).unwrap_or_else(|e| {
         eprintln!("compile refused: {e}");
         std::process::exit(3)
