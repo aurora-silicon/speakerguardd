@@ -631,6 +631,12 @@ fn phase_paths(p: &Params, fs: f64, band_zero_rate: f64) -> [Path; BANDS] {
     out
 }
 
+fn phase_detector_paths(p: &Params, fs: f64, band_zero_rate: f64) -> [DetectorPath; BANDS] {
+    let mut out = detector_paths(p, fs);
+    out[0] = detector_paths(p, band_zero_rate)[0];
+    out
+}
+
 /// Analytic (mode-4) detector of algorithms 0-2 at quality 0 and 1.
 ///
 /// Black-box law (SW-COMP2, installed unit, synthetic controls): the band
@@ -1164,6 +1170,8 @@ pub struct Run {
     phase_path: [Path; BANDS],
     phase_band_state: [[[[f32; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS],
     phase_reference_state: [[[[f32; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS],
+    phase_detector_path: [DetectorPath; BANDS],
+    phase_detector_state: [[[[f32; 2]; MAX_DETECTOR_FILTERS]; BANDS]; MAX_CHANNELS],
 }
 
 impl Run {
@@ -1279,6 +1287,8 @@ impl Run {
             phase_path: phase_paths(q, fs, phase_band_zero_rate),
             phase_band_state: [[[[0.0; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS],
             phase_reference_state: [[[[0.0; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS],
+            phase_detector_path: phase_detector_paths(q, fs, phase_band_zero_rate),
+            phase_detector_state: [[[[0.0; 2]; MAX_DETECTOR_FILTERS]; BANDS]; MAX_CHANNELS],
         };
         run.set_automation_input(q.automation_input);
         run
@@ -1331,6 +1341,7 @@ impl Run {
         self.reference_quadrature = [[QuadratureEnvelope::default(); BANDS]; MAX_CHANNELS];
         self.phase_band_state = [[[[0.0; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS];
         self.phase_reference_state = [[[[0.0; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS];
+        self.phase_detector_state = [[[[0.0; 2]; MAX_DETECTOR_FILTERS]; BANDS]; MAX_CHANNELS];
     }
 
     pub fn latency(&self) -> usize {
@@ -1500,8 +1511,9 @@ impl Run {
                             * self.phase_reference_quadrature[c][b].push(reference),
                     )
                 } else {
-                    let phase = Self::run_detector_path(&phase, &mut self.phase_band_state[c][b], v);
-                    phase.abs()
+                    let phase = Self::run_detector_path(&phase, &mut self.phase_band_state[c][b], x);
+                    Self::run_detector_path(&self.phase_detector_path[b], &mut self.phase_detector_state[c][b], phase)
+                        .abs()
                 };
                 overshoot[b] = (phase_magnitude * scale) as f32 as f64;
             }
