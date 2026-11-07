@@ -23,6 +23,8 @@ fn main() {
     let mut scalar: f32 = get("--mvsc").parse().unwrap();
     let mut db: f32 =
         if let Some(at) = args.iter().position(|s| s == "--mvol") { args[at + 1].parse().unwrap() } else { 1.0 };
+    let profile = args.iter().position(|s| s == "--profile").map(|at| &args[at + 1]);
+    let (mut render_ns, mut max_block_ns, mut blocks) = (0u128, 0u128, 0usize);
     let mut health = 0.0f32;
     let mut program = [[0.0f32; voicing::BLOCK]; 2];
     let mut output = vec![[0.0f32; voicing::BLOCK]; n];
@@ -48,10 +50,17 @@ fn main() {
                 *v = input[2 * (at + i) + c];
             }
         }
+        let start = profile.map(|_| std::time::Instant::now());
         // SAFETY: the offline host owns the live handle and all connected buffers;
         // descriptor storage is static and every callback length fits those buffers.
         unsafe {
             (d.run)(h, len as u32);
+        }
+        if let Some(start) = start {
+            let elapsed = start.elapsed().as_nanos();
+            render_ns += elapsed;
+            max_block_ns = max_block_ns.max(elapsed);
+            blocks += 1;
         }
         assert_eq!(health, 0.0);
         for i in 0..len {
@@ -64,5 +73,20 @@ fn main() {
     // descriptor storage is static and every callback length fits those buffers.
     unsafe {
         (d.cleanup)(h);
+    }
+    if let Some(path) = profile {
+        std::fs::write(
+            path,
+            format!(
+                "{{\"frames\":{},\"sample_rate\":{},\"block\":{},\"blocks\":{},\"total_ns\":{},\"max_block_ns\":{}}}\n",
+                input.len() / 2,
+                header.sample_rate,
+                voicing::BLOCK,
+                blocks,
+                render_ns,
+                max_block_ns
+            ),
+        )
+        .unwrap();
     }
 }
