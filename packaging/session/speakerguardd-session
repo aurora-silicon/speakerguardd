@@ -54,8 +54,8 @@ PROTECT_INPUT = "alsa_output.platform-sound.RawSpeakers"
 # its own: nothing may be linked to the amps then.
 SELFCHECK_ACTIVE = "/run/speakerguardd-selfcheck/active"
 # Before system sleep speakerguardd-sleep.service sets this hold: the amps
-# are unlinked (their sink stops and closes) before the supervisor stops,
-# and stay unlinked until the resume clears it.
+# and the sense are unlinked and suspended (their PCMs close) before the
+# supervisor stops, and stay so until the resume clears it.
 SLEEP_HOLD = "/run/speakerguardd-sleep/hold"
 
 # ALSA control ioctls (include/uapi/sound/asound.h, 64-bit)
@@ -184,6 +184,10 @@ class Graph:
                 return o["id"]
         return None
 
+    def node_state(self, nid):
+        """A node's state ("suspended", "idle", "running", ...), or None."""
+        return ((self.objs.get(nid) or {}).get("info") or {}).get("state")
+
     def node_props(self, nid):
         o = self.objs.get(nid) or {}
         params = (o.get("info") or {}).get("params") or {}
@@ -226,6 +230,7 @@ class Session:
         self.speaker = f"sgv2.speaker.{m}"
         self.sense_name = f"sgv2.sense.{m}"
         self.last_try = -10.0
+        self.last_suspend = -10.0
         self.pending = {}
 
     def wanted(self, g):
@@ -343,9 +348,30 @@ class Session:
             spk = g.node_id(self.speaker)
             sense = g.node_id(self.sense_name) if self.sense else None
             owners = {o["id"]: (o["info"].get("props") or {}).get("node.id") for o in g.of_type("Port")}
+            linked = False
             for lid, o, i in g.links():
                 if owners.get(i) == spk or (sense is not None and owners.get(o) == sense):
+                    linked = True
                     self._spawn(("unlink", lid), ["pw-link", "-d", str(lid)])
+            if os.path.exists(SLEEP_HOLD) and not linked:
+                self.suspend_for_sleep(g, (spk, sense))
+
+    def suspend_for_sleep(self, g, nodes):
+        """Under the sleep hold, once nothing is linked: suspend the amps'
+        sink and the sense, which closes their PCMs. Unlinked they are only
+        paused, and WirePlumber closes an idle node after 5 s, after the
+        sleep has begun; a PCM held open across a sleep is unmuted by the
+        resume before its I2S clocks are back (the MCA loses its state in
+        sleep). speakerguardd-provision sleep waits for the PCMs to read
+        closed. Sent again every 0.5 s while a node is not suspended."""
+        now = time.monotonic()
+        if now - self.last_suspend < 0.5:
+            return
+        for nid in nodes:
+            if nid is not None and g.node_state(nid) not in (None, "suspended"):
+                self.last_suspend = now
+                # pw-cli's send-command sends a node the Suspend command
+                self._spawn(("suspend", nid), ["pw-cli", "send-command", str(nid)])
 
 
 _WRITER = None
