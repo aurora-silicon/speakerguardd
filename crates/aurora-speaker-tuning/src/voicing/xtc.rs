@@ -74,6 +74,20 @@ fn number(d: &Dict, key: &str) -> Result<f64> {
 }
 
 fn compressed_f32(d: &Dict, key: &str) -> Result<[f64; BINS]> {
+    if let Some(Value::Array(values)) = d.get(key) {
+        if values.len() != BINS {
+            return Err(bad("uncompressed spectrum has the wrong bin count"));
+        }
+        let mut out = [0.0; BINS];
+        for (dst, value) in out.iter_mut().zip(values) {
+            let v = value
+                .as_number()
+                .filter(|v| v.is_finite() && (*v as f32).is_finite())
+                .ok_or_else(|| bad("invalid uncompressed spectrum number"))?;
+            *dst = v as f32 as f64;
+        }
+        return Ok(out);
+    }
     let bytes =
         d.get(key).and_then(Value::as_data).ok_or_else(|| bad(format!("Setup_0/W/{key} is missing or not data")))?;
     let mut raw = Vec::new();
@@ -246,6 +260,14 @@ fn optimize(
     Params { taps, count, ..Params::default() }
 }
 
+/// Saved delay is a position on the finite FIR's tap grid. The percentage
+/// conversion and nearest-tap rounding are Float32; the center tap is the
+/// largest position exposed by the control.
+fn group_delay(count: usize, percent: f64) -> usize {
+    let fraction = percent as f32 * 0.01_f32;
+    ((count as f32 * fraction).round() as usize).min(count / 2)
+}
+
 /// Compile the one exact state used by the builtin-speaker graph.  States
 /// which would require live orientation, a different setup, test signals,
 /// muting, swapping, or an optimizer bypass are refused.
@@ -303,8 +325,16 @@ pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option
     for id in 23..=29 {
         exact(id, 0.0, "orientation setup")?;
     }
-    for id in (31..=63).filter(|id| !(35..=39).contains(id) && !(51..=55).contains(id)) {
+    for id in (31..=63).filter(|id| ![33, 49].contains(id) && !(35..=39).contains(id) && !(51..=55).contains(id)) {
         exact(id, 0.0, "reserved parameter")?;
+    }
+
+    // These boolean fields do not alter an explicitly supplied Setup_0/W.
+    // Both live changes and pre-restoration ClassInfo controls were measured.
+    for id in [33, 49] {
+        if !matches!(req(id)?, 0.0 | 1.0) {
+            return Err(bad(format!("reserved saved-filter flag {id} is not boolean")));
+        }
     }
 
     // The restored controls affect the intermediate startup filter and
@@ -324,8 +354,20 @@ pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option
         )));
     }
     let w = dict(setup, "W")?;
-    if w.get("WDataIsCompressed").and_then(Value::as_bool) != Some(true) {
-        return Err(bad("Setup_0/W is not marked raw-DEFLATE compressed"));
+    let compressed = match w.get("WDataIsCompressed") {
+        None | Some(Value::Bool(false)) => false,
+        Some(Value::Bool(true)) => true,
+        Some(_) => return Err(bad("spectrum compression flag is not boolean")),
+    };
+    for name in ["11", "12", "21", "22"] {
+        for part in ["real", "imag"] {
+            let value = w.get(&format!("W{name}{part}"));
+            if (compressed && !matches!(value, Some(Value::Data(_))))
+                || (!compressed && !matches!(value, Some(Value::Array(_))))
+            {
+                return Err(bad("spectrum storage disagrees with its compression flag"));
+            }
+        }
     }
     let raw = [spectrum(w, "11")?, spectrum(w, "12")?, spectrum(w, "21")?, spectrum(w, "22")?];
     let cached_count = (CONSTRUCTION_RATE * CACHED_LENGTH_MS / 1000.0).floor() as usize - 1;
@@ -342,7 +384,8 @@ pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option
         1.0,
         CACHED_EFFECT_MIX_PERCENT / 100.0,
     );
-    let reported_latency = (fs * length_ms / 1000.0 * saved_delay_pct / 100.0).round() as usize;
+    let restored_count = (fs * length_ms / 1000.0).floor() as usize - 1;
+    let reported_latency = group_delay(restored_count, saved_delay_pct);
     p.reported_latency = reported_latency;
 
     let order = |id| -> Result<f64> {
@@ -368,7 +411,15 @@ pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option
         return Err(bad("restored crossover, window, mix or crossfade duration is out of range"));
     }
     // At the carried system volume (0 dB) the upper taper point applies.
-    exact(19, 0.0, "upper wet/dry taper volume")?;
+    // Saved negative endpoints also reach this endpoint. Coincident or
+    // reversed points are carried only for a constant wet/dry value.
+    let upper_volume = req(19)?;
+    if !(-100.0..=0.0).contains(&upper_volume)
+        || !(-100.0..=0.0).contains(&req(17)?)
+        || (req(17)? >= upper_volume && req(18)? != req(20)?)
+    {
+        return Err(bad("wet/dry taper volumes do not bracket the carried system volume"));
+    }
     exact(21, 0.0, "startup gain trim")?;
     let initial_count = (fs * CACHED_LENGTH_MS / 1000.0).floor() as usize - 1;
     let initial = optimize(
@@ -478,7 +529,7 @@ mod tests {
         let mut d = Diagnostics::default();
         let p = compile(&stage(0.0), 48_000.0, &mut d).unwrap().unwrap();
         assert_eq!(p.count, 87);
-        assert_eq!(p.reported_latency, 10);
+        assert_eq!(p.reported_latency, 9);
         assert!(p.taps[1][..p.count].iter().all(|x| x.abs() < 1e-12));
         assert!(p.taps[2][..p.count].iter().all(|x| x.abs() < 1e-12));
         assert!((p.taps[0][..p.count].iter().sum::<f64>() - 1.0).abs() < 1e-12);
@@ -557,6 +608,53 @@ mod tests {
         let peak2 = q.taps[1][..q.count].iter().fold(0.0f64, |m, x| m.max(x.abs()));
         assert!((peak2 / peak - 2.0).abs() < 1e-9);
         assert!(p.taps[1][..p.count].iter().sum::<f64>().abs() < 1e-12);
+    }
+
+    #[test]
+    fn delay_uses_the_finite_tap_grid_and_center_limit() {
+        for (length_ms, percent, frames) in [
+            (2.0, 10.0, 9),
+            (2.0, 10.416, 10),
+            (2.0, 10.417, 10),
+            (2.0, 50.0, 47),
+            (2.01, 50.0, 47),
+            (1.5, 25.0, 18),
+            (3.0, 33.3, 48),
+        ] {
+            let count = (48.0_f64 * length_ms).floor() as usize - 1;
+            assert_eq!(group_delay(count, percent), frames);
+        }
+    }
+
+    #[test]
+    fn uncompressed_spectra_and_dormant_flags_preserve_the_filter() {
+        let mut s = effect_stage(-0.5);
+        let before = compile(&s, 48_000.0, &mut Diagnostics::default()).unwrap().unwrap();
+        let custom = match s.preset_extra.get_mut("DspLibXTC_customFilterDictionary") {
+            Some(Value::Dict(d)) => d,
+            _ => unreachable!(),
+        };
+        let setup = match custom.get_mut("Setup_0") {
+            Some(Value::Dict(d)) => d,
+            _ => unreachable!(),
+        };
+        let w = match setup.get_mut("W") {
+            Some(Value::Dict(d)) => d,
+            _ => unreachable!(),
+        };
+        for name in ["11", "12", "21", "22"] {
+            for part in ["real", "imag"] {
+                let key = format!("W{name}{part}");
+                let values = compressed_f32(w, &key).unwrap();
+                *w.get_mut(&key).unwrap() = Value::Array(values.into_iter().map(Value::Real).collect());
+            }
+        }
+        *w.get_mut("WDataIsCompressed").unwrap() = Value::Bool(false);
+        let uncompressed = compile(&s, 48_000.0, &mut Diagnostics::default()).unwrap().unwrap();
+        assert_eq!(before, uncompressed);
+        let flags = with_params(s.clone(), &[(33, 1.0), (49, 1.0), (17, -1.0), (19, -1.0), (18, 40.0), (20, 40.0)]);
+        assert_eq!(uncompressed, compile(&flags, 48_000.0, &mut Diagnostics::default()).unwrap().unwrap());
+        assert!(compile(&with_params(s, &[(33, 2.0)]), 48_000.0, &mut Diagnostics::default()).is_err());
     }
 
     #[test]
