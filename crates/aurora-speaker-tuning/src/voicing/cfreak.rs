@@ -53,6 +53,9 @@ pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option
     compile_for(stage, fs, None, diags)
 }
 
+/// The published range of parameter 17 ("max saturation"), dB.
+pub const MAX_SATURATION_DB: (f64, f64) = (0.0, 40.0);
+
 /// Whether a tuning extracted from macOS build `build` runs the macOS 27
 /// unit (builds `26xxx` and later), whose saturation drive has the
 /// parameter-17 block-peak ceiling. Unknown builds keep the 25G83 unit.
@@ -135,8 +138,11 @@ pub fn compile_for(
             return Err(bad("output saturation without oversampling and an active de-esser (not carried)".into()));
         }
         // "max saturation" (dB): the macOS 27 unit's block-peak ceiling of
-        // the shaper drive; the 25G83 unit has none
-        let saved = get(17)?;
+        // the shaper drive; the 25G83 unit has none. The unit holds the
+        // value inside the parameter's published range, so a saved value
+        // under the floor runs at the floor (black-box: a saved -2 dB
+        // ceiling drives every block exactly as 0 dB does).
+        let saved = get(17)?.clamp(MAX_SATURATION_DB.0, MAX_SATURATION_DB.1);
         let ceiling = if macos27(source_build) { saved } else { sgv2_core::voicing::cfreak::CEILING_OFF_DB };
         // The de-esser (18-20) shapes the saturation drive; 21 belongs to
         // the version-1 state. Require complete finite saved values rather
@@ -306,6 +312,13 @@ mod tests {
         let st = stage(&[(1, 3.0), (10, 2.0), (16, 1.0), (17, 30.0), (18, 10_000.0), (19, 10.0), (20, 1.0), (23, 1.0)]);
         let on = compile_for(&st, 48_000.0, Some("26B8125"), &mut Diagnostics::default()).unwrap().unwrap();
         assert_eq!(on.saturation_ceiling_db, 30.0);
+        // a saved ceiling outside the published range runs at its bound
+        for (saved, held) in [(-2.0, 0.0), (0.0, 0.0), (6.0, 6.0), (45.0, 40.0)] {
+            let st =
+                stage(&[(1, 3.0), (10, 2.0), (16, 1.0), (17, saved), (18, 10_000.0), (19, 10.0), (20, 1.0), (23, 1.0)]);
+            let p = compile_for(&st, 48_000.0, Some("27C100"), &mut Diagnostics::default()).unwrap().unwrap();
+            assert_eq!(p.saturation_ceiling_db, held);
+        }
         assert!(macos27(Some("26A428")) && !macos27(Some("25G83")) && !macos27(None) && !macos27(Some("x")));
         assert_eq!((saturated.deesser_hz, saturated.deesser_db, saturated.deesser_q), (10_000.0, 10.0, 1.0));
         // flavour 1 (cubic) is carried with version 0 or 1, at the base rate

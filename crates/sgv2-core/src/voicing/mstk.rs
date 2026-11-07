@@ -1082,6 +1082,14 @@ pub struct Run {
     band_zero_factor: usize,
     band_zero_phase: usize,
     analytic_pick: bool,
+    /// With threshold automation (eight-frame sub-blocks) band 0's gain
+    /// is computed from the previous sub-block's pick. Black-box
+    /// (installed unit, AID44 strip): band-0 attacks at full scale came
+    /// 0.1 to 0.2 dB too early in their first 10 ms; one sub-block of lag
+    /// brings every per-box probe within 0.034 dB. The other bands pick
+    /// their own sub-block (a lag there misses by up to 0.1 dB).
+    band_zero_pick_lag: bool,
+    band_zero_previous_pick: f64,
     gain_src: [GainSrc; BANDS],
     half_analysis_low_a: [[[[f32; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
     half_analysis_high_a: [[[[f32; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
@@ -1182,6 +1190,8 @@ impl Run {
             band_zero_factor,
             band_zero_phase: 0,
             analytic_pick: cadence(q) == Cadence::AnalyticPick,
+            band_zero_pick_lag: cadence(q) == Cadence::PickEight,
+            band_zero_previous_pick: 0.0,
             gain_src: core::array::from_fn(|b| {
                 GainSrc::new(detector_factor[b], if b == 0 { band_zero_rate } else { fs })
             }),
@@ -1213,6 +1223,7 @@ impl Run {
         self.gain_state = [1.0; BANDS];
         self.detector_max = [SlidingMax::EMPTY; BANDS];
         self.detector_phase = [0; BANDS];
+        self.band_zero_previous_pick = 0.0;
         for envelope in &mut self.audio_quadrature {
             envelope.reset();
         }
@@ -1391,8 +1402,12 @@ impl Run {
     }
 
     #[inline]
+    /// The band saturator shapes the gained band, as on the analytic path.
+    /// Black-box (installed unit, AID37/42 strips with every band on
+    /// flavour 1): shaping before the gain left full-scale tones 0.05 to
+    /// 0.09 dB low; after the gain every per-box probe is within 0.02 dB.
     fn band_output(flavor: Option<u32>, gain: f64, x: f64) -> f64 {
-        gain * Self::saturate(flavor, x)
+        Self::saturate(flavor, gain * x)
     }
 
     pub fn process(&mut self, bufs: &mut [&mut [f32]], frames: usize) {
@@ -1473,6 +1488,9 @@ impl Run {
                 }
                 let update = self.detector_phase[b] == 0;
                 let input = if update {
+                    if b == 0 && self.band_zero_pick_lag {
+                        p = core::mem::replace(&mut self.band_zero_previous_pick, p);
+                    }
                     let held = self.window_max(b, p);
                     // Every algorithm releases the post-curve linear gain.
                     // Reduction applies immediately; recovery is a one-pole
@@ -1838,6 +1856,8 @@ mod tests {
         // updates.
         assert_eq!(window, [1, 13, 13, 13]);
         assert!(!analytic_pick);
+        assert!(alloc::boxed::Box::new(Run::new(&automated, 48_000.0, 1)).band_zero_pick_lag);
+        assert!(!alloc::boxed::Box::new(Run::new(&p, 48_000.0, 1)).band_zero_pick_lag);
 
         let mut max = SlidingMax::EMPTY;
         assert_eq!(max.push(9.0, 3), 9.0);
@@ -2157,8 +2177,9 @@ mod tests {
     }
 
     #[test]
-    fn saturation_precedes_detector_gain() {
-        assert_eq!(Run::band_output(Some(0), 0.25, 2.0), 0.25);
+    fn saturation_follows_detector_gain() {
+        assert_eq!(Run::band_output(Some(0), 0.25, 2.0), 0.5);
+        assert_eq!(Run::band_output(Some(0), 1.0, 2.0), 1.0);
         assert_eq!(Run::band_output(None, 0.25, 2.0), 0.5);
     }
 
