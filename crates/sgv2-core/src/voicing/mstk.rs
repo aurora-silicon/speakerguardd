@@ -772,11 +772,20 @@ impl Run {
             }
         }
         let detector_factor = detector_factors(q);
-        let window_ms = [10.0, 8.0, 2.0, 1.0];
-        let detector_window = core::array::from_fn(|b| {
-            ((libm::round(window_ms[b] * fs / (1000.0 * detector_factor[b] as f64)) as usize) | 1)
-                .clamp(1, MAX_DETECTOR_WINDOW)
-        });
+        let detector_window = match cadence(q) {
+            // Black-box carrier-stop probes resolve the quadrature path's
+            // hold as integer counts of its fixed eight-frame hops.  The
+            // phase-compensator tail makes observable recovery slightly
+            // longer than the queue itself.
+            Cadence::HopPeak => [32, 32, 28, 24],
+            Cadence::Pick => {
+                let window_ms = [10.0, 8.0, 2.0, 1.0];
+                core::array::from_fn(|b| {
+                    ((libm::round(window_ms[b] * fs / (1000.0 * detector_factor[b] as f64)) as usize) | 1)
+                        .clamp(1, MAX_DETECTOR_WINDOW)
+                })
+            }
+        };
         let release = core::array::from_fn(|b| {
             if q.release_s > 0.0 {
                 libm::exp(-(detector_factor[b] as f64) / (q.release_s * fs))
@@ -1309,13 +1318,13 @@ mod tests {
     fn detector_cadences_scale_windows_and_keep_the_next_peak() {
         let run = Run::new(&params(), 48_000.0, 1);
         assert_eq!(run.detector_factor, [8; BANDS]);
-        assert_eq!(run.detector_window, [61, 49, 13, 7]);
+        assert_eq!(run.detector_window, [32, 32, 28, 24]);
         for b in 0..BANDS {
             let embedded_fs = 48_000.0 / run.detector_factor[b] as f64;
             assert!((run.release[b] - libm::exp(-1.0 / (params().release_s * embedded_fs))).abs() < 1e-12);
         }
         let run = Run::new(&params(), 96_000.0, 1);
-        assert_eq!(run.detector_window, [121, 97, 25, 13]);
+        assert_eq!(run.detector_window, [32, 32, 28, 24]);
 
         let mut p = params();
         p.algorithm = 3;
