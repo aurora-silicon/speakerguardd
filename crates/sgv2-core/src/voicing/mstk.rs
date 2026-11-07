@@ -1002,7 +1002,8 @@ pub struct Run {
     overshoot_quadrature: [[[QuadratureEnvelope; BANDS]; BANDS]; MAX_CHANNELS],
     audio_quadrature: [QuadratureEnvelope; MAX_CHANNELS],
     mode4_gain: [Mode4Gain; BANDS],
-    mode4_held: [Mode4Mix; BANDS],
+    mode4_old: [(f32, f32); BANDS],
+    mode4_new: [(f32, f32); BANDS],
     mode4_phase: usize,
     hop_peak: bool,
     detector_hop: [f64; BANDS],
@@ -1093,7 +1094,8 @@ impl Run {
                 let rate = if q.algorithm == 0 && b == 0 && q.band[b].mode == BandMode::Active { fs * 0.5 } else { fs };
                 Mode4Gain::new(rate)
             }),
-            mode4_held: [Mode4Mix::default(); BANDS],
+            mode4_old: [(1.0, 1.0); BANDS],
+            mode4_new: [(1.0, 1.0); BANDS],
             mode4_phase: 0,
             hop_peak,
             detector_hop: [0.0; BANDS],
@@ -1145,7 +1147,8 @@ impl Run {
         for gain in &mut self.mode4_gain {
             gain.reset();
         }
-        self.mode4_held = [Mode4Mix::default(); BANDS];
+        self.mode4_old = [(1.0, 1.0); BANDS];
+        self.mode4_new = [(1.0, 1.0); BANDS];
         self.mode4_phase = 0;
         self.state = [[[[0.0; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS];
         self.state_b = [[[[0.0; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS];
@@ -1454,10 +1457,25 @@ impl Run {
                 self.mode4_phase ^= 1;
                 for b in 0..BANDS {
                     if self.algorithm == 0 && b == 0 && self.band[b].mode == BandMode::Active {
-                        if phase == 0 {
-                            self.mode4_held[b] = self.mode4_gain[b].step(gain[b]);
+                        if phase == 1 {
+                            let mix = self.mode4_gain[b].step(gain[b]);
+                            let direct = mix.correction_weight;
+                            let corrected = 1.0 - direct;
+                            self.mode4_old[b] = self.mode4_new[b];
+                            self.mode4_new[b] = (
+                                corrected * (mix.lowpass + mix.arm_a) + direct * mix.gain,
+                                corrected * (mix.lowpass + mix.arm_b) + direct * mix.gain,
+                            );
                         }
-                        mode4[b] = self.mode4_held[b];
+                        let (arm_a, arm_b) = if phase == 1 {
+                            self.mode4_old[b]
+                        } else {
+                            (
+                                0.5 * (self.mode4_old[b].0 + self.mode4_new[b].0),
+                                0.5 * (self.mode4_old[b].1 + self.mode4_new[b].1),
+                            )
+                        };
+                        mode4[b] = Mode4Mix { arm_a, arm_b, ..Mode4Mix::default() };
                     } else {
                         mode4[b] = self.mode4_gain[b].step(gain[b]);
                     }
