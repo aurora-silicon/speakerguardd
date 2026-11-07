@@ -270,6 +270,11 @@ fn level(power: f64) -> f64 {
     10.0 * libm::log10(libm::fabs(power).max(1e-20))
 }
 
+/// Algorithm 1's single-precision detector-level conversion.
+fn level_f32(power: f64) -> f64 {
+    f64::from(10.0 * libm::log10f((power as f32).abs().max(1e-20)))
+}
+
 fn loudness(power: f64) -> f64 {
     level(power) + LOUDNESS_OFFSET
 }
@@ -816,7 +821,7 @@ impl Run {
     /// the boundary `LONG_DELAY` windows later.
     fn on_step(&mut self) {
         let ema = self.ema;
-        let db = level(ema);
+        let db = if self.p.algorithm1 { level_f32(ema) } else { level(ema) };
         self.peak = self.peak.max(db);
         self.events += 1;
         if self.steps == 0 && self.blocks == 0 {
