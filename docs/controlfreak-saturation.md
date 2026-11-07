@@ -69,6 +69,7 @@ scale = f32(1 / sum(double(q[j])))
 h[j] = f32(q[j] * scale)
 ```
 
-The interpolator uses `f32(2*h)` and the decimator uses `h`; their persistent
-polyphase histories are not reset at drive-block boundaries.  Both saturation
-flavours share this path.
+The interpolator uses `f32(2*h)` and the decimator uses `h`; their samples,
+accumulators and persistent polyphase histories are single precision and are
+not reset at drive-block boundaries.  Both saturation flavours share this
+path.
