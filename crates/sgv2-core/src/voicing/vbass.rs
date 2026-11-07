@@ -527,8 +527,12 @@ impl Follower {
         } else {
             (self.a_rel, self.a_smo)
         };
-        self.e = a * self.e + (1.0 - a) * u;
-        self.s = b * self.s + (1.0 - b) * self.e;
+        // The retained stores and both associations are Float32.  Keep the
+        // follower's multiply-add boundary explicit: a long program history
+        // can otherwise move the first post-step windows by a measurable
+        // fraction of a decibel even though steady segments agree.
+        self.e = a.mul_add(self.e, (1.0 - a) * u);
+        self.s = b.mul_add(self.s, (1.0 - b) * self.e);
         self.s as f64
     }
 }
