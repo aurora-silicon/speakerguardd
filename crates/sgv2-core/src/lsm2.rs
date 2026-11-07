@@ -78,14 +78,21 @@
 //! - **Slow gain** (power, temperature, linked across channels; residuals
 //!   2.4): the output-temperature ceiling solves the absolute ordinary
 //!   request on the fast-gained retained frame and look-ahead as
-//!   `B + g L + g^2 Q`; the idle follower releases toward that solved request,
-//!   and a result below its provisional endpoint makes a second follower call
-//!   toward 0.99 x the request. The audio applies the slow trajectory after
-//!   summing the fast-gained bands.
+//!   `B + g L + g^2 Q`. Runtime look-ahead writes move the retained
+//!   start inside the fixed initial latency allocation, and every
+//!   ceiling substep uses the native Float32 vector-sum tree. The retained
+//!   current response contributes to the linear term for one filterbank
+//!   stage; the zero-state quadratic response spans the complete window. The
+//!   idle follower releases toward that solved request, and a result below
+//!   its provisional endpoint makes a second follower call toward 0.99 x the
+//!   request. The audio applies the slow trajectory after summing the
+//!   fast-gained bands.
 //! - **Monitor** (rig laws 3, 4, 11): on the protected output, `u = Vfs y`;
 //!   the Float32 substep mean of `u i` drives the two thermal branches
 //!   (residuals 2.1: `theta += alpha (R_eff P - theta)`), and `Pamp = idle + ratio max(mean(u i), 0) (Rdc + Rpar) /
-//!   Rdc` the four exponential averages the meters report.
+//!   Rdc` the four exponential averages the meters report. Coil telemetry
+//!   adds the ambient captured at initialisation; control and magnet
+//!   telemetry use the live ambient parameter.
 //!
 //! Full scale: the output is held to digital full scale, a non-finite input
 //! sample is 0 to the audio and the models and the most restrictive to the
@@ -174,7 +181,9 @@ pub fn controller_frames(rate: u32) -> usize {
 fn vector_frames(ms: f32, rate: u32) -> usize {
     let f = ms as f64 * 1e-3 * rate as f64;
     let vector = SUBSTEPS * rate_family(rate);
-    (libm::round(f / vector as f64) as usize * vector).max(vector)
+    // A zero look-ahead is native (t-4892 rate captures; t-4870 runtime
+    // writes): no one-vector minimum.
+    libm::round(f / vector as f64) as usize * vector
 }
 /// Filterbank bands.
 pub const BANDS: usize = 5;
@@ -182,7 +191,7 @@ pub const BANDS: usize = 5;
 pub const PRESSURE_TAPS: usize = 1024;
 const EPS: f64 = f32::MIN_POSITIVE as f64;
 /// The 0.99 downward target of every gain law (rig laws 5, 8; spec 15.4).
-const CUT: f64 = 0.99;
+const CUT: f32 = 0.99;
 
 /// Native realizes the ordinary sample-peak request window one bank sample
 /// before the retained audio/model window; the span stays unchanged.
@@ -573,6 +582,17 @@ pub mod ids {
 }
 
 impl Params {
+    /// A runtime look-ahead write: finite and non-negative. Its window
+    /// position is checked by the unit against the fixed geometry.
+    fn validate_runtime_lookahead(&self) -> Result<(), InitError> {
+        let v = self.speaker_response_lookahead_ms;
+        if v.is_finite() && v >= 0.0 {
+            Ok(())
+        } else {
+            Err(InitError::Invalid("latency"))
+        }
+    }
+
     /// Structural checks only: the model trusts the tuning's values.
     pub fn validate(&self) -> Result<(), InitError> {
         let n = self.channels as usize;
@@ -928,6 +948,86 @@ pub fn settle_step(delta_s: f64, time_s: f64) -> f64 {
     1.0 - libm::exp(libm::log(0.01) * delta_s / time_s)
 }
 
+/// Accelerate's Float32 `vDSP_sve` reduction tree. The native controller
+/// forms every thermal substep mean with this reduction, rather than a
+/// left-to-right scalar sum. `next` supplies one or more parallel vectors so
+/// the ceiling's linear and quadratic products keep the same sample order.
+fn vdsp_sve<const K: usize>(n: usize, mut next: impl FnMut() -> [f32; K]) -> [f32; K] {
+    let chunks = n / 4;
+    // These are exactly the contiguous-input paths used by the supported
+    // 44.1--96 kHz substeps (at most 64 frames). Larger unusual rates keep
+    // the same first sixteen vector accumulators, then consume more vectors
+    // into the folded result.
+    let grouped = if chunks >= 16 {
+        16
+    } else if chunks >= 8 {
+        8
+    } else if chunks >= 4 {
+        4
+    } else if chunks >= 2 {
+        2
+    } else {
+        chunks
+    };
+    let mut a = [[[0.0f32; 4]; 4]; K];
+    for v in 0..grouped {
+        for l in 0..4 {
+            let x = next();
+            for k in 0..K {
+                a[k][v & 3][l] += x[k];
+            }
+        }
+    }
+    let mut sum = [0.0f32; K];
+    let mut lanes = [[0.0f32; 4]; K];
+    for k in 0..K {
+        lanes[k] = match grouped {
+            0 => [0.0; 4],
+            1 => a[k][0],
+            2 | 3 => core::array::from_fn(|l| a[k][0][l] + a[k][1][l]),
+            _ => core::array::from_fn(|l| (a[k][0][l] + a[k][2][l]) + (a[k][1][l] + a[k][3][l])),
+        };
+    }
+    for _ in grouped..chunks {
+        for l in 0..4 {
+            let x = next();
+            for k in 0..K {
+                lanes[k][l] += x[k];
+            }
+        }
+    }
+    let tail = n & 3;
+    if tail >= 2 {
+        let x0 = next();
+        let x1 = next();
+        for k in 0..K {
+            lanes[k][0] += x0[k];
+            lanes[k][1] += x1[k];
+        }
+    }
+    if tail & 1 != 0 {
+        let x = next();
+        for k in 0..K {
+            lanes[k][0] += x[k];
+        }
+    }
+    for k in 0..K {
+        sum[k] = (lanes[k][0] + lanes[k][1]) + (lanes[k][2] + lanes[k][3]);
+    }
+    sum
+}
+
+/// The thermal substep power total of a contiguous block (the monitor and
+/// input temperature models): the same `vDSP_sve` tree as the ceiling.
+fn vdsp_sve_slice(x: &[f32]) -> f32 {
+    let mut i = 0;
+    vdsp_sve(x.len(), || {
+        let v = x[i];
+        i += 1;
+        [v]
+    })[0]
+}
+
 fn db_to_lin(db: f64) -> f64 {
     libm::pow(10.0, -db / 20.0)
 }
@@ -1130,9 +1230,7 @@ impl ProtectedPeak {
     }
 }
 
-/// The current model of spec 15.2: a Float32 biquad, every output rounded
-/// to f32, `i[n] = f32(b0 u[n] + b1 u[n-1] + b2 u[n-2] - a1 i[n-1] - a2
-/// i[n-2])`.
+/// The input power-path current model: binary32 state and output.
 #[derive(Clone, Copy, Default)]
 struct Current {
     b: [f32; 3],
@@ -1142,8 +1240,6 @@ struct Current {
 }
 
 impl Current {
-    /// `I/U = (Mms s^2 + Rms s + Kms) / (R Mms s^2 + (R Rms + Bl^2) s + R Kms)`
-    /// by the generative builder of residuals section 1.
     fn new(rdc: f64, bl: f64, m: f64, rms: f64, k: f64, rate: f64) -> Self {
         let (b, a) = current_coefficients(rdc, bl, m, rms, k, rate);
         Current { b, a, u: [0.0; 2], i: [0.0; 2] }
@@ -1165,6 +1261,150 @@ impl Current {
     }
     fn is_finite(&self) -> bool {
         self.i[0].is_finite() && self.i[1].is_finite()
+    }
+}
+
+/// Largest native power/thermal substep (64 frames at 88.2/96/176.4/192 kHz).
+const MAX_SUBSTEP_FRAMES: usize = 2 * SUBSTEP_FRAMES;
+
+/// The output-monitor current model in the optimized vDSP bulk form.
+///
+/// The multichannel API documents a direct-form-II filter but its optimized
+/// single-channel path does not iterate that recurrence one sample at a time.
+/// It precalculates the first eight input and state responses in binary64,
+/// rounds the table to binary32, evaluates two groups of four outputs, and
+/// updates the two transposed states once per eight samples.  This portable
+/// expression preserves that arithmetic order without depending on
+/// Accelerate or an architecture-specific vector ISA.
+#[derive(Clone, Copy)]
+struct MonitorCurrent {
+    b: [f32; 3],
+    a: [f32; 2],
+    table: [f32; 56],
+    z: [f32; 2],
+}
+
+impl Default for MonitorCurrent {
+    fn default() -> Self {
+        Self { b: [0.0; 3], a: [0.0; 2], table: [0.0; 56], z: [0.0; 2] }
+    }
+}
+
+impl MonitorCurrent {
+    fn new(rdc: f64, bl: f64, m: f64, rms: f64, k: f64, rate: f64) -> Self {
+        let (b, a) = current_coefficients(rdc, bl, m, rms, k, rate);
+        MonitorCurrent { b, a, table: Self::bulk_table(b, a), z: [0.0; 2] }
+    }
+
+    fn bulk_table(b: [f32; 3], a: [f32; 2]) -> [f32; 56] {
+        let (b0, b1, b2) = (f64::from(b[0]), f64::from(b[1]), f64::from(b[2]));
+        let (a1, a2) = (f64::from(a[0]), f64::from(a[1]));
+        let mut h = [0.0f64; 8];
+        let mut p = [0.0f64; 8];
+        let mut q = [0.0f64; 8];
+        h[0] = b0;
+        h[1] = b1 - a1 * h[0];
+        h[2] = (b2 - a1 * h[1]) - a2 * h[0];
+        p[0] = 1.0;
+        p[1] = -a1;
+        q[1] = 1.0;
+        for i in 2..8 {
+            if i >= 3 {
+                h[i] = -a1 * h[i - 1] - a2 * h[i - 2];
+            }
+            p[i] = -a1 * p[i - 1] - a2 * p[i - 2];
+            q[i] = -a1 * q[i - 1] - a2 * q[i - 2];
+        }
+
+        let mut t = [0.0f32; 56];
+        for row in 0..4 {
+            for column in 0..4 {
+                if row >= column {
+                    t[4 * column + row] = h[row - column] as f32;
+                }
+            }
+        }
+        for i in 0..4 {
+            t[16 + i] = p[i] as f32;
+            t[20 + i] = q[i] as f32;
+        }
+        t[24..32].copy_from_slice(&[b[2], 0.0, b[1], b[2], a[1], 0.0, a[0], a[1]]);
+        for i in 0..4 {
+            t[32 + i] = h[4 + i] as f32;
+            t[36 + i] = h[3 + i] as f32;
+            t[40 + i] = h[2 + i] as f32;
+            t[44 + i] = h[1 + i] as f32;
+            t[48 + i] = p[4 + i] as f32;
+            t[52 + i] = q[4 + i] as f32;
+        }
+        t
+    }
+
+    fn process(&mut self, input: &[f32], output: &mut [f32]) {
+        debug_assert_eq!(input.len(), output.len());
+        let bulk = input.len() / 8 * 8;
+        for base in (0..bulk).step_by(8) {
+            let x = &input[base..base + 8];
+            let y = &mut output[base..base + 8];
+            for lane in 0..4 {
+                let mut low = self.table[lane] * x[0];
+                low = libm::fmaf(self.table[4 + lane], x[1], low);
+                low = libm::fmaf(self.table[8 + lane], x[2], low);
+                low = libm::fmaf(self.table[12 + lane], x[3], low);
+                low = libm::fmaf(self.table[16 + lane], self.z[0], low);
+                y[lane] = libm::fmaf(self.table[20 + lane], self.z[1], low);
+
+                let mut upper = self.table[32 + lane] * x[0];
+                upper = libm::fmaf(self.table[36 + lane], x[1], upper);
+                upper = libm::fmaf(self.table[40 + lane], x[2], upper);
+                upper = libm::fmaf(self.table[44 + lane], x[3], upper);
+                upper = libm::fmaf(self.table[48 + lane], self.z[0], upper);
+                let mut lower = self.table[lane] * x[4];
+                lower = libm::fmaf(self.table[52 + lane], self.z[1], lower);
+                lower = libm::fmaf(self.table[4 + lane], x[5], lower);
+                lower = libm::fmaf(self.table[8 + lane], x[6], lower);
+                lower = libm::fmaf(self.table[12 + lane], x[7], lower);
+                y[4 + lane] = upper + lower;
+            }
+            let mut next = [0.0f32; 2];
+            for lane in 0..2 {
+                let mut state = self.table[24 + lane] * x[6];
+                state = libm::fmaf(self.table[26 + lane], x[7], state);
+                state = libm::fmaf(-self.table[28 + lane], y[6], state);
+                next[lane] = libm::fmaf(-self.table[30 + lane], y[7], state);
+            }
+            self.z = next;
+        }
+        for i in bulk..input.len() {
+            let x = input[i];
+            let y = libm::fmaf(self.b[0], x, self.z[0]);
+            let z1 = libm::fmaf(-self.a[0], y, libm::fmaf(self.b[1], x, self.z[1]));
+            let z2 = libm::fmaf(self.b[2], x, -self.a[1] * y);
+            output[i] = y;
+            self.z = [z1, z2];
+        }
+    }
+
+    /// Replace voltages with their binary32 `u*i` products and return the
+    /// corresponding unrounded binary64 sum used by the amplifier monitor.
+    fn power_products_in_place(&mut self, voltage: &mut [f32]) -> f64 {
+        debug_assert!(voltage.len() <= MAX_SUBSTEP_FRAMES);
+        let mut current = [0.0f32; MAX_SUBSTEP_FRAMES];
+        self.process(voltage, &mut current[..voltage.len()]);
+        let mut sum = 0.0;
+        for i in 0..voltage.len() {
+            let product = f64::from(voltage[i]) * f64::from(current[i]);
+            sum += product;
+            voltage[i] = product as f32;
+        }
+        sum
+    }
+
+    fn clear(&mut self) {
+        self.z = [0.0; 2];
+    }
+    fn is_finite(&self) -> bool {
+        self.z[0].is_finite() && self.z[1].is_finite()
     }
 }
 
@@ -1197,6 +1437,7 @@ struct SlowGain {
     g: f32,
     start: f32,
     target: f32,
+    release: f32,
     n: u32,
     len: u32,
     attack: bool,
@@ -1204,13 +1445,14 @@ struct SlowGain {
 
 impl SlowGain {
     fn unity(len: u32) -> Self {
-        SlowGain { g: 1.0, start: 1.0, target: 1.0, n: 0, len, attack: false }
+        SlowGain { g: 1.0, start: 1.0, target: 1.0, release: 0.0, n: 0, len, attack: false }
     }
     /// A held gain, used at reset and hand-off.
     fn set(&mut self, g: f32) {
         self.g = g;
         self.start = g;
         self.target = g;
+        self.release = 0.0;
         self.n = 0;
         self.attack = false;
     }
@@ -1218,6 +1460,7 @@ impl SlowGain {
         if !self.attack || self.n >= self.len {
             self.start = self.g;
             self.target = request.clamp(self.g, 1.0);
+            self.release = 0.0;
             self.n = 0;
             self.attack = false;
         }
@@ -1228,20 +1471,31 @@ impl SlowGain {
         if self.attack {
             if self.n < self.len {
                 self.n += 1;
-                let w = 0.5 * (1.0 + libm::cos(core::f64::consts::PI * self.n as f64 / self.len as f64));
-                self.g = (self.target as f64 + (self.start as f64 - self.target as f64) * w) as f32;
+                // The arm64 implementation builds its raised-cosine table as
+                // Float32 from a binary64 sincos: angle is (pi / len) * n and
+                // the stored ordinate is Float32(1 + cos(angle)).  A fresh
+                // segment normalizes the start ordinate by Float32(1 / 2),
+                // then vDSP applies the segment with a fused multiply-add.
+                let angle = (core::f64::consts::PI / self.len as f64) * self.n as f64;
+                let ordinate = (1.0 + libm::cos(angle)) as f32;
+                let scale = (self.start - self.target) * 0.5;
+                self.g = libm::fmaf(scale, ordinate, self.target);
             } else {
                 self.g = self.target;
             }
         } else if self.start != self.target {
             self.n += 1;
-            let r = (1.0 - libm::exp(-(self.n as f64) * release_lambda)).min(1.0) as f32;
-            self.g = self.start + r * (self.target - self.start);
+            // Native builds the release curve recursively in binary32, then
+            // applies it with a second FMA.  Re-evaluating the closed-form
+            // exponential at each sample is not bit-equivalent.
+            let alpha = (release_lambda as f32).min(1.0);
+            self.release = libm::fmaf(1.0 - alpha, self.release, alpha);
+            self.g = libm::fmaf(self.target - self.start, self.release, self.start);
         }
         self.g
     }
     fn finite(&self) -> bool {
-        self.g.is_finite() && self.start.is_finite() && self.target.is_finite()
+        self.g.is_finite() && self.start.is_finite() && self.target.is_finite() && self.release.is_finite()
     }
 }
 
@@ -1342,8 +1596,9 @@ struct Chan {
     // Temperature axis (residuals 2): the input model, unattenuated, on
     // the input's own current model; its temperature points by global
     // substep (ring), the newest at `tn - 1`.
-    tin_cur: Current,
-    tin_acc: f32,
+    tin_cur: MonitorCurrent,
+    /// One thermal substep of `u*i` products (monitor sum).
+    power_work: Vec<f32>,
     tp_vc: f32,
     tp_mg: f32,
     tring: [f32; TRING],
@@ -1352,9 +1607,16 @@ struct Chan {
     // Slow gain.
     slow: SlowGain,
     // Monitor on the output.
-    cur_out: Current,
+    cur_out: MonitorCurrent,
     th_vc: f32,
     th_mg: f32,
+    /// The preceding output frame before slow gain, and the output-model
+    /// state at each of its substep starts. Runtime attack changes move the
+    /// native ceiling window's start within this retained frame.
+    ceil_fast_prev: Vec<f32>,
+    ceil_cur_prev: [MonitorCurrent; SUBSTEPS],
+    ceil_vc_prev: [f32; SUBSTEPS],
+    ceil_mg_prev: [f32; SUBSTEPS],
     pbar: [f64; 4],
     pbar1_frame: f64,
     pbar1s_frame: f64,
@@ -1365,6 +1627,9 @@ struct Chan {
     tau_vc: f64,
     tau_mag: f64,
     ambient: f64,
+    /// Ambient captured when the AU was initialised. Native coil telemetry
+    /// keeps this reference across the post-initialisation ambient write.
+    telemetry_ambient: f64,
     amp_limit: f64,
     disp_limit: f64,
     vel_floor: f64,
@@ -1410,41 +1675,63 @@ impl Chan {
     /// corrections start at the absolute ordinary request and continue at
     /// the hottest substep until every substep is within
     /// `TemperatureHardLimit + max(TemperatureHeadroom, 0)`.
-    fn ceiling_scale(&self, g0: f32, ctl: usize, sub: usize) -> f32 {
-        // the retained span: the frame and its known look-ahead
-        let od = self.xc.len() - ctl;
-        let horizon = ctl + od;
-        let subs = horizon / sub;
+    fn ceiling_scale(&self, g0: f32, ctl: usize, sub: usize, fb: usize, shift: isize) -> f32 {
+        let extra = shift.max(0) as usize;
+        let skip = (-shift).max(0) as usize;
+        let full = extra + self.xc.len();
+        let discard = skip / sub;
+        let subs = (full - skip) / sub;
         let mut base = [0.0f32; CEIL_FRAMES * SUBSTEPS];
         let mut lin = [0.0f32; CEIL_FRAMES * SUBSTEPS];
         let mut quad = [0.0f32; CEIL_FRAMES * SUBSTEPS];
-        let mut plin = [0.0f32; CEIL_FRAMES * SUBSTEPS];
-        let mut pquad = [0.0f32; CEIL_FRAMES * SUBSTEPS];
-        let mut zi = self.cur_out;
+        let hist_sub = (ctl - extra) / sub;
+        let mut zi = if extra == 0 { self.cur_out } else { self.ceil_cur_prev[hist_sub] };
         let mut zs = self.cur_out;
         zs.clear();
-        let (mut bv, mut bm) = (self.th_vc, self.th_mg);
+        let (mut bv, mut bm) = if extra == 0 {
+            (self.th_vc, self.th_mg)
+        } else {
+            (self.ceil_vc_prev[hist_sub], self.ceil_mg_prev[hist_sub])
+        };
         let (mut lv, mut lm, mut qv, mut qm) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
-        let (mut al, mut aq) = (0.0f32, 0.0f32);
         let amb = self.ambient as f32;
-        for i in 0..horizon {
-            let u = self.vfs * self.out_sample(i, 1.0);
-            al += u * zi.step(0.0);
-            aq += u * zs.step(u);
-            if (i + 1) % sub == 0 {
-                let k = i / sub;
-                let (pl, pq) = (al / sub as f32, aq / sub as f32);
-                plin[k] = pl;
-                pquad[k] = pq;
-                al = 0.0;
-                aq = 0.0;
-                bv = self.br_vc.step(bv, 0.0);
-                bm = self.br_mg.step(bm, 0.0);
-                lv = self.br_vc.step(lv, pl);
-                lm = self.br_mg.step(lm, pl);
-                qv = self.br_vc.step(qv, pq);
-                qm = self.br_mg.step(qm, pq);
-                base[k] = amb + bv + bm;
+        let mut i = 0;
+        for raw_k in 0..full / sub {
+            let mut voltage = [0.0f32; MAX_SUBSTEP_FRAMES];
+            for j in 0..sub {
+                let y = if i + j < extra {
+                    self.ceil_fast_prev[ctl - extra + i + j]
+                } else {
+                    self.out_sample(i + j - extra, 1.0)
+                };
+                voltage[j] = self.vfs * y;
+            }
+            let mut retained = [0.0f32; MAX_SUBSTEP_FRAMES];
+            let keep = fb.saturating_sub(i).min(sub);
+            if keep != 0 {
+                zi.process(&[0.0; MAX_SUBSTEP_FRAMES][..keep], &mut retained[..keep]);
+            }
+            let mut zero = [0.0f32; MAX_SUBSTEP_FRAMES];
+            zs.process(&voltage[..sub], &mut zero[..sub]);
+            let mut j = 0;
+            let [sl, sq] = vdsp_sve(sub, || {
+                let u = voltage[j];
+                let products =
+                    [(f64::from(u) * f64::from(retained[j])) as f32, (f64::from(u) * f64::from(zero[j])) as f32];
+                j += 1;
+                products
+            });
+            i += sub;
+            let (pl, pq) = (sl / sub as f32, sq / sub as f32);
+            bv = self.br_vc.step(bv, 0.0);
+            bm = self.br_mg.step(bm, 0.0);
+            lv = self.br_vc.step(lv, pl);
+            lm = self.br_mg.step(lm, pl);
+            qv = self.br_vc.step(qv, pq);
+            qm = self.br_mg.step(qm, pq);
+            if raw_k >= discard {
+                let k = raw_k - discard;
+                base[k] = amb + (bv + bm);
                 lin[k] = lv + lm;
                 quad[k] = qv + qm;
             }
@@ -1499,6 +1786,10 @@ impl Chan {
 pub struct Unit {
     params: Params,
     run: Option<Run>,
+    /// Geometry is fixed by AU initialisation. Runtime parameter writes may
+    /// move the ceiling window inside it, but do not rebuild the audio delay.
+    geometry_lookahead_ms: f32,
+    telemetry_ambient: [f32; MAX_CHANNELS],
 }
 
 struct Run {
@@ -1509,6 +1800,10 @@ struct Run {
     fb: usize,
     od: usize,
     latency: usize,
+    /// Runtime ceiling-window start relative to the initial output region.
+    /// Positive values retain this many frames from the preceding region;
+    /// negative values skip the corresponding leading frames.
+    ceiling_shift: isize,
     /// A model state went non-finite: the fail-safe is latched until reset.
     fault: bool,
     /// Frames into the current controller frame (input FIFO fill).
@@ -1556,13 +1851,17 @@ impl Unit {
     /// Allocation happens here, never in `process`. Unusable parameters
     /// give a unit that is the fail-safe; `init_error` says why.
     pub fn new(params: Params) -> Self {
-        let run = params.check_protects().and_then(|()| Run::new(&params)).ok();
-        Unit { params, run }
+        let geometry_lookahead_ms = params.speaker_response_lookahead_ms;
+        let telemetry_ambient = core::array::from_fn(|i| params.ch[i].ambient);
+        let run =
+            params.check_protects().and_then(|()| Run::new(&params, geometry_lookahead_ms, &telemetry_ambient)).ok();
+        Unit { params, run, geometry_lookahead_ms, telemetry_ambient }
     }
     /// Why [`Unit::new`] gives the fail-safe for `params`: unprotected
     /// (mitigation off, or no thermal axis) or unusable.
     pub fn init_error(params: &Params) -> Option<InitError> {
-        params.check_protects().and_then(|()| Run::new(params)).err()
+        let ambient = core::array::from_fn(|i| params.ch[i].ambient);
+        params.check_protects().and_then(|()| Run::new(params, params.speaker_response_lookahead_ms, &ambient)).err()
     }
     pub fn params(&self) -> &Params {
         &self.params
@@ -1581,8 +1880,14 @@ fn motion(rdc: f32, bl: f32, mms: f32, rms: f32, kms: f32, rate: f64, vel: bool)
 }
 
 impl Run {
-    fn new(p: &Params) -> Result<Run, InitError> {
-        p.validate()?;
+    fn new(p: &Params, geometry_lookahead_ms: f32, telemetry_ambient: &[f32; MAX_CHANNELS]) -> Result<Run, InitError> {
+        // The geometry (latency floor, look-ahead region) is the one built at
+        // initialisation; a runtime look-ahead write only moves the ceiling
+        // window inside it (checked below against the substep grid).
+        let mut geometry = *p;
+        geometry.speaker_response_lookahead_ms = geometry_lookahead_ms;
+        geometry.validate()?;
+        p.validate_runtime_lookahead()?;
         if p.model_only == 0 {
             return Err(InitError::Unsupported("system ID or closed-loop temperature"));
         }
@@ -1597,15 +1902,25 @@ impl Run {
         let ctl = controller_frames(p.sample_rate);
         let sub = ctl / SUBSTEPS;
         let fb = p.filterbank_frames();
-        let od = p.output_offset_frames();
+        let geometry_lookahead = vector_frames(geometry_lookahead_ms, p.sample_rate);
+        let od = fb + geometry_lookahead;
         let ring_len = (ctl + od) / sub;
         let sub_dt = sub as f64 / rate;
         let ctl_dt = ctl as f64 / rate;
         // residuals 2.4: AttackTime clamped to 10 ms, the raised-cosine
         // window at most one controller frame
         let attack_len = (libm::round((p.attack_time_ms as f64 * 1e-3).min(0.010) * rate) as u32).clamp(1, ctl as u32);
+        // Native keeps the AU's initial latency allocation fixed. A runtime
+        // look-ahead write moves the retained ceiling window's start; the
+        // window still ends at the newest retained sample. (t-4870 also moved
+        // it on a runtime attack write; on the arm64 rig that took t3-att50's
+        // displacement over macOS, so the attack write keeps the window.)
+        let ceiling_shift = p.lookahead_frames() as isize - geometry_lookahead as isize;
+        if ceiling_shift > (ctl - sub) as isize || ceiling_shift.unsigned_abs() % sub != 0 {
+            return Err(InitError::Invalid("ceiling window against the controller cadence"));
+        }
         let mut ch = Vec::with_capacity(n);
-        for c in &p.ch[..n] {
+        for (ci, c) in p.ch[..n].iter().enumerate() {
             let h = filterbank(rate, &c.band_center_hz, c.bandwidth, fb);
             let bank: [Vec<f32>; BANDS - 1] = core::array::from_fn(|k| h[k].clone());
             let taps = c.pressure_taps as usize;
@@ -1631,6 +1946,8 @@ impl Run {
             let vel = motion(c.vel_rdc, c.vel_bl, c.vel_mms_kg, c.vel_rms, c.vel_kms, rate, true);
             let disp = motion(c.disp_rdc, c.disp_bl, c.disp_mms_kg, c.disp_rms, c.disp_kms, rate, false);
             let cur = Current::new(c.rdc as f64, c.bl as f64, c.mms_kg as f64, c.rms as f64, c.kms as f64, rate);
+            let monitor_cur =
+                MonitorCurrent::new(c.rdc as f64, c.bl as f64, c.mms_kg as f64, c.rms as f64, c.kms as f64, rate);
             let br_vc = ThermalBranch::new(c.rth_vc as f64, c.tau_vc as f64, sub_dt);
             let br_mg = ThermalBranch::new(c.rth_mag as f64, c.tau_mag as f64, sub_dt);
             ch.push(Chan {
@@ -1685,17 +2002,21 @@ impl Run {
                 cur_in: cur,
                 pbar_in: [0.0; 4],
                 p_sub: [0.0; SUBSTEPS],
-                tin_cur: cur,
-                tin_acc: 0.0,
+                tin_cur: monitor_cur,
+                power_work: vec![0.0; sub],
                 tp_vc: 0.0,
                 tp_mg: 0.0,
                 tring: [c.ambient; TRING],
                 tn: 0,
                 gt: 1.0,
                 slow: SlowGain::unity(attack_len),
-                cur_out: cur,
+                cur_out: monitor_cur,
                 th_vc: 0.0,
                 th_mg: 0.0,
+                ceil_fast_prev: vec![0.0; ctl],
+                ceil_cur_prev: [monitor_cur; SUBSTEPS],
+                ceil_vc_prev: [0.0; SUBSTEPS],
+                ceil_mg_prev: [0.0; SUBSTEPS],
                 pbar: [0.0; 4],
                 pbar1_frame: 0.0,
                 pbar1s_frame: 0.0,
@@ -1705,6 +2026,7 @@ impl Run {
                 tau_vc: c.tau_vc as f64,
                 tau_mag: c.tau_mag as f64,
                 ambient: c.ambient as f64,
+                telemetry_ambient: telemetry_ambient[ci] as f64,
                 amp_limit: c.amplitude_limit as f64 - c.pilot_reserve as f64,
                 disp_limit: c.displacement_limit as f64,
                 vel_floor: db_to_lin(c.max_velocity_attenuation_db as f64),
@@ -1729,7 +2051,8 @@ impl Run {
             sub,
             fb,
             od,
-            latency: p.unit_latency_frames(),
+            latency: 2 * fb + geometry_lookahead + ctl,
+            ceiling_shift,
             fault: false,
             pos: 0,
             fragment_lens: [0; 2 * CONTROLLER_FRAMES],
@@ -1815,7 +2138,7 @@ impl Run {
             c.pbar_in = [0.0; 4];
             c.p_sub = [0.0; SUBSTEPS];
             c.tin_cur.clear();
-            c.tin_acc = 0.0;
+            c.power_work.fill(0.0);
             c.tp_vc = 0.0;
             c.tp_mg = 0.0;
             c.tring = [c.ambient as f32; TRING];
@@ -1825,6 +2148,10 @@ impl Run {
             c.cur_out.clear();
             c.th_vc = 0.0;
             c.th_mg = 0.0;
+            c.ceil_fast_prev.fill(0.0);
+            c.ceil_cur_prev = [c.cur_out; SUBSTEPS];
+            c.ceil_vc_prev = [0.0; SUBSTEPS];
+            c.ceil_mg_prev = [0.0; SUBSTEPS];
             c.pbar = [0.0; 4];
             c.pbar1_frame = 0.0;
             c.pbar1s_frame = 0.0;
@@ -1890,16 +2217,15 @@ impl Run {
                 let mw = c.vwin.len();
                 c.vwin[mw - ctl + i] = c.mvel.step(vfs * xin[i] as f64) as f32;
             }
-            // the input temperature model, unattenuated (residuals 2)
-            let ut = c.vfs * xin[i];
-            let it = c.tin_cur.step(ut);
-            c.tin_acc += ut * it;
+            // the input temperature model, unattenuated (residuals 2): the
+            // same bulk current model and substep reduction as the monitor
+            c.power_work[i % sub] = c.vfs * xin[i];
             if (i + 1) % sub == 0 {
-                let p = (c.tin_acc / sub as f32).max(0.0);
-                c.tin_acc = 0.0;
+                c.tin_cur.power_products_in_place(&mut c.power_work);
+                let p = (vdsp_sve_slice(&c.power_work) / sub as f32).max(0.0);
                 c.tp_vc = c.br_vc.step(c.tp_vc, p);
                 c.tp_mg = c.br_mg.step(c.tp_mg, p);
-                c.tring[c.tn % TRING] = c.ambient as f32 + c.tp_vc + c.tp_mg;
+                c.tring[c.tn % TRING] = c.ambient as f32 + (c.tp_vc + c.tp_mg);
                 c.tn += 1;
                 c.pk_x[slot] = px;
                 c.pk_d[slot] = pd;
@@ -2352,7 +2678,7 @@ impl Run {
         }
         if self.axis[4] {
             for (ci, c) in self.ch.iter().enumerate() {
-                want[ci] = c.ceiling_scale(want[ci], ctl, sub);
+                want[ci] = c.ceiling_scale(want[ci], ctl, sub, self.fb, self.ceiling_shift);
             }
         }
         if self.link && n > 1 {
@@ -2377,7 +2703,7 @@ impl Run {
                 }
                 // the second call starts at the provisionally advanced value
                 f.start = f.g;
-                f.target = (CUT * request as f64) as f32;
+                f.target = CUT * request;
                 f.n = 0;
                 f.attack = true;
                 c.slow = f;
@@ -2389,12 +2715,18 @@ impl Run {
         let (idle, ratio_p) = (self.idle, self.ratio);
         for (ci, c) in self.ch.iter_mut().enumerate() {
             let y = &mut self.yout[ci];
-            let mut acc = 0.0f64;
-            let mut acc32 = 0.0f32;
             let mut s = 0;
             let mut protected_model_peak = 0.0f32;
             let (mut p1, mut p1s) = (0.0f64, 0.0f64);
             for (i, yo) in y.iter_mut().enumerate().take(ctl) {
+                if i % sub == 0 {
+                    let k = i / sub;
+                    c.ceil_cur_prev[k] = c.cur_out;
+                    c.ceil_vc_prev[k] = c.th_vc;
+                    c.ceil_mg_prev[k] = c.th_mg;
+                }
+                let fast = c.out_sample(i, 1.0);
+                c.ceil_fast_prev[i] = fast;
                 let sg = c.slow.sample(slow_lambda);
                 let g0 = c.eg[0][i] * sg;
                 let mut same = true;
@@ -2413,20 +2745,16 @@ impl Run {
                     v
                 };
                 let u = c.vfs * v;
-                let iv = c.cur_out.step(u);
-                acc += u as f64 * iv as f64;
-                acc32 += u * iv;
+                c.power_work[i % sub] = u;
                 *yo = v.clamp(-1.0, 1.0);
                 // The persistent motion models follow the protected output.
                 c.dcar_m.step(c.vfs * *yo);
                 let modeled_velocity = c.vcar_m.step(c.vfs * *yo);
                 protected_model_peak = protected_model_peak.max(modeled_velocity.abs());
                 if (i + 1) % sub == 0 {
-                    let p = acc / sub as f64;
-                    acc = 0.0;
+                    let p = c.cur_out.power_products_in_place(&mut c.power_work) / sub as f64;
                     // the output thermal model (residuals 2.1)
-                    let pp = (acc32 / sub as f32).max(0.0);
-                    acc32 = 0.0;
+                    let pp = (vdsp_sve_slice(&c.power_work) / sub as f32).max(0.0);
                     c.th_vc = c.br_vc.step(c.th_vc, pp);
                     c.th_mg = c.br_mg.step(c.th_mg, pp);
                     let pamp = idle + ratio_p * (p * c.load_scale).max(0.0);
@@ -2610,8 +2938,10 @@ impl ProtectionUnit for Unit {
         for c in &run.ch {
             let mut s = ChannelState::ABSENT;
             let t = c.ambient + c.th_mg as f64 + c.th_vc as f64;
+            // binary32, ambient plus the coil rise, then the magnet rise
+            let coil_telemetry = (c.telemetry_ambient as f32 + c.th_vc) + c.th_mg;
             s.modeled_power_w = c.pbar[2] as f32;
-            s.coil_temp_c = t as f32;
+            s.coil_temp_c = coil_telemetry;
             s.magnet_temp_c = (c.ambient + c.th_mg as f64) as f32;
             s.control_temp_c = t as f32;
             s.ol_temp_c = t as f32;
@@ -2654,7 +2984,7 @@ impl ProtectionUnit for Unit {
             return false;
         }
         self.params = p;
-        self.run = Run::new(&self.params).ok();
+        self.run = Run::new(&self.params, self.geometry_lookahead_ms, &self.telemetry_ambient).ok();
         true
     }
 
@@ -2696,7 +3026,7 @@ impl ProtectionUnit for Unit {
             c.tp_vc = (s[6] * ev) as f32;
             c.tp_mg = (s[7] * em) as f32;
             // the input model's buffer holds the cooled temperature
-            c.tring = [c.ambient as f32 + c.tp_vc + c.tp_mg; TRING];
+            c.tring = [c.ambient as f32 + (c.tp_vc + c.tp_mg); TRING];
             for j in 0..4 {
                 let v = run.idle + (s[2 + j] - run.idle) * libm::pow(run.p_pole[j], substeps);
                 c.pbar[j] = v;
@@ -2716,6 +3046,27 @@ impl ProtectionUnit for Unit {
 #[cfg(test)]
 mod fault_tests {
     use super::*;
+
+    #[test]
+    fn current_bulk_table_and_state_are_chunk_stable() {
+        let b = [0.75, -0.25, 0.125];
+        let a = [-0.5, 0.25];
+        let table = MonitorCurrent::bulk_table(b, a);
+        assert_eq!(&table[..4], &[0.75, 0.125, 0.0, -0.03125]);
+        assert_eq!(&table[16..20], &[1.0, 0.5, 0.0, -0.125]);
+        assert_eq!(&table[24..32], &[0.125, 0.0, -0.25, 0.125, 0.25, 0.0, -0.5, 0.25]);
+
+        let input: [f32; 16] = core::array::from_fn(|i| (i as f32 - 7.0) / 13.0);
+        let mut whole = MonitorCurrent { b, a, table, z: [0.0; 2] };
+        let mut split = whole;
+        let mut whole_output = [0.0; 16];
+        let mut split_output = [0.0; 16];
+        whole.process(&input, &mut whole_output);
+        split.process(&input[..8], &mut split_output[..8]);
+        split.process(&input[8..], &mut split_output[8..]);
+        assert_eq!(whole_output.map(f32::to_bits), split_output.map(f32::to_bits));
+        assert_eq!(whole.z.map(f32::to_bits), split.z.map(f32::to_bits));
+    }
 
     #[test]
     fn sample_peak_window_keeps_the_span_and_prepends_the_previous_sample() {
@@ -2814,7 +3165,7 @@ mod fault_tests {
         assert_eq!(p.lookahead_frames(), 32);
         assert_eq!(p.latency_frames(), 320);
         assert_eq!(p.unit_latency_frames(), 576);
-        assert!(Run::new(&p).is_ok());
+        assert!(Unit::init_error(&p).is_none());
     }
 
     #[test]
@@ -2828,7 +3179,7 @@ mod fault_tests {
         assert_eq!(p.lookahead_frames(), 64);
         assert_eq!(p.latency_frames(), 640);
         assert_eq!(p.unit_latency_frames(), 1152);
-        assert!(Run::new(&p).is_ok());
+        assert!(Unit::init_error(&p).is_none());
     }
 
     #[test]
@@ -2840,7 +3191,7 @@ mod fault_tests {
         p.sample_rate = 32_000;
         assert_eq!(controller_frames(p.sample_rate), 192);
         assert_eq!((p.filterbank_frames(), p.lookahead_frames(), p.latency_frames()), (96, 24, 216));
-        assert!(Run::new(&p).is_ok());
+        assert!(Unit::init_error(&p).is_none());
 
         p.sample_rate = 176_400;
         assert_eq!(controller_frames(p.sample_rate), 512);
@@ -2885,7 +3236,7 @@ mod fault_tests {
         f.set(0.4);
         let step = 0.125;
         let ceiling = 0.6;
-        let lambda = -libm::log(1.0 - step);
+        let lambda = step;
         let mut got = f.released_toward(ceiling);
         assert_eq!(got.g, 0.4);
         got.sample(lambda);
@@ -2895,6 +3246,37 @@ mod fault_tests {
         let mut lower = f.released_toward(0.3);
         lower.sample(lambda);
         assert_eq!(lower.g, f.g);
+    }
+
+    #[test]
+    fn thermal_substeps_use_the_vdsp_sum_tree() {
+        let x: [f32; 32] = core::array::from_fn(|i| (i + 1) as f32 * 0.1);
+        assert_eq!(vdsp_sve_slice(&x).to_bits(), 0x4253_3334);
+    }
+
+    #[test]
+    fn runtime_ceiling_parameters_move_the_window_without_moving_latency() {
+        let mut no_lookahead = Unit::new(params());
+        assert!(no_lookahead.set_parameter(ids::controller(ids::C_LOOKAHEAD), 0.0));
+        let r = no_lookahead.run.as_ref().unwrap();
+        assert_eq!((r.latency, r.ceiling_shift), (512, -64));
+
+        let mut long_attack = Unit::new(params());
+        assert!(long_attack.set_parameter(ids::controller(ids::C_ATTACK), 50.0));
+        let r = long_attack.run.as_ref().unwrap();
+        assert_eq!((r.latency, r.ceiling_shift), (512, 0));
+    }
+
+    #[test]
+    fn coil_telemetry_keeps_the_initial_ambient_reference() {
+        let mut u = Unit::new(params());
+        assert!(u.set_parameter(ids::thermal(0, ids::T_AMBIENT), 30.0));
+        run(&mut u, 0.2, 2048);
+        let mut t = Telemetry::new();
+        u.telemetry(&mut t);
+        let c = t.channels[0];
+        assert!((c.coil_temp_c - c.control_temp_c - 10.0).abs() < 1e-4);
+        assert!(c.magnet_temp_c >= 30.0 && c.magnet_temp_c < c.control_temp_c);
     }
 
     #[test]

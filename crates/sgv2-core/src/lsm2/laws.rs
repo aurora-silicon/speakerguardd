@@ -89,18 +89,20 @@ pub struct ThermalBranch {
 }
 
 impl ThermalBranch {
-    /// The matched pole of `tau` for an update every `dt` seconds and the
-    /// numerator `Rth (1 - exp(-dt/tau)) / 2`.
+    /// The matched pole of `tau` for an update every `dt` seconds, with the
+    /// binary32 gain `(1 - exp(-dt/tau)) * (Rth / alpha)`: the ideal step
+    /// rounded once to binary32 times the binary32 quotient of `Rth` by the
+    /// rounded step `alpha`.
     pub fn new(rth: f64, tau: f64, dt: f64) -> Self {
         let ideal = 1.0 - libm::exp(-dt / tau);
         let alpha = 1.0f32 - r32(1.0 - ideal);
-        let b0 = r32(rth * ideal / 2.0);
-        ThermalBranch { alpha, r_eff: (b0 + b0) / alpha }
+        ThermalBranch { alpha, r_eff: r32(ideal) * (r32(rth) / alpha) }
     }
-    /// `theta + alpha (R_eff P - theta)`.
+    /// `theta + alpha (R_eff P - theta)`, both products fused:
+    /// `fma(alpha, fma(R_eff, P, -theta), theta)`.
     #[inline]
     pub fn step(&self, theta: f32, p: f32) -> f32 {
-        theta + self.alpha * (self.r_eff * p - theta)
+        libm::fmaf(self.alpha, libm::fmaf(self.r_eff, p, -theta), theta)
     }
     /// The rise after `n` updates at no power (the gap's cooling).
     pub fn cool(&self, theta: f64, n: f64) -> f64 {
@@ -127,7 +129,13 @@ pub fn temperature_candidate(
         return 1.0;
     }
     let width = hard - soft;
-    let knee = soft + width * (1.0 - libm::expf(-(tpk - soft) / width.max(1e-15)));
+    let arg = -(tpk - soft) / width.max(1e-15);
+    // The native expf is correctly rounded on this candidate domain.  The
+    // public Rust libm expf differs by a ULP for a few inputs; evaluating its
+    // binary32 argument in binary64 and rounding once reproduces the native
+    // binary32 result without a captured table.
+    let e = libm::exp(arg as f64) as f32;
+    let knee = soft + width * (1.0 - e);
     // the second strict guard: in binary32 the goal can reach the peak
     if tpk <= knee {
         return 1.0;
@@ -140,9 +148,16 @@ pub fn temperature_candidate(
     let body_ceiling = (1.0 - rho) * hard;
     let mix = if om >= body_ceiling { 1.0 } else { (om / body_ceiling).max(0.0) };
     let mix = mix * mix;
-    let split = phi + mix * (rho - phi);
-    let allowed_vc = room * split;
-    let allowed_mg = room * (1.0 - split);
+    // The native arm64 path does not form an interpolated split and then
+    // multiply it by the room.  It first scales both endpoint splits by the
+    // room, then interpolates each allowance with one binary32 FMA.  The two
+    // forms are algebraically equal but differ by a ULP near the first bite.
+    let phi_vc = room * phi;
+    let phi_mg = room - phi_vc;
+    let rho_vc = room * rho;
+    let rho_mg = room - rho_vc;
+    let allowed_vc = libm::fmaf(mix, rho_vc - phi_vc, phi_vc);
+    let allowed_mg = libm::fmaf(mix, rho_mg - phi_mg, phi_mg);
     let mut g = 1.0f32;
     for (allowed, present) in [(allowed_vc, vc), (allowed_mg, mg)] {
         if allowed < present {
