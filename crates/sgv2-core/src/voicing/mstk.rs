@@ -1205,17 +1205,17 @@ impl Run {
             let mut remaining = input;
             for stage in 0..XOVERS {
                 out[stage] =
-                    Self::run_detector_path(&stages[stage].low, &mut low_state[stage], remaining) * band_in[stage];
-                remaining = Self::run_detector_path(&stages[stage].high, &mut high_state[stage], remaining);
+                    Self::run_float_path(&stages[stage].low, &mut low_state[stage], remaining) * band_in[stage];
+                remaining = Self::run_float_path(&stages[stage].high, &mut high_state[stage], remaining);
             }
             out[BANDS - 1] = remaining * band_in[BANDS - 1];
         } else {
-            let low_mid = Self::run_detector_path(&stages[1].low, &mut low_state[1], input);
-            let high_mid = Self::run_detector_path(&stages[1].high, &mut high_state[1], input);
-            out[0] = Self::run_detector_path(&stages[0].low, &mut low_state[0], low_mid) * band_in[0];
-            out[1] = Self::run_detector_path(&stages[0].high, &mut high_state[0], low_mid) * band_in[1];
-            out[2] = Self::run_detector_path(&stages[2].low, &mut low_state[2], high_mid) * band_in[2];
-            out[3] = Self::run_detector_path(&stages[2].high, &mut high_state[2], high_mid) * band_in[3];
+            let low_mid = Self::run_float_path(&stages[1].low, &mut low_state[1], input);
+            let high_mid = Self::run_float_path(&stages[1].high, &mut high_state[1], input);
+            out[0] = Self::run_float_path(&stages[0].low, &mut low_state[0], low_mid) * band_in[0];
+            out[1] = Self::run_float_path(&stages[0].high, &mut high_state[0], low_mid) * band_in[1];
+            out[2] = Self::run_float_path(&stages[2].low, &mut low_state[2], high_mid) * band_in[2];
+            out[3] = Self::run_float_path(&stages[2].high, &mut high_state[2], high_mid) * band_in[3];
         }
         out
     }
@@ -1228,7 +1228,7 @@ impl Run {
     ) -> f64 {
         let mut output = 0.0;
         for band in 0..BANDS {
-            output += Self::run_detector_path(&paths[band], &mut state[band], bands[band]);
+            output += Self::run_float_path(&paths[band], &mut state[band], bands[band]);
         }
         output
     }
@@ -1287,6 +1287,27 @@ impl Run {
             v = o;
         }
         v
+    }
+
+    /// Multi-section Float32 path used by the native analysis/synthesis
+    /// bank. Coefficients, every section output and both state updates round
+    /// at Float32 boundaries; retaining an f64 section output destroys the
+    /// deep image/alias cancellation of reduced band zero.
+    #[inline]
+    fn run_float_path(path: &Path, state: &mut [[f32; 2]; MAX_FILTERS], value: f64) -> f64 {
+        let mut value = value as f32;
+        for (section, delay) in path.section[..path.count].iter().zip(state.iter_mut()) {
+            let b0 = section.b0 as f32;
+            let b1 = section.b1 as f32;
+            let b2 = section.b2 as f32;
+            let a1 = section.a1 as f32;
+            let a2 = section.a2 as f32;
+            let output = b0 * value + delay[0];
+            delay[0] = b1 * value - a1 * output + delay[1];
+            delay[1] = b2 * value - a2 * output;
+            value = output;
+        }
+        f64::from(value)
     }
 
     fn gain(&mut self, b: usize) -> f64 {
