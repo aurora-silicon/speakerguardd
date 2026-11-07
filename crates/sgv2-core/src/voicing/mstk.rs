@@ -857,11 +857,21 @@ impl GainSrc {
             }
             out.taps[i] = value;
         }
+        out.reset();
         out
     }
 
+    /// Start from the history of a producer that has held unity gain: every
+    /// earlier producer slot holds 1.0, the inserted slots stay zero.
+    /// Black-box (installed unit): the first milliseconds of a stream carry
+    /// no gain ramp; a zero history cost up to 1.1 dB in the first 10 ms.
     fn reset(&mut self) {
         self.ring = [0.0; MAX_GAIN_SRC_TAPS];
+        let mut back = self.factor;
+        while back <= self.len {
+            self.ring[(self.len - back) % self.len] = 1.0;
+            back += self.factor;
+        }
         self.cursor = 0;
         self.phase = 0;
     }
@@ -1007,7 +1017,6 @@ pub struct Run {
     channels: usize,
     env: [f64; BANDS],
     gain_state: [f64; BANDS],
-    gain_rest: [f64; BANDS],
     detector_window: [usize; BANDS],
     detector_factor: [usize; BANDS],
     detector_phase: [usize; BANDS],
@@ -1034,7 +1043,6 @@ impl Run {
         let valid = p.valid(fs);
         let q = if valid { p } else { &Params::default() };
         let curve_top_db = if q.algorithm >= 2 { 20.0 } else { 0.0 };
-        let gain_rest = q.band.map(|b| spline_gain(&curve_points(b, curve_top_db), -100.0, curve_top_db));
         let edges = [0.0, q.crossover_hz[0], q.crossover_hz[1], q.crossover_hz[2], 20_000.0];
         let reference_edges = [0.0, 100.0, 1000.0, 10_000.0, 20_000.0];
         let mut detector_bandwidth = [1.0; BANDS];
@@ -1096,8 +1104,11 @@ impl Run {
             overshoot_compensation: q.overshoot_compensation,
             channels: channels.min(MAX_CHANNELS),
             env: [0.0; BANDS],
-            gain_state: gain_rest,
-            gain_rest,
+            // The linear gain state starts at unity and the rest gain
+            // (makeup included) is reached through the release: black-box,
+            // a band with +3.5 dB makeup starts 3.5 dB low and recovers over
+            // the release time on the installed unit.
+            gain_state: [1.0; BANDS],
             detector_window,
             detector_factor,
             detector_phase: [0; BANDS],
@@ -1125,7 +1136,7 @@ impl Run {
 
     pub fn reset(&mut self) {
         self.env = [0.0; BANDS];
-        self.gain_state = self.gain_rest;
+        self.gain_state = [1.0; BANDS];
         self.detector_max = [SlidingMax::EMPTY; BANDS];
         self.detector_phase = [0; BANDS];
         for envelope in &mut self.audio_quadrature {
@@ -1839,18 +1850,19 @@ mod tests {
     }
 
     #[test]
-    fn gain_src_has_zero_startup_and_unity_dc() {
+    fn gain_src_starts_from_unity_and_has_unity_dc() {
         for factor in [1, 2, 4] {
             let mut src = GainSrc::new(factor, 48_000.0);
             let first = src.step(Some(1.0));
-            assert!(first > 0.0 && first < 0.01, "factor {factor}: {first}");
+            assert!((first - 1.0).abs() < 2e-6, "factor {factor}: {first}");
             let mut output = first;
             for i in 1..512 {
                 output = src.step((i % factor == 0).then_some(1.0));
             }
             assert!((output - 1.0).abs() < 2e-6, "factor {factor}: {output}");
             src.reset();
-            assert_eq!(src.step(None), 0.0);
+            let restarted = src.step(Some(1.0));
+            assert!((restarted - 1.0).abs() < 2e-6, "factor {factor}: {restarted}");
         }
     }
 
@@ -1861,13 +1873,14 @@ mod tests {
         for fs in [8_000.0, 44_100.0, 48_000.0, 96_000.0, 192_000.0] {
             for factor in [1, 2, 4, 8] {
                 let mut src = GainSrc::new(factor, fs);
-                let mut history = std::vec![0.0f32; src.len];
+                // Both start from the primed unity history.
+                let mut history = src.ring[..src.len].to_vec();
                 let mut cursor = 0;
                 let mut random = 0x1234_5678u32;
                 for frame in 0..4096 {
                     if frame == 2048 {
                         src.reset();
-                        history.fill(0.0);
+                        history.copy_from_slice(&src.ring[..src.len]);
                         cursor = 0;
                     }
                     random = random.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
