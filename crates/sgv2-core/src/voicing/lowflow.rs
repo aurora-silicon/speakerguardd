@@ -15,8 +15,9 @@
 //! per-bin gains (immediate attack, saved release) scale the square-root Hann
 //! analysis spectrum before overlap-add. A separate detector transforms a
 //! `latency + 128` frame sliding history through a unit-energy Hann. It
-//! applies the saved tweeter-response magnitude, reduces squared magnitudes
-//! on the unit's 99-band grid, and smooths the resulting linked mask level.
+//! applies the saved LF pressure- and HF tweeter-response magnitudes, reduces
+//! their summed magnitude on the unit's 99-band grid, and smooths the
+//! resulting linked mask level.
 //! The velocity detector independently reads current LF.
 //!
 //! The optional `lowflow-conservative` compile feature is deliberately not an
@@ -45,6 +46,8 @@ const MASK_REFERENCE_FS: f64 = 48_000.0;
 const MODEL_SCALARS: usize = 28;
 const MAX_FS: f64 = 192_000.0;
 const CONSERVATIVE_GUARD_DB: f64 = 6.0;
+#[cfg(not(feature = "lowflow-conservative"))]
+const MAX_MASK_VELOCITY: f32 = 1.2;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Model {
@@ -293,6 +296,7 @@ fn valid_model(m: &Model) -> bool {
         && m.max_frequency_hz <= MAX_FS / 2.0
 }
 
+#[cfg(feature = "lowflow-conservative")]
 #[derive(Clone, Copy)]
 struct Biquad {
     b0: f64,
@@ -304,6 +308,156 @@ struct Biquad {
     z2: f64,
 }
 
+/// The cone and front port are two mechanical impedances driven by the same
+/// voice-coil current. The electrical damping therefore belongs to their
+/// common denominator; treating it as two independent dampers changes both
+/// the cancellation notch and the onset ringing.
+#[cfg(not(feature = "lowflow-conservative"))]
+struct VelocityCascade {
+    input_gain: f32,
+    sections: [VelocityBiquad; 2],
+}
+
+#[cfg(not(feature = "lowflow-conservative"))]
+#[derive(Clone, Copy, Default)]
+struct VelocityBiquad {
+    b0: f32,
+    b1: f32,
+    b2: f32,
+    a1: f32,
+    a2: f32,
+    z1: f32,
+    z2: f32,
+}
+
+#[cfg(not(feature = "lowflow-conservative"))]
+impl VelocityBiquad {
+    fn from_analog(mut c: [f32; 5]) -> Self {
+        // Unprewarped bilinear transform at the fixed 48 kHz model rate.
+        // Intermediates are double precision and coefficient words are
+        // rounded back to float before use.
+        const K: f64 = 2.0 * 48_000.0;
+        let b0 = f64::from(c[0]);
+        let b1 = f64::from(c[1]);
+        let b2 = f64::from(c[2]);
+        let a1 = f64::from(c[3]);
+        let a2 = f64::from(c[4]);
+        let k2 = K * K;
+        let d = k2 + a1 * K + a2;
+        c[0] = ((b0 * k2 + b1 * K + b2) / d) as f32;
+        c[1] = ((-2.0 * b0 * k2 + 2.0 * b2) / d) as f32;
+        c[2] = ((b0 * k2 - b1 * K + b2) / d) as f32;
+        c[3] = ((-2.0 * k2 + 2.0 * a2) / d) as f32;
+        c[4] = ((k2 - a1 * K + a2) / d) as f32;
+        Self { b0: c[0], b1: c[1], b2: c[2], a1: c[3], a2: c[4], z1: 0.0, z2: 0.0 }
+    }
+
+    fn run(&mut self, x: f32) -> f32 {
+        let y = self.b0 * x + self.z1;
+        self.z1 = self.b1 * x - self.a1 * y + self.z2;
+        self.z2 = self.b2 * x - self.a2 * y;
+        if y.is_finite() {
+            y
+        } else {
+            0.0
+        }
+    }
+
+    fn reset(&mut self) {
+        self.z1 = 0.0;
+        self.z2 = 0.0;
+    }
+}
+
+#[cfg(not(feature = "lowflow-conservative"))]
+impl VelocityCascade {
+    fn new(model: &Model) -> Self {
+        // Preserve the binary's float32 construction order.  Let Zc and Zp
+        // be the cone and port mechanical impedances and e = Bl^2/Reb.  The
+        // shared-current transfer is
+        //
+        //   Bl/Reb * s*(Zc + Zp) / (Zc*Zp + e*s*(Zc + Zp)).
+        let bl = model.bl as f32;
+        let reb = model.reb as f32;
+        let mc = model.mms as f32;
+        let mp = model.mms_front_port as f32;
+        let rc = model.rms as f32;
+        let rp = model.rms_front_port as f32;
+        let kc = model.kms as f32;
+        let kp = model.kms_front_port as f32;
+        let force = bl / reb;
+        let electrical = bl * force;
+        let numerator = [force * (mc + mp), force * (rc + rp), force * (kc + kp)];
+        let d1 = libm::fmaf(electrical, mc + mp, libm::fmaf(mc, rp, mp * rc));
+        let d2 = libm::fmaf(electrical, rc + rp, libm::fmaf(kc, mp, libm::fmaf(mc, kp, rc * rp)));
+        let d3 = libm::fmaf(electrical, kc + kp, libm::fmaf(kc, rp, rc * kp));
+        let denominator = [mc * mp, d1, d2, d3, kc * kp];
+
+        let zero_b = (f64::from(numerator[1]) / f64::from(numerator[0])) as f32;
+        let zero_c = (f64::from(numerator[2]) / f64::from(numerator[0])) as f32;
+        let mut poles = factor_quartic(denominator);
+        poles.sort_by(|a, b| a.1.total_cmp(&b.1));
+        let gain = numerator[0] / denominator[0];
+        let first = VelocityBiquad::from_analog([1.0, zero_b, zero_c, poles[0].0 as f32, poles[0].1 as f32]);
+        let second = VelocityBiquad::from_analog([0.0, gain, 0.0, poles[1].0 as f32, poles[1].1 as f32]);
+        Self { input_gain: model.analog_gain as f32, sections: [first, second] }
+    }
+
+    fn run(&mut self, x: f32) -> f32 {
+        let mut y = x * self.input_gain;
+        for section in &mut self.sections {
+            y = section.run(y);
+        }
+        y
+    }
+
+    fn reset(&mut self) {
+        for section in &mut self.sections {
+            section.reset();
+        }
+    }
+}
+
+#[cfg(not(feature = "lowflow-conservative"))]
+fn factor_quartic(c: [f32; 5]) -> [(f64, f64); 2] {
+    let lead = f64::from(c[0]);
+    let a = f64::from(c[1]) / lead;
+    let b = f64::from(c[2]) / lead;
+    let cc = f64::from(c[3]) / lead;
+    let d = f64::from(c[4]) / lead;
+    let p = b - 3.0 * a * a / 8.0;
+    let q = a * a * a / 8.0 - a * b / 2.0 + cc;
+    let r = -3.0 * a * a * a * a / 256.0 + a * a * b / 16.0 - a * cc / 4.0 + d;
+
+    // Ferrari's factorisation follows from
+    // (y^2 + u*y + v) * (y^2 - u*y + w), where y = s + a/4.
+    let cubic_a = 2.0 * p;
+    let cubic_b = p * p - 4.0 * r;
+    let cubic_c = -q * q;
+    let depressed_p = cubic_b - cubic_a * cubic_a / 3.0;
+    let depressed_q = 2.0 * cubic_a * cubic_a * cubic_a / 27.0 - cubic_a * cubic_b / 3.0 + cubic_c;
+    let discriminant = depressed_q * depressed_q / 4.0 + depressed_p * depressed_p * depressed_p / 27.0;
+    let z = if discriminant >= 0.0 {
+        libm::cbrt(-depressed_q / 2.0 + libm::sqrt(discriminant))
+            + libm::cbrt(-depressed_q / 2.0 - libm::sqrt(discriminant))
+            - cubic_a / 3.0
+    } else {
+        let magnitude = 2.0 * libm::sqrt(-depressed_p / 3.0);
+        let cosine = ((3.0 * depressed_q / (2.0 * depressed_p)) * libm::sqrt(-3.0 / depressed_p)).clamp(-1.0, 1.0);
+        let phase = libm::acos(cosine);
+        (0..3)
+            .map(|index| magnitude * libm::cos((phase + 2.0 * core::f64::consts::PI * index as f64) / 3.0))
+            .map(|root| root - cubic_a / 3.0)
+            .fold(0.0_f64, f64::max)
+    };
+    let u = libm::sqrt(z);
+    let v = (p + z - q / u) / 2.0;
+    let w = (p + z + q / u) / 2.0;
+    let shift = a / 4.0;
+    [(2.0 * shift + u, shift * shift + u * shift + v), (2.0 * shift - u, shift * shift - u * shift + w)]
+}
+
+#[cfg(feature = "lowflow-conservative")]
 impl Biquad {
     fn run(&mut self, x: f64) -> f64 {
         let y = self.b0 * x + self.z1;
@@ -365,8 +519,12 @@ struct State {
     mask_hp2: Biquad,
     #[cfg(feature = "lowflow-conservative")]
     mask_lp2: Biquad,
+    #[cfg(feature = "lowflow-conservative")]
     cone: Biquad,
+    #[cfg(feature = "lowflow-conservative")]
     front: Biquad,
+    #[cfg(not(feature = "lowflow-conservative"))]
+    velocity: VelocityCascade,
     #[cfg(feature = "lowflow-conservative")]
     pressure_taps: Box<[f64]>,
     #[cfg(feature = "lowflow-conservative")]
@@ -571,9 +729,7 @@ impl MaskDetector {
         let median = if region.len() % 2 == 0 { 0.5 * (region[middle - 1] + region[middle]) } else { region[middle] };
         let raw_db = 10.0 * libm::log10(libm::fabs(median + 1.0e-30) + 1.0e-20) + 97.0
             - 4.0 * (4.0 - self.concentration.clamp(1.0, 4.0));
-        if raw_db > self.peak_db + 3.0 {
-            self.peak_db = raw_db;
-        } else if raw_db + 12.0 < self.peak_db {
+        if raw_db > self.peak_db + 3.0 || raw_db + 12.0 < self.peak_db {
             self.peak_db = raw_db;
         }
         let alpha = if self.peak_db > self.db { self.attack } else { self.release };
@@ -907,7 +1063,9 @@ impl Run {
         let models = params.model_count.min(channels / 2).min(MAX_MODELS);
         let mut state = Vec::with_capacity(models);
         for m in &params.models[..models] {
+            #[cfg(feature = "lowflow-conservative")]
             let electrical_damping = m.bl * m.bl / m.reb;
+            #[cfg(feature = "lowflow-conservative")]
             let force = m.bl / m.reb * m.analog_gain;
             state.push(State {
                 #[cfg(feature = "lowflow-conservative")]
@@ -918,7 +1076,9 @@ impl Run {
                 mask_hp2: Biquad::butterworth(fs, m.mask_band_min_hz, true),
                 #[cfg(feature = "lowflow-conservative")]
                 mask_lp2: Biquad::butterworth(fs, m.mask_band_max_hz, false),
+                #[cfg(feature = "lowflow-conservative")]
                 cone: Biquad::velocity(fs, m.mms, m.rms + electrical_damping, m.kms, force),
+                #[cfg(feature = "lowflow-conservative")]
                 front: Biquad::velocity(
                     fs,
                     m.mms_front_port,
@@ -926,6 +1086,8 @@ impl Run {
                     m.kms_front_port,
                     force,
                 ),
+                #[cfg(not(feature = "lowflow-conservative"))]
+                velocity: VelocityCascade::new(m),
                 #[cfg(feature = "lowflow-conservative")]
                 pressure_taps: m.pressure_response.to_vec().into_boxed_slice(),
                 #[cfg(feature = "lowflow-conservative")]
@@ -1000,7 +1162,9 @@ impl Run {
         self.line.fill(0.0);
         self.line_at = 0;
         for state in self.state.iter_mut() {
+            #[cfg(feature = "lowflow-conservative")]
             state.cone.reset();
+            #[cfg(feature = "lowflow-conservative")]
             state.front.reset();
             #[cfg(feature = "lowflow-conservative")]
             {
@@ -1019,6 +1183,7 @@ impl Run {
             }
             #[cfg(not(feature = "lowflow-conservative"))]
             {
+                state.velocity.reset();
                 state.velocity_block_energy = 0.0;
                 state.velocity_block_frames = 0;
                 state.hop_velocity = 0.0;
@@ -1032,6 +1197,21 @@ impl Run {
 
     pub fn latency(&self) -> usize {
         self.latency_frames
+    }
+
+    /// Offline diagnostics: the linked mask level (dB) and newest completed
+    /// hop velocity of one model, as of the last processed hop.
+    #[doc(hidden)]
+    pub fn probe(&self, model: usize) -> [f64; 2] {
+        #[cfg(not(feature = "lowflow-conservative"))]
+        {
+            self.state.get(model).map_or([0.0; 2], |state| [state.mask_output_db, state.velocity_history[0]])
+        }
+        #[cfg(feature = "lowflow-conservative")]
+        {
+            let _ = model;
+            [0.0; 2]
+        }
     }
 
     #[allow(clippy::needless_range_loop)] // one frame across planar buffers
@@ -1125,10 +1305,9 @@ impl Run {
                     let woofer_sample = finite(bufs[c][frame]);
                     let tweeter_sample =
                         if c + self.models < channels { finite(bufs[c + self.models][frame]) } else { 0.0 };
-                    let woofer = f64::from(woofer_sample);
                     let state = &mut self.state[c];
-                    state.mask.push(0.0, tweeter_sample);
-                    let velocity = state.cone.run(woofer) + state.front.run(woofer);
+                    state.mask.push(woofer_sample, tweeter_sample);
+                    let velocity = f64::from(state.velocity.run(woofer_sample));
                     state.velocity_block_energy += velocity * velocity;
                     state.velocity_block_frames += 1;
                     // The physical detector reports the largest 8-frame RMS
@@ -1248,28 +1427,34 @@ fn fir(taps: &[f64], history: &[f64], newest: usize) -> f64 {
 }
 #[cfg(not(feature = "lowflow-conservative"))]
 fn velocity_limit(m: &Model, energy_db: f64) -> f64 {
-    if energy_db <= m.min_mask_energy_db {
-        return m.min_velocity;
+    let energy = energy_db as f32;
+    let min_mask = m.min_mask_energy_db as f32;
+    let mid_mask = m.mid_mask_energy_db as f32;
+    let high_mask = m.high_mask_energy_db as f32;
+    let max_mask = m.max_mask_energy_db as f32;
+    let min_velocity = m.min_velocity as f32;
+    let mid_velocity = m.mid_velocity as f32;
+    let high_velocity = m.high_velocity as f32;
+    if energy <= min_mask {
+        return f64::from(min_velocity);
     }
-    if energy_db < m.mid_mask_energy_db {
-        return lerp(
-            m.min_velocity,
-            m.mid_velocity,
-            (energy_db - m.min_mask_energy_db) / (m.mid_mask_energy_db - m.min_mask_energy_db),
-        );
+    if energy < mid_mask {
+        let slope = (mid_velocity - min_velocity) / (mid_mask - min_mask);
+        return f64::from(libm::fmaf(slope, energy - min_mask, min_velocity));
     }
-    if energy_db < m.high_mask_energy_db {
-        return lerp(
-            m.mid_velocity,
-            m.high_velocity,
-            (energy_db - m.mid_mask_energy_db) / (m.high_mask_energy_db - m.mid_mask_energy_db),
-        );
+    if energy < high_mask {
+        let slope = (high_velocity - mid_velocity) / (high_mask - mid_mask);
+        return f64::from(libm::fmaf(slope, energy - mid_mask, mid_velocity));
     }
-    m.high_velocity
-}
-#[cfg(not(feature = "lowflow-conservative"))]
-fn lerp(a: f64, b: f64, t: f64) -> f64 {
-    a + t.clamp(0.0, 1.0) * (b - a)
+    // The final segment reaches the fixed fourth velocity knot at the saved
+    // maximum mask energy. It is a line, not a clamp: still-higher mask
+    // levels continue to raise the allowed velocity.
+    if max_mask > high_mask {
+        let slope = (MAX_MASK_VELOCITY - high_velocity) / (max_mask - high_mask);
+        f64::from(libm::fmaf(slope, energy - high_mask, high_velocity))
+    } else {
+        f64::from(high_velocity)
+    }
 }
 fn finite(x: f32) -> f32 {
     if x.is_finite() {
@@ -1445,6 +1630,42 @@ mod tests {
 
     #[cfg(not(feature = "lowflow-conservative"))]
     #[test]
+    fn velocity_curve_uses_and_extrapolates_the_fourth_knot() {
+        let model = synthetic().models[0];
+        assert_eq!(velocity_limit(&model, model.high_mask_energy_db), f64::from(model.high_velocity as f32));
+        assert_eq!(velocity_limit(&model, model.max_mask_energy_db), f64::from(MAX_MASK_VELOCITY));
+        let expected = libm::fmaf(2.0, MAX_MASK_VELOCITY - model.high_velocity as f32, model.high_velocity as f32);
+        assert_eq!(velocity_limit(&model, 50.0), f64::from(expected));
+    }
+
+    #[cfg(not(feature = "lowflow-conservative"))]
+    #[test]
+    fn coupled_velocity_cascade_is_stable_and_has_two_distinct_modes() {
+        let factors = factor_quartic([1.0, 6.0, 38.0, 80.0, 200.0]);
+        let rebuilt = [
+            1.0,
+            factors[0].0 + factors[1].0,
+            factors[0].1 + factors[1].1 + factors[0].0 * factors[1].0,
+            factors[0].0 * factors[1].1 + factors[1].0 * factors[0].1,
+            factors[0].1 * factors[1].1,
+        ];
+        for (actual, expected) in rebuilt.into_iter().zip([1.0, 6.0, 38.0, 80.0, 200.0]) {
+            assert!((actual - expected).abs() < 1.0e-9);
+        }
+        let model = synthetic().models[0];
+        let mut velocity = VelocityCascade::new(&model);
+        assert!(velocity.sections.iter().all(|section| {
+            [section.b0, section.b1, section.b2, section.a1, section.a2].iter().all(|value| value.is_finite())
+                && section.a2.abs() < 1.0
+        }));
+        assert_ne!(velocity.sections[0].a1, velocity.sections[1].a1);
+        let peak =
+            (0..4096).map(|frame| velocity.run(if frame == 0 { 1.0 } else { 0.0 }).abs()).fold(0.0_f32, f32::max);
+        assert!(peak.is_finite() && peak > 0.0);
+    }
+
+    #[cfg(not(feature = "lowflow-conservative"))]
+    #[test]
     fn mask_grid_has_the_recovered_384_point_boundaries() {
         let boundaries = mask_boundaries(384);
         for (index, boundary) in boundaries[..MASK_DIRECT_BANDS].iter().enumerate() {
@@ -1471,6 +1692,19 @@ mod tests {
         assert!(run.state[0].mask.db > 0.0);
         assert!(run.state[0].mask_output_db > 0.0);
         assert!(b[2].iter().all(|value| *value == 0.0));
+    }
+
+    #[cfg(not(feature = "lowflow-conservative"))]
+    #[test]
+    fn mask_also_reads_the_pre_delay_low_lane() {
+        let p = synthetic();
+        let mut run = Run::new(&p, 48_000.0, 4);
+        let mut b = [vec![0.0; 128], vec![0.0; 128], vec![0.0; 128], vec![0.0; 128]];
+        b[0][64] = 0.7;
+        let mut refs: Vec<&mut [f32]> = b.iter_mut().map(Vec::as_mut_slice).collect();
+        run.process(&mut refs, 128);
+        assert!(run.state[0].mask.db > 0.0);
+        assert!(run.state[0].mask_output_db > 0.0);
     }
 
     #[cfg(not(feature = "lowflow-conservative"))]
