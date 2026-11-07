@@ -175,19 +175,17 @@ fn peak_curve_fit(m: [f64; 3]) -> [f64; 3] {
 }
 
 fn peak_analog_magnitude(x: f32, gain: f32, q: f32) -> f64 {
-    // Evaluate (s^2 + gain*s/q + 1) / (s^2 + s/q + 1)
-    // at s=j*x in the same Float32 complex arithmetic used by the box.
-    // Black-box (exact numerators against the unit's poles): the real part
-    // and the numerator's real part round their products before the sum;
-    // the divisor is fused.
+    // Evaluate (s^2 + gain*s/q + 1) / (s^2 + s/q + 1) at s=j*x in the
+    // box's Float32 complex arithmetic: the real part 1 - x^2 rounds its
+    // product; the quotient is the platform split-complex division, which
+    // fuses the first product of the squared divisor and of each output
+    // part, rounds the second, and scales both by one reciprocal.
     let real = 1.0 - x * x;
     let num_imag = x * (gain / q);
     let den_imag = x * (1.0 / q);
-    let real_power = real * real;
-    let divisor = libm::fmaf(den_imag, den_imag, real_power);
-    let inverse = 1.0 / divisor;
-    let out_real = (real_power + num_imag * den_imag) * inverse;
-    let out_imag = libm::fmaf(real, den_imag, -(num_imag * real)) * inverse;
+    let inverse = 1.0 / libm::fmaf(real, real, den_imag * den_imag);
+    let out_real = inverse * libm::fmaf(real, real, num_imag * den_imag);
+    let out_imag = inverse * libm::fmaf(num_imag, real, -(den_imag * real));
     platform_magnitude(out_real, out_imag) as f64
 }
 
@@ -489,7 +487,7 @@ pub fn butterworth_shelf(gain_db: f64, from_hz: f64, to_hz: f64, max_order: u32,
     let top = (0.499 * fs).min(20_000.0);
     let edge = |f: f64| (f as f32).min(top).max(20.0);
     let (from, to) = (edge(from_hz), edge(to_hz));
-    let gain = (gain_db as f32).min(40.0).max(-40.0);
+    let gain = (gain_db as f32).clamp(-40.0, 40.0);
     if from == to {
         return out;
     }
