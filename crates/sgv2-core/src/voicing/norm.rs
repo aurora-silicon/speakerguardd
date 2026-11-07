@@ -62,11 +62,11 @@
 //! the tuning (target, maximum gain, upward and downward ranges, ratio),
 //! read as a uniform cubic B-spline over the nodes (not by linear
 //! interpolation: the unit rounds the table's knees). The applied gain is
-//! linear: each frame it covers a fixed share of the remaining distance to
-//! the call's target amplitude, a one-pole smoother with a 200 Hz corner
-//! (time constant 1/(2 pi 200) s, about 0.8 ms, the same time at every
-//! sample rate). Gliding in dB instead bends every large step's onset by
-//! up to tenths of a dB.
+//! linear and single precision: each frame it covers a fixed share of the
+//! remaining distance to the call's target amplitude with a fused one-pole
+//! recurrence. The response is 0.8 ms at every sample rate. Gliding in dB,
+//! rounding only the applied value, or splitting the multiply-add bends a
+//! large step's onset enough to show up in a 10 ms window.
 //!
 //! No tuning value lives here; `aurora-speaker-tuning`'s `voicing::norm`
 //! compiles [`Params`] from the Mac's saved state.
@@ -94,9 +94,14 @@ const BINS: usize = 1001;
 const BIN_LO_DB: f64 = -100.0;
 const BIN_DB: f64 = 0.1;
 const SEED_HALF: usize = 5;
-/// Corner of the one-pole that glides the linear gain toward each call's
-/// target, Hz.
-const GLIDE_HZ: f64 = 200.0;
+/// Time constant of the linear-gain glide, s.
+const GLIDE_S: f32 = 0.0008;
+const DB_TO_GAIN: f32 = core::f32::consts::LN_10 / 20.0;
+
+#[inline]
+fn glide_gain(gain: f32, target: f32, amount: f32) -> f32 {
+    libm::fmaf(target - gain, amount, gain)
+}
 /// macOS renders the speaker graph in calls of this many frames; the unit
 /// meters a whole call before it moves its gain across that call.
 pub const CALL: usize = 512;
@@ -581,11 +586,12 @@ pub struct Run {
     clear_due: bool,
     candidate: f64,
     target_db: f64,
-    /// The applied gain, linear, and the target it glides to.
-    gain: f64,
-    target: f64,
+    /// The applied gain, linear, and the target it glides to. Both are
+    /// Float32 state in the unit, not merely Float32 at the audio multiply.
+    gain: f32,
+    target: f32,
     /// Per-frame share of the remaining distance the gain covers.
-    glide: f64,
+    glide: f32,
 }
 
 impl Run {
@@ -627,7 +633,7 @@ impl Run {
             target_db: 0.0,
             gain: 1.0,
             target: 1.0,
-            glide: 1.0 - libm::exp(-2.0 * core::f64::consts::PI * GLIDE_HZ / fs),
+            glide: 1.0 - libm::expf(-1.0 / (GLIDE_S * fs as f32)),
         };
         r.reset();
         r
@@ -662,7 +668,7 @@ impl Run {
         self.clear_due = true;
         self.candidate = e;
         self.target_db = self.p.gain_db(e);
-        self.target = libm::pow(10.0, self.target_db / 20.0);
+        self.target = libm::expf(self.target_db as f32 * DB_TO_GAIN);
         self.gain = self.target;
     }
 
@@ -674,7 +680,7 @@ impl Run {
 
     /// The gain at the end of the last whole call, dB.
     pub fn gain_db(&self) -> f64 {
-        20.0 * libm::log10(self.gain)
+        20.0 * libm::log10(f64::from(self.gain))
     }
 
     /// The loudness the last whole call's gain was read for, dB.
@@ -758,7 +764,7 @@ impl Run {
         }
         self.candidate = self.held.max(self.fast);
         self.target_db = self.p.gain_db(self.candidate);
-        self.target = libm::pow(10.0, self.target_db / 20.0);
+        self.target = libm::expf(self.target_db as f32 * DB_TO_GAIN);
     }
 
     /// One call: meter all of it, then move the gain across it.
@@ -787,8 +793,8 @@ impl Run {
             self.z = [[[0.0; 2]; MAX_SECTIONS]; MAX_CHANNELS];
         }
         for n in 0..CALL {
-            self.gain += self.glide * (self.target - self.gain);
-            let g = self.gain as f32;
+            self.gain = glide_gain(self.gain, self.target, self.glide);
+            let g = self.gain;
             for ch in 0..nch {
                 let x = self.call_in[ch * CALL + n];
                 let y = if la == 0 {
@@ -840,18 +846,25 @@ mod tests {
     }
 
     #[test]
-    fn gain_glides_linearly_with_a_200_hz_one_pole() {
+    fn gain_glides_with_the_float32_800_us_fused_recurrence() {
         let p = params(0);
         let mut r = Run::new(&p, 48_000.0, 1);
-        let from = libm::pow(10.0, p.gain_db(p.expected_db) / 20.0);
+        let from = libm::expf(p.gain_db(p.expected_db) as f32 * DB_TO_GAIN);
         // a loud call moves the target; the applied amplitude covers the
         // same share of the remaining distance every frame
         let mut buf = vec![0.5f32; CALL * 3];
         r.process(&mut [&mut buf[..]], CALL * 3);
         let to = r.target;
         assert!((to - from).abs() > 0.1);
-        let a = 1.0 - libm::exp(-2.0 * core::f64::consts::PI * 200.0 / 48_000.0);
-        assert!((r.glide - a).abs() < 1e-15);
+        let a = 1.0 - libm::expf(-1.0 / (0.0008f32 * 48_000.0));
+        assert_eq!(r.glide.to_bits(), a.to_bits());
+
+        // This vector separates one Float32 FMA from a rounded multiply
+        // followed by an add by one ULP.
+        let gain = f32::from_bits(0x3fe1_bd94);
+        let target = f32::from_bits(0x3ff1_6b91);
+        assert_eq!(glide_gain(gain, target, a).to_bits(), 0x3fe2_24c3);
+        assert_eq!(((target - gain) * a + gain).to_bits(), 0x3fe2_24c2);
     }
 
     #[test]
