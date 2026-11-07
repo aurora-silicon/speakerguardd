@@ -14,6 +14,12 @@ SPEC.loader.exec_module(inventory)
 
 
 class PrivacyAndStatus(unittest.TestCase):
+    def test_unloaded_source_does_not_pollute_aid_rollup(self):
+        result = inventory.report([{"aid": None, "source": "missing-bundle", "variants": {}}], "synthetic")
+        self.assertEqual(result["aids"], [])
+        self.assertEqual(result["per_law"], {})
+        self.assertEqual(result["source_failures"][0]["source"], "missing-bundle")
+
     def test_instrumentation_restores_sources_after_failure(self):
         paths = [inventory.REPO / p for p in [
             "crates/sgv2-core/src/lib.rs", "crates/sgv2-core/src/voicing/chain.rs",

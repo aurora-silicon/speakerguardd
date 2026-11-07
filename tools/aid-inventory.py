@@ -103,6 +103,8 @@ REASONS = [
 ]
 
 def reason(message):
+    if ("metadata.json" in message or "manifest.json" in message) and "No such file" in message:
+        return "bundle-manifest-missing"
     return next((label for phrase, label in REASONS if phrase in message), "unclassified-refusal")
 
 def todo_law(code, message):
@@ -401,6 +403,8 @@ def sweep(root, aids, private, binaries, bundles, source_tag="host"):
     return rows
 
 def report(rows, revision):
+    source_failures = [r for r in rows if r["aid"] is None]
+    rows = [r for r in rows if r["aid"] is not None]
     baseline = {r["aid"] for r in rows if r["source"] == "host"}
     newer_tags = sorted({r["source"] for r in rows if r["source"].startswith("27.")})
     for row in rows:
@@ -442,6 +446,7 @@ def report(rows, revision):
             "newer_root_counts": {tag: dict(sorted(Counter(r["category"] for r in rows if r["source"] == tag).items())) for tag in newer_tags},
             "only_in_27_2_aids": sorted({r["aid"] for r in rows if r["only_in_27_2"]}),
             "aids": rows, "per_law": {k: sorted(v) for k, v in sorted(rollup.items())},
+            "source_failures": source_failures,
             "law_sources": LAW_SOURCES,
             "limitations": [
                 "Exact is reserved for bypass/nonfinite/plumbing; active DSP without a parity certificate remains a gap.",
@@ -484,6 +489,9 @@ def markdown(data):
             identity += " (" + r["model"] + ")"
         lines.append(f'| {r["aid"]} | {r["source"]} / {identity} | {variants["default"]["unit"]} | {r["category"]} | {cell(variants["default"])} | {cell(variants["conservative"])} | ' + " / ".join("yes" if b else "no" for b in r["presence"].values()) + " |")
     lines += ["", "## Boxes and emitted findings per AID", ""]
+    if data.get("source_failures"):
+        lines += ["Source loading failures are recorded separately and do not count as AID refusals: " +
+                  ", ".join(r["source"] for r in data["source_failures"]) + ".", ""]
     for r in data["aids"]:
         lines += [f'### AID{r["aid"]} ({r["source"]})', "", "| Box | Type / ports in-out | Default law status | Conservative law status | Discrete controls / active tmst types | Open laws |", "|---|---|---|---|---|---|"]
         cons = {b["name"]: b for b in r["variants"]["conservative"]["boxes"]}
