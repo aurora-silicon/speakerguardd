@@ -35,8 +35,9 @@
 //!
 //! * the signal is oversampled [`OVERSAMPLE`] times through a linear-phase
 //!   windowed-sinc low pass `h` ([`FIR_TAPS`] taps at the oversampled rate,
-//!   [`FIR_HALF_BASE`] base frames of delay, Dolph-Chebyshev window with
-//!   [`WINDOW_SIDELOBE_DB`] side lobes), cut at `19 kHz - 1 kHz * mode`
+//!   [`FIR_HALF_BASE`] base frames of delay, Kaiser window [`WINDOW_BETA`]
+//!   over [`WINDOW_HALF_OS`] oversampled samples each side), cut at
+//!   `19 kHz - 1 kHz * mode`
 //!   (rates up to 48 kHz) or `fs / 4` (88.2 kHz and up);
 //! * on the oversampled signal a de-esser cut `D` (the saved frequency
 //!   `f0`, strength `S` dB and Q:
@@ -78,14 +79,17 @@ pub const OVERSAMPLE: usize = 3;
 pub const FIR_HALF_BASE: usize = 12;
 /// Taps of the saturation low pass at the oversampled rate.
 pub const FIR_TAPS: usize = 2 * FIR_HALF_BASE * OVERSAMPLE + 1;
-/// Side-lobe level of the low pass's Dolph-Chebyshev window.
+/// The low pass's window: Kaiser `I0(beta sqrt(1 - (t/T)^2)) / I0(beta)`
+/// over the 73 taps, `t` in oversampled samples from the centre.
 ///
-/// TODO(SPEC): the window is pinned black-box: Chebyshev 90 dB matches the
-/// unit's low-level impulse to 2.5e-7 at 96 kHz and 6e-6 at 48 kHz, and its
-/// 20 kHz stop band within 0.13 dB on the quiet side (-68.5 dB). The exact
-/// design recipe is still open (no Kaiser/DPSS/Blackman-family window
-/// matches better).
-pub const WINDOW_SIDELOBE_DB: f64 = 90.0;
+/// TODO(SPEC): pinned black-box. The single filter, factored out of the
+/// unit's low-level impulse at 88.2/96/192 kHz (a 25-tap half band), has
+/// the same window in base frames at every rate; this Kaiser matches the
+/// impulses at 44.1/48/96 kHz to 1.5e-5 and the 48 kHz stop band within
+/// 0.06 dB (20 kHz: 0.004 dB). No standard window (Chebyshev, DPSS,
+/// cosine sums, Kaiser-formula beta) matches exactly; the recipe is open.
+pub const WINDOW_BETA: f64 = 11.143;
+pub const WINDOW_HALF_OS: f64 = 38.0;
 /// Saturation latency (up plus down low pass), base frames.
 pub const SATURATION_DELAY: usize = 2 * FIR_HALF_BASE;
 /// Shaper drive bounds: `sin(k u) / k` with `k` in `[K_MIN, 1]`.
@@ -316,44 +320,24 @@ fn deesser(f0: f64, strength_db: f64, q: f64, fs: f64) -> (Biquad, Biquad) {
     (Biquad::new(num, den), Biquad::new(den, num))
 }
 
-/// Dolph-Chebyshev window of odd length `n` with `at` dB side lobes,
-/// peak 1 (the classic construction: the DFT of the Chebyshev polynomial
-/// sampled on the unit circle).
-fn chebwin(n: usize, at: f64) -> Vec<f64> {
-    let order = (n - 1) as f64;
-    let beta = libm::cosh(libm::acosh(libm::pow(10.0, at / 20.0)) / order);
-    let p: Vec<f64> = (0..n)
-        .map(|k| {
-            let x = beta * libm::cos(core::f64::consts::PI * k as f64 / n as f64);
-            if x > 1.0 {
-                libm::cosh(order * libm::acosh(x))
-            } else if x < -1.0 {
-                libm::cosh(order * libm::acosh(-x))
-            } else {
-                libm::cos(order * libm::acos(x))
-            }
-        })
-        .collect();
-    let half = n.div_ceil(2);
-    let w: Vec<f64> = (0..half)
-        .map(|m| {
-            p.iter()
-                .enumerate()
-                .map(|(k, v)| v * libm::cos(2.0 * core::f64::consts::PI * (k * m) as f64 / n as f64))
-                .sum()
-        })
-        .collect();
-    let mut full: Vec<f64> = (0..n).map(|i| if i < half - 1 { w[half - 1 - i] } else { w[i + 1 - half] }).collect();
-    let peak = full.iter().copied().fold(0.0, f64::max);
-    full.iter_mut().for_each(|v| *v /= peak);
-    full
+/// Modified Bessel function of the first kind, order zero (power series).
+fn bessel_i0(x: f64) -> f64 {
+    let q = x * x / 4.0;
+    let (mut term, mut sum) = (1.0, 1.0);
+    for k in 1..200 {
+        term *= q / (k * k) as f64;
+        sum += term;
+        if term < sum * 1e-17 {
+            break;
+        }
+    }
+    sum
 }
 
 /// The saturation low pass at the oversampled rate, unity DC gain.
 fn saturation_fir(mode: u32, fs: f64) -> [f64; FIR_TAPS] {
     let fc = if fs >= 88_000.0 { fs / 4.0 } else { 19_000.0 - 1_000.0 * f64::from(mode) };
     let fs_os = fs * OVERSAMPLE as f64;
-    let win = chebwin(FIR_TAPS, WINDOW_SIDELOBE_DB);
     let mut h = [0.0; FIR_TAPS];
     let mid = (FIR_TAPS / 2) as f64;
     for (i, v) in h.iter_mut().enumerate() {
@@ -361,7 +345,9 @@ fn saturation_fir(mode: u32, fs: f64) -> [f64; FIR_TAPS] {
         let a = 2.0 * fc / fs_os;
         let sinc =
             if t == 0.0 { 1.0 } else { libm::sin(core::f64::consts::PI * a * t) / (core::f64::consts::PI * a * t) };
-        *v = a * sinc * win[i];
+        let r = t / WINDOW_HALF_OS;
+        let win = bessel_i0(WINDOW_BETA * libm::sqrt((1.0 - r * r).max(0.0))) / bessel_i0(WINDOW_BETA);
+        *v = a * sinc * win;
     }
     let sum: f64 = h.iter().sum();
     h.iter_mut().for_each(|v| *v /= sum);
