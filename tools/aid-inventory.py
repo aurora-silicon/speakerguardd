@@ -39,11 +39,10 @@ KNOWN_BOARDS = {9: ("j316s", "MacBook Pro (16-inch, M1 Pro, 2021)"),
                 48: ("j873s", "Mac mini (M5 Pro / M6)"),
                 49: ("k114s", "K114 MacBook Pro (M5 Pro / M5 Max)"),
                 50: ("k116s", "K116 MacBook Pro (M5 Pro / M5 Max)")}
-TRACE_LAWS = {1: "cfrk-slow-release-TODO(SPEC)", 2: "tmst-type18-TODO(SPEC)",
-              4: "lowflow-conservative", 8: "cfrk-true-peak-scale", 16: "tmst-type15-release-gap",
+TRACE_LAWS = {2: "tmst-type18-TODO(SPEC)", 4: "lowflow-conservative",
+              8: "cfrk-true-peak-scale", 16: "tmst-type15-release-gap",
               32: "input-amplitude-bound"}
 LAW_SOURCES = {
-    "cfrk-slow-release-TODO(SPEC)": "crates/sgv2-core/src/voicing/cfreak.rs:TAU_SLOW_S",
     "cfrk-ceiling-trim": "crates/sgv2-core/src/voicing/cfreak.rs:CEILING_TRIM_DB",
     "cfrk-true-peak-scale": "crates/sgv2-core/src/voicing/cfreak.rs:TRUE_PEAK_SCALE_DB",
     "gain-positive-clamp": "crates/sgv2-core/src/voicing/chain.rs:Run::set",
