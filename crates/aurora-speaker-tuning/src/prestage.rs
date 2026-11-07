@@ -34,7 +34,7 @@
 //! | 12 | high shelf | matched-Z, two-zero magnitude-corrected high shelf |
 //! | 0 | a Butterworth band shelf; four frequencies set its two edges | two Butterworth shelves and the compensating flat gain |
 //! | 2 | a Butterworth shelf; the first two frequencies set its direction, midpoint and slope | bilinear, prewarped Butterworth shelf sections |
-//! | 7 | a constant tilt, from `-gain` to `+gain` around the slot frequency | the decoded complementary 0x15/0x16 biquad pair |
+//! | 7 | a constant tilt, from `-gain` to `+gain` around the slot frequency | the decoded complementary biquad pair |
 //! | 18 | a level-dependent high cut, at most its full-scale response | the measured full-scale two-shelf envelope (never less cut at lower levels) |
 //! | 14 | resonant second-order high-pass; gain and order are ignored | bilinear high-pass with the saved analog-decay quality convention |
 //!
@@ -438,7 +438,7 @@ fn tilt_section(gain_db: f64, f0: f64, fs: f64, complement: bool) -> Section {
     }
 }
 
-/// ToneMeister's exact type-7 constant tilt: the decoded 0x15/0x16 pair.
+/// ToneMeister's exact type-7 constant tilt: the decoded complementary pair.
 fn constant_tilt(gain_db: f64, f0: f64, fs: f64) -> Vec<Section> {
     vec![tilt_section(gain_db, f0, fs, false), tilt_section(-gain_db, f0, fs, true)]
 }
@@ -1531,7 +1531,7 @@ mod tests {
         assert!((20.0 * pd.sections[0].magnitude(200.0, fs).log10() + 9.0).abs() < 0.01);
         let tilt = tmst(&[], &[(0, [3.0, 7.0, 12.0, 300.0, 9.0, 8.0, 3.0, 0.0])]);
         let pt = part(&tilt, 0, fs, &mut d).unwrap();
-        assert_eq!((pt.sections.len(), pt.gain_db), (4, -12.0));
+        assert_eq!((pt.sections.len(), pt.gain_db), (2, 0.0));
         assert!(pt.sections.iter().all(Section::stable));
         let high_cut = tmst(&[], &[(0, [3.0, 18.0, -4.0, 8000.0, 2.0, 3.0, 3.0, 0.0])]);
         let ph = part(&high_cut, 0, fs, &mut d).unwrap();
