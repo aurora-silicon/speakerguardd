@@ -6,7 +6,7 @@
 //! ```text
 //! aurora-speaker-tuning dump     [--json] [--speaker-id N] [SOURCE]
 //! aurora-speaker-tuning validate [--json] [--speaker-id N] [SOURCE]
-//! aurora-speaker-tuning compile  [--speaker-id N] [--board B [--unit-id U]] [--development] [--prestage identity|tuning] [SOURCE | --bundle PATH] -o BLOB
+//! aurora-speaker-tuning compile  [--speaker-id N] [--board B [--unit-id U]] [--development] [--voicing-pre | --prestage identity|tuning] [SOURCE | --bundle PATH] -o BLOB
 //! aurora-speaker-tuning identify [--json] [SOURCE]   (the bundle's identity, for provisioning)
 //! aurora-speaker-tuning blob     BLOB [BLOB]     (decode; with two, diff field by field)
 //! aurora-speaker-tuning units    [--json]
@@ -58,13 +58,15 @@ struct Args {
     board: Option<String>,
     unit_id: Option<String>,
     development: bool,
+    voicing_pre: bool,
     prestage: compile::PreStageMode,
 }
 
 fn usage() -> ! {
     eprintln!(
         "usage: aurora-speaker-tuning {{dump|validate}} [--json] [--speaker-id N] [PATH | --tunings-root DIR --aid N]\n       \
-         aurora-speaker-tuning compile [--speaker-id N] [--board B [--unit-id U]] [--development] [--prestage identity|tuning] [--bundle PATH | --tunings-root DIR --aid N] -o BLOB\n       \
+         aurora-speaker-tuning compile [--speaker-id N] [--board B [--unit-id U]] [--development] [--voicing-pre | --prestage identity|tuning] [--bundle PATH | --tunings-root DIR --aid N] -o BLOB\n       \
+         aurora-speaker-tuning plan [--speaker-id N] [PATH | --tunings-root DIR --aid N]\n       \
          aurora-speaker-tuning identify [--json] [PATH | --tunings-root DIR --aid N]\n       \
          aurora-speaker-tuning blob BLOB [BLOB]\n       \
          aurora-speaker-tuning units [--json]\n       aurora-speaker-tuning plist FILE"
@@ -82,6 +84,7 @@ fn parse_args() -> Args {
         Some("compile") => "compile",
         Some("blob") => "blob",
         Some("identify") => "identify",
+        Some("plan") => "plan",
         _ => usage(),
     }
     .to_string();
@@ -97,6 +100,7 @@ fn parse_args() -> Args {
         board: None,
         unit_id: None,
         development: false,
+        voicing_pre: false,
         prestage: compile::PreStageMode::default(),
     };
     while let Some(x) = it.next() {
@@ -112,6 +116,7 @@ fn parse_args() -> Args {
             "--board" => a.board = Some(it.next().unwrap_or_else(|| usage())),
             "--unit-id" => a.unit_id = Some(it.next().unwrap_or_else(|| usage())),
             "--development" => a.development = true,
+            "--voicing-pre" => a.voicing_pre = true,
             "--prestage" => {
                 a.prestage = match it.next().as_deref() {
                     Some("identity") => compile::PreStageMode::Identity,
@@ -127,6 +132,9 @@ fn parse_args() -> Args {
     }
     // A unit ID names the Mac an offline compile is for; it never stands
     // in for the running Mac's device tree.
+    if a.voicing_pre && a.cmd != "compile" {
+        usage();
+    }
     if a.unit_id.is_some() && (a.board.is_none() || a.cmd != "compile") {
         usage();
     }
@@ -491,7 +499,13 @@ fn main() {
                     (None, _) => Machine::from_device_tree(dt),
                 };
                 let provenance = if a.development { Provenance::AllowUnverified } else { Provenance::Verified };
-                match m.and_then(|m| compile::compile_opts(&t, &m, provenance, a.prestage, &mut diags)) {
+                match m.and_then(|m| {
+                    if a.voicing_pre {
+                        compile::compile_voicing_with(&t, &m, provenance, &mut diags)
+                    } else {
+                        compile::compile_opts(&t, &m, provenance, a.prestage, &mut diags)
+                    }
+                }) {
                     Ok(c) => {
                         if let Err(e) = write_atomic(&out, &c.blob) {
                             eprintln!("{}: {e}", out.display());
@@ -511,6 +525,11 @@ fn main() {
                         );
                     }
                     Err(e) => diags.from_error("compile", &e),
+                }
+            } else if a.cmd == "plan" {
+                match aurora_speaker_tuning::voicing::topology::plan(&t) {
+                    Ok(p) => println!("{}", serde_json::to_string_pretty(&p).unwrap()),
+                    Err(e) => diags.from_error("plan", &e),
                 }
             } else if a.cmd == "dump" {
                 if a.json {

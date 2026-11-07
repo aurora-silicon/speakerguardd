@@ -872,6 +872,15 @@ def cmd_generate(args):
     if not c:
         raise SystemExit("the self-check record has no machine description: run it again")
     m = rec["key"]
+    c = dict(c, board=rec["board"])
+    enabled = gen.voicing_enabled(rec["board"])
+    bind_path = os.path.join(args.state, "provision.bind")
+    bound_mode = False
+    if os.path.exists(bind_path):
+        with open(bind_path) as f:
+            bound_mode = any(line.strip() == "voicing_pre=true" for line in f)
+    if enabled != bound_mode:
+        raise SystemExit("voicing gate changed since compilation: run speakerguardd-provision again")
     src = f"the self-check of {rec['board']} ({rec['kernel']})"
     for d, name, text in (
         (args.pipewire_dir, f"sgv2-{m}.conf", gen.pipewire_conf(m, c, (w["unit_channels"], w["sense_ports"], w["hash"]), src)),

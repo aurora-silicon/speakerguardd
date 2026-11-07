@@ -28,6 +28,9 @@
 //!     pub fn process(&mut self, bufs: &mut [&mut [f32]], frames: usize);
 //! }
 //! ```
+//! A box driven by graph system volume additionally exposes
+//! `set_volume(db)`. The setter is RT-safe and is called before the next
+//! process block; the saved parameter-4 default is not baked into `Params`.
 //!
 //! `process` runs in place on `channels` buffers and is real-time code: no
 //! allocation, no locks, no panics on any input (non-finite input is
@@ -37,4 +40,18 @@
 //! Box modules are added one per box type (`norm`, `vbass`, `xtc`,
 //! `vareq`, `cfreak`, `buzz`, `cdelay`, ...).
 
+pub mod artifact;
+pub mod buzz;
+pub mod cdelay;
+pub mod cfreak;
+pub mod chain;
+pub mod lowflow;
 pub mod mstk;
+pub mod norm;
+pub mod pchr;
+pub mod tone;
+pub mod vareq;
+pub mod vbass;
+pub mod volt;
+pub mod volume;
+pub mod xtc;

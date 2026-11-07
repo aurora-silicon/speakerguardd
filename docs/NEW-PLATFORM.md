@@ -279,3 +279,19 @@ on the J413. A boot that has a valid record only checks the binding.
    provisioning compiles and binds it and configures the units, the
    self-check derives and proves the wiring at first boot, and the graph is
    generated from the self-check's record.
+
+## Generated full-chain voicing deployment
+
+`packaging/session/gate.json` has an independent default-off `voicing_pre`
+map keyed by the physical board. A literal `true` compiles the user's bundle
+with `aurora-speaker-tuning compile --voicing-pre` and generates a stereo
+voicing sink ahead of `RawSpeakers`. Every source parameter comes from that
+bundle at provisioning time. The chain artifact and protection parameters
+share one atomic publication; the protect pre-stage is identity in this
+mode. Missing/mismatched artifacts mute the voicing plugin and refuse the
+protect plugin's raw-feed pre-stage.
+
+Qualification and the kernel ownership gate still apply. The deployment
+switch is separate from numerical/acoustic approval of the current box
+laws. See [the deployment and rollback procedure](../packaging/pipewire/README.md)
+for mode changes, the volume convention and installation of the LV2 metadata.

@@ -5,8 +5,11 @@
 
 use crate::error::{Diagnostics, Error, Result};
 use crate::fourcc::FourCc;
+use crate::plist::Value;
 use crate::tuning::Stage;
-use sgv2_core::voicing::mstk::{Band, BandMode, Params, BANDS};
+use sgv2_core::voicing::mstk::{
+    AutomationPoint, Band, BandMode, Params, ThresholdAutomation, BANDS, MAX_AUTOMATION_POINTS,
+};
 
 pub const MSTK: FourCc = FourCc::from_bytes(*b"mstk");
 
@@ -22,6 +25,53 @@ fn flag(stage: &Stage, id: u32, value: f64) -> Result<bool> {
     } else {
         Err(bad(stage, format!("parameter {id} is {value}, not a switch")))
     }
+}
+
+fn threshold_automation(stage: &Stage, input_min: f64, input_max: f64) -> Result<[ThresholdAutomation; BANDS]> {
+    let mut out = [ThresholdAutomation::default(); BANDS];
+    let Some(value) = stage.preset_extra.get("automation") else { return Ok(out) };
+    let inputs = value.as_dict().ok_or_else(|| bad(stage, "automation is not a dictionary"))?;
+    if inputs.len() != 1 || inputs.get("0").is_none() {
+        return Err(bad(stage, "automation must contain only input 0"));
+    }
+    let targets =
+        inputs.get("0").and_then(Value::as_dict).ok_or_else(|| bad(stage, "automation input 0 is not a dictionary"))?;
+    for (target, value) in targets.iter() {
+        let target =
+            target.parse::<u32>().map_err(|_| bad(stage, format!("automation target {target:?} is not numeric")))?;
+        let Some(band) = (0..BANDS).find(|band| target == 4 + 25 * *band as u32) else {
+            return Err(bad(stage, format!("automation target {target} is not a downward-threshold parameter")));
+        };
+        let points =
+            value.as_array().ok_or_else(|| bad(stage, format!("automation target {target} is not an array")))?;
+        if !(2..=MAX_AUTOMATION_POINTS).contains(&points.len()) {
+            return Err(bad(
+                stage,
+                format!("automation target {target} has {} points, expected 2..={MAX_AUTOMATION_POINTS}", points.len()),
+            ));
+        }
+        let mut curve = ThresholdAutomation { count: points.len(), ..ThresholdAutomation::default() };
+        for (i, point) in points.iter().enumerate() {
+            let pair = point
+                .as_array()
+                .filter(|pair| pair.len() == 2)
+                .ok_or_else(|| bad(stage, format!("automation target {target} point {i} is not a pair")))?;
+            let input = pair[0]
+                .as_number()
+                .filter(|v| v.is_finite() && (input_min..=input_max).contains(v))
+                .ok_or_else(|| bad(stage, format!("automation target {target} point {i} has invalid input")))?;
+            let threshold = pair[1]
+                .as_number()
+                .filter(|v| v.is_finite() && (-120.0..=0.0).contains(v))
+                .ok_or_else(|| bad(stage, format!("automation target {target} point {i} has invalid threshold")))?;
+            if i != 0 && input <= curve.points[i - 1].input {
+                return Err(bad(stage, format!("automation target {target} inputs are not strictly increasing")));
+            }
+            curve.points[i] = AutomationPoint { input, value: threshold };
+        }
+        out[band] = curve;
+    }
+    Ok(out)
 }
 
 /// Compile one graph stage.  Part-scope sections are the unit's identical
@@ -75,9 +125,6 @@ pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option
         if flavor.fract() != 0.0 || !(0.0..=4.0).contains(&flavor) {
             return Err(bad(stage, format!("band {b} saturation flavor {flavor}")));
         }
-        if sat_on && flavor != 1.0 {
-            return Err(bad(stage, format!("band {b} enables uncarried saturation flavor {flavor}")));
-        }
         let mode = if mute || (any_solo && !solo[b]) {
             BandMode::Mute
         } else if !enabled || bypass {
@@ -108,6 +155,9 @@ pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option
             Err(bad(stage, format!("parameter {id} is {v}, expected 0..{hi}")))
         }
     };
+    let automation_input = opt(79, 0.0);
+    let automation_min = opt(80, -100.0);
+    let automation_max = opt(81, 0.0);
     let p = Params {
         crossover_hz: [req(4)?, req(6)?, req(8)?],
         crossover_order: [req(5)?, req(7)?, req(9)?],
@@ -119,9 +169,10 @@ pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option
         render_quality: integer(64, 0.0, 2)?,
         overshoot_compensation: flag(stage, 69, opt(69, 0.0))?,
         algorithm: integer(70, 0.0, 3)?,
-        automation_input: opt(79, 0.0),
-        automation_min: opt(80, -100.0),
-        automation_max: opt(81, 0.0),
+        automation_input,
+        automation_min,
+        automation_max,
+        threshold_automation: threshold_automation(stage, automation_min, automation_max)?,
         band: bands,
     };
     let mut words = [0.0; Params::WORDS];
@@ -138,6 +189,7 @@ pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option
 mod tests {
     use super::*;
     use crate::aupreset::{ParamSection, ParamState, UnitId};
+    use crate::plist::{Dict, Value};
 
     fn stage(extra: &[(u32, f32)]) -> Stage {
         let mut params = vec![
@@ -193,6 +245,9 @@ mod tests {
             preset_name: None,
             state: Some(ParamState { sections: vec![ParamSection { scope: 0, element: 0, params }] }),
             preset_extra_keys: vec![],
+            preset_extra: Default::default(),
+            strip_properties: Vec::new(),
+            property_files: Vec::new(),
             before_protection: true,
         }
     }
@@ -206,15 +261,32 @@ mod tests {
             (69, 1.0),
             (70, 3.0),
             (71, 1.0),
-            (72, 1.0),
+            (72, 4.0),
             (79, -16.0),
             (80, -100.0),
             (81, 0.0),
         ]);
         let p = compile(&s, 48_000.0, &mut Diagnostics::default()).unwrap().unwrap();
         assert_eq!((p.band[0].up_ratio, p.band[0].exp_ratio, p.band[0].input_gain_db), (2.0, 1.5, -3.0));
-        assert_eq!(p.band[0].saturation, Some(1));
+        assert_eq!(p.band[0].saturation, Some(4));
         assert!(p.overshoot_compensation);
+    }
+
+    #[test]
+    fn compiles_generic_threshold_automation_curves() {
+        let mut s = stage(&[(79, -16.0), (80, -100.0), (81, 0.0)]);
+        let pair = |input: f64, threshold: f64| Value::Array(vec![Value::Real(input), Value::Real(threshold)]);
+        let mut targets = Dict::new();
+        assert!(targets
+            .insert_unique("4".into(), Value::Array(vec![pair(-30.0, -10.0), pair(-10.0, -20.0), pair(0.0, -24.0)]),));
+        let mut inputs = Dict::new();
+        assert!(inputs.insert_unique("0".into(), Value::Dict(targets)));
+        assert!(s.preset_extra.insert_unique("automation".into(), Value::Dict(inputs)));
+
+        let p = compile(&s, 48_000.0, &mut Diagnostics::default()).unwrap().unwrap();
+        assert_eq!(p.threshold_automation[0].count, 3);
+        assert_eq!(p.threshold_automation[0].points[1], AutomationPoint { input: -10.0, value: -20.0 });
+        assert!(p.threshold_automation[1..].iter().all(|curve| curve.count == 0));
     }
 
     #[test]

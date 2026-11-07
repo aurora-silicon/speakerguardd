@@ -37,6 +37,7 @@ The graph, per machine:
   the supervisor.
 """
 import json
+import math
 import os
 import sys
 
@@ -47,6 +48,167 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PKG = os.path.dirname(HERE)
 QUANTUM = 512
 PROTECT_INPUT = "alsa_output.platform-sound.RawSpeakers"
+
+
+# Where gate.json is: beside this file in the source tree, else where every
+# distribution installs it (speakerguardd-gate's default). SGV2_GATE overrides.
+GATE_PATHS = (os.path.join(HERE, "gate.json"), "/usr/share/speakerguardd/gate.json")
+
+
+def load_gate():
+    env = os.environ.get("SGV2_GATE")
+    for path in ((env,) if env else ()) + GATE_PATHS:
+        if os.path.exists(path):
+            with open(path) as f:
+                return json.load(f)
+    raise FileNotFoundError("gate.json: none of " + ", ".join(((env,) if env else ()) + GATE_PATHS))
+
+
+def voicing_enabled(board, gate=None):
+    """Per-board deployment gate. Missing keys/boards keep the interim graph.
+    Values must be literal JSON booleans; strings never enable a board.
+    """
+    if gate is None:
+        gate = load_gate()
+    return gate.get("voicing_pre", {}).get(board) is True
+
+
+def voicing_bound(board, gate=None):
+    """Interim never-louder bound for a board's generated voicing: one gain
+    in dB (<= 0) per unit lane, applied after the voicing plugin, from
+    gate.json voicing_pre_bound_db. It exists only while a voicing law is
+    still open (it keeps every lane at or below macOS on the full-chain
+    safety scan) and goes when the law is exact. Anything malformed, any
+    positive value or a wrong lane count refuses the board's voicing.
+    """
+    if gate is None:
+        gate = load_gate()
+    b = gate.get("voicing_pre_bound_db", {}).get(board)
+    if b is None:
+        return None
+    if not isinstance(b, list) or not all(isinstance(x, (int, float)) and not isinstance(x, bool) and -12.0 <= x <= 0.0 for x in b):
+        raise ValueError(f"voicing_pre_bound_db for {board}: want a list of dB values in [-12, 0]")
+    return [float(x) for x in b]
+
+
+LOWPASS_ORDERS = (2, 4, 6, 8, 10, 12)
+
+
+def voicing_lowpass(board, gate=None):
+    """INTERIM never-louder band limit for a board's generated voicing, from
+    gate.json voicing_pre_lowpass: {"hz": corner, "order": even Butterworth
+    order}. It is not a macOS law. It exists only because one voicing law is
+    still open and makes a board louder than macOS in a band no lane trim
+    can hold: on the j700 (AID44) v2's ControlFreak lacks the AU's
+    reconstruction low-pass, so above ~17 kHz the box is up to +23 dB
+    (+30 dB at full scale) louder than macOS, and its saturation folds a
+    loud high-frequency input back into the band (aliases at 9-16.5 kHz).
+    The low-pass therefore sits in front of the voicing plugin, so neither
+    the excess band nor the aliases reach the output; a filter after the
+    plugin cannot remove the aliases. Each section is PipeWire's builtin
+    bq_lowpass (RBJ) at the corner with the Butterworth Q of its pole pair,
+    so the cascade is the bilinear Butterworth response, monotonic and
+    never above 0 dB. It goes when the ControlFreak law is exact. Anything
+    malformed refuses the board's voicing.
+    """
+    if gate is None:
+        gate = load_gate()
+    lp = gate.get("voicing_pre_lowpass", {}).get(board)
+    if lp is None:
+        return None
+    hz = lp.get("hz") if isinstance(lp, dict) else None
+    order = lp.get("order") if isinstance(lp, dict) else None
+    if (
+        not isinstance(lp, dict)
+        or set(lp) != {"hz", "order"}
+        or not isinstance(hz, (int, float))
+        or isinstance(hz, bool)
+        or not 1000.0 <= hz <= 23000.0
+        or not isinstance(order, int)
+        or isinstance(order, bool)
+        or order not in LOWPASS_ORDERS
+    ):
+        raise ValueError(f"voicing_pre_lowpass for {board}: want {{\"hz\": 1000..23000, \"order\": one of {LOWPASS_ORDERS}}}")
+    return float(hz), order
+
+
+def butterworth_q(order):
+    """Q of each pole pair of an even-order Butterworth low-pass."""
+    return [1.0 / (2.0 * math.sin((2 * k - 1) * math.pi / (2 * order))) for k in range(1, order // 2 + 1)]
+
+
+def voicing_conf(m, c, w):
+    """One stereo chain, in unit-lane order, mapped to physical AUX ports
+    with the same map as the protection input. Volume is handled by the
+    chain control, so PipeWire must not attenuate the audio a second time.
+    """
+    amps = c["amps"]
+    unit = w[0]
+    bound = voicing_bound(c.get("board", m))
+    if bound is not None and len(bound) != amps:
+        raise ValueError(f"voicing_pre_bound_db for {c.get('board', m)}: {len(bound)} lanes, the board has {amps}")
+    trims = {k: bound[k] for k in range(amps) if bound and bound[k] < 0.0}
+    outputs = " ".join(f'"b{unit[p]}:Out"' if unit[p] in trims else f'"voicing:out_{unit[p]}"' for p in range(amps))
+    extra_nodes = "".join(
+        f' {{ type = builtin name = b{k} label = linear control = {{ "Mult" = {10.0 ** (t / 20.0):.9f} "Add" = 0.0 }} }}'
+        for k, t in sorted(trims.items())
+    )
+    links = "".join(f' {{ output = "voicing:out_{k}" input = "b{k}:In" }}' for k in sorted(trims))
+    inputs = '"voicing:in_0" "voicing:in_1"'
+    pre_nodes = ""
+    lp = voicing_lowpass(c.get("board", m))
+    if lp is not None:
+        hz, order = lp
+        if hz >= c["rate"] / 2:
+            raise ValueError(f"voicing_pre_lowpass for {c.get('board', m)}: {hz} Hz is not below Nyquist at {c['rate']} Hz")
+        qs = butterworth_q(order)
+        for ch in (0, 1):
+            pre_nodes += "".join(
+                f' {{ type = builtin name = lp{ch}s{k} label = bq_lowpass control = {{ "Freq" = {hz:.1f} "Q" = {q:.9f} }} }}'
+                for k, q in enumerate(qs)
+            )
+            chain = [f"lp{ch}s{k}" for k in range(len(qs))]
+            links += "".join(f' {{ output = "{a}:Out" input = "{b}:In" }}' for a, b in zip(chain, chain[1:]))
+            links += f' {{ output = "{chain[-1]}:Out" input = "voicing:in_{ch}" }}'
+        inputs = '"lp0s0:In" "lp1s0:In"'
+    links_line = f"\n               links = [{links} ]" if links else ""
+    return f"""
+    {{ name = libpipewire-module-filter-chain
+       flags = [ nofail ]
+       args = {{
+           node.description = "{c['name']} speakers"
+           media.name = "{c['name']} speakers"
+           filter.graph = {{
+               nodes = [{pre_nodes} {{ type = lv2 name = voicing plugin = "https://aurora-silicon.org/lv2/sgv2#voicing-{amps}ch" }}{extra_nodes} ]{links_line}
+               inputs = [ {inputs} ]
+               outputs = [ {outputs} ]
+               capture.volumes = [ {{ control = "voicing:volume" min = 0.0 max = 1.0 scale = cubic }} ]
+           }}
+           capture.props = {{
+               node.name = "sgv2.voicing.{m}"
+               node.description = "{c['name']} speakers"
+               media.class = "Audio/Sink"
+               audio.rate = {c['rate']}
+               audio.channels = 2
+               audio.position = [ FL FR ]
+               priority.session = 1000
+               sgv2.stage = "voicing-pre"
+               sgv2.machine = "{m}"
+           }}
+           playback.props = {{
+               node.name = "sgv2.voicing.{m}.out"
+               target.object = "{PROTECT_INPUT}"
+               audio.rate = {c['rate']}
+               audio.channels = {amps}
+               audio.position = {aux(amps)}
+               node.passive = true
+               stream.dont-remix = true
+               channelmix.disable = true
+               resample.disable = true
+           }}
+       }}
+    }}
+"""
 
 
 def names(m):
@@ -94,9 +256,10 @@ def machine(m):
     return c, (w["unit_channels"], w["sense_ports"], w["hash"])
 
 
-def pipewire_conf(m, c, w, source=None):
+def pipewire_conf(m, c, w, source=None, voicing_pre=None):
     """The PipeWire file for description `c` (wiring.describe) and map `w`
     (unit_channels, sense_ports, wiring hash)."""
+    enabled = voicing_enabled(c.get("board", m)) if voicing_pre is None else voicing_pre
     n = names(m)
     amps, sense = c["amps"], c["sense"]
     uri = f"https://aurora-silicon.org/lv2/sgv2#{c['plugin']}"
@@ -143,7 +306,7 @@ def pipewire_conf(m, c, w, source=None):
             monitor.channel-volumes = false
         }}
     }}"""
-    return f"""# Generated by packaging/session/gen.py from {source or f'fixtures/{m}.json'}; do not edit.
+    text = f"""# Generated by packaging/session/gen.py from {source or f'fixtures/{m}.json'}; do not edit.
 # speakerguardd v2: the protect stage, the speaker amps and the sense of the {c['name']}.
 
 context.objects = [
@@ -234,6 +397,7 @@ context.modules = [
     }}
 ]
 """
+    return text.rsplit("]", 1)[0] + voicing_conf(m, c, w) + "]\n" if enabled else text
 
 
 RAW_RULES = "59-sgv2-raw.conf"
@@ -268,9 +432,10 @@ monitor.alsa.rules = [
 """
 
 
-def wireplumber_conf(m, c, source=None):
+def wireplumber_conf(m, c, source=None, voicing_pre=None):
+    enabled = voicing_enabled(c.get("board", m)) if voicing_pre is None else voicing_pre
     card = c["card"]
-    return f"""# Generated by packaging/session/gen.py from {source or f'fixtures/{m}.json'}; do not edit.
+    text = f"""# Generated by packaging/session/gen.py from {source or f'fixtures/{m}.json'}; do not edit.
 # speakerguardd v2 on the {c['name']}: the only path to the speaker amps is the protect stage.
 
 monitor.alsa.rules = [
@@ -308,6 +473,10 @@ node.software-dsp.rules = [
     }}
 ]
 """
+    if enabled:
+        # Do not create the interim software-dsp filter as well.
+        text = text[:text.index("node.software-dsp.rules = [")] + "node.software-dsp.rules = []\n"
+    return text
 
 
 def outputs():

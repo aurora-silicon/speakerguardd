@@ -14,6 +14,21 @@
 //! `Ok(None)` means the box is bypassed in the saved state (it contributes
 //! nothing). Graph-level parameters are taken at full system volume (graph
 //! `mvsc` = 1, `mvol` = 0 dB); a box whose saved state depends on another
-//! volume refuses rather than guesses.
+//! volume refuses rather than guesses, unless its runner takes the volume at
+//! run time (VarEQ: `Run::set_volume_scalar` from `mvsc`; AULowFlow:
+//! `Run::set_volume(db)` from `mvol` on its parameter 4).
 
+pub mod buzz;
+pub mod cdelay;
+pub mod cfreak;
+pub mod chain;
+pub mod lowflow;
 pub mod mstk;
+pub mod norm;
+pub mod pchr;
+pub mod topology;
+pub mod vareq;
+pub mod vbass;
+pub mod volt;
+pub mod volume;
+pub mod xtc;

@@ -350,6 +350,37 @@ pub fn compile_opts(
     Ok(c)
 }
 
+/// Compile the same full chain as voicing-render, bound with the ordinary
+/// protection payload in one blob. The protect pre-stage becomes identity:
+/// applying the interim crossover/dynamics again would double the voicing.
+/// Board, unit and provenance refusal rules are shared with normal compile.
+pub fn compile_voicing_with(
+    t: &Tuning,
+    m: &Machine,
+    provenance: Provenance,
+    diags: &mut Diagnostics,
+) -> Result<Compiled> {
+    let b = preflight(t, m, provenance, diags)?;
+    let mut c = match t.protection.kind {
+        UnitKind::Spp3 => compile_spp3(t, &b, diags),
+        UnitKind::Lsm2 => compile_lsm2(t, &b, diags),
+        UnitKind::Atsp => compile_atsp(t, &b),
+    }?;
+    let chain = crate::voicing::chain::compile(t, c.sample_rate as f64, diags)?;
+    if !chain.stubs.is_empty() || !chain.unwired.is_empty() {
+        return Err(bad("the voicing chain has unimplemented boxes or graph parameters"));
+    }
+    for (node, gap) in &chain.gaps {
+        diags.warn("voicing-gap", node, gap);
+    }
+    let mut pre = sgv2_core::prestage::Params::identity(c.channels as usize);
+    pre.flags = sgv2_core::prestage::FLAG_FROM_TUNING | sgv2_core::prestage::FLAG_EXTERNAL_VOICING;
+    c.blob = sgv2_core::blob::with_prestage(&c.blob, &pre)
+        .and_then(|blob| sgv2_core::blob::with_voicing(&blob, &chain.spec))
+        .map_err(|e| bad(format!("the engine rejects the compiled voicing: {e:?}")))?;
+    Ok(c)
+}
+
 // ------------------------------------------------------------------ spp3
 
 struct Spp3Lookup<'a> {

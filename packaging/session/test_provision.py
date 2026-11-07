@@ -156,6 +156,25 @@ class Base(unittest.TestCase):
 
 
 class Provision(Base):
+    def test_voicing_gate_switch_recompiles_and_records_the_mode(self):
+        import gen
+        self.patch(gen, "voicing_enabled", lambda board: False)
+        self.assertEqual(self.run_(), 0)
+        self.assertEqual(prov.read_kv(self.p.bind)["voicing_pre"], "false")
+        self.patch(gen, "voicing_enabled", lambda board: board == "j316s")
+        self.assertEqual(self.run_(), 0)
+        self.assertTrue(self.record()["compiled"])
+        self.assertEqual(prov.read_kv(self.p.bind)["voicing_pre"], "true")
+        with open(os.path.join(os.path.dirname(self.cli), "calls")) as f:
+            self.assertIn("--voicing-pre", f.read())
+        self.assertEqual(self.run_(), 0)
+        self.assertFalse(self.record()["compiled"])
+        self.patch(gen, "voicing_enabled", lambda board: False)
+        self.assertEqual(self.run_(), 0)
+        self.assertTrue(self.record()["compiled"])
+        self.assertEqual(prov.read_kv(self.p.bind)["voicing_pre"], "false")
+
+
     def test_compiles_binds_and_configures(self):
         self.assertEqual(self.run_(), 0)
         self.assertEqual(self.calls(), ["identify", "compile"])
@@ -354,6 +373,39 @@ class Seat(Base):
 
 
 class Graph(Base):
+    def test_checked_voicing_blob_is_published_before_graph_start(self):
+        self.provisioned()
+        digest = prov.sha256_file(self.p.params)
+        prov.write_atomic(self.p.bind, f"voicing_pre=true\nparams_sha256={digest}\n")
+        prov.write_atomic(os.path.join(self.p.state, "selfcheck.bind"), f"result=pass\nparams_sha256={digest}\n")
+        prov.publish_voicing_parameters(self.p)
+        with open(self.p.published, "rb") as f:
+            self.assertEqual(f.read(), b"blob d1")
+        with open(self.p.params, "ab") as f:
+            f.write(b"changed")
+        with self.assertRaises(prov.Failed):
+            prov.publish_voicing_parameters(self.p)
+        with open(self.p.published, "rb") as f:
+            self.assertEqual(f.read(), b"blob d1")
+
+
+    def test_rollback_publishes_checked_interim_parameters_before_restarting_graph(self):
+        self.provisioned()
+        digest = prov.sha256_file(self.p.params)
+        prov.write_atomic(self.p.bind, f"voicing_pre=false\nparams_sha256={digest}\n")
+        prov.write_atomic(os.path.join(self.p.state, "selfcheck.bind"), f"result=pass\nparams_sha256={digest}\n")
+        prov.publish_voicing_parameters(self.p, previous_voicing=True)
+        with open(self.p.published, "rb") as f:
+            self.assertEqual(f.read(), b"blob d1")
+
+    def test_voicing_only_parameter_update_changes_graph_digest(self):
+        self.provisioned()
+        prov.write_atomic(self.p.bind, "voicing_pre=true\nparams_sha256=aaa\n")
+        first = prov.graph_digest(self.p)
+        prov.write_atomic(self.p.bind, "voicing_pre=true\nparams_sha256=bbb\n")
+        self.assertNotEqual(first, prov.graph_digest(self.p))
+
+
     def provisioned(self):
         self.assertEqual(self.run_(), 0)
         for d, n in (("pipewire", "sgv2-j316.conf"), ("wireplumber", "60-sgv2-j316.conf")):
@@ -710,7 +762,8 @@ class Gate(Base):
             sorted(["j316s", "j413", "j616s", "j700", "j274", "j293", "j313", "j375c", "j375d", "j473", "j474s", "j475c", "j475d", "j493"]),
         )
         # policy only: no hardware in the gate
-        self.assertEqual(sorted(k for k in g if not k.startswith("_")), ["qualified", "require_qualified_board", "units_at_parity"])
+        self.assertEqual(sorted(k for k in g if not k.startswith("_")), ["qualified", "require_qualified_board", "units_at_parity", "voicing_pre", "voicing_pre_bound_db", "voicing_pre_lowpass"])
+        self.assertEqual(g["voicing_pre"], {"j316s": True, "j413": True, "j616s": True, "j700": True})
         self.assertFalse(os.path.exists(os.path.join(HERE, "machines.json")))
 
 

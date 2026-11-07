@@ -395,6 +395,7 @@ def describe(hw, w):
     fmt = speaker_format(t)
     return {
         "key": machine_key(hw),
+        "board": hw["board"],
         "card": card_id(hw),
         "name": hw.get("model") or card_id(hw),
         "transport": t["transport"],

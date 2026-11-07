@@ -164,6 +164,45 @@ class Checks(unittest.TestCase):
         self.assertEqual(s.wanted(g), list(zip(p["pout"], p["spk"])))
 
 
+class AmpsUnity(unittest.TestCase):
+    def _run(self, props):
+        g, _, s = build("j316")
+        spk = g.node_id("sgv2.speaker.j316")
+        g.objs[spk]["info"].setdefault("params", {})["Props"] = [props] if props is not None else []
+        ran = []
+
+        class P:
+            def __init__(self, argv):
+                ran.append(argv)
+
+            def poll(self):
+                return 0
+
+        orig = sgs.subprocess.Popen
+        sgs.subprocess.Popen = lambda argv, **kw: P(argv)
+        try:
+            started = s.pin_amps_unity(g)
+            again = s.pin_amps_unity(g)
+        finally:
+            sgs.subprocess.Popen = orig
+        return started, again, ran, spk
+
+    def test_a_volume_on_the_amps_sink_is_put_back_to_unity(self):
+        started, again, ran, spk = self._run({"volume": 1.0, "mute": False, "channelVolumes": [0.027] * 6})
+        self.assertTrue(started)
+        self.assertFalse(again)  # at most once a second
+        self.assertEqual(len(ran), 1)
+        self.assertEqual(ran[0][:4], ["pw-cli", "set-param", str(spk), "Props"])
+        self.assertIn("channelVolumes: [ 1.0, 1.0, 1.0, 1.0, 1.0, 1.0 ]", ran[0][4])
+        self.assertIn("mute: false", ran[0][4])
+
+    def test_unity_or_unknown_amps_volume_is_left_alone(self):
+        for props in ({"volume": 1.0, "mute": False, "channelVolumes": [1.0] * 6}, {}, None):
+            started, _, ran, _ = self._run(props)
+            self.assertFalse(started, props)
+            self.assertEqual(ran, [], props)
+
+
 class Stop(unittest.TestCase):
     def test_stopping_unlinks_the_amps_and_the_sense_within_its_bound(self):
         import time
@@ -205,6 +244,90 @@ class Stop(unittest.TestCase):
 
 
 class Generated(unittest.TestCase):
+    def test_voicing_gate_is_per_physical_board_and_default_off(self):
+        self.assertFalse(gen.voicing_enabled("j616s", {}))
+        self.assertTrue(gen.voicing_enabled("j616s", {"voicing_pre": {"j616s": True}}))
+        self.assertFalse(gen.voicing_enabled("j616c", {"voicing_pre": {"j616s": True}}))
+        for value in (False, "true", 1, None):
+            self.assertFalse(gen.voicing_enabled("j616s", {"voicing_pre": {"j616s": value}}))
+        # Shipped gate (Ryan 2026-11-07, Plan A tonight): the four qualified test
+        # boards together, every other board keeps the interim graph.
+        on = sorted(gen.fixture(m)["hw"]["board"] for m in gen.machines() if gen.voicing_enabled(gen.fixture(m)["hw"]["board"]))
+        self.assertEqual(on, ["j316s", "j413", "j616s", "j700"])
+
+    def test_voicing_bound_is_validated_and_never_positive(self):
+        self.assertIsNone(gen.voicing_bound("j616s", {}))
+        self.assertEqual(gen.voicing_bound("j616s", {"voicing_pre_bound_db": {"j616s": [0, -1.5]}}), [0.0, -1.5])
+        for bad in ([0.1], ["-1"], [True], -1.0, [-13.0], [float("nan")]):
+            with self.assertRaises(ValueError):
+                gen.voicing_bound("j616s", {"voicing_pre_bound_db": {"j616s": bad}})
+        for m in gen.machines():
+            c, w = gen.machine(m)
+            b = gen.voicing_bound(c.get("board", m))
+            if gen.voicing_enabled(c.get("board", m)) and b is not None:
+                self.assertEqual(len(b), c["amps"])
+
+    def test_voicing_lowpass_is_interim_validated_and_only_on_the_j700(self):
+        self.assertIsNone(gen.voicing_lowpass("j700", {}))
+        self.assertEqual(gen.voicing_lowpass("j700", {"voicing_pre_lowpass": {"j700": {"hz": 17400, "order": 8}}}), (17400.0, 8))
+        for bad in ({"hz": 17400}, {"hz": 17400, "order": 7}, {"hz": 17400, "order": 8.0}, {"hz": "17400", "order": 8},
+                    {"hz": True, "order": 8}, {"hz": 500, "order": 8}, {"hz": 30000, "order": 8}, {"hz": float("nan"), "order": 8},
+                    {"hz": 17400, "order": 8, "gain": 0}, [17400, 8], 17400):
+            with self.assertRaises(ValueError):
+                gen.voicing_lowpass("j700", {"voicing_pre_lowpass": {"j700": bad}})
+        # Butterworth pole-pair Qs (order 2: 1/sqrt(2); order 8: the four classic values)
+        self.assertAlmostEqual(gen.butterworth_q(2)[0], 2 ** -0.5, places=12)
+        self.assertEqual([round(q, 4) for q in gen.butterworth_q(8)], [2.5629, 0.9, 0.6013, 0.5098])
+        # Shipped gate: the j700 only (the AID44 ControlFreak band, Daybreak t-5511), in front of the plugin.
+        on = sorted(b for b in (gen.fixture(m)["hw"]["board"] for m in gen.machines()) if gen.voicing_lowpass(b) is not None)
+        self.assertEqual(sorted(set(on)), ["j700"])
+        for m in gen.machines():
+            c, w = gen.machine(m)
+            conf = gen.pipewire_conf(m, c, w, voicing_pre=True)
+            lp = gen.voicing_lowpass(c.get("board", m))
+            if lp is None:
+                self.assertNotIn("bq_lowpass", conf)
+                self.assertIn('inputs = [ "voicing:in_0" "voicing:in_1" ]', conf)
+                continue
+            hz, order = lp
+            self.assertEqual(conf.count("label = bq_lowpass"), order)
+            self.assertEqual(conf.count(f'"Freq" = {hz:.1f}'), order)
+            self.assertIn('inputs = [ "lp0s0:In" "lp1s0:In" ]', conf)
+            for ch in (0, 1):
+                self.assertIn(f'{{ output = "lp{ch}s{order // 2 - 1}:Out" input = "voicing:in_{ch}" }}', conf)
+        # A corner at or above Nyquist refuses the board.
+        m = next(m for m in gen.machines() if gen.fixture(m)["hw"]["board"] == "j700")
+        c, w = gen.machine(m)
+        orig = gen.voicing_lowpass
+        try:
+            gen.voicing_lowpass = lambda board, gate=None: (24000.0, 8)
+            with self.assertRaises(ValueError):
+                gen.voicing_conf(m, c, w)
+        finally:
+            gen.voicing_lowpass = orig
+
+    def test_both_modes_target_the_same_protect_input_and_only_generated_mode_owns_volume(self):
+        for m in gen.machines():
+            c, w = gen.machine(m)
+            interim = gen.pipewire_conf(m, c, w, voicing_pre=False)
+            generated = gen.pipewire_conf(m, c, w, voicing_pre=True)
+            self.assertNotIn('sgv2.stage = "voicing-pre"', interim)
+            self.assertEqual(generated.count("context.modules = ["), 1)
+            self.assertIn(f'target.object = "{gen.PROTECT_INPUT}"', generated)
+            self.assertIn('audio.position = [ FL FR ]', generated)
+            self.assertIn('capture.volumes = [ { control = "voicing:volume"', generated)
+            self.assertIn('scale = cubic', generated)
+            b = gen.voicing_bound(c.get("board", m)) or []
+            ports = " ".join(f'"b{lane}:Out"' if lane < len(b) and b[lane] < 0 else f'"voicing:out_{lane}"' for lane in w[0])
+            self.assertIn(f'outputs = [ {ports} ]', generated)
+            wp_old = gen.wireplumber_conf(m, c, voicing_pre=False)
+            wp_new = gen.wireplumber_conf(m, c, voicing_pre=True)
+            self.assertIn(f'/usr/share/asahi-audio/{m}/graph.json', wp_old)
+            self.assertNotIn("create-filter", wp_new)
+            self.assertNotIn("graph.json", wp_new)
+            self.assertIn("node.disabled = true", wp_new)
+
+
     def test_generated_files_are_current(self):
         import subprocess
         import sys

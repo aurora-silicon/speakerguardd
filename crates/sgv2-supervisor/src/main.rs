@@ -514,7 +514,13 @@ mod linux {
     /// offer the persisted record if this boot, board, blob and geometry
     /// match and it is at most ten minutes old. Normal priority, off the RT
     /// loop.
-    fn spawn_thermal(page_path: PathBuf, file: PathBuf, header: sgv2_core::blob::Header, board: [u8; 8]) {
+    fn spawn_thermal(
+        page_path: PathBuf,
+        file: PathBuf,
+        header: sgv2_core::blob::Header,
+        board: [u8; 8],
+        engine_crc: u32,
+    ) {
         use sgv2_supervisor::thermal::{parse_boot_id, trusted, Persisted};
         let _ = std::thread::Builder::new().name("sgv2-thermal".into()).spawn(move || {
             let Ok(page) = EnginePage::open(&page_path.to_string_lossy()) else {
@@ -524,10 +530,13 @@ mod linux {
             let boot_id =
                 std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok().and_then(|t| parse_boot_id(&t));
             let now = sgv2_lv2::handoff::boottime_ns;
+            // Live trust names the complete deployment; persistent thermal
+            // state remains tied to the protection payload across voicing updates.
+            let engine_header = sgv2_core::blob::Header { payload_crc: engine_crc, ..header };
             match (boot_id, std::fs::read(&file).ok().and_then(|b| Persisted::decode(&b))) {
                 (Some(id), Some(p)) => match p.refusal(&id, &board, &header, now()) {
                     None => {
-                        page.provide(&p.record, p.stamp_boottime_ns, header.payload_crc);
+                        page.provide(&p.record, p.stamp_boottime_ns, engine_crc);
                         eprintln!(
                             "thermal: offering the state saved {} s ago",
                             now().saturating_sub(p.stamp_boottime_ns) / 1_000_000_000
@@ -544,11 +553,15 @@ mod linux {
             loop {
                 let h = page.header();
                 if let Some((rec, stamp)) = h.saved.read() {
-                    let ok =
-                        trusted(&rec, &header, h.params_crc.load(Ordering::Acquire), h.health.load(Ordering::Acquire));
+                    let ok = trusted(
+                        &rec,
+                        &engine_header,
+                        h.params_crc.load(Ordering::Acquire),
+                        h.health.load(Ordering::Acquire),
+                    );
                     if ok && stamp != last_stamp {
                         last_stamp = stamp;
-                        page.provide(&rec, stamp, header.payload_crc);
+                        page.provide(&rec, stamp, engine_crc);
                         if let Some(id) = boot_id {
                             if now().saturating_sub(last_write) >= 1_000_000_000 {
                                 last_write = now();
@@ -660,6 +673,9 @@ mod linux {
         }
         // The Mac's own filtering ahead of the unit: the plugin runs it and
         // refuses a blob whose pre-stage is bad, so the supervisor does too.
+        if let Err(e) = sgv2_core::blob::voicing(&blob) {
+            return refuse(format!("voicing rejected ({e:?})"));
+        }
         let crossover = match sgv2_core::blob::prestage(&blob, header.sample_rate as f64) {
             Ok(p) => p.from_tuning(),
             Err(e) => return refuse(format!("pre-stage rejected ({e:?})")),
@@ -667,6 +683,10 @@ mod linux {
         let full_scales = match blob_full_scales(&blob) {
             Ok(v) => v,
             Err(why) => return refuse(why),
+        };
+        let engine_crc = match sgv2_core::blob::engine_crc(&blob) {
+            Ok(crc) if crc != 0 => crc,
+            _ => return refuse("invalid deployment identity".into()),
         };
         let params_sha256 = aurora_speaker_tuning::manifest::sha256_hex(&blob);
         let Some(kernel_rel) = kernel_release() else {
@@ -708,7 +728,7 @@ mod linux {
             }
         };
         let board_field = sgv2_core::blob::machine_field(&board).unwrap_or([0; 8]);
-        spawn_thermal(page_path.clone(), user_dir.join("thermal"), header, board_field);
+        spawn_thermal(page_path.clone(), user_dir.join("thermal"), header, board_field, engine_crc);
         let helper = user_dir.join("helper");
         if let Err(e) = helper_dir(&helper, uid) {
             eprintln!("helper directory: {e}");
@@ -803,7 +823,7 @@ mod linux {
         let mut engine = Page(page);
         let mut pcm_view = PcmLatest(snapshot);
         let mut session = Session(session_path, live);
-        let mut observer = Observer::new(header.payload_crc, header.sample_rate, TICK_NS);
+        let mut observer = Observer::new(engine_crc, header.sample_rate, TICK_NS);
         observer.expect_wiring(bind.wiring);
         let mut sup = Supervisor::new(Expect::new(machine, full_scales, &info.id));
         let mut deadline = now_ns();
