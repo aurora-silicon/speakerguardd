@@ -645,6 +645,7 @@ mod tests {
     fn activate_keeps_the_thermal_state_across_streams_and_instances() {
         use sgv2_core::blob::Pod;
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _clock = handoff::test_clock::Clock::at(1_000_000_000);
         let mut p = spp3::Params {
             channels: 2,
             sample_rate: 48_000,
@@ -708,17 +709,14 @@ mod tests {
             // pause and resume the same instance
             ((*d).activate.unwrap())(h);
             ((*d).run)(h, 512);
-            // The carried state cools with the time between the two runs
-            // (monotonic clock), so a loaded test host lets the gain recover a
-            // little. A cold start would play near unity; staying far below
-            // that proves the state was carried.
-            assert!(out() <= hot + 0.02 || out() < 0.25, "resumed at {}, was {hot}", out());
+            // No elapsed time at the hand-off, regardless of host load.
+            assert!(out() <= hot + 0.02, "resumed at {}, was {hot}", out());
             ((*d).cleanup)(h);
             // a new instance in the same process starts from that state too
             let h = open();
             ((*d).activate.unwrap())(h);
             ((*d).run)(h, 512);
-            assert!(out() <= hot + 0.02 || out() < 0.25, "new instance at {}, was {hot}", out());
+            assert!(out() <= hot + 0.02, "new instance at {}, was {hot}", out());
             ((*d).cleanup)(h);
         }
         let _ = std::fs::remove_file(&path);
@@ -872,6 +870,7 @@ mod tests {
     #[test]
     fn a_new_process_restores_the_hot_state_the_supervisor_provided() {
         use sgv2_core::blob::Pod;
+        let clock = handoff::test_clock::Clock::at(1_000_000_000);
         let mut p = spp3::Params {
             channels: 2,
             sample_rate: 48_000,
@@ -926,10 +925,12 @@ mod tests {
         // the supervisor reads it and provides it for the blob
         let (got, stamp) = page.header().saved.read().unwrap();
         assert_eq!(got, rec);
+        assert_eq!(stamp, 1_000_000_000);
         page.provide(&got, stamp, crc);
         // process B: its own slot is empty, so it restores what was provided
         let empty = handoff::Slot::new();
         let (mut b, _, crc_b) = load_unit(Some(&blob), 48_000.0, 2, 0, Role::Protect);
+        assert_eq!(page.provided_for(crc_b), Some((got, 0.0)));
         assert!(start_stream(b.as_dyn(), &empty, page.provided_for(crc_b)));
         let restored = run(&mut b).0;
         assert!(restored <= hot + 0.02, "restored at {restored}, was {hot}");
@@ -940,14 +941,20 @@ mod tests {
         assert!(cold_out > restored + 0.1, "cold {cold_out}, restored {restored}");
         // another blob gets nothing; a record past ten minutes is not restored
         assert!(page.provided_for(crc ^ 1).is_none());
-        let (mut c, _, _) = load_unit(Some(&blob), 48_000.0, 2, 0, Role::Protect);
-        assert!(!start_stream(c.as_dyn(), &empty, Some((got, PROVIDED_MAX_AGE_S + 1.0))));
         // the record is aged by the unit's own decay: an older record
         // restores cooler (this unit's time constants are seconds)
+        clock.advance(20_000_000_000);
+        assert_eq!(page.provided_for(crc), Some((got, 20.0)));
         let (mut d, _, _) = load_unit(Some(&blob), 48_000.0, 2, 0, Role::Protect);
-        assert!(start_stream(d.as_dyn(), &empty, Some((got, 20.0))));
+        assert!(start_stream(d.as_dyn(), &empty, page.provided_for(crc)));
         let aged = run(&mut d).0;
-        assert!(aged >= restored - 1e-6, "aged {aged}, restored {restored}");
+        assert!(aged > restored + 0.1, "aged {aged}, restored {restored}");
+        // Test the inclusive age limit through the page's timestamp path.
+        clock.advance(580_000_000_000);
+        let (mut c, _, _) = load_unit(Some(&blob), 48_000.0, 2, 0, Role::Protect);
+        assert!(start_stream(c.as_dyn(), &empty, page.provided_for(crc)));
+        clock.advance(1_000_000_000);
+        assert!(!start_stream(c.as_dyn(), &empty, page.provided_for(crc)));
         let _ = std::fs::remove_file(&path);
     }
 }
