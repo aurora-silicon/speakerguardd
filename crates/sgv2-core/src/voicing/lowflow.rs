@@ -45,6 +45,9 @@ const MASK_REFERENCE_FS: f64 = 48_000.0;
 const MODEL_SCALARS: usize = 28;
 const MAX_FS: f64 = 192_000.0;
 const CONSERVATIVE_GUARD_DB: f64 = 6.0;
+/// Velocity limit reached at the saved max mask point (black-box, SW-LOWFLOW2).
+#[cfg(not(feature = "lowflow-conservative"))]
+const MASK_CEILING_VELOCITY: f64 = 1.2111;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Model {
@@ -1034,6 +1037,14 @@ impl Run {
         self.latency_frames
     }
 
+    /// Offline diagnostics: the linked mask level (dB) and the newest completed
+    /// hop velocity of one model, as of the last processed hop.
+    #[cfg(not(feature = "lowflow-conservative"))]
+    #[doc(hidden)]
+    pub fn probe(&self, model: usize) -> [f64; 2] {
+        self.state.get(model).map_or([0.0; 2], |s| [s.mask_output_db, s.velocity_history[0]])
+    }
+
     #[allow(clippy::needless_range_loop)] // one frame across planar buffers
     #[cfg(feature = "lowflow-conservative")]
     pub fn process(&mut self, bufs: &mut [&mut [f32]], frames: usize) {
@@ -1264,6 +1275,14 @@ fn velocity_limit(m: &Model, energy_db: f64) -> f64 {
             m.high_velocity,
             (energy_db - m.mid_mask_energy_db) / (m.high_mask_energy_db - m.mid_mask_energy_db),
         );
+    }
+    // Above the high point the limit keeps rising on the line through
+    // (high, high_velocity) and (max, MASK_CEILING_VELOCITY), without a clamp
+    // at the max point. A max point at or below the high point disables this.
+    if m.max_mask_energy_db > m.high_mask_energy_db {
+        let span = m.max_mask_energy_db - m.high_mask_energy_db;
+        let rise = MASK_CEILING_VELOCITY;
+        return m.high_velocity + (rise - m.high_velocity) * (energy_db - m.high_mask_energy_db) / span;
     }
     m.high_velocity
 }
