@@ -48,8 +48,10 @@ change, and the repository's core/plugin sources are untouched after building.
 program. The program has quiet, loud and release segments, runs offline, and
 has no speaker output. Counter hits cover nontrivial CFreak slow release and
 true-peak scaling, the
-type-15 runtime, type-18 conservative dispatcher and enabled conservative LowFlow lanes. Other
-configured bounds are retained as open items without fabricated hit counts.
+type-15 runtime, type-18 conservative dispatcher and enabled conservative LowFlow lanes.
+Input-amplitude clamps are tagged only when an actual sample exceeds the
+existing public-code bound. Other configured bounds are retained as open items
+without fabricated hit counts.
 
 An accepted compile or an empty chain gap list is insufficient evidence of
 macOS exactness. The report reserves `exact` for bypass and simple structural

@@ -18,7 +18,7 @@ class PrivacyAndStatus(unittest.TestCase):
         paths = [inventory.REPO / p for p in [
             "crates/sgv2-core/src/lib.rs", "crates/sgv2-core/src/voicing/chain.rs",
             "crates/sgv2-core/src/voicing/cfreak.rs", "crates/sgv2-core/src/prestage.rs",
-            "crates/sgv2-core/src/voicing/lowflow.rs"]]
+            "crates/sgv2-core/src/voicing/lowflow.rs", "crates/sgv2-core/src/voicing/mstk.rs"]]
         originals = {p: p.read_bytes() for p in paths}
         probe = inventory.REPO / "crates/aurora-speaker-tuning/examples/aid-inventory-probe.rs"
         with tempfile.TemporaryDirectory(dir=inventory.REPO) as scratch:

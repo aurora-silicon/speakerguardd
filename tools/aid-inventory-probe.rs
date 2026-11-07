@@ -152,6 +152,7 @@ fn main() {
                     Kind::Stub(_) => ("stub", vec![]),
                     Kind::Gain => ("gain", vec!["gain-positive-clamp"]),
                     Kind::NonFinite => ("nonfinite", vec![]),
+                    Kind::Mstk(_) => ("mstk", vec!["input-amplitude-bound"]),
                     Kind::Cfreak(p) => {
                         let mut bounds = vec!["cfrk-slow-release-TODO(SPEC)", "cfrk-ceiling-trim"];
                         if p.true_peak {
@@ -170,17 +171,16 @@ fn main() {
                             },
                         )
                     }
-                    Kind::Tone(p) => (
-                        "tmst",
+                    Kind::Tone(p) => {
+                        let mut bounds = vec!["input-amplitude-bound"];
                         if p.dynamic
                             .iter()
                             .any(|d| d.params.kind == sgv2_core::prestage::DynamicKind::HighShelf && !d.params.smooth)
                         {
-                            vec!["tmst-type18-TODO(SPEC)"]
-                        } else {
-                            vec![]
-                        },
-                    ),
+                            bounds.push("tmst-type18-TODO(SPEC)");
+                        }
+                        ("tmst", bounds)
+                    }
                     _ => ("carried", vec![]),
                 };
                 let mut metadata = json!({"name":n.name,"kind":kind,"configured_bounds":configured});

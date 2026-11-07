@@ -40,7 +40,8 @@ KNOWN_BOARDS = {9: ("j316s", "MacBook Pro (16-inch, M1 Pro, 2021)"),
                 49: ("k114s", "K114 MacBook Pro (M5 Pro / M5 Max)"),
                 50: ("k116s", "K116 MacBook Pro (M5 Pro / M5 Max)")}
 TRACE_LAWS = {1: "cfrk-slow-release-TODO(SPEC)", 2: "tmst-type18-TODO(SPEC)",
-              4: "lowflow-conservative", 8: "cfrk-true-peak-scale", 16: "tmst-type15-release-gap"}
+              4: "lowflow-conservative", 8: "cfrk-true-peak-scale", 16: "tmst-type15-release-gap",
+              32: "input-amplitude-bound"}
 LAW_SOURCES = {
     "cfrk-slow-release-TODO(SPEC)": "crates/sgv2-core/src/voicing/cfreak.rs:TAU_SLOW_S",
     "cfrk-ceiling-trim": "crates/sgv2-core/src/voicing/cfreak.rs:CEILING_TRIM_DB",
@@ -56,6 +57,7 @@ LAW_SOURCES = {
     "lsm2-pressure-masking-unwired": "crates/aurora-speaker-tuning/src/compile.rs:pressure_response",
     "lsm2-pressure-response-gap": "crates/aurora-speaker-tuning/src/compile.rs:pressure_response",
     "spp3-closed-loop-sense-unwired": "crates/aurora-speaker-tuning/src/compile.rs:compile_spp3",
+    "input-amplitude-bound": "crates/sgv2-core/src/prestage.rs:INPUT_BOUND; crates/sgv2-core/src/voicing/mstk.rs:INPUT_BOUND",
 }
 PUBLIC_OPTIONAL_FIELDS = set(re.findall(r'\w+:\s*"(\w+)",\s*Opt\w+',
     (REPO / "crates/aurora-speaker-tuning/src/spp3.rs").read_text()))
@@ -122,6 +124,10 @@ pub mod aid_inventory_trace {
     pub fn hit(bit: u64) { HITS[NODE.load(Ordering::Relaxed)].fetch_or(bit, Ordering::Relaxed); }
     pub fn reset() { for h in &HITS { h.store(0, Ordering::Relaxed); } }
     pub fn get(n: usize) -> u64 { HITS[n].load(Ordering::Relaxed) }
+    pub fn bounded(x: f32, bound: f32) -> f32 {
+        if x.is_finite() && !(-bound..=bound).contains(&x) { hit(32); }
+        x.clamp(-bound, bound)
+    }
 }
 '''
 
@@ -136,7 +142,13 @@ def overlay(private):
             ("                if self.true_peak {", "                if self.true_peak {\n                    crate::aid_inventory_trace::hit(8);")],
         "crates/sgv2-core/src/prestage.rs": [
             ("            self.process_conservative_high_shelf(at, bufs, frames, n);", "            crate::aid_inventory_trace::hit(2);\n            self.process_conservative_high_shelf(at, bufs, frames, n);"),
-            ("        if at.params.kind == DynamicKind::HighShelf && !at.params.smooth {", "        if at.params.kind == DynamicKind::Notch { crate::aid_inventory_trace::hit(16); }\n        if at.params.kind == DynamicKind::HighShelf && !at.params.smooth {")],
+            ("        if at.params.kind == DynamicKind::HighShelf && !at.params.smooth {", "        if at.params.kind == DynamicKind::Notch { crate::aid_inventory_trace::hit(16); }\n        if at.params.kind == DynamicKind::HighShelf && !at.params.smooth {"),
+            ("x.clamp(-INPUT_BOUND, INPUT_BOUND)", "crate::aid_inventory_trace::bounded(x, INPUT_BOUND)", 3),
+            ("v.clamp(-INPUT_BOUND, INPUT_BOUND)", "crate::aid_inventory_trace::bounded(v, INPUT_BOUND)", 3),
+            ("sample.clamp(-INPUT_BOUND, INPUT_BOUND)", "crate::aid_inventory_trace::bounded(sample, INPUT_BOUND)", 2),
+            ("y.clamp(-INPUT_BOUND, INPUT_BOUND)", "crate::aid_inventory_trace::bounded(y, INPUT_BOUND)", 2)],
+        "crates/sgv2-core/src/voicing/mstk.rs": [
+            ("x.clamp(-INPUT_BOUND, INPUT_BOUND)", "crate::aid_inventory_trace::bounded(x, INPUT_BOUND)")],
         "crates/sgv2-core/src/voicing/lowflow.rs": [
             ("                    state.conservative_floor\n", "                    crate::aid_inventory_trace::hit(4);\n                    state.conservative_floor\n")],
     }
@@ -149,8 +161,10 @@ def overlay(private):
             path = REPO / rel
             original = path.read_text()
             text = original
-            for before, after in replacements:
-                if text.count(before) != 1:
+            for replacement in replacements:
+                before, after = replacement[:2]
+                expected = replacement[2] if len(replacement) == 3 else 1
+                if text.count(before) != expected:
                     raise RuntimeError("instrumentation anchor changed: " + rel)
                 text = text.replace(before, after)
             originals[path] = original
@@ -430,7 +444,7 @@ def report(rows, revision):
                 "The short synthetic render does not qualify all histories, volumes or sample rates and does not render the protection unit.",
                 "TODO(SPEC) counts are emitted diagnostics; source-only TODOs are not falsely reported as exercised.",
                 "Default host selection only; explicit optional bundles provide actual rig selections. Vendor configurations are not exhaustively swept.",
-                "Temporary counters cover CFreak nontrivial slow release and true-peak scaling, type-15 execution, type-18 conservative dispatch and active conservative LowFlow; other configured bounds have no hit counter.",
+                "Temporary counters cover CFreak nontrivial slow release and true-peak scaling, type-15 execution, type-18 conservative dispatch, active conservative LowFlow and actual input-amplitude clipping; other configured bounds have no hit counter.",
             ]}
 
 def markdown(data):
