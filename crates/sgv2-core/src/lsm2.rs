@@ -486,6 +486,7 @@ pub mod ids {
     pub const MANAGER_ADMITTANCE: u32 = 1;
     pub const MANAGER_DISPLACEMENT: u32 = 2;
     pub const MANAGER_VELOCITY: u32 = 3;
+    pub const MANAGER_ACCELERATION: u32 = 4;
     pub fn model(manager: u32, ty: u32, k: u32) -> u32 {
         3072 + 1024 * (3 * manager + ty) + k
     }
@@ -521,7 +522,12 @@ pub mod ids {
     pub const M_ENABLE_RES2: u32 = 8;
     pub const M_ENABLE_LR2: u32 = 13;
     pub const M_CREEP: u32 = 18;
+    pub const M_USE_STATIC_MODEL: u32 = 23;
     pub const M_USE_COMPENSATION: u32 = 24;
+    pub const M_DESIRED_RESONATOR_HZ: u32 = 25;
+    pub const M_DESIRED_RESONATOR_Q: u32 = 26;
+    pub const M_MAX_DC_BOOST_DB: u32 = 27;
+    pub const M_MAX_RESONANCE_CUT_DB: u32 = 28;
     pub const M_PASSIVE_RADIATOR: u32 = 29;
     // Thermal-block offsets.
     pub const T_RTH_VC: u32 = 3;
@@ -581,6 +587,102 @@ pub mod ids {
     pub const CH_MASK_ATTACK_RANGE: u32 = 28;
     pub const CH_BANDWIDTH: u32 = 29;
     pub const CH_POWER_AMP_MODEL: u32 = 32;
+}
+
+/// One channel's resonator target and the LSID bank that may refresh its
+/// physical source model. This lives in the optional companion transaction;
+/// ordinary LSM2 payload bytes and the shipped model-only ABI stay unchanged.
+#[derive(Clone, Copy, Debug)]
+struct CompensationSpec {
+    params: crate::resonator::Params,
+    bank: usize,
+}
+
+impl CompensationSpec {
+    fn with_model(self, model: &crate::lsid::ModelGeneration) -> Result<Self, InitError> {
+        let bank = model.banks().get(self.bank).ok_or(InitError::Invalid("compensation bank"))?;
+        let source = bank.resonance[0];
+        let mut next = self;
+        next.params.rdc = bank.fast_rdc as f64;
+        next.params.bl = source[0] as f64;
+        next.params.mass_kg = source[1] as f64 * 1e-3;
+        next.params.damping = source[2] as f64;
+        next.params.stiffness = source[3] as f64;
+        crate::resonator::Filter::new(next.params).map_err(|_| InitError::Invalid("adapted resonator compensation"))?;
+        Ok(next)
+    }
+}
+
+fn compensation_specs(
+    p: &Params,
+    companion: Option<&companion::Companion>,
+) -> Result<[Option<CompensationSpec>; MAX_CHANNELS], InitError> {
+    use ids as d;
+    let mut out = [None; MAX_CHANNELS];
+    let Some(companion) = companion else { return Ok(out) };
+    let get = |id: u32| {
+        companion
+            .lsm2_records
+            .iter()
+            .find(|r| r.0 == id)
+            .map(|r| r.1)
+            .ok_or(InitError::Invalid("compensation saved field"))
+    };
+    let flag = |id| Ok::<_, InitError>(get(id)? != 0.0);
+    let selector = |id| {
+        let v = get(id)?;
+        if v.is_finite() && v >= 0.0 && v.fract() == 0.0 {
+            Ok(v as usize)
+        } else {
+            Err(InitError::Invalid("compensation selector"))
+        }
+    };
+    if !flag(d::controller(d::C_COMPENSATE_RESONATORS))? {
+        return Ok(out);
+    }
+    for c in 0..p.channels as usize {
+        let ty = selector(d::CH_SPEAKER_TYPE + c as u32)?;
+        let bank = selector(d::CH_TUNING + c as u32)?;
+        if ty > 2 || bank >= crate::lsid::BANKS {
+            return Err(InitError::Invalid("compensation selector"));
+        }
+        // The controller's compensator is the type-A acceleration model.
+        // Enabling the same manager field on type B/C is inert in the native
+        // unit; those channels remain exact negative controls.
+        if ty != 0 {
+            continue;
+        }
+        let acc = |k| d::model(d::MANAGER_ACCELERATION, ty as u32, k);
+        if !flag(acc(d::M_USE_COMPENSATION))? {
+            continue;
+        }
+        if !flag(acc(d::M_ENABLE_RES1))?
+            || flag(acc(d::M_ENABLE_RES2))?
+            || flag(acc(d::M_ENABLE_LR2))?
+            || get(acc(d::M_CREEP))? != 0.0
+            || flag(acc(d::M_PASSIVE_RADIATOR))?
+        {
+            return Err(InitError::Unsupported("compensated acceleration model outside the single-resonator path"));
+        }
+        let params = crate::resonator::Params {
+            // Compensation consumes the acceleration block's live fields
+            // directly. Its generic selectors do not redirect these reads to
+            // the family/impedance row (verified by independent runtime writes).
+            rdc: get(acc(d::M_RDC))? as f64,
+            bl: get(acc(d::M_BL))? as f64,
+            mass_kg: get(acc(d::M_MMS_G))? as f64 * 1e-3,
+            damping: get(acc(d::M_RMS))? as f64,
+            stiffness: get(acc(d::M_KMS))? as f64,
+            desired_hz: get(acc(d::M_DESIRED_RESONATOR_HZ))? as f64,
+            desired_q: get(acc(d::M_DESIRED_RESONATOR_Q))? as f64,
+            max_boost_db: get(acc(d::M_MAX_DC_BOOST_DB))? as f64,
+            max_cut_db: get(acc(d::M_MAX_RESONANCE_CUT_DB))? as f64,
+            rate: p.sample_rate as f64,
+        };
+        crate::resonator::Filter::new(params).map_err(|_| InitError::Invalid("resonator compensation"))?;
+        out[c] = Some(CompensationSpec { params, bank });
+    }
+    Ok(out)
 }
 
 impl Params {
@@ -1513,6 +1615,9 @@ const CEIL_FRAMES: usize = 16;
 
 struct Chan {
     src: usize,
+    /// Resonator equalisation runs before every nonlinear controller/model
+    /// path. `None` is a bit-identical no-op.
+    compensation: Option<crate::resonator::Filter>,
     vfs: f32,
     /// Input history: the bank's 2 FB - 1 previous samples, then the frame.
     xb: Vec<f32>,
@@ -1790,9 +1895,11 @@ impl Chan {
 pub struct Unit {
     params: Params,
     run: Option<Run>,
+    compensation: [Option<CompensationSpec>; MAX_CHANNELS],
     companion: Option<companion::Companion>,
     estimator: Option<crate::lsid::Estimator>,
     handoff: Option<crate::lsid::Handoff>,
+    compensation_generation: u64,
     model_frames: u64,
     /// Geometry is fixed by AU initialisation. Runtime parameter writes may
     /// move the ceiling window inside it, but do not rebuild the audio delay.
@@ -1856,16 +1963,21 @@ impl Unit {
     pub fn new(params: Params) -> Self {
         let geometry_lookahead_ms = params.speaker_response_lookahead_ms;
         let telemetry_ambient = core::array::from_fn(|i| params.ch[i].ambient);
-        let run =
-            params.check_protects().and_then(|()| Run::new(&params, geometry_lookahead_ms, &telemetry_ambient)).ok();
+        let compensation = [None; MAX_CHANNELS];
+        let run = params
+            .check_protects()
+            .and_then(|()| Run::new(&params, geometry_lookahead_ms, &telemetry_ambient, &compensation))
+            .ok();
         Unit {
             params,
             run,
+            compensation,
             geometry_lookahead_ms,
             telemetry_ambient,
             companion: None,
             estimator: None,
             handoff: None,
+            compensation_generation: 0,
             model_frames: 0,
         }
     }
@@ -1879,7 +1991,13 @@ impl Unit {
         if rate != 0 {
             params.sample_rate = rate;
         }
+        let compensation = compensation_specs(&params, companion.as_ref())?;
         let mut unit = Self::new(params);
+        unit.compensation = compensation;
+        unit.run = params
+            .check_protects()
+            .and_then(|()| Run::new(&params, unit.geometry_lookahead_ms, &unit.telemetry_ambient, &compensation))
+            .ok();
         if let Some(c) = &companion {
             if let Some(topology) = c.topology {
                 let preset =
@@ -1887,6 +2005,7 @@ impl Unit {
                 let estimator = crate::lsid::Estimator::new(preset, topology, params.sample_rate)
                     .map_err(|_| InitError::Invalid("LSID seed"))?;
                 unit.handoff = Some(crate::lsid::Handoff::new(estimator.model().clone()));
+                unit.compensation_generation = estimator.model().generation();
                 unit.estimator = Some(estimator);
             }
         }
@@ -1905,20 +2024,36 @@ impl Unit {
     pub fn stage_model(&mut self, model: crate::lsid::ModelGeneration) -> Result<(), crate::lsid::Error> {
         self.handoff.as_mut().ok_or(crate::lsid::Error::Unsupported)?.stage(model)
     }
+    fn apply_compensation_model(&mut self, model: &crate::lsid::ModelGeneration) -> Result<(), InitError> {
+        let mut next = self.compensation;
+        for spec in next.iter_mut().flatten() {
+            *spec = spec.with_model(model)?;
+        }
+        if let Some(run) = &mut self.run {
+            run.reconfigure_compensation(&next)?;
+        }
+        self.compensation = next;
+        Ok(())
+    }
     pub fn set_runtime_budgets(&mut self, budgets: [f32; 4]) {
         self.params.runtime_budget_present = 1;
         self.params.runtime_budget_w = budgets;
         self.run = self
             .params
             .check_protects()
-            .and_then(|()| Run::new(&self.params, self.geometry_lookahead_ms, &self.telemetry_ambient))
+            .and_then(|()| {
+                Run::new(&self.params, self.geometry_lookahead_ms, &self.telemetry_ambient, &self.compensation)
+            })
             .ok();
     }
     /// Why [`Unit::new`] gives the fail-safe for `params`: unprotected
     /// (mitigation off, or no thermal axis) or unusable.
     pub fn init_error(params: &Params) -> Option<InitError> {
         let ambient = core::array::from_fn(|i| params.ch[i].ambient);
-        params.check_protects().and_then(|()| Run::new(params, params.speaker_response_lookahead_ms, &ambient)).err()
+        params
+            .check_protects()
+            .and_then(|()| Run::new(params, params.speaker_response_lookahead_ms, &ambient, &[None; MAX_CHANNELS]))
+            .err()
     }
     pub fn params(&self) -> &Params {
         &self.params
@@ -1937,7 +2072,12 @@ fn motion(rdc: f32, bl: f32, mms: f32, rms: f32, kms: f32, rate: f64, vel: bool)
 }
 
 impl Run {
-    fn new(p: &Params, geometry_lookahead_ms: f32, telemetry_ambient: &[f32; MAX_CHANNELS]) -> Result<Run, InitError> {
+    fn new(
+        p: &Params,
+        geometry_lookahead_ms: f32,
+        telemetry_ambient: &[f32; MAX_CHANNELS],
+        compensation: &[Option<CompensationSpec>; MAX_CHANNELS],
+    ) -> Result<Run, InitError> {
         // The geometry (latency floor, look-ahead region) is the one built at
         // initialisation; a runtime look-ahead write only moves the ceiling
         // window inside it (checked below against the substep grid).
@@ -2007,8 +2147,13 @@ impl Run {
                 MonitorCurrent::new(c.rdc as f64, c.bl as f64, c.mms_kg as f64, c.rms as f64, c.kms as f64, rate);
             let br_vc = ThermalBranch::new(c.rth_vc as f64, c.tau_vc as f64, sub_dt);
             let br_mg = ThermalBranch::new(c.rth_mag as f64, c.tau_mag as f64, sub_dt);
+            let compensation = compensation[ci]
+                .map(|spec| crate::resonator::Filter::new(spec.params))
+                .transpose()
+                .map_err(|_| InitError::Invalid("resonator compensation"))?;
             ch.push(Chan {
                 src: c.source as usize,
+                compensation,
                 vfs: c.volts_full_scale,
                 xb: vec![0.0; 2 * fb - 1 + ctl],
                 bank,
@@ -2147,9 +2292,28 @@ impl Run {
         })
     }
 
+    fn reconfigure_compensation(
+        &mut self,
+        compensation: &[Option<CompensationSpec>; MAX_CHANNELS],
+    ) -> Result<(), InitError> {
+        for (i, channel) in self.ch.iter_mut().enumerate() {
+            match (&mut channel.compensation, compensation[i]) {
+                (Some(filter), Some(spec)) => {
+                    filter.reconfigure(spec.params).map_err(|_| InitError::Invalid("adapted resonator compensation"))?
+                }
+                (None, None) => {}
+                _ => return Err(InitError::Invalid("adapted compensation channel set")),
+            }
+        }
+        Ok(())
+    }
+
     fn reset(&mut self) {
         let ctl = self.ctl;
         for c in self.ch.iter_mut() {
+            if let Some(compensation) = &mut c.compensation {
+                compensation.reset();
+            }
             c.xb.iter_mut().for_each(|v| *v = 0.0);
             c.ab.iter_mut().for_each(|b| b.iter_mut().for_each(|v| *v = 0.0));
             c.peak_ab.iter_mut().for_each(|b| b.iter_mut().for_each(|v| *v = 0.0));
@@ -2850,9 +3014,24 @@ impl Run {
                     let x = io.input[src][k];
                     // a non-finite sample is 0 to the audio and the models;
                     // the peak axis sees it as the most restrictive
-                    self.xin[ci][pos] = if x.is_finite() { dsp::meter1(x) } else { dsp::METER_FS };
+                    let x = if x.is_finite() { dsp::meter1(x) } else { dsp::METER_FS };
+                    self.xin[ci][pos] = if let Some(filter) = &mut self.ch[ci].compensation {
+                        match filter.process_sample(x) {
+                            Ok(y) => y,
+                            Err(_) => {
+                                self.fault = true;
+                                0.0
+                            }
+                        }
+                    } else {
+                        x
+                    };
                     io.output[src][k] = self.yout[ci][pos];
                 }
+            }
+            if self.fault {
+                crate::failsafe::fill_from(io, start, FAILSAFE_GAIN);
+                return;
             }
             self.pos += take;
             self.frame += take as u64;
@@ -2942,10 +3121,24 @@ impl ProtectionUnit for Unit {
         }
         let cadence = controller_frames(self.params.sample_rate) as u64;
         let end = self.model_frames.saturating_add(frames as u64);
+        let mut model_update = None;
         if self.model_frames % cadence == 0 || end / cadence > self.model_frames / cadence {
             if let Some(handoff) = &mut self.handoff {
                 handoff.commit();
+                if handoff.current().generation() != self.compensation_generation {
+                    model_update = Some(handoff.current().clone());
+                }
             }
+        }
+        if let Some(model) = model_update {
+            if self.apply_compensation_model(&model).is_err() {
+                if let Some(run) = &mut self.run {
+                    run.fault = true;
+                }
+                crate::spp3::failsafe_io(&mut io);
+                return Health(Health::FAILSAFE | Health::MODEL_FAULT);
+            }
+            self.compensation_generation = model.generation();
         }
         self.model_frames = end;
         if self.companion.as_ref().is_some_and(|c| c.gates != 0) {
@@ -3064,7 +3257,7 @@ impl ProtectionUnit for Unit {
             return false;
         }
         self.params = p;
-        self.run = Run::new(&self.params, self.geometry_lookahead_ms, &self.telemetry_ambient).ok();
+        self.run = Run::new(&self.params, self.geometry_lookahead_ms, &self.telemetry_ambient, &self.compensation).ok();
         true
     }
 
@@ -3232,6 +3425,88 @@ mod fault_tests {
         let mut outs: [&mut [f32]; 2] = [&mut o0, &mut o1];
         let h = u.process(Io { frames: n, input: &ins, sense: &[], output: &mut outs });
         (o0, h)
+    }
+
+    fn compensation_companion() -> companion::Companion {
+        use ids as d;
+        let mut records = Vec::new();
+        let mut put = |id, value| records.push((id, value));
+        put(d::controller(d::C_COMPENSATE_RESONATORS), 1.0);
+        for c in 0..2 {
+            put(d::CH_TUNING + c, c as f32);
+            put(d::CH_SPEAKER_TYPE + c, c as f32);
+        }
+        for ty in 0..2 {
+            let id = |k| d::model(d::MANAGER_ACCELERATION, ty, k);
+            put(id(d::M_USE_GENERIC_RDC), 1.0);
+            put(id(d::M_ENABLE_RES1), 1.0);
+            put(id(d::M_USE_GENERIC_RES1), 1.0);
+            put(id(d::M_ENABLE_RES2), 0.0);
+            put(id(d::M_ENABLE_LR2), 0.0);
+            put(id(d::M_CREEP), 0.0);
+            put(id(d::M_PASSIVE_RADIATOR), 0.0);
+            put(id(d::M_USE_COMPENSATION), 1.0);
+            put(id(d::M_RDC), 4.0);
+            put(id(d::M_BL), 0.7);
+            put(id(d::M_MMS_G), 0.3);
+            put(id(d::M_RMS), 0.2);
+            put(id(d::M_KMS), 1500.0);
+            put(id(d::M_DESIRED_RESONATOR_HZ), 300.0);
+            put(id(d::M_DESIRED_RESONATOR_Q), 0.8);
+            put(id(d::M_MAX_DC_BOOST_DB), 12.0);
+            put(id(d::M_MAX_RESONANCE_CUT_DB), 12.0);
+        }
+        companion::Companion {
+            gates: companion::LEGACY_ESTIMATOR,
+            channels: 2,
+            lsm2_records: records,
+            lsid_records: vec![(0, 0.0)],
+            topology: None,
+            flow: Vec::new(),
+            property_64004: 0,
+            flow_roles: [[0; 2]; 6],
+            systems: [0; MAX_CHANNELS],
+        }
+    }
+
+    #[test]
+    fn compensation_is_type_a_and_precedes_the_controller() {
+        let p = params();
+        let companion = compensation_companion();
+        let specs = compensation_specs(&p, Some(&companion)).unwrap();
+        assert!(specs[0].is_some());
+        assert!(specs[1].is_none(), "type-B UseCompensation is inert");
+        let mut unsupported = companion.clone();
+        unsupported
+            .lsm2_records
+            .iter_mut()
+            .find(|r| r.0 == ids::model(ids::MANAGER_ACCELERATION, 0, ids::M_ENABLE_RES2))
+            .unwrap()
+            .1 = 1.0;
+        assert!(matches!(
+            compensation_specs(&p, Some(&unsupported)),
+            Err(InitError::Unsupported("compensated acceleration model outside the single-resonator path"))
+        ));
+
+        let mut plain = Unit::new(p);
+        let mut compensated = Unit::new(p);
+        compensated.compensation = specs;
+        compensated.run =
+            Run::new(&p, compensated.geometry_lookahead_ms, &compensated.telemetry_ambient, &compensated.compensation)
+                .ok();
+        let input: Vec<f32> =
+            (0..1024).map(|i| libm::sinf(2.0 * core::f32::consts::PI * 300.0 * i as f32 / 48_000.0) * 0.01).collect();
+        let ins: [&[f32]; 2] = [&input, &input];
+        let mut po = [vec![0.0f32; 1024], vec![0.0f32; 1024]];
+        let mut co = [vec![0.0f32; 1024], vec![0.0f32; 1024]];
+        let mut pout: Vec<_> = po.iter_mut().map(Vec::as_mut_slice).collect();
+        let mut cout: Vec<_> = co.iter_mut().map(Vec::as_mut_slice).collect();
+        assert_eq!(plain.process(Io { frames: 1024, input: &ins, sense: &[], output: &mut pout }), Health::OK);
+        assert_eq!(compensated.process(Io { frames: 1024, input: &ins, sense: &[], output: &mut cout }), Health::OK);
+        drop(pout);
+        drop(cout);
+        assert_ne!(po[0].iter().map(|v| v.to_bits()).collect::<Vec<_>>(), co[0].iter().map(|v| v.to_bits()).collect());
+        assert_eq!(po[1].iter().map(|v| v.to_bits()).collect::<Vec<_>>(), co[1].iter().map(|v| v.to_bits()).collect());
     }
 
     #[test]

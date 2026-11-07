@@ -76,7 +76,7 @@ REASONS = [
     ("is soloed", "mstk-interim-solo-refused"),
     ("upward or expanding branch", "mstk-interim-upward-expander-refused"),
     ("unimplemented boxes or graph parameters", "chain-stub-or-unwired-refused"),
-    ("CompensateResonators", "spp3-CompensateResonators-refused"),
+    ("CompensateResonators", "lsm2-CompensateResonators-refused"),
     ("UseFastPeakSampleControl", "spp3-UseFastPeakSampleControl-refused"),
     ("saturation flavor", "mstk-saturation-flavor-refused"),
     ("saved controls are invalid", "mstk-saved-controls-refused"),
