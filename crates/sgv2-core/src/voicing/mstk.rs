@@ -987,15 +987,11 @@ fn detector_factors(p: &Params) -> [usize; BANDS] {
     // The embedded compressor, including its window and release state, runs
     // at fs / N; its gain vector is sent through the separate causal outer
     // SRC above.
-    let mut factor = match cadence(p) {
+    match cadence(p) {
         Cadence::Pick => [1, 2, 4, 4],
         Cadence::PickEight => [8; BANDS],
         Cadence::AnalyticPick => [8; BANDS],
-    };
-    if p.overshoot_compensation && cadence(p) != Cadence::AnalyticPick {
-        factor[0] = factor[0].max(2);
     }
-    factor
 }
 
 /// Algorithm zero reduces band zero until the first image reaches the
@@ -1986,7 +1982,7 @@ mod tests {
         let run = Run::new(&p, 48_000.0, 1);
         assert_eq!(run.phase_path.map(|path| path.count), [1, 2, 2, 1]);
         assert_eq!(run.phase_band_zero_factor, 2);
-        assert_eq!(run.detector_factor[0], 2);
+        assert_eq!(run.detector_factor[0], 1);
         let order = 4.0; // band 1 uses floor(order of its upper edge 4.5)
         let expected = phase_peak(order, p.crossover_hz[0] / phase_edge_ratio(order), 48_000.0);
         let got = run.phase_path[1].section[0];
