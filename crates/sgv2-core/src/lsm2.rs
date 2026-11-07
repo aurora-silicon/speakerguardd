@@ -1731,7 +1731,7 @@ impl Chan {
             qm = self.br_mg.step(qm, pq);
             if raw_k >= discard {
                 let k = raw_k - discard;
-                base[k] = amb + bv + bm;
+                base[k] = amb + (bv + bm);
                 lin[k] = lv + lm;
                 quad[k] = qv + qm;
             }
@@ -3026,7 +3026,7 @@ impl ProtectionUnit for Unit {
             c.tp_vc = (s[6] * ev) as f32;
             c.tp_mg = (s[7] * em) as f32;
             // the input model's buffer holds the cooled temperature
-            c.tring = [c.ambient as f32 + c.tp_vc + c.tp_mg; TRING];
+            c.tring = [c.ambient as f32 + (c.tp_vc + c.tp_mg); TRING];
             for j in 0..4 {
                 let v = run.idle + (s[2 + j] - run.idle) * libm::pow(run.p_pole[j], substeps);
                 c.pbar[j] = v;
