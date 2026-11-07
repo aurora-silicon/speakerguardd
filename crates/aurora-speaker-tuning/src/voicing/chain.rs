@@ -77,7 +77,7 @@ fn tone(
     if tone.dynamic.iter().any(|d| d.params.kind == sgv2_core::prestage::DynamicKind::Notch) {
         gaps.push((
             stage.name.clone(),
-            "type-15 filters carry native multirate reconstruction and the settled-idle carrier; active/tail parity is pending"
+            "level-dependent filters carry native multirate reconstruction and a knee-qualified release-to-idle carrier handoff; active-floor and release-tracking parity are pending"
                 .into(),
         ));
     }
