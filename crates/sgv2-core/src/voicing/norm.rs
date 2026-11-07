@@ -72,12 +72,15 @@
 //! detector, meters and gain law with these differences:
 //! - the detector smoothing time is the saved transient response, not the
 //!   fixed 30 ms;
-//! - a reset starts every meter silent: the detector power, the median ring,
-//!   the long reading and its delay line, the fast level and the held
-//!   candidate all start at the histogram floor, so the first call is read
-//!   from the program alone (the long histogram's relative gate still starts
-//!   from the expected loudness); there is no deferred second clear of the
-//!   detector state;
+//! - a reset starts every meter silent: the median ring, the long reading
+//!   and its delay line, the fast level and the held candidate all start at
+//!   the histogram floor, so the first call is read from the program alone
+//!   (the long histogram's relative gate starts from the same -70 dB seed as
+//!   the other algorithms, not from the expected loudness: a gate seeded at
+//!   an expected loudness of -14 lifts the second pause's long reading
+//!   above the unit's); the smoothed detector power starts from a small fixed floor
+//!   (`V1_DETECTOR_SEED_DB`) that fades with the detector's own time
+//!   constant; there is no deferred second clear of the detector state;
 //! - the applied gain starts its glide from `V1_START_GAIN_DB`;
 //! - the fast level is a two-sided hysteresis on every 64-frame level, less
 //!   a 4 dB store: it rises only when the stored level clears it by 3 dB and
@@ -87,6 +90,14 @@
 //!   there is no low-level coordinate move;
 //! - the candidate and the gain's target are read on every 64-frame step,
 //!   so the gain moves within a call instead of at its boundary;
+//! - the long path's preconditioner competes against the fast level (the
+//!   hysteresis output of this step), not against the 512-frame level: it
+//!   follows the long reading while the fast level is above it and, once
+//!   the reading overtakes the fast level, holds the smaller of the reading
+//!   and the fast level it overtook. So in a pause the long path keeps the
+//!   reading that lands while the fast level is still releasing, and a
+//!   following burst whose fast level stays under a newer reading keeps
+//!   that hold;
 //! - an invalid long window still ages the histogram.
 //!
 //! No tuning value lives here; `aurora-speaker-tuning`'s `voicing::norm`
@@ -388,9 +399,18 @@ const V1_FAST_RISE_DB: f64 = 3.0;
 const V1_FAST_FALL_DB: f64 = 8.0;
 const V1_MEDIAN_STORE_DB: f64 = LOUDNESS_OFFSET - 1.0;
 const V1_SILENT_DB: f64 = BIN_LO_DB;
-/// Algorithm 1: where the applied gain starts its glide after a reset, dB
-/// (measured on the installed unit: the same on every algorithm-1 state).
+/// Algorithm 1: where the applied gain starts its glide after a reset, dB.
+/// Measured on the installed unit sample by sample (the 200 Hz glide's own
+/// pole fits frames 3..39 of a 1 kHz onset to 24.0195..24.0187 dB, the same
+/// on every algorithm-1 state); it is not the parameter default of 24 dB.
 const V1_START_GAIN_DB: f64 = 24.0195;
+/// Algorithm 1: the smoothed detector power after a reset, dB (power
+/// `10^(dB / 10)`). Measured on the installed unit through the fast path's
+/// +3 dB rise test: onsets whose rise margin is a few thousandths of a dB
+/// resolve as the unit does only for a start between -53.5 and -51.5 dB
+/// (a 40 Hz onset at -12 dBFS does not rise where the same onset at 0 and
+/// -6 dBFS does, which no scale-free law explains).
+const V1_DETECTOR_SEED_DB: f64 = -52.5;
 const COMPETITOR_STORE_DB: f64 = -2.0;
 /// The median path: the true median of this many 512-frame levels (an odd
 /// count, read at its middle sorted index). Measured on the unit: after a
@@ -729,15 +749,14 @@ impl Run {
         }
     }
 
-    /// Algorithm 1 starts every meter silent; only the long histogram's
-    /// relative gate starts from the expected loudness.
+    /// Algorithm 1 starts every meter silent; the long histogram's relative
+    /// gate keeps the common seed and the detector power its own floor.
     fn reset_algorithm1(&mut self) {
         let s = V1_SILENT_DB;
-        self.ema = 0.0;
+        self.ema = libm::pow(10.0, V1_DETECTOR_SEED_DB / 10.0);
         self.window.reset(0.0);
         self.median.reset(s);
         self.long.reset(s);
-        self.long.gate_energy = power_of(self.p.expected_db);
         self.long.age_invalid = true;
         self.long_line = [s; LONG_DELAY];
         self.long_out = s;
@@ -811,7 +830,8 @@ impl Run {
     }
 
     /// Algorithm 1, every 64-frame step: the fast hysteresis, the held
-    /// candidate on a 512-frame event, and the gain's target.
+    /// candidate on a 512-frame event (the long path conditioned against
+    /// the fast level), and the gain's target.
     fn arbitrate_step(&mut self, db: f64) {
         let fast = db + V1_FAST_STORE_DB;
         if fast > self.fast + V1_FAST_RISE_DB {
@@ -819,8 +839,10 @@ impl Run {
         } else if fast + V1_FAST_FALL_DB < self.fast {
             self.fast = fast + V1_FAST_FALL_DB;
         }
-        if let Some((db, mid, long)) = self.pending.take() {
-            let long = self.pre.update(db, long);
+        if let Some((_, mid, long)) = self.pending.take() {
+            // the long path competes against the fast level, not the
+            // 512-frame level
+            let long = self.pre.update(self.fast, long);
             self.held = mid.max(long);
         }
         self.candidate = self.held.max(self.fast);
@@ -994,6 +1016,7 @@ mod tests {
         let mut r = Run::new(&p, 48_000.0, 1);
         assert_eq!(r.candidate, V1_SILENT_DB);
         assert!((r.gain_db() - V1_START_GAIN_DB).abs() < 1e-9);
+        assert!((level(r.ema) - V1_DETECTOR_SEED_DB).abs() < 1e-9);
         assert!(!r.clear_due);
         r.fast = -20.0;
         r.arbitrate_step(-14.0); // stored -18 is inside +3 dB
@@ -1005,6 +1028,33 @@ mod tests {
         // the target follows the step, not the call boundary
         assert_eq!(r.candidate, -26.0);
         assert!((r.target_db - p.gain_db(-26.0)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn algorithm1_conditions_the_long_path_against_the_fast_level() {
+        let p = Params { algorithm1: true, detector_ema_s: 0.040, ..params(0) };
+        let mut r = Run::new(&p, 48_000.0, 1);
+        // a reading under the held fast level passes, though the 512-frame
+        // level is far under it
+        r.fast = -12.0;
+        r.pending = Some((-40.0, V1_SILENT_DB, -20.0));
+        r.arbitrate_step(-8.0);
+        assert_eq!(r.held, -20.0);
+        r.pending = Some((-60.0, V1_SILENT_DB, -18.0));
+        r.arbitrate_step(-8.0);
+        assert_eq!(r.held, -18.0);
+        // the fast level releases under the next reading: hold that reading
+        // (the smaller of it and the fast level it overtook), not the level
+        // the 512-frame path fell to
+        r.pending = Some((-60.0, V1_SILENT_DB, -17.0));
+        r.arbitrate_step(-30.0);
+        assert_eq!(r.fast, -26.0);
+        assert_eq!(r.held, -17.0);
+        // a burst whose fast level stays under a newer reading keeps the hold
+        r.pending = Some((-5.0, V1_SILENT_DB, -15.0));
+        r.arbitrate_step(-22.0);
+        assert_eq!(r.fast, -26.0);
+        assert_eq!(r.held, -17.0);
     }
 
     #[test]
