@@ -15,10 +15,9 @@
 //! per-bin gains (immediate attack, saved release) scale the square-root Hann
 //! analysis spectrum before overlap-add. A separate detector transforms a
 //! `latency + 128` frame sliding history through a unit-energy Hann. It
-//! applies the saved pressure response to the velocity-filtered LF lane and
-//! the saved tweeter response to HF, reduces their summed magnitudes on the
-//! unit's 99-band grid, and smooths the resulting linked mask level. The LF
-//! mask and velocity detector share the current velocity-filter output.
+//! applies the saved tweeter-response magnitude, reduces squared magnitudes
+//! on the unit's 99-band grid, and smooths the resulting linked mask level.
+//! The velocity detector independently reads current LF.
 //!
 //! The optional `lowflow-conservative` compile feature is deliberately not an
 //! exact-law claim. It applies a fixed ceiling 6 dB below the saved
@@ -625,10 +624,7 @@ impl MaskDetector {
             let phase = -2.0 * core::f64::consts::PI * i as f64 / n as f64;
             *value = Complex { re: libm::cos(phase), im: libm::sin(phase) };
         }
-        // LF is already scaled by AnalogGain and passed through the velocity
-        // cascade before it reaches this detector. The response constructor
-        // therefore applies no second input gain (unlike the HF response).
-        let pressure_magnitude = response_magnitude(&model.pressure_response, n, 1.0, &twiddles);
+        let pressure_magnitude = response_magnitude(&model.pressure_response, n, model.analog_gain, &twiddles);
         let tweeter_magnitude = response_magnitude(&model.tweeter_response, n, model.tweeter_gain, &twiddles);
         let boundaries = mask_boundaries(n);
         let lower_hz = |band: usize| {
@@ -1311,8 +1307,8 @@ impl Run {
                     let tweeter_sample =
                         if c + self.models < channels { finite(bufs[c + self.models][frame]) } else { 0.0 };
                     let state = &mut self.state[c];
+                    state.mask.push(0.0, tweeter_sample);
                     let velocity = f64::from(state.velocity.run(woofer_sample));
-                    state.mask.push(velocity as f32, tweeter_sample);
                     state.velocity_block_energy += velocity * velocity;
                     state.velocity_block_frames += 1;
                     // The physical detector reports the largest 8-frame RMS
@@ -1697,22 +1693,6 @@ mod tests {
         assert!(run.state[0].mask.db > 0.0);
         assert!(run.state[0].mask_output_db > 0.0);
         assert!(b[2].iter().all(|value| *value == 0.0));
-    }
-
-    #[cfg(not(feature = "lowflow-conservative"))]
-    #[test]
-    fn mask_low_lane_is_the_current_velocity_filter_output() {
-        let p = synthetic();
-        let mut expected_filter = VelocityCascade::new(&p.models[0]);
-        let expected = expected_filter.run(0.7);
-        let mut run = Run::new(&p, 48_000.0, 4);
-        let mut b = [vec![0.7], vec![0.0], vec![0.0], vec![0.0]];
-        let mut refs: Vec<&mut [f32]> = b.iter_mut().map(Vec::as_mut_slice).collect();
-        run.process(&mut refs, 1);
-        let detector = &run.state[0].mask;
-        assert_eq!(detector.low_history[detector.n - SPECTRAL_HOP], f64::from(expected));
-        assert!((detector.pressure_magnitude[0] - 1.0).abs() < 1.0e-12);
-        assert!((detector.tweeter_magnitude[0] - 0.16).abs() < 1.0e-12);
     }
 
     #[cfg(not(feature = "lowflow-conservative"))]
