@@ -24,7 +24,11 @@
 //!   dead band under it;
 //! - long: a 1001-bin histogram of 4096-frame window levels over -100..0 in
 //!   0.1 dB bins, read as the power mean of the bins above a relative gate
-//!   that trails the histogram's own smoothed energy. Every admitted window
+//!   that trails the histogram's own smoothed energy (a fixed one-second
+//!   smoothing). A level's bin is the one below the nearest point of the
+//!   unit's 10.01-per-dB index grid, for every use of the index (the
+//!   window's count, the reset seed, the gate and the history pivot), while
+//!   each bin still represents its own 0.1 dB step. Every admitted window
 //!   fades all counts by a factor whose time constant shortens as the counts
 //!   lean below the reading, so the history spans seconds, not the whole
 //!   program. A reset clears it and seeds the eleven bins around the
@@ -32,8 +36,8 @@
 //!   A window below the validity floor still emits one slot containing the
 //!   retained reading; the following hold does not skip or reset that slot.
 //! - the long reading reaches the arbitration `LONG_DELAY` long windows
-//!   and one 512-frame block after the window that produced it (the reset
-//!   reading fills the gap);
+//!   after the window that produced it, on that window boundary's own
+//!   512-frame event (the reset reading fills the gap);
 //! - the long reading passes a preconditioner against the 512-frame level
 //!   (less its own store): it follows the reading while that level is above
 //!   it and, once the reading overtakes it, holds the level it overtook.
@@ -197,9 +201,11 @@ fn power_of(l: f64) -> f64 {
     libm::pow(10.0, (l - LOUDNESS_OFFSET) / 10.0)
 }
 
+/// The histogram bin of loudness `l`: one below the nearest point of the
+/// 10.01-per-dB index grid, clamped to the histogram.
 fn bin_of(l: f64) -> usize {
     let b = libm::round((l - BIN_LO_DB).max(0.0) * 10.01);
-    (b as usize).min(BINS - 1)
+    ((b as usize).saturating_sub(1)).min(BINS - 1)
 }
 
 /// `exp(-1 / (tau * rate))` in single precision, as the unit forms it.
@@ -218,7 +224,7 @@ const GATE_DB: f64 = 20.0;
 /// History and gate time constants, s. A balanced histogram (or one
 /// weighted above its reading) keeps `HIST_LONG_S` of history; one weighted
 /// `IMBALANCE_DB` or more below its reading keeps `HIST_SHORT_S`. The gate's
-/// smoothing runs from `GATE_S` to twice that on the same measure.
+/// smoothing is `GATE_S` whatever the balance.
 const HIST_LONG_S: f32 = 5.0;
 const HIST_SHORT_S: f32 = 2.0;
 const GATE_S: f32 = 1.0;
@@ -285,7 +291,6 @@ impl LongTerm {
         let below = (self.hist[..pivot].iter().sum::<f64>() + 1e-20) as f32;
         let lean = 20.0 * libm::log10f(libm::fabsf(above / below) + 1e-6) / -IMBALANCE_DB;
         let x2 = lean.clamp(0.0, 1.0) * lean.clamp(0.0, 1.0);
-        self.gate_a = pole(GATE_S * (1.0 + x2), self.rate);
         let fade = f64::from(pole(HIST_LONG_S - (HIST_LONG_S - HIST_SHORT_S) * x2, self.rate));
         self.hist.iter_mut().for_each(|h| *h *= fade);
         self.reading
@@ -310,11 +315,12 @@ const MEDIAN_AT: usize = 48;
 /// the histogram every eight blocks.
 const WINDOW_LEN: usize = 600;
 /// Long windows between a histogram reading and the arbitration that
-/// first sees it; the reading then joins on the block after that window's
-/// boundary. Measured on the installed unit (its long-path steps land this
-/// many 4096-frame windows and one 512-frame block after a reading is
-/// formed); not yet attributed to a stage of the unit.
-const LONG_DELAY: usize = 2;
+/// first sees it, on that later window boundary's own 512-frame event.
+/// Measured on the installed unit's audio (its long-path steps land exactly
+/// this many 4096-frame windows after a reading is formed; the unit's
+/// momentary-gain report trails its audio by one call); not yet attributed
+/// to a stage of the unit.
+const LONG_DELAY: usize = 3;
 /// Release dead band of the median path, dB, and its time constant, s.
 const MID_DEADBAND_DB: f64 = 5.0;
 const MID_RELEASE_S: f32 = 2.316;
@@ -602,21 +608,21 @@ impl Run {
     /// paths. Every stage takes its first input, so the paths sample frames
     /// 0, 64, ...; 0, 512, ...; 0, 4096, ... of the stream. The long path
     /// reads the window before the current power joins it, and its reading
-    /// joins the 512-frame events `LONG_DELAY` windows and one block later.
+    /// joins the 512-frame event on the boundary `LONG_DELAY` windows later.
     fn on_step(&mut self) {
         let ema = self.ema;
         let db = level(ema);
         self.peak = self.peak.max(db);
         self.events += 1;
-        // the 512-frame event on a long window's own boundary still pairs
-        // with the reading from before it
-        let long = self.long_out;
         if self.steps == 0 && self.blocks == 0 {
             self.window.resum();
             let reading = self.long.update(self.window.mean());
             self.long_out = core::mem::replace(&mut self.long_line[self.long_at], reading);
             self.long_at = (self.long_at + 1) % LONG_DELAY;
         }
+        // the 512-frame event on a long window's own boundary pairs with the
+        // reading that reaches the arbitration there
+        let long = self.long_out;
         self.window.push(ema);
         if self.steps == 0 {
             // the median's first level is the block at frame 512; the one at
@@ -876,6 +882,20 @@ mod tests {
     }
 
     #[test]
+    fn a_level_counts_one_bin_below_the_nearest_index_grid_point() {
+        // -20 sits at grid point 800.8 -> 801, so it counts in bin 800
+        assert_eq!(bin_of(-20.0), 800);
+        // the clamps: the floor of the scale and anything loud
+        assert_eq!(bin_of(-100.0), 0);
+        assert_eq!(bin_of(-150.0), 0);
+        assert_eq!(bin_of(0.0), BINS - 1);
+        assert_eq!(bin_of(6.0), BINS - 1);
+        // each bin still represents its own 0.1 dB step
+        let m = LongTerm::new(11.0);
+        assert!((loudness(m.energy[800]) + 20.0).abs() < 1e-9);
+    }
+
+    #[test]
     fn the_median_starts_at_the_second_block() {
         let p = params(0);
         let mut r = Run::new(&p, 48_000.0, 1);
@@ -890,7 +910,7 @@ mod tests {
     }
 
     #[test]
-    fn the_long_reading_reaches_the_arbitration_two_windows_and_a_block_late() {
+    fn the_long_reading_reaches_the_arbitration_three_windows_late() {
         let p = params(0);
         let mut r = Run::new(&p, 48_000.0, 1);
         let mut readings = vec![];
