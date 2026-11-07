@@ -546,12 +546,7 @@ fn half_synthesis_paths(p: &Params, fs: f64, half: &[HalfStage; XOVERS]) -> [Pat
                     append_half(path, item, false);
                 } else if stage > band {
                     let mut allpass = Path::EMPTY;
-                    push_lr_allpass(
-                        &mut allpass,
-                        effective_order(p.crossover_order[stage]),
-                        p.crossover_hz[stage],
-                        fs,
-                    );
+                    push_lr_allpass(&mut allpass, effective_order(p.crossover_order[stage]), p.crossover_hz[stage], fs);
                     append_path(path, &allpass);
                 }
             }
@@ -559,12 +554,8 @@ fn half_synthesis_paths(p: &Params, fs: f64, half: &[HalfStage; XOVERS]) -> [Pat
         return out;
     }
 
-    let tree: [&[(usize, bool)]; BANDS] = [
-        &[(1, false), (0, false)],
-        &[(1, false), (0, true)],
-        &[(1, true), (2, false)],
-        &[(1, true), (2, true)],
-    ];
+    let tree: [&[(usize, bool)]; BANDS] =
+        [&[(1, false), (0, false)], &[(1, false), (0, true)], &[(1, true), (2, false)], &[(1, true), (2, true)]];
     let passing = [2, 2, 0, 0];
     for (band, path) in out.iter_mut().enumerate() {
         for &(stage, high) in tree[band] {
@@ -572,12 +563,7 @@ fn half_synthesis_paths(p: &Params, fs: f64, half: &[HalfStage; XOVERS]) -> [Pat
         }
         let stage = passing[band];
         let mut allpass = Path::EMPTY;
-        push_lr_allpass(
-            &mut allpass,
-            effective_order(p.crossover_order[stage]),
-            p.crossover_hz[stage],
-            fs,
-        );
+        push_lr_allpass(&mut allpass, effective_order(p.crossover_order[stage]), p.crossover_hz[stage], fs);
         append_path(path, &allpass);
     }
     out
@@ -628,12 +614,12 @@ fn phase_peak(order: f64, frequency: f64, fs: f64) -> Section {
 fn phase_paths(p: &Params, fs: f64, band_zero_rate: f64) -> [Path; BANDS] {
     let mut out = [Path::EMPTY; BANDS];
     for edge in 0..XOVERS {
-        let order = effective_order(p.crossover_order[edge]) as f64;
-        let shape = phase_shape(order);
+        let below = libm::floor(p.crossover_order[edge]).clamp(2.0, 20.0);
+        let above = effective_order(p.crossover_order[edge]) as f64;
         let frequency = p.crossover_hz[edge];
         let lower_rate = if edge == 0 { band_zero_rate } else { fs };
-        out[edge].push(phase_peak(order, frequency * shape, lower_rate));
-        out[edge + 1].push(phase_peak(order, frequency / shape, fs));
+        out[edge].push(phase_peak(below, frequency * phase_shape(below), lower_rate));
+        out[edge + 1].push(phase_peak(above, frequency / phase_shape(above), fs));
     }
     out
 }
@@ -1046,11 +1032,15 @@ fn detector_factors(p: &Params) -> [usize; BANDS] {
     // The embedded compressor, including its window and release state, runs
     // at fs / N; its gain vector is sent through the separate causal outer
     // SRC above.
-    match cadence(p) {
+    let mut factor = match cadence(p) {
         Cadence::Pick => [1, 2, 4, 4],
         Cadence::PickEight => [8; BANDS],
         Cadence::HopPeak => [8; BANDS],
+    };
+    if p.overshoot_compensation && (p.algorithm >= 3 || p.render_quality >= 2) {
+        factor[0] = factor[0].max(2);
     }
+    factor
 }
 
 /// Algorithm zero reduces band zero until the first image reaches the
@@ -1504,7 +1494,7 @@ impl Run {
                     )
                 } else {
                     let phase = Self::run_detector_path(&phase, &mut self.phase_band_state[c][b], v);
-                    self.phase_band_quadrature[c][b].push(phase)
+                    phase.abs()
                 };
                 overshoot[b] = (phase_magnitude * scale) as f32 as f64;
             }
@@ -1691,11 +1681,7 @@ impl Run {
                     };
                 }
                 let mut y = if self.hop_peak {
-                    Self::half_synthesize(
-                        &self.half_synthesis_path,
-                        &mut self.half_synthesis_state[c],
-                        processed,
-                    )
+                    Self::half_synthesize(&self.half_synthesis_path, &mut self.half_synthesis_state[c], processed)
                 } else if self.legacy_recombination {
                     self.legacy_recombine(c, processed)
                 } else {
@@ -2029,6 +2015,22 @@ mod tests {
         p.render_quality = 2;
         let run = Run::new(&p, 48_000.0, 1);
         assert_eq!(run.phase_band_zero_factor, 2);
+        assert_eq!(run.detector_factor[0], 2);
+
+        p.crossover_order[0] = 3.0;
+        let run = Run::new(&p, 48_000.0, 1);
+        let below = phase_peak(3.0, p.crossover_hz[0] * phase_shape(3.0), 24_000.0);
+        let above = phase_peak(4.0, p.crossover_hz[0] / phase_shape(4.0), 48_000.0);
+        let got_below = run.phase_path[0].section[0];
+        let got_above = run.phase_path[1].section[0];
+        assert_eq!(
+            [got_below.b0, got_below.b1, got_below.b2, got_below.a1, got_below.a2],
+            [below.b0, below.b1, below.b2, below.a1, below.a2]
+        );
+        assert_eq!(
+            [got_above.b0, got_above.b1, got_above.b2, got_above.a1, got_above.a2],
+            [above.b0, above.b1, above.b2, above.a1, above.a2]
+        );
     }
 
     #[test]
