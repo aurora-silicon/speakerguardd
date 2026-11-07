@@ -429,7 +429,7 @@ impl Params {
             return None;
         }
         let order = |v: f64| -> Option<usize> {
-            (v >= 2.0 && v <= 20.0 && libm::trunc(v) == v && (v as usize) % 2 == 0).then_some(v as usize)
+            ((2.0..=20.0).contains(&v) && libm::trunc(v) == v && (v as usize) % 2 == 0).then_some(v as usize)
         };
         let corner = |v: f64| (v > 0.0 && v < 20_000.0).then_some(v);
         let gain = |v: f64| (0.0..=100.0).contains(&v).then_some(v);
