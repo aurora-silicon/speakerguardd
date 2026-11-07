@@ -459,9 +459,10 @@ fn chebyshev_reference() -> [f32; WINDOW_REFERENCE] {
     }
     let mut ordered = [0.0f64; WINDOW_REFERENCE];
     let half = m / 2;
-    for i in 0..half {
-        ordered[i] = dft[half - i];
-        ordered[half + i] = dft[i + 1];
+    let (left, right) = ordered.split_at_mut(half);
+    for (i, (left_slot, right_slot)) in left.iter_mut().zip(right.iter_mut()).enumerate() {
+        *left_slot = dft[half - i];
+        *right_slot = dft[i + 1];
     }
     let peak = ordered.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     let mut window = [0.0f32; WINDOW_REFERENCE];
@@ -508,11 +509,11 @@ fn saturation_fir(mode: u32, fs: f64) -> [f32; FIR_TAPS] {
     let a = ratio / OVERSAMPLE as f64;
     let window = saturation_window();
     let mut h = [0.0f32; FIR_TAPS];
-    for (i, v) in h.iter_mut().enumerate() {
+    for ((i, v), &win) in h.iter_mut().enumerate().zip(window.iter()) {
         let z = a * (i as f64 - FIR_HALF_BASE as f64 * OVERSAMPLE as f64);
         let sinc =
             if libm::fabs(z) < 1e-6 { 1.0 } else { libm::sin(core::f64::consts::PI * z) / (core::f64::consts::PI * z) };
-        *v = (f64::from(window[i]) * sinc) as f32;
+        *v = (f64::from(win) * sinc) as f32;
     }
     let sum: f64 = h.iter().map(|&v| f64::from(v)).sum();
     let scale = (1.0 / sum) as f32;
