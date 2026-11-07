@@ -633,6 +633,14 @@ pub struct Run {
     lp_sign: f64,
     harm_sign: f64,
     lc: LevelControl,
+    /// An odd lower Butterworth half puts the nonlinear device one selected
+    /// frame behind the input follower.  The output follower sees that
+    /// delayed branch, but its restoration numerator is the current input
+    /// level.  The blend branch carries the same frame of delay.
+    lc_odd_delay: bool,
+    lc_lo_delay: f64,
+    lc_p_in_delay: f64,
+    lc_low_delay: f64,
     compressor: HarmonicCompressor,
     stride: usize,
     /// Selected-rate delay: one sub-rate frame per odd band-edge section.
@@ -667,6 +675,7 @@ impl Run {
         band_hp.extend(&butterworth(nu, p.fu_hz, fs8, Kind::Low));
         let band_lp = butterworth(nu, p.fu_hz, fs8, Kind::Low);
         let latency = nu % 2 + nl % 2;
+        let lc_odd_delay = p.level_control && nl % 2 == 1;
         Run {
             p: p.clone(),
             fs,
@@ -684,11 +693,15 @@ impl Run {
             lp_sign: if nh % 2 == 1 { -1.0 } else { 1.0 },
             harm_sign: if nh % 2 == nl % 2 { 1.0 } else { -1.0 },
             lc: LevelControl::new(fs8),
+            lc_odd_delay,
+            lc_lo_delay: 0.0,
+            lc_p_in_delay: law::LC_SEED,
+            lc_low_delay: 0.0,
             compressor: HarmonicCompressor::new(fs8, p.compressor_threshold_db, p.compressor_ratio),
             stride,
             sline: [0.0; SUB_LINE],
             spos: 0,
-            sdelay: latency,
+            sdelay: latency - usize::from(lc_odd_delay),
             phase: 0,
             recon: elliptic(law::RECON_ORDER, law::RECON_RIPPLE_DB, law::RECON_STOP_DB, law::RECON_EDGE_HZ, fs),
             recon_st: CascadeState::default(),
@@ -707,6 +720,9 @@ impl Run {
         self.band_hp_st = CascadeState::default();
         self.band_lp_st = CascadeState::default();
         self.lc = LevelControl::new(self.fs / self.stride as f64);
+        self.lc_lo_delay = 0.0;
+        self.lc_p_in_delay = law::LC_SEED;
+        self.lc_low_delay = 0.0;
         self.compressor = HarmonicCompressor::new(
             self.fs / self.stride as f64,
             self.p.compressor_threshold_db,
@@ -757,10 +773,18 @@ impl Run {
     /// One selected-rate frame of both mid branches.
     #[inline]
     fn sub_frame(&mut self, lo: f64) -> f64 {
-        let low = self.lp_sign * self.p.blend_gain * self.ap.run(&mut self.ap_st, lo);
+        let low_now = self.lp_sign * self.p.blend_gain * self.ap.run(&mut self.ap_st, lo);
         let harm = if self.p.level_control {
             let p_in = self.lc.input.run(lo);
-            let z = (lo / p_in.max(law::LC_FLOOR)).clamp(-law::LC_CLIP, law::LC_CLIP);
+            let (device_lo, device_p_in) = if self.lc_odd_delay {
+                let delayed = (self.lc_lo_delay, self.lc_p_in_delay);
+                self.lc_lo_delay = lo;
+                self.lc_p_in_delay = p_in;
+                delayed
+            } else {
+                (lo, p_in)
+            };
+            let z = (device_lo / device_p_in.max(law::LC_FLOOR)).clamp(-law::LC_CLIP, law::LC_CLIP);
             let dev = self.device(z);
             let hp = self.band_hp.run(&mut self.band_hp_st, dev);
             let p_out = self.lc.output.run(hp);
@@ -775,6 +799,13 @@ impl Run {
         let harmonic_gain = self.p.harmonic_gain;
         let harm = self.compress_harmonic(harmonic_gain * harm);
         let harm = self.band_lp.run(&mut self.band_lp_st, harm);
+        let low = if self.lc_odd_delay {
+            let delayed = self.lc_low_delay;
+            self.lc_low_delay = low_now;
+            delayed
+        } else {
+            low_now
+        };
         let v = low + self.harm_sign * harm;
         if self.sdelay == 0 {
             return v;
@@ -979,6 +1010,32 @@ mod tests {
             f.run(0.0);
         }
         assert!(f.run(0.0) < 0.2 * top);
+    }
+
+    #[test]
+    fn odd_lower_edge_moves_the_level_control_delay_ahead_of_the_device() {
+        let mut r = Run::new(&params(true), 48_000.0, 2);
+        assert!(r.lc_odd_delay);
+        assert_eq!(r.latency(), 1);
+        assert_eq!(r.sdelay, 0);
+
+        // Frame zero updates the input follower, but the device and blend
+        // consume their retained frame.  Restoration will use this frame's
+        // input level when the delayed device output reaches it.
+        assert_eq!(r.sub_frame(0.5), 0.0);
+        assert_eq!(r.lc_lo_delay, 0.5);
+        assert!(r.lc_p_in_delay > law::LC_SEED);
+        assert_ne!(r.lc_low_delay, 0.0);
+
+        let off = Run::new(&params(false), 48_000.0, 2);
+        assert!(!off.lc_odd_delay);
+        assert_eq!(off.sdelay, off.latency());
+
+        let mut even = params(true);
+        even.lower_order = 4;
+        let even = Run::new(&even, 48_000.0, 2);
+        assert!(!even.lc_odd_delay);
+        assert_eq!(even.sdelay, even.latency());
     }
 
     fn gain_db(c: &Cascade, f: f64, fs: f64) -> f64 {
