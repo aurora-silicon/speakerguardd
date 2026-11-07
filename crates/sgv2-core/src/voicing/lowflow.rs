@@ -15,9 +15,8 @@
 //! per-bin gains (immediate attack, saved release) scale the square-root Hann
 //! analysis spectrum before overlap-add. A separate detector transforms a
 //! `latency + 128` frame sliding history through a unit-energy Hann. It
-//! applies the saved LF pressure- and HF tweeter-response magnitudes, reduces
-//! their summed magnitude on the unit's 99-band grid, and smooths the
-//! resulting linked mask level.
+//! applies the saved tweeter-response magnitude, reduces squared magnitudes
+//! on the unit's 99-band grid, and smooths the resulting linked mask level.
 //! The velocity detector independently reads current LF.
 //!
 //! The optional `lowflow-conservative` compile feature is deliberately not an
@@ -396,7 +395,9 @@ impl VelocityCascade {
         let zero_b = (f64::from(numerator[1]) / f64::from(numerator[0])) as f32;
         let zero_c = (f64::from(numerator[2]) / f64::from(numerator[0])) as f32;
         let mut poles = factor_quartic(denominator);
-        poles.sort_by(|a, b| a.1.total_cmp(&b.1));
+        // The companion-matrix eigensolver returns the higher-frequency pair
+        // first; section ordering matters once each section rounds its state.
+        poles.sort_by(|a, b| b.1.total_cmp(&a.1));
         let gain = numerator[0] / denominator[0];
         let first = VelocityBiquad::from_analog([1.0, zero_b, zero_c, poles[0].0 as f32, poles[0].1 as f32]);
         let second = VelocityBiquad::from_analog([0.0, gain, 0.0, poles[1].0 as f32, poles[1].1 as f32]);
@@ -1306,7 +1307,7 @@ impl Run {
                     let tweeter_sample =
                         if c + self.models < channels { finite(bufs[c + self.models][frame]) } else { 0.0 };
                     let state = &mut self.state[c];
-                    state.mask.push(woofer_sample, tweeter_sample);
+                    state.mask.push(0.0, tweeter_sample);
                     let velocity = f64::from(state.velocity.run(woofer_sample));
                     state.velocity_block_energy += velocity * velocity;
                     state.velocity_block_frames += 1;
@@ -1692,19 +1693,6 @@ mod tests {
         assert!(run.state[0].mask.db > 0.0);
         assert!(run.state[0].mask_output_db > 0.0);
         assert!(b[2].iter().all(|value| *value == 0.0));
-    }
-
-    #[cfg(not(feature = "lowflow-conservative"))]
-    #[test]
-    fn mask_also_reads_the_pre_delay_low_lane() {
-        let p = synthetic();
-        let mut run = Run::new(&p, 48_000.0, 4);
-        let mut b = [vec![0.0; 128], vec![0.0; 128], vec![0.0; 128], vec![0.0; 128]];
-        b[0][64] = 0.7;
-        let mut refs: Vec<&mut [f32]> = b.iter_mut().map(Vec::as_mut_slice).collect();
-        run.process(&mut refs, 128);
-        assert!(run.state[0].mask.db > 0.0);
-        assert!(run.state[0].mask_output_db > 0.0);
     }
 
     #[cfg(not(feature = "lowflow-conservative"))]
