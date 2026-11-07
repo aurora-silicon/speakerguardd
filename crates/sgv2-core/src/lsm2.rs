@@ -1017,7 +1017,8 @@ fn vdsp_sve<const K: usize>(n: usize, mut next: impl FnMut() -> [f32; K]) -> [f3
     sum
 }
 
-#[cfg(test)]
+/// The thermal substep power total of a contiguous block (the monitor and
+/// input temperature models): the same `vDSP_sve` tree as the ceiling.
 fn vdsp_sve_slice(x: &[f32]) -> f32 {
     let mut i = 0;
     vdsp_sve(x.len(), || {
@@ -1025,14 +1026,6 @@ fn vdsp_sve_slice(x: &[f32]) -> f32 {
         i += 1;
         [v]
     })[0]
-}
-
-/// The monitor's substep power total: a left-to-right Float32 sum. The
-/// vDSP_sve tree here moved the long ceiling trajectories away from macOS
-/// (t3-a085 +0.023 C, t3-a10 +0.018 C on the arm64 rig), so only the
-/// ceiling predictor uses it.
-fn seq_sum(x: &[f32]) -> f32 {
-    x.iter().fold(0.0f32, |a, &v| a + v)
 }
 
 fn db_to_lin(db: f64) -> f64 {
@@ -2215,7 +2208,7 @@ impl Run {
             let it = c.tin_cur.step(ut);
             c.power_work[i % sub] = ut * it;
             if (i + 1) % sub == 0 {
-                let p = (seq_sum(&c.power_work) / sub as f32).max(0.0);
+                let p = (vdsp_sve_slice(&c.power_work) / sub as f32).max(0.0);
                 c.tp_vc = c.br_vc.step(c.tp_vc, p);
                 c.tp_mg = c.br_mg.step(c.tp_mg, p);
                 c.tring[c.tn % TRING] = c.ambient as f32 + c.tp_vc + c.tp_mg;
@@ -2747,7 +2740,7 @@ impl Run {
                 if (i + 1) % sub == 0 {
                     let p = c.cur_out.power_products_in_place(&mut c.power_work) / sub as f64;
                     // the output thermal model (residuals 2.1)
-                    let pp = (seq_sum(&c.power_work) / sub as f32).max(0.0);
+                    let pp = (vdsp_sve_slice(&c.power_work) / sub as f32).max(0.0);
                     c.th_vc = c.br_vc.step(c.th_vc, pp);
                     c.th_mg = c.br_mg.step(c.th_mg, pp);
                     let pamp = idle + ratio_p * (p * c.load_scale).max(0.0);
