@@ -34,11 +34,12 @@
 //!   previous selected-rate frame, driven by that frame's input level, while
 //!   the output follower's restore uses the current input level (one frame
 //!   ahead of the device). The branch's total delay is unchanged.
-//! - Every filter stores Float32 coefficients and runs with the platform
-//!   multichannel-biquad arithmetic. The per-channel full-rate high path is
-//!   one multichannel setup; the mid and selected-rate filters are separate
-//!   one-channel setups. A render call is passed to each setup as one block,
-//!   so its frame count is part of the result (see [`crate::vdsp`]).
+//! - The filter objects store Float32 coefficients and use the platform
+//!   multichannel-biquad arithmetic described in [`crate::vdsp`]. The
+//!   full-rate mono crossover low pass is the material render-quantum-
+//!   dependent object and is run here as one platform call per render. The
+//!   other established paths remain unchanged until their independently
+//!   generated SOS words pass the whole-graph gate.
 //! - The high-pass path runs independently on every L/R channel. In M/S
 //!   terms both `HP(M)` and `HP(S)` survive; only the reconstructed low and
 //!   harmonic branches are mono and added equally to every channel.
@@ -56,6 +57,21 @@ struct Bq {
     a: [f64; 2],
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct BqState {
+    z: [f64; 2],
+}
+
+impl Bq {
+    #[inline]
+    fn run(&self, s: &mut BqState, x: f64) -> f64 {
+        let y = self.b[0] * x + s.z[0];
+        s.z[0] = self.b[1] * x - self.a[0] * y + s.z[1];
+        s.z[1] = self.b[2] * x - self.a[1] * y;
+        y
+    }
+}
+
 /// A maximum-order high pass has ten Linkwitz-Riley sections followed by two
 /// five-section phase companions. Keep the complete mono cascade.
 const MAX_SECTIONS: usize = 20;
@@ -64,6 +80,11 @@ const MAX_SECTIONS: usize = 20;
 struct Cascade {
     n: usize,
     s: [Bq; MAX_SECTIONS],
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CascadeState {
+    z: [BqState; MAX_SECTIONS],
 }
 
 impl Cascade {
@@ -84,6 +105,13 @@ impl Cascade {
             *dst = [q.b[0], q.b[1], q.b[2], q.a[0], q.a[1]];
         }
         crate::vdsp::Cascade::new(&sections[..self.n], multichannel)
+    }
+    #[inline]
+    fn run(&self, st: &mut CascadeState, mut x: f64) -> f64 {
+        for i in 0..self.n {
+            x = self.s[i].run(&mut st.z[i], x);
+        }
+        x
     }
 }
 
@@ -594,14 +622,18 @@ pub struct Run {
     fs: f64,
     channels: usize,
     /// Per channel at the stream rate: high pass then both all-passes.
-    hp: Vec<crate::vdsp::Cascade>,
+    hp: Cascade,
+    hp_st: Vec<CascadeState>,
     /// Crossover low pass of the mid, at the stream rate.
     lp: crate::vdsp::Cascade,
     /// Selected rate: both band-edge all-passes (blend), the band's lower
     /// edge with the first half of its upper edge, then the second half.
-    ap: crate::vdsp::Cascade,
-    band_hp: crate::vdsp::Cascade,
-    band_lp: crate::vdsp::Cascade,
+    ap: Cascade,
+    ap_st: CascadeState,
+    band_hp: Cascade,
+    band_hp_st: CascadeState,
+    band_lp: Cascade,
+    band_lp_st: CascadeState,
     /// Polarities: blend inverted for an odd-order crossover; harmonics
     /// inverted when the crossover and the band's lower edge differ in
     /// Butterworth-order parity.
@@ -625,12 +657,11 @@ pub struct Run {
     /// Position in the selected-rate grid (carried across blocks).
     phase: usize,
     /// Reconstruction low pass (stream rate).
-    recon: crate::vdsp::Cascade,
-    /// Full-rate mono work buffer, plus the two selected-rate branches. All
-    /// storage is made with the graph and reused by real-time processing.
+    recon: Cascade,
+    recon_st: CascadeState,
+    /// Full-rate mono work buffer. Storage is made with the graph and reused
+    /// by real-time processing.
     mono: Vec<f32>,
-    blend: Vec<f32>,
-    harm: Vec<f32>,
     /// High-pass path delay, `latency` frames per channel (the mid
     /// branches carry theirs at the selected rate).
     latency: usize,
@@ -645,27 +676,30 @@ impl Run {
         let (nh, nu, nl) = (p.hp_order / 2, p.upper_order / 2, p.lower_order / 2);
         let mut ap48 = butterworth(nu, p.fu_hz, fs, Kind::AllPass);
         ap48.extend(&butterworth(nl, p.fc_hz, fs, Kind::AllPass));
-        let mut hp_design = linkwitz_riley(p.hp_order, p.fc_hz, fs, Kind::High);
-        hp_design.extend(&ap48);
+        let mut hp = linkwitz_riley(p.hp_order, p.fc_hz, fs, Kind::High);
+        hp.extend(&ap48);
         let lp_design = linkwitz_riley(p.hp_order, p.fc_hz, fs, Kind::Low);
-        let mut ap_design = butterworth(nu, p.fu_hz, fs8, Kind::AllPass);
-        ap_design.extend(&butterworth(nl, p.fc_hz, fs8, Kind::AllPass));
-        let mut band_hp_design = linkwitz_riley(p.lower_order, p.fc_hz, fs8, Kind::High);
-        band_hp_design.extend(&butterworth(nu, p.fu_hz, fs8, Kind::Low));
-        let band_lp_design = butterworth(nu, p.fu_hz, fs8, Kind::Low);
+        let mut ap = butterworth(nu, p.fu_hz, fs8, Kind::AllPass);
+        ap.extend(&butterworth(nl, p.fc_hz, fs8, Kind::AllPass));
+        let mut band_hp = linkwitz_riley(p.lower_order, p.fc_hz, fs8, Kind::High);
+        band_hp.extend(&butterworth(nu, p.fu_hz, fs8, Kind::Low));
+        let band_lp = butterworth(nu, p.fu_hz, fs8, Kind::Low);
         let latency = nu % 2 + nl % 2;
         let lead = if p.level_control { nl % 2 } else { 0 };
         let max_frames = max_frames.max(1);
-        let selected_frames = max_frames.div_ceil(stride);
         Run {
             p: p.clone(),
             fs,
             channels,
-            hp: (0..channels).map(|_| hp_design.platform(channels >= 2)).collect(),
+            hp,
+            hp_st: vec![CascadeState::default(); channels],
             lp: lp_design.platform(false),
-            ap: ap_design.platform(false),
-            band_hp: band_hp_design.platform(false),
-            band_lp: band_lp_design.platform(false),
+            ap,
+            ap_st: CascadeState::default(),
+            band_hp,
+            band_hp_st: CascadeState::default(),
+            band_lp,
+            band_lp_st: CascadeState::default(),
             lp_sign: if nh % 2 == 1 { -1.0 } else { 1.0 },
             harm_sign: if nh % 2 == nl % 2 { 1.0 } else { -1.0 },
             lc: LevelControl::new(fs8),
@@ -679,11 +713,9 @@ impl Run {
             spos: 0,
             sdelay: latency - lead,
             phase: 0,
-            recon: elliptic(law::RECON_ORDER, law::RECON_RIPPLE_DB, law::RECON_STOP_DB, law::RECON_EDGE_HZ, fs)
-                .platform(false),
+            recon: elliptic(law::RECON_ORDER, law::RECON_RIPPLE_DB, law::RECON_STOP_DB, law::RECON_EDGE_HZ, fs),
+            recon_st: CascadeState::default(),
             mono: vec![0.0; max_frames],
-            blend: vec![0.0; selected_frames],
-            harm: vec![0.0; selected_frames],
             latency,
             oline: vec![[0.0; OUT_LINE]; channels],
             opos: 0,
@@ -691,13 +723,13 @@ impl Run {
     }
 
     pub fn reset(&mut self) {
-        for s in &mut self.hp {
-            s.reset();
+        for s in &mut self.hp_st {
+            *s = CascadeState::default();
         }
         self.lp.reset();
-        self.ap.reset();
-        self.band_hp.reset();
-        self.band_lp.reset();
+        self.ap_st = CascadeState::default();
+        self.band_hp_st = CascadeState::default();
+        self.band_lp_st = CascadeState::default();
         self.lc = LevelControl::new(self.fs / self.stride as f64);
         self.prev_lo = 0.0;
         self.prev_p_in = 0.0;
@@ -709,10 +741,8 @@ impl Run {
         );
         self.sline = [0.0; SUB_LINE];
         self.phase = 0;
-        self.recon.reset();
+        self.recon_st = CascadeState::default();
         self.mono.fill(0.0);
-        self.blend.fill(0.0);
-        self.harm.fill(0.0);
         self.oline.fill([0.0; OUT_LINE]);
     }
 
@@ -750,6 +780,47 @@ impl Run {
         self.compressor.run(x)
     }
 
+    /// One selected-rate frame of both mid branches.
+    #[inline]
+    fn sub_frame(&mut self, lo: f64) -> f64 {
+        let mut low = self.lp_sign * self.p.blend_gain * self.ap.run(&mut self.ap_st, lo);
+        if self.lead > 0 {
+            core::mem::swap(&mut low, &mut self.prev_low);
+        }
+        let harm = if self.p.level_control {
+            let p_in = self.lc.input.run(lo);
+            // The device runs `lead` frames behind the input follower, driven
+            // by its own frame's level; the restore below uses the current one.
+            let (x, p_drive) = if self.lead > 0 {
+                let d = (self.prev_lo, self.prev_p_in);
+                self.prev_lo = lo;
+                self.prev_p_in = p_in;
+                d
+            } else {
+                (lo, p_in)
+            };
+            let z = (x / p_drive.max(law::LC_FLOOR)).clamp(-law::LC_CLIP, law::LC_CLIP);
+            let dev = self.device(z);
+            let hp = self.band_hp.run(&mut self.band_hp_st, dev);
+            let p_out = self.lc.output.run(hp);
+            hp * p_in / p_out.max(law::LC_FLOOR)
+        } else {
+            let dev = self.device(lo);
+            self.band_hp.run(&mut self.band_hp_st, dev)
+        };
+        let harmonic_gain = self.p.harmonic_gain;
+        let harm = self.compress_harmonic(harmonic_gain * harm);
+        let harm = self.band_lp.run(&mut self.band_lp_st, harm);
+        let v = low + self.harm_sign * harm;
+        if self.sdelay == 0 {
+            return v;
+        }
+        self.sline[self.spos] = v;
+        let out = self.sline[(self.spos + SUB_LINE - self.sdelay) % SUB_LINE];
+        self.spos = (self.spos + 1) % SUB_LINE;
+        out
+    }
+
     pub fn process(&mut self, bufs: &mut [&mut [f32]], frames: usize) {
         let ch = self.channels.min(bufs.len());
         if ch == 0 {
@@ -758,8 +829,10 @@ impl Run {
         let frames = bufs[..ch].iter().fold(frames.min(self.mono.len()), |n, b| n.min(b.len()));
         let ig = self.p.input_gain;
 
-        // Build the mono input before the channel buffers become the high
-        // path, then give every filter exactly one call for this render.
+        // The material render-quantum-dependent object is the full-rate mono
+        // crossover low pass. Give it the render as one platform-filter call;
+        // the factor-six phase and the remaining established box state carry
+        // through the frame loop unchanged.
         for i in 0..frames {
             let mut mid = 0.0;
             for b in bufs[..ch].iter() {
@@ -768,95 +841,18 @@ impl Run {
             }
             self.mono[i] = (mid / ch as f64) as f32;
         }
-        for (c, b) in bufs[..ch].iter_mut().enumerate() {
-            for v in &mut b[..frames] {
-                let x = f64::from(*v);
-                *v = if x.is_finite() { (x * ig) as f32 } else { 0.0 };
-            }
-            self.hp[c].run(&mut b[..frames]);
-        }
         self.lp.run(&mut self.mono[..frames]);
-
-        let start_phase = self.phase;
-        let mut phase = start_phase;
-        let mut selected = 0;
         for i in 0..frames {
-            if phase == 0 {
-                let lo = self.mono[i];
-                self.mono[selected] = lo;
-                self.blend[selected] = lo;
-                selected += 1;
-            }
-            phase = (phase + 1) % self.stride;
-        }
-        self.phase = phase;
-
-        self.ap.run(&mut self.blend[..selected]);
-        for i in 0..selected {
             let lo = f64::from(self.mono[i]);
-            self.harm[i] = if self.p.level_control {
-                let p_in = self.lc.input.run(lo);
-                // The device runs `lead` frames behind the input follower,
-                // driven by its own frame's level. Save the current level in
-                // the now-compacted mono buffer for the restore pass.
-                let (x, p_drive) = if self.lead > 0 {
-                    let d = (self.prev_lo, self.prev_p_in);
-                    self.prev_lo = lo;
-                    self.prev_p_in = p_in;
-                    d
-                } else {
-                    (lo, p_in)
-                };
-                self.mono[i] = p_in as f32;
-                let z = (x / p_drive.max(law::LC_FLOOR)).clamp(-law::LC_CLIP, law::LC_CLIP);
-                self.device(z) as f32
-            } else {
-                self.device(lo) as f32
-            };
-        }
-        self.band_hp.run(&mut self.harm[..selected]);
-        for i in 0..selected {
-            let mut harm = f64::from(self.harm[i]);
-            if self.p.level_control {
-                let p_in = f64::from(self.mono[i]);
-                let p_out = self.lc.output.run(harm);
-                harm *= p_in / p_out.max(law::LC_FLOOR);
-            }
-            self.harm[i] = self.compress_harmonic(self.p.harmonic_gain * harm) as f32;
-        }
-        self.band_lp.run(&mut self.harm[..selected]);
-
-        self.mono[..frames].fill(0.0);
-        phase = start_phase;
-        selected = 0;
-        for i in 0..frames {
-            if phase == 0 {
-                let mut low = self.lp_sign * self.p.blend_gain * f64::from(self.blend[selected]);
-                if self.lead > 0 {
-                    core::mem::swap(&mut low, &mut self.prev_low);
-                }
-                let v = low + self.harm_sign * f64::from(self.harm[selected]);
-                let delayed = if self.sdelay == 0 {
-                    v
-                } else {
-                    self.sline[self.spos] = v;
-                    let out = self.sline[(self.spos + SUB_LINE - self.sdelay) % SUB_LINE];
-                    self.spos = (self.spos + 1) % SUB_LINE;
-                    out
-                };
-                self.mono[i] = (delayed * self.stride as f64) as f32;
-                selected += 1;
-            }
-            phase = (phase + 1) % self.stride;
-        }
-        self.recon.run(&mut self.mono[..frames]);
-
-        for i in 0..frames {
-            let common = f64::from(self.mono[i]);
+            let up = if self.phase == 0 { self.sub_frame(lo) * self.stride as f64 } else { 0.0 };
+            self.phase = (self.phase + 1) % self.stride;
+            let common = self.recon.run(&mut self.recon_st, up);
             let (l, pos) = (self.latency, self.opos);
             for (c, b) in bufs[..ch].iter_mut().enumerate() {
+                let v = b[i] as f64;
+                let x = if v.is_finite() { v * ig } else { 0.0 };
                 let line = &mut self.oline[c];
-                line[pos] = f64::from(b[i]);
+                line[pos] = self.hp.run(&mut self.hp_st[c], x);
                 let y = (line[(pos + OUT_LINE - l) % OUT_LINE] + common) * self.p.output_gain;
                 b[i] = y as f32;
             }
