@@ -61,8 +61,12 @@
 //! Gain law: a 21-node table over -100..+10 in 5.5 dB steps, compiled from
 //! the tuning (target, maximum gain, upward and downward ranges, ratio),
 //! read as a uniform cubic B-spline over the nodes (not by linear
-//! interpolation: the unit rounds the table's knees). The gain glides toward its target in dB
-//! with a 0.8 ms one-pole (the same time at every sample rate).
+//! interpolation: the unit rounds the table's knees). The applied gain is
+//! linear: each frame it covers a fixed share of the remaining distance to
+//! the call's target amplitude, a one-pole smoother with a 200 Hz corner
+//! (time constant 1/(2 pi 200) s, about 0.8 ms, the same time at every
+//! sample rate). Gliding in dB instead bends every large step's onset by
+//! up to tenths of a dB.
 //!
 //! No tuning value lives here; `aurora-speaker-tuning`'s `voicing::norm`
 //! compiles [`Params`] from the Mac's saved state.
@@ -90,8 +94,9 @@ const BINS: usize = 1001;
 const BIN_LO_DB: f64 = -100.0;
 const BIN_DB: f64 = 0.1;
 const SEED_HALF: usize = 5;
-/// Time constant of the gain's glide toward each call's target, in dB, s.
-const GLIDE_S: f64 = 0.0008;
+/// Corner of the one-pole that glides the linear gain toward each call's
+/// target, Hz.
+const GLIDE_HZ: f64 = 200.0;
 /// macOS renders the speaker graph in calls of this many frames; the unit
 /// meters a whole call before it moves its gain across that call.
 pub const CALL: usize = 512;
@@ -576,7 +581,9 @@ pub struct Run {
     clear_due: bool,
     candidate: f64,
     target_db: f64,
-    gain_db: f64,
+    /// The applied gain, linear, and the target it glides to.
+    gain: f64,
+    target: f64,
     /// Per-frame share of the remaining distance the gain covers.
     glide: f64,
 }
@@ -618,8 +625,9 @@ impl Run {
             clear_due: false,
             candidate: 0.0,
             target_db: 0.0,
-            gain_db: 0.0,
-            glide: 1.0 - libm::exp(-1.0 / (GLIDE_S * fs)),
+            gain: 1.0,
+            target: 1.0,
+            glide: 1.0 - libm::exp(-2.0 * core::f64::consts::PI * GLIDE_HZ / fs),
         };
         r.reset();
         r
@@ -654,7 +662,8 @@ impl Run {
         self.clear_due = true;
         self.candidate = e;
         self.target_db = self.p.gain_db(e);
-        self.gain_db = self.target_db;
+        self.target = libm::pow(10.0, self.target_db / 20.0);
+        self.gain = self.target;
     }
 
     /// Frames: the unit's look-ahead plus one call, because the unit meters
@@ -665,7 +674,7 @@ impl Run {
 
     /// The gain at the end of the last whole call, dB.
     pub fn gain_db(&self) -> f64 {
-        self.gain_db
+        20.0 * libm::log10(self.gain)
     }
 
     /// The loudness the last whole call's gain was read for, dB.
@@ -749,6 +758,7 @@ impl Run {
         }
         self.candidate = self.held.max(self.fast);
         self.target_db = self.p.gain_db(self.candidate);
+        self.target = libm::pow(10.0, self.target_db / 20.0);
     }
 
     /// One call: meter all of it, then move the gain across it.
@@ -777,8 +787,8 @@ impl Run {
             self.z = [[[0.0; 2]; MAX_SECTIONS]; MAX_CHANNELS];
         }
         for n in 0..CALL {
-            self.gain_db += self.glide * (self.target_db - self.gain_db);
-            let g = libm::pow(10.0, self.gain_db / 20.0) as f32;
+            self.gain += self.glide * (self.target - self.gain);
+            let g = self.gain as f32;
             for ch in 0..nch {
                 let x = self.call_in[ch * CALL + n];
                 let y = if la == 0 {
@@ -827,6 +837,21 @@ mod tests {
             *t = (4.0 - 0.5 * (l + 40.0).max(0.0)).max(-11.0);
         }
         Params { table, expected_db: -30.0, reset_timeout_s: 8.0, lookahead, ..Params::default() }
+    }
+
+    #[test]
+    fn gain_glides_linearly_with_a_200_hz_one_pole() {
+        let p = params(0);
+        let mut r = Run::new(&p, 48_000.0, 1);
+        let from = libm::pow(10.0, p.gain_db(p.expected_db) / 20.0);
+        // a loud call moves the target; the applied amplitude covers the
+        // same share of the remaining distance every frame
+        let mut buf = vec![0.5f32; CALL * 3];
+        r.process(&mut [&mut buf[..]], CALL * 3);
+        let to = r.target;
+        assert!((to - from).abs() > 0.1);
+        let a = 1.0 - libm::exp(-2.0 * core::f64::consts::PI * 200.0 / 48_000.0);
+        assert!((r.glide - a).abs() < 1e-15);
     }
 
     #[test]
