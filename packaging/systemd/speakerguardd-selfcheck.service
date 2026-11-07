@@ -7,7 +7,15 @@ Documentation=https://github.com/aurora-silicon/speakerguardd/blob/v2/docs/NEW-P
 # board, the kernel release, the parameter blob and the wiring. A passing
 # record for exactly this combination is kept, so a boot without a kernel
 # or tuning change only checks the binding. A failure leaves the floor.
-Before=speakerguardd.service
+# Before user sessions too: its ExecStartPost puts this boot's graph in
+# /run/speakerguardd-graph, and the seat user's PipeWire and WirePlumber must
+# start with it. Without the graph, WirePlumber creates its own nodes on the
+# raw speaker and sense PCMs and probes them at the kernel's floor; on the
+# first boot after a kernel or tuning change (a fresh compile and self-check)
+# an automatic login won that race and a tweeter amp latched a TDM clock
+# fault. systemd-user-sessions.service gates every login, the display
+# manager's greeter and automatic login included.
+Before=speakerguardd.service systemd-user-sessions.service
 After=systemd-udev-settle.service speakerguardd-provision.service
 # Its parameter blob and configuration come from provisioning.
 Requires=speakerguardd-provision.service

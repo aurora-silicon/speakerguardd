@@ -381,6 +381,37 @@ fn lsm2_fields_follow_the_id_rule() {
 }
 
 #[test]
+fn lsm2_masker_lattice_comes_from_the_bundle() {
+    // Provisioned: the validated table reaches the engine unchanged.
+    let ends = synthetic_lattice_ends();
+    let mut files = lsm2_files(|_| {});
+    files.insert(LATTICE.into(), lattice_bytes(&ends));
+    let t = tuning(&files, "c-lsm2-lattice");
+    let c = compile(&t, &mut Diagnostics::default()).unwrap();
+    let p = sgv2_core::lsm2::Params::from_blob(&c.blob).unwrap();
+    assert_eq!(p.mask_lattice_len, 100);
+    assert_eq!(p.mask_lattice.iter().map(|&v| v as u64).collect::<Vec<_>>(), ends);
+    // Absent (a bundle collected before the installer read it): no
+    // lattice, so no masking credit, and the load warned.
+    let dir = scratch("c-lsm2-no-lattice");
+    let files = lsm2_files(|_| {});
+    write_dir(&dir, &files, &manifest_json(&files, "25G83"));
+    let mut d = Diagnostics::default();
+    let t = Tuning::load(&Bundle::open(&dir).unwrap(), &Options::default(), &mut d).unwrap();
+    assert!(d.items.iter().any(|x| x.code == "mask-lattice-absent"));
+    let c = compile(&t, &mut Diagnostics::default()).unwrap();
+    let p = sgv2_core::lsm2::Params::from_blob(&c.blob).unwrap();
+    assert_eq!((p.mask_lattice_len, p.mask_lattice), (0, [0; 100]));
+    // A listed table that fails the rule is refused before any blob.
+    let mut bad = ends.clone();
+    bad[99] = 320;
+    let mut files = lsm2_files(|_| {});
+    files.insert(LATTICE.into(), lattice_bytes(&bad));
+    let t = tuning_any(&files, "c-lsm2-bad-lattice");
+    assert!(compile(&t, &mut Diagnostics::default()).is_err());
+}
+
+#[test]
 fn lsm2_channels_keep_their_own_full_scale_within_one_operating_point() {
     // As on the J700 (7.30/7.33 V, 0.036 dB): the header takes channel 0's,
     // the payload keeps each channel's own.
@@ -494,4 +525,47 @@ fn a_bypassed_atsp_preset_is_refused() {
     let t = tuning(&f, "c-atsp-bypass");
     let e = compile(&t, &mut Diagnostics::default()).unwrap_err();
     assert!(format!("{e}").contains("bypasses atsp"), "{e}");
+}
+
+/// Plan B (2026-11-07): the shipped compile runs the unit pass-through, an
+/// identity pre-stage with no crossover declared, for spp3 as for atsp; the
+/// tuning's own pre-stage only when asked for (rigs, the full macOS chain).
+#[test]
+fn the_shipped_prestage_is_pass_through() {
+    let t = tuning(&spp3_files(4), "c-prestage-pass-through");
+    let mut d = Diagnostics::default();
+    let c = compile(&t, &mut d).unwrap();
+    let pre = sgv2_core::blob::prestage(&c.blob, c.sample_rate as f64).unwrap();
+    assert!(!pre.from_tuning(), "no crossover declared");
+    assert_eq!(pre.box_count, 0, "identity: nothing ahead of the unit");
+    assert_eq!(pre, sgv2_core::prestage::Params::identity(c.channels as usize));
+    assert!(d.items.iter().any(|x| x.code == "prestage-protection-only"), "the compile says so");
+    // The same as asking for it, and the unit itself is the same either way
+    let explicit = comp::compile_opts(
+        &t,
+        &j413(),
+        Provenance::Verified,
+        comp::PreStageMode::Identity,
+        &mut Diagnostics::default(),
+    )
+    .unwrap();
+    assert_eq!(c.blob, explicit.blob);
+    // The tuning's pre-stage only on request, exactly what derive gives
+    let derived = aurora_speaker_tuning::prestage::derive(
+        &t,
+        c.sample_rate as f64,
+        c.channels as usize,
+        &mut Diagnostics::default(),
+    );
+    let tuned =
+        comp::compile_opts(&t, &j413(), Provenance::Verified, comp::PreStageMode::Tuning, &mut Diagnostics::default());
+    match (derived, tuned) {
+        (Ok(want), Ok(got)) => {
+            let p = sgv2_core::blob::prestage(&got.blob, got.sample_rate as f64).unwrap();
+            assert_eq!(p.from_tuning(), want.from_tuning());
+            assert_eq!(p.box_count, want.box_count);
+        }
+        (Err(_), Err(_)) => {}
+        (a, b) => panic!("derive {:?} vs compile {:?}", a.is_ok(), b.is_ok()),
+    }
 }

@@ -115,12 +115,27 @@ self-check and the supervisor, which both require it.
    generated; overrides go in `provision.conf`.
 5. **Graph.** After the self-check passes, `speakerguardd-provision activate`
    generates the machine's PipeWire and WirePlumber files from the record
-   into `/run/speakerguardd-graph`. The user unit `speakerguardd-graph.service`,
-   ordered before PipeWire, links them into the seat user's
+   into `/run/speakerguardd-graph`. The self-check is ordered before
+   `systemd-user-sessions.service`, so the graph is in place before any
+   login, the display manager's automatic login included. The user unit
+   `speakerguardd-graph.service`, ordered before PipeWire, links them into
+   the seat user's
    `pipewire.conf.d` and `wireplumber.conf.d`, and removes them for every
    other user. If the seat user's PipeWire was already running, it is
    restarted on the new graph. The links lead into `/run`, so after a boot
    without v2 they lead nowhere, and PipeWire skips them.
+
+6. **Sleep.** `speakerguardd-sleep.service` is ordered before `sleep.target`.
+   While everything is still awake it sets the hold
+   (`/run/speakerguardd-sleep/hold`); the session helper then unlinks the
+   amps as on a withdrawal and reports them unlinked, and the supervisor stops and
+   releases its ownership. The kernel holds its floor over the sleep with no
+   stream running and no owner to freeze, so no start is refused and no
+   watchdog runs out across the freeze. After the resume the unit is no
+   longer needed; its stop clears the hold and starts the supervisor, which
+   grants as at boot. A sleep entered without systemd (a direct write to
+   `/sys/power/state`) skips this, and the kernel's own withdrawal at
+   suspend is what holds.
 
 Any failure fails closed: the blob, the configuration and the graph are
 removed, the self-check and the supervisor do not start, the kernel holds
@@ -144,9 +159,13 @@ both, so exactly one stack runs on a board:
 The kernel is the switch: a fleet kernel without the v2 interface keeps
 every Mac on the older daemons, the kernel with it moves every gated Mac at
 once, and booting the older kernel moves it back. atsp joined
-`units_at_parity` when all 117 rig cases matched macOS bit for bit. The
-fleet cutover adds lsm2 once it reaches parity and sets
-`require_qualified_board` to false: every board with a parity unit. The data
+`units_at_parity` when all 117 rig cases matched macOS bit for bit. At the
+fleet cutover `require_qualified_board` stays true: v2 runs on the boards in
+their unit's `qualified` list. A spp3 board that is not on it joins after
+the per-band rig against macOS's own graph. Setting the flag to false runs
+v2 on every board with a parity unit, from its own tuning, and waits for
+that rig coverage. lsm2 joins once it holds every
+Apple limit on every rig case. The data
 is speakerguardd's own; every distribution ships it unchanged.
 `speakerguardd-gate explain` prints the decision.
 
@@ -253,8 +272,9 @@ on the J413. A boot that has a valid record only checks the binding.
    parity.
 3. Confirm the amp count has an LV2 variant (2, 4 or 6), and the speaker
    link's CPU DAI driver is in `wiring.py` TRANSPORTS.
-4. After its audible run, add the board to its unit's `qualified` list in
-   `gate.json`; once `require_qualified_board` is false, nothing.
+4. `gate.json`: while `require_qualified_board` is true, add the board to
+   its unit's `qualified` list after its per-band rig against macOS and its
+   silent hardware run. Until then it stays on the older daemons.
 6. Everything else is automatic: the installer collects the tuning,
    provisioning compiles and binds it and configures the units, the
    self-check derives and proves the wiring at first boot, and the graph is

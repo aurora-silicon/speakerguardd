@@ -7,6 +7,8 @@ manual step, before the self-check and the supervisor start.
     speakerguardd-provision seat     --unit UNIT                (root, when seat0 changes hands)
     speakerguardd-provision graph-user                          (the user's speakerguardd-graph.service)
     speakerguardd-provision is-seat                             (ExecCondition of the session helper)
+    speakerguardd-provision sleep    --unit UNIT                (root, speakerguardd-sleep.service, before sleep)
+    speakerguardd-provision wake     --unit UNIT                (root, the same unit's stop, after the resume)
     speakerguardd-provision status
 
 `run`:
@@ -55,6 +57,18 @@ them.
 `seat` (speakerguardd-seat.path, on every seat0 change) restarts the
 supervisor, which provisions again, when seat0's regular user is not the one
 provisioned.
+
+`sleep` (speakerguardd-sleep.service, ordered before sleep.target) takes
+the speakers down in order while everything is still awake: it sets the
+hold (/run/speakerguardd-sleep/hold), on which the session helper unlinks
+the amps as if protection were withdrawn, waits until the helper reports
+them unlinked, then stops the supervisor, which releases its ownership; the
+kernel then holds its floor with no stream running. Nothing of v2 is left
+to be frozen in the middle of a grant: no refused start, no watchdog that
+runs out across the freeze (systemd's clock keeps running through the
+device suspend and resume), no owner that dies while the amps resume.
+`wake` (the unit's stop, after the resume) clears the hold and starts the
+supervisor again, which grants as at boot.
 
 `--root DIR` (or SGV2_PROVISION_ROOT) moves every file this program writes
 or reads under DIR, for tests: etc/speakerguardd, var/lib/speakerguardd,
@@ -109,6 +123,11 @@ class Paths:
         self.published = os.path.join(self.run_dir, "params.bin")
         self.graph = r("/run/speakerguardd-graph")
         self.graph_state = os.path.join(self.graph, "state")
+        # The raw-PCM rules, linked for every user from session start
+        self.raw = os.path.join(self.graph, "raw")
+        self.sleep = r("/run/speakerguardd-sleep")
+        self.hold = os.path.join(self.sleep, "hold")
+        self.proc_asound = r("/proc/asound")
 
 
 # ------------------------------------------------------------------ files
@@ -518,6 +537,7 @@ def cmd_run(args, p):
         idx, card = find_card(want_card, args.card_wait)
         pcm = speaker_pcm(idx)
         write_conf(p, conf_text(rec, key, user, pw.pw_uid, card, pcm, p, src))
+        write_raw_rules(p, card)
         if how == "seat0":
             write_atomic(p.seat_last, user + "\n")
         rec["result"] = "pass"
@@ -543,6 +563,16 @@ def cmd_run(args, p):
     log(f"provisioned {rec['board']}: blob {rec['params_sha256'][:12]} ({'compiled' if rec['compiled'] else 'bound'}), "
         f"seat user {rec['seat_user']} ({rec['seat_how']}), {p.conf}")
     return 0
+
+
+def write_raw_rules(p, card):
+    """This boot's raw-PCM rules (gen.wireplumber_raw_conf): provisioning
+    runs before any session, so every user's WirePlumber starts with them,
+    while the self-check may still be running."""
+    import gen
+
+    os.makedirs(p.raw, mode=0o755, exist_ok=True)
+    write_atomic(os.path.join(p.raw, gen.RAW_RULES), gen.wireplumber_raw_conf(card))
 
 
 def write_conf(p, text):
@@ -688,6 +718,10 @@ def cmd_graph_user(args, p):
     st = read_kv(p.graph_state)
     seat = conf.get("SGV2_UID") == str(os.getuid()) and st.get("result") == "pass"
     want = {}
+    # Every user, the seat user before the self-check passes included: no
+    # WirePlumber node on the raw speaker or sense PCMs this boot
+    for f in sorted(glob.glob(os.path.join(p.raw, "*.conf"))):
+        want[("wireplumber", os.path.basename(f))] = f
     if seat:
         for d in ("pipewire", "wireplumber"):
             for f in sorted(glob.glob(os.path.join(p.graph, d, "*.conf"))):
@@ -758,6 +792,124 @@ def cmd_seat(args, p):
     return 0
 
 
+def helper_amps(conf, since_ns):
+    """The seat user's session helper report written after `since_ns`:
+    True while it says the amps are linked, False once they are not, None
+    without a fresh report (no session, or the helper is not running)."""
+    uid = conf.get("SGV2_UID")
+    if not uid or not uid.isdigit():
+        return None
+    try:
+        with open(f"/run/speakerguardd/{uid}/helper/session") as f:
+            rep = dict(w.split("=", 1) for w in f.read().split() if "=" in w)
+    except OSError:
+        return None
+    try:
+        mono = int(rep.get("mono_ns", "0"))
+    except ValueError:
+        return None
+    if mono < since_ns or "amps" not in rep:
+        return None
+    return rep["amps"] != "0"
+
+
+def graph_pcms(p):
+    """The /proc/asound status files of the PCMs this boot's graph opens
+    (its api.alsa.path entries: the amps and the sense)."""
+    out = []
+    d = os.path.join(p.graph, "pipewire")
+    try:
+        names = sorted(os.listdir(d))
+    except OSError:
+        return out
+    for n in names:
+        try:
+            with open(os.path.join(d, n)) as f:
+                text = f.read()
+        except OSError:
+            continue
+        for card, dev in re.findall(r'api\.alsa\.path\s*=\s*"hw:CARD=([^,"]+),DEV=(\d+)"', text):
+            for direction in "pc":
+                st = os.path.join(p.proc_asound, card, f"pcm{dev}{direction}", "sub0", "status")
+                if os.path.exists(st) and st not in out:
+                    out.append(st)
+    return out
+
+
+def open_pcms(p):
+    """The graph's PCMs that are not closed (by status file)."""
+    left = []
+    for st in graph_pcms(p):
+        try:
+            with open(st) as f:
+                first = f.readline().strip()
+        except OSError:
+            continue
+        if first != "closed":
+            left.append(st)
+    return left
+
+
+def cmd_sleep(args, p):
+    """Before system sleep: the amps and the sense unlinked (the helper
+    reports it) and suspended, so their PCMs close (a PCM held open across
+    the sleep is unmuted at the resume before its clocks are back), then the
+    supervisor stopped (it releases its ownership), all while awake. Never
+    fails the sleep: the kernel's floor at suspend is the backstop."""
+    os.makedirs(p.sleep, mode=0o755, exist_ok=True)
+    write_atomic(p.hold, f"since_ns={time.monotonic_ns()}\n")
+    if p.root:
+        return 0
+    if subprocess.run(["systemctl", "is-active", "--quiet", args.unit]).returncode != 0:
+        log(f"{args.unit} is not running: nothing to take down before sleep")
+        return 0
+    conf = read_kv(p.conf)
+    since = time.monotonic_ns()
+    deadline = time.monotonic() + args.sleep_wait
+    amps = helper_amps(conf, since)
+    while amps is not False and time.monotonic() < deadline:
+        time.sleep(0.01)
+        amps = helper_amps(conf, since)
+    if amps is not False:
+        log(f"no report of the amps unlinked within {args.sleep_wait:.1f} s: stopping {args.unit} anyway")
+    deadline = time.monotonic() + args.sleep_wait
+    left = open_pcms(p)
+    while left and time.monotonic() < deadline:
+        time.sleep(0.01)
+        left = open_pcms(p)
+    subprocess.run(["systemctl", "stop", args.unit])
+    left = open_pcms(p)
+    if left:
+        log(f"speaker PCMs still open after {args.sleep_wait:.1f} s: " + ", ".join(left))
+    log(f"speakers down for sleep: amps {'unlinked' if amps is False else 'not reported'}, "
+        f"PCMs {'closed' if not left else 'OPEN'}, {args.unit} stopped")
+    return 0
+
+
+def provision_unit(unit):
+    """The provisioning unit beside the supervisor's (speakerguardd.service ->
+    speakerguardd-provision.service; packaged as speakerguardd-v2*)."""
+    return unit.removesuffix(".service") + "-provision.service"
+
+
+def cmd_wake(args, p):
+    """After the resume: clear the hold and start the supervisor again.
+    Every start of the supervisor runs provisioning again; sleeps that end at
+    once (a suspend aborted by a pending wakeup) can come several a second,
+    and must not run the two into their start limits (the supervisor would
+    then stay down until a reboot, at the kernel's floor), so their start
+    counters are reset first: a resume is a deliberate start, not a crash
+    loop."""
+    unlink(p.hold)
+    if p.root:
+        return 0
+    subprocess.run(["systemctl", "reset-failed", args.unit, provision_unit(args.unit)],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    r = subprocess.run(["systemctl", "start", "--no-block", args.unit])
+    log(f"resumed: hold cleared, {args.unit} {'starting' if r.returncode == 0 else 'not started'}")
+    return 0
+
+
 def cmd_status(args, p):
     for path in (p.report, p.selfcheck_json):
         try:
@@ -770,10 +922,11 @@ def cmd_status(args, p):
 
 def main():
     ap = argparse.ArgumentParser(prog="speakerguardd-provision")
-    ap.add_argument("cmd", choices=["run", "activate", "seat", "graph-user", "is-seat", "status"])
+    ap.add_argument("cmd", choices=["run", "activate", "seat", "graph-user", "is-seat", "sleep", "wake", "status"])
     ap.add_argument("--bundle", help="the tuning source (default: the installer's bundle)")
     ap.add_argument("--force", action="store_true", help="compile even if the blob is bound")
-    ap.add_argument("--unit", default="speakerguardd.service", help="the supervisor's unit (seat)")
+    ap.add_argument("--unit", default="speakerguardd.service", help="the supervisor's unit (seat, sleep, wake)")
+    ap.add_argument("--sleep-wait", type=float, default=2.0, help="how long sleep waits for the amps to unlink, and then for the PCMs to close")
     ap.add_argument("--graph-unit", default="speakerguardd-graph.service", help="the user's graph unit (activate)")
     ap.add_argument("--root", default=os.environ.get("SGV2_PROVISION_ROOT", ""), help="test root for every file written")
     ap.add_argument("--tuning-cli", default="aurora-speaker-tuning")
@@ -783,7 +936,7 @@ def main():
     args = ap.parse_args()
     p = Paths(args.root)
     return {"run": cmd_run, "activate": cmd_activate, "seat": cmd_seat, "graph-user": cmd_graph_user,
-            "is-seat": cmd_is_seat, "status": cmd_status}[args.cmd](args, p)
+            "is-seat": cmd_is_seat, "sleep": cmd_sleep, "wake": cmd_wake, "status": cmd_status}[args.cmd](args, p)
 
 
 if __name__ == "__main__":

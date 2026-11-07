@@ -29,3 +29,4 @@ cc 54f18330d24211715b220ad41f8fff9ec981d7051aeaf20d21ab7f3fe75a21a6 # shrinks to
 cc 44a8a5832d7cd946c5e62e6e1fbcb11fb28788f63802b0c8d9afd646b7372b2a # shrinks to seed = 1380472128039838, n = 1, blk = 512, rate = 141657, hot = false, len = 6203, amp = 0.01, h = Clean, sl = 44182944025523
 cc c22121d00a1a6944572f5eaa2ba5257cbe9a7f394201f8c76e60679de4a4fe60 # shrinks to seed = 66884580471797230, n = 1, blk = 512, rate = 153635, hot = false, len = 5873, amp = 0.01, h = Specials, sl = 0
 cc 7653692c56ef0eeba79a475ec2072649966d7c1acca06008784e8de3cca68cf2 # shrinks to seed = 10342436200309593071, n = 5, blk = 0, call = 2424, secs = 6.464697722967383, amp = 3.241301, h = Clean
+cc 69faad4c70b3828a61a932e5b81cebbb9b547c3ddf7bd68fa83f2692a7b1fedf # shrinks to seed = 9576011240461377074, n = 2, rate = 8000, len = 8777, amp = 0.01, h = Wild, a = 6132426734545411105, b = 3445577339917830935
