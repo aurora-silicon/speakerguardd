@@ -1488,7 +1488,13 @@ impl PreStage {
     }
 
     /// Float-coefficient counterpart of [`Self::run_sections`] for a
-    /// ToneMeister box. Its static cascade rounds after every section.
+    /// ToneMeister box. Its static cascade rounds after every section and
+    /// steps each frame as a fused transposed direct form II, the way the
+    /// platform's single-precision multichannel biquad steps a setup of two
+    /// or more channels (black-box renders of the installed unit: a
+    /// 2-channel box's automated peak matches it bit for bit; the unfused
+    /// form leaves a rounding floor up to 8 dB louder, e.g. under a 16 kHz
+    /// tone through 80-100 Hz sections).
     fn run_sections_float(&mut self, c: usize, from: usize, to: usize, gain: f64, buf: &mut [f32]) {
         let (Some(ch), Some(z)) = (self.params.channel.get(c), self.state.get_mut(c)) else {
             buf.fill(0.0);
@@ -1499,9 +1505,10 @@ impl PreStage {
         for y in buf.iter_mut() {
             let mut v = if y.is_finite() { y.clamp(-INPUT_BOUND, INPUT_BOUND) } else { 0.0 };
             for (s, st) in ch.sections[from..to].iter().zip(z[from..to].iter_mut()) {
-                let out = s.b0 as f32 * v + st[0] as f32;
-                let z0 = s.b1 as f32 * v - s.a1 as f32 * out + st[1] as f32;
-                let z1 = s.b2 as f32 * v - s.a2 as f32 * out;
+                let (b0, b1, b2, a1, a2) = (s.b0 as f32, s.b1 as f32, s.b2 as f32, s.a1 as f32, s.a2 as f32);
+                let out = libm::fmaf(b0, v, st[0] as f32);
+                let z0 = libm::fmaf(-a1, out, libm::fmaf(b1, v, st[1] as f32));
+                let z1 = libm::fmaf(-a2, out, b2 * v);
                 *st = [z0 as f64, z1 as f64];
                 v = out;
             }
@@ -1662,8 +1669,9 @@ impl PreStage {
 
     /// The filter-only float path used by a ToneMeister box. The installed
     /// box runs its biquad cascade in float, whose rounding is observable
-    /// when many low-frequency sections are cascaded. The protection
-    /// pre-stage deliberately keeps the f64 path above.
+    /// when many low-frequency sections are cascaded; each frame steps as
+    /// in [`Self::run_sections_float`]. The protection pre-stage
+    /// deliberately keeps the f64 path above.
     pub(crate) fn process_float(&mut self, c: usize, input: &[f32], output: &mut [f32]) {
         let (Some(ch), Some(z)) = (self.params.channel.get(c), self.state.get_mut(c)) else {
             output.fill(0.0);
@@ -1677,9 +1685,10 @@ impl PreStage {
         for (x, y) in input.iter().zip(output.iter_mut()) {
             let mut v = if x.is_finite() { x.clamp(-INPUT_BOUND, INPUT_BOUND) } else { 0.0 };
             for (s, st) in secs.iter().zip(z.iter_mut()) {
-                let out = s.b0 as f32 * v + st[0] as f32;
-                let z0 = s.b1 as f32 * v - s.a1 as f32 * out + st[1] as f32;
-                let z1 = s.b2 as f32 * v - s.a2 as f32 * out;
+                let (b0, b1, b2, a1, a2) = (s.b0 as f32, s.b1 as f32, s.b2 as f32, s.a1 as f32, s.a2 as f32);
+                let out = libm::fmaf(b0, v, st[0] as f32);
+                let z0 = libm::fmaf(-a1, out, libm::fmaf(b1, v, st[1] as f32));
+                let z1 = libm::fmaf(-a2, out, b2 * v);
                 st[0] = z0 as f64;
                 st[1] = z1 as f64;
                 v = out;
@@ -1767,6 +1776,24 @@ mod tests {
         // a channel the pre-stage does not have is muted
         s.process(5, &x, &mut y);
         assert!(y.iter().all(|v| *v == 0.0));
+    }
+
+    #[test]
+    fn tone_float_cascade_steps_fused() {
+        // Synthetic section, not any Mac's: a 0 dB 100 Hz peak's poles.
+        let s = Section { b0: 1.000_01, b1: -1.998_7, b2: 0.998_72, a1: -1.998_7, a2: 0.998_73 };
+        let mut stage = PreStage::new(params(&[s], 1.0));
+        let x: std::vec::Vec<f32> = (0..256).map(|i| (0.37 * i as f32).sin() * 0.5).collect();
+        let mut y = std::vec![0.0f32; x.len()];
+        stage.process_float(0, &x, &mut y);
+        let (b0, b1, b2, a1, a2) = (s.b0 as f32, s.b1 as f32, s.b2 as f32, s.a1 as f32, s.a2 as f32);
+        let (mut z1, mut z2) = (0.0f32, 0.0f32);
+        for (v, out) in x.iter().zip(&y) {
+            let o = libm::fmaf(b0, *v, z1);
+            z1 = libm::fmaf(-a1, o, libm::fmaf(b1, *v, z2));
+            z2 = libm::fmaf(-a2, o, b2 * v);
+            assert_eq!(o.to_bits(), out.to_bits());
+        }
     }
 
     fn dyn_params() -> Params {
