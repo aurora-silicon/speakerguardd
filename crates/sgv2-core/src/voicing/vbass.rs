@@ -59,9 +59,9 @@ impl Bq {
     }
 }
 
-/// Most biquads one cascade needs (a Linkwitz-Riley of order 20 is two
-/// Butterworths of order 10: ten sections).
-const MAX_SECTIONS: usize = 10;
+/// A maximum-order high pass has ten Linkwitz-Riley sections followed by two
+/// five-section phase companions. Keep the complete mono cascade.
+const MAX_SECTIONS: usize = 20;
 
 #[derive(Clone, Debug, Default)]
 struct Cascade {
@@ -424,8 +424,7 @@ impl Params {
             return None;
         }
         let order = |v: f64| -> Option<usize> {
-            (v >= 2.0 && v <= (2 * MAX_SECTIONS) as f64 && libm::trunc(v) == v && (v as usize) % 2 == 0)
-                .then_some(v as usize)
+            (v >= 2.0 && v <= 20.0 && libm::trunc(v) == v && (v as usize) % 2 == 0).then_some(v as usize)
         };
         let corner = |v: f64| (v > 0.0 && v < 20_000.0).then_some(v);
         let gain = |v: f64| (0.0..=100.0).contains(&v).then_some(v);
@@ -907,6 +906,23 @@ mod tests {
         }
         // 40 Hz is far below the 100 Hz eighth-order high pass.
         assert!(amp(&l[n / 2..], 40.0) < 1e-3);
+    }
+
+    #[test]
+    fn mono_and_equal_stereo_share_the_complete_high_order_path() {
+        let mut p = params(true);
+        p.hp_order = 20;
+        p.upper_order = 20;
+        p.lower_order = 20;
+        let n = 8_192;
+        let input = tone(125.0, 0.4, n);
+        let mut mono = input.clone();
+        let mut left = input.clone();
+        let mut right = input;
+        Run::new(&p, 48_000.0, 1).process(&mut [&mut mono], n);
+        Run::new(&p, 48_000.0, 2).process(&mut [&mut left, &mut right], n);
+        assert_eq!(mono, left);
+        assert_eq!(mono, right);
     }
 
     #[test]
