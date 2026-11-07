@@ -36,3 +36,19 @@ Controls, run on buildbox:
 python3 tools/diffrig/test_boxrig_renderer.py --renderer PATH/voicing-box-render --work PRIVATE_SCRATCH
 python3 tools/diffrig/test_boxrig_metric.py
 ```
+
+Norm timing checks, using the same private AU cache (no new Mac access):
+
+```sh
+python3 tools/diffrig/norm/timing.py --root PRIVATE_DIR --renderer PATH/voicing-box-render --baseline PATH/older-voicing-box-render --work PRIVATE_SCRATCH
+python3 tools/diffrig/aidgate/test_timing.py
+```
+
+The timing report checks impulse positions against the AU's reported latency,
+checks that retained broadband references correlate at zero lag, and compares
+complete 512-frame calls bit for bit with the older renderer. The old renderer
+includes its own transport compensation; the new one never compensates.
+A short final call is metered at its actual length, so its gain can differ from
+the older runner's zero-padded last block. Missing or refused states are reported
+separately. These timing checks supplement the amplitude gate; a synthetic
+impulse checked against latency metadata is not a fresh AU impulse render.
