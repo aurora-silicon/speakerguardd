@@ -934,8 +934,8 @@ impl DynamicRun {
     }
 
     /// Rebuild the coefficient sets for volume automation without resetting
-    /// any detector, controller or carrier history. These ToneMeister shapes
-    /// update one fixed parallel carrier in place.
+    /// any detector, controller or carrier history. Non-shelf shapes update
+    /// one fixed parallel carrier; type 17 keeps its per-frame moving pole.
     fn reconfigure(&mut self, params: &DynamicFilter, fs: f64) {
         let fresh = Self::new(params, fs);
         self.fs = fs;
@@ -1000,6 +1000,14 @@ impl DynamicRun {
         output
     }
 
+    fn step_f32_fused(section: &Section, state: &mut [f32; 2], input: f32) -> f32 {
+        let (b0, b1, b2, a1, a2) =
+            (section.b0 as f32, section.b1 as f32, section.b2 as f32, section.a1 as f32, section.a2 as f32);
+        let output = libm::fmaf(b0, input, state[0]);
+        state[0] = libm::fmaf(-a1, output, libm::fmaf(b1, input, state[1]));
+        state[1] = libm::fmaf(-a2, output, b2 * input);
+        output
+    }
     /// This table depends only on the configured law, not the detector
     /// level. Build it at construction and automation updates, retaining the
     /// original Float32 grid accumulation and exponential rounding.
@@ -1111,20 +1119,33 @@ impl DynamicRun {
                 gain[..len].fill(self.held);
             }
             self.control.run(&mut gain[..len]);
-            let mut carriers = [self.component; CONTROL_CHUNK];
-            if let Some(zero_hz) = self.shelf_zero_hz {
-                for (carrier, g) in carriers.iter_mut().zip(gain.iter()).take(len) {
-                    *carrier = Self::moving_shelf_carrier(zero_hz, f64::from(*g), self.fs).unwrap_or(self.component);
-                }
-            }
             for (c, buf) in bufs.iter_mut().enumerate().take(n) {
                 if at.active_mask >> c & 1 == 0 {
                     continue;
                 }
-                for ((sample, g), carrier) in buf[from..from + len].iter_mut().zip(gain.iter()).zip(carriers.iter()) {
+                let mut component = [0.0f32; CONTROL_CHUNK];
+                for (output, &input) in component.iter_mut().zip(&buf[from..from + len]) {
+                    *output = if input.is_finite() { input.clamp(-INPUT_BOUND, INPUT_BOUND) } else { 0.0 };
+                }
+                if let Some(zero_hz) = self.shelf_zero_hz {
+                    for k in 0..len {
+                        let carrier =
+                            Self::moving_shelf_carrier(zero_hz, f64::from(gain[k]), self.fs).unwrap_or(self.component);
+                        component[k] = Self::step_f32(&carrier, &mut self.component_state[c], component[k]);
+                    }
+                } else {
+                    for sample in &mut component[..len] {
+                        *sample = Self::step_f32_fused(&self.component, &mut self.component_state[c], *sample);
+                    }
+                }
+                for ((sample, g), component) in buf[from..from + len].iter_mut().zip(gain.iter()).zip(component.iter()) {
                     let input = if sample.is_finite() { sample.clamp(-INPUT_BOUND, INPUT_BOUND) } else { 0.0 };
-                    let component = Self::step_f32(carrier, &mut self.component_state[c], input);
-                    let output = input + (g - 1.0) * component;
+                    // The installed vector path subtracts one from the
+                    // control, multiplies the carrier, then adds the dry
+                    // signal. Keep all three Float32 roundings separate.
+                    let control = *g - 1.0;
+                    let scaled = *component * control;
+                    let output = input + scaled;
                     *sample = if output.is_finite() { output } else { 0.0 };
                 }
             }
@@ -1231,6 +1252,13 @@ impl ControlFilter {
     fn reset_zero(&mut self) {
         self.z = [0.0; 2];
         self.history = [0.0; 4];
+    }
+
+    fn run_zeroed(section: &Section, state: &mut [f32; 2], buf: &mut [f32]) {
+        let mut filter = Self::zeroed(section);
+        filter.z = *state;
+        filter.run(buf);
+        *state = filter.z;
     }
 
     fn install(&mut self, c: [f64; 5]) {
@@ -1488,13 +1516,11 @@ impl PreStage {
     }
 
     /// Float-coefficient counterpart of [`Self::run_sections`] for a
-    /// ToneMeister box. Its static cascade rounds after every section and
-    /// steps each frame as a fused transposed direct form II, the way the
-    /// platform's single-precision multichannel biquad steps a setup of two
-    /// or more channels (black-box renders of the installed unit: a
-    /// 2-channel box's automated peak matches it bit for bit; the unfused
-    /// form leaves a rounding floor up to 8 dB louder, e.g. under a 16 kHz
-    /// tone through 80-100 Hz sections).
+    /// ToneMeister box. A one-section setup steps each frame as fused
+    /// transposed direct form II. A multi-section setup uses the platform's
+    /// grouped kernel section by section. This keeps the single automated
+    /// peak bit-exact while preserving the grouped rounding of shelf and
+    /// full-box cascades.
     fn run_sections_float(&mut self, c: usize, from: usize, to: usize, gain: f64, buf: &mut [f32]) {
         let (Some(ch), Some(z)) = (self.params.channel.get(c), self.state.get_mut(c)) else {
             buf.fill(0.0);
@@ -1502,6 +1528,26 @@ impl PreStage {
         };
         let to = to.min(ch.count).min(MAX_SECTIONS);
         let from = from.min(to);
+        if to - from > 1 {
+            for sample in buf.iter_mut() {
+                *sample = if sample.is_finite() { sample.clamp(-INPUT_BOUND, INPUT_BOUND) } else { 0.0 };
+            }
+            for (section, state) in ch.sections[from..to].iter().zip(z[from..to].iter_mut()) {
+                let mut state_f32 = [state[0] as f32, state[1] as f32];
+                ControlFilter::run_zeroed(section, &mut state_f32, buf);
+                *state = state_f32.map(f64::from);
+            }
+            for sample in buf.iter_mut() {
+                *sample *= gain as f32;
+                if !sample.is_finite() {
+                    for state in z[from..to].iter_mut() {
+                        *state = [0.0; 2];
+                    }
+                    *sample = 0.0;
+                }
+            }
+            return;
+        }
         for y in buf.iter_mut() {
             let mut v = if y.is_finite() { y.clamp(-INPUT_BOUND, INPUT_BOUND) } else { 0.0 };
             for (s, st) in ch.sections[from..to].iter().zip(z[from..to].iter_mut()) {
@@ -1682,6 +1728,25 @@ impl PreStage {
             return;
         }
         let secs = &ch.sections[..ch.count.min(MAX_SECTIONS)];
+        let len = input.len().min(output.len());
+        if secs.len() > 1 {
+            for (x, y) in input.iter().zip(output.iter_mut()).take(len) {
+                *y = if x.is_finite() { x.clamp(-INPUT_BOUND, INPUT_BOUND) } else { 0.0 };
+            }
+            for (section, state) in secs.iter().zip(z.iter_mut()) {
+                let mut state_f32 = [state[0] as f32, state[1] as f32];
+                ControlFilter::run_zeroed(section, &mut state_f32, &mut output[..len]);
+                *state = state_f32.map(f64::from);
+            }
+            for sample in &mut output[..len] {
+                *sample *= ch.gain as f32;
+                if !sample.is_finite() {
+                    *z = [[0.0; 2]; MAX_SECTIONS];
+                    *sample = 0.0;
+                }
+            }
+            return;
+        }
         for (x, y) in input.iter().zip(output.iter_mut()) {
             let mut v = if x.is_finite() { x.clamp(-INPUT_BOUND, INPUT_BOUND) } else { 0.0 };
             for (s, st) in secs.iter().zip(z.iter_mut()) {
@@ -1987,6 +2052,36 @@ mod tests {
         filter.run(&mut floor);
         // Second-order low-pass: the first frames barely move.
         assert!(floor[0] > 0.999 && floor[63] < floor[0]);
+    }
+
+    #[test]
+    fn float_tone_sections_select_the_platform_kernel_by_section_count() {
+        let section = hp2(1_000.0, 48_000.0);
+        let input = [0.5, -0.25, 0.125, 0.75, -0.9, 0.2, 0.4, -0.1, 0.3, -0.6, 0.8, 0.05, -0.7, 0.9, -0.2, 0.1, 0.6];
+        let mut expected_grouped = input;
+        let mut filter = ControlFilter::zeroed(&section);
+        filter.run(&mut expected_grouped);
+        filter.reset_zero();
+        filter.run(&mut expected_grouped);
+
+        let mut stage = PreStage::new(params(&[section, section], 1.0));
+        let mut actual = [0.0; 17];
+        stage.process_float(0, &input, &mut actual);
+        assert_eq!(actual, expected_grouped);
+
+        let mut expected_fused = input;
+        let mut state = [0.0f32; 2];
+        let (b0, b1, b2, a1, a2) =
+            (section.b0 as f32, section.b1 as f32, section.b2 as f32, section.a1 as f32, section.a2 as f32);
+        for sample in &mut expected_fused {
+            let output = libm::fmaf(b0, *sample, state[0]);
+            state[0] = libm::fmaf(-a1, output, libm::fmaf(b1, *sample, state[1]));
+            state[1] = libm::fmaf(-a2, output, b2 * *sample);
+            *sample = output;
+        }
+        let mut stage = PreStage::new(params(&[section], 1.0));
+        stage.process_float(0, &input, &mut actual);
+        assert_eq!(actual, expected_fused);
     }
 
     #[test]
