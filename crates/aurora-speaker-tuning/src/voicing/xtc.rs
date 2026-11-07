@@ -27,9 +27,9 @@ const BINS: usize = FFT / 2;
 const CONSTRUCTION_RATE: f64 = 44_100.0;
 const CACHED_LENGTH_MS: f64 = 2.0;
 const CACHED_HP_HZ: f64 = 900.0;
-const CACHED_HP_ORDER: u32 = 2;
+const CACHED_HP_ORDER: f64 = 2.0;
 const CACHED_LP_HZ: f64 = 10_000.0;
-const CACHED_LP_ORDER: u32 = 4;
+const CACHED_LP_ORDER: f64 = 4.0;
 /// The unit's construction-default effect mixer (both wet/dry taper points).
 /// The cached filter is built before the saved parameters are restored, so
 /// it carries this mix, not the saved one; likewise the saved gain trim does
@@ -104,14 +104,23 @@ fn spectrum(w: &Dict, name: &str) -> Result<[Complex; BINS]> {
     Ok(out)
 }
 
-fn band_weight(f: f64, hp: f64, hp_order: u32, lp: f64, lp_order: u32) -> f64 {
+fn band_weight(f: f64, hp: f64, hp_order: f64, lp: f64, lp_order: f64) -> f64 {
     if f <= 0.0 {
         return 0.0;
     }
     // The crossover uses the Butterworth power response, not its amplitude
     // response.  This is why an order-two edge is 12 dB/octave here.
-    let high = 1.0 / (1.0 + (hp / f).powi(hp_order as i32));
-    let low = 1.0 / (1.0 + (f / lp).powi(lp_order as i32));
+    // Orders are continuous controls. Preserve the existing integer path
+    // for construction defaults while retaining fractional saved orders.
+    let power = |x: f64, order: f64| {
+        if order.fract() == 0.0 {
+            x.powi(order as i32)
+        } else {
+            x.powf(order)
+        }
+    };
+    let high = 1.0 / (1.0 + power(hp / f, hp_order));
+    let low = 1.0 / (1.0 + power(f / lp, lp_order));
     high * low
 }
 
@@ -151,6 +160,90 @@ fn finite_fir(
         }
     }
     out
+}
+
+// Both initialization filters and the cached endpoint use the same
+// spectrum-to-finite-record law. Their controls and construction rates
+// differ because ClassInfo restores controls before the stream is installed.
+#[allow(clippy::too_many_arguments)]
+fn optimize(
+    mut raw: [[Complex; BINS]; 4],
+    state_rate: f64,
+    rate: f64,
+    hp: f64,
+    hp_order: f64,
+    lp: f64,
+    lp_order: f64,
+    length_ms: f64,
+    delay: usize,
+    alpha: f64,
+    wet: f64,
+) -> Params {
+    // Apply the crossover at the dictionary's spectral sample rate before
+    // remapping to the rate at which this filter was constructed.
+    for (m, matrix) in raw.iter_mut().enumerate() {
+        let diagonal = m == 0 || m == 3;
+        for (k, bin) in matrix.iter_mut().enumerate() {
+            let f = k as f64 * state_rate / FFT as f64;
+            let c = band_weight(f, hp, hp_order, lp, lp_order);
+            let identity = if diagonal { 1.0 } else { 0.0 };
+            *bin = bin.sub_real(identity).scale(c).add_real(identity);
+        }
+    }
+
+    // The optimizer linearly remaps the setup's bins before its IDFT.
+    let mut remapped = [[Complex::default(); BINS]; 4];
+    for (m, destination) in remapped.iter_mut().enumerate() {
+        for (k, bin) in destination.iter_mut().enumerate() {
+            let x = k as f64 * rate / state_rate;
+            let lo = x.floor() as usize;
+            let t = x - lo as f64;
+            *bin = if lo + 1 >= BINS {
+                raw[m][BINS - 1]
+            } else {
+                Complex {
+                    re: raw[m][lo].re * (1.0 - t) + raw[m][lo + 1].re * t,
+                    im: raw[m][lo].im * (1.0 - t) + raw[m][lo + 1].im * t,
+                }
+            };
+        }
+    }
+
+    let mut freq = [[Complex::default(); BINS]; 4];
+    for (m, destination) in freq.iter_mut().enumerate() {
+        let identity = if m == 0 || m == 3 { 1.0 } else { 0.0 };
+        for (k, bin) in destination.iter_mut().enumerate() {
+            *bin = remapped[m][k].scale(wet).add_real((1.0 - wet) * identity);
+        }
+    }
+
+    // DC is the exact direct-only endpoint (the crossover is zero there).
+    // The destination Nyquist bin is remapped like every other bin; only its
+    // real part survives a real transform.
+    let mut nyquist = [0.0; 4];
+    for (m, value) in nyquist.iter_mut().enumerate() {
+        let identity = if m == 0 || m == 3 { 1.0 } else { 0.0 };
+        let x = BINS as f64 * rate / state_rate;
+        let lo = x.floor() as usize;
+        let t = x - lo as f64;
+        let re = if lo + 1 >= BINS { raw[m][BINS - 1].re } else { raw[m][lo].re * (1.0 - t) + raw[m][lo + 1].re * t };
+        *value = re * wet + (1.0 - wet) * identity;
+    }
+
+    let count = (rate * length_ms / 1000.0).floor() as usize - 1;
+    let mut taps = finite_fir(&freq, nyquist, count, delay, alpha);
+
+    // The optimizer restores each matrix entry's exact DC after windowing by
+    // spreading the residual uniformly across its finite record.
+    for (m, vector) in taps.iter_mut().enumerate() {
+        let target = if m == 0 || m == 3 { 1.0 } else { 0.0 };
+        let correction = (target - vector[..count].iter().sum::<f64>()) / count as f64;
+        for x in &mut vector[..count] {
+            *x += correction;
+        }
+    }
+
+    Params { taps, count, ..Params::default() }
 }
 
 /// Compile the one exact state used by the builtin-speaker graph.  States
@@ -214,10 +307,8 @@ pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option
         exact(id, 0.0, "reserved parameter")?;
     }
 
-    // Saved crossover, orders, window, wet/dry taper and trim are restored
-    // after the cached filter exists and do not change it (black-box: a
-    // ClassInfo state with each of them altered renders bit-identically).
-    // Only the saved FIR length and group delay set the reported latency.
+    // The restored controls affect the intermediate startup filter and
+    // reset state. The settled cached endpoint retains construction defaults.
     let length_ms = req(12)?;
     let saved_delay_pct = req(14)?;
     if !(1.0..=20.0).contains(&length_ms) || !(0.0..=50.0).contains(&saved_delay_pct) {
@@ -236,91 +327,77 @@ pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option
     if w.get("WDataIsCompressed").and_then(Value::as_bool) != Some(true) {
         return Err(bad("Setup_0/W is not marked raw-DEFLATE compressed"));
     }
-    let mut raw = [spectrum(w, "11")?, spectrum(w, "12")?, spectrum(w, "21")?, spectrum(w, "22")?];
-    // ClassInfo creates the FIR as soon as it reads the custom dictionary.
-    // At that point the ordinary AU parameter blob has not restored the
-    // saved crossover yet, so the construction defaults are normative.
-    for (m, matrix) in raw.iter_mut().enumerate() {
-        let diagonal = m == 0 || m == 3;
-        for (k, bin) in matrix.iter_mut().enumerate() {
-            let f = k as f64 * state_rate / FFT as f64;
-            let c = band_weight(f, CACHED_HP_HZ, CACHED_HP_ORDER, CACHED_LP_HZ, CACHED_LP_ORDER);
-            let identity = if diagonal { 1.0 } else { 0.0 };
-            *bin = bin.sub_real(identity).scale(c).add_real(identity);
+    let raw = [spectrum(w, "11")?, spectrum(w, "12")?, spectrum(w, "21")?, spectrum(w, "22")?];
+    let cached_count = (CONSTRUCTION_RATE * CACHED_LENGTH_MS / 1000.0).floor() as usize - 1;
+    let mut p = optimize(
+        raw,
+        state_rate,
+        CONSTRUCTION_RATE,
+        CACHED_HP_HZ,
+        CACHED_HP_ORDER,
+        CACHED_LP_HZ,
+        CACHED_LP_ORDER,
+        CACHED_LENGTH_MS,
+        cached_count.div_ceil(2),
+        1.0,
+        CACHED_EFFECT_MIX_PERCENT / 100.0,
+    );
+    let reported_latency = (fs * length_ms / 1000.0 * saved_delay_pct / 100.0).round() as usize;
+    p.reported_latency = reported_latency;
+
+    let order = |id| -> Result<f64> {
+        let value = req(id)?;
+        if !(1.0..=10.0).contains(&value) {
+            return Err(bad(format!("crossover order {id} is {value}")));
         }
+        Ok(value)
+    };
+    let hp = req(6)?;
+    let lp = req(4)?;
+    let alpha = req(13)?;
+    let wet = req(20)? / 100.0;
+    let crossfade_ms = req(22)?;
+    if !(0.0..fs / 2.0).contains(&hp)
+        || hp == 0.0
+        || !(0.0..fs / 2.0).contains(&lp)
+        || lp == 0.0
+        || !(0.0..=1.0).contains(&alpha)
+        || !(0.0..=1.0).contains(&wet)
+        || !(100.0..=1000.0).contains(&crossfade_ms)
+    {
+        return Err(bad("restored crossover, window, mix or crossfade duration is out of range"));
     }
-
-    // The stream format is still at the AudioUnit's construction rate.  The
-    // optimizer linearly remaps the setup's frequency bins before its IDFT.
-    let mut remapped = [[Complex::default(); BINS]; 4];
-    for (m, destination) in remapped.iter_mut().enumerate() {
-        for (k, bin) in destination.iter_mut().enumerate() {
-            let x = k as f64 * CONSTRUCTION_RATE / state_rate;
-            let lo = x.floor() as usize;
-            let t = x - lo as f64;
-            *bin = if lo + 1 >= BINS {
-                raw[m][BINS - 1]
-            } else {
-                Complex {
-                    re: raw[m][lo].re * (1.0 - t) + raw[m][lo + 1].re * t,
-                    im: raw[m][lo].im * (1.0 - t) + raw[m][lo + 1].im * t,
-                }
-            };
-        }
-    }
-
-    let wet = CACHED_EFFECT_MIX_PERCENT / 100.0;
-    let mut freq = [[Complex::default(); BINS]; 4];
-    for (m, destination) in freq.iter_mut().enumerate() {
-        let identity = if m == 0 || m == 3 { 1.0 } else { 0.0 };
-        for (k, bin) in destination.iter_mut().enumerate() {
-            *bin = remapped[m][k].scale(wet).add_real((1.0 - wet) * identity);
-        }
-    }
-
-    // DC is the exact direct-only endpoint (the crossover is zero there).
-    // The destination Nyquist bin is remapped like every other bin; only its
-    // real part survives a real transform.
-    let mut nyquist = [0.0; 4];
-    for (m, value) in nyquist.iter_mut().enumerate() {
-        let identity = if m == 0 || m == 3 { 1.0 } else { 0.0 };
-        let x = BINS as f64 * CONSTRUCTION_RATE / state_rate;
-        let lo = x.floor() as usize;
-        let t = x - lo as f64;
-        let re = if lo + 1 >= BINS { raw[m][BINS - 1].re } else { raw[m][lo].re * (1.0 - t) + raw[m][lo + 1].re * t };
-        *value = re * wet + (1.0 - wet) * identity;
-    }
-
-    // floor(2 ms * 44.1 kHz) minus the duplicated endpoint: 87 stored taps.
-    // The cached optimizer is at its default 50% delay and Tukey=1 (Hann),
-    // independently of the later-restored saved parameter values.
-    let count = (CONSTRUCTION_RATE * CACHED_LENGTH_MS / 1000.0).floor() as usize - 1;
-    let applied_delay = count.div_ceil(2);
-    let mut taps = finite_fir(&freq, nyquist, count, applied_delay, 1.0);
-
-    // The optimizer restores each matrix entry's exact DC after windowing by
-    // spreading the residual uniformly across its finite record.
-    for (m, vector) in taps.iter_mut().enumerate() {
-        let target = if m == 0 || m == 3 { 1.0 } else { 0.0 };
-        let correction = (target - vector[..count].iter().sum::<f64>()) / count as f64;
-        for x in &mut vector[..count] {
-            *x += correction;
-        }
-    }
+    // At the carried system volume (0 dB) the upper taper point applies.
+    exact(19, 0.0, "upper wet/dry taper volume")?;
+    exact(21, 0.0, "startup gain trim")?;
+    let initial_count = (fs * CACHED_LENGTH_MS / 1000.0).floor() as usize - 1;
+    let initial = optimize(
+        raw,
+        state_rate,
+        fs,
+        CACHED_HP_HZ,
+        CACHED_HP_ORDER,
+        CACHED_LP_HZ,
+        CACHED_LP_ORDER,
+        CACHED_LENGTH_MS,
+        initial_count / 2,
+        1.0,
+        CACHED_EFFECT_MIX_PERCENT / 100.0,
+    );
+    let restored = optimize(raw, state_rate, fs, hp, order(7)?, lp, order(5)?, length_ms, reported_latency, alpha, wet);
+    let crossfade_frames = (fs * crossfade_ms / 1000.0).round() as usize;
 
     diags.info(
         "xtc-setup",
         stage.name.clone(),
         format!(
-            "Setup_0, {count}-tap cached stereo FIR, {wet:.3} construction wet, reported delay {:.3}%",
-            saved_delay_pct
+            "Setup_0, {}-tap cached stereo FIR with queued startup filters, reported delay {:.3}%",
+            p.count, saved_delay_pct
         ),
     );
-    let reported_latency = (fs * length_ms / 1000.0 * saved_delay_pct / 100.0).round() as usize;
-    let p = Params { taps, count, reported_latency };
-    let mut words = vec![0.0; Params::WORDS];
-    p.to_words(&mut words);
-    Params::from_words(&words).ok_or_else(|| bad("compiled FIR violates the bounded core parameter format")).map(Some)
+    p.with_startup(initial, restored, crossfade_frames)
+        .ok_or_else(|| bad("compiled FIR violates the bounded core parameter format"))
+        .map(Some)
 }
 
 #[cfg(test)]
@@ -435,19 +512,39 @@ mod tests {
     }
 
     #[test]
-    fn saved_mix_trim_and_crossover_do_not_reach_the_cached_filter() {
+    fn saved_controls_do_not_change_the_settled_filter() {
         let base = compile(&effect_stage(-0.5), 48_000.0, &mut Diagnostics::default()).unwrap().unwrap();
         assert!(base.taps[1][..base.count].iter().any(|x| x.abs() > 1e-6));
         for changes in [
             &[(18, 65.0), (20, 65.0)][..],
             &[(17, -50.0), (18, 45.0), (20, 45.0)][..],
-            &[(21, 3.0)][..],
             &[(4, 9_000.0), (5, 5.99), (6, 2_000.0), (7, 2.0), (13, 1.0)][..],
         ] {
             let s = with_params(effect_stage(-0.5), changes);
             let p = compile(&s, 48_000.0, &mut Diagnostics::default()).unwrap().unwrap();
             assert_eq!(p.taps, base.taps, "{changes:?}");
         }
+    }
+
+    #[test]
+    fn carries_restored_controls_and_crossfade_duration_separately() {
+        let s = with_params(effect_stage(-0.5), &[(22, 250.0), (20, 60.0)]);
+        let p = compile(&s, 48_000.0, &mut Diagnostics::default()).unwrap().unwrap();
+        let startup = p.startup.as_ref().unwrap();
+        assert_eq!(startup.crossfade_frames, 12_000);
+        assert_eq!(startup.initial.count, 95);
+        assert_eq!(startup.restored.count, 95);
+        assert_ne!(startup.initial.taps, startup.restored.taps);
+        assert!(compile(&with_params(s, &[(21, 3.0)]), 48_000.0, &mut Diagnostics::default()).is_err());
+        let fractional = |order| {
+            compile(&with_params(effect_stage(-0.5), &[(5, order)]), 48_000.0, &mut Diagnostics::default())
+                .unwrap()
+                .unwrap()
+                .startup
+                .unwrap()
+                .restored
+        };
+        assert_ne!(fractional(5.25).taps, fractional(5.75).taps);
     }
 
     #[test]

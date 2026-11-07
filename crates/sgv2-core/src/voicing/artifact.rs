@@ -242,11 +242,21 @@ impl Wire for Kind {
                 out.put(o);
             }
             Self::Xtc(p) => {
-                6u32.put(o);
+                (if p.startup.is_some() { 21u32 } else { 6u32 }).put(o);
                 let mut w = vec![0.0; super::xtc::Params::WORDS];
                 p.to_words(&mut w);
                 for v in w {
                     v.put(o);
+                }
+                if let Some(startup) = &p.startup {
+                    for filter in [&startup.initial, &startup.restored] {
+                        let mut w = vec![0.0; super::xtc::Params::WORDS];
+                        filter.to_words(&mut w);
+                        for v in w {
+                            v.put(o);
+                        }
+                    }
+                    startup.crossfade_frames.put(o);
                 }
             }
             Self::Cfreak(p) => {
@@ -345,9 +355,19 @@ impl Wire for Kind {
             3 => Self::Comp(Dynamics::get(r)?),
             4 => Self::Bypass,
             17 => Self::Sum(usize::get(r)?),
-            6 => {
+            tag @ (6 | 21) => {
                 let w: Vec<f64> = (0..super::xtc::Params::WORDS).map(|_| f64::get(r)).collect::<Result<_>>()?;
-                Self::Xtc(Box::new(super::xtc::Params::from_words(&w).ok_or(BlobError::Unstable)?))
+                let mut params = super::xtc::Params::from_words(&w).ok_or(BlobError::Unstable)?;
+                if tag == 21 {
+                    let mut filter = || -> Result<super::xtc::Params> {
+                        let w: Vec<f64> = (0..super::xtc::Params::WORDS).map(|_| f64::get(r)).collect::<Result<_>>()?;
+                        super::xtc::Params::from_words(&w).ok_or(BlobError::Unstable)
+                    };
+                    let initial = filter()?;
+                    let restored = filter()?;
+                    params = params.with_startup(initial, restored, usize::get(r)?).ok_or(BlobError::Unstable)?;
+                }
+                Self::Xtc(Box::new(params))
             }
             tag @ (7 | 18) => {
                 let words = if tag == 7 { super::cfreak::Params::LEGACY_WORDS } else { super::cfreak::Params::WORDS };
@@ -460,6 +480,7 @@ fn validate(spec: &Spec, fs: f64, lanes: usize) -> Result<()> {
             return Err(BlobError::Unstable);
         }
         match &node.kind {
+            Kind::Xtc(p) if !p.valid() => return Err(BlobError::Unstable),
             Kind::Xtc(_) | Kind::Vbass(_) if width != 2 => return Err(BlobError::Channels),
             Kind::Norm(_) if width > super::norm::MAX_CHANNELS => return Err(BlobError::Channels),
             Kind::Cdelay(p) if p.channels != width => return Err(BlobError::Channels),
@@ -472,4 +493,27 @@ fn validate(spec: &Spec, fs: f64, lanes: usize) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod xtc_startup_tests {
+    use super::*;
+
+    #[test]
+    fn startup_node_preserves_both_filters_and_legacy_node_stays_readable() {
+        let mut initial = super::super::xtc::Params::identity();
+        initial.taps[0][0] = 0.5;
+        let mut restored = initial.clone();
+        restored.taps[3][0] = 0.25;
+        let params = super::super::xtc::Params::identity().with_startup(initial, restored, 7).unwrap();
+        for params in [params, super::super::xtc::Params::identity()] {
+            let kind = Kind::Xtc(Box::new(params.clone()));
+            let mut bytes = Vec::new();
+            kind.put(&mut bytes);
+            let mut reader = Reader(&bytes);
+            let Kind::Xtc(decoded) = Kind::get(&mut reader).unwrap() else { panic!("wrong node kind") };
+            assert_eq!(*decoded, params);
+            assert!(reader.0.is_empty());
+        }
+    }
 }

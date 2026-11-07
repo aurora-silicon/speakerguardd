@@ -31,6 +31,9 @@
 //! `--set ID=VALUE` (repeatable) overrides one saved global parameter of the
 //! box before it is compiled, as the macOS side of the rig sets the
 //! installed unit's.
+//!
+//! For XTC, `--q FRAMES` selects the render slice (1..4096) and
+//! `--reset-at FRAME` resets at an exact slice boundary before rendering it.
 
 use aurora_speaker_tuning::bundle::Bundle;
 use aurora_speaker_tuning::dspg::analysis::{Lane, Origin, Pass};
@@ -111,6 +114,8 @@ fn main() {
     let mut automation_input = None;
     let mut tone_volume = None;
     let mut own_timing = false;
+    let mut quantum = 512usize;
+    let mut reset_at = None;
     let mut sets: Vec<(u32, f32)> = Vec::new();
     let mut files = Vec::new();
     let mut it = std::env::args().skip(1);
@@ -125,6 +130,20 @@ fn main() {
             "--ch" => ch = it.next().and_then(|v| v.parse::<usize>().ok()),
             "--only-slot" => only_slot = it.next().and_then(|v| v.parse::<u32>().ok()),
             "--slot-own-timing" => own_timing = true,
+            "--q" => {
+                quantum = it
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .filter(|n| (1..=4096).contains(n))
+                    .unwrap_or_else(|| die("--q must be in 1..4096"));
+            }
+            "--reset-at" => {
+                reset_at = Some(
+                    it.next()
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .unwrap_or_else(|| die("--reset-at needs a frame number")),
+                );
+            }
             // Override one saved global parameter (ID=VALUE), as a rig sets
             // the installed unit's with AudioUnitSetParameter.
             "--set" => {
@@ -152,6 +171,9 @@ fn main() {
         die("--ch is outside the supported channel range")
     }
     if let Some(path) = params_words {
+        if quantum != 512 || reset_at.is_some() {
+            die("--q and --reset-at are only carried for XTC")
+        }
         if root.is_some() || aid.is_some() || name.is_some() || strip_path.is_some() {
             die("--params-words is exclusive with tuning selection")
         }
@@ -262,6 +284,9 @@ fn main() {
     let mut planar: Vec<Vec<f32>> = (0..ch).map(|c| (0..frames).map(|i| x[i * ch + c]).collect()).collect();
 
     let subtype = stage.unit.map(|u| u.subtype.to_string()).unwrap_or_default();
+    if subtype != "axtc" && (quantum != 512 || reset_at.is_some()) {
+        die("--q and --reset-at are only carried for XTC")
+    }
     match subtype.as_str() {
         "mstk" => {
             let p = voicing::mstk::compile(stage, fs, &mut diags).unwrap_or_else(|e| die(format!("{e:?}")));
@@ -380,14 +405,20 @@ fn main() {
                 links: Vec::new(),
                 relays: Vec::new(),
             };
-            let mut run = Chain::new(spec, fs, 512).unwrap_or_else(|| die("invalid isolated box"));
+            let mut run = Chain::new(spec, fs, quantum).unwrap_or_else(|| die("invalid isolated box"));
             let total = frames + extra;
+            if reset_at.is_some_and(|at| at >= total || at % quantum != 0) {
+                die("--reset-at must select an input frame at a render boundary")
+            }
             for channel in &mut planar {
                 channel.resize(total, 0.0);
             }
             let mut rendered = vec![vec![0.0f32; total]; ch];
-            for at in (0..total).step_by(512) {
-                let k = (total - at).min(512);
+            for at in (0..total).step_by(quantum) {
+                if reset_at == Some(at) {
+                    run.reset();
+                }
+                let k = (total - at).min(quantum);
                 let input: Vec<&[f32]> = planar.iter().map(|v| &v[at..at + k]).collect();
                 let mut output: Vec<&mut [f32]> = rendered.iter_mut().map(|v| &mut v[at..at + k]).collect();
                 run.process(&input, &mut output, k);
