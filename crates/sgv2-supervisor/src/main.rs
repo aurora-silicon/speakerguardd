@@ -77,6 +77,11 @@ mod linux {
     const PCM_POLL_NS: u64 = 1_000_000;
     /// A PCM snapshot whose read started longer ago than this is Unknown.
     const PCM_SNAPSHOT_MAX_NS: u64 = 12_000_000;
+    /// How long a status read blocked behind an open in progress keeps the
+    /// last proof, Closed: no stream can start before that open returns, and
+    /// the read that follows it proves the owner at once. The J700's speaker
+    /// PCM takes ~190 ms to open (its first open after a grant).
+    const PCM_OPENING_MAX_NS: u64 = 500_000_000;
     /// A helper liveness check older than this vouches for nothing.
     const HELPER_CHECK_MAX_NS: u64 = 12_000_000;
     /// Waiting for the card: 50 ms doubling to 2 s.
@@ -146,18 +151,41 @@ mod linux {
     struct PcmSnapshot {
         state: AtomicU64,
         taken_ns: AtomicU64,
+        /// When the read in progress began, 0 between reads.
+        reading_ns: AtomicU64,
+    }
+
+    /// What the RT loop may take from the reader: the snapshot while it is
+    /// fresh; while a read has been blocked since right after a Closed
+    /// snapshot (the PCM's `/proc` status waits for an open in progress), that
+    /// Closed for at most `PCM_OPENING_MAX_NS`; otherwise Unknown, which is no
+    /// proof. Before this, the first open after a grant (its status read
+    /// blocked ~190 ms on the J700) read as Unknown and released the grant
+    /// it had just given, and PipeWire's start hit the floor.
+    fn snapshot_view(state: PcmState, taken: u64, reading: u64, now: u64) -> PcmState {
+        if taken != 0 && now.saturating_sub(taken) <= PCM_SNAPSHOT_MAX_NS {
+            return state;
+        }
+        let opening = matches!(state, PcmState::Closed)
+            && taken != 0
+            && reading >= taken
+            && reading - taken <= PCM_SNAPSHOT_MAX_NS
+            && now.saturating_sub(reading) <= PCM_OPENING_MAX_NS;
+        if opening {
+            PcmState::Closed
+        } else {
+            PcmState::Unknown
+        }
     }
 
     /// The RT side: never touches /proc.
     struct PcmLatest(Arc<PcmSnapshot>);
     impl PcmView for PcmLatest {
         fn read(&mut self) -> PcmState {
+            let reading = self.0.reading_ns.load(Ordering::Acquire);
             let taken = self.0.taken_ns.load(Ordering::Acquire);
             let state = PcmState::unpack(self.0.state.load(Ordering::Acquire));
-            if taken == 0 || now_ns().saturating_sub(taken) > PCM_SNAPSHOT_MAX_NS {
-                return PcmState::Unknown;
-            }
-            state
+            snapshot_view(state, taken, reading, now_ns())
         }
     }
 
@@ -186,7 +214,6 @@ mod linux {
             if unsafe { libc::sched_setscheduler(0, libc::SCHED_FIFO, &sp) } != 0 {
                 eprintln!("PCM reader: SCHED_FIFO unavailable; normal priority");
             }
-            let mut hbuf = String::with_capacity(1024);
             let paths: Vec<String> = (0..subs).map(|s| format!("{dir}/sub{s}/status")).collect();
             let mut buf = String::with_capacity(1024);
             let mut tbuf = String::with_capacity(2048);
@@ -194,6 +221,7 @@ mod linux {
             let mut last = PcmState::Closed;
             loop {
                 let started = now_ns();
+                out.reading_ns.store(started, Ordering::Release);
                 states.clear();
                 for p in &paths {
                     let st = if read_small(p, &mut buf) { parse_pcm_status(&buf) } else { PcmState::Unknown };
@@ -205,12 +233,28 @@ mod linux {
                 let now = combine(&states);
                 out.state.store(now.pack(), Ordering::Release);
                 out.taken_ns.store(started, Ordering::Release);
+                out.reading_ns.store(0, Ordering::Release);
                 if wakes(last, now) {
                     let one: u64 = 1;
                     // SAFETY: an eventfd we own; an 8-byte counter write.
                     unsafe { libc::write(wake, (&one as *const u64).cast(), 8) };
                 }
                 last = now;
+                sleep_until(started + PCM_POLL_NS);
+            }
+        })?;
+        // The helper's liveness on its own thread: a PCM status read blocked
+        // behind an open or close must not leave the report unvouched (the
+        // J700 released its first grant of every boot and wake that way).
+        std::thread::Builder::new().name("sgv2-helper".into()).spawn(move || {
+            let sp = libc::sched_param { sched_priority: 10 };
+            // SAFETY: this thread's own policy; failure is tolerated.
+            if unsafe { libc::sched_setscheduler(0, libc::SCHED_FIFO, &sp) } != 0 {
+                eprintln!("helper checker: SCHED_FIFO unavailable; normal priority");
+            }
+            let mut hbuf = String::with_capacity(1024);
+            loop {
+                let started = now_ns();
                 check_helper(&report, uid, &live, &mut hbuf);
                 sleep_until(started + PCM_POLL_NS);
             }
@@ -829,6 +873,33 @@ mod linux {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn a_status_read_blocked_by_an_open_keeps_closed_for_a_while() {
+            let ms = 1_000_000u64;
+            let closed = PcmState::Closed;
+            // fresh: as read
+            assert_eq!(snapshot_view(closed, 100 * ms, 0, 105 * ms), closed);
+            // stale and no read in progress (a starved reader): no proof
+            assert_eq!(snapshot_view(closed, 100 * ms, 0, 120 * ms), PcmState::Unknown);
+            // a read blocked since right after a Closed snapshot: Closed for up to the bound
+            assert_eq!(snapshot_view(closed, 100 * ms, 101 * ms, 300 * ms), closed);
+            assert_eq!(snapshot_view(closed, 100 * ms, 101 * ms, 101 * ms + PCM_OPENING_MAX_NS), closed);
+            assert_eq!(snapshot_view(closed, 100 * ms, 101 * ms, 102 * ms + PCM_OPENING_MAX_NS), PcmState::Unknown);
+            // a read that began long after the last snapshot proves nothing
+            assert_eq!(snapshot_view(closed, 100 * ms, 140 * ms, 150 * ms), PcmState::Unknown);
+            // never taken
+            assert_eq!(snapshot_view(closed, 0, 1, 2), PcmState::Unknown);
+        }
+
+        #[test]
+        fn a_blocked_read_after_an_open_stream_is_no_proof() {
+            let ms = 1_000_000u64;
+            let open = parse_pcm_status("state: RUNNING\nowner_pid   : 42\n");
+            assert_ne!(open, PcmState::Closed);
+            assert_eq!(snapshot_view(open, 100 * ms, 105 * ms, 110 * ms), open);
+            assert_eq!(snapshot_view(open, 100 * ms, 101 * ms, 150 * ms), PcmState::Unknown);
+        }
 
         #[test]
         fn the_helper_verdict_is_one_word_and_never_reads_half_written() {
