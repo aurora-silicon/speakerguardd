@@ -60,6 +60,11 @@ renderer refusals are retained separately. A zero stub count after a failed
 load is not a stub-free support claim. Counts include the diagnostic strips;
 they must not be interpreted as ordinary-playback parity failures.
 
+The per-AID Channels column records the protection input width. Per-box widths
+remain in JSON, including auxiliary LSID paths whose width can differ from
+the protection unit. Per-reason totals retain separate CLI-error, stub and
+probe/render-refusal columns; they are not a sum of unique failed invocations.
+
 Run `python3 tools/test_aid_sweep.py` and `python3 tools/test_aid_inventory.py`
 on the buildbox for synthetic privacy, route-coverage, failure-accounting and
 overlay-restoration checks. The original default-selection inventory below
