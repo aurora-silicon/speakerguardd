@@ -5,6 +5,7 @@
 //! voicing-render (--bundle PATH | --tunings-root DIR --aid N)
 //!     --in PROGRAM.f32 --out LANES.f32 [--mvsc S] [--mvol DB]
 //!     [--tap NODE=FILE.f32 ...] [--info FILE.json] [--block N] [--only NODE]
+//!     [--profile PROFILE.json]
 //! ```
 //!
 //! `--only NODE` runs that one box alone: the input has the box's width and
@@ -35,6 +36,7 @@ fn main() {
     let (mut mvsc, mut mvol, mut block) = (1.0f64, 0.0f64, 512usize);
     let mut taps: Vec<(String, String)> = Vec::new();
     let mut only: Option<String> = None;
+    let mut profile: Option<String> = None;
     while let Some(a) = args.next() {
         let mut v = || args.next().expect("value");
         match a.as_str() {
@@ -48,6 +50,7 @@ fn main() {
             "--mvol" => mvol = v().parse().expect("mvol"),
             "--block" => block = v().parse().expect("block"),
             "--only" => only = Some(v()),
+            "--profile" => profile = Some(v()),
             "--tap" => {
                 let s = v();
                 let (n, f) = s.split_once('=').expect("--tap NODE=FILE");
@@ -109,6 +112,9 @@ fn main() {
     let mut w = std::io::BufWriter::new(std::fs::File::create(&output).unwrap());
     let mut tw: Vec<_> =
         tap_nodes.iter().map(|(_, f)| std::io::BufWriter::new(std::fs::File::create(f).unwrap())).collect();
+    let mut node_ns = vec![0u128; chain.spec().nodes.len()];
+    let mut block_ns = Vec::new();
+    let mut node_start = std::time::Instant::now();
     let mut f = 0;
     while f < frames {
         let n = block.min(frames - f);
@@ -119,7 +125,19 @@ fn main() {
         }
         let pr: Vec<&[f32]> = prog.iter().map(|v| &v[..n]).collect();
         let mut or: Vec<&mut [f32]> = outs.iter_mut().map(|v| &mut v[..n]).collect();
-        chain.process(&pr, &mut or, n);
+        if profile.is_some() {
+            let start = std::time::Instant::now();
+            chain.process_observed(&pr, &mut or, n, |node, entering| {
+                if entering {
+                    node_start = std::time::Instant::now();
+                } else {
+                    node_ns[node] += node_start.elapsed().as_nanos();
+                }
+            });
+            block_ns.push(start.elapsed().as_nanos());
+        } else {
+            chain.process(&pr, &mut or, n);
+        }
         for i in 0..n {
             for o in &outs {
                 w.write_all(&o[i].to_le_bytes()).unwrap();
@@ -134,5 +152,28 @@ fn main() {
             }
         }
         f += n;
+    }
+    if let Some(path) = profile {
+        let total_ns: u128 = block_ns.iter().sum();
+        let nodes: Vec<_> = chain
+            .spec()
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(i, node)| {
+                // The kind's variant name is public; omit its tuning parameters.
+                let kind = format!("{:?}", node.kind).split(['(', ' ', '{']).next().unwrap().to_owned();
+                serde_json::json!({"index": i, "kind": kind, "total_ns": node_ns[i]})
+            })
+            .collect();
+        block_ns.sort_unstable();
+        let j = serde_json::json!({
+            "frames": frames, "sample_rate": 48_000, "block": block,
+            "blocks": block_ns.len(), "total_ns": total_ns,
+            "max_block_ns": block_ns.last(),
+            "median_block_ns": block_ns.get(block_ns.len() / 2),
+            "nodes": nodes,
+        });
+        std::fs::write(path, serde_json::to_vec_pretty(&j).unwrap()).unwrap();
     }
 }

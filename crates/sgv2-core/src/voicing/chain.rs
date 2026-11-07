@@ -748,8 +748,24 @@ impl Chain {
     /// unit's channels). At most [`Chain::max_frames`] frames; more are cut.
     /// Real time.
     pub fn process(&mut self, program: &[&[f32]], lanes: &mut [&mut [f32]], frames: usize) {
+        self.process_observed(program, lanes, frames, |_, _| {});
+    }
+
+    /// Offline profiling hook. `observe(node, true)` precedes input routing
+    /// and `observe(node, false)` follows the node's processing. The ordinary
+    /// real-time entry point specializes this with an empty callback, so it
+    /// performs no clock reads or other profiling work.
+    #[inline]
+    pub fn process_observed(
+        &mut self,
+        program: &[&[f32]],
+        lanes: &mut [&mut [f32]],
+        frames: usize,
+        mut observe: impl FnMut(usize, bool),
+    ) {
         let frames = frames.min(self.max_frames);
         for n in 0..self.runs.len() {
+            observe(n, true);
             let w = self.spec.nodes[n].inputs.len();
             for c in 0..w {
                 let src = self.spec.nodes[n].inputs[c];
@@ -764,6 +780,7 @@ impl Chain {
             }
             let (x, y) = (&self.scratch[..w], &mut self.out[n][..]);
             self.runs[n].process(x, y, frames);
+            observe(n, false);
         }
         for (c, lane) in lanes.iter_mut().enumerate() {
             let n = frames.min(lane.len());
