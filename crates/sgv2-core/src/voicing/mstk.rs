@@ -2003,17 +2003,17 @@ mod tests {
     }
 
     #[test]
-    fn reset_clears_the_detector_and_overshoot_bank() {
+    fn reset_clears_the_analysis_and_overshoot_bank() {
         let mut run = Run::new(&params(), 48_000.0, 1);
         run.env = [0.25; BANDS];
         run.overshoot_state[0][0][0][0] = [0.25; 2];
-        run.quadrature[0][0].arm_a.input_delay[0][0] = 0.25;
+        run.half_analysis_low_a[0][0][0] = [0.25; 2];
         run.audio_quadrature[0].arm_b.output_delay[0][1] = 0.25;
         run.reset();
         assert_eq!(run.audio_quadrature[0].arm_b.output_delay, [[0.0; 2]; QUADRATURE_STAGES]);
         assert_eq!(run.env, [0.0; BANDS]);
         assert_eq!(run.overshoot_state[0][0][0][0], [0.0; 2]);
-        assert_eq!(run.quadrature[0][0].arm_a.input_delay, [[0.0; 2]; QUADRATURE_STAGES]);
+        assert_eq!(run.half_analysis_low_a[0][0][0], [0.0; 2]);
     }
 
     #[test]
