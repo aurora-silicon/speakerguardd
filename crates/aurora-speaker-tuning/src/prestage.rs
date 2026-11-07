@@ -32,12 +32,16 @@
 //! | 9 | flat gain | gain |
 //! | 11 | low shelf | matched-Z, two-zero magnitude-corrected low shelf |
 //! | 12 | high shelf | matched-Z, two-zero magnitude-corrected high shelf |
-//! | 0 | a Butterworth band shelf; four frequencies set its two edges | two Butterworth shelves and the compensating flat gain |
+//! | 0 | a Butterworth band shelf; four frequencies set its two edges | two Butterworth shelves, the compensating flat gain in the first section |
 //! | 2 | a Butterworth shelf; the first two frequencies set its direction, midpoint and slope | bilinear, prewarped Butterworth shelf sections |
 //! | 7 | a constant tilt, from `-gain` to `+gain` around the slot frequency | the decoded complementary biquad pair |
 //! | 14 | resonant second-order high-pass; gain and order are ignored | bilinear high-pass with the saved analog-decay quality convention |
 //! | 15 | a level-dependent notch | saved detector, range, ratio, threshold and attack/release law |
 //! | 18 | a level-dependent high shelf | saved detector, range, ratio, threshold and attack/release law |
+//!
+//! The level-dependent slots (15, 18) run after every static slot of the
+//! box, in slot order, whatever their slot numbers: each detects the box's
+//! whole static response (measured on full-box renders).
 //!
 //! A peak or shelf of 0 dB is left out (the identity). Every other type is
 //! refused, as is a slot whose values are out of range.
@@ -56,7 +60,12 @@
 //! The system volume is the unit's parameter 3 (0 to 1). This reading is
 //! from the unit's measured response on test signals at volumes 0 to 1; a
 //! set point's gain does not act on a Butterworth slot, as the slot's own
-//! gain does not.
+//! gain does not. An entry runs only when its state is 2 or more: states 0
+//! and 1 (and fractions below 2) change nothing at any volume, while 2, 3,
+//! 4, 6, 7 and 1000 act identically (measured). A Butterworth shelf moves as
+//! a whole: the set point's frequency replaces the shelf's reference and
+//! every edge frequency scales with it (type 2: the first edge; type 0: the
+//! geometric centre of the two inner edges, `sqrt(f2 f3)`).
 //! The pre-stage does not follow the volume; it carries, for every slot an
 //! entry moves, the one setting that passes no more than any setting the
 //! slot can take, at every frequency:
@@ -76,8 +85,7 @@
 //!
 //! On a Mac whose tuning raises a high-pass and fades boosts as the volume
 //! rises, that is the setting macOS runs at full volume. An entry aimed at
-//! a running slot with a state other than 1 or 2, or with set points out of
-//! order, refuses the compile.
+//! a running slot with set points out of order refuses the compile.
 //!
 //! The voicing chain does follow the volume: [`voicing_tone`] carries a
 //! slot the chain can move exactly (a peak, shelf, Butterworth or gain with
@@ -157,8 +165,12 @@ const AUTOMATION_ENTRIES: u32 = 10;
 /// order field caps type-0/2 Butterworth shelves, not these crossovers.
 pub const MAX_ORDER: u32 = 20;
 
+/// A volume automation entry runs when its state is 2 or more. Black-box
+/// renders of the installed unit: states 0, 0.5, 1, 1.5 and -1 leave the
+/// slot at its own values at every volume; 2, 3, 4, 6, 7 and the legacy
+/// 1000 move it identically, at the set points and between them.
 fn automation_on(state: f64) -> bool {
-    state != 0.0
+    state >= 2.0
 }
 
 fn bad(message: impl Into<String>) -> Error {
@@ -451,7 +463,7 @@ fn tone_dynamic(parts: &[Part], ctx: &str) -> Result<Vec<DynamicAt>> {
 }
 
 /// The volume automation entries of a filter box that move something: on
-/// (state nonzero, including 2 and the legacy value 1000), aimed at a slot, with two distinct volume set points
+/// (state 2 or more, see [`automation_on`]), aimed at a slot, with two distinct volume set points
 /// (entry words 2 and 3). An entry whose set points coincide was measured
 /// to change nothing at any volume (black-box renders of the unit), so it
 /// is not counted.
@@ -528,7 +540,6 @@ struct Point {
 #[derive(Clone, Copy, Debug)]
 struct Automation {
     target: u32,
-    state: f64,
     a: f64,
     b_at: f64,
     b: Point,
@@ -541,9 +552,6 @@ impl Automation {
     /// be ones whose meaning is settled.
     fn check(&self, ctx: &str, e: u32, kind: i64) -> Result<()> {
         let fail = |why: &str| Err(bad(format!("{ctx}: volume automation {e} on slot {}: {why}", self.target)));
-        if self.state != 1.0 && self.state != 2.0 {
-            return fail(&format!("state {}", self.state));
-        }
         if self.m_enable != 0.0 && self.m_enable != 1.0 {
             return fail(&format!("set point M enable {}", self.m_enable));
         }
@@ -585,13 +593,42 @@ impl Automation {
     }
 }
 
+/// A type-0/2 Butterworth shelf moves as a whole with its volume automation
+/// (see the module notes): every set point's frequency over the shelf's
+/// reference scales all of its edge frequencies. The chain follows the
+/// glide only when every edge stays inside 0 to Nyquist at every point.
+/// `edges` are the slot's two (type 2) or four (type 0) frequency fields.
+fn shelf_moves_in_band(edges: &[f64], a: &Automation, nyquist: f64) -> bool {
+    let reference = shelf_reference(edges);
+    reference.is_finite()
+        && reference > 0.0
+        && a.middle.map(|(_, m)| m).into_iter().chain([a.b]).all(|pt| {
+            let scale = pt.f0 / reference;
+            edges.iter().all(|&f| {
+                let moved = f * scale;
+                moved.is_finite() && moved > 0.0 && moved < nyquist
+            })
+        })
+}
+
+/// The frequency a type-0/2 shelf's volume automation moves: a type-2
+/// shelf's first edge, a type-0 band shelf's geometric centre of its two
+/// inner edges.
+fn shelf_reference(edges: &[f64]) -> f64 {
+    match edges {
+        [first, _] => *first,
+        [_, f2, f3, _] => (f2 * f3).sqrt(),
+        _ => f64::NAN,
+    }
+}
+
 /// The box's volume automation entries that are switched on, by entry.
 fn automation_entries(get: &dyn Fn(u32) -> f64, ctx: &str) -> Result<Vec<(u32, Automation)>> {
     let mut v = Vec::new();
     for e in 0..AUTOMATION_ENTRIES {
         let at = |k: u32| get(AUTOMATION_BASE + AUTOMATION_STRIDE * e + k);
         let (target, state) = (at(0), at(1));
-        if state == 0.0 {
+        if !automation_on(state) {
             continue;
         }
         if !(0.0..SLOTS as f64).contains(&target) || target.fract() != 0.0 {
@@ -602,7 +639,6 @@ fn automation_entries(get: &dyn Fn(u32) -> f64, ctx: &str) -> Result<Vec<(u32, A
             e,
             Automation {
                 target: target as u32,
-                state,
                 a: at(2),
                 b_at: at(3),
                 b: Point { gain: at(4), f0: at(5) },
@@ -792,7 +828,12 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics, mode: Rea
             && matches!(kind, 0 | 1 | 2 | 3 | 4 | 9 | 11 | 12 | 14)
             && !in_bypassed_group
             && moving.len() == 1
-            && moving[0].chain_exact(points[0]);
+            && moving[0].chain_exact(points[0])
+            && match kind {
+                0 => shelf_moves_in_band(&[f0, q, order, at(6)?], moving[0], nyquist),
+                2 => shelf_moves_in_band(&[f0, q], moving[0], nyquist),
+                _ => true,
+            };
         let dynamic_exact = mode == Realise::Saved
             && dynamic_kind.is_some()
             && !in_bypassed_group
@@ -850,7 +891,8 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics, mode: Rea
             let sidechain_bits = sidechain_mask as u32;
             p.dynamics.push(PartDynamic {
                 slot: i,
-                split: p.sections.len(),
+                // set to the end of the box's static slots below
+                split: 0,
                 active,
                 sidechain: (if sidechain_bits == 0 { mask as u32 } else { sidechain_bits }) >> ch & 1 != 0,
                 params: DynamicFilter {
@@ -1048,10 +1090,17 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics, mode: Rea
                     }
                     // Type 0 is exactly a rising shelf over f3..f4 and a
                     // falling shelf over f5..f6, with a compensating flat
-                    // gain so both outer asymptotes are 0 dB.
-                    p.sections.extend(reserve(butterworth_shelf(gain, q, f0, max_order, fs)));
-                    p.sections.extend(reserve(butterworth_shelf(gain, f5, f6, max_order, fs)));
-                    p.gain_db -= gain;
+                    // gain so both outer asymptotes are 0 dB. The flat gain
+                    // acts at the slot, inside its first section: a
+                    // level-dependent slot after it detects the band shelf's
+                    // true response, as the unit's does (full-box renders).
+                    let mut band = reserve(butterworth_shelf(gain, q, f0, max_order, fs));
+                    band.extend(reserve(butterworth_shelf(gain, f5, f6, max_order, fs)));
+                    if band.is_empty() {
+                        band.push(Section::IDENTITY);
+                    }
+                    band[0] = band[0].scaled(10f64.powf(-gain / 20.0));
+                    p.sections.extend(band);
                 }
             }
             t => {
@@ -1098,6 +1147,15 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics, mode: Rea
                 format!("slot {i}: carried at its saved values; the voicing chain follows its volume automation"),
             );
         }
+    }
+    // The unit runs every static slot of the box first and its
+    // level-dependent slots after them, in slot order: a level-dependent
+    // slot's detector sees the box's whole static response, including the
+    // slots numbered after it (full-box black-box renders of AID21 Tone2
+    // and AID36 Tone1; an isolated-slot render cannot tell the two apart).
+    let n = p.sections.len();
+    for d in &mut p.dynamics {
+        d.split = n;
     }
     if p.sections.iter().any(|s| !s.stable()) {
         return Err(bad(format!("{ctx}: a filter of channel {ch} is unstable at {fs} Hz")));
@@ -1701,15 +1759,31 @@ mod tests {
         assert_eq!((p0.sections.len(), p0.gain_db), (0, -7.0));
         let p1 = part(&st, 1, fs, &mut d).unwrap();
         assert_eq!((p1.sections.len(), p1.gain_db), (2, -7.0));
-        // Type-0 band shelves are carried as their two exact edges plus the
-        // flat compensation (offset 6 is supplied separately by this terse
-        // synthetic-slot helper).
+        // Type-0 band shelves are carried as their two exact edges, the
+        // flat compensation inside the first section, where a later
+        // level-dependent slot detects it (offset 6 is supplied separately
+        // by this terse synthetic-slot helper).
         let boost = tmst(&[(20, 3000.0)], &[(0, [3.0, 0.0, 2.0, 700.0, 800.0, 1800.0, 3.0, 0.0])]);
         let pb = part(&boost, 0, fs, &mut d).unwrap();
-        assert_eq!((pb.sections.len(), pb.gain_db), (3, -2.0));
+        assert_eq!((pb.sections.len(), pb.gain_db), (3, 0.0));
         let cut = tmst(&[(20, 3000.0)], &[(0, [3.0, 0.0, -2.0, 700.0, 800.0, 1800.0, 3.0, 0.0])]);
         let pc = part(&cut, 0, fs, &mut d).unwrap();
-        assert_eq!((pc.sections.len(), pc.gain_db), (3, 2.0));
+        assert_eq!((pc.sections.len(), pc.gain_db), (3, 0.0));
+        let db = |p: &Part, f: f64| {
+            let mut ch = Channel::IDENTITY;
+            ch.count = p.sections.len();
+            ch.sections[..p.sections.len()].copy_from_slice(&p.sections);
+            20.0 * ch.magnitude(f, fs).log10()
+        };
+        // the two shelves less the gain, at every frequency
+        for (p, g) in [(&pb, 2.0), (&pc, -2.0)] {
+            let mut shelves = butterworth_shelf(g, 800.0, 700.0, MAX_ORDER, fs);
+            shelves.extend(butterworth_shelf(g, 1800.0, 3000.0, MAX_ORDER, fs));
+            let reference = Part { sections: shelves, gain_db: -g, ..Part::default() };
+            for f in [1.0, 300.0, 750.0, 1200.0, 2300.0, 8000.0] {
+                assert!((db(p, f) - db(&reference, f) + g).abs() < 1e-9, "{g} dB at {f} Hz");
+            }
+        }
         // a 0 dB peak at 0 Hz is the identity; a level-dependent cut is a
         // runtime dynamic slot rather than a fixed full-depth section
         let flat = tmst(&[], &[(0, [3.0, 1.0, 0.0, 0.0, 0.1, 2.0, 3.0, 0.0])]);
@@ -1718,6 +1792,14 @@ mod tests {
         let pd = part(&dynamic, 0, fs, &mut d).unwrap();
         assert_eq!((pd.sections.len(), pd.dynamics.len()), (0, 1));
         assert_eq!(pd.dynamics[0].params.kind, DynamicKind::Notch);
+        // it runs after every static slot of the box, a later-numbered one
+        // included
+        let after = tmst(
+            &[],
+            &[(0, [3.0, 15.0, -9.0, 200.0, 3.0, 3.0, 3.0, 0.0]), (1, [3.0, 1.0, -6.0, 250.0, 5.0, 2.0, 3.0, 0.0])],
+        );
+        let pa = part(&after, 0, fs, &mut d).unwrap();
+        assert_eq!((pa.sections.len(), pa.dynamics[0].split), (1, 1));
         let (tone, partial) = voicing_tone(&dynamic, 2, false, fs, &mut d).unwrap();
         assert!(partial.is_empty());
         assert_eq!(tone.dynamic.len(), 1);
@@ -1774,21 +1856,25 @@ mod tests {
         assert!(part(&high, 0, fs, &mut d).is_err());
         // volume automation: see `volume_automation`; one with values whose
         // meaning is not settled is refused
-        let auto = tmst(
-            &[
-                (AUTOMATION_BASE, 0.0),
-                (AUTOMATION_BASE + 1, 1.0),
-                (AUTOMATION_BASE + 2, 0.8),
-                (AUTOMATION_BASE + 3, 0.2),
-            ],
-            &[(0, [3.0, 4.0, 0.0, 200.0, 0.7, 2.0, 3.0, 0.0])],
-        );
-        assert!(part(&auto, 0, fs, &mut d).is_err());
-        let state = tmst(
-            &[(AUTOMATION_BASE, 0.0), (AUTOMATION_BASE + 1, 5.0), (AUTOMATION_BASE + 3, 1.0)],
-            &[(0, [3.0, 4.0, 0.0, 200.0, 0.7, 2.0, 3.0, 0.0])],
-        );
-        assert!(part(&state, 0, fs, &mut d).is_err());
+        let reversed = |state: f32| {
+            tmst(
+                &[
+                    (AUTOMATION_BASE, 0.0),
+                    (AUTOMATION_BASE + 1, state),
+                    (AUTOMATION_BASE + 2, 0.8),
+                    (AUTOMATION_BASE + 3, 0.2),
+                ],
+                &[(0, [3.0, 4.0, 0.0, 200.0, 0.7, 2.0, 3.0, 0.0])],
+            )
+        };
+        // an entry runs from state 2 up (2, 3, 4, 6, 7 and 1000 measured
+        // alike); below 2 it is off and never read
+        for state in [2.0, 3.0, 5.0, 1000.0] {
+            assert!(part(&reversed(state), 0, fs, &mut d).is_err(), "state {state}");
+        }
+        for state in [-1.0, 0.5, 1.0, 1.5] {
+            assert_eq!(part(&reversed(state), 0, fs, &mut d).unwrap().sections.len(), 1, "state {state}");
+        }
         // a bypassed box contributes nothing
         let off = tmst(&[(0, 1.0)], &[(0, [3.0, 4.0, 0.0, 200.0, 0.7, 2.0, 3.0, 0.0])]);
         assert_eq!(part(&off, 0, fs, &mut d).unwrap().sections.len(), 0);
@@ -2007,10 +2093,14 @@ mod tests {
         assert!(voicing_tone(&st, 2, true, fs, &mut d).unwrap().0.automation.is_empty());
         assert!(voicing_tone(&st, 2, false, fs, &mut d).unwrap().0.automation.is_empty());
 
-        // a state whose meaning is not settled still refuses on a running slot
-        let mut odd = globals;
-        odd[1].1 = 1000.0;
-        assert!(voicing_tone(&tmst(&odd, &[(0, shelf)]), 2, true, fs, &mut d).is_err());
+        // the legacy state 1000 runs like 2 (measured); state 1 is off
+        let mut legacy = globals;
+        legacy[1].1 = 1000.0;
+        let (tone, _) = voicing_tone(&tmst(&legacy, &[(0, shelf)]), 2, true, fs, &mut d).unwrap();
+        assert_eq!(tone.automation.len(), 1);
+        let mut off = globals;
+        off[1].1 = 1.0;
+        assert!(voicing_tone(&tmst(&off, &[(0, shelf)]), 2, true, fs, &mut d).unwrap().0.automation.is_empty());
     }
 
     #[test]
