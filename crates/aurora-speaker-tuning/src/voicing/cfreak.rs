@@ -53,6 +53,9 @@ pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option
     compile_for(stage, fs, None, diags)
 }
 
+/// The published range of parameter 17 ("maximum saturation"), dB.
+pub const MAX_SATURATION_DB: (f64, f64) = (0.0, 40.0);
+
 fn macos27(build: Option<&str>) -> bool {
     let mut major = 0u32;
     let mut digits = 0usize;
@@ -152,7 +155,10 @@ pub fn compile_for(
         // Keep old flavor-2 wire words byte-identical. Internal flavor 4
         // is the same sine shaper plus the source-selected ceiling.
         let (flavor, control) = if saturation_ceiling_present {
-            (if flavor == 2.0 { 4.0 } else { flavor }, amount)
+            // The newer unit holds its block-peak ceiling inside the
+            // parameter's published range. Payload provenance selects this
+            // behavior; the device identity does not.
+            (if flavor == 2.0 { 4.0 } else { flavor }, amount.clamp(MAX_SATURATION_DB.0, MAX_SATURATION_DB.1))
         } else if flavor == 1.0 {
             (flavor, sgv2_core::voicing::cfreak::CEILING_OFF_DB)
         } else {
@@ -372,8 +378,29 @@ mod tests {
         .unwrap();
         assert_eq!(
             (cubic_27.saturation_mode, cubic_27.saturation_flavor, cubic_27.saturation_mix, cubic_27.highpass_order,),
-            (2, 1, -6.0, 4)
+            (2, 1, 0.0, 4)
         );
+        for (saved, held) in [(-2.0, 0.0), (0.0, 0.0), (6.0, 6.0), (45.0, 40.0)] {
+            let p = compile_for(
+                &stage(&[
+                    (1, 3.0),
+                    (10, 1.0),
+                    (16, 1.0),
+                    (17, saved),
+                    (18, 10_000.0),
+                    (19, 10.0),
+                    (20, 1.0),
+                    (21, 2.0),
+                    (23, 1.0),
+                ]),
+                48_000.0,
+                Some("27C100"),
+                &mut Diagnostics::default(),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(p.saturation_mix, held);
+        }
         for refused in [[(1, 0.0)], [(1, 8.0)], [(10, 4.0)], [(23, 0.0)]] {
             let mut st = vec![
                 (1, 3.0),
