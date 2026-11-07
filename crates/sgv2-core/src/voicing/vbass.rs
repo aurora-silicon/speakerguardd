@@ -531,8 +531,8 @@ impl Follower {
         // follower's multiply-add boundary explicit: a long program history
         // can otherwise move the first post-step windows by a measurable
         // fraction of a decibel even though steady segments agree.
-        self.e = a.mul_add(self.e, (1.0 - a) * u);
-        self.s = b.mul_add(self.s, (1.0 - b) * self.e);
+        self.e = libm::fmaf(a, self.e, (1.0 - a) * u);
+        self.s = libm::fmaf(b, self.s, (1.0 - b) * self.e);
         self.s as f64
     }
 }
