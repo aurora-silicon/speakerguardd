@@ -94,6 +94,11 @@ pub const K_MIN: f64 = 9.0 / 16.0;
 pub const DRIVE_BLOCK: usize = 512;
 /// Fraction of the dB distance to the block's target the drive moves.
 pub const DRIVE_SMOOTH: f64 = 0.1;
+/// The drive (dB) a fresh or reset unit starts from, and the blocks it
+/// holds it before following the input (black-box: tone onsets at 100 Hz
+/// and 1 kHz, 0 to -24 dBFS, both give 9.0 dB with two held blocks).
+pub const DRIVE_START_DB: f64 = 9.0;
+pub const DRIVE_WARMUP_BLOCKS: usize = 2;
 /// `k^2 = DRIVE_C * rms(weighted) / rms(input)`.
 ///
 /// TODO(SPEC): the weighting's exact sections are open. Black-box (single
@@ -399,7 +404,7 @@ impl Saturator {
             det: [BiquadState::default(); 3],
             ex: 0.0,
             eg: 0.0,
-            drive_db: 0.0,
+            drive_db: DRIVE_START_DB,
             k: 1.0,
         }
     }
@@ -412,6 +417,8 @@ struct Saturation {
     post: Biquad,
     det: [Biquad; 3],
     pos: usize,
+    /// Drive blocks completed since the start or a reset.
+    blocks: usize,
     ch: Vec<Saturator>,
 }
 
@@ -427,20 +434,28 @@ impl Saturation {
             post,
             det: [hp, hp, lp],
             pos: 0,
+            blocks: 0,
             ch: vec![Saturator::new(); channels],
         }
     }
 
     fn reset(&mut self) {
         self.pos = 0;
+        self.blocks = 0;
         self.ch.iter_mut().for_each(|c| *c = Saturator::new());
     }
 
     /// Ends a drive block: each channel's drive moves towards the block's
-    /// target.
+    /// target (the first [`DRIVE_WARMUP_BLOCKS`] after a start leave it).
+    ///
+    /// The unit sets a block's drive from that block's own input before
+    /// rendering it; a streaming run only knows it once the block is over,
+    /// so here it takes effect one block later.
     fn end_block(&mut self) {
+        let warm = self.blocks >= DRIVE_WARMUP_BLOCKS;
+        self.blocks = self.blocks.saturating_add(1);
         for c in &mut self.ch {
-            if c.ex > 0.0 {
+            if warm && c.ex > 0.0 {
                 let k2 = DRIVE_C * libm::sqrt(c.eg / c.ex);
                 let target = 10.0 * libm::log10(k2.max(1e-30));
                 c.drive_db += DRIVE_SMOOTH * (target - c.drive_db);
