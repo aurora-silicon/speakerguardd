@@ -27,7 +27,17 @@ fn effect(name: &str, kind: &str, subtype: &str, manufacturer: &str, state: Para
 fn strip() -> AuStrip {
     let records = sgv2_core::lsid::schema_ids()
         .into_iter()
-        .map(|id| (id, if [3075, 10243, 17411].contains(&id) { 3.0 } else { 0.0 }))
+        .map(|id| {
+            // Valid synthetic acquisition geometry is required even while the
+            // mandatory companion mute keeps adaptation unqualified.
+            let value = match id {
+                2048 | 2049 | 9216 | 9217 | 16384 | 16385 => 1.0,
+                2054 | 9222 | 16390 => 32.0,
+                3075 | 10243 | 17411 => 3.0,
+                _ => 0.0,
+            };
+            (id, value)
+        })
         .collect();
     AuStrip {
         strips: vec![vec![effect(
@@ -273,6 +283,23 @@ fn complete_synthetic_six_channel_bundle_compiles_in_both_modes() {
             .process(Io { frames: 32, input: &[&[0.5; 32][..]; 6], sense: &[], output: &mut out })
             .is_failsafe());
         assert!(storage.iter().flatten().all(|x| *x == 0.0));
+    }
+    // A schema-complete preset with invalid seed/acquisition values must not
+    // become loadable just because its companion already has a mute gate.
+    for bank in 0..3 {
+        for (offset, value) in [(2048, 0.0), (2049, -1.0), (2054, 0.0), (2054, 32.5), (3075, 0.0)] {
+            let mut invalid = tuning.clone();
+            let records = &mut invalid.lsid.as_mut().unwrap().state.sections[0].params;
+            records.iter_mut().find(|r| r.0 == offset + bank * 7168).unwrap().1 = value;
+            for voicing in [false, true] {
+                let result = if voicing {
+                    compile::compile_voicing_with(&invalid, &machine, compile::Provenance::Verified, &mut diagnostics)
+                } else {
+                    compile::compile(&invalid, &machine, &mut diagnostics)
+                };
+                assert!(result.is_err(), "bank {bank}, record {offset}, value {value}, voicing {voicing}");
+            }
+        }
     }
     // A rejected voicing effect may produce a quarantined bundle only when
     // the already compiled governor proves it has the mandatory mute gate.

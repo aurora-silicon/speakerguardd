@@ -26,18 +26,23 @@ program latency. Adaptation must not infer source identity from channel count.
 The current host I/O interface does not authenticate that identity.
 
 The estimator exposes seeded, acquiring, tracking, decaying and reset states,
-per-bank acquisition/validity state, fast/slow static resistance seeds, and
-immutable complete model generations. The handoff stages a generation before
-committing it at a controller boundary. Reset discards partial acquisition and
-pending generations. Invalid, dead, stale or mismatched telemetry cannot replace
-the static model, produce valid measured power, or raise the output.
+per-bank acquisition/validity state, bounded fast/slow resistance, LR2 and
+three-resonance fits, measured power, calibration validity, and immutable
+complete model generations. `SPEC-LSID-NUMERICS.md` defines the independent
+clean-room law. The handoff stages a complete property-6630 semantic payload
+before committing it at a controller boundary. Reset discards partial
+acquisition and pending generations. Invalid, dead, stale or mismatched
+telemetry cannot replace the last accepted model, produce valid measured
+power, or raise the output.
 
-TODO(SPEC): the numerical estimator, calibration overlay, model-update coefficient law,
-legacy compensated models, appended feature semantics and side/role flow law
-remain unqualified. Adaptation cannot be enabled, including with all Cargo
-features. Tracking is reserved for a qualified solver; no fitted values or
-thermal/calibration validity are fabricated. Stale state retains the static
-seed, so decay cannot relax protection. There is no estimator persistence.
+The native private property serialization, legacy compensated models,
+appended enabled-feature semantics and response/gain application from the flow
+dictionary remain unqualified. Adaptation cannot be enabled, including with
+all Cargo features: the normal host path also lacks authenticated source
+identity. Numerical candidates can therefore be exercised only offline and
+cannot remove the mandatory release gate. Stale private state decays toward
+the static seed but is not published, so decay cannot relax protection. There
+is no estimator persistence.
 
 A companion bundle therefore carries mandatory audible-release gates. The
 single governing LSM2 unit retains/runs its representable static/open-loop model
