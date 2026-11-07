@@ -660,8 +660,9 @@ impl QuadratureEnvelope {
     }
 }
 
-/// The mode-4 arm law keeps a direct gain and a 50 Hz bilinear low-pass copy.
-/// The difference drives a second quadrature pair; its two components rotate
+/// The gain stage keeps a direct gain and a 50 Hz bilinear low-pass copy.
+/// The real path blends them with the same bounded power-ratio weight. In
+/// mode 4 the difference also drives a quadrature pair; its components rotate
 /// the audio arms during a gain transition. A bounded power-ratio crossfade
 /// selects the direct or corrected path. This is asymmetric by construction:
 /// on release `gain / lowpass > 1`, so the crossfade clamps to the corrected
@@ -704,16 +705,24 @@ impl Mode4Gain {
     }
 
     #[inline]
-    fn step(&mut self, gain: f64) -> Mode4Mix {
+    fn step_real(&mut self, gain: f64) -> Mode4Mix {
         let gain = gain as f32;
         let lowpass = libm::fmaf(self.b, gain, libm::fmaf(self.b, self.previous_input, self.a * self.previous_output));
         self.previous_input = gain;
         self.previous_output = lowpass;
-        let (arm_a, arm_b) = self.quadrature.push_components(gain - lowpass);
         let ratio = mode4_ratio(gain, lowpass);
         let ratio_squared = ratio * ratio;
         let correction_weight = (1.0 - ratio_squared).clamp(0.0, 1.0);
-        Mode4Mix { gain, lowpass, arm_a, arm_b, correction_weight }
+        Mode4Mix { gain, lowpass, correction_weight, ..Mode4Mix::default() }
+    }
+
+    #[inline]
+    fn step(&mut self, gain: f64) -> Mode4Mix {
+        let mut mix = self.step_real(gain);
+        let (a, b) = self.quadrature.push_components(mix.gain - mix.lowpass);
+        mix.arm_a = a;
+        mix.arm_b = b;
+        mix
     }
 }
 
@@ -721,6 +730,11 @@ impl Mode4Mix {
     #[inline]
     fn apply_direct(self, arm_a: f64, arm_b: f64) -> f64 {
         (((arm_a as f32 + arm_b as f32) * self.gain) * core::f32::consts::FRAC_1_SQRT_2) as f64
+    }
+
+    #[inline]
+    fn real_gain(self) -> f64 {
+        (self.lowpass * (1.0 - self.correction_weight) + self.gain * self.correction_weight) as f64
     }
 
     #[inline]
@@ -1347,10 +1361,10 @@ impl Run {
                     self.detector_phase[b] = 0;
                 }
             }
-            let mode4 = if self.hop_peak {
+            let mode4: [Mode4Mix; BANDS] = if self.hop_peak {
                 core::array::from_fn(|b| self.mode4_gain[b].step(gain[b]))
             } else {
-                [Mode4Mix::default(); BANDS]
+                core::array::from_fn(|b| self.mode4_gain[b].step_real(gain[b]))
             };
             for c in 0..n {
                 let mut processed = [0.0; BANDS];
@@ -1363,7 +1377,9 @@ impl Run {
                         };
                         Self::saturate(self.band[b].saturation, output)
                     } else {
-                        Self::band_output(self.band[b].saturation, gain[b], bands_a[c][b])
+                        let real_gain =
+                            if self.band[b].mode == BandMode::Active { mode4[b].real_gain() } else { gain[b] };
+                        Self::band_output(self.band[b].saturation, real_gain, bands_a[c][b])
                     };
                 }
                 let mut y = if self.legacy_recombination {
@@ -1822,6 +1838,9 @@ mod tests {
         run.process(&mut [&mut x[..]], 64);
         assert!(!run.hop_peak);
         assert_eq!(run.audio_quadrature[0].arm_b.input_delay, [[0.0; 2]; QUADRATURE_STAGES]);
+        for gain in &run.mode4_gain {
+            assert_eq!(gain.quadrature.arm_b.input_delay, [[0.0; 2]; QUADRATURE_STAGES]);
+        }
     }
 
     #[test]
