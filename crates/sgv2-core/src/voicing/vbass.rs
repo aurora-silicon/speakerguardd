@@ -34,12 +34,11 @@
 //!   previous selected-rate frame, driven by that frame's input level, while
 //!   the output follower's restore uses the current input level (one frame
 //!   ahead of the device). The branch's total delay is unchanged.
-//! - The filter objects store Float32 coefficients and use the platform
+//! - Every filter object stores Float32 coefficients and uses the platform
 //!   multichannel-biquad arithmetic described in [`crate::vdsp`]. The
-//!   full-rate mono crossover low pass is the material render-quantum-
-//!   dependent object and is run here as one platform call per render. The
-//!   other established paths remain unchanged until their independently
-//!   generated SOS words pass the whole-graph gate.
+//!   full-rate high and phase paths use the stream channel count; the mono
+//!   crossover, selected-rate and reconstruction objects use one channel.
+//!   Every object receives its complete render-call slice.
 //! - The high-pass path runs independently on every L/R channel. In M/S
 //!   terms both `HP(M)` and `HP(S)` survive; only the reconstructed low and
 //!   harmonic branches are mono and added equally to every channel.
