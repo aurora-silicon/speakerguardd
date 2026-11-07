@@ -3,11 +3,13 @@
 //!
 //! Carried: target loudness, maximum gain, upward and downward ranges, the
 //! downward ratio (when the state enables it), the compressor clamp, the
-//! side-chain high-pass, look-ahead, the expected loudness after a reset and
-//! the reset timeout. Everything the speaker strips leave switched off
-//! (AGC, voice activity, environmental-noise adaptation, personalization,
-//! volume automation, the output ceiling, the side-chain low-pass, the
-//! shaping filter, other gain curves and weightings, adaptation hold) is
+//! side-chain high-pass, look-ahead (capped at 3 ms, as the unit caps it),
+//! the expected loudness after a reset and the reset timeout (reset modes
+//! 13 and 8), and the side-chain low-pass (IDs 39 and 41: one more
+//! Butterworth section after the weighting). Everything the speaker strips
+//! leave switched off (AGC, voice activity, environmental-noise adaptation,
+//! personalization, volume automation, the output ceiling, the shaping
+//! filter, other gain curves and weightings, adaptation hold) is
 //! refused when switched on, so a state this module cannot carry exactly
 //! never compiles.
 //!
@@ -54,6 +56,7 @@ const WEIGHTING: u32 = 36;
 const USE_RATIO: u32 = 37;
 const RATIO: u32 = 38;
 const LP_ENABLE: u32 = 39;
+const LP_HZ: u32 = 41;
 const HOLD: u32 = 40;
 const CEILING_ENABLE: u32 = 43;
 const PEAK_OFFSET: u32 = 44;
@@ -64,8 +67,13 @@ const PERSONALIZATION: u32 = 61;
 
 /// The one meter mode carried: the gated integrated meter.
 const METER_GATED: f64 = 2.0;
-/// The reset mode carried: history and gain reset, expected-loudness seed.
+/// The reset modes carried: history and gain reset, expected-loudness seed
+/// (13), and mode 8, identical to it with a silence timeout.
 const RESET_SEEDED: f64 = 13.0;
+const RESET_ON_TIMEOUT: f64 = 8.0;
+/// The unit's look-ahead is its parameter capped at 3 ms: it reports and
+/// applies `min(look-ahead, 3 ms)`.
+const MAX_LOOKAHEAD_MS: f64 = 3.0;
 /// The render quality carried: full-rate side chain.
 const QUALITY_FULL: f64 = 3.0;
 const SUPPORTED_FS: f64 = 48_000.0;
@@ -103,6 +111,17 @@ fn highpass(f0: f64, fs: f64) -> [f64; 5] {
     let a0 = 1.0 + alpha;
     let f = |v: f64| f64::from(v as f32);
     [f((1.0 + c) / (2.0 * a0)), f(-(1.0 + c) / a0), f((1.0 + c) / (2.0 * a0)), f(-2.0 * c / a0), f((1.0 - alpha) / a0)]
+}
+
+/// Second-order Butterworth low-pass (bilinear, prewarped), in single
+/// precision like the weighting.
+fn lowpass(f0: f64, fs: f64) -> [f64; 5] {
+    let w = 2.0 * PI * f0 / fs;
+    let (s, c) = w.sin_cos();
+    let alpha = s / (2.0 * std::f64::consts::FRAC_1_SQRT_2);
+    let a0 = 1.0 + alpha;
+    let f = |v: f64| f64::from(v as f32);
+    [f((1.0 - c) / (2.0 * a0)), f((1.0 - c) / a0), f((1.0 - c) / (2.0 * a0)), f(-2.0 * c / a0), f((1.0 - alpha) / a0)]
 }
 
 /// The loudness weighting of weighting mode 0: the two-section K weighting
@@ -163,7 +182,6 @@ pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option
         (SHAPING, "shaping filter"),
         (VAD_INPUT, "voice-activity input"),
         (WEIGHTING, "weighting other than mode 0"),
-        (LP_ENABLE, "side-chain low-pass"),
         (HOLD, "adaptation hold"),
         (CEILING_ENABLE, "output ceiling"),
         (PEAK_OFFSET, "peak level offset"),
@@ -177,13 +195,23 @@ pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option
     for (id, want, what) in [
         (METER_IN, METER_GATED, "input meter mode"),
         (METER_OUT, METER_GATED, "output meter mode"),
-        (RESET_MODE, RESET_SEEDED, "reset mode"),
         (RENDER_QUALITY, QUALITY_FULL, "render quality"),
     ] {
         let v = req(id)?;
         if v != want {
             return Err(bad(format!("{}: {what} {v} is not carried", stage.name)));
         }
+    }
+    // Reset modes 8 and 13 render identically whenever the silence timeout
+    // is set; with a zero timeout, bits 0 and 2 together (13) change the
+    // output across silences and are not carried, while mode 8 is the
+    // runner's never-on-silence reset.
+    let reset_mode = req(RESET_MODE)?;
+    if reset_mode != RESET_SEEDED && reset_mode != RESET_ON_TIMEOUT {
+        return Err(bad(format!("{}: reset mode {reset_mode} is not carried", stage.name)));
+    }
+    if reset_mode == RESET_SEEDED && req(RESET_TIMEOUT)? == 0.0 {
+        return Err(bad(format!("{}: reset mode {reset_mode} without a silence timeout is not carried", stage.name)));
     }
     // the fast path's release dead band is the one law that differs between
     // the algorithm versions the speaker strips use
@@ -228,10 +256,18 @@ pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option
         // replaces the weighting's high-pass section
         sos[1] = highpass(hz, fs);
     }
+    if g.get(LP_ENABLE).is_some_and(|v| v != 0.0) {
+        // a further section after the weighting
+        let hz = req(LP_HZ)?;
+        if !(1000.0..fs / 2.0).contains(&hz) {
+            return Err(bad(format!("{}: side-chain low-pass at {hz} Hz", stage.name)));
+        }
+        sos.push(lowpass(hz, fs));
+    }
     if sos.len() > MAX_SECTIONS {
         return Err(bad("detector needs more sections than carried"));
     }
-    let lookahead = (req(LOOKAHEAD_MS)? * fs / 1000.0).round();
+    let lookahead = (req(LOOKAHEAD_MS)?.min(MAX_LOOKAHEAD_MS) * fs / 1000.0).round();
     let expected = req(EXPECTED)?;
     let timeout = req(RESET_TIMEOUT)?;
     let mut p = Params {
@@ -265,6 +301,20 @@ mod tests {
         assert!((g(0.0) - (-14.0)).abs() < 1e-12);
         let r = |l| node_gain(l, -20.0, 4.0, 8.0, 6.0, Some(4.0), false);
         assert!((r(-8.0) - (-9.0)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn lowpass_is_minus_3_db_at_its_corner_and_flat_below() {
+        let s = lowpass(15_000.0, 48_000.0);
+        let db = |f: f64| {
+            let w = 2.0 * PI * f / 48_000.0;
+            let (c1, s1, c2, s2) = (w.cos(), -w.sin(), (2.0 * w).cos(), -(2.0 * w).sin());
+            let num = ((s[0] + s[1] * c1 + s[2] * c2).powi(2) + (s[1] * s1 + s[2] * s2).powi(2)).sqrt();
+            let den = ((1.0 + s[3] * c1 + s[4] * c2).powi(2) + (s[3] * s1 + s[4] * s2).powi(2)).sqrt();
+            20.0 * (num / den).log10()
+        };
+        assert!((db(15_000.0) + 3.0103).abs() < 0.01);
+        assert!(db(100.0).abs() < 0.001);
     }
 
     #[test]
