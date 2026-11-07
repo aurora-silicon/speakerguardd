@@ -2225,7 +2225,7 @@ impl Run {
                 let p = (vdsp_sve_slice(&c.power_work) / sub as f32).max(0.0);
                 c.tp_vc = c.br_vc.step(c.tp_vc, p);
                 c.tp_mg = c.br_mg.step(c.tp_mg, p);
-                c.tring[c.tn % TRING] = c.ambient as f32 + c.tp_vc + c.tp_mg;
+                c.tring[c.tn % TRING] = c.ambient as f32 + (c.tp_vc + c.tp_mg);
                 c.tn += 1;
                 c.pk_x[slot] = px;
                 c.pk_d[slot] = pd;
