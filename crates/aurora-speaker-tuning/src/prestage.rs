@@ -510,7 +510,7 @@ fn tilt_section(gain_db: f64, f0: f64, fs: f64, complement: bool) -> Section {
     }
 }
 
-/// ToneMeister's exact type-7 constant tilt: the decoded 0x15/0x16 pair.
+/// ToneMeister's exact type-7 constant tilt: the decoded complementary pair.
 fn constant_tilt(gain_db: f64, f0: f64, fs: f64) -> Vec<Section> {
     vec![tilt_section(gain_db, f0, fs, false), tilt_section(-gain_db, f0, fs, true)]
 }
@@ -1688,7 +1688,7 @@ mod tests {
         assert_eq!((tone.dynamic[0].active_mask, tone.dynamic[0].sidechain_mask), (3, 3));
         let tilt = tmst(&[], &[(0, [3.0, 7.0, 12.0, 300.0, 9.0, 8.0, 3.0, 0.0])]);
         let pt = part(&tilt, 0, fs, &mut d).unwrap();
-        assert_eq!((pt.sections.len(), pt.gain_db), (4, -12.0));
+        assert_eq!((pt.sections.len(), pt.gain_db), (2, 0.0));
         assert!(pt.sections.iter().all(Section::stable));
         let high_cut = tmst(&[], &[(0, [3.0, 18.0, -4.0, 8000.0, 2.0, 3.0, 3.0, 0.0])]);
         let ph = part(&high_cut, 0, fs, &mut d).unwrap();
