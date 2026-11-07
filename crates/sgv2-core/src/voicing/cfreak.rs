@@ -613,10 +613,10 @@ fn saturation_fir(mode: u32, fs: f64) -> [f32; FIR_TAPS] {
 #[derive(Clone)]
 struct Saturator {
     /// Base-rate input history (newest at `x_at`).
-    x: [f64; PHASE_TAPS],
+    x: [f32; PHASE_TAPS],
     x_at: usize,
     /// Oversampled shaper output history (newest at `v_at`).
-    v: [f64; V_RING],
+    v: [f32; V_RING],
     v_at: usize,
     pre: Df1State,
     post: Df1State,
@@ -674,6 +674,12 @@ struct Saturation {
     /// Smoothed drive (dB) and the drive in use (ceiling scale included).
     drive_db: f64,
     k: f64,
+    /// Drive scalars in the same streaming coordinate as the delayed FIR
+    /// output.  The reciprocal applied to a returned sample belongs to the
+    /// base-rate carrier sample that entered the FIR pair 24 frames earlier,
+    /// not merely to the preceding render piece.
+    makeup: [f64; SATURATION_DELAY],
+    makeup_at: usize,
     ch: Vec<Saturator>,
 }
 
@@ -698,6 +704,8 @@ impl Saturation {
             tau_frames: DRIVE_TAU_S * fs,
             drive_db: start_db(),
             k: 1.0,
+            makeup: [1.0; SATURATION_DELAY],
+            makeup_at: 0,
             ch: vec![Saturator::new(); channels],
         }
     }
@@ -710,6 +718,8 @@ impl Saturation {
         self.peak = 0.0;
         self.drive_db = start_db();
         self.k = 1.0;
+        self.makeup.fill(1.0);
+        self.makeup_at = 0;
         self.ch.iter_mut().for_each(|c| *c = Saturator::new());
     }
 
@@ -751,6 +761,17 @@ impl Saturation {
         }
     }
 
+    /// Associates the base-rate reciprocal with the FIR pair's returned
+    /// output buffer.  Keeping this as a streaming history, rather than a
+    /// fixed prefix of each render piece, also covers pieces shorter than the
+    /// FIR latency and arbitrary host render-call boundaries.
+    fn delayed_makeup(&mut self, k: f64) -> f64 {
+        let makeup = self.makeup[self.makeup_at];
+        self.makeup[self.makeup_at] = k;
+        self.makeup_at = (self.makeup_at + 1) % SATURATION_DELAY;
+        makeup
+    }
+
     /// The shaper on an already driven value `v` (`k` times the signal).
     fn shape_driven(flavor: u32, v: f64) -> f64 {
         if flavor == 1 {
@@ -764,6 +785,22 @@ impl Saturation {
             }
         } else {
             libm::sin(v)
+        }
+    }
+
+    /// The native Float32 shaper between the Float32 polyphase FIRs.
+    fn shape_driven_f32(flavor: u32, v: f32) -> f32 {
+        if flavor == 1 {
+            let u = CUBIC_SCALE as f32 * v;
+            if u > 1.0 {
+                1.0
+            } else if u < -1.0 {
+                -1.0
+            } else {
+                1.5 * u - 0.5 * u * u * u
+            }
+        } else {
+            libm::sinf(v)
         }
     }
 
@@ -784,31 +821,31 @@ impl Saturation {
         }
         let s = &mut self.ch[c];
         let cut = self.pre.run(&mut s.pre, x);
-        let driven = f64::from(cut as f32 * k as f32);
+        let driven = cut as f32 * k as f32;
         s.x_at = (s.x_at + 1) % PHASE_TAPS;
         s.x[s.x_at] = driven;
         for phase in 0..OVERSAMPLE {
             // u[2n + phase] = sum_j (2 h[phase + 2 j]) (k d[n - j])
-            let mut u = 0.0;
+            let mut u = 0.0f32;
             let mut i = phase;
             let mut j = 0;
             while i < FIR_TAPS {
                 let up = h[i] * OVERSAMPLE as f32;
-                u += f64::from(up) * s.x[(s.x_at + PHASE_TAPS - j) % PHASE_TAPS];
+                u += up * s.x[(s.x_at + PHASE_TAPS - j) % PHASE_TAPS];
                 i += OVERSAMPLE;
                 j += 1;
             }
             s.v_at = (s.v_at + 1) % V_RING;
-            s.v[s.v_at] = Self::shape_driven(flavor, u);
+            s.v[s.v_at] = Self::shape_driven_f32(flavor, u);
         }
         // y[n] = sum_i h[i] v[2n - i]; v[2n] was pushed OVERSAMPLE - 1
         // samples before the newest.
         let newest_2n = (s.v_at + V_RING - (OVERSAMPLE - 1)) % V_RING;
-        let mut y = 0.0;
+        let mut y = 0.0f32;
         for (i, hv) in h.iter().enumerate() {
-            y += f64::from(*hv) * s.v[(newest_2n + V_RING - i) % V_RING];
+            y += *hv * s.v[(newest_2n + V_RING - i) % V_RING];
         }
-        let made_up = f64::from(y as f32 * (1.0f32 / makeup as f32));
+        let made_up = f64::from(y * (1.0f32 / makeup as f32));
         self.post.run(&mut s.post, made_up)
     }
 }
@@ -1130,20 +1167,28 @@ impl Run {
         }
         // This block is measured before it is shaped.  Its new scalar applies
         // from sample zero; the FIR delay itself retains prior driven samples.
-        let (mut k_before, mut k) = (1.0, 1.0);
+        let mut k = 1.0;
         if let Some(s) = &mut self.saturation {
             for i in 0..n {
                 for c in 0..ch {
                     s.measure(c, self.piece[c * DRIVE_BLOCK + i]);
                 }
             }
-            k_before = s.k;
             s.pos = n;
             s.end_block();
             k = s.k;
         }
         let l = self.lookahead;
         for i in 0..n {
+            let makeup = if let Some(s) = &mut self.saturation {
+                if s.oversampled {
+                    s.delayed_makeup(k)
+                } else {
+                    k
+                }
+            } else {
+                1.0
+            };
             let mut peak = 0.0f64;
             let mut linked = 0.0f32;
             let mut frame = [0.0f64; MAX_CHANNELS];
@@ -1151,7 +1196,6 @@ impl Run {
             for (c, slot) in frame[..ch].iter_mut().enumerate() {
                 let mut x = self.piece[c * DRIVE_BLOCK + i];
                 if let Some(s) = &mut self.saturation {
-                    let makeup = if s.oversampled && i < SATURATION_DELAY { k_before } else { k };
                     x = s.run(c, x, k, makeup);
                     if s.started < s.delay() {
                         x = 0.0;
@@ -1472,13 +1516,34 @@ mod tests {
         let pre_before = sat.ch[0].pre;
         let mut expected_pre = pre_before;
         let cut = sat.pre.run(&mut expected_pre, -0.2);
-        let expected_driven = f64::from(cut as f32 * 0.9f32);
+        let expected_driven = cut as f32 * 0.9f32;
 
         sat.run(0, -0.2, 0.9, 0.7);
 
         assert_eq!(sat.ch[0].x[old_at], old_driven);
         assert_eq!(sat.ch[0].x[sat.ch[0].x_at], expected_driven);
         assert_eq!(sat.ch[0].pre, expected_pre);
+    }
+
+    #[test]
+    fn makeup_follows_the_streaming_output_buffer_across_short_pieces() {
+        let p = saturating(3);
+        let mut sat = Saturation::new(&p, 48_000.0, 1);
+
+        // Model three short host pieces whose total is exactly the FIR-pair
+        // latency.  A per-piece prefix would restart at each boundary; the
+        // streaming history must return the original scalar exactly once the
+        // delayed carrier reaches the output buffer.
+        for (frames, k) in [(7, 0.7), (5, 0.8), (12, 0.9)] {
+            for _ in 0..frames {
+                assert_eq!(sat.delayed_makeup(k), 1.0);
+            }
+        }
+        assert_eq!(sat.delayed_makeup(0.6), 0.7);
+
+        sat.reset();
+        assert_eq!(sat.delayed_makeup(0.5), 1.0);
+        assert_eq!(sat.makeup_at, 1);
     }
 
     #[test]
