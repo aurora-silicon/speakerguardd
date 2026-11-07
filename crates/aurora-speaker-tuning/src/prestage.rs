@@ -1715,7 +1715,8 @@ mod tests {
         let pd = part(&dynamic, 0, fs, &mut d).unwrap();
         assert_eq!((pd.sections.len(), pd.dynamics.len()), (0, 1));
         assert_eq!(pd.dynamics[0].params.kind, DynamicKind::Notch);
-        let tone = voicing_tone(&dynamic, 2, false, fs, &mut d).unwrap();
+        let (tone, partial) = voicing_tone(&dynamic, 2, false, fs, &mut d).unwrap();
+        assert!(partial.is_empty());
         assert_eq!(tone.dynamic.len(), 1);
         assert_eq!((tone.dynamic[0].active_mask, tone.dynamic[0].sidechain_mask), (3, 3));
         let tilt = tmst(&[], &[(0, [3.0, 7.0, 12.0, 300.0, 9.0, 8.0, 3.0, 0.0])]);
@@ -1971,6 +1972,22 @@ mod tests {
         let mut odd = globals;
         odd[1].1 = 1000.0;
         assert!(voicing_tone(&tmst(&odd, &[(0, shelf)]), 2, true, fs, &mut d).is_err());
+    }
+
+    #[test]
+    fn voicing_compiles_dynamic_volume_automation() {
+        let fs = 48_000.0;
+        let mut d = Diagnostics::default();
+        let mut globals = auto(0, 0.0, 0.2, (0.8, -6.0, 9_000.0), None);
+        globals.push((20, -29.67));
+        let stage = tmst(&globals, &[(0, [3.0, 18.0, -3.6, 9_500.0, 3.0, 3.0, 3.0, 0.0])]);
+        let (tone, partial) = voicing_tone(&stage, 2, true, fs, &mut d).unwrap();
+        assert!(partial.is_empty());
+        assert_eq!(tone.dynamic.len(), 1);
+        assert_eq!(tone.dynamic_automation.len(), 1);
+        assert_eq!(tone.dynamic_automation[0].index, 0);
+        assert_eq!(tone.dynamic_automation[0].a.frequency_hz, 9_500.0);
+        assert_eq!(tone.dynamic_automation[0].b.frequency_hz, 9_000.0);
     }
 
     #[test]
