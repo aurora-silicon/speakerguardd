@@ -574,7 +574,7 @@ impl MaskDetector {
         if raw_db > self.peak_db + 3.0 {
             self.peak_db = raw_db;
         } else if raw_db + 12.0 < self.peak_db {
-            self.peak_db = raw_db + 12.0;
+            self.peak_db = raw_db;
         }
         let alpha = if self.peak_db > self.db { self.attack } else { self.release };
         self.db += alpha * (self.peak_db - self.db);
