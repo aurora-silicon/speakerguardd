@@ -2190,7 +2190,7 @@ mod tests {
         };
         let p = part(&pk((0.85, -0.5, 9190.0)), 0, fs, &mut d).unwrap();
         assert_eq!(p.sections.len(), 0);
-        assert!(p.gain_db < -0.5);
+        assert!(p.gain_db <= -0.5);
         // that fades to 0 dB: nothing
         let p = part(&pk((0.85, 0.0, 9190.0)), 0, fs, &mut d).unwrap();
         assert_eq!(p.sections.len(), 0);

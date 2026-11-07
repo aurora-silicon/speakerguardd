@@ -56,9 +56,20 @@ fn peak_den(gain_db: f64, f0: f64, q: f64, fs: f64) -> [f64; 2] {
     let a = libm::sqrtf(gain);
     let damping = 1.0 / (2.0 * a * q as f32);
     let w = 2.0 * core::f32::consts::PI * f0 as f32 / fs as f32;
-    let radius = libm::expf(-damping * w);
-    let angle = libm::sqrtf((1.0 - damping * damping).max(0.0)) * w;
-    [f64::from(-2.0 * radius * libm::cosf(angle)), f64::from(libm::expf(-2.0 * damping * w))]
+    let sum = if damping > 1.0 {
+        // Overdamped prototypes have two distinct real roots. Clamping
+        // the imaginary part to zero instead maps a repeated pole and
+        // changes the low-Q response.
+        let spread = libm::sqrtf(damping * damping - 1.0);
+        let p0 = libm::expf(-(damping - spread) * w);
+        let p1 = libm::expf(-(damping + spread) * w);
+        -(p0 + p1)
+    } else {
+        let radius = libm::expf(-damping * w);
+        let angle = libm::sqrtf(1.0 - damping * damping) * w;
+        -2.0 * radius * libm::cosf(angle)
+    };
+    [f64::from(sum), f64::from(libm::expf(-2.0 * damping * w))]
 }
 
 fn polynomial_power(c: [f64; 3], x: f64) -> f64 {
@@ -442,6 +453,23 @@ mod tests {
 
     fn magnitude(s: Section, f: f64, fs: f64) -> f64 {
         s.magnitude(f, fs)
+    }
+
+    #[test]
+    fn peak_poles_follow_real_and_complex_analog_roots() {
+        let fs = 48_000.0;
+        for gain_db in [0.0, 6.0, 12.0] {
+            let a = libm::pow(10.0, gain_db / 40.0);
+            for q in [0.2, 0.4, 0.5, 5.0] {
+                for f0 in [200.0, 8500.0] {
+                    let expected = matched_den([1.0, 1.0 / (a * q), 1.0], f0, fs);
+                    let actual = peak_den(gain_db, f0, q, fs);
+                    for (got, want) in actual.into_iter().zip(expected) {
+                        assert!((got - want).abs() < 1e-6, "{gain_db} dB, {f0} Hz, Q {q}: {got} vs {want}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
