@@ -78,10 +78,46 @@ fn lowflow_parameter_words_are_carried_including_responses() {
     models[0].pressure_response[7] = 0.125;
     models[0].tweeter_response[13] = 0.0625;
     spec.nodes[0].kind =
-        Kind::Lowflow(Box::new(Params { model_count: 1, link_channel_energies: true, latency_frames: 256, models }));
+        Kind::Lowflow(Box::new(Params {
+            model_count: 1,
+            link_channel_energies: true,
+            latency_frames: 256,
+            conservative_fallback: false,
+            models,
+        }));
     let base = voicing_fixture::unit("j413", 4);
     let bytes = artifact::encode(&spec, &base).unwrap();
+    assert_eq!(u32::from_le_bytes(bytes[12..16].try_into().unwrap()), CONSERVATIVE as u32);
     assert_eq!(artifact::decode(&bytes, &base).unwrap(), spec);
+    let mut wrong_flavor = bytes;
+    wrong_flavor[12..16].copy_from_slice(&((!CONSERVATIVE) as u32).to_le_bytes());
+    let end = wrong_flavor.len() - 4;
+    let crc = blob::crc32(&wrong_flavor[..end]);
+    wrong_flavor[end..].copy_from_slice(&crc.to_le_bytes());
+    assert_eq!(artifact::decode(&wrong_flavor, &base), Err(blob::BlobError::Version));
+}
+
+#[test]
+fn artifacts_without_lowflow_keep_build_independent_bytes_and_read_legacy_flavors() {
+    let spec = voicing_fixture::spec(4);
+    let base = voicing_fixture::unit("j413", 4);
+    let bytes = artifact::encode(&spec, &base).unwrap();
+    assert_eq!(u32::from_le_bytes(bytes[12..16].try_into().unwrap()), 1);
+
+    let fix_crc = |b: &mut [u8]| {
+        let end = b.len() - 4;
+        let crc = blob::crc32(&b[..end]);
+        b[end..].copy_from_slice(&crc.to_le_bytes());
+    };
+    let mut legacy_exact = bytes.clone();
+    legacy_exact[12..16].copy_from_slice(&0u32.to_le_bytes());
+    fix_crc(&mut legacy_exact);
+    assert_eq!(artifact::decode(&legacy_exact, &base).unwrap(), spec);
+
+    let mut unknown = bytes;
+    unknown[12..16].copy_from_slice(&2u32.to_le_bytes());
+    fix_crc(&mut unknown);
+    assert_eq!(artifact::decode(&unknown, &base), Err(blob::BlobError::Version));
 }
 
 #[test]

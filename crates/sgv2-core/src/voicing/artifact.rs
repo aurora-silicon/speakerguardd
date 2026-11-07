@@ -7,10 +7,12 @@
 //! existing checked codec. Changing this wire layout requires a version bump.
 //! Decode and chain construction allocate and belong outside the RT callback.
 //!
-//! Header: magic (8 bytes), schema version u32, build flavor u32, CRC of
+//! Header: magic (8 bytes), schema version u32, LowFlow flavor u32, CRC of
 //! the preceding unit blob u32. The Spec follows in declared field order;
 //! vector lengths and enum tags are u32. A trailing u32 CRC covers all of
-//! the artifact before it. The build flavor binds the LowFlow law variant.
+//! the artifact before it. The flavor binds the LowFlow law variant only when
+//! the artifact carries a LowFlow node; artifacts without one use the stable
+//! legacy value 1 and are identical between exact and conservative builds.
 use super::chain::*;
 use crate::blob::{crc32, BlobError, Header};
 use crate::prestage::*;
@@ -18,9 +20,7 @@ use alloc::{boxed::Box, vec, vec::Vec};
 
 pub const MAGIC: [u8; 8] = *b"SGVOICE\0";
 pub const VERSION: u32 = 1;
-// The conservative LowFlow build intentionally runs a different law. Do not
-// silently load an artifact made for the other build of that same schema.
-const FLAVOR: u32 = super::lowflow::CONSERVATIVE as u32;
+const NO_LOWFLOW_FLAVOR: u32 = 1;
 pub const MAX_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ITEMS: usize = 4096;
 type Result<T> = core::result::Result<T, BlobError>;
@@ -421,7 +421,7 @@ pub fn encode(spec: &Spec, unit_blob: &[u8]) -> Result<Vec<u8>> {
     validate(spec, h.sample_rate as f64, h.channels as usize)?;
     let mut out = MAGIC.to_vec();
     VERSION.put(&mut out);
-    FLAVOR.put(&mut out);
+    artifact_flavor(spec).put(&mut out);
     // Bind to the complete unit blob, including the board and pre-stage.
     crc32(unit_blob).put(&mut out);
     spec.put(&mut out);
@@ -447,9 +447,10 @@ pub fn decode(bytes: &[u8], unit_blob: &[u8]) -> Result<Spec> {
     if r.take::<8>()? != MAGIC {
         return Err(BlobError::Magic);
     }
-    if u32::get(&mut r)? != VERSION || u32::get(&mut r)? != FLAVOR {
+    if u32::get(&mut r)? != VERSION {
         return Err(BlobError::Version);
     }
+    let encoded_flavor = u32::get(&mut r)?;
     if u32::get(&mut r)? != crc32(unit_blob) {
         return Err(BlobError::Crc);
     }
@@ -458,8 +459,34 @@ pub fn decode(bytes: &[u8], unit_blob: &[u8]) -> Result<Spec> {
     if !r.0.is_empty() {
         return Err(BlobError::Length);
     }
+    if !flavor_compatible(&spec, encoded_flavor) {
+        return Err(BlobError::Version);
+    }
     validate(&spec, h.sample_rate as f64, h.channels as usize)?;
     Ok(spec)
+}
+
+fn has_lowflow(spec: &Spec) -> bool {
+    spec.nodes.iter().any(|node| matches!(node.kind, Kind::Lowflow(_)))
+}
+
+fn artifact_flavor(spec: &Spec) -> u32 {
+    if has_lowflow(spec) {
+        super::lowflow::CONSERVATIVE as u32
+    } else {
+        NO_LOWFLOW_FLAVOR
+    }
+}
+
+fn flavor_compatible(spec: &Spec, encoded: u32) -> bool {
+    if has_lowflow(spec) {
+        encoded == super::lowflow::CONSERVATIVE as u32
+    } else {
+        // Exact builds historically wrote 0 and the interim conservative
+        // default wrote 1. Neither law is present, so both are safe to load;
+        // new encodes use 1 to preserve the shipped artifact bytes.
+        encoded <= NO_LOWFLOW_FLAVOR
+    }
 }
 
 fn validate(spec: &Spec, fs: f64, lanes: usize) -> Result<()> {
