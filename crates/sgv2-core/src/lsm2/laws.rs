@@ -89,13 +89,14 @@ pub struct ThermalBranch {
 }
 
 impl ThermalBranch {
-    /// The matched pole of `tau` for an update every `dt` seconds and the
-    /// numerator `Rth (1 - exp(-dt/tau)) / 2`.
+    /// The matched pole of `tau` for an update every `dt` seconds, with the
+    /// binary32 gain `(1 - exp(-dt/tau)) * (Rth / alpha)`: the ideal step
+    /// rounded once to binary32 times the binary32 quotient of `Rth` by the
+    /// rounded step `alpha`.
     pub fn new(rth: f64, tau: f64, dt: f64) -> Self {
         let ideal = 1.0 - libm::exp(-dt / tau);
         let alpha = 1.0f32 - r32(1.0 - ideal);
-        let b0 = r32(rth * ideal / 2.0);
-        ThermalBranch { alpha, r_eff: (b0 + b0) / alpha }
+        ThermalBranch { alpha, r_eff: r32(ideal) * (r32(rth) / alpha) }
     }
     /// `theta + alpha (R_eff P - theta)`, both products fused:
     /// `fma(alpha, fma(R_eff, P, -theta), theta)`.
