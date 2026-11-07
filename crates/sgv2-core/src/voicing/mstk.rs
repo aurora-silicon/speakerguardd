@@ -512,25 +512,15 @@ fn append_half(output: &mut Path, stage: &HalfStage, high: bool) {
 /// Continue each analysis branch independently after its moving gain. The
 /// active crossover halves complete the Linkwitz-Riley branches, while the
 /// nonparticipating full allpasses retain the collapsed bank's neutral path.
+/// Every quality and algorithm uses this one tree. Black-box (installed unit,
+/// quality 1): band 2's gain lands later than a sequential bank whose
+/// lowest crossover runs first would put it (its first two milliseconds read
+/// up to 0.18 dB louder), and algorithm 0's multirate band 0 releases as if
+/// the middle crossover's low half sat ahead of its lowest one; with the
+/// middle-first analysis and the per-band synthesis below, every probe window
+/// matches within 0.03 dB and the neutral bank stays an allpass.
 fn half_synthesis_paths(p: &Params, fs: f64, half: &[HalfStage; XOVERS]) -> [Path; BANDS] {
     let mut out = [Path::EMPTY; BANDS];
-    if p.render_quality == 1 && p.algorithm < 3 {
-        for (band, path) in out.iter_mut().enumerate() {
-            for (stage, item) in half.iter().enumerate() {
-                if stage < band {
-                    append_half(path, item, true);
-                } else if stage == band && band < XOVERS {
-                    append_half(path, item, false);
-                } else if stage > band {
-                    let mut allpass = Path::EMPTY;
-                    push_lr_allpass(&mut allpass, effective_order(p.crossover_order[stage]), p.crossover_hz[stage], fs);
-                    append_path(path, &allpass);
-                }
-            }
-        }
-        return out;
-    }
-
     let tree: [&[(usize, bool)]; BANDS] =
         [&[(1, false), (0, false)], &[(1, false), (0, true)], &[(1, true), (2, false)], &[(1, true), (2, true)]];
     let passing = [2, 2, 0, 0];
@@ -1013,7 +1003,6 @@ pub struct Run {
     release: [f64; BANDS],
     release_on: bool,
     algorithm: u32,
-    legacy_recombination: bool,
     overshoot_compensation: bool,
     channels: usize,
     env: [f64; BANDS],
@@ -1104,7 +1093,6 @@ impl Run {
             release,
             release_on: q.release_on,
             algorithm: q.algorithm,
-            legacy_recombination: q.render_quality == 1 && q.algorithm < 3,
             overshoot_compensation: q.overshoot_compensation,
             channels: channels.min(MAX_CHANNELS),
             env: [0.0; BANDS],
@@ -1194,30 +1182,21 @@ impl Run {
     #[inline]
     fn half_analyze(
         stages: [HalfStage; XOVERS],
-        legacy: bool,
         band_in: [f64; BANDS],
         low_state: &mut [[[f32; 2]; MAX_FILTERS]; XOVERS],
         high_state: &mut [[[f32; 2]; MAX_FILTERS]; XOVERS],
         input: f64,
     ) -> [f64; BANDS] {
-        let mut out = [0.0; BANDS];
-        if legacy {
-            let mut remaining = input;
-            for stage in 0..XOVERS {
-                out[stage] =
-                    Self::run_detector_path(&stages[stage].low, &mut low_state[stage], remaining) * band_in[stage];
-                remaining = Self::run_detector_path(&stages[stage].high, &mut high_state[stage], remaining);
-            }
-            out[BANDS - 1] = remaining * band_in[BANDS - 1];
-        } else {
-            let low_mid = Self::run_detector_path(&stages[1].low, &mut low_state[1], input);
-            let high_mid = Self::run_detector_path(&stages[1].high, &mut high_state[1], input);
-            out[0] = Self::run_detector_path(&stages[0].low, &mut low_state[0], low_mid) * band_in[0];
-            out[1] = Self::run_detector_path(&stages[0].high, &mut high_state[0], low_mid) * band_in[1];
-            out[2] = Self::run_detector_path(&stages[2].low, &mut low_state[2], high_mid) * band_in[2];
-            out[3] = Self::run_detector_path(&stages[2].high, &mut high_state[2], high_mid) * band_in[3];
-        }
-        out
+        // Middle crossover first at every quality: bands 0/1 split from its
+        // low half, bands 2/3 from its high half.
+        let low_mid = Self::run_detector_path(&stages[1].low, &mut low_state[1], input);
+        let high_mid = Self::run_detector_path(&stages[1].high, &mut high_state[1], input);
+        [
+            Self::run_detector_path(&stages[0].low, &mut low_state[0], low_mid) * band_in[0],
+            Self::run_detector_path(&stages[0].high, &mut high_state[0], low_mid) * band_in[1],
+            Self::run_detector_path(&stages[2].low, &mut low_state[2], high_mid) * band_in[2],
+            Self::run_detector_path(&stages[2].high, &mut high_state[2], high_mid) * band_in[3],
+        ]
     }
 
     #[inline]
@@ -1357,7 +1336,6 @@ impl Run {
                     let (a, b) = self.audio_quadrature[c].push_components(input as f32);
                     bands_a[c] = Self::half_analyze(
                         self.half_stage,
-                        self.legacy_recombination,
                         self.band_in,
                         &mut self.half_analysis_low_a[c],
                         &mut self.half_analysis_high_a[c],
@@ -1365,7 +1343,6 @@ impl Run {
                     );
                     bands_b[c] = Self::half_analyze(
                         self.half_stage,
-                        self.legacy_recombination,
                         self.band_in,
                         &mut self.half_analysis_low_b[c],
                         &mut self.half_analysis_high_b[c],
@@ -1376,7 +1353,6 @@ impl Run {
                     // sits between them and the synthesis halves too.
                     bands_a[c] = Self::half_analyze(
                         self.half_stage,
-                        self.legacy_recombination,
                         self.band_in,
                         &mut self.half_analysis_low_a[c],
                         &mut self.half_analysis_high_a[c],
