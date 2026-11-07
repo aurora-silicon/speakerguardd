@@ -40,6 +40,7 @@
 //! Box modules are added one per box type (`norm`, `vbass`, `xtc`,
 //! `vareq`, `cfreak`, `buzz`, `cdelay`, ...).
 
+pub mod artifact;
 pub mod buzz;
 pub mod cdelay;
 pub mod cfreak;
