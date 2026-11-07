@@ -552,12 +552,7 @@ fn analytic_detector_paths(p: &Params, fs: f64) -> ([DetectorPath; BANDS], [Dete
             }
         }
     } else {
-        let tree = [
-            [(1, false), (0, false)],
-            [(1, false), (0, true)],
-            [(1, true), (2, false)],
-            [(1, true), (2, true)],
-        ];
+        let tree = [[(1, false), (0, false)], [(1, false), (0, true)], [(1, true), (2, false)], [(1, true), (2, true)]];
         for b in 0..BANDS {
             for &(stage, high) in &tree[b] {
                 push_detector_lr(&mut band[b], high, n[stage], f[stage], fs);
