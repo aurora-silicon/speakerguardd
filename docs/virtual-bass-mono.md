@@ -49,8 +49,9 @@ s = fma(b, s, (1-b) * e)
 
 The attack/release/hold choice precedes these updates. Normalization applies
 the published floor and clip only at the input and output divisions; the
-floor is not the follower seed. Filter coefficients, samples and retained
-section state round at every Float32 biquad boundary.
+floor is not the follower seed. Follower coefficients and retained follower
+state are Float32. The filter cascades retain the common stable implementation
+used by the qualified stereo path.
 
 There is no AID-specific branch, fitted gain, fitted timing offset or
 protective hold margin in this law.
