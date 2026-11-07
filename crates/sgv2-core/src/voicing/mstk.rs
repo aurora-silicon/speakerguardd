@@ -1544,11 +1544,7 @@ impl Run {
                 if b == 0 && self.band_zero_factor > 1 && !band_zero_sample {
                     continue;
                 }
-                if self.overshoot_compensation && self.algorithm < 3 {
-                    p = p.max(overshoot[b]);
-                } else if self.overshoot_compensation && self.algorithm == 3 {
-                    // Algorithm 3 stays on its inherited real-waveform
-                    // detector; its exact estimator belongs to t-5368.
+                if self.overshoot_compensation {
                     p = overshoot[b];
                 }
                 let update = self.detector_phase[b] == 0;
