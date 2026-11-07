@@ -14,10 +14,9 @@ std = []
 # band gains water-filled across the bands instead of the full-band
 # candidate on every band. Off by default.
 lsm2-waterfill = []
-# Deliberately quieter LowFlow fallback. This replaces the unresolved
-# detector/state approximation with a fixed, guarded attenuation ceiling.
-# It is intended only for bundles whose exact LowFlow law has not passed the
-# differential rig; see the module documentation for the bound.
+# Deliberately quieter LowFlow fallback. The default build carries the exact
+# detector/state law; this feature retains the fixed guarded ceiling for an
+# explicitly conservative image or an incomplete legacy sidecar.
 lowflow-conservative = []
 
 [dependencies]

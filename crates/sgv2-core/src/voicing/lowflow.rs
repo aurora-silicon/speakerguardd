@@ -24,8 +24,8 @@
 //! The optional `lowflow-conservative` compile feature is deliberately not an
 //! exact-law claim. It applies a fixed ceiling 6 dB below the saved
 //! volume-dependent ceiling to every enabled low-frequency lane. This makes
-//! the fallback independent of the unresolved detector transition and release
-//! history while retaining the saved volume law and the exact lane delay.
+//! the fallback independent of detector and release history while retaining
+//! the saved volume law and the exact lane delay.
 //! Since the unit's instantaneous gain is bounded below by its saved ceiling,
 //! `g_fallback <= 10^(-6/20) * g_unit` sample by sample. Disabled and HF lanes
 //! remain exact delays, while muted lanes remain silent.
