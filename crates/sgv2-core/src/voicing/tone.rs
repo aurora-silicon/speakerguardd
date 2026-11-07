@@ -123,9 +123,6 @@ fn peak_magnitudes(gain_db: f64, f0: f64, q: f64, fs: f64, den_z: [f64; 2]) -> [
 }
 
 fn matched(shape: Shape, gain_db: f64, f0: f64, q: f64, fs: f64) -> Section {
-    if gain_db == 0.0 {
-        return Section::IDENTITY;
-    }
     if gain_db < 0.0 && !matches!(shape, Shape::HighShelf) {
         return inverse(matched(shape, -gain_db, f0, q, fs));
     }
@@ -402,6 +399,23 @@ mod tests {
         let cut = peak(-12.0, 18_000.0, 2.0, fs);
         for f in [20.0, 1000.0, 8000.0, 16_000.0, 20_000.0, 23_900.0] {
             assert!((magnitude(boost, f, fs) * magnitude(cut, f, fs) - 1.0).abs() < 2e-6);
+        }
+    }
+
+    #[test]
+    fn a_zero_gain_peak_is_a_real_section() {
+        // The installed unit still runs a 0 dB peak; its section is the
+        // same matched design (unity at the fit points), not the identity.
+        let fs = 48_000.0;
+        let flat = peak(0.0, 97.5, 3.0, fs);
+        assert_ne!(flat, Section::IDENTITY);
+        // its poles are the analog prototype's, as for any boost
+        let boost = peak(4.0, 97.5, 3.0, fs);
+        assert!((flat.a1 - boost.a1).abs() < 1e-3 && (flat.a2 - boost.a2).abs() < 1e-3);
+        // unity to within its Float32 coefficients (a few thousandths of a
+        // dB next to poles this close to the unit circle)
+        for f in [0.0, 20.0, 97.5, 1000.0, 8_000.0, 16_000.0, 20_000.0] {
+            assert!((magnitude(flat, f, fs) - 1.0).abs() < 1e-3, "{f} {}", magnitude(flat, f, fs));
         }
     }
 

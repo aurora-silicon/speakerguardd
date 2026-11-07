@@ -16,8 +16,10 @@
 //!   times [`CEILING_TRIM`];
 //! * the fast stage carries at most `MinFastGain` dB (`F = 10^(-mfg/20)`);
 //!   what is left goes to a slow gain `s`: its target `u` is
-//!   `min(1, t / F)` held at its minimum over the last `H + 1` frames; `s`
-//!   drops to `u` at once and otherwise moves towards it with
+//!   `min(1, t / F)`; `s`
+//!   drops to `u` at once and otherwise moves towards it with the release
+//!   coefficient selected by the detector history: [`TAU_FAST_S`] while a
+//!   five-dB upward detector excursion has fast-release budget left, then
 //!   [`TAU_SLOW_S`];
 //! * the combined target `s * max(t, F)` is held at its minimum over the
 //!   last `H + 1` frames and smoothed by a normalised `L`-tap sine window
@@ -74,15 +76,9 @@ use alloc::vec::Vec;
 pub const TRUE_PEAK_SCALE_DB: f64 = 0.688;
 /// The unit's sample ceiling sits 0.00002 dB under the threshold.
 pub const CEILING_TRIM_DB: f64 = -0.00002;
-/// Slow gain time constant (towards its target, from below).
-///
-/// TODO(SPEC): the unit releases the slow gain with a 0.27 s constant for a
-/// while after an over and with this 10 s one afterwards; how long the fast
-/// phase lasts depends on its render blocks and on signal history (about
-/// 44 ms after an isolated over, about 9 ms after some sustained ones, none
-/// after others). Until that is pinned the slow constant is used
-/// throughout, which can only hold the gain lower than the unit's. This
-/// only matters past `MinFastGain` dB of limiting.
+/// First slow-gain release time constant (towards its target, from below).
+pub const TAU_FAST_S: f64 = 0.270;
+/// Long slow-gain release time constant (towards its target, from below).
 pub const TAU_SLOW_S: f64 = 10.0;
 /// Output saturation oversampling factor.
 pub const OVERSAMPLE: usize = 2;
@@ -139,6 +135,66 @@ pub const DRIVE_LP_HZ: f64 = 13_000.0;
 /// and of a second-order one.
 const DRIVE_HP_Q: [f64; 2] = [0.541_196_100_146_197, 1.306_562_964_876_376_5];
 const DRIVE_LP_Q: f64 = core::f64::consts::FRAC_1_SQRT_2;
+/// Detector movement that adds one fast-release interval.
+const RELEASE_STEP_DB: f64 = 5.0;
+/// The release selector runs after a 4-by-10 control-rate reduction. Each
+/// step adds ten control frames at 48 kHz (and the nearest corresponding
+/// count at other rates).
+const RELEASE_DECIMATE_1: usize = 4;
+const RELEASE_DECIMATE_2: usize = 10;
+const RELEASE_CONTROL_DECIMATION: usize = RELEASE_DECIMATE_1 * RELEASE_DECIMATE_2;
+const RELEASE_ADD_RATE_HZ: f64 = 5_000.0;
+const RELEASE_POWER_WINDOW_S: f64 = 0.030;
+const RELEASE_POWER_FLOOR: f64 = 1.0e-10;
+const RELEASE_FIR_TAPS: usize = 31;
+
+/// A clean 31-tap least-squares low pass for the first 4:1 reduction.
+///
+/// Generated with SciPy's BSD-licensed `signal.firls`: pass band 0..0.0755,
+/// stop band 0.125..0.5 (cycles/sample), stop weight 1500. The recipe is
+/// deliberately public and reproducible; no installed-unit coefficient table
+/// is carried here.
+const RELEASE_FIR: [f32; RELEASE_FIR_TAPS] = [
+    1.498_691_4e-4,
+    -7.314_614_5e-4,
+    -3.267_145_2e-3,
+    -8.002_404e-3,
+    -1.475_691_9e-2,
+    -2.222_959_1e-2,
+    -2.791_541e-2,
+    -2.848_869_4e-2,
+    -2.064_968_6e-2,
+    -2.237_285_7e-3,
+    2.674_28e-2,
+    6.356_486e-2,
+    1.029_868_1e-1,
+    1.382_596_3e-1,
+    1.627_121_9e-1,
+    1.714_600_2e-1,
+    1.627_121_9e-1,
+    1.382_596_3e-1,
+    1.029_868_1e-1,
+    6.356_486e-2,
+    2.674_28e-2,
+    -2.237_285_7e-3,
+    -2.064_968_6e-2,
+    -2.848_869_4e-2,
+    -2.791_541e-2,
+    -2.222_959_1e-2,
+    -1.475_691_9e-2,
+    -8.002_404e-3,
+    -3.267_145_2e-3,
+    -7.314_614_5e-4,
+    1.498_691_4e-4,
+];
+
+/// Public Favreau/Pure Data fourth-order quadrature pair, with the measured
+/// Float32 numerator normalisation used by the control reducer. Each row is
+/// `[b0, b1, b2, a1, a2]` for transposed direct-form II.
+const RELEASE_HILBERT: [[[f32; 5]; 2]; 2] = [
+    [[0.94657, -1.94630, 1.0, -1.94632, 0.94657], [0.06338, -0.83774, 1.0, -0.83774, 0.06338]],
+    [[-0.260502, 0.02569, 1.0, 0.02569, -0.0260502], [1.1058, -2.373, 1.27, -1.8685, 0.870686]],
+];
 
 /// ITU-R BS.1770-4 Annex 2 true-peak interpolator, first two phases (the
 /// other two are their mirror images).
@@ -213,6 +269,20 @@ fn highpass_sections(order: usize, f0: f64, fs: f64) -> ([SatSection; HIGHPASS_S
         n += 1;
     }
     (s, n)
+}
+
+#[derive(Clone, Copy, Default)]
+struct ReleaseBiquad {
+    z: [f32; 2],
+}
+
+impl ReleaseBiquad {
+    fn run(&mut self, c: &[f32; 5], x: f32) -> f32 {
+        let y = x * c[0] + self.z[0];
+        self.z[0] = x * c[1] - y * c[3] + self.z[1];
+        self.z[1] = x * c[2] - y * c[4];
+        y
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -827,7 +897,24 @@ pub struct Run {
     ceiling: f64,
     floor: f64,
     tp_scale: f64,
-    a_slow: f64,
+    a_fast: f32,
+    a_slow: f32,
+    release_up: f32,
+    release_down: f32,
+    release_anchor: f32,
+    fast_release_left: usize,
+    fast_release_add: usize,
+    fast_release: bool,
+    release_became_slow: bool,
+    fast_lookahead_pole: f32,
+    release_decimate_1_at: usize,
+    release_decimate_2_at: usize,
+    release_fir_state: [f32; RELEASE_FIR_TAPS],
+    release_fir_at: usize,
+    release_hilbert: [[ReleaseBiquad; 2]; 2],
+    release_power: Box<[f32]>,
+    release_power_at: usize,
+    release_power_sum: f64,
     /// Window weights, `w[j]` applies to the held target `j` frames ago.
     weight: Box<[f64]>,
     /// Ring of the last `lookahead` held targets.
@@ -835,7 +922,7 @@ pub struct Run {
     held_at: usize,
     slow_target: MinHold,
     target: MinHold,
-    slow: f64,
+    slow: f32,
     /// Per channel: the last `lookahead` input samples (ring) and the last
     /// `TAPS` for the interpolator (ring).
     line: Box<[f32]>,
@@ -865,7 +952,9 @@ impl Run {
         }
         let sum: f64 = weight.iter().sum();
         weight.iter_mut().for_each(|w| *w /= sum);
-        let coef = |tau: f64| 1.0 - libm::exp(-1.0 / (tau * fs));
+        let fs_f32 = fs as f32;
+        let coef = |tau: f32| 1.0 - libm::expf(-1.0 / (tau * fs_f32));
+        let a_fast = coef(TAU_FAST_S as f32);
         let (highpass, highpass_sections) = if p.highpass_order > 0 {
             highpass_sections(p.highpass_order as usize, p.highpass_hz, fs)
         } else {
@@ -878,11 +967,33 @@ impl Run {
             ceiling: db(p.threshold_db + CEILING_TRIM_DB),
             floor: db(-p.min_fast_gain_db),
             tp_scale: db(TRUE_PEAK_SCALE_DB),
-            a_slow: coef(TAU_SLOW_S),
+            a_fast,
+            a_slow: coef(TAU_SLOW_S as f32),
+            release_up: db(RELEASE_STEP_DB) as f32,
+            release_down: db(-RELEASE_STEP_DB) as f32,
+            release_anchor: 0.0,
+            fast_release_left: 0,
+            fast_release_add: libm::ceil(fs / RELEASE_ADD_RATE_HZ) as usize,
+            fast_release: true,
+            release_became_slow: false,
+            fast_lookahead_pole: libm::powf(1.0 - a_fast, lookahead as f32),
+            release_decimate_1_at: 0,
+            release_decimate_2_at: 0,
+            release_fir_state: [0.0; RELEASE_FIR_TAPS],
+            release_fir_at: 0,
+            release_hilbert: [[ReleaseBiquad::default(); 2]; 2],
+            release_power: vec![
+                0.0;
+                libm::round(fs / RELEASE_CONTROL_DECIMATION as f64 * RELEASE_POWER_WINDOW_S).max(1.0)
+                    as usize
+            ]
+            .into_boxed_slice(),
+            release_power_at: 0,
+            release_power_sum: 0.0,
             weight,
             held: vec![1.0; lookahead].into_boxed_slice(),
             held_at: 0,
-            slow_target: MinHold::new(window),
+            slow_target: MinHold::new(1),
             target: MinHold::new(window),
             slow: 1.0,
             line: vec![0.0; lookahead * channels].into_boxed_slice(),
@@ -905,6 +1016,18 @@ impl Run {
         self.slow_target.reset();
         self.target.reset();
         self.slow = 1.0;
+        self.release_anchor = 0.0;
+        self.fast_release_left = 0;
+        self.fast_release = true;
+        self.release_became_slow = false;
+        self.release_decimate_1_at = 0;
+        self.release_decimate_2_at = 0;
+        self.release_fir_state = [0.0; RELEASE_FIR_TAPS];
+        self.release_fir_at = 0;
+        self.release_hilbert = [[ReleaseBiquad::default(); 2]; 2];
+        self.release_power.fill(0.0);
+        self.release_power_at = 0;
+        self.release_power_sum = 0.0;
         self.line.iter_mut().for_each(|v| *v = 0.0);
         self.line_at = 0;
         self.hist.iter_mut().for_each(|v| *v = 0.0);
@@ -919,16 +1042,68 @@ impl Run {
         self.lookahead + self.saturation.as_ref().map_or(0, |s| s.delay())
     }
 
+    /// Advances the linked release detector by one audio-rate sample.
+    fn release_control(&mut self, linked: f32) {
+        self.release_fir_at = (self.release_fir_at + 1) % RELEASE_FIR_TAPS;
+        self.release_fir_state[self.release_fir_at] = linked;
+        if self.release_decimate_1_at == 0 {
+            let mut filtered = 0.0f32;
+            for (i, tap) in RELEASE_FIR.iter().enumerate() {
+                filtered +=
+                    tap * self.release_fir_state[(self.release_fir_at + RELEASE_FIR_TAPS - i) % RELEASE_FIR_TAPS];
+            }
+
+            let mut quadrature = [filtered; 2];
+            for ((value, states), coefficients) in
+                quadrature.iter_mut().zip(self.release_hilbert.iter_mut()).zip(RELEASE_HILBERT.iter())
+            {
+                for (state, coefficient) in states.iter_mut().zip(coefficients) {
+                    *value = state.run(coefficient, *value);
+                }
+            }
+            let magnitude = libm::sqrtf(quadrature[0] * quadrature[0] + quadrature[1] * quadrature[1]);
+
+            if self.release_decimate_2_at == 0 {
+                let was_fast = self.fast_release;
+                let value = magnitude * magnitude;
+                self.release_power_sum -= f64::from(self.release_power[self.release_power_at]);
+                self.release_power_sum += f64::from(value);
+                self.release_power[self.release_power_at] = value;
+                self.release_power_at = (self.release_power_at + 1) % self.release_power.len();
+                let level = (self.release_power_sum / self.release_power.len() as f64 + RELEASE_POWER_FLOOR) as f32;
+                if level > self.release_anchor * self.release_up {
+                    self.release_anchor = level;
+                    self.fast_release_left = self.fast_release_left.saturating_add(self.fast_release_add);
+                } else if level < self.release_anchor * self.release_down {
+                    self.release_anchor = level;
+                }
+                self.fast_release = self.fast_release_left > 0;
+                self.fast_release_left = self.fast_release_left.saturating_sub(1);
+                self.release_became_slow = was_fast && !self.fast_release;
+            }
+            self.release_decimate_2_at = (self.release_decimate_2_at + 1) % RELEASE_DECIMATE_2;
+        }
+        self.release_decimate_1_at = (self.release_decimate_1_at + 1) % RELEASE_DECIMATE_1;
+    }
+
     /// The linked gain for this frame, given the newest input frame.
     fn gain(&mut self, peak: f64) -> f64 {
         let t = if peak > self.ceiling { self.ceiling / peak } else { 1.0 };
-        let u = self.slow_target.push((t / self.floor).min(1.0));
+        let u = self.slow_target.push((t / self.floor).min(1.0)) as f32;
+        if self.release_became_slow && u > 0.99 {
+            // The native 10x/4x coefficient return is aligned to the start
+            // of the look-ahead interval. Undo the fast-pole moves made over
+            // that interval when the held coefficient changes to slow.
+            self.slow = 1.0 - (1.0 - self.slow) / self.fast_lookahead_pole;
+            self.release_became_slow = false;
+        }
         if u < self.slow {
             self.slow = u;
         } else {
-            self.slow += self.a_slow * (u - self.slow);
+            let a = if self.fast_release { self.a_fast } else { self.a_slow };
+            self.slow += a * (u - self.slow);
         }
-        let h = self.target.push(self.slow * t.max(self.floor));
+        let h = self.target.push(f64::from(self.slow) * t.max(self.floor));
         let l = self.lookahead;
         self.held_at = (self.held_at + 1) % l;
         self.held[self.held_at] = h;
@@ -985,6 +1160,7 @@ impl Run {
         let l = self.lookahead;
         for i in 0..n {
             let mut peak = 0.0f64;
+            let mut linked = 0.0f32;
             let mut frame = [0.0f64; MAX_CHANNELS];
             self.hist_at = (self.hist_at + 1) % TAPS;
             for (c, slot) in frame[..ch].iter_mut().enumerate() {
@@ -1012,10 +1188,12 @@ impl Run {
                     a = a.max(self.tp_scale * best);
                 }
                 peak = peak.max(a);
+                linked += x as f32;
             }
             if let Some(s) = &mut self.saturation {
                 s.started = s.started.saturating_add(1);
             }
+            self.release_control(linked);
             let g = self.gain(peak);
             for (c, b) in bufs[..ch].iter_mut().enumerate() {
                 let slot = c * l + self.line_at;
@@ -1111,6 +1289,28 @@ mod tests {
             assert_eq!(Saturation::shape(1, k, 10.0), 1.0 / k);
         }
         assert!((Saturation::shape(2, 1.0, 0.5) - libm::sin(0.5)).abs() < 1e-15);
+    }
+
+    #[test]
+    fn release_control_fir_is_symmetric() {
+        for i in 0..RELEASE_FIR_TAPS {
+            assert_eq!(RELEASE_FIR[i].to_bits(), RELEASE_FIR[RELEASE_FIR_TAPS - 1 - i].to_bits());
+        }
+    }
+
+    #[test]
+    fn release_control_cadence_and_reset_are_stable() {
+        let p = params(0.0, false);
+        let mut run = Run::new(&p, 48_000.0, 2);
+        for _ in 0..512 {
+            run.release_control(0.002);
+        }
+        assert_eq!(run.release_decimate_1_at, 0);
+        assert_eq!(run.release_decimate_2_at, 8);
+        run.reset();
+        assert_eq!(run.release_decimate_1_at, 0);
+        assert_eq!(run.release_decimate_2_at, 0);
+        assert!(run.release_fir_state.iter().all(|value| *value == 0.0));
     }
 
     #[test]
