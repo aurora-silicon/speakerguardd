@@ -19,7 +19,7 @@
 //! | 7 | look-ahead (ms) [0.5] | yes |
 //! | 8, 15 | output gain (dB) [0], its stage enabled [1] | yes, or unity when disabled |
 //! | 9 | parameter ramp time [0] | not needed: the state is fixed |
-//! | 12, 13, 21, 22 | high-pass enable [0], corner, order, placement | refused when enabled |
+//! | 12, 13, 21, 22 | high-pass enable [0], corner, order, placement | version-1 location 0 |
 //! | 14 | limiter enabled [1] | refused when off |
 //! | 16 | output saturation [0] | off, or the mode-3 sine subset |
 //! | 18-21 | de-esser controls | dormant for the carried sine flavor, but required |
@@ -71,12 +71,23 @@ pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option
     if get(14)? == 0.0 {
         return Err(bad("the limiter is switched off (not carried)".into()));
     }
+    let algorithm_version = get(23)?;
+    let (high_pass_frequency_hz, high_pass_order, high_pass_location) = if get(12)? != 0.0 {
+        let frequency = get(13)?;
+        let order = get(21)?;
+        let location = get(22)?;
+        if algorithm_version != 1.0 || location != 0.0 {
+            return Err(bad(format!(
+                "high-pass algorithm/location {algorithm_version}/{location} (only version 1 at location 0 is carried)"
+            )));
+        }
+        (frequency, order, location)
+    } else {
+        (0.0, 0.0, 0.0)
+    };
     let saturation = get(16)? != 0.0;
-    if get(12)? != 0.0 {
-        return Err(bad("the high-pass is on (not carried)".into()));
-    }
     let (saturation_mode, saturation_flavor, saturation_mix) = if saturation {
-        if get(1)? != 3.0 || get(10)? != 2.0 || get(23)? != 1.0 {
+        if get(1)? != 3.0 || get(10)? != 2.0 || algorithm_version != 1.0 {
             return Err(bad(format!(
                 "output saturation mode/flavor/version {}/{}/{} (only 3/2/1 is carried)",
                 get(1)?,
@@ -96,8 +107,8 @@ pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option
         }
         (3.0, 2.0, amount / 100.0)
     } else {
-        if get(23)? != 0.0 {
-            return Err(bad(format!("algorithm version {} (only 0 without saturation is carried)", get(23)?)));
+        if algorithm_version != 0.0 && algorithm_version != 1.0 {
+            return Err(bad(format!("algorithm version {algorithm_version}")));
         }
         (0.0, 0.0, 0.0)
     };
@@ -112,6 +123,10 @@ pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option
         saturation_mix,
         if get(11)? != 0.0 { get(2)? } else { 0.0 },
         if get(15)? != 0.0 { get(8)? } else { 0.0 },
+        algorithm_version,
+        high_pass_frequency_hz,
+        high_pass_order,
+        high_pass_location,
     ];
     let p = Params::from_words(&words).ok_or_else(|| bad(format!("values out of range: {words:?}")))?;
     let frames = |s: f64| s * fs;
@@ -175,6 +190,10 @@ mod tests {
                 saturation_mix: 0.0,
                 input_gain_db: 0.0,
                 output_gain_db: 0.0,
+                algorithm_version: 0,
+                high_pass_frequency_hz: 0.0,
+                high_pass_order: 0,
+                high_pass_location: 0,
             }
         );
         let d = compile_of(&[]).unwrap().unwrap();
@@ -190,6 +209,15 @@ mod tests {
         assert_eq!((enabled.input_gain_db, enabled.output_gain_db), (3.0, -2.0));
         let disabled = compile_of(&[(2, 3.0), (11, 0.0), (8, -2.0), (15, 0.0)]).unwrap().unwrap();
         assert_eq!((disabled.input_gain_db, disabled.output_gain_db), (0.0, 0.0));
+    }
+
+    #[test]
+    fn carries_version_one_location_zero_high_pass() {
+        let p = compile_of(&[(12, 1.0), (13, 40.0), (21, 3.0), (22, 0.0), (23, 1.0)]).unwrap().unwrap();
+        assert_eq!(p.algorithm_version, 1);
+        assert_eq!((p.high_pass_frequency_hz, p.high_pass_order, p.high_pass_location), (40.0, 3, 0));
+        assert!(p.needs_extended_words());
+        assert!(compile_of(&[(12, 1.0), (13, 40.0), (21, 3.0), (22, 1.0), (23, 1.0)]).is_err());
     }
 
     #[test]

@@ -260,6 +260,15 @@ impl Wire for Kind {
                 }
             }
             Self::Cfreak(p) => {
+                if p.needs_extended_words() {
+                    22u32.put(o);
+                    let mut w = vec![0.0; super::cfreak::Params::EXTENDED_WORDS];
+                    p.to_extended_words(&mut w);
+                    for v in w {
+                        v.put(o);
+                    }
+                    return;
+                }
                 let legacy = p.input_gain_db == 0.0 && p.output_gain_db == 0.0;
                 (if legacy { 7u32 } else { 18u32 }).put(o);
                 let mut w = vec![0.0; super::cfreak::Params::WORDS];
@@ -369,8 +378,12 @@ impl Wire for Kind {
                 }
                 Self::Xtc(Box::new(params))
             }
-            tag @ (7 | 18) => {
-                let words = if tag == 7 { super::cfreak::Params::LEGACY_WORDS } else { super::cfreak::Params::WORDS };
+            tag @ (7 | 18 | 22) => {
+                let words = match tag {
+                    7 => super::cfreak::Params::LEGACY_WORDS,
+                    18 => super::cfreak::Params::WORDS,
+                    _ => super::cfreak::Params::EXTENDED_WORDS,
+                };
                 let w: Vec<f64> = (0..words).map(|_| f64::get(r)).collect::<Result<_>>()?;
                 Self::Cfreak(Box::new(super::cfreak::Params::from_words(&w).ok_or(BlobError::Unstable)?))
             }
