@@ -13,8 +13,8 @@
 //! hop, the velocity target from the two previously completed hops sets a
 //! water-fill cap on the Hann-window magnitudes of the affected bins, and the
 //! per-bin gains (immediate attack, saved release) scale the square-root Hann
-//! analysis spectrum before overlap-add. A separate non-overlapping detector
-//! transforms `latency + 128` input frames through a unit-energy Hann. It
+//! analysis spectrum before overlap-add. A separate detector transforms a
+//! `latency + 128` frame sliding history through a unit-energy Hann. It
 //! applies the saved LF/HF response magnitudes, reduces squared magnitudes on
 //! the unit's 99-band grid, and smooths the resulting linked mask level. The
 //! detector reads the input lanes before the fixed output delay.
@@ -420,14 +420,15 @@ impl Complex {
     }
 }
 
-/// Non-overlapping acoustic-mask analyzer. The transform is intentionally
-/// independent of the 128-frame limiter STFT: a completed `n`-frame detector
-/// block updates one held mask value, while limiter hops between updates use
-/// that value unchanged.
+/// Acoustic-mask analyzer whose `n`-frame sliding history advances by the
+/// same 128-frame hop as the limiter STFT but has its own unit-energy Hann and
+/// response-magnitude reduction.
 #[cfg(not(feature = "lowflow-conservative"))]
 struct MaskDetector {
     n: usize,
     at: usize,
+    low_history: Box<[f64]>,
+    high_history: Box<[f64]>,
     low: Box<[Complex]>,
     high: Box<[Complex]>,
     scratch: Box<[Complex]>,
@@ -483,6 +484,8 @@ impl MaskDetector {
         Self {
             n,
             at: 0,
+            low_history: vec![0.0; n].into_boxed_slice(),
+            high_history: vec![0.0; n].into_boxed_slice(),
             low: vec![Complex::default(); n].into_boxed_slice(),
             high: vec![Complex::default(); n].into_boxed_slice(),
             scratch: vec![Complex::default(); n].into_boxed_slice(),
@@ -504,6 +507,8 @@ impl MaskDetector {
 
     fn reset(&mut self) {
         self.at = 0;
+        self.low_history.fill(0.0);
+        self.high_history.fill(0.0);
         self.low.fill(Complex::default());
         self.high.fill(Complex::default());
         self.scratch.fill(Complex::default());
@@ -513,16 +518,25 @@ impl MaskDetector {
         self.db = 0.0;
     }
 
-    /// Adds one pre-delay LF/HF frame and returns a new smoothed level when a
-    /// complete detector transform has been reduced.
+    /// Adds one pre-delay LF/HF frame and returns a new smoothed level at the
+    /// end of each 128-frame hop.
     fn push(&mut self, low: f32, high: f32) -> Option<f64> {
-        self.low[self.at] = Complex { re: f64::from(finite(low)) * self.window[self.at], im: 0.0 };
-        self.high[self.at] = Complex { re: f64::from(finite(high)) * self.window[self.at], im: 0.0 };
+        if self.at == 0 {
+            self.low_history.copy_within(SPECTRAL_HOP.., 0);
+            self.high_history.copy_within(SPECTRAL_HOP.., 0);
+        }
+        let history_at = self.n - SPECTRAL_HOP + self.at;
+        self.low_history[history_at] = f64::from(finite(low));
+        self.high_history[history_at] = f64::from(finite(high));
         self.at += 1;
-        if self.at != self.n {
+        if self.at != SPECTRAL_HOP {
             return None;
         }
         self.at = 0;
+        for i in 0..self.n {
+            self.low[i] = Complex { re: self.low_history[i] * self.window[i], im: 0.0 };
+            self.high[i] = Complex { re: self.high_history[i] * self.window[i], im: 0.0 };
+        }
         transform(&mut self.low, &mut self.scratch, &self.twiddles, false);
         transform(&mut self.high, &mut self.scratch, &self.twiddles, false);
         let bin_count = self.n / 2 + 1;
@@ -1150,27 +1164,23 @@ impl Run {
             }
             if full_hop && !self.conservative_fallback {
                 for c in 0..self.models {
-                    let model = &self.params[c];
-                    let state = &mut self.state[c];
-                    let limit = velocity_limit(model, state.mask_output_db);
-                    let target = detector_target(model.enabled, model.mute, state.floor, limit, state.velocity_history);
-                    state.spectral.set_target(target);
-                    // The unit solves and releases the gain vector from the
-                    // preceding detector spectrum before it transforms the
-                    // current input hop. The released vector is then applied
-                    // to the current complex spectrum.
-                    state.spectral.update_gains();
-                    // The target controls the frame already in flight, so the
-                    // just-completed detector hop becomes history afterwards.
-                    state.velocity_history = [state.hop_velocity, state.velocity_history[0]];
-                    state.hop_velocity = 0.0;
-                }
-                for c in 0..self.models {
                     self.state[c].spectral.prepare_hop(&bufs[c][chunk_at..chunk_at + chunk_frames]);
                 }
                 for c in 0..self.models {
                     let model = &self.params[c];
                     let state = &mut self.state[c];
+                    let limit = velocity_limit(model, state.mask_output_db);
+                    let target = detector_target(model.enabled, model.mute, state.floor, limit, state.velocity_history);
+                    state.spectral.set_target(target);
+                    // The mask runtime has already transformed the current
+                    // detector hop. Target/water-fill and gain release run
+                    // before the current output transform consumes that
+                    // released vector.
+                    state.spectral.update_gains();
+                    // The target controls the frame already in flight, so the
+                    // just-completed detector hop becomes history afterwards.
+                    state.velocity_history = [state.hop_velocity, state.velocity_history[0]];
+                    state.hop_velocity = 0.0;
                     if model.mute {
                         bufs[c][chunk_at..chunk_at + chunk_frames].fill(0.0);
                         state.spectral.reset();
