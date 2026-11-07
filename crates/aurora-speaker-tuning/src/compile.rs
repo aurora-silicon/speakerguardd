@@ -646,11 +646,95 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
         Ok(v as u32)
     };
     let refuse = |what: &str| bad(format!("{what}: the engine's payload cannot represent it (TODO(lane B))"));
-    if !guarded && get(id::controller(id::C_USE_FAST_PEAK))? != 0.0 {
-        return Err(refuse("UseFastPeakSampleControl"));
-    }
-    if !guarded && get(id::controller(id::C_COMPENSATE_RESONATORS))? != 0.0 {
-        return Err(refuse("CompensateResonators"));
+    if !guarded {
+        // Report the independent missing mechanisms together. Returning only
+        // the first one made a new board appear to need just a prefilter when
+        // its own tuning also requested an estimator and a different current
+        // model. Nothing here substitutes model-only operation or drops a flag.
+        let mut unsupported = Vec::new();
+        for (key, name) in [
+            (id::controller(id::C_USE_FAST_PEAK), "UseFastPeakSampleControl"),
+            (id::controller(id::C_COMPENSATE_RESONATORS), "CompensateResonators integration"),
+            (id::ENABLE_CLOSED_LOOP_TEMPERATURE, "closed-loop temperature"),
+        ] {
+            if get(key)? != 0.0 {
+                unsupported.push(name.to_owned());
+            }
+        }
+        if get(id::BYPASS_SYS_ID)? != 1.0 {
+            unsupported.push("system identification".to_owned());
+        }
+        if get(id::amp0(id::A_USE_BATTERY))? != 0.0 {
+            unsupported.push("battery power model".to_owned());
+        }
+        if (0..4).any(|j| g.get(id::amp0(id::A_SOFT_LIMIT + j)).is_some_and(|v| v != 100.0)) {
+            unsupported.push("power soft limits other than 100 %".to_owned());
+        }
+        let mut selected_amp_model = None;
+        for c in 0..n as u32 {
+            let bank = whole(id::CH_TUNING + c, "ChTuning")?;
+            if bank != 0 {
+                unsupported.push(format!("Ch{c}Tuning selects bank {bank} instead of 0"));
+            }
+            let ty = whole(id::CH_SPEAKER_TYPE + c, "ChSpeakerType")?;
+            if ty > 2 {
+                return Err(bad(format!("Ch{c}SpeakerType {ty} is not a type A/B/C")));
+            }
+            let model_key = id::channel(c, id::CH_POWER_AMP_MODEL);
+            if g.get(model_key).is_none() {
+                unsupported.push(format!("channel {c} lacks saved PowerAmpModel"));
+            } else {
+                let model = whole(model_key, "PowerAmpModel")?;
+                if model > 2 {
+                    return Err(bad(format!("channel {c} PowerAmpModel {model}")));
+                }
+                if selected_amp_model.is_some_and(|m| m != model) {
+                    let feature = "channels select different amplifier models".to_owned();
+                    if !unsupported.contains(&feature) {
+                        unsupported.push(feature);
+                    }
+                }
+                selected_amp_model = Some(model);
+                for (field, rail) in [(id::A_ENABLE_MID, "mid"), (id::A_ENABLE_HIGH, "high")] {
+                    let key = if model == 0 { id::amp0(field) } else { id::amp(model, field - 1) };
+                    if get(key)? != 0.0 {
+                        let feature = format!("amplifier model {model} enables its {rail} rail");
+                        if !unsupported.contains(&feature) {
+                            unsupported.push(feature);
+                        }
+                    }
+                }
+            }
+            for (m, manager) in [
+                (id::MANAGER_ADMITTANCE, "admittance"),
+                (id::MANAGER_DISPLACEMENT, "displacement"),
+                (id::MANAGER_VELOCITY, "velocity"),
+            ] {
+                if get(id::model(m, ty, id::M_ENABLE_RES1))? == 0.0 {
+                    let feature = format!("type {ty} {manager} model without resonator 1");
+                    if !unsupported.contains(&feature) {
+                        unsupported.push(feature);
+                    }
+                }
+                for (k, name) in [
+                    (id::M_ENABLE_RES2, "resonator 2"),
+                    (id::M_ENABLE_LR2, "LR2 inductance"),
+                    (id::M_CREEP, "creep model"),
+                    (id::M_USE_COMPENSATION, "model compensation"),
+                    (id::M_PASSIVE_RADIATOR, "passive radiator"),
+                ] {
+                    if get(id::model(m, ty, k))? != 0.0 {
+                        let feature = format!("type {ty} {manager} {name}");
+                        if !unsupported.contains(&feature) {
+                            unsupported.push(feature);
+                        }
+                    }
+                }
+            }
+        }
+        if !unsupported.is_empty() {
+            return Err(bad(format!("unsupported or incomplete LSM2 configuration: {}", unsupported.join("; "))));
+        }
     }
     let model_only =
         (guarded || (get(id::BYPASS_SYS_ID)? == 1.0 && get(id::ENABLE_CLOSED_LOOP_TEMPERATURE)? == 0.0)) as u32;
@@ -682,6 +766,13 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
         low_rail_idle_power_w: 0.0,
         low_rail_power_ratio: 0.0,
         other_power_features: 0,
+        // The masker's bucket lattice is not in the tuning: the installer
+        // extracts it from the Mac's own macOS into the bundle, and
+        // Tuning::load has checked it (crate::lattice). A bundle without
+        // one (warned at load) gives no masking credit: the velocity limit
+        // stays at VelocityLimit0.
+        mask_lattice_len: if t.mask_lattice.is_some() { crate::lattice::ENTRIES as u32 } else { 0 },
+        mask_lattice: t.mask_lattice.unwrap_or([0; crate::lattice::ENTRIES]),
         // Platform runtime budgets (property 64008): the supervisor fills
         // them; the bundle has none.
         runtime_budget_present: 0,

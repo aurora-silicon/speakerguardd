@@ -62,7 +62,7 @@ struct Args {
     file_channels: usize,
     limit_frames: usize,
     preset_params: Vec<(u32, f32)>,
-    /// atsp: the stream rate the reference ran (`--rate`), 0 for the blob's.
+    /// atsp and lsm2: the stream rate the reference ran (`--rate`), 0 for the blob's.
     rate: u32,
     params_at: Vec<(usize, u32, f32)>,
     /// Host events by frame (`--events`), in order.
@@ -218,7 +218,7 @@ fn make_unit(
         UnitKind::Spp3 => {
             spp3::Params::from_blob(bytes).map(|p| Box::new(spp3::Unit::new(p)) as _).map_err(|e| format!("{e:?}"))
         }
-        UnitKind::Lsm2 => lsm2::Unit::from_blob(bytes)
+        UnitKind::Lsm2 => lsm2::Unit::from_blob_at_rate(bytes, rate)
             .map(|mut unit| {
                 if let Some(w) = cpms {
                     unit.set_runtime_budgets(w);

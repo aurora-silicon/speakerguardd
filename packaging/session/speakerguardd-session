@@ -18,12 +18,13 @@ It runs in the user's session, beside PipeWire, and does three things:
    also checks the carrier: the protect stage's input and the sense at unity
    volume, unmuted.
 3. **Report.** On every link or carrier change, and every 50 ms, it writes
-   `links=<0|1> carrier=<0|1> mono_ns=<t> pid=<pid> start=<ticks> wiring=<hash>`
+   `links=<0|1> carrier=<0|1> mono_ns=<t> pid=<pid> start=<ticks> wiring=<hash> amps=<0|1>`
    to /run/speakerguardd/<uid>/helper/session, where the wiring is the one
    the protect stage was built with (its `sgv2.wiring` property; the
    supervisor grants only for the wiring the self-check proved), by a write
    to a new file and a
-   rename, so the supervisor never reads a partial report. A report older
+   rename, so the supervisor never reads a partial report. `amps` says whether
+   anything is linked into the amps' sink (the sleep step waits for 0). A report older
    than 500 ms, dated in the future, or whose writer (pid, start time) is not
    this live process counts as absent, and the supervisor then releases.
 4. **The grant-before-start sequence.** The supervisor grants only on a
@@ -52,6 +53,10 @@ PROTECT_INPUT = "alsa_output.platform-sound.RawSpeakers"
 # While speakerguardd-selfcheck runs its silent check it holds a grant of
 # its own: nothing may be linked to the amps then.
 SELFCHECK_ACTIVE = "/run/speakerguardd-selfcheck/active"
+# Before system sleep speakerguardd-sleep.service sets this hold: the amps
+# and the sense are unlinked and suspended (their PCMs close) before the
+# supervisor stops, and stay so until the resume clears it.
+SLEEP_HOLD = "/run/speakerguardd-sleep/hold"
 
 # ALSA control ioctls (include/uapi/sound/asound.h, 64-bit)
 _ID_FMT = "IiII44sI"
@@ -114,7 +119,7 @@ class Card:
             fcntl.ioctl(self.fd, _ELEM_READ, buf)
         except OSError:
             return False
-        if os.path.exists(SELFCHECK_ACTIVE):
+        if os.path.exists(SELFCHECK_ACTIVE) or os.path.exists(SLEEP_HOLD):
             return False
         return struct.unpack_from("q", buf, 72)[0] == 1
 
@@ -179,6 +184,10 @@ class Graph:
                 return o["id"]
         return None
 
+    def node_state(self, nid):
+        """A node's state ("suspended", "idle", "running", ...), or None."""
+        return ((self.objs.get(nid) or {}).get("info") or {}).get("state")
+
     def node_props(self, nid):
         o = self.objs.get(nid) or {}
         params = (o.get("info") or {}).get("params") or {}
@@ -221,6 +230,7 @@ class Session:
         self.speaker = f"sgv2.speaker.{m}"
         self.sense_name = f"sgv2.sense.{m}"
         self.last_try = -10.0
+        self.last_suspend = -10.0
         self.pending = {}
 
     def wanted(self, g):
@@ -281,6 +291,14 @@ class Session:
         carrier = unity(g.node_props(protect)) and (sense is None or unity(g.node_props(sense)))
         return ok, carrier
 
+    def amps_linked(self, g):
+        """True while any link feeds the amps' sink."""
+        spk = g.node_id(self.speaker)
+        if spk is None:
+            return False
+        owners = {o["id"]: (o["info"].get("props") or {}).get("node.id") for o in g.of_type("Port")}
+        return any(owners.get(i) == spk for _, _, i in g.links())
+
     def wiring(self, g):
         """The protect stage's `sgv2.wiring` (16 hex digits), or None."""
         protect = g.node_id(PROTECT_INPUT)
@@ -330,9 +348,30 @@ class Session:
             spk = g.node_id(self.speaker)
             sense = g.node_id(self.sense_name) if self.sense else None
             owners = {o["id"]: (o["info"].get("props") or {}).get("node.id") for o in g.of_type("Port")}
+            linked = False
             for lid, o, i in g.links():
                 if owners.get(i) == spk or (sense is not None and owners.get(o) == sense):
+                    linked = True
                     self._spawn(("unlink", lid), ["pw-link", "-d", str(lid)])
+            if os.path.exists(SLEEP_HOLD) and not linked:
+                self.suspend_for_sleep(g, (spk, sense))
+
+    def suspend_for_sleep(self, g, nodes):
+        """Under the sleep hold, once nothing is linked: suspend the amps'
+        sink and the sense, which closes their PCMs. Unlinked they are only
+        paused, and WirePlumber closes an idle node after 5 s, after the
+        sleep has begun; a PCM held open across a sleep is unmuted by the
+        resume before its I2S clocks are back (the MCA loses its state in
+        sleep). speakerguardd-provision sleep waits for the PCMs to read
+        closed. Sent again every 0.5 s while a node is not suspended."""
+        now = time.monotonic()
+        if now - self.last_suspend < 0.5:
+            return
+        for nid in nodes:
+            if nid is not None and g.node_state(nid) not in (None, "suspended"):
+                self.last_suspend = now
+                # the node's Suspend command (pw-cli 1.x: id, command, args)
+                self._spawn(("suspend", nid), ["pw-cli", "send-command", str(nid), "Suspend", "{}"])
 
 
 _WRITER = None
@@ -357,7 +396,7 @@ def realtime():
         log("normal priority (no RLIMIT_RTPRIO or CAP_SYS_NICE)")
 
 
-def write_report(path, links, carrier, wiring=None):
+def write_report(path, links, carrier, wiring=None, amps=None):
     """Write one report atomically: a new file in the helper's own
     directory, renamed over the last one. The supervisor reads either the
     whole new report or the whole previous one, never a partial write.
@@ -368,6 +407,10 @@ def write_report(path, links, carrier, wiring=None):
         _WRITER = (os.getpid(), own_start())
     pid, start = _WRITER
     w = f" wiring={wiring}" if wiring else ""
+    # amps: whether anything is linked into the amps' sink (speakerguardd-sleep
+    # waits for 0 before the supervisor stops)
+    if amps is not None:
+        w += f" amps={int(amps)}"
     line = f"links={int(links)} carrier={int(carrier)} mono_ns={time.monotonic_ns()} pid={pid} start={start}{w}\n".encode()
     tmp = os.path.join(os.path.dirname(path), f".session.{os.getpid()}")
     try:
@@ -450,7 +493,7 @@ def main():
             nxt = time.monotonic() + PERIOD
         granted = card.granted()
         links, carrier = s.check(g)
-        wrote = write_report(report, links, carrier, s.wiring(g))
+        wrote = write_report(report, links, carrier, s.wiring(g), s.amps_linked(g))
         s.reconcile(g, granted)
         was_granted = granted
         state = (granted, links, carrier, wrote)

@@ -29,6 +29,9 @@
 //! `--board` the `--unit-id` given (the bundle's own, to compile offline
 //! for the Mac it came from), else unknown: then per-unit calibration is
 //! not used (open loop).  See `compile` for the binding rules.
+//! `--prestage` picks what runs ahead of the unit: `identity` (the default,
+//! pass-through: the voicing graph feeds the unit) or `tuning` (the Mac's
+//! own filtering, derived from the tuning; rigs and the full macOS chain).
 //!
 //! `identify` loads and verifies the bundle (nothing is parsed beyond the
 //! manifest) and prints where it was found and its digest
