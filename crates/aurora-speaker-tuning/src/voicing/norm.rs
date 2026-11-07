@@ -44,6 +44,7 @@ const HP_ENABLE: u32 = 10;
 const HP_HZ: u32 = 11;
 const RESET_MODE: u32 = 12;
 const VERSION: u32 = 13;
+const TRANSIENT_RESPONSE: u32 = 14;
 const AUTOMATION: u32 = 15;
 const EXPECTED: u32 = 28;
 const RESET_TIMEOUT: u32 = 29;
@@ -80,6 +81,10 @@ const SUPPORTED_FS: f64 = 48_000.0;
 /// Fast-path release dead band by algorithm version, dB.
 const FAST_DEADBAND_V2_DB: f64 = 10.0;
 const FAST_DEADBAND_V3_DB: f64 = 7.0;
+/// Algorithm 1's saved transient response (the detector smoothing), ms.
+const V1_TRANSIENT_MS: std::ops::RangeInclusive<f64> = 1.0..=1000.0;
+/// The detector smoothing of algorithms 2 and 3, s.
+const DETECTOR_S: f64 = 0.030;
 
 fn bad(message: impl Into<String>) -> Error {
     Error::format("Norm", message)
@@ -213,13 +218,19 @@ pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option
     if reset_mode == RESET_SEEDED && req(RESET_TIMEOUT)? == 0.0 {
         return Err(bad(format!("{}: reset mode {reset_mode} without a silence timeout is not carried", stage.name)));
     }
-    // the fast path's release dead band is the one law that differs between
-    // the algorithm versions the speaker strips use
+    // Algorithms 2 and 3 differ in the fast path's release dead band;
+    // algorithm 1 is its own arbitration (see sgv2-core's Norm).
     let version = req(VERSION)?;
-    let fast_deadband_db = if version == 2.0 {
-        FAST_DEADBAND_V2_DB
+    let (algorithm1, fast_deadband_db, detector_ema_s) = if version == 1.0 {
+        let ms = req(TRANSIENT_RESPONSE)?;
+        if !V1_TRANSIENT_MS.contains(&ms) {
+            return Err(bad(format!("{}: transient response {ms} ms out of the unit's range", stage.name)));
+        }
+        (true, FAST_DEADBAND_V2_DB, ms / 1000.0)
+    } else if version == 2.0 {
+        (false, FAST_DEADBAND_V2_DB, DETECTOR_S)
     } else if version == 3.0 {
-        FAST_DEADBAND_V3_DB
+        (false, FAST_DEADBAND_V3_DB, DETECTOR_S)
     } else {
         return Err(bad(format!("{}: algorithm version {version} is not carried", stage.name)));
     };
@@ -227,8 +238,9 @@ pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option
     let max_gain = req(MAX_GAIN)?;
     let up = req(UP_RANGE)?;
     let down = req(DOWN_RANGE)?;
-    let clamp = req(COMPRESSOR)? != 0.0;
-    let ratio = (req(USE_RATIO)? != 0.0).then(|| req(RATIO)).transpose()?;
+    // Absent switches are off. Algorithm 1 has no output clamp.
+    let clamp = !algorithm1 && g.get(COMPRESSOR).is_some_and(|v| v != 0.0);
+    let ratio = g.get(USE_RATIO).is_some_and(|v| v != 0.0).then(|| req(RATIO)).transpose()?;
     if target >= 0.0
         || target.is_nan()
         || !(0.0..=40.0).contains(&max_gain)
@@ -267,7 +279,9 @@ pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option
     if sos.len() > MAX_SECTIONS {
         return Err(bad("detector needs more sections than carried"));
     }
-    let lookahead = (req(LOOKAHEAD_MS)?.min(MAX_LOOKAHEAD_MS) * fs / 1000.0).round();
+    // the 3 ms cap applies from algorithm 2 on
+    let lookahead_ms = if algorithm1 { req(LOOKAHEAD_MS)? } else { req(LOOKAHEAD_MS)?.min(MAX_LOOKAHEAD_MS) };
+    let lookahead = (lookahead_ms * fs / 1000.0).round();
     let expected = req(EXPECTED)?;
     let timeout = req(RESET_TIMEOUT)?;
     let mut p = Params {
@@ -277,6 +291,8 @@ pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option
         lookahead: lookahead.max(0.0) as usize,
         sections: sos.len(),
         fast_deadband_db,
+        algorithm1,
+        detector_ema_s,
         ..Params::default()
     };
     for (d, s) in p.sos.iter_mut().zip(&sos) {
