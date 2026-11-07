@@ -7,10 +7,10 @@
     "j616s": true,
     "j700": true
   },
-  "_voicing_pre_bound_doc": "Interim never-louder bound (Ryan 2026-11-07: Plan A tonight on all four boards, open laws in their never-louder form): one gain in dB per unit lane, applied by the PipeWire voicing graph after the voicing plugin, so no lane of the generated voicing is louder than macOS while the Comp onset/param-69 (all four), LowFlow (j413, conservative build) and AID44 q2 detector laws are still open. Derived from the full-chain safety scan (packaging: bound.py = worst louder excess + 0.03 dB, L/R pairs equal) for j316s/j413/j616s and from the AID44 voicing-level VLS gate for j700; protection is unchanged and governs. Each entry goes when its board's laws are exact.",
+  "_voicing_pre_bound_doc": "Interim never-louder bound (Ryan 2026-11-07: Plan A tonight on all four boards, open laws in their never-louder form): one gain in dB per unit lane, applied by the PipeWire voicing graph after the voicing plugin, so no lane of the generated voicing is louder than macOS while the Comp onset/param-69 (all four), AID44 q2 detector laws are still open (j413 woofers: -1.09 dB since the exact LowFlow landed, 2026-11-08, covering the Comp onset excess the exact LowFlow now passes through). Derived from the full-chain safety scan (packaging: bound.py = worst louder excess + 0.03 dB, L/R pairs equal) for j316s/j413/j616s and from the AID44 voicing-level VLS gate for j700; protection is unchanged and governs. Each entry goes when its board's laws are exact.",
   "voicing_pre_bound_db": {
     "j316s": [-0.136, -0.136, -0.136, -0.136, -0.654, -0.654],
-    "j413": [0.0, 0.0, -0.217, -0.217],
+    "j413": [-1.09, -1.09, -0.217, -0.217],
     "j616s": [-1.217, -1.217, -1.24, -1.24, -0.837, -0.837],
     "j700": [-0.919, -0.919]
   },
