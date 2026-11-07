@@ -6,7 +6,7 @@
 //! The parameter compiler supplies the Audio Unit's saved controls.  This
 //! module contains no machine tuning.  Detection uses the Butterworth half
 //! of each Linkwitz-Riley band and is linked by taking the largest channel
-//! magnitude.  Algorithms zero and two measure a phase-invariant complex
+//! magnitude.  Algorithms zero through two measure a phase-invariant complex
 //! envelope; algorithm three retains the real-waveform estimator.  Overshoot
 //! compensation sends each band-local detector signal through the same
 //! four-band analysis bank once more and max-links that separate magnitude
@@ -22,7 +22,7 @@ const XOVERS: usize = BANDS - 1;
 const MAX_FILTERS: usize = 32;
 const MAX_DETECTOR_FILTERS: usize = 10;
 const MAX_DETECTOR_WINDOW: usize = 1921;
-const ANALYTIC_ORDER: usize = 12;
+const QUADRATURE_STAGES: usize = 4;
 const MAX_GAIN_SRC_TAPS: usize = 225;
 const INPUT_BOUND: f32 = 16.0;
 const CURVE_POINTS: usize = 11;
@@ -496,100 +496,70 @@ struct SlidingMax {
     next: u64,
 }
 
-/// Streaming analytic-signal producer used by detector algorithms 0 and 2.
-///
-/// This is a Rust translation of Signalsmith's 0BSD `hilbert-iir` realization
-/// (<https://github.com/Signalsmith-Audio/hilbert-iir>): a continuous-time
-/// design expressed as twelve parallel complex one-pole
-/// filters and converted to the render rate by impulse invariance.  The public
-/// design constants are independent of any captured response or machine
-/// tuning.  Its real component has unity passband gain; the complex magnitude
-/// is consequently the phase-invariant envelope used by the peak hold.
-#[derive(Clone, Copy)]
-struct AnalyticEnvelope {
-    coeff_real: [f32; ANALYTIC_ORDER],
-    coeff_imag: [f32; ANALYTIC_ORDER],
-    pole_real: [f32; ANALYTIC_ORDER],
-    pole_imag: [f32; ANALYTIC_ORDER],
-    state_real: [f32; ANALYTIC_ORDER],
-    state_imag: [f32; ANALYTIC_ORDER],
-    direct: f32,
+/// State for four cascaded second-order allpasses. Each section implements
+/// `(a^2 - z^-2) / (1 - a^2 z^-2)` with two interleaved delay lanes.
+#[derive(Clone, Copy, Default)]
+struct QuadratureArm {
+    input_delay: [[f32; 2]; QUADRATURE_STAGES],
+    output_delay: [[f32; 2]; QUADRATURE_STAGES],
 }
 
-impl AnalyticEnvelope {
-    const COEFFICIENT: [(f64, f64); ANALYTIC_ORDER] = [
-        (-0.000_224_352_093_802, 0.005_434_990_182_01),
-        (0.010_750_055_781_5, -0.017_389_068_568_1),
-        (-0.045_679_587_391_7, 0.022_916_693_142_9),
-        (0.112_825_005_82, 0.002_784_136_612_37),
-        (-0.208_067_578_452, -0.104_628_958_675),
-        (0.287_178_375_01, 0.336_192_397_19),
-        (-0.254_675_294_431, -0.683_033_899_655),
-        (0.048_108_183_502_6, 0.954_061_589_374),
-        (0.227_861_357_867, -0.891_273_574_569),
-        (-0.365_411_839_137, 0.525_088_317_271),
-        (0.280_729_061_131, -0.155_131_206_606),
-        (-0.093_506_178_772_8, 0.005_122_458_554_04),
-    ];
-    const POLE: [(f64, f64); ANALYTIC_ORDER] = [
-        (-0.004_953_359_764_78, 0.009_257_987_687_2),
-        (-0.017_859_491_302, 0.027_349_372_554_3),
-        (-0.041_371_437_315_5, 0.074_475_691_028_7),
-        (-0.088_214_840_888_5, 0.178_349_677_457),
-        (-0.179_229_658_12, 0.396_013_402_23),
-        (-0.338_261_800_753, 0.829_229_533_354),
-        (-0.557_688_699_732, 1.612_985_383_28),
-        (-0.735_157_736_148, 2.799_873_986_82),
-        (-0.719_057_381_172, 4.163_961_661_28),
-        (-0.517_871_025_209, 5.297_248_268_04),
-        (-0.280_197_469_471, 5.995_986_023_88),
-        (-0.085_275_135_453_1, 6.304_849_237_7),
-    ];
-
-    fn new(fs: f64) -> Self {
-        let frequency_factor = (20_000.0 / fs).min(0.46);
-        let passband_gain = 2.0;
-        let mut out = Self {
-            coeff_real: [0.0; ANALYTIC_ORDER],
-            coeff_imag: [0.0; ANALYTIC_ORDER],
-            pole_real: [0.0; ANALYTIC_ORDER],
-            pole_imag: [0.0; ANALYTIC_ORDER],
-            state_real: [0.0; ANALYTIC_ORDER],
-            state_imag: [0.0; ANALYTIC_ORDER],
-            direct: (0.000_262_057_212_648 * 2.0 * passband_gain * frequency_factor) as f32,
-        };
-        for i in 0..ANALYTIC_ORDER {
-            out.coeff_real[i] = (Self::COEFFICIENT[i].0 * frequency_factor * passband_gain) as f32;
-            out.coeff_imag[i] = (Self::COEFFICIENT[i].1 * frequency_factor * passband_gain) as f32;
-            let magnitude = libm::exp(Self::POLE[i].0 * frequency_factor);
-            let phase = Self::POLE[i].1 * frequency_factor;
-            out.pole_real[i] = (magnitude * libm::cos(phase)) as f32;
-            out.pole_imag[i] = (magnitude * libm::sin(phase)) as f32;
+impl QuadratureArm {
+    #[inline]
+    fn push(&mut self, mut input: f32, coefficient: &[f32; QUADRATURE_STAGES], phase: usize) -> f32 {
+        for (stage, &a_squared) in coefficient.iter().enumerate() {
+            let output =
+                a_squared * input - self.input_delay[stage][phase] + a_squared * self.output_delay[stage][phase];
+            self.input_delay[stage][phase] = input;
+            self.output_delay[stage][phase] = output;
+            input = output;
         }
-        out
+        input
     }
+}
+
+/// Phase-invariant envelope used by algorithms 0-2 at qualities 0 and 1.
+///
+/// These are Olli Niemitalo's public-domain 90-degree allpass coefficients
+/// from <https://yehar.com/blog/?p=368>. The installed unit uses the same
+/// topology: arm A has one additional sample of delay and the detector takes
+/// `sqrt(B(v)^2 + (z^-1 A(v))^2)`. The coefficients are the public design,
+/// not values fitted to machine captures.
+#[derive(Clone, Copy, Default)]
+struct QuadratureEnvelope {
+    arm_a: QuadratureArm,
+    arm_b: QuadratureArm,
+    arm_a_delay: f32,
+    phase: usize,
+}
+
+impl QuadratureEnvelope {
+    const A: [f32; QUADRATURE_STAGES] = [
+        0.692_387_8_f32 * 0.692_387_8_f32,
+        0.936_065_432_295_9_f32 * 0.936_065_432_295_9_f32,
+        0.988_229_522_686_f32 * 0.988_229_522_686_f32,
+        0.998_748_845_273_7_f32 * 0.998_748_845_273_7_f32,
+    ];
+    const B: [f32; QUADRATURE_STAGES] = [
+        0.402_192_116_242_6_f32 * 0.402_192_116_242_6_f32,
+        0.856_171_088_242_f32 * 0.856_171_088_242_f32,
+        0.972_290_954_565_1_f32 * 0.972_290_954_565_1_f32,
+        0.995_288_479_127_8_f32 * 0.995_288_479_127_8_f32,
+    ];
 
     fn reset(&mut self) {
-        self.state_real = [0.0; ANALYTIC_ORDER];
-        self.state_imag = [0.0; ANALYTIC_ORDER];
+        *self = Self::default();
     }
 
     #[inline]
     fn push(&mut self, input: f64) -> f64 {
         let input = input as f32;
-        let mut real = input * self.direct;
-        let mut imag = 0.0f32;
-        for i in 0..ANALYTIC_ORDER {
-            let old_real = self.state_real[i];
-            let old_imag = self.state_imag[i];
-            let new_real = old_real * self.pole_real[i] - old_imag * self.pole_imag[i] + input * self.coeff_real[i];
-            let new_imag = old_real * self.pole_imag[i] + old_imag * self.pole_real[i] + input * self.coeff_imag[i];
-            self.state_real[i] = new_real;
-            self.state_imag[i] = new_imag;
-            real += new_real;
-            imag += new_imag;
-        }
-        libm::sqrt((real * real + imag * imag) as f64)
+        let b = self.arm_b.push(input, &Self::B, self.phase);
+        let a = self.arm_a.push(input, &Self::A, self.phase);
+        let delayed_a = self.arm_a_delay;
+        self.arm_a_delay = a;
+        self.phase ^= 1;
+        libm::sqrt((b * b + delayed_a * delayed_a) as f64)
     }
 }
 
@@ -748,8 +718,8 @@ pub struct Run {
     detector_factor: [usize; BANDS],
     detector_phase: [usize; BANDS],
     detector_max: [SlidingMax; BANDS],
-    analytic: [[AnalyticEnvelope; BANDS]; MAX_CHANNELS],
-    overshoot_analytic: [[[AnalyticEnvelope; BANDS]; BANDS]; MAX_CHANNELS],
+    quadrature: [[QuadratureEnvelope; BANDS]; MAX_CHANNELS],
+    overshoot_quadrature: [[[QuadratureEnvelope; BANDS]; BANDS]; MAX_CHANNELS],
     hop_peak: bool,
     detector_hop: [f64; BANDS],
     gain_src: [GainSrc; BANDS],
@@ -815,10 +785,8 @@ impl Run {
             detector_factor,
             detector_phase: [0; BANDS],
             detector_max: [SlidingMax::EMPTY; BANDS],
-            analytic: core::array::from_fn(|_| core::array::from_fn(|_| AnalyticEnvelope::new(fs))),
-            overshoot_analytic: core::array::from_fn(|_| {
-                core::array::from_fn(|_| core::array::from_fn(|_| AnalyticEnvelope::new(fs)))
-            }),
+            quadrature: [[QuadratureEnvelope::default(); BANDS]; MAX_CHANNELS],
+            overshoot_quadrature: [[[QuadratureEnvelope::default(); BANDS]; BANDS]; MAX_CHANNELS],
             hop_peak: cadence(q) == Cadence::HopPeak,
             detector_hop: [0.0; BANDS],
             gain_src: core::array::from_fn(|b| GainSrc::new(detector_factor[b], fs)),
@@ -835,12 +803,12 @@ impl Run {
         self.env = [0.0; BANDS];
         self.detector_max = [SlidingMax::EMPTY; BANDS];
         self.detector_phase = [0; BANDS];
-        for channel in &mut self.analytic {
+        for channel in &mut self.quadrature {
             for envelope in channel {
                 envelope.reset();
             }
         }
-        for channel in &mut self.overshoot_analytic {
+        for channel in &mut self.overshoot_quadrature {
             for band in channel {
                 for envelope in band {
                     envelope.reset();
@@ -938,8 +906,7 @@ impl Run {
                 v = o;
             }
             let scale = self.band_in[b] * self.detector_bandwidth[b];
-            let magnitude =
-                if matches!(self.algorithm, 0 | 2) { v.abs().max(self.analytic[c][b].push(v)) } else { v.abs() };
+            let magnitude = if self.hop_peak { self.quadrature[c][b].push(v) } else { v.abs() };
             base[b] = (magnitude * scale) as f32 as f64;
             if self.overshoot_compensation {
                 let mut sum = 0.0;
@@ -953,8 +920,8 @@ impl Run {
                         z[1] = (s.b2 * branch - s.a2 * o) as f32;
                         branch = o;
                     }
-                    sum += if matches!(self.algorithm, 0 | 2) {
-                        branch.abs().max(self.overshoot_analytic[c][b][analysis_band].push(branch))
+                    sum += if self.hop_peak {
+                        self.overshoot_quadrature[c][b][analysis_band].push(branch)
                     } else {
                         branch.abs()
                     };
@@ -1320,9 +1287,9 @@ mod tests {
     }
 
     #[test]
-    fn analytic_envelope_is_phase_invariant_and_sums_tones() {
+    fn quadrature_envelope_is_phase_invariant_and_sums_tones() {
         let single = |frequency: f64, phase: f64| {
-            let mut envelope = AnalyticEnvelope::new(48_000.0);
+            let mut envelope = QuadratureEnvelope::default();
             let mut maximum = 0.0f64;
             for i in 0..48_000 {
                 let angle = 2.0 * core::f64::consts::PI * frequency * i as f64 / 48_000.0 + phase;
@@ -1341,7 +1308,7 @@ mod tests {
         }
 
         for phase in [0.0, core::f64::consts::FRAC_PI_2] {
-            let mut envelope = AnalyticEnvelope::new(48_000.0);
+            let mut envelope = QuadratureEnvelope::default();
             let mut maximum = 0.0f64;
             for i in 0..48_000 {
                 let t = i as f64 / 48_000.0;
@@ -1394,11 +1361,11 @@ mod tests {
         let mut run = Run::new(&params(), 48_000.0, 1);
         run.env = [0.25; BANDS];
         run.overshoot_state[0][0][0][0] = [0.25; 2];
-        run.analytic[0][0].state_real[0] = 0.25;
+        run.quadrature[0][0].arm_a.input_delay[0][0] = 0.25;
         run.reset();
         assert_eq!(run.env, [0.0; BANDS]);
         assert_eq!(run.overshoot_state[0][0][0][0], [0.0; 2]);
-        assert_eq!(run.analytic[0][0].state_real, [0.0; ANALYTIC_ORDER]);
+        assert_eq!(run.quadrature[0][0].arm_a.input_delay, [[0.0; 2]; QUADRATURE_STAGES]);
     }
 
     #[test]
