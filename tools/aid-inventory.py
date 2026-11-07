@@ -13,7 +13,7 @@ messages, graph parameter defaults, coefficients, unit IDs or bundle manifests.
 Builds default and lowflow-conservative tools, runs both compile modes and the
 renderer for each AID, then repeats the complete sweep to verify reproducibility.
 
-Temporary, exact-match source overlays count known bound paths in the
+Temporary, exact-match source overlays count known law paths in the
 actual full-chain render. They change no signal calculations and are restored
 even on build failure. Use a dedicated checkout: do not run concurrent builds
 in it. Instrumentation sources and build failures are preserved privately.
@@ -40,13 +40,14 @@ KNOWN_BOARDS = {9: ("j316s", "MacBook Pro (16-inch, M1 Pro, 2021)"),
                 49: ("k114s", "K114 MacBook Pro (M5 Pro / M5 Max)"),
                 50: ("k116s", "K116 MacBook Pro (M5 Pro / M5 Max)")}
 TRACE_LAWS = {1: "cfrk-slow-release-TODO(SPEC)", 2: "tmst-type18-TODO(SPEC)",
-              4: "lowflow-conservative", 8: "cfrk-true-peak-scale"}
+              4: "lowflow-conservative", 8: "cfrk-true-peak-scale", 16: "tmst-type15-release-gap"}
 LAW_SOURCES = {
     "cfrk-slow-release-TODO(SPEC)": "crates/sgv2-core/src/voicing/cfreak.rs:TAU_SLOW_S",
     "cfrk-ceiling-trim": "crates/sgv2-core/src/voicing/cfreak.rs:CEILING_TRIM_DB",
     "cfrk-true-peak-scale": "crates/sgv2-core/src/voicing/cfreak.rs:TRUE_PEAK_SCALE_DB",
     "gain-positive-clamp": "crates/sgv2-core/src/voicing/chain.rs:Run::set",
     "tmst-type18-TODO(SPEC)": "crates/sgv2-core/src/prestage.rs:process_conservative_high_shelf",
+    "tmst-type15-release-gap": "crates/sgv2-core/src/prestage.rs:DynamicRun::process",
     "lowflow-conservative": "crates/sgv2-core/src/voicing/lowflow.rs:CONSERVATIVE_GUARD_DB",
     "cfrk-frame-rounding": "crates/aurora-speaker-tuning/src/voicing/cfreak.rs:compile",
     "interim-filter-unity-bound": "crates/aurora-speaker-tuning/src/prestage.rs:derive_lanes",
@@ -131,7 +132,8 @@ def overlay(private):
             ("            self.slow += self.a_slow * (u - self.slow);", "            if u > self.slow { crate::aid_inventory_trace::hit(1); }\n            self.slow += self.a_slow * (u - self.slow);"),
             ("                if self.true_peak {", "                if self.true_peak {\n                    crate::aid_inventory_trace::hit(8);")],
         "crates/sgv2-core/src/prestage.rs": [
-            ("            self.process_conservative_high_shelf(at, bufs, frames, n);", "            crate::aid_inventory_trace::hit(2);\n            self.process_conservative_high_shelf(at, bufs, frames, n);")],
+            ("            self.process_conservative_high_shelf(at, bufs, frames, n);", "            crate::aid_inventory_trace::hit(2);\n            self.process_conservative_high_shelf(at, bufs, frames, n);"),
+            ("        if at.params.kind == DynamicKind::HighShelf && !at.params.smooth {", "        if at.params.kind == DynamicKind::Notch { crate::aid_inventory_trace::hit(16); }\n        if at.params.kind == DynamicKind::HighShelf && !at.params.smooth {")],
         "crates/sgv2-core/src/voicing/lowflow.rs": [
             ("                    state.conservative_floor\n", "                    crate::aid_inventory_trace::hit(4);\n                    state.conservative_floor\n")],
     }
@@ -272,7 +274,10 @@ def public_probe(raw):
                "compiled_kind": c.get("kind"),
                "in_voicing_plan": name in planned, "bypassed": b["bypass"],
                "laws": sorted(set(laws)), "configured_bounds": sorted(bounds),
-               "exercised_bounds": sorted(exercised)}
+               "exercised_bounds": sorted(law for law in exercised if law != "tmst-type15-release-gap"),
+               "exercised_law_paths": sorted(exercised)}
+        if "compiled_dynamic_type_counts" in c:
+            out["compiled_dynamic_type_counts"] = c["compiled_dynamic_type_counts"]
         if status == "unimplemented":
             out["refusal_text"] = ("builtin dbcontrol on the unit's lanes is not carried" if subtype == "dbcontrol"
                                    else "lsid has no carried compiler implementation")
@@ -419,7 +424,7 @@ def report(rows, revision):
                 "The short synthetic render does not qualify all histories, volumes or sample rates and does not render the protection unit.",
                 "TODO(SPEC) counts are emitted diagnostics; source-only TODOs are not falsely reported as exercised.",
                 "Default host selection only; explicit optional bundles provide actual rig selections. Vendor configurations are not exhaustively swept.",
-                "Temporary counters cover CFreak nontrivial slow release and true-peak scaling, type-18 conservative dispatch and active conservative LowFlow; other configured bounds have no hit counter.",
+                "Temporary counters cover CFreak nontrivial slow release and true-peak scaling, type-15 execution, type-18 conservative dispatch and active conservative LowFlow; other configured bounds have no hit counter.",
             ]}
 
 def markdown(data):
@@ -473,8 +478,8 @@ def markdown(data):
         for feature, v in r["variants"].items():
             for mode, c in v["compiles"].items():
                 lines.append(f'- {feature}/{mode}: {c["status"]}; refusals: ' + (", ".join(c["refusal_reasons"]) or "none") + "; TODO(SPEC) law counts: " + json.dumps(c["todo_spec_law_counts"], sort_keys=True) + "; emitted bound/gap paths: " + json.dumps(c["emitted_law_counts"], sort_keys=True) + ".")
-            exercised = {b["name"]: b["exercised_bounds"] for b in v["boxes"] if b["exercised_bounds"]}
-            lines.append(f'- {feature} render rc={v["render"]["rc"]}; unwired parameter count={v.get("unwired_parameter_count",0)}; exercised bound paths: ' + json.dumps(exercised, sort_keys=True) + ".")
+            exercised = {b["name"]: b["exercised_law_paths"] for b in v["boxes"] if b["exercised_law_paths"]}
+            lines.append(f'- {feature} render rc={v["render"]["rc"]}; unwired parameter count={v.get("unwired_parameter_count",0)}; exercised law paths: ' + json.dumps(exercised, sort_keys=True) + ".")
         lines.append("")
     lines += ["## Per-law rollup", "", "| Law / open item | AIDs needing it | Count |", "|---|---|---|"]
     for law, aids in data["per_law"].items():
