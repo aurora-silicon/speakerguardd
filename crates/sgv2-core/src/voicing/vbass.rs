@@ -93,7 +93,14 @@ impl Cascade {
         let mut sections = [[0.0; 5]; MAX_SECTIONS];
         for (dst, q) in sections.iter_mut().zip(&self.s[..self.n]) {
             let a1 = q.a[0] as f32;
-            let a2 = q.a[1] as f32;
+            let mut a2 = q.a[1] as f32;
+            if q.kind != SosKind::Stored && a2 > 0.0 {
+                // The platform object's stored positive quadratic pole is
+                // the next Float32 value after the scalar bilinear result.
+                // This is observable before the cancellation-sensitive DC
+                // numerator is formed below.
+                a2 = f32::from_bits(a2.to_bits() + 1);
+            }
             let first_order = q.a[1] == 0.0;
             let low_gain = || {
                 if first_order {
@@ -145,24 +152,22 @@ enum Kind {
 /// for odd `n`). `AllPass` is the all-pass with the same poles.
 fn butterworth(n: usize, fc: f64, fs: f64, kind: Kind) -> Cascade {
     let mut c = Cascade::default();
-    let w0 = 2.0 * core::f64::consts::PI * fc / fs;
-    let (sin_w0, cos_w0) = (libm::sin(w0), libm::cos(w0));
+    let k = libm::tan(core::f64::consts::PI * fc / fs);
     let pairs = n / 2;
     for i in 0..pairs {
         // analogue pole pair angle; q = 1 / (2 cos θ)
         let theta = core::f64::consts::PI * (2 * i + 1) as f64 / (2 * n) as f64;
         let two_zeta = 2.0 * libm::sin(theta);
-        let alpha = 0.5 * two_zeta * sin_w0;
-        let a0 = 1.0 + alpha;
-        let a1 = -2.0 * cos_w0 / a0;
-        let a2 = (1.0 - alpha) / a0;
+        let a0 = 1.0 + two_zeta * k + k * k;
+        let a1 = 2.0 * (k * k - 1.0) / a0;
+        let a2 = (1.0 - two_zeta * k + k * k) / a0;
         let b = match kind {
             Kind::Low => {
-                let g = (1.0 - cos_w0) / (2.0 * a0);
+                let g = k * k / a0;
                 [g, 2.0 * g, g]
             }
             Kind::High => {
-                let g = (1.0 + cos_w0) / (2.0 * a0);
+                let g = 1.0 / a0;
                 [g, -2.0 * g, g]
             }
             Kind::AllPass => [a2, a1, 1.0],
@@ -175,7 +180,6 @@ fn butterworth(n: usize, fc: f64, fs: f64, kind: Kind) -> Cascade {
         c.push(Bq { b, a: [a1, a2], kind: sos_kind });
     }
     if n % 2 == 1 {
-        let k = libm::tan(0.5 * w0);
         let a0 = 1.0 + k;
         let a1 = (k - 1.0) / a0;
         let b = match kind {
