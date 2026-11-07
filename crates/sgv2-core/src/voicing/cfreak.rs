@@ -56,9 +56,8 @@
 //!   channels, set once per [`DRIVE_BLOCK`] frames from the ratio of the
 //!   block's RMS (all channels) through a fixed high-band weighting to its
 //!   plain RMS (`k^2 = DRIVE_C * (ratio + DRIVE_RATIO_FLOOR)`),
-//!   smoothed in dB with [`DRIVE_TAU_S`]; an aligned
-//!   512-frame host call is measured before it is shaped, so it uses its
-//!   own block's drive;
+//!   smoothed in dB with [`DRIVE_TAU_S`]; each render call is split into
+//!   blocks of at most 512 frames, measured before they are shaped;
 //! * the same low pass `h` reconstructs and decimates: a low-level impulse
 //!   comes out as `h * h` sampled at the base rate, centred
 //!   [`SATURATION_DELAY`] frames late.
@@ -109,8 +108,14 @@ pub const CUBIC_SCALE: f64 = 0.674_484_5;
 pub const CEILING_OFF_DB: f64 = 100.0;
 /// Shaper drive bounds. The lower bound is exactly -5 dB.
 pub const K_MIN: f64 = 0.562_341_325_190_349; // 10^(-1/4)
-/// The drive is set once per this many frames.
+/// A render call is split from its first frame into drive blocks of at most
+/// this many frames; a short block advances the follower by its own length.
 pub const DRIVE_BLOCK: usize = 512;
+/// The new drive enters the oversampled shaper after the interpolation
+/// filter's delay, and its reciprocal makeup enters the decimated output
+/// after the full saturation delay.
+const DRIVE_SWITCH_OS: usize = OVERSAMPLE * FIR_HALF_BASE;
+const MAKEUP_SWITCH: usize = SATURATION_DELAY;
 /// Time constant of the per-block one-pole drive follower.
 pub const DRIVE_TAU_S: f64 = 0.1;
 /// `k^2 = DRIVE_C * (rms(weighted) / rms(input) + DRIVE_RATIO_FLOOR)`.
@@ -487,13 +492,15 @@ struct Saturation {
     post: Biquad,
     det: [Biquad; 3],
     pos: usize,
+    /// Output frames since start/reset, for exact startup silence.
+    started: usize,
     /// The block's energies, summed over the channels, of the input and of
     /// the weighted input (the drive is linked).
     ex: f64,
     eg: f64,
     peak: f64,
-    /// Per-block one-pole coefficient.
-    alpha: f64,
+    /// Drive time constant in frames.
+    tau_frames: f64,
     /// Smoothed drive (dB) and the drive in use.
     drive_db: f64,
     k: f64,
@@ -516,10 +523,11 @@ impl Saturation {
             post,
             det: [hp(DRIVE_HP_Q[0]), hp(DRIVE_HP_Q[1]), lp],
             pos: 0,
+            started: 0,
             ex: 0.0,
             eg: 0.0,
             peak: 0.0,
-            alpha: 1.0 - libm::exp(-(DRIVE_BLOCK as f64) / (DRIVE_TAU_S * fs)),
+            tau_frames: DRIVE_TAU_S * fs,
             drive_db: drive_start_db(),
             k: 1.0,
             peak_scale: 1.0,
@@ -529,6 +537,7 @@ impl Saturation {
 
     fn reset(&mut self) {
         self.pos = 0;
+        self.started = 0;
         self.ex = 0.0;
         self.eg = 0.0;
         self.peak = 0.0;
@@ -564,7 +573,8 @@ impl Saturation {
     fn end_block(&mut self) {
         let ratio = if self.ex > 0.0 { libm::sqrt(self.eg / self.ex) } else { 0.0 };
         let target = 10.0 * libm::log10(DRIVE_C * (ratio + DRIVE_RATIO_FLOOR));
-        self.drive_db += self.alpha * (target - self.drive_db);
+        let alpha = 1.0 - libm::exp(-(self.pos as f64) / self.tau_frames);
+        self.drive_db += alpha * (target - self.drive_db);
         self.k = libm::pow(10.0, self.drive_db / 20.0).clamp(K_MIN, 1.0);
         self.peak_scale =
             self.peak_ceiling.map_or(1.0, |ceiling| if self.peak > ceiling { ceiling / self.peak } else { 1.0 });
@@ -574,30 +584,32 @@ impl Saturation {
         self.pos = 0;
     }
 
+    /// Shaper numerator. The reciprocal-drive makeup is applied after
+    /// decimation so a block transition follows the native two switch
+    /// positions.
     fn shape(flavor: u32, k: f64, x: f64) -> f64 {
         if flavor == 1 {
             let u = CUBIC_SCALE * k * x;
-            let f = if u >= 1.0 {
+            if u >= 1.0 {
                 1.0
             } else if u <= -1.0 {
                 -1.0
             } else {
                 1.5 * u - 0.5 * u * u * u
-            };
-            f / k
+            }
         } else {
-            libm::sin(k * x) / k
+            libm::sin(k * x)
         }
     }
 
     /// One base-rate sample of channel `c`; returns the sample delayed by
     /// [`SATURATION_DELAY`].
-    fn run(&mut self, c: usize, x: f64, k: f64) -> f64 {
+    fn run(&mut self, c: usize, x: f64, k: [f64; OVERSAMPLE], makeup: f64) -> f64 {
         let h = &self.h;
         let flavor = self.flavor;
         let s = &mut self.ch[c];
         if !self.oversampled {
-            return Self::shape(flavor, k, x);
+            return Self::shape(flavor, k[0], x) / makeup;
         }
         s.x_at = (s.x_at + 1) % PHASE_TAPS;
         s.x[s.x_at] = x;
@@ -612,8 +624,8 @@ impl Saturation {
                 j += 1;
             }
             u *= OVERSAMPLE as f64;
-            let d = self.pre.run(&mut s.pre, u);
-            let shaped = Self::shape(flavor, k, d);
+            let d = self.pre.run(&mut s.pre, k[phase] * u);
+            let shaped = Self::shape(flavor, 1.0, d);
             let v = self.post.run(&mut s.post, shaped);
             s.v_at = (s.v_at + 1) % V_RING;
             s.v[s.v_at] = v;
@@ -625,7 +637,7 @@ impl Saturation {
         for (i, hv) in h.iter().enumerate() {
             y += hv * s.v[(newest_3n + V_RING - i) % V_RING];
         }
-        y
+        y / makeup
     }
 }
 
@@ -814,17 +826,15 @@ impl Run {
         let frames = bufs[..ch].iter().fold(frames, |n, b| n.min(b.len()));
         let mut at = 0;
         while at < frames {
-            let room = self.saturation.as_ref().map_or(DRIVE_BLOCK, |s| DRIVE_BLOCK - s.pos);
-            let n = room.min(frames - at);
-            self.process_piece(bufs, ch, at, n);
+            let n = DRIVE_BLOCK.min(frames - at);
+            self.process_block(bufs, ch, at, n);
             at += n;
         }
     }
 
-    /// Process one part of a call, ending no later than the current linked
-    /// drive-block boundary. The input part is measured before it is shaped;
-    /// an aligned 512-frame host call therefore uses that same block's drive.
-    fn process_piece(&mut self, bufs: &mut [&mut [f32]], ch: usize, at: usize, n: usize) {
+    /// Process one call-relative block. Its input is measured before it is
+    /// shaped, and a short final block advances the drive by its own length.
+    fn process_block(&mut self, bufs: &mut [&mut [f32]], ch: usize, at: usize, n: usize) {
         for (c, b) in bufs[..ch].iter().enumerate() {
             let state = &mut self.highpass_state[c];
             let piece = &mut self.piece[c * DRIVE_BLOCK..c * DRIVE_BLOCK + n];
@@ -839,19 +849,15 @@ impl Run {
             }
         }
         let drive = if let Some(s) = &mut self.saturation {
-            let block_at = s.pos;
-            let oversampled = s.oversampled;
             let drive_before = s.k * s.peak_scale;
             for i in 0..n {
                 for c in 0..ch {
                     s.measure(c, self.piece[c * DRIVE_BLOCK + i]);
                 }
             }
-            s.pos += n;
-            if s.pos == DRIVE_BLOCK {
-                s.end_block();
-            }
-            Some((drive_before, s.k * s.peak_scale, block_at, oversampled))
+            s.pos = n;
+            s.end_block();
+            Some((drive_before, s.k * s.peak_scale))
         } else {
             None
         };
@@ -863,11 +869,18 @@ impl Run {
             for (c, slot) in frame[..ch].iter_mut().enumerate() {
                 let mut x = self.piece[c * DRIVE_BLOCK + i];
                 if let Some(s) = &mut self.saturation {
-                    let (drive_before, drive_after, block_at, oversampled) = drive.expect("saturation drive");
-                    // The oversampled shaper sees the new block drive once
-                    // its interpolation filter is centred in the block.
-                    let k = if oversampled && block_at + i < FIR_HALF_BASE { drive_before } else { drive_after };
-                    x = s.run(c, x, k);
+                    let (before, after) = drive.expect("saturation drive");
+                    let os = OVERSAMPLE * i;
+                    let k = if s.oversampled {
+                        core::array::from_fn(|phase| if os + phase < DRIVE_SWITCH_OS { before } else { after })
+                    } else {
+                        [after; OVERSAMPLE]
+                    };
+                    let makeup = if s.oversampled && i < MAKEUP_SWITCH { before } else { after };
+                    x = s.run(c, x, k, makeup);
+                    if s.oversampled && s.started < SATURATION_DELAY {
+                        x = 0.0;
+                    }
                 }
                 *slot = x;
                 let hist = &mut self.hist[c * TAPS..(c + 1) * TAPS];
@@ -886,6 +899,9 @@ impl Run {
                     a = a.max(self.tp_scale * best);
                 }
                 peak = peak.max(a);
+            }
+            if let Some(s) = &mut self.saturation {
+                s.started = s.started.saturating_add(1);
             }
             let g = self.gain(peak);
             for (c, b) in bufs[..ch].iter_mut().enumerate() {
@@ -1134,7 +1150,7 @@ mod tests {
                 s.end_block();
             }
             let drive = s.k * s.peak_scale;
-            s.run(0, x, drive);
+            s.run(0, x, [drive; OVERSAMPLE], drive);
         }
         assert_eq!(s.k, 1.0);
     }
@@ -1160,7 +1176,7 @@ mod tests {
             } else {
                 (1.5 * u - 0.5 * u * u * u) / K_MIN
             };
-            assert!((Saturation::shape(1, K_MIN, x) - want).abs() < 1e-12);
+            assert!((Saturation::shape(1, K_MIN, x) / K_MIN - want).abs() < 1e-12);
         }
     }
 
