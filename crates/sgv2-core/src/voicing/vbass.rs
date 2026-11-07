@@ -29,6 +29,10 @@
 //! - `SUB` band-limits the mid branches (a low pass designed at a quarter
 //!   of the rate); each odd-order band-edge all-pass adds one frame of
 //!   output latency and a further branch delay.
+//! - With level control on and an odd lower band edge, that edge's frame of
+//!   branch delay sits in front of the device: the device reads the previous
+//!   selected-rate frame and its input level, while restoration uses the
+//!   current input level. The branch's total delay is unchanged.
 //! - The side signal only ever takes the high-pass path: stereo width is
 //!   untouched, and the bass is folded to the mid.
 //!
@@ -330,10 +334,13 @@ pub mod law {
     pub const LC_HOLD_S: f64 = 0.5;
     pub const LC_HOLD_RATIO: f64 = 0.9;
     pub const LC_SMOOTH_S: f64 = 0.5;
-    /// Retained envelope and smoothing stores start at this linear level on
-    /// construction and reset.  The follower floor is applied later, at the
-    /// two level-control divisions; it is not the state seed.
-    pub const LC_SEED: f64 = 1e-3;
+    /// Never-louder margin on the hold-restart test (not part of macOS's
+    /// law): this box's arithmetic is not bit-identical to macOS's, so a
+    /// near-tie restart could fall either way. The input follower restarts
+    /// its hold only clearly above the ratio (it then releases no later than
+    /// macOS's), the output follower already slightly below it (it then
+    /// releases no earlier): a tie always resolves to the quieter output.
+    pub const LC_HOLD_MARGIN: f64 = 1e-3;
     /// Harmonic compressor. The detector converts `abs(x) + epsilon` to dB,
     /// computes a conventional soft-knee gain-reduction request, then runs
     /// that non-negative request through the same peak-follower topology as
@@ -486,33 +493,17 @@ struct Follower {
 
 impl Follower {
     fn new(fs: f64, ratio: f64) -> Follower {
-        Follower::with_times(
-            fs,
-            ratio,
-            law::LC_ATTACK_S,
-            law::LC_RELEASE_S,
-            law::LC_HOLD_S,
-            law::LC_SMOOTH_S,
-            law::LC_SEED,
-        )
+        Follower::with_times(fs, ratio, law::LC_ATTACK_S, law::LC_RELEASE_S, law::LC_HOLD_S, law::LC_SMOOTH_S)
     }
 
-    fn with_times(
-        fs: f64,
-        ratio: f64,
-        attack_s: f64,
-        release_s: f64,
-        hold_s: f64,
-        smooth_s: f64,
-        seed: f64,
-    ) -> Follower {
+    fn with_times(fs: f64, ratio: f64, attack_s: f64, release_s: f64, hold_s: f64, smooth_s: f64) -> Follower {
         let fs = fs as f32;
         let pole = |t: f64| libm::expf(-1.0 / (t as f32 * fs));
         Follower {
             ratio: ratio as f32,
             tie: f32::INFINITY,
-            e: seed as f32,
-            s: seed as f32,
+            e: 0.0,
+            s: 0.0,
             held: 0,
             hold: (hold_s as f32 * fs) as usize + 1,
             a_att: pole(attack_s),
@@ -543,12 +534,8 @@ impl Follower {
         } else {
             (self.a_rel, self.a_smo)
         };
-        // The retained stores and both associations are Float32.  Keep the
-        // follower's multiply-add boundary explicit: a long program history
-        // can otherwise move the first post-step windows by a measurable
-        // fraction of a decibel even though steady segments agree.
-        self.e = libm::fmaf(a, self.e, (1.0 - a) * u);
-        self.s = libm::fmaf(b, self.s, (1.0 - b) * self.e);
+        self.e = a * self.e + (1.0 - a) * u;
+        self.s = b * self.s + (1.0 - b) * self.e;
         self.s as f64
     }
 }
@@ -572,7 +559,6 @@ impl HarmonicCompressor {
                 law::COMP_RELEASE_S,
                 law::COMP_HOLD_S,
                 law::COMP_SMOOTH_S,
-                0.0,
             ),
         }
     }
@@ -605,7 +591,10 @@ struct LevelControl {
 
 impl LevelControl {
     fn new(fs: f64) -> LevelControl {
-        LevelControl { input: Follower::new(fs, law::LC_HOLD_RATIO), output: Follower::new(fs, law::LC_HOLD_RATIO) }
+        LevelControl {
+            input: Follower::new(fs, law::LC_HOLD_RATIO * (1.0 + law::LC_HOLD_MARGIN)),
+            output: Follower::new(fs, law::LC_HOLD_RATIO * (1.0 - law::LC_HOLD_MARGIN)),
+        }
     }
 }
 
@@ -695,7 +684,7 @@ impl Run {
             lc: LevelControl::new(fs8),
             lc_odd_delay,
             lc_lo_delay: 0.0,
-            lc_p_in_delay: law::LC_SEED,
+            lc_p_in_delay: 0.0,
             lc_low_delay: 0.0,
             compressor: HarmonicCompressor::new(fs8, p.compressor_threshold_db, p.compressor_ratio),
             stride,
@@ -721,7 +710,7 @@ impl Run {
         self.band_lp_st = CascadeState::default();
         self.lc = LevelControl::new(self.fs / self.stride as f64);
         self.lc_lo_delay = 0.0;
-        self.lc_p_in_delay = law::LC_SEED;
+        self.lc_p_in_delay = 0.0;
         self.lc_low_delay = 0.0;
         self.compressor = HarmonicCompressor::new(
             self.fs / self.stride as f64,
@@ -995,8 +984,8 @@ mod tests {
     #[test]
     fn level_control_holds_then_releases() {
         let mut f = Follower::new(48_000.0, law::LC_HOLD_RATIO);
-        assert_eq!(f.e, law::LC_SEED as f32);
-        assert_eq!(f.s, law::LC_SEED as f32);
+        assert_eq!(f.e, 0.0);
+        assert_eq!(f.s, 0.0);
         for _ in 0..4_800 {
             f.run(1.0);
         }
@@ -1024,7 +1013,7 @@ mod tests {
         // input level when the delayed device output reaches it.
         assert_eq!(r.sub_frame(0.5), 0.0);
         assert_eq!(r.lc_lo_delay, 0.5);
-        assert!(r.lc_p_in_delay > law::LC_SEED);
+        assert!(r.lc_p_in_delay > 0.0);
         assert_ne!(r.lc_low_delay, 0.0);
 
         let off = Run::new(&params(false), 48_000.0, 2);
@@ -1036,6 +1025,25 @@ mod tests {
         let even = Run::new(&even, 48_000.0, 2);
         assert!(!even.lc_odd_delay);
         assert_eq!(even.sdelay, even.latency());
+    }
+
+    #[test]
+    fn odd_lower_edge_delay_keeps_the_steady_response() {
+        let steady = |ahead: bool| {
+            let mut r = Run::new(&params(true), 48_000.0, 2);
+            if !ahead {
+                r.lc_odd_delay = false;
+                r.sdelay = r.latency;
+            }
+            let n = 2 * 48_000;
+            let mut l = tone(60.0, 0.5, n);
+            let mut rr = l.clone();
+            r.process(&mut [&mut l, &mut rr], n);
+            (amp(&l[n / 2..], 60.0), amp(&l[n / 2..], 180.0))
+        };
+        let (ahead, after) = (steady(true), steady(false));
+        assert!((ahead.0 - after.0).abs() < 1e-6 * after.0.max(1e-3), "{ahead:?} {after:?}");
+        assert!((ahead.1 - after.1).abs() < 1e-3 * after.1.max(1e-3), "{ahead:?} {after:?}");
     }
 
     fn gain_db(c: &Cascade, f: f64, fs: f64) -> f64 {
