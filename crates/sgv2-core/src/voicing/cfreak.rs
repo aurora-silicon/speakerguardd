@@ -838,11 +838,10 @@ impl Run {
                 *slot = x;
             }
         }
-        let (mut drive_before, mut drive_after, mut block_at, mut oversampled) = (1.0, 1.0, 0, false);
-        if let Some(s) = &mut self.saturation {
-            block_at = s.pos;
-            oversampled = s.oversampled;
-            drive_before = s.k * s.peak_scale;
+        let drive = if let Some(s) = &mut self.saturation {
+            let block_at = s.pos;
+            let oversampled = s.oversampled;
+            let drive_before = s.k * s.peak_scale;
             for i in 0..n {
                 for c in 0..ch {
                     s.measure(c, self.piece[c * DRIVE_BLOCK + i]);
@@ -852,8 +851,10 @@ impl Run {
             if s.pos == DRIVE_BLOCK {
                 s.end_block();
             }
-            drive_after = s.k * s.peak_scale;
-        }
+            Some((drive_before, s.k * s.peak_scale, block_at, oversampled))
+        } else {
+            None
+        };
         let l = self.lookahead;
         for i in 0..n {
             let mut peak = 0.0f64;
@@ -862,6 +863,7 @@ impl Run {
             for (c, slot) in frame[..ch].iter_mut().enumerate() {
                 let mut x = self.piece[c * DRIVE_BLOCK + i];
                 if let Some(s) = &mut self.saturation {
+                    let (drive_before, drive_after, block_at, oversampled) = drive.expect("saturation drive");
                     // The oversampled shaper sees the new block drive once
                     // its interpolation filter is centred in the block.
                     let k = if oversampled && block_at + i < FIR_HALF_BASE { drive_before } else { drive_after };
