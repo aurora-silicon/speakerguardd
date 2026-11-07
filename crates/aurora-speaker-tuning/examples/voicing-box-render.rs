@@ -15,6 +15,12 @@
 //! little-endian f32 with C channels, rendered in 512-frame slices. A box
 //! the saved state bypasses is copied through. For the differential rig;
 //! never part of the plugin.
+//!
+//! For a full ToneMeister box, `--voicing-chain --tone-volume V` drives
+//! parameter 3 and compiles its slot automation. Supply the value at that
+//! box input, including any upstream relay's effect; this isolated render
+//! does not run the graph's other boxes. Without `--tone-volume`, it keeps
+//! the unwired pre-stage's least-passing settings.
 
 use aurora_speaker_tuning::bundle::Bundle;
 use aurora_speaker_tuning::dspg::analysis::{Lane, Origin, Pass};
@@ -23,6 +29,31 @@ use aurora_speaker_tuning::{prestage, voicing, Diagnostics};
 use sgv2_core::voicing::chain::{Chain, GraphParam, Kind, Link, NodeSpec, Source, Spec};
 use std::path::PathBuf;
 use std::process::exit;
+
+// The rig's explicit parameter-3 input must enable automation at compile
+// time, just as a volume wire does in the full-chain compiler.
+pub(crate) fn tone_spec(
+    stage: &aurora_speaker_tuning::tuning::Stage,
+    ch: usize,
+    fs: f64,
+    volume: Option<f64>,
+    diags: &mut Diagnostics,
+) -> aurora_speaker_tuning::Result<Spec> {
+    let (tone, partial) = prestage::voicing_tone(stage, ch, volume.is_some(), fs, diags)?;
+    if !partial.is_empty() {
+        return Err(aurora_speaker_tuning::Error::format(
+            "isolated Tone chain",
+            format!("volume automation entries carried only in part: {partial:?}"),
+        ));
+    }
+    Ok(Spec {
+        program_channels: ch,
+        nodes: vec![NodeSpec { kind: Kind::Tone(tone), inputs: (0..ch).map(Source::Program).collect() }],
+        outputs: (0..ch).map(|channel| Source::Node(0, channel)).collect(),
+        links: volume.map(|_| vec![Link { param: GraphParam::VolumeScalar, node: 0, id: 3 }]).unwrap_or_default(),
+        relays: Vec::new(),
+    })
+}
 
 fn die(msg: impl std::fmt::Display) -> ! {
     eprintln!("voicing-box-render: {msg}");
@@ -89,7 +120,7 @@ fn main() {
     }
     let (Some(ch), [inp, out]) = (ch, files.as_slice()) else {
         eprintln!(
-            "usage: voicing-box-render (--tunings-root DIR --aid N --box NAME [--voicing-chain] [--sample-rate HZ] [--automation-input V] \
+            "usage: voicing-box-render (--tunings-root DIR --aid N --box NAME [--voicing-chain] [--tone-volume V] [--sample-rate HZ] [--automation-input V] \
              | --params-words FILE [--fs HZ]) --ch C IN.f32 OUT.f32"
         );
         exit(2)
@@ -177,20 +208,7 @@ fn main() {
         }
         "tmst" => {
             if voicing_chain {
-                let (tone, partial) =
-                    prestage::voicing_tone(stage, ch, false, fs, &mut diags).unwrap_or_else(|e| die(format!("{e:?}")));
-                if !partial.is_empty() {
-                    die(format!("volume automation entries carried only in part: {partial:?}"));
-                }
-                let spec = Spec {
-                    program_channels: ch,
-                    nodes: vec![NodeSpec { kind: Kind::Tone(tone), inputs: (0..ch).map(Source::Program).collect() }],
-                    outputs: (0..ch).map(|channel| Source::Node(0, channel)).collect(),
-                    links: tone_volume
-                        .map(|_| vec![Link { param: GraphParam::VolumeScalar, node: 0, id: 3 }])
-                        .unwrap_or_default(),
-                    relays: Vec::new(),
-                };
+                let spec = tone_spec(stage, ch, fs, tone_volume, &mut diags).unwrap_or_else(|e| die(format!("{e:?}")));
                 let mut run = Chain::new(spec, fs, 512).unwrap_or_else(|| die("invalid isolated Tone chain"));
                 if let Some(v) = tone_volume {
                     run.set_param(GraphParam::VolumeScalar, v);
