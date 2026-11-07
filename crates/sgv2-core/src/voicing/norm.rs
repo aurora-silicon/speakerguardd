@@ -404,7 +404,7 @@ impl Precondition {
         self.source = 0.0;
     }
 
-    fn update(&mut self, source: f64, reading: f64) -> f64 {
+    fn update(&mut self, source: f64, reading: f64, direction_reading: f64) -> f64 {
         let out = if source <= reading && self.out <= reading {
             if self.rising {
                 reading.min(self.source)
@@ -416,7 +416,7 @@ impl Precondition {
         };
         self.out = out;
         self.source = source;
-        self.rising = source > reading;
+        self.rising = source > direction_reading;
         out
     }
 }
@@ -487,6 +487,9 @@ pub struct Run {
     long_line: [f64; LONG_DELAY],
     long_at: usize,
     long_out: f64,
+    /// The undelayed histogram reading used by the preconditioner's
+    /// direction comparator. Its output branch sees `long_out` instead.
+    long_current: f64,
     /// Whether the median has passed its first block since the reset.
     median_live: bool,
     /// The 512-frame candidate: limited median against the conditioned
@@ -529,6 +532,7 @@ impl Run {
             long_line: [p.expected_db; LONG_DELAY],
             long_at: 0,
             long_out: p.expected_db,
+            long_current: p.expected_db,
             median_live: false,
             held: 0.0,
             candidate: 0.0,
@@ -563,6 +567,7 @@ impl Run {
         self.long_line = [e; LONG_DELAY];
         self.long_at = 0;
         self.long_out = e;
+        self.long_current = e;
         self.median_live = false;
         self.held = e;
         self.candidate = e;
@@ -614,6 +619,7 @@ impl Run {
         if self.steps == 0 && self.blocks == 0 {
             self.window.resum();
             let reading = self.long.update(self.window.mean());
+            self.long_current = reading;
             self.long_out = core::mem::replace(&mut self.long_line[self.long_at], reading);
             self.long_at = (self.long_at + 1) % LONG_DELAY;
         }
@@ -648,7 +654,7 @@ impl Run {
             self.fast += (1.0 - pole) * (fast + self.p.fast_deadband_db - self.fast);
         }
         if let Some((db, mid, long)) = self.pending.take() {
-            let long = self.pre.update(db + COMPETITOR_STORE_DB, long);
+            let long = self.pre.update(db + COMPETITOR_STORE_DB, long, self.long_current);
             self.held = mid.max(long);
         }
         self.candidate = self.held.max(self.fast);
@@ -914,12 +920,32 @@ mod tests {
         // the reading climbs past a steady competitor at -12
         let mut out = 0.0;
         for r in [-20.0, -16.0, -13.0, -11.0, -10.5, -10.4] {
-            out = p.update(-12.0, r);
+            out = p.update(-12.0, r, r);
         }
         assert_eq!(out, -12.0);
         // it follows the reading down, and again once the competitor is above
-        assert_eq!(p.update(-12.0, -12.5), -12.5);
-        assert_eq!(p.update(-5.0, -11.0), -11.0);
+        assert_eq!(p.update(-12.0, -12.5, -12.5), -12.5);
+        assert_eq!(p.update(-5.0, -11.0, -11.0), -11.0);
+    }
+
+    #[test]
+    fn the_preconditioner_uses_the_current_reading_for_direction() {
+        let mut p = Precondition::new(750.0);
+        p.out = -22.42;
+        p.source = -23.70;
+
+        // The delayed reading still governs the output branch. The current
+        // reading alone sets the direction remembered for the next block.
+        assert_eq!(p.update(-22.69, -21.94, -23.0), -22.42);
+        assert!(p.rising);
+        assert_eq!(p.update(-22.14, -21.94, -23.0), -22.69);
+
+        // A current reading above the source does not arm that ratchet.
+        p.out = -6.37;
+        p.source = -6.37;
+        p.rising = false;
+        assert_eq!(p.update(-6.28, -6.05, -6.05), -6.37);
+        assert!(!p.rising);
     }
 
     #[test]
