@@ -1030,11 +1030,8 @@ pub struct Run {
     detector_hop: [f64; BANDS],
     gain_src: [GainSrc; BANDS],
     state: [[[[f64; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS],
-    state_b: [[[[f64; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS],
     legacy_high_state: [[[[f64; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
-    legacy_high_state_b: [[[[f64; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
     legacy_split_allpass_state: [[[[f64; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
-    legacy_split_allpass_state_b: [[[[f64; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
     legacy_merge_allpass_state: [[[[f64; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
     half_analysis_low_a: [[[[f32; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
     half_analysis_high_a: [[[[f32; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
@@ -1142,11 +1139,8 @@ impl Run {
                 GainSrc::new(detector_factor[b], if b == 0 { band_zero_rate } else { fs })
             }),
             state: [[[[0.0; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS],
-            state_b: [[[[0.0; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS],
             legacy_high_state: [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
-            legacy_high_state_b: [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
             legacy_split_allpass_state: [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
-            legacy_split_allpass_state_b: [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
             legacy_merge_allpass_state: [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
             half_analysis_low_a: [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
             half_analysis_high_a: [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
@@ -1197,11 +1191,8 @@ impl Run {
         }
         self.band_zero_phase = 0;
         self.state = [[[[0.0; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS];
-        self.state_b = [[[[0.0; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS];
         self.legacy_high_state = [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS];
-        self.legacy_high_state_b = [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS];
         self.legacy_split_allpass_state = [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS];
-        self.legacy_split_allpass_state_b = [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS];
         self.legacy_merge_allpass_state = [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS];
         self.half_analysis_low_a = [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS];
         self.half_analysis_high_a = [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS];
@@ -1265,27 +1256,6 @@ impl Run {
     }
 
     #[inline]
-    fn split_b(&mut self, c: usize, x: f64) -> [f64; BANDS] {
-        if self.legacy_recombination {
-            return self.legacy_split_b(c, x);
-        }
-        let mut out = [0.0; BANDS];
-        for (b, y) in out.iter_mut().enumerate() {
-            let mut v = x;
-            for i in 0..self.path[b].count {
-                let s = self.path[b].section[i];
-                let z = &mut self.state_b[c][b][i];
-                let o = s.b0 * v + z[0];
-                z[0] = s.b1 * v - s.a1 * o + z[1];
-                z[1] = s.b2 * v - s.a2 * o;
-                v = o;
-            }
-            *y = v * self.band_in[b];
-        }
-        out
-    }
-
-    #[inline]
     fn run_path(path: Path, state: &mut [[f64; 2]; MAX_FILTERS], mut value: f64) -> f64 {
         for (s, z) in path.section[..path.count].iter().zip(state.iter_mut()) {
             let output = s.b0 * value + z[0];
@@ -1304,21 +1274,6 @@ impl Run {
             let filters = self.legacy_stage[stage];
             let high = Self::run_path(filters.high, &mut self.legacy_high_state[c][stage], remaining);
             let allpass = Self::run_path(filters.allpass, &mut self.legacy_split_allpass_state[c][stage], remaining);
-            *band = (allpass - high) * self.band_in[stage];
-            remaining = high;
-        }
-        out[BANDS - 1] = remaining * self.band_in[BANDS - 1];
-        out
-    }
-
-    #[inline]
-    fn legacy_split_b(&mut self, c: usize, x: f64) -> [f64; BANDS] {
-        let mut out = [0.0; BANDS];
-        let mut remaining = x;
-        for (stage, band) in out.iter_mut().enumerate().take(XOVERS) {
-            let filters = self.legacy_stage[stage];
-            let high = Self::run_path(filters.high, &mut self.legacy_high_state_b[c][stage], remaining);
-            let allpass = Self::run_path(filters.allpass, &mut self.legacy_split_allpass_state_b[c][stage], remaining);
             *band = (allpass - high) * self.band_in[stage];
             remaining = high;
         }
@@ -1643,11 +1598,8 @@ impl Run {
                 }
                 if !y.is_finite() {
                     self.state[c] = [[[0.0; 2]; MAX_FILTERS]; BANDS];
-                    self.state_b[c] = [[[0.0; 2]; MAX_FILTERS]; BANDS];
                     self.legacy_high_state[c] = [[[0.0; 2]; MAX_FILTERS]; XOVERS];
-                    self.legacy_high_state_b[c] = [[[0.0; 2]; MAX_FILTERS]; XOVERS];
                     self.legacy_split_allpass_state[c] = [[[0.0; 2]; MAX_FILTERS]; XOVERS];
-                    self.legacy_split_allpass_state_b[c] = [[[0.0; 2]; MAX_FILTERS]; XOVERS];
                     self.legacy_merge_allpass_state[c] = [[[0.0; 2]; MAX_FILTERS]; XOVERS];
                     self.half_analysis_low_a[c] = [[[0.0; 2]; MAX_FILTERS]; XOVERS];
                     self.half_analysis_high_a[c] = [[[0.0; 2]; MAX_FILTERS]; XOVERS];
