@@ -123,16 +123,24 @@ pub fn high_shelf(gain_db: f64, f0: f64, q: f64, fs: f64) -> Section {
 /// ToneMeister's phase-compensated high shelf and its companion allpass.
 ///
 /// A channel selected by the slot's filter mask runs the shelf; a channel in
-/// the separate phase mask runs the allpass.  The analog pole/zero prototypes
-/// split the requested shelf gain symmetrically around the half-gain phase
-/// prototype.  Their poles are mapped by matched Z and the shelf numerator is
-/// magnitude-corrected at the same three frequencies as [`high_shelf`].
-pub fn phase_compensated_high_shelf(gain_db: f64, f0: f64, q: f64, fs: f64) -> (Section, Section) {
+/// the separate phase mask runs the allpass.  The shelf is the square of a
+/// half-gain shelf: its analog zeros and poles sit a quarter of the gain
+/// ratio either side of the slot frequency (`A^(-1/2) s^2 + A^(-1/4) s / Q +
+/// 1` over `A^(1/2) s^2 + A^(1/4) s / Q + 1` for a cut, the reverse for a
+/// boost), the poles are mapped by matched Z and the numerator is
+/// magnitude-corrected at the same three frequencies as [`high_shelf`].  The
+/// shelf runs that half-gain section followed by its numerator-reversed twin,
+/// so its magnitude is the half-gain magnitude squared and its phase is
+/// exactly that of the allpass built on the same poles (black-box: the unit's
+/// shelf impulse is fourth order with a doubled pole pair and a zero pair
+/// mirrored about the unit circle, and the companion's poles are the half
+/// shelf's; cuts and boosts of 2-6 dB at Q 0.7-2 match to <= 0.01 dB).
+pub fn phase_compensated_high_shelf(gain_db: f64, f0: f64, q: f64, fs: f64) -> ([Section; 2], Section) {
     if gain_db == 0.0 {
-        return (Section::IDENTITY, Section::IDENTITY);
+        return ([Section::IDENTITY; 2], Section::IDENTITY);
     }
     let a = libm::pow(10.0, gain_db.abs() / 40.0);
-    let (num_power, den_power) = if gain_db < 0.0 { (-0.5, 1.5) } else { (1.5, -0.5) };
+    let (num_power, den_power) = if gain_db < 0.0 { (-0.5, 0.5) } else { (0.5, -0.5) };
     let prototype = |power: f64| {
         let leading = libm::pow(a, power);
         [leading, libm::sqrt(leading) / q, 1.0]
@@ -146,14 +154,11 @@ pub fn phase_compensated_high_shelf(gain_db: f64, f0: f64, q: f64, fs: f64) -> (
         let target = libm::sqrt(polynomial_power(num, x) / polynomial_power(den, x));
         magnitude[i] = target * denominator_magnitude(den_z, w);
     }
-    // Reversing the minimum-phase magnitude fit gives the filter the phase of
-    // the companion prototype while retaining exactly the same magnitude.
     let b = curve_fit(magnitude);
-    let filter = Section { b0: b[2], b1: b[1], b2: b[0], a1: den_z[0], a2: den_z[1] };
-
-    let phase_den = matched_den(prototype(0.5), f0, fs);
-    let allpass = Section { b0: phase_den[1], b1: phase_den[0], b2: 1.0, a1: phase_den[0], a2: phase_den[1] };
-    (filter, allpass)
+    let half = Section { b0: b[0], b1: b[1], b2: b[2], a1: den_z[0], a2: den_z[1] };
+    let twin = Section { b0: b[2], b1: b[1], b2: b[0], a1: den_z[0], a2: den_z[1] };
+    let allpass = Section { b0: den_z[1], b1: den_z[0], b2: 1.0, a1: den_z[0], a2: den_z[1] };
+    ([half, twin], allpass)
 }
 
 /// ToneMeister's resonant high-pass slot. `Q` is stored in an analog decay
@@ -336,14 +341,30 @@ mod tests {
     #[test]
     fn phase_compensated_shelf_and_companion_share_phase() {
         let fs = 48_000.0;
-        let (shelf, allpass) = phase_compensated_high_shelf(-6.0, 1200.0, 0.9, fs);
-        for f in [20.0, 300.0, 1200.0, 5000.0, 16_000.0] {
-            assert!((magnitude(allpass, f, fs) - 1.0).abs() < 1e-12);
-            let relative = magnitude(shelf, f, fs) / magnitude(allpass, f, fs);
-            assert!(relative.is_finite() && relative > 0.0);
+        for gain in [-6.0, -2.0, 3.0, 6.0] {
+            let ([half, twin], allpass) = phase_compensated_high_shelf(gain, 1200.0, 0.9, fs);
+            let shelf = |f: f64| magnitude(half, f, fs) * magnitude(twin, f, fs);
+            for f in [20.0, 300.0, 1200.0, 5000.0, 16_000.0] {
+                assert!((magnitude(allpass, f, fs) - 1.0).abs() < 1e-12);
+                // The twin mirrors the half section's zeros: equal magnitude.
+                assert!((magnitude(half, f, fs) - magnitude(twin, f, fs)).abs() < 1e-12);
+                // Same phase as the companion: the cascade over the allpass
+                // is real and positive.
+                let w = 2.0 * core::f64::consts::PI * f / fs;
+                let ph = |s: Section| {
+                    let z = |k: f64| (libm::cos(k * w), -libm::sin(k * w));
+                    let (c1, c2) = (z(1.0), z(2.0));
+                    let n = (s.b0 + s.b1 * c1.0 + s.b2 * c2.0, s.b1 * c1.1 + s.b2 * c2.1);
+                    let d = (1.0 + s.a1 * c1.0 + s.a2 * c2.0, s.a1 * c1.1 + s.a2 * c2.1);
+                    libm::atan2(n.1, n.0) - libm::atan2(d.1, d.0)
+                };
+                let diff = ph(half) + ph(twin) - ph(allpass);
+                let wrapped = libm::atan2(libm::sin(diff), libm::cos(diff));
+                assert!(wrapped.abs() < 1e-9, "{gain} dB at {f} Hz: phase {wrapped}");
+            }
+            assert!((shelf(0.0) - 1.0).abs() < 1e-9);
+            assert!((20.0 * libm::log10(shelf(23_999.0)) - gain).abs() < 0.05);
         }
-        assert!((magnitude(shelf, 0.0, fs) - 1.0).abs() < 1e-9);
-        assert!((20.0 * libm::log10(magnitude(shelf, 23_999.0, fs)) + 6.0).abs() < 0.01);
     }
 
     #[test]

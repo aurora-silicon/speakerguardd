@@ -968,12 +968,13 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics, mode: Rea
                 };
                 match carried(carry, carry_spans) {
                     Carry::Exact(k) if in_bypassed_group && carry[k].gain > 0.0 => {}
+                    Carry::Exact(k) if matches!(r, Rbj::HighShelf) && phase_mask != 0.0 => {
+                        let (shelf, _) = tone_filter::phase_compensated_high_shelf(carry[k].gain, carry[k].f0, q, fs);
+                        p.sections.extend(shelf);
+                    }
                     Carry::Exact(k) => p.sections.push(match r {
                         Rbj::Peak => tone_filter::peak(carry[k].gain, carry[k].f0, q, fs),
                         Rbj::LowShelf => tone_filter::low_shelf(carry[k].gain, carry[k].f0, q, fs),
-                        Rbj::HighShelf if phase_mask != 0.0 => {
-                            tone_filter::phase_compensated_high_shelf(carry[k].gain, carry[k].f0, q, fs).0
-                        }
                         Rbj::HighShelf => tone_filter::high_shelf(carry[k].gain, carry[k].f0, q, fs),
                     }),
                     Carry::Flat(g) => p.gain_db += g,
@@ -1785,11 +1786,14 @@ mod tests {
         let mut diagnostics = Diagnostics::default();
         let mid = part_with(&stage, 0, 48_000.0, &mut diagnostics, Realise::Saved).unwrap();
         let side = part_with(&stage, 1, 48_000.0, &mut diagnostics, Realise::Saved).unwrap();
-        assert_eq!((mid.sections.len(), side.sections.len()), (1, 1));
+        // The shelf is the half-gain section and its reversed twin.
+        assert_eq!((mid.sections.len(), side.sections.len()), (1, 2));
         for frequency in [20.0, 1500.0, 20_000.0] {
             assert!((mid.sections[0].magnitude(frequency, 48_000.0) - 1.0).abs() < 1e-12);
         }
-        assert!(side.sections[0].magnitude(20_000.0, 48_000.0) < 0.81);
+        let side_at = |f: f64| side.sections[0].magnitude(f, 48_000.0) * side.sections[1].magnitude(f, 48_000.0);
+        assert!((side_at(20.0) - 1.0).abs() < 1e-3);
+        assert!(side_at(20_000.0) < 0.81);
     }
 
     /// The pre-stage of `chain` with every one of `n` lanes passing every box.
