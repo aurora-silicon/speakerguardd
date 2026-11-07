@@ -4,12 +4,16 @@
 //! ```text
 //! voicing-render (--bundle PATH | --tunings-root DIR --aid N)
 //!     --in PROGRAM.f32 --out LANES.f32 [--mvsc S] [--mvol DB]
-//!     [--tap NODE=FILE.f32 ...] [--info FILE.json] [--block N] [--only NODE]
+//!     [--tap NODE=FILE.f32 ...] [--info FILE.json] [--block N]
+//!     [--only NODE | --after NODE]
 //!     [--profile PROFILE.json]
 //! ```
 //!
 //! `--only NODE` runs that one box alone: the input has the box's width and
 //! the output is the box's output (the per-box gate of the rig).
+//! `--after NODE` treats that node's output as the program and runs only its
+//! downstream dependency tail. This is the stage-boundary isolation gate:
+//! an installed-unit tap can be injected without running an upstream v2 box.
 //!
 //! Interleaved float32 at 48 kHz. `--tap` writes a box's output (all its
 //! channels, interleaved). `--info` writes the plan, the stubs and the
@@ -19,7 +23,7 @@ use aurora_speaker_tuning::bundle::Bundle;
 use aurora_speaker_tuning::tuning::{Options, Tuning};
 use aurora_speaker_tuning::voicing::chain::compile;
 use aurora_speaker_tuning::Diagnostics;
-use sgv2_core::voicing::chain::{Chain, GraphParam, Link, Source, Spec};
+use sgv2_core::voicing::chain::{Chain, GraphParam, Link, Relay, Source, Spec};
 use std::io::Write;
 
 fn rd(p: &str) -> Vec<f32> {
@@ -30,12 +34,79 @@ fn rd(p: &str) -> Vec<f32> {
         .collect()
 }
 
+/// Keep the dependency tail after `boundary`, replacing references to the
+/// boundary's output with program inputs. A retained node may not also read
+/// some other removed source: that would no longer be an exact boundary
+/// injection, so refuse it instead of silently wiring a different graph.
+fn after(mut spec: Spec, boundary: usize) -> Result<(Spec, Vec<Option<usize>>), String> {
+    let Some(boundary_node) = spec.nodes.get(boundary) else { return Err("boundary node is outside the spec".into()) };
+    let program_channels = boundary_node.out_width();
+    let mut map = vec![None; spec.nodes.len()];
+    let mut nodes = Vec::new();
+    for old in boundary + 1..spec.nodes.len() {
+        let depends = spec.nodes[old].inputs.iter().any(|source| match *source {
+            Source::Node(node, _) => node == boundary || map[node].is_some(),
+            Source::Program(_) => false,
+        });
+        if !depends {
+            continue;
+        }
+        let mut node = spec.nodes[old].clone();
+        for source in &mut node.inputs {
+            *source = match *source {
+                Source::Node(node, channel) if node == boundary => {
+                    if channel >= program_channels {
+                        return Err(format!(
+                            "node {old} reads boundary channel {channel} past width {program_channels}"
+                        ));
+                    }
+                    Source::Program(channel)
+                }
+                Source::Node(node, channel) => match map[node] {
+                    Some(node) => Source::Node(node, channel),
+                    None => return Err(format!("node {old} also depends on removed node {node}")),
+                },
+                Source::Program(channel) => {
+                    return Err(format!("node {old} also depends on original program channel {channel}"))
+                }
+            };
+        }
+        map[old] = Some(nodes.len());
+        nodes.push(node);
+    }
+    let remap_source = |source: Source| -> Result<Source, String> {
+        match source {
+            Source::Node(node, channel) if node == boundary => Ok(Source::Program(channel)),
+            Source::Node(node, channel) => map[node]
+                .map(|node| Source::Node(node, channel))
+                .ok_or_else(|| format!("chain output depends on removed node {node}")),
+            Source::Program(channel) => Err(format!("chain output depends on original program channel {channel}")),
+        }
+    };
+    let outputs = spec.outputs.into_iter().map(remap_source).collect::<Result<Vec<_>, _>>()?;
+    let links = spec.links.into_iter().filter_map(|link| map[link.node].map(|node| Link { node, ..link })).collect();
+    let mut relays = Vec::new();
+    for relay in spec.relays {
+        match (map[relay.from_node], map[relay.to_node]) {
+            (Some(from_node), Some(to_node)) => relays.push(Relay { from_node, to_node, ..relay }),
+            (None, Some(_)) => {
+                return Err(format!("retained node has a parameter relay from removed node {}", relay.from_node))
+            }
+            _ => {}
+        }
+    }
+    spec = Spec { program_channels, nodes, outputs, links, relays };
+    spec.check().map_err(|e| format!("tail spec is invalid: {e:?}"))?;
+    Ok((spec, map))
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let (mut root, mut aid, mut bundle, mut input, mut output, mut info) = (None, None, None, None, None, None);
     let (mut mvsc, mut mvol, mut block) = (1.0f64, 0.0f64, 512usize);
     let mut taps: Vec<(String, String)> = Vec::new();
     let mut only: Option<String> = None;
+    let mut after_node: Option<String> = None;
     let mut profile: Option<String> = None;
     while let Some(a) = args.next() {
         let mut v = || args.next().expect("value");
@@ -50,6 +121,7 @@ fn main() {
             "--mvol" => mvol = v().parse().expect("mvol"),
             "--block" => block = v().parse().expect("block"),
             "--only" => only = Some(v()),
+            "--after" => after_node = Some(v()),
             "--profile" => profile = Some(v()),
             "--tap" => {
                 let s = v();
@@ -82,6 +154,8 @@ fn main() {
     }
     let (Some(input), Some(output)) = (input, output) else { return };
     let mut c = c;
+    assert!(only.is_none() || after_node.is_none(), "--only and --after are exclusive");
+    let mut node_map: Vec<Option<usize>> = (0..c.spec.nodes.len()).map(Some).collect();
     if let Some(name) = &only {
         // one box alone: its channels are the input, its output the lanes
         let n = c.plan.node(name).unwrap_or_else(|| panic!("no node {name}"));
@@ -95,12 +169,23 @@ fn main() {
             links: c.spec.links.iter().filter(|l| l.node == n).map(|l| Link { node: 0, ..*l }).collect(),
             relays: vec![],
         };
+        node_map.fill(None);
+        node_map[n] = Some(0);
         assert!(taps.is_empty(), "--only takes no --tap");
+    } else if let Some(name) = &after_node {
+        let n = c.plan.node(name).unwrap_or_else(|| panic!("no node {name}"));
+        (c.spec, node_map) = after(c.spec, n).unwrap_or_else(|e| panic!("cannot isolate after {name}: {e}"));
     }
     let pc = c.spec.program_channels;
     let lanes = c.spec.outputs.len();
-    let tap_nodes: Vec<(usize, String)> =
-        taps.iter().map(|(n, f)| (c.plan.node(n).unwrap_or_else(|| panic!("no node {n}")), f.clone())).collect();
+    let tap_nodes: Vec<(usize, String)> = taps
+        .iter()
+        .map(|(name, file)| {
+            let old = c.plan.node(name).unwrap_or_else(|| panic!("no node {name}"));
+            let node = node_map[old].unwrap_or_else(|| panic!("node {name} is not in the selected chain"));
+            (node, file.clone())
+        })
+        .collect();
     let mut chain = Chain::new(c.spec, 48_000.0, block).expect("spec");
     chain.set_param(GraphParam::VolumeScalar, mvsc);
     chain.set_param(GraphParam::VolumeDb, mvol);
@@ -175,5 +260,55 @@ fn main() {
             "nodes": nodes,
         });
         std::fs::write(path, serde_json::to_vec_pretty(&j).unwrap()).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sgv2_core::voicing::chain::{Kind, NodeSpec};
+
+    fn node(inputs: Vec<Source>) -> NodeSpec {
+        NodeSpec { kind: Kind::Bypass, inputs }
+    }
+
+    #[test]
+    fn exact_dependency_tail_rewires_the_boundary() {
+        let spec = Spec {
+            program_channels: 2,
+            nodes: vec![
+                node(vec![Source::Program(0), Source::Program(1)]),
+                node(vec![Source::Node(0, 0), Source::Node(0, 1)]),
+                node(vec![Source::Node(1, 0), Source::Node(1, 1)]),
+                node(vec![Source::Node(2, 0), Source::Node(2, 1)]),
+            ],
+            outputs: vec![Source::Node(3, 0), Source::Node(3, 1)],
+            links: vec![Link { param: GraphParam::VolumeScalar, node: 3, id: 5 }],
+            relays: vec![Relay { from_node: 2, from_id: 1, to_node: 3, to_id: 2 }],
+        };
+        let (tail, map) = after(spec, 1).unwrap();
+        assert_eq!(map, vec![None, None, Some(0), Some(1)]);
+        assert_eq!(tail.program_channels, 2);
+        assert_eq!(tail.nodes[0].inputs, vec![Source::Program(0), Source::Program(1)]);
+        assert_eq!(tail.nodes[1].inputs, vec![Source::Node(0, 0), Source::Node(0, 1)]);
+        assert_eq!(tail.outputs, vec![Source::Node(1, 0), Source::Node(1, 1)]);
+        assert_eq!(tail.links[0].node, 1);
+        assert_eq!((tail.relays[0].from_node, tail.relays[0].to_node), (0, 1));
+    }
+
+    #[test]
+    fn tail_refuses_a_second_upstream_source() {
+        let spec = Spec {
+            program_channels: 2,
+            nodes: vec![
+                node(vec![Source::Program(0), Source::Program(1)]),
+                node(vec![Source::Node(0, 0), Source::Node(0, 1)]),
+                node(vec![Source::Node(1, 0), Source::Program(1)]),
+            ],
+            outputs: vec![Source::Node(2, 0), Source::Node(2, 1)],
+            links: vec![],
+            relays: vec![],
+        };
+        assert!(after(spec, 1).unwrap_err().contains("original program"));
     }
 }

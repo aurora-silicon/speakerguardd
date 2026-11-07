@@ -30,6 +30,13 @@ call, matching the existing `norm-render` tool; its intrinsic look-ahead is
 retained. There is no fitted latency alignment or fitted gain.
 Amplitude parity alone does not establish phase or sample identity.
 
+For a boundary inside a full chain, `voicing-render --after NODE` accepts
+that node's output channels as its input and runs only the downstream
+dependency tail. It refuses a retained node that also reads the original
+program or another removed node, so an installed-unit stage tap cannot be
+silently tested against a differently wired tail. Downstream `--tap` names
+remain the graph's original node names.
+
 Controls, run on buildbox:
 
 ```sh
