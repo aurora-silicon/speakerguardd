@@ -1889,37 +1889,49 @@ mod tests {
 
     #[test]
     fn detector_cadences_scale_windows_and_keep_the_next_peak() {
-        let run = Run::new(&params(), 48_000.0, 1);
-        assert_eq!(run.detector_factor, [8; BANDS]);
-        assert_eq!(run.band_zero_factor, 11);
-        assert_eq!(run.detector_window, [1, 13, 13, 7]);
+        // Keep only the small observable state on the debug test stack.
+        let cadence = |p: &Params, fs: f64| {
+            let run = alloc::boxed::Box::new(Run::new(p, fs, 1));
+            (
+                run.detector_factor,
+                run.detector_window,
+                run.release,
+                run.band_zero_factor,
+                run.hop_peak,
+            )
+        };
+        let p0 = params();
+        let (factor, window, release, band_zero_factor, _) = cadence(&p0, 48_000.0);
+        assert_eq!(factor, [8; BANDS]);
+        assert_eq!(band_zero_factor, 11);
+        assert_eq!(window, [1, 13, 13, 7]);
         for b in 0..BANDS {
-            let rate = if b == 0 { 48_000.0 / run.band_zero_factor as f64 } else { 48_000.0 };
-            let embedded_fs = rate / run.detector_factor[b] as f64;
-            assert!((run.release[b] - libm::exp(-1.0 / (params().release_s * embedded_fs))).abs() < 1e-12);
+            let rate = if b == 0 { 48_000.0 / band_zero_factor as f64 } else { 48_000.0 };
+            let embedded_fs = rate / factor[b] as f64;
+            assert!((release[b] - libm::exp(-1.0 / (p0.release_s * embedded_fs))).abs() < 1e-12);
         }
-        let run = Run::new(&params(), 96_000.0, 1);
-        assert_eq!(run.band_zero_factor, 23);
-        assert_eq!(run.detector_window, [1, 25, 25, 13]);
+        let (_, window, _, band_zero_factor, _) = cadence(&p0, 96_000.0);
+        assert_eq!(band_zero_factor, 23);
+        assert_eq!(window, [1, 25, 25, 13]);
 
         let mut p = params();
         p.algorithm = 3;
-        let run = Run::new(&p, 48_000.0, 1);
-        assert_eq!(run.detector_factor, [1, 2, 4, 4]);
-        assert_eq!(run.detector_window, [481, 193, 25, 13]);
+        let (factor, window, _, _, _) = cadence(&p, 48_000.0);
+        assert_eq!(factor, [1, 2, 4, 4]);
+        assert_eq!(window, [481, 193, 25, 13]);
         p.algorithm = 0;
         p.render_quality = 2;
-        assert_eq!(Run::new(&p, 48_000.0, 1).detector_factor, [1, 2, 4, 4]);
+        assert_eq!(cadence(&p, 48_000.0).0, [1, 2, 4, 4]);
 
         // Threshold automation switches the picking cadence to eight frames.
         let mut automated = p;
         automated.threshold_automation[0].count = 2;
         automated.threshold_automation[0].points[0] = AutomationPoint { input: -100.0, value: -20.0 };
         automated.threshold_automation[0].points[1] = AutomationPoint { input: 0.0, value: -30.0 };
-        let run = Run::new(&automated, 48_000.0, 1);
-        assert_eq!(run.detector_factor, [8; BANDS]);
-        assert_eq!(run.detector_window, [61, 49, 13, 7]);
-        assert!(!run.hop_peak);
+        let (factor, window, _, _, hop_peak) = cadence(&automated, 48_000.0);
+        assert_eq!(factor, [8; BANDS]);
+        assert_eq!(window, [61, 49, 13, 7]);
+        assert!(!hop_peak);
 
         let mut max = SlidingMax::EMPTY;
         assert_eq!(max.push(9.0, 3), 9.0);
