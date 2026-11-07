@@ -79,6 +79,49 @@ fn curve_fit(m: [f64; 3]) -> [f64; 3] {
     [(sum + difference) / 2.0, b1, (sum - difference) / 2.0]
 }
 
+fn peak_curve_fit(m: [f64; 3]) -> [f64; 3] {
+    let [h0, h1, h2] = m;
+    let first = h0 * h0 - 2.0 * h1 * h1 + 2.0 * h2 * h2;
+    let first_root = libm::sqrtf(first.abs() as f32);
+    let b1 = ((h0 as f32 - first_root) * 0.5) as f64;
+    let second = -3.0 * h0 * h0 + 12.0 * h1 * h1 - 6.0 * h0 * b1 - 3.0 * b1 * b1;
+    let second_root = libm::sqrtf(second.abs() as f32);
+    let b2 = (((3.0 * (h0 - b1)) as f32 - second_root) / 6.0) as f64;
+    [h0 - b1 - b2, b1, b2]
+}
+
+fn peak_analog_magnitude(x: f32, gain: f32, q: f32) -> f64 {
+    // Evaluate (s^2 + gain*s/q + 1) / (s^2 + s/q + 1)
+    // at s=j*x in the same Float32 complex arithmetic used by the box.
+    let real = (-x).mul_add(x, 1.0);
+    let num_imag = x * (gain / q);
+    let den_imag = x * (1.0 / q);
+    let divisor = den_imag.mul_add(den_imag, real * real);
+    let inverse = 1.0 / divisor;
+    let out_real = num_imag.mul_add(den_imag, real * real) * inverse;
+    let out_imag = real.mul_add(den_imag, -(num_imag * real)) * inverse;
+    // Keep the two Float32 products separate; the Accelerate magnitude
+    // reduction rounds them before the sum rather than contracting an FMA.
+    let real_power = (out_real as f64 * out_real as f64) as f32;
+    let imag_power = (out_imag as f64 * out_imag as f64) as f32;
+    let power = (real_power as f64 + imag_power as f64) as f32;
+    libm::sqrtf(power) as f64
+}
+
+fn peak_magnitudes(gain_db: f64, f0: f64, q: f64, fs: f64, den_z: [f64; 2]) -> [f64; 3] {
+    let gain = libm::expf((gain_db as f32) * 0.115_129_255);
+    let q = (q as f32) * libm::sqrtf(gain);
+    let w0 = 2.0 * PI * f0 / fs;
+    let x1 = ((PI / 3.0) / w0) as f32;
+    let x2 = 2.0 * x1;
+    let d0 = (1.0 + den_z[0] + den_z[1]).abs();
+    let d1 =
+        libm::sqrt((1.0 + den_z[0] - den_z[1] + den_z[0] * den_z[0] + den_z[0] * den_z[1] + den_z[1] * den_z[1]).abs());
+    let d2 =
+        libm::sqrt((1.0 - den_z[0] - den_z[1] + den_z[0] * den_z[0] - den_z[0] * den_z[1] + den_z[1] * den_z[1]).abs());
+    [d0, peak_analog_magnitude(x1, gain, q) * d1, peak_analog_magnitude(x2, gain, q) * d2]
+}
+
 fn matched(shape: Shape, gain_db: f64, f0: f64, q: f64, fs: f64) -> Section {
     if gain_db == 0.0 {
         return Section::IDENTITY;
@@ -97,20 +140,46 @@ fn matched(shape: Shape, gain_db: f64, f0: f64, q: f64, fs: f64) -> Section {
         // A * N/D gives unity at DC and A^2 at high frequency.
         Shape::HighShelf => ([a, root_a / q, 1.0], [1.0, root_a / q, a], a),
     };
-    let den_z = matched_den(den, f0, fs);
-    let mut magnitude = [0.0; 3];
-    for (i, w) in [0.0, PI / 3.0, 2.0 * PI / 3.0].into_iter().enumerate() {
-        let x = if w == 0.0 { 0.0 } else { w * fs / (2.0 * PI * f0) };
-        let target = scale * libm::sqrt(polynomial_power(num, x) / polynomial_power(den, x));
-        magnitude[i] = target * denominator_magnitude(den_z, w);
+    let mut den_z = matched_den(den, f0, fs);
+    if matches!(shape, Shape::Peak) {
+        den_z = [den_z[0] as f32 as f64, den_z[1] as f32 as f64];
     }
-    let b = curve_fit(magnitude);
-    Section { b0: b[0], b1: b[1], b2: b[2], a1: den_z[0], a2: den_z[1] }
+    let mut magnitude = [0.0; 3];
+    if matches!(shape, Shape::Peak) {
+        magnitude = peak_magnitudes(gain_db, f0, q, fs, den_z);
+    } else {
+        for (i, w) in [0.0, PI / 3.0, 2.0 * PI / 3.0].into_iter().enumerate() {
+            let x = if w == 0.0 { 0.0 } else { w * fs / (2.0 * PI * f0) };
+            let target = scale * libm::sqrt(polynomial_power(num, x) / polynomial_power(den, x));
+            magnitude[i] = target * denominator_magnitude(den_z, w);
+        }
+    }
+    let b = if matches!(shape, Shape::Peak) { peak_curve_fit(magnitude) } else { curve_fit(magnitude) };
+    let section = Section { b0: b[0], b1: b[1], b2: b[2], a1: den_z[0], a2: den_z[1] };
+    if matches!(shape, Shape::Peak) {
+        // The box publishes peak coefficients through its Float32 cascade.
+        Section {
+            b0: section.b0 as f32 as f64,
+            b1: section.b1 as f32 as f64,
+            b2: section.b2 as f32 as f64,
+            a1: section.a1 as f32 as f64,
+            a2: section.a2 as f32 as f64,
+        }
+    } else {
+        section
+    }
 }
 
 /// A decramped peaking section.
 pub fn peak(gain_db: f64, f0: f64, q: f64, fs: f64) -> Section {
-    matched(Shape::Peak, gain_db, f0, q, fs)
+    let section = matched(Shape::Peak, gain_db, f0, q, fs);
+    Section {
+        b0: section.b0 as f32 as f64,
+        b1: section.b1 as f32 as f64,
+        b2: section.b2 as f32 as f64,
+        a1: section.a1 as f32 as f64,
+        a2: section.a2 as f32 as f64,
+    }
 }
 
 /// A decramped low-shelf section.
@@ -235,7 +304,14 @@ fn shelf_factor(high: bool, boost: bool, a: f64, q2: Option<f64>, k: f64) -> Sec
     if boost {
         core::mem::swap(&mut num, &mut den);
     }
-    bilinear_factor(num, den, k)
+    let section = bilinear_factor(num, den, k);
+    Section {
+        b0: section.b0 as f32 as f64,
+        b1: section.b1 as f32 as f64,
+        b2: section.b2 as f32 as f64,
+        a1: section.a1 as f32 as f64,
+        a2: section.a2 as f32 as f64,
+    }
 }
 
 fn integer_shelf(high: bool, order: u32, gain_db: f64, fm: f64, fs: f64) -> Cascade {
@@ -269,40 +345,39 @@ pub fn butterworth_shelf(gain_db: f64, f3: f64, f4: f64, max_order: u32, fs: f64
     let high = f3 > f4;
     let fm = libm::sqrt(f3 * f4);
     let octaves = libm::log2(f3.max(f4) / f3.min(f4));
-    let n = (gain_db.abs() / (3.010_299_956_64 * octaves)).max(1.0).min(max_order.clamp(1, 10) as f64);
-    if n == 1.0 {
-        return integer_shelf(high, 1, gain_db, fm, fs);
+    // ToneMeister calls one octave of transition 3 dB exactly.  The familiar
+    // half-power value (3.0103 dB) is not used in this order calculation.
+    let requested = (gain_db.abs() / (3.0 * octaves)).max(1.0);
+    // MaxAllowedFilterOrder limits the realised prototype.  The installed
+    // box treats 1 as the same minimum second order and caps at ten.
+    let maximum = max_order.clamp(2, 10);
+    if requested >= maximum as f64 {
+        return integer_shelf(high, maximum, gain_db, fm, fs);
     }
 
+    // A fractional prototype interpolates each Butterworth pole angle
+    // between the adjacent integer prototypes.  Since the angle is
+    // proportional to 1/order, this is a harmonic interpolation of order.
+    // The upper integer is rounded up to an even number for the pole pairs;
+    // a first-order remainder restores the requested total gain.  At odd
+    // integers this deliberately makes a cancellable extra pair, keeping the
+    // law continuous on the side selected by the Float32 tuning value.
+    let lower = libm::floor(requested);
+    let fraction = requested - lower;
+    let upper = if fraction == 0.0 { lower } else { lower + 1.0 };
+    let angle_order = if fraction == 0.0 { requested } else { 1.0 / ((1.0 - fraction) / lower + fraction / upper) };
+    let pairs = (upper as u32) / 2;
     let mut out = Cascade { sections: [Section::IDENTITY; 10], count: 0 };
-    if n < 2.0 {
-        let fraction = n - 1.0;
-        let shape = n - 0.4 * fraction * (1.0 - fraction);
-        let boost = gain_db > 0.0;
-        let g = libm::pow(10.0, -gain_db.abs() / 20.0);
-        let a = libm::pow(g, 0.25);
-        let q2 = 2.0 * libm::sin(PI / (2.0 * shape));
-        let k = libm::tan(PI * fm / fs);
-        out.sections[0] = shelf_factor(high, boost, a, Some(q2), k);
-        out.count = 1;
-        return out;
-    }
-
-    // f64::fract and floor are std-only; the core builds without std
-    let fraction = n - libm::trunc(n);
-    let easing = (0.6 - 0.04 * n).max(0.2);
-    let shape = n - easing * fraction * (1.0 - fraction);
-    let pairs = libm::floor(n / 2.0) as u32;
     let boost = gain_db > 0.0;
     let g = libm::pow(10.0, -gain_db.abs() / 20.0);
-    let a = libm::pow(g, 1.0 / (2.0 * shape));
+    let a = libm::pow(g, 1.0 / (2.0 * requested));
     let k = libm::tan(PI * fm / fs);
     for i in 0..pairs {
-        let q2 = 2.0 * libm::sin(PI * (2 * i + 1) as f64 / (2.0 * shape));
+        let q2 = 2.0 * libm::sin(PI * (2 * i + 1) as f64 / (2.0 * angle_order));
         out.sections[out.count] = shelf_factor(high, boost, a, Some(q2), k);
         out.count += 1;
     }
-    let used = 2.0 * pairs as f64 / shape;
+    let used = 2.0 * pairs as f64 / requested;
     let remainder_db = gain_db * (1.0 - used);
     if remainder_db.abs() > 1e-12 {
         let ar = libm::pow(10.0, -remainder_db.abs() / 40.0);
@@ -326,8 +401,28 @@ mod tests {
         let boost = peak(12.0, 18_000.0, 2.0, fs);
         let cut = peak(-12.0, 18_000.0, 2.0, fs);
         for f in [20.0, 1000.0, 8000.0, 16_000.0, 20_000.0, 23_900.0] {
-            assert!((magnitude(boost, f, fs) * magnitude(cut, f, fs) - 1.0).abs() < 1e-12);
+            assert!((magnitude(boost, f, fs) * magnitude(cut, f, fs) - 1.0).abs() < 2e-6);
         }
+    }
+
+    #[test]
+    fn fractional_butterworth_shelf_uses_adjacent_integer_prototypes() {
+        let fs = 48_000.0;
+        let lo = 120.0;
+        let hi = 180.0;
+        let gain_for = |order: f64| order * 3.0 * libm::log2(hi / lo);
+
+        // Below the third-order boundary there is one pole pair and a real
+        // remainder.  On its upper side there are two pairs and a remainder.
+        assert_eq!(butterworth_shelf(gain_for(2.75), lo, hi, 10, fs).count, 2);
+        assert_eq!(butterworth_shelf(gain_for(3.25), lo, hi, 10, fs).count, 3);
+
+        // MaxAllowedFilterOrder is a hard integer prototype limit with a
+        // second-order minimum.
+        assert_eq!(butterworth_shelf(gain_for(8.0), lo, hi, 1, fs).count, 1);
+        assert_eq!(butterworth_shelf(gain_for(8.0), lo, hi, 2, fs).count, 1);
+        assert_eq!(butterworth_shelf(gain_for(8.0), lo, hi, 3, fs).count, 2);
+        assert_eq!(butterworth_shelf(gain_for(8.0), lo, hi, 6, fs).count, 3);
     }
 
     #[test]
