@@ -559,12 +559,42 @@ impl GainSrc {
     }
 }
 
-fn detector_factors(_p: &Params) -> [usize; BANDS] {
-    // MeisterStueck's outer cadence adapter selects every Nth detector-band
-    // sample without a prefilter. The embedded compressor, including its
-    // window and release state, then runs at fs / N; its gain vector is sent
-    // through the separate causal outer SRC above.
-    [1, 2, 4, 4]
+/// How the reduced-rate detector obtains one value per update.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Cadence {
+    /// Every Nth detector-band sample, no prefilter (algorithm 3 and every
+    /// quality-2 setting).
+    Pick,
+    /// One value per fixed eight-frame hop in every band, at every rate
+    /// (algorithms 0-2 at quality 0 and 1). The hop keeps the largest
+    /// magnitude it saw, so no peak between updates is lost.
+    HopPeak,
+}
+
+/// Observable cadence of the unit's gain updates (black-box: the first
+/// output sample that a level step moves, swept over the step's offset).
+/// Algorithm 3, and quality 2 with any algorithm, update bands 2-3 every
+/// fourth frame and drop the samples in between: a tone whose samples
+/// alternate at that stride swings the gain by more than 12 dB with its
+/// start phase.  Algorithms 0-2 at quality 0 and 1 update all four bands
+/// every eight frames at 44.1, 48 and 96 kHz alike, and their steady gain
+/// does not depend on a tone's phase in any band.
+fn cadence(p: &Params) -> Cadence {
+    if p.algorithm >= 3 || p.render_quality >= 2 {
+        Cadence::Pick
+    } else {
+        Cadence::HopPeak
+    }
+}
+
+fn detector_factors(p: &Params) -> [usize; BANDS] {
+    // The embedded compressor, including its window and release state, runs
+    // at fs / N; its gain vector is sent through the separate causal outer
+    // SRC above.
+    match cadence(p) {
+        Cadence::Pick => [1, 2, 4, 4],
+        Cadence::HopPeak => [8; BANDS],
+    }
 }
 
 impl SlidingMax {
@@ -618,6 +648,8 @@ pub struct Run {
     detector_phase: [usize; BANDS],
     detector_max: [SlidingMax; BANDS],
     detector_rms: [f64; BANDS],
+    hop_peak: bool,
+    detector_hop: [f64; BANDS],
     gain_src: [GainSrc; BANDS],
     state: [[[[f64; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS],
     legacy_high_state: [[[[f64; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
@@ -682,6 +714,8 @@ impl Run {
             detector_phase: [0; BANDS],
             detector_max: [SlidingMax::EMPTY; BANDS],
             detector_rms: [0.0; BANDS],
+            hop_peak: cadence(q) == Cadence::HopPeak,
+            detector_hop: [0.0; BANDS],
             gain_src: core::array::from_fn(|b| GainSrc::new(detector_factor[b], fs)),
             state: [[[[0.0; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS],
             legacy_high_state: [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
@@ -697,6 +731,7 @@ impl Run {
         self.detector_max = [SlidingMax::EMPTY; BANDS];
         self.detector_phase = [0; BANDS];
         self.detector_rms = [0.0; BANDS];
+        self.detector_hop = [0.0; BANDS];
         for src in &mut self.gain_src {
             src.reset();
         }
@@ -864,6 +899,13 @@ impl Run {
             let mut gain = [0.0; BANDS];
             for (b, p) in detector.into_iter().enumerate() {
                 let update = self.detector_phase[b] == 0;
+                let p = if self.hop_peak {
+                    let peak = self.detector_hop[b].max(p);
+                    self.detector_hop[b] = if update { 0.0 } else { peak };
+                    peak
+                } else {
+                    p
+                };
                 let input = if update {
                     let mut held = self.window_max(b, p);
                     if self.algorithm0 {
