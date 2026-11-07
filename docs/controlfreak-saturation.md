@@ -18,14 +18,13 @@ base-rate DF1 de-esser cut
   -> base-rate DF1 inverse de-esser
 ```
 
-The new `k` applies at base frame zero of the piece.  There is no within-piece
-interpolation.  The interpolation delay retains samples scaled by the drive
-active when they entered.  The base-rate reciprocal is associated with the
-returned FIR output buffer: each output uses the scalar carried by the input
-frame 24 frames earlier.  This is a continuous scalar history, not a prefix
-rule that restarts at host render-call boundaries.  Both FIR delays and both
-independent DF1 states continue without scaling, exchange or coefficient
-changes.  The FIR pair adds 24 base frames of latency.
+The new `k` and `1/k` apply at base frame zero of the piece.  There is no
+within-piece interpolation.  The interpolation delay retains samples scaled
+by the drive active when they entered, so the delayed carrier can still
+contain samples driven by the previous scalar while the new reciprocal is
+already active.  Both FIR delays and both independent DF1 states continue
+without scaling, exchange or coefficient changes.  The FIR pair adds 24 base
+frames of latency.
 
 The de-esser recurrence is single precision:
 
