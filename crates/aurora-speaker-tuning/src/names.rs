@@ -7,10 +7,13 @@
 //! "AU SaveState layout and complete ID map").  An ID the specification does
 //! not name stays unnamed; callers then see the raw ID.
 //!
-//! TODO(SPEC): the atsp and lsm2 ID maps.  The atsp specification names the
-//! per-speaker-type fields but not their IDs, and the lsm2 specification
-//! names fields by their preset names without IDs; until the specification
-//! states the IDs, those units expose raw `(scope, element, id, value)`.
+//! atsp: the specification's AU parameter map (section 2) is complete, 41
+//! global IDs: bypass, three 13-ID speaker-type slots, gain link all; the
+//! compiler reads every one of them.
+//!
+//! TODO(SPEC): the lsm2 ID map.  The lsm2 specification names fields by their
+//! preset names without IDs; until it states them, lsm2 exposes raw
+//! `(scope, element, id, value)`.
 
 use serde::Serialize;
 
@@ -133,12 +136,67 @@ pub const SPP3_PART_METERS: &[ParamName] = &[
     p(66, "power gain", "dB", None),
 ];
 
+/// atsp global scope (0), element 0: the 41 saved IDs (spec 2): bypass,
+/// slot `t` at `1 + 13 t` (eleven continuous constants in AU order, gain
+/// link, channel assignment mask), gain link all.
+pub const ATSP_GLOBAL: &[ParamName] = &[
+    p(0, "bypass", "bool", None),
+    p(1, "slot 0 amplifier sensitivity", "V/FS", None),
+    p(2, "slot 0 Rdc", "ohm", None),
+    p(3, "slot 0 Rth voice coil", "K/W", None),
+    p(4, "slot 0 tau voice coil", "s", None),
+    p(5, "slot 0 Rth magnet", "K/W", None),
+    p(6, "slot 0 tau magnet", "s", None),
+    p(7, "slot 0 ambient temperature", "degC", None),
+    p(8, "slot 0 temperature limit", "degC", None),
+    p(9, "slot 0 attack", "ms", None),
+    p(10, "slot 0 release", "ms", None),
+    p(11, "slot 0 hard-limit headroom", "K", None),
+    p(12, "slot 0 gain link", "bool", None),
+    p(13, "slot 0 audio channel assignment", "mask", None),
+    p(14, "slot 1 amplifier sensitivity", "V/FS", None),
+    p(15, "slot 1 Rdc", "ohm", None),
+    p(16, "slot 1 Rth voice coil", "K/W", None),
+    p(17, "slot 1 tau voice coil", "s", None),
+    p(18, "slot 1 Rth magnet", "K/W", None),
+    p(19, "slot 1 tau magnet", "s", None),
+    p(20, "slot 1 ambient temperature", "degC", None),
+    p(21, "slot 1 temperature limit", "degC", None),
+    p(22, "slot 1 attack", "ms", None),
+    p(23, "slot 1 release", "ms", None),
+    p(24, "slot 1 hard-limit headroom", "K", None),
+    p(25, "slot 1 gain link", "bool", None),
+    p(26, "slot 1 audio channel assignment", "mask", None),
+    p(27, "slot 2 amplifier sensitivity", "V/FS", None),
+    p(28, "slot 2 Rdc", "ohm", None),
+    p(29, "slot 2 Rth voice coil", "K/W", None),
+    p(30, "slot 2 tau voice coil", "s", None),
+    p(31, "slot 2 Rth magnet", "K/W", None),
+    p(32, "slot 2 tau magnet", "s", None),
+    p(33, "slot 2 ambient temperature", "degC", None),
+    p(34, "slot 2 temperature limit", "degC", None),
+    p(35, "slot 2 attack", "ms", None),
+    p(36, "slot 2 release", "ms", None),
+    p(37, "slot 2 hard-limit headroom", "K", None),
+    p(38, "slot 2 gain link", "bool", None),
+    p(39, "slot 2 audio channel assignment", "mask", None),
+    p(40, "gain link all", "bool", None),
+];
+
 /// The public scope numbers the specification uses.
 pub const SCOPE_GLOBAL: u32 = 0;
 pub const SCOPE_PART: u32 = 4;
 
 pub fn lookup(table: &[ParamName], id: u32) -> Option<&ParamName> {
     table.iter().find(|p| p.id == id)
+}
+
+/// Name for a saved atsp ID (global scope only), if the specification names it.
+pub fn atsp(scope: u32, id: u32) -> Option<&'static ParamName> {
+    match scope {
+        SCOPE_GLOBAL => lookup(ATSP_GLOBAL, id),
+        _ => None,
+    }
 }
 
 /// Name for a saved spp3 ID, if the specification names it.

@@ -762,7 +762,7 @@ class Gate(Base):
             sorted(["j316s", "j413", "j616s", "j700", "j274", "j293", "j313", "j375c", "j375d", "j473", "j474s", "j475c", "j475d", "j493"]),
         )
         # policy only: no hardware in the gate
-        self.assertEqual(sorted(k for k in g if not k.startswith("_")), ["qualified", "require_qualified_board", "units_at_parity", "voicing_pre", "voicing_pre_bound_db"])
+        self.assertEqual(sorted(k for k in g if not k.startswith("_")), ["qualified", "require_qualified_board", "units_at_parity", "voicing_pre", "voicing_pre_bound_db", "voicing_pre_lowpass"])
         self.assertEqual(g["voicing_pre"], {"j316s": True, "j413": True, "j616s": True, "j700": True})
         self.assertFalse(os.path.exists(os.path.join(HERE, "machines.json")))
 
