@@ -1,7 +1,7 @@
 #!/usr/bin/python3 -I
 """speakerguardd-gate: which speaker protection runs on this Mac.
 
-    speakerguardd-gate v2      [--gate F] [--wait S]
+    speakerguardd-gate prepare|v2      [--gate F] [--wait S]
     speakerguardd-gate legacy  [--gate F] [--wait S]
     speakerguardd-gate explain [--gate F] [--wait S]
 
@@ -9,18 +9,15 @@ Every Mac carries both stacks: speakerguardd v2, and the older daemons
 (speakerguardd 0.1, speakersafetyd). This program is the ExecCondition of
 both, so exactly one of them runs on a board, chosen at boot:
 
-- v2 runs (`v2` exits 0) when
-  1. the protection unit this Mac's own tuning names is at parity
-     (gate.json units_at_parity);
-  2. while gate.json require_qualified_board is true, the board is in that
-     unit's qualified list (gate.json qualified: a passing audible run on
-     the shipped tree), or /etc/speakerguardd/allow-unqualified names it
-     (qualification itself);
-  3. the kernel has the v2 interface: the speaker card has a "Speaker
-     Protection" control.
+- v2 runs (`v2` exits 0) only with current successful compilation, own-Mac
+  extraction provenance, a silent wiring self-check bound to this board,
+  kernel and blob, and every protection type (including LSID) at parity.
+  Board policy may deny, but an allow never bypasses those proofs.
+- `prepare` admits provisioning and the silent check before those records
+  exist, when the graph's protection types are at parity and not denied.
 - the older daemons run (`legacy` exits 0) when v2 does not and the kernel
   does not have that interface: on a v2 kernel they have nothing to own.
-  A board on a v2 kernel that does not pass 1 and 2 runs neither, and the
+  An unqualified board on a v2 kernel runs neither, and the
   kernel holds its speakers at the floor.
 
 So the kernel is the switch. A fleet kernel without the v2 interface keeps
@@ -41,8 +38,10 @@ import sys
 import time
 
 HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, HERE)
+import gen  # noqa: E402
+import wiring  # noqa: E402
 DT = "/proc/device-tree"
-ALLOW = "/etc/speakerguardd/allow-unqualified"
 # The bundle provisioning compiles when the installer's copy is not where the
 # reader looks first (speakerguardd-provision: SGV2_BUNDLE=<path>).
 PROVISION_CONF = "/etc/speakerguardd/provision.conf"
@@ -78,16 +77,10 @@ def bundle_override(path):
     return None
 
 
-def tuning_unit(cli, conf=None):
-    """The protection unit this Mac's own tuning names, or None: the bundle
-    provisioning compiles (its SGV2_BUNDLE, else the installer's copy)."""
+def tuning_units(cli, conf=None):
+    """The complete protection type set from provisioning's own source."""
     bundle = bundle_override(conf or PROVISION_CONF)
-    try:
-        r = subprocess.run([cli, "dump", "--json"] + ([bundle] if bundle else []), capture_output=True, text=True,
-                           timeout=30)
-        return json.loads(r.stdout)["tuning"]["protection"]["kind"]
-    except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired):
-        return None
+    return wiring.protection_units(wiring.tuning_dump([bundle] if bundle else [], cli, strict=True))
 
 
 def speaker_card(sysfs="/sys/class/sound"):
@@ -137,24 +130,16 @@ def decide(args):
     board = board_of(args.dt)
     if board is None:
         return False, True, "no Apple device tree: not an Apple Silicon Mac"
-    unit = tuning_unit(args.tuning_cli)
-    parity = gate.get("units_at_parity", [])
+    units = []
     why_not = None
-    if unit is None:
-        why_not = f"{board}'s tuning names no protection unit (no tuning bundle, or one the reader refuses)"
-    elif unit not in parity:
-        why_not = f"{board}'s protection unit {unit} is not at parity yet (at parity: {' '.join(parity) or 'none'})"
-    elif gate.get("require_qualified_board", True) and board not in (gate.get("qualified") or {}).get(unit, []):
-        allowed = False
-        try:
-            with open(ALLOW) as f:
-                allowed = board in f.read().split()
-        except OSError:
-            pass
-        if not allowed:
-            why_not = f"{board} has not qualified on speakerguardd v2 (no passing audible run on the shipped tree)"
-        else:
-            log(f"{board} has not qualified; {ALLOW} names it, so v2 may start")
+    try:
+        units = tuning_units(args.tuning_cli)
+        gen.qualification_policy(board, units, gate)
+        if getattr(args, "cmd", "v2") != "prepare":
+            wiring.qualification(getattr(args, "state", "/var/lib/speakerguardd"), board,
+                                 os.uname().release, unit=wiring.unit_id(args.dt), units=units)
+    except (wiring.Refused, OSError, ValueError, TypeError, AttributeError, subprocess.TimeoutExpired) as e:
+        why_not = f"{board} is unqualified: {e}"
     iface, card = kernel_interface(args.wait)
     if iface is None:
         return False, True, (why_not or f"{board} is gated") + "; no speaker card: the older daemons decide for themselves"
@@ -164,14 +149,15 @@ def decide(args):
         return False, True, f"{why_not}; the older daemons protect the speakers"
     if iface == "legacy":
         return False, True, f"{board} is gated for v2, but this kernel has no \"{CONTROL}\" control on {card}: the older daemons protect the speakers"
-    return True, False, f"{board} ({unit}) is gated for v2 and the kernel has the v2 interface on {card}: speakerguardd v2 protects the speakers"
+    return True, False, f"{board} ({','.join(units)}) is gated for v2 and the kernel has the v2 interface on {card}: speakerguardd v2 protects the speakers"
 
 
 def main():
     ap = argparse.ArgumentParser(prog="speakerguardd-gate")
-    ap.add_argument("cmd", choices=["v2", "legacy", "explain"])
+    ap.add_argument("cmd", choices=["prepare", "v2", "legacy", "explain"])
     ap.add_argument("--gate", default="/usr/share/speakerguardd/gate.json")
     ap.add_argument("--dt", default=DT)
+    ap.add_argument("--state", default="/var/lib/speakerguardd")
     ap.add_argument("--tuning-cli", default="aurora-speaker-tuning")
     ap.add_argument("--wait", type=float, default=15.0, help="seconds to wait for the speaker card")
     args = ap.parse_args()
@@ -180,11 +166,12 @@ def main():
     except (OSError, ValueError) as e:
         # Without its data the gate cannot place v2: the older daemons keep
         # the speakers, as before v2 was installed.
-        v2, legacy, why = False, True, f"cannot read the gate data: {e}"
+        iface, _ = kernel_interface(args.wait)
+        v2, legacy, why = False, iface != "v2", f"cannot read the gate data: {e}"
     if args.cmd == "explain":
         print(f"v2={int(v2)} legacy={int(legacy)}: {why}")
         return 0
-    run = v2 if args.cmd == "v2" else legacy
+    run = v2 if args.cmd in ("prepare", "v2") else legacy
     log(("starting: " if run else "not starting: ") + why)
     return 0 if run else 1
 

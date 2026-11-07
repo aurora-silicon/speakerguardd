@@ -9,11 +9,13 @@ Each file holds:
 
 See `gen.py` for the whole graph and `../session/speakerguardd-session` for the links and the report.
 
-Generated voicing is available behind `packaging/session/gate.json`'s
-`voicing_pre` map. It is empty by default. A literal `true` at the physical
-board name (for example `"j616s": true`) selects the generated stereo
-`voicing-pre` filter-chain instead of the interim software-dsp convolver.
-This flag does not change protection qualification; SPP3V owns promotion.
+At runtime, new boards automatically compile their own generated voicing.
+`packaging/session/gate.json`'s `voicing_pre` map holds explicit deployment
+overrides: literal `true` selects the generated stereo `voicing-pre` chain,
+and `false` selects the interim software-dsp convolver. Offline fixture
+artifacts retain their recorded mode. Qualification still requires a
+refusal-free compile, build-wide protection parity, own-Mac extraction
+provenance and a current silent self-check; an override cannot bypass it.
 
 Provisioning passes `--voicing-pre` to `aurora-speaker-tuning compile` in this
 mode. It compiles the **same spec as `voicing-render`**, with every box's
@@ -55,7 +57,7 @@ both plugins instantiate from the newly published blob. Mode changes
 invalidate the provisioning cache. A voicing-only parameter change also
 invalidates the graph digest and the protect engine's advertised identity;
 the persisted thermal state remains bound to the unchanged unit payload. Generation refuses a gate/compiled-mode
-mismatch. For rollback, clear that board's flag and repeat the same
+mismatch. For rollback, set that board's flag to `false` and repeat the same
 sequence; provisioning recompiles the interim pre-stage and restores the
 software-dsp convolver. No target was changed by the implementation tests.
 

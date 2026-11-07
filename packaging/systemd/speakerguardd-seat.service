@@ -7,5 +7,5 @@ Documentation=https://github.com/aurora-silicon/speakerguardd/blob/v2/docs/NEW-P
 
 [Service]
 Type=oneshot
-ExecCondition=/usr/libexec/speakerguardd/speakerguardd-gate v2
+ExecCondition=/usr/libexec/speakerguardd/speakerguardd-gate prepare
 ExecStart=/usr/libexec/speakerguardd/speakerguardd-provision seat --unit speakerguardd.service

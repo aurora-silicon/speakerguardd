@@ -685,7 +685,7 @@ def derive_live(args):
     or old tuning reader, a tuning the derivation cannot place) fails the
     self-check: nothing runs on an unproven map."""
     hw = wiring.read_dt()
-    dump = wiring.tuning_dump(args.tuning, args.tuning_cli)
+    dump = wiring.tuning_dump(args.tuning, args.tuning_cli, strict=True)
     units = wiring.roles(dump)["channels"]
     w = wiring.derive(hw, dump)
     w["method"] = "derived" if w["sense"] else "derived-static"
@@ -852,9 +852,9 @@ def format_errors(desc, fmt):
 
 def cmd_check(args):
     b = read_bind(os.path.join(args.state, "selfcheck.bind"))
-    want = {"kernel": os.uname().release, "params_sha256": sha256(args.params)}
+    want = {"board": wiring.read_dt()["board"], "kernel": os.uname().release, "params_sha256": sha256(args.params)}
     bad = [k for k, v in want.items() if b.get(k) != v]
-    if b.get("result") != "pass" or bad:
+    if b.get("result") != "pass" or bad or not report_matches(os.path.join(args.state, "selfcheck.json"), b):
         log(f"no passing self-check for this kernel and these parameters (result {b.get('result')}, stale {bad})")
         return 1
     log(f"bound: {b.get('board')} {b.get('kernel')} wiring {b.get('wiring')}")
@@ -871,9 +871,11 @@ def cmd_generate(args):
         raise SystemExit("the self-check has not passed: nothing to generate")
     if not c:
         raise SystemExit("the self-check record has no machine description: run it again")
+    units = wiring.qualification(args.state, rec["board"], os.uname().release)
+    gen.qualification_policy(rec["board"], units)
     m = rec["key"]
     c = dict(c, board=rec["board"])
-    enabled = gen.voicing_enabled(rec["board"])
+    enabled = gen.runtime_voicing_enabled(rec["board"])
     bind_path = os.path.join(args.state, "provision.bind")
     bound_mode = False
     if os.path.exists(bind_path):
@@ -883,8 +885,8 @@ def cmd_generate(args):
         raise SystemExit("voicing gate changed since compilation: run speakerguardd-provision again")
     src = f"the self-check of {rec['board']} ({rec['kernel']})"
     for d, name, text in (
-        (args.pipewire_dir, f"sgv2-{m}.conf", gen.pipewire_conf(m, c, (w["unit_channels"], w["sense_ports"], w["hash"]), src)),
-        (args.wireplumber_dir, f"60-sgv2-{m}.conf", gen.wireplumber_conf(m, c, src)),
+        (args.pipewire_dir, f"sgv2-{m}.conf", gen.pipewire_conf(m, c, (w["unit_channels"], w["sense_ports"], w["hash"]), src, voicing_pre=enabled)),
+        (args.wireplumber_dir, f"60-sgv2-{m}.conf", gen.wireplumber_conf(m, c, src, voicing_pre=enabled)),
     ):
         os.makedirs(d, exist_ok=True)
         write_atomic(os.path.join(d, name), text)
