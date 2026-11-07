@@ -350,12 +350,12 @@ impl Spec {
     }
 }
 
-fn shape_sections(shape: ToneShape) -> usize {
+fn shape_sections(shape: ToneShape, max_order: u32) -> usize {
     match shape {
         ToneShape::LowPass(n) | ToneShape::HighPass(n) => (n as usize).div_ceil(2),
         ToneShape::Gain => 0,
-        ToneShape::ButterworthShelf => 5,
-        ToneShape::ButterworthBandShelf => 10,
+        ToneShape::ButterworthShelf => super::tone::shelf_sections(max_order),
+        ToneShape::ButterworthBandShelf => 2 * super::tone::shelf_sections(max_order),
         _ => 1,
     }
 }
@@ -385,12 +385,12 @@ fn automation_valid(a: &ToneAutomation, channels: &[Channel]) -> bool {
         && point_valid(a.b)
         && a.a.scalar < a.b.scalar
         && midpoint_ok
-        && (1..=10).contains(&a.max_order)
+        && (1..=super::tone::MAX_SHELF_ORDER).contains(&a.max_order)
         && a.fixed.iter().all(|v| v.is_finite() && *v >= 0.0)
         && !a.targets.is_empty()
         && a.targets.iter().all(|t| {
             channels.get(t.channel).is_some_and(|c| {
-                t.section <= MAX_SECTIONS && shape_sections(a.shape) <= c.count.saturating_sub(t.section)
+                t.section <= MAX_SECTIONS && shape_sections(a.shape, a.max_order) <= c.count.saturating_sub(t.section)
             })
         })
 }
@@ -462,24 +462,22 @@ fn apply_tone_automation(stage: &mut PreStage, base: &[Channel], automation: &[T
                 ToneShape::ButterworthShelf => {
                     let (gain_db, [f3, f4, _, _]) = moved_shelf(a, scalar);
                     let made = super::tone::butterworth_shelf(gain_db, f3, f4, a.max_order, fs);
-                    let sections = &mut channel.sections[target.section..target.section + 5];
+                    let n = super::tone::shelf_sections(a.max_order);
+                    let sections = &mut channel.sections[target.section..target.section + n];
                     sections.fill(Section::IDENTITY);
                     sections[..made.count].copy_from_slice(&made.sections[..made.count]);
                 }
                 ToneShape::ButterworthBandShelf => {
-                    let (gain_db, [f1, f2, f3, f4]) = moved_shelf(a, scalar);
-                    let first = super::tone::butterworth_shelf(gain_db, f2, f1, a.max_order, fs);
-                    let second = super::tone::butterworth_shelf(gain_db, f3, f4, a.max_order, fs);
-                    let sections = &mut channel.sections[target.section..target.section + 10];
+                    let (gain_db, edges) = moved_shelf(a, scalar);
+                    let (first, second) = super::tone::butterworth_band_shelf(gain_db, edges, a.max_order, fs);
+                    let n = super::tone::shelf_sections(a.max_order);
+                    let sections = &mut channel.sections[target.section..target.section + 2 * n];
                     sections.fill(Section::IDENTITY);
                     sections[..first.count].copy_from_slice(&first.sections[..first.count]);
-                    sections[5..5 + second.count].copy_from_slice(&second.sections[..second.count]);
-                    // the compensating flat gain acts at the slot, in its
-                    // first section, as the saved shape carries it
-                    sections[0] = sections[0].scaled(libm::pow(10.0, -gain_db / 20.0));
+                    sections[n..n + second.count].copy_from_slice(&second.sections[..second.count]);
                 }
                 ToneShape::LowPass(order) | ToneShape::HighPass(order) => {
-                    let n = shape_sections(a.shape);
+                    let n = shape_sections(a.shape, a.max_order);
                     let sections = &mut channel.sections[target.section..target.section + n];
                     let made =
                         super::tone::butterworth(matches!(a.shape, ToneShape::HighPass(_)), order, frequency_hz, fs);
@@ -1122,19 +1120,17 @@ mod tests {
         let fs = 48_000.0;
         let band = shape == ToneShape::ButterworthBandShelf;
         let mut channel = Channel::IDENTITY;
-        channel.count = if band { 10 } else { 5 };
+        let n = crate::voicing::tone::shelf_sections(10);
+        channel.count = if band { 2 * n } else { n };
         let (first, second) = if band {
-            (
-                crate::voicing::tone::butterworth_shelf(gain_db, saved[1], saved[0], 10, fs),
-                Some(crate::voicing::tone::butterworth_shelf(gain_db, saved[2], saved[3], 10, fs)),
-            )
+            let (first, second) = crate::voicing::tone::butterworth_band_shelf(gain_db, saved, 10, fs);
+            (first, Some(second))
         } else {
             (crate::voicing::tone::butterworth_shelf(gain_db, saved[0], saved[1], 10, fs), None)
         };
         channel.sections[..first.count].copy_from_slice(&first.sections[..first.count]);
         if let Some(second) = second {
-            channel.sections[5..5 + second.count].copy_from_slice(&second.sections[..second.count]);
-            channel.sections[0] = channel.sections[0].scaled(libm::pow(10.0, -gain_db / 20.0));
+            channel.sections[n..n + second.count].copy_from_slice(&second.sections[..second.count]);
         }
         let spec = Spec {
             program_channels: 1,
