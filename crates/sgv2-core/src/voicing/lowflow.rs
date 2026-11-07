@@ -17,8 +17,7 @@
 //! `latency + 128` frame sliding history through a unit-energy Hann. It
 //! applies the saved tweeter-response magnitude, reduces squared magnitudes
 //! on the unit's 99-band grid, and smooths the resulting linked mask level.
-//! The masker reads the upper lane after the fixed output delay; the velocity
-//! detector independently reads current LF.
+//! The velocity detector independently reads current LF.
 //!
 //! The optional `lowflow-conservative` compile feature is deliberately not an
 //! exact-law claim. It applies a fixed ceiling 6 dB below the saved
@@ -1124,14 +1123,11 @@ impl Run {
             for frame in chunk_at..chunk_at + chunk_frames {
                 for c in 0..self.models {
                     let woofer_sample = finite(bufs[c][frame]);
-                    let mask_tweeter = if c + self.models < channels {
-                        self.line[(c + self.models) * self.latency_frames + self.line_at]
-                    } else {
-                        0.0
-                    };
+                    let tweeter_sample =
+                        if c + self.models < channels { finite(bufs[c + self.models][frame]) } else { 0.0 };
                     let woofer = f64::from(woofer_sample);
                     let state = &mut self.state[c];
-                    state.mask.push(0.0, mask_tweeter);
+                    state.mask.push(0.0, tweeter_sample);
                     let velocity = state.cone.run(woofer) + state.front.run(woofer);
                     state.velocity_block_energy += velocity * velocity;
                     state.velocity_block_frames += 1;
@@ -1465,16 +1461,16 @@ mod tests {
 
     #[cfg(not(feature = "lowflow-conservative"))]
     #[test]
-    fn mask_reads_high_lane_after_its_output_delay() {
+    fn mask_reads_high_lane_before_its_output_delay() {
         let p = synthetic();
         let mut run = Run::new(&p, 48_000.0, 4);
-        let mut b = [vec![0.0; 384], vec![0.0; 384], vec![0.0; 384], vec![0.0; 384]];
+        let mut b = [vec![0.0; 128], vec![0.0; 128], vec![0.0; 128], vec![0.0; 128]];
         b[2][64] = 0.7;
         let mut refs: Vec<&mut [f32]> = b.iter_mut().map(Vec::as_mut_slice).collect();
-        run.process(&mut refs, 384);
+        run.process(&mut refs, 128);
         assert!(run.state[0].mask.db > 0.0);
         assert!(run.state[0].mask_output_db > 0.0);
-        assert!(b[2][..LATENCY_FRAMES].iter().all(|value| *value == 0.0));
+        assert!(b[2].iter().all(|value| *value == 0.0));
     }
 
     #[cfg(not(feature = "lowflow-conservative"))]
