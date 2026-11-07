@@ -97,10 +97,11 @@ impl ThermalBranch {
         let b0 = r32(rth * ideal / 2.0);
         ThermalBranch { alpha, r_eff: (b0 + b0) / alpha }
     }
-    /// `theta + alpha (R_eff P - theta)`.
+    /// `theta + alpha (R_eff P - theta)`, both products fused:
+    /// `fma(alpha, fma(R_eff, P, -theta), theta)`.
     #[inline]
     pub fn step(&self, theta: f32, p: f32) -> f32 {
-        theta + self.alpha * (self.r_eff * p - theta)
+        libm::fmaf(self.alpha, libm::fmaf(self.r_eff, p, -theta), theta)
     }
     /// The rise after `n` updates at no power (the gap's cooling).
     pub fn cool(&self, theta: f64, n: f64) -> f64 {
