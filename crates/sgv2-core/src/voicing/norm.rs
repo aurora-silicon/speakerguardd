@@ -949,10 +949,11 @@ impl Run {
             if step_done {
                 self.arbitrate_fast_step();
                 if self.steps_in_call < self.step_target.len() {
-                    // A completed step changes the causal target of the
-                    // following frame. A boundary at the end of this call is
-                    // retained as the next call's starting target.
-                    self.step_target[self.steps_in_call] = (n + 1, self.target);
+                    // The unit meters the complete render call before its
+                    // audio pass, so a completed step's target applies from
+                    // that buffered step's first frame.
+                    let start = (n + 1).saturating_sub(STEP);
+                    self.step_target[self.steps_in_call] = (start, self.target);
                     self.steps_in_call += 1;
                 }
             }
