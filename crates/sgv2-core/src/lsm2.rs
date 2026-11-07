@@ -1570,8 +1570,10 @@ struct Chan {
     vel_limit_now: f64,
     vel_bound_ready: bool,
     vel_bound_release: bool,
-    /// Native's one retained producer window. Host fragments shift it by
-    /// their admitted length and append one protected peak per fragment.
+    /// Native's one retained producer window. Each decision shifts it by one
+    /// controller frame and admits that frame's protected peak as one
+    /// segment: the unit decides on whole buffered frames, as the reference
+    /// does at its production slicing, never on the host's call geometry.
     vel_bound_window: Vec<f32>,
     /// A velocity episode chooses its solve topology on its first ordinary
     /// cut. An onset before the streaming peak has a complete window stays
@@ -1808,11 +1810,6 @@ struct Run {
     fault: bool,
     /// Frames into the current controller frame (input FIFO fill).
     pos: usize,
-    /// Host-fragment geometry admitted into the current buffered frame.
-    /// The largest native controller frame is 512 samples, hence q1 needs at
-    /// most 512 entries and longer calls collapse to controller-sized pieces.
-    fragment_lens: [usize; 2 * CONTROLLER_FRAMES],
-    fragment_count: usize,
     frame: u64,
     last_frame: u64,
     frames_done: u64,
@@ -2055,8 +2052,6 @@ impl Run {
             ceiling_shift,
             fault: false,
             pos: 0,
-            fragment_lens: [0; 2 * CONTROLLER_FRAMES],
-            fragment_count: 0,
             frame: 0,
             last_frame: 0,
             frames_done: 0,
@@ -2161,7 +2156,6 @@ impl Run {
             b[..ctl].iter_mut().for_each(|v| *v = 0.0);
         }
         self.pos = 0;
-        self.fragment_count = 0;
         self.frame = 0;
         self.last_frame = 0;
         self.frames_done = 0;
@@ -2267,8 +2261,6 @@ impl Run {
         let window_max = |r: &[f32; RING]| r[..ring_len].iter().copied().fold(0.0f32, f32::max);
         let ratio = |limit: f64, q: f32| (limit / (q as f64).max(EPS)).min(1.0);
         let (a_fast, a_low) = (self.a_fast, self.a_low);
-        let fragments = &self.fragment_lens[..self.fragment_count];
-        let complete_host_frame = fragments == [ctl];
         let velocity_release = 1.0 - libm::exp(-(ctl as f64) * a_fast);
         // the allocator span excludes the first millisecond (t-4719)
         let vfirst = libm::round(self.ctl as f64 * 3.0 / 16.0) as usize;
@@ -2397,8 +2389,7 @@ impl Run {
                 let y = (0..BANDS).fold(c.vcar[i], |y, k| y + (producer_r[k] * sg) * c.vb[k][i]);
                 peak.max(y.abs())
             });
-            let streaming_ramp = complete_host_frame
-                && centroid > c.input_centroid_previous
+            let streaming_ramp = centroid > c.input_centroid_previous
                 && protected_trial > c.protected_trial_previous
                 && protected_trial < vlim_g;
             c.input_centroid_previous = centroid;
@@ -2408,44 +2399,34 @@ impl Run {
             // protected envelope and the decision-local protected trial owns
             // the segment. This compares existing producer states, not signal
             // levels, spectra, case identities, or fitted thresholds.
-            if vel_on && complete_host_frame && stream_ready && !c.vel_bound_release {
+            // The buffered frame is one admitted segment whatever the host's
+            // call sizes were, so the decision depends on the stream only
+            // (the reference at its production slicing). Its peak is the
+            // decision-local protected trial.
+            if vel_on && stream_ready && !c.vel_bound_release {
                 let ordinary_onset = velocity_band_gains(&c.vb, &c.vcar, vfirst, vlim_g, sg, all, producer_r);
                 let onset_admitted = (c.vel_active.0..c.vel_active.1).any(|k| ordinary_onset[k] < producer_r[k]);
                 if !streaming_ramp || onset_admitted {
-                    let mut offset = 0;
-                    let mut boundary = c.vel_bound_window[od - 1];
-                    for &len in fragments {
-                        let mut peak = 0.0f32;
-                        for i in od + offset..od + offset + len {
-                            let mut y = c.vcar[i];
-                            for k in 0..BANDS {
-                                y += (producer_r[k] * sg) * c.vb[k][i];
-                            }
-                            peak = peak.max(y.abs());
+                    let boundary = c.vel_bound_window[od - 1];
+                    let onset_bound = protected_trial.min(vlim_g);
+                    // The streaming producer is the moving protected trial
+                    // envelope advanced by one controller frame. Quiet
+                    // history is seeded at the structural floor; a nonzero
+                    // trial, including one below that floor, is admitted.
+                    let stream_source = if onset_bound == 0.0 { 0.25 * vlim_g } else { onset_bound };
+                    let stream_bound = c.protected_peak.update(stream_source, ctl).min(vlim_g);
+                    c.protected_peak_now = stream_bound;
+                    c.protected_peak_advanced = true;
+                    let admitted = arbitrate_producer_segment(onset_bound, stream_bound);
+                    let segment = &mut c.vel_bound_window[od..od + ctl];
+                    if admitted >= boundary {
+                        segment.fill(admitted);
+                    } else {
+                        let step = (admitted - boundary) / ctl as f32;
+                        for (i, value) in segment.iter_mut().enumerate() {
+                            *value = boundary + step * (i + 1) as f32;
                         }
-                        let onset_bound = peak.min(vlim_g);
-                        // The streaming producer is the moving protected trial
-                        // envelope advanced by the admitted host fragment. Quiet
-                        // history is seeded at the structural floor; a nonzero
-                        // trial, including one below that floor, is admitted.
-                        let stream_source = if onset_bound == 0.0 { 0.25 * vlim_g } else { onset_bound };
-                        let stream_bound = c.protected_peak.update(stream_source, len).min(vlim_g);
-                        c.protected_peak_now = stream_bound;
-                        c.protected_peak_advanced = true;
-                        let admitted = arbitrate_producer_segment(onset_bound, stream_bound);
-                        let segment = &mut c.vel_bound_window[od + offset..od + offset + len];
-                        if admitted >= boundary {
-                            segment.fill(admitted);
-                        } else {
-                            let step = (admitted - boundary) / len as f32;
-                            for (i, value) in segment.iter_mut().enumerate() {
-                                *value = boundary + step * (i + 1) as f32;
-                            }
-                        }
-                        boundary = admitted;
-                        offset += len;
                     }
-                    debug_assert_eq!(offset, ctl);
                 }
             }
             let retained_room_bound = c.vel_bound_window[od..].iter().copied().fold(0.0f32, f32::max);
@@ -2802,9 +2783,6 @@ impl Run {
         let mut start = 0;
         while start < io.frames {
             let take = (io.frames - start).min(self.ctl - self.pos);
-            debug_assert!(self.fragment_count < self.fragment_lens.len());
-            self.fragment_lens[self.fragment_count] = take;
-            self.fragment_count += 1;
             for k in start..start + take {
                 let pos = self.pos + k - start;
                 for ci in 0..self.n {
@@ -2821,7 +2799,6 @@ impl Run {
             if self.pos == self.ctl {
                 self.pos = 0;
                 self.process_frame();
-                self.fragment_count = 0;
                 if self.fault {
                     crate::failsafe::fill_from(io, start + take, FAILSAFE_GAIN);
                     return;
