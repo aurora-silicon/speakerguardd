@@ -77,8 +77,13 @@ fn lowflow_parameter_words_are_carried_including_responses() {
     models[0] = m;
     models[0].pressure_response[7] = 0.125;
     models[0].tweeter_response[13] = 0.0625;
-    spec.nodes[0].kind =
-        Kind::Lowflow(Box::new(Params { model_count: 1, link_channel_energies: true, latency_frames: 256, models }));
+    spec.nodes[0].kind = Kind::Lowflow(Box::new(Params {
+        model_count: 1,
+        link_channel_energies: true,
+        latency_frames: 256,
+        conservative_fallback: false,
+        models,
+    }));
     let base = voicing_fixture::unit("j413", 4);
     let bytes = artifact::encode(&spec, &base).unwrap();
     assert_eq!(artifact::decode(&bytes, &base).unwrap(), spec);
@@ -118,4 +123,25 @@ fn valid_crc_does_not_admit_unknown_versions_or_unbounded_spec_lengths() {
     bad[24..28].copy_from_slice(&u32::MAX.to_le_bytes());
     fix_crc(&mut bad);
     assert_eq!(artifact::decode(&bad, &base), Err(blob::BlobError::Length));
+}
+
+#[test]
+fn cfreak_gains_roundtrip_without_changing_legacy_unity_records() {
+    use sgv2_core::voicing::chain::Kind;
+    let base = voicing_fixture::unit("j413", 4);
+    let mut spec = voicing_fixture::spec(4);
+    let legacy = artifact::encode(&spec, &base).unwrap();
+    assert_eq!(artifact::decode(&legacy, &base).unwrap(), spec);
+    let node = spec.nodes.iter_mut().find(|n| matches!(n.kind, Kind::Cfreak(_))).unwrap();
+    let Kind::Cfreak(p) = &mut node.kind else { unreachable!() };
+    p.input_gain_db = 3.0;
+    p.output_gain_db = -2.0;
+    let extended = artifact::encode(&spec, &base).unwrap();
+    assert_eq!(extended.len(), legacy.len() + 16);
+    assert_eq!(artifact::decode(&extended, &base).unwrap(), spec);
+    let node = spec.nodes.iter_mut().find(|n| matches!(n.kind, Kind::Cfreak(_))).unwrap();
+    let Kind::Cfreak(p) = &mut node.kind else { unreachable!() };
+    p.input_gain_db = 0.0;
+    p.output_gain_db = 0.0;
+    assert_eq!(artifact::encode(&spec, &base).unwrap(), legacy);
 }

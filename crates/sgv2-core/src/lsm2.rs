@@ -212,6 +212,8 @@ const VELOCITY_PARAM_MAX: f32 = 2.0;
 /// `UseGenericModelParametersRdc` and `...Resonator1` flags. A generic field
 /// takes the tuning's embedded family row (resolved by the compiler) and
 /// does not follow later writes of the block's own field (rig law 1).
+pub mod companion;
+
 pub mod generic {
     pub const ADM_RDC: u32 = 1 << 0;
     pub const ADM_RES1: u32 = 1 << 1;
@@ -1788,6 +1790,10 @@ impl Chan {
 pub struct Unit {
     params: Params,
     run: Option<Run>,
+    companion: Option<companion::Companion>,
+    estimator: Option<crate::lsid::Estimator>,
+    handoff: Option<crate::lsid::Handoff>,
+    model_frames: u64,
     /// Geometry is fixed by AU initialisation. Runtime parameter writes may
     /// move the ceiling window inside it, but do not rebuild the audio delay.
     geometry_lookahead_ms: f32,
@@ -1852,7 +1858,61 @@ impl Unit {
         let telemetry_ambient = core::array::from_fn(|i| params.ch[i].ambient);
         let run =
             params.check_protects().and_then(|()| Run::new(&params, geometry_lookahead_ms, &telemetry_ambient)).ok();
-        Unit { params, run, geometry_lookahead_ms, telemetry_ambient }
+        Unit {
+            params,
+            run,
+            geometry_lookahead_ms,
+            telemetry_ambient,
+            companion: None,
+            estimator: None,
+            handoff: None,
+            model_frames: 0,
+        }
+    }
+    pub fn from_blob(bytes: &[u8]) -> Result<Self, InitError> {
+        Self::from_blob_at_rate(bytes, 0)
+    }
+    /// Decode the companion and initialise at the stream rate, or the blob rate
+    /// when `rate` is zero. Geometry and estimator share this initial rate.
+    pub fn from_blob_at_rate(bytes: &[u8], rate: u32) -> Result<Self, InitError> {
+        let (mut params, companion) = companion::decode_blob(bytes)?;
+        if rate != 0 {
+            params.sample_rate = rate;
+        }
+        let mut unit = Self::new(params);
+        if let Some(c) = &companion {
+            if let Some(topology) = c.topology {
+                let preset =
+                    crate::lsid::Preset::decode(&c.lsid_records).map_err(|_| InitError::Invalid("LSID preset"))?;
+                let estimator = crate::lsid::Estimator::new(preset, topology, params.sample_rate)
+                    .map_err(|_| InitError::Invalid("LSID seed"))?;
+                unit.handoff = Some(crate::lsid::Handoff::new(estimator.model().clone()));
+                unit.estimator = Some(estimator);
+            }
+        }
+        unit.companion = companion;
+        Ok(unit)
+    }
+    pub fn companion(&self) -> Option<&companion::Companion> {
+        self.companion.as_ref()
+    }
+    pub fn estimator(&self) -> Option<&crate::lsid::Estimator> {
+        self.estimator.as_ref()
+    }
+    pub fn model_generation(&self) -> Option<&crate::lsid::ModelGeneration> {
+        self.handoff.as_ref().map(|h| h.current())
+    }
+    pub fn stage_model(&mut self, model: crate::lsid::ModelGeneration) -> Result<(), crate::lsid::Error> {
+        self.handoff.as_mut().ok_or(crate::lsid::Error::Unsupported)?.stage(model)
+    }
+    pub fn set_runtime_budgets(&mut self, budgets: [f32; 4]) {
+        self.params.runtime_budget_present = 1;
+        self.params.runtime_budget_w = budgets;
+        self.run = self
+            .params
+            .check_protects()
+            .and_then(|()| Run::new(&self.params, self.geometry_lookahead_ms, &self.telemetry_ambient))
+            .ok();
     }
     /// Why [`Unit::new`] gives the fail-safe for `params`: unprotected
     /// (mitigation off, or no thermal axis) or unusable.
@@ -1864,7 +1924,7 @@ impl Unit {
         &self.params
     }
     pub fn is_failsafe(&self) -> bool {
-        self.run.is_none()
+        self.run.is_none() || self.companion.as_ref().is_some_and(|c| c.gates != 0)
     }
 }
 
@@ -2875,6 +2935,35 @@ impl ProtectionUnit for Unit {
     }
     fn process(&mut self, mut io: Io<'_, '_>) -> Health {
         let frames = io.frames;
+        if let Some(estimator) = &mut self.estimator {
+            // Io has no authenticated source identity. Never infer it from port
+            // count: adaptation stays disabled, even when all twelve ports exist.
+            estimator.observe("", io.sense, frames);
+        }
+        let cadence = controller_frames(self.params.sample_rate) as u64;
+        let end = self.model_frames.saturating_add(frames as u64);
+        if self.model_frames % cadence == 0 || end / cadence > self.model_frames / cadence {
+            if let Some(handoff) = &mut self.handoff {
+                handoff.commit();
+            }
+        }
+        self.model_frames = end;
+        if self.companion.as_ref().is_some_and(|c| c.gates != 0) {
+            if let Some(run) = &mut self.run {
+                if !run.fault
+                    && io.input.len() == run.n
+                    && io.output.len() == run.n
+                    && io.input.iter().all(|b| b.len() >= frames)
+                    && io.output.iter().all(|b| b.len() >= frames)
+                {
+                    run.process(&mut io);
+                }
+            }
+            // Section-10 release gates are unresolved. The complete model is
+            // preserved, but it cannot grant audible output or relax protection.
+            crate::failsafe::fill_from(&mut io, 0, 0.0);
+            return Health(Health::FAILSAFE | Health::NO_PARAMS);
+        }
         let Some(run) = self.run.as_mut() else {
             crate::spp3::failsafe_io(&mut io);
             return Health(Health::FAILSAFE | Health::NO_PARAMS);
@@ -2900,6 +2989,13 @@ impl ProtectionUnit for Unit {
     }
     fn telemetry(&self, out: &mut Telemetry) {
         out.clear();
+        if self.companion.as_ref().is_some_and(|c| c.gates != 0) {
+            out.health = Health(Health::FAILSAFE | Health::NO_PARAMS);
+            for channel in &mut out.channels {
+                channel.gain = 0.0;
+            }
+            return;
+        }
         let Some(run) = self.run.as_ref() else {
             out.health = Health(Health::FAILSAFE | Health::NO_PARAMS);
             for ch in out.channels.iter_mut() {
@@ -2942,6 +3038,13 @@ impl ProtectionUnit for Unit {
         g.amp_input_power_w = amp_now as f32;
     }
     fn reset(&mut self) {
+        self.model_frames = 0;
+        if let Some(e) = &mut self.estimator {
+            e.reset();
+        }
+        if let Some(h) = &mut self.handoff {
+            h.discard_pending();
+        }
         if let Some(r) = self.run.as_mut() {
             r.reset();
         }
@@ -3129,6 +3232,37 @@ mod fault_tests {
         let mut outs: [&mut [f32]; 2] = [&mut o0, &mut o1];
         let h = u.process(Io { frames: n, input: &ins, sense: &[], output: &mut outs });
         (o0, h)
+    }
+
+    #[test]
+    fn gated_static_model_handles_malformed_buffers_without_losing_mute() {
+        let mut unit = Unit::new(params());
+        assert!(!unit.is_failsafe());
+        unit.companion = Some(companion::Companion {
+            gates: companion::LEGACY_ESTIMATOR,
+            channels: 2,
+            lsm2_records: vec![(0, 0.0)],
+            lsid_records: vec![(0, 0.0)],
+            topology: None,
+            flow: Vec::new(),
+            property_64004: 0,
+            flow_roles: [[0; 2]; 6],
+            systems: [0; MAX_CHANNELS],
+        });
+        assert!(unit.is_failsafe());
+        for (inputs, frames) in [(0, 9), (1, 9), (2, 10)] {
+            let input = [0.5; 8];
+            let ins: [&[f32]; 2] = [&input, &input];
+            let mut first = [9.0; 8];
+            let mut second = [9.0; 8];
+            let health =
+                unit.process(Io { frames, input: &ins[..inputs], sense: &[], output: &mut [&mut first, &mut second] });
+            assert!(health.is_failsafe());
+            assert_eq!(first, [0.0; 8]);
+            assert_eq!(second, [0.0; 8]);
+        }
+        unit.reset();
+        assert!(unit.is_failsafe());
     }
 
     #[test]

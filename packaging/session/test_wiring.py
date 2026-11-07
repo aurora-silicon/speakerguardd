@@ -185,6 +185,30 @@ class Derivation(unittest.TestCase):
         self.assertEqual(w["unit_channels"], [1, 0])
         self.assertEqual(w["sense"], [])
 
+    def test_lsid_companion_selects_vi_without_changing_plain_lsm2(self):
+        f = fx("j316")
+        t = f["tuning"]["tuning"]
+        t["protection"]["kind"] = "lsm2"
+        t["lsid"] = {
+            "adaptation_enabled": False, "source_port": "synthetic-sense",
+            "source_lanes": list(range(12)),
+            "delay_frames": [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        }
+        w = wiring.derive(f["hw"], f["tuning"])
+        d = wiring.describe(f["hw"], w)
+        self.assertEqual((d["plugin"], d["sense"]), ("6ch-vi", 12))
+        self.assertEqual(w["unit_channels"], [0, 1, 4, 5, 2, 3])
+        for key, value in [("adaptation_enabled", True), ("source_lanes", list(reversed(range(12)))), ("delay_frames", [0] * 12)]:
+            bad = copy.deepcopy(f["tuning"])
+            bad["tuning"]["lsid"][key] = value
+            with self.assertRaises(wiring.Refused):
+                wiring.derive(f["hw"], bad)
+        no_companion = copy.deepcopy(w)
+        no_companion.pop("sense_companion")
+        with self.assertRaises(wiring.Refused):
+            # No 6ch model-only variant exists: do not silently claim V/I.
+            wiring.describe(f["hw"], no_companion)
+
     def test_the_rate_is_the_tunings(self):
         t = fx("j413")["tuning"]
         self.assertEqual(wiring.tuning_rate(t), 48000)

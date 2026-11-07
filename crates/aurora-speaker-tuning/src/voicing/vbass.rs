@@ -69,6 +69,9 @@ pub fn compile(stage: &Stage, fs: f64, _diags: &mut Diagnostics) -> Result<Optio
     if opt(15) != 0.0 {
         return Ok(None);
     }
+    if stage.channels != Some(2) {
+        return Err(bad(format!("{ctx}: mono VirtBass width law is not carried")));
+    }
     let monitor = req(1)?;
     if monitor != 1.0 {
         return Err(bad(format!("{ctx}: monitor {monitor} (only the full sum, 1, is carried)")));

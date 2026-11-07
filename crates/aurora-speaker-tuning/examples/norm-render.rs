@@ -5,8 +5,8 @@
 //! Input and output are headerless, stereo-interleaved little-endian f32.
 //! The input is fed in calls of `--q` frames (default 512); `--trace` writes
 //! the applied gain (dB) after each call, like the unit's momentary-gain
-//! parameter, and the output is moved back by the box's extra call so it
-//! lines up with the unit's. `--set ID=VALUE` overrides one saved parameter first.
+//! parameter. Output is returned at its original sample positions, with only
+//! the configured look-ahead. `--set ID=VALUE` overrides one saved parameter first.
 
 use aurora_speaker_tuning::bundle::Bundle;
 use aurora_speaker_tuning::tuning::{Options, Tuning};
@@ -34,6 +34,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             _ => pos.push(a),
         }
+    }
+    if q == 0 {
+        return Err("--q must be positive".into());
     }
     let [input, output] = <[String; 2]>::try_from(pos).map_err(|_| "need IN.f32 OUT.f32")?;
     let bundle = match (root, aid, bundle_path) {
@@ -81,15 +84,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         tr.extend_from_slice(&(run.gain_db() as f32).to_le_bytes());
         at += n;
     }
-    // flush the box's extra call so the output lines up with the unit's
-    let extra = sgv2_core::voicing::norm::CALL;
-    let mut zl = vec![0.0f32; extra];
-    let mut zr = vec![0.0f32; extra];
-    run.process(&mut [&mut zl, &mut zr], extra);
-    left.extend_from_slice(&zl);
-    right.extend_from_slice(&zr);
     let mut out = Vec::with_capacity(bytes.len());
-    for i in extra..frames + extra {
+    for i in 0..frames {
         out.extend_from_slice(&left[i].to_le_bytes());
         out.extend_from_slice(&right[i].to_le_bytes());
     }

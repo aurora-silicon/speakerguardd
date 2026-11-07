@@ -37,6 +37,7 @@
 //! | 7 | a constant tilt, from `-gain` to `+gain` around the slot frequency | the decoded complementary biquad pair |
 //! | 14 | resonant second-order high-pass; gain and order are ignored | bilinear high-pass with the saved analog-decay quality convention |
 //! | 15 | a level-dependent notch | saved detector, range, ratio, threshold and attack/release law |
+//! | 17 | a level-dependent low shelf | saved detector, range, ratio, threshold and attack/release law |
 //! | 18 | a level-dependent high shelf | saved detector, range, ratio, threshold and attack/release law |
 //!
 //! The level-dependent slots (15, 18) run after every static slot of the
@@ -239,6 +240,31 @@ fn butterworth(high: bool, order: u32, f0: f64, fs: f64) -> Vec<Section> {
     made.sections[..made.count].to_vec()
 }
 
+/// A static phase-matched low-pass: two identical half-order Butterworth
+/// cascades on filtered channels, their all-pass denominator companions on
+/// the phase channels. An odd half-order delays both paths by one frame.
+fn phase_compensated_low_pass(order: u32, f0: f64, fs: f64) -> (Vec<Section>, Vec<Section>) {
+    let half = butterworth(false, order / 2, f0, fs);
+    let mut filtered = half.clone();
+    filtered.extend_from_slice(&half);
+    let mut companion: Vec<Section> = half
+        .iter()
+        .map(|s| {
+            if s.a2 == 0.0 {
+                Section { b0: s.a1, b1: 1.0, b2: 0.0, a1: s.a1, a2: 0.0 }
+            } else {
+                Section { b0: s.a2, b1: s.a1, b2: 1.0, a1: s.a1, a2: s.a2 }
+            }
+        })
+        .collect();
+    if (order / 2) % 2 != 0 {
+        let delay = Section { b0: 0.0, b1: 1.0, b2: 0.0, a1: 0.0, a2: 0.0 };
+        filtered.push(delay);
+        companion.push(delay);
+    }
+    (filtered, companion)
+}
+
 #[derive(Clone, Copy)]
 enum Rbj {
     Peak,
@@ -376,7 +402,8 @@ pub fn voicing_tone(
             };
             let point = |scalar: f64, gain_db: f64, frequency_hz: f64, which: &str| -> Result<TonePoint> {
                 if !gain_db.is_finite()
-                    || !(-30.0..=0.0).contains(&gain_db)
+                    || !(if dynamic_slot.params.kind == DynamicKind::LowShelf { -30.0..=30.0 } else { -30.0..=0.0 })
+                        .contains(&gain_db)
                     || !frequency_hz.is_finite()
                     || frequency_hz <= 0.0
                     || frequency_hz >= fs / 2.0
@@ -753,6 +780,7 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics, mode: Rea
         }
         let dynamic_kind = match kind_value as i64 {
             15 => Some(DynamicKind::Notch),
+            17 => Some(DynamicKind::LowShelf),
             18 => Some(DynamicKind::HighShelf),
             _ => None,
         };
@@ -788,6 +816,20 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics, mode: Rea
             return Err(bad(format!("{ctx}: slot {i} has a non-numeric field")));
         }
         let kind = kind as i64;
+        if kind == 3 && phase_mask != 0.0 {
+            if order.fract() != 0.0 || !(2.0..=MAX_ORDER as f64).contains(&order) || order as u32 % 2 != 0 {
+                return Err(bad(format!("{ctx}: slot {i} phase-matched low-pass needs an even order")));
+            }
+            if !(f0 > 0.0 && f0 < nyquist) {
+                return Err(bad(format!("{ctx}: invalid phase-matched low-pass frequency")));
+            }
+            if automation.iter().any(|(_, a)| a.target == i && a.moves()) {
+                return Err(bad(format!("{ctx}: slot {i} has moving low-pass phase compensation")));
+            }
+            let (low, allpass) = phase_compensated_low_pass(order as u32, f0, fs);
+            p.sections.extend(if filtered { low } else { allpass });
+            continue;
+        }
         if phase_companion && !filtered {
             if kind != 12 || gain == 0.0 {
                 return Err(bad(format!("{ctx}: slot {i} type {kind} phase companion is not carried")));
@@ -807,6 +849,13 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics, mode: Rea
         let mut spans = Vec::new();
         for (e, a) in automation.iter().filter(|(_, a)| a.target == i) {
             a.check(&ctx, *e, kind)?;
+            // An entry whose set points coincide changes nothing at any
+            // volume (measured): its set point B is never applied, whatever
+            // it holds (AIDs 8/14/24/28/30/34/39/40 save such entries with a
+            // 0 Hz B on a high-pass).
+            if !a.moves() {
+                continue;
+            }
             let base = points.len();
             points.extend(a.middle.map(|(_, m)| m));
             points.push(a.b);
@@ -863,7 +912,7 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics, mode: Rea
                 .filter(|&j| {
                     let state = get(SLOT_BASE + SLOT_STRIDE * j);
                     let kind = get(SLOT_BASE + SLOT_STRIDE * j + 1);
-                    state != 0.0 && (kind == 15.0 || kind == 18.0)
+                    state != 0.0 && (kind == 15.0 || kind == 17.0 || kind == 18.0)
                 })
                 .count() as u32;
             let attack = get(616 + 3 * in_use);
@@ -872,7 +921,12 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics, mode: Rea
             if !(0.0..=65535.0).contains(&sidechain_mask) || sidechain_mask.fract() != 0.0 {
                 return Err(bad(format!("{ctx}: slot {i} sidechain mask {sidechain_mask}")));
             }
-            if !(-30.0..=0.0).contains(&gain)
+            let range_ok = if dynamic_kind == DynamicKind::LowShelf {
+                (-30.0..=30.0).contains(&gain)
+            } else {
+                (-30.0..=0.0).contains(&gain)
+            };
+            if !range_ok
                 || !f0.is_finite()
                 || q <= 0.0
                 || !q.is_finite()
@@ -888,6 +942,17 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics, mode: Rea
                 )));
             }
             need_freq("level-dependent filter", f0)?;
+            // A positive type-17 range is a loudness boost. The exact
+            // voicing chain carries it; the protection pre-stage omits it,
+            // which is the least-passing setting over the slot's law.
+            if dynamic_kind == DynamicKind::LowShelf && gain > 0.0 && mode == Realise::LeastPassing {
+                diags.info(
+                    "prestage-dynamic-filter",
+                    ctx.clone(),
+                    format!("slot {i}: positive level-dependent low shelf omitted from the least-passing pre-stage"),
+                );
+                continue;
+            }
             let sidechain_bits = sidechain_mask as u32;
             p.dynamics.push(PartDynamic {
                 slot: i,
@@ -1683,6 +1748,7 @@ mod tests {
             origin: Origin { node: "in".into(), port: 0, channel: c },
             hops: Vec::new(),
             through: through.iter().map(|(n, ch)| Pass { node: (*n).into(), channel: *ch }).collect(),
+            summed: Vec::new(),
         }
     }
 
@@ -1765,10 +1831,10 @@ mod tests {
         // by this terse synthetic-slot helper).
         let boost = tmst(&[(20, 3000.0)], &[(0, [3.0, 0.0, 2.0, 700.0, 800.0, 1800.0, 3.0, 0.0])]);
         let pb = part(&boost, 0, fs, &mut d).unwrap();
-        assert_eq!((pb.sections.len(), pb.gain_db), (3, 0.0));
+        assert_eq!((pb.sections.len(), pb.gain_db), (4, 0.0));
         let cut = tmst(&[(20, 3000.0)], &[(0, [3.0, 0.0, -2.0, 700.0, 800.0, 1800.0, 3.0, 0.0])]);
         let pc = part(&cut, 0, fs, &mut d).unwrap();
-        assert_eq!((pc.sections.len(), pc.gain_db), (3, 0.0));
+        assert_eq!((pc.sections.len(), pc.gain_db), (4, 0.0));
         let db = |p: &Part, f: f64| {
             let mut ch = Channel::IDENTITY;
             ch.count = p.sections.len();
@@ -1812,6 +1878,14 @@ mod tests {
         let ph = part(&high_cut, 0, fs, &mut d).unwrap();
         assert_eq!((ph.sections.len(), ph.dynamics.len()), (0, 1));
         assert_eq!(ph.dynamics[0].params.kind, DynamicKind::HighShelf);
+        let low_boost = tmst(&[(20, -14.695)], &[(0, [3.0, 17.0, 18.0, 400.0, 4.209, 2.5, 3.0, 0.0])]);
+        // The protection pre-stage omits a boost; the exact voicing box
+        // carries type 17 and its sidechain law.
+        assert!(part(&low_boost, 0, fs, &mut d).unwrap().dynamics.is_empty());
+        let (low_tone, partial) = voicing_tone(&low_boost, 2, true, fs, &mut d).unwrap();
+        assert!(partial.is_empty());
+        assert_eq!(low_tone.dynamic.len(), 1);
+        assert_eq!(low_tone.dynamic[0].params.kind, DynamicKind::LowShelf);
         // Attack/release/smoothing triplets follow the level-dependent slots
         // in use, in order: slot 5 is the second such slot (619..621); an
         // unused level-dependent slot does not take a triplet.
@@ -1891,6 +1965,53 @@ mod tests {
     }
 
     #[test]
+    fn low_pass_phase_mask_preserves_magnitude_and_matches_phase() {
+        let fs = 48_000.0;
+        for order in [2, 4, 6, 18, 20] {
+            let (low, allpass) = phase_compensated_low_pass(order, 1800.0, fs);
+            let response = |sections: &[Section], f: f64| {
+                let w = 2.0 * PI * f / fs;
+                sections.iter().fold((1.0, 0.0), |(re, im), s| {
+                    let (c1, s1) = (w.cos(), -w.sin());
+                    let (c2, s2) = ((2.0 * w).cos(), -(2.0 * w).sin());
+                    let (nr, ni) = (s.b0 + s.b1 * c1 + s.b2 * c2, s.b1 * s1 + s.b2 * s2);
+                    let (dr, di) = (1.0 + s.a1 * c1 + s.a2 * c2, s.a1 * s1 + s.a2 * s2);
+                    let den = dr * dr + di * di;
+                    let (hr, hi) = ((nr * dr + ni * di) / den, (ni * dr - nr * di) / den);
+                    (re * hr - im * hi, re * hi + im * hr)
+                })
+            };
+            for f in [30.0, 900.0, 1800.0, 3000.0, 12_000.0] {
+                let (lr, li) = response(&low, f);
+                let (ar, ai) = response(&allpass, f);
+                assert!((ar.hypot(ai) - 1.0).abs() < 1e-9);
+                let relative_imaginary = li * ar - lr * ai;
+                assert!(relative_imaginary.abs() < 1e-9);
+                assert!(lr * ar + li * ai >= -1e-12);
+            }
+            let (re, im) = response(&low, 1800.0);
+            assert!((re.hypot(im) - 0.5).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn low_pass_phase_companion_uses_masks_and_rejects_unqualified_orders() {
+        let mut stage = tmst(&[], &[(0, [3.0, 3.0, 0.0, 1800.0, 0.7, 2.0, 1.0, 0.0])]);
+        stage.state.as_mut().unwrap().sections[0].params.iter_mut().find(|(id, _)| *id == SLOT_BASE + 8).unwrap().1 =
+            2.0;
+        let mut d = Diagnostics::default();
+        let low = part_with(&stage, 0, 48_000.0, &mut d, Realise::Saved).unwrap();
+        let companion = part_with(&stage, 1, 48_000.0, &mut d, Realise::Saved).unwrap();
+        assert_eq!(low.sections.last().unwrap().b0, 0.0);
+        assert_eq!(companion.sections.last().unwrap().b0, 0.0);
+        assert_eq!(part_with(&stage, 2, 48_000.0, &mut d, Realise::Saved).unwrap().sections.len(), 0);
+        stage.state.as_mut().unwrap().sections[0].params.iter_mut().find(|(id, _)| *id == SLOT_BASE + 5).unwrap().1 =
+            3.0;
+        assert!(part_with(&stage, 0, 48_000.0, &mut d, Realise::Saved).is_err());
+        assert!(part_with(&stage, 1, 48_000.0, &mut d, Realise::Saved).is_err());
+    }
+
+    #[test]
     fn high_shelf_phase_mask_builds_the_companion_channel() {
         let mut stage = tmst(&[], &[(0, [3.0, 12.0, -2.0, 1500.0, 1.0, 2.0, 2.0, 0.0])]);
         let global = stage.state.as_mut().unwrap().sections.iter_mut().find(|section| section.scope == 0).unwrap();
@@ -1917,6 +2038,7 @@ mod tests {
                 origin: Origin { node: "in".into(), port: 0, channel: c },
                 hops: Vec::new(),
                 through: chain.iter().map(|s| Pass { node: s.name.clone(), channel: c }).collect(),
+                summed: Vec::new(),
             })
             .collect();
         derive_lanes(&chain, &lanes, fs, n, d)
@@ -1988,6 +2110,17 @@ mod tests {
         let p = part(&hp(auto(0, 1.0, 0.2, (1.0, -0.1, 100.0), Some((0.8, -0.05, 80.0)))), 0, fs, &mut d).unwrap();
         assert_eq!(p.sections, butterworth(true, 4, 100.0f32 as f64, fs));
         assert!((p.gain_db + 0.1).abs() < 1e-6);
+        // an entry whose set points coincide (the legacy state 1000, B at 0 Hz)
+        // changes nothing: the slot's own corner, in both modes
+        let mut still = auto(2, 1.0, 0.0, (0.0, 0.0, 0.0), None);
+        still[1].1 = 1000.0;
+        still.push((AUTOMATION_BASE + AUTOMATION_STRIDE * 2 + 7, 1000.0));
+        let p = part(&hp(still.clone()), 0, fs, &mut d).unwrap();
+        assert_eq!(p.sections, butterworth(true, 4, 45.0, fs));
+        assert_eq!(p.gain_db, 0.0);
+        let p = part_with(&hp(still), 0, fs, &mut d, Realise::Saved).unwrap();
+        assert_eq!(p.sections, butterworth(true, 4, 45.0, fs));
+        assert!(p.conservative.is_empty());
         // one falling with the volume: the slot's own corner is the highest
         let p = part(&hp(auto(0, 1.0, 0.2, (1.0, 0.0, 30.0), None)), 0, fs, &mut d).unwrap();
         assert_eq!(p.sections, butterworth(true, 4, 45.0, fs));
@@ -2117,6 +2250,16 @@ mod tests {
         assert_eq!(tone.dynamic_automation[0].index, 0);
         assert_eq!(tone.dynamic_automation[0].a.frequency_hz, 9_500.0);
         assert_eq!(tone.dynamic_automation[0].b.frequency_hz, 9_000.0);
+    }
+
+    #[test]
+    fn dynamic_low_shelf_automation_carries_positive_range() {
+        let stage =
+            tmst(&auto(0, 0.0, 0.0, (1.0, 0.0, 500.0), None), &[(0, [3.0, 17.0, 12.0, 500.0, 1.0, 2.0, 3.0, 0.0])]);
+        let (tone, partial) = voicing_tone(&stage, 2, true, 48_000.0, &mut Diagnostics::default()).unwrap();
+        assert!(partial.is_empty());
+        assert_eq!(tone.dynamic_automation[0].a.gain_db, 12.0);
+        assert_eq!(tone.dynamic_automation[0].b.gain_db, 0.0);
     }
 
     #[test]

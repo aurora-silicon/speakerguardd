@@ -153,9 +153,9 @@ macro_rules! choices {
         }
     };
 }
-choices!(GraphParam, VolumeScalar = 0, VolumeDb = 1, Mute = 2, BalanceLeft = 3, BalanceRight = 4);
+choices!(GraphParam, VolumeScalar = 0, VolumeDb = 1, Mute = 2, BalanceLeft = 3, BalanceRight = 4, Lid = 5);
 choices!(BandMode, Compress = 0, Pass = 1, Mute = 2);
-choices!(DynamicKind, Notch = 15, HighShelf = 18);
+choices!(DynamicKind, Notch = 15, LowShelf = 17, HighShelf = 18);
 impl Wire for Source {
     fn put(&self, o: &mut Vec<u8>) {
         match self {
@@ -211,11 +211,22 @@ impl Wire for ToneShape {
         })
     }
 }
+record!(ToneVariant, mask, tone);
+
 impl Wire for Kind {
     fn put(&self, o: &mut Vec<u8>) {
         match self {
             Self::NonFinite => 0u32.put(o),
             Self::Gain => 1u32.put(o),
+            Self::ParameterAdd(values) => {
+                19u32.put(o);
+                values.put(o);
+            }
+            Self::ToneGroups { default_mask, variants } => {
+                20u32.put(o);
+                default_mask.put(o);
+                variants.put(o);
+            }
             Self::Tone(p) => {
                 2u32.put(o);
                 p.put(o);
@@ -226,18 +237,40 @@ impl Wire for Kind {
             }
             Self::Bypass => 4u32.put(o),
             Self::Stub(_) => 5u32.put(o), // never deploy a stub
+            Self::Sum(out) => {
+                17u32.put(o);
+                out.put(o);
+            }
             Self::Xtc(p) => {
-                6u32.put(o);
+                (if p.startup.is_some() { 21u32 } else { 6u32 }).put(o);
                 let mut w = vec![0.0; super::xtc::Params::WORDS];
                 p.to_words(&mut w);
                 for v in w {
                     v.put(o);
                 }
+                if let Some(startup) = &p.startup {
+                    for filter in [&startup.initial, &startup.restored] {
+                        let mut w = vec![0.0; super::xtc::Params::WORDS];
+                        filter.to_words(&mut w);
+                        for v in w {
+                            v.put(o);
+                        }
+                    }
+                    startup.crossfade_frames.put(o);
+                }
             }
             Self::Cfreak(p) => {
-                7u32.put(o);
+                let words = p.words();
+                (match words {
+                    super::cfreak::Params::LEGACY_WORDS => 7u32,
+                    super::cfreak::Params::PLAIN_WORDS => 18u32,
+                    super::cfreak::Params::HIGHPASS_WORDS => 22u32,
+                    _ => 27u32,
+                })
+                .put(o);
                 let mut w = vec![0.0; super::cfreak::Params::WORDS];
                 p.to_words(&mut w);
+                w.truncate(words);
                 for v in w {
                     v.put(o);
                 }
@@ -320,15 +353,34 @@ impl Wire for Kind {
         Ok(match u32::get(r)? {
             0 => Self::NonFinite,
             1 => Self::Gain,
+            19 => Self::ParameterAdd(Vec::get(r)?),
+            20 => Self::ToneGroups { default_mask: u32::get(r)?, variants: Vec::get(r)? },
             2 => Self::Tone(Tone::get(r)?),
             3 => Self::Comp(Dynamics::get(r)?),
             4 => Self::Bypass,
-            6 => {
+            17 => Self::Sum(usize::get(r)?),
+            tag @ (6 | 21) => {
                 let w: Vec<f64> = (0..super::xtc::Params::WORDS).map(|_| f64::get(r)).collect::<Result<_>>()?;
-                Self::Xtc(Box::new(super::xtc::Params::from_words(&w).ok_or(BlobError::Unstable)?))
+                let mut params = super::xtc::Params::from_words(&w).ok_or(BlobError::Unstable)?;
+                if tag == 21 {
+                    let mut filter = || -> Result<super::xtc::Params> {
+                        let w: Vec<f64> = (0..super::xtc::Params::WORDS).map(|_| f64::get(r)).collect::<Result<_>>()?;
+                        super::xtc::Params::from_words(&w).ok_or(BlobError::Unstable)
+                    };
+                    let initial = filter()?;
+                    let restored = filter()?;
+                    params = params.with_startup(initial, restored, usize::get(r)?).ok_or(BlobError::Unstable)?;
+                }
+                Self::Xtc(Box::new(params))
             }
-            7 => {
-                let w: Vec<f64> = (0..super::cfreak::Params::WORDS).map(|_| f64::get(r)).collect::<Result<_>>()?;
+            tag @ (7 | 18 | 22 | 27) => {
+                let words = match tag {
+                    7 => super::cfreak::Params::LEGACY_WORDS,
+                    18 => super::cfreak::Params::PLAIN_WORDS,
+                    22 => super::cfreak::Params::HIGHPASS_WORDS,
+                    _ => super::cfreak::Params::WORDS,
+                };
+                let w: Vec<f64> = (0..words).map(|_| f64::get(r)).collect::<Result<_>>()?;
                 Self::Cfreak(Box::new(super::cfreak::Params::from_words(&w).ok_or(BlobError::Unstable)?))
             }
             8 => {
@@ -427,16 +479,20 @@ fn validate(spec: &Spec, fs: f64, lanes: usize) -> Result<()> {
         return Err(BlobError::Channels);
     }
     // Check counts before Spec::check calls Channel::sections().
-    if spec.nodes.iter().any(|n| matches!(&n.kind, Kind::Tone(t) if t.channels.iter().any(|c| c.count > MAX_SECTIONS)))
-    {
+    if spec.nodes.iter().any(|n| n.kind.tones().any(|t| t.channels.iter().any(|c| c.count > MAX_SECTIONS))) {
         return Err(BlobError::Length);
     }
     spec.check().map_err(|_| BlobError::Unstable)?;
     for node in &spec.nodes {
         let width = node.inputs.len();
+        if node.kind.tones().any(|t| t.dynamic.iter().any(|d| !d.params.valid(fs))) {
+            return Err(BlobError::Unstable);
+        }
         match &node.kind {
+            Kind::Xtc(p) if !p.valid() => return Err(BlobError::Unstable),
             Kind::Xtc(_) | Kind::Vbass(_) if width != 2 => return Err(BlobError::Channels),
             Kind::Norm(_) if width > super::norm::MAX_CHANNELS => return Err(BlobError::Channels),
+            Kind::Vareq(p) if !p.transitions_valid_at(fs) => return Err(BlobError::Unstable),
             Kind::Cdelay(p) if p.channels != width => return Err(BlobError::Channels),
             Kind::Lowflow(p) if p.model_count * 2 != width => return Err(BlobError::Channels),
             Kind::Pchr(p) if p.channels != width as f64 => return Err(BlobError::Channels),
@@ -447,4 +503,27 @@ fn validate(spec: &Spec, fs: f64, lanes: usize) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod xtc_startup_tests {
+    use super::*;
+
+    #[test]
+    fn startup_node_preserves_both_filters_and_legacy_node_stays_readable() {
+        let mut initial = super::super::xtc::Params::identity();
+        initial.taps[0][0] = 0.5;
+        let mut restored = initial.clone();
+        restored.taps[3][0] = 0.25;
+        let params = super::super::xtc::Params::identity().with_startup(initial, restored, 7).unwrap();
+        for params in [params, super::super::xtc::Params::identity()] {
+            let kind = Kind::Xtc(Box::new(params.clone()));
+            let mut bytes = Vec::new();
+            kind.put(&mut bytes);
+            let mut reader = Reader(&bytes);
+            let Kind::Xtc(decoded) = Kind::get(&mut reader).unwrap() else { panic!("wrong node kind") };
+            assert_eq!(*decoded, params);
+            assert!(reader.0.is_empty());
+        }
+    }
 }

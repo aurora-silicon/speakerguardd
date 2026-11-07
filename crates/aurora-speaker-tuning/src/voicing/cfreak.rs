@@ -10,20 +10,20 @@
 //! | ID | meaning | carried |
 //! |---:|---|---|
 //! | 0 | bypass [0] | 1: the box is left out |
-//! | 1, 10, 17 | saturation oversampling, flavour, amount [0] | mode 3 / sine / wet percent |
-//! | 2, 11 | input gain (dB) [0], its stage enabled [1] | only 0 dB or disabled |
+//! | 1, 10, 17 | saturation oversampling, flavour, amount [0] | modes 1-7 / sine / dormant |
+//! | 2, 11 | input gain (dB) [0], its stage enabled [1] | yes, or unity when disabled |
 //! | 3 | threshold (dB) [0] | yes |
 //! | 4 | MinFastGain (dB) [3] | yes |
 //! | 5 | fast gain release (ms) [10]: a hold | yes |
 //! | 6 | true-peak detection [0] | yes |
 //! | 7 | look-ahead (ms) [0.5] | yes |
-//! | 8, 15 | output gain (dB) [0], its stage enabled [1] | only 0 dB or disabled |
+//! | 8, 15 | output gain (dB) [0], its stage enabled [1] | yes, or unity when disabled |
 //! | 9 | parameter ramp time [0] | not needed: the state is fixed |
-//! | 12, 13, 21, 22 | high-pass enable [0], corner, order, placement | refused when enabled |
+//! | 12, 13, 21, 22 | high-pass enable [0], corner [50], order [2], location [0] | Butterworth at the input; location 0 only |
 //! | 14 | limiter enabled [1] | refused when off |
-//! | 16 | output saturation [0] | off, or the mode-3 sine subset |
-//! | 18-21 | de-esser controls | dormant for the carried sine flavor, but required |
-//! | 23 | algorithm version [0] | 0 without saturation, 1 with the carried subset |
+//! | 16 | output saturation [0] | off, or the sine flavour |
+//! | 18-20 | de-esser frequency, strength (dB), Q | yes, with output saturation |
+//! | 23 | algorithm version [0] | 0 without saturation; 1 with the high-pass or the carried saturation subset |
 //!
 //! The group-scope sections the strips also save do not change the unit's
 //! output; the global values are used.
@@ -39,6 +39,8 @@ pub const CFRK: FourCc = FourCc::from_bytes(*b"cfrk");
 fn default(id: u32) -> Option<f64> {
     Some(match id {
         0..=3 | 6 | 8 | 9 | 10 | 12 | 16 | 17 | 22 | 23 => 0.0,
+        13 => 50.0,
+        21 => 2.0,
         4 => 3.0,
         5 => 10.0,
         7 => 0.5,
@@ -48,6 +50,28 @@ fn default(id: u32) -> Option<f64> {
 }
 
 pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option<Params>> {
+    compile_for(stage, fs, None, diags)
+}
+
+/// The published range of parameter 17 ("max saturation"), dB.
+pub const MAX_SATURATION_DB: (f64, f64) = (0.0, 40.0);
+
+/// Whether a tuning extracted from macOS build `build` runs the macOS 27
+/// unit (builds `26xxx` and later), whose saturation drive has the
+/// parameter-17 block-peak ceiling. Unknown builds keep the 25G83 unit.
+pub fn macos27(build: Option<&str>) -> bool {
+    let major: String = build.unwrap_or("").chars().take_while(|c| c.is_ascii_digit()).collect();
+    major.parse::<u32>().is_ok_and(|m| m >= 26)
+}
+
+/// [`compile`] for a tuning extracted from macOS build `source_build`: the
+/// unit's behaviour follows the macOS that the tuning came from.
+pub fn compile_for(
+    stage: &Stage,
+    fs: f64,
+    source_build: Option<&str>,
+    diags: &mut Diagnostics,
+) -> Result<Option<Params>> {
     let ctx = format!("limiter box {}", stage.name);
     let bad = |m: String| Error::format(&ctx, m);
     if stage.unit.map(|u| u.subtype) != Some(CFRK) {
@@ -72,41 +96,69 @@ pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option
         return Err(bad("the limiter is switched off (not carried)".into()));
     }
     let saturation = get(16)? != 0.0;
-    if get(12)? != 0.0 {
-        return Err(bad("the high-pass is on (not carried)".into()));
-    }
-    let (saturation_mode, saturation_flavor, saturation_mix) = if saturation {
-        if get(1)? != 3.0 || get(10)? != 2.0 || get(23)? != 1.0 {
+    let highpass = get(12)? != 0.0;
+    let (highpass_order, highpass_hz) = if highpass {
+        // observed only with algorithm version 1; version 0's high-pass is
+        // not established
+        if get(23)? != 1.0 {
+            return Err(bad(format!("high-pass with algorithm version {} (only 1 is carried)", get(23)?)));
+        }
+        if get(22)? != 0.0 {
+            return Err(bad(format!("high-pass location {} (only 0, at the input, is carried)", get(22)?)));
+        }
+        let order = get(21)?;
+        let hz = get(13)?;
+        if order.fract() != 0.0 || !(1.0..=sgv2_core::voicing::cfreak::MAX_HIGHPASS_ORDER as f64).contains(&order) {
+            return Err(bad(format!("high-pass order {order}")));
+        }
+        if !(hz > 0.0 && hz < fs / 2.0) {
+            return Err(bad(format!("high-pass corner {hz} Hz")));
+        }
+        (order as u32, hz)
+    } else {
+        (0, 0.0)
+    };
+    let (saturation_mode, saturation_flavor, saturation_ceiling_db) = if saturation {
+        let mode = get(1)?;
+        let flavor = get(10)?;
+        let version = get(23)?;
+        // flavour 2 (sine) is established with version 1; flavour 1 (cubic)
+        // renders identically under versions 0 and 1
+        let carried = match flavor {
+            1.0 => version == 0.0 || version == 1.0,
+            2.0 => version == 1.0,
+            _ => false,
+        };
+        if !(0.0..=7.0).contains(&mode) || mode != mode.trunc() || !carried {
             return Err(bad(format!(
-                "output saturation mode/flavor/version {}/{}/{} (only 3/2/1 is carried)",
-                get(1)?,
-                get(10)?,
-                get(23)?
+                "output saturation mode/flavor/version {mode}/{flavor}/{version} (modes 0-7; cubic flavor 1 with version 0 or 1, sine flavor 2 with version 1 are carried)"
             )));
         }
-        let amount = get(17)?;
-        if !(0.0..=100.0).contains(&amount) {
-            return Err(bad(format!("output saturation amount {amount}%")));
+        if mode == 0.0 && get(19)? != 0.0 {
+            return Err(bad("output saturation without oversampling and an active de-esser (not carried)".into()));
         }
-        // These controls are part of the version-1 state but dormant for
-        // sine flavor 2. Require their complete finite saved values rather
+        // "max saturation" (dB): the macOS 27 unit's block-peak ceiling of
+        // the shaper drive; the 25G83 unit has none. The unit holds the
+        // value inside the parameter's published range, so a saved value
+        // under the floor runs at the floor (black-box: a saved -2 dB
+        // ceiling drives every block exactly as 0 dB does).
+        let saved = get(17)?.clamp(MAX_SATURATION_DB.0, MAX_SATURATION_DB.1);
+        let ceiling = if macos27(source_build) { saved } else { sgv2_core::voicing::cfreak::CEILING_OFF_DB };
+        // The de-esser (18-20) shapes the saturation drive; 21 belongs to
+        // the version-1 state. Require complete finite saved values rather
         // than silently defaulting an unknown state.
         for id in [18, 19, 20, 21] {
             get(id)?;
         }
-        (3.0, 2.0, amount / 100.0)
+        (mode, flavor, ceiling)
     } else {
-        if get(23)? != 0.0 {
+        // version 1 without saturation: the high-pass (if on) is its only
+        // addition the strips use
+        if get(23)? != 0.0 && !(get(23)? == 1.0 && highpass) {
             return Err(bad(format!("algorithm version {} (only 0 without saturation is carried)", get(23)?)));
         }
         (0.0, 0.0, 0.0)
     };
-    if get(11)? != 0.0 && get(2)? != 0.0 {
-        return Err(bad(format!("input gain {} dB (not carried)", get(2)?)));
-    }
-    if get(15)? != 0.0 && get(8)? != 0.0 {
-        return Err(bad(format!("output gain {} dB (not carried)", get(8)?)));
-    }
     let words = [
         get(7)? / 1000.0,
         get(5)? / 1000.0,
@@ -115,9 +167,21 @@ pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option
         get(6)?,
         saturation_mode,
         saturation_flavor,
-        saturation_mix,
+        saturation_ceiling_db,
+        if get(11)? != 0.0 { get(2)? } else { 0.0 },
+        if get(15)? != 0.0 { get(8)? } else { 0.0 },
+        // the high-pass words (set below) and the de-esser
+        0.0,
+        0.0,
+        0.0,
+        if saturation { get(18)? } else { 0.0 },
+        if saturation { get(19)? } else { 0.0 },
+        if saturation { get(20)? } else { 0.0 },
     ];
-    let p = Params::from_words(&words).ok_or_else(|| bad(format!("values out of range: {words:?}")))?;
+    let words = if saturation { &words[..] } else { &words[..Params::PLAIN_WORDS] };
+    let mut p = Params::from_words(words).ok_or_else(|| bad(format!("values out of range: {words:?}")))?;
+    p.highpass_order = highpass_order;
+    p.highpass_hz = highpass_hz;
     let frames = |s: f64| s * fs;
     if (frames(p.lookahead_s) - frames(p.lookahead_s).round()).abs() > 1e-6
         || (frames(p.hold_s) - frames(p.hold_s).round()).abs() > 1e-6
@@ -176,7 +240,15 @@ mod tests {
                 true_peak: true,
                 saturation_mode: 0,
                 saturation_flavor: 0,
-                saturation_mix: 0.0,
+                saturation_ceiling_db: 0.0,
+                deesser_hz: 0.0,
+                deesser_db: 0.0,
+                deesser_q: 0.0,
+                input_gain_db: 0.0,
+                output_gain_db: 0.0,
+                highpass_order: 0,
+                highpass_hz: 0.0,
+                highpass_location: 0,
             }
         );
         let d = compile_of(&[]).unwrap().unwrap();
@@ -184,6 +256,14 @@ mod tests {
             (d.lookahead_s, d.hold_s, d.threshold_db, d.min_fast_gain_db, d.true_peak),
             (0.0005, 0.01, 0.0, 3.0, false)
         );
+    }
+
+    #[test]
+    fn carries_enabled_gain_stages_and_ignores_disabled_values() {
+        let enabled = compile_of(&[(2, 3.0), (8, -2.0)]).unwrap().unwrap();
+        assert_eq!((enabled.input_gain_db, enabled.output_gain_db), (3.0, -2.0));
+        let disabled = compile_of(&[(2, 3.0), (11, 0.0), (8, -2.0), (15, 0.0)]).unwrap().unwrap();
+        assert_eq!((disabled.input_gain_db, disabled.output_gain_db), (0.0, 0.0));
     }
 
     #[test]
@@ -197,14 +277,20 @@ mod tests {
             [(16, 1.0), (0, 0.0)],
             [(12, 1.0), (0, 0.0)],
             [(23, 1.0), (0, 0.0)],
-            [(2, 3.0), (11, 1.0)],
-            [(8, -2.0), (15, 1.0)],
             [(6, 0.5), (0, 0.0)],
             [(7, 5.0), (0, 0.0)],
         ] {
             assert!(compile_of(&refused).is_err(), "{refused:?}");
         }
         assert!(compile_of(&[(2, 3.0), (11, 0.0), (8, -2.0), (15, 0.0)]).unwrap().is_some());
+        let hp = compile_of(&[(12, 1.0), (23, 1.0), (13, 40.0), (21, 3.0)]).unwrap().unwrap();
+        assert_eq!((hp.highpass_order, hp.highpass_hz, hp.highpass_location), (3, 40.0, 0));
+        assert_eq!(compile_of(&[(12, 1.0), (23, 1.0)]).unwrap().unwrap().highpass_order, 2);
+        for refused in
+            [[(12, 1.0), (23, 1.0), (22, 1.0)], [(12, 1.0), (23, 1.0), (21, 11.0)], [(12, 1.0), (23, 1.0), (16, 1.0)]]
+        {
+            assert!(compile_of(&refused).is_err(), "{refused:?}");
+        }
         let saturated = compile_of(&[
             (1, 3.0),
             (10, 2.0),
@@ -218,7 +304,49 @@ mod tests {
         ])
         .unwrap()
         .unwrap();
-        assert_eq!((saturated.saturation_mode, saturated.saturation_flavor, saturated.saturation_mix), (3, 2, 0.3));
+        assert_eq!(
+            (saturated.saturation_mode, saturated.saturation_flavor, saturated.saturation_ceiling_db),
+            (3, 2, sgv2_core::voicing::cfreak::CEILING_OFF_DB)
+        );
+        // a macOS 27 source switches the saved block-peak ceiling on
+        let st = stage(&[(1, 3.0), (10, 2.0), (16, 1.0), (17, 30.0), (18, 10_000.0), (19, 10.0), (20, 1.0), (23, 1.0)]);
+        let on = compile_for(&st, 48_000.0, Some("26B8125"), &mut Diagnostics::default()).unwrap().unwrap();
+        assert_eq!(on.saturation_ceiling_db, 30.0);
+        // a saved ceiling outside the published range runs at its bound
+        for (saved, held) in [(-2.0, 0.0), (0.0, 0.0), (6.0, 6.0), (45.0, 40.0)] {
+            let st =
+                stage(&[(1, 3.0), (10, 2.0), (16, 1.0), (17, saved), (18, 10_000.0), (19, 10.0), (20, 1.0), (23, 1.0)]);
+            let p = compile_for(&st, 48_000.0, Some("27C100"), &mut Diagnostics::default()).unwrap().unwrap();
+            assert_eq!(p.saturation_ceiling_db, held);
+        }
+        assert!(macos27(Some("26A428")) && !macos27(Some("25G83")) && !macos27(None) && !macos27(Some("x")));
+        assert_eq!((saturated.deesser_hz, saturated.deesser_db, saturated.deesser_q), (10_000.0, 10.0, 1.0));
+        // flavour 1 (cubic) is carried with version 0 or 1, at the base rate
+        // without a de-esser
+        let cubic =
+            compile_of(&[(1, 0.0), (10, 1.0), (16, 1.0), (17, 1.0), (18, 1_000.0), (19, 0.0), (20, 1.0), (23, 0.0)])
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            (cubic.saturation_mode, cubic.saturation_flavor, cubic.saturation_ceiling_db),
+            (0, 1, sgv2_core::voicing::cfreak::CEILING_OFF_DB)
+        );
+        for refused in [[(1, 0.0)], [(1, 8.0)], [(10, 3.0)], [(23, 0.0)]] {
+            let mut st = vec![
+                (1, 3.0),
+                (10, 2.0),
+                (16, 1.0),
+                (17, 30.0),
+                (18, 10_000.0),
+                (19, 10.0),
+                (20, 1.0),
+                (21, 2.0),
+                (23, 1.0),
+            ];
+            st.retain(|(id, _)| *id != refused[0].0);
+            st.push(refused[0]);
+            assert!(compile_of(&st).is_err(), "{refused:?}");
+        }
         assert!(compile_of(&[(99, 1.0)]).unwrap().is_some());
         let mut st = stage(&[]);
         st.state = None;

@@ -45,9 +45,6 @@ pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option
             return Err(Error::range(&stage.name, &format!("delay parameter {slot}"), format!("is {ms} ms")));
         }
         if slot >= channels {
-            if ms != 0.0 {
-                return Err(bad(stage, format!("unused delay parameter {slot} is nonzero")));
-            }
             continue;
         }
         let frames = (ms * RATE / 1000.0).round() as usize;
@@ -118,12 +115,13 @@ mod tests {
     }
 
     #[test]
-    fn bypass_omits_box_and_unknown_profiles_refuse() {
+    fn bypass_omits_box_and_unknown_rates_refuse() {
         let values = [4.3, 4.3, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
         assert_eq!(compile(&stage(true, values), RATE, &mut Diagnostics::default()).unwrap(), None);
         assert!(compile(&stage(false, values), 96_000.0, &mut Diagnostics::default()).is_err());
         let mut bad = values;
         bad[2] = 1.0;
-        assert!(compile(&stage(false, bad), RATE, &mut Diagnostics::default()).is_err());
+        let base = compile(&stage(false, values), RATE, &mut Diagnostics::default()).unwrap();
+        assert_eq!(compile(&stage(false, bad), RATE, &mut Diagnostics::default()).unwrap(), base);
     }
 }

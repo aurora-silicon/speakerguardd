@@ -135,3 +135,19 @@ fn no_unit_allocates_in_process() {
     assert!(!a.is_failsafe());
     run(&mut a, 4, 0);
 }
+
+#[test]
+fn xtc_startup_and_reset_do_not_allocate() {
+    use sgv2_core::voicing::xtc::{Params, Run};
+    let params = Params::identity().with_startup(Params::identity(), Params::identity(), 16).unwrap();
+    let mut run = Run::new(&params, 48_000.0, 2);
+    for frames in [1, 7, 31, 512, 1024] {
+        let (mut left, mut right) = (vec![0.25; frames], vec![0.5; frames]);
+        let before = allocs();
+        run.process(&mut [&mut left, &mut right], frames);
+        assert_eq!(allocs(), before, "XTC allocated during its startup queue");
+    }
+    let before = allocs();
+    run.reset();
+    assert_eq!(allocs(), before, "XTC allocated while selecting the restored filter");
+}

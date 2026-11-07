@@ -99,11 +99,12 @@ pub const BANDS: usize = 4;
 
 use crate::voicing::mstk;
 
-/// The two level-dependent ToneMeister shapes carried by the pre-stage.
+/// The level-dependent ToneMeister shapes carried by the pre-stage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum DynamicKind {
     Notch = 15,
+    LowShelf = 17,
     HighShelf = 18,
 }
 
@@ -140,7 +141,11 @@ impl Default for DynamicFilter {
 impl DynamicFilter {
     pub(crate) fn valid(&self, fs: f64) -> bool {
         let finite = |v: f64, lo: f64, hi: f64| v.is_finite() && v >= lo && v <= hi;
-        finite(self.range_db, -30.0, 0.0)
+        let range_valid = match self.kind {
+            DynamicKind::LowShelf => finite(self.range_db, -30.0, 30.0),
+            DynamicKind::Notch | DynamicKind::HighShelf => finite(self.range_db, -30.0, 0.0),
+        };
+        range_valid
             && finite(self.frequency_hz, 1.0, 0.49 * fs)
             && finite(self.quality, 0.01, 100.0)
             && finite(self.ratio, 0.1, 10.0)
@@ -282,9 +287,11 @@ impl Dynamics {
 }
 /// Largest response the plugin accepts on its check grid (rounding only).
 pub const UNITY_TOLERANCE: f64 = 1.0 + 1e-9;
-/// What the filters see at most: far above any program, it keeps the
-/// state finite on garbage input.
-const INPUT_BOUND: f32 = 16.0;
+/// What the filters see at most: +120 dBFS. The installed units do not
+/// limit their input (an AID13 ToneMeister/MeisterStueck fed +30 dBFS
+/// noise runs linear), so the bound sits where no program, however hot,
+/// reaches it; it only keeps the state finite on garbage input.
+pub const INPUT_BOUND: f32 = 1.0e6;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Section {
@@ -622,6 +629,7 @@ impl Params {
                 let sidechain_mask = word(body, at + 8);
                 let kind = match word(body, at + 12) {
                     15 => DynamicKind::Notch,
+                    17 => DynamicKind::LowShelf,
                     18 => DynamicKind::HighShelf,
                     _ => return Err(BlobError::Length),
                 };
@@ -825,13 +833,14 @@ impl DynRun {
     }
 }
 
-/// Running state for one level-dependent ToneMeister slot. Both shapes run
+/// Running state for one level-dependent ToneMeister slot. The shapes run
 /// `dry + (gain - 1) * carrier` with a fixed carrier (type 15: the detector's
-/// constant-peak band pass; type 18: a first-order high-pass at half the
-/// corner). The control law:
+/// constant-peak band pass; type 17: a first-order low-pass at twice the
+/// corner; type 18: a first-order high-pass at half the corner). The control
+/// law:
 ///
-/// - the side chain passes the detector (type 15: the band pass; type 18: a
-///   second-order Butterworth high-pass at the corner);
+/// - the side chain passes the detector (type 15: the band pass; type 17/18:
+///   a second-order Butterworth low/high-pass at the corner);
 /// - two all-pass branches at half and twice the analysis centre form a
 ///   quadrature pair; their magnitude is taken on the first frame of every
 ///   16 (the phase carries across render calls) and mapped through the
@@ -848,15 +857,18 @@ struct DynamicRun {
     fs: f64,
     detector: Section,
     component: Section,
-    detector_state: [f32; 2],
+    detector_filter: ControlFilter,
     component_state: [[f32; 2]; MAX_CHANNELS],
     quadrature: [Section; 2],
-    quadrature_state: [[f32; 2]; 2],
+    quadrature_filter: [ControlFilter; 2],
     control_phase: usize,
     held: f32,
     control: ControlFilter,
     envelope: f64,
+    curve_samples: [f32; DYNAMIC_CURVE_POINTS],
 }
+
+const DYNAMIC_CURVE_POINTS: usize = 44;
 
 /// Frames per control-filter call; a multiple of the filter's group.
 const CONTROL_CHUNK: usize = 64;
@@ -874,6 +886,7 @@ impl DynamicRun {
                 let n = 1.0 / (1.0 + kq + k2);
                 Section { b0: kq * n, b1: 0.0, b2: -kq * n, a1: 2.0 * (k2 - 1.0) * n, a2: (1.0 - kq + k2) * n }
             }
+            DynamicKind::LowShelf => butter2(false, params.frequency_hz, fs),
             DynamicKind::HighShelf => {
                 // ToneMeister filter type 9: a second-order Butterworth
                 // high-pass at the saved corner.
@@ -882,6 +895,11 @@ impl DynamicRun {
         };
         let component = match params.kind {
             DynamicKind::Notch => detector,
+            DynamicKind::LowShelf => {
+                let k = libm::tan(core::f64::consts::PI * 2.0 * params.frequency_hz / fs);
+                let n = 1.0 / (1.0 + k);
+                Section { b0: k * n, b1: k * n, b2: 0.0, a1: (k - 1.0) * n, a2: 0.0 }
+            }
             DynamicKind::HighShelf => {
                 let k = libm::tan(core::f64::consts::PI * 0.5 * params.frequency_hz / fs);
                 let n = 1.0 / (1.0 + k);
@@ -890,6 +908,7 @@ impl DynamicRun {
         };
         let analysis_hz = match params.kind {
             DynamicKind::Notch => params.frequency_hz,
+            DynamicKind::LowShelf => libm::sqrt(params.frequency_hz * 20.0).clamp(40.0, 10_000.0),
             DynamicKind::HighShelf => libm::sqrt(params.frequency_hz * 20_000.0).clamp(40.0, 10_000.0),
         };
         let quadrature = [Self::allpass(0.5 * analysis_hz, 0.37, fs), Self::allpass(2.0 * analysis_hz, 0.37, fs)];
@@ -897,14 +916,15 @@ impl DynamicRun {
             fs,
             detector,
             component,
-            detector_state: [0.0; 2],
+            detector_filter: ControlFilter::zeroed(&detector),
             component_state: [[0.0; 2]; MAX_CHANNELS],
             quadrature,
-            quadrature_state: [[0.0; 2]; 2],
+            quadrature_filter: [ControlFilter::zeroed(&quadrature[0]), ControlFilter::zeroed(&quadrature[1])],
             control_phase: 0,
             held: 1.0,
             control: ControlFilter::new(&Self::lowpass(20.0, f64::from(0.707f32), fs)),
             envelope: 0.0,
+            curve_samples: Self::curve_samples(params),
         }
     }
 
@@ -915,15 +935,20 @@ impl DynamicRun {
         let fresh = Self::new(params, fs);
         self.fs = fs;
         self.detector = fresh.detector;
+        self.detector_filter.set(&fresh.detector);
         self.component = fresh.component;
+        self.curve_samples = fresh.curve_samples;
         self.quadrature = fresh.quadrature;
+        self.quadrature_filter[0].set(&fresh.quadrature[0]);
+        self.quadrature_filter[1].set(&fresh.quadrature[1]);
         self.control.set(&Self::lowpass(20.0, f64::from(0.707f32), fs));
     }
 
     fn reset(&mut self) {
-        self.detector_state = [0.0; 2];
+        self.detector_filter.reset_zero();
         self.component_state = [[0.0; 2]; MAX_CHANNELS];
-        self.quadrature_state = [[0.0; 2]; 2];
+        self.quadrature_filter[0].reset_zero();
+        self.quadrature_filter[1].reset_zero();
         self.control_phase = 0;
         self.held = 1.0;
         self.control.prime(&Self::lowpass(20.0, f64::from(0.707f32), self.fs), 1.0);
@@ -957,28 +982,44 @@ impl DynamicRun {
         output
     }
 
-    fn curve(params: &DynamicFilter, level: f64) -> f64 {
-        const POINTS: usize = 44;
-        const STEP: f64 = 100.0 / 43.0;
-        let slope = if params.ratio >= 9.9 { -1.0 } else { 1.0 / params.ratio.clamp(0.1, 10.0) - 1.0 };
-        let lo = params.range_db.min(0.0);
-        let hi = params.range_db.max(0.0);
-        let sample = |i: usize| {
-            let level_db = -100.0 + STEP * i.min(POINTS - 1) as f64;
-            let gain_db = ((level_db - params.threshold_db) * slope).clamp(lo, hi);
-            libm::exp(gain_db * core::f64::consts::LN_10 / 20.0)
-        };
-        let db = 20.0 * libm::log10(level.clamp(1e-5, 1.0));
-        let x = ((db + 100.0) * 0.43).clamp(0.0, 43.0);
-        let i = x as usize;
-        let t = x - i as f64;
+    /// This table depends only on the configured law, not the detector
+    /// level. Build it at construction and automation updates, retaining the
+    /// original Float32 grid accumulation and exponential rounding.
+    fn curve_samples(params: &DynamicFilter) -> [f32; DYNAMIC_CURVE_POINTS] {
+        const STEP: f32 = 100.0 / 43.0;
+        // ToneMeister builds and evaluates this spline entirely in
+        // Float32. In particular, it does not clamp the polynomial result:
+        // the tiny rounding overshoot of a nominally flat segment is part
+        // of the value written to the 20 Hz control filter.
+        let ratio = params.ratio as f32;
+        let slope = if ratio >= 9.9 { -1.0 } else { 1.0 / ratio.clamp(0.1, 10.0) - 1.0 };
+        let lo = (params.range_db as f32).min(0.0);
+        let hi = (params.range_db as f32).max(0.0);
+        let threshold = params.threshold_db as f32;
+        let mut samples = [0.0f32; DYNAMIC_CURVE_POINTS];
+        let mut level_db = -100.0f32;
+        for sample in &mut samples {
+            let gain_db = ((level_db - threshold) * slope).clamp(lo, hi);
+            *sample = libm::expf(gain_db * (core::f32::consts::LN_10 / 20.0));
+            level_db += STEP;
+        }
+        samples
+    }
+
+    fn curve(&self, level: f64) -> f32 {
+        let samples = &self.curve_samples;
+        let db = 20.0 * libm::log10f((level as f32).clamp(1e-5, 1.0));
+        let x = ((db + 100.0) * 0.43).max(0.0);
+        let raw_index = x as usize;
+        let i = raw_index.min(43);
+        let t = x - raw_index as f32;
         let (previous, current, next, next2) =
-            (sample(i.saturating_sub(1)), sample(i), sample((i + 1).min(43)), sample((i + 2).min(43)));
-        let a = 0.5 * current - previous / 6.0 - 0.5 * next + next2 / 6.0;
-        let b = -current + 0.5 * previous + 0.5 * next;
-        let c = -0.5 * previous + 0.5 * next;
-        let d = (previous + 4.0 * current + next) / 6.0;
-        (((a * t + b) * t + c) * t + d).clamp(libm::exp(lo * core::f64::consts::LN_10 / 20.0), 1.0)
+            (samples[i.saturating_sub(1)], samples[i], samples[(i + 1).min(43)], samples[(i + 2).min(43)]);
+        let a = libm::fmaf(1.0 / 6.0, next2, libm::fmaf(-0.5, next, libm::fmaf(-1.0 / 6.0, previous, 0.5 * current)));
+        let b = libm::fmaf(0.5, next, libm::fmaf(0.5, previous, -current));
+        let c = libm::fmaf(0.5, next, libm::fmaf(-0.5, previous, 0.0));
+        let d = libm::fmaf(1.0 / 6.0, next, libm::fmaf(1.0 / 6.0, previous, (2.0 / 3.0) * current));
+        libm::fmaf(t, libm::fmaf(t, libm::fmaf(t, a, b), c), d)
     }
 
     /// The side-chain sample: the mean of the selected channels.
@@ -1007,35 +1048,49 @@ impl DynamicRun {
         if at.params.smooth {
             // Explicit attack/release: a block envelope on the detector.
             let mut sum_sq = 0.0;
-            for i in 0..frames {
-                let input = Self::sidechain(at, bufs, n, sidechains, i);
-                let detected = Self::step_f32(&self.detector, &mut self.detector_state, input as f32);
-                sum_sq += f64::from(detected) * f64::from(detected);
+            let mut from = 0;
+            while from < frames {
+                let len = (frames - from).min(CONTROL_CHUNK);
+                let mut detected = [0.0f32; CONTROL_CHUNK];
+                for (k, sample) in detected.iter_mut().enumerate().take(len) {
+                    *sample = Self::sidechain(at, bufs, n, sidechains, from + k) as f32;
+                }
+                self.detector_filter.run(&mut detected[..len]);
+                for &sample in &detected[..len] {
+                    sum_sq += f64::from(sample) * f64::from(sample);
+                }
+                from += len;
             }
             let measured = core::f64::consts::SQRT_2 * libm::sqrt(sum_sq / frames as f64);
             let time_ms = if measured > self.envelope { at.params.attack_ms } else { at.params.release_ms };
             let coefficient =
                 if time_ms <= 0.0 { 0.0 } else { libm::exp(-(frames as f64) / (time_ms * self.fs / 1_000.0)) };
             self.envelope += (1.0 - coefficient) * (measured - self.envelope);
-            self.held = Self::curve(&at.params, self.envelope) as f32;
+            self.held = self.curve(self.envelope);
         }
         let mut gain = [0.0f32; CONTROL_CHUNK];
         let mut from = 0;
         while from < frames {
             let len = (frames - from).min(CONTROL_CHUNK);
-            for (k, held) in gain.iter_mut().enumerate().take(len) {
-                if !at.params.smooth {
-                    let input = Self::sidechain(at, bufs, n, sidechains, from + k);
-                    let detected = Self::step_f32(&self.detector, &mut self.detector_state, input as f32);
-                    let a = Self::step_f32(&self.quadrature[0], &mut self.quadrature_state[0], detected);
-                    let b = Self::step_f32(&self.quadrature[1], &mut self.quadrature_state[1], detected);
+            if !at.params.smooth {
+                for (k, sample) in gain.iter_mut().enumerate().take(len) {
+                    *sample = Self::sidechain(at, bufs, n, sidechains, from + k) as f32;
+                }
+                self.detector_filter.run(&mut gain[..len]);
+                let mut a = gain;
+                let mut b = gain;
+                self.quadrature_filter[0].run(&mut a[..len]);
+                self.quadrature_filter[1].run(&mut b[..len]);
+                for k in 0..len {
                     if self.control_phase == 0 {
-                        self.envelope = f64::from(libm::sqrtf(a * a + b * b));
-                        self.held = Self::curve(&at.params, self.envelope) as f32;
+                        self.envelope = f64::from(libm::sqrtf(a[k] * a[k] + b[k] * b[k]));
+                        self.held = self.curve(self.envelope);
                     }
                     self.control_phase = (self.control_phase + 1) & 15;
+                    gain[k] = self.held;
                 }
-                *held = self.held;
+            } else {
+                gain[..len].fill(self.held);
             }
             self.control.run(&mut gain[..len]);
             for (c, buf) in bufs.iter_mut().enumerate().take(n) {
@@ -1109,6 +1164,22 @@ impl ControlFilter {
         filter
     }
 
+    /// A freshly reset platform filter with the section installed and no
+    /// priming. ToneMeister uses this for its detector and analytic branches.
+    fn zeroed(section: &Section) -> ControlFilter {
+        let mut filter = ControlFilter {
+            coefficients: [0.0; 5],
+            b: [0.0; 3],
+            a: [0.0; 2],
+            d: [0.0; 8],
+            h: [0.0; 8],
+            z: [0.0; 2],
+            history: [0.0; 4],
+        };
+        filter.install(Self::rounded(section));
+        filter
+    }
+
     fn rounded(section: &Section) -> [f64; 5] {
         [section.b0, section.b1, section.b2, section.a1, section.a2].map(|v| f64::from(v as f32))
     }
@@ -1131,6 +1202,11 @@ impl ControlFilter {
         if c != self.coefficients {
             self.install(c);
         }
+    }
+
+    fn reset_zero(&mut self) {
+        self.z = [0.0; 2];
+        self.history = [0.0; 4];
     }
 
     fn install(&mut self, c: [f64; 5]) {
@@ -1761,11 +1837,27 @@ mod tests {
             sidechain_mask: 1,
             params: DynamicFilter {
                 kind,
-                range_db: if kind == DynamicKind::Notch { -12.0 } else { -3.6 },
-                frequency_hz: if kind == DynamicKind::Notch { 1_000.0 } else { 9_500.0 },
+                range_db: match kind {
+                    DynamicKind::Notch => -12.0,
+                    DynamicKind::LowShelf => 18.0,
+                    DynamicKind::HighShelf => -3.6,
+                },
+                frequency_hz: match kind {
+                    DynamicKind::Notch => 1_000.0,
+                    DynamicKind::LowShelf => 400.0,
+                    DynamicKind::HighShelf => 9_500.0,
+                },
                 quality: 2.0,
-                ratio: if kind == DynamicKind::Notch { 4.0 } else { 3.0 },
-                threshold_db: if kind == DynamicKind::Notch { -20.0 } else { -29.67 },
+                ratio: match kind {
+                    DynamicKind::Notch => 4.0,
+                    DynamicKind::LowShelf => 2.5,
+                    DynamicKind::HighShelf => 3.0,
+                },
+                threshold_db: match kind {
+                    DynamicKind::Notch => -20.0,
+                    DynamicKind::LowShelf => -14.695,
+                    DynamicKind::HighShelf => -29.67,
+                },
                 attack_ms: 20.0,
                 release_ms: 100.0,
                 smooth: false,
@@ -1789,7 +1881,7 @@ mod tests {
 
     #[test]
     fn dynamic_filters_roundtrip_and_follow_level() {
-        for kind in [DynamicKind::Notch, DynamicKind::HighShelf] {
+        for kind in [DynamicKind::Notch, DynamicKind::LowShelf, DynamicKind::HighShelf] {
             let p = dynamic_filter_params(kind);
             assert_eq!(Params::decode(&p.encode(), 1, 48_000.0).unwrap(), p);
         }
@@ -1802,6 +1894,11 @@ mod tests {
         let shelf = dynamic_filter_params(DynamicKind::HighShelf);
         assert!(run_filter(shelf.clone(), 1_000.0, 1.0).abs() < 0.15);
         assert!(run_filter(shelf, 12_000.0, 1.0) < -3.0);
+        let low = dynamic_filter_params(DynamicKind::LowShelf);
+        let low_band = run_filter(low.clone(), 100.0, 1e-3);
+        let high_band = run_filter(low, 4_000.0, 1e-3);
+        assert!(low_band > 12.0);
+        assert!(high_band < low_band - 5.0);
     }
 
     #[test]
@@ -1849,20 +1946,24 @@ mod tests {
         let mut signal = tone(1_000.0, 1.0, 512);
         run.process(&at, &mut [&mut signal], 512);
 
-        let detector_state = run.detector_state;
+        let detector_history = run.detector_filter.history;
         let component_state = run.component_state;
-        let quadrature_state = run.quadrature_state;
+        let quadrature_history = [run.quadrature_filter[0].history, run.quadrature_filter[1].history];
         let control = run.control.history;
         let phase = run.control_phase;
         let held = run.held;
         let envelope = run.envelope;
 
+        let original_curve = run.curve_samples;
         let mut moved = at.params;
         moved.frequency_hz = 1_200.0;
+        moved.threshold_db -= 6.0;
         run.reconfigure(&moved, 48_000.0);
-        assert_eq!(run.detector_state, detector_state);
+        assert_ne!(run.curve_samples, original_curve);
+        assert_eq!(run.curve_samples, DynamicRun::new(&moved, 48_000.0).curve_samples);
+        assert_eq!(run.detector_filter.history, detector_history);
         assert_eq!(run.component_state, component_state);
-        assert_eq!(run.quadrature_state, quadrature_state);
+        assert_eq!([run.quadrature_filter[0].history, run.quadrature_filter[1].history], quadrature_history);
         assert_eq!(run.control.history, control);
         assert_eq!(run.control_phase, phase);
         assert_eq!(run.held, held);
@@ -1877,5 +1978,22 @@ mod tests {
         let mut y = [0.0f32; 5];
         s.process(0, &x, &mut y);
         assert!(y.iter().all(|v| v.is_finite()));
+    }
+
+    /// A hot program is filtered, not limited: the installed units run
+    /// linear at +30 dBFS, so only garbage meets the input bound.
+    #[test]
+    fn hot_input_is_not_limited() {
+        let fs = 48_000.0;
+        let mut s = PreStage::new(params(&[hp2(60.0, fs)], 1.0));
+        let mut q = PreStage::new(params(&[hp2(60.0, fs)], 1.0));
+        let x: Vec<f32> = (0..4800).map(|i| (i as f32 * 0.13).sin()).collect();
+        let hot: Vec<f32> = x.iter().map(|v| v * 32.0).collect();
+        let (mut y, mut z) = (vec![0.0f32; x.len()], vec![0.0f32; x.len()]);
+        s.process(0, &x, &mut y);
+        q.process(0, &hot, &mut z);
+        for (a, b) in y.iter().zip(z.iter()) {
+            assert!((a * 32.0 - b).abs() <= 1e-4 * b.abs().max(1.0), "{a} {b}");
+        }
     }
 }

@@ -165,6 +165,8 @@ pub struct Tuning {
     pub refusals: Vec<crate::error::Diagnostic>,
     pub selection: Selection,
     pub graph_name: Option<String>,
+    pub lsid: Option<crate::lsid::Companion>,
+    pub eliminated_controls: Vec<String>,
     /// Boxes in processing order.
     pub chain: Vec<Stage>,
     pub protection: Protection,
@@ -289,6 +291,15 @@ impl Tuning {
             None => None,
         };
 
+        let eliminated_controls = crate::lsid::eliminate_dbcontrol(&graph, &strip, props.as_ref())?;
+        for name in &eliminated_controls {
+            diags.info(
+                "dbcontrol-eliminated",
+                name,
+                "zero audio/control/parameter/property connectivity proven; orphan eliminated",
+            );
+        }
+
         // The protection unit: exactly one known protection box.
         let prot: Vec<(&dspg::GraphBox, UnitKind)> = graph
             .boxes
@@ -377,6 +388,10 @@ impl Tuning {
         }
 
         let lanes = analysis::lanes_into(&graph, &Endpoint { node: pbox.name.clone(), port: 0 })?;
+        let lsid = crate::lsid::load(&graph, &strip, &pbox.name, lanes.len(), diags)?;
+        if lsid.is_some() && kind != UnitKind::Lsm2 {
+            return Err(Error::format("lsid", "estimator companion requires LSM2"));
+        }
         let block_size = wire_into(&graph, &pbox.name, 0)
             .and_then(|w| graph.wire_format(w))
             .and_then(|f: &FormatSpec| f.block_size.as_ref())
@@ -449,7 +464,7 @@ impl Tuning {
             }
             Some(s)
         } else {
-            if kind == UnitKind::Atsp || kind == UnitKind::Lsm2 {
+            if kind == UnitKind::Lsm2 {
                 diags.info(
                     "params-raw-ids",
                     &pbox.name,
@@ -524,6 +539,8 @@ impl Tuning {
             speaker_id_source,
             refusals: Vec::new(),
             graph_name: graph.name.clone(),
+            lsid,
+            eliminated_controls,
             selection: sel,
             chain,
             protection: Protection {

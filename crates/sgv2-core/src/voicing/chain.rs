@@ -11,6 +11,9 @@
 //!
 //! * [`Kind::NonFinite`]: the graph's non-finite protection (a non-finite
 //!   sample becomes silence);
+//! * [`Kind::Sum`]: the graph's `sum` builtin: its channels are its inputs,
+//!   input after input, and output channel `c` adds channel `c` of every
+//!   input (later boxes name only its first `width` channels);
 //! * [`Kind::Gain`]: the graph's gain builtin. Parameter 0 is the gain in
 //!   dB, 1 the mute; the graph's volume and balance parameters drive them
 //!   ([`Chain::set_param`]);
@@ -71,6 +74,8 @@ pub enum GraphParam {
     /// Left and right balance, dB (`lbal`, `rbal`).
     BalanceLeft,
     BalanceRight,
+    /// Lid state: closed (0) or open (1).
+    Lid,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -159,10 +164,26 @@ pub struct Tone {
     pub dynamic_automation: Vec<DynamicToneAutomation>,
 }
 
+/// A precompiled group-bypass mask of one filter box.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToneVariant {
+    pub mask: u32,
+    pub tone: Tone,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Kind {
     NonFinite,
+    /// The graph's `sum` builtin: output channels (each input's width).
+    Sum(usize),
     Gain,
+    /// Zero audio ports; input values sum into published parameter 0.
+    ParameterAdd(Vec<f64>),
+    /// Filter alternatives selected by group-bypass parameter 1.
+    ToneGroups {
+        default_mask: u32,
+        variants: Vec<ToneVariant>,
+    },
     /// One entry per box channel.
     Tone(Tone),
     Comp(Dynamics),
@@ -195,11 +216,30 @@ pub enum Kind {
     Bypass,
 }
 
+impl Kind {
+    pub(crate) fn tones(&self) -> impl Iterator<Item = &Tone> {
+        let tone = if let Self::Tone(tone) = self { Some(tone) } else { None };
+        let variants = if let Self::ToneGroups { variants, .. } = self { variants.as_slice() } else { &[] };
+        tone.into_iter().chain(variants.iter().map(|v| &v.tone))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct NodeSpec {
     pub kind: Kind,
     /// Per box channel, its source.
     pub inputs: Vec<Source>,
+}
+
+impl NodeSpec {
+    /// The channels later boxes may name: a sum's output width, else the
+    /// box's width.
+    pub fn out_width(&self) -> usize {
+        match self.kind {
+            Kind::Sum(out) => out.min(self.inputs.len()),
+            _ => self.inputs.len(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -234,14 +274,36 @@ impl Spec {
         }
         let ok = |s: &Source, before: usize| match *s {
             Source::Program(c) => c < self.program_channels,
-            Source::Node(n, c) => n < before && c < self.nodes[n].inputs.len(),
+            Source::Node(n, c) => n < before && c < self.nodes[n].out_width(),
         };
         for (n, node) in self.nodes.iter().enumerate() {
             let w = node.inputs.len();
-            if w == 0 || w > MAX_CHANNELS {
+            if (w == 0 && !matches!(node.kind, Kind::ParameterAdd(_))) || w > MAX_CHANNELS {
                 return Err(SpecError::BadWidth { node: n });
             }
-            if let Kind::Tone(tone) = &node.kind {
+            if let Kind::Sum(out) = node.kind {
+                if out == 0 || w % out != 0 {
+                    return Err(SpecError::BadWidth { node: n });
+                }
+            }
+            match &node.kind {
+                Kind::ParameterAdd(values)
+                    if w != 0 || values.is_empty() || values.len() > 16 || values.iter().any(|v| !v.is_finite()) =>
+                {
+                    return Err(SpecError::BadParams { node: n })
+                }
+                Kind::ToneGroups { default_mask, variants }
+                    if variants.is_empty()
+                        || variants.len() > 16
+                        || !variants.iter().any(|v| v.mask == *default_mask)
+                        || variants.iter().any(|v| v.mask > 1023)
+                        || variants.iter().enumerate().any(|(i, v)| variants[..i].iter().any(|u| u.mask == v.mask)) =>
+                {
+                    return Err(SpecError::BadParams { node: n })
+                }
+                _ => {}
+            }
+            for tone in node.kind.tones() {
                 let all_channels = if w == 32 { u32::MAX } else { (1u32 << w) - 1 };
                 if tone.channels.len() != w
                     || tone.channels.iter().any(|c| !c.sections().iter().all(|s| s.stable()) || !c.gain.is_finite())
@@ -449,7 +511,13 @@ fn apply_dynamic_tone_automation(
 }
 
 enum Run {
+    ParameterAdd(Vec<f64>),
+    ToneGroups {
+        runs: Vec<(u32, Run)>,
+        active: usize,
+    },
     NonFinite,
+    Sum(usize),
     Gain {
         gain_db: f64,
         mute: bool,
@@ -483,7 +551,13 @@ impl Run {
     fn new(kind: &Kind, width: usize, fs: f64) -> Run {
         match kind {
             Kind::NonFinite => Run::NonFinite,
+            Kind::Sum(out) => Run::Sum(*out),
             Kind::Gain => Run::Gain { gain_db: 0.0, mute: false, scale: 1.0 },
+            Kind::ParameterAdd(values) => Run::ParameterAdd(values.clone()),
+            Kind::ToneGroups { default_mask, variants } => Run::ToneGroups {
+                active: variants.iter().position(|v| v.mask == *default_mask).unwrap_or(0),
+                runs: variants.iter().map(|v| (v.mask, Run::new(&Kind::Tone(v.tone.clone()), width, fs))).collect(),
+            },
             Kind::Tone(tone) => {
                 let mut p = PreParams::identity(width);
                 p.channel[..width].copy_from_slice(&tone.channels[..width]);
@@ -525,6 +599,22 @@ impl Run {
 
     fn set(&mut self, id: u32, v: f64) {
         match self {
+            Run::ParameterAdd(values) if v.is_finite() => {
+                if let Some(slot) = values.get_mut(id as usize) {
+                    *slot = v;
+                }
+            }
+            Run::ToneGroups { runs, active } => {
+                if id == 1 && v.is_finite() && v >= 0.0 {
+                    if let Some(index) = runs.iter().position(|(mask, _)| f64::from(*mask) == v) {
+                        *active = index;
+                    }
+                } else {
+                    for (_, run) in runs {
+                        run.set(id, v);
+                    }
+                }
+            }
             Run::Gain { gain_db, mute, scale } => {
                 match id {
                     // a gain box only ever attenuates: it never adds drive
@@ -555,6 +645,7 @@ impl Run {
 
     fn get(&self, id: u32) -> Option<f64> {
         match self {
+            Run::ParameterAdd(values) if id == 0 => Some(values.iter().sum()),
             Run::Volt(r) if id == 100 => Some(r.gain_db()),
             _ => None,
         }
@@ -562,6 +653,11 @@ impl Run {
 
     fn reset(&mut self) {
         match self {
+            Run::ToneGroups { runs, .. } => {
+                for (_, run) in runs {
+                    run.reset();
+                }
+            }
             Run::Filters { stage, .. } | Run::Comp(stage) => stage.reset(),
             Run::Xtc(r) => r.reset(),
             Run::Vbass(r) => r.reset(),
@@ -581,6 +677,24 @@ impl Run {
     /// `x` in, `y` out (both the box's width).
     fn process(&mut self, x: &[Vec<f32>], y: &mut [Vec<f32>], frames: usize) {
         match self {
+            Run::ParameterAdd(_) => {}
+            Run::ToneGroups { runs, active } => runs[*active].1.process(x, y, frames),
+            // input 0 plus each later input, channel by channel
+            Run::Sum(out) => {
+                let out = *out;
+                for (c, o) in y.iter_mut().enumerate() {
+                    if c >= out {
+                        o[..frames].fill(0.0);
+                        continue;
+                    }
+                    o[..frames].copy_from_slice(&x[c][..frames]);
+                    for input in x.iter().skip(out + c).step_by(out) {
+                        for (b, a) in o[..frames].iter_mut().zip(input[..frames].iter()) {
+                            *b += *a;
+                        }
+                    }
+                }
+            }
             Run::NonFinite => {
                 for (i, o) in x.iter().zip(y.iter_mut()) {
                     for (a, b) in i[..frames].iter().zip(o[..frames].iter_mut()) {
@@ -675,12 +789,15 @@ impl Chain {
     /// Builds the chain; `None` if the spec does not check.
     pub fn new(spec: Spec, fs: f64, max_frames: usize) -> Option<Chain> {
         spec.check().ok()?;
+        if spec.nodes.iter().any(|node| matches!(&node.kind, Kind::Vareq(p) if !p.transitions_valid_at(fs))) {
+            return None;
+        }
         if !fs.is_finite()
             || fs <= 0.0
             || spec
                 .nodes
                 .iter()
-                .any(|node| matches!(&node.kind, Kind::Tone(tone) if tone.dynamic.iter().any(|d| !d.params.valid(fs))))
+                .any(|node| node.kind.tones().any(|tone| tone.dynamic.iter().any(|d| !d.params.valid(fs))))
         {
             return None;
         }
@@ -844,6 +961,37 @@ mod tests {
         c.process(&[&l, &r], &mut lanes, 64);
         assert_eq!(lanes[0][5], 0.0);
         assert!((lanes[1][5] + 0.025).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sum_adds_its_inputs_and_exposes_only_its_output() {
+        // stereo program summed to mono, then fanned to two lanes
+        let spec = Spec {
+            program_channels: 2,
+            nodes: vec![
+                NodeSpec { kind: Kind::Sum(1), inputs: vec![Source::Program(0), Source::Program(1)] },
+                NodeSpec { kind: Kind::NonFinite, inputs: vec![Source::Node(0, 0)] },
+            ],
+            outputs: vec![Source::Node(1, 0), Source::Node(1, 0)],
+            links: vec![],
+            relays: vec![],
+        };
+        let mut c = Chain::new(spec.clone(), 48_000.0, 8).unwrap();
+        let l = [0.5f32; 8];
+        let r = [-0.125f32; 8];
+        let mut o = [[0.0f32; 8]; 2];
+        let mut it = o.iter_mut();
+        let mut lanes: [&mut [f32]; 2] = core::array::from_fn(|_| &mut it.next().unwrap()[..]);
+        c.process(&[&l, &r], &mut lanes, 8);
+        assert_eq!(lanes[0][3], 0.375);
+        assert_eq!(lanes[1][7], 0.375);
+        // a later box may not name a sum's input-only channel
+        let mut bad = spec.clone();
+        bad.nodes[1].inputs[0] = Source::Node(0, 1);
+        assert_eq!(bad.check(), Err(SpecError::BadSource { node: 1, channel: 0 }));
+        let mut bad = spec;
+        bad.nodes[0].kind = Kind::Sum(0);
+        assert_eq!(bad.check(), Err(SpecError::BadWidth { node: 0 }));
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! lsm2 against the behaviour specification's equations, on synthetic
 //! parameters only (no Mac's tuning appears here).
 
+use sgv2_core::blob::Pod;
 use sgv2_core::lsm2::{self, ChannelParams, Params, Unit, BANDS};
 use sgv2_core::{dsp, HandOff, Io, ProtectionUnit, Telemetry};
 
@@ -573,4 +574,38 @@ fn generic_flags_switch_a_model_to_the_family_row_at_run_time() {
     // the impedance block is accepted and inert
     assert!(p.set(vel(0, 0, 1), 9.0));
     assert_eq!(p.ch[0].family[0], 3.0);
+}
+
+#[test]
+fn ordinary_blob_decoding_keeps_stream_geometry_and_runtime_budgets() {
+    let mut p = params();
+    // Valid initial geometry in both the 44.1/48 and 88.2/96 kHz families.
+    p.filterbank_latency_ms = 10.0 / 3.0;
+    p.speaker_response_lookahead_ms = 2.0 / 3.0;
+    let blob = sgv2_core::blob::build(sgv2_core::UnitKind::Lsm2, p.channels, 0, p.sample_rate, p.as_bytes());
+    for rate in [0, 44_100, 88_200] {
+        let mut expected = p;
+        if rate != 0 {
+            expected.sample_rate = rate;
+        }
+        let mut decoded = Unit::from_blob_at_rate(&blob, rate).unwrap();
+        assert!(decoded.companion().is_none());
+        assert!(decoded.estimator().is_none());
+        assert!(decoded.model_generation().is_none());
+        let budgets = [50.0, 0.4, 50.0, 50.0];
+        decoded.set_runtime_budgets(budgets);
+        expected.runtime_budget_present = 1;
+        expected.runtime_budget_w = budgets;
+        let mut direct = Unit::new(expected);
+        assert!(!decoded.is_failsafe(), "rate {rate}: {:?}", Unit::init_error(&expected));
+        assert!(!direct.is_failsafe());
+        assert_eq!(decoded.latency_frames(), direct.latency_frames());
+        let input = vec![sine(1000.0, 0.8, 0.1), sine(200.0, 1.0, 0.1)];
+        let want = run(&mut direct, &input, 256);
+        let got = run(&mut decoded, &input, 31);
+        assert!(want.iter().flatten().any(|&sample| sample != 0.0));
+        for (a, b) in got.iter().flatten().zip(want.iter().flatten()) {
+            assert_eq!(a.to_bits(), b.to_bits());
+        }
+    }
 }

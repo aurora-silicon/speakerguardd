@@ -32,3 +32,5 @@ pub mod vbass;
 pub mod volt;
 pub mod volume;
 pub mod xtc;
+
+mod controls;

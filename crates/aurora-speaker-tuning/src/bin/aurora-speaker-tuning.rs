@@ -6,7 +6,7 @@
 //! ```text
 //! aurora-speaker-tuning dump     [--json] [--speaker-id N] [SOURCE]
 //! aurora-speaker-tuning validate [--json] [--speaker-id N] [SOURCE]
-//! aurora-speaker-tuning compile  [--speaker-id N] [--board B [--unit-id U]] [--development] [--voicing-pre | --prestage identity|tuning] [SOURCE | --bundle PATH] -o BLOB
+//! aurora-speaker-tuning compile  [--speaker-id N] [--board B [--unit-id U]] [--development] [--voicing-pre] [--prestage identity|tuning] [SOURCE | --bundle PATH] -o BLOB
 //! aurora-speaker-tuning identify [--json] [SOURCE]   (the bundle's identity, for provisioning)
 //! aurora-speaker-tuning blob     BLOB [BLOB]     (decode; with two, diff field by field)
 //! aurora-speaker-tuning units    [--json]
@@ -65,7 +65,7 @@ struct Args {
 fn usage() -> ! {
     eprintln!(
         "usage: aurora-speaker-tuning {{dump|validate}} [--json] [--speaker-id N] [PATH | --tunings-root DIR --aid N]\n       \
-         aurora-speaker-tuning compile [--speaker-id N] [--board B [--unit-id U]] [--development] [--voicing-pre | --prestage identity|tuning] [--bundle PATH | --tunings-root DIR --aid N] -o BLOB\n       \
+         aurora-speaker-tuning compile [--speaker-id N] [--board B [--unit-id U]] [--development] [--voicing-pre] [--prestage identity|tuning] [--bundle PATH | --tunings-root DIR --aid N] -o BLOB\n       \
          aurora-speaker-tuning plan [--speaker-id N] [PATH | --tunings-root DIR --aid N]\n       \
          aurora-speaker-tuning identify [--json] [PATH | --tunings-root DIR --aid N]\n       \
          aurora-speaker-tuning blob BLOB [BLOB]\n       \
@@ -122,7 +122,7 @@ fn parse_args() -> Args {
                     Some("identity") => compile::PreStageMode::Identity,
                     Some("tuning") => compile::PreStageMode::Tuning,
                     _ => usage(),
-                }
+                };
             }
             "-o" | "--output" => a.out = Some(it.next().map(PathBuf::from).unwrap_or_else(|| usage())),
             p if !p.starts_with('-') && a.path.is_none() => a.path = Some(PathBuf::from(p)),
@@ -132,7 +132,7 @@ fn parse_args() -> Args {
     }
     // A unit ID names the Mac an offline compile is for; it never stands
     // in for the running Mac's device tree.
-    if a.voicing_pre && a.cmd != "compile" {
+    if (a.voicing_pre || a.prestage != compile::PreStageMode::default()) && a.cmd != "compile" {
         usage();
     }
     if a.unit_id.is_some() && (a.board.is_none() || a.cmd != "compile") {
@@ -290,6 +290,14 @@ fn human(t: &Tuning) {
                 ))
             );
         }
+    } else if p.kind == aurora_speaker_tuning::tuning::UnitKind::Atsp {
+        println!("\nsaved state of {} (atsp, spec 2 names):", p.box_name);
+        for s in &p.state.sections {
+            for (i, v) in &s.params {
+                let name = aurora_speaker_tuning::names::atsp(s.scope, *i).map_or("unnamed", |n| n.name);
+                println!("  scope {} element {} ID {i:>2} {name} = {v}", s.scope, s.element);
+            }
+        }
     } else {
         println!("\nsaved state of {} (raw IDs; TODO(SPEC) names):", p.box_name);
         for s in &p.state.sections {
@@ -329,8 +337,8 @@ fn decode_blob(p: &std::path::Path) -> String {
             .map(|x| trim(format!("{x:#?}"), x.channels))
             .map_err(|e| format!("{e:?}"))
     } else if unit == sgv2_core::UnitKind::Lsm2 as u32 {
-        sgv2_core::lsm2::Params::from_blob(&bytes)
-            .map(|x| trim(format!("{x:#?}"), x.channels))
+        sgv2_core::lsm2::companion::decode_blob(&bytes)
+            .map(|(x, companion)| format!("{}\ncompanion: {companion:#?}", trim(format!("{x:#?}"), x.channels)))
             .map_err(|e| format!("{e:?}"))
     } else {
         sgv2_core::atsp::Params::from_blob(&bytes).map(|x| format!("{x:#?}")).map_err(|e| format!("{e:?}"))

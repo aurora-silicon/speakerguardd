@@ -89,9 +89,17 @@ pub fn spec(lanes: usize) -> Spec {
             true_peak: false,
             saturation_mode: 0,
             saturation_flavor: 0,
-            saturation_mix: 0.0,
+            saturation_ceiling_db: 0.0,
+            deesser_hz: 0.0,
+            deesser_db: 0.0,
+            deesser_q: 0.0,
+            input_gain_db: 0.0,
+            output_gain_db: 0.0,
+            highpass_order: 0,
+            highpass_hz: 0.0,
+            highpass_location: 0,
         })),
-        Kind::Buzz(Box::new(voicing::buzz::Params)),
+        Kind::Buzz(Box::default()),
         Kind::Cdelay(Box::new(voicing::cdelay::Params { channels: 2, delay_frames: [0; MAX_CHANNELS] })),
         Kind::Pchr(Box::new(voicing::pchr::Params {
             channels: 2.0,
@@ -169,5 +177,5 @@ pub fn lowflow_params() -> voicing::lowflow::Params {
     models[0] = model;
     models[0].pressure_response[0] = 1.0;
     models[0].tweeter_response[0] = 1.0;
-    Params { model_count: 1, link_channel_energies: true, latency_frames: 256, models }
+    Params { model_count: 1, link_channel_energies: true, latency_frames: 256, conservative_fallback: false, models }
 }

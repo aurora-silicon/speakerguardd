@@ -25,7 +25,8 @@ const MAX_DETECTOR_FILTERS: usize = 10;
 const MAX_DETECTOR_WINDOW: usize = 1921;
 const QUADRATURE_STAGES: usize = 4;
 const MAX_GAIN_SRC_TAPS: usize = 225;
-const INPUT_BOUND: f32 = 16.0;
+/// The pre-stage bound (+120 dBFS): garbage only, never a program level.
+const INPUT_BOUND: f32 = crate::prestage::INPUT_BOUND;
 const CURVE_POINTS: usize = 11;
 
 /// Processing selected for one analysis band.
@@ -356,13 +357,14 @@ struct DetectorPath {
 }
 
 #[derive(Clone, Copy)]
-struct LegacyStage {
+struct HalfStage {
+    low: Path,
     high: Path,
-    allpass: Path,
+    high_sign: f64,
 }
 
-impl LegacyStage {
-    const EMPTY: Self = Self { high: Path::EMPTY, allpass: Path::EMPTY };
+impl HalfStage {
+    const EMPTY: Self = Self { low: Path::EMPTY, high: Path::EMPTY, high_sign: 1.0 };
 }
 
 impl DetectorPath {
@@ -412,6 +414,12 @@ fn push_butter(path: &mut Path, high: bool, n: usize, fc: f64, fs: f64) {
     }
 }
 
+/// The complete Butterworth half of order `n` for the real-waveform
+/// detector, including the first-order section of an odd `n`.  Black-box
+/// (installed unit, steady tones, algorithm 3 and quality 2): an edge whose
+/// Linkwitz-Riley half is odd (order controls 2, 5-6, 9-10) compresses like
+/// the full Butterworth half; dropping its first-order section read up to
+/// 1.4 dB too much compression at that edge, an order-2 edge none at all.
 fn push_detector_butter(path: &mut DetectorPath, high: bool, n: usize, fc: f64, fs: f64) {
     let k = libm::tan(core::f64::consts::PI * fc / fs);
     for i in 0..n / 2 {
@@ -421,8 +429,14 @@ fn push_detector_butter(path: &mut DetectorPath, high: bool, n: usize, fc: f64, 
         let (b0, b1, b2) = if high { (1.0 / d, -2.0 / d, 1.0 / d) } else { (k * k / d, 2.0 * k * k / d, k * k / d) };
         path.push(Section { b0, b1, b2, a1, a2 });
     }
+    if n % 2 != 0 {
+        let d = 1.0 + k;
+        let (b0, b1) = if high { (1.0 / d, -1.0 / d) } else { (k / d, k / d) };
+        path.push(Section { b0, b1, b2: 0.0, a1: (k - 1.0) / d, a2: 0.0 });
+    }
 }
 
+#[cfg(test)]
 /// One side of a Linkwitz-Riley crossover of even order `n`: the Butterworth
 /// of order `n / 2` twice. When `n / 2` is odd the high side is inverted so
 /// that low plus high is an allpass.
@@ -455,6 +469,7 @@ fn push_lr_allpass(path: &mut Path, n: usize, fc: f64, fs: f64) {
     }
 }
 
+#[cfg(test)]
 /// The unit's band tree, measured: the program splits at the middle
 /// crossover first; the low side splits at the lowest crossover and passes
 /// the highest crossover's allpass, the high side splits at the highest and
@@ -479,18 +494,55 @@ fn paths(p: &Params, fs: f64) -> [Path; BANDS] {
     v
 }
 
-/// Split/merge stages used by the quality-1 algorithms.  Each stage keeps the
-/// Linkwitz-Riley high branch and obtains the low branch as `allpass - high`.
-/// Recombination phase-corrects the running low-band sum before adding the
-/// next band.  This is the split/merge realization described by Google's
-/// Apache-2.0 `MultiCrossoverFilter`, specialized here to four bands and the
-/// saved independent crossover orders.
-fn legacy_stages(p: &Params, fs: f64) -> [LegacyStage; XOVERS] {
-    let mut out = [LegacyStage::EMPTY; XOVERS];
+/// Analysis and synthesis each run one Butterworth half. Applying a moving
+/// gain between these halves is not equivalent to the collapsed LR path.
+fn half_stages(p: &Params, fs: f64) -> [HalfStage; XOVERS] {
+    let mut out = [HalfStage::EMPTY; XOVERS];
     for (stage, item) in out.iter_mut().enumerate() {
-        let n = effective_order(p.crossover_order[stage]);
-        push_lr(&mut item.high, true, n, p.crossover_hz[stage], fs);
-        push_lr_allpass(&mut item.allpass, n, p.crossover_hz[stage], fs);
+        let half_order = effective_order(p.crossover_order[stage]) / 2;
+        push_butter(&mut item.low, false, half_order, p.crossover_hz[stage], fs);
+        push_butter(&mut item.high, true, half_order, p.crossover_hz[stage], fs);
+        item.high_sign = if half_order % 2 == 0 { 1.0 } else { -1.0 };
+    }
+    out
+}
+
+fn append_path(output: &mut Path, input: &Path) {
+    for section in &input.section[..input.count] {
+        output.push(*section);
+    }
+}
+
+fn append_half(output: &mut Path, stage: &HalfStage, high: bool) {
+    append_path(output, if high { &stage.high } else { &stage.low });
+    if high && stage.high_sign < 0.0 {
+        output.push(Section { b0: -1.0, ..Section::ID });
+    }
+}
+
+/// Continue each analysis branch independently after its moving gain. The
+/// active crossover halves complete the Linkwitz-Riley branches, while the
+/// nonparticipating full allpasses retain the collapsed bank's neutral path.
+/// Every quality and algorithm uses this one tree. Black-box (installed unit,
+/// quality 1): band 2's gain lands later than a sequential bank whose
+/// lowest crossover runs first would put it (its first two milliseconds read
+/// up to 0.18 dB louder), and algorithm 0's multirate band 0 releases as if
+/// the middle crossover's low half sat ahead of its lowest one; with the
+/// middle-first analysis and the per-band synthesis below, every probe window
+/// matches within 0.03 dB and the neutral bank stays an allpass.
+fn half_synthesis_paths(p: &Params, fs: f64, half: &[HalfStage; XOVERS]) -> [Path; BANDS] {
+    let mut out = [Path::EMPTY; BANDS];
+    let tree: [&[(usize, bool)]; BANDS] =
+        [&[(1, false), (0, false)], &[(1, false), (0, true)], &[(1, true), (2, false)], &[(1, true), (2, true)]];
+    let passing = [2, 2, 0, 0];
+    for (band, path) in out.iter_mut().enumerate() {
+        for &(stage, high) in tree[band] {
+            append_half(path, &half[stage], high);
+        }
+        let stage = passing[band];
+        let mut allpass = Path::EMPTY;
+        push_lr_allpass(&mut allpass, effective_order(p.crossover_order[stage]), p.crossover_hz[stage], fs);
+        append_path(path, &allpass);
     }
     out
 }
@@ -512,6 +564,61 @@ fn detector_paths(p: &Params, fs: f64) -> [DetectorPath; BANDS] {
     push_detector_butter(&mut v[3], true, n[1] / 2, f[1], fs);
     push_detector_butter(&mut v[3], true, n[2] / 2, f[2], fs);
     v
+}
+
+/// Overshoot compensation (parameter 69) is a phase-compensation stage that
+/// sits between a band's detector components and their magnitude.  It is a
+/// cascade of the decramped matched-Z peaks of `tone::peak`, one just inside
+/// each edge of the band, so each band reads louder towards its own edges.
+/// Both components see the same filter, so a steady tone reaches the gain
+/// law `|H(f)|` louder than without the stage.  Placement, width and lift
+/// follow from an order alone, so any saved state compiles without board
+/// data.
+const PHASE_LIFT_DB: f64 = 3.41;
+
+fn phase_edge_ratio(order: f64) -> f64 {
+    1.0 - libm::exp(
+        -0.000_950_566_55 * order * order * order + 0.038_869_36 * order * order - 0.548_316_7 * order + 0.002_123_865,
+    )
+}
+
+fn phase_peak(order: f64, frequency: f64, fs: f64) -> Section {
+    // tone::peak takes the analog quality before its lift is folded in.
+    let lift = libm::pow(10.0, PHASE_LIFT_DB / 40.0);
+    let q = (-0.1 + 0.320_909_08 * order) / lift;
+    let s = super::tone::peak(PHASE_LIFT_DB, frequency.min(0.49 * fs), q, fs);
+    Section { b0: s.b0, b1: s.b1, b2: s.b2, a1: s.a1, a2: s.a2 }
+}
+
+/// Each band builds both of its peaks from one order: the saved order
+/// control (truncated) of its upper edge, or of the last edge for the top
+/// band.  Band 0's stage runs at `band_zero_rate`, the rate its detector
+/// components are picked at; the other bands run at the host rate.
+fn phase_paths(p: &Params, fs: f64, band_zero_rate: f64) -> [DetectorPath; BANDS] {
+    let mut out = [DetectorPath::EMPTY; BANDS];
+    for (b, path) in out.iter_mut().enumerate() {
+        let order = libm::floor(p.crossover_order[b.min(XOVERS - 1)]).clamp(2.0, 20.0);
+        let ratio = phase_edge_ratio(order);
+        let rate = if b == 0 { band_zero_rate } else { fs };
+        if b > 0 {
+            path.push(phase_peak(order, p.crossover_hz[b - 1] / ratio, rate));
+        }
+        if b < XOVERS {
+            path.push(phase_peak(order, p.crossover_hz[b] * ratio, rate));
+        }
+    }
+    out
+}
+
+/// Band 0 of the real-waveform picking detectors (algorithm 3, or quality
+/// 2) feeds its phase stage every second frame; between those frames the
+/// band's level is not refreshed.
+fn phase_band_zero_factor(p: &Params) -> usize {
+    if p.overshoot_compensation && (p.algorithm >= 3 || p.render_quality >= 2) {
+        2
+    } else {
+        1
+    }
 }
 
 #[inline]
@@ -609,22 +716,24 @@ struct QuadratureEnvelope {
 
 impl QuadratureEnvelope {
     const A: [f32; QUADRATURE_STAGES] = [
-        (0.692_387_8_f64 * 0.692_387_8_f64) as f32,
-        (0.936_065_432_295_9_f64 * 0.936_065_432_295_9_f64) as f32,
-        (0.988_229_522_686_f64 * 0.988_229_522_686_f64) as f32,
-        (0.998_748_845_273_7_f64 * 0.998_748_845_273_7_f64) as f32,
+        0.692_387_8_f32 * 0.692_387_8_f32,
+        0.936_065_43_f32 * 0.936_065_43_f32,
+        0.988_229_5_f32 * 0.988_229_5_f32,
+        0.998_748_84_f32 * 0.998_748_84_f32,
     ];
     const B: [f32; QUADRATURE_STAGES] = [
-        (0.402_192_116_242_6_f64 * 0.402_192_116_242_6_f64) as f32,
-        (0.856_171_088_242_f64 * 0.856_171_088_242_f64) as f32,
-        (0.972_290_954_565_1_f64 * 0.972_290_954_565_1_f64) as f32,
-        (0.995_288_479_127_8_f64 * 0.995_288_479_127_8_f64) as f32,
+        0.402_192_12_f32 * 0.402_192_12_f32,
+        0.856_171_1_f32 * 0.856_171_1_f32,
+        0.972_290_93_f32 * 0.972_290_93_f32,
+        0.995_288_5_f32 * 0.995_288_5_f32,
     ];
 
     fn reset(&mut self) {
         *self = Self::default();
     }
 
+    /// The envelope alone (the detector now reads the half-bank components).
+    #[cfg(test)]
     #[inline]
     fn push(&mut self, input: f64) -> f64 {
         let input = input as f32;
@@ -642,15 +751,132 @@ impl QuadratureEnvelope {
     /// envelope above.  Measured against the installed unit's impulse
     /// response, quality 0/1 differs from quality 2 by exactly this allpass
     /// in every band (within 1.3 degrees from 15 Hz to 22 kHz at 48 kHz).
+    #[cfg(test)]
     #[inline]
     fn push_audio(&mut self, input: f64) -> f64 {
-        let input = input as f32;
+        let (delayed_a, b) = self.push_components(input as f32);
+        ((b + delayed_a) as f64) * core::f64::consts::FRAC_1_SQRT_2
+    }
+
+    #[inline]
+    fn push_components(&mut self, input: f32) -> (f32, f32) {
         let b = self.arm_b.push(input, &Self::B, self.phase);
         let a = self.arm_a.push(input, &Self::A, self.phase);
         let delayed_a = self.arm_a_delay;
         self.arm_a_delay = a;
         self.phase ^= 1;
-        ((b + delayed_a) as f64) * core::f64::consts::FRAC_1_SQRT_2
+        (delayed_a, b)
+    }
+}
+
+/// The mode-4 arm law keeps a direct gain and a 50 Hz bilinear low-pass copy.
+/// The difference drives a second quadrature pair; its two components rotate
+/// the audio arms during a gain transition. A bounded power-ratio crossfade
+/// selects the direct or corrected path. This is asymmetric by construction:
+/// on release `gain / lowpass > 1`, so the crossfade clamps to the corrected
+/// path and retains the allpass state that produces the native overshoot.
+#[derive(Clone, Copy)]
+struct Mode4Gain {
+    b: f32,
+    a: f32,
+    previous_input: f32,
+    previous_output: f32,
+    quadrature: QuadratureEnvelope,
+}
+
+#[derive(Clone, Copy, Default)]
+struct Mode4Mix {
+    gain: f32,
+    lowpass: f32,
+    arm_a: f32,
+    arm_b: f32,
+    correction_weight: f32,
+}
+
+impl Mode4Gain {
+    fn new(sample_rate: f64) -> Self {
+        let k = libm::tan(core::f64::consts::PI * 50.0 / sample_rate);
+        let b = (k / (1.0 + k)) as f32;
+        Self {
+            b,
+            a: ((1.0 - k) / (1.0 + k)) as f32,
+            previous_input: 0.0,
+            previous_output: 0.0,
+            quadrature: QuadratureEnvelope::default(),
+        }
+    }
+
+    fn reset(&mut self) {
+        self.previous_input = 0.0;
+        self.previous_output = 0.0;
+        self.quadrature.reset();
+    }
+
+    #[inline]
+    fn step(&mut self, gain: f64) -> Mode4Mix {
+        let gain = gain as f32;
+        let lowpass = libm::fmaf(self.b, gain, libm::fmaf(self.b, self.previous_input, self.a * self.previous_output));
+        self.previous_input = gain;
+        self.previous_output = lowpass;
+        let (arm_a, arm_b) = self.quadrature.push_components(gain - lowpass);
+        let ratio = mode4_ratio(gain, lowpass);
+        let ratio_squared = ratio * ratio;
+        let correction_weight = (1.0 - ratio_squared).clamp(0.0, 1.0);
+        Mode4Mix { gain, lowpass, arm_a, arm_b, correction_weight }
+    }
+}
+
+impl Mode4Mix {
+    /// The bounded crossfade as one real gain: `w * g + (1 - w) * l`.
+    /// Black-box (installed unit, quality 2 and algorithm 3, every band):
+    /// the attack carries the lobe that peaks where the 50 Hz companion is
+    /// twice the gain, and recovery after a short burst follows the
+    /// companion; with it every probe window matches within 0.03 dB.
+    #[inline]
+    fn real_gain(self) -> f64 {
+        let weight = self.correction_weight;
+        f64::from(self.gain * weight + self.lowpass * (1.0 - weight))
+    }
+
+    #[inline]
+    fn apply_real(self, arm_a: f64, arm_b: f64) -> f64 {
+        let gain = self.gain * self.correction_weight + self.lowpass * (1.0 - self.correction_weight);
+        (((arm_a as f32 + arm_b as f32) * gain) * core::f32::consts::FRAC_1_SQRT_2) as f64
+    }
+
+    #[inline]
+    fn apply(self, arm_a: f64, arm_b: f64) -> f64 {
+        let arm_a = arm_a as f32;
+        let arm_b = arm_b as f32;
+        let sum = arm_a + arm_b;
+        let direct = (sum * self.gain) * core::f32::consts::FRAC_1_SQRT_2;
+        let rotated = arm_a * self.arm_a + arm_b * self.arm_b;
+        let corrected = (sum * self.lowpass + rotated) * core::f32::consts::FRAC_1_SQRT_2;
+        let direct_weight = self.correction_weight;
+        (corrected * (1.0 - direct_weight) + direct * direct_weight) as f64
+    }
+}
+
+#[inline]
+fn mode4_ratio(numerator: f32, denominator: f32) -> f32 {
+    if denominator == 0.0 {
+        return if numerator == 0.0 { 0.0 } else { f32::INFINITY };
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        use core::arch::aarch64::{vrecpes_f32, vrecpss_f32};
+        // SAFETY: scalar NEON reciprocal instructions have no memory effects
+        // and are available on every AArch64 target supported by this crate.
+        unsafe {
+            let mut reciprocal = vrecpes_f32(denominator);
+            reciprocal *= vrecpss_f32(denominator, reciprocal);
+            let step = vrecpss_f32(denominator, reciprocal);
+            (reciprocal * numerator) * step
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        numerator / denominator
     }
 }
 
@@ -699,11 +925,21 @@ impl GainSrc {
             }
             out.taps[i] = value;
         }
+        out.reset();
         out
     }
 
+    /// Start from the history of a producer that has held unity gain: every
+    /// earlier producer slot holds 1.0, the inserted slots stay zero.
+    /// Black-box (installed unit): the first milliseconds of a stream carry
+    /// no gain ramp; a zero history cost up to 1.1 dB in the first 10 ms.
     fn reset(&mut self) {
         self.ring = [0.0; MAX_GAIN_SRC_TAPS];
+        let mut back = self.factor;
+        while back <= self.len {
+            self.ring[(self.len - back) % self.len] = 1.0;
+            back += self.factor;
+        }
         self.cursor = 0;
         self.phase = 0;
     }
@@ -745,10 +981,9 @@ enum Cadence {
     /// automation sub-blocks and picks one real-waveform detector sample per
     /// sub-block in every band.
     PickEight,
-    /// One value per fixed eight-frame hop in every band, at every rate
-    /// (algorithms 0-2 at quality 0 and 1). The hop keeps the largest
-    /// magnitude it saw, so no peak between updates is lost.
-    HopPeak,
+    /// The phase-zero complex magnitude from each fixed eight-frame group
+    /// (algorithms 0-2 at quality 0 and 1, at the band's actual rate).
+    AnalyticPick,
 }
 
 /// Observable cadence of the unit's gain updates (black-box: the first
@@ -772,7 +1007,7 @@ fn cadence(p: &Params) -> Cadence {
     } else if picks {
         Cadence::Pick
     } else {
-        Cadence::HopPeak
+        Cadence::AnalyticPick
     }
 }
 
@@ -783,8 +1018,23 @@ fn detector_factors(p: &Params) -> [usize; BANDS] {
     match cadence(p) {
         Cadence::Pick => [1, 2, 4, 4],
         Cadence::PickEight => [8; BANDS],
-        Cadence::HopPeak => [8; BANDS],
+        Cadence::AnalyticPick => [8; BANDS],
     }
+}
+
+/// Algorithm zero reduces band zero until the first image reaches the
+/// quality's Butterworth stop-band budget. The unit uses 50 dB at quality 1
+/// and 40 dB at qualities 0 and 2 (black-box image spacing, quality 2 equals
+/// quality 0 at every crossover and rate measured).
+fn band_zero_factor(p: &Params, fs: f64) -> usize {
+    if p.algorithm != 0 || p.band[0].mode != BandMode::Active {
+        return 1;
+    }
+    let half_order = ((libm::ceil(p.crossover_order[0] * 0.5) as usize).max(1)) as f64;
+    let edge = p.crossover_hz[0].min(p.crossover_hz[1] / 1.25).min(p.crossover_hz[2] / (1.25 * 1.25));
+    let budget = if p.render_quality == 1 { 50.0 } else { 40.0 };
+    let separation = 2.0 * libm::pow(2.0, budget / (6.0 * half_order));
+    libm::floor(fs / (separation * edge)).max(1.0) as usize
 }
 
 impl SlidingMax {
@@ -816,8 +1066,8 @@ impl SlidingMax {
 
 /// The real-time state of one linked compressor instance.
 pub struct Run {
-    path: [Path; BANDS],
-    legacy_stage: [LegacyStage; XOVERS],
+    half_stage: [HalfStage; XOVERS],
+    half_synthesis_path: [Path; BANDS],
     detector_path: [DetectorPath; BANDS],
     band: [Band; BANDS],
     base_band: [Band; BANDS],
@@ -830,29 +1080,38 @@ pub struct Run {
     curve_top_db: f64,
     release: [f64; BANDS],
     release_on: bool,
-    algorithm: u32,
-    legacy_recombination: bool,
     overshoot_compensation: bool,
     channels: usize,
     env: [f64; BANDS],
     gain_state: [f64; BANDS],
-    gain_rest: [f64; BANDS],
     detector_window: [usize; BANDS],
     detector_factor: [usize; BANDS],
     detector_phase: [usize; BANDS],
     detector_max: [SlidingMax; BANDS],
-    quadrature: [[QuadratureEnvelope; BANDS]; MAX_CHANNELS],
-    overshoot_quadrature: [[[QuadratureEnvelope; BANDS]; BANDS]; MAX_CHANNELS],
     audio_quadrature: [QuadratureEnvelope; MAX_CHANNELS],
-    hop_peak: bool,
-    detector_hop: [f64; BANDS],
+    mode4_gain: [Mode4Gain; BANDS],
+    band_zero_factor: usize,
+    band_zero_phase: usize,
+    analytic_pick: bool,
+    /// With threshold automation (eight-frame sub-blocks) band 0's gain
+    /// is computed from the previous sub-block's pick. Black-box
+    /// (installed unit, AID44 strip): band-0 attacks at full scale came
+    /// 0.1 to 0.2 dB too early in their first 10 ms; one sub-block of lag
+    /// brings every per-box probe within 0.034 dB. The other bands pick
+    /// their own sub-block (a lag there misses by up to 0.1 dB).
+    band_zero_pick_lag: bool,
+    band_zero_previous_pick: f64,
     gain_src: [GainSrc; BANDS],
-    state: [[[[f64; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS],
-    legacy_high_state: [[[[f64; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
-    legacy_split_allpass_state: [[[[f64; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
-    legacy_merge_allpass_state: [[[[f64; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
+    half_analysis_low_a: [[[[f32; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
+    half_analysis_high_a: [[[[f32; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
+    half_analysis_low_b: [[[[f32; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
+    half_analysis_high_b: [[[[f32; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
+    half_synthesis_state: [[[[f32; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS],
     detector_state: [[[[f32; 2]; MAX_DETECTOR_FILTERS]; BANDS]; MAX_CHANNELS],
-    overshoot_state: [[[[[f32; 2]; MAX_DETECTOR_FILTERS]; BANDS]; BANDS]; MAX_CHANNELS],
+    phase_path: [DetectorPath; BANDS],
+    phase_state: [[[[[f32; 2]; MAX_DETECTOR_FILTERS]; BANDS]; MAX_CHANNELS]; 2],
+    phase_band_zero_factor: usize,
+    phase_band_zero_phase: usize,
 }
 
 impl Run {
@@ -861,7 +1120,6 @@ impl Run {
         let valid = p.valid(fs);
         let q = if valid { p } else { &Params::default() };
         let curve_top_db = if q.algorithm >= 2 { 20.0 } else { 0.0 };
-        let gain_rest = q.band.map(|b| spline_gain(&curve_points(b, curve_top_db), -100.0, curve_top_db));
         let edges = [0.0, q.crossover_hz[0], q.crossover_hz[1], q.crossover_hz[2], 20_000.0];
         let reference_edges = [0.0, 100.0, 1000.0, 10_000.0, 20_000.0];
         let mut detector_bandwidth = [1.0; BANDS];
@@ -876,21 +1134,44 @@ impl Run {
             }
         }
         let detector_factor = detector_factors(q);
-        let window_ms = [10.0, 8.0, 2.0, 1.0];
-        let detector_window = core::array::from_fn(|b| {
+        // Mode 4 shares one two-millisecond odd trailing maximum across all
+        // four arms. At the fixed eight-frame cadence this is 11/13/25
+        // updates at 44.1/48/96 kHz before any outer band-rate reduction.
+        // The eight-frame automation pick shares that window too. Black-box
+        // (installed unit, a box with threshold automation): with the
+        // per-band 10/8/2/1 ms windows, low tones at full scale compressed
+        // up to 0.33 dB too far and steps down released up to 1 dB late.
+        let window_ms = match cadence(q) {
+            Cadence::AnalyticPick | Cadence::PickEight => [2.0; BANDS],
+            Cadence::Pick => [10.0, 8.0, 2.0, 1.0],
+        };
+        let mut detector_window = core::array::from_fn(|b| {
             ((libm::round(window_ms[b] * fs / (1000.0 * detector_factor[b] as f64)) as usize) | 1)
                 .clamp(1, MAX_DETECTOR_WINDOW)
         });
-        let release = core::array::from_fn(|b| {
+        let mut release = core::array::from_fn(|b| {
             if q.release_s > 0.0 {
                 libm::exp(-(detector_factor[b] as f64) / (q.release_s * fs))
             } else {
                 0.0
             }
         });
+        let band_zero_factor = band_zero_factor(q, fs);
+        let band_zero_rate = fs / band_zero_factor as f64;
+        if band_zero_factor > 1 {
+            detector_window[0] =
+                ((libm::round(window_ms[0] * band_zero_rate / (1000.0 * detector_factor[0] as f64)) as usize) | 1)
+                    .clamp(1, MAX_DETECTOR_WINDOW);
+            release[0] = if q.release_s > 0.0 {
+                libm::exp(-(detector_factor[0] as f64) / (q.release_s * band_zero_rate))
+            } else {
+                0.0
+            };
+        }
+        let half_stage = half_stages(q, fs);
         let mut run = Run {
-            path: paths(q, fs),
-            legacy_stage: legacy_stages(q, fs),
+            half_stage,
+            half_synthesis_path: half_synthesis_paths(q, fs, &half_stage),
             detector_path: detector_paths(q, fs),
             band: q.band,
             base_band: q.band,
@@ -903,29 +1184,46 @@ impl Run {
             curve_top_db,
             release,
             release_on: q.release_on,
-            algorithm: q.algorithm,
-            legacy_recombination: q.render_quality == 1 && q.algorithm < 3,
             overshoot_compensation: q.overshoot_compensation,
             channels: channels.min(MAX_CHANNELS),
             env: [0.0; BANDS],
-            gain_state: gain_rest,
-            gain_rest,
+            // The linear gain state starts at unity and the rest gain
+            // (makeup included) is reached through the release: black-box,
+            // a band with +3.5 dB makeup starts 3.5 dB low and recovers over
+            // the release time on the installed unit.
+            gain_state: [1.0; BANDS],
             detector_window,
             detector_factor,
             detector_phase: [0; BANDS],
             detector_max: [SlidingMax::EMPTY; BANDS],
-            quadrature: [[QuadratureEnvelope::default(); BANDS]; MAX_CHANNELS],
-            overshoot_quadrature: [[[QuadratureEnvelope::default(); BANDS]; BANDS]; MAX_CHANNELS],
             audio_quadrature: [QuadratureEnvelope::default(); MAX_CHANNELS],
-            hop_peak: cadence(q) == Cadence::HopPeak,
-            detector_hop: [0.0; BANDS],
-            gain_src: core::array::from_fn(|b| GainSrc::new(detector_factor[b], fs)),
-            state: [[[[0.0; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS],
-            legacy_high_state: [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
-            legacy_split_allpass_state: [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
-            legacy_merge_allpass_state: [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
+            mode4_gain: core::array::from_fn(|b| Mode4Gain::new(if b == 0 { band_zero_rate } else { fs })),
+            band_zero_factor,
+            band_zero_phase: 0,
+            analytic_pick: cadence(q) == Cadence::AnalyticPick,
+            band_zero_pick_lag: cadence(q) == Cadence::PickEight,
+            band_zero_previous_pick: 0.0,
+            gain_src: core::array::from_fn(|b| {
+                GainSrc::new(detector_factor[b], if b == 0 { band_zero_rate } else { fs })
+            }),
+            half_analysis_low_a: [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
+            half_analysis_high_a: [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
+            half_analysis_low_b: [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
+            half_analysis_high_b: [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
+            half_synthesis_state: [[[[0.0; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS],
             detector_state: [[[[0.0; 2]; MAX_DETECTOR_FILTERS]; BANDS]; MAX_CHANNELS],
-            overshoot_state: [[[[[0.0; 2]; MAX_DETECTOR_FILTERS]; BANDS]; BANDS]; MAX_CHANNELS],
+            phase_path: phase_paths(
+                q,
+                fs,
+                if cadence(q) == Cadence::AnalyticPick {
+                    band_zero_rate
+                } else {
+                    fs / phase_band_zero_factor(q) as f64
+                },
+            ),
+            phase_state: [[[[[0.0; 2]; MAX_DETECTOR_FILTERS]; BANDS]; MAX_CHANNELS]; 2],
+            phase_band_zero_factor: phase_band_zero_factor(q),
+            phase_band_zero_phase: 0,
         };
         run.set_automation_input(q.automation_input);
         run
@@ -933,34 +1231,41 @@ impl Run {
 
     pub fn reset(&mut self) {
         self.env = [0.0; BANDS];
-        self.gain_state = self.gain_rest;
+        self.gain_state = [1.0; BANDS];
         self.detector_max = [SlidingMax::EMPTY; BANDS];
         self.detector_phase = [0; BANDS];
+        self.band_zero_previous_pick = 0.0;
         for envelope in &mut self.audio_quadrature {
             envelope.reset();
         }
-        for channel in &mut self.quadrature {
-            for envelope in channel {
-                envelope.reset();
-            }
-        }
-        for channel in &mut self.overshoot_quadrature {
-            for band in channel {
-                for envelope in band {
-                    envelope.reset();
-                }
-            }
-        }
-        self.detector_hop = [0.0; BANDS];
+        self.phase_band_zero_phase = 0;
         for src in &mut self.gain_src {
             src.reset();
         }
-        self.state = [[[[0.0; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS];
-        self.legacy_high_state = [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS];
-        self.legacy_split_allpass_state = [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS];
-        self.legacy_merge_allpass_state = [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS];
+        for gain in &mut self.mode4_gain {
+            gain.reset();
+        }
+        self.band_zero_phase = 0;
+        self.half_analysis_low_a = [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS];
+        self.half_analysis_high_a = [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS];
+        self.half_analysis_low_b = [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS];
+        self.half_analysis_high_b = [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS];
+        self.half_synthesis_state = [[[[0.0; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS];
         self.detector_state = [[[[0.0; 2]; MAX_DETECTOR_FILTERS]; BANDS]; MAX_CHANNELS];
-        self.overshoot_state = [[[[[0.0; 2]; MAX_DETECTOR_FILTERS]; BANDS]; BANDS]; MAX_CHANNELS];
+        self.phase_state = [[[[[0.0; 2]; MAX_DETECTOR_FILTERS]; BANDS]; MAX_CHANNELS]; 2];
+    }
+
+    /// One component through band `b`'s phase stage (Float32 state).
+    #[inline]
+    fn phase_stage(&mut self, arm: usize, c: usize, b: usize, mut v: f64) -> f64 {
+        let path = self.phase_path[b];
+        for (s, z) in path.section[..path.count].iter().zip(self.phase_state[arm][c][b].iter_mut()) {
+            let o = s.b0 * v + z[0] as f64;
+            z[0] = (s.b1 * v - s.a1 * o + z[1] as f64) as f32;
+            z[1] = (s.b2 * v - s.a2 * o) as f32;
+            v = o;
+        }
+        v
     }
 
     pub fn latency(&self) -> usize {
@@ -989,67 +1294,40 @@ impl Run {
     }
 
     #[inline]
-    fn split(&mut self, c: usize, x: f64) -> [f64; BANDS] {
-        if self.legacy_recombination {
-            return self.legacy_split(c, x);
-        }
-        let mut out = [0.0; BANDS];
-        for (b, y) in out.iter_mut().enumerate() {
-            let mut v = x;
-            for i in 0..self.path[b].count {
-                let s = self.path[b].section[i];
-                let z = &mut self.state[c][b][i];
-                let o = s.b0 * v + z[0];
-                z[0] = s.b1 * v - s.a1 * o + z[1];
-                z[1] = s.b2 * v - s.a2 * o;
-                v = o;
-            }
-            *y = v * self.band_in[b];
-        }
-        out
+    fn half_analyze(
+        stages: [HalfStage; XOVERS],
+        band_in: [f64; BANDS],
+        low_state: &mut [[[f32; 2]; MAX_FILTERS]; XOVERS],
+        high_state: &mut [[[f32; 2]; MAX_FILTERS]; XOVERS],
+        input: f64,
+    ) -> [f64; BANDS] {
+        // Middle crossover first at every quality: bands 0/1 split from its
+        // low half, bands 2/3 from its high half.
+        let low_mid = Self::run_detector_path(&stages[1].low, &mut low_state[1], input);
+        let high_mid = Self::run_detector_path(&stages[1].high, &mut high_state[1], input);
+        [
+            Self::run_detector_path(&stages[0].low, &mut low_state[0], low_mid) * band_in[0],
+            Self::run_detector_path(&stages[0].high, &mut high_state[0], low_mid) * band_in[1],
+            Self::run_detector_path(&stages[2].low, &mut low_state[2], high_mid) * band_in[2],
+            Self::run_detector_path(&stages[2].high, &mut high_state[2], high_mid) * band_in[3],
+        ]
     }
 
     #[inline]
-    fn run_path(path: Path, state: &mut [[f64; 2]; MAX_FILTERS], mut value: f64) -> f64 {
-        for (s, z) in path.section[..path.count].iter().zip(state.iter_mut()) {
-            let output = s.b0 * value + z[0];
-            z[0] = s.b1 * value - s.a1 * output + z[1];
-            z[1] = s.b2 * value - s.a2 * output;
-            value = output;
+    fn half_synthesize(
+        paths: &[Path; BANDS],
+        state: &mut [[[f32; 2]; MAX_FILTERS]; BANDS],
+        bands: [f64; BANDS],
+    ) -> f64 {
+        let mut output = 0.0;
+        for band in 0..BANDS {
+            output += Self::run_detector_path(&paths[band], &mut state[band], bands[band]);
         }
-        value
+        output
     }
 
     #[inline]
-    fn legacy_split(&mut self, c: usize, x: f64) -> [f64; BANDS] {
-        let mut out = [0.0; BANDS];
-        let mut remaining = x;
-        for (stage, band) in out.iter_mut().enumerate().take(XOVERS) {
-            let filters = self.legacy_stage[stage];
-            let high = Self::run_path(filters.high, &mut self.legacy_high_state[c][stage], remaining);
-            let allpass = Self::run_path(filters.allpass, &mut self.legacy_split_allpass_state[c][stage], remaining);
-            *band = (allpass - high) * self.band_in[stage];
-            remaining = high;
-        }
-        out[BANDS - 1] = remaining * self.band_in[BANDS - 1];
-        out
-    }
-
-    #[inline]
-    fn legacy_recombine(&mut self, c: usize, bands: [f64; BANDS]) -> f64 {
-        let mut output = bands[0];
-        for (stage, band) in bands.iter().enumerate().take(XOVERS).skip(1) {
-            output = Self::run_path(
-                self.legacy_stage[stage].allpass,
-                &mut self.legacy_merge_allpass_state[c][stage],
-                output,
-            ) + *band;
-        }
-        output + bands[BANDS - 1]
-    }
-
-    #[inline]
-    fn detect(&mut self, c: usize, x: f64) -> ([f64; BANDS], [f64; BANDS]) {
+    fn detect(&mut self, c: usize, x: f64, phase_band_zero_sample: bool) -> ([f64; BANDS], [f64; BANDS]) {
         let mut base = [0.0; BANDS];
         let mut overshoot = [0.0; BANDS];
         for b in 0..BANDS {
@@ -1063,30 +1341,31 @@ impl Run {
                 v = o;
             }
             let scale = self.band_in[b] * self.detector_bandwidth[b];
-            let magnitude = if self.hop_peak { self.quadrature[c][b].push(v) } else { v.abs() };
+            // Mode 4 takes its base magnitude directly from the A/B
+            // half-bank components in `process`; only the real-waveform
+            // modes consume this collapsed detector path.
+            let magnitude = if self.analytic_pick { 0.0 } else { v.abs() };
             base[b] = (magnitude * scale) as f32 as f64;
-            if self.overshoot_compensation {
-                let mut sum = 0.0;
-                for analysis_band in 0..BANDS {
-                    let mut branch = v;
-                    for i in 0..self.detector_path[analysis_band].count {
-                        let s = self.detector_path[analysis_band].section[i];
-                        let z = &mut self.overshoot_state[c][b][analysis_band][i];
-                        let o = s.b0 * branch + z[0] as f64;
-                        z[0] = (s.b1 * branch - s.a1 * o + z[1] as f64) as f32;
-                        z[1] = (s.b2 * branch - s.a2 * o) as f32;
-                        branch = o;
-                    }
-                    sum += if self.hop_peak {
-                        self.overshoot_quadrature[c][b][analysis_band].push(branch)
-                    } else {
-                        branch.abs()
-                    };
-                }
-                overshoot[b] = (sum * scale) as f32 as f64;
+            // The real-waveform detectors pick |stage(band waveform)|; the
+            // analytic detector compensates its two components in `process`.
+            if self.overshoot_compensation && !self.analytic_pick && (b != 0 || phase_band_zero_sample) {
+                let phase = self.phase_stage(0, c, b, v);
+                overshoot[b] = (phase.abs() * scale) as f32 as f64;
             }
         }
         (base, overshoot)
+    }
+
+    /// Single-precision-state biquad cascade (the detector's storage width).
+    #[inline]
+    fn run_detector_path(path: &Path, state: &mut [[f32; 2]; MAX_FILTERS], mut v: f64) -> f64 {
+        for (s, z) in path.section[..path.count].iter().zip(state.iter_mut()) {
+            let o = s.b0 * v + z[0] as f64;
+            z[0] = (s.b1 * v - s.a1 * o + z[1] as f64) as f32;
+            z[1] = (s.b2 * v - s.a2 * o) as f32;
+            v = o;
+        }
+        v
     }
 
     fn gain(&mut self, b: usize) -> f64 {
@@ -1134,48 +1413,95 @@ impl Run {
     }
 
     #[inline]
+    /// The band saturator shapes the gained band, as on the analytic path.
+    /// Black-box (installed unit, AID37/42 strips with every band on
+    /// flavour 1): shaping before the gain left full-scale tones 0.05 to
+    /// 0.09 dB low; after the gain every per-box probe is within 0.02 dB.
     fn band_output(flavor: Option<u32>, gain: f64, x: f64) -> f64 {
-        gain * Self::saturate(flavor, x)
+        Self::saturate(flavor, gain * x)
     }
 
     pub fn process(&mut self, bufs: &mut [&mut [f32]], frames: usize) {
         let n = bufs.len().min(self.channels).min(MAX_CHANNELS);
-        let mut bands = [[0.0; BANDS]; MAX_CHANNELS];
+        let mut bands_a = [[0.0; BANDS]; MAX_CHANNELS];
+        let mut bands_b = [[0.0; BANDS]; MAX_CHANNELS];
         for i in 0..frames {
+            let band_zero_sample = self.band_zero_phase == 0;
+            let phase_band_zero_sample = self.phase_band_zero_phase == 0;
             let mut detector = [0.0f64; BANDS];
             let mut overshoot = [0.0f64; BANDS];
             for c in 0..n {
                 let x = bufs[c].get(i).copied().unwrap_or(0.0);
                 let x = if x.is_finite() { x.clamp(-INPUT_BOUND, INPUT_BOUND) as f64 } else { 0.0 };
                 let input = self.in_gain * x;
-                // Algorithms 0-2 at quality 0/1 process the audio through the
-                // detector's quadrature pair, so gain and audio stay aligned.
-                let audio = if self.hop_peak { self.audio_quadrature[c].push_audio(input) } else { input };
-                bands[c] = self.split(c, audio);
-                let (detected, overshoot_arm) = self.detect(c, input);
+                // Mode 4 keeps the two analytic components separate through
+                // the band tree. They collapse only after the coupled gain
+                // recurrence below; quality 2 keeps the real path.
+                if self.analytic_pick {
+                    let (a, b) = self.audio_quadrature[c].push_components(input as f32);
+                    bands_a[c] = Self::half_analyze(
+                        self.half_stage,
+                        self.band_in,
+                        &mut self.half_analysis_low_a[c],
+                        &mut self.half_analysis_high_a[c],
+                        f64::from(a),
+                    );
+                    bands_b[c] = Self::half_analyze(
+                        self.half_stage,
+                        self.band_in,
+                        &mut self.half_analysis_low_b[c],
+                        &mut self.half_analysis_high_b[c],
+                        f64::from(b),
+                    );
+                } else {
+                    // The real path takes the same analysis halves; its gain
+                    // sits between them and the synthesis halves too.
+                    bands_a[c] = Self::half_analyze(
+                        self.half_stage,
+                        self.band_in,
+                        &mut self.half_analysis_low_a[c],
+                        &mut self.half_analysis_high_a[c],
+                        input,
+                    );
+                }
+                let (detected, mut overshoot_arm) = self.detect(c, input, phase_band_zero_sample);
+                if self.overshoot_compensation && self.analytic_pick {
+                    for b in 0..BANDS {
+                        if b == 0 && self.band_zero_factor > 1 && !band_zero_sample {
+                            continue;
+                        }
+                        let a = self.phase_stage(0, c, b, bands_a[c][b]) as f32;
+                        let q = self.phase_stage(1, c, b, bands_b[c][b]) as f32;
+                        overshoot_arm[b] =
+                            (f64::from(libm::sqrtf(a * a + q * q)) * self.detector_bandwidth[b]) as f32 as f64;
+                    }
+                }
                 for b in 0..BANDS {
-                    detector[b] = detector[b].max(detected[b]);
+                    let detected = if self.analytic_pick {
+                        let a = bands_a[c][b] as f32;
+                        let q = bands_b[c][b] as f32;
+                        (f64::from(libm::sqrtf(a * a + q * q)) * self.detector_bandwidth[b]) as f32 as f64
+                    } else {
+                        detected[b]
+                    };
+                    detector[b] = detector[b].max(detected);
                     overshoot[b] = overshoot[b].max(overshoot_arm[b]);
                 }
             }
             let mut gain = [0.0; BANDS];
             for (b, mut p) in detector.into_iter().enumerate() {
-                if self.overshoot_compensation && self.algorithm < 3 {
-                    p = p.max(overshoot[b]);
-                } else if self.overshoot_compensation && self.algorithm == 3 {
-                    // Algorithm 3 stays on its inherited real-waveform
-                    // detector; its exact estimator belongs to t-5368.
+                if b == 0 && self.band_zero_factor > 1 && !band_zero_sample {
+                    continue;
+                }
+                if self.overshoot_compensation {
+                    // The compensated components replace the band's own.
                     p = overshoot[b];
                 }
                 let update = self.detector_phase[b] == 0;
-                let p = if self.hop_peak {
-                    let peak = self.detector_hop[b].max(p);
-                    self.detector_hop[b] = if update { 0.0 } else { peak };
-                    peak
-                } else {
-                    p
-                };
                 let input = if update {
+                    if b == 0 && self.band_zero_pick_lag {
+                        p = core::mem::replace(&mut self.band_zero_previous_pick, p);
+                    }
                     let held = self.window_max(b, p);
                     // Every algorithm releases the post-curve linear gain.
                     // Reduction applies immediately; recovery is a one-pole
@@ -1195,30 +1521,75 @@ impl Run {
                     self.detector_phase[b] = 0;
                 }
             }
+            let mode4: [Mode4Mix; BANDS] = if self.analytic_pick {
+                core::array::from_fn(|b| {
+                    if b == 0 && self.band_zero_factor > 1 && !band_zero_sample {
+                        Mode4Mix::default()
+                    } else {
+                        self.mode4_gain[b].step(gain[b])
+                    }
+                })
+            } else {
+                core::array::from_fn(|b| {
+                    if b == 0 && self.band_zero_factor > 1 && !band_zero_sample {
+                        Mode4Mix::default()
+                    } else {
+                        self.mode4_gain[b].step(gain[b])
+                    }
+                })
+            };
             for c in 0..n {
                 let mut processed = [0.0; BANDS];
                 for b in 0..BANDS {
-                    processed[b] = Self::band_output(self.band[b].saturation, gain[b], bands[c][b]);
+                    processed[b] = if self.analytic_pick {
+                        let output = if b == 0 && self.band_zero_factor > 1 && !band_zero_sample {
+                            0.0
+                        } else if b + 1 == BANDS {
+                            mode4[b].apply_real(bands_a[c][b], bands_b[c][b])
+                        } else {
+                            mode4[b].apply(bands_a[c][b], bands_b[c][b])
+                        };
+                        let scale =
+                            if b == 0 && self.band_zero_factor > 1 { self.band_zero_factor as f64 } else { 1.0 };
+                        Self::saturate(self.band[b].saturation, output) * scale
+                    } else {
+                        if b == 0 && self.band_zero_factor > 1 {
+                            if band_zero_sample {
+                                Self::band_output(self.band[b].saturation, mode4[b].real_gain(), bands_a[c][b])
+                                    * self.band_zero_factor as f64
+                            } else {
+                                0.0
+                            }
+                        } else {
+                            Self::band_output(self.band[b].saturation, mode4[b].real_gain(), bands_a[c][b])
+                        }
+                    };
                 }
-                let mut y = if self.legacy_recombination {
-                    self.legacy_recombine(c, processed)
-                } else {
-                    processed.into_iter().sum()
-                };
+                let mut y =
+                    Self::half_synthesize(&self.half_synthesis_path, &mut self.half_synthesis_state[c], processed);
                 y *= self.out_gain;
                 if let Some(out) = bufs[c].get_mut(i) {
                     *out = if y.is_finite() { y as f32 } else { 0.0 };
                 }
                 if !y.is_finite() {
-                    self.state[c] = [[[0.0; 2]; MAX_FILTERS]; BANDS];
-                    self.legacy_high_state[c] = [[[0.0; 2]; MAX_FILTERS]; XOVERS];
-                    self.legacy_split_allpass_state[c] = [[[0.0; 2]; MAX_FILTERS]; XOVERS];
-                    self.legacy_merge_allpass_state[c] = [[[0.0; 2]; MAX_FILTERS]; XOVERS];
+                    self.half_analysis_low_a[c] = [[[0.0; 2]; MAX_FILTERS]; XOVERS];
+                    self.half_analysis_high_a[c] = [[[0.0; 2]; MAX_FILTERS]; XOVERS];
+                    self.half_analysis_low_b[c] = [[[0.0; 2]; MAX_FILTERS]; XOVERS];
+                    self.half_analysis_high_b[c] = [[[0.0; 2]; MAX_FILTERS]; XOVERS];
+                    self.half_synthesis_state[c] = [[[0.0; 2]; MAX_FILTERS]; BANDS];
                     self.audio_quadrature[c].reset();
                 }
             }
             if self.env.iter().any(|v| !v.is_finite()) {
                 self.env = [0.0; BANDS];
+            }
+            self.band_zero_phase += 1;
+            if self.band_zero_phase == self.band_zero_factor {
+                self.band_zero_phase = 0;
+            }
+            self.phase_band_zero_phase += 1;
+            if self.phase_band_zero_phase == self.phase_band_zero_factor {
+                self.phase_band_zero_phase = 0;
             }
         }
     }
@@ -1401,9 +1772,9 @@ mod tests {
     }
 
     #[test]
-    fn algorithms_zero_through_two_share_the_fixed_recombination_path() {
+    fn algorithms_one_and_two_share_the_fixed_recombination_path() {
         let mut expected = None;
-        for algorithm in 0..=2 {
+        for algorithm in 1..=2 {
             let mut p = params();
             p.algorithm = algorithm;
             p.render_quality = 1;
@@ -1426,15 +1797,33 @@ mod tests {
 
     #[test]
     fn detector_is_the_butterworth_half_of_each_audio_band() {
-        let mut p = params();
-        p.algorithm = 3;
-        let audio = paths(&p, 48_000.0);
-        let detector = detector_paths(&p, 48_000.0);
-        for b in 0..BANDS {
-            for f in [40.0, 200.0, 1000.0, 5000.0, 16_000.0] {
-                let a = band_magnitude(&audio[b], f);
-                let d = detector_band_magnitude(&detector[b], f);
-                assert!((a - d * d).abs() < 1e-10, "band {b} at {f} Hz: audio {a}, detector {d}");
+        // Odd Linkwitz-Riley halves (controls 2, 5, 6, 9, 10) included, and
+        // the mixed orders of saved tunings.
+        let orders: [[f64; XOVERS]; 11] = [
+            [4.0; 3],
+            [2.0; 3],
+            [3.0; 3],
+            [5.0; 3],
+            [6.0; 3],
+            [8.0; 3],
+            [9.0; 3],
+            [10.0; 3],
+            [20.0; 3],
+            [9.0, 5.0, 6.0],
+            [8.5, 9.0, 8.0],
+        ];
+        for order in orders {
+            let mut p = params();
+            p.algorithm = 3;
+            p.crossover_order = order;
+            let audio = paths(&p, 48_000.0);
+            let detector = detector_paths(&p, 48_000.0);
+            for b in 0..BANDS {
+                for f in [40.0, 200.0, 1000.0, 1500.0, 5000.0, 8000.0, 16_000.0] {
+                    let a = band_magnitude(&audio[b], f);
+                    let d = detector_band_magnitude(&detector[b], f);
+                    assert!((a - d * d).abs() < 1e-10, "orders {order:?} band {b} at {f} Hz: audio {a}, detector {d}");
+                }
             }
         }
     }
@@ -1455,35 +1844,49 @@ mod tests {
     }
 
     #[test]
-    fn detector_cadences_scale_windows_and_keep_the_next_peak() {
-        let run = Run::new(&params(), 48_000.0, 1);
-        assert_eq!(run.detector_factor, [8; BANDS]);
-        assert_eq!(run.detector_window, [61, 49, 13, 7]);
+    fn detector_cadences_scale_windows_and_pick_phase_zero() {
+        // Keep only the small observable state on the debug test stack.
+        let cadence = |p: &Params, fs: f64| {
+            let run = alloc::boxed::Box::new(Run::new(p, fs, 1));
+            (run.detector_factor, run.detector_window, run.release, run.band_zero_factor, run.analytic_pick)
+        };
+        let p0 = params();
+        let (factor, window, release, band_zero_factor, _) = cadence(&p0, 48_000.0);
+        assert_eq!(factor, [8; BANDS]);
+        assert_eq!(band_zero_factor, 11);
+        assert_eq!(window, [1, 13, 13, 13]);
         for b in 0..BANDS {
-            let embedded_fs = 48_000.0 / run.detector_factor[b] as f64;
-            assert!((run.release[b] - libm::exp(-1.0 / (params().release_s * embedded_fs))).abs() < 1e-12);
+            let rate = if b == 0 { 48_000.0 / band_zero_factor as f64 } else { 48_000.0 };
+            let embedded_fs = rate / factor[b] as f64;
+            assert!((release[b] - libm::exp(-1.0 / (p0.release_s * embedded_fs))).abs() < 1e-12);
         }
-        let run = Run::new(&params(), 96_000.0, 1);
-        assert_eq!(run.detector_window, [121, 97, 25, 13]);
+        let (_, window, _, band_zero_factor, _) = cadence(&p0, 96_000.0);
+        assert_eq!(band_zero_factor, 23);
+        assert_eq!(window, [1, 25, 25, 25]);
 
         let mut p = params();
         p.algorithm = 3;
-        let run = Run::new(&p, 48_000.0, 1);
-        assert_eq!(run.detector_factor, [1, 2, 4, 4]);
-        assert_eq!(run.detector_window, [481, 193, 25, 13]);
+        let (factor, window, _, _, _) = cadence(&p, 48_000.0);
+        assert_eq!(factor, [1, 2, 4, 4]);
+        assert_eq!(window, [481, 193, 25, 13]);
         p.algorithm = 0;
         p.render_quality = 2;
-        assert_eq!(Run::new(&p, 48_000.0, 1).detector_factor, [1, 2, 4, 4]);
+        assert_eq!(cadence(&p, 48_000.0).0, [1, 2, 4, 4]);
 
         // Threshold automation switches the picking cadence to eight frames.
         let mut automated = p;
         automated.threshold_automation[0].count = 2;
         automated.threshold_automation[0].points[0] = AutomationPoint { input: -100.0, value: -20.0 };
         automated.threshold_automation[0].points[1] = AutomationPoint { input: 0.0, value: -30.0 };
-        let run = Run::new(&automated, 48_000.0, 1);
-        assert_eq!(run.detector_factor, [8; BANDS]);
-        assert_eq!(run.detector_window, [61, 49, 13, 7]);
-        assert!(!run.hop_peak);
+        let (factor, window, _, _, analytic_pick) = cadence(&automated, 48_000.0);
+        assert_eq!(factor, [8; BANDS]);
+        // It shares the two-millisecond window; algorithm 0 also reduces
+        // band 0 here (M = 11 at 48 kHz), so that window counts band-rate
+        // updates.
+        assert_eq!(window, [1, 13, 13, 13]);
+        assert!(!analytic_pick);
+        assert!(alloc::boxed::Box::new(Run::new(&automated, 48_000.0, 1)).band_zero_pick_lag);
+        assert!(!alloc::boxed::Box::new(Run::new(&p, 48_000.0, 1)).band_zero_pick_lag);
 
         let mut max = SlidingMax::EMPTY;
         assert_eq!(max.push(9.0, 3), 9.0);
@@ -1493,6 +1896,31 @@ mod tests {
         assert_eq!(max.push(1.0, 3), 8.0);
         assert_eq!(max.push(2.0, 3), 8.0);
         assert_eq!(max.push(3.0, 3), 3.0);
+    }
+
+    #[test]
+    fn algorithm_zero_band_rate_matches_the_stopband_budget() {
+        let mut p = params();
+        p.algorithm = 0;
+        p.render_quality = 0;
+        p.crossover_hz[1..].copy_from_slice(&[6000.0, 16_000.0]);
+        for (x0, expected) in
+            [(100.0, 23), (150.0, 15), (200.0, 11), (250.0, 9), (300.0, 7), (400.0, 5), (500.0, 4), (600.0, 3)]
+        {
+            p.crossover_hz[0] = x0;
+            assert_eq!(band_zero_factor(&p, 48_000.0), expected, "q0 x0={x0}");
+        }
+        p.render_quality = 1;
+        for (x0, expected) in [(100.0, 13), (150.0, 8), (200.0, 6), (250.0, 5), (300.0, 4), (1000.0, 1)] {
+            p.crossover_hz[0] = x0;
+            assert_eq!(band_zero_factor(&p, 48_000.0), expected, "q1 x0={x0}");
+        }
+        p.crossover_hz[0] = 200.0;
+        assert_eq!(band_zero_factor(&p, 96_000.0), 13);
+        p.render_quality = 2;
+        assert_eq!(band_zero_factor(&p, 48_000.0), 11);
+        p.algorithm = 2;
+        assert_eq!(band_zero_factor(&p, 48_000.0), 1);
     }
 
     #[test]
@@ -1552,18 +1980,19 @@ mod tests {
     }
 
     #[test]
-    fn gain_src_has_zero_startup_and_unity_dc() {
+    fn gain_src_starts_from_unity_and_has_unity_dc() {
         for factor in [1, 2, 4] {
             let mut src = GainSrc::new(factor, 48_000.0);
             let first = src.step(Some(1.0));
-            assert!(first > 0.0 && first < 0.01, "factor {factor}: {first}");
+            assert!((first - 1.0).abs() < 2e-6, "factor {factor}: {first}");
             let mut output = first;
             for i in 1..512 {
                 output = src.step((i % factor == 0).then_some(1.0));
             }
             assert!((output - 1.0).abs() < 2e-6, "factor {factor}: {output}");
             src.reset();
-            assert_eq!(src.step(None), 0.0);
+            let restarted = src.step(Some(1.0));
+            assert!((restarted - 1.0).abs() < 2e-6, "factor {factor}: {restarted}");
         }
     }
 
@@ -1574,13 +2003,14 @@ mod tests {
         for fs in [8_000.0, 44_100.0, 48_000.0, 96_000.0, 192_000.0] {
             for factor in [1, 2, 4, 8] {
                 let mut src = GainSrc::new(factor, fs);
-                let mut history = std::vec![0.0f32; src.len];
+                // Both start from the primed unity history.
+                let mut history = src.ring[..src.len].to_vec();
                 let mut cursor = 0;
                 let mut random = 0x1234_5678u32;
                 for frame in 0..4096 {
                     if frame == 2048 {
                         src.reset();
-                        history.fill(0.0);
+                        history.copy_from_slice(&src.ring[..src.len]);
                         cursor = 0;
                     }
                     random = random.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
@@ -1625,17 +2055,54 @@ mod tests {
     }
 
     #[test]
-    fn reset_clears_the_detector_and_overshoot_bank() {
+    fn phase_stage_lifts_each_band_towards_its_own_edges() {
+        let mut p = params();
+        p.overshoot_compensation = true;
+        let run = Run::new(&p, 48_000.0, 1);
+        assert_eq!(run.phase_path.map(|path| path.count), [1, 2, 2, 1]);
+        let lift = |b: usize, f: f64| {
+            let path = run.phase_path[b];
+            sections_magnitude(&path.section[..path.count], f)
+        };
+        // Bands above band 0 run at the host rate; each reads louder just
+        // inside its edges than at its centre, and the stage never cuts.
+        for b in 1..BANDS {
+            for f in [550.0, 1400.0, 3500.0, 7000.0, 12_000.0] {
+                assert!(lift(b, f) >= 1.0 - 1e-6, "band {b} {f} Hz");
+            }
+        }
+        assert!(lift(1, 1200.0) > lift(1, 550.0));
+        assert!(lift(1, 260.0) > lift(1, 550.0));
+        assert!(lift(3, 9000.0) > lift(3, 16_000.0));
+
+        // A band takes both of its peaks from the order of its upper edge.
+        let mut q = p;
+        q.crossover_order = [4.0, 8.0, 4.0];
+        let mixed = Run::new(&q, 48_000.0, 1);
+        let r = phase_edge_ratio(8.0);
+        let expected = phase_peak(8.0, q.crossover_hz[0] / r, 48_000.0);
+        let got = mixed.phase_path[1].section[0];
+        assert_eq!([got.b0, got.a1, got.a2], [expected.b0, expected.a1, expected.a2]);
+
+        p.algorithm = 3;
+        p.render_quality = 2;
+        assert_eq!(Run::new(&p, 48_000.0, 1).phase_band_zero_factor, 2);
+        p.overshoot_compensation = false;
+        assert_eq!(Run::new(&p, 48_000.0, 1).phase_band_zero_factor, 1);
+    }
+
+    #[test]
+    fn reset_clears_the_analysis_and_phase_stage() {
         let mut run = Run::new(&params(), 48_000.0, 1);
         run.env = [0.25; BANDS];
-        run.overshoot_state[0][0][0][0] = [0.25; 2];
-        run.quadrature[0][0].arm_a.input_delay[0][0] = 0.25;
+        run.phase_state[0][0][0][0] = [0.25; 2];
+        run.half_analysis_low_a[0][0][0] = [0.25; 2];
         run.audio_quadrature[0].arm_b.output_delay[0][1] = 0.25;
         run.reset();
         assert_eq!(run.audio_quadrature[0].arm_b.output_delay, [[0.0; 2]; QUADRATURE_STAGES]);
         assert_eq!(run.env, [0.0; BANDS]);
-        assert_eq!(run.overshoot_state[0][0][0][0], [0.0; 2]);
-        assert_eq!(run.quadrature[0][0].arm_a.input_delay, [[0.0; 2]; QUADRATURE_STAGES]);
+        assert_eq!(run.phase_state[0][0][0][0], [0.0; 2]);
+        assert_eq!(run.half_analysis_low_a[0][0][0], [0.0; 2]);
     }
 
     #[test]
@@ -1655,6 +2122,42 @@ mod tests {
     }
 
     #[test]
+    fn mode4_gain_uses_the_50_hz_bilinear_arm_recurrence() {
+        for sample_rate in [44_100.0, 48_000.0, 96_000.0] {
+            let mut state = Mode4Gain::new(sample_rate);
+            let k = libm::tan(core::f64::consts::PI * 50.0 / sample_rate);
+            let first = state.step(1.0);
+            assert_eq!(first.lowpass, (k / (1.0 + k)) as f32);
+            for _ in 0..(sample_rate as usize) {
+                state.step(1.0);
+            }
+            assert!((state.previous_output - 1.0).abs() < 2e-5);
+        }
+    }
+
+    #[test]
+    fn mode4_power_ratio_is_directional_and_complementary() {
+        let reducing = {
+            let ratio = mode4_ratio(0.25, 0.5);
+            (1.0 - ratio * ratio).clamp(0.0, 1.0)
+        };
+        let recovering = {
+            let ratio = mode4_ratio(0.5, 0.25);
+            (1.0 - ratio * ratio).clamp(0.0, 1.0)
+        };
+        assert!((reducing - 0.75).abs() < 1e-5);
+        assert_eq!(recovering, 0.0);
+        assert_eq!(reducing + (1.0 - reducing), 1.0);
+    }
+
+    #[test]
+    fn mode4_real_arm_crossfades_the_direct_and_companion_gains() {
+        let mix = Mode4Mix { gain: 0.25, lowpass: 0.5, correction_weight: 0.75, ..Mode4Mix::default() };
+        let expected = (0.75 * 0.25 + 0.25 * 0.5) * core::f32::consts::SQRT_2;
+        assert!((mix.apply_real(1.0, 1.0) as f32 - expected).abs() < 1e-6);
+    }
+
+    #[test]
     fn quality_two_audio_path_has_no_quadrature_allpass() {
         let mut p = params();
         p.render_quality = 2;
@@ -1662,7 +2165,7 @@ mod tests {
         let mut x = [0.0f32; 64];
         x[0] = 0.01;
         run.process(&mut [&mut x[..]], 64);
-        assert!(!run.hop_peak);
+        assert!(!run.analytic_pick);
         assert_eq!(run.audio_quadrature[0].arm_b.input_delay, [[0.0; 2]; QUADRATURE_STAGES]);
     }
 
@@ -1703,8 +2206,9 @@ mod tests {
     }
 
     #[test]
-    fn saturation_precedes_detector_gain() {
-        assert_eq!(Run::band_output(Some(0), 0.25, 2.0), 0.25);
+    fn saturation_follows_detector_gain() {
+        assert_eq!(Run::band_output(Some(0), 0.25, 2.0), 0.5);
+        assert_eq!(Run::band_output(Some(0), 1.0, 2.0), 1.0);
         assert_eq!(Run::band_output(None, 0.25, 2.0), 0.5);
     }
 
