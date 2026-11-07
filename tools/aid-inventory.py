@@ -291,6 +291,7 @@ def public_probe(raw):
                 laws.append(subtype + "-outside-voicing-plan")
         out = {"name": name, "subtype": subtype, "status": status,
                "channels": b.get("channels"),
+               "input_ports": b.get("input_ports"), "output_ports": b.get("output_ports"),
                "compiled_kind": c.get("kind"),
                "in_voicing_plan": name in planned, "bypassed": b["bypass"],
                "laws": sorted(set(laws)), "configured_bounds": sorted(bounds),
@@ -299,8 +300,11 @@ def public_probe(raw):
         if "compiled_dynamic_type_counts" in c:
             out["compiled_dynamic_type_counts"] = c["compiled_dynamic_type_counts"]
         if status == "unimplemented":
-            out["refusal_text"] = ("builtin dbcontrol on the unit's lanes is not carried" if subtype == "dbcontrol"
-                                   else "lsid has no carried compiler implementation")
+            out["capability_reason"] = subtype + " has no carried compiler implementation"
+            messages = [raw.get(key, "") for key in ("load_error", "plan_error", "chain_error")]
+            out["refusal_text"] = (subtype + " is not carried by the compiler" if any(
+                name in message and subtype in message and reason(message) == subtype + "-unimplemented"
+                for message in messages) else None)
             out["refusal_evidence"] = "compiler capability; actual compile refusals are recorded separately"
         if "mstk" in b:
             out["mstk"] = {key: b["mstk"][key] for key in
@@ -480,7 +484,7 @@ def markdown(data):
         lines.append(f'| {r["aid"]} | {r["source"]} / {identity} | {variants["default"]["unit"]} | {r["category"]} | {cell(variants["default"])} | {cell(variants["conservative"])} | ' + " / ".join("yes" if b else "no" for b in r["presence"].values()) + " |")
     lines += ["", "## Boxes and emitted findings per AID", ""]
     for r in data["aids"]:
-        lines += [f'### AID{r["aid"]} ({r["source"]})', "", "| Box | Type | Default law status | Conservative law status | Discrete controls / active tmst types | Open laws |", "|---|---|---|---|---|---|"]
+        lines += [f'### AID{r["aid"]} ({r["source"]})', "", "| Box | Type / ports in-out | Default law status | Conservative law status | Discrete controls / active tmst types | Open laws |", "|---|---|---|---|---|---|"]
         cons = {b["name"]: b for b in r["variants"]["conservative"]["boxes"]}
         for b in r["variants"]["default"]["boxes"]:
             c = cons[b["name"]]
@@ -493,7 +497,10 @@ def markdown(data):
             laws = "; ".join(sorted(set(b["laws"] + c["laws"])))
             if b.get("refusal_text"):
                 laws += "; " + b["refusal_text"]
-            lines.append(f'| {b["name"]} | {b["subtype"]} | {b["status"]} | {c["status"]} | {controls} | {laws} |')
+            if b.get("capability_reason"):
+                laws += "; " + b["capability_reason"]
+            ports = str(b.get("input_ports")) + "-" + str(b.get("output_ports"))
+            lines.append(f'| {b["name"]} | {b["subtype"]} / {ports} | {b["status"]} | {c["status"]} | {controls} | {laws} |')
         lines.append("")
         for feature, v in r["variants"].items():
             for mode, c in v["compiles"].items():

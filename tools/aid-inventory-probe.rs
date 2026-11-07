@@ -32,7 +32,7 @@ fn graph_boxes(b: &Bundle) -> aurora_speaker_tuning::error::Result<Vec<Value>> {
                 .iter()
                 .find(|w| w.src.node == bx.name && w.src.port == 0)
                 .and_then(|w| dspg::analysis::wire_channels(&graph, w).ok());
-            let mut entry = json!({"name":bx.name,"subtype":subtype,
+            let mut entry = json!({"name":bx.name,"subtype":subtype,"input_ports":bx.inputs,"output_ports":bx.outputs,
             "bypass":effect.is_some_and(|e| e.bypass),"channels":channels,
             "before_protection":false,"protection":matches!(subtype.as_str(),"spp3"|"atsp"|"lsm2")});
             if subtype == "mstk" {
@@ -97,6 +97,7 @@ fn main() {
     for stage in &t.chain {
         let subtype = stage.unit.map(|u| u.subtype.to_string()).unwrap_or_else(|| stage.kind.clone());
         let mut b = json!({"name":stage.name, "subtype":subtype, "bypass":stage.bypass,"channels":stage.channels,
+            "input_ports":stage.inputs,"output_ports":stage.outputs,
             "before_protection": stage.before_protection, "protection":stage.name == t.protection.box_name});
         if let Some(g) = stage.state.as_ref().and_then(|s| s.global()) {
             if subtype == "mstk" {

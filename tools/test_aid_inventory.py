@@ -101,6 +101,17 @@ class PrivacyAndStatus(unittest.TestCase):
         self.assertEqual(public["load_refusal"], "dbcontrol-unimplemented")
         self.assertNotIn("PRIVATE", json.dumps(public))
 
+    def test_unimplemented_declaration_does_not_invent_a_refusal(self):
+        raw = {"unit": "lsm2", "boxes": [
+            {"name": "Control", "subtype": "dbcontrol", "bypass": False,
+             "input_ports": 0, "output_ports": 0, "channels": None,
+             "before_protection": False, "protection": False}]}
+        box = inventory.public_probe(raw)["boxes"][0]
+        self.assertEqual(box["status"], "unimplemented")
+        self.assertIsNone(box["refusal_text"])
+        self.assertIn("dbcontrol", box["capability_reason"])
+        self.assertEqual((box["input_ports"], box["output_ports"]), (0, 0))
+
 
 if __name__ == "__main__":
     unittest.main()
