@@ -1391,8 +1391,12 @@ impl Run {
     }
 
     #[inline]
+    /// The band saturator shapes the gained band, as on the analytic path.
+    /// Black-box (installed unit, AID37/42 strips with every band on
+    /// flavour 1): shaping before the gain left full-scale tones 0.05 to
+    /// 0.09 dB low; after the gain every per-box probe is within 0.02 dB.
     fn band_output(flavor: Option<u32>, gain: f64, x: f64) -> f64 {
-        gain * Self::saturate(flavor, x)
+        Self::saturate(flavor, gain * x)
     }
 
     pub fn process(&mut self, bufs: &mut [&mut [f32]], frames: usize) {
@@ -2157,8 +2161,9 @@ mod tests {
     }
 
     #[test]
-    fn saturation_precedes_detector_gain() {
-        assert_eq!(Run::band_output(Some(0), 0.25, 2.0), 0.25);
+    fn saturation_follows_detector_gain() {
+        assert_eq!(Run::band_output(Some(0), 0.25, 2.0), 0.5);
+        assert_eq!(Run::band_output(Some(0), 1.0, 2.0), 1.0);
         assert_eq!(Run::band_output(None, 0.25, 2.0), 0.5);
     }
 
