@@ -691,8 +691,7 @@ impl Run {
             legacy_split_allpass_state: [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
             legacy_merge_allpass_state: [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
             detector_state: [[[[0.0; 2]; MAX_DETECTOR_FILTERS]; BANDS]; MAX_CHANNELS],
-            overshoot_state: vec![0.0; MAX_CHANNELS * BANDS * BANDS * MAX_DETECTOR_FILTERS * 2]
-                .into_boxed_slice(),
+            overshoot_state: vec![0.0; MAX_CHANNELS * BANDS * BANDS * MAX_DETECTOR_FILTERS * 2].into_boxed_slice(),
         }
     }
 
