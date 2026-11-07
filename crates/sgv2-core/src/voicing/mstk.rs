@@ -727,6 +727,10 @@ enum Cadence {
     /// Every Nth detector-band sample, no prefilter (algorithm 3 and every
     /// quality-2 setting).
     Pick,
+    /// A box carrying threshold automation renders in eight-frame
+    /// automation sub-blocks and picks one real-waveform detector sample per
+    /// sub-block in every band.
+    PickEight,
     /// One value per fixed eight-frame hop in every band, at every rate
     /// (algorithms 0-2 at quality 0 and 1). The hop keeps the largest
     /// magnitude it saw, so no peak between updates is lost.
@@ -740,9 +744,18 @@ enum Cadence {
 /// alternate at that stride swings the gain by more than 12 dB with its
 /// start phase.  Algorithms 0-2 at quality 0 and 1 update all four bands
 /// every eight frames at 44.1, 48 and 96 kHz alike, and their steady gain
-/// does not depend on a tone's phase in any band.
+/// does not depend on a tone's phase in any band.  With saved threshold
+/// automation (AU parameter 79 curves) the picking cadence is eight frames
+/// in every band instead: the onset sawtooth has period 8 in bands 1-3 and
+/// tones at multiples of fs/16 swing the gain with their start phase; the
+/// same preset without its automation curves returns to [1, 2, 4, 4].  With
+/// overshoot compensation off, that eight-frame pick of the Butterworth-half
+/// magnitude reproduces the unit's steady tone gains above 300 Hz exactly.
 fn cadence(p: &Params) -> Cadence {
-    if p.algorithm >= 3 || p.render_quality >= 2 {
+    let picks = p.algorithm >= 3 || p.render_quality >= 2;
+    if picks && p.threshold_automation.iter().any(|curve| curve.count != 0) {
+        Cadence::PickEight
+    } else if picks {
         Cadence::Pick
     } else {
         Cadence::HopPeak
@@ -755,6 +768,7 @@ fn detector_factors(p: &Params) -> [usize; BANDS] {
     // SRC above.
     match cadence(p) {
         Cadence::Pick => [1, 2, 4, 4],
+        Cadence::PickEight => [8; BANDS],
         Cadence::HopPeak => [8; BANDS],
     }
 }
@@ -1446,6 +1460,16 @@ mod tests {
         p.algorithm = 0;
         p.render_quality = 2;
         assert_eq!(Run::new(&p, 48_000.0, 1).detector_factor, [1, 2, 4, 4]);
+
+        // Threshold automation switches the picking cadence to eight frames.
+        let mut automated = p;
+        automated.threshold_automation[0].count = 2;
+        automated.threshold_automation[0].points[0] = AutomationPoint { input: -100.0, value: -20.0 };
+        automated.threshold_automation[0].points[1] = AutomationPoint { input: 0.0, value: -30.0 };
+        let run = Run::new(&automated, 48_000.0, 1);
+        assert_eq!(run.detector_factor, [8; BANDS]);
+        assert_eq!(run.detector_window, [61, 49, 13, 7]);
+        assert!(!run.hop_peak);
 
         let mut max = SlidingMax::EMPTY;
         assert_eq!(max.push(9.0, 3), 9.0);

@@ -63,6 +63,7 @@ fn main() {
     let (mut aid, mut name, mut ch, mut only_slot) = (None, None, None, None);
     let mut voicing_chain = false;
     let mut sample_rate = None;
+    let mut automation_input = None;
     let mut files = Vec::new();
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -76,12 +77,13 @@ fn main() {
             "--only-slot" => only_slot = it.next().and_then(|v| v.parse::<u32>().ok()),
             "--voicing-chain" => voicing_chain = true,
             "--sample-rate" => sample_rate = it.next().and_then(|v| v.parse::<i128>().ok()),
+            "--automation-input" => automation_input = it.next().and_then(|v| v.parse::<f64>().ok()),
             _ => files.push(a),
         }
     }
     let (Some(ch), [inp, out]) = (ch, files.as_slice()) else {
         eprintln!(
-            "usage: voicing-box-render (--tunings-root DIR --aid N --box NAME [--voicing-chain] [--sample-rate HZ] \
+            "usage: voicing-box-render (--tunings-root DIR --aid N --box NAME [--voicing-chain] [--sample-rate HZ] [--automation-input V] \
              | --params-words FILE [--fs HZ]) --ch C IN.f32 OUT.f32"
         );
         exit(2)
@@ -136,6 +138,11 @@ fn main() {
             let p = voicing::mstk::compile(stage, fs, &mut diags).unwrap_or_else(|e| die(format!("{e:?}")));
             if let Some(p) = p {
                 let mut run = sgv2_core::voicing::mstk::Run::new(&p, fs, ch);
+                if let Some(v) = automation_input {
+                    // The value a graph relays into the box's automation
+                    // input (AU parameter 79), e.g. a VolumeTaper output.
+                    run.set_automation_input(v);
+                }
                 let mut at = 0;
                 while at < frames {
                     let k = (frames - at).min(512);
