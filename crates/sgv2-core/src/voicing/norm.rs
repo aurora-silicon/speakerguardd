@@ -258,6 +258,18 @@ impl LongTerm {
         self.gate_a = pole(GATE_S, self.rate);
     }
 
+    /// Translate retained state into a colder level coordinate.
+    fn shift_down(&mut self, db: f64) {
+        let bins = libm::round(db / BIN_DB).max(0.0) as usize;
+        if bins >= BINS {
+            self.hist.iter_mut().for_each(|h| *h = 0.0);
+        } else if bins != 0 {
+            self.hist.copy_within(bins.., 0);
+            self.hist[BINS - bins..].fill(0.0);
+        }
+        self.reading -= db;
+    }
+
     /// One window's mean power; the output slot. An invalid window returns
     /// the retained reading without changing or aging the histogram.
     fn update(&mut self, power: f64) -> f64 {
@@ -421,6 +433,44 @@ impl Precondition {
     }
 }
 
+/// Low-level coordinate correction used by algorithm versions 2 and 3.
+/// It detects a settled rise far below expected loudness and returns the
+/// exact correction applied to the retained long-path coordinate.
+struct LevelCorrection {
+    rate: f32,
+    smoothed: f32,
+    last_peak: f32,
+}
+
+impl LevelCorrection {
+    fn new(rate: f32) -> Self {
+        Self { rate, smoothed: 0.0, last_peak: 0.0 }
+    }
+
+    fn reset(&mut self) {
+        self.smoothed = 0.0;
+        self.last_peak = 0.0;
+    }
+
+    fn update(&mut self, peak: f64, count: usize, expected: f64) -> f64 {
+        if count == 0 {
+            return 0.0;
+        }
+        let raw_peak = peak as f32;
+        let peak = raw_peak.max(VALID_DB as f32);
+        let slope = self.rate * (peak - self.last_peak) / count as f32 / 100.0;
+        self.last_peak = peak;
+        let trigger = slope < 1.0 && self.smoothed + 4.0 < peak;
+        self.smoothed = if trigger || self.smoothed > peak {
+            peak
+        } else {
+            self.smoothed + (peak - self.smoothed) * 10.0 * count as f32 / self.rate
+        };
+        let correct = trigger && raw_peak < expected as f32 - 10.0;
+        if correct { 1.5 } else { 0.0 }
+    }
+}
+
 /// The long path's input: the sliding mean of the last 600 smoothed
 /// powers, kept as a running sum.
 struct Window {
@@ -473,6 +523,7 @@ pub struct Run {
     median: Median,
     long: LongTerm,
     pre: Precondition,
+    correction: LevelCorrection,
     fs: f64,
     /// The call's loudest 64-frame level, dB, and its 64-frame events.
     peak: f64,
@@ -520,6 +571,7 @@ impl Run {
             median: Median::new(block_rate),
             long: LongTerm::new(long_rate),
             pre: Precondition::new(fs as f32 / STEP as f32),
+            correction: LevelCorrection::new(fs as f32 / STEP as f32),
             fs,
             peak: f64::NEG_INFINITY,
             events: 0,
@@ -555,6 +607,7 @@ impl Run {
         self.median.reset(e);
         self.long.reset(e);
         self.pre.reset();
+        self.correction.reset();
         self.peak = f64::NEG_INFINITY;
         self.events = 0;
         self.fast = e;
@@ -632,6 +685,17 @@ impl Run {
     /// End of a call: the fast path's held level, then the long path's
     /// preconditioner and the two maxima.
     fn arbitrate(&mut self) {
+        let correction = self.correction.update(self.peak, self.events, self.p.expected_db);
+        if correction > 0.0 {
+            self.long.shift_down(correction);
+            self.long_line.iter_mut().for_each(|v| *v -= correction);
+            self.long_out -= correction;
+            self.pre.out -= correction;
+            self.held -= correction;
+            if let Some((_, _, long)) = self.pending.as_mut() {
+                *long -= correction;
+            }
+        }
         let fast = self.peak + FAST_STORE_DB;
         let span = self.fs / self.events as f64;
         if fast > VALID_DB {
@@ -942,6 +1006,15 @@ mod tests {
         slow.history = FAST_HISTORY;
         slow.arbitrate();
         assert!(fast.fast < slow.fast, "{} vs {}", fast.fast, slow.fast);
+    }
+
+    #[test]
+    fn settled_low_level_rise_requests_one_coordinate_correction() {
+        let mut correction = LevelCorrection::new(750.0);
+        assert_eq!(correction.update(-70.0, 8, -20.0), 0.0);
+        assert_eq!(correction.update(-65.0, 8, -20.0), 0.0);
+        assert_eq!(correction.update(-65.0, 8, -20.0), 1.5);
+        assert_eq!(correction.update(-65.0, 8, -20.0), 0.0);
     }
 
     #[test]
