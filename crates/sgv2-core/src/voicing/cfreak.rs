@@ -37,8 +37,8 @@
 //!   windowed-sinc low pass `h` ([`FIR_TAPS`] taps at the oversampled rate,
 //!   [`FIR_HALF_BASE`] base frames of delay, Kaiser window [`WINDOW_BETA`]
 //!   over [`WINDOW_HALF_OS`] oversampled samples each side), cut at
-//!   `19 kHz - 1 kHz * mode`
-//!   (rates up to 48 kHz) or `fs / 4` (88.2 kHz and up);
+//!   `min(19 kHz - 1 kHz * mode, fs / 2)` (rates up to 48 kHz) or `fs / 4`
+//!   (88.2 kHz and up);
 //! * on the oversampled signal a de-esser cut `D` (the saved frequency
 //!   `f0`, strength `S` dB and Q:
 //!   `D(s) = (s^2 + s w0/Q + w0^2) / (s^2 + s w0/(Q g) + w0^2)`,
@@ -342,7 +342,9 @@ fn bessel_i0(x: f64) -> f64 {
 
 /// The saturation low pass at the oversampled rate, unity DC gain.
 fn saturation_fir(mode: u32, fs: f64) -> [f64; FIR_TAPS] {
-    let fc = if fs >= 88_000.0 { fs / 4.0 } else { 19_000.0 - 1_000.0 * f64::from(mode) };
+    // 32 kHz: every mode cuts at fs/2 (measured); 44.1/48 kHz: per mode;
+    // 88.2 kHz and up: fs/4 for every mode.
+    let fc = if fs >= 88_000.0 { fs / 4.0 } else { (19_000.0 - 1_000.0 * f64::from(mode)).min(fs / 2.0) };
     let fs_os = fs * OVERSAMPLE as f64;
     let mut h = [0.0; FIR_TAPS];
     let mid = (FIR_TAPS / 2) as f64;
