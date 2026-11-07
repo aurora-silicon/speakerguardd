@@ -20,7 +20,7 @@ use aurora_speaker_tuning::bundle::Bundle;
 use aurora_speaker_tuning::dspg::analysis::{Lane, Origin, Pass};
 use aurora_speaker_tuning::tuning::{Options, Tuning};
 use aurora_speaker_tuning::{prestage, voicing, Diagnostics};
-use sgv2_core::voicing::chain::{Chain, Kind, NodeSpec, Source, Spec};
+use sgv2_core::voicing::chain::{Chain, GraphParam, Kind, Link, NodeSpec, Source, Spec};
 use std::path::PathBuf;
 use std::process::exit;
 
@@ -64,6 +64,8 @@ fn main() {
     let mut voicing_chain = false;
     let mut sample_rate = None;
     let mut automation_input = None;
+    let mut tone_volume = None;
+    let mut own_timing = false;
     let mut files = Vec::new();
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -75,9 +77,13 @@ fn main() {
             "--box" => name = it.next(),
             "--ch" => ch = it.next().and_then(|v| v.parse::<usize>().ok()),
             "--only-slot" => only_slot = it.next().and_then(|v| v.parse::<u32>().ok()),
+            "--slot-own-timing" => own_timing = true,
             "--voicing-chain" => voicing_chain = true,
             "--sample-rate" => sample_rate = it.next().and_then(|v| v.parse::<i128>().ok()),
             "--automation-input" => automation_input = it.next().and_then(|v| v.parse::<f64>().ok()),
+            // ToneMeister's volume-automation input (its parameter 3), as
+            // the installed unit's saved state or a rig sets it.
+            "--tone-volume" => tone_volume = it.next().and_then(|v| v.parse::<f64>().ok()),
             _ => files.push(a),
         }
     }
@@ -109,6 +115,18 @@ fn main() {
             .as_mut()
             .and_then(|s| s.sections.iter_mut().find(|s| s.scope == 0 && s.element == 0))
             .unwrap_or_else(|| die(format!("box {name} has no global saved state")));
+        // The unit stores attack/release/smoothing triplets per
+        // level-dependent slot in use, so an isolated slot reads the first
+        // triplet. With --slot-own-timing the slot keeps its own (a rig must
+        // then set the installed unit's first triplet the same way).
+        let saved = |id: u32| global.params.iter().find(|(i, _)| *i == id).map(|(_, v)| *v).unwrap_or(0.0);
+        let in_use = (0..slot)
+            .filter(|&j| {
+                let kind = saved(14 + 10 * j + 1);
+                saved(14 + 10 * j) != 0.0 && (kind == 15.0 || kind == 18.0)
+            })
+            .count() as u32;
+        let triplet = [0, 1, 2].map(|k| saved(616 + 3 * in_use + k));
         let mut set = |id: u32, value: f32| {
             if let Some((_, v)) = global.params.iter_mut().find(|(i, _)| *i == id) {
                 *v = value;
@@ -116,6 +134,11 @@ fn main() {
                 global.params.push((id, value));
             }
         };
+        if own_timing {
+            for (k, v) in triplet.into_iter().enumerate() {
+                set(616 + k as u32, v);
+            }
+        }
         for id in [0, 1, 4, 11, 13] {
             set(id, 0.0);
         }
@@ -163,10 +186,15 @@ fn main() {
                     program_channels: ch,
                     nodes: vec![NodeSpec { kind: Kind::Tone(tone), inputs: (0..ch).map(Source::Program).collect() }],
                     outputs: (0..ch).map(|channel| Source::Node(0, channel)).collect(),
-                    links: Vec::new(),
+                    links: tone_volume
+                        .map(|_| vec![Link { param: GraphParam::VolumeScalar, node: 0, id: 3 }])
+                        .unwrap_or_default(),
                     relays: Vec::new(),
                 };
                 let mut run = Chain::new(spec, fs, 512).unwrap_or_else(|| die("invalid isolated Tone chain"));
+                if let Some(v) = tone_volume {
+                    run.set_param(GraphParam::VolumeScalar, v);
+                }
                 let mut rendered = vec![vec![0.0f32; frames]; ch];
                 let mut at = 0;
                 while at < frames {

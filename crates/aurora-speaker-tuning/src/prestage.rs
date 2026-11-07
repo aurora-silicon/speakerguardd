@@ -148,8 +148,8 @@ const SLOT_STRIDE: u32 = 10;
 /// Volume automation entries after the slots (514 and 515 are the range of
 /// the system volume they follow): target filter, state, set point A, set
 /// point B with its gain and frequency, set point M's enable, M, its gain
-/// and frequency. Ten entries; the slots' attack and release follow (616
-/// on).
+/// and frequency. Ten entries; attack, release and smoothing triplets
+/// follow (616 on), one per level-dependent slot in use, in slot order.
 const AUTOMATION_BASE: u32 = 516;
 const AUTOMATION_STRIDE: u32 = 10;
 const AUTOMATION_ENTRIES: u32 = 10;
@@ -815,9 +815,19 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics, mode: Rea
         if let Some(dynamic_kind) = dynamic_kind {
             let threshold = at(6)?;
             let sidechain_mask = at(8)?;
-            let attack = get(616 + 3 * i);
-            let release = get(617 + 3 * i);
-            let smooth = get(618 + 3 * i);
+            // The explicit attack/release triplets are stored per
+            // level-dependent slot in use (state set), in slot order, not
+            // per slot number.
+            let in_use = (0..i)
+                .filter(|&j| {
+                    let state = get(SLOT_BASE + SLOT_STRIDE * j);
+                    let kind = get(SLOT_BASE + SLOT_STRIDE * j + 1);
+                    state != 0.0 && (kind == 15.0 || kind == 18.0)
+                })
+                .count() as u32;
+            let attack = get(616 + 3 * in_use);
+            let release = get(617 + 3 * in_use);
+            let smooth = get(618 + 3 * in_use);
             if !(0.0..=65535.0).contains(&sidechain_mask) || sidechain_mask.fract() != 0.0 {
                 return Err(bad(format!("{ctx}: slot {i} sidechain mask {sidechain_mask}")));
             }
@@ -1720,6 +1730,23 @@ mod tests {
         let ph = part(&high_cut, 0, fs, &mut d).unwrap();
         assert_eq!((ph.sections.len(), ph.dynamics.len()), (0, 1));
         assert_eq!(ph.dynamics[0].params.kind, DynamicKind::HighShelf);
+        // Attack/release/smoothing triplets follow the level-dependent slots
+        // in use, in order: slot 5 is the second such slot (619..621); an
+        // unused level-dependent slot does not take a triplet.
+        let timed = tmst(
+            &[(616, 5.0), (617, 6.0), (618, 0.0), (619, 20.0), (620, 100.0), (621, 1.0)],
+            &[
+                (1, [3.0, 15.0, -3.0, 400.0, 2.0, 2.0, 3.0, 0.0]),
+                (3, [0.0, 15.0, -3.0, 900.0, 2.0, 2.0, 3.0, 0.0]),
+                (5, [3.0, 15.0, -6.0, 120.0, 2.0, 3.0, 3.0, 0.0]),
+            ],
+        );
+        let pt = part(&timed, 0, fs, &mut d).unwrap();
+        assert_eq!(pt.dynamics.len(), 2);
+        let first = pt.dynamics[0].params;
+        let second = pt.dynamics[1].params;
+        assert_eq!((first.attack_ms, first.release_ms, first.smooth), (5.0, 6.0, false));
+        assert_eq!((second.attack_ms, second.release_ms, second.smooth), (20.0, 100.0, true));
         let odd = tmst(&[], &[(0, [3.0, 13.0, 0.0, 700.0, 0.7, 2.0, 3.0, 0.0])]);
         assert!(part(&odd, 0, fs, &mut d).is_err());
         // a running slot in a bypassed group is carried only as a cut
