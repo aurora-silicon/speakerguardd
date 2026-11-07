@@ -558,6 +558,9 @@ fn analytic_detector_paths(p: &Params, fs: f64) -> ([DetectorPath; BANDS], [Dete
                 push_detector_lr(&mut band[b], high, n[stage], f[stage], fs);
                 push_detector_allpass(&mut reference[b], n[stage], f[stage], fs);
             }
+            let phase_stage = if b < 2 { 2 } else { 0 };
+            push_detector_allpass(&mut band[b], n[phase_stage], f[phase_stage], fs);
+            push_detector_allpass(&mut reference[b], n[phase_stage], f[phase_stage], fs);
         }
     }
     (band, reference)
