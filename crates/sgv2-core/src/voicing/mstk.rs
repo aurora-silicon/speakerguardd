@@ -537,25 +537,12 @@ fn append_half(output: &mut Path, stage: &HalfStage, high: bool) {
 /// nonparticipating full allpasses retain the collapsed bank's neutral path.
 fn half_synthesis_paths(p: &Params, fs: f64, half: &[HalfStage; XOVERS]) -> [Path; BANDS] {
     let mut out = [Path::EMPTY; BANDS];
-    if p.render_quality == 1 && p.algorithm < 3 {
-        for (band, path) in out.iter_mut().enumerate() {
-            for (stage, item) in half.iter().enumerate() {
-                if stage < band {
-                    append_half(path, item, true);
-                } else if stage == band && band < XOVERS {
-                    append_half(path, item, false);
-                } else if stage > band {
-                    let mut allpass = Path::EMPTY;
-                    push_lr_allpass(&mut allpass, effective_order(p.crossover_order[stage]), p.crossover_hz[stage], fs);
-                    append_path(path, &allpass);
-                }
-            }
-        }
-        return out;
-    }
-
+    // Synthesis walks from each band's outer edge back toward the middle
+    // crossover, then applies the nonparticipating outer allpass. Quality 1
+    // keeps its sequential analysis chain, but uses this same middle-first
+    // synthesis tree (captured q1 band 1: H0,L1,AP2; band 2: L2,H1,AP0).
     let tree: [&[(usize, bool)]; BANDS] =
-        [&[(1, false), (0, false)], &[(1, false), (0, true)], &[(1, true), (2, false)], &[(1, true), (2, true)]];
+        [&[(0, false), (1, false)], &[(0, true), (1, false)], &[(2, false), (1, true)], &[(2, true), (1, true)]];
     let passing = [2, 2, 0, 0];
     for (band, path) in out.iter_mut().enumerate() {
         for &(stage, high) in tree[band] {
