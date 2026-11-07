@@ -6,7 +6,9 @@
 //! The parameter compiler supplies the Audio Unit's saved controls.  This
 //! module contains no machine tuning.  Detection uses the Butterworth half
 //! of each Linkwitz-Riley band and is linked by taking the largest channel
-//! magnitude, while audio filtering and saturation remain per channel.
+//! magnitude.  Overshoot compensation sends each band-local detector signal
+//! through the same four-band analysis bank once more and sums the four
+//! magnitudes.  Audio filtering and saturation remain per channel.
 //! Construction owns all storage; [`Run::process`] allocates
 //! nothing and accepts arbitrary frame counts.
 
@@ -605,14 +607,12 @@ pub struct Run {
     curve: [[f64; CURVE_POINTS]; BANDS],
     curve_top_db: f64,
     release: [f64; BANDS],
-    recovery: [f64; BANDS],
     release_on: bool,
     algorithm0: bool,
     legacy_recombination: bool,
     overshoot_compensation: bool,
     channels: usize,
     env: [f64; BANDS],
-    smoothed_gain: [f64; BANDS],
     detector_window: [usize; BANDS],
     detector_factor: [usize; BANDS],
     detector_phase: [usize; BANDS],
@@ -624,6 +624,7 @@ pub struct Run {
     legacy_split_allpass_state: [[[[f64; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
     legacy_merge_allpass_state: [[[[f64; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
     detector_state: [[[[f32; 2]; MAX_DETECTOR_FILTERS]; BANDS]; MAX_CHANNELS],
+    overshoot_state: [[[[[f32; 2]; MAX_DETECTOR_FILTERS]; BANDS]; BANDS]; MAX_CHANNELS],
 }
 
 impl Run {
@@ -658,7 +659,6 @@ impl Run {
                 0.0
             }
         });
-        let recovery = release.map(|coefficient| 1.0 - coefficient);
         Run {
             path: paths(q, fs),
             legacy_stage: legacy_stages(q, fs),
@@ -671,14 +671,12 @@ impl Run {
             curve: q.band.map(|b| curve_points(b, curve_top_db)),
             curve_top_db,
             release,
-            recovery,
             release_on: q.release_on,
             algorithm0: q.algorithm == 0,
             legacy_recombination: q.render_quality == 1 && q.algorithm < 3,
             overshoot_compensation: q.overshoot_compensation,
             channels: channels.min(MAX_CHANNELS),
             env: [0.0; BANDS],
-            smoothed_gain: [1.0; BANDS],
             detector_window,
             detector_factor,
             detector_phase: [0; BANDS],
@@ -690,12 +688,12 @@ impl Run {
             legacy_split_allpass_state: [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
             legacy_merge_allpass_state: [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
             detector_state: [[[[0.0; 2]; MAX_DETECTOR_FILTERS]; BANDS]; MAX_CHANNELS],
+            overshoot_state: [[[[[0.0; 2]; MAX_DETECTOR_FILTERS]; BANDS]; BANDS]; MAX_CHANNELS],
         }
     }
 
     pub fn reset(&mut self) {
         self.env = [0.0; BANDS];
-        self.smoothed_gain = [1.0; BANDS];
         self.detector_max = [SlidingMax::EMPTY; BANDS];
         self.detector_phase = [0; BANDS];
         self.detector_rms = [0.0; BANDS];
@@ -707,6 +705,7 @@ impl Run {
         self.legacy_split_allpass_state = [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS];
         self.legacy_merge_allpass_state = [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS];
         self.detector_state = [[[[0.0; 2]; MAX_DETECTOR_FILTERS]; BANDS]; MAX_CHANNELS];
+        self.overshoot_state = [[[[[0.0; 2]; MAX_DETECTOR_FILTERS]; BANDS]; BANDS]; MAX_CHANNELS];
     }
 
     pub fn latency(&self) -> usize {
@@ -786,7 +785,25 @@ impl Run {
                 z[1] = (s.b2 * v - s.a2 * o) as f32;
                 v = o;
             }
-            *y = (v * self.band_in[b] * self.detector_bandwidth[b]).abs() as f32 as f64;
+            let magnitude = if self.overshoot_compensation {
+                let mut sum = 0.0;
+                for analysis_band in 0..BANDS {
+                    let mut branch = v;
+                    for i in 0..self.detector_path[analysis_band].count {
+                        let s = self.detector_path[analysis_band].section[i];
+                        let z = &mut self.overshoot_state[c][b][analysis_band][i];
+                        let o = s.b0 * branch + z[0] as f64;
+                        z[0] = (s.b1 * branch - s.a1 * o + z[1] as f64) as f32;
+                        z[1] = (s.b2 * branch - s.a2 * o) as f32;
+                        branch = o;
+                    }
+                    sum += branch.abs();
+                }
+                sum
+            } else {
+                v.abs()
+            };
+            *y = (magnitude * self.band_in[b] * self.detector_bandwidth[b]) as f32 as f64;
         }
         out
     }
@@ -800,13 +817,7 @@ impl Run {
             return 1.0;
         }
         let level = 20.0 * libm::log10(self.env[b].max(1e-5));
-        let target = spline_gain(&self.curve[b], level, self.curve_top_db);
-        if self.overshoot_compensation && target > self.smoothed_gain[b] {
-            self.smoothed_gain[b] += (target - self.smoothed_gain[b]) * self.recovery[b];
-        } else {
-            self.smoothed_gain[b] = target;
-        }
-        self.smoothed_gain[b]
+        spline_gain(&self.curve[b], level, self.curve_top_db)
     }
 
     #[inline]
@@ -1168,13 +1179,13 @@ mod tests {
     }
 
     #[test]
-    fn reset_clears_the_detector_and_restores_unity_smoothed_gain() {
+    fn reset_clears_the_detector_and_overshoot_bank() {
         let mut run = Run::new(&params(), 48_000.0, 1);
         run.env = [0.25; BANDS];
-        run.smoothed_gain = [0.25; BANDS];
+        run.overshoot_state[0][0][0][0] = [0.25; 2];
         run.reset();
         assert_eq!(run.env, [0.0; BANDS]);
-        assert_eq!(run.smoothed_gain, [1.0; BANDS]);
+        assert_eq!(run.overshoot_state[0][0][0][0], [0.0; 2]);
     }
 
     #[test]
