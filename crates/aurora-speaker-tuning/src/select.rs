@@ -190,7 +190,22 @@ pub fn speaker_chain(b: &Bundle, speaker_id: Option<i128>, diags: &mut Diagnosti
     };
     let candidates: Vec<&Configuration> =
         all.iter().filter(|c| c.cdes_kind == Some(kind) && c.graph.is_some() && c.strip.is_some()).collect();
+    let neutral = |c: &&Configuration| c.speaker_id.is_none() || c.speaker_id == Some(SPID_GENERIC);
+    // A database whose General configurations name no speaker vendor (the
+    // M2's, the J700's) has one chain for every vendor: the speaker ID
+    // selects nothing there, so it is neither needed nor checked.
+    let by_vendor = candidates.iter().any(|c| !neutral(c));
     let pick: Vec<&Configuration> = match speaker_id {
+        _ if !by_vendor => {
+            if let Some(id) = speaker_id {
+                diags.info(
+                    "select-speaker-id-unused",
+                    ctx,
+                    format!("speaker ID {id}: the database has one configuration for every speaker vendor"),
+                );
+            }
+            candidates.iter().copied().filter(neutral).collect()
+        }
         Some(id) => candidates.iter().copied().filter(|c| c.speaker_id == Some(id)).collect(),
         None => {
             diags.warn(
@@ -198,11 +213,7 @@ pub fn speaker_chain(b: &Bundle, speaker_id: Option<i128>, diags: &mut Diagnosti
                 ctx,
                 format!("speaker ID unknown: using the vendor-neutral (spid {SPID_GENERIC} or none) configuration"),
             );
-            candidates
-                .iter()
-                .copied()
-                .filter(|c| c.speaker_id.is_none() || c.speaker_id == Some(SPID_GENERIC))
-                .collect()
+            candidates.iter().copied().filter(neutral).collect()
         }
     };
     let c = match pick.as_slice() {
