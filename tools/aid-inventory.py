@@ -105,6 +105,8 @@ REASONS = [
 def reason(message):
     if ("metadata.json" in message or "manifest.json" in message) and "No such file" in message:
         return "bundle-manifest-missing"
+    if "volume automation " in message and " on slot " in message and ": state " in message:
+        return "tmst-automation-state-refused"
     return next((label for phrase, label in REASONS if phrase in message), "unclassified-refusal")
 
 def todo_law(code, message):
