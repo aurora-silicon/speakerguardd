@@ -143,10 +143,11 @@ def overlay(private):
         "crates/sgv2-core/src/prestage.rs": [
             ("            self.process_conservative_high_shelf(at, bufs, frames, n);", "            crate::aid_inventory_trace::hit(2);\n            self.process_conservative_high_shelf(at, bufs, frames, n);"),
             ("        if at.params.kind == DynamicKind::HighShelf && !at.params.smooth {", "        if at.params.kind == DynamicKind::Notch { crate::aid_inventory_trace::hit(16); }\n        if at.params.kind == DynamicKind::HighShelf && !at.params.smooth {"),
-            ("x.clamp(-INPUT_BOUND, INPUT_BOUND)", "crate::aid_inventory_trace::bounded(x, INPUT_BOUND)", 3),
+            ("let x = if x.is_finite() { x.clamp(-INPUT_BOUND, INPUT_BOUND)", "let x = if x.is_finite() { crate::aid_inventory_trace::bounded(x, INPUT_BOUND)"),
+            ("x.clamp(-INPUT_BOUND, INPUT_BOUND)", "crate::aid_inventory_trace::bounded(*x, INPUT_BOUND)", 2),
             ("v.clamp(-INPUT_BOUND, INPUT_BOUND)", "crate::aid_inventory_trace::bounded(v, INPUT_BOUND)", 3),
-            ("sample.clamp(-INPUT_BOUND, INPUT_BOUND)", "crate::aid_inventory_trace::bounded(sample, INPUT_BOUND)", 2),
-            ("y.clamp(-INPUT_BOUND, INPUT_BOUND)", "crate::aid_inventory_trace::bounded(y, INPUT_BOUND)", 2)],
+            ("sample.clamp(-INPUT_BOUND, INPUT_BOUND)", "crate::aid_inventory_trace::bounded(*sample, INPUT_BOUND)", 2),
+            ("y.clamp(-INPUT_BOUND, INPUT_BOUND)", "crate::aid_inventory_trace::bounded(*y, INPUT_BOUND)", 2)],
         "crates/sgv2-core/src/voicing/mstk.rs": [
             ("x.clamp(-INPUT_BOUND, INPUT_BOUND)", "crate::aid_inventory_trace::bounded(x, INPUT_BOUND)")],
         "crates/sgv2-core/src/voicing/lowflow.rs": [
