@@ -486,17 +486,33 @@ struct Follower {
 
 impl Follower {
     fn new(fs: f64, ratio: f64) -> Follower {
-        Follower::with_times(fs, ratio, law::LC_ATTACK_S, law::LC_RELEASE_S, law::LC_HOLD_S, law::LC_SMOOTH_S)
+        Follower::with_times(
+            fs,
+            ratio,
+            law::LC_ATTACK_S,
+            law::LC_RELEASE_S,
+            law::LC_HOLD_S,
+            law::LC_SMOOTH_S,
+            law::LC_SEED,
+        )
     }
 
-    fn with_times(fs: f64, ratio: f64, attack_s: f64, release_s: f64, hold_s: f64, smooth_s: f64) -> Follower {
+    fn with_times(
+        fs: f64,
+        ratio: f64,
+        attack_s: f64,
+        release_s: f64,
+        hold_s: f64,
+        smooth_s: f64,
+        seed: f64,
+    ) -> Follower {
         let fs = fs as f32;
         let pole = |t: f64| libm::expf(-1.0 / (t as f32 * fs));
         Follower {
             ratio: ratio as f32,
             tie: f32::INFINITY,
-            e: law::LC_SEED as f32,
-            s: law::LC_SEED as f32,
+            e: seed as f32,
+            s: seed as f32,
             held: 0,
             hold: (hold_s as f32 * fs) as usize + 1,
             a_att: pole(attack_s),
@@ -556,6 +572,7 @@ impl HarmonicCompressor {
                 law::COMP_RELEASE_S,
                 law::COMP_HOLD_S,
                 law::COMP_SMOOTH_S,
+                0.0,
             ),
         }
     }
@@ -874,6 +891,8 @@ mod tests {
     #[test]
     fn harmonic_compressor_tracks_soft_knee_gain_reduction() {
         let mut c = HarmonicCompressor::new(8_000.0, 0.0, 4.0);
+        assert_eq!(c.follower.e, 0.0);
+        assert_eq!(c.follower.s, 0.0);
         assert!((c.run(-0.1) + 0.1).abs() < 1e-6);
         let mut y = 0.0;
         for _ in 0..8_000 {
