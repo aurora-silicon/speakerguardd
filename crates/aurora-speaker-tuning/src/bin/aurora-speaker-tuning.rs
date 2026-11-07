@@ -406,6 +406,7 @@ fn identify(bundle: aurora_speaker_tuning::Result<Bundle>, json: bool) {
         "speaker_id": m.speaker_id,
         "board": m.board,
         "unit_bound": m.unit_id.is_some(),
+        "unit_id": m.unit_id,
         "files": m.records().count().max(b.files.len()),
         "digest": b.digest(),
         "reader": env!("CARGO_PKG_VERSION"),

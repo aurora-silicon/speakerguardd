@@ -334,7 +334,10 @@ fn digest_is_the_bundle_identity() {
 fn identify_cli() {
     let files = spp3_files(2);
     let dir = scratch("identify-cli");
-    write_dir(&dir, &files, &manifest_json(&files, "25G83"));
+    let mut manifest: serde_json::Value = serde_json::from_str(&manifest_json(&files, "25G83")).unwrap();
+    manifest["board"] = "j316s".into();
+    manifest["unit_id"] = "ab".repeat(32).into();
+    write_dir(&dir, &files, &serde_json::to_string(&manifest).unwrap());
     let exe = env!("CARGO_BIN_EXE_aurora-speaker-tuning");
     let out = std::process::Command::new(exe).args(["identify", "--json"]).arg(&dir).output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
@@ -343,6 +346,9 @@ fn identify_cli() {
     assert_eq!(v["macos_build"], "25G83");
     assert_eq!(v["aid"], AID);
     assert_eq!(v["verified"], true);
+    assert_eq!(v["board"], "j316s");
+    assert_eq!(v["unit_bound"], true);
+    assert_eq!(v["unit_id"], "ab".repeat(32));
     let out = std::process::Command::new(exe).args(["identify", "--json"]).arg(dir.join("absent")).output().unwrap();
     assert_eq!(out.status.code(), Some(1));
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();

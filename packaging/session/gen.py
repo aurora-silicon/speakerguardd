@@ -64,13 +64,50 @@ def load_gate():
     raise FileNotFoundError("gate.json: none of " + ", ".join(((env,) if env else ()) + GATE_PATHS))
 
 
+def qualification_policy(board, units, gate=None):
+    """Build-wide parity plus board policy. An allow never replaces proofs."""
+    gate = load_gate() if gate is None else gate
+    overrides = gate.get("board_overrides", {})
+    denied = gate.get("denied_boards", [])
+    if not isinstance(overrides, dict) or not isinstance(denied, list) or not all(isinstance(b, str) for b in denied):
+        raise wiring.Refused("malformed board qualification policy")
+    override = overrides.get(board)
+    if board in denied or override == "deny":
+        raise wiring.Refused(f"{board} is denied by board policy")
+    if override not in (None, "allow"):
+        raise wiring.Refused(f"invalid board override for {board}")
+    parity = gate.get("units_at_parity", [])
+    if not isinstance(parity, list) or any(u not in wiring.PROTECTION_UNITS for u in parity):
+        raise wiring.Refused("malformed build parity policy")
+    if not units or any(u not in parity for u in units):
+        raise wiring.Refused(f"protection types not at parity: {', '.join(u for u in units if u not in parity)}")
+
+
 def voicing_enabled(board, gate=None):
     """Per-board deployment gate. Missing keys/boards keep the interim graph.
     Values must be literal JSON booleans; strings never enable a board.
+    This also selects the historical mode of offline fixture artifacts;
+    runtime_voicing_enabled supplies the automatic first-boot default.
     """
     if gate is None:
         gate = load_gate()
     return gate.get("voicing_pre", {}).get(board) is True
+
+
+def runtime_voicing_enabled(board):
+    """New boards compile their own full voicing chain automatically.
+
+    Existing explicit deployment choices remain overrides. Offline fixture
+    generation keeps its recorded mode; the live generator uses the mode
+    actually compiled and bound by provisioning.
+    """
+    gate = load_gate()
+    overrides = gate.get("voicing_pre", {})
+    if not isinstance(overrides, dict):
+        raise wiring.Refused("malformed voicing deployment overrides")
+    if board in overrides:
+        return voicing_enabled(board)
+    return True
 
 
 def voicing_bound(board, gate=None):
