@@ -19,6 +19,45 @@ pub const LEGACY_ESTIMATOR: u32 = 4;
 pub const UNQUALIFIED_VOICING: u32 = 8;
 const MAX_FLOW: usize = 1 << 20;
 
+/// Build-matched names for the append-only 26B8125 fields. These offsets make
+/// diagnostics and future feature admission explicit; they do not enable a
+/// feature merely because its stored name is known.
+pub mod extension {
+    pub const GENERAL_SYS_ID_FFT_SIZE: u32 = 3;
+
+    pub const M_SENSITIVITY_ENABLE: u32 = 37;
+    pub const M_SENSITIVITY_MIN_GAIN_DB: u32 = 38;
+    pub const M_SENSITIVITY_MAX_GAIN_DB: u32 = 39;
+    pub const M_SENSITIVITY_MAX_GAIN_DIFF_DB: u32 = 40;
+    pub const M_SENSITIVITY_MAX_QTS_DIFF: u32 = 41;
+    pub const M_SENSITIVITY_LINK_TYPE_A: u32 = 42;
+    pub const M_SENSITIVITY_LINK_TYPE_B: u32 = 43;
+    pub const M_SENSITIVITY_LINK_TYPE_C: u32 = 44;
+    pub const M_STATIC_CREEP_Q: u32 = 45;
+    pub const M_MIMO_COMPENSATION_ENABLE: u32 = 46;
+    pub const M_MIMO_TARGET_Q: u32 = 47;
+    pub const M_MIMO_TARGET_MODE: u32 = 48;
+    pub const M_MIMO_MAX_FC_RATIO: u32 = 49;
+    pub const M_MIMO_MAX_Q_RATIO: u32 = 50;
+    pub const M_MIMO_SD_CM2: u32 = 51;
+    pub const M_MIMO_VBOX_CM3: u32 = 52;
+
+    pub const T_NUM_PARALLEL_SPEAKERS: u32 = 16;
+    pub const T_RDC_TOLERANCE_PERCENT: u32 = 17;
+    pub const PILOT_TUNING_RESERVED: u32 = 21_512;
+
+    pub const CONTROLLER_DISPLACEMENT_RELEASE: u32 = 23;
+    pub const CONTROLLER_VELOCITY_RELEASE: u32 = 24;
+    pub const CONTROLLER_ADAPTIVE_RELEASE_ENABLE: u32 = 25;
+    pub const CONTROLLER_NUM_POWER_GROUPS: u32 = 26;
+    pub const CONTROLLER_TEMPERATURE_RATE_FACTOR: u32 = 27;
+    pub const CHANNEL_POWER_GROUP_NUMBER: u32 = 33;
+
+    pub const POWER_GROUP_TIME_SCALE: core::ops::Range<u32> = 0..4;
+    pub const POWER_GROUP_HARD_LIMIT: core::ops::Range<u32> = 4..8;
+    pub const POWER_GROUP_SOFT_LIMIT: core::ops::Range<u32> = 8..12;
+}
+
 pub fn base_ids() -> Vec<u32> {
     let mut out: Vec<u32> = (0..3).chain(1024..1033).chain(2048..2062).collect();
     for b in 0..15 {

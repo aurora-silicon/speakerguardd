@@ -144,7 +144,37 @@ This mapping prevents the two records from being mistaken for channels 0 and
 1. Response arrays and role-specific gains remain inside the property-6632
 dictionary until their numerical application is independently qualified.
 
-## 7. Safety and qualification boundary
+## 7. Build-matched appended-field meanings
+
+The build-matched 26B8125 public parameter inventory names all 305 appended
+LSM2 records. The append map is semantic, but naming does not enable a feature:
+
+| Location | Meaning |
+|---|---|
+| global ID 3 | system-ID FFT-size selector |
+| model-manager offsets 37–44 | sensitivity-control enable, gain/Q-difference bounds, and type A/B/C links |
+| model-manager offset 45 | static creep-model Q |
+| model-manager offsets 46–52 | MIMO compensation enable, target Q/mode, Fc/Q ratio bounds, active area, and box volume |
+| thermal offsets 16–17 | number of parallel speakers and Rdc tolerance percent |
+| ID 21512 | reserved pilot-tone channel tuning selector |
+| IDs 24576–24583 | channel 0–7 sensitivity-control pairing |
+| four-field type A/B/C blocks | high-impedance watermark enable, threshold, hold, and smoothing |
+| controller offsets 23–27 | displacement/velocity release, adaptive-release enable, power-group count, and temperature response-rate factor |
+| channel offset 33 | power-group number |
+| two 12-field system blocks | four time scales, four hard limits, and four soft limits per power group |
+
+LSID's formerly opaque auxiliary blocks are the eight-field MIMO-coupled model
+for each bank: enable, active-driver area, static box volume, fit band, fit-bin
+count, error threshold, and smoothing time. Its eight selector records are the
+per-channel MIMO paired-driver selectors. A non-zero MIMO enable is refused by
+the independent single-driver solver rather than partially interpreted.
+
+The Rdc tail is now explicit: bypass-SpTS, thermal-estimation enable,
+thermal-correction enable, parallel-speaker count, and Rdc tolerance. The
+single-driver Rdc observation is multiplied by the integral parallel count and
+must remain within the optional percentage tolerance from the static default.
+
+## 8. Safety and qualification boundary
 
 The normal host path lacks an authenticated sense-source identity, so it
 cannot accept a numerical window. Even an offline authenticated estimator only

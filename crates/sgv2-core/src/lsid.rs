@@ -648,6 +648,11 @@ impl Estimator {
         if bank.rdc[1] == 0.0 {
             return None;
         }
+        if bank.auxiliary[0] != 0.0 {
+            // The auxiliary block is the MIMO-coupled fit. Never collapse it
+            // into the independent single-driver law below.
+            return None;
+        }
         // Optional laws that are represented in the saved schema but not in
         // this addendum must fail closed as a whole, never produce a partial
         // generation with silently omitted dynamics.
@@ -701,9 +706,16 @@ impl Estimator {
         }
         let coherence = (cross.norm2() / (vv * ii)).clamp(0.0, 1.0) as f32;
         let threshold = bank.rdc[2].clamp(0.0, 1.0);
-        let raw_rdc = (r_num / r_den) as f32;
+        let parallel = if bank.rdc[31].is_finite() && bank.rdc[31] >= 1.0 { bank.rdc[31].round() } else { 1.0 };
+        let raw_rdc = (r_num / r_den) as f32 * parallel;
         let (rmin, rmax) = positive_bounds(bank.rdc[4], bank.rdc[5])?;
         if coherence < threshold || !raw_rdc.is_finite() || !(rmin..=rmax).contains(&raw_rdc) {
+            return None;
+        }
+        let tolerance = bank.rdc[32].max(0.0);
+        let default = bank.default_rdc();
+        let default_delta = 100.0 * (raw_rdc - default).abs() / default.abs().max(1e-12);
+        if tolerance > 0.0 && default_delta > tolerance {
             return None;
         }
         let seconds = n as f32 / desired_rate as f32;
@@ -725,7 +737,7 @@ impl Estimator {
         model.resonance = resonance;
         let calibration = calibration_temperature(bank, model.slow_rdc);
         model.calibration_valid = calibration.is_some();
-        model.thermal_valid = calibration.is_some() && bank.rdc[31] != 0.0;
+        model.thermal_valid = calibration.is_some() && bank.rdc[29] != 0.0;
         model.voice_coil_temp_c = calibration.unwrap_or(0.0);
         model.confidence = (coherence * (1.0 - error).clamp(0.0, 1.0)).clamp(0.0, 1.0);
         let changed = 100.0 * (model.fast_rdc - previous.fast_rdc).abs() / previous.fast_rdc.abs().max(1e-12);
