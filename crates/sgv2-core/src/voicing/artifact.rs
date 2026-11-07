@@ -155,7 +155,7 @@ macro_rules! choices {
 }
 choices!(GraphParam, VolumeScalar = 0, VolumeDb = 1, Mute = 2, BalanceLeft = 3, BalanceRight = 4);
 choices!(BandMode, Compress = 0, Pass = 1, Mute = 2);
-choices!(DynamicKind, Notch = 15, HighShelf = 18);
+choices!(DynamicKind, Notch = 15, LowShelf = 17, HighShelf = 18);
 impl Wire for Source {
     fn put(&self, o: &mut Vec<u8>) {
         match self {
