@@ -743,7 +743,6 @@ impl MaskDetector {
         self.high.fill(Complex::default());
         Some(self.db)
     }
-
 }
 
 #[cfg(not(feature = "lowflow-conservative"))]
