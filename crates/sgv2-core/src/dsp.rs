@@ -695,7 +695,7 @@ mod tests {
 
     #[test]
     fn power_acc_matches_256_frame_reduction() {
-        let x: Vec<f32> = (0..256).map(|i| (((i * 37) % 257) as i32 - 128) as f32 / 127.0).collect();
+        let x: Vec<f32> = (0..256).map(|i| (((i * 37) % 257) - 128) as f32 / 127.0).collect();
         let mut a = PowerAcc::new();
         a.add_sq(&x, 0);
         assert_eq!(a.total().to_bits(), 0x42ae_5a30);
