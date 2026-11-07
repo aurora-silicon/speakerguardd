@@ -196,6 +196,9 @@ fn preflight(t: &Tuning, m: &Machine, provenance: Provenance, diags: &mut Diagno
         ),
     }
     let calibration_trusted = unit_binding(t, m, diags)?;
+    if t.native_lsm2_sample_rate.is_some() && !calibration_trusted {
+        return Err(bad("native LSM2 selectors require a known matching runtime unit ID"));
+    }
     let machine = machine_field(&m.board).ok_or_else(|| bad(format!("board {:?} does not fit the header", m.board)))?;
     Ok(Bound { machine, board: m.board.clone(), calibration_trusted })
 }
@@ -532,6 +535,9 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
     use lsm2_ids as id;
     let n = channels(t)?;
     let rate = sample_rate(t)?;
+    if t.native_lsm2_sample_rate.is_some_and(|native| native != rate) {
+        return Err(bad("native LSM2 sample rate differs from compile rate"));
+    }
     let g = t.protection.state.section(SCOPE_GLOBAL, 0).ok_or_else(|| bad("lsm2 saved state has no global section"))?;
     let get = |i: u32| -> Result<f32> { g.get(i).ok_or_else(|| bad(format!("lsm2 saved ID {i} is missing"))) };
     let flag = |i: u32| -> Result<u32> { Ok((get(i)? != 0.0) as u32) };

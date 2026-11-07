@@ -41,6 +41,7 @@ pub mod lattice;
 pub mod machine;
 pub mod manifest;
 pub mod names;
+pub mod native_lsm2;
 pub mod plist;
 pub mod prestage;
 pub mod select;
