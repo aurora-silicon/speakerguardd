@@ -370,8 +370,8 @@ class Session:
         for nid in nodes:
             if nid is not None and g.node_state(nid) not in (None, "suspended"):
                 self.last_suspend = now
-                # pw-cli's send-command sends a node the Suspend command
-                self._spawn(("suspend", nid), ["pw-cli", "send-command", str(nid)])
+                # the node's Suspend command (pw-cli 1.x: id, command, args)
+                self._spawn(("suspend", nid), ["pw-cli", "send-command", str(nid), "Suspend", "{}"])
 
 
 _WRITER = None
