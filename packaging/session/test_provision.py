@@ -437,9 +437,90 @@ class Sleep(Base):
         loader.exec_module(ses)
         self.assertEqual(ses.SLEEP_HOLD, prov.Paths().hold)
 
+    def test_provision_unit_name(self):
+        self.assertEqual(prov.provision_unit("speakerguardd.service"), "speakerguardd-provision.service")
+        self.assertEqual(prov.provision_unit("speakerguardd-v2.service"), "speakerguardd-v2-provision.service")
+
     def test_helper_amps_needs_a_fresh_report(self):
         self.assertIsNone(prov.helper_amps({}, 0))
         self.assertIsNone(prov.helper_amps({"SGV2_UID": "999999999"}, 0))
+
+    def _pcm(self, card, name, first):
+        d = os.path.join(self.p.proc_asound, card, name, "sub0")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "status"), "w") as f:
+            f.write(first + "\n")
+        return os.path.join(d, "status")
+
+    def test_open_pcms_are_the_graph_ones(self):
+        gd = os.path.join(self.p.graph, "pipewire")
+        os.makedirs(gd, exist_ok=True)
+        with open(os.path.join(gd, "sgv2-j413.conf"), "w") as f:
+            f.write('api.alsa.path          = "hw:CARD=AppleJ413,DEV=1"\n'
+                    'api.alsa.path          = "hw:CARD=AppleJ413,DEV=2"\n')
+        spk = self._pcm("AppleJ413", "pcm1p", "state: RUNNING")
+        sense = self._pcm("AppleJ413", "pcm2c", "state: SETUP")
+        # the headphone PCM is not the graph's: never waited for
+        self._pcm("AppleJ413", "pcm0p", "state: RUNNING")
+        self.assertEqual(prov.graph_pcms(self.p), [spk, sense])
+        self.assertEqual(prov.open_pcms(self.p), [spk, sense])
+        self._pcm("AppleJ413", "pcm1p", "closed")
+        self.assertEqual(prov.open_pcms(self.p), [sense])
+        self._pcm("AppleJ413", "pcm2c", "closed")
+        self.assertEqual(prov.open_pcms(self.p), [])
+
+    def test_open_pcms_without_a_graph(self):
+        self.assertEqual(prov.open_pcms(self.p), [])
+
+    def test_helper_suspends_under_the_hold_only_when_unlinked(self):
+        import importlib.machinery
+        import importlib.util
+        loader = importlib.machinery.SourceFileLoader("sgv2_session", os.path.join(HERE, "speakerguardd-session"))
+        spec = importlib.util.spec_from_loader("sgv2_session", loader)
+        ses = importlib.util.module_from_spec(spec)
+        loader.exec_module(ses)
+
+        class G:
+            def __init__(self, states, links):
+                self.states, self._links = states, links
+                self.objs = {}
+
+            def node_id(self, name):
+                return {"sgv2.speaker.j413": 10, "sgv2.sense.j413": 20}.get(name)
+
+            def node_state(self, nid):
+                return self.states.get(nid)
+
+            def of_type(self, t):
+                return [{"id": 11, "info": {"props": {"node.id": 10}}},
+                        {"id": 21, "info": {"props": {"node.id": 20}}}] if t == "Port" else []
+
+            def links(self):
+                return self._links
+
+            def ports(self, nid, d):
+                return {}
+
+        s = ses.Session("j413", {"card": "AppleJ413", "amps": 4, "sense": 8})
+        spawned = []
+        s._spawn = lambda key, argv: spawned.append(argv)
+        os.makedirs(self.p.sleep, exist_ok=True)
+        hold = self.p.hold
+        ses.SLEEP_HOLD = hold
+        # no hold: a withdrawal unlinks, never suspends
+        s.reconcile(G({10: "idle", 20: "running"}, []), False)
+        self.assertEqual(spawned, [])
+        open(hold, "w").close()
+        # still linked: unlink first
+        s.reconcile(G({10: "running", 20: "running"}, [(99, 5, 11)]), False)
+        self.assertEqual(spawned, [["pw-link", "-d", "99"]])
+        spawned.clear()
+        s.reconcile(G({10: "idle", 20: "running"}, []), False)
+        self.assertEqual(spawned, [["pw-cli", "send-command", "10", "Suspend", "{}"], ["pw-cli", "send-command", "20", "Suspend", "{}"]])
+        spawned.clear()
+        s.last_suspend = -10.0
+        s.reconcile(G({10: "suspended", 20: "suspended"}, []), False)
+        self.assertEqual(spawned, [])
 
 
 class UserManager(unittest.TestCase):
