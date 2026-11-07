@@ -468,6 +468,32 @@ class Graph(Base):
 
 
 
+class Sleep(Base):
+    """The sleep hold: set before sleep, cleared after the resume."""
+
+    def test_hold_set_and_cleared(self):
+        self.assertEqual(prov.cmd_sleep(self.args("sleep", sleep_wait=0), self.p), 0)
+        self.assertTrue(os.path.exists(self.p.hold))
+        self.assertTrue(self.p.hold.startswith(self.root))
+        self.assertEqual(prov.cmd_wake(self.args("wake"), self.p), 0)
+        self.assertFalse(os.path.exists(self.p.hold))
+        # A resume without a hold (a sleep v2 did not see) is fine too
+        self.assertEqual(prov.cmd_wake(self.args("wake"), self.p), 0)
+
+    def test_session_helper_honours_the_hold(self):
+        import importlib.machinery
+        import importlib.util
+        loader = importlib.machinery.SourceFileLoader("sgv2_session", os.path.join(HERE, "speakerguardd-session"))
+        spec = importlib.util.spec_from_loader("sgv2_session", loader)
+        ses = importlib.util.module_from_spec(spec)
+        loader.exec_module(ses)
+        self.assertEqual(ses.SLEEP_HOLD, prov.Paths().hold)
+
+    def test_helper_amps_needs_a_fresh_report(self):
+        self.assertIsNone(prov.helper_amps({}, 0))
+        self.assertIsNone(prov.helper_amps({"SGV2_UID": "999999999"}, 0))
+
+
 class UserManager(unittest.TestCase):
     """refresh_session reaches the seat user's own manager on the user's bus,
     as that user, never through machined (which fails from a system unit)."""
@@ -653,6 +679,18 @@ class Units(unittest.TestCase):
         self.assertIn("speakerguardd-provision.service", req(chk))
         self.assertIn("speakerguardd-provision.service", aft(chk))
         self.assertIn("Before=speakerguardd-selfcheck.service speakerguardd.service", prv)
+        # The graph is in /run before any login, so the seat user's PipeWire
+        # never starts without it (a first-boot amp fault otherwise).
+        bef = lambda u: " ".join(l.split("=", 1)[1] for l in u if l.startswith("Before="))  # noqa: E731
+        self.assertIn("systemd-user-sessions.service", bef(chk))
+        self.assertIn("systemd-user-sessions.service", aft(sup))
+        slp = self.unit("speakerguardd-sleep.service")
+        self.assertIn("Before=sleep.target", slp)
+        self.assertIn("StopWhenUnneeded=yes", slp)
+        self.assertIn("WantedBy=sleep.target", slp)
+        self.assertIn("ExecCondition=/usr/libexec/speakerguardd/speakerguardd-gate v2", slp)
+        self.assertIn("ExecStart=/usr/libexec/speakerguardd/speakerguardd-provision sleep --unit speakerguardd.service", slp)
+        self.assertIn("ExecStop=/usr/libexec/speakerguardd/speakerguardd-provision wake --unit speakerguardd.service", slp)
         for u in (sup, chk, prv, self.unit("speakerguardd-seat.service")):
             self.assertIn("ExecCondition=/usr/libexec/speakerguardd/speakerguardd-gate v2", u)
         self.assertIn("ExecStartPost=/usr/libexec/speakerguardd/speakerguardd-provision activate --graph-unit speakerguardd-graph.service", chk)
@@ -661,9 +699,9 @@ class Units(unittest.TestCase):
         # Every program a unit runs is in one directory, so a package moves
         # them all with one rewrite.
         for name in ("speakerguardd-provision.service", "speakerguardd-selfcheck.service", "speakerguardd-session.service",
-                     "speakerguardd-seat.service", "speakerguardd-graph.service"):
+                     "speakerguardd-seat.service", "speakerguardd-graph.service", "speakerguardd-sleep.service"):
             for l in self.unit(name):
-                if l.startswith(("ExecStart=", "ExecStartPost=", "ExecCondition=")):
+                if l.startswith(("ExecStart=", "ExecStartPost=", "ExecStop=", "ExecCondition=")):
                     self.assertTrue(l.split("=", 1)[1].startswith("/usr/libexec/speakerguardd/"), l)
         self.assertIn("Before=pipewire.service wireplumber.service", self.unit("speakerguardd-graph.service"))
         self.assertIn("ExecCondition=/usr/libexec/speakerguardd/speakerguardd-gate legacy", self.unit("legacy-gate.conf"))
