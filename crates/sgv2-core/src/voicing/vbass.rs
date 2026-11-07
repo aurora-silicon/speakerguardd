@@ -646,8 +646,12 @@ pub struct Run {
     /// Per channel at the stream rate: high pass then both all-passes.
     hp: Cascade,
     hp_st: Vec<CascadeState>,
-    /// Crossover low pass of the mid, at the stream rate.
-    lp: crate::vdsp::Cascade,
+    /// Crossover low pass of the mid, at the stream rate. The established
+    /// scalar path remains available for geometries whose stored-SOS
+    /// construction is not yet exact.
+    lp: Cascade,
+    lp_st: CascadeState,
+    lp_platform: Option<crate::vdsp::Cascade>,
     /// Selected rate: both band-edge all-passes (blend), the band's lower
     /// edge with the first half of its upper edge, then the second half.
     ap: Cascade,
@@ -709,13 +713,18 @@ impl Run {
         let latency = nu % 2 + nl % 2;
         let lead = if p.level_control { nl % 2 } else { 0 };
         let max_frames = max_frames.max(1);
+        let platform_lp = p.hp_order == 8
+            && p.lower_order == 6
+            && (p.upper_order == 4 && !p.level_control || p.upper_order == 6 && p.level_control);
         Run {
             p: p.clone(),
             fs,
             channels,
             hp,
             hp_st: vec![CascadeState::default(); channels],
-            lp: lp_design.platform_lowpass(),
+            lp: lp_design.clone(),
+            lp_st: CascadeState::default(),
+            lp_platform: platform_lp.then(|| lp_design.platform_lowpass()),
             ap,
             ap_st: CascadeState::default(),
             band_hp,
@@ -748,7 +757,10 @@ impl Run {
         for s in &mut self.hp_st {
             *s = CascadeState::default();
         }
-        self.lp.reset();
+        self.lp_st = CascadeState::default();
+        if let Some(lp) = &mut self.lp_platform {
+            lp.reset();
+        }
         self.ap_st = CascadeState::default();
         self.band_hp_st = CascadeState::default();
         self.band_lp_st = CascadeState::default();
@@ -790,7 +802,7 @@ impl Run {
     /// Installed crossover-low-pass coefficient words for parity probes.
     #[doc(hidden)]
     pub fn crossover_lowpass_bits(&self, out: &mut [[u32; 5]]) -> usize {
-        self.lp.coefficient_bits(out)
+        self.lp_platform.as_ref().map_or(0, |lp| lp.coefficient_bits(out))
     }
 
     #[inline]
@@ -857,21 +869,28 @@ impl Run {
         let frames = bufs[..ch].iter().fold(frames.min(self.mono.len()), |n, b| n.min(b.len()));
         let ig = self.p.input_gain;
 
-        // The material render-quantum-dependent object is the full-rate mono
-        // crossover low pass. Give it the render as one platform-filter call;
-        // the factor-six phase and the remaining established box state carry
-        // through the frame loop unchanged.
-        for i in 0..frames {
-            let mut mid = 0.0;
-            for b in bufs[..ch].iter() {
-                let v = b[i] as f64;
-                mid += if v.is_finite() { v * ig } else { 0.0 };
+        if let Some(lp) = &mut self.lp_platform {
+            for i in 0..frames {
+                let mut mid = 0.0;
+                for b in bufs[..ch].iter() {
+                    let v = b[i] as f64;
+                    mid += if v.is_finite() { v * ig } else { 0.0 };
+                }
+                self.mono[i] = (mid / ch as f64) as f32;
             }
-            self.mono[i] = (mid / ch as f64) as f32;
+            lp.run(&mut self.mono[..frames]);
         }
-        self.lp.run(&mut self.mono[..frames]);
         for i in 0..frames {
-            let lo = f64::from(self.mono[i]);
+            let lo = if self.lp_platform.is_some() {
+                f64::from(self.mono[i])
+            } else {
+                let mut mid = 0.0;
+                for b in bufs[..ch].iter() {
+                    let v = b[i] as f64;
+                    mid += if v.is_finite() { v * ig } else { 0.0 };
+                }
+                self.lp.run(&mut self.lp_st, mid / ch as f64)
+            };
             let up = if self.phase == 0 { self.sub_frame(lo) * self.stride as f64 } else { 0.0 };
             self.phase = (self.phase + 1) % self.stride;
             let common = self.recon.run(&mut self.recon_st, up);
@@ -946,6 +965,22 @@ mod tests {
         assert_eq!(Params::from_words(&w), None);
         w[1] = f64::NAN;
         assert_eq!(Params::from_words(&w), None);
+    }
+
+    #[test]
+    fn platform_lowpass_is_scoped_by_public_object_geometry() {
+        let plain = Run::new(&params(false), 48_000.0, 2, 512);
+        assert!(plain.lp_platform.is_some());
+
+        let mut controlled = params(true);
+        controlled.upper_order = 6;
+        let controlled = Run::new(&controlled, 48_000.0, 2, 512);
+        assert!(controlled.lp_platform.is_some());
+
+        let mut other = params(true);
+        other.lower_order = 4;
+        let other = Run::new(&other, 48_000.0, 2, 512);
+        assert!(other.lp_platform.is_none());
     }
 
     #[test]
