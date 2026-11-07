@@ -1166,23 +1166,26 @@ impl Run {
             }
             if full_hop && !self.conservative_fallback {
                 for c in 0..self.models {
-                    self.state[c].spectral.prepare_hop(&bufs[c][chunk_at..chunk_at + chunk_frames]);
-                }
-                for c in 0..self.models {
                     let model = &self.params[c];
                     let state = &mut self.state[c];
                     let limit = velocity_limit(model, state.mask_output_db);
                     let target = detector_target(model.enabled, model.mute, state.floor, limit, state.velocity_history);
                     state.spectral.set_target(target);
-                    // The mask runtime has already transformed the current
-                    // detector hop. Target/water-fill and gain release run
-                    // before the current output transform consumes that
-                    // released vector.
+                    // Target/water-fill and gain release consume the retained
+                    // detector vector before the current output transform is
+                    // prepared and multiplied by the released vector.
                     state.spectral.update_gains();
                     // The target controls the frame already in flight, so the
                     // just-completed detector hop becomes history afterwards.
                     state.velocity_history = [state.hop_velocity, state.velocity_history[0]];
                     state.hop_velocity = 0.0;
+                }
+                for c in 0..self.models {
+                    self.state[c].spectral.prepare_hop(&bufs[c][chunk_at..chunk_at + chunk_frames]);
+                }
+                for c in 0..self.models {
+                    let model = &self.params[c];
+                    let state = &mut self.state[c];
                     if model.mute {
                         bufs[c][chunk_at..chunk_at + chunk_frames].fill(0.0);
                         state.spectral.reset();
