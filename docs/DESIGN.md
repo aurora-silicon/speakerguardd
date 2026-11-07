@@ -17,6 +17,15 @@ apps → voicing-pre filter-chain (user volume, the stages before the unit)
 sense PCM (same card, same clock, same cycle) → protect filter-chain sense ports
 ```
 
+- **Generated voicing mode (default off).** `gate.json`'s per-board
+  `voicing_pre` flag replaces the interim convolver with a stereo-to-lanes
+  LV2 host of `sgv2_core::voicing::Chain`. The full spec (including box
+  parameter words, automation and relays) is a CRC-checked versioned section
+  appended after the length-delimited pre-stage in the unit blob. It binds
+  to the exact preceding unit blob. The supervisor publishes both together;
+  the protect plugin's pre-stage is identity and declares the crossover
+  supplied by the full chain. Both plugins refuse invalid artifacts, with
+  silence from voicing. See `packaging/pipewire/README.md` for activation.
 - The unit sits where the Mac's own speaker graph places it, and the stages around it come from the same bundle.
 - **Pre-stage.** spp3 limits coil temperature; how hard each cone is driven at low frequency is set by the filtering macOS's graph applies ahead of the unit: the program's high-pass and, per speaker, the crossover (tweeter high-pass, woofer low-pass), shelves, gains and cuts. The compiler reads those filter boxes along each unit channel's lane (`aurora-speaker-tuning::prestage`) into second-order sections that the plugin runs right before the unit (`sgv2-core::prestage`). A filter it cannot carry exactly is left out only when it is a boost; otherwise the compile is refused, as is a filter box without a preset, a saved-state field that is missing, or a box ahead of the unit the compiler does not account for. The filters' response is scaled to never exceed unity. The supervisor declares it to the kernel ("Speaker Protection Crossover"), and only then does the kernel open the tweeters' amp high-pass to the Mac's own corner.
 - **Dynamics.** The graph's multiband compressor boxes ahead of the unit (`aufx/mstk`) are part of the pre-stage too, each compiled by the voicing box (`voicing::mstk`) from its saved state and run at its own place in the lane: the filters and gains before it run ahead of it, the rest after, so each detector sees what macOS's sees. Its detector is linked across every channel, its band tree is the unit's (measured: split at the middle crossover first, Linkwitz-Riley crossovers of the order control rounded up to even), and its output carries the unit's own gain staging (input and output gain, band input gains, makeups). The gain computer is interim (peak power, hard knee, instant attack): the unit's own is an RMS detector with a soft, ratio-dependent knee and a soft range, which the interim law does not bound from above in every band (up to 2 dB louder at full scale on some states), so the exact law is required before a board's voicing counts as matching macOS. A compressor feature the box does not carry refuses the compile.

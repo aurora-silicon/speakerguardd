@@ -286,3 +286,60 @@
         a lv2:ControlPort, lv2:OutputPort ; lv2:index 4 ; lv2:symbol "sense_delay" ; lv2:name "Sense delay" ;
         lv2:portProperty lv2:integer
     ] .
+
+<https://aurora-silicon.org/lv2/sgv2#voicing-1ch>
+    a lv2:Plugin, lv2:UtilityPlugin ;
+    doap:name "sgv2 voicing (1 lanes)" ;
+    doap:license <https://opensource.org/licenses/MIT> ;
+    lv2:optionalFeature lv2:hardRTCapable ;
+    lv2:port [ a lv2:AudioPort, lv2:InputPort ; lv2:index 0 ; lv2:symbol "in_0" ; lv2:name "In 0" ] ,
+    [ a lv2:AudioPort, lv2:InputPort ; lv2:index 1 ; lv2:symbol "in_1" ; lv2:name "In 1" ] ,
+    [ a lv2:AudioPort, lv2:OutputPort ; lv2:index 2 ; lv2:symbol "out_0" ; lv2:name "Out 0" ] ,
+    [ a lv2:ControlPort, lv2:InputPort ; lv2:index 3 ; lv2:symbol "volume" ; lv2:name "Volume" ; lv2:default 1 ; lv2:minimum 0 ; lv2:maximum 1 ] ,
+    [ a lv2:ControlPort, lv2:InputPort ; lv2:index 4 ; lv2:symbol "volume_db" ; lv2:name "Volume dB override (1 = automatic)" ; lv2:default 1 ; lv2:minimum -200 ; lv2:maximum 1 ] ,
+    [ a lv2:ControlPort, lv2:OutputPort ; lv2:index 5 ; lv2:symbol "health" ; lv2:name "Health" ; lv2:portProperty lv2:integer ] .
+
+<https://aurora-silicon.org/lv2/sgv2#voicing-2ch>
+    a lv2:Plugin, lv2:UtilityPlugin ;
+    doap:name "sgv2 voicing (2 lanes)" ;
+    doap:license <https://opensource.org/licenses/MIT> ;
+    lv2:optionalFeature lv2:hardRTCapable ;
+    lv2:port [ a lv2:AudioPort, lv2:InputPort ; lv2:index 0 ; lv2:symbol "in_0" ; lv2:name "In 0" ] ,
+    [ a lv2:AudioPort, lv2:InputPort ; lv2:index 1 ; lv2:symbol "in_1" ; lv2:name "In 1" ] ,
+    [ a lv2:AudioPort, lv2:OutputPort ; lv2:index 2 ; lv2:symbol "out_0" ; lv2:name "Out 0" ] ,
+    [ a lv2:AudioPort, lv2:OutputPort ; lv2:index 3 ; lv2:symbol "out_1" ; lv2:name "Out 1" ] ,
+    [ a lv2:ControlPort, lv2:InputPort ; lv2:index 4 ; lv2:symbol "volume" ; lv2:name "Volume" ; lv2:default 1 ; lv2:minimum 0 ; lv2:maximum 1 ] ,
+    [ a lv2:ControlPort, lv2:InputPort ; lv2:index 5 ; lv2:symbol "volume_db" ; lv2:name "Volume dB override (1 = automatic)" ; lv2:default 1 ; lv2:minimum -200 ; lv2:maximum 1 ] ,
+    [ a lv2:ControlPort, lv2:OutputPort ; lv2:index 6 ; lv2:symbol "health" ; lv2:name "Health" ; lv2:portProperty lv2:integer ] .
+
+<https://aurora-silicon.org/lv2/sgv2#voicing-4ch>
+    a lv2:Plugin, lv2:UtilityPlugin ;
+    doap:name "sgv2 voicing (4 lanes)" ;
+    doap:license <https://opensource.org/licenses/MIT> ;
+    lv2:optionalFeature lv2:hardRTCapable ;
+    lv2:port [ a lv2:AudioPort, lv2:InputPort ; lv2:index 0 ; lv2:symbol "in_0" ; lv2:name "In 0" ] ,
+    [ a lv2:AudioPort, lv2:InputPort ; lv2:index 1 ; lv2:symbol "in_1" ; lv2:name "In 1" ] ,
+    [ a lv2:AudioPort, lv2:OutputPort ; lv2:index 2 ; lv2:symbol "out_0" ; lv2:name "Out 0" ] ,
+    [ a lv2:AudioPort, lv2:OutputPort ; lv2:index 3 ; lv2:symbol "out_1" ; lv2:name "Out 1" ] ,
+    [ a lv2:AudioPort, lv2:OutputPort ; lv2:index 4 ; lv2:symbol "out_2" ; lv2:name "Out 2" ] ,
+    [ a lv2:AudioPort, lv2:OutputPort ; lv2:index 5 ; lv2:symbol "out_3" ; lv2:name "Out 3" ] ,
+    [ a lv2:ControlPort, lv2:InputPort ; lv2:index 6 ; lv2:symbol "volume" ; lv2:name "Volume" ; lv2:default 1 ; lv2:minimum 0 ; lv2:maximum 1 ] ,
+    [ a lv2:ControlPort, lv2:InputPort ; lv2:index 7 ; lv2:symbol "volume_db" ; lv2:name "Volume dB override (1 = automatic)" ; lv2:default 1 ; lv2:minimum -200 ; lv2:maximum 1 ] ,
+    [ a lv2:ControlPort, lv2:OutputPort ; lv2:index 8 ; lv2:symbol "health" ; lv2:name "Health" ; lv2:portProperty lv2:integer ] .
+
+<https://aurora-silicon.org/lv2/sgv2#voicing-6ch>
+    a lv2:Plugin, lv2:UtilityPlugin ;
+    doap:name "sgv2 voicing (6 lanes)" ;
+    doap:license <https://opensource.org/licenses/MIT> ;
+    lv2:optionalFeature lv2:hardRTCapable ;
+    lv2:port [ a lv2:AudioPort, lv2:InputPort ; lv2:index 0 ; lv2:symbol "in_0" ; lv2:name "In 0" ] ,
+    [ a lv2:AudioPort, lv2:InputPort ; lv2:index 1 ; lv2:symbol "in_1" ; lv2:name "In 1" ] ,
+    [ a lv2:AudioPort, lv2:OutputPort ; lv2:index 2 ; lv2:symbol "out_0" ; lv2:name "Out 0" ] ,
+    [ a lv2:AudioPort, lv2:OutputPort ; lv2:index 3 ; lv2:symbol "out_1" ; lv2:name "Out 1" ] ,
+    [ a lv2:AudioPort, lv2:OutputPort ; lv2:index 4 ; lv2:symbol "out_2" ; lv2:name "Out 2" ] ,
+    [ a lv2:AudioPort, lv2:OutputPort ; lv2:index 5 ; lv2:symbol "out_3" ; lv2:name "Out 3" ] ,
+    [ a lv2:AudioPort, lv2:OutputPort ; lv2:index 6 ; lv2:symbol "out_4" ; lv2:name "Out 4" ] ,
+    [ a lv2:AudioPort, lv2:OutputPort ; lv2:index 7 ; lv2:symbol "out_5" ; lv2:name "Out 5" ] ,
+    [ a lv2:ControlPort, lv2:InputPort ; lv2:index 8 ; lv2:symbol "volume" ; lv2:name "Volume" ; lv2:default 1 ; lv2:minimum 0 ; lv2:maximum 1 ] ,
+    [ a lv2:ControlPort, lv2:InputPort ; lv2:index 9 ; lv2:symbol "volume_db" ; lv2:name "Volume dB override (1 = automatic)" ; lv2:default 1 ; lv2:minimum -200 ; lv2:maximum 1 ] ,
+    [ a lv2:ControlPort, lv2:OutputPort ; lv2:index 10 ; lv2:symbol "health" ; lv2:name "Health" ; lv2:portProperty lv2:integer ] .

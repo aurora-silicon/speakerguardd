@@ -17,8 +17,9 @@
 //! that leaves them zero names no machine, and the supervisor refuses it.
 //!
 //! Version 2 adds the pre-stage ([`crate::prestage`]): `payload_len` bytes
-//! of unit payload, then the pre-stage section, which runs to the end of the
-//! blob and carries its own length and CRC. A version 1 blob has no
+//! of unit payload, then the length-delimited pre-stage section with its
+//! own CRC. A generated-voicing blob appends a separately versioned complete
+//! chain artifact (`voicing::artifact`) bound to that preceding unit blob. A version 1 blob has no
 //! pre-stage and is refused.
 
 pub const MAGIC: [u8; 8] = *b"SGV2PRM\0";
@@ -110,7 +111,11 @@ impl Header {
         if crc32(payload) != header.payload_crc {
             return Err(BlobError::Crc);
         }
+        let (pre, voice) = split_prestage(pre)?;
         check_prestage(pre)?;
+        if !voice.is_empty() {
+            crate::voicing::artifact::decode(voice, &bytes[..HEADER_LEN + n + pre.len()])?;
+        }
         Ok((header, payload))
     }
 
@@ -170,7 +175,8 @@ fn check_prestage(pre: &[u8]) -> Result<(), BlobError> {
 pub fn prestage(bytes: &[u8], fs: f64) -> Result<crate::prestage::Params, BlobError> {
     let (h, payload) = Header::parse(bytes)?;
     let at = HEADER_LEN + payload.len();
-    crate::prestage::Params::decode(&bytes[at..], h.channels as usize, fs)
+    let (pre, _) = split_prestage(&bytes[at..])?;
+    crate::prestage::Params::decode(pre, h.channels as usize, fs)
 }
 
 /// `blob` with its pre-stage replaced by `pre` (the header is unchanged).
@@ -257,6 +263,72 @@ pub fn crc32(data: &[u8]) -> u32 {
         }
     }
     !crc
+}
+
+/// Split the length-delimited pre-stage from an optional voicing artifact.
+fn split_prestage(rest: &[u8]) -> Result<(&[u8], &[u8]), BlobError> {
+    if rest.len() < crate::prestage::HEAD_LEN {
+        return Err(BlobError::Short);
+    }
+    let n = u32::from_le_bytes(rest[16..20].try_into().map_err(|_| BlobError::Short)?) as usize;
+    let end = crate::prestage::HEAD_LEN.checked_add(n).ok_or(BlobError::Length)?;
+    if end > rest.len() {
+        return Err(BlobError::Length);
+    }
+    Ok(rest.split_at(end))
+}
+
+/// Complete voicing spec bound to this exact protection blob. A raw-feed
+/// pre-stage without its artifact, or an artifact on an interim blob, refuses.
+pub fn voicing(bytes: &[u8]) -> Result<Option<crate::voicing::chain::Spec>, BlobError> {
+    let (h, payload) = Header::parse(bytes)?;
+    let start = HEADER_LEN + payload.len();
+    let (pre, voice) = split_prestage(&bytes[start..])?;
+    let p = crate::prestage::Params::decode(pre, h.channels as usize, h.sample_rate as f64)?;
+    let external = p.flags & crate::prestage::FLAG_EXTERNAL_VOICING != 0;
+    if external == voice.is_empty() {
+        return Err(BlobError::Length);
+    }
+    if !external {
+        return Ok(None);
+    }
+    if p.flags != (crate::prestage::FLAG_FROM_TUNING | crate::prestage::FLAG_EXTERNAL_VOICING)
+        || p.dynamics.is_some()
+        || p.box_count != 0
+        || p.dynamic_count != 0
+        || p.channel[..p.channels].iter().any(|c| c.count != 0 || c.gain != 1.0)
+    {
+        return Err(BlobError::Unstable);
+    }
+    crate::voicing::artifact::decode(voice, &bytes[..start + pre.len()]).map(Some)
+}
+
+/// Append the compiled voicing, preserving a single atomic publication of
+/// protection and voicing parameters by the existing supervisor.
+#[cfg(any(test, feature = "std"))]
+pub fn with_voicing(blob: &[u8], spec: &crate::voicing::chain::Spec) -> Result<std::vec::Vec<u8>, BlobError> {
+    let (h, _) = Header::parse(blob)?;
+    let p = prestage(blob, h.sample_rate as f64)?;
+    if p.flags & crate::prestage::FLAG_EXTERNAL_VOICING == 0 {
+        return Err(BlobError::Length);
+    }
+    let mut out = blob.to_vec();
+    out.extend_from_slice(&crate::voicing::artifact::encode(spec, blob)?);
+    voicing(&out)?;
+    Ok(out)
+}
+
+/// Identity advertised by the protect engine. Full-chain mode uses the
+/// artifact CRC (which binds the entire preceding unit blob), so changing
+/// only voicing invalidates an old engine heartbeat. Interim mode retains
+/// the existing payload identity and thermal persistence stays unit-bound.
+pub fn engine_crc(bytes: &[u8]) -> Result<u32, BlobError> {
+    let (h, payload) = Header::parse(bytes)?;
+    let (_, voice) = split_prestage(&bytes[HEADER_LEN + payload.len()..])?;
+    if voice.is_empty() {
+        return Ok(h.payload_crc);
+    }
+    Ok(u32::from_le_bytes(voice[voice.len() - 4..].try_into().map_err(|_| BlobError::Length)?))
 }
 
 #[cfg(test)]

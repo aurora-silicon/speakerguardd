@@ -75,6 +75,9 @@ pub const MAGIC: [u8; 8] = *b"SGV2PRE\0";
 pub const HEAD_LEN: usize = 24;
 /// Most sections one channel may carry. The shipped tunings use under 30.
 pub const MAX_SECTIONS: usize = 64;
+/// The complete voicing runs in a separate upstream plugin. The unit
+/// pre-stage is identity and the blob must also carry its bound artifact.
+pub const FLAG_EXTERNAL_VOICING: u32 = 1 << 4;
 /// `flags` bit: the sections were compiled from the Mac's own speaker graph
 /// (its high-pass and crossover included). The supervisor tells the kernel
 /// so, and only then does the kernel open the tweeters' amp high-pass.
@@ -220,7 +223,7 @@ pub struct Dynamics {
 }
 
 impl Dynamics {
-    fn valid(&self, fs: f64) -> bool {
+    pub(crate) fn valid(&self, fs: f64) -> bool {
         let x = self.crossover_hz;
         let finite = |v: f64, lo: f64, hi: f64| v.is_finite() && v >= lo && v <= hi;
         x[0] > 0.0
@@ -671,7 +674,8 @@ impl Params {
                 return Err(BlobError::Unstable);
             }
         }
-        if flags & !(FLAG_FROM_TUNING | FLAG_DYNAMICS | FLAG_BOXES | FLAG_DYNAMIC_FILTERS) != 0 {
+        if flags & !(FLAG_FROM_TUNING | FLAG_DYNAMICS | FLAG_BOXES | FLAG_DYNAMIC_FILTERS | FLAG_EXTERNAL_VOICING) != 0
+        {
             return Err(BlobError::Length);
         }
         if at != body.len() {
@@ -1010,10 +1014,10 @@ impl DynamicRun {
             f64::from(section.a2 as f32),
         );
         let mut output = b1 * f64::from(state[0]);
-        output = b0.mul_add(f64::from(input), output);
-        output = b2.mul_add(f64::from(state[1]), output);
-        output = (-a1).mul_add(f64::from(state[2]), output);
-        output = (-a2).mul_add(f64::from(state[3]), output);
+        output = libm::fma(b0, f64::from(input), output);
+        output = libm::fma(b2, f64::from(state[1]), output);
+        output = libm::fma(-a1, f64::from(state[2]), output);
+        output = libm::fma(-a2, f64::from(state[3]), output);
         let output = output as f32;
         state[1] = state[0];
         state[0] = input;
