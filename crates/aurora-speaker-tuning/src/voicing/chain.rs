@@ -127,7 +127,7 @@ fn compile_node(
                 Ok(None) => Kind::Bypass,
                 Err(e) => uncarried(n, subtype, e, gaps),
             },
-            "cfrk" => match super::cfreak::compile(stage, fs, diags) {
+            "cfrk" => match super::cfreak::compile_for(stage, fs, t.macos_build.as_deref(), diags) {
                 Ok(Some(p)) => Kind::Cfreak(Box::new(p)),
                 Ok(None) => Kind::Bypass,
                 Err(e) => uncarried(n, subtype, e, gaps),

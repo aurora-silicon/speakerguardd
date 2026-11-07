@@ -10,7 +10,7 @@
 //! | ID | meaning | carried |
 //! |---:|---|---|
 //! | 0 | bypass [0] | 1: the box is left out |
-//! | 1, 10, 17 | saturation oversampling, flavour, amount [0] | modes 1-7 / sine / dormant |
+//! | 1, 10, 17 | saturation oversampling, flavour, maximum [0] | modes 0-7 / cubic or sine / payload-selected peak ceiling |
 //! | 2, 11 | input gain (dB) [0], its stage enabled [1] | yes, or unity when disabled |
 //! | 3 | threshold (dB) [0] | yes |
 //! | 4 | MinFastGain (dB) [3] | yes |
@@ -21,7 +21,7 @@
 //! | 9 | parameter ramp time [0] | not needed: the state is fixed |
 //! | 12, 13, 21, 22 | high-pass enable [0], corner [50], order [2], location [0] | Butterworth at the input; location 0 only |
 //! | 14 | limiter enabled [1] | refused when off |
-//! | 16 | output saturation [0] | off, or the sine flavour |
+//! | 16 | output saturation [0] | off, cubic, or sine |
 //! | 18-20 | de-esser frequency, strength (dB), Q | yes, with output saturation |
 //! | 23 | algorithm version [0] | 0 without saturation; 1 with the high-pass or the carried saturation subset |
 //!
@@ -50,6 +50,31 @@ fn default(id: u32) -> Option<f64> {
 }
 
 pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option<Params>> {
+    compile_for(stage, fs, None, diags)
+}
+
+fn macos27(build: Option<&str>) -> bool {
+    let mut major = 0u32;
+    let mut digits = 0usize;
+    for b in build.unwrap_or("").bytes() {
+        if !b.is_ascii_digit() {
+            break;
+        }
+        major = major.saturating_mul(10) + u32::from(b - b'0');
+        digits += 1;
+    }
+    digits != 0 && major >= 26
+}
+
+/// Compile with the source tuning's macOS build provenance. Darwin build
+/// 26 is the first macOS 27 generation and selects its parameter-17
+/// block-peak ceiling; unknown and older payloads keep the 25G83 behavior.
+pub fn compile_for(
+    stage: &Stage,
+    fs: f64,
+    macos_build: Option<&str>,
+    diags: &mut Diagnostics,
+) -> Result<Option<Params>> {
     let ctx = format!("limiter box {}", stage.name);
     let bad = |m: String| Error::format(&ctx, m);
     if stage.unit.map(|u| u.subtype) != Some(CFRK) {
@@ -67,6 +92,7 @@ pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option
             None => default(id).ok_or_else(|| bad(format!("saved parameter {id} is missing"))),
         }
     };
+    let saturation_ceiling_present = macos27(macos_build);
     if get(0)? != 0.0 {
         return Ok(None);
     }
@@ -98,17 +124,21 @@ pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option
     };
     let (saturation_mode, saturation_flavor, saturation_mix) = if saturation {
         let mode = get(1)?;
-        if !(1.0..=7.0).contains(&mode) || mode != mode.trunc() || get(10)? != 2.0 || get(23)? != 1.0 {
+        let flavor = get(10)?;
+        let version = get(23)?;
+        let carried = match flavor {
+            1.0 => version == 0.0 || version == 1.0,
+            2.0 => version == 1.0,
+            _ => false,
+        };
+        if !(0.0..=7.0).contains(&mode) || mode != mode.trunc() || !carried {
             return Err(bad(format!(
-                "output saturation mode/flavor/version {}/{}/{} (modes 1-7, sine flavor 2, version 1 are carried)",
-                mode,
-                get(10)?,
-                get(23)?
+                "output saturation mode/flavor/version {mode}/{flavor}/{version} (modes 0-7; cubic flavor 1 with version 0 or 1, sine flavor 2 with version 1 are carried)"
             )));
         }
         let amount = get(17)?;
-        if !(0.0..=100.0).contains(&amount) {
-            return Err(bad(format!("output saturation amount {amount}%")));
+        if !(-100.0..=100.0).contains(&amount) {
+            return Err(bad(format!("maximum saturation {amount} dB")));
         }
         // The de-esser (18-20) shapes the saturation drive; 21 belongs to
         // the version-1 state. Require complete finite saved values rather
@@ -116,7 +146,19 @@ pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option
         for id in [18, 19, 20, 21] {
             get(id)?;
         }
-        (mode, 2.0, amount / 100.0)
+        if mode == 0.0 && get(19)? != 0.0 {
+            return Err(bad("output saturation without oversampling and an active de-esser (not carried)".into()));
+        }
+        // Keep old flavor-2 wire words byte-identical. Internal flavor 4
+        // is the same sine shaper plus the source-selected ceiling.
+        let (flavor, control) = if saturation_ceiling_present {
+            (if flavor == 2.0 { 4.0 } else { flavor }, amount)
+        } else if flavor == 1.0 {
+            (flavor, sgv2_core::voicing::cfreak::CEILING_OFF_DB)
+        } else {
+            (flavor, amount / 100.0)
+        };
+        (mode, flavor, control)
     } else {
         // version 1 without saturation: the high-pass (if on) is its only
         // addition the strips use
@@ -125,9 +167,6 @@ pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option
         }
         (0.0, 0.0, 0.0)
     };
-    if highpass && saturation {
-        return Err(bad("high-pass together with output saturation (not carried)".into()));
-    }
     let words = [
         get(7)? / 1000.0,
         get(5)? / 1000.0,
@@ -194,6 +233,15 @@ mod tests {
 
     fn compile_of(params: &[(u32, f32)]) -> Result<Option<Params>> {
         compile(&stage(params), 48_000.0, &mut Diagnostics::default())
+    }
+
+    #[test]
+    fn source_build_selects_the_new_unit_without_an_aid_rule() {
+        assert!(!macos27(None));
+        assert!(!macos27(Some("25G83")));
+        assert!(macos27(Some("26A1")));
+        assert!(macos27(Some("27B2")));
+        assert!(!macos27(Some("unknown")));
     }
 
     #[test]
@@ -275,7 +323,58 @@ mod tests {
         .unwrap();
         assert_eq!((saturated.saturation_mode, saturated.saturation_flavor, saturated.saturation_mix), (3, 2, 0.3));
         assert_eq!((saturated.deesser_hz, saturated.deesser_db, saturated.deesser_q), (10_000.0, 10.0, 1.0));
-        for refused in [[(1, 0.0)], [(1, 8.0)], [(10, 1.0)], [(23, 0.0)]] {
+        let sine_27 = compile_for(
+            &stage(&[
+                (1, 3.0),
+                (10, 2.0),
+                (16, 1.0),
+                (17, 30.0),
+                (18, 10_000.0),
+                (19, 10.0),
+                (20, 1.0),
+                (21, 2.0),
+                (23, 1.0),
+            ]),
+            48_000.0,
+            Some("26A1"),
+            &mut Diagnostics::default(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!((sine_27.saturation_flavor, sine_27.saturation_mix), (4, 30.0));
+        let cubic_25 =
+            compile_of(&[(1, 0.0), (10, 1.0), (16, 1.0), (18, 10_000.0), (19, 0.0), (20, 1.0), (21, 2.0), (23, 0.0)])
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            (cubic_25.saturation_mode, cubic_25.saturation_flavor, cubic_25.saturation_mix),
+            (0, 1, sgv2_core::voicing::cfreak::CEILING_OFF_DB)
+        );
+        let cubic_27 = compile_for(
+            &stage(&[
+                (1, 2.0),
+                (10, 1.0),
+                (12, 1.0),
+                (13, 80.0),
+                (16, 1.0),
+                (17, -6.0),
+                (18, 10_000.0),
+                (19, 1.0),
+                (20, 1.0),
+                (21, 4.0),
+                (23, 1.0),
+            ]),
+            48_000.0,
+            Some("26A1"),
+            &mut Diagnostics::default(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            (cubic_27.saturation_mode, cubic_27.saturation_flavor, cubic_27.saturation_mix, cubic_27.highpass_order,),
+            (2, 1, -6.0, 4)
+        );
+        for refused in [[(1, 0.0)], [(1, 8.0)], [(10, 4.0)], [(23, 0.0)]] {
             let mut st = vec![
                 (1, 3.0),
                 (10, 2.0),

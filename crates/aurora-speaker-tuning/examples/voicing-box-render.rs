@@ -111,6 +111,7 @@ fn main() {
     let (mut aid, mut name, mut ch, mut only_slot) = (None, None, None, None);
     let mut voicing_chain = false;
     let mut sample_rate = None;
+    let mut macos_build = None;
     let mut automation_input = None;
     let mut tone_volume = None;
     let mut own_timing = false;
@@ -153,6 +154,7 @@ fn main() {
             }
             "--voicing-chain" => voicing_chain = true,
             "--sample-rate" => sample_rate = it.next().and_then(|v| v.parse::<i128>().ok()),
+            "--macos-build" => macos_build = it.next(),
             "--automation-input" => automation_input = it.next().and_then(|v| v.parse::<f64>().ok()),
             // ToneMeister's volume-automation input (its parameter 3), as
             // the installed unit's saved state or a rig sets it.
@@ -162,7 +164,7 @@ fn main() {
     }
     let (Some(ch), [inp, out]) = (ch, files.as_slice()) else {
         eprintln!(
-            "usage: voicing-box-render (--strip FILE --only NAME | --tunings-root DIR --aid N --box NAME [--voicing-chain] [--tone-volume V] [--set ID=V]... [--sample-rate HZ] [--automation-input V] \
+            "usage: voicing-box-render (--strip FILE --only NAME | --tunings-root DIR --aid N --box NAME [--voicing-chain] [--tone-volume V] [--set ID=V]... [--sample-rate HZ] [--macos-build BUILD] [--automation-input V] \
              | --params-words FILE [--fs HZ]) --ch C IN.f32 OUT.f32"
         );
         exit(2)
@@ -212,6 +214,9 @@ fn main() {
         let (Some(root), Some(aid)) = (root, aid) else { die("give --strip FILE or --tunings-root DIR --aid N") };
         let bundle = Bundle::from_tunings_root(&root, aid).unwrap_or_else(|e| die(format!("{e:?}")));
         let t = Tuning::load(&bundle, &Options::default(), &mut diags).unwrap_or_else(|e| die(format!("{e:?}")));
+        if macos_build.is_none() {
+            macos_build.clone_from(&t.macos_build);
+        }
         let stage = t.chain.iter().find(|s| s.name == name).cloned().unwrap_or_else(|| die(format!("no box {name}")));
         if stage.channels.is_some_and(|width| width as usize != ch) {
             die("--ch does not match the graph box width")
@@ -285,8 +290,8 @@ fn main() {
     let mut planar: Vec<Vec<f32>> = (0..ch).map(|c| (0..frames).map(|i| x[i * ch + c]).collect()).collect();
 
     let subtype = stage.unit.map(|u| u.subtype.to_string()).unwrap_or_default();
-    if subtype != "axtc" && (quantum != 512 || reset_at.is_some()) {
-        die("--q and --reset-at are only carried for XTC")
+    if !matches!(subtype.as_str(), "axtc" | "cfrk") && (quantum != 512 || reset_at.is_some()) {
+        die("--q and --reset-at are only carried for XTC and ControlFreak")
     }
     match subtype.as_str() {
         "mstk" => {
@@ -385,7 +390,11 @@ fn main() {
                 };
             }
             let kind = match subtype.as_str() {
-                "cfrk" => kind!(cfreak, Cfreak),
+                "cfrk" => match voicing::cfreak::compile_for(stage, fs, macos_build.as_deref(), &mut diags) {
+                    Ok(Some(p)) => Kind::Cfreak(Box::new(p)),
+                    Ok(None) => Kind::Bypass,
+                    Err(e) => die(e),
+                },
                 "vben" => kind!(vbass, Vbass),
                 "axtc" => kind!(xtc, Xtc),
                 "vrq2" => kind!(vareq, Vareq),
