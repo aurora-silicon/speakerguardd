@@ -48,6 +48,11 @@ pub const CEILING_TRIM_DB: f64 = -0.00002;
 /// throughout, which can only hold the gain lower than the unit's. This
 /// only matters past `MinFastGain` dB of limiting.
 pub const TAU_SLOW_S: f64 = 10.0;
+/// Mode-3 output-saturation reconstruction: a ninth-order Butterworth low
+/// pass followed by the unit's 24-frame reported-latency alignment.
+pub const SATURATION_FILTER_HZ: f64 = 14_100.0;
+pub const SATURATION_FILTER_ORDER: usize = 5;
+pub const SATURATION_DELAY: usize = 24;
 
 /// ITU-R BS.1770-4 Annex 2 true-peak interpolator, first two phases (the
 /// other two are their mirror images).
@@ -97,10 +102,15 @@ pub struct Params {
     pub threshold_db: f64,
     pub min_fast_gain_db: f64,
     pub true_peak: bool,
+    /// Output saturation oversampling mode (zero disables it; mode 3 is
+    /// carried with flavor 2, the sine shaper).
+    pub saturation_mode: u32,
+    pub saturation_flavor: u32,
+    pub saturation_mix: f64,
 }
 
 impl Params {
-    pub const WORDS: usize = 5;
+    pub const WORDS: usize = 8;
 
     pub fn to_words(&self, out: &mut [f64]) {
         out[..Self::WORDS].copy_from_slice(&[
@@ -109,6 +119,9 @@ impl Params {
             self.threshold_db,
             self.min_fast_gain_db,
             if self.true_peak { 1.0 } else { 0.0 },
+            self.saturation_mode as f64,
+            self.saturation_flavor as f64,
+            self.saturation_mix,
         ]);
     }
 
@@ -126,13 +139,71 @@ impl Params {
                 1.0 => true,
                 _ => return None,
             },
+            saturation_mode: match w[5] {
+                0.0 => 0,
+                3.0 => 3,
+                _ => return None,
+            },
+            saturation_flavor: match w[6] {
+                0.0 => 0,
+                2.0 => 2,
+                _ => return None,
+            },
+            saturation_mix: w[7],
         };
         let ok = (0.0..=MAX_LOOKAHEAD_S).contains(&p.lookahead_s)
             && (0.0..=MAX_HOLD_S).contains(&p.hold_s)
             && (-40.0..=6.0).contains(&p.threshold_db)
             && (0.0..=40.0).contains(&p.min_fast_gain_db);
-        ok.then_some(p)
+        let saturation_ok = if p.saturation_mode == 0 {
+            p.saturation_flavor == 0 && p.saturation_mix == 0.0
+        } else {
+            p.saturation_flavor == 2 && (0.0..=1.0).contains(&p.saturation_mix)
+        };
+        (ok && saturation_ok).then_some(p)
     }
+}
+
+#[derive(Clone, Copy, Default)]
+struct SatSection {
+    b: [f64; 3],
+    a: [f64; 2],
+}
+
+#[derive(Clone, Copy, Default)]
+struct SatState {
+    z: [f64; 2],
+}
+
+impl SatSection {
+    fn run(&self, state: &mut SatState, x: f64) -> f64 {
+        let y = self.b[0] * x + state.z[0];
+        state.z[0] = self.b[1] * x - self.a[0] * y + state.z[1];
+        state.z[1] = self.b[2] * x - self.a[1] * y;
+        y
+    }
+}
+
+const SATURATION_SECTIONS: usize = SATURATION_FILTER_ORDER.div_ceil(2);
+
+fn saturation_filter(fs: f64) -> [SatSection; SATURATION_SECTIONS] {
+    let mut sections = [SatSection::default(); SATURATION_SECTIONS];
+    let k = libm::tan(core::f64::consts::PI * SATURATION_FILTER_HZ / fs);
+    for (i, section) in sections.iter_mut().take(SATURATION_FILTER_ORDER / 2).enumerate() {
+        let theta = core::f64::consts::PI * (2 * i + 1) as f64 / (2 * SATURATION_FILTER_ORDER) as f64;
+        let two_zeta = 2.0 * libm::sin(theta);
+        let a0 = 1.0 + two_zeta * k + k * k;
+        let gain = k * k / a0;
+        *section = SatSection {
+            b: [gain, 2.0 * gain, gain],
+            a: [2.0 * (k * k - 1.0) / a0, (1.0 - two_zeta * k + k * k) / a0],
+        };
+    }
+    if SATURATION_FILTER_ORDER % 2 == 1 {
+        let a0 = 1.0 + k;
+        sections[SATURATION_SECTIONS - 1] = SatSection { b: [k / a0, k / a0, 0.0], a: [(k - 1.0) / a0, 0.0] };
+    }
+    sections
 }
 
 /// Sliding minimum over the last `cap` values (monotonic queue in a fixed
@@ -218,6 +289,11 @@ pub struct Run {
     line_at: usize,
     hist: Box<[f64]>,
     hist_at: usize,
+    saturation_mix: f64,
+    saturation_filter: [SatSection; SATURATION_SECTIONS],
+    saturation_state: [[SatState; SATURATION_SECTIONS]; MAX_CHANNELS],
+    saturation_line: [[f32; SATURATION_DELAY]; MAX_CHANNELS],
+    saturation_at: usize,
 }
 
 impl Run {
@@ -251,6 +327,11 @@ impl Run {
             line_at: 0,
             hist: vec![0.0; TAPS * channels].into_boxed_slice(),
             hist_at: 0,
+            saturation_mix: if p.saturation_mode == 3 { p.saturation_mix } else { 0.0 },
+            saturation_filter: saturation_filter(fs),
+            saturation_state: [[SatState::default(); SATURATION_SECTIONS]; MAX_CHANNELS],
+            saturation_line: [[0.0; SATURATION_DELAY]; MAX_CHANNELS],
+            saturation_at: 0,
         }
     }
 
@@ -264,10 +345,13 @@ impl Run {
         self.line_at = 0;
         self.hist.iter_mut().for_each(|v| *v = 0.0);
         self.hist_at = 0;
+        self.saturation_state = [[SatState::default(); SATURATION_SECTIONS]; MAX_CHANNELS];
+        self.saturation_line = [[0.0; SATURATION_DELAY]; MAX_CHANNELS];
+        self.saturation_at = 0;
     }
 
     pub fn latency(&self) -> usize {
-        self.lookahead
+        self.lookahead + if self.saturation_mix > 0.0 { SATURATION_DELAY } else { 0 }
     }
 
     /// The linked gain for this frame, given the newest input frame.
@@ -297,9 +381,20 @@ impl Run {
         let l = self.lookahead;
         for k in 0..frames {
             let mut peak = 0.0f64;
+            let mut frame = [0.0f64; MAX_CHANNELS];
             self.hist_at = (self.hist_at + 1) % TAPS;
             for (c, b) in bufs[..ch].iter().enumerate() {
-                let x = if b[k].is_finite() { f64::from(b[k]) } else { 0.0 };
+                let mut x = if b[k].is_finite() { f64::from(b[k]) } else { 0.0 };
+                if self.saturation_mix > 0.0 {
+                    x = (1.0 - self.saturation_mix) * x + self.saturation_mix * libm::sin(x);
+                    for section in 0..SATURATION_SECTIONS {
+                        x = self.saturation_filter[section].run(&mut self.saturation_state[c][section], x);
+                    }
+                    let held = self.saturation_line[c][self.saturation_at];
+                    self.saturation_line[c][self.saturation_at] = x as f32;
+                    x = f64::from(held);
+                }
+                frame[c] = x;
                 let hist = &mut self.hist[c * TAPS..(c + 1) * TAPS];
                 hist[self.hist_at] = x;
                 let mut a = libm::fabs(x);
@@ -320,12 +415,14 @@ impl Run {
             let g = self.gain(peak);
             for (c, b) in bufs[..ch].iter_mut().enumerate() {
                 let slot = c * l + self.line_at;
-                let x = if b[k].is_finite() { b[k] } else { 0.0 };
                 let delayed = self.line[slot];
-                self.line[slot] = x;
+                self.line[slot] = frame[c] as f32;
                 b[k] = (f64::from(delayed) * g) as f32;
             }
             self.line_at = (self.line_at + 1) % l;
+            if self.saturation_mix > 0.0 {
+                self.saturation_at = (self.saturation_at + 1) % SATURATION_DELAY;
+            }
         }
     }
 }
@@ -341,7 +438,16 @@ mod tests {
     use proptest::prelude::*;
 
     fn params(threshold_db: f64, true_peak: bool) -> Params {
-        Params { lookahead_s: 0.0005, hold_s: 0.0005, threshold_db, min_fast_gain_db: 20.0, true_peak }
+        Params {
+            lookahead_s: 0.0005,
+            hold_s: 0.0005,
+            threshold_db,
+            min_fast_gain_db: 20.0,
+            true_peak,
+            saturation_mode: 0,
+            saturation_flavor: 0,
+            saturation_mix: 0.0,
+        }
     }
 
     fn render(p: &Params, chans: &[Vec<f32>]) -> Vec<Vec<f32>> {
@@ -449,7 +555,16 @@ mod tests {
             level_db in -10.0f64..40.0,
             ch in 1usize..5,
         ) {
-            let p = Params { lookahead_s: 0.0005, hold_s: hold, threshold_db: thr, min_fast_gain_db: mfg, true_peak: tp };
+            let p = Params {
+                lookahead_s: 0.0005,
+                hold_s: hold,
+                threshold_db: thr,
+                min_fast_gain_db: mfg,
+                true_peak: tp,
+                saturation_mode: 0,
+                saturation_flavor: 0,
+                saturation_mix: 0.0,
+            };
             let mut s = seed | 1;
             let amp = db(level_db);
             let chans: Vec<Vec<f32>> = (0..ch).map(|_| (0..1500).map(|k| {

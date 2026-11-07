@@ -80,6 +80,15 @@ pub struct Link {
     pub id: u32,
 }
 
+/// A box-published parameter copied to a later box at each control update.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Relay {
+    pub from_node: usize,
+    pub from_id: u32,
+    pub to_node: usize,
+    pub to_id: u32,
+}
+
 /// The part of one ToneMeister slot that volume automation may move.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToneShape {
@@ -198,6 +207,7 @@ pub struct Spec {
     /// Per unit channel.
     pub outputs: Vec<Source>,
     pub links: Vec<Link>,
+    pub relays: Vec<Relay>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -264,6 +274,13 @@ impl Spec {
         }
         if let Some(i) = self.links.iter().position(|l| l.node >= self.nodes.len()) {
             return Err(SpecError::BadLink(i));
+        }
+        if let Some(i) = self
+            .relays
+            .iter()
+            .position(|r| r.from_node >= self.nodes.len() || r.to_node >= self.nodes.len() || r.from_node >= r.to_node)
+        {
+            return Err(SpecError::BadLink(self.links.len() + i));
         }
         Ok(())
     }
@@ -501,12 +518,22 @@ impl Run {
                 apply_dynamic_tone_automation(stage, dynamic_base, dynamic_automation, *fs, v);
             }
             // the volume taper's slider; a non-finite value is its quiet end
-            Run::Volt(r) if id == 4 => r.set_volume(v),
+            Run::Volt(r) if id == 4 => {
+                r.prime_volume(v);
+            }
             // VarEQ's volume scalar; the box ignores a non-finite value
             Run::Vareq(r) if id == 5 => r.set_volume_scalar(v),
             // AULowFlow's attenuation ceiling follows the system volume in dB
             Run::Lowflow(r) if id == 4 => r.set_volume(v),
+            Run::Mstk(r) if id == 79 => r.set_automation_input(v),
             _ => {}
+        }
+    }
+
+    fn get(&self, id: u32) -> Option<f64> {
+        match self {
+            Run::Volt(r) if id == 100 => Some(r.gain_db()),
+            _ => None,
         }
     }
 
@@ -667,6 +694,16 @@ impl Chain {
                 r.set(l.id, v);
             }
         }
+        self.apply_relays();
+    }
+
+    fn apply_relays(&mut self) {
+        for relay in self.spec.relays.iter().copied() {
+            let Some(value) = self.runs.get(relay.from_node).and_then(|run| run.get(relay.from_id)) else { continue };
+            if let Some(run) = self.runs.get_mut(relay.to_node) {
+                run.set(relay.to_id, value);
+            }
+        }
     }
 
     pub fn reset(&mut self) {
@@ -742,6 +779,7 @@ mod tests {
                 Link { param: GraphParam::VolumeDb, node: 1, id: 0 },
                 Link { param: GraphParam::Mute, node: 0, id: 1 },
             ],
+            relays: vec![],
         }
     }
 
@@ -789,6 +827,46 @@ mod tests {
         assert_eq!(s.check(), Err(SpecError::BadSource { node: 0, channel: 0 }));
     }
 
+    #[test]
+    fn volume_taper_relay_primes_compressor_before_audio() {
+        let volt = super::super::volt::Params {
+            saved_scalar: 0.25,
+            pre_gain_db: 0.0,
+            curve_db: [-6.0; super::super::volt::CURVE_POINTS],
+            offset_db: [0.0; super::super::volt::OFFSET_POINTS],
+        };
+        let mut points = [super::super::mstk::AutomationPoint::default(); super::super::mstk::MAX_AUTOMATION_POINTS];
+        points[..2].copy_from_slice(&[
+            super::super::mstk::AutomationPoint { input: -12.0, value: -10.0 },
+            super::super::mstk::AutomationPoint { input: 0.0, value: -22.0 },
+        ]);
+        let curve = super::super::mstk::ThresholdAutomation { points, count: 2 };
+        let comp = super::super::mstk::Params {
+            automation_min: -12.0,
+            automation_max: 0.0,
+            threshold_automation: [
+                curve,
+                super::super::mstk::ThresholdAutomation::default(),
+                super::super::mstk::ThresholdAutomation::default(),
+                super::super::mstk::ThresholdAutomation::default(),
+            ],
+            ..super::super::mstk::Params::default()
+        };
+        let spec = Spec {
+            program_channels: 1,
+            nodes: vec![
+                NodeSpec { kind: Kind::Volt(Box::new(volt)), inputs: vec![Source::Program(0)] },
+                NodeSpec { kind: Kind::Mstk(Box::new(comp)), inputs: vec![Source::Node(0, 0)] },
+            ],
+            outputs: vec![Source::Node(1, 0)],
+            links: vec![Link { param: GraphParam::VolumeScalar, node: 0, id: 4 }],
+            relays: vec![Relay { from_node: 0, from_id: 100, to_node: 1, to_id: 79 }],
+        };
+        let chain = Chain::new(spec, 48_000.0, 16).unwrap();
+        let Run::Mstk(comp) = &chain.runs[1] else { panic!("compressor runner") };
+        assert_eq!(comp.down_threshold_db(0), Some(-16.0));
+    }
+
     fn automated_tone() -> Spec {
         let fs = 48_000.0;
         let mut channel = Channel::IDENTITY;
@@ -816,6 +894,7 @@ mod tests {
             }],
             outputs: vec![Source::Node(0, 0)],
             links: vec![Link { param: GraphParam::VolumeScalar, node: 0, id: 3 }],
+            relays: vec![],
         }
     }
 
@@ -892,6 +971,7 @@ mod tests {
             }],
             outputs: vec![Source::Node(0, 0)],
             links: Vec::new(),
+            relays: vec![],
         }
     }
 

@@ -6,7 +6,7 @@
 //!  per channel c:  hp_c  = AP_u(AP_l(HP(x_c)))
 //!  mid M = (L+R)/2: lo    = LP(M)
 //!                   low   = s_b * blend * AP_u(AP_l(lo))
-//!                   harm  = s_h * gain * LP_u(LC(nld, HP_l, lo))
+//!                   harm  = s_h * LP_u(COMP(gain * LC(nld, HP_l, lo)))
 //!                   mid   = SUB(delay(low + harm))
 //!  y_c = out_gain * (hp_c + mid), `latency` frames late
 //! ```
@@ -22,6 +22,10 @@
 //!   level control: off, it is `HP_l(nld(lo))`; on, the device input is
 //!   normalised by a peak follower and its band-limited output rescaled by
 //!   a second one (see [`law`]).
+//! - `COMP` is the optional soft-knee harmonic compressor. Its peak follower
+//!   smooths the requested dB gain reduction before applying it. The box runs
+//!   it after harmonic gain and before the upper edge's second Butterworth
+//!   half (see [`law`]).
 //! - `SUB` band-limits the mid branches (a low pass designed at a quarter
 //!   of the rate); each odd-order band-edge all-pass adds one frame of
 //!   output latency and a further branch delay.
@@ -333,6 +337,18 @@ pub mod law {
     /// macOS's), the output follower already slightly below it (it then
     /// releases no earlier): a tie always resolves to the quieter output.
     pub const LC_HOLD_MARGIN: f64 = 1e-3;
+    /// Harmonic compressor. The detector converts `abs(x) + epsilon` to dB,
+    /// computes a conventional soft-knee gain-reduction request, then runs
+    /// that non-negative request through the same peak-follower topology as
+    /// the level control. These are the box defaults; the saved state exposes
+    /// only enable, threshold and ratio.
+    pub const COMP_DETECTOR_EPSILON: f64 = 1e-6;
+    pub const COMP_KNEE_DB: f64 = 10.0;
+    pub const COMP_ATTACK_S: f64 = 50e-6;
+    pub const COMP_RELEASE_S: f64 = 0.05;
+    pub const COMP_HOLD_S: f64 = 0.03;
+    pub const COMP_HOLD_RATIO: f64 = 0.9;
+    pub const COMP_SMOOTH_S: f64 = 0.05;
     /// The mid branches run at the selected rate (SPEC-vben §3): the
     /// crossover low pass at the stream rate, every `fs / SUB_RATE_HZ`-th
     /// frame taken, the
@@ -377,10 +393,14 @@ pub struct Params {
     pub device: Device,
     /// Level control in front of the device.
     pub level_control: bool,
+    /// Optional soft-knee compressor on the harmonic branch.
+    pub harmonic_compressor: bool,
+    pub compressor_threshold_db: f64,
+    pub compressor_ratio: f64,
 }
 
 impl Params {
-    pub const WORDS: usize = 11;
+    pub const WORDS: usize = 14;
 
     pub fn to_words(&self, out: &mut [f64]) {
         let w = [
@@ -395,6 +415,9 @@ impl Params {
             self.output_gain,
             self.device.code(),
             if self.level_control { 1.0 } else { 0.0 },
+            if self.harmonic_compressor { 1.0 } else { 0.0 },
+            self.compressor_threshold_db,
+            self.compressor_ratio,
         ];
         out[..Self::WORDS].copy_from_slice(&w);
     }
@@ -416,6 +439,18 @@ impl Params {
         } else {
             return None;
         };
+        let harmonic_compressor = if w[11] == 0.0 {
+            false
+        } else if w[11] == 1.0 {
+            true
+        } else {
+            return None;
+        };
+        let compressor_threshold_db = w[12];
+        let compressor_ratio = w[13];
+        if !(-100.0..=100.0).contains(&compressor_threshold_db) || !(1.0..=100.0).contains(&compressor_ratio) {
+            return None;
+        }
         Some(Params {
             fc_hz: corner(w[0])?,
             hp_order: order(w[1])?,
@@ -428,6 +463,9 @@ impl Params {
             output_gain: gain(w[8])?,
             device: Device::from_code(w[9])?,
             level_control,
+            harmonic_compressor,
+            compressor_threshold_db,
+            compressor_ratio,
         })
     }
 }
@@ -451,6 +489,10 @@ struct Follower {
 
 impl Follower {
     fn new(fs: f64, ratio: f64) -> Follower {
+        Follower::with_times(fs, ratio, law::LC_ATTACK_S, law::LC_RELEASE_S, law::LC_HOLD_S, law::LC_SMOOTH_S)
+    }
+
+    fn with_times(fs: f64, ratio: f64, attack_s: f64, release_s: f64, hold_s: f64, smooth_s: f64) -> Follower {
         let fs = fs as f32;
         let pole = |t: f64| libm::expf(-1.0 / (t as f32 * fs));
         Follower {
@@ -459,10 +501,10 @@ impl Follower {
             e: 0.0,
             s: 0.0,
             held: 0,
-            hold: (law::LC_HOLD_S as f32 * fs) as usize + 1,
-            a_att: pole(law::LC_ATTACK_S),
-            a_rel: pole(law::LC_RELEASE_S),
-            a_smo: pole(law::LC_SMOOTH_S),
+            hold: (hold_s as f32 * fs) as usize + 1,
+            a_att: pole(attack_s),
+            a_rel: pole(release_s),
+            a_smo: pole(smooth_s),
         }
     }
     #[inline]
@@ -491,6 +533,48 @@ impl Follower {
         self.e = a * self.e + (1.0 - a) * u;
         self.s = b * self.s + (1.0 - b) * self.e;
         self.s as f64
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct HarmonicCompressor {
+    threshold_db: f32,
+    ratio: f32,
+    follower: Follower,
+}
+
+impl HarmonicCompressor {
+    fn new(fs: f64, threshold_db: f64, ratio: f64) -> HarmonicCompressor {
+        HarmonicCompressor {
+            threshold_db: threshold_db as f32,
+            ratio: ratio as f32,
+            follower: Follower::with_times(
+                fs,
+                law::COMP_HOLD_RATIO,
+                law::COMP_ATTACK_S,
+                law::COMP_RELEASE_S,
+                law::COMP_HOLD_S,
+                law::COMP_SMOOTH_S,
+            ),
+        }
+    }
+
+    #[inline]
+    fn run(&mut self, x: f64) -> f64 {
+        let x = x as f32;
+        let level_db = 20.0 * libm::log10f(libm::fabsf(x) + law::COMP_DETECTOR_EPSILON as f32);
+        let d = level_db - self.threshold_db;
+        let half_knee = 0.5 * law::COMP_KNEE_DB as f32;
+        let slope = 1.0 - 1.0 / self.ratio;
+        let requested_db = if d > half_knee {
+            slope * d
+        } else if libm::fabsf(d) <= half_knee {
+            slope * (d + half_knee) * (d + half_knee) / (2.0 * law::COMP_KNEE_DB as f32)
+        } else {
+            0.0
+        };
+        let reduction_db = self.follower.run(requested_db as f64) as f32;
+        (x * libm::powf(10.0, -reduction_db / 20.0)) as f64
     }
 }
 
@@ -534,6 +618,7 @@ pub struct Run {
     lp_sign: f64,
     harm_sign: f64,
     lc: LevelControl,
+    compressor: HarmonicCompressor,
     stride: usize,
     /// Selected-rate delay: one sub-rate frame per odd band-edge section.
     sline: [f64; SUB_LINE],
@@ -584,6 +669,7 @@ impl Run {
             lp_sign: if nh % 2 == 1 { -1.0 } else { 1.0 },
             harm_sign: if nh % 2 == nl % 2 { 1.0 } else { -1.0 },
             lc: LevelControl::new(fs8),
+            compressor: HarmonicCompressor::new(fs8, p.compressor_threshold_db, p.compressor_ratio),
             stride,
             sline: [0.0; SUB_LINE],
             spos: 0,
@@ -606,6 +692,11 @@ impl Run {
         self.band_hp_st = CascadeState::default();
         self.band_lp_st = CascadeState::default();
         self.lc = LevelControl::new(self.fs / self.stride as f64);
+        self.compressor = HarmonicCompressor::new(
+            self.fs / self.stride as f64,
+            self.p.compressor_threshold_db,
+            self.p.compressor_ratio,
+        );
         self.sline = [0.0; SUB_LINE];
         self.phase = 0;
         self.recon_st = CascadeState::default();
@@ -640,6 +731,14 @@ impl Run {
         }
     }
 
+    #[inline]
+    fn compress_harmonic(&mut self, x: f64) -> f64 {
+        if !self.p.harmonic_compressor {
+            return x;
+        }
+        self.compressor.run(x)
+    }
+
     /// One selected-rate frame of both mid branches.
     #[inline]
     fn sub_frame(&mut self, lo: f64) -> f64 {
@@ -650,14 +749,18 @@ impl Run {
             let dev = self.device(z);
             let hp = self.band_hp.run(&mut self.band_hp_st, dev);
             let p_out = self.lc.output.run(hp);
-            let y = hp * p_in / p_out.max(law::LC_FLOOR);
-            self.band_lp.run(&mut self.band_lp_st, y)
+            hp * p_in / p_out.max(law::LC_FLOOR)
         } else {
             let dev = self.device(lo);
-            let hp = self.band_hp.run(&mut self.band_hp_st, dev);
-            self.band_lp.run(&mut self.band_lp_st, hp)
+            self.band_hp.run(&mut self.band_hp_st, dev)
         };
-        let v = low + self.harm_sign * self.p.harmonic_gain * harm;
+        // The compressor sees harmonic gain and precedes the upper edge's
+        // second Butterworth half. Both details affect its detector without
+        // changing the complementary LF fold.
+        let harmonic_gain = self.p.harmonic_gain;
+        let harm = self.compress_harmonic(harmonic_gain * harm);
+        let harm = self.band_lp.run(&mut self.band_lp_st, harm);
+        let v = low + self.harm_sign * harm;
         if self.sdelay == 0 {
             return v;
         }
@@ -717,6 +820,9 @@ mod tests {
             output_gain: 1.0,
             device: Device::Saturator3,
             level_control,
+            harmonic_compressor: false,
+            compressor_threshold_db: 0.0,
+            compressor_ratio: 1.0,
         }
     }
 
@@ -737,10 +843,15 @@ mod tests {
     #[test]
     fn words_round_trip() {
         for lc in [false, true] {
-            let p = params(lc);
-            let mut w = [0.0; Params::WORDS];
-            p.to_words(&mut w);
-            assert_eq!(Params::from_words(&w), Some(p));
+            for compressor in [false, true] {
+                let mut p = params(lc);
+                p.harmonic_compressor = compressor;
+                p.compressor_threshold_db = -3.0;
+                p.compressor_ratio = 3.5;
+                let mut w = [0.0; Params::WORDS];
+                p.to_words(&mut w);
+                assert_eq!(Params::from_words(&w), Some(p));
+            }
         }
         let mut w = [0.0; Params::WORDS];
         params(false).to_words(&mut w);
@@ -748,6 +859,18 @@ mod tests {
         assert_eq!(Params::from_words(&w), None);
         w[1] = f64::NAN;
         assert_eq!(Params::from_words(&w), None);
+    }
+
+    #[test]
+    fn harmonic_compressor_tracks_soft_knee_gain_reduction() {
+        let mut c = HarmonicCompressor::new(8_000.0, 0.0, 4.0);
+        assert!((c.run(-0.1) + 0.1).abs() < 1e-6);
+        let mut y = 0.0;
+        for _ in 0..8_000 {
+            y = c.run(10.0);
+        }
+        // 20 dB in at 4:1 settles to 5 dB out (15 dB reduction).
+        assert!((20.0 * libm::log10(y) - 5.0).abs() < 0.01, "{y}");
     }
 
     #[test]

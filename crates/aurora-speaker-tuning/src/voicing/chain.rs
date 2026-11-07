@@ -18,7 +18,7 @@
 use super::topology::{self, NodeKind, Plan, Source as PSource};
 use crate::error::{Diagnostics, Error, Result};
 use crate::tuning::{Stage, Tuning};
-use sgv2_core::voicing::chain::{GraphParam, Kind, Link, NodeSpec, Source, Spec};
+use sgv2_core::voicing::chain::{GraphParam, Kind, Link, NodeSpec, Relay, Source, Spec};
 
 pub struct Compiled {
     pub plan: Plan,
@@ -224,11 +224,30 @@ pub fn compile(t: &Tuning, fs: f64, diags: &mut Diagnostics) -> Result<Compiled>
             None => unwired.push(format!("{} -> {} {}", l.param, plan.nodes[l.node].name, l.id)),
         }
     }
+    let mut relays = Vec::new();
+    if t.graph
+        .box_param_links
+        .iter()
+        .any(|link| plan.node(&link.from.node).is_some() || plan.node(&link.to.node).is_some())
+    {
+        let volume = super::volume::compile_tuning(t)?;
+        relays.reserve(volume.relays.len());
+        for relay in volume.relays {
+            let from_node = plan
+                .node(&relay.from_box)
+                .ok_or_else(|| bad(format!("volume relay source {} is not in the voicing plan", relay.from_box)))?;
+            let to_node = plan
+                .node(&relay.to_box)
+                .ok_or_else(|| bad(format!("volume relay target {} is not in the voicing plan", relay.to_box)))?;
+            relays.push(Relay { from_node, from_id: relay.from_id, to_node, to_id: relay.to_id });
+        }
+    }
     let spec = Spec {
         program_channels: plan.program_channels as usize,
         nodes,
         outputs: plan.outputs.iter().map(source).collect(),
         links,
+        relays,
     };
     spec.check().map_err(|e| bad(format!("{e:?}")))?;
     Ok(Compiled { plan, spec, stubs, gaps, unwired })

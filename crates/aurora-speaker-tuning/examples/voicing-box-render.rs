@@ -157,6 +157,7 @@ fn main() {
                     nodes: vec![NodeSpec { kind: Kind::Tone(tone), inputs: (0..ch).map(Source::Program).collect() }],
                     outputs: (0..ch).map(|channel| Source::Node(0, channel)).collect(),
                     links: Vec::new(),
+                    relays: Vec::new(),
                 };
                 let mut run = Chain::new(spec, fs, 512).unwrap_or_else(|| die("invalid isolated Tone chain"));
                 let mut rendered = vec![vec![0.0f32; frames]; ch];
