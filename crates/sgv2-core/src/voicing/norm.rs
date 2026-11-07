@@ -75,8 +75,10 @@
 //! - a reset starts every meter silent: the median ring, the long reading
 //!   and its delay line, the fast level and the held candidate all start at
 //!   the histogram floor, so the first call is read from the program alone
-//!   (the long histogram's relative gate still starts from the expected
-//!   loudness); the smoothed detector power starts from a small fixed floor
+//!   (the long histogram's relative gate starts from the same -70 dB seed as
+//!   the other algorithms, not from the expected loudness: a gate seeded at
+//!   an expected loudness of -14 lifts the second pause's long reading
+//!   above the unit's); the smoothed detector power starts from a small fixed floor
 //!   (`V1_DETECTOR_SEED_DB`) that fades with the detector's own time
 //!   constant; there is no deferred second clear of the detector state;
 //! - the applied gain starts its glide from `V1_START_GAIN_DB`;
@@ -747,15 +749,14 @@ impl Run {
         }
     }
 
-    /// Algorithm 1 starts every meter silent; only the long histogram's
-    /// relative gate starts from the expected loudness.
+    /// Algorithm 1 starts every meter silent; the long histogram's relative
+    /// gate keeps the common seed and the detector power its own floor.
     fn reset_algorithm1(&mut self) {
         let s = V1_SILENT_DB;
         self.ema = libm::pow(10.0, V1_DETECTOR_SEED_DB / 10.0);
         self.window.reset(0.0);
         self.median.reset(s);
         self.long.reset(s);
-        self.long.gate_energy = power_of(self.p.expected_db);
         self.long.age_invalid = true;
         self.long_line = [s; LONG_DELAY];
         self.long_out = s;
