@@ -290,6 +290,14 @@ fn human(t: &Tuning) {
                 ))
             );
         }
+    } else if p.kind == aurora_speaker_tuning::tuning::UnitKind::Atsp {
+        println!("\nsaved state of {} (atsp, spec 2 names):", p.box_name);
+        for s in &p.state.sections {
+            for (i, v) in &s.params {
+                let name = aurora_speaker_tuning::names::atsp(s.scope, *i).map_or("unnamed", |n| n.name);
+                println!("  scope {} element {} ID {i:>2} {name} = {v}", s.scope, s.element);
+            }
+        }
     } else {
         println!("\nsaved state of {} (raw IDs; TODO(SPEC) names):", p.box_name);
         for s in &p.state.sections {
