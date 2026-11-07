@@ -8,6 +8,23 @@ use sgv2_lv2::{load_unit, AnyUnit, Role};
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();
+    if a.get(1).map(String::as_str) == Some("--summary") {
+        let path = a.get(2).expect("usage: blob-info --summary BLOB BOARD");
+        let board = a.get(3).expect("usage: blob-info --summary BLOB BOARD");
+        let bytes = std::fs::read(path).expect("read blob");
+        let (h, _) = Header::parse(&bytes).expect("header");
+        assert_eq!(h.machine(), Some(board.as_str()), "board mismatch");
+        let n = h.channels as usize;
+        let rate = h.sample_rate as f64;
+        let spec = sgv2_core::blob::voicing(&bytes).expect("voicing section integrity");
+        assert!(spec.is_some(), "voicing section absent");
+        let (unit, err, _) = load_unit(Some(&bytes), rate, n, 2 * n, Role::Protect);
+        assert!(err.is_none(), "protect loader: {err:?}");
+        assert!(sgv2_lv2::load_prestage(Some(&bytes), rate, n, &unit).is_some(), "prestage loader");
+        assert!(sgv2_lv2::voicing::Voicing::load(Some(&bytes), board, rate, n).ready(), "voicing loader");
+        println!("board={board} channels={n} voicing=present protect=ready voicing_plugin=ready");
+        return;
+    }
     let path = a.get(1).expect("usage: blob-info <blob> [channels] [sense]");
     let n: usize = a.get(2).and_then(|v| v.parse().ok()).unwrap_or(6);
     let s: usize = a.get(3).and_then(|v| v.parse().ok()).unwrap_or(2 * n);
