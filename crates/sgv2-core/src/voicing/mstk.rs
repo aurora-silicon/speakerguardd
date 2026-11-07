@@ -1277,18 +1277,6 @@ impl Run {
         (base, overshoot)
     }
 
-    /// Single-precision-state biquad cascade (the detector's storage width).
-    #[inline]
-    fn run_detector_path(path: &Path, state: &mut [[f32; 2]; MAX_FILTERS], mut v: f64) -> f64 {
-        for (s, z) in path.section[..path.count].iter().zip(state.iter_mut()) {
-            let o = s.b0 * v + z[0] as f64;
-            z[0] = (s.b1 * v - s.a1 * o + z[1] as f64) as f32;
-            z[1] = (s.b2 * v - s.a2 * o) as f32;
-            v = o;
-        }
-        v
-    }
-
     /// Multi-section Float32 path used by the native analysis/synthesis
     /// bank. Coefficients, every section output and both state updates round
     /// at Float32 boundaries; retaining an f64 section output destroys the
