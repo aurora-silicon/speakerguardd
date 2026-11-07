@@ -1437,6 +1437,7 @@ struct SlowGain {
     g: f32,
     start: f32,
     target: f32,
+    release: f32,
     n: u32,
     len: u32,
     attack: bool,
@@ -1444,13 +1445,14 @@ struct SlowGain {
 
 impl SlowGain {
     fn unity(len: u32) -> Self {
-        SlowGain { g: 1.0, start: 1.0, target: 1.0, n: 0, len, attack: false }
+        SlowGain { g: 1.0, start: 1.0, target: 1.0, release: 0.0, n: 0, len, attack: false }
     }
     /// A held gain, used at reset and hand-off.
     fn set(&mut self, g: f32) {
         self.g = g;
         self.start = g;
         self.target = g;
+        self.release = 0.0;
         self.n = 0;
         self.attack = false;
     }
@@ -1458,6 +1460,7 @@ impl SlowGain {
         if !self.attack || self.n >= self.len {
             self.start = self.g;
             self.target = request.clamp(self.g, 1.0);
+            self.release = 0.0;
             self.n = 0;
             self.attack = false;
         }
@@ -1482,13 +1485,17 @@ impl SlowGain {
             }
         } else if self.start != self.target {
             self.n += 1;
-            let r = (1.0 - libm::exp(-(self.n as f64) * release_lambda)).min(1.0) as f32;
-            self.g = libm::fmaf(r, self.target - self.start, self.start);
+            // Native builds the release curve recursively in binary32, then
+            // applies it with a second FMA.  Re-evaluating the closed-form
+            // exponential at each sample is not bit-equivalent.
+            let alpha = (release_lambda as f32).min(1.0);
+            self.release = libm::fmaf(1.0 - alpha, self.release, alpha);
+            self.g = libm::fmaf(self.target - self.start, self.release, self.start);
         }
         self.g
     }
     fn finite(&self) -> bool {
-        self.g.is_finite() && self.start.is_finite() && self.target.is_finite()
+        self.g.is_finite() && self.start.is_finite() && self.target.is_finite() && self.release.is_finite()
     }
 }
 
@@ -3229,7 +3236,7 @@ mod fault_tests {
         f.set(0.4);
         let step = 0.125;
         let ceiling = 0.6;
-        let lambda = -libm::log(1.0 - step);
+        let lambda = step;
         let mut got = f.released_toward(ceiling);
         assert_eq!(got.g, 0.4);
         got.sample(lambda);
