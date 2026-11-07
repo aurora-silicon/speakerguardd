@@ -457,14 +457,17 @@ fn chebyshev_reference() -> [f32; WINDOW_REFERENCE] {
             *slot += re * libm::cos(phase) + im * libm::sin(phase);
         }
     }
-    let mut window = [0.0f32; WINDOW_REFERENCE];
+    let mut ordered = [0.0f64; WINDOW_REFERENCE];
     let half = m / 2;
     for i in 0..half {
-        window[i] = dft[half - i] as f32;
-        window[half + i] = dft[i + 1] as f32;
+        ordered[i] = dft[half - i];
+        ordered[half + i] = dft[i + 1];
     }
-    let peak = window.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    window.iter_mut().for_each(|v| *v /= peak);
+    let peak = ordered.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let mut window = [0.0f32; WINDOW_REFERENCE];
+    for (dst, src) in window.iter_mut().zip(ordered) {
+        *dst = (src / peak) as f32;
+    }
     window
 }
 
@@ -500,7 +503,7 @@ fn saturation_window() -> [f32; FIR_TAPS] {
 fn saturation_fir(mode: u32, fs: f64) -> [f32; FIR_TAPS] {
     // 32 kHz: every mode cuts at fs/2 (measured); 44.1/48 kHz: per mode;
     // 88.2 kHz and up: fs/4 for every mode.
-    let fc = if fs >= 88_000.0 { fs / 4.0 } else { (19_000.0 - 1_000.0 * f64::from(mode)).min(fs / 2.0) };
+    let fc = if fs >= 88_200.0 { fs / 4.0 } else { (19_000.0 - 1_000.0 * f64::from(mode)).min(fs / 2.0) };
     let ratio = (2.0 * fc / fs).clamp(0.5, 1.0);
     let a = ratio / OVERSAMPLE as f64;
     let window = saturation_window();
