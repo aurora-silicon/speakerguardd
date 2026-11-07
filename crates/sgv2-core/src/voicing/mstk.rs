@@ -1720,6 +1720,22 @@ mod tests {
     }
 
     #[test]
+    fn analytic_detector_keeps_full_band_timing_and_half_magnitude() {
+        let mut p = params();
+        p.algorithm = 0;
+        p.render_quality = 0;
+        let audio = paths(&p, 48_000.0);
+        let (band, reference) = analytic_detector_paths(&p, 48_000.0);
+        for b in 0..BANDS {
+            for f in [40.0, 200.0, 1000.0, 5000.0, 16_000.0] {
+                let expected = band_magnitude(&audio[b], f);
+                let measured = detector_band_magnitude(&band[b], f) * detector_band_magnitude(&reference[b], f);
+                assert!((expected - measured).abs() < 1e-10, "band {b} at {f} Hz: {expected} vs {measured}");
+            }
+        }
+    }
+
+    #[test]
     fn bandwidth_compensation_applies_the_normalized_band_width() {
         let mut p = params();
         p.crossover_hz = [400.0, 1600.0, 8000.0];
@@ -1946,6 +1962,18 @@ mod tests {
             }
             assert!((state.previous_output - 1.0).abs() < 2e-5);
         }
+    }
+
+    #[test]
+    fn algorithm_zero_band_zero_uses_half_rate_gain_synthesis() {
+        let mut p = params();
+        p.algorithm = 0;
+        p.band[0].mode = BandMode::Active;
+        let run = Run::new(&p, 48_000.0, 1);
+        let k = libm::tan(core::f64::consts::PI * 50.0 / 24_000.0);
+        assert_eq!(run.mode4_gain[0].b, (k / (1.0 + k)) as f32);
+        let full_rate = libm::tan(core::f64::consts::PI * 50.0 / 48_000.0);
+        assert_eq!(run.mode4_gain[1].b, (full_rate / (1.0 + full_rate)) as f32);
     }
 
     #[test]
