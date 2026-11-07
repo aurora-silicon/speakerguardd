@@ -7,6 +7,8 @@ manual step, before the self-check and the supervisor start.
     speakerguardd-provision seat     --unit UNIT                (root, when seat0 changes hands)
     speakerguardd-provision graph-user                          (the user's speakerguardd-graph.service)
     speakerguardd-provision is-seat                             (ExecCondition of the session helper)
+    speakerguardd-provision sleep    --unit UNIT                (root, speakerguardd-sleep.service, before sleep)
+    speakerguardd-provision wake     --unit UNIT                (root, the same unit's stop, after the resume)
     speakerguardd-provision status
 
 `run`:
@@ -55,6 +57,18 @@ them.
 `seat` (speakerguardd-seat.path, on every seat0 change) restarts the
 supervisor, which provisions again, when seat0's regular user is not the one
 provisioned.
+
+`sleep` (speakerguardd-sleep.service, ordered before sleep.target) takes
+the speakers down in order while everything is still awake: it sets the
+hold (/run/speakerguardd-sleep/hold), on which the session helper unlinks
+the amps as if protection were withdrawn, waits until the helper reports
+them unlinked, then stops the supervisor, which releases its ownership; the
+kernel then holds its floor with no stream running. Nothing of v2 is left
+to be frozen in the middle of a grant: no refused start, no watchdog that
+runs out across the freeze (systemd's clock keeps running through the
+device suspend and resume), no owner that dies while the amps resume.
+`wake` (the unit's stop, after the resume) clears the hold and starts the
+supervisor again, which grants as at boot.
 
 `--root DIR` (or SGV2_PROVISION_ROOT) moves every file this program writes
 or reads under DIR, for tests: etc/speakerguardd, var/lib/speakerguardd,
@@ -107,6 +121,8 @@ class Paths:
         self.selfcheck_json = os.path.join(self.state, "selfcheck.json")
         self.graph = r("/run/speakerguardd-graph")
         self.graph_state = os.path.join(self.graph, "state")
+        self.sleep = r("/run/speakerguardd-sleep")
+        self.hold = os.path.join(self.sleep, "hold")
 
 
 # ------------------------------------------------------------------ files
@@ -718,6 +734,62 @@ def cmd_seat(args, p):
     return 0
 
 
+def helper_amps(conf, since_ns):
+    """The seat user's session helper report written after `since_ns`:
+    True while it says the amps are linked, False once they are not, None
+    without a fresh report (no session, or the helper is not running)."""
+    uid = conf.get("SGV2_UID")
+    if not uid or not uid.isdigit():
+        return None
+    try:
+        with open(f"/run/speakerguardd/{uid}/helper/session") as f:
+            rep = dict(w.split("=", 1) for w in f.read().split() if "=" in w)
+    except OSError:
+        return None
+    try:
+        mono = int(rep.get("mono_ns", "0"))
+    except ValueError:
+        return None
+    if mono < since_ns or "amps" not in rep:
+        return None
+    return rep["amps"] != "0"
+
+
+def cmd_sleep(args, p):
+    """Before system sleep: the amps unlinked (the helper reports it), then
+    the supervisor stopped (it releases its ownership), all while awake.
+    Never fails the sleep: the kernel's floor at suspend is the backstop."""
+    os.makedirs(p.sleep, mode=0o755, exist_ok=True)
+    write_atomic(p.hold, f"since_ns={time.monotonic_ns()}\n")
+    if p.root:
+        return 0
+    if subprocess.run(["systemctl", "is-active", "--quiet", args.unit]).returncode != 0:
+        log(f"{args.unit} is not running: nothing to take down before sleep")
+        return 0
+    conf = read_kv(p.conf)
+    since = time.monotonic_ns()
+    deadline = time.monotonic() + args.sleep_wait
+    amps = helper_amps(conf, since)
+    while amps is not False and time.monotonic() < deadline:
+        time.sleep(0.01)
+        amps = helper_amps(conf, since)
+    if amps is not False:
+        log(f"no report of the amps unlinked within {args.sleep_wait:.1f} s: stopping {args.unit} anyway")
+    subprocess.run(["systemctl", "stop", args.unit])
+    log(f"speakers down for sleep: amps unlinked, {args.unit} stopped")
+    return 0
+
+
+def cmd_wake(args, p):
+    """After the resume: clear the hold and start the supervisor again."""
+    unlink(p.hold)
+    if p.root:
+        return 0
+    r = subprocess.run(["systemctl", "start", "--no-block", args.unit])
+    log(f"resumed: hold cleared, {args.unit} {'starting' if r.returncode == 0 else 'not started'}")
+    return 0
+
+
 def cmd_status(args, p):
     for path in (p.report, p.selfcheck_json):
         try:
@@ -730,10 +802,11 @@ def cmd_status(args, p):
 
 def main():
     ap = argparse.ArgumentParser(prog="speakerguardd-provision")
-    ap.add_argument("cmd", choices=["run", "activate", "seat", "graph-user", "is-seat", "status"])
+    ap.add_argument("cmd", choices=["run", "activate", "seat", "graph-user", "is-seat", "sleep", "wake", "status"])
     ap.add_argument("--bundle", help="the tuning source (default: the installer's bundle)")
     ap.add_argument("--force", action="store_true", help="compile even if the blob is bound")
-    ap.add_argument("--unit", default="speakerguardd.service", help="the supervisor's unit (seat)")
+    ap.add_argument("--unit", default="speakerguardd.service", help="the supervisor's unit (seat, sleep, wake)")
+    ap.add_argument("--sleep-wait", type=float, default=2.0, help="how long sleep waits for the speaker PCM to close")
     ap.add_argument("--graph-unit", default="speakerguardd-graph.service", help="the user's graph unit (activate)")
     ap.add_argument("--root", default=os.environ.get("SGV2_PROVISION_ROOT", ""), help="test root for every file written")
     ap.add_argument("--tuning-cli", default="aurora-speaker-tuning")
@@ -743,7 +816,7 @@ def main():
     args = ap.parse_args()
     p = Paths(args.root)
     return {"run": cmd_run, "activate": cmd_activate, "seat": cmd_seat, "graph-user": cmd_graph_user,
-            "is-seat": cmd_is_seat, "status": cmd_status}[args.cmd](args, p)
+            "is-seat": cmd_is_seat, "sleep": cmd_sleep, "wake": cmd_wake, "status": cmd_status}[args.cmd](args, p)
 
 
 if __name__ == "__main__":
