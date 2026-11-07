@@ -77,8 +77,8 @@
 //! * flat gain: its lowest;
 //! * peak or shelf: the lowest setting when the frequency does not move;
 //!   otherwise nothing when no setting cuts, the one cut exactly when no
-//!   glide reaches it, and else a flat gain of the deepest cut (a peak or
-//!   shelf stays between 0 dB and its gain);
+//!   glide reaches it, and else a flat gain of the deepest cut, lowered for
+//!   peaks to cover the actual designed response at every set point;
 //! * resonant high-pass (type 14): its highest corner when it does not
 //!   resonate (bilinear Q at most 1/sqrt 2); a resonant one is refused;
 //! * Butterworth shelf or band shelf (types 2, 0): a flat gain of the
@@ -683,8 +683,8 @@ enum Carry {
     /// The filter at this point: it passes no more than any other point, or
     /// any setting gliding between two of them, at every frequency.
     Exact(usize),
-    /// A flat gain (dB): the deepest cut of any point. A peak or shelf stays
-    /// between 0 dB and its gain, so no setting passes less.
+    /// The ideal flat envelope (dB): the deepest cut of any point.
+    /// Rounded peak sections additionally need `peak_carry_floor`.
     Flat(f64),
 }
 
@@ -707,6 +707,51 @@ fn carried(points: &[Point], spans: &[(usize, usize, bool)]) -> Carry {
         return Carry::Exact(cuts[0]);
     }
     Carry::Flat(lo)
+}
+
+/// Minimum magnitude of the actual section over the whole unit circle.
+/// Its squared magnitude is a ratio of quadratics in cos(w); extrema are
+/// the endpoints and the real roots of the quadratic derivative numerator.
+/// Evaluate the section itself at those roots to avoid cancellation in the
+/// expanded power polynomials near DC.
+fn section_floor(s: Section, fs: f64) -> f64 {
+    let power = |b0: f64, b1: f64, b2: f64| [(b0 - b2).powi(2) + b1 * b1, 2.0 * b1 * (b0 + b2), 4.0 * b0 * b2];
+    let n = power(s.b0, s.b1, s.b2);
+    let d = power(1.0, s.a1, s.a2);
+    let a = n[2] * d[1] - n[1] * d[2];
+    let b = 2.0 * (n[2] * d[0] - n[0] * d[2]);
+    let c = n[1] * d[0] - n[0] * d[1];
+    let mut floor = s.magnitude(0.0, fs).min(s.magnitude(fs * 0.5, fs));
+    let mut at = |x: f64| {
+        if (-1.0..=1.0).contains(&x) {
+            floor = floor.min(s.magnitude(x.acos() * fs / (2.0 * PI), fs));
+        }
+    };
+    if a == 0.0 {
+        if b != 0.0 {
+            at(-c / b);
+        }
+    } else {
+        let discriminant = b * b - 4.0 * a * c;
+        if discriminant >= 0.0 {
+            // The paired-root form retains the small root when b and the
+            // square root nearly cancel.
+            let q = -0.5 * (b + discriminant.sqrt().copysign(b));
+            at(q / a);
+            if q != 0.0 {
+                at(c / q);
+            }
+        }
+    }
+    20.0 * floor.log10()
+}
+
+/// The rounded, magnitude-corrected peak can cut below its nominal gain.
+/// A flat carry must cover that actual response at every set point, using
+/// the same designer as the saved section, rather than assuming its nominal
+/// gain is a lower bound. Retain the ideal envelope too.
+fn peak_carry_floor(points: &[Point], nominal: f64, q: f64, fs: f64) -> f64 {
+    points.iter().fold(nominal, |floor, pt| floor.min(section_floor(tone_filter::peak(pt.gain, pt.f0, q, fs), fs)))
 }
 
 /// The filters box `stage` applies to its channel `ch`.
@@ -1094,7 +1139,9 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics, mode: Rea
                         Rbj::LowShelf => tone_filter::low_shelf(carry[k].gain, carry[k].f0, q, fs),
                         Rbj::HighShelf => tone_filter::high_shelf(carry[k].gain, carry[k].f0, q, fs),
                     }),
-                    Carry::Flat(g) => p.gain_db += g,
+                    Carry::Flat(g) => {
+                        p.gain_db += if matches!(r, Rbj::Peak) { peak_carry_floor(carry, g, q, fs) } else { g };
+                    }
                 }
                 if automated {
                     diags.info(
@@ -1105,7 +1152,10 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics, mode: Rea
                                 "slot {i}: the volume-automated filter is carried at {} dB, {} Hz (it passes the least)",
                                 points[k].gain, points[k].f0
                             ),
-                            Carry::Flat(g) => format!("slot {i}: the volume-automated filter is carried as a flat {g} dB"),
+                            Carry::Flat(g) => {
+                                let floor = if matches!(r, Rbj::Peak) { peak_carry_floor(&points, g, q, fs) } else { g };
+                                format!("slot {i}: the volume-automated filter is carried as a flat {floor} dB")
+                            }
                         },
                     );
                 }
@@ -2137,10 +2187,12 @@ mod tests {
             tmst(&auto(0, 2.0, 0.16, b, Some((0.6, 2.0, 9200.0))), &[(2, [3.0, 1.0, 3.3, 9300.0, 0.4, 2.0, 3.0, 0.0])])
         };
         let p = part(&pk((0.85, -0.5, 9190.0)), 0, fs, &mut d).unwrap();
-        assert_eq!((p.sections.len(), p.gain_db), (0, -0.5f32 as f64));
+        assert_eq!(p.sections.len(), 0);
+        assert!(p.gain_db < -0.5);
         // that fades to 0 dB: nothing
         let p = part(&pk((0.85, 0.0, 9190.0)), 0, fs, &mut d).unwrap();
-        assert_eq!((p.sections.len(), p.gain_db), (0, 0.0));
+        assert_eq!(p.sections.len(), 0);
+        assert!(p.gain_db <= 0.0);
         // at one frequency: the lowest setting, exactly
         let same = tmst(
             &auto(0, 2.0, 0.16, (0.85, -1.0, 9300.0), Some((0.6, 2.0, 9300.0))),
@@ -2162,11 +2214,23 @@ mod tests {
         let p = part(&shelf, 0, fs, &mut d).unwrap();
         assert_eq!((p.sections.len(), p.gain_db), (0, -0.07f32 as f64));
         // the carried response never passes more than any set point does
-        for f in [20.0, 50.0, 100.0, 200.0, 1000.0, 9200.0] {
+        for f in (0..=2400).map(|i| i as f64 * 10.0) {
             let carried = mag(&part(&pk((0.85, -0.5, 9190.0)), 0, fs, &mut d).unwrap(), f);
-            for (g, f0) in [(3.3, 9300.0), (2.0, 9200.0), (-0.5, 9190.0)] {
-                let s = tone_filter::peak(g, f0, 0.4f32 as f64, fs);
+            for (g, f0) in [(3.3f32, 9300.0), (2.0, 9200.0), (-0.5, 9190.0)] {
+                let s = tone_filter::peak(g as f64, f0, 0.4f32 as f64, fs);
                 assert!(carried <= 20.0 * s.magnitude(f, fs).log10() + 1e-9, "{f} Hz vs {g} dB at {f0}");
+            }
+        }
+        // Check the saved glides too, including the region where the peak
+        // dips below the nominal -0.5 dB flat envelope.
+        let carried = part(&pk((0.85, -0.5, 9190.0)), 0, fs, &mut d).unwrap().gain_db;
+        for (from, to) in [((3.3f32 as f64, 9300.0), (2.0, 9200.0)), ((2.0, 9200.0), (-0.5, 9190.0))] {
+            for i in 0..=128 {
+                let t = i as f64 / 128.0;
+                let g = from.0 + (to.0 - from.0) * t;
+                let f0 = from.1 + (to.1 - from.1) * t;
+                let s = tone_filter::peak(g, f0, 0.4f32 as f64, fs);
+                assert!(carried <= section_floor(s, fs) + 1e-9, "glide {g} dB at {f0}");
             }
         }
         // an entry aimed at a slot that does not run is not read
@@ -2181,6 +2245,29 @@ mod tests {
             &[(0, [3.0, 4.0, 0.0, 200.0, 0.7, 2.0, 3.0, 0.0])],
         );
         assert_eq!(part(&ramps, 0, fs, &mut d).unwrap().sections.len(), 1);
+    }
+
+    #[test]
+    fn section_floor_covers_narrow_peaks_and_band_edges() {
+        let fs = 48_000.0;
+        assert_eq!(section_floor(Section::IDENTITY, fs), 0.0);
+        for gain in [-12.0, -0.5, 0.5, 12.0] {
+            for f0 in [200.0, 2500.0, 11_000.0] {
+                for q in [0.4, 1.0, 20.0] {
+                    let s = tone_filter::peak(gain, f0, q, fs);
+                    let floor = section_floor(s, fs);
+                    let mut sampled = f64::INFINITY;
+                    for f in (0..=12_000).map(|i| i as f64 * 2.0).chain([f0]) {
+                        let db = 20.0 * s.magnitude(f, fs).log10();
+                        assert!(floor <= db + 1e-9, "{gain} dB, {f0} Hz, Q {q}: {floor} vs {db} at {f}");
+                        sampled = sampled.min(db);
+                    }
+                    // A floor must be an attained minimum, not excessive
+                    // attenuation from a loose coefficient bound.
+                    assert!(sampled - floor < 0.01, "{sampled} vs {floor}");
+                }
+            }
+        }
     }
 
     #[test]

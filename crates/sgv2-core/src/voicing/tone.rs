@@ -123,7 +123,7 @@ fn arm_rsqrt_estimate(value: f32) -> f32 {
     while u64::from(scaled) * u64::from(root + 1) * u64::from(root + 1) < (1u64 << 28) {
         root += 1;
     }
-    let estimate = (root + 1) / 2;
+    let estimate = root.div_ceil(2);
     let result_exponent = (380 - exponent) / 2;
     f32::from_bits(((result_exponent as u32) << 23) | ((estimate & 0xff) << 15))
 }
