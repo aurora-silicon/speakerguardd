@@ -260,6 +260,7 @@ fn main() {
             }
         }
     }
+    let isolated_volume = sets.iter().rev().find(|(id, _)| *id == 5).map(|(_, value)| *value as f64);
     if !sets.is_empty() {
         let global = stage
             .state
@@ -402,10 +403,19 @@ fn main() {
                 program_channels: ch,
                 nodes: vec![NodeSpec { kind, inputs: (0..ch).map(Source::Program).collect() }],
                 outputs: (0..ch).map(|c| Source::Node(0, c)).collect(),
-                links: Vec::new(),
+                links: if subtype == "vrq2" && isolated_volume.is_some() {
+                    vec![Link { param: GraphParam::VolumeScalar, node: 0, id: 5 }]
+                } else {
+                    Vec::new()
+                },
                 relays: Vec::new(),
             };
             let mut run = Chain::new(spec, fs, quantum).unwrap_or_else(|| die("invalid isolated box"));
+            if subtype == "vrq2" {
+                if let Some(volume) = isolated_volume {
+                    run.set_param(GraphParam::VolumeScalar, volume);
+                }
+            }
             let total = frames + extra;
             if reset_at.is_some_and(|at| at >= total || at % quantum != 0) {
                 die("--reset-at must select an input frame at a render boundary")

@@ -13,7 +13,8 @@
 //! are refused: unknown filter types, a type change between two neighbouring
 //! elements that both enable the band, breakpoints out of order, bands at or
 //! above Nyquist (other than a low pass), or parameters this compiler does
-//! not know.
+//! not know. Mixed ordinary/resonant low shelves are carried for nonzero-gain
+//! conjugate-pole endpoints; other enabled type changes remain refused.
 
 use crate::error::{Diagnostics, Error, Result};
 use crate::fourcc::FourCc;
@@ -118,6 +119,9 @@ pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option
     let p = Params::from_words(&words).ok_or_else(|| {
         bad("saved state is out of range (breakpoints not increasing in (0, 1), gains, bandwidths, or a band type change between neighbouring elements)")
     })?;
+    if !p.transitions_valid_at(fs) {
+        return Err(bad("resonant shelf or mixed transition is outside the carried numeric domain at this rate"));
+    }
     if g.get(CURRENT_VOLUME).is_some() {
         diags.info(
             "vareq-volume-from-graph",
