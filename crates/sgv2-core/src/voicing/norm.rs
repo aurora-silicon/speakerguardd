@@ -440,16 +440,18 @@ struct LevelCorrection {
     rate: f32,
     smoothed: f32,
     last_peak: f32,
+    latched: bool,
 }
 
 impl LevelCorrection {
     fn new(rate: f32) -> Self {
-        Self { rate, smoothed: 0.0, last_peak: 0.0 }
+        Self { rate, smoothed: 0.0, last_peak: 0.0, latched: false }
     }
 
     fn reset(&mut self) {
         self.smoothed = 0.0;
         self.last_peak = 0.0;
+        self.latched = false;
     }
 
     fn update(&mut self, peak: f64, count: usize, expected: f64) -> f64 {
@@ -467,6 +469,7 @@ impl LevelCorrection {
             self.smoothed + (peak - self.smoothed) * 10.0 * count as f32 / self.rate
         };
         let correct = trigger && raw_peak < expected as f32 - 10.0;
+        self.latched |= correct;
         if correct { 1.5 } else { 0.0 }
     }
 }
@@ -691,7 +694,9 @@ impl Run {
             self.long_line.iter_mut().for_each(|v| *v -= correction);
             self.long_out -= correction;
             self.pre.out -= correction;
-            self.held -= correction;
+            // The downstream hold retains the already translated slow
+            // coordinate, so both layers move when the coordinate changes.
+            self.held -= 2.0 * correction;
             if let Some((_, _, long)) = self.pending.as_mut() {
                 *long -= correction;
             }
@@ -1014,7 +1019,33 @@ mod tests {
         assert_eq!(correction.update(-70.0, 8, -20.0), 0.0);
         assert_eq!(correction.update(-65.0, 8, -20.0), 0.0);
         assert_eq!(correction.update(-65.0, 8, -20.0), 1.5);
+        assert!(correction.latched);
         assert_eq!(correction.update(-65.0, 8, -20.0), 0.0);
+        correction.reset();
+        assert!(!correction.latched);
+    }
+
+    #[test]
+    fn coordinate_correction_moves_both_slow_hold_layers() {
+        let p = Params { expected_db: -20.0, ..params(0) };
+        let mut r = Run::new(&p, 48_000.0, 1);
+        r.correction.smoothed = -70.0;
+        r.correction.last_peak = -65.0;
+        r.peak = -65.0;
+        r.events = 8;
+        r.long.reading = -20.0;
+        r.long_line = [-20.0; LONG_DELAY];
+        r.long_out = -20.0;
+        r.pre.out = -20.0;
+        r.held = -20.0;
+
+        r.arbitrate();
+
+        assert_eq!(r.long.reading, -21.5);
+        assert_eq!(r.long_line, [-21.5; LONG_DELAY]);
+        assert_eq!(r.long_out, -21.5);
+        assert_eq!(r.pre.out, -21.5);
+        assert_eq!(r.held, -23.0);
     }
 
     #[test]
