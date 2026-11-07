@@ -607,19 +607,26 @@ fn phase_peak(order: f64, frequency: f64, fs: f64) -> Section {
     // primitive so its matched-Z poles and Float32 coefficients are shared.
     let a = libm::pow(10.0, PHASE_GAIN_DB / 40.0);
     let q = (-0.1 + 0.320_909_08 * order) / a;
-    let s = super::tone::peak(PHASE_GAIN_DB, frequency, q, fs);
+    let s = super::tone::peak(PHASE_GAIN_DB, frequency.min(0.49 * fs), q, fs);
     Section { b0: s.b0, b1: s.b1, b2: s.b2, a1: s.a1, a2: s.a2 }
 }
 
 fn phase_paths(p: &Params, fs: f64, band_zero_rate: f64) -> [Path; BANDS] {
     let mut out = [Path::EMPTY; BANDS];
-    for edge in 0..XOVERS {
-        let below = libm::floor(p.crossover_order[edge]).clamp(2.0, 20.0);
-        let above = effective_order(p.crossover_order[edge]) as f64;
-        let frequency = p.crossover_hz[edge];
-        let lower_rate = if edge == 0 { band_zero_rate } else { fs };
-        out[edge].push(phase_peak(below, frequency * phase_shape(below), lower_rate));
-        out[edge + 1].push(phase_peak(above, frequency / phase_shape(above), fs));
+    for band in 0..BANDS {
+        // One order configures the whole band's phase stage: the floored
+        // order control of its upper edge (the top band reuses the last
+        // edge). This is intentionally not the even LR processing order.
+        let edge = band.min(XOVERS - 1);
+        let order = libm::floor(p.crossover_order[edge]).clamp(2.0, 20.0);
+        let shape = phase_shape(order);
+        let rate = if band == 0 { band_zero_rate } else { fs };
+        if band != 0 {
+            out[band].push(phase_peak(order, p.crossover_hz[band - 1] / shape, rate));
+        }
+        if band != BANDS - 1 {
+            out[band].push(phase_peak(order, p.crossover_hz[band] * shape, rate));
+        }
     }
     out
 }
