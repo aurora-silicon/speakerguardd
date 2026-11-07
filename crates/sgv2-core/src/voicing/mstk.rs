@@ -1060,7 +1060,14 @@ impl Run {
         // Mode 4 shares one two-millisecond odd trailing maximum across all
         // four arms. At the fixed eight-frame cadence this is 11/13/25
         // updates at 44.1/48/96 kHz before any outer band-rate reduction.
-        let window_ms = if cadence(q) == Cadence::AnalyticPick { [2.0; BANDS] } else { [10.0, 8.0, 2.0, 1.0] };
+        // The eight-frame automation pick shares that window too. Black-box
+        // (installed unit, a box with threshold automation): with the
+        // per-band 10/8/2/1 ms windows, low tones at full scale compressed
+        // up to 0.33 dB too far and steps down released up to 1 dB late.
+        let window_ms = match cadence(q) {
+            Cadence::AnalyticPick | Cadence::PickEight => [2.0; BANDS],
+            Cadence::Pick => [10.0, 8.0, 2.0, 1.0],
+        };
         let mut detector_window = core::array::from_fn(|b| {
             ((libm::round(window_ms[b] * fs / (1000.0 * detector_factor[b] as f64)) as usize) | 1)
                 .clamp(1, MAX_DETECTOR_WINDOW)
@@ -1753,9 +1760,10 @@ mod tests {
         automated.threshold_automation[0].points[1] = AutomationPoint { input: 0.0, value: -30.0 };
         let (factor, window, _, _, analytic_pick) = cadence(&automated, 48_000.0);
         assert_eq!(factor, [8; BANDS]);
-        // Algorithm 0 also reduces band 0 here (M = 11 at 48 kHz), so its
-        // ten-millisecond window counts band-rate updates.
-        assert_eq!(window, [5, 49, 13, 7]);
+        // It shares the two-millisecond window; algorithm 0 also reduces
+        // band 0 here (M = 11 at 48 kHz), so that window counts band-rate
+        // updates.
+        assert_eq!(window, [1, 13, 13, 13]);
         assert!(!analytic_pick);
 
         let mut max = SlidingMax::EMPTY;
