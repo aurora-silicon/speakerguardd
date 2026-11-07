@@ -240,6 +240,31 @@ fn butterworth(high: bool, order: u32, f0: f64, fs: f64) -> Vec<Section> {
     made.sections[..made.count].to_vec()
 }
 
+/// A static phase-matched low-pass: two identical half-order Butterworth
+/// cascades on filtered channels, their all-pass denominator companions on
+/// the phase channels. An odd half-order delays both paths by one frame.
+fn phase_compensated_low_pass(order: u32, f0: f64, fs: f64) -> (Vec<Section>, Vec<Section>) {
+    let half = butterworth(false, order / 2, f0, fs);
+    let mut filtered = half.clone();
+    filtered.extend_from_slice(&half);
+    let mut companion: Vec<Section> = half
+        .iter()
+        .map(|s| {
+            if s.a2 == 0.0 {
+                Section { b0: s.a1, b1: 1.0, b2: 0.0, a1: s.a1, a2: 0.0 }
+            } else {
+                Section { b0: s.a2, b1: s.a1, b2: 1.0, a1: s.a1, a2: s.a2 }
+            }
+        })
+        .collect();
+    if (order / 2) % 2 != 0 {
+        let delay = Section { b0: 0.0, b1: 1.0, b2: 0.0, a1: 0.0, a2: 0.0 };
+        filtered.push(delay);
+        companion.push(delay);
+    }
+    (filtered, companion)
+}
+
 #[derive(Clone, Copy)]
 enum Rbj {
     Peak,
@@ -791,6 +816,20 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics, mode: Rea
             return Err(bad(format!("{ctx}: slot {i} has a non-numeric field")));
         }
         let kind = kind as i64;
+        if kind == 3 && phase_mask != 0.0 {
+            if order.fract() != 0.0 || !(2.0..=MAX_ORDER as f64).contains(&order) || order as u32 % 2 != 0 {
+                return Err(bad(format!("{ctx}: slot {i} phase-matched low-pass needs an even order")));
+            }
+            if !(f0 > 0.0 && f0 < nyquist) {
+                return Err(bad(format!("{ctx}: invalid phase-matched low-pass frequency")));
+            }
+            if automation.iter().any(|(_, a)| a.target == i && a.moves()) {
+                return Err(bad(format!("{ctx}: slot {i} has moving low-pass phase compensation")));
+            }
+            let (low, allpass) = phase_compensated_low_pass(order as u32, f0, fs);
+            p.sections.extend(if filtered { low } else { allpass });
+            continue;
+        }
         if phase_companion && !filtered {
             if kind != 12 || gain == 0.0 {
                 return Err(bad(format!("{ctx}: slot {i} type {kind} phase companion is not carried")));
@@ -1923,6 +1962,53 @@ mod tests {
             assert!(part(&st, 0, fs, &mut d).is_err(), "parameter {id} left out");
         }
         assert_eq!(part(&full, 0, fs, &mut d).unwrap().gain_db, -6.0);
+    }
+
+    #[test]
+    fn low_pass_phase_mask_preserves_magnitude_and_matches_phase() {
+        let fs = 48_000.0;
+        for order in [2, 4, 6, 18, 20] {
+            let (low, allpass) = phase_compensated_low_pass(order, 1800.0, fs);
+            let response = |sections: &[Section], f: f64| {
+                let w = 2.0 * PI * f / fs;
+                sections.iter().fold((1.0, 0.0), |(re, im), s| {
+                    let (c1, s1) = (w.cos(), -w.sin());
+                    let (c2, s2) = ((2.0 * w).cos(), -(2.0 * w).sin());
+                    let (nr, ni) = (s.b0 + s.b1 * c1 + s.b2 * c2, s.b1 * s1 + s.b2 * s2);
+                    let (dr, di) = (1.0 + s.a1 * c1 + s.a2 * c2, s.a1 * s1 + s.a2 * s2);
+                    let den = dr * dr + di * di;
+                    let (hr, hi) = ((nr * dr + ni * di) / den, (ni * dr - nr * di) / den);
+                    (re * hr - im * hi, re * hi + im * hr)
+                })
+            };
+            for f in [30.0, 900.0, 1800.0, 3000.0, 12_000.0] {
+                let (lr, li) = response(&low, f);
+                let (ar, ai) = response(&allpass, f);
+                assert!((ar.hypot(ai) - 1.0).abs() < 1e-9);
+                let relative_imaginary = li * ar - lr * ai;
+                assert!(relative_imaginary.abs() < 1e-9);
+                assert!(lr * ar + li * ai >= -1e-12);
+            }
+            let (re, im) = response(&low, 1800.0);
+            assert!((re.hypot(im) - 0.5).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn low_pass_phase_companion_uses_masks_and_rejects_unqualified_orders() {
+        let mut stage = tmst(&[], &[(0, [3.0, 3.0, 0.0, 1800.0, 0.7, 2.0, 1.0, 0.0])]);
+        stage.state.as_mut().unwrap().sections[0].params.iter_mut().find(|(id, _)| *id == SLOT_BASE + 8).unwrap().1 =
+            2.0;
+        let mut d = Diagnostics::default();
+        let low = part_with(&stage, 0, 48_000.0, &mut d, Realise::Saved).unwrap();
+        let companion = part_with(&stage, 1, 48_000.0, &mut d, Realise::Saved).unwrap();
+        assert_eq!(low.sections.last().unwrap().b0, 0.0);
+        assert_eq!(companion.sections.last().unwrap().b0, 0.0);
+        assert_eq!(part_with(&stage, 2, 48_000.0, &mut d, Realise::Saved).unwrap().sections.len(), 0);
+        stage.state.as_mut().unwrap().sections[0].params.iter_mut().find(|(id, _)| *id == SLOT_BASE + 5).unwrap().1 =
+            3.0;
+        assert!(part_with(&stage, 0, 48_000.0, &mut d, Realise::Saved).is_err());
+        assert!(part_with(&stage, 1, 48_000.0, &mut d, Realise::Saved).is_err());
     }
 
     #[test]

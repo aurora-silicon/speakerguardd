@@ -789,6 +789,9 @@ impl Chain {
     /// Builds the chain; `None` if the spec does not check.
     pub fn new(spec: Spec, fs: f64, max_frames: usize) -> Option<Chain> {
         spec.check().ok()?;
+        if spec.nodes.iter().any(|node| matches!(&node.kind, Kind::Vareq(p) if !p.transitions_valid_at(fs))) {
+            return None;
+        }
         if !fs.is_finite()
             || fs <= 0.0
             || spec

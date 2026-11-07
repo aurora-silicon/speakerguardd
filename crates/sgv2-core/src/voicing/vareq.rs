@@ -13,7 +13,11 @@
 //! - Peaking: `a = (1 + α, -2 cos w, 1 - α)`, `b = (1 + αG, -2 cos w, 1 - αG)`
 //!   with `α = sin w · sinh(ln 2 / 2 · bw · w / sin w)`, `G = 10^(g/20)`; the
 //!   denominator does not depend on the gain.
-//! - Shelves: the cookbook shelves with slope 1; the bandwidth is unused.
+//! - Ordinary shelves use the cookbook slope-1 design; bandwidth is unused.
+//!   Resonant low shelves use the peaking band's octave-bandwidth alpha.
+//! - A resonant/plain low-shelf type transition linearly interpolates the
+//!   numerator coefficients and the denominator poles' radius and angle.
+//!   Only nonzero-gain conjugate-pole endpoints are currently carried.
 //! - Low and high pass: second-order Butterworth (Q = 1/√2); a low pass at or
 //!   above Nyquist is a wire.
 //! - A band that is on in only one of the two neighbouring elements fades by
@@ -32,7 +36,7 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
-use libm::{cos, pow, sin, sinh, sqrt};
+use libm::{acos, cos, pow, sin, sinh, sqrt};
 
 pub const BANDS: usize = 8;
 pub const ELEMENTS: usize = 5;
@@ -65,6 +69,7 @@ pub enum Kind {
     HighPass = 2,
     LowShelf = 7,
     HighShelf = 8,
+    ResonantLowShelf = 9,
 }
 
 impl Kind {
@@ -78,12 +83,13 @@ impl Kind {
             2 => Some(Kind::HighPass),
             7 => Some(Kind::LowShelf),
             8 => Some(Kind::HighShelf),
+            9 => Some(Kind::ResonantLowShelf),
             _ => None,
         }
     }
 
     fn has_gain(self) -> bool {
-        matches!(self, Kind::Peak | Kind::LowShelf | Kind::HighShelf)
+        matches!(self, Kind::Peak | Kind::LowShelf | Kind::HighShelf | Kind::ResonantLowShelf)
     }
 }
 
@@ -148,7 +154,7 @@ impl Params {
         // type: the unit's law across a type change is not specified.
         for pair in self.elements.windows(2) {
             for (a, b) in pair[0].bands.iter().zip(pair[1].bands.iter()) {
-                if a.on && b.on && a.kind != b.kind {
+                if a.on && b.on && a.kind != b.kind && !shelf_transition(a.kind, b.kind) {
                     return false;
                 }
             }
@@ -246,11 +252,16 @@ fn design(kind: Kind, f: f64, g: f64, bw: f64, fs: f64) -> Option<Coeffs> {
                 if kind == Kind::LowPass { ((1.0 - c) / 2.0, 1.0 - c) } else { ((1.0 + c) / 2.0, -(1.0 + c)) };
             norm([b0, b1, b0], [1.0 + al, -2.0 * c, 1.0 - al])
         }
-        Kind::LowShelf | Kind::HighShelf => {
+        Kind::LowShelf | Kind::HighShelf | Kind::ResonantLowShelf => {
             let a = pow(10.0, g / 40.0);
-            let sa = 2.0 * sqrt(a) * s / core::f64::consts::SQRT_2;
+            let alpha = if kind == Kind::ResonantLowShelf {
+                s * sinh(core::f64::consts::LN_2 / 2.0 * bw * w / s)
+            } else {
+                s / core::f64::consts::SQRT_2
+            };
+            let sa = 2.0 * sqrt(a) * alpha;
             let (ap, am) = (a + 1.0, a - 1.0);
-            if kind == Kind::LowShelf {
+            if matches!(kind, Kind::LowShelf | Kind::ResonantLowShelf) {
                 norm(
                     [a * (ap - am * c + sa), 2.0 * a * (am - ap * c), a * (ap - am * c - sa)],
                     [ap + am * c + sa, -2.0 * (am + ap * c), ap + am * c - sa],
@@ -263,6 +274,73 @@ fn design(kind: Kind, f: f64, g: f64, bw: f64, fs: f64) -> Option<Coeffs> {
             }
         }
     })
+}
+
+fn shelf_transition(a: Kind, b: Kind) -> bool {
+    matches!((a, b), (Kind::LowShelf, Kind::ResonantLowShelf) | (Kind::ResonantLowShelf, Kind::LowShelf))
+}
+
+/// Interpolate numerator coefficients and the denominator's pole radius
+/// and angle. The caller has established two complex-conjugate pole pairs.
+fn blend_shelves(a: Coeffs, b: Coeffs, w: f64) -> Coeffs {
+    if w <= 0.0 {
+        return a;
+    }
+    if w >= 1.0 {
+        return b;
+    }
+    let (ra, rb) = (sqrt(a[4]), sqrt(b[4]));
+    let ta = acos((-a[3] / (2.0 * ra)).clamp(-1.0, 1.0));
+    let tb = acos((-b[3] / (2.0 * rb)).clamp(-1.0, 1.0));
+    let r = lerp(ra, rb, w);
+    [lerp(a[0], b[0], w), lerp(a[1], b[1], w), lerp(a[2], b[2], w), -2.0 * r * cos(lerp(ta, tb, w)), r * r]
+}
+
+impl Params {
+    /// Mixed resonant/plain shelves carry nonzero-gain conjugate-pole pairs.
+    /// Other type changes, zero-gain endpoints and real poles remain refused.
+    pub fn transitions_valid_at(&self, fs: f64) -> bool {
+        if !fs.is_finite() || fs <= 0.0 {
+            return false;
+        }
+        for band in self.elements.iter().flat_map(|element| element.bands.iter()) {
+            if band.on && band.kind == Kind::ResonantLowShelf {
+                if !(band.freq_hz > 0.0 && band.freq_hz < fs / 2.0) {
+                    return false;
+                }
+                if let Some(c) = design(band.kind, band.freq_hz, band.gain_db, band.bw_oct, fs) {
+                    if c.iter().any(|v| !v.is_finite())
+                        || c[4].abs() >= 1.0
+                        || 1.0 + c[3] + c[4] <= 0.0
+                        || 1.0 - c[3] + c[4] <= 0.0
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+        self.elements.windows(2).all(|pair| {
+            pair[0].bands.iter().zip(pair[1].bands.iter()).all(|(a, b)| {
+                if a.on && b.on && a.kind == Kind::ResonantLowShelf && b.kind == Kind::ResonantLowShelf {
+                    let w = 2.0 * core::f64::consts::PI * a.freq_hz.max(b.freq_hz) / fs;
+                    let alpha = sin(w) * sinh(core::f64::consts::LN_2 / 2.0 * a.bw_oct.max(b.bw_oct) * w / sin(w));
+                    if !alpha.is_finite() {
+                        return false;
+                    }
+                }
+                if !a.on || !b.on || a.kind == b.kind {
+                    return true;
+                }
+                if !shelf_transition(a.kind, b.kind) || a.gain_db == 0.0 || b.gain_db == 0.0 {
+                    return false;
+                }
+                [a, b].iter().all(|band| {
+                    design(band.kind, band.freq_hz, band.gain_db, band.bw_oct, fs)
+                        .is_some_and(|c| c[4] > 0.0 && c[4] < 1.0 && c[3] * c[3] < 4.0 * c[4])
+                })
+            })
+        })
+    }
 }
 
 /// One resolved setting: the output gain and each band's filter.
@@ -288,6 +366,11 @@ fn resolve(p: &Params, volume: f64, fs: f64) -> Setting {
         let (a, b) = (&el.bands[k], &eh.bands[k]);
         *f = match (a.on, b.on) {
             (false, false) => None,
+            (true, true) if a.kind != b.kind => {
+                let ca = design(a.kind, a.freq_hz, a.gain_db, a.bw_oct, fs).unwrap_or([1.0, 0.0, 0.0, 0.0, 0.0]);
+                let cb = design(b.kind, b.freq_hz, b.gain_db, b.bw_oct, fs).unwrap_or([1.0, 0.0, 0.0, 0.0, 0.0]);
+                Some(blend_shelves(ca, cb, w))
+            }
             (true, true) => design(
                 a.kind,
                 lerp(a.freq_hz, b.freq_hz, w),
@@ -347,7 +430,11 @@ pub struct Run {
 impl Run {
     /// Builds the box at full volume (`mvsc` = 1).
     pub fn new(params: &Params, fs: f64, channels: usize) -> Run {
-        let enabled = params.valid() && fs.is_finite() && fs > 0.0 && (1..=MAX_CHANNELS).contains(&channels);
+        let enabled = params.valid()
+            && params.transitions_valid_at(fs)
+            && fs.is_finite()
+            && fs > 0.0
+            && (1..=MAX_CHANNELS).contains(&channels);
         let fs_ok = if fs.is_finite() && fs > 0.0 { fs } else { 48_000.0 };
         let cur = resolve(params, 1.0, fs_ok);
         let fade_len = libm::round(FADE_S * fs_ok).max(1.0) as usize;
@@ -502,6 +589,53 @@ mod tests {
         let mut w = [0.0; Params::WORDS];
         p.to_words(&mut w);
         assert_eq!(Params::from_words(&w), None);
+    }
+
+    #[test]
+    fn resonant_shelf_has_requested_asymptotes_and_bandwidth() {
+        for gain in [-12.0, -3.0, 6.0, 12.0] {
+            let magnitude = |f: f64, bw| {
+                let [b0, b1, b2, a1, a2] = design(Kind::ResonantLowShelf, 900.0, gain, bw, 48_000.0).unwrap();
+                let w = 2.0 * core::f64::consts::PI * f / 48_000.0;
+                let num = (b0 + b1 * cos(w) + b2 * cos(2.0 * w)).hypot(b1 * sin(w) + b2 * sin(2.0 * w));
+                let den = (1.0 + a1 * cos(w) + a2 * cos(2.0 * w)).hypot(a1 * sin(w) + a2 * sin(2.0 * w));
+                20.0 * libm::log10(num / den)
+            };
+            assert!((magnitude(0.0, 0.5) - gain).abs() < 1e-9);
+            assert!(magnitude(24_000.0, 0.5).abs() < 1e-9);
+            assert!((magnitude(900.0, 0.5) - gain / 2.0).abs() < 1e-9);
+            assert!((magnitude(600.0, 0.5) - magnitude(600.0, 2.0)).abs() > 0.1);
+        }
+    }
+
+    #[test]
+    fn hostile_resonant_shelf_design_is_refused_at_the_stream_rate() {
+        let mut p = synthetic();
+        for e in &mut p.elements {
+            e.bands[0] = Band { on: true, kind: Kind::ResonantLowShelf, freq_hz: 23_999.0, gain_db: 6.0, bw_oct: 10.0 };
+        }
+        assert!(!p.transitions_valid_at(48_000.0));
+    }
+
+    #[test]
+    fn mixed_shelf_poles_remain_stable_and_endpoints_are_exact() {
+        let a = design(Kind::ResonantLowShelf, 900.0, 6.0, 0.5, 48_000.0).unwrap();
+        let b = design(Kind::LowShelf, 1800.0, 3.0, 0.5, 48_000.0).unwrap();
+        assert_eq!(blend_shelves(a, b, 0.0), a);
+        assert_eq!(blend_shelves(a, b, 1.0), b);
+        for i in 1..100 {
+            let c = blend_shelves(a, b, i as f64 / 100.0);
+            assert!(c[4] > 0.0 && c[4] < 1.0);
+            assert!(1.0 + c[3] + c[4] > 0.0 && 1.0 - c[3] + c[4] > 0.0);
+        }
+        let mut p = synthetic();
+        p.elements[0].bands[0].kind = Kind::ResonantLowShelf;
+        assert!(p.valid() && p.transitions_valid_at(48_000.0));
+        p.elements[0].bands[0].gain_db = 0.0;
+        assert!(!p.transitions_valid_at(48_000.0));
+        p.elements[0].bands[0].gain_db = 6.0;
+        p.elements[0].bands[0].bw_oct = 10.0;
+        assert!(!p.transitions_valid_at(48_000.0));
     }
 
     #[test]
