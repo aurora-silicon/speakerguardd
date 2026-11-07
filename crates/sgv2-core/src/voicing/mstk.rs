@@ -546,12 +546,7 @@ fn half_synthesis_paths(p: &Params, fs: f64, half: &[HalfStage; XOVERS]) -> [Pat
                     append_half(path, item, false);
                 } else if stage > band {
                     let mut allpass = Path::EMPTY;
-                    push_lr_allpass(
-                        &mut allpass,
-                        effective_order(p.crossover_order[stage]),
-                        p.crossover_hz[stage],
-                        fs,
-                    );
+                    push_lr_allpass(&mut allpass, effective_order(p.crossover_order[stage]), p.crossover_hz[stage], fs);
                     append_path(path, &allpass);
                 }
             }
@@ -559,12 +554,8 @@ fn half_synthesis_paths(p: &Params, fs: f64, half: &[HalfStage; XOVERS]) -> [Pat
         return out;
     }
 
-    let tree: [&[(usize, bool)]; BANDS] = [
-        &[(1, false), (0, false)],
-        &[(1, false), (0, true)],
-        &[(1, true), (2, false)],
-        &[(1, true), (2, true)],
-    ];
+    let tree: [&[(usize, bool)]; BANDS] =
+        [&[(1, false), (0, false)], &[(1, false), (0, true)], &[(1, true), (2, false)], &[(1, true), (2, true)]];
     let passing = [2, 2, 0, 0];
     for (band, path) in out.iter_mut().enumerate() {
         for &(stage, high) in tree[band] {
@@ -572,12 +563,7 @@ fn half_synthesis_paths(p: &Params, fs: f64, half: &[HalfStage; XOVERS]) -> [Pat
         }
         let stage = passing[band];
         let mut allpass = Path::EMPTY;
-        push_lr_allpass(
-            &mut allpass,
-            effective_order(p.crossover_order[stage]),
-            p.crossover_hz[stage],
-            fs,
-        );
+        push_lr_allpass(&mut allpass, effective_order(p.crossover_order[stage]), p.crossover_hz[stage], fs);
         append_path(path, &allpass);
     }
     out
@@ -1619,11 +1605,7 @@ impl Run {
                     };
                 }
                 let mut y = if self.hop_peak {
-                    Self::half_synthesize(
-                        &self.half_synthesis_path,
-                        &mut self.half_synthesis_state[c],
-                        processed,
-                    )
+                    Self::half_synthesize(&self.half_synthesis_path, &mut self.half_synthesis_state[c], processed)
                 } else if self.legacy_recombination {
                     self.legacy_recombine(c, processed)
                 } else {
@@ -1892,13 +1874,7 @@ mod tests {
         // Keep only the small observable state on the debug test stack.
         let cadence = |p: &Params, fs: f64| {
             let run = alloc::boxed::Box::new(Run::new(p, fs, 1));
-            (
-                run.detector_factor,
-                run.detector_window,
-                run.release,
-                run.band_zero_factor,
-                run.hop_peak,
-            )
+            (run.detector_factor, run.detector_window, run.release, run.band_zero_factor, run.hop_peak)
         };
         let p0 = params();
         let (factor, window, release, band_zero_factor, _) = cadence(&p0, 48_000.0);
