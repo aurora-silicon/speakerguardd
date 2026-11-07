@@ -981,5 +981,27 @@ class BoundRecord(unittest.TestCase):
             self.assertFalse(sgsc.report_matches(path, bind))
 
 
+class GatePath(unittest.TestCase):
+    """gen.py finds gate.json where the distributions install it, not only
+    beside itself (11-07: the packaged gen.py read /usr/libexec/.../gate.json
+    and every Plan A provisioning failed closed)."""
+
+    def test_falls_back_to_the_installed_gate(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            g = os.path.join(d, "gate.json")
+            with open(g, "w") as f:
+                json.dump({"voicing_pre": {"j413": True}}, f)
+            with mock.patch.object(gen, "GATE_PATHS", (os.path.join(d, "missing.json"), g)):
+                self.assertTrue(gen.voicing_enabled("j413"))
+                self.assertFalse(gen.voicing_enabled("j316s"))
+            with mock.patch.dict(os.environ, {"SGV2_GATE": g}), \
+                    mock.patch.object(gen, "GATE_PATHS", (os.path.join(d, "missing.json"),)):
+                self.assertTrue(gen.voicing_enabled("j413"))
+            with mock.patch.object(gen, "GATE_PATHS", (os.path.join(d, "missing.json"),)):
+                with self.assertRaises(FileNotFoundError):
+                    gen.voicing_enabled("j413")
+
+
 if __name__ == "__main__":
     unittest.main()

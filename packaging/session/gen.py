@@ -49,13 +49,26 @@ QUANTUM = 512
 PROTECT_INPUT = "alsa_output.platform-sound.RawSpeakers"
 
 
+# Where gate.json is: beside this file in the source tree, else where every
+# distribution installs it (speakerguardd-gate's default). SGV2_GATE overrides.
+GATE_PATHS = (os.path.join(HERE, "gate.json"), "/usr/share/speakerguardd/gate.json")
+
+
+def load_gate():
+    env = os.environ.get("SGV2_GATE")
+    for path in ((env,) if env else ()) + GATE_PATHS:
+        if os.path.exists(path):
+            with open(path) as f:
+                return json.load(f)
+    raise FileNotFoundError("gate.json: none of " + ", ".join(((env,) if env else ()) + GATE_PATHS))
+
+
 def voicing_enabled(board, gate=None):
     """Per-board deployment gate. Missing keys/boards keep the interim graph.
     Values must be literal JSON booleans; strings never enable a board.
     """
     if gate is None:
-        with open(os.path.join(HERE, "gate.json")) as f:
-            gate = json.load(f)
+        gate = load_gate()
     return gate.get("voicing_pre", {}).get(board) is True
 
 
@@ -68,8 +81,7 @@ def voicing_bound(board, gate=None):
     positive value or a wrong lane count refuses the board's voicing.
     """
     if gate is None:
-        with open(os.path.join(HERE, "gate.json")) as f:
-            gate = json.load(f)
+        gate = load_gate()
     b = gate.get("voicing_pre_bound_db", {}).get(board)
     if b is None:
         return None
