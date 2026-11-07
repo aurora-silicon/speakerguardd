@@ -3505,8 +3505,14 @@ mod fault_tests {
         assert_eq!(compensated.process(Io { frames: 1024, input: &ins, sense: &[], output: &mut cout }), Health::OK);
         drop(pout);
         drop(cout);
-        assert_ne!(po[0].iter().map(|v| v.to_bits()).collect::<Vec<_>>(), co[0].iter().map(|v| v.to_bits()).collect::<Vec<_>>());
-        assert_eq!(po[1].iter().map(|v| v.to_bits()).collect::<Vec<_>>(), co[1].iter().map(|v| v.to_bits()).collect());
+        assert_ne!(
+            po[0].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            co[0].iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            po[1].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            co[1].iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
     }
 
     #[test]
