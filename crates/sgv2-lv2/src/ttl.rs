@@ -71,5 +71,30 @@ pub fn generate() -> (String, String) {
         p.push_str(&ports.join(" , "));
         p.push_str(" .\n");
     }
+    for &(u, n) in crate::voicing::VARIANTS {
+        let _ = write!(
+            m,
+            "\n<{}>\n    a lv2:Plugin ;\n    lv2:binary <libsgv2_lv2.so> ;\n    rdfs:seeAlso <sgv2.ttl> .\n",
+            uri(u)
+        );
+        let _ = write!(p, "\n<{}>\n    a lv2:Plugin, lv2:UtilityPlugin ;\n    doap:name \"sgv2 voicing ({n} lanes)\" ;\n    doap:license <https://opensource.org/licenses/MIT> ;\n    lv2:optionalFeature lv2:hardRTCapable ;\n    lv2:port ", uri(u));
+        let mut ports = Vec::new();
+        for c in 0..2 {
+            ports.push(format!(
+                "[ a lv2:AudioPort, lv2:InputPort ; lv2:index {c} ; lv2:symbol \"in_{c}\" ; lv2:name \"In {c}\" ]"
+            ));
+        }
+        for c in 0..n {
+            ports.push(format!(
+                "[ a lv2:AudioPort, lv2:OutputPort ; lv2:index {} ; lv2:symbol \"out_{c}\" ; lv2:name \"Out {c}\" ]",
+                c + 2
+            ));
+        }
+        ports.push(format!("[ a lv2:ControlPort, lv2:InputPort ; lv2:index {} ; lv2:symbol \"volume\" ; lv2:name \"Volume\" ; lv2:default 1 ; lv2:minimum 0 ; lv2:maximum 1 ]", n+2));
+        ports.push(format!("[ a lv2:ControlPort, lv2:InputPort ; lv2:index {} ; lv2:symbol \"volume_db\" ; lv2:name \"Volume dB override (1 = automatic)\" ; lv2:default 1 ; lv2:minimum -200 ; lv2:maximum 1 ]", n+3));
+        ports.push(format!("[ a lv2:ControlPort, lv2:OutputPort ; lv2:index {} ; lv2:symbol \"health\" ; lv2:name \"Health\" ; lv2:portProperty lv2:integer ]", n+4));
+        p.push_str(&ports.join(" ,\n    "));
+        p.push_str(" .\n");
+    }
     (m, p)
 }

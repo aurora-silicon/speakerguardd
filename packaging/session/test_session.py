@@ -205,6 +205,35 @@ class Stop(unittest.TestCase):
 
 
 class Generated(unittest.TestCase):
+    def test_voicing_gate_is_per_physical_board_and_default_off(self):
+        self.assertFalse(gen.voicing_enabled("j616s", {}))
+        self.assertTrue(gen.voicing_enabled("j616s", {"voicing_pre": {"j616s": True}}))
+        self.assertFalse(gen.voicing_enabled("j616c", {"voicing_pre": {"j616s": True}}))
+        for value in (False, "true", 1, None):
+            self.assertFalse(gen.voicing_enabled("j616s", {"voicing_pre": {"j616s": value}}))
+        self.assertFalse(any(gen.voicing_enabled(gen.fixture(m)["hw"]["board"]) for m in gen.machines()))
+
+    def test_both_modes_target_the_same_protect_input_and_only_generated_mode_owns_volume(self):
+        for m in gen.machines():
+            c, w = gen.machine(m)
+            interim = gen.pipewire_conf(m, c, w, voicing_pre=False)
+            generated = gen.pipewire_conf(m, c, w, voicing_pre=True)
+            self.assertNotIn('sgv2.stage = "voicing-pre"', interim)
+            self.assertEqual(generated.count("context.modules = ["), 1)
+            self.assertIn(f'target.object = "{gen.PROTECT_INPUT}"', generated)
+            self.assertIn('audio.position = [ FL FR ]', generated)
+            self.assertIn('capture.volumes = [ { control = "voicing:volume"', generated)
+            self.assertIn('scale = cubic', generated)
+            ports = " ".join(f'"voicing:out_{lane}"' for lane in w[0])
+            self.assertIn(f'outputs = [ {ports} ]', generated)
+            wp_old = gen.wireplumber_conf(m, c, voicing_pre=False)
+            wp_new = gen.wireplumber_conf(m, c, voicing_pre=True)
+            self.assertIn(f'/usr/share/asahi-audio/{m}/graph.json', wp_old)
+            self.assertNotIn("create-filter", wp_new)
+            self.assertNotIn("graph.json", wp_new)
+            self.assertIn("node.disabled = true", wp_new)
+
+
     def test_generated_files_are_current(self):
         import subprocess
         import sys

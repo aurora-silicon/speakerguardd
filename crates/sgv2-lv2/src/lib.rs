@@ -47,6 +47,7 @@ pub mod attach;
 pub mod handoff;
 pub mod page;
 pub mod ttl;
+pub mod voicing;
 
 use core::ffi::{c_char, c_void};
 use sgv2_core::prestage::PreStage;
@@ -142,7 +143,7 @@ pub enum LoadError {
 }
 
 /// Build the unit for a variant from blob bytes (or the placeholder), and
-/// the blob's payload CRC as its identity. Not real time.
+/// the blob's deployment CRC as its identity. Not real time.
 pub fn load_unit(
     blob: Option<&[u8]>,
     rate: f64,
@@ -157,6 +158,7 @@ pub fn load_unit(
     let fail = |e| (AnyUnit::FailSafe(FailSafe::new(UnitKind::Spp3, Health::NO_PARAMS)), Some(e), 0);
     let Some(bytes) = blob else { return fail(LoadError::Read) };
     let Ok((h, _)) = sgv2_core::blob::Header::parse(bytes) else { return fail(LoadError::Blob) };
+    let Ok(engine_crc) = sgv2_core::blob::engine_crc(bytes) else { return fail(LoadError::Blob) };
     if h.channels as usize != channels || h.sense_channels as usize != sense {
         return fail(LoadError::Geometry);
     }
@@ -168,7 +170,7 @@ pub fn load_unit(
     if h.unit == UnitKind::Spp3 as u32 {
         match spp3::Params::from_blob(bytes) {
             Ok(p) if spp3::Unit::init_error(&p).is_none() => {
-                (AnyUnit::Spp3(Box::new(spp3::Unit::for_machine(p, h.machine()))), None, h.payload_crc)
+                (AnyUnit::Spp3(Box::new(spp3::Unit::for_machine(p, h.machine()))), None, engine_crc)
             }
             Ok(_) => fail(LoadError::Refused),
             Err(_) => fail(LoadError::Blob),
@@ -176,7 +178,7 @@ pub fn load_unit(
     } else if h.unit == UnitKind::Lsm2 as u32 {
         match lsm2::Params::from_blob(bytes) {
             Ok(p) if lsm2::Unit::init_error(&p).is_none() => {
-                (AnyUnit::Lsm2(Box::new(lsm2::Unit::new(p))), None, h.payload_crc)
+                (AnyUnit::Lsm2(Box::new(lsm2::Unit::new(p))), None, engine_crc)
             }
             Ok(_) => fail(LoadError::Refused),
             Err(_) => fail(LoadError::Blob),
@@ -184,7 +186,7 @@ pub fn load_unit(
     } else if h.unit == UnitKind::Atsp as u32 {
         match atsp::Params::from_blob(bytes) {
             Ok(p) if atsp::Unit::init_error(&p).is_none() => {
-                (AnyUnit::Atsp(Box::new(atsp::Unit::new(p))), None, h.payload_crc)
+                (AnyUnit::Atsp(Box::new(atsp::Unit::new(p))), None, engine_crc)
             }
             Ok(_) => fail(LoadError::Refused),
             Err(_) => fail(LoadError::Blob),
@@ -203,6 +205,7 @@ pub fn load_prestage(blob: Option<&[u8]>, rate: f64, channels: usize, unit: &Any
     if !from_blob {
         return Some(PreStage::new(sgv2_core::prestage::Params::identity(channels)));
     }
+    sgv2_core::blob::voicing(blob?).ok()?;
     let p = sgv2_core::blob::prestage(blob?, rate).ok()?;
     (p.channels == channels).then(|| PreStage::with_rate(p, rate))
 }
@@ -222,7 +225,7 @@ struct Instance {
     frames: u64,
     /// Scratch for the thermal hand-off record `run` publishes.
     handoff: HandOff,
-    /// The blob payload CRC the unit runs (0: none).
+    /// The blob deployment CRC the unit runs (0: none).
     params_crc: u32,
     /// The Mac's filtering ahead of the unit, and its output.
     pre: Box<PreStage>,
@@ -534,7 +537,9 @@ const _: () = assert!(DESCRIPTORS.len() == VARIANTS.len());
 /// The LV2 entry point.
 #[no_mangle]
 pub extern "C" fn lv2_descriptor(index: u32) -> *const Lv2Descriptor {
-    DESCRIPTORS.get(index as usize).map_or(core::ptr::null(), |d| d as *const _)
+    DESCRIPTORS
+        .get(index as usize)
+        .map_or_else(|| voicing::descriptor(index as usize - DESCRIPTORS.len()), |d| d as *const _)
 }
 
 #[cfg(test)]
@@ -607,7 +612,8 @@ mod tests {
         std::env::set_var("SGV2_ENGINE_PAGE", "/nonexistent/sgv2-test");
         let d = lv2_descriptor(0);
         assert!(!d.is_null());
-        assert!(lv2_descriptor(VARIANTS.len() as u32).is_null());
+        assert!(!lv2_descriptor(VARIANTS.len() as u32).is_null());
+        assert!(lv2_descriptor((VARIANTS.len() + voicing::VARIANTS.len()) as u32).is_null());
         unsafe {
             let h = ((*d).instantiate)(d, 48_000.0, core::ptr::null(), core::ptr::null());
             let mut l = [1.0f32; 4];
