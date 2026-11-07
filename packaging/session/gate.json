@@ -7,13 +7,15 @@
     "j616s": true,
     "j700": true
   },
-  "_voicing_pre_bound_doc": "Interim never-louder bound (Ryan 2026-11-07: Plan A tonight on all four boards, open laws in their never-louder form): one gain in dB per unit lane, applied by the PipeWire voicing graph after the voicing plugin, so no lane of the generated voicing is louder than macOS while the Comp onset/param-69 (all four), LowFlow (j413, conservative build) and AID44 q2 detector laws are still open. Derived from the full-chain safety scan (packaging: bound.py = worst louder excess + 0.03 dB, L/R pairs equal) for j316s/j413/j616s and from the AID44 voicing-level VLS gate for j700; protection is unchanged and governs. Each entry goes when its board's laws are exact.",
+  "_voicing_pre_bound_doc": "Interim never-louder bound (Ryan 2026-11-07: Plan A tonight on all four boards, open laws in their never-louder form): one gain in dB per unit lane, applied by the PipeWire voicing graph after the voicing plugin, so no lane of the generated voicing is louder than macOS while the Comp onset/param-69 (all four), AID44 q2 detector laws are still open (j413 woofers: -1.09 dB since the exact LowFlow landed, 2026-11-08, covering the Comp onset excess the exact LowFlow now passes through). Derived from the full-chain safety scan (packaging: bound.py = worst louder excess + 0.03 dB, L/R pairs equal) for j316s/j413/j616s and from the AID44 voicing-level VLS gate for j700; protection is unchanged and governs. Each entry goes when its board's laws are exact.",
   "voicing_pre_bound_db": {
     "j316s": [-0.136, -0.136, -0.136, -0.136, -0.654, -0.654],
-    "j413": [0.0, 0.0, -0.217, -0.217],
+    "j413": [-1.09, -1.09, -0.217, -0.217],
     "j616s": [-1.217, -1.217, -1.24, -1.24, -0.837, -0.837],
-    "j700": [-0.919, -0.919]
+    "j700": [-0.35, -0.35]
   },
+  "_voicing_pre_lowpass_doc": "INTERIM never-louder band limit, not a macOS law (AUD-CUT2 2026-11-07, Ryan's parity rule: never-louder is fine as interim). {hz, order}: an even-order Butterworth low-pass built from PipeWire bq_lowpass sections in FRONT of the voicing plugin. j700 only: v2's AID44 ControlFreak lacks the AU's reconstruction low-pass, so above ~17 kHz the box is up to +23 dB (+30 dB at 0 dBFS) louder than macOS and its saturation aliases a loud high-frequency input into 9-16.5 kHz; the lane trim cannot hold either. 17.4 kHz order 8 (with the j700 trim): AID44 box rig (installed AU, 362 tones/pink/steps incl. 16-23.75 kHz probes) 0 louder cases, worst -0.58 dB; full AID44 voicing VLS 30 Hz-19.5 kHz 0 louder bands, worst -0.03 dB; cost at 16 kHz -0.1 dB. Goes when the ControlFreak law is exact (Daybreak t-5511). 2026-11-08: no board carries it; the AID44 ControlFreak saturation, reconstruction and drive laws are exact on the box rig (steady and 20 kHz), so the j700 trim alone (-0.35 dB from the AID44 VLS, worst +0.311) holds.",
+  "voicing_pre_lowpass": {},
   "units_at_parity": ["spp3", "lsm2", "atsp"],
   "require_qualified_board": true,
   "qualified": {

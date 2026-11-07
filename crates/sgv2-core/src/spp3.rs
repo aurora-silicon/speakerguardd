@@ -12,9 +12,14 @@
 //!   `PilotToneEnabled` (else 1), `g[n]` the group's dezippered gain.
 //! - **Powers.** On each update's own 256 frames (no history shift):
 //!   `Pcoil = elec * mean(out^2)` drives the coil and magnet, `Pdrv = elec *
-//!   mean(in^2)` drives the feed-forward node and the pilot gate, with
-//!   `elec = ag^2 Reb / (Reb + Rshunt + Rampout)^2` (Rampout fractional,
-//!   unrounded). See `PDRV_WITH_HEADROOM` and `PCOIL_WITH_PILOT`.
+//!   mean(in^2)` drives the feed-forward node and the pilot gate. The native
+//!   order is a Float32 eight-vector fused sum of squares followed by a
+//!   halves/adjacent-pair reduction. The electrical factor is associated as
+//!   `ageff = f32(f32(ag * Reb) / f32(Reb + series))`. Its square, followed
+//!   by `f32(1 / Reb)`, `f32(1 / frames)` and the Float32 sum, is multiplied
+//!   left to right in Float64 and rounded once to Float32 (`series = Rshunt
+//!   + Rampout`; Rampout fractional and unrounded). See `PDRV_WITH_HEADROOM`
+//!   and `PCOIL_WITH_PILOT`.
 //! - **Thermal filters.** Trapezoidal-input, linear-decay recurrences at
 //!   `dt = 256/fs` for the coil, the magnet and the feed-forward node
 //!   (`tau_ff = ThermalFFSpeedupFactor * tau_Tvc`). `T_OL = ambient +
@@ -1286,7 +1291,9 @@ struct Chan {
     /// A non-finite program sample in the current thermal update: the rest
     /// of the update gets the meter-failure 20 dB.
     meter_failed: bool,
-    elec: f64,
+    loaded_amp_gain: f32,
+    inv_reb: f32,
+    frame_recip: f32,
     headroom2: f64,
     safe: SafeTlim,
     headroom_c: f64,
@@ -1302,8 +1309,8 @@ struct Chan {
     p_prev: f64,
     p_ff_prev: f64,
     /// Post-gain coil drive (before the pilot) and pre-gain drive.
-    acc: dsp::LaneAcc,
-    acc_in: dsp::LaneAcc,
+    acc: dsp::PowerAcc,
+    acc_in: dsp::PowerAcc,
     sense: Option<(usize, usize)>,
     vi_scale: f64,
     acc_vi: dsp::LaneAcc,
@@ -1352,6 +1359,18 @@ impl Chan {
         self.out_of_range = false;
         self.vi_power = f64::NAN;
     }
+}
+
+/// The open-loop meter's final association. The sum and electrical inputs
+/// are Float32 values, but the products are evaluated in Float64 and rounded
+/// once to Float32 for the model state.
+#[inline]
+fn open_loop_power(sum_sq: f32, loaded_amp_gain: f32, inv_reb: f32, frame_recip: f32) -> f64 {
+    let mut p = loaded_amp_gain as f64 * loaded_amp_gain as f64;
+    p *= inv_reb as f64;
+    p *= frame_recip as f64;
+    p *= sum_sq as f64;
+    (p as f32) as f64
 }
 
 /// The release hold of the ordinary candidate (rig law 5): when the fresh
@@ -1646,19 +1665,26 @@ impl Run {
             };
             // the series resistance includes the amplifier output
             // resistance, fractional and unrounded (spec 12)
-            let (reb, series, ag) = (c.reb_ref as f64, c.rshunt as f64 + c.rampout as f64, c.ag as f64);
+            let series = c.rshunt + c.rampout;
+            let loaded_amp_gain = c.ag * c.reb_ref / (c.reb_ref + series);
             let ff_factor = c.thermal_ff_speedup_factor as f64;
             let ff_on = ff_factor > 0.0;
             let ff_tau = if ff_on { c.thermal_ff_speedup_factor * c.tau_tvc } else { c.tau_tvc };
             let dt32 = upd as f32 / p.sample_rate as f32;
             let ff = Thermal::new(c.t_sett_vc, ff_tau, dt32);
-            let (tvc, tmg) = (c.t_sett_vc as f64, c.t_sett_mg as f64);
-            // hot fallback: the steady-state split at the ordinary limit
+            // hot fallback: the steady-state split at the ordinary limit, in
+            // the reference's Float32 arithmetic, left to right: `(Tlim -
+            // ambient) * T_sett / (T_sett_vc + T_sett_mg)` per node (the
+            // macOS bit-8 controller record of an AID9 hot start: coil and
+            // feed-forward nodes exact from the first update with this
+            // order, one ulp high on every update with the f64 split)
             let seed = if cold {
                 (0.0, 0.0, 0.0)
             } else {
-                let p0 = (c.temperature_limit as f64 - ambient) / (tvc + tmg);
-                (p0 * tvc, p0 * tmg, p0 * tvc)
+                let rise = c.temperature_limit - p.thermal_ambient_temp;
+                let sum = c.t_sett_vc + c.t_sett_mg;
+                let vc = rise * c.t_sett_vc / sum;
+                (vc as f64, (rise * c.t_sett_mg / sum) as f64, vc as f64)
             };
             let headroom = if c.pilot_tone_enabled != 0 { 1.0 - pilot_amplitude(c.pilot_ampl_hi_db) } else { 1.0 };
             let pilot_cfg = c.pilot_tone_enabled != 0
@@ -1671,7 +1697,9 @@ impl Run {
                 headroom,
                 scratch: vec![0.0; MODEL_SCRATCH],
                 meter_failed: false,
-                elec: ag * ag * reb / ((reb + series) * (reb + series)),
+                loaded_amp_gain,
+                inv_reb: 1.0 / c.reb_ref,
+                frame_recip: 1.0 / upd as f32,
                 headroom2: (headroom as f64) * (headroom as f64),
                 safe: SafeTlim::new(c.temperature_limit, p.thermal_safe_tlim, p.thermal_safe_tlim_offset, safe_init),
                 headroom_c: c.hard_temp_limit_headroom as f64,
@@ -1682,8 +1710,8 @@ impl Run {
                 seed,
                 p_prev: 0.0,
                 p_ff_prev: 0.0,
-                acc: dsp::LaneAcc::new(),
-                acc_in: dsp::LaneAcc::new(),
+                acc: dsp::PowerAcc::new(),
+                acc_in: dsp::PowerAcc::new(),
                 sense: if c.ignore_telemetry != 0 { None } else { Some((c.sense_i as usize, c.sense_v as usize)) },
                 vi_scale: c.imon_scale as f64 * c.vmon_scale as f64,
                 acc_vi: dsp::LaneAcc::new(),
@@ -1888,12 +1916,12 @@ impl Run {
         let mut hard_t = [1.0f64; MAX_CHANNELS];
         for c in self.ch.iter_mut() {
             c.meter_failed = false;
-            let p = c.elec * c.acc.total() / n;
+            let p = open_loop_power(c.acc.total(), c.loaded_amp_gain, c.inv_reb, c.frame_recip);
             c.acc.clear();
             c.p_model = p;
             c.vc.step(p, c.p_prev);
             c.mg.step(p, c.p_prev);
-            let mut p_ff = c.elec * c.acc_in.total() / n;
+            let mut p_ff = open_loop_power(c.acc_in.total(), c.loaded_amp_gain, c.inv_reb, c.frame_recip);
             if PDRV_WITH_HEADROOM {
                 p_ff *= c.headroom2;
             }
@@ -1956,13 +1984,19 @@ impl Run {
             }
         }
         for (gi, g) in self.groups.iter_mut().enumerate() {
-            let t = ff_t[gi];
-            let k = if t < g.g { self.k_attack } else { self.k_release };
-            g.g += k * (t - g.g);
+            // Float32 state and arithmetic, `g + k * (t - g)` (the macOS
+            // bit-8 controller record: this law reproduces every selected
+            // gain from the previous one and the candidates, 10461/10461
+            // updates on both AID9 groups; the f64 state it replaces drifts
+            // off by an ulp within seconds whenever the gain moves)
+            let t = ff_t[gi] as f32;
+            let g32 = g.g as f32;
+            let k = (if t < g32 { self.k_attack } else { self.k_release }) as f32;
+            let next = g32 + k * (t - g32);
             // the smoother's state is the selected minimum (spec 6)
-            let sel = min_nan(g.g, hard_t[gi]);
-            g.g = sel;
-            g.sel = sel as f32;
+            let sel = min_nan(next as f64, hard_t[gi]) as f32;
+            g.g = sel as f64;
+            g.sel = sel;
         }
         let complete = self.sums.complete
             && !self.sense_bad
@@ -2185,8 +2219,8 @@ impl ProtectionUnit for Unit {
         }
         let k = 1.0 - run.k_release;
         for (gi, grp) in run.groups.iter_mut().enumerate() {
-            let v = release_toward_unity(g[gi], k, updates);
-            *grp = Group { g: v, sel: v as f32, z1: v as f32, z2: v as f32 };
+            let v = release_toward_unity(g[gi], k, updates) as f32;
+            *grp = Group { g: v as f64, sel: v, z1: v, z2: v };
         }
         run.curve.iter_mut().for_each(|v| *v = 1.0);
         true

@@ -267,6 +267,46 @@ class Generated(unittest.TestCase):
             if gen.voicing_enabled(c.get("board", m)) and b is not None:
                 self.assertEqual(len(b), c["amps"])
 
+    def test_voicing_lowpass_is_interim_validated_and_only_on_the_j700(self):
+        self.assertIsNone(gen.voicing_lowpass("j700", {}))
+        self.assertEqual(gen.voicing_lowpass("j700", {"voicing_pre_lowpass": {"j700": {"hz": 17400, "order": 8}}}), (17400.0, 8))
+        for bad in ({"hz": 17400}, {"hz": 17400, "order": 7}, {"hz": 17400, "order": 8.0}, {"hz": "17400", "order": 8},
+                    {"hz": True, "order": 8}, {"hz": 500, "order": 8}, {"hz": 30000, "order": 8}, {"hz": float("nan"), "order": 8},
+                    {"hz": 17400, "order": 8, "gain": 0}, [17400, 8], 17400):
+            with self.assertRaises(ValueError):
+                gen.voicing_lowpass("j700", {"voicing_pre_lowpass": {"j700": bad}})
+        # Butterworth pole-pair Qs (order 2: 1/sqrt(2); order 8: the four classic values)
+        self.assertAlmostEqual(gen.butterworth_q(2)[0], 2 ** -0.5, places=12)
+        self.assertEqual([round(q, 4) for q in gen.butterworth_q(8)], [2.5629, 0.9, 0.6013, 0.5098])
+        # Shipped gate: no board needs the interim band limit since the AID44 ControlFreak saturation
+        # law is exact (2026-11-08); the mechanism stays for a future open law.
+        on = sorted(b for b in (gen.fixture(m)["hw"]["board"] for m in gen.machines()) if gen.voicing_lowpass(b) is not None)
+        self.assertEqual(sorted(set(on)), [])
+        for m in gen.machines():
+            c, w = gen.machine(m)
+            conf = gen.pipewire_conf(m, c, w, voicing_pre=True)
+            lp = gen.voicing_lowpass(c.get("board", m))
+            if lp is None:
+                self.assertNotIn("bq_lowpass", conf)
+                self.assertIn('inputs = [ "voicing:in_0" "voicing:in_1" ]', conf)
+                continue
+            hz, order = lp
+            self.assertEqual(conf.count("label = bq_lowpass"), order)
+            self.assertEqual(conf.count(f'"Freq" = {hz:.1f}'), order)
+            self.assertIn('inputs = [ "lp0s0:In" "lp1s0:In" ]', conf)
+            for ch in (0, 1):
+                self.assertIn(f'{{ output = "lp{ch}s{order // 2 - 1}:Out" input = "voicing:in_{ch}" }}', conf)
+        # A corner at or above Nyquist refuses the board.
+        m = next(m for m in gen.machines() if gen.fixture(m)["hw"]["board"] == "j700")
+        c, w = gen.machine(m)
+        orig = gen.voicing_lowpass
+        try:
+            gen.voicing_lowpass = lambda board, gate=None: (24000.0, 8)
+            with self.assertRaises(ValueError):
+                gen.voicing_conf(m, c, w)
+        finally:
+            gen.voicing_lowpass = orig
+
     def test_both_modes_target_the_same_protect_input_and_only_generated_mode_owns_volume(self):
         for m in gen.machines():
             c, w = gen.machine(m)

@@ -176,8 +176,8 @@ block!(
     pilot_upper_thres: "PilotUpperThres", Number, "TODO(SPEC)", "content threshold (upper) for the pilot fade";
     pilot_lower_thres: "PilotLowerThres", Number, "TODO(SPEC)", "content threshold (lower) for the pilot fade";
     pilot_decay_time: "PilotDecayTime", Number, "s", "pilot fade stage 1";
-    pilot_decay_time_stage2: "PilotDecayTimeStage2", OptNumber, "s", "pilot fade stage 2; absent on some AIDs (TODO(SPEC) behaviour when absent)";
-    pilot_enable_thres: "PilotEnableThres", OptNumber, "TODO(SPEC)", "pilot enable threshold; absent on some AIDs (TODO(SPEC) behaviour when absent)";
+    pilot_decay_time_stage2: "PilotDecayTimeStage2", OptNumber, "s", "pilot fade stage 2; absent on some AIDs: the saved-state value (part ID 67) applies";
+    pilot_enable_thres: "PilotEnableThres", OptNumber, "TODO(SPEC)", "pilot enable threshold; absent on some AIDs: the saved-state value (part ID 68) applies";
     temp_sense_window_time: "TempSenseWindowTime", Number, "s", "V/I collection window";
     temp_sense_smoothing_tau: "TempSenseSmoothingTau", Number, "s", "smoothing of accepted temperature";
     tlim_err_decay_time: "TlimErrDecayTime", Number, "s", "decay of stale TlimAdj error toward zero";
@@ -329,11 +329,14 @@ impl Sidecar {
                 for (k, v) in
                     [("PilotDecayTimeStage2", l.pilot_decay_time_stage2), ("PilotEnableThres", l.pilot_enable_thres)]
                 {
+                    // The sidecar applies after the saved state: a key it
+                    // omits keeps the saved-state value (25G83 AID13/AID20
+                    // parameter readback, with and without the sidecar).
                     if v.is_none() {
-                        diags.warn(
+                        diags.info(
                             "spp3-optional-absent",
                             format!("{cctx}.CL"),
-                            format!("{k} is absent: TODO(SPEC) the unit's value when absent"),
+                            format!("{k} is absent: the saved-state value applies"),
                         );
                     }
                 }
