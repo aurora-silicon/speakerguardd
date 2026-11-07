@@ -38,7 +38,7 @@ def main():
         metas = list(md.get('meta', {}).values())
         rec = {'id': row['id'], 'aid': row['aid'], 'cases': 0, 'planned': sum(p['ch'] == row['ch'] for p in probes),
                'complete_call_mismatches': 0, 'short_final_call_differences': 0,
-               'timing_misses': [], 'errors': []}
+               'timing_misses': [], 'errors': [], 'cached_onset_aligned': None}
         if not metas:
             rec['status'] = 'missing-au-metadata'
             records.append(rec)
@@ -79,6 +79,13 @@ def main():
                 continue
             new = np.fromfile(out, '<f4').reshape(-1, row['ch'])
             mac = np.fromfile(macfile, '<f4').reshape(-1, row['ch'])
+            if rec['cached_onset_aligned'] is None:
+                native = np.flatnonzero(np.any(mac != 0, axis=1))
+                current = np.flatnonzero(np.any(new != 0, axis=1))
+                rec['cached_onset_case'] = p['name']
+                rec['au_onset_frame'] = int(native[0]) if native.size else None
+                rec['v2_onset_frame'] = int(current[0]) if current.size else None
+                rec['cached_onset_aligned'] = bool(native.size and current.size and native[0] == current[0])
             # A broadband onset has a unique sample position. Correlation is
             # diagnostic only and never shifts either side of the comparison.
             if p['name'].startswith('pink'):
@@ -101,7 +108,7 @@ def main():
                 rec['complete_call_mismatches'] += int(new[:full].tobytes() != base[:full].tobytes())
                 rec['short_final_call_differences'] += int(new[full:].tobytes() != base[full:].tobytes())
             rec['cases'] += 1
-        rec['status'] = 'PASS' if (rec['impulse_matches_au_latency'] and not rec['timing_misses']
+        rec['status'] = 'PASS' if (rec['impulse_matches_au_latency'] and rec['cached_onset_aligned'] and not rec['timing_misses']
                                          and not rec['complete_call_mismatches'] and not rec['errors']) else 'FAIL'
         if rec['status'] == 'PASS' and rec['cases'] != rec['planned']:
             rec['status'] = 'incomplete'

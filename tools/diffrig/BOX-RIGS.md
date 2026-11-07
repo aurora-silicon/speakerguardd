@@ -45,7 +45,8 @@ python3 tools/diffrig/aidgate/test_timing.py
 ```
 
 The timing report checks impulse positions against the AU's reported latency,
-checks that retained broadband references correlate at zero lag, and compares
+checks the first nonzero sample against retained AU audio, checks that
+broadband references correlate at zero lag, and compares
 complete 512-frame calls bit for bit with the older renderer. The old renderer
 includes its own transport compensation; the new one never compensates.
 A short final call is metered at its actual length, so its gain can differ from
