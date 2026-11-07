@@ -45,6 +45,19 @@
 //! The call's candidate is the larger of fast and of median against the
 //! conditioned long path; it is read once per call.
 //!
+//! Two start-up and low-level rules of the unit:
+//! - a reset takes full effect one call late: after the first call that
+//!   follows it the detector cascade's state is cleared again (the meters
+//!   keep what that call gave them), so a program that starts abruptly with
+//!   the reset sees its own onset twice;
+//! - a settled low-level rise (the call's loudest 64-frame level, floored at
+//!   the validity floor, more than 4 dB over its slow follower while moving
+//!   less than one dB per 100 frames' worth of events, and more than 10 dB
+//!   under the long reading) moves the whole retained long-path
+//!   coordinate 1.5 dB colder: histogram, reading, the readings on their way
+//!   to the arbitration, the conditioned output and, twice over, the held
+//!   candidate.
+//!
 //! Gain law: a 21-node table over -100..+10 in 5.5 dB steps, compiled from
 //! the tuning (target, maximum gain, upward and downward ranges, ratio),
 //! read as a uniform cubic B-spline over the nodes (not by linear
@@ -264,6 +277,14 @@ impl LongTerm {
         self.gate_a = pole(GATE_S, self.rate);
     }
 
+    /// Move the whole retained coordinate `db` colder (whole bins).
+    fn shift_down(&mut self, db: f64) {
+        let bins = (libm::round(db / BIN_DB).max(0.0) as usize).min(BINS);
+        self.hist.copy_within(bins.., 0);
+        self.hist[BINS - bins..].fill(0.0);
+        self.reading -= db;
+    }
+
     /// One window's mean power; the output slot. An invalid window returns
     /// the retained reading without changing or aging the histogram.
     fn update(&mut self, power: f64) -> f64 {
@@ -427,6 +448,57 @@ impl Precondition {
     }
 }
 
+/// The low-level rise that moves the long-path coordinate.
+const RISE_DB: f32 = 4.0;
+/// The follower's rate, in follower steps per second of events.
+const RISE_FOLLOW: f32 = 10.0;
+/// The rise counts while the peak moves less than this many dB per
+/// `RISE_SLOPE_FRAMES` worth of events.
+const RISE_SLOPE: f32 = 1.0;
+const RISE_SLOPE_FRAMES: f32 = 100.0;
+/// Only this far or more under the long reading, dB.
+const RISE_BELOW_DB: f32 = 10.0;
+/// The coordinate move, dB (15 histogram bins).
+const RISE_SHIFT_DB: f64 = 1.5;
+
+/// Watches the call's peak for a settled low-level rise.
+struct LowRise {
+    rate: f32,
+    follow: f32,
+    last: f32,
+}
+
+impl LowRise {
+    fn new(rate: f32) -> Self {
+        LowRise { rate, follow: 0.0, last: 0.0 }
+    }
+
+    fn reset(&mut self) {
+        self.follow = 0.0;
+        self.last = 0.0;
+    }
+
+    /// The call's loudest 64-frame level, its event count and the long
+    /// reading; the coordinate move this call asks for, dB.
+    fn update(&mut self, peak: f64, events: usize, reading: f64) -> f64 {
+        let raw = peak as f32;
+        let peak = raw.max(VALID_DB as f32);
+        let slope = self.rate * (peak - self.last) / events as f32 / RISE_SLOPE_FRAMES;
+        self.last = peak;
+        let rise = slope < RISE_SLOPE && self.follow + RISE_DB < peak;
+        self.follow = if rise || self.follow > peak {
+            peak
+        } else {
+            self.follow + (peak - self.follow) * RISE_FOLLOW * events as f32 / self.rate
+        };
+        if rise && raw < reading as f32 - RISE_BELOW_DB {
+            RISE_SHIFT_DB
+        } else {
+            0.0
+        }
+    }
+}
+
 /// The long path's input: the sliding mean of the last 600 smoothed
 /// powers, kept as a running sum.
 struct Window {
@@ -479,6 +551,7 @@ pub struct Run {
     median: Median,
     long: LongTerm,
     pre: Precondition,
+    rise: LowRise,
     fs: f64,
     /// The call's loudest 64-frame level, dB, and its 64-frame events.
     peak: f64,
@@ -498,6 +571,9 @@ pub struct Run {
     /// The 512-frame candidate: limited median against the conditioned
     /// long path.
     held: f64,
+    /// The reset's second, deferred clearing of the detector state is due
+    /// after the next whole call.
+    clear_due: bool,
     candidate: f64,
     target_db: f64,
     gain_db: f64,
@@ -526,6 +602,7 @@ impl Run {
             median: Median::new(block_rate),
             long: LongTerm::new(long_rate),
             pre: Precondition::new(fs as f32 / STEP as f32),
+            rise: LowRise::new(fs as f32 / STEP as f32),
             fs,
             peak: f64::NEG_INFINITY,
             events: 0,
@@ -537,6 +614,7 @@ impl Run {
             long_out: p.expected_db,
             median_live: false,
             held: 0.0,
+            clear_due: false,
             candidate: 0.0,
             target_db: 0.0,
             gain_db: 0.0,
@@ -561,6 +639,7 @@ impl Run {
         self.median.reset(e);
         self.long.reset(e);
         self.pre.reset();
+        self.rise.reset();
         self.peak = f64::NEG_INFINITY;
         self.events = 0;
         self.fast = e;
@@ -571,6 +650,7 @@ impl Run {
         self.long_out = e;
         self.median_live = false;
         self.held = e;
+        self.clear_due = true;
         self.candidate = e;
         self.target_db = self.p.gain_db(e);
         self.gain_db = self.target_db;
@@ -638,6 +718,18 @@ impl Run {
     /// End of a call: the fast path's held level, then the long path's
     /// preconditioner and the two maxima.
     fn arbitrate(&mut self) {
+        let shift = self.rise.update(self.peak, self.events, self.long.reading);
+        if shift > 0.0 {
+            self.long.shift_down(shift);
+            self.long_line.iter_mut().for_each(|v| *v -= shift);
+            self.long_out -= shift;
+            self.pre.out -= shift;
+            // the held candidate carries the coordinate through two holds
+            self.held -= 2.0 * shift;
+            if let Some((_, _, long)) = self.pending.as_mut() {
+                *long -= shift;
+            }
+        }
         let fast = self.peak + FAST_STORE_DB;
         let span = self.fs / self.events as f64;
         if fast > VALID_DB {
@@ -681,6 +773,10 @@ impl Run {
             self.arbitrate();
             self.peak = f64::NEG_INFINITY;
             self.events = 0;
+        }
+        if self.clear_due {
+            self.clear_due = false;
+            self.z = [[[0.0; 2]; MAX_SECTIONS]; MAX_CHANNELS];
         }
         for n in 0..CALL {
             self.gain_db += GLIDE * (self.target_db - self.gain_db);
@@ -962,6 +1058,56 @@ mod tests {
         slow.history = FAST_HISTORY;
         slow.arbitrate();
         assert!(fast.fast < slow.fast, "{} vs {}", fast.fast, slow.fast);
+    }
+
+    #[test]
+    fn a_settled_low_rise_asks_for_one_coordinate_move() {
+        let mut r = LowRise::new(750.0);
+        assert_eq!(r.update(-70.0, 8, -20.0), 0.0);
+        // a jump is not settled
+        assert_eq!(r.update(-65.0, 8, -20.0), 0.0);
+        // the next, settled call more than 4 dB over the follower moves it
+        assert_eq!(r.update(-65.0, 8, -20.0), RISE_SHIFT_DB);
+        assert_eq!(r.update(-65.0, 8, -20.0), 0.0);
+        // never within 10 dB of the long reading
+        let mut r = LowRise::new(750.0);
+        r.update(-70.0, 8, -60.0);
+        r.update(-65.0, 8, -60.0);
+        assert_eq!(r.update(-65.0, 8, -60.0), 0.0);
+    }
+
+    #[test]
+    fn the_move_shifts_every_retained_long_state() {
+        let p = Params { expected_db: -20.0, ..params(0) };
+        let mut r = Run::new(&p, 48_000.0, 1);
+        r.rise.follow = -70.0;
+        r.rise.last = -65.0;
+        r.peak = -65.0;
+        r.events = 8;
+        let before = r.long.hist.iter().position(|h| *h > 0.0).unwrap();
+        r.arbitrate();
+        assert_eq!(r.long.hist.iter().position(|h| *h > 0.0).unwrap(), before - 15);
+        assert_eq!(r.long.reading, -21.5);
+        assert_eq!(r.long_line, [-21.5; LONG_DELAY]);
+        assert_eq!(r.long_out, -21.5);
+        assert_eq!(r.held, -23.0);
+    }
+
+    #[test]
+    fn the_detector_state_clears_again_after_the_first_call() {
+        let p =
+            Params { sections: 1, sos: [[1.0, -2.0, 1.0, -1.9, 0.9025], [0.0; 5], [0.0; 5], [0.0; 5]], ..params(0) };
+        let mut r = Run::new(&p, 48_000.0, 1);
+        let mut buf = vec![0.25f32; CALL - 1];
+        r.process(&mut [&mut buf], CALL - 1);
+        assert!(r.clear_due);
+        let mut one = vec![0.25f32; 1];
+        r.process(&mut [&mut one], 1);
+        assert!(!r.clear_due);
+        assert_eq!(r.z[0][0], [0.0; 2]);
+        let mut more = vec![0.25f32; CALL];
+        r.process(&mut [&mut more], CALL);
+        assert_ne!(r.z[0][0], [0.0; 2]);
     }
 
     #[test]
