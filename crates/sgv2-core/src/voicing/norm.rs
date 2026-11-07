@@ -82,10 +82,11 @@
 //!   below its lower knee; there is no deferred second clear of the detector
 //!   state;
 //! - the applied gain starts its glide at the public default maximum gain;
-//! - the fast level is a two-sided hysteresis on the maximum smoothed
-//!   detector level in each completed 64-frame step, less a 4 dB store: it
-//!   rises only when that stored maximum strictly clears it by 3 dB and
-//!   falls to 8 dB above the stored maximum once that edge is under it;
+//! - the fast level is a two-sided hysteresis on every single-precision
+//!   smoothed-detector sample, less a 4 dB store: it rises only when that
+//!   stored sample strictly clears it by 3 dB and falls to 8 dB above the
+//!   stored sample once that edge is under it; the 64-frame arbitration
+//!   samples the retained result after all samples in the step;
 //! - the median store is 1.691 dB and the median moves straight to its
 //!   five-dB release edge; the competitor of the long path has no store and
 //!   there is no low-level coordinate move;
@@ -638,10 +639,6 @@ pub struct Run {
     z: [[[f64; 2]; MAX_SECTIONS]; MAX_CHANNELS],
     ema: f64,
     ema_a: f64,
-    /// Algorithm 1: maximum smoothed detector level in the current
-    /// 64-frame step. The first partial step starts at the detector reset
-    /// level; later steps contain only their own samples.
-    step_peak: f64,
     in_step: usize,
     steps: usize,
     blocks: usize,
@@ -697,7 +694,6 @@ impl Run {
             z: [[[0.0; 2]; MAX_SECTIONS]; MAX_CHANNELS],
             ema: 0.0,
             ema_a: libm::exp(-1.0 / (p.detector_ema_s * fs)),
-            step_peak: f64::NEG_INFINITY,
             in_step: 0,
             steps: 0,
             blocks: 0,
@@ -735,7 +731,6 @@ impl Run {
         self.pos = 0;
         self.z = [[[0.0; 2]; MAX_SECTIONS]; MAX_CHANNELS];
         self.ema = SEED_POWER;
-        self.step_peak = f64::NEG_INFINITY;
         self.in_step = 0;
         self.steps = 0;
         self.blocks = 0;
@@ -768,7 +763,6 @@ impl Run {
     fn reset_algorithm1(&mut self) {
         let s = V1_SILENT_DB;
         self.ema = power_of_f32(V1_RESET_LEVEL_DB);
-        self.step_peak = level(self.ema);
         self.window.reset(0.0);
         self.median.reset(s);
         self.long.reset(s);
@@ -839,10 +833,9 @@ impl Run {
         self.steps = (self.steps + 1) % PER_BLOCK;
     }
 
-    /// Algorithm 1, every 64-frame step: the fast hysteresis, the held
-    /// candidate on a 512-frame event (the long path conditioned against
-    /// the fast level), and the gain's target.
-    fn arbitrate_step(&mut self, db: f64) {
+    /// Algorithm 1, every detector sample: advance the fast hysteresis in
+    /// the unit's single-precision dB domain.
+    fn update_fast_sample(&mut self, db: f64) {
         let fast = db as f32 + V1_FAST_STORE_DB;
         let retained = self.fast as f32;
         if fast > retained + V1_FAST_RISE_DB {
@@ -850,6 +843,12 @@ impl Run {
         } else if fast + V1_FAST_FALL_DB < retained {
             self.fast = f64::from(fast + V1_FAST_FALL_DB);
         }
+    }
+
+    /// Algorithm 1, every completed 64-frame step: sample the retained fast
+    /// state, condition the long path on its 512-frame events, and read the
+    /// gain target.
+    fn arbitrate_fast_step(&mut self) {
         if let Some((_, mid, long)) = self.pending.take() {
             // the long path competes against the fast level, not the
             // 512-frame level
@@ -940,16 +939,15 @@ impl Run {
                 power += self.detect(ch, f64::from(x));
             }
             self.ema = self.ema_a * self.ema + (1.0 - self.ema_a) * power.max(1e-12);
+            if self.p.algorithm1 {
+                self.update_fast_sample(level(self.ema));
+            }
             if self.in_step == 0 {
                 self.on_step();
             }
-            if self.p.algorithm1 {
-                self.step_peak = self.step_peak.max(level(self.ema));
-            }
             let step_done = self.p.algorithm1 && self.in_step + 1 == STEP;
             if step_done {
-                self.arbitrate_step(self.step_peak);
-                self.step_peak = f64::NEG_INFINITY;
+                self.arbitrate_fast_step();
                 if self.steps_in_call < self.step_target.len() {
                     // A completed step changes the causal target of the
                     // following frame. A boundary at the end of this call is
@@ -1045,11 +1043,14 @@ mod tests {
         assert_eq!(r.ema, power_of_f32(V1_RESET_LEVEL_DB));
         assert!(!r.clear_due);
         r.fast = -20.0;
-        r.arbitrate_step(-14.0); // stored -18 is inside +3 dB
+        r.update_fast_sample(-14.0); // stored -18 is inside +3 dB
+        r.arbitrate_fast_step();
         assert_eq!(r.fast, -20.0);
-        r.arbitrate_step(-12.0); // stored -16 clears +3 dB
+        r.update_fast_sample(-12.0); // stored -16 clears +3 dB
+        r.arbitrate_fast_step();
         assert_eq!(r.fast, -16.0);
-        r.arbitrate_step(-30.0); // stored -34 + 8 is under the held level
+        r.update_fast_sample(-30.0); // stored -34 + 8 is under the held level
+        r.arbitrate_fast_step();
         assert_eq!(r.fast, -26.0);
         // the target follows the step, not the call boundary
         assert_eq!(r.candidate, -26.0);
@@ -1057,19 +1058,17 @@ mod tests {
     }
 
     #[test]
-    fn algorithm1_fast_uses_the_completed_step_maximum() {
+    fn algorithm1_fast_updates_on_every_detector_sample() {
         let p = Params { algorithm1: true, detector_ema_s: 0.040, ..params(0) };
         let mut r = Run::new(&p, 48_000.0, 1);
-        // Make the detector state equal each sample's power so the reducer
-        // is isolated from its time constant. A step-start sampler sees
-        // silence; the completed-step maximum sees the final sample.
-        r.ema_a = 0.0;
-        r.fast = V1_SILENT_DB;
-        let mut buf = [0.0f32; STEP];
-        buf[STEP - 1] = 1.0;
-        r.process(&mut [&mut buf], STEP);
-        assert_eq!(r.fast, f64::from(V1_FAST_STORE_DB));
-        assert_eq!(r.step_peak, f64::NEG_INFINITY);
+        r.fast = -100.0;
+        // A single update at the maximum (0 dB) would jump to -4 dB. The
+        // actual sequence repeatedly raises its own +3 dB edge and ends at
+        // -6 dB for this two-dB staircase.
+        for db in (-90..=0).step_by(2) {
+            r.update_fast_sample(f64::from(db));
+        }
+        assert_eq!(r.fast, -6.0);
     }
 
     #[test]
@@ -1080,21 +1079,25 @@ mod tests {
         // level is far under it
         r.fast = -12.0;
         r.pending = Some((-40.0, V1_SILENT_DB, -20.0));
-        r.arbitrate_step(-8.0);
+        r.update_fast_sample(-8.0);
+        r.arbitrate_fast_step();
         assert_eq!(r.held, -20.0);
         r.pending = Some((-60.0, V1_SILENT_DB, -18.0));
-        r.arbitrate_step(-8.0);
+        r.update_fast_sample(-8.0);
+        r.arbitrate_fast_step();
         assert_eq!(r.held, -18.0);
         // the fast level releases under the next reading: hold that reading
         // (the smaller of it and the fast level it overtook), not the level
         // the 512-frame path fell to
         r.pending = Some((-60.0, V1_SILENT_DB, -17.0));
-        r.arbitrate_step(-30.0);
+        r.update_fast_sample(-30.0);
+        r.arbitrate_fast_step();
         assert_eq!(r.fast, -26.0);
         assert_eq!(r.held, -17.0);
         // a burst whose fast level stays under a newer reading keeps the hold
         r.pending = Some((-5.0, V1_SILENT_DB, -15.0));
-        r.arbitrate_step(-22.0);
+        r.update_fast_sample(-22.0);
+        r.arbitrate_fast_step();
         assert_eq!(r.fast, -26.0);
         assert_eq!(r.held, -17.0);
     }
