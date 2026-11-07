@@ -1,9 +1,9 @@
 //! Single-resonator compensation, from the measured transfer specified in
 //! `docs/RESONATOR-COMPONENT.md`. The caller supplies every model parameter.
 //!
-//! This is a standalone component, not a [`crate::ProtectionUnit`]. It is
-//! intentionally not wired into LSM2: small-signal filter agreement cannot
-//! establish its ordering against the nonlinear limiter or adaptive models.
+//! This remains a component rather than a [`crate::ProtectionUnit`]. LSM2
+//! owns its placement before the nonlinear controller, target selection and
+//! atomic model-generation updates; the file renderer uses it directly.
 
 /// Runtime physical model and requested compensation. SI units, except for
 /// frequency (Hz), sample rate (Hz), and the two nonnegative limits (dB).
@@ -43,7 +43,7 @@ pub struct Filter {
 }
 
 impl Filter {
-    pub fn new(p: Params) -> Result<Self, Error> {
+    fn coefficients(p: Params) -> Result<([f64; 3], [f64; 2]), Error> {
         let positive = [p.rdc, p.mass_kg, p.damping, p.stiffness, p.desired_hz, p.desired_q, p.rate];
         let nonnegative = [p.bl, p.max_boost_db, p.max_cut_db];
         if !positive.iter().all(|v| v.is_finite() && *v > 0.0)
@@ -77,7 +77,44 @@ impl Filter {
         {
             return Err(Error::UnstableFilter);
         }
+        Ok((b, a))
+    }
+
+    pub fn new(p: Params) -> Result<Self, Error> {
+        let (b, a) = Self::coefficients(p)?;
         Ok(Self { b, a, x: [0.0; 2], y: [0.0; 2], faulted: false })
+    }
+
+    /// Install a new validated physical model without discontinuing the
+    /// input/output delay history. An explicit [`Self::reset`] is the only
+    /// operation that clears history or the failure latch.
+    pub fn reconfigure(&mut self, p: Params) -> Result<(), Error> {
+        let (b, a) = Self::coefficients(p)?;
+        self.b = b;
+        self.a = a;
+        Ok(())
+    }
+
+    pub(crate) fn process_sample(&mut self, sample: f32) -> Result<f32, Error> {
+        if self.faulted {
+            return Err(Error::Faulted);
+        }
+        if !sample.is_finite() {
+            self.faulted = true;
+            return Err(Error::NonfiniteInput);
+        }
+        let x = sample as f64;
+        let y = self.b[0] * x + self.b[1] * self.x[0] + self.b[2] * self.x[1]
+            - self.a[0] * self.y[0]
+            - self.a[1] * self.y[1];
+        let out = y as f32;
+        if !y.is_finite() || !out.is_finite() {
+            self.faulted = true;
+            return Err(Error::NonfiniteState);
+        }
+        self.x = [x, self.x[0]];
+        self.y = [y, self.y[0]];
+        Ok(out)
     }
 
     /// Filter a mono block in place. On any failure the entire supplied
@@ -94,28 +131,65 @@ impl Filter {
             return Err(Error::NonfiniteInput);
         }
         for i in 0..samples.len() {
-            let x = samples[i] as f64;
-            let y = self.b[0] * x + self.b[1] * self.x[0] + self.b[2] * self.x[1]
-                - self.a[0] * self.y[0]
-                - self.a[1] * self.y[1];
-            let out = y as f32;
-            if !y.is_finite() || !out.is_finite() {
-                samples.fill(0.0);
-                self.faulted = true;
-                return Err(Error::NonfiniteState);
+            match self.process_sample(samples[i]) {
+                Ok(out) => samples[i] = out,
+                Err(e) => {
+                    samples.fill(0.0);
+                    return Err(e);
+                }
             }
-            self.x = [x, self.x[0]];
-            self.y = [y, self.y[0]];
-            samples[i] = out;
         }
         Ok(())
     }
 
-    /// Reset history and the failure latch. The validated coefficients stay
-    /// unchanged; a different model requires construction of a new filter.
+    /// Reset history and the failure latch. The currently validated
+    /// coefficients stay unchanged.
     pub fn reset(&mut self) {
         self.x = [0.0; 2];
         self.y = [0.0; 2];
         self.faulted = false;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn params(hz: f64) -> Params {
+        Params {
+            rdc: 4.0,
+            bl: 0.7,
+            mass_kg: 0.0003,
+            damping: 0.2,
+            stiffness: 1500.0,
+            desired_hz: hz,
+            desired_q: 0.8,
+            max_boost_db: 12.0,
+            max_cut_db: 12.0,
+            rate: 48_000.0,
+        }
+    }
+
+    #[test]
+    fn reconfigure_retains_history_and_fault_until_reset() {
+        let mut retained = Filter::new(params(300.0)).unwrap();
+        let mut prefix = [0.0; 64];
+        prefix[63] = 0.25;
+        retained.process(&mut prefix).unwrap();
+        retained.reconfigure(params(500.0)).unwrap();
+
+        let mut fresh = Filter::new(params(500.0)).unwrap();
+        let mut a = [0.0; 16];
+        let mut b = a;
+        retained.process(&mut a).unwrap();
+        fresh.process(&mut b).unwrap();
+        assert_ne!(a, b, "the retained old-model tail must survive a coefficient update");
+
+        let mut faulted = Filter::new(params(300.0)).unwrap();
+        assert_eq!(faulted.process(&mut [f32::NAN]), Err(Error::NonfiniteInput));
+        faulted.reconfigure(params(500.0)).unwrap();
+        assert_eq!(faulted.process(&mut [0.0]), Err(Error::Faulted));
+        faulted.reset();
+        assert_eq!(faulted.process(&mut [0.0]), Ok(()));
     }
 }

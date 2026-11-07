@@ -925,6 +925,13 @@ fn finish_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics, p: lsm2::Params) 
     let n = p.channels as usize;
     let guarded = t.lsid.is_some();
     let g = t.protection.state.global().ok_or_else(|| bad("LSM2 global state missing"))?;
+    if g.get(lsm2_ids::controller(lsm2_ids::C_COMPENSATE_RESONATORS)).is_some_and(|v| v != 0.0) {
+        diags.info(
+            "lsm2-resonator-compensation",
+            "compile",
+            "type-A acceleration-model compensation carried before the nonlinear controller; independent LSID/LR2 release gates remain",
+        );
+    }
     // VoltsFullScale is peak volts (KERNEL.md 2.3).
     let vfs: Vec<f32> = p.ch[..n].iter().map(|c| c.volts_full_scale).collect();
     let full_scale_mv = operating_point("VoltsFullScale", &vfs)?;
