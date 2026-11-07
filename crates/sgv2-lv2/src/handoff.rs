@@ -61,6 +61,10 @@ pub fn init() {
 /// CLOCK_BOOTTIME in ns: the time base of the page's slots. Through the
 /// vDSO on aarch64 and x86_64 Linux, so real-time safe.
 pub fn boottime_ns() -> u64 {
+    #[cfg(test)]
+    if let Some(now) = test_clock::now() {
+        return now;
+    }
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     #[cfg(target_os = "linux")]
     let clock = libc::CLOCK_BOOTTIME;
@@ -73,7 +77,49 @@ pub fn boottime_ns() -> u64 {
 }
 
 fn now_ns() -> Option<u64> {
+    #[cfg(test)]
+    if let Some(now) = test_clock::now() {
+        return Some(now);
+    }
     EPOCH.get().map(|e| u64::try_from(e.elapsed().as_nanos()).unwrap_or(u64::MAX))
+}
+
+/// A scoped clock for thermal lifecycle tests. Only the calling test thread
+/// sees it; parallel tests and page watchers keep their normal clocks.
+#[cfg(test)]
+pub(crate) mod test_clock {
+    use std::cell::Cell;
+    use std::marker::PhantomData;
+
+    thread_local! {
+        static NOW: Cell<Option<u64>> = const { Cell::new(None) };
+    }
+
+    pub struct Clock {
+        previous: Option<u64>,
+        // The guard must be dropped on the thread whose clock it changed.
+        _thread: PhantomData<*mut ()>,
+    }
+
+    impl Clock {
+        pub fn at(now_ns: u64) -> Self {
+            Self { previous: NOW.replace(Some(now_ns)), _thread: PhantomData }
+        }
+
+        pub fn advance(&self, ns: u64) {
+            NOW.set(Some(NOW.get().unwrap().checked_add(ns).unwrap()));
+        }
+    }
+
+    pub(super) fn now() -> Option<u64> {
+        NOW.get()
+    }
+
+    impl Drop for Clock {
+        fn drop(&mut self) {
+            NOW.set(self.previous);
+        }
+    }
 }
 
 impl Slot {
@@ -156,6 +202,22 @@ impl Slot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_test_clock_is_scoped_and_controls_both_time_bases() {
+        assert_eq!(test_clock::now(), None);
+        {
+            let clock = test_clock::Clock::at(1_000_000_000);
+            let slot = Slot::new();
+            slot.publish(&HandOff::EMPTY);
+            assert_eq!(slot.read().unwrap().1, boottime_ns());
+            clock.advance(2_500_000_000);
+            assert_eq!(slot.latest().unwrap().1, 2.5);
+            assert_eq!(boottime_ns(), 3_500_000_000);
+            std::thread::spawn(|| assert_eq!(test_clock::now(), None)).join().unwrap();
+        }
+        assert_eq!(test_clock::now(), None);
+    }
 
     #[test]
     fn a_record_round_trips_with_its_age() {
