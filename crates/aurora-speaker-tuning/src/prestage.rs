@@ -701,10 +701,15 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics, mode: Rea
         if (state as u32) & 2 == 0 {
             continue;
         }
-        let mask = at(7)?;
-        if !(0.0..=65535.0).contains(&mask) || mask.fract() != 0.0 {
-            return Err(bad(format!("{ctx}: slot {i} channel mask {mask}")));
+        let filter_mask = at(7)?;
+        let phase_mask = at(8)?;
+        if !(0.0..=65535.0).contains(&filter_mask) || filter_mask.fract() != 0.0 {
+            return Err(bad(format!("{ctx}: slot {i} filter channel mask {filter_mask}")));
         }
+        if !(0.0..=65535.0).contains(&phase_mask) || phase_mask.fract() != 0.0 {
+            return Err(bad(format!("{ctx}: slot {i} phase channel mask {phase_mask}")));
+        }
+        let mask = filter_mask;
         let active = (mask as u32) >> ch & 1 != 0;
         let kind_value = at(1)?;
         if kind_value.fract() != 0.0 {
@@ -715,7 +720,11 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics, mode: Rea
             18 => Some(DynamicKind::HighShelf),
             _ => None,
         };
-        if !active && dynamic_kind.is_none() {
+        // Slot field 8 is the sidechain mask on a level-dependent slot and
+        // the phase-companion mask on a static shelf.
+        let filtered = active;
+        let phase_companion = dynamic_kind.is_none() && (phase_mask as u32) >> ch & 1 != 0;
+        if !filtered && !phase_companion && dynamic_kind.is_none() {
             continue;
         }
         let group = at(9)?;
@@ -743,6 +752,19 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics, mode: Rea
             return Err(bad(format!("{ctx}: slot {i} has a non-numeric field")));
         }
         let kind = kind as i64;
+        if phase_companion && !filtered {
+            if kind != 12 || gain == 0.0 {
+                return Err(bad(format!("{ctx}: slot {i} type {kind} phase companion is not carried")));
+            }
+            if q <= 0.0 || !(-30.0..=30.0).contains(&gain) || !(f0 > 0.0 && f0 < nyquist) {
+                return Err(bad(format!("{ctx}: slot {i} has invalid phase-compensated shelf controls")));
+            }
+            if automation.iter().any(|(_, a)| a.target == i && a.moves()) {
+                return Err(bad(format!("{ctx}: slot {i} has moving phase compensation")));
+            }
+            p.sections.push(tone_filter::phase_compensated_high_shelf(gain, f0, q, fs).1);
+            continue;
+        }
         // The slot's own values, then every set point a volume automation
         // moves it to.
         let mut points = vec![Point { gain, f0 }];
@@ -949,6 +971,9 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics, mode: Rea
                     Carry::Exact(k) => p.sections.push(match r {
                         Rbj::Peak => tone_filter::peak(carry[k].gain, carry[k].f0, q, fs),
                         Rbj::LowShelf => tone_filter::low_shelf(carry[k].gain, carry[k].f0, q, fs),
+                        Rbj::HighShelf if phase_mask != 0.0 => {
+                            tone_filter::phase_compensated_high_shelf(carry[k].gain, carry[k].f0, q, fs).0
+                        }
                         Rbj::HighShelf => tone_filter::high_shelf(carry[k].gain, carry[k].f0, q, fs),
                     }),
                     Carry::Flat(g) => p.gain_db += g,
@@ -1749,6 +1774,22 @@ mod tests {
             assert!(part(&st, 0, fs, &mut d).is_err(), "parameter {id} left out");
         }
         assert_eq!(part(&full, 0, fs, &mut d).unwrap().gain_db, -6.0);
+    }
+
+    #[test]
+    fn high_shelf_phase_mask_builds_the_companion_channel() {
+        let mut stage = tmst(&[], &[(0, [3.0, 12.0, -2.0, 1500.0, 1.0, 2.0, 2.0, 0.0])]);
+        let global = stage.state.as_mut().unwrap().sections.iter_mut().find(|section| section.scope == 0).unwrap();
+        global.params.iter_mut().find(|(id, _)| *id == SLOT_BASE + 8).unwrap().1 = 1.0;
+
+        let mut diagnostics = Diagnostics::default();
+        let mid = part_with(&stage, 0, 48_000.0, &mut diagnostics, Realise::Saved).unwrap();
+        let side = part_with(&stage, 1, 48_000.0, &mut diagnostics, Realise::Saved).unwrap();
+        assert_eq!((mid.sections.len(), side.sections.len()), (1, 1));
+        for frequency in [20.0, 1500.0, 20_000.0] {
+            assert!((mid.sections[0].magnitude(frequency, 48_000.0) - 1.0).abs() < 1e-12);
+        }
+        assert!(side.sections[0].magnitude(20_000.0, 48_000.0) < 0.81);
     }
 
     /// The pre-stage of `chain` with every one of `n` lanes passing every box.

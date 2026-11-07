@@ -120,6 +120,42 @@ pub fn high_shelf(gain_db: f64, f0: f64, q: f64, fs: f64) -> Section {
     matched(Shape::HighShelf, gain_db, f0, q, fs)
 }
 
+/// ToneMeister's phase-compensated high shelf and its companion allpass.
+///
+/// A channel selected by the slot's filter mask runs the shelf; a channel in
+/// the separate phase mask runs the allpass.  The analog pole/zero prototypes
+/// split the requested shelf gain symmetrically around the half-gain phase
+/// prototype.  Their poles are mapped by matched Z and the shelf numerator is
+/// magnitude-corrected at the same three frequencies as [`high_shelf`].
+pub fn phase_compensated_high_shelf(gain_db: f64, f0: f64, q: f64, fs: f64) -> (Section, Section) {
+    if gain_db == 0.0 {
+        return (Section::IDENTITY, Section::IDENTITY);
+    }
+    let a = libm::pow(10.0, gain_db.abs() / 40.0);
+    let (num_power, den_power) = if gain_db < 0.0 { (-0.5, 1.5) } else { (1.5, -0.5) };
+    let prototype = |power: f64| {
+        let leading = libm::pow(a, power);
+        [leading, libm::sqrt(leading) / q, 1.0]
+    };
+    let num = prototype(num_power);
+    let den = prototype(den_power);
+    let den_z = matched_den(den, f0, fs);
+    let mut magnitude = [0.0; 3];
+    for (i, w) in [0.0, PI / 3.0, 2.0 * PI / 3.0].into_iter().enumerate() {
+        let x = if w == 0.0 { 0.0 } else { w * fs / (2.0 * PI * f0) };
+        let target = libm::sqrt(polynomial_power(num, x) / polynomial_power(den, x));
+        magnitude[i] = target * denominator_magnitude(den_z, w);
+    }
+    // Reversing the minimum-phase magnitude fit gives the filter the phase of
+    // the companion prototype while retaining exactly the same magnitude.
+    let b = curve_fit(magnitude);
+    let filter = Section { b0: b[2], b1: b[1], b2: b[0], a1: den_z[0], a2: den_z[1] };
+
+    let phase_den = matched_den(prototype(0.5), f0, fs);
+    let allpass = Section { b0: phase_den[1], b1: phase_den[0], b2: 1.0, a1: phase_den[0], a2: phase_den[1] };
+    (filter, allpass)
+}
+
 /// ToneMeister's resonant high-pass slot. `Q` is stored in an analog decay
 /// convention; its bilinear equivalent is `1 / (2*sinh(1/(2*Q)))`.
 pub fn resonant_high_pass(f0: f64, q: f64, fs: f64) -> Section {
@@ -295,6 +331,19 @@ mod tests {
         assert!(20.0 * libm::log10(magnitude(low, 23_999.0, fs)) < 0.01);
         assert!(20.0 * libm::log10(magnitude(high, 0.0, fs)).abs() < 1e-9);
         assert!((20.0 * libm::log10(magnitude(high, 23_999.0, fs)) - 6.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn phase_compensated_shelf_and_companion_share_phase() {
+        let fs = 48_000.0;
+        let (shelf, allpass) = phase_compensated_high_shelf(-6.0, 1200.0, 0.9, fs);
+        for f in [20.0, 300.0, 1200.0, 5000.0, 16_000.0] {
+            assert!((magnitude(allpass, f, fs) - 1.0).abs() < 1e-12);
+            let relative = magnitude(shelf, f, fs) / magnitude(allpass, f, fs);
+            assert!(relative.is_finite() && relative > 0.0);
+        }
+        assert!((magnitude(shelf, 0.0, fs) - 1.0).abs() < 1e-9);
+        assert!((20.0 * libm::log10(magnitude(shelf, 23_999.0, fs)) + 6.0).abs() < 0.01);
     }
 
     #[test]
