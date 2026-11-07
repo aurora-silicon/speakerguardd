@@ -999,6 +999,8 @@ pub struct Run {
     detector_phase: [usize; BANDS],
     detector_max: [SlidingMax; BANDS],
     quadrature: [[QuadratureEnvelope; BANDS]; MAX_CHANNELS],
+    analytic_band_path: [DetectorPath; BANDS],
+    analytic_band_state: [[[[f32; 2]; MAX_DETECTOR_FILTERS]; BANDS]; MAX_CHANNELS],
     detector_reference_path: [DetectorPath; BANDS],
     detector_reference_state: [[[[f32; 2]; MAX_DETECTOR_FILTERS]; BANDS]; MAX_CHANNELS],
     detector_reference_quadrature: [[QuadratureEnvelope; BANDS]; MAX_CHANNELS],
@@ -1060,11 +1062,11 @@ impl Run {
             }
         });
         let hop_peak = cadence(q) == Cadence::HopPeak;
-        let (analytic_path, detector_reference_path) = analytic_detector_paths(q, fs);
+        let (analytic_band_path, detector_reference_path) = analytic_detector_paths(q, fs);
         let mut run = Run {
             path: paths(q, fs),
             legacy_stage: legacy_stages(q, fs),
-            detector_path: if hop_peak { analytic_path } else { detector_paths(q, fs) },
+            detector_path: detector_paths(q, fs),
             band: q.band,
             base_band: q.band,
             threshold_automation: q.threshold_automation,
@@ -1088,6 +1090,8 @@ impl Run {
             detector_phase: [0; BANDS],
             detector_max: [SlidingMax::EMPTY; BANDS],
             quadrature: [[QuadratureEnvelope::default(); BANDS]; MAX_CHANNELS],
+            analytic_band_path,
+            analytic_band_state: [[[[0.0; 2]; MAX_DETECTOR_FILTERS]; BANDS]; MAX_CHANNELS],
             detector_reference_path,
             detector_reference_state: [[[[0.0; 2]; MAX_DETECTOR_FILTERS]; BANDS]; MAX_CHANNELS],
             detector_reference_quadrature: [[QuadratureEnvelope::default(); BANDS]; MAX_CHANNELS],
@@ -1130,6 +1134,7 @@ impl Run {
                 envelope.reset();
             }
         }
+        self.analytic_band_state = [[[[0.0; 2]; MAX_DETECTOR_FILTERS]; BANDS]; MAX_CHANNELS];
         self.detector_reference_state = [[[[0.0; 2]; MAX_DETECTOR_FILTERS]; BANDS]; MAX_CHANNELS];
         for channel in &mut self.detector_reference_quadrature {
             for envelope in channel {
@@ -1301,7 +1306,16 @@ impl Run {
             }
             let scale = self.band_in[b] * self.detector_bandwidth[b];
             let magnitude = if self.hop_peak {
-                let band_envelope = self.quadrature[c][b].push(v);
+                let mut band = x;
+                for i in 0..self.analytic_band_path[b].count {
+                    let s = self.analytic_band_path[b].section[i];
+                    let z = &mut self.analytic_band_state[c][b][i];
+                    let output = s.b0 * band + z[0] as f64;
+                    z[0] = (s.b1 * band - s.a1 * output + z[1] as f64) as f32;
+                    z[1] = (s.b2 * band - s.a2 * output) as f32;
+                    band = output;
+                }
+                let band_envelope = self.quadrature[c][b].push(band);
                 let mut reference = x;
                 for i in 0..self.detector_reference_path[b].count {
                     let s = self.detector_reference_path[b].section[i];
