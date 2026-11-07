@@ -23,7 +23,8 @@ tuning are Apple-derived data: keep them out of this repository.
 
     graph_render.py --tunings /System/Library/Audio/Tunings --aid 12 \
         --in stereo.f32 --out unit_in.f32 [--strip NAME] [--graph NAME] \
-        [--param mvsc=1] [--through-protection] [--q 512] [--keep DIR]
+        [--param mvsc=1] [--through-protection | --stop-after BOX] \
+        [--q 512] [--keep DIR]
 """
 
 import argparse
@@ -150,11 +151,14 @@ def main():
     ap.add_argument("--meta")
     ap.add_argument("--param", action="append", default=[])
     ap.add_argument("--through-protection", action="store_true")
+    ap.add_argument("--stop-after", help="write this box's output without rendering later boxes")
     ap.add_argument("--bypass", action="append", default=[], help="treat this box as a wire (diagnostics)")
     ap.add_argument("--q", type=int, default=512)
     ap.add_argument("--sr", type=float, default=48000.0)
     ap.add_argument("--keep")
     args = ap.parse_args()
+    if args.through_protection and args.stop_after:
+        raise SystemExit("--through-protection and --stop-after are exclusive")
 
     root = os.path.join(args.tunings, f"AID{args.aid}", "DSP")
     defs, boxes, wires, params, gparam = parse_dspg(open(os.path.join(root, "Graphs", args.graph)).read())
@@ -174,7 +178,7 @@ def main():
     os.makedirs(work, exist_ok=True)
 
     outputs = {("in", 0): x}  # (box, port) -> frames x ch
-    done, metas, stop_box = {"in"}, [], None
+    done, metas, stop_box, boundary = {"in"}, [], None, None
     incoming = {}
     for w in wires:
         incoming.setdefault(w["dst"][0], []).append(w)
@@ -232,10 +236,19 @@ def main():
             done.add(name)
             pending.remove(name)
             progressed = True
+            if name == args.stop_after:
+                boundary = y
+                pending.clear()
+                break
         if not progressed:
             raise SystemExit(f"graph does not resolve: {pending}")
 
-    if args.through_protection:
+    if args.stop_after:
+        if boundary is None:
+            raise SystemExit(f"box {args.stop_after} was not reached or has no audio output")
+        y = boundary
+        stop_box = args.stop_after
+    elif args.through_protection:
         y = outputs[("out", 0)]
     else:
         if stop_box is None:
