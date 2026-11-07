@@ -452,6 +452,78 @@ impl LaneAcc {
     }
 }
 
+/// Float32 sum-of-squares accumulator used by the speaker thermal meters.
+///
+/// Samples are accumulated with fused multiply-add into eight four-lane
+/// vectors. The last four vectors (16 samples) are held aside: the eight
+/// main accumulators are combined by halves first, then that tail is fused
+/// into the four results. Two more halves and an adjacent-pair horizontal
+/// reduction finish the sum. Keeping this state across calls makes the
+/// result independent of how a thermal update was split by the host while
+/// retaining the native 256-frame reduction order.
+#[derive(Clone, Copy, Debug)]
+pub struct PowerAcc {
+    lanes: [f32; 32],
+    tail: [f32; 16],
+    frames: usize,
+}
+
+impl Default for PowerAcc {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PowerAcc {
+    pub const fn new() -> Self {
+        PowerAcc { lanes: [0.0; 32], tail: [0.0; 16], frames: 0 }
+    }
+
+    pub fn clear(&mut self) {
+        self.lanes = [0.0; 32];
+        self.tail = [0.0; 16];
+        self.frames = 0;
+    }
+
+    #[inline]
+    pub fn add_sq(&mut self, x: &[f32], phase: usize) {
+        debug_assert_eq!(self.frames, phase);
+        for &v in x {
+            let slot = self.frames & 15;
+            if self.frames >= 16 {
+                let lane = (self.frames - 16) & 31;
+                let old = self.tail[slot];
+                self.lanes[lane] = libm::fmaf(old, old, self.lanes[lane]);
+            }
+            self.tail[slot] = v;
+            self.frames += 1;
+        }
+    }
+
+    /// The Float32 block total in the native vector reduction order.
+    pub fn total(&self) -> f32 {
+        let mut half = [0.0f32; 16];
+        for (i, v) in half.iter_mut().enumerate() {
+            *v = self.lanes[i] + self.lanes[i + 16];
+        }
+        let tail_n = self.frames.min(16);
+        let tail_start = if self.frames >= 16 { self.frames & 15 } else { 0 };
+        for (i, v) in half.iter_mut().take(tail_n).enumerate() {
+            let x = self.tail[(tail_start + i) & 15];
+            *v = libm::fmaf(x, x, *v);
+        }
+        let mut quarter = [0.0f32; 8];
+        for (i, v) in quarter.iter_mut().enumerate() {
+            *v = half[i] + half[i + 8];
+        }
+        let mut vector = [0.0f32; 4];
+        for (i, v) in vector.iter_mut().enumerate() {
+            *v = quarter[i] + quarter[i + 4];
+        }
+        (vector[0] + vector[1]) + (vector[2] + vector[3])
+    }
+}
+
 /// Replace every non-finite sample with 0 and return how many there were.
 /// (Apple's graph has a non-finite guard at its head; the unit keeps one of
 /// its own so a NaN can never poison the thermal state.)
@@ -602,6 +674,31 @@ mod tests {
             }
             assert_eq!(a.total().to_bits(), whole.total().to_bits(), "split {split}");
         }
+    }
+
+    #[test]
+    fn power_acc_is_split_invariant() {
+        let x = sig(2048, 17);
+        let mut whole = PowerAcc::new();
+        whole.add_sq(&x, 0);
+        for split in [1usize, 3, 7, 16, 31, 32, 33, 100, 511] {
+            let mut a = PowerAcc::new();
+            let mut pos = 0;
+            while pos < x.len() {
+                let n = split.min(x.len() - pos);
+                a.add_sq(&x[pos..pos + n], pos);
+                pos += n;
+            }
+            assert_eq!(a.total().to_bits(), whole.total().to_bits(), "split {split}");
+        }
+    }
+
+    #[test]
+    fn power_acc_matches_256_frame_reduction() {
+        let x: Vec<f32> = (0..256).map(|i| (((i * 37) % 257) - 128) as f32 / 127.0).collect();
+        let mut a = PowerAcc::new();
+        a.add_sq(&x, 0);
+        assert_eq!(a.total().to_bits(), 0x42ae_5a30);
     }
 
     #[test]
