@@ -31,14 +31,17 @@ def sha(p):
 
 def generate(root):
     cases=[]
-    def add(name, mono, ch, channel=None):
+    def add(name, mono, ch, channel=None, measure_start=0, measure_frames=None):
         x=np.repeat(mono[:,None], ch, axis=1)
         if channel is not None:
             x[:]=0; x[:,channel]=mono
         p=root/'inputs'/f'{ch}ch-{name}.f32'; p.parent.mkdir(exist_ok=True)
         x.astype('<f4').tofile(p)
         cases.append({'name':name, 'ch':ch,'file':str(p.relative_to(root)),
-                      'frames':len(mono),'sha256':sha(p),'dynamic':name.startswith(('step','burst'))})
+                      'frames':len(mono),'sha256':sha(p),
+                      'dynamic':name.startswith(('step','burst','history_step')),
+                      'measure_start':measure_start,
+                      'measure_frames':measure_frames if measure_frames is not None else len(mono)-measure_start})
     for ch in sorted({r['ch'] for r in json.loads((root/'inventory.json').read_text())['rows']}):
         n=FS; t=np.arange(n)/FS
         for f in FREQS:
@@ -56,6 +59,26 @@ def generate(root):
             burst=np.where((np.arange(n)//4800)%10==0,1.,0.)
             for name,amp in [('step_up',up),('step_down',down),('burst',burst)]:
                 add(f'{name}_{f:g}',carrier*amp,ch)
+        # The short probes above start from one second of quiet history.  The
+        # full-chain gate reaches VirtualBass after varied program material,
+        # so retain twenty seconds of deterministic level/frequency history
+        # before measuring the same -40 to 0 dBFS LF step.  Only the final
+        # 1.5-second probe is scored; the prefix exists solely to advance the
+        # box's follower and filter state.
+        history_frames=20*FS; ht=np.arange(history_frames)/FS
+        history=np.zeros(history_frames)
+        hist_freqs=(31.5,63.,125.,250.,500.,1000.,2000.,4000.)
+        hist_db=(-30.,-12.,-6.,-24.,0.,-18.,-9.,-36.)
+        for second in range(20):
+            lo=second*FS; hi=(second+1)*FS
+            f=hist_freqs[second%len(hist_freqs)]; amp=10**(hist_db[second%len(hist_db)]/20)
+            history[lo:hi]=amp*np.sin(2*np.pi*f*ht[lo:hi])
+        probe_frames=3*FS//2; pt=np.arange(probe_frames)/FS
+        step_amp=np.where(np.arange(probe_frames)<FS//2,0.01,1.0)
+        for f in (40.,125.):
+            probe=step_amp*np.sin(2*np.pi*f*pt)
+            add(f'history_step_up_{f:g}',np.concatenate((history,probe)),ch,
+                measure_start=history_frames,measure_frames=probe_frames)
         if ch>1:
             for c in range(ch):
                 for f in [40,125,1000,10000,20000]:
@@ -63,14 +86,17 @@ def generate(root):
     dump(root/'probes.json',{'fs':FS,'levels_dbfs':LEVELS,'cases':cases})
     print('generated',len(cases),'shared inputs',flush=True)
 
-def metric(mac, v2, dynamic):
+def metric(mac, v2, dynamic, measure_start=0, measure_frames=None):
     if mac.shape!=v2.shape or not np.isfinite(mac).all() or not np.isfinite(v2).all():
         raise ValueError('shape mismatch or nonfinite render')
+    measure_end=len(mac) if measure_frames is None else min(len(mac),measure_start+measure_frames)
+    mac=mac[measure_start:measure_end];v2=v2[measure_start:measure_end]
     n=len(mac); halves=[]; windows=[]; nulls=0
-    # Steady ratios use a -240 dBFS numerical-silence floor. Transient
-    # windows use the prior rig's -80 dBFS floor on BOTH sides, so unexpected
-    # output above that floor remains a miss. No latency alignment is applied.
-    def delta(a,b, floor=1e-12):
+    # Both steady ratios and transient windows use the full-chain gate's
+    # -80 dBFS floor on BOTH sides.  Numerical opposite-channel leakage is
+    # therefore excluded, while unexpected output above the floor remains a
+    # miss. No latency alignment is applied.
+    def delta(a,b, floor=1e-4):
         nonlocal nulls
         ar=float(np.sqrt(np.mean(a*a))); br=float(np.sqrt(np.mean(b*b)))
         if max(ar,br)<floor:
@@ -113,7 +139,10 @@ def render_row(root, row, tag='v2', force=False):
             mac=np.fromfile(mp,'<f4').reshape(-1,row['ch']).astype(float)
             v2=np.fromfile(vp,'<f4').reshape(-1,row['ch']).astype(float)
             try:
-                record.update(metric(mac,v2,p['dynamic']));record['status']='measured'
+                record.update(metric(mac,v2,p['dynamic'],p.get('measure_start',0),p.get('measure_frames')))
+                record['status']='measured'
+                record['measure_start']=p.get('measure_start',0)
+                record['measure_frames']=p.get('measure_frames',p['frames'])
                 record['mac_sha256']=sha(mp);record['v2_sha256']=sha(vp)
             except ValueError as e: record.update(status='invalid',error=str(e))
         records.append(record)
@@ -123,7 +152,7 @@ def render_row(root, row, tag='v2', force=False):
     def signature(r):
         name=r['case']
         if name.startswith('step_down'): return 'release windows'
-        if name.startswith('step_up'): return 'attack windows'
+        if name.startswith(('step_up','history_step_up')): return 'attack windows'
         if name.startswith('burst'): return 'burst/tail windows'
         if name.startswith('only'): return 'channel isolation'
         if name.startswith('pink'): return 'broadband gain'
