@@ -262,6 +262,7 @@ fn main() {
                     origin: Origin { node: "in".into(), port: 0, channel: c as u32 },
                     hops: Vec::new(),
                     through: vec![Pass { node: stage.name.clone(), channel: c as u32 }],
+                    summed: Vec::new(),
                 })
                 .collect();
             let mut p = prestage::derive_lanes(std::slice::from_ref(stage), &lanes, fs, ch, &mut diags)

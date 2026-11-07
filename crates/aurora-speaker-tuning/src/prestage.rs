@@ -1683,6 +1683,7 @@ mod tests {
             origin: Origin { node: "in".into(), port: 0, channel: c },
             hops: Vec::new(),
             through: through.iter().map(|(n, ch)| Pass { node: (*n).into(), channel: *ch }).collect(),
+            summed: Vec::new(),
         }
     }
 
@@ -1917,6 +1918,7 @@ mod tests {
                 origin: Origin { node: "in".into(), port: 0, channel: c },
                 hops: Vec::new(),
                 through: chain.iter().map(|s| Pass { node: s.name.clone(), channel: c }).collect(),
+                summed: Vec::new(),
             })
             .collect();
         derive_lanes(&chain, &lanes, fs, n, d)

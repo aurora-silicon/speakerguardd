@@ -226,6 +226,10 @@ impl Wire for Kind {
             }
             Self::Bypass => 4u32.put(o),
             Self::Stub(_) => 5u32.put(o), // never deploy a stub
+            Self::Sum(out) => {
+                17u32.put(o);
+                out.put(o);
+            }
             Self::Xtc(p) => {
                 6u32.put(o);
                 let mut w = vec![0.0; super::xtc::Params::WORDS];
@@ -323,6 +327,7 @@ impl Wire for Kind {
             2 => Self::Tone(Tone::get(r)?),
             3 => Self::Comp(Dynamics::get(r)?),
             4 => Self::Bypass,
+            17 => Self::Sum(usize::get(r)?),
             6 => {
                 let w: Vec<f64> = (0..super::xtc::Params::WORDS).map(|_| f64::get(r)).collect::<Result<_>>()?;
                 Self::Xtc(Box::new(super::xtc::Params::from_words(&w).ok_or(BlobError::Unstable)?))
