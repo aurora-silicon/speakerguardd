@@ -497,34 +497,44 @@ impl Run {
             let mut energies = [0.0; MAX_MODELS];
             #[cfg(not(feature = "lowflow-conservative"))]
             let mut velocities = [0.0; MAX_MODELS];
-            for c in 0..self.models {
-                let woofer = f64::from(finite(bufs[c][frame]));
-                let tweeter = f64::from(finite(bufs[c + self.models][frame]));
-                let state = &mut self.state[c];
-                state.woofer_history[state.history_at] = woofer;
-                state.tweeter_history[state.history_at] = tweeter;
-                let pressure = fir(&state.pressure_taps, &state.woofer_history, state.history_at)
-                    * self.params[c].analog_gain
-                    + fir(&state.tweeter_taps, &state.tweeter_history, state.history_at) * self.params[c].tweeter_gain;
-                state.history_at = (state.history_at + 1) % RESPONSE_TAPS;
-                let mask_band = state.mask_lp2.run(state.mask_lp.run(state.mask_hp2.run(state.mask_hp.run(pressure))));
-                energies[c] = mask_band * mask_band;
-                #[cfg(not(feature = "lowflow-conservative"))]
-                {
-                    let band = state.detector_lp.run(state.detector_hp.run(woofer));
-                    let velocity = state.cone.run(band) + state.front.run(band);
-                    velocities[c] = state.velocity_scale * libm::fabs(velocity);
+            // The conservative law never reads the detector. In that build,
+            // do not run its masking FIRs or advance its unobservable state.
+            // This is a compile-time choice; a running instance cannot switch
+            // back to the detector law and observe a different history.
+            if !CONSERVATIVE {
+                for c in 0..self.models {
+                    let woofer = f64::from(finite(bufs[c][frame]));
+                    let tweeter = f64::from(finite(bufs[c + self.models][frame]));
+                    let state = &mut self.state[c];
+                    state.woofer_history[state.history_at] = woofer;
+                    state.tweeter_history[state.history_at] = tweeter;
+                    let pressure = fir(&state.pressure_taps, &state.woofer_history, state.history_at)
+                        * self.params[c].analog_gain
+                        + fir(&state.tweeter_taps, &state.tweeter_history, state.history_at)
+                            * self.params[c].tweeter_gain;
+                    state.history_at = (state.history_at + 1) % RESPONSE_TAPS;
+                    let mask_band =
+                        state.mask_lp2.run(state.mask_lp.run(state.mask_hp2.run(state.mask_hp.run(pressure))));
+                    energies[c] = mask_band * mask_band;
+                    #[cfg(not(feature = "lowflow-conservative"))]
+                    {
+                        let band = state.detector_lp.run(state.detector_hp.run(woofer));
+                        let velocity = state.cone.run(band) + state.front.run(band);
+                        velocities[c] = state.velocity_scale * libm::fabs(velocity);
+                    }
                 }
-            }
-            if self.link_energies && self.models > 1 {
-                let total: f64 = energies[..self.models].iter().sum();
-                energies[..self.models].fill(total);
+                if self.link_energies && self.models > 1 {
+                    let total: f64 = energies[..self.models].iter().sum();
+                    energies[..self.models].fill(total);
+                }
             }
             for c in 0..self.models {
                 let model = &self.params[c];
                 let state = &mut self.state[c];
-                let alpha = if energies[c] > state.mask_energy { state.mask_attack } else { state.mask_release };
-                state.mask_energy += alpha * (energies[c] - state.mask_energy);
+                if !CONSERVATIVE {
+                    let alpha = if energies[c] > state.mask_energy { state.mask_attack } else { state.mask_release };
+                    state.mask_energy += alpha * (energies[c] - state.mask_energy);
+                }
                 #[cfg(not(feature = "lowflow-conservative"))]
                 let limit = {
                     let energy_db = 10.0 * libm::log10(state.mask_energy.max(1.0e-30));
