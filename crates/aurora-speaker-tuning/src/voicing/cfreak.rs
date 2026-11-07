@@ -50,6 +50,25 @@ fn default(id: u32) -> Option<f64> {
 }
 
 pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option<Params>> {
+    compile_for(stage, fs, None, diags)
+}
+
+/// Whether a tuning extracted from macOS build `build` runs the macOS 27
+/// unit (builds `26xxx` and later), whose saturation drive has the
+/// parameter-17 block-peak ceiling. Unknown builds keep the 25G83 unit.
+pub fn macos27(build: Option<&str>) -> bool {
+    let major: String = build.unwrap_or("").chars().take_while(|c| c.is_ascii_digit()).collect();
+    major.parse::<u32>().is_ok_and(|m| m >= 26)
+}
+
+/// [`compile`] for a tuning extracted from macOS build `source_build`: the
+/// unit's behaviour follows the macOS that the tuning came from.
+pub fn compile_for(
+    stage: &Stage,
+    fs: f64,
+    source_build: Option<&str>,
+    diags: &mut Diagnostics,
+) -> Result<Option<Params>> {
     let ctx = format!("limiter box {}", stage.name);
     let bad = |m: String| Error::format(&ctx, m);
     if stage.unit.map(|u| u.subtype) != Some(CFRK) {
@@ -96,27 +115,36 @@ pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option
     } else {
         (0, 0.0)
     };
-    let (saturation_mode, saturation_flavor, saturation_mix) = if saturation {
+    let (saturation_mode, saturation_flavor, saturation_ceiling_db) = if saturation {
         let mode = get(1)?;
-        if !(1.0..=7.0).contains(&mode) || mode != mode.trunc() || get(10)? != 2.0 || get(23)? != 1.0 {
+        let flavor = get(10)?;
+        let version = get(23)?;
+        // flavour 2 (sine) is established with version 1; flavour 1 (cubic)
+        // renders identically under versions 0 and 1
+        let carried = match flavor {
+            1.0 => version == 0.0 || version == 1.0,
+            2.0 => version == 1.0,
+            _ => false,
+        };
+        if !(0.0..=7.0).contains(&mode) || mode != mode.trunc() || !carried {
             return Err(bad(format!(
-                "output saturation mode/flavor/version {}/{}/{} (modes 1-7, sine flavor 2, version 1 are carried)",
-                mode,
-                get(10)?,
-                get(23)?
+                "output saturation mode/flavor/version {mode}/{flavor}/{version} (modes 0-7; cubic flavor 1 with version 0 or 1, sine flavor 2 with version 1 are carried)"
             )));
         }
-        let amount = get(17)?;
-        if !(0.0..=100.0).contains(&amount) {
-            return Err(bad(format!("output saturation amount {amount}%")));
+        if mode == 0.0 && get(19)? != 0.0 {
+            return Err(bad("output saturation without oversampling and an active de-esser (not carried)".into()));
         }
+        // "max saturation" (dB): the macOS 27 unit's block-peak ceiling of
+        // the shaper drive; the 25G83 unit has none
+        let saved = get(17)?;
+        let ceiling = if macos27(source_build) { saved } else { sgv2_core::voicing::cfreak::CEILING_OFF_DB };
         // The de-esser (18-20) shapes the saturation drive; 21 belongs to
         // the version-1 state. Require complete finite saved values rather
         // than silently defaulting an unknown state.
         for id in [18, 19, 20, 21] {
             get(id)?;
         }
-        (mode, 2.0, amount / 100.0)
+        (mode, flavor, ceiling)
     } else {
         // version 1 without saturation: the high-pass (if on) is its only
         // addition the strips use
@@ -125,9 +153,6 @@ pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option
         }
         (0.0, 0.0, 0.0)
     };
-    if highpass && saturation {
-        return Err(bad("high-pass together with output saturation (not carried)".into()));
-    }
     let words = [
         get(7)? / 1000.0,
         get(5)? / 1000.0,
@@ -136,7 +161,7 @@ pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option
         get(6)?,
         saturation_mode,
         saturation_flavor,
-        saturation_mix,
+        saturation_ceiling_db,
         if get(11)? != 0.0 { get(2)? } else { 0.0 },
         if get(15)? != 0.0 { get(8)? } else { 0.0 },
         // the high-pass words (set below) and the de-esser
@@ -209,7 +234,7 @@ mod tests {
                 true_peak: true,
                 saturation_mode: 0,
                 saturation_flavor: 0,
-                saturation_mix: 0.0,
+                saturation_ceiling_db: 0.0,
                 deesser_hz: 0.0,
                 deesser_db: 0.0,
                 deesser_q: 0.0,
@@ -273,9 +298,27 @@ mod tests {
         ])
         .unwrap()
         .unwrap();
-        assert_eq!((saturated.saturation_mode, saturated.saturation_flavor, saturated.saturation_mix), (3, 2, 0.3));
+        assert_eq!(
+            (saturated.saturation_mode, saturated.saturation_flavor, saturated.saturation_ceiling_db),
+            (3, 2, sgv2_core::voicing::cfreak::CEILING_OFF_DB)
+        );
+        // a macOS 27 source switches the saved block-peak ceiling on
+        let st = stage(&[(1, 3.0), (10, 2.0), (16, 1.0), (17, 30.0), (18, 10_000.0), (19, 10.0), (20, 1.0), (23, 1.0)]);
+        let on = compile_for(&st, 48_000.0, Some("26B8125"), &mut Diagnostics::default()).unwrap().unwrap();
+        assert_eq!(on.saturation_ceiling_db, 30.0);
+        assert!(macos27(Some("26A428")) && !macos27(Some("25G83")) && !macos27(None) && !macos27(Some("x")));
         assert_eq!((saturated.deesser_hz, saturated.deesser_db, saturated.deesser_q), (10_000.0, 10.0, 1.0));
-        for refused in [[(1, 0.0)], [(1, 8.0)], [(10, 1.0)], [(23, 0.0)]] {
+        // flavour 1 (cubic) is carried with version 0 or 1, at the base rate
+        // without a de-esser
+        let cubic =
+            compile_of(&[(1, 0.0), (10, 1.0), (16, 1.0), (17, 1.0), (18, 1_000.0), (19, 0.0), (20, 1.0), (23, 0.0)])
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            (cubic.saturation_mode, cubic.saturation_flavor, cubic.saturation_ceiling_db),
+            (0, 1, sgv2_core::voicing::cfreak::CEILING_OFF_DB)
+        );
+        for refused in [[(1, 0.0)], [(1, 8.0)], [(10, 3.0)], [(23, 0.0)]] {
             let mut st = vec![
                 (1, 3.0),
                 (10, 2.0),
