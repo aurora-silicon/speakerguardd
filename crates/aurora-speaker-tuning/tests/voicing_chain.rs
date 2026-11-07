@@ -55,3 +55,55 @@ fn compile_stubs_unknown_boxes_and_runs() {
     ch.process(&[&l, &r], &mut lanes, 16);
     assert_eq!([lanes[0][3], lanes[1][3], lanes[2][3], lanes[3][3]], [0.25, -0.5, 0.25, -0.5]);
 }
+
+/// The stereo program summed to one channel (a one-speaker graph) and
+/// duplicated to the four lanes.
+fn summed_tuning(tag: &str) -> Tuning {
+    let mut files = spp3_files(4);
+    let key = files.keys().find(|k| k.ends_with(".dspg")).unwrap().clone();
+    let g = String::from_utf8(files[&key].clone()).unwrap();
+    let g = g
+        .replace("box Spl split 1 2\n", "box Spl split 1 2\nbox Mix sum 2 1\n")
+        .replace(
+            "wire Guard Eq ([fs] [chIn])\nwire Eq Spl ([fs] [chIn])\n",
+            "wire Guard Spl ([fs] [chIn])\nwire (Spl 0) (Mix 0) ([fs] 1)\nwire (Spl 1) (Mix 1) ([fs] 1)\nwire Mix Eq ([fs] 1)\n",
+        )
+        .replace("wire (Spl 0) (Up 0) ([fs] 1)\n", "wire Eq (Up 0) ([fs] 1)\n")
+        .replace("wire (Spl 0) (Up 1) ([fs] 1)\n", "wire Eq (Up 1) ([fs] 1)\n")
+        .replace("wire (Spl 1) (Up 2) ([fs] 1)\n", "wire Eq (Up 2) ([fs] 1)\n")
+        .replace("wire (Spl 1) (Up 3) ([fs] 1)\n", "wire Eq (Up 3) ([fs] 1)\n");
+    assert!(g.contains("wire Mix Eq") && g.contains("wire Eq (Up 3)"));
+    files.insert(key, g.into_bytes());
+    let dir = scratch(&format!("voicing-chain-{tag}"));
+    write_dir(&dir, &files, &manifest_json(&files, "25G83"));
+    let b = Bundle::open(&dir).unwrap();
+    let mut d = Diagnostics::default();
+    Tuning::load(&b, &Options::default(), &mut d).unwrap()
+}
+
+#[test]
+fn plan_carries_a_sum_of_both_program_channels() {
+    let t = summed_tuning("sum");
+    let p = topology::plan(&t).unwrap();
+    let names: Vec<&str> = p.nodes.iter().map(|n| n.name.as_str()).collect();
+    assert_eq!(names, ["Guard", "Mix", "Eq"]);
+    assert_eq!(p.nodes[1].kind, topology::NodeKind::Sum { inputs: 2 });
+    let guard = |c| topology::Source::Node { node: 0, channel: c };
+    assert_eq!(p.nodes[0].inputs, [topology::Source::Program { channel: 0 }, topology::Source::Program { channel: 1 }]);
+    assert_eq!(p.nodes[1].inputs, [guard(0), guard(1)]);
+    assert_eq!(p.nodes[1].out_width(), 1);
+    assert_eq!(p.nodes[2].inputs, [topology::Source::Node { node: 1, channel: 0 }]);
+    assert_eq!(p.outputs, [topology::Source::Node { node: 2, channel: 0 }; 4]);
+
+    let mut d = Diagnostics::default();
+    let c = chain::compile(&t, 48_000.0, &mut d).unwrap();
+    assert_eq!(c.spec.nodes[1].kind, Kind::Sum(1));
+    let mut run = Chain::new(c.spec, 48_000.0, 16).unwrap();
+    let l = [0.25f32; 16];
+    let r = [0.5f32; 16];
+    let mut o = [[0.0f32; 16]; 4];
+    let mut it = o.iter_mut();
+    let mut lanes: [&mut [f32]; 4] = core::array::from_fn(|_| &mut it.next().unwrap()[..]);
+    run.process(&[&l, &r], &mut lanes, 16);
+    assert!(lanes.iter().all(|lane| lane[9] == 0.75));
+}

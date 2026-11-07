@@ -218,13 +218,12 @@ fn make_unit(
         UnitKind::Spp3 => {
             spp3::Params::from_blob(bytes).map(|p| Box::new(spp3::Unit::new(p)) as _).map_err(|e| format!("{e:?}"))
         }
-        UnitKind::Lsm2 => lsm2::Params::from_blob(bytes)
-            .map(|mut p| {
+        UnitKind::Lsm2 => lsm2::Unit::from_blob(bytes)
+            .map(|mut unit| {
                 if let Some(w) = cpms {
-                    p.runtime_budget_present = 1;
-                    p.runtime_budget_w = w;
+                    unit.set_runtime_budgets(w);
                 }
-                Box::new(lsm2::Unit::new(p)) as _
+                Box::new(unit) as _
             })
             .map_err(|e| format!("{e:?}")),
         UnitKind::Atsp => atsp::Params::from_blob(bytes).map_err(|e| format!("{e:?}")).and_then(|mut p| {
