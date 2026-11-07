@@ -24,6 +24,11 @@
 //!   (`w[j] = sin(pi (j + 1) / (L + 1))`);
 //! * `y_c[k] = g[k] * x_c[k - L]` for every channel.
 //!
+//! With the optional high-pass (algorithm version 1, location 0) every
+//! channel is filtered after the input gain, ahead of the detector and the
+//! look-ahead delay: an order-`n` Butterworth high-pass, see
+//! [`highpass_sections`].
+//!
 //! The hold makes the window cover every delayed sample under it, so the
 //! output's sample peak never exceeds `C`.
 //!
@@ -160,6 +165,41 @@ const TAPS: usize = 12;
 const MAX_LOOKAHEAD_S: f64 = 0.001;
 const MAX_HOLD_S: f64 = 0.020;
 const MAX_FS: f64 = 192_000.0;
+/// Highest high-pass order the unit offers.
+pub const MAX_HIGHPASS_ORDER: usize = 10;
+const HIGHPASS_SECTIONS: usize = MAX_HIGHPASS_ORDER.div_ceil(2);
+
+/// The high-pass of `order` at `f0`: the bilinear transform, prewarped at
+/// the corner, of the analog Butterworth prototype. Pole pairs become
+/// second-order sections (`Q = 1 / (2 sin((2k + 1) pi / 2n))`), an odd
+/// order's real pole one first-order section. The unit designs them in
+/// single precision; at a corner of tens of hertz that rounding moves the
+/// poles enough to shift the filter's decaying tail by tenths of a dB, so
+/// the design is single precision here too (the filtering is not).
+fn highpass_sections(order: usize, f0: f64, fs: f64) -> ([SatSection; HIGHPASS_SECTIONS], usize) {
+    let mut s = [SatSection::default(); HIGHPASS_SECTIONS];
+    let w = 2.0 * core::f32::consts::PI * f0 as f32 / fs as f32;
+    let (sn, cs) = (libm::sinf(w), libm::cosf(w));
+    let pairs = order / 2;
+    for (k, sec) in s.iter_mut().enumerate().take(pairs) {
+        let q = 1.0 / (2.0 * libm::sinf((2 * k + 1) as f32 * core::f32::consts::PI / (2 * order) as f32));
+        let alpha = sn / (2.0 * q);
+        let a0 = 1.0 + alpha;
+        let b = (1.0 + cs) / (2.0 * a0);
+        *sec = SatSection {
+            b: [f64::from(b), f64::from(-2.0 * b), f64::from(b)],
+            a: [f64::from(-2.0 * cs / a0), f64::from((1.0 - alpha) / a0)],
+        };
+    }
+    let mut n = pairs;
+    if order % 2 == 1 {
+        let k = libm::tanf(w / 2.0);
+        let a0 = 1.0 + k;
+        s[n] = SatSection { b: [f64::from(1.0 / a0), f64::from(-1.0 / a0), 0.0], a: [f64::from((k - 1.0) / a0), 0.0] };
+        n += 1;
+    }
+    (s, n)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Params {
@@ -183,18 +223,28 @@ pub struct Params {
     pub deesser_hz: f64,
     pub deesser_db: f64,
     pub deesser_q: f64,
+    /// Butterworth high-pass order (0: off), corner and location (0: at
+    /// the input, ahead of the detector and the look-ahead delay).
+    pub highpass_order: u32,
+    pub highpass_hz: f64,
+    pub highpass_location: u32,
 }
 
 impl Params {
-    pub const WORDS: usize = 13;
-    /// Words without the de-esser (states without output saturation).
+    /// All words: the plain ten, the high-pass three, the de-esser three.
+    pub const WORDS: usize = 16;
+    /// Without the high-pass and the de-esser.
     pub const PLAIN_WORDS: usize = 10;
     pub const LEGACY_WORDS: usize = 8;
+    /// With the high-pass: the plain words plus order, corner and location.
+    pub const HIGHPASS_WORDS: usize = 13;
 
     /// The number of words this state needs.
     pub fn words(&self) -> usize {
         if self.saturation_mode != 0 {
             Self::WORDS
+        } else if self.highpass_order != 0 {
+            Self::HIGHPASS_WORDS
         } else if self.input_gain_db == 0.0 && self.output_gain_db == 0.0 {
             Self::LEGACY_WORDS
         } else {
@@ -214,6 +264,9 @@ impl Params {
             self.saturation_mix,
             self.input_gain_db,
             self.output_gain_db,
+            self.highpass_order as f64,
+            self.highpass_hz,
+            self.highpass_location as f64,
             self.deesser_hz,
             self.deesser_db,
             self.deesser_q,
@@ -221,7 +274,8 @@ impl Params {
     }
 
     pub fn from_words(w: &[f64]) -> Option<Params> {
-        if ![Self::LEGACY_WORDS, Self::PLAIN_WORDS, Self::WORDS].contains(&w.len()) || w.iter().any(|v| !v.is_finite())
+        if ![Self::LEGACY_WORDS, Self::PLAIN_WORDS, Self::HIGHPASS_WORDS, Self::WORDS].contains(&w.len())
+            || w.iter().any(|v| !v.is_finite())
         {
             return None;
         }
@@ -247,10 +301,23 @@ impl Params {
             saturation_mix: w[7],
             input_gain_db: w.get(8).copied().unwrap_or(0.0),
             output_gain_db: w.get(9).copied().unwrap_or(0.0),
-            deesser_hz: w.get(10).copied().unwrap_or(0.0),
-            deesser_db: w.get(11).copied().unwrap_or(0.0),
-            deesser_q: w.get(12).copied().unwrap_or(0.0),
+            highpass_order: w.get(10).copied().unwrap_or(0.0) as u32,
+            highpass_hz: w.get(11).copied().unwrap_or(0.0),
+            highpass_location: w.get(12).copied().unwrap_or(0.0) as u32,
+            deesser_hz: w.get(13).copied().unwrap_or(0.0),
+            deesser_db: w.get(14).copied().unwrap_or(0.0),
+            deesser_q: w.get(15).copied().unwrap_or(0.0),
         };
+        if w.len() >= Self::HIGHPASS_WORDS {
+            // The 13-word form always carries a high-pass; the full form
+            // may leave it off (order 0, corner 0).
+            let order = w[10];
+            let off = w.len() == Self::WORDS && order == 0.0 && w[11] == 0.0;
+            let whole = libm::trunc(order) == order && (1.0..=MAX_HIGHPASS_ORDER as f64).contains(&order);
+            if !(off || (whole && p.highpass_hz > 0.0 && p.highpass_hz < 20_000.0)) || w[12] != 0.0 {
+                return None;
+            }
+        }
         let ok = (-120.0..=40.0).contains(&p.input_gain_db)
             && (-120.0..=40.0).contains(&p.output_gain_db)
             && (0.0..=MAX_LOOKAHEAD_S).contains(&p.lookahead_s)
@@ -313,6 +380,10 @@ impl Biquad {
         y
     }
 }
+
+/// The high-pass sections share the biquad form.
+type SatSection = Biquad;
+type SatState = BiquadState;
 
 /// The de-esser cut and its inverse at the oversampled rate `fs`.
 fn deesser(f0: f64, strength_db: f64, q: f64, fs: f64) -> (Biquad, Biquad) {
@@ -586,6 +657,9 @@ pub struct Run {
     input_gain: f64,
     output_gain: f64,
     saturation: Option<Box<Saturation>>,
+    highpass: [SatSection; HIGHPASS_SECTIONS],
+    highpass_sections: usize,
+    highpass_state: [[SatState; HIGHPASS_SECTIONS]; MAX_CHANNELS],
 }
 
 impl Run {
@@ -601,6 +675,11 @@ impl Run {
         let sum: f64 = weight.iter().sum();
         weight.iter_mut().for_each(|w| *w /= sum);
         let coef = |tau: f64| 1.0 - libm::exp(-1.0 / (tau * fs));
+        let (highpass, highpass_sections) = if p.highpass_order > 0 {
+            highpass_sections(p.highpass_order as usize, p.highpass_hz, fs)
+        } else {
+            ([SatSection::default(); HIGHPASS_SECTIONS], 0)
+        };
         Run {
             channels,
             lookahead,
@@ -622,6 +701,9 @@ impl Run {
             input_gain: db(p.input_gain_db),
             output_gain: db(p.output_gain_db),
             saturation: (p.saturation_mode != 0).then(|| Box::new(Saturation::new(p, fs, channels))),
+            highpass,
+            highpass_sections,
+            highpass_state: [[SatState::default(); HIGHPASS_SECTIONS]; MAX_CHANNELS],
         }
     }
 
@@ -638,6 +720,7 @@ impl Run {
         if let Some(s) = &mut self.saturation {
             s.reset();
         }
+        self.highpass_state = [[SatState::default(); HIGHPASS_SECTIONS]; MAX_CHANNELS];
     }
 
     pub fn latency(&self) -> usize {
@@ -682,6 +765,9 @@ impl Run {
             for (c, b) in bufs[..ch].iter().enumerate() {
                 let mut x = if b[k].is_finite() { f64::from(b[k]) } else { 0.0 };
                 x *= self.input_gain;
+                for section in 0..self.highpass_sections {
+                    x = self.highpass[section].run(&mut self.highpass_state[c][section], x);
+                }
                 if let Some(s) = &mut self.saturation {
                     x = s.run(c, x);
                 }
@@ -740,6 +826,9 @@ mod tests {
             deesser_q: 0.0,
             input_gain_db: 0.0,
             output_gain_db: 0.0,
+            highpass_order: 0,
+            highpass_hz: 0.0,
+            highpass_location: 0,
         }
     }
 
@@ -750,6 +839,35 @@ mod tests {
         let n = refs[0].len();
         r.process(&mut refs, n);
         out
+    }
+
+    #[test]
+    fn highpass_is_a_butterworth_at_the_input() {
+        let mut p = params(0.0, false);
+        p.highpass_order = 3;
+        p.highpass_hz = 40.0;
+        let mut w = [0.0; Params::WORDS];
+        p.to_words(&mut w);
+        assert_eq!(Params::from_words(&w[..Params::HIGHPASS_WORDS]), Some(p));
+        assert_eq!(Params::from_words(&w), Some(p));
+        let mut bad = w;
+        bad[12] = 1.0; // output location is not carried
+        assert_eq!(Params::from_words(&bad), None);
+        bad = w;
+        bad[10] = 11.0;
+        assert_eq!(Params::from_words(&bad), None);
+        // below the threshold: the corner is 3 dB down, the pass band flat,
+        // an octave under the corner 18 dB down (third order)
+        for (f, want) in [(40.0, -3.0103), (1000.0, 0.0), (20.0, -18.1)] {
+            let n = 96_000;
+            let x: Vec<f32> = (0..n)
+                .map(|k| 0.01 * libm::sin(2.0 * core::f64::consts::PI * f * k as f64 / 48_000.0) as f32)
+                .collect();
+            let y = render(&p, core::slice::from_ref(&x));
+            let rms = |v: &[f32]| libm::sqrt(v.iter().map(|s| f64::from(*s).powi(2)).sum::<f64>() / v.len() as f64);
+            let g = 20.0 * libm::log10(rms(&y[0][n / 2..]) / rms(&x[n / 2..]));
+            assert!((g - want).abs() < 0.05, "{f} Hz: {g}");
+        }
     }
 
     #[test]
@@ -954,6 +1072,9 @@ mod tests {
                 deesser_q: 0.0,
             input_gain_db: 0.0,
             output_gain_db: 0.0,
+            highpass_order: 0,
+            highpass_hz: 0.0,
+            highpass_location: 0,
             };
             let mut s = seed | 1;
             let amp = db(level_db);

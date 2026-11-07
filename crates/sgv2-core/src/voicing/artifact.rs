@@ -264,6 +264,7 @@ impl Wire for Kind {
                 (match words {
                     super::cfreak::Params::LEGACY_WORDS => 7u32,
                     super::cfreak::Params::PLAIN_WORDS => 18u32,
+                    super::cfreak::Params::HIGHPASS_WORDS => 22u32,
                     _ => 27u32,
                 })
                 .put(o);
@@ -372,10 +373,11 @@ impl Wire for Kind {
                 }
                 Self::Xtc(Box::new(params))
             }
-            tag @ (7 | 18 | 27) => {
+            tag @ (7 | 18 | 22 | 27) => {
                 let words = match tag {
                     7 => super::cfreak::Params::LEGACY_WORDS,
                     18 => super::cfreak::Params::PLAIN_WORDS,
+                    22 => super::cfreak::Params::HIGHPASS_WORDS,
                     _ => super::cfreak::Params::WORDS,
                 };
                 let w: Vec<f64> = (0..words).map(|_| f64::get(r)).collect::<Result<_>>()?;

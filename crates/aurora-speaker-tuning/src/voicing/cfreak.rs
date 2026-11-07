@@ -19,12 +19,11 @@
 //! | 7 | look-ahead (ms) [0.5] | yes |
 //! | 8, 15 | output gain (dB) [0], its stage enabled [1] | yes, or unity when disabled |
 //! | 9 | parameter ramp time [0] | not needed: the state is fixed |
-//! | 12, 13, 21, 22 | high-pass enable [0], corner, order, placement | refused when enabled |
+//! | 12, 13, 21, 22 | high-pass enable [0], corner [50], order [2], location [0] | Butterworth at the input; location 0 only |
 //! | 14 | limiter enabled [1] | refused when off |
 //! | 16 | output saturation [0] | off, or the sine flavour |
 //! | 18-20 | de-esser frequency, strength (dB), Q | yes, with output saturation |
-//! | 21 | high-pass order | required with output saturation |
-//! | 23 | algorithm version [0] | 0 without saturation, 1 with the carried subset |
+//! | 23 | algorithm version [0] | 0 without saturation; 1 with the high-pass or the carried saturation subset |
 //!
 //! The group-scope sections the strips also save do not change the unit's
 //! output; the global values are used.
@@ -40,6 +39,8 @@ pub const CFRK: FourCc = FourCc::from_bytes(*b"cfrk");
 fn default(id: u32) -> Option<f64> {
     Some(match id {
         0..=3 | 6 | 8 | 9 | 10 | 12 | 16 | 17 | 22 | 23 => 0.0,
+        13 => 50.0,
+        21 => 2.0,
         4 => 3.0,
         5 => 10.0,
         7 => 0.5,
@@ -73,9 +74,28 @@ pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option
         return Err(bad("the limiter is switched off (not carried)".into()));
     }
     let saturation = get(16)? != 0.0;
-    if get(12)? != 0.0 {
-        return Err(bad("the high-pass is on (not carried)".into()));
-    }
+    let highpass = get(12)? != 0.0;
+    let (highpass_order, highpass_hz) = if highpass {
+        // observed only with algorithm version 1; version 0's high-pass is
+        // not established
+        if get(23)? != 1.0 {
+            return Err(bad(format!("high-pass with algorithm version {} (only 1 is carried)", get(23)?)));
+        }
+        if get(22)? != 0.0 {
+            return Err(bad(format!("high-pass location {} (only 0, at the input, is carried)", get(22)?)));
+        }
+        let order = get(21)?;
+        let hz = get(13)?;
+        if order.fract() != 0.0 || !(1.0..=sgv2_core::voicing::cfreak::MAX_HIGHPASS_ORDER as f64).contains(&order) {
+            return Err(bad(format!("high-pass order {order}")));
+        }
+        if !(hz > 0.0 && hz < fs / 2.0) {
+            return Err(bad(format!("high-pass corner {hz} Hz")));
+        }
+        (order as u32, hz)
+    } else {
+        (0, 0.0)
+    };
     let (saturation_mode, saturation_flavor, saturation_mix) = if saturation {
         let mode = get(1)?;
         if !(1.0..=7.0).contains(&mode) || mode != mode.trunc() || get(10)? != 2.0 || get(23)? != 1.0 {
@@ -98,11 +118,16 @@ pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option
         }
         (mode, 2.0, amount / 100.0)
     } else {
-        if get(23)? != 0.0 {
+        // version 1 without saturation: the high-pass (if on) is its only
+        // addition the strips use
+        if get(23)? != 0.0 && !(get(23)? == 1.0 && highpass) {
             return Err(bad(format!("algorithm version {} (only 0 without saturation is carried)", get(23)?)));
         }
         (0.0, 0.0, 0.0)
     };
+    if highpass && saturation {
+        return Err(bad("high-pass together with output saturation (not carried)".into()));
+    }
     let words = [
         get(7)? / 1000.0,
         get(5)? / 1000.0,
@@ -114,12 +139,18 @@ pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option
         saturation_mix,
         if get(11)? != 0.0 { get(2)? } else { 0.0 },
         if get(15)? != 0.0 { get(8)? } else { 0.0 },
+        // the high-pass words (set below) and the de-esser
+        0.0,
+        0.0,
+        0.0,
         if saturation { get(18)? } else { 0.0 },
         if saturation { get(19)? } else { 0.0 },
         if saturation { get(20)? } else { 0.0 },
     ];
     let words = if saturation { &words[..] } else { &words[..Params::PLAIN_WORDS] };
-    let p = Params::from_words(words).ok_or_else(|| bad(format!("values out of range: {words:?}")))?;
+    let mut p = Params::from_words(words).ok_or_else(|| bad(format!("values out of range: {words:?}")))?;
+    p.highpass_order = highpass_order;
+    p.highpass_hz = highpass_hz;
     let frames = |s: f64| s * fs;
     if (frames(p.lookahead_s) - frames(p.lookahead_s).round()).abs() > 1e-6
         || (frames(p.hold_s) - frames(p.hold_s).round()).abs() > 1e-6
@@ -184,6 +215,9 @@ mod tests {
                 deesser_q: 0.0,
                 input_gain_db: 0.0,
                 output_gain_db: 0.0,
+                highpass_order: 0,
+                highpass_hz: 0.0,
+                highpass_location: 0,
             }
         );
         let d = compile_of(&[]).unwrap().unwrap();
@@ -218,6 +252,14 @@ mod tests {
             assert!(compile_of(&refused).is_err(), "{refused:?}");
         }
         assert!(compile_of(&[(2, 3.0), (11, 0.0), (8, -2.0), (15, 0.0)]).unwrap().is_some());
+        let hp = compile_of(&[(12, 1.0), (23, 1.0), (13, 40.0), (21, 3.0)]).unwrap().unwrap();
+        assert_eq!((hp.highpass_order, hp.highpass_hz, hp.highpass_location), (3, 40.0, 0));
+        assert_eq!(compile_of(&[(12, 1.0), (23, 1.0)]).unwrap().unwrap().highpass_order, 2);
+        for refused in
+            [[(12, 1.0), (23, 1.0), (22, 1.0)], [(12, 1.0), (23, 1.0), (21, 11.0)], [(12, 1.0), (23, 1.0), (16, 1.0)]]
+        {
+            assert!(compile_of(&refused).is_err(), "{refused:?}");
+        }
         let saturated = compile_of(&[
             (1, 3.0),
             (10, 2.0),
