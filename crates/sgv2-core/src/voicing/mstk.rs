@@ -25,7 +25,8 @@ const MAX_DETECTOR_FILTERS: usize = 10;
 const MAX_DETECTOR_WINDOW: usize = 1921;
 const QUADRATURE_STAGES: usize = 4;
 const MAX_GAIN_SRC_TAPS: usize = 225;
-const INPUT_BOUND: f32 = 16.0;
+/// The pre-stage bound (+120 dBFS): garbage only, never a program level.
+const INPUT_BOUND: f32 = crate::prestage::INPUT_BOUND;
 const CURVE_POINTS: usize = 11;
 
 /// Processing selected for one analysis band.
