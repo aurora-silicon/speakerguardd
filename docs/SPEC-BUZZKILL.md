@@ -2,7 +2,7 @@
 
 BuzzKill is a linked multi-line suppressor. It is not a bank of static equalizers. The ten saved Kill points shape a permitted line level; the moving sections are created from the analysed program.
 
-At 48 kHz the analyser reduces the linked, already-suppressed program to 12 kHz, retains 512 samples, and makes one decision every 128 host frames. It evaluates bins from 50 Hz through the selected maximum (2.5, 3, 4, 6, or 20 kHz). For each bin whose transformed amplitude `A[k]` exceeds the shaped threshold `T[k]`, it emits a candidate with multiplier
+At 48 kHz the analyser low-pass resamples the linked, already-suppressed program to 12 kHz, retains 512 samples, and makes one decision every 128 host frames. The 512-point transform always keeps its fixed normalization while the initial record fills; that fixed normalization produces the neighbouring onset candidates. It evaluates bins from 50 Hz through the selected maximum (2.5, 3, 4, 6, or 20 kHz). For each bin whose transformed amplitude `A[k]` exceeds the shaped threshold `T[k]`, it emits a candidate with multiplier
 
 ```text
 m[k] = clamp(T[k] / A[k], 1e-6, 1).

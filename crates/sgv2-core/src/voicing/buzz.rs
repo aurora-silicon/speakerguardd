@@ -16,6 +16,7 @@ const TRACKS: usize = 50;
 const HOST_HOP: usize = 128;
 const ANALYSIS_RATE: f64 = 12_000.0;
 const DECIMATION: usize = 4;
+const FIR: usize = 33;
 const MIN_HZ: f64 = 50.0;
 const MAX_HZ: [f64; 5] = [2500.0, 3000.0, 4000.0, 6000.0, 20_000.0];
 const MATCH_RELATIVE: f64 = 0.035_264_92;
@@ -157,8 +158,10 @@ pub struct Run {
     history_at: usize,
     history_len: usize,
     hop: usize,
-    decimation_sum: f64,
     decimation_at: usize,
+    fir: [f64; FIR],
+    fir_state: [f64; FIR],
+    fir_at: usize,
     threshold_db: f64,
     threshold_shape: [Section; BANDS],
     tracks: Vec<Track>,
@@ -171,6 +174,19 @@ impl Run {
         let channels = channels.clamp(1, MAX_CHANNELS);
         let lookahead = libm::round(p.lookahead_s * fs).clamp(1.0, 2880.0) as usize;
         let release = 1.0 - libm::exp(-(HOST_HOP as f64) / (0.050 * fs));
+        let mut fir = core::array::from_fn(|n| {
+            let m = n as f64 - (FIR - 1) as f64 * 0.5;
+            let sinc = if m == 0.0 {
+                0.225
+            } else {
+                libm::sin(2.0 * core::f64::consts::PI * 0.1125 * m) / (core::f64::consts::PI * m)
+            };
+            sinc * (0.54 - 0.46 * libm::cos(2.0 * core::f64::consts::PI * n as f64 / (FIR - 1) as f64))
+        });
+        let fir_sum: f64 = fir.iter().sum();
+        for coefficient in &mut fir {
+            *coefficient /= fir_sum;
+        }
         Run {
             channels,
             fs,
@@ -182,8 +198,10 @@ impl Run {
             history_at: 0,
             history_len: 0,
             hop: HOST_HOP,
-            decimation_sum: 0.0,
             decimation_at: 0,
+            fir,
+            fir_state: [0.0; FIR],
+            fir_at: 0,
             threshold_db: p.threshold_db,
             threshold_shape: core::array::from_fn(|i| {
                 let b = p.bands[i];
@@ -205,8 +223,9 @@ impl Run {
         self.history_at = 0;
         self.history_len = 0;
         self.hop = HOST_HOP;
-        self.decimation_sum = 0.0;
         self.decimation_at = 0;
+        self.fir_state.fill(0.0);
+        self.fir_at = 0;
         self.tracks.fill(Track::default());
     }
     pub fn latency(&self) -> usize {
@@ -234,7 +253,7 @@ impl Run {
             im -= x * s;
             (s, c) = (s * cc + c * ss, c * cc - s * ss);
         }
-        2.0 * libm::sqrt(re * re + im * im) / self.history_len.max(1) as f64
+        2.0 * libm::sqrt(re * re + im * im) / FFT as f64
     }
 
     fn redesign(&mut self, index: usize) {
@@ -335,13 +354,17 @@ impl Run {
                 buffer[frame] = delayed as f32;
             }
             self.delay_at = (self.delay_at + 1) % self.lookahead;
-            self.decimation_sum += linked;
+            self.fir_state[self.fir_at] = linked;
+            self.fir_at = (self.fir_at + 1) % FIR;
             self.decimation_at += 1;
             if self.decimation_at == DECIMATION {
-                self.history[self.history_at] = (self.decimation_sum / DECIMATION as f64) as f32;
+                let mut filtered = 0.0;
+                for (tap, coefficient) in self.fir.iter().enumerate() {
+                    filtered += coefficient * self.fir_state[(self.fir_at + FIR - 1 - tap) % FIR];
+                }
+                self.history[self.history_at] = filtered as f32;
                 self.history_at = (self.history_at + 1) % FFT;
                 self.history_len = (self.history_len + 1).min(FFT);
-                self.decimation_sum = 0.0;
                 self.decimation_at = 0;
             }
             self.hop -= 1;
