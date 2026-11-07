@@ -168,6 +168,7 @@ pub struct GraphParam {
     pub default: f64,
     /// Declared `out` (published by the graph); `in` or nothing otherwise.
     pub output: bool,
+    pub constant: bool,
 }
 
 /// `(BOX ID [SCOPE] [ELEMENT])`, the target of a parameter or property link.
@@ -181,6 +182,7 @@ pub struct Target {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Link {
     pub name: String,
+    pub flag: Option<String>,
     pub target: Target,
 }
 
@@ -453,13 +455,14 @@ pub fn parse(text: &str, subst: &BTreeMap<String, String>, ctx: &str) -> Result<
                 let (name, default, output) = match a {
                     [n, d] => (n, d, false),
                     [n, d, Expr::Word(o)] if o == "out" => (n, d, true),
-                    [n, d, Expr::Word(o)] if o == "in" => (n, d, false),
+                    [n, d, Expr::Word(o)] if o == "in" || o == "const" => (n, d, false),
                     _ => return Err(bad("param")),
                 };
                 g.params.push(GraphParam {
                     name: name.word().ok_or_else(|| bad("param name"))?.to_string(),
                     default: default.number().ok_or_else(|| bad("param default"))?,
                     output,
+                    constant: matches!(a.get(2), Some(Expr::Word(w)) if w == "const"),
                 });
             }
             "property" => {
@@ -467,8 +470,12 @@ pub fn parse(text: &str, subst: &BTreeMap<String, String>, ctx: &str) -> Result<
                 g.properties.push((n.clone(), dir.clone()));
             }
             "wireGraphParam" | "wireGraphProperty" => {
-                let [Expr::Word(n), t] = a else { return Err(bad(kw)) };
-                let link = Link { name: n.clone(), target: target(t).ok_or_else(|| bad(kw))? };
+                let (n, t, flag) = match a {
+                    [Expr::Word(n), t] => (n, t, None),
+                    [Expr::Word(n), t, Expr::Word(f)] if f == "true" || f == "false" => (n, t, Some(f.clone())),
+                    _ => return Err(bad(kw)),
+                };
+                let link = Link { name: n.clone(), target: target(t).ok_or_else(|| bad(kw))?, flag };
                 if kw == "wireGraphParam" {
                     g.param_links.push(link)
                 } else {

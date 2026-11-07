@@ -38,6 +38,7 @@ pub mod dspg;
 pub mod error;
 pub mod fourcc;
 pub mod lattice;
+pub mod lsid;
 pub mod machine;
 pub mod manifest;
 pub mod names;

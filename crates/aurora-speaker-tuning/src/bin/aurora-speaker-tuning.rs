@@ -317,8 +317,8 @@ fn decode_blob(p: &std::path::Path) -> String {
             .map(|x| trim(format!("{x:#?}"), x.channels))
             .map_err(|e| format!("{e:?}"))
     } else if unit == sgv2_core::UnitKind::Lsm2 as u32 {
-        sgv2_core::lsm2::Params::from_blob(&bytes)
-            .map(|x| trim(format!("{x:#?}"), x.channels))
+        sgv2_core::lsm2::companion::decode_blob(&bytes)
+            .map(|(x, companion)| format!("{}\ncompanion: {companion:#?}", trim(format!("{x:#?}"), x.channels)))
             .map_err(|e| format!("{e:?}"))
     } else {
         sgv2_core::atsp::Params::from_blob(&bytes).map(|x| format!("{x:#?}")).map_err(|e| format!("{e:?}"))

@@ -132,7 +132,7 @@ pub fn blob_full_scales(blob: &[u8]) -> Result<Vec<u32>, String> {
         let p = sgv2_core::spp3::Params::from_blob(blob).map_err(|e| format!("spp3: {e:?}"))?;
         p.ch[..n].iter().map(|c| mv(c.ag)).collect::<Result<_, _>>()?
     } else if h.unit == UnitKind::Lsm2 as u32 {
-        let p = sgv2_core::lsm2::Params::from_blob(blob).map_err(|e| format!("lsm2: {e:?}"))?;
+        let (p, _) = sgv2_core::lsm2::companion::decode_blob(blob).map_err(|e| format!("lsm2: {e:?}"))?;
         p.ch[..n].iter().map(|c| mv(c.volts_full_scale)).collect::<Result<_, _>>()?
     } else {
         vec![h.full_scale_mv; n]
