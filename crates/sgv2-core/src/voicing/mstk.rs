@@ -1223,11 +1223,8 @@ impl Run {
             }
             let mut gain = [0.0; BANDS];
             for (b, mut p) in detector.into_iter().enumerate() {
-                if self.overshoot_compensation && self.algorithm < 3 {
-                    p = p.max(overshoot[b]);
-                } else if self.overshoot_compensation && self.algorithm == 3 {
-                    // Algorithm 3 stays on its inherited real-waveform
-                    // detector; its exact estimator belongs to t-5368.
+                if self.overshoot_compensation {
+                    // The compensated components replace the band's own.
                     p = overshoot[b];
                 }
                 let update = self.detector_phase[b] == 0;
