@@ -57,7 +57,13 @@ def main():
             boxes.append({"name": box["name"], "subtype": box["kind"],
                           "status": "unimplemented" if unknown else "unexecuted",
                           "evidence": "static declaration; no compiler/render outcome"})
+        board, model = inventory.KNOWN_BOARDS.get(aid, (None, None))
+        kinds = {box["subtype"] for box in boxes}
         unexecuted.append({"aid": aid, "only_in_27_2": aid in newer_only,
+                           "board": board, "model": model,
+                           "declared_units": sorted(kinds & {"spp3", "atsp", "lsm2", "lsid"}),
+                           "declared_presence": {name: kind in kinds for name, kind in
+                               [("LowFlow", "flow"), ("Norm", "ldnm"), ("VirtBass", "vben"), ("XTC", "axtc")]},
                            "boxes": boxes, "saved_control_metadata": controls.get(aid),
                            "execution_status": "not_run"})
     rollup = defaultdict(set, {law: set(aids) for law, aids in data["per_law"].items()})
@@ -90,13 +96,15 @@ def main():
              "Unexecuted reference AIDs: " + ", ".join(map(str, missing_reference)) + ". " +
              "Newer-only AIDs awaiting execution: " + ", ".join(map(str, missing_newer)) + ".", "",
              "The unexecuted rows below are structural observations, not compiler refusals or parity certificates.", "",
-             "| AID | 25G83 parity reference | 27.2 presence | Only in 27.2 |",
-             "|---|---|---|---|"]
+             "| AID | Known representative board / model | 25G83 parity reference | 27.2 presence | Only in 27.2 |",
+             "|---|---|---|---|---|"]
     hosts = {r["aid"]: r for r in measured if r["source"] == "host"}
     newer_members = set(membership.get("27.2-26B8125", [])) | set(membership.get("27.2-26B123", []))
     for aid in sorted(reference | newer_only):
         state = hosts[aid]["category"] if aid in hosts else "not run" if aid in reference else "absent"
-        lines.append(f'| {aid} | {state} | {"present" if aid in newer_members else "absent"} | {"yes" if aid in newer_only else "no"} |')
+        board, model = inventory.KNOWN_BOARDS.get(aid, (None, None))
+        identity = (board + " / " + model) if board and model else "unknown"
+        lines.append(f'| {aid} | {identity} | {state} | {"present" if aid in newer_members else "absent"} | {"yes" if aid in newer_only else "no"} |')
     lines += ["", "## Unexecuted structural inventory", "",
               "| AID | Box | Type | Law/coverage status |", "|---|---|---|---|"]
     for row in unexecuted:
