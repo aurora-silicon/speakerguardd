@@ -93,13 +93,13 @@ fn peak_curve_fit(m: [f64; 3]) -> [f64; 3] {
 fn peak_analog_magnitude(x: f32, gain: f32, q: f32) -> f64 {
     // Evaluate (s^2 + gain*s/q + 1) / (s^2 + s/q + 1)
     // at s=j*x in the same Float32 complex arithmetic used by the box.
-    let real = (-x).mul_add(x, 1.0);
+    let real = libm::fmaf(-x, x, 1.0);
     let num_imag = x * (gain / q);
     let den_imag = x * (1.0 / q);
-    let divisor = den_imag.mul_add(den_imag, real * real);
+    let divisor = libm::fmaf(den_imag, den_imag, real * real);
     let inverse = 1.0 / divisor;
-    let out_real = num_imag.mul_add(den_imag, real * real) * inverse;
-    let out_imag = real.mul_add(den_imag, -(num_imag * real)) * inverse;
+    let out_real = libm::fmaf(num_imag, den_imag, real * real) * inverse;
+    let out_imag = libm::fmaf(real, den_imag, -(num_imag * real)) * inverse;
     // Keep the two Float32 products separate; the Accelerate magnitude
     // reduction rounds them before the sum rather than contracting an FMA.
     let real_power = (out_real as f64 * out_real as f64) as f32;
