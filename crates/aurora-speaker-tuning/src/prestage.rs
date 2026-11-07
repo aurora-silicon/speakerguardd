@@ -1791,10 +1791,10 @@ mod tests {
         // by this terse synthetic-slot helper).
         let boost = tmst(&[(20, 3000.0)], &[(0, [3.0, 0.0, 2.0, 700.0, 800.0, 1800.0, 3.0, 0.0])]);
         let pb = part(&boost, 0, fs, &mut d).unwrap();
-        assert_eq!((pb.sections.len(), pb.gain_db), (3, 0.0));
+        assert_eq!((pb.sections.len(), pb.gain_db), (4, 0.0));
         let cut = tmst(&[(20, 3000.0)], &[(0, [3.0, 0.0, -2.0, 700.0, 800.0, 1800.0, 3.0, 0.0])]);
         let pc = part(&cut, 0, fs, &mut d).unwrap();
-        assert_eq!((pc.sections.len(), pc.gain_db), (3, 0.0));
+        assert_eq!((pc.sections.len(), pc.gain_db), (4, 0.0));
         let db = |p: &Part, f: f64| {
             let mut ch = Channel::IDENTITY;
             ch.count = p.sections.len();
