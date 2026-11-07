@@ -731,6 +731,8 @@ pub struct Run {
     overshoot_compensation: bool,
     channels: usize,
     env: [f64; BANDS],
+    gain_state: [f64; BANDS],
+    gain_rest: [f64; BANDS],
     detector_window: [usize; BANDS],
     detector_factor: [usize; BANDS],
     detector_phase: [usize; BANDS],
@@ -755,6 +757,7 @@ impl Run {
         let valid = p.valid(fs);
         let q = if valid { p } else { &Params::default() };
         let curve_top_db = if q.algorithm >= 2 { 20.0 } else { 0.0 };
+        let gain_rest = q.band.map(|b| spline_gain(&curve_points(b, curve_top_db), -100.0, curve_top_db));
         let edges = [0.0, q.crossover_hz[0], q.crossover_hz[1], q.crossover_hz[2], 20_000.0];
         let reference_edges = [0.0, 100.0, 1000.0, 10_000.0, 20_000.0];
         let mut detector_bandwidth = [1.0; BANDS];
@@ -799,6 +802,8 @@ impl Run {
             overshoot_compensation: q.overshoot_compensation,
             channels: channels.min(MAX_CHANNELS),
             env: [0.0; BANDS],
+            gain_state: gain_rest,
+            gain_rest,
             detector_window,
             detector_factor,
             detector_phase: [0; BANDS],
@@ -820,6 +825,7 @@ impl Run {
 
     pub fn reset(&mut self) {
         self.env = [0.0; BANDS];
+        self.gain_state = self.gain_rest;
         self.detector_max = [SlidingMax::EMPTY; BANDS];
         self.detector_phase = [0; BANDS];
         for envelope in &mut self.audio_quadrature {
@@ -1031,8 +1037,23 @@ impl Run {
                 };
                 let input = if update {
                     let held = self.window_max(b, p);
-                    self.env[b] = if self.release_on { held.max(self.env[b] * self.release[b]) } else { held };
-                    Some(self.gain(b))
+                    if self.hop_peak {
+                        // Quality 0/1, algorithms 0-2: the release recovers the
+                        // linear band gain, not the detector level.
+                        self.env[b] = held;
+                        let target = self.gain(b);
+                        let recovery = if self.release_on { self.release[b] } else { 0.0 };
+                        let gain = if target <= self.gain_state[b] {
+                            target
+                        } else {
+                            target + (self.gain_state[b] - target) * recovery
+                        };
+                        self.gain_state[b] = gain;
+                        Some(gain)
+                    } else {
+                        self.env[b] = if self.release_on { held.max(self.env[b] * self.release[b]) } else { held };
+                        Some(self.gain(b))
+                    }
                 } else {
                     None
                 };
