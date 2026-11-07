@@ -2,13 +2,13 @@
 
 BuzzKill is a linked multi-line suppressor. It is not a bank of static equalizers. The ten saved Kill points shape a permitted line level; the moving sections are created from the analysed program.
 
-At 48 kHz the analyser low-pass resamples the linked, already-suppressed program to 12 kHz, retains 512 samples, and makes one decision every 128 host frames. Before the transform it applies the symmetric window
+At 48 kHz the analyser low-pass resamples the linked, already-suppressed program to 12 kHz with a 97-tap, 4:1 low-pass stage. The resampler has a pass-band gain of two; this is part of the detector's amplitude domain and must not be normalized away. It retains 512 analysis samples and makes one decision every 128 host frames. Before the transform it applies the symmetric window
 
 ```text
 w[n] = (1 - cos(2*pi*n/511)) / (2*511),  n = 0..511.
 ```
 
-The transform keeps that fixed normalization while the initial record fills; the partial window produces the neighbouring onset candidates. It evaluates bins from 50 Hz through the selected maximum (2.5, 3, 4, 6, or 20 kHz). For each bin whose transformed amplitude `A[k]` exceeds the shaped threshold `T[k]`, it emits a candidate with multiplier
+The real-input transform uses its doubled positive-frequency convention. With the direct complex sum `X[k]` used below, the line amplitude is therefore `A[k] = sqrt(2) * abs(X[k])` (the doubled transform magnitude divided by `sqrt(2)` for RMS). The transform keeps the fixed window normalization while the initial record fills; the partial window produces the neighbouring onset candidates. It evaluates bins from 50 Hz through the selected maximum (2.5, 3, 4, 6, or 20 kHz). For each bin whose transformed amplitude `A[k]` exceeds the shaped threshold `T[k]`, it emits a candidate with multiplier
 
 ```text
 m[k] = clamp(T[k] / A[k], 1e-6, 1).
