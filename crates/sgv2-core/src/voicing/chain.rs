@@ -567,8 +567,10 @@ impl Run {
                 if p.dynamic_count != 0 {
                     p.flags |= FLAG_DYNAMIC_FILTERS;
                 }
+                let mut stage = PreStage::with_rate(p, fs);
+                stage.use_one_channel_platform_path();
                 Run::Filters {
-                    stage: PreStage::with_rate(p, fs),
+                    stage,
                     base: tone.channels.clone(),
                     automation: tone.automation.clone(),
                     dynamic_base: tone.dynamic.clone(),

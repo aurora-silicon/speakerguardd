@@ -1395,6 +1395,9 @@ pub struct PreStage {
     /// allocated once here, never in the real-time path.
     boxes: [Option<alloc::boxed::Box<mstk::Run>>; MAX_BOXES],
     dynamic: [Option<DynamicRun>; MAX_DYNAMIC_FILTERS],
+    /// A one-channel ToneMeister box's static sections as the platform
+    /// filter runs a one-channel setup (see [`PreStage::use_one_channel_platform_path`]).
+    platform: Option<alloc::boxed::Box<[ControlFilter; MAX_SECTIONS]>>,
 }
 
 impl PreStage {
@@ -1414,7 +1417,20 @@ impl PreStage {
         let dynamic = core::array::from_fn(|k| {
             (k < params.dynamic_count.min(MAX_DYNAMIC_FILTERS)).then(|| DynamicRun::new(&params.dynamic[k].params, fs))
         });
-        PreStage { params, state: [[[0.0; 2]; MAX_SECTIONS]; MAX_CHANNELS], dynamics, boxes, dynamic }
+        PreStage { params, state: [[[0.0; 2]; MAX_SECTIONS]; MAX_CHANNELS], dynamics, boxes, dynamic, platform: None }
+    }
+
+    /// A one-channel ToneMeister box hands its static cascade to the
+    /// platform's single-precision multichannel biquad as a one-channel
+    /// setup, which evaluates grouped frames (see [`ControlFilter`]) rather
+    /// than stepping each frame (black-box: single-slot and whole-box renders
+    /// of the installed unit with one channel match that model bit for bit;
+    /// the same slots with two channels match the per-frame fused step).
+    /// Allocates; call it while building the box. Other widths are unchanged.
+    pub(crate) fn use_one_channel_platform_path(&mut self) {
+        if self.params.channels == 1 && self.platform.is_none() {
+            self.platform = Some(alloc::boxed::Box::new([ControlFilter::zeroed(&Section::IDENTITY); MAX_SECTIONS]));
+        }
     }
 
     pub fn params(&self) -> &Params {
@@ -1456,6 +1472,9 @@ impl PreStage {
         }
         for d in self.dynamic.iter_mut().flatten() {
             d.reset();
+        }
+        for f in self.platform.iter_mut().flat_map(|p| p.iter_mut()) {
+            f.reset_zero();
         }
     }
 
@@ -1502,6 +1521,31 @@ impl PreStage {
         };
         let to = to.min(ch.count).min(MAX_SECTIONS);
         let from = from.min(to);
+        if let Some(filters) = self.platform.as_deref_mut().filter(|_| c == 0) {
+            // one-channel setup: each section runs over the whole call in turn
+            for y in buf.iter_mut() {
+                *y = if y.is_finite() { y.clamp(-INPUT_BOUND, INPUT_BOUND) } else { 0.0 };
+            }
+            for (s, f) in ch.sections[from..to].iter().zip(filters[from..to].iter_mut()) {
+                f.set(s);
+                f.run(buf);
+            }
+            let g = gain as f32;
+            let mut poisoned = false;
+            for y in buf.iter_mut() {
+                *y *= g;
+                if !y.is_finite() {
+                    *y = 0.0;
+                    poisoned = true;
+                }
+            }
+            if poisoned {
+                for f in &mut filters[from..to] {
+                    f.reset_zero();
+                }
+            }
+            return;
+        }
         for y in buf.iter_mut() {
             let mut v = if y.is_finite() { y.clamp(-INPUT_BOUND, INPUT_BOUND) } else { 0.0 };
             for (s, st) in ch.sections[from..to].iter().zip(z[from..to].iter_mut()) {
@@ -1673,6 +1717,13 @@ impl PreStage {
     /// in [`Self::run_sections_float`]. The protection pre-stage
     /// deliberately keeps the f64 path above.
     pub(crate) fn process_float(&mut self, c: usize, input: &[f32], output: &mut [f32]) {
+        if c == 0 && self.platform.is_some() && self.params.channels == 1 {
+            let n = input.len().min(output.len());
+            output[..n].copy_from_slice(&input[..n]);
+            let (count, gain) = (self.params.channel[0].count, self.params.channel[0].gain);
+            self.run_sections_float(0, 0, count, gain, &mut output[..n]);
+            return;
+        }
         let (Some(ch), Some(z)) = (self.params.channel.get(c), self.state.get_mut(c)) else {
             output.fill(0.0);
             return;
@@ -1794,6 +1845,46 @@ mod tests {
             z2 = libm::fmaf(-a2, o, b2 * v);
             assert_eq!(o.to_bits(), out.to_bits());
         }
+    }
+
+    #[test]
+    fn one_channel_tone_cascade_runs_the_platform_group_path() {
+        // Synthetic sections, not any Mac's: a 100 Hz peak's poles and a
+        // high-pass, so the Float32 rounding of the two paths differs.
+        let peak = Section { b0: 1.000_01, b1: -1.998_7, b2: 0.998_72, a1: -1.998_7, a2: 0.998_73 };
+        let hp = hp2(80.0, 48_000.0);
+        let mut p = Params::identity(1);
+        p.flags = FLAG_FROM_TUNING;
+        p.channel[0].count = 2;
+        p.channel[0].sections[..2].copy_from_slice(&[peak, hp]);
+        let x: std::vec::Vec<f32> = (0..1024).map(|i| (0.37 * i as f32).sin() * 0.5).collect();
+        let words = |s: &Section| [s.b0, s.b1, s.b2, s.a1, s.a2].map(|v| v as f32 as f64);
+
+        let mut grouped = PreStage::new(p.clone());
+        grouped.use_one_channel_platform_path();
+        let mut model = crate::vdsp::Cascade::new(&[words(&peak), words(&hp)], false);
+        let mut fused = PreStage::new(p);
+        let (mut y, mut z) = (std::vec![0.0f32; 512], std::vec![0.0f32; 512]);
+        let mut differs = false;
+        for block in x.chunks(512) {
+            grouped.process_float(0, block, &mut y);
+            let mut expected = block.to_vec();
+            model.run(&mut expected);
+            assert_eq!(
+                y.iter().map(|v| v.to_bits()).collect::<std::vec::Vec<_>>(),
+                expected.iter().map(|v| v.to_bits()).collect::<std::vec::Vec<_>>()
+            );
+            fused.process_float(0, block, &mut z);
+            differs |= y != z;
+        }
+        assert!(differs);
+        // a reset clears the grouped state too
+        grouped.reset();
+        let mut again = std::vec![0.0f32; 512];
+        grouped.process_float(0, &x[..512], &mut again);
+        let mut expected = x[..512].to_vec();
+        crate::vdsp::Cascade::new(&[words(&peak), words(&hp)], false).run(&mut expected);
+        assert_eq!(again, expected);
     }
 
     fn dyn_params() -> Params {
