@@ -32,6 +32,12 @@ fn db(v: f64) -> f64 {
     10f64.powf(v / 20.0)
 }
 
+/// The public low-end blend control tops out at 0 dB. Saved readback can be
+/// larger, but the rendered blend saturates at the control maximum.
+fn blend_gain(saved_db: f64) -> f64 {
+    db(saved_db.min(0.0))
+}
+
 /// A real order parameter becomes the Linkwitz-Riley order that carries it:
 /// the nearest integer (halves up), raised to even.
 fn lr_order(v: f64) -> Option<usize> {
@@ -69,8 +75,8 @@ pub fn compile(stage: &Stage, fs: f64, _diags: &mut Diagnostics) -> Result<Optio
     if opt(15) != 0.0 {
         return Ok(None);
     }
-    if stage.channels != Some(2) {
-        return Err(bad(format!("{ctx}: mono VirtBass width law is not carried")));
+    if !matches!(stage.channels, Some(1 | 2)) {
+        return Err(bad(format!("{ctx}: only mono and stereo VirtBass widths are carried")));
     }
     let monitor = req(1)?;
     if monitor != 1.0 {
@@ -117,7 +123,7 @@ pub fn compile(stage: &Stage, fs: f64, _diags: &mut Diagnostics) -> Result<Optio
         upper_order: order(5)?,
         lower_order: order(6)?,
         harmonic_gain: db(req(7)?),
-        blend_gain: db(req(8)?),
+        blend_gain: blend_gain(req(8)?),
         input_gain: db(req(13)?),
         output_gain: db(req(14)?),
         device,
@@ -136,7 +142,14 @@ pub fn compile(stage: &Stage, fs: f64, _diags: &mut Diagnostics) -> Result<Optio
 
 #[cfg(test)]
 mod tests {
-    use super::lr_order;
+    use super::{blend_gain, lr_order};
+
+    #[test]
+    fn blend_stops_at_the_public_zero_db_maximum() {
+        assert_eq!(blend_gain(2.5), 1.0);
+        assert_eq!(blend_gain(0.0), 1.0);
+        assert!((blend_gain(-6.0) - 10f64.powf(-6.0 / 20.0)).abs() < 1e-12);
+    }
 
     #[test]
     fn orders_round_then_go_even() {

@@ -68,6 +68,38 @@
 //! sample rate). Gliding in dB instead bends every large step's onset by
 //! up to tenths of a dB.
 //!
+//! Algorithm 1 (the earliest version a strip can select) keeps the same
+//! detector, meters and gain law with these differences:
+//! - the detector smoothing time is the saved transient response, not the
+//!   fixed 30 ms;
+//! - a reset starts every meter silent: the median ring, the long reading
+//!   and its delay line, the fast level and the held candidate all start at
+//!   the histogram floor, so the first call is read from the program alone
+//!   (the long histogram's relative gate starts from the same -70 dB seed as
+//!   the other algorithms, not from the expected loudness: a gate seeded at
+//!   an expected loudness of -14 lifts the second pause's long reading
+//!   above the unit's); the smoothed detector power starts from a small fixed floor
+//!   (`V1_DETECTOR_SEED_DB`) that fades with the detector's own time
+//!   constant; there is no deferred second clear of the detector state;
+//! - the applied gain starts its glide from `V1_START_GAIN_DB`;
+//! - the fast level is a two-sided hysteresis on every 64-frame level, less
+//!   a 4 dB store: it rises only when the stored level clears it by 3 dB and
+//!   falls to 8 dB above the stored level once that edge is under it;
+//! - the median store is 1.691 dB and the median moves straight to its
+//!   five-dB release edge; the competitor of the long path has no store and
+//!   there is no low-level coordinate move;
+//! - the candidate and the gain's target are read on every 64-frame step,
+//!   so the gain moves within a call instead of at its boundary;
+//! - the long path's preconditioner competes against the fast level (the
+//!   hysteresis output of this step), not against the 512-frame level: it
+//!   follows the long reading while the fast level is above it and, once
+//!   the reading overtakes the fast level, holds the smaller of the reading
+//!   and the fast level it overtook. So in a pause the long path keeps the
+//!   reading that lands while the fast level is still releasing, and a
+//!   following burst whose fast level stays under a newer reading keeps
+//!   that hold;
+//! - an invalid long window still ages the histogram.
+//!
 //! No tuning value lives here; `aurora-speaker-tuning`'s `voicing::norm`
 //! compiles [`Params`] from the Mac's saved state.
 
@@ -117,6 +149,11 @@ pub struct Params {
     /// Dead band of the fast path's release, dB: the held fast level only
     /// releases once the call's level is this far under it.
     pub fast_deadband_db: f64,
+    /// Algorithm 1: see the module documentation.
+    pub algorithm1: bool,
+    /// Detector power smoothing time, s (algorithm 1: the saved transient
+    /// response; algorithms 2 and 3: `EMA_S`).
+    pub detector_ema_s: f64,
 }
 
 impl Default for Params {
@@ -129,12 +166,17 @@ impl Default for Params {
             sections: 0,
             sos: [[0.0; 5]; MAX_SECTIONS],
             fast_deadband_db: 7.0,
+            algorithm1: false,
+            detector_ema_s: EMA_S,
         }
     }
 }
 
 impl Params {
-    pub const WORDS: usize = NODES + 5 + 5 * MAX_SECTIONS;
+    /// The algorithm 2/3 payload.
+    pub const LEGACY_WORDS: usize = NODES + 5 + 5 * MAX_SECTIONS;
+    /// The algorithm-1 payload adds its selector and detector time.
+    pub const WORDS: usize = Self::LEGACY_WORDS + 2;
 
     pub fn to_words(&self, out: &mut [f64]) {
         out[..NODES].copy_from_slice(&self.table);
@@ -146,10 +188,14 @@ impl Params {
             out[NODES + 4 + 5 * i..NODES + 9 + 5 * i].copy_from_slice(s);
         }
         out[NODES + 4 + 5 * MAX_SECTIONS] = self.fast_deadband_db;
+        if out.len() >= Self::WORDS {
+            out[Self::LEGACY_WORDS] = if self.algorithm1 { 1.0 } else { 0.0 };
+            out[Self::LEGACY_WORDS + 1] = self.detector_ema_s;
+        }
     }
 
     pub fn from_words(w: &[f64]) -> Option<Params> {
-        if w.len() != Self::WORDS || w.iter().any(|v| !v.is_finite()) {
+        if ![Self::LEGACY_WORDS, Self::WORDS].contains(&w.len()) || w.iter().any(|v| !v.is_finite()) {
             return None;
         }
         let mut p = Params::default();
@@ -170,6 +216,14 @@ impl Params {
             s.copy_from_slice(&w[NODES + 4 + 5 * i..NODES + 9 + 5 * i]);
         }
         p.fast_deadband_db = w[NODES + 4 + 5 * MAX_SECTIONS];
+        if w.len() == Self::WORDS {
+            let selector = w[Self::LEGACY_WORDS];
+            if selector != 0.0 && selector != 1.0 {
+                return None;
+            }
+            p.algorithm1 = selector == 1.0;
+            p.detector_ema_s = w[Self::LEGACY_WORDS + 1];
+        }
         p.valid().then_some(p)
     }
 
@@ -178,13 +232,14 @@ impl Params {
         let expected_ok = (-100.0..=0.0).contains(&self.expected_db);
         let timeout_ok = (0.0..=3600.0).contains(&self.reset_timeout_s);
         let deadband_ok = (0.0..=40.0).contains(&self.fast_deadband_db);
+        let detector_ok = (1e-6..=1.0).contains(&self.detector_ema_s);
         // every section stable (poles inside the unit circle)
         let stable = self.sos[..self.sections].iter().all(|s| {
             let (a1, a2) = (s[3], s[4]);
             a2.abs() < 1.0 && a1.abs() < 1.0 + a2
         });
         let unused_zero = self.sos[self.sections..].iter().all(|s| s.iter().all(|v| *v == 0.0));
-        table_ok && expected_ok && timeout_ok && deadband_ok && stable && unused_zero
+        table_ok && expected_ok && timeout_ok && deadband_ok && detector_ok && stable && unused_zero
     }
 
     /// The table's gain for loudness `l`, dB: a uniform cubic B-spline
@@ -257,6 +312,8 @@ struct LongTerm {
     gate_energy: f64,
     gate_a: f32,
     rate: f32,
+    /// Algorithm 1 keeps aging the counts on an invalid window.
+    age_invalid: bool,
 }
 
 impl LongTerm {
@@ -269,6 +326,7 @@ impl LongTerm {
             gate_energy: SEED_POWER,
             gate_a: 0.0,
             rate,
+            age_invalid: false,
         }
     }
 
@@ -295,21 +353,24 @@ impl LongTerm {
     /// the retained reading without changing or aging the histogram.
     fn update(&mut self, power: f64) -> f64 {
         let l = loudness(power);
-        if l <= VALID_DB {
+        let valid = l > VALID_DB;
+        if !valid && !self.age_invalid {
             return self.reading;
         }
-        let a = f64::from(self.gate_a);
-        self.gate_energy = a * self.gate_energy + (1.0 - a) * power;
-        let floor = loudness(self.gate_energy) - GATE_DB;
-        self.hist[bin_of(l)] += 1.0;
-        let start = bin_of(floor);
-        let (mut n, mut e) = (0.0, 0.0);
-        for (h, en) in self.hist[start..].iter().zip(&self.energy[start..]) {
-            n += h;
-            e += h * en;
-        }
-        if n > 1e-20 {
-            self.reading = loudness(e / n);
+        if valid {
+            let a = f64::from(self.gate_a);
+            self.gate_energy = a * self.gate_energy + (1.0 - a) * power;
+            let floor = loudness(self.gate_energy) - GATE_DB;
+            self.hist[bin_of(l)] += 1.0;
+            let start = bin_of(floor);
+            let (mut n, mut e) = (0.0, 0.0);
+            for (h, en) in self.hist[start..].iter().zip(&self.energy[start..]) {
+                n += h;
+                e += h * en;
+            }
+            if n > 1e-20 {
+                self.reading = loudness(e / n);
+            }
         }
         // History: how far the counts lean below the new reading (the
         // reading's own bin excluded) sets how fast every count fades.
@@ -331,6 +392,25 @@ const EMA_S: f64 = 0.030;
 /// 512-frame level that competes with the long path.
 const FAST_STORE_DB: f64 = -8.0;
 const MEDIAN_STORE_DB: f64 = -5.0;
+/// Algorithm 1: fast store, its rise and fall hysteresis, the median store
+/// and the level every meter starts from after a reset, dB.
+const V1_FAST_STORE_DB: f64 = -4.0;
+const V1_FAST_RISE_DB: f64 = 3.0;
+const V1_FAST_FALL_DB: f64 = 8.0;
+const V1_MEDIAN_STORE_DB: f64 = LOUDNESS_OFFSET - 1.0;
+const V1_SILENT_DB: f64 = BIN_LO_DB;
+/// Algorithm 1: where the applied gain starts its glide after a reset, dB.
+/// Measured on the installed unit sample by sample (the 200 Hz glide's own
+/// pole fits frames 3..39 of a 1 kHz onset to 24.0195..24.0187 dB, the same
+/// on every algorithm-1 state); it is not the parameter default of 24 dB.
+const V1_START_GAIN_DB: f64 = 24.0195;
+/// Algorithm 1: the smoothed detector power after a reset, dB (power
+/// `10^(dB / 10)`). Measured on the installed unit through the fast path's
+/// +3 dB rise test: onsets whose rise margin is a few thousandths of a dB
+/// resolve as the unit does only for a start between -53.5 and -51.5 dB
+/// (a 40 Hz onset at -12 dBFS does not rise where the same onset at 0 and
+/// -6 dBFS does, which no scale-free law explains).
+const V1_DETECTOR_SEED_DB: f64 = -52.5;
 const COMPETITOR_STORE_DB: f64 = -2.0;
 /// The median path: the true median of this many 512-frame levels (an odd
 /// count, read at its middle sorted index). Measured on the unit: after a
@@ -371,16 +451,19 @@ struct Median {
     at: usize,
     limited: f64,
     coef: f64,
+    store_db: f64,
 }
 
 impl Median {
-    fn new(rate: f32) -> Self {
+    fn new(rate: f32, algorithm1: bool) -> Self {
         Median {
             ring: [0.0; MEDIAN_LEN],
             sorted: [0.0; MEDIAN_LEN],
             at: 0,
             limited: 0.0,
-            coef: f64::from(1.0 - pole(MID_RELEASE_S, rate)),
+            // algorithm 1 moves straight to the release edge
+            coef: if algorithm1 { 1.0 } else { f64::from(1.0 - pole(MID_RELEASE_S, rate)) },
+            store_db: if algorithm1 { V1_MEDIAN_STORE_DB } else { MEDIAN_STORE_DB },
         }
     }
 
@@ -406,7 +489,7 @@ impl Median {
             self.sorted.swap(k + 1, k);
             k += 1;
         }
-        let m = self.sorted[MEDIAN_AT] + MEDIAN_STORE_DB;
+        let m = self.sorted[MEDIAN_AT] + self.store_db;
         if m > self.limited {
             self.limited = m;
         } else if m + MID_DEADBAND_DB < self.limited {
@@ -577,6 +660,11 @@ pub struct Run {
     clear_due: bool,
     candidate: f64,
     target_db: f64,
+    /// Algorithm 1: the target read on each 64-frame step of the call.
+    /// Algorithm 1: (frame in the call, target) of each 64-frame step of the
+    /// current call, and how many.
+    step_target: [(usize, f64); CALL / STEP + 1],
+    steps_in_call: usize,
     /// The applied gain, linear, and the target it glides to.
     gain: f64,
     target: f64,
@@ -596,12 +684,12 @@ impl Run {
             pos: 0,
             z: [[[0.0; 2]; MAX_SECTIONS]; MAX_CHANNELS],
             ema: 0.0,
-            ema_a: libm::exp(-1.0 / (EMA_S * fs)),
+            ema_a: libm::exp(-1.0 / (p.detector_ema_s * fs)),
             in_step: 0,
             steps: 0,
             blocks: 0,
             window: Window::new(),
-            median: Median::new(block_rate),
+            median: Median::new(block_rate, p.algorithm1),
             long: LongTerm::new(long_rate),
             pre: Precondition::new(fs as f32 / STEP as f32),
             rise: LowRise::new(fs as f32 / STEP as f32),
@@ -618,6 +706,8 @@ impl Run {
             clear_due: false,
             candidate: 0.0,
             target_db: 0.0,
+            step_target: [(0, 1.0); CALL / STEP + 1],
+            steps_in_call: 0,
             gain: 1.0,
             target: 1.0,
             glide: 1.0 - libm::exp(-2.0 * core::f64::consts::PI * GLIDE_HZ / fs),
@@ -654,6 +744,30 @@ impl Run {
         self.target_db = self.p.gain_db(e);
         self.target = libm::pow(10.0, self.target_db / 20.0);
         self.gain = self.target;
+        if self.p.algorithm1 {
+            self.reset_algorithm1();
+        }
+    }
+
+    /// Algorithm 1 starts every meter silent; the long histogram's relative
+    /// gate keeps the common seed and the detector power its own floor.
+    fn reset_algorithm1(&mut self) {
+        let s = V1_SILENT_DB;
+        self.ema = libm::pow(10.0, V1_DETECTOR_SEED_DB / 10.0);
+        self.window.reset(0.0);
+        self.median.reset(s);
+        self.long.reset(s);
+        self.long.age_invalid = true;
+        self.long_line = [s; LONG_DELAY];
+        self.long_out = s;
+        self.fast = s;
+        self.held = s;
+        self.candidate = s;
+        self.clear_due = false;
+        self.target_db = self.p.gain_db(s);
+        self.target = libm::pow(10.0, self.target_db / 20.0);
+        self.steps_in_call = 0;
+        self.gain = libm::pow(10.0, V1_START_GAIN_DB / 20.0);
     }
 
     /// Audio delay in frames. Metering and gain application complete inside
@@ -710,6 +824,30 @@ impl Run {
             self.blocks = (self.blocks + 1) % PER_LONG;
         }
         self.steps = (self.steps + 1) % PER_BLOCK;
+        if self.p.algorithm1 {
+            self.arbitrate_step(db);
+        }
+    }
+
+    /// Algorithm 1, every 64-frame step: the fast hysteresis, the held
+    /// candidate on a 512-frame event (the long path conditioned against
+    /// the fast level), and the gain's target.
+    fn arbitrate_step(&mut self, db: f64) {
+        let fast = db + V1_FAST_STORE_DB;
+        if fast > self.fast + V1_FAST_RISE_DB {
+            self.fast = fast;
+        } else if fast + V1_FAST_FALL_DB < self.fast {
+            self.fast = fast + V1_FAST_FALL_DB;
+        }
+        if let Some((_, mid, long)) = self.pending.take() {
+            // the long path competes against the fast level, not the
+            // 512-frame level
+            let long = self.pre.update(self.fast, long);
+            self.held = mid.max(long);
+        }
+        self.candidate = self.held.max(self.fast);
+        self.target_db = self.p.gain_db(self.candidate);
+        self.target = libm::pow(10.0, self.target_db / 20.0);
     }
 
     /// End of a call: the fast path's held level, then the long path's
@@ -761,8 +899,29 @@ impl Run {
         if frames == 0 {
             return;
         }
+        if self.p.algorithm1 && frames > CALL {
+            // Algorithm 1 moves the gain on every 64-frame step, so metering
+            // a long call in pieces of at most one speaker call is the same
+            // as metering it whole; it bounds the per-step target store.
+            let nch = self.channels.min(bufs.len());
+            let mut at = 0;
+            while at < frames {
+                let k = (frames - at).min(CALL);
+                let mut piece: [&mut [f32]; MAX_CHANNELS] = [&mut [], &mut []];
+                for (slot, b) in piece.iter_mut().zip(bufs.iter_mut()) {
+                    let end = b.len().min(at + k);
+                    let start = at.min(end);
+                    *slot = &mut b[start..end];
+                }
+                self.process(&mut piece[..nch], k);
+                at += k;
+            }
+            return;
+        }
+        self.steps_in_call = 0;
         let nch = self.channels.min(bufs.len());
         let la = self.p.lookahead;
+        let start_target = self.target;
         for n in 0..frames {
             let mut power = 0.0;
             for (ch, b) in bufs.iter().enumerate().take(nch) {
@@ -772,11 +931,17 @@ impl Run {
             self.ema = self.ema_a * self.ema + (1.0 - self.ema_a) * power.max(1e-12);
             if self.in_step == 0 {
                 self.on_step();
+                if self.p.algorithm1 && self.steps_in_call < self.step_target.len() {
+                    self.step_target[self.steps_in_call] = (n, self.target);
+                    self.steps_in_call += 1;
+                }
             }
             self.in_step = (self.in_step + 1) % STEP;
         }
         if self.events != 0 {
-            self.arbitrate();
+            if !self.p.algorithm1 {
+                self.arbitrate();
+            }
             self.peak = f64::NEG_INFINITY;
             self.events = 0;
         }
@@ -784,7 +949,15 @@ impl Run {
             self.clear_due = false;
             self.z = [[[0.0; 2]; MAX_SECTIONS]; MAX_CHANNELS];
         }
+        let mut next = 0;
+        if self.p.algorithm1 {
+            self.target = start_target;
+        }
         for n in 0..frames {
+            if next < self.steps_in_call && self.step_target[next].0 == n {
+                self.target = self.step_target[next].1;
+                next += 1;
+            }
             self.gain += self.glide * (self.target - self.gain);
             let g = self.gain as f32;
             for (ch, b) in bufs.iter_mut().enumerate().take(nch) {
@@ -832,6 +1005,56 @@ mod tests {
         assert!((to - from).abs() > 0.1);
         let a = 1.0 - libm::exp(-2.0 * core::f64::consts::PI * 200.0 / 48_000.0);
         assert!((r.glide - a).abs() < 1e-15);
+    }
+
+    #[test]
+    fn algorithm1_starts_silent_and_steps_its_fast_hysteresis() {
+        let p = Params { algorithm1: true, detector_ema_s: 0.040, ..params(0) };
+        let mut w = vec![0.0; Params::WORDS];
+        p.to_words(&mut w);
+        assert_eq!(Params::from_words(&w), Some(p.clone()));
+        let mut r = Run::new(&p, 48_000.0, 1);
+        assert_eq!(r.candidate, V1_SILENT_DB);
+        assert!((r.gain_db() - V1_START_GAIN_DB).abs() < 1e-9);
+        assert!((level(r.ema) - V1_DETECTOR_SEED_DB).abs() < 1e-9);
+        assert!(!r.clear_due);
+        r.fast = -20.0;
+        r.arbitrate_step(-14.0); // stored -18 is inside +3 dB
+        assert_eq!(r.fast, -20.0);
+        r.arbitrate_step(-12.0); // stored -16 clears +3 dB
+        assert_eq!(r.fast, -16.0);
+        r.arbitrate_step(-30.0); // stored -34 + 8 is under the held level
+        assert_eq!(r.fast, -26.0);
+        // the target follows the step, not the call boundary
+        assert_eq!(r.candidate, -26.0);
+        assert!((r.target_db - p.gain_db(-26.0)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn algorithm1_conditions_the_long_path_against_the_fast_level() {
+        let p = Params { algorithm1: true, detector_ema_s: 0.040, ..params(0) };
+        let mut r = Run::new(&p, 48_000.0, 1);
+        // a reading under the held fast level passes, though the 512-frame
+        // level is far under it
+        r.fast = -12.0;
+        r.pending = Some((-40.0, V1_SILENT_DB, -20.0));
+        r.arbitrate_step(-8.0);
+        assert_eq!(r.held, -20.0);
+        r.pending = Some((-60.0, V1_SILENT_DB, -18.0));
+        r.arbitrate_step(-8.0);
+        assert_eq!(r.held, -18.0);
+        // the fast level releases under the next reading: hold that reading
+        // (the smaller of it and the fast level it overtook), not the level
+        // the 512-frame path fell to
+        r.pending = Some((-60.0, V1_SILENT_DB, -17.0));
+        r.arbitrate_step(-30.0);
+        assert_eq!(r.fast, -26.0);
+        assert_eq!(r.held, -17.0);
+        // a burst whose fast level stays under a newer reading keeps the hold
+        r.pending = Some((-5.0, V1_SILENT_DB, -15.0));
+        r.arbitrate_step(-22.0);
+        assert_eq!(r.fast, -26.0);
+        assert_eq!(r.held, -17.0);
     }
 
     #[test]
@@ -1024,7 +1247,7 @@ mod tests {
         r.process(&mut [&mut buf], CALL);
         // frame 0's block joins as well
         assert_eq!(r.median.ring.iter().filter(|v| **v != p.expected_db).count(), 1);
-        let mut m = Median::new(93.75);
+        let mut m = Median::new(93.75, false);
         m.reset(-20.0);
         for _ in 0..MEDIAN_AT {
             assert_eq!(m.push(-10.0), -20.0);

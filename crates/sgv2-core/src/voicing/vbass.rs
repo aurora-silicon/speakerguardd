@@ -64,9 +64,9 @@ impl Bq {
     }
 }
 
-/// Most biquads one cascade needs (a Linkwitz-Riley of order 20 is two
-/// Butterworths of order 10: ten sections).
-const MAX_SECTIONS: usize = 10;
+/// A maximum-order high pass has ten Linkwitz-Riley sections followed by two
+/// five-section phase companions. Keep the complete mono cascade.
+const MAX_SECTIONS: usize = 20;
 
 #[derive(Clone, Debug, Default)]
 struct Cascade {
@@ -335,13 +335,10 @@ pub mod law {
     pub const LC_HOLD_S: f64 = 0.5;
     pub const LC_HOLD_RATIO: f64 = 0.9;
     pub const LC_SMOOTH_S: f64 = 0.5;
-    /// Never-louder margin on the hold-restart test (not part of macOS's
-    /// law): this box's arithmetic is not bit-identical to macOS's, so a
-    /// near-tie restart could fall either way. The input follower restarts
-    /// its hold only clearly above the ratio (it then releases no later than
-    /// macOS's), the output follower already slightly below it (it then
-    /// releases no earlier): a tie always resolves to the quieter output.
-    pub const LC_HOLD_MARGIN: f64 = 1e-3;
+    /// Retained envelope and smoothing stores start at this linear level on
+    /// construction and reset.  The follower floor is applied later, at the
+    /// two level-control divisions; it is not the state seed.
+    pub const LC_SEED: f64 = 1e-3;
     /// Harmonic compressor. The detector converts `abs(x) + epsilon` to dB,
     /// computes a conventional soft-knee gain-reduction request, then runs
     /// that non-negative request through the same peak-follower topology as
@@ -432,8 +429,7 @@ impl Params {
             return None;
         }
         let order = |v: f64| -> Option<usize> {
-            (v >= 2.0 && v <= (2 * MAX_SECTIONS) as f64 && libm::trunc(v) == v && (v as usize) % 2 == 0)
-                .then_some(v as usize)
+            ((2.0..=20.0).contains(&v) && libm::trunc(v) == v && (v as usize) % 2 == 0).then_some(v as usize)
         };
         let corner = |v: f64| (v > 0.0 && v < 20_000.0).then_some(v);
         let gain = |v: f64| (0.0..=100.0).contains(&v).then_some(v);
@@ -493,8 +489,14 @@ struct Follower {
 }
 
 impl Follower {
+    /// A level-control follower: its stores start at the level-control
+    /// seed. The harmonic compressor's follower starts from zero.
     fn new(fs: f64, ratio: f64) -> Follower {
-        Follower::with_times(fs, ratio, law::LC_ATTACK_S, law::LC_RELEASE_S, law::LC_HOLD_S, law::LC_SMOOTH_S)
+        let mut f =
+            Follower::with_times(fs, ratio, law::LC_ATTACK_S, law::LC_RELEASE_S, law::LC_HOLD_S, law::LC_SMOOTH_S);
+        f.e = law::LC_SEED as f32;
+        f.s = law::LC_SEED as f32;
+        f
     }
 
     fn with_times(fs: f64, ratio: f64, attack_s: f64, release_s: f64, hold_s: f64, smooth_s: f64) -> Follower {
@@ -535,8 +537,12 @@ impl Follower {
         } else {
             (self.a_rel, self.a_smo)
         };
-        self.e = a * self.e + (1.0 - a) * u;
-        self.s = b * self.s + (1.0 - b) * self.e;
+        // The retained stores and both associations are Float32.  Keep the
+        // follower's multiply-add boundary explicit: a long program history
+        // can otherwise move the first post-step windows by a measurable
+        // fraction of a decibel even though steady segments agree.
+        self.e = libm::fmaf(a, self.e, (1.0 - a) * u);
+        self.s = libm::fmaf(b, self.s, (1.0 - b) * self.e);
         self.s as f64
     }
 }
@@ -592,10 +598,7 @@ struct LevelControl {
 
 impl LevelControl {
     fn new(fs: f64) -> LevelControl {
-        LevelControl {
-            input: Follower::new(fs, law::LC_HOLD_RATIO * (1.0 + law::LC_HOLD_MARGIN)),
-            output: Follower::new(fs, law::LC_HOLD_RATIO * (1.0 - law::LC_HOLD_MARGIN)),
-        }
+        LevelControl { input: Follower::new(fs, law::LC_HOLD_RATIO), output: Follower::new(fs, law::LC_HOLD_RATIO) }
     }
 }
 
@@ -934,6 +937,23 @@ mod tests {
     }
 
     #[test]
+    fn mono_and_equal_stereo_share_the_complete_high_order_path() {
+        let mut p = params(true);
+        p.hp_order = 20;
+        p.upper_order = 20;
+        p.lower_order = 20;
+        let n = 8_192;
+        let input = tone(125.0, 0.4, n);
+        let mut mono = input.clone();
+        let mut left = input.clone();
+        let mut right = input;
+        Run::new(&p, 48_000.0, 1).process(&mut [&mut mono], n);
+        Run::new(&p, 48_000.0, 2).process(&mut [&mut left, &mut right], n);
+        assert_eq!(mono, left);
+        assert_eq!(mono, right);
+    }
+
+    #[test]
     fn mid_bass_is_kept_by_the_blend() {
         let mut p = params(false);
         p.harmonic_gain = 0.0;
@@ -1014,6 +1034,8 @@ mod tests {
     #[test]
     fn level_control_holds_then_releases() {
         let mut f = Follower::new(48_000.0, law::LC_HOLD_RATIO);
+        assert_eq!(f.e, law::LC_SEED as f32);
+        assert_eq!(f.s, law::LC_SEED as f32);
         for _ in 0..4_800 {
             f.run(1.0);
         }

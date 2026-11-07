@@ -834,10 +834,11 @@ impl DynRun {
 }
 
 /// Running state for one level-dependent ToneMeister slot. The shapes run
-/// `dry + (gain - 1) * carrier` with a fixed carrier (type 15: the detector's
+/// `dry + (gain - 1) * carrier` (type 15: a fixed carrier, the detector's
 /// constant-peak band pass; type 17: a first-order low-pass at twice the
-/// corner; type 18: a first-order high-pass at half the corner). The control
-/// law:
+/// corner divided by the current linear gain, so the shelf keeps its zero at
+/// twice the corner and moves its pole with the gain; type 18: a fixed
+/// first-order high-pass at half the corner). The control law:
 ///
 /// - the side chain passes the detector (type 15: the band pass; type 17/18:
 ///   a second-order Butterworth low/high-pass at the corner);
@@ -857,6 +858,9 @@ struct DynamicRun {
     fs: f64,
     detector: Section,
     component: Section,
+    /// Type 17: the shelf's zero (twice the corner), Hz; its carrier
+    /// follows the gain frame by frame.
+    shelf_zero_hz: Option<f64>,
     detector_filter: ControlFilter,
     component_state: [[f32; 2]; MAX_CHANNELS],
     quadrature: [Section; 2],
@@ -916,6 +920,7 @@ impl DynamicRun {
             fs,
             detector,
             component,
+            shelf_zero_hz: matches!(params.kind, DynamicKind::LowShelf).then_some(2.0 * params.frequency_hz),
             detector_filter: ControlFilter::zeroed(&detector),
             component_state: [[0.0; 2]; MAX_CHANNELS],
             quadrature,
@@ -937,6 +942,7 @@ impl DynamicRun {
         self.detector = fresh.detector;
         self.detector_filter.set(&fresh.detector);
         self.component = fresh.component;
+        self.shelf_zero_hz = fresh.shelf_zero_hz;
         self.curve_samples = fresh.curve_samples;
         self.quadrature = fresh.quadrature;
         self.quadrature_filter[0].set(&fresh.quadrature[0]);
@@ -973,6 +979,18 @@ impl DynamicRun {
     }
 
     #[inline]
+    /// Type 17's carrier at linear gain `g`: the prewarped first-order
+    /// low-pass at `zero_hz / g` (none outside the representable range).
+    fn moving_shelf_carrier(zero_hz: f64, g: f64, fs: f64) -> Option<Section> {
+        let corner = zero_hz / g;
+        if !(g > 0.0 && corner.is_finite() && corner > 0.0 && corner < 0.5 * fs) {
+            return None;
+        }
+        let k = libm::tan(core::f64::consts::PI * corner / fs);
+        let n = 1.0 / (1.0 + k);
+        Some(Section { b0: k * n, b1: k * n, b2: 0.0, a1: (k - 1.0) * n, a2: 0.0 })
+    }
+
     fn step_f32(section: &Section, state: &mut [f32; 2], input: f32) -> f32 {
         let (b0, b1, b2, a1, a2) =
             (section.b0 as f32, section.b1 as f32, section.b2 as f32, section.a1 as f32, section.a2 as f32);
@@ -1093,13 +1111,19 @@ impl DynamicRun {
                 gain[..len].fill(self.held);
             }
             self.control.run(&mut gain[..len]);
+            let mut carriers = [self.component; CONTROL_CHUNK];
+            if let Some(zero_hz) = self.shelf_zero_hz {
+                for (carrier, g) in carriers.iter_mut().zip(gain.iter()).take(len) {
+                    *carrier = Self::moving_shelf_carrier(zero_hz, f64::from(*g), self.fs).unwrap_or(self.component);
+                }
+            }
             for (c, buf) in bufs.iter_mut().enumerate().take(n) {
                 if at.active_mask >> c & 1 == 0 {
                     continue;
                 }
-                for (sample, g) in buf[from..from + len].iter_mut().zip(gain.iter()) {
+                for ((sample, g), carrier) in buf[from..from + len].iter_mut().zip(gain.iter()).zip(carriers.iter()) {
                     let input = if sample.is_finite() { sample.clamp(-INPUT_BOUND, INPUT_BOUND) } else { 0.0 };
-                    let component = Self::step_f32(&self.component, &mut self.component_state[c], input);
+                    let component = Self::step_f32(carrier, &mut self.component_state[c], input);
                     let output = input + (g - 1.0) * component;
                     *sample = if output.is_finite() { output } else { 0.0 };
                 }
@@ -1674,6 +1698,23 @@ impl PreStage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn type_17_shelf_keeps_its_zero_and_moves_its_pole_with_the_gain() {
+        // Synthetic corner, not any Mac's.
+        let (zero_hz, fs) = (720.0, 48_000.0);
+        for g in [0.5, 1.0, 1.5, 3.0] {
+            let carrier = DynamicRun::moving_shelf_carrier(zero_hz, g, fs).unwrap();
+            // The carrier's corner sits at zero / g (prewarped, so exact).
+            let at_corner = carrier.magnitude(zero_hz / g, fs);
+            assert!((at_corner - core::f64::consts::FRAC_1_SQRT_2).abs() < 1e-12, "{g} {at_corner}");
+            // dry + (g - 1) * carrier: gain g at DC, unity at Nyquist.
+            let dc = 1.0 + (g - 1.0) * carrier.magnitude(0.0, fs);
+            assert!((dc - g).abs() < 1e-12, "{g} {dc}");
+        }
+        assert!(DynamicRun::moving_shelf_carrier(zero_hz, 0.0, fs).is_none());
+        assert!(DynamicRun::moving_shelf_carrier(zero_hz, 0.01, fs).is_none());
+    }
 
     fn hp2(f0: f64, fs: f64) -> Section {
         // Butterworth high-pass, bilinear with prewarping
