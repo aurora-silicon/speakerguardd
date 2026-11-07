@@ -53,6 +53,9 @@ LAW_SOURCES = {
     "interim-filter-unity-bound": "crates/aurora-speaker-tuning/src/prestage.rs:derive_lanes",
     "interim-voicing-boxes-unwired": "crates/aurora-speaker-tuning/src/prestage.rs:derive_lanes",
     "atsp-interim-protection-only": "crates/aurora-speaker-tuning/src/compile.rs:compile_with",
+    "lsm2-pressure-masking-unwired": "crates/aurora-speaker-tuning/src/compile.rs:pressure_response",
+    "lsm2-pressure-response-gap": "crates/aurora-speaker-tuning/src/compile.rs:pressure_response",
+    "spp3-closed-loop-sense-unwired": "crates/aurora-speaker-tuning/src/compile.rs:compile_spp3",
 }
 PUBLIC_OPTIONAL_FIELDS = set(re.findall(r'\w+:\s*"(\w+)",\s*Opt\w+',
     (REPO / "crates/aurora-speaker-tuning/src/spp3.rs").read_text()))
@@ -197,7 +200,10 @@ def diagnostic_summary(text, interim=False):
             law = {"prestage-scaled": "interim-filter-unity-bound",
                    "prestage-not-carried": "interim-voicing-boxes-unwired",
                    "prestage-atsp-protection-only": "atsp-interim-protection-only",
-                   "cfrk-fractional-frames": "cfrk-frame-rounding"}.get(code[1])
+                   "cfrk-fractional-frames": "cfrk-frame-rounding",
+                   "lsm2-6632-absent": "lsm2-pressure-masking-unwired",
+                   "lsm2-6632-pressure": "lsm2-pressure-response-gap",
+                   "compile-no-sense": "spp3-closed-loop-sense-unwired"}.get(code[1])
             if interim and code[1] == "prestage-group-bypass":
                 law = "tmst-interim-group-cut-bound"
             if code[1] == "prestage-volume-automation" and "the voicing chain follows its volume automation" not in line:

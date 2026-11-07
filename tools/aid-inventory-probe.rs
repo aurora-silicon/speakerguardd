@@ -17,9 +17,7 @@ fn graph_boxes(b: &Bundle) -> aurora_speaker_tuning::error::Result<Vec<Value>> {
     let text =
         std::str::from_utf8(bytes).map_err(|_| aurora_speaker_tuning::Error::format("inventory", "graph UTF-8"))?;
     let graph = dspg::parse(text, &selected.substitutions, &selected.graph)?;
-    let strip_bytes =
-        b.file(&selected.strip).ok_or_else(|| aurora_speaker_tuning::Error::missing("inventory", "selected strip"))?;
-    let strip = AuStrip::parse(strip_bytes, &selected.strip)?;
+    let strip = b.file(&selected.strip).and_then(|bytes| AuStrip::parse(bytes, &selected.strip).ok());
     Ok(graph
         .boxes
         .iter()
@@ -28,7 +26,7 @@ fn graph_boxes(b: &Bundle) -> aurora_speaker_tuning::error::Result<Vec<Value>> {
                 dspg::BoxKind::AudioUnit { subtype, .. } => subtype.to_string(),
                 dspg::BoxKind::Builtin(k) => k.clone(),
             };
-            let effect = strip.effect(&bx.name);
+            let effect = strip.as_ref().and_then(|strip| strip.effect(&bx.name));
             let channels = graph
                 .wires
                 .iter()
