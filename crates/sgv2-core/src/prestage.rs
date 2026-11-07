@@ -972,16 +972,6 @@ impl DynamicRun {
         Section { b0, b1: 2.0 * b0, b2: b0, a1: -2.0 * libm::cos(w) * n, a2: (1.0 - alpha) * n }
     }
 
-    #[inline]
-    fn step_f32(section: &Section, state: &mut [f32; 2], input: f32) -> f32 {
-        let (b0, b1, b2, a1, a2) =
-            (section.b0 as f32, section.b1 as f32, section.b2 as f32, section.a1 as f32, section.a2 as f32);
-        let output = b0 * input + state[0];
-        state[0] = b1 * input - a1 * output + state[1];
-        state[1] = b2 * input - a2 * output;
-        output
-    }
-
     /// This table depends only on the configured law, not the detector
     /// level. Build it at construction and automation updates, retaining the
     /// original Float32 grid accumulation and exponential rounding.
@@ -1097,10 +1087,19 @@ impl DynamicRun {
                 if at.active_mask >> c & 1 == 0 {
                     continue;
                 }
-                for (sample, g) in buf[from..from + len].iter_mut().zip(gain.iter()) {
+                let mut carrier = [0.0f32; CONTROL_CHUNK];
+                for (output, &input) in carrier.iter_mut().zip(&buf[from..from + len]) {
+                    *output = if input.is_finite() { input.clamp(-INPUT_BOUND, INPUT_BOUND) } else { 0.0 };
+                }
+                ControlFilter::run_zeroed(&self.component, &mut self.component_state[c], &mut carrier[..len]);
+                for ((sample, g), component) in buf[from..from + len].iter_mut().zip(gain.iter()).zip(carrier.iter()) {
                     let input = if sample.is_finite() { sample.clamp(-INPUT_BOUND, INPUT_BOUND) } else { 0.0 };
-                    let component = Self::step_f32(&self.component, &mut self.component_state[c], input);
-                    let output = input + (g - 1.0) * component;
+                    // The installed vector path subtracts one from the
+                    // control, multiplies the carrier, then adds the dry
+                    // signal. Keep all three Float32 roundings separate.
+                    let control = *g - 1.0;
+                    let scaled = *component * control;
+                    let output = input + scaled;
                     *sample = if output.is_finite() { output } else { 0.0 };
                 }
             }
@@ -1207,6 +1206,18 @@ impl ControlFilter {
     fn reset_zero(&mut self) {
         self.z = [0.0; 2];
         self.history = [0.0; 4];
+    }
+
+    /// One call through a fixed section with the platform kernel.  Static
+    /// Tone sections and the dynamic carrier never change coefficients while
+    /// this state is live, so only the two transposed values have to persist
+    /// between calls; the published input/output history is needed solely by
+    /// coefficient replacement.
+    fn run_zeroed(section: &Section, state: &mut [f32; 2], buf: &mut [f32]) {
+        let mut filter = Self::zeroed(section);
+        filter.z = *state;
+        filter.run(buf);
+        *state = filter.z;
     }
 
     fn install(&mut self, c: [f64; 5]) {
@@ -1472,23 +1483,21 @@ impl PreStage {
         };
         let to = to.min(ch.count).min(MAX_SECTIONS);
         let from = from.min(to);
-        for y in buf.iter_mut() {
-            let mut v = if y.is_finite() { y.clamp(-INPUT_BOUND, INPUT_BOUND) } else { 0.0 };
-            for (s, st) in ch.sections[from..to].iter().zip(z[from..to].iter_mut()) {
-                let out = s.b0 as f32 * v + st[0] as f32;
-                let z0 = s.b1 as f32 * v - s.a1 as f32 * out + st[1] as f32;
-                let z1 = s.b2 as f32 * v - s.a2 as f32 * out;
-                *st = [z0 as f64, z1 as f64];
-                v = out;
-            }
-            v *= gain as f32;
-            if v.is_finite() {
-                *y = v;
-            } else {
+        for sample in buf.iter_mut() {
+            *sample = if sample.is_finite() { sample.clamp(-INPUT_BOUND, INPUT_BOUND) } else { 0.0 };
+        }
+        for (s, st) in ch.sections[from..to].iter().zip(z[from..to].iter_mut()) {
+            let mut state = [st[0] as f32, st[1] as f32];
+            ControlFilter::run_zeroed(s, &mut state, buf);
+            *st = state.map(f64::from);
+        }
+        for sample in buf.iter_mut() {
+            *sample *= gain as f32;
+            if !sample.is_finite() {
                 for st in z[from..to].iter_mut() {
                     *st = [0.0; 2];
                 }
-                *y = 0.0;
+                *sample = 0.0;
             }
         }
     }
@@ -1649,21 +1658,18 @@ impl PreStage {
             output.fill(0.0);
             return;
         }
-        let secs = &ch.sections[..ch.count.min(MAX_SECTIONS)];
-        for (x, y) in input.iter().zip(output.iter_mut()) {
-            let mut v = if x.is_finite() { x.clamp(-INPUT_BOUND, INPUT_BOUND) } else { 0.0 };
-            for (s, st) in secs.iter().zip(z.iter_mut()) {
-                let out = s.b0 as f32 * v + st[0] as f32;
-                let z0 = s.b1 as f32 * v - s.a1 as f32 * out + st[1] as f32;
-                let z1 = s.b2 as f32 * v - s.a2 as f32 * out;
-                st[0] = z0 as f64;
-                st[1] = z1 as f64;
-                v = out;
-            }
-            v *= ch.gain as f32;
-            if v.is_finite() {
-                *y = v;
-            } else {
+        let len = input.len().min(output.len());
+        for (x, y) in input.iter().zip(output.iter_mut()).take(len) {
+            *y = if x.is_finite() { x.clamp(-INPUT_BOUND, INPUT_BOUND) } else { 0.0 };
+        }
+        for (s, st) in ch.sections[..ch.count.min(MAX_SECTIONS)].iter().zip(z.iter_mut()) {
+            let mut state = [st[0] as f32, st[1] as f32];
+            ControlFilter::run_zeroed(s, &mut state, &mut output[..len]);
+            *st = state.map(f64::from);
+        }
+        for y in &mut output[..len] {
+            *y *= ch.gain as f32;
+            if !y.is_finite() {
                 *z = [[0.0; 2]; MAX_SECTIONS];
                 *y = 0.0;
             }
@@ -1919,6 +1925,20 @@ mod tests {
         filter.run(&mut floor);
         // Second-order low-pass: the first frames barely move.
         assert!(floor[0] > 0.999 && floor[63] < floor[0]);
+    }
+
+    #[test]
+    fn float_tone_sections_use_the_platform_grouping() {
+        let section = hp2(1_000.0, 48_000.0);
+        let input = [0.5, -0.25, 0.125, 0.75, -0.9, 0.2, 0.4, -0.1, 0.3, -0.6, 0.8, 0.05, -0.7, 0.9, -0.2, 0.1, 0.6];
+        let mut expected = input;
+        let mut filter = ControlFilter::zeroed(&section);
+        filter.run(&mut expected);
+
+        let mut stage = PreStage::new(params(&[section], 1.0));
+        let mut actual = [0.0; 17];
+        stage.process_float(0, &input, &mut actual);
+        assert_eq!(actual, expected);
     }
 
     #[test]
