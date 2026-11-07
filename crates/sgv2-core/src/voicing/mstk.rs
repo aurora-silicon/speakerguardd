@@ -779,8 +779,9 @@ impl Mode4Gain {
 
 impl Mode4Mix {
     #[inline]
-    fn apply_direct(self, arm_a: f64, arm_b: f64) -> f64 {
-        (((arm_a as f32 + arm_b as f32) * self.gain) * core::f32::consts::FRAC_1_SQRT_2) as f64
+    fn apply_real(self, arm_a: f64, arm_b: f64) -> f64 {
+        let gain = self.gain * self.correction_weight + self.lowpass * (1.0 - self.correction_weight);
+        (((arm_a as f32 + arm_b as f32) * gain) * core::f32::consts::FRAC_1_SQRT_2) as f64
     }
 
     #[inline]
@@ -1566,7 +1567,7 @@ impl Run {
                         let output = if b == 0 && self.band_zero_factor > 1 && !band_zero_sample {
                             0.0
                         } else if b + 1 == BANDS {
-                            mode4[b].apply_direct(bands_a[c][b], bands_b[c][b])
+                            mode4[b].apply_real(bands_a[c][b], bands_b[c][b])
                         } else {
                             mode4[b].apply(bands_a[c][b], bands_b[c][b])
                         };
@@ -2106,6 +2107,13 @@ mod tests {
         assert!((reducing - 0.75).abs() < 1e-5);
         assert_eq!(recovering, 0.0);
         assert_eq!(reducing + (1.0 - reducing), 1.0);
+    }
+
+    #[test]
+    fn mode4_real_arm_crossfades_the_direct_and_companion_gains() {
+        let mix = Mode4Mix { gain: 0.25, lowpass: 0.5, correction_weight: 0.75, ..Mode4Mix::default() };
+        let expected = (0.75 * 0.25 + 0.25 * 0.5) * core::f32::consts::SQRT_2;
+        assert!((mix.apply_real(1.0, 1.0) as f32 - expected).abs() < 1e-6);
     }
 
     #[test]
