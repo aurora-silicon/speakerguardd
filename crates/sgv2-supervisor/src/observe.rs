@@ -51,6 +51,10 @@
 //! - Open, owned by the engine's process: + grace. The PCM is not running,
 //!   only that process holds it and can start it, and it can do so only by
 //!   running the graph, which beats.
+//! - Opening (the status read waits behind an open in progress, so the
+//!   last proof is Closed and no stream can start until the open returns):
+//!   grace of [`OPENING_GRACE_NS`]. The sink's open blocks the graph's data
+//!   thread, so the engine cannot beat during it (~190 ms on the J700).
 //! - RUNNING: + grace for [`START_GRACE_NS`] after it is first seen running,
 //!   strict from then on.
 //! - For [`GRANT_GRACE_WINDOW_NS`] after each grant, in any of those states,
@@ -131,6 +135,12 @@ pub enum PcmState {
     Running {
         owner: u32,
     },
+    /// Closed at the last read, and the read since then has been waiting
+    /// behind an open in progress (the status read takes the PCM's
+    /// open_mutex). No stream can start before that open returns; the read
+    /// that follows proves its owner. Only the supervisor's snapshot view
+    /// makes this state, never a `/proc` parse.
+    Opening,
     /// Not readable, or not read recently enough: no proof of anything.
     Unknown,
 }
@@ -145,6 +155,7 @@ impl PcmState {
             PcmState::Running { owner } => (3, owner),
             PcmState::Unknown => (4, 0),
             PcmState::Xrun { owner } => (5, owner),
+            PcmState::Opening => (6, 0),
         };
         k << 32 | u64::from(o)
     }
@@ -157,6 +168,7 @@ impl PcmState {
             2 => PcmState::Stopped { owner },
             3 => PcmState::Running { owner },
             5 => PcmState::Xrun { owner },
+            6 => PcmState::Opening,
             _ => PcmState::Unknown,
         }
     }
@@ -226,6 +238,12 @@ pub const GRANT_GRACE_WINDOW_NS: u64 = 250_000_000;
 /// Extra heartbeat age tolerated just after a grant (not added to
 /// [`START_GRACE_NS`]: the larger of the two applies).
 pub const GRANT_GRACE_NS: u64 = 100_000_000;
+/// Extra heartbeat age tolerated while the speaker PCM is [`PcmState::Opening`]
+/// (and [`START_GRACE_NS`] once it is open): the sink's open blocks the
+/// graph's data thread, so the engine cannot beat, and nothing can play
+/// until the open returns. The J700's first open after a grant takes about
+/// 190 ms; the supervisor's view keeps Opening for at most this long.
+pub const OPENING_GRACE_NS: u64 = 500_000_000;
 
 /// Freshness bound while the engine runs: two unit quanta (the
 /// architecture's "at most 2 quanta stale") plus one supervisor tick.
@@ -362,6 +380,7 @@ impl Observer {
         }
         self.was_running = running;
         let start_grace = match p {
+            PcmState::Opening => OPENING_GRACE_NS,
             PcmState::Open { .. } => START_GRACE_NS,
             PcmState::Running { .. } if self.grace_until.is_some_and(|t| now_ns < t) => START_GRACE_NS,
             _ => 0,
@@ -387,7 +406,7 @@ impl Observer {
         // only the plugin's host process may hold the speaker PCM
         let pcm_owner_ok = match p.owner() {
             Some(owner) => owner == e.pid && e.pid != 0,
-            None => closed,
+            None => closed || matches!(p, PcmState::Opening),
         };
         // an underrun the sink recovers from, for at most the heartbeat bound
         if matches!(p, PcmState::Xrun { .. }) {
@@ -400,7 +419,8 @@ impl Observer {
             _ => false,
         };
         let pcm_state_ok =
-            matches!(p, PcmState::Closed | PcmState::Open { .. } | PcmState::Running { .. }) || recovering;
+            matches!(p, PcmState::Closed | PcmState::Opening | PcmState::Open { .. } | PcmState::Running { .. })
+                || recovering;
         // A new engine generation: another process, a page that became
         // valid, or a sequence that restarted.
         let restarted = self.last_seq_before.is_some_and(|l| e.seq < l);
@@ -503,6 +523,7 @@ pub fn combine(states: &[PcmState]) -> PcmState {
     fn rank(x: PcmState) -> u8 {
         match x {
             PcmState::Closed => 0,
+            PcmState::Opening => 1,
             PcmState::Open { .. } => 1,
             PcmState::Running { .. } => 2,
             PcmState::Xrun { .. } => 3,
@@ -743,6 +764,34 @@ mod tests {
             // idle (the protect stage on the dummy driver) needs the same proof
             assert_eq!(simulate(q, PcmState::Closed, 5, 0, 0), 0, "quantum {q} closed");
         }
+    }
+
+    /// The heartbeat pauses while the sink's open blocks the graph (the
+    /// J700: ~190 ms): Opening tolerates it up to OPENING_GRACE_NS, Closed
+    /// does not, and the owner and PCM checks hold throughout.
+    #[test]
+    fn an_opening_pcm_tolerates_the_heartbeat_pause_of_the_open() {
+        for (pcm, fresh) in [(PcmState::Opening, true), (PcmState::Closed, false)] {
+            let mut o = Observer::new(7, 48_000, TICK);
+            o.observe(&mut || 1, &mut E(beat(1, 512, 1)), &mut P(PcmState::Closed), &mut S(session(1)));
+            o.observe(
+                &mut || 10_666_667,
+                &mut E(beat(2, 512, 10_666_667)),
+                &mut P(PcmState::Closed),
+                &mut S(session(10_666_667)),
+            );
+            // no beat for 300 ms, well past any grant window (none here)
+            let now = 10_666_667 + 300_000_000;
+            let obs = o.observe(&mut || now, &mut E(beat(2, 512, 10_666_667)), &mut P(pcm), &mut S(session(now)));
+            assert_eq!(obs.heartbeat_fresh, fresh, "{pcm:?}");
+            assert!(obs.pcm_owner_ok && obs.pcm_state_ok, "{pcm:?}");
+            // and not forever
+            let late = 10_666_667 + OPENING_GRACE_NS + 100_000_000;
+            let obs = o.observe(&mut || late, &mut E(beat(2, 512, 10_666_667)), &mut P(pcm), &mut S(session(late)));
+            assert!(!obs.heartbeat_fresh, "{pcm:?} after the grace");
+        }
+        assert_eq!(PcmState::unpack(PcmState::Opening.pack()), PcmState::Opening);
+        assert_eq!(PcmState::Opening.owner(), None);
     }
 
     #[test]

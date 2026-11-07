@@ -77,11 +77,11 @@ mod linux {
     const PCM_POLL_NS: u64 = 1_000_000;
     /// A PCM snapshot whose read started longer ago than this is Unknown.
     const PCM_SNAPSHOT_MAX_NS: u64 = 12_000_000;
-    /// How long a status read blocked behind an open in progress keeps the
-    /// last proof, Closed: no stream can start before that open returns, and
-    /// the read that follows it proves the owner at once. The J700's speaker
-    /// PCM takes ~190 ms to open (its first open after a grant).
-    const PCM_OPENING_MAX_NS: u64 = 500_000_000;
+    /// How long a status read blocked behind an open in progress reads as
+    /// Opening: no stream can start before that open returns, and the read
+    /// that follows it proves the owner at once. The J700's speaker PCM takes
+    /// ~190 ms to open (its first open after a grant).
+    const PCM_OPENING_MAX_NS: u64 = sgv2_supervisor::observe::OPENING_GRACE_NS;
     /// A helper liveness check older than this vouches for nothing.
     const HELPER_CHECK_MAX_NS: u64 = 12_000_000;
     /// Waiting for the card: 50 ms doubling to 2 s.
@@ -157,8 +157,9 @@ mod linux {
 
     /// What the RT loop may take from the reader: the snapshot while it is
     /// fresh; while a read has been blocked since right after a Closed
-    /// snapshot (the PCM's `/proc` status waits for an open in progress), that
-    /// Closed for at most `PCM_OPENING_MAX_NS`; otherwise Unknown, which is no
+    /// snapshot (the PCM's `/proc` status waits for an open in progress),
+    /// Opening for at most `PCM_OPENING_MAX_NS` (the observer then tolerates
+    /// the heartbeat pause the open causes); otherwise Unknown, which is no
     /// proof. Before this, the first open after a grant (its status read
     /// blocked ~190 ms on the J700) read as Unknown and released the grant
     /// it had just given, and PipeWire's start hit the floor.
@@ -172,7 +173,7 @@ mod linux {
             && reading - taken <= PCM_SNAPSHOT_MAX_NS
             && now.saturating_sub(reading) <= PCM_OPENING_MAX_NS;
         if opening {
-            PcmState::Closed
+            PcmState::Opening
         } else {
             PcmState::Unknown
         }
@@ -875,16 +876,16 @@ mod linux {
         use super::*;
 
         #[test]
-        fn a_status_read_blocked_by_an_open_keeps_closed_for_a_while() {
+        fn a_status_read_blocked_by_an_open_reads_as_opening_for_a_while() {
             let ms = 1_000_000u64;
             let closed = PcmState::Closed;
             // fresh: as read
             assert_eq!(snapshot_view(closed, 100 * ms, 0, 105 * ms), closed);
             // stale and no read in progress (a starved reader): no proof
             assert_eq!(snapshot_view(closed, 100 * ms, 0, 120 * ms), PcmState::Unknown);
-            // a read blocked since right after a Closed snapshot: Closed for up to the bound
-            assert_eq!(snapshot_view(closed, 100 * ms, 101 * ms, 300 * ms), closed);
-            assert_eq!(snapshot_view(closed, 100 * ms, 101 * ms, 101 * ms + PCM_OPENING_MAX_NS), closed);
+            // a read blocked since right after a Closed snapshot: Opening for up to the bound
+            assert_eq!(snapshot_view(closed, 100 * ms, 101 * ms, 300 * ms), PcmState::Opening);
+            assert_eq!(snapshot_view(closed, 100 * ms, 101 * ms, 101 * ms + PCM_OPENING_MAX_NS), PcmState::Opening);
             assert_eq!(snapshot_view(closed, 100 * ms, 101 * ms, 102 * ms + PCM_OPENING_MAX_NS), PcmState::Unknown);
             // a read that began long after the last snapshot proves nothing
             assert_eq!(snapshot_view(closed, 100 * ms, 140 * ms, 150 * ms), PcmState::Unknown);
