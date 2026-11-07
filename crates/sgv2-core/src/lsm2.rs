@@ -191,7 +191,7 @@ pub const BANDS: usize = 5;
 pub const PRESSURE_TAPS: usize = 1024;
 const EPS: f64 = f32::MIN_POSITIVE as f64;
 /// The 0.99 downward target of every gain law (rig laws 5, 8; spec 15.4).
-const CUT: f64 = 0.99;
+const CUT: f32 = 0.99;
 
 /// Native realizes the ordinary sample-peak request window one bank sample
 /// before the retained audio/model window; the span stays unchanged.
@@ -2703,7 +2703,7 @@ impl Run {
                 }
                 // the second call starts at the provisionally advanced value
                 f.start = f.g;
-                f.target = (CUT * request as f64) as f32;
+                f.target = CUT * request;
                 f.n = 0;
                 f.attack = true;
                 c.slow = f;
