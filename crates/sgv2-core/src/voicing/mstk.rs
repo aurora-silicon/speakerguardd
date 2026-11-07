@@ -609,7 +609,6 @@ pub struct Run {
     release: [f64; BANDS],
     release_on: bool,
     algorithm0: bool,
-    algorithm2: bool,
     legacy_recombination: bool,
     overshoot_compensation: bool,
     channels: usize,
@@ -674,7 +673,6 @@ impl Run {
             release,
             release_on: q.release_on,
             algorithm0: q.algorithm == 0,
-            algorithm2: q.algorithm == 2,
             legacy_recombination: q.render_quality == 1 && q.algorithm < 3,
             overshoot_compensation: q.overshoot_compensation,
             channels: channels.min(MAX_CHANNELS),
@@ -868,14 +866,10 @@ impl Run {
                 let update = self.detector_phase[b] == 0;
                 let input = if update {
                     let mut held = self.window_max(b, p);
-                    let alpha = 1.0 / self.detector_window[b] as f64;
-                    self.detector_rms[b] += alpha * (p * p - self.detector_rms[b]);
-                    let rms = libm::sqrt(2.0 * self.detector_rms[b]).max(1e-12);
-                    if !self.overshoot_compensation && self.algorithm0 {
-                        held = rms;
-                    } else if !self.overshoot_compensation && self.algorithm2 {
-                        held = held.max(rms);
-                    } else if self.algorithm0 {
+                    if self.algorithm0 {
+                        let alpha = 1.0 / self.detector_window[b] as f64;
+                        self.detector_rms[b] += alpha * (p * p - self.detector_rms[b]);
+                        let rms = libm::sqrt(2.0 * self.detector_rms[b]).max(1e-12);
                         let crest_db = (20.0 * libm::log10(held / rms)).clamp(0.0, 6.0);
                         let crest_weight = if b == 0 { 0.52 } else { 0.49 };
                         held *= db_amp(crest_weight * crest_db);
