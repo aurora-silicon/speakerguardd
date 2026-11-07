@@ -26,11 +26,14 @@ to linear amplitude. This applies uniformly to mono and stereo states.
 ## Selected-rate branch
 
 The selected rate is 8 kHz, requiring the stream rate to be an integer
-multiple. Before phase-0 decimation, the low branch passes through the same
-seventh-order elliptic low-pass used after zero insertion for reconstruction.
-The band-edge all-pass and Linkwitz–Riley sections, level control, nonlinear
-device and harmonic compressor run at the selected rate. The reconstructed
-common branch is added to every delayed direct channel.
+multiple. The stream-rate crossover low-pass feeds phase-0 decimation
+directly; there is no additional pre-decimation elliptic stage. The band-edge
+all-pass and Linkwitz–Riley sections, level control, nonlinear device and
+harmonic compressor run at the selected rate. Phase-0 zero insertion and the
+seventh-order elliptic reconstruction low-pass return the common branch to the
+stream rate before it is added to every delayed direct channel. A matched
+pre-decimation elliptic trial was rejected because it changed steady LF gain
+by 0.24–0.79 dB across the stereo states.
 
 ## Level-control followers
 
