@@ -1079,6 +1079,17 @@ impl Run {
     }
 
     #[inline]
+    fn update_gain(&mut self, b: usize, held: f64) -> f64 {
+        self.env[b] = held;
+        let target = self.gain(b);
+        let recovery = if self.release_on { self.release[b] } else { 0.0 };
+        let gain =
+            if target <= self.gain_state[b] { target } else { target + (self.gain_state[b] - target) * recovery };
+        self.gain_state[b] = gain;
+        gain
+    }
+
+    #[inline]
     fn saturate(flavor: Option<u32>, x: f64) -> f64 {
         let Some(f) = flavor else { return x };
         match f {
@@ -1138,23 +1149,11 @@ impl Run {
                 };
                 let input = if update {
                     let held = self.window_max(b, p);
-                    if self.hop_peak {
-                        // Quality 0/1, algorithms 0-2: the release recovers the
-                        // linear band gain, not the detector level.
-                        self.env[b] = held;
-                        let target = self.gain(b);
-                        let recovery = if self.release_on { self.release[b] } else { 0.0 };
-                        let gain = if target <= self.gain_state[b] {
-                            target
-                        } else {
-                            target + (self.gain_state[b] - target) * recovery
-                        };
-                        self.gain_state[b] = gain;
-                        Some(gain)
-                    } else {
-                        self.env[b] = if self.release_on { held.max(self.env[b] * self.release[b]) } else { held };
-                        Some(self.gain(b))
-                    }
+                    // Every algorithm releases the post-curve linear gain.
+                    // Reduction applies immediately; recovery is a one-pole
+                    // at the embedded detector rate.  Quality changes the
+                    // detector producer and cadence, not this gain state.
+                    Some(self.update_gain(b, held))
                 } else {
                     None
                 };
@@ -1456,6 +1455,25 @@ mod tests {
         assert_eq!(max.push(1.0, 3), 8.0);
         assert_eq!(max.push(2.0, 3), 8.0);
         assert_eq!(max.push(3.0, 3), 3.0);
+    }
+
+    #[test]
+    fn quality_two_releases_the_linear_gain() {
+        let mut p = params();
+        p.algorithm = 3;
+        p.render_quality = 2;
+        p.release_on = true;
+        let mut run = Run::new(&p, 48_000.0, 1);
+        run.gain_state[0] = 0.25;
+
+        let recovering = run.update_gain(0, 1e-5);
+        let target = run.gain(0);
+        let expected = target + (0.25 - target) * run.release[0];
+        assert!((recovering - expected).abs() < 1e-12);
+
+        let reducing = run.update_gain(0, 1.0);
+        assert_eq!(reducing, run.gain(0));
+        assert!(reducing < recovering);
     }
 
     #[test]
