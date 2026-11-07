@@ -888,7 +888,7 @@ impl DynamicRun {
         };
         let analysis_hz = match params.kind {
             DynamicKind::Notch => params.frequency_hz,
-            DynamicKind::HighShelf => libm::sqrt(params.frequency_hz * 20_000.0),
+            DynamicKind::HighShelf => libm::sqrt(params.frequency_hz * 20_000.0).clamp(40.0, 10_000.0),
         };
         let quadrature = [Self::allpass(0.5 * analysis_hz, 0.37, fs), Self::allpass(2.0 * analysis_hz, 0.37, fs)];
         let reconstruction = Self::lowpass(20.0, 0.707, fs);
@@ -1692,6 +1692,14 @@ mod tests {
         let shelf = dynamic_filter_params(DynamicKind::HighShelf);
         assert!(run_filter(shelf.clone(), 1_000.0, 1.0).abs() < 0.15);
         assert!(run_filter(shelf, 12_000.0, 1.0) < -3.0);
+    }
+
+    #[test]
+    fn type18_bounds_the_quadrature_analysis_center() {
+        let p = dynamic_filter_params(DynamicKind::HighShelf);
+        let run = DynamicRun::new(&p.dynamic[0].params, 48_000.0);
+        assert_eq!(run.quadrature[0], DynamicRun::allpass(5_000.0, 0.37, 48_000.0));
+        assert_eq!(run.quadrature[1], DynamicRun::allpass(20_000.0, 0.37, 48_000.0));
     }
 
     #[test]
