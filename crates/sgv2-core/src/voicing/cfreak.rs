@@ -98,11 +98,16 @@ pub const K_MIN: f64 = 9.0 / 16.0;
 pub const DRIVE_BLOCK: usize = 512;
 /// Fraction of the dB distance to the block's target the drive moves.
 pub const DRIVE_SMOOTH: f64 = 0.1;
-/// The drive (dB) a fresh or reset unit starts from, and the blocks it
-/// holds it before following the input (black-box: tone onsets at 100 Hz
-/// and 1 kHz, 0 to -24 dBFS, both give 9.0 dB with two held blocks).
+/// The drive (dB) a fresh or reset unit starts from (black-box: tone
+/// onsets at 100 Hz and 1 kHz, 0 to -24 dBFS, all give 9.0 dB).
 pub const DRIVE_START_DB: f64 = 9.0;
-pub const DRIVE_WARMUP_BLOCKS: usize = 2;
+/// Blocks whose input does not move the drive after a start. The unit
+/// holds the start drive over its first two blocks and moves the third
+/// block's drive by that block's own target; a streaming run knows a
+/// block's target only once the block is over, so it moves the third
+/// block's drive by the second block's target (one complete block
+/// ignored).
+pub const DRIVE_WARMUP_BLOCKS: usize = 1;
 /// `k^2 = DRIVE_C * rms(weighted) / rms(input)`.
 ///
 /// TODO(SPEC): the weighting's exact sections are open. Black-box (single
