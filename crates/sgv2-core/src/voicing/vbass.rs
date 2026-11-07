@@ -700,9 +700,7 @@ impl Run {
         self.sline = [0.0; SUB_LINE];
         self.phase = 0;
         self.recon_st = CascadeState::default();
-        for l in &mut self.oline {
-            *l = [0.0; OUT_LINE];
-        }
+        self.oline.fill([0.0; OUT_LINE]);
     }
 
     pub fn latency(&self) -> usize {
