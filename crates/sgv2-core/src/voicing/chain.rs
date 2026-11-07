@@ -605,7 +605,7 @@ impl Run {
                 }
             }
             Run::ToneGroups { runs, active } => {
-                if id == 1 && v.is_finite() && v >= 0.0 && v.fract() == 0.0 {
+                if id == 1 && v.is_finite() && v >= 0.0 {
                     if let Some(index) = runs.iter().position(|(mask, _)| f64::from(*mask) == v) {
                         *active = index;
                     }
