@@ -322,16 +322,33 @@ pub fn resonant_high_pass(f0: f64, q: f64, fs: f64) -> Section {
     }
 }
 
+/// The highest Butterworth shelf order a ToneMeister box accepts
+/// (`MaxAllowedFilterOrder`, parameter 5; the lowest is two).
+pub const MAX_SHELF_ORDER: u32 = 50;
+/// The box's shelf order limit when the tuning does not set one.
+pub const DEFAULT_SHELF_ORDER: u32 = 10;
+/// Most sections one cascade holds: a shelf at the highest order limit.
+pub const MAX_CASCADE: usize = MAX_SHELF_ORDER as usize / 2 + 1;
+
 /// A fixed-capacity static cascade returned by [`butterworth_shelf`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Cascade {
-    pub sections: [Section; 10],
+    pub sections: [Section; MAX_CASCADE],
     pub count: usize,
+}
+
+impl Cascade {
+    const EMPTY: Cascade = Cascade { sections: [Section::IDENTITY; MAX_CASCADE], count: 0 };
+
+    fn push(&mut self, s: Section) {
+        self.sections[self.count] = s;
+        self.count += 1;
+    }
 }
 
 /// A bilinear-prewarped Butterworth low- or high-pass of integer order.
 pub fn butterworth(high: bool, order: u32, f0: f64, fs: f64) -> Cascade {
-    let mut out = Cascade { sections: [Section::IDENTITY; 10], count: 0 };
+    let mut out = Cascade::EMPTY;
     let order = order.clamp(1, 20);
     let k = libm::tan(PI * f0 / fs);
     for i in 0..order / 2 {
@@ -352,112 +369,173 @@ pub fn butterworth(high: bool, order: u32, f0: f64, fs: f64) -> Cascade {
     out
 }
 
-fn bilinear_factor(num: [f64; 3], den: [f64; 3], k: f64) -> Section {
-    let transform = |c: [f64; 3]| {
-        if c[0] == 0.0 {
-            let c1 = c[1] / k;
-            return [c1 + c[2], -c1 + c[2], 0.0];
-        }
-        let c2 = c[0] / (k * k);
-        let c1 = c[1] / k;
-        [c2 + c1 + c[2], -2.0 * c2 + 2.0 * c[2], c2 - c1 + c[2]]
-    };
-    let b = transform(num);
-    let a = transform(den);
-    Section { b0: b[0] / a[0], b1: b[1] / a[0], b2: b[2] / a[0], a1: a[1] / a[0], a2: a[2] / a[0] }
+/// A double-double value `hi + lo`, `|lo| <= ulp(hi) / 2`.
+type Dd = (f64, f64);
+
+fn two_sum(a: f64, b: f64) -> Dd {
+    let s = a + b;
+    let v = s - a;
+    (s, (a - (s - v)) + (b - v))
 }
 
-fn shelf_factor(high: bool, boost: bool, a: f64, q2: Option<f64>, k: f64) -> Section {
-    let (mut num, mut den) = match (high, q2) {
-        (true, Some(q)) => ([a * a, q * a, 1.0], [1.0 / (a * a), q / a, 1.0]),
-        (false, Some(q)) => ([1.0, q * a, a * a], [1.0, q / a, 1.0 / (a * a)]),
-        (true, None) => ([0.0, a, 1.0], [0.0, 1.0 / a, 1.0]),
-        (false, None) => ([0.0, 1.0, a], [0.0, 1.0, 1.0 / a]),
-    };
-    if boost {
-        core::mem::swap(&mut num, &mut den);
-    }
-    let section = bilinear_factor(num, den, k);
-    Section {
-        b0: section.b0 as f32 as f64,
-        b1: section.b1 as f32 as f64,
-        b2: section.b2 as f32 as f64,
-        a1: section.a1 as f32 as f64,
-        a2: section.a2 as f32 as f64,
-    }
+fn dd_add(a: Dd, b: Dd) -> Dd {
+    let (s, e) = two_sum(a.0, b.0);
+    two_sum(s, e + a.1 + b.1)
 }
 
-fn integer_shelf(high: bool, order: u32, gain_db: f64, fm: f64, fs: f64) -> Cascade {
-    let mut out = Cascade { sections: [Section::IDENTITY; 10], count: 0 };
-    if gain_db == 0.0 {
+fn dd_mul(a: Dd, b: Dd) -> Dd {
+    let p = a.0 * b.0;
+    let e = libm::fma(a.0, b.0, -p) + (a.0 * b.1 + a.1 * b.0);
+    two_sum(p, e)
+}
+
+fn dd_div(a: Dd, b: Dd) -> Dd {
+    let q1 = a.0 / b.0;
+    let r = dd_add(a, dd_mul(b, (-q1, 0.0)));
+    let q2 = r.0 / b.0;
+    let r = dd_add(r, dd_mul(b, (-q2, 0.0)));
+    let q3 = r.0 / b.0;
+    dd_add(two_sum(q1, q2), (q3, 0.0))
+}
+
+/// The natural logarithm of a positive normal `x`, correctly rounded to
+/// binary64 (but for ties closer than about 2^-100 relative). The shelf's
+/// real order is a difference of two logarithms, and its integer part
+/// sets the section count, so it must not depend on a libm's last bit.
+fn ln(x: f64) -> f64 {
+    const LN_2: Dd = (core::f64::consts::LN_2, 2.319_046_813_846_299_6e-17);
+    let bits = x.to_bits();
+    let mut e = ((bits >> 52) & 0x7ff) as i32 - 1023;
+    let mut m = f64::from_bits((bits & ((1 << 52) - 1)) | (1023 << 52));
+    if m > core::f64::consts::SQRT_2 {
+        m *= 0.5;
+        e += 1;
+    }
+    // ln m = 2 atanh(s), s = (m - 1)/(m + 1), |s| < 0.172
+    let s = dd_div((m - 1.0, 0.0), two_sum(m, 1.0));
+    let s2 = dd_mul(s, s);
+    let mut sum: Dd = (0.0, 0.0);
+    for k in (0..24).rev() {
+        let term = dd_div((1.0, 0.0), ((2 * k + 1) as f64, 0.0));
+        sum = dd_add(term, dd_mul(s2, sum));
+    }
+    let lnm = dd_mul((2.0 * s.0, 2.0 * s.1), sum);
+    let r = dd_add(dd_mul(LN_2, (e as f64, 0.0)), lnm);
+    r.0 + r.1
+}
+
+/// The most sections one Butterworth shelf makes under an order limit:
+/// one per pole pair (or real pole) of the highest integer order, plus the
+/// real remainder section that is always present.
+pub fn shelf_sections(max_order: u32) -> usize {
+    (max_order.clamp(2, MAX_SHELF_ORDER) as usize).div_ceil(2) + 1
+}
+
+/// A Float32 complex root `(re, im)`; `im == 0` is a real root.
+type Root = (f32, f32);
+
+/// Maps an analog root (normalised to the prewarped midpoint) to the z
+/// plane: `(1 + k q) / (1 - k q)`, one Float32 rounding per operation, the
+/// quotient through a reciprocal of the squared denominator magnitude.
+fn bilinear_root(k: f32, (qr, qi): Root) -> Root {
+    let br = 1.0 + k * qr;
+    let bi = k * qi;
+    let dr = 1.0 + -k * qr;
+    let di = -k * qi;
+    let inv = 1.0 / libm::fmaf(dr, dr, di * di);
+    (inv * libm::fmaf(br, dr, bi * di), inv * libm::fmaf(bi, dr, -(di * br)))
+}
+
+/// The `z^-1` and `z^-2` coefficients of the monic factor with the root
+/// (and its conjugate when complex).
+fn monic(q: Root) -> (f32, f32) {
+    if q.1 == 0.0 {
+        return (-q.0, 0.0);
+    }
+    let (re, im) = (-q.0 as f64, -q.1 as f64);
+    (-2.0 * q.0, libm::fma(re, re, im * im) as f32)
+}
+
+/// One section from a pole and a zero root, its numerator scaled for unit
+/// gain at Nyquist.
+fn root_section(pole: Root, zero: Root) -> Section {
+    let (a1, a2) = monic(pole);
+    let (c1, c2) = monic(zero);
+    let at_nyquist_den = (1.0 - a1) + a2;
+    let at_nyquist_num = (1.0 - c1) + c2;
+    let v = at_nyquist_num / at_nyquist_den;
+    Section { b0: (1.0 / v) as f64, b1: (c1 / v) as f64, b2: (c2 / v) as f64, a1: a1 as f64, a2: a2 as f64 }
+}
+
+/// ToneMeister's type-2 Butterworth shelf over the slot's two edge
+/// frequencies, in their saved order: rising edges put the gain below the
+/// transition, falling edges above it. The design follows the unit's
+/// Float32 values and arithmetic order, so each section is bit-exact.
+///
+/// The real order is the gain over three times the transition width in
+/// octaves, at least one and at most `max_order` (two to
+/// [`MAX_SHELF_ORDER`]). Each Butterworth pole angle is interpolated between
+/// the two adjacent integer orders (a harmonic interpolation of the order),
+/// every analog root takes an equal logarithmic share of the gain, and one
+/// real remainder root carries the fractional order up to the adjacent
+/// even integer. The remainder section is kept even when its pole and zero
+/// cancel: the unit runs it, and its rounding is part of the output. The
+/// roots are bilinear-mapped at the prewarped geometric-mean frequency. A
+/// falling shelf is designed as the rising one with the opposite gain and
+/// a flat gain folded into its first numerator.
+pub fn butterworth_shelf(gain_db: f64, from_hz: f64, to_hz: f64, max_order: u32, fs: f64) -> Cascade {
+    let mut out = Cascade::EMPTY;
+    let fs = fs as f32;
+    let top = (0.499 * fs).min(20_000.0);
+    let edge = |f: f64| (f as f32).min(top).max(20.0);
+    let (from, to) = (edge(from_hz), edge(to_hz));
+    let gain = (gain_db as f32).min(40.0).max(-40.0);
+    if from == to {
         return out;
     }
-    let boost = gain_db > 0.0;
-    let g = libm::pow(10.0, -gain_db.abs() / 20.0);
-    let a = libm::pow(g, 1.0 / (2.0 * order as f64));
-    let k = libm::tan(PI * fm / fs);
-    for i in 0..order / 2 {
-        let q2 = 2.0 * libm::sin(PI * (2 * i + 1) as f64 / (2 * order) as f64);
-        out.sections[out.count] = shelf_factor(high, boost, a, Some(q2), k);
-        out.count += 1;
+    let (lo, hi, rising_gain, flat_db) = if from < to { (from, to, gain, 0.0) } else { (to, from, -gain, gain) };
+
+    let width = ln(hi as f64) - ln(lo as f64);
+    let per_octave = (rising_gain as f64).abs() / width * core::f64::consts::LN_2 / 6.0;
+    let order = (per_octave + per_octave).max(1.0).min(max_order.clamp(2, MAX_SHELF_ORDER) as f64);
+    let whole = libm::floor(order);
+    let fraction = order - whole;
+    let lower = whole as u32;
+    let pairs = lower.div_ceil(2);
+
+    let fm = libm::sqrtf(lo * hi);
+    let k = libm::tan(fm as f64 * (2.0 * PI) / fs as f64 * 0.5) as f32;
+    let share = rising_gain as f64 / (40.0 * order);
+    let (pole_r, zero_r) = (libm::exp10(-share), libm::exp10(share));
+    let angle = |j: u32, n: f64| (0.5 - (2 * j - 1) as f64 * 0.5 / n) * PI;
+    for j in 1..=pairs {
+        let theta = angle(j, lower as f64 + 1.0) * fraction + angle(j, lower as f64) * (1.0 - fraction);
+        let (c, s) = (libm::cos(theta), libm::sin(theta));
+        let pole = ((-pole_r * c) as f32, (pole_r * s) as f32);
+        let zero = ((-zero_r * c) as f32, (zero_r * s) as f32);
+        out.push(root_section(bilinear_root(k, pole), bilinear_root(k, zero)));
     }
-    if order % 2 != 0 {
-        out.sections[out.count] = shelf_factor(high, boost, a, None, k);
-        out.count += 1;
+    let even = if lower % 2 == 1 { libm::ceil(order) } else { whole };
+    let t = (share * (even - order)) as f32;
+    out.push(root_section(bilinear_root(k, (-libm::exp10f(t), 0.0)), bilinear_root(k, (-libm::exp10f(-t), 0.0))));
+
+    let flat = libm::exp10(flat_db as f64 / 20.0);
+    let first = &mut out.sections[0];
+    for b in [&mut first.b0, &mut first.b1, &mut first.b2] {
+        *b = (*b * flat) as f32 as f64;
     }
     out
 }
 
-/// ToneMeister's type-2 Butterworth shelf. The two frequencies determine
-/// direction, midpoint and the fractional order; at most five sections are
-/// returned because the box caps the order at ten.
-pub fn butterworth_shelf(gain_db: f64, f3: f64, f4: f64, max_order: u32, fs: f64) -> Cascade {
-    if gain_db == 0.0 || f3 == f4 {
-        return Cascade { sections: [Section::IDENTITY; 10], count: 0 };
-    }
-    let high = f3 > f4;
-    let fm = libm::sqrt(f3 * f4);
-    let octaves = libm::log2(f3.max(f4) / f3.min(f4));
-    // ToneMeister calls one octave of transition 3 dB exactly.  The familiar
-    // half-power value (3.0103 dB) is not used in this order calculation.
-    let requested = (gain_db.abs() / (3.0 * octaves)).max(1.0);
-    // MaxAllowedFilterOrder limits the realised prototype.  The installed
-    // box treats 1 as the same minimum second order and caps at ten.
-    let maximum = max_order.clamp(2, 10);
-    if requested >= maximum as f64 {
-        return integer_shelf(high, maximum, gain_db, fm, fs);
-    }
-
-    // A fractional prototype interpolates each Butterworth pole angle
-    // between the adjacent integer prototypes.  Since the angle is
-    // proportional to 1/order, this is a harmonic interpolation of order.
-    // The upper integer is rounded up to an even number for the pole pairs;
-    // a first-order remainder restores the requested total gain.  At odd
-    // integers this deliberately makes a cancellable extra pair, keeping the
-    // law continuous on the side selected by the Float32 tuning value.
-    let lower = libm::floor(requested);
-    let fraction = requested - lower;
-    let upper = if fraction == 0.0 { lower } else { lower + 1.0 };
-    let angle_order = if fraction == 0.0 { requested } else { 1.0 / ((1.0 - fraction) / lower + fraction / upper) };
-    let pairs = (upper as u32) / 2;
-    let mut out = Cascade { sections: [Section::IDENTITY; 10], count: 0 };
-    let boost = gain_db > 0.0;
-    let g = libm::pow(10.0, -gain_db.abs() / 20.0);
-    let a = libm::pow(g, 1.0 / (2.0 * requested));
-    let k = libm::tan(PI * fm / fs);
-    for i in 0..pairs {
-        let q2 = 2.0 * libm::sin(PI * (2 * i + 1) as f64 / (2.0 * angle_order));
-        out.sections[out.count] = shelf_factor(high, boost, a, Some(q2), k);
-        out.count += 1;
-    }
-    let used = 2.0 * pairs as f64 / requested;
-    let remainder_db = gain_db * (1.0 - used);
-    if remainder_db.abs() > 1e-12 {
-        let ar = libm::pow(10.0, -remainder_db.abs() / 40.0);
-        out.sections[out.count] = shelf_factor(high, remainder_db > 0.0, ar, None, k);
-        out.count += 1;
-    }
-    out
+/// ToneMeister's type-0 band shelf over its four edges: a falling-gain
+/// shelf over the first two edges followed by a rising-gain one over the
+/// last two. For ordered edges the outer plateaus cancel and the band
+/// between the inner edges keeps the gain; no separate gain stage exists.
+pub fn butterworth_band_shelf(gain_db: f64, edges: [f64; 4], max_order: u32, fs: f64) -> (Cascade, Cascade) {
+    (
+        butterworth_shelf(-(gain_db as f32) as f64, edges[0], edges[1], max_order, fs),
+        butterworth_shelf(gain_db, edges[2], edges[3], max_order, fs),
+    )
 }
 
 #[cfg(test)]
@@ -538,24 +616,91 @@ mod tests {
         }
     }
 
+    fn cascade_db(c: &Cascade, f: f64, fs: f64) -> f64 {
+        20.0 * libm::log10(c.sections[..c.count].iter().map(|s| magnitude(*s, f, fs)).product::<f64>())
+    }
+
     #[test]
-    fn fractional_butterworth_shelf_uses_adjacent_integer_prototypes() {
+    fn ln_is_correctly_rounded() {
+        // ln 2 and ln 10 to binary64, and values where a one-ulp libm
+        // error moves a one-octave shelf's real order across 1
+        assert_eq!(ln(2.0), core::f64::consts::LN_2);
+        assert_eq!(ln(10.0), core::f64::consts::LN_10);
+        assert_eq!(ln(1.0), 0.0);
+        assert_eq!(ln(98.672_531_127_929_69), f64::from_bits(0x4012_5e02_8cb3_5b4f));
+        assert_eq!(ln(2_892.636_718_75), f64::from_bits(0x401f_e133_af52_e423));
+        for x in [20.0, 141.4, 1000.0, 19_999.0, 0.75, 1.5] {
+            assert!((ln(x) - libm::log(x)).abs() <= 1.0e-15 * libm::log(x).abs().max(1.0));
+        }
+    }
+
+    #[test]
+    fn butterworth_shelf_sections_are_pole_pairs_plus_a_remainder() {
         let fs = 48_000.0;
         let lo = 120.0;
         let hi = 180.0;
         let gain_for = |order: f64| order * 3.0 * libm::log2(hi / lo);
 
-        // Below the third-order boundary there is one pole pair and a real
-        // remainder.  On its upper side there are two pairs and a remainder.
+        // One pole pair below order three, two above; the real remainder
+        // section is always there.
         assert_eq!(butterworth_shelf(gain_for(2.75), lo, hi, 10, fs).count, 2);
         assert_eq!(butterworth_shelf(gain_for(3.25), lo, hi, 10, fs).count, 3);
+        // An order under one is raised to one: one first-order section and
+        // the remainder.
+        assert_eq!(butterworth_shelf(0.5, lo, hi, 10, fs).count, 2);
 
-        // MaxAllowedFilterOrder is a hard integer prototype limit with a
-        // second-order minimum.
-        assert_eq!(butterworth_shelf(gain_for(8.0), lo, hi, 1, fs).count, 1);
-        assert_eq!(butterworth_shelf(gain_for(8.0), lo, hi, 2, fs).count, 1);
-        assert_eq!(butterworth_shelf(gain_for(8.0), lo, hi, 3, fs).count, 2);
-        assert_eq!(butterworth_shelf(gain_for(8.0), lo, hi, 6, fs).count, 3);
+        // MaxAllowedFilterOrder limits the real order, from two up.
+        for (limit, count) in [(1, 2), (2, 2), (3, 3), (6, 4), (10, 5), (50, 5)] {
+            assert_eq!(butterworth_shelf(gain_for(8.0), lo, hi, limit, fs).count, count, "limit {limit}");
+            assert!(count <= shelf_sections(limit));
+        }
+        // the gain is clamped to 40 dB: a steep narrow shelf reaches the
+        // highest limit
+        let steep = 49.5 * 3.0 * libm::log2(130.0 / lo);
+        assert_eq!(butterworth_shelf(steep, lo, 130.0, 50, fs).count, shelf_sections(50));
+    }
+
+    #[test]
+    fn butterworth_shelf_reaches_its_asymptotes_and_half_gain_at_the_midpoint() {
+        let fs = 48_000.0;
+        for gain in [-9.0, -3.0, 4.5, 12.0] {
+            for (from, to, low, high) in [(2000.0, 8000.0, gain, 0.0), (8000.0, 2000.0, 0.0, gain)] {
+                let c = butterworth_shelf(gain, from, to, 10, fs);
+                assert!((cascade_db(&c, 1.0, fs) - low).abs() < 1e-3, "{gain} {from}->{to} low");
+                assert!((cascade_db(&c, 23_999.0, fs) - high).abs() < 1e-3, "{gain} {from}->{to} high");
+                assert!((cascade_db(&c, 4000.0, fs) - gain / 2.0).abs() < 1e-3, "{gain} {from}->{to} mid");
+                for s in &c.sections[..c.count] {
+                    assert_eq!([s.b0, s.b1, s.b2, s.a1, s.a2].map(|v| v as f32 as f64), [s.b0, s.b1, s.b2, s.a1, s.a2]);
+                }
+            }
+        }
+        // a 0 dB shelf and equal edges are the identity
+        assert!(cascade_db(&butterworth_shelf(0.0, 100.0, 200.0, 10, fs), 150.0, fs).abs() < 1e-5);
+        assert_eq!(butterworth_shelf(6.0, 300.0, 300.0, 10, fs).count, 0);
+    }
+
+    #[test]
+    fn an_even_order_shelf_still_runs_its_cancelling_remainder() {
+        let fs = 48_000.0;
+        // 12 dB over one octave: order four, two pole pairs and a
+        // remainder whose pole and zero coincide
+        let c = butterworth_shelf(12.0, 500.0, 1000.0, 10, fs);
+        assert_eq!(c.count, 3);
+        let r = c.sections[2];
+        assert_eq!((r.b0, r.b1, r.b2, r.a2), (1.0, r.a1, 0.0, 0.0));
+    }
+
+    #[test]
+    fn band_shelf_keeps_the_gain_between_its_inner_edges_only() {
+        let fs = 48_000.0;
+        for gain in [-6.0, 8.0] {
+            let (first, second) = butterworth_band_shelf(gain, [100.0, 200.0, 2000.0, 4000.0], 10, fs);
+            let db = |f: f64| cascade_db(&first, f, fs) + cascade_db(&second, f, fs);
+            // Float32 coefficients of a low-frequency section move its DC
+            // gain by a few thousandths of a dB, as the unit's do
+            assert!(db(1.0).abs() < 0.01 && db(23_999.0).abs() < 1e-3, "{gain}: {} {}", db(1.0), db(23_999.0));
+            assert!((db(630.0) - gain).abs() < 0.05, "{gain}: {}", db(630.0));
+        }
     }
 
     #[test]

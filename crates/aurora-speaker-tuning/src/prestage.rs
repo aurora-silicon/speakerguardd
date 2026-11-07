@@ -505,18 +505,18 @@ pub fn automation(stage: &Stage) -> Vec<u32> {
         .collect()
 }
 
-/// ToneMeister's type-2 shelf. At integer order this is the exact
-/// Butterworth shelf
-///
-/// `|H|^2 = (1 + g^2 r) / (1 + r)`, `r = x^(2N) / g`,
-///
-/// with a bilinear-prewarped `x` and midpoint `sqrt(f3*f4)`. The unit caps
-/// the order at its global maximum. Between integer orders it rounds the
-/// Butterworth factors gently; the real-factor construction below follows
-/// that measured response to within the pre-stage's 0.05 dB rig tolerance.
+/// ToneMeister's type-2 Butterworth shelf over two edges in their saved
+/// order ([`tone_filter::butterworth_shelf`]).
 fn butterworth_shelf(gain_db: f64, f3: f64, f4: f64, max_order: u32, fs: f64) -> Vec<Section> {
     let made = tone_filter::butterworth_shelf(gain_db, f3, f4, max_order, fs);
     made.sections[..made.count].to_vec()
+}
+
+/// ToneMeister's type-0 band shelf: its two type-2 shelves
+/// ([`tone_filter::butterworth_band_shelf`]).
+fn butterworth_band_shelf(gain_db: f64, edges: [f64; 4], max_order: u32, fs: f64) -> (Vec<Section>, Vec<Section>) {
+    let (first, second) = tone_filter::butterworth_band_shelf(gain_db, edges, max_order, fs);
+    (first.sections[..first.count].to_vec(), second.sections[..second.count].to_vec())
 }
 
 /// One half of ToneMeister's type-7 constant tilt. The installed constructor
@@ -747,9 +747,9 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics, mode: Rea
         return Ok(p);
     }
     let max_order = match g.get(5) {
-        Some(v) if v >= 1.0 && v.fract() == 0.0 => (v as u32).min(MAX_ORDER),
+        Some(v) if v >= 1.0 && v.fract() == 0.0 => (v as u32).min(tone_filter::MAX_SHELF_ORDER),
         Some(v) => return Err(bad(format!("{ctx}: highest filter order {v}"))),
-        None => MAX_ORDER,
+        None => tone_filter::DEFAULT_SHELF_ORDER,
     };
     p.gain_db = req(4)? + req(13)?;
     let group_bypass = bits(1)?;
@@ -900,6 +900,15 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics, mode: Rea
                 Ok(())
             } else {
                 Err(bad(format!("{ctx}: slot {i} ({what}) frequency {f} Hz is outside 0 to {nyquist} Hz")))
+            }
+        };
+        // A Butterworth shelf clamps its edges into its own design range
+        // (20 Hz up to just under Nyquist), so any finite edge designs.
+        let need_edge = |what: &str, f: f64| -> Result<()> {
+            if f.is_finite() {
+                Ok(())
+            } else {
+                Err(bad(format!("{ctx}: slot {i} ({what}) frequency {f} Hz")))
             }
         };
         if let Some(dynamic_kind) = dynamic_kind {
@@ -1139,38 +1148,39 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics, mode: Rea
                 if in_bypassed_group && gain > 0.0 {
                     continue;
                 }
-                // A slot the voicing chain moves keeps a fixed five sections
-                // per shelf, so a recomputed shelf of another order fits.
+                // A shelf of 0 dB is a cancelling pole and zero. The
+                // protection pre-stage leaves it out; the voicing box runs
+                // it, as the unit does.
+                if gain == 0.0 && mode != Realise::Saved {
+                    continue;
+                }
+                // A slot the voicing chain moves keeps room for the most
+                // sections its order limit allows per shelf, so a
+                // recomputed shelf of another order fits.
                 let reserve = |shelf: Vec<Section>| -> Vec<Section> {
                     let mut v = shelf;
                     if exact {
-                        v.resize(5, Section::IDENTITY);
+                        v.resize(tone_filter::shelf_sections(max_order), Section::IDENTITY);
                     }
                     v
                 };
                 if kind == 2 {
-                    need_freq("Butterworth shelf", f0)?;
-                    need_freq("Butterworth shelf", q)?;
+                    need_edge("Butterworth shelf", f0)?;
+                    need_edge("Butterworth shelf", q)?;
                     p.sections.extend(reserve(butterworth_shelf(gain, f0, q, max_order, fs)));
                 } else {
                     let f5 = order;
                     let f6 = at(6)?;
                     for f in [f0, q, f5, f6] {
-                        need_freq("Butterworth band shelf", f)?;
+                        need_edge("Butterworth band shelf", f)?;
                     }
-                    // Type 0 is exactly a rising shelf over f3..f4 and a
-                    // falling shelf over f5..f6, with a compensating flat
-                    // gain so both outer asymptotes are 0 dB. The flat gain
-                    // acts at the slot, inside its first section: a
-                    // level-dependent slot after it detects the band shelf's
-                    // true response, as the unit's does (full-box renders).
-                    let mut band = reserve(butterworth_shelf(gain, q, f0, max_order, fs));
-                    band.extend(reserve(butterworth_shelf(gain, f5, f6, max_order, fs)));
-                    if band.is_empty() {
-                        band.push(Section::IDENTITY);
-                    }
-                    band[0] = band[0].scaled(10f64.powf(-gain / 20.0));
-                    p.sections.extend(band);
+                    // Type 0 is a shelf with the opposite gain over its
+                    // first two edges followed by a shelf with the gain over
+                    // the last two: for ordered edges both outer asymptotes
+                    // are 0 dB, with no separate gain stage.
+                    let (first, second) = butterworth_band_shelf(gain, [f0, q, f5, f6], max_order, fs);
+                    p.sections.extend(reserve(first));
+                    p.sections.extend(reserve(second));
                 }
             }
             t => {
@@ -1207,8 +1217,7 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics, mode: Rea
                 frequency_hz,
                 quality,
                 fixed,
-                // the shelf caps its order at ten sections' worth
-                max_order: max_order.clamp(1, 10),
+                max_order,
                 section: first,
             });
             diags.info(
@@ -1661,7 +1670,7 @@ mod tests {
     fn tmst(globals: &[(u32, f32)], slots: &[(u32, [f32; 8])]) -> Stage {
         let mut full: std::collections::BTreeMap<u32, f32> =
             (0..SLOT_BASE + SLOT_STRIDE * SLOTS).map(|id| (id, 0.0)).collect();
-        full.insert(5, MAX_ORDER as f32);
+        full.insert(5, tone_filter::DEFAULT_SHELF_ORDER as f32);
         for (id, v) in globals {
             full.insert(*id, *v);
         }
@@ -1836,24 +1845,25 @@ mod tests {
         // by this terse synthetic-slot helper).
         let boost = tmst(&[(20, 3000.0)], &[(0, [3.0, 0.0, 2.0, 700.0, 800.0, 1800.0, 3.0, 0.0])]);
         let pb = part(&boost, 0, fs, &mut d).unwrap();
-        assert_eq!((pb.sections.len(), pb.gain_db), (4, 0.0));
+        assert_eq!((pb.sections.len(), pb.gain_db), (5, 0.0));
         let cut = tmst(&[(20, 3000.0)], &[(0, [3.0, 0.0, -2.0, 700.0, 800.0, 1800.0, 3.0, 0.0])]);
         let pc = part(&cut, 0, fs, &mut d).unwrap();
-        assert_eq!((pc.sections.len(), pc.gain_db), (4, 0.0));
+        assert_eq!((pc.sections.len(), pc.gain_db), (5, 0.0));
         let db = |p: &Part, f: f64| {
             let mut ch = Channel::IDENTITY;
             ch.count = p.sections.len();
             ch.sections[..p.sections.len()].copy_from_slice(&p.sections);
             20.0 * ch.magnitude(f, fs).log10()
         };
-        // the two shelves less the gain, at every frequency
+        // the opposite-gain shelf over the first edges, then the shelf
+        // over the last: 0 dB outside, the gain between
         for (p, g) in [(&pb, 2.0), (&pc, -2.0)] {
-            let mut shelves = butterworth_shelf(g, 800.0, 700.0, MAX_ORDER, fs);
-            shelves.extend(butterworth_shelf(g, 1800.0, 3000.0, MAX_ORDER, fs));
-            let reference = Part { sections: shelves, gain_db: -g, ..Part::default() };
-            for f in [1.0, 300.0, 750.0, 1200.0, 2300.0, 8000.0] {
-                assert!((db(p, f) - db(&reference, f) + g).abs() < 1e-9, "{g} dB at {f} Hz");
-            }
+            let mut shelves = butterworth_shelf(-g, 700.0, 800.0, tone_filter::DEFAULT_SHELF_ORDER, fs);
+            shelves.extend(butterworth_shelf(g, 1800.0, 3000.0, tone_filter::DEFAULT_SHELF_ORDER, fs));
+            assert_eq!(p.sections, shelves);
+            assert!(db(p, 1.0).abs() < 1e-3 && db(p, 23_000.0).abs() < 1e-3);
+            // a first-order upper transition: most of the gain in between
+            assert!(db(p, 1200.0) / g > 0.7, "{g} dB: {}", db(p, 1200.0));
         }
         // a 0 dB peak at 0 Hz is the identity; a level-dependent cut is a
         // runtime dynamic slot rather than a fixed full-depth section
@@ -2327,8 +2337,8 @@ mod tests {
         assert_eq!(tone.automation.len(), 1);
         assert_eq!(tone.automation[0].shape, ToneShape::ButterworthShelf);
         assert_eq!(tone.automation[0].fixed, [300.0, 0.0, 0.0]);
-        assert_eq!(tone.channels[0].count, 5);
-        let made = butterworth_shelf(8.4f32 as f64, 189.0, 300.0, MAX_ORDER, fs);
+        assert_eq!(tone.channels[0].count, tone_filter::shelf_sections(tone_filter::DEFAULT_SHELF_ORDER));
+        let made = butterworth_shelf(8.4f32 as f64, 189.0, 300.0, tone_filter::DEFAULT_SHELF_ORDER, fs);
         assert_eq!(tone.channels[0].sections()[..made.len()], made[..]);
         let legacy = part(&st, 0, fs, &mut d).unwrap();
         assert!(legacy.sections.is_empty() && legacy.gain_db < 0.0);
