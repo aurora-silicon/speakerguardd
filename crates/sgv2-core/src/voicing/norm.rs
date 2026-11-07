@@ -543,10 +543,6 @@ pub struct Run {
     // look-ahead ring, per channel
     ring: Box<[f32]>,
     pos: usize,
-    // one call of input and of output, per channel
-    call_in: Box<[f32]>,
-    call_out: Box<[f32]>,
-    fill: usize,
     // detector state, per channel and section
     z: [[[f64; 2]; MAX_SECTIONS]; MAX_CHANNELS],
     ema: f64,
@@ -577,7 +573,7 @@ pub struct Run {
     /// long path.
     held: f64,
     /// The reset's second, deferred clearing of the detector state is due
-    /// after the next whole call.
+    /// after the next nonempty render call.
     clear_due: bool,
     candidate: f64,
     target_db: f64,
@@ -598,9 +594,6 @@ impl Run {
             channels,
             ring: vec![0.0; channels * p.lookahead.max(1)].into_boxed_slice(),
             pos: 0,
-            call_in: vec![0.0; channels * CALL].into_boxed_slice(),
-            call_out: vec![0.0; channels * CALL].into_boxed_slice(),
-            fill: 0,
             z: [[[0.0; 2]; MAX_SECTIONS]; MAX_CHANNELS],
             ema: 0.0,
             ema_a: libm::exp(-1.0 / (EMA_S * fs)),
@@ -637,9 +630,6 @@ impl Run {
         let e = self.p.expected_db;
         self.ring.iter_mut().for_each(|v| *v = 0.0);
         self.pos = 0;
-        self.call_in.iter_mut().for_each(|v| *v = 0.0);
-        self.call_out.iter_mut().for_each(|v| *v = 0.0);
-        self.fill = 0;
         self.z = [[[0.0; 2]; MAX_SECTIONS]; MAX_CHANNELS];
         self.ema = SEED_POWER;
         self.in_step = 0;
@@ -666,10 +656,10 @@ impl Run {
         self.gain = self.target;
     }
 
-    /// Frames: the unit's look-ahead plus one call, because the unit meters
-    /// a whole call before it applies that call's gain.
+    /// Audio delay in frames. Metering and gain application complete inside
+    /// the same render call, so only the configured look-ahead delays audio.
     pub fn latency(&self) -> usize {
-        self.p.lookahead + CALL
+        self.p.lookahead
     }
 
     /// The gain at the end of the last whole call, dB.
@@ -761,14 +751,22 @@ impl Run {
         self.target = libm::pow(10.0, self.target_db / 20.0);
     }
 
-    /// One call: meter all of it, then move the gain across it.
-    fn run_call(&mut self) {
-        let nch = self.channels;
+    /// In place on `channels` buffers of at least `frames` samples.
+    ///
+    /// Like the AU, meter the entire render call before moving the gain
+    /// across that same call. The caller supplies the render boundary (512
+    /// frames in the speaker graph); the meter counters remain stream based.
+    /// A short final call is processed immediately, without padding or a flush.
+    pub fn process(&mut self, bufs: &mut [&mut [f32]], frames: usize) {
+        if frames == 0 {
+            return;
+        }
+        let nch = self.channels.min(bufs.len());
         let la = self.p.lookahead;
-        for n in 0..CALL {
+        for n in 0..frames {
             let mut power = 0.0;
-            for ch in 0..nch {
-                let x = self.call_in[ch * CALL + n];
+            for (ch, b) in bufs.iter().enumerate().take(nch) {
+                let x = b.get(n).copied().filter(|v| v.is_finite()).unwrap_or(0.0);
                 power += self.detect(ch, f64::from(x));
             }
             self.ema = self.ema_a * self.ema + (1.0 - self.ema_a) * power.max(1e-12);
@@ -786,40 +784,22 @@ impl Run {
             self.clear_due = false;
             self.z = [[[0.0; 2]; MAX_SECTIONS]; MAX_CHANNELS];
         }
-        for n in 0..CALL {
+        for n in 0..frames {
             self.gain += self.glide * (self.target - self.gain);
             let g = self.gain as f32;
-            for ch in 0..nch {
-                let x = self.call_in[ch * CALL + n];
+            for (ch, b) in bufs.iter_mut().enumerate().take(nch) {
+                let Some(s) = b.get_mut(n) else { continue };
+                let x = if s.is_finite() { *s } else { 0.0 };
                 let y = if la == 0 {
                     x
                 } else {
                     let slot = &mut self.ring[ch * la + self.pos];
                     core::mem::replace(slot, x)
                 };
-                self.call_out[ch * CALL + n] = y * g;
+                *s = y * g;
             }
             if la != 0 {
                 self.pos = (self.pos + 1) % la;
-            }
-        }
-    }
-
-    /// In place on `channels` buffers of at least `frames` samples.
-    pub fn process(&mut self, bufs: &mut [&mut [f32]], frames: usize) {
-        let nch = self.channels.min(bufs.len());
-        for n in 0..frames {
-            let f = self.fill;
-            for (ch, b) in bufs.iter_mut().enumerate().take(nch) {
-                let Some(s) = b.get_mut(n) else { continue };
-                let x = if s.is_finite() { *s } else { 0.0 };
-                self.call_in[ch * CALL + f] = x;
-                *s = self.call_out[ch * CALL + f];
-            }
-            self.fill += 1;
-            if self.fill == CALL {
-                self.fill = 0;
-                self.run_call();
             }
         }
     }
@@ -899,7 +879,7 @@ mod tests {
         let p = params(144);
         let mut r = Run::new(&p, 48_000.0, 2);
         assert!((r.gain_db() - p.gain_db(p.expected_db)).abs() < 1e-12);
-        assert_eq!(r.latency(), 144 + CALL);
+        assert_eq!(r.latency(), 144);
         let n = 2048;
         let mut a = vec![0.0f32; n];
         let mut b = vec![0.0f32; n];
@@ -913,25 +893,47 @@ mod tests {
     }
 
     #[test]
-    fn calls_of_any_size_give_the_same_output() {
-        let p = params(144);
-        let n = 48_000;
-        let x: Vec<f32> =
-            (0..n).map(|i| 0.3 * libm::sinf(i as f32 * 0.05) * if i > 20_000 { 1.0 } else { 0.1 }).collect();
-        let mut whole = x.clone();
-        Run::new(&p, 48_000.0, 1).process(&mut [&mut whole], n);
-        let mut pieces = x;
-        let mut r = Run::new(&p, 48_000.0, 1);
-        let mut at = 0;
-        for (k, q) in [1usize, 7, 64, 333, 512, 1024, 4000].iter().cycle().enumerate() {
-            if at >= n || k > 10_000 {
-                break;
+    fn the_current_call_sets_its_own_gain_without_a_transport_call() {
+        let p = params(0);
+        let mut quiet = vec![0.001f32; CALL];
+        let mut onset = quiet.clone();
+        onset[CALL / 2..].fill(1.0);
+        let mut a = Run::new(&p, 48_000.0, 1);
+        let mut b = Run::new(&p, 48_000.0, 1);
+        a.process(&mut [&mut quiet], CALL);
+        b.process(&mut [&mut onset], CALL);
+        // Identical input at frame zero, different later input in this call:
+        // the later metered peak already affects frame zero's applied gain.
+        assert!(onset[0] > 0.0);
+        assert!(onset[0] < quiet[0]);
+        assert_eq!(a.latency(), 0);
+        assert_eq!(b.latency(), 0);
+    }
+
+    #[test]
+    fn short_calls_keep_only_the_lookahead_and_reset_discards_old_audio() {
+        for la in [0, 1, 144] {
+            let p = Params { table: [0.0; NODES], lookahead: la, ..params(la) };
+            let mut r = Run::new(&p, 48_000.0, 1);
+            let mut output = Vec::new();
+            let mut frame = 0;
+            for q in [1, 7, 64, 333, 512, 19] {
+                let mut x: Vec<f32> = (frame..frame + q).map(|i| if i == 0 { 0.25 } else { 0.0 }).collect();
+                r.process(&mut [&mut x], q);
+                output.extend(x);
+                frame += q;
             }
-            let m = (*q).min(n - at);
-            r.process(&mut [&mut pieces[at..at + m]], m);
-            at += m;
+            assert_eq!(r.latency(), la);
+            for (i, x) in output.iter().enumerate() {
+                assert_eq!(*x, if i == la { 0.25 } else { 0.0 });
+            }
+            let mut old = vec![0.5; CALL];
+            r.process(&mut [&mut old], CALL);
+            r.reset();
+            let mut silence = vec![0.0; CALL];
+            r.process(&mut [&mut silence], CALL);
+            assert!(silence.iter().all(|v| *v == 0.0));
         }
-        assert_eq!(whole, pieces);
     }
 
     #[test]
@@ -1126,9 +1128,7 @@ mod tests {
         let mut r = Run::new(&p, 48_000.0, 1);
         let mut buf = vec![0.25f32; CALL - 1];
         r.process(&mut [&mut buf], CALL - 1);
-        assert!(r.clear_due);
-        let mut one = vec![0.25f32; 1];
-        r.process(&mut [&mut one], 1);
+        // Reset clearing follows the actual render call, even a short one.
         assert!(!r.clear_due);
         assert_eq!(r.z[0][0], [0.0; 2]);
         let mut more = vec![0.25f32; CALL];
