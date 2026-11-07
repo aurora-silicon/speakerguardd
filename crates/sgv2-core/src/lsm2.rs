@@ -2924,9 +2924,10 @@ impl ProtectionUnit for Unit {
         for c in &run.ch {
             let mut s = ChannelState::ABSENT;
             let t = c.ambient + c.th_mg as f64 + c.th_vc as f64;
-            let coil_telemetry = c.telemetry_ambient + c.th_mg as f64 + c.th_vc as f64;
+            // binary32, ambient plus the coil rise, then the magnet rise
+            let coil_telemetry = (c.telemetry_ambient as f32 + c.th_vc) + c.th_mg;
             s.modeled_power_w = c.pbar[2] as f32;
-            s.coil_temp_c = coil_telemetry as f32;
+            s.coil_temp_c = coil_telemetry;
             s.magnet_temp_c = (c.ambient + c.th_mg as f64) as f32;
             s.control_temp_c = t as f32;
             s.ol_temp_c = t as f32;
