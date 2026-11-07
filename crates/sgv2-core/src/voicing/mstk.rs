@@ -754,6 +754,18 @@ impl Mode4Gain {
 }
 
 impl Mode4Mix {
+    /// Band 3 has no analytic correction arms, but it keeps the same
+    /// bounded crossfade between the direct gain and its 50 Hz companion,
+    /// as a real gain (black-box, installed unit: both arm gains stay equal,
+    /// the attack carries the `(g / l)^2 (l - g)` lobe that peaks where the
+    /// companion is twice the gain, and recovery follows the companion).
+    #[inline]
+    fn apply_real(self, arm_a: f64, arm_b: f64) -> f64 {
+        let weight = self.correction_weight;
+        let gain = self.gain * weight + self.lowpass * (1.0 - weight);
+        (((arm_a as f32 + arm_b as f32) * gain) * core::f32::consts::FRAC_1_SQRT_2) as f64
+    }
+
     #[inline]
     fn apply_direct(self, arm_a: f64, arm_b: f64) -> f64 {
         (((arm_a as f32 + arm_b as f32) * self.gain) * core::f32::consts::FRAC_1_SQRT_2) as f64
@@ -1457,7 +1469,9 @@ impl Run {
                 let mut processed = [0.0; BANDS];
                 for b in 0..BANDS {
                     processed[b] = if self.hop_peak {
-                        let output = if b + 1 == BANDS || (self.previous_band0 && b == 0) {
+                        let output = if b + 1 == BANDS {
+                            mode4[b].apply_real(bands_a[c][b], bands_b[c][b])
+                        } else if self.previous_band0 && b == 0 {
                             mode4[b].apply_direct(bands_a[c][b], bands_b[c][b])
                         } else {
                             mode4[b].apply(bands_a[c][b], bands_b[c][b])
