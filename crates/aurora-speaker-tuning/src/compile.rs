@@ -276,33 +276,57 @@ pub fn compile(t: &Tuning, m: &Machine, diags: &mut Diagnostics) -> Result<Compi
     compile_with(t, m, Provenance::Verified, diags)
 }
 
+/// What runs ahead of the protection unit, inside the engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PreStageMode {
+    /// Pass-through (identity): the unit protects exactly what the voicing
+    /// graph sends it, which is what reaches the amps, and no crossover is
+    /// declared to the kernel (the tweeters' amp high-pass stays at its safe
+    /// corner). The shipped default for every unit (Plan B, 2026-11-07): the
+    /// tuning's pre-stage stacked on the distribution's voicing graph applied
+    /// the Mac's filtering twice and held every volume-dependent slot at its
+    /// strongest cut (-16..-18 dB on the J700 at full volume), which is
+    /// neither macOS parity nor a safety need. Protection, its limits and
+    /// its models are unchanged.
+    #[default]
+    Identity,
+    /// The Mac's own filtering ahead of the unit, derived from the tuning
+    /// (crate::prestage), with the crossover declared to the kernel. For
+    /// the differential rigs and the full macOS chain (the voicing graph
+    /// must then not filter a second time).
+    Tuning,
+}
+
 pub fn compile_with(t: &Tuning, m: &Machine, provenance: Provenance, diags: &mut Diagnostics) -> Result<Compiled> {
+    compile_opts(t, m, provenance, PreStageMode::default(), diags)
+}
+
+pub fn compile_opts(
+    t: &Tuning,
+    m: &Machine,
+    provenance: Provenance,
+    prestage: PreStageMode,
+    diags: &mut Diagnostics,
+) -> Result<Compiled> {
     let b = preflight(t, m, provenance, diags)?;
     let mut c = match t.protection.kind {
         UnitKind::Spp3 => compile_spp3(t, &b, diags),
         UnitKind::Lsm2 => compile_lsm2(t, &b, diags),
         UnitKind::Atsp => compile_atsp(t, &b),
     }?;
-    // The graph's own filtering ahead of the unit (crate::prestage). spp3
-    // and lsm2 get no blob without it: it is how hard their cones are driven.
-    // atsp limits coil temperature and reached parity with the voicing graph
-    // feeding the unit directly, so it runs protection-only (identity
-    // pre-stage, no crossover declared to the kernel) until the voicing
-    // chain carries the whole graph: the voicing graph already shapes its
-    // feed, and a second copy of the graph's filters would apply them twice.
-    let pre = if t.protection.kind == UnitKind::Atsp {
-        match crate::prestage::derive(t, c.sample_rate as f64, c.channels as usize, &mut Diagnostics::default()) {
-            Ok(_) => diags.info(
-                "prestage-atsp-protection-only",
-                "pre-stage",
-                "atsp runs protection-only: the voicing graph feeds the unit (the graph's pre-stage compiles but is not used)",
-            ),
-            Err(e) => diags.info(
-                "prestage-atsp-protection-only",
-                "pre-stage",
-                format!("atsp runs protection-only: the voicing graph feeds the unit (the graph's pre-stage would refuse: {e})"),
-            ),
-        }
+    // Derive the interim crossover/compressor only on explicit request.
+    // The default protects the actual feed from the external voicing graph;
+    // deriving unused filters would still apply obsolete admission rules.
+    let pre = if prestage == PreStageMode::Identity || t.protection.kind == UnitKind::Atsp {
+        diags.info(
+            if t.protection.kind == UnitKind::Atsp {
+                "prestage-atsp-protection-only"
+            } else {
+                "prestage-protection-only"
+            },
+            "pre-stage",
+            "protection-only: identity pre-stage; the external voicing graph feeds the unit",
+        );
         sgv2_core::prestage::Params::identity(c.channels as usize)
     } else {
         match crate::prestage::derive(t, c.sample_rate as f64, c.channels as usize, diags) {

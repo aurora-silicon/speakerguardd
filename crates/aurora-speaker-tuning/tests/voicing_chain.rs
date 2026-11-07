@@ -107,3 +107,51 @@ fn plan_carries_a_sum_of_both_program_channels() {
     run.process(&[&l, &r], &mut lanes, 16);
     assert!(lanes.iter().all(|lane| lane[9] == 0.75));
 }
+
+#[test]
+fn zero_port_control_sum_selects_tone_groups_at_runtime() {
+    use aurora_speaker_tuning::{
+        aupreset::{ParamSection, ParamState},
+        dspg,
+        fourcc::FourCc,
+    };
+    let mut t = tuning("control-sum");
+    let control_graph = dspg::parse(
+        "box Selector parameter_add 0 0\nbox Eq (aufx tmst) 1 1\nparam one 1 const\nparam lids 1\nwireGraphParam one (Selector 0 input 0)\nwireGraphParam lids (Selector 0 input 1)\nwireParam (Selector 0 output 0) (Eq 1)\n",
+        &Default::default(), "synthetic controls").unwrap();
+    t.graph.boxes.retain(|b| b.name != "Eq");
+    t.graph.boxes.extend(control_graph.boxes);
+    t.graph.params.extend(control_graph.params);
+    t.graph.param_links.extend(control_graph.param_links);
+    t.graph.box_param_links.extend(control_graph.box_param_links);
+    let stage = t.chain.iter_mut().find(|s| s.name == "Eq").unwrap();
+    stage.unit.as_mut().unwrap().subtype = FourCc::from_bytes(*b"tmst");
+    let mut params: std::collections::BTreeMap<u32, f32> = (0..514).map(|id| (id, 0.0)).collect();
+    params.extend([(5, 12.0), (14, 3.0), (15, 9.0), (16, -6.0), (17, 500.0), (18, 1.0), (19, 2.0), (21, 3.0)]);
+    stage.state = Some(ParamState {
+        sections: vec![ParamSection { scope: 0, element: 0, params: params.into_iter().collect() }],
+    });
+    let c = chain::compile(&t, 48_000.0, &mut Diagnostics::default()).unwrap();
+    assert!(c.stubs.is_empty() && c.unwired.is_empty(), "{:?}", c.gaps);
+    assert_eq!(c.plan.nodes[0].name, "Selector");
+    let base = aurora_speaker_tuning::compile::compile(
+        &t,
+        &aurora_speaker_tuning::machine::Machine::with_unit("j413", &test_unit()).unwrap(),
+        &mut Diagnostics::default(),
+    )
+    .unwrap();
+    let bytes = sgv2_core::voicing::artifact::encode(&c.spec, &base.blob).unwrap();
+    assert_eq!(sgv2_core::voicing::artifact::decode(&bytes, &base.blob).unwrap(), c.spec);
+    let mut run = Chain::new(c.spec, 48_000.0, 16).unwrap();
+    let input = [1.0; 16];
+    let mut output = [[0.0; 16]; 4];
+    for (lid, expected) in [(1.0, 10f32.powf(-6.0 / 20.0)), (0.0, 1.0), (1.0, 10f32.powf(-6.0 / 20.0))] {
+        run.set_param(sgv2_core::voicing::chain::GraphParam::Lid, lid);
+        let mut refs: Vec<&mut [f32]> = output.iter_mut().map(|c| &mut c[..]).collect();
+        run.process(&[&input, &input], &mut refs, 16);
+        assert!(output.iter().flatten().all(|v| (*v - expected).abs() < 1e-6));
+    }
+    // A control input with no supported runtime source is not silently lost.
+    t.graph.params.iter_mut().find(|p| p.name == "one").unwrap().constant = false;
+    assert!(chain::compile(&t, 48_000.0, &mut Diagnostics::default()).is_err());
+}

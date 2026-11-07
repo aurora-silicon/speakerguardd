@@ -141,6 +141,11 @@ where
     }
     for link in &graph.box_param_links {
         let from = checked_box(graph, &link.from.node, &mut check)?;
+        // Parameter arithmetic and other control boxes are not volume
+        // publishers. Their named scopes belong to their own compiler.
+        if subtype(from) != Some(*b"volt") {
+            continue;
+        }
         let to = checked_box(graph, &link.to.node, &mut check)?;
         let (from_id, from_scope, from_element) = location(&link.from)?;
         let (to_id, to_scope, to_element) = location(&link.to)?;

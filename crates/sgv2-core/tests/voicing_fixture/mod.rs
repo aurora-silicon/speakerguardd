@@ -90,6 +90,8 @@ pub fn spec(lanes: usize) -> Spec {
             saturation_mode: 0,
             saturation_flavor: 0,
             saturation_mix: 0.0,
+            input_gain_db: 0.0,
+            output_gain_db: 0.0,
         })),
         Kind::Buzz(Box::new(voicing::buzz::Params)),
         Kind::Cdelay(Box::new(voicing::cdelay::Params { channels: 2, delay_frames: [0; MAX_CHANNELS] })),

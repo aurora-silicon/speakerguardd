@@ -377,7 +377,8 @@ pub fn voicing_tone(
             };
             let point = |scalar: f64, gain_db: f64, frequency_hz: f64, which: &str| -> Result<TonePoint> {
                 if !gain_db.is_finite()
-                    || !(-30.0..=0.0).contains(&gain_db)
+                    || !(if dynamic_slot.params.kind == DynamicKind::LowShelf { -30.0..=30.0 } else { -30.0..=0.0 })
+                        .contains(&gain_db)
                     || !frequency_hz.is_finite()
                     || frequency_hz <= 0.0
                     || frequency_hz >= fs / 2.0
@@ -2163,6 +2164,16 @@ mod tests {
         assert_eq!(tone.dynamic_automation[0].index, 0);
         assert_eq!(tone.dynamic_automation[0].a.frequency_hz, 9_500.0);
         assert_eq!(tone.dynamic_automation[0].b.frequency_hz, 9_000.0);
+    }
+
+    #[test]
+    fn dynamic_low_shelf_automation_carries_positive_range() {
+        let stage =
+            tmst(&auto(0, 0.0, 0.0, (1.0, 0.0, 500.0), None), &[(0, [3.0, 17.0, 12.0, 500.0, 1.0, 2.0, 3.0, 0.0])]);
+        let (tone, partial) = voicing_tone(&stage, 2, true, 48_000.0, &mut Diagnostics::default()).unwrap();
+        assert!(partial.is_empty());
+        assert_eq!(tone.dynamic_automation[0].a.gain_db, 12.0);
+        assert_eq!(tone.dynamic_automation[0].b.gain_db, 0.0);
     }
 
     #[test]

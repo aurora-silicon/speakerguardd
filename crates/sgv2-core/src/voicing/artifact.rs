@@ -153,7 +153,7 @@ macro_rules! choices {
         }
     };
 }
-choices!(GraphParam, VolumeScalar = 0, VolumeDb = 1, Mute = 2, BalanceLeft = 3, BalanceRight = 4);
+choices!(GraphParam, VolumeScalar = 0, VolumeDb = 1, Mute = 2, BalanceLeft = 3, BalanceRight = 4, Lid = 5);
 choices!(BandMode, Compress = 0, Pass = 1, Mute = 2);
 choices!(DynamicKind, Notch = 15, LowShelf = 17, HighShelf = 18);
 impl Wire for Source {
@@ -211,11 +211,22 @@ impl Wire for ToneShape {
         })
     }
 }
+record!(ToneVariant, mask, tone);
+
 impl Wire for Kind {
     fn put(&self, o: &mut Vec<u8>) {
         match self {
             Self::NonFinite => 0u32.put(o),
             Self::Gain => 1u32.put(o),
+            Self::ParameterAdd(values) => {
+                19u32.put(o);
+                values.put(o);
+            }
+            Self::ToneGroups { default_mask, variants } => {
+                20u32.put(o);
+                default_mask.put(o);
+                variants.put(o);
+            }
             Self::Tone(p) => {
                 2u32.put(o);
                 p.put(o);
@@ -239,9 +250,13 @@ impl Wire for Kind {
                 }
             }
             Self::Cfreak(p) => {
-                7u32.put(o);
+                let legacy = p.input_gain_db == 0.0 && p.output_gain_db == 0.0;
+                (if legacy { 7u32 } else { 18u32 }).put(o);
                 let mut w = vec![0.0; super::cfreak::Params::WORDS];
                 p.to_words(&mut w);
+                if legacy {
+                    w.truncate(super::cfreak::Params::LEGACY_WORDS);
+                }
                 for v in w {
                     v.put(o);
                 }
@@ -324,6 +339,8 @@ impl Wire for Kind {
         Ok(match u32::get(r)? {
             0 => Self::NonFinite,
             1 => Self::Gain,
+            19 => Self::ParameterAdd(Vec::get(r)?),
+            20 => Self::ToneGroups { default_mask: u32::get(r)?, variants: Vec::get(r)? },
             2 => Self::Tone(Tone::get(r)?),
             3 => Self::Comp(Dynamics::get(r)?),
             4 => Self::Bypass,
@@ -332,8 +349,9 @@ impl Wire for Kind {
                 let w: Vec<f64> = (0..super::xtc::Params::WORDS).map(|_| f64::get(r)).collect::<Result<_>>()?;
                 Self::Xtc(Box::new(super::xtc::Params::from_words(&w).ok_or(BlobError::Unstable)?))
             }
-            7 => {
-                let w: Vec<f64> = (0..super::cfreak::Params::WORDS).map(|_| f64::get(r)).collect::<Result<_>>()?;
+            tag @ (7 | 18) => {
+                let words = if tag == 7 { super::cfreak::Params::LEGACY_WORDS } else { super::cfreak::Params::WORDS };
+                let w: Vec<f64> = (0..words).map(|_| f64::get(r)).collect::<Result<_>>()?;
                 Self::Cfreak(Box::new(super::cfreak::Params::from_words(&w).ok_or(BlobError::Unstable)?))
             }
             8 => {
@@ -432,13 +450,15 @@ fn validate(spec: &Spec, fs: f64, lanes: usize) -> Result<()> {
         return Err(BlobError::Channels);
     }
     // Check counts before Spec::check calls Channel::sections().
-    if spec.nodes.iter().any(|n| matches!(&n.kind, Kind::Tone(t) if t.channels.iter().any(|c| c.count > MAX_SECTIONS)))
-    {
+    if spec.nodes.iter().any(|n| n.kind.tones().any(|t| t.channels.iter().any(|c| c.count > MAX_SECTIONS))) {
         return Err(BlobError::Length);
     }
     spec.check().map_err(|_| BlobError::Unstable)?;
     for node in &spec.nodes {
         let width = node.inputs.len();
+        if node.kind.tones().any(|t| t.dynamic.iter().any(|d| !d.params.valid(fs))) {
+            return Err(BlobError::Unstable);
+        }
         match &node.kind {
             Kind::Xtc(_) | Kind::Vbass(_) if width != 2 => return Err(BlobError::Channels),
             Kind::Norm(_) if width > super::norm::MAX_CHANNELS => return Err(BlobError::Channels),
