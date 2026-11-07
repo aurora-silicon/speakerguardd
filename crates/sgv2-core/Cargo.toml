@@ -18,6 +18,10 @@ lsm2-waterfill = []
 # detector/state law; this feature retains the fixed guarded ceiling for an
 # explicitly conservative image or an incomplete legacy sidecar.
 lowflow-conservative = []
+# Plan A tonight (2026-11-07): the shipped builds take the conservative
+# LowFlow until its exact law passes the rig (t-5476). Without it the j413
+# voicing refuses to compile (fails closed). Remove once LowFlow is exact.
+default = ["lowflow-conservative"]
 
 [dependencies]
 # Pure-Rust, no_std, correctly rounded sqrt and a portable exp: the same
