@@ -171,5 +171,5 @@ pub fn lowflow_params() -> voicing::lowflow::Params {
     models[0] = model;
     models[0].pressure_response[0] = 1.0;
     models[0].tweeter_response[0] = 1.0;
-    Params { model_count: 1, link_channel_energies: true, latency_frames: 256, models }
+    Params { model_count: 1, link_channel_energies: true, latency_frames: 256, conservative_fallback: false, models }
 }
