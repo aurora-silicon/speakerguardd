@@ -63,9 +63,8 @@
 //! read as a uniform cubic B-spline over the nodes (not by linear
 //! interpolation: the unit rounds the table's knees). The applied gain is
 //! linear: each frame it covers a fixed share of the remaining distance to
-//! the call's target amplitude, a one-pole smoother with a 0.8 ms time
-//! constant (the same time at every sample rate). Gliding in dB instead
-//! bends every large step's onset by up to tenths of a dB.
+//! the call's target amplitude through a one-pole smoother. Gliding in dB
+//! instead bends every large step's onset by up to tenths of a dB.
 //!
 //! Algorithm 1 (the earliest version a strip can select) keeps the same
 //! detector, meters and gain law with these differences:
@@ -82,6 +81,7 @@
 //!   below its lower knee; there is no deferred second clear of the detector
 //!   state;
 //! - the applied gain starts its glide at the public default maximum gain;
+//!   its glide has a 0.8 ms time constant at every sample rate;
 //! - the fast level is a two-sided hysteresis on the first single-precision
 //!   smoothed-detector level of every 64-frame step, less a 4 dB store: it
 //!   rises only when that stored level strictly clears it by 3 dB and falls
@@ -128,8 +128,10 @@ const BIN_LO_DB: f64 = -100.0;
 const BIN_DB: f64 = 0.1;
 const SEED_HALF: usize = 5;
 /// Time constant of the one-pole that glides the linear gain toward each
-/// call's target.
+/// call's target in algorithm 1.
 const GLIDE_S: f32 = 0.000_8;
+/// Existing algorithms 2/3 glide, retained outside this algorithm-1 change.
+const LEGACY_GLIDE_HZ: f64 = 200.0;
 /// macOS renders the speaker graph in calls of this many frames; the unit
 /// meters a whole call before it moves its gain across that call.
 pub const CALL: usize = 512;
@@ -718,7 +720,11 @@ impl Run {
             steps_in_call: 0,
             gain: 1.0,
             target: 1.0,
-            glide: f64::from(1.0 - libm::expf(-1.0 / (GLIDE_S * fs as f32))),
+            glide: if p.algorithm1 {
+                f64::from(1.0 - libm::expf(-1.0 / (GLIDE_S * fs as f32)))
+            } else {
+                1.0 - libm::exp(-2.0 * core::f64::consts::PI * LEGACY_GLIDE_HZ / fs)
+            },
         };
         r.reset();
         r
@@ -1000,7 +1006,7 @@ mod tests {
 
     #[test]
     fn gain_glides_linearly_with_an_800_us_one_pole() {
-        let p = params(0);
+        let p = Params { algorithm1: true, detector_ema_s: 0.040, ..params(0) };
         let mut r = Run::new(&p, 48_000.0, 1);
         let from = libm::pow(10.0, p.gain_db(p.expected_db) / 20.0);
         // a loud call moves the target; the applied amplitude covers the
