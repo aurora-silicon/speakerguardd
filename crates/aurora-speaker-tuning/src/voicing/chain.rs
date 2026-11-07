@@ -74,6 +74,13 @@ fn tone(
             format!("tmst volume automation carried at its least-passing setting (entries {partial:?})"),
         ));
     }
+    if tone.dynamic.iter().any(|d| d.params.kind == sgv2_core::prestage::DynamicKind::Notch) {
+        gaps.push((
+            stage.name.clone(),
+            "type-15 filters carry native multirate reconstruction and the settled-idle carrier; active/tail parity is pending"
+                .into(),
+        ));
+    }
     Ok(Kind::Tone(tone))
 }
 
