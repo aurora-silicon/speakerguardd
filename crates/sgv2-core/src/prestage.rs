@@ -1699,6 +1699,23 @@ impl PreStage {
 mod tests {
     use super::*;
 
+    #[test]
+    fn type_17_shelf_keeps_its_zero_and_moves_its_pole_with_the_gain() {
+        // Synthetic corner, not any Mac's.
+        let (zero_hz, fs) = (720.0, 48_000.0);
+        for g in [0.5, 1.0, 1.5, 3.0] {
+            let carrier = DynamicRun::moving_shelf_carrier(zero_hz, g, fs).unwrap();
+            // The carrier's corner sits at zero / g (prewarped, so exact).
+            let at_corner = carrier.magnitude(zero_hz / g, fs);
+            assert!((at_corner - core::f64::consts::FRAC_1_SQRT_2).abs() < 1e-12, "{g} {at_corner}");
+            // dry + (g - 1) * carrier: gain g at DC, unity at Nyquist.
+            let dc = 1.0 + (g - 1.0) * carrier.magnitude(0.0, fs);
+            assert!((dc - g).abs() < 1e-12, "{g} {dc}");
+        }
+        assert!(DynamicRun::moving_shelf_carrier(zero_hz, 0.0, fs).is_none());
+        assert!(DynamicRun::moving_shelf_carrier(zero_hz, 0.01, fs).is_none());
+    }
+
     fn hp2(f0: f64, fs: f64) -> Section {
         // Butterworth high-pass, bilinear with prewarping
         let k = libm::tan(core::f64::consts::PI * f0 / fs);
