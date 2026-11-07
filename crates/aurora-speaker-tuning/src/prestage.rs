@@ -1057,8 +1057,13 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics, mode: Rea
                 }
             }
             // A peak or shelf of 0 dB at every point is the identity at
-            // any frequency and quality.
-            1 | 11 | 12 if points.iter().all(|pt| pt.gain == 0.0) => {}
+            // any frequency and quality. The protection pre-stage leaves it
+            // out; the voicing box keeps it, because the installed unit
+            // still runs its section and that section's Float32 rounding
+            // is part of the box's output (black-box renders of the
+            // installed unit: a 0 dB peak at 97 Hz adds a -89 dB rounding
+            // floor to a 16 kHz tone).
+            1 | 11 | 12 if mode != Realise::Saved && points.iter().all(|pt| pt.gain == 0.0) => {}
             7 => {
                 if automated {
                     return Err(bad(format!("{ctx}: slot {i}: volume automation on a constant tilt")));

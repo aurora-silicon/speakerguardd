@@ -35,7 +35,7 @@ gate = load("gate", "speakerguardd-gate")
 # A stand-in for aurora-speaker-tuning: `identify` and `compile`, steered by
 # a JSON file beside it.
 FAKE_CLI = r'''#!/usr/bin/env python3
-import json, os, sys
+import hashlib, json, os, sys
 ctl = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "ctl.json")))
 cmd = sys.argv[1]
 log = os.path.join(os.path.dirname(os.path.abspath(__file__)), "calls")
@@ -45,7 +45,10 @@ if cmd == "identify":
     if ctl.get("no_bundle"):
         print(json.dumps({"error": "no speaker tuning bundle found"})); sys.exit(1)
     print(json.dumps({"source": "/lib/firmware/vendor/apple/audio-tuning", "verified": True, "aid": "AID9",
-                      "macos_build": ctl.get("build", "25G83"), "digest": ctl.get("digest", "d1"), "reader": "1.0.0"}))
+                      "macos_build": ctl.get("build", "25G83"), "digest": ctl.get("digest", "d1"), "reader": "1.0.0",
+                      "kind": ctl.get("kind", "Installer"), "board": ctl.get("board", "j316s"),
+                      "unit_bound": ctl.get("unit_bound", True),
+                      "unit_id": ctl.get("unit_id", hashlib.sha256(b"aurora-speaker-unit-v1\0SYNTHETIC0A").hexdigest())}))
 elif cmd == "compile":
     if ctl.get("compile_fails"):
         print("error[spp3-channel-count] NumChannels 6 but the graph feeds the unit 4 channels", file=sys.stderr)
@@ -56,11 +59,15 @@ elif cmd == "compile":
     for w in ctl.get("warnings", []):
         print(w, file=sys.stderr)
 elif cmd == "dump":
-    print(json.dumps({"tuning": {"protection": {"kind": ctl.get("unit", "spp3")}}}))
+    t = {"protection": {"kind": ctl.get("unit", "spp3")}, "refusals": ctl.get("refusals", [])}
+    if ctl.get("lsid"):
+        t["lsid"] = {}
+    print(json.dumps({"tuning": t}))
+    sys.exit(ctl.get("dump_rc", 0))
 '''
 
-# The test gate: only j316s has qualified.
-GATE = {"units_at_parity": ["spp3"], "require_qualified_board": True, "qualified": {"spp3": ["j316s"]}}
+# Parity belongs to the build, never a per-board list.
+GATE = {"units_at_parity": ["spp3"], "denied_boards": [], "board_overrides": {}}
 
 
 def write_dt(root, board):
@@ -81,7 +88,7 @@ def write_dt(root, board):
 
     for d in ("sound", "soc"):
         shutil.rmtree(os.path.join(root, d), ignore_errors=True)
-    node(".", {"compatible": f"apple,{board}\0apple,t6000\0".encode()})
+    node(".", {"compatible": f"apple,{board}\0apple,t6000\0".encode(), "serial-number": b"SYNTHETIC0A\0"})
     node("soc/be", {"compatible": b"apple,mca\0", "#sound-dai-cells": (1).to_bytes(4, "big")}, 0x10)
     node("soc/amp", {"compatible": b"ti,sn012776\0", "sound-name-prefix": b"Speaker\0"}, 0x11)
     node("sound", {"compatible": f"apple,{key}-macaudio\0apple,macaudio\0".encode(), "model": f"Test Mac {key.upper()}\0".encode()})
@@ -177,7 +184,7 @@ class Provision(Base):
 
     def test_compiles_binds_and_configures(self):
         self.assertEqual(self.run_(), 0)
-        self.assertEqual(self.calls(), ["identify", "compile"])
+        self.assertEqual(self.calls(), ["identify", "dump", "compile"])
         conf = prov.read_kv(self.p.conf)
         self.assertEqual(conf["SGV2_MACHINE"], "j316")
         self.assertEqual(conf["SGV2_USER"], ME.pw_name)
@@ -222,26 +229,25 @@ class Provision(Base):
         prov.write_atomic(self.p.bind, "".join(f"{k}={v}\n" for k, v in b.items()))
 
     def test_binds_the_unit_not_the_serial(self):
-        # No serial-number: "-". A synthetic one: its domain-separated hash,
-        # and another unit recompiles (where the compiler refuses the bundle).
-        self.assertEqual(self.run_(), 0)
-        self.assertEqual(prov.read_kv(self.p.bind)["unit"], "-")
-        with open(os.path.join(self.dt, "serial-number"), "wb") as f:
-            f.write(b"SYNTHETIC0A\0")
         self.assertEqual(self.run_(), 0)
         want = hashlib.sha256(b"aurora-speaker-unit-v1\0SYNTHETIC0A").hexdigest()
         self.assertEqual(prov.read_kv(self.p.bind)["unit"], want)
-        self.assertEqual(self.calls().count("compile"), 2)
         for path in (self.p.bind, self.p.report, self.p.conf):
             with open(path, "rb") as f:
                 self.assertNotIn(b"SYNTHETIC0A", f.read())
+        # Another Mac's extraction and a missing/malformed local identity
+        # must never reuse a blob or compile in open-loop fallback mode.
         with open(os.path.join(self.dt, "serial-number"), "wb") as f:
             f.write(b"SYNTHETIC0B\0")
-        self.assertEqual(self.run_(), 0)
-        self.assertEqual(self.calls().count("compile"), 3)
+        self.assertEqual(self.run_(), 1)
+        self.assert_closed("provenance")
+        os.unlink(os.path.join(self.dt, "serial-number"))
+        self.assertEqual(self.run_(), 1)
+        self.assert_closed("provenance")
         with open(os.path.join(self.dt, "serial-number"), "wb") as f:
             f.write(b"NOT ONE\0")
         self.assertEqual(prov.unit_id(self.dt), "malformed")
+        self.assertEqual(self.run_(), 1)
 
     def test_logs_the_compilers_warnings(self):
         warn = "warning[unit-unbound] compile: the tuning bundle does not name the Mac it was collected on"
@@ -255,6 +261,7 @@ class Provision(Base):
     def test_another_board_recompiles(self):
         self.assertEqual(self.run_(), 0)
         self.board("j413")
+        self.ctl({"board": "j413"})
         self.assertEqual(self.run_(), 0)
         self.assertEqual(self.calls().count("compile"), 2)
         self.assertEqual(prov.read_kv(self.p.conf)["SGV2_MACHINE"], "j413")
@@ -685,84 +692,193 @@ class LV2Shadow(unittest.TestCase):
         self.assertEqual(self.scan(environ={"LV2_PATH": "/usr/lib64/lv2:/usr/lib/lv2"}), [])
 
 class Gate(Base):
-    def decide(self, iface="v2", gate_data=None, allow=False):
+    def decide(self, iface="v2", gate_data=None, cmd="v2"):
         g = os.path.join(self.t, "gate.json")
         with open(g, "w") as f:
-            json.dump(gate_data or GATE, f)
+            json.dump(GATE if gate_data is None else gate_data, f)
         self.patch(gate, "kernel_interface", lambda wait: (iface, "AppleX") if iface else (None, None))
-        self.patch(gate, "ALLOW", os.path.join(self.t, "allow"))
         self.patch(gate, "PROVISION_CONF", os.path.join(self.t, "provision.conf"))
-        if allow:
-            with open(gate.ALLOW, "w") as f:
-                f.write("j413\n")
-        a = types.SimpleNamespace(gate=g, dt=self.dt, tuning_cli=self.cli, wait=0)
+        a = types.SimpleNamespace(gate=g, dt=self.dt, tuning_cli=self.cli, wait=0, state=self.p.state, cmd=cmd)
         v2, legacy, why = gate.decide(a)
         self.assertFalse(v2 and legacy, why)
         return v2, legacy
 
-    def test_matrix(self):
-        self.board("j316s")
-        self.assertEqual(self.decide("v2"), (True, False))
+    def checked(self, result="pass", **kw):
+        sc = load("sc", "speakerguardd-selfcheck")
+        rec = dict(result=result, board=prov.board_of(self.dt), kernel=os.uname().release,
+                   params_sha256=prov.sha256_file(self.p.params), wiring="synthetic-wiring")
+        rec.update(kw)
+        prov.write_atomic(os.path.join(self.p.state, "selfcheck.bind"), "".join(f"{k}={v}\n" for k, v in rec.items()))
+        prov.write_atomic(self.p.selfcheck_json, json.dumps({"record": rec}))
+        self.assertTrue(sc.report_matches(self.p.selfcheck_json, {k: str(v) for k, v in rec.items()}) if result == "pass" else True)
+
+    def test_first_boot_prepares_but_only_a_current_check_admits_v2(self):
+        self.board("j999")
+        self.ctl({"board": "j999"})
+        self.assertEqual(self.decide(cmd="prepare"), (True, False))
+        self.assertEqual(self.decide(), (False, False))
+        self.assertEqual(self.run_(), 0)
+        with open(os.path.join(os.path.dirname(self.cli), "calls")) as f:
+            self.assertIn("--voicing-pre", f.read())
+        self.assertEqual(self.decide(), (False, False))
+        self.checked()
+        self.assertEqual(self.decide(), (True, False))
         self.assertEqual(self.decide("legacy"), (False, True))
         self.assertEqual(self.decide(None), (False, True))
-        # Not qualified: the older daemons, or on a v2 kernel the floor.
-        self.board("j413")
-        self.assertEqual(self.decide("legacy"), (False, True))
-        self.assertEqual(self.decide("v2"), (False, False))
-        self.assertEqual(self.decide("v2", allow=True), (True, False))
-        # The unit is the one this Mac's tuning names: lsm2 is not at parity,
-        # even for a board the spp3 list names.
-        self.board("j700")
-        self.ctl({"unit": "lsm2"})
-        self.assertEqual(self.decide("legacy"), (False, True))
-        self.assertEqual(self.decide("v2"), (False, False))
-        self.board("j316s")
-        self.assertEqual(self.decide("v2"), (False, False))
-        # Option A: every unit at parity, no per-board run required.
-        a = {"units_at_parity": ["spp3", "lsm2", "atsp"], "require_qualified_board": False}
-        self.assertEqual(self.decide("v2", a), (True, False))
-        self.board("j413")
-        self.ctl({"unit": "spp3"})
-        self.assertEqual(self.decide("v2", a), (True, False))
-        # A new board: nothing about it is written anywhere.
-        self.board("j999")
-        self.assertEqual(self.decide("v2", a), (True, False))
-        self.assertEqual(self.decide("v2"), (False, False))
-        # No tuning unit: never v2.
-        self.ctl({"no_bundle": True, "unit": None})
-        self.assertEqual(self.decide("v2", a), (False, False))
+        self.checked(result="fail")
+        self.assertEqual(self.decide(), (False, False))
+        self.checked(kernel="another-kernel")
+        self.assertEqual(self.decide(), (False, False))
+        self.checked(board="another-board")
+        self.assertEqual(self.decide(), (False, False))
+        self.checked()
+        with open(self.p.params, "ab") as f:
+            f.write(b"new-blob")
+        self.assertEqual(self.decide(), (False, False))
 
-    def test_the_bundle_provisioning_compiles_names_the_unit(self):
-        # SGV2_BUNDLE in provisioning's configuration: the gate reads the
-        # same bundle provisioning compiles, not only the installer's copy
-        self.board("j700")
-        self.ctl({"unit": "lsm2"})
+    def test_unlisted_board_silent_check_and_full_voicing_generation(self):
+        import gen
+        import wiring
+        from unittest import mock
+        sc = load("sc", "speakerguardd-selfcheck")
+        self.board("j999")
+        self.ctl({"board": "j999", "unit": "lsm2"})
+        self.assertEqual(self.run_(), 0)
+        fx = gen.fixture("j700")
+        hw = fx["hw"]
+        hw.update(board="j999", compatible=["apple,j999", "apple,t8140"],
+                  sound_compatible=["apple,j999-macaudio", "apple,macaudio"], model="Synthetic Mac J999")
+        w = wiring.derive(hw, fx["tuning"])
+        w["method"] = "derived-static"
+        desc = wiring.describe(hw, w)
+        args = types.SimpleNamespace(state=self.p.state, params=self.p.params, force=False,
+                                     pipewire_dir=os.path.join(self.t, "pw"), wireplumber_dir=os.path.join(self.t, "wp"))
+        with mock.patch.object(sc, "derive_live", return_value=(hw, w, desc, [])), \
+                mock.patch.object(sc, "lv2_shadows", return_value=[]), \
+                mock.patch.object(sc, "blob_rate", return_value=w["rate"]), \
+                mock.patch.object(sc, "find_card", return_value=(0, desc["card"])), \
+                mock.patch.object(sc, "pcm_ids", return_value={("Secondary", "p"): 1}) as pcm:
+            self.assertEqual(sc.cmd_run(args), 0)
+            self.assertEqual(pcm.call_count, 1)
+            self.assertEqual(sc.cmd_run(args), 0)  # exact binding: no new probe
+            self.assertEqual(pcm.call_count, 1)
+            self.assertEqual(self.decide(gate_data=gen.load_gate()), (True, False))
+            self.assertEqual(sc.cmd_generate(args), 0)
+            with open(os.path.join(args.pipewire_dir, "sgv2-j999.conf")) as f:
+                self.assertIn("sgv2#voicing", f.read())
+            with open(os.path.join(args.wireplumber_dir, "60-sgv2-j999.conf")) as f:
+                self.assertIn("node.software-dsp.rules = []", f.read())
+            # Kernel and blob changes re-run the silent check. Until it
+            # passes again, the stale graph record cannot admit the board.
+            self.checked(kernel="old-kernel")
+            self.assertEqual(self.decide(), (False, False))
+            self.assertEqual(sc.cmd_run(args), 0)
+            self.assertEqual(pcm.call_count, 2)
+            with open(self.p.params, "ab") as f:
+                f.write(b"changed-blob")
+            self.assertEqual(self.decide(), (False, False))
+            with self.assertRaises(wiring.Refused):
+                sc.cmd_generate(args)
+            self.assertEqual(sc.cmd_run(args), 0)
+            self.assertEqual(pcm.call_count, 3)
+            # A self-check alone cannot approve an uncompiled replacement.
+            self.assertEqual(self.decide(), (False, False))
+
+    def test_refusal_or_compiler_failure_stays_muted(self):
+        self.board("j999")
+        for change in ({"refusals": [{"code": "synthetic-refusal"}]}, {"dump_rc": 1}, {"compile_fails": True}):
+            with self.subTest(change=change):
+                self.ctl({"board": "j999", **change})
+                self.assertEqual(self.run_(), 1)
+                self.assertEqual(self.decide(), (False, False))
+        self.ctl({"board": "j999"})
+        self.assertEqual(self.run_(), 0)
+        self.checked()
+        self.assertEqual(self.decide(), (True, False))
+        self.ctl({"board": "j999", "refusals": [{"code": "new-refusal"}]})
+        self.assertEqual(self.decide(), (False, False))
+
+    def test_foreign_and_unbound_provenance_stays_muted(self):
+        self.board("j999")
+        for change in ({"board": "j998"}, {"unit_id": "0" * 64}, {"unit_bound": False}, {"kind": "Collector"}, {"build": None}):
+            with self.subTest(change=change):
+                self.ctl({"board": "j999", **change})
+                self.assertEqual(self.run_(), 1)
+                self.assertEqual(self.decide(), (False, False))
+
+    def test_deny_wins_and_allow_cannot_bypass_proofs_or_parity(self):
+        self.assertEqual(self.run_(), 0)
+        allow = dict(GATE, board_overrides={"j316s": "allow"})
+        self.assertEqual(self.decide(gate_data=allow), (False, False))
+        self.checked()
+        self.assertEqual(self.decide(gate_data=allow), (True, False))
+        self.assertEqual(self.decide(gate_data=dict(allow, denied_boards=["j316s"])), (False, False))
+        self.assertEqual(self.decide(gate_data=dict(GATE, board_overrides={"j316s": "deny"})), (False, False))
+        self.assertEqual(self.decide(gate_data=dict(allow, units_at_parity=[])), (False, False))
+        # Old policy switches and the old hand-written allow file do not
+        # bypass qualification even if a distribution accidentally keeps them.
+        self.checked(result="fail")
+        old = dict(GATE, require_qualified_board=False, qualified={"spp3": ["j316s"]})
+        self.assertEqual(self.decide(gate_data=old), (False, False))
+
+    def test_corrupt_or_disagreeing_qualification_records_stay_muted(self):
+        self.assertEqual(self.run_(), 0)
+        self.checked()
+        self.assertEqual(self.decide(), (True, False))
+        allow = dict(GATE, board_overrides={"j316s": "allow"})
+        for change in ({"provenance": "foreign"}, {"compile_refusals": 1}, {"version": 1}):
+            with self.subTest(change=change):
+                self.assertEqual(self.run_(), 0)
+                rec = self.record()
+                rec.update(change)
+                prov.write_atomic(self.p.report, json.dumps(rec))
+                bind = prov.read_kv(self.p.bind)
+                bind.update({k: str(v) for k, v in change.items()})
+                prov.write_atomic(self.p.bind, "".join(f"{k}={v}\n" for k, v in bind.items()))
+                self.assertEqual(self.decide(gate_data=allow), (False, False))
+        self.assertEqual(self.run_(), 0)
+        prov.write_atomic(self.p.selfcheck_json, "{}")
+        self.assertEqual(self.decide(), (False, False))
+        self.checked()
+        os.unlink(self.p.bind)
+        self.assertEqual(self.decide(), (False, False))
+
+    def test_lsid_requires_its_own_build_parity(self):
+        policy = dict(GATE, units_at_parity=["spp3", "atsp", "lsm2"])
+        for board in ("k114", "k116"):
+            self.board(board)
+            self.ctl({"board": board, "unit": "lsm2", "lsid": True})
+            self.assertEqual(self.decide(gate_data=policy, cmd="prepare"), (False, False))
+            self.assertEqual(self.decide(gate_data=policy), (False, False))
+        # An allow for a board can never promote LSID itself.
+        policy["board_overrides"] = {"k116": "allow"}
+        self.assertEqual(self.decide(gate_data=policy, cmd="prepare"), (False, False))
+
+    def test_four_reference_boards_qualify_without_a_board_list(self):
+        import gen
+        for board, kind in (("j316s", "spp3"), ("j413", "spp3"), ("j616s", "spp3"), ("j700", "lsm2")):
+            with self.subTest(board=board):
+                self.board(board)
+                self.ctl({"board": board, "unit": kind})
+                self.assertEqual(self.run_(), 0)
+                self.checked()
+                self.assertEqual(self.decide(gate_data=gen.load_gate()), (True, False))
+
+    def test_the_bundle_provisioning_compiles_names_the_units(self):
         with open(os.path.join(self.t, "provision.conf"), "w") as f:
             f.write("SGV2_BUNDLE='/var/lib/speakerguardd-tuning/audio-tuning'\n")
-        self.decide("v2")
+        self.decide(cmd="prepare")
         with open(os.path.join(os.path.dirname(self.cli), "calls")) as f:
-            calls = f.read().splitlines()
-        self.assertEqual(calls[-1], "dump --json /var/lib/speakerguardd-tuning/audio-tuning")
-        os.remove(os.path.join(self.t, "provision.conf"))
-        self.decide("v2")
-        with open(os.path.join(os.path.dirname(self.cli), "calls")) as f:
-            self.assertEqual(f.read().splitlines()[-1], "dump --json")
+            self.assertEqual(f.read().splitlines()[-1], "dump --json /var/lib/speakerguardd-tuning/audio-tuning")
 
     def test_shipped_data(self):
         with open(os.path.join(HERE, "gate.json")) as f:
             g = json.load(f)
-        # fleet cutover: only the qualified boards of a parity unit run v2
         self.assertEqual(g["units_at_parity"], ["spp3", "lsm2", "atsp"])
-        self.assertTrue(g["require_qualified_board"])
-        self.assertEqual(sorted(g["qualified"]), ["atsp", "lsm2", "spp3"])
-        # the qualified lists stay as the record of audible runs
-        qualified = sorted(b for u in g["units_at_parity"] for b in g["qualified"].get(u, []))
-        self.assertEqual(
-            qualified,
-            sorted(["j316s", "j413", "j616s", "j700", "j274", "j293", "j313", "j375c", "j375d", "j473", "j474s", "j475c", "j475d", "j493"]),
-        )
-        # policy only: no hardware in the gate
-        self.assertEqual(sorted(k for k in g if not k.startswith("_")), ["qualified", "require_qualified_board", "units_at_parity", "voicing_pre", "voicing_pre_bound_db", "voicing_pre_lowpass"])
+        self.assertNotIn("qualified", g)
+        self.assertNotIn("require_qualified_board", g)
+        self.assertEqual(g["denied_boards"], [])
+        self.assertEqual(g["board_overrides"], {})
         self.assertEqual(g["voicing_pre"], {"j316s": True, "j413": True, "j616s": True, "j700": True})
         self.assertFalse(os.path.exists(os.path.join(HERE, "machines.json")))
 
@@ -797,8 +913,9 @@ class Units(unittest.TestCase):
         self.assertIn("ExecCondition=/usr/libexec/speakerguardd/speakerguardd-gate v2", slp)
         self.assertIn("ExecStart=/usr/libexec/speakerguardd/speakerguardd-provision sleep --unit speakerguardd.service", slp)
         self.assertIn("ExecStop=/usr/libexec/speakerguardd/speakerguardd-provision wake --unit speakerguardd.service", slp)
-        for u in (sup, chk, prv, self.unit("speakerguardd-seat.service")):
-            self.assertIn("ExecCondition=/usr/libexec/speakerguardd/speakerguardd-gate v2", u)
+        self.assertIn("ExecCondition=/usr/libexec/speakerguardd/speakerguardd-gate v2", sup)
+        for u in (chk, prv, self.unit("speakerguardd-seat.service")):
+            self.assertIn("ExecCondition=/usr/libexec/speakerguardd/speakerguardd-gate prepare", u)
         self.assertIn("ExecStartPost=/usr/libexec/speakerguardd/speakerguardd-provision activate --graph-unit speakerguardd-graph.service", chk)
         ses = self.unit("speakerguardd-session.service")
         self.assertIn("ExecCondition=/usr/libexec/speakerguardd/speakerguardd-provision is-seat", ses)

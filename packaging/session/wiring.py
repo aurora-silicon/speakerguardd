@@ -506,6 +506,83 @@ def hardware(hw):
 # ------------------------------------------------------------------ tuning
 
 
+# Qualification records contain hashes/structural facts only, never tuning values.
+QUALIFICATION_VERSION = 2
+PROTECTION_UNITS = {"spp3", "atsp", "lsm2", "lsid"}
+
+
+def unit_id(dt="/proc/device-tree"):
+    """The collector/compiler's domain-separated unit identity, never the serial."""
+    try:
+        with open(os.path.join(dt, "serial-number"), "rb") as f:
+            serial = f.read().rstrip(b"\0")
+    except OSError:
+        return "-"
+    if not 0 < len(serial) <= 64 or not all(0x21 <= b <= 0x7E for b in serial):
+        return "malformed"
+    return hashlib.sha256(b"aurora-speaker-unit-v1\0" + serial).hexdigest()
+
+
+def protection_units(dump):
+    """All protection types on the graph, including the LSID companion.
+
+    The production reader admits exactly one primary protection box. Its
+    refusals and error diagnostics must be empty; wiring alone is not proof
+    that a graph can compile.
+    """
+    t = dump.get("tuning", dump)
+    if t.get("refusals") or any(d.get("severity") == "error" for d in dump.get("diagnostics", {}).get("items", [])):
+        raise Refused("the tuning graph has refusals")
+    primary = (t.get("protection") or {}).get("kind")
+    if primary not in PROTECTION_UNITS - {"lsid"}:
+        raise Refused("the tuning names no supported primary protection unit")
+    return sorted({primary} | ({"lsid"} if t.get("lsid") is not None else set()))
+
+
+def read_binding(path):
+    with open(path) as f:
+        return dict(line.strip().split("=", 1) for line in f if "=" in line)
+
+
+def qualification(state, board, kernel, params=None, unit=None, units=None):
+    """Require matching successful compile/provenance and silent-check records.
+
+    Only root-owned provisioning writes these records. A legacy record lacks
+    this version and therefore triggers fresh provisioning, never admission.
+    Returns the compiled protection types, for the build's parity policy.
+    """
+    try:
+        with open(os.path.join(state, "provision.json")) as f:
+            p = json.load(f)
+        pb = read_binding(os.path.join(state, "provision.bind"))
+        with open(params or os.path.join(state, "params.bin"), "rb") as f:
+            digest = hashlib.sha256(f.read()).hexdigest()
+        want = {"version": QUALIFICATION_VERSION, "result": "pass", "board": board,
+                "kernel": kernel, "params_sha256": digest, "compile_refusals": 0,
+                "provenance": "own-macos"}
+        if any(type(p.get(k)) is not type(v) or p[k] != v for k, v in want.items()):
+            raise Refused("no current successful compilation with own-Mac provenance")
+        keys = (*want, "unit", "bundle_digest", "macos_build", "protection_units", "voicing_pre")
+        if any(pb.get(k) != str(p.get(k)) for k in keys):
+            raise Refused("the provisioning report and binding disagree")
+        if not re.fullmatch(r"[0-9a-f]{64}", p.get("unit", "")) or (unit is not None and p["unit"] != unit):
+            raise Refused("the tuning provenance is not bound to this Mac")
+        compiled = p.get("protection_units", "").split(",")
+        if not compiled or any(u not in PROTECTION_UNITS for u in compiled) or (units is not None and compiled != units):
+            raise Refused("the compiled protection types disagree with the tuning")
+        b = read_binding(os.path.join(state, "selfcheck.bind"))
+        with open(os.path.join(state, "selfcheck.json")) as f:
+            checked = json.load(f)["record"]
+        want = {"result": "pass", "board": board, "kernel": kernel, "params_sha256": digest}
+        if any(b.get(k) != v or checked.get(k) != v for k, v in want.items()):
+            raise Refused("no passing self-check for this board, kernel and blob")
+        if not b.get("wiring") or b["wiring"] == "-" or checked.get("wiring") != b["wiring"]:
+            raise Refused("the self-check wiring records disagree")
+        return compiled
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
+        raise Refused(f"qualification records unavailable or malformed: {e}") from e
+
+
 def roles(dump):
     """Each unit channel's (side, role), from the reader's JSON dump."""
     t = dump.get("tuning", dump)
@@ -660,12 +737,18 @@ def role_errors(w, units):
     return errs
 
 
-def tuning_dump(cli_args, cli="aurora-speaker-tuning"):
+def tuning_dump(cli_args, cli="aurora-speaker-tuning", strict=False):
     """Run the tuning reader's JSON dump; its exit code reports refusals,
-    which the derivation does not need, so the JSON is what counts."""
+    which offline derivation does not need. Qualification uses strict=True
+    to require success and an empty refusal/error set."""
     r = subprocess.run([cli, "dump", "--json", *cli_args], capture_output=True, text=True, timeout=60)
+    if strict and r.returncode != 0:
+        raise Refused(f"{cli} dump refused the tuning (exit {r.returncode})")
     try:
-        return json.loads(r.stdout)
+        result = json.loads(r.stdout)
+        if strict:
+            protection_units(result)
+        return result
     except ValueError:
         raise Refused(f"{cli} dump --json gave no JSON (exit {r.returncode}): {r.stderr.strip()[-300:]}")
 
