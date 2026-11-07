@@ -273,8 +273,8 @@ impl Run {
     fn update_track(&mut self, frequency_hz: f64, multiplier: f64, used: &mut [bool; TRACKS]) {
         let mut replacement = None;
         let mut replacement_distance = f64::INFINITY;
-        for (i, t) in self.tracks.iter().enumerate() {
-            let distance = (frequency_hz - t.frequency_hz).abs() / frequency_hz;
+        for i in 0..TRACKS {
+            let distance = (frequency_hz - self.tracks[i].frequency_hz).abs() / frequency_hz;
             if distance < MATCH_RELATIVE && !used[i] {
                 let t = &mut self.tracks[i];
                 t.frequency_hz = frequency_hz;
@@ -283,7 +283,7 @@ impl Run {
                 self.redesign(i);
                 return;
             }
-            if t.gain > REPLACE_GAIN && distance < replacement_distance {
+            if self.tracks[i].gain > REPLACE_GAIN && distance < replacement_distance {
                 replacement = Some(i);
                 replacement_distance = distance;
             }
