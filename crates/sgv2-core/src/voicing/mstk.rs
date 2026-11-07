@@ -1004,7 +1004,6 @@ pub struct Run {
     release: [f64; BANDS],
     release_on: bool,
     algorithm: u32,
-    legacy_recombination: bool,
     overshoot_compensation: bool,
     channels: usize,
     env: [f64; BANDS],
@@ -1102,7 +1101,6 @@ impl Run {
             release,
             release_on: q.release_on,
             algorithm: q.algorithm,
-            legacy_recombination: q.render_quality == 1 && q.algorithm < 3,
             overshoot_compensation: q.overshoot_compensation,
             channels: channels.min(MAX_CHANNELS),
             env: [0.0; BANDS],
@@ -1367,7 +1365,6 @@ impl Run {
                     // sits between them and the synthesis halves too.
                     bands_a[c] = Self::half_analyze(
                         self.half_stage,
-                        self.legacy_recombination,
                         self.band_in,
                         &mut self.half_analysis_low_a[c],
                         &mut self.half_analysis_high_a[c],
