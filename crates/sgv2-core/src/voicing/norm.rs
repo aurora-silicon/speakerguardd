@@ -812,15 +812,14 @@ impl Run {
         v * v
     }
 
-    /// One completed 64-frame step. `fast_db` is the maximum smoothed
-    /// detector level in that step for algorithm 1; the other meters read
-    /// the step-end detector state. The long path reads the window before
-    /// the current power joins it, and its reading joins the 512-frame event
-    /// on the boundary `LONG_DELAY` windows later.
-    fn on_step(&mut self, fast_db: f64) {
+    /// The 64-frame meter clock. The long path reads the window before the
+    /// current power joins it, and its reading joins the 512-frame event on
+    /// the boundary `LONG_DELAY` windows later. Algorithm 1's fast reducer
+    /// completes separately at the end of this step.
+    fn on_step(&mut self) {
         let ema = self.ema;
         let db = level(ema);
-        self.peak = self.peak.max(fast_db);
+        self.peak = self.peak.max(db);
         self.events += 1;
         if self.steps == 0 && self.blocks == 0 {
             self.window.resum();
@@ -838,9 +837,6 @@ impl Run {
             self.blocks = (self.blocks + 1) % PER_LONG;
         }
         self.steps = (self.steps + 1) % PER_BLOCK;
-        if self.p.algorithm1 {
-            self.arbitrate_step(fast_db);
-        }
     }
 
     /// Algorithm 1, every 64-frame step: the fast hysteresis, the held
@@ -944,12 +940,15 @@ impl Run {
                 power += self.detect(ch, f64::from(x));
             }
             self.ema = self.ema_a * self.ema + (1.0 - self.ema_a) * power.max(1e-12);
+            if self.in_step == 0 {
+                self.on_step();
+            }
             if self.p.algorithm1 {
                 self.step_peak = self.step_peak.max(level(self.ema));
             }
             let step_done = self.p.algorithm1 && self.in_step + 1 == STEP;
             if step_done {
-                self.on_step(self.step_peak);
+                self.arbitrate_step(self.step_peak);
                 self.step_peak = f64::NEG_INFINITY;
                 if self.steps_in_call < self.step_target.len() {
                     // A completed step changes the causal target of the
@@ -958,8 +957,6 @@ impl Run {
                     self.step_target[self.steps_in_call] = (n + 1, self.target);
                     self.steps_in_call += 1;
                 }
-            } else if !self.p.algorithm1 && self.in_step == 0 {
-                self.on_step(level(self.ema));
             }
             self.in_step = (self.in_step + 1) % STEP;
         }
