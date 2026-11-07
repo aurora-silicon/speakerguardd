@@ -831,6 +831,8 @@ struct DynamicRun {
     quadrature_state: [[f32; 2]; 2],
     control_phase: usize,
     response_gain: f64,
+    idle_below_knee: bool,
+    release_armed: bool,
     carrier_handoff: bool,
     previous_reconstruction: f32,
     carrier_settle_frames: usize,
@@ -846,6 +848,13 @@ impl DynamicRun {
     // neutral point. Attack stays on the active response; release hands the
     // carrier back to this target through the control reconstruction.
     const CARRIER_NEUTRAL: f32 = 0.013_660_6;
+    const CURVE_STEP_DB: f64 = 100.0 / 43.0;
+    // Do not mistake the response table's small near-knee ripple for a
+    // release. The installed controller stays on its active path until it
+    // has made a material reduction; only that path can subsequently hand
+    // the carrier back to neutral. Two neutral-carrier steps are the first
+    // unambiguous reduction beyond the shaped idle response.
+    const RELEASE_ARM_GAIN: f64 = 1.0 / ((1.0 + Self::CARRIER_NEUTRAL as f64) * (1.0 + Self::CARRIER_NEUTRAL as f64));
     const CARRIER_SETTLE_DELTA: f32 = 1e-7;
     const CARRIER_SETTLE_FRAMES: usize = 256;
 
@@ -891,6 +900,8 @@ impl DynamicRun {
             quadrature_state: [[0.0; 2]; 2],
             control_phase: 0,
             response_gain: 1.0,
+            idle_below_knee: true,
+            release_armed: false,
             carrier_handoff: false,
             previous_reconstruction: 1.0,
             carrier_settle_frames: 0,
@@ -920,6 +931,8 @@ impl DynamicRun {
         self.quadrature_state = [[0.0; 2]; 2];
         self.control_phase = 0;
         self.response_gain = 1.0;
+        self.idle_below_knee = true;
+        self.release_armed = false;
         self.carrier_handoff = false;
         self.previous_reconstruction = 1.0;
         self.carrier_settle_frames = 0;
@@ -999,8 +1012,9 @@ impl DynamicRun {
         }
         if gain < self.response_gain {
             self.carrier_handoff = false;
-        } else if gain > self.response_gain || gain == 1.0 {
-            self.carrier_handoff = true;
+            self.release_armed |= gain <= Self::RELEASE_ARM_GAIN;
+        } else if gain > self.response_gain {
+            self.carrier_handoff = self.release_armed;
         }
         self.response_gain = gain;
         self.reconstructed_gain =
@@ -1037,6 +1051,8 @@ impl DynamicRun {
                 if time_ms <= 0.0 { 0.0 } else { libm::exp(-(frames as f64) / (time_ms * self.fs / 1_000.0)) };
             self.envelope += (1.0 - coefficient) * (measured - self.envelope);
             self.set_response_gain(Self::curve(&at.params, self.envelope));
+            self.idle_below_knee = self.envelope
+                <= libm::exp((at.params.threshold_db - Self::CURVE_STEP_DB) * core::f64::consts::LN_10 / 20.0);
         }
         for i in 0..frames {
             if !at.params.smooth {
@@ -1054,6 +1070,8 @@ impl DynamicRun {
                 if self.control_phase == 0 {
                     self.envelope = f64::from(libm::sqrtf(a * a + b * b));
                     self.set_response_gain(Self::curve(&at.params, self.envelope));
+                    self.idle_below_knee = self.envelope
+                        <= libm::exp((at.params.threshold_db - Self::CURVE_STEP_DB) * core::f64::consts::LN_10 / 20.0);
                 }
                 self.control_phase = (self.control_phase + 1) & 15;
             }
@@ -1066,12 +1084,15 @@ impl DynamicRun {
                 &mut self.reconstruction_state,
                 self.reconstructed_gain as f32,
             );
-            if self.carrier_handoff
+            if (self.carrier_handoff || self.idle_below_knee)
                 && self.response_gain == 1.0
                 && (reconstructed - self.previous_reconstruction).abs() < Self::CARRIER_SETTLE_DELTA
             {
                 self.carrier_settle_frames += 1;
                 self.carrier_settled |= self.carrier_settle_frames >= Self::CARRIER_SETTLE_FRAMES;
+                if self.carrier_settled {
+                    self.release_armed = false;
+                }
             } else {
                 self.carrier_settle_frames = 0;
                 self.carrier_settled = false;
@@ -1613,7 +1634,16 @@ mod tests {
         let p = dynamic_filter_params(DynamicKind::Notch);
         let mut run = DynamicRun::new(&p.dynamic[0].params, 48_000.0);
 
+        // A small knee excursion is active tracking, not a release. It must
+        // not alternate between the active and neutral carrier targets.
+        run.set_response_gain(0.99);
+        run.set_response_gain(1.0);
+        assert!(!run.release_armed);
+        assert!(!run.carrier_handoff);
+        assert_eq!(run.reconstructed_gain, 1.0);
+
         run.set_response_gain(0.5);
+        assert!(run.release_armed);
         assert!(!run.carrier_handoff);
         assert_eq!(run.reconstructed_gain, 0.5);
 
@@ -1641,6 +1671,8 @@ mod tests {
         let reconstruction_state = run.reconstruction_state;
         let phase = run.control_phase;
         let response_gain = run.response_gain;
+        let idle_below_knee = run.idle_below_knee;
+        let release_armed = run.release_armed;
         let carrier_handoff = run.carrier_handoff;
         let previous_reconstruction = run.previous_reconstruction;
         let carrier_settle_frames = run.carrier_settle_frames;
@@ -1656,6 +1688,8 @@ mod tests {
         assert_eq!(run.reconstruction_state, reconstruction_state);
         assert_eq!(run.control_phase, phase);
         assert_eq!(run.response_gain, response_gain);
+        assert_eq!(run.idle_below_knee, idle_below_knee);
+        assert_eq!(run.release_armed, release_armed);
         assert_eq!(run.carrier_handoff, carrier_handoff);
         assert_eq!(run.previous_reconstruction, previous_reconstruction);
         assert_eq!(run.carrier_settle_frames, carrier_settle_frames);
