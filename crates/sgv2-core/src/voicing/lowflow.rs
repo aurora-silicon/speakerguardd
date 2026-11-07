@@ -1120,16 +1120,6 @@ impl Run {
         while chunk_at < frames {
             let chunk_frames = SPECTRAL_HOP.min(frames - chunk_at);
             let full_hop = chunk_frames == SPECTRAL_HOP;
-            if self.link_masks && self.models > 1 {
-                let linked = self.state[..self.models].iter().map(|state| state.mask.db).fold(0.0_f64, f64::max);
-                for state in &mut self.state[..self.models] {
-                    state.mask_output_db = linked;
-                }
-            } else {
-                for state in &mut self.state[..self.models] {
-                    state.mask_output_db = state.mask.db.max(0.0);
-                }
-            }
             for frame in chunk_at..chunk_at + chunk_frames {
                 for c in 0..self.models {
                     let woofer_sample = finite(bufs[c][frame]);
@@ -1149,6 +1139,16 @@ impl Run {
                         state.hop_velocity = state.hop_velocity.max(rms);
                         state.velocity_block_energy = 0.0;
                         state.velocity_block_frames = 0;
+                    }
+                }
+                if self.link_masks && self.models > 1 {
+                    let linked = self.state[..self.models].iter().map(|state| state.mask.db).fold(0.0_f64, f64::max);
+                    for state in &mut self.state[..self.models] {
+                        state.mask_output_db = linked;
+                    }
+                } else {
+                    for state in &mut self.state[..self.models] {
+                        state.mask_output_db = state.mask.db.max(0.0);
                     }
                 }
                 for c in 0..channels {
@@ -1467,10 +1467,10 @@ mod tests {
     fn mask_reads_high_lane_before_its_output_delay() {
         let p = synthetic();
         let mut run = Run::new(&p, 48_000.0, 4);
-        let mut b = [vec![0.0; 256], vec![0.0; 256], vec![0.0; 256], vec![0.0; 256]];
+        let mut b = [vec![0.0; 128], vec![0.0; 128], vec![0.0; 128], vec![0.0; 128]];
         b[2][64] = 0.7;
         let mut refs: Vec<&mut [f32]> = b.iter_mut().map(Vec::as_mut_slice).collect();
-        run.process(&mut refs, 256);
+        run.process(&mut refs, 128);
         assert!(run.state[0].mask.db > 0.0);
         assert!(run.state[0].mask_output_db > 0.0);
         assert!(b[2].iter().all(|value| *value == 0.0));
