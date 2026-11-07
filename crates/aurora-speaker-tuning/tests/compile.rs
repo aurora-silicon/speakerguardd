@@ -495,3 +495,46 @@ fn a_bypassed_atsp_preset_is_refused() {
     let e = compile(&t, &mut Diagnostics::default()).unwrap_err();
     assert!(format!("{e}").contains("bypasses atsp"), "{e}");
 }
+
+/// Plan B (2026-11-07): the shipped compile runs the unit pass-through, an
+/// identity pre-stage with no crossover declared, for spp3 as for atsp; the
+/// tuning's own pre-stage only when asked for (rigs, the full macOS chain).
+#[test]
+fn the_shipped_prestage_is_pass_through() {
+    let t = tuning(&spp3_files(4), "c-prestage-pass-through");
+    let mut d = Diagnostics::default();
+    let c = compile(&t, &mut d).unwrap();
+    let pre = sgv2_core::blob::prestage(&c.blob, c.sample_rate as f64).unwrap();
+    assert!(!pre.from_tuning(), "no crossover declared");
+    assert_eq!(pre.box_count, 0, "identity: nothing ahead of the unit");
+    assert_eq!(pre, sgv2_core::prestage::Params::identity(c.channels as usize));
+    assert!(d.items.iter().any(|x| x.code == "prestage-protection-only"), "the compile says so");
+    // The same as asking for it, and the unit itself is the same either way
+    let explicit = comp::compile_opts(
+        &t,
+        &j413(),
+        Provenance::Verified,
+        comp::PreStageMode::Identity,
+        &mut Diagnostics::default(),
+    )
+    .unwrap();
+    assert_eq!(c.blob, explicit.blob);
+    // The tuning's pre-stage only on request, exactly what derive gives
+    let derived = aurora_speaker_tuning::prestage::derive(
+        &t,
+        c.sample_rate as f64,
+        c.channels as usize,
+        &mut Diagnostics::default(),
+    );
+    let tuned =
+        comp::compile_opts(&t, &j413(), Provenance::Verified, comp::PreStageMode::Tuning, &mut Diagnostics::default());
+    match (derived, tuned) {
+        (Ok(want), Ok(got)) => {
+            let p = sgv2_core::blob::prestage(&got.blob, got.sample_rate as f64).unwrap();
+            assert_eq!(p.from_tuning(), want.from_tuning());
+            assert_eq!(p.box_count, want.box_count);
+        }
+        (Err(_), Err(_)) => {}
+        (a, b) => panic!("derive {:?} vs compile {:?}", a.is_ok(), b.is_ok()),
+    }
+}
