@@ -381,11 +381,12 @@ def describe(hw, w):
     and the tuning's sample rate.
     The self-check checks the card id and the format against ALSA."""
     t = transport(hw)
-    # The graph carries the amps' sense only to a unit that takes it: spp3
-    # models from V/I, lsm2 and atsp from the program alone (their blobs
-    # have no sense channels). The self-check proves the sense map either way.
+    # LSID is a side-chain inside the existing LSM2 governor. Plain LSM2
+    # bundles still have no sense ports; only an explicit companion requests
+    # the V/I variant. The self-check proves the sense map either way.
     n = len(w["amps"])
-    s = len(w["sense"]) if w.get("unit_kind") in (None, *SENSE_UNITS) else 0
+    takes_sense = w.get("unit_kind") in (None, *SENSE_UNITS) or w.get("sense_companion", False)
+    s = len(w["sense"]) if takes_sense else 0
     plugin = PLUGINS.get((n, s))
     if plugin is None:
         raise Refused(f"no sgv2 plugin variant for {n} amps and {s} sense channels")
@@ -536,7 +537,19 @@ def roles(dump):
     rs = {r for _, r in out}
     if "full" in rs and len(rs) > 1:
         raise Refused("some unit channels pass a crossover branch and some do not")
-    return {"kind": p.get("kind"), "aid": t.get("aid"), "channels": out}
+    result = {"kind": p.get("kind"), "aid": t.get("aid"), "channels": out}
+    companion = t.get("lsid")
+    if companion is not None:
+        if (p.get("kind") != "lsm2" or not isinstance(companion, dict)
+                or companion.get("adaptation_enabled") is not False
+                or not isinstance(companion.get("source_port"), str)
+                or not companion["source_port"]
+                or companion.get("source_lanes") != list(range(2 * len(lanes)))):
+            raise Refused("invalid or enabled LSID companion metadata")
+        if len(lanes) == 6 and companion.get("delay_frames") != [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]:
+            raise Refused("LSID needs lane 1 alone aligned by one frame")
+        result["sense_companion"] = True
+    return result
 
 
 def tuning_rate(dump):
@@ -612,6 +625,10 @@ def derive(hw, dump, key=None):
         "sense": sense,
         "sense_ports": [s["port"] for s in sense],
     }
+    if rl.get("sense_companion"):
+        if len(sense) != 2 * len(amps):
+            raise Refused("LSID companion requires a complete V/I sense bus")
+        w["sense_companion"] = True
     w["hash"] = wiring_hash(w)
     return w
 

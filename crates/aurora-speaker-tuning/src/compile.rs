@@ -305,7 +305,18 @@ pub fn compile_with(t: &Tuning, m: &Machine, provenance: Provenance, diags: &mut
         }
         sgv2_core::prestage::Params::identity(c.channels as usize)
     } else {
-        crate::prestage::derive(t, c.sample_rate as f64, c.channels as usize, diags)?
+        match crate::prestage::derive(t, c.sample_rate as f64, c.channels as usize, diags) {
+            Ok(pre) => pre,
+            Err(e) if muted_companion(&c) => {
+                diags.warn(
+                    "lsid-voicing-release-gated",
+                    "compile",
+                    format!("pre-stage unqualified ({e}); mandatory muted companion bundle carries identity pre-stage"),
+                );
+                sgv2_core::prestage::Params::identity(c.channels as usize)
+            }
+            Err(e) => return Err(e),
+        }
     };
     c.blob = sgv2_core::blob::with_prestage(&c.blob, &pre)
         .map_err(|e| bad(format!("the pre-stage does not fit the blob: {e:?}")))?;
@@ -330,7 +341,14 @@ pub fn compile_voicing_with(
         UnitKind::Lsm2 => compile_lsm2(t, &b, diags),
         UnitKind::Atsp => compile_atsp(t, &b),
     }?;
-    let chain = crate::voicing::chain::compile(t, c.sample_rate as f64, diags)?;
+    let chain = match crate::voicing::chain::compile(t, c.sample_rate as f64, diags) {
+        Ok(chain) => chain,
+        Err(e) if muted_companion(&c) => {
+            diags.warn("lsid-voicing-release-gated", "compile", format!("voicing unqualified ({e}); mandatory muted companion bundle has identity pre-stage and no voicing artifact"));
+            return Ok(c);
+        }
+        Err(e) => return Err(e),
+    };
     if !chain.stubs.is_empty() || !chain.unwired.is_empty() {
         let why: Vec<String> = chain
             .stubs
@@ -341,17 +359,38 @@ pub fn compile_voicing_with(
             })
             .chain(chain.unwired.iter().map(|u| format!("graph parameter {u} is not carried")))
             .collect();
-        return Err(bad(format!("the voicing chain has unimplemented boxes or graph parameters: {}", why.join("; "))));
+        if !muted_companion(&c) {
+            return Err(bad(format!("the voicing chain has unimplemented boxes or graph parameters: {}", why.join("; "))));
+        }
+        diags.warn("lsid-voicing-release-gated", "compile", format!("mandatory muted companion bundle has identity pre-stage and no voicing artifact: unqualified boxes {:?}, graph parameters {:?}", chain.stubs, chain.unwired));
+        return Ok(c);
     }
     for (node, gap) in &chain.gaps {
         diags.warn("voicing-gap", node, gap);
     }
     let mut pre = sgv2_core::prestage::Params::identity(c.channels as usize);
     pre.flags = sgv2_core::prestage::FLAG_FROM_TUNING | sgv2_core::prestage::FLAG_EXTERNAL_VOICING;
-    c.blob = sgv2_core::blob::with_prestage(&c.blob, &pre)
+    match sgv2_core::blob::with_prestage(&c.blob, &pre)
         .and_then(|blob| sgv2_core::blob::with_voicing(&blob, &chain.spec))
-        .map_err(|e| bad(format!("the engine rejects the compiled voicing: {e:?}")))?;
+    {
+        Ok(blob) => c.blob = blob,
+        Err(e) if muted_companion(&c) => {
+            diags.warn("lsid-voicing-release-gated", "compile", format!("voicing artifact refused ({e:?}); mandatory muted companion bundle has identity pre-stage and no voicing artifact"));
+        }
+        Err(e) => return Err(bad(format!("the engine rejects the compiled voicing: {e:?}"))),
+    }
     Ok(c)
+}
+
+/// A voicing refusal may fall back only after proving that the *compiled*
+/// governor carries the mandatory mute gate. A mutable input Tuning alone is
+/// not proof, and a non-LSM2 unit can never take this path.
+fn muted_companion(c: &Compiled) -> bool {
+    c.unit == UnitKind::Lsm2
+        && lsm2::companion::decode_blob(&c.blob)
+            .ok()
+            .and_then(|(_, companion)| companion)
+            .is_some_and(|companion| companion.gates & lsm2::companion::UNQUALIFIED_VOICING != 0)
 }
 
 // ------------------------------------------------------------------ spp3
@@ -536,8 +575,41 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
     use lsm2_ids as id;
     let n = channels(t)?;
     let rate = sample_rate(t)?;
+    let guarded = t.lsid.is_some();
     let g = t.protection.state.section(SCOPE_GLOBAL, 0).ok_or_else(|| bad("lsm2 saved state has no global section"))?;
+    if guarded || g.params.len() >= 1021 {
+        if t.protection.state.sections.len() != 1 {
+            return Err(bad("LSM2 requires one global saved-state section"));
+        }
+        lsm2::companion::validate_records(&g.params, n == 6 || g.params.len() > 1021)
+            .map_err(|e| bad(format!("LSM2 saved-ID schema: {e:?}")))?;
+    }
     let get = |i: u32| -> Result<f32> { g.get(i).ok_or_else(|| bad(format!("lsm2 saved ID {i} is missing"))) };
+    if guarded && g.params.len() < 1021 {
+        // The clean contract does not define the older model's missing or
+        // renumbered fields. Keep all records behind the mandatory mute gate;
+        // do not fabricate latency, coefficients or limits to fill a modern ABI.
+        let mut p = lsm2::Params {
+            channels: n as u32,
+            sample_rate: rate,
+            model_only: 1,
+            enable_mitigation: u32::from(get(id::controller(id::C_ENABLE_MITIGATION))? != 0.0),
+            control_power: u32::from(get(id::controller(id::C_CONTROL_POWER))? != 0.0),
+            control_temperature: u32::from(get(id::controller(id::C_CONTROL_TEMPERATURE))? != 0.0),
+            ..Default::default()
+        };
+        for c in 0..n {
+            p.ch[c].source = c as u32;
+            p.ch[c].volts_full_scale = get(id::channel(c as u32, id::CH_VOLTS_FS))?;
+        }
+        diags.warn(
+            "lsm2-legacy-opaque",
+            "compile",
+            "legacy model fields preserved without supplying missing modern parameters; mandatory muted output",
+        );
+        return finish_lsm2(t, b, diags, p);
+    }
+
     let flag = |i: u32| -> Result<u32> { Ok((get(i)? != 0.0) as u32) };
     let whole = |i: u32, what: &str| -> Result<u32> {
         let v = get(i)?;
@@ -547,13 +619,14 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
         Ok(v as u32)
     };
     let refuse = |what: &str| bad(format!("{what}: the engine's payload cannot represent it (TODO(lane B))"));
-    if get(id::controller(id::C_USE_FAST_PEAK))? != 0.0 {
+    if !guarded && get(id::controller(id::C_USE_FAST_PEAK))? != 0.0 {
         return Err(refuse("UseFastPeakSampleControl"));
     }
-    if get(id::controller(id::C_COMPENSATE_RESONATORS))? != 0.0 {
+    if !guarded && get(id::controller(id::C_COMPENSATE_RESONATORS))? != 0.0 {
         return Err(refuse("CompensateResonators"));
     }
-    let model_only = (get(id::BYPASS_SYS_ID)? == 1.0 && get(id::ENABLE_CLOSED_LOOP_TEMPERATURE)? == 0.0) as u32;
+    let model_only =
+        (guarded || (get(id::BYPASS_SYS_ID)? == 1.0 && get(id::ENABLE_CLOSED_LOOP_TEMPERATURE)? == 0.0)) as u32;
 
     let mut p = lsm2::Params {
         channels: n as u32,
@@ -595,7 +668,7 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
     }
     let mut amp_model = None;
     for c in 0..n as u32 {
-        if whole(id::CH_TUNING + c, "ChTuning")? != 0 {
+        if whole(id::CH_TUNING + c, "ChTuning")? > if guarded { 2 } else { 0 } {
             return Err(refuse(&format!("Ch{c}Tuning selects a bank other than 0 (TODO(SPEC) banks)")));
         }
         let ty = whole(id::CH_SPEAKER_TYPE + c, "ChSpeakerType")?;
@@ -607,7 +680,7 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
         }
         for m in [id::MANAGER_ADMITTANCE, id::MANAGER_DISPLACEMENT, id::MANAGER_VELOCITY] {
             let f = |k: u32| get(id::model(m, ty, k));
-            if f(id::M_ENABLE_RES1)? == 0.0 {
+            if !guarded && f(id::M_ENABLE_RES1)? == 0.0 {
                 return Err(refuse(&format!("channel {c} model without resonator 1")));
             }
             for (k, what) in [
@@ -617,7 +690,7 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
                 (id::M_USE_COMPENSATION, "compensation"),
                 (id::M_PASSIVE_RADIATOR, "passive radiator"),
             ] {
-                if f(k)? != 0.0 {
+                if !guarded && f(k)? != 0.0 {
                     return Err(refuse(&format!("channel {c} model enables {what}")));
                 }
             }
@@ -631,7 +704,7 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
             let f = |k: u32| get(id::model(m, t, k));
             Ok([f(id::M_RDC)?, f(id::M_BL)?, f(id::M_MMS_G)? * 1e-3, f(id::M_RMS)?, f(id::M_KMS)?])
         };
-        let family = row(id::MANAGER_IMPEDANCE, 0)?;
+        let family = row(id::MANAGER_IMPEDANCE, if guarded { ty } else { 0 })?;
         let mut model_generic = 0u32;
         let mut explicit = [[0.0f32; 5]; 3];
         use sgv2_core::lsm2::generic as gen;
@@ -657,7 +730,7 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
         if model > 2 {
             return Err(bad(format!("channel {c} PowerAmpModel {model}")));
         }
-        if amp_model.is_some_and(|m| m != model) {
+        if !guarded && amp_model.is_some_and(|m| m != model) {
             return Err(refuse("channels select different amplifier models"));
         }
         amp_model = Some(model);
@@ -705,7 +778,7 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
         arr(id::CH_VELOCITY_LIMIT0, &mut x.velocity_limit)?;
         arr(id::CH_MASK_ENERGY0, &mut x.mask_energy_db)?;
         arr(id::CH_BAND_CENTER0, &mut x.band_center_hz)?;
-        if let Some(fir) = pressure_response(t, c as usize, diags) {
+        if let Some(fir) = (!guarded).then(|| pressure_response(t, c as usize, diags)).flatten() {
             x.pressure_taps = lsm2::PRESSURE_TAPS as u32;
             x.pressure_fir = fir;
         }
@@ -719,7 +792,7 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
         let m = |k: u32| id::amp(model, k - 1);
         (m(id::A_LOW_IDLE), m(id::A_LOW_RATIO), m(id::A_ENABLE_MID), m(id::A_ENABLE_HIGH))
     };
-    if get(mid)? != 0.0 || get(high)? != 0.0 {
+    if !guarded && (get(mid)? != 0.0 || get(high)? != 0.0) {
         return Err(refuse("the amplifier model enables a mid or high rail"));
     }
     p.low_rail_idle_power_w = get(idle)?;
@@ -727,19 +800,75 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
     p.other_power_features = (get(mid)? != 0.0) as u32
         | ((get(high)? != 0.0) as u32) << 1
         | ((get(id::amp0(id::A_USE_BATTERY))? != 0.0) as u32) << 2;
-    // VoltsFullScale is peak volts (KERNEL.md 2.3; Daybreak t-4662).
+    finish_lsm2(t, b, diags, p)
+}
+
+fn finish_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics, p: lsm2::Params) -> Result<Compiled> {
+    let n = p.channels as usize;
+    let guarded = t.lsid.is_some();
+    let g = t.protection.state.global().ok_or_else(|| bad("LSM2 global state missing"))?;
+    // VoltsFullScale is peak volts (KERNEL.md 2.3).
     let vfs: Vec<f32> = p.ch[..n].iter().map(|c| c.volts_full_scale).collect();
     let full_scale_mv = operating_point("VoltsFullScale", &vfs)?;
-    let blob =
-        build_for(sgv2_core::UnitKind::Lsm2, p.channels, 0, p.sample_rate, b.machine, full_scale_mv, p.as_bytes());
-    lsm2::Params::from_blob(&blob).map_err(|e| bad(format!("the engine rejects the compiled blob: {e:?}")))?;
-    if let Some(e) = lsm2::Unit::init_error(&p) {
-        return Err(bad(format!("the engine would run the fail-safe: {e:?}")));
+    let mut payload = p.as_bytes().to_vec();
+    if let Some(lsid) = &t.lsid {
+        use lsm2::companion::{Companion, LEGACY_ESTIMATOR, UNQUALIFIED_FLOW, UNQUALIFIED_MODEL, UNQUALIFIED_VOICING};
+        let flow = t.protection.property_files.iter().find(|f| f.number == 6632);
+        if n == 6 {
+            let records = flow
+                .and_then(|f| f.value.as_dict())
+                .and_then(|d| d.get("ChannelData"))
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| bad("six-channel flow dictionary missing"))?;
+            if records.len() != 2 || records.iter().any(|r| r.as_dict().is_none()) {
+                return Err(bad("six-channel flow requires two side/role records"));
+            }
+        }
+        let property_64004 = t
+            .protection
+            .strip_properties
+            .iter()
+            .find(|p| p.number == 64004)
+            .and_then(|p| if let PropValue::UInt32(v) = p.value { Some(v) } else { None })
+            .unwrap_or(0);
+        let companion = Companion {
+            gates: UNQUALIFIED_VOICING
+                | if n == 6 { UNQUALIFIED_FLOW | UNQUALIFIED_MODEL } else { LEGACY_ESTIMATOR | UNQUALIFIED_MODEL },
+            channels: n as u32,
+            lsm2_records: g.params.clone(),
+            lsid_records: lsid.state.global().ok_or_else(|| bad("LSID global state missing"))?.params.clone(),
+            topology: lsid.topology,
+            flow: flow.map(|f| crate::plist::binary::write(&f.value)).unwrap_or_default(),
+            property_64004,
+            flow_roles: if n == 6 { Companion::six_flow_roles() } else { [[0; 2]; 6] },
+            systems: if n == 6 { Companion::six_systems() } else { [0; MAX_CHANNELS] },
+        };
+        if let Some(why) = companion.geometry_error() {
+            return Err(bad(why));
+        }
+        payload.extend_from_slice(&companion.encode().map_err(|e| bad(format!("LSID companion bundle: {e:?}")))?);
+        diags.warn("lsm2-release-gated", "compile", "unqualified companion/model/flow laws: output MUTED by the single governing LSM2 unit; static saved model retained, adaptation disabled");
+    }
+    let sense_channels = if guarded { 2 * p.channels } else { 0 };
+    let blob = build_for(
+        sgv2_core::UnitKind::Lsm2,
+        p.channels,
+        sense_channels,
+        p.sample_rate,
+        b.machine,
+        full_scale_mv,
+        &payload,
+    );
+    lsm2::Unit::from_blob(&blob).map_err(|e| bad(format!("the engine rejects the compiled blob: {e:?}")))?;
+    if !guarded {
+        if let Some(e) = lsm2::Unit::init_error(&p) {
+            return Err(bad(format!("the engine would run the fail-safe: {e:?}")));
+        }
     }
     Ok(Compiled {
         unit: UnitKind::Lsm2,
         channels: p.channels,
-        sense_channels: 0,
+        sense_channels,
         sample_rate: p.sample_rate,
         board: b.board.clone(),
         full_scale_mv,
