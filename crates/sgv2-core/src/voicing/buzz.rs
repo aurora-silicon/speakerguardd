@@ -282,6 +282,8 @@ impl Run {
         };
     }
 
+    // The index also addresses self.tracks and self.redesign(), which an iterator over used cannot borrow.
+    #[allow(clippy::needless_range_loop)]
     fn update_track(&mut self, frequency_hz: f64, multiplier: f64, used: &mut [bool; TRACKS]) {
         let mut replacement = None;
         let mut replacement_distance = f64::INFINITY;
