@@ -231,6 +231,7 @@ class Session:
         self.sense_name = f"sgv2.sense.{m}"
         self.last_try = -10.0
         self.last_suspend = -10.0
+        self.last_unity = -10.0
         self.pending = {}
 
     def wanted(self, g):
@@ -290,6 +291,29 @@ class Session:
                 ok = False
         carrier = unity(g.node_props(protect)) and (sense is None or unity(g.node_props(sense)))
         return ok, carrier
+
+    def pin_amps_unity(self, g):
+        """The amps' sink carries no volume: the protect stage models exactly
+        what reaches the amps, and the user's volume lives in the voicing in
+        front of it. A volume or mute set on it (by a session restore, a
+        mixer or a script) is put back to unity, at most once a second.
+        Returns True when a reset was started."""
+        spk = g.node_id(self.speaker)
+        props = g.node_props(spk) if spk is not None else {}
+        if not props or unity(props):
+            return False
+        now = time.monotonic()
+        if now - self.last_unity < 1.0:
+            return False
+        self.last_unity = now
+        n = max(len(props.get("channelVolumes", [])), self.amps)
+        vols = ", ".join(["1.0"] * n)
+        log(f"amps sink volume {props.get('volume')} {props.get('channelVolumes')} mute={props.get('mute')}: reset to unity")
+        self._spawn(
+            ("unity", spk),
+            ["pw-cli", "set-param", str(spk), "Props", f"{{ mute: false, volume: 1.0, channelVolumes: [ {vols} ] }}"],
+        )
+        return True
 
     def amps_linked(self, g):
         """True while any link feeds the amps' sink."""
@@ -495,6 +519,7 @@ def main():
         links, carrier = s.check(g)
         wrote = write_report(report, links, carrier, s.wiring(g), s.amps_linked(g))
         s.reconcile(g, granted)
+        s.pin_amps_unity(g)
         was_granted = granted
         state = (granted, links, carrier, wrote)
         if state != last:
