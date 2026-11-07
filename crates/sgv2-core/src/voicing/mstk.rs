@@ -665,10 +665,13 @@ struct GainSrc {
     ring: [f32; MAX_GAIN_SRC_TAPS],
     len: usize,
     cursor: usize,
+    factor: usize,
+    phase: usize,
 }
 
 impl GainSrc {
-    const EMPTY: Self = Self { taps: [0.0; MAX_GAIN_SRC_TAPS], ring: [0.0; MAX_GAIN_SRC_TAPS], len: 1, cursor: 0 };
+    const EMPTY: Self =
+        Self { taps: [0.0; MAX_GAIN_SRC_TAPS], ring: [0.0; MAX_GAIN_SRC_TAPS], len: 1, cursor: 0, factor: 1, phase: 0 };
 
     fn new(factor: usize, fs: f64) -> Self {
         let factor = factor.clamp(1, 8);
@@ -684,7 +687,7 @@ impl GainSrc {
         for value in &mut window[..window_len] {
             *value /= sum;
         }
-        let mut out = Self { len, ..Self::EMPTY };
+        let mut out = Self { len, factor, ..Self::EMPTY };
         for i in 0..len {
             let mut value = 0.0f32;
             let first = i.saturating_sub(triangle_len - 1);
@@ -702,16 +705,27 @@ impl GainSrc {
     fn reset(&mut self) {
         self.ring = [0.0; MAX_GAIN_SRC_TAPS];
         self.cursor = 0;
+        self.phase = 0;
     }
 
+    /// The producer supplies a value every `factor` frames, starting at
+    /// frame zero. All other ring entries are the explicit inserted zeros.
     #[inline]
     fn step(&mut self, input: Option<f64>) -> f64 {
         self.ring[self.cursor] = input.unwrap_or(0.0) as f32;
         let mut output = 0.0f32;
-        let mut index = self.cursor;
-        for tap in &self.taps[..self.len] {
+        let mut index =
+            if self.cursor >= self.phase { self.cursor - self.phase } else { self.cursor + self.len - self.phase };
+        // Keep the original order of every nonzero product and addition.
+        // Omitting inserted zero products does not reassociate the sum or
+        // fuse any operation; the accumulator still starts at positive zero.
+        for tap in self.taps[self.phase..self.len].iter().step_by(self.factor) {
             output += *tap * self.ring[index];
-            index = if index == 0 { self.len - 1 } else { index - 1 };
+            index = if index >= self.factor { index - self.factor } else { index + self.len - self.factor };
+        }
+        self.phase += 1;
+        if self.phase == self.factor {
+            self.phase = 0;
         }
         self.cursor += 1;
         if self.cursor == self.len {
@@ -1550,6 +1564,46 @@ mod tests {
             assert!((output - 1.0).abs() < 2e-6, "factor {factor}: {output}");
             src.reset();
             assert_eq!(src.step(None), 0.0);
+        }
+    }
+
+    #[test]
+    fn polyphase_gain_src_matches_zero_stuffed_convolution_bits() {
+        // Independent direct FIR oracle: include every inserted zero, wrap
+        // the history with modular indexing, and preserve sequential sums.
+        for fs in [8_000.0, 44_100.0, 48_000.0, 96_000.0, 192_000.0] {
+            for factor in [1, 2, 4, 8] {
+                let mut src = GainSrc::new(factor, fs);
+                let mut history = std::vec![0.0f32; src.len];
+                let mut cursor = 0;
+                let mut random = 0x1234_5678u32;
+                for frame in 0..4096 {
+                    if frame == 2048 {
+                        src.reset();
+                        history.fill(0.0);
+                        cursor = 0;
+                    }
+                    random = random.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    let value = match frame % 11 {
+                        0 => -0.0f32,
+                        1 => f32::from_bits(1),
+                        2 => -f32::from_bits(1),
+                        _ => (random as i32) as f32 / i32::MAX as f32,
+                    };
+                    let input = (frame % factor == 0).then_some(value as f64);
+                    history[cursor] = input.unwrap_or(0.0) as f32;
+                    let mut expected = 0.0f32;
+                    for k in 0..src.len {
+                        expected += src.taps[k] * history[(cursor + src.len - k) % src.len];
+                    }
+                    assert_eq!(
+                        src.step(input).to_bits(),
+                        (expected as f64).to_bits(),
+                        "fs {fs}, factor {factor}, frame {frame}"
+                    );
+                    cursor = (cursor + 1) % src.len;
+                }
+            }
         }
     }
 
