@@ -30,7 +30,6 @@
 //! State is f64; the unit keeps its slow gain in f32, which moves it by
 //! less than 0.005 dB over a 10 s release.
 
-use crate::prestage::Section;
 use crate::MAX_CHANNELS;
 use alloc::boxed::Box;
 use alloc::vec;
@@ -110,19 +109,11 @@ pub struct Params {
     pub saturation_mix: f64,
     pub input_gain_db: f64,
     pub output_gain_db: f64,
-    /// Limiter state-machine version. Version 1 remains meaningful when
-    /// output saturation is disabled.
-    pub algorithm_version: u32,
-    /// Zero disables the optional input high-pass.
-    pub high_pass_frequency_hz: f64,
-    pub high_pass_order: u32,
-    pub high_pass_location: u32,
 }
 
 impl Params {
     pub const WORDS: usize = 10;
     pub const LEGACY_WORDS: usize = 8;
-    pub const EXTENDED_WORDS: usize = 14;
 
     pub fn to_words(&self, out: &mut [f64]) {
         out[..Self::WORDS].copy_from_slice(&[
@@ -139,24 +130,8 @@ impl Params {
         ]);
     }
 
-    pub fn to_extended_words(&self, out: &mut [f64]) {
-        self.to_words(out);
-        out[Self::WORDS..Self::EXTENDED_WORDS].copy_from_slice(&[
-            self.algorithm_version as f64,
-            self.high_pass_frequency_hz,
-            self.high_pass_order as f64,
-            self.high_pass_location as f64,
-        ]);
-    }
-
-    pub fn needs_extended_words(&self) -> bool {
-        self.high_pass_frequency_hz != 0.0 || (self.algorithm_version != 0 && self.saturation_mode == 0)
-    }
-
     pub fn from_words(w: &[f64]) -> Option<Params> {
-        if ![Self::LEGACY_WORDS, Self::WORDS, Self::EXTENDED_WORDS].contains(&w.len())
-            || w.iter().any(|v| !v.is_finite())
-        {
+        if ![Self::LEGACY_WORDS, Self::WORDS].contains(&w.len()) || w.iter().any(|v| !v.is_finite()) {
             return None;
         }
         let p = Params {
@@ -182,24 +157,6 @@ impl Params {
             saturation_mix: w[7],
             input_gain_db: w.get(8).copied().unwrap_or(0.0),
             output_gain_db: w.get(9).copied().unwrap_or(0.0),
-            // The original saturation-only wire formats admit only the
-            // mode-3/flavor-2 version-1 state, so its version is implicit.
-            algorithm_version: match w.get(10).copied().unwrap_or(if w[5] == 0.0 { 0.0 } else { 1.0 }) {
-                0.0 => 0,
-                1.0 => 1,
-                _ => return None,
-            },
-            high_pass_frequency_hz: w.get(11).copied().unwrap_or(0.0),
-            high_pass_order: match w.get(12).copied().unwrap_or(0.0) {
-                0.0 => 0,
-                n if (1.0..=10.0).contains(&n) && n.fract() == 0.0 => n as u32,
-                _ => return None,
-            },
-            high_pass_location: match w.get(13).copied().unwrap_or(0.0) {
-                0.0 => 0,
-                1.0 => 1,
-                _ => return None,
-            },
         };
         let ok = (-120.0..=40.0).contains(&p.input_gain_db)
             && (-120.0..=40.0).contains(&p.output_gain_db)
@@ -207,32 +164,12 @@ impl Params {
             && (0.0..=MAX_HOLD_S).contains(&p.hold_s)
             && (-40.0..=6.0).contains(&p.threshold_db)
             && (0.0..=40.0).contains(&p.min_fast_gain_db);
-        let high_pass_ok = if p.high_pass_frequency_hz == 0.0 {
-            p.high_pass_order == 0 && p.high_pass_location == 0
-        } else {
-            (10.0..=1000.0).contains(&p.high_pass_frequency_hz) && p.high_pass_order != 0 && p.high_pass_location == 0
-        };
         let saturation_ok = if p.saturation_mode == 0 {
             p.saturation_flavor == 0 && p.saturation_mix == 0.0
         } else {
             p.saturation_flavor == 2 && (0.0..=1.0).contains(&p.saturation_mix)
         };
-        (ok && high_pass_ok && saturation_ok).then_some(p)
-    }
-}
-
-#[derive(Clone, Copy, Default)]
-struct FilterState {
-    z: [f64; 2],
-}
-
-impl FilterState {
-    #[inline]
-    fn run(&mut self, section: &Section, x: f64) -> f64 {
-        let y = section.b0 * x + self.z[0];
-        self.z[0] = section.b1 * x - section.a1 * y + self.z[1];
-        self.z[1] = section.b2 * x - section.a2 * y;
-        y
+        (ok && saturation_ok).then_some(p)
     }
 }
 
@@ -364,8 +301,6 @@ pub struct Run {
     saturation_mix: f64,
     input_gain: f64,
     output_gain: f64,
-    high_pass: super::tone::Cascade,
-    high_pass_state: [[FilterState; 10]; MAX_CHANNELS],
     saturation_filter: [SatSection; SATURATION_SECTIONS],
     saturation_state: [[SatState; SATURATION_SECTIONS]; MAX_CHANNELS],
     saturation_line: [[f32; SATURATION_DELAY]; MAX_CHANNELS],
@@ -405,12 +340,6 @@ impl Run {
             hist_at: 0,
             input_gain: db(p.input_gain_db),
             output_gain: db(p.output_gain_db),
-            high_pass: if p.high_pass_frequency_hz == 0.0 {
-                super::tone::Cascade { sections: [Section::IDENTITY; 10], count: 0 }
-            } else {
-                super::tone::butterworth(true, p.high_pass_order, p.high_pass_frequency_hz, fs)
-            },
-            high_pass_state: [[FilterState::default(); 10]; MAX_CHANNELS],
             saturation_mix: if p.saturation_mode == 3 { p.saturation_mix } else { 0.0 },
             saturation_filter: saturation_filter(fs),
             saturation_state: [[SatState::default(); SATURATION_SECTIONS]; MAX_CHANNELS],
@@ -432,7 +361,6 @@ impl Run {
         self.saturation_state = [[SatState::default(); SATURATION_SECTIONS]; MAX_CHANNELS];
         self.saturation_line = [[0.0; SATURATION_DELAY]; MAX_CHANNELS];
         self.saturation_at = 0;
-        self.high_pass_state = [[FilterState::default(); 10]; MAX_CHANNELS];
     }
 
     pub fn latency(&self) -> usize {
@@ -471,9 +399,6 @@ impl Run {
             for (c, b) in bufs[..ch].iter().enumerate() {
                 let mut x = if b[k].is_finite() { f64::from(b[k]) } else { 0.0 };
                 x *= self.input_gain;
-                for section in 0..self.high_pass.count {
-                    x = self.high_pass_state[c][section].run(&self.high_pass.sections[section], x);
-                }
                 if self.saturation_mix > 0.0 {
                     x = (1.0 - self.saturation_mix) * x + self.saturation_mix * libm::sin(x);
                     for section in 0..SATURATION_SECTIONS {
@@ -538,10 +463,6 @@ mod tests {
             saturation_mix: 0.0,
             input_gain_db: 0.0,
             output_gain_db: 0.0,
-            algorithm_version: 0,
-            high_pass_frequency_hz: 0.0,
-            high_pass_order: 0,
-            high_pass_location: 0,
         }
     }
 
@@ -584,37 +505,6 @@ mod tests {
         w[0] = 0.01;
         assert_eq!(Params::from_words(&w), None);
         assert_eq!(Params::from_words(&w[..4]), None);
-
-        let mut hp = p;
-        hp.algorithm_version = 1;
-        hp.high_pass_frequency_hz = 40.0;
-        hp.high_pass_order = 3;
-        let mut extended = [0.0; Params::EXTENDED_WORDS];
-        hp.to_extended_words(&mut extended);
-        assert_eq!(Params::from_words(&extended), Some(hp));
-        extended[12] = 2.5;
-        assert_eq!(Params::from_words(&extended), None);
-    }
-
-    #[test]
-    fn version_one_location_zero_high_pass_precedes_limiting() {
-        let mut p = params(6.0, false);
-        p.algorithm_version = 1;
-        p.high_pass_frequency_hz = 40.0;
-        p.high_pass_order = 3;
-        let low: Vec<f32> = (0..48_000)
-            .map(|k| (0.1 * libm::sin(2.0 * core::f64::consts::PI * 20.0 * k as f64 / 48_000.0)) as f32)
-            .collect();
-        let high: Vec<f32> = (0..48_000)
-            .map(|k| (0.1 * libm::sin(2.0 * core::f64::consts::PI * 1000.0 * k as f64 / 48_000.0)) as f32)
-            .collect();
-        let low = render(&p, &[low]);
-        let high = render(&p, &[high]);
-        let rms = |v: &[f32]| {
-            libm::sqrt(v[4096..].iter().map(|x| f64::from(*x) * f64::from(*x)).sum::<f64>() / (v.len() - 4096) as f64)
-        };
-        assert!(rms(&low[0]) < 0.01);
-        assert!(rms(&high[0]) > 0.069);
     }
 
     #[test]
@@ -708,12 +598,8 @@ mod tests {
                 saturation_mode: 0,
                 saturation_flavor: 0,
                 saturation_mix: 0.0,
-                input_gain_db: 0.0,
-                output_gain_db: 0.0,
-                algorithm_version: 0,
-                high_pass_frequency_hz: 0.0,
-                high_pass_order: 0,
-                high_pass_location: 0,
+            input_gain_db: 0.0,
+            output_gain_db: 0.0,
             };
             let mut s = seed | 1;
             let amp = db(level_db);
