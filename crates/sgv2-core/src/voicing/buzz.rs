@@ -13,15 +13,16 @@ use alloc::vec::Vec;
 pub const BANDS: usize = 10;
 const FFT: usize = 512;
 const TRACKS: usize = 50;
-const HOST_HOP: usize = 128;
+const ANALYSIS_HOP: usize = 128;
 const ANALYSIS_RATE: f64 = 12_000.0;
 const DECIMATION: usize = 4;
+const HOST_HOP: usize = ANALYSIS_HOP * DECIMATION;
 const FIR: usize = 97;
 const MIN_HZ: f64 = 50.0;
 const MAX_HZ: [f64; 5] = [2500.0, 3000.0, 4000.0, 6000.0, 20_000.0];
 const MATCH_RELATIVE: f64 = 0.035_264_92;
 const REPLACE_GAIN: f64 = 0.82;
-const NOTCH_BANDWIDTH_HZ: f64 = 6.0;
+const NOTCH_QUALITY: f64 = 6.0;
 
 // The analysis path is a 4:1, 97-tap low-pass resampler. Its gain of two is
 // intentional: the transformed-spectrum thresholds use this amplitude domain.
@@ -230,13 +231,41 @@ fn filter(section: Section, state: &mut FilterState, x: f64) -> f64 {
     y
 }
 
+/// Unity-centre band-pass used by one moving rejection track.  BuzzKill's
+/// tracked gain is a dry remainder, not a peaking-EQ gain: the unit subtracts
+/// `(1 - gain)` times this narrow component from the signal.  Keeping the
+/// resonator fixed while the mix moves is also what lets its state survive a
+/// detector decision without a coefficient discontinuity.
+fn rejection(frequency_hz: f64, quality: f64, fs: f64) -> Section {
+    let w = 2.0 * core::f64::consts::PI * frequency_hz / fs;
+    let alpha = libm::sin(w) / (2.0 * quality.max(0.5));
+    let norm = 1.0 / (1.0 + alpha);
+    Section { b0: alpha * norm, b1: 0.0, b2: -alpha * norm, a1: -2.0 * libm::cos(w) * norm, a2: (1.0 - alpha) * norm }
+}
+
+fn threshold_peak(gain_db: f64, frequency_hz: f64, quality: f64, fs: f64) -> Section {
+    let a = libm::pow(10.0, gain_db / 40.0);
+    let w = 2.0 * core::f64::consts::PI * frequency_hz / fs;
+    let alpha = libm::sin(w) * libm::sinh(0.5 / quality.max(0.1));
+    let cosine = libm::cos(w);
+    let norm = 1.0 / (1.0 + alpha / a);
+    Section {
+        b0: (1.0 + alpha * a) * norm,
+        b1: -2.0 * cosine * norm,
+        b2: (1.0 - alpha * a) * norm,
+        a1: -2.0 * cosine * norm,
+        a2: (1.0 - alpha / a) * norm,
+    }
+}
+
 #[derive(Clone)]
 struct Track {
     frequency_hz: f64,
     gain: f64,
-    section: Section,
+    audio_section: Section,
+    analysis_section: Section,
     audio: [FilterState; MAX_CHANNELS],
-    analysis: [FilterState; MAX_CHANNELS],
+    analysis: FilterState,
 }
 
 impl Default for Track {
@@ -244,9 +273,10 @@ impl Default for Track {
         Track {
             frequency_hz: 1000.0,
             gain: 1.0,
-            section: Section::IDENTITY,
+            audio_section: Section::IDENTITY,
+            analysis_section: Section::IDENTITY,
             audio: [FilterState::default(); MAX_CHANNELS],
-            analysis: [FilterState::default(); MAX_CHANNELS],
+            analysis: FilterState::default(),
         }
     }
 }
@@ -277,7 +307,10 @@ impl Run {
         let fs = if fs.is_finite() { fs.clamp(8_000.0, 192_000.0) } else { 48_000.0 };
         let channels = channels.clamp(1, MAX_CHANNELS);
         let lookahead = libm::round(p.lookahead_s * fs).clamp(1.0, 2880.0) as usize;
-        let release = 1.0 - libm::exp(-(HOST_HOP as f64) / (0.050 * fs));
+        // The saved coefficient uses the 128-frame analysis hop with the
+        // host-rate timebase even though one decision advances 4*128 host
+        // frames.  Keep those two counts distinct.
+        let release = 1.0 - libm::exp(-(ANALYSIS_HOP as f64) / (0.050 * fs));
         Run {
             channels,
             fs,
@@ -297,7 +330,7 @@ impl Run {
             threshold_shape: core::array::from_fn(|i| {
                 let b = p.bands[i];
                 if b.enabled {
-                    super::tone::peak(b.gain_db, b.frequency_hz, b.quality, fs)
+                    threshold_peak(b.gain_db, b.frequency_hz, b.quality, ANALYSIS_RATE)
                 } else {
                     Section::IDENTITY
                 }
@@ -364,16 +397,8 @@ impl Run {
 
     fn redesign(&mut self, index: usize) {
         let t = &mut self.tracks[index];
-        t.section = if t.gain >= 0.999_999 {
-            Section::IDENTITY
-        } else {
-            super::tone::peak(
-                20.0 * libm::log10(t.gain.max(1.0e-6)),
-                t.frequency_hz,
-                (t.frequency_hz / NOTCH_BANDWIDTH_HZ).max(0.5),
-                self.fs,
-            )
-        };
+        t.audio_section = rejection(t.frequency_hz, NOTCH_QUALITY, self.fs);
+        t.analysis_section = rejection(t.frequency_hz, NOTCH_QUALITY, ANALYSIS_RATE);
     }
 
     // The index also addresses self.tracks and self.redesign(), which an iterator over used cannot borrow.
@@ -426,7 +451,7 @@ impl Run {
                 continue;
             }
             let frequency_hz = frequencies[bin];
-            if (MIN_HZ..=self.maximum_hz).contains(&frequency_hz) {
+            if frequency_hz > MIN_HZ && frequency_hz < self.maximum_hz {
                 self.update_track(frequency_hz, (threshold / amplitude).clamp(1.0e-6, 1.0), &mut used);
                 candidates += 1;
                 if candidates == TRACKS {
@@ -439,44 +464,66 @@ impl Run {
     pub fn process(&mut self, buffers: &mut [&mut [f32]], frames: usize) {
         let channels = self.channels.min(buffers.len());
         let frames = frames.min(buffers.iter().take(channels).map(|b| b.len()).min().unwrap_or(0));
-        for frame in 0..frames {
-            let mut linked = 0.0f64;
-            for (channel, buffer) in buffers.iter_mut().take(channels).enumerate() {
-                let raw = if buffer[frame].is_finite() { buffer[frame] as f64 } else { 0.0 };
-                let mut detected = raw;
-                for track in &mut self.tracks {
-                    detected = filter(track.section, &mut track.analysis[channel], detected);
+        let mut at = 0;
+        while at < frames {
+            // The native analyser returns one decision-sized block, updates
+            // the tracks, and only then runs the host-rate rejection bank on
+            // that block's delayed audio.  Buffer the transported samples in
+            // place so the decision at this boundary governs this whole
+            // look-ahead block rather than starting one block late.
+            let count = (frames - at).min(self.hop);
+            for frame in at..at + count {
+                let mut linked = 0.0f64;
+                for (channel, buffer) in buffers.iter_mut().take(channels).enumerate() {
+                    let raw = if buffer[frame].is_finite() { buffer[frame] as f64 } else { 0.0 };
+                    if raw.abs() > linked.abs() {
+                        linked = raw;
+                    }
+                    let slot = self.delay_at * self.channels + channel;
+                    buffer[frame] = self.delay[slot];
+                    self.delay[slot] = raw as f32;
                 }
-                if detected.abs() > linked.abs() {
-                    linked = detected;
+                self.delay_at = (self.delay_at + 1) % self.lookahead;
+                self.fir_state[self.fir_at] = linked;
+                self.fir_at = (self.fir_at + 1) % FIR;
+                self.decimation_at += 1;
+                if self.decimation_at == DECIMATION {
+                    let mut filtered = 0.0;
+                    for (tap, coefficient) in self.fir.iter().enumerate() {
+                        filtered += coefficient * self.fir_state[(self.fir_at + FIR - 1 - tap) % FIR];
+                    }
+                    for track in &mut self.tracks {
+                        let wet = 1.0 - track.gain;
+                        if wet > f32::EPSILON as f64 {
+                            let rejected = filter(track.analysis_section, &mut track.analysis, filtered);
+                            filtered -= wet * rejected;
+                        }
+                    }
+                    self.history[self.history_at] = filtered as f32;
+                    self.history_at = (self.history_at + 1) % FFT;
+                    self.history_len = (self.history_len + 1).min(FFT);
+                    self.decimation_at = 0;
                 }
-                let slot = self.delay_at * self.channels + channel;
-                let mut delayed = self.delay[slot] as f64;
-                self.delay[slot] = raw as f32;
-                for track in &mut self.tracks {
-                    delayed = filter(track.section, &mut track.audio[channel], delayed);
-                }
-                buffer[frame] = delayed as f32;
             }
-            self.delay_at = (self.delay_at + 1) % self.lookahead;
-            self.fir_state[self.fir_at] = linked;
-            self.fir_at = (self.fir_at + 1) % FIR;
-            self.decimation_at += 1;
-            if self.decimation_at == DECIMATION {
-                let mut filtered = 0.0;
-                for (tap, coefficient) in self.fir.iter().enumerate() {
-                    filtered += coefficient * self.fir_state[(self.fir_at + FIR - 1 - tap) % FIR];
-                }
-                self.history[self.history_at] = filtered as f32;
-                self.history_at = (self.history_at + 1) % FFT;
-                self.history_len = (self.history_len + 1).min(FFT);
-                self.decimation_at = 0;
-            }
-            self.hop -= 1;
+            self.hop -= count;
             if self.hop == 0 {
                 self.analyse();
                 self.hop = HOST_HOP;
             }
+            for frame in at..at + count {
+                for (channel, buffer) in buffers.iter_mut().take(channels).enumerate() {
+                    let mut delayed = buffer[frame] as f64;
+                    for track in &mut self.tracks {
+                        let wet = 1.0 - track.gain;
+                        if wet > f32::EPSILON as f64 {
+                            let rejected = filter(track.audio_section, &mut track.audio[channel], delayed);
+                            delayed -= wet * rejected;
+                        }
+                    }
+                    buffer[frame] = delayed as f32;
+                }
+            }
+            at += count;
         }
     }
 }
@@ -510,5 +557,16 @@ mod tests {
         }
         r.process(&mut [&mut x], 4096);
         assert!(r.tracks.iter().any(|track| track.gain < 0.7));
+    }
+
+    #[test]
+    fn rejection_uses_constant_quality_in_each_rate_domain() {
+        for fs in [ANALYSIS_RATE, 48_000.0] {
+            let f = 120.0;
+            let section = rejection(f, NOTCH_QUALITY, fs);
+            assert!((section.magnitude(f, fs) - 1.0).abs() < 1.0e-10);
+            let half_bandwidth = f / (2.0 * NOTCH_QUALITY);
+            assert!((section.magnitude(f + half_bandwidth, fs) - core::f64::consts::FRAC_1_SQRT_2).abs() < 0.02);
+        }
     }
 }
