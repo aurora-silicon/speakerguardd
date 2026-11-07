@@ -19,9 +19,10 @@
 //! coefficients were read back from single-slot impulse renders of the
 //! installed unit (the cascade step is known exactly, so an impulse response
 //! fixes every coefficient) over 300 peaks (gains -15..15 dB, Q 0.5..8,
-//! 100 Hz..12 kHz): the pole pair comes from a Float32 gain `10^(g/20)`, a
-//! Float32 angular frequency `f/fs * 2 pi` and Float32 exponentials; a cut
-//! inverts the boost before its numerator is rounded to Float32.
+//! 100 Hz..12 kHz, plus 400 random and every extracted tuning's peaks): the
+//! pole pair comes from a Float32 `A = exp(g ln10/40)`, the angular frequency
+//! rounded once to Float32 and Float32 exponentials; a cut inverts the boost
+//! before its numerator is rounded to Float32.
 
 use crate::prestage::Section;
 use core::f64::consts::PI;
@@ -64,15 +65,19 @@ fn cos32(x: f32) -> f32 {
     libm::cos(f64::from(x)) as f32
 }
 
+/// `A = 10^(g/40)` as the unit forms it: one Float32 exponential.
+fn peak_amplitude(gain_db: f64) -> f32 {
+    exp32((gain_db as f32) * 0.057_564_627)
+}
+
 /// The boost peak's pole pair, mapped in Float32 as the unit maps it: the
-/// prototype `s^2 + s/(A Q) + 1` with `A = sqrt(10^(g/20))`, its roots
-/// scaled by `w = f/fs * 2 pi` and mapped by `exp`. An overdamped prototype
-/// keeps its two real roots.
+/// prototype `s^2 + s/(A Q) + 1`, its roots scaled by `w = 2 pi f/fs`
+/// (rounded once) and mapped by `exp`. An overdamped prototype keeps its two
+/// real roots.
 fn peak_den(gain_db: f64, f0: f64, q: f64, fs: f64) -> [f64; 2] {
-    let gain = libm::pow(10.0, f64::from((gain_db as f32) * 0.05)) as f32;
-    let a = libm::sqrtf(gain);
+    let a = peak_amplitude(gain_db);
     let damping = 1.0 / (2.0 * a * q as f32);
-    let w = (f0 as f32 / fs as f32) * (2.0 * core::f32::consts::PI);
+    let w = (2.0 * PI * f0 / fs) as f32;
     let dw = damping * w;
     let a2 = exp32(-2.0 * dw);
     if damping > 1.0 {
@@ -82,7 +87,7 @@ fn peak_den(gain_db: f64, f0: f64, q: f64, fs: f64) -> [f64; 2] {
         [f64::from(-(p0 + p1)), f64::from(a2)]
     } else {
         let radius = exp32(-dw);
-        let angle = libm::sqrtf(1.0 - damping * damping) * w;
+        let angle = libm::sqrtf(libm::fmaf(-damping, damping, 1.0)) * w;
         [f64::from(-2.0 * (radius * cos32(angle))), f64::from(a2)]
     }
 }
@@ -172,19 +177,23 @@ fn peak_curve_fit(m: [f64; 3]) -> [f64; 3] {
 fn peak_analog_magnitude(x: f32, gain: f32, q: f32) -> f64 {
     // Evaluate (s^2 + gain*s/q + 1) / (s^2 + s/q + 1)
     // at s=j*x in the same Float32 complex arithmetic used by the box.
-    let real = libm::fmaf(-x, x, 1.0);
+    // Black-box (exact numerators against the unit's poles): the real part
+    // and the numerator's real part round their products before the sum;
+    // the divisor is fused.
+    let real = 1.0 - x * x;
     let num_imag = x * (gain / q);
     let den_imag = x * (1.0 / q);
-    let divisor = libm::fmaf(den_imag, den_imag, real * real);
+    let real_power = real * real;
+    let divisor = libm::fmaf(den_imag, den_imag, real_power);
     let inverse = 1.0 / divisor;
-    let out_real = libm::fmaf(num_imag, den_imag, real * real) * inverse;
+    let out_real = (real_power + num_imag * den_imag) * inverse;
     let out_imag = libm::fmaf(real, den_imag, -(num_imag * real)) * inverse;
     platform_magnitude(out_real, out_imag) as f64
 }
 
 fn peak_magnitudes(gain_db: f64, f0: f64, q: f64, fs: f64, den_z: [f64; 2]) -> [f64; 3] {
     let gain = exp32((gain_db as f32) * 0.115_129_255);
-    let q = (q as f32) * libm::sqrtf(gain);
+    let q = (q as f32) * peak_amplitude(gain_db);
     let w0 = 2.0 * PI * f0 / fs;
     let x1 = ((PI / 3.0) / w0) as f32;
     let x2 = 2.0 * x1;
@@ -233,8 +242,8 @@ fn round32(s: Section) -> Section {
 /// A decramped peaking section, as the unit's Float32 coefficients.
 ///
 /// A cut inverts the complementary boost before its numerator is rounded:
-/// the boost's `b0` enters the inverse unrounded (black-box: 102 of 150
-/// cuts exact against 54 when the rounded boost is inverted).
+/// the boost's `b0` enters the inverse unrounded (black-box: about twice as
+/// many cuts exact as when the rounded boost is inverted).
 pub fn peak(gain_db: f64, f0: f64, q: f64, fs: f64) -> Section {
     let g = gain_db.abs();
     let den = peak_den(g, f0, q, fs);
