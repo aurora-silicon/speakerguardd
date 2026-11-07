@@ -829,11 +829,25 @@ def cmd_sleep(args, p):
     return 0
 
 
+def provision_unit(unit):
+    """The provisioning unit beside the supervisor's (speakerguardd.service ->
+    speakerguardd-provision.service; packaged as speakerguardd-v2*)."""
+    return unit.removesuffix(".service") + "-provision.service"
+
+
 def cmd_wake(args, p):
-    """After the resume: clear the hold and start the supervisor again."""
+    """After the resume: clear the hold and start the supervisor again.
+    Every start of the supervisor runs provisioning again; sleeps that end at
+    once (a suspend aborted by a pending wakeup) can come several a second,
+    and must not run the two into their start limits (the supervisor would
+    then stay down until a reboot, at the kernel's floor), so their start
+    counters are reset first: a resume is a deliberate start, not a crash
+    loop."""
     unlink(p.hold)
     if p.root:
         return 0
+    subprocess.run(["systemctl", "reset-failed", args.unit, provision_unit(args.unit)],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     r = subprocess.run(["systemctl", "start", "--no-block", args.unit])
     log(f"resumed: hold cleared, {args.unit} {'starting' if r.returncode == 0 else 'not started'}")
     return 0

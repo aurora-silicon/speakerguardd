@@ -437,6 +437,10 @@ class Sleep(Base):
         loader.exec_module(ses)
         self.assertEqual(ses.SLEEP_HOLD, prov.Paths().hold)
 
+    def test_provision_unit_name(self):
+        self.assertEqual(prov.provision_unit("speakerguardd.service"), "speakerguardd-provision.service")
+        self.assertEqual(prov.provision_unit("speakerguardd-v2.service"), "speakerguardd-v2-provision.service")
+
     def test_helper_amps_needs_a_fresh_report(self):
         self.assertIsNone(prov.helper_amps({}, 0))
         self.assertIsNone(prov.helper_amps({"SGV2_UID": "999999999"}, 0))
@@ -512,7 +516,7 @@ class Sleep(Base):
         self.assertEqual(spawned, [["pw-link", "-d", "99"]])
         spawned.clear()
         s.reconcile(G({10: "idle", 20: "running"}, []), False)
-        self.assertEqual(spawned, [["pw-cli", "send-command", "10"], ["pw-cli", "send-command", "20"]])
+        self.assertEqual(spawned, [["pw-cli", "send-command", "10", "Suspend", "{}"], ["pw-cli", "send-command", "20", "Suspend", "{}"]])
         spawned.clear()
         s.last_suspend = -10.0
         s.reconcile(G({10: "suspended", 20: "suspended"}, []), False)
