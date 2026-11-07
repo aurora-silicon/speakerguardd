@@ -261,11 +261,19 @@ impl Wire for Kind {
             }
             Self::Cfreak(p) => {
                 let legacy = p.input_gain_db == 0.0 && p.output_gain_db == 0.0;
-                (if legacy { 7u32 } else { 18u32 }).put(o);
-                let mut w = vec![0.0; super::cfreak::Params::WORDS];
+                let highpass = p.highpass_order != 0;
+                (if highpass {
+                    22u32
+                } else if legacy {
+                    7u32
+                } else {
+                    18u32
+                })
+                .put(o);
+                let mut w = vec![0.0; super::cfreak::Params::HIGHPASS_WORDS];
                 p.to_words(&mut w);
-                if legacy {
-                    w.truncate(super::cfreak::Params::LEGACY_WORDS);
+                if !highpass {
+                    w.truncate(if legacy { super::cfreak::Params::LEGACY_WORDS } else { super::cfreak::Params::WORDS });
                 }
                 for v in w {
                     v.put(o);
@@ -369,8 +377,12 @@ impl Wire for Kind {
                 }
                 Self::Xtc(Box::new(params))
             }
-            tag @ (7 | 18) => {
-                let words = if tag == 7 { super::cfreak::Params::LEGACY_WORDS } else { super::cfreak::Params::WORDS };
+            tag @ (7 | 18 | 22) => {
+                let words = match tag {
+                    7 => super::cfreak::Params::LEGACY_WORDS,
+                    18 => super::cfreak::Params::WORDS,
+                    _ => super::cfreak::Params::HIGHPASS_WORDS,
+                };
                 let w: Vec<f64> = (0..words).map(|_| f64::get(r)).collect::<Result<_>>()?;
                 Self::Cfreak(Box::new(super::cfreak::Params::from_words(&w).ok_or(BlobError::Unstable)?))
             }
