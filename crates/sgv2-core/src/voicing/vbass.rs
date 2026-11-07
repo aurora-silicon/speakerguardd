@@ -128,39 +128,6 @@ impl Cascade {
         }
         crate::vdsp::Cascade::new(&sections[..self.n], false)
     }
-    fn platform_butterworth(&self, multichannel: bool) -> crate::vdsp::Cascade {
-        let mut sections = [[0.0; 5]; MAX_SECTIONS];
-        for (dst, q) in sections.iter_mut().zip(&self.s[..self.n]) {
-            let a1 = q.a[0] as f32;
-            let mut a2 = q.a[1] as f32;
-            if a2 > 0.0 {
-                a2 = f32::from_bits(a2.to_bits() + 1);
-            }
-            let first = q.a[1] == 0.0;
-            let b = if q.b[2] == 1.0 || first && q.b[1] == 1.0 {
-                if first {
-                    [a1, 1.0, 0.0]
-                } else {
-                    [a2, a1, 1.0]
-                }
-            } else if q.b[1] < 0.0 {
-                let g = if first { (1.0 - a1) * 0.5 } else { ((1.0 + a2) - a1) * 0.25 };
-                [g, if first { -g } else { -2.0 * g }, if first { 0.0 } else { g }]
-            } else {
-                let g = if first { (1.0 + a1) * 0.5 } else { ((1.0 + a2) + a1) * 0.25 };
-                [g, if first { g } else { 2.0 * g }, if first { 0.0 } else { g }]
-            };
-            *dst = [f64::from(b[0]), f64::from(b[1]), f64::from(b[2]), f64::from(a1), f64::from(a2)];
-        }
-        crate::vdsp::Cascade::new(&sections[..self.n], multichannel)
-    }
-    fn platform_stored(&self) -> crate::vdsp::Cascade {
-        let mut sections = [[0.0; 5]; MAX_SECTIONS];
-        for (dst, q) in sections.iter_mut().zip(&self.s[..self.n]) {
-            *dst = [q.b[0], q.b[1], q.b[2], q.a[0], q.a[1]];
-        }
-        crate::vdsp::Cascade::new(&sections[..self.n], false)
-    }
     #[inline]
     fn run(&self, st: &mut CascadeState, mut x: f64) -> f64 {
         for i in 0..self.n {
@@ -679,7 +646,6 @@ pub struct Run {
     /// Per channel at the stream rate: high pass then both all-passes.
     hp: Cascade,
     hp_st: Vec<CascadeState>,
-    hp_platform: Option<Vec<crate::vdsp::Cascade>>,
     /// Crossover low pass of the mid, at the stream rate. The established
     /// scalar path remains available for geometries whose stored-SOS
     /// construction is not yet exact.
@@ -690,13 +656,10 @@ pub struct Run {
     /// edge with the first half of its upper edge, then the second half.
     ap: Cascade,
     ap_st: CascadeState,
-    ap_platform: Option<crate::vdsp::Cascade>,
     band_hp: Cascade,
     band_hp_st: CascadeState,
-    band_hp_platform: Option<crate::vdsp::Cascade>,
     band_lp: Cascade,
     band_lp_st: CascadeState,
-    band_lp_platform: Option<crate::vdsp::Cascade>,
     /// Polarities: blend inverted for an odd-order crossover; harmonics
     /// inverted when the crossover and the band's lower edge differ in
     /// Butterworth-order parity.
@@ -722,12 +685,9 @@ pub struct Run {
     /// Reconstruction low pass (stream rate).
     recon: Cascade,
     recon_st: CascadeState,
-    recon_platform: Option<crate::vdsp::Cascade>,
     /// Full-rate mono work buffer. Storage is made with the graph and reused
     /// by real-time processing.
     mono: Vec<f32>,
-    blend: Vec<f32>,
-    harm: Vec<f32>,
     /// High-pass path delay, `latency` frames per channel (the mid
     /// branches carry theirs at the selected rate).
     latency: usize,
@@ -750,40 +710,25 @@ impl Run {
         let mut band_hp = linkwitz_riley(p.lower_order, p.fc_hz, fs8, Kind::High);
         band_hp.extend(&butterworth(nu, p.fu_hz, fs8, Kind::Low));
         let band_lp = butterworth(nu, p.fu_hz, fs8, Kind::Low);
-        let recon = elliptic(law::RECON_ORDER, law::RECON_RIPPLE_DB, law::RECON_STOP_DB, law::RECON_EDGE_HZ, fs);
         let latency = nu % 2 + nl % 2;
         let lead = if p.level_control { nl % 2 } else { 0 };
         let max_frames = max_frames.max(1);
-        let platform_lp = p.hp_order == 8
-            && p.lower_order == 6
-            && (p.upper_order == 4 && !p.level_control || p.upper_order == 6 && p.level_control);
-        let full_platform = p.hp_order == 8 && p.upper_order == 6 && p.lower_order == 6 && p.level_control;
-        let selected_frames = max_frames.div_ceil(stride);
-        let hp_platform =
-            full_platform.then(|| (0..channels).map(|_| hp.platform_butterworth(channels >= 2)).collect());
-        let ap_platform = full_platform.then(|| ap.platform_butterworth(false));
-        let band_hp_platform = full_platform.then(|| band_hp.platform_butterworth(false));
-        let band_lp_platform = full_platform.then(|| band_lp.platform_butterworth(false));
-        let recon_platform = full_platform.then(|| recon.platform_stored());
+        let platform_lp = p.hp_order == 8 && p.upper_order == 4 && p.lower_order == 6 && !p.level_control;
         Run {
             p: p.clone(),
             fs,
             channels,
             hp,
             hp_st: vec![CascadeState::default(); channels],
-            hp_platform,
             lp: lp_design.clone(),
             lp_st: CascadeState::default(),
             lp_platform: platform_lp.then(|| lp_design.platform_lowpass()),
             ap,
             ap_st: CascadeState::default(),
-            ap_platform,
             band_hp,
             band_hp_st: CascadeState::default(),
-            band_hp_platform,
             band_lp,
             band_lp_st: CascadeState::default(),
-            band_lp_platform,
             lp_sign: if nh % 2 == 1 { -1.0 } else { 1.0 },
             harm_sign: if nh % 2 == nl % 2 { 1.0 } else { -1.0 },
             lc: LevelControl::new(fs8),
@@ -797,12 +742,9 @@ impl Run {
             spos: 0,
             sdelay: latency - lead,
             phase: 0,
-            recon: recon.clone(),
+            recon: elliptic(law::RECON_ORDER, law::RECON_RIPPLE_DB, law::RECON_STOP_DB, law::RECON_EDGE_HZ, fs),
             recon_st: CascadeState::default(),
-            recon_platform,
             mono: vec![0.0; max_frames],
-            blend: vec![0.0; selected_frames],
-            harm: vec![0.0; selected_frames],
             latency,
             oline: vec![[0.0; OUT_LINE]; channels],
             opos: 0,
@@ -813,9 +755,6 @@ impl Run {
         for s in &mut self.hp_st {
             *s = CascadeState::default();
         }
-        if let Some(hp) = &mut self.hp_platform {
-            hp.iter_mut().for_each(crate::vdsp::Cascade::reset);
-        }
         self.lp_st = CascadeState::default();
         if let Some(lp) = &mut self.lp_platform {
             lp.reset();
@@ -823,15 +762,6 @@ impl Run {
         self.ap_st = CascadeState::default();
         self.band_hp_st = CascadeState::default();
         self.band_lp_st = CascadeState::default();
-        if let Some(ap) = &mut self.ap_platform {
-            ap.reset();
-        }
-        if let Some(band) = &mut self.band_hp_platform {
-            band.reset();
-        }
-        if let Some(band) = &mut self.band_lp_platform {
-            band.reset();
-        }
         self.lc = LevelControl::new(self.fs / self.stride as f64);
         self.prev_lo = 0.0;
         self.prev_p_in = 0.0;
@@ -844,12 +774,7 @@ impl Run {
         self.sline = [0.0; SUB_LINE];
         self.phase = 0;
         self.recon_st = CascadeState::default();
-        if let Some(recon) = &mut self.recon_platform {
-            recon.reset();
-        }
         self.mono.fill(0.0);
-        self.blend.fill(0.0);
-        self.harm.fill(0.0);
         self.oline.fill([0.0; OUT_LINE]);
     }
 
@@ -934,118 +859,12 @@ impl Run {
         out
     }
 
-    fn process_all_platform(&mut self, bufs: &mut [&mut [f32]], ch: usize, frames: usize) {
-        let ig = self.p.input_gain;
-        for i in 0..frames {
-            let mut mid = 0.0;
-            for b in bufs[..ch].iter() {
-                let v = f64::from(b[i]);
-                mid += if v.is_finite() { v * ig } else { 0.0 };
-            }
-            self.mono[i] = (mid / ch as f64) as f32;
-        }
-        for (c, b) in bufs[..ch].iter_mut().enumerate() {
-            for v in &mut b[..frames] {
-                let x = f64::from(*v);
-                *v = if x.is_finite() { (x * ig) as f32 } else { 0.0 };
-            }
-            self.hp_platform.as_mut().unwrap()[c].run(&mut b[..frames]);
-        }
-        self.lp_platform.as_mut().unwrap().run(&mut self.mono[..frames]);
-
-        let start_phase = self.phase;
-        let mut phase = start_phase;
-        let mut selected = 0;
-        for i in 0..frames {
-            if phase == 0 {
-                let lo = self.mono[i];
-                self.mono[selected] = lo;
-                self.blend[selected] = lo;
-                selected += 1;
-            }
-            phase = (phase + 1) % self.stride;
-        }
-        self.phase = phase;
-
-        self.ap_platform.as_mut().unwrap().run(&mut self.blend[..selected]);
-        for i in 0..selected {
-            let lo = f64::from(self.mono[i]);
-            self.harm[i] = if self.p.level_control {
-                let p_in = self.lc.input.run(lo);
-                let (x, p_drive) = if self.lead > 0 {
-                    let d = (self.prev_lo, self.prev_p_in);
-                    self.prev_lo = lo;
-                    self.prev_p_in = p_in;
-                    d
-                } else {
-                    (lo, p_in)
-                };
-                self.mono[i] = p_in as f32;
-                let z = (x / p_drive.max(law::LC_FLOOR)).clamp(-law::LC_CLIP, law::LC_CLIP);
-                self.device(z) as f32
-            } else {
-                self.device(lo) as f32
-            };
-        }
-        self.band_hp_platform.as_mut().unwrap().run(&mut self.harm[..selected]);
-        for i in 0..selected {
-            let mut harm = f64::from(self.harm[i]);
-            if self.p.level_control {
-                let p_in = f64::from(self.mono[i]);
-                let p_out = self.lc.output.run(harm);
-                harm *= p_in / p_out.max(law::LC_FLOOR);
-            }
-            self.harm[i] = self.compress_harmonic(self.p.harmonic_gain * harm) as f32;
-        }
-        self.band_lp_platform.as_mut().unwrap().run(&mut self.harm[..selected]);
-
-        self.mono[..frames].fill(0.0);
-        phase = start_phase;
-        selected = 0;
-        for i in 0..frames {
-            if phase == 0 {
-                let mut low = self.lp_sign * self.p.blend_gain * f64::from(self.blend[selected]);
-                if self.lead > 0 {
-                    core::mem::swap(&mut low, &mut self.prev_low);
-                }
-                let v = low + self.harm_sign * f64::from(self.harm[selected]);
-                let delayed = if self.sdelay == 0 {
-                    v
-                } else {
-                    self.sline[self.spos] = v;
-                    let out = self.sline[(self.spos + SUB_LINE - self.sdelay) % SUB_LINE];
-                    self.spos = (self.spos + 1) % SUB_LINE;
-                    out
-                };
-                self.mono[i] = (delayed * self.stride as f64) as f32;
-                selected += 1;
-            }
-            phase = (phase + 1) % self.stride;
-        }
-        self.recon_platform.as_mut().unwrap().run(&mut self.mono[..frames]);
-
-        for i in 0..frames {
-            let common = f64::from(self.mono[i]);
-            let (l, pos) = (self.latency, self.opos);
-            for (c, b) in bufs[..ch].iter_mut().enumerate() {
-                let line = &mut self.oline[c];
-                line[pos] = f64::from(b[i]);
-                b[i] = ((line[(pos + OUT_LINE - l) % OUT_LINE] + common) * self.p.output_gain) as f32;
-            }
-            self.opos = (pos + 1) % OUT_LINE;
-        }
-    }
-
     pub fn process(&mut self, bufs: &mut [&mut [f32]], frames: usize) {
         let ch = self.channels.min(bufs.len());
         if ch == 0 {
             return;
         }
         let frames = bufs[..ch].iter().fold(frames.min(self.mono.len()), |n, b| n.min(b.len()));
-        if self.hp_platform.is_some() {
-            self.process_all_platform(bufs, ch, frames);
-            return;
-        }
         let ig = self.p.input_gain;
 
         if let Some(lp) = &mut self.lp_platform {
@@ -1150,19 +969,16 @@ mod tests {
     fn platform_lowpass_is_scoped_by_public_object_geometry() {
         let plain = Run::new(&params(false), 48_000.0, 2, 512);
         assert!(plain.lp_platform.is_some());
-        assert!(plain.hp_platform.is_none());
 
         let mut controlled = params(true);
         controlled.upper_order = 6;
         let controlled = Run::new(&controlled, 48_000.0, 2, 512);
-        assert!(controlled.lp_platform.is_some());
-        assert!(controlled.hp_platform.is_some());
+        assert!(controlled.lp_platform.is_none());
 
         let mut other = params(true);
         other.lower_order = 4;
         let other = Run::new(&other, 48_000.0, 2, 512);
         assert!(other.lp_platform.is_none());
-        assert!(other.hp_platform.is_none());
     }
 
     #[test]
