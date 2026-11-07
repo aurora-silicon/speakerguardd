@@ -6,7 +6,7 @@
 //! ```text
 //! aurora-speaker-tuning dump     [--json] [--speaker-id N] [SOURCE]
 //! aurora-speaker-tuning validate [--json] [--speaker-id N] [SOURCE]
-//! aurora-speaker-tuning compile  [--speaker-id N] [--board B [--unit-id U]] [--development] [SOURCE | --bundle PATH] -o BLOB
+//! aurora-speaker-tuning compile  [--speaker-id N] [--board B [--unit-id U]] [--development] [--prestage identity|tuning] [SOURCE | --bundle PATH] -o BLOB
 //! aurora-speaker-tuning identify [--json] [SOURCE]   (the bundle's identity, for provisioning)
 //! aurora-speaker-tuning blob     BLOB [BLOB]     (decode; with two, diff field by field)
 //! aurora-speaker-tuning units    [--json]
@@ -29,6 +29,9 @@
 //! `--board` the `--unit-id` given (the bundle's own, to compile offline
 //! for the Mac it came from), else unknown: then per-unit calibration is
 //! not used (open loop).  See `compile` for the binding rules.
+//! `--prestage` picks what runs ahead of the unit: `identity` (the default,
+//! pass-through: the voicing graph feeds the unit) or `tuning` (the Mac's
+//! own filtering, derived from the tuning; rigs and the full macOS chain).
 //!
 //! `identify` loads and verifies the bundle (nothing is parsed beyond the
 //! manifest) and prints where it was found and its digest
@@ -55,12 +58,13 @@ struct Args {
     board: Option<String>,
     unit_id: Option<String>,
     development: bool,
+    prestage: compile::PreStageMode,
 }
 
 fn usage() -> ! {
     eprintln!(
         "usage: aurora-speaker-tuning {{dump|validate}} [--json] [--speaker-id N] [PATH | --tunings-root DIR --aid N]\n       \
-         aurora-speaker-tuning compile [--speaker-id N] [--board B [--unit-id U]] [--development] [--bundle PATH | --tunings-root DIR --aid N] -o BLOB\n       \
+         aurora-speaker-tuning compile [--speaker-id N] [--board B [--unit-id U]] [--development] [--prestage identity|tuning] [--bundle PATH | --tunings-root DIR --aid N] -o BLOB\n       \
          aurora-speaker-tuning identify [--json] [PATH | --tunings-root DIR --aid N]\n       \
          aurora-speaker-tuning blob BLOB [BLOB]\n       \
          aurora-speaker-tuning units [--json]\n       aurora-speaker-tuning plist FILE"
@@ -93,6 +97,7 @@ fn parse_args() -> Args {
         board: None,
         unit_id: None,
         development: false,
+        prestage: compile::PreStageMode::default(),
     };
     while let Some(x) = it.next() {
         match x.as_str() {
@@ -107,6 +112,13 @@ fn parse_args() -> Args {
             "--board" => a.board = Some(it.next().unwrap_or_else(|| usage())),
             "--unit-id" => a.unit_id = Some(it.next().unwrap_or_else(|| usage())),
             "--development" => a.development = true,
+            "--prestage" => {
+                a.prestage = match it.next().as_deref() {
+                    Some("identity") => compile::PreStageMode::Identity,
+                    Some("tuning") => compile::PreStageMode::Tuning,
+                    _ => usage(),
+                }
+            }
             "-o" | "--output" => a.out = Some(it.next().map(PathBuf::from).unwrap_or_else(|| usage())),
             p if !p.starts_with('-') && a.path.is_none() => a.path = Some(PathBuf::from(p)),
             p if !p.starts_with('-') && a.path2.is_none() => a.path2 = Some(PathBuf::from(p)),
@@ -479,7 +491,7 @@ fn main() {
                     (None, _) => Machine::from_device_tree(dt),
                 };
                 let provenance = if a.development { Provenance::AllowUnverified } else { Provenance::Verified };
-                match m.and_then(|m| compile::compile_with(&t, &m, provenance, &mut diags)) {
+                match m.and_then(|m| compile::compile_opts(&t, &m, provenance, a.prestage, &mut diags)) {
                     Ok(c) => {
                         if let Err(e) = write_atomic(&out, &c.blob) {
                             eprintln!("{}: {e}", out.display());
