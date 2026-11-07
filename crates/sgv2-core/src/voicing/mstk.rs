@@ -365,6 +365,17 @@ impl LegacyStage {
     const EMPTY: Self = Self { high: Path::EMPTY, allpass: Path::EMPTY };
 }
 
+#[derive(Clone, Copy)]
+struct HalfStage {
+    low: Path,
+    high: Path,
+    high_sign: f64,
+}
+
+impl HalfStage {
+    const EMPTY: Self = Self { low: Path::EMPTY, high: Path::EMPTY, high_sign: 1.0 };
+}
+
 impl DetectorPath {
     const EMPTY: Self = Self { section: [Section::ID; MAX_DETECTOR_FILTERS], count: 0 };
 
@@ -491,6 +502,19 @@ fn legacy_stages(p: &Params, fs: f64) -> [LegacyStage; XOVERS] {
         let n = effective_order(p.crossover_order[stage]);
         push_lr(&mut item.high, true, n, p.crossover_hz[stage], fs);
         push_lr_allpass(&mut item.allpass, n, p.crossover_hz[stage], fs);
+    }
+    out
+}
+
+/// Analysis and synthesis each run one Butterworth half. Applying a moving
+/// gain between these halves is not equivalent to the collapsed LR path.
+fn half_stages(p: &Params, fs: f64) -> [HalfStage; XOVERS] {
+    let mut out = [HalfStage::EMPTY; XOVERS];
+    for (stage, item) in out.iter_mut().enumerate() {
+        let half_order = effective_order(p.crossover_order[stage]) / 2;
+        push_butter(&mut item.low, false, half_order, p.crossover_hz[stage], fs);
+        push_butter(&mut item.high, true, half_order, p.crossover_hz[stage], fs);
+        item.high_sign = if half_order % 2 == 0 { 1.0 } else { -1.0 };
     }
     out
 }
@@ -928,6 +952,19 @@ fn detector_factors(p: &Params) -> [usize; BANDS] {
     }
 }
 
+/// Algorithm zero reduces band zero until the first image reaches the
+/// quality's Butterworth stop-band budget. The unit uses 40/50 dB for q0/q1.
+fn band_zero_factor(p: &Params, fs: f64) -> usize {
+    if p.algorithm != 0 || p.render_quality >= 2 || p.band[0].mode != BandMode::Active {
+        return 1;
+    }
+    let half_order = ((libm::ceil(p.crossover_order[0] * 0.5) as usize).max(1)) as f64;
+    let edge = p.crossover_hz[0].min(p.crossover_hz[1] / 1.25).min(p.crossover_hz[2] / (1.25 * 1.25));
+    let budget = if p.render_quality == 0 { 40.0 } else { 50.0 };
+    let separation = 2.0 * libm::pow(2.0, budget / (6.0 * half_order));
+    libm::floor(fs / (separation * edge)).max(1.0) as usize
+}
+
 impl SlidingMax {
     const EMPTY: Self =
         Self { value: [0.0; MAX_DETECTOR_WINDOW], index: [0; MAX_DETECTOR_WINDOW], head: 0, len: 0, next: 0 };
@@ -959,6 +996,7 @@ impl SlidingMax {
 pub struct Run {
     path: [Path; BANDS],
     legacy_stage: [LegacyStage; XOVERS],
+    half_stage: [HalfStage; XOVERS],
     detector_path: [DetectorPath; BANDS],
     band: [Band; BANDS],
     base_band: [Band; BANDS],
@@ -986,6 +1024,8 @@ pub struct Run {
     overshoot_quadrature: [[[QuadratureEnvelope; BANDS]; BANDS]; MAX_CHANNELS],
     audio_quadrature: [QuadratureEnvelope; MAX_CHANNELS],
     mode4_gain: [Mode4Gain; BANDS],
+    band_zero_factor: usize,
+    band_zero_phase: usize,
     hop_peak: bool,
     detector_hop: [f64; BANDS],
     gain_src: [GainSrc; BANDS],
@@ -996,6 +1036,14 @@ pub struct Run {
     legacy_split_allpass_state: [[[[f64; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
     legacy_split_allpass_state_b: [[[[f64; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
     legacy_merge_allpass_state: [[[[f64; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
+    half_analysis_low_a: [[[[f32; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
+    half_analysis_high_a: [[[[f32; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
+    half_analysis_low_b: [[[[f32; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
+    half_analysis_high_b: [[[[f32; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
+    half_synthesis_low: [[[[f32; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
+    half_synthesis_high: [[[[f32; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
+    half_synthesis_phase_low: [[[f32; 2]; MAX_FILTERS]; MAX_CHANNELS],
+    half_synthesis_phase_high: [[[f32; 2]; MAX_FILTERS]; MAX_CHANNELS],
     detector_state: [[[[f32; 2]; MAX_DETECTOR_FILTERS]; BANDS]; MAX_CHANNELS],
     analytic_band_path: [Path; BANDS],
     analytic_reference_path: [Path; BANDS],
@@ -1031,21 +1079,34 @@ impl Run {
         // window. At the fixed eight-frame cadence this is 11/13/25 updates
         // at 44.1/48/96 kHz for bands zero through two.
         let window_ms = if cadence(q) == Cadence::HopPeak { [2.0, 2.0, 2.0, 1.0] } else { [10.0, 8.0, 2.0, 1.0] };
-        let detector_window = core::array::from_fn(|b| {
+        let mut detector_window = core::array::from_fn(|b| {
             ((libm::round(window_ms[b] * fs / (1000.0 * detector_factor[b] as f64)) as usize) | 1)
                 .clamp(1, MAX_DETECTOR_WINDOW)
         });
-        let release = core::array::from_fn(|b| {
+        let mut release = core::array::from_fn(|b| {
             if q.release_s > 0.0 {
                 libm::exp(-(detector_factor[b] as f64) / (q.release_s * fs))
             } else {
                 0.0
             }
         });
+        let band_zero_factor = band_zero_factor(q, fs);
+        let band_zero_rate = fs / band_zero_factor as f64;
+        if band_zero_factor > 1 {
+            detector_window[0] = ((libm::round(2.0 * band_zero_rate / (1000.0 * detector_factor[0] as f64)) as usize)
+                | 1)
+            .clamp(1, MAX_DETECTOR_WINDOW);
+            release[0] = if q.release_s > 0.0 {
+                libm::exp(-(detector_factor[0] as f64) / (q.release_s * band_zero_rate))
+            } else {
+                0.0
+            };
+        }
         let (analytic_band_path, analytic_reference_path) = analytic_detector_paths(q, fs);
         let mut run = Run {
             path: paths(q, fs),
             legacy_stage: legacy_stages(q, fs),
+            half_stage: half_stages(q, fs),
             detector_path: detector_paths(q, fs),
             band: q.band,
             base_band: q.band,
@@ -1072,10 +1133,14 @@ impl Run {
             quadrature: [[QuadratureEnvelope::default(); BANDS]; MAX_CHANNELS],
             overshoot_quadrature: [[[QuadratureEnvelope::default(); BANDS]; BANDS]; MAX_CHANNELS],
             audio_quadrature: [QuadratureEnvelope::default(); MAX_CHANNELS],
-            mode4_gain: core::array::from_fn(|_| Mode4Gain::new(fs)),
+            mode4_gain: core::array::from_fn(|b| Mode4Gain::new(if b == 0 { band_zero_rate } else { fs })),
+            band_zero_factor,
+            band_zero_phase: 0,
             hop_peak: cadence(q) == Cadence::HopPeak,
             detector_hop: [0.0; BANDS],
-            gain_src: core::array::from_fn(|b| GainSrc::new(detector_factor[b], fs)),
+            gain_src: core::array::from_fn(|b| {
+                GainSrc::new(detector_factor[b], if b == 0 { band_zero_rate } else { fs })
+            }),
             state: [[[[0.0; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS],
             state_b: [[[[0.0; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS],
             legacy_high_state: [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
@@ -1083,6 +1148,14 @@ impl Run {
             legacy_split_allpass_state: [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
             legacy_split_allpass_state_b: [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
             legacy_merge_allpass_state: [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
+            half_analysis_low_a: [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
+            half_analysis_high_a: [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
+            half_analysis_low_b: [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
+            half_analysis_high_b: [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
+            half_synthesis_low: [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
+            half_synthesis_high: [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
+            half_synthesis_phase_low: [[[0.0; 2]; MAX_FILTERS]; MAX_CHANNELS],
+            half_synthesis_phase_high: [[[0.0; 2]; MAX_FILTERS]; MAX_CHANNELS],
             detector_state: [[[[0.0; 2]; MAX_DETECTOR_FILTERS]; BANDS]; MAX_CHANNELS],
             analytic_band_path,
             analytic_reference_path,
@@ -1122,6 +1195,7 @@ impl Run {
         for gain in &mut self.mode4_gain {
             gain.reset();
         }
+        self.band_zero_phase = 0;
         self.state = [[[[0.0; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS];
         self.state_b = [[[[0.0; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS];
         self.legacy_high_state = [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS];
@@ -1129,6 +1203,14 @@ impl Run {
         self.legacy_split_allpass_state = [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS];
         self.legacy_split_allpass_state_b = [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS];
         self.legacy_merge_allpass_state = [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS];
+        self.half_analysis_low_a = [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS];
+        self.half_analysis_high_a = [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS];
+        self.half_analysis_low_b = [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS];
+        self.half_analysis_high_b = [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS];
+        self.half_synthesis_low = [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS];
+        self.half_synthesis_high = [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS];
+        self.half_synthesis_phase_low = [[[0.0; 2]; MAX_FILTERS]; MAX_CHANNELS];
+        self.half_synthesis_phase_high = [[[0.0; 2]; MAX_FILTERS]; MAX_CHANNELS];
         self.detector_state = [[[[0.0; 2]; MAX_DETECTOR_FILTERS]; BANDS]; MAX_CHANNELS];
         self.analytic_band_state = [[[[0.0; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS];
         self.analytic_reference_state = [[[[0.0; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS];
@@ -1258,6 +1340,66 @@ impl Run {
     }
 
     #[inline]
+    fn half_analyze(
+        stages: [HalfStage; XOVERS],
+        legacy: bool,
+        band_in: [f64; BANDS],
+        low_state: &mut [[[f32; 2]; MAX_FILTERS]; XOVERS],
+        high_state: &mut [[[f32; 2]; MAX_FILTERS]; XOVERS],
+        input: f64,
+    ) -> [f64; BANDS] {
+        let mut out = [0.0; BANDS];
+        if legacy {
+            let mut remaining = input;
+            for stage in 0..XOVERS {
+                out[stage] =
+                    Self::run_detector_path(&stages[stage].low, &mut low_state[stage], remaining) * band_in[stage];
+                remaining = Self::run_detector_path(&stages[stage].high, &mut high_state[stage], remaining);
+            }
+            out[BANDS - 1] = remaining * band_in[BANDS - 1];
+        } else {
+            let low_mid = Self::run_detector_path(&stages[1].low, &mut low_state[1], input);
+            let high_mid = Self::run_detector_path(&stages[1].high, &mut high_state[1], input);
+            out[0] = Self::run_detector_path(&stages[0].low, &mut low_state[0], low_mid) * band_in[0];
+            out[1] = Self::run_detector_path(&stages[0].high, &mut high_state[0], low_mid) * band_in[1];
+            out[2] = Self::run_detector_path(&stages[2].low, &mut low_state[2], high_mid) * band_in[2];
+            out[3] = Self::run_detector_path(&stages[2].high, &mut high_state[2], high_mid) * band_in[3];
+        }
+        out
+    }
+
+    #[inline]
+    fn half_synthesize(
+        stages: [HalfStage; XOVERS],
+        legacy: bool,
+        low_state: &mut [[[f32; 2]; MAX_FILTERS]; XOVERS],
+        high_state: &mut [[[f32; 2]; MAX_FILTERS]; XOVERS],
+        phase_low_state: &mut [[f32; 2]; MAX_FILTERS],
+        phase_high_state: &mut [[f32; 2]; MAX_FILTERS],
+        bands: [f64; BANDS],
+    ) -> f64 {
+        if legacy {
+            let mut remaining = bands[BANDS - 1];
+            for stage in (0..XOVERS).rev() {
+                let low = Self::run_detector_path(&stages[stage].low, &mut low_state[stage], bands[stage]);
+                let high = Self::run_detector_path(&stages[stage].high, &mut high_state[stage], remaining)
+                    * stages[stage].high_sign;
+                remaining = low + high;
+            }
+            remaining
+        } else {
+            let low_pair = Self::run_detector_path(&stages[0].low, &mut low_state[0], bands[0])
+                + stages[0].high_sign * Self::run_detector_path(&stages[0].high, &mut high_state[0], bands[1]);
+            let high_pair = Self::run_detector_path(&stages[2].low, &mut low_state[2], bands[2])
+                + stages[2].high_sign * Self::run_detector_path(&stages[2].high, &mut high_state[2], bands[3]);
+            let low_side = Self::run_detector_path(&stages[2].low, phase_low_state, low_pair);
+            let high_side = stages[0].high_sign * Self::run_detector_path(&stages[0].high, phase_high_state, high_pair);
+            Self::run_detector_path(&stages[1].low, &mut low_state[1], low_side)
+                + stages[1].high_sign * Self::run_detector_path(&stages[1].high, &mut high_state[1], high_side)
+        }
+    }
+
+    #[inline]
     fn detect(&mut self, c: usize, x: f64) -> ([f64; BANDS], [f64; BANDS]) {
         let mut base = [0.0; BANDS];
         let mut overshoot = [0.0; BANDS];
@@ -1374,6 +1516,7 @@ impl Run {
         let mut bands_a = [[0.0; BANDS]; MAX_CHANNELS];
         let mut bands_b = [[0.0; BANDS]; MAX_CHANNELS];
         for i in 0..frames {
+            let band_zero_sample = self.band_zero_phase == 0;
             let mut detector = [0.0f64; BANDS];
             let mut overshoot = [0.0f64; BANDS];
             for c in 0..n {
@@ -1385,8 +1528,22 @@ impl Run {
                 // recurrence below; quality 2 keeps the real path.
                 if self.hop_peak {
                     let (a, b) = self.audio_quadrature[c].push_components(input as f32);
-                    bands_a[c] = self.split(c, f64::from(a));
-                    bands_b[c] = self.split_b(c, f64::from(b));
+                    bands_a[c] = Self::half_analyze(
+                        self.half_stage,
+                        self.legacy_recombination,
+                        self.band_in,
+                        &mut self.half_analysis_low_a[c],
+                        &mut self.half_analysis_high_a[c],
+                        f64::from(a),
+                    );
+                    bands_b[c] = Self::half_analyze(
+                        self.half_stage,
+                        self.legacy_recombination,
+                        self.band_in,
+                        &mut self.half_analysis_low_b[c],
+                        &mut self.half_analysis_high_b[c],
+                        f64::from(b),
+                    );
                 } else {
                     bands_a[c] = self.split(c, input);
                 }
@@ -1398,6 +1555,9 @@ impl Run {
             }
             let mut gain = [0.0; BANDS];
             for (b, mut p) in detector.into_iter().enumerate() {
+                if b == 0 && self.band_zero_factor > 1 && !band_zero_sample {
+                    continue;
+                }
                 if self.overshoot_compensation && self.algorithm < 3 {
                     p = p.max(overshoot[b]);
                 } else if self.overshoot_compensation && self.algorithm == 3 {
@@ -1434,7 +1594,13 @@ impl Run {
                 }
             }
             let mode4 = if self.hop_peak {
-                core::array::from_fn(|b| self.mode4_gain[b].step(gain[b]))
+                core::array::from_fn(|b| {
+                    if b == 0 && self.band_zero_factor > 1 && !band_zero_sample {
+                        Mode4Mix::default()
+                    } else {
+                        self.mode4_gain[b].step(gain[b])
+                    }
+                })
             } else {
                 [Mode4Mix::default(); BANDS]
             };
@@ -1442,17 +1608,31 @@ impl Run {
                 let mut processed = [0.0; BANDS];
                 for b in 0..BANDS {
                     processed[b] = if self.hop_peak {
-                        let output = if b + 1 == BANDS {
+                        let output = if b == 0 && self.band_zero_factor > 1 && !band_zero_sample {
+                            0.0
+                        } else if b + 1 == BANDS {
                             mode4[b].apply_direct(bands_a[c][b], bands_b[c][b])
                         } else {
                             mode4[b].apply(bands_a[c][b], bands_b[c][b])
                         };
-                        Self::saturate(self.band[b].saturation, output)
+                        let scale =
+                            if b == 0 && self.band_zero_factor > 1 { self.band_zero_factor as f64 } else { 1.0 };
+                        Self::saturate(self.band[b].saturation, output) * scale
                     } else {
                         Self::band_output(self.band[b].saturation, gain[b], bands_a[c][b])
                     };
                 }
-                let mut y = if self.legacy_recombination {
+                let mut y = if self.hop_peak {
+                    Self::half_synthesize(
+                        self.half_stage,
+                        self.legacy_recombination,
+                        &mut self.half_synthesis_low[c],
+                        &mut self.half_synthesis_high[c],
+                        &mut self.half_synthesis_phase_low[c],
+                        &mut self.half_synthesis_phase_high[c],
+                        processed,
+                    )
+                } else if self.legacy_recombination {
                     self.legacy_recombine(c, processed)
                 } else {
                     processed.into_iter().sum()
@@ -1469,11 +1649,23 @@ impl Run {
                     self.legacy_split_allpass_state[c] = [[[0.0; 2]; MAX_FILTERS]; XOVERS];
                     self.legacy_split_allpass_state_b[c] = [[[0.0; 2]; MAX_FILTERS]; XOVERS];
                     self.legacy_merge_allpass_state[c] = [[[0.0; 2]; MAX_FILTERS]; XOVERS];
+                    self.half_analysis_low_a[c] = [[[0.0; 2]; MAX_FILTERS]; XOVERS];
+                    self.half_analysis_high_a[c] = [[[0.0; 2]; MAX_FILTERS]; XOVERS];
+                    self.half_analysis_low_b[c] = [[[0.0; 2]; MAX_FILTERS]; XOVERS];
+                    self.half_analysis_high_b[c] = [[[0.0; 2]; MAX_FILTERS]; XOVERS];
+                    self.half_synthesis_low[c] = [[[0.0; 2]; MAX_FILTERS]; XOVERS];
+                    self.half_synthesis_high[c] = [[[0.0; 2]; MAX_FILTERS]; XOVERS];
+                    self.half_synthesis_phase_low[c] = [[0.0; 2]; MAX_FILTERS];
+                    self.half_synthesis_phase_high[c] = [[0.0; 2]; MAX_FILTERS];
                     self.audio_quadrature[c].reset();
                 }
             }
             if self.env.iter().any(|v| !v.is_finite()) {
                 self.env = [0.0; BANDS];
+            }
+            self.band_zero_phase += 1;
+            if self.band_zero_phase == self.band_zero_factor {
+                self.band_zero_phase = 0;
             }
         }
     }
@@ -1656,9 +1848,9 @@ mod tests {
     }
 
     #[test]
-    fn algorithms_zero_through_two_share_the_fixed_recombination_path() {
+    fn algorithms_one_and_two_share_the_fixed_recombination_path() {
         let mut expected = None;
-        for algorithm in 0..=2 {
+        for algorithm in 1..=2 {
             let mut p = params();
             p.algorithm = algorithm;
             p.render_quality = 1;
@@ -1713,13 +1905,16 @@ mod tests {
     fn detector_cadences_scale_windows_and_keep_the_next_peak() {
         let run = Run::new(&params(), 48_000.0, 1);
         assert_eq!(run.detector_factor, [8; BANDS]);
-        assert_eq!(run.detector_window, [13, 13, 13, 7]);
+        assert_eq!(run.band_zero_factor, 11);
+        assert_eq!(run.detector_window, [1, 13, 13, 7]);
         for b in 0..BANDS {
-            let embedded_fs = 48_000.0 / run.detector_factor[b] as f64;
+            let rate = if b == 0 { 48_000.0 / run.band_zero_factor as f64 } else { 48_000.0 };
+            let embedded_fs = rate / run.detector_factor[b] as f64;
             assert!((run.release[b] - libm::exp(-1.0 / (params().release_s * embedded_fs))).abs() < 1e-12);
         }
         let run = Run::new(&params(), 96_000.0, 1);
-        assert_eq!(run.detector_window, [25, 25, 25, 13]);
+        assert_eq!(run.band_zero_factor, 23);
+        assert_eq!(run.detector_window, [1, 25, 25, 13]);
 
         let mut p = params();
         p.algorithm = 3;
@@ -1748,6 +1943,29 @@ mod tests {
         assert_eq!(max.push(1.0, 3), 8.0);
         assert_eq!(max.push(2.0, 3), 8.0);
         assert_eq!(max.push(3.0, 3), 3.0);
+    }
+
+    #[test]
+    fn algorithm_zero_band_rate_matches_the_stopband_budget() {
+        let mut p = params();
+        p.algorithm = 0;
+        p.render_quality = 0;
+        p.crossover_hz[1..].copy_from_slice(&[6000.0, 16_000.0]);
+        for (x0, expected) in
+            [(100.0, 23), (150.0, 15), (200.0, 11), (250.0, 9), (300.0, 7), (400.0, 5), (500.0, 4), (600.0, 3)]
+        {
+            p.crossover_hz[0] = x0;
+            assert_eq!(band_zero_factor(&p, 48_000.0), expected, "q0 x0={x0}");
+        }
+        p.render_quality = 1;
+        for (x0, expected) in [(100.0, 13), (150.0, 8), (200.0, 6), (250.0, 5), (300.0, 4), (1000.0, 1)] {
+            p.crossover_hz[0] = x0;
+            assert_eq!(band_zero_factor(&p, 48_000.0), expected, "q1 x0={x0}");
+        }
+        p.crossover_hz[0] = 200.0;
+        assert_eq!(band_zero_factor(&p, 96_000.0), 13);
+        p.algorithm = 2;
+        assert_eq!(band_zero_factor(&p, 48_000.0), 1);
     }
 
     #[test]
