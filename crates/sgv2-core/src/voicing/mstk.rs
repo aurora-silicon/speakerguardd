@@ -721,6 +721,8 @@ impl QuadratureEnvelope {
         *self = Self::default();
     }
 
+    /// The envelope alone (the detector now reads the half-bank components).
+    #[cfg(test)]
     #[inline]
     fn push(&mut self, input: f64) -> f64 {
         let input = input as f32;
@@ -1057,7 +1059,6 @@ pub struct Run {
     curve_top_db: f64,
     release: [f64; BANDS],
     release_on: bool,
-    algorithm: u32,
     overshoot_compensation: bool,
     channels: usize,
     env: [f64; BANDS],
@@ -1149,7 +1150,6 @@ impl Run {
             curve_top_db,
             release,
             release_on: q.release_on,
-            algorithm: q.algorithm,
             overshoot_compensation: q.overshoot_compensation,
             channels: channels.min(MAX_CHANNELS),
             env: [0.0; BANDS],
