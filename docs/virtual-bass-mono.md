@@ -35,6 +35,13 @@ stream rate before it is added to every delayed direct channel. A matched
 pre-decimation elliptic trial was rejected because it changed steady LF gain
 by 0.24–0.79 dB across the stereo states.
 
+With level control enabled and an odd lower band-edge half-order, that edge's
+one selected-rate frame of delay sits before the nonlinear device. The device
+uses the previous `lo` sample and its previous input-follower value; output
+normalization restores with the current input follower and current band-output
+follower. The blend branch is held by the same frame, and the corresponding
+post-branch delay is removed, so reported and total latency do not change.
+
 ## Level-control followers
 
 Input and band-output followers have the same lifecycle and 0.9 restart
