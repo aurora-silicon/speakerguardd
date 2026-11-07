@@ -15,9 +15,11 @@
 //! per-bin gains (immediate attack, saved release) scale the square-root Hann
 //! analysis spectrum before overlap-add. A separate detector transforms a
 //! `latency + 128` frame sliding history through a unit-energy Hann. It
-//! applies the saved tweeter-response magnitude, reduces squared magnitudes
-//! on the unit's 99-band grid, and smooths the resulting linked mask level.
-//! The velocity detector independently reads current LF.
+//! weights the velocity-filtered LF lane by the saved pressure-response
+//! magnitude and the HF lane by the saved tweeter-response magnitude, sums
+//! the two, reduces squared magnitudes on the unit's 99-band grid, and holds
+//! and smooths the resulting linked mask level. The velocity detector and the
+//! LF half of the mask share the same velocity-filter output.
 //!
 //! The optional `lowflow-conservative` compile feature is deliberately not an
 //! exact-law claim. It applies a fixed ceiling 6 dB below the saved
@@ -624,7 +626,9 @@ impl MaskDetector {
             let phase = -2.0 * core::f64::consts::PI * i as f64 / n as f64;
             *value = Complex { re: libm::cos(phase), im: libm::sin(phase) };
         }
-        let pressure_magnitude = response_magnitude(&model.pressure_response, n, model.analog_gain, &twiddles);
+        // The LF lane reaches this detector after `AnalogGain` and the
+        // velocity filter, so its response applies no second input gain.
+        let pressure_magnitude = response_magnitude(&model.pressure_response, n, 1.0, &twiddles);
         let tweeter_magnitude = response_magnitude(&model.tweeter_response, n, model.tweeter_gain, &twiddles);
         let boundaries = mask_boundaries(n);
         let lower_hz = |band: usize| {
@@ -729,15 +733,34 @@ impl MaskDetector {
         let middle = region.len() / 2;
         let median = if region.len() % 2 == 0 { 0.5 * (region[middle - 1] + region[middle]) } else { region[middle] };
         let raw_db = 10.0 * libm::log10(libm::fabs(median + 1.0e-30) + 1.0e-20) + 97.0
-            - 4.0 * (4.0 - self.concentration.clamp(1.0, 4.0));
-        if raw_db > self.peak_db + 3.0 || raw_db + 12.0 < self.peak_db {
-            self.peak_db = raw_db;
-        }
+            - concentration_penalty_db(self.concentration);
+        self.peak_db = mask_hold(self.peak_db, raw_db);
         let alpha = if self.peak_db > self.db { self.attack } else { self.release };
         self.db += alpha * (self.peak_db - self.db);
         self.low.fill(Complex::default());
         self.high.fill(Complex::default());
         Some(self.db)
+    }
+}
+
+/// A concentrated (tonal) spectrum earns less masking credit than a flat one:
+/// no penalty at concentration 1, 12 dB at 4 and above.
+#[cfg(not(feature = "lowflow-conservative"))]
+fn concentration_penalty_db(concentration: f64) -> f64 {
+    4.0 * (concentration.clamp(1.0, 4.0) - 1.0)
+}
+
+/// Two-sided hold of the mask level: a rise of more than 3 dB is taken as is;
+/// a fall of more than 12 dB re-anchors the hold 12 dB above the new level,
+/// from which the release smoothing then decays.
+#[cfg(not(feature = "lowflow-conservative"))]
+fn mask_hold(held: f64, level: f64) -> f64 {
+    if level > held + 3.0 {
+        level
+    } else if level + 12.0 < held {
+        level + 12.0
+    } else {
+        held
     }
 }
 
@@ -1307,8 +1330,9 @@ impl Run {
                     let tweeter_sample =
                         if c + self.models < channels { finite(bufs[c + self.models][frame]) } else { 0.0 };
                     let state = &mut self.state[c];
-                    state.mask.push(0.0, tweeter_sample);
-                    let velocity = f64::from(state.velocity.run(woofer_sample));
+                    let velocity = state.velocity.run(woofer_sample);
+                    state.mask.push(velocity, tweeter_sample);
+                    let velocity = f64::from(velocity);
                     state.velocity_block_energy += velocity * velocity;
                     state.velocity_block_frames += 1;
                     // The physical detector reports the largest 8-frame RMS
@@ -1693,6 +1717,43 @@ mod tests {
         assert!(run.state[0].mask.db > 0.0);
         assert!(run.state[0].mask_output_db > 0.0);
         assert!(b[2].iter().all(|value| *value == 0.0));
+    }
+
+    #[cfg(not(feature = "lowflow-conservative"))]
+    #[test]
+    fn mask_low_lane_is_the_velocity_filter_output() {
+        let p = synthetic();
+        let mut expected_filter = VelocityCascade::new(&p.models[0]);
+        let expected = expected_filter.run(0.7);
+        let mut run = Run::new(&p, 48_000.0, 4);
+        let mut b = [vec![0.7], vec![0.0], vec![0.0], vec![0.0]];
+        let mut refs: Vec<&mut [f32]> = b.iter_mut().map(Vec::as_mut_slice).collect();
+        run.process(&mut refs, 1);
+        let detector = &run.state[0].mask;
+        assert_eq!(detector.low_history[detector.n - SPECTRAL_HOP], f64::from(expected));
+        // Unit impulse response: the LF weighting carries no second input gain.
+        assert!((detector.pressure_magnitude[0] - 1.0).abs() < 1.0e-12);
+        assert!((detector.tweeter_magnitude[0] - 0.16).abs() < 1.0e-12);
+    }
+
+    #[cfg(not(feature = "lowflow-conservative"))]
+    #[test]
+    fn tonal_spectra_earn_less_mask_credit() {
+        assert_eq!(concentration_penalty_db(0.0), 0.0);
+        assert_eq!(concentration_penalty_db(1.0), 0.0);
+        assert_eq!(concentration_penalty_db(2.5), 6.0);
+        assert_eq!(concentration_penalty_db(4.0), 12.0);
+        assert_eq!(concentration_penalty_db(9.0), 12.0);
+    }
+
+    #[cfg(not(feature = "lowflow-conservative"))]
+    #[test]
+    fn mask_hold_rises_freely_and_reanchors_large_falls() {
+        assert_eq!(mask_hold(10.0, 13.5), 13.5);
+        assert_eq!(mask_hold(10.0, 12.9), 10.0);
+        assert_eq!(mask_hold(10.0, -1.9), 10.0);
+        assert_eq!(mask_hold(10.0, -2.5), 9.5);
+        assert_eq!(mask_hold(40.0, -115.0), -103.0);
     }
 
     #[cfg(not(feature = "lowflow-conservative"))]
