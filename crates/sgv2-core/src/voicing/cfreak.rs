@@ -40,19 +40,20 @@
 //!
 //! * the signal is oversampled [`OVERSAMPLE`] times through a linear-phase
 //!   windowed-sinc low pass `h` ([`FIR_TAPS`] taps at the oversampled rate,
-//!   [`FIR_HALF_BASE`] base frames of delay, Kaiser window [`WINDOW_BETA`]
-//!   over [`WINDOW_HALF_OS`] oversampled samples each side), cut at
+//!   [`FIR_HALF_BASE`] base frames of delay, a 90 dB Dolph-Chebyshev
+//!   window), cut at
 //!   `min(19 kHz - 1 kHz * mode, fs / 2)` (rates up to 48 kHz) or `fs / 4`
 //!   (88.2 kHz and up);
-//! * on the oversampled signal a de-esser cut `D` (the saved frequency
+//! * at base rate a direct-form-I de-esser cut `D` (the saved frequency
 //!   `f0`, strength `S` dB and Q:
 //!   `D(s) = (s^2 + s w0/Q + w0^2) / (s^2 + s w0/(Q g) + w0^2)`,
-//!   `g = 10^(-S/20)`, bilinear at the oversampled rate) runs before the
-//!   shaper and its exact inverse after it, so it only shapes how hard each
-//!   band is driven;
-//! * the shaper is `sin(k u) / k` (the drive `k` scales the oversampled
-//!   signal ahead of the de-esser cut, the `1/k` make-up the decimated
-//!   output), unity slope at zero; `k` is a drive between [`K_MIN`] (no
+//!   `g = 10^(-S/20)`, bilinear at `fs`) runs before the interpolator and
+//!   its independently stateful exact inverse runs after the decimator;
+//! * the drive `k` scales each cut base-rate sample before it enters the
+//!   interpolation delay, the memoryless shaper runs at 2fs, and `1/k`
+//!   scales the decimated sample before the inverse de-esser.  A new block's
+//!   scalar is used from its first base-rate sample; FIR histories and both
+//!   biquad states continue unchanged. `k` is between [`K_MIN`] (no
 //!   high-band content) and 1, linked over the channels, set per block
 //!   from the ratio of the block's RMS (all channels) through a fixed
 //!   high-band weighting to its plain RMS
@@ -84,22 +85,15 @@ pub const CEILING_TRIM_DB: f64 = -0.00002;
 /// only matters past `MinFastGain` dB of limiting.
 pub const TAU_SLOW_S: f64 = 10.0;
 /// Output saturation oversampling factor.
-pub const OVERSAMPLE: usize = 3;
+pub const OVERSAMPLE: usize = 2;
 /// Delay of each of the two saturation low passes, in base frames.
 pub const FIR_HALF_BASE: usize = 12;
 /// Taps of the saturation low pass at the oversampled rate.
 pub const FIR_TAPS: usize = 2 * FIR_HALF_BASE * OVERSAMPLE + 1;
-/// The low pass's window: Kaiser `I0(beta sqrt(1 - (t/T)^2)) / I0(beta)`
-/// over the 73 taps, `t` in oversampled samples from the centre.
-///
-/// TODO(SPEC): pinned black-box. The single filter, factored out of the
-/// unit's low-level impulse at 88.2/96/192 kHz (a 25-tap half band), has
-/// the same window in base frames at every rate; this Kaiser matches the
-/// impulses at 44.1/48/96 kHz to 1.5e-5 and the 48 kHz stop band within
-/// 0.06 dB (20 kHz: 0.004 dB). No standard window (Chebyshev, DPSS,
-/// cosine sums, Kaiser-formula beta) matches exactly; the recipe is open.
-pub const WINDOW_BETA: f64 = 11.143;
-pub const WINDOW_HALF_OS: f64 = 38.0;
+/// Length of the max-normalised 90 dB Chebyshev reference window.  The FIR
+/// constructor resamples it to [`FIR_TAPS`] with a clamped cubic B-spline.
+pub const CHEB_REFERENCE_TAPS: usize = 100;
+pub const CHEB_ATTENUATION_DB: f64 = 90.0;
 /// Saturation latency (up plus down low pass), base frames.
 pub const SATURATION_DELAY: usize = 2 * FIR_HALF_BASE;
 /// The cubic (flavour 1) shaper: `f(CUBIC_SCALE k u) / k` with
@@ -121,13 +115,6 @@ pub const K_MIN: f64 = 0.562_341_325_190_349; // 10^(-1/4)
 /// block is set from that block's own input before the block is shaped,
 /// so no look-ahead and no added latency are needed for any call size.
 pub const DRIVE_BLOCK: usize = 512;
-/// Where an oversampled block's new drive takes over, counted from the
-/// block's first frame: inside the shaper from this oversampled sample
-/// (`3 n + phase`, the upsampler's delay), and as the `1/k` make-up on the
-/// decimated output from this frame (the saturation latency). Black-box:
-/// switch-instant fits on tone onsets at 40 Hz to 1.6 kHz all land here.
-const DRIVE_SWITCH_OS: usize = OVERSAMPLE * FIR_HALF_BASE;
-const MAKEUP_SWITCH: usize = 2 * FIR_HALF_BASE;
 /// The drive (dB of `k`) follows each block's target with a one-pole of
 /// this time constant: a block of `n` frames moves it
 /// `1 - exp(-n / (DRIVE_TAU_S fs))` of the way (0.1012 for 512 frames at
@@ -418,51 +405,138 @@ impl Biquad {
 type SatSection = Biquad;
 type SatState = BiquadState;
 
-/// The de-esser cut and its inverse at the oversampled rate `fs`.
-fn deesser(f0: f64, strength_db: f64, q: f64, fs: f64) -> (Biquad, Biquad) {
-    let g = libm::pow(10.0, -strength_db / 20.0);
-    let w0 = 2.0 * core::f64::consts::PI * f0.min(0.49 * fs) / fs;
-    let (s, c) = (libm::sin(w0), libm::cos(w0));
+/// One single-precision direct-form-I section.  The four logical delay
+/// samples are explicit so a drive-block boundary cannot accidentally map or
+/// scale filter state.
+#[derive(Clone, Copy, Default)]
+struct Df1 {
+    b: [f32; 3],
+    a: [f32; 2],
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Df1State {
+    x: [f32; 2],
+    y: [f32; 2],
+}
+
+impl Df1 {
+    fn new(b: [f32; 3], a: [f32; 3]) -> Df1 {
+        Df1 { b: [b[0] / a[0], b[1] / a[0], b[2] / a[0]], a: [a[1] / a[0], a[2] / a[0]] }
+    }
+
+    fn run(&self, st: &mut Df1State, x: f64) -> f64 {
+        let x = x as f32;
+        let y = self.b[0] * x + self.b[1] * st.x[0] + self.b[2] * st.x[1] - self.a[0] * st.y[0] - self.a[1] * st.y[1];
+        st.x[1] = st.x[0];
+        st.x[0] = x;
+        st.y[1] = st.y[0];
+        st.y[0] = y;
+        f64::from(y)
+    }
+}
+
+/// The base-rate de-esser cut and its independently stateful inverse.  The
+/// coefficient construction is single precision, like the filtering path.
+fn deesser(f0: f64, strength_db: f64, q: f64, fs: f64) -> (Df1, Df1) {
+    let (f0, strength_db, q, fs) = (f0 as f32, strength_db as f32, q as f32, fs as f32);
+    let g = libm::powf(10.0, -strength_db / 20.0);
+    let w0 = 2.0 * core::f32::consts::PI * f0.min(0.49 * fs) / fs;
+    let (s, c) = (libm::sinf(w0), libm::cosf(w0));
     let al = s / (2.0 * q);
     let num = [1.0 + al, -2.0 * c, 1.0 - al];
     let den = [1.0 + al / g, -2.0 * c, 1.0 - al / g];
-    (Biquad::new(num, den), Biquad::new(den, num))
+    (Df1::new(num, den), Df1::new(den, num))
 }
 
-/// Modified Bessel function of the first kind, order zero (power series).
-fn bessel_i0(x: f64) -> f64 {
-    let q = x * x / 4.0;
-    let (mut term, mut sum) = (1.0, 1.0);
-    for k in 1..200 {
-        term *= q / (k * k) as f64;
-        sum += term;
-        if term < sum * 1e-17 {
-            break;
+/// A symmetric, max-normalised 100-point, 90 dB Dolph-Chebyshev window.
+///
+/// This is the public analytic construction used by SciPy's BSD-licensed
+/// `scipy.signal.windows.chebwin`, written as a direct DFT because the fixed
+/// reference is small and is built only when the box is created.
+fn chebyshev_reference() -> [f32; CHEB_REFERENCE_TAPS] {
+    let m = CHEB_REFERENCE_TAPS;
+    let order = (m - 1) as f64;
+    let attenuation = libm::pow(10.0, CHEB_ATTENUATION_DB / 20.0);
+    let beta = libm::cosh(libm::acosh(attenuation) / order);
+    let mut p = [0.0; CHEB_REFERENCE_TAPS];
+    for (k, v) in p.iter_mut().enumerate() {
+        let x = beta * libm::cos(core::f64::consts::PI * k as f64 / m as f64);
+        *v = if x > 1.0 {
+            libm::cosh(order * libm::acosh(x))
+        } else if x < -1.0 {
+            -libm::cosh(order * libm::acosh(-x))
+        } else {
+            libm::cos(order * libm::acos(x.clamp(-1.0, 1.0)))
+        };
+    }
+
+    // For even M SciPy phase-shifts p by exp(i*pi*k/M), takes its FFT,
+    // then mirrors bins 1..=M/2.  Only those real bins are needed here.
+    let mut bins = [0.0; CHEB_REFERENCE_TAPS / 2 + 1];
+    for (j, v) in bins.iter_mut().enumerate().skip(1) {
+        for (k, &pk) in p.iter().enumerate() {
+            let phase = core::f64::consts::PI * k as f64 * (1.0 - 2.0 * j as f64) / m as f64;
+            *v += pk * libm::cos(phase);
         }
     }
-    sum
+    let peak = bins[1..].iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let mut out = [0.0; CHEB_REFERENCE_TAPS];
+    for (i, v) in out.iter_mut().enumerate() {
+        let j = if i < m / 2 { m / 2 - i } else { i + 1 - m / 2 };
+        *v = (bins[j] / peak) as f32;
+    }
+    out
 }
 
-/// The saturation low pass at the oversampled rate, unity DC gain.
-fn saturation_fir(mode: u32, fs: f64) -> [f64; FIR_TAPS] {
-    // 32 kHz: every mode cuts at fs/2 (measured); 44.1/48 kHz: per mode;
-    // 88.2 kHz and up: fs/4 for every mode.
-    let fc = if fs >= 88_000.0 { fs / 4.0 } else { (19_000.0 - 1_000.0 * f64::from(mode)).min(fs / 2.0) };
-    let fs_os = fs * OVERSAMPLE as f64;
-    let mut h = [0.0; FIR_TAPS];
-    let mid = (FIR_TAPS / 2) as f64;
-    for (i, v) in h.iter_mut().enumerate() {
-        let t = i as f64 - mid;
-        let a = 2.0 * fc / fs_os;
-        let sinc =
-            if t == 0.0 { 1.0 } else { libm::sin(core::f64::consts::PI * a * t) / (core::f64::consts::PI * a * t) };
-        let r = t / WINDOW_HALF_OS;
-        let win = bessel_i0(WINDOW_BETA * libm::sqrt((1.0 - r * r).max(0.0))) / bessel_i0(WINDOW_BETA);
-        *v = a * sinc * win;
+fn cubic_bspline(x: f32) -> f32 {
+    let a = libm::fabsf(x);
+    if a < 1.0 {
+        2.0 / 3.0 - x * x + 0.5 * a * a * a
+    } else if a < 2.0 {
+        let d = 2.0 - a;
+        d * d * d / 6.0
+    } else {
+        0.0
     }
-    let sum: f64 = h.iter().sum();
-    h.iter_mut().for_each(|v| *v /= sum);
-    h
+}
+
+/// Resample the reference window to the FIR length with clamped cubic
+/// B-spline control points.  Coordinates, weights and output are f32.
+fn saturation_window() -> [f32; FIR_TAPS] {
+    let reference = chebyshev_reference();
+    let mut window = [0.0; FIR_TAPS];
+    for (j, w) in window.iter_mut().enumerate() {
+        let u = (CHEB_REFERENCE_TAPS - 1) as f32 * j as f32 / (FIR_TAPS - 1) as f32;
+        let base = libm::floorf(u) as i32;
+        let frac = u - base as f32;
+        for offset in -1..=2 {
+            let at = (base + offset).clamp(0, (CHEB_REFERENCE_TAPS - 1) as i32) as usize;
+            *w += reference[at] * cubic_bspline(frac - offset as f32);
+        }
+    }
+    window
+}
+
+/// The saturation low pass at the oversampled rate, unity DC gain.  Every
+/// prototype value is rounded to f32 before the double-precision sum, then
+/// the f32 normalisation is applied to the f32 value.
+fn saturation_fir(mode: u32, fs: f64) -> [f32; FIR_TAPS] {
+    let fc = if fs >= 88_200.0 { fs / 4.0 } else { (19_000.0 - 1_000.0 * f64::from(mode)).min(fs / 2.0) };
+    let ratio = (2.0 * fc / fs).clamp(0.5, 1.0);
+    let a = ratio / OVERSAMPLE as f64;
+    let window = saturation_window();
+    let mut q = [0.0; FIR_TAPS];
+    let mut sum = 0.0;
+    for (j, v) in q.iter_mut().enumerate() {
+        let z = a * (j as f64 - (FIR_TAPS / 2) as f64);
+        let sinc =
+            if libm::fabs(z) < 1e-6 { 1.0 } else { libm::sin(core::f64::consts::PI * z) / (core::f64::consts::PI * z) };
+        *v = (f64::from(window[j]) * sinc) as f32;
+        sum += f64::from(*v);
+    }
+    let scale = (1.0 / sum) as f32;
+    q.map(|v| v * scale)
 }
 
 /// Per-channel output saturation state.
@@ -474,13 +548,13 @@ struct Saturator {
     /// Oversampled shaper output history (newest at `v_at`).
     v: [f64; V_RING],
     v_at: usize,
-    pre: BiquadState,
-    post: BiquadState,
+    pre: Df1State,
+    post: Df1State,
     det: [BiquadState; 3],
 }
 
 const PHASE_TAPS: usize = FIR_TAPS.div_ceil(OVERSAMPLE);
-/// The decimator reads `v[3n - i]`, `i < FIR_TAPS`, after `v[3n + 2]`.
+/// The decimator reads `v[2n - i]`, `i < FIR_TAPS`, after `v[2n + 1]`.
 const V_RING: usize = FIR_TAPS + OVERSAMPLE - 1;
 
 impl Saturator {
@@ -490,8 +564,8 @@ impl Saturator {
             x_at: 0,
             v: [0.0; V_RING],
             v_at: 0,
-            pre: BiquadState::default(),
-            post: BiquadState::default(),
+            pre: Df1State::default(),
+            post: Df1State::default(),
             det: [BiquadState::default(); 3],
         }
     }
@@ -510,9 +584,9 @@ struct Saturation {
     ceiling: f64,
     flavor: u32,
     oversampled: bool,
-    h: [f64; FIR_TAPS],
-    pre: Biquad,
-    post: Biquad,
+    h: [f32; FIR_TAPS],
+    pre: Df1,
+    post: Df1,
     det: [Biquad; 3],
     /// Frames measured in the current drive block.
     pos: usize,
@@ -535,8 +609,7 @@ struct Saturation {
 
 impl Saturation {
     fn new(p: &Params, fs: f64, channels: usize) -> Saturation {
-        let fs_os = fs * OVERSAMPLE as f64;
-        let (pre, post) = deesser(p.deesser_hz, p.deesser_db, p.deesser_q, fs_os);
+        let (pre, post) = deesser(p.deesser_hz, p.deesser_db, p.deesser_q, fs);
         let hp = |q| Biquad::rbj(true, DRIVE_HP_HZ.min(0.45 * fs), q, fs);
         let lp = Biquad::rbj(false, DRIVE_LP_HZ.min(0.45 * fs), DRIVE_LP_Q, fs);
         Saturation {
@@ -629,45 +702,44 @@ impl Saturation {
         Self::shape_driven(flavor, k * d) / k
     }
 
-    /// One base-rate sample of channel `c`: with oversampling its
-    /// oversampled samples are driven by `k[phase]` ahead of the de-esser
-    /// cut and shaped, and the decimated output is divided by `makeup`
-    /// (returned [`SATURATION_DELAY`] frames late); at the base rate
-    /// (mode 0) the sample is shaped with `k[0]` and its make-up.
-    fn run(&mut self, c: usize, x: f64, k: [f64; OVERSAMPLE], makeup: f64) -> f64 {
+    /// One base-rate sample of channel `c`.  With oversampling, the cut runs
+    /// first at base rate, `k` scales the value entering the interpolation
+    /// delay, the shaper runs at 2fs, and `1/k` precedes the base-rate inverse.
+    /// At the base rate (mode 0), the sample is shaped directly.
+    fn run(&mut self, c: usize, x: f64, k: f64) -> f64 {
         let h = &self.h;
         let flavor = self.flavor;
         if !self.oversampled {
-            return Self::shape(flavor, k[0], x);
+            return Self::shape(flavor, k, x);
         }
         let s = &mut self.ch[c];
+        let cut = self.pre.run(&mut s.pre, x);
+        let driven = f64::from(cut as f32 * k as f32);
         s.x_at = (s.x_at + 1) % PHASE_TAPS;
-        s.x[s.x_at] = x;
-        for (phase, &kp) in k.iter().enumerate() {
-            // u[3n + phase] = 3 * sum_j h[phase + 3 j] x[n - j]
+        s.x[s.x_at] = driven;
+        for phase in 0..OVERSAMPLE {
+            // u[2n + phase] = sum_j (2 h[phase + 2 j]) (k d[n - j])
             let mut u = 0.0;
             let mut i = phase;
             let mut j = 0;
             while i < FIR_TAPS {
-                u += h[i] * s.x[(s.x_at + PHASE_TAPS - j) % PHASE_TAPS];
+                let up = h[i] * OVERSAMPLE as f32;
+                u += f64::from(up) * s.x[(s.x_at + PHASE_TAPS - j) % PHASE_TAPS];
                 i += OVERSAMPLE;
                 j += 1;
             }
-            u *= OVERSAMPLE as f64;
-            let d = self.pre.run(&mut s.pre, kp * u);
-            let shaped = Self::shape_driven(flavor, d);
-            let v = self.post.run(&mut s.post, shaped);
             s.v_at = (s.v_at + 1) % V_RING;
-            s.v[s.v_at] = v;
+            s.v[s.v_at] = Self::shape_driven(flavor, u);
         }
-        // y[n] = sum_i h[i] v[3n - i]; v[3n] was pushed OVERSAMPLE - 1
+        // y[n] = sum_i h[i] v[2n - i]; v[2n] was pushed OVERSAMPLE - 1
         // samples before the newest.
-        let newest_3n = (s.v_at + V_RING - (OVERSAMPLE - 1)) % V_RING;
+        let newest_2n = (s.v_at + V_RING - (OVERSAMPLE - 1)) % V_RING;
         let mut y = 0.0;
         for (i, hv) in h.iter().enumerate() {
-            y += hv * s.v[(newest_3n + V_RING - i) % V_RING];
+            y += f64::from(*hv) * s.v[(newest_2n + V_RING - i) % V_RING];
         }
-        y / makeup
+        let made_up = f64::from(y as f32 * (1.0f32 / k as f32));
+        self.post.run(&mut s.post, made_up)
     }
 }
 
@@ -881,21 +953,18 @@ impl Run {
                 *v = x;
             }
         }
-        // the previous block's drive and this block's (measured first)
-        let (mut k_before, mut k_after, mut switch_os, mut switch_makeup) = (1.0, 1.0, 0, 0);
+        // This block is measured before it is shaped.  Its new scalar applies
+        // from sample zero; the FIR delay itself retains prior driven samples.
+        let mut k = 1.0;
         if let Some(s) = &mut self.saturation {
             for i in 0..n {
                 for c in 0..ch {
                     s.measure(c, self.piece[c * DRIVE_BLOCK + i]);
                 }
             }
-            k_before = s.k;
             s.pos = n;
             s.end_block();
-            k_after = s.k;
-            if s.oversampled {
-                (switch_os, switch_makeup) = (DRIVE_SWITCH_OS, MAKEUP_SWITCH);
-            }
+            k = s.k;
         }
         let l = self.lookahead;
         for i in 0..n {
@@ -905,13 +974,7 @@ impl Run {
             for (c, slot) in frame[..ch].iter_mut().enumerate() {
                 let mut x = self.piece[c * DRIVE_BLOCK + i];
                 if let Some(s) = &mut self.saturation {
-                    // the block's drive takes over inside the shaper from
-                    // oversampled sample `switch_os` of the block and as
-                    // the 1/k make-up from output frame `switch_makeup`
-                    let os = OVERSAMPLE * i;
-                    let k = core::array::from_fn(|p| if os + p < switch_os { k_before } else { k_after });
-                    let makeup = if i < switch_makeup { k_before } else { k_after };
-                    x = s.run(c, x, k, makeup);
+                    x = s.run(c, x, k);
                     if s.started < s.delay() {
                         x = 0.0;
                     }
@@ -1177,6 +1240,43 @@ mod tests {
             assert!((20.0 * libm::log10(g) + 12.04).abs() < 0.2, "mode {mode}: {} dB at {cut}", 20.0 * libm::log10(g));
         }
         assert!(20.0 * libm::log10(tone_gain(&saturating(3), 20_000.0, 1e-3)) < -60.0);
+    }
+
+    #[test]
+    fn chebyshev_window_and_fir_are_symmetric_and_normalised() {
+        let reference = chebyshev_reference();
+        assert_eq!(reference[CHEB_REFERENCE_TAPS / 2 - 1], 1.0);
+        assert_eq!(reference[CHEB_REFERENCE_TAPS / 2], 1.0);
+        for i in 0..CHEB_REFERENCE_TAPS {
+            assert_eq!(reference[i], reference[CHEB_REFERENCE_TAPS - 1 - i]);
+        }
+
+        let h = saturation_fir(3, 48_000.0);
+        assert_eq!((OVERSAMPLE, FIR_TAPS, SATURATION_DELAY), (2, 49, 24));
+        let sum: f64 = h.iter().map(|&v| f64::from(v)).sum();
+        assert!((sum - 1.0).abs() < 2e-7, "dc {sum}");
+        for i in 0..FIR_TAPS {
+            assert!((h[i] - h[FIR_TAPS - 1 - i]).abs() < 2e-7);
+        }
+    }
+
+    #[test]
+    fn a_new_block_drive_starts_at_its_first_base_sample_without_state_mapping() {
+        let p = saturating(3);
+        let mut sat = Saturation::new(&p, 48_000.0, 1);
+        sat.run(0, 0.25, 0.7);
+        let old_at = sat.ch[0].x_at;
+        let old_driven = sat.ch[0].x[old_at];
+        let pre_before = sat.ch[0].pre;
+        let mut expected_pre = pre_before;
+        let cut = sat.pre.run(&mut expected_pre, -0.2);
+        let expected_driven = f64::from(cut as f32 * 0.9f32);
+
+        sat.run(0, -0.2, 0.9);
+
+        assert_eq!(sat.ch[0].x[old_at], old_driven);
+        assert_eq!(sat.ch[0].x[sat.ch[0].x_at], expected_driven);
+        assert_eq!(sat.ch[0].pre, expected_pre);
     }
 
     #[test]
