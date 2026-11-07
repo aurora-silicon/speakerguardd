@@ -519,6 +519,70 @@ fn half_stages(p: &Params, fs: f64) -> [HalfStage; XOVERS] {
     out
 }
 
+fn append_path(output: &mut Path, input: &Path) {
+    for section in &input.section[..input.count] {
+        output.push(*section);
+    }
+}
+
+fn append_half(output: &mut Path, stage: &HalfStage, high: bool) {
+    append_path(output, if high { &stage.high } else { &stage.low });
+    if high && stage.high_sign < 0.0 {
+        output.push(Section { b0: -1.0, ..Section::ID });
+    }
+}
+
+/// Continue each analysis branch independently after its moving gain. The
+/// active crossover halves complete the Linkwitz-Riley branches, while the
+/// nonparticipating full allpasses retain the collapsed bank's neutral path.
+fn half_synthesis_paths(p: &Params, fs: f64, half: &[HalfStage; XOVERS]) -> [Path; BANDS] {
+    let mut out = [Path::EMPTY; BANDS];
+    if p.render_quality == 1 && p.algorithm < 3 {
+        for (band, path) in out.iter_mut().enumerate() {
+            for (stage, item) in half.iter().enumerate() {
+                if stage < band {
+                    append_half(path, item, true);
+                } else if stage == band && band < XOVERS {
+                    append_half(path, item, false);
+                } else if stage > band {
+                    let mut allpass = Path::EMPTY;
+                    push_lr_allpass(
+                        &mut allpass,
+                        effective_order(p.crossover_order[stage]),
+                        p.crossover_hz[stage],
+                        fs,
+                    );
+                    append_path(path, &allpass);
+                }
+            }
+        }
+        return out;
+    }
+
+    let tree: [&[(usize, bool)]; BANDS] = [
+        &[(1, false), (0, false)],
+        &[(1, false), (0, true)],
+        &[(1, true), (2, false)],
+        &[(1, true), (2, true)],
+    ];
+    let passing = [2, 2, 0, 0];
+    for (band, path) in out.iter_mut().enumerate() {
+        for &(stage, high) in tree[band] {
+            append_half(path, &half[stage], high);
+        }
+        let stage = passing[band];
+        let mut allpass = Path::EMPTY;
+        push_lr_allpass(
+            &mut allpass,
+            effective_order(p.crossover_order[stage]),
+            p.crossover_hz[stage],
+            fs,
+        );
+        append_path(path, &allpass);
+    }
+    out
+}
+
 /// Detector paths use one Butterworth half of each Linkwitz-Riley branch.
 /// Their magnitudes are consequently the square root of the audio bands'
 /// magnitudes.  Phase-equalising allpasses are unnecessary before magnitude
@@ -998,6 +1062,7 @@ pub struct Run {
     path: [Path; BANDS],
     legacy_stage: [LegacyStage; XOVERS],
     half_stage: [HalfStage; XOVERS],
+    half_synthesis_path: [Path; BANDS],
     detector_path: [DetectorPath; BANDS],
     band: [Band; BANDS],
     base_band: [Band; BANDS],
@@ -1038,10 +1103,7 @@ pub struct Run {
     half_analysis_high_a: [[[[f32; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
     half_analysis_low_b: [[[[f32; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
     half_analysis_high_b: [[[[f32; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
-    half_synthesis_low: [[[[f32; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
-    half_synthesis_high: [[[[f32; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
-    half_synthesis_phase_low: [[[f32; 2]; MAX_FILTERS]; MAX_CHANNELS],
-    half_synthesis_phase_high: [[[f32; 2]; MAX_FILTERS]; MAX_CHANNELS],
+    half_synthesis_state: [[[[f32; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS],
     detector_state: [[[[f32; 2]; MAX_DETECTOR_FILTERS]; BANDS]; MAX_CHANNELS],
     analytic_band_path: [Path; BANDS],
     analytic_reference_path: [Path; BANDS],
@@ -1101,10 +1163,12 @@ impl Run {
             };
         }
         let (analytic_band_path, analytic_reference_path) = analytic_detector_paths(q, fs);
+        let half_stage = half_stages(q, fs);
         let mut run = Run {
             path: paths(q, fs),
             legacy_stage: legacy_stages(q, fs),
-            half_stage: half_stages(q, fs),
+            half_stage,
+            half_synthesis_path: half_synthesis_paths(q, fs, &half_stage),
             detector_path: detector_paths(q, fs),
             band: q.band,
             base_band: q.band,
@@ -1147,10 +1211,7 @@ impl Run {
             half_analysis_high_a: [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
             half_analysis_low_b: [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
             half_analysis_high_b: [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
-            half_synthesis_low: [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
-            half_synthesis_high: [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
-            half_synthesis_phase_low: [[[0.0; 2]; MAX_FILTERS]; MAX_CHANNELS],
-            half_synthesis_phase_high: [[[0.0; 2]; MAX_FILTERS]; MAX_CHANNELS],
+            half_synthesis_state: [[[[0.0; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS],
             detector_state: [[[[0.0; 2]; MAX_DETECTOR_FILTERS]; BANDS]; MAX_CHANNELS],
             analytic_band_path,
             analytic_reference_path,
@@ -1199,10 +1260,7 @@ impl Run {
         self.half_analysis_high_a = [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS];
         self.half_analysis_low_b = [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS];
         self.half_analysis_high_b = [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS];
-        self.half_synthesis_low = [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS];
-        self.half_synthesis_high = [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS];
-        self.half_synthesis_phase_low = [[[0.0; 2]; MAX_FILTERS]; MAX_CHANNELS];
-        self.half_synthesis_phase_high = [[[0.0; 2]; MAX_FILTERS]; MAX_CHANNELS];
+        self.half_synthesis_state = [[[[0.0; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS];
         self.detector_state = [[[[0.0; 2]; MAX_DETECTOR_FILTERS]; BANDS]; MAX_CHANNELS];
         self.analytic_band_state = [[[[0.0; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS];
         self.analytic_reference_state = [[[[0.0; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS];
@@ -1326,33 +1384,15 @@ impl Run {
 
     #[inline]
     fn half_synthesize(
-        stages: [HalfStage; XOVERS],
-        legacy: bool,
-        low_state: &mut [[[f32; 2]; MAX_FILTERS]; XOVERS],
-        high_state: &mut [[[f32; 2]; MAX_FILTERS]; XOVERS],
-        phase_low_state: &mut [[f32; 2]; MAX_FILTERS],
-        phase_high_state: &mut [[f32; 2]; MAX_FILTERS],
+        paths: &[Path; BANDS],
+        state: &mut [[[f32; 2]; MAX_FILTERS]; BANDS],
         bands: [f64; BANDS],
     ) -> f64 {
-        if legacy {
-            let mut remaining = bands[BANDS - 1];
-            for stage in (0..XOVERS).rev() {
-                let low = Self::run_detector_path(&stages[stage].low, &mut low_state[stage], bands[stage]);
-                let high = Self::run_detector_path(&stages[stage].high, &mut high_state[stage], remaining)
-                    * stages[stage].high_sign;
-                remaining = low + high;
-            }
-            remaining
-        } else {
-            let low_pair = Self::run_detector_path(&stages[0].low, &mut low_state[0], bands[0])
-                + stages[0].high_sign * Self::run_detector_path(&stages[0].high, &mut high_state[0], bands[1]);
-            let high_pair = Self::run_detector_path(&stages[2].low, &mut low_state[2], bands[2])
-                + stages[2].high_sign * Self::run_detector_path(&stages[2].high, &mut high_state[2], bands[3]);
-            let low_side = Self::run_detector_path(&stages[2].low, phase_low_state, low_pair);
-            let high_side = stages[0].high_sign * Self::run_detector_path(&stages[0].high, phase_high_state, high_pair);
-            Self::run_detector_path(&stages[1].low, &mut low_state[1], low_side)
-                + stages[1].high_sign * Self::run_detector_path(&stages[1].high, &mut high_state[1], high_side)
+        let mut output = 0.0;
+        for band in 0..BANDS {
+            output += Self::run_detector_path(&paths[band], &mut state[band], bands[band]);
         }
+        output
     }
 
     #[inline]
@@ -1580,12 +1620,8 @@ impl Run {
                 }
                 let mut y = if self.hop_peak {
                     Self::half_synthesize(
-                        self.half_stage,
-                        self.legacy_recombination,
-                        &mut self.half_synthesis_low[c],
-                        &mut self.half_synthesis_high[c],
-                        &mut self.half_synthesis_phase_low[c],
-                        &mut self.half_synthesis_phase_high[c],
+                        &self.half_synthesis_path,
+                        &mut self.half_synthesis_state[c],
                         processed,
                     )
                 } else if self.legacy_recombination {
@@ -1606,10 +1642,7 @@ impl Run {
                     self.half_analysis_high_a[c] = [[[0.0; 2]; MAX_FILTERS]; XOVERS];
                     self.half_analysis_low_b[c] = [[[0.0; 2]; MAX_FILTERS]; XOVERS];
                     self.half_analysis_high_b[c] = [[[0.0; 2]; MAX_FILTERS]; XOVERS];
-                    self.half_synthesis_low[c] = [[[0.0; 2]; MAX_FILTERS]; XOVERS];
-                    self.half_synthesis_high[c] = [[[0.0; 2]; MAX_FILTERS]; XOVERS];
-                    self.half_synthesis_phase_low[c] = [[0.0; 2]; MAX_FILTERS];
-                    self.half_synthesis_phase_high[c] = [[0.0; 2]; MAX_FILTERS];
+                    self.half_synthesis_state[c] = [[[0.0; 2]; MAX_FILTERS]; BANDS];
                     self.audio_quadrature[c].reset();
                 }
             }
