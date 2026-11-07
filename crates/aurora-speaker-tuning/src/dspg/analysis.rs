@@ -176,7 +176,10 @@ pub fn lanes_into(g: &Graph, dst: &Endpoint) -> Result<Vec<Lane>> {
 
 /// Longest box chain the lane tracer follows (it recurses once per box).
 /// The shipped graphs chain a few tens of boxes.
-pub const MAX_TRACE_DEPTH: usize = 256;
+// Real speaker graphs trace through a few dozen boxes. The cap keeps the
+// recursive tracer inside a 2 MiB thread stack on every target, debug
+// builds included (aarch64 debug frames are the largest).
+pub const MAX_TRACE_DEPTH: usize = 128;
 
 fn in_wire<'a>(g: &'a Graph, node: &str, port: u32) -> Option<&'a Wire> {
     g.wires.iter().find(|w| w.dst.node == node && w.dst.port == port)
