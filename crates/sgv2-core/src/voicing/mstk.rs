@@ -989,7 +989,6 @@ impl SlidingMax {
 /// The real-time state of one linked compressor instance.
 pub struct Run {
     half_stage: [HalfStage; XOVERS],
-    band_zero_antialias: Path,
     half_synthesis_path: [Path; BANDS],
     detector_path: [DetectorPath; BANDS],
     band: [Band; BANDS],
@@ -1024,8 +1023,6 @@ pub struct Run {
     half_analysis_high_a: [[[[f32; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
     half_analysis_low_b: [[[[f32; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
     half_analysis_high_b: [[[[f32; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
-    band_zero_antialias_a: [[[f32; 2]; MAX_FILTERS]; MAX_CHANNELS],
-    band_zero_antialias_b: [[[f32; 2]; MAX_FILTERS]; MAX_CHANNELS],
     half_synthesis_state: [[[[f32; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS],
     detector_state: [[[[f32; 2]; MAX_DETECTOR_FILTERS]; BANDS]; MAX_CHANNELS],
     overshoot_state: [[[[[f32; 2]; MAX_DETECTOR_FILTERS]; BANDS]; BANDS]; MAX_CHANNELS],
@@ -1080,13 +1077,8 @@ impl Run {
             };
         }
         let half_stage = half_stages(q, fs);
-        let mut band_zero_antialias = Path::EMPTY;
-        if band_zero_factor > 1 {
-            push_butter(&mut band_zero_antialias, false, 5, fs / (2.0 * band_zero_factor as f64), fs);
-        }
         let mut run = Run {
             half_stage,
-            band_zero_antialias,
             half_synthesis_path: half_synthesis_paths(q, fs, &half_stage),
             detector_path: detector_paths(q, fs),
             band: q.band,
@@ -1123,8 +1115,6 @@ impl Run {
             half_analysis_high_a: [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
             half_analysis_low_b: [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
             half_analysis_high_b: [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
-            band_zero_antialias_a: [[[0.0; 2]; MAX_FILTERS]; MAX_CHANNELS],
-            band_zero_antialias_b: [[[0.0; 2]; MAX_FILTERS]; MAX_CHANNELS],
             half_synthesis_state: [[[[0.0; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS],
             detector_state: [[[[0.0; 2]; MAX_DETECTOR_FILTERS]; BANDS]; MAX_CHANNELS],
             overshoot_state: [[[[[0.0; 2]; MAX_DETECTOR_FILTERS]; BANDS]; BANDS]; MAX_CHANNELS],
@@ -1159,8 +1149,6 @@ impl Run {
         self.half_analysis_high_a = [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS];
         self.half_analysis_low_b = [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS];
         self.half_analysis_high_b = [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS];
-        self.band_zero_antialias_a = [[[0.0; 2]; MAX_FILTERS]; MAX_CHANNELS];
-        self.band_zero_antialias_b = [[[0.0; 2]; MAX_FILTERS]; MAX_CHANNELS];
         self.half_synthesis_state = [[[[0.0; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS];
         self.detector_state = [[[[0.0; 2]; MAX_DETECTOR_FILTERS]; BANDS]; MAX_CHANNELS];
         self.overshoot_state = [[[[[0.0; 2]; MAX_DETECTOR_FILTERS]; BANDS]; BANDS]; MAX_CHANNELS];
@@ -1371,20 +1359,6 @@ impl Run {
                         input,
                     );
                 }
-                if self.band_zero_factor > 1 {
-                    bands_a[c][0] = Self::run_detector_path(
-                        &self.band_zero_antialias,
-                        &mut self.band_zero_antialias_a[c],
-                        bands_a[c][0],
-                    );
-                    if self.analytic_pick {
-                        bands_b[c][0] = Self::run_detector_path(
-                            &self.band_zero_antialias,
-                            &mut self.band_zero_antialias_b[c],
-                            bands_b[c][0],
-                        );
-                    }
-                }
                 let (detected, overshoot_arm) = self.detect(c, input);
                 for b in 0..BANDS {
                     let detected = if self.analytic_pick {
@@ -1486,8 +1460,6 @@ impl Run {
                     self.half_analysis_high_a[c] = [[[0.0; 2]; MAX_FILTERS]; XOVERS];
                     self.half_analysis_low_b[c] = [[[0.0; 2]; MAX_FILTERS]; XOVERS];
                     self.half_analysis_high_b[c] = [[[0.0; 2]; MAX_FILTERS]; XOVERS];
-                    self.band_zero_antialias_a[c] = [[0.0; 2]; MAX_FILTERS];
-                    self.band_zero_antialias_b[c] = [[0.0; 2]; MAX_FILTERS];
                     self.half_synthesis_state[c] = [[[0.0; 2]; MAX_FILTERS]; BANDS];
                     self.audio_quadrature[c].reset();
                 }
