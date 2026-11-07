@@ -631,7 +631,7 @@ fn compensation_specs(
     let flag = |id| Ok::<_, InitError>(get(id)? != 0.0);
     let selector = |id| {
         let v = get(id)?;
-        if v.is_finite() && v >= 0.0 && v.fract() == 0.0 {
+        if v.is_finite() && v >= 0.0 && libm::floorf(v) == v {
             Ok(v as usize)
         } else {
             Err(InitError::Invalid("compensation selector"))
