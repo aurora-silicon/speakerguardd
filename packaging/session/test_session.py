@@ -278,9 +278,10 @@ class Generated(unittest.TestCase):
         # Butterworth pole-pair Qs (order 2: 1/sqrt(2); order 8: the four classic values)
         self.assertAlmostEqual(gen.butterworth_q(2)[0], 2 ** -0.5, places=12)
         self.assertEqual([round(q, 4) for q in gen.butterworth_q(8)], [2.5629, 0.9, 0.6013, 0.5098])
-        # Shipped gate: the j700 only (the AID44 ControlFreak band, Daybreak t-5511), in front of the plugin.
+        # Shipped gate: no board needs the interim band limit since the AID44 ControlFreak saturation
+        # law is exact (2026-11-08); the mechanism stays for a future open law.
         on = sorted(b for b in (gen.fixture(m)["hw"]["board"] for m in gen.machines()) if gen.voicing_lowpass(b) is not None)
-        self.assertEqual(sorted(set(on)), ["j700"])
+        self.assertEqual(sorted(set(on)), [])
         for m in gen.machines():
             c, w = gen.machine(m)
             conf = gen.pipewire_conf(m, c, w, voicing_pre=True)
