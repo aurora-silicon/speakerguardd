@@ -44,6 +44,7 @@ const HP_ENABLE: u32 = 10;
 const HP_HZ: u32 = 11;
 const RESET_MODE: u32 = 12;
 const VERSION: u32 = 13;
+const TRANSIENT_RESPONSE: u32 = 14;
 const AUTOMATION: u32 = 15;
 const EXPECTED: u32 = 28;
 const RESET_TIMEOUT: u32 = 29;
@@ -80,6 +81,8 @@ const SUPPORTED_FS: f64 = 48_000.0;
 /// Fast-path release dead band by algorithm version, dB.
 const FAST_DEADBAND_V2_DB: f64 = 10.0;
 const FAST_DEADBAND_V3_DB: f64 = 7.0;
+const VERSION1_MIN_TRANSIENT_MS: f64 = 1.0;
+const VERSION1_MAX_TRANSIENT_MS: f64 = 100.0;
 
 fn bad(message: impl Into<String>) -> Error {
     Error::format("Norm", message)
@@ -213,13 +216,19 @@ pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option
     if reset_mode == RESET_SEEDED && req(RESET_TIMEOUT)? == 0.0 {
         return Err(bad(format!("{}: reset mode {reset_mode} without a silence timeout is not carried", stage.name)));
     }
-    // the fast path's release dead band is the one law that differs between
-    // the algorithm versions the speaker strips use
+    // Version 1 retains the older detector response and two-sided fast
+    // arbitration. Versions 2/3 share the newer history-weighted release.
     let version = req(VERSION)?;
-    let fast_deadband_db = if version == 2.0 {
-        FAST_DEADBAND_V2_DB
+    let (algorithm1, fast_deadband_db, detector_ema_s) = if version == 1.0 {
+        let transient_ms = req(TRANSIENT_RESPONSE)?;
+        if !(VERSION1_MIN_TRANSIENT_MS..=VERSION1_MAX_TRANSIENT_MS).contains(&transient_ms) {
+            return Err(bad(format!("{}: version-1 transient response {transient_ms} ms", stage.name)));
+        }
+        (true, 8.0, transient_ms / 1000.0)
+    } else if version == 2.0 {
+        (false, FAST_DEADBAND_V2_DB, 0.030)
     } else if version == 3.0 {
-        FAST_DEADBAND_V3_DB
+        (false, FAST_DEADBAND_V3_DB, 0.030)
     } else {
         return Err(bad(format!("{}: algorithm version {version} is not carried", stage.name)));
     };
@@ -277,6 +286,8 @@ pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option
         lookahead: lookahead.max(0.0) as usize,
         sections: sos.len(),
         fast_deadband_db,
+        algorithm1,
+        detector_ema_s,
         ..Params::default()
     };
     for (d, s) in p.sos.iter_mut().zip(&sos) {
