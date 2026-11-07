@@ -710,12 +710,14 @@ fn carried(points: &[Point], spans: &[(usize, usize, bool)]) -> Carry {
 }
 
 /// Minimum magnitude of the actual section over the whole unit circle.
-/// Its squared magnitude is a ratio of quadratics in cos(w); extrema are
-/// the endpoints and the real roots of the quadratic derivative numerator.
-/// Evaluate the section itself at those roots to avoid cancellation in the
-/// expanded power polynomials near DC.
+/// Its squared magnitude is a ratio of quadratics in sin(w/2)^2; extrema
+/// are the endpoints and the real roots of the derivative numerator.
+/// This shifted coordinate preserves the small DC terms of narrow peaks;
+/// expanding in cos(w) instead loses them to cancellation. Evaluate the
+/// section itself at the roots rather than dividing expanded polynomials.
 fn section_floor(s: Section, fs: f64) -> f64 {
-    let power = |b0: f64, b1: f64, b2: f64| [(b0 - b2).powi(2) + b1 * b1, 2.0 * b1 * (b0 + b2), 4.0 * b0 * b2];
+    let power =
+        |b0: f64, b1: f64, b2: f64| [(b0 + b1 + b2).powi(2), -4.0 * (b1 * (b0 + b2) + 4.0 * b0 * b2), 16.0 * b0 * b2];
     let n = power(s.b0, s.b1, s.b2);
     let d = power(1.0, s.a1, s.a2);
     let a = n[2] * d[1] - n[1] * d[2];
@@ -723,8 +725,8 @@ fn section_floor(s: Section, fs: f64) -> f64 {
     let c = n[1] * d[0] - n[0] * d[1];
     let mut floor = s.magnitude(0.0, fs).min(s.magnitude(fs * 0.5, fs));
     let mut at = |x: f64| {
-        if (-1.0..=1.0).contains(&x) {
-            floor = floor.min(s.magnitude(x.acos() * fs / (2.0 * PI), fs));
+        if (0.0..=1.0).contains(&x) {
+            floor = floor.min(s.magnitude(x.sqrt().asin() * fs / PI, fs));
         }
     };
     if a == 0.0 {
