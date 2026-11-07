@@ -77,14 +77,13 @@ fn lowflow_parameter_words_are_carried_including_responses() {
     models[0] = m;
     models[0].pressure_response[7] = 0.125;
     models[0].tweeter_response[13] = 0.0625;
-    spec.nodes[0].kind =
-        Kind::Lowflow(Box::new(Params {
-            model_count: 1,
-            link_channel_energies: true,
-            latency_frames: 256,
-            conservative_fallback: false,
-            models,
-        }));
+    spec.nodes[0].kind = Kind::Lowflow(Box::new(Params {
+        model_count: 1,
+        link_channel_energies: true,
+        latency_frames: 256,
+        conservative_fallback: false,
+        models,
+    }));
     let base = voicing_fixture::unit("j413", 4);
     let bytes = artifact::encode(&spec, &base).unwrap();
     assert_eq!(u32::from_le_bytes(bytes[12..16].try_into().unwrap()), CONSERVATIVE as u32);

@@ -142,6 +142,8 @@ fn compile_node(
                 Ok(None) => Kind::Bypass,
                 Err(e) => uncarried(n, subtype, e, gaps),
             },
+            // The default build carries the unit's full detector, mask and
+            // water-fill law; the conservative build its guarded fallback.
             "flow" => match super::lowflow::compile(stage, fs, diags) {
                 Ok(Some(p)) => Kind::Lowflow(Box::new(p)),
                 Ok(None) => Kind::Bypass,
