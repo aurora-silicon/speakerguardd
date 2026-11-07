@@ -55,6 +55,13 @@
 //!   last proof is Closed and no stream can start until the open returns):
 //!   grace of [`OPENING_GRACE_NS`]. The sink's open blocks the graph's data
 //!   thread, so the engine cannot beat during it (~190 ms on the J700).
+//!   Once that open completes, the same pre-open beat keeps this allowance
+//!   for at most [`START_GRACE_NS`], until the first post-open beat. The PCM
+//!   reader can see Open/RUNNING before the graph runs again; reducing the
+//!   allowed age at that instant would make the old beat stale retroactively.
+//!   This handoff never extends Opening's heartbeat-age bound, survives a
+//!   transition only to the engine's own Open/RUNNING PCM, and ends at the
+//!   next beat (or any other PCM state).
 //! - RUNNING: + grace for [`START_GRACE_NS`] after it is first seen running,
 //!   strict from then on.
 //! - For [`GRANT_GRACE_WINDOW_NS`] after each grant, in any of those states,
@@ -269,6 +276,10 @@ pub struct Observer {
     quantum: Option<u64>,
     was_running: bool,
     grace_until: Option<u64>,
+    /// The engine beat seen while Opening, and the one-shot deadline for
+    /// handing it to Open/RUNNING. Cleared on a new beat or any other state.
+    opening_beat: Option<(u32, u64)>,
+    opening_handoff_until: Option<u64>,
     /// When the current XRUN was first seen.
     xrun_since: Option<u64>,
     granted_at: Option<u64>,
@@ -295,6 +306,8 @@ impl Observer {
             quantum: None,
             was_running: false,
             grace_until: None,
+            opening_beat: None,
+            opening_handoff_until: None,
             xrun_since: None,
             granted_at: None,
             expected_wiring: None,
@@ -379,6 +392,30 @@ impl Observer {
             self.grace_until = None;
         }
         self.was_running = running;
+        let opening_handoff = match p {
+            PcmState::Opening => {
+                self.opening_beat = e.valid.then_some((e.pid, e.seq));
+                self.opening_handoff_until = None;
+                0
+            }
+            PcmState::Open { owner } | PcmState::Running { owner }
+                if e.valid && owner != 0 && owner == e.pid && self.opening_beat == Some((e.pid, e.seq)) =>
+            {
+                let until = *self.opening_handoff_until.get_or_insert(now_ns.saturating_add(START_GRACE_NS));
+                if now_ns < until {
+                    OPENING_GRACE_NS
+                } else {
+                    self.opening_beat = None;
+                    self.opening_handoff_until = None;
+                    0
+                }
+            }
+            _ => {
+                self.opening_beat = None;
+                self.opening_handoff_until = None;
+                0
+            }
+        };
         let start_grace = match p {
             PcmState::Opening => OPENING_GRACE_NS,
             PcmState::Open { .. } => START_GRACE_NS,
@@ -392,7 +429,7 @@ impl Observer {
                 0
             }
         };
-        let grace = start_grace.max(grant_grace);
+        let grace = start_grace.max(grant_grace).max(opening_handoff);
 
         let heartbeat_fresh = match self.quantum.filter(|q| (1..=MAX_QUANTUM).contains(q)) {
             Some(q) => {
@@ -792,6 +829,130 @@ mod tests {
         }
         assert_eq!(PcmState::unpack(PcmState::Opening.pack()), PcmState::Opening);
         assert_eq!(PcmState::Opening.owner(), None);
+    }
+
+    /// J700: after the first grant, the sink's open blocks the graph for
+    /// about 190 ms. The PCM reader sees the completed open before the
+    /// graph publishes its first post-open beat. Dropping Opening's age
+    /// allowance on that tick withdrew a healthy grant at about +210 ms.
+    #[test]
+    fn first_grant_survives_open_completion_before_the_next_heartbeat() {
+        use crate::lease::{Action, Lease};
+
+        for completed in [PcmState::Open { owner: PID }, PcmState::Running { owner: PID }] {
+            let mut o = Observer::new(7, 48_000, TICK);
+            let mut lease = Lease::default();
+            let mut seq = 0;
+            let mut mono = 0;
+            let mut at = |o: &mut Observer, now: u64, advancing: bool, pcm| {
+                if advancing {
+                    seq += 1;
+                    mono = now;
+                }
+                let obs = o.observe(&mut || now, &mut E(beat(seq, 512, mono)), &mut P(pcm), &mut S(session(now)));
+                Observation { route_ok: true, amps_ok: true, ..obs }
+            };
+            // The sequence also repeats after a service restart on resume.
+            for cycle in 0..6 {
+                let base = 1_000_000_000 + cycle * 1_000_000_000;
+                for k in 0..4 {
+                    lease.tick(at(&mut o, base + k * TICK, true, PcmState::Closed));
+                }
+                assert!(lease.held());
+                let grant = base + 3 * TICK;
+                o.note_grant(grant);
+                for k in 1..21 {
+                    assert_eq!(lease.tick(at(&mut o, grant + k * TICK, false, PcmState::Opening)), Action::Renew);
+                }
+                // Open has completed, but the engine page still contains
+                // the pre-open beat. The next beat is three ticks later.
+                for k in 21..24 {
+                    assert_eq!(lease.tick(at(&mut o, grant + k * TICK, false, completed)), Action::Renew);
+                }
+                assert_eq!(lease.tick(at(&mut o, grant + 24 * TICK, true, completed)), Action::Renew);
+                // A real stop must still withdraw immediately.
+                assert_eq!(
+                    lease.tick(at(&mut o, grant + 25 * TICK, true, PcmState::Stopped { owner: PID })),
+                    Action::Release
+                );
+            }
+        }
+    }
+
+    /// A completed open gets one bounded handoff of the old beat, not a
+    /// new watchdog deadline on every Open/RUNNING transition.
+    #[test]
+    fn opening_handoff_expires_and_a_resumed_heartbeat_ends_it() {
+        for resumed in [false, true] {
+            let mut o = Observer::new(7, 48_000, TICK);
+            let last = 100_000_000;
+            let run = PcmState::Running { owner: PID };
+            let at =
+                |o: &mut Observer, now, e, pcm| o.observe(&mut || now, &mut E(e), &mut P(pcm), &mut S(session(now)));
+            at(&mut o, last - TICK, beat(1, 512, last - TICK), PcmState::Closed);
+            at(&mut o, last, beat(2, 512, last), PcmState::Closed);
+            let old = beat(2, 512, last);
+            assert!(at(&mut o, last + 300_000_000, old, PcmState::Opening).heartbeat_fresh);
+            let complete = last + 310_000_000;
+            assert!(at(&mut o, complete, old, PcmState::Open { owner: PID }).heartbeat_fresh);
+            // Open -> RUNNING must not restart the handoff timer.
+            assert!(at(&mut o, complete + START_GRACE_NS - 1, old, run).heartbeat_fresh);
+            if resumed {
+                let now = complete + START_GRACE_NS;
+                let fresh = beat(3, 512, now);
+                assert!(at(&mut o, now, fresh, run).heartbeat_fresh);
+                // The old 500 ms Opening allowance is gone; the ordinary
+                // RUNNING/driver-switch bound applies, then a real stall
+                // releases. Clock and advancement checks both still run.
+                assert!(
+                    !at(&mut o, now + stale_ns(512, 48_000, TICK) + START_GRACE_NS + 1, fresh, run).heartbeat_fresh
+                );
+            } else {
+                assert!(!at(&mut o, complete + START_GRACE_NS, old, run).heartbeat_fresh);
+                assert!(!at(&mut o, complete + START_GRACE_NS + 1, old, PcmState::Open { owner: PID }).heartbeat_fresh);
+            }
+        }
+    }
+
+    #[test]
+    fn opening_handoff_never_extends_the_original_heartbeat_age_bound() {
+        let mut o = Observer::new(7, 48_000, TICK);
+        let last = 100_000_000;
+        let at = |o: &mut Observer, now, e, pcm| o.observe(&mut || now, &mut E(e), &mut P(pcm), &mut S(session(now)));
+        at(&mut o, last - TICK, beat(1, 512, last - TICK), PcmState::Closed);
+        at(&mut o, last, beat(2, 512, last), PcmState::Closed);
+        let old = beat(2, 512, last);
+        let deadline = last + OPENING_GRACE_NS + stale_ns(512, 48_000, TICK);
+        assert!(at(&mut o, deadline - 2, old, PcmState::Opening).heartbeat_fresh);
+        let open = PcmState::Open { owner: PID };
+        assert!(at(&mut o, deadline - 1, old, open).heartbeat_fresh);
+        assert!(!at(&mut o, deadline + 1, old, open).heartbeat_fresh);
+    }
+
+    #[test]
+    fn opening_handoff_cannot_cross_a_fault_or_engine_generation() {
+        let last = 100_000_000;
+        let old = beat(2, 512, last);
+        let open = PcmState::Open { owner: PID };
+        for (e, pcm) in [
+            (old, PcmState::Closed),
+            (old, PcmState::Unknown),
+            (old, PcmState::Stopped { owner: PID }),
+            (old, PcmState::Xrun { owner: PID }),
+            (old, PcmState::Open { owner: PID + 1 }),
+            (EngineState { pid: PID + 1, ..old }, PcmState::Open { owner: PID + 1 }),
+            (EngineState { valid: false, ..old }, open),
+            (EngineState { seq: 1, ..old }, open),
+        ] {
+            let mut o = Observer::new(7, 48_000, TICK);
+            let at =
+                |o: &mut Observer, now, e, pcm| o.observe(&mut || now, &mut E(e), &mut P(pcm), &mut S(session(now)));
+            at(&mut o, last - TICK, beat(1, 512, last - TICK), PcmState::Closed);
+            at(&mut o, last, old, PcmState::Closed);
+            assert!(at(&mut o, last + 300_000_000, old, PcmState::Opening).heartbeat_fresh);
+            at(&mut o, last + 310_000_000, e, pcm);
+            assert!(!at(&mut o, last + 320_000_000, old, open).heartbeat_fresh, "{e:?}, {pcm:?}");
+        }
     }
 
     #[test]
