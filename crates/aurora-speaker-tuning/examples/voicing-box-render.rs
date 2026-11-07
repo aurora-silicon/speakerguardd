@@ -19,8 +19,8 @@
 //!
 //! `--only NAME` is an alias for `--box NAME`. `--strip FILE` selects a
 //! saved box directly, without requiring the unrelated graph to compile.
-//! The explicit `--ch` then supplies its graph width. Norm removes the
-//! streaming runner's fixed extra CALL, as `norm-render` does. No DSP law is changed.
+//! The explicit `--ch` then supplies its graph width. Every box returns
+//! audio at its production sample positions, without latency compensation.
 //!
 //! For a full ToneMeister box, `--voicing-chain --tone-volume V` drives
 //! parameter 3 and compiles its slot automation. Supply the value at that
@@ -403,11 +403,6 @@ fn main() {
                 "volt" => kind!(volt, Volt),
                 _ => unreachable!(),
             };
-            // Norm's streaming runner buffers one extra CALL. The installed
-            // AU does not have that transport call; match norm-render's
-            // fixed flush/crop rather than fitting an alignment to the output.
-            let extra =
-                if subtype == "ldnm" && !matches!(kind, Kind::Bypass) { sgv2_core::voicing::norm::CALL } else { 0 };
             let spec = Spec {
                 program_channels: ch,
                 nodes: vec![NodeSpec { kind, inputs: (0..ch).map(Source::Program).collect() }],
@@ -425,7 +420,7 @@ fn main() {
                     run.set_param(GraphParam::VolumeScalar, volume);
                 }
             }
-            let total = frames + extra;
+            let total = frames;
             if reset_at.is_some_and(|at| at >= total || at % quantum != 0) {
                 die("--reset-at must select an input frame at a render boundary")
             }
@@ -442,7 +437,7 @@ fn main() {
                 let mut output: Vec<&mut [f32]> = rendered.iter_mut().map(|v| &mut v[at..at + k]).collect();
                 run.process(&input, &mut output, k);
             }
-            planar = rendered.into_iter().map(|channel| channel[extra..extra + frames].to_vec()).collect();
+            planar = rendered;
         }
         other => die(format!("box {name} is aufx/{other}: no v2 implementation in this renderer yet")),
     }

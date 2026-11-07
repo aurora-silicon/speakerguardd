@@ -10,8 +10,8 @@ and compare per segment and per unit lane:
 - steady segments: RMS of the second half;
 - dynamic segments: also every 10 ms window above -80 dBFS on either side;
 - a measurement fails above 0.05 dB in either direction.
-Latency is structural: v2's Norm runs one 512-frame call behind the unit
-(a stubbed Norm: 0); the raw cross-correlation lag is reported.
+All comparisons use the original sample positions, with no latency
+compensation. The raw cross-correlation lag is reported for diagnosis.
 An AID PASSES only with a compiled chain, matching lane count and 0 over.
 Per-box attribution compares each AU box's cumulative output (both sides
 fed by their own upstream chain): the first box over the gate is named.
@@ -26,9 +26,6 @@ GATE = 0.05
 # measured, as in the box rigs' transient windows; they are counted separately.
 FLOOR = 1e-4
 STOPBAND = 60.0
-# v2's Norm (ldnm) runner meters one whole 512-frame call before applying it, so the chain runs
-# exactly one call (512 frames) behind the unit fed in 512-frame quanta; that constant is allowed.
-ALLOWED_LAGS = (0, 512)
 
 
 def rms(x):
@@ -42,7 +39,7 @@ def ddb(a, b, floor):
     return float(20 * np.log10(max(rb, 1e-15) / max(ra, 1e-15)))
 
 
-def lag_of(mac, v2, seg, search=4096, raw=False):
+def lag_of(mac, v2, seg, search=4096):
     s, n = seg["start"], seg["frames"]
     a = mac[s:s + n].sum(axis=1)
     lo = max(0, s - search)
@@ -53,19 +50,11 @@ def lag_of(mac, v2, seg, search=4096, raw=False):
     f = 1 << (m - 1).bit_length()
     c = np.fft.irfft(np.fft.rfft(b, f) * np.conj(np.fft.rfft(a, f)), f)[: len(b)]
     best = int(np.argmax(c))
-    if raw:
-        return best - (s - lo)
-    # Band-limited lanes give broad correlation peaks: compare at the better
-    # of the allowed lags; the raw peak is reported separately.
-    return max(ALLOWED_LAGS, key=lambda lag: c[lag + (s - lo)] if 0 <= lag + (s - lo) < len(c) else -np.inf)
+    return best - (s - lo)
 
 
-def compare(mac, v2, segs, lag):
-    """Per segment x lane deltas; v2 shifted back by lag."""
-    if lag > 0:
-        v2 = np.concatenate([v2[lag:], np.zeros((lag, v2.shape[1]), v2.dtype)])
-    elif lag < 0:
-        v2 = np.concatenate([np.zeros((-lag, v2.shape[1]), v2.dtype), v2[:lag]])
+def compare(mac, v2, segs):
+    """Per segment x lane deltas at the original sample positions."""
     rows = []
     for sg in segs:
         if sg["kind"] == "silence":
@@ -147,10 +136,6 @@ def main():
         info = json.load(open(os.path.join(work, "info.json")))
         res["stubs"] = info.get("stubs")
         res["gaps"] = info.get("gaps")
-        # Structural latency: v2's Norm runs one 512-frame call behind the
-        # unit; a stubbed Norm is a zero-latency wire.
-        stubbed = {x[0] if isinstance(x, list) else x for x in (res["stubs"] or [])}
-        norm_live = [b["box"] for b in gm["boxes"] if b["subtype"] == "ldnm" and b["box"] not in stubbed]
         v2 = np.fromfile(os.path.join(work, "v2.f32"), "<f4")
         if v2.size % nch:
             res.update(status="LANE-MISMATCH", reason=f"v2 samples {v2.size} not a multiple of {nch}")
@@ -159,10 +144,9 @@ def main():
             if not np.isfinite(v2).all():
                 res.update(status="NONFINITE")
             else:
-                lag = 512 if norm_live else 0
-                res["lag_frames"] = lag
-                res["xcorr_lag"] = lag_of(mac, v2, pink, raw=True)
-                res.update(compare(mac, v2, segs, lag))
+                res["lag_frames"] = 0
+                res["xcorr_lag"] = lag_of(mac, v2, pink)
+                res.update(compare(mac, v2, segs))
                 res["status"] = "PASS" if res["over"] == 0 and not res["stubs"] else "FAIL"
         # Per-box cumulative attribution.
         boxes = []
@@ -176,11 +160,8 @@ def main():
                 continue
             ch = mb.size // mac.shape[0]
             mb, vb = mb.reshape(-1, ch), vb.reshape(-1, ch)
-            order = [x["box"] for x in gm["boxes"]]
-            upto = order[: order.index(name) + 1] if name in order else order
-            lb = 512 if any(x in norm_live for x in upto) else 0
-            c = compare(mb, vb, segs, lb)
-            boxes.append({"box": name, "lag": lb, "xcorr_lag": lag_of(mb, vb, pink, raw=True), "measured": c["measured"], "over": c["over"],
+            c = compare(mb, vb, segs)
+            boxes.append({"box": name, "lag": 0, "xcorr_lag": lag_of(mb, vb, pink), "measured": c["measured"], "over": c["over"],
                           "worst_db": c["worst"]["db"] if c["worst"] else None,
                           "worst_seg": c["worst"]["seg"] if c["worst"] else None})
         res["boxes"] = boxes
