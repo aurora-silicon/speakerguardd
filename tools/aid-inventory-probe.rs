@@ -28,7 +28,14 @@ fn graph_boxes(b: &Bundle) -> aurora_speaker_tuning::error::Result<Vec<Value>> {
                 .filter(|line| {
                     !matches!(
                         line.split_whitespace().next(),
-                        Some("param" | "property" | "wireGraphParam" | "wireGraphProperty" | "wireParam" | "wireProperty")
+                        Some(
+                            "param"
+                                | "property"
+                                | "wireGraphParam"
+                                | "wireGraphProperty"
+                                | "wireParam"
+                                | "wireProperty"
+                        )
                     )
                 })
                 .collect::<Vec<_>>()
@@ -171,6 +178,9 @@ fn main() {
     match chain::compile(&t, 48_000.0, &mut diags) {
         Err(e) => result["chain_error"] = json!(e.to_string()),
         Ok(c) => {
+            // The compiler can add zero-port control nodes to the audio
+            // topology. Compare the renderer with the actual executable plan.
+            result["plan"] = json!(c.plan);
             result["stubs"] = json!(c.stubs);
             result["gaps"] = json!(c.gaps);
             result["unwired"] = json!(c.unwired);
