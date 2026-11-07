@@ -21,6 +21,8 @@ const FIR: usize = 97;
 const MIN_HZ: f64 = 50.0;
 const MAX_HZ: [f64; 5] = [2500.0, 3000.0, 4000.0, 6000.0, 20_000.0];
 const MATCH_RELATIVE: f64 = 0.035_264_92;
+const CANDIDATE_LOWER: f32 = 0.965_936_3;
+const CANDIDATE_UPPER: f32 = 1.035_265;
 const REPLACE_GAIN: f64 = 0.82;
 const NOTCH_QUALITY: f64 = 6.0;
 
@@ -369,35 +371,35 @@ impl Run {
     }
 
     fn spectrum(&self, bin: usize) -> (f64, f64) {
-        let centre = bin as f64;
+        let centre = bin as f32;
         if self.history_len == 0 {
-            return (0.0, centre * ANALYSIS_RATE / FFT as f64);
+            return (0.0, centre as f64 * ANALYSIS_RATE / FFT as f64);
         }
-        let step = 2.0 * core::f64::consts::PI * centre / FFT as f64;
-        let (ss, cc) = (libm::sin(step), libm::cos(step));
-        let (mut s, mut c, mut re, mut im, mut dre, mut dim) = (0.0, 1.0, 0.0, 0.0, 0.0, 0.0);
+        let step = 2.0f32 * core::f32::consts::PI * centre / FFT as f32;
+        let (ss, cc) = (libm::sinf(step), libm::cosf(step));
+        let (mut s, mut c, mut re, mut im, mut dre, mut dim) = (0.0f32, 1.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32);
         for n in 0..FFT {
-            let window =
-                0.5 * (1.0 - libm::cos(2.0 * core::f64::consts::PI * n as f64 / (FFT - 1) as f64)) / (FFT - 1) as f64;
+            let window = 0.5f32 * (1.0 - libm::cosf(2.0 * core::f32::consts::PI * n as f32 / (FFT - 1) as f32))
+                / (FFT - 1) as f32;
             let at = (self.history_at + n) % FFT;
             let previous = (at + FFT - 1) % FFT;
-            let raw = self.history[at] as f64;
+            let raw = self.history[at];
             let x = raw * window;
-            let difference = (raw - self.history[previous] as f64) * window;
+            let difference = (raw - self.history[previous]) * window;
             re += x * c;
             im -= x * s;
             dre += difference * c;
             dim -= difference * s;
             (s, c) = (s * cc + c * ss, c * cc - s * ss);
         }
-        let magnitude = libm::sqrt(re * re + im * im);
-        let q = libm::sqrt(dre * dre + dim * dim) / (magnitude + 1.0e-20);
-        let denominator = libm::sqrt(2.0 * (1.0 - libm::cos(q))).max(1.0e-20);
-        let frequency_hz = ANALYSIS_RATE / (2.0 * core::f64::consts::PI) * q * q / denominator;
+        let magnitude = libm::sqrtf(re * re + im * im);
+        let q = libm::sqrtf(dre * dre + dim * dim) / (magnitude + 1.0e-40f32);
+        let denominator = libm::sqrt(2.0 * (1.0 - libm::cos(q as f64))).max(1.0e-20);
+        let frequency_hz = (ANALYSIS_RATE / (2.0 * core::f64::consts::PI) * (q * q) as f64 / denominator) as f32;
         // The analyser compares the doubled positive-frequency magnitude
         // published by its real-input transform.  This is a peak-domain
         // comparison; it does not convert the doubled line to RMS.
-        (2.0 * magnitude, frequency_hz)
+        ((2.0f32 * magnitude) as f64, frequency_hz as f64)
     }
 
     fn redesign(&mut self, index: usize) {
@@ -448,20 +450,31 @@ impl Run {
         let mut amplitudes = [0.0; FFT / 2 + 1];
         let mut frequencies = [0.0; FFT / 2 + 1];
         for (bin, value) in amplitudes.iter_mut().enumerate().take(max_bin + 2) {
-            (*value, frequencies[bin]) = self.spectrum(bin);
+            let (amplitude, frequency) = self.spectrum(bin);
+            *value = amplitude;
+            frequencies[bin] = frequency;
         }
         let mut used = [false; TRACKS];
+        let mut accepted = [0.0f32; TRACKS];
         let mut candidates = 0usize;
         for bin in 1..=max_bin {
             let frequency = (bin as f64 + 0.5) * ANALYSIS_RATE / FFT as f64;
-            let threshold = self.threshold(frequency);
-            let amplitude = amplitudes[bin];
+            let threshold = self.threshold(frequency) as f32;
+            let amplitude = amplitudes[bin] as f32;
             if amplitude <= threshold || !amplitude.is_finite() {
                 continue;
             }
+            let multiplier = (threshold / amplitude).clamp(1.0e-6, 1.0);
             let frequency_hz = frequencies[bin];
             if frequency_hz > MIN_HZ && frequency_hz < self.maximum_hz {
-                self.update_track(frequency_hz, (threshold / amplitude).clamp(1.0e-6, 1.0), &mut used);
+                let frequency_hz = frequency_hz as f32;
+                if accepted[..candidates].iter().any(|previous| {
+                    frequency_hz > *previous * CANDIDATE_LOWER && frequency_hz < *previous * CANDIDATE_UPPER
+                }) {
+                    continue;
+                }
+                accepted[candidates] = frequency_hz;
+                self.update_track(frequency_hz as f64, multiplier as f64, &mut used);
                 candidates += 1;
                 if candidates == TRACKS {
                     break;
