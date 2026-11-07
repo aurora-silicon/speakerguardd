@@ -285,8 +285,8 @@ fn main() {
     let mut planar: Vec<Vec<f32>> = (0..ch).map(|c| (0..frames).map(|i| x[i * ch + c]).collect()).collect();
 
     let subtype = stage.unit.map(|u| u.subtype.to_string()).unwrap_or_default();
-    if subtype != "axtc" && (quantum != 512 || reset_at.is_some()) {
-        die("--q and --reset-at are only carried for XTC")
+    if !matches!(subtype.as_str(), "axtc" | "cfrk") && (quantum != 512 || reset_at.is_some()) {
+        die("--q and --reset-at are only carried for XTC and ControlFreak")
     }
     match subtype.as_str() {
         "mstk" => {
