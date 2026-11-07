@@ -20,7 +20,8 @@ Two sides, one program:
   the same tuning at full volume, and taps every AU box that v2's plan also has.
 
 The gate compares each segment on each unit lane: the RMS of the second half, plus 10 ms windows on
-dynamic segments where either side is above -80 dBFS. Any value outside 0.05 dB in either direction
+dynamic segments where either side is above -80 dBFS. A lane more than 60 dB under the segment's loudest
+lane on both sides (a crossover stop band) is numerical residue and is not measured. Any value outside 0.05 dB in either direction
 fails. Latency is structural, not fitted: v2's Norm (ldnm) meters one whole 512-frame call before it
 applies it, so a chain with a live Norm runs exactly 512 frames behind the unit fed in 512-frame quanta
 and is compared at that offset (a stubbed Norm is a zero-latency wire); the raw cross-correlation lag is

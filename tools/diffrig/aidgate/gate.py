@@ -25,6 +25,7 @@ GATE = 0.05
 # Cells where both sides sit below -80 dBFS (deep driver stop bands, numerical residue) are not
 # measured, as in the box rigs' transient windows; they are counted separately.
 FLOOR = 1e-4
+STOPBAND = 60.0
 # v2's Norm (ldnm) runner meters one whole 512-frame call before applying it, so the chain runs
 # exactly one call (512 frames) behind the unit fed in 512-frame quanta; that constant is allowed.
 ALLOWED_LAGS = (0, 512)
@@ -70,9 +71,13 @@ def compare(mac, v2, segs, lag):
         if sg["kind"] == "silence":
             continue
         s, n = sg["start"], sg["frames"]
+        # A lane more than STOPBAND dB under the segment's loudest lane on
+        # both sides is a crossover stop band: numerical residue, not program.
+        top = max(rms(mac[s + n // 2:s + n, c]) for c in range(mac.shape[1]))
+        floor = max(FLOOR, top * 10 ** (-STOPBAND / 20))
         for c in range(mac.shape[1]):
             a, b = mac[s:s + n, c], v2[s:s + n, c]
-            d = [ddb(a[n // 2:], b[n // 2:], FLOOR)]
+            d = [ddb(a[n // 2:], b[n // 2:], floor)]
             if sg["kind"] == "dynamic":
                 for at in range(0, n - 479, 480):
                     d.append(ddb(a[at:at + 480], b[at:at + 480], 1e-4))
