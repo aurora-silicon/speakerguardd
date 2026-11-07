@@ -115,12 +115,27 @@ self-check and the supervisor, which both require it.
    generated; overrides go in `provision.conf`.
 5. **Graph.** After the self-check passes, `speakerguardd-provision activate`
    generates the machine's PipeWire and WirePlumber files from the record
-   into `/run/speakerguardd-graph`. The user unit `speakerguardd-graph.service`,
-   ordered before PipeWire, links them into the seat user's
+   into `/run/speakerguardd-graph`. The self-check is ordered before
+   `systemd-user-sessions.service`, so the graph is in place before any
+   login, the display manager's automatic login included. The user unit
+   `speakerguardd-graph.service`, ordered before PipeWire, links them into
+   the seat user's
    `pipewire.conf.d` and `wireplumber.conf.d`, and removes them for every
    other user. If the seat user's PipeWire was already running, it is
    restarted on the new graph. The links lead into `/run`, so after a boot
    without v2 they lead nowhere, and PipeWire skips them.
+
+6. **Sleep.** `speakerguardd-sleep.service` is ordered before `sleep.target`.
+   While everything is still awake it sets the hold
+   (`/run/speakerguardd-sleep/hold`); the session helper then unlinks the
+   amps as on a withdrawal and reports them unlinked, and the supervisor stops and
+   releases its ownership. The kernel holds its floor over the sleep with no
+   stream running and no owner to freeze, so no start is refused and no
+   watchdog runs out across the freeze. After the resume the unit is no
+   longer needed; its stop clears the hold and starts the supervisor, which
+   grants as at boot. A sleep entered without systemd (a direct write to
+   `/sys/power/state`) skips this, and the kernel's own withdrawal at
+   suspend is what holds.
 
 Any failure fails closed: the blob, the configuration and the graph are
 removed, the self-check and the supervisor do not start, the kernel holds

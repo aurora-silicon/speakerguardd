@@ -4,6 +4,10 @@ Documentation=https://github.com/aurora-silicon/speakerguardd/tree/v2
 # Without this service no protection holds the amplifiers, and the kernel's
 # own safe level applies. There is deliberately no OnFailure= chain.
 After=systemd-udev-settle.service speakerguardd-provision.service speakerguardd-selfcheck.service
+# Stopped only after every user session (and its PipeWire) is gone, at
+# shutdown and reboot: no speaker stream is left running into the
+# withdrawal, so no start is refused.
+After=systemd-user-sessions.service
 # Provisioning (the parameter blob from this Mac's tuning, the seat user,
 # this unit's configuration) and the first-boot wiring self-check: the
 # supervisor grants only with a passing record of both for this board,
@@ -28,7 +32,14 @@ Restart=on-failure
 # loop still ends in the unit's start limit, at the floor.
 RestartSec=100ms
 RestartPreventExitStatus=78
-WatchdogSec=1s
+# Only restarts a hung supervisor: a stall itself is caught by the kernel,
+# whose 30 ms lease floors the amps when it is not renewed. systemd's clock
+# keeps running while userspace is frozen for a sleep (the device suspend
+# and resume take 1.5-2.6 s here, and pm_test adds 5 s), and a 1 s
+# watchdog killed the supervisor at every thaw of a sleep entered without
+# speakerguardd-sleep.service (a direct write to /sys/power/state); its
+# owner then died while the amps resumed.
+WatchdogSec=10s
 RuntimeDirectory=speakerguardd
 RuntimeDirectoryMode=0755
 # Kept over every stop and start, not only an automatic restart: the plugin
