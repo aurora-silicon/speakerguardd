@@ -514,6 +514,42 @@ fn detector_paths(p: &Params, fs: f64) -> [DetectorPath; BANDS] {
     v
 }
 
+/// Analytic (mode-4) detector of algorithms 0-2 at quality 0 and 1.
+///
+/// Black-box law (SW-COMP2, installed unit, synthetic controls): the band
+/// level has the Butterworth-half magnitude of the steady law above, but
+/// the timing of the full Linkwitz-Riley band the audio takes.  Both hold
+/// when the level is the geometric mean of two analytic envelopes: the
+/// band's own Linkwitz-Riley filter `|B|^2 e^{-j2 arg D}` and the
+/// Linkwitz-Riley allpass of the same crossovers `e^{-j2 arg D}`, whose
+/// product has magnitude `|B|^2` and whose square root is `|B|`.  The tree
+/// follows the audio split of the quality: quality 0 uses the band tree of
+/// `paths`, quality 1 the split chain of `legacy_stages` (no passing
+/// allpass in either; it carries no level information).
+fn analytic_detector_paths(p: &Params, fs: f64) -> ([Path; BANDS], [Path; BANDS]) {
+    let mut band = [Path::EMPTY; BANDS];
+    let mut reference = [Path::EMPTY; BANDS];
+    let n = p.crossover_order.map(effective_order);
+    let f = p.crossover_hz;
+    // (crossover, high side) per band, in processing order.
+    let tree: [&[(usize, bool)]; BANDS] =
+        [&[(1, false), (0, false)], &[(1, false), (0, true)], &[(1, true), (2, false)], &[(1, true), (2, true)]];
+    let chain: [&[(usize, bool)]; BANDS] = [
+        &[(0, false)],
+        &[(0, true), (1, false)],
+        &[(0, true), (1, true), (2, false)],
+        &[(0, true), (1, true), (2, true)],
+    ];
+    let legacy = p.render_quality == 1 && p.algorithm < 3;
+    for b in 0..BANDS {
+        for &(x, high) in if legacy { chain[b] } else { tree[b] } {
+            push_lr(&mut band[b], high, n[x], f[x], fs);
+            push_lr_allpass(&mut reference[b], n[x], f[x], fs);
+        }
+    }
+    (band, reference)
+}
+
 #[inline]
 fn db_amp(db: f64) -> f64 {
     libm::pow(10.0, db / 20.0)
@@ -961,6 +997,11 @@ pub struct Run {
     legacy_split_allpass_state_b: [[[[f64; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
     legacy_merge_allpass_state: [[[[f64; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
     detector_state: [[[[f32; 2]; MAX_DETECTOR_FILTERS]; BANDS]; MAX_CHANNELS],
+    analytic_band_path: [Path; BANDS],
+    analytic_reference_path: [Path; BANDS],
+    analytic_band_state: [[[[f32; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS],
+    analytic_reference_state: [[[[f32; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS],
+    reference_quadrature: [[QuadratureEnvelope; BANDS]; MAX_CHANNELS],
     overshoot_state: [[[[[f32; 2]; MAX_DETECTOR_FILTERS]; BANDS]; BANDS]; MAX_CHANNELS],
 }
 
@@ -1001,6 +1042,7 @@ impl Run {
                 0.0
             }
         });
+        let (analytic_band_path, analytic_reference_path) = analytic_detector_paths(q, fs);
         let mut run = Run {
             path: paths(q, fs),
             legacy_stage: legacy_stages(q, fs),
@@ -1042,6 +1084,11 @@ impl Run {
             legacy_split_allpass_state_b: [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
             legacy_merge_allpass_state: [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
             detector_state: [[[[0.0; 2]; MAX_DETECTOR_FILTERS]; BANDS]; MAX_CHANNELS],
+            analytic_band_path,
+            analytic_reference_path,
+            analytic_band_state: [[[[0.0; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS],
+            analytic_reference_state: [[[[0.0; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS],
+            reference_quadrature: [[QuadratureEnvelope::default(); BANDS]; MAX_CHANNELS],
             overshoot_state: [[[[[0.0; 2]; MAX_DETECTOR_FILTERS]; BANDS]; BANDS]; MAX_CHANNELS],
         };
         run.set_automation_input(q.automation_input);
@@ -1083,6 +1130,9 @@ impl Run {
         self.legacy_split_allpass_state_b = [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS];
         self.legacy_merge_allpass_state = [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS];
         self.detector_state = [[[[0.0; 2]; MAX_DETECTOR_FILTERS]; BANDS]; MAX_CHANNELS];
+        self.analytic_band_state = [[[[0.0; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS];
+        self.analytic_reference_state = [[[[0.0; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS];
+        self.reference_quadrature = [[QuadratureEnvelope::default(); BANDS]; MAX_CHANNELS];
         self.overshoot_state = [[[[[0.0; 2]; MAX_DETECTOR_FILTERS]; BANDS]; BANDS]; MAX_CHANNELS];
     }
 
@@ -1222,7 +1272,17 @@ impl Run {
                 v = o;
             }
             let scale = self.band_in[b] * self.detector_bandwidth[b];
-            let magnitude = if self.hop_peak { self.quadrature[c][b].push(v) } else { v.abs() };
+            let magnitude = if self.hop_peak {
+                let band = Self::run_detector_path(&self.analytic_band_path[b], &mut self.analytic_band_state[c][b], x);
+                let reference = Self::run_detector_path(
+                    &self.analytic_reference_path[b],
+                    &mut self.analytic_reference_state[c][b],
+                    x,
+                );
+                libm::sqrt(self.quadrature[c][b].push(band) * self.reference_quadrature[c][b].push(reference))
+            } else {
+                v.abs()
+            };
             base[b] = (magnitude * scale) as f32 as f64;
             if self.overshoot_compensation {
                 let mut sum = 0.0;
@@ -1246,6 +1306,18 @@ impl Run {
             }
         }
         (base, overshoot)
+    }
+
+    /// Single-precision-state biquad cascade (the detector's storage width).
+    #[inline]
+    fn run_detector_path(path: &Path, state: &mut [[f32; 2]; MAX_FILTERS], mut v: f64) -> f64 {
+        for (s, z) in path.section[..path.count].iter().zip(state.iter_mut()) {
+            let o = s.b0 * v + z[0] as f64;
+            z[0] = (s.b1 * v - s.a1 * o + z[1] as f64) as f32;
+            z[1] = (s.b2 * v - s.a2 * o) as f32;
+            v = o;
+        }
+        v
     }
 
     fn gain(&mut self, b: usize) -> f64 {
