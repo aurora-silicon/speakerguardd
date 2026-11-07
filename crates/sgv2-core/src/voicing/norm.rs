@@ -206,11 +206,11 @@ impl Params {
         }
         p.fast_deadband_db = w[NODES + 4 + 5 * MAX_SECTIONS];
         if w.len() == Self::WORDS {
-            p.algorithm1 = match w[Self::LEGACY_WORDS] {
-                v if v == 0.0 => false,
-                v if v == 1.0 => true,
-                _ => return None,
-            };
+            let selector = w[Self::LEGACY_WORDS];
+            if selector != 0.0 && selector != 1.0 {
+                return None;
+            }
+            p.algorithm1 = selector == 1.0;
             p.detector_ema_s = w[Self::LEGACY_WORDS + 1];
         }
         p.valid().then_some(p)
