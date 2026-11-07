@@ -21,10 +21,12 @@ Two sides, one program:
 
 The gate compares each segment on each unit lane: the RMS of the second half, plus 10 ms windows on
 dynamic segments where either side is above -80 dBFS. Any value outside 0.05 dB in either direction
-fails. One integer latency per AID is estimated by cross-correlation on the pink segment and applied;
-a non-zero lag fails the AID as a timing gap. An AID passes only if its chain compiles with no stubs,
-the lane counts match, the lag is 0 and no measurement is over the limit. Each AU box's cumulative
-output is compared the same way, and the first box over the limit is named.
+fails. Latency is structural, not fitted: v2's Norm (ldnm) meters one whole 512-frame call before it
+applies it, so a chain with a live Norm runs exactly 512 frames behind the unit fed in 512-frame quanta
+and is compared at that offset (a stubbed Norm is a zero-latency wire); the raw cross-correlation lag is
+reported beside it. An AID passes only if its chain compiles with no stubs, the lane counts match and no
+measurement is over the limit. Each AU box's cumulative output is compared the same way, and the first
+box over the limit is named.
 
 `summarize.py GATE_OUT SWEEP_JSON...` joins the gate results with the all-AID compile sweep
 (`aidsweep.sh`: refusals, stubs, bounds, TODO(SPEC)) into one table per AID.

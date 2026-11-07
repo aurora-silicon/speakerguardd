@@ -10,8 +10,8 @@ and compare per segment and per unit lane:
 - steady segments: RMS of the second half;
 - dynamic segments: also every 10 ms window above -80 dBFS on either side;
 - a measurement fails above 0.05 dB in either direction.
-One integer latency (cross-correlation on the pink segment) is applied per
-AID and reported; a lag other than 0 or v2's one-call Norm latency (512) fails.
+Latency is structural: v2's Norm runs one 512-frame call behind the unit
+(a stubbed Norm: 0); the raw cross-correlation lag is reported.
 An AID PASSES only with a compiled chain, matching lane count and 0 over.
 Per-box attribution compares each AU box's cumulative output (both sides
 fed by their own upstream chain): the first box over the gate is named.
