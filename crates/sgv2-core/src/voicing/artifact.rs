@@ -260,21 +260,17 @@ impl Wire for Kind {
                 }
             }
             Self::Cfreak(p) => {
-                let legacy = p.input_gain_db == 0.0 && p.output_gain_db == 0.0;
-                let highpass = p.highpass_order != 0;
-                (if highpass {
-                    22u32
-                } else if legacy {
-                    7u32
-                } else {
-                    18u32
+                let words = p.words();
+                (match words {
+                    super::cfreak::Params::LEGACY_WORDS => 7u32,
+                    super::cfreak::Params::PLAIN_WORDS => 18u32,
+                    super::cfreak::Params::HIGHPASS_WORDS => 22u32,
+                    _ => 27u32,
                 })
                 .put(o);
-                let mut w = vec![0.0; super::cfreak::Params::HIGHPASS_WORDS];
+                let mut w = vec![0.0; super::cfreak::Params::WORDS];
                 p.to_words(&mut w);
-                if !highpass {
-                    w.truncate(if legacy { super::cfreak::Params::LEGACY_WORDS } else { super::cfreak::Params::WORDS });
-                }
+                w.truncate(words);
                 for v in w {
                     v.put(o);
                 }
@@ -377,11 +373,12 @@ impl Wire for Kind {
                 }
                 Self::Xtc(Box::new(params))
             }
-            tag @ (7 | 18 | 22) => {
+            tag @ (7 | 18 | 22 | 27) => {
                 let words = match tag {
                     7 => super::cfreak::Params::LEGACY_WORDS,
-                    18 => super::cfreak::Params::WORDS,
-                    _ => super::cfreak::Params::HIGHPASS_WORDS,
+                    18 => super::cfreak::Params::PLAIN_WORDS,
+                    22 => super::cfreak::Params::HIGHPASS_WORDS,
+                    _ => super::cfreak::Params::WORDS,
                 };
                 let w: Vec<f64> = (0..words).map(|_| f64::get(r)).collect::<Result<_>>()?;
                 Self::Cfreak(Box::new(super::cfreak::Params::from_words(&w).ok_or(BlobError::Unstable)?))

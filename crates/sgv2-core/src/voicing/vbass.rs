@@ -29,6 +29,11 @@
 //! - `SUB` band-limits the mid branches (a low pass designed at a quarter
 //!   of the rate); each odd-order band-edge all-pass adds one frame of
 //!   output latency and a further branch delay.
+//! - With the level control on and an odd lower band edge, that edge's
+//!   frame of branch delay sits in front of the device: the device reads the
+//!   previous selected-rate frame, driven by that frame's input level, while
+//!   the output follower's restore uses the current input level (one frame
+//!   ahead of the device). The branch's total delay is unchanged.
 //! - The side signal only ever takes the high-pass path: stereo width is
 //!   untouched, and the bass is folded to the mid.
 //!
@@ -615,6 +620,14 @@ pub struct Run {
     lp_sign: f64,
     harm_sign: f64,
     lc: LevelControl,
+    /// Selected-rate frames the device runs behind the input follower
+    /// (1 with the level control on and an odd lower band edge, else 0).
+    lead: usize,
+    /// The previous frame's device input and its input level, and the blend
+    /// branch held back by `lead` frames to stay aligned with the harmonics.
+    prev_lo: f64,
+    prev_p_in: f64,
+    prev_low: f64,
     compressor: HarmonicCompressor,
     stride: usize,
     /// Selected-rate delay: one sub-rate frame per odd band-edge section.
@@ -649,6 +662,7 @@ impl Run {
         band_hp.extend(&butterworth(nu, p.fu_hz, fs8, Kind::Low));
         let band_lp = butterworth(nu, p.fu_hz, fs8, Kind::Low);
         let latency = nu % 2 + nl % 2;
+        let lead = if p.level_control { nl % 2 } else { 0 };
         Run {
             p: p.clone(),
             fs,
@@ -666,11 +680,15 @@ impl Run {
             lp_sign: if nh % 2 == 1 { -1.0 } else { 1.0 },
             harm_sign: if nh % 2 == nl % 2 { 1.0 } else { -1.0 },
             lc: LevelControl::new(fs8),
+            lead,
+            prev_lo: 0.0,
+            prev_p_in: 0.0,
+            prev_low: 0.0,
             compressor: HarmonicCompressor::new(fs8, p.compressor_threshold_db, p.compressor_ratio),
             stride,
             sline: [0.0; SUB_LINE],
             spos: 0,
-            sdelay: latency,
+            sdelay: latency - lead,
             phase: 0,
             recon: elliptic(law::RECON_ORDER, law::RECON_RIPPLE_DB, law::RECON_STOP_DB, law::RECON_EDGE_HZ, fs),
             recon_st: CascadeState::default(),
@@ -689,6 +707,9 @@ impl Run {
         self.band_hp_st = CascadeState::default();
         self.band_lp_st = CascadeState::default();
         self.lc = LevelControl::new(self.fs / self.stride as f64);
+        self.prev_lo = 0.0;
+        self.prev_p_in = 0.0;
+        self.prev_low = 0.0;
         self.compressor = HarmonicCompressor::new(
             self.fs / self.stride as f64,
             self.p.compressor_threshold_db,
@@ -737,10 +758,23 @@ impl Run {
     /// One selected-rate frame of both mid branches.
     #[inline]
     fn sub_frame(&mut self, lo: f64) -> f64 {
-        let low = self.lp_sign * self.p.blend_gain * self.ap.run(&mut self.ap_st, lo);
+        let mut low = self.lp_sign * self.p.blend_gain * self.ap.run(&mut self.ap_st, lo);
+        if self.lead > 0 {
+            core::mem::swap(&mut low, &mut self.prev_low);
+        }
         let harm = if self.p.level_control {
             let p_in = self.lc.input.run(lo);
-            let z = (lo / p_in.max(law::LC_FLOOR)).clamp(-law::LC_CLIP, law::LC_CLIP);
+            // The device runs `lead` frames behind the input follower, driven
+            // by its own frame's level; the restore below uses the current one.
+            let (x, p_drive) = if self.lead > 0 {
+                let d = (self.prev_lo, self.prev_p_in);
+                self.prev_lo = lo;
+                self.prev_p_in = p_in;
+                d
+            } else {
+                (lo, p_in)
+            };
+            let z = (x / p_drive.max(law::LC_FLOOR)).clamp(-law::LC_CLIP, law::LC_CLIP);
             let dev = self.device(z);
             let hp = self.band_hp.run(&mut self.band_hp_st, dev);
             let p_out = self.lc.output.run(hp);
@@ -954,6 +988,41 @@ mod tests {
         let (lo, hi) = (level(0.1), level(0.316_227_766));
         let step = 20.0 * libm::log10(hi / lo);
         assert!((step - 10.0).abs() < 0.2, "{step}");
+    }
+
+    #[test]
+    fn odd_lower_edge_moves_one_frame_in_front_of_the_device() {
+        // params(): lower order 6 (three sections, odd), upper order 4 (even).
+        let lc = Run::new(&params(true), 48_000.0, 2);
+        assert_eq!((lc.latency(), lc.lead, lc.sdelay), (1, 1, 0));
+        let plain = Run::new(&params(false), 48_000.0, 2);
+        assert_eq!((plain.latency(), plain.lead, plain.sdelay), (1, 0, 1));
+        let mut p = params(true);
+        p.lower_order = 4;
+        let even = Run::new(&p, 48_000.0, 2);
+        assert_eq!((even.latency(), even.lead, even.sdelay), (0, 0, 0));
+    }
+
+    #[test]
+    fn level_control_lead_keeps_the_steady_response() {
+        // Moving the frame of delay in front of the device changes only the
+        // transient: the steady harmonic and blend output is the same as with
+        // the delay after the branch (both are the same LTI delay in steady state).
+        let steady = |lead: bool| {
+            let mut r = Run::new(&params(true), 48_000.0, 2);
+            if !lead {
+                r.lead = 0;
+                r.sdelay = r.latency;
+            }
+            let n = 2 * 48_000;
+            let mut l = tone(60.0, 0.5, n);
+            let mut rr = l.clone();
+            r.process(&mut [&mut l, &mut rr], n);
+            (amp(&l[n / 2..], 60.0), amp(&l[n / 2..], 180.0))
+        };
+        let (a, b) = (steady(true), steady(false));
+        assert!((a.0 - b.0).abs() < 1e-6 * b.0.max(1e-3), "{a:?} {b:?}");
+        assert!((a.1 - b.1).abs() < 1e-3 * b.1.max(1e-3), "{a:?} {b:?}");
     }
 
     #[test]
