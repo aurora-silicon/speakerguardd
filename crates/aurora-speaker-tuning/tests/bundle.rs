@@ -232,7 +232,8 @@ fn other_unit_kinds_expose_raw_state() {
         let t = t.unwrap();
         assert!(t.protection.spp3.is_none());
         assert_eq!(t.protection.state.elements(4).len(), 4);
-        assert!(d.items.iter().any(|x| x.code == "params-raw-ids"));
+        // atsp is named from the specification map; lsm2 is still raw.
+        assert_eq!(d.items.iter().any(|x| x.code == "params-raw-ids"), unit == "lsm2");
     }
 }
 

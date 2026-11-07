@@ -287,9 +287,11 @@ impl Dynamics {
 }
 /// Largest response the plugin accepts on its check grid (rounding only).
 pub const UNITY_TOLERANCE: f64 = 1.0 + 1e-9;
-/// What the filters see at most: far above any program, it keeps the
-/// state finite on garbage input.
-const INPUT_BOUND: f32 = 16.0;
+/// What the filters see at most: +120 dBFS. The installed units do not
+/// limit their input (an AID13 ToneMeister/MeisterStueck fed +30 dBFS
+/// noise runs linear), so the bound sits where no program, however hot,
+/// reaches it; it only keeps the state finite on garbage input.
+pub const INPUT_BOUND: f32 = 1.0e6;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Section {
@@ -1976,5 +1978,22 @@ mod tests {
         let mut y = [0.0f32; 5];
         s.process(0, &x, &mut y);
         assert!(y.iter().all(|v| v.is_finite()));
+    }
+
+    /// A hot program is filtered, not limited: the installed units run
+    /// linear at +30 dBFS, so only garbage meets the input bound.
+    #[test]
+    fn hot_input_is_not_limited() {
+        let fs = 48_000.0;
+        let mut s = PreStage::new(params(&[hp2(60.0, fs)], 1.0));
+        let mut q = PreStage::new(params(&[hp2(60.0, fs)], 1.0));
+        let x: Vec<f32> = (0..4800).map(|i| (i as f32 * 0.13).sin()).collect();
+        let hot: Vec<f32> = x.iter().map(|v| v * 32.0).collect();
+        let (mut y, mut z) = (vec![0.0f32; x.len()], vec![0.0f32; x.len()]);
+        s.process(0, &x, &mut y);
+        q.process(0, &hot, &mut z);
+        for (a, b) in y.iter().zip(z.iter()) {
+            assert!((a * 32.0 - b).abs() <= 1e-4 * b.abs().max(1.0), "{a} {b}");
+        }
     }
 }
