@@ -381,6 +381,37 @@ fn lsm2_fields_follow_the_id_rule() {
 }
 
 #[test]
+fn lsm2_masker_lattice_comes_from_the_bundle() {
+    // Provisioned: the validated table reaches the engine unchanged.
+    let ends = synthetic_lattice_ends();
+    let mut files = lsm2_files(|_| {});
+    files.insert(LATTICE.into(), lattice_bytes(&ends));
+    let t = tuning(&files, "c-lsm2-lattice");
+    let c = compile(&t, &mut Diagnostics::default()).unwrap();
+    let p = sgv2_core::lsm2::Params::from_blob(&c.blob).unwrap();
+    assert_eq!(p.mask_lattice_len, 100);
+    assert_eq!(p.mask_lattice.iter().map(|&v| v as u64).collect::<Vec<_>>(), ends);
+    // Absent (a bundle collected before the installer read it): no
+    // lattice, so no masking credit, and the load warned.
+    let dir = scratch("c-lsm2-no-lattice");
+    let files = lsm2_files(|_| {});
+    write_dir(&dir, &files, &manifest_json(&files, "25G83"));
+    let mut d = Diagnostics::default();
+    let t = Tuning::load(&Bundle::open(&dir).unwrap(), &Options::default(), &mut d).unwrap();
+    assert!(d.items.iter().any(|x| x.code == "mask-lattice-absent"));
+    let c = compile(&t, &mut Diagnostics::default()).unwrap();
+    let p = sgv2_core::lsm2::Params::from_blob(&c.blob).unwrap();
+    assert_eq!((p.mask_lattice_len, p.mask_lattice), (0, [0; 100]));
+    // A listed table that fails the rule is refused before any blob.
+    let mut bad = ends.clone();
+    bad[99] = 320;
+    let mut files = lsm2_files(|_| {});
+    files.insert(LATTICE.into(), lattice_bytes(&bad));
+    let t = tuning_any(&files, "c-lsm2-bad-lattice");
+    assert!(compile(&t, &mut Diagnostics::default()).is_err());
+}
+
+#[test]
 fn lsm2_channels_keep_their_own_full_scale_within_one_operating_point() {
     // As on the J700 (7.30/7.33 V, 0.036 dB): the header takes channel 0's,
     // the payload keeps each channel's own.

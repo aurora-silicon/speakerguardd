@@ -1,7 +1,8 @@
 //! `lsm2`: signal-only loudspeaker model and five-axis constraint
 //! controller (MacBook Neo, MacBook Air M4/M5), from the behaviour
 //! specification (SPEC-LSM2 v1.1 with the section 15 binary closure of
-//! 2026-11-05) and the 25G83 differential-rig laws. This is the model-only
+//! 2026-11-05, as corrected by SPEC-LSM2-RESIDUALS) and the 25G83
+//! differential-rig laws. This is the model-only
 //! configuration the Neo ships (static model, system ID bypassed, no
 //! closed-loop temperature); a tuning that asks for the DSP estimator or
 //! closed-loop temperature is refused.
@@ -25,8 +26,9 @@
 //! x ─┬─ analysis bank (319 centred taps, delay FB) ─ a[k] ─┬─ delay OD ─ Σ g[k]·a[k] ─ y
 //!    │                                                     ├─ x/v models per band ─ frame peaks ─ candidates
 //!    │                                                     └─ Σ a[k] (before any gain) ─ u·i ─ power, temperature axes
-//!    └─ pressure FIR ─ 8–12 kHz 4th-order edges ─ frame mean square ─ dB ─ one limit per pair
-//! y ─ u = Vfs·y ─ current model ─ u·i ─ four averages, two series thermal nodes (the monitor)
+//!    ├─ velocity model ─ Hann window ─ DFT ─ pressure weighting ─ median bucket power ─ level ─ limit
+//!    └─ current model ─ u·i ─ input thermal model ─ temperature candidate
+//! y ─ u = Vfs·y ─ current model ─ u·i ─ four averages, output thermal model (the monitor)
 //! ```
 //!
 //! - **Models** (rig laws 1 and 4, spec 15.1 and 15.2). Displacement and
@@ -36,8 +38,10 @@
 //!   `UseGenericModelParameters*` flag is set takes the tuning's embedded
 //!   family row (the compiler resolves it). The current model is a Float32
 //!   biquad whose zeros are the exponentially mapped mechanical roots and
-//!   whose poles are the exponentially mapped electrical ones, with
-//!   `1/Rdc` at DC.
+//!   whose denominator is the minimum-phase quadratic matching the analog
+//!   section's magnitude at 0, Fs/6 and Fs/3, with `1/Rdc` on the numerator
+//!   (residuals section 1; the extra pole damping is an output of this
+//!   construction, not a fitted loss).
 //! - **Filterbank** (rig law 10): the raised-cosine crossfade bank on the
 //!   design grid of `M = 2 FB` points, each centre snapped to a bin, the
 //!   `M/2` tap dropped (319 taps), generated in f64 and rounded once to f32.
@@ -47,42 +51,48 @@
 //!   the bank-stage stream over the `W = 448` frames that end with the
 //!   frame, i.e. the output region of the frame (`N` frames) plus the `OD`
 //!   frames of look-ahead behind it, in 32-frame substeps.
-//! - **Candidates**, linear in [0, 1], a disabled axis giving 1:
-//!   - sample peak (rig law 6): `min(1, (AmplitudeLimit - pilot) / max|x|)`;
-//!   - displacement: `min(1, DisplacementLimit / max|x_d|)` on the
-//!     full-band model, applied to every band;
-//!   - velocity (spec 15.3, 15.4): the logged candidate is the full-band
-//!     `Vlim / max|v|`; the band gains water-fill the five band velocities'
-//!     frame peaks scaled by the applied slow gain, `sum min(s pk, L) =
-//!     Vlim` over the active bands, floored at `-MaxVelocityAttenuation`, so
-//!     the output velocity stays at the limit while a thermal gain falls;
-//!     the limit follows the masking curve of spec 6.2 driven by the
-//!     pressure-filtered 8–12 kHz program, one level for the pair;
-//!   - power (rig law 7): one gain for all systems, `min_j min(1, sqrt((B_j -
-//!     N idle) / sum (Phat_j - idle)))`, `Phat_j` each system's largest
+//! - **Candidates** (logged diagnostics, linear in [0, 1], a disabled axis
+//!   giving 1): sample peak `min(1, (AmplitudeLimit - pilot) / max|x|)`,
+//!   displacement and velocity on the full-band models. The applied fast
+//!   requests come from the band chain below.
+//!   - The velocity limit follows the four-anchor curve (residuals 4,
+//!     extrapolated past the last anchor) of the mask level: each channel's
+//!     modeled input velocity over the retained window, energy-normalised
+//!     Hann, real DFT, pressure-response weighting, the median bucket power
+//!     of the mask band, a spectral-shape penalty, the level tracker and the
+//!     three-state follower (residuals 3); the largest level of the pair.
+//!   - Power (rig law 7): one gain for all systems,
+//!     `min_j min(1, sqrt((B_j - N idle) / sum (Phat_j - idle)))`, `Phat_j` each system's largest
 //!     average over the window of the bank-stage program before any gain
-//!     (input-referred, rig law 4);
-//!   - temperature (spec 15.5): the axis's own series predictor driven by
-//!     the input-referred power times its own gain squared, the regulating
-//!     target `q^2 = clamp((Thard - Tamb - theta_mag) / (Rvc Pin + 1), 1e-4,
-//!     1)` once the prediction strictly exceeds `TemperatureSoftLimit`, and a
-//!     linear release in `gt^2`.
-//! - **Gains.** Fast (band, peak): below the applied gain the target is 0.99
-//!   x the request, ramped linearly over `AttackTime`; otherwise a
-//!   per-sample release toward it (99 % settling over `FastReleaseTime`,
-//!   `LowBandReleaseTime` for band 0). Slow (power, temperature, linked
-//!   across channels): the same 0.99 attack; otherwise one 99 %-settling
-//!   `SlowReleaseTime` step per frame (rig law 8). Before committing, the
-//!   slow gain is checked against the output-referred monitor: if the
-//!   frame would take the hottest coil above `TemperatureHardLimit +
-//!   max(TemperatureHeadroom, 0)`, it is cut to `0.99 sqrt((C - Tamb -
-//!   theta_mag) / (Rvc Pin))`, at most four passes (spec 15.5). Each band's
-//!   applied gain is the minimum of its fast gain, the peak gain and the
-//!   slow gain (spec 2: never a product).
+//!     (input-referred, rig law 4).
+//!   - Temperature (residuals 2): the input thermal model, unattenuated, on
+//!     the input's own current model; its peak over the selected span of the
+//!     temperature buffer, an exponential knee from the soft toward the hard
+//!     limit, and the room partitioned between the coil and body rises,
+//!     moving toward the DC split as the output body heats.
+//! - **Band gains** (residuals 5): the displacement, velocity and sample-peak
+//!   chain of signed worst-sample allocations, a post-retarget second chain
+//!   when a lane rises, and one decision-local follower per band (a
+//!   raised-cosine attack to 0.99 x the request then hold, or a recovery on
+//!   the 99 % response table realigned each decision).
+//! - **Slow gain** (power, temperature, linked across channels; residuals
+//!   2.4): the output-temperature ceiling solves the absolute ordinary
+//!   request on the fast-gained retained frame and look-ahead as
+//!   `B + g L + g^2 Q`. Runtime look-ahead writes move the retained
+//!   start inside the fixed initial latency allocation, and every
+//!   ceiling substep uses the native Float32 vector-sum tree. The retained
+//!   current response contributes to the linear term for one filterbank
+//!   stage; the zero-state quadratic response spans the complete window. The
+//!   idle follower releases toward that solved request, and a result below
+//!   its provisional endpoint makes a second follower call toward 0.99 x the
+//!   request. The audio applies the slow trajectory after summing the
+//!   fast-gained bands.
 //! - **Monitor** (rig laws 3, 4, 11): on the protected output, `u = Vfs y`;
-//!   the substep mean of `u i` drives the two series matched one-poles
-//!   (Float32), and `Pamp = idle + ratio max(mean(u i), 0) (Rdc + Rpar) /
-//!   Rdc` the four exponential averages the meters report.
+//!   the Float32 substep mean of `u i` drives the two thermal branches
+//!   (residuals 2.1: `theta += alpha (R_eff P - theta)`), and `Pamp = idle + ratio max(mean(u i), 0) (Rdc + Rpar) /
+//!   Rdc` the four exponential averages the meters report. Coil telemetry
+//!   adds the ambient captured at initialisation; control and magnet
+//!   telemetry use the live ambient parameter.
 //!
 //! Full scale: the output is held to digital full scale, a non-finite input
 //! sample is 0 to the audio and the models and the most restrictive to the
@@ -94,17 +104,30 @@
 //! temperature predictor's coil and magnet rises, the four power averages
 //! and the slow gain to the next stream, cooled for the gap.
 //!
-//! Known residuals against 25G83 (rig report; each errs on the protective
-//! side):
-//! - the current model's poles: the reference's are about 0.9 % more damped
-//!   than the electrical poles give (spec 15.2's Delta-sigma; its coefficient
-//!   builder is not specified), so near the resonance this unit models up to
-//!   0.9 % more power;
-//! - the temperature candidate: spec 15.5's target cuts at once on a steady
-//!   tone where the reference approaches it over seconds;
-//! - the mask level: the masker's band edges and dB reference are fitted on
-//!   the rig (`MASK_DB_OFFSET`), and the limit is held at `VelocityLimit2`
-//!   where the reference's active limit rises above it on loud music.
+//! Fast axes (residuals 5, Daybreak t-4731): one sequential chain of
+//! signed worst-sample allocations per decision on five band buffers:
+//! displacement (fresh band models over the retained window, with the
+//! protected-output model's state carry), velocity (fresh band models, from
+//! 1 ms; the ignore switches mask only the committed cut), then sample peak
+//! (the raw bank bands). One band follower per band takes the final request;
+//! the audio applies `slow * sum(band * signal)`.
+//!
+//! Velocity fixed term (t-4751, t-4763): the zero-input carry of a
+//! persistent Float32 full-band velocity model that advances on the
+//! protected output. Displacement uses the corresponding protected-output
+//! displacement carry (t-4800); the retained full-band displacement peak
+//! supplies its old/new two-level bound. Motion carries share one Float32
+//! biquad with the measured fused order.
+//!
+//! Known residuals against 25G83 (rig report):
+//! - 96 kHz: the steady velocity margin on the fb8-sr96 law cases is
+//!   shallower than the reference's (Daybreak t-4769);
+//! - 48 kHz mid-band law cases and two programs sit within 0.02 x of the
+//!   reference's velocity peak, some above it (Daybreak follow-up);
+//! - the masker lattice is an input extracted from the Mac's macOS; without
+//!   it there is no masking credit;
+//! - host slices: at q1, q7 and q160 this unit is slice-independent by
+//!   design.
 
 // The DSP loops index several parallel per-band and per-channel arrays at
 // once; an index reads better there than zipped iterators.
@@ -112,6 +135,13 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
+
+mod laws;
+pub use laws::{
+    arbitrate_producer_segment, current_coefficients, mask_lattice_resized, minimum_phase_triplet, release_lambda,
+    temperature_candidate, transform_len, velocity_band_gains, velocity_band_gains_limit_window,
+    velocity_band_gains_window, velocity_limit, BandGain, Fft, Masker, ThermalBranch,
+};
 
 use crate::blob::{BlobError, Pod};
 use crate::{
@@ -128,11 +158,32 @@ pub const SUBSTEP_FRAMES: usize = 32;
 /// Substeps per controller frame.
 pub const SUBSTEPS: usize = CONTROLLER_FRAMES / SUBSTEP_FRAMES;
 
-/// The controller frame at `rate`: 256 frames per 48 kHz, i.e. 5.333 ms.
+/// The native rate-family multiplier: one at 32/44.1/48 kHz, two at
+/// 88.2/96 kHz and four at 176.4/192 kHz. Geometry is quantised by this
+/// multiplier; it is not a continuously scaled time.
+fn rate_family(rate: u32) -> usize {
+    (libm::round(rate as f64 / 48_000.0) as usize).max(1)
+}
+
+/// The controller frame at `rate`: 256 frames in the 44.1/48 kHz family and
+/// 512 in the 88.2/96 kHz family. The native controller caps there at the
+/// 176.4/192 kHz family (four 128-frame substeps); 32 kHz uses 192 frames.
 pub fn controller_frames(rate: u32) -> usize {
-    let f = libm::round(CONTROLLER_FRAMES as f64 * rate as f64 / 48_000.0) as usize;
-    // whole substeps, at least one frame each
-    (f / SUBSTEPS).max(1) * SUBSTEPS
+    if rate == 32_000 {
+        192
+    } else {
+        (CONTROLLER_FRAMES * rate_family(rate)).min(2 * CONTROLLER_FRAMES)
+    }
+}
+
+/// A millisecond geometry field converted to frames and rounded to the
+/// native rate family's eight-frame vector cadence.
+fn vector_frames(ms: f32, rate: u32) -> usize {
+    let f = ms as f64 * 1e-3 * rate as f64;
+    let vector = SUBSTEPS * rate_family(rate);
+    // A zero look-ahead is native (t-4892 rate captures; t-4870 runtime
+    // writes): no one-vector minimum.
+    libm::round(f / vector as f64) as usize * vector
 }
 /// Filterbank bands.
 pub const BANDS: usize = 5;
@@ -140,18 +191,22 @@ pub const BANDS: usize = 5;
 pub const PRESSURE_TAPS: usize = 1024;
 const EPS: f64 = f32::MIN_POSITIVE as f64;
 /// The 0.99 downward target of every gain law (rig laws 5, 8; spec 15.4).
-const CUT: f64 = 0.99;
-/// The mask level's dB offset: `E = 10 log10(Ems) + MASK_DB_OFFSET`.
-/// Spec 15.3 names 20 uPa (+94 dB); on the 25G83 rig that reference puts a
-/// 1 kHz tone with no 8-12 kHz content far above every knot (the reference
-/// stays unmasked there, `lsm2-law-fb-vel-*`), and the active velocity limit
-/// of the music traces is matched best (median 0.07 m/s within the curve,
-/// `lsm2-tokyo_30s`) by this offset with fourth-order edges. Interim, from
-/// the rig, until the binary closure gives the exact level (Daybreak
-/// follow-up): a lower level only ever lowers the velocity limit.
-const MASK_DB_OFFSET: f64 = 30.6;
-/// Ceiling correction passes per frame (spec 15.5).
-const CEILING_PASSES: usize = 4;
+const CUT: f32 = 0.99;
+
+/// Native realizes the ordinary sample-peak request window one bank sample
+/// before the retained audio/model window; the span stays unchanged.
+fn realize_peak_window(dst: &mut [f32], previous: f32, bank: &[f32]) {
+    debug_assert_eq!(dst.len(), bank.len());
+    if let Some((first, rest)) = dst.split_first_mut() {
+        *first = previous;
+        let n = rest.len();
+        rest.copy_from_slice(&bank[..n]);
+    }
+}
+
+/// The declared maximum of the `VelocityLimit*` parameters, m/s: the
+/// velocity curve's last anchor (residuals section 4), not a runtime cap.
+const VELOCITY_PARAM_MAX: f32 = 2.0;
 
 /// Bits of [`ChannelParams::model_generic`]: the manager's
 /// `UseGenericModelParametersRdc` and `...Resonator1` flags. A generic field
@@ -353,6 +408,13 @@ pub struct Params {
     /// limits, a key the platform does not send being 50 W (spec 6.1, 8).
     pub runtime_budget_present: u32,
     pub runtime_budget_w: [f32; 4],
+    /// The masker's bucket lattice for the 640-point transform (residuals
+    /// 3): 100 exclusive end bins, extracted from the Mac's own macOS at
+    /// provisioning. `mask_lattice_len` is 100 when present, else 0; without
+    /// it the masker gives no masking credit (the velocity limit stays at
+    /// `VelocityLimit0`).
+    pub mask_lattice_len: u32,
+    pub mask_lattice: [u32; laws::MASK_BUCKETS],
     pub ch: [ChannelParams; MAX_CHANNELS],
 }
 
@@ -363,7 +425,7 @@ unsafe impl Pod for ChannelParams {}
 
 const CH_WORDS: usize = 74 + PRESSURE_TAPS;
 const _: () = assert!(core::mem::size_of::<ChannelParams>() == CH_WORDS * 4);
-const _: () = assert!(core::mem::size_of::<Params>() == (39 + MAX_CHANNELS * CH_WORDS) * 4);
+const _: () = assert!(core::mem::size_of::<Params>() == (40 + laws::MASK_BUCKETS + MAX_CHANNELS * CH_WORDS) * 4);
 
 impl Default for Params {
     fn default() -> Self {
@@ -395,6 +457,8 @@ impl Default for Params {
             other_power_features: 0,
             runtime_budget_present: 0,
             runtime_budget_w: [0.0; 4],
+            mask_lattice_len: 0,
+            mask_lattice: [0; laws::MASK_BUCKETS],
             ch: [ChannelParams::default(); MAX_CHANNELS],
         }
     }
@@ -518,6 +582,17 @@ pub mod ids {
 }
 
 impl Params {
+    /// A runtime look-ahead write: finite and non-negative. Its window
+    /// position is checked by the unit against the fixed geometry.
+    fn validate_runtime_lookahead(&self) -> Result<(), InitError> {
+        let v = self.speaker_response_lookahead_ms;
+        if v.is_finite() && v >= 0.0 {
+            Ok(())
+        } else {
+            Err(InitError::Invalid("latency"))
+        }
+    }
+
     /// Structural checks only: the model trusts the tuning's values.
     pub fn validate(&self) -> Result<(), InitError> {
         let n = self.channels as usize;
@@ -542,8 +617,14 @@ impl Params {
         if self.filterbank_frames() < 2 || self.latency_frames() > 16384 {
             return Err(InitError::Invalid("latency"));
         }
-        if self.output_offset_frames() >= ctl || self.output_offset_frames() % (ctl / SUBSTEPS) != 0 {
+        if self.output_offset_frames() >= ctl {
             return Err(InitError::Invalid("look-ahead region against the controller cadence"));
+        }
+        // review of #31, finding 8: the controller decides once per frame
+        // over the samples still in the delay line, so a latency shorter
+        // than one controller frame lets a transient leave undecided
+        if self.latency_frames() < ctl {
+            return Err(InitError::Invalid("latency below the controller cadence"));
         }
         for j in 0..4 {
             if !(pos(self.power_time_scale_s[j])
@@ -640,12 +721,18 @@ impl Params {
 
     /// One filterbank stage in frames.
     pub fn filterbank_frames(&self) -> usize {
-        libm::round(self.filterbank_latency_ms as f64 * 1e-3 * self.sample_rate as f64) as usize
+        let f = self.filterbank_latency_ms as f64 * 1e-3 * self.sample_rate as f64;
+        let vector = 2 * SUBSTEPS * rate_family(self.sample_rate);
+        if self.sample_rate == 32_000 {
+            libm::floor(f / vector as f64) as usize * vector
+        } else {
+            libm::round(f / vector as f64) as usize * vector
+        }
     }
 
     /// The speaker-response look-ahead in frames.
     pub fn lookahead_frames(&self) -> usize {
-        libm::round(self.speaker_response_lookahead_ms as f64 * 1e-3 * self.sample_rate as f64) as usize
+        vector_frames(self.speaker_response_lookahead_ms, self.sample_rate)
     }
 
     /// Frames between the bank stage and the output: one more filterbank
@@ -861,6 +948,86 @@ pub fn settle_step(delta_s: f64, time_s: f64) -> f64 {
     1.0 - libm::exp(libm::log(0.01) * delta_s / time_s)
 }
 
+/// Accelerate's Float32 `vDSP_sve` reduction tree. The native controller
+/// forms every thermal substep mean with this reduction, rather than a
+/// left-to-right scalar sum. `next` supplies one or more parallel vectors so
+/// the ceiling's linear and quadratic products keep the same sample order.
+fn vdsp_sve<const K: usize>(n: usize, mut next: impl FnMut() -> [f32; K]) -> [f32; K] {
+    let chunks = n / 4;
+    // These are exactly the contiguous-input paths used by the supported
+    // 44.1--96 kHz substeps (at most 64 frames). Larger unusual rates keep
+    // the same first sixteen vector accumulators, then consume more vectors
+    // into the folded result.
+    let grouped = if chunks >= 16 {
+        16
+    } else if chunks >= 8 {
+        8
+    } else if chunks >= 4 {
+        4
+    } else if chunks >= 2 {
+        2
+    } else {
+        chunks
+    };
+    let mut a = [[[0.0f32; 4]; 4]; K];
+    for v in 0..grouped {
+        for l in 0..4 {
+            let x = next();
+            for k in 0..K {
+                a[k][v & 3][l] += x[k];
+            }
+        }
+    }
+    let mut sum = [0.0f32; K];
+    let mut lanes = [[0.0f32; 4]; K];
+    for k in 0..K {
+        lanes[k] = match grouped {
+            0 => [0.0; 4],
+            1 => a[k][0],
+            2 | 3 => core::array::from_fn(|l| a[k][0][l] + a[k][1][l]),
+            _ => core::array::from_fn(|l| (a[k][0][l] + a[k][2][l]) + (a[k][1][l] + a[k][3][l])),
+        };
+    }
+    for _ in grouped..chunks {
+        for l in 0..4 {
+            let x = next();
+            for k in 0..K {
+                lanes[k][l] += x[k];
+            }
+        }
+    }
+    let tail = n & 3;
+    if tail >= 2 {
+        let x0 = next();
+        let x1 = next();
+        for k in 0..K {
+            lanes[k][0] += x0[k];
+            lanes[k][1] += x1[k];
+        }
+    }
+    if tail & 1 != 0 {
+        let x = next();
+        for k in 0..K {
+            lanes[k][0] += x[k];
+        }
+    }
+    for k in 0..K {
+        sum[k] = (lanes[k][0] + lanes[k][1]) + (lanes[k][2] + lanes[k][3]);
+    }
+    sum
+}
+
+/// The thermal substep power total of a contiguous block (the monitor and
+/// input temperature models): the same `vDSP_sve` tree as the ceiling.
+fn vdsp_sve_slice(x: &[f32]) -> f32 {
+    let mut i = 0;
+    vdsp_sve(x.len(), || {
+        let v = x[i];
+        i += 1;
+        [v]
+    })[0]
+}
+
 fn db_to_lin(db: f64) -> f64 {
     libm::pow(10.0, -db / 20.0)
 }
@@ -953,9 +1120,117 @@ impl Biquad {
     }
 }
 
-/// The current model of spec 15.2: a Float32 biquad, every output rounded
-/// to f32, `i[n] = f32(b0 u[n] + b1 u[n-1] + b2 u[n-2] - a1 i[n-1] - a2
-/// i[n-2])`.
+/// A Float32 direct-form-I biquad: the persistent motion models whose
+/// zero-input carry the fast allocations take (t-4751).
+#[derive(Clone, Copy, Default)]
+struct Biquad32 {
+    b: [f32; 3],
+    a: [f32; 2],
+    x: [f32; 2],
+    y: [f32; 2],
+}
+
+impl Biquad32 {
+    fn from(q: &Biquad) -> Self {
+        Biquad32 { b: q.b.map(|v| v as f32), a: q.a.map(|v| v as f32), x: [0.0; 2], y: [0.0; 2] }
+    }
+    #[inline]
+    fn step(&mut self, x: f32) -> f32 {
+        // the measured fused contraction order (t-4763)
+        let mut acc = self.b[2] * self.x[1];
+        acc = libm::fmaf(-self.a[1], self.y[1], acc);
+        acc = libm::fmaf(self.b[1], self.x[0], acc);
+        acc = libm::fmaf(-self.a[0], self.y[0], acc);
+        let y = libm::fmaf(self.b[0], x, acc);
+        self.x = [x, self.x[0]];
+        self.y = [y, self.y[0]];
+        y
+    }
+    /// The zero-input response from the current state into `out[..n]`,
+    /// zeros after; the state is unchanged.
+    fn carry(&self, out: &mut [f32], n: usize) {
+        let mut m = *self;
+        for (i, o) in out.iter_mut().enumerate() {
+            *o = if i < n { m.step(0.0) } else { 0.0 };
+        }
+    }
+    fn clear(&mut self) {
+        self.x = [0.0; 2];
+        self.y = [0.0; 2];
+    }
+}
+
+/// The protected-model peak stream's one-second moving mean. The decoded
+/// object is a sample-rate-sized Float32 ring with a rolling sum and a
+/// separately retained partial-traversal sum/count. At the ring boundary
+/// the rolling sum is rebuilt from that partial sum instead of accumulating
+/// an indefinitely long add/sub chain.
+struct ProtectedPeak {
+    ring: Vec<f32>,
+    pos: usize,
+    sum: f32,
+    partial_sum: f32,
+    partial_len: usize,
+    samples: usize,
+    scale: f32,
+}
+
+impl ProtectedPeak {
+    fn new(rate: usize) -> Self {
+        Self {
+            ring: vec![0.0; rate],
+            pos: 0,
+            sum: 0.0,
+            partial_sum: 0.0,
+            partial_len: 0,
+            samples: 0,
+            scale: 1.0 / rate as f32,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.ring.iter_mut().for_each(|v| *v = 0.0);
+        self.pos = 0;
+        self.sum = 0.0;
+        self.partial_sum = 0.0;
+        self.partial_len = 0;
+        self.samples = 0;
+    }
+
+    /// Advance one controller frame. This reconstruction holds the frame's
+    /// protected-model peak, so the chunk sum is the Float32 product below.
+    fn update(&mut self, peak: f32, mut count: usize) -> f32 {
+        let window = self.ring.len();
+        self.samples = self.samples.saturating_add(count);
+        while count != 0 {
+            let take = count.min(window - self.partial_len);
+            let new_sum = peak * take as f32;
+            if self.partial_len + take == window {
+                self.sum = self.partial_sum + new_sum;
+                self.partial_sum = 0.0;
+                self.partial_len = 0;
+            } else {
+                let old_sum = self.ring[self.pos..self.pos + take].iter().copied().sum::<f32>();
+                self.sum += new_sum - old_sum;
+                self.partial_sum += new_sum;
+                self.partial_len += take;
+            }
+            self.ring[self.pos..self.pos + take].fill(peak);
+            self.pos += take;
+            if self.pos == window {
+                self.pos = 0;
+            }
+            count -= take;
+        }
+        self.sum * self.scale
+    }
+
+    fn ready(&self) -> bool {
+        self.samples >= self.ring.len()
+    }
+}
+
+/// The input power-path current model: binary32 state and output.
 #[derive(Clone, Copy, Default)]
 struct Current {
     b: [f32; 3],
@@ -964,36 +1239,10 @@ struct Current {
     i: [f32; 2],
 }
 
-/// `1 + c1 z^-1 + c2 z^-2` whose roots are `exp(p T)` for the roots `p` of
-/// `m s^2 + r s + k` (all positive): the exponentially mapped pair.
-fn matched_pair(m: f64, r: f64, k: f64, t: f64) -> [f64; 2] {
-    let sigma = r / (2.0 * m);
-    let w2 = k / m - sigma * sigma;
-    if w2 >= 0.0 {
-        let e = libm::exp(-sigma * t);
-        [-2.0 * e * libm::cos(libm::sqrt(w2) * t), e * e]
-    } else {
-        // two real roots
-        let d = libm::sqrt(-w2);
-        let (z1, z2) = (libm::exp((-sigma + d) * t), libm::exp((-sigma - d) * t));
-        [-(z1 + z2), z1 * z2]
-    }
-}
-
 impl Current {
-    /// `I/U = (Mms s^2 + Rms s + Kms) / (R Mms s^2 + (R Rms + Bl^2) s + R Kms)`
-    /// with matched zeros and poles and `1/R` at DC.
     fn new(rdc: f64, bl: f64, m: f64, rms: f64, k: f64, rate: f64) -> Self {
-        let t = 1.0 / rate;
-        let n = matched_pair(m, rms, k, t);
-        let d = matched_pair(m, rms + bl * bl / rdc, k, t);
-        let g = (1.0 + d[0] + d[1]) / ((1.0 + n[0] + n[1]) * rdc);
-        Current {
-            b: [g as f32, (g * n[0]) as f32, (g * n[1]) as f32],
-            a: [d[0] as f32, d[1] as f32],
-            u: [0.0; 2],
-            i: [0.0; 2],
-        }
+        let (b, a) = current_coefficients(rdc, bl, m, rms, k, rate);
+        Current { b, a, u: [0.0; 2], i: [0.0; 2] }
     }
     #[inline]
     fn step(&mut self, u: f32) -> f32 {
@@ -1015,33 +1264,147 @@ impl Current {
     }
 }
 
-/// A fourth-order Butterworth edge (two bilinear, pre-warped biquads), high
-/// or low pass: the masker's 8 kHz and 12 kHz edges.
-#[derive(Clone, Copy, Default)]
-struct Edge4 {
-    s: [Biquad; 2],
+/// Largest native power/thermal substep (64 frames at 88.2/96/176.4/192 kHz).
+const MAX_SUBSTEP_FRAMES: usize = 2 * SUBSTEP_FRAMES;
+
+/// The output-monitor current model in the optimized vDSP bulk form.
+///
+/// The multichannel API documents a direct-form-II filter but its optimized
+/// single-channel path does not iterate that recurrence one sample at a time.
+/// It precalculates the first eight input and state responses in binary64,
+/// rounds the table to binary32, evaluates two groups of four outputs, and
+/// updates the two transposed states once per eight samples.  This portable
+/// expression preserves that arithmetic order without depending on
+/// Accelerate or an architecture-specific vector ISA.
+#[derive(Clone, Copy)]
+struct MonitorCurrent {
+    b: [f32; 3],
+    a: [f32; 2],
+    table: [f32; 56],
+    z: [f32; 2],
 }
 
-impl Edge4 {
-    fn new(f: f64, rate: f64, high: bool) -> Self {
-        // RBJ cookbook sections with the fourth-order Butterworth Qs
-        let w = 2.0 * core::f64::consts::PI * f / rate;
-        let (sn, cs) = (libm::sin(w), libm::cos(w));
-        let sec = |q: f64| {
-            let alpha = sn / (2.0 * q);
-            let a0 = 1.0 + alpha;
-            let (b0, b1) = if high { ((1.0 + cs) / 2.0, -(1.0 + cs)) } else { ((1.0 - cs) / 2.0, 1.0 - cs) };
-            Biquad { b: [b0 / a0, b1 / a0, b0 / a0], a: [-2.0 * cs / a0, (1.0 - alpha) / a0], x: [0.0; 2], y: [0.0; 2] }
-        };
-        Edge4 { s: [sec(0.541_196_100_146_197), sec(1.306_562_964_876_376_6)] }
+impl Default for MonitorCurrent {
+    fn default() -> Self {
+        Self { b: [0.0; 3], a: [0.0; 2], table: [0.0; 56], z: [0.0; 2] }
     }
-    #[inline]
-    fn step(&mut self, x: f64) -> f64 {
-        let y = self.s[0].step(x);
-        self.s[1].step(y)
+}
+
+impl MonitorCurrent {
+    fn new(rdc: f64, bl: f64, m: f64, rms: f64, k: f64, rate: f64) -> Self {
+        let (b, a) = current_coefficients(rdc, bl, m, rms, k, rate);
+        MonitorCurrent { b, a, table: Self::bulk_table(b, a), z: [0.0; 2] }
     }
+
+    fn bulk_table(b: [f32; 3], a: [f32; 2]) -> [f32; 56] {
+        let (b0, b1, b2) = (f64::from(b[0]), f64::from(b[1]), f64::from(b[2]));
+        let (a1, a2) = (f64::from(a[0]), f64::from(a[1]));
+        let mut h = [0.0f64; 8];
+        let mut p = [0.0f64; 8];
+        let mut q = [0.0f64; 8];
+        h[0] = b0;
+        h[1] = b1 - a1 * h[0];
+        h[2] = (b2 - a1 * h[1]) - a2 * h[0];
+        p[0] = 1.0;
+        p[1] = -a1;
+        q[1] = 1.0;
+        for i in 2..8 {
+            if i >= 3 {
+                h[i] = -a1 * h[i - 1] - a2 * h[i - 2];
+            }
+            p[i] = -a1 * p[i - 1] - a2 * p[i - 2];
+            q[i] = -a1 * q[i - 1] - a2 * q[i - 2];
+        }
+
+        let mut t = [0.0f32; 56];
+        for row in 0..4 {
+            for column in 0..4 {
+                if row >= column {
+                    t[4 * column + row] = h[row - column] as f32;
+                }
+            }
+        }
+        for i in 0..4 {
+            t[16 + i] = p[i] as f32;
+            t[20 + i] = q[i] as f32;
+        }
+        t[24..32].copy_from_slice(&[b[2], 0.0, b[1], b[2], a[1], 0.0, a[0], a[1]]);
+        for i in 0..4 {
+            t[32 + i] = h[4 + i] as f32;
+            t[36 + i] = h[3 + i] as f32;
+            t[40 + i] = h[2 + i] as f32;
+            t[44 + i] = h[1 + i] as f32;
+            t[48 + i] = p[4 + i] as f32;
+            t[52 + i] = q[4 + i] as f32;
+        }
+        t
+    }
+
+    fn process(&mut self, input: &[f32], output: &mut [f32]) {
+        debug_assert_eq!(input.len(), output.len());
+        let bulk = input.len() / 8 * 8;
+        for base in (0..bulk).step_by(8) {
+            let x = &input[base..base + 8];
+            let y = &mut output[base..base + 8];
+            for lane in 0..4 {
+                let mut low = self.table[lane] * x[0];
+                low = libm::fmaf(self.table[4 + lane], x[1], low);
+                low = libm::fmaf(self.table[8 + lane], x[2], low);
+                low = libm::fmaf(self.table[12 + lane], x[3], low);
+                low = libm::fmaf(self.table[16 + lane], self.z[0], low);
+                y[lane] = libm::fmaf(self.table[20 + lane], self.z[1], low);
+
+                let mut upper = self.table[32 + lane] * x[0];
+                upper = libm::fmaf(self.table[36 + lane], x[1], upper);
+                upper = libm::fmaf(self.table[40 + lane], x[2], upper);
+                upper = libm::fmaf(self.table[44 + lane], x[3], upper);
+                upper = libm::fmaf(self.table[48 + lane], self.z[0], upper);
+                let mut lower = self.table[lane] * x[4];
+                lower = libm::fmaf(self.table[52 + lane], self.z[1], lower);
+                lower = libm::fmaf(self.table[4 + lane], x[5], lower);
+                lower = libm::fmaf(self.table[8 + lane], x[6], lower);
+                lower = libm::fmaf(self.table[12 + lane], x[7], lower);
+                y[4 + lane] = upper + lower;
+            }
+            let mut next = [0.0f32; 2];
+            for lane in 0..2 {
+                let mut state = self.table[24 + lane] * x[6];
+                state = libm::fmaf(self.table[26 + lane], x[7], state);
+                state = libm::fmaf(-self.table[28 + lane], y[6], state);
+                next[lane] = libm::fmaf(-self.table[30 + lane], y[7], state);
+            }
+            self.z = next;
+        }
+        for i in bulk..input.len() {
+            let x = input[i];
+            let y = libm::fmaf(self.b[0], x, self.z[0]);
+            let z1 = libm::fmaf(-self.a[0], y, libm::fmaf(self.b[1], x, self.z[1]));
+            let z2 = libm::fmaf(self.b[2], x, -self.a[1] * y);
+            output[i] = y;
+            self.z = [z1, z2];
+        }
+    }
+
+    /// Replace voltages with their binary32 `u*i` products and return the
+    /// corresponding unrounded binary64 sum used by the amplifier monitor.
+    fn power_products_in_place(&mut self, voltage: &mut [f32]) -> f64 {
+        debug_assert!(voltage.len() <= MAX_SUBSTEP_FRAMES);
+        let mut current = [0.0f32; MAX_SUBSTEP_FRAMES];
+        self.process(voltage, &mut current[..voltage.len()]);
+        let mut sum = 0.0;
+        for i in 0..voltage.len() {
+            let product = f64::from(voltage[i]) * f64::from(current[i]);
+            sum += product;
+            voltage[i] = product as f32;
+        }
+        sum
+    }
+
     fn clear(&mut self) {
-        self.s.iter_mut().for_each(Biquad::clear);
+        self.z = [0.0; 2];
+    }
+    fn is_finite(&self) -> bool {
+        self.z[0].is_finite() && self.z[1].is_finite()
     }
 }
 
@@ -1064,95 +1427,87 @@ pub fn fir_reversed(rev_taps: &[f32], window: &[f32]) -> f32 {
     crate::dsp::dot_f32(rev_taps, window)
 }
 
-/// A history kept twice over, so the last `len` samples are always one
-/// contiguous slice (newest last) for the FIR dot products.
-struct History {
-    buf: Vec<f32>,
-    len: usize,
-    pos: usize,
-}
-
-impl History {
-    fn new(len: usize) -> Self {
-        History { buf: vec![0.0; 2 * len], len, pos: 0 }
-    }
-    #[inline]
-    fn push(&mut self, x: f32) {
-        self.buf[self.pos] = x;
-        self.buf[self.pos + self.len] = x;
-        self.pos += 1;
-        if self.pos == self.len {
-            self.pos = 0;
-        }
-    }
-    #[inline]
-    fn window(&self) -> &[f32] {
-        &self.buf[self.pos..self.pos + self.len]
-    }
-    fn clear(&mut self) {
-        self.buf.iter_mut().for_each(|v| *v = 0.0);
-        self.pos = 0;
-    }
-}
-
-/// One gain follower of the fast or slow law: a linear ramp toward 0.99 x
-/// a lower request, else a follower toward the request.
+/// The applied slow gain (residuals 2.4): a downward decision targets 0.99
+/// x the request along the first half of a periodic raised cosine of `len`
+/// samples from the gain already reached, then holds; restartable. An idle
+/// follower realigns its exponential recovery toward the solved request on
+/// every decision.
 #[derive(Clone, Copy)]
-struct Follower {
+struct SlowGain {
     g: f32,
-    step: f32,
-    left: u32,
+    start: f32,
     target: f32,
+    release: f32,
+    n: u32,
+    len: u32,
+    attack: bool,
 }
 
-impl Follower {
-    const UNITY: Follower = Follower { g: 1.0, step: 0.0, left: 0, target: 1.0 };
-    /// A new request at a frame boundary: below the gain, ramp to 0.99 x
-    /// the request over `attack` samples.
-    #[inline]
-    fn request(&mut self, req: f32, attack: u32) {
-        if req < self.g {
-            let to = (CUT * req as f64) as f32;
-            self.left = attack.max(1);
-            self.step = (to - self.g) / self.left as f32;
-            self.target = req;
-        } else {
-            self.target = req;
-        }
+impl SlowGain {
+    fn unity(len: u32) -> Self {
+        SlowGain { g: 1.0, start: 1.0, target: 1.0, release: 0.0, n: 0, len, attack: false }
     }
-    /// One sample: the ramp, else the per-sample release `r` toward the
-    /// request (fast gains).
+    /// A held gain, used at reset and hand-off.
+    fn set(&mut self, g: f32) {
+        self.g = g;
+        self.start = g;
+        self.target = g;
+        self.release = 0.0;
+        self.n = 0;
+        self.attack = false;
+    }
+    fn released_toward(mut self, request: f32) -> Self {
+        if !self.attack || self.n >= self.len {
+            self.start = self.g;
+            self.target = request.clamp(self.g, 1.0);
+            self.release = 0.0;
+            self.n = 0;
+            self.attack = false;
+        }
+        self
+    }
     #[inline]
-    fn sample(&mut self, r: f32) -> f32 {
-        if self.left > 0 {
-            self.g += self.step;
-            self.left -= 1;
-        } else if self.g < self.target {
-            self.g += r * (self.target - self.g);
-            if self.target - self.g <= f32::EPSILON * self.target {
+    fn sample(&mut self, release_lambda: f64) -> f32 {
+        if self.attack {
+            if self.n < self.len {
+                self.n += 1;
+                // The arm64 implementation builds its raised-cosine table as
+                // Float32 from a binary64 sincos: angle is (pi / len) * n and
+                // the stored ordinate is Float32(1 + cos(angle)).  A fresh
+                // segment normalizes the start ordinate by Float32(1 / 2),
+                // then vDSP applies the segment with a fused multiply-add.
+                let angle = (core::f64::consts::PI / self.len as f64) * self.n as f64;
+                let ordinate = (1.0 + libm::cos(angle)) as f32;
+                let scale = (self.start - self.target) * 0.5;
+                self.g = libm::fmaf(scale, ordinate, self.target);
+            } else {
                 self.g = self.target;
             }
-        }
-        self.g
-    }
-    /// One sample of a slow gain: the ramp only (its release is a step at
-    /// the frame boundary).
-    #[inline]
-    fn sample_ramp(&mut self) -> f32 {
-        if self.left > 0 {
-            self.g += self.step;
-            self.left -= 1;
+        } else if self.start != self.target {
+            self.n += 1;
+            // Native builds the release curve recursively in binary32, then
+            // applies it with a second FMA.  Re-evaluating the closed-form
+            // exponential at each sample is not bit-equivalent.
+            let alpha = (release_lambda as f32).min(1.0);
+            self.release = libm::fmaf(1.0 - alpha, self.release, alpha);
+            self.g = libm::fmaf(self.target - self.start, self.release, self.start);
         }
         self.g
     }
     fn finite(&self) -> bool {
-        self.g.is_finite() && self.step.is_finite() && self.target.is_finite()
+        self.g.is_finite() && self.start.is_finite() && self.target.is_finite() && self.release.is_finite()
     }
 }
 
 /// Substeps in the decision window: the frame's eight plus the look-ahead
 /// region's (six at 48 kHz). Bounded by one controller frame of look-ahead.
 const RING: usize = 2 * SUBSTEPS;
+/// The input temperature model's point ring (at least the retained history
+/// plus one frame's points).
+const TRING: usize = 4 * SUBSTEPS;
+/// The ceiling's longest horizon in controller frames (an attack of up to
+/// about 80 ms at 48 kHz).
+const CEIL_FRAMES: usize = 16;
 
 struct Chan {
     src: usize,
@@ -1163,35 +1518,73 @@ struct Chan {
     bank: [Vec<f32>; BANDS - 1],
     /// Bank-stage bands: the OD frames before the frame, then the frame.
     ab: [Vec<f32>; BANDS],
+    /// The ordinary sample-peak allocator's one-sample-earlier realization
+    /// of `ab`, with the same W-sample span (Daybreak t-4876).
+    peak_ab: [Vec<f32>; BANDS],
+    peak_previous: [f32; BANDS],
     /// Bank-stage full band (the delayed input), same layout.
     xc: Vec<f32>,
     // Motion models on the bank stage.
     disp: Biquad,
     vel: Biquad,
     vel_band: [Biquad; BANDS - 1],
+    /// The velocity model in its zero state (residuals 5: five fresh models
+    /// per decision over the retained window).
+    vel_proto: Biquad32,
+    /// The displacement model in its zero state and five band displacement
+    /// buffers. The fixed term comes from `dcar_m`.
+    disp_proto: Biquad,
+    /// Persistent full-band displacement state driven by protected output.
+    dcar_m: Biquad32,
+    rd: Vec<f32>,
+    db: [Vec<f32>; BANDS],
+    /// Retained full-band displacement peaks on the two sides of the
+    /// bank/output handoff.
+    disp_bound_old: f32,
+    disp_bound_new: f32,
+    disp_bound_ready: bool,
+    /// The persistent full-band displacement and velocity models at the
+    /// window start (Float32), and their zero-input carries over the first
+    /// filterbank latency of the window (t-4751).
+    vcar_m: Biquad32,
+    vcar: Vec<f32>,
+    /// Streaming one-second mean of the protected full-band model's
+    /// controller-frame peak.
+    protected_peak: ProtectedPeak,
+    protected_peak_now: f32,
+    protected_peak_advanced: bool,
+    input_centroid_previous: f32,
+    protected_trial_previous: f32,
     /// Per-substep peaks over the window (ring of RING slots).
     pk_x: [f32; RING],
     pk_d: [f32; RING],
     pk_v: [f32; RING],
     pk_vb: [[f32; RING]; BANDS],
-    // Masking path, on the program at the input.
-    pressure: Vec<f32>,
-    p_hist: History,
-    mask_hp: Edge4,
-    mask_lp: Edge4,
-    mask_acc: f64,
-    mask_db: f64,
-    mask_init: bool,
-    vel_lim: [f64; 3],
-    mask_knots: [f64; 4],
-    mask_a: f64,
-    mask_af: f64,
-    mask_r: f64,
-    mask_range: f64,
+    // Masking path (residuals 3): the velocity model on the input, its
+    // retained window (oldest first) and the spectral detector.
+    masker: Option<Masker>,
+    mvel: Biquad,
+    vwin: Vec<f32>,
+    vel_lim: [f32; 3],
+    mask_knots: [f32; 4],
     vel_limit_now: f64,
+    vel_bound_ready: bool,
+    vel_bound_release: bool,
+    /// Native's one retained producer window. Host fragments shift it by
+    /// their admitted length and append one protected peak per fragment.
+    vel_bound_window: Vec<f32>,
+    /// A velocity episode chooses its solve topology on its first ordinary
+    /// cut. An onset before the streaming peak has a complete window stays
+    /// ordinary; an onset with retained history adds the retained solve.
+    vel_episode: bool,
+    vel_episode_retained: bool,
     // Fast gains.
-    band: [Follower; BANDS],
-    peak: Follower,
+    band: [BandGain; BANDS],
+    /// The modeled band velocities over the decision window: the output
+    /// region's look-ahead behind it, then the frame (as `ab`).
+    vb: [Vec<f32>; BANDS],
+    /// Bands the velocity allocation may cut (the others are ignored).
+    vel_active: (usize, usize),
     /// The fast gains over the frame's output region, per sample.
     eg: [Vec<f32>; BANDS],
     // Power path (fast-gained bank stage): the committed state at the
@@ -1200,34 +1593,46 @@ struct Chan {
     pbar_in: [f64; 4],
     /// Per-substep `u i` of the fast-gained bank stage, output region.
     p_sub: [f64; SUBSTEPS],
-    // Temperature axis: own series predictor and its gain.
+    // Temperature axis (residuals 2): the input model, unattenuated, on
+    // the input's own current model; its temperature points by global
+    // substep (ring), the newest at `tn - 1`.
+    tin_cur: MonitorCurrent,
+    /// One thermal substep of `u*i` products (monitor sum).
+    power_work: Vec<f32>,
     tp_vc: f32,
     tp_mg: f32,
+    tring: [f32; TRING],
+    tn: usize,
     gt: f64,
     // Slow gain.
-    slow: Follower,
+    slow: SlowGain,
     // Monitor on the output.
-    cur_out: Current,
+    cur_out: MonitorCurrent,
     th_vc: f32,
     th_mg: f32,
+    /// The preceding output frame before slow gain, and the output-model
+    /// state at each of its substep starts. Runtime attack changes move the
+    /// native ceiling window's start within this retained frame.
+    ceil_fast_prev: Vec<f32>,
+    ceil_cur_prev: [MonitorCurrent; SUBSTEPS],
+    ceil_vc_prev: [f32; SUBSTEPS],
+    ceil_mg_prev: [f32; SUBSTEPS],
     pbar: [f64; 4],
     pbar1_frame: f64,
     pbar1s_frame: f64,
     // Per-channel constants.
     load_scale: f64,
-    rth_vc: f64,
-    rth_mag: f64,
-    b_vc: f32,
-    a_vc: f32,
-    b_mg: f32,
-    a_mg: f32,
+    br_vc: ThermalBranch,
+    br_mg: ThermalBranch,
     tau_vc: f64,
     tau_mag: f64,
     ambient: f64,
+    /// Ambient captured when the AU was initialised. Native coil telemetry
+    /// keeps this reference across the post-initialisation ambient write.
+    telemetry_ambient: f64,
     amp_limit: f64,
     disp_limit: f64,
     vel_floor: f64,
-    ignore: [bool; BANDS],
     vel_off: bool,
     t_soft: f64,
     t_hard: f64,
@@ -1237,9 +1642,154 @@ struct Chan {
     cand: [f64; 5],
 }
 
+impl Chan {
+    /// Output sample `i` of the frame at slow gain `sg`: the fast-gained
+    /// band sum followed by the scalar slow trajectory.
+    #[inline]
+    fn out_sample(&self, i: usize, sg: f32) -> f32 {
+        // past the frame (the look-ahead) the fast gains hold their last value
+        let e = i.min(self.eg[0].len() - 1);
+        let g0 = self.eg[0][e] * sg;
+        let mut same = true;
+        let mut g = [0.0f32; BANDS];
+        for k in 0..BANDS {
+            g[k] = self.eg[k][e] * sg;
+            same &= g[k] == g0;
+        }
+        if same {
+            g0 * self.xc[i]
+        } else {
+            let mut v = 0.0f32;
+            for k in 0..BANDS {
+                v += g[k] * self.ab[k][i];
+            }
+            v
+        }
+    }
+
+    /// The output-temperature ceiling (residuals 2.4): on the frame's
+    /// fast-gained output at slow unity, the output model at substep `k` under
+    /// the absolute slow gain `g` is `B_k + g L_k + g^2 Q_k` (the retained
+    /// state, the current model's retained response crossed with the new
+    /// signal, the new signal alone); multiplicative quadratic-root
+    /// corrections start at the absolute ordinary request and continue at
+    /// the hottest substep until every substep is within
+    /// `TemperatureHardLimit + max(TemperatureHeadroom, 0)`.
+    fn ceiling_scale(&self, g0: f32, ctl: usize, sub: usize, fb: usize, shift: isize) -> f32 {
+        let extra = shift.max(0) as usize;
+        let skip = (-shift).max(0) as usize;
+        let full = extra + self.xc.len();
+        let discard = skip / sub;
+        let subs = (full - skip) / sub;
+        let mut base = [0.0f32; CEIL_FRAMES * SUBSTEPS];
+        let mut lin = [0.0f32; CEIL_FRAMES * SUBSTEPS];
+        let mut quad = [0.0f32; CEIL_FRAMES * SUBSTEPS];
+        let hist_sub = (ctl - extra) / sub;
+        let mut zi = if extra == 0 { self.cur_out } else { self.ceil_cur_prev[hist_sub] };
+        let mut zs = self.cur_out;
+        zs.clear();
+        let (mut bv, mut bm) = if extra == 0 {
+            (self.th_vc, self.th_mg)
+        } else {
+            (self.ceil_vc_prev[hist_sub], self.ceil_mg_prev[hist_sub])
+        };
+        let (mut lv, mut lm, mut qv, mut qm) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+        let amb = self.ambient as f32;
+        let mut i = 0;
+        for raw_k in 0..full / sub {
+            let mut voltage = [0.0f32; MAX_SUBSTEP_FRAMES];
+            for j in 0..sub {
+                let y = if i + j < extra {
+                    self.ceil_fast_prev[ctl - extra + i + j]
+                } else {
+                    self.out_sample(i + j - extra, 1.0)
+                };
+                voltage[j] = self.vfs * y;
+            }
+            let mut retained = [0.0f32; MAX_SUBSTEP_FRAMES];
+            let keep = fb.saturating_sub(i).min(sub);
+            if keep != 0 {
+                zi.process(&[0.0; MAX_SUBSTEP_FRAMES][..keep], &mut retained[..keep]);
+            }
+            let mut zero = [0.0f32; MAX_SUBSTEP_FRAMES];
+            zs.process(&voltage[..sub], &mut zero[..sub]);
+            let mut j = 0;
+            let [sl, sq] = vdsp_sve(sub, || {
+                let u = voltage[j];
+                let products =
+                    [(f64::from(u) * f64::from(retained[j])) as f32, (f64::from(u) * f64::from(zero[j])) as f32];
+                j += 1;
+                products
+            });
+            i += sub;
+            let (pl, pq) = (sl / sub as f32, sq / sub as f32);
+            bv = self.br_vc.step(bv, 0.0);
+            bm = self.br_mg.step(bm, 0.0);
+            lv = self.br_vc.step(lv, pl);
+            lm = self.br_mg.step(lm, pl);
+            qv = self.br_vc.step(qv, pq);
+            qm = self.br_mg.step(qm, pq);
+            if raw_k >= discard {
+                let k = raw_k - discard;
+                base[k] = amb + (bv + bm);
+                lin[k] = lv + lm;
+                quad[k] = qv + qm;
+            }
+        }
+        let limit = (self.t_hard + self.t_headroom.max(0.0)) as f32;
+        Self::ceiling_solve(&base[..subs], &lin[..subs], &quad[..subs], limit, g0)
+    }
+
+    /// The multiplicative quadratic-root solve of residuals 2.4 on the
+    /// substep decomposition `base + g lin + g^2 quad`.
+    fn ceiling_solve(base: &[f32], lin: &[f32], quad: &[f32], limit: f32, g0: f32) -> f32 {
+        let subs = base.len();
+        let mut g = g0.min(1.0);
+        loop {
+            let (mut kmax, mut tmax) = (0usize, f32::NEG_INFINITY);
+            for k in 0..subs {
+                let t = (g * lin[k] + (g * g) * quad[k]) + base[k];
+                if t > tmax {
+                    tmax = t;
+                    kmax = k;
+                }
+            }
+            if tmax <= limit || tmax.is_nan() {
+                return g;
+            }
+            let room = limit - base[kmax];
+            if room <= 0.0 {
+                return 0.0;
+            }
+            let (a, b) = (quad[kmax], lin[kmax]);
+            let ratio = if a > 0.0 {
+                let disc = b * b + (4.0 * a) * room;
+                (libm::sqrtf(disc.max(0.0)) - b) / (a + a)
+            } else if b > 0.0 {
+                room / b
+            } else {
+                return 0.0;
+            };
+            let ratio = ratio.clamp(0.0, 1.0);
+            if ratio == 1.0 {
+                return g;
+            }
+            let next = g * ratio;
+            if next == 0.0 || next == g {
+                return next;
+            }
+            g = next;
+        }
+    }
+}
+
 pub struct Unit {
     params: Params,
     run: Option<Run>,
+    /// Geometry is fixed by AU initialisation. Runtime parameter writes may
+    /// move the ceiling window inside it, but do not rebuild the audio delay.
+    geometry_lookahead_ms: f32,
+    telemetry_ambient: [f32; MAX_CHANNELS],
 }
 
 struct Run {
@@ -1250,28 +1800,44 @@ struct Run {
     fb: usize,
     od: usize,
     latency: usize,
+    /// Runtime ceiling-window start relative to the initial output region.
+    /// Positive values retain this many frames from the preceding region;
+    /// negative values skip the corresponding leading frames.
+    ceiling_shift: isize,
     /// A model state went non-finite: the fail-safe is latched until reset.
     fault: bool,
     /// Frames into the current controller frame (input FIFO fill).
     pos: usize,
+    /// Host-fragment geometry admitted into the current buffered frame.
+    /// The largest native controller frame is 512 samples, hence q1 needs at
+    /// most 512 entries and longer calls collapse to controller-sized pieces.
+    fragment_lens: [usize; 2 * CONTROLLER_FRAMES],
+    fragment_count: usize,
     frame: u64,
     last_frame: u64,
     frames_done: u64,
     /// Ring slot of the next substep.
     ring: usize,
     ring_len: usize,
+    /// The temperature buffer (residuals 2.3): `tb_hist` retained points,
+    /// the peak over its oldest `tb_sel` points with the frame's.
+    tb_hist: usize,
+    tb_sel: usize,
     axis: [bool; 5],
+    /// ControlVelocity alone: the published velocity candidate is computed
+    /// whenever the axis is configured, also with EnableMitigation = 0
+    /// (rig: the therm/meter law cases log it with unity audio).
+    vel_logged: bool,
     link: bool,
     unlink_temp: bool,
     p_pole: [f64; 4],
     budget: [f64; 4],
     idle: f64,
     ratio: f64,
-    attack: u32,
-    r_fast: f32,
-    r_low: f32,
+    a_fast: f64,
+    a_low: f64,
+    slow_lambda: f64,
     slow_step: f64,
-    temp_release: f64,
     linked_power: f64,
     /// `10^(-MaxPowerAttenuation/20)`.
     power_floor: f64,
@@ -1285,13 +1851,17 @@ impl Unit {
     /// Allocation happens here, never in `process`. Unusable parameters
     /// give a unit that is the fail-safe; `init_error` says why.
     pub fn new(params: Params) -> Self {
-        let run = params.check_protects().and_then(|()| Run::new(&params)).ok();
-        Unit { params, run }
+        let geometry_lookahead_ms = params.speaker_response_lookahead_ms;
+        let telemetry_ambient = core::array::from_fn(|i| params.ch[i].ambient);
+        let run =
+            params.check_protects().and_then(|()| Run::new(&params, geometry_lookahead_ms, &telemetry_ambient)).ok();
+        Unit { params, run, geometry_lookahead_ms, telemetry_ambient }
     }
     /// Why [`Unit::new`] gives the fail-safe for `params`: unprotected
     /// (mitigation off, or no thermal axis) or unusable.
     pub fn init_error(params: &Params) -> Option<InitError> {
-        params.check_protects().and_then(|()| Run::new(params)).err()
+        let ambient = core::array::from_fn(|i| params.ch[i].ambient);
+        params.check_protects().and_then(|()| Run::new(params, params.speaker_response_lookahead_ms, &ambient)).err()
     }
     pub fn params(&self) -> &Params {
         &self.params
@@ -1310,8 +1880,14 @@ fn motion(rdc: f32, bl: f32, mms: f32, rms: f32, kms: f32, rate: f64, vel: bool)
 }
 
 impl Run {
-    fn new(p: &Params) -> Result<Run, InitError> {
-        p.validate()?;
+    fn new(p: &Params, geometry_lookahead_ms: f32, telemetry_ambient: &[f32; MAX_CHANNELS]) -> Result<Run, InitError> {
+        // The geometry (latency floor, look-ahead region) is the one built at
+        // initialisation; a runtime look-ahead write only moves the ceiling
+        // window inside it (checked below against the substep grid).
+        let mut geometry = *p;
+        geometry.speaker_response_lookahead_ms = geometry_lookahead_ms;
+        geometry.validate()?;
+        p.validate_runtime_lookahead()?;
         if p.model_only == 0 {
             return Err(InitError::Unsupported("system ID or closed-loop temperature"));
         }
@@ -1326,81 +1902,134 @@ impl Run {
         let ctl = controller_frames(p.sample_rate);
         let sub = ctl / SUBSTEPS;
         let fb = p.filterbank_frames();
-        let od = p.output_offset_frames();
+        let geometry_lookahead = vector_frames(geometry_lookahead_ms, p.sample_rate);
+        let od = fb + geometry_lookahead;
         let ring_len = (ctl + od) / sub;
         let sub_dt = sub as f64 / rate;
         let ctl_dt = ctl as f64 / rate;
+        // residuals 2.4: AttackTime clamped to 10 ms, the raised-cosine
+        // window at most one controller frame
+        let attack_len = (libm::round((p.attack_time_ms as f64 * 1e-3).min(0.010) * rate) as u32).clamp(1, ctl as u32);
+        // Native keeps the AU's initial latency allocation fixed. A runtime
+        // look-ahead write moves the retained ceiling window's start; the
+        // window still ends at the newest retained sample. (t-4870 also moved
+        // it on a runtime attack write; on the arm64 rig that took t3-att50's
+        // displacement over macOS, so the attack write keeps the window.)
+        let ceiling_shift = p.lookahead_frames() as isize - geometry_lookahead as isize;
+        if ceiling_shift > (ctl - sub) as isize || ceiling_shift.unsigned_abs() % sub != 0 {
+            return Err(InitError::Invalid("ceiling window against the controller cadence"));
+        }
         let mut ch = Vec::with_capacity(n);
-        for c in &p.ch[..n] {
+        for (ci, c) in p.ch[..n].iter().enumerate() {
             let h = filterbank(rate, &c.band_center_hz, c.bandwidth, fb);
             let bank: [Vec<f32>; BANDS - 1] = core::array::from_fn(|k| h[k].clone());
             let taps = c.pressure_taps as usize;
-            let pressure: Vec<f32> = (0..taps).map(|j| c.pressure_fir[taps - 1 - j]).collect();
+            let mwin = (ctl + p.latency_frames()).min(laws::MASK_MAX_POINTS);
+            // no extracted lattice (or no pressure response): no masking
+            // credit, the velocity limit stays at its lowest anchor
+            let masker = if taps > 0 && p.mask_lattice_len as usize == laws::MASK_BUCKETS {
+                Masker::new(
+                    &p.mask_lattice,
+                    mwin,
+                    rate,
+                    &c.pressure_fir[..taps],
+                    c.mask_band_hz,
+                    c.mask_attack_s,
+                    c.mask_release_s,
+                    c.mask_attack_fast_s,
+                    c.mask_attack_range_db,
+                    ctl,
+                )
+            } else {
+                None
+            };
             let vel = motion(c.vel_rdc, c.vel_bl, c.vel_mms_kg, c.vel_rms, c.vel_kms, rate, true);
+            let disp = motion(c.disp_rdc, c.disp_bl, c.disp_mms_kg, c.disp_rms, c.disp_kms, rate, false);
             let cur = Current::new(c.rdc as f64, c.bl as f64, c.mms_kg as f64, c.rms as f64, c.kms as f64, rate);
-            let bvc = pole(sub_dt, c.tau_vc as f64);
-            let bmg = pole(sub_dt, c.tau_mag as f64);
-            let ignore: [bool; BANDS] = core::array::from_fn(|k| {
-                (k == 0 && c.velocity_ignore_low_band != 0) || (k == BANDS - 1 && c.velocity_ignore_high_band != 0)
-            });
+            let monitor_cur =
+                MonitorCurrent::new(c.rdc as f64, c.bl as f64, c.mms_kg as f64, c.rms as f64, c.kms as f64, rate);
+            let br_vc = ThermalBranch::new(c.rth_vc as f64, c.tau_vc as f64, sub_dt);
+            let br_mg = ThermalBranch::new(c.rth_mag as f64, c.tau_mag as f64, sub_dt);
             ch.push(Chan {
                 src: c.source as usize,
                 vfs: c.volts_full_scale,
                 xb: vec![0.0; 2 * fb - 1 + ctl],
                 bank,
                 ab: core::array::from_fn(|_| vec![0.0; od + ctl]),
+                peak_ab: core::array::from_fn(|_| vec![0.0; od + ctl]),
+                peak_previous: [0.0; BANDS],
                 xc: vec![0.0; od + ctl],
-                disp: motion(c.disp_rdc, c.disp_bl, c.disp_mms_kg, c.disp_rms, c.disp_kms, rate, false),
+                disp,
                 vel,
                 vel_band: [vel; BANDS - 1],
+                vel_proto: Biquad32::from(&vel),
+                disp_proto: disp,
+                dcar_m: Biquad32::from(&disp),
+                db: core::array::from_fn(|_| vec![0.0; od + ctl]),
+                disp_bound_old: 0.0,
+                disp_bound_new: 0.0,
+                disp_bound_ready: false,
+                vcar_m: Biquad32::from(&vel),
+                protected_peak: ProtectedPeak::new(rate as usize),
+                protected_peak_now: 0.0,
+                protected_peak_advanced: false,
+                input_centroid_previous: 0.0,
+                protected_trial_previous: 0.0,
+                rd: vec![0.0; od + ctl],
+                vcar: vec![0.0; od + ctl],
                 pk_x: [0.0; RING],
                 pk_d: [0.0; RING],
                 pk_v: [0.0; RING],
                 pk_vb: [[0.0; RING]; BANDS],
-                pressure,
-                p_hist: History::new(taps.max(1)),
-                mask_hp: Edge4::new(c.mask_band_hz[0] as f64, rate, true),
-                mask_lp: Edge4::new(c.mask_band_hz[1] as f64, rate, false),
-                mask_acc: 0.0,
-                mask_db: 0.0,
-                mask_init: false,
-                vel_lim: c.velocity_limit.map(|v| v as f64),
-                mask_knots: c.mask_energy_db.map(|v| v as f64),
-                mask_a: 1.0 - pole(ctl_dt, c.mask_attack_s as f64),
-                mask_af: 1.0 - pole(ctl_dt, c.mask_attack_fast_s as f64),
-                mask_r: 1.0 - pole(ctl_dt, c.mask_release_s as f64),
-                mask_range: c.mask_attack_range_db as f64,
+                masker,
+                mvel: vel,
+                vwin: vec![0.0; mwin],
+                vel_lim: c.velocity_limit,
+                mask_knots: c.mask_energy_db,
                 vel_limit_now: c.velocity_limit[0] as f64,
-                band: [Follower::UNITY; BANDS],
-                peak: Follower::UNITY,
+                vel_bound_ready: false,
+                vel_bound_release: false,
+                vel_bound_window: vec![0.0; od + ctl],
+                vel_episode: false,
+                vel_episode_retained: false,
+                band: [BandGain::unity(attack_len); BANDS],
+                vb: core::array::from_fn(|_| vec![0.0; od + ctl]),
+                vel_active: (
+                    (c.velocity_ignore_low_band != 0) as usize,
+                    if c.velocity_ignore_high_band != 0 { BANDS - 1 } else { BANDS },
+                ),
                 eg: core::array::from_fn(|_| vec![1.0; ctl]),
                 cur_in: cur,
                 pbar_in: [0.0; 4],
                 p_sub: [0.0; SUBSTEPS],
+                tin_cur: monitor_cur,
+                power_work: vec![0.0; sub],
                 tp_vc: 0.0,
                 tp_mg: 0.0,
+                tring: [c.ambient; TRING],
+                tn: 0,
                 gt: 1.0,
-                slow: Follower::UNITY,
-                cur_out: cur,
+                slow: SlowGain::unity(attack_len),
+                cur_out: monitor_cur,
                 th_vc: 0.0,
                 th_mg: 0.0,
+                ceil_fast_prev: vec![0.0; ctl],
+                ceil_cur_prev: [monitor_cur; SUBSTEPS],
+                ceil_vc_prev: [0.0; SUBSTEPS],
+                ceil_mg_prev: [0.0; SUBSTEPS],
                 pbar: [0.0; 4],
                 pbar1_frame: 0.0,
                 pbar1s_frame: 0.0,
                 load_scale: (c.rdc as f64 + c.parasitic_resistance as f64) / c.rdc as f64,
-                rth_vc: c.rth_vc as f64,
-                rth_mag: c.rth_mag as f64,
-                b_vc: bvc as f32,
-                a_vc: (1.0 - bvc) as f32,
-                b_mg: bmg as f32,
-                a_mg: (1.0 - bmg) as f32,
+                br_vc,
+                br_mg,
                 tau_vc: c.tau_vc as f64,
                 tau_mag: c.tau_mag as f64,
                 ambient: c.ambient as f64,
+                telemetry_ambient: telemetry_ambient[ci] as f64,
                 amp_limit: c.amplitude_limit as f64 - c.pilot_reserve as f64,
                 disp_limit: c.displacement_limit as f64,
                 vel_floor: db_to_lin(c.max_velocity_attenuation_db as f64),
-                ignore,
                 // rig law 10: Bandwidth 2 gives no velocity attenuation
                 vel_off: c.bandwidth == 2,
                 t_soft: c.temperature_soft_limit as f64,
@@ -1416,21 +2045,25 @@ impl Run {
             let b = if p.runtime_budget_present != 0 { p.runtime_budget_w[j] } else { p.power_hard_limit_w[j] };
             budget[j] = b as f64 * p.power_budgets_scale as f64;
         }
-        let sample = |ms: f32| settle_step(1.0 / rate, ms as f64 * 1e-3) as f32;
         Ok(Run {
             n,
             ctl,
             sub,
             fb,
             od,
-            latency: p.unit_latency_frames(),
+            latency: 2 * fb + geometry_lookahead + ctl,
+            ceiling_shift,
             fault: false,
             pos: 0,
+            fragment_lens: [0; 2 * CONTROLLER_FRAMES],
+            fragment_count: 0,
             frame: 0,
             last_frame: 0,
             frames_done: 0,
             ring: 0,
             ring_len,
+            tb_hist: p.latency_frames() / sub,
+            tb_sel: p.latency_frames() / sub + SUBSTEPS - fb / sub,
             // EnableMitigation = 0: every axis off, the models and meters run
             axis: [
                 p.control_sample_peak,
@@ -1440,17 +2073,17 @@ impl Run {
                 p.control_temperature,
             ]
             .map(|f| f != 0 && p.enable_mitigation != 0),
+            vel_logged: p.control_velocity != 0,
             link: p.link_slow_gains != 0,
             unlink_temp: p.unlink_temperature_gains != 0,
             p_pole,
             budget,
             idle: p.low_rail_idle_power_w as f64,
             ratio: p.low_rail_power_ratio as f64,
-            attack: libm::round(p.attack_time_ms as f64 * 1e-3 * rate) as u32,
-            r_fast: sample(p.fast_release_time_ms),
-            r_low: sample(p.low_band_release_time_ms),
+            a_fast: release_lambda(rate, p.fast_release_time_ms as f64 * 1e-3),
+            a_low: release_lambda(rate, p.low_band_release_time_ms as f64 * 1e-3),
+            slow_lambda: release_lambda(rate, p.slow_release_time_ms as f64 * 1e-3),
             slow_step: settle_step(ctl_dt, p.slow_release_time_ms as f64 * 1e-3),
-            temp_release: 1.0 - pole(ctl_dt, p.slow_release_time_ms as f64 * 1e-3),
             linked_power: 1.0,
             power_floor: db_to_lin(p.max_power_attenuation_db as f64),
             xin: vec![vec![0.0; ctl]; n],
@@ -1464,34 +2097,61 @@ impl Run {
         for c in self.ch.iter_mut() {
             c.xb.iter_mut().for_each(|v| *v = 0.0);
             c.ab.iter_mut().for_each(|b| b.iter_mut().for_each(|v| *v = 0.0));
+            c.peak_ab.iter_mut().for_each(|b| b.iter_mut().for_each(|v| *v = 0.0));
+            c.peak_previous = [0.0; BANDS];
             c.xc.iter_mut().for_each(|v| *v = 0.0);
             c.disp.clear();
+            c.dcar_m.clear();
+            c.disp_bound_old = 0.0;
+            c.disp_bound_new = 0.0;
+            c.disp_bound_ready = false;
             c.vel.clear();
             c.vel_band.iter_mut().for_each(Biquad::clear);
             c.pk_x = [0.0; RING];
             c.pk_d = [0.0; RING];
             c.pk_v = [0.0; RING];
             c.pk_vb = [[0.0; RING]; BANDS];
-            c.p_hist.clear();
-            c.mask_hp.clear();
-            c.mask_lp.clear();
-            c.mask_acc = 0.0;
-            c.mask_db = 0.0;
-            c.mask_init = false;
-            c.vel_limit_now = c.vel_lim[0];
-            c.band = [Follower::UNITY; BANDS];
-            c.peak = Follower::UNITY;
+            if let Some(m) = c.masker.as_mut() {
+                m.clear();
+            }
+            c.mvel.clear();
+            c.vwin.iter_mut().for_each(|v| *v = 0.0);
+            c.vel_limit_now = c.vel_lim[0] as f64;
+            c.vel_bound_ready = false;
+            c.vel_bound_release = false;
+            c.vel_bound_window.iter_mut().for_each(|v| *v = 0.0);
+            c.vel_episode = false;
+            c.vel_episode_retained = false;
+            c.band = [BandGain::unity(c.slow.len); BANDS];
+            for b in c.vb.iter_mut().chain(c.db.iter_mut()) {
+                b.iter_mut().for_each(|v| *v = 0.0);
+            }
+            c.vcar_m.clear();
+            c.protected_peak.clear();
+            c.protected_peak_now = 0.0;
+            c.protected_peak_advanced = false;
+            c.input_centroid_previous = 0.0;
+            c.protected_trial_previous = 0.0;
+            c.vcar.iter_mut().chain(c.rd.iter_mut()).for_each(|v| *v = 0.0);
             c.eg.iter_mut().for_each(|e| e.iter_mut().for_each(|v| *v = 1.0));
             c.cur_in.clear();
             c.pbar_in = [0.0; 4];
             c.p_sub = [0.0; SUBSTEPS];
+            c.tin_cur.clear();
+            c.power_work.fill(0.0);
             c.tp_vc = 0.0;
             c.tp_mg = 0.0;
+            c.tring = [c.ambient as f32; TRING];
+            c.tn = 0;
             c.gt = 1.0;
-            c.slow = Follower::UNITY;
+            c.slow = SlowGain::unity(c.slow.len);
             c.cur_out.clear();
             c.th_vc = 0.0;
             c.th_mg = 0.0;
+            c.ceil_fast_prev.fill(0.0);
+            c.ceil_cur_prev = [c.cur_out; SUBSTEPS];
+            c.ceil_vc_prev = [0.0; SUBSTEPS];
+            c.ceil_mg_prev = [0.0; SUBSTEPS];
             c.pbar = [0.0; 4];
             c.pbar1_frame = 0.0;
             c.pbar1s_frame = 0.0;
@@ -1501,6 +2161,7 @@ impl Run {
             b[..ctl].iter_mut().for_each(|v| *v = 0.0);
         }
         self.pos = 0;
+        self.fragment_count = 0;
         self.frame = 0;
         self.last_frame = 0;
         self.frames_done = 0;
@@ -1517,6 +2178,9 @@ impl Run {
         let c = &mut self.ch[ci];
         let xin = &self.xin[ci];
         let hist = 2 * fb - 1;
+        if c.masker.is_some() {
+            c.vwin.copy_within(ctl.., 0);
+        }
         c.xb[hist..hist + ctl].copy_from_slice(&xin[..ctl]);
         let vfs = c.vfs as f64;
         let (mut px, mut pd, mut pv) = (0.0f32, 0.0f32, 0.0f32);
@@ -1548,14 +2212,21 @@ impl Run {
             px = px.max(xc.abs());
             pd = pd.max(libm::fabs(d) as f32);
             pv = pv.max(libm::fabs(v) as f32);
-            // the masker sees the program at the input (spec 15.3)
-            if !c.pressure.is_empty() {
-                c.p_hist.push(xin[i]);
-                let p = fir_reversed(&c.pressure, c.p_hist.window()) as f64;
-                let m = c.mask_lp.step(c.mask_hp.step(p));
-                c.mask_acc += m * m;
+            // the masker's modeled velocity of the input (residuals 3)
+            if c.masker.is_some() {
+                let mw = c.vwin.len();
+                c.vwin[mw - ctl + i] = c.mvel.step(vfs * xin[i] as f64) as f32;
             }
+            // the input temperature model, unattenuated (residuals 2): the
+            // same bulk current model and substep reduction as the monitor
+            c.power_work[i % sub] = c.vfs * xin[i];
             if (i + 1) % sub == 0 {
+                c.tin_cur.power_products_in_place(&mut c.power_work);
+                let p = (vdsp_sve_slice(&c.power_work) / sub as f32).max(0.0);
+                c.tp_vc = c.br_vc.step(c.tp_vc, p);
+                c.tp_mg = c.br_mg.step(c.tp_mg, p);
+                c.tring[c.tn % TRING] = c.ambient as f32 + (c.tp_vc + c.tp_mg);
+                c.tn += 1;
                 c.pk_x[slot] = px;
                 c.pk_d[slot] = pd;
                 c.pk_v[slot] = pv;
@@ -1569,6 +2240,9 @@ impl Run {
                 slot = (slot + 1) % ring_len;
             }
         }
+        for k in 0..BANDS {
+            realize_peak_window(&mut c.peak_ab[k], c.peak_previous[k], &c.ab[k]);
+        }
         // keep the bank's history
         c.xb.copy_within(ctl..ctl + hist, 0);
     }
@@ -1578,7 +2252,7 @@ impl Run {
     fn process_frame(&mut self) {
         // a gain state that went non-finite since the last frame is caught
         // before this frame's min/max could turn it into a number
-        if !self.ch.iter().all(|c| c.band.iter().all(Follower::finite) && c.peak.finite() && c.slow.finite()) {
+        if !self.ch.iter().all(|c| c.band.iter().all(BandGain::finite) && c.slow.finite()) {
             self.fault = true;
             return;
         }
@@ -1586,74 +2260,313 @@ impl Run {
             self.analyse(ci);
         }
         self.ring = (self.ring + SUBSTEPS) % self.ring_len;
-        let (ctl, sub, od, attack) = (self.ctl, self.sub, self.od, self.attack);
-        let (r_fast, r_low) = (self.r_fast, self.r_low);
+        let (ctl, sub, od) = (self.ctl, self.sub, self.od);
+        let fbl = self.fb;
+        let slow_lambda = self.slow_lambda;
         let ring_len = self.ring_len;
         let window_max = |r: &[f32; RING]| r[..ring_len].iter().copied().fold(0.0f32, f32::max);
         let ratio = |limit: f64, q: f32| (limit / (q as f64).max(EPS)).min(1.0);
+        let (a_fast, a_low) = (self.a_fast, self.a_low);
+        let fragments = &self.fragment_lens[..self.fragment_count];
+        let complete_host_frame = fragments == [ctl];
+        let velocity_release = 1.0 - libm::exp(-(ctl as f64) * a_fast);
+        // the allocator span excludes the first millisecond (t-4719)
+        let vfirst = libm::round(self.ctl as f64 * 3.0 / 16.0) as usize;
         // ---- fast axes: candidates, band requests, the frame's trajectories
-        let linked_ems = self
-            .ch
-            .iter()
-            .filter(|c| !c.pressure.is_empty())
-            .map(|c| (c.mask_acc / ctl as f64) as f32 as f64)
-            .fold(f64::INFINITY, f64::min);
+        // mask level (residuals 3): each channel's detector, the largest
+        // level for every channel's velocity curve
+        let mut level = f32::NEG_INFINITY;
         for c in self.ch.iter_mut() {
-            c.mask_acc = 0.0;
+            if let Some(m) = c.masker.as_mut() {
+                level = level.max(m.update(&c.vwin));
+            }
         }
         for c in self.ch.iter_mut() {
-            // velocity limit from the smoothed mask level (spec 15.3), one
-            // level for the pair: the 25G83 frame logs give both channels the
-            // same active velocity limit; the quieter channel's masker sets it
-            if !c.pressure.is_empty() {
-                let e = 10.0 * libm::log10(linked_ems.max(EPS)) + MASK_DB_OFFSET;
-                // the smoothed level starts at 0 dB (25G83: the first frame's
-                // limit is one attack step up from there)
-                let a = if e > c.mask_db {
-                    if e - c.mask_db >= c.mask_range {
-                        c.mask_af
-                    } else {
-                        c.mask_a
-                    }
-                } else {
-                    c.mask_r
-                };
-                c.mask_db += a * (e - c.mask_db);
-                c.mask_init = true;
-                c.vel_limit_now = mask_curve(c.mask_db, &c.mask_knots, &c.vel_lim);
+            if c.masker.is_some() {
+                c.vel_limit_now = velocity_limit(level, &c.mask_knots, &c.vel_lim, VELOCITY_PARAM_MAX) as f64;
             }
+            let (mut energy, mut weighted_energy) = (0.0f64, 0.0f64);
+            for k in 0..BANDS {
+                let band_energy = c.ab[k][od..od + ctl].iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>();
+                energy += band_energy;
+                weighted_energy += (k + 1) as f64 * band_energy;
+            }
+            let centroid = if energy > 0.0 { (weighted_energy / energy) as f32 } else { 0.0 };
             let g_peak = if self.axis[0] { ratio(c.amp_limit, window_max(&c.pk_x)) } else { 1.0 };
             let g_disp = if self.axis[1] { ratio(c.disp_limit, window_max(&c.pk_d)) } else { 1.0 };
             let vel_on = self.axis[2] && !c.vel_off;
-            let g_vel = if self.axis[2] { ratio(c.vel_limit_now, window_max(&c.pk_v)).max(c.vel_floor) } else { 1.0 };
-            // spec 15.4: the five bands' peaks over the frame itself (its
-            // eight newest substeps), not the decision window
-            let first = (self.ring + ring_len - SUBSTEPS) % ring_len;
-            let pk: [f64; BANDS] = core::array::from_fn(|k| {
-                (0..SUBSTEPS).map(|j| c.pk_vb[k][(first + j) % ring_len]).fold(0.0f32, f32::max) as f64
-            });
-            let active: [bool; BANDS] = core::array::from_fn(|k| vel_on && !c.ignore[k] && pk[k] > 0.0);
-            // the velocity limit holds on the program the slow gain already
-            // shapes (25G83 thermal ramps: the output velocity stays at the
-            // limit while the temperature gain falls): water filling on the
-            // slow-gained peaks, then each band's gain made absolute
-            let sg = (c.slow.g as f64).clamp(EPS, 1.0);
-            let pks: [f64; BANDS] = core::array::from_fn(|k| pk[k] * sg);
-            let rel = waterfill(&pks, &active, c.vel_limit_now, c.vel_floor);
-            let gv: [f64; BANDS] = core::array::from_fn(|k| if rel[k] < 1.0 { (rel[k] * sg).min(1.0) } else { 1.0 });
-            for k in 0..BANDS {
-                let req = g_disp.min(gv[k]) as f32;
-                c.band[k].request(req, attack);
+            // the published velocity candidate: the full-band ratio before
+            // the MaxVelocityAttenuation floor (the floor caps the applied
+            // band gains only), unity when Bandwidth 2 turns the axis off,
+            // and computed with mitigation off (rig law cases fb5, fb8-bw2,
+            // fb-vel-ignlow-bw2, therm, meter)
+            let g_vel = if self.vel_logged && !c.vel_off { ratio(c.vel_limit_now, window_max(&c.pk_v)) } else { 1.0 };
+            // residuals 5 (t-4731): one sequential fast-request chain of
+            // signed worst-sample allocations on five band buffers each:
+            // displacement, then velocity, then sample peak, each starting
+            // from the preceding stage's requests; the logged candidates are
+            // diagnostics only
+            // the slow scalar: the decision-local predicted endpoint of the
+            // slow follower (t-4758): its current ramp's target, else the
+            // gain with this frame's provisional recovery estimate
+            let sg = {
+                let f = c.slow;
+                let e = if f.attack && f.n < f.len {
+                    f.target
+                } else {
+                    let mut e = f.released_toward(1.0);
+                    for _ in 0..ctl {
+                        e.sample(slow_lambda);
+                    }
+                    e.g
+                };
+                (e as f64).clamp(EPS, 1.0) as f32
+            };
+            let disp_on = self.axis[1];
+            let peak_on = self.axis[0];
+            let vfs = c.vfs as f64;
+            if vel_on {
+                // five fresh zero-state velocity models over the retained
+                // window on the unattenuated bank signals (t-4719)
+                for k in 0..BANDS {
+                    let mut m = c.vel_proto;
+                    for i in 0..c.vb[k].len() {
+                        c.vb[k][i] = m.step(c.vfs * c.ab[k][i]);
+                    }
+                }
             }
-            c.peak.request(g_peak as f32, attack);
+            if disp_on {
+                // five fresh displacement models, and the fixed residual of
+                // the retained full-band trajectory
+                for k in 0..BANDS {
+                    let mut m = c.disp_proto;
+                    for i in 0..c.db[k].len() {
+                        c.db[k][i] = m.step(vfs * c.ab[k][i] as f64) as f32;
+                    }
+                }
+                c.dcar_m.carry(&mut c.rd, fbl);
+                let next = window_max(&c.pk_d).min(c.disp_limit as f32);
+                if c.disp_bound_ready {
+                    c.disp_bound_old = c.disp_bound_new;
+                    c.disp_bound_new = next;
+                } else {
+                    c.disp_bound_old = next;
+                    c.disp_bound_new = next;
+                    c.disp_bound_ready = true;
+                }
+            }
+            let vlim_g = c.vel_limit_now as f32;
+            let stream_ready = c.protected_peak.ready();
+            c.protected_peak_advanced = false;
+            let prior_bound = c.vel_bound_window.last().copied().unwrap_or(0.0);
+            let next_bound = if c.vel_bound_release && c.vel_bound_ready {
+                (prior_bound as f64 + velocity_release * (c.vel_limit_now - prior_bound as f64)) as f32
+            } else {
+                c.protected_peak_now.max(0.25 * vlim_g).min(vlim_g)
+            };
+            if c.vel_bound_ready && stream_ready {
+                c.vel_bound_window.copy_within(ctl.., 0);
+                c.vel_bound_window[od..].fill(next_bound);
+            } else if stream_ready {
+                c.vel_bound_ready = true;
+                c.vel_bound_window.fill(next_bound);
+            }
+            // the velocity fixed term (t-4751, t-4763): the zero-input carry
+            // of the persistent full-band velocity model, over one
+            // filterbank latency, zeros after; the model itself advances on
+            // the protected output, below
+            c.vcar_m.carry(&mut c.vcar, fbl);
+            let all = (0, BANDS);
+            let mut producer_r = [1.0; BANDS];
+            if disp_on {
+                let room = 0.25 * (c.disp_limit as f32 - c.disp_bound_new).max(0.0);
+                producer_r = velocity_band_gains_window(
+                    &c.db,
+                    &c.rd,
+                    0,
+                    c.disp_bound_old,
+                    c.disp_bound_new,
+                    od,
+                    room,
+                    sg,
+                    all,
+                    producer_r,
+                );
+            }
+            let protected_trial = (od..od + ctl).fold(0.0f32, |peak, i| {
+                let y = (0..BANDS).fold(c.vcar[i], |y, k| y + (producer_r[k] * sg) * c.vb[k][i]);
+                peak.max(y.abs())
+            });
+            let streaming_ramp = complete_host_frame
+                && centroid > c.input_centroid_previous
+                && protected_trial > c.protected_trial_previous
+                && protected_trial < vlim_g;
+            c.input_centroid_previous = centroid;
+            c.protected_trial_previous = protected_trial;
+            // Native arbitrates each newly admitted segment while shifted
+            // samples keep their source. The greater of the streaming
+            // protected envelope and the decision-local protected trial owns
+            // the segment. This compares existing producer states, not signal
+            // levels, spectra, case identities, or fitted thresholds.
+            if vel_on && complete_host_frame && stream_ready && !c.vel_bound_release {
+                let ordinary_onset = velocity_band_gains(&c.vb, &c.vcar, vfirst, vlim_g, sg, all, producer_r);
+                let onset_admitted = (c.vel_active.0..c.vel_active.1).any(|k| ordinary_onset[k] < producer_r[k]);
+                if !streaming_ramp || onset_admitted {
+                    let mut offset = 0;
+                    let mut boundary = c.vel_bound_window[od - 1];
+                    for &len in fragments {
+                        let mut peak = 0.0f32;
+                        for i in od + offset..od + offset + len {
+                            let mut y = c.vcar[i];
+                            for k in 0..BANDS {
+                                y += (producer_r[k] * sg) * c.vb[k][i];
+                            }
+                            peak = peak.max(y.abs());
+                        }
+                        let onset_bound = peak.min(vlim_g);
+                        // The streaming producer is the moving protected trial
+                        // envelope advanced by the admitted host fragment. Quiet
+                        // history is seeded at the structural floor; a nonzero
+                        // trial, including one below that floor, is admitted.
+                        let stream_source = if onset_bound == 0.0 { 0.25 * vlim_g } else { onset_bound };
+                        let stream_bound = c.protected_peak.update(stream_source, len).min(vlim_g);
+                        c.protected_peak_now = stream_bound;
+                        c.protected_peak_advanced = true;
+                        let admitted = arbitrate_producer_segment(onset_bound, stream_bound);
+                        let segment = &mut c.vel_bound_window[od + offset..od + offset + len];
+                        if admitted >= boundary {
+                            segment.fill(admitted);
+                        } else {
+                            let step = (admitted - boundary) / len as f32;
+                            for (i, value) in segment.iter_mut().enumerate() {
+                                *value = boundary + step * (i + 1) as f32;
+                            }
+                        }
+                        boundary = admitted;
+                        offset += len;
+                    }
+                    debug_assert_eq!(offset, ctl);
+                }
+            }
+            let retained_room_bound = c.vel_bound_window[od..].iter().copied().fold(0.0f32, f32::max);
+            let velocity_cut = core::cell::Cell::new(false);
+            let primary_floor_limited = core::cell::Cell::new(false);
+            let retained_episode = core::cell::Cell::new(c.vel_episode && c.vel_episode_retained);
+            let chain = |c: &Chan, seed: [f32; BANDS], floor_velocity: bool| -> [f32; BANDS] {
+                let all = (0, BANDS);
+                let mut r = seed;
+                if disp_on {
+                    let room = 0.25 * (c.disp_limit as f32 - c.disp_bound_new).max(0.0);
+                    r = velocity_band_gains_window(
+                        &c.db,
+                        &c.rd,
+                        0,
+                        c.disp_bound_old,
+                        c.disp_bound_new,
+                        od,
+                        room,
+                        sg,
+                        all,
+                        r,
+                    );
+                }
+                if vel_on {
+                    let ordinary = velocity_band_gains(&c.vb, &c.vcar, vfirst, vlim_g, sg, all, r);
+                    let ordinary_cut = (c.vel_active.0..c.vel_active.1).any(|k| ordinary[k] < r[k]);
+                    let retained = if stream_ready && c.vel_bound_ready {
+                        velocity_band_gains_limit_window(
+                            &c.vb,
+                            &c.vcar,
+                            vfirst,
+                            &c.vel_bound_window,
+                            0.25 * (vlim_g - retained_room_bound).max(0.0),
+                            sg,
+                            all,
+                            ordinary,
+                        )
+                    } else {
+                        ordinary
+                    };
+                    if !c.vel_episode && (ordinary_cut || streaming_ramp) && stream_ready {
+                        retained_episode.set(true);
+                    }
+                    let q = if retained_episode.get() { retained } else { ordinary };
+                    for k in c.vel_active.0..c.vel_active.1 {
+                        let raw = q[k];
+                        let v = if floor_velocity {
+                            primary_floor_limited.set(primary_floor_limited.get() || sg * raw < c.vel_floor as f32);
+                            (sg * raw).max(c.vel_floor as f32) / sg
+                        } else {
+                            raw
+                        };
+                        velocity_cut.set(velocity_cut.get() || v < r[k]);
+                        r[k] = r[k].min(v);
+                    }
+                }
+                if peak_on {
+                    r = velocity_band_gains(&c.peak_ab, &[], 0, c.amp_limit as f32, sg, all, r);
+                }
+                r
+            };
+            let req: [f32; BANDS] = if disp_on || vel_on || peak_on {
+                // The scalar shapes every allocator trial, but the fast
+                // follower's request stays in the band domain. The output
+                // applies the slow trajectory after the fast-gained sum;
+                // scaling the request by `sg` here would apply it twice.
+                let p = chain(c, [1.0; BANDS], true);
+                // residuals 5.2 (t-4713): upward lanes (primary above the
+                // applied gain); one second chain seeded from the predicted
+                // endpoint toward the complete primary request of upward
+                // lanes whose applied gain at the decision boundary is 3 dB
+                // or more below it. The others take the
+                // second (t-4772). An upward lane keeps the primary unless
+                // the second solve cut it below its own seed: then it takes
+                // the second request too (a lane the second solve leaves at
+                // its seed, unity included, is not a request of that solve)
+                let up: [bool; BANDS] = core::array::from_fn(|k| p[k] > c.band[k].g);
+                if up.iter().any(|&u| u) {
+                    let guard = libm::pow(10.0, 3.0 / 20.0) as f32;
+                    let seed: [f32; BANDS] = core::array::from_fn(|k| {
+                        let end = c.band[k].end_after(p[k], ctl, if k == 0 { a_low } else { a_fast });
+                        if up[k] && guard * c.band[k].g <= p[k] {
+                            end
+                        } else {
+                            1.0
+                        }
+                    });
+                    // A primary request below MaxVelocityAttenuation proves
+                    // that the configured floor cannot meet the modeled
+                    // bound. Keep the retarget solve's lower no-progress
+                    // result instead of applying the insufficient floor a
+                    // second time: a conservative clean-room fallback.
+                    let q = chain(c, seed, !primary_floor_limited.get());
+                    core::array::from_fn(|k| if up[k] && q[k] >= seed[k] { p[k] } else { q[k] })
+                } else {
+                    p
+                }
+            } else {
+                [1.0; BANDS]
+            };
+            if velocity_cut.get() {
+                if !c.vel_episode {
+                    c.vel_episode = true;
+                    c.vel_episode_retained = retained_episode.get();
+                }
+            } else {
+                c.vel_episode = false;
+                c.vel_episode_retained = false;
+            }
+            c.vel_bound_release = c.vel_episode && c.vel_episode_retained;
+            for k in 0..BANDS {
+                c.band[k].decide(req[k]);
+            }
             c.cand[0] = g_peak;
             c.cand[1] = g_disp;
             c.cand[2] = g_vel;
             for i in 0..ctl {
-                let pg = c.peak.sample(r_fast);
                 for k in 0..BANDS {
-                    let r = if k == 0 { r_low } else { r_fast };
-                    c.eg[k][i] = c.band[k].sample(r).min(pg);
+                    let a = if k == 0 { a_low } else { a_fast };
+                    c.eg[k][i] = c.band[k].sample(a);
                 }
             }
         }
@@ -1705,31 +2618,29 @@ impl Run {
             1.0
         };
         self.linked_power = g_pow;
-        // ---- temperature axis (spec 15.5): own predictor and candidate
+        // ---- temperature axis (residuals 2): the input model's selected
+        // peak, its current rises and the output body rise before this frame
+        let (hist, sel) = (self.tb_hist, self.tb_sel);
         for c in self.ch.iter_mut() {
-            let pin = c.p_sub.iter().sum::<f64>() / SUBSTEPS as f64;
-            let g2 = c.gt * c.gt;
-            for &p in &c.p_sub {
-                let p = p.max(0.0) * g2;
-                c.tp_vc = c.b_vc * c.tp_vc + (c.a_vc as f64 * c.rth_vc * p) as f32;
-                c.tp_mg = c.b_mg * c.tp_mg + (c.a_mg as f64 * c.rth_mag * p) as f32;
-            }
-            let t_pred = c.ambient + c.tp_mg as f64 + c.tp_vc as f64;
-            let release = libm::sqrt((g2 + self.temp_release).min(1.0));
-            c.gt = if self.axis[4] && t_pred > c.t_soft {
-                let q2 = ((c.t_hard - c.ambient - c.tp_mg as f64) / (c.rth_vc * pin.max(0.0) + 1.0)).clamp(1e-4, 1.0);
-                let q = libm::sqrt(q2);
-                if q < c.gt {
-                    q
-                } else {
-                    release
-                }
+            // buffer: the `hist` retained points then the frame's, oldest
+            // first; the peak over its first `sel`
+            let start = c.tn + TRING - hist - SUBSTEPS;
+            let tpk = (0..sel).map(|j| c.tring[(start + j) % TRING]).fold(f32::NEG_INFINITY, f32::max);
+            c.gt = if self.axis[4] {
+                temperature_candidate(
+                    tpk,
+                    c.tp_vc,
+                    c.tp_mg,
+                    c.th_mg,
+                    c.ambient as f32,
+                    c.t_soft as f32,
+                    c.t_hard as f32,
+                    c.br_vc.r_eff,
+                    c.br_mg.r_eff,
+                ) as f64
             } else {
-                release
+                1.0
             };
-            if !self.axis[4] {
-                c.gt = 1.0;
-            }
             c.cand[3] = g_pow;
             c.cand[4] = c.gt;
         }
@@ -1748,68 +2659,80 @@ impl Run {
             let m = req[..n].iter().copied().fold(1.0f64, f64::min);
             req[..n].iter_mut().for_each(|r| *r = m);
         }
-        let mut commit = [0.0f64; MAX_CHANNELS];
-        for (ci, c) in self.ch.iter().enumerate() {
-            let a = c.slow.g as f64;
-            commit[ci] = if req[ci] < a { CUT * req[ci] } else { a + self.slow_step * (req[ci] - a) };
+        // residuals 2.4, in its native order: (1) the output-temperature
+        // ceiling solves the absolute ordinary power/temperature request on
+        // the fast-gained waveform at slow unity, over the retained frame and
+        // look-ahead; (2) an idle slow follower releases one decision toward
+        // that solved request; (3) a result below the provisionally advanced
+        // endpoint makes one downward follower call toward 0.99 x the solved
+        // request. Thus recovery follows the ceiling while it binds, and the
+        // ordinary request otherwise. The provisional trajectory is follower
+        // state only: baking it into B/L/Q and normalizing the proposal by its
+        // endpoint is not equivalent because the ceiling's root corrections
+        // multiply the proposal.
+        let mut prov = [SlowGain::unity(1); MAX_CHANNELS];
+        let mut end = [1.0f32; MAX_CHANNELS];
+        let mut want = [1.0f32; MAX_CHANNELS];
+        for ci in 0..n {
+            want[ci] = req[ci] as f32;
         }
         if self.axis[4] {
-            for _ in 0..CEILING_PASSES {
-                let mut cut = f64::INFINITY;
-                for (ci, c) in self.ch.iter().enumerate() {
-                    let ceiling = c.t_hard + c.t_headroom.max(0.0);
-                    let pin = c.p_sub.iter().sum::<f64>() / SUBSTEPS as f64;
-                    if pin <= 0.0 {
-                        continue;
-                    }
-                    // the monitor after this frame at the proposed gain
-                    let g2 = commit[ci] * commit[ci];
-                    let (mut vc, mut mg) = (c.th_vc, c.th_mg);
-                    for &p in &c.p_sub {
-                        let p = p.max(0.0) * g2;
-                        vc = c.b_vc * vc + (c.a_vc as f64 * c.rth_vc * p) as f32;
-                        mg = c.b_mg * mg + (c.a_mg as f64 * c.rth_mag * p) as f32;
-                    }
-                    if c.ambient + mg as f64 + vc as f64 > ceiling {
-                        let room = (ceiling - c.ambient - mg as f64).max(0.0);
-                        let g = CUT * libm::sqrt(room / (c.rth_vc * pin));
-                        cut = cut.min(g.min(commit[ci]));
-                    }
-                }
-                if !cut.is_finite() {
-                    break;
-                }
-                for ci in 0..n {
-                    if self.link || cut < commit[ci] {
-                        commit[ci] = commit[ci].min(cut);
-                    }
-                }
+            for (ci, c) in self.ch.iter().enumerate() {
+                want[ci] = c.ceiling_scale(want[ci], ctl, sub, self.fb, self.ceiling_shift);
             }
         }
+        if self.link && n > 1 {
+            let m = want[..n].iter().copied().fold(1.0f32, f32::min);
+            want[..n].iter_mut().for_each(|v| *v = m);
+        }
+        for (ci, c) in self.ch.iter().enumerate() {
+            let f = c.slow.released_toward(want[ci]);
+            prov[ci] = f;
+            let mut e = f;
+            for _ in 0..ctl {
+                e.sample(slow_lambda);
+            }
+            end[ci] = e.g;
+        }
         for (ci, c) in self.ch.iter_mut().enumerate() {
-            let to = commit[ci] as f32;
-            if to < c.slow.g {
-                c.slow.left = attack.max(1);
-                c.slow.step = (to - c.slow.g) / c.slow.left as f32;
+            let request = want[ci];
+            if request < end[ci] {
+                let mut f = prov[ci];
+                for _ in 0..ctl {
+                    f.sample(slow_lambda);
+                }
+                // the second call starts at the provisionally advanced value
+                f.start = f.g;
+                f.target = CUT * request;
+                f.n = 0;
+                f.attack = true;
+                c.slow = f;
             } else {
-                c.slow.left = 0;
-                c.slow.g = to.min(1.0);
+                c.slow = prov[ci];
             }
         }
         // ---- output region and the monitor
         let (idle, ratio_p) = (self.idle, self.ratio);
         for (ci, c) in self.ch.iter_mut().enumerate() {
             let y = &mut self.yout[ci];
-            let mut acc = 0.0f64;
             let mut s = 0;
+            let mut protected_model_peak = 0.0f32;
             let (mut p1, mut p1s) = (0.0f64, 0.0f64);
             for (i, yo) in y.iter_mut().enumerate().take(ctl) {
-                let sg = c.slow.sample_ramp();
-                let g0 = c.eg[0][i].min(sg);
+                if i % sub == 0 {
+                    let k = i / sub;
+                    c.ceil_cur_prev[k] = c.cur_out;
+                    c.ceil_vc_prev[k] = c.th_vc;
+                    c.ceil_mg_prev[k] = c.th_mg;
+                }
+                let fast = c.out_sample(i, 1.0);
+                c.ceil_fast_prev[i] = fast;
+                let sg = c.slow.sample(slow_lambda);
+                let g0 = c.eg[0][i] * sg;
                 let mut same = true;
                 let mut g = [0.0f32; BANDS];
                 for k in 0..BANDS {
-                    g[k] = c.eg[k][i].min(sg);
+                    g[k] = c.eg[k][i] * sg;
                     same &= g[k] == g0;
                 }
                 let v = if same {
@@ -1822,16 +2745,18 @@ impl Run {
                     v
                 };
                 let u = c.vfs * v;
-                let iv = c.cur_out.step(u);
-                acc += u as f64 * iv as f64;
+                c.power_work[i % sub] = u;
                 *yo = v.clamp(-1.0, 1.0);
+                // The persistent motion models follow the protected output.
+                c.dcar_m.step(c.vfs * *yo);
+                let modeled_velocity = c.vcar_m.step(c.vfs * *yo);
+                protected_model_peak = protected_model_peak.max(modeled_velocity.abs());
                 if (i + 1) % sub == 0 {
-                    let p = acc / sub as f64;
-                    acc = 0.0;
-                    // thermal (rig law 3): series matched one-poles in Float32
-                    let pp = p.max(0.0);
-                    c.th_vc = c.b_vc * c.th_vc + (c.a_vc as f64 * c.rth_vc * pp) as f32;
-                    c.th_mg = c.b_mg * c.th_mg + (c.a_mg as f64 * c.rth_mag * pp) as f32;
+                    let p = c.cur_out.power_products_in_place(&mut c.power_work) / sub as f64;
+                    // the output thermal model (residuals 2.1)
+                    let pp = (vdsp_sve_slice(&c.power_work) / sub as f32).max(0.0);
+                    c.th_vc = c.br_vc.step(c.th_vc, pp);
+                    c.th_mg = c.br_mg.step(c.th_mg, pp);
                     let pamp = idle + ratio_p * (p * c.load_scale).max(0.0);
                     for j in 0..4 {
                         c.pbar[j] = self.p_pole[j] * c.pbar[j] + (1.0 - self.p_pole[j]) * pamp;
@@ -1841,25 +2766,29 @@ impl Run {
                     s += 1;
                 }
             }
+            if !c.protected_peak_advanced {
+                let stream_source = protected_model_peak.max(0.25 * c.vel_limit_now as f32);
+                c.protected_peak_now = c.protected_peak.update(stream_source, ctl);
+            }
             c.pbar1_frame = p1;
             c.pbar1s_frame = p1s;
             // shift the bank-stage buffers: keep the look-ahead region
-            for b in c.ab.iter_mut() {
+            for (k, b) in c.ab.iter_mut().enumerate() {
+                c.peak_previous[k] = b[ctl - 1];
                 b.copy_within(ctl..ctl + od, 0);
             }
             c.xc.copy_within(ctl..ctl + od, 0);
             let model = [c.th_vc, c.th_mg, c.tp_vc, c.tp_mg].iter().all(|v| v.is_finite())
-                && c.mask_db.is_finite()
+                && c.masker.as_ref().is_none_or(Masker::is_finite)
                 && c.pbar.iter().chain(&c.pbar_in).all(|v| v.is_finite())
                 && c.gt.is_finite();
-            let motion = [&c.disp, &c.vel].iter().all(|b| b.y[0].is_finite())
+            let motion = c.disp.y[0].is_finite()
+                && c.dcar_m.y[0].is_finite()
+                && c.vel.y[0].is_finite()
                 && c.vel_band.iter().all(|b| b.y[0].is_finite())
                 && c.cur_in.is_finite()
                 && c.cur_out.is_finite();
-            let gains = c.cand.iter().all(|v| v.is_finite())
-                && c.band.iter().all(Follower::finite)
-                && c.peak.finite()
-                && c.slow.finite();
+            let gains = c.cand.iter().all(|v| v.is_finite()) && c.band.iter().all(BandGain::finite) && c.slow.finite();
             if !(model && motion && gains) {
                 self.fault = true;
             }
@@ -1870,26 +2799,35 @@ impl Run {
     }
 
     fn process(&mut self, io: &mut Io<'_, '_>) {
-        for k in 0..io.frames {
-            let pos = self.pos;
-            for ci in 0..self.n {
-                let src = self.ch[ci].src;
-                let x = io.input[src][k];
-                // a non-finite sample is 0 to the audio and the models; the
-                // peak axis sees it as the most restrictive
-                self.xin[ci][pos] = if x.is_finite() { dsp::meter1(x) } else { dsp::METER_FS };
-                io.output[src][k] = self.yout[ci][pos];
+        let mut start = 0;
+        while start < io.frames {
+            let take = (io.frames - start).min(self.ctl - self.pos);
+            debug_assert!(self.fragment_count < self.fragment_lens.len());
+            self.fragment_lens[self.fragment_count] = take;
+            self.fragment_count += 1;
+            for k in start..start + take {
+                let pos = self.pos + k - start;
+                for ci in 0..self.n {
+                    let src = self.ch[ci].src;
+                    let x = io.input[src][k];
+                    // a non-finite sample is 0 to the audio and the models;
+                    // the peak axis sees it as the most restrictive
+                    self.xin[ci][pos] = if x.is_finite() { dsp::meter1(x) } else { dsp::METER_FS };
+                    io.output[src][k] = self.yout[ci][pos];
+                }
             }
-            self.pos += 1;
-            self.frame += 1;
+            self.pos += take;
+            self.frame += take as u64;
             if self.pos == self.ctl {
                 self.pos = 0;
                 self.process_frame();
+                self.fragment_count = 0;
                 if self.fault {
-                    crate::failsafe::fill_from(io, k + 1, FAILSAFE_GAIN);
+                    crate::failsafe::fill_from(io, start + take, FAILSAFE_GAIN);
                     return;
                 }
             }
+            start += take;
         }
     }
 }
@@ -2000,18 +2938,20 @@ impl ProtectionUnit for Unit {
         for c in &run.ch {
             let mut s = ChannelState::ABSENT;
             let t = c.ambient + c.th_mg as f64 + c.th_vc as f64;
+            // binary32, ambient plus the coil rise, then the magnet rise
+            let coil_telemetry = (c.telemetry_ambient as f32 + c.th_vc) + c.th_mg;
             s.modeled_power_w = c.pbar[2] as f32;
-            s.coil_temp_c = t as f32;
+            s.coil_temp_c = coil_telemetry;
             s.magnet_temp_c = (c.ambient + c.th_mg as f64) as f32;
             s.control_temp_c = t as f32;
             s.ol_temp_c = t as f32;
             s.velocity_limit_m_s = c.vel_limit_now as f32;
-            s.mask_db = if c.mask_init { c.mask_db as f32 } else { f32::NAN };
+            s.mask_db = c.masker.as_ref().map_or(f32::NAN, |m| m.level);
             for (a, &g) in s.axis_gain.iter_mut().zip(&c.cand) {
                 *a = g as f32;
             }
             s.band_gain = core::array::from_fn(|k| c.band[k].g);
-            s.gain = if run.fault { FAILSAFE_GAIN } else { c.slow.g.min(c.peak.g) };
+            s.gain = if run.fault { FAILSAFE_GAIN } else { c.slow.g };
             out.channels[c.src] = s;
             amp_1s += c.pbar1s_frame;
             if c.src == 0 {
@@ -2044,7 +2984,7 @@ impl ProtectionUnit for Unit {
             return false;
         }
         self.params = p;
-        self.run = Run::new(&self.params).ok();
+        self.run = Run::new(&self.params, self.geometry_lookahead_ms, &self.telemetry_ambient).ok();
         true
     }
 
@@ -2085,18 +3025,19 @@ impl ProtectionUnit for Unit {
             c.th_mg = (s[1] * em) as f32;
             c.tp_vc = (s[6] * ev) as f32;
             c.tp_mg = (s[7] * em) as f32;
+            // the input model's buffer holds the cooled temperature
+            c.tring = [c.ambient as f32 + (c.tp_vc + c.tp_mg); TRING];
             for j in 0..4 {
                 let v = run.idle + (s[2 + j] - run.idle) * libm::pow(run.p_pole[j], substeps);
                 c.pbar[j] = v;
                 c.pbar_in[j] = v;
             }
-            // the slow gain released over the gap by its per-frame law, the
-            // temperature axis's linearly in gt^2
+            // the slow gain released over the gap by its per-frame law; the
+            // temperature candidate follows from the restored states
             let g = state.gain[i];
             let slow = 1.0 - (1.0 - g) * libm::pow(1.0 - run.slow_step, frames);
-            c.slow.g = slow.clamp(0.0, 1.0) as f32;
-            c.slow.left = 0;
-            c.gt = libm::sqrt((g * g + run.temp_release * frames).min(1.0));
+            c.slow.set(slow.clamp(0.0, 1.0) as f32);
+            c.gt = 1.0;
         }
         true
     }
@@ -2105,6 +3046,35 @@ impl ProtectionUnit for Unit {
 #[cfg(test)]
 mod fault_tests {
     use super::*;
+
+    #[test]
+    fn current_bulk_table_and_state_are_chunk_stable() {
+        let b = [0.75, -0.25, 0.125];
+        let a = [-0.5, 0.25];
+        let table = MonitorCurrent::bulk_table(b, a);
+        assert_eq!(&table[..4], &[0.75, 0.125, 0.0, -0.03125]);
+        assert_eq!(&table[16..20], &[1.0, 0.5, 0.0, -0.125]);
+        assert_eq!(&table[24..32], &[0.125, 0.0, -0.25, 0.125, 0.25, 0.0, -0.5, 0.25]);
+
+        let input: [f32; 16] = core::array::from_fn(|i| (i as f32 - 7.0) / 13.0);
+        let mut whole = MonitorCurrent { b, a, table, z: [0.0; 2] };
+        let mut split = whole;
+        let mut whole_output = [0.0; 16];
+        let mut split_output = [0.0; 16];
+        whole.process(&input, &mut whole_output);
+        split.process(&input[..8], &mut split_output[..8]);
+        split.process(&input[8..], &mut split_output[8..]);
+        assert_eq!(whole_output.map(f32::to_bits), split_output.map(f32::to_bits));
+        assert_eq!(whole.z.map(f32::to_bits), split.z.map(f32::to_bits));
+    }
+
+    #[test]
+    fn sample_peak_window_keeps_the_span_and_prepends_the_previous_sample() {
+        let bank = [10.0, 11.0, 12.0, 13.0];
+        let mut peak = [0.0; 4];
+        realize_peak_window(&mut peak, 9.0, &bank);
+        assert_eq!(peak, [9.0, 10.0, 11.0, 12.0]);
+    }
 
     fn params() -> Params {
         let mut p = Params {
@@ -2184,6 +3154,54 @@ mod fault_tests {
         (o0, h)
     }
 
+    #[test]
+    fn forty_four_khz_geometry_keeps_the_native_vector_cadence() {
+        let mut p = params();
+        p.sample_rate = 44_100;
+        p.filterbank_latency_ms = 10.0 / 3.0;
+        p.speaker_response_lookahead_ms = 2.0 / 3.0;
+        assert_eq!(controller_frames(p.sample_rate), 256);
+        assert_eq!(p.filterbank_frames(), 144);
+        assert_eq!(p.lookahead_frames(), 32);
+        assert_eq!(p.latency_frames(), 320);
+        assert_eq!(p.unit_latency_frames(), 576);
+        assert!(Unit::init_error(&p).is_none());
+    }
+
+    #[test]
+    fn eighty_eight_khz_geometry_uses_the_two_x_rate_family() {
+        let mut p = params();
+        p.sample_rate = 88_200;
+        p.filterbank_latency_ms = 10.0 / 3.0;
+        p.speaker_response_lookahead_ms = 2.0 / 3.0;
+        assert_eq!(controller_frames(p.sample_rate), 512);
+        assert_eq!(p.filterbank_frames(), 288);
+        assert_eq!(p.lookahead_frames(), 64);
+        assert_eq!(p.latency_frames(), 640);
+        assert_eq!(p.unit_latency_frames(), 1152);
+        assert!(Unit::init_error(&p).is_none());
+    }
+
+    #[test]
+    fn other_native_rate_families_keep_their_geometry() {
+        let mut p = params();
+        p.filterbank_latency_ms = 10.0 / 3.0;
+        p.speaker_response_lookahead_ms = 2.0 / 3.0;
+
+        p.sample_rate = 32_000;
+        assert_eq!(controller_frames(p.sample_rate), 192);
+        assert_eq!((p.filterbank_frames(), p.lookahead_frames(), p.latency_frames()), (96, 24, 216));
+        assert!(Unit::init_error(&p).is_none());
+
+        p.sample_rate = 176_400;
+        assert_eq!(controller_frames(p.sample_rate), 512);
+        assert_eq!((p.filterbank_frames(), p.lookahead_frames(), p.latency_frames()), (576, 128, 1280));
+
+        p.sample_rate = 192_000;
+        assert_eq!(controller_frames(p.sample_rate), 512);
+        assert_eq!((p.filterbank_frames(), p.lookahead_frames(), p.latency_frames()), (640, 128, 1408));
+    }
+
     /// A non-finite state latches 20 dB until reset.
     #[test]
     fn a_non_finite_model_state_latches_the_failsafe_until_reset() {
@@ -2213,6 +3231,93 @@ mod fault_tests {
     }
 
     #[test]
+    fn slow_recovery_follows_the_solved_ceiling_request() {
+        let mut f = SlowGain::unity(256);
+        f.set(0.4);
+        let step = 0.125;
+        let ceiling = 0.6;
+        let lambda = step;
+        let mut got = f.released_toward(ceiling);
+        assert_eq!(got.g, 0.4);
+        got.sample(lambda);
+        assert_eq!(got.g, 0.425);
+
+        // A lower solve is an attack request, not a provisional release.
+        let mut lower = f.released_toward(0.3);
+        lower.sample(lambda);
+        assert_eq!(lower.g, f.g);
+    }
+
+    #[test]
+    fn thermal_substeps_use_the_vdsp_sum_tree() {
+        let x: [f32; 32] = core::array::from_fn(|i| (i + 1) as f32 * 0.1);
+        assert_eq!(vdsp_sve_slice(&x).to_bits(), 0x4253_3334);
+    }
+
+    #[test]
+    fn runtime_ceiling_parameters_move_the_window_without_moving_latency() {
+        let mut no_lookahead = Unit::new(params());
+        assert!(no_lookahead.set_parameter(ids::controller(ids::C_LOOKAHEAD), 0.0));
+        let r = no_lookahead.run.as_ref().unwrap();
+        assert_eq!((r.latency, r.ceiling_shift), (512, -64));
+
+        let mut long_attack = Unit::new(params());
+        assert!(long_attack.set_parameter(ids::controller(ids::C_ATTACK), 50.0));
+        let r = long_attack.run.as_ref().unwrap();
+        assert_eq!((r.latency, r.ceiling_shift), (512, 0));
+    }
+
+    #[test]
+    fn coil_telemetry_keeps_the_initial_ambient_reference() {
+        let mut u = Unit::new(params());
+        assert!(u.set_parameter(ids::thermal(0, ids::T_AMBIENT), 30.0));
+        run(&mut u, 0.2, 2048);
+        let mut t = Telemetry::new();
+        u.telemetry(&mut t);
+        let c = t.channels[0];
+        assert!((c.coil_temp_c - c.control_temp_c - 10.0).abs() < 1e-4);
+        assert!(c.magnet_temp_c >= 30.0 && c.magnet_temp_c < c.control_temp_c);
+    }
+
+    #[test]
+    fn displacement_fixed_term_is_the_truncated_protected_output_carry() {
+        let mut p = params();
+        p.control_displacement = 1;
+        let mut u = Unit::new(p);
+        run(&mut u, 1.0, CONTROLLER_FRAMES);
+
+        let r = u.run.as_ref().unwrap();
+        let c = &r.ch[0];
+        let q = motion(
+            p.ch[0].disp_rdc,
+            p.ch[0].disp_bl,
+            p.ch[0].disp_mms_kg,
+            p.ch[0].disp_rms,
+            p.ch[0].disp_kms,
+            p.sample_rate as f64,
+            false,
+        );
+        let mut replay = Biquad32::from(&q);
+        for &y in &r.yout[0] {
+            replay.step(p.ch[0].volts_full_scale * y);
+        }
+        assert_eq!(c.dcar_m.x.map(f32::to_bits), replay.x.map(f32::to_bits));
+        assert_eq!(c.dcar_m.y.map(f32::to_bits), replay.y.map(f32::to_bits));
+
+        let mut want = vec![0.0; c.rd.len()];
+        c.dcar_m.carry(&mut want, r.fb);
+        assert!(want[..r.fb].iter().any(|&v| v != 0.0));
+        run(&mut u, 1.0, CONTROLLER_FRAMES);
+        let r = u.run.as_ref().unwrap();
+        assert!(r.ch[0].disp_bound_ready);
+        assert_eq!(
+            r.ch[0].rd.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            want.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+        assert!(r.ch[0].rd[r.fb..].iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
     fn waterfill_levels_the_active_peaks() {
         let all = [true; BANDS];
         // no attenuation when the sum fits
@@ -2233,13 +3338,5 @@ mod fault_tests {
         // the floor
         let g = waterfill(&[0.0, 10.0, 0.0, 0.0, 0.0], &all, 0.1, 0.1);
         assert_eq!(g[1], 0.1);
-    }
-
-    #[test]
-    fn the_current_model_has_one_over_rdc_at_dc() {
-        let c = Current::new(4.0, 0.8, 0.2e-3, 0.2, 1500.0, 48_000.0);
-        let b: f64 = c.b.iter().map(|&v| v as f64).sum();
-        let a = 1.0 + c.a[0] as f64 + c.a[1] as f64;
-        assert!((b / a * 4.0 - 1.0).abs() < 1e-5);
     }
 }

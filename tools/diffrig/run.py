@@ -104,7 +104,7 @@ def like_for_like(ref, got, program, file_ch, ch, out_path, ref_lat, got_lat, ra
     x = x[: len(x) // file_ch * file_ch].reshape(-1, file_ch).astype(np.float64)
     y = np.fromfile(out_path, "<f4")
     y = y[: len(y) // ch * ch].reshape(-1, ch).astype(np.float64)
-    ctl = int(round(256 * rate / 48000))
+    ctl = 192 if rate == 32000 else min(512, 256 * max(1, int(round(rate / 48000))))
 
     def note(what, why):
         e = excluded.setdefault(what, {"reason": why, "slices": 0})
@@ -250,7 +250,9 @@ def main(argv):
         blob = blobs.get(f"{unit}-aid{aid}", blobs.get(unit))
         if blob:
             args += ["--blob", blob]
-        if unit == "atsp" and meta.get("sr"):
+        # the stream rate the reference ran: atsp and lsm2 derive their
+        # geometry and coefficients from it (Daybreak t-4769)
+        if unit in ("atsp", "lsm2") and meta.get("sr"):
             args += ["--rate", str(meta["sr"])]
         if c.get("limit_frames"):
             args += ["--limit-frames", str(c["limit_frames"])]
