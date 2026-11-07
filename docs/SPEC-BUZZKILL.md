@@ -14,6 +14,12 @@ The transform keeps that fixed normalization while the initial record fills; the
 m[k] = clamp(T[k] / A[k], 1e-6, 1).
 ```
 
+Candidate frequency is not the centre of the FFT bin. Let `X[k]` be the complex transform of the windowed signal and `D[k]` the transform of its windowed first difference. With `q = abs(D[k]) / (abs(X[k]) + 1e-20)`, the refined frequency is
+
+```text
+f[k] = (fs_analysis / (2*pi)) * q^2 / sqrt(2 * (1 - cos(q))).
+```
+
 Neighbouring over-threshold bins are independent candidates. This is why one line can install several sections at onset; as the 512-sample record fills and the sections feed back into the detector, only the stable line remains.
 
 There are 50 tracks. A candidate matches the first unused track satisfying

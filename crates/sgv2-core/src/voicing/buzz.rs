@@ -240,22 +240,32 @@ impl Run {
         libm::pow(10.0, db / 20.0)
     }
 
-    fn spectrum(&self, bin: usize) -> f64 {
+    fn spectrum(&self, bin: usize) -> (f64, f64) {
         if self.history_len == 0 {
-            return 0.0;
+            return (0.0, bin as f64 * ANALYSIS_RATE / FFT as f64);
         }
         let step = 2.0 * core::f64::consts::PI * bin as f64 / FFT as f64;
         let (ss, cc) = (libm::sin(step), libm::cos(step));
-        let (mut s, mut c, mut re, mut im) = (0.0, 1.0, 0.0, 0.0);
+        let (mut s, mut c, mut re, mut im, mut dre, mut dim) = (0.0, 1.0, 0.0, 0.0, 0.0, 0.0);
         for n in 0..FFT {
             let window =
                 0.5 * (1.0 - libm::cos(2.0 * core::f64::consts::PI * n as f64 / (FFT - 1) as f64)) / (FFT - 1) as f64;
-            let x = self.history[(self.history_at + n) % FFT] as f64 * window;
+            let at = (self.history_at + n) % FFT;
+            let previous = (at + FFT - 1) % FFT;
+            let raw = self.history[at] as f64;
+            let x = raw * window;
+            let difference = (raw - self.history[previous] as f64) * window;
             re += x * c;
             im -= x * s;
+            dre += difference * c;
+            dim -= difference * s;
             (s, c) = (s * cc + c * ss, c * cc - s * ss);
         }
-        2.0 * libm::sqrt(re * re + im * im)
+        let magnitude = libm::sqrt(re * re + im * im);
+        let q = libm::sqrt(dre * dre + dim * dim) / (magnitude + 1.0e-20);
+        let denominator = libm::sqrt(2.0 * (1.0 - libm::cos(q))).max(1.0e-20);
+        let frequency_hz = ANALYSIS_RATE / (2.0 * core::f64::consts::PI) * q * q / denominator;
+        (core::f64::consts::FRAC_1_SQRT_2 * magnitude, frequency_hz)
     }
 
     fn redesign(&mut self, index: usize) {
@@ -306,8 +316,9 @@ impl Run {
         }
         let max_bin = (libm::ceil(self.maximum_hz * FFT as f64 / ANALYSIS_RATE) as usize).min(FFT / 2 - 1);
         let mut amplitudes = [0.0; FFT / 2 + 1];
+        let mut frequencies = [0.0; FFT / 2 + 1];
         for (bin, value) in amplitudes.iter_mut().enumerate().take(max_bin + 2) {
-            *value = self.spectrum(bin);
+            (*value, frequencies[bin]) = self.spectrum(bin);
         }
         let mut used = [false; TRACKS];
         let mut candidates = 0usize;
@@ -318,11 +329,7 @@ impl Run {
             if frequency < MIN_HZ || amplitude <= threshold || !amplitude.is_finite() {
                 continue;
             }
-            let left = amplitudes[bin - 1];
-            let right = amplitudes[bin + 1];
-            let weight = (left + amplitude + right).max(1.0e-30);
-            let refined = ((bin - 1) as f64 * left + bin as f64 * amplitude + (bin + 1) as f64 * right) / weight;
-            let frequency_hz = refined * ANALYSIS_RATE / FFT as f64;
+            let frequency_hz = frequencies[bin];
             if (MIN_HZ..=self.maximum_hz).contains(&frequency_hz) {
                 self.update_track(frequency_hz, (threshold / amplitude).clamp(1.0e-6, 1.0), &mut used);
                 candidates += 1;
