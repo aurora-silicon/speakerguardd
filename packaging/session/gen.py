@@ -54,7 +54,10 @@ def voicing_enabled(board, gate=None):
     Values must be literal JSON booleans; strings never enable a board.
     """
     if gate is None:
-        with open(os.path.join(HERE, "gate.json")) as f:
+        path = os.path.join(HERE, "gate.json")
+        if not os.path.exists(path):
+            path = "/usr/share/speakerguardd/gate.json"
+        with open(path) as f:
             gate = json.load(f)
     return gate.get("voicing_pre", {}).get(board) is True
 
