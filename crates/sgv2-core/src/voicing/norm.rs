@@ -952,7 +952,8 @@ impl Run {
             if self.p.algorithm1 {
                 let y = self.ema as f32;
                 let x = power.max(1e-12) as f32;
-                self.ema = f64::from(y + (1.0 - self.ema_a as f32) * (x - y));
+                let a = self.ema_a as f32;
+                self.ema = f64::from(a * y + (1.0 - a) * x);
             } else {
                 self.ema = self.ema_a * self.ema + (1.0 - self.ema_a) * power.max(1e-12);
             }
