@@ -18,9 +18,10 @@
 //! - fast: the loudest 64-frame level of the call, less a fixed store, held
 //!   and released only once the call sits more than a dead band under it,
 //!   with a release that speeds up over the first seconds of audible program;
-//! - median: the lower median of the last 96 512-frame levels, less a fixed
-//!   store, behind a release limiter that only lets go once the median sits
-//!   more than its dead band under it;
+//! - median: the lower median of the last 96 512-frame levels (the first
+//!   one after a reset is frame 512's), less a fixed store, behind a
+//!   release limiter that only lets go once the median sits more than its
+//!   dead band under it;
 //! - long: a 1001-bin histogram of 4096-frame window levels over -100..0 in
 //!   0.1 dB bins, read as the power mean of the bins above a relative gate
 //!   that trails the histogram's own smoothed energy. Every admitted window
@@ -30,6 +31,9 @@
 //!   expected loudness with one count each.
 //!   A window below the validity floor still emits one slot containing the
 //!   retained reading; the following hold does not skip or reset that slot.
+//! - the long reading reaches the arbitration `LONG_DELAY` long windows
+//!   and one 512-frame block after the window that produced it (the reset
+//!   reading fills the gap);
 //! - the long reading passes a preconditioner against the 512-frame level
 //!   (less its own store): it follows the reading while that level is above
 //!   it and, once the reading overtakes it, holds the level it overtook.
@@ -39,7 +43,8 @@
 //!
 //! Gain law: a 21-node table over -100..+10 in 5.5 dB steps, compiled from
 //! the tuning (target, maximum gain, upward and downward ranges, ratio),
-//! read with linear interpolation. The gain glides toward its target by a
+//! read as a uniform cubic B-spline over the nodes (not by linear
+//! interpolation: the unit rounds the table's knees). The gain glides toward its target by a
 //! tenth of the remaining distance per frame, in dB.
 //!
 //! No tuning value lives here; `aurora-speaker-tuning`'s `voicing::norm`
@@ -159,15 +164,23 @@ impl Params {
         table_ok && expected_ok && timeout_ok && deadband_ok && stable && unused_zero
     }
 
-    /// The table's gain for loudness `l`, dB.
+    /// The table's gain for loudness `l`, dB: a uniform cubic B-spline
+    /// with the nodes as its control points, the end nodes repeated past
+    /// either end of the grid, and `l` clamped to the grid. On a straight
+    /// run of nodes it equals linear interpolation; at a node it reads
+    /// `(left + 4 * node + right) / 6`, so every knee of the table is
+    /// rounded off.
     pub fn gain_db(&self, l: f64) -> f64 {
         let pos = ((l - NODE_LO_DB) / NODE_STEP_DB).clamp(0.0, (NODES - 1) as f64);
-        if pos >= (NODES - 1) as f64 {
-            return self.table[NODES - 1];
-        }
-        let i = pos as usize;
-        let f = pos - i as f64;
-        self.table[i] + f * (self.table[i + 1] - self.table[i])
+        let i = (pos as usize).min(NODES - 2);
+        let t = pos - i as f64;
+        let node = |k: isize| self.table[k.clamp(0, NODES as isize - 1) as usize];
+        let k = i as isize;
+        let (p0, p1, p2, p3) = (node(k - 1), node(k), node(k + 1), node(k + 2));
+        let (t2, t3) = (t * t, t * t * t);
+        let u = 1.0 - t;
+        (u * u * u * p0 + (3.0 * t3 - 6.0 * t2 + 4.0) * p1 + (-3.0 * t3 + 3.0 * t2 + 3.0 * t + 1.0) * p2 + t3 * p3)
+            / 6.0
     }
 }
 
@@ -295,6 +308,12 @@ const MEDIAN_AT: usize = 47;
 /// The long path: a sliding mean of this many 64-frame powers, emitted to
 /// the histogram every eight blocks.
 const WINDOW_LEN: usize = 600;
+/// Long windows between a histogram reading and the arbitration that
+/// first sees it; the reading then joins on the block after that window's
+/// boundary. Measured on the installed unit (its long-path steps land this
+/// many 4096-frame windows and one 512-frame block after a reading is
+/// formed); not yet attributed to a stage of the unit.
+const LONG_DELAY: usize = 2;
 /// Release dead band of the median path, dB, and its time constant, s.
 const MID_DEADBAND_DB: f64 = 5.0;
 const MID_RELEASE_S: f32 = 2.316;
@@ -462,6 +481,13 @@ pub struct Run {
     history: f64,
     /// This call's 512-frame event: level, limited median, long reading.
     pending: Option<(f64, f64, f64)>,
+    /// The last `LONG_DELAY` long readings, oldest at `long_at`, and the
+    /// reading the arbitration sees now.
+    long_line: [f64; LONG_DELAY],
+    long_at: usize,
+    long_out: f64,
+    /// Whether the median has passed its first block since the reset.
+    median_live: bool,
     /// The 512-frame candidate: limited median against the conditioned
     /// long path.
     held: f64,
@@ -499,6 +525,10 @@ impl Run {
             fast: 0.0,
             history: FAST_HISTORY,
             pending: None,
+            long_line: [p.expected_db; LONG_DELAY],
+            long_at: 0,
+            long_out: p.expected_db,
+            median_live: false,
             held: 0.0,
             candidate: 0.0,
             target_db: 0.0,
@@ -529,6 +559,10 @@ impl Run {
         self.fast = e;
         self.history = FAST_HISTORY;
         self.pending = None;
+        self.long_line = [e; LONG_DELAY];
+        self.long_at = 0;
+        self.long_out = e;
+        self.median_live = false;
         self.held = e;
         self.candidate = e;
         self.target_db = self.p.gain_db(e);
@@ -566,20 +600,28 @@ impl Run {
     /// window, and on their own boundaries the long (4096) and median (512)
     /// paths. Every stage takes its first input, so the paths sample frames
     /// 0, 64, ...; 0, 512, ...; 0, 4096, ... of the stream. The long path
-    /// reads the window before the current power joins it.
+    /// reads the window before the current power joins it, and its reading
+    /// joins the 512-frame events `LONG_DELAY` windows and one block later.
     fn on_step(&mut self) {
         let ema = self.ema;
         let db = level(ema);
         self.peak = self.peak.max(db);
         self.events += 1;
-        let mut long = self.long.reading;
+        // the 512-frame event on a long window's own boundary still pairs
+        // with the reading from before it
+        let long = self.long_out;
         if self.steps == 0 && self.blocks == 0 {
             self.window.resum();
-            long = self.long.update(self.window.mean());
+            let reading = self.long.update(self.window.mean());
+            self.long_out = core::mem::replace(&mut self.long_line[self.long_at], reading);
+            self.long_at = (self.long_at + 1) % LONG_DELAY;
         }
         self.window.push(ema);
         if self.steps == 0 {
-            let mid = self.median.push(db);
+            // the median's first level is the block at frame 512; the one at
+            // frame 0 (the reset seed's) never joins it
+            let mid = if self.median_live { self.median.push(db) } else { self.median.limited };
+            self.median_live = true;
             self.pending = Some((db, mid, long));
             self.blocks = (self.blocks + 1) % PER_LONG;
         }
@@ -706,12 +748,24 @@ mod tests {
     }
 
     #[test]
-    fn table_reads_interpolate_and_clamp() {
+    fn table_reads_are_a_clamped_cubic_b_spline() {
         let p = params(0);
-        assert_eq!(p.gain_db(-200.0), p.table[0]);
-        assert_eq!(p.gain_db(50.0), p.table[NODES - 1]);
-        let mid = p.gain_db(NODE_LO_DB + 2.75);
-        assert!((mid - 0.5 * (p.table[0] + p.table[1])).abs() < 1e-12);
+        let t = &p.table;
+        let at = |i: usize| NODE_LO_DB + NODE_STEP_DB * i as f64;
+        // flat ends, clamped past the grid
+        assert!((p.gain_db(-200.0) - t[0]).abs() < 1e-12);
+        assert!((p.gain_db(50.0) - t[NODES - 1]).abs() < 1e-12);
+        // a straight run of nodes (12..14 fall 0.5 dB/dB) reads as the line
+        assert!((p.gain_db(at(13)) - t[13]).abs() < 1e-12);
+        let mid = p.gain_db(at(13) + 2.75);
+        assert!((mid - 0.5 * (t[13] + t[14])).abs() < 1e-12);
+        // the knee at node 11 is rounded: (left + 4 node + right) / 6
+        let knee = (t[10] + 4.0 * t[11] + t[12]) / 6.0;
+        assert!((p.gain_db(at(11)) - knee).abs() < 1e-12);
+        assert!(knee < t[11]);
+        // continuous across a node boundary
+        let e = 1e-9;
+        assert!((p.gain_db(at(11) - e) - p.gain_db(at(11) + e)).abs() < 1e-6);
     }
 
     #[test]
@@ -818,6 +872,38 @@ mod tests {
             assert_eq!(m.update(power_of(-80.0)), before);
         }
         assert_eq!(m.reading, before);
+    }
+
+    #[test]
+    fn the_median_starts_at_the_second_block() {
+        let p = params(0);
+        let mut r = Run::new(&p, 48_000.0, 1);
+        let mut buf = vec![0.3f32; CALL];
+        r.process(&mut [&mut buf], CALL);
+        assert!(r.median.ring.iter().all(|v| *v == p.expected_db));
+        r.process(&mut [&mut buf], CALL);
+        assert_eq!(r.median.ring.iter().filter(|v| **v != p.expected_db).count(), 1);
+        r.reset();
+        r.process(&mut [&mut buf], CALL);
+        assert!(r.median.ring.iter().all(|v| *v == p.expected_db));
+    }
+
+    #[test]
+    fn the_long_reading_reaches_the_arbitration_two_windows_and_a_block_late() {
+        let p = params(0);
+        let mut r = Run::new(&p, 48_000.0, 1);
+        let mut readings = vec![];
+        let mut buf = vec![0.0f32; 4096];
+        for k in 0..12 {
+            // a loud square wave: every window counts and moves the reading
+            buf.iter_mut().enumerate().for_each(|(i, v)| *v = if i % 2 == 0 { 0.3 } else { -0.3 });
+            r.process(&mut [&mut buf], 4096);
+            // chunk k ran the window that starts it (frame 4096 k)
+            readings.push(r.long.reading);
+            let seen = if k < LONG_DELAY { p.expected_db } else { readings[k - LONG_DELAY] };
+            assert_eq!(r.long_out, seen, "window {k}");
+        }
+        assert!(readings[11] > readings[1] + 1.0);
     }
 
     #[test]
