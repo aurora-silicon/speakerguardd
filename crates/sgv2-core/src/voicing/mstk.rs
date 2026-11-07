@@ -618,6 +618,7 @@ pub struct Run {
     detector_phase: [usize; BANDS],
     detector_max: [SlidingMax; BANDS],
     detector_rms: [f64; BANDS],
+    overshoot_rms: [f64; BANDS],
     gain_src: [GainSrc; BANDS],
     state: [[[[f64; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS],
     legacy_high_state: [[[[f64; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
@@ -682,6 +683,7 @@ impl Run {
             detector_phase: [0; BANDS],
             detector_max: [SlidingMax::EMPTY; BANDS],
             detector_rms: [0.0; BANDS],
+            overshoot_rms: [0.0; BANDS],
             gain_src: core::array::from_fn(|b| GainSrc::new(detector_factor[b], fs)),
             state: [[[[0.0; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS],
             legacy_high_state: [[[[0.0; 2]; MAX_FILTERS]; XOVERS]; MAX_CHANNELS],
@@ -697,6 +699,7 @@ impl Run {
         self.detector_max = [SlidingMax::EMPTY; BANDS];
         self.detector_phase = [0; BANDS];
         self.detector_rms = [0.0; BANDS];
+        self.overshoot_rms = [0.0; BANDS];
         for src in &mut self.gain_src {
             src.reset();
         }
@@ -865,8 +868,14 @@ impl Run {
             for (b, p) in detector.into_iter().enumerate() {
                 let update = self.detector_phase[b] == 0;
                 let input = if update {
-                    let mut held = self.window_max(b, p);
-                    if self.algorithm0 {
+                    let mut held = if self.overshoot_compensation {
+                        let alpha = 1.0 / self.detector_window[b] as f64;
+                        self.overshoot_rms[b] += alpha * (p * p - self.overshoot_rms[b]);
+                        libm::sqrt(2.0 * self.overshoot_rms[b])
+                    } else {
+                        self.window_max(b, p)
+                    };
+                    if self.algorithm0 && !self.overshoot_compensation {
                         let alpha = 1.0 / self.detector_window[b] as f64;
                         self.detector_rms[b] += alpha * (p * p - self.detector_rms[b]);
                         let rms = libm::sqrt(2.0 * self.detector_rms[b]).max(1e-12);
@@ -1182,9 +1191,11 @@ mod tests {
     fn reset_clears_the_detector_and_overshoot_bank() {
         let mut run = Run::new(&params(), 48_000.0, 1);
         run.env = [0.25; BANDS];
+        run.overshoot_rms = [0.25; BANDS];
         run.overshoot_state[0][0][0][0] = [0.25; 2];
         run.reset();
         assert_eq!(run.env, [0.0; BANDS]);
+        assert_eq!(run.overshoot_rms, [0.0; BANDS]);
         assert_eq!(run.overshoot_state[0][0][0][0], [0.0; 2]);
     }
 
