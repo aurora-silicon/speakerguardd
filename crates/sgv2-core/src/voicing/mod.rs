@@ -22,7 +22,7 @@
 //! }
 //! pub struct Run { .. }                       // all storage made in new
 //! impl Run {
-//!     pub fn new(p: &Params, fs: f64, channels: usize) -> Run;
+//!     pub fn new(p: &Params, fs: f64, channels: usize, max_frames: usize) -> Run;
 //!     pub fn reset(&mut self);
 //!     pub fn latency(&self) -> usize;         // frames
 //!     pub fn process(&mut self, bufs: &mut [&mut [f32]], frames: usize);

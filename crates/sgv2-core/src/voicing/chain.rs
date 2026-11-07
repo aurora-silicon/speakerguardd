@@ -546,7 +546,7 @@ enum Run {
 }
 
 impl Run {
-    fn new(kind: &Kind, width: usize, fs: f64) -> Run {
+    fn new(kind: &Kind, width: usize, fs: f64, max_frames: usize) -> Run {
         match kind {
             Kind::NonFinite => Run::NonFinite,
             Kind::Sum(out) => Run::Sum(*out),
@@ -554,7 +554,10 @@ impl Run {
             Kind::ParameterAdd(values) => Run::ParameterAdd(values.clone()),
             Kind::ToneGroups { default_mask, variants } => Run::ToneGroups {
                 active: variants.iter().position(|v| v.mask == *default_mask).unwrap_or(0),
-                runs: variants.iter().map(|v| (v.mask, Run::new(&Kind::Tone(v.tone.clone()), width, fs))).collect(),
+                runs: variants
+                    .iter()
+                    .map(|v| (v.mask, Run::new(&Kind::Tone(v.tone.clone()), width, fs, max_frames)))
+                    .collect(),
             },
             Kind::Tone(tone) => {
                 let mut p = PreParams::identity(width);
@@ -586,7 +589,7 @@ impl Run {
             Kind::Buzz(p) => Run::Buzz(alloc::boxed::Box::new(super::buzz::Run::new(p, fs, width))),
             Kind::Cdelay(p) => Run::Cdelay(alloc::boxed::Box::new(super::cdelay::Run::new(p, fs, width))),
             Kind::Lowflow(p) => Run::Lowflow(alloc::boxed::Box::new(super::lowflow::Run::new(p, fs, width))),
-            Kind::Vbass(p) => Run::Vbass(alloc::boxed::Box::new(super::vbass::Run::new(p, fs, width))),
+            Kind::Vbass(p) => Run::Vbass(alloc::boxed::Box::new(super::vbass::Run::new(p, fs, width, max_frames))),
             Kind::Vareq(p) => Run::Vareq(alloc::boxed::Box::new(super::vareq::Run::new(p, fs, width))),
             Kind::Norm(p) => Run::Norm(alloc::boxed::Box::new(super::norm::Run::new(p, fs, width))),
             Kind::Volt(p) => Run::Volt(alloc::boxed::Box::new(super::volt::Run::new(p, fs, width))),
@@ -800,7 +803,7 @@ impl Chain {
             return None;
         }
         let max_frames = max_frames.max(1);
-        let runs = spec.nodes.iter().map(|n| Run::new(&n.kind, n.inputs.len(), fs)).collect();
+        let runs = spec.nodes.iter().map(|n| Run::new(&n.kind, n.inputs.len(), fs, max_frames)).collect();
         let out = spec.nodes.iter().map(|n| vec![vec![0.0; max_frames]; n.inputs.len()]).collect();
         let scratch = vec![vec![0.0; max_frames]; MAX_CHANNELS];
         let mut c = Chain { spec, runs, out, scratch, max_frames };
