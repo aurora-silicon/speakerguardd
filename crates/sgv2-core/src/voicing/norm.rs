@@ -18,7 +18,7 @@
 //! - fast: the loudest 64-frame level of the call, less a fixed store, held
 //!   and released only once the call sits more than a dead band under it,
 //!   with a release that speeds up over the first seconds of audible program;
-//! - median: the lower median of the last 96 512-frame levels (the first
+//! - median: the upper median of the last 96 512-frame levels (the first
 //!   one after a reset is frame 512's), less a fixed store, behind a
 //!   release limiter that only lets go once the median sits more than its
 //!   dead band under it;
@@ -295,16 +295,17 @@ impl LongTerm {
 /// Per-sample smoothing of the summed detector power, s.
 const EMA_S: f64 = 0.030;
 /// The unit's level stores, dB: added to the call's loudest 64-frame level
-/// (the fast path), to the lower median (the median path), and to the
+/// (the fast path), to the median (the median path), and to the
 /// 512-frame level that competes with the long path.
 const FAST_STORE_DB: f64 = -8.0;
 const MEDIAN_STORE_DB: f64 = -5.0;
 const COMPETITOR_STORE_DB: f64 = -2.0;
 /// The median path (the unit asks for 0.5 s of 512-frame levels and rounds
 /// its backing store up to an even length): this many 512-frame levels, read at this sorted index
-/// (the lower median).
+/// (the upper median: after a short burst the unit's median sits one rank
+/// higher on the burst's decay than the lower median would).
 const MEDIAN_LEN: usize = 96;
-const MEDIAN_AT: usize = 47;
+const MEDIAN_AT: usize = 48;
 /// The long path: a sliding mean of this many 64-frame powers, emitted to
 /// the histogram every eight blocks.
 const WINDOW_LEN: usize = 600;
