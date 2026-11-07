@@ -129,7 +129,13 @@ pub fn temperature_candidate(
         return 1.0;
     }
     let width = hard - soft;
-    let knee = soft + width * (1.0 - libm::expf(-(tpk - soft) / width.max(1e-15)));
+    let arg = -(tpk - soft) / width.max(1e-15);
+    // The native expf is correctly rounded on this candidate domain.  The
+    // public Rust libm expf differs by a ULP for a few inputs; evaluating its
+    // binary32 argument in binary64 and rounding once reproduces the native
+    // binary32 result without a captured table.
+    let e = libm::exp(arg as f64) as f32;
+    let knee = soft + width * (1.0 - e);
     // the second strict guard: in binary32 the goal can reach the peak
     if tpk <= knee {
         return 1.0;
