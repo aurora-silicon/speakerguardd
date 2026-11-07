@@ -987,6 +987,13 @@ pub struct Run {
     audio_quadrature: [QuadratureEnvelope; MAX_CHANNELS],
     mode4_gain: [Mode4Gain; BANDS],
     hop_peak: bool,
+    /// Algorithm 0 processes band 0 at a reduced, crossover-dependent rate
+    /// (images at multiples of fs/M in the installed unit, M growing as the
+    /// lowest crossover falls). Until that multirate path is ported, band 0
+    /// of algorithm 0 keeps the previous law: real gain on the analytic
+    /// audio pair, Butterworth-half analytic detector, ten-millisecond
+    /// trailing maximum.
+    previous_band0: bool,
     detector_hop: [f64; BANDS],
     gain_src: [GainSrc; BANDS],
     state: [[[[f64; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS],
@@ -1030,7 +1037,12 @@ impl Run {
         // first three arms. The direct fourth band keeps its one-millisecond
         // window. At the fixed eight-frame cadence this is 11/13/25 updates
         // at 44.1/48/96 kHz for bands zero through two.
-        let window_ms = if cadence(q) == Cadence::HopPeak { [2.0, 2.0, 2.0, 1.0] } else { [10.0, 8.0, 2.0, 1.0] };
+        let previous_band0 = cadence(q) == Cadence::HopPeak && q.algorithm == 0;
+        let window_ms = if cadence(q) == Cadence::HopPeak {
+            [if previous_band0 { 10.0 } else { 2.0 }, 2.0, 2.0, 1.0]
+        } else {
+            [10.0, 8.0, 2.0, 1.0]
+        };
         let detector_window = core::array::from_fn(|b| {
             ((libm::round(window_ms[b] * fs / (1000.0 * detector_factor[b] as f64)) as usize) | 1)
                 .clamp(1, MAX_DETECTOR_WINDOW)
@@ -1074,6 +1086,7 @@ impl Run {
             audio_quadrature: [QuadratureEnvelope::default(); MAX_CHANNELS],
             mode4_gain: core::array::from_fn(|_| Mode4Gain::new(fs)),
             hop_peak: cadence(q) == Cadence::HopPeak,
+            previous_band0,
             detector_hop: [0.0; BANDS],
             gain_src: core::array::from_fn(|b| GainSrc::new(detector_factor[b], fs)),
             state: [[[[0.0; 2]; MAX_FILTERS]; BANDS]; MAX_CHANNELS],
@@ -1272,7 +1285,9 @@ impl Run {
                 v = o;
             }
             let scale = self.band_in[b] * self.detector_bandwidth[b];
-            let magnitude = if self.hop_peak {
+            let magnitude = if self.hop_peak && self.previous_band0 && b == 0 {
+                self.quadrature[c][b].push(v)
+            } else if self.hop_peak {
                 let band = Self::run_detector_path(&self.analytic_band_path[b], &mut self.analytic_band_state[c][b], x);
                 let reference = Self::run_detector_path(
                     &self.analytic_reference_path[b],
@@ -1442,7 +1457,7 @@ impl Run {
                 let mut processed = [0.0; BANDS];
                 for b in 0..BANDS {
                     processed[b] = if self.hop_peak {
-                        let output = if b + 1 == BANDS {
+                        let output = if b + 1 == BANDS || (self.previous_band0 && b == 0) {
                             mode4[b].apply_direct(bands_a[c][b], bands_b[c][b])
                         } else {
                             mode4[b].apply(bands_a[c][b], bands_b[c][b])
