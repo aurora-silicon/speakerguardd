@@ -26,9 +26,9 @@
 //!   smooths the requested dB gain reduction before applying it. The box runs
 //!   it after harmonic gain and before the upper edge's second Butterworth
 //!   half (see [`law`]).
-//! - `SUB` band-limits the mid branches (a low pass designed at a quarter
-//!   of the rate); each odd-order band-edge all-pass adds one frame of
-//!   output latency and a further branch delay.
+//! - `SUB` band-limits the mid branch before decimation and after zero
+//!   insertion with a matched low-pass pair; each odd-order band-edge
+//!   all-pass adds one frame of output latency and a further branch delay.
 //! - The side signal only ever takes the high-pass path: stereo width is
 //!   untouched, and the bass is folded to the mid.
 //!
@@ -350,10 +350,10 @@ pub mod law {
     pub const COMP_HOLD_RATIO: f64 = 0.9;
     pub const COMP_SMOOTH_S: f64 = 0.05;
     /// The mid branches run at the selected rate (SPEC-vben §3): the
-    /// crossover low pass at the stream rate, every `fs / SUB_RATE_HZ`-th
-    /// frame taken, the
-    /// rest at the selected rate, then zero insertion and an elliptic
-    /// reconstruction low pass at the stream rate.
+    /// crossover low pass at the stream rate, an elliptic anti-alias low
+    /// pass, every `fs / SUB_RATE_HZ`-th frame taken, the rest at the
+    /// selected rate, then zero insertion and the same elliptic low pass
+    /// for reconstruction at the stream rate.
     pub const SUB_RATE_HZ: f64 = 8_000.0;
     pub const RECON_ORDER: usize = 7;
     pub const RECON_RIPPLE_DB: f64 = 1.0;
@@ -604,6 +604,12 @@ pub struct Run {
     /// Crossover low pass of the mid, at the stream rate.
     lp: Cascade,
     lp_st: CascadeState,
+    /// The selected-rate branch is anti-aliased before taking every
+    /// `stride`th sample.  The box uses the same low-pass design here and
+    /// after zero insertion; omitting this first half leaves steady tones
+    /// almost unchanged but advances the harmonic onset at level steps.
+    anti_alias: Cascade,
+    anti_alias_st: CascadeState,
     /// Selected rate: both band-edge all-passes (blend), the band's lower
     /// edge with the first half of its upper edge, then the second half.
     ap: Cascade,
@@ -652,6 +658,8 @@ impl Run {
         band_hp.extend(&butterworth(nu, p.fu_hz, fs8, Kind::Low));
         let band_lp = butterworth(nu, p.fu_hz, fs8, Kind::Low);
         let latency = nu % 2 + nl % 2;
+        let selected_rate_filter =
+            elliptic(law::RECON_ORDER, law::RECON_RIPPLE_DB, law::RECON_STOP_DB, law::RECON_EDGE_HZ, fs);
         Run {
             p: p.clone(),
             fs,
@@ -660,6 +668,8 @@ impl Run {
             hp_st: vec![CascadeState::default(); channels],
             lp,
             lp_st: CascadeState::default(),
+            anti_alias: selected_rate_filter.clone(),
+            anti_alias_st: CascadeState::default(),
             ap,
             ap_st: CascadeState::default(),
             band_hp,
@@ -675,7 +685,7 @@ impl Run {
             spos: 0,
             sdelay: latency,
             phase: 0,
-            recon: elliptic(law::RECON_ORDER, law::RECON_RIPPLE_DB, law::RECON_STOP_DB, law::RECON_EDGE_HZ, fs),
+            recon: selected_rate_filter,
             recon_st: CascadeState::default(),
             latency,
             oline: vec![[0.0; OUT_LINE]; channels],
@@ -688,6 +698,7 @@ impl Run {
             *s = CascadeState::default();
         }
         self.lp_st = CascadeState::default();
+        self.anti_alias_st = CascadeState::default();
         self.ap_st = CascadeState::default();
         self.band_hp_st = CascadeState::default();
         self.band_lp_st = CascadeState::default();
@@ -785,6 +796,7 @@ impl Run {
             }
             mid /= ch as f64;
             let lo = self.lp.run(&mut self.lp_st, mid);
+            let lo = self.anti_alias.run(&mut self.anti_alias_st, lo);
             let up = if self.phase == 0 { self.sub_frame(lo) * self.stride as f64 } else { 0.0 };
             self.phase = (self.phase + 1) % self.stride;
             let common = self.recon.run(&mut self.recon_st, up);
