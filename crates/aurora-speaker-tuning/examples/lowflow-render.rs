@@ -14,6 +14,7 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let (mut root, mut aid, mut input, mut output) = (None, None, None, None);
     let (mut volume, mut block, mut inspect) = (0.0, 256usize, false);
+    let mut dump_words = None;
     while let Some(arg) = args.next() {
         let mut value = || args.next().expect("missing argument value");
         match arg.as_str() {
@@ -24,6 +25,7 @@ fn main() {
             "--volume" => volume = value().parse::<f64>().expect("volume dB"),
             "--block" => block = value().parse::<usize>().expect("block frames"),
             "--inspect" => inspect = true,
+            "--dump-words" => dump_words = Some(value()),
             other => panic!("unknown argument {other}"),
         }
     }
@@ -35,6 +37,14 @@ fn main() {
     let params =
         lowflow::compile(stage, 48_000.0, &mut diagnostics).expect("compile LowFlow").expect("LowFlow is bypassed");
     let channels = stage.channels.expect("known channel count") as usize;
+    if let Some(path) = dump_words {
+        // Little-endian f64 parameter words for offline analysis tools.
+        let mut words = vec![0.0; sgv2_core::voicing::lowflow::Params::WORDS];
+        params.to_words(&mut words);
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        std::fs::write(path, bytes).expect("write words");
+        return;
+    }
     if inspect {
         for (index, model) in params.models[..params.model_count].iter().enumerate() {
             eprintln!(
