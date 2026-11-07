@@ -863,7 +863,10 @@ struct DynamicRun {
     held: f32,
     control: ControlFilter,
     envelope: f64,
+    curve_samples: [f32; DYNAMIC_CURVE_POINTS],
 }
+
+const DYNAMIC_CURVE_POINTS: usize = 44;
 
 /// Frames per control-filter call; a multiple of the filter's group.
 const CONTROL_CHUNK: usize = 64;
@@ -919,6 +922,7 @@ impl DynamicRun {
             held: 1.0,
             control: ControlFilter::new(&Self::lowpass(20.0, f64::from(0.707f32), fs)),
             envelope: 0.0,
+            curve_samples: Self::curve_samples(params),
         }
     }
 
@@ -931,6 +935,7 @@ impl DynamicRun {
         self.detector = fresh.detector;
         self.detector_filter.set(&fresh.detector);
         self.component = fresh.component;
+        self.curve_samples = fresh.curve_samples;
         self.quadrature = fresh.quadrature;
         self.quadrature_filter[0].set(&fresh.quadrature[0]);
         self.quadrature_filter[1].set(&fresh.quadrature[1]);
@@ -975,8 +980,10 @@ impl DynamicRun {
         output
     }
 
-    fn curve(params: &DynamicFilter, level: f64) -> f32 {
-        const POINTS: usize = 44;
+    /// This table depends only on the configured law, not the detector
+    /// level. Build it at construction and automation updates, retaining the
+    /// original Float32 grid accumulation and exponential rounding.
+    fn curve_samples(params: &DynamicFilter) -> [f32; DYNAMIC_CURVE_POINTS] {
         const STEP: f32 = 100.0 / 43.0;
         // ToneMeister builds and evaluates this spline entirely in
         // Float32. In particular, it does not clamp the polynomial result:
@@ -987,13 +994,18 @@ impl DynamicRun {
         let lo = (params.range_db as f32).min(0.0);
         let hi = (params.range_db as f32).max(0.0);
         let threshold = params.threshold_db as f32;
-        let mut samples = [0.0f32; POINTS];
+        let mut samples = [0.0f32; DYNAMIC_CURVE_POINTS];
         let mut level_db = -100.0f32;
         for sample in &mut samples {
             let gain_db = ((level_db - threshold) * slope).clamp(lo, hi);
             *sample = libm::expf(gain_db * (core::f32::consts::LN_10 / 20.0));
             level_db += STEP;
         }
+        samples
+    }
+
+    fn curve(&self, level: f64) -> f32 {
+        let samples = &self.curve_samples;
         let db = 20.0 * libm::log10f((level as f32).clamp(1e-5, 1.0));
         let x = ((db + 100.0) * 0.43).max(0.0);
         let raw_index = x as usize;
@@ -1052,7 +1064,7 @@ impl DynamicRun {
             let coefficient =
                 if time_ms <= 0.0 { 0.0 } else { libm::exp(-(frames as f64) / (time_ms * self.fs / 1_000.0)) };
             self.envelope += (1.0 - coefficient) * (measured - self.envelope);
-            self.held = Self::curve(&at.params, self.envelope);
+            self.held = self.curve(self.envelope);
         }
         let mut gain = [0.0f32; CONTROL_CHUNK];
         let mut from = 0;
@@ -1070,7 +1082,7 @@ impl DynamicRun {
                 for k in 0..len {
                     if self.control_phase == 0 {
                         self.envelope = f64::from(libm::sqrtf(a[k] * a[k] + b[k] * b[k]));
-                        self.held = Self::curve(&at.params, self.envelope);
+                        self.held = self.curve(self.envelope);
                     }
                     self.control_phase = (self.control_phase + 1) & 15;
                     gain[k] = self.held;
@@ -1940,9 +1952,13 @@ mod tests {
         let held = run.held;
         let envelope = run.envelope;
 
+        let original_curve = run.curve_samples;
         let mut moved = at.params;
         moved.frequency_hz = 1_200.0;
+        moved.threshold_db -= 6.0;
         run.reconfigure(&moved, 48_000.0);
+        assert_ne!(run.curve_samples, original_curve);
+        assert_eq!(run.curve_samples, DynamicRun::new(&moved, 48_000.0).curve_samples);
         assert_eq!(run.detector_filter.history, detector_history);
         assert_eq!(run.component_state, component_state);
         assert_eq!([run.quadrature_filter[0].history, run.quadrature_filter[1].history], quadrature_history);

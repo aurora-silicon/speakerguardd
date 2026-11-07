@@ -30,6 +30,10 @@ No tolerance is needed for the optimizations below:
   and the delay still run in their original order. The detector law retains
   its processing. The feature is fixed when compiling, so detector history
   cannot become observable through a runtime mode switch.
+* A level-dependent ToneMeister slot builds its 44-point Float32 response
+  table at construction and parameter updates. Detector updates evaluate
+  that cached table with the original spline arithmetic. Automation refreshes
+  the table while retaining all running histories.
 * The multiband gain interpolator visits only the phase's nonzero input
   slots. The same coefficients and stored gains are multiplied and summed
   in the same order, from a positive-zero accumulator. It omits products
