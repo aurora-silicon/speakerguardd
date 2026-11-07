@@ -79,14 +79,20 @@ class SweepCoverage(unittest.TestCase):
             path.write_bytes(plistlib.dumps(db))
             self.assertEqual(len(sweep.configurations(root, 123)[0]), 5)
 
-    def test_unreferenced_strip_is_explicit(self):
+    def test_unreferenced_strip_is_actually_selected_for_every_general_route(self):
         with tempfile.TemporaryDirectory(dir=sweep.inv.REPO) as tmp:
             root = Path(tmp)
             base = self.make_root(root)
             (base / 'Strips/builtin_speaker_orphan.austrip').write_bytes(b'private')
-            variants, _, _, disk = sweep.configurations(root, 123)
+            variants, configs, strips, disk = sweep.configurations(root, 123)
             self.assertEqual(disk, 4)
-            self.assertEqual(variants[-1]['discovery_error'], 'speaker-strip-unreferenced')
+            self.assertEqual(strips, 4)
+            orphans = [v for v in variants if v.get('unreferenced_strip')]
+            self.assertEqual(len(orphans), 2)
+            self.assertEqual(sum(len(v['names']) for v in variants), configs)
+            for variant in orphans:
+                hardware = variant['config']['Output'][0]['Hardware']
+                self.assertTrue(next(h['Path'] for h in hardware if h['Type'] == 'AUStrip').endswith('speaker_orphan.austrip'))
 
     def test_probe_failure_still_executes_four_cli_attempts(self):
         commands = []

@@ -42,8 +42,11 @@ control and is included in the total. Each forced route uses a private copy
 of the selection database: one entry named General, vendor selector made
 neutral, original hardware mapping and substitutions retained. Graph, strip
 and property bytes are unchanged. This measures route compiler support;
-it does not test automatic runtime vendor selection. Unreferenced speaker
-strips get an explicit discovery refusal rather than a guessed pairing.
+it does not test automatic runtime vendor selection. Each disk speaker strip
+absent from the database is also compiled against every distinct General
+hardware mapping, substituting only the strip path. These explicitly labelled
+forced-strip cases measure retained variants and are not claimed macOS
+configurations. No vendor ID, board rule or tuning value is invented.
 
 When newer graph parameter-link syntax refuses parsing, the observer can omit
 parameter/property declarations and links solely while extracting box/unit/channel metadata.

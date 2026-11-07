@@ -65,12 +65,26 @@ def configurations(root, aid):
     variants += [routes[key] for key in sorted(routes)]
     referenced = set().union(*(v['strips'] for v in variants))
     disk = {str(p.relative_to(root)) for p in (root / aname / 'DSP/Strips').glob('*speaker*.austrip')}
-    if disk - referenced:
-        # No guessed graph/strip pairing: an orphan is an explicit discovery
-        # refusal and still gets actual compiler attempts using the source root.
-        variants.append({'discovery_error': 'speaker-strip-unreferenced', 'original': True,
-                         'config': None, 'names': [], 'strips': disk - referenced})
-    return variants, len(db), len(referenced), len(disk)
+    # Some releases retain vendor strips the database no longer selects.
+    # Exercise each against every distinct General hardware mapping rather
+    # than silently omitting it or inventing a vendor/board selector. These
+    # are explicit forced-strip tests, not claimed macOS configurations.
+    generals = [v for v in variants[1:] if any('General' in n for n in v['names'])]
+    if disk - referenced and not generals:
+        raise ValueError('unreferenced speaker strips but no General hardware mapping')
+    for strip in sorted(disk - referenced):
+        for general in generals:
+            config = copy.deepcopy(general['config'])
+            replaced = 0
+            for output in config.get('Output', []):
+                for hardware in output.get('Hardware', []):
+                    if hardware.get('Type') == 'AUStrip':
+                        hardware['Path'] = strip
+                        replaced += 1
+            if replaced != 1:
+                raise ValueError('General mapping has no unique strip')
+            variants.append({'config': config, 'names': [], 'strips': {strip}, 'unreferenced_strip': True})
+    return variants, len(db), len(referenced | disk), len(disk)
 
 
 def fixture(root, aid, variant, dest):
@@ -225,6 +239,7 @@ def sweep(root, aids, private, binaries, programs):
             features = measure(selected, aid, vp / 'execution', binaries, variant.get('discovery_error'), programs)
             measured.append({'variant': i, 'default_selection': i == 0,
                               'selection_kind': 'default-control' if i == 0 else
+                              'unreferenced-strip' if variant.get('unreferenced_strip') else
                               'diagnostic' if variant.get('names') and all('Diagnostic' in n for n in variant['names']) else 'speaker',
                               'configuration_count': len(variant.get('names', [])),
                               'strip_count': len(variant.get('strips', [])), 'features': features})
@@ -287,7 +302,7 @@ def assemble(rows, revision):
                               **dict(reason_categories[k])} for k, v in sorted(rollup.items())},
             'definitions': {
                 'refusals': 'Refused CLI invocations or explicit discovery-refusal attempts, across selections x 2 builds x 2 modes. rc preserves actual CLI status. Reason counts are emitted errors; one invocation can emit multiple errors.',
-                'selections': 'Original default selection plus every distinct database Output/UnderlyingDeviceProperties mapping, including Diagnostic. Identical mappings are executed once; configuration_count retains multiplicity.',
+                'selections': 'Original default selection plus every distinct database Output/UnderlyingDeviceProperties mapping, including Diagnostic. Identical mappings are executed once; configuration_count retains multiplicity. Each disk speaker strip absent from the database is additionally tested against every distinct General hardware mapping; these forced-strip cases are not claimed macOS configurations.',
                 'stubs': 'Actual full-chain compiler stubs, once per selection/build; no double-count per CLI mode. A failed chain emits no stubs and is a refusal, never proof of stub-free support.',
                 'bounds': 'Distinct instrumented (box, reason) hits, once per selection/build during deterministic quiet/loud/release offline rendering.',
                 'todo_spec': 'Emitted TODO(SPEC) diagnostics across the four CLI calls per selection. Source-only TODOs are excluded.',
