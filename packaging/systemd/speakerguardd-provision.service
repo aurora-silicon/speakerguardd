@@ -16,7 +16,7 @@ ConditionPathExists=/proc/device-tree/compatible
 
 [Service]
 Type=oneshot
-ExecCondition=/usr/libexec/speakerguardd/speakerguardd-gate v2
+ExecCondition=/usr/libexec/speakerguardd/speakerguardd-gate prepare
 ExecStart=/usr/libexec/speakerguardd/speakerguardd-provision run
 StateDirectory=speakerguardd
 StateDirectoryMode=0755
