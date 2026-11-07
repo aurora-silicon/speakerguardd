@@ -330,13 +330,10 @@ pub mod law {
     pub const LC_HOLD_S: f64 = 0.5;
     pub const LC_HOLD_RATIO: f64 = 0.9;
     pub const LC_SMOOTH_S: f64 = 0.5;
-    /// Never-louder margin on the hold-restart test (not part of macOS's
-    /// law): this box's arithmetic is not bit-identical to macOS's, so a
-    /// near-tie restart could fall either way. The input follower restarts
-    /// its hold only clearly above the ratio (it then releases no later than
-    /// macOS's), the output follower already slightly below it (it then
-    /// releases no earlier): a tie always resolves to the quieter output.
-    pub const LC_HOLD_MARGIN: f64 = 1e-3;
+    /// Retained envelope and smoothing stores start at this linear level on
+    /// construction and reset.  The follower floor is applied later, at the
+    /// two level-control divisions; it is not the state seed.
+    pub const LC_SEED: f64 = 1e-3;
     /// Harmonic compressor. The detector converts `abs(x) + epsilon` to dB,
     /// computes a conventional soft-knee gain-reduction request, then runs
     /// that non-negative request through the same peak-follower topology as
@@ -498,8 +495,8 @@ impl Follower {
         Follower {
             ratio: ratio as f32,
             tie: f32::INFINITY,
-            e: 0.0,
-            s: 0.0,
+            e: law::LC_SEED as f32,
+            s: law::LC_SEED as f32,
             held: 0,
             hold: (hold_s as f32 * fs) as usize + 1,
             a_att: pole(attack_s),
@@ -587,10 +584,7 @@ struct LevelControl {
 
 impl LevelControl {
     fn new(fs: f64) -> LevelControl {
-        LevelControl {
-            input: Follower::new(fs, law::LC_HOLD_RATIO * (1.0 + law::LC_HOLD_MARGIN)),
-            output: Follower::new(fs, law::LC_HOLD_RATIO * (1.0 - law::LC_HOLD_MARGIN)),
-        }
+        LevelControl { input: Follower::new(fs, law::LC_HOLD_RATIO), output: Follower::new(fs, law::LC_HOLD_RATIO) }
     }
 }
 
@@ -959,6 +953,8 @@ mod tests {
     #[test]
     fn level_control_holds_then_releases() {
         let mut f = Follower::new(48_000.0, law::LC_HOLD_RATIO);
+        assert_eq!(f.e, law::LC_SEED as f32);
+        assert_eq!(f.s, law::LC_SEED as f32);
         for _ in 0..4_800 {
             f.run(1.0);
         }
