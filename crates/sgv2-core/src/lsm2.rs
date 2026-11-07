@@ -1230,7 +1230,7 @@ impl ProtectedPeak {
     }
 }
 
-/// The input power/temperature current model: binary32 state and output.
+/// The input power-path current model: binary32 state and output.
 #[derive(Clone, Copy, Default)]
 struct Current {
     b: [f32; 3],
@@ -1582,7 +1582,7 @@ struct Chan {
     // Temperature axis (residuals 2): the input model, unattenuated, on
     // the input's own current model; its temperature points by global
     // substep (ring), the newest at `tn - 1`.
-    tin_cur: Current,
+    tin_cur: MonitorCurrent,
     /// One thermal substep of `u*i` products (monitor sum).
     power_work: Vec<f32>,
     tp_vc: f32,
@@ -1988,7 +1988,7 @@ impl Run {
                 cur_in: cur,
                 pbar_in: [0.0; 4],
                 p_sub: [0.0; SUBSTEPS],
-                tin_cur: cur,
+                tin_cur: monitor_cur,
                 power_work: vec![0.0; sub],
                 tp_vc: 0.0,
                 tp_mg: 0.0,
@@ -2203,11 +2203,11 @@ impl Run {
                 let mw = c.vwin.len();
                 c.vwin[mw - ctl + i] = c.mvel.step(vfs * xin[i] as f64) as f32;
             }
-            // the input temperature model, unattenuated (residuals 2)
-            let ut = c.vfs * xin[i];
-            let it = c.tin_cur.step(ut);
-            c.power_work[i % sub] = ut * it;
+            // the input temperature model, unattenuated (residuals 2): the
+            // same bulk current model and substep reduction as the monitor
+            c.power_work[i % sub] = c.vfs * xin[i];
             if (i + 1) % sub == 0 {
+                c.tin_cur.power_products_in_place(&mut c.power_work);
                 let p = (vdsp_sve_slice(&c.power_work) / sub as f32).max(0.0);
                 c.tp_vc = c.br_vc.step(c.tp_vc, p);
                 c.tp_mg = c.br_mg.step(c.tp_mg, p);
