@@ -15,9 +15,9 @@
 //! per-bin gains (immediate attack, saved release) scale the square-root Hann
 //! analysis spectrum before overlap-add. A separate detector transforms a
 //! `latency + 128` frame sliding history through a unit-energy Hann. It
-//! applies the saved LF/HF response magnitudes, reduces squared magnitudes on
-//! the unit's 99-band grid, and smooths the resulting linked mask level. The
-//! detector reads the input lanes before the fixed output delay.
+//! applies the saved tweeter-response magnitude, reduces squared magnitudes
+//! on the unit's 99-band grid, and smooths the resulting linked mask level.
+//! The velocity detector independently reads current LF.
 //!
 //! The optional `lowflow-conservative` compile feature is deliberately not an
 //! exact-law claim. It applies a fixed ceiling 6 dB below the saved
@@ -1127,7 +1127,7 @@ impl Run {
                         if c + self.models < channels { finite(bufs[c + self.models][frame]) } else { 0.0 };
                     let woofer = f64::from(woofer_sample);
                     let state = &mut self.state[c];
-                    state.mask.push(woofer_sample, tweeter_sample);
+                    state.mask.push(0.0, tweeter_sample);
                     let velocity = state.cone.run(woofer) + state.front.run(woofer);
                     state.velocity_block_energy += velocity * velocity;
                     state.velocity_block_frames += 1;
