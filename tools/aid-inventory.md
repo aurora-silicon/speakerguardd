@@ -72,3 +72,17 @@ Run the synthetic privacy/classification checks on the build host with:
 ```sh
 python3 tools/test_aid_inventory.py
 ```
+
+When only a subset of reference inputs is available, the report assembler
+keeps unexecuted AIDs explicit and never counts source-loading failures as
+AID refusals:
+
+```sh
+python3 tools/aid-inventory-merge.py --catalogue STRUCTURAL_CATALOGUE.json \
+  --measured FIRST_REPORT.json --measured SECOND_REPORT.json --out-dir REPORT_DIR
+```
+
+Its inputs are the public-safe inventory JSON reports and a structural
+catalogue with release membership, reference/newer declarations and optional
+saved-control metadata. It rejects conflicting measured rows and preserves
+the distinction between actual execution and declarations alone.
