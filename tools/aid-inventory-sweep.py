@@ -132,6 +132,7 @@ def why(message):
     # Public-source literal diagnostic phrases only. Unknown text stays private.
     more = [
         ('output saturation mode/flavor/version', 'LAW-cfrk-saturation-flavor'),
+        ('the high-pass is on (not carried)', 'LAW-cfrk-highpass'),
         ('filter type 9 is not carried', 'LAW-vrq2-filter-type9'),
         ('active BuzzKill detector/envelope law', 'LAW-buzk-detector-envelope'),
         ('mono VirtBass width law', 'LAW-vben-mono-width'),
