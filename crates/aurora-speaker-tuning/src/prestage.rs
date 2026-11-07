@@ -37,6 +37,7 @@
 //! | 7 | a constant tilt, from `-gain` to `+gain` around the slot frequency | the decoded complementary biquad pair |
 //! | 14 | resonant second-order high-pass; gain and order are ignored | bilinear high-pass with the saved analog-decay quality convention |
 //! | 15 | a level-dependent notch | saved detector, range, ratio, threshold and attack/release law |
+//! | 17 | a level-dependent low shelf | saved detector, range, ratio, threshold and attack/release law |
 //! | 18 | a level-dependent high shelf | saved detector, range, ratio, threshold and attack/release law |
 //!
 //! The level-dependent slots (15, 18) run after every static slot of the
@@ -753,6 +754,7 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics, mode: Rea
         }
         let dynamic_kind = match kind_value as i64 {
             15 => Some(DynamicKind::Notch),
+            17 => Some(DynamicKind::LowShelf),
             18 => Some(DynamicKind::HighShelf),
             _ => None,
         };
@@ -870,7 +872,7 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics, mode: Rea
                 .filter(|&j| {
                     let state = get(SLOT_BASE + SLOT_STRIDE * j);
                     let kind = get(SLOT_BASE + SLOT_STRIDE * j + 1);
-                    state != 0.0 && (kind == 15.0 || kind == 18.0)
+                    state != 0.0 && (kind == 15.0 || kind == 17.0 || kind == 18.0)
                 })
                 .count() as u32;
             let attack = get(616 + 3 * in_use);
@@ -879,7 +881,12 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics, mode: Rea
             if !(0.0..=65535.0).contains(&sidechain_mask) || sidechain_mask.fract() != 0.0 {
                 return Err(bad(format!("{ctx}: slot {i} sidechain mask {sidechain_mask}")));
             }
-            if !(-30.0..=0.0).contains(&gain)
+            let range_ok = if dynamic_kind == DynamicKind::LowShelf {
+                (-30.0..=30.0).contains(&gain)
+            } else {
+                (-30.0..=0.0).contains(&gain)
+            };
+            if !range_ok
                 || !f0.is_finite()
                 || q <= 0.0
                 || !q.is_finite()
@@ -895,6 +902,17 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics, mode: Rea
                 )));
             }
             need_freq("level-dependent filter", f0)?;
+            // A positive type-17 range is a loudness boost. The exact
+            // voicing chain carries it; the protection pre-stage omits it,
+            // which is the least-passing setting over the slot's law.
+            if dynamic_kind == DynamicKind::LowShelf && gain > 0.0 && mode == Realise::LeastPassing {
+                diags.info(
+                    "prestage-dynamic-filter",
+                    ctx.clone(),
+                    format!("slot {i}: positive level-dependent low shelf omitted from the least-passing pre-stage"),
+                );
+                continue;
+            }
             let sidechain_bits = sidechain_mask as u32;
             p.dynamics.push(PartDynamic {
                 slot: i,
@@ -1820,6 +1838,14 @@ mod tests {
         let ph = part(&high_cut, 0, fs, &mut d).unwrap();
         assert_eq!((ph.sections.len(), ph.dynamics.len()), (0, 1));
         assert_eq!(ph.dynamics[0].params.kind, DynamicKind::HighShelf);
+        let low_boost = tmst(&[(20, -14.695)], &[(0, [3.0, 17.0, 18.0, 400.0, 4.209, 2.5, 3.0, 0.0])]);
+        // The protection pre-stage omits a boost; the exact voicing box
+        // carries type 17 and its sidechain law.
+        assert!(part(&low_boost, 0, fs, &mut d).unwrap().dynamics.is_empty());
+        let (low_tone, partial) = voicing_tone(&low_boost, 2, true, fs, &mut d).unwrap();
+        assert!(partial.is_empty());
+        assert_eq!(low_tone.dynamic.len(), 1);
+        assert_eq!(low_tone.dynamic[0].params.kind, DynamicKind::LowShelf);
         // Attack/release/smoothing triplets follow the level-dependent slots
         // in use, in order: slot 5 is the second such slot (619..621); an
         // unused level-dependent slot does not take a triplet.
