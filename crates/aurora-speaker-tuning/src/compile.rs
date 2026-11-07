@@ -332,7 +332,16 @@ pub fn compile_voicing_with(
     }?;
     let chain = crate::voicing::chain::compile(t, c.sample_rate as f64, diags)?;
     if !chain.stubs.is_empty() || !chain.unwired.is_empty() {
-        return Err(bad("the voicing chain has unimplemented boxes or graph parameters"));
+        let why: Vec<String> = chain
+            .stubs
+            .iter()
+            .map(|(node, subtype)| match chain.gaps.iter().find(|(n, _)| n == node) {
+                Some((_, gap)) => format!("{node} ({subtype}): {gap}"),
+                None => format!("{node} ({subtype}): no box module"),
+            })
+            .chain(chain.unwired.iter().map(|u| format!("graph parameter {u} is not carried")))
+            .collect();
+        return Err(bad(format!("the voicing chain has unimplemented boxes or graph parameters: {}", why.join("; "))));
     }
     for (node, gap) in &chain.gaps {
         diags.warn("voicing-gap", node, gap);
