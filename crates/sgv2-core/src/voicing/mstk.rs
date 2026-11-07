@@ -1022,17 +1022,37 @@ fn detector_factors(p: &Params) -> [usize; BANDS] {
     }
 }
 
-/// Algorithm zero reduces band zero until the first image reaches the
-/// quality's Butterworth stop-band budget. The unit uses 50 dB at quality 1
-/// and 40 dB at qualities 0 and 2 (black-box image spacing, quality 2 equals
-/// quality 0 at every crossover and rate measured).
+/// Reduce band zero until the first image reaches the active producer's
+/// Butterworth stop-band budget. Algorithm zero uses 50 dB at quality 1 and
+/// 40 dB at qualities 0 and 2 (black-box image spacing, quality 2 equals
+/// quality 0 at every crossover and rate measured). The real-waveform
+/// threshold-automation producer uses 100 dB at quality 1 and 65 dB at
+/// qualities 0 and 2 before its eight-frame pick. Consequently a quality-1
+/// 150 Hz edge at 48 kHz selects factors 1/8/15/23 for effective orders
+/// 4/8/10/12. The transition to factor 15 is exactly where the Butterworth
+/// half first needs section index 2.
 fn band_zero_factor(p: &Params, fs: f64) -> usize {
-    if p.algorithm != 0 || p.band[0].mode != BandMode::Active {
+    let automated_pick = cadence(p) == Cadence::PickEight && p.algorithm >= 3;
+    if (!automated_pick && p.algorithm != 0) || p.band[0].mode != BandMode::Active {
         return 1;
     }
-    let half_order = ((libm::ceil(p.crossover_order[0] * 0.5) as usize).max(1)) as f64;
+    let half_order = if automated_pick {
+        effective_order(p.crossover_order[0]) / 2
+    } else {
+        (libm::ceil(p.crossover_order[0] * 0.5) as usize).max(1)
+    } as f64;
     let edge = p.crossover_hz[0].min(p.crossover_hz[1] / 1.25).min(p.crossover_hz[2] / (1.25 * 1.25));
-    let budget = if p.render_quality == 1 { 50.0 } else { 40.0 };
+    let budget = if automated_pick {
+        if p.render_quality == 1 {
+            100.0
+        } else {
+            65.0
+        }
+    } else if p.render_quality == 1 {
+        50.0
+    } else {
+        40.0
+    };
     let separation = 2.0 * libm::pow(2.0, budget / (6.0 * half_order));
     libm::floor(fs / (separation * edge)).max(1.0) as usize
 }
@@ -1093,12 +1113,13 @@ pub struct Run {
     band_zero_factor: usize,
     band_zero_phase: usize,
     analytic_pick: bool,
-    /// With threshold automation (eight-frame sub-blocks) band 0's gain
-    /// is computed from the previous sub-block's pick. Black-box
-    /// (installed unit, AID44 strip): band-0 attacks at full scale came
-    /// 0.1 to 0.2 dB too early in their first 10 ms; one sub-block of lag
-    /// brings every per-box probe within 0.034 dB. The other bands pick
-    /// their own sub-block (a lag there misses by up to 0.1 dB).
+    /// On the host-rate threshold-automation path, band 0's gain is computed
+    /// from the previous eight-frame sub-block's pick. Black-box (installed
+    /// unit, AID44 strip): band-0 attacks at full scale came 0.1 to 0.2 dB
+    /// too early in their first 10 ms; one sub-block of lag brings every
+    /// per-box probe within 0.034 dB. A selected-rate band-0 producer instead
+    /// consumes its current pick; retaining this lag after rate selection
+    /// delays a high-order attack by 64 to 184 host frames.
     band_zero_pick_lag: bool,
     band_zero_previous_pick: f64,
     gain_src: [GainSrc; BANDS],
@@ -1201,7 +1222,7 @@ impl Run {
             band_zero_factor,
             band_zero_phase: 0,
             analytic_pick: cadence(q) == Cadence::AnalyticPick,
-            band_zero_pick_lag: cadence(q) == Cadence::PickEight,
+            band_zero_pick_lag: cadence(q) == Cadence::PickEight && !(q.algorithm >= 3 && band_zero_factor > 1),
             band_zero_previous_pick: 0.0,
             gain_src: core::array::from_fn(|b| {
                 GainSrc::new(detector_factor[b], if b == 0 { band_zero_rate } else { fs })
@@ -1217,6 +1238,8 @@ impl Run {
                 fs,
                 if cadence(q) == Cadence::AnalyticPick {
                     band_zero_rate
+                } else if band_zero_factor > 1 {
+                    band_zero_rate / phase_band_zero_factor(q) as f64
                 } else {
                     fs / phase_band_zero_factor(q) as f64
                 },
@@ -1348,7 +1371,8 @@ impl Run {
             base[b] = (magnitude * scale) as f32 as f64;
             // The real-waveform detectors pick |stage(band waveform)|; the
             // analytic detector compensates its two components in `process`.
-            if self.overshoot_compensation && !self.analytic_pick && (b != 0 || phase_band_zero_sample) {
+            let phase_stage_sample = b != 0 || (phase_band_zero_sample && self.band_zero_factor <= 1);
+            if self.overshoot_compensation && !self.analytic_pick && phase_stage_sample {
                 let phase = self.phase_stage(0, c, b, v);
                 overshoot[b] = (phase.abs() * scale) as f32 as f64;
             }
@@ -1464,7 +1488,14 @@ impl Run {
                         input,
                     );
                 }
-                let (detected, mut overshoot_arm) = self.detect(c, input, phase_band_zero_sample);
+                let (mut detected, mut overshoot_arm) = self.detect(c, input, phase_band_zero_sample);
+                if self.band_zero_factor > 1 && band_zero_sample && !self.analytic_pick {
+                    detected[0] = (bands_a[c][0].abs() * self.detector_bandwidth[0]) as f32 as f64;
+                    if self.overshoot_compensation && phase_band_zero_sample {
+                        let phase = self.phase_stage(0, c, 0, bands_a[c][0]);
+                        overshoot_arm[0] = (phase.abs() * self.detector_bandwidth[0]) as f32 as f64;
+                    }
+                }
                 if self.overshoot_compensation && self.analytic_pick {
                     for b in 0..BANDS {
                         if b == 0 && self.band_zero_factor > 1 && !band_zero_sample {
@@ -1587,9 +1618,11 @@ impl Run {
             if self.band_zero_phase == self.band_zero_factor {
                 self.band_zero_phase = 0;
             }
-            self.phase_band_zero_phase += 1;
-            if self.phase_band_zero_phase == self.phase_band_zero_factor {
-                self.phase_band_zero_phase = 0;
+            if self.analytic_pick || self.band_zero_factor == 1 || band_zero_sample {
+                self.phase_band_zero_phase += 1;
+                if self.phase_band_zero_phase == self.phase_band_zero_factor {
+                    self.phase_band_zero_phase = 0;
+                }
             }
         }
     }
@@ -1921,6 +1954,32 @@ mod tests {
         assert_eq!(band_zero_factor(&p, 48_000.0), 11);
         p.algorithm = 2;
         assert_eq!(band_zero_factor(&p, 48_000.0), 1);
+    }
+
+    #[test]
+    fn threshold_automation_uses_quality_specific_band_zero_budgets() {
+        let mut p = params();
+        p.algorithm = 3;
+        p.render_quality = 1;
+        p.crossover_hz.copy_from_slice(&[150.0, 1000.0, 9000.0]);
+        assert_eq!(band_zero_factor(&p, 48_000.0), 1);
+
+        p.threshold_automation[0].count = 2;
+        p.threshold_automation[0].points[0] = AutomationPoint { input: -100.0, value: -20.0 };
+        p.threshold_automation[0].points[1] = AutomationPoint { input: 0.0, value: -30.0 };
+        for (order, expected) in [(4.0, 1), (7.0, 8), (8.0, 8), (9.0, 15), (10.0, 15), (12.0, 23)] {
+            p.crossover_order[0] = order;
+            assert_eq!(band_zero_factor(&p, 48_000.0), expected, "order {order}");
+            assert_eq!(Run::new(&p, 48_000.0, 1).band_zero_pick_lag, expected == 1, "order {order}");
+        }
+
+        p.render_quality = 2;
+        p.crossover_hz.copy_from_slice(&[250.0, 1500.0, 8000.0]);
+        for (order, expected) in [(9.0, 21), (12.0, 27)] {
+            p.crossover_order[0] = order;
+            assert_eq!(band_zero_factor(&p, 48_000.0), expected, "quality 2 order {order}");
+            assert!(!Run::new(&p, 48_000.0, 1).band_zero_pick_lag);
+        }
     }
 
     #[test]
