@@ -164,6 +164,45 @@ class Checks(unittest.TestCase):
         self.assertEqual(s.wanted(g), list(zip(p["pout"], p["spk"])))
 
 
+class AmpsUnity(unittest.TestCase):
+    def _run(self, props):
+        g, _, s = build("j316")
+        spk = g.node_id("sgv2.speaker.j316")
+        g.objs[spk]["info"].setdefault("params", {})["Props"] = [props] if props is not None else []
+        ran = []
+
+        class P:
+            def __init__(self, argv):
+                ran.append(argv)
+
+            def poll(self):
+                return 0
+
+        orig = sgs.subprocess.Popen
+        sgs.subprocess.Popen = lambda argv, **kw: P(argv)
+        try:
+            started = s.pin_amps_unity(g)
+            again = s.pin_amps_unity(g)
+        finally:
+            sgs.subprocess.Popen = orig
+        return started, again, ran, spk
+
+    def test_a_volume_on_the_amps_sink_is_put_back_to_unity(self):
+        started, again, ran, spk = self._run({"volume": 1.0, "mute": False, "channelVolumes": [0.027] * 6})
+        self.assertTrue(started)
+        self.assertFalse(again)  # at most once a second
+        self.assertEqual(len(ran), 1)
+        self.assertEqual(ran[0][:4], ["pw-cli", "set-param", str(spk), "Props"])
+        self.assertIn("channelVolumes: [ 1.0, 1.0, 1.0, 1.0, 1.0, 1.0 ]", ran[0][4])
+        self.assertIn("mute: false", ran[0][4])
+
+    def test_unity_or_unknown_amps_volume_is_left_alone(self):
+        for props in ({"volume": 1.0, "mute": False, "channelVolumes": [1.0] * 6}, {}, None):
+            started, _, ran, _ = self._run(props)
+            self.assertFalse(started, props)
+            self.assertEqual(ran, [], props)
+
+
 class Stop(unittest.TestCase):
     def test_stopping_unlinks_the_amps_and_the_sense_within_its_bound(self):
         import time
