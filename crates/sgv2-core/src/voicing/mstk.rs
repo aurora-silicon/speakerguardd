@@ -955,14 +955,16 @@ fn detector_factors(p: &Params) -> [usize; BANDS] {
 }
 
 /// Algorithm zero reduces band zero until the first image reaches the
-/// quality's Butterworth stop-band budget. The unit uses 40/50 dB for q0/q1.
+/// quality's Butterworth stop-band budget. The unit uses 50 dB at quality 1
+/// and 40 dB at qualities 0 and 2 (black-box image spacing, quality 2 equals
+/// quality 0 at every crossover and rate measured).
 fn band_zero_factor(p: &Params, fs: f64) -> usize {
-    if p.algorithm != 0 || p.render_quality >= 2 || p.band[0].mode != BandMode::Active {
+    if p.algorithm != 0 || p.band[0].mode != BandMode::Active {
         return 1;
     }
     let half_order = ((libm::ceil(p.crossover_order[0] * 0.5) as usize).max(1)) as f64;
     let edge = p.crossover_hz[0].min(p.crossover_hz[1] / 1.25).min(p.crossover_hz[2] / (1.25 * 1.25));
-    let budget = if p.render_quality == 0 { 40.0 } else { 50.0 };
+    let budget = if p.render_quality == 1 { 50.0 } else { 40.0 };
     let separation = 2.0 * libm::pow(2.0, budget / (6.0 * half_order));
     libm::floor(fs / (separation * edge)).max(1.0) as usize
 }
@@ -1076,9 +1078,9 @@ impl Run {
         let band_zero_factor = band_zero_factor(q, fs);
         let band_zero_rate = fs / band_zero_factor as f64;
         if band_zero_factor > 1 {
-            detector_window[0] = ((libm::round(2.0 * band_zero_rate / (1000.0 * detector_factor[0] as f64)) as usize)
-                | 1)
-            .clamp(1, MAX_DETECTOR_WINDOW);
+            detector_window[0] =
+                ((libm::round(window_ms[0] * band_zero_rate / (1000.0 * detector_factor[0] as f64)) as usize) | 1)
+                    .clamp(1, MAX_DETECTOR_WINDOW);
             release[0] = if q.release_s > 0.0 {
                 libm::exp(-(detector_factor[0] as f64) / (q.release_s * band_zero_rate))
             } else {
@@ -1436,7 +1438,13 @@ impl Run {
                     }
                 })
             } else {
-                core::array::from_fn(|b| self.mode4_gain[b].step(gain[b]))
+                core::array::from_fn(|b| {
+                    if b == 0 && self.band_zero_factor > 1 && !band_zero_sample {
+                        Mode4Mix::default()
+                    } else {
+                        self.mode4_gain[b].step(gain[b])
+                    }
+                })
             };
             for c in 0..n {
                 let mut processed = [0.0; BANDS];
@@ -1453,7 +1461,16 @@ impl Run {
                             if b == 0 && self.band_zero_factor > 1 { self.band_zero_factor as f64 } else { 1.0 };
                         Self::saturate(self.band[b].saturation, output) * scale
                     } else {
-                        Self::band_output(self.band[b].saturation, mode4[b].real_gain(), bands_a[c][b])
+                        if b == 0 && self.band_zero_factor > 1 {
+                            if band_zero_sample {
+                                Self::band_output(self.band[b].saturation, mode4[b].real_gain(), bands_a[c][b])
+                                    * self.band_zero_factor as f64
+                            } else {
+                                0.0
+                            }
+                        } else {
+                            Self::band_output(self.band[b].saturation, mode4[b].real_gain(), bands_a[c][b])
+                        }
                     };
                 }
                 let mut y =
@@ -1749,7 +1766,9 @@ mod tests {
         automated.threshold_automation[0].points[1] = AutomationPoint { input: 0.0, value: -30.0 };
         let (factor, window, _, _, analytic_pick) = cadence(&automated, 48_000.0);
         assert_eq!(factor, [8; BANDS]);
-        assert_eq!(window, [61, 49, 13, 7]);
+        // Algorithm 0 also reduces band 0 here (M = 11 at 48 kHz), so its
+        // ten-millisecond window counts band-rate updates.
+        assert_eq!(window, [5, 49, 13, 7]);
         assert!(!analytic_pick);
 
         let mut max = SlidingMax::EMPTY;
@@ -1781,6 +1800,8 @@ mod tests {
         }
         p.crossover_hz[0] = 200.0;
         assert_eq!(band_zero_factor(&p, 96_000.0), 13);
+        p.render_quality = 2;
+        assert_eq!(band_zero_factor(&p, 48_000.0), 11);
         p.algorithm = 2;
         assert_eq!(band_zero_factor(&p, 48_000.0), 1);
     }
