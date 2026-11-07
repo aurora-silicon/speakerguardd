@@ -14,6 +14,10 @@
     "j616s": [-1.217, -1.217, -1.24, -1.24, -0.837, -0.837],
     "j700": [-0.919, -0.919]
   },
+  "_voicing_pre_lowpass_doc": "INTERIM never-louder band limit, not a macOS law (AUD-CUT2 2026-11-07, Ryan's parity rule: never-louder is fine as interim). {hz, order}: an even-order Butterworth low-pass built from PipeWire bq_lowpass sections in FRONT of the voicing plugin. j700 only: v2's AID44 ControlFreak lacks the AU's reconstruction low-pass, so above ~17 kHz the box is up to +23 dB (+30 dB at 0 dBFS) louder than macOS and its saturation aliases a loud high-frequency input into 9-16.5 kHz; the lane trim cannot hold either. 17.4 kHz order 8 (with the j700 trim): AID44 box rig (installed AU, 362 tones/pink/steps incl. 16-23.75 kHz probes) 0 louder cases, worst -0.58 dB; full AID44 voicing VLS 30 Hz-19.5 kHz 0 louder bands, worst -0.03 dB; cost at 16 kHz -0.1 dB. Goes when the ControlFreak law is exact (Daybreak t-5511).",
+  "voicing_pre_lowpass": {
+    "j700": {"hz": 17400, "order": 8}
+  },
   "units_at_parity": ["spp3", "lsm2", "atsp"],
   "require_qualified_board": true,
   "qualified": {

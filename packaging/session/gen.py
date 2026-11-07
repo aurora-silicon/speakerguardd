@@ -37,6 +37,7 @@ The graph, per machine:
   the supervisor.
 """
 import json
+import math
 import os
 import sys
 
@@ -90,6 +91,52 @@ def voicing_bound(board, gate=None):
     return [float(x) for x in b]
 
 
+LOWPASS_ORDERS = (2, 4, 6, 8, 10, 12)
+
+
+def voicing_lowpass(board, gate=None):
+    """INTERIM never-louder band limit for a board's generated voicing, from
+    gate.json voicing_pre_lowpass: {"hz": corner, "order": even Butterworth
+    order}. It is not a macOS law. It exists only because one voicing law is
+    still open and makes a board louder than macOS in a band no lane trim
+    can hold: on the j700 (AID44) v2's ControlFreak lacks the AU's
+    reconstruction low-pass, so above ~17 kHz the box is up to +23 dB
+    (+30 dB at full scale) louder than macOS, and its saturation folds a
+    loud high-frequency input back into the band (aliases at 9-16.5 kHz).
+    The low-pass therefore sits in front of the voicing plugin, so neither
+    the excess band nor the aliases reach the output; a filter after the
+    plugin cannot remove the aliases. Each section is PipeWire's builtin
+    bq_lowpass (RBJ) at the corner with the Butterworth Q of its pole pair,
+    so the cascade is the bilinear Butterworth response, monotonic and
+    never above 0 dB. It goes when the ControlFreak law is exact. Anything
+    malformed refuses the board's voicing.
+    """
+    if gate is None:
+        gate = load_gate()
+    lp = gate.get("voicing_pre_lowpass", {}).get(board)
+    if lp is None:
+        return None
+    hz = lp.get("hz") if isinstance(lp, dict) else None
+    order = lp.get("order") if isinstance(lp, dict) else None
+    if (
+        not isinstance(lp, dict)
+        or set(lp) != {"hz", "order"}
+        or not isinstance(hz, (int, float))
+        or isinstance(hz, bool)
+        or not 1000.0 <= hz <= 23000.0
+        or not isinstance(order, int)
+        or isinstance(order, bool)
+        or order not in LOWPASS_ORDERS
+    ):
+        raise ValueError(f"voicing_pre_lowpass for {board}: want {{\"hz\": 1000..23000, \"order\": one of {LOWPASS_ORDERS}}}")
+    return float(hz), order
+
+
+def butterworth_q(order):
+    """Q of each pole pair of an even-order Butterworth low-pass."""
+    return [1.0 / (2.0 * math.sin((2 * k - 1) * math.pi / (2 * order))) for k in range(1, order // 2 + 1)]
+
+
 def voicing_conf(m, c, w):
     """One stereo chain, in unit-lane order, mapped to physical AUX ports
     with the same map as the protection input. Volume is handled by the
@@ -107,7 +154,24 @@ def voicing_conf(m, c, w):
         for k, t in sorted(trims.items())
     )
     links = "".join(f' {{ output = "voicing:out_{k}" input = "b{k}:In" }}' for k in sorted(trims))
-    links_line = f"\n               links = [{links} ]" if trims else ""
+    inputs = '"voicing:in_0" "voicing:in_1"'
+    pre_nodes = ""
+    lp = voicing_lowpass(c.get("board", m))
+    if lp is not None:
+        hz, order = lp
+        if hz >= c["rate"] / 2:
+            raise ValueError(f"voicing_pre_lowpass for {c.get('board', m)}: {hz} Hz is not below Nyquist at {c['rate']} Hz")
+        qs = butterworth_q(order)
+        for ch in (0, 1):
+            pre_nodes += "".join(
+                f' {{ type = builtin name = lp{ch}s{k} label = bq_lowpass control = {{ "Freq" = {hz:.1f} "Q" = {q:.9f} }} }}'
+                for k, q in enumerate(qs)
+            )
+            chain = [f"lp{ch}s{k}" for k in range(len(qs))]
+            links += "".join(f' {{ output = "{a}:Out" input = "{b}:In" }}' for a, b in zip(chain, chain[1:]))
+            links += f' {{ output = "{chain[-1]}:Out" input = "voicing:in_{ch}" }}'
+        inputs = '"lp0s0:In" "lp1s0:In"'
+    links_line = f"\n               links = [{links} ]" if links else ""
     return f"""
     {{ name = libpipewire-module-filter-chain
        flags = [ nofail ]
@@ -115,8 +179,8 @@ def voicing_conf(m, c, w):
            node.description = "{c['name']} speakers"
            media.name = "{c['name']} speakers"
            filter.graph = {{
-               nodes = [ {{ type = lv2 name = voicing plugin = "https://aurora-silicon.org/lv2/sgv2#voicing-{amps}ch" }}{extra_nodes} ]{links_line}
-               inputs = [ "voicing:in_0" "voicing:in_1" ]
+               nodes = [{pre_nodes} {{ type = lv2 name = voicing plugin = "https://aurora-silicon.org/lv2/sgv2#voicing-{amps}ch" }}{extra_nodes} ]{links_line}
+               inputs = [ {inputs} ]
                outputs = [ {outputs} ]
                capture.volumes = [ {{ control = "voicing:volume" min = 0.0 max = 1.0 scale = cubic }} ]
            }}
