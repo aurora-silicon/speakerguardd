@@ -29,6 +29,11 @@
 //!
 //! A channel of a node no unit lane passes cannot be fed; the plan refuses
 //! it, as it refuses a channel two lanes reach from different sources.
+//!
+//! A `sum` builtin is a node of [`NodeKind::Sum`]: its channels are its
+//! inputs' channels, input after input (input `q`'s channel `c` at
+//! `q * width + c`), and its output channel `c` is their sum; later boxes
+//! name only its first `width` channels.
 
 use crate::dspg::analysis::Lane;
 use crate::error::{Error, Result};
@@ -47,6 +52,8 @@ pub enum NodeKind {
     Gain,
     /// The graph's non-finite protection builtin (`nfnp`).
     NonFinite,
+    /// The graph's `sum` builtin over `inputs` equally wide inputs.
+    Sum { inputs: u32 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -83,6 +90,13 @@ pub struct Node {
 impl Node {
     pub fn width(&self) -> usize {
         self.inputs.len()
+    }
+    /// The channels the node puts out (a sum's inputs are wider).
+    pub fn out_width(&self) -> usize {
+        match self.kind {
+            NodeKind::Sum { inputs } => self.inputs.len() / inputs.max(1) as usize,
+            _ => self.inputs.len(),
+        }
     }
     pub fn subtype(&self) -> Option<&str> {
         match &self.kind {
@@ -144,6 +158,60 @@ fn source_of(lane: &Lane, step: usize, kept: &[Option<usize>]) -> Source {
     Source::Program { channel: lane.origin.channel }
 }
 
+/// Whether `lane`, or a lane a sum on it adds in, passes box `name`.
+fn passes(lane: &Lane, name: &str) -> bool {
+    lane.through.iter().any(|p| p.node == name) || lane.summed.iter().any(|s| s.lanes.iter().any(|l| passes(l, name)))
+}
+
+struct Found<'a> {
+    names: &'a [&'a str],
+    sources: Vec<Vec<Option<Source>>>,
+    lanes: Vec<Vec<usize>>,
+}
+
+impl Found<'_> {
+    fn index(&self, name: &str) -> Option<usize> {
+        self.names.iter().position(|n| *n == name)
+    }
+
+    fn set(&mut self, n: usize, ch: usize, src: Source, li: usize) -> Result<()> {
+        let name = self.names[n];
+        let slot = self.sources[n]
+            .get_mut(ch)
+            .ok_or_else(|| bad(format!("lane {li} enters box {name} on channel {ch}, past its width")))?;
+        match slot {
+            None => *slot = Some(src),
+            Some(prev) if *prev == src => {}
+            Some(prev) => {
+                return Err(bad(format!("box {name} channel {ch} is reached from {prev:?} and from {src:?}")))
+            }
+        }
+        if !self.lanes[n].contains(&li) {
+            self.lanes[n].push(li);
+        }
+        Ok(())
+    }
+
+    /// Record every box `lane` (of unit lane `li`) passes, and what feeds
+    /// each; a sum on the lane takes its other inputs from the lanes it adds.
+    /// Returns what the lane carries at its end.
+    fn lane(&mut self, lane: &Lane, li: usize, widths: &[usize]) -> Result<Source> {
+        let kept: Vec<Option<usize>> = lane.through.iter().map(|p| self.index(&p.node)).collect();
+        for (k, pass) in lane.through.iter().enumerate() {
+            let Some(n) = kept[k] else { continue };
+            let ch = pass.channel as usize;
+            self.set(n, ch, source_of(lane, k, &kept), li)?;
+            for s in lane.summed.iter().filter(|s| s.at == k) {
+                for (q, other) in s.lanes.iter().enumerate() {
+                    let src = self.lane(other, li, widths)?;
+                    self.set(n, (q + 1) * widths[n] + ch, src, li)?;
+                }
+            }
+        }
+        Ok(source_of(lane, lane.through.len(), &kept))
+    }
+}
+
 /// The chain plan of `t`'s protection unit.
 pub fn plan(t: &Tuning) -> Result<Plan> {
     let lanes = &t.protection.lanes;
@@ -168,16 +236,28 @@ pub fn plan(t: &Tuning) -> Result<Plan> {
         if PLUMBING.contains(&s.kind.as_str()) {
             continue;
         }
-        if lanes.iter().any(|l| l.through.iter().any(|p| p.node == s.name)) {
+        if lanes.iter().any(|l| passes(l, &s.name)) {
             names.push(&s.name);
         }
     }
-    let index = |name: &str| names.iter().position(|n| *n == name);
 
     let mut nodes: Vec<Node> = Vec::with_capacity(names.len());
+    // per node: its channels (a sum's inputs, input after input) and its
+    // output channels
+    let mut widths: Vec<(usize, usize)> = Vec::with_capacity(names.len());
     for name in &names {
         let s = t.chain.iter().find(|s| s.name == *name).expect("chain stage");
+        // a strip may name a builtin by its unit subtype (`abox summ`)
+        let sum =
+            s.kind == "sum" || s.kind == "summ" || s.unit.as_ref().is_some_and(|u| u.subtype.to_string() == "summ");
         let kind = match (&s.unit, s.kind.as_str()) {
+            _ if sum => {
+                let inputs = t.graph.find_box(name).map_or(0, |b| b.inputs);
+                if inputs == 0 {
+                    return Err(bad(format!("box {name}: a sum with no inputs")));
+                }
+                NodeKind::Sum { inputs }
+            }
             (Some(u), _) if u.subtype.to_string() == "nfnp" => NodeKind::NonFinite,
             (Some(u), _) if u.subtype.to_string() == "dbgn" => NodeKind::Gain,
             (Some(u), _) => NodeKind::Unit { subtype: u.subtype.to_string() },
@@ -185,10 +265,15 @@ pub fn plan(t: &Tuning) -> Result<Plan> {
             (None, "nfnp") => NodeKind::NonFinite,
             (None, k) => return Err(bad(format!("box {name}: builtin {k} on the unit's lanes is not carried"))),
         };
-        let width = s.channels.ok_or_else(|| bad(format!("box {name}: its channel count is unknown")))? as usize;
-        if width == 0 || width > sgv2_core::MAX_CHANNELS {
+        let out = s.channels.ok_or_else(|| bad(format!("box {name}: its channel count is unknown")))? as usize;
+        let width = match kind {
+            NodeKind::Sum { inputs } => out * inputs as usize,
+            _ => out,
+        };
+        if out == 0 || width > sgv2_core::MAX_CHANNELS {
             return Err(bad(format!("box {name}: {width} channels")));
         }
+        widths.push((width, out));
         nodes.push(Node {
             name: (*name).to_string(),
             kind,
@@ -200,37 +285,20 @@ pub fn plan(t: &Tuning) -> Result<Plan> {
     }
 
     // Sources per node channel, from every lane that passes it.
-    let mut found: Vec<Vec<Option<Source>>> = names
-        .iter()
-        .map(|n| {
-            let s = t.chain.iter().find(|s| s.name == *n).expect("chain stage");
-            vec![None; s.channels.unwrap_or(0) as usize]
-        })
-        .collect();
+    let out_widths: Vec<usize> = widths.iter().map(|w| w.1).collect();
+    let mut found = Found {
+        names: &names,
+        sources: widths.iter().map(|w| vec![None; w.0]).collect(),
+        lanes: vec![Vec::new(); nodes.len()],
+    };
     let mut outputs = Vec::with_capacity(lanes.len());
     for (li, lane) in lanes.iter().enumerate() {
-        let kept: Vec<Option<usize>> = lane.through.iter().map(|p| index(&p.node)).collect();
-        for (k, pass) in lane.through.iter().enumerate() {
-            let Some(n) = kept[k] else { continue };
-            let src = source_of(lane, k, &kept);
-            let ch = pass.channel as usize;
-            let slot = found[n]
-                .get_mut(ch)
-                .ok_or_else(|| bad(format!("lane {li} enters box {} on channel {ch}, past its width", names[n])))?;
-            match slot {
-                None => *slot = Some(src),
-                Some(prev) if *prev == src => {}
-                Some(prev) => {
-                    return Err(bad(format!("box {} channel {ch} is reached from {prev:?} and from {src:?}", names[n])))
-                }
-            }
-            if !nodes[n].lanes.contains(&li) {
-                nodes[n].lanes.push(li);
-            }
-        }
-        outputs.push(source_of(lane, lane.through.len(), &kept));
+        outputs.push(found.lane(lane, li, &out_widths)?);
     }
-    for (n, chans) in found.into_iter().enumerate() {
+    for (n, l) in found.lanes.into_iter().enumerate() {
+        nodes[n].lanes = l;
+    }
+    for (n, chans) in found.sources.into_iter().enumerate() {
         let mut inputs = Vec::with_capacity(chans.len());
         for (c, s) in chans.into_iter().enumerate() {
             inputs.push(s.ok_or_else(|| bad(format!("box {} channel {c} is on none of the unit's lanes", names[n])))?);
@@ -244,7 +312,7 @@ pub fn plan(t: &Tuning) -> Result<Plan> {
     let all = lanes.len();
     let mut widened = false;
     for n in nodes.iter_mut() {
-        widened |= n.width() > program_channels as usize;
+        widened |= n.out_width() > program_channels as usize;
         n.role = if !widened {
             Role::Program
         } else if n.lanes.len() == all {
@@ -284,6 +352,7 @@ mod tests {
             origin: Origin { node: "in".into(), port: 0, channel: ch },
             hops: Vec::new(),
             through: through.iter().map(|(n, c)| Pass { node: (*n).into(), channel: *c }).collect(),
+            summed: Vec::new(),
         }
     }
 

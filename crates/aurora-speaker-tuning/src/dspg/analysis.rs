@@ -18,6 +18,10 @@
 //!   (every wire leaving one port must agree on the width);
 //! * `join`: its output is the concatenation of its inputs in port order;
 //!   each lane records the join slot it entered as a [`Hop`];
+//! * `sum` (and `summ`) with one output and inputs all as wide as it: lane
+//!   `k` of the output continues lane `k` of input 0 through the sum, and
+//!   records lane `k` of every other input as a [`Summand`] at that pass
+//!   (the box adds its inputs channel by channel);
 //! * any other box whose output 0 is as wide as its input 0: lane `k` of the
 //!   output is lane `k` of input 0.  This is lane *position*, not signal
 //!   content: an effect may mix channels (crosstalk cancellation does), but
@@ -59,6 +63,14 @@ pub struct Pass {
     pub channel: u32,
 }
 
+/// The other inputs a `sum` adds into a lane: at `through[at]` (the sum's
+/// pass), the lanes of the sum's inputs 1, 2, ... on the lane's channel.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Summand {
+    pub at: usize,
+    pub lanes: Vec<Lane>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Lane {
     pub origin: Origin,
@@ -66,6 +78,8 @@ pub struct Lane {
     /// The boxes the lane passes through, upstream first, with its channel
     /// on each.
     pub through: Vec<Pass>,
+    /// The `sum` boxes on the lane and what each adds into it.
+    pub summed: Vec<Summand>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -168,6 +182,39 @@ fn in_wire<'a>(g: &'a Graph, node: &str, port: u32) -> Option<&'a Wire> {
     g.wires.iter().find(|w| w.dst.node == node && w.dst.port == port)
 }
 
+/// The lanes out of a `sum` box `name` of output width `width`, from the
+/// lanes of its inputs (kept out of the recursive tracer's frame).
+#[inline(never)]
+fn sum_lanes(name: &str, width: usize, ports: Vec<Option<Vec<Lane>>>) -> Result<Vec<Lane>> {
+    let mut ports = ports
+        .into_iter()
+        .enumerate()
+        .map(|(p, l)| {
+            let l = l.ok_or_else(|| Error::format("dspg", format!("sum {name} input {p} is unconnected")))?;
+            if l.len() != width {
+                return Err(Error::format(
+                    "dspg",
+                    format!("sum {name} input {p} is {} channels wide, its output {width}", l.len()),
+                ));
+            }
+            Ok(l)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let others = ports.split_off(1);
+    Ok(ports
+        .pop()
+        .unwrap_or_default()
+        .into_iter()
+        .enumerate()
+        .map(|(c, mut lane)| {
+            lane.through.push(Pass { node: name.to_string(), channel: c as u32 });
+            let at = lane.through.len() - 1;
+            lane.summed.push(Summand { at, lanes: others.iter().map(|o| o[c].clone()).collect() });
+            lane
+        })
+        .collect())
+}
+
 fn out_lanes(
     g: &Graph,
     src: &Endpoint,
@@ -192,6 +239,7 @@ fn out_lanes(
                 origin: Origin { node: src.node.clone(), port: 0, channel: c },
                 hops: Vec::new(),
                 through: Vec::new(),
+                summed: Vec::new(),
             })
             .collect()
     } else {
@@ -232,6 +280,7 @@ fn out_lanes(
                     origin: Origin { node: b.name.clone(), port: src.port, channel: c },
                     hops: Vec::new(),
                     through: Vec::new(),
+                    summed: Vec::new(),
                 })
                 .collect()
         };
@@ -281,6 +330,14 @@ fn out_lanes(
                     }
                 }
                 all
+            }
+            "sum" | "summ" if b.outputs == 1 && b.inputs >= 1 => {
+                let width = out_width(0)?.unwrap_or(0) as usize;
+                let mut ports = Vec::with_capacity(b.inputs as usize);
+                for p in 0..b.inputs {
+                    ports.push(input(p, memo, active)?);
+                }
+                sum_lanes(&b.name, width, ports)?
             }
             _ => {
                 let width = out_width(src.port)?.unwrap_or(0) as usize;

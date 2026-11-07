@@ -807,6 +807,13 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics, mode: Rea
         let mut spans = Vec::new();
         for (e, a) in automation.iter().filter(|(_, a)| a.target == i) {
             a.check(&ctx, *e, kind)?;
+            // An entry whose set points coincide changes nothing at any
+            // volume (measured): its set point B is never applied, whatever
+            // it holds (AIDs 8/14/24/28/30/34/39/40 save such entries with a
+            // 0 Hz B on a high-pass).
+            if !a.moves() {
+                continue;
+            }
             let base = points.len();
             points.extend(a.middle.map(|(_, m)| m));
             points.push(a.b);
@@ -1683,6 +1690,7 @@ mod tests {
             origin: Origin { node: "in".into(), port: 0, channel: c },
             hops: Vec::new(),
             through: through.iter().map(|(n, ch)| Pass { node: (*n).into(), channel: *ch }).collect(),
+            summed: Vec::new(),
         }
     }
 
@@ -1917,6 +1925,7 @@ mod tests {
                 origin: Origin { node: "in".into(), port: 0, channel: c },
                 hops: Vec::new(),
                 through: chain.iter().map(|s| Pass { node: s.name.clone(), channel: c }).collect(),
+                summed: Vec::new(),
             })
             .collect();
         derive_lanes(&chain, &lanes, fs, n, d)
@@ -1988,6 +1997,17 @@ mod tests {
         let p = part(&hp(auto(0, 1.0, 0.2, (1.0, -0.1, 100.0), Some((0.8, -0.05, 80.0)))), 0, fs, &mut d).unwrap();
         assert_eq!(p.sections, butterworth(true, 4, 100.0f32 as f64, fs));
         assert!((p.gain_db + 0.1).abs() < 1e-6);
+        // an entry whose set points coincide (the legacy state 1000, B at 0 Hz)
+        // changes nothing: the slot's own corner, in both modes
+        let mut still = auto(2, 1.0, 0.0, (0.0, 0.0, 0.0), None);
+        still[1].1 = 1000.0;
+        still.push((AUTOMATION_BASE + AUTOMATION_STRIDE * 2 + 7, 1000.0));
+        let p = part(&hp(still.clone()), 0, fs, &mut d).unwrap();
+        assert_eq!(p.sections, butterworth(true, 4, 45.0, fs));
+        assert_eq!(p.gain_db, 0.0);
+        let p = part_with(&hp(still), 0, fs, &mut d, Realise::Saved).unwrap();
+        assert_eq!(p.sections, butterworth(true, 4, 45.0, fs));
+        assert!(p.conservative.is_empty());
         // one falling with the volume: the slot's own corner is the highest
         let p = part(&hp(auto(0, 1.0, 0.2, (1.0, 0.0, 30.0), None)), 0, fs, &mut d).unwrap();
         assert_eq!(p.sections, butterworth(true, 4, 45.0, fs));
