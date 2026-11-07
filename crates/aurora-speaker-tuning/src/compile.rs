@@ -360,7 +360,10 @@ pub fn compile_voicing_with(
             .chain(chain.unwired.iter().map(|u| format!("graph parameter {u} is not carried")))
             .collect();
         if !muted_companion(&c) {
-            return Err(bad(format!("the voicing chain has unimplemented boxes or graph parameters: {}", why.join("; "))));
+            return Err(bad(format!(
+                "the voicing chain has unimplemented boxes or graph parameters: {}",
+                why.join("; ")
+            )));
         }
         diags.warn("lsid-voicing-release-gated", "compile", format!("mandatory muted companion bundle has identity pre-stage and no voicing artifact: unqualified boxes {:?}, graph parameters {:?}", chain.stubs, chain.unwired));
         return Ok(c);
