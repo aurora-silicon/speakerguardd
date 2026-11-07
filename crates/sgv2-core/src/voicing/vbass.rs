@@ -99,12 +99,27 @@ impl Cascade {
             self.push(*q);
         }
     }
-    fn platform(&self, multichannel: bool) -> crate::vdsp::Cascade {
+    fn platform_lowpass(&self) -> crate::vdsp::Cascade {
         let mut sections = [[0.0; 5]; MAX_SECTIONS];
         for (dst, q) in sections.iter_mut().zip(&self.s[..self.n]) {
-            *dst = [q.b[0], q.b[1], q.b[2], q.a[0], q.a[1]];
+            let a1 = q.a[0] as f32;
+            let a2 = q.a[1] as f32;
+            let g = if q.b[2] == 0.0 {
+                (1.0 + a1) * 0.5
+            } else {
+                // The saved Float32 SOS forms the DC numerator from its
+                // already-rounded denominator. This association is visible
+                // at very low corners: adding a2 to one before a1 preserves
+                // the same cancellation bits as the platform object.
+                ((1.0 + a2) + a1) * 0.25
+            };
+            *dst = if q.b[2] == 0.0 {
+                [f64::from(g), f64::from(g), 0.0, f64::from(a1), f64::from(a2)]
+            } else {
+                [f64::from(g), f64::from(2.0 * g), f64::from(g), f64::from(a1), f64::from(a2)]
+            };
         }
-        crate::vdsp::Cascade::new(&sections[..self.n], multichannel)
+        crate::vdsp::Cascade::new(&sections[..self.n], false)
     }
     #[inline]
     fn run(&self, st: &mut CascadeState, mut x: f64) -> f64 {
@@ -693,7 +708,7 @@ impl Run {
             channels,
             hp,
             hp_st: vec![CascadeState::default(); channels],
-            lp: lp_design.platform(false),
+            lp: lp_design.platform_lowpass(),
             ap,
             ap_st: CascadeState::default(),
             band_hp,
