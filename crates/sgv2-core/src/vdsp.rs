@@ -58,6 +58,12 @@ impl Section {
         self.history = [0.0; 4];
     }
 
+    /// Installed Float32 coefficient words, for synthetic parity probes.
+    #[doc(hidden)]
+    pub fn coefficient_bits(&self) -> [u32; 5] {
+        [self.b[0].to_bits(), self.b[1].to_bits(), self.b[2].to_bits(), self.a[0].to_bits(), self.a[1].to_bits()]
+    }
+
     fn install(&mut self, c: [f64; 5]) {
         let [b0, b1, b2, a1, a2] = c;
         let mut g = [0.0f64; 8];
@@ -244,6 +250,16 @@ impl Cascade {
 
     pub fn is_empty(&self) -> bool {
         self.n == 0
+    }
+
+    /// Copies installed coefficient words into `out`, returning the count.
+    #[doc(hidden)]
+    pub fn coefficient_bits(&self, out: &mut [[u32; 5]]) -> usize {
+        let n = self.n.min(out.len());
+        for (dst, section) in out[..n].iter_mut().zip(&self.s[..n]) {
+            *dst = section.coefficient_bits();
+        }
+        n
     }
 
     pub fn reset(&mut self) {

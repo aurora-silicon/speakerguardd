@@ -80,6 +80,13 @@ fn main() {
     let x: Vec<f32> = raw.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
     let n = x.len() / 2;
     let mut run = Run::new(&p, fs, 2, 512);
+    if std::env::var_os("VBASS_COEFFICIENTS").is_some() {
+        let mut words = [[0u32; 5]; 20];
+        let sections = run.crossover_lowpass_bits(&mut words);
+        for section in &words[..sections] {
+            eprintln!("{:08x} {:08x} {:08x} {:08x} {:08x}", section[0], section[1], section[2], section[3], section[4]);
+        }
+    }
     let mut l: Vec<f32> = (0..n).map(|i| x[2 * i]).collect();
     let mut r: Vec<f32> = (0..n).map(|i| x[2 * i + 1]).collect();
     // VBASS_TIES=FILE: per 512-frame block, the closest level-control

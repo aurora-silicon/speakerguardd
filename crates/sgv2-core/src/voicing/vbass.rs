@@ -103,7 +103,14 @@ impl Cascade {
         let mut sections = [[0.0; 5]; MAX_SECTIONS];
         for (dst, q) in sections.iter_mut().zip(&self.s[..self.n]) {
             let a1 = q.a[0] as f32;
-            let a2 = q.a[1] as f32;
+            let mut a2 = q.a[1] as f32;
+            if a2 > 0.0 {
+                // The platform object's stored positive quadratic pole is
+                // the next Float32 value after the scalar bilinear result.
+                // This is observable before the cancellation-sensitive DC
+                // numerator is formed below.
+                a2 = f32::from_bits(a2.to_bits() + 1);
+            }
             let g = if q.b[2] == 0.0 {
                 (1.0 + a1) * 0.5
             } else {
@@ -778,6 +785,12 @@ impl Run {
 
     pub fn sample_rate(&self) -> f64 {
         self.fs
+    }
+
+    /// Installed crossover-low-pass coefficient words for parity probes.
+    #[doc(hidden)]
+    pub fn crossover_lowpass_bits(&self, out: &mut [[u32; 5]]) -> usize {
+        self.lp.coefficient_bits(out)
     }
 
     #[inline]
