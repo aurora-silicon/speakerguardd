@@ -50,7 +50,6 @@ FACTORY = {
     "buzk": "AUBuzzKillFactory",
     "cdly": "AUChannelSpecificDelayFactory",
     "volt": "AUVolumeTaperFactory",
-    "pchr": "AUMatrixPatcherFactory",
     "flow": "AULowFlowFactory",
     "atsp": "AUThermalSpeakerProtectionFactory",
     "spp3": "AUSpeakerProtectionV3Factory",

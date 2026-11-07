@@ -39,9 +39,6 @@ wireGraphParam mvsc (A 3 0 0)
 
 @unittest.skipIf(gr is None, "numpy not installed")
 class Parse(unittest.TestCase):
-    def test_aid44_matrix_factory_is_available(self):
-        self.assertEqual(gr.FACTORY["pchr"], "AUMatrixPatcherFactory")
-
     def test_graph(self):
         defs, boxes, wires, params, gparam = gr.parse_dspg(GRAPH)
         self.assertEqual(defs["numChansIn"], "2")
