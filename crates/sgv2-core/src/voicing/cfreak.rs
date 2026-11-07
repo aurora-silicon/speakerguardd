@@ -17,7 +17,9 @@
 //! * the fast stage carries at most `MinFastGain` dB (`F = 10^(-mfg/20)`);
 //!   what is left goes to a slow gain `s`: its target `u` is
 //!   `min(1, t / F)` held at its minimum over the last `H + 1` frames; `s`
-//!   drops to `u` at once and otherwise moves towards it with
+//!   drops to `u` at once and otherwise moves towards it with the release
+//!   coefficient selected by the detector history: [`TAU_FAST_S`] while a
+//!   five-dB upward detector excursion has fast-release budget left, then
 //!   [`TAU_SLOW_S`];
 //! * the combined target `s * max(t, F)` is held at its minimum over the
 //!   last `H + 1` frames and smoothed by a normalised `L`-tap sine window
@@ -73,15 +75,9 @@ use alloc::vec::Vec;
 pub const TRUE_PEAK_SCALE_DB: f64 = 0.688;
 /// The unit's sample ceiling sits 0.00002 dB under the threshold.
 pub const CEILING_TRIM_DB: f64 = -0.00002;
-/// Slow gain time constant (towards its target, from below).
-///
-/// TODO(SPEC): the unit releases the slow gain with a 0.27 s constant for a
-/// while after an over and with this 10 s one afterwards; how long the fast
-/// phase lasts depends on its render blocks and on signal history (about
-/// 44 ms after an isolated over, about 9 ms after some sustained ones, none
-/// after others). Until that is pinned the slow constant is used
-/// throughout, which can only hold the gain lower than the unit's. This
-/// only matters past `MinFastGain` dB of limiting.
+/// First slow-gain release time constant (towards its target, from below).
+pub const TAU_FAST_S: f64 = 0.270;
+/// Long slow-gain release time constant (towards its target, from below).
 pub const TAU_SLOW_S: f64 = 10.0;
 /// Output saturation oversampling factor.
 pub const OVERSAMPLE: usize = 3;
@@ -152,6 +148,16 @@ pub const DRIVE_LP_HZ: f64 = 13_000.0;
 /// and of a second-order one.
 const DRIVE_HP_Q: [f64; 2] = [0.541_196_100_146_197, 1.306_562_964_876_376_5];
 const DRIVE_LP_Q: f64 = core::f64::consts::FRAC_1_SQRT_2;
+/// Detector movement that adds one fast-release interval.
+const RELEASE_STEP_DB: f64 = 5.0;
+/// The release selector runs after the detector's 4-by-10 control-rate
+/// reduction. Each step adds ten control frames at 48 kHz (and the nearest
+/// corresponding count at other rates).
+const RELEASE_CONTROL_DECIMATION: usize = 40;
+const RELEASE_ADD_RATE_HZ: f64 = 5_000.0;
+const RELEASE_POWER_WINDOW_S: f64 = 0.030;
+const RELEASE_FILTER_TAPS: usize = 4;
+const RELEASE_POWER_FLOOR: f64 = 1.0e-10;
 
 /// ITU-R BS.1770-4 Annex 2 true-peak interpolator, first two phases (the
 /// other two are their mirror images).
@@ -226,6 +232,12 @@ fn highpass_sections(order: usize, f0: f64, fs: f64) -> ([SatSection; HIGHPASS_S
         n += 1;
     }
     (s, n)
+}
+
+/// Short public boxcar for the 40:1 release-control reduction.  This avoids
+/// carrying an installed-unit coefficient table.
+fn release_filter() -> [f64; RELEASE_FILTER_TAPS] {
+    [1.0 / RELEASE_FILTER_TAPS as f64; RELEASE_FILTER_TAPS]
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -739,7 +751,21 @@ pub struct Run {
     ceiling: f64,
     floor: f64,
     tp_scale: f64,
+    a_fast: f64,
     a_slow: f64,
+    release_up: f32,
+    release_down: f32,
+    release_anchor: f32,
+    fast_release_left: usize,
+    fast_release_add: usize,
+    fast_release: bool,
+    release_control_at: usize,
+    release_filter: [f64; RELEASE_FILTER_TAPS],
+    release_filter_state: [f64; RELEASE_FILTER_TAPS],
+    release_filter_at: usize,
+    release_power: Box<[f32]>,
+    release_power_at: usize,
+    release_power_sum: f64,
     /// Window weights, `w[j]` applies to the held target `j` frames ago.
     weight: Box<[f64]>,
     /// Ring of the last `lookahead` held targets.
@@ -790,7 +816,26 @@ impl Run {
             ceiling: db(p.threshold_db + CEILING_TRIM_DB),
             floor: db(-p.min_fast_gain_db),
             tp_scale: db(TRUE_PEAK_SCALE_DB),
+            a_fast: coef(TAU_FAST_S),
             a_slow: coef(TAU_SLOW_S),
+            release_up: db(RELEASE_STEP_DB) as f32,
+            release_down: db(-RELEASE_STEP_DB) as f32,
+            release_anchor: 0.0,
+            fast_release_left: 0,
+            fast_release_add: libm::ceil(fs / RELEASE_ADD_RATE_HZ) as usize,
+            fast_release: true,
+            release_control_at: 0,
+            release_filter: release_filter(),
+            release_filter_state: [0.0; RELEASE_FILTER_TAPS],
+            release_filter_at: 0,
+            release_power: vec![
+                0.0;
+                libm::round(fs / RELEASE_CONTROL_DECIMATION as f64 * RELEASE_POWER_WINDOW_S).max(1.0)
+                    as usize
+            ]
+            .into_boxed_slice(),
+            release_power_at: 0,
+            release_power_sum: 0.0,
             weight,
             held: vec![1.0; lookahead].into_boxed_slice(),
             held_at: 0,
@@ -817,6 +862,15 @@ impl Run {
         self.slow_target.reset();
         self.target.reset();
         self.slow = 1.0;
+        self.release_anchor = 0.0;
+        self.fast_release_left = 0;
+        self.fast_release = true;
+        self.release_control_at = 0;
+        self.release_filter_state = [0.0; RELEASE_FILTER_TAPS];
+        self.release_filter_at = 0;
+        self.release_power.fill(0.0);
+        self.release_power_at = 0;
+        self.release_power_sum = 0.0;
         self.line.iter_mut().for_each(|v| *v = 0.0);
         self.line_at = 0;
         self.hist.iter_mut().for_each(|v| *v = 0.0);
@@ -832,13 +886,40 @@ impl Run {
     }
 
     /// The linked gain for this frame, given the newest input frame.
-    fn gain(&mut self, peak: f64) -> f64 {
+    fn gain(&mut self, peak: f64, power: f64) -> f64 {
+        if self.release_control_at == 0 {
+            self.release_filter_state[self.release_filter_at] = libm::sqrt(power);
+            let mut filtered = 0.0;
+            for (i, tap) in self.release_filter.iter().enumerate() {
+                filtered += tap
+                    * self.release_filter_state
+                        [(self.release_filter_at + RELEASE_FILTER_TAPS - i) % RELEASE_FILTER_TAPS];
+            }
+            self.release_filter_at = (self.release_filter_at + 1) % RELEASE_FILTER_TAPS;
+
+            let value = (filtered * filtered) as f32;
+            self.release_power_sum -= f64::from(self.release_power[self.release_power_at]);
+            self.release_power_sum += f64::from(value);
+            self.release_power[self.release_power_at] = value;
+            self.release_power_at = (self.release_power_at + 1) % self.release_power.len();
+            let level = (self.release_power_sum / self.release_power.len() as f64 + RELEASE_POWER_FLOOR) as f32;
+            if level > self.release_anchor * self.release_up {
+                self.release_anchor = level;
+                self.fast_release_left = self.fast_release_left.saturating_add(self.fast_release_add);
+            } else if level < self.release_anchor * self.release_down {
+                self.release_anchor = level;
+            }
+            self.fast_release = self.fast_release_left > 0;
+            self.fast_release_left = self.fast_release_left.saturating_sub(1);
+        }
+        self.release_control_at = (self.release_control_at + 1) % RELEASE_CONTROL_DECIMATION;
         let t = if peak > self.ceiling { self.ceiling / peak } else { 1.0 };
         let u = self.slow_target.push((t / self.floor).min(1.0));
         if u < self.slow {
             self.slow = u;
         } else {
-            self.slow += self.a_slow * (u - self.slow);
+            let a = if self.fast_release { self.a_fast } else { self.a_slow };
+            self.slow += a * (u - self.slow);
         }
         let h = self.target.push(self.slow * t.max(self.floor));
         let l = self.lookahead;
@@ -900,6 +981,7 @@ impl Run {
         let l = self.lookahead;
         for i in 0..n {
             let mut peak = 0.0f64;
+            let mut power = 0.0f64;
             let mut frame = [0.0f64; MAX_CHANNELS];
             self.hist_at = (self.hist_at + 1) % TAPS;
             for (c, slot) in frame[..ch].iter_mut().enumerate() {
@@ -933,11 +1015,12 @@ impl Run {
                     a = a.max(self.tp_scale * best);
                 }
                 peak = peak.max(a);
+                power += a * a;
             }
             if let Some(s) = &mut self.saturation {
                 s.started = s.started.saturating_add(1);
             }
-            let g = self.gain(peak);
+            let g = self.gain(peak, power);
             for (c, b) in bufs[..ch].iter_mut().enumerate() {
                 let slot = c * l + self.line_at;
                 let delayed = self.line[slot];
@@ -1032,6 +1115,15 @@ mod tests {
             assert_eq!(Saturation::shape(1, k, 10.0), 1.0 / k);
         }
         assert!((Saturation::shape(2, 1.0, 0.5) - libm::sin(0.5)).abs() < 1e-15);
+    }
+
+    #[test]
+    fn release_control_filter_is_dc_normalised() {
+        let taps = release_filter();
+        assert!((taps.iter().sum::<f64>() - 1.0).abs() < 1e-12);
+        for i in 0..RELEASE_FILTER_TAPS {
+            assert!((taps[i] - taps[RELEASE_FILTER_TAPS - 1 - i]).abs() < 1e-12);
+        }
     }
 
     #[test]
