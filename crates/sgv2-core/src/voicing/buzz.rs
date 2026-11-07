@@ -220,14 +220,15 @@ impl Params {
 
 #[derive(Clone, Copy, Default)]
 struct FilterState {
-    z1: f64,
-    z2: f64,
+    z1: f32,
+    z2: f32,
 }
 
-fn filter(section: Section, state: &mut FilterState, x: f64) -> f64 {
-    let y = section.b0 * x + state.z1;
-    state.z1 = section.b1 * x - section.a1 * y + state.z2;
-    state.z2 = section.b2 * x - section.a2 * y;
+fn filter(section: Section, state: &mut FilterState, x: f32) -> f32 {
+    let [b0, b1, b2, a1, a2] = [section.b0, section.b1, section.b2, section.a1, section.a2].map(|v| v as f32);
+    let y = b0 * x + state.z1;
+    state.z1 = b1 * x - a1 * y + state.z2;
+    state.z2 = b2 * x - a2 * y;
     y
 }
 
@@ -260,8 +261,8 @@ fn threshold_peak(gain_db: f64, frequency_hz: f64, quality: f64, fs: f64) -> Sec
 
 #[derive(Clone)]
 struct Track {
-    frequency_hz: f64,
-    gain: f64,
+    frequency_hz: f32,
+    gain: f32,
     audio_section: Section,
     analysis_section: Section,
     audio: [FilterState; MAX_CHANNELS],
@@ -294,23 +295,27 @@ pub struct Run {
     hop: usize,
     decimation_at: usize,
     fir: [f64; FIR],
-    fir_state: [f64; FIR],
+    fir_state: [f32; FIR],
     fir_at: usize,
     threshold_db: f64,
     threshold_shape: [Section; BANDS],
     tracks: Vec<Track>,
-    release: f64,
+    release: f32,
 }
 
 impl Run {
     pub fn new(p: &Params, fs: f64, channels: usize) -> Run {
         let fs = if fs.is_finite() { fs.clamp(8_000.0, 192_000.0) } else { 48_000.0 };
         let channels = channels.clamp(1, MAX_CHANNELS);
-        let lookahead = libm::round(p.lookahead_s * fs).clamp(1.0, 2880.0) as usize;
+        // The AU publishes the saved count as a span including the current
+        // frame: an 8 ms value at 48 kHz maps input frame 1 to output frame
+        // 384.  A ring containing the full saved count maps it one frame
+        // late, so retain one fewer prior frame.
+        let lookahead = (libm::round(p.lookahead_s * fs).clamp(2.0, 2880.0) as usize) - 1;
         // The saved coefficient uses the 128-frame analysis hop with the
         // host-rate timebase even though one decision advances 4*128 host
         // frames.  Keep those two counts distinct.
-        let release = 1.0 - libm::exp(-(ANALYSIS_HOP as f64) / (0.050 * fs));
+        let release = (1.0 - libm::exp(-(ANALYSIS_HOP as f64) / (0.050 * fs))) as f32;
         Run {
             channels,
             fs,
@@ -357,18 +362,18 @@ impl Run {
     }
 
     fn threshold(&self, frequency_hz: f64) -> f64 {
-        let db = self
-            .threshold_shape
-            .iter()
-            .fold(self.threshold_db, |v, s| v + 20.0 * libm::log10(s.magnitude(frequency_hz, self.fs).max(1.0e-20)));
+        let db = self.threshold_shape.iter().fold(self.threshold_db, |v, s| {
+            v + 20.0 * libm::log10(s.magnitude(frequency_hz, ANALYSIS_RATE).max(1.0e-20))
+        });
         libm::pow(10.0, db / 20.0)
     }
 
     fn spectrum(&self, bin: usize) -> (f64, f64) {
+        let centre = bin as f64;
         if self.history_len == 0 {
-            return (0.0, bin as f64 * ANALYSIS_RATE / FFT as f64);
+            return (0.0, centre * ANALYSIS_RATE / FFT as f64);
         }
-        let step = 2.0 * core::f64::consts::PI * bin as f64 / FFT as f64;
+        let step = 2.0 * core::f64::consts::PI * centre / FFT as f64;
         let (ss, cc) = (libm::sin(step), libm::cos(step));
         let (mut s, mut c, mut re, mut im, mut dre, mut dim) = (0.0, 1.0, 0.0, 0.0, 0.0, 0.0);
         for n in 0..FFT {
@@ -389,16 +394,16 @@ impl Run {
         let q = libm::sqrt(dre * dre + dim * dim) / (magnitude + 1.0e-20);
         let denominator = libm::sqrt(2.0 * (1.0 - libm::cos(q))).max(1.0e-20);
         let frequency_hz = ANALYSIS_RATE / (2.0 * core::f64::consts::PI) * q * q / denominator;
-        // A real-input transform publishes twice the positive-frequency
-        // complex magnitude. Converting that convention to line RMS leaves
-        // sqrt(2) times the direct complex sum used here.
-        (core::f64::consts::SQRT_2 * magnitude, frequency_hz)
+        // The analyser compares the doubled positive-frequency magnitude
+        // published by its real-input transform.  This is a peak-domain
+        // comparison; it does not convert the doubled line to RMS.
+        (2.0 * magnitude, frequency_hz)
     }
 
     fn redesign(&mut self, index: usize) {
         let t = &mut self.tracks[index];
-        t.audio_section = rejection(t.frequency_hz, NOTCH_QUALITY, self.fs);
-        t.analysis_section = rejection(t.frequency_hz, NOTCH_QUALITY, ANALYSIS_RATE);
+        t.audio_section = rejection(t.frequency_hz as f64, NOTCH_QUALITY, self.fs);
+        t.analysis_section = rejection(t.frequency_hz as f64, NOTCH_QUALITY, ANALYSIS_RATE);
     }
 
     // The index also addresses self.tracks and self.redesign(), which an iterator over used cannot borrow.
@@ -407,24 +412,24 @@ impl Run {
         let mut replacement = None;
         let mut replacement_distance = f64::INFINITY;
         for i in 0..TRACKS {
-            let distance = (frequency_hz - self.tracks[i].frequency_hz).abs() / frequency_hz;
+            let distance = (frequency_hz - self.tracks[i].frequency_hz as f64).abs() / frequency_hz;
             if distance < MATCH_RELATIVE && !used[i] {
                 let t = &mut self.tracks[i];
-                t.frequency_hz = frequency_hz;
-                t.gain = (t.gain * multiplier).clamp(1.0e-6, 1.0);
+                t.frequency_hz = frequency_hz as f32;
+                t.gain = (t.gain * multiplier as f32).clamp(1.0e-6, 1.0);
                 used[i] = true;
                 self.redesign(i);
                 return;
             }
-            if self.tracks[i].gain > REPLACE_GAIN && distance < replacement_distance {
+            if self.tracks[i].gain > REPLACE_GAIN as f32 && distance < replacement_distance {
                 replacement = Some(i);
                 replacement_distance = distance;
             }
         }
         if let Some(i) = replacement {
             let t = &mut self.tracks[i];
-            t.frequency_hz = frequency_hz;
-            t.gain = multiplier.clamp(1.0e-6, 1.0);
+            t.frequency_hz = frequency_hz as f32;
+            t.gain = multiplier.clamp(1.0e-6, 1.0) as f32;
             used[i] = true;
             self.redesign(i);
         }
@@ -435,7 +440,11 @@ impl Run {
             self.tracks[i].gain += self.release * (1.0 - self.tracks[i].gain);
             self.redesign(i);
         }
-        let max_bin = (libm::ceil(self.maximum_hz * FFT as f64 / ANALYSIS_RATE) as usize).min(FFT / 2 - 1);
+        // The saved threshold curve is sampled at k + 1/2 even though the
+        // transformed program uses integer DFT cells. Keep the upper edge
+        // strict and retain one extra cell for candidate neighbour work.
+        let bin_count = (libm::ceil(self.maximum_hz * FFT as f64 / ANALYSIS_RATE - 0.5) as usize).min(FFT / 2);
+        let max_bin = bin_count.saturating_sub(1);
         let mut amplitudes = [0.0; FFT / 2 + 1];
         let mut frequencies = [0.0; FFT / 2 + 1];
         for (bin, value) in amplitudes.iter_mut().enumerate().take(max_bin + 2) {
@@ -444,10 +453,10 @@ impl Run {
         let mut used = [false; TRACKS];
         let mut candidates = 0usize;
         for bin in 1..=max_bin {
-            let frequency = bin as f64 * ANALYSIS_RATE / FFT as f64;
+            let frequency = (bin as f64 + 0.5) * ANALYSIS_RATE / FFT as f64;
             let threshold = self.threshold(frequency);
             let amplitude = amplitudes[bin];
-            if frequency < MIN_HZ || amplitude <= threshold || !amplitude.is_finite() {
+            if amplitude <= threshold || !amplitude.is_finite() {
                 continue;
             }
             let frequency_hz = frequencies[bin];
@@ -473,33 +482,33 @@ impl Run {
             // look-ahead block rather than starting one block late.
             let count = (frames - at).min(self.hop);
             for frame in at..at + count {
-                let mut linked = 0.0f64;
+                let mut linked = 0.0f32;
                 for (channel, buffer) in buffers.iter_mut().take(channels).enumerate() {
-                    let raw = if buffer[frame].is_finite() { buffer[frame] as f64 } else { 0.0 };
+                    let raw = if buffer[frame].is_finite() { buffer[frame] } else { 0.0 };
                     if raw.abs() > linked.abs() {
                         linked = raw;
                     }
                     let slot = self.delay_at * self.channels + channel;
                     buffer[frame] = self.delay[slot];
-                    self.delay[slot] = raw as f32;
+                    self.delay[slot] = raw;
                 }
                 self.delay_at = (self.delay_at + 1) % self.lookahead;
                 self.fir_state[self.fir_at] = linked;
                 self.fir_at = (self.fir_at + 1) % FIR;
                 self.decimation_at += 1;
                 if self.decimation_at == DECIMATION {
-                    let mut filtered = 0.0;
+                    let mut filtered = 0.0f32;
                     for (tap, coefficient) in self.fir.iter().enumerate() {
-                        filtered += coefficient * self.fir_state[(self.fir_at + FIR - 1 - tap) % FIR];
+                        filtered += *coefficient as f32 * self.fir_state[(self.fir_at + FIR - 1 - tap) % FIR];
                     }
                     for track in &mut self.tracks {
                         let wet = 1.0 - track.gain;
-                        if wet > f32::EPSILON as f64 {
+                        if wet > f32::EPSILON {
                             let rejected = filter(track.analysis_section, &mut track.analysis, filtered);
                             filtered -= wet * rejected;
                         }
                     }
-                    self.history[self.history_at] = filtered as f32;
+                    self.history[self.history_at] = filtered;
                     self.history_at = (self.history_at + 1) % FFT;
                     self.history_len = (self.history_len + 1).min(FFT);
                     self.decimation_at = 0;
@@ -512,15 +521,15 @@ impl Run {
             }
             for frame in at..at + count {
                 for (channel, buffer) in buffers.iter_mut().take(channels).enumerate() {
-                    let mut delayed = buffer[frame] as f64;
+                    let mut delayed = buffer[frame];
                     for track in &mut self.tracks {
                         let wet = 1.0 - track.gain;
-                        if wet > f32::EPSILON as f64 {
+                        if wet > f32::EPSILON {
                             let rejected = filter(track.audio_section, &mut track.audio[channel], delayed);
                             delayed -= wet * rejected;
                         }
                     }
-                    buffer[frame] = delayed as f32;
+                    buffer[frame] = delayed;
                 }
             }
             at += count;
@@ -544,7 +553,7 @@ mod tests {
         let mut z = [0.0; 512];
         r.process(&mut [&mut z], 512);
         assert!(z.iter().all(|v| *v == 0.0));
-        assert_eq!(r.latency(), 384);
+        assert_eq!(r.latency(), 383);
     }
 
     #[test]
