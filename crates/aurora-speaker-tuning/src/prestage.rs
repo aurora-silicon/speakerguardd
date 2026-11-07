@@ -34,7 +34,7 @@
 //! | 12 | high shelf | matched-Z, two-zero magnitude-corrected high shelf |
 //! | 0 | a Butterworth band shelf; four frequencies set its two edges | two Butterworth shelves and the compensating flat gain |
 //! | 2 | a Butterworth shelf; the first two frequencies set its direction, midpoint and slope | bilinear, prewarped Butterworth shelf sections |
-//! | 7 | a four-section constant tilt, from `-gain` to `+gain` around the slot frequency | four bilinear first-order shelves and a flat `-gain` |
+//! | 7 | a constant tilt, from `-gain` to `+gain` around the slot frequency | the decoded complementary biquad pair |
 //! | 14 | resonant second-order high-pass; gain and order are ignored | bilinear high-pass with the saved analog-decay quality convention |
 //! | 15 | a level-dependent notch | saved detector, range, ratio, threshold and attack/release law |
 //! | 18 | a level-dependent high shelf | saved detector, range, ratio, threshold and attack/release law |
@@ -290,7 +290,7 @@ pub fn tone(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics) -> Result<
 ///
 /// A box whose volume input the graph leaves alone is carried as the
 /// pre-stage carries it, with no automation and no gap.
-pub(crate) fn voicing_tone(
+pub fn voicing_tone(
     stage: &Stage,
     width: usize,
     volume_wired: bool,
@@ -466,58 +466,6 @@ pub fn automation(stage: &Stage) -> Vec<u32> {
         .collect()
 }
 
-/// Bilinear-transform one real analog factor. Coefficients are in descending
-/// powers (`c2 s^2 + c1 s + c0`); a first-order factor has `c2 == 0`.
-fn bilinear_factor(num: [f64; 3], den: [f64; 3], k: f64) -> Section {
-    let transform = |c: [f64; 3]| {
-        if c[0] == 0.0 {
-            let c1 = c[1] / k;
-            return [c1 + c[2], -c1 + c[2], 0.0];
-        }
-        let c2 = c[0] / (k * k);
-        let c1 = c[1] / k;
-        [c2 + c1 + c[2], -2.0 * c2 + 2.0 * c[2], c2 - c1 + c[2]]
-    };
-    let b = transform(num);
-    let a = transform(den);
-    Section { b0: b[0] / a[0], b1: b[1] / a[0], b2: b[2] / a[0], a1: a[1] / a[0], a2: a[2] / a[0] }
-}
-
-/// One real factor of a high- or low-shelf cut. `a` is the pole/zero
-/// radius ratio and `q2` is the coefficient of a complex Butterworth pair;
-/// `None` selects the real first-order factor. A boost is the exact inverse.
-fn shelf_factor(high: bool, boost: bool, a: f64, q2: Option<f64>, k: f64) -> Section {
-    let (mut num, mut den) = match (high, q2) {
-        (true, Some(q)) => ([a * a, q * a, 1.0], [1.0 / (a * a), q / a, 1.0]),
-        (false, Some(q)) => ([1.0, q * a, a * a], [1.0, q / a, 1.0 / (a * a)]),
-        (true, None) => ([0.0, a, 1.0], [0.0, 1.0 / a, 1.0]),
-        (false, None) => ([0.0, 1.0, a], [0.0, 1.0, 1.0 / a]),
-    };
-    if boost {
-        std::mem::swap(&mut num, &mut den);
-    }
-    bilinear_factor(num, den, k)
-}
-
-fn integer_shelf(high: bool, order: u32, gain_db: f64, fm: f64, fs: f64) -> Vec<Section> {
-    if gain_db == 0.0 {
-        return Vec::new();
-    }
-    let boost = gain_db > 0.0;
-    let g = 10f64.powf(-gain_db.abs() / 20.0);
-    let a = g.powf(1.0 / (2.0 * order as f64));
-    let k = (PI * fm / fs).tan();
-    let mut out = Vec::new();
-    for i in 0..order / 2 {
-        let q2 = 2.0 * (PI * (2 * i + 1) as f64 / (2 * order) as f64).sin();
-        out.push(shelf_factor(high, boost, a, Some(q2), k));
-    }
-    if order % 2 != 0 {
-        out.push(shelf_factor(high, boost, a, None, k));
-    }
-    out
-}
-
 /// ToneMeister's type-2 shelf. At integer order this is the exact
 /// Butterworth shelf
 ///
@@ -532,19 +480,39 @@ fn butterworth_shelf(gain_db: f64, f3: f64, f4: f64, max_order: u32, fs: f64) ->
     made.sections[..made.count].to_vec()
 }
 
-/// ToneMeister's type-7 constant tilt. Four equal first-order shelves are
-/// spaced symmetrically in octaves around the pivot; the small gain-squared
-/// spreading is the unit's measured constant-slope law. Q and the remaining
-/// slot fields do not participate.
-fn constant_tilt(gain_db: f64, f0: f64, fs: f64) -> Vec<Section> {
-    let g2 = gain_db * gain_db;
-    let outer = 3.110 + 0.001_305 * g2;
-    let inner = 1.214 + 0.000_345 * g2;
-    let mut out = Vec::new();
-    for octaves in [-outer, -inner, inner, outer] {
-        out.extend(integer_shelf(true, 1, gain_db / 2.0, f0 * 2f64.powf(octaves), fs));
+/// One half of ToneMeister's type-7 constant tilt. The installed constructor
+/// uses this dedicated second-order prototype twice, at the saved pivot and
+/// opposite gains. `complement` selects its paired pole/zero mapping.
+fn tilt_section(gain_db: f64, f0: f64, fs: f64, complement: bool) -> Section {
+    if gain_db == 0.0 {
+        return Section::IDENTITY;
     }
-    out
+    let k = (PI * f0 / fs).tan();
+    let g = (gain_db * std::f64::consts::LN_10 / 20.0).exp();
+    let sqrt_g = g.sqrt();
+    let root = (g * (g + 34.0) + 1.0).sqrt();
+    let easing = (g.ln() * (3.0 * (g + 1.0) + root) / (-8.0 * (g - 1.0))).exp();
+    let fourth_root = sqrt_g.sqrt();
+    let spread = 2.0 * ((g + 4.0 * sqrt_g + 1.0 + root) / (8.0 * sqrt_g)).sqrt();
+    let upper = easing * fourth_root;
+    let lower = easing / fourth_root;
+    let (pole, zero, base) = if complement { (k * lower, k * upper, g) } else { (k / lower, k / upper, 1.0) };
+    let pole_den = pole * pole + spread * pole + 1.0;
+    let zero_den = zero * zero + spread * zero + 1.0;
+    let b0 = base * (pole * pole * zero_den) / (zero * zero * pole_den);
+    let native = |value: f64| f64::from(value as f32);
+    Section {
+        b0: native(b0),
+        b1: native(2.0 * b0 * (zero * zero - 1.0) / zero_den),
+        b2: native(b0 * (zero * zero - spread * zero + 1.0) / zero_den),
+        a1: native(2.0 * (pole * pole - 1.0) / pole_den),
+        a2: native((pole * pole - spread * pole + 1.0) / pole_den),
+    }
+}
+
+/// ToneMeister's exact type-7 constant tilt: the decoded 0x15/0x16 pair.
+fn constant_tilt(gain_db: f64, f0: f64, fs: f64) -> Vec<Section> {
+    vec![tilt_section(gain_db, f0, fs, false), tilt_section(-gain_db, f0, fs, true)]
 }
 
 /// A slot's gain and frequency at one volume.
@@ -962,7 +930,6 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics, mode: Rea
                 }
                 if !(in_bypassed_group && gain > 0.0) {
                     p.sections.extend(constant_tilt(gain, f0, fs));
-                    p.gain_db -= gain;
                 }
             }
             1 | 11 | 12 => {
@@ -1988,6 +1955,20 @@ mod tests {
         assert_eq!(tone.dynamic_automation[0].index, 0);
         assert_eq!(tone.dynamic_automation[0].a.frequency_hz, 9_500.0);
         assert_eq!(tone.dynamic_automation[0].b.frequency_hz, 9_000.0);
+    }
+
+    #[test]
+    fn voicing_keeps_the_full_constant_tilt() {
+        let fs = 48_000.0;
+        let mut d = Diagnostics::default();
+        let stage = tmst(&[], &[(0, [3.0, 7.0, 20.0, 300.0, 1.0, 1.0, 3.0, 0.0])]);
+        let (tone, partial) = voicing_tone(&stage, 1, false, fs, &mut d).unwrap();
+        assert!(partial.is_empty());
+        let channel = &tone.channels[0];
+        let db = |frequency| 20.0 * channel.magnitude(frequency, fs).log10();
+        assert!(db(1.0) < -19.9, "low asymptote: {} dB", db(1.0));
+        assert!(db(23_900.0) > 19.9, "high asymptote: {} dB", db(23_900.0));
+        assert!(db(300.0).abs() < 0.05, "pivot: {} dB", db(300.0));
     }
 
     #[test]

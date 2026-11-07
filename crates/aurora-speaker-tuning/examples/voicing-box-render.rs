@@ -19,6 +19,7 @@ use aurora_speaker_tuning::bundle::Bundle;
 use aurora_speaker_tuning::dspg::analysis::{Lane, Origin, Pass};
 use aurora_speaker_tuning::tuning::{Options, Tuning};
 use aurora_speaker_tuning::{prestage, voicing, Diagnostics};
+use sgv2_core::voicing::chain::{Chain, Kind, NodeSpec, Source, Spec};
 use std::path::PathBuf;
 use std::process::exit;
 
@@ -30,6 +31,8 @@ fn die(msg: impl std::fmt::Display) -> ! {
 fn main() {
     let mut root = None;
     let (mut aid, mut name, mut ch, mut only_slot) = (None, None, None, None);
+    let mut voicing_chain = false;
+    let mut sample_rate = None;
     let mut files = Vec::new();
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -39,17 +42,21 @@ fn main() {
             "--box" => name = it.next(),
             "--ch" => ch = it.next().and_then(|v| v.parse::<usize>().ok()),
             "--only-slot" => only_slot = it.next().and_then(|v| v.parse::<u32>().ok()),
+            "--voicing-chain" => voicing_chain = true,
+            "--sample-rate" => sample_rate = it.next().and_then(|v| v.parse::<i128>().ok()),
             _ => files.push(a),
         }
     }
     let (Some(root), Some(aid), Some(name), Some(ch), [inp, out]) = (root, aid, name, ch, files.as_slice()) else {
-        eprintln!("usage: voicing-box-render --tunings-root DIR --aid N --box NAME --ch C IN.f32 OUT.f32");
+        eprintln!(
+            "usage: voicing-box-render --tunings-root DIR --aid N --box NAME --ch C [--voicing-chain] [--sample-rate HZ] IN.f32 OUT.f32"
+        );
         exit(2)
     };
     let mut diags = Diagnostics::default();
     let bundle = Bundle::from_tunings_root(&root, aid).unwrap_or_else(|e| die(format!("{e:?}")));
     let t = Tuning::load(&bundle, &Options::default(), &mut diags).unwrap_or_else(|e| die(format!("{e:?}")));
-    let fs = t.selection.sample_rate.unwrap_or(48_000) as f64;
+    let fs = sample_rate.or(t.selection.sample_rate).unwrap_or(48_000) as f64;
     let mut stage = t.chain.iter().find(|s| s.name == name).cloned().unwrap_or_else(|| die(format!("no box {name}")));
     if let Some(slot) = only_slot {
         let global = stage
@@ -96,6 +103,38 @@ fn main() {
             }
         }
         "tmst" => {
+            if voicing_chain {
+                let (tone, partial) =
+                    prestage::voicing_tone(stage, ch, false, fs, &mut diags).unwrap_or_else(|e| die(format!("{e:?}")));
+                if !partial.is_empty() {
+                    die(format!("volume automation entries carried only in part: {partial:?}"));
+                }
+                let spec = Spec {
+                    program_channels: ch,
+                    nodes: vec![NodeSpec { kind: Kind::Tone(tone), inputs: (0..ch).map(Source::Program).collect() }],
+                    outputs: (0..ch).map(|channel| Source::Node(0, channel)).collect(),
+                    links: Vec::new(),
+                };
+                let mut run = Chain::new(spec, fs, 512).unwrap_or_else(|| die("invalid isolated Tone chain"));
+                let mut rendered = vec![vec![0.0f32; frames]; ch];
+                let mut at = 0;
+                while at < frames {
+                    let k = (frames - at).min(512);
+                    let input: Vec<&[f32]> = planar.iter().map(|v| &v[at..at + k]).collect();
+                    let mut output: Vec<&mut [f32]> = rendered.iter_mut().map(|v| &mut v[at..at + k]).collect();
+                    run.process(&input, &mut output, k);
+                    at += k;
+                }
+                planar = rendered;
+                for i in 0..frames {
+                    for c in 0..ch {
+                        x[i * ch + c] = planar[c][i];
+                    }
+                }
+                let bytes: Vec<u8> = x.iter().flat_map(|v| v.to_le_bytes()).collect();
+                std::fs::write(out, bytes).unwrap_or_else(|e| die(e));
+                return;
+            }
             let lanes: Vec<Lane> = (0..ch)
                 .map(|c| Lane {
                     origin: Origin { node: "in".into(), port: 0, channel: c as u32 },
