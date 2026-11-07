@@ -1905,6 +1905,26 @@ impl Unit {
     pub fn stage_model(&mut self, model: crate::lsid::ModelGeneration) -> Result<(), crate::lsid::Error> {
         self.handoff.as_mut().ok_or(crate::lsid::Error::Unsupported)?.stage(model)
     }
+    /// Advance the companion with an authenticated graph-source identity and
+    /// stage one complete property-6630 generation. This is exposed for the
+    /// offline graph host; the ordinary [`ProtectionUnit::process`] interface
+    /// has no source identity and therefore passes an empty identity.
+    pub fn observe_estimator(&mut self, source: &str, sense: &[&[f32]], frames: usize) {
+        let candidate = self.estimator.as_mut().and_then(|estimator| {
+            let before = estimator.model().generation();
+            estimator.observe(source, sense, frames);
+            if estimator.model().generation() > before {
+                Some(estimator.model().clone())
+            } else {
+                None
+            }
+        });
+        if let (Some(candidate), Some(handoff)) = (candidate, &mut self.handoff) {
+            // The estimator has already validated the complete candidate. A
+            // rejected stage can only be stale; retain the current generation.
+            let _ = handoff.stage(candidate);
+        }
+    }
     pub fn set_runtime_budgets(&mut self, budgets: [f32; 4]) {
         self.params.runtime_budget_present = 1;
         self.params.runtime_budget_w = budgets;
@@ -2935,11 +2955,9 @@ impl ProtectionUnit for Unit {
     }
     fn process(&mut self, mut io: Io<'_, '_>) -> Health {
         let frames = io.frames;
-        if let Some(estimator) = &mut self.estimator {
-            // Io has no authenticated source identity. Never infer it from port
-            // count: adaptation stays disabled, even when all twelve ports exist.
-            estimator.observe("", io.sense, frames);
-        }
+        // Io has no authenticated source identity. Never infer it from port
+        // count: no candidate can be accepted, even with twelve sense ports.
+        self.observe_estimator("", io.sense, frames);
         let cadence = controller_frames(self.params.sample_rate) as u64;
         let end = self.model_frames.saturating_add(frames as u64);
         if self.model_frames % cadence == 0 || end / cadence > self.model_frames / cadence {
