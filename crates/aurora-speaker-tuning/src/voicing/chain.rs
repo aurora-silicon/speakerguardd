@@ -66,7 +66,7 @@ fn tone(
     if !tone.dynamic.is_empty() {
         gaps.push((
             stage.name.clone(),
-            "level-dependent filters carry native multirate reconstruction and a knee-qualified release-to-idle carrier handoff; active-floor and release-tracking parity are pending"
+            "level-dependent filters carry native multirate reconstruction, a knee-qualified release-to-idle handoff, and the fixed-carrier setup-copy ramp; final release-tracking parity is pending"
                 .into(),
         ));
     }

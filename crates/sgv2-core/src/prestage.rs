@@ -826,7 +826,11 @@ struct DynamicRun {
     detector: Section,
     component: Section,
     detector_state: [f32; 2],
-    component_state: [[f32; 2]; MAX_CHANNELS],
+    component_state: [[[f32; 4]; MAX_CHANNELS]; 2],
+    component_sections: [Section; 2],
+    component_setup: usize,
+    component_ramp_frame: usize,
+    component_ramp_frames: usize,
     quadrature: [Section; 2],
     quadrature_state: [[f32; 2]; 2],
     control_phase: usize,
@@ -857,6 +861,10 @@ impl DynamicRun {
     const RELEASE_ARM_GAIN: f64 = 1.0 / ((1.0 + Self::CARRIER_NEUTRAL as f64) * (1.0 + Self::CARRIER_NEUTRAL as f64));
     const CARRIER_SETTLE_DELTA: f32 = 1e-7;
     const CARRIER_SETTLE_FRAMES: usize = 256;
+    // The fixed carrier owns two setup objects.  When the preceding ramp is
+    // complete, the installed box swaps them, copies the old setup's state
+    // into the new one, and crossfades over round(20 ms * fs) + 1 points.
+    const COMPONENT_RAMP_MS: f64 = 20.0;
 
     fn new(params: &DynamicFilter, fs: f64) -> DynamicRun {
         let detector = match params.kind {
@@ -895,7 +903,11 @@ impl DynamicRun {
             detector,
             component,
             detector_state: [0.0; 2],
-            component_state: [[0.0; 2]; MAX_CHANNELS],
+            component_state: [[[0.0; 4]; MAX_CHANNELS]; 2],
+            component_sections: [component; 2],
+            component_setup: 0,
+            component_ramp_frame: 0,
+            component_ramp_frames: libm::round(Self::COMPONENT_RAMP_MS * fs / 1_000.0) as usize + 1,
             quadrature,
             quadrature_state: [[0.0; 2]; 2],
             control_phase: 0,
@@ -923,11 +935,14 @@ impl DynamicRun {
         self.component = fresh.component;
         self.quadrature = fresh.quadrature;
         self.reconstruction = fresh.reconstruction;
+        self.component_ramp_frames = fresh.component_ramp_frames;
     }
 
     fn reset(&mut self) {
         self.detector_state = [0.0; 2];
-        self.component_state = [[0.0; 2]; MAX_CHANNELS];
+        self.component_state = [[[0.0; 4]; MAX_CHANNELS]; 2];
+        self.component_setup = 0;
+        self.component_ramp_frame = 0;
         self.quadrature_state = [[0.0; 2]; 2];
         self.control_phase = 0;
         self.response_gain = 1.0;
@@ -960,7 +975,7 @@ impl DynamicRun {
     }
 
     #[inline]
-    fn step_f32(section: &Section, state: &mut [f32; 2], input: f32) -> f32 {
+    fn step_f32(section: &Section, state: &mut [f32], input: f32) -> f32 {
         let (b0, b1, b2, a1, a2) =
             (section.b0 as f32, section.b1 as f32, section.b2 as f32, section.a1 as f32, section.a2 as f32);
         let output = b0 * input + state[0];
@@ -996,10 +1011,10 @@ impl DynamicRun {
             f64::from(section.a2 as f32),
         );
         let mut output = b1 * f64::from(state[0]);
-        output = b0.mul_add(f64::from(input), output);
-        output = b2.mul_add(f64::from(state[1]), output);
-        output = (-a1).mul_add(f64::from(state[2]), output);
-        output = (-a2).mul_add(f64::from(state[3]), output);
+        output = libm::fma(b0, f64::from(input), output);
+        output = libm::fma(b2, f64::from(state[1]), output);
+        output = libm::fma(-a1, f64::from(state[2]), output);
+        output = libm::fma(-a2, f64::from(state[3]), output);
         let output = output as f32;
         state[1] = state[0];
         state[0] = input;
@@ -1015,6 +1030,51 @@ impl DynamicRun {
         } else {
             Self::step_df1_f32(&self.reconstruction, &mut self.reconstruction_state, input)
         }
+    }
+
+    fn begin_component_block(&mut self, kind: DynamicKind) {
+        if kind != DynamicKind::Notch || self.component_ramp_frame != 0 {
+            return;
+        }
+        let old = self.component_setup;
+        let new = old ^ 1;
+        self.component_sections[new] = self.component;
+        self.component_state[new] = self.component_state[old];
+        self.component_setup = new;
+    }
+
+    #[inline]
+    fn step_component(&mut self, kind: DynamicKind, channel: usize, input: f32, frame: usize) -> f32 {
+        if kind != DynamicKind::Notch {
+            return Self::step_f32(&self.component, &mut self.component_state[0][channel], input);
+        }
+
+        let new_setup = self.component_setup;
+        let old_setup = new_setup ^ 1;
+        let new = Self::step_vdsp_df1_f32(
+            &self.component_sections[new_setup],
+            &mut self.component_state[new_setup][channel],
+            input,
+        );
+        let old = Self::step_vdsp_df1_f32(
+            &self.component_sections[old_setup],
+            &mut self.component_state[old_setup][channel],
+            input,
+        );
+        let last = self.component_ramp_frames - 1;
+        let at = (self.component_ramp_frame + frame).min(last);
+        let t = at as f32 / last as f32;
+        let new_weight = t * t;
+        let old_weight = 1.0 - new_weight;
+        new * new_weight + old * old_weight
+    }
+
+    fn end_component_block(&mut self, kind: DynamicKind, frames: usize) {
+        if kind != DynamicKind::Notch {
+            return;
+        }
+        let next = self.component_ramp_frame.saturating_add(frames);
+        self.component_ramp_frame = if next < self.component_ramp_frames { next } else { 0 };
     }
 
     fn curve(params: &DynamicFilter, level: f64) -> f64 {
@@ -1067,6 +1127,7 @@ impl DynamicRun {
         if sidechains == 0 {
             return;
         }
+        self.begin_component_block(at.params.kind);
         if at.params.smooth {
             let mut sum_sq = 0.0;
             for i in 0..frames {
@@ -1141,11 +1202,12 @@ impl DynamicRun {
                 }
                 let sample = &mut buf[i];
                 let input = if sample.is_finite() { sample.clamp(-INPUT_BOUND, INPUT_BOUND) } else { 0.0 };
-                let component = Self::step_f32(&self.component, &mut self.component_state[c], input);
+                let component = self.step_component(at.params.kind, c, input, i);
                 let output = input + (gain - 1.0) * component;
                 *sample = if output.is_finite() { output } else { 0.0 };
             }
         }
+        self.end_component_block(at.params.kind, frames);
     }
 }
 
@@ -1723,6 +1785,47 @@ mod tests {
     }
 
     #[test]
+    fn type15_carrier_copies_setup_state_and_restarts_the_complementary_ramp() {
+        let p = dynamic_filter_params(DynamicKind::Notch);
+        let mut run = DynamicRun::new(&p.dynamic[0].params, 48_000.0);
+        run.component_state[0][0] = [0.7, -0.2, 0.3, -0.4];
+        run.component_state[1][0] = [-0.1, 0.8, -0.6, 0.5];
+
+        run.begin_component_block(DynamicKind::Notch);
+        assert_eq!(run.component_setup, 1);
+        assert_eq!(run.component_state[1][0], run.component_state[0][0]);
+
+        run.end_component_block(DynamicKind::Notch, 512);
+        assert_eq!(run.component_ramp_frame, 512);
+        let setup = run.component_setup;
+        run.begin_component_block(DynamicKind::Notch);
+        assert_eq!(run.component_setup, setup);
+
+        // The 961-point ramp's tail is padded at its terminal values for a
+        // whole render block.  Crossing its end resets the block-boundary
+        // state, rather than retaining a modulo remainder.
+        run.end_component_block(DynamicKind::Notch, 512);
+        assert_eq!(run.component_ramp_frame, 0);
+        let active = run.component_setup;
+        run.component_state[active][0] = [0.2, 0.4, 0.6, 0.8];
+        run.component_state[active ^ 1][0] = [0.9, 0.7, 0.5, 0.3];
+        let prior = run.component_state[active][0];
+        let old_section = run.component_sections[active];
+        run.component.b0 *= 0.5;
+        run.begin_component_block(DynamicKind::Notch);
+        assert_eq!(run.component_state[run.component_setup][0], prior);
+        assert_eq!(run.component_sections[run.component_setup], run.component);
+        assert_eq!(run.component_sections[run.component_setup ^ 1], old_section);
+
+        // Type 18 retains its single-setup component path.
+        let setup = run.component_setup;
+        run.end_component_block(DynamicKind::HighShelf, 512);
+        run.begin_component_block(DynamicKind::HighShelf);
+        assert_eq!(run.component_setup, setup);
+        assert_eq!(run.component_ramp_frame, 0);
+    }
+
+    #[test]
     fn dynamic_filter_automation_retains_running_state() {
         let p = dynamic_filter_params(DynamicKind::Notch);
         let at = p.dynamic[0];
@@ -1732,6 +1835,10 @@ mod tests {
 
         let detector_state = run.detector_state;
         let component_state = run.component_state;
+        let component_sections = run.component_sections;
+        let component_setup = run.component_setup;
+        let component_ramp_frame = run.component_ramp_frame;
+        let component_ramp_frames = run.component_ramp_frames;
         let quadrature_state = run.quadrature_state;
         let reconstruction_state = run.reconstruction_state;
         let phase = run.control_phase;
@@ -1749,6 +1856,10 @@ mod tests {
         run.reconfigure(&moved, 48_000.0);
         assert_eq!(run.detector_state, detector_state);
         assert_eq!(run.component_state, component_state);
+        assert_eq!(run.component_sections, component_sections);
+        assert_eq!(run.component_setup, component_setup);
+        assert_eq!(run.component_ramp_frame, component_ramp_frame);
+        assert_eq!(run.component_ramp_frames, component_ramp_frames);
         assert_eq!(run.quadrature_state, quadrature_state);
         assert_eq!(run.reconstruction_state, reconstruction_state);
         assert_eq!(run.control_phase, phase);
