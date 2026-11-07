@@ -384,6 +384,29 @@ class Graph(Base):
         self.assertFalse(os.path.lexists(pw) or os.path.lexists(wp))
         self.assertEqual(prov.cmd_is_seat(self.args("is-seat"), self.p), 1)
 
+    def test_raw_rules_for_every_user_from_the_start(self):
+        """Provisioning writes the raw-PCM rules; every user's session links
+        them, before the self-check has passed and when not the seat user."""
+        home = self.provisioned()
+        raw = os.path.join(self.p.raw, "59-sgv2-raw.conf")
+        self.assertTrue(os.path.exists(raw))
+        text = open(raw).read()
+        self.assertIn("node.disabled = true", text)
+        self.assertNotIn("software-dsp", text)
+        wpd = os.path.join(home, "wireplumber", "wireplumber.conf.d")
+        # the self-check has not passed yet: the raw rules, not the graph
+        prov.write_atomic(self.p.graph_state, "result=fail\n")
+        self.assertEqual(prov.cmd_graph_user(self.args("graph-user"), self.p), 0)
+        self.assertEqual(os.readlink(os.path.join(wpd, "59-sgv2-raw.conf")), raw)
+        self.assertFalse(os.path.lexists(os.path.join(wpd, "60-sgv2-j316.conf")))
+        # another user (a greeter): the raw rules too
+        conf = open(self.p.conf).read().replace(f"SGV2_UID={ME.pw_uid}", f"SGV2_UID={ME.pw_uid + 1}")
+        prov.write_atomic(self.p.conf, conf)
+        prov.write_atomic(self.p.graph_state, "result=pass\n")
+        self.assertEqual(prov.cmd_graph_user(self.args("graph-user"), self.p), 0)
+        self.assertTrue(os.path.islink(os.path.join(wpd, "59-sgv2-raw.conf")))
+        self.assertFalse(os.path.lexists(os.path.join(wpd, "60-sgv2-j316.conf")))
+
     def test_no_graph_in_this_boot(self):
         home = self.provisioned()
         prov.cmd_graph_user(self.args("graph-user"), self.p)
