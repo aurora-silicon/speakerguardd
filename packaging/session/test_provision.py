@@ -726,6 +726,8 @@ class Units(unittest.TestCase):
         self.assertIn("ExecStartPost=/usr/libexec/speakerguardd/speakerguardd-provision activate --graph-unit speakerguardd-graph.service", chk)
         ses = self.unit("speakerguardd-session.service")
         self.assertIn("ExecCondition=/usr/libexec/speakerguardd/speakerguardd-provision is-seat", ses)
+        # never in root's user manager, where PipeWire itself does not run
+        self.assertIn("ConditionUser=!root", ses)
         # Every program a unit runs is in one directory, so a package moves
         # them all with one rewrite.
         for name in ("speakerguardd-provision.service", "speakerguardd-selfcheck.service", "speakerguardd-session.service",
