@@ -9,8 +9,11 @@
 //! The poles of a boost are the analog prototype's poles mapped by
 //! `z = exp(sT)`. Its minimum-phase numerator is the real second-order FIR
 //! whose magnitude matches the analog target at DC, one-third Nyquist and
-//! two-thirds Nyquist. A cut is the exact inverse of its complementary
-//! boost. This avoids the high-frequency cramping of a bilinear biquad.
+//! two-thirds Nyquist. A peak or low-shelf cut is the exact inverse of its
+//! complementary boost; a high-shelf cut is designed directly, the same way
+//! as a boost (black-box renders of the installed unit: the inverse misses
+//! it by 0.003, 0.018 and 0.034 dB at -6, -12 and -15 dB, the direct design
+//! matches). This avoids the high-frequency cramping of a bilinear biquad.
 
 use crate::prestage::Section;
 use core::f64::consts::PI;
@@ -80,7 +83,7 @@ fn matched(shape: Shape, gain_db: f64, f0: f64, q: f64, fs: f64) -> Section {
     if gain_db == 0.0 {
         return Section::IDENTITY;
     }
-    if gain_db < 0.0 {
+    if gain_db < 0.0 && !matches!(shape, Shape::HighShelf) {
         return inverse(matched(shape, -gain_db, f0, q, fs));
     }
 
@@ -336,6 +339,12 @@ mod tests {
         assert!(20.0 * libm::log10(magnitude(low, 23_999.0, fs)) < 0.01);
         assert!(20.0 * libm::log10(magnitude(high, 0.0, fs)).abs() < 1e-9);
         assert!((20.0 * libm::log10(magnitude(high, 23_999.0, fs)) - 6.0).abs() < 0.01);
+        // a high-shelf cut is designed directly, not as the inverse boost
+        let cut = high_shelf(-12.0, 6000.0, core::f64::consts::FRAC_1_SQRT_2, fs);
+        assert!(20.0 * libm::log10(magnitude(cut, 0.0, fs)).abs() < 1e-9);
+        assert!((20.0 * libm::log10(magnitude(cut, 16_000.0, fs)) + 12.0).abs() < 0.5);
+        let inverse_boost = inverse(high_shelf(12.0, 6000.0, core::f64::consts::FRAC_1_SQRT_2, fs));
+        assert!((magnitude(cut, 4000.0, fs) - magnitude(inverse_boost, 4000.0, fs)).abs() > 1e-4);
     }
 
     #[test]

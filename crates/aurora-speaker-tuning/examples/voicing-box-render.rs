@@ -21,6 +21,10 @@
 //! box input, including any upstream relay's effect; this isolated render
 //! does not run the graph's other boxes. Without `--tone-volume`, it keeps
 //! the unwired pre-stage's least-passing settings.
+//!
+//! `--set ID=VALUE` (repeatable) overrides one saved global parameter of the
+//! box before it is compiled, as the macOS side of the rig sets the
+//! installed unit's.
 
 use aurora_speaker_tuning::bundle::Bundle;
 use aurora_speaker_tuning::dspg::analysis::{Lane, Origin, Pass};
@@ -97,6 +101,7 @@ fn main() {
     let mut automation_input = None;
     let mut tone_volume = None;
     let mut own_timing = false;
+    let mut sets: Vec<(u32, f32)> = Vec::new();
     let mut files = Vec::new();
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -109,6 +114,13 @@ fn main() {
             "--ch" => ch = it.next().and_then(|v| v.parse::<usize>().ok()),
             "--only-slot" => only_slot = it.next().and_then(|v| v.parse::<u32>().ok()),
             "--slot-own-timing" => own_timing = true,
+            // Override one saved global parameter (ID=VALUE), as a rig sets
+            // the installed unit's with AudioUnitSetParameter.
+            "--set" => {
+                let v = it.next().unwrap_or_default();
+                let parsed = v.split_once('=').and_then(|(id, value)| Some((id.parse().ok()?, value.parse().ok()?)));
+                sets.push(parsed.unwrap_or_else(|| die(format!("--set {v:?}: expected ID=VALUE"))));
+            }
             "--voicing-chain" => voicing_chain = true,
             "--sample-rate" => sample_rate = it.next().and_then(|v| v.parse::<i128>().ok()),
             "--automation-input" => automation_input = it.next().and_then(|v| v.parse::<f64>().ok()),
@@ -120,7 +132,7 @@ fn main() {
     }
     let (Some(ch), [inp, out]) = (ch, files.as_slice()) else {
         eprintln!(
-            "usage: voicing-box-render (--tunings-root DIR --aid N --box NAME [--voicing-chain] [--tone-volume V] [--sample-rate HZ] [--automation-input V] \
+            "usage: voicing-box-render (--tunings-root DIR --aid N --box NAME [--voicing-chain] [--tone-volume V] [--set ID=V]... [--sample-rate HZ] [--automation-input V] \
              | --params-words FILE [--fs HZ]) --ch C IN.f32 OUT.f32"
         );
         exit(2)
@@ -176,6 +188,19 @@ fn main() {
         for i in 0..prestage::SLOTS {
             if i != slot {
                 set(14 + 10 * i, 0.0);
+            }
+        }
+    }
+    if !sets.is_empty() {
+        let global = stage
+            .state
+            .as_mut()
+            .and_then(|s| s.sections.iter_mut().find(|s| s.scope == 0 && s.element == 0))
+            .unwrap_or_else(|| die(format!("box {name} has no global saved state")));
+        for (id, value) in sets {
+            match global.params.iter_mut().find(|(i, _)| *i == id) {
+                Some((_, v)) => *v = value,
+                None => global.params.push((id, value)),
             }
         }
     }
@@ -250,8 +275,9 @@ fn main() {
                 let kind = global.and_then(|g| g.get(14 + 10 * slot + 1)).unwrap_or(0.0) as u32;
                 let gain = f64::from(global.and_then(|g| g.get(14 + 10 * slot + 2)).unwrap_or(0.0));
                 let raw_gain = match kind {
-                    0 | 7 => Some(10f64.powf(-gain / 20.0)),
-                    2 => Some(1.0),
+                    7 => Some(10f64.powf(-gain / 20.0)),
+                    // a band shelf carries its flat gain in its first section
+                    0 | 2 => Some(1.0),
                     _ => None,
                 };
                 if let Some(raw_gain) = raw_gain {

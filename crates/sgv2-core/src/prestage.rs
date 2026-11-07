@@ -298,6 +298,11 @@ pub struct Section {
 impl Section {
     pub const IDENTITY: Section = Section { b0: 1.0, b1: 0.0, b2: 0.0, a1: 0.0, a2: 0.0 };
 
+    /// The section followed by a flat gain `k` (its numerator scaled).
+    pub fn scaled(self, k: f64) -> Section {
+        Section { b0: self.b0 * k, b1: self.b1 * k, b2: self.b2 * k, ..self }
+    }
+
     fn finite(&self) -> bool {
         [self.b0, self.b1, self.b2, self.a1, self.a2].iter().all(|v| v.is_finite())
     }

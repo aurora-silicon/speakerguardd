@@ -127,8 +127,10 @@ pub struct TonePoint {
 pub struct ToneAutomation {
     pub shape: ToneShape,
     pub quality: f64,
-    /// Shape fields that do not move with volume (the remaining shelf
-    /// edge frequencies for type 0/2 slots).
+    /// The remaining saved edge frequencies of a type-2 shelf (its second)
+    /// or a type-0 band shelf (its second to fourth); `a.frequency_hz` is
+    /// the first. The automation moves the shelf as a whole, scaling every
+    /// edge (`moved_shelf`).
     pub fixed: [f64; 3],
     pub max_order: u32,
     pub a: TonePoint,
@@ -342,6 +344,23 @@ fn automated_values(a: &ToneAutomation, scalar: f64) -> (f64, f64) {
     automated_point_values(a.a, a.b, a.midpoint, scalar)
 }
 
+/// The edge frequencies a Butterworth shelf (type 2: two; band shelf, type
+/// 0: four) takes at `scalar`, with the gain. The installed unit moves the
+/// shelf as a whole (black-box renders): the set points' frequency replaces
+/// the shelf's reference, and every saved edge scales by the same ratio. The
+/// reference is a type-2 shelf's first edge and a band shelf's geometric
+/// centre of its two inner edges; it glides from there like any slot's
+/// frequency (log in Hz, gain linear in dB).
+fn moved_shelf(a: &ToneAutomation, scalar: f64) -> (f64, [f64; 4]) {
+    let band = matches!(a.shape, ToneShape::ButterworthBandShelf);
+    let edges = [a.a.frequency_hz, a.fixed[0], a.fixed[1], a.fixed[2]];
+    let reference = if band { libm::sqrt(edges[1] * edges[2]) } else { edges[0] };
+    let from = TonePoint { frequency_hz: reference, ..a.a };
+    let (gain_db, frequency_hz) = automated_point_values(from, a.b, a.midpoint, scalar);
+    let scale = frequency_hz / reference;
+    (gain_db, edges.map(|f| f * scale))
+}
+
 fn automated_point_values(a: TonePoint, b: TonePoint, midpoint: Option<TonePoint>, scalar: f64) -> (f64, f64) {
     match midpoint {
         Some(m) if scalar <= m.scalar => interpolate(a, m, scalar),
@@ -379,19 +398,23 @@ fn apply_tone_automation(stage: &mut PreStage, base: &[Channel], automation: &[T
                     }
                 }
                 ToneShape::ButterworthShelf => {
-                    let made = super::tone::butterworth_shelf(gain_db, frequency_hz, a.fixed[0], a.max_order, fs);
+                    let (gain_db, [f3, f4, _, _]) = moved_shelf(a, scalar);
+                    let made = super::tone::butterworth_shelf(gain_db, f3, f4, a.max_order, fs);
                     let sections = &mut channel.sections[target.section..target.section + 5];
                     sections.fill(Section::IDENTITY);
                     sections[..made.count].copy_from_slice(&made.sections[..made.count]);
                 }
                 ToneShape::ButterworthBandShelf => {
-                    let first = super::tone::butterworth_shelf(gain_db, a.fixed[0], frequency_hz, a.max_order, fs);
-                    let second = super::tone::butterworth_shelf(gain_db, a.fixed[1], a.fixed[2], a.max_order, fs);
+                    let (gain_db, [f1, f2, f3, f4]) = moved_shelf(a, scalar);
+                    let first = super::tone::butterworth_shelf(gain_db, f2, f1, a.max_order, fs);
+                    let second = super::tone::butterworth_shelf(gain_db, f3, f4, a.max_order, fs);
                     let sections = &mut channel.sections[target.section..target.section + 10];
                     sections.fill(Section::IDENTITY);
                     sections[..first.count].copy_from_slice(&first.sections[..first.count]);
                     sections[5..5 + second.count].copy_from_slice(&second.sections[..second.count]);
-                    channel.gain *= libm::pow(10.0, -(gain_db - a.a.gain_db) / 20.0);
+                    // the compensating flat gain acts at the slot, in its
+                    // first section, as the saved shape carries it
+                    sections[0] = sections[0].scaled(libm::pow(10.0, -gain_db / 20.0));
                 }
                 ToneShape::LowPass(order) | ToneShape::HighPass(order) => {
                     let n = shape_sections(a.shape);
@@ -928,6 +951,88 @@ mod tests {
         assert!((below - 12.0).abs() < 1e-6, "{below}");
         c.set_param(GraphParam::VolumeScalar, 10.0);
         assert!(tone_channel(&c).magnitude(0.0, fs).log10().abs() < 1e-10);
+    }
+
+    fn shelf_tone(shape: ToneShape, saved: [f64; 4], gain_db: f64, b: TonePoint) -> (Spec, Channel) {
+        let fs = 48_000.0;
+        let band = shape == ToneShape::ButterworthBandShelf;
+        let mut channel = Channel::IDENTITY;
+        channel.count = if band { 10 } else { 5 };
+        let (first, second) = if band {
+            (
+                crate::voicing::tone::butterworth_shelf(gain_db, saved[1], saved[0], 10, fs),
+                Some(crate::voicing::tone::butterworth_shelf(gain_db, saved[2], saved[3], 10, fs)),
+            )
+        } else {
+            (crate::voicing::tone::butterworth_shelf(gain_db, saved[0], saved[1], 10, fs), None)
+        };
+        channel.sections[..first.count].copy_from_slice(&first.sections[..first.count]);
+        if let Some(second) = second {
+            channel.sections[5..5 + second.count].copy_from_slice(&second.sections[..second.count]);
+            channel.sections[0] = channel.sections[0].scaled(libm::pow(10.0, -gain_db / 20.0));
+        }
+        let spec = Spec {
+            program_channels: 1,
+            nodes: vec![NodeSpec {
+                kind: Kind::Tone(Tone {
+                    channels: vec![channel],
+                    dynamic: Vec::new(),
+                    dynamic_automation: Vec::new(),
+                    automation: vec![ToneAutomation {
+                        shape,
+                        quality: 0.0,
+                        fixed: [saved[1], saved[2], saved[3]],
+                        max_order: 10,
+                        a: TonePoint { scalar: 0.0, gain_db, frequency_hz: saved[0] },
+                        b,
+                        midpoint: None,
+                        targets: vec![ToneTarget { channel: 0, section: 0 }],
+                    }],
+                }),
+                inputs: vec![Source::Program(0)],
+            }],
+            outputs: vec![Source::Node(0, 0)],
+            links: vec![Link { param: GraphParam::VolumeScalar, node: 0, id: 3 }],
+            relays: vec![],
+        };
+        (spec, channel)
+    }
+
+    #[test]
+    fn tone_automation_moves_a_butterworth_shelf_as_a_whole() {
+        let fs = 48_000.0;
+        let db = |c: &Channel, f: f64| 20.0 * libm::log10(c.magnitude(f, fs));
+        // A band shelf (type 0): every edge scales by B's frequency over the
+        // geometric centre of the inner edges (black-box renders of the
+        // installed unit), the gain glides in dB.
+        let saved = [40.0, 60.0, 135.0, 180.0];
+        let b = TonePoint { scalar: 1.0, gain_db: 4.0, frequency_hz: 2.0 * libm::sqrt(60.0 * 135.0) };
+        let (spec, at_a) = shelf_tone(ToneShape::ButterworthBandShelf, saved, 10.0, b);
+        let mut c = Chain::new(spec, fs, 8).unwrap();
+        let (_, moved) = shelf_tone(ToneShape::ButterworthBandShelf, saved.map(|f| 2.0 * f), 4.0, b);
+        for f in [30.0, 80.0, 180.0, 300.0, 1000.0, 10_000.0] {
+            assert!((db(tone_channel(&c), f) - db(&moved, f)).abs() < 1e-9, "{f} Hz at B");
+        }
+        // at or below A it is the saved band shelf
+        c.set_param(GraphParam::VolumeScalar, 0.0);
+        for f in [30.0, 80.0, 180.0, 300.0, 1000.0, 10_000.0] {
+            assert!((db(tone_channel(&c), f) - db(&at_a, f)).abs() < 1e-9, "{f} Hz at A");
+        }
+        // halfway: half the gain in dB, the centre at the geometric mean
+        c.set_param(GraphParam::VolumeScalar, 0.5);
+        let (_, half) = shelf_tone(ToneShape::ButterworthBandShelf, saved.map(|f| libm::sqrt(2.0) * f), 7.0, b);
+        for f in [30.0, 80.0, 180.0, 300.0, 1000.0, 10_000.0] {
+            assert!((db(tone_channel(&c), f) - db(&half, f)).abs() < 1e-9, "{f} Hz halfway");
+        }
+        // A type-2 shelf: both edges scale by B's frequency over the first.
+        let saved = [120.0, 180.0, 0.0, 0.0];
+        let b = TonePoint { scalar: 1.0, gain_db: 3.0, frequency_hz: 240.0 };
+        let (spec, _) = shelf_tone(ToneShape::ButterworthShelf, saved, 6.0, b);
+        let c = Chain::new(spec, fs, 8).unwrap();
+        let (_, moved) = shelf_tone(ToneShape::ButterworthShelf, [240.0, 360.0, 0.0, 0.0], 3.0, b);
+        for f in [30.0, 150.0, 300.0, 1000.0] {
+            assert!((db(tone_channel(&c), f) - db(&moved, f)).abs() < 1e-9, "{f} Hz type 2 at B");
+        }
     }
 
     #[test]

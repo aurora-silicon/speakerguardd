@@ -20,7 +20,8 @@ fn fixture(tag: &str) -> Tuning {
     let graph = graph_text("spp3").replace("aufx vrq2", "aufx tmst") + "param mvsc 1\nwireGraphParam mvsc (Eq 3 0 0)\n";
     files.insert(format!("{AID}/DSP/Graphs/builtin_speaker_out.dspg"), graph.into_bytes());
     let mut p: std::collections::BTreeMap<u32, f32> = (0..616).map(|id| (id, 0.0)).collect();
-    // Gain plus a peak: both gain and frequency move with parameter 3.
+    // Gain plus a peak: both gain and frequency move with parameter 3
+    // (automation entries run at state 2; state 1 is off on the unit).
     for (id, value) in [
         (5, 10.0),
         (14, 3.0),
@@ -35,12 +36,12 @@ fn fixture(tag: &str) -> Tuning {
         (29, 2.0),
         (31, 3.0),
         (516, 0.0),
-        (517, 1.0),
+        (517, 2.0),
         (518, 0.0),
         (519, 1.0),
         (520, 6.0),
         (526, 1.0),
-        (527, 1.0),
+        (527, 2.0),
         (528, 0.0),
         (529, 1.0),
         (530, 4.0),
