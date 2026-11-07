@@ -9,7 +9,13 @@ transient margin. Outputs are aligned by cross-correlation before per-segment le
 read.
 
 - `progs.py OUT`: the programs (stepped sines, bursts, pink, music).
-- `mac_refs.py PROGS OUT`: macOS side, on a Mac only (run it under the host-heavy slot).
+- `mac_refs.py [--bundles DIR] PROGS OUT`: macOS side, on a Mac only (run it under the host-heavy slot).
+  It renders the configuration macOS selects for each Mac: the DSP database's General speaker
+  configuration for the speaker ID in the Mac's own bundle (`DIR/<mac>.tar.gz`), with every
+  graph property of its property strip (`preprotect_host.m --propstrip`). A reference made from
+  the vendor-neutral strip, or without the property strip, is a different chain: the M1 Pro
+  (speaker ID 0) uses `builtin_speaker_out_general_0`, and the M2's AULowFlow needs its 6620
+  sidecar.
 - `a64build.sh NAME REF [MERGE...]`: static aarch64 builds of the three tools (buildbox).
 - `scan.py`: one Mac's scan on a farm node; writes `report.md` (pass/fail per driver/axis)
   and `scan.json`. A chain that still stubs boxes is reported as informational only.
