@@ -89,7 +89,7 @@ pub fn spec(lanes: usize) -> Spec {
             true_peak: false,
             saturation_mode: 0,
             saturation_flavor: 0,
-            saturation_mix: 0.0,
+            saturation_ceiling_db: 0.0,
             deesser_hz: 0.0,
             deesser_db: 0.0,
             deesser_q: 0.0,
