@@ -35,6 +35,7 @@ pub fn table() -> Vec<Row> {
         ("spp3 meters, global scope 0", names::SPP3_GLOBAL_METERS),
         ("spp3 saved state, part scope 4", names::SPP3_PART),
         ("spp3 meters, part scope 4", names::SPP3_PART_METERS),
+        ("atsp saved state, global scope 0", names::ATSP_GLOBAL),
     ] {
         for p in t {
             let meaning = match p.sidecar {
@@ -69,7 +70,7 @@ pub fn table() -> Vec<Row> {
         meaning: "the other Thiele-Small fields (x0.1, x0.001, x0.01, x1, x0.0001, x0.0001, x0.001); dump only".into(),
     });
     rows.push(Row {
-        source: "atsp / lsm2 saved state",
+        source: "lsm2 saved state",
         field: "all IDs".into(),
         unit: "TODO(SPEC)",
         meaning: "ID-to-name map not yet in the specification; exposed raw".into(),
