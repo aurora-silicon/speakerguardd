@@ -49,6 +49,7 @@ fn graph_param(name: &str) -> Option<GraphParam> {
         "mmut" => GraphParam::Mute,
         "lbal" => GraphParam::BalanceLeft,
         "rbal" => GraphParam::BalanceRight,
+        "lids" => GraphParam::Lid,
         _ => return None,
     })
 }
@@ -101,15 +102,19 @@ fn compile_node(
     diags: &mut Diagnostics,
     gaps: &mut Vec<(String, String)>,
 ) -> Result<Kind> {
+    if let NodeKind::ParameterAdd { values } = &n.kind {
+        return Ok(Kind::ParameterAdd(values.clone()));
+    }
     let stage =
         t.chain.iter().find(|s| s.name == n.name).ok_or_else(|| bad(format!("box {} is not in the chain", n.name)))?;
     Ok(match &n.kind {
+        NodeKind::ParameterAdd { .. } => unreachable!("control node compiled above"),
         NodeKind::NonFinite => Kind::NonFinite,
         NodeKind::Sum { .. } => Kind::Sum(n.out_width()),
         NodeKind::Gain => Kind::Gain,
         NodeKind::Unit { .. } if n.bypass => Kind::Bypass,
         NodeKind::Unit { subtype } => match subtype.as_str() {
-            "tmst" => match tone(stage, n.width(), volume_wired, fs, diags, gaps) {
+            "tmst" => match controlled_tone(t, stage, n.width(), volume_wired, fs, diags, gaps) {
                 Ok(k) => k,
                 Err(e) => uncarried(n, subtype, e, gaps),
             },
@@ -203,9 +208,47 @@ fn compile_node(
     })
 }
 
+fn controlled_tone(
+    t: &Tuning,
+    stage: &Stage,
+    width: usize,
+    volume_wired: bool,
+    fs: f64,
+    diags: &mut Diagnostics,
+    gaps: &mut Vec<(String, String)>,
+) -> Result<Kind> {
+    let Some(control) = super::controls::source(t, &stage.name) else {
+        return tone(stage, width, volume_wired, fs, diags, gaps);
+    };
+    let default_mask = super::controls::mask(t, control, None)?;
+    let mut variants = Vec::new();
+    for lid in [0.0, 1.0] {
+        let mask = super::controls::mask(t, control, Some(lid))?;
+        if variants.iter().any(|v: &sgv2_core::voicing::chain::ToneVariant| v.mask == mask) {
+            continue;
+        }
+        let mut stage = stage.clone();
+        let global = stage
+            .state
+            .as_mut()
+            .and_then(|s| s.sections.iter_mut().find(|s| s.scope == 0 && s.element == 0))
+            .ok_or_else(|| bad("group-controlled tone has no global state"))?;
+        global.params.retain(|(id, _)| *id != 1);
+        global.params.push((1, mask as f32));
+        // Group switches are exact bypasses, independent of volume wiring.
+        let Kind::Tone(tone) = tone(&stage, width, true, fs, diags, gaps)? else { unreachable!() };
+        if !volume_wired && (!tone.automation.is_empty() || !tone.dynamic_automation.is_empty()) {
+            return Err(bad("group-controlled tone also needs an explicit volume wire"));
+        }
+        variants.push(sgv2_core::voicing::chain::ToneVariant { mask, tone });
+    }
+    Ok(Kind::ToneGroups { default_mask, variants })
+}
+
 /// The whole chain of `t`'s unit at rate `fs`.
 pub fn compile(t: &Tuning, fs: f64, diags: &mut Diagnostics) -> Result<Compiled> {
-    let plan = topology::plan(t)?;
+    let mut plan = topology::plan(t)?;
+    let mut relays = super::controls::prepare(t, &mut plan)?;
     let mut nodes = Vec::with_capacity(plan.nodes.len());
     let mut stubs = Vec::new();
     let mut gaps = Vec::new();
@@ -225,12 +268,10 @@ pub fn compile(t: &Tuning, fs: f64, diags: &mut Diagnostics) -> Result<Compiled>
             None => unwired.push(format!("{} -> {} {}", l.param, plan.nodes[l.node].name, l.id)),
         }
     }
-    let mut relays = Vec::new();
-    if t.graph
-        .box_param_links
-        .iter()
-        .any(|link| plan.node(&link.from.node).is_some() || plan.node(&link.to.node).is_some())
-    {
+    if t.graph.box_param_links.iter().any(|link| {
+        t.graph.find_box(&link.from.node).is_some_and(|b| b.subtype().is_some_and(|s| s.bytes() == *b"volt"))
+            && (plan.node(&link.from.node).is_some() || plan.node(&link.to.node).is_some())
+    }) {
         let volume = super::volume::compile_tuning(t)?;
         relays.reserve(volume.relays.len());
         for relay in volume.relays {

@@ -436,6 +436,29 @@ class Graph(Base):
         self.assertFalse(os.path.lexists(pw) or os.path.lexists(wp))
         self.assertEqual(prov.cmd_is_seat(self.args("is-seat"), self.p), 1)
 
+    def test_raw_rules_for_every_user_from_the_start(self):
+        """Provisioning writes the raw-PCM rules; every user's session links
+        them, before the self-check has passed and when not the seat user."""
+        home = self.provisioned()
+        raw = os.path.join(self.p.raw, "59-sgv2-raw.conf")
+        self.assertTrue(os.path.exists(raw))
+        text = open(raw).read()
+        self.assertIn("node.disabled = true", text)
+        self.assertNotIn("software-dsp", text)
+        wpd = os.path.join(home, "wireplumber", "wireplumber.conf.d")
+        # the self-check has not passed yet: the raw rules, not the graph
+        prov.write_atomic(self.p.graph_state, "result=fail\n")
+        self.assertEqual(prov.cmd_graph_user(self.args("graph-user"), self.p), 0)
+        self.assertEqual(os.readlink(os.path.join(wpd, "59-sgv2-raw.conf")), raw)
+        self.assertFalse(os.path.lexists(os.path.join(wpd, "60-sgv2-j316.conf")))
+        # another user (a greeter): the raw rules too
+        conf = open(self.p.conf).read().replace(f"SGV2_UID={ME.pw_uid}", f"SGV2_UID={ME.pw_uid + 1}")
+        prov.write_atomic(self.p.conf, conf)
+        prov.write_atomic(self.p.graph_state, "result=pass\n")
+        self.assertEqual(prov.cmd_graph_user(self.args("graph-user"), self.p), 0)
+        self.assertTrue(os.path.islink(os.path.join(wpd, "59-sgv2-raw.conf")))
+        self.assertFalse(os.path.lexists(os.path.join(wpd, "60-sgv2-j316.conf")))
+
     def test_no_graph_in_this_boot(self):
         home = self.provisioned()
         prov.cmd_graph_user(self.args("graph-user"), self.p)
@@ -466,6 +489,113 @@ class Graph(Base):
         self.assertEqual(prov.read_kv(self.p.graph_state)["result"], "fail")
         self.assertEqual(os.listdir(os.path.join(self.p.graph, "pipewire")), [])
 
+
+
+class Sleep(Base):
+    """The sleep hold: set before sleep, cleared after the resume."""
+
+    def test_hold_set_and_cleared(self):
+        self.assertEqual(prov.cmd_sleep(self.args("sleep", sleep_wait=0), self.p), 0)
+        self.assertTrue(os.path.exists(self.p.hold))
+        self.assertTrue(self.p.hold.startswith(self.root))
+        self.assertEqual(prov.cmd_wake(self.args("wake"), self.p), 0)
+        self.assertFalse(os.path.exists(self.p.hold))
+        # A resume without a hold (a sleep v2 did not see) is fine too
+        self.assertEqual(prov.cmd_wake(self.args("wake"), self.p), 0)
+
+    def test_session_helper_honours_the_hold(self):
+        import importlib.machinery
+        import importlib.util
+        loader = importlib.machinery.SourceFileLoader("sgv2_session", os.path.join(HERE, "speakerguardd-session"))
+        spec = importlib.util.spec_from_loader("sgv2_session", loader)
+        ses = importlib.util.module_from_spec(spec)
+        loader.exec_module(ses)
+        self.assertEqual(ses.SLEEP_HOLD, prov.Paths().hold)
+
+    def test_provision_unit_name(self):
+        self.assertEqual(prov.provision_unit("speakerguardd.service"), "speakerguardd-provision.service")
+        self.assertEqual(prov.provision_unit("speakerguardd-v2.service"), "speakerguardd-v2-provision.service")
+
+    def test_helper_amps_needs_a_fresh_report(self):
+        self.assertIsNone(prov.helper_amps({}, 0))
+        self.assertIsNone(prov.helper_amps({"SGV2_UID": "999999999"}, 0))
+
+    def _pcm(self, card, name, first):
+        d = os.path.join(self.p.proc_asound, card, name, "sub0")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "status"), "w") as f:
+            f.write(first + "\n")
+        return os.path.join(d, "status")
+
+    def test_open_pcms_are_the_graph_ones(self):
+        gd = os.path.join(self.p.graph, "pipewire")
+        os.makedirs(gd, exist_ok=True)
+        with open(os.path.join(gd, "sgv2-j413.conf"), "w") as f:
+            f.write('api.alsa.path          = "hw:CARD=AppleJ413,DEV=1"\n'
+                    'api.alsa.path          = "hw:CARD=AppleJ413,DEV=2"\n')
+        spk = self._pcm("AppleJ413", "pcm1p", "state: RUNNING")
+        sense = self._pcm("AppleJ413", "pcm2c", "state: SETUP")
+        # the headphone PCM is not the graph's: never waited for
+        self._pcm("AppleJ413", "pcm0p", "state: RUNNING")
+        self.assertEqual(prov.graph_pcms(self.p), [spk, sense])
+        self.assertEqual(prov.open_pcms(self.p), [spk, sense])
+        self._pcm("AppleJ413", "pcm1p", "closed")
+        self.assertEqual(prov.open_pcms(self.p), [sense])
+        self._pcm("AppleJ413", "pcm2c", "closed")
+        self.assertEqual(prov.open_pcms(self.p), [])
+
+    def test_open_pcms_without_a_graph(self):
+        self.assertEqual(prov.open_pcms(self.p), [])
+
+    def test_helper_suspends_under_the_hold_only_when_unlinked(self):
+        import importlib.machinery
+        import importlib.util
+        loader = importlib.machinery.SourceFileLoader("sgv2_session", os.path.join(HERE, "speakerguardd-session"))
+        spec = importlib.util.spec_from_loader("sgv2_session", loader)
+        ses = importlib.util.module_from_spec(spec)
+        loader.exec_module(ses)
+
+        class G:
+            def __init__(self, states, links):
+                self.states, self._links = states, links
+                self.objs = {}
+
+            def node_id(self, name):
+                return {"sgv2.speaker.j413": 10, "sgv2.sense.j413": 20}.get(name)
+
+            def node_state(self, nid):
+                return self.states.get(nid)
+
+            def of_type(self, t):
+                return [{"id": 11, "info": {"props": {"node.id": 10}}},
+                        {"id": 21, "info": {"props": {"node.id": 20}}}] if t == "Port" else []
+
+            def links(self):
+                return self._links
+
+            def ports(self, nid, d):
+                return {}
+
+        s = ses.Session("j413", {"card": "AppleJ413", "amps": 4, "sense": 8})
+        spawned = []
+        s._spawn = lambda key, argv: spawned.append(argv)
+        os.makedirs(self.p.sleep, exist_ok=True)
+        hold = self.p.hold
+        ses.SLEEP_HOLD = hold
+        # no hold: a withdrawal unlinks, never suspends
+        s.reconcile(G({10: "idle", 20: "running"}, []), False)
+        self.assertEqual(spawned, [])
+        open(hold, "w").close()
+        # still linked: unlink first
+        s.reconcile(G({10: "running", 20: "running"}, [(99, 5, 11)]), False)
+        self.assertEqual(spawned, [["pw-link", "-d", "99"]])
+        spawned.clear()
+        s.reconcile(G({10: "idle", 20: "running"}, []), False)
+        self.assertEqual(spawned, [["pw-cli", "send-command", "10", "Suspend", "{}"], ["pw-cli", "send-command", "20", "Suspend", "{}"]])
+        spawned.clear()
+        s.last_suspend = -10.0
+        s.reconcile(G({10: "suspended", 20: "suspended"}, []), False)
+        self.assertEqual(spawned, [])
 
 
 class UserManager(unittest.TestCase):
@@ -621,17 +751,19 @@ class Gate(Base):
     def test_shipped_data(self):
         with open(os.path.join(HERE, "gate.json")) as f:
             g = json.load(f)
-        self.assertEqual(g["units_at_parity"], ["spp3", "atsp"])
+        # fleet cutover: only the qualified boards of a parity unit run v2
+        self.assertEqual(g["units_at_parity"], ["spp3", "lsm2", "atsp"])
         self.assertTrue(g["require_qualified_board"])
         self.assertEqual(sorted(g["qualified"]), ["atsp", "lsm2", "spp3"])
+        # the qualified lists stay as the record of audible runs
         qualified = sorted(b for u in g["units_at_parity"] for b in g["qualified"].get(u, []))
         self.assertEqual(
             qualified,
-            sorted(["j316s", "j413", "j616s", "j274", "j293", "j313", "j375c", "j375d", "j473", "j474s", "j475c", "j475d", "j493"]),
+            sorted(["j316s", "j413", "j616s", "j700", "j274", "j293", "j313", "j375c", "j375d", "j473", "j474s", "j475c", "j475d", "j493"]),
         )
         # policy only: no hardware in the gate
-        self.assertEqual(sorted(k for k in g if not k.startswith("_")), ["qualified", "require_qualified_board", "units_at_parity", "voicing_pre"])
-        self.assertEqual(g["voicing_pre"], {})
+        self.assertEqual(sorted(k for k in g if not k.startswith("_")), ["qualified", "require_qualified_board", "units_at_parity", "voicing_pre", "voicing_pre_bound_db"])
+        self.assertEqual(g["voicing_pre"], {"j316s": True, "j413": True, "j616s": True, "j700": True})
         self.assertFalse(os.path.exists(os.path.join(HERE, "machines.json")))
 
 
@@ -653,17 +785,31 @@ class Units(unittest.TestCase):
         self.assertIn("speakerguardd-provision.service", req(chk))
         self.assertIn("speakerguardd-provision.service", aft(chk))
         self.assertIn("Before=speakerguardd-selfcheck.service speakerguardd.service", prv)
+        # The graph is in /run before any login, so the seat user's PipeWire
+        # never starts without it (a first-boot amp fault otherwise).
+        bef = lambda u: " ".join(l.split("=", 1)[1] for l in u if l.startswith("Before="))  # noqa: E731
+        self.assertIn("systemd-user-sessions.service", bef(chk))
+        self.assertIn("systemd-user-sessions.service", aft(sup))
+        slp = self.unit("speakerguardd-sleep.service")
+        self.assertIn("Before=sleep.target", slp)
+        self.assertIn("StopWhenUnneeded=yes", slp)
+        self.assertIn("WantedBy=sleep.target", slp)
+        self.assertIn("ExecCondition=/usr/libexec/speakerguardd/speakerguardd-gate v2", slp)
+        self.assertIn("ExecStart=/usr/libexec/speakerguardd/speakerguardd-provision sleep --unit speakerguardd.service", slp)
+        self.assertIn("ExecStop=/usr/libexec/speakerguardd/speakerguardd-provision wake --unit speakerguardd.service", slp)
         for u in (sup, chk, prv, self.unit("speakerguardd-seat.service")):
             self.assertIn("ExecCondition=/usr/libexec/speakerguardd/speakerguardd-gate v2", u)
         self.assertIn("ExecStartPost=/usr/libexec/speakerguardd/speakerguardd-provision activate --graph-unit speakerguardd-graph.service", chk)
         ses = self.unit("speakerguardd-session.service")
         self.assertIn("ExecCondition=/usr/libexec/speakerguardd/speakerguardd-provision is-seat", ses)
+        # never in root's user manager, where PipeWire itself does not run
+        self.assertIn("ConditionUser=!root", ses)
         # Every program a unit runs is in one directory, so a package moves
         # them all with one rewrite.
         for name in ("speakerguardd-provision.service", "speakerguardd-selfcheck.service", "speakerguardd-session.service",
-                     "speakerguardd-seat.service", "speakerguardd-graph.service"):
+                     "speakerguardd-seat.service", "speakerguardd-graph.service", "speakerguardd-sleep.service"):
             for l in self.unit(name):
-                if l.startswith(("ExecStart=", "ExecStartPost=", "ExecCondition=")):
+                if l.startswith(("ExecStart=", "ExecStartPost=", "ExecStop=", "ExecCondition=")):
                     self.assertTrue(l.split("=", 1)[1].startswith("/usr/libexec/speakerguardd/"), l)
         self.assertIn("Before=pipewire.service wireplumber.service", self.unit("speakerguardd-graph.service"))
         self.assertIn("ExecCondition=/usr/libexec/speakerguardd/speakerguardd-gate legacy", self.unit("legacy-gate.conf"))

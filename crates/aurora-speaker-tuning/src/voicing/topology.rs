@@ -43,9 +43,11 @@ use serde::Serialize;
 /// Builtins that only re-block or re-lay a bus: no level or content change.
 const PLUMBING: &[&str] = &["reblocker", "srlconverter"];
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum NodeKind {
+    /// A control-only sum, with graph defaults per input.
+    ParameterAdd { values: Vec<f64> },
     /// An AudioUnit box: its subtype (`ldnm`, `vben`, `tmst`, ...).
     Unit { subtype: String },
     /// The graph's gain builtin (`dbgn`): per-side gain, balance, ramp.

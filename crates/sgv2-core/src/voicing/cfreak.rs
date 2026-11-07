@@ -107,10 +107,13 @@ pub struct Params {
     pub saturation_mode: u32,
     pub saturation_flavor: u32,
     pub saturation_mix: f64,
+    pub input_gain_db: f64,
+    pub output_gain_db: f64,
 }
 
 impl Params {
-    pub const WORDS: usize = 8;
+    pub const WORDS: usize = 10;
+    pub const LEGACY_WORDS: usize = 8;
 
     pub fn to_words(&self, out: &mut [f64]) {
         out[..Self::WORDS].copy_from_slice(&[
@@ -122,11 +125,13 @@ impl Params {
             self.saturation_mode as f64,
             self.saturation_flavor as f64,
             self.saturation_mix,
+            self.input_gain_db,
+            self.output_gain_db,
         ]);
     }
 
     pub fn from_words(w: &[f64]) -> Option<Params> {
-        if w.len() != Self::WORDS || w.iter().any(|v| !v.is_finite()) {
+        if ![Self::LEGACY_WORDS, Self::WORDS].contains(&w.len()) || w.iter().any(|v| !v.is_finite()) {
             return None;
         }
         let p = Params {
@@ -150,8 +155,12 @@ impl Params {
                 _ => return None,
             },
             saturation_mix: w[7],
+            input_gain_db: w.get(8).copied().unwrap_or(0.0),
+            output_gain_db: w.get(9).copied().unwrap_or(0.0),
         };
-        let ok = (0.0..=MAX_LOOKAHEAD_S).contains(&p.lookahead_s)
+        let ok = (-120.0..=40.0).contains(&p.input_gain_db)
+            && (-120.0..=40.0).contains(&p.output_gain_db)
+            && (0.0..=MAX_LOOKAHEAD_S).contains(&p.lookahead_s)
             && (0.0..=MAX_HOLD_S).contains(&p.hold_s)
             && (-40.0..=6.0).contains(&p.threshold_db)
             && (0.0..=40.0).contains(&p.min_fast_gain_db);
@@ -290,6 +299,8 @@ pub struct Run {
     hist: Box<[f64]>,
     hist_at: usize,
     saturation_mix: f64,
+    input_gain: f64,
+    output_gain: f64,
     saturation_filter: [SatSection; SATURATION_SECTIONS],
     saturation_state: [[SatState; SATURATION_SECTIONS]; MAX_CHANNELS],
     saturation_line: [[f32; SATURATION_DELAY]; MAX_CHANNELS],
@@ -327,6 +338,8 @@ impl Run {
             line_at: 0,
             hist: vec![0.0; TAPS * channels].into_boxed_slice(),
             hist_at: 0,
+            input_gain: db(p.input_gain_db),
+            output_gain: db(p.output_gain_db),
             saturation_mix: if p.saturation_mode == 3 { p.saturation_mix } else { 0.0 },
             saturation_filter: saturation_filter(fs),
             saturation_state: [[SatState::default(); SATURATION_SECTIONS]; MAX_CHANNELS],
@@ -385,6 +398,7 @@ impl Run {
             self.hist_at = (self.hist_at + 1) % TAPS;
             for (c, b) in bufs[..ch].iter().enumerate() {
                 let mut x = if b[k].is_finite() { f64::from(b[k]) } else { 0.0 };
+                x *= self.input_gain;
                 if self.saturation_mix > 0.0 {
                     x = (1.0 - self.saturation_mix) * x + self.saturation_mix * libm::sin(x);
                     for section in 0..SATURATION_SECTIONS {
@@ -417,7 +431,7 @@ impl Run {
                 let slot = c * l + self.line_at;
                 let delayed = self.line[slot];
                 self.line[slot] = frame[c] as f32;
-                b[k] = (f64::from(delayed) * g) as f32;
+                b[k] = (f64::from(delayed) * g * self.output_gain) as f32;
             }
             self.line_at = (self.line_at + 1) % l;
             if self.saturation_mix > 0.0 {
@@ -447,6 +461,8 @@ mod tests {
             saturation_mode: 0,
             saturation_flavor: 0,
             saturation_mix: 0.0,
+            input_gain_db: 0.0,
+            output_gain_db: 0.0,
         }
     }
 
@@ -460,11 +476,29 @@ mod tests {
     }
 
     #[test]
+    fn gain_stages_surround_the_detector_and_delay() {
+        let mut p = params(-12.0, false);
+        p.input_gain_db = 6.0;
+        p.output_gain_db = -3.0;
+        let x: Vec<f32> = (0..2048).map(|k| if k < 512 { 0.6 } else { 0.01 }).collect();
+        let scaled: Vec<f32> = x.iter().map(|x| (f64::from(*x) * db(p.input_gain_db)) as f32).collect();
+        let y = render(&p, &[x]);
+        let mut reference = p;
+        reference.input_gain_db = 0.0;
+        reference.output_gain_db = 0.0;
+        let expected = render(&reference, &[scaled]);
+        for (a, b) in y[0].iter().zip(&expected[0]) {
+            assert!((f64::from(*a) - f64::from(*b) * db(p.output_gain_db)).abs() < 1e-6);
+        }
+    }
+
+    #[test]
     fn words_round_trip_and_refuse() {
         let p = params(-2.0, true);
         let mut w = [0.0; Params::WORDS];
         p.to_words(&mut w);
         assert_eq!(Params::from_words(&w), Some(p));
+        assert_eq!(Params::from_words(&w[..Params::LEGACY_WORDS]), Some(p));
         w[4] = 0.5;
         assert_eq!(Params::from_words(&w), None);
         w[4] = 0.0;
@@ -564,6 +598,8 @@ mod tests {
                 saturation_mode: 0,
                 saturation_flavor: 0,
                 saturation_mix: 0.0,
+            input_gain_db: 0.0,
+            output_gain_db: 0.0,
             };
             let mut s = seed | 1;
             let amp = db(level_db);

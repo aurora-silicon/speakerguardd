@@ -29,6 +29,7 @@ pub mod lsm2;
 pub mod machine;
 pub mod placeholder;
 pub mod prestage;
+pub mod resonator;
 pub mod ring;
 pub mod sense;
 pub mod spp3;

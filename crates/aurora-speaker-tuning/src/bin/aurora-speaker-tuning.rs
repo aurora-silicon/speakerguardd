@@ -6,7 +6,7 @@
 //! ```text
 //! aurora-speaker-tuning dump     [--json] [--speaker-id N] [SOURCE]
 //! aurora-speaker-tuning validate [--json] [--speaker-id N] [SOURCE]
-//! aurora-speaker-tuning compile  [--speaker-id N] [--board B [--unit-id U]] [--development] [--voicing-pre] [SOURCE | --bundle PATH] -o BLOB
+//! aurora-speaker-tuning compile  [--speaker-id N] [--board B [--unit-id U]] [--development] [--voicing-pre] [--prestage identity|tuning] [SOURCE | --bundle PATH] -o BLOB
 //! aurora-speaker-tuning identify [--json] [SOURCE]   (the bundle's identity, for provisioning)
 //! aurora-speaker-tuning blob     BLOB [BLOB]     (decode; with two, diff field by field)
 //! aurora-speaker-tuning units    [--json]
@@ -29,6 +29,9 @@
 //! `--board` the `--unit-id` given (the bundle's own, to compile offline
 //! for the Mac it came from), else unknown: then per-unit calibration is
 //! not used (open loop).  See `compile` for the binding rules.
+//! `--prestage` picks what runs ahead of the unit: `identity` (the default,
+//! pass-through: the voicing graph feeds the unit) or `tuning` (the Mac's
+//! own filtering, derived from the tuning; rigs and the full macOS chain).
 //!
 //! `identify` loads and verifies the bundle (nothing is parsed beyond the
 //! manifest) and prints where it was found and its digest
@@ -56,12 +59,13 @@ struct Args {
     unit_id: Option<String>,
     development: bool,
     voicing_pre: bool,
+    prestage: compile::PreStageMode,
 }
 
 fn usage() -> ! {
     eprintln!(
         "usage: aurora-speaker-tuning {{dump|validate}} [--json] [--speaker-id N] [PATH | --tunings-root DIR --aid N]\n       \
-         aurora-speaker-tuning compile [--speaker-id N] [--board B [--unit-id U]] [--development] [--voicing-pre] [--bundle PATH | --tunings-root DIR --aid N] -o BLOB\n       \
+         aurora-speaker-tuning compile [--speaker-id N] [--board B [--unit-id U]] [--development] [--voicing-pre] [--prestage identity|tuning] [--bundle PATH | --tunings-root DIR --aid N] -o BLOB\n       \
          aurora-speaker-tuning plan [--speaker-id N] [PATH | --tunings-root DIR --aid N]\n       \
          aurora-speaker-tuning identify [--json] [PATH | --tunings-root DIR --aid N]\n       \
          aurora-speaker-tuning blob BLOB [BLOB]\n       \
@@ -97,6 +101,7 @@ fn parse_args() -> Args {
         unit_id: None,
         development: false,
         voicing_pre: false,
+        prestage: compile::PreStageMode::default(),
     };
     while let Some(x) = it.next() {
         match x.as_str() {
@@ -112,6 +117,13 @@ fn parse_args() -> Args {
             "--unit-id" => a.unit_id = Some(it.next().unwrap_or_else(|| usage())),
             "--development" => a.development = true,
             "--voicing-pre" => a.voicing_pre = true,
+            "--prestage" => {
+                a.prestage = match it.next().as_deref() {
+                    Some("identity") => compile::PreStageMode::Identity,
+                    Some("tuning") => compile::PreStageMode::Tuning,
+                    _ => usage(),
+                };
+            }
             "-o" | "--output" => a.out = Some(it.next().map(PathBuf::from).unwrap_or_else(|| usage())),
             p if !p.starts_with('-') && a.path.is_none() => a.path = Some(PathBuf::from(p)),
             p if !p.starts_with('-') && a.path2.is_none() => a.path2 = Some(PathBuf::from(p)),
@@ -120,7 +132,7 @@ fn parse_args() -> Args {
     }
     // A unit ID names the Mac an offline compile is for; it never stands
     // in for the running Mac's device tree.
-    if a.voicing_pre && a.cmd != "compile" {
+    if (a.voicing_pre || a.prestage != compile::PreStageMode::default()) && a.cmd != "compile" {
         usage();
     }
     if a.unit_id.is_some() && (a.board.is_none() || a.cmd != "compile") {
@@ -491,7 +503,7 @@ fn main() {
                     if a.voicing_pre {
                         compile::compile_voicing_with(&t, &m, provenance, &mut diags)
                     } else {
-                        compile::compile_with(&t, &m, provenance, &mut diags)
+                        compile::compile_opts(&t, &m, provenance, a.prestage, &mut diags)
                     }
                 }) {
                     Ok(c) => {

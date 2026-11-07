@@ -119,3 +119,24 @@ fn valid_crc_does_not_admit_unknown_versions_or_unbounded_spec_lengths() {
     fix_crc(&mut bad);
     assert_eq!(artifact::decode(&bad, &base), Err(blob::BlobError::Length));
 }
+
+#[test]
+fn cfreak_gains_roundtrip_without_changing_legacy_unity_records() {
+    use sgv2_core::voicing::chain::Kind;
+    let base = voicing_fixture::unit("j413", 4);
+    let mut spec = voicing_fixture::spec(4);
+    let legacy = artifact::encode(&spec, &base).unwrap();
+    assert_eq!(artifact::decode(&legacy, &base).unwrap(), spec);
+    let node = spec.nodes.iter_mut().find(|n| matches!(n.kind, Kind::Cfreak(_))).unwrap();
+    let Kind::Cfreak(p) = &mut node.kind else { unreachable!() };
+    p.input_gain_db = 3.0;
+    p.output_gain_db = -2.0;
+    let extended = artifact::encode(&spec, &base).unwrap();
+    assert_eq!(extended.len(), legacy.len() + 16);
+    assert_eq!(artifact::decode(&extended, &base).unwrap(), spec);
+    let node = spec.nodes.iter_mut().find(|n| matches!(n.kind, Kind::Cfreak(_))).unwrap();
+    let Kind::Cfreak(p) = &mut node.kind else { unreachable!() };
+    p.input_gain_db = 0.0;
+    p.output_gain_db = 0.0;
+    assert_eq!(artifact::encode(&spec, &base).unwrap(), legacy);
+}

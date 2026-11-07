@@ -11,13 +11,13 @@
 //! |---:|---|---|
 //! | 0 | bypass [0] | 1: the box is left out |
 //! | 1, 10, 17 | saturation oversampling, flavour, amount [0] | mode 3 / sine / wet percent |
-//! | 2, 11 | input gain (dB) [0], its stage enabled [1] | only 0 dB or disabled |
+//! | 2, 11 | input gain (dB) [0], its stage enabled [1] | yes, or unity when disabled |
 //! | 3 | threshold (dB) [0] | yes |
 //! | 4 | MinFastGain (dB) [3] | yes |
 //! | 5 | fast gain release (ms) [10]: a hold | yes |
 //! | 6 | true-peak detection [0] | yes |
 //! | 7 | look-ahead (ms) [0.5] | yes |
-//! | 8, 15 | output gain (dB) [0], its stage enabled [1] | only 0 dB or disabled |
+//! | 8, 15 | output gain (dB) [0], its stage enabled [1] | yes, or unity when disabled |
 //! | 9 | parameter ramp time [0] | not needed: the state is fixed |
 //! | 12, 13, 21, 22 | high-pass enable [0], corner, order, placement | refused when enabled |
 //! | 14 | limiter enabled [1] | refused when off |
@@ -101,12 +101,6 @@ pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option
         }
         (0.0, 0.0, 0.0)
     };
-    if get(11)? != 0.0 && get(2)? != 0.0 {
-        return Err(bad(format!("input gain {} dB (not carried)", get(2)?)));
-    }
-    if get(15)? != 0.0 && get(8)? != 0.0 {
-        return Err(bad(format!("output gain {} dB (not carried)", get(8)?)));
-    }
     let words = [
         get(7)? / 1000.0,
         get(5)? / 1000.0,
@@ -116,6 +110,8 @@ pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option
         saturation_mode,
         saturation_flavor,
         saturation_mix,
+        if get(11)? != 0.0 { get(2)? } else { 0.0 },
+        if get(15)? != 0.0 { get(8)? } else { 0.0 },
     ];
     let p = Params::from_words(&words).ok_or_else(|| bad(format!("values out of range: {words:?}")))?;
     let frames = |s: f64| s * fs;
@@ -177,6 +173,8 @@ mod tests {
                 saturation_mode: 0,
                 saturation_flavor: 0,
                 saturation_mix: 0.0,
+                input_gain_db: 0.0,
+                output_gain_db: 0.0,
             }
         );
         let d = compile_of(&[]).unwrap().unwrap();
@@ -184,6 +182,14 @@ mod tests {
             (d.lookahead_s, d.hold_s, d.threshold_db, d.min_fast_gain_db, d.true_peak),
             (0.0005, 0.01, 0.0, 3.0, false)
         );
+    }
+
+    #[test]
+    fn carries_enabled_gain_stages_and_ignores_disabled_values() {
+        let enabled = compile_of(&[(2, 3.0), (8, -2.0)]).unwrap().unwrap();
+        assert_eq!((enabled.input_gain_db, enabled.output_gain_db), (3.0, -2.0));
+        let disabled = compile_of(&[(2, 3.0), (11, 0.0), (8, -2.0), (15, 0.0)]).unwrap().unwrap();
+        assert_eq!((disabled.input_gain_db, disabled.output_gain_db), (0.0, 0.0));
     }
 
     #[test]
@@ -197,8 +203,6 @@ mod tests {
             [(16, 1.0), (0, 0.0)],
             [(12, 1.0), (0, 0.0)],
             [(23, 1.0), (0, 0.0)],
-            [(2, 3.0), (11, 1.0)],
-            [(8, -2.0), (15, 1.0)],
             [(6, 0.5), (0, 0.0)],
             [(7, 5.0), (0, 0.0)],
         ] {
