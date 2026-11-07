@@ -99,7 +99,11 @@ fn lowflow_parameter_words_are_carried_including_responses() {
 
 #[test]
 fn artifacts_without_lowflow_keep_build_independent_bytes_and_read_legacy_flavors() {
-    let spec = voicing_fixture::spec(4);
+    use sgv2_core::voicing::chain::Kind;
+    let mut spec = voicing_fixture::spec(4);
+    let lowflow = spec.nodes.iter().position(|node| matches!(node.kind, Kind::Lowflow(_))).unwrap();
+    spec.nodes[lowflow].kind = Kind::Bypass;
+    spec.links.retain(|link| link.node != lowflow);
     let base = voicing_fixture::unit("j413", 4);
     let bytes = artifact::encode(&spec, &base).unwrap();
     assert_eq!(u32::from_le_bytes(bytes[12..16].try_into().unwrap()), 1);
