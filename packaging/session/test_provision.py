@@ -15,6 +15,7 @@ import pwd
 import shutil
 import sys
 import tempfile
+import time
 import types
 import unittest
 
@@ -149,7 +150,8 @@ class Base(unittest.TestCase):
             return []
 
     def args(self, cmd="run", **kw):
-        a = dict(cmd=cmd, bundle=None, force=False, unit="speakerguardd.service", graph_unit="speakerguardd-graph.service", root=self.root,
+        a = dict(cmd=cmd, bundle=None, force=False, unit="speakerguardd.service", graph_unit="speakerguardd-graph.service",
+                 switch_test_wait=0.3, root=self.root,
                  tuning_cli=self.cli, dt=self.dt, etc=os.path.join(self.t, "etc"), card_wait=0)
         a.update(kw)
         return types.SimpleNamespace(**a)
@@ -499,10 +501,56 @@ class Graph(Base):
         self.assertEqual(prov.read_kv(self.p.graph_state)["result"], "pending")
         self.assertEqual(os.listdir(os.path.join(self.p.graph, "pipewire")), [])
         self.assertEqual(os.listdir(os.path.join(self.p.graph, "wireplumber")), [])
+        # The switch test passed after login: its activate generates the
+        # graph while the test is still marked pending (until ExecStopPost).
+        digest = prov.sha256_file(self.p.params)
+        prov.write_atomic(os.path.join(self.p.state, "selfcheck.bind"),
+                          f"result=pass\nkernel={os.uname().release}\nparams_sha256={digest}\n")
+        from unittest import mock
+        done = types.SimpleNamespace(returncode=0, stderr="", stdout="")
+        with mock.patch.object(prov.subprocess, "run", return_value=done) as run:
+            self.assertEqual(prov.cmd_activate(self.args("activate"), self.p), 0)
+        self.assertIn("generate", run.call_args_list[0][0][0])
+        self.assertEqual(prov.read_kv(self.p.graph_state)["result"], "pass")
+        # A failed test: no pass, the graph stays down; the session starts
+        # with the raw rules alone, and the helper does not start.
+        prov.write_atomic(os.path.join(self.p.state, "selfcheck.bind"), "result=fail\n")
+        self.assertEqual(prov.cmd_activate(self.args("activate"), self.p), 0)
+        self.assertEqual(prov.read_kv(self.p.graph_state)["result"], "pending")
+        os.unlink(self.p.deferred)
         self.assertEqual(prov.cmd_graph_user(self.args("graph-user"), self.p), 0)
         wpd = os.path.join(home, "wireplumber", "wireplumber.conf.d")
         self.assertEqual(os.listdir(wpd), ["59-sgv2-raw.conf"])
         self.assertEqual(prov.cmd_is_seat(self.args("is-seat"), self.p), 1)
+
+    def test_sessions_wait_for_a_pending_switch_test(self):
+        """No session's PipeWire (and so WirePlumber, whose device probe opens
+        the raw PCMs) starts while the switch test is pending; it starts with
+        the graph once the test passed."""
+        import threading
+        home = self.provisioned()
+        prov.write_atomic(self.p.deferred, "kernel=k\n")
+        prov.write_atomic(self.p.graph_state, "result=pending\n")
+        done = []
+
+        def finish():
+            time.sleep(0.4)
+            prov.write_atomic(self.p.graph_state, "result=pass\n")
+            os.unlink(self.p.deferred)
+            done.append(time.monotonic())
+        th = threading.Thread(target=finish)
+        th.start()
+        t = time.monotonic()
+        self.assertEqual(prov.cmd_graph_user(self.args("graph-user", switch_test_wait=10), self.p), 0)
+        th.join()
+        self.assertGreaterEqual(time.monotonic(), done[0])
+        self.assertGreater(time.monotonic() - t, 0.35)
+        self.assertTrue(os.path.islink(os.path.join(home, "pipewire", "pipewire.conf.d", "sgv2-j316.conf")))
+        # bounded: a test that never ends does not keep PipeWire down forever
+        prov.write_atomic(self.p.deferred, "kernel=k\n")
+        t = time.monotonic()
+        self.assertEqual(prov.cmd_graph_user(self.args("graph-user", switch_test_wait=0.3), self.p), 0)
+        self.assertLess(time.monotonic() - t, 2)
 
     def test_a_failed_run_clears_the_graph(self):
         self.provisioned()
@@ -936,6 +984,10 @@ class Units(unittest.TestCase):
         self.assertIn("ExecCondition=/usr/libexec/speakerguardd/speakerguardd-selfcheck pending", swt)
         self.assertIn("ExecStart=/usr/libexec/speakerguardd/speakerguardd-selfcheck run --params ${SGV2_PARAMS} -- $SGV2_TUNING", swt)
         self.assertIn("ExecStartPost=/usr/libexec/speakerguardd/speakerguardd-provision activate --graph-unit speakerguardd-graph.service", swt)
+        self.assertIn("ExecStopPost=/usr/libexec/speakerguardd/speakerguardd-selfcheck pending --clear", swt)
+        # The sessions' PipeWire waits for a pending switch test, beyond its
+        # timeout.
+        self.assertIn("TimeoutStartSec=180", self.unit("speakerguardd-graph.service"))
         self.assertIn("RequiredBy=speakerguardd.service", swt)
         # Provisioning, which writes the raw-PCM rules every session starts
         # with, is before the self-check and so before every login.
@@ -961,7 +1013,7 @@ class Units(unittest.TestCase):
                      "speakerguardd-session.service", "speakerguardd-seat.service", "speakerguardd-graph.service",
                      "speakerguardd-sleep.service"):
             for l in self.unit(name):
-                if l.startswith(("ExecStart=", "ExecStartPost=", "ExecStop=", "ExecCondition=")):
+                if l.startswith(("ExecStart=", "ExecStartPost=", "ExecStop=", "ExecStopPost=", "ExecCondition=")):
                     self.assertTrue(l.split("=", 1)[1].startswith("/usr/libexec/speakerguardd/"), l)
         self.assertIn("Before=pipewire.service wireplumber.service", self.unit("speakerguardd-graph.service"))
         self.assertIn("ExecCondition=/usr/libexec/speakerguardd/speakerguardd-gate legacy", self.unit("legacy-gate.conf"))

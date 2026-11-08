@@ -6,6 +6,7 @@ manual step, before the self-check and the supervisor start.
     speakerguardd-provision activate [--graph-unit UNIT]        (root, after the self-check passed)
     speakerguardd-provision seat     --unit UNIT                (root, when seat0 changes hands)
     speakerguardd-provision graph-user                          (the user's speakerguardd-graph.service)
+                                                                (waits while the switch test is pending)
     speakerguardd-provision is-seat                             (ExecCondition of the session helper)
     speakerguardd-provision sleep    --unit UNIT                (root, speakerguardd-sleep.service, before sleep)
     speakerguardd-provision wake     --unit UNIT                (root, the same unit's stop, after the resume)
@@ -659,6 +660,17 @@ def publish_voicing_parameters(p, previous_voicing=False):
     write_atomic(p.published, data)
 
 
+def selfcheck_current(p):
+    """The self-check's record is a pass for this kernel and this blob (the
+    switch test after login has passed; `generate` checks the rest)."""
+    b = read_kv(os.path.join(p.state, "selfcheck.bind"))
+    try:
+        digest = sha256_file(p.params)
+    except OSError:
+        return False
+    return b.get("result") == "pass" and b.get("kernel") == os.uname().release and b.get("params_sha256") == digest
+
+
 def cmd_activate(args, p):
     """The self-check passed: generate the graph from its record, then
     bring the seat user's session onto it."""
@@ -667,11 +679,11 @@ def cmd_activate(args, p):
         log(f"{p.conf} names no seat user: provisioning has not passed")
         return 1
     os.makedirs(p.graph, mode=0o755, exist_ok=True)
-    if os.path.exists(p.deferred):
+    if os.path.exists(p.deferred) and not selfcheck_current(p):
         # Before login, with the switch test still to run: no graph (and
-        # none left from earlier in this boot), so every session starts with
-        # the raw-PCM rules alone. speakerguardd-switchtest.service runs
-        # the test after login and activates again.
+        # none left from earlier in this boot). speakerguardd-switchtest
+        # runs the test after login and activates again; until it ends no
+        # session's PipeWire starts (graph-user).
         clear_graph(p, result="pending")
         log("the silent switch test runs after login (speakerguardd-switchtest): no speaker graph until it passes")
         return 0
@@ -724,10 +736,31 @@ def user_conf_dirs():
             "wireplumber": os.path.join(base, "wireplumber", "wireplumber.conf.d")}
 
 
+def wait_switch_test(p, limit):
+    """While the self-check's switch test is pending (the first boot after a
+    kernel or tuning change, until speakerguardd-switchtest.service ends),
+    hold this session's PipeWire and WirePlumber: WirePlumber's ALSA device
+    probe opens and prepares every PCM of the speaker card, the raw speaker
+    and sense PCMs included, whatever its node rules say (the UCM Speaker
+    device, the pro-audio profile). During the test's streams that latched a
+    TDM clock fault on an amp, and it would take the PCMs the test needs."""
+    if not os.path.exists(p.deferred):
+        return
+    log("the speaker self-check's switch test is running: PipeWire and WirePlumber start when it is done")
+    t0 = time.monotonic()
+    while os.path.exists(p.deferred):
+        if time.monotonic() - t0 >= limit:
+            log(f"the switch test is still pending after {limit:.0f} s: starting without the speaker graph")
+            return
+        time.sleep(0.1)
+    log(f"the switch test is done ({time.monotonic() - t0:.1f} s)")
+
+
 def cmd_graph_user(args, p):
     """In the user's session, before PipeWire: link the graph for the seat
     user, and remove the links for every other user. Never fails: a missing
     graph only means no speakers for this session."""
+    wait_switch_test(p, args.switch_test_wait)
     conf = read_kv(p.conf)
     st = read_kv(p.graph_state)
     seat = conf.get("SGV2_UID") == str(os.getuid()) and st.get("result") == "pass"
@@ -942,6 +975,8 @@ def main():
     ap.add_argument("--unit", default="speakerguardd.service", help="the supervisor's unit (seat, sleep, wake)")
     ap.add_argument("--sleep-wait", type=float, default=2.0, help="how long sleep waits for the amps to unlink, and then for the PCMs to close")
     ap.add_argument("--graph-unit", default="speakerguardd-graph.service", help="the user's graph unit (activate)")
+    ap.add_argument("--switch-test-wait", type=float, default=150.0,
+                    help="graph-user: how long to hold the session's PipeWire for a pending switch test")
     ap.add_argument("--root", default=os.environ.get("SGV2_PROVISION_ROOT", ""), help="test root for every file written")
     ap.add_argument("--tuning-cli", default="aurora-speaker-tuning")
     ap.add_argument("--dt", default=DT)

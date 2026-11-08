@@ -22,10 +22,20 @@ at its floor, in two units:
   the raw speaker or sense PCMs, for every user).
 - speakerguardd-switchtest.service, after systemd-user-sessions.service and
   before the supervisor, runs `run` only while that file exists (`pending`
-  is its ExecCondition). It runs the whole check, writes the record and
-  removes the file; its ExecStartPost generates the graph and restarts the
-  seat user's PipeWire onto it. The supervisor requires both units, so it
-  grants only after the switch test passed.
+  is its ExecCondition). It runs the whole check and writes the record; its
+  ExecStartPost generates the graph, and its ExecStopPost (`pending
+  --clear`) removes the file, pass or fail. The supervisor requires both
+  units, so it grants only after the switch test passed.
+
+While the file exists, no session's PipeWire or WirePlumber starts: their
+speakerguardd-graph.service (speakerguardd-provision graph-user, ordered
+before both) waits for it to go. WirePlumber's ALSA device probe opens and
+prepares every PCM of the speaker card, the raw speaker and sense PCMs
+included, whatever its node rules say (the UCM Speaker device and the
+pro-audio profile); during the switch test's streams that latched a TDM
+clock fault on an amp, and it would take the PCMs the test needs. So the
+login is not held, and the session's audio starts once the test is done,
+with the graph when it passed.
 
 A board without V/I sense has no switch test (its check is static) and is
 never deferred. Runs take an exclusive lock (selfcheck.lock in the state
@@ -68,6 +78,7 @@ import argparse
 import errno
 import fcntl
 import hashlib
+import itertools
 import json
 import math
 import os
@@ -90,8 +101,10 @@ VERSION = 2
 STATE = "/var/lib/speakerguardd"
 MARKER = "/run/speakerguardd-selfcheck/active"
 # The switch test is pending: written by `run --defer` (before login),
-# removed by every other completed run. In provisioning's runtime directory,
-# which outlives each self-check unit (theirs is removed when they stop).
+# removed by `pending --clear` when speakerguardd-switchtest.service ends,
+# and by a `run --defer` that does not defer. In provisioning's runtime
+# directory, which outlives each self-check unit (theirs is removed when
+# they stop), where every session's graph-user reads it.
 DEFERRED = "/run/speakerguardd-graph/selfcheck.deferred"
 CAPTURE_S = 0.4
 # After a sense switch turns, before the next capture opens.
@@ -289,9 +302,11 @@ def switch_set(ctl, name, v):
 # ---------------------------------------------------------------- checks
 
 
-def regmap_values(i2c, regs):
-    """{reg: value} from the amp's regmap in debugfs."""
-    path = f"/sys/kernel/debug/regmap/{i2c}/registers"
+REGMAP = "/sys/kernel/debug/regmap"
+
+
+def _regmap_dump(path, regs):
+    """{reg: value} from the whole debugfs dump (every readable register)."""
     try:
         with open(path) as f:
             text = f.read()
@@ -307,6 +322,41 @@ def regmap_values(i2c, regs):
         if r in regs:
             out[r] = int(v.strip(), 16)
     return out
+
+
+def regmap_values(i2c, regs):
+    """{reg: value} from the amp's regmap in debugfs, reading only `regs`.
+
+    The dump is fixed-width lines ("<reg>: <value>"), and the kernel reads
+    only the registers whose lines a read covers. Reading it whole reads
+    every register of every page over I2C (about 0.33 s per amp on the
+    J616s, 2 s of every check) and fills the register cache with all of
+    them. So each wanted register's line is read on its own, at its offset
+    if every register before it is in the dump (the line names its
+    register, and is checked); anything else reads the whole dump."""
+    path = f"{REGMAP}/{i2c}/registers"
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+    except OSError as e:
+        raise wiring.Refused(f"cannot read {path}: {e.strerror} (debugfs is needed for the slot check)")
+    try:
+        first = os.pread(fd, 64, 0).decode(errors="replace").split("\n", 1)[0]
+        k, sep, _ = first.partition(": ")
+        if not sep or int(k, 16) != 0:
+            raise ValueError(first)
+        width = len(first) + 1
+        out = {}
+        for r in sorted(regs):
+            line = os.pread(fd, width, r * width).decode(errors="replace")
+            k, sep, v = line.rstrip("\n").partition(": ")
+            if not sep or int(k, 16) != r:
+                raise ValueError(line)
+            out[r] = int(v, 16)
+        return out
+    except (OSError, ValueError):
+        return _regmap_dump(path, regs)
+    finally:
+        os.close(fd)
 
 
 def check_registers(w):
@@ -427,11 +477,14 @@ class Streams:
             raise wiring.Refused(f"the self-check's own lease lapsed during the switch test ({self.lease.err or 'ETIMEDOUT'})")
 
     @staticmethod
-    def _stop_process(proc):
+    def _stop_process(proc, kill=False):
         if proc is None:
             return
         if proc.poll() is None:
-            proc.terminate()
+            if kill:
+                proc.kill()
+            else:
+                proc.terminate()
             try:
                 proc.wait(2)
             except subprocess.TimeoutExpired:
@@ -521,7 +574,12 @@ class Streams:
         except Exception as e:
             errors.append(str(e))
         try:
-            self._stop_process(self.rec)
+            # Its data is no longer needed, and once the zero-sample stream
+            # has stopped, the sense capture can stall (the MCA Macs: no
+            # more frames), where arecord does not act on SIGTERM: it was
+            # killed after the full 2 s wait on every such run. End it at
+            # once; the kernel closes the substream either way.
+            self._stop_process(self.rec, kill=True)
             if self.reader is not None:
                 self.reader.join(2)
                 if self.reader.is_alive():
@@ -536,6 +594,28 @@ class Streams:
         self.play = self.rec = None
         if errors:
             raise wiring.Refused("silent stream cleanup failed: " + "; ".join(errors))
+
+
+def switch_codes(n):
+    """Each of n sense switches' captures: (k, codes), where switch i is off
+    in exactly the captures in codes[i]. Every code has two of k captures,
+    so no code contains another: a channel quiet in exactly its switch's
+    code is quieted by that switch alone. If a second switch also quieted
+    it (or the claimed one did not), the channel's quiet captures would be
+    the union of two codes (or another code, or none), never the claimed
+    code; and a switch that quieted a second channel would show in that
+    channel's captures the same way. So the coded test proves what one
+    switch at a time does: each switch quiets exactly its claimed channel,
+    and every other channel stays live. Measured on every amp of the J413,
+    J316s and J616s: with several switches off at once (V and I of one amp
+    included) every channel reads as with one switch off (speakerguardd#102).
+    k = 0 (one switch at a time) when coding saves no capture."""
+    k = 2
+    while math.comb(k, 2) < n:
+        k += 1
+    if k >= n:
+        return 0, []
+    return k, [frozenset(c) for c in itertools.combinations(range(k), 2)][:n]
 
 
 def check_sense(ctl, idx, card, devs, w, runs):
@@ -554,6 +634,8 @@ def check_sense(ctl, idx, card, devs, w, runs):
         if v is None:
             return [f"no {nm!r} control"], None
         saved[nm] = v
+    switches = [(p, a, kind) for p, a in enumerate(amps) for kind in ("V", "I")]
+    k, codes = switch_codes(len(switches))
     st = Streams(ctl, card, devs[0], devs[1], n, w["rate"])
     try:
         for nm in saved:
@@ -565,8 +647,8 @@ def check_sense(ctl, idx, card, devs, w, runs):
         if any(c != "live" for c in cls):
             errs.append(f"with every sense switch on, sense channels {[k for k, c in enumerate(cls) if c != 'live']} are not live")
             return errs, st.fmt
-        for p, a in enumerate(amps):
-            for kind in ("V", "I"):
+        if not k:
+            for p, a, kind in switches:
                 nm = names[(a["prefix"], kind)]
                 switch_set(ctl, nm, "off")
                 try:
@@ -584,6 +666,43 @@ def check_sense(ctl, idx, card, devs, w, runs):
                     errs.append(
                         f"{a['prefix']} {kind}SENSE off quietened sense channel(s) {quiet}; the map has its {kind} on channel {want}"
                     )
+        else:
+            # Coded: capture j has every switch whose code holds j off.
+            quiet_in = {c: set() for c in range(len(cls))}
+            unclear_any = False
+            for j in range(k):
+                off = [i for i, c in enumerate(codes) if j in c]
+                for i in off:
+                    switch_set(ctl, names[(switches[i][1]["prefix"], switches[i][2])], "off")
+                try:
+                    s = st.capture()
+                finally:
+                    for i in off:
+                        switch_set(ctl, names[(switches[i][1]["prefix"], switches[i][2])], "on")
+                label = ", ".join(f"{switches[i][1]['prefix']} {switches[i][2]}" for i in off)
+                runs[f"coded {j}: {label} SENSE off"] = s
+                cls = classify(s)
+                unclear = [c for c, v in enumerate(cls) if v == "unclear"]
+                if unclear:
+                    unclear_any = True
+                    errs.append(f"coded capture {j} ({label} SENSE off): sense channels {unclear} neither live nor quiet")
+                for c, v in enumerate(cls):
+                    if v == "quiet":
+                        quiet_in[c].add(j)
+            if not unclear_any:
+                follows = {code: f"{a['prefix']} {kind}" for (p, a, kind), code in zip(switches, codes)}
+                claimed = set()
+                for (p, a, kind), code in zip(switches, codes):
+                    want = claims.get((p, kind))
+                    claimed.add(want)
+                    got = quiet_in.get(want, set())
+                    if got != code:
+                        who = follows.get(frozenset(got), "no single switch" if got else "no switch")
+                        errs.append(f"{a['prefix']} {kind}SENSE: the map has its {kind} on channel {want}, which went quiet in "
+                                    f"captures {sorted(got)}, the switch's are {sorted(code)} (channel {want} follows {who})")
+                for c in sorted(set(quiet_in) - claimed):
+                    if quiet_in[c]:
+                        errs.append(f"sense channel {c}, which the map gives no switch, went quiet in captures {sorted(quiet_in[c])}")
     finally:
         try:
             st.stop()
@@ -828,10 +947,14 @@ def run_locked(args):
         errs.append(f"internal error: {type(e).__name__}: {e}")
     rec["reasons"] = errs
     rec["result"] = "fail" if errs else "pass"
-    try:
-        set_deferred(args.deferred)
-    except OSError as e:
-        log(f"removing {args.deferred}: {e}")
+    if args.defer:
+        # Before login and not deferred (a failure, or a board without
+        # sense): nothing is pending. After login the file stays until the
+        # unit's ExecStopPost, once the graph is generated.
+        try:
+            set_deferred(args.deferred)
+        except OSError as e:
+            log(f"removing {args.deferred}: {e}")
     try:
         write_atomic(report_path, json.dumps(report, indent=1, default=str) + "\n")
         write_atomic(bind_path, bind_lines(rec))
@@ -923,7 +1046,12 @@ def format_errors(desc, fmt):
 def cmd_pending(args):
     """speakerguardd-switchtest.service's ExecCondition: 0 (run) when the
     run before login deferred the switch test in this boot, 1 (skip)
-    otherwise."""
+    otherwise. With --clear (its ExecStopPost, after the graph is generated
+    or the check failed): the test is no longer pending, and the sessions
+    waiting for it start."""
+    if args.clear:
+        set_deferred(args.deferred)
+        return 0
     if not os.path.exists(args.deferred):
         return 1
     log("the switch test was deferred until after login: running it now")
@@ -984,6 +1112,7 @@ def main():
     ap.add_argument("--defer", action="store_true",
                     help="run: before login, leave a needed switch test to speakerguardd-switchtest.service")
     ap.add_argument("--deferred", default=DEFERRED, help="the switch-test-pending file")
+    ap.add_argument("--clear", action="store_true", help="pending: the switch test is done (pass or fail)")
     ap.add_argument("--pipewire-dir")
     ap.add_argument("--wireplumber-dir")
     ap.add_argument("tuning", nargs="*", help="after --: the tuning source, as aurora-speaker-tuning takes it")

@@ -119,9 +119,13 @@ self-check and the supervisor, which both require it.
    change the self-check only reuses its bound record, before
    `systemd-user-sessions.service`, so the graph is in place before any
    login, the display manager's automatic login included. On the first boot
-   after a change, the silent switch test runs after login (section 6) and
-   the graph follows when it passes. Every session, before and after,
-   starts with the raw-PCM rules provisioning writes on every boot
+   after a change, the silent switch test runs after login (section 6), and
+   every session's PipeWire and WirePlumber wait for it: WirePlumber's ALSA
+   device probe opens and prepares every PCM of the speaker card, the raw
+   speaker and sense PCMs included, whatever its node rules say (the UCM
+   Speaker device and the pro-audio profile), and that must never meet the
+   test's streams. They start with the graph once it passed. Every session
+   also gets the raw-PCM rules provisioning writes on every boot
    (`/run/speakerguardd-graph/raw/59-sgv2-raw.conf`, linked for every user):
    WirePlumber creates no node on the raw speaker or sense PCMs. The user unit
    `speakerguardd-graph.service`, ordered before PipeWire, links them into
@@ -191,11 +195,12 @@ the speakers at the floor, in two units:
   card). It does not hold the login for the switch test (step 3).
 - `speakerguardd-switchtest.service`, after `systemd-user-sessions.service`,
   runs only when the first unit deferred the switch test in this boot: the
-  whole check, then the record, then the graph, and the seat user's
-  PipeWire restarts onto it. The supervisor requires it, so it grants only
-  after the test passed. Until then the speakers stay at the floor, about
-  10 s after login on the first boot of a new kernel. A failure leaves them
-  there.
+  whole check, then the record, then the graph. Until it ends, every
+  session's `speakerguardd-graph.service` holds that session's PipeWire and
+  WirePlumber (section 4), which then start with the graph. The supervisor
+  requires it, so it grants only after the test passed. The login is not
+  held; the session's audio starts a few seconds after login, on the first
+  boot of a new kernel only. A failure leaves the speakers at the floor.
 
 A board without V/I sense has no switch test and runs entirely in the first
 unit.
