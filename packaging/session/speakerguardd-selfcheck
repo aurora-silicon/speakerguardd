@@ -78,6 +78,7 @@ import argparse
 import errno
 import fcntl
 import hashlib
+import itertools
 import json
 import math
 import os
@@ -558,6 +559,28 @@ class Streams:
             raise wiring.Refused("silent stream cleanup failed: " + "; ".join(errors))
 
 
+def switch_codes(n):
+    """Each of n sense switches' captures: (k, codes), where switch i is off
+    in exactly the captures in codes[i]. Every code has two of k captures,
+    so no code contains another: a channel quiet in exactly its switch's
+    code is quieted by that switch alone. If a second switch also quieted
+    it (or the claimed one did not), the channel's quiet captures would be
+    the union of two codes (or another code, or none), never the claimed
+    code; and a switch that quieted a second channel would show in that
+    channel's captures the same way. So the coded test proves what one
+    switch at a time does: each switch quiets exactly its claimed channel,
+    and every other channel stays live. Measured on every amp of the J413,
+    J316s and J616s: with several switches off at once (V and I of one amp
+    included) every channel reads as with one switch off (speakerguardd#102).
+    k = 0 (one switch at a time) when coding saves no capture."""
+    k = 2
+    while math.comb(k, 2) < n:
+        k += 1
+    if k >= n:
+        return 0, []
+    return k, [frozenset(c) for c in itertools.combinations(range(k), 2)][:n]
+
+
 def check_sense(ctl, idx, card, devs, w, runs):
     """The switch test. Returns (errors, speaker format)."""
     errs = []
@@ -574,6 +597,8 @@ def check_sense(ctl, idx, card, devs, w, runs):
         if v is None:
             return [f"no {nm!r} control"], None
         saved[nm] = v
+    switches = [(p, a, kind) for p, a in enumerate(amps) for kind in ("V", "I")]
+    k, codes = switch_codes(len(switches))
     st = Streams(ctl, card, devs[0], devs[1], n, w["rate"])
     try:
         for nm in saved:
@@ -585,8 +610,8 @@ def check_sense(ctl, idx, card, devs, w, runs):
         if any(c != "live" for c in cls):
             errs.append(f"with every sense switch on, sense channels {[k for k, c in enumerate(cls) if c != 'live']} are not live")
             return errs, st.fmt
-        for p, a in enumerate(amps):
-            for kind in ("V", "I"):
+        if not k:
+            for p, a, kind in switches:
                 nm = names[(a["prefix"], kind)]
                 switch_set(ctl, nm, "off")
                 try:
@@ -604,6 +629,43 @@ def check_sense(ctl, idx, card, devs, w, runs):
                     errs.append(
                         f"{a['prefix']} {kind}SENSE off quietened sense channel(s) {quiet}; the map has its {kind} on channel {want}"
                     )
+        else:
+            # Coded: capture j has every switch whose code holds j off.
+            quiet_in = {c: set() for c in range(len(cls))}
+            unclear_any = False
+            for j in range(k):
+                off = [i for i, c in enumerate(codes) if j in c]
+                for i in off:
+                    switch_set(ctl, names[(switches[i][1]["prefix"], switches[i][2])], "off")
+                try:
+                    s = st.capture()
+                finally:
+                    for i in off:
+                        switch_set(ctl, names[(switches[i][1]["prefix"], switches[i][2])], "on")
+                label = ", ".join(f"{switches[i][1]['prefix']} {switches[i][2]}" for i in off)
+                runs[f"coded {j}: {label} SENSE off"] = s
+                cls = classify(s)
+                unclear = [c for c, v in enumerate(cls) if v == "unclear"]
+                if unclear:
+                    unclear_any = True
+                    errs.append(f"coded capture {j} ({label} SENSE off): sense channels {unclear} neither live nor quiet")
+                for c, v in enumerate(cls):
+                    if v == "quiet":
+                        quiet_in[c].add(j)
+            if not unclear_any:
+                follows = {code: f"{a['prefix']} {kind}" for (p, a, kind), code in zip(switches, codes)}
+                claimed = set()
+                for (p, a, kind), code in zip(switches, codes):
+                    want = claims.get((p, kind))
+                    claimed.add(want)
+                    got = quiet_in.get(want, set())
+                    if got != code:
+                        who = follows.get(frozenset(got), "no single switch" if got else "no switch")
+                        errs.append(f"{a['prefix']} {kind}SENSE: the map has its {kind} on channel {want}, which went quiet in "
+                                    f"captures {sorted(got)}, the switch's are {sorted(code)} (channel {want} follows {who})")
+                for c in sorted(set(quiet_in) - claimed):
+                    if quiet_in[c]:
+                        errs.append(f"sense channel {c}, which the map gives no switch, went quiet in captures {sorted(quiet_in[c])}")
     finally:
         try:
             st.stop()

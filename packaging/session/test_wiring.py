@@ -272,8 +272,9 @@ class SenseCheck(unittest.TestCase):
     do: [I, V] per amp, V switched off gives an idle pattern, I gives
     zeros."""
 
-    def run_check(self, w, truth):
+    def run_check(self, w, truth, also=None):
         switches = {}
+        also = also or {}
         n = len(w["amps"])
 
         calls = self.calls = []
@@ -290,8 +291,9 @@ class SenseCheck(unittest.TestCase):
                 quiet, pattern = [], []
                 for (prefix, kind), on in switches.items():
                     if on == "off":
-                        ch = truth[(prefix, kind)]
-                        (pattern if kind == "V" else quiet).append(ch)
+                        for ch in (truth[(prefix, kind)], also.get((prefix, kind))):
+                            if ch is not None:
+                                (pattern if kind == "V" else quiet).append(ch)
                 return capture(2 * n, quiet, pattern)
 
             def stop(self):
@@ -332,7 +334,9 @@ class SenseCheck(unittest.TestCase):
         # protection flapping
         self.assertEqual(self.run_check(self.w, self.truth), [])
         n = len(self.w["amps"])
-        self.assertEqual(self.calls, ["start"] + ["capture"] * (1 + 2 * n) + ["stop"])
+        k, _ = sgsc.switch_codes(2 * n)
+        self.assertEqual(k, 5)  # J413: 8 switches in 5 coded captures
+        self.assertEqual(self.calls, ["start"] + ["capture"] * (1 + k) + ["stop"])
 
     def test_a_failed_step_still_ends_the_stream_and_the_grant(self):
         calls, switches = [], {}
@@ -369,13 +373,42 @@ class SenseCheck(unittest.TestCase):
     def test_a_vi_override_fails_on_every_channel(self):
         errs = self.run_check(remap(self.w, swap_vi=True), self.truth)
         self.assertEqual(len(errs), 8, errs)
-        self.assertIn("Left Woofer VSENSE off quietened sense channel(s) [1]; the map has its V on channel 0", errs)
+        self.assertIn("Left Woofer VSENSE: the map has its V on channel 0, which went quiet in captures [0, 2], the switch's are "
+                      "[0, 1] (channel 0 follows Left Woofer I)", errs)
 
     def test_a_dead_or_shared_channel_fails(self):
         truth = dict(self.truth)
         truth[("Right Tweeter", "I")] = truth[("Left Tweeter", "I")]
         errs = self.run_check(self.w, truth)
         self.assertTrue(any("Right Tweeter ISENSE" in e for e in errs), errs)
+
+    def test_switch_codes(self):
+        # No code contains another (two of k each), all distinct, and coding
+        # only where it saves captures.
+        for n in range(1, 25):
+            k, codes = sgsc.switch_codes(n)
+            if not k:
+                self.assertLessEqual(n, 5)
+                continue
+            self.assertLess(k, n)
+            self.assertEqual(len(set(codes)), n)
+            self.assertTrue(all(len(c) == 2 and c <= set(range(k)) for c in codes))
+        self.assertEqual(sgsc.switch_codes(12)[0], 6)  # J316s/J616s: 13 captures -> 7
+        self.assertEqual(sgsc.switch_codes(8)[0], 5)   # J413: 9 -> 6
+        self.assertEqual(sgsc.switch_codes(4), (0, []))
+
+    def test_a_switch_that_also_quiets_another_channel_fails(self):
+        # Left Tweeter's I switch also quiets Left Woofer's I channel: the
+        # union of two codes is no single code.
+        errs = self.run_check(self.w, self.truth, also={("Left Tweeter", "I"): self.truth[("Left Woofer", "I")]})
+        self.assertTrue(any("Left Woofer ISENSE" in e and "no single switch" in e for e in errs), errs)
+        self.assertEqual(len(errs), 1, errs)
+
+    def test_a_switch_that_quiets_nothing_fails(self):
+        truth = dict(self.truth)
+        truth[("Right Woofer", "V")] = None
+        errs = self.run_check(self.w, truth)
+        self.assertTrue(any("Right Woofer VSENSE" in e and "follows no switch" in e for e in errs), errs)
 
     def test_j616s_aop_sense_check(self):
         f = fx("j616")
@@ -518,7 +551,7 @@ class RestoreCommand(unittest.TestCase):
             self.assertTrue(state["closed"])
             self.assertEqual(state["restored"], names)
             self.assertFalse(os.path.exists(sgsc.MARKER))
-            self.assertEqual(len(report["runs"]), 1 + len(names))
+            self.assertEqual(len(report["runs"]), 1 + (sgsc.switch_codes(len(names))[0] or len(names)))
             if fault:
                 self.assertEqual(status, 1, (fault, report))
                 self.assertEqual(binding["result"], "fail")
