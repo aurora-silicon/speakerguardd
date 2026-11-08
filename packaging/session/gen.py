@@ -393,7 +393,11 @@ context.modules = [
             capture.props = {{
                 node.name          = "{n['protect']}"
                 node.description   = "{c['name']} speaker protection input (internal)"
-                media.class        = "Audio/Sink"
+                # Internal, like the amps' sink: desktops neither offer it as
+                # an output nor resolve their volume keys through the voicing
+                # to it (its name looks like hardware), where any volume or
+                # mute drops the carrier and the grant.
+                media.class        = "Audio/Sink/Internal"
                 audio.rate         = {c['rate']}
                 audio.channels     = {amps + sense}
                 audio.position     = {aux(amps + sense)}
