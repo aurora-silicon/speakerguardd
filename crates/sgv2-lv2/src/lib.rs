@@ -44,6 +44,7 @@
 //! therefore never gives a hot speaker full power back.
 
 pub mod attach;
+pub mod gate;
 pub mod handoff;
 pub mod page;
 pub mod ttl;
@@ -230,6 +231,10 @@ struct Instance {
     /// The Mac's filtering ahead of the unit, and its output.
     pre: Box<PreStage>,
     scratch: Box<[[f32; SCRATCH_FRAMES]; MAX_CHANNELS]>,
+    /// Follows the kernel's speaker grant (a watcher thread).
+    gate: gate::Gate,
+    /// The gain the grant puts on the program.
+    ramp: gate::Ramp,
 }
 
 fn env_or(var: &str, default: String) -> String {
@@ -283,6 +288,8 @@ unsafe extern "C" fn instantiate(
         params_crc,
         pre: Box::new(pre),
         scratch: Box::new([[0.0; SCRATCH_FRAMES]; MAX_CHANNELS]),
+        gate: gate::Gate::watch(),
+        ramp: gate::Ramp::new(rate),
     });
     Box::into_raw(instance).cast()
 }
@@ -302,6 +309,8 @@ unsafe extern "C" fn activate(handle: *mut c_void) {
     instance.attach.leave();
     start_stream(instance.unit.as_dyn(), &handoff::SLOT, provided);
     instance.pre.reset();
+    // histories cleared under a program that may be mid-waveform: ramp in
+    instance.ramp.restart();
     instance.last_frame = u64::MAX;
     instance.frames = 0;
 }
@@ -436,6 +445,10 @@ fn run_chunk(instance: &mut Instance, page: Option<&page::EnginePage>, off: usiz
         for (b, s) in bufs.iter_mut().zip(scratch.iter_mut()).take(n) {
             *b = &mut s[..frames];
         }
+        // the kernel's grant: muted while withdrawn, ramped in after a
+        // grant (see gate), ahead of every filter so none sees a step
+        instance.ramp.follow(instance.gate.shared().load());
+        instance.ramp.apply(&mut bufs[..n], frames);
         pre.process_block(&mut bufs[..n], frames);
     }
     for (f, buf) in filtered.iter_mut().zip(instance.scratch.iter()).take(n) {
@@ -616,10 +629,12 @@ mod tests {
         assert!(lv2_descriptor((VARIANTS.len() + voicing::VARIANTS.len()) as u32).is_null());
         unsafe {
             let h = ((*d).instantiate)(d, 48_000.0, core::ptr::null(), core::ptr::null());
-            let mut l = [1.0f32; 4];
-            let mut r = [-1.0f32; 4];
-            let mut ol = [0.0f32; 4];
-            let mut or = [0.0f32; 4];
+            // past the ramp in that follows activate (gate::RAMP_IN_MS)
+            const N: usize = 1024;
+            let mut l = [1.0f32; N];
+            let mut r = [-1.0f32; N];
+            let mut ol = [0.0f32; N];
+            let mut or = [0.0f32; N];
             let mut latency = -1.0f32;
             let mut health = 0.0f32;
             let mut delay = 0.0f32;
@@ -630,8 +645,10 @@ mod tests {
             ((*d).connect_port)(h, 5, (&mut health as *mut f32).cast());
             ((*d).connect_port)(h, 6, (&mut delay as *mut f32).cast());
             ((*d).activate.unwrap())(h);
-            ((*d).run)(h, 4);
-            assert!((ol[0] - 0.1).abs() < 1e-7 && (or[3] + 0.1).abs() < 1e-7);
+            ((*d).run)(h, N as u32);
+            // the stream starts from silence, then the fail-safe's 20 dB
+            assert!(ol[0].abs() < 1e-5 && ol[..480].windows(2).all(|w| w[1] >= w[0]));
+            assert!((ol[N - 1] - 0.1).abs() < 1e-7 && (or[N - 1] + 0.1).abs() < 1e-7);
             assert_eq!(latency, 0.0);
             assert_eq!(delay, -1.0);
             assert_eq!(health as u32 & Health::FAILSAFE, Health::FAILSAFE);
