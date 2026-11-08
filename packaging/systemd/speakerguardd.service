@@ -41,8 +41,12 @@ RestartPreventExitStatus=78
 # and resume take 1.5-2.6 s here, and pm_test adds 5 s), and a 1 s
 # watchdog killed the supervisor at every thaw of a sleep entered without
 # speakerguardd-sleep.service (a direct write to /sys/power/state); its
-# owner then died while the amps resumed.
-WatchdogSec=10s
+# owner then died while the amps resumed. 10 s was not enough either: an M2
+# device suspend with a Thunderbolt link up took 11.2 s, and a pm_test
+# cycle adds 5 s on top. 30 s covers both with margin. The watchdog only
+# restarts a hung supervisor; a longer one never lets a stall play on,
+# because the kernel lease floors the amps 30 ms after its last renewal.
+WatchdogSec=30s
 RuntimeDirectory=speakerguardd
 RuntimeDirectoryMode=0755
 # Kept over every stop and start, not only an automatic restart: the plugin
