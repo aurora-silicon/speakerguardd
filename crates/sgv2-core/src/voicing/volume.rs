@@ -105,6 +105,80 @@ impl Law {
     }
 }
 
+/// `mvol` for a silent or invalid scalar under [`Curve::Cubic`].
+pub const QUIET_DB: f64 = -200.0;
+
+/// The speaker volume control's scalar-to-dB law, as the chain artifact
+/// carries it: the HAL law over the Mac's own dB range, or the legacy
+/// cubic taper when the bundle names no range.
+///
+/// The HAL law is the CoreAudio level control with the 2-over-1 transfer
+/// function (`kAudioLevelControlTranferFunction2Over1`): the scalar is the
+/// square of the dB position within the control's range, so
+///
+/// ```text
+/// dB(s) = min_db + (max_db - min_db) * sqrt(s)
+/// ```
+///
+/// This is measured, not assumed: macOS's built-in speaker control follows
+/// it to 1e-3 dB on every Mac read so far.  The range is not a constant
+/// here: the tuning compiler reads it from the Mac's own tuning bundle
+/// (its device configuration), so a new Mac needs no table entry.
+///
+/// [`Curve::db`] is real-time safe: no allocation, lock or syscall.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum Curve {
+    /// No HAL range known: the PipeWire cubic taper, `60 * log10(s)`.
+    #[default]
+    Cubic,
+    /// The HAL law over `[min_db, max_db]`; build it with [`Curve::hal`].
+    Hal { min_db: f64, max_db: f64 },
+}
+
+impl Curve {
+    /// A HAL law over the control's dB range.  The range must be finite,
+    /// non-empty, end at 0 dB (full scale is unity, so the law never adds
+    /// drive) and start no lower than [`QUIET_DB`].
+    pub fn hal(min_db: f64, max_db: f64) -> Result<Self, LawError> {
+        if !min_db.is_finite() || !max_db.is_finite() {
+            return Err(LawError::NonFinite);
+        }
+        if max_db != 0.0 {
+            return Err(LawError::FullScaleNotUnity);
+        }
+        if min_db >= max_db || min_db < QUIET_DB {
+            return Err(LawError::DbOrder);
+        }
+        Ok(Self::Hal { min_db, max_db })
+    }
+
+    /// Re-check a decoded value (a `Hal` built without [`Curve::hal`]).
+    pub fn valid(&self) -> bool {
+        match *self {
+            Self::Cubic => true,
+            Self::Hal { min_db, max_db } => Self::hal(min_db, max_db).is_ok(),
+        }
+    }
+
+    /// `mvol` for user scalar `s`.  A non-finite scalar maps to the quiet end.
+    #[inline]
+    pub fn db(&self, s: f64) -> f64 {
+        let s = if s.is_finite() { s.clamp(0.0, 1.0) } else { 0.0 };
+        match *self {
+            Self::Cubic if s > 0.0 => 60.0 * libm::log10(s),
+            Self::Cubic => QUIET_DB,
+            Self::Hal { min_db, max_db } => (min_db + (max_db - min_db) * libm::sqrt(s)).min(0.0),
+        }
+    }
+
+    /// Map a user scalar to the graph's `mvsc` and `mvol` values.
+    #[inline]
+    pub fn map(&self, s: f64) -> Frame {
+        let scalar = if s.is_finite() { s.clamp(0.0, 1.0) } else { 0.0 };
+        Frame { scalar, db: self.db(scalar) }
+    }
+}
+
 /// The two simultaneous graph-level representations of system volume.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Frame {
@@ -231,6 +305,56 @@ mod tests {
             ]),
             Err(LawError::DbOrder)
         );
+    }
+
+    #[test]
+    fn hal_curve_is_the_two_over_one_law() {
+        // A synthetic range: the law, not any Mac's value.
+        let c = Curve::hal(-40.0, 0.0).unwrap();
+        assert_eq!(c.db(1.0), 0.0);
+        assert_eq!(c.db(0.0), -40.0);
+        // dB position = sqrt(scalar): a quarter scalar is half the range.
+        assert_eq!(c.db(0.25), -20.0);
+        assert!((c.db(0.81) - -4.0).abs() < 1e-12);
+        // The inverse, scalar = position^2, round-trips.
+        for i in 0..=100 {
+            let s = i as f64 / 100.0;
+            let pos = (c.db(s) + 40.0) / 40.0;
+            assert!((pos * pos - s).abs() < 1e-12, "{s}");
+        }
+        assert_eq!(c.map(f64::NAN), Frame { scalar: 0.0, db: -40.0 });
+        assert_eq!(c.map(3.0), Frame { scalar: 1.0, db: 0.0 });
+        // Monotone, never positive.
+        let mut last = f64::NEG_INFINITY;
+        for i in 0..=1000 {
+            let d = c.db(i as f64 / 1000.0);
+            assert!(d >= last && d <= 0.0);
+            last = d;
+        }
+    }
+
+    #[test]
+    fn cubic_curve_is_the_legacy_taper() {
+        let c = Curve::default();
+        assert_eq!(c, Curve::Cubic);
+        assert!((c.db(0.5) - 60.0 * libm::log10(0.5)).abs() < 1e-12);
+        assert_eq!(c.db(1.0), 0.0);
+        assert_eq!(c.db(0.0), QUIET_DB);
+        assert_eq!(c.db(-1.0), QUIET_DB);
+        assert_eq!(c.db(f64::NAN), QUIET_DB);
+        assert_eq!(c.db(2.0), 0.0);
+    }
+
+    #[test]
+    fn hal_range_that_could_add_drive_or_is_empty_is_refused() {
+        assert_eq!(Curve::hal(-40.0, 1.0), Err(LawError::FullScaleNotUnity));
+        assert_eq!(Curve::hal(0.0, 0.0), Err(LawError::DbOrder));
+        assert_eq!(Curve::hal(10.0, 0.0), Err(LawError::DbOrder));
+        assert_eq!(Curve::hal(-500.0, 0.0), Err(LawError::DbOrder));
+        assert_eq!(Curve::hal(f64::NAN, 0.0), Err(LawError::NonFinite));
+        assert!(!Curve::Hal { min_db: -10.0, max_db: 3.0 }.valid());
+        assert!(Curve::Hal { min_db: -10.0, max_db: 0.0 }.valid());
+        assert!(Curve::Cubic.valid());
     }
 
     #[test]

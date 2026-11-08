@@ -44,10 +44,15 @@ The visible stereo sink handles user volume through `capture.volumes` and
 an LV2 control port, as documented in [PipeWire's filter-chain volume
 controls](https://docs.pipewire.org/page_module_filter_chain.html). Cubic
 mapping sends the slider scalar to `VolumeScalar`; the plugin derives
-`VolumeDb = 60*log10(scalar)` for the graph's dB consumers. `VolumeTaper`
+`VolumeDb` for the graph's dB consumers with the artifact's volume law: the
+macOS HAL law, `min + (max - min) * sqrt(scalar)` over the speaker volume
+range the Mac's own tuning bundle states (`Config/AID<n>.plist`), so slider
+x% gives the level macOS gives at x%. A bundle without that range keeps
+`60*log10(scalar)`. `VolumeTaper`
 applies the bundle's own curve and publishes its gain to Comp automation
 through the saved relay. Offline hosts can supply an explicit nonpositive
-`volume_db` control to match `voicing-render --mvsc S --mvol DB` exactly.
+`volume_db` control to match `voicing-render --mvsc S --mvol DB` exactly
+(`--mvol auto` applies the artifact's law).
 Zero/non-finite scalar mutes residual history as well as the input. Balance
 controls are not exposed; the chain uses its centred defaults.
 

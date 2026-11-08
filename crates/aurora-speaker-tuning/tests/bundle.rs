@@ -35,6 +35,14 @@ fn directory_bundle_end_to_end() {
     assert!(!d.items.iter().any(|x| x.code.starts_with("macos-build")));
 
     assert_eq!(t.aid, AID);
+    // The speaker volume law comes from the bundle's own device configuration.
+    let range = t.volume_range.as_ref().expect("speaker volume range");
+    assert_eq!((range.min_db, range.max_db), (FIXTURE_VOLUME_MIN_DB, 0.0));
+    assert_eq!(range.source, format!("Config/{AID}.plist"));
+    assert_eq!(
+        range.curve(),
+        Some(sgv2_core::voicing::volume::Curve::Hal { min_db: FIXTURE_VOLUME_MIN_DB, max_db: 0.0 })
+    );
     assert_eq!(t.selection.configuration.as_deref(), Some("48k - General"));
     assert_eq!(t.selection.substitutions.get("fs").map(String::as_str), Some("48000"));
     let p = &t.protection;
@@ -424,4 +432,27 @@ fn single_vendor_database_needs_no_speaker_id() {
         assert_eq!(d.count(Severity::Warning), 0, "spid {spid:?}: {:?}", d.items);
         assert_eq!(d.items.iter().any(|x| x.code == "select-speaker-id-unused"), spid.is_some());
     }
+}
+
+#[test]
+fn a_configuration_without_a_speaker_range_keeps_the_cubic_law_and_warns() {
+    let mut files = spp3_files(4);
+    files.insert(format!("Config/{AID}.plist"), aurora_speaker_tuning::plist::binary::write(&dict(vec![])));
+    let dir = scratch("no-volume-range");
+    write_dir(&dir, &files, &manifest_json(&files, "25G83"));
+    let b = Bundle::open(&dir).unwrap();
+    let (t, d) = load(&b, None);
+    let t = t.unwrap();
+    assert_eq!(t.volume_range, None);
+    assert!(d.items.iter().any(|x| x.code == "hal-volume-absent" && x.severity == Severity::Warning), "{:?}", d.items);
+    // A range that would add drive at full scale is not used either.
+    let mut files = spp3_files(4);
+    let params = dict(vec![("OutputVolumeMax", i(3)), ("OutputVolumeMin", r(-40.0))]);
+    let bad = dict(vec![("DSP Devices", dict(vec![("Built-in Speaker", dict(vec![("Parameters", params)]))]))]);
+    files.insert(format!("Config/{AID}.plist"), aurora_speaker_tuning::plist::binary::write(&bad));
+    let dir = scratch("bad-volume-range");
+    write_dir(&dir, &files, &manifest_json(&files, "25G83"));
+    let (t, d) = load(&Bundle::open(&dir).unwrap(), None);
+    assert_eq!(t.unwrap().volume_range, None);
+    assert!(d.items.iter().any(|x| x.code == "hal-volume-invalid"), "{:?}", d.items);
 }

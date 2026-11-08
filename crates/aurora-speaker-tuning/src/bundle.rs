@@ -235,8 +235,8 @@ impl Bundle {
     }
 
     /// Development only: an `AID<n>` folder read in place from a macOS
-    /// `Tunings` directory, plus its `DeviceDSPDatabase.plist` entry if the
-    /// directory has one.  Nothing is verified.
+    /// `Tunings` directory, plus its `DeviceDSPDatabase.plist` and
+    /// `Config/AID<n>.plist` if the directory has them.  Nothing is verified.
     pub fn from_tunings_root(root: &Path, acoustic_id: u32) -> Result<Bundle> {
         let aid = format!("AID{acoustic_id}");
         let base = root.join(&aid);
@@ -260,6 +260,13 @@ impl Bundle {
         let db = root.join(DSP_DATABASE);
         if db.is_file() {
             files.insert(DSP_DATABASE.to_string(), std::fs::read(&db).map_err(|e| io(&db, e))?);
+        }
+        // The device configuration (the speaker volume range), as the
+        // installer collects it.
+        let config = format!("Config/{aid}.plist");
+        let cpath = root.join(&config);
+        if cpath.is_file() {
+            files.insert(config, std::fs::read(&cpath).map_err(|e| io(&cpath, e))?);
         }
         let manifest = Manifest {
             source: Source::Collector,

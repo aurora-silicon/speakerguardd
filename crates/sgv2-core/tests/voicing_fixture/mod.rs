@@ -129,6 +129,7 @@ pub fn spec(lanes: usize) -> Spec {
             Link { param: GraphParam::VolumeDb, node: last - 1, id: 4 },
         ],
         relays: vec![Relay { from_node: 2, from_id: 100, to_node: 4, to_id: 79 }],
+        volume: Default::default(),
     }
 }
 

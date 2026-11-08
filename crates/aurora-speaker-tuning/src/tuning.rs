@@ -177,6 +177,9 @@ pub struct Tuning {
     #[serde(skip)]
     pub mask_lattice: Option<[u32; crate::lattice::ENTRIES]>,
     pub mask_lattice_present: bool,
+    /// The speaker volume control's dB range from the bundle's device
+    /// configuration ([`crate::hal_volume`]); `None` keeps the cubic law.
+    pub volume_range: Option<crate::hal_volume::VolumeRange>,
     #[serde(skip)]
     pub graph: Graph,
 }
@@ -476,6 +479,7 @@ impl Tuning {
 
         let property_files = chain[ppos].property_files.clone();
 
+        let volume_range = crate::hal_volume::speaker_range(b, diags);
         let spts = match b.spts() {
             Some(bytes) => Some(spts::decode(bytes, crate::manifest::SPTS_NAME, diags)?),
             None => {
@@ -560,6 +564,7 @@ impl Tuning {
             },
             spts,
             mask_lattice_present: mask_lattice.is_some(),
+            volume_range,
             mask_lattice,
             graph,
         })

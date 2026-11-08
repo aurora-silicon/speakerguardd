@@ -3,7 +3,8 @@
 //!
 //! ```text
 //! voicing-render (--bundle PATH | --tunings-root DIR --aid N)
-//!     --in PROGRAM.f32 --out LANES.f32 [--mvsc S] [--mvol DB]
+//!     --in PROGRAM.f32 --out LANES.f32 [--mvsc S] [--mvol DB|auto]
+//! (`--mvol auto`: the dB the plugin derives from S with the artifact's volume law)
 //!     [--tap NODE=FILE.f32 ...] [--info FILE.json] [--block N] [--only NODE]
 //!     [--profile PROFILE.json]
 //! ```
@@ -34,6 +35,7 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let (mut root, mut aid, mut bundle, mut input, mut output, mut info) = (None, None, None, None, None, None);
     let (mut mvsc, mut mvol, mut block) = (1.0f64, 0.0f64, 512usize);
+    let mut mvol_auto = false;
     let mut taps: Vec<(String, String)> = Vec::new();
     let mut only: Option<String> = None;
     let mut profile: Option<String> = None;
@@ -47,7 +49,10 @@ fn main() {
             "--out" => output = Some(v()),
             "--info" => info = Some(v()),
             "--mvsc" => mvsc = v().parse().expect("mvsc"),
-            "--mvol" => mvol = v().parse().expect("mvol"),
+            "--mvol" => match v().as_str() {
+                "auto" => mvol_auto = true,
+                x => mvol = x.parse().expect("mvol"),
+            },
             "--block" => block = v().parse().expect("block"),
             "--only" => only = Some(v()),
             "--profile" => profile = Some(v()),
@@ -94,6 +99,7 @@ fn main() {
             outputs: (0..w).map(|k| Source::Node(0, k)).collect(),
             links: c.spec.links.iter().filter(|l| l.node == n).map(|l| Link { node: 0, ..*l }).collect(),
             relays: vec![],
+            volume: c.spec.volume,
         };
         assert!(taps.is_empty(), "--only takes no --tap");
     }
@@ -101,6 +107,10 @@ fn main() {
     let lanes = c.spec.outputs.len();
     let tap_nodes: Vec<(usize, String)> =
         taps.iter().map(|(n, f)| (c.plan.node(n).unwrap_or_else(|| panic!("no node {n}")), f.clone())).collect();
+    if mvol_auto {
+        mvol = c.spec.volume.db(mvsc);
+        eprintln!("mvol auto: {:?} at mvsc {mvsc} -> {mvol} dB", c.spec.volume);
+    }
     let mut chain = Chain::new(c.spec, 48_000.0, block).expect("spec");
     chain.set_param(GraphParam::VolumeScalar, mvsc);
     chain.set_param(GraphParam::VolumeDb, mvol);
