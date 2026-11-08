@@ -1,0 +1,39 @@
+[Unit]
+Description=Speaker wiring self-check, silent switch test after login (speakerguardd v2)
+Documentation=https://github.com/aurora-silicon/speakerguardd/blob/v2/docs/NEW-PLATFORM.md
+# The part of the self-check that speakerguardd-selfcheck.service defers
+# from the login path: on the first boot after a kernel or tuning change,
+# the silent switch test (one capture per sense switch, about 0.5 s each).
+# It runs only when that unit left /run/speakerguardd-graph/selfcheck.deferred
+# in this boot, so a boot without a kernel or tuning change skips it.
+# After user sessions: the login does not wait for it. Every session's
+# PipeWire and WirePlumber wait for it instead (their
+# speakerguardd-graph.service, until this unit's ExecStopPost): WirePlumber's
+# device probe opens and prepares the raw speaker and sense PCMs whatever
+# its node rules say, which must never meet the test's streams. Before the
+# supervisor, which requires a passing record: its ExecStartPost generates
+# the graph, so the sessions start with it, and the supervisor then grants.
+# A failure leaves the kernel's floor, and the supervisor does not start.
+After=speakerguardd-selfcheck.service systemd-user-sessions.service
+Before=speakerguardd.service
+Requires=speakerguardd-selfcheck.service
+ConditionPathExists=/proc/device-tree/compatible
+
+[Service]
+Type=oneshot
+# speakerguardd-selfcheck.service passed the gate in this boot before it
+# deferred the test.
+ExecCondition=/usr/libexec/speakerguardd/speakerguardd-selfcheck pending
+EnvironmentFile=-/etc/speakerguardd/speakerguardd.conf
+ExecStart=/usr/libexec/speakerguardd/speakerguardd-selfcheck run --params ${SGV2_PARAMS} -- $SGV2_TUNING
+ExecStartPost=/usr/libexec/speakerguardd/speakerguardd-provision activate --graph-unit speakerguardd-graph.service
+# Pass or fail (or a timeout): the test is no longer pending, and the
+# sessions' PipeWire and WirePlumber start.
+ExecStopPost=/usr/libexec/speakerguardd/speakerguardd-selfcheck pending --clear
+StateDirectory=speakerguardd
+StateDirectoryMode=0755
+RuntimeDirectory=speakerguardd-selfcheck
+TimeoutStartSec=120
+
+[Install]
+RequiredBy=speakerguardd.service

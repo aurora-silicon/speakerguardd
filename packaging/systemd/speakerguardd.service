@@ -4,6 +4,7 @@ Documentation=https://github.com/aurora-silicon/speakerguardd/tree/v2
 # Without this service no protection holds the amplifiers, and the kernel's
 # own safe level applies. There is deliberately no OnFailure= chain.
 After=systemd-udev-settle.service speakerguardd-provision.service speakerguardd-selfcheck.service
+After=speakerguardd-switchtest.service
 # Stopped only after every user session (and its PipeWire) is gone, at
 # shutdown and reboot: no speaker stream is left running into the
 # withdrawal, so no start is refused.
@@ -11,8 +12,10 @@ After=systemd-user-sessions.service
 # Provisioning (the parameter blob from this Mac's tuning, the seat user,
 # this unit's configuration) and the first-boot wiring self-check: the
 # supervisor grants only with a passing record of both for this board,
-# kernel and parameter blob.
+# kernel and parameter blob. The self-check's switch test, when it has to
+# run, runs after login (speakerguardd-switchtest.service).
 Requires=speakerguardd-provision.service speakerguardd-selfcheck.service
+Requires=speakerguardd-switchtest.service
 ConditionPathExists=/proc/device-tree/compatible
 
 [Service]
