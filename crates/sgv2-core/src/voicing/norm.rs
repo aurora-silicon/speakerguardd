@@ -63,10 +63,8 @@
 //! read as a uniform cubic B-spline over the nodes (not by linear
 //! interpolation: the unit rounds the table's knees). The applied gain is
 //! linear: each frame it covers a fixed share of the remaining distance to
-//! the call's target amplitude, a one-pole smoother with a 200 Hz corner
-//! (time constant 1/(2 pi 200) s, about 0.8 ms, the same time at every
-//! sample rate). Gliding in dB instead bends every large step's onset by
-//! up to tenths of a dB.
+//! the call's target amplitude through a one-pole smoother. Gliding in dB
+//! instead bends every large step's onset by up to tenths of a dB.
 //!
 //! Algorithm 1 (the earliest version a strip can select) keeps the same
 //! detector, meters and gain law with these differences:
@@ -78,13 +76,16 @@
 //!   (the long histogram's relative gate starts from the same -70 dB seed as
 //!   the other algorithms, not from the expected loudness: a gate seeded at
 //!   an expected loudness of -14 lifts the second pause's long reading
-//!   above the unit's); the smoothed detector power starts from a small fixed floor
-//!   (`V1_DETECTOR_SEED_DB`) that fades with the detector's own time
-//!   constant; there is no deferred second clear of the detector state;
-//! - the applied gain starts its glide from `V1_START_GAIN_DB`;
-//! - the fast level is a two-sided hysteresis on every 64-frame level, less
-//!   a 4 dB store: it rises only when the stored level clears it by 3 dB and
-//!   falls to 8 dB above the stored level once that edge is under it;
+//!   above the unit's); the smoothed detector power starts at the power
+//!   represented by the default gain curve's reset coordinate, five dB
+//!   below its lower knee; there is no deferred second clear of the detector
+//!   state;
+//! - the applied gain starts its glide at the public default maximum gain;
+//!   its glide has a 0.8 ms time constant at every sample rate;
+//! - the fast level is a two-sided hysteresis on the first single-precision
+//!   smoothed-detector level of every 64-frame step, less a 4 dB store: it
+//!   rises only when that stored level strictly clears it by 3 dB and falls
+//!   to 8 dB above the stored level once that edge is under it;
 //! - the median store is 1.691 dB and the median moves straight to its
 //!   five-dB release edge; the competitor of the long path has no store and
 //!   there is no low-level coordinate move;
@@ -126,9 +127,11 @@ const BINS: usize = 1001;
 const BIN_LO_DB: f64 = -100.0;
 const BIN_DB: f64 = 0.1;
 const SEED_HALF: usize = 5;
-/// Corner of the one-pole that glides the linear gain toward each call's
-/// target, Hz.
-const GLIDE_HZ: f64 = 200.0;
+/// Time constant of the one-pole that glides the linear gain toward each
+/// call's target in algorithm 1.
+const GLIDE_S: f32 = 0.000_8;
+/// Existing algorithms 2/3 glide, retained outside this algorithm-1 change.
+const LEGACY_GLIDE_HZ: f64 = 200.0;
 /// macOS renders the speaker graph in calls of this many frames; the unit
 /// meters a whole call before it moves its gain across that call.
 pub const CALL: usize = 512;
@@ -267,12 +270,28 @@ fn level(power: f64) -> f64 {
     10.0 * libm::log10(libm::fabs(power).max(1e-20))
 }
 
+/// Algorithm 1's single-precision detector-level conversion.
+fn level_f32(power: f64) -> f64 {
+    f64::from(10.0 * libm::log10f((power as f32).abs().max(1e-20)))
+}
+
 fn loudness(power: f64) -> f64 {
     level(power) + LOUDNESS_OFFSET
 }
 
 fn power_of(l: f64) -> f64 {
     libm::pow(10.0, (l - LOUDNESS_OFFSET) / 10.0)
+}
+
+/// The unit's single-precision loudness-to-power conversion.
+fn power_of_f32(l: f32) -> f64 {
+    let exponent = (l - LOUDNESS_OFFSET as f32) * (core::f32::consts::LN_10 / 10.0);
+    f64::from(libm::expf(exponent))
+}
+
+/// The unit's single-precision dB-to-linear-amplitude conversion.
+fn amplitude_of_f32(db: f32) -> f64 {
+    f64::from(libm::expf(db * (core::f32::consts::LN_10 / 20.0)))
 }
 
 /// The histogram bin of loudness `l`: one below the nearest point of the
@@ -394,23 +413,19 @@ const FAST_STORE_DB: f64 = -8.0;
 const MEDIAN_STORE_DB: f64 = -5.0;
 /// Algorithm 1: fast store, its rise and fall hysteresis, the median store
 /// and the level every meter starts from after a reset, dB.
-const V1_FAST_STORE_DB: f64 = -4.0;
-const V1_FAST_RISE_DB: f64 = 3.0;
-const V1_FAST_FALL_DB: f64 = 8.0;
+const V1_FAST_STORE_DB: f32 = -4.0;
+const V1_FAST_RISE_DB: f32 = 3.0;
+const V1_FAST_FALL_DB: f32 = 8.0;
 const V1_MEDIAN_STORE_DB: f64 = LOUDNESS_OFFSET - 1.0;
 const V1_SILENT_DB: f64 = BIN_LO_DB;
-/// Algorithm 1: where the applied gain starts its glide after a reset, dB.
-/// Measured on the installed unit sample by sample (the 200 Hz glide's own
-/// pole fits frames 3..39 of a 1 kHz onset to 24.0195..24.0187 dB, the same
-/// on every algorithm-1 state); it is not the parameter default of 24 dB.
-const V1_START_GAIN_DB: f64 = 24.0195;
-/// Algorithm 1: the smoothed detector power after a reset, dB (power
-/// `10^(dB / 10)`). Measured on the installed unit through the fast path's
-/// +3 dB rise test: onsets whose rise margin is a few thousandths of a dB
-/// resolve as the unit does only for a start between -53.5 and -51.5 dB
-/// (a 40 Hz onset at -12 dBFS does not rise where the same onset at 0 and
-/// -6 dBFS does, which no scale-free law explains).
-const V1_DETECTOR_SEED_DB: f64 = -52.5;
+/// Public defaults used while the unit constructs its gain curve, before a
+/// strip's saved state is restored.
+const DEFAULT_TARGET_DB: f32 = -24.0;
+const DEFAULT_MAX_GAIN_DB: f32 = 24.0;
+const DEFAULT_UP_RANGE_DB: f32 = 0.0;
+/// The reset coordinate is this far below the lower gain-curve knee.
+const RESET_MARGIN_DB: f32 = 5.0;
+const V1_RESET_LEVEL_DB: f32 = DEFAULT_TARGET_DB - DEFAULT_UP_RANGE_DB - DEFAULT_MAX_GAIN_DB - RESET_MARGIN_DB;
 const COMPETITOR_STORE_DB: f64 = -2.0;
 /// The median path: the true median of this many 512-frame levels (an odd
 /// count, read at its middle sorted index). Measured on the unit: after a
@@ -684,7 +699,11 @@ impl Run {
             pos: 0,
             z: [[[0.0; 2]; MAX_SECTIONS]; MAX_CHANNELS],
             ema: 0.0,
-            ema_a: libm::exp(-1.0 / (p.detector_ema_s * fs)),
+            ema_a: if p.algorithm1 {
+                f64::from(libm::expf(-1.0 / (p.detector_ema_s as f32 * fs as f32)))
+            } else {
+                libm::exp(-1.0 / (p.detector_ema_s * fs))
+            },
             in_step: 0,
             steps: 0,
             blocks: 0,
@@ -710,7 +729,11 @@ impl Run {
             steps_in_call: 0,
             gain: 1.0,
             target: 1.0,
-            glide: 1.0 - libm::exp(-2.0 * core::f64::consts::PI * GLIDE_HZ / fs),
+            glide: if p.algorithm1 {
+                f64::from(1.0 - libm::expf(-1.0 / (GLIDE_S * fs as f32)))
+            } else {
+                1.0 - libm::exp(-2.0 * core::f64::consts::PI * LEGACY_GLIDE_HZ / fs)
+            },
         };
         r.reset();
         r
@@ -753,7 +776,7 @@ impl Run {
     /// gate keeps the common seed and the detector power its own floor.
     fn reset_algorithm1(&mut self) {
         let s = V1_SILENT_DB;
-        self.ema = libm::pow(10.0, V1_DETECTOR_SEED_DB / 10.0);
+        self.ema = power_of_f32(V1_RESET_LEVEL_DB);
         self.window.reset(0.0);
         self.median.reset(s);
         self.long.reset(s);
@@ -767,7 +790,7 @@ impl Run {
         self.target_db = self.p.gain_db(s);
         self.target = libm::pow(10.0, self.target_db / 20.0);
         self.steps_in_call = 0;
-        self.gain = libm::pow(10.0, V1_START_GAIN_DB / 20.0);
+        self.gain = amplitude_of_f32(DEFAULT_MAX_GAIN_DB);
     }
 
     /// Audio delay in frames. Metering and gain application complete inside
@@ -797,15 +820,12 @@ impl Run {
         v * v
     }
 
-    /// On the first frame of every 64: the call's peak level and the
-    /// window, and on their own boundaries the long (4096) and median (512)
-    /// paths. Every stage takes its first input, so the paths sample frames
-    /// 0, 64, ...; 0, 512, ...; 0, 4096, ... of the stream. The long path
-    /// reads the window before the current power joins it, and its reading
-    /// joins the 512-frame event on the boundary `LONG_DELAY` windows later.
+    /// The 64-frame meter clock. The long path reads the window before the
+    /// current power joins it, and its reading joins the 512-frame event on
+    /// the boundary `LONG_DELAY` windows later.
     fn on_step(&mut self) {
         let ema = self.ema;
-        let db = level(ema);
+        let db = if self.p.algorithm1 { level_f32(ema) } else { level(ema) };
         self.peak = self.peak.max(db);
         self.events += 1;
         if self.steps == 0 && self.blocks == 0 {
@@ -829,15 +849,16 @@ impl Run {
         }
     }
 
-    /// Algorithm 1, every 64-frame step: the fast hysteresis, the held
-    /// candidate on a 512-frame event (the long path conditioned against
-    /// the fast level), and the gain's target.
+    /// Algorithm 1, every 64-frame step: advance the fast hysteresis in the
+    /// unit's single-precision dB domain, condition the long path on its
+    /// 512-frame events, and read the gain target.
     fn arbitrate_step(&mut self, db: f64) {
-        let fast = db + V1_FAST_STORE_DB;
-        if fast > self.fast + V1_FAST_RISE_DB {
-            self.fast = fast;
-        } else if fast + V1_FAST_FALL_DB < self.fast {
-            self.fast = fast + V1_FAST_FALL_DB;
+        let fast = db as f32 + V1_FAST_STORE_DB;
+        let retained = self.fast as f32;
+        if fast > retained + V1_FAST_RISE_DB {
+            self.fast = f64::from(fast);
+        } else if fast + V1_FAST_FALL_DB < retained {
+            self.fast = f64::from(fast + V1_FAST_FALL_DB);
         }
         if let Some((_, mid, long)) = self.pending.take() {
             // the long path competes against the fast level, not the
@@ -928,7 +949,14 @@ impl Run {
                 let x = b.get(n).copied().filter(|v| v.is_finite()).unwrap_or(0.0);
                 power += self.detect(ch, f64::from(x));
             }
-            self.ema = self.ema_a * self.ema + (1.0 - self.ema_a) * power.max(1e-12);
+            if self.p.algorithm1 {
+                let y = self.ema as f32;
+                let x = power.max(1e-12) as f32;
+                let a = self.ema_a as f32;
+                self.ema = f64::from(a * y + (1.0 - a) * x);
+            } else {
+                self.ema = self.ema_a * self.ema + (1.0 - self.ema_a) * power.max(1e-12);
+            }
             if self.in_step == 0 {
                 self.on_step();
                 if self.p.algorithm1 && self.steps_in_call < self.step_target.len() {
@@ -993,8 +1021,8 @@ mod tests {
     }
 
     #[test]
-    fn gain_glides_linearly_with_a_200_hz_one_pole() {
-        let p = params(0);
+    fn gain_glides_linearly_with_an_800_us_one_pole() {
+        let p = Params { algorithm1: true, detector_ema_s: 0.040, ..params(0) };
         let mut r = Run::new(&p, 48_000.0, 1);
         let from = libm::pow(10.0, p.gain_db(p.expected_db) / 20.0);
         // a loud call moves the target; the applied amplitude covers the
@@ -1003,8 +1031,8 @@ mod tests {
         r.process(&mut [&mut buf[..]], CALL * 3);
         let to = r.target;
         assert!((to - from).abs() > 0.1);
-        let a = 1.0 - libm::exp(-2.0 * core::f64::consts::PI * 200.0 / 48_000.0);
-        assert!((r.glide - a).abs() < 1e-15);
+        let a = f64::from(1.0 - libm::expf(-1.0 / (GLIDE_S * 48_000.0)));
+        assert_eq!(r.glide, a);
     }
 
     #[test]
@@ -1015,8 +1043,8 @@ mod tests {
         assert_eq!(Params::from_words(&w), Some(p.clone()));
         let mut r = Run::new(&p, 48_000.0, 1);
         assert_eq!(r.candidate, V1_SILENT_DB);
-        assert!((r.gain_db() - V1_START_GAIN_DB).abs() < 1e-9);
-        assert!((level(r.ema) - V1_DETECTOR_SEED_DB).abs() < 1e-9);
+        assert_eq!(r.gain, amplitude_of_f32(DEFAULT_MAX_GAIN_DB));
+        assert_eq!(r.ema, power_of_f32(V1_RESET_LEVEL_DB));
         assert!(!r.clear_due);
         r.fast = -20.0;
         r.arbitrate_step(-14.0); // stored -18 is inside +3 dB

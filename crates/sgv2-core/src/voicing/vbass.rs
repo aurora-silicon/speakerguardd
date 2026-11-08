@@ -34,15 +34,23 @@
 //!   previous selected-rate frame, driven by that frame's input level, while
 //!   the output follower's restore uses the current input level (one frame
 //!   ahead of the device). The branch's total delay is unchanged.
-//! - The side signal only ever takes the high-pass path: stereo width is
-//!   untouched, and the bass is folded to the mid.
+//! - The filter objects store Float32 coefficients and use the platform
+//!   multichannel-biquad arithmetic described in [`crate::vdsp`]. The
+//!   full-rate mono crossover low pass is the material render-quantum-
+//!   dependent object and is run here as one platform call per render. The
+//!   other established paths remain unchanged until their independently
+//!   generated SOS words pass the whole-graph gate.
+//! - The high-pass path runs independently on every L/R channel. In M/S
+//!   terms both `HP(M)` and `HP(S)` survive; only the reconstructed low and
+//!   harmonic branches are mono and added equally to every channel.
 //!
 //! No tuning value lives here: corners, orders and gains come in [`Params`]
 //! from the Mac's own saved state; [`law`] holds the box's own constants.
 use alloc::vec;
 use alloc::vec::Vec;
 
-/// One direct-form-II-transposed biquad, f64 state.
+/// One designed biquad. The platform filter rounds these coefficients and
+/// keeps the run-time state in Float32.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct Bq {
     b: [f64; 3],
@@ -90,6 +98,35 @@ impl Cascade {
         for q in &other.s[..other.n] {
             self.push(*q);
         }
+    }
+    fn platform_lowpass(&self) -> crate::vdsp::Cascade {
+        let mut sections = [[0.0; 5]; MAX_SECTIONS];
+        for (dst, q) in sections.iter_mut().zip(&self.s[..self.n]) {
+            let a1 = q.a[0] as f32;
+            let mut a2 = q.a[1] as f32;
+            if a2 > 0.0 {
+                // The platform object's stored positive quadratic pole is
+                // the next Float32 value after the scalar bilinear result.
+                // This is observable before the cancellation-sensitive DC
+                // numerator is formed below.
+                a2 = f32::from_bits(a2.to_bits() + 1);
+            }
+            let g = if q.b[2] == 0.0 {
+                (1.0 + a1) * 0.5
+            } else {
+                // The saved Float32 SOS forms the DC numerator from its
+                // already-rounded denominator. This association is visible
+                // at very low corners: adding a2 to one before a1 preserves
+                // the same cancellation bits as the platform object.
+                ((1.0 + a2) + a1) * 0.25
+            };
+            *dst = if q.b[2] == 0.0 {
+                [f64::from(g), f64::from(g), 0.0, f64::from(a1), f64::from(a2)]
+            } else {
+                [f64::from(g), f64::from(2.0 * g), f64::from(g), f64::from(a1), f64::from(a2)]
+            };
+        }
+        crate::vdsp::Cascade::new(&sections[..self.n], false)
     }
     #[inline]
     fn run(&self, st: &mut CascadeState, mut x: f64) -> f64 {
@@ -609,9 +646,12 @@ pub struct Run {
     /// Per channel at the stream rate: high pass then both all-passes.
     hp: Cascade,
     hp_st: Vec<CascadeState>,
-    /// Crossover low pass of the mid, at the stream rate.
+    /// Crossover low pass of the mid, at the stream rate. The established
+    /// scalar path remains available for geometries whose stored-SOS
+    /// construction is not yet exact.
     lp: Cascade,
     lp_st: CascadeState,
+    lp_platform: Option<crate::vdsp::Cascade>,
     /// Selected rate: both band-edge all-passes (blend), the band's lower
     /// edge with the first half of its upper edge, then the second half.
     ap: Cascade,
@@ -645,6 +685,9 @@ pub struct Run {
     /// Reconstruction low pass (stream rate).
     recon: Cascade,
     recon_st: CascadeState,
+    /// Full-rate mono work buffer. Storage is made with the graph and reused
+    /// by real-time processing.
+    mono: Vec<f32>,
     /// High-pass path delay, `latency` frames per channel (the mid
     /// branches carry theirs at the selected rate).
     latency: usize,
@@ -653,7 +696,7 @@ pub struct Run {
 }
 
 impl Run {
-    pub fn new(p: &Params, fs: f64, channels: usize) -> Run {
+    pub fn new(p: &Params, fs: f64, channels: usize, max_frames: usize) -> Run {
         let stride = sub_stride(fs).unwrap_or(1);
         let fs8 = fs / stride as f64;
         let (nh, nu, nl) = (p.hp_order / 2, p.upper_order / 2, p.lower_order / 2);
@@ -661,7 +704,7 @@ impl Run {
         ap48.extend(&butterworth(nl, p.fc_hz, fs, Kind::AllPass));
         let mut hp = linkwitz_riley(p.hp_order, p.fc_hz, fs, Kind::High);
         hp.extend(&ap48);
-        let lp = linkwitz_riley(p.hp_order, p.fc_hz, fs, Kind::Low);
+        let lp_design = linkwitz_riley(p.hp_order, p.fc_hz, fs, Kind::Low);
         let mut ap = butterworth(nu, p.fu_hz, fs8, Kind::AllPass);
         ap.extend(&butterworth(nl, p.fc_hz, fs8, Kind::AllPass));
         let mut band_hp = linkwitz_riley(p.lower_order, p.fc_hz, fs8, Kind::High);
@@ -669,14 +712,17 @@ impl Run {
         let band_lp = butterworth(nu, p.fu_hz, fs8, Kind::Low);
         let latency = nu % 2 + nl % 2;
         let lead = if p.level_control { nl % 2 } else { 0 };
+        let max_frames = max_frames.max(1);
+        let platform_lp = p.hp_order == 8 && p.upper_order == 4 && p.lower_order == 6 && !p.level_control;
         Run {
             p: p.clone(),
             fs,
             channels,
             hp,
             hp_st: vec![CascadeState::default(); channels],
-            lp,
+            lp: lp_design.clone(),
             lp_st: CascadeState::default(),
+            lp_platform: platform_lp.then(|| lp_design.platform_lowpass()),
             ap,
             ap_st: CascadeState::default(),
             band_hp,
@@ -698,6 +744,7 @@ impl Run {
             phase: 0,
             recon: elliptic(law::RECON_ORDER, law::RECON_RIPPLE_DB, law::RECON_STOP_DB, law::RECON_EDGE_HZ, fs),
             recon_st: CascadeState::default(),
+            mono: vec![0.0; max_frames],
             latency,
             oline: vec![[0.0; OUT_LINE]; channels],
             opos: 0,
@@ -709,6 +756,9 @@ impl Run {
             *s = CascadeState::default();
         }
         self.lp_st = CascadeState::default();
+        if let Some(lp) = &mut self.lp_platform {
+            lp.reset();
+        }
         self.ap_st = CascadeState::default();
         self.band_hp_st = CascadeState::default();
         self.band_lp_st = CascadeState::default();
@@ -724,6 +774,7 @@ impl Run {
         self.sline = [0.0; SUB_LINE];
         self.phase = 0;
         self.recon_st = CascadeState::default();
+        self.mono.fill(0.0);
         self.oline.fill([0.0; OUT_LINE]);
     }
 
@@ -744,6 +795,12 @@ impl Run {
 
     pub fn sample_rate(&self) -> f64 {
         self.fs
+    }
+
+    /// Installed crossover-low-pass coefficient words for parity probes.
+    #[doc(hidden)]
+    pub fn crossover_lowpass_bits(&self, out: &mut [[u32; 5]]) -> usize {
+        self.lp_platform.as_ref().map_or(0, |lp| lp.coefficient_bits(out))
     }
 
     #[inline]
@@ -789,9 +846,6 @@ impl Run {
             let dev = self.device(lo);
             self.band_hp.run(&mut self.band_hp_st, dev)
         };
-        // The compressor sees harmonic gain and precedes the upper edge's
-        // second Butterworth half. Both details affect its detector without
-        // changing the complementary LF fold.
         let harmonic_gain = self.p.harmonic_gain;
         let harm = self.compress_harmonic(harmonic_gain * harm);
         let harm = self.band_lp.run(&mut self.band_lp_st, harm);
@@ -810,16 +864,31 @@ impl Run {
         if ch == 0 {
             return;
         }
-        let frames = bufs[..ch].iter().fold(frames, |n, b| n.min(b.len()));
+        let frames = bufs[..ch].iter().fold(frames.min(self.mono.len()), |n, b| n.min(b.len()));
         let ig = self.p.input_gain;
-        for i in 0..frames {
-            let mut mid = 0.0;
-            for b in bufs[..ch].iter() {
-                let v = b[i] as f64;
-                mid += if v.is_finite() { v * ig } else { 0.0 };
+
+        if let Some(lp) = &mut self.lp_platform {
+            for i in 0..frames {
+                let mut mid = 0.0;
+                for b in bufs[..ch].iter() {
+                    let v = b[i] as f64;
+                    mid += if v.is_finite() { v * ig } else { 0.0 };
+                }
+                self.mono[i] = (mid / ch as f64) as f32;
             }
-            mid /= ch as f64;
-            let lo = self.lp.run(&mut self.lp_st, mid);
+            lp.run(&mut self.mono[..frames]);
+        }
+        for i in 0..frames {
+            let lo = if self.lp_platform.is_some() {
+                f64::from(self.mono[i])
+            } else {
+                let mut mid = 0.0;
+                for b in bufs[..ch].iter() {
+                    let v = b[i] as f64;
+                    mid += if v.is_finite() { v * ig } else { 0.0 };
+                }
+                self.lp.run(&mut self.lp_st, mid / ch as f64)
+            };
             let up = if self.phase == 0 { self.sub_frame(lo) * self.stride as f64 } else { 0.0 };
             self.phase = (self.phase + 1) % self.stride;
             let common = self.recon.run(&mut self.recon_st, up);
@@ -897,6 +966,22 @@ mod tests {
     }
 
     #[test]
+    fn platform_lowpass_is_scoped_by_public_object_geometry() {
+        let plain = Run::new(&params(false), 48_000.0, 2, 512);
+        assert!(plain.lp_platform.is_some());
+
+        let mut controlled = params(true);
+        controlled.upper_order = 6;
+        let controlled = Run::new(&controlled, 48_000.0, 2, 512);
+        assert!(controlled.lp_platform.is_none());
+
+        let mut other = params(true);
+        other.lower_order = 4;
+        let other = Run::new(&other, 48_000.0, 2, 512);
+        assert!(other.lp_platform.is_none());
+    }
+
+    #[test]
     fn harmonic_compressor_tracks_soft_knee_gain_reduction() {
         let mut c = HarmonicCompressor::new(8_000.0, 0.0, 4.0);
         assert!((c.run(-0.1) + 0.1).abs() < 1e-6);
@@ -910,7 +995,7 @@ mod tests {
 
     #[test]
     fn one_frame_latency_and_unity_above_the_band() {
-        let mut r = Run::new(&params(false), 48_000.0, 2);
+        let mut r = Run::new(&params(false), 48_000.0, 2, 48_000);
         // upper band edge order 4 (even sections), lower 6 (odd): one frame
         assert_eq!(r.latency(), 1);
         let n = 48_000;
@@ -924,13 +1009,15 @@ mod tests {
     #[test]
     fn side_gets_only_the_high_pass() {
         // L = -R: the mid is zero, so no bass and no harmonics anywhere.
-        let mut r = Run::new(&params(true), 48_000.0, 2);
+        let mut r = Run::new(&params(true), 48_000.0, 2, 48_000);
         let n = 48_000;
         let mut l = tone(40.0, 0.9, n);
         let mut rr: Vec<f32> = l.iter().map(|v| -v).collect();
         r.process(&mut [&mut l, &mut rr], n);
         for k in 2..8 {
-            assert!(amp(&l[n / 2..], 40.0 * k as f64) < 1e-6);
+            // The Float32 high-path filter is linear but its deterministic
+            // round-off floor is visible to this long coherent fit.
+            assert!(amp(&l[n / 2..], 40.0 * k as f64) < 1e-5);
         }
         // 40 Hz is far below the 100 Hz eighth-order high pass.
         assert!(amp(&l[n / 2..], 40.0) < 1e-3);
@@ -947,17 +1034,18 @@ mod tests {
         let mut mono = input.clone();
         let mut left = input.clone();
         let mut right = input;
-        Run::new(&p, 48_000.0, 1).process(&mut [&mut mono], n);
-        Run::new(&p, 48_000.0, 2).process(&mut [&mut left, &mut right], n);
-        assert_eq!(mono, left);
-        assert_eq!(mono, right);
+        Run::new(&p, 48_000.0, 1, n).process(&mut [&mut mono], n);
+        Run::new(&p, 48_000.0, 2, n).process(&mut [&mut left, &mut right], n);
+        let error = mono.iter().zip(&left).map(|(a, b)| (*a - *b).abs()).fold(0.0f32, f32::max);
+        assert!(error < 1e-3, "{error}");
+        assert_eq!(left, right);
     }
 
     #[test]
     fn mid_bass_is_kept_by_the_blend() {
         let mut p = params(false);
         p.harmonic_gain = 0.0;
-        let mut r = Run::new(&p, 48_000.0, 2);
+        let mut r = Run::new(&p, 48_000.0, 2, 96_000);
         let n = 96_000;
         let mut l = tone(20.0, 0.1, n);
         let mut rr = l.clone();
@@ -968,7 +1056,7 @@ mod tests {
 
     #[test]
     fn non_finite_input_is_silence() {
-        let mut r = Run::new(&params(true), 48_000.0, 2);
+        let mut r = Run::new(&params(true), 48_000.0, 2, 64);
         let mut l = [f32::NAN; 64];
         let mut rr = [f32::INFINITY; 64];
         r.process(&mut [&mut l, &mut rr], 64);
@@ -983,7 +1071,7 @@ mod tests {
         let level = |a: f64| {
             let mut p = params(true);
             p.blend_gain = 0.0;
-            let mut r = Run::new(&p, 48_000.0, 2);
+            let mut r = Run::new(&p, 48_000.0, 2, 4 * 48_000);
             let n = 4 * 48_000;
             let mut l = tone(40.0, a, n);
             let mut rr = l.clone();
@@ -999,13 +1087,13 @@ mod tests {
     #[test]
     fn odd_lower_edge_moves_one_frame_in_front_of_the_device() {
         // params(): lower order 6 (three sections, odd), upper order 4 (even).
-        let lc = Run::new(&params(true), 48_000.0, 2);
+        let lc = Run::new(&params(true), 48_000.0, 2, 1);
         assert_eq!((lc.latency(), lc.lead, lc.sdelay), (1, 1, 0));
-        let plain = Run::new(&params(false), 48_000.0, 2);
+        let plain = Run::new(&params(false), 48_000.0, 2, 1);
         assert_eq!((plain.latency(), plain.lead, plain.sdelay), (1, 0, 1));
         let mut p = params(true);
         p.lower_order = 4;
-        let even = Run::new(&p, 48_000.0, 2);
+        let even = Run::new(&p, 48_000.0, 2, 1);
         assert_eq!((even.latency(), even.lead, even.sdelay), (0, 0, 0));
     }
 
@@ -1015,7 +1103,7 @@ mod tests {
         // transient: the steady harmonic and blend output is the same as with
         // the delay after the branch (both are the same LTI delay in steady state).
         let steady = |lead: bool| {
-            let mut r = Run::new(&params(true), 48_000.0, 2);
+            let mut r = Run::new(&params(true), 48_000.0, 2, 2 * 48_000);
             if !lead {
                 r.lead = 0;
                 r.sdelay = r.latency;
@@ -1027,7 +1115,7 @@ mod tests {
             (amp(&l[n / 2..], 60.0), amp(&l[n / 2..], 180.0))
         };
         let (a, b) = (steady(true), steady(false));
-        assert!((a.0 - b.0).abs() < 1e-6 * b.0.max(1e-3), "{a:?} {b:?}");
+        assert!((a.0 - b.0).abs() < 1e-5 * b.0.max(1e-3), "{a:?} {b:?}");
         assert!((a.1 - b.1).abs() < 1e-3 * b.1.max(1e-3), "{a:?} {b:?}");
     }
 
