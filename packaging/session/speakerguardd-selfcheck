@@ -302,9 +302,11 @@ def switch_set(ctl, name, v):
 # ---------------------------------------------------------------- checks
 
 
-def regmap_values(i2c, regs):
-    """{reg: value} from the amp's regmap in debugfs."""
-    path = f"/sys/kernel/debug/regmap/{i2c}/registers"
+REGMAP = "/sys/kernel/debug/regmap"
+
+
+def _regmap_dump(path, regs):
+    """{reg: value} from the whole debugfs dump (every readable register)."""
     try:
         with open(path) as f:
             text = f.read()
@@ -320,6 +322,41 @@ def regmap_values(i2c, regs):
         if r in regs:
             out[r] = int(v.strip(), 16)
     return out
+
+
+def regmap_values(i2c, regs):
+    """{reg: value} from the amp's regmap in debugfs, reading only `regs`.
+
+    The dump is fixed-width lines ("<reg>: <value>"), and the kernel reads
+    only the registers whose lines a read covers. Reading it whole reads
+    every register of every page over I2C (about 0.33 s per amp on the
+    J616s, 2 s of every check) and fills the register cache with all of
+    them. So each wanted register's line is read on its own, at its offset
+    if every register before it is in the dump (the line names its
+    register, and is checked); anything else reads the whole dump."""
+    path = f"{REGMAP}/{i2c}/registers"
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+    except OSError as e:
+        raise wiring.Refused(f"cannot read {path}: {e.strerror} (debugfs is needed for the slot check)")
+    try:
+        first = os.pread(fd, 64, 0).decode(errors="replace").split("\n", 1)[0]
+        k, sep, _ = first.partition(": ")
+        if not sep or int(k, 16) != 0:
+            raise ValueError(first)
+        width = len(first) + 1
+        out = {}
+        for r in sorted(regs):
+            line = os.pread(fd, width, r * width).decode(errors="replace")
+            k, sep, v = line.rstrip("\n").partition(": ")
+            if not sep or int(k, 16) != r:
+                raise ValueError(line)
+            out[r] = int(v, 16)
+        return out
+    except (OSError, ValueError):
+        return _regmap_dump(path, regs)
+    finally:
+        os.close(fd)
 
 
 def check_registers(w):

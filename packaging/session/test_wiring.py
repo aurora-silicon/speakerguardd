@@ -1015,6 +1015,34 @@ class BoundRecord(unittest.TestCase):
             self.assertFalse(sgsc.report_matches(path, bind))
 
 
+class RegmapRead(unittest.TestCase):
+    """Only the wanted registers' lines are read from the regmap dump, at
+    their offsets; a dump whose lines do not line up is read whole."""
+
+    def dump(self, d, regs, width=2):
+        os.makedirs(os.path.join(d, "3-0038"))
+        with open(os.path.join(d, "3-0038", "registers"), "w") as f:
+            for r, v in regs:
+                f.write(f"{r:0{width}x}: {v:02x}\n")
+
+    def test_targeted_and_fallback(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(sgsc, "REGMAP", d):
+            self.dump(d, [(r, (r * 7) & 0xFF) for r in range(0x40)])
+            reads = []
+            real = os.pread
+            with mock.patch.object(sgsc.os, "pread", side_effect=lambda fd, n, off: (reads.append((n, off)), real(fd, n, off))[1]):
+                self.assertEqual(sgsc.regmap_values("3-0038", {0x0C, 0x0E, 0x0F}), {0x0C: 0x54, 0x0E: 0x62, 0x0F: 0x69})
+            self.assertEqual(reads, [(64, 0), (7, 0x0C * 7), (7, 0x0E * 7), (7, 0x0F * 7)])
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(sgsc, "REGMAP", d):
+            # register 0x05 is not in the dump: the offsets shift, read it whole
+            self.dump(d, [(r, r) for r in range(0x40) if r != 5], width=4)
+            self.assertEqual(sgsc.regmap_values("3-0038", {0x0C, 0x0E, 0x0F}), {0x0C: 0x0C, 0x0E: 0x0E, 0x0F: 0x0F})
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(sgsc, "REGMAP", d):
+            with self.assertRaises(sgsc.wiring.Refused):
+                sgsc.regmap_values("3-0038", {0x0C})
+
+
 class StreamStop(unittest.TestCase):
     """The zero-sample playback ends on SIGTERM; the sense capture, whose
     data is no longer needed and which can stall once the playback stopped,
