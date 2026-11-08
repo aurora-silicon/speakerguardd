@@ -2,12 +2,34 @@
 """speakerguardd-selfcheck: prove this Mac's speaker wiring, silently, before
 speakerguardd may grant.
 
-    speakerguardd-selfcheck run      --params BLOB [--force] [-- TUNING-SOURCE...]
+    speakerguardd-selfcheck run      --params BLOB [--force] [--defer] [-- TUNING-SOURCE...]
+    speakerguardd-selfcheck pending
     speakerguardd-selfcheck check    --params BLOB
     speakerguardd-selfcheck generate --pipewire-dir D --wireplumber-dir D
 
-It runs as root, before the supervisor (speakerguardd-selfcheck.service),
-while the kernel holds the speakers at its floor.
+It runs as root, before the supervisor, while the kernel holds the speakers
+at its floor, in two units:
+
+- speakerguardd-selfcheck.service, before any login, runs `run --defer`. A
+  passing record bound to this board, kernel, blob and wiring (every boot
+  without a kernel or tuning change) is reused, and its ExecStartPost puts
+  the graph in place before the session starts. The cheap checks (steps 1
+  and 2, the card) run here too. Only the silent switch test (step 3), which
+  takes about 0.5 s per sense switch, is deferred: the run leaves
+  /run/speakerguardd-graph/selfcheck.deferred, writes no record, and no
+  graph is generated, so the seat user's session starts with the raw-PCM
+  rules alone (provisioning's raw/59-sgv2-raw.conf: no WirePlumber node on
+  the raw speaker or sense PCMs, for every user).
+- speakerguardd-switchtest.service, after systemd-user-sessions.service and
+  before the supervisor, runs `run` only while that file exists (`pending`
+  is its ExecCondition). It runs the whole check, writes the record and
+  removes the file; its ExecStartPost generates the graph and restarts the
+  seat user's PipeWire onto it. The supervisor requires both units, so it
+  grants only after the switch test passed.
+
+A board without V/I sense has no switch test (its check is static) and is
+never deferred. Runs take an exclusive lock (selfcheck.lock in the state
+directory), so the two units never overlap.
 
 1. **Derive** the wiring (wiring.py) from the device tree and the tuning's
    graph (`aurora-speaker-tuning dump --json` on the same source the
@@ -67,6 +89,10 @@ import wiring  # noqa: E402
 VERSION = 2
 STATE = "/var/lib/speakerguardd"
 MARKER = "/run/speakerguardd-selfcheck/active"
+# The switch test is pending: written by `run --defer` (before login),
+# removed by every other completed run. In provisioning's runtime directory,
+# which outlives each self-check unit (theirs is removed when they stop).
+DEFERRED = "/run/speakerguardd-graph/selfcheck.deferred"
 CAPTURE_S = 0.4
 # After a sense switch turns, before the next capture opens.
 SETTLE_S = 0.05
@@ -707,8 +733,32 @@ def report_matches(path, bind):
     return r.get("result") == "pass" and all(str(r.get(k)) == bind.get(k) for k in ("board", "kernel", "params_sha256", "wiring"))
 
 
+def set_deferred(path, text=None):
+    """Write (text) or remove (None) the switch-test-pending file."""
+    if text is None:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    write_atomic(path, text)
+
+
 def cmd_run(args):
+    """`run`, under an exclusive lock on the state directory: the
+    before-login and after-login units never run the check at the same time,
+    and never interleave their records."""
     os.makedirs(args.state, exist_ok=True)
+    fd = os.open(os.path.join(args.state, "selfcheck.lock"), os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return run_locked(args)
+    finally:
+        os.close(fd)
+
+
+def run_locked(args):
     bind_path = os.path.join(args.state, "selfcheck.bind")
     report_path = os.path.join(args.state, "selfcheck.json")
     kernel = os.uname().release
@@ -743,13 +793,26 @@ def cmd_run(args):
             # record (lost or removed) is checked again, not reused
             and report_matches(report_path, old)
         ):
+            set_deferred(args.deferred)
             log(f"a passing self-check is bound to {hw['board']}, {kernel}, params {rec['params_sha256'][:12]}, wiring {w['hash']}: nothing to do")
             return 0
         idx, card = find_card(hw)
         rec["card"] = card
         if card != desc["card"]:
             errs.append(f"the speaker card is {card}; macaudio names it {desc['card']} from the device tree's model")
-        if w["method"] == "derived-static":
+        if args.defer and w["method"] == "derived":
+            if not errs:
+                # No record is written: the previous one stays (stale for
+                # this kernel or blob, so neither the supervisor nor the gate
+                # accepts it), and no graph is generated (provision activate).
+                set_deferred(args.deferred, f"board={hw['board']}\nkernel={kernel}\nparams_sha256={rec['params_sha256']}\n"
+                                            f"wiring={w['hash']}\n")
+                log(f"no passing self-check for {hw['board']}, {kernel}, params {rec['params_sha256'][:12]}: the silent switch "
+                    "test runs after login (speakerguardd-switchtest); no speaker graph and no grant until it passes")
+                return 0
+            # The cheap checks failed already: the record fails now, before
+            # login, without the switch test.
+        elif w["method"] == "derived-static":
             errs += static(idx, w, report)
         elif w["method"] == "derived":
             try:
@@ -765,6 +828,10 @@ def cmd_run(args):
         errs.append(f"internal error: {type(e).__name__}: {e}")
     rec["reasons"] = errs
     rec["result"] = "fail" if errs else "pass"
+    try:
+        set_deferred(args.deferred)
+    except OSError as e:
+        log(f"removing {args.deferred}: {e}")
     try:
         write_atomic(report_path, json.dumps(report, indent=1, default=str) + "\n")
         write_atomic(bind_path, bind_lines(rec))
@@ -853,6 +920,16 @@ def format_errors(desc, fmt):
     return []
 
 
+def cmd_pending(args):
+    """speakerguardd-switchtest.service's ExecCondition: 0 (run) when the
+    run before login deferred the switch test in this boot, 1 (skip)
+    otherwise."""
+    if not os.path.exists(args.deferred):
+        return 1
+    log("the switch test was deferred until after login: running it now")
+    return 0
+
+
 def cmd_check(args):
     b = read_bind(os.path.join(args.state, "selfcheck.bind"))
     want = {"board": wiring.read_dt()["board"], "kernel": os.uname().release, "params_sha256": sha256(args.params)}
@@ -899,11 +976,14 @@ def cmd_generate(args):
 
 def main():
     ap = argparse.ArgumentParser(prog="speakerguardd-selfcheck")
-    ap.add_argument("cmd", choices=["run", "check", "generate"])
+    ap.add_argument("cmd", choices=["run", "pending", "check", "generate"])
     ap.add_argument("--params")
     ap.add_argument("--state", default=STATE)
     ap.add_argument("--tuning-cli", default="aurora-speaker-tuning")
     ap.add_argument("--force", action="store_true")
+    ap.add_argument("--defer", action="store_true",
+                    help="run: before login, leave a needed switch test to speakerguardd-switchtest.service")
+    ap.add_argument("--deferred", default=DEFERRED, help="the switch-test-pending file")
     ap.add_argument("--pipewire-dir")
     ap.add_argument("--wireplumber-dir")
     ap.add_argument("tuning", nargs="*", help="after --: the tuning source, as aurora-speaker-tuning takes it")
@@ -912,7 +992,7 @@ def main():
         ap.error("--params is required")
     if args.cmd == "generate" and not (args.pipewire_dir and args.wireplumber_dir):
         ap.error("--pipewire-dir and --wireplumber-dir are required")
-    return {"run": cmd_run, "check": cmd_check, "generate": cmd_generate}[args.cmd](args)
+    return {"run": cmd_run, "pending": cmd_pending, "check": cmd_check, "generate": cmd_generate}[args.cmd](args)
 
 
 if __name__ == "__main__":
