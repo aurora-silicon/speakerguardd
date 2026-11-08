@@ -68,7 +68,11 @@ elif cmd == "dump":
 '''
 
 # Parity belongs to the build, never a per-board list.
-GATE = {"units_at_parity": ["spp3"], "denied_boards": [], "board_overrides": {}}
+# The synthetic boards are on the fixture's hardware-qualified list so the
+# proofs themselves stay under test; Gate.test_only_hardware_qualified_boards
+# covers the list.
+GATE = {"units_at_parity": ["spp3"], "denied_boards": [], "board_overrides": {},
+        "hardware_qualified_boards": ["j316s", "j413", "j616s", "j700", "j999", "k114", "k116"]}
 
 
 def write_dt(root, board):
@@ -788,7 +792,26 @@ class LV2Shadow(unittest.TestCase):
     def test_system_dirs_are_the_packaged_ones(self):
         self.assertEqual(self.scan(environ={"LV2_PATH": "/usr/lib64/lv2:/usr/lib/lv2"}), [])
 
+def shipped_gate():
+    with open(os.path.join(HERE, "gate.json")) as f:
+        return json.load(f)
+
+
 class Gate(Base):
+    def setUp(self):
+        super().setUp()
+        # Provisioning and the self-check read the policy through gen.load_gate():
+        # give them the fixture policy, as decide() gives the gate.
+        from unittest import mock
+        env = mock.patch.dict(os.environ, {"SGV2_GATE": os.path.join(self.t, "provision-gate.json")})
+        env.start()
+        self.addCleanup(env.stop)
+        self.provision_gate(GATE)
+
+    def provision_gate(self, data):
+        with open(os.environ["SGV2_GATE"], "w") as f:
+            json.dump(data, f)
+
     def decide(self, iface="v2", gate_data=None, cmd="v2"):
         g = os.path.join(self.t, "gate.json")
         with open(g, "w") as f:
@@ -840,6 +863,10 @@ class Gate(Base):
         sc = load("sc", "speakerguardd-selfcheck")
         self.board("j999")
         self.ctl({"board": "j999", "unit": "lsm2"})
+        # Provision and check under the shipped policy with j999 listed.
+        listed = shipped_gate()
+        listed["hardware_qualified_boards"] = listed["hardware_qualified_boards"] + ["j999"]
+        self.provision_gate(listed)
         self.assertEqual(self.run_(), 0)
         fx = gen.fixture("j700")
         hw = fx["hw"]
@@ -859,7 +886,11 @@ class Gate(Base):
             self.assertEqual(pcm.call_count, 1)
             self.assertEqual(sc.cmd_run(args), 0)  # exact binding: no new probe
             self.assertEqual(pcm.call_count, 1)
-            self.assertEqual(self.decide(gate_data=gen.load_gate()), (True, False))
+            # Every silent proof passes, but j999 has not passed hardware
+            # qualification: the shipped gate never gives it v2.
+            self.assertEqual(self.decide(gate_data=shipped_gate()), (False, False))
+            self.assertEqual(self.decide(iface="legacy", gate_data=shipped_gate()), (False, True))
+            self.assertEqual(self.decide(gate_data=listed), (True, False))
             self.assertEqual(sc.cmd_generate(args), 0)
             with open(os.path.join(args.pipewire_dir, "sgv2-j999.conf")) as f:
                 self.assertIn("sgv2#voicing", f.read())
@@ -951,15 +982,43 @@ class Gate(Base):
         policy["board_overrides"] = {"k116": "allow"}
         self.assertEqual(self.decide(gate_data=policy, cmd="prepare"), (False, False))
 
-    def test_four_reference_boards_qualify_without_a_board_list(self):
-        import gen
+    def test_only_hardware_qualified_boards_get_v2(self):
+        # j316s with every silent proof current.
+        self.assertEqual(self.run_(), 0)
+        self.checked()
+        self.assertEqual(self.decide(), (True, False))
+        off = dict(GATE, hardware_qualified_boards=["j413", "j616s", "j700"])
+        self.assertEqual(self.decide(gate_data=off), (False, False))
+        self.assertEqual(self.decide(iface="legacy", gate_data=off), (False, True))
+        # An allow override never adds a board to the hardware list.
+        self.assertEqual(self.decide(gate_data=dict(off, board_overrides={"j316s": "allow"})), (False, False))
+        # A missing or malformed list qualifies no board (fails closed).
+        missing = {k: v for k, v in GATE.items() if k != "hardware_qualified_boards"}
+        for bad in (missing, dict(GATE, hardware_qualified_boards="j316s"), dict(GATE, hardware_qualified_boards=[316])):
+            with self.subTest(gate=bad.get("hardware_qualified_boards")):
+                self.assertEqual(self.decide(gate_data=bad), (False, False))
+                self.assertEqual(self.decide(iface="legacy", gate_data=bad), (False, True))
+
+    def test_unqualified_m2_pro_is_never_provisioned_or_admitted(self):
+        # j414s (2026-11-08): tuning, parity and the silent check all pass, but
+        # v2 buzzed on it. The shipped list keeps v2 off it at every step.
+        self.provision_gate(shipped_gate())
+        self.board("j414s")
+        self.ctl({"board": "j414s", "unit": "spp3"})
+        self.assertNotEqual(self.run_(), 0)
+        self.assertEqual(self.decide(gate_data=shipped_gate(), cmd="prepare"), (False, False))
+        self.assertEqual(self.decide(gate_data=shipped_gate()), (False, False))
+        self.assertEqual(self.decide(iface="legacy", gate_data=shipped_gate()), (False, True))
+
+    def test_four_reference_boards_qualify_from_the_shipped_gate(self):
+        self.provision_gate(shipped_gate())
         for board, kind in (("j316s", "spp3"), ("j413", "spp3"), ("j616s", "spp3"), ("j700", "lsm2")):
             with self.subTest(board=board):
                 self.board(board)
                 self.ctl({"board": board, "unit": kind})
                 self.assertEqual(self.run_(), 0)
                 self.checked()
-                self.assertEqual(self.decide(gate_data=gen.load_gate()), (True, False))
+                self.assertEqual(self.decide(gate_data=shipped_gate()), (True, False))
 
     def test_the_bundle_provisioning_compiles_names_the_units(self):
         with open(os.path.join(self.t, "provision.conf"), "w") as f:
@@ -976,6 +1035,7 @@ class Gate(Base):
         self.assertNotIn("require_qualified_board", g)
         self.assertEqual(g["denied_boards"], [])
         self.assertEqual(g["board_overrides"], {})
+        self.assertEqual(g["hardware_qualified_boards"], ["j316s", "j413", "j616s", "j700"])
         self.assertEqual(g["voicing_pre"], {"j316s": True, "j413": True, "j616s": True, "j700": True})
         self.assertFalse(os.path.exists(os.path.join(HERE, "machines.json")))
 

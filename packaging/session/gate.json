@@ -16,6 +16,8 @@
   },
   "_voicing_pre_lowpass_doc": "INTERIM never-louder band limit, not a macOS law (AUD-CUT2 2026-11-07, Ryan's parity rule: never-louder is fine as interim). {hz, order}: an even-order Butterworth low-pass built from PipeWire bq_lowpass sections in FRONT of the voicing plugin. j700 only: v2's AID44 ControlFreak lacks the AU's reconstruction low-pass, so above ~17 kHz the box is up to +23 dB (+30 dB at 0 dBFS) louder than macOS and its saturation aliases a loud high-frequency input into 9-16.5 kHz; the lane trim cannot hold either. 17.4 kHz order 8 (with the j700 trim): AID44 box rig (installed AU, 362 tones/pink/steps incl. 16-23.75 kHz probes) 0 louder cases, worst -0.58 dB; full AID44 voicing VLS 30 Hz-19.5 kHz 0 louder bands, worst -0.03 dB; cost at 16 kHz -0.1 dB. Goes when the ControlFreak law is exact (Daybreak t-5511). 2026-11-08: no board carries it; the AID44 ControlFreak saturation, reconstruction and drive laws are exact on the box rig (steady and 20 kHz), so the j700 trim alone (-0.35 dB from the AID44 VLS, worst +0.311) holds.",
   "voicing_pre_lowpass": {},
+  "_hardware_qualified_doc": "Boards v2 may govern (2026-11-09, after an unqualified j414s buzzed and crackled under v2): each passed our hardware qualification on a lab Mac (audible and sensed checks against its own macOS, rig and scanner parity). Every other board keeps the older daemons (speakersafetyd, speakerguardd 0.1), whatever its tuning and silent self-check say. A board is added only with its hardware qualification record. Missing or malformed: no board qualifies. An allow override does not add a board.",
+  "hardware_qualified_boards": ["j316s", "j413", "j616s", "j700"],
   "units_at_parity": ["spp3", "lsm2", "atsp"],
   "denied_boards": [],
   "board_overrides": {}

@@ -76,6 +76,17 @@ def qualification_policy(board, units, gate=None):
         raise wiring.Refused(f"{board} is denied by board policy")
     if override not in (None, "allow"):
         raise wiring.Refused(f"invalid board override for {board}")
+    # Hardware qualification: v2 governs only a board that passed our
+    # hardware qualification on a real Mac (audible and sensed, against its
+    # own macOS). The silent self-check proves the wiring it can see, not how
+    # the speakers sound: on an unqualified M2 Pro (j414s, 2026-11-08) v2 passed
+    # every silent proof and still buzzed and crackled. A missing or malformed
+    # list qualifies no board. An allow override does not add a board here.
+    hw = gate.get("hardware_qualified_boards")
+    if not isinstance(hw, list) or not all(isinstance(b, str) for b in hw):
+        raise wiring.Refused("no hardware-qualified board list: v2 governs no board")
+    if board not in hw:
+        raise wiring.Refused(f"{board} has not passed hardware qualification")
     parity = gate.get("units_at_parity", [])
     if not isinstance(parity, list) or any(u not in wiring.PROTECTION_UNITS for u in parity):
         raise wiring.Refused("malformed build parity policy")
