@@ -104,6 +104,9 @@ TRANSPORTS = {
     # S24_LE playback and S16_LE sense, not the T6041 firmware ring above.
     "apple,t8142-aop-audio": {"transport": "aop-dma", "formats": ["S24_LE"], "sense_batch": False, "speaker_headroom": 0},
 }
+# Newer device trees omit the generic MCA fallback. Both compatibles bind
+# mca.c; share the entry so back-ends using either name are the same driver.
+TRANSPORTS["apple,t8103-mca"] = TRANSPORTS["apple,mca"]
 # The self-check's probe order on the speaker PCM.
 FORMAT_ORDER = ["S24_LE", "S32_LE", "S16_LE"]
 # ALSA format -> PipeWire audio.format (the 24-bit samples sit in 32-bit words).
