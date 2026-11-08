@@ -445,6 +445,40 @@ class Graph(Base):
         self.assertFalse(os.path.lexists(pw) or os.path.lexists(wp))
         self.assertEqual(prov.cmd_is_seat(self.args("is-seat"), self.p), 1)
 
+    def _cards(self, idx, card, name, pcms):
+        a = self.p.proc_asound
+        os.makedirs(a, exist_ok=True)
+        with open(os.path.join(a, "cards"), "a") as f:
+            f.write(f"{idx:2d} [{card:<15s}]: macaudio - {name}\n                      {name}\n")
+        for d in pcms:
+            os.makedirs(os.path.join(a, f"card{idx}", d), exist_ok=True)
+
+    def test_card_layout(self):
+        self._cards(0, "AppleJ616HPAI", "MacBook Pro J616 HPAI", ["pcm0c"])
+        self._cards(1, "AppleJ616", "MacBook Pro J616", ["pcm1p", "pcm2c"])
+        self._cards(2, "AppleJ413", "MacBook Air J413", ["pcm0p", "pcm0c", "pcm1p", "pcm2c"])
+        a = self.p.proc_asound
+        self.assertEqual(prov.card_layout(1, a), ("MacBook Pro J616", True))
+        self.assertEqual(prov.card_layout(2, a), ("MacBook Air J413", False))
+        self.assertEqual(prov.card_layout(7, a), (None, False))
+
+    def test_raw_rules_name_the_card_and_mark_ucm(self):
+        """The speaker card's device loses its pro-audio profile; a card of
+        speakers and sense alone is hidden from clients too; the UCM marker
+        is written beside the rules."""
+        import gen
+        self._cards(0, "AppleJ316", "MacBook Pro J316", ["pcm0p", "pcm0c", "pcm1p", "pcm2c"])
+        self.provisioned()
+        text = open(os.path.join(self.p.raw, gen.RAW_RULES)).read()
+        self.assertIn('api.alsa.card.name = "MacBook Pro J316"', text)
+        self.assertIn("api.acp.disable-pro-audio = true", text)
+        self.assertNotIn("asahi.hide-device", text)
+        self.assertEqual(open(os.path.join(self.p.graph, gen.UCM_MARKER)).read(), "AppleJ316\n")
+        only = gen.wireplumber_raw_conf("AppleJ616", "MacBook Pro J616", True)
+        self.assertIn("asahi.hide-device = true", only)
+        self.assertIn("node.disabled = true", only)
+        self.assertNotIn("api.alsa.card.name", gen.wireplumber_raw_conf("AppleJ616"))
+
     def test_raw_rules_for_every_user_from_the_start(self):
         """Provisioning writes the raw-PCM rules; every user's session links
         them, before the self-check has passed and when not the seat user."""
