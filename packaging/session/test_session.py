@@ -339,6 +339,21 @@ class Generated(unittest.TestCase):
                 block = conf.split(f'node.name          = "{gen.PROTECT_INPUT}"', 1)[1].split("}", 1)[0]
                 self.assertIn('media.class        = "Audio/Sink/Internal"', block)
 
+    def test_the_amps_and_sense_are_one_internal_link_group(self):
+        # wpctl and other session tools list a node with a link group as part
+        # of a graph, not as a device sink or source; the group is the same
+        # set as node.group, so the drivers do not change.
+        for m in gen.machines():
+            c, w = gen.machine(m)
+            n = gen.names(m)
+            for pre in (False, True):
+                conf = gen.pipewire_conf(m, c, w, voicing_pre=pre)
+                for node in ("speaker", "sense") if c["sense"] else ("speaker",):
+                    block = conf.split(f'node.name              = "{n[node]}"', 1)[1].split("}", 1)[0]
+                    self.assertIn(f'node.link-group        = "{n["group"]}"', block)
+                    self.assertIn(f'node.group             = "{n["group"]}"', block)
+                    self.assertIn('/Internal"', block)
+
     def test_generated_files_are_current(self):
         import subprocess
         import sys
