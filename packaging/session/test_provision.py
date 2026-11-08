@@ -1004,6 +1004,14 @@ class SpeakerCard(unittest.TestCase):
             self.card(sysfs, 2, "AppleJ616", b"apple,j616-macaudio\0apple,macaudio\0", b"Speakers")
             self.assertEqual(gate.speaker_card(sysfs), "AppleJ616")
 
+    def test_the_provisioner_skips_the_jack_card(self):
+        with tempfile.TemporaryDirectory() as sysfs:
+            self.card(sysfs, 1, "AppleJack", JACK, b"Headphone Jack")
+            self.card(sysfs, 2, "AppleJ616", b"apple,j616-macaudio\0apple,macaudio\0", b"Speakers")
+            self.assertEqual(prov.find_card("AppleJ616", 0, sysfs), (2, "AppleJ616"))
+            with self.assertRaises(prov.Failed):
+                prov.find_card("AppleJ614", 0, sysfs)
+
     def test_no_speaker_link_is_no_speaker_card(self):
         with tempfile.TemporaryDirectory() as sysfs:
             self.card(sysfs, 1, "AppleJack", JACK, b"Headphone Jack")

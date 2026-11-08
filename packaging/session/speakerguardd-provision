@@ -248,19 +248,23 @@ def machine_of(dt):
 
 
 def find_card(want, wait, sysfs="/sys/class/sound"):
-    """(index, id) of the speaker card: the macaudio card, by its device
-    tree node. Its id must be `want`, the one macaudio derives from the
-    device tree's model."""
+    """(index, id) of the speaker card: the macaudio card with the speaker
+    link, by its device tree node (the jack-only card of a J614s/J616s/J713
+    may come first). Its id must be `want`, the one macaudio derives from
+    the device tree's model."""
     deadline = time.monotonic() + wait
     while True:
         for d in sorted(os.listdir(sysfs)) if os.path.isdir(sysfs) else []:
             if not re.fullmatch(r"card\d+", d):
                 continue
+            node = f"{sysfs}/{d}/device/of_node"
             try:
-                with open(f"{sysfs}/{d}/device/of_node/compatible", "rb") as f:
+                with open(f"{node}/compatible", "rb") as f:
                     if b"apple,macaudio" not in f.read().split(b"\0"):
                         continue
-                with open(f"/proc/asound/{d}/id") as f:
+                if not wiring.has_speaker_link(node):
+                    continue
+                with open(f"{sysfs}/{d}/id") as f:
                     cid = f.read().strip()
             except OSError:
                 continue

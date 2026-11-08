@@ -98,7 +98,7 @@ def speaker_card(sysfs="/sys/class/sound"):
         try:
             with open(f"{node}/compatible", "rb") as f:
                 compat = f.read().split(b"\0")
-            if b"apple,macaudio" not in compat or not _has_speaker_link(node):
+            if b"apple,macaudio" not in compat or not wiring.has_speaker_link(node):
                 continue
             with open(f"{sysfs}/{d}/id") as f:
                 return f.read().strip()
@@ -106,17 +106,6 @@ def speaker_card(sysfs="/sys/class/sound"):
             continue
     return None
 
-
-def _has_speaker_link(node):
-    """Whether a macaudio node has the link macaudio drives speakers on."""
-    for c in os.listdir(node):
-        try:
-            with open(f"{node}/{c}/link-name", "rb") as f:
-                if f.read().rstrip(b"\0") in (b"Speaker", b"Speakers"):
-                    return True
-        except OSError:
-            continue
-    return False
 
 
 def kernel_interface(wait):
