@@ -87,6 +87,9 @@ pub const FLAG_DYNAMICS: u32 = 1 << 1;
 /// `flags` bit: compressor boxes at their graph places follow the channels
 /// (see the module documentation); they replace [`FLAG_DYNAMICS`].
 pub const FLAG_BOXES: u32 = 1 << 2;
+/// `flags` bit: compressor boxes use the source-OS-aware mstk word layout.
+/// Without it, [`FLAG_BOXES`] carries the legacy 25G83-only layout.
+pub const FLAG_BOXES_SOURCE_OS: u32 = 1 << 5;
 /// `flags` bit: level-dependent ToneMeister filters follow the compressor
 /// boxes in the blob and run at their recorded places in the lanes.
 pub const FLAG_DYNAMIC_FILTERS: u32 = 1 << 3;
@@ -444,7 +447,7 @@ impl Params {
                 }
             }
         }
-        let mut flags = self.flags & !(FLAG_DYNAMICS | FLAG_BOXES | FLAG_DYNAMIC_FILTERS);
+        let mut flags = self.flags & !(FLAG_DYNAMICS | FLAG_BOXES | FLAG_BOXES_SOURCE_OS | FLAG_DYNAMIC_FILTERS);
         if let Some(d) = &self.dynamics {
             flags |= FLAG_DYNAMICS;
             for v in d.words() {
@@ -452,7 +455,7 @@ impl Params {
             }
         }
         if self.box_count > 0 {
-            flags |= FLAG_BOXES;
+            flags |= FLAG_BOXES | FLAG_BOXES_SOURCE_OS;
             body.extend_from_slice(&(self.box_count as u32).to_le_bytes());
             body.extend_from_slice(&0u32.to_le_bytes());
             for b in self.boxes() {
@@ -595,12 +598,14 @@ impl Params {
                         return Err(BlobError::Length);
                     }
                 }
+                let words =
+                    if flags & FLAG_BOXES_SOURCE_OS != 0 { mstk::Params::WORDS } else { mstk::Params::LEGACY_WORDS };
                 let mut w = [0.0f64; mstk::Params::WORDS];
-                for (i, v) in w.iter_mut().enumerate() {
+                for (i, v) in w.iter_mut().take(words).enumerate() {
                     *v = f64_at(at + 8 * i)?;
                 }
-                at += 8 * mstk::Params::WORDS;
-                b.params = mstk::Params::from_words(&w).ok_or(BlobError::Length)?;
+                at += 8 * words;
+                b.params = mstk::Params::from_words(&w[..words]).ok_or(BlobError::Length)?;
                 if !b.params.valid(fs) {
                     return Err(BlobError::Unstable);
                 }
@@ -687,7 +692,15 @@ impl Params {
                 return Err(BlobError::Unstable);
             }
         }
-        if flags & !(FLAG_FROM_TUNING | FLAG_DYNAMICS | FLAG_BOXES | FLAG_DYNAMIC_FILTERS | FLAG_EXTERNAL_VOICING) != 0
+        if flags
+            & !(FLAG_FROM_TUNING
+                | FLAG_DYNAMICS
+                | FLAG_BOXES
+                | FLAG_DYNAMIC_FILTERS
+                | FLAG_EXTERNAL_VOICING
+                | FLAG_BOXES_SOURCE_OS)
+            != 0
+            || flags & FLAG_BOXES_SOURCE_OS != 0 && flags & FLAG_BOXES == 0
         {
             return Err(BlobError::Length);
         }

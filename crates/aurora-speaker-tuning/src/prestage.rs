@@ -1366,7 +1366,7 @@ pub fn derive(t: &Tuning, fs: f64, channels: usize, diags: &mut Diagnostics) -> 
     if t.protection.kind != crate::tuning::UnitKind::Atsp {
         interim_compressor_rules(&t.chain, &t.protection.lanes)?;
     }
-    derive_lanes(&t.chain, &t.protection.lanes, fs, channels, diags)
+    derive_lanes_for(&t.chain, &t.protection.lanes, fs, channels, t.macos_build.as_deref(), diags)
 }
 
 /// Until the compressor box's gain law is the unit's own, the speakers whose
@@ -1447,6 +1447,18 @@ pub fn derive_lanes(
     channels: usize,
     diags: &mut Diagnostics,
 ) -> Result<Params> {
+    derive_lanes_for(chain, lanes, fs, channels, None, diags)
+}
+
+/// [`derive_lanes`] for a tuning extracted from `source_build`.
+pub fn derive_lanes_for(
+    chain: &[Stage],
+    lanes: &[crate::dspg::analysis::Lane],
+    fs: f64,
+    channels: usize,
+    source_build: Option<&str>,
+    diags: &mut Diagnostics,
+) -> Result<Params> {
     if channels == 0 || channels > MAX_CHANNELS {
         return Err(bad(format!("{channels} unit channels")));
     }
@@ -1518,7 +1530,7 @@ pub fn derive_lanes(
                 }
                 Some(MSTK) => {
                     if !compiled.iter().any(|(n, _)| *n == stage.name) {
-                        let p = crate::voicing::mstk::compile(stage, fs, diags)?;
+                        let p = crate::voicing::mstk::compile_for(stage, fs, source_build, diags)?;
                         compiled.push((stage.name.clone(), p));
                     }
                     let carried = compiled.iter().any(|(n, p)| *n == stage.name && p.is_some());
