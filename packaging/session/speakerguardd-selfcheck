@@ -22,10 +22,20 @@ at its floor, in two units:
   the raw speaker or sense PCMs, for every user).
 - speakerguardd-switchtest.service, after systemd-user-sessions.service and
   before the supervisor, runs `run` only while that file exists (`pending`
-  is its ExecCondition). It runs the whole check, writes the record and
-  removes the file; its ExecStartPost generates the graph and restarts the
-  seat user's PipeWire onto it. The supervisor requires both units, so it
-  grants only after the switch test passed.
+  is its ExecCondition). It runs the whole check and writes the record; its
+  ExecStartPost generates the graph, and its ExecStopPost (`pending
+  --clear`) removes the file, pass or fail. The supervisor requires both
+  units, so it grants only after the switch test passed.
+
+While the file exists, no session's PipeWire or WirePlumber starts: their
+speakerguardd-graph.service (speakerguardd-provision graph-user, ordered
+before both) waits for it to go. WirePlumber's ALSA device probe opens and
+prepares every PCM of the speaker card, the raw speaker and sense PCMs
+included, whatever its node rules say (the UCM Speaker device and the
+pro-audio profile); during the switch test's streams that latched a TDM
+clock fault on an amp, and it would take the PCMs the test needs. So the
+login is not held, and the session's audio starts once the test is done,
+with the graph when it passed.
 
 A board without V/I sense has no switch test (its check is static) and is
 never deferred. Runs take an exclusive lock (selfcheck.lock in the state
@@ -90,8 +100,10 @@ VERSION = 2
 STATE = "/var/lib/speakerguardd"
 MARKER = "/run/speakerguardd-selfcheck/active"
 # The switch test is pending: written by `run --defer` (before login),
-# removed by every other completed run. In provisioning's runtime directory,
-# which outlives each self-check unit (theirs is removed when they stop).
+# removed by `pending --clear` when speakerguardd-switchtest.service ends,
+# and by a `run --defer` that does not defer. In provisioning's runtime
+# directory, which outlives each self-check unit (theirs is removed when
+# they stop), where every session's graph-user reads it.
 DEFERRED = "/run/speakerguardd-graph/selfcheck.deferred"
 CAPTURE_S = 0.4
 # After a sense switch turns, before the next capture opens.
@@ -427,11 +439,14 @@ class Streams:
             raise wiring.Refused(f"the self-check's own lease lapsed during the switch test ({self.lease.err or 'ETIMEDOUT'})")
 
     @staticmethod
-    def _stop_process(proc):
+    def _stop_process(proc, kill=False):
         if proc is None:
             return
         if proc.poll() is None:
-            proc.terminate()
+            if kill:
+                proc.kill()
+            else:
+                proc.terminate()
             try:
                 proc.wait(2)
             except subprocess.TimeoutExpired:
@@ -521,7 +536,12 @@ class Streams:
         except Exception as e:
             errors.append(str(e))
         try:
-            self._stop_process(self.rec)
+            # Its data is no longer needed, and once the zero-sample stream
+            # has stopped, the sense capture can stall (the MCA Macs: no
+            # more frames), where arecord does not act on SIGTERM: it was
+            # killed after the full 2 s wait on every such run. End it at
+            # once; the kernel closes the substream either way.
+            self._stop_process(self.rec, kill=True)
             if self.reader is not None:
                 self.reader.join(2)
                 if self.reader.is_alive():
@@ -828,10 +848,14 @@ def run_locked(args):
         errs.append(f"internal error: {type(e).__name__}: {e}")
     rec["reasons"] = errs
     rec["result"] = "fail" if errs else "pass"
-    try:
-        set_deferred(args.deferred)
-    except OSError as e:
-        log(f"removing {args.deferred}: {e}")
+    if args.defer:
+        # Before login and not deferred (a failure, or a board without
+        # sense): nothing is pending. After login the file stays until the
+        # unit's ExecStopPost, once the graph is generated.
+        try:
+            set_deferred(args.deferred)
+        except OSError as e:
+            log(f"removing {args.deferred}: {e}")
     try:
         write_atomic(report_path, json.dumps(report, indent=1, default=str) + "\n")
         write_atomic(bind_path, bind_lines(rec))
@@ -923,7 +947,12 @@ def format_errors(desc, fmt):
 def cmd_pending(args):
     """speakerguardd-switchtest.service's ExecCondition: 0 (run) when the
     run before login deferred the switch test in this boot, 1 (skip)
-    otherwise."""
+    otherwise. With --clear (its ExecStopPost, after the graph is generated
+    or the check failed): the test is no longer pending, and the sessions
+    waiting for it start."""
+    if args.clear:
+        set_deferred(args.deferred)
+        return 0
     if not os.path.exists(args.deferred):
         return 1
     log("the switch test was deferred until after login: running it now")
@@ -984,6 +1013,7 @@ def main():
     ap.add_argument("--defer", action="store_true",
                     help="run: before login, leave a needed switch test to speakerguardd-switchtest.service")
     ap.add_argument("--deferred", default=DEFERRED, help="the switch-test-pending file")
+    ap.add_argument("--clear", action="store_true", help="pending: the switch test is done (pass or fail)")
     ap.add_argument("--pipewire-dir")
     ap.add_argument("--wireplumber-dir")
     ap.add_argument("tuning", nargs="*", help="after --: the tuning source, as aurora-speaker-tuning takes it")

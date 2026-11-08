@@ -982,6 +982,35 @@ class BoundRecord(unittest.TestCase):
             self.assertFalse(sgsc.report_matches(path, bind))
 
 
+class StreamStop(unittest.TestCase):
+    """The zero-sample playback ends on SIGTERM; the sense capture, whose
+    data is no longer needed and which can stall once the playback stopped,
+    is killed at once (speakerguardd#102: 2 s per check otherwise)."""
+
+    def test_capture_killed_playback_terminated(self):
+        class Proc:
+            def __init__(self, name):
+                self.args, self.sig, self.stdout, self.stderr = [name], [], None, None
+
+            def poll(self):
+                return 0 if self.sig else None
+
+            def terminate(self):
+                self.sig.append("TERM")
+
+            def kill(self):
+                self.sig.append("KILL")
+
+            def wait(self, timeout=None):
+                return 0
+        st = sgsc.Streams(None, "AppleJ413", 1, 2, 4, 48000)
+        st.play, st.rec = Proc("aplay"), Proc("arecord")
+        play, rec = st.play, st.rec
+        st.stop()
+        self.assertEqual(play.sig, ["TERM"])
+        self.assertEqual(rec.sig, ["KILL"])
+
+
 class Deferral(unittest.TestCase):
     """speakerguardd#102: before login only the binding and the cheap checks
     run (`run --defer`); a needed switch test is left to the after-login
@@ -1045,6 +1074,9 @@ class Deferral(unittest.TestCase):
         self.assertEqual(self.run_sc("run"), 0)
         self.assertEqual(self.calls, ["active"])
         self.assertEqual(self.bind()["result"], "pass")
+        # pending until the unit's ExecStopPost, after the graph is generated
+        self.assertTrue(os.path.exists(self.deferred))
+        self.assertEqual(self.run_sc("pending", "--clear"), 0)
         self.assertFalse(os.path.exists(self.deferred))
         self.assertEqual(self.run_sc("pending"), 1)
         # the next boot, same kernel: the bound pass, nothing deferred
@@ -1063,6 +1095,7 @@ class Deferral(unittest.TestCase):
         self.hw_errs = ["AMP V SENSE off quietened sense channel(s) []"]
         self.assertEqual(self.run_sc("run"), 1)
         self.assertEqual(self.bind()["result"], "fail")
+        self.assertEqual(self.run_sc("pending", "--clear"), 0)
         self.assertFalse(os.path.exists(self.deferred))
         # the next run before login does not reuse the failure: deferred again
         self.assertEqual(self.run_sc("run", "--defer"), 0)

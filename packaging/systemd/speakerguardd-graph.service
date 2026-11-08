@@ -4,12 +4,19 @@ Documentation=https://github.com/aurora-silicon/speakerguardd/blob/v2/docs/NEW-P
 # Before PipeWire and WirePlumber read their configuration: for the seat
 # user it links the generated graph (/run/speakerguardd-graph) into the
 # user's pipewire.conf.d and wireplumber.conf.d; for every other user it
-# removes those links. It never fails, so it never holds PipeWire back.
+# removes those links. It never fails, so it never keeps PipeWire from
+# starting. On the first boot after a kernel or tuning change it holds
+# PipeWire and WirePlumber while the speaker self-check's switch test runs
+# (speakerguardd-switchtest.service, a few seconds after login): WirePlumber's
+# device probe opens the raw speaker and sense PCMs.
 Before=pipewire.service wireplumber.service
 
 [Service]
 Type=oneshot
 ExecStart=/usr/libexec/speakerguardd/speakerguardd-provision graph-user
+# Above graph-user's own bound for a pending switch test (150 s, beyond the
+# test unit's 120 s timeout, after which its ExecStopPost clears it).
+TimeoutStartSec=180
 
 [Install]
 WantedBy=pipewire.service
