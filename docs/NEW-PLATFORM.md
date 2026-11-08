@@ -115,9 +115,15 @@ self-check and the supervisor, which both require it.
    generated; overrides go in `provision.conf`.
 5. **Graph.** After the self-check passes, `speakerguardd-provision activate`
    generates the machine's PipeWire and WirePlumber files from the record
-   into `/run/speakerguardd-graph`. The self-check is ordered before
+   into `/run/speakerguardd-graph`. On a boot without a kernel or tuning
+   change the self-check only reuses its bound record, before
    `systemd-user-sessions.service`, so the graph is in place before any
-   login, the display manager's automatic login included. The user unit
+   login, the display manager's automatic login included. On the first boot
+   after a change, the silent switch test runs after login (section 6) and
+   the graph follows when it passes. Every session, before and after,
+   starts with the raw-PCM rules provisioning writes on every boot
+   (`/run/speakerguardd-graph/raw/59-sgv2-raw.conf`, linked for every user):
+   WirePlumber creates no node on the raw speaker or sense PCMs. The user unit
    `speakerguardd-graph.service`, ordered before PipeWire, links them into
    the seat user's
    `pipewire.conf.d` and `wireplumber.conf.d`, and removes them for every
@@ -176,8 +182,23 @@ be recollected on the Mac's macOS. Every distribution ships the same policy.
 
 ## 6. The self-check (`speakerguardd-selfcheck`)
 
-This is automatic. It runs as `speakerguardd-selfcheck.service` before the
-supervisor, while the kernel holds the speakers at the floor.
+This is automatic. It runs before the supervisor, while the kernel holds
+the speakers at the floor, in two units:
+
+- `speakerguardd-selfcheck.service`, before any login, reuses a passing
+  record bound to this board, kernel, blob and wiring (every boot without
+  a kernel or tuning change), and runs the cheap checks (steps 1 and 2, the
+  card). It does not hold the login for the switch test (step 3).
+- `speakerguardd-switchtest.service`, after `systemd-user-sessions.service`,
+  runs only when the first unit deferred the switch test in this boot: the
+  whole check, then the record, then the graph, and the seat user's
+  PipeWire restarts onto it. The supervisor requires it, so it grants only
+  after the test passed. Until then the speakers stay at the floor, about
+  10 s after login on the first boot of a new kernel. A failure leaves them
+  there.
+
+A board without V/I sense has no switch test and runs entirely in the first
+unit.
 
 1. **Derive.** It works out the channel map (the unit channel for each
    physical speaker channel) and the sense map (which amp's V or I is on

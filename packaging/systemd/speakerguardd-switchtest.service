@@ -1,0 +1,35 @@
+[Unit]
+Description=Speaker wiring self-check, silent switch test after login (speakerguardd v2)
+Documentation=https://github.com/aurora-silicon/speakerguardd/blob/v2/docs/NEW-PLATFORM.md
+# The part of the self-check that speakerguardd-selfcheck.service defers
+# from the login path: on the first boot after a kernel or tuning change,
+# the silent switch test (one capture per sense switch, about 0.5 s each).
+# It runs only when that unit left /run/speakerguardd-graph/selfcheck.deferred
+# in this boot, so a boot without a kernel or tuning change skips it.
+# After user sessions: the login does not wait for it. The sessions that
+# start meanwhile have the raw-PCM rules (no WirePlumber node on the raw
+# speaker or sense PCMs) and no speaker graph; the speakers stay at the
+# kernel's floor. Before the supervisor, which requires a passing record:
+# its ExecStartPost generates the graph and restarts the seat user's
+# PipeWire onto it, and the supervisor then grants. A failure leaves the
+# floor, and the supervisor does not start.
+After=speakerguardd-selfcheck.service systemd-user-sessions.service
+Before=speakerguardd.service
+Requires=speakerguardd-selfcheck.service
+ConditionPathExists=/proc/device-tree/compatible
+
+[Service]
+Type=oneshot
+# speakerguardd-selfcheck.service passed the gate in this boot before it
+# deferred the test.
+ExecCondition=/usr/libexec/speakerguardd/speakerguardd-selfcheck pending
+EnvironmentFile=-/etc/speakerguardd/speakerguardd.conf
+ExecStart=/usr/libexec/speakerguardd/speakerguardd-selfcheck run --params ${SGV2_PARAMS} -- $SGV2_TUNING
+ExecStartPost=/usr/libexec/speakerguardd/speakerguardd-provision activate --graph-unit speakerguardd-graph.service
+StateDirectory=speakerguardd
+StateDirectoryMode=0755
+RuntimeDirectory=speakerguardd-selfcheck
+TimeoutStartSec=120
+
+[Install]
+RequiredBy=speakerguardd.service

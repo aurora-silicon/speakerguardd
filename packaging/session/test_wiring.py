@@ -495,7 +495,8 @@ class RestoreCommand(unittest.TestCase):
             params = os.path.join(tmp, "params")
             with open(params, "wb") as stream:
                 stream.write(b"synthetic test parameters")
-            args = types.SimpleNamespace(state=tmp, params=params, force=True)
+            args = types.SimpleNamespace(state=tmp, params=params, force=True, defer=False,
+                                         deferred=os.path.join(tmp, "selfcheck.deferred"))
             patches = {
                 "lv2_shadows": lambda: [], "derive_live": lambda args: (hw, w, desc, []),
                 "blob_rate": lambda path: w["rate"], "find_card": lambda hw: (1, desc["card"]),
@@ -979,6 +980,127 @@ class BoundRecord(unittest.TestCase):
             with open(path, "w") as f:
                 f.write("{")
             self.assertFalse(sgsc.report_matches(path, bind))
+
+
+class Deferral(unittest.TestCase):
+    """speakerguardd#102: before login only the binding and the cheap checks
+    run (`run --defer`); a needed switch test is left to the after-login
+    unit (`pending`, then `run`). Nothing passes, and no graph loads, until
+    the switch test itself passed."""
+
+    def setUp(self):
+        import tempfile
+        self.d = tempfile.mkdtemp(prefix="sgv2-defer-")
+        self.state = os.path.join(self.d, "state")
+        self.deferred = os.path.join(self.d, "run", "speakerguardd-graph", "selfcheck.deferred")
+        self.params = os.path.join(self.d, "params.bin")
+        with open(self.params, "wb") as f:
+            f.write(b"SGV2PRM\0" + bytes(24))
+        self.use("j413")
+        self.shadows = []
+        self.hw_errs = []
+        self.calls = []
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.d)
+
+    def use(self, m, static=False):
+        f = fx(m)
+        self.hw = f["hw"]
+        self.w = wiring.derive(self.hw, f["tuning"])
+        self.w["method"] = "derived-static" if static else "derived"
+        self.desc = wiring.describe(self.hw, self.w)
+
+    def run_sc(self, *argv, kernel="7.3.0-test"):
+        def active(idx, card, w, report):
+            self.calls.append("active")
+            return list(self.hw_errs)
+
+        def static(idx, w, report):
+            self.calls.append("static")
+            return []
+        uname = os.uname()
+        fake = mock.Mock(release=kernel, sysname=uname.sysname, nodename=uname.nodename)
+        with mock.patch.object(sgsc, "lv2_shadows", return_value=self.shadows), \
+                mock.patch.object(sgsc, "derive_live", return_value=(self.hw, self.w, self.desc, [])), \
+                mock.patch.object(sgsc, "blob_rate", return_value=self.w["rate"]), \
+                mock.patch.object(sgsc, "find_card", return_value=(0, self.desc["card"])), \
+                mock.patch.object(sgsc, "active", side_effect=active), \
+                mock.patch.object(sgsc, "static", side_effect=static), \
+                mock.patch.object(sgsc.os, "uname", return_value=fake), \
+                mock.patch.object(sys, "argv", ["speakerguardd-selfcheck", *argv, "--state", self.state,
+                                                "--deferred", self.deferred, "--params", self.params]):
+            return sgsc.main()
+
+    def bind(self):
+        return sgsc.read_bind(os.path.join(self.state, "selfcheck.bind"))
+
+    def test_first_boot_defers_then_the_switch_test_passes_after_login(self):
+        self.assertEqual(self.run_sc("run", "--defer"), 0)
+        self.assertEqual(self.calls, [])
+        self.assertTrue(os.path.exists(self.deferred))
+        self.assertEqual(self.bind(), {}, "no record before the switch test")
+        self.assertEqual(self.run_sc("pending"), 0)
+        self.assertEqual(self.run_sc("run"), 0)
+        self.assertEqual(self.calls, ["active"])
+        self.assertEqual(self.bind()["result"], "pass")
+        self.assertFalse(os.path.exists(self.deferred))
+        self.assertEqual(self.run_sc("pending"), 1)
+        # the next boot, same kernel: the bound pass, nothing deferred
+        self.assertEqual(self.run_sc("run", "--defer"), 0)
+        self.assertEqual(self.calls, ["active"])
+        self.assertEqual(self.run_sc("pending"), 1)
+        # a new kernel: the binding is stale, deferred again, the old pass
+        # does not cover it
+        self.assertEqual(self.run_sc("run", "--defer", kernel="7.3.0-next"), 0)
+        self.assertEqual(self.calls, ["active"])
+        self.assertEqual(self.run_sc("pending"), 0)
+        self.assertEqual(self.bind()["kernel"], "7.3.0-test")
+
+    def test_a_failed_switch_test_after_login_fails_closed(self):
+        self.assertEqual(self.run_sc("run", "--defer"), 0)
+        self.hw_errs = ["AMP V SENSE off quietened sense channel(s) []"]
+        self.assertEqual(self.run_sc("run"), 1)
+        self.assertEqual(self.bind()["result"], "fail")
+        self.assertFalse(os.path.exists(self.deferred))
+        # the next run before login does not reuse the failure: deferred again
+        self.assertEqual(self.run_sc("run", "--defer"), 0)
+        self.assertTrue(os.path.exists(self.deferred))
+        self.assertEqual(self.bind()["result"], "fail")
+
+    def test_failed_cheap_checks_fail_before_login_without_the_switch_test(self):
+        self.shadows = [("/home/u/.lv2/sgv2.lv2", "u's ~/.lv2")]
+        self.assertEqual(self.run_sc("run", "--defer"), 1)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.bind()["result"], "fail")
+        self.assertFalse(os.path.exists(self.deferred))
+        self.assertEqual(self.run_sc("pending"), 1)
+
+    def test_a_board_without_sense_is_never_deferred(self):
+        self.use("j700", static=True)
+        self.assertEqual(self.run_sc("run", "--defer"), 0)
+        self.assertEqual(self.calls, ["static"])
+        self.assertEqual(self.bind()["result"], "pass")
+        self.assertFalse(os.path.exists(self.deferred))
+
+    def test_without_defer_the_whole_check_runs(self):
+        self.assertEqual(self.run_sc("run"), 0)
+        self.assertEqual(self.calls, ["active"])
+        self.assertEqual(self.bind()["result"], "pass")
+
+    def test_runs_take_the_lock(self):
+        import fcntl
+        os.makedirs(self.state)
+        fd = os.open(os.path.join(self.state, "selfcheck.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            with mock.patch.object(sgsc.fcntl, "flock", side_effect=BlockingIOError) as fl:
+                with self.assertRaises(BlockingIOError):
+                    self.run_sc("run", "--defer")
+                self.assertEqual(fl.call_args[0][1], fcntl.LOCK_EX)
+        finally:
+            os.close(fd)
 
 
 class GatePath(unittest.TestCase):

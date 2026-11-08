@@ -49,7 +49,10 @@ the speakers at its floor, and the journal lists every reason.
 `activate` (the self-check's ExecStartPost) generates the machine's
 PipeWire and WirePlumber files from the self-check's record into
 /run/speakerguardd-graph, and refreshes the seat user's session if its
-PipeWire started before they changed. The user's speakerguardd-graph.service,
+PipeWire started before they changed. While the self-check's switch test is
+deferred until after login (/run/speakerguardd-graph/selfcheck.deferred) it
+generates nothing and removes any graph: the after-login unit
+(speakerguardd-switchtest.service) activates again once the test passed. The user's speakerguardd-graph.service,
 ordered before PipeWire, links them into that user's configuration only for
 the seat user (and removes them for everyone else). The links point into
 /run, so after a reboot without v2 they lead nowhere and PipeWire skips
@@ -130,6 +133,9 @@ class Paths:
         self.graph_state = os.path.join(self.graph, "state")
         # The raw-PCM rules, linked for every user from session start
         self.raw = os.path.join(self.graph, "raw")
+        # The self-check deferred its switch test until after login
+        # (speakerguardd-selfcheck DEFERRED)
+        self.deferred = os.path.join(self.graph, "selfcheck.deferred")
         self.sleep = r("/run/speakerguardd-sleep")
         self.hold = os.path.join(self.sleep, "hold")
         self.proc_asound = r("/proc/asound")
@@ -589,13 +595,13 @@ def write_conf(p, text):
 # ------------------------------------------------------------------ graph
 
 
-def clear_graph(p):
+def clear_graph(p, result="fail"):
     for d in ("pipewire", "wireplumber"):
         for f in glob.glob(os.path.join(p.graph, d, "*.conf")):
             unlink(f)
     if os.path.isdir(p.graph):
         try:
-            write_atomic(p.graph_state, "result=fail\n")
+            write_atomic(p.graph_state, f"result={result}\n")
         except OSError:
             pass
 
@@ -661,6 +667,14 @@ def cmd_activate(args, p):
         log(f"{p.conf} names no seat user: provisioning has not passed")
         return 1
     os.makedirs(p.graph, mode=0o755, exist_ok=True)
+    if os.path.exists(p.deferred):
+        # Before login, with the switch test still to run: no graph (and
+        # none left from earlier in this boot), so every session starts with
+        # the raw-PCM rules alone. speakerguardd-switchtest.service runs
+        # the test after login and activates again.
+        clear_graph(p, result="pending")
+        log("the silent switch test runs after login (speakerguardd-switchtest): no speaker graph until it passes")
+        return 0
     old = read_kv(p.graph_state)
     before = old.get("digest") if old.get("result") == "pass" else None
     gen = [os.path.join(HERE, "speakerguardd-selfcheck"), "generate", "--state", p.state,
