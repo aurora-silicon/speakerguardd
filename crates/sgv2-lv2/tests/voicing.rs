@@ -205,3 +205,29 @@ fn null_ports_mute_connected_outputs() {
         }
     }
 }
+
+#[test]
+fn the_artifact_volume_law_drives_mvol_and_the_port_still_overrides() {
+    use sgv2_core::voicing::volume::Curve;
+    let board = "j616s";
+    let lanes = 6;
+    // Synthetic range: the law, not any Mac's value.
+    let mut spec = fixture::spec(lanes);
+    spec.volume = Curve::hal(-40.0, 0.0).unwrap();
+    let blob = blob::with_voicing(&fixture::unit(board, lanes), &spec).unwrap();
+    let engine = voicing::Voicing::load(Some(&blob), board, 48_000.0, lanes);
+    assert!(engine.ready());
+    assert_eq!(engine.curve(), Curve::Hal { min_db: -40.0, max_db: 0.0 });
+    assert_eq!(engine.volume_db(0.25, 1.0), -20.0);
+    assert_eq!(engine.volume_db(1.0, 1.0), 0.0);
+    assert_eq!(engine.volume_db(f64::NAN, 1.0), -40.0);
+    assert_eq!(engine.volume_db(0.25, -7.0), -7.0);
+    // A bundle without a range keeps the cubic taper exactly.
+    let cubic = blob::with_voicing(&fixture::unit(board, lanes), &fixture::spec(lanes)).unwrap();
+    let engine = voicing::Voicing::load(Some(&cubic), board, 48_000.0, lanes);
+    assert_eq!(engine.curve(), Curve::Cubic);
+    assert_eq!(engine.volume_db(0.5, 1.0), 60.0 * 0.5f64.log10());
+    assert_eq!(engine.volume_db(0.0, 1.0), -200.0);
+    // No artifact: silent anyway, and the law falls back to cubic.
+    assert_eq!(voicing::Voicing::load(None, board, 48_000.0, lanes).curve(), Curve::Cubic);
+}

@@ -66,6 +66,7 @@ pub(crate) fn tone_spec(
         outputs: (0..ch).map(|channel| Source::Node(0, channel)).collect(),
         links: volume.map(|_| vec![Link { param: GraphParam::VolumeScalar, node: 0, id: 3 }]).unwrap_or_default(),
         relays: Vec::new(),
+        volume: Default::default(),
     })
 }
 
@@ -422,6 +423,7 @@ fn main() {
                     Vec::new()
                 },
                 relays: Vec::new(),
+                volume: Default::default(),
             };
             let mut run = Chain::new(spec, fs, quantum).unwrap_or_else(|| die("invalid isolated box"));
             if subtype == "vrq2" {

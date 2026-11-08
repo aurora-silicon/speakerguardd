@@ -39,6 +39,16 @@ pub fn s(x: &str) -> Value {
     Value::String(x.to_string())
 }
 
+/// The fixture speaker volume range's floor: synthetic, not any Mac's.
+pub const FIXTURE_VOLUME_MIN_DB: f64 = -48.5;
+
+/// A device configuration (`Config/AID<n>.plist`) whose speaker states a
+/// volume range of `[min_db, 0]`.
+pub fn device_config(min_db: f64) -> Value {
+    let params = dict(vec![("OutputVolumeMax", i(0)), ("OutputVolumeMin", r(min_db))]);
+    dict(vec![("DSP Devices", dict(vec![("Built-in Speaker", dict(vec![("Parameters", params)]))]))])
+}
+
 /// A four-channel graph: stereo duplicated to [L, L, R, R] lanes, permuted
 /// to [L, R, L, R] before the protection unit, with an 8-channel telemetry
 /// bus through a converter.  Names are this test's own.
@@ -334,7 +344,7 @@ pub fn spp3_files(channels: usize) -> BTreeMap<String, Vec<u8>> {
     f.insert(format!("{AID}/DSP/Strips/builtin_speaker_out_general.propstrip"), propstrip(&sc));
     f.insert(format!("{AID}/DSP/Strips/{sc}"), binary::write(&sidecar_value(channels)));
     f.insert("DeviceDSPDatabase.plist".into(), database(&[(65535, "builtin_speaker_out_general.austrip")]));
-    f.insert(format!("Config/{AID}.plist"), binary::write(&dict(vec![])));
+    f.insert(format!("Config/{AID}.plist"), binary::write(&device_config(FIXTURE_VOLUME_MIN_DB)));
     let recs: Vec<(FourCc, u16, u16)> =
         (0..channels).map(|c| (FourCc::from_str_exact(&format!("spA{c}")).unwrap(), 3000 + c as u16, 3100)).collect();
     f.insert("speaker-thiele-small.bin".into(), spts::encode(&recs, 0xBEEF));

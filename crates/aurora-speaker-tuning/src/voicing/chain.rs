@@ -280,6 +280,8 @@ pub fn compile(t: &Tuning, fs: f64, diags: &mut Diagnostics) -> Result<Compiled>
         outputs: plan.outputs.iter().map(source).collect(),
         links,
         relays,
+        // The Mac's own HAL law when its bundle states the range.
+        volume: t.volume_range.as_ref().and_then(|r| r.curve()).unwrap_or_default(),
     };
     spec.check().map_err(|e| bad(format!("{e:?}")))?;
     Ok(Compiled { plan, spec, stubs, gaps, unwired })

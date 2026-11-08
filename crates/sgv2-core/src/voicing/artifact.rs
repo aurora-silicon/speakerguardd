@@ -17,7 +17,8 @@ use crate::prestage::*;
 use alloc::{boxed::Box, vec, vec::Vec};
 
 pub const MAGIC: [u8; 8] = *b"SGVOICE\0";
-pub const VERSION: u32 = 1;
+/// 2: the Spec carries the volume law ([`super::volume::Curve`]).
+pub const VERSION: u32 = 2;
 // The conservative LowFlow build intentionally runs a different law. Do not
 // silently load an artifact made for the other build of that same schema.
 const FLAVOR: u32 = super::lowflow::CONSERVATIVE as u32;
@@ -127,7 +128,7 @@ macro_rules! record {
         }
     };
 }
-record!(Spec, program_channels, nodes, outputs, links, relays);
+record!(Spec, program_channels, nodes, outputs, links, relays, volume);
 record!(NodeSpec, kind, inputs);
 record!(Link, param, node, id);
 record!(Relay, from_node, from_id, to_node, to_id);
@@ -156,6 +157,25 @@ macro_rules! choices {
 choices!(GraphParam, VolumeScalar = 0, VolumeDb = 1, Mute = 2, BalanceLeft = 3, BalanceRight = 4, Lid = 5);
 choices!(BandMode, Compress = 0, Pass = 1, Mute = 2);
 choices!(DynamicKind, Notch = 15, LowShelf = 17, HighShelf = 18);
+impl Wire for super::volume::Curve {
+    fn put(&self, o: &mut Vec<u8>) {
+        match *self {
+            Self::Cubic => 0u32.put(o),
+            Self::Hal { min_db, max_db } => {
+                1u32.put(o);
+                min_db.put(o);
+                max_db.put(o);
+            }
+        }
+    }
+    fn get(r: &mut Reader<'_>) -> Result<Self> {
+        match u32::get(r)? {
+            0 => Ok(Self::Cubic),
+            1 => Self::hal(f64::get(r)?, f64::get(r)?).map_err(|_| BlobError::Unstable),
+            _ => Err(BlobError::Length),
+        }
+    }
+}
 impl Wire for Source {
     fn put(&self, o: &mut Vec<u8>) {
         match self {
@@ -488,6 +508,9 @@ fn validate(spec: &Spec, fs: f64, lanes: usize) -> Result<()> {
         return Err(BlobError::Length);
     }
     spec.check().map_err(|_| BlobError::Unstable)?;
+    if !spec.volume.valid() {
+        return Err(BlobError::Unstable);
+    }
     for node in &spec.nodes {
         let width = node.inputs.len();
         if node.kind.tones().any(|t| t.dynamic.iter().any(|d| !d.params.valid(fs))) {
@@ -531,5 +554,31 @@ mod xtc_startup_tests {
             assert_eq!(*decoded, params);
             assert!(reader.0.is_empty());
         }
+    }
+}
+
+#[cfg(test)]
+mod volume_law_tests {
+    use super::super::volume::Curve;
+    use super::*;
+
+    fn roundtrip(c: Curve) -> Result<Curve> {
+        let mut bytes = Vec::new();
+        c.put(&mut bytes);
+        let mut r = Reader(&bytes);
+        let out = Curve::get(&mut r)?;
+        assert!(r.0.is_empty());
+        Ok(out)
+    }
+
+    #[test]
+    fn volume_law_round_trips_and_a_law_that_adds_drive_is_refused() {
+        assert_eq!(roundtrip(Curve::Cubic), Ok(Curve::Cubic));
+        let hal = Curve::hal(-40.0, 0.0).unwrap();
+        assert_eq!(roundtrip(hal), Ok(hal));
+        assert_eq!(roundtrip(Curve::Hal { min_db: -40.0, max_db: 6.0 }), Err(BlobError::Unstable));
+        let mut bad = Vec::new();
+        7u32.put(&mut bad);
+        assert_eq!(Curve::get(&mut Reader(&bad)), Err(BlobError::Length));
     }
 }

@@ -3,8 +3,10 @@
 
 //! Stereo program -> protection lanes. Port order is two audio inputs,
 //! N audio outputs, scalar volume input, optional dB volume input, health
-//! output. `volume_db` <= 0 overrides the default 60*log10(scalar): the
-//! PipeWire scalar is the cube root of linear gain (`scale = cubic`).
+//! output. The scalar is the PipeWire slider position (`scale = cubic`).
+//! Its dB comes from the artifact's volume law (`volume::Curve`): the Mac's
+//! own HAL law when its bundle states the range, else 60*log10(scalar).
+//! `volume_db` <= 0 overrides either.
 //! The scalar reaches VolumeTaper, variable EQ and Tone automation; dB
 //! reaches the graph's dB gain/LowFlow links. Chain applies its own relays.
 //! Missing/bad artifacts or ports produce silence. All I/O and allocation
@@ -12,6 +14,7 @@
 use crate::Lv2Descriptor;
 use core::ffi::{c_char, c_void};
 use sgv2_core::voicing::chain::{Chain, GraphParam};
+use sgv2_core::voicing::volume::Curve;
 use sgv2_core::{blob, MAX_CHANNELS};
 
 pub const BLOCK: usize = 512;
@@ -24,21 +27,43 @@ pub const VARIANTS: &[(&str, usize)] = &[
 
 pub struct Voicing {
     chain: Option<Chain>,
+    /// The artifact's scalar-to-dB law; cubic when no chain loaded.
+    curve: Curve,
     scalar: f64,
     db: f64,
 }
 impl Voicing {
     /// Non-RT: require the running board, rate and plugin geometry to match.
     pub fn load(bytes: Option<&[u8]>, board: &str, rate: f64, lanes: usize) -> Self {
-        let chain = (|| {
+        let loaded = (|| {
             let bytes = bytes?;
             let (h, _) = blob::Header::parse(bytes).ok()?;
             if h.machine() != Some(board) || h.sample_rate as f64 != rate || h.channels as usize != lanes {
                 return None;
             }
-            Chain::new(blob::voicing(bytes).ok()??, rate, BLOCK)
+            let spec = blob::voicing(bytes).ok()??;
+            let curve = spec.volume;
+            Some((Chain::new(spec, rate, BLOCK)?, curve))
         })();
-        Self { chain, scalar: f64::NAN, db: f64::NAN }
+        let (chain, curve) = match loaded {
+            Some((c, v)) => (Some(c), v),
+            None => (None, Curve::Cubic),
+        };
+        Self { chain, curve, scalar: f64::NAN, db: f64::NAN }
+    }
+    /// The loaded volume law.
+    pub fn curve(&self) -> Curve {
+        self.curve
+    }
+    /// RT: the dB the graph's `mvol` links receive for `scalar`, unless a
+    /// connected `volume_db` port (<= 0) overrides it.
+    #[inline]
+    pub fn volume_db(&self, scalar: f64, override_db: f64) -> f64 {
+        if override_db.is_finite() && override_db <= 0.0 {
+            override_db
+        } else {
+            self.curve.db(scalar)
+        }
     }
     pub fn ready(&self) -> bool {
         self.chain.is_some()
@@ -149,13 +174,7 @@ unsafe extern "C" fn run(h: *mut c_void, frames: u32) {
     let scalar = unsafe { *i.ports[n + 2] } as f64;
     // SAFETY: the optional connected control holds one readable f32.
     let override_db = if i.ports[n + 3].is_null() { 1.0 } else { (unsafe { *i.ports[n + 3] }) as f64 };
-    let db = if override_db.is_finite() && override_db <= 0.0 {
-        override_db
-    } else if scalar.is_finite() && scalar > 0.0 {
-        60.0 * scalar.min(1.0).log10()
-    } else {
-        -200.0
-    };
+    let db = i.engine.volume_db(scalar, override_db);
     for at in (0..frames as usize).step_by(BLOCK) {
         let len = BLOCK.min(frames as usize - at);
         for (c, dst) in i.input.iter_mut().enumerate() {

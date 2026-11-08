@@ -250,6 +250,11 @@ pub struct Spec {
     pub outputs: Vec<Source>,
     pub links: Vec<Link>,
     pub relays: Vec<Relay>,
+    /// The speaker volume control's scalar-to-dB law: how the plugin turns
+    /// the user scalar (`mvsc`) into `mvol`.  The tuning compiler derives it
+    /// from the Mac's own bundle; [`super::volume::Curve::Cubic`] when the
+    /// bundle names no range.
+    pub volume: super::volume::Curve,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -938,6 +943,7 @@ mod tests {
                 Link { param: GraphParam::Mute, node: 0, id: 1 },
             ],
             relays: vec![],
+            volume: Default::default(),
         }
     }
 
@@ -976,6 +982,7 @@ mod tests {
             outputs: vec![Source::Node(1, 0), Source::Node(1, 0)],
             links: vec![],
             relays: vec![],
+            volume: Default::default(),
         };
         let mut c = Chain::new(spec.clone(), 48_000.0, 8).unwrap();
         let l = [0.5f32; 8];
@@ -1050,6 +1057,7 @@ mod tests {
             outputs: vec![Source::Node(1, 0)],
             links: vec![Link { param: GraphParam::VolumeScalar, node: 0, id: 4 }],
             relays: vec![Relay { from_node: 0, from_id: 100, to_node: 1, to_id: 79 }],
+            volume: Default::default(),
         };
         let chain = Chain::new(spec, 48_000.0, 16).unwrap();
         let Run::Mstk(comp) = &chain.runs[1] else { panic!("compressor runner") };
@@ -1084,6 +1092,7 @@ mod tests {
             outputs: vec![Source::Node(0, 0)],
             links: vec![Link { param: GraphParam::VolumeScalar, node: 0, id: 3 }],
             relays: vec![],
+            volume: Default::default(),
         }
     }
 
@@ -1158,6 +1167,7 @@ mod tests {
             outputs: vec![Source::Node(0, 0)],
             links: vec![Link { param: GraphParam::VolumeScalar, node: 0, id: 3 }],
             relays: vec![],
+            volume: Default::default(),
         };
         (spec, channel)
     }
@@ -1241,6 +1251,7 @@ mod tests {
             outputs: vec![Source::Node(0, 0)],
             links: Vec::new(),
             relays: vec![],
+            volume: Default::default(),
         }
     }
 
