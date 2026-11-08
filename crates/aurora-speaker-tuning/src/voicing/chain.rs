@@ -122,7 +122,7 @@ fn compile_node(
             // detector, bandwidth behaviour); the pre-stage's interim
             // peak/hard-knee law tilted the whole chain against macOS
             // (2-3.5 dB under at 50-200 Hz, 0.5-2.5 dB over above 300 Hz)
-            "mstk" => match super::mstk::compile(stage, fs, diags) {
+            "mstk" => match super::mstk::compile_for(stage, fs, t.macos_build.as_deref(), diags) {
                 Ok(Some(p)) => Kind::Mstk(Box::new(p)),
                 Ok(None) => Kind::Bypass,
                 Err(e) => uncarried(n, subtype, e, gaps),
@@ -280,6 +280,8 @@ pub fn compile(t: &Tuning, fs: f64, diags: &mut Diagnostics) -> Result<Compiled>
         outputs: plan.outputs.iter().map(source).collect(),
         links,
         relays,
+        // The Mac's own HAL law when its bundle states the range.
+        volume: t.volume_range.as_ref().and_then(|r| r.curve()).unwrap_or_default(),
     };
     spec.check().map_err(|e| bad(format!("{e:?}")))?;
     Ok(Compiled { plan, spec, stubs, gaps, unwired })

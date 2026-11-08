@@ -37,6 +37,7 @@ pub mod compile;
 pub mod dspg;
 pub mod error;
 pub mod fourcc;
+pub mod hal_volume;
 pub mod lattice;
 pub mod lsid;
 pub mod machine;

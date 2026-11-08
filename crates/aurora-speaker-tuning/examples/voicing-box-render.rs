@@ -66,6 +66,7 @@ pub(crate) fn tone_spec(
         outputs: (0..ch).map(|channel| Source::Node(0, channel)).collect(),
         links: volume.map(|_| vec![Link { param: GraphParam::VolumeScalar, node: 0, id: 3 }]).unwrap_or_default(),
         relays: Vec::new(),
+        volume: Default::default(),
     })
 }
 
@@ -290,7 +291,9 @@ fn main() {
     }
     match subtype.as_str() {
         "mstk" => {
-            let p = voicing::mstk::compile(stage, fs, &mut diags).unwrap_or_else(|e| die(format!("{e:?}")));
+            let p =
+                voicing::mstk::compile_for(stage, fs, std::env::var("SGV2_MACOS_BUILD").ok().as_deref(), &mut diags)
+                    .unwrap_or_else(|e| die(format!("{e:?}")));
             if let Some(p) = p {
                 let mut run = sgv2_core::voicing::mstk::Run::new(&p, fs, ch);
                 if let Some(v) = automation_input {
@@ -341,8 +344,15 @@ fn main() {
                     summed: Vec::new(),
                 })
                 .collect();
-            let mut p = prestage::derive_lanes(std::slice::from_ref(stage), &lanes, fs, ch, &mut diags)
-                .unwrap_or_else(|e| die(format!("{e:?}")));
+            let mut p = prestage::derive_lanes_for(
+                std::slice::from_ref(stage),
+                &lanes,
+                fs,
+                ch,
+                std::env::var("SGV2_MACOS_BUILD").ok().as_deref(),
+                &mut diags,
+            )
+            .unwrap_or_else(|e| die(format!("{e:?}")));
             // The production pre-stage applies one final whole-lane unity
             // envelope after every box. Slot-isolation rigs compare the
             // slot's sections themselves, before that envelope; restore a
@@ -413,6 +423,7 @@ fn main() {
                     Vec::new()
                 },
                 relays: Vec::new(),
+                volume: Default::default(),
             };
             let mut run = Chain::new(spec, fs, quantum).unwrap_or_else(|| die("invalid isolated box"));
             if subtype == "vrq2" {
