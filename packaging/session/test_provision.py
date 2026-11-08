@@ -980,6 +980,36 @@ class Gate(Base):
         self.assertFalse(os.path.exists(os.path.join(HERE, "machines.json")))
 
 
+JACK = b"apple,j616-macaudio-jack\0apple,macaudio\0"
+
+
+class SpeakerCard(unittest.TestCase):
+    """The gate's speaker card is the macaudio card with the speaker link,
+    whichever card number the jack-only card took."""
+
+    def card(self, sysfs, n, ident, compat, link):
+        node = os.path.join(sysfs, f"card{n}", "device", "of_node")
+        os.makedirs(os.path.join(node, "dai-link@0"))
+        with open(os.path.join(sysfs, f"card{n}", "id"), "w") as f:
+            f.write(ident + "\n")
+        with open(os.path.join(node, "compatible"), "wb") as f:
+            f.write(compat)
+        with open(os.path.join(node, "dai-link@0", "link-name"), "wb") as f:
+            f.write(link + b"\0")
+
+    def test_the_jack_card_first_is_skipped(self):
+        with tempfile.TemporaryDirectory() as sysfs:
+            self.card(sysfs, 0, "AppleJ616HPAI", b"apple,aop-audio\0", b"Speakers")
+            self.card(sysfs, 1, "AppleJack", JACK, b"Headphone Jack")
+            self.card(sysfs, 2, "AppleJ616", b"apple,j616-macaudio\0apple,macaudio\0", b"Speakers")
+            self.assertEqual(gate.speaker_card(sysfs), "AppleJ616")
+
+    def test_no_speaker_link_is_no_speaker_card(self):
+        with tempfile.TemporaryDirectory() as sysfs:
+            self.card(sysfs, 1, "AppleJack", JACK, b"Headphone Jack")
+            self.assertIsNone(gate.speaker_card(sysfs))
+
+
 class Units(unittest.TestCase):
     """The units' order: provisioning, then the self-check, then the supervisor."""
 
