@@ -325,6 +325,7 @@ def pipewire_conf(m, c, w, source=None, voicing_pre=None):
             node.name              = "{n['sense']}"
             node.description       = "{c['name']} speaker sense (protection only)"
             media.class            = "Audio/Source/Internal"
+            node.link-group        = "{n['group']}"
             api.alsa.path          = "hw:CARD={c['card']},DEV=2"
             audio.format           = "S16LE"
             audio.rate             = {c['rate']}
@@ -353,6 +354,10 @@ context.objects = [
             node.name              = "{n['speaker']}"
             node.description       = "{c['name']} speaker amps (protected path only)"
             media.class            = "Audio/Sink/Internal"
+            # One link group with the sense (the same set as node.group, so
+            # scheduling is unchanged): session tools list the pair as part
+            # of the protection graph, never as a device sink or source.
+            node.link-group        = "{n['group']}"
             api.alsa.path          = "hw:CARD={c['card']},DEV=1"
             audio.format           = "{c['speaker_format']}"
             audio.rate             = {c['rate']}
