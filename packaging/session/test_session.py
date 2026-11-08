@@ -329,6 +329,16 @@ class Generated(unittest.TestCase):
             self.assertIn("node.disabled = true", wp_new)
 
 
+    def test_the_protect_input_is_internal(self):
+        # A desktop that lists it, or resolves its volume keys through the
+        # voicing to it, would change its volume and drop the carrier.
+        for m in gen.machines():
+            c, w = gen.machine(m)
+            for pre in (False, True):
+                conf = gen.pipewire_conf(m, c, w, voicing_pre=pre)
+                block = conf.split(f'node.name          = "{gen.PROTECT_INPUT}"', 1)[1].split("}", 1)[0]
+                self.assertIn('media.class        = "Audio/Sink/Internal"', block)
+
     def test_generated_files_are_current(self):
         import subprocess
         import sys
