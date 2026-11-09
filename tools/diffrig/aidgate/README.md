@@ -36,3 +36,50 @@ run through those units are compatibility measurements, not native 27.2 qualific
 amplitude only, not sample identity. It runs at 48 kHz and full volume only. The protection unit is
 outside this gate; it has its own rigs. Every output made from Apple tuning is Apple-derived: keep it
 in private directories and publish numbers only.
+
+## macOS parity attestations (`attest.py`): what `speakerguardd-selfcheck verify` reads
+
+The gate above answers "how close is v2 to macOS" per AID. `attest.py` turns the same measurement
+into the file a Mac checks before v2 may take its speakers (`packaging/session/parity.json`, read by
+`aurora-speaker-tuning voicing-check`, `crates/aurora-speaker-tuning/src/voicing/parity.rs`).
+
+- It covers every tuning the release can select: every AID of the Tunings folder and every speaker
+  configuration (speaker ID) of its DSP database, deduplicated by tuning key (a SHA-256 of what the
+  voicing compiler reads: chain, saved states, unit dictionaries, plan, volume range; no per-unit or
+  per-collection data). It never lists boards and is never edited by hand: it records whether this
+  code renders each tuning like macOS.
+- The macOS side applies the configuration's strip and property strip (`gr.py --strip --propstrip`,
+  `box_host --propstrip`), as macOS does.
+- Verdict per tuning: refused when the reference failed, v2 does not compile it, the compiler reports
+  a stub, an unwired parameter or a gap, the lanes differ, any sample is non-finite, or any measured
+  cell is louder than macOS by more than 0.25 dB or quieter by more than 1.0 dB.
+- Each file is bound to `law`, a hash of the rendering code (`crates/aurora-speaker-tuning/build.rs`).
+  A build whose law differs refuses every Mac until the file is regenerated: any change to the voicing
+  compiler or engine needs a new run before it can ship.
+- The file holds keys, verdicts, reasons and summary numbers only. Every render and the per-cell rows
+  (`--details`) stay in private, tainted directories.
+
+### When it runs
+
+Run all three steps, in full, whenever:
+1. **a macOS release ships** (every point release and every device-forked build: their Tunings may
+   add AIDs, speaker configurations or new states). Update the host Mac to it first, because the
+   reference is the installed Audio Units. Extract the release's Tunings folder from its IPSW
+   (`ipsw extract --remote --dmg fs`, or SGUP2's `tools/aea_ro.py` + `apfs_ro.py` ranged reads) for
+   AIDs the host's own tree lacks;
+2. **the rendering code changes** (the law changes; the macOS renders from step 2 can be reused while
+   the release is unchanged);
+3. **the gate program or the tolerance changes.**
+
+```text
+# buildbox
+attest.py variants --bin BIN --tunings NEW_TREE --tunings-fallback HOST_TREE --out variants.json
+# host Mac on that release, under a host-heavy slot (about 2 s per tuning)
+BOXHOST=.../box_host SCRATCH=... PROG=prog.f32 attest_refs.sh SLOT variants.json
+# buildbox (about 1 min for 63 tunings with 12 jobs)
+attest.py gate --variants variants.json --mac REFS --bin BIN --prog prog --reference "macOS <ver> <build> Audio Units" \
+    --out packaging/session/parity.json --details PRIVATE_DIR
+```
+
+Commit the new `parity.json` in the same PR as the code change it attests. `test_verify.py` checks
+that the file is consistent with its own tolerance.

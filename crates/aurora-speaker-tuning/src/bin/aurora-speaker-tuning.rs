@@ -11,6 +11,9 @@
 //! aurora-speaker-tuning blob     BLOB [BLOB]     (decode; with two, diff field by field)
 //! aurora-speaker-tuning units    [--json]
 //! aurora-speaker-tuning plist    FILE            (any plist as XML)
+//! aurora-speaker-tuning voicing-check [--json] [--key-only] [--attestations FILE] [--speaker-id N] [SOURCE]
+//!       (the voicing chain's offline self-check, `voicing::parity`: exit 0
+//!        pass, 1 refused, 3 internal error)
 //!
 //! SOURCE: PATH (directory, .tar, .tar.gz)
 //!       | --tunings-root DIR --aid N   (development: read macOS Tunings in place)
@@ -60,6 +63,8 @@ struct Args {
     development: bool,
     voicing_pre: bool,
     prestage: compile::PreStageMode,
+    attestations: Option<PathBuf>,
+    key_only: bool,
 }
 
 fn usage() -> ! {
@@ -69,6 +74,7 @@ fn usage() -> ! {
          aurora-speaker-tuning plan [--speaker-id N] [PATH | --tunings-root DIR --aid N]\n       \
          aurora-speaker-tuning identify [--json] [PATH | --tunings-root DIR --aid N]\n       \
          aurora-speaker-tuning blob BLOB [BLOB]\n       \
+         aurora-speaker-tuning voicing-check [--json] [--key-only] [--attestations FILE] [--speaker-id N] [PATH | --tunings-root DIR --aid N]\n       \
          aurora-speaker-tuning units [--json]\n       aurora-speaker-tuning plist FILE"
     );
     exit(2)
@@ -85,6 +91,7 @@ fn parse_args() -> Args {
         Some("blob") => "blob",
         Some("identify") => "identify",
         Some("plan") => "plan",
+        Some("voicing-check") => "voicing-check",
         _ => usage(),
     }
     .to_string();
@@ -102,6 +109,8 @@ fn parse_args() -> Args {
         development: false,
         voicing_pre: false,
         prestage: compile::PreStageMode::default(),
+        attestations: None,
+        key_only: false,
     };
     while let Some(x) = it.next() {
         match x.as_str() {
@@ -116,6 +125,8 @@ fn parse_args() -> Args {
             "--board" => a.board = Some(it.next().unwrap_or_else(|| usage())),
             "--unit-id" => a.unit_id = Some(it.next().unwrap_or_else(|| usage())),
             "--development" => a.development = true,
+            "--attestations" => a.attestations = Some(it.next().map(PathBuf::from).unwrap_or_else(|| usage())),
+            "--key-only" => a.key_only = true,
             "--voicing-pre" => a.voicing_pre = true,
             "--prestage" => {
                 a.prestage = match it.next().as_deref() {
@@ -485,6 +496,9 @@ fn main() {
         identify(bundle, a.json);
         return;
     }
+    if a.cmd == "voicing-check" {
+        voicing_check(bundle, &a);
+    }
     let mut diags = Diagnostics::default();
     let dt = std::path::Path::new(machine::DEVICE_TREE);
     let live = a.board.is_none() && dt.is_dir();
@@ -568,4 +582,93 @@ fn main() {
             exit(1);
         }
     }
+}
+
+/// `voicing-check`: the voicing chain's offline self-check
+/// ([`aurora_speaker_tuning::voicing::parity`]). One JSON object on stdout
+/// with `--json`, else one line per step; exit 0 pass, 1 refused, 3 error.
+fn voicing_check(bundle: aurora_speaker_tuning::Result<Bundle>, a: &Args) -> ! {
+    use aurora_speaker_tuning::voicing::parity;
+    let mut diags = Diagnostics::default();
+    let dt = std::path::Path::new(machine::DEVICE_TREE);
+    let device_tree_speaker_id = if a.tunings_root.is_none() && dt.is_dir() {
+        machine::speaker_id(dt).unwrap_or_else(|e| {
+            eprintln!("{e}");
+            exit(3)
+        })
+    } else {
+        None
+    };
+    let opts = Options { speaker_id: a.speaker_id, device_tree_speaker_id };
+    let mut t = match bundle.and_then(|b| Tuning::load(&b, &opts, &mut diags)) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("voicing-check: load: {e}");
+            exit(3)
+        }
+    };
+    // a raw macOS Tunings folder states no build; the gate names the one
+    // whose units it rendered with (production bundles carry it)
+    if a.tunings_root.is_some() && t.macos_build.is_none() {
+        t.macos_build = std::env::var("SGV2_MACOS_BUILD").ok();
+    }
+    if a.key_only {
+        match parity::key(&t) {
+            Ok(k) => {
+                println!(
+                    "{}",
+                    serde_json::json!({"key": k, "law": parity::LAW, "aid": t.acoustic_id, "speaker_id": t.speaker_id})
+                );
+                exit(0)
+            }
+            Err(e) => {
+                eprintln!("voicing-check: key: {e}");
+                exit(3)
+            }
+        }
+    }
+    let attest = match &a.attestations {
+        None => None,
+        Some(p) => match std::fs::read(p) {
+            Ok(b) => Some(b),
+            Err(e) => {
+                eprintln!("voicing-check: {}: {e}", p.display());
+                None
+            }
+        },
+    };
+    if !t.refusals.is_empty() {
+        eprintln!("voicing-check: the tuning has {} refusal(s)", t.refusals.len());
+    }
+    let (key, mut checks) = parity::run(&t, attest.as_deref(), &mut diags);
+    if !t.refusals.is_empty() {
+        checks.insert(
+            0,
+            parity::Check {
+                name: "tuning".into(),
+                result: "refused",
+                detail: t.refusals.iter().map(|d| d.message.clone()).collect::<Vec<_>>().join("; "),
+            },
+        );
+    }
+    let pass = checks.iter().all(|c| c.result != "refused");
+    if a.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "result": if pass { "pass" } else { "refused" },
+                "key": key,
+                "law": parity::LAW,
+                "aid": t.acoustic_id,
+                "speaker_id": t.speaker_id,
+                "steps": checks,
+            }))
+            .unwrap()
+        );
+    } else {
+        for c in &checks {
+            println!("{:8} {:16} {}", c.result, c.name, c.detail);
+        }
+    }
+    exit(if pass { 0 } else { 1 })
 }
