@@ -26,6 +26,10 @@ GATE = 0.05
 # measured, as in the box rigs' transient windows; they are counted separately.
 FLOOR = 1e-4
 STOPBAND = 60.0
+# Floor residue (README.md): a measurement more than FLOOR_RESIDUE_DB under its lane's own
+# peak where v2 is QUIETER than macOS is reported separately and not counted over the gate.
+# Louder than macOS counts at every level.
+FLOOR_RESIDUE_DB = 55.0
 
 
 def rms(x):
@@ -53,9 +57,26 @@ def lag_of(mac, v2, seg, search=4096):
     return best - (s - lo)
 
 
+def lane_peaks(mac, segs):
+    """Each lane's own peak: its loudest macOS level anywhere in the program (steady
+    second halves and 10 ms windows of dynamic segments)."""
+    peak = [0.0] * mac.shape[1]
+    for sg in segs:
+        if sg["kind"] == "silence":
+            continue
+        s, n = sg["start"], sg["frames"]
+        for c in range(mac.shape[1]):
+            lv = [rms(mac[s + n // 2:s + n, c])]
+            if sg["kind"] == "dynamic":
+                lv += [rms(mac[s + at:s + at + 480, c]) for at in range(0, n - 479, 480)]
+            peak[c] = max(peak[c], *lv)
+    return peak
+
+
 def compare(mac, v2, segs):
     """Per segment x lane deltas at the original sample positions."""
-    rows = []
+    rows, residue = [], []
+    peak = lane_peaks(mac, segs)
     for sg in segs:
         if sg["kind"] == "silence":
             continue
@@ -66,11 +87,17 @@ def compare(mac, v2, segs):
         floor = max(FLOOR, top * 10 ** (-STOPBAND / 20))
         for c in range(mac.shape[1]):
             a, b = mac[s:s + n, c], v2[s:s + n, c]
-            d = [ddb(a[n // 2:], b[n // 2:], floor)]
+            parts = [(a[n // 2:], b[n // 2:], floor)]
             if sg["kind"] == "dynamic":
-                for at in range(0, n - 479, 480):
-                    d.append(ddb(a[at:at + 480], b[at:at + 480], 1e-4))
-            d = [x for x in d if x is not None]
+                parts += [(a[at:at + 480], b[at:at + 480], 1e-4) for at in range(0, n - 479, 480)]
+            edge = peak[c] * 10 ** (-FLOOR_RESIDUE_DB / 20)
+            d, fl = [], []
+            for x, y, f in parts:
+                v = ddb(x, y, f)
+                if v is not None:
+                    (fl if v < 0 and rms(x) < edge else d).append(v)
+            if fl:
+                residue.append({"seg": sg["name"], "lane": c, "db": min(fl)})
             if not d:
                 continue
             w = max(d, key=abs)
@@ -78,7 +105,9 @@ def compare(mac, v2, segs):
     over = [r for r in rows if abs(r["db"]) > GATE]
     worst = max(rows, key=lambda r: abs(r["db"])) if rows else None
     return {"measured": len(rows), "over": len(over), "louder_over": sum(r["db"] > GATE for r in over),
-            "worst": worst, "over_rows": over[:400]}
+            "worst": worst, "over_rows": over[:400],
+            "floor_residue": sum(abs(r["db"]) > GATE for r in residue),
+            "floor_residue_rows": [r for r in residue if abs(r["db"]) > GATE][:400]}
 
 
 def main():
