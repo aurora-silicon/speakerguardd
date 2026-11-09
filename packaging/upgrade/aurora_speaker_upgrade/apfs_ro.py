@@ -72,7 +72,10 @@ def lzfse():
         try:
             lib = ctypes.CDLL(name)
         except OSError:
-            lib = ctypes.CDLL("liblzfse.so")
+            try:
+                lib = ctypes.CDLL("liblzfse.so")
+            except OSError:
+                raise ApfsError("an LZFSE-compressed file needs liblzfse (install the lzfse package)") from None
         lib.lzfse_decode_buffer.restype = ctypes.c_size_t
         lib.lzfse_decode_buffer.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_char_p,
                                             ctypes.c_size_t, ctypes.c_void_p]
