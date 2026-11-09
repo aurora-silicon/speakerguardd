@@ -35,6 +35,8 @@ FLOOR_RESIDUE_DB = 55.0
 # (--spread FILE, attest.py spread) when that exceeds GATE, louder included.
 CHAOTIC_MAX_DBFS = -60.0
 CHAOTIC_UNDER_PEAK_DB = 40.0
+# Main-band measurements: macOS's own spread for the cell, capped at MAIN_SPREAD_CAP_DB.
+MAIN_SPREAD_CAP_DB = 0.25
 
 
 def rms(x):
@@ -119,13 +121,15 @@ def compare(mac, v2, segs, spread=None):
             if not d:
                 continue
             w = max(d, key=abs)
-            rows.append({"seg": sg["name"], "lane": c, "db": w})
-    over = [r for r in rows if abs(r["db"]) > GATE]
+            lim = GATE if sp is None else max(GATE, min(sp, MAIN_SPREAD_CAP_DB))
+            rows.append({"seg": sg["name"], "lane": c, "db": w, "limit": lim})
+    over = [r for r in rows if abs(r["db"]) > r["limit"]]
     worst = max(rows, key=lambda r: abs(r["db"])) if rows else None
     return {"measured": len(rows), "over": len(over) + sum(r["over"] for r in chaotic), "louder_over": sum(r["db"] > GATE for r in over),
             "worst": worst, "over_rows": over[:400],
             "floor_residue": sum(abs(r["db"]) > GATE for r in residue),
             "chaotic_held": sum(abs(r["db"]) > GATE and not r["over"] for r in chaotic),
+            "spread_held": sum(GATE < abs(r["db"]) <= r["limit"] for r in rows),
             "chaotic_over": sum(r["over"] for r in chaotic),
             "chaotic_rows": [r for r in chaotic if abs(r["db"]) > GATE][:400],
             "floor_residue_rows": [r for r in residue if abs(r["db"]) > GATE][:400]}
