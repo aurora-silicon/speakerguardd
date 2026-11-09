@@ -698,9 +698,9 @@ mod tests {
         [left, right]
     }
 
-    fn render_in_buffers(p: &Params, sizes: &[usize], frames: usize) -> [Vec<f32>; 2] {
+    fn render_in_buffers(p: &Params, mode: BufferMode, sizes: &[usize], frames: usize) -> [Vec<f32>; 2] {
         let [mut left, mut right] = invariance_source(frames);
-        let mut run = Run::with_buffer_mode(p, 48_000.0, 2, BufferMode::Staged);
+        let mut run = Run::with_buffer_mode(p, 48_000.0, 2, mode);
         let (mut at, mut k) = (0, 0);
         while at < frames {
             let n = sizes[k % sizes.len()].min(frames - at);
@@ -715,12 +715,19 @@ mod tests {
     fn staged_output_is_identical_for_every_host_buffer_size() {
         let p = Params { threshold_db: -100.0, ..Default::default() };
         let frames = 8 * HOST_HOP;
-        let whole = render_in_buffers(&p, &[frames], frames);
+        let whole = render_in_buffers(&p, BufferMode::Staged, &[frames], frames);
         for size in [1, 2, 3, 7, 64, 100, 128, 255, 256, 257, 511, 512, 513, 1000, 1024, 2048] {
-            assert_eq!(render_in_buffers(&p, &[size], frames), whole, "host buffer {size}");
+            assert_eq!(render_in_buffers(&p, BufferMode::Staged, &[size], frames), whole, "host buffer {size}");
         }
         let mixed = [1, 511, 3, 257, 64, 1000, 2, 129];
-        assert_eq!(render_in_buffers(&p, &mixed, frames), whole, "mixed host buffers");
+        assert_eq!(render_in_buffers(&p, BufferMode::Staged, &mixed, frames), whole, "mixed host buffers");
+
+        // Staging changes only transport: it is the direct 512-frame path,
+        // bit for bit, held by exactly one completed decision block.
+        let direct = render_in_buffers(&p, BufferMode::Direct, &[HOST_HOP], frames);
+        for channel in 0..2 {
+            assert_eq!(&whole[channel][HOST_HOP..], &direct[channel][..frames - HOST_HOP]);
+        }
 
         let latency = Run::with_buffer_mode(&p, 48_000.0, 2, BufferMode::Staged).latency();
         assert_eq!(latency, Run::new(&p, 48_000.0, 2).latency() + HOST_HOP);
