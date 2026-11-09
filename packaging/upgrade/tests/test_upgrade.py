@@ -296,5 +296,30 @@ class BootRefusalRecord(unittest.TestCase):
         self.assertNotEqual(k, self.saved[2](types.SimpleNamespace(unit="u2")))
 
 
+class LegacyStart(unittest.TestCase):
+    """RC8 E2E B2: a revert starts the older daemon the packaged udev rules
+    want for the sense PCM, never every installed one (speakerguardd 0.1
+    on an M2 exits 78/CONFIG)."""
+
+    def test_only_the_wanted_unit(self):
+        import types
+        from unittest import mock
+        from aurora_speaker_upgrade import upgrade as up
+        props = {"/dev/snd/pcmC0D2c": "DEVNAME=/dev/snd/pcmC0D2c\nSYSTEMD_WANTS=speakersafetyd.service\n",
+                 "/dev/snd/pcmC1D0c": "DEVNAME=/dev/snd/pcmC1D0c\n"}
+        calls = []
+
+        def run(argv, **kw):
+            out = props.get(argv[-1], "") if argv[:2] == ["udevadm", "info"] else ""
+            return types.SimpleNamespace(returncode=0, stdout=out, stderr="")
+        with mock.patch.object(up, "run", run), mock.patch.object(up.glob, "glob", lambda p: sorted(props)), \
+                mock.patch.object(up, "v2_unit", return_value="speakerguardd-v2.service"), \
+                mock.patch.object(up, "systemctl", lambda *a: calls.append(a) or types.SimpleNamespace(returncode=0)):
+            self.assertEqual(up.legacy_wanted(), ["speakersafetyd.service"])
+            up.legacy_start()
+        started = [a[-1] for a in calls if a[0] == "start"]
+        self.assertEqual(started, ["speakersafetyd.service"])
+
+
 if __name__ == "__main__":
     unittest.main()
