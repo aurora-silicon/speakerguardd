@@ -32,6 +32,7 @@ this Mac's own tuning, and back.
 import argparse
 import contextlib
 import fcntl
+import hashlib
 import json
 import logging
 import os
@@ -60,6 +61,7 @@ INTERFACE_CTL = "Speaker Protection Interface"
 IF_V2, IF_LEGACY = "Speaker Protection", "Speaker Volume Unlock"
 V2_UNITS = ("speakerguardd-v2.service", "speakerguardd.service")
 GRANT_WAIT_S = 30
+PARITY = ("/usr/share/speakerguardd/parity.json",)
 MARK = "# aurora-speaker-upgrade: the bundle collected for this Mac"
 
 EXIT_OK, EXIT_REFUSED, EXIT_RETRY, EXIT_ERROR = 0, 1, 2, 3
@@ -571,7 +573,7 @@ def cmd_collect(a):
     return EXIT_OK
 
 
-def cmd_run(a):
+def _cmd_run(a):
     store = Store(a.store)
     identity = collect.Identity(a.adt)
     if not identity.matches_dt():
@@ -641,6 +643,59 @@ def cmd_run(a):
     say(f"done: speakerguardd v2 owns the speakers ({prov.get('aid')}, macOS {prov.get('macos_build')}, "
         f"route {prov['route']}); the legacy stack stays installed (aurora-speaker-upgrade --revert)")
     return EXIT_OK
+
+
+def refusal_key(identity):
+    """What a refusal depends on: this unit, the running kernel, and the code
+    and data that judged it (this tool, v2's provisioning and self-check, the
+    parity attestation). A new kernel, a v2 update or a new attestation makes
+    the boot unit try again; nothing else does."""
+    h = hashlib.sha256()
+    h.update(f"{identity.unit}\0{os.uname().release}\0".encode())
+    for p in [os.path.abspath(__file__), tool("speakerguardd-provision"), tool("speakerguardd-selfcheck"), *PARITY]:
+        try:
+            with open(p or "", "rb") as f:
+                h.update(hashlib.sha256(f.read()).digest())
+        except OSError:
+            h.update(b"-")
+    return h.hexdigest()
+
+
+def cmd_run(a):
+    """run, plus the boot unit's refusal record: a Mac the self-check (or the
+    collection) refused is not tried again at every boot, which would stop
+    and restart the legacy protection each time for the same answer. The
+    record lives in the store and is keyed by refusal_key(); `run` by hand
+    always tries again."""
+    store = Store(a.store)
+    identity = collect.Identity(a.adt)
+    record = os.path.join(store.root, "refused.json")
+    key = refusal_key(identity)
+    if getattr(a, "at_boot", False):
+        try:
+            with open(record) as f:
+                old = json.load(f)
+        except (OSError, ValueError):
+            old = {}
+        if old.get("key") == key:
+            say(f"refused before for this kernel and this speakerguardd ({old.get('when')}): {old.get('reason')}; "
+                "the legacy protection keeps the speakers (run 'aurora-speaker-upgrade run' to try again)")
+            return EXIT_OK
+    try:
+        code = _cmd_run(a)
+    except (Refused, collect.CollectError) as e:
+        with contextlib.suppress(Exception):
+            store.ensure()
+            fd = os.open(record, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "w") as f:
+                json.dump({"key": key, "reason": str(e).splitlines()[0],
+                           "when": time.strftime("%Y-%m-%dT%H:%M:%S%z")}, f, indent=2, sort_keys=True)
+                f.write("\n")
+        raise
+    if code == EXIT_OK:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(record)
+    return code
 
 
 def back_to_legacy(store, state, mode, card):
@@ -740,6 +795,8 @@ def main(argv=None):
     ap.add_argument("--macos-build", help="route 2: this macOS build")
     ap.add_argument("--collection", help="route 3: the installer's macOS collection tarball")
     ap.add_argument("--no-switch", action="store_true", help="collect and store only")
+    ap.add_argument("--at-boot", action="store_true",
+                    help="run: skip a Mac refused before for the same kernel and speakerguardd (the boot unit)")
     ap.add_argument("--force", action="store_true", help="recompile even if bound")
     ap.add_argument("--out", help="collect: the directory to write the bundle to (must not exist)")
     ap.add_argument("--store", default=STORE)
