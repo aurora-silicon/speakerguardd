@@ -25,10 +25,8 @@ const CANDIDATE_UPPER: f32 = 1.035_265;
 const REPLACE_GAIN: f64 = 0.82;
 const NOTCH_QUALITY: f64 = 6.0;
 const WET_SMOOTH_HZ: f64 = 5.0;
-/// The analyser makes its first decision once the history holds two
-/// decision blocks: the first boundary after reset passes without one.
-const WARMUP_DECISIONS: u32 = 1;
-
+/// The first complete analysis block produces the native narrow D1 bank.
+const WARMUP_DECISIONS: u32 = 0;
 /// One line found by a decision.
 #[derive(Clone, Copy, Default)]
 struct Candidate {
@@ -275,7 +273,6 @@ pub struct Run {
     threshold_shape: [Section; BANDS],
     tracks: Vec<Track>,
     release: f32,
-    /// Decision boundaries still to pass before the first decision.
     warmup: u32,
 }
 
@@ -622,21 +619,18 @@ mod tests {
     }
 
     #[test]
-    fn the_first_decision_waits_for_two_blocks() {
-        let p = Params { threshold_db: -20.0, ..Default::default() };
+    fn the_first_decision_uses_the_first_complete_block() {
+        let p = Params { threshold_db: -100.0, ..Default::default() };
         let mut r = Run::new(&p, 48_000.0, 1);
         let mut x = line(1000.0, 0.7, HOST_HOP);
         r.process(&mut [&mut x], HOST_HOP);
-        assert!(r.tracks.iter().all(|t| t.gain == 1.0));
-        assert!(r.bin_gains.iter().all(|g| *g == 1.0));
-        let mut x = line(1000.0, 0.7, HOST_HOP);
-        r.process(&mut [&mut x], HOST_HOP);
         assert!(r.tracks.iter().any(|t| t.gain < 1.0));
+        assert!(r.bin_gains.iter().any(|g| *g < 1.0));
     }
 
     #[test]
     fn every_over_threshold_cell_deepens_the_record_and_its_neighbours() {
-        let p = Params { threshold_db: -20.0, ..Default::default() };
+        let p = Params { threshold_db: -100.0, ..Default::default() };
         let mut r = Run::new(&p, 48_000.0, 1);
         let mut x = line(1000.0, 0.7, 2 * HOST_HOP);
         r.process(&mut [&mut x], 2 * HOST_HOP);
