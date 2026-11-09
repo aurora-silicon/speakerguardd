@@ -1689,6 +1689,8 @@ mod tests {
         let mut full: std::collections::BTreeMap<u32, f32> =
             (0..SLOT_BASE + SLOT_STRIDE * SLOTS).map(|id| (id, 0.0)).collect();
         full.insert(5, tone_filter::DEFAULT_SHELF_ORDER as f32);
+        // the current algorithm version unless a test asks for the first
+        full.insert(12, 1.0);
         for (id, v) in globals {
             full.insert(*id, *v);
         }
@@ -2125,6 +2127,23 @@ mod tests {
             v.extend([(o + 6, 1.0), (o + 7, at), (o + 8, g), (o + 9, f)]);
         }
         v
+    }
+
+    #[test]
+    fn algorithm_version_0_peaks_use_the_pole_quality_law() {
+        let fs = 48_000.0;
+        let mut d = Diagnostics::default();
+        let slot = [(1, [3.0, 1.0, 9.0, 1000.0, 1.3, 2.0, 3.0, 0.0])];
+        let p = part(&tmst(&[(12, 0.0)], &slot), 0, fs, &mut d).unwrap();
+        assert_eq!(p.sections, vec![tone_filter::legacy_peak(9.0, 1000.0, 1.3f32 as f64, fs)]);
+        let p = part(&tmst(&[(12, 1.0)], &slot), 0, fs, &mut d).unwrap();
+        assert_eq!(p.sections, vec![tone_filter::peak(9.0, 1000.0, 1.3f32 as f64, fs)]);
+        // the two laws differ: version 0 is narrower at +9 dB, Q 1.3
+        let mag = |s: &[sgv2_core::prestage::Section], f: f64| s[0].magnitude(f, fs);
+        let v0 = part(&tmst(&[(12, 0.0)], &slot), 0, fs, &mut d).unwrap().sections;
+        let v1 = part(&tmst(&[(12, 1.0)], &slot), 0, fs, &mut d).unwrap().sections;
+        assert!(mag(&v0, 600.0) < mag(&v1, 600.0));
+        assert!((mag(&v0, 1000.0) - mag(&v1, 1000.0)).abs() < 0.02);
     }
 
     #[test]
