@@ -2,7 +2,7 @@
 //! tuning and renders a stereo program into the unit's lanes.
 //!
 //! ```text
-//! voicing-render (--bundle PATH | --tunings-root DIR --aid N)
+//! voicing-render (--bundle PATH | --tunings-root DIR --aid N [--speaker-id N])
 //!     --in PROGRAM.f32 --out LANES.f32 [--mvsc S] [--mvol DB|auto]
 //! (`--mvol auto`: the dB the plugin derives from S with the artifact's volume law)
 //!     [--tap NODE=FILE.f32 ...] [--info FILE.json] [--block N] [--only NODE]
@@ -36,9 +36,11 @@ fn main() {
     let (mut root, mut aid, mut bundle, mut input, mut output, mut info) = (None, None, None, None, None, None);
     let (mut mvsc, mut mvol, mut block) = (1.0f64, 0.0f64, 512usize);
     let mut mvol_auto = false;
+    let mut ramp: Option<(f64, f64, usize, usize)> = None;
     let mut taps: Vec<(String, String)> = Vec::new();
     let mut only: Option<String> = None;
     let mut profile: Option<String> = None;
+    let mut speaker_id: Option<i128> = None;
     while let Some(a) = args.next() {
         let mut v = || args.next().expect("value");
         match a.as_str() {
@@ -54,8 +56,17 @@ fn main() {
                 x => mvol = x.parse().expect("mvol"),
             },
             "--block" => block = v().parse().expect("block"),
+            "--speaker-id" => speaker_id = Some(v().parse().expect("speaker id")),
             "--only" => only = Some(v()),
             "--profile" => profile = Some(v()),
+            // --mvsc-ramp TO:STEP:EVERY[:START]: from --mvsc, move the scalar by STEP toward TO every EVERY
+            // frames after frame START (a host volume slider moved slowly; mvol follows the artifact's law)
+            "--mvsc-ramp" => {
+                let s = v();
+                let p: Vec<f64> = s.split(':').map(|x| x.parse().expect("--mvsc-ramp TO:STEP:EVERY[:START]")).collect();
+                assert!(p.len() == 3 || p.len() == 4, "--mvsc-ramp TO:STEP:EVERY[:START]");
+                ramp = Some((p[0], p[1], p[2] as usize, p.get(3).map_or(0, |v| *v as usize)));
+            }
             "--tap" => {
                 let s = v();
                 let (n, f) = s.split_once('=').expect("--tap NODE=FILE");
@@ -71,12 +82,16 @@ fn main() {
     }
     .expect("bundle");
     let mut diags = Diagnostics::default();
-    let mut t = Tuning::load(&b, &Options::default(), &mut diags).unwrap_or_else(|e| panic!("load: {e}"));
+    let mut t = Tuning::load(&b, &Options { speaker_id, ..Options::default() }, &mut diags)
+        .unwrap_or_else(|e| panic!("load: {e}"));
     // Raw tuning roots have no installer manifest. Offline cross-OS rigs
     // supply the source build explicitly; production bundles carry it in
     // their manifest and therefore never consult this harness override.
     if t.macos_build.is_none() {
         t.macos_build = std::env::var("SGV2_MACOS_BUILD").ok();
+        if t.law_build.is_none() {
+            t.law_build = t.macos_build.clone();
+        }
     }
     let c = compile(&t, 48_000.0, &mut diags).unwrap_or_else(|e| {
         eprintln!("compile refused: {e}");
@@ -117,6 +132,7 @@ fn main() {
         mvol = c.spec.volume.db(mvsc);
         eprintln!("mvol auto: {:?} at mvsc {mvsc} -> {mvol} dB", c.spec.volume);
     }
+    let curve = c.spec.volume;
     let mut chain = Chain::new(c.spec, 48_000.0, block).expect("spec");
     chain.set_param(GraphParam::VolumeScalar, mvsc);
     chain.set_param(GraphParam::VolumeDb, mvol);
@@ -134,6 +150,13 @@ fn main() {
     let mut f = 0;
     while f < frames {
         let n = block.min(frames - f);
+        if let Some((to, step, every, start)) = ramp {
+            if every > 0 && f > start && (f - start) % every < n && (mvsc - to).abs() > 1e-12 {
+                mvsc = if to > mvsc { (mvsc + step).min(to) } else { (mvsc - step).max(to) };
+                chain.set_param(GraphParam::VolumeScalar, mvsc);
+                chain.set_param(GraphParam::VolumeDb, curve.db(mvsc));
+            }
+        }
         for (c, p) in prog.iter_mut().enumerate() {
             for i in 0..n {
                 p[i] = x[(f + i) * pc + c];

@@ -28,8 +28,10 @@ fn bad(message: impl Into<String>) -> Error {
     Error::format("voicing vben", message)
 }
 
+/// A saved dB gain as the box forms it: Float32 `exp(db * (ln 10 / 20))`.
 fn db(v: f64) -> f64 {
-    10f64.powf(v / 20.0)
+    let k = (core::f64::consts::LN_10 / 20.0) as f32;
+    f64::from((v as f32 * k).exp())
 }
 
 /// The public low-end blend control tops out at 0 dB. Saved readback can be
@@ -148,7 +150,9 @@ mod tests {
     fn blend_stops_at_the_public_zero_db_maximum() {
         assert_eq!(blend_gain(2.5), 1.0);
         assert_eq!(blend_gain(0.0), 1.0);
-        assert!((blend_gain(-6.0) - 10f64.powf(-6.0 / 20.0)).abs() < 1e-12);
+        assert!((blend_gain(-6.0) - 10f64.powf(-6.0 / 20.0)).abs() < 1e-7);
+        assert_eq!(blend_gain(0.0), 1.0);
+        assert_eq!(blend_gain(3.0), 1.0);
     }
 
     #[test]

@@ -68,21 +68,33 @@ fn tone(
     diags: &mut Diagnostics,
     gaps: &mut Vec<(String, String)>,
 ) -> Result<Kind> {
-    let (tone, partial) = crate::prestage::voicing_tone(stage, width, volume_wired, fs, diags)?;
+    // The box runs at its saved state either way. Without a volume wire its
+    // automation sits at the saved SystemVolume (parameter 3) for good:
+    // carrying it at the least-passing setting dropped the boosts of
+    // bypassed groups and cut where macOS does not (AID4 Tone3: 12-35 dB
+    // under macOS; black-box renders of the installed unit at its saved
+    // state).
+    let (tone, partial) = crate::prestage::voicing_tone(stage, width, true, fs, diags)?;
+    let tone = if volume_wired { tone } else { tone.at_volume(fs, saved_volume(stage)) };
     if !partial.is_empty() {
         gaps.push((
             stage.name.clone(),
             format!("tmst volume automation carried at its least-passing setting (entries {partial:?})"),
         ));
     }
-    if tone.dynamic.iter().any(|d| d.params.kind == sgv2_core::prestage::DynamicKind::Notch) {
-        gaps.push((
-            stage.name.clone(),
-            "level-dependent filters carry native multirate reconstruction and a knee-qualified release-to-idle carrier handoff; active-floor and release-tracking parity are pending"
-                .into(),
-        ));
-    }
+    // Level-dependent slots (types 15, 17, 18) run their saved detector,
+    // range, ratio, threshold and time law in the box at every level. They
+    // are not a compiler gap: whether a tuning's whole chain, these slots
+    // included, renders like macOS is what its parity attestation measures
+    // (`super::parity`), per tuning, against Apple's own units.
     Ok(Kind::Tone(tone))
+}
+
+/// The saved SystemVolume (parameter 3) of a filter box: where its volume
+/// automation sits when the graph does not drive it. A state without it
+/// reads as 0, the unit's default.
+fn saved_volume(stage: &Stage) -> f64 {
+    stage.state.as_ref().and_then(|s| s.global()).and_then(|g| g.get(3)).map(f64::from).unwrap_or(0.0)
 }
 
 /// A box of a carried type whose saved state the module cannot carry: a
@@ -122,12 +134,12 @@ fn compile_node(
             // detector, bandwidth behaviour); the pre-stage's interim
             // peak/hard-knee law tilted the whole chain against macOS
             // (2-3.5 dB under at 50-200 Hz, 0.5-2.5 dB over above 300 Hz)
-            "mstk" => match super::mstk::compile_for(stage, fs, t.macos_build.as_deref(), diags) {
+            "mstk" => match super::mstk::compile_for(stage, fs, t.law_build.as_deref(), diags) {
                 Ok(Some(p)) => Kind::Mstk(Box::new(p)),
                 Ok(None) => Kind::Bypass,
                 Err(e) => uncarried(n, subtype, e, gaps),
             },
-            "cfrk" => match super::cfreak::compile_for(stage, fs, t.macos_build.as_deref(), diags) {
+            "cfrk" => match super::cfreak::compile_for(stage, fs, t.law_build.as_deref(), diags) {
                 Ok(Some(p)) => Kind::Cfreak(Box::new(p)),
                 Ok(None) => Kind::Bypass,
                 Err(e) => uncarried(n, subtype, e, gaps),
@@ -226,10 +238,7 @@ fn controlled_tone(
         global.params.retain(|(id, _)| *id != 1);
         global.params.push((1, mask as f32));
         // Group switches are exact bypasses, independent of volume wiring.
-        let Kind::Tone(tone) = tone(&stage, width, true, fs, diags, gaps)? else { unreachable!() };
-        if !volume_wired && (!tone.automation.is_empty() || !tone.dynamic_automation.is_empty()) {
-            return Err(bad("group-controlled tone also needs an explicit volume wire"));
-        }
+        let Kind::Tone(tone) = tone(&stage, width, volume_wired, fs, diags, gaps)? else { unreachable!() };
         variants.push(sgv2_core::voicing::chain::ToneVariant { mask, tone });
     }
     Ok(Kind::ToneGroups { default_mask, variants })

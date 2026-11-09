@@ -25,6 +25,9 @@ typedef struct {
     int channels;
 } Feed;
 static Feed feed;
+// The property strip (`--propstrip`): the box's graph properties, set as
+// macOS sets them after the class info (AULowFlow's 6620 sidecar, say).
+static NSDictionary *property_strip;
 
 static OSStatus input_cb(void *ref, AudioUnitRenderActionFlags *flags,
                          const AudioTimeStamp *ts, UInt32 bus, UInt32 frames,
@@ -59,6 +62,42 @@ static NSDictionary *effect_named(NSDictionary *strip, NSString *wanted) {
     return nil;
 }
 
+static void apply_properties(AudioUnit au, NSString *wanted) {
+    if (!property_strip) return;
+    for (NSDictionary *box in property_strip[@"Boxes"]) {
+        if (![box[@"Name"] isEqualToString:wanted]) continue;
+        for (NSDictionary *p in box[@"Properties"]) {
+            UInt32 number = [p[@"Number"] unsignedIntValue];
+            OSStatus status = -1;
+            if (p[@"UInt32"]) {
+                UInt32 value = [p[@"UInt32"] unsignedIntValue];
+                status = AudioUnitSetProperty(au, number, kAudioUnitScope_Global, 0, &value, sizeof(value));
+            } else if (p[@"Float32"]) {
+                Float32 value = [p[@"Float32"] floatValue];
+                status = AudioUnitSetProperty(au, number, kAudioUnitScope_Global, 0, &value, sizeof(value));
+            } else if (p[@"Path"]) {
+                CFURLRef url = (__bridge CFURLRef)[NSURL fileURLWithPath:p[@"Path"]];
+                status = AudioUnitSetProperty(au, number, kAudioUnitScope_Global, 0, &url, sizeof(url));
+                if (status) {
+                    CFStringRef path = (__bridge CFStringRef)p[@"Path"];
+                    status = AudioUnitSetProperty(au, number, kAudioUnitScope_Global, 0, &path, sizeof(path));
+                }
+                if (status) {
+                    NSDictionary *contents = [NSDictionary dictionaryWithContentsOfFile:p[@"Path"]];
+                    if (contents) {
+                        CFDictionaryRef dict = (__bridge CFDictionaryRef)contents;
+                        status = AudioUnitSetProperty(au, number, kAudioUnitScope_Global, 0, &dict, sizeof(dict));
+                    }
+                }
+            }
+            if (status) {
+                fprintf(stderr, "FATAL %s property %u: %d\n", wanted.UTF8String, number, (int)status);
+                exit(1);
+            }
+        }
+    }
+}
+
 static AudioUnit instantiate(NSString *stage, NSDictionary *effect,
                              const char *subtype, const char *factory_name,
                              double sample_rate, int channels, int quantum) {
@@ -69,7 +108,23 @@ static AudioUnit instantiate(NSString *stage, NSDictionary *effect,
     AudioComponentDescription d = {
         kAudioUnitType_Effect, fcc(subtype), kAudioUnitManufacturer_Apple, 0, 0
     };
-    AudioComponent component = AudioComponentFindNext(NULL, &d);
+    // AUDIODSP_PATH: render another macOS build's units (its AudioDSP.component binary, read from that
+    // build's restore image) on this host, used directly (never looked up, so the installed
+    // units are never picked by mistake). Fails with the loader's message if the binary needs symbols
+    // this macOS does not have.
+    const char *alt = getenv("AUDIODSP_PATH");
+    AudioComponent alt_component = NULL;
+    if (alt && *alt) {
+        void *image = dlopen(alt, RTLD_NOW | RTLD_LOCAL);
+        if (!image) { fprintf(stderr, "AUDIODSP_PATH: %s\n", dlerror()); exit(1); }
+        AudioComponentFactoryFunction factory = (AudioComponentFactoryFunction)dlsym(image, factory_name);
+        if (!factory) { fprintf(stderr, "AUDIODSP_PATH: missing factory %s\n", factory_name); exit(1); }
+        Dl_info info = {0};
+        if (dladdr((const void *)factory, &info)) fprintf(stderr, "AUDIODSP_PATH: %s from %s\n", factory_name, info.dli_fname);
+        alt_component = AudioComponentRegister(&d, (__bridge CFStringRef)stage, 0x7fffffff, factory);
+        if (!alt_component) { fprintf(stderr, "AUDIODSP_PATH: register failed\n"); exit(1); }
+    }
+    AudioComponent component = alt_component ? alt_component : AudioComponentFindNext(NULL, &d);
     if (!component) {
         void *image = dlopen("/System/Library/Components/AudioDSP.component/Contents/MacOS/AudioDSP",
                             RTLD_NOW | RTLD_LOCAL);
@@ -91,6 +146,7 @@ static AudioUnit instantiate(NSString *stage, NSDictionary *effect,
                                         kAudioUnitScope_Global, 0,
                                         &preset, sizeof(preset)), "set class info");
     }
+    apply_properties(au, stage);
     UInt32 max_frames = quantum;
     fail_status(AudioUnitSetProperty(au, kAudioUnitProperty_MaximumFramesPerSlice,
                                     kAudioUnitScope_Global, 0,
@@ -154,6 +210,8 @@ int main(int argc, const char **argv) {
                    *meta_path = NULL, *stage_c = NULL,
                    *subtype_c = NULL, *factory_c = NULL;
         const char *sets[MAXSET] = {0};
+        const char *set_ats[MAXSET] = {0};
+        int set_at_count = 0;
         int set_count = 0, channels = 0, quantum = 512;
         double sample_rate = 48000.0;
         bool inventory_only = false, no_preset = false;
@@ -162,6 +220,10 @@ int main(int argc, const char **argv) {
 #define ARG(x) (!strcmp(a, x) && v && ++i)
             if (ARG("--strip")) strip_path = v;
             else if (ARG("--stage")) stage_c = v;
+            else if (ARG("--propstrip")) {
+                property_strip = [NSDictionary dictionaryWithContentsOfFile:@(v)];
+                if (!property_strip) { fprintf(stderr, "bad property strip: %s\n", v); return 1; }
+            }
             else if (ARG("--subtype")) subtype_c = v;
             else if (ARG("--factory")) factory_c = v;
             else if (ARG("--in")) input_path = v;
@@ -171,6 +233,7 @@ int main(int argc, const char **argv) {
             else if (ARG("--q")) quantum = atoi(v);
             else if (ARG("--sr")) sample_rate = atof(v);
             else if (ARG("--set") && set_count < MAXSET) sets[set_count++] = v;
+            else if (ARG("--set-at") && set_at_count < MAXSET) set_ats[set_at_count++] = v;
             else if (!strcmp(a, "--inventory")) inventory_only = true;
             else if (!strcmp(a, "--no-preset")) no_preset = true;
             else { fprintf(stderr, "bad arg: %s\n", a); return 2; }
@@ -180,7 +243,7 @@ int main(int argc, const char **argv) {
             (!inventory_only && (!input_path || !output_path))) {
             fprintf(stderr, "usage: box_host --strip FILE --stage NAME --subtype XXXX --factory NAME "
                     "--channels N --meta FILE [--inventory] [--in FILE --out FILE] "
-                    "[--set ID=VALUE] [--q N] [--sr HZ]\n");
+                    "[--set ID=VALUE] [--set-at FRAME:ID=VALUE] [--propstrip FILE] [--q N] [--sr HZ]\n");
             return 2;
         }
 
@@ -233,6 +296,17 @@ int main(int argc, const char **argv) {
                     abl->mBuffers[c].mNumberChannels = 1;
                     abl->mBuffers[c].mData = planar_out[c];
                     abl->mBuffers[c].mDataByteSize = (UInt32)got * sizeof(float);
+                }
+                // --set-at FRAME:ID=VALUE: a run-time parameter change before the
+                // host slice that starts at or after FRAME (a host volume move).
+                for (int k = 0; k < set_at_count; ++k) {
+                    char *end = NULL;
+                    unsigned long long at = strtoull(set_ats[k], &end, 0);
+                    if (!end || *end != ':' || at < frame_count || at >= frame_count + got) continue;
+                    unsigned long pid = strtoul(end + 1, &end, 0);
+                    if (!end || *end != '=') { fprintf(stderr, "bad --set-at: %s\n", set_ats[k]); return 2; }
+                    fail_status(AudioUnitSetParameter(au, (AudioUnitParameterID)pid, kAudioUnitScope_Global, 0,
+                                                      strtof(end + 1, NULL), 0), "set parameter at");
                 }
                 AudioTimeStamp ts = {.mSampleTime = (Float64)frame_count,
                                      .mFlags = kAudioTimeStampSampleTimeValid};

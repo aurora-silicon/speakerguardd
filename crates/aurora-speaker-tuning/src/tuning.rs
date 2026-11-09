@@ -150,6 +150,10 @@ pub struct Tuning {
     pub aid: String,
     pub acoustic_id: u32,
     pub macos_build: Option<String>,
+    /// The build whose laws compile this tuning and whose parity block
+    /// checks it: the reference (25G83) when the speaker files equal
+    /// 25G83's, else `macos_build` ([`crate::reference`]).
+    pub law_build: Option<String>,
     /// The collecting Mac's board and unit ID, from the manifest
     /// ([`crate::manifest::Manifest::board`], [`crate::manifest::Manifest::unit_id`]).
     pub board: Option<String>,
@@ -536,6 +540,7 @@ impl Tuning {
             aid: b.manifest.aid.clone(),
             acoustic_id: b.manifest.acoustic_id,
             macos_build: b.manifest.macos_build.clone(),
+            law_build: crate::reference::law_build(&b.manifest.aid, &b.files, b.manifest.macos_build.as_deref()),
             board: b.manifest.board.clone(),
             unit_id: b.manifest.unit_id.clone(),
             verified: b.verified,

@@ -25,8 +25,9 @@
 //! For a full ToneMeister box, `--voicing-chain --tone-volume V` drives
 //! parameter 3 and compiles its slot automation. Supply the value at that
 //! box input, including any upstream relay's effect; this isolated render
-//! does not run the graph's other boxes. Without `--tone-volume`, it keeps
-//! the unwired pre-stage's least-passing settings.
+//! does not run the graph's other boxes. Without `--tone-volume`, it runs
+//! the box as an unwired box runs: its automation held at the saved
+//! SystemVolume.
 //!
 //! `--set ID=VALUE` (repeatable) overrides one saved global parameter of the
 //! box before it is compiled, as the macOS side of the rig sets the
@@ -53,8 +54,19 @@ pub(crate) fn tone_spec(
     volume: Option<f64>,
     diags: &mut Diagnostics,
 ) -> aurora_speaker_tuning::Result<Spec> {
-    let (tone, partial) = prestage::voicing_tone(stage, ch, volume.is_some(), fs, diags)?;
-    if !partial.is_empty() {
+    // As the full-chain compiler: the saved state, and without a volume
+    // input the automation held at the saved SystemVolume.
+    let (tone, partial) = prestage::voicing_tone(stage, ch, true, fs, diags)?;
+    let tone = if volume.is_some() {
+        tone
+    } else {
+        let saved = stage.state.as_ref().and_then(|s| s.global()).and_then(|g| g.get(3)).map(f64::from).unwrap_or(0.0);
+        tone.at_volume(fs, saved)
+    };
+    // Like the full-chain compiler, an unwired box carries the entries the
+    // chain cannot follow at their least-passing setting; with an explicit
+    // volume input they would have to move, so the rig refuses them.
+    if volume.is_some() && !partial.is_empty() {
         return Err(aurora_speaker_tuning::Error::format(
             "isolated Tone chain",
             format!("volume automation entries carried only in part: {partial:?}"),
@@ -382,7 +394,7 @@ fn main() {
                 at += k;
             }
         }
-        "cfrk" | "vben" | "axtc" | "vrq2" | "ldnm" | "pchr" | "volt" => {
+        "cfrk" | "vben" | "axtc" | "vrq2" | "ldnm" | "pchr" | "volt" | "buzk" => {
             // Use the production compiler and runner, without compiling unrelated
             // graph nodes. A module refusal must never turn into a bypass here.
             macro_rules! kind {
@@ -411,6 +423,7 @@ fn main() {
                 "ldnm" => kind!(norm, Norm),
                 "pchr" => kind!(pchr, Pchr),
                 "volt" => kind!(volt, Volt),
+                "buzk" => kind!(buzz, Buzz),
                 _ => unreachable!(),
             };
             let spec = Spec {

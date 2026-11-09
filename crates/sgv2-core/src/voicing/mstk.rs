@@ -1041,17 +1041,26 @@ fn detector_factors(p: &Params) -> [usize; BANDS] {
 /// qualities 0 and 2 before its eight-frame pick. Consequently a quality-1
 /// 150 Hz edge at 48 kHz selects factors 1/8/15/23 for effective orders
 /// 4/8/10/12. The transition to factor 15 is exactly where the Butterworth
-/// half first needs section index 2.
+/// half first needs section index 2. Algorithm zero instead budgets with
+/// half the truncated order control, which is fractional for odd orders.
 fn band_zero_factor(p: &Params, fs: f64) -> usize {
     let automated_pick = p.selected_rate_band_zero && cadence(p) == Cadence::PickEight && p.algorithm >= 3;
     if (!automated_pick && p.algorithm != 0) || p.band[0].mode != BandMode::Active {
         return 1;
     }
     let half_order = if automated_pick {
-        effective_order(p.crossover_order[0]) / 2
+        (effective_order(p.crossover_order[0]) / 2) as f64
     } else {
-        (libm::ceil(p.crossover_order[0] * 0.5) as usize).max(1)
-    } as f64;
+        // Half of the saved order control (truncated), not of the even
+        // Linkwitz-Riley order the bank runs: an order-3 edge budgets a
+        // 9 dB/octave slope and so selects a higher band-zero rate than
+        // order 4. Black-box (installed unit, algorithm 0, every quality):
+        // rounding odd orders up held a loud bass onset 4-5 dB over the
+        // unit's for about 20 ms; with this half every probe window over
+        // orders 2-11, fractional controls and edges 100-900 Hz matches
+        // within 0.003 dB.
+        libm::floor(p.crossover_order[0].clamp(2.0, 20.0)) * 0.5
+    };
     let edge = p.crossover_hz[0].min(p.crossover_hz[1] / 1.25).min(p.crossover_hz[2] / (1.25 * 1.25));
     let budget = if automated_pick {
         if p.render_quality == 1 {
@@ -1970,6 +1979,54 @@ mod tests {
         assert_eq!(band_zero_factor(&p, 48_000.0), 11);
         p.algorithm = 2;
         assert_eq!(band_zero_factor(&p, 48_000.0), 1);
+    }
+
+    #[test]
+    fn algorithm_zero_band_rate_budgets_the_truncated_order_control() {
+        // Odd and fractional controls keep their own slope in the budget
+        // (half of the truncated control), although the bank runs the next
+        // even Linkwitz-Riley order.
+        let mut p = params();
+        p.algorithm = 0;
+        p.render_quality = 1;
+        p.crossover_hz = [250.0, 6000.0, 16_000.0];
+        for (order, expected) in
+            [(2.0, 1), (2.5, 1), (3.0, 2), (3.5, 2), (4.0, 5), (4.5, 5), (5.0, 9), (7.0, 18), (9.0, 26)]
+        {
+            p.crossover_order[0] = order;
+            assert_eq!(band_zero_factor(&p, 48_000.0), expected, "order {order}");
+        }
+        assert_eq!(effective_order(3.0), effective_order(4.0));
+    }
+
+    #[test]
+    fn algorithm_zero_odd_edge_catches_the_onset_sooner() {
+        // A loud low tone after silence through an order-3 lowest edge (an
+        // order-4 bank with a faster band-zero rate): the steady level is
+        // that of order 4, while the faster rate catches the onset sooner
+        // and so passes clearly less level in the first 20 ms.
+        let fs = 48_000.0;
+        let mut p = params();
+        p.algorithm = 0;
+        p.render_quality = 1;
+        p.crossover_hz = [250.0, 1350.0, 6800.0];
+        p.input_gain_db = 0.0;
+        p.output_gain_db = 0.0;
+        let render = |order: f64| {
+            let mut q = p;
+            q.crossover_order = [order, order, 4.0];
+            let mut run = Run::new(&q, fs, 1);
+            let mut x = std::vec![0.0f32; 4800];
+            x.extend(tone(125.0, 0.5, 24_000));
+            run.process(&mut [&mut x[..]], 28_800);
+            x
+        };
+        let rms = |x: &[f32]| libm::sqrt(x.iter().map(|v| f64::from(*v) * f64::from(*v)).sum::<f64>() / x.len() as f64);
+        let (odd, even) = (render(3.0), render(4.0));
+        let onset = 20.0 * libm::log10(rms(&odd[4800..5760]) / rms(&even[4800..5760]));
+        let steady = 20.0 * libm::log10(rms(&odd[19_200..]) / rms(&even[19_200..]));
+        assert!(steady.abs() < 0.05, "steady {steady}");
+        assert!(onset < -0.5, "onset {onset}");
     }
 
     #[test]

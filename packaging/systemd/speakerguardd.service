@@ -22,6 +22,12 @@ ConditionPathExists=/proc/device-tree/compatible
 Type=notify
 # Only on a board the fleet gate places on v2, with the v2 kernel interface.
 ExecCondition=/usr/libexec/speakerguardd/speakerguardd-gate v2
+# A dual kernel ("Speaker Protection Interface", linux 98cb6a86 and later)
+# starts every boot on "Speaker Volume Unlock": on a Mac aurora-speaker-
+# upgrade switched to v2, put it on the lease right before the supervisor
+# takes it (the kernel goes back to the volume lock 30 s after the last
+# owner closes, so this runs on every start). A no-op on other kernels.
+ExecStartPre=/usr/libexec/speakerguardd/speakerguardd-gate interface
 # Written by speakerguardd-provision: SGV2_ARGS="--card <ID> --pcm <D>
 # --uid <UID> --params <blob>", the seat user's uid resolved by name.
 # Optional ("-"), so that on a board or kernel the gate skips, the unit is
@@ -35,14 +41,15 @@ Restart=on-failure
 # loop still ends in the unit's start limit, at the floor.
 RestartSec=100ms
 RestartPreventExitStatus=78
-# Only restarts a hung supervisor: a stall itself is caught by the kernel,
-# whose 30 ms lease floors the amps when it is not renewed. systemd's clock
-# keeps running while userspace is frozen for a sleep (the device suspend
-# and resume take 1.5-2.6 s here, and pm_test adds 5 s), and a 1 s
-# watchdog killed the supervisor at every thaw of a sleep entered without
-# speakerguardd-sleep.service (a direct write to /sys/power/state); its
-# owner then died while the amps resumed.
-WatchdogSec=10s
+# A stall itself is caught by the kernel, whose 30 ms lease floors the amps
+# when it is not renewed. A hung supervisor is aborted by its own hang watch
+# after 10 s, which does not count a system sleep: systemd's watchdog clock
+# keeps running while userspace is frozen (the freezer, device suspend and
+# resume, a pm_test delay), so a frozen supervisor looked hung at every thaw
+# of a sleep entered without speakerguardd-sleep.service (a direct write to
+# /sys/power/state). systemd's watchdog stays only as the last resort for a
+# wedged process, far above any freeze.
+WatchdogSec=10min
 RuntimeDirectory=speakerguardd
 RuntimeDirectoryMode=0755
 # Kept over every stop and start, not only an automatic restart: the plugin

@@ -5,6 +5,7 @@ with a stand-in tuning reader, device tree and speaker card.
     python3 -I packaging/session/test_provision.py
 """
 import contextlib
+import glob
 import hashlib
 import importlib.machinery
 import importlib.util
@@ -788,6 +789,52 @@ class LV2Shadow(unittest.TestCase):
     def test_system_dirs_are_the_packaged_ones(self):
         self.assertEqual(self.scan(environ={"LV2_PATH": "/usr/lib64/lv2:/usr/lib/lv2"}), [])
 
+class Umask(Base):
+    def test_graph_dirs_are_readable_whatever_the_callers_umask(self):
+        """RC8 E2E B4: aurora-speaker-upgrade runs with umask 077; the graph
+        directories it made were 0700 and the seat user's session could not
+        read them, so v2 never granted in the same boot."""
+        import stat
+        shutil.rmtree(self.p.graph, ignore_errors=True)
+        old = os.umask(0o077)
+        try:
+            prov.write_raw_rules(self.p, "AppleJ316")
+        finally:
+            os.umask(old)
+        for d in (self.p.graph, self.p.raw):
+            self.assertEqual(stat.S_IMODE(os.stat(d).st_mode), 0o755, d)
+
+
+    def test_the_blob_from_the_macs_own_tuning_stays_root_only(self):
+        """The graph directories open up for the session; the compiled blob
+        at rest does not, under the units' umask or the upgrade tool's."""
+        import stat
+        for mask in (0o022, 0o077):
+            old = os.umask(mask)
+            try:
+                self.assertEqual(self.run_(force=True), 0)
+            finally:
+                os.umask(old)
+            self.assertEqual(stat.S_IMODE(os.stat(self.p.params).st_mode), 0o600, oct(mask))
+
+
+class Deactivate(Base):
+    def test_revert_removes_the_v2_graph(self):
+        os.makedirs(os.path.join(self.p.graph, "pipewire"), exist_ok=True)
+        f = os.path.join(self.p.graph, "pipewire", "sgv2-j316.conf")
+        prov.write_atomic(f, "context.modules = []\n")
+        prov.write_atomic(self.p.graph_state, "result=pass\nuser=ryan\n")
+        prov.write_raw_rules(self.p, "AppleJ316")
+        raw = glob.glob(os.path.join(self.p.raw, "*.conf"))
+        self.assertTrue(raw)
+        a = types.SimpleNamespace(graph_unit="speakerguardd-graph.service")
+        self.assertEqual(prov.cmd_deactivate(a, self.p), 0)
+        self.assertFalse(os.path.exists(f))
+        self.assertFalse(any(os.path.exists(r) for r in raw))
+        self.assertFalse(os.path.exists(os.path.join(self.p.graph, "speakerguardd-owns-speakers")))
+        self.assertEqual(prov.read_kv(self.p.graph_state)["result"], "legacy")
+
+
 class Gate(Base):
     def decide(self, iface="v2", gate_data=None, cmd="v2"):
         g = os.path.join(self.t, "gate.json")
@@ -795,8 +842,13 @@ class Gate(Base):
             json.dump(GATE if gate_data is None else gate_data, f)
         self.patch(gate, "kernel_interface", lambda wait: (iface, "AppleX") if iface else (None, None))
         self.patch(gate, "PROVISION_CONF", os.path.join(self.t, "provision.conf"))
-        a = types.SimpleNamespace(gate=g, dt=self.dt, tuning_cli=self.cli, wait=0, state=self.p.state, cmd=cmd)
+        # the gate runs as root on a Mac (ExecCondition=+...); no waits here
+        self.patch(gate, "privileged", lambda: True)
+        self.patch(gate, "STABLE_WAIT_S", 0)
+        a = types.SimpleNamespace(gate=g, dt=self.dt, tuning_cli=self.cli, wait=0, state=self.p.state, cmd=cmd,
+                                  setting=os.path.join(self.t, "upgrade-interface"))
         v2, legacy, why = gate.decide(a)
+        self.why = why
         self.assertFalse(v2 and legacy, why)
         return v2, legacy
 
@@ -832,6 +884,130 @@ class Gate(Base):
         with open(self.p.params, "ab") as f:
             f.write(b"new-blob")
         self.assertEqual(self.decide(), (False, False))
+
+    def test_kernel_interface_reads_the_selector(self):
+        self.patch(gate, "speaker_card", lambda: "AppleX")
+        for controls, want in (({"Speaker Protection Interface", "Speaker Protection"}, "dual"),
+                               ({"Speaker Protection"}, "v2"), (set(), "legacy")):
+            self.patch(gate, "has_control", lambda card, name, c=controls: name in c)
+            self.assertEqual(gate.kernel_interface(0), (want, "AppleX"))
+        self.patch(gate, "has_control", lambda card, name: None)
+        self.assertEqual(gate.kernel_interface(0), (None, "AppleX"))
+
+    def test_dual_kernel_runs_v2_only_after_the_upgrade_switched(self):
+        # linux#1279: "Speaker Protection Interface" serves both interfaces,
+        # the volume lock by default; v2 needs the upgrade's setting too
+        self.board("j999")
+        self.ctl({"board": "j999"})
+        self.assertEqual(self.run_(), 0)
+        self.checked()
+        setting = os.path.join(self.t, "upgrade-interface")
+        self.assertEqual(self.decide("dual"), (False, True))
+        with open(setting, "w") as f:
+            f.write("legacy\n")
+        self.assertEqual(self.decide("dual"), (False, True))
+        with open(setting, "w") as f:
+            f.write("v2\n")
+        self.assertEqual(self.decide("dual"), (True, False))
+        # a failing proof on a dual kernel keeps the older daemons, never the floor
+        self.checked(result="fail")
+        self.assertEqual(self.decide("dual"), (False, True))
+        # the v2-only kernel is unchanged
+        self.assertEqual(self.decide("v2"), (False, False))
+        os.unlink(setting)
+
+    def test_dual_kernel_switched_mac_waits_for_its_switch_test(self):
+        """A switched Mac on a kernel its switch test has not run on: neither
+        daemon (no older daemon holding the volume lock the test takes); a
+        failed test sends it back to the older daemons."""
+        setting = os.path.join(self.t, "upgrade-interface")
+        self.board("j999")
+        self.ctl({"board": "j999"})
+        self.assertEqual(self.run_(), 0)
+        with open(setting, "w") as f:
+            f.write("v2\n")
+        self.checked(kernel="another-kernel")
+        self.assertEqual(self.decide("dual"), (False, False))
+        self.assertEqual(self.decide("dual", cmd="prepare"), (True, False))
+        self.checked(result="fail")
+        self.assertEqual(self.decide("dual"), (False, True))
+        self.checked()
+        self.assertEqual(self.decide("dual"), (True, False))
+        os.unlink(setting)
+        self.checked(kernel="another-kernel")
+        self.assertEqual(self.decide("dual"), (False, True))
+
+    def test_dual_kernel_refused_board_keeps_the_older_daemons(self):
+        with open(os.path.join(self.t, "upgrade-interface"), "w") as f:
+            f.write("v2\n")
+        self.board("j999")
+        self.ctl({"board": "j999", "refusals": [{"code": "synthetic-refusal"}]})
+        self.assertEqual(self.run_(), 1)
+        self.assertEqual(self.decide("dual"), (False, True))
+        self.assertEqual(self.decide("v2"), (False, False))
+
+    def test_switched_mac_never_gets_legacy_on_a_transient_answer(self):
+        """RC8 E2E B1: as speakersafetyd's DynamicUser the gate could not read
+        the root-only store and started legacy on a switched Mac. A switched
+        Mac on a dual kernel starts the older daemons only on a stable,
+        definite refusal; an unreadable setting starts nothing."""
+        setting = os.path.join(self.t, "upgrade-interface")
+        self.board("j999")
+        self.ctl({"board": "j999"})
+        self.assertEqual(self.run_(), 0)
+        self.checked()
+        with open(setting, "w") as f:
+            f.write("v2\n")
+        self.assertEqual(self.decide("dual", cmd="legacy"), (True, False))
+        calls = []
+        real = gate.tuning_units
+
+        def flaky(cli, conf=None):
+            calls.append(1)
+            if len(calls) == 1:
+                raise PermissionError(13, "Permission denied", "/var/lib/aurora-speaker-upgrade/bundle")
+            return real(cli, conf)
+        self.patch(gate, "tuning_units", flaky)
+        self.assertEqual(self.decide("dual", cmd="legacy"), (True, False))
+        self.assertEqual(len(calls), 2, "asked again")
+
+        def broken(cli, conf=None):
+            raise PermissionError(13, "Permission denied", "/var/lib/aurora-speaker-upgrade/bundle")
+        self.patch(gate, "tuning_units", broken)
+        self.assertEqual(self.decide("dual", cmd="legacy"), (False, False))
+        self.assertIn("not starting the older daemons", self.why)
+        # not root: an unreadable store is not an answer
+        self.patch(gate, "tuning_units", real)
+        self.patch(gate, "privileged", lambda: False)
+        os.chmod(setting, 0)
+        try:
+            if os.geteuid() != 0:
+                self.assertEqual(gate.upgrade_setting(setting), "unreadable")
+        finally:
+            os.chmod(setting, 0o600)
+
+    def test_interface_switches_only_dual_and_upgraded(self):
+        sets = []
+        state = {"iface": "dual"}
+        setting = os.path.join(self.t, "upgrade-interface")
+        self.patch(gate, "kernel_interface", lambda wait: (state["iface"], "AppleX"))
+        self.patch(gate.wiring, "interface_lease", lambda card: sets.append(card) or True)
+        a = types.SimpleNamespace(wait=0, setting=setting)
+        self.assertEqual(gate.interface(a), 0)
+        self.assertEqual(sets, [])
+        with open(setting, "w") as f:
+            f.write("v2\n")
+        self.assertEqual(gate.interface(a), 0)
+        self.assertEqual(sets, ["AppleX"])
+        state["iface"] = "v2"
+        self.assertEqual(gate.interface(a), 0)
+        self.assertEqual(sets, ["AppleX"])
+        state["iface"] = "dual"
+
+        def refuse(card):
+            raise gate.wiring.Refused("-EIO")
+        self.patch(gate.wiring, "interface_lease", refuse)
+        self.assertEqual(gate.interface(a), 1)
 
     def test_unlisted_board_silent_check_and_full_voicing_generation(self):
         import gen
@@ -1088,7 +1264,7 @@ class Units(unittest.TestCase):
                 if l.startswith(("ExecStart=", "ExecStartPost=", "ExecStop=", "ExecStopPost=", "ExecCondition=")):
                     self.assertTrue(l.split("=", 1)[1].startswith("/usr/libexec/speakerguardd/"), l)
         self.assertIn("Before=pipewire.service wireplumber.service", self.unit("speakerguardd-graph.service"))
-        self.assertIn("ExecCondition=/usr/libexec/speakerguardd/speakerguardd-gate legacy", self.unit("legacy-gate.conf"))
+        self.assertIn("ExecCondition=+/usr/libexec/speakerguardd/speakerguardd-gate legacy", self.unit("legacy-gate.conf"))
         for u in (sup, chk, prv, swt):
             self.assertFalse([l for l in u if l.startswith(("OnFailure=", "OnSuccess="))])
         # A unit the gate skips must not fail first on the configuration that

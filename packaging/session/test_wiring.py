@@ -503,7 +503,7 @@ class RestoreCommand(unittest.TestCase):
                 state["stopped"] = True
 
         class Control:
-            def __init__(self, idx):
+            def __init__(self, idx, switch=False):
                 pass
 
             def close(self):
@@ -946,8 +946,16 @@ class Describe(unittest.TestCase):
         # the kernel binds the first compatible it knows
         c = self.describe(self.hw(cpu=("apple,t6041-aop-audio", "apple,t6030-aop-audio")))
         self.assertEqual((c["transport"], c["speaker_format"], c["sense_batch"], c["speaker_headroom"]), ("aop-spkr", "S24_32LE", False, 256))
+        # the T6040 speaker service's ADMAC raises a period interrupt per period (SINKGAP 11-09): no timer scheduling
+        self.assertTrue(c["speaker_irq"])
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "pipewire", "sgv2-j616.conf")) as f:
+            self.assertIn("api.alsa.disable-tsched = true", f.read())
         c = self.describe(self.hw(cpu=("vendor,new-dai", "apple,t8140-aop-audio")))
         self.assertEqual((c["transport"], c["speaker_format"]), ("aop-t8140", "S32LE"))
+        # the T8140 speaker DMA raises a period interrupt per period (SINKGAP 11-09): no timer scheduling
+        self.assertTrue(c["speaker_irq"])
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "pipewire", "sgv2-j700.conf")) as f:
+            self.assertIn("api.alsa.disable-tsched = true", f.read())
 
     def test_the_card_id_is_macaudios(self):
         self.assertEqual(wiring.card_id({"model": "Test Mac J999"}), "AppleJ999")
@@ -1103,7 +1111,7 @@ class Deferral(unittest.TestCase):
         self.desc = wiring.describe(self.hw, self.w)
 
     def run_sc(self, *argv, kernel="7.3.0-test"):
-        def active(idx, card, w, report):
+        def active(idx, card, w, report, args=None):
             self.calls.append("active")
             return list(self.hw_errs)
 
