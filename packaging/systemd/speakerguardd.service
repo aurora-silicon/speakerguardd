@@ -41,18 +41,15 @@ Restart=on-failure
 # loop still ends in the unit's start limit, at the floor.
 RestartSec=100ms
 RestartPreventExitStatus=78
-# Only restarts a hung supervisor: a stall itself is caught by the kernel,
-# whose 30 ms lease floors the amps when it is not renewed. systemd's clock
-# keeps running while userspace is frozen for a sleep (the device suspend
-# and resume take 1.5-2.6 s here, and pm_test adds 5 s), and a 1 s
-# watchdog killed the supervisor at every thaw of a sleep entered without
-# speakerguardd-sleep.service (a direct write to /sys/power/state); its
-# owner then died while the amps resumed. 10 s was not enough either: an M2
-# device suspend with a Thunderbolt link up took 11.2 s, and a pm_test
-# cycle adds 5 s on top. 30 s covers both with margin. The watchdog only
-# restarts a hung supervisor; a longer one never lets a stall play on,
-# because the kernel lease floors the amps 30 ms after its last renewal.
-WatchdogSec=30s
+# A stall itself is caught by the kernel, whose 30 ms lease floors the amps
+# when it is not renewed. A hung supervisor is aborted by its own hang watch
+# after 10 s, which does not count a system sleep: systemd's watchdog clock
+# keeps running while userspace is frozen (the freezer, device suspend and
+# resume, a pm_test delay), so a frozen supervisor looked hung at every thaw
+# of a sleep entered without speakerguardd-sleep.service (a direct write to
+# /sys/power/state). systemd's watchdog stays only as the last resort for a
+# wedged process, far above any freeze.
+WatchdogSec=10min
 RuntimeDirectory=speakerguardd
 RuntimeDirectoryMode=0755
 # Kept over every stop and start, not only an automatic restart: the plugin
