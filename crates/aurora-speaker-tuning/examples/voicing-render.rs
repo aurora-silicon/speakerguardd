@@ -36,6 +36,7 @@ fn main() {
     let (mut root, mut aid, mut bundle, mut input, mut output, mut info) = (None, None, None, None, None, None);
     let (mut mvsc, mut mvol, mut block) = (1.0f64, 0.0f64, 512usize);
     let mut mvol_auto = false;
+    let mut ramp: Option<(f64, f64, usize)> = None;
     let mut taps: Vec<(String, String)> = Vec::new();
     let mut only: Option<String> = None;
     let mut profile: Option<String> = None;
@@ -58,6 +59,14 @@ fn main() {
             "--speaker-id" => speaker_id = Some(v().parse().expect("speaker id")),
             "--only" => only = Some(v()),
             "--profile" => profile = Some(v()),
+            // --mvsc-ramp TO:STEP:EVERY: from --mvsc, move the scalar by STEP toward TO every EVERY frames
+            // (a host volume slider moved slowly; mvol follows the artifact's law)
+            "--mvsc-ramp" => {
+                let s = v();
+                let p: Vec<f64> = s.split(':').map(|x| x.parse().expect("--mvsc-ramp TO:STEP:EVERY")).collect();
+                assert_eq!(p.len(), 3, "--mvsc-ramp TO:STEP:EVERY");
+                ramp = Some((p[0], p[1], p[2] as usize));
+            }
             "--tap" => {
                 let s = v();
                 let (n, f) = s.split_once('=').expect("--tap NODE=FILE");
@@ -120,6 +129,7 @@ fn main() {
         mvol = c.spec.volume.db(mvsc);
         eprintln!("mvol auto: {:?} at mvsc {mvsc} -> {mvol} dB", c.spec.volume);
     }
+    let curve = c.spec.volume.clone();
     let mut chain = Chain::new(c.spec, 48_000.0, block).expect("spec");
     chain.set_param(GraphParam::VolumeScalar, mvsc);
     chain.set_param(GraphParam::VolumeDb, mvol);
@@ -137,6 +147,13 @@ fn main() {
     let mut f = 0;
     while f < frames {
         let n = block.min(frames - f);
+        if let Some((to, step, every)) = ramp {
+            if every > 0 && f > 0 && f % every < n && (mvsc - to).abs() > 1e-12 {
+                mvsc = if to > mvsc { (mvsc + step).min(to) } else { (mvsc - step).max(to) };
+                chain.set_param(GraphParam::VolumeScalar, mvsc);
+                chain.set_param(GraphParam::VolumeDb, curve.db(mvsc));
+            }
+        }
         for (c, p) in prog.iter_mut().enumerate() {
             for i in 0..n {
                 p[i] = x[(f + i) * pc + c];
