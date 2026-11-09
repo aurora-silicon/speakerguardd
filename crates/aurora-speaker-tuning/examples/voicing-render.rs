@@ -89,6 +89,9 @@ fn main() {
     // their manifest and therefore never consult this harness override.
     if t.macos_build.is_none() {
         t.macos_build = std::env::var("SGV2_MACOS_BUILD").ok();
+        if t.law_build.is_none() {
+            t.law_build = t.macos_build.clone();
+        }
     }
     let c = compile(&t, 48_000.0, &mut diags).unwrap_or_else(|e| {
         eprintln!("compile refused: {e}");
