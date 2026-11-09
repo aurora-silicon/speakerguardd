@@ -121,13 +121,27 @@ def speaker_card(sysfs="/sys/class/sound"):
 
 
 def upgrade_setting(path=None):
-    """The upgrade's persistent interface choice ("v2", or None)."""
+    """The upgrade's persistent interface choice: "v2", None (not switched),
+    or "unreadable" (it exists but this process may not read it: the
+    store is root only, so a gate not running as root cannot know)."""
+    path = path or UPGRADE_SETTING
     try:
-        with open(path or UPGRADE_SETTING) as f:
+        with open(path) as f:
             v = f.read().strip()
-    except OSError:
+    except FileNotFoundError:
         return None
+    except PermissionError:
+        return "unreadable"
+    except OSError:
+        return "unreadable" if os.path.lexists(os.path.dirname(path)) else None
     return v if v == "v2" else None
+
+
+# A switched Mac on a dual kernel: how often, and how far apart, the gate
+# asks again before it would start an older daemon. One transient answer
+# must not hand the sense PCM to speakersafetyd for the whole boot.
+STABLE_TRIES = 4
+STABLE_WAIT_S = 0.5
 
 
 def has_control(card, name):
@@ -199,12 +213,45 @@ def interface(args):
 
 
 def decide(args):
-    """(v2 runs, legacy runs, reason)."""
+    """(v2 runs, legacy runs, reason). On a dual kernel a Mac the upgrade
+    switched to v2 gets the older daemons only on a stable, definite
+    refusal: the gate asks again (STABLE_TRIES), and an answer that only
+    says the check could not run (an unreadable file, a timeout, a gate not
+    running as root) never starts them; the volume lock's ceiling holds."""
+    setting = upgrade_setting(getattr(args, "setting", None))
+    if setting == "unreadable":
+        return False, False, (f"cannot read the upgrade's setting {getattr(args, 'setting', None) or UPGRADE_SETTING} "
+                              f"as uid {os.geteuid()} (the gate must run as root, ExecCondition=+...): starting nothing")
+    for attempt in range(STABLE_TRIES):
+        v2, legacy, why, info = _decide(args)
+        if not (legacy and info.get("dual") and setting == "v2"):
+            return v2, legacy, why
+        if attempt + 1 < STABLE_TRIES:
+            log(f"switched to v2, but: {why}; asking again in {STABLE_WAIT_S} s")
+            time.sleep(STABLE_WAIT_S)
+    if not info.get("definite"):
+        return False, False, (f"{why} [after {STABLE_TRIES} tries]; the upgrade switched this Mac to v2 and nothing "
+                              "says v2 cannot run, only that the check could not: not starting the older daemons, "
+                              "the volume lock holds the speakers at its ceiling")
+    return v2, legacy, why
+
+
+def privileged():
+    return os.geteuid() == 0
+
+
+def _info(iface, definite):
+    return {"dual": iface == "dual", "definite": definite}
+
+
+def _decide(args):
+    """(v2 runs, legacy runs, reason, {dual, definite})."""
+    iface, definite = None, True
     with open(args.gate) as f:
         gate = json.load(f)
     board = board_of(args.dt)
     if board is None:
-        return False, True, "no Apple device tree: not an Apple Silicon Mac"
+        return False, True, "no Apple device tree: not an Apple Silicon Mac", _info(iface, definite)
     units = []
     why_not = None
     policy_ok = False
@@ -217,12 +264,14 @@ def decide(args):
                                  os.uname().release, unit=wiring.unit_id(args.dt), units=units)
     except (wiring.Refused, OSError, ValueError, TypeError, AttributeError, subprocess.TimeoutExpired) as e:
         why_not = f"{board} is unqualified: {e}"
+        # only a refusal by a gate that could read everything is definite
+        definite = isinstance(e, (wiring.Refused, ValueError)) and privileged()
     iface, card = kernel_interface(args.wait)
     if iface is None:
-        return False, True, (why_not or f"{board} is gated") + "; no speaker card: the older daemons decide for themselves"
+        return False, True, (why_not or f"{board} is gated") + "; no speaker card: the older daemons decide for themselves", _info(iface, definite)
     if why_not:
         if iface == "v2":
-            return False, False, f"{why_not}; the kernel has the v2 interface ({card}), so the older daemons have nothing to own: the kernel holds the speakers at its floor"
+            return False, False, f"{why_not}; the kernel has the v2 interface ({card}), so the older daemons have nothing to own: the kernel holds the speakers at its floor", _info(iface, definite)
         if (iface == "dual" and policy_ok and upgrade_setting(getattr(args, "setting", None)) == "v2"
                 and not check_failed(getattr(args, "state", "/var/lib/speakerguardd"), board)):
             # Switched by the upgrade, on a kernel this Mac's silent switch
@@ -233,19 +282,19 @@ def decide(args):
             # failed test sends the Mac back to the older daemons.
             return False, False, (f"{why_not}; the kernel serves both interfaces ({card}) and the upgrade switched this "
                                   "Mac to v2, which waits for its silent switch test: the volume lock holds the speakers "
-                                  "at its ceiling")
+                                  "at its ceiling"), _info(iface, definite)
         if iface == "dual":
-            return False, True, f"{why_not}; the kernel serves both interfaces ({card}): the older daemons protect the speakers"
-        return False, True, f"{why_not}; the older daemons protect the speakers"
+            return False, True, f"{why_not}; the kernel serves both interfaces ({card}): the older daemons protect the speakers", _info(iface, definite)
+        return False, True, f"{why_not}; the older daemons protect the speakers", _info(iface, definite)
     if iface == "legacy":
-        return False, True, f"{board} is gated for v2, but this kernel has no \"{CONTROL}\" control on {card}: the older daemons protect the speakers"
+        return False, True, f"{board} is gated for v2, but this kernel has no \"{CONTROL}\" control on {card}: the older daemons protect the speakers", _info(iface, definite)
     if iface == "dual" and upgrade_setting(getattr(args, "setting", None)) != "v2":
         return False, True, (f"{board} is gated for v2 and the kernel serves both interfaces on {card}, but the upgrade has not "
-                             f"switched this Mac ({UPGRADE_SETTING} is not \"v2\"): the older daemons protect the speakers")
+                             f"switched this Mac ({UPGRADE_SETTING} is not \"v2\"): the older daemons protect the speakers"), _info(iface, definite)
     if iface == "dual":
         return True, False, (f"{board} ({','.join(units)}) is gated for v2, the kernel serves both interfaces on {card} and the "
-                             "upgrade switched this Mac to v2: speakerguardd v2 protects the speakers")
-    return True, False, f"{board} ({','.join(units)}) is gated for v2 and the kernel has the v2 interface on {card}: speakerguardd v2 protects the speakers"
+                             "upgrade switched this Mac to v2: speakerguardd v2 protects the speakers"), _info(iface, definite)
+    return True, False, f"{board} ({','.join(units)}) is gated for v2 and the kernel has the v2 interface on {card}: speakerguardd v2 protects the speakers", _info(iface, definite)
 
 
 def main():

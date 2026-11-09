@@ -32,6 +32,7 @@ this Mac's own tuning, and back.
 import argparse
 import contextlib
 import fcntl
+import glob
 import hashlib
 import json
 import logging
@@ -443,14 +444,36 @@ def graph_deactivate():
     sys.stderr.write(r.stderr[-1000:])
 
 
+def legacy_wanted():
+    """The older daemons the packaged udev rules start for this Mac's
+    speaker sense PCMs (SYSTEMD_WANTS), exactly as a boot would: speakersafetyd
+    on most Macs, speakerguardd 0.1 where its own rules ask for it (the
+    J700). Never a unit nothing asks for."""
+    want = []
+    for dev in sorted(glob.glob("/dev/snd/pcmC*D*c")):
+        r = run(["udevadm", "info", "--query=property", dev])
+        for line in r.stdout.splitlines():
+            if line.startswith("SYSTEMD_WANTS="):
+                for u in line.split("=", 1)[1].split():
+                    u = u if u.endswith(".service") else u + ".service"
+                    if u in legacy_units() and u not in want:
+                        want.append(u)
+    return want
+
+
 def legacy_start():
-    """Puts the legacy daemon back: the packaged udev rules start it for the
-    speaker sense PCM."""
+    """Puts the legacy daemon back, the one the packaged udev rules start
+    for the speaker sense PCM; nothing else (on a Mac that is not a J700,
+    speakerguardd 0.1 is installed but not wanted, and fails 78/CONFIG)."""
     run(["udevadm", "trigger", "--subsystem-match=sound", "--action=change"])
-    for u in legacy_units():
-        if systemctl("cat", u).returncode == 0:
-            systemctl("reset-failed", u)
-            systemctl("start", "--no-block", u)
+    run(["udevadm", "settle", "--timeout=10"])
+    units = legacy_wanted()
+    if not units and systemctl("cat", "speakersafetyd.service").returncode == 0:
+        # rules without SYSTEMD_WANTS on the PCM: the distributions' default
+        units = ["speakersafetyd.service"]
+    for u in units:
+        systemctl("reset-failed", u)
+        systemctl("start", "--no-block", u)
 
 
 def legacy_stop():
@@ -487,9 +510,12 @@ def locked():
 
 def cmd_check(a):
     """A dry run: collect, compile and self-check this Mac's tuning in the
-    /run scratch only. Nothing is stored, no configuration is written,
-    nothing switches and no unit is stopped or started. Exit codes are the
-    self-check's: 0 pass, 1 refused, 2 cannot run, 3 error."""
+    /run scratch only. Nothing is stored and no configuration is written.
+    On a dual kernel, where no hardware record of this kernel exists before
+    a switch, the silent switch test runs into the private root: the older
+    daemon is paused and the interface lent to the test for a few seconds,
+    then both are put back. Exit codes are the self-check's: 0 pass,
+    1 refused, 2 cannot run, 3 error."""
     out = {"result": "error", "kernel": os.uname().release, "steps": []}
 
     def step(name, result, detail=""):
@@ -541,10 +567,27 @@ def cmd_check(a):
             out["params_sha256"] = hashlib.sha256(f.read()).hexdigest()
         step("compile", "pass", f"blob {out['params_sha256'][:12]}")
         state = os.path.join(root, STATE_V2.lstrip("/"))
+        conf = os.path.join(root, V2_CONF.lstrip("/"))
         js = os.path.join(work, "selfcheck.json")
         h = run([sc_tool, "--help"])
+        if mode == "dual" and "--switch-interface" in h.stdout + h.stderr:
+            # No hardware record of this kernel exists before a switch: make
+            # one in the private root, the way 'run' does. The silent switch
+            # test needs the speakers for a few seconds: the older daemon is
+            # paused and the interface lent to the test, then both are put
+            # back; nothing is stored outside /run.
+            res, detail = check_hardware(sc_tool, card, params, state, conf)
+            step("hardware switch test", res, detail)
+            if res != "pass":
+                code = EXIT_RETRY if res == "cannot-run" else EXIT_REFUSED
+                return finish(res, code, detail.splitlines()[0] if detail else "the silent switch test did not pass")
+        graph = os.path.join(work, "graph")
+        if "--conf" in h.stdout + h.stderr:
+            run([sc_tool, "generate", "--state", state, "--pipewire-dir", os.path.join(graph, "pipewire"),
+                 "--wireplumber-dir", os.path.join(graph, "wireplumber")])
         if re.search(r"\bverify\b", h.stdout + h.stderr):
-            r = run([sc_tool, "verify", "--params", params, "--state", state, "--json", js])
+            extra = ["--conf", conf, "--graph-dir", graph] if "--conf" in h.stdout + h.stderr else []
+            r = run([sc_tool, "verify", "--params", params, "--state", state, "--json", js, *extra])
             code = r.returncode if r.returncode in (0, 1, 2, 3) else EXIT_ERROR
             with contextlib.suppress(OSError, ValueError):
                 with open(js) as f:
@@ -567,6 +610,30 @@ def cmd_check(a):
         return finish("refused", EXIT_REFUSED, str(e))
     except Exception as e:
         return finish("error", EXIT_ERROR, f"{type(e).__name__}: {e}")
+
+
+def check_hardware(sc_tool, card, params, state, conf):
+    """--check on a dual kernel: the silent switch test into the private
+    state, with the speakers lent to it and given back. ('pass'|'refused'|
+    'cannot-run', detail)."""
+    paused = [u for u in legacy_units() if systemctl("is-active", "-q", u).returncode == 0]
+    for u in paused:
+        systemctl("stop", u)
+    try:
+        r = run([sc_tool, "run", "--switch-interface", "--force", "--params", params, "--state", state,
+                 "--", *v2_tuning_args(conf)])
+    finally:
+        with contextlib.suppress(Refused):
+            interface_set(card, IF_LEGACY)
+        for u in paused:
+            systemctl("reset-failed", u)
+            systemctl("start", "--no-block", u)
+    if r.returncode == 0:
+        return "pass", "silent switch test passed on this kernel (private record)"
+    tail = r.stderr.strip()[-800:]
+    if re.search(r"stayed in use|owned by another process|no ALSA card", tail):
+        return "cannot-run", tail
+    return "refused", tail
 
 
 def cmd_collect(a):

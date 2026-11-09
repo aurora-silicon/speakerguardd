@@ -155,3 +155,65 @@ fn zero_port_control_sum_selects_tone_groups_at_runtime() {
     t.graph.params.iter_mut().find(|p| p.name == "one").unwrap().constant = false;
     assert!(chain::compile(&t, 48_000.0, &mut Diagnostics::default()).is_err());
 }
+
+/// A level-dependent notch (tmst slot type 15) compiles as a carried box,
+/// not a compiler gap, and acts on level: a loud tone at its frequency is
+/// cut by its ratio law up to its range, a quiet one passes, and a loud tone well away
+/// from it passes. Synthetic values only.
+#[test]
+fn level_dependent_notch_is_carried_and_follows_level() {
+    use aurora_speaker_tuning::{
+        aupreset::{ParamSection, ParamState},
+        dspg,
+        fourcc::FourCc,
+    };
+    let mut t = tuning("notch");
+    let g = dspg::parse("box Eq (aufx tmst) 1 1\n", &Default::default(), "synthetic notch").unwrap();
+    let at = t.graph.boxes.iter().position(|b| b.name == "Eq").unwrap();
+    t.graph.boxes[at] = g.boxes.into_iter().next().unwrap();
+    let stage = t.chain.iter_mut().find(|s| s.name == "Eq").unwrap();
+    stage.unit.as_mut().unwrap().subtype = FourCc::from_bytes(*b"tmst");
+    let mut params: std::collections::BTreeMap<u32, f32> = (0..640).map(|id| (id, 0.0)).collect();
+    // global: shelf order 4, algorithm version 1; slot 0: running, type 15,
+    // range -12 dB at 1 kHz, quality 2, ratio 4, threshold -40 dB, both
+    // channels; first level-dependent slot's attack 1 ms, release 50 ms
+    params.extend([(5, 4.0), (12, 1.0)]);
+    params.extend([(14, 3.0), (15, 15.0), (16, -12.0), (17, 1000.0), (18, 2.0), (19, 4.0), (20, -40.0), (21, 3.0)]);
+    params.extend([(616, 1.0), (617, 50.0)]);
+    stage.state = Some(ParamState {
+        sections: vec![ParamSection { scope: 0, element: 0, params: params.into_iter().collect() }],
+    });
+    let c = chain::compile(&t, 48_000.0, &mut Diagnostics::default()).unwrap();
+    assert!(c.stubs.is_empty() && c.unwired.is_empty() && c.gaps.is_empty(), "{:?} {:?}", c.stubs, c.gaps);
+    match &c.spec.nodes[1].kind {
+        Kind::Tone(tone) => assert_eq!(tone.dynamic.len(), 1),
+        k => panic!("Eq compiled as {k:?}"),
+    }
+    let level = |f: f64, db: f64| -> f64 {
+        let mut run = Chain::new(c.spec.clone(), 48_000.0, 512).unwrap();
+        let a = 10f64.powf(db / 20.0);
+        let n = 48_000;
+        let x: Vec<f32> =
+            (0..n).map(|i| (a * (2.0 * std::f64::consts::PI * f * i as f64 / 48_000.0).sin()) as f32).collect();
+        let mut out = vec![vec![0f32; n]; 4];
+        for at in (0..n).step_by(512) {
+            let m = 512.min(n - at);
+            let mut refs: Vec<&mut [f32]> = out.iter_mut().map(|o| &mut o[at..at + m]).collect();
+            run.process(&[&x[at..at + m], &x[at..at + m]], &mut refs, m);
+        }
+        let tail = &out[0][n / 2..];
+        let rms = (tail.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / tail.len() as f64).sqrt();
+        20.0 * (rms / (a / 2f64.sqrt())).log10()
+    };
+    let loud = level(1000.0, -6.0);
+    let mid = level(1000.0, -30.0);
+    let quiet = level(1000.0, -80.0);
+    let away = level(100.0, -6.0);
+    // 34 dB over the threshold: the cut reaches the range
+    assert!((-12.5..=-11.0).contains(&loud), "loud tone at the notch: {loud} dB");
+    // 10 dB over at ratio 4: about 7.5 dB of cut
+    assert!((-8.5..=-6.5).contains(&mid), "tone 10 dB over the threshold: {mid} dB");
+    assert!(quiet.abs() < 0.25, "quiet tone at the notch: {quiet} dB");
+    assert!(away.abs() < 0.5, "loud tone an octave and more away: {away} dB");
+    assert!(loud < quiet - 6.0);
+}
