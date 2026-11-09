@@ -49,5 +49,23 @@ class Verdicts(unittest.TestCase):
         self.assertEqual(attest.verdict([])["verdict"], "refused")
 
 
+class Releases(unittest.TestCase):
+    """One block per macOS release; a release is never inherited from another."""
+
+    def test_merge_keeps_other_releases_of_the_same_law(self):
+        import json, tempfile
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "parity.json")
+            r = lambda b: {"build": b, "reference": f"macOS {b} Audio Units", "rev": "x", "entries": []}
+            json.dump(attest.merge(p, "L1", r("25G83")), open(p, "w"))
+            doc = attest.merge(p, "L1", r("26A428"))
+            self.assertEqual([x["build"] for x in doc["releases"]], ["25G83", "26A428"])
+            json.dump(doc, open(p, "w"))
+            # re-gating one release replaces only that block
+            self.assertEqual([x["build"] for x in attest.merge(p, "L1", r("26A428"))["releases"]], ["25G83", "26A428"])
+            # other rendering code: every older block is stale and dropped
+            self.assertEqual([x["build"] for x in attest.merge(p, "L2", r("26A428"))["releases"]], ["26A428"])
+
+
 if __name__ == "__main__":
     unittest.main()

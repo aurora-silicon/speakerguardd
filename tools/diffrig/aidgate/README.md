@@ -59,6 +59,13 @@ into the file a Mac checks before v2 may take its speakers (`packaging/session/p
 - The file holds keys, verdicts, reasons and summary numbers only. Every render and the per-cell rows
   (`--details`) stay in private, tainted directories.
 
+- The file holds one block per macOS release (`releases[].build`, format 2). `verify` takes the
+  block whose build is the one the Mac's tuning bundle came from. A bundle from a build with no
+  block is refused ("macOS 26A428 has no parity attestation"), even when another release's block
+  holds the same tuning key: that release's Audio Units, not this build's, were the reference.
+  New macOS builds therefore get coverage by a run of the steps below on that build, never by
+  inheritance from an older one.
+
 ### When it runs
 
 Run all three steps, in full, whenever:
@@ -73,7 +80,7 @@ Run all three steps, in full, whenever:
 
 ```text
 # buildbox
-attest.py variants --bin BIN --tunings NEW_TREE --tunings-fallback HOST_TREE --out variants.json
+attest.py variants --bin BIN --build BUILD --tunings NEW_TREE --tunings-fallback HOST_TREE --out variants.json
 # host Mac on that release, under a host-heavy slot (about 2 s per tuning)
 BOXHOST=.../box_host SCRATCH=... PROG=prog.f32 attest_refs.sh SLOT variants.json
 # buildbox (about 1 min for 63 tunings with 12 jobs)

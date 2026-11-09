@@ -244,19 +244,25 @@ class Packaged(unittest.TestCase):
     def test_consistent(self):
         with open(os.path.join(HERE, "parity.json")) as f:
             a = json.load(f)
-        self.assertEqual(a["format"], 1)
+        self.assertEqual(a["format"], 2)
         self.assertEqual(len(a["law"]), 64)
         tol = a["tolerance"]
-        keys = [e["key"] for e in a["entries"]]
-        self.assertEqual(len(keys), len(set(keys)), "one entry per tuning key")
-        for e in a["entries"]:
-            self.assertIn(e["verdict"], ("pass", "refused"))
-            self.assertEqual(len(e["key"]), 64)
-            if e["verdict"] == "pass":
-                self.assertLessEqual(e["worst_louder_db"], tol["louder_db"], e)
-                self.assertGreaterEqual(e["worst_quieter_db"], -tol["quieter_db"], e)
-            else:
-                self.assertTrue(e["reason"])
+        builds = [r["build"] for r in a["releases"]]
+        self.assertTrue(builds, "at least one attested macOS release")
+        self.assertEqual(len(builds), len(set(builds)), "one block per macOS release")
+        for r in a["releases"]:
+            self.assertRegex(r["build"], r"^[0-9]{2}[A-Z][0-9]+[a-z]?$")
+            self.assertIn(r["build"], r["reference"], "the reference names its own build")
+            keys = [e["key"] for e in r["entries"]]
+            self.assertEqual(len(keys), len(set(keys)), "one entry per tuning key")
+            for e in r["entries"]:
+                self.assertIn(e["verdict"], ("pass", "refused"))
+                self.assertEqual(len(e["key"]), 64)
+                if e["verdict"] == "pass":
+                    self.assertLessEqual(e["worst_louder_db"], tol["louder_db"], e)
+                    self.assertGreaterEqual(e["worst_quieter_db"], -tol["quieter_db"], e)
+                else:
+                    self.assertTrue(e["reason"])
 
 
 if __name__ == "__main__":
