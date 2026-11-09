@@ -25,6 +25,7 @@ pub mod chain;
 pub mod lowflow;
 pub mod mstk;
 pub mod norm;
+pub mod parity;
 pub mod pchr;
 pub mod topology;
 pub mod vareq;

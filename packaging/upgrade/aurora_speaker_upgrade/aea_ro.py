@@ -295,6 +295,21 @@ def bounded_lzfse(data, maximum):
         off += header + payload
 
 
+def have_lzfse():
+    """Whether an LZFSE decoder is available (liblzfse, or libcompression
+    on macOS development hosts)."""
+    import ctypes
+    import ctypes.util
+    if sys.platform == "darwin":
+        return True
+    name = os.environ.get("AURORA_LZFSE_LIB") or ctypes.util.find_library("lzfse") or "liblzfse.so.1"
+    try:
+        ctypes.CDLL(name)
+        return True
+    except OSError:
+        return False
+
+
 def lzfse_decode(data, size):
     import ctypes
     import ctypes.util
@@ -308,7 +323,11 @@ def lzfse_decode(data, size):
     else:
         # AURORA_LZFSE_LIB: distributions without a library search path (NixOS).
         name = os.environ.get("AURORA_LZFSE_LIB") or ctypes.util.find_library("lzfse") or "liblzfse.so.1"
-        lib = ctypes.CDLL(name)
+        try:
+            lib = ctypes.CDLL(name)
+        except OSError:
+            raise AeaError("Apple's restore image is LZFSE-compressed and liblzfse is not installed "
+                           "(install the lzfse package)") from None
         lib.lzfse_decode_buffer.restype = ctypes.c_size_t
         lib.lzfse_decode_buffer.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_char_p,
                                             ctypes.c_size_t, ctypes.c_void_p]

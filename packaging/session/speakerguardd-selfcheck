@@ -5,6 +5,7 @@ speakerguardd may grant.
     speakerguardd-selfcheck run      --params BLOB [--force] [--defer] [-- TUNING-SOURCE...]
     speakerguardd-selfcheck pending
     speakerguardd-selfcheck check    --params BLOB
+    speakerguardd-selfcheck verify   --params BLOB [--json FILE] [--attestations FILE] [-- TUNING-SOURCE...]
     speakerguardd-selfcheck generate --pipewire-dir D --wireplumber-dir D
 
 It runs as root, before the supervisor, while the kernel holds the speakers
@@ -73,6 +74,34 @@ directory), so the two units never overlap.
 
 Any failure writes a failing record with every reason, exits 1, and leaves
 the speakers at the kernel's floor.
+
+`verify` is the whole proof another tool (aurora-speaker-upgrade) asks for
+before it switches a Mac to v2. It changes nothing, plays only zero samples,
+and stops at the first failing step:
+
+1. **hardware** (steps 1-3 above): a passing record bound to this board,
+   kernel and blob. Without one (never run, or stale) it cannot run (2).
+2. **voicing** (`aurora-speaker-tuning voicing-check`): the Mac's own chain
+   compiled from its own tuning, with no stub, unwired parameter or compiler
+   gap; the render invariants on this Mac (finite at the clip edge, silence
+   in is silence out, the limiter's saved ceiling holds, deterministic); and
+   the macOS parity attestation for this tuning: the gate renders every
+   tuning of the macOS release through Apple's own Audio Units and through
+   this code (tools/diffrig/aidgate/attest.py), and this tuning must be
+   within its tolerance, for this build's rendering code. A tuning with no
+   attestation, or one for other code, is refused.
+3. **graph**: the speaker graph must hold the 512-frame quantum the gate
+   measured (generated config); with a session up, the speaker and sense
+   nodes must show no xrun since the graph started, and a silent pilot
+   (zero-sample streams into the voicing input, started and stopped
+   PILOT_STARTS times) must leave their xrun counts unchanged. Without
+   a running v2 graph only the generated config is checked.
+
+Exit codes: 0 pass (the switch may proceed), 1 refused (stay on the legacy
+stack; reason on stderr), 2 cannot run (retry later; do not switch), 3
+internal error (treat as refused). `--json FILE`: {"result", "board",
+"kernel", "params_sha256", "wiring_hash", "steps": [{"name", "result",
+"detail"}]}.
 """
 import argparse
 import errno
@@ -97,7 +126,9 @@ sys.dont_write_bytecode = True
 import wiring  # noqa: E402
 
 # 2: the record carries the derived machine description (report "machine").
-VERSION = 2
+# 3: the description carries speaker_irq (the speaker sink's period-interrupt
+# scheduling, wiring.TRANSPORTS): records of 2 are checked again.
+VERSION = 3
 STATE = "/var/lib/speakerguardd"
 MARKER = "/run/speakerguardd-selfcheck/active"
 # The switch test is pending: written by `run --defer` (before login),
@@ -1069,6 +1100,235 @@ def cmd_check(args):
     return 0
 
 
+# ------------------------------------------------------------------ verify
+
+EXIT_PASS, EXIT_REFUSED, EXIT_CANNOT, EXIT_ERROR = 0, 1, 2, 3
+CONF = "/etc/speakerguardd/speakerguardd.conf"
+ATTESTATIONS = (os.path.join(HERE, "parity.json"), "/usr/share/speakerguardd/parity.json")
+QUANTUM = 512
+PILOT_STARTS = 5
+PILOT_S = 0.6
+
+
+class Cannot(Exception):
+    """A step cannot run now (exit 2)."""
+
+
+def read_conf(path=None):
+    """The units' environment file, as a dict of strings."""
+    import shlex
+    out = {}
+    try:
+        with open(path or CONF) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    out[k] = " ".join(shlex.split(v))
+    except OSError:
+        pass
+    return out
+
+
+def verify_hardware(args):
+    """Step 1: the bound hardware record (this board, kernel and blob)."""
+    if not os.path.exists(args.params):
+        raise Cannot(f"no parameter blob at {args.params}: provision first")
+    b = read_bind(os.path.join(args.state, "selfcheck.bind"))
+    want = {"board": wiring.read_dt()["board"], "kernel": os.uname().release, "params_sha256": sha256(args.params)}
+    if not b:
+        raise Cannot("the silent hardware self-check has not run (speakerguardd-selfcheck run)")
+    stale = [k for k, v in want.items() if b.get(k) != v]
+    if stale:
+        raise Cannot(f"the hardware self-check record is for another {', '.join(stale)}: run it again")
+    if b.get("result") != "pass" or not report_matches(os.path.join(args.state, "selfcheck.json"), b):
+        raise wiring.Refused(f"the silent hardware self-check failed: {b.get('reason', 'see selfcheck.json')}")
+    return b, f"{b.get('board')} {b.get('kernel')} wiring {b.get('wiring')} ({b.get('method')})"
+
+
+def find_attestations(path=None):
+    for p in ([path] if path else ATTESTATIONS):
+        if p and os.path.isfile(p):
+            return p
+    return None
+
+
+def verify_voicing(args):
+    """Step 2: `aurora-speaker-tuning voicing-check` on this Mac's tuning."""
+    src = args.tuning or (read_conf().get("SGV2_TUNING", "").split() if not args.tuning else [])
+    att = find_attestations(args.attestations)
+    cmd = [args.tuning_cli, "voicing-check", "--json"] + (["--attestations", att] if att else []) + list(src)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise RuntimeError(f"{args.tuning_cli} voicing-check: {e}")
+    try:
+        out = json.loads(r.stdout)
+    except ValueError:
+        # an older reader without voicing-check (usage, exit 2) or a crash
+        raise RuntimeError(f"{args.tuning_cli} voicing-check gave no result (exit {r.returncode}): {r.stderr.strip()[-300:]}")
+    failed = [st for st in out.get("steps", []) if st.get("result") == "refused"]
+    if r.returncode == 0 and out.get("result") == "pass" and not failed:
+        parity = next((st["detail"] for st in out["steps"] if st["name"] == "macos-parity"), "")
+        return out, f"tuning {str(out.get('key'))[:12]} (AID{out.get('aid')}): {parity}"
+    if r.returncode == 1 or failed:
+        raise wiring.Refused("; ".join(f"{st['name']}: {st['detail']}" for st in failed) or "voicing-check refused")
+    raise RuntimeError(f"voicing-check exit {r.returncode}: {r.stderr.strip()[-300:]}")
+
+
+def as_user(uid, cmd, timeout=20, **kw):
+    """`cmd` as the seat user, against that user's PipeWire."""
+    import pwd as _pwd
+    name = _pwd.getpwuid(uid).pw_name
+    env = ["env", f"XDG_RUNTIME_DIR=/run/user/{uid}"]
+    pre = [] if os.getuid() == uid else ["runuser", "-u", name, "--"]
+    return subprocess.run(pre + env + cmd, capture_output=True, text=True, timeout=timeout, **kw)
+
+
+def pw_errors(uid, nodes):
+    """xrun counts (pw-top's ERR column) of the named nodes, or None when
+    pw-top cannot read the graph."""
+    r = as_user(uid, ["pw-top", "-b", "-n", "2"], timeout=15)
+    if r.returncode:
+        return None
+    errs = {}
+    for line in r.stdout.splitlines():
+        f = line.split()
+        # S ID QUANT RATE WAIT BUSY W/Q B/Q ERR [FORMAT] NAME (a follower's
+        # name is prefixed with ' + ')
+        if len(f) >= 10 and f[-1] in nodes:
+            try:
+                errs[f[-1]] = int(f[8])
+            except ValueError:
+                pass
+    return errs
+
+
+def refused_starts():
+    """How many speaker starts the kernel refused before its latest grant
+    ("Speaker protection granted (N speaker starts refused before)")."""
+    try:
+        r = subprocess.run(["journalctl", "-k", "-b", "-o", "cat", "--no-pager", "-g", "Speaker protection granted"],
+                           capture_output=True, text=True, timeout=15)
+        lines = r.stdout.splitlines()
+    except (OSError, subprocess.TimeoutExpired):
+        lines = []
+    if not lines:
+        return 0
+    m = re.search(r"\((\d+) speaker starts? refused before\)", lines[-1])
+    return int(m.group(1)) if m else 0
+
+
+def generated_quantum(m, graph="/run/speakerguardd-graph"):
+    """The force-quantum the generated speaker config sets, or None."""
+    for d, _, files in os.walk(graph):
+        for f in files:
+            if f == f"sgv2-{m}.conf":
+                with open(os.path.join(d, f)) as fh:
+                    t = fh.read()
+                q = re.search(r"node\.force-quantum\s*=\s*(\d+)", t)
+                lock = re.search(r"node\.lock-quantum\s*=\s*true", t)
+                return int(q.group(1)) if q and lock else 0
+    return None
+
+
+def verify_graph(args):
+    """Step 3: the quantum the gate measured, and no xrun at stream start."""
+    conf = read_conf()
+    m = conf.get("SGV2_MACHINE")
+    if not m:
+        raise Cannot(f"{CONF} names no machine: provision first")
+    q = generated_quantum(m, args.graph_dir)
+    if q is None:
+        raise Cannot(f"no generated speaker graph for {m} in {args.graph_dir}")
+    if q != QUANTUM:
+        raise wiring.Refused(f"the speaker graph does not lock the {QUANTUM}-frame quantum the parity gate measured (config: {q})")
+    import gen
+    n = gen.names(m)
+    nodes = {n["speaker"], n["sense"]}
+    try:
+        uid = int(conf.get("SGV2_UID", ""))
+    except ValueError:
+        return f"{QUANTUM}-frame quantum locked (config); no seat user: no live pilot"
+    if not os.path.exists(f"/run/user/{uid}/pipewire-0"):
+        return f"{QUANTUM}-frame quantum locked (config); no session PipeWire: no live pilot"
+    before = pw_errors(uid, nodes)
+    if not before or n["speaker"] not in before:
+        return f"{QUANTUM}-frame quantum locked (config); the v2 graph is not running: no live pilot"
+    # xruns since the graph started (PipeWire counts every one; pw-top's ERR).
+    # A start the kernel refused before the grant (it logs how many) counts
+    # once on the speaker node and plays nothing: those are not xruns.
+    refused = refused_starts()
+    started = {k: v - (refused if k == n["speaker"] else 0) for k, v in before.items()}
+    started = {k: v for k, v in started.items() if v > 0}
+    if started:
+        raise wiring.Refused("the speaker graph has xrun since it started: "
+                             + ", ".join(f"{k} {v}" for k, v in sorted(started.items())))
+    sink = f"sgv2.voicing.{m}"
+    zeros = bytes(int(48000 * PILOT_S) * 2 * 4)
+    for _ in range(PILOT_STARTS):
+        _pilot(uid, sink, zeros)
+        time.sleep(0.3)
+    time.sleep(0.5)
+    after = pw_errors(uid, nodes) or {}
+    grew = {k: after.get(k, 0) - before.get(k, 0) for k in nodes if k in before}
+    bad = {k: v for k, v in grew.items() if v != 0}
+    if bad:
+        raise wiring.Refused("the speaker graph xruns when a stream starts: "
+                             + ", ".join(f"{k} +{v}" for k, v in sorted(bad.items()))
+                             + f" over {PILOT_STARTS} silent pilot starts")
+    return f"{QUANTUM}-frame quantum locked; {PILOT_STARTS} silent pilot starts, no xrun on {', '.join(sorted(grew))}"
+
+
+def _pilot(uid, sink, zeros):
+    """One zero-sample stream into the voicing input: start, play, stop."""
+    import pwd as _pwd
+    name = _pwd.getpwuid(uid).pw_name
+    pre = [] if os.getuid() == uid else ["runuser", "-u", name, "--"]
+    cmd = pre + ["env", f"XDG_RUNTIME_DIR=/run/user/{uid}", "pw-cat", "--playback", "--raw", "--target", sink,
+                 "--rate", "48000", "--channels", "2", "--format", "f32", "-"]
+    p = subprocess.run(cmd, input=zeros, capture_output=True, timeout=15)
+    if p.returncode:
+        raise Cannot(f"the silent pilot stream did not run: {p.stderr.decode(errors='replace').strip()[-200:]}")
+    return p
+
+
+def cmd_verify(args):
+    out = {"result": "error", "board": "-", "kernel": os.uname().release, "params_sha256": "-",
+           "wiring_hash": "-", "steps": []}
+    code = EXIT_ERROR
+    try:
+        out["board"] = wiring.read_dt()["board"]
+        if os.path.exists(args.params):
+            out["params_sha256"] = sha256(args.params)
+        for name, step in (("hardware", verify_hardware), ("voicing", verify_voicing), ("graph", verify_graph)):
+            try:
+                res = step(args)
+            except Cannot as e:
+                out["steps"].append({"name": name, "result": "cannot-run", "detail": str(e)})
+                out["result"], code = "cannot-run", EXIT_CANNOT
+                break
+            except wiring.Refused as e:
+                out["steps"].append({"name": name, "result": "refused", "detail": str(e)})
+                out["result"], code = "refused", EXIT_REFUSED
+                break
+            if name == "hardware":
+                out["wiring_hash"] = res[0].get("wiring", "-")
+            detail = res[1] if isinstance(res, tuple) else res
+            out["steps"].append({"name": name, "result": "pass", "detail": detail})
+        else:
+            out["result"], code = "pass", EXIT_PASS
+    except Exception as e:  # noqa: BLE001 - an internal error refuses
+        out["steps"].append({"name": "internal", "result": "error", "detail": f"{type(e).__name__}: {e}"})
+        out["result"], code = "error", EXIT_ERROR
+    if args.json:
+        write_atomic(args.json, json.dumps(out, indent=1) + "\n")
+    for st in out["steps"]:
+        log(f"verify {st['name']}: {st['result']}: {st['detail']}")
+    log(f"verify: {out['result']} ({out['board']}, {out['kernel']})")
+    return code
+
+
 def cmd_generate(args):
     import gen
 
@@ -1104,7 +1364,7 @@ def cmd_generate(args):
 
 def main():
     ap = argparse.ArgumentParser(prog="speakerguardd-selfcheck")
-    ap.add_argument("cmd", choices=["run", "pending", "check", "generate"])
+    ap.add_argument("cmd", choices=["run", "pending", "check", "generate", "verify"])
     ap.add_argument("--params")
     ap.add_argument("--state", default=STATE)
     ap.add_argument("--tuning-cli", default="aurora-speaker-tuning")
@@ -1115,13 +1375,17 @@ def main():
     ap.add_argument("--clear", action="store_true", help="pending: the switch test is done (pass or fail)")
     ap.add_argument("--pipewire-dir")
     ap.add_argument("--wireplumber-dir")
+    ap.add_argument("--json", help="verify: write the result here")
+    ap.add_argument("--attestations", help="verify: the macOS parity attestations (default: the packaged parity.json)")
+    ap.add_argument("--graph-dir", default="/run/speakerguardd-graph", help="verify: the generated graph")
     ap.add_argument("tuning", nargs="*", help="after --: the tuning source, as aurora-speaker-tuning takes it")
     args = ap.parse_args()
-    if args.cmd in ("run", "check") and not args.params:
+    if args.cmd in ("run", "check", "verify") and not args.params:
         ap.error("--params is required")
     if args.cmd == "generate" and not (args.pipewire_dir and args.wireplumber_dir):
         ap.error("--pipewire-dir and --wireplumber-dir are required")
-    return {"run": cmd_run, "pending": cmd_pending, "check": cmd_check, "generate": cmd_generate}[args.cmd](args)
+    return {"run": cmd_run, "pending": cmd_pending, "check": cmd_check, "generate": cmd_generate,
+            "verify": cmd_verify}[args.cmd](args)
 
 
 if __name__ == "__main__":
