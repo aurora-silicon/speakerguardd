@@ -6,7 +6,8 @@
 //! The custom law has 17 uniformly spaced gain points and a five-control
 //! offset curve. The gain points are linearly interpolated. The offsets use
 //! the unit's uniform cubic B-spline. [`Run::set_volume`] is RT-safe and the
-//! box has no latency or tail.
+//! box has no latency or tail. Run-time slider and mute moves ramp like the
+//! unit's ([`Run`]).
 
 pub const CURVE_POINTS: usize = 17;
 pub const OFFSET_POINTS: usize = 5;
@@ -87,16 +88,52 @@ fn cubic_bspline(x: f64) -> f64 {
     }
 }
 
+/// The unit's run-time ramp (macOS 25G83): a host render is cut into
+/// internal chunks of at most [`CHUNK`] frames. A chunk that sees a new
+/// endpoint (the slider's curve value, or zero when muted) feeds a linear
+/// amplitude ramp from the old endpoint to the new one, over the chunk,
+/// into a one-pole low-pass `y = p y + (1 - p) u` with `p = exp(-600 / fs)`
+/// (Float32). Later chunks feed the endpoint until the filtered value is
+/// within 0.01 dB of it at a chunk's end; from the next chunk on the
+/// endpoint is used directly, and the filter's state stays where it was.
+/// A value set before the first block is installed at once.
+pub const CHUNK: usize = 512;
+const SETTLED_DB: f32 = 0.01;
+
 pub struct Run {
     params: Params,
     channels: usize,
     gain_db: f64,
+    /// The slider's endpoint (linear) and the mute.
     gain: f32,
+    mute: bool,
+    /// The ramp: the endpoint in force, the filter's state, its pole.
+    end: f32,
+    y: f32,
+    pole: f32,
+    settled: bool,
+    started: bool,
+}
+
+fn db(x: f32) -> f32 {
+    20.0 * libm::log10f(x.abs() + 1e-20)
 }
 
 impl Run {
-    pub fn new(params: &Params, _fs: f64, channels: usize) -> Self {
-        let mut run = Self { params: *params, channels, gain_db: 0.0, gain: 1.0 };
+    pub fn new(params: &Params, fs: f64, channels: usize) -> Self {
+        let pole = libm::exp(-600.0 / fs) as f32;
+        let mut run = Self {
+            params: *params,
+            channels,
+            gain_db: 0.0,
+            gain: 1.0,
+            mute: false,
+            end: 1.0,
+            y: 1.0,
+            pole,
+            settled: true,
+            started: false,
+        };
         run.set_volume(params.saved_scalar);
         run
     }
@@ -107,6 +144,22 @@ impl Run {
         0
     }
 
+    fn target(&self) -> f32 {
+        if self.mute {
+            0.0
+        } else {
+            self.gain
+        }
+    }
+
+    fn install_if_idle(&mut self) {
+        if !self.started {
+            self.end = self.target();
+            self.y = self.end;
+            self.settled = true;
+        }
+    }
+
     /// Sets the graph's system-volume scalar (`mvsc`), in `[0, 1]`.
     pub fn set_volume(&mut self, scalar: f64) {
         self.gain_db = self.params.db_at(scalar);
@@ -114,6 +167,13 @@ impl Run {
         if !self.gain.is_finite() {
             self.gain = 0.0;
         }
+        self.install_if_idle();
+    }
+
+    /// The graph's system mute (`mmut`, parameter 0).
+    pub fn set_mute(&mut self, mute: bool) {
+        self.mute = mute;
+        self.install_if_idle();
     }
 
     /// Applies the graph's declared initial control before the first slice
@@ -129,12 +189,47 @@ impl Run {
     }
 
     pub fn process(&mut self, bufs: &mut [&mut [f32]], frames: usize) {
-        for buf in bufs.iter_mut().take(self.channels) {
-            for sample in buf.iter_mut().take(frames) {
-                let input = if sample.is_finite() { *sample } else { 0.0 };
-                let output = input * self.gain;
-                *sample = if output.is_finite() { output } else { 0.0 };
+        self.started = true;
+        let mut at = 0;
+        while at < frames {
+            let len = CHUNK.min(frames - at);
+            let target = self.target();
+            let (from, ramp) = if target != self.end {
+                let from = self.end;
+                self.end = target;
+                self.settled = false;
+                (from, true)
+            } else {
+                (self.end, false)
+            };
+            let direct = self.settled;
+            let step = if ramp && len > 1 { (self.end - from) / (len - 1) as f32 } else { 0.0 };
+            for i in 0..len {
+                let g = if direct {
+                    self.end
+                } else {
+                    let u = if ramp {
+                        if len > 1 {
+                            from + step * i as f32
+                        } else {
+                            self.end
+                        }
+                    } else {
+                        self.end
+                    };
+                    self.y = self.pole * self.y + (1.0 - self.pole) * u;
+                    self.y
+                };
+                for buf in bufs.iter_mut().take(self.channels) {
+                    let input = if buf[at + i].is_finite() { buf[at + i] } else { 0.0 };
+                    let output = input * g;
+                    buf[at + i] = if output.is_finite() { output } else { 0.0 };
+                }
             }
+            if !direct && (db(self.end) - db(self.y)).abs() < SETTLED_DB {
+                self.settled = true;
+            }
+            at += len;
         }
     }
 }
@@ -189,6 +284,51 @@ mod tests {
         assert!((right[0] + want).abs() < 1e-6);
         assert_eq!((left[1], right[1]), (0.0, 0.0));
         assert_eq!(run.latency(), 0);
+    }
+
+    /// macOS 25G83 (AID44 strip, 0.15 -> 0.50 at a host-slice boundary):
+    /// normalized amplitude progress every 64 frames, host slices of 512
+    /// and of 64 frames.
+    #[test]
+    fn slider_moves_ramp_like_the_unit() {
+        let p = params();
+        for (q, want) in [
+            (512usize, &[0.040, 0.126, 0.234, 0.352, 0.473, 0.597, 0.722, 0.847, 0.931, 0.969][..]),
+            (64, &[0.321, 0.695, 0.863, 0.938][..]),
+        ] {
+            let mut run = Run::new(&p, 48_000.0, 1);
+            run.set_volume(0.15);
+            let mut buf = vec![1.0f32; q];
+            run.process(&mut [&mut buf[..]], q);
+            let (g0, g1) = (buf[q - 1], libm::pow(10.0, p.db_at(0.5) / 20.0) as f32);
+            run.set_volume(0.5);
+            let mut out = Vec::new();
+            for _ in 0..(2048 / q) {
+                let mut b = vec![1.0f32; q];
+                run.process(&mut [&mut b[..]], q);
+                out.extend_from_slice(&b);
+            }
+            for (k, w) in want.iter().enumerate() {
+                let got = (out[(k + 1) * 64] - g0) / (g1 - g0);
+                assert!((got - w).abs() < 0.006, "q{q} at {}: {got} vs {w}", (k + 1) * 64);
+            }
+            assert_eq!(*out.last().unwrap(), g1, "settled on the exact endpoint");
+        }
+    }
+
+    #[test]
+    fn mute_ramps_to_silence_and_an_initial_value_is_installed() {
+        let p = params();
+        let mut run = Run::new(&p, 48_000.0, 1);
+        run.set_volume(0.5);
+        let mut b = vec![1.0f32; 512];
+        run.process(&mut [&mut b[..]], 512);
+        let g = libm::pow(10.0, p.db_at(0.5) / 20.0) as f32;
+        assert!(b.iter().all(|v| (*v - g).abs() < 1e-7), "installed, not ramped");
+        run.set_mute(true);
+        let mut b = vec![1.0f32; 512];
+        run.process(&mut [&mut b[..]], 512);
+        assert!(b[0] > 0.9 * g && b[511] < 0.2 * g, "ramping down");
     }
 
     #[test]
