@@ -75,13 +75,11 @@ fn tone(
             format!("tmst volume automation carried at its least-passing setting (entries {partial:?})"),
         ));
     }
-    if tone.dynamic.iter().any(|d| d.params.kind == sgv2_core::prestage::DynamicKind::Notch) {
-        gaps.push((
-            stage.name.clone(),
-            "level-dependent filters carry native multirate reconstruction and a knee-qualified release-to-idle carrier handoff; active-floor and release-tracking parity are pending"
-                .into(),
-        ));
-    }
+    // Level-dependent slots (types 15, 17, 18) run their saved detector,
+    // range, ratio, threshold and time law in the box at every level. They
+    // are not a compiler gap: whether a tuning's whole chain, these slots
+    // included, renders like macOS is what its parity attestation measures
+    // (`super::parity`), per tuning, against Apple's own units.
     Ok(Kind::Tone(tone))
 }
 
