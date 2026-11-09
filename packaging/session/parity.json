@@ -10,7 +10,7 @@
   {
    "build": "25C56",
    "reference": "macOS 26.2 25C56 Audio Units (its AudioDSP.component, read from the 25C56 restore image, rendered on a 25G83 host)",
-   "rev": "ce49e11dbc749d5206b585b714e2d794a9307e53",
+   "rev": "2781bd016415d7ed30f348abc169d653c20ccb6e",
    "spread": null,
    "entries": [
     {
@@ -605,7 +605,7 @@
   {
    "build": "25G72",
    "reference": "macOS 25G72 Audio Units (its AudioDSP.component, read from the 25G72 restore image, rendered on a 25G83 host)",
-   "rev": "34d55246ecfb8b02748c22cdd5a63d89a9056138",
+   "rev": "2781bd016415d7ed30f348abc169d653c20ccb6e",
    "spread": null,
    "entries": [
     {
@@ -862,16 +862,22 @@
       0,
       65535
      ],
-     "verdict": "refused",
-     "reason": "compiler-gaps: Tone2: level-dependent filters carry native multirate reconstruction and a knee-qualified release-to-idle carrier handoff; active-floor and release-tracking parity are pending"
+     "verdict": "pass",
+     "measured": 152,
+     "worst_louder_db": 0.028,
+     "worst_quieter_db": -0.026,
+     "reason": "within +0.25/-1.0 dB of macOS on 152 cells"
     },
     {
      "key": "d6e1a92c60173543565567c76c021572ea3da27c696af0dd40f61c556b84a8b7",
      "aid": 21,
      "speaker_id": 3,
      "also_speaker_ids": [],
-     "verdict": "refused",
-     "reason": "compiler-gaps: Tone2: level-dependent filters carry native multirate reconstruction and a knee-qualified release-to-idle carrier handoff; active-floor and release-tracking parity are pending"
+     "verdict": "pass",
+     "measured": 152,
+     "worst_louder_db": 0.029,
+     "worst_quieter_db": -0.022,
+     "reason": "within +0.25/-1.0 dB of macOS on 152 cells"
     },
     {
      "key": "f0d6719d11f02797a56ae92e01fdf76eaf29d71a967b95462d28cd76649dda1d",
@@ -952,16 +958,22 @@
       0,
       65535
      ],
-     "verdict": "refused",
-     "reason": "compiler-gaps: Tone2: level-dependent filters carry native multirate reconstruction and a knee-qualified release-to-idle carrier handoff; active-floor and release-tracking parity are pending"
+     "verdict": "pass",
+     "measured": 152,
+     "worst_louder_db": 0.028,
+     "worst_quieter_db": -0.026,
+     "reason": "within +0.25/-1.0 dB of macOS on 152 cells"
     },
     {
      "key": "1595ec9ee1a4f87c5418b410b412f2a9796672d7a9a3635be6841c3efbb3bb34",
      "aid": 27,
      "speaker_id": 3,
      "also_speaker_ids": [],
-     "verdict": "refused",
-     "reason": "compiler-gaps: Tone2: level-dependent filters carry native multirate reconstruction and a knee-qualified release-to-idle carrier handoff; active-floor and release-tracking parity are pending"
+     "verdict": "pass",
+     "measured": 152,
+     "worst_louder_db": 0.029,
+     "worst_quieter_db": -0.022,
+     "reason": "within +0.25/-1.0 dB of macOS on 152 cells"
     },
     {
      "key": "828c5e9f9b4cd41a9f88754654f9991a97bc0e7f6c1005ae3a32854a329743d9",
@@ -1116,16 +1128,22 @@
      "aid": 36,
      "speaker_id": null,
      "also_speaker_ids": [],
-     "verdict": "refused",
-     "reason": "compiler-gaps: Tone1: level-dependent filters carry native multirate reconstruction and a knee-qualified release-to-idle carrier handoff; active-floor and release-tracking parity are pending"
+     "verdict": "pass",
+     "measured": 36,
+     "worst_louder_db": 0.097,
+     "worst_quieter_db": -0.016,
+     "reason": "within +0.25/-1.0 dB of macOS on 36 cells"
     },
     {
      "key": "ba5aa4d20eeb63035f91abf81682116c13490c3ca6496bcd56dbac4f2e631be8",
      "aid": 37,
      "speaker_id": null,
      "also_speaker_ids": [],
-     "verdict": "refused",
-     "reason": "compiler-gaps: Tone1: level-dependent filters carry native multirate reconstruction and a knee-qualified release-to-idle carrier handoff; active-floor and release-tracking parity are pending; Tone2: level-dependent filters carry native multirate reconstru"
+     "verdict": "pass",
+     "measured": 114,
+     "worst_louder_db": 0.045,
+     "worst_quieter_db": -0.075,
+     "reason": "within +0.25/-1.0 dB of macOS on 114 cells"
     },
     {
      "key": "3f5c078bcc4fcfc0844794ffabb7494c1b53684f9a69e827235e839b7dba18f7",
@@ -1135,16 +1153,22 @@
       0,
       65535
      ],
-     "verdict": "refused",
-     "reason": "compiler-gaps: Tone2: level-dependent filters carry native multirate reconstruction and a knee-qualified release-to-idle carrier handoff; active-floor and release-tracking parity are pending"
+     "verdict": "pass",
+     "measured": 152,
+     "worst_louder_db": 0.028,
+     "worst_quieter_db": -0.026,
+     "reason": "within +0.25/-1.0 dB of macOS on 152 cells"
     },
     {
      "key": "2a412905c1c3f14f2180cf93bbf5799a4a9266d05908ec962532e44014b182d2",
      "aid": 38,
      "speaker_id": 3,
      "also_speaker_ids": [],
-     "verdict": "refused",
-     "reason": "compiler-gaps: Tone2: level-dependent filters carry native multirate reconstruction and a knee-qualified release-to-idle carrier handoff; active-floor and release-tracking parity are pending"
+     "verdict": "pass",
+     "measured": 152,
+     "worst_louder_db": 0.029,
+     "worst_quieter_db": -0.022,
+     "reason": "within +0.25/-1.0 dB of macOS on 152 cells"
     },
     {
      "key": "8a1d80440326e40d84109f9da24c61827cb411ffba480847dc53bd600fbf95eb",
@@ -1226,8 +1250,11 @@
      "aid": 42,
      "speaker_id": null,
      "also_speaker_ids": [],
-     "verdict": "refused",
-     "reason": "compiler-gaps: Tone1: level-dependent filters carry native multirate reconstruction and a knee-qualified release-to-idle carrier handoff; active-floor and release-tracking parity are pending; Tone2: level-dependent filters carry native multirate reconstru"
+     "verdict": "pass",
+     "measured": 114,
+     "worst_louder_db": 0.045,
+     "worst_quieter_db": -0.075,
+     "reason": "within +0.25/-1.0 dB of macOS on 114 cells"
     },
     {
      "key": "d0b2e49c11ab7bb34a2fe461623a00f868955b54fc4107ad08cfd24ee8763baf",
@@ -1237,16 +1264,22 @@
       0,
       65535
      ],
-     "verdict": "refused",
-     "reason": "compiler-gaps: Tone2: level-dependent filters carry native multirate reconstruction and a knee-qualified release-to-idle carrier handoff; active-floor and release-tracking parity are pending"
+     "verdict": "pass",
+     "measured": 152,
+     "worst_louder_db": 0.028,
+     "worst_quieter_db": -0.026,
+     "reason": "within +0.25/-1.0 dB of macOS on 152 cells"
     },
     {
      "key": "929b1cc0355357ae9d7ce8a09b94599df9aa21a6118071114299dbbf28ed2009",
      "aid": 43,
      "speaker_id": 3,
      "also_speaker_ids": [],
-     "verdict": "refused",
-     "reason": "compiler-gaps: Tone2: level-dependent filters carry native multirate reconstruction and a knee-qualified release-to-idle carrier handoff; active-floor and release-tracking parity are pending"
+     "verdict": "pass",
+     "measured": 152,
+     "worst_louder_db": 0.029,
+     "worst_quieter_db": -0.022,
+     "reason": "within +0.25/-1.0 dB of macOS on 152 cells"
     },
     {
      "key": "5e985890356f439301906f916069f225b64bb2cbcf87487baa88af85c516c845",
@@ -1264,7 +1297,7 @@
   {
    "build": "25G83",
    "reference": "macOS 26.6.2 25G83 Audio Units",
-   "rev": "ce49e11dbc749d5206b585b714e2d794a9307e53",
+   "rev": "2781bd016415d7ed30f348abc169d653c20ccb6e",
    "spread": {
     "sha256": "9ee1a2415e3e2887165c7acfdfdd85504b1c8f88e3ba06f2d0a527672b7668e8",
     "chaotic_max_dbfs": -60.0,
@@ -2054,7 +2087,7 @@
   {
    "build": "26A428",
    "reference": "macOS 27.0 26A428 Audio Units",
-   "rev": "ce49e11dbc749d5206b585b714e2d794a9307e53",
+   "rev": "2781bd016415d7ed30f348abc169d653c20ccb6e",
    "spread": null,
    "entries": [
     {
