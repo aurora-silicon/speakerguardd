@@ -565,6 +565,69 @@ def read_binding(path):
         return dict(line.strip().split("=", 1) for line in f if "=" in line)
 
 
+# ------------------------------------------------------- kernel interface
+
+# A dual kernel (linux integration/aurora 98cb6a86 and later) serves both
+# speaker protection interfaces on one card. "Speaker Volume Unlock" (the
+# older daemons: speakersafetyd, speakerguardd 0.1) is in charge at every
+# card bind. A root write of "Speaker Protection Interface" = "Speaker
+# Protection" hands the speakers to the v2 lease, through the floor; the
+# kernel hands them back to the volume lock (at its floor) after 30 s with
+# no owner of "Speaker Protection". The switch is state for the boot, never
+# saved by alsactl: v2 writes it again at every start, and only on a Mac
+# that aurora-speaker-upgrade switched (its setting file, root only).
+INTERFACE_CONTROL = "Speaker Protection Interface"
+IF_LEASE = "Speaker Protection"
+IF_UNLOCK = "Speaker Volume Unlock"
+UPGRADE_SETTING = "/var/lib/aurora-speaker-upgrade/interface"
+
+
+def upgraded(path=None):
+    """True when aurora-speaker-upgrade switched this Mac to v2 (its
+    persistent choice). Only that tool writes the file."""
+    try:
+        with open(path or UPGRADE_SETTING) as f:
+            return f.read() == "v2\n"
+    except OSError:
+        return False
+
+
+def _amixer(card, *args):
+    return subprocess.run(["amixer", "-c", str(card), *args], capture_output=True, text=True, timeout=10)
+
+
+def parse_enum(text):
+    """The current item's name from `amixer cget` of an enumerated control."""
+    items = dict(re.findall(r"; Item #(\d+) '([^']*)'", text))
+    m = re.search(r": values=(\d+)", text)
+    return items.get(m.group(1)) if m else None
+
+
+def interface_get(card):
+    """The card's "Speaker Protection Interface" item, or None when the
+    kernel has no such control (not a dual kernel)."""
+    r = _amixer(card, "cget", f"name={INTERFACE_CONTROL}")
+    if r.returncode != 0:
+        return None
+    cur = parse_enum(r.stdout)
+    if cur is None:
+        raise Refused(f"cannot read {INTERFACE_CONTROL!r} on card {card}: {r.stdout.strip()[-200:]}")
+    return cur
+
+
+def interface_lease(card):
+    """Puts a dual kernel's speakers on the v2 lease (root). Returns True if
+    it switched, False if the lease already was the interface."""
+    if interface_get(card) == IF_LEASE:
+        return False
+    r = _amixer(card, "-q", "cset", f"name={INTERFACE_CONTROL}", IF_LEASE)
+    if r.returncode != 0:
+        raise Refused(f"the kernel refused {INTERFACE_CONTROL!r} = {IF_LEASE!r}: {r.stderr.strip()[-200:]}")
+    if interface_get(card) != IF_LEASE:
+        raise Refused(f"{INTERFACE_CONTROL!r} did not switch to {IF_LEASE!r}")
+    return True
+
+
 def qualification(state, board, kernel, params=None, unit=None, units=None):
     """Require matching successful compile/provenance and silent-check records.
 

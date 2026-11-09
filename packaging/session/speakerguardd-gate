@@ -25,8 +25,13 @@ both, so exactly one of them runs on a board, chosen at boot:
   (/var/lib/aurora-speaker-upgrade/interface, written by
   aurora-speaker-upgrade after `speakerguardd-selfcheck verify` passed) says
   "v2" and every proof above holds; otherwise the older daemons run, on
-  the interface the kernel boots with. Nothing here writes the control:
-  aurora-speaker-upgrade's ExecStartPre does, after this condition passed.
+  the interface the kernel boots with. One exception: a switched Mac on a
+  kernel its silent switch test has not run on yet runs neither until the
+  test (after login) is done, so no older daemon holds the volume lock the
+  test takes; the lock's ceiling holds meanwhile. `interface` (the
+  supervisor's ExecStartPre, after this condition passed) writes the
+  control on every start: the kernel goes back to the volume lock 30 s
+  after the last owner of "Speaker Protection" closes.
 
 So the kernel is the switch. A fleet kernel without the v2 interface keeps
 every Mac on the older daemons; the kernel that brings the interface moves
@@ -158,6 +163,41 @@ def kernel_interface(wait):
     return ("v2" if v2 else "legacy"), card
 
 
+def check_failed(state, board):
+    """True when this kernel's silent self-check ran on this board and
+    failed (not merely missing or stale)."""
+    try:
+        b = wiring.read_binding(os.path.join(state, "selfcheck.bind"))
+    except OSError:
+        return False
+    return b.get("result") == "fail" and b.get("board") == board and b.get("kernel") == os.uname().release
+
+
+def interface(args):
+    """speakerguardd.service ExecStartPre, after its ExecCondition (`v2`)
+    placed this Mac on v2: on a dual kernel, put the speakers on the v2
+    lease for the supervisor that starts next (every start, so a restart
+    after the kernel went back to the volume lock takes it again). A no-op
+    on a kernel with one interface and on a Mac the upgrade did not switch.
+    Fails (the start fails; Restart= tries again) only when the kernel
+    refuses the switch."""
+    iface, card = kernel_interface(args.wait)
+    if iface != "dual":
+        return 0
+    if upgrade_setting(args.setting) != "v2":
+        log("not switching the speaker interface: the upgrade did not switch this Mac to v2")
+        return 0
+    try:
+        if wiring.interface_lease(card):
+            log(f"{INTERFACE_CONTROL!r} = {wiring.IF_LEASE!r} on {card}: speakerguardd v2 takes the lease next")
+        else:
+            log(f"{INTERFACE_CONTROL!r} is already {wiring.IF_LEASE!r} on {card}")
+    except (wiring.Refused, OSError, subprocess.TimeoutExpired) as e:
+        log(f"the speaker interface switch failed: {e}")
+        return 1
+    return 0
+
+
 def decide(args):
     """(v2 runs, legacy runs, reason)."""
     with open(args.gate) as f:
@@ -167,9 +207,11 @@ def decide(args):
         return False, True, "no Apple device tree: not an Apple Silicon Mac"
     units = []
     why_not = None
+    policy_ok = False
     try:
         units = tuning_units(args.tuning_cli)
         gen.qualification_policy(board, units, gate)
+        policy_ok = True
         if getattr(args, "cmd", "v2") != "prepare":
             wiring.qualification(getattr(args, "state", "/var/lib/speakerguardd"), board,
                                  os.uname().release, unit=wiring.unit_id(args.dt), units=units)
@@ -181,6 +223,17 @@ def decide(args):
     if why_not:
         if iface == "v2":
             return False, False, f"{why_not}; the kernel has the v2 interface ({card}), so the older daemons have nothing to own: the kernel holds the speakers at its floor"
+        if (iface == "dual" and policy_ok and upgrade_setting(getattr(args, "setting", None)) == "v2"
+                and not check_failed(getattr(args, "state", "/var/lib/speakerguardd"), board)):
+            # Switched by the upgrade, on a kernel this Mac's silent switch
+            # test has not run on yet (it runs after login, on the v2 lease):
+            # an older daemon started now would hold the volume lock the
+            # switch test takes from it. Neither runs until the test is done;
+            # the kernel's volume lock holds the speakers at its ceiling. A
+            # failed test sends the Mac back to the older daemons.
+            return False, False, (f"{why_not}; the kernel serves both interfaces ({card}) and the upgrade switched this "
+                                  "Mac to v2, which waits for its silent switch test: the volume lock holds the speakers "
+                                  "at its ceiling")
         if iface == "dual":
             return False, True, f"{why_not}; the kernel serves both interfaces ({card}): the older daemons protect the speakers"
         return False, True, f"{why_not}; the older daemons protect the speakers"
@@ -197,7 +250,7 @@ def decide(args):
 
 def main():
     ap = argparse.ArgumentParser(prog="speakerguardd-gate")
-    ap.add_argument("cmd", choices=["prepare", "v2", "legacy", "explain"])
+    ap.add_argument("cmd", choices=["prepare", "v2", "legacy", "explain", "interface"])
     ap.add_argument("--gate", default="/usr/share/speakerguardd/gate.json")
     ap.add_argument("--dt", default=DT)
     ap.add_argument("--state", default="/var/lib/speakerguardd")
@@ -205,6 +258,8 @@ def main():
     ap.add_argument("--wait", type=float, default=15.0, help="seconds to wait for the speaker card")
     ap.add_argument("--setting", default=UPGRADE_SETTING, help="the upgrade's persistent interface choice")
     args = ap.parse_args()
+    if args.cmd == "interface":
+        return interface(args)
     try:
         v2, legacy, why = decide(args)
     except (OSError, ValueError) as e:
