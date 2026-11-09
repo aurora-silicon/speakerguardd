@@ -540,6 +540,10 @@ def cmd_run(args, p):
             rec["compiled"] = True
         else:
             log(f"the blob is bound to {rec['board']}, {rec['kernel']}, {rec['aid']} from macOS {rec['macos_build']}: not recompiling")
+        # Compiled from this Mac's own Apple tuning: root only at rest,
+        # whatever the caller's umask. (The session's plugin reads the copy
+        # the supervisor publishes in /run, never this one.)
+        os.chmod(p.params, 0o600)
         user, how = resolve_seat_user(p, override, etc=args.etc)
         pw = pwd.getpwnam(user)
         rec.update(seat_user=user, seat_how=how)

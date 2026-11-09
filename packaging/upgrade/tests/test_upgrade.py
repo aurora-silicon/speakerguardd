@@ -312,6 +312,31 @@ class V2Umask(unittest.TestCase):
             os.umask(old)
 
 
+class StorePermissions(unittest.TestCase):
+    """The store holds this Mac's extracted Apple tuning: root only (0700
+    directories, 0600 files) after a run, whatever umask v2's own programs
+    get (B4 gave them 022)."""
+
+    def test_store_is_root_only_after_a_run(self):
+        import stat, tempfile
+        from aurora_speaker_upgrade import upgrade as up
+        old = os.umask(0o077)  # what main() sets
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                st = up.Store(os.path.join(d, "store"))
+                st.ensure()
+                st.put_bundle({"manifest.json": b"{}", "tuning/AID13/a.aupreset": b"x" * 16})
+                up.write_file(st.interface, "v2\n", 0o600)
+                st.save({"switched": True})
+                up.run_v2(["true"])  # v2 subprocesses get 022, the store does not change
+                for root, dirs, files in os.walk(st.root):
+                    self.assertEqual(stat.S_IMODE(os.stat(root).st_mode), 0o700, root)
+                    for f in files:
+                        self.assertEqual(stat.S_IMODE(os.stat(os.path.join(root, f)).st_mode), 0o600, f)
+        finally:
+            os.umask(old)
+
+
 class LegacyStart(unittest.TestCase):
     """RC8 E2E B2: a revert starts the older daemon the packaged udev rules
     want for the sense PCM, never every installed one (speakerguardd 0.1

@@ -805,6 +805,19 @@ class Umask(Base):
             self.assertEqual(stat.S_IMODE(os.stat(d).st_mode), 0o755, d)
 
 
+    def test_the_blob_from_the_macs_own_tuning_stays_root_only(self):
+        """The graph directories open up for the session; the compiled blob
+        at rest does not, under the units' umask or the upgrade tool's."""
+        import stat
+        for mask in (0o022, 0o077):
+            old = os.umask(mask)
+            try:
+                self.assertEqual(self.run_(force=True), 0)
+            finally:
+                os.umask(old)
+            self.assertEqual(stat.S_IMODE(os.stat(self.p.params).st_mode), 0o600, oct(mask))
+
+
 class Deactivate(Base):
     def test_revert_removes_the_v2_graph(self):
         os.makedirs(os.path.join(self.p.graph, "pipewire"), exist_ok=True)
