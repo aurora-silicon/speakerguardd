@@ -32,10 +32,12 @@ this Mac's own tuning, and back.
 import argparse
 import contextlib
 import fcntl
+import hashlib
 import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -52,12 +54,14 @@ STORE = "/var/lib/aurora-speaker-upgrade"
 LOCK = "/run/aurora-speaker-upgrade.lock"
 PROVISION_CONF = "/etc/speakerguardd/provision.conf"
 PARAMS = "/var/lib/speakerguardd/params.bin"
+V2_CONF = "/etc/speakerguardd/speakerguardd.conf"
 STATE_V2 = "/var/lib/speakerguardd"
 LIBEXEC = ("/usr/libexec/speakerguardd-v2", "/usr/libexec/speakerguardd")
 INTERFACE_CTL = "Speaker Protection Interface"
 IF_V2, IF_LEGACY = "Speaker Protection", "Speaker Volume Unlock"
 V2_UNITS = ("speakerguardd-v2.service", "speakerguardd.service")
 GRANT_WAIT_S = 30
+PARITY = ("/usr/share/speakerguardd/parity.json",)
 MARK = "# aurora-speaker-upgrade: the bundle collected for this Mac"
 
 EXIT_OK, EXIT_REFUSED, EXIT_RETRY, EXIT_ERROR = 0, 1, 2, 3
@@ -314,15 +318,40 @@ def provision(store, a):
         raise Refused(f"speakerguardd v2 could not compile this Mac's tuning (exit {r.returncode})")
 
 
-def selfcheck(a):
+def v2_tuning_args(conf=None):
+    """The tuning source the units pass the self-check (SGV2_TUNING)."""
+    with contextlib.suppress(OSError):
+        with open(conf or V2_CONF) as f:
+            for line in f:
+                if line.startswith("SGV2_TUNING="):
+                    return shlex.split(line.split("=", 1)[1])
+    return []
+
+
+def selfcheck(a, mode=None):
     """SGFIX's verify: 0 pass, 1 refused, 2 cannot run, 3 error. Until
     `verify` exists: a passing record for this kernel and blob, else a full
-    `run`."""
+    `run`. On a dual kernel the hardware record of this kernel is made
+    first (`run --switch-interface`: reused at once when it is bound
+    already), with the speakers on the v2 lease, so verify has it."""
     p = tool("speakerguardd-selfcheck")
     if not p:
         raise Refused("speakerguardd v2 is not installed (no speakerguardd-selfcheck)")
     js = os.path.join(a.scratch, "selfcheck.json")
+    os.makedirs(a.scratch, mode=0o700, exist_ok=True)
     h = run([p, "--help"])
+    if mode == "dual" and "--switch-interface" in h.stdout + h.stderr:
+        r = run([p, "run", "--switch-interface", "--params", PARAMS, "--", *v2_tuning_args()])
+        sys.stderr.write(r.stderr[-3000:])
+        if r.returncode != 0:
+            raise Refused(f"the silent hardware self-check failed on this kernel (exit {r.returncode}): "
+                          "the legacy protection keeps the speakers")
+        # The boot did not prepare v2 on a Mac that was not switched yet (the
+        # gate kept the older daemons), and a revert removed the graph:
+        # generate it from the record just made and bring the session onto
+        # it (as speakerguardd-selfcheck.service's ExecStartPost does at
+        # boot), so verify's graph step sees it.
+        graph_activate()
     if re.search(r"\bverify\b", h.stdout + h.stderr):
         r = run([p, "verify", "--params", PARAMS, "--json", js])
         code = r.returncode
@@ -388,6 +417,30 @@ def v2_unit():
 def legacy_units():
     v2 = v2_unit()
     return [u for u in ("speakersafetyd.service", "speakerguardd.service") if u != v2]
+
+
+def graph_unit():
+    return "speakerguardd-v2-graph.service" if v2_unit() == "speakerguardd-v2.service" else "speakerguardd-graph.service"
+
+
+def graph_activate():
+    p = tool("speakerguardd-provision")
+    if not p:
+        return
+    r = run([p, "activate", "--graph-unit", graph_unit()])
+    sys.stderr.write(r.stderr[-1000:])
+    if r.returncode != 0:
+        raise Refused(f"speakerguardd v2 could not generate this Mac's speaker graph (exit {r.returncode})")
+
+
+def graph_deactivate():
+    """v2's session graph goes too, so the seat user's running session plays
+    through the distribution's speaker graph again in this boot."""
+    p = tool("speakerguardd-provision")
+    if not p or "deactivate" not in run([p, "--help"]).stdout:
+        return
+    r = run([p, "deactivate", "--graph-unit", graph_unit()])
+    sys.stderr.write(r.stderr[-1000:])
 
 
 def legacy_start():
@@ -526,7 +579,7 @@ def cmd_collect(a):
     return EXIT_OK
 
 
-def cmd_run(a):
+def _cmd_run(a):
     store = Store(a.store)
     identity = collect.Identity(a.adt)
     if not identity.matches_dt():
@@ -561,13 +614,15 @@ def cmd_run(a):
     since = time.strftime("%Y-%m-%d %H:%M:%S")
     try:
         if mode == "dual":
+            legacy_stop()
+        provision(store, a)
+        if mode == "dual":
             # The self-check takes a v2 lease itself: v2 must own the
             # interface while it runs; the kernel falls back to legacy (from
-            # the floor) if no lease follows within 30 s.
-            legacy_stop()
+            # the floor) 30 s after the last owner closes, and speakerguardd's
+            # ExecStartPre switches it again when the supervisor starts.
             interface_set(card, IF_V2)
-        provision(store, a)
-        selfcheck(a)
+        selfcheck(a, mode)
     except (Refused, Retry):
         back_to_legacy(store, state, mode, card)
         raise
@@ -586,6 +641,59 @@ def cmd_run(a):
     return EXIT_OK
 
 
+def refusal_key(identity):
+    """What a refusal depends on: this unit, the running kernel, and the code
+    and data that judged it (this tool, v2's provisioning and self-check, the
+    parity attestation). A new kernel, a v2 update or a new attestation makes
+    the boot unit try again; nothing else does."""
+    h = hashlib.sha256()
+    h.update(f"{identity.unit}\0{os.uname().release}\0".encode())
+    for p in [os.path.abspath(__file__), tool("speakerguardd-provision"), tool("speakerguardd-selfcheck"), *PARITY]:
+        try:
+            with open(p or "", "rb") as f:
+                h.update(hashlib.sha256(f.read()).digest())
+        except OSError:
+            h.update(b"-")
+    return h.hexdigest()
+
+
+def cmd_run(a):
+    """run, plus the boot unit's refusal record: a Mac the self-check (or the
+    collection) refused is not tried again at every boot, which would stop
+    and restart the legacy protection each time for the same answer. The
+    record lives in the store and is keyed by refusal_key(); `run` by hand
+    always tries again."""
+    store = Store(a.store)
+    identity = collect.Identity(a.adt)
+    record = os.path.join(store.root, "refused.json")
+    key = refusal_key(identity)
+    if getattr(a, "at_boot", False):
+        try:
+            with open(record) as f:
+                old = json.load(f)
+        except (OSError, ValueError):
+            old = {}
+        if old.get("key") == key:
+            say(f"refused before for this kernel and this speakerguardd ({old.get('when')}): {old.get('reason')}; "
+                "the legacy protection keeps the speakers (run 'aurora-speaker-upgrade run' to try again)")
+            return EXIT_OK
+    try:
+        code = _cmd_run(a)
+    except (Refused, collect.CollectError) as e:
+        with contextlib.suppress(Exception):
+            store.ensure()
+            fd = os.open(record, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "w") as f:
+                json.dump({"key": key, "reason": str(e).splitlines()[0],
+                           "when": time.strftime("%Y-%m-%dT%H:%M:%S%z")}, f, indent=2, sort_keys=True)
+                f.write("\n")
+        raise
+    if code == EXIT_OK:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(record)
+    return code
+
+
 def back_to_legacy(store, state, mode, card):
     with contextlib.suppress(FileNotFoundError):
         os.unlink(store.interface)
@@ -601,6 +709,7 @@ def back_to_legacy(store, state, mode, card):
         systemctl("stop", v2_unit())
         with contextlib.suppress(Refused):
             interface_set(card, IF_LEGACY)
+        graph_deactivate()
         legacy_start()
     else:
         # A fleet kernel (v2 interface only): the stack that ran before
@@ -682,6 +791,8 @@ def main(argv=None):
     ap.add_argument("--macos-build", help="route 2: this macOS build")
     ap.add_argument("--collection", help="route 3: the installer's macOS collection tarball")
     ap.add_argument("--no-switch", action="store_true", help="collect and store only")
+    ap.add_argument("--at-boot", action="store_true",
+                    help="run: skip a Mac refused before for the same kernel and speakerguardd (the boot unit)")
     ap.add_argument("--force", action="store_true", help="recompile even if bound")
     ap.add_argument("--out", help="collect: the directory to write the bundle to (must not exist)")
     ap.add_argument("--store", default=STORE)

@@ -354,6 +354,26 @@ class Generated(unittest.TestCase):
                     self.assertIn(f'node.group             = "{n["group"]}"', block)
                     self.assertIn('/Internal"', block)
 
+    def test_every_sink_of_the_graph_holds_the_pcm_rate(self):
+        # The amps PCM runs at audio.rate with resampling off. A start after
+        # a grant, a wake or a boot takes the highest rate of a driver's
+        # followers, and while the amps wait for their grant the voicing
+        # sink runs on another driver at a playing client's rate: a 44.1 kHz
+        # client then wedged the path (the amps can never start). The amps
+        # sink, the protect stage and the voicing sink hold the PCM rate.
+        for m in gen.machines():
+            c, w = gen.machine(m)
+            for voicing_pre in (False, True):
+                text = gen.pipewire_conf(m, c, w, voicing_pre=voicing_pre)
+                sink = text.split("factory.name           = api.alsa.pcm.sink", 1)[1].split("}", 1)[0]
+                self.assertIn(f"audio.rate             = {c['rate']}", sink)
+                self.assertIn(f"node.force-rate        = {c['rate']}", sink)
+                protect = text.split(f'node.name          = "{gen.names(m)["protect"]}"', 1)[1].split("}", 1)[0]
+                self.assertIn(f"node.force-rate    = {c['rate']}", protect)
+                if voicing_pre:
+                    voicing = text.split(f'node.name = "sgv2.voicing.{m}"', 1)[1].split("}", 1)[0]
+                    self.assertIn(f"node.force-rate = {c['rate']}", voicing)
+
     def test_generated_files_are_current(self):
         import subprocess
         import sys

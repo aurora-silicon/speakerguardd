@@ -231,6 +231,11 @@ struct Instance {
     /// The Mac's filtering ahead of the unit, and its output.
     pre: Box<PreStage>,
     scratch: Box<[[f32; SCRATCH_FRAMES]; MAX_CHANNELS]>,
+    /// Private copies of the sense ports and the unit's output: LV2 lets a
+    /// host connect ports in place (an output may share any input's buffer),
+    /// so every input is copied before any output is written.
+    sense_scratch: Box<[[f32; SCRATCH_FRAMES]; MAX_SENSE]>,
+    out_scratch: Box<[[f32; SCRATCH_FRAMES]; MAX_CHANNELS]>,
     /// Follows the kernel's speaker grant (a watcher thread).
     gate: gate::Gate,
     /// The gain the grant puts on the program.
@@ -288,6 +293,8 @@ unsafe extern "C" fn instantiate(
         params_crc,
         pre: Box::new(pre),
         scratch: Box::new([[0.0; SCRATCH_FRAMES]; MAX_CHANNELS]),
+        sense_scratch: Box::new([[0.0; SCRATCH_FRAMES]; MAX_SENSE]),
+        out_scratch: Box::new([[0.0; SCRATCH_FRAMES]; MAX_CHANNELS]),
         gate: gate::Gate::watch(),
         ramp: gate::Ramp::new(rate),
     });
@@ -379,9 +386,7 @@ fn at(ports: &[*mut f32; MAX_PORTS], p: usize, off: usize) -> *mut f32 {
 fn run_chunk(instance: &mut Instance, page: Option<&page::EnginePage>, off: usize, frames: usize) {
     let (n, s) = (instance.channels, instance.sense);
     let empty: &[f32] = &[];
-    let mut input = [empty; MAX_CHANNELS];
     let mut sense = [empty; MAX_SENSE];
-    let mut out_store: [&mut [f32]; MAX_CHANNELS] = Default::default();
     // A missing program port: every connected output gets the 20 dB
     // fail-safe of its own input (silence without one), never a stale
     // buffer, and the call still reports and beats.
@@ -410,35 +415,32 @@ fn run_chunk(instance: &mut Instance, page: Option<&page::EnginePage>, off: usiz
         finish_call(instance, page, frames, Health(Health::FAILSAFE | Health::CHANNEL_MISMATCH));
         return;
     }
-    // The core needs distinct input and output buffers. PipeWire's
-    // filter-graph gives every port its own buffer; if a host ever connects
-    // a channel in place, every output is muted for that call rather than
-    // run on aliased memory.
-    let aliased = (0..n).any(|c| (0..n).any(|k| core::ptr::eq(instance.ports[c], instance.ports[n + k])));
-    if aliased {
-        for c in 0..n {
-            // SAFETY: connected audio ports hold `frames` samples.
-            unsafe { core::slice::from_raw_parts_mut(at(&instance.ports, n + c, off), frames) }.fill(0.0);
-        }
-        finish_call(instance, page, frames, Health(Health::FAILSAFE | Health::CHANNEL_MISMATCH));
-        return;
-    }
+    // LV2 lets a host connect ports in place: an output may share its own
+    // input's buffer, another channel's, or a sense port's. Every program
+    // and sense input is copied into private storage first; the unit then
+    // writes private storage, and only that is copied to the output ports.
     for c in 0..n {
-        // SAFETY: connected audio ports hold `frames` samples and are
-        // distinct buffers (checked above).
-        unsafe {
-            input[c] = core::slice::from_raw_parts(at(&instance.ports, c, off), frames);
-            out_store[c] = core::slice::from_raw_parts_mut(at(&instance.ports, n + c, off), frames);
+        // SAFETY: connected audio ports hold `frames` samples (checked
+        // above: no program port is null). Read only, before any write.
+        let src = unsafe { core::slice::from_raw_parts(at(&instance.ports, c, off), frames) };
+        instance.scratch[c][..frames].copy_from_slice(src);
+    }
+    let mut sense_n = 0;
+    for k in 0..s {
+        let p = at(&instance.ports, 2 * n + k, off);
+        if p.is_null() {
+            break;
         }
+        // SAFETY: as above; copied before any output port is written.
+        let src = unsafe { core::slice::from_raw_parts(p, frames) };
+        instance.sense_scratch[k][..frames].copy_from_slice(src);
+        sense_n = k + 1;
     }
     // The Mac's own filtering ahead of the unit (the pre-stage): the unit
     // protects what the speakers will actually be driven with.
     let mut filtered = [empty; MAX_CHANNELS];
     {
         let (pre, scratch) = (&mut instance.pre, &mut instance.scratch);
-        for c in 0..n {
-            scratch[c][..frames].copy_from_slice(&input[c][..frames]);
-        }
         // filters, gains and the graph's compressor boxes in graph order
         // (each box linked across every channel)
         let mut bufs: [&mut [f32]; MAX_CHANNELS] = Default::default();
@@ -454,21 +456,26 @@ fn run_chunk(instance: &mut Instance, page: Option<&page::EnginePage>, off: usiz
     for (f, buf) in filtered.iter_mut().zip(instance.scratch.iter()).take(n) {
         *f = &buf[..frames];
     }
-    let mut sense_n = 0;
-    for (k, slot) in sense.iter_mut().enumerate().take(s) {
-        let p = at(&instance.ports, 2 * n + k, off);
-        if p.is_null() {
-            break;
-        }
-        // SAFETY: as above.
-        *slot = unsafe { core::slice::from_raw_parts(p, frames) };
-        sense_n = k + 1;
+    for (slot, src) in sense.iter_mut().zip(instance.sense_scratch.iter()).take(sense_n) {
+        *slot = &src[..frames];
+    }
+    let mut out_store: [&mut [f32]; MAX_CHANNELS] = Default::default();
+    for (slot, dst) in out_store.iter_mut().zip(instance.out_scratch.iter_mut()).take(n) {
+        *slot = &mut dst[..frames];
     }
     // An incomplete sense bus is no bus: the unit runs open loop.
     let sense_slice = if sense_n == s { &sense[..s] } else { &sense[..0] };
     let unit = instance.unit.as_dyn();
     let latency = unit.latency_frames() as f32;
     let health = unit.process(Io { frames, input: &filtered[..n], sense: sense_slice, output: &mut out_store[..n] });
+    for c in 0..n {
+        // SAFETY: connected output ports hold `frames` samples; the source
+        // is private storage. A raw copy creates no reference to host
+        // memory, so two outputs sharing one buffer are not two `&mut`.
+        unsafe {
+            core::ptr::copy_nonoverlapping(instance.out_scratch[c].as_ptr(), at(&instance.ports, n + c, off), frames)
+        };
+    }
     instance.frames += frames as u64;
     if instance.unit.unit().save_state(&mut instance.handoff) {
         handoff::SLOT.publish(&instance.handoff);

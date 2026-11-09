@@ -5,6 +5,7 @@ with a stand-in tuning reader, device tree and speaker card.
     python3 -I packaging/session/test_provision.py
 """
 import contextlib
+import glob
 import hashlib
 import importlib.machinery
 import importlib.util
@@ -788,6 +789,23 @@ class LV2Shadow(unittest.TestCase):
     def test_system_dirs_are_the_packaged_ones(self):
         self.assertEqual(self.scan(environ={"LV2_PATH": "/usr/lib64/lv2:/usr/lib/lv2"}), [])
 
+class Deactivate(Base):
+    def test_revert_removes_the_v2_graph(self):
+        os.makedirs(os.path.join(self.p.graph, "pipewire"), exist_ok=True)
+        f = os.path.join(self.p.graph, "pipewire", "sgv2-j316.conf")
+        prov.write_atomic(f, "context.modules = []\n")
+        prov.write_atomic(self.p.graph_state, "result=pass\nuser=ryan\n")
+        prov.write_raw_rules(self.p, "AppleJ316")
+        raw = glob.glob(os.path.join(self.p.raw, "*.conf"))
+        self.assertTrue(raw)
+        a = types.SimpleNamespace(graph_unit="speakerguardd-graph.service")
+        self.assertEqual(prov.cmd_deactivate(a, self.p), 0)
+        self.assertFalse(os.path.exists(f))
+        self.assertFalse(any(os.path.exists(r) for r in raw))
+        self.assertFalse(os.path.exists(os.path.join(self.p.graph, "speakerguardd-owns-speakers")))
+        self.assertEqual(prov.read_kv(self.p.graph_state)["result"], "legacy")
+
+
 class Gate(Base):
     def decide(self, iface="v2", gate_data=None, cmd="v2"):
         g = os.path.join(self.t, "gate.json")
@@ -864,6 +882,59 @@ class Gate(Base):
         # the v2-only kernel is unchanged
         self.assertEqual(self.decide("v2"), (False, False))
         os.unlink(setting)
+
+    def test_dual_kernel_switched_mac_waits_for_its_switch_test(self):
+        """A switched Mac on a kernel its switch test has not run on: neither
+        daemon (no older daemon holding the volume lock the test takes); a
+        failed test sends it back to the older daemons."""
+        setting = os.path.join(self.t, "upgrade-interface")
+        self.board("j999")
+        self.ctl({"board": "j999"})
+        self.assertEqual(self.run_(), 0)
+        with open(setting, "w") as f:
+            f.write("v2\n")
+        self.checked(kernel="another-kernel")
+        self.assertEqual(self.decide("dual"), (False, False))
+        self.assertEqual(self.decide("dual", cmd="prepare"), (True, False))
+        self.checked(result="fail")
+        self.assertEqual(self.decide("dual"), (False, True))
+        self.checked()
+        self.assertEqual(self.decide("dual"), (True, False))
+        os.unlink(setting)
+        self.checked(kernel="another-kernel")
+        self.assertEqual(self.decide("dual"), (False, True))
+
+    def test_dual_kernel_refused_board_keeps_the_older_daemons(self):
+        with open(os.path.join(self.t, "upgrade-interface"), "w") as f:
+            f.write("v2\n")
+        self.board("j999")
+        self.ctl({"board": "j999", "refusals": [{"code": "synthetic-refusal"}]})
+        self.assertEqual(self.run_(), 1)
+        self.assertEqual(self.decide("dual"), (False, True))
+        self.assertEqual(self.decide("v2"), (False, False))
+
+    def test_interface_switches_only_dual_and_upgraded(self):
+        sets = []
+        state = {"iface": "dual"}
+        setting = os.path.join(self.t, "upgrade-interface")
+        self.patch(gate, "kernel_interface", lambda wait: (state["iface"], "AppleX"))
+        self.patch(gate.wiring, "interface_lease", lambda card: sets.append(card) or True)
+        a = types.SimpleNamespace(wait=0, setting=setting)
+        self.assertEqual(gate.interface(a), 0)
+        self.assertEqual(sets, [])
+        with open(setting, "w") as f:
+            f.write("v2\n")
+        self.assertEqual(gate.interface(a), 0)
+        self.assertEqual(sets, ["AppleX"])
+        state["iface"] = "v2"
+        self.assertEqual(gate.interface(a), 0)
+        self.assertEqual(sets, ["AppleX"])
+        state["iface"] = "dual"
+
+        def refuse(card):
+            raise gate.wiring.Refused("-EIO")
+        self.patch(gate.wiring, "interface_lease", refuse)
+        self.assertEqual(gate.interface(a), 1)
 
     def test_unlisted_board_silent_check_and_full_voicing_generation(self):
         import gen

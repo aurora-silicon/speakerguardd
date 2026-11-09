@@ -60,6 +60,13 @@ into the file a Mac checks before v2 may take its speakers (`packaging/session/p
 - The file holds keys, verdicts, reasons and summary numbers only. Every render and the per-cell rows
   (`--details`) stay in private, tainted directories.
 
+- The file holds one block per macOS release (`releases[].build`, format 2). `verify` takes the
+  block whose build is the one the Mac's tuning bundle came from. A bundle from a build with no
+  block is refused ("macOS 26A428 has no parity attestation"), even when another release's block
+  holds the same tuning key: that release's Audio Units, not this build's, were the reference.
+  New macOS builds therefore get coverage by a run of the steps below on that build, never by
+  inheritance from an older one.
+
 ### Floor residue
 
 Both `gate.py` and `attest.py` apply one per-measurement rule, the same for every tuning (it names
@@ -104,7 +111,7 @@ So the gate measures that spread on macOS itself:
    40 dB under its lane's own peak. A main-band measurement keeps the ordinary tolerance whatever
    the spread, so a main-band cell louder than macOS still fails.
 3. `spread-25G83.json` (this directory) holds tuning keys, cell names and spread values only: no
-   Apple data. `parity.json` records the spread file's SHA-256 next to the tolerance. Regenerate
+   Apple data. `parity.json` records the spread file's SHA-256 and the rule's limits in that release's block (`releases[].spread`); a release without a spread file is gated by the ordinary rule. Regenerate
    both for every macOS release, from the same references (`attest_refs.sh` once per perturbed
    program: `GATE`-side `perturb.py`).
 
@@ -129,7 +136,7 @@ Each run regenerates the spread file too (step 3 in `attest.py`), before the gat
 
 ```text
 # buildbox
-attest.py variants --bin BIN --tunings NEW_TREE --tunings-fallback HOST_TREE --out variants.json
+attest.py variants --bin BIN --build BUILD --tunings NEW_TREE --tunings-fallback HOST_TREE --out variants.json
 # host Mac on that release, under a host-heavy slot (about 2 s per tuning)
 BOXHOST=.../box_host SCRATCH=... PROG=prog.f32 attest_refs.sh SLOT variants.json
 # buildbox (about 1 min for 63 tunings with 12 jobs)

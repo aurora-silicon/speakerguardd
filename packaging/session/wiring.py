@@ -101,15 +101,21 @@ SENSE_BITS = 16
 #   ~10 quanta, and the speaker driver xruns: 42 xruns at every M2 boot when
 #   chrony corrected the boot clock (0.37 s, 15.5-20.3 s after boot), 34
 #   on a forced 0.4 s slew; 0 of either with period interrupts (SGCHK
-#   2026-11-09). MCA raises a period interrupt per period; the AOP
-#   transports' cadence is unproven here and keeps the timer.
+#   2026-11-09). MCA raises a period interrupt per period. The T6040 AOP
+#   speaker service's playback is a cyclic ADMAC channel with a callback per
+#   period: on the J616s the channel's line ran 494/s with the 400/s sense
+#   ring, i.e. 94/s of playback against 93.75/s for 512-frame periods, and
+#   with period interrupts a forced 0.4 s slew re-prepared the speaker PCM
+#   0 times (timer: 14 SETUP/XRUN restarts and 27 sense resyncs, SINKGAP
+#   2026-11-09). The T8140/T8142 transports' cadence is unproven here and
+#   keeps the timer.
 TRANSPORTS = {
     # sound/soc/apple/mca.c: S16_LE, S24_LE, S32_LE
     "apple,mca": {"transport": "mca", "formats": ["S16_LE", "S24_LE", "S32_LE"], "sense_batch": True, "speaker_headroom": 0,
                   "speaker_irq": True},
     # sound/soc/apple/aop_spkr.rs (T6040 speaker service): S24_LE playback, S16_LE sense
     "apple,t6041-aop-audio": {"transport": "aop-spkr", "formats": ["S24_LE"], "sense_batch": False, "speaker_headroom": 256,
-                              "speaker_irq": False},
+                              "speaker_irq": True},
     # sound/soc/apple/aop_t8140.rs: S32_LE playback, no sense
     "apple,t8140-aop-audio": {"transport": "aop-t8140", "formats": ["S32_LE"], "sense_batch": True, "speaker_headroom": 0,
                               "speaker_irq": False},
@@ -557,6 +563,69 @@ def protection_units(dump):
 def read_binding(path):
     with open(path) as f:
         return dict(line.strip().split("=", 1) for line in f if "=" in line)
+
+
+# ------------------------------------------------------- kernel interface
+
+# A dual kernel (linux integration/aurora 98cb6a86 and later) serves both
+# speaker protection interfaces on one card. "Speaker Volume Unlock" (the
+# older daemons: speakersafetyd, speakerguardd 0.1) is in charge at every
+# card bind. A root write of "Speaker Protection Interface" = "Speaker
+# Protection" hands the speakers to the v2 lease, through the floor; the
+# kernel hands them back to the volume lock (at its floor) after 30 s with
+# no owner of "Speaker Protection". The switch is state for the boot, never
+# saved by alsactl: v2 writes it again at every start, and only on a Mac
+# that aurora-speaker-upgrade switched (its setting file, root only).
+INTERFACE_CONTROL = "Speaker Protection Interface"
+IF_LEASE = "Speaker Protection"
+IF_UNLOCK = "Speaker Volume Unlock"
+UPGRADE_SETTING = "/var/lib/aurora-speaker-upgrade/interface"
+
+
+def upgraded(path=None):
+    """True when aurora-speaker-upgrade switched this Mac to v2 (its
+    persistent choice). Only that tool writes the file."""
+    try:
+        with open(path or UPGRADE_SETTING) as f:
+            return f.read() == "v2\n"
+    except OSError:
+        return False
+
+
+def _amixer(card, *args):
+    return subprocess.run(["amixer", "-c", str(card), *args], capture_output=True, text=True, timeout=10)
+
+
+def parse_enum(text):
+    """The current item's name from `amixer cget` of an enumerated control."""
+    items = dict(re.findall(r"; Item #(\d+) '([^']*)'", text))
+    m = re.search(r": values=(\d+)", text)
+    return items.get(m.group(1)) if m else None
+
+
+def interface_get(card):
+    """The card's "Speaker Protection Interface" item, or None when the
+    kernel has no such control (not a dual kernel)."""
+    r = _amixer(card, "cget", f"name={INTERFACE_CONTROL}")
+    if r.returncode != 0:
+        return None
+    cur = parse_enum(r.stdout)
+    if cur is None:
+        raise Refused(f"cannot read {INTERFACE_CONTROL!r} on card {card}: {r.stdout.strip()[-200:]}")
+    return cur
+
+
+def interface_lease(card):
+    """Puts a dual kernel's speakers on the v2 lease (root). Returns True if
+    it switched, False if the lease already was the interface."""
+    if interface_get(card) == IF_LEASE:
+        return False
+    r = _amixer(card, "-q", "cset", f"name={INTERFACE_CONTROL}", IF_LEASE)
+    if r.returncode != 0:
+        raise Refused(f"the kernel refused {INTERFACE_CONTROL!r} = {IF_LEASE!r}: {r.stderr.strip()[-200:]}")
+    if interface_get(card) != IF_LEASE:
+        raise Refused(f"{INTERFACE_CONTROL!r} did not switch to {IF_LEASE!r}")
+    return True
 
 
 def qualification(state, board, kernel, params=None, unit=None, units=None):
