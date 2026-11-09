@@ -158,7 +158,7 @@ fn zero_port_control_sum_selects_tone_groups_at_runtime() {
 
 /// A level-dependent notch (tmst slot type 15) compiles as a carried box,
 /// not a compiler gap, and acts on level: a loud tone at its frequency is
-/// cut by up to its range, a quiet one passes, and a loud tone well away
+/// cut by its ratio law up to its range, a quiet one passes, and a loud tone well away
 /// from it passes. Synthetic values only.
 #[test]
 fn level_dependent_notch_is_carried_and_follows_level() {
@@ -205,10 +205,14 @@ fn level_dependent_notch_is_carried_and_follows_level() {
         20.0 * (rms / (a / 2f64.sqrt())).log10()
     };
     let loud = level(1000.0, -6.0);
+    let mid = level(1000.0, -30.0);
     let quiet = level(1000.0, -80.0);
     let away = level(100.0, -6.0);
-    assert!((-12.5..=-6.0).contains(&loud), "loud tone at the notch: {loud} dB");
-    assert!(quiet.abs() < 0.1, "quiet tone at the notch: {quiet} dB");
+    // 34 dB over the threshold: the cut reaches the range
+    assert!((-12.5..=-11.0).contains(&loud), "loud tone at the notch: {loud} dB");
+    // 10 dB over at ratio 4: about 7.5 dB of cut
+    assert!((-8.5..=-6.5).contains(&mid), "tone 10 dB over the threshold: {mid} dB");
+    assert!(quiet.abs() < 0.25, "quiet tone at the notch: {quiet} dB");
     assert!(away.abs() < 0.5, "loud tone an octave and more away: {away} dB");
     assert!(loud < quiet - 6.0);
 }
