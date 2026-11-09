@@ -126,7 +126,7 @@ fn rsqrt_step(a: f32, b: f32) -> f32 {
 /// power sum `im*im + re*re`, the reciprocal-square-root estimate (zero for
 /// a zero power) and two refinement steps, the last applied to the rounded
 /// `power * estimate`.
-fn platform_magnitude(real: f32, imaginary: f32) -> f32 {
+pub(crate) fn platform_magnitude(real: f32, imaginary: f32) -> f32 {
     if real.is_nan() || imaginary.is_nan() {
         return f32::NAN;
     }
