@@ -20,6 +20,12 @@ Apple-derived: keep them in a private directory.
 
     gr.py --tunings DIR --aid N --in stereo.f32 --out unit_in.f32 --box-host BIN
           [--strip NAME] [--propstrip NAME] [--meta FILE] [--keep DIR] [--param NAME=VALUE ...]
+          [--param-at FRAME:NAME=VALUE ...]
+
+`--param-at` moves a graph parameter at run time (a host volume slider): every Audio Unit box
+it is wired to gets the change before the host slice that starts at FRAME (box_host --set-at),
+as macOS's graph does. The graph's own `dbgn` gain box ramps each change linearly in
+amplitude over 20 ms, as macOS's does.
 
 `--strip`/`--propstrip` name the speaker configuration's strip and property
 strip (in AID<n>/DSP/Strips), as the DSP database selects them for a speaker
@@ -180,7 +186,7 @@ class Renderer:
         self.args, self.strip, self.work = args, strip, work
         self.propstrip = None
 
-    def box_host(self, name, sub, chans, sets, tag="run"):
+    def box_host(self, name, sub, chans, sets, tag="run", set_ats=()):
         n = len(chans)
         fi, fo, fm = (os.path.join(self.work, f"{name}.{tag}.{e}") for e in ("in.f32", "out.f32", "json"))
         write_f32(fi, chans)
@@ -191,6 +197,8 @@ class Renderer:
             cmd += ["--propstrip", self.propstrip]
         for pid, val in sets:
             cmd += ["--set", f"{pid}={val!r}"]
+        for frame, pid, val in set_ats:
+            cmd += ["--set-at", f"{frame}:{pid}={val!r}"]
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         if r.returncode:
             raise SystemExit(f"box_host {name}: rc={r.returncode} {r.stderr.strip()[-400:]}")
@@ -235,6 +243,7 @@ def main():
     ap.add_argument("--meta")
     ap.add_argument("--box-host", required=True)
     ap.add_argument("--param", action="append", default=[])
+    ap.add_argument("--param-at", action="append", default=[], help="FRAME:NAME=VALUE, a run-time graph parameter move")
     ap.add_argument("--q", type=int, default=512)
     ap.add_argument("--sr", type=float, default=48000.0)
     ap.add_argument("--keep")
@@ -262,6 +271,20 @@ def main():
         R.propstrip = remap_propstrip(os.path.join(root, "Strips", args.propstrip), args.tunings, work)
     bypassed = strip_bypassed(strip)
 
+    moves = []
+    for kv in args.param_at:
+        f, rest = kv.split(":", 1)
+        k, v = rest.split("=")
+        moves.append((int(f), k, float(v)))
+    box_moves = {}
+    for gname, bname, pid, rest in gparam:
+        if bname in boxes and boxes[bname]["type"] != "parameter_add":
+            for f, k, v in moves:
+                if k == gname:
+                    try:
+                        box_moves.setdefault(bname, []).append((f, int(pid), v))
+                    except ValueError:
+                        pass
     box_sets, padd_in = {}, {}
     for gname, bname, pid, rest in gparam:
         if bname not in boxes:
@@ -341,7 +364,8 @@ def main():
                      array("f", (m[2] * a + m[3] * b for a, b in zip(x0, x1)))]
                 notes.append({"modelled_box": name, "law": "pchr 2x2 matrix (no installed AU)"})
             elif box.get("au"):
-                y, meta = R.box_host(name, t, [c for p in ports for c in p], box_sets.get(name, []))
+                y, meta = R.box_host(name, t, [c for p in ports for c in p], box_sets.get(name, []),
+                                     set_ats=box_moves.get(name, ()))
                 metas.append({"box": name, "subtype": t, "latency_s": meta["latency_s"],
                               "tail_s": meta["tail_s"], "sets": box_sets.get(name, [])})
             elif t == "nfnp" or t in WIRE_BUILTINS:
@@ -363,7 +387,31 @@ def main():
             elif t == "dbgn":
                 s = dict(box_sets.get(name, []))
                 g = 0.0 if s.get(1, 0.0) else 10 ** (s.get(0, 0.0) / 20)
-                y = [c if g == 1.0 else array("f", (v * g for v in c)) for p in ports for c in p]
+                mv = sorted(box_moves.get(name, []))
+                if not mv:
+                    y = [c if g == 1.0 else array("f", (v * g for v in c)) for p in ports for c in p]
+                else:
+                    # run-time moves (macOS's graph gain box): each change ramps linearly in
+                    # amplitude over floor(0.020 * fs) samples, the current value on the first
+                    # sample; a change during a ramp starts its own ramp after it
+                    nramp = max(1, int(0.020 * int(args.sr)))
+                    y = []
+                    for p in ports:
+                        for c in p:
+                            st = dict(s); cur = g; tgt = g; inc = 0.0; left = 0
+                            pend = sorted(mv); out = array("f")
+                            for n, xv in enumerate(c):
+                                while pend and pend[0][0] <= n:
+                                    _, pid, v = pend.pop(0); st[pid] = v
+                                desired = 0.0 if st.get(1, 0.0) else 10 ** (st.get(0, 0.0) / 20)
+                                if left == 0 and desired != tgt:
+                                    tgt = desired; left = nramp; inc = (tgt - cur) / left
+                                out.append(xv * cur)
+                                if left:
+                                    left -= 1
+                                    cur = tgt if left == 0 else cur + inc
+                            y.append(out)
+                    notes.append({"dbgn_moves": name, "law": "linear amplitude ramp, 20 ms"})
             elif t == "delay":
                 d = int(dict(box_sets.get(name, [])).get(0, 0))
                 y = [array("f", bytes(4 * d)) + c[: len(c) - d] for p in ports for c in p]
