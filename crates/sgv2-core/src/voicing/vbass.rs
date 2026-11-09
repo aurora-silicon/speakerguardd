@@ -68,6 +68,11 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
+use crate::platform_math;
+
+/// `ln 10 / 20` in Float32: the compressor's dB-to-exponent factor.
+const LN10_OVER_20: f32 = f32::from_bits(0x3deb_c8e3);
+
 /// One designed biquad (double): the reconstruction design and tests.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct Bq {
@@ -599,7 +604,7 @@ impl HarmonicCompressor {
     #[inline]
     fn run(&mut self, x: f64) -> f64 {
         let x = x as f32;
-        let level_db = 20.0 * libm::log10f(libm::fabsf(x) + law::COMP_DETECTOR_EPSILON as f32);
+        let level_db = 20.0 * platform_math::vlog10f(libm::fabsf(x) + law::COMP_DETECTOR_EPSILON as f32);
         let d = level_db - self.threshold_db;
         let half_knee = 0.5 * law::COMP_KNEE_DB as f32;
         let slope = 1.0 - 1.0 / self.ratio;
@@ -611,7 +616,7 @@ impl HarmonicCompressor {
             0.0
         };
         let reduction_db = self.follower.run(requested_db as f64) as f32;
-        (x * libm::powf(10.0, -reduction_db / 20.0)) as f64
+        (x * platform_math::vexpf(-reduction_db * LN10_OVER_20)) as f64
     }
 }
 
@@ -805,7 +810,7 @@ impl Run {
     #[inline]
     fn device(&self, u: f32) -> f32 {
         match self.p.device {
-            Device::Saturator3 => law::DEVICE3_AMP as f32 * libm::tanhf(law::DEVICE3_SLOPE as f32 * u),
+            Device::Saturator3 => law::DEVICE3_AMP as f32 * platform_math::vtanhf(law::DEVICE3_SLOPE as f32 * u),
         }
     }
 
@@ -843,7 +848,7 @@ impl Run {
                 } else {
                     (lo, p_in)
                 };
-                (x * (1.0 / Self::level(p_drive))).clamp(-clip, clip)
+                (x * platform_math::vdiv(1.0, Self::level(p_drive))).clamp(-clip, clip)
             } else {
                 lo
             };
@@ -855,7 +860,7 @@ impl Run {
             let mut h = self.harm[k];
             if self.p.level_control {
                 let p_out = Self::level(self.lc.output.run(f64::from(h)) as f32);
-                h *= self.p_in[k] as f32 / p_out;
+                h *= platform_math::vdiv(self.p_in[k] as f32, p_out);
             }
             h *= gain;
             if self.p.harmonic_compressor {

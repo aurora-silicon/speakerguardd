@@ -20,6 +20,17 @@
 //!   and eight (cosine) on `|x| < pi/4`, a fused reduction by `pi/2` above,
 //!   rounded once to Float32.
 //!
+//! The vector library's kernels, as the VirtualBass box calls them, are not
+//! the scalar functions and differ from correct rounding on more arguments:
+//!
+//! - `vtanhf`: `(e^(2|x|) - 1) / (e^(2|x|) + 1)` with the sign of `x`, the
+//!   exponential minus one from a Float32 reduction by `ln 2` and a
+//!   polynomial;
+//! - `vexpf` and `vlog10f`: Float32 reductions and polynomials (a nine-point
+//!   reciprocal table for the logarithm);
+//! - `vdiv`: the quotient from the architecture's reciprocal estimate and two
+//!   Newton steps, the numerator applied before the last correction.
+//!
 //! Every function is checked against platform results for our own inputs in
 //! the tests. Outside the range the boxes use (`|x| > 10^4` for the sine and
 //! cosine) the correctly rounded value is returned instead.
@@ -314,6 +325,165 @@ pub fn cosf(x: f32) -> f32 {
     with_sign_bit(v, q >> 1) as f32
 }
 
+// The platform's Float32 vector library (vForce and vDSP), as the
+// VirtualBass box calls it. Each lane is computed on its own; the vector
+// length and alignment do not change a lane's result.
+
+fn fma32(a: f32, b: f32, c: f32) -> f32 {
+    libm::fmaf(a, b, c)
+}
+
+/// Rounds to the nearest integer, ties to even, for `|v| < 2^22`.
+fn nearest_even(v: f32) -> f32 {
+    const MAGIC: f32 = 12_582_912.0; // 1.5 * 2^23
+    if v >= 0.0 {
+        (v + MAGIC) - MAGIC
+    } else {
+        (v - MAGIC) + MAGIC
+    }
+}
+
+const LOG2_E: f32 = f32::from_bits(0x3fb8_aa3b);
+/// `ln 2` split in a high part with a short mantissa and the remainder.
+const LN2_HI: f32 = f32::from_bits(0x3f31_8000);
+const LN2_LO: f32 = f32::from_bits(0x395e_8083);
+
+/// The platform's vector `tanh`: `(e^(2|x|) - 1) / (e^(2|x|) + 1)` with the
+/// sign of `x`, where `e^(2|x|) - 1` comes from a Float32 reduction by
+/// `ln 2`, a degree-seven polynomial for `e^r - 1` and an exponent
+/// assembly that keeps small arguments free of cancellation.
+pub fn vtanhf(x: f32) -> f32 {
+    const CLAMP: f32 = f32::from_bits(0x42b1_7217); // the largest finite e^y
+    const P: [f32; 5] = [
+        f32::from_bits(0x3950_6967),
+        f32::from_bits(0x3ab7_43ce),
+        f32::from_bits(0x3c08_8908),
+        f32::from_bits(0x3d2a_a9c1),
+        f32::from_bits(0x3e2a_aaaa),
+    ];
+    let w = x.to_bits();
+    if w & 0x7fff_ffff > 0x7f80_0000 {
+        return f32::from_bits(w | 0x0040_0000);
+    }
+    let a = f32::from_bits(w & 0x7fff_ffff);
+    let y = (a + a).min(CLAMP);
+    let kf = nearest_even(y * LOG2_E);
+    let k = kf as i32;
+    let r = fma32(-LN2_HI, kf, y);
+    let r = fma32(LN2_LO, kf, r);
+    let mut p = fma32(P[0], r, P[1]);
+    p = fma32(p, r, P[2]);
+    p = fma32(p, r, P[3]);
+    p = fma32(p, r, P[4]);
+    p = fma32(p, r, 0.5);
+    let q = fma32(r * r, p, r); // e^r - 1
+    let s = f32::from_bits(0x3f00_0000u32.wrapping_add((k as u32) << 23)); // 2^(k-1)
+    let c = if k == 0 { 0.0 } else { -1.0 };
+    let mut n = (q - c) * s;
+    n += n;
+    n += c; // e^y - 1
+    let z = n / (n + 2.0);
+    f32::from_bits(z.to_bits() | (w & 0x8000_0000))
+}
+
+/// The platform's vector `e^x` for `|x| <= 20`: reduction by `ln 2` with the
+/// integer rounded down, a degree-six polynomial, one scaling multiply.
+pub fn vexpf(x: f32) -> f32 {
+    const P: [f32; 5] = [
+        f32::from_bits(0x3aea_6bc0),
+        f32::from_bits(0x3c04_5bfb),
+        f32::from_bits(0x3d2a_ee9a),
+        f32::from_bits(0x3e2a_a92b),
+        f32::from_bits(0x3f00_0001),
+    ];
+    if !(-20.0..=20.0).contains(&x) {
+        return expf(x);
+    }
+    let kf = libm::floorf(x * LOG2_E);
+    let k = kf as i32;
+    let r = fma32(-LN2_HI, kf, x);
+    let r = fma32(LN2_LO, kf, r);
+    let mut p = fma32(P[0], r, P[1]);
+    p = fma32(p, r, P[2]);
+    p = fma32(p, r, P[3]);
+    p = fma32(p, r, P[4]);
+    p = fma32(p, r, 1.0);
+    p = fma32(p, r, 1.0);
+    p * f32::from_bits(((k + 127) as u32) << 23)
+}
+
+/// The platform's vector `log10` of a positive normal `x`: the mantissa
+/// reduced by one of nine tabulated reciprocals around `1 + i/8`, a
+/// polynomial for `log2(1 + r)` added to the exponent and the table point's
+/// `log2`, times `log10 2`. Other arguments take the correctly rounded value.
+pub fn vlog10f(x: f32) -> f32 {
+    const RECIP: [u32; 9] = [
+        0x3f80_0000,
+        0x3f64_2f47,
+        0x3f4d_34fa,
+        0x3f3a_8deb,
+        0x3f2a_d23b,
+        0x3f1d_7339,
+        0x3f12_c6ac,
+        0x3f08_27e9,
+        0x3f00_0000,
+    ];
+    const CENTER: [u32; 9] = [
+        0x0000_0000,
+        0x3e29_ecac,
+        0x3ea3_5c65,
+        0x3ee9_c09e,
+        0xbed5_2af4,
+        0xbe98_f5dc,
+        0xbe4a_3655,
+        0xbdb6_8248,
+        0x0000_0000,
+    ];
+    const C1: f32 = f32::from_bits(0xbf38_aa2d);
+    const C2: f32 = f32::from_bits(0x3ef6_3993);
+    const C3: f32 = f32::from_bits(0xbeb9_2e1d);
+    const C4: f32 = f32::from_bits(0x3e92_0aa5);
+    const LOG10_2: f32 = f32::from_bits(0x3e9a_209b);
+    let w = x.to_bits();
+    let e_field = (w >> 23) & 0xff;
+    if w >> 31 != 0 || e_field == 0 || e_field == 0xff {
+        return libm::log10f(x);
+    }
+    let f = w & 0x007f_ffff;
+    let i = ((f + 0x0008_0000) >> 20) as usize;
+    let e = e_field as i32 - 127 + ((f + 0x0048_0000) >> 23) as i32;
+    let m = f32::from_bits(0x3f80_0000 | f);
+    let r = fma32(f32::from_bits(RECIP[i]), m, -1.0);
+    let r2 = r * r;
+    let p = fma32(C1, r, LOG2_E);
+    let t = fma32(C3, r, C2);
+    let p = fma32(r2, t, p);
+    let r4 = r2 * r2;
+    let b = f32::from_bits(CENTER[i]) + e as f32;
+    let b = fma32(r4, r * C4, b);
+    (r * p + b) * LOG10_2
+}
+
+/// `n / d` as the platform's vector divisions form it for a normal `d`: the
+/// architecture's reciprocal estimate, two Newton steps, the numerator
+/// applied before the second step's correction. A zero, subnormal or
+/// non-finite `d` takes the IEEE quotient.
+pub fn vdiv(n: f32, d: f32) -> f32 {
+    let w = d.to_bits();
+    let e_field = (w >> 23) & 0xff;
+    if e_field == 0 || e_field >= 0xfd {
+        return n / d;
+    }
+    let a = 256 + ((w & 0x007f_ffff) >> 15);
+    let b = (1u32 << 19) / (2 * a + 1);
+    let est = b.div_ceil(2);
+    let e0 = f32::from_bits((w & 0x8000_0000) | ((253 - e_field) << 23) | ((est & 0xff) << 15));
+    let step = |x: f32| fma32(-d, x, 2.0);
+    let e1 = e0 * step(e0);
+    let s1 = step(e1);
+    (e1 * n) * s1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,5 +547,69 @@ mod tests {
         assert_eq!(sinf(-0.0).to_bits(), (-0.0f32).to_bits());
         assert!(expf(-200.0) == 0.0 && expf(200.0).is_infinite());
         assert_eq!(exp10f(2.0), 100.0);
+    }
+
+    /// Platform vector-library results for our own arguments (macOS 26.6.2,
+    /// Arm), each where the correctly rounded `tanh` differs from it:
+    /// `(x, vtanhf(x))` as Float32 bits.
+    #[test]
+    fn vector_tanh_matches_the_platform_where_correct_rounding_does_not() {
+        let cases: [(u32, u32); 4] =
+            [(0xbf5b62b0, 0xbf31d792), (0xbecdeb03, 0xbec37d5d), (0xbcd5edf8, 0xbcd5e185), (0xbef66d89, 0xbee502e3)];
+        for (x, y) in cases {
+            let x = f32::from_bits(x);
+            assert_eq!(vtanhf(x).to_bits(), y, "tanh {x}");
+            assert_ne!((libm::tanh(f64::from(x)) as f32).to_bits(), y);
+            assert_eq!(vtanhf(-x).to_bits(), y ^ 0x8000_0000);
+        }
+        assert_eq!(vtanhf(0.0).to_bits(), 0);
+        assert_eq!(vtanhf(-0.0).to_bits(), 0x8000_0000);
+        assert_eq!(vtanhf(f32::INFINITY), 1.0);
+        assert_eq!(vtanhf(-50.0), -1.0);
+        assert!(vtanhf(f32::NAN).is_nan());
+    }
+
+    /// `(d, n, x, vexpf(x), vlog10f(d), 1/d, n/d)` as the platform's vector
+    /// library returns them for our own arguments (macOS 26.6.2, Arm); in
+    /// each row the correctly rounded exponential, logarithm and quotient
+    /// all differ from it.
+    #[test]
+    fn vector_exp_log_and_division_match_the_platform() {
+        let cases: [[u32; 7]; 4] = [
+            [0x41dec2d9, 0xbfc0fc46, 0x40c3b513, 0x43e27dc6, 0x3fb8ed8d, 0x3d13196a, 0xbd5dc809],
+            [0x37ba41fa, 0xbf5c04b8, 0x413a1eb8, 0x47dc1ed9, 0xc094ea18, 0x472feda3, 0xc7173376],
+            [0x41006f4c, 0x3fd2f740, 0x413ba3c3, 0x47f20d8b, 0x3f67916b, 0x3dff222a, 0x3e524071],
+            [0x38aee69f, 0xbff26487, 0x407cd8a2, 0x424fe43c, 0xc08285d8, 0x463b5a12, 0xc6b164b7],
+        ];
+        for [d, n, x, e, l, r, q] in cases {
+            let (d, n, x) = (f32::from_bits(d), f32::from_bits(n), f32::from_bits(x));
+            assert_eq!(vexpf(x).to_bits(), e, "exp {x}");
+            assert_ne!((libm::exp(f64::from(x)) as f32).to_bits(), e);
+            assert_eq!(vlog10f(d).to_bits(), l, "log10 {d}");
+            assert_ne!((libm::log10(f64::from(d)) as f32).to_bits(), l);
+            assert_eq!(vdiv(1.0, d).to_bits(), r, "1/{d}");
+            assert_eq!(vdiv(n, d).to_bits(), q, "{n}/{d}");
+            assert_ne!((n / d).to_bits(), q);
+        }
+    }
+
+    #[test]
+    fn vector_kernels_are_close_to_the_true_functions() {
+        // relative error within a few units in the last place
+        let close = |v: f32, t: f64| (f64::from(v) - t).abs() <= 6e-7 * t.abs();
+        let mut x = -19.75f32;
+        while x < 19.75 {
+            let xd = f64::from(x);
+            assert!(close(vtanhf(x), libm::tanh(xd)), "tanh {x}");
+            assert!(close(vexpf(x), libm::exp(xd)), "exp {x}");
+            let a = libm::fabsf(x) + 0.01;
+            assert!(close(vlog10f(a), libm::log10(f64::from(a))), "log10 {a}");
+            assert!(close(vdiv(x, a), xd / f64::from(a)), "div {x}/{a}");
+            x += 0.0137;
+        }
+        assert_eq!(vexpf(0.0), 1.0);
+        assert_eq!(vlog10f(1.0), 0.0);
+        assert_eq!(vlog10f(100.0), 2.0);
+        assert_eq!(vdiv(3.0, 1.0), 3.0);
     }
 }
