@@ -95,12 +95,14 @@ impl Cascade {
 }
 
 /// One stored section: `[b0, b1, b2, a1, a2]` as the object keeps it.
-type Words = [f32; 5];
+pub(crate) type Words = [f32; 5];
 
-/// The unit's Float32 Butterworth sections of order `n` at `fc` for a
-/// filter object at rate `fs` (both as the box keeps them, Float32), in
-/// pole-pair order with the first-order section last for odd `n`.
-fn butter_words(n: usize, fc: f32, fs: f32, kind: Kind, out: &mut Vec<Words>) {
+/// The platform voicing library's Float32 Butterworth sections of order `n`
+/// at `fc` for a filter object at rate `fs` (both as the box keeps them,
+/// Float32), in pole-pair order with the first-order section last for odd
+/// `n`. VirtualBass and the ToneMeister's Butterworth slots share it. The
+/// words go to `out` one by one (no allocation of its own).
+pub(crate) fn butter_words(n: usize, fc: f32, fs: f32, kind: Kind, out: &mut impl Extend<Words>) {
     let f = fc.min((fs * 0.5) * 0.9);
     let w = (f64::from(f) * (2.0 * core::f64::consts::PI) / f64::from(fs)) as f32;
     let s = libm::sin(f64::from(w)) as f32;
@@ -112,7 +114,7 @@ fn butter_words(n: usize, fc: f32, fs: f32, kind: Kind, out: &mut Vec<Words>) {
         let u = 1.0 + a2;
         let uc = u * c;
         let a1 = -uc;
-        out.push(match kind {
+        out.extend([match kind {
             Kind::Low => {
                 let g = (u - uc) * 0.25;
                 [g, g + g, g, a1, a2]
@@ -122,12 +124,12 @@ fn butter_words(n: usize, fc: f32, fs: f32, kind: Kind, out: &mut Vec<Words>) {
                 [g, -(g + g), g, a1, a2]
             }
             Kind::AllPass => [a2, a1, 1.0, a1, a2],
-        });
+        }]);
     }
     if n % 2 == 1 {
         let q = (1.0 / libm::tan(f64::from(w) * 0.5)) as f32;
         let a1 = (1.0 - q) / (1.0 + q);
-        out.push(match kind {
+        out.extend([match kind {
             Kind::Low => {
                 let g = 1.0 / (2.0 / (1.0 + a1));
                 [g, g, 0.0, a1, 0.0]
@@ -138,7 +140,7 @@ fn butter_words(n: usize, fc: f32, fs: f32, kind: Kind, out: &mut Vec<Words>) {
             }
             // the one-frame-delayed first-order all-pass
             Kind::AllPass => [0.0, a1, 1.0, a1, 0.0],
-        });
+        }]);
     }
 }
 
@@ -160,7 +162,7 @@ fn object(words: &[Words], multichannel: bool) -> crate::vdsp::Cascade {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Kind {
+pub(crate) enum Kind {
     Low,
     High,
     AllPass,
@@ -522,7 +524,7 @@ impl Follower {
 
     fn with_times(fs: f64, ratio: f64, attack_s: f64, release_s: f64, hold_s: f64, smooth_s: f64) -> Follower {
         let fs = fs as f32;
-        let pole = |t: f64| libm::expf(-1.0 / (t as f32 * fs));
+        let pole = |t: f64| crate::platform_math::expf(-1.0 / (t as f32 * fs));
         Follower {
             ratio: ratio as f32,
             tie: f32::INFINITY,

@@ -6,100 +6,103 @@
 //! Peaks and ordinary shelves use the matched-Z transform with the
 //! two-zero magnitude correction described by Gunness and Chauhan,
 //! "Optimizing the Magnitude Response of Matched Z Transform Filters".
-//! The poles of a boost are the analog prototype's poles mapped by
-//! `z = exp(sT)`. Its minimum-phase numerator is the real second-order FIR
+//! The poles are the analog prototype's two roots, each mapped by
+//! `z = exp(sT)`. The minimum-phase numerator is the real second-order FIR
 //! whose magnitude matches the analog target at DC, one-third Nyquist and
-//! two-thirds Nyquist. A peak or low-shelf cut is the exact inverse of its
-//! complementary boost; a high-shelf cut is designed directly, the same way
-//! as a boost (black-box renders of the installed unit: the inverse misses
-//! it by 0.003, 0.018 and 0.034 dB at -6, -12 and -15 dB, the direct design
-//! matches). This avoids the high-frequency cramping of a bilinear biquad.
+//! two-thirds Nyquist. This avoids the high-frequency cramping of a bilinear
+//! biquad.
 //!
-//! The peak is computed in the unit's own Float32 order. Its exact Float32
-//! coefficients were read back from single-slot impulse renders of the
-//! installed unit (the cascade step is known exactly, so an impulse response
-//! fixes every coefficient) over 300 peaks (gains -15..15 dB, Q 0.5..8,
-//! 100 Hz..12 kHz, plus 400 random and every extracted tuning's peaks): the
-//! pole pair comes from a Float32 `A = exp(g ln10/40)`, the angular frequency
-//! rounded once to Float32 and Float32 exponentials; a cut inverts the boost
-//! before its numerator is rounded to Float32.
+//! The box stores every section as five Float32 words and its output depends
+//! on their last bits (a box's static cascade runs in Float32, and next to
+//! poles this close to the unit circle one word changes the stop band by
+//! hundredths of a dB). Every constructor here therefore follows the box's
+//! own construction step by step: which values are Float32 and which
+//! binary64, where each is rounded, which products are fused, and the
+//! platform's complex magnitude. The dB gains are Float32 exponentials of
+//! the dB value times Float32 `ln(10)/20` (or `/40`).
+//!
+//! The Float32 elementary functions are the platform's own
+//! ([`crate::platform_math`]), which are not correctly rounded. The binary64
+//! `sin`, `cos` and `tan` are the correctly rounded ones, which the
+//! platform's differ from in rare last bits.
 
 use crate::prestage::Section;
 use core::f64::consts::PI;
 
-#[derive(Clone, Copy)]
-enum Shape {
-    LowShelf,
-    HighShelf,
-}
-
-fn inverse(s: Section) -> Section {
-    Section { b0: 1.0 / s.b0, b1: s.a1 / s.b0, b2: s.a2 / s.b0, a1: s.b1 / s.b0, a2: s.b2 / s.b0 }
-}
-
-/// The denominator obtained by mapping the roots of
-/// `c2*s^2 + c1*w0*s + c0*w0^2` with `z = exp(s/fs)`.
-fn matched_den(c: [f64; 3], f0: f64, fs: f64) -> [f64; 2] {
-    let d = c[1] / (2.0 * c[0]);
-    let r2 = c[2] / c[0];
-    let w = 2.0 * PI * f0 / fs;
-    if d * d <= r2 {
-        let radius = libm::exp(-d * w);
-        let angle = libm::sqrt((r2 - d * d).max(0.0)) * w;
-        [-2.0 * radius * libm::cos(angle), radius * radius]
-    } else {
-        let spread = libm::sqrt(d * d - r2);
-        let p0 = libm::exp(-(d - spread) * w);
-        let p1 = libm::exp(-(d + spread) * w);
-        [-(p0 + p1), p0 * p1]
-    }
-}
-
-/// A Float32 elementary function evaluated in f64 and rounded once (the
-/// correctly rounded result in all but vanishingly rare halfway cases).
 fn exp32(x: f32) -> f32 {
-    libm::exp(f64::from(x)) as f32
+    crate::platform_math::expf(x)
 }
 
 fn cos32(x: f32) -> f32 {
-    libm::cos(f64::from(x)) as f32
+    crate::platform_math::cosf(x)
 }
 
-/// `A = 10^(g/40)` as the unit forms it: one Float32 exponential.
-fn peak_amplitude(gain_db: f64) -> f32 {
-    exp32((gain_db as f32) * 0.057_564_627)
+fn sin32(x: f32) -> f32 {
+    crate::platform_math::sinf(x)
 }
 
-/// The boost peak's pole pair, mapped in Float32 as the unit maps it: the
-/// prototype `s^2 + s/(A Q) + 1`, its roots scaled by `w = 2 pi f/fs`
-/// (rounded once) and mapped by `exp`. An overdamped prototype keeps its two
-/// real roots.
-fn peak_den(gain_db: f64, f0: f64, q: f64, fs: f64) -> [f64; 2] {
-    let a = peak_amplitude(gain_db);
-    let damping = 1.0 / (2.0 * a * q as f32);
-    let w = (2.0 * PI * f0 / fs) as f32;
-    let dw = damping * w;
-    let a2 = exp32(-2.0 * dw);
-    if damping > 1.0 {
-        let spread = libm::sqrtf(damping * damping - 1.0);
-        let p0 = exp32(-(damping - spread) * w);
-        let p1 = exp32(-(damping + spread) * w);
-        [f64::from(-(p0 + p1)), f64::from(a2)]
+/// Float32 `ln(10)/20`: a dB value times it is the exponent of the linear
+/// amplitude.
+const DB_TO_EXPONENT: f32 = (core::f64::consts::LN_10 / 20.0) as f32;
+/// Float32 `ln(10)/40`, for the square root of an amplitude.
+const DB_TO_HALF_EXPONENT: f32 = (core::f64::consts::LN_10 / 40.0) as f32;
+
+/// A dB gain as the box forms its linear word: `exp(dB * ln(10)/20)`, all
+/// Float32. The box's input and output gains and its gain slots use it.
+pub fn db_gain(gain_db: f32) -> f32 {
+    exp32(gain_db * DB_TO_EXPONENT)
+}
+
+/// A flat gain as a section: the box applies a gain as `g*x + 0` in Float32,
+/// which is exactly what this section computes in the box's fused Float32
+/// step (its state stays zero).
+pub fn gain_section(gain_db: f64) -> Section {
+    Section { b0: f64::from(db_gain(gain_db as f32)), b1: 0.0, b2: 0.0, a1: 0.0, a2: 0.0 }
+}
+
+/// The platform's Float32 argument of a negative real number: pi rounded
+/// down (black-box: `atan2f(+0, x)` returns this word for every negative
+/// `x`, while the nearest Float32 to pi is one unit above it).
+const NEGATIVE_REAL_ARGUMENT: f32 = f32::from_bits(0x4049_0fda);
+
+/// Sine and cosine of half the Float32 argument of the real number `x`
+/// (`x + 0i`): zero for `x >= 0`, half of [`NEGATIVE_REAL_ARGUMENT`] below.
+fn half_argument(x: f32) -> (f32, f32) {
+    if x < 0.0 {
+        let half = NEGATIVE_REAL_ARGUMENT * 0.5;
+        (sin32(half), cos32(half))
     } else {
-        let radius = exp32(-dw);
-        let angle = libm::sqrtf(libm::fmaf(-damping, damping, 1.0)) * w;
-        [f64::from(-2.0 * (radius * cos32(angle))), f64::from(a2)]
+        (0.0, 1.0)
     }
 }
 
-/// The Arm Float32 reciprocal-square-root estimate for a positive normal
-/// (Arm ARM `FPRSqrtEstimate`: exponent parity and the leading eight
-/// significand bits).
+/// The principal square root of `x + 0i` in the box's Float32 polar form:
+/// radius `sqrt(sqrt(x*x))` and half the argument.
+fn complex_sqrt(x: f32) -> (f32, f32) {
+    let radius = libm::sqrtf(libm::sqrtf(libm::fmaf(x, x, 0.0)));
+    let (sin, cos) = half_argument(x);
+    (cos * radius, sin * radius)
+}
+
+/// The Arm Float32 reciprocal-square-root estimate for a positive finite
+/// value (Arm ARM `FPRSqrtEstimate`: exponent parity and the leading eight
+/// significand bits, a subnormal normalised first).
 fn arm_rsqrt_estimate(value: f32) -> f32 {
     let bits = value.to_bits();
-    let exponent = ((bits >> 23) & 0xff) as i32;
-    let fraction = bits & 0x7f_ffff;
-    let mut scaled = if exponent & 1 != 0 { 0x80 | (fraction >> 16) } else { 0x100 | (fraction >> 15) };
+    let mut exponent = ((bits >> 23) & 0xff) as i32;
+    let mut fraction = u64::from(bits & 0x7f_ffff) << 29;
+    if exponent == 0 {
+        while (fraction >> 51) & 1 == 0 {
+            fraction = (fraction << 1) & ((1 << 52) - 1);
+            exponent -= 1;
+        }
+        fraction = (fraction << 1) & ((1 << 52) - 1);
+    }
+    let mut scaled = if exponent & 1 == 0 {
+        0x100 | ((fraction >> 44) & 0xff) as u32
+    } else {
+        0x80 | ((fraction >> 45) & 0x7f) as u32
+    };
     if scaled < 0x100 {
         scaled = 2 * scaled + 1;
     } else {
@@ -111,146 +114,164 @@ fn arm_rsqrt_estimate(value: f32) -> f32 {
     }
     let estimate = root.div_ceil(2);
     let result_exponent = (380 - exponent) / 2;
-    f32::from_bits(((result_exponent as u32) << 23) | ((estimate & 0xff) << 15))
+    f32::from_bits(((result_exponent as u32 & 0xff) << 23) | ((estimate & 0xff) << 15))
 }
 
-/// A Float32 vector magnitude: fused power sum, reciprocal-square-root
-/// estimate and two Newton refinement steps.
+/// The Arm Float32 reciprocal-square-root step `(3 - a*b) / 2`, fused.
+fn rsqrt_step(a: f32, b: f32) -> f32 {
+    libm::fmaf(-a, b, 3.0) * 0.5
+}
+
+/// The platform's one-element Float32 complex magnitude on Arm: the fused
+/// power sum `im*im + re*re`, the reciprocal-square-root estimate (zero for
+/// a zero power) and two refinement steps, the last applied to the rounded
+/// `power * estimate`.
 fn platform_magnitude(real: f32, imaginary: f32) -> f32 {
+    if real.is_nan() || imaginary.is_nan() {
+        return f32::NAN;
+    }
     let power = libm::fmaf(imaginary, imaginary, real * real);
-    let exponent = power.to_bits() >> 23 & 0xff;
-    if power <= 0.0 || !power.is_finite() || exponent == 0 {
-        return libm::sqrtf(power);
+    if !power.is_finite() {
+        return f32::NAN;
     }
-    let mut reciprocal = arm_rsqrt_estimate(power);
-    let mut product = power * reciprocal;
-    let step = libm::fmaf(-reciprocal, product, 3.0) * 0.5;
-    reciprocal *= step;
-    product = power * reciprocal;
-    let step = libm::fmaf(-reciprocal, product, 3.0) * 0.5;
-    product * step
+    let mut estimate = if power == 0.0 { 0.0 } else { arm_rsqrt_estimate(power) };
+    let product = power * estimate;
+    estimate *= rsqrt_step(estimate, product);
+    let product = power * estimate;
+    product * rsqrt_step(estimate, product)
 }
 
-fn polynomial_power(c: [f64; 3], x: f64) -> f64 {
-    let real = c[2] - c[0] * x * x;
-    let imag = c[1] * x;
-    real * real + imag * imag
+/// The quotient of two Float32 complex numbers as the platform's split
+/// complex division forms it: each output part fuses one product and rounds
+/// the other, both are scaled by one reciprocal of the fused squared divisor.
+fn complex_divide((nr, ni): (f32, f32), (dr, di): (f32, f32)) -> (f32, f32) {
+    let real = libm::fmaf(nr, dr, ni * di);
+    let imaginary = libm::fmaf(-nr, di, dr * ni);
+    let inverse = 1.0 / libm::fmaf(dr, dr, di * di);
+    (real * inverse, imaginary * inverse)
 }
 
-fn denominator_magnitude(a: [f64; 2], w: f64) -> f64 {
-    let c1 = libm::cos(w);
-    let s1 = libm::sin(w);
-    let c2 = libm::cos(2.0 * w);
-    let s2 = libm::sin(2.0 * w);
-    let (re, im) = (1.0 + a[0] * c1 + a[1] * c2, a[0] * s1 + a[1] * s2);
-    libm::sqrt(re * re + im * im)
+/// `(i x)^2` as a Float32 complex square of `0 + i x`.
+fn imaginary_square(x: f32) -> (f32, f32) {
+    let (re, im) = (0.0f32, x);
+    (libm::fmaf(re, re, -im * im), libm::fmaf(re, im, im * re))
 }
 
-/// Minimum-phase real FIR of order two from its magnitudes at DC,
-/// one-third Nyquist and two-thirds Nyquist.
-fn curve_fit(m: [f64; 3]) -> [f64; 3] {
-    let h0 = m[0] * m[0];
-    let h1 = m[1] * m[1];
-    let h2 = m[2] * m[2];
-    let y = h1 - h2;
-    let x = (h0 + 2.0 * h2) / 3.0;
-    let z = (2.0 * h0 + h2) / 3.0 - h1;
-    let xz = x + z;
-    let u = (xz + libm::sqrt((xz * xz - y * y).max(0.0))) / 2.0;
-    let sum = libm::sqrt(u.max(0.0));
-    let b1 = y / (2.0 * sum);
-    let difference = libm::sqrt((sum * sum - 2.0 * z).max(0.0));
-    [(sum + difference) / 2.0, b1, (sum - difference) / 2.0]
+/// The denominator of a peak or ordinary shelf: the two roots of the analog
+/// prototype `s^2 + s/q + base` (in units of the slot frequency), each mapped
+/// by `z = exp(s w)` on its own, `w` the slot's angular frequency per sample.
+/// The roots come from the Float32 polar square root of the discriminant,
+/// with the radius scale `w * base^(1/4)` in binary64.
+fn mapped_den(q: f32, w: f64, base: f64) -> [f32; 2] {
+    let q = f64::from(q);
+    let damping = (1.0 / (q + q)) as f32;
+    let discriminant = (1.0 / ((q * 4.0) * q) - 1.0) as f32;
+    let (u, v) = complex_sqrt(discriminant);
+    let scale = (-w * libm::sqrt(libm::sqrt(base))) as f32;
+    let (x0, y0) = ((damping + u) * scale, v * scale);
+    let (x1, y1) = ((damping - u) * scale, -v * scale);
+    let p0 = exp32(x0) * cos32(y0);
+    let p1 = exp32(x1) * cos32(y1);
+    [-(p0 + p1), exp32(x1 + x0) * cos32(y1 + y0)]
 }
 
-fn peak_curve_fit(m: [f64; 3]) -> [f64; 3] {
-    let [h0, h1, h2] = m;
-    let first = h0 * h0 - 2.0 * h1 * h1 + 2.0 * h2 * h2;
-    let first_root = libm::sqrtf(first.abs() as f32);
-    let b1 = ((h0 as f32 - first_root) * 0.5) as f64;
-    let second = -3.0 * h0 * h0 + 12.0 * h1 * h1 - 6.0 * h0 * b1 - 3.0 * b1 * b1;
-    let second_root = libm::sqrtf(second.abs() as f32);
-    let b2 = (((3.0 * (h0 - b1)) as f32 - second_root) / 6.0) as f64;
-    [h0 - b1 - b2, b1, b2]
+/// The reciprocals of the denominator's magnitude at DC, one-third and
+/// two-thirds Nyquist, from its Float32 words in binary64.
+fn inverse_den_magnitudes([a1, a2]: [f32; 2]) -> [f64; 3] {
+    let (a, b) = (f64::from(a1), f64::from(a2));
+    let d0 = ((1.0 + a) + b).abs();
+    let d1 = libm::fma(b, b, libm::fma(a, b, libm::fma(a, a, (1.0 + a) - b)));
+    let d2 = libm::fma(b, b, libm::fma(-a, b, libm::fma(a, a, (1.0 - a) - b)));
+    [1.0 / d0, 1.0 / libm::sqrt(d1.abs()), 1.0 / libm::sqrt(d2.abs())]
 }
 
-fn peak_analog_magnitude(x: f32, gain: f32, q: f32) -> f64 {
-    // Evaluate (s^2 + gain*s/q + 1) / (s^2 + s/q + 1) at s=j*x in the
-    // box's Float32 complex arithmetic: the real part 1 - x^2 rounds its
-    // product; the quotient is the platform split-complex division, which
-    // fuses the first product of the squared divisor and of each output
-    // part, rounds the second, and scales both by one reciprocal.
-    let real = 1.0 - x * x;
-    let num_imag = x * (gain / q);
-    let den_imag = x * (1.0 / q);
-    let inverse = 1.0 / libm::fmaf(real, real, den_imag * den_imag);
-    let out_real = inverse * libm::fmaf(real, real, num_imag * den_imag);
-    let out_imag = inverse * libm::fmaf(num_imag, real, -(den_imag * real));
-    platform_magnitude(out_real, out_imag) as f64
-}
-
-fn peak_magnitudes(gain_db: f64, f0: f64, q: f64, fs: f64, den_z: [f64; 2]) -> [f64; 3] {
-    let gain = exp32((gain_db as f32) * 0.115_129_255);
-    let q = (q as f32) * peak_amplitude(gain_db);
-    let w0 = 2.0 * PI * f0 / fs;
-    let x1 = ((PI / 3.0) / w0) as f32;
-    let x2 = 2.0 * x1;
-    let d0 = (1.0 + den_z[0] + den_z[1]).abs();
-    let d1 =
-        libm::sqrt((1.0 + den_z[0] - den_z[1] + den_z[0] * den_z[0] + den_z[0] * den_z[1] + den_z[1] * den_z[1]).abs());
-    let d2 =
-        libm::sqrt((1.0 - den_z[0] - den_z[1] + den_z[0] * den_z[0] - den_z[0] * den_z[1] + den_z[1] * den_z[1]).abs());
-    [d0, peak_analog_magnitude(x1, gain, q) * d1, peak_analog_magnitude(x2, gain, q) * d2]
-}
-
-fn matched(shape: Shape, gain_db: f64, f0: f64, q: f64, fs: f64) -> Section {
-    if gain_db < 0.0 && !matches!(shape, Shape::HighShelf) {
-        return inverse(matched(shape, -gain_db, f0, q, fs));
-    }
-
-    let a = libm::pow(10.0, gain_db / 40.0);
-    let root_a = libm::sqrt(a);
-    let (num, den, scale) = match shape {
-        // A * N/D gives A^2 at DC and unity at high frequency.
-        Shape::LowShelf => ([1.0, root_a / q, a], [a, root_a / q, 1.0], a),
-        // A * N/D gives unity at DC and A^2 at high frequency.
-        Shape::HighShelf => ([a, root_a / q, 1.0], [1.0, root_a / q, a], a),
-    };
-    let den_z = matched_den(den, f0, fs);
-    let mut magnitude = [0.0; 3];
-    for (i, w) in [0.0, PI / 3.0, 2.0 * PI / 3.0].into_iter().enumerate() {
-        let x = if w == 0.0 { 0.0 } else { w * fs / (2.0 * PI * f0) };
-        let target = scale * libm::sqrt(polynomial_power(num, x) / polynomial_power(den, x));
-        magnitude[i] = target * denominator_magnitude(den_z, w);
-    }
-    let b = curve_fit(magnitude);
-    Section { b0: b[0], b1: b[1], b2: b[2], a1: den_z[0], a2: den_z[1] }
-}
-
-fn round32(s: Section) -> Section {
-    Section {
-        b0: s.b0 as f32 as f64,
-        b1: s.b1 as f32 as f64,
-        b2: s.b2 as f32 as f64,
-        a1: s.a1 as f32 as f64,
-        a2: s.a2 as f32 as f64,
-    }
-}
-
-/// A decramped peaking section, as the unit's Float32 coefficients.
-///
-/// A cut inverts the complementary boost before its numerator is rounded:
-/// the boost's `b0` enters the inverse unrounded (black-box: about twice as
-/// many cuts exact as when the rounded boost is inverted).
-pub fn peak(gain_db: f64, f0: f64, q: f64, fs: f64) -> Section {
-    let g = gain_db.abs();
-    let den = peak_den(g, f0, q, fs);
-    let b = peak_curve_fit(peak_magnitudes(g, f0, q, fs, den));
-    round32(if gain_db < 0.0 {
-        Section { b0: 1.0 / b[0], b1: den[0] / b[0], b2: den[1] / b[0], a1: b[1] / b[0], a2: b[2] / b[0] }
+/// `m - sqrt(x)` for a real `x`, as a real: its magnitude when the root is
+/// imaginary, else its real part.
+fn sqrt_difference(m: f32, x: f32) -> f32 {
+    let (re, im) = complex_sqrt(x);
+    let real = m - re;
+    if x < 0.0 {
+        platform_magnitude(real, -im)
     } else {
-        Section { b0: b[0], b1: b[1], b2: b[2], a1: den[0], a2: den[1] }
-    })
+        real
+    }
+}
+
+/// The minimum-phase second-order FIR `[b0, b1, b2]` whose magnitudes at
+/// DC, one-third and two-thirds Nyquist are `h`: binary64 fused
+/// discriminants, Float32 roots, `b0` kept in binary64 until it is stored.
+fn fit([h0, h1, h2]: [f64; 3]) -> (f64, f32, f32) {
+    let first = libm::fma(h2 + h2, h2, libm::fma(h0, h0, -((h1 + h1) * h1)));
+    let b1 = sqrt_difference(h0 as f32, first as f32) * 0.5;
+    let b1d = f64::from(b1);
+    let mut second = libm::fma(-3.0 * h0, h0, (12.0 * h1) * h1);
+    second = libm::fma(-6.0 * h0, b1d, second);
+    second = libm::fma(-3.0 * b1d, b1d, second);
+    let lead = ((h0 - b1d) * 3.0) as f32;
+    let b2 = sqrt_difference(lead, second as f32) / 6.0;
+    ((h0 - b1d) - f64::from(b2), b1, b2)
+}
+
+/// The slot's angular frequency per sample, from its Float32 frequency and
+/// rate.
+fn angular(f0: f64, fs: f64) -> f64 {
+    f64::from(f0 as f32) * (2.0 * PI) / f64::from(fs as f32)
+}
+
+/// The two analog evaluation points `(pi/3)/w` and twice it, in Float32.
+fn evaluation_points(w: f64) -> [f32; 2] {
+    let x1 = ((PI / 3.0) / w) as f32;
+    [x1, x1 + x1]
+}
+
+fn section(b: [f32; 3], a: [f32; 2]) -> Section {
+    Section { b0: f64::from(b[0]), b1: f64::from(b[1]), b2: f64::from(b[2]), a1: f64::from(a[0]), a2: f64::from(a[1]) }
+}
+
+/// `|(z^2 + (g/q) z + 1) / (z^2 + z/q + 1)|` at `z = i x`, in Float32.
+fn peak_analog_magnitude(x: f32, gain: f64, q: f32) -> f32 {
+    let (zr, zi) = imaginary_square(x);
+    let (re, im) = (0.0f32, x);
+    let zeros = (gain / f64::from(q)) as f32;
+    let poles = 1.0 / q;
+    let num = ((zr + re * zeros) + 1.0, zi + im * zeros);
+    let den = ((zr + re * poles) + 1.0, zi + im * poles);
+    let (r, i) = complex_divide(num, den);
+    platform_magnitude(r, i)
+}
+
+/// A decramped peaking section, as the box stores it.
+///
+/// A boost's prototype is `s^2 + (A^2/q') s + 1` over `s^2 + s/q' + 1` with
+/// `q' = A q`, `A = 10^(g/40)`. A cut is the exact inverse of the
+/// complementary boost: its pole quality takes `A` of the positive gain, but
+/// its linear gain is the binary64 reciprocal of the Float32 exponential of
+/// the negative gain, and the inverse is formed before the words are rounded.
+pub fn peak(gain_db: f64, f0: f64, q: f64, fs: f64) -> Section {
+    let g = gain_db as f32;
+    let q = q as f32;
+    let (amplitude, linear) = if g < 0.0 {
+        (exp32(-g * DB_TO_HALF_EXPONENT), 1.0 / f64::from(exp32(g * DB_TO_EXPONENT)))
+    } else {
+        (exp32(g * DB_TO_HALF_EXPONENT), f64::from(exp32(g * DB_TO_EXPONENT)))
+    };
+    let qe = amplitude * q;
+    let w = angular(f0, fs);
+    let a = mapped_den(qe, w, 1.0);
+    let inv = inverse_den_magnitudes(a);
+    let [x1, x2] = evaluation_points(w);
+    let h = [
+        1.0 / inv[0],
+        f64::from(peak_analog_magnitude(x1, linear, qe)) / inv[1],
+        f64::from(peak_analog_magnitude(x2, linear, qe)) / inv[2],
+    ];
+    let (b0, b1, b2) = fit(h);
+    if g < 0.0 {
+        let k = |v: f64| (v / b0) as f32;
+        section([(1.0 / b0) as f32, k(f64::from(a[0])), k(f64::from(a[1]))], [k(f64::from(b1)), k(f64::from(b2))])
+    } else {
+        section([b0 as f32, b1, b2], a)
+    }
 }
 
 /// The quality a ToneMeister peak of the first algorithm version (box
@@ -278,55 +299,76 @@ pub fn legacy_peak(gain_db: f64, f0: f64, q: f64, fs: f64) -> Section {
     peak(gain_db, f0, legacy_peak_quality(gain_db, q), fs)
 }
 
-/// A decramped low-shelf section.
-pub fn low_shelf(gain_db: f64, f0: f64, q: f64, fs: f64) -> Section {
-    matched(Shape::LowShelf, gain_db, f0, q, fs)
+/// `|A (z^2 + c z + A) / (A z^2 + c z + 1)|` (low shelf) or
+/// `|A (A z^2 + c z + 1) / (z^2 + c z + A)|` (high shelf) at `z = i x`, in
+/// Float32, with `A = sqrt(G)` and `c = G^(1/4) / q` from two binary64
+/// square roots rounded once.
+fn shelf_analog_magnitude(high: bool, gain: f32, q: f32, x: f32) -> f32 {
+    let a64 = libm::sqrt(f64::from(gain));
+    let a = a64 as f32;
+    let c1 = (libm::sqrt(a64) / f64::from(q)) as f32;
+    let (zr, zi) = imaginary_square(x);
+    let (cr, ci) = (0.0f32 * c1, x * c1);
+    let unit_lead = (zr + (cr + a), zi + ci);
+    let scaled_lead = (zr * a + (cr + 1.0), zi * a + ci);
+    let (num, den) = if high { (scaled_lead, unit_lead) } else { (unit_lead, scaled_lead) };
+    let num = (num.0 * a, num.1 * a);
+    let (r, i) = complex_divide(num, den);
+    platform_magnitude(r, i)
 }
 
-/// A decramped high-shelf section.
+/// An ordinary (decramped) shelf, boost or cut, designed directly: its
+/// poles are the prototype's roots with the natural frequency scaled by
+/// `G^-1/2` (low shelf) or `G^1/2` (high shelf), `G = 10^(g/20)`.
+fn shelf(high: bool, gain_db: f64, f0: f64, q: f64, fs: f64) -> Section {
+    let g = gain_db as f32;
+    let gain = db_gain(g);
+    let q = q as f32;
+    let w = angular(f0, fs);
+    let base = if high { f64::from(gain) } else { 1.0 / f64::from(gain) };
+    let a = mapped_den(q, w, base);
+    let inv = inverse_den_magnitudes(a);
+    let [x1, x2] = evaluation_points(w);
+    let dc = if high { 1.0 } else { f64::from(gain) };
+    let h = [
+        dc / inv[0],
+        f64::from(shelf_analog_magnitude(high, gain, q, x1)) / inv[1],
+        f64::from(shelf_analog_magnitude(high, gain, q, x2)) / inv[2],
+    ];
+    let (b0, b1, b2) = fit(h);
+    section([b0 as f32, b1, b2], a)
+}
+
+/// A decramped low-shelf section. A 0 dB low shelf is the identity.
+pub fn low_shelf(gain_db: f64, f0: f64, q: f64, fs: f64) -> Section {
+    if gain_db as f32 == 0.0 {
+        return Section::IDENTITY;
+    }
+    shelf(false, gain_db, f0, q, fs)
+}
+
+/// A decramped high-shelf section. A 0 dB high shelf keeps its section, a
+/// pole and zero pair that cancel up to its Float32 words.
 pub fn high_shelf(gain_db: f64, f0: f64, q: f64, fs: f64) -> Section {
-    matched(Shape::HighShelf, gain_db, f0, q, fs)
+    shelf(true, gain_db, f0, q, fs)
 }
 
 /// ToneMeister's phase-compensated high shelf and its companion allpass.
 ///
 /// A channel selected by the slot's filter mask runs the shelf; a channel in
-/// the separate phase mask runs the allpass.  The shelf is the square of a
-/// half-gain shelf: its analog zeros and poles sit a quarter of the gain
-/// ratio either side of the slot frequency (`A^(-1/2) s^2 + A^(-1/4) s / Q +
-/// 1` over `A^(1/2) s^2 + A^(1/4) s / Q + 1` for a cut, the reverse for a
-/// boost), the poles are mapped by matched Z and the numerator is
-/// magnitude-corrected at the same three frequencies as [`high_shelf`].  The
-/// shelf runs that half-gain section followed by its numerator-reversed twin,
-/// so its magnitude is the half-gain magnitude squared and its phase is
-/// exactly that of the allpass built on the same poles (black-box: the unit's
-/// shelf impulse is fourth order with a doubled pole pair and a zero pair
-/// mirrored about the unit circle, and the companion's poles are the half
-/// shelf's; cuts and boosts of 2-6 dB at Q 0.7-2 match to <= 0.01 dB).
+/// the separate phase mask runs the allpass. The shelf is a high shelf of
+/// half the gain (in Float32) followed by its numerator-reversed twin, so its
+/// magnitude is the half-gain magnitude squared and its phase is exactly
+/// that of the allpass built on the same poles.
 pub fn phase_compensated_high_shelf(gain_db: f64, f0: f64, q: f64, fs: f64) -> ([Section; 2], Section) {
-    if gain_db == 0.0 {
-        return ([Section::IDENTITY; 2], Section::IDENTITY);
-    }
-    let a = libm::pow(10.0, gain_db.abs() / 40.0);
-    let (num_power, den_power) = if gain_db < 0.0 { (-0.5, 0.5) } else { (0.5, -0.5) };
-    let prototype = |power: f64| {
-        let leading = libm::pow(a, power);
-        [leading, libm::sqrt(leading) / q, 1.0]
-    };
-    let num = prototype(num_power);
-    let den = prototype(den_power);
-    let den_z = matched_den(den, f0, fs);
-    let mut magnitude = [0.0; 3];
-    for (i, w) in [0.0, PI / 3.0, 2.0 * PI / 3.0].into_iter().enumerate() {
-        let x = if w == 0.0 { 0.0 } else { w * fs / (2.0 * PI * f0) };
-        let target = libm::sqrt(polynomial_power(num, x) / polynomial_power(den, x));
-        magnitude[i] = target * denominator_magnitude(den_z, w);
-    }
-    let b = curve_fit(magnitude);
-    let half = Section { b0: b[0], b1: b[1], b2: b[2], a1: den_z[0], a2: den_z[1] };
-    let twin = Section { b0: b[2], b1: b[1], b2: b[0], a1: den_z[0], a2: den_z[1] };
-    let allpass = Section { b0: den_z[1], b1: den_z[0], b2: 1.0, a1: den_z[0], a2: den_z[1] };
-    ([half, twin], allpass)
+    let half = high_shelf(f64::from(gain_db as f32 * 0.5), f0, q, fs);
+    let twin = Section { b0: half.b2, b1: half.b1, b2: half.b0, a1: half.a1, a2: half.a2 };
+    ([half, twin], allpass(half))
+}
+
+/// The allpass on a section's poles, `[a2, a1, 1, a1, a2]`.
+pub fn allpass(s: Section) -> Section {
+    Section { b0: s.a2, b1: s.a1, b2: 1.0, a1: s.a1, a2: s.a2 }
 }
 
 /// ToneMeister's resonant high-pass slot. `Q` is stored in an analog decay
@@ -369,27 +411,51 @@ impl Cascade {
     }
 }
 
-/// A bilinear-prewarped Butterworth low- or high-pass of integer order.
+/// A Butterworth low- or high-pass of integer order, as the box stores it:
+/// the platform voicing library's Float32 construction (corner clamped to
+/// 20 Hz .. 0.45 of the rate, rounded angle, sine and cosine, numerators
+/// formed from the rounded poles), widened. No allocation (volume automation
+/// recomputes it on the audio thread).
 pub fn butterworth(high: bool, order: u32, f0: f64, fs: f64) -> Cascade {
-    let mut out = Cascade::EMPTY;
+    use super::vbass::{butter_words, Kind, Words};
+    struct Sink(Cascade);
+    impl Extend<Words> for Sink {
+        fn extend<I: IntoIterator<Item = Words>>(&mut self, words: I) {
+            for w in words {
+                if self.0.count < MAX_CASCADE {
+                    let [b0, b1, b2, a1, a2] = w.map(f64::from);
+                    self.0.push(Section { b0, b1, b2, a1, a2 });
+                }
+            }
+        }
+    }
+    let mut out = Sink(Cascade::EMPTY);
     let order = order.clamp(1, 20);
-    let k = libm::tan(PI * f0 / fs);
-    for i in 0..order / 2 {
-        let q2 = 2.0 * libm::sin(PI * (2 * i + 1) as f64 / (2 * order) as f64);
-        let n = 1.0 + q2 * k + k * k;
-        let (a1, a2) = (2.0 * (k * k - 1.0) / n, (1.0 - q2 * k + k * k) / n);
-        let (b0, b1, b2) = if high { (1.0 / n, -2.0 / n, 1.0 / n) } else { (k * k / n, 2.0 * k * k / n, k * k / n) };
-        out.sections[out.count] = Section { b0, b1, b2, a1, a2 };
-        out.count += 1;
+    let kind = if high { Kind::High } else { Kind::Low };
+    butter_words(order as usize, (f0 as f32).max(20.0), fs as f32, kind, &mut out);
+    out.0
+}
+
+/// The box's phase-matched Butterworth low-pass of an even `order`: two
+/// copies of the half-order low-pass for a filtered channel, and the allpass
+/// on the same poles for a phase channel. An odd half-order's first-order
+/// allpass is the one-frame-delayed `[0, a1, 1, a1, 0]`; the filtered
+/// channel then runs a one-frame delay after its two copies, so both paths
+/// keep the same phase.
+pub fn phase_matched_low_pass(order: u32, f0: f64, fs: f64) -> (Cascade, Cascade) {
+    let half = butterworth(false, order / 2, f0, fs);
+    let mut filtered = half;
+    let mut phase = Cascade::EMPTY;
+    for s in &half.sections[..half.count] {
+        if filtered.count < MAX_CASCADE {
+            filtered.push(*s);
+        }
+        phase.push(allpass(*s));
     }
-    if order % 2 == 1 {
-        let n = 1.0 + k;
-        let a1 = (k - 1.0) / n;
-        let (b0, b1) = if high { (1.0 / n, -1.0 / n) } else { (k / n, k / n) };
-        out.sections[out.count] = Section { b0, b1, b2: 0.0, a1, a2: 0.0 };
-        out.count += 1;
+    if (order / 2) % 2 != 0 && filtered.count < MAX_CASCADE {
+        filtered.push(Section { b0: 0.0, b1: 1.0, b2: 0.0, a1: 0.0, a2: 0.0 });
     }
-    out
+    (filtered, phase)
 }
 
 /// A double-double value `hi + lo`, `|lo| <= ulp(hi) / 2`.
@@ -540,7 +606,10 @@ pub fn butterworth_shelf(gain_db: f64, from_hz: f64, to_hz: f64, max_order: u32,
     }
     let even = if lower % 2 == 1 { libm::ceil(order) } else { whole };
     let t = (share * (even - order)) as f32;
-    out.push(root_section(bilinear_root(k, (-libm::exp10f(t), 0.0)), bilinear_root(k, (-libm::exp10f(-t), 0.0))));
+    out.push(root_section(
+        bilinear_root(k, (-crate::platform_math::exp10f(t), 0.0)),
+        bilinear_root(k, (-crate::platform_math::exp10f(-t), 0.0)),
+    ));
 
     let flat = libm::exp10(flat_db as f64 / 20.0);
     let first = &mut out.sections[0];
@@ -593,18 +662,31 @@ mod tests {
         assert!(magnitude(s, 500.0, fs) < magnitude(r, 500.0, fs));
     }
 
+    /// The analog matched-Z poles of `s^2 + s/q + base`, in binary64.
+    fn matched_poles(q: f64, w: f64, base: f64) -> [f64; 2] {
+        let (d, r2) = (1.0 / (2.0 * q), 1.0);
+        let wn = w * libm::sqrt(libm::sqrt(base));
+        if d * d <= r2 {
+            let radius = libm::exp(-d * wn);
+            [-2.0 * radius * libm::cos(libm::sqrt(r2 - d * d) * wn), radius * radius]
+        } else {
+            let spread = libm::sqrt(d * d - r2);
+            let (p0, p1) = (libm::exp(-(d - spread) * wn), libm::exp(-(d + spread) * wn));
+            [-(p0 + p1), p0 * p1]
+        }
+    }
+
     #[test]
-    fn peak_poles_are_the_matched_analog_roots_in_float32() {
+    fn mapped_poles_are_the_analog_roots_in_float32() {
         let fs = 48_000.0;
-        for gain_db in [0.0, 3.5, 6.0, 12.0] {
-            let a = libm::pow(10.0, gain_db / 40.0);
-            for q in [0.2, 0.4, 0.5, 1.0, 5.0] {
+        for base in [1.0, 0.25, 4.0] {
+            for q in [0.2f32, 0.4, 0.5, 0.75, 1.0, 5.0] {
                 for f0 in [40.0, 200.0, 8500.0] {
-                    let expected = matched_den([1.0, 1.0 / (a * q), 1.0], f0, fs);
-                    let actual = peak_den(gain_db, f0, q, fs);
-                    for (got, want) in actual.into_iter().zip(expected) {
-                        assert!((got - want).abs() < 2e-6, "{gain_db} dB, {f0} Hz, Q {q}: {got} vs {want}");
-                        assert_eq!(got, got as f32 as f64);
+                    let w = angular(f0, fs);
+                    let want = matched_poles(f64::from(q), w, base);
+                    let got = mapped_den(q, w, base);
+                    for (g, e) in got.into_iter().zip(want) {
+                        assert!((f64::from(g) - e).abs() < 4e-6, "q {q} f {f0} base {base}: {g} vs {e}");
                     }
                 }
             }
@@ -612,19 +694,43 @@ mod tests {
     }
 
     #[test]
-    fn a_peak_cut_inverts_the_unrounded_boost() {
+    fn a_negative_real_has_the_platform_argument() {
+        // pi rounded down, its half's cosine as the platform returns it
+        assert_eq!(NEGATIVE_REAL_ARGUMENT.to_bits() + 1, core::f32::consts::PI.to_bits());
+        assert_eq!(half_argument(-2.0), (1.0, f32::from_bits(0x33a2_2169)));
+        assert_eq!(half_argument(0.0), (0.0, 1.0));
+        let (re, im) = complex_sqrt(-4.0);
+        assert_eq!((re, im), (f32::from_bits(0x33a2_2169) * 2.0, 2.0));
+    }
+
+    #[test]
+    fn a_peak_cut_inverts_its_complementary_boost_before_rounding() {
         let fs = 48_000.0;
-        let (g, f0, q) = (7.25, 1234.5, 2.5);
-        let den = peak_den(g, f0, q, fs);
-        let b = peak_curve_fit(peak_magnitudes(g, f0, q, fs, den));
-        let cut = peak(-g, f0, q, fs);
-        assert_eq!(cut.b0, (1.0 / b[0]) as f32 as f64);
-        assert_eq!(cut.a1, (b[1] / b[0]) as f32 as f64);
-        assert_eq!(cut.b1, (den[0] / b[0]) as f32 as f64);
-        // every coefficient is a Float32 value
-        for c in [cut.b0, cut.b1, cut.b2, cut.a1, cut.a2] {
-            assert_eq!(c, c as f32 as f64);
+        for (g, f0, q) in [(7.25, 1234.5, 2.5), (3.0, 90.0, 0.7), (12.0, 18_000.0, 2.0)] {
+            let boost = peak(g, f0, q, fs);
+            let cut = peak(-g, f0, q, fs);
+            // the cut's zeros are the boost's poles
+            assert!((cut.b1 / cut.b0 - boost.a1).abs() < 1e-6 && (cut.b2 / cut.b0 - boost.a2).abs() < 1e-6);
+            for f in [20.0, f0 * 0.5, f0, f0 * 2.0, 20_000.0] {
+                // exact inverses up to their Float32 words (a hundredth of a dB
+                // next to poles close to the unit circle)
+                assert!((magnitude(boost, f, fs) * magnitude(cut, f, fs) - 1.0).abs() < 1.2e-3, "{g} {f0} {f}");
+            }
+            for c in [cut.b0, cut.b1, cut.b2, cut.a1, cut.a2] {
+                assert_eq!(c, c as f32 as f64);
+            }
         }
+    }
+
+    #[test]
+    fn gains_are_float32_exponentials_applied_as_a_fused_product() {
+        assert_eq!(db_gain(-6.0).to_bits(), 0x3f00_4dcf);
+        assert_eq!(db_gain(0.0), 1.0);
+        let s = gain_section(-18.5);
+        let g = s.b0 as f32;
+        assert_eq!((s.b1, s.b2, s.a1, s.a2), (0.0, 0.0, 0.0, 0.0));
+        assert!((20.0 * libm::log10(f64::from(g)) + 18.5).abs() < 1e-5);
+        assert!((magnitude(s, 1000.0, 48_000.0) - f64::from(g)).abs() < 1e-12);
     }
 
     #[test]
@@ -755,15 +861,17 @@ mod tests {
         let fs = 48_000.0;
         let low = low_shelf(6.0, 1000.0, core::f64::consts::FRAC_1_SQRT_2, fs);
         let high = high_shelf(6.0, 1000.0, core::f64::consts::FRAC_1_SQRT_2, fs);
-        assert!((20.0 * libm::log10(magnitude(low, 0.0, fs)) - 6.0).abs() < 1e-9);
+        assert!((20.0 * libm::log10(magnitude(low, 0.0, fs)) - 6.0).abs() < 1e-3);
         assert!(20.0 * libm::log10(magnitude(low, 23_999.0, fs)) < 0.01);
-        assert!(20.0 * libm::log10(magnitude(high, 0.0, fs)).abs() < 1e-9);
+        assert!(20.0 * libm::log10(magnitude(high, 0.0, fs)).abs() < 1e-3);
         assert!((20.0 * libm::log10(magnitude(high, 23_999.0, fs)) - 6.0).abs() < 0.01);
         // a high-shelf cut is designed directly, not as the inverse boost
         let cut = high_shelf(-12.0, 6000.0, core::f64::consts::FRAC_1_SQRT_2, fs);
-        assert!(20.0 * libm::log10(magnitude(cut, 0.0, fs)).abs() < 1e-9);
+        assert!(20.0 * libm::log10(magnitude(cut, 0.0, fs)).abs() < 1e-3);
         assert!((20.0 * libm::log10(magnitude(cut, 16_000.0, fs)) + 12.0).abs() < 0.5);
-        let inverse_boost = inverse(high_shelf(12.0, 6000.0, core::f64::consts::FRAC_1_SQRT_2, fs));
+        let b = high_shelf(12.0, 6000.0, core::f64::consts::FRAC_1_SQRT_2, fs);
+        let inverse_boost =
+            Section { b0: 1.0 / b.b0, b1: b.a1 / b.b0, b2: b.a2 / b.b0, a1: b.b1 / b.b0, a2: b.b2 / b.b0 };
         assert!((magnitude(cut, 4000.0, fs) - magnitude(inverse_boost, 4000.0, fs)).abs() > 1e-4);
     }
 
@@ -791,7 +899,7 @@ mod tests {
                 let wrapped = libm::atan2(libm::sin(diff), libm::cos(diff));
                 assert!(wrapped.abs() < 1e-9, "{gain} dB at {f} Hz: phase {wrapped}");
             }
-            assert!((shelf(0.0) - 1.0).abs() < 1e-9);
+            assert!((shelf(0.0) - 1.0).abs() < 1e-4);
             assert!((20.0 * libm::log10(shelf(23_999.0)) - gain).abs() < 0.05);
         }
     }

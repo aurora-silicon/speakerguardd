@@ -288,12 +288,12 @@ fn power_of(l: f64) -> f64 {
 /// The unit's single-precision loudness-to-power conversion.
 fn power_of_f32(l: f32) -> f64 {
     let exponent = (l - LOUDNESS_OFFSET as f32) * (core::f32::consts::LN_10 / 10.0);
-    f64::from(libm::expf(exponent))
+    f64::from(crate::platform_math::expf(exponent))
 }
 
 /// The unit's single-precision dB-to-linear-amplitude conversion.
 fn amplitude_of_f32(db: f32) -> f64 {
-    f64::from(libm::expf(db * (core::f32::consts::LN_10 / 20.0)))
+    f64::from(crate::platform_math::expf(db * (core::f32::consts::LN_10 / 20.0)))
 }
 
 /// The histogram bin of loudness `l`: one below the nearest point of the
@@ -305,7 +305,7 @@ fn bin_of(l: f64) -> usize {
 
 /// `exp(-1 / (tau * rate))` in single precision, as the unit forms it.
 fn pole(tau_s: f32, rate: f32) -> f32 {
-    libm::expf(-1.0 / (tau_s * rate))
+    crate::platform_math::expf(-1.0 / (tau_s * rate))
 }
 
 /// The power every smoothed store starts from after a reset (-70 dB).
@@ -702,7 +702,7 @@ impl Run {
             z: [[[0.0; 2]; MAX_SECTIONS]; MAX_CHANNELS],
             ema: 0.0,
             ema_a: if p.algorithm1 {
-                f64::from(libm::expf(-1.0 / (p.detector_ema_s as f32 * fs as f32)))
+                f64::from(crate::platform_math::expf(-1.0 / (p.detector_ema_s as f32 * fs as f32)))
             } else {
                 libm::exp(-1.0 / (p.detector_ema_s * fs))
             },
@@ -732,7 +732,7 @@ impl Run {
             gain: 1.0,
             target: 1.0,
             glide: if p.algorithm1 {
-                f64::from(1.0 - libm::expf(-1.0 / (GLIDE_S * fs as f32)))
+                f64::from(1.0 - crate::platform_math::expf(-1.0 / (GLIDE_S * fs as f32)))
             } else {
                 1.0 - libm::exp(-2.0 * core::f64::consts::PI * LEGACY_GLIDE_HZ / fs)
             },
@@ -1036,7 +1036,7 @@ mod tests {
         r.process(&mut [&mut buf[..]], CALL * 3);
         let to = r.target;
         assert!((to - from).abs() > 0.1);
-        let a = f64::from(1.0 - libm::expf(-1.0 / (GLIDE_S * 48_000.0)));
+        let a = f64::from(1.0 - crate::platform_math::expf(-1.0 / (GLIDE_S * 48_000.0)));
         assert_eq!(r.glide, a);
     }
 

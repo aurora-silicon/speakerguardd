@@ -1408,6 +1408,9 @@ pub struct PreStage {
     /// allocated once here, never in the real-time path.
     boxes: [Option<alloc::boxed::Box<mstk::Run>>; MAX_BOXES],
     dynamic: [Option<DynamicRun>; MAX_DYNAMIC_FILTERS],
+    /// A one-channel ToneMeister box's static sections as the platform's
+    /// one-channel biquad runs them (allocated once, for one channel only).
+    mono: Option<alloc::boxed::Box<[crate::vdsp::Section; MAX_SECTIONS]>>,
 }
 
 impl PreStage {
@@ -1427,7 +1430,10 @@ impl PreStage {
         let dynamic = core::array::from_fn(|k| {
             (k < params.dynamic_count.min(MAX_DYNAMIC_FILTERS)).then(|| DynamicRun::new(&params.dynamic[k].params, fs))
         });
-        PreStage { params, state: [[[0.0; 2]; MAX_SECTIONS]; MAX_CHANNELS], dynamics, boxes, dynamic }
+        let mono = (params.channels == 1).then(|| {
+            alloc::boxed::Box::new(core::array::from_fn(|_| crate::vdsp::Section::new([1.0, 0.0, 0.0, 0.0, 0.0])))
+        });
+        PreStage { params, state: [[[0.0; 2]; MAX_SECTIONS]; MAX_CHANNELS], dynamics, boxes, dynamic, mono }
     }
 
     pub fn params(&self) -> &Params {
@@ -1461,6 +1467,9 @@ impl PreStage {
     /// Clears every filter's history and the dynamics' detectors (stream start).
     pub fn reset(&mut self) {
         self.state = [[[0.0; 2]; MAX_SECTIONS]; MAX_CHANNELS];
+        for s in self.mono.iter_mut().flat_map(|m| m.iter_mut()) {
+            s.reset();
+        }
         if let Some(d) = &mut self.dynamics {
             d.reset();
         }
@@ -1509,6 +1518,10 @@ impl PreStage {
     /// form leaves a rounding floor up to 8 dB louder, e.g. under a 16 kHz
     /// tone through 80-100 Hz sections).
     fn run_sections_float(&mut self, c: usize, from: usize, to: usize, gain: f64, buf: &mut [f32]) {
+        if c == 0 && self.mono.is_some() {
+            self.run_mono(from, to, gain, buf);
+            return;
+        }
         let (Some(ch), Some(z)) = (self.params.channel.get(c), self.state.get_mut(c)) else {
             buf.fill(0.0);
             return;
@@ -1533,6 +1546,41 @@ impl PreStage {
                     *st = [0.0; 2];
                 }
                 *y = 0.0;
+            }
+        }
+    }
+
+    /// [`Self::run_sections_float`] for a one-channel box: the platform runs
+    /// a one-channel setup's sections one after another over the whole call
+    /// in its blocked form ([`crate::vdsp::Section::run`]), not frame by
+    /// frame (black-box: one-channel boxes of the installed unit match this
+    /// bit for bit and miss the fused frame step from the second sample).
+    fn run_mono(&mut self, from: usize, to: usize, gain: f64, buf: &mut [f32]) {
+        let (Some(mono), Some(ch)) = (self.mono.as_mut(), self.params.channel.first()) else {
+            buf.fill(0.0);
+            return;
+        };
+        let to = to.min(ch.count).min(MAX_SECTIONS);
+        let from = from.min(to);
+        for v in buf.iter_mut() {
+            *v = if v.is_finite() { v.clamp(-INPUT_BOUND, INPUT_BOUND) } else { 0.0 };
+        }
+        for (run, s) in mono[from..to].iter_mut().zip(&ch.sections[from..to]) {
+            run.set([s.b0, s.b1, s.b2, s.a1, s.a2]);
+            run.run(buf);
+        }
+        let g = gain as f32;
+        let mut poisoned = false;
+        for v in buf.iter_mut() {
+            *v *= g;
+            if !v.is_finite() {
+                poisoned = true;
+                *v = 0.0;
+            }
+        }
+        if poisoned {
+            for s in mono[from..to].iter_mut() {
+                s.reset();
             }
         }
     }
@@ -1686,6 +1734,13 @@ impl PreStage {
     /// in [`Self::run_sections_float`]. The protection pre-stage
     /// deliberately keeps the f64 path above.
     pub(crate) fn process_float(&mut self, c: usize, input: &[f32], output: &mut [f32]) {
+        if c == 0 && self.mono.is_some() {
+            let n = input.len().min(output.len());
+            output[..n].copy_from_slice(&input[..n]);
+            let (count, gain) = (self.params.channel[0].count, self.params.channel[0].gain);
+            self.run_mono(0, count, gain, &mut output[..n]);
+            return;
+        }
         let (Some(ch), Some(z)) = (self.params.channel.get(c), self.state.get_mut(c)) else {
             output.fill(0.0);
             return;
