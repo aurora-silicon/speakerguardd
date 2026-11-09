@@ -108,7 +108,23 @@ static AudioUnit instantiate(NSString *stage, NSDictionary *effect,
     AudioComponentDescription d = {
         kAudioUnitType_Effect, fcc(subtype), kAudioUnitManufacturer_Apple, 0, 0
     };
-    AudioComponent component = AudioComponentFindNext(NULL, &d);
+    // AUDIODSP_PATH: render another macOS build's units (its AudioDSP.component binary, read from that
+    // build's restore image) on this host, used directly (never looked up, so the installed
+    // units are never picked by mistake). Fails with the loader's message if the binary needs symbols
+    // this macOS does not have.
+    const char *alt = getenv("AUDIODSP_PATH");
+    AudioComponent alt_component = NULL;
+    if (alt && *alt) {
+        void *image = dlopen(alt, RTLD_NOW | RTLD_LOCAL);
+        if (!image) { fprintf(stderr, "AUDIODSP_PATH: %s\n", dlerror()); exit(1); }
+        AudioComponentFactoryFunction factory = (AudioComponentFactoryFunction)dlsym(image, factory_name);
+        if (!factory) { fprintf(stderr, "AUDIODSP_PATH: missing factory %s\n", factory_name); exit(1); }
+        Dl_info info = {0};
+        if (dladdr((const void *)factory, &info)) fprintf(stderr, "AUDIODSP_PATH: %s from %s\n", factory_name, info.dli_fname);
+        alt_component = AudioComponentRegister(&d, (__bridge CFStringRef)stage, 0x7fffffff, factory);
+        if (!alt_component) { fprintf(stderr, "AUDIODSP_PATH: register failed\n"); exit(1); }
+    }
+    AudioComponent component = alt_component ? alt_component : AudioComponentFindNext(NULL, &d);
     if (!component) {
         void *image = dlopen("/System/Library/Components/AudioDSP.component/Contents/MacOS/AudioDSP",
                             RTLD_NOW | RTLD_LOCAL);

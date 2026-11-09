@@ -83,3 +83,18 @@ attest.py gate --variants variants.json --mac REFS --bin BIN --prog prog --refer
 
 Commit the new `parity.json` in the same PR as the code change it attests. `test_verify.py` checks
 that the file is consistent with its own tolerance.
+
+### Builds without a Mac (`ipsw_units.py`)
+
+A release can be attested without booting a Mac on it when its units load on the reference
+host. `ipsw_units.py BUILD BOARD DIR --ipsw URL` reads the build's AudioDSP.component and Tunings
+from its restore image by HTTP ranges. After an ad-hoc re-sign of the private copy, `attest_refs.sh`
+runs with `AUDIODSP_PATH=DIR/AudioDSP-signed`, `TUNINGS_NEW=TUNINGS_HOST=DIR/Tunings`, and
+`attest.py variants/gate --build BUILD` writes that build's block. The reference string says
+so ("its AudioDSP.component ... rendered on a <host build> host"): the system frameworks the
+units link against are the host's.
+
+Coverage on 2026-11-09 (host 25G83): 25C56 (26.2) loads and is attested this way.
+26A428 (27.0) does not load ("built for macOS 27.0 which is newer than running OS"), so it was
+gated on a J616s booted into 26A428. Newer builds than the host need such a Mac. A build
+whose AudioDSP and Tunings are byte-identical to an attested build's renders the same.
