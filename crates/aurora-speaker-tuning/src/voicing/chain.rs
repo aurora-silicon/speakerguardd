@@ -68,7 +68,14 @@ fn tone(
     diags: &mut Diagnostics,
     gaps: &mut Vec<(String, String)>,
 ) -> Result<Kind> {
-    let (tone, partial) = crate::prestage::voicing_tone(stage, width, volume_wired, fs, diags)?;
+    // The box runs at its saved state either way. Without a volume wire its
+    // automation sits at the saved SystemVolume (parameter 3) for good:
+    // carrying it at the least-passing setting dropped the boosts of
+    // bypassed groups and cut where macOS does not (AID4 Tone3: 12-35 dB
+    // under macOS; black-box renders of the installed unit at its saved
+    // state).
+    let (tone, partial) = crate::prestage::voicing_tone(stage, width, true, fs, diags)?;
+    let tone = if volume_wired { tone } else { tone.at_volume(fs, saved_volume(stage)) };
     if !partial.is_empty() {
         gaps.push((
             stage.name.clone(),
@@ -83,6 +90,13 @@ fn tone(
         ));
     }
     Ok(Kind::Tone(tone))
+}
+
+/// The saved SystemVolume (parameter 3) of a filter box: where its volume
+/// automation sits when the graph does not drive it. A state without it
+/// reads as 0, the unit's default.
+fn saved_volume(stage: &Stage) -> f64 {
+    stage.state.as_ref().and_then(|s| s.global()).and_then(|g| g.get(3)).map(f64::from).unwrap_or(0.0)
 }
 
 /// A box of a carried type whose saved state the module cannot carry: a
@@ -226,10 +240,7 @@ fn controlled_tone(
         global.params.retain(|(id, _)| *id != 1);
         global.params.push((1, mask as f32));
         // Group switches are exact bypasses, independent of volume wiring.
-        let Kind::Tone(tone) = tone(&stage, width, true, fs, diags, gaps)? else { unreachable!() };
-        if !volume_wired && (!tone.automation.is_empty() || !tone.dynamic_automation.is_empty()) {
-            return Err(bad("group-controlled tone also needs an explicit volume wire"));
-        }
+        let Kind::Tone(tone) = tone(&stage, width, volume_wired, fs, diags, gaps)? else { unreachable!() };
         variants.push(sgv2_core::voicing::chain::ToneVariant { mask, tone });
     }
     Ok(Kind::ToneGroups { default_mask, variants })

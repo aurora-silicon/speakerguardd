@@ -166,6 +166,32 @@ pub struct Tone {
     pub dynamic_automation: Vec<DynamicToneAutomation>,
 }
 
+impl Tone {
+    /// The box as it runs at one fixed system-volume scalar: every volume
+    /// automation entry applied once at `scalar`, none left to follow. A
+    /// box whose SystemVolume input the graph leaves alone runs its
+    /// automation at the saved value of that parameter, never at a volume
+    /// the user sets.
+    pub fn at_volume(&self, fs: f64, scalar: f64) -> Tone {
+        let width = self.channels.len().min(MAX_CHANNELS);
+        let count = self.dynamic.len().min(crate::prestage::MAX_DYNAMIC_FILTERS);
+        let mut p = PreParams::identity(width);
+        p.channel[..width].copy_from_slice(&self.channels[..width]);
+        p.dynamic_count = count;
+        p.dynamic[..count].copy_from_slice(&self.dynamic[..count]);
+        let mut stage = PreStage::with_rate(p, fs);
+        apply_tone_automation(&mut stage, &self.channels[..width], &self.automation, fs, scalar);
+        apply_dynamic_tone_automation(&mut stage, &self.dynamic[..count], &self.dynamic_automation, fs, scalar);
+        let params = stage.params();
+        Tone {
+            channels: params.channel[..width].to_vec(),
+            automation: Vec::new(),
+            dynamic: params.dynamic[..count].to_vec(),
+            dynamic_automation: Vec::new(),
+        }
+    }
+}
+
 /// A precompiled group-bypass mask of one filter box.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ToneVariant {
