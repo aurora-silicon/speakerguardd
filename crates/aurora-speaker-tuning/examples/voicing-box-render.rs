@@ -382,7 +382,7 @@ fn main() {
                 at += k;
             }
         }
-        "cfrk" | "vben" | "axtc" | "vrq2" | "ldnm" | "pchr" | "volt" => {
+        "cfrk" | "vben" | "axtc" | "vrq2" | "ldnm" | "pchr" | "volt" | "buzk" => {
             // Use the production compiler and runner, without compiling unrelated
             // graph nodes. A module refusal must never turn into a bypass here.
             macro_rules! kind {
@@ -411,6 +411,7 @@ fn main() {
                 "ldnm" => kind!(norm, Norm),
                 "pchr" => kind!(pchr, Pchr),
                 "volt" => kind!(volt, Volt),
+                "buzk" => kind!(buzz, Buzz),
                 _ => unreachable!(),
             };
             let spec = Spec {
