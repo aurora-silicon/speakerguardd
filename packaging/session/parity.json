@@ -1,8 +1,8 @@
 {
  "format": 1,
- "law": "2e054ed2504fd412924ae91b5fa197daa8b0a4dae6a61c349c68f6cebdd101a1",
+ "law": "48e7abafc61e193f225c742a16d018a1573456536c4d6467d075090db702c28a",
  "reference": "macOS 26.6.2 25G83 Audio Units",
- "rev": "7c97fb1fca8221c19430798074ed73980b2bfbbd",
+ "rev": "86ff3f4018277f6460a0ad248d1cdf05455628df",
  "tolerance": {
   "louder_db": 0.25,
   "quieter_db": 1.0
@@ -24,11 +24,11 @@
    "aid": 3,
    "speaker_id": null,
    "also_speaker_ids": [],
-   "verdict": "refused",
+   "verdict": "pass",
    "measured": 148,
-   "worst_louder_db": 4.678,
-   "worst_quieter_db": -1.802,
-   "reason": "8 cell(s) louder than macOS by more than 0.25 dB, worst +4.68 dB (lane 0, step_up_125); 4 cell(s) quieter than macOS by more than 1.0 dB, worst -1.80 dB (lane 1, step_up_125)"
+   "worst_louder_db": 0.027,
+   "worst_quieter_db": -0.034,
+   "reason": "within +0.25/-1.0 dB of macOS on 148 cells"
   },
   {
    "key": "4539367e23687b8a253f81b57d3159e89ee33282931f7f673170f2d37c586abf",
@@ -82,22 +82,22 @@
     3,
     65535
    ],
-   "verdict": "refused",
+   "verdict": "pass",
    "measured": 180,
-   "worst_louder_db": 4.352,
-   "worst_quieter_db": -1.064,
-   "reason": "10 cell(s) louder than macOS by more than 0.25 dB, worst +4.35 dB (lane 0, step_up_125); 4 cell(s) quieter than macOS by more than 1.0 dB, worst -1.06 dB (lane 0, step_up_125)"
+   "worst_louder_db": 0.012,
+   "worst_quieter_db": -0.075,
+   "reason": "within +0.25/-1.0 dB of macOS on 180 cells"
   },
   {
    "key": "2dcfd992c8e6205413278045ec9107f9d352fdc0626866bf8b942d68a85f44f4",
    "aid": 8,
    "speaker_id": 0,
    "also_speaker_ids": [],
-   "verdict": "refused",
+   "verdict": "pass",
    "measured": 180,
-   "worst_louder_db": 4.352,
-   "worst_quieter_db": -1.064,
-   "reason": "10 cell(s) louder than macOS by more than 0.25 dB, worst +4.35 dB (lane 0, step_up_125); 4 cell(s) quieter than macOS by more than 1.0 dB, worst -1.06 dB (lane 0, step_up_125)"
+   "worst_louder_db": 0.009,
+   "worst_quieter_db": -0.075,
+   "reason": "within +0.25/-1.0 dB of macOS on 180 cells"
   },
   {
    "key": "bea9f81fc5a98b5baff1f089332d398ce3fb5493e7c80b0820a495825e447ba1",
@@ -165,22 +165,22 @@
     0,
     65535
    ],
-   "verdict": "refused",
+   "verdict": "pass",
    "measured": 180,
-   "worst_louder_db": 4.352,
-   "worst_quieter_db": -1.064,
-   "reason": "10 cell(s) louder than macOS by more than 0.25 dB, worst +4.35 dB (lane 0, step_up_125); 4 cell(s) quieter than macOS by more than 1.0 dB, worst -1.06 dB (lane 0, step_up_125)"
+   "worst_louder_db": 0.009,
+   "worst_quieter_db": -0.075,
+   "reason": "within +0.25/-1.0 dB of macOS on 180 cells"
   },
   {
    "key": "b139ff7c9854fae1143e20777f24558bc54a932875b0f2e15bac7aab654693a5",
    "aid": 14,
    "speaker_id": 3,
    "also_speaker_ids": [],
-   "verdict": "refused",
+   "verdict": "pass",
    "measured": 180,
-   "worst_louder_db": 4.352,
-   "worst_quieter_db": -1.064,
-   "reason": "10 cell(s) louder than macOS by more than 0.25 dB, worst +4.35 dB (lane 0, step_up_125); 4 cell(s) quieter than macOS by more than 1.0 dB, worst -1.06 dB (lane 0, step_up_125)"
+   "worst_louder_db": 0.012,
+   "worst_quieter_db": -0.075,
+   "reason": "within +0.25/-1.0 dB of macOS on 180 cells"
   },
   {
    "key": "b6b63bdcfda8d9945b94c11ad6343683201d346bd6c48ac9b65a5fff72f834ea",
@@ -212,11 +212,11 @@
    "aid": 18,
    "speaker_id": null,
    "also_speaker_ids": [],
-   "verdict": "refused",
+   "verdict": "pass",
    "measured": 148,
-   "worst_louder_db": 4.75,
-   "worst_quieter_db": -1.786,
-   "reason": "8 cell(s) louder than macOS by more than 0.25 dB, worst +4.75 dB (lane 2, step_up_125); 4 cell(s) quieter than macOS by more than 1.0 dB, worst -1.79 dB (lane 3, step_up_125)"
+   "worst_louder_db": 0.028,
+   "worst_quieter_db": -0.034,
+   "reason": "within +0.25/-1.0 dB of macOS on 148 cells"
   },
   {
    "key": "783c005df12a2bcf63f050c507011742f3d497dd9412f8f343b09fd105dc32d3",
