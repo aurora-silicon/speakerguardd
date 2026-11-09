@@ -108,7 +108,23 @@ static AudioUnit instantiate(NSString *stage, NSDictionary *effect,
     AudioComponentDescription d = {
         kAudioUnitType_Effect, fcc(subtype), kAudioUnitManufacturer_Apple, 0, 0
     };
-    AudioComponent component = AudioComponentFindNext(NULL, &d);
+    // AUDIODSP_PATH: render another macOS build's units (its AudioDSP.component binary, read from that
+    // build's restore image) on this host, used directly (never looked up, so the installed
+    // units are never picked by mistake). Fails with the loader's message if the binary needs symbols
+    // this macOS does not have.
+    const char *alt = getenv("AUDIODSP_PATH");
+    AudioComponent alt_component = NULL;
+    if (alt && *alt) {
+        void *image = dlopen(alt, RTLD_NOW | RTLD_LOCAL);
+        if (!image) { fprintf(stderr, "AUDIODSP_PATH: %s\n", dlerror()); exit(1); }
+        AudioComponentFactoryFunction factory = (AudioComponentFactoryFunction)dlsym(image, factory_name);
+        if (!factory) { fprintf(stderr, "AUDIODSP_PATH: missing factory %s\n", factory_name); exit(1); }
+        Dl_info info = {0};
+        if (dladdr((const void *)factory, &info)) fprintf(stderr, "AUDIODSP_PATH: %s from %s\n", factory_name, info.dli_fname);
+        alt_component = AudioComponentRegister(&d, (__bridge CFStringRef)stage, 0x7fffffff, factory);
+        if (!alt_component) { fprintf(stderr, "AUDIODSP_PATH: register failed\n"); exit(1); }
+    }
+    AudioComponent component = alt_component ? alt_component : AudioComponentFindNext(NULL, &d);
     if (!component) {
         void *image = dlopen("/System/Library/Components/AudioDSP.component/Contents/MacOS/AudioDSP",
                             RTLD_NOW | RTLD_LOCAL);
@@ -194,6 +210,8 @@ int main(int argc, const char **argv) {
                    *meta_path = NULL, *stage_c = NULL,
                    *subtype_c = NULL, *factory_c = NULL;
         const char *sets[MAXSET] = {0};
+        const char *set_ats[MAXSET] = {0};
+        int set_at_count = 0;
         int set_count = 0, channels = 0, quantum = 512;
         double sample_rate = 48000.0;
         bool inventory_only = false, no_preset = false;
@@ -215,6 +233,7 @@ int main(int argc, const char **argv) {
             else if (ARG("--q")) quantum = atoi(v);
             else if (ARG("--sr")) sample_rate = atof(v);
             else if (ARG("--set") && set_count < MAXSET) sets[set_count++] = v;
+            else if (ARG("--set-at") && set_at_count < MAXSET) set_ats[set_at_count++] = v;
             else if (!strcmp(a, "--inventory")) inventory_only = true;
             else if (!strcmp(a, "--no-preset")) no_preset = true;
             else { fprintf(stderr, "bad arg: %s\n", a); return 2; }
@@ -224,7 +243,7 @@ int main(int argc, const char **argv) {
             (!inventory_only && (!input_path || !output_path))) {
             fprintf(stderr, "usage: box_host --strip FILE --stage NAME --subtype XXXX --factory NAME "
                     "--channels N --meta FILE [--inventory] [--in FILE --out FILE] "
-                    "[--set ID=VALUE] [--propstrip FILE] [--q N] [--sr HZ]\n");
+                    "[--set ID=VALUE] [--set-at FRAME:ID=VALUE] [--propstrip FILE] [--q N] [--sr HZ]\n");
             return 2;
         }
 
@@ -277,6 +296,17 @@ int main(int argc, const char **argv) {
                     abl->mBuffers[c].mNumberChannels = 1;
                     abl->mBuffers[c].mData = planar_out[c];
                     abl->mBuffers[c].mDataByteSize = (UInt32)got * sizeof(float);
+                }
+                // --set-at FRAME:ID=VALUE: a run-time parameter change before the
+                // host slice that starts at or after FRAME (a host volume move).
+                for (int k = 0; k < set_at_count; ++k) {
+                    char *end = NULL;
+                    unsigned long long at = strtoull(set_ats[k], &end, 0);
+                    if (!end || *end != ':' || at < frame_count || at >= frame_count + got) continue;
+                    unsigned long pid = strtoul(end + 1, &end, 0);
+                    if (!end || *end != '=') { fprintf(stderr, "bad --set-at: %s\n", set_ats[k]); return 2; }
+                    fail_status(AudioUnitSetParameter(au, (AudioUnitParameterID)pid, kAudioUnitScope_Global, 0,
+                                                      strtof(end + 1, NULL), 0), "set parameter at");
                 }
                 AudioTimeStamp ts = {.mSampleTime = (Float64)frame_count,
                                      .mFlags = kAudioTimeStampSampleTimeValid};
