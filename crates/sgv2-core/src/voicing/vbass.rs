@@ -125,8 +125,8 @@ pub(crate) fn butter_words(n: usize, fc: f32, fs: f32, kind: Kind, out: &mut imp
                 [g, g + g, g, a1, a2]
             }
             Kind::High => {
-                let g = ((1.0 - a1) + a2) * 0.25;
-                [g, -(g + g), g, a1, a2]
+                let g = (u - uc) * 0.25;
+                high_from_low([g, g + g, g], a1, a2)
             }
             Kind::AllPass => [a2, a1, 1.0, a1, a2],
         }]);
@@ -140,13 +140,27 @@ pub(crate) fn butter_words(n: usize, fc: f32, fs: f32, kind: Kind, out: &mut imp
                 [g, g, 0.0, a1, 0.0]
             }
             Kind::High => {
-                let g = (1.0 - a1) * 0.5;
-                [g, -g, 0.0, a1, 0.0]
+                let g = 1.0 / (2.0 / (1.0 + a1));
+                high_from_low([g, g, 0.0], a1, 0.0)
             }
             // the one-frame-delayed first-order all-pass
             Kind::AllPass => [0.0, a1, 1.0, a1, 0.0],
         }]);
     }
+}
+
+/// A high-pass section from the low-pass section on the same poles, as the
+/// platform library forms it: `z -> -z` on the stored low-pass numerator,
+/// then that numerator scaled by the Float32 ratio of the denominator at
+/// Nyquist to the low-pass numerator's sum at DC, so the section has unity
+/// gain at Nyquist. The ratio is rounded on its own before it scales each
+/// word, so the words can differ by a unit in the last place from the
+/// closed form `(1 - a1 + a2) / 4`.
+fn high_from_low(lp: [f32; 3], a1: f32, a2: f32) -> Words {
+    let d = (1.0 - a1) + a2;
+    let n = (lp[0] + lp[1]) + lp[2];
+    let k = d / n;
+    [lp[0] * k, -(lp[1] * k), lp[2] * k, a1, a2]
 }
 
 /// Scales a stored section's numerator (each word rounded on its own).
