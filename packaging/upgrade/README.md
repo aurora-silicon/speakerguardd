@@ -8,6 +8,7 @@ the maintainers.
 ```sh
 sudo aurora-speaker-upgrade            # collect, compile, self-check, switch (idempotent)
 sudo aurora-speaker-upgrade status
+sudo aurora-speaker-upgrade --check [--json F]   # dry run: collect, compile, self-check in /run; nothing stored or switched
 sudo aurora-speaker-upgrade --revert   # back to the legacy protection (--purge drops the bundle)
 aurora-speaker-upgrade guide           # the macOS route, when Linux cannot read the tuning
 ```

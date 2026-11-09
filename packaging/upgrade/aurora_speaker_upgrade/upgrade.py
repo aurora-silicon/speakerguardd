@@ -7,6 +7,7 @@ this Mac's own tuning, and back.
     aurora-speaker-upgrade [run] [--route auto|0|1|2|3] [--ipsw URL] [--macos-build B]
                                  [--collection TARBALL] [--no-switch]
     aurora-speaker-upgrade --revert [--purge]
+    aurora-speaker-upgrade --check [--json FILE]                (dry run: /run only, nothing stored or switched)
     aurora-speaker-upgrade status
     aurora-speaker-upgrade collect --out DIR [--route ...]     (no switch; for checks)
     aurora-speaker-upgrade interface-apply                     (speakerguardd.service ExecStartPre)
@@ -51,6 +52,7 @@ STORE = "/var/lib/aurora-speaker-upgrade"
 LOCK = "/run/aurora-speaker-upgrade.lock"
 PROVISION_CONF = "/etc/speakerguardd/provision.conf"
 PARAMS = "/var/lib/speakerguardd/params.bin"
+STATE_V2 = "/var/lib/speakerguardd"
 LIBEXEC = ("/usr/libexec/speakerguardd-v2", "/usr/libexec/speakerguardd")
 INTERFACE_CTL = "Speaker Protection Interface"
 IF_V2, IF_LEGACY = "Speaker Protection", "Speaker Volume Unlock"
@@ -430,6 +432,90 @@ def locked():
         os.close(fd)
 
 
+def cmd_check(a):
+    """A dry run: collect, compile and self-check this Mac's tuning in the
+    /run scratch only. Nothing is stored, no configuration is written,
+    nothing switches and no unit is stopped or started. Exit codes are the
+    self-check's: 0 pass, 1 refused, 2 cannot run, 3 error."""
+    out = {"result": "error", "kernel": os.uname().release, "steps": []}
+
+    def step(name, result, detail=""):
+        out["steps"].append({"name": name, "result": result, "detail": detail})
+        say(f"check: {name}: {result}{': ' + detail if detail else ''}")
+
+    def finish(result, code, reason=""):
+        out["result"], out["reason"] = result, reason
+        if a.json:
+            with open(a.json, "w") as f:
+                json.dump(out, f, indent=2, sort_keys=True)
+                f.write("\n")
+        say(f"check: {result.upper()}" + (f": {reason}" if reason else ""))
+        return code
+
+    try:
+        identity = collect.Identity(a.adt)
+        out.update(board=identity.board, acoustic_id=identity.acoustic, unit_bound=identity.matches_dt())
+        if not out["unit_bound"]:
+            step("identity", "refused", "the Linux device tree and the ADT name different units")
+            return finish("refused", EXIT_REFUSED, "the device tree and the ADT name different units")
+        step("identity", "pass", f"{identity.board}, AID{identity.acoustic}")
+        mode, card = interface_mode()
+        out["kernel_interface"] = mode
+        try:
+            b, prov = acquire(identity, a)
+        except Refused as e:
+            step("acquire", "refused", str(e))
+            return finish("refused", EXIT_REFUSED, str(e).splitlines()[0])
+        out.update({k: prov.get(k) for k in ("route", "source", "aid", "macos_build", "speaker_id", "speaker_id_from")},
+                   bundle_digest=digest(b))
+        step("acquire", "pass", f"route {prov['route']} ({prov['source']})")
+        os.makedirs(a.scratch, mode=0o700, exist_ok=True)
+        work = tempfile.mkdtemp(prefix="check-", dir=a.scratch)
+        bdir = os.path.join(work, "bundle")
+        collect.write_bundle(b, bdir)
+        prov_tool, sc_tool = tool("speakerguardd-provision"), tool("speakerguardd-selfcheck")
+        if not prov_tool or not sc_tool:
+            step("compile", "cannot-run", "speakerguardd v2 is not installed")
+            return finish("cannot-run", EXIT_RETRY, "speakerguardd v2 is not installed: only the bundle was checked")
+        root = os.path.join(work, "root")
+        r = run([prov_tool, "run", "--force", "--bundle", bdir, "--root", root])
+        params = os.path.join(root, PARAMS.lstrip("/"))
+        if r.returncode != 0 or not os.path.isfile(params):
+            step("compile", "refused", r.stderr.strip()[-800:])
+            return finish("refused", EXIT_REFUSED, "speakerguardd v2 could not compile this Mac's tuning")
+        import hashlib
+        with open(params, "rb") as f:
+            out["params_sha256"] = hashlib.sha256(f.read()).hexdigest()
+        step("compile", "pass", f"blob {out['params_sha256'][:12]}")
+        state = os.path.join(root, STATE_V2.lstrip("/"))
+        js = os.path.join(work, "selfcheck.json")
+        h = run([sc_tool, "--help"])
+        if re.search(r"\bverify\b", h.stdout + h.stderr):
+            r = run([sc_tool, "verify", "--params", params, "--state", state, "--json", js])
+            code = r.returncode if r.returncode in (0, 1, 2, 3) else EXIT_ERROR
+            with contextlib.suppress(OSError, ValueError):
+                with open(js) as f:
+                    out["selfcheck"] = json.load(f)
+            res = {0: "pass", 1: "refused", 2: "cannot-run", 3: "error"}[code]
+            step("selfcheck verify", res, r.stderr.strip()[-800:])
+            return finish(res, code, "" if code == 0 else "the speaker self-check did not pass")
+        # Until SGFIX's verify lands: a passing hardware record of this
+        # kernel for exactly this blob (the live one) counts; anything else
+        # needs the hardware switch test, which a dry run may not take.
+        r = run([sc_tool, "check", "--params", params])
+        if r.returncode == 0:
+            step("selfcheck", "pass", "a passing self-check record binds this kernel to this exact blob")
+            return finish("pass", EXIT_OK)
+        step("selfcheck", "cannot-run", "no record for this blob; the silent switch test needs "
+             "speakerguardd-selfcheck verify (SGFIX) or the speakers")
+        return finish("cannot-run", EXIT_RETRY, "compiled; the hardware self-check could not run in a dry run")
+    except collect.CollectError as e:
+        step("acquire", "refused", str(e))
+        return finish("refused", EXIT_REFUSED, str(e))
+    except Exception as e:
+        return finish("error", EXIT_ERROR, f"{type(e).__name__}: {e}")
+
+
 def cmd_collect(a):
     identity = collect.Identity(a.adt)
     b, prov = acquire(identity, a)
@@ -585,8 +671,11 @@ not report it.
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="aurora-speaker-upgrade", description=__doc__.split("\n\n")[0])
     ap.add_argument("cmd", nargs="?", default="run",
-                    choices=["run", "collect", "status", "guide", "interface-apply", "revert"])
+                    choices=["run", "check", "collect", "status", "guide", "interface-apply", "revert"])
     ap.add_argument("--revert", action="store_true", help="go back to the legacy protection")
+    ap.add_argument("--check", action="store_true",
+                    help="dry run: collect, compile and self-check in /run only; nothing stored or switched")
+    ap.add_argument("--json", help="--check: write the result here")
     ap.add_argument("--purge", action="store_true", help="with --revert: remove the stored bundle")
     ap.add_argument("--route", default="auto", choices=["auto", "0", "1", "2", "3"])
     ap.add_argument("--ipsw", help="route 2: this restore image (an Apple CDN URL)")
@@ -607,6 +696,8 @@ def main(argv=None):
                         format="aurora-speaker-upgrade: %(message)s")
     if a.revert:
         a.cmd = "revert"
+    if a.check:
+        a.cmd = "check"
     a.installer_dirs = a.installer_dirs or list(collect.INSTALLER_BUNDLES)
     # Staging (about 25 MB) in a root-only directory on /run, never in the store.
     a.scratch = a.scratch or "/run/aurora-speaker-upgrade.scratch"
@@ -619,7 +710,7 @@ def main(argv=None):
     if a.cmd == "collect" and not a.out:
         ap.error("collect needs --out")
     os.umask(0o077)
-    cmds = {"run": cmd_run, "collect": cmd_collect, "status": cmd_status,
+    cmds = {"run": cmd_run, "check": cmd_check, "collect": cmd_collect, "status": cmd_status,
             "interface-apply": cmd_interface_apply, "revert": cmd_revert}
     try:
         if a.cmd in ("status", "interface-apply"):
@@ -641,5 +732,5 @@ def main(argv=None):
         say(f"internal error ({type(e).__name__}): {e}; nothing switched")
         return EXIT_ERROR
     finally:
-        if a.cmd in ("run", "collect"):
+        if a.cmd in ("run", "collect", "check"):
             collect.rmtree(a.scratch)
