@@ -752,6 +752,10 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics, mode: Rea
         None => tone_filter::DEFAULT_SHELF_ORDER,
     };
     p.gain_db = req(4)? + req(13)?;
+    // Parameter 12 is the box's algorithm version: version 0 designs its
+    // peaks on their poles (tone_filter::legacy_peak); later versions keep
+    // the symmetric peak.
+    let legacy_peaks = g.get(12) == Some(0.0);
     let group_bypass = bits(1)?;
     let nyquist = fs / 2.0;
     let automation = automation_entries(&get, &ctx)?;
@@ -1104,6 +1108,7 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics, mode: Rea
                         p.sections.extend(shelf);
                     }
                     Carry::Exact(k) => p.sections.push(match r {
+                        Rbj::Peak if legacy_peaks => tone_filter::legacy_peak(carry[k].gain, carry[k].f0, q, fs),
                         Rbj::Peak => tone_filter::peak(carry[k].gain, carry[k].f0, q, fs),
                         Rbj::LowShelf => tone_filter::low_shelf(carry[k].gain, carry[k].f0, q, fs),
                         Rbj::HighShelf => tone_filter::high_shelf(carry[k].gain, carry[k].f0, q, fs),
@@ -1194,6 +1199,7 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics, mode: Rea
         // nothing; every other exact slot is recorded for the chain.
         if exact && (kind == 9 || p.sections.len() > first) {
             let shape = match kind {
+                1 if legacy_peaks => ToneShape::LegacyPeak,
                 1 => ToneShape::Peak,
                 3 => ToneShape::LowPass(order as u32),
                 4 => ToneShape::HighPass(order as u32),
