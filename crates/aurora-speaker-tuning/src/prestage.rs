@@ -1372,7 +1372,7 @@ pub fn derive(t: &Tuning, fs: f64, channels: usize, diags: &mut Diagnostics) -> 
     if t.protection.kind != crate::tuning::UnitKind::Atsp {
         interim_compressor_rules(&t.chain, &t.protection.lanes)?;
     }
-    derive_lanes_for(&t.chain, &t.protection.lanes, fs, channels, t.macos_build.as_deref(), diags)
+    derive_lanes_for(&t.chain, &t.protection.lanes, fs, channels, t.law_build.as_deref(), diags)
 }
 
 /// Until the compressor box's gain law is the unit's own, the speakers whose

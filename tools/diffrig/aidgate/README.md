@@ -167,5 +167,5 @@ python3-cryptography), carry-over check against `units.json` (AudioDSP hashes of
 host render with that build's units, gate and merge. Per-release trigger: run it for every new macOS build in
 Apple's feed (point releases, betas users install, device-forked builds) and after every law change (all blocks,
 because a block is kept only with the law it was gated at). A build whose units do not load on the host stops with
-exit 3; that build needs a reference host on it (today the J616s on 26A428). Status: assembled from the steps proven
-on 25C56 on 2026-11-09, not yet run end to end as one command.
+exit 3; that build needs a reference host on it (today the J616s on 26A428). First end-to-end run: 25G72 (26.6) on
+2026-11-09, fetched on an M2, rendered on the 25G83 host, 39/56 pass.
