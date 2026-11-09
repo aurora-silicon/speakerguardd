@@ -752,6 +752,10 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics, mode: Rea
         None => tone_filter::DEFAULT_SHELF_ORDER,
     };
     p.gain_db = req(4)? + req(13)?;
+    // Parameter 12 is the box's algorithm version: version 0 designs its
+    // peaks on their poles (tone_filter::legacy_peak); later versions keep
+    // the symmetric peak.
+    let legacy_peaks = g.get(12) == Some(0.0);
     let group_bypass = bits(1)?;
     let nyquist = fs / 2.0;
     let automation = automation_entries(&get, &ctx)?;
@@ -1104,6 +1108,7 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics, mode: Rea
                         p.sections.extend(shelf);
                     }
                     Carry::Exact(k) => p.sections.push(match r {
+                        Rbj::Peak if legacy_peaks => tone_filter::legacy_peak(carry[k].gain, carry[k].f0, q, fs),
                         Rbj::Peak => tone_filter::peak(carry[k].gain, carry[k].f0, q, fs),
                         Rbj::LowShelf => tone_filter::low_shelf(carry[k].gain, carry[k].f0, q, fs),
                         Rbj::HighShelf => tone_filter::high_shelf(carry[k].gain, carry[k].f0, q, fs),
@@ -1194,6 +1199,7 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics, mode: Rea
         // nothing; every other exact slot is recorded for the chain.
         if exact && (kind == 9 || p.sections.len() > first) {
             let shape = match kind {
+                1 if legacy_peaks => ToneShape::LegacyPeak,
                 1 => ToneShape::Peak,
                 3 => ToneShape::LowPass(order as u32),
                 4 => ToneShape::HighPass(order as u32),
@@ -1683,6 +1689,8 @@ mod tests {
         let mut full: std::collections::BTreeMap<u32, f32> =
             (0..SLOT_BASE + SLOT_STRIDE * SLOTS).map(|id| (id, 0.0)).collect();
         full.insert(5, tone_filter::DEFAULT_SHELF_ORDER as f32);
+        // the current algorithm version unless a test asks for the first
+        full.insert(12, 1.0);
         for (id, v) in globals {
             full.insert(*id, *v);
         }
@@ -2119,6 +2127,23 @@ mod tests {
             v.extend([(o + 6, 1.0), (o + 7, at), (o + 8, g), (o + 9, f)]);
         }
         v
+    }
+
+    #[test]
+    fn algorithm_version_0_peaks_use_the_pole_quality_law() {
+        let fs = 48_000.0;
+        let mut d = Diagnostics::default();
+        let slot = [(1, [3.0, 1.0, 9.0, 1000.0, 1.3, 2.0, 3.0, 0.0])];
+        let p = part(&tmst(&[(12, 0.0)], &slot), 0, fs, &mut d).unwrap();
+        assert_eq!(p.sections, vec![tone_filter::legacy_peak(9.0, 1000.0, 1.3f32 as f64, fs)]);
+        let p = part(&tmst(&[(12, 1.0)], &slot), 0, fs, &mut d).unwrap();
+        assert_eq!(p.sections, vec![tone_filter::peak(9.0, 1000.0, 1.3f32 as f64, fs)]);
+        // the two laws differ: version 0 is narrower at +9 dB, Q 1.3
+        let mag = |s: &[sgv2_core::prestage::Section], f: f64| s[0].magnitude(f, fs);
+        let v0 = part(&tmst(&[(12, 0.0)], &slot), 0, fs, &mut d).unwrap().sections;
+        let v1 = part(&tmst(&[(12, 1.0)], &slot), 0, fs, &mut d).unwrap().sections;
+        assert!(mag(&v0, 600.0) < mag(&v1, 600.0));
+        assert!((mag(&v0, 1000.0) - mag(&v1, 1000.0)).abs() < 0.02);
     }
 
     #[test]

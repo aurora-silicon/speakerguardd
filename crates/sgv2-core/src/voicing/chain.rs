@@ -98,6 +98,8 @@ pub struct Relay {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToneShape {
     Peak,
+    /// A peak of the first ToneMeister algorithm version ([`super::tone::legacy_peak`]).
+    LegacyPeak,
     LowPass(u32),
     HighPass(u32),
     Gain,
@@ -448,9 +450,10 @@ fn apply_tone_automation(stage: &mut PreStage, base: &[Channel], automation: &[T
                 ToneShape::Gain => {
                     channel.gain *= libm::pow(10.0, (gain_db - a.a.gain_db) / 20.0);
                 }
-                ToneShape::Peak | ToneShape::LowShelf | ToneShape::HighShelf => {
+                ToneShape::Peak | ToneShape::LegacyPeak | ToneShape::LowShelf | ToneShape::HighShelf => {
                     let section = match a.shape {
                         ToneShape::Peak => super::tone::peak(gain_db, frequency_hz, a.quality, fs),
+                        ToneShape::LegacyPeak => super::tone::legacy_peak(gain_db, frequency_hz, a.quality, fs),
                         ToneShape::LowShelf => super::tone::low_shelf(gain_db, frequency_hz, a.quality, fs),
                         _ => super::tone::high_shelf(gain_db, frequency_hz, a.quality, fs),
                     };

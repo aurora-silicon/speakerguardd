@@ -253,6 +253,31 @@ pub fn peak(gain_db: f64, f0: f64, q: f64, fs: f64) -> Section {
     })
 }
 
+/// The quality a ToneMeister peak of the first algorithm version (box
+/// parameter 12 = 0) is designed with. That version specifies a peak's
+/// bandwidth on its pole: a boost's zeros keep the saved quality and its
+/// poles take it times the linear gain, a cut is the inverse of the
+/// matching boost. From about +6 dB on (where `A^2 - 2/A^2` reaches 1) the
+/// quality is narrowed so the bandwidth stays where the response is 3 dB
+/// below the peak. As a quality for [`peak`] (poles `q A`, zeros `q / A`):
+/// `q A c`, `A = 10^(|g| / 40)`, `c = min(1, 1 / sqrt(A^2 - 2 / A^2))`.
+/// Black-box: single-peak renders of the installed unit over gains -15 to
+/// +15 dB, qualities 0.5 to 4 and 50 Hz to 12 kHz give the pole quality of
+/// this law to 1e-5.
+pub fn legacy_peak_quality(gain_db: f64, q: f64) -> f64 {
+    let a = libm::pow(10.0, gain_db.abs() / 40.0);
+    let a2 = a * a;
+    let narrowing = a2 - 2.0 / a2;
+    let c = if narrowing > 1.0 { 1.0 / libm::sqrt(narrowing) } else { 1.0 };
+    q * a * c
+}
+
+/// A peaking section of the first ToneMeister algorithm version: [`peak`]
+/// at [`legacy_peak_quality`].
+pub fn legacy_peak(gain_db: f64, f0: f64, q: f64, fs: f64) -> Section {
+    peak(gain_db, f0, legacy_peak_quality(gain_db, q), fs)
+}
+
 /// A decramped low-shelf section.
 pub fn low_shelf(gain_db: f64, f0: f64, q: f64, fs: f64) -> Section {
     matched(Shape::LowShelf, gain_db, f0, q, fs)
@@ -542,6 +567,30 @@ mod tests {
 
     fn magnitude(s: Section, f: f64, fs: f64) -> f64 {
         s.magnitude(f, fs)
+    }
+
+    #[test]
+    fn legacy_peaks_keep_the_saved_quality_on_one_side_up_to_6_db() {
+        // up to +6 dB: zeros at the saved quality, poles at q A^2
+        for g in [0.5, 1.0, 3.0, 6.0] {
+            let a = libm::pow(10.0, g / 40.0);
+            assert!((legacy_peak_quality(g, 1.5) - 1.5 * a).abs() < 1e-12, "{g}");
+            assert_eq!(legacy_peak_quality(-g, 1.5), legacy_peak_quality(g, 1.5));
+        }
+        // above: narrowed by 1/sqrt(A^2 - 2/A^2), continuous at the knee
+        let knee = 20.0 * libm::log10(2.0);
+        let below = legacy_peak_quality(knee - 1e-9, 1.0);
+        let above = legacy_peak_quality(knee + 1e-9, 1.0);
+        assert!((below - above).abs() < 1e-8);
+        let a: f64 = libm::pow(10.0, 12.0 / 40.0);
+        let want = a / libm::sqrt(a * a - 2.0 / (a * a));
+        assert!((legacy_peak_quality(12.0, 1.0) - want).abs() < 1e-12);
+        // the same peak gain, a different bandwidth
+        let fs = 48_000.0;
+        let s = legacy_peak(12.0, 1000.0, 1.0, fs);
+        let r = peak(12.0, 1000.0, 1.0, fs);
+        assert!((20.0 * libm::log10(magnitude(s, 1000.0, fs)) - 12.0).abs() < 0.2);
+        assert!(magnitude(s, 500.0, fs) < magnitude(r, 500.0, fs));
     }
 
     #[test]
