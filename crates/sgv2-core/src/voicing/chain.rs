@@ -680,7 +680,7 @@ enum Run {
 }
 
 impl Run {
-    fn new(kind: &Kind, width: usize, fs: f64, max_frames: usize) -> Run {
+    fn new(kind: &Kind, width: usize, fs: f64, max_frames: usize, buzz_mode: super::buzz::BufferMode) -> Run {
         match kind {
             Kind::NonFinite => Run::NonFinite,
             Kind::Sum(out) => Run::Sum(*out),
@@ -700,7 +700,7 @@ impl Run {
                 active: variants.iter().position(|v| v.mask == *default_mask).unwrap_or(0),
                 runs: variants
                     .iter()
-                    .map(|v| (v.mask, Run::new(&Kind::Tone(v.tone.clone()), width, fs, max_frames)))
+                    .map(|v| (v.mask, Run::new(&Kind::Tone(v.tone.clone()), width, fs, max_frames, buzz_mode)))
                     .collect(),
             },
             Kind::Tone(tone) => {
@@ -731,7 +731,9 @@ impl Run {
             Kind::Xtc(p) => Run::Xtc(alloc::boxed::Box::new(super::xtc::Run::new(p, fs, width))),
             Kind::Cfreak(p) => Run::Cfreak(alloc::boxed::Box::new(super::cfreak::Run::new(p, fs, width))),
             Kind::Mstk(p) => Run::Mstk(alloc::boxed::Box::new(super::mstk::Run::new(p, fs, width))),
-            Kind::Buzz(p) => Run::Buzz(alloc::boxed::Box::new(super::buzz::Run::new(p, fs, width))),
+            Kind::Buzz(p) => {
+                Run::Buzz(alloc::boxed::Box::new(super::buzz::Run::with_buffer_mode(p, fs, width, buzz_mode)))
+            }
             Kind::Cdelay(p) => Run::Cdelay(alloc::boxed::Box::new(super::cdelay::Run::new(p, fs, width))),
             Kind::Lowflow(p) => Run::Lowflow(alloc::boxed::Box::new(super::lowflow::Run::new(p, fs, width))),
             Kind::Vbass(p) => Run::Vbass(alloc::boxed::Box::new(super::vbass::Run::new(p, fs, width, max_frames))),
@@ -986,6 +988,18 @@ pub struct Chain {
 impl Chain {
     /// Builds the chain; `None` if the spec does not check.
     pub fn new(spec: Spec, fs: f64, max_frames: usize) -> Option<Chain> {
+        Self::with_buzz_buffer_mode(spec, fs, max_frames, super::buzz::BufferMode::Direct)
+    }
+
+    /// Builds a chain with one fixed BuzzKill hosting mode. Direct is the
+    /// compatibility path; staged is selected once by a host that cannot
+    /// guarantee callbacks aligned to BuzzKill's decision hop.
+    pub fn with_buzz_buffer_mode(
+        spec: Spec,
+        fs: f64,
+        max_frames: usize,
+        buzz_mode: super::buzz::BufferMode,
+    ) -> Option<Chain> {
         spec.check().ok()?;
         if spec.nodes.iter().any(|node| matches!(&node.kind, Kind::Vareq(p) if !p.transitions_valid_at(fs))) {
             return None;
@@ -1000,7 +1014,7 @@ impl Chain {
             return None;
         }
         let max_frames = max_frames.max(1);
-        let runs = spec.nodes.iter().map(|n| Run::new(&n.kind, n.inputs.len(), fs, max_frames)).collect();
+        let runs = spec.nodes.iter().map(|n| Run::new(&n.kind, n.inputs.len(), fs, max_frames, buzz_mode)).collect();
         let out = spec.nodes.iter().map(|n| vec![vec![0.0; max_frames]; n.inputs.len()]).collect();
         let scratch = vec![vec![0.0; max_frames]; MAX_CHANNELS];
         let mut c = Chain { spec, runs, out, scratch, max_frames };
@@ -1010,6 +1024,37 @@ impl Chain {
         }
         c.set_param(GraphParam::VolumeScalar, 1.0);
         Some(c)
+    }
+
+    /// Processing latency contributed by BuzzKill on the longest output
+    /// path. Staged mode adds exactly one decision hop to the direct path.
+    pub fn latency(&self) -> usize {
+        let mut node_latency = vec![0usize; self.runs.len()];
+        for (index, run) in self.runs.iter().enumerate() {
+            let input = self.spec.nodes[index]
+                .inputs
+                .iter()
+                .filter_map(|source| match source {
+                    Source::Program(_) => Some(0),
+                    Source::Node(node, _) => node_latency.get(*node).copied(),
+                })
+                .max()
+                .unwrap_or(0);
+            node_latency[index] = input
+                + match run {
+                    Run::Buzz(buzz) => buzz.latency(),
+                    _ => 0,
+                };
+        }
+        self.spec
+            .outputs
+            .iter()
+            .filter_map(|source| match source {
+                Source::Program(_) => Some(0),
+                Source::Node(node, _) => node_latency.get(*node).copied(),
+            })
+            .max()
+            .unwrap_or(0)
     }
 
     pub fn spec(&self) -> &Spec {

@@ -35,6 +35,9 @@
 //!
 //! For XTC, `--q FRAMES` selects the render slice (1..4096) and
 //! `--reset-at FRAME` resets at an exact slice boundary before rendering it.
+//! For BuzzKill, `--buzz-buffer-mode direct|staged` selects the production
+//! zero-added-latency path or the callback-invariant one-hop staged path;
+//! `--q FRAMES` controls the callbacks presented to either mode.
 
 use aurora_speaker_tuning::bundle::Bundle;
 use aurora_speaker_tuning::dspg::analysis::{Lane, Origin, Pass};
@@ -129,6 +132,7 @@ fn main() {
     let mut own_timing = false;
     let mut quantum = 512usize;
     let mut reset_at = None;
+    let mut buzz_buffer_mode = sgv2_core::voicing::buzz::BufferMode::Direct;
     let mut sets: Vec<(u32, f32)> = Vec::new();
     let mut files = Vec::new();
     let mut it = std::env::args().skip(1);
@@ -156,6 +160,13 @@ fn main() {
                         .and_then(|v| v.parse::<usize>().ok())
                         .unwrap_or_else(|| die("--reset-at needs a frame number")),
                 );
+            }
+            "--buzz-buffer-mode" => {
+                buzz_buffer_mode = match it.next().as_deref() {
+                    Some("direct") => sgv2_core::voicing::buzz::BufferMode::Direct,
+                    Some("staged") => sgv2_core::voicing::buzz::BufferMode::Staged,
+                    _ => die("--buzz-buffer-mode must be direct or staged"),
+                };
             }
             // Override one saved global parameter (ID=VALUE), as a rig sets
             // the installed unit's with AudioUnitSetParameter.
@@ -298,8 +309,11 @@ fn main() {
     let mut planar: Vec<Vec<f32>> = (0..ch).map(|c| (0..frames).map(|i| x[i * ch + c]).collect()).collect();
 
     let subtype = stage.unit.map(|u| u.subtype.to_string()).unwrap_or_default();
-    if !matches!(subtype.as_str(), "axtc" | "cfrk") && (quantum != 512 || reset_at.is_some()) {
-        die("--q and --reset-at are only carried for XTC and ControlFreak")
+    if !matches!(subtype.as_str(), "axtc" | "cfrk" | "buzk") && (quantum != 512 || reset_at.is_some()) {
+        die("--q and --reset-at are only carried for XTC, ControlFreak and BuzzKill")
+    }
+    if subtype != "buzk" && buzz_buffer_mode != sgv2_core::voicing::buzz::BufferMode::Direct {
+        die("--buzz-buffer-mode is only carried for BuzzKill")
     }
     match subtype.as_str() {
         "mstk" => {
@@ -438,7 +452,11 @@ fn main() {
                 relays: Vec::new(),
                 volume: Default::default(),
             };
-            let mut run = Chain::new(spec, fs, quantum).unwrap_or_else(|| die("invalid isolated box"));
+            let mut run = Chain::with_buzz_buffer_mode(spec, fs, quantum, buzz_buffer_mode)
+                .unwrap_or_else(|| die("invalid isolated box"));
+            if subtype == "buzk" {
+                eprintln!("buzz_buffer_mode={buzz_buffer_mode:?} latency_frames={}", run.latency());
+            }
             if subtype == "vrq2" {
                 if let Some(volume) = isolated_volume {
                     run.set_param(GraphParam::VolumeScalar, volume);

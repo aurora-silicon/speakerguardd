@@ -16,7 +16,7 @@ const TRACKS: usize = 50;
 const ANALYSIS_HOP: usize = 128;
 const ANALYSIS_RATE: f64 = 12_000.0;
 const DECIMATION: usize = 4;
-const HOST_HOP: usize = ANALYSIS_HOP * DECIMATION;
+pub const HOST_HOP: usize = ANALYSIS_HOP * DECIMATION;
 const MIN_HZ: f64 = 50.0;
 const MAX_HZ: [f64; 5] = [2500.0, 3000.0, 4000.0, 6000.0, 20_000.0];
 const MATCH_RELATIVE: f64 = 0.035_264_92;
@@ -28,6 +28,20 @@ const WET_SMOOTH_HZ: f64 = 5.0;
 /// The analyser makes its first decision once the history holds two
 /// decision blocks: the first boundary after reset passes without one.
 const WARMUP_DECISIONS: u32 = 1;
+
+/// How BuzzKill is hosted.
+///
+/// [`Direct`](BufferMode::Direct) is the production 512-frame path and is
+/// deliberately the default: it preserves the original output and latency
+/// exactly. [`Staged`](BufferMode::Staged) is for hosts whose callback length
+/// is not guaranteed to be a multiple of [`HOST_HOP`]. It holds one complete
+/// decision block so a decision can govern every frame in that block.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BufferMode {
+    #[default]
+    Direct,
+    Staged,
+}
 
 /// One line found by a decision.
 #[derive(Clone, Copy, Default)]
@@ -221,6 +235,12 @@ pub struct Run {
     lookahead: usize,
     delay: Box<[f32]>,
     delay_at: usize,
+    mode: BufferMode,
+    /// Delayed audio for the decision block currently being collected.
+    block_audio: [f32; HOST_HOP * MAX_CHANNELS],
+    /// The completed previous decision block. Staged mode holds this for one
+    /// host hop so callbacks may divide a decision block anywhere.
+    block_output: [f32; HOST_HOP * MAX_CHANNELS],
     history: [f32; FFT],
     /// Per-cell gain record of the detector: what the moving sections have
     /// removed from each transform cell, as the analyser sees it.
@@ -241,6 +261,10 @@ pub struct Run {
 
 impl Run {
     pub fn new(p: &Params, fs: f64, channels: usize) -> Run {
+        Self::with_buffer_mode(p, fs, channels, BufferMode::Direct)
+    }
+
+    pub fn with_buffer_mode(p: &Params, fs: f64, channels: usize, mode: BufferMode) -> Run {
         let fs = if fs.is_finite() { fs.clamp(8_000.0, 192_000.0) } else { 48_000.0 };
         let channels = channels.clamp(1, MAX_CHANNELS);
         // The AU publishes the saved count as a span including the current
@@ -260,6 +284,9 @@ impl Run {
             lookahead,
             delay: vec![0.0; lookahead * channels].into_boxed_slice(),
             delay_at: 0,
+            mode,
+            block_audio: [0.0; HOST_HOP * MAX_CHANNELS],
+            block_output: [0.0; HOST_HOP * MAX_CHANNELS],
             history: [0.0; FFT],
             bin_gains: [1.0; FFT / 2 + 1],
             history_at: 0,
@@ -286,6 +313,8 @@ impl Run {
     pub fn reset(&mut self) {
         self.delay.fill(0.0);
         self.delay_at = 0;
+        self.block_audio.fill(0.0);
+        self.block_output.fill(0.0);
         self.history.fill(0.0);
         self.bin_gains.fill(1.0);
         self.history_at = 0;
@@ -297,7 +326,7 @@ impl Run {
         self.warmup = WARMUP_DECISIONS;
     }
     pub fn latency(&self) -> usize {
-        self.lookahead
+        self.lookahead + usize::from(self.mode == BufferMode::Staged) * HOST_HOP
     }
 
     fn threshold(&self, frequency_hz: f64) -> f64 {
@@ -452,6 +481,13 @@ impl Run {
     }
 
     pub fn process(&mut self, buffers: &mut [&mut [f32]], frames: usize) {
+        match self.mode {
+            BufferMode::Direct => self.process_direct(buffers, frames),
+            BufferMode::Staged => self.process_staged(buffers, frames),
+        }
+    }
+
+    fn process_direct(&mut self, buffers: &mut [&mut [f32]], frames: usize) {
         let channels = self.channels.min(buffers.len());
         let frames = frames.min(buffers.iter().take(channels).map(|b| b.len()).min().unwrap_or(0));
         let mut at = 0;
@@ -515,6 +551,75 @@ impl Run {
             at += count;
         }
     }
+
+    fn process_staged(&mut self, buffers: &mut [&mut [f32]], frames: usize) {
+        let channels = self.channels.min(buffers.len());
+        let frames = frames.min(buffers.iter().take(channels).map(|b| b.len()).min().unwrap_or(0));
+        let mut at = 0;
+        while at < frames {
+            // A decision is made only at a HOST_HOP boundary. If a callback
+            // ends inside that block, direct processing has already emitted
+            // the earlier frames and can only rewrite the callback remainder.
+            // Staged mode retains the whole block and emits the preceding one,
+            // making callback slicing irrelevant at one fixed-hop latency.
+            let block_at = HOST_HOP - self.hop;
+            let count = (frames - at).min(self.hop);
+            for frame in at..at + count {
+                let mut linked = 0.0f32;
+                for (channel, buffer) in buffers.iter_mut().take(channels).enumerate() {
+                    let raw = if buffer[frame].is_finite() { buffer[frame] } else { 0.0 };
+                    if raw.abs() > linked.abs() {
+                        linked = raw;
+                    }
+                    let delay_slot = self.delay_at * self.channels + channel;
+                    let block_slot = (block_at + frame - at) * MAX_CHANNELS + channel;
+                    self.block_audio[block_slot] = self.delay[delay_slot];
+                    self.delay[delay_slot] = raw;
+                    buffer[frame] = self.block_output[block_slot];
+                }
+                self.delay_at = (self.delay_at + 1) % self.lookahead;
+                let filtered = ANALYSIS_GAIN * filter(self.analysis_lowpass, &mut self.analysis_state, linked);
+                self.decimation_at += 1;
+                if self.decimation_at == DECIMATION {
+                    self.history[self.history_at] = filtered;
+                    self.history_at = (self.history_at + 1) % FFT;
+                    self.history_len = (self.history_len + 1).min(FFT);
+                    self.decimation_at = 0;
+                }
+            }
+            self.hop -= count;
+            if self.hop == 0 {
+                if self.warmup == 0 {
+                    self.analyse();
+                } else {
+                    self.warmup -= 1;
+                }
+                self.hop = HOST_HOP;
+                let audio_wet_section = wet_smoother(self.fs);
+                for block_frame in 0..HOST_HOP {
+                    for channel in 0..channels {
+                        let slot = block_frame * MAX_CHANNELS + channel;
+                        let mut delayed = self.block_audio[slot];
+                        for track in &mut self.tracks {
+                            let target_wet = 1.0 - track.gain;
+                            if target_wet > f32::EPSILON || track.audio_applied_wet[channel] > f32::EPSILON {
+                                track.audio_applied_wet[channel] =
+                                    filter(audio_wet_section, &mut track.audio_wet[channel], target_wet);
+                                let rejected = filter(
+                                    track.audio_section,
+                                    &mut track.audio[channel],
+                                    track.audio_applied_wet[channel] * delayed,
+                                );
+                                delayed -= rejected;
+                            }
+                        }
+                        self.block_output[slot] = delayed;
+                    }
+                }
+            }
+            at += count;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -571,6 +676,58 @@ mod tests {
             assert!(r.bin_gains[j] <= libm::sqrtf(m) * 1.000_001, "{j} {} {m}", r.bin_gains[j]);
         }
         assert!(r.bin_gains.iter().all(|g| *g > 0.0 && *g <= 1.0));
+    }
+
+    /// Two channels, a line that steps up by 12 dB after three blocks and a
+    /// second line that starts later, so decisions and a real cut fall inside
+    /// the render rather than the test passing on startup silence alone.
+    fn invariance_source(frames: usize) -> [Vec<f32>; 2] {
+        let step_at = 3 * HOST_HOP + HOST_HOP / 3;
+        let second_at = 5 * HOST_HOP + 17;
+        let mut left = line(400.0, 0.25, frames);
+        let mut right = line(160.0, 0.25, frames);
+        let late = line(1000.0, 0.2, frames);
+        for n in 0..frames {
+            if n >= step_at {
+                left[n] *= 4.0;
+            }
+            if n >= second_at {
+                right[n] += late[n - second_at];
+            }
+        }
+        [left, right]
+    }
+
+    fn render_in_buffers(p: &Params, sizes: &[usize], frames: usize) -> [Vec<f32>; 2] {
+        let [mut left, mut right] = invariance_source(frames);
+        let mut run = Run::with_buffer_mode(p, 48_000.0, 2, BufferMode::Staged);
+        let (mut at, mut k) = (0, 0);
+        while at < frames {
+            let n = sizes[k % sizes.len()].min(frames - at);
+            run.process(&mut [&mut left[at..at + n], &mut right[at..at + n]], n);
+            at += n;
+            k += 1;
+        }
+        [left, right]
+    }
+
+    #[test]
+    fn staged_output_is_identical_for_every_host_buffer_size() {
+        let p = Params { threshold_db: -100.0, ..Default::default() };
+        let frames = 8 * HOST_HOP;
+        let whole = render_in_buffers(&p, &[frames], frames);
+        for size in [1, 2, 3, 7, 64, 100, 128, 255, 256, 257, 511, 512, 513, 1000, 1024, 2048] {
+            assert_eq!(render_in_buffers(&p, &[size], frames), whole, "host buffer {size}");
+        }
+        let mixed = [1, 511, 3, 257, 64, 1000, 2, 129];
+        assert_eq!(render_in_buffers(&p, &mixed, frames), whole, "mixed host buffers");
+
+        let latency = Run::with_buffer_mode(&p, 48_000.0, 2, BufferMode::Staged).latency();
+        assert_eq!(latency, Run::new(&p, 48_000.0, 2).latency() + HOST_HOP);
+        let source = invariance_source(frames);
+        assert!(whole.iter().zip(&source).any(|(output, input)| {
+            output[latency..].iter().zip(&input[..frames - latency]).any(|(wet, dry)| wet.to_bits() != dry.to_bits())
+        }));
     }
 
     #[test]
