@@ -1199,7 +1199,7 @@ def find_attestations(path=None):
 
 def verify_voicing(args):
     """Step 2: `aurora-speaker-tuning voicing-check` on this Mac's tuning."""
-    src = args.tuning or (read_conf().get("SGV2_TUNING", "").split() if not args.tuning else [])
+    src = args.tuning or (read_conf(getattr(args, "conf", None)).get("SGV2_TUNING", "").split() if not args.tuning else [])
     att = find_attestations(args.attestations)
     cmd = [args.tuning_cli, "voicing-check", "--json"] + (["--attestations", att] if att else []) + list(src)
     try:
@@ -1278,10 +1278,10 @@ def generated_quantum(m, graph="/run/speakerguardd-graph"):
 
 def verify_graph(args):
     """Step 3: the quantum the gate measured, and no xrun at stream start."""
-    conf = read_conf()
+    conf = read_conf(getattr(args, "conf", None))
     m = conf.get("SGV2_MACHINE")
     if not m:
-        raise Cannot(f"{CONF} names no machine: provision first")
+        raise Cannot(f"{getattr(args, 'conf', None) or CONF} names no machine: provision first")
     q = generated_quantum(m, args.graph_dir)
     if q is None:
         raise Cannot(f"no generated speaker graph for {m} in {args.graph_dir}")
@@ -1426,6 +1426,9 @@ def main():
     ap.add_argument("--json", help="verify: write the result here")
     ap.add_argument("--attestations", help="verify: the macOS parity attestations (default: the packaged parity.json)")
     ap.add_argument("--graph-dir", default="/run/speakerguardd-graph", help="verify: the generated graph")
+    ap.add_argument("--conf", default=None,
+                    help="verify: the units' environment file (default /etc/speakerguardd/speakerguardd.conf; "
+                         "aurora-speaker-upgrade --check passes its private root's)")
     ap.add_argument("tuning", nargs="*", help="after --: the tuning source, as aurora-speaker-tuning takes it")
     args = ap.parse_args()
     if args.cmd in ("run", "check", "verify") and not args.params:

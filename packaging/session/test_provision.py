@@ -813,9 +813,13 @@ class Gate(Base):
             json.dump(GATE if gate_data is None else gate_data, f)
         self.patch(gate, "kernel_interface", lambda wait: (iface, "AppleX") if iface else (None, None))
         self.patch(gate, "PROVISION_CONF", os.path.join(self.t, "provision.conf"))
+        # the gate runs as root on a Mac (ExecCondition=+...); no waits here
+        self.patch(gate, "privileged", lambda: True)
+        self.patch(gate, "STABLE_WAIT_S", 0)
         a = types.SimpleNamespace(gate=g, dt=self.dt, tuning_cli=self.cli, wait=0, state=self.p.state, cmd=cmd,
                                   setting=os.path.join(self.t, "upgrade-interface"))
         v2, legacy, why = gate.decide(a)
+        self.why = why
         self.assertFalse(v2 and legacy, why)
         return v2, legacy
 
@@ -912,6 +916,46 @@ class Gate(Base):
         self.assertEqual(self.run_(), 1)
         self.assertEqual(self.decide("dual"), (False, True))
         self.assertEqual(self.decide("v2"), (False, False))
+
+    def test_switched_mac_never_gets_legacy_on_a_transient_answer(self):
+        """RC8 E2E B1: as speakersafetyd's DynamicUser the gate could not read
+        the root-only store and started legacy on a switched Mac. A switched
+        Mac on a dual kernel starts the older daemons only on a stable,
+        definite refusal; an unreadable setting starts nothing."""
+        setting = os.path.join(self.t, "upgrade-interface")
+        self.board("j999")
+        self.ctl({"board": "j999"})
+        self.assertEqual(self.run_(), 0)
+        self.checked()
+        with open(setting, "w") as f:
+            f.write("v2\n")
+        self.assertEqual(self.decide("dual", cmd="legacy"), (True, False))
+        calls = []
+        real = gate.tuning_units
+
+        def flaky(cli, conf=None):
+            calls.append(1)
+            if len(calls) == 1:
+                raise PermissionError(13, "Permission denied", "/var/lib/aurora-speaker-upgrade/bundle")
+            return real(cli, conf)
+        self.patch(gate, "tuning_units", flaky)
+        self.assertEqual(self.decide("dual", cmd="legacy"), (True, False))
+        self.assertEqual(len(calls), 2, "asked again")
+
+        def broken(cli, conf=None):
+            raise PermissionError(13, "Permission denied", "/var/lib/aurora-speaker-upgrade/bundle")
+        self.patch(gate, "tuning_units", broken)
+        self.assertEqual(self.decide("dual", cmd="legacy"), (False, False))
+        self.assertIn("not starting the older daemons", self.why)
+        # not root: an unreadable store is not an answer
+        self.patch(gate, "tuning_units", real)
+        self.patch(gate, "privileged", lambda: False)
+        os.chmod(setting, 0)
+        try:
+            if os.geteuid() != 0:
+                self.assertEqual(gate.upgrade_setting(setting), "unreadable")
+        finally:
+            os.chmod(setting, 0o600)
 
     def test_interface_switches_only_dual_and_upgraded(self):
         sets = []
@@ -1153,7 +1197,7 @@ class Units(unittest.TestCase):
                 if l.startswith(("ExecStart=", "ExecStartPost=", "ExecStop=", "ExecStopPost=", "ExecCondition=")):
                     self.assertTrue(l.split("=", 1)[1].startswith("/usr/libexec/speakerguardd/"), l)
         self.assertIn("Before=pipewire.service wireplumber.service", self.unit("speakerguardd-graph.service"))
-        self.assertIn("ExecCondition=/usr/libexec/speakerguardd/speakerguardd-gate legacy", self.unit("legacy-gate.conf"))
+        self.assertIn("ExecCondition=+/usr/libexec/speakerguardd/speakerguardd-gate legacy", self.unit("legacy-gate.conf"))
         for u in (sup, chk, prv, swt):
             self.assertFalse([l for l in u if l.startswith(("OnFailure=", "OnSuccess="))])
         # A unit the gate skips must not fail first on the configuration that
