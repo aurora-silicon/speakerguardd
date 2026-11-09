@@ -287,6 +287,19 @@ def run(argv, **kw):
     return subprocess.run(argv, capture_output=True, text=True, **kw)
 
 
+# This tool runs with umask 077 (its store is root only). speakerguardd v2's
+# own programs are written for their units' umask 022: run under 077 in the
+# same boot as a switch, provisioning made /run/speakerguardd-graph and its
+# subdirectories 0700, so the seat user's session could not read the graph
+# state or the generated configuration, the session helper was skipped, and
+# the supervisor never granted until a reboot (RC8 E2E B4, M1 Pro + M2).
+V2_UMASK = 0o022
+
+
+def run_v2(argv, **kw):
+    return run(argv, umask=V2_UMASK, **kw)
+
+
 def provision_conf_with(text, path):
     lines = [l for l in (text or "").splitlines() if not l.startswith("SGV2_BUNDLE=") and l != MARK]
     return "\n".join(lines + [MARK, f"SGV2_BUNDLE={path}"]) + "\n"
@@ -313,7 +326,7 @@ def provision(store, a):
     p = tool("speakerguardd-provision")
     if not p:
         raise Refused("speakerguardd v2 is not installed (no speakerguardd-provision)")
-    r = run([p, "run"] + (["--force"] if a.force else []))
+    r = run_v2([p, "run"] + (["--force"] if a.force else []))
     sys.stderr.write(r.stderr[-2000:])
     if r.returncode != 0:
         raise Refused(f"speakerguardd v2 could not compile this Mac's tuning (exit {r.returncode})")
@@ -342,7 +355,7 @@ def selfcheck(a, mode=None):
     os.makedirs(a.scratch, mode=0o700, exist_ok=True)
     h = run([p, "--help"])
     if mode == "dual" and "--switch-interface" in h.stdout + h.stderr:
-        r = run([p, "run", "--switch-interface", "--params", PARAMS, "--", *v2_tuning_args()])
+        r = run_v2([p, "run", "--switch-interface", "--params", PARAMS, "--", *v2_tuning_args()])
         sys.stderr.write(r.stderr[-3000:])
         if r.returncode != 0:
             raise Refused(f"the silent hardware self-check failed on this kernel (exit {r.returncode}): "
@@ -354,13 +367,13 @@ def selfcheck(a, mode=None):
         # boot), so verify's graph step sees it.
         graph_activate()
     if re.search(r"\bverify\b", h.stdout + h.stderr):
-        r = run([p, "verify", "--params", PARAMS, "--json", js])
+        r = run_v2([p, "verify", "--params", PARAMS, "--json", js])
         code = r.returncode
     else:
-        r = run([p, "check", "--params", PARAMS])
+        r = run_v2([p, "check", "--params", PARAMS])
         code = r.returncode
         if code != 0:
-            r = run([p, "run", "--params", PARAMS])
+            r = run_v2([p, "run", "--params", PARAMS])
             code = 0 if r.returncode == 0 else 1
     sys.stderr.write(r.stderr[-3000:])
     if code == 0:
@@ -428,7 +441,7 @@ def graph_activate():
     p = tool("speakerguardd-provision")
     if not p:
         return
-    r = run([p, "activate", "--graph-unit", graph_unit()])
+    r = run_v2([p, "activate", "--graph-unit", graph_unit()])
     sys.stderr.write(r.stderr[-1000:])
     if r.returncode != 0:
         raise Refused(f"speakerguardd v2 could not generate this Mac's speaker graph (exit {r.returncode})")
@@ -440,7 +453,7 @@ def graph_deactivate():
     p = tool("speakerguardd-provision")
     if not p or "deactivate" not in run([p, "--help"]).stdout:
         return
-    r = run([p, "deactivate", "--graph-unit", graph_unit()])
+    r = run_v2([p, "deactivate", "--graph-unit", graph_unit()])
     sys.stderr.write(r.stderr[-1000:])
 
 

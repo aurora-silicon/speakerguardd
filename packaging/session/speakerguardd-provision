@@ -205,6 +205,7 @@ def ensure_dir(path, mode, live):
     if os.path.isdir(path):
         return
     os.makedirs(path, mode=mode, exist_ok=True)
+    os.chmod(path, mode)  # whatever the caller's umask
     if live and shutil.which("restorecon"):
         subprocess.run(["restorecon", "-R", path], capture_output=True)
 
@@ -600,7 +601,9 @@ def write_raw_rules(p, card, idx=None):
     import gen
 
     name, only = card_layout(idx, p.proc_asound) if idx is not None else (None, False)
-    os.makedirs(p.raw, mode=0o755, exist_ok=True)
+    for d in (p.graph, p.raw):
+        os.makedirs(d, mode=0o755, exist_ok=True)
+        os.chmod(d, 0o755)  # every user's WirePlumber reads it, whatever the caller's umask
     write_atomic(os.path.join(p.raw, gen.RAW_RULES), gen.wireplumber_raw_conf(card, name, only))
     write_atomic(os.path.join(p.graph, gen.UCM_MARKER), f"{card}\n")
 
@@ -702,6 +705,7 @@ def cmd_activate(args, p):
         log(f"{p.conf} names no seat user: provisioning has not passed")
         return 1
     os.makedirs(p.graph, mode=0o755, exist_ok=True)
+    os.chmod(p.graph, 0o755)  # the seat user's session reads it, whatever the caller's umask
     if os.path.exists(p.deferred) and not selfcheck_current(p):
         # Before login, with the switch test still to run: no graph (and
         # none left from earlier in this boot). speakerguardd-switchtest

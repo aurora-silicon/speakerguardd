@@ -789,6 +789,22 @@ class LV2Shadow(unittest.TestCase):
     def test_system_dirs_are_the_packaged_ones(self):
         self.assertEqual(self.scan(environ={"LV2_PATH": "/usr/lib64/lv2:/usr/lib/lv2"}), [])
 
+class Umask(Base):
+    def test_graph_dirs_are_readable_whatever_the_callers_umask(self):
+        """RC8 E2E B4: aurora-speaker-upgrade runs with umask 077; the graph
+        directories it made were 0700 and the seat user's session could not
+        read them, so v2 never granted in the same boot."""
+        import stat
+        shutil.rmtree(self.p.graph, ignore_errors=True)
+        old = os.umask(0o077)
+        try:
+            prov.write_raw_rules(self.p, "AppleJ316")
+        finally:
+            os.umask(old)
+        for d in (self.p.graph, self.p.raw):
+            self.assertEqual(stat.S_IMODE(os.stat(d).st_mode), 0o755, d)
+
+
 class Deactivate(Base):
     def test_revert_removes_the_v2_graph(self):
         os.makedirs(os.path.join(self.p.graph, "pipewire"), exist_ok=True)

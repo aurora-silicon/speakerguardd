@@ -296,6 +296,22 @@ class BootRefusalRecord(unittest.TestCase):
         self.assertNotEqual(k, self.saved[2](types.SimpleNamespace(unit="u2")))
 
 
+class V2Umask(unittest.TestCase):
+    def test_v2_programs_run_with_the_units_umask(self):
+        """B4: v2's provisioning and self-check run as their units would
+        (umask 022), not with this tool's 077."""
+        import subprocess, tempfile
+        from aurora_speaker_upgrade import upgrade as up
+        old = os.umask(0o077)
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                r = up.run_v2(["sh", "-c", "umask"])
+                self.assertEqual(r.stdout.strip(), "0022")
+                self.assertEqual(up.run(["sh", "-c", "umask"]).stdout.strip(), "0077")
+        finally:
+            os.umask(old)
+
+
 class LegacyStart(unittest.TestCase):
     """RC8 E2E B2: a revert starts the older daemon the packaged udev rules
     want for the sense PCM, never every installed one (speakerguardd 0.1
