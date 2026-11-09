@@ -63,7 +63,10 @@ pub(crate) fn tone_spec(
         let saved = stage.state.as_ref().and_then(|s| s.global()).and_then(|g| g.get(3)).map(f64::from).unwrap_or(0.0);
         tone.at_volume(fs, saved)
     };
-    if !partial.is_empty() {
+    // Like the full-chain compiler, an unwired box carries the entries the
+    // chain cannot follow at their least-passing setting; with an explicit
+    // volume input they would have to move, so the rig refuses them.
+    if volume.is_some() && !partial.is_empty() {
         return Err(aurora_speaker_tuning::Error::format(
             "isolated Tone chain",
             format!("volume automation entries carried only in part: {partial:?}"),
