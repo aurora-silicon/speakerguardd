@@ -252,7 +252,7 @@ class Pilot(unittest.TestCase):
         self.conf = os.path.join(self.tmp.name, "c.conf")
         with open(self.conf, "w") as f:
             f.write(f"SGV2_MACHINE=j414\nSGV2_UID={os.getuid()}\n")
-        self.args = mock.Mock(graph_dir=self.tmp.name)
+        self.args = mock.Mock(graph_dir=self.tmp.name, conf=None)
         self.refused = 0
 
     def tearDown(self):
