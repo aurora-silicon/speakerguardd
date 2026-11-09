@@ -1,8 +1,8 @@
 {
  "format": 1,
- "law": "be86516df77d5581bb07d2e7c8ea8a79e5cff31c6610c22b839ede5e2eab33e1",
+ "law": "2e054ed2504fd412924ae91b5fa197daa8b0a4dae6a61c349c68f6cebdd101a1",
  "reference": "macOS 26.6.2 25G83 Audio Units",
- "rev": "ee37e5cfbedabb994f745fb0c7f504aa588ff8e7",
+ "rev": "7c97fb1fca8221c19430798074ed73980b2bfbbd",
  "tolerance": {
   "louder_db": 0.25,
   "quieter_db": 1.0
