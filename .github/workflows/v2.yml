@@ -57,3 +57,11 @@ jobs:
       - run: python3 -I packaging/session/test_wiring.py
       - run: python3 -I packaging/session/test_session.py
       - run: python3 -I packaging/session/test_provision.py
+
+  upgrade:
+    name: aurora-speaker-upgrade (AEA range port vs the Go reference vectors)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -q && sudo apt-get install -y -q python3-cryptography liblzfse1
+      - run: python3 -I -m unittest discover -s packaging/upgrade/tests -v
