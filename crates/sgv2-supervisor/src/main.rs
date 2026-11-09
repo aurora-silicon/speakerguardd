@@ -392,6 +392,71 @@ mod linux {
         ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
     }
 
+    /// The supervisor's own hang watch. systemd's service watchdog runs on
+    /// CLOCK_MONOTONIC, which keeps counting while a system sleep freezes
+    /// userspace (the freezer, the device suspend and resume, a pm_test
+    /// delay), so a frozen supervisor looks hung at the thaw however long
+    /// WatchdogSec is. This watch counts a stall only when no system sleep
+    /// happened since it last looked (the kernel's suspend counters), and
+    /// aborts a supervisor whose loop really stopped; systemd then restarts
+    /// it (Restart=on-failure). The unit's WatchdogSec stays as a last
+    /// resort for a wedged process, set far above any freeze.
+    pub(crate) const HANG_NS: u64 = 10_000_000_000;
+    static HEARTBEAT_NS: AtomicU64 = AtomicU64::new(0);
+
+    /// The loop is alive: feed systemd and the hang watch.
+    fn alive(notify: &Notify) {
+        HEARTBEAT_NS.store(now_ns(), Ordering::Relaxed);
+        notify.send("WATCHDOG=1");
+    }
+
+    /// Every suspend attempt the kernel finished, successful or not
+    /// (/sys/power/suspend_stats); None without the counters.
+    fn sleeps() -> Option<u64> {
+        let n =
+            |f: &str| std::fs::read_to_string(format!("/sys/power/suspend_stats/{f}")).ok()?.trim().parse::<u64>().ok();
+        Some(n("success")? + n("fail")?)
+    }
+
+    /// CLOCK_BOOTTIME minus CLOCK_MONOTONIC: grows by the time the system
+    /// spent suspended (not by a freeze with the clock running).
+    fn suspended_ns() -> u64 {
+        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        // SAFETY: valid out-pointer.
+        unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts) };
+        (ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64).saturating_sub(now_ns())
+    }
+
+    /// The watch's decision: hung only when the heartbeat is older than the
+    /// limit and no sleep happened since the last look (`slept`).
+    pub(crate) fn hung(now: u64, heartbeat: u64, limit: u64, slept: bool) -> bool {
+        heartbeat != 0 && !slept && now.saturating_sub(heartbeat) > limit
+    }
+
+    fn spawn_hang_watch() -> std::io::Result<()> {
+        std::thread::Builder::new().name("hang-watch".into()).spawn(|| {
+            let (mut seen, mut asleep) = (sleeps(), suspended_ns());
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                let (count, susp) = (sleeps(), suspended_ns());
+                // a sleep since the last look: its freeze is not a stall
+                let slept = count != seen || susp > asleep + 500_000_000;
+                if slept {
+                    // the loop gets a full limit after the thaw
+                    HEARTBEAT_NS.store(now_ns(), Ordering::Relaxed);
+                }
+                seen = count;
+                asleep = susp;
+                let hb = HEARTBEAT_NS.load(Ordering::Relaxed);
+                if hung(now_ns(), hb, HANG_NS, slept) {
+                    eprintln!("supervisor loop stalled for over {} s outside any system sleep; aborting for a restart (the kernel floor holds)", HANG_NS / 1_000_000_000);
+                    std::process::abort();
+                }
+            }
+        })?;
+        Ok(())
+    }
+
     fn sleep_until(t: u64) {
         let ts = libc::timespec { tv_sec: (t / 1_000_000_000) as i64, tv_nsec: (t % 1_000_000_000) as i64 };
         // SAFETY: valid timespec; absolute monotonic deadline.
@@ -745,6 +810,11 @@ mod linux {
         // Up, holding nothing: the kernel floor is the state. The watchdog
         // guards the wait for the card as well as the loop.
         let notify = Notify::new();
+        HEARTBEAT_NS.store(now_ns(), Ordering::Relaxed);
+        if let Err(e) = spawn_hang_watch() {
+            eprintln!("hang watch: {e}");
+            return EX_UNAVAILABLE;
+        }
         notify.send("READY=1\nSTATUS=waiting for the speaker card");
         let mut attempt = 0u32;
         let mut last_why = String::new();
@@ -779,7 +849,7 @@ mod linux {
                     attempt += 1;
                     let until = now_ns() + ms * 1_000_000;
                     loop {
-                        notify.send("WATCHDOG=1");
+                        alive(&notify);
                         let now = now_ns();
                         if now >= until {
                             break;
@@ -874,8 +944,8 @@ mod linux {
             }
             if scheduled {
                 if ticks % 20 == 0 {
-                    // every 200 ms, under the unit's WatchdogSec
-                    notify.send("WATCHDOG=1");
+                    // every 200 ms: systemd and the hang watch
+                    alive(&notify);
                 }
                 ticks += 1;
                 deadline += TICK_NS;
@@ -894,6 +964,21 @@ mod linux {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn a_freeze_for_a_sleep_is_not_a_hang() {
+            let s = 1_000_000_000u64;
+            // fresh heartbeat: alive
+            assert!(!hung(100 * s, 99 * s, HANG_NS, false));
+            // stalled past the limit with no sleep: hung
+            assert!(hung(120 * s, 99 * s, HANG_NS, false));
+            // the same gap across a system sleep (pm_test or a long device suspend): not a hang
+            assert!(!hung(140 * s, 99 * s, HANG_NS, true));
+            // not started yet
+            assert!(!hung(140 * s, 0, HANG_NS, false));
+            // exactly at the limit: not yet
+            assert!(!hung(109 * s, 99 * s, HANG_NS, false));
+        }
 
         #[test]
         fn a_status_read_blocked_by_an_open_reads_as_opening_for_a_while() {
