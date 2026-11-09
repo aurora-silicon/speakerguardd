@@ -101,15 +101,21 @@ SENSE_BITS = 16
 #   ~10 quanta, and the speaker driver xruns: 42 xruns at every M2 boot when
 #   chrony corrected the boot clock (0.37 s, 15.5-20.3 s after boot), 34
 #   on a forced 0.4 s slew; 0 of either with period interrupts (SGCHK
-#   2026-11-09). MCA raises a period interrupt per period; the AOP
-#   transports' cadence is unproven here and keeps the timer.
+#   2026-11-09). MCA raises a period interrupt per period. The T6040 AOP
+#   speaker service's playback is a cyclic ADMAC channel with a callback per
+#   period: on the J616s the channel's line ran 494/s with the 400/s sense
+#   ring, i.e. 94/s of playback against 93.75/s for 512-frame periods, and
+#   with period interrupts a forced 0.4 s slew re-prepared the speaker PCM
+#   0 times (timer: 14 SETUP/XRUN restarts and 27 sense resyncs, SINKGAP
+#   2026-11-09). The T8140/T8142 transports' cadence is unproven here and
+#   keeps the timer.
 TRANSPORTS = {
     # sound/soc/apple/mca.c: S16_LE, S24_LE, S32_LE
     "apple,mca": {"transport": "mca", "formats": ["S16_LE", "S24_LE", "S32_LE"], "sense_batch": True, "speaker_headroom": 0,
                   "speaker_irq": True},
     # sound/soc/apple/aop_spkr.rs (T6040 speaker service): S24_LE playback, S16_LE sense
     "apple,t6041-aop-audio": {"transport": "aop-spkr", "formats": ["S24_LE"], "sense_batch": False, "speaker_headroom": 256,
-                              "speaker_irq": False},
+                              "speaker_irq": True},
     # sound/soc/apple/aop_t8140.rs: S32_LE playback, no sense
     "apple,t8140-aop-audio": {"transport": "aop-t8140", "formats": ["S32_LE"], "sense_batch": True, "speaker_headroom": 0,
                               "speaker_irq": False},
