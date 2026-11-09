@@ -795,7 +795,8 @@ class Gate(Base):
             json.dump(GATE if gate_data is None else gate_data, f)
         self.patch(gate, "kernel_interface", lambda wait: (iface, "AppleX") if iface else (None, None))
         self.patch(gate, "PROVISION_CONF", os.path.join(self.t, "provision.conf"))
-        a = types.SimpleNamespace(gate=g, dt=self.dt, tuning_cli=self.cli, wait=0, state=self.p.state, cmd=cmd)
+        a = types.SimpleNamespace(gate=g, dt=self.dt, tuning_cli=self.cli, wait=0, state=self.p.state, cmd=cmd,
+                                  setting=os.path.join(self.t, "upgrade-interface"))
         v2, legacy, why = gate.decide(a)
         self.assertFalse(v2 and legacy, why)
         return v2, legacy
@@ -832,6 +833,37 @@ class Gate(Base):
         with open(self.p.params, "ab") as f:
             f.write(b"new-blob")
         self.assertEqual(self.decide(), (False, False))
+
+    def test_kernel_interface_reads_the_selector(self):
+        self.patch(gate, "speaker_card", lambda: "AppleX")
+        for controls, want in (({"Speaker Protection Interface", "Speaker Protection"}, "dual"),
+                               ({"Speaker Protection"}, "v2"), (set(), "legacy")):
+            self.patch(gate, "has_control", lambda card, name, c=controls: name in c)
+            self.assertEqual(gate.kernel_interface(0), (want, "AppleX"))
+        self.patch(gate, "has_control", lambda card, name: None)
+        self.assertEqual(gate.kernel_interface(0), (None, "AppleX"))
+
+    def test_dual_kernel_runs_v2_only_after_the_upgrade_switched(self):
+        # linux#1279: "Speaker Protection Interface" serves both interfaces,
+        # the volume lock by default; v2 needs the upgrade's setting too
+        self.board("j999")
+        self.ctl({"board": "j999"})
+        self.assertEqual(self.run_(), 0)
+        self.checked()
+        setting = os.path.join(self.t, "upgrade-interface")
+        self.assertEqual(self.decide("dual"), (False, True))
+        with open(setting, "w") as f:
+            f.write("legacy\n")
+        self.assertEqual(self.decide("dual"), (False, True))
+        with open(setting, "w") as f:
+            f.write("v2\n")
+        self.assertEqual(self.decide("dual"), (True, False))
+        # a failing proof on a dual kernel keeps the older daemons, never the floor
+        self.checked(result="fail")
+        self.assertEqual(self.decide("dual"), (False, True))
+        # the v2-only kernel is unchanged
+        self.assertEqual(self.decide("v2"), (False, False))
+        os.unlink(setting)
 
     def test_unlisted_board_silent_check_and_full_voicing_generation(self):
         import gen

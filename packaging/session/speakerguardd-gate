@@ -19,6 +19,14 @@ both, so exactly one of them runs on a board, chosen at boot:
   does not have that interface: on a v2 kernel they have nothing to own.
   An unqualified board on a v2 kernel runs neither, and the
   kernel holds its speakers at the floor.
+- a dual kernel (macaudio's root-only "Speaker Protection Interface"
+  control, default "Speaker Volume Unlock" at every bind) serves both
+  interfaces. There v2 runs only when the upgrade's persistent setting
+  (/var/lib/aurora-speaker-upgrade/interface, written by
+  aurora-speaker-upgrade after `speakerguardd-selfcheck verify` passed) says
+  "v2" and every proof above holds; otherwise the older daemons run, on
+  the interface the kernel boots with. Nothing here writes the control:
+  aurora-speaker-upgrade's ExecStartPre does, after this condition passed.
 
 So the kernel is the switch. A fleet kernel without the v2 interface keeps
 every Mac on the older daemons; the kernel that brings the interface moves
@@ -46,6 +54,9 @@ DT = "/proc/device-tree"
 # reader looks first (speakerguardd-provision: SGV2_BUNDLE=<path>).
 PROVISION_CONF = "/etc/speakerguardd/provision.conf"
 CONTROL = "Speaker Protection"
+# The dual kernel's selector (linux#1279) and the upgrade's persistent choice.
+INTERFACE_CONTROL = "Speaker Protection Interface"
+UPGRADE_SETTING = "/var/lib/aurora-speaker-upgrade/interface"
 
 
 def log(*a):
@@ -104,9 +115,30 @@ def speaker_card(sysfs="/sys/class/sound"):
     return None
 
 
+def upgrade_setting(path=None):
+    """The upgrade's persistent interface choice ("v2", or None)."""
+    try:
+        with open(path or UPGRADE_SETTING) as f:
+            v = f.read().strip()
+    except OSError:
+        return None
+    return v if v == "v2" else None
+
+
+def has_control(card, name):
+    try:
+        r = subprocess.run(["amixer", "-c", card, "cget", f"name={name}"], capture_output=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log(f"amixer: {e}")
+        return None
+    return r.returncode == 0
+
+
 def kernel_interface(wait):
-    """'v2' (the card has "Speaker Protection"), 'legacy' (a speaker card
-    without it) or None (no speaker card within the wait)."""
+    """'dual' (the card has "Speaker Protection Interface": both interfaces,
+    the volume lock by default), 'v2' (only "Speaker Protection"), 'legacy'
+    (a speaker card with neither) or None (no speaker card within the
+    wait, or unreadable controls)."""
     deadline = time.monotonic() + wait
     while True:
         card = speaker_card()
@@ -115,12 +147,15 @@ def kernel_interface(wait):
         if time.monotonic() >= deadline:
             return None, None
         time.sleep(0.25)
-    try:
-        r = subprocess.run(["amixer", "-c", card, "cget", f"name={CONTROL}"], capture_output=True, timeout=10)
-    except (OSError, subprocess.TimeoutExpired) as e:
-        log(f"amixer: {e}")
+    dual = has_control(card, INTERFACE_CONTROL)
+    if dual is None:
         return None, card
-    return ("v2" if r.returncode == 0 else "legacy"), card
+    if dual:
+        return "dual", card
+    v2 = has_control(card, CONTROL)
+    if v2 is None:
+        return None, card
+    return ("v2" if v2 else "legacy"), card
 
 
 def decide(args):
@@ -146,9 +181,17 @@ def decide(args):
     if why_not:
         if iface == "v2":
             return False, False, f"{why_not}; the kernel has the v2 interface ({card}), so the older daemons have nothing to own: the kernel holds the speakers at its floor"
+        if iface == "dual":
+            return False, True, f"{why_not}; the kernel serves both interfaces ({card}): the older daemons protect the speakers"
         return False, True, f"{why_not}; the older daemons protect the speakers"
     if iface == "legacy":
         return False, True, f"{board} is gated for v2, but this kernel has no \"{CONTROL}\" control on {card}: the older daemons protect the speakers"
+    if iface == "dual" and upgrade_setting(getattr(args, "setting", None)) != "v2":
+        return False, True, (f"{board} is gated for v2 and the kernel serves both interfaces on {card}, but the upgrade has not "
+                             f"switched this Mac ({UPGRADE_SETTING} is not \"v2\"): the older daemons protect the speakers")
+    if iface == "dual":
+        return True, False, (f"{board} ({','.join(units)}) is gated for v2, the kernel serves both interfaces on {card} and the "
+                             "upgrade switched this Mac to v2: speakerguardd v2 protects the speakers")
     return True, False, f"{board} ({','.join(units)}) is gated for v2 and the kernel has the v2 interface on {card}: speakerguardd v2 protects the speakers"
 
 
@@ -160,6 +203,7 @@ def main():
     ap.add_argument("--state", default="/var/lib/speakerguardd")
     ap.add_argument("--tuning-cli", default="aurora-speaker-tuning")
     ap.add_argument("--wait", type=float, default=15.0, help="seconds to wait for the speaker card")
+    ap.add_argument("--setting", default=UPGRADE_SETTING, help="the upgrade's persistent interface choice")
     args = ap.parse_args()
     try:
         v2, legacy, why = decide(args)
