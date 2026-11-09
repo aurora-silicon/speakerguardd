@@ -10,9 +10,12 @@ ConditionPathExists=/proc/device-tree/compatible
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/aurora-speaker-upgrade run
-# 2 = cannot run yet (no card, the speakers busy): not a failure of the unit.
-SuccessExitStatus=2
+ExecStart=/usr/bin/aurora-speaker-upgrade run --at-boot
+# 1 = refused (the legacy protection keeps the speakers, the reason is in the
+# journal and in refused.json) and 2 = cannot run yet (no card, the speakers
+# busy) are outcomes, not failures of the unit. A refusal is not retried at
+# boot until the kernel, speakerguardd or the parity attestation changes.
+SuccessExitStatus=1 2
 TimeoutStartSec=900
 StateDirectory=aurora-speaker-upgrade
 StateDirectoryMode=0700

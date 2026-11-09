@@ -2,7 +2,7 @@
 """speakerguardd-selfcheck: prove this Mac's speaker wiring, silently, before
 speakerguardd may grant.
 
-    speakerguardd-selfcheck run      --params BLOB [--force] [--defer] [-- TUNING-SOURCE...]
+    speakerguardd-selfcheck run      --params BLOB [--force] [--defer] [--switch-interface] [-- TUNING-SOURCE...]
     speakerguardd-selfcheck pending
     speakerguardd-selfcheck check    --params BLOB
     speakerguardd-selfcheck verify   --params BLOB [--json FILE] [--attestations FILE] [-- TUNING-SOURCE...]
@@ -248,7 +248,8 @@ def pcm_state(idx, dev, d):
 class Control:
     """The card's control device: "Speaker Protection" owned by this process."""
 
-    def __init__(self, idx):
+    def __init__(self, idx, switch=False):
+        lease_interface(idx, switch)
         self.fd = os.open(f"/dev/snd/controlC{idx}", os.O_RDWR | os.O_CLOEXEC)
         try:
             fcntl.ioctl(self.fd, _ELEM_LOCK, self._id("Speaker Protection"))
@@ -279,6 +280,27 @@ class Control:
         except OSError:
             pass
         os.close(self.fd)
+
+
+def lease_interface(card, switch=False):
+    """On a dual kernel ("Speaker Protection Interface", linux 98cb6a86 and
+    later) "Speaker Volume Unlock" is in charge at boot, and "Speaker
+    Protection" grants nothing until root switches the interface. The check
+    switches it only on a Mac aurora-speaker-upgrade switched (its setting),
+    or when that tool runs the check itself (`--switch-interface`); the
+    kernel goes back to the volume lock, at its floor, 30 s after the last
+    owner closes. Returns the interface ("dual" or None)."""
+    cur = wiring.interface_get(card)
+    if cur is None:
+        return None
+    if cur != wiring.IF_LEASE:
+        if not (switch or wiring.upgraded()):
+            raise wiring.Refused(
+                f"this kernel serves both speaker interfaces and {wiring.IF_UNLOCK!r} is in charge: this Mac was not "
+                "switched to speakerguardd v2 (aurora-speaker-upgrade), so the older daemons own the speakers")
+        wiring.interface_lease(card)
+        log(f"{wiring.INTERFACE_CONTROL!r} = {wiring.IF_LEASE!r} (the volume lock's floor first)")
+    return "dual"
 
 
 class Lease(threading.Thread):
@@ -968,7 +990,7 @@ def run_locked(args):
             errs += static(idx, w, report)
         elif w["method"] == "derived":
             try:
-                errs += active(idx, card, w, report)
+                errs += active(idx, card, w, report, args)
             finally:
                 try:
                     os.unlink(MARKER)
@@ -1018,7 +1040,7 @@ def static(idx, w, report):
     return []
 
 
-def active(idx, card, w, report):
+def active(idx, card, w, report, args=None):
     """The hardware half: registers, then the silent switch test."""
     errs = []
     ids = pcm_ids(idx)
@@ -1044,7 +1066,7 @@ def active(idx, card, w, report):
     old_mux = None
     ctl = None
     try:
-        ctl = Control(idx)
+        ctl = Control(idx, switch=getattr(args, "switch_interface", False))
         r = amixer(card, "cget", f"name={mux}")
         if r.returncode == 0:
             m = re.search(r": values=(\d+)", r.stdout)
@@ -1396,6 +1418,9 @@ def main():
                     help="run: before login, leave a needed switch test to speakerguardd-switchtest.service")
     ap.add_argument("--deferred", default=DEFERRED, help="the switch-test-pending file")
     ap.add_argument("--clear", action="store_true", help="pending: the switch test is done (pass or fail)")
+    ap.add_argument("--switch-interface", action="store_true",
+                    help="run: on a dual kernel, switch the speakers to the v2 lease for the switch test even before "
+                         "this Mac's upgrade setting exists (aurora-speaker-upgrade, which decides the switch)")
     ap.add_argument("--pipewire-dir")
     ap.add_argument("--wireplumber-dir")
     ap.add_argument("--json", help="verify: write the result here")

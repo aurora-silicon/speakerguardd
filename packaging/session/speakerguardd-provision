@@ -4,6 +4,7 @@ manual step, before the self-check and the supervisor start.
 
     speakerguardd-provision run      [--bundle SRC] [--force]   (root, speakerguardd-provision.service)
     speakerguardd-provision activate [--graph-unit UNIT]        (root, after the self-check passed)
+    speakerguardd-provision deactivate [--graph-unit UNIT]      (root, the older daemons take the speakers back)
     speakerguardd-provision seat     --unit UNIT                (root, when seat0 changes hands)
     speakerguardd-provision graph-user                          (the user's speakerguardd-graph.service)
                                                                 (waits while the switch test is pending)
@@ -735,6 +736,32 @@ def cmd_activate(args, p):
     return 0
 
 
+def cmd_deactivate(args, p):
+    """The older daemons take the speakers back in this boot (aurora-speaker-
+    upgrade --revert on a dual kernel): remove v2's graph and bring the seat
+    user's running session back onto the distribution's own speaker graph
+    now, instead of at the next boot."""
+    import gen
+
+    conf = read_kv(p.conf)
+    clear_graph(p, result="legacy")
+    # The raw-PCM rules and the UCM marker hide the distribution's own
+    # speaker device; they go too (provisioning writes them again).
+    for f in glob.glob(os.path.join(p.raw, "*.conf")) + [os.path.join(p.graph, gen.UCM_MARKER)]:
+        unlink(f)
+    log(f"speaker graph, raw-PCM rules and UCM marker removed from {p.graph}: the distribution's speaker graph returns")
+    user = conf.get("SGV2_USER")
+    if not user or p.root:
+        return 0
+    r = user_systemctl(user, "show", "pipewire.service", "--property=ActiveState")
+    if r.returncode != 0 or "ActiveState=active" not in r.stdout:
+        return 0
+    log(f"restarting {user}'s PipeWire on the distribution's speaker graph")
+    user_systemctl(user, "restart", args.graph_unit)
+    user_systemctl(user, "try-restart", "pipewire.service", "wireplumber.service", "pipewire-pulse.service")
+    return 0
+
+
 def refresh_session(user, changed_us, graph_unit):
     """If the seat user's PipeWire is running and started before the graph
     changed, link the graph and restart it, so it loads the graph now."""
@@ -991,7 +1018,7 @@ def cmd_status(args, p):
 
 def main():
     ap = argparse.ArgumentParser(prog="speakerguardd-provision")
-    ap.add_argument("cmd", choices=["run", "activate", "seat", "graph-user", "is-seat", "sleep", "wake", "status"])
+    ap.add_argument("cmd", choices=["run", "activate", "deactivate", "seat", "graph-user", "is-seat", "sleep", "wake", "status"])
     ap.add_argument("--bundle", help="the tuning source (default: the installer's bundle)")
     ap.add_argument("--force", action="store_true", help="compile even if the blob is bound")
     ap.add_argument("--unit", default="speakerguardd.service", help="the supervisor's unit (seat, sleep, wake)")
@@ -1006,7 +1033,7 @@ def main():
     ap.add_argument("--card-wait", type=float, default=20.0)
     args = ap.parse_args()
     p = Paths(args.root)
-    return {"run": cmd_run, "activate": cmd_activate, "seat": cmd_seat, "graph-user": cmd_graph_user,
+    return {"run": cmd_run, "activate": cmd_activate, "deactivate": cmd_deactivate, "seat": cmd_seat, "graph-user": cmd_graph_user,
             "is-seat": cmd_is_seat, "sleep": cmd_sleep, "wake": cmd_wake, "status": cmd_status}[args.cmd](args, p)
 
 

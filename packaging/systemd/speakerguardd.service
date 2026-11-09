@@ -22,6 +22,12 @@ ConditionPathExists=/proc/device-tree/compatible
 Type=notify
 # Only on a board the fleet gate places on v2, with the v2 kernel interface.
 ExecCondition=/usr/libexec/speakerguardd/speakerguardd-gate v2
+# A dual kernel ("Speaker Protection Interface", linux 98cb6a86 and later)
+# starts every boot on "Speaker Volume Unlock": on a Mac aurora-speaker-
+# upgrade switched to v2, put it on the lease right before the supervisor
+# takes it (the kernel goes back to the volume lock 30 s after the last
+# owner closes, so this runs on every start). A no-op on other kernels.
+ExecStartPre=/usr/libexec/speakerguardd/speakerguardd-gate interface
 # Written by speakerguardd-provision: SGV2_ARGS="--card <ID> --pcm <D>
 # --uid <UID> --params <blob>", the seat user's uid resolved by name.
 # Optional ("-"), so that on a board or kernel the gate skips, the unit is

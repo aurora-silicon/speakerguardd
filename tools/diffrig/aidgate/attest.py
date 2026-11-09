@@ -15,7 +15,7 @@ code (`law`, see parity.rs; a stale file refuses every Mac until it is regenerat
 
   1. variants (buildbox): every AID x every speaker configuration in the tree, deduplicated
      by tuning key (two speaker IDs whose strips are identical share one entry):
-       attest.py variants --bin BIN --tunings TREE [--tunings-fallback TREE] --out variants.json
+       attest.py variants --bin BIN --build BUILD --tunings TREE [--tunings-fallback TREE] --out variants.json
   2. macOS references (the host Mac running that release, under a host-heavy slot):
        attest_refs.sh SLOTDIR variants.json         (gr.py per variant, strip + property strip)
   3. macOS spread (host + buildbox): the same references rendered again from the program
@@ -24,7 +24,14 @@ code (`law`, see parity.rs; a stale file refuses every Mac until it is regenerat
              --prog PROG --reference 25G83 --out spread-25G83.json
   4. gate (buildbox): render each variant through v2 and compare with its reference:
        attest.py gate --variants variants.json --mac REFDIR --bin BIN --prog PROG \
-             --reference 25G83 --spread spread-25G83.json --out parity.json [--details DIR]
+             --reference "macOS 27.0 26A428 Audio Units" [--spread spread-26A428.json] \
+             --out parity.json [--details DIR]
+
+BUILD is the macOS build whose Tunings and installed Audio Units the run uses (26A428). The
+gate writes one release block for it into parity.json and keeps the blocks of other releases
+already there (same law only). A Mac whose tuning bundle comes from a build without a block
+is refused by `verify`: every release needs its own run, never an assumption that an older
+release's Audio Units still render the same.
 
 A tuning is refused when: the macOS reference failed or is missing; v2's chain does not
 compile, has a stub, an unwired graph parameter or a compiler gap; the lane counts
@@ -60,15 +67,18 @@ FLOOR_RESIDUE_DB = 55.0
 CHAOTIC_MAX_DBFS = -60.0
 CHAOTIC_UNDER_PEAK_DB = 40.0
 SPREAD_FORMAT = 1
-FORMAT = 1
+FORMAT = 2
 
 
 def tool(bin_dir, name):
     return os.path.join(bin_dir, name)
 
 
+BUILD_ENV = {}
+
+
 def run_json(cmd):
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=900, env={**os.environ, **BUILD_ENV})
     try:
         return r.returncode, json.loads(r.stdout)
     except ValueError:
@@ -113,7 +123,7 @@ def variants(a):
             seen[k["key"]] = v
             out.append(v)
         print(f"AID{aid}: {len(seen)} tuning(s)", flush=True)
-    json.dump({"law": law, "variants": out}, open(a.out, "w"), indent=1)
+    json.dump({"law": law, "build": a.build, "variants": out}, open(a.out, "w"), indent=1)
     return 0
 
 
@@ -286,7 +296,7 @@ def gate_one(a, v, segs, np):
     out = os.path.join(a.work, ref_name(v) + ".v2.f32")
     r = subprocess.run([tool(a.bin, "voicing-render")] + root + extra +
                        ["--in", a.prog + ".f32", "--out", out, "--mvsc", "1", "--mvol", "0"],
-                       capture_output=True, text=True, timeout=900)
+                       capture_output=True, text=True, timeout=900, env={**os.environ, **BUILD_ENV})
     if r.returncode:
         e["reason"] = f"v2 does not render the chain: {(r.stderr or r.stdout)[-240:]}"
         return e, None
@@ -353,11 +363,13 @@ def spread(a):
 
 
 def spread_id(path):
-    """The spread file a gate used: its SHA-256 (or None)."""
+    """The spread rule a release block was gated with: the spread file's SHA-256 and the
+    rule's limits (None without a spread file: the ordinary rule)."""
     if not path:
         return None
     import hashlib
-    return hashlib.sha256(open(path, "rb").read()).hexdigest()
+    return {"sha256": hashlib.sha256(open(path, "rb").read()).hexdigest(),
+            "chaotic_max_dbfs": CHAOTIC_MAX_DBFS, "chaotic_under_peak_db": CHAOTIC_UNDER_PEAK_DB}
 
 
 def gate(a):
@@ -376,20 +388,35 @@ def gate(a):
         if a.details and rows is not None:
             json.dump(rows, open(os.path.join(a.details, ref_name(v) + ".json"), "w"))
         print(f"{ref_name(v):16s} {e['verdict']:8s} {e['reason'][:160]}", flush=True)
-    doc = {
-        "format": FORMAT,
-        "law": vs["law"],
+    release = {
+        "build": vs["build"],
         "reference": a.reference,
         "rev": open(os.path.join(a.bin, "REV")).read().strip(),
-        "tolerance": {"louder_db": LOUDER_DB, "quieter_db": QUIETER_DB, "floor_residue_db": FLOOR_RESIDUE_DB,
-                      "chaotic_max_dbfs": CHAOTIC_MAX_DBFS, "chaotic_under_peak_db": CHAOTIC_UNDER_PEAK_DB},
         "spread": spread_id(a.spread),
         "entries": sorted(entries, key=lambda e: (e["aid"], -1 if e["speaker_id"] is None else e["speaker_id"])),
     }
+    doc = merge(a.out, vs["law"], release)
     json.dump(doc, open(a.out, "w"), indent=1)
     p = sum(e["verdict"] == "pass" for e in entries)
     print(f"{p}/{len(entries)} tunings pass", flush=True)
     return 0
+
+
+def merge(path, law, release):
+    """The attestation file with `release` added or replaced; other releases are kept only
+    when they were gated with the same rendering code (law)."""
+    doc = {"format": FORMAT, "law": law,
+           "tolerance": {"louder_db": LOUDER_DB, "quieter_db": QUIETER_DB, "floor_residue_db": FLOOR_RESIDUE_DB},
+           "releases": []}
+    if os.path.exists(path):
+        old = json.load(open(path))
+        if old.get("format") == FORMAT and old.get("law") == law and old.get("tolerance") == doc["tolerance"]:
+            doc["releases"] = [r for r in old["releases"] if r["build"] != release["build"]]
+        else:
+            dropped = [r["build"] for r in old.get("releases", [])] or ["(format 1 file)"]
+            print(f"dropping releases gated with other code or tolerance: {', '.join(dropped)}", flush=True)
+    doc["releases"] = sorted(doc["releases"] + [release], key=lambda r: r["build"])
+    return doc
 
 
 def main():
@@ -399,6 +426,7 @@ def main():
     v.add_argument("--bin", required=True)
     v.add_argument("--tunings", required=True)
     v.add_argument("--tunings-fallback")
+    v.add_argument("--build", required=True, help="the macOS build the Tunings come from (26A428)")
     v.add_argument("--out", required=True)
     g = sub.add_parser("gate")
     for k in ("variants", "mac", "bin", "prog", "reference", "out"):
@@ -414,6 +442,10 @@ def main():
     a = ap.parse_args()
     if a.cmd == "spread" and len(a.perturbed) < 4:
         raise SystemExit("spread needs at least four perturbed reference sets")
+    if a.cmd == "variants":
+        BUILD_ENV["SGV2_MACOS_BUILD"] = a.build
+    else:
+        BUILD_ENV["SGV2_MACOS_BUILD"] = json.load(open(a.variants))["build"]
     return {"variants": variants, "gate": gate, "spread": spread}[a.cmd](a)
 
 
