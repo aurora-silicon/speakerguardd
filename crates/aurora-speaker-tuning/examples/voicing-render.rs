@@ -2,7 +2,7 @@
 //! tuning and renders a stereo program into the unit's lanes.
 //!
 //! ```text
-//! voicing-render (--bundle PATH | --tunings-root DIR --aid N)
+//! voicing-render (--bundle PATH | --tunings-root DIR --aid N [--speaker-id N])
 //!     --in PROGRAM.f32 --out LANES.f32 [--mvsc S] [--mvol DB|auto]
 //! (`--mvol auto`: the dB the plugin derives from S with the artifact's volume law)
 //!     [--tap NODE=FILE.f32 ...] [--info FILE.json] [--block N] [--only NODE]
@@ -39,6 +39,7 @@ fn main() {
     let mut taps: Vec<(String, String)> = Vec::new();
     let mut only: Option<String> = None;
     let mut profile: Option<String> = None;
+    let mut speaker_id: Option<i128> = None;
     while let Some(a) = args.next() {
         let mut v = || args.next().expect("value");
         match a.as_str() {
@@ -54,6 +55,7 @@ fn main() {
                 x => mvol = x.parse().expect("mvol"),
             },
             "--block" => block = v().parse().expect("block"),
+            "--speaker-id" => speaker_id = Some(v().parse().expect("speaker id")),
             "--only" => only = Some(v()),
             "--profile" => profile = Some(v()),
             "--tap" => {
@@ -71,7 +73,8 @@ fn main() {
     }
     .expect("bundle");
     let mut diags = Diagnostics::default();
-    let mut t = Tuning::load(&b, &Options::default(), &mut diags).unwrap_or_else(|e| panic!("load: {e}"));
+    let mut t = Tuning::load(&b, &Options { speaker_id, ..Options::default() }, &mut diags)
+        .unwrap_or_else(|e| panic!("load: {e}"));
     // Raw tuning roots have no installer manifest. Offline cross-OS rigs
     // supply the source build explicitly; production bundles carry it in
     // their manifest and therefore never consult this harness override.

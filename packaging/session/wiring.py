@@ -92,17 +92,31 @@ SENSE_BITS = 16
 #   (PipeWire's batch handling fits it) or in small chunks (the AOP sense
 #   ring's 120 frames, where batch handling makes the follower resync);
 # - speaker_headroom: frames of extra queue on the speaker sink (the AOP
-#   speaker service's DMA cadence underran without 256).
+#   speaker service's DMA cadence underran without 256);
+# - speaker_irq: the speaker sink wakes on the PCM's period interrupt
+#   (api.alsa.disable-tsched), i.e. on the audio clock, not on a system timer.
+#   PipeWire's timer scheduling runs on CLOCK_MONOTONIC, which NTP slews (up
+#   to 8.3% with chrony's default maxslewrate); during a slew the sense
+#   follower, which may not resample, drifts against it and resyncs every
+#   ~10 quanta, and the speaker driver xruns: 42 xruns at every M2 boot when
+#   chrony corrected the boot clock (0.37 s, 15.5-20.3 s after boot), 34
+#   on a forced 0.4 s slew; 0 of either with period interrupts (SGCHK
+#   2026-11-09). MCA raises a period interrupt per period; the AOP
+#   transports' cadence is unproven here and keeps the timer.
 TRANSPORTS = {
     # sound/soc/apple/mca.c: S16_LE, S24_LE, S32_LE
-    "apple,mca": {"transport": "mca", "formats": ["S16_LE", "S24_LE", "S32_LE"], "sense_batch": True, "speaker_headroom": 0},
+    "apple,mca": {"transport": "mca", "formats": ["S16_LE", "S24_LE", "S32_LE"], "sense_batch": True, "speaker_headroom": 0,
+                  "speaker_irq": True},
     # sound/soc/apple/aop_spkr.rs (T6040 speaker service): S24_LE playback, S16_LE sense
-    "apple,t6041-aop-audio": {"transport": "aop-spkr", "formats": ["S24_LE"], "sense_batch": False, "speaker_headroom": 256},
+    "apple,t6041-aop-audio": {"transport": "aop-spkr", "formats": ["S24_LE"], "sense_batch": False, "speaker_headroom": 256,
+                              "speaker_irq": False},
     # sound/soc/apple/aop_t8140.rs: S32_LE playback, no sense
-    "apple,t8140-aop-audio": {"transport": "aop-t8140", "formats": ["S32_LE"], "sense_batch": True, "speaker_headroom": 0},
+    "apple,t8140-aop-audio": {"transport": "aop-t8140", "formats": ["S32_LE"], "sense_batch": True, "speaker_headroom": 0,
+                              "speaker_irq": False},
     # t8152_aop_audio.rs, T8142 configuration: ADMAC burst-residue DMA,
     # S24_LE playback and S16_LE sense, not the T6041 firmware ring above.
-    "apple,t8142-aop-audio": {"transport": "aop-dma", "formats": ["S24_LE"], "sense_batch": False, "speaker_headroom": 0},
+    "apple,t8142-aop-audio": {"transport": "aop-dma", "formats": ["S24_LE"], "sense_batch": False, "speaker_headroom": 0,
+                              "speaker_irq": False},
 }
 # The self-check's probe order on the speaker PCM.
 FORMAT_ORDER = ["S24_LE", "S32_LE", "S16_LE"]
@@ -409,6 +423,7 @@ def describe(hw, w):
         "speaker_headroom": t["speaker_headroom"],
         "sense_headroom": SENSE_HEADROOM if s else 0,
         "sense_batch": t["sense_batch"],
+        "speaker_irq": t["speaker_irq"],
     }
 
 
