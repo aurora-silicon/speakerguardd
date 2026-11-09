@@ -486,6 +486,49 @@ class CheckKeepsTheInterface(unittest.TestCase):
         self.assertEqual(called, [])
 
 
+class RunRechecksTheLiveState(unittest.TestCase):
+    """'run' on a Mac switched on record says "nothing to do" only while v2
+    really holds the speakers in this boot (or at boot, where v2's own unit
+    starts it); otherwise it switches again instead of leaving the speakers
+    at the floor."""
+
+    def setUp(self):
+        import types
+        from aurora_speaker_upgrade import upgrade as up
+        self.up, self.types = up, types
+
+    def run_with(self, at_boot, owns):
+        import json, contextlib, io
+        from unittest import mock
+        up, types = self.up, self.types
+        manifest = {"unit_id": "U1", "aid": "AID9", "macos_build": "25C56"}
+        store = types.SimpleNamespace(state=lambda: {"switched": True, "route": 0}, interface="/x/interface",
+                                      read_bundle=lambda: {up.audio_tuning.MANIFEST: json.dumps(manifest)})
+        acquired = []
+        with mock.patch.object(up, "Store", return_value=store), \
+                mock.patch.object(up.collect, "Identity", return_value=types.SimpleNamespace(unit="U1", matches_dt=lambda: True)), \
+                mock.patch.object(up, "interface_mode", return_value=("dual", "AppleJ316")), \
+                mock.patch.object(up, "read_text", return_value="v2\n"), \
+                mock.patch.object(up, "v2_owns_speakers", return_value=owns), \
+                mock.patch.object(up, "acquire", side_effect=lambda *x: acquired.append(1) or (_ for _ in ()).throw(up.Retry("stop here"))):
+            a = types.SimpleNamespace(store="/x", adt=None, at_boot=at_boot)
+            with contextlib.redirect_stderr(io.StringIO()):
+                try:
+                    rc = up._cmd_run(a)
+                except up.Retry:
+                    rc = "switching"
+        return rc, acquired
+
+    def test_nothing_to_do_while_v2_holds_them(self):
+        self.assertEqual(self.run_with(False, True), (self.up.EXIT_OK, []))
+
+    def test_switches_again_when_v2_does_not_hold_them(self):
+        self.assertEqual(self.run_with(False, False), ("switching", [1]))
+
+    def test_at_boot_trusts_the_record(self):
+        self.assertEqual(self.run_with(True, False), (self.up.EXIT_OK, []))
+
+
 if __name__ == "__main__":
     unittest.main()
 

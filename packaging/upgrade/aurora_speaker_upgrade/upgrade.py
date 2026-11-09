@@ -729,10 +729,17 @@ def _cmd_run(a):
     have = store.read_bundle()
     m = json.loads(have[audio_tuning.MANIFEST]) if have else {}
     if state.get("switched") and have and m.get("unit_id") == identity.unit:
-        if mode != "dual" or read_text(store.interface) == "v2\n":
+        if (mode != "dual" or read_text(store.interface) == "v2\n") \
+                and (getattr(a, "at_boot", False) or v2_owns_speakers(mode, card)):
             say(f"nothing to do: speakerguardd v2 owns the speakers with {m.get('aid')} from macOS "
                 f"{m.get('macos_build')} (route {state.get('route')})")
             return EXIT_OK
+        if not getattr(a, "at_boot", False):
+            # Switched on record, but v2 does not hold the speakers in this
+            # boot (for example speakerguardd-v2 was reinstalled or updated
+            # since the boot, so its provisioning is gone until it runs
+            # again): switch again instead of leaving them at the floor.
+            say("switched on record, but speakerguardd v2 does not hold the speakers in this boot: switching again")
     b, prov = acquire(identity, a)
     store.ensure()
     if not have or digest(have) != digest(b):
@@ -830,6 +837,14 @@ def cmd_run(a):
         with contextlib.suppress(FileNotFoundError):
             os.unlink(record)
     return code
+
+
+def v2_owns_speakers(mode, card):
+    """In this boot: the v2 supervisor runs and, on a dual kernel, the
+    kernel's interface is v2's (the speakers are not left at the floor)."""
+    if systemctl("is-active", "-q", v2_unit()).returncode != 0:
+        return False
+    return mode != "dual" or interface_get(card) == IF_V2
 
 
 def back_to_legacy(store, state, mode, card):
