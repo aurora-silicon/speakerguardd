@@ -234,7 +234,7 @@ pub enum Kind {
     Vareq(alloc::boxed::Box<super::vareq::Params>),
     /// Loudness normalizer (`ldnm`).
     Norm(alloc::boxed::Box<super::norm::Params>),
-    /// Volume taper (`volt`), custom-curve non-ramping subset; its slider
+    /// Volume taper (`volt`), custom curve, with the unit's run-time ramp; its slider
     /// (parameter 4) follows the system-volume scalar.
     Volt(alloc::boxed::Box<super::volt::Params>),
     /// Channel matrix (`pchr`).
@@ -785,6 +785,8 @@ impl Run {
                 }
             }
             // the volume taper's slider; a non-finite value is its quiet end
+            // the volume taper's mute (graph mmut)
+            Run::Volt(r) if id == 0 => r.set_mute(v != 0.0),
             Run::Volt(r) if id == 4 => {
                 r.prime_volume(v);
             }
