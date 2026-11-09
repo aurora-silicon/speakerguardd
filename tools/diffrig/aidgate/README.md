@@ -83,6 +83,36 @@ driver, never more. Louder cells stay failures at any level because extra energy
 protection must never pass. The rule does not replace exact parity: matching the units'
 Float32 arithmetic remains the goal, and the gate still prints every floor-residue cell.
 
+### Arithmetic-chaotic cells
+
+Some cells measure macOS's own Float32 arithmetic rather than the program: the woofer lanes of a
+high tone, the residue a 20 Hz high pass leaves of a 20 Hz tone, a crossover's stop band right
+after a loud step. There the units' low-corner, high-order Float32 filters amplify any one-bit
+difference in their input into a different rounding pattern, so macOS does not even agree with
+itself. Measured 2026-11-09 on 25G83: VirtualBass fed v2's Norm output, which differs from
+macOS's by 3.6e-7, lands 72 dB under its output instead of 103 dB, and the analytical crossover's
+stop band after the 2 kHz step-down misses an exact convolution with its own impulse response by
++-0.03 dB.
+
+So the gate measures that spread on macOS itself:
+
+1. `attest.py spread` compares every reference with renders of the same tuning from four or more
+   copies of the program in which every nonzero sample moved by one Float32 ULP (seeded; zeros
+   stay zero). A cell's spread is the largest |dB| of any of its measurements over those renders.
+2. A measurement is held to that spread instead of the ordinary tolerance (louder included) only
+   if the spread is larger, its macOS level is below -60 dBFS absolute and it sits more than
+   40 dB under its lane's own peak. A main-band measurement keeps the ordinary tolerance whatever
+   the spread, so a main-band cell louder than macOS still fails.
+3. `spread-25G83.json` (this directory) holds tuning keys, cell names and spread values only: no
+   Apple data. `parity.json` records the spread file's SHA-256 next to the tolerance. Regenerate
+   both for every macOS release, from the same references (`attest_refs.sh` once per perturbed
+   program: `GATE`-side `perturb.py`).
+
+`gate.py --spread spread-25G83.json` applies the same rule per AID at 0.05 dB; it prints the held
+cells (`chaotic_held`) separately and counts a measurement outside macOS's spread as over the gate.
+Exact parity stays the goal: the floor and spread rules only stop the gate from demanding more
+agreement than macOS has with itself.
+
 ### When it runs
 
 Run all three steps, in full, whenever:
@@ -94,6 +124,8 @@ Run all three steps, in full, whenever:
 2. **the rendering code changes** (the law changes; the macOS renders from step 2 can be reused while
    the release is unchanged);
 3. **the gate program or the tolerance changes.**
+
+Each run regenerates the spread file too (step 3 in `attest.py`), before the gate step.
 
 ```text
 # buildbox

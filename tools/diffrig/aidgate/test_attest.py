@@ -51,7 +51,8 @@ class Verdicts(unittest.TestCase):
         deep = peak * 10 ** (-64 / 20)      # 64 dB under the lane's peak
         edge = peak * 10 ** (-55 / 20)      # exactly at the edge: still main band
         main = peak * 10 ** (-40 / 20)
-        ok = {"seg": "pink_-30", "lane": 0, "louder": 0.01, "quieter": -0.01, "floor_quieter": None}
+        ok = {"seg": "pink_-30", "lane": 0, "louder": 0.01, "quieter": -0.01, "floor_quieter": None,
+              "chaotic": None}
         # quieter than macOS deep under the lane's peak: reported, not refused
         v = attest.verdict([ok, attest.cell("tone_16000_0", 2, [(-4.84, deep)], peak)])
         self.assertEqual(v["verdict"], "pass", v)
@@ -69,6 +70,36 @@ class Verdicts(unittest.TestCase):
         c = attest.cell("burst_1000", 1, [(-3.0, deep), (0.4, main)], peak)
         self.assertEqual((c["louder"], c["quieter"], c["floor_quieter"]), (0.4, 0.4, -3.0))
         self.assertEqual(attest.verdict([ok, c])["verdict"], "refused")
+
+    def test_arithmetic_chaotic_cells(self):
+        # (delta dB, macOS RMS) on a lane whose own peak is -26 dBFS; synthetic numbers only
+        peak = 0.05
+        deep = 10 ** (-70 / 20)            # -70 dBFS, 44 dB under the peak (not floor residue)
+        shallow = 10 ** (-50 / 20)         # -50 dBFS: above the -60 dBFS ceiling
+        near = 10 ** (-61 / 20)            # under -60 dBFS but only 35 dB under the peak
+        ok = {"seg": "pink_-30", "lane": 0, "louder": 0.01, "quieter": -0.01, "floor_quieter": None,
+              "chaotic": None}
+        # louder by 0.30 dB in a deep cell where macOS itself moves by 0.40 dB: held, passes
+        c = attest.cell("tone_20_-12", 0, [(0.30, deep)], peak, 0.40)
+        v = attest.verdict([ok, c])
+        self.assertEqual(v["verdict"], "pass", v)
+        self.assertEqual(v["chaotic_cells"], 1)
+        self.assertIn("macOS's own", v["reason"])
+        # outside macOS's own spread: refused, louder or quieter
+        for db in (0.45, -1.50):
+            v = attest.verdict([ok, attest.cell("tone_20_-12", 0, [(db, deep)], peak, 0.40)])
+            self.assertEqual(v["verdict"], "refused", (db, v))
+        # the ceiling: main-band measurements keep the ordinary tolerance whatever the spread
+        for lv in (shallow, near):
+            v = attest.verdict([ok, attest.cell("tone_20_-12", 0, [(0.30, lv)], peak, 0.40)])
+            self.assertEqual(v["verdict"], "refused", (lv, v))
+        # no measured spread: ordinary rule
+        v = attest.verdict([ok, attest.cell("tone_20_-12", 0, [(0.30, deep)], peak, None)])
+        self.assertEqual(v["verdict"], "refused", v)
+        # a spread under the tolerance changes nothing
+        v = attest.verdict([ok, attest.cell("tone_20_-12", 0, [(0.20, deep)], peak, 0.10)])
+        self.assertEqual(v["verdict"], "pass", v)
+        self.assertNotIn("chaotic_cells", v)
 
     def test_nothing_measured_is_refused(self):
         self.assertEqual(attest.verdict([])["verdict"], "refused")

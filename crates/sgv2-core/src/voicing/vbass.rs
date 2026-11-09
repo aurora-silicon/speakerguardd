@@ -34,12 +34,31 @@
 //!   previous selected-rate frame, driven by that frame's input level, while
 //!   the output follower's restore uses the current input level (one frame
 //!   ahead of the device). The branch's total delay is unchanged.
-//! - The filter objects store Float32 coefficients and use the platform
-//!   multichannel-biquad arithmetic described in [`crate::vdsp`]. The
-//!   full-rate mono crossover low pass is the material render-quantum-
-//!   dependent object and is run here as one platform call per render. The
-//!   other established paths remain unchanged until their independently
-//!   generated SOS words pass the whole-graph gate.
+//! - Every filter is one platform single-precision multichannel-biquad
+//!   object ([`crate::vdsp`]) holding Float32 section words, called once per
+//!   render call over the call's frames: the stereo crossover high pass, the
+//!   stereo band-edge all-passes, the mono crossover low pass, and at the
+//!   selected rate the blend all-passes, the harmonic band (lower edge twice,
+//!   then the first upper half) and the second upper half, then the mono
+//!   reconstruction low pass. The selected-rate objects run once per call over
+//!   that call's selected frames (the decimation phase carries across calls).
+//! - Section words come from the unit's own Float32 Butterworth construction
+//!   ([`butter_words`]): the corner is limited to 0.45 of the rate, the
+//!   angular frequency is rounded once, its sine and cosine are rounded, and
+//!   every pole and numerator word is formed in Float32 from those; a
+//!   first-order section uses the rounded cotangent of half the angle. The
+//!   numerators are derived from the rounded poles, so no ULP adjustment is
+//!   needed anywhere.
+//! - Odd sections carry their own delay and polarity: an odd all-pass is the
+//!   one-frame-delayed form, the mono low pass embeds the mid average and the
+//!   crossover polarity (`+-1/channels` on its second half's first section),
+//!   the harmonic band's odd lower edge is delayed and inverted, the second
+//!   upper half's odd section delayed. The blend gain scales the blend
+//!   all-pass's first numerator; the harmonic gain sits between the two upper
+//!   halves. Zero insertion keeps the selected samples as they are; the
+//!   reconstruction low pass carries the stride's gain in its first section.
+//! - The upper band corner's internal word is the Float32 value just above
+//!   the saved one (the saved-state import rounds it up).
 //! - The high-pass path runs independently on every L/R channel. In M/S
 //!   terms both `HP(M)` and `HP(S)` survive; only the reconstructed low and
 //!   harmonic branches are mono and added equally to every channel.
@@ -49,27 +68,11 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-/// One designed biquad. The platform filter rounds these coefficients and
-/// keeps the run-time state in Float32.
+/// One designed biquad (double): the reconstruction design and tests.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct Bq {
     b: [f64; 3],
     a: [f64; 2],
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct BqState {
-    z: [f64; 2],
-}
-
-impl Bq {
-    #[inline]
-    fn run(&self, s: &mut BqState, x: f64) -> f64 {
-        let y = self.b[0] * x + s.z[0];
-        s.z[0] = self.b[1] * x - self.a[0] * y + s.z[1];
-        s.z[1] = self.b[2] * x - self.a[1] * y;
-        y
-    }
 }
 
 /// A maximum-order high pass has ten Linkwitz-Riley sections followed by two
@@ -82,11 +85,6 @@ struct Cascade {
     s: [Bq; MAX_SECTIONS],
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-struct CascadeState {
-    z: [BqState; MAX_SECTIONS],
-}
-
 impl Cascade {
     fn push(&mut self, q: Bq) {
         if self.n < MAX_SECTIONS {
@@ -94,47 +92,71 @@ impl Cascade {
             self.n += 1;
         }
     }
-    fn extend(&mut self, other: &Cascade) {
-        for q in &other.s[..other.n] {
-            self.push(*q);
-        }
-    }
-    fn platform_lowpass(&self) -> crate::vdsp::Cascade {
-        let mut sections = [[0.0; 5]; MAX_SECTIONS];
-        for (dst, q) in sections.iter_mut().zip(&self.s[..self.n]) {
-            let a1 = q.a[0] as f32;
-            let mut a2 = q.a[1] as f32;
-            if a2 > 0.0 {
-                // The platform object's stored positive quadratic pole is
-                // the next Float32 value after the scalar bilinear result.
-                // This is observable before the cancellation-sensitive DC
-                // numerator is formed below.
-                a2 = f32::from_bits(a2.to_bits() + 1);
+}
+
+/// One stored section: `[b0, b1, b2, a1, a2]` as the object keeps it.
+type Words = [f32; 5];
+
+/// The unit's Float32 Butterworth sections of order `n` at `fc` for a
+/// filter object at rate `fs` (both as the box keeps them, Float32), in
+/// pole-pair order with the first-order section last for odd `n`.
+fn butter_words(n: usize, fc: f32, fs: f32, kind: Kind, out: &mut Vec<Words>) {
+    let f = fc.min((fs * 0.5) * 0.9);
+    let w = (f64::from(f) * (2.0 * core::f64::consts::PI) / f64::from(fs)) as f32;
+    let s = libm::sin(f64::from(w)) as f32;
+    let c = libm::cos(f64::from(w)) as f32;
+    for i in 1..=n / 2 {
+        let t = libm::sin((2 * i - 1) as f64 * core::f64::consts::PI / (2 * n) as f64) as f32;
+        let p = t * s;
+        let a2 = (1.0 - p) / (1.0 + p);
+        let u = 1.0 + a2;
+        let uc = u * c;
+        let a1 = -uc;
+        out.push(match kind {
+            Kind::Low => {
+                let g = (u - uc) * 0.25;
+                [g, g + g, g, a1, a2]
             }
-            let g = if q.b[2] == 0.0 {
-                (1.0 + a1) * 0.5
-            } else {
-                // The saved Float32 SOS forms the DC numerator from its
-                // already-rounded denominator. This association is visible
-                // at very low corners: adding a2 to one before a1 preserves
-                // the same cancellation bits as the platform object.
-                ((1.0 + a2) + a1) * 0.25
-            };
-            *dst = if q.b[2] == 0.0 {
-                [f64::from(g), f64::from(g), 0.0, f64::from(a1), f64::from(a2)]
-            } else {
-                [f64::from(g), f64::from(2.0 * g), f64::from(g), f64::from(a1), f64::from(a2)]
-            };
-        }
-        crate::vdsp::Cascade::new(&sections[..self.n], false)
+            Kind::High => {
+                let g = ((1.0 - a1) + a2) * 0.25;
+                [g, -(g + g), g, a1, a2]
+            }
+            Kind::AllPass => [a2, a1, 1.0, a1, a2],
+        });
     }
-    #[inline]
-    fn run(&self, st: &mut CascadeState, mut x: f64) -> f64 {
-        for i in 0..self.n {
-            x = self.s[i].run(&mut st.z[i], x);
-        }
-        x
+    if n % 2 == 1 {
+        let q = (1.0 / libm::tan(f64::from(w) * 0.5)) as f32;
+        let a1 = (1.0 - q) / (1.0 + q);
+        out.push(match kind {
+            Kind::Low => {
+                let g = 1.0 / (2.0 / (1.0 + a1));
+                [g, g, 0.0, a1, 0.0]
+            }
+            Kind::High => {
+                let g = (1.0 - a1) * 0.5;
+                [g, -g, 0.0, a1, 0.0]
+            }
+            // the one-frame-delayed first-order all-pass
+            Kind::AllPass => [0.0, a1, 1.0, a1, 0.0],
+        });
     }
+}
+
+/// Scales a stored section's numerator (each word rounded on its own).
+fn scale_numerator(q: &mut Words, k: f32) {
+    for b in &mut q[..3] {
+        *b *= k;
+    }
+}
+
+/// A platform object from stored words.
+fn object(words: &[Words], multichannel: bool) -> crate::vdsp::Cascade {
+    let mut c = [[0.0f64; 5]; crate::vdsp::MAX_SECTIONS];
+    let n = words.len().min(c.len());
+    for (dst, w) in c.iter_mut().zip(&words[..n]) {
+        *dst = w.map(f64::from);
+    }
+    crate::vdsp::Cascade::new(&c[..n], multichannel)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -142,55 +164,6 @@ enum Kind {
     Low,
     High,
     AllPass,
-}
-
-/// Butterworth of order `n` at `fc` by the bilinear transform with the
-/// corner pre-warped, as second-order sections (one first-order section
-/// for odd `n`). `AllPass` is the all-pass with the same poles.
-fn butterworth(n: usize, fc: f64, fs: f64, kind: Kind) -> Cascade {
-    let mut c = Cascade::default();
-    let k = libm::tan(core::f64::consts::PI * fc / fs);
-    let pairs = n / 2;
-    for i in 0..pairs {
-        // analogue pole pair angle; q = 1 / (2 cos θ)
-        let theta = core::f64::consts::PI * (2 * i + 1) as f64 / (2 * n) as f64;
-        let two_zeta = 2.0 * libm::sin(theta);
-        let a0 = 1.0 + two_zeta * k + k * k;
-        let a1 = 2.0 * (k * k - 1.0) / a0;
-        let a2 = (1.0 - two_zeta * k + k * k) / a0;
-        let b = match kind {
-            Kind::Low => {
-                let g = k * k / a0;
-                [g, 2.0 * g, g]
-            }
-            Kind::High => {
-                let g = 1.0 / a0;
-                [g, -2.0 * g, g]
-            }
-            Kind::AllPass => [a2, a1, 1.0],
-        };
-        c.push(Bq { b, a: [a1, a2] });
-    }
-    if n % 2 == 1 {
-        let a0 = 1.0 + k;
-        let a1 = (k - 1.0) / a0;
-        let b = match kind {
-            Kind::Low => [k / a0, k / a0, 0.0],
-            Kind::High => [1.0 / a0, -1.0 / a0, 0.0],
-            Kind::AllPass => [a1, 1.0, 0.0],
-        };
-        c.push(Bq { b, a: [a1, 0.0] });
-    }
-    c
-}
-
-/// Linkwitz-Riley of even order `order`: the Butterworth of half the order,
-/// twice.
-fn linkwitz_riley(order: usize, fc: f64, fs: f64, kind: Kind) -> Cascade {
-    let half = butterworth(order / 2, fc, fs, kind);
-    let mut c = half.clone();
-    c.extend(&half);
-    c
 }
 
 /// Minimal complex arithmetic for the elliptic design (setup only).
@@ -363,6 +336,8 @@ pub mod law {
     /// SPEC-vben §1 (floor, clip).
     pub const LC_FLOOR: f64 = 0.05;
     pub const LC_CLIP: f64 = 1.2;
+    /// Upper clip of both level-control followers' outputs.
+    pub const LC_CEILING: f64 = 1000.0;
     /// Follower: attack and release one-poles, a hold that restarts while
     /// the input stays within `LC_HOLD_RATIO` of the level, and a smoothing
     /// one-pole that follows a rising level at the attack rate.
@@ -400,10 +375,6 @@ pub mod law {
     pub const RECON_EDGE_HZ: f64 = 2_000.0;
 }
 
-/// Selected-rate delay line (sub-rate frames): at most two odd sections.
-const SUB_LINE: usize = 3;
-/// Output delay line length (frames): at most two odd sections.
-const OUT_LINE: usize = 3;
 /// Largest stream-to-selected rate ratio carried.
 const STRIDE_MAX: usize = 24;
 
@@ -523,6 +494,9 @@ struct Follower {
     a_att: f32,
     a_rel: f32,
     a_smo: f32,
+    /// The level control's stores update with separate Float32 multiplies
+    /// and adds; the harmonic compressor's detector keeps its fused update.
+    fused: bool,
 }
 
 impl Follower {
@@ -533,6 +507,7 @@ impl Follower {
             Follower::with_times(fs, ratio, law::LC_ATTACK_S, law::LC_RELEASE_S, law::LC_HOLD_S, law::LC_SMOOTH_S);
         f.e = law::LC_SEED as f32;
         f.s = law::LC_SEED as f32;
+        f.fused = false;
         f
     }
 
@@ -549,6 +524,7 @@ impl Follower {
             a_att: pole(attack_s),
             a_rel: pole(release_s),
             a_smo: pole(smooth_s),
+            fused: true,
         }
     }
     #[inline]
@@ -574,12 +550,14 @@ impl Follower {
         } else {
             (self.a_rel, self.a_smo)
         };
-        // The retained stores and both associations are Float32.  Keep the
-        // follower's multiply-add boundary explicit: a long program history
-        // can otherwise move the first post-step windows by a measurable
-        // fraction of a decibel even though steady segments agree.
-        self.e = libm::fmaf(a, self.e, (1.0 - a) * u);
-        self.s = libm::fmaf(b, self.s, (1.0 - b) * self.e);
+        // The retained stores and both associations are Float32.
+        if self.fused {
+            self.e = libm::fmaf(a, self.e, (1.0 - a) * u);
+            self.s = libm::fmaf(b, self.s, (1.0 - b) * self.e);
+        } else {
+            self.e = a * self.e + (1.0 - a) * u;
+            self.s = b * self.s + (1.0 - b) * self.e;
+        }
         self.s as f64
     }
 }
@@ -643,139 +621,148 @@ pub struct Run {
     p: Params,
     fs: f64,
     channels: usize,
-    /// Per channel at the stream rate: high pass then both all-passes.
-    hp: Cascade,
-    hp_st: Vec<CascadeState>,
-    /// Crossover low pass of the mid, at the stream rate. The established
-    /// scalar path remains available for geometries whose stored-SOS
-    /// construction is not yet exact.
-    lp: Cascade,
-    lp_st: CascadeState,
-    lp_platform: Option<crate::vdsp::Cascade>,
-    /// Selected rate: both band-edge all-passes (blend), the band's lower
-    /// edge with the first half of its upper edge, then the second half.
-    ap: Cascade,
-    ap_st: CascadeState,
-    band_hp: Cascade,
-    band_hp_st: CascadeState,
-    band_lp: Cascade,
-    band_lp_st: CascadeState,
-    /// Polarities: blend inverted for an odd-order crossover; harmonics
-    /// inverted when the crossover and the band's lower edge differ in
-    /// Butterworth-order parity.
-    lp_sign: f64,
-    harm_sign: f64,
+    /// Stream rate, every channel: the crossover high pass, then the lower
+    /// and upper band-edge all-passes.
+    hp: Vec<crate::vdsp::Cascade>,
+    ap: Vec<crate::vdsp::Cascade>,
+    /// Stream rate, mono: the crossover low pass of the channel sum.
+    lp: crate::vdsp::Cascade,
+    /// Selected rate, mono: blend all-passes, harmonic band, second upper half.
+    blend: crate::vdsp::Cascade,
+    band: crate::vdsp::Cascade,
+    upper: crate::vdsp::Cascade,
+    /// Stream rate, mono: reconstruction low pass.
+    recon: crate::vdsp::Cascade,
     lc: LevelControl,
     /// Selected-rate frames the device runs behind the input follower
     /// (1 with the level control on and an odd lower band edge, else 0).
     lead: usize,
-    /// The previous frame's device input and its input level, and the blend
-    /// branch held back by `lead` frames to stay aligned with the harmonics.
+    /// The previous frame's device input and its input level.
     prev_lo: f64,
     prev_p_in: f64,
-    prev_low: f64,
     compressor: HarmonicCompressor,
     stride: usize,
-    /// Selected-rate delay: one sub-rate frame per odd band-edge section.
-    sline: [f64; SUB_LINE],
-    spos: usize,
-    sdelay: usize,
-    /// Position in the selected-rate grid (carried across blocks).
+    /// Position in the selected-rate grid (carried across calls).
     phase: usize,
-    /// Reconstruction low pass (stream rate).
-    recon: Cascade,
-    recon_st: CascadeState,
-    /// Full-rate mono work buffer. Storage is made with the graph and reused
-    /// by real-time processing.
-    mono: Vec<f32>,
-    /// High-pass path delay, `latency` frames per channel (the mid
-    /// branches carry theirs at the selected rate).
     latency: usize,
-    oline: Vec<[f64; OUT_LINE]>,
-    opos: usize,
+    /// Storage made with the graph and reused by real-time processing.
+    work: Vec<Vec<f32>>,
+    mono: Vec<f32>,
+    picked: Vec<f32>,
+    at: Vec<usize>,
+    low: Vec<f32>,
+    harm: Vec<f32>,
+    p_in: Vec<f64>,
 }
 
 impl Run {
     pub fn new(p: &Params, fs: f64, channels: usize, max_frames: usize) -> Run {
+        Self::build(p, fs, channels, max_frames, None)
+    }
+
+    /// `lead`: test hook forcing the level-control lead off.
+    fn build(p: &Params, fs: f64, channels: usize, max_frames: usize, lead: Option<usize>) -> Run {
         let stride = sub_stride(fs).unwrap_or(1);
-        let fs8 = fs / stride as f64;
+        let (fs32, fs8) = (fs as f32, (fs / stride as f64) as f32);
         let (nh, nu, nl) = (p.hp_order / 2, p.upper_order / 2, p.lower_order / 2);
-        let mut ap48 = butterworth(nu, p.fu_hz, fs, Kind::AllPass);
-        ap48.extend(&butterworth(nl, p.fc_hz, fs, Kind::AllPass));
-        let mut hp = linkwitz_riley(p.hp_order, p.fc_hz, fs, Kind::High);
-        hp.extend(&ap48);
-        let lp_design = linkwitz_riley(p.hp_order, p.fc_hz, fs, Kind::Low);
-        let mut ap = butterworth(nu, p.fu_hz, fs8, Kind::AllPass);
-        ap.extend(&butterworth(nl, p.fc_hz, fs8, Kind::AllPass));
-        let mut band_hp = linkwitz_riley(p.lower_order, p.fc_hz, fs8, Kind::High);
-        band_hp.extend(&butterworth(nu, p.fu_hz, fs8, Kind::Low));
-        let band_lp = butterworth(nu, p.fu_hz, fs8, Kind::Low);
-        let latency = nu % 2 + nl % 2;
-        let lead = if p.level_control { nl % 2 } else { 0 };
+        let fc = p.fc_hz as f32;
+        let fu = f32::from_bits((p.fu_hz as f32).to_bits() + 1);
+        let channels = channels.max(1);
+        let lead = lead.unwrap_or(if p.level_control { nl % 2 } else { 0 });
+        let multi = channels >= 2;
+
+        let mut hp = Vec::new();
+        butter_words(nh, fc, fs32, Kind::High, &mut hp);
+        let half = hp.clone();
+        hp.extend_from_slice(&half);
+        let mut ap = Vec::new();
+        butter_words(nl, fc, fs32, Kind::AllPass, &mut ap);
+        butter_words(nu, fu, fs32, Kind::AllPass, &mut ap);
+
+        let mut lp = Vec::new();
+        butter_words(nh, fc, fs32, Kind::Low, &mut lp);
+        let k = lp.len();
+        let half = lp.clone();
+        lp.extend_from_slice(&half);
+        let avg = 1.0 / channels as f32;
+        scale_numerator(&mut lp[k], if nh % 2 == 1 { -avg } else { avg });
+
+        let mut blend = Vec::new();
+        butter_words(nl, fc, fs8, Kind::AllPass, &mut blend);
+        butter_words(nu, fu, fs8, Kind::AllPass, &mut blend);
+        scale_numerator(&mut blend[0], p.blend_gain as f32);
+
+        let mut band = Vec::new();
+        butter_words(nl, fc, fs8, Kind::High, &mut band);
+        let half = band.clone();
+        band.extend_from_slice(&half);
+        if nl % 2 == 1 {
+            // The odd lower edge's frame of delay and its polarity; with the
+            // lead that frame sits in front of the device instead.
+            let last = band.len() - 1;
+            let g = band[last][0];
+            band[last][..3].copy_from_slice(&if lead > 0 { [-g, g, 0.0] } else { [0.0, -g, g] });
+        }
+        butter_words(nu, fu, fs8, Kind::Low, &mut band);
+        let mut upper = Vec::new();
+        butter_words(nu, fu, fs8, Kind::Low, &mut upper);
+        if nu % 2 == 1 {
+            let last = upper.len() - 1;
+            let g = upper[last][0];
+            upper[last][..3].copy_from_slice(&[0.0, g, g]);
+        }
+
+        let rd = elliptic(law::RECON_ORDER, law::RECON_RIPPLE_DB, law::RECON_STOP_DB, law::RECON_EDGE_HZ, fs);
+        let mut recon: Vec<Words> =
+            rd.s[..rd.n].iter().map(|q| [q.b[0], q.b[1], q.b[2], q.a[0], q.a[1]].map(|v| v as f32)).collect();
+        if let Some(first) = recon.first_mut() {
+            scale_numerator(first, stride as f32);
+        }
+
         let max_frames = max_frames.max(1);
-        let platform_lp = p.hp_order == 8 && p.upper_order == 4 && p.lower_order == 6 && !p.level_control;
+        let sel = max_frames.div_ceil(stride) + 1;
         Run {
             p: p.clone(),
             fs,
             channels,
-            hp,
-            hp_st: vec![CascadeState::default(); channels],
-            lp: lp_design.clone(),
-            lp_st: CascadeState::default(),
-            lp_platform: platform_lp.then(|| lp_design.platform_lowpass()),
-            ap,
-            ap_st: CascadeState::default(),
-            band_hp,
-            band_hp_st: CascadeState::default(),
-            band_lp,
-            band_lp_st: CascadeState::default(),
-            lp_sign: if nh % 2 == 1 { -1.0 } else { 1.0 },
-            harm_sign: if nh % 2 == nl % 2 { 1.0 } else { -1.0 },
-            lc: LevelControl::new(fs8),
+            hp: (0..channels).map(|_| object(&hp, multi)).collect(),
+            ap: (0..channels).map(|_| object(&ap, multi)).collect(),
+            lp: object(&lp, false),
+            blend: object(&blend, false),
+            band: object(&band, false),
+            upper: object(&upper, false),
+            recon: object(&recon, false),
+            lc: LevelControl::new(f64::from(fs8)),
             lead,
             prev_lo: 0.0,
             prev_p_in: 0.0,
-            prev_low: 0.0,
-            compressor: HarmonicCompressor::new(fs8, p.compressor_threshold_db, p.compressor_ratio),
+            compressor: HarmonicCompressor::new(f64::from(fs8), p.compressor_threshold_db, p.compressor_ratio),
             stride,
-            sline: [0.0; SUB_LINE],
-            spos: 0,
-            sdelay: latency - lead,
             phase: 0,
-            recon: elliptic(law::RECON_ORDER, law::RECON_RIPPLE_DB, law::RECON_STOP_DB, law::RECON_EDGE_HZ, fs),
-            recon_st: CascadeState::default(),
+            latency: nu % 2 + nl % 2,
+            work: vec![vec![0.0; max_frames]; channels],
             mono: vec![0.0; max_frames],
-            latency,
-            oline: vec![[0.0; OUT_LINE]; channels],
-            opos: 0,
+            picked: vec![0.0; sel],
+            at: vec![0; sel],
+            low: vec![0.0; sel],
+            harm: vec![0.0; sel],
+            p_in: vec![0.0; sel],
         }
     }
 
     pub fn reset(&mut self) {
-        for s in &mut self.hp_st {
-            *s = CascadeState::default();
+        for o in self.hp.iter_mut().chain(self.ap.iter_mut()) {
+            o.reset();
         }
-        self.lp_st = CascadeState::default();
-        if let Some(lp) = &mut self.lp_platform {
-            lp.reset();
+        for o in [&mut self.lp, &mut self.blend, &mut self.band, &mut self.upper, &mut self.recon] {
+            o.reset();
         }
-        self.ap_st = CascadeState::default();
-        self.band_hp_st = CascadeState::default();
-        self.band_lp_st = CascadeState::default();
-        self.lc = LevelControl::new(self.fs / self.stride as f64);
+        let fs8 = self.fs / self.stride as f64;
+        self.lc = LevelControl::new(fs8);
         self.prev_lo = 0.0;
         self.prev_p_in = 0.0;
-        self.prev_low = 0.0;
-        self.compressor = HarmonicCompressor::new(
-            self.fs / self.stride as f64,
-            self.p.compressor_threshold_db,
-            self.p.compressor_ratio,
-        );
-        self.sline = [0.0; SUB_LINE];
+        self.compressor = HarmonicCompressor::new(fs8, self.p.compressor_threshold_db, self.p.compressor_ratio);
         self.phase = 0;
-        self.recon_st = CascadeState::default();
-        self.mono.fill(0.0);
-        self.oline.fill([0.0; OUT_LINE]);
     }
 
     pub fn latency(&self) -> usize {
@@ -800,63 +787,75 @@ impl Run {
     /// Installed crossover-low-pass coefficient words for parity probes.
     #[doc(hidden)]
     pub fn crossover_lowpass_bits(&self, out: &mut [[u32; 5]]) -> usize {
-        self.lp_platform.as_ref().map_or(0, |lp| lp.coefficient_bits(out))
+        self.lp.coefficient_bits(out)
     }
 
+    /// The saturating device in its Float32 vector form.
     #[inline]
-    fn device(&self, u: f64) -> f64 {
+    fn device(&self, u: f32) -> f32 {
         match self.p.device {
-            Device::Saturator3 => law::DEVICE3_AMP * libm::tanh(law::DEVICE3_SLOPE * u),
+            Device::Saturator3 => law::DEVICE3_AMP as f32 * libm::tanhf(law::DEVICE3_SLOPE as f32 * u),
         }
     }
 
+    /// Both mid branches over one call's selected frames (`n` of them, in
+    /// `picked`); leaves their sum in `low`.
+    /// A level follower's output as the branch reads it.
     #[inline]
-    fn compress_harmonic(&mut self, x: f64) -> f64 {
-        if !self.p.harmonic_compressor {
-            return x;
-        }
-        self.compressor.run(x)
+    fn level(p: f32) -> f32 {
+        p.clamp(law::LC_FLOOR as f32, law::LC_CEILING as f32)
     }
 
-    /// One selected-rate frame of both mid branches.
-    #[inline]
-    fn sub_frame(&mut self, lo: f64) -> f64 {
-        let mut low = self.lp_sign * self.p.blend_gain * self.ap.run(&mut self.ap_st, lo);
-        if self.lead > 0 {
-            core::mem::swap(&mut low, &mut self.prev_low);
-        }
-        let harm = if self.p.level_control {
-            let p_in = self.lc.input.run(lo);
-            // The device runs `lead` frames behind the input follower, driven
-            // by its own frame's level; the restore below uses the current one.
-            let (x, p_drive) = if self.lead > 0 {
-                let d = (self.prev_lo, self.prev_p_in);
-                self.prev_lo = lo;
-                self.prev_p_in = p_in;
-                d
+    /// Both mid branches over one call's selected frames (`n` of them, in
+    /// `picked`); leaves their sum in `low`. The level-controlled harmonic
+    /// path is Float32 throughout: normalise by the reciprocal of the input
+    /// level, clip, run the device, band-limit, restore by the ratio of the
+    /// input level to the output level, then apply the harmonic gain.
+    fn selected(&mut self, n: usize) {
+        self.low[..n].copy_from_slice(&self.picked[..n]);
+        self.blend.run(&mut self.low[..n]);
+        let clip = law::LC_CLIP as f32;
+        for k in 0..n {
+            let lo = self.picked[k];
+            let x = if self.p.level_control {
+                // the restore takes the input level as measured; the drive and
+                // the output level are clipped to the level range
+                let p_in = self.lc.input.run(f64::from(lo)) as f32;
+                self.p_in[k] = f64::from(p_in);
+                // The device runs `lead` frames behind the input follower, driven
+                // by its own frame's level; the restore uses the current one.
+                let (x, p_drive) = if self.lead > 0 {
+                    let d = (self.prev_lo as f32, self.prev_p_in as f32);
+                    self.prev_lo = f64::from(lo);
+                    self.prev_p_in = f64::from(p_in);
+                    d
+                } else {
+                    (lo, p_in)
+                };
+                (x * (1.0 / Self::level(p_drive))).clamp(-clip, clip)
             } else {
-                (lo, p_in)
+                lo
             };
-            let z = (x / p_drive.max(law::LC_FLOOR)).clamp(-law::LC_CLIP, law::LC_CLIP);
-            let dev = self.device(z);
-            let hp = self.band_hp.run(&mut self.band_hp_st, dev);
-            let p_out = self.lc.output.run(hp);
-            hp * p_in / p_out.max(law::LC_FLOOR)
-        } else {
-            let dev = self.device(lo);
-            self.band_hp.run(&mut self.band_hp_st, dev)
-        };
-        let harmonic_gain = self.p.harmonic_gain;
-        let harm = self.compress_harmonic(harmonic_gain * harm);
-        let harm = self.band_lp.run(&mut self.band_lp_st, harm);
-        let v = low + self.harm_sign * harm;
-        if self.sdelay == 0 {
-            return v;
+            self.harm[k] = self.device(x);
         }
-        self.sline[self.spos] = v;
-        let out = self.sline[(self.spos + SUB_LINE - self.sdelay) % SUB_LINE];
-        self.spos = (self.spos + 1) % SUB_LINE;
-        out
+        self.band.run(&mut self.harm[..n]);
+        let gain = self.p.harmonic_gain as f32;
+        for k in 0..n {
+            let mut h = self.harm[k];
+            if self.p.level_control {
+                let p_out = Self::level(self.lc.output.run(f64::from(h)) as f32);
+                h *= self.p_in[k] as f32 / p_out;
+            }
+            h *= gain;
+            if self.p.harmonic_compressor {
+                h = self.compressor.run(f64::from(h)) as f32;
+            }
+            self.harm[k] = h;
+        }
+        self.upper.run(&mut self.harm[..n]);
+        for k in 0..n {
+            self.low[k] += self.harm[k];
+        }
     }
 
     pub fn process(&mut self, bufs: &mut [&mut [f32]], frames: usize) {
@@ -865,43 +864,42 @@ impl Run {
             return;
         }
         let frames = bufs[..ch].iter().fold(frames.min(self.mono.len()), |n, b| n.min(b.len()));
-        let ig = self.p.input_gain;
-
-        if let Some(lp) = &mut self.lp_platform {
-            for i in 0..frames {
-                let mut mid = 0.0;
-                for b in bufs[..ch].iter() {
-                    let v = b[i] as f64;
-                    mid += if v.is_finite() { v * ig } else { 0.0 };
-                }
-                self.mono[i] = (mid / ch as f64) as f32;
+        let ig = self.p.input_gain as f32;
+        self.mono[..frames].fill(0.0);
+        for (c, b) in bufs[..ch].iter().enumerate() {
+            let w = &mut self.work[c][..frames];
+            for (o, v) in w.iter_mut().zip(b.iter()) {
+                let x = if v.is_finite() { *v } else { 0.0 };
+                *o = if ig == 1.0 { x } else { x * ig };
             }
-            lp.run(&mut self.mono[..frames]);
+            for (m, x) in self.mono[..frames].iter_mut().zip(w.iter()) {
+                *m += *x;
+            }
+            self.hp[c].run(w);
+            self.ap[c].run(w);
         }
+        self.lp.run(&mut self.mono[..frames]);
+        let mut n = 0;
         for i in 0..frames {
-            let lo = if self.lp_platform.is_some() {
-                f64::from(self.mono[i])
-            } else {
-                let mut mid = 0.0;
-                for b in bufs[..ch].iter() {
-                    let v = b[i] as f64;
-                    mid += if v.is_finite() { v * ig } else { 0.0 };
-                }
-                self.lp.run(&mut self.lp_st, mid / ch as f64)
-            };
-            let up = if self.phase == 0 { self.sub_frame(lo) * self.stride as f64 } else { 0.0 };
-            self.phase = (self.phase + 1) % self.stride;
-            let common = self.recon.run(&mut self.recon_st, up);
-            let (l, pos) = (self.latency, self.opos);
-            for (c, b) in bufs[..ch].iter_mut().enumerate() {
-                let v = b[i] as f64;
-                let x = if v.is_finite() { v * ig } else { 0.0 };
-                let line = &mut self.oline[c];
-                line[pos] = self.hp.run(&mut self.hp_st[c], x);
-                let y = (line[(pos + OUT_LINE - l) % OUT_LINE] + common) * self.p.output_gain;
-                b[i] = y as f32;
+            if self.phase == 0 && n < self.picked.len() {
+                self.picked[n] = self.mono[i];
+                self.at[n] = i;
+                n += 1;
             }
-            self.opos = (pos + 1) % OUT_LINE;
+            self.phase = (self.phase + 1) % self.stride;
+        }
+        self.selected(n);
+        self.mono[..frames].fill(0.0);
+        for k in 0..n {
+            self.mono[self.at[k]] = self.low[k];
+        }
+        self.recon.run(&mut self.mono[..frames]);
+        let og = self.p.output_gain as f32;
+        for (c, b) in bufs[..ch].iter_mut().enumerate() {
+            for ((y, h), m) in b[..frames].iter_mut().zip(&self.work[c][..frames]).zip(&self.mono[..frames]) {
+                let v = *h + *m;
+                *y = if og == 1.0 { v } else { v * og };
+            }
         }
     }
 }
@@ -966,19 +964,58 @@ mod tests {
     }
 
     #[test]
-    fn platform_lowpass_is_scoped_by_public_object_geometry() {
-        let plain = Run::new(&params(false), 48_000.0, 2, 512);
-        assert!(plain.lp_platform.is_some());
+    fn float32_butterworth_words_follow_their_rounded_poles() {
+        // Synthetic corners, not any Mac's.
+        for (n, fc, fs) in [(4usize, 100.0f32, 48_000.0f32), (3, 180.0, 8_000.0), (5, 95.0, 48_000.0)] {
+            let mut lp = Vec::new();
+            let mut hp = Vec::new();
+            let mut ap = Vec::new();
+            butter_words(n, fc, fs, Kind::Low, &mut lp);
+            butter_words(n, fc, fs, Kind::High, &mut hp);
+            butter_words(n, fc, fs, Kind::AllPass, &mut ap);
+            assert_eq!((lp.len(), hp.len(), ap.len()), (n.div_ceil(2), n.div_ceil(2), n.div_ceil(2)));
+            for ((l, h), a) in lp.iter().zip(&hp).zip(&ap) {
+                // one shared denominator per pole pair
+                assert_eq!((l[3], l[4]), (h[3], h[4]));
+                assert_eq!((l[3], l[4]), (a[3], a[4]));
+                let dc = f64::from(l[0] + l[1] + l[2]) / f64::from(1.0 + l[3] + l[4]);
+                let ny = f64::from(h[0] - h[1] + h[2]) / f64::from(1.0 - h[3] + h[4]);
+                assert!((dc - 1.0).abs() < 2e-3, "{n} {fc} dc {dc}");
+                assert!((ny - 1.0).abs() < 1e-5, "{n} {fc} nyquist {ny}");
+                if l[4] != 0.0 {
+                    // quadratic: the pole words come from the rounded sine and cosine
+                    // with no adjustment; the all-pass numerator mirrors them
+                    assert_eq!(l[1], l[0] + l[0]);
+                    assert_eq!(*a, [a[4], a[3], 1.0, a[3], a[4]]);
+                } else {
+                    // first order: the delayed all-pass form
+                    assert_eq!(*a, [0.0, a[3], 1.0, a[3], 0.0]);
+                    assert_eq!(l[0], l[1]);
+                }
+            }
+        }
+        // the corner is limited to 0.45 of the object's rate
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        butter_words(2, 3_900.0, 8_000.0, Kind::Low, &mut a);
+        butter_words(2, 3_600.0, 8_000.0, Kind::Low, &mut b);
+        assert_eq!(a, b);
+    }
 
-        let mut controlled = params(true);
-        controlled.upper_order = 6;
-        let controlled = Run::new(&controlled, 48_000.0, 2, 512);
-        assert!(controlled.lp_platform.is_none());
-
-        let mut other = params(true);
-        other.lower_order = 4;
-        let other = Run::new(&other, 48_000.0, 2, 512);
-        assert!(other.lp_platform.is_none());
+    #[test]
+    fn mono_low_pass_embeds_the_average_and_the_crossover_polarity() {
+        for (order, sign) in [(8usize, 1.0f32), (6, -1.0)] {
+            let mut p = params(false);
+            p.hp_order = order;
+            let r = Run::new(&p, 48_000.0, 2, 64);
+            let mut w = [[0u32; 5]; 32];
+            let n = r.crossover_lowpass_bits(&mut w);
+            assert_eq!(n, 2 * (order / 2).div_ceil(2));
+            let half = n / 2;
+            let first = f32::from_bits(w[0][0]);
+            let scaled = f32::from_bits(w[half][0]);
+            assert_eq!(scaled, first * (sign * 0.5));
+            assert_eq!(w[1..half], w[half + 1..n]);
+        }
     }
 
     #[test]
@@ -1037,7 +1074,9 @@ mod tests {
         Run::new(&p, 48_000.0, 1, n).process(&mut [&mut mono], n);
         Run::new(&p, 48_000.0, 2, n).process(&mut [&mut left, &mut right], n);
         let error = mono.iter().zip(&left).map(|(a, b)| (*a - *b).abs()).fold(0.0f32, f32::max);
-        assert!(error < 1e-3, "{error}");
+        // a one-channel object runs the platform's grouped Float32 schedule,
+        // a stereo one steps frame by frame: the same filter, different roundoff
+        assert!(error < 2e-3, "{error}");
         assert_eq!(left, right);
     }
 
@@ -1088,13 +1127,13 @@ mod tests {
     fn odd_lower_edge_moves_one_frame_in_front_of_the_device() {
         // params(): lower order 6 (three sections, odd), upper order 4 (even).
         let lc = Run::new(&params(true), 48_000.0, 2, 1);
-        assert_eq!((lc.latency(), lc.lead, lc.sdelay), (1, 1, 0));
+        assert_eq!((lc.latency(), lc.lead), (1, 1));
         let plain = Run::new(&params(false), 48_000.0, 2, 1);
-        assert_eq!((plain.latency(), plain.lead, plain.sdelay), (1, 0, 1));
+        assert_eq!((plain.latency(), plain.lead), (1, 0));
         let mut p = params(true);
         p.lower_order = 4;
         let even = Run::new(&p, 48_000.0, 2, 1);
-        assert_eq!((even.latency(), even.lead, even.sdelay), (0, 0, 0));
+        assert_eq!((even.latency(), even.lead), (0, 0));
     }
 
     #[test]
@@ -1103,11 +1142,7 @@ mod tests {
         // transient: the steady harmonic and blend output is the same as with
         // the delay after the branch (both are the same LTI delay in steady state).
         let steady = |lead: bool| {
-            let mut r = Run::new(&params(true), 48_000.0, 2, 2 * 48_000);
-            if !lead {
-                r.lead = 0;
-                r.sdelay = r.latency;
-            }
+            let mut r = Run::build(&params(true), 48_000.0, 2, 2 * 48_000, (!lead).then_some(0));
             let n = 2 * 48_000;
             let mut l = tone(60.0, 0.5, n);
             let mut rr = l.clone();
