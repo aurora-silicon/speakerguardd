@@ -87,3 +87,54 @@ fn the_engine_page_reports_the_most_restrictive_gain() {
     let _ = std::fs::remove_file(&path);
     assert_eq!(g, 0.2);
 }
+
+/// j414s review (J414S): LV2 lets a host connect an output to the same
+/// buffer as an input (in place), its own channel's or another's. The stage
+/// muted every output for any such call, a dropout under a host that uses
+/// in-place buffers. Every input is now copied before any output is written:
+/// in place and crossed connections render exactly like distinct buffers.
+#[test]
+fn in_place_and_crossed_ports_render_like_distinct_buffers() {
+    let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::set_var("SGV2_PARAMS", "/nonexistent/sgv2-adversarial");
+    std::env::set_var("SGV2_ENGINE_PAGE", "/nonexistent/sgv2-adversarial");
+    let (_, channels, sense, _) = VARIANTS[0];
+    assert_eq!((channels, sense), (2, 0));
+    let d = lv2_descriptor(0);
+    let program =
+        |c: usize| -> [f32; 64] { core::array::from_fn(|k| (((k * 7 + c * 13) % 23) as f32 / 23.0 - 0.5) * 0.8) };
+    // layout: which buffer each output port uses (None = its own buffer)
+    let run = |layout: [Option<usize>; 2]| -> [[f32; 64]; 2] {
+        let mut ins = [program(0), program(1)];
+        let mut own = [[0.0f32; 64]; 2];
+        let mut ctl = [0.0f32; 3];
+        unsafe {
+            let h = ((*d).instantiate)(d, 48_000.0, core::ptr::null(), core::ptr::null());
+            assert!(!h.is_null());
+            for (c, b) in ins.iter_mut().enumerate() {
+                ((*d).connect_port)(h, c as u32, b.as_mut_ptr().cast());
+            }
+            for c in 0..2 {
+                let p = match layout[c] {
+                    Some(i) => ins[i].as_mut_ptr(),
+                    None => own[c].as_mut_ptr(),
+                };
+                ((*d).connect_port)(h, (2 + c) as u32, p.cast());
+            }
+            for k in 0..3 {
+                ((*d).connect_port)(h, 4 + k as u32, ctl.as_mut_ptr().add(k).cast());
+            }
+            ((*d).activate.unwrap())(h);
+            ((*d).run)(h, 64);
+            ((*d).cleanup)(h);
+        }
+        core::array::from_fn(|c| match layout[c] {
+            Some(i) => ins[i],
+            None => own[c],
+        })
+    };
+    let distinct = run([None, None]);
+    assert!(distinct.iter().flatten().any(|v| *v != 0.0), "the reference render is not silent");
+    assert_eq!(run([Some(0), Some(1)]), distinct, "in place");
+    assert_eq!(run([Some(1), Some(0)]), distinct, "crossed");
+}
