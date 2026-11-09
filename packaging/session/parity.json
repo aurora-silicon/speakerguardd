@@ -580,7 +580,12 @@
   {
    "build": "25G83",
    "reference": "macOS 26.6.2 25G83 Audio Units",
-   "rev": "9e738799de39f91fea221e1aaf28034272f7f5dd",
+   "rev": "3852c84ab2235671ac47befb5ccafe4498d0627f",
+   "spread": {
+    "sha256": "9ee1a2415e3e2887165c7acfdfdd85504b1c8f88e3ba06f2d0a527672b7668e8",
+    "chaotic_max_dbfs": -60.0,
+    "chaotic_under_peak_db": 40.0
+   },
    "entries": [
     {
      "key": "081aba71eea05ec69f1d7203915894aaa5d40c51a23384f01b8b1404a1730466",
@@ -854,7 +859,7 @@
      "also_speaker_ids": [],
      "verdict": "pass",
      "measured": 112,
-     "worst_louder_db": 0.046,
+     "worst_louder_db": 0.034,
      "worst_quieter_db": -0.032,
      "reason": "within +0.25/-1.0 dB of macOS on 112 cells"
     },
@@ -865,7 +870,7 @@
      "also_speaker_ids": [],
      "verdict": "pass",
      "measured": 112,
-     "worst_louder_db": 0.046,
+     "worst_louder_db": 0.034,
      "worst_quieter_db": -0.032,
      "reason": "within +0.25/-1.0 dB of macOS on 112 cells"
     },
@@ -1009,7 +1014,7 @@
      "also_speaker_ids": [],
      "verdict": "pass",
      "measured": 112,
-     "worst_louder_db": 0.046,
+     "worst_louder_db": 0.034,
      "worst_quieter_db": -0.032,
      "reason": "within +0.25/-1.0 dB of macOS on 112 cells"
     },
@@ -1265,7 +1270,7 @@
      "also_speaker_ids": [],
      "verdict": "pass",
      "measured": 112,
-     "worst_louder_db": 0.046,
+     "worst_louder_db": 0.034,
      "worst_quieter_db": -0.032,
      "reason": "within +0.25/-1.0 dB of macOS on 112 cells"
     },
@@ -1299,9 +1304,11 @@
      ],
      "verdict": "refused",
      "measured": 166,
-     "worst_louder_db": 3.228,
+     "worst_louder_db": 0.094,
      "worst_quieter_db": -0.109,
-     "reason": "4 cell(s) louder than macOS by more than 0.25 dB, worst +3.23 dB (lane 1, tone_4000_0); 4 floor-residue cell(s) quieter than macOS by more than 1.0 dB more than 55 dB under their lane's peak, worst -4.59 dB (lane 0, tone_20000_-12): reported, not refused",
+     "reason": "2 arithmetic-chaotic cell(s) outside macOS's own spread, worst +3.23/+3.23 dB against 2.41 dB (lane 1, tone_4000_0); 4 floor-residue cell(s) quieter than macOS by more than 1.0 dB more than 55 dB under their lane's peak, worst -4.59 dB (lane 0, tone_20000_-12): reported, not refused",
+     "chaotic_cells": 4,
+     "worst_chaotic_db": 3.228,
      "floor_residue_cells": 4,
      "worst_floor_residue_db": -4.593
     },

@@ -30,6 +30,11 @@ STOPBAND = 60.0
 # peak where v2 is QUIETER than macOS is reported separately and not counted over the gate.
 # Louder than macOS counts at every level.
 FLOOR_RESIDUE_DB = 55.0
+# Arithmetic-chaotic cells (README.md): a measurement below CHAOTIC_MAX_DBFS and more than
+# CHAOTIC_UNDER_PEAK_DB under its lane's peak is held to macOS's own measured +-1 LSB spread
+# (--spread FILE, attest.py spread) when that exceeds GATE, louder included.
+CHAOTIC_MAX_DBFS = -60.0
+CHAOTIC_UNDER_PEAK_DB = 40.0
 
 
 def rms(x):
@@ -73,9 +78,9 @@ def lane_peaks(mac, segs):
     return peak
 
 
-def compare(mac, v2, segs):
+def compare(mac, v2, segs, spread=None):
     """Per segment x lane deltas at the original sample positions."""
-    rows, residue = [], []
+    rows, residue, chaotic = [], [], []
     peak = lane_peaks(mac, segs)
     for sg in segs:
         if sg["kind"] == "silence":
@@ -91,11 +96,24 @@ def compare(mac, v2, segs):
             if sg["kind"] == "dynamic":
                 parts += [(a[at:at + 480], b[at:at + 480], 1e-4) for at in range(0, n - 479, 480)]
             edge = peak[c] * 10 ** (-FLOOR_RESIDUE_DB / 20)
-            d, fl = [], []
+            sp = (spread or {}).get((sg["name"], c))
+            deep = min(10 ** (CHAOTIC_MAX_DBFS / 20), peak[c] * 10 ** (-CHAOTIC_UNDER_PEAK_DB / 20))
+            d, fl, ch = [], [], []
             for x, y, f in parts:
                 v = ddb(x, y, f)
-                if v is not None:
-                    (fl if v < 0 and rms(x) < edge else d).append(v)
+                if v is None:
+                    continue
+                lv = rms(x)
+                if v < 0 and lv < edge:
+                    fl.append(v)
+                elif sp is not None and lv < deep:
+                    ch.append(v)
+                else:
+                    d.append(v)
+            if ch:
+                w = max(ch, key=abs)
+                chaotic.append({"seg": sg["name"], "lane": c, "db": w, "spread": sp,
+                                "over": abs(w) > max(GATE, sp)})
             if fl:
                 residue.append({"seg": sg["name"], "lane": c, "db": min(fl)})
             if not d:
@@ -104,9 +122,12 @@ def compare(mac, v2, segs):
             rows.append({"seg": sg["name"], "lane": c, "db": w})
     over = [r for r in rows if abs(r["db"]) > GATE]
     worst = max(rows, key=lambda r: abs(r["db"])) if rows else None
-    return {"measured": len(rows), "over": len(over), "louder_over": sum(r["db"] > GATE for r in over),
+    return {"measured": len(rows), "over": len(over) + sum(r["over"] for r in chaotic), "louder_over": sum(r["db"] > GATE for r in over),
             "worst": worst, "over_rows": over[:400],
             "floor_residue": sum(abs(r["db"]) > GATE for r in residue),
+            "chaotic_held": sum(abs(r["db"]) > GATE and not r["over"] for r in chaotic),
+            "chaotic_over": sum(r["over"] for r in chaotic),
+            "chaotic_rows": [r for r in chaotic if abs(r["db"]) > GATE][:400],
             "floor_residue_rows": [r for r in residue if abs(r["db"]) > GATE][:400]}
 
 
@@ -115,7 +136,12 @@ def main():
     for k in ("prog", "mac", "bin", "tunings27", "tunings25", "out"):
         ap.add_argument("--" + k, required=True)
     ap.add_argument("aids", nargs="*", type=int)
+    ap.add_argument("--spread", default=os.environ.get("GATE_SPREAD"))
     a = ap.parse_args()
+    spreads = {}
+    if a.spread:
+        for e in json.load(open(a.spread))["entries"]:
+            spreads[e["name"]] = {(c[0], c[1]): c[2] for c in e["cells"]}
     meta = json.load(open(a.prog + ".json"))
     segs = meta["segments"]
     pink = next(s for s in segs if s["name"] == "pink_-6")
@@ -175,7 +201,7 @@ def main():
             else:
                 res["lag_frames"] = 0
                 res["xcorr_lag"] = lag_of(mac, v2, pink)
-                res.update(compare(mac, v2, segs))
+                res.update(compare(mac, v2, segs, spreads.get(f"AID{aid}")))
                 res["status"] = "PASS" if res["over"] == 0 and not res["stubs"] else "FAIL"
         # Per-box cumulative attribution.
         boxes = []
