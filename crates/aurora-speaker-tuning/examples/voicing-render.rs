@@ -6,7 +6,7 @@
 //!     --in PROGRAM.f32 --out LANES.f32 [--mvsc S] [--mvol DB|auto]
 //! (`--mvol auto`: the dB the plugin derives from S with the artifact's volume law)
 //!     [--tap NODE=FILE.f32 ...] [--info FILE.json] [--block N] [--only NODE]
-//!     [--profile PROFILE.json]
+//!     [--buzz-buffer-mode direct|staged] [--profile PROFILE.json]
 //! ```
 //!
 //! `--only NODE` runs that one box alone: the input has the box's width and
@@ -41,6 +41,7 @@ fn main() {
     let mut only: Option<String> = None;
     let mut profile: Option<String> = None;
     let mut speaker_id: Option<i128> = None;
+    let mut buzz_buffer_mode = sgv2_core::voicing::buzz::BufferMode::Direct;
     while let Some(a) = args.next() {
         let mut v = || args.next().expect("value");
         match a.as_str() {
@@ -59,6 +60,13 @@ fn main() {
             "--speaker-id" => speaker_id = Some(v().parse().expect("speaker id")),
             "--only" => only = Some(v()),
             "--profile" => profile = Some(v()),
+            "--buzz-buffer-mode" => {
+                buzz_buffer_mode = match v().as_str() {
+                    "direct" => sgv2_core::voicing::buzz::BufferMode::Direct,
+                    "staged" => sgv2_core::voicing::buzz::BufferMode::Staged,
+                    _ => panic!("--buzz-buffer-mode must be direct or staged"),
+                }
+            }
             // --mvsc-ramp TO:STEP:EVERY[:START]: from --mvsc, move the scalar by STEP toward TO every EVERY
             // frames after frame START (a host volume slider moved slowly; mvol follows the artifact's law)
             "--mvsc-ramp" => {
@@ -133,7 +141,8 @@ fn main() {
         eprintln!("mvol auto: {:?} at mvsc {mvsc} -> {mvol} dB", c.spec.volume);
     }
     let curve = c.spec.volume;
-    let mut chain = Chain::new(c.spec, 48_000.0, block).expect("spec");
+    let mut chain = Chain::with_buzz_buffer_mode(c.spec, 48_000.0, block, buzz_buffer_mode).expect("spec");
+    eprintln!("buzz_buffer_mode={buzz_buffer_mode:?} latency_frames={}", chain.latency());
     chain.set_param(GraphParam::VolumeScalar, mvsc);
     chain.set_param(GraphParam::VolumeDb, mvol);
 
