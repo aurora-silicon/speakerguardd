@@ -411,9 +411,11 @@ class RevertSettle(unittest.TestCase):
             open(f"{d}/pcm1p/sub0/status", "w").write("state: RUNNING\nowner_pid   : 42\n")
             os.makedirs(f"{d}/pcm0p/sub0")
             open(f"{d}/pcm0p/sub0/status", "w").write("closed\n")
+            os.makedirs(f"{d}/pcm2c/sub0")
+            open(f"{d}/pcm2c/sub0/status", "w").write("state: SETUP\n")
             real = up.glob.glob
             with mock.patch.object(up.glob, "glob", lambda p: real(p.replace("/proc/asound/AppleJ316", d))):
-                self.assertEqual(sorted(up.pcm_states("AppleJ316").values()), ["RUNNING", "closed"])
+                self.assertEqual(sorted(up.pcm_states("AppleJ316").values()), ["RUNNING", "SETUP", "closed"])
 
 
 if __name__ == "__main__":
