@@ -1,6 +1,6 @@
 {
  "format": 2,
- "law": "8ca3c795820628d279b2af4c4657f1fef204c14a85d405ac5947f4109bb03b09",
+ "law": "75b4aadf26dc2a7b81fc3f09134a8f8b96402f026f0e8170f225b31d162f05e8",
  "tolerance": {
   "louder_db": 0.25,
   "quieter_db": 1.0,
@@ -10,7 +10,8 @@
   {
    "build": "25C56",
    "reference": "macOS 26.2 25C56 Audio Units (its AudioDSP.component, read from the 25C56 restore image, rendered on a 25G83 host)",
-   "rev": "d6871f8f8059dfcab535d7c11d1c15c173db862b",
+   "rev": "34d55246ecfb8b02748c22cdd5a63d89a9056138",
+   "spread": null,
    "entries": [
     {
      "key": "081aba71eea05ec69f1d7203915894aaa5d40c51a23384f01b8b1404a1730466",
@@ -580,7 +581,12 @@
   {
    "build": "25G83",
    "reference": "macOS 26.6.2 25G83 Audio Units",
-   "rev": "9e738799de39f91fea221e1aaf28034272f7f5dd",
+   "rev": "34d55246ecfb8b02748c22cdd5a63d89a9056138",
+   "spread": {
+    "sha256": "9ee1a2415e3e2887165c7acfdfdd85504b1c8f88e3ba06f2d0a527672b7668e8",
+    "chaotic_max_dbfs": -60.0,
+    "chaotic_under_peak_db": 40.0
+   },
    "entries": [
     {
      "key": "081aba71eea05ec69f1d7203915894aaa5d40c51a23384f01b8b1404a1730466",
@@ -854,7 +860,7 @@
      "also_speaker_ids": [],
      "verdict": "pass",
      "measured": 112,
-     "worst_louder_db": 0.046,
+     "worst_louder_db": 0.034,
      "worst_quieter_db": -0.032,
      "reason": "within +0.25/-1.0 dB of macOS on 112 cells"
     },
@@ -865,7 +871,7 @@
      "also_speaker_ids": [],
      "verdict": "pass",
      "measured": 112,
-     "worst_louder_db": 0.046,
+     "worst_louder_db": 0.034,
      "worst_quieter_db": -0.032,
      "reason": "within +0.25/-1.0 dB of macOS on 112 cells"
     },
@@ -1009,7 +1015,7 @@
      "also_speaker_ids": [],
      "verdict": "pass",
      "measured": 112,
-     "worst_louder_db": 0.046,
+     "worst_louder_db": 0.034,
      "worst_quieter_db": -0.032,
      "reason": "within +0.25/-1.0 dB of macOS on 112 cells"
     },
@@ -1265,7 +1271,7 @@
      "also_speaker_ids": [],
      "verdict": "pass",
      "measured": 112,
-     "worst_louder_db": 0.046,
+     "worst_louder_db": 0.034,
      "worst_quieter_db": -0.032,
      "reason": "within +0.25/-1.0 dB of macOS on 112 cells"
     },
@@ -1299,9 +1305,11 @@
      ],
      "verdict": "refused",
      "measured": 166,
-     "worst_louder_db": 3.228,
+     "worst_louder_db": 0.094,
      "worst_quieter_db": -0.109,
-     "reason": "4 cell(s) louder than macOS by more than 0.25 dB, worst +3.23 dB (lane 1, tone_4000_0); 4 floor-residue cell(s) quieter than macOS by more than 1.0 dB more than 55 dB under their lane's peak, worst -4.59 dB (lane 0, tone_20000_-12): reported, not refused",
+     "reason": "2 arithmetic-chaotic cell(s) outside macOS's own spread, worst +3.23/+3.23 dB against 2.41 dB (lane 1, tone_4000_0); 4 floor-residue cell(s) quieter than macOS by more than 1.0 dB more than 55 dB under their lane's peak, worst -4.59 dB (lane 0, tone_20000_-12): reported, not refused",
+     "chaotic_cells": 4,
+     "worst_chaotic_db": 3.228,
      "floor_residue_cells": 4,
      "worst_floor_residue_db": -4.593
     },
@@ -1322,7 +1330,8 @@
   {
    "build": "26A428",
    "reference": "macOS 27.0 26A428 Audio Units",
-   "rev": "d6871f8f8059dfcab535d7c11d1c15c173db862b",
+   "rev": "34d55246ecfb8b02748c22cdd5a63d89a9056138",
+   "spread": null,
    "entries": [
     {
      "key": "8e72b09f39657d4d6d619b324d05d17704e19b3b622823bf06526905e45c550a",
