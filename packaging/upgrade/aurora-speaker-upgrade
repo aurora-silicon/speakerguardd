@@ -1,0 +1,7 @@
+#!/usr/bin/python3 -I
+# SPDX-License-Identifier: MIT
+import os, sys
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.environ.get("AURORA_SPEAKER_UPGRADE_LIB", "/usr/lib/aurora-speaker-upgrade"))
+from aurora_speaker_upgrade.upgrade import main  # noqa: E402
+sys.exit(main())
