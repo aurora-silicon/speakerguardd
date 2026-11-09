@@ -63,7 +63,9 @@
 //! read as a uniform cubic B-spline over the nodes (not by linear
 //! interpolation: the unit rounds the table's knees). The applied gain is
 //! linear: each frame it covers a fixed share of the remaining distance to
-//! the call's target amplitude through a one-pole smoother. Gliding in dB
+//! the call's target amplitude through a one-pole smoother. Algorithms 2 and 3
+//! restart that glide on every render call: the call's first frame covers
+//! half the share, every later frame the full share. Gliding in dB
 //! instead bends every large step's onset by up to tenths of a dB.
 //!
 //! Algorithm 1 (the earliest version a strip can select) keeps the same
@@ -986,7 +988,10 @@ impl Run {
                 self.target = self.step_target[next].1;
                 next += 1;
             }
-            self.gain += self.glide * (self.target - self.gain);
+            // Algorithms 2 and 3 restart the glide at every call: its first
+            // frame takes half a step, the rest full steps.
+            let k = if n == 0 && !self.p.algorithm1 { 0.5 * self.glide } else { self.glide };
+            self.gain += k * (self.target - self.gain);
             let g = self.gain as f32;
             for (ch, b) in bufs.iter_mut().enumerate().take(nch) {
                 let Some(s) = b.get_mut(n) else { continue };

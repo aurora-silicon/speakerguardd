@@ -66,6 +66,9 @@ FLOOR_RESIDUE_DB = 55.0
 # tolerance whatever the spread.
 CHAOTIC_MAX_DBFS = -60.0
 CHAOTIC_UNDER_PEAK_DB = 40.0
+# A main-band measurement may also differ by macOS's own spread for that cell, but never by more
+# than MAIN_SPREAD_CAP_DB (louder or quieter); beyond that the ordinary tolerance decides.
+MAIN_SPREAD_CAP_DB = 0.25
 SPREAD_FORMAT = 1
 FORMAT = 2
 
@@ -212,7 +215,7 @@ def cell(seg, lane, meas, lane_peak, spread=None):
     main = [db for db, lv in rest if not is_chaotic(lv, lane_peak, spread)]
     return {"seg": seg, "lane": lane, "louder": max(main) if main else 0.0,
             "quieter": min(main) if main else 0.0, "floor_quieter": min(res) if res else None,
-            "chaotic": [max(ch), min(ch), spread] if ch else None}
+            "chaotic": [max(ch), min(ch), spread] if ch else None, "spread": spread}
 
 
 def verdict(rows):
@@ -222,16 +225,20 @@ def verdict(rows):
     cells are counted and reported, never refused."""
     if not rows:
         return {"verdict": "refused", "reason": "nothing measured", "measured": 0}
+    def allow(r, tol):
+        # main band: macOS's own spread, capped
+        sp = r.get("spread")
+        return tol if sp is None else max(tol, min(sp, MAIN_SPREAD_CAP_DB))
     lo = max(rows, key=lambda r: r["louder"])
     qu = min(rows, key=lambda r: r["quieter"])
     fl = [r for r in rows if r.get("floor_quieter") is not None and r["floor_quieter"] < -QUIETER_DB]
     why = []
-    if lo["louder"] > LOUDER_DB:
-        n = sum(r["louder"] > LOUDER_DB for r in rows)
+    if any(r["louder"] > allow(r, LOUDER_DB) for r in rows):
+        n = sum(r["louder"] > allow(r, LOUDER_DB) for r in rows)
         why.append(f"{n} cell(s) louder than macOS by more than {LOUDER_DB} dB, worst {lo['louder']:+.2f} dB "
                    f"(lane {lo['lane']}, {lo['seg']})")
-    if qu["quieter"] < -QUIETER_DB:
-        n = sum(r["quieter"] < -QUIETER_DB for r in rows)
+    if any(r["quieter"] < -allow(r, QUIETER_DB) for r in rows):
+        n = sum(r["quieter"] < -allow(r, QUIETER_DB) for r in rows)
         why.append(f"{n} cell(s) quieter than macOS by more than {QUIETER_DB} dB, worst {qu['quieter']:+.2f} dB "
                    f"(lane {qu['lane']}, {qu['seg']})")
     out = {"measured": len(rows), "worst_louder_db": round(lo["louder"], 3),
@@ -369,7 +376,8 @@ def spread_id(path):
         return None
     import hashlib
     return {"sha256": hashlib.sha256(open(path, "rb").read()).hexdigest(),
-            "chaotic_max_dbfs": CHAOTIC_MAX_DBFS, "chaotic_under_peak_db": CHAOTIC_UNDER_PEAK_DB}
+            "chaotic_max_dbfs": CHAOTIC_MAX_DBFS, "chaotic_under_peak_db": CHAOTIC_UNDER_PEAK_DB,
+            "main_spread_cap_db": MAIN_SPREAD_CAP_DB}
 
 
 def gate(a):
