@@ -109,8 +109,14 @@ So the gate measures that spread on macOS itself:
 2. A measurement is held to that spread instead of the ordinary tolerance (louder included) only
    if the spread is larger, its macOS level is below -60 dBFS absolute and it sits more than
    40 dB under its lane's own peak. A main-band measurement keeps the ordinary tolerance whatever
-   the spread, so a main-band cell louder than macOS still fails.
-3. `spread-25G83.json` (this directory) holds tuning keys, cell names and spread values only: no
+   the spread, except for the capped allowance below.
+3. A main-band measurement passes when v2's deviation is within macOS's own spread for that cell
+   **and** within 0.25 dB (`MAIN_SPREAD_CAP_DB`), louder or quieter. Above 0.25 dB it fails as
+   before, whatever the spread. Measured on 25G83, macOS moves by 0.07-0.14 dB in some main-band
+   cells (AID9 step-down tail 0.14, AID36 31.5 Hz 0.12, AID10 20 Hz 0.07): at that size macOS does
+   not agree with itself, so a 0.05 dB demand there tests rounding luck, not parity. The cap keeps
+   every main-band difference within the attestation's own louder bound.
+4. `spread-25G83.json` (this directory) holds tuning keys, cell names and spread values only: no
    Apple data. `parity.json` records the spread file's SHA-256 and the rule's limits in that release's block (`releases[].spread`); a release without a spread file is gated by the ordinary rule. Regenerate
    both for every macOS release, from the same references (`attest_refs.sh` once per perturbed
    program: `GATE`-side `perturb.py`).
