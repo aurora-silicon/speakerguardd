@@ -129,7 +129,7 @@ fn main() {
         mvol = c.spec.volume.db(mvsc);
         eprintln!("mvol auto: {:?} at mvsc {mvsc} -> {mvol} dB", c.spec.volume);
     }
-    let curve = c.spec.volume.clone();
+    let curve = c.spec.volume;
     let mut chain = Chain::new(c.spec, 48_000.0, block).expect("spec");
     chain.set_param(GraphParam::VolumeScalar, mvsc);
     chain.set_param(GraphParam::VolumeDb, mvol);

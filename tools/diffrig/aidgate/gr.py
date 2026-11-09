@@ -24,9 +24,8 @@ Apple-derived: keep them in a private directory.
 
 `--param-at` moves a graph parameter at run time (a host volume slider): every Audio Unit box
 it is wired to gets the change before the host slice that starts at FRAME (box_host --set-at),
-as macOS's graph does. The graph's own `dbgn` gain box applies it at FRAME without a ramp:
-its ramp law is not known yet (Daybreak t-5917), so volume-move cells that depend on a dbgn
-box are informational only.
+as macOS's graph does. The graph's own `dbgn` gain box ramps each change linearly in
+amplitude over 20 ms, as macOS's does.
 
 `--strip`/`--propstrip` name the speaker configuration's strip and property
 strip (in AID<n>/DSP/Strips), as the DSP database selects them for a speaker
@@ -392,21 +391,27 @@ def main():
                 if not mv:
                     y = [c if g == 1.0 else array("f", (v * g for v in c)) for p in ports for c in p]
                 else:
-                    # run-time moves at their frame, no ramp (law pending, Daybreak t-5917)
+                    # run-time moves (macOS's graph gain box): each change ramps linearly in
+                    # amplitude over floor(0.020 * fs) samples, the current value on the first
+                    # sample; a change during a ramp starts its own ramp after it
+                    nramp = max(1, int(0.020 * int(args.sr)))
                     y = []
                     for p in ports:
                         for c in p:
-                            out, st, cur = array("f"), dict(s), g
-                            last = 0
-                            for f, pid, v in mv + [(len(c), None, None)]:
-                                f = min(f, len(c))
-                                out.extend(x * cur for x in c[last:f])
-                                last = f
-                                if pid is not None:
-                                    st[pid] = v
-                                    cur = 0.0 if st.get(1, 0.0) else 10 ** (st.get(0, 0.0) / 20)
+                            st = dict(s); cur = g; tgt = g; inc = 0.0; left = 0
+                            pend = sorted(mv); out = array("f")
+                            for n, xv in enumerate(c):
+                                while pend and pend[0][0] <= n:
+                                    _, pid, v = pend.pop(0); st[pid] = v
+                                desired = 0.0 if st.get(1, 0.0) else 10 ** (st.get(0, 0.0) / 20)
+                                if left == 0 and desired != tgt:
+                                    tgt = desired; left = nramp; inc = (tgt - cur) / left
+                                out.append(xv * cur)
+                                if left:
+                                    left -= 1
+                                    cur = tgt if left == 0 else cur + inc
                             y.append(out)
-                    notes.append({"dbgn_moves": name, "law": "instant (pending t-5917)"})
+                    notes.append({"dbgn_moves": name, "law": "linear amplitude ramp, 20 ms"})
             elif t == "delay":
                 d = int(dict(box_sets.get(name, [])).get(0, 0))
                 y = [array("f", bytes(4 * d)) + c[: len(c) - d] for p in ports for c in p]
