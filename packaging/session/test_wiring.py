@@ -952,6 +952,10 @@ class Describe(unittest.TestCase):
             self.assertIn("api.alsa.disable-tsched = true", f.read())
         c = self.describe(self.hw(cpu=("vendor,new-dai", "apple,t8140-aop-audio")))
         self.assertEqual((c["transport"], c["speaker_format"]), ("aop-t8140", "S32LE"))
+        # the T8140 speaker DMA raises a period interrupt per period (SINKGAP 11-09): no timer scheduling
+        self.assertTrue(c["speaker_irq"])
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "pipewire", "sgv2-j700.conf")) as f:
+            self.assertIn("api.alsa.disable-tsched = true", f.read())
 
     def test_the_card_id_is_macaudios(self):
         self.assertEqual(wiring.card_id({"model": "Test Mac J999"}), "AppleJ999")
