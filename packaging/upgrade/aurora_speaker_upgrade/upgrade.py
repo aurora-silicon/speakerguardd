@@ -67,6 +67,11 @@ INTERFACE_CTL = "Speaker Protection Interface"
 IF_V2, IF_LEGACY = "Speaker Protection", "Speaker Volume Unlock"
 V2_UNITS = ("speakerguardd-v2.service", "speakerguardd.service")
 GRANT_WAIT_S = 30
+# After a revert restarts the seat user's PipeWire, the older daemon starts
+# once the speaker card's PCMs have kept their state this long
+# (at most PCM_SETTLE_S).
+PCM_SETTLE_S = 10
+PCM_QUIET_S = 1.5
 PARITY = ("/usr/share/speakerguardd/parity.json",)
 MARK = "# aurora-speaker-upgrade: the bundle collected for this Mac"
 
@@ -479,6 +484,34 @@ def legacy_wanted():
     return want
 
 
+def pcm_states(card):
+    """The state of each substream of the speaker card, playback and
+    capture (the sense PCM), from /proc/asound (closed, SETUP, PREPARED,
+    RUNNING, ...)."""
+    out = {}
+    for f in sorted(glob.glob(f"/proc/asound/{card}/pcm*[pc]/sub*/status")):
+        t = read_text(f) or ""
+        m = re.search(r"(?m)^state:\s*(\S+)", t)
+        out[f] = m.group(1) if m else t.strip()
+    return out
+
+
+def pcm_settle(card, wait=PCM_SETTLE_S, quiet=PCM_QUIET_S):
+    """Waits until the speaker card's PCMs keep their state for
+    `quiet` seconds, at most `wait`. False on a timeout; the caller goes on."""
+    end = time.monotonic() + wait
+    last, since = None, time.monotonic()
+    while True:
+        cur, now = pcm_states(card), time.monotonic()
+        if cur != last:
+            last, since = cur, now
+        elif now - since >= quiet:
+            return True
+        if now >= end:
+            return False
+        time.sleep(0.1)
+
+
 def legacy_start():
     """Puts the legacy daemon back, the one the packaged udev rules start
     for the speaker sense PCM; nothing else (on a Mac that is not a J700,
@@ -795,6 +828,17 @@ def back_to_legacy(store, state, mode, card):
         with contextlib.suppress(Refused):
             interface_set(card, IF_LEGACY)
         graph_deactivate()
+        # speakersafetyd reads the sense PCM's rate range and then opens it
+        # at the lowest rate; when the restarted session's WirePlumber opened
+        # the speaker PCM at 48 kHz in between, the open failed on the I2S
+        # rate symmetry (EINVAL) and the daemon panicked and restarted. Wait
+        # for the session to finish opening the speaker first; its ALSA
+        # monitor can also hold the sense PCM for a moment while it starts
+        # (EBUSY), so every PCM of the card counts. (Starting the
+        # daemon before the restart does not work: v2's graph still holds
+        # the sense PCM, EBUSY.)
+        if card:
+            pcm_settle(card)
         legacy_start()
     else:
         # A fleet kernel (v2 interface only): the stack that ran before

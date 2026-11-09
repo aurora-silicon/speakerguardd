@@ -362,6 +362,62 @@ class LegacyStart(unittest.TestCase):
         self.assertEqual(started, ["speakersafetyd.service"])
 
 
+class RevertSettle(unittest.TestCase):
+    """A same-boot revert on a dual kernel restarts the seat user's
+    PipeWire, waits until the speaker PCMs keep their state, and only then
+    starts the older daemon, so the two never configure the I2S at once."""
+
+    def test_order(self):
+        import types
+        from unittest import mock
+        from aurora_speaker_upgrade import upgrade as up
+        order = []
+        store = types.SimpleNamespace(interface="/nonexistent/sgb6-interface", save=lambda st: None)
+        with mock.patch.object(up, "systemctl", lambda *a: order.append(("systemctl",) + a) or types.SimpleNamespace(returncode=0)), \
+                mock.patch.object(up, "interface_set", lambda c, v: order.append(("interface", v))), \
+                mock.patch.object(up, "graph_deactivate", lambda: order.append(("graph_deactivate",))), \
+                mock.patch.object(up, "pcm_settle", lambda card: order.append(("settle", card)) or True), \
+                mock.patch.object(up, "legacy_start", lambda: order.append(("legacy_start",))), \
+                mock.patch.object(up, "v2_unit", return_value="speakerguardd-v2.service"), \
+                mock.patch.object(up, "PROVISION_CONF", "/nonexistent/sgb6-provision.conf"):
+            up.back_to_legacy(store, {}, "dual", "AppleJ316")
+        names = [o[0] for o in order]
+        self.assertEqual(names[-4:], ["interface", "graph_deactivate", "settle", "legacy_start"])
+        self.assertIn(("settle", "AppleJ316"), order)
+
+    def test_settle_waits_for_a_steady_state(self):
+        from unittest import mock
+        from aurora_speaker_upgrade import upgrade as up
+        now = [0.0]
+        seq = iter(["closed"] * 3 + ["SETUP", "PREPARED"] + ["RUNNING"] * 100)
+        with mock.patch.object(up, "pcm_states", lambda card: {"p1": next(seq)}), \
+                mock.patch.object(up.time, "monotonic", lambda: now[0]), \
+                mock.patch.object(up.time, "sleep", lambda t: now.__setitem__(0, now[0] + t)):
+            self.assertTrue(up.pcm_settle("AppleJ316", wait=10, quiet=1.5))
+            self.assertGreaterEqual(now[0], 0.4 + 1.5 - 1e-9)
+        flip = iter(["closed", "RUNNING"] * 200)
+        now[0] = 0.0
+        with mock.patch.object(up, "pcm_states", lambda card: {"p1": next(flip)}), \
+                mock.patch.object(up.time, "monotonic", lambda: now[0]), \
+                mock.patch.object(up.time, "sleep", lambda t: now.__setitem__(0, now[0] + t)):
+            self.assertFalse(up.pcm_settle("AppleJ316", wait=2, quiet=1.5))
+
+    def test_pcm_states_reads_proc(self):
+        import tempfile
+        from unittest import mock
+        from aurora_speaker_upgrade import upgrade as up
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(f"{d}/pcm1p/sub0")
+            open(f"{d}/pcm1p/sub0/status", "w").write("state: RUNNING\nowner_pid   : 42\n")
+            os.makedirs(f"{d}/pcm0p/sub0")
+            open(f"{d}/pcm0p/sub0/status", "w").write("closed\n")
+            os.makedirs(f"{d}/pcm2c/sub0")
+            open(f"{d}/pcm2c/sub0/status", "w").write("state: SETUP\n")
+            real = up.glob.glob
+            with mock.patch.object(up.glob, "glob", lambda p: real(p.replace("/proc/asound/AppleJ316", d))):
+                self.assertEqual(sorted(up.pcm_states("AppleJ316").values()), ["RUNNING", "SETUP", "closed"])
+
+
 if __name__ == "__main__":
     unittest.main()
 
