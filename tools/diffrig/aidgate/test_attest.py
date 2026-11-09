@@ -89,10 +89,16 @@ class Verdicts(unittest.TestCase):
         for db in (0.45, -1.50):
             v = attest.verdict([ok, attest.cell("tone_20_-12", 0, [(db, deep)], peak, 0.40)])
             self.assertEqual(v["verdict"], "refused", (db, v))
-        # the ceiling: main-band measurements keep the ordinary tolerance whatever the spread
+        # the ceiling: main-band measurements get at most a 0.25 dB allowance whatever the spread
         for lv in (shallow, near):
             v = attest.verdict([ok, attest.cell("tone_20_-12", 0, [(0.30, lv)], peak, 0.40)])
             self.assertEqual(v["verdict"], "refused", (lv, v))
+        # main band: at most the 0.25 dB cap, even where macOS's own spread is larger
+        self.assertEqual(attest.MAIN_SPREAD_CAP_DB, 0.25)
+        v = attest.verdict([ok, attest.cell("tone_20_-12", 0, [(0.26, shallow)], peak, 2.0)])
+        self.assertEqual(v["verdict"], "refused", v)
+        v = attest.verdict([ok, attest.cell("tone_20_-12", 0, [(0.24, shallow)], peak, 2.0)])
+        self.assertEqual(v["verdict"], "pass", v)
         # no measured spread: ordinary rule
         v = attest.verdict([ok, attest.cell("tone_20_-12", 0, [(0.30, deep)], peak, None)])
         self.assertEqual(v["verdict"], "refused", v)
