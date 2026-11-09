@@ -226,6 +226,11 @@ def voicing_conf(m, c, w):
                node.description = "{c['name']} speakers"
                media.class = "Audio/Sink"
                audio.rate = {c['rate']}
+               # Held at the PCM rate like the amps' sink: while the amps
+               # wait for a grant this sink runs on another driver, which
+               # takes a playing client's rate (44.1 kHz), and the amps can
+               # then never start (resampling is off).
+               node.force-rate = {c['rate']}
                audio.channels = 2
                audio.position = [ FL FR ]
                priority.session = 1000
@@ -372,6 +377,11 @@ context.objects = [
             node.group             = "{n['group']}"
             node.force-quantum     = {QUANTUM}
             node.lock-quantum      = true
+            # The PCM runs at audio.rate only and resampling is off. A
+            # node's allowed rates do not hold the graph rate: a driver that
+            # (re)starts takes the highest rate of its followers, so a lone
+            # 44.1 kHz client would move the graph to 44.1 kHz.
+            node.force-rate        = {c['rate']}
             priority.driver        = 2000
             priority.session       = 0
             node.autoconnect       = false
@@ -408,6 +418,7 @@ context.modules = [
                 # mute drops the carrier and the grant.
                 media.class        = "Audio/Sink/Internal"
                 audio.rate         = {c['rate']}
+                node.force-rate    = {c['rate']}
                 audio.channels     = {amps + sense}
                 audio.position     = {aux(amps + sense)}
                 priority.session   = 0
