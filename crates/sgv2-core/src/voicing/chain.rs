@@ -516,6 +516,91 @@ fn apply_dynamic_tone_automation(
     }
 }
 
+/// Frames per coefficient update during a tone automation glide.
+pub const TONE_RAMP_STEP: usize = 16;
+
+/// macOS's ToneMeister applies a new automation input (parameter 3) as a
+/// per-frame glide: progress `clamp(n / len, 0, 1)^2` from the current value,
+/// `len` = 40 ms. The glide begins `onset` frames after the change (two
+/// 512-frame host slices in the speaker graph: macOS starts it at a later
+/// slice boundary). A new value during a glide starts a new glide from where
+/// the value is.
+#[derive(Clone, Copy, Debug)]
+struct ToneRamp {
+    from: f64,
+    to: f64,
+    n: usize,
+    len: usize,
+    /// Frames left before the glide begins.
+    wait: usize,
+    onset: usize,
+    started: bool,
+}
+
+impl ToneRamp {
+    fn new(fs: f64) -> ToneRamp {
+        let len = libm::round(0.040 * fs).max(1.0) as usize;
+        let onset = libm::round(1024.0 * fs / 48_000.0) as usize;
+        ToneRamp { from: 0.0, to: 0.0, n: len, len, wait: 0, onset, started: false }
+    }
+    fn value_at(&self, n: f64) -> f64 {
+        let p = (n / self.len as f64).clamp(0.0, 1.0);
+        self.from + (self.to - self.from) * p * p
+    }
+    /// A new target; true when it is to be applied at once (nothing played yet).
+    fn set(&mut self, v: f64) -> bool {
+        if !self.started {
+            self.from = v;
+            self.to = v;
+            self.n = self.len;
+            return true;
+        }
+        if v != self.to {
+            self.from = self.value_at(self.n as f64);
+            self.to = v;
+            self.n = 0;
+            self.wait = self.onset;
+        }
+        false
+    }
+    fn active(&self) -> bool {
+        self.n < self.len
+    }
+    /// Frames (of `frames`) still to run before the glide begins.
+    fn waiting(&mut self, frames: usize) -> usize {
+        let w = self.wait.min(frames);
+        self.wait -= w;
+        w
+    }
+    /// The value for the next `frames` frames (at their middle), or None
+    /// when the glide is over and the target is already applied.
+    fn advance(&mut self, frames: usize) -> Option<f64> {
+        if !self.active() {
+            return None;
+        }
+        let mid = self.n as f64 + frames as f64 / 2.0;
+        self.n += frames;
+        Some(if self.n >= self.len { self.to } else { self.value_at(mid) })
+    }
+}
+
+/// The filter box over frames `at..at + n` of every channel.
+fn process_filters(stage: &mut PreStage, dynamic: bool, x: &[Vec<f32>], y: &mut [Vec<f32>], at: usize, n: usize) {
+    if dynamic {
+        for (i, o) in x.iter().zip(y.iter_mut()) {
+            o[at..at + n].copy_from_slice(&i[at..at + n]);
+        }
+        let mut it = y.iter_mut();
+        let mut refs: [&mut [f32]; MAX_CHANNELS] =
+            core::array::from_fn(|_| it.next().map(|v| &mut v[at..at + n]).unwrap_or(&mut []));
+        stage.process_block_float(&mut refs[..x.len().min(MAX_CHANNELS)], n);
+    } else {
+        for (c, (i, o)) in x.iter().zip(y.iter_mut()).enumerate() {
+            stage.process_float(c, &i[at..at + n], &mut o[at..at + n]);
+        }
+    }
+}
+
 enum Run {
     ParameterAdd(Vec<f64>),
     ToneGroups {
@@ -527,7 +612,17 @@ enum Run {
     Gain {
         gain_db: f64,
         mute: bool,
-        scale: f32,
+        /// The parameters' linear target (0 when muted).
+        desired: f32,
+        /// The ramp: the value on the next sample, its target, the per-sample
+        /// increment and the samples left. A change during a ramp waits for it.
+        current: f32,
+        target: f32,
+        inc: f32,
+        left: usize,
+        /// 20 ms at the box's rate.
+        ramp: usize,
+        started: bool,
     },
     Filters {
         stage: PreStage,
@@ -537,6 +632,11 @@ enum Run {
         dynamic_automation: Vec<DynamicToneAutomation>,
         fs: f64,
         dynamic: bool,
+        /// The automation input (parameter 3) as macOS's unit applies it: a new value
+        /// glides from the current one over 40 ms with progress (n / len)^2, the
+        /// coefficients following the glided value. Coefficients are recomputed every
+        /// [`TONE_RAMP_STEP`] frames of the glide (from the value at the step's middle).
+        ramp: ToneRamp,
     },
     Comp(PreStage),
     Xtc(alloc::boxed::Box<super::xtc::Run>),
@@ -558,7 +658,17 @@ impl Run {
         match kind {
             Kind::NonFinite => Run::NonFinite,
             Kind::Sum(out) => Run::Sum(*out),
-            Kind::Gain => Run::Gain { gain_db: 0.0, mute: false, scale: 1.0 },
+            Kind::Gain => Run::Gain {
+                gain_db: 0.0,
+                mute: false,
+                desired: 1.0,
+                current: 1.0,
+                target: 1.0,
+                inc: 0.0,
+                left: 0,
+                ramp: libm::floor(0.020 * libm::floor(fs)) as usize,
+                started: false,
+            },
             Kind::ParameterAdd(values) => Run::ParameterAdd(values.clone()),
             Kind::ToneGroups { default_mask, variants } => Run::ToneGroups {
                 active: variants.iter().position(|v| v.mask == *default_mask).unwrap_or(0),
@@ -583,6 +693,7 @@ impl Run {
                     dynamic_automation: tone.dynamic_automation.clone(),
                     fs,
                     dynamic: !tone.dynamic.is_empty(),
+                    ramp: ToneRamp::new(fs),
                 }
             }
             Kind::Comp(d) => {
@@ -624,20 +735,28 @@ impl Run {
                     }
                 }
             }
-            Run::Gain { gain_db, mute, scale } => {
+            Run::Gain { gain_db, mute, desired, current, target, started, .. } => {
                 match id {
                     // a gain box only ever attenuates: it never adds drive
                     0 if v.is_finite() => *gain_db = v.min(0.0),
                     1 => *mute = v != 0.0,
                     _ => {}
                 }
-                *scale = if *mute { 0.0 } else { libm::pow(10.0, *gain_db / 20.0) as f32 };
+                *desired = if *mute { 0.0 } else { libm::pow(10.0, *gain_db / 20.0) as f32 };
+                // before the first block a value is installed, not ramped to
+                if !*started {
+                    *current = *desired;
+                    *target = *desired;
+                }
             }
-            Run::Filters { stage, base, automation, dynamic_base, dynamic_automation, fs, .. }
+            Run::Filters { stage, base, automation, dynamic_base, dynamic_automation, fs, ramp, .. }
                 if id == 3 && v.is_finite() =>
             {
-                apply_tone_automation(stage, base, automation, *fs, v);
-                apply_dynamic_tone_automation(stage, dynamic_base, dynamic_automation, *fs, v);
+                // before the first block a value is installed, not glided to
+                if ramp.set(v) {
+                    apply_tone_automation(stage, base, automation, *fs, v);
+                    apply_dynamic_tone_automation(stage, dynamic_base, dynamic_automation, *fs, v);
+                }
             }
             // the volume taper's slider; a non-finite value is its quiet end
             Run::Volt(r) if id == 4 => {
@@ -711,14 +830,56 @@ impl Run {
                     }
                 }
             }
-            Run::Gain { scale, .. } => {
+            // The graph's gain builtin ramps every change linearly in amplitude over
+            // 20 ms: the current value on the first sample, then a constant step, held
+            // at the target. A change during a ramp starts its own ramp after it.
+            Run::Gain { desired, current, target, inc, left, ramp, started, .. } => {
+                *started = true;
+                if *left == 0 && *desired != *target {
+                    *target = *desired;
+                    *left = (*ramp).max(1);
+                    *inc = (*target - *current) / *left as f32;
+                }
+                let (c0, inc0, left0, tgt) = (*current, *inc, *left, *target);
                 for (i, o) in x.iter().zip(y.iter_mut()) {
+                    let (mut g, mut l) = (c0, left0);
                     for (a, b) in i[..frames].iter().zip(o[..frames].iter_mut()) {
-                        *b = *a * *scale;
+                        *b = *a * g;
+                        if l > 0 {
+                            l -= 1;
+                            g = if l == 0 { tgt } else { g + inc0 };
+                        }
                     }
+                    *current = g;
+                    *left = l;
+                }
+                if x.is_empty() {
+                    let n = frames.min(left0);
+                    *left = left0 - n;
+                    *current = if *left == 0 { tgt } else { c0 + inc0 * n as f32 };
                 }
             }
-            Run::Filters { stage, dynamic, .. } => {
+            Run::Filters { stage, base, automation, dynamic_base, dynamic_automation, fs, dynamic, ramp } => {
+                ramp.started = true;
+                if ramp.active() {
+                    // the glide: sub-blocks with the glided automation value
+                    let mut at = 0;
+                    let w = ramp.waiting(frames);
+                    if w > 0 {
+                        process_filters(stage, *dynamic, x, y, 0, w);
+                        at = w;
+                    }
+                    while at < frames {
+                        let n = if ramp.active() { TONE_RAMP_STEP.min(frames - at) } else { frames - at };
+                        if let Some(v) = ramp.advance(n) {
+                            apply_tone_automation(stage, base, automation, *fs, v);
+                            apply_dynamic_tone_automation(stage, dynamic_base, dynamic_automation, *fs, v);
+                        }
+                        process_filters(stage, *dynamic, x, y, at, n);
+                        at += n;
+                    }
+                    return;
+                }
                 if *dynamic {
                     for (i, o) in x.iter().zip(y.iter_mut()) {
                         o[..frames].copy_from_slice(&i[..frames]);
@@ -964,13 +1125,49 @@ mod tests {
         c.process(&[&l, &r], &mut lanes, 64);
         assert_eq!(lanes[0][10], 0.5);
         assert_eq!(lanes[3][10], -0.25);
+        // a volume or mute change ramps over 20 ms (960 samples at 48 kHz)
         c.set_param(GraphParam::VolumeDb, -20.0);
-        c.process(&[&l, &r], &mut lanes, 64);
+        for _ in 0..16 {
+            c.process(&[&l, &r], &mut lanes, 64);
+        }
         assert!((lanes[2][5] - 0.05).abs() < 1e-6);
         c.set_param(GraphParam::Mute, 1.0);
-        c.process(&[&l, &r], &mut lanes, 64);
+        for _ in 0..16 {
+            c.process(&[&l, &r], &mut lanes, 64);
+        }
         assert_eq!(lanes[0][5], 0.0);
         assert!((lanes[1][5] + 0.025).abs() < 1e-6);
+    }
+
+    #[test]
+    fn gain_changes_ramp_linearly_in_amplitude_over_20_ms() {
+        let mut c = Chain::new(fanout_spec(), 48_000.0, 512).unwrap();
+        // set before the first block: installed, not ramped to
+        c.set_param(GraphParam::VolumeDb, -6.0);
+        let one = [1.0f32; 512];
+        let mut o = vec![[0.0f32; 512]; 4];
+        let run = |c: &mut Chain, o: &mut Vec<[f32; 512]>| -> Vec<f32> {
+            let mut it = o.iter_mut();
+            let mut lanes: Vec<&mut [f32]> = (0..4).map(|_| &mut it.next().unwrap()[..]).collect();
+            c.process(&[&one, &one], &mut lanes, 512);
+            lanes[0].to_vec()
+        };
+        let g0 = libm::pow(10.0, -6.0 / 20.0) as f32;
+        assert!(run(&mut c, &mut o).iter().all(|v| (*v - g0).abs() < 1e-7));
+        c.set_param(GraphParam::VolumeDb, -12.0);
+        let g1 = libm::pow(10.0, -12.0 / 20.0) as f32;
+        let mut y = run(&mut c, &mut o);
+        y.extend(run(&mut c, &mut o));
+        let inc = (g1 - g0) / 960.0;
+        assert!((y[0] - g0).abs() < 1e-7, "the current value on the first sample");
+        assert!((y[480] - (g0 + 480.0 * inc)).abs() < 1e-5, "linear in amplitude");
+        assert!(y[960..].iter().all(|v| *v == g1), "held at the target after 960 samples");
+        // a change during a ramp waits for it to finish
+        c.set_param(GraphParam::VolumeDb, 0.0);
+        let a = run(&mut c, &mut o);
+        c.set_param(GraphParam::VolumeDb, -20.0);
+        let b = run(&mut c, &mut o);
+        assert!(a[0] == g1 && b[0] > a[511] && b[0] < 1.0, "still ramping toward 0 dB");
     }
 
     #[test]
