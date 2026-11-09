@@ -174,6 +174,67 @@ class Verify(unittest.TestCase):
         self.assertEqual(code, 2)
 
 
+class LeaseInterface(unittest.TestCase):
+    """The switch test takes "Speaker Protection" itself: on a dual kernel
+    it first needs the interface, which it switches only on a Mac
+    aurora-speaker-upgrade switched (or when that tool asks)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.setting = os.path.join(self.tmp.name, "interface")
+        self.cur, self.sets = "Speaker Volume Unlock", []
+
+        def amix(card, *a):
+            if a[0] == "cget":
+                if self.cur is None:
+                    return subprocess.CompletedProcess(a, 1, "", "no control")
+                n = 1 if self.cur == "Speaker Protection" else 0
+                return subprocess.CompletedProcess(
+                    a, 0, "numid=40,iface=MIXER,name='Speaker Protection Interface'\n"
+                          "  ; type=ENUMERATED,access=rw------,values=1,items=2\n"
+                          "  ; Item #0 'Speaker Volume Unlock'\n  ; Item #1 'Speaker Protection'\n"
+                          f"  : values={n}\n", "")
+            self.sets.append(a[-1])
+            self.cur = a[-1]
+            return subprocess.CompletedProcess(a, 0, "", "")
+        self.patches = [mock.patch.object(sgsc.wiring, "_amixer", amix),
+                        mock.patch.object(sgsc.wiring, "UPGRADE_SETTING", self.setting)]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+        self.tmp.cleanup()
+
+    def test_v2_only_kernel_is_left_alone(self):
+        self.cur = None
+        self.assertIsNone(sgsc.lease_interface(0))
+        self.assertEqual(self.sets, [])
+
+    def test_not_upgraded_refuses_and_leaves_the_volume_lock(self):
+        with self.assertRaises(sgsc.wiring.Refused):
+            sgsc.lease_interface(0)
+        self.assertEqual(self.sets, [])
+
+    def test_upgraded_switches_once(self):
+        with open(self.setting, "w") as f:
+            f.write("v2\n")
+        self.assertEqual(sgsc.lease_interface(0), "dual")
+        self.assertEqual(sgsc.lease_interface(0), "dual")
+        self.assertEqual(self.sets, ["Speaker Protection"])
+
+    def test_the_upgrade_tool_may_switch_before_its_setting(self):
+        self.assertEqual(sgsc.lease_interface(0, switch=True), "dual")
+        self.assertEqual(self.sets, ["Speaker Protection"])
+
+    def test_a_setting_other_than_v2_does_not_switch(self):
+        with open(self.setting, "w") as f:
+            f.write("legacy\n")
+        with self.assertRaises(sgsc.wiring.Refused):
+            sgsc.lease_interface(0)
+
+
 class Pilot(unittest.TestCase):
     """The live graph step against a fake pw-top."""
 

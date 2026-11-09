@@ -167,5 +167,68 @@ class SpeakerId(unittest.TestCase):
         self.assertIsNone(at.probe_speaker_id(collect.FakeRun(I(), "25C56", None)))
 
 
+class DualKernelRun(unittest.TestCase):
+    """cmd_run on a dual kernel (linux 98cb6a86+): legacy stops, the tuning
+    compiles, the interface goes to the lease right before the self-check
+    (which makes this kernel's hardware record with --switch-interface, then
+    verifies), and only then the setting is written and v2 restarted."""
+
+    def test_order_and_setting(self):
+        import tempfile, types
+        from unittest import mock
+        from aurora_speaker_upgrade import upgrade as up
+        calls = []
+        with tempfile.TemporaryDirectory() as d:
+            store = os.path.join(d, "store")
+            conf = os.path.join(d, "speakerguardd.conf")
+            with open(conf, "w") as f:
+                f.write("SGV2_TUNING=--bundle /b\n")
+
+            class Ident:
+                unit, board, acoustic = "u" * 64, "j316s", 9
+
+                def __init__(self, adt):
+                    pass
+
+                def matches_dt(self):
+                    return True
+
+            def run(argv, **kw):
+                calls.append(("run", tuple(argv)))
+                if argv[-1] == "--help":
+                    return types.SimpleNamespace(returncode=0, stdout="run verify --switch-interface", stderr="")
+                return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+            a = types.SimpleNamespace(store=store, adt=None, no_switch=False, force=False, scratch=os.path.join(d, "s"))
+            with mock.patch.object(up.collect, "Identity", Ident), \
+                    mock.patch.object(up, "interface_mode", return_value=("dual", "1")), \
+                    mock.patch.object(up, "acquire", return_value=({}, {"route": 1, "aid": "AID9"})), \
+                    mock.patch.object(up, "digest", return_value="dg"), \
+                    mock.patch.object(up.Store, "put_bundle", lambda self, b: None), \
+                    mock.patch.object(up.Store, "read_bundle", lambda self: None), \
+                    mock.patch.object(up, "PROVISION_CONF", os.path.join(d, "provision.conf")), \
+                    mock.patch.object(up, "V2_CONF", conf), \
+                    mock.patch.object(up, "tool", lambda name: "/x/" + name), \
+                    mock.patch.object(up, "run", run), \
+                    mock.patch.object(up, "legacy_stop", lambda: calls.append(("legacy_stop",))), \
+                    mock.patch.object(up, "interface_set", lambda card, v: calls.append(("iface", v))), \
+                    mock.patch.object(up, "systemctl", lambda *x: calls.append(("systemctl",) + x) or
+                                      types.SimpleNamespace(returncode=0, stdout="", stderr="")), \
+                    mock.patch.object(up, "v2_unit", return_value="speakerguardd-v2.service"), \
+                    mock.patch.object(up, "wait_v2_granted", return_value=True):
+                self.assertEqual(up.cmd_run(a), up.EXIT_OK)
+                with open(os.path.join(store, "interface")) as f:
+                    self.assertEqual(f.read(), "v2\n")
+        names = [c[0] if c[0] != "run" else os.path.basename(c[1][0]) + " " + c[1][1] for c in calls]
+        i = names.index
+        self.assertLess(i("legacy_stop"), i("speakerguardd-provision run"))
+        self.assertLess(i("speakerguardd-provision run"), i("iface"))
+        self.assertLess(i("iface"), i("speakerguardd-selfcheck run"))
+        self.assertLess(i("speakerguardd-selfcheck run"), i("speakerguardd-selfcheck verify"))
+        sc = [c[1] for c in calls if c[0] == "run" and c[1][1:2] == ("run",) and "selfcheck" in c[1][0]][0]
+        self.assertIn("--switch-interface", sc)
+        self.assertEqual(sc[-2:], ("--bundle", "/b"))
+        self.assertIn(("iface", "Speaker Protection"), calls)
+
+
 if __name__ == "__main__":
     unittest.main()

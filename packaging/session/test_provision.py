@@ -865,6 +865,59 @@ class Gate(Base):
         self.assertEqual(self.decide("v2"), (False, False))
         os.unlink(setting)
 
+    def test_dual_kernel_switched_mac_waits_for_its_switch_test(self):
+        """A switched Mac on a kernel its switch test has not run on: neither
+        daemon (no older daemon holding the volume lock the test takes); a
+        failed test sends it back to the older daemons."""
+        setting = os.path.join(self.t, "upgrade-interface")
+        self.board("j999")
+        self.ctl({"board": "j999"})
+        self.assertEqual(self.run_(), 0)
+        with open(setting, "w") as f:
+            f.write("v2\n")
+        self.checked(kernel="another-kernel")
+        self.assertEqual(self.decide("dual"), (False, False))
+        self.assertEqual(self.decide("dual", cmd="prepare"), (True, False))
+        self.checked(result="fail")
+        self.assertEqual(self.decide("dual"), (False, True))
+        self.checked()
+        self.assertEqual(self.decide("dual"), (True, False))
+        os.unlink(setting)
+        self.checked(kernel="another-kernel")
+        self.assertEqual(self.decide("dual"), (False, True))
+
+    def test_dual_kernel_refused_board_keeps_the_older_daemons(self):
+        with open(os.path.join(self.t, "upgrade-interface"), "w") as f:
+            f.write("v2\n")
+        self.board("j999")
+        self.ctl({"board": "j999", "refusals": [{"code": "synthetic-refusal"}]})
+        self.assertEqual(self.run_(), 1)
+        self.assertEqual(self.decide("dual"), (False, True))
+        self.assertEqual(self.decide("v2"), (False, False))
+
+    def test_interface_switches_only_dual_and_upgraded(self):
+        sets = []
+        state = {"iface": "dual"}
+        setting = os.path.join(self.t, "upgrade-interface")
+        self.patch(gate, "kernel_interface", lambda wait: (state["iface"], "AppleX"))
+        self.patch(gate.wiring, "interface_lease", lambda card: sets.append(card) or True)
+        a = types.SimpleNamespace(wait=0, setting=setting)
+        self.assertEqual(gate.interface(a), 0)
+        self.assertEqual(sets, [])
+        with open(setting, "w") as f:
+            f.write("v2\n")
+        self.assertEqual(gate.interface(a), 0)
+        self.assertEqual(sets, ["AppleX"])
+        state["iface"] = "v2"
+        self.assertEqual(gate.interface(a), 0)
+        self.assertEqual(sets, ["AppleX"])
+        state["iface"] = "dual"
+
+        def refuse(card):
+            raise gate.wiring.Refused("-EIO")
+        self.patch(gate.wiring, "interface_lease", refuse)
+        self.assertEqual(gate.interface(a), 1)
+
     def test_unlisted_board_silent_check_and_full_voicing_generation(self):
         import gen
         import wiring

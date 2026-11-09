@@ -503,7 +503,7 @@ class RestoreCommand(unittest.TestCase):
                 state["stopped"] = True
 
         class Control:
-            def __init__(self, idx):
+            def __init__(self, idx, switch=False):
                 pass
 
             def close(self):
@@ -1103,7 +1103,7 @@ class Deferral(unittest.TestCase):
         self.desc = wiring.describe(self.hw, self.w)
 
     def run_sc(self, *argv, kernel="7.3.0-test"):
-        def active(idx, card, w, report):
+        def active(idx, card, w, report, args=None):
             self.calls.append("active")
             return list(self.hw_errs)
 
