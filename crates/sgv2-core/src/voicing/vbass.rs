@@ -95,12 +95,13 @@ impl Cascade {
 }
 
 /// One stored section: `[b0, b1, b2, a1, a2]` as the object keeps it.
-type Words = [f32; 5];
+pub(crate) type Words = [f32; 5];
 
-/// The unit's Float32 Butterworth sections of order `n` at `fc` for a
-/// filter object at rate `fs` (both as the box keeps them, Float32), in
-/// pole-pair order with the first-order section last for odd `n`.
-fn butter_words(n: usize, fc: f32, fs: f32, kind: Kind, out: &mut Vec<Words>) {
+/// The platform voicing library's Float32 Butterworth sections of order `n`
+/// at `fc` for a filter object at rate `fs` (both as the box keeps them,
+/// Float32), in pole-pair order with the first-order section last for odd
+/// `n`. VirtualBass and the ToneMeister's Butterworth slots share it.
+pub(crate) fn butter_words(n: usize, fc: f32, fs: f32, kind: Kind, out: &mut Vec<Words>) {
     let f = fc.min((fs * 0.5) * 0.9);
     let w = (f64::from(f) * (2.0 * core::f64::consts::PI) / f64::from(fs)) as f32;
     let s = libm::sin(f64::from(w)) as f32;
@@ -160,7 +161,7 @@ fn object(words: &[Words], multichannel: bool) -> crate::vdsp::Cascade {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Kind {
+pub(crate) enum Kind {
     Low,
     High,
     AllPass,

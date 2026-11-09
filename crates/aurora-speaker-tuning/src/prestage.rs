@@ -347,7 +347,9 @@ pub fn voicing_tone(
         let mut ch = Channel::IDENTITY;
         ch.count = p.sections.len();
         ch.sections[..p.sections.len()].copy_from_slice(&p.sections);
-        ch.gain = if p.muted { 0.0 } else { 10f64.powf(p.gain_db / 20.0) };
+        // The box forms a dB gain in Float32: exp(dB * (ln 10 / 20)).
+        ch.gain =
+            if p.muted { 0.0 } else { f64::from((p.gain_db as f32 * (core::f64::consts::LN_10 / 20.0) as f32).exp()) };
         if !ch.gain.is_finite() {
             return Err(bad(format!("{ctx} channel {c}: gain {} dB", p.gain_db)));
         }

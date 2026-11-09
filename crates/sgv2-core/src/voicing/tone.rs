@@ -369,25 +369,19 @@ impl Cascade {
     }
 }
 
-/// A bilinear-prewarped Butterworth low- or high-pass of integer order.
+/// A Butterworth low- or high-pass of integer order, as the box stores it:
+/// the platform voicing library's Float32 construction (corner limited to
+/// 0.45 of the rate, rounded angle, sine and cosine, numerators formed from
+/// the rounded poles), widened.
 pub fn butterworth(high: bool, order: u32, f0: f64, fs: f64) -> Cascade {
+    use super::vbass::{butter_words, Kind};
     let mut out = Cascade::EMPTY;
     let order = order.clamp(1, 20);
-    let k = libm::tan(PI * f0 / fs);
-    for i in 0..order / 2 {
-        let q2 = 2.0 * libm::sin(PI * (2 * i + 1) as f64 / (2 * order) as f64);
-        let n = 1.0 + q2 * k + k * k;
-        let (a1, a2) = (2.0 * (k * k - 1.0) / n, (1.0 - q2 * k + k * k) / n);
-        let (b0, b1, b2) = if high { (1.0 / n, -2.0 / n, 1.0 / n) } else { (k * k / n, 2.0 * k * k / n, k * k / n) };
-        out.sections[out.count] = Section { b0, b1, b2, a1, a2 };
-        out.count += 1;
-    }
-    if order % 2 == 1 {
-        let n = 1.0 + k;
-        let a1 = (k - 1.0) / n;
-        let (b0, b1) = if high { (1.0 / n, -1.0 / n) } else { (k / n, k / n) };
-        out.sections[out.count] = Section { b0, b1, b2: 0.0, a1, a2: 0.0 };
-        out.count += 1;
+    let mut words = alloc::vec::Vec::new();
+    butter_words(order as usize, f0 as f32, fs as f32, if high { Kind::High } else { Kind::Low }, &mut words);
+    for w in words.iter().take(MAX_CASCADE) {
+        let [b0, b1, b2, a1, a2] = w.map(f64::from);
+        out.push(Section { b0, b1, b2, a1, a2 });
     }
     out
 }
