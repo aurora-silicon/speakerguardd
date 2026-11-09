@@ -1,6 +1,6 @@
 {
  "format": 2,
- "law": "48e7abafc61e193f225c742a16d018a1573456536c4d6467d075090db702c28a",
+ "law": "bd53c7bf0efb0c28793b8ca99ac9bb2f87cd1f8ae21c3f238dfba0c8e12ae405",
  "tolerance": {
   "louder_db": 0.25,
   "quieter_db": 1.0
@@ -9,7 +9,7 @@
   {
    "build": "25G83",
    "reference": "macOS 26.6.2 25G83 Audio Units",
-   "rev": "86ff3f4018277f6460a0ad248d1cdf05455628df",
+   "rev": "82266b8c92b8b1a328b1c14f091e860152e29390",
    "entries": [
     {
      "key": "081aba71eea05ec69f1d7203915894aaa5d40c51a23384f01b8b1404a1730466",
@@ -18,9 +18,9 @@
      "also_speaker_ids": [],
      "verdict": "refused",
      "measured": 37,
-     "worst_louder_db": 12.311,
-     "worst_quieter_db": -54.446,
-     "reason": "23 cell(s) louder than macOS by more than 0.25 dB, worst +12.31 dB (lane 0, tone_160_-12); 2 cell(s) quieter than macOS by more than 1.0 dB, worst -54.45 dB (lane 0, burst_1000)"
+     "worst_louder_db": 12.235,
+     "worst_quieter_db": -52.408,
+     "reason": "8 cell(s) louder than macOS by more than 0.25 dB, worst +12.23 dB (lane 0, tone_160_-12); 2 cell(s) quieter than macOS by more than 1.0 dB, worst -52.41 dB (lane 0, burst_1000)"
     },
     {
      "key": "8246d16e753c88cd093fe6a8999e42246fbd6d8b1a1d26d723cde9d71668dcfe",
@@ -62,9 +62,9 @@
      "also_speaker_ids": [],
      "verdict": "refused",
      "measured": 37,
-     "worst_louder_db": 12.311,
-     "worst_quieter_db": -54.446,
-     "reason": "23 cell(s) louder than macOS by more than 0.25 dB, worst +12.31 dB (lane 0, tone_160_-12); 2 cell(s) quieter than macOS by more than 1.0 dB, worst -54.45 dB (lane 0, burst_1000)"
+     "worst_louder_db": 12.235,
+     "worst_quieter_db": -52.408,
+     "reason": "8 cell(s) louder than macOS by more than 0.25 dB, worst +12.23 dB (lane 0, tone_160_-12); 2 cell(s) quieter than macOS by more than 1.0 dB, worst -52.41 dB (lane 0, burst_1000)"
     },
     {
      "key": "20d82db71d69a4e5feea6ca1bcf695729a57cc15d21ea7386f295f66534f0317",
@@ -145,9 +145,9 @@
      "also_speaker_ids": [],
      "verdict": "refused",
      "measured": 37,
-     "worst_louder_db": 12.311,
-     "worst_quieter_db": -54.446,
-     "reason": "23 cell(s) louder than macOS by more than 0.25 dB, worst +12.31 dB (lane 0, tone_160_-12); 2 cell(s) quieter than macOS by more than 1.0 dB, worst -54.45 dB (lane 0, burst_1000)"
+     "worst_louder_db": 12.235,
+     "worst_quieter_db": -52.408,
+     "reason": "8 cell(s) louder than macOS by more than 0.25 dB, worst +12.23 dB (lane 0, tone_160_-12); 2 cell(s) quieter than macOS by more than 1.0 dB, worst -52.41 dB (lane 0, burst_1000)"
     },
     {
      "key": "9f771cd7b4bbbe8c3a56a79a93bb231baeee2406dba93f16300ade1e5ac81f4c",

@@ -210,6 +210,7 @@ impl Wire for ToneShape {
             Self::ResonantHighPass => (6, 0),
             Self::ButterworthShelf => (7, 0),
             Self::ButterworthBandShelf => (8, 0),
+            Self::LegacyPeak => (9, 0),
         };
         (tag as u32).put(o);
         arg.put(o);
@@ -227,6 +228,7 @@ impl Wire for ToneShape {
             (6, 0) => Self::ResonantHighPass,
             (7, 0) => Self::ButterworthShelf,
             (8, 0) => Self::ButterworthBandShelf,
+            (9, 0) => Self::LegacyPeak,
             _ => return Err(BlobError::Length),
         })
     }
