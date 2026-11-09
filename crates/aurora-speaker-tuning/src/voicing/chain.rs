@@ -120,12 +120,12 @@ fn compile_node(
             // detector, bandwidth behaviour); the pre-stage's interim
             // peak/hard-knee law tilted the whole chain against macOS
             // (2-3.5 dB under at 50-200 Hz, 0.5-2.5 dB over above 300 Hz)
-            "mstk" => match super::mstk::compile_for(stage, fs, t.macos_build.as_deref(), diags) {
+            "mstk" => match super::mstk::compile_for(stage, fs, t.law_build.as_deref(), diags) {
                 Ok(Some(p)) => Kind::Mstk(Box::new(p)),
                 Ok(None) => Kind::Bypass,
                 Err(e) => uncarried(n, subtype, e, gaps),
             },
-            "cfrk" => match super::cfreak::compile_for(stage, fs, t.macos_build.as_deref(), diags) {
+            "cfrk" => match super::cfreak::compile_for(stage, fs, t.law_build.as_deref(), diags) {
                 Ok(Some(p)) => Kind::Cfreak(Box::new(p)),
                 Ok(None) => Kind::Bypass,
                 Err(e) => uncarried(n, subtype, e, gaps),

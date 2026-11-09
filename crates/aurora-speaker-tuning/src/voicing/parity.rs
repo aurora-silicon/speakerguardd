@@ -63,6 +63,7 @@ pub fn key(t: &Tuning) -> Result<String> {
     let o = v.as_object_mut().ok_or_else(|| bad("tuning is not an object"))?;
     for k in [
         "macos_build",
+        "law_build",
         "board",
         "unit_id",
         "verified",
@@ -81,7 +82,7 @@ pub fn key(t: &Tuning) -> Result<String> {
     if let Some(sel) = o.get_mut("selection").and_then(|s| s.as_object_mut()) {
         sel.retain(|k, _| k == "substitutions" || k == "sample_rate");
     }
-    o.insert("macos27".into(), serde_json::Value::Bool(super::cfreak::macos27(t.macos_build.as_deref())));
+    o.insert("macos27".into(), serde_json::Value::Bool(super::cfreak::macos27(t.law_build.as_deref())));
     let extra: Vec<String> = t
         .chain
         .iter()
@@ -474,7 +475,7 @@ pub fn run(t: &Tuning, attest: Option<&[u8]>, diags: &mut Diagnostics) -> (Optio
         (_, None) => Err("no tuning key".to_string()),
         (Some(b), Some(k)) => match Attestations::parse(b) {
             Err(e) => Err(e.to_string()),
-            Ok(a) => attested(&a, t.macos_build.as_deref(), k).map(|(r, e)| {
+            Ok(a) => attested(&a, t.law_build.as_deref(), k).map(|(r, e)| {
                 format!(
                     "{} (AID{}): worst louder {:+.3} dB, quieter {:+.3} dB vs {}",
                     short(k),

@@ -611,6 +611,9 @@ fn voicing_check(bundle: aurora_speaker_tuning::Result<Bundle>, a: &Args) -> ! {
     // whose units it rendered with (production bundles carry it)
     if a.tunings_root.is_some() && t.macos_build.is_none() {
         t.macos_build = std::env::var("SGV2_MACOS_BUILD").ok();
+        if t.law_build.is_none() {
+            t.law_build = t.macos_build.clone();
+        }
     }
     if a.key_only {
         match parity::key(&t) {
