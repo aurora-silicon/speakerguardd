@@ -63,5 +63,5 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update -q && sudo apt-get install -y -q python3-cryptography
+      - run: sudo apt-get update -q && sudo apt-get install -y -q python3-cryptography liblzfse1
       - run: python3 -I -m unittest discover -s packaging/upgrade/tests -v
