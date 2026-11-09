@@ -294,9 +294,18 @@ fn elliptic(n: usize, rp_db: f64, rs_db: f64, fp: f64, fs: f64) -> Cascade {
         });
     }
     if n % 2 == 1 {
+        // The first-order section's numerator is the band edge, not its own
+        // pole; the first pole pair takes the difference so the cascade keeps
+        // unity gain at DC.
         let p0 = j.mul(jacobi(j.mul(v0), k, true)).scale(wp).re;
         let d0 = 1.0 - p0;
-        c.push(Bq { b: [-p0 / d0, -p0 / d0, 0.0], a: [-(1.0 + p0) / d0, 0.0] });
+        c.push(Bq { b: [wp / d0, wp / d0, 0.0], a: [-(1.0 + p0) / d0, 0.0] });
+        if c.n > 1 {
+            let back = -p0 / wp;
+            for b in &mut c.s[0].b {
+                *b *= back;
+            }
+        }
     }
     c
 }
