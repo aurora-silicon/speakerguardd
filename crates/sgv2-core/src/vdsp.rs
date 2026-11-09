@@ -74,6 +74,14 @@ impl Section {
         [self.b[0].to_bits(), self.b[1].to_bits(), self.b[2].to_bits(), self.a[0].to_bits(), self.a[1].to_bits()]
     }
 
+    /// Clears the section and leaves it as if a constant input `x` had
+    /// settled its output at `y` (the state a group republishes after two
+    /// frames of `x` in and `y` out).
+    pub fn settle(&mut self, x: f32, y: f32) {
+        self.history = [x, x, y, y];
+        self.publish((x, x), (y, y));
+    }
+
     fn install(&mut self, c: [f64; 5]) {
         let [b0, b1, b2, a1, a2] = c;
         let mut g = [0.0f64; 8];

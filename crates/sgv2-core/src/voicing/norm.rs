@@ -109,6 +109,8 @@
 use alloc::boxed::Box;
 use alloc::vec;
 
+use crate::vdsp;
+
 /// Gain-table nodes and their grid.
 pub const NODES: usize = 21;
 pub const NODE_LO_DB: f64 = -100.0;
@@ -265,6 +267,21 @@ impl Params {
         (u * u * u * p0 + (3.0 * t3 - 6.0 * t2 + 4.0) * p1 + (-3.0 * t3 + 3.0 * t2 + 3.0 * t + 1.0) * p2 + t3 * p3)
             / 6.0
     }
+
+    /// [`Params::gain_db`] evaluated in single precision on Float32 nodes
+    /// (algorithms 2 and 3 store the call's target in single precision).
+    pub fn gain_db_f32(&self, l: f32) -> f32 {
+        let pos = ((l - NODE_LO_DB as f32) / NODE_STEP_DB as f32).clamp(0.0, (NODES - 1) as f32);
+        let i = (pos as usize).min(NODES - 2);
+        let t = pos - i as f32;
+        let node = |k: isize| self.table[k.clamp(0, NODES as isize - 1) as usize] as f32;
+        let k = i as isize;
+        let (p0, p1, p2, p3) = (node(k - 1), node(k), node(k + 1), node(k + 2));
+        let (t2, t3) = (t * t, t * t * t);
+        let u = 1.0 - t;
+        (u * u * u * p0 + (3.0 * t3 - 6.0 * t2 + 4.0) * p1 + (-3.0 * t3 + 3.0 * t2 + 3.0 * t + 1.0) * p2 + t3 * p3)
+            / 6.0
+    }
 }
 
 /// Detector level, dB, before the loudness offset.
@@ -275,6 +292,12 @@ fn level(power: f64) -> f64 {
 /// Algorithm 1's single-precision detector-level conversion.
 fn level_f32(power: f64) -> f64 {
     f64::from(10.0 * libm::log10f((power as f32).abs().max(1e-20)))
+}
+
+/// Algorithms 2 and 3: the single-precision 64-frame event level of the
+/// smoothed detector power, offset by the smallest double step above one.
+fn event_level(power: f64) -> f64 {
+    f64::from(10.0 * crate::platform_math::log10f(libm::fabsf(power as f32) + f64::EPSILON as f32))
 }
 
 fn loudness(power: f64) -> f64 {
@@ -469,6 +492,7 @@ struct Median {
     limited: f64,
     coef: f64,
     store_db: f64,
+    single: bool,
 }
 
 impl Median {
@@ -478,6 +502,7 @@ impl Median {
             sorted: [0.0; MEDIAN_LEN],
             at: 0,
             limited: 0.0,
+            single: !algorithm1,
             // algorithm 1 moves straight to the release edge
             coef: if algorithm1 { 1.0 } else { f64::from(1.0 - pole(MID_RELEASE_S, rate)) },
             store_db: if algorithm1 { V1_MEDIAN_STORE_DB } else { MEDIAN_STORE_DB },
@@ -505,6 +530,18 @@ impl Median {
         while k + 1 < MEDIAN_LEN && self.sorted[k + 1] < self.sorted[k] {
             self.sorted.swap(k + 1, k);
             k += 1;
+        }
+        if self.single {
+            // algorithms 2 and 3: the stored median, its dead band and its
+            // release in single precision
+            let (m, limited) = (self.sorted[MEDIAN_AT] as f32 + self.store_db as f32, self.limited as f32);
+            let edge = m + MID_DEADBAND_DB as f32;
+            if m > limited {
+                self.limited = f64::from(m);
+            } else if edge < limited {
+                self.limited = f64::from(limited + self.coef as f32 * (edge - limited));
+            }
+            return self.limited;
         }
         let m = self.sorted[MEDIAN_AT] + self.store_db;
         if m > self.limited {
@@ -647,6 +684,12 @@ pub struct Run {
     z: [[[f64; 2]; MAX_SECTIONS]; MAX_CHANNELS],
     ema: f64,
     ema_a: f64,
+    /// Algorithms 2 and 3: the detector sections and the power smoother on
+    /// the platform's single-precision biquad, and one call's work buffers
+    /// (each channel's detector output, then the smoothed power).
+    detector: [[vdsp::Section; MAX_SECTIONS]; MAX_CHANNELS],
+    smoother: vdsp::Section,
+    work: Box<[f32]>,
     in_step: usize,
     steps: usize,
     blocks: usize,
@@ -706,6 +749,14 @@ impl Run {
             } else {
                 libm::exp(-1.0 / (p.detector_ema_s * fs))
             },
+            detector: core::array::from_fn(|_| {
+                core::array::from_fn(|k| vdsp::Section::new(if k < p.sections { p.sos[k] } else { [0.0; 5] }))
+            }),
+            smoother: {
+                let pole = crate::platform_math::expf(-1.0 / (p.detector_ema_s as f32 * fs as f32));
+                vdsp::Section::new([f64::from(1.0 - pole), 0.0, 0.0, f64::from(-pole), 0.0])
+            },
+            work: vec![0.0; (MAX_CHANNELS + 1) * CALL].into_boxed_slice(),
             in_step: 0,
             steps: 0,
             blocks: 0,
@@ -746,7 +797,9 @@ impl Run {
         self.ring.iter_mut().for_each(|v| *v = 0.0);
         self.pos = 0;
         self.z = [[[0.0; 2]; MAX_SECTIONS]; MAX_CHANNELS];
+        self.detector.iter_mut().flatten().for_each(vdsp::Section::reset);
         self.ema = SEED_POWER;
+        self.smoother.settle(SEED_POWER as f32, SEED_POWER as f32);
         self.in_step = 0;
         self.steps = 0;
         self.blocks = 0;
@@ -827,7 +880,7 @@ impl Run {
     /// the boundary `LONG_DELAY` windows later.
     fn on_step(&mut self) {
         let ema = self.ema;
-        let db = if self.p.algorithm1 { level_f32(ema) } else { level(ema) };
+        let db = if self.p.algorithm1 { level_f32(ema) } else { event_level(ema) };
         self.peak = self.peak.max(db);
         self.events += 1;
         if self.steps == 0 && self.blocks == 0 {
@@ -888,28 +941,87 @@ impl Run {
                 *long -= shift;
             }
         }
-        let fast = self.peak + FAST_STORE_DB;
-        let span = self.fs / self.events as f64;
-        if fast > VALID_DB {
-            self.history += (1.0 - self.history) * FAST_HISTORY_STEP / span;
+        // The fast path in single precision: the call's loudest raw event
+        // level plus its store, the history weight, the release pole, the
+        // dead band and the retained level.
+        let fast = self.peak as f32 + FAST_STORE_DB as f32;
+        let span = self.fs as f32 / self.events as f32;
+        let mut history = self.history as f32;
+        if fast > VALID_DB as f32 {
+            history += (1.0 - history) * FAST_HISTORY_STEP as f32 / span;
         }
-        let k = self.history.max(1.0);
-        let pole = libm::exp(-1000.0 / (k * span));
-        if fast > self.fast {
-            self.fast = fast;
-        } else if self.fast > fast + self.p.fast_deadband_db {
+        self.history = f64::from(history);
+        let k = history.max(1.0);
+        let pole = crate::platform_math::expf(-1000.0 / (k * span));
+        let retained = self.fast as f32;
+        let edge = fast + self.p.fast_deadband_db as f32;
+        if fast > retained {
+            self.fast = f64::from(fast);
+        } else if retained > edge {
             // The dead-band edge is both the strict engagement threshold and
             // the release target. The held level approaches that edge, not
             // the colder call target below it.
-            self.fast += (1.0 - pole) * (fast + self.p.fast_deadband_db - self.fast);
+            self.fast = f64::from(retained + (1.0 - pole) * (edge - retained));
         }
         if let Some((db, mid, long)) = self.pending.take() {
             let long = self.pre.update(db + COMPETITOR_STORE_DB, long);
-            self.held = mid.max(long);
+            self.held = f64::from(libm::fmaxf(mid as f32, long as f32));
         }
-        self.candidate = self.held.max(self.fast);
-        self.target_db = self.p.gain_db(self.candidate);
-        self.target = libm::pow(10.0, self.target_db / 20.0);
+        let candidate = libm::fmaxf(self.held as f32, self.fast as f32);
+        self.candidate = f64::from(candidate);
+        // the target store is single precision: the gain curve's Float32
+        // reading through the platform's decimal exponential
+        let gain_db = self.p.gain_db_f32(candidate);
+        self.target_db = f64::from(gain_db);
+        self.target = f64::from(crate::platform_math::exp10f(gain_db / 20.0));
+    }
+
+    /// Algorithms 2 and 3: meter one call. Each channel's detector runs on
+    /// the platform's single-precision biquad (a setup of two or more
+    /// channels steps frame by frame, a one-channel setup in its blocked
+    /// form); the stereo power is one rounded square plus a fused square,
+    /// floored; the 30 ms smoother is a one-channel platform one-pole over
+    /// the call; the 64-frame events read the smoothed power.
+    fn meter_single(&mut self, bufs: &[&mut [f32]], nch: usize, frames: usize) {
+        let multichannel = nch >= 2;
+        let mut at = 0;
+        while at < frames {
+            // pieces of whole eight-frame groups keep the blocked schedule
+            let len = (frames - at).min(CALL);
+            let (chans, rest) = self.work.split_at_mut(MAX_CHANNELS * CALL);
+            let power = &mut rest[..len];
+            for ch in 0..nch {
+                let x = &mut chans[ch * CALL..ch * CALL + len];
+                for (k, v) in x.iter_mut().enumerate() {
+                    *v = bufs[ch].get(at + k).copied().filter(|v| v.is_finite()).unwrap_or(0.0);
+                }
+                for s in self.detector[ch][..self.p.sections].iter_mut() {
+                    if multichannel {
+                        s.run_frames(x);
+                    } else {
+                        s.run(x);
+                    }
+                }
+            }
+            for (k, p) in power.iter_mut().enumerate() {
+                let (l, r) = (chans[k], chans[CALL + k]);
+                let v = match nch {
+                    0 => 0.0,
+                    1 => l * l,
+                    _ => libm::fmaf(l, l, r * r),
+                };
+                *p = v.max(1e-12);
+            }
+            self.smoother.run(power);
+            for k in 0..len {
+                self.ema = f64::from(self.work[MAX_CHANNELS * CALL + k]);
+                if self.in_step == 0 {
+                    self.on_step();
+                }
+                self.in_step = (self.in_step + 1) % STEP;
+            }
+            at += len;
+        }
     }
 
     /// In place on `channels` buffers of at least `frames` samples.
@@ -945,7 +1057,13 @@ impl Run {
         let nch = self.channels.min(bufs.len());
         let la = self.p.lookahead;
         let start_target = self.target;
-        for n in 0..frames {
+        let scalar_frames = if self.p.algorithm1 {
+            frames
+        } else {
+            self.meter_single(bufs, nch, frames);
+            0
+        };
+        for n in 0..scalar_frames {
             let mut power = 0.0;
             for (ch, b) in bufs.iter().enumerate().take(nch) {
                 let x = b.get(n).copied().filter(|v| v.is_finite()).unwrap_or(0.0);
@@ -978,6 +1096,7 @@ impl Run {
         if self.clear_due {
             self.clear_due = false;
             self.z = [[[0.0; 2]; MAX_SECTIONS]; MAX_CHANNELS];
+            self.detector.iter_mut().flatten().for_each(vdsp::Section::reset);
         }
         let mut next = 0;
         if self.p.algorithm1 {
@@ -1331,10 +1450,11 @@ mod tests {
         fast.history = 1.0;
         fast.arbitrate();
 
-        let span = 48_000.0 / 8.0;
-        let pole = libm::exp(-1000.0 / span);
-        let expected = -20.0 + (1.0 - pole) * (-43.0 - -20.0);
-        assert!((fast.fast - expected).abs() < 1e-12, "{} vs {}", fast.fast, expected);
+        // single precision, as the unit keeps the fast path
+        let span = 48_000.0f32 / 8.0;
+        let pole = crate::platform_math::expf(-1000.0 / span);
+        let expected = -20.0f32 + (1.0 - pole) * (-43.0 - -20.0);
+        assert_eq!(fast.fast, f64::from(expected));
 
         let mut slow = Run::new(&p, 48_000.0, 1);
         slow.peak = -42.0;
@@ -1386,10 +1506,11 @@ mod tests {
         r.process(&mut [&mut buf], CALL - 1);
         // Reset clearing follows the actual render call, even a short one.
         assert!(!r.clear_due);
-        assert_eq!(r.z[0][0], [0.0; 2]);
+        let cleared = vdsp::Section::new(p.sos[0]);
+        assert_eq!(r.detector[0][0], cleared);
         let mut more = vec![0.25f32; CALL];
         r.process(&mut [&mut more], CALL);
-        assert_ne!(r.z[0][0], [0.0; 2]);
+        assert_ne!(r.detector[0][0], cleared);
     }
 
     #[test]
