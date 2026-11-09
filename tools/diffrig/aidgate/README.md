@@ -122,3 +122,11 @@ Coverage on 2026-11-09 (host 25G83): 25C56 (26.2) loads and is attested this way
 26A428 (27.0) does not load ("built for macOS 27.0 which is newer than running OS"), so it was
 gated on a J616s booted into 26A428. Newer builds than the host need such a Mac. A build
 whose AudioDSP and Tunings are byte-identical to an attested build's renders the same.
+
+`attest-build.sh BUILD BOARD IPSW_URL` runs those steps for one build: fetch (a Linux Mac with liblzfse +
+python3-cryptography), carry-over check against `units.json` (AudioDSP hashes of attested builds, hashes only),
+host render with that build's units, gate and merge. Per-release trigger: run it for every new macOS build in
+Apple's feed (point releases, betas users install, device-forked builds) and after every law change (all blocks,
+because a block is kept only with the law it was gated at). A build whose units do not load on the host stops with
+exit 3; that build needs a reference host on it (today the J616s on 26A428). Status: assembled from the steps proven
+on 25C56 on 2026-11-09, not yet run end to end as one command.
