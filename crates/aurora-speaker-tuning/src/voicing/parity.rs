@@ -21,11 +21,13 @@
 //!   the Mac being checked. The gate (`tools/diffrig/aidgate`) renders every
 //!   AID of a macOS release through that release's installed units and
 //!   through this code, automatically, for all of them. Its result is an
-//!   attestation per tuning [`key`] (a hash of what the voicing compiler
+//!   attestation per macOS release (the build whose Audio Units were the
+//!   reference) and per tuning [`key`] (a hash of what the voicing compiler
 //!   reads, nothing else), bound to [`LAW`] (a hash of the rendering code
-//!   this binary was built from). A key with no attestation, an attestation
-//!   for other rendering code, or a failing one refuses. The file holds
-//!   hashes, verdicts and summary numbers only: no Apple data.
+//!   this binary was built from). A tuning from a macOS build the gate has
+//!   not attested, a key with no attestation, an attestation for other
+//!   rendering code, or a failing one refuses. The file holds hashes,
+//!   verdicts and summary numbers only: no Apple data.
 //!
 //! The attestation does not choose boards: it records, for every tuning of
 //! the release, whether this code renders it like macOS. A Mac nobody here
@@ -40,8 +42,9 @@ use sgv2_core::voicing::chain::{Chain, GraphParam, Kind, Source};
 
 /// Hash of the rendering code this binary was built from (see `build.rs`).
 pub const LAW: &str = env!("SGV2_VOICING_LAW");
-/// The attestation format this binary reads.
-pub const FORMAT: u32 = 1;
+/// The attestation format this binary reads (2: one block per attested
+/// macOS release).
+pub const FORMAT: u32 = 2;
 const FS: f64 = 48_000.0;
 
 fn bad(msg: impl Into<String>) -> Error {
@@ -122,15 +125,25 @@ pub struct Entry {
     pub worst_quieter_db: Option<f64>,
 }
 
+/// The gate's result for one macOS release: its Tunings rendered through
+/// its own installed Audio Units and through this code.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Release {
+    /// The macOS build (`26A428`), as a Mac's tuning bundle records it.
+    pub build: String,
+    /// The Audio Units that were the reference, in words.
+    pub reference: String,
+    pub entries: Vec<Entry>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Attestations {
     pub format: u32,
     /// The [`LAW`] of the code the gate rendered with.
     pub law: String,
-    /// The macOS build whose Audio Units were the reference.
-    pub reference: String,
     pub tolerance: Tolerance,
-    pub entries: Vec<Entry>,
+    /// Every macOS release the gate has attested.
+    pub releases: Vec<Release>,
 }
 
 impl Attestations {
@@ -143,9 +156,16 @@ impl Attestations {
     }
 }
 
-/// The attestation's answer for `key`: Ok(entry) when it passes for this
-/// code, else the refusal.
-pub fn attested<'a>(a: &'a Attestations, key: &str) -> std::result::Result<&'a Entry, String> {
+/// The attestation's answer for a tuning `key` taken from macOS `build`:
+/// Ok((release, entry)) when it passes for this code, else the refusal.
+/// A tuning from a build the gate has not run against refuses, even when
+/// another release holds the same key: that release's Audio Units, not
+/// this build's, were the reference.
+pub fn attested<'a>(
+    a: &'a Attestations,
+    build: Option<&str>,
+    key: &str,
+) -> std::result::Result<(&'a Release, &'a Entry), String> {
     if a.law != LAW {
         return Err(format!(
             "the macOS parity attestations are for other rendering code (law {} vs this build's {}): re-run the gate",
@@ -153,13 +173,23 @@ pub fn attested<'a>(a: &'a Attestations, key: &str) -> std::result::Result<&'a E
             short(LAW)
         ));
     }
-    let e = a.entries.iter().find(|e| e.key == key).ok_or_else(|| {
-        format!("no macOS parity attestation for this tuning (key {}) against {}", short(key), a.reference)
+    let builds = || a.releases.iter().map(|r| r.build.as_str()).collect::<Vec<_>>().join(", ");
+    let build = build.ok_or_else(|| {
+        format!("the tuning names no macOS build, so no attested release applies (attested: {})", builds())
+    })?;
+    let r = a.releases.iter().find(|r| r.build == build).ok_or_else(|| {
+        format!(
+            "macOS {build} has no parity attestation (attested: {}): run the per-release gate (tools/diffrig/aidgate) on {build}",
+            builds()
+        )
+    })?;
+    let e = r.entries.iter().find(|e| e.key == key).ok_or_else(|| {
+        format!("no macOS parity attestation for this tuning (key {}) against {}", short(key), r.reference)
     })?;
     if e.verdict != "pass" {
-        return Err(format!("macOS parity gate ({}) refused this tuning: {}", a.reference, e.reason));
+        return Err(format!("macOS parity gate ({}) refused this tuning: {}", r.reference, e.reason));
     }
-    Ok(e)
+    Ok((r, e))
 }
 
 fn short(s: &str) -> &str {
@@ -444,14 +474,14 @@ pub fn run(t: &Tuning, attest: Option<&[u8]>, diags: &mut Diagnostics) -> (Optio
         (_, None) => Err("no tuning key".to_string()),
         (Some(b), Some(k)) => match Attestations::parse(b) {
             Err(e) => Err(e.to_string()),
-            Ok(a) => attested(&a, k).map(|e| {
+            Ok(a) => attested(&a, t.macos_build.as_deref(), k).map(|(r, e)| {
                 format!(
                     "{} (AID{}): worst louder {:+.3} dB, quieter {:+.3} dB vs {}",
                     short(k),
                     e.aid.map_or("?".into(), |v| v.to_string()),
                     e.worst_louder_db.unwrap_or(0.0),
                     e.worst_quieter_db.unwrap_or(0.0),
-                    a.reference
+                    r.reference
                 )
             }),
         },
@@ -471,29 +501,47 @@ mod tests {
         Attestations {
             format: FORMAT,
             law: law.into(),
-            reference: "test".into(),
             tolerance: Tolerance { louder_db: 0.25, quieter_db: 1.0 },
-            entries: vec![Entry {
-                key: "k1".into(),
-                aid: Some(1),
-                speaker_id: None,
-                verdict: verdict.into(),
-                reason: "lane 0 +4.35 dB louder than macOS (step_up_125)".into(),
-                worst_louder_db: Some(4.35),
-                worst_quieter_db: None,
+            releases: vec![Release {
+                build: "25G83".into(),
+                reference: "test".into(),
+                entries: vec![Entry {
+                    key: "k1".into(),
+                    aid: Some(1),
+                    speaker_id: None,
+                    verdict: verdict.into(),
+                    reason: "lane 0 +4.35 dB louder than macOS (step_up_125)".into(),
+                    worst_louder_db: Some(4.35),
+                    worst_quieter_db: None,
+                }],
             }],
         }
     }
 
     #[test]
     fn attestation_fails_closed() {
-        assert!(attested(&att(LAW, "pass"), "k1").is_ok());
+        let b = Some("25G83");
+        assert!(attested(&att(LAW, "pass"), b, "k1").is_ok());
         // unknown tuning
-        assert!(attested(&att(LAW, "pass"), "k2").unwrap_err().contains("no macOS parity attestation"));
+        assert!(attested(&att(LAW, "pass"), b, "k2").unwrap_err().contains("no macOS parity attestation"));
         // a j414s-like refusal
-        assert!(attested(&att(LAW, "refused"), "k1").unwrap_err().contains("+4.35 dB louder"));
+        assert!(attested(&att(LAW, "refused"), b, "k1").unwrap_err().contains("+4.35 dB louder"));
         // stale: the rendering code changed after the gate ran
-        assert!(attested(&att("0000", "pass"), "k1").unwrap_err().contains("other rendering code"));
+        assert!(attested(&att("0000", "pass"), b, "k1").unwrap_err().contains("other rendering code"));
+    }
+
+    #[test]
+    fn a_tuning_from_an_unattested_macos_build_is_refused() {
+        // j414s: its bundle came from 26A428 while only 25G83 was attested;
+        // the same tuning key passing on 25G83 does not cover 26A428.
+        let e = attested(&att(LAW, "pass"), Some("26A428"), "k1").unwrap_err();
+        assert!(e.contains("macOS 26A428 has no parity attestation") && e.contains("attested: 25G83"), "{e}");
+        assert!(attested(&att(LAW, "pass"), None, "k1").unwrap_err().contains("names no macOS build"));
+        let mut a = att(LAW, "pass");
+        let mut r = a.releases[0].clone();
+        r.build = "26A428".into();
+        a.releases.push(r);
+        assert_eq!(attested(&a, Some("26A428"), "k1").unwrap().0.build, "26A428");
     }
 
     #[test]
