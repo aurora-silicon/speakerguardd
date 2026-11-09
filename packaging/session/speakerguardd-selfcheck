@@ -79,6 +79,8 @@ the speakers at the kernel's floor.
 before it switches a Mac to v2. It changes nothing, plays only zero samples,
 and stops at the first failing step:
 
+0. **kernel**: the v2 interface, alone or beside the volume lock (the dual
+   kernel's "Speaker Protection Interface"); a legacy-only kernel cannot run.
 1. **hardware** (steps 1-3 above): a passing record bound to this board,
    kernel and blob. Without one (never run, or stale) it cannot run (2).
 2. **voicing** (`aurora-speaker-tuning voicing-check`): the Mac's own chain
@@ -1130,6 +1132,26 @@ def read_conf(path=None):
     return out
 
 
+def kernel_interface(wait=5.0):
+    """speakerguardd-gate's reading of the kernel: 'dual', 'v2', 'legacy' or None."""
+    import importlib.machinery
+    import importlib.util
+    loader = importlib.machinery.SourceFileLoader("sgv2_gate", os.path.join(HERE, "speakerguardd-gate"))
+    spec = importlib.util.spec_from_loader("sgv2_gate", loader)
+    gate = importlib.util.module_from_spec(spec)
+    loader.exec_module(gate)
+    return gate.kernel_interface(wait)
+
+
+def verify_kernel(args):
+    """Step 0: the kernel serves the v2 interface (alone, or beside the
+    volume lock behind "Speaker Protection Interface")."""
+    iface, card = kernel_interface()
+    if iface in (None, "legacy"):
+        raise Cannot(f"this kernel has no v2 speaker interface ({card or 'no speaker card'}): the legacy protection keeps the speakers")
+    return f"{card}: " + ("both interfaces (Speaker Protection Interface)" if iface == "dual" else "v2 interface only")
+
+
 def verify_hardware(args):
     """Step 1: the bound hardware record (this board, kernel and blob)."""
     if not os.path.exists(args.params):
@@ -1301,7 +1323,8 @@ def cmd_verify(args):
         out["board"] = wiring.read_dt()["board"]
         if os.path.exists(args.params):
             out["params_sha256"] = sha256(args.params)
-        for name, step in (("hardware", verify_hardware), ("voicing", verify_voicing), ("graph", verify_graph)):
+        for name, step in (("kernel", verify_kernel), ("hardware", verify_hardware), ("voicing", verify_voicing),
+                           ("graph", verify_graph)):
             try:
                 res = step(args)
             except Cannot as e:

@@ -65,7 +65,9 @@ class Verify(unittest.TestCase):
         self.patches = [
             mock.patch.object(sgsc.wiring, "read_dt", lambda *a, **k: {"board": "j414s"}),
             mock.patch.object(sgsc, "CONF", self.conf),
+            mock.patch.object(sgsc, "kernel_interface", lambda wait=5.0: (self.iface, "AppleJ414")),
         ]
+        self.iface = "dual"
         for p in self.patches:
             p.start()
 
@@ -111,11 +113,11 @@ class Verify(unittest.TestCase):
         self.graph_conf()
         code, out = self.run_verify(voicing())
         self.assertEqual((code, out["result"]), (0, "pass"), out)
-        self.assertEqual([s["name"] for s in out["steps"]], ["hardware", "voicing", "graph"])
+        self.assertEqual([s["name"] for s in out["steps"]], ["kernel", "hardware", "voicing", "graph"])
         self.assertEqual(out["wiring_hash"], "w1")
         # the tuning source comes from the units' configuration
         self.assertEqual(self.tool_cmd[-2:], ["--bundle", "/x"])
-        self.assertIn("no session PipeWire", out["steps"][2]["detail"])
+        self.assertIn("no session PipeWire", out["steps"][-1]["detail"])
 
     def test_j414s_like_tuning_is_refused(self):
         self.bind()
@@ -149,7 +151,7 @@ class Verify(unittest.TestCase):
         self.graph_conf()
         code, out = self.run_verify(voicing())
         self.assertEqual(code, 1)
-        self.assertEqual(out["steps"][0]["name"], "hardware")
+        self.assertEqual(out["steps"][-1]["name"], "hardware")
 
     def test_unlocked_quantum_is_refused(self):
         self.bind()
@@ -157,6 +159,14 @@ class Verify(unittest.TestCase):
         code, out = self.run_verify(voicing())
         self.assertEqual(code, 1)
         self.assertIn("512-frame quantum", out["steps"][-1]["detail"])
+
+    def test_legacy_only_kernel_cannot_run(self):
+        self.bind()
+        self.graph_conf()
+        self.iface = "legacy"
+        code, out = self.run_verify(voicing())
+        self.assertEqual((code, out["result"]), (2, "cannot-run"))
+        self.assertEqual(out["steps"][0]["name"], "kernel")
 
     def test_no_graph_cannot_run(self):
         self.bind()
