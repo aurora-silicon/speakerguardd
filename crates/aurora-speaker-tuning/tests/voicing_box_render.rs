@@ -98,7 +98,8 @@ fn explicit_tone_volume_matches_production_at_zero_middle_and_full_volume() {
         levels.push(energy);
     }
     assert!(levels[0] < levels[1] && levels[1] < levels[2], "automation must change the render: {levels:?}");
-    // An absent override keeps the unwired rig's least-passing carry.
+    // An absent override runs the box as an unwired box runs: its
+    // automation held at the saved SystemVolume, none left to follow.
     let spec = renderer::tone_spec(stage, 2, 48_000.0, None, &mut d).unwrap();
     assert!(spec.links.is_empty());
     let Kind::Tone(tone) = &spec.nodes[0].kind else { panic!("expected Tone") };

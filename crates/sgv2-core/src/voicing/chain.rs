@@ -166,6 +166,32 @@ pub struct Tone {
     pub dynamic_automation: Vec<DynamicToneAutomation>,
 }
 
+impl Tone {
+    /// The box as it runs at one fixed system-volume scalar: every volume
+    /// automation entry applied once at `scalar`, none left to follow. A
+    /// box whose SystemVolume input the graph leaves alone runs its
+    /// automation at the saved value of that parameter, never at a volume
+    /// the user sets.
+    pub fn at_volume(&self, fs: f64, scalar: f64) -> Tone {
+        let width = self.channels.len().min(MAX_CHANNELS);
+        let count = self.dynamic.len().min(crate::prestage::MAX_DYNAMIC_FILTERS);
+        let mut p = PreParams::identity(width);
+        p.channel[..width].copy_from_slice(&self.channels[..width]);
+        p.dynamic_count = count;
+        p.dynamic[..count].copy_from_slice(&self.dynamic[..count]);
+        let mut stage = PreStage::with_rate(p, fs);
+        apply_tone_automation(&mut stage, &self.channels[..width], &self.automation, fs, scalar);
+        apply_dynamic_tone_automation(&mut stage, &self.dynamic[..count], &self.dynamic_automation, fs, scalar);
+        let params = stage.params();
+        Tone {
+            channels: params.channel[..width].to_vec(),
+            automation: Vec::new(),
+            dynamic: params.dynamic[..count].to_vec(),
+            dynamic_automation: Vec::new(),
+        }
+    }
+}
+
 /// A precompiled group-bypass mask of one filter box.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ToneVariant {
@@ -1370,6 +1396,26 @@ mod tests {
             volume: Default::default(),
         };
         (spec, channel)
+    }
+
+    #[test]
+    fn an_unwired_tone_runs_its_automation_at_one_fixed_volume() {
+        let fs = 48_000.0;
+        let Kind::Tone(tone) = automated_tone().nodes[0].kind.clone() else { panic!("not a tone") };
+        // below set point A: the saved section itself
+        let held = tone.at_volume(fs, 0.0);
+        assert!(held.automation.is_empty() && held.dynamic_automation.is_empty());
+        assert_eq!(held.channels[0].sections[0], tone.channels[0].sections[0]);
+        // at the midpoint: the midpoint's own shelf, as the running chain sets it
+        let mid = tone.at_volume(fs, 0.5);
+        assert_eq!(
+            mid.channels[0].sections[0],
+            crate::voicing::tone::low_shelf(9.0, 200.0, core::f64::consts::FRAC_1_SQRT_2, fs)
+        );
+        let mut chain = Chain::new(automated_tone(), fs, 512).unwrap();
+        chain.set_param(GraphParam::VolumeScalar, 0.5);
+        assert_eq!(tone_channel(&chain).sections[0], mid.channels[0].sections[0]);
+        assert_eq!(tone_channel(&chain).gain, mid.channels[0].gain);
     }
 
     #[test]
