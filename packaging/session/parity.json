@@ -1,8 +1,8 @@
 {
  "format": 1,
- "law": "bd53c7bf0efb0c28793b8ca99ac9bb2f87cd1f8ae21c3f238dfba0c8e12ae405",
+ "law": "8ca3c795820628d279b2af4c4657f1fef204c14a85d405ac5947f4109bb03b09",
  "reference": "macOS 26.6.2 25G83 Audio Units",
- "rev": "82266b8c92b8b1a328b1c14f091e860152e29390",
+ "rev": "7a645287ad8508276af327a866a467bc0e541ad8",
  "tolerance": {
   "louder_db": 0.25,
   "quieter_db": 1.0
@@ -15,9 +15,9 @@
    "also_speaker_ids": [],
    "verdict": "refused",
    "measured": 37,
-   "worst_louder_db": 12.235,
-   "worst_quieter_db": -52.408,
-   "reason": "8 cell(s) louder than macOS by more than 0.25 dB, worst +12.23 dB (lane 0, tone_160_-12); 2 cell(s) quieter than macOS by more than 1.0 dB, worst -52.41 dB (lane 0, burst_1000)"
+   "worst_louder_db": 2.423,
+   "worst_quieter_db": -13.095,
+   "reason": "7 cell(s) louder than macOS by more than 0.25 dB, worst +2.42 dB (lane 0, step_down_2000); 4 cell(s) quieter than macOS by more than 1.0 dB, worst -13.09 dB (lane 0, step_up_125)"
   },
   {
    "key": "8246d16e753c88cd093fe6a8999e42246fbd6d8b1a1d26d723cde9d71668dcfe",
@@ -37,9 +37,9 @@
    "also_speaker_ids": [],
    "verdict": "refused",
    "measured": 74,
-   "worst_louder_db": 1.685,
-   "worst_quieter_db": -44.981,
-   "reason": "2 cell(s) louder than macOS by more than 0.25 dB, worst +1.69 dB (lane 0, burst_1000); 74 cell(s) quieter than macOS by more than 1.0 dB, worst -44.98 dB (lane 0, burst_1000)"
+   "worst_louder_db": 1.641,
+   "worst_quieter_db": -44.989,
+   "reason": "2 cell(s) louder than macOS by more than 0.25 dB, worst +1.64 dB (lane 0, burst_1000); 74 cell(s) quieter than macOS by more than 1.0 dB, worst -44.99 dB (lane 0, burst_1000)"
   },
   {
    "key": "6e60f82770b70ff55f499440d0aefc52c3b0aa21e03627a9bcdec3459202e2f9",
@@ -59,9 +59,9 @@
    "also_speaker_ids": [],
    "verdict": "refused",
    "measured": 37,
-   "worst_louder_db": 12.235,
-   "worst_quieter_db": -52.408,
-   "reason": "8 cell(s) louder than macOS by more than 0.25 dB, worst +12.23 dB (lane 0, tone_160_-12); 2 cell(s) quieter than macOS by more than 1.0 dB, worst -52.41 dB (lane 0, burst_1000)"
+   "worst_louder_db": 2.423,
+   "worst_quieter_db": -13.095,
+   "reason": "7 cell(s) louder than macOS by more than 0.25 dB, worst +2.42 dB (lane 0, step_down_2000); 4 cell(s) quieter than macOS by more than 1.0 dB, worst -13.09 dB (lane 0, step_up_125)"
   },
   {
    "key": "20d82db71d69a4e5feea6ca1bcf695729a57cc15d21ea7386f295f66534f0317",
@@ -142,9 +142,9 @@
    "also_speaker_ids": [],
    "verdict": "refused",
    "measured": 37,
-   "worst_louder_db": 12.235,
-   "worst_quieter_db": -52.408,
-   "reason": "8 cell(s) louder than macOS by more than 0.25 dB, worst +12.23 dB (lane 0, tone_160_-12); 2 cell(s) quieter than macOS by more than 1.0 dB, worst -52.41 dB (lane 0, burst_1000)"
+   "worst_louder_db": 2.423,
+   "worst_quieter_db": -13.095,
+   "reason": "7 cell(s) louder than macOS by more than 0.25 dB, worst +2.42 dB (lane 0, step_down_2000); 4 cell(s) quieter than macOS by more than 1.0 dB, worst -13.09 dB (lane 0, step_up_125)"
   },
   {
    "key": "9f771cd7b4bbbe8c3a56a79a93bb231baeee2406dba93f16300ade1e5ac81f4c",
@@ -225,9 +225,9 @@
    "also_speaker_ids": [],
    "verdict": "refused",
    "measured": 65,
-   "worst_louder_db": 21.001,
-   "worst_quieter_db": -2.845,
-   "reason": "15 cell(s) louder than macOS by more than 0.25 dB, worst +21.00 dB (lane 1, burst_1000); 1 cell(s) quieter than macOS by more than 1.0 dB, worst -2.84 dB (lane 1, burst_1000)"
+   "worst_louder_db": 8.836,
+   "worst_quieter_db": -15.924,
+   "reason": "8 cell(s) louder than macOS by more than 0.25 dB, worst +8.84 dB (lane 1, step_up_125); 6 cell(s) quieter than macOS by more than 1.0 dB, worst -15.92 dB (lane 1, step_up_125)"
   },
   {
    "key": "b5a8cdb50d9e4cc8c64744a9ea38ce8496d3a2dd1dcf4990d41e9ce4ad1436ce",
@@ -324,9 +324,9 @@
    "also_speaker_ids": [],
    "verdict": "refused",
    "measured": 37,
-   "worst_louder_db": 11.811,
-   "worst_quieter_db": -51.789,
-   "reason": "8 cell(s) louder than macOS by more than 0.25 dB, worst +11.81 dB (lane 0, step_down_2000); 2 cell(s) quieter than macOS by more than 1.0 dB, worst -51.79 dB (lane 0, burst_1000)"
+   "worst_louder_db": 2.921,
+   "worst_quieter_db": -12.246,
+   "reason": "6 cell(s) louder than macOS by more than 0.25 dB, worst +2.92 dB (lane 0, step_down_2000); 4 cell(s) quieter than macOS by more than 1.0 dB, worst -12.25 dB (lane 0, step_up_125)"
   },
   {
    "key": "5267a9e210fa3e550df5a4a8f9446ea4213bb09a3546514bad703ed34ca0393b",
