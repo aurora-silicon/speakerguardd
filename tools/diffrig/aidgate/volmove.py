@@ -27,7 +27,7 @@ FS = 48000
 S0, S1, AT = 0.15, 0.16, 48128
 N = 4800
 LIMIT_DB = -20.0
-LANE_DB = 30.0
+LANE_DB = 20.0
 PROGRAMS = {"lo": (100.0, 700.0), "hi": (6000.0,)}
 SECONDS = 2
 
@@ -136,7 +136,7 @@ def gate(a):
             top = max(lv for _, lv in r)
             e["lanes"][name] = [None if x is None else round(x, 1) for x, _ in r]
             for c, (x, lv) in enumerate(r):
-                if x is not None and lv >= top - 2 * LANE_DB / 2 and x > worst:
+                if x is not None and lv >= top - LANE_DB and x > worst:
                     worst, at = x, f"{name} lane {c}"
         if ok:
             e["worst_db"] = round(worst, 1)
