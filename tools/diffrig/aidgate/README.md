@@ -22,7 +22,7 @@ Two sides, one program:
 The gate compares each segment on each unit lane: the RMS of the second half, plus 10 ms windows on
 dynamic segments where either side is above -80 dBFS. A lane more than 60 dB under the segment's loudest
 lane on both sides (a crossover stop band) is numerical residue and is not measured. Any value outside 0.05 dB in either direction
-fails. Both sides are compared at their original sample positions with zero latency compensation.
+fails. Floor residue (below) is reported separately and does not count over the limit. Both sides are compared at their original sample positions with zero latency compensation.
 Norm meters each render call before applying gain to that same call; only its intrinsic look-ahead
 remains. The raw cross-correlation lag is reported for diagnosis and never shifts the comparison. An AID passes only if its chain compiles with no stubs, the lane counts match and no
 measurement is over the limit. Each AU box's cumulative output is compared the same way, and the first
@@ -52,12 +52,36 @@ into the file a Mac checks before v2 may take its speakers (`packaging/session/p
   `box_host --propstrip`), as macOS does.
 - Verdict per tuning: refused when the reference failed, v2 does not compile it, the compiler reports
   a stub, an unwired parameter or a gap, the lanes differ, any sample is non-finite, or any measured
-  cell is louder than macOS by more than 0.25 dB or quieter by more than 1.0 dB.
+  cell is louder than macOS by more than 0.25 dB or quieter by more than 1.0 dB. Floor residue
+  (below) is reported in the entry (`floor_residue_cells`, `worst_floor_residue_db`) and never refuses.
 - Each file is bound to `law`, a hash of the rendering code (`crates/aurora-speaker-tuning/build.rs`).
   A build whose law differs refuses every Mac until the file is regenerated: any change to the voicing
   compiler or engine needs a new run before it can ship.
 - The file holds keys, verdicts, reasons and summary numbers only. Every render and the per-cell rows
   (`--details`) stay in private, tainted directories.
+
+### Floor residue
+
+Both `gate.py` and `attest.py` apply one per-measurement rule, the same for every tuning (it names
+no board and holds no tuning data):
+
+- a measurement whose macOS level is more than 55 dB (`FLOOR_RESIDUE_DB`) under its lane's own peak
+  (the loudest level that lane reaches anywhere in the program, macOS side), where v2 is **quieter**
+  than macOS, is *floor residue*: reported and counted, not a failure or a refusal;
+- a measurement where v2 is **louder** than macOS fails at every level, floor or not;
+- every main-band measurement (55 dB or less under the lane's peak) is gated as before.
+
+Why: the macOS voicing units run their filters in Float32 arithmetic. Low-corner, high-order
+sections at 48 kHz have a large low-frequency noise gain, so a full-scale tone leaves a
+deterministic residue around -90 dBFS that a double-precision path does not have (measured
+2026-11-09 on the installed 25G83 VirtualBass unit: a 4 kHz or 16 kHz tone at 0.7 peak leaves
+-89..-91 dBFS below 2 kHz, linear in level and independent of the harmonic and blend gains;
+v2: -143..-174 dBFS). In the woofer lanes of a high tone that residue is the whole cell, so v2
+reads several dB "quieter" there while the program itself matches. Such a cell is inaudible
+(more than 55 dB under the lane's own program) and on the safe side: v2 sends less to that
+driver, never more. Louder cells stay failures at any level because extra energy is what
+protection must never pass. The rule does not replace exact parity: matching the units'
+Float32 arithmetic remains the goal, and the gate still prints every floor-residue cell.
 
 ### When it runs
 
