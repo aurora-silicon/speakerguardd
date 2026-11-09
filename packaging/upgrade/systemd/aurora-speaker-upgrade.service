@@ -1,0 +1,21 @@
+[Unit]
+Description=Move the speakers to speakerguardd v2 with this Mac's own tuning
+Documentation=https://github.com/aurora-silicon/speakerguardd/blob/v2/packaging/upgrade/README.md
+# Shipped disabled: users opt in (systemctl enable --now aurora-speaker-upgrade)
+# until the rollout is approved. Idempotent: a Mac already on v2 with its
+# bundle does nothing. Any failure leaves the legacy protection in charge.
+After=local-fs.target sound.target systemd-udev-settle.service network-online.target
+Wants=network-online.target
+ConditionPathExists=/proc/device-tree/compatible
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/aurora-speaker-upgrade run
+# 2 = cannot run yet (no card, the speakers busy): not a failure of the unit.
+SuccessExitStatus=2
+TimeoutStartSec=900
+StateDirectory=aurora-speaker-upgrade
+StateDirectoryMode=0700
+
+[Install]
+WantedBy=multi-user.target

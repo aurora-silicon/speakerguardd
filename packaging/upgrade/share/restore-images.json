@@ -1,0 +1,7 @@
+{
+  "comment": "Public addresses of Apple's macOS restore images by build, for route 2 when Apple's IPSW feed no longer lists a build. Addresses only, no Apple data.",
+  "restore_images": {
+    "25G72": "https://updates.cdn-apple.com/2026SummerFCS/fullrestores/140-65618/10445B26-DE2C-43EC-9149-0A831602E74B/UniversalMac_26.6_25G72_Restore.ipsw",
+    "25G83": "https://updates.cdn-apple.com/2026SummerFCS/fullrestores/140-75212/A2A24B94-1FC1-45A3-93F7-C51B02AF1F4D/UniversalMac_26.6.2_25G83_Restore.ipsw"
+  }
+}
