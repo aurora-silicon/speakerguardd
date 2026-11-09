@@ -130,6 +130,28 @@ def compare(mac, v2, segs, np):
     return rows
 
 
+def verdict(rows):
+    """The attestation verdict for measured cells ({"seg", "lane", "louder",
+    "quieter"} in dB): refused on any cell louder than macOS by more than
+    LOUDER_DB or quieter by more than QUIETER_DB."""
+    if not rows:
+        return {"verdict": "refused", "reason": "nothing measured", "measured": 0}
+    lo = max(rows, key=lambda r: r["louder"])
+    qu = min(rows, key=lambda r: r["quieter"])
+    why = []
+    if lo["louder"] > LOUDER_DB:
+        n = sum(r["louder"] > LOUDER_DB for r in rows)
+        why.append(f"{n} cell(s) louder than macOS by more than {LOUDER_DB} dB, worst {lo['louder']:+.2f} dB "
+                   f"(lane {lo['lane']}, {lo['seg']})")
+    if qu["quieter"] < -QUIETER_DB:
+        n = sum(r["quieter"] < -QUIETER_DB for r in rows)
+        why.append(f"{n} cell(s) quieter than macOS by more than {QUIETER_DB} dB, worst {qu['quieter']:+.2f} dB "
+                   f"(lane {qu['lane']}, {qu['seg']})")
+    return {"measured": len(rows), "worst_louder_db": round(lo["louder"], 3),
+            "worst_quieter_db": round(qu["quieter"], 3), "verdict": "refused" if why else "pass",
+            "reason": "; ".join(why) if why else f"within +{LOUDER_DB}/-{QUIETER_DB} dB of macOS on {len(rows)} cells"}
+
+
 def gate_one(a, v, segs, np):
     e = {"key": v.get("key"), "aid": v["aid"], "speaker_id": v["speaker_id"],
          "also_speaker_ids": v.get("also_speaker_ids", []), "verdict": "refused"}
@@ -175,22 +197,7 @@ def gate_one(a, v, segs, np):
         e["reason"] = "non-finite output"
         return e, None
     rows = compare(mac, v2, segs, np)
-    lo = max(rows, key=lambda r: r["louder"])
-    qu = min(rows, key=lambda r: r["quieter"])
-    e["measured"] = len(rows)
-    e["worst_louder_db"] = round(lo["louder"], 3)
-    e["worst_quieter_db"] = round(qu["quieter"], 3)
-    why = []
-    if lo["louder"] > LOUDER_DB:
-        n = sum(r["louder"] > LOUDER_DB for r in rows)
-        why.append(f"{n} cell(s) louder than macOS by more than {LOUDER_DB} dB, worst {lo['louder']:+.2f} dB "
-                   f"(lane {lo['lane']}, {lo['seg']})")
-    if qu["quieter"] < -QUIETER_DB:
-        n = sum(r["quieter"] < -QUIETER_DB for r in rows)
-        why.append(f"{n} cell(s) quieter than macOS by more than {QUIETER_DB} dB, worst {qu['quieter']:+.2f} dB "
-                   f"(lane {qu['lane']}, {qu['seg']})")
-    e["verdict"] = "refused" if why else "pass"
-    e["reason"] = "; ".join(why) if why else f"within +{LOUDER_DB}/-{QUIETER_DB} dB of macOS on {len(rows)} cells"
+    e.update(verdict(rows))
     return e, rows
 
 
