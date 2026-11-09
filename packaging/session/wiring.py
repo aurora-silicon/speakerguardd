@@ -107,8 +107,11 @@ SENSE_BITS = 16
 #   ring, i.e. 94/s of playback against 93.75/s for 512-frame periods, and
 #   with period interrupts a forced 0.4 s slew re-prepared the speaker PCM
 #   0 times (timer: 14 SETUP/XRUN restarts and 27 sense resyncs, SINKGAP
-#   2026-11-09). The T8140/T8142 transports' cadence is unproven here and
-#   keeps the timer.
+#   2026-11-09). The T8140 (MacBook Neo) speaker DMA raises one interrupt
+#   per period too (94/s for 512-frame periods on its own line), and its
+#   timer-scheduled sink stopped and restarted 12 times under a forced slew
+#   1.5 min after boot (0 with period interrupts; SINKGAP 2026-11-09). The
+#   T8142 transport's cadence is unproven here and keeps the timer.
 TRANSPORTS = {
     # sound/soc/apple/mca.c: S16_LE, S24_LE, S32_LE
     "apple,mca": {"transport": "mca", "formats": ["S16_LE", "S24_LE", "S32_LE"], "sense_batch": True, "speaker_headroom": 0,
@@ -118,7 +121,7 @@ TRANSPORTS = {
                               "speaker_irq": True},
     # sound/soc/apple/aop_t8140.rs: S32_LE playback, no sense
     "apple,t8140-aop-audio": {"transport": "aop-t8140", "formats": ["S32_LE"], "sense_batch": True, "speaker_headroom": 0,
-                              "speaker_irq": False},
+                              "speaker_irq": True},
     # t8152_aop_audio.rs, T8142 configuration: ADMAC burst-residue DMA,
     # S24_LE playback and S16_LE sense, not the T6041 firmware ring above.
     "apple,t8142-aop-audio": {"transport": "aop-dma", "formats": ["S24_LE"], "sense_batch": False, "speaker_headroom": 0,
