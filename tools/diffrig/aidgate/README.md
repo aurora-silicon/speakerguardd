@@ -104,6 +104,7 @@ stop band after the 2 kHz step-down misses an exact convolution with its own imp
 So the gate measures that spread on macOS itself:
 
 1. `attest.py spread` compares every reference with renders of the same tuning from four or more
+   (eight on 25G83 and 25C56)
    copies of the program in which every nonzero sample moved by one Float32 ULP (seeded; zeros
    stay zero). A cell's spread is the largest |dB| of any of its measurements over those renders.
 2. A measurement is held to that spread instead of the ordinary tolerance (louder included) only
@@ -116,7 +117,9 @@ So the gate measures that spread on macOS itself:
    cells (AID9 step-down tail 0.14, AID36 31.5 Hz 0.12, AID10 20 Hz 0.07): at that size macOS does
    not agree with itself, so a 0.05 dB demand there tests rounding luck, not parity. The cap keeps
    every main-band difference within the attestation's own louder bound.
-4. `spread-25G83.json` (this directory) holds tuning keys, cell names and spread values only: no
+4. `spread-<build>.json` (this directory, one per macOS release that has a host for the perturbed
+   renders: 25G83 and 25C56 today; 26A428 needs a Mac on that build and is gated by the ordinary
+   rule until it has one) holds tuning keys, cell names and spread values only: no
    Apple data. `parity.json` records the spread file's SHA-256 and the rule's limits in that release's block (`releases[].spread`); a release without a spread file is gated by the ordinary rule. Regenerate
    both for every macOS release, from the same references (`attest_refs.sh` once per perturbed
    program: `GATE`-side `perturb.py`).
