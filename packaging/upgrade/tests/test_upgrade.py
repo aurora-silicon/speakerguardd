@@ -70,6 +70,7 @@ class GoArchive(unittest.TestCase):
         self.data = b"".join(b64(r["data"]) for r in recs)
         self.f = f
 
+    @unittest.skipUnless(aea_ro.have_lzfse(), "no liblzfse (its segment is LZFSE)")
     def test_decode(self):
         a = aea_ro.Archive(Bytes(self.data), archive_key=b64(self.f["key"]))
         self.assertEqual(a.size, len(b64(self.f["plain"])))
@@ -77,6 +78,8 @@ class GoArchive(unittest.TestCase):
         self.assertEqual(a.pread(10, 100), b64(self.f["plain"])[100:110])
 
     def test_every_byte_is_authenticated(self):
+        # Authentication fails before any decompression, so this needs no
+        # LZFSE decoder.
         for off in (len(self.data) - 1, 200, 5000, len(self.data) - 50):
             d = bytearray(self.data)
             d[off] ^= 1

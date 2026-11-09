@@ -19,7 +19,12 @@ signal. No playback, no audio device. Outputs made from Apple tuning are
 Apple-derived: keep them in a private directory.
 
     gr.py --tunings DIR --aid N --in stereo.f32 --out unit_in.f32 --box-host BIN
-          [--meta FILE] [--keep DIR] [--param NAME=VALUE ...]
+          [--strip NAME] [--propstrip NAME] [--meta FILE] [--keep DIR] [--param NAME=VALUE ...]
+
+`--strip`/`--propstrip` name the speaker configuration's strip and property
+strip (in AID<n>/DSP/Strips), as the DSP database selects them for a speaker
+ID. The property strip's properties are set on each box as macOS sets them;
+its `Path` values under /System/Library/Audio/Tunings are read from --tunings.
 """
 import argparse, json, os, plistlib, re, shutil, struct, subprocess, sys, tempfile
 from array import array
@@ -173,6 +178,7 @@ def write_f32(path, chans):
 class Renderer:
     def __init__(self, args, strip, work):
         self.args, self.strip, self.work = args, strip, work
+        self.propstrip = None
 
     def box_host(self, name, sub, chans, sets, tag="run"):
         n = len(chans)
@@ -181,6 +187,8 @@ class Renderer:
         cmd = ["nice", "-n", "15", self.args.box_host, "--strip", self.strip, "--stage", name,
                "--subtype", sub, "--factory", FACTORY[sub], "--channels", str(n),
                "--in", fi, "--out", fo, "--meta", fm, "--q", str(self.args.q), "--sr", str(self.args.sr)]
+        if self.propstrip:
+            cmd += ["--propstrip", self.propstrip]
         for pid, val in sets:
             cmd += ["--set", f"{pid}={val!r}"]
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
@@ -194,12 +202,34 @@ class Renderer:
         return y, meta
 
 
+def remap_propstrip(path, tunings, work):
+    """The property strip with its Path values read from `tunings` (they name
+    /System/Library/Audio/Tunings/...), written to `work`; the protection
+    unit's own properties stay (gr.py never runs it)."""
+    ps = plistlib.load(open(path, "rb"))
+    sysroot = "/System/Library/Audio/Tunings/"
+    for box in ps.get("Boxes", []):
+        for p in box.get("Properties", []):
+            v = p.get("Path")
+            if isinstance(v, str) and v.startswith(sysroot):
+                local = os.path.join(tunings, v[len(sysroot):])
+                # a path the tree lacks stays: box_host fails on it only if
+                # a box it renders needs it
+                if os.path.exists(local):
+                    p["Path"] = local
+    out = os.path.join(work, "propstrip.plist")
+    with open(out, "wb") as f:
+        plistlib.dump(ps, f, fmt=plistlib.FMT_XML)
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tunings", required=True)
     ap.add_argument("--aid", required=True, type=int)
     ap.add_argument("--graph", default="builtin_speaker_out.dspg")
     ap.add_argument("--strip", default="builtin_speaker_out_general.austrip")
+    ap.add_argument("--propstrip")
     ap.add_argument("--in", dest="inp", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--meta")
@@ -228,6 +258,8 @@ def main():
     work = args.keep or tempfile.mkdtemp(prefix="gr.")
     os.makedirs(work, exist_ok=True)
     R = Renderer(args, strip, work)
+    if args.propstrip:
+        R.propstrip = remap_propstrip(os.path.join(root, "Strips", args.propstrip), args.tunings, work)
     bypassed = strip_bypassed(strip)
 
     box_sets, padd_in = {}, {}
