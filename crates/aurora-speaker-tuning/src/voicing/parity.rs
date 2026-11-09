@@ -189,8 +189,11 @@ pub fn gaps(c: &Compiled) -> Check {
     check("compiler-gaps", why.is_empty(), if why.is_empty() { "none".into() } else { why.join("; ") })
 }
 
-/// Deterministic stereo test program, `(name, seconds, left, right)`.
-fn signal(kind: &str, f: f64, db: f64, secs: f64) -> (Vec<f32>, Vec<f32>) {
+/// A stereo program: left, right.
+type Stereo = (Vec<f32>, Vec<f32>);
+
+/// A deterministic stereo test signal.
+fn signal(kind: &str, f: f64, db: f64, secs: f64) -> Stereo {
     let n = (secs * FS) as usize;
     let a = 10f64.powf(db / 20.0);
     let mut l = vec![0f32; n];
@@ -234,7 +237,7 @@ fn signal(kind: &str, f: f64, db: f64, secs: f64) -> (Vec<f32>, Vec<f32>) {
 
 /// Renders `prog` (stereo) through a fresh chain from `spec`, host block
 /// `block`, at full system volume. Returns lanes x frames.
-fn render(c: &Compiled, prog: &(Vec<f32>, Vec<f32>), block: usize) -> Result<Vec<Vec<f32>>> {
+fn render(c: &Compiled, prog: &Stereo, block: usize) -> Result<Vec<Vec<f32>>> {
     let mut chain = Chain::new(c.spec.clone(), FS, block).ok_or_else(|| bad("the engine refuses the chain"))?;
     chain.set_param(GraphParam::VolumeScalar, 1.0);
     chain.set_param(GraphParam::VolumeDb, 0.0);
@@ -298,7 +301,7 @@ const STOPBAND_DB: f64 = 60.0;
 pub fn invariants(c: &Compiled) -> Result<Vec<Check>> {
     let mut out = Vec::new();
     let lanes = c.spec.outputs.len();
-    let progs: Vec<(String, (Vec<f32>, Vec<f32>))> = vec![
+    let progs: Vec<(String, Stereo)> = vec![
         ("silence".into(), signal("silence", 0.0, 0.0, 1.0)),
         ("sweep_0".into(), signal("sweep", 0.0, 0.0, 4.0)),
         ("noise_0".into(), signal("noise", 0.0, 0.0, 2.0)),
