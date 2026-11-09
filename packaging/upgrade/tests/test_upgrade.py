@@ -296,6 +296,47 @@ class BootRefusalRecord(unittest.TestCase):
         self.assertNotEqual(k, self.saved[2](types.SimpleNamespace(unit="u2")))
 
 
+class V2Umask(unittest.TestCase):
+    def test_v2_programs_run_with_the_units_umask(self):
+        """B4: v2's provisioning and self-check run as their units would
+        (umask 022), not with this tool's 077."""
+        import subprocess, tempfile
+        from aurora_speaker_upgrade import upgrade as up
+        old = os.umask(0o077)
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                r = up.run_v2(["sh", "-c", "umask"])
+                self.assertEqual(r.stdout.strip(), "0022")
+                self.assertEqual(up.run(["sh", "-c", "umask"]).stdout.strip(), "0077")
+        finally:
+            os.umask(old)
+
+
+class StorePermissions(unittest.TestCase):
+    """The store holds this Mac's extracted Apple tuning: root only (0700
+    directories, 0600 files) after a run, whatever umask v2's own programs
+    get (B4 gave them 022)."""
+
+    def test_store_is_root_only_after_a_run(self):
+        import stat, tempfile
+        from aurora_speaker_upgrade import upgrade as up
+        old = os.umask(0o077)  # what main() sets
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                st = up.Store(os.path.join(d, "store"))
+                st.ensure()
+                st.put_bundle({"manifest.json": b"{}", "tuning/AID13/a.aupreset": b"x" * 16})
+                up.write_file(st.interface, "v2\n", 0o600)
+                st.save({"switched": True})
+                up.run_v2(["true"])  # v2 subprocesses get 022, the store does not change
+                for root, dirs, files in os.walk(st.root):
+                    self.assertEqual(stat.S_IMODE(os.stat(root).st_mode), 0o700, root)
+                    for f in files:
+                        self.assertEqual(stat.S_IMODE(os.stat(os.path.join(root, f)).st_mode), 0o600, f)
+        finally:
+            os.umask(old)
+
+
 class LegacyStart(unittest.TestCase):
     """RC8 E2E B2: a revert starts the older daemon the packaged udev rules
     want for the sense PCM, never every installed one (speakerguardd 0.1
