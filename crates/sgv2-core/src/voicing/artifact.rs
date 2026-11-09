@@ -211,6 +211,7 @@ impl Wire for ToneShape {
             Self::ButterworthShelf => (7, 0),
             Self::ButterworthBandShelf => (8, 0),
             Self::LegacyPeak => (9, 0),
+            Self::EndpointPublishedPeak => (10, 0),
         };
         (tag as u32).put(o);
         arg.put(o);
@@ -229,6 +230,7 @@ impl Wire for ToneShape {
             (7, 0) => Self::ButterworthShelf,
             (8, 0) => Self::ButterworthBandShelf,
             (9, 0) => Self::LegacyPeak,
+            (10, 0) => Self::EndpointPublishedPeak,
             _ => return Err(BlobError::Length),
         })
     }
@@ -582,5 +584,20 @@ mod volume_law_tests {
         let mut bad = Vec::new();
         7u32.put(&mut bad);
         assert_eq!(Curve::get(&mut Reader(&bad)), Err(BlobError::Length));
+    }
+}
+
+#[cfg(test)]
+mod tone_shape_tests {
+    use super::*;
+
+    #[test]
+    fn endpoint_published_peak_round_trips() {
+        let shape = ToneShape::EndpointPublishedPeak;
+        let mut bytes = Vec::new();
+        shape.put(&mut bytes);
+        let mut reader = Reader(&bytes);
+        assert_eq!(ToneShape::get(&mut reader), Ok(shape));
+        assert!(reader.0.is_empty());
     }
 }

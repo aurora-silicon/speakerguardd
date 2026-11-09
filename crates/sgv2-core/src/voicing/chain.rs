@@ -98,6 +98,10 @@ pub struct Relay {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToneShape {
     Peak,
+    /// The fourth automation path of a box containing a type-18 slot. At
+    /// its B endpoint this peak republishes frequency through the platform
+    /// Float32 logarithm/exponential pair before construction.
+    EndpointPublishedPeak,
     /// A peak of the first ToneMeister algorithm version ([`super::tone::legacy_peak`]).
     LegacyPeak,
     LowPass(u32),
@@ -446,6 +450,19 @@ fn automated_values(a: &ToneAutomation, scalar: f64) -> (f64, f64) {
     automated_point_values(a.a, a.b, a.midpoint, scalar)
 }
 
+/// The automation controller treats the last fifteen Float32 relative ULPs
+/// as the B endpoint. This includes values reconstructed from a dB-domain
+/// full-volume word that land just below the saved endpoint.
+fn at_b_endpoint(a: &ToneAutomation, scalar: f64) -> bool {
+    let t = (scalar - a.a.scalar) / (a.b.scalar - a.a.scalar);
+    t >= 1.0 - 15.0 * f64::from(f32::EPSILON)
+}
+
+fn published_frequency(frequency_hz: f64) -> f64 {
+    let frequency_hz = frequency_hz as f32;
+    f64::from(crate::platform_math::expf(libm::log(f64::from(frequency_hz)) as f32))
+}
+
 /// The edge frequencies a Butterworth shelf (type 2: two; band shelf, type
 /// 0: four) takes at `scalar`, with the gain. The installed unit moves the
 /// shelf as a whole (black-box renders): the set points' frequency replaces
@@ -483,9 +500,21 @@ fn apply_tone_automation(stage: &mut PreStage, base: &[Channel], automation: &[T
                 ToneShape::Gain => {
                     channel.sections[target.section] = super::tone::gain_section(gain_db);
                 }
-                ToneShape::Peak | ToneShape::LegacyPeak | ToneShape::LowShelf | ToneShape::HighShelf => {
+                ToneShape::Peak
+                | ToneShape::EndpointPublishedPeak
+                | ToneShape::LegacyPeak
+                | ToneShape::LowShelf
+                | ToneShape::HighShelf => {
                     let section = match a.shape {
-                        ToneShape::Peak => super::tone::peak(gain_db, frequency_hz, a.quality, fs),
+                        ToneShape::Peak | ToneShape::EndpointPublishedPeak => {
+                            let frequency_hz =
+                                if a.shape == ToneShape::EndpointPublishedPeak && at_b_endpoint(a, scalar) {
+                                    published_frequency(frequency_hz)
+                                } else {
+                                    frequency_hz
+                                };
+                            super::tone::peak(gain_db, frequency_hz, a.quality, fs)
+                        }
                         ToneShape::LegacyPeak => super::tone::legacy_peak(gain_db, frequency_hz, a.quality, fs),
                         ToneShape::LowShelf => super::tone::low_shelf(gain_db, frequency_hz, a.quality, fs),
                         _ => super::tone::high_shelf(gain_db, frequency_hz, a.quality, fs),
@@ -1425,6 +1454,36 @@ mod tests {
         chain.set_param(GraphParam::VolumeScalar, 0.5);
         assert_eq!(tone_channel(&chain).sections[0], mid.channels[0].sections[0]);
         assert_eq!(tone_channel(&chain).gain, mid.channels[0].gain);
+    }
+
+    #[test]
+    fn endpoint_published_peak_uses_the_b_path_only_at_its_float32_endpoint() {
+        let fs = 48_000.0;
+        let mut channel = Channel::IDENTITY;
+        channel.count = 1;
+        let automation = ToneAutomation {
+            shape: ToneShape::EndpointPublishedPeak,
+            quality: 10.0,
+            fixed: [0.0; 3],
+            max_order: 10,
+            a: TonePoint { scalar: 0.0, gain_db: -3.0, frequency_hz: 300.0 },
+            b: TonePoint { scalar: 1.0, gain_db: -12.0, frequency_hz: 333.0 },
+            midpoint: Some(TonePoint { scalar: 0.5, gain_db: -6.0, frequency_hz: 320.0 }),
+            targets: vec![ToneTarget { channel: 0, section: 0 }],
+        };
+        assert!(at_b_endpoint(&automation, 1.0 - 15.0 * f64::from(f32::EPSILON)));
+        assert!(!at_b_endpoint(&automation, 1.0 - 16.0 * f64::from(f32::EPSILON)));
+        let tone = Tone {
+            channels: vec![channel],
+            automation: vec![automation],
+            dynamic: Vec::new(),
+            dynamic_automation: Vec::new(),
+        };
+        let endpoint = tone.at_volume(fs, 1.0).channels[0].sections[0];
+        let direct = crate::voicing::tone::peak(-12.0, 333.0, 10.0, fs);
+        let published = crate::voicing::tone::peak(-12.0, published_frequency(333.0), 10.0, fs);
+        assert_ne!(direct, published);
+        assert_eq!(endpoint, published);
     }
 
     #[test]

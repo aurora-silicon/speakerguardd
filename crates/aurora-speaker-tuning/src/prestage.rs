@@ -341,6 +341,7 @@ pub fn voicing_tone(
     }
     let (mut out, mut partial, mut dynamic_automation) = (Vec::new(), Vec::new(), Vec::new());
     let dynamic = tone_dynamic(&parts, &ctx)?;
+    let has_type_18 = dynamic.iter().any(|slot| slot.params.kind == DynamicKind::HighShelf);
     if mode == Realise::LeastPassing || stage.bypass {
         return Ok((Tone { channels, automation: out, dynamic, dynamic_automation }, partial));
     }
@@ -426,8 +427,17 @@ pub fn voicing_tone(
             Some((at, m)) => Some(point(at, m.gain, m.f0, "M")?),
             None => None,
         };
+        // A type-18 graph routes the fourth automation record's three-point
+        // type-1 B endpoint through its Float32 log/exp publication object.
+        // The record path and slot topology select this arithmetic; gain is
+        // not a selector.
+        let shape = if has_type_18 && e == 3 && saved.shape == ToneShape::Peak && midpoint.is_some() {
+            ToneShape::EndpointPublishedPeak
+        } else {
+            saved.shape
+        };
         out.push(ToneAutomation {
-            shape: saved.shape,
+            shape,
             quality: saved.quality,
             fixed: saved.fixed,
             max_order: saved.max_order,
