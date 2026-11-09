@@ -190,7 +190,8 @@ fn speaker_id_comes_from_the_manifest_then_the_device_tree() {
     let b = spid_bundle("e2e-spid-clash", Some(7));
     assert!(load_with(&b, Options { device_tree_speaker_id: Some(3), ..Options::default() }).is_err());
     // An explicit override wins.
-    let t = load_with(&b, Options { speaker_id: Some(65535), device_tree_speaker_id: Some(3) }).unwrap();
+    let t = load_with(&b, Options { speaker_id: Some(65535), device_tree_speaker_id: Some(3), ..Options::default() })
+        .unwrap();
     assert_eq!(t.speaker_id_source, Some("override"));
 }
 
