@@ -411,14 +411,27 @@ def legacy_units():
     return [u for u in ("speakersafetyd.service", "speakerguardd.service") if u != v2]
 
 
+def graph_unit():
+    return "speakerguardd-v2-graph.service" if v2_unit() == "speakerguardd-v2.service" else "speakerguardd-graph.service"
+
+
+def graph_activate():
+    p = tool("speakerguardd-provision")
+    if not p:
+        return
+    r = run([p, "activate", "--graph-unit", graph_unit()])
+    sys.stderr.write(r.stderr[-1000:])
+    if r.returncode != 0:
+        raise Refused(f"speakerguardd v2 could not generate this Mac's speaker graph (exit {r.returncode})")
+
+
 def graph_deactivate():
     """v2's session graph goes too, so the seat user's running session plays
     through the distribution's speaker graph again in this boot."""
     p = tool("speakerguardd-provision")
     if not p or "deactivate" not in run([p, "--help"]).stdout:
         return
-    unit = "speakerguardd-v2-graph.service" if v2_unit() == "speakerguardd-v2.service" else "speakerguardd-graph.service"
-    r = run([p, "deactivate", "--graph-unit", unit])
+    r = run([p, "deactivate", "--graph-unit", graph_unit()])
     sys.stderr.write(r.stderr[-1000:])
 
 
@@ -608,6 +621,16 @@ def cmd_run(a):
     write_file(store.interface, "v2\n", 0o600)
     state["switched"] = True
     store.save(state)
+    if mode == "dual":
+        # On a dual kernel the boot did not prepare v2 (the gate kept the
+        # older daemons), or a revert removed its graph: generate it from the
+        # record the self-check just wrote and bring the session onto it,
+        # as speakerguardd-selfcheck.service's ExecStartPost does at boot.
+        try:
+            graph_activate()
+        except Refused:
+            back_to_legacy(store, state, mode, card)
+            raise
     systemctl("daemon-reload")
     systemctl("reset-failed", v2_unit())
     r = systemctl("restart", v2_unit())

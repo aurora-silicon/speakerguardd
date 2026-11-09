@@ -224,6 +224,9 @@ class DualKernelRun(unittest.TestCase):
         self.assertLess(i("speakerguardd-provision run"), i("iface"))
         self.assertLess(i("iface"), i("speakerguardd-selfcheck run"))
         self.assertLess(i("speakerguardd-selfcheck run"), i("speakerguardd-selfcheck verify"))
+        # the graph is generated from the new record before v2 restarts
+        self.assertLess(i("speakerguardd-selfcheck verify"), i("speakerguardd-provision activate"))
+        self.assertLess(i("speakerguardd-provision activate"), names.index("systemctl", i("speakerguardd-provision activate")))
         sc = [c[1] for c in calls if c[0] == "run" and c[1][1:2] == ("run",) and "selfcheck" in c[1][0]][0]
         self.assertIn("--switch-interface", sc)
         self.assertEqual(sc[-2:], ("--bundle", "/b"))
