@@ -2,7 +2,7 @@
 
 BuzzKill is a linked multi-line suppressor. It is not a bank of static equalizers. The ten saved Kill points shape a permitted line level; the moving sections are created from the analysed program.
 
-At 48 kHz the analyser low-pass resamples the linked program to 12 kHz with a 97-tap, 4:1 low-pass stage. The resampler has a pass-band gain of two; this is part of the detector's amplitude domain and must not be normalized away. The retained 512-sample analysis history is the dry (pre-section) program: the moving sections do not filter it. What they remove reaches the detector through a separate per-cell gain record (below). The analyser makes one decision every 128 analysis frames, which advances 512 host frames at the supported 4:1 rate. The first boundary after reset passes without a decision: the first decision sees two filled blocks. Before the transform it applies the symmetric window
+At 48 kHz the analyser low-passes the linked program with a second-order Butterworth (bilinear) at the operation limit and keeps every fourth sample (12 kHz). The analysis gain of two is part of the detector's amplitude domain and must not be normalized away. The retained 512-sample analysis history is the dry (pre-section) program: the moving sections do not filter it. What they remove reaches the detector through a separate per-cell gain record (below). The analyser makes one decision every 128 analysis frames, which advances 512 host frames at the supported 4:1 rate. The first boundary after reset passes without a decision: the first decision sees two filled blocks. Before the transform it applies the symmetric window
 
 ```text
 w[n] = (1 - cos(2*pi*n/511)) / (2*511),  n = 0..511.
