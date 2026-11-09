@@ -31,6 +31,7 @@ const WET_SMOOTH_HZ: f64 = 5.0;
 const WARMUP_DECISIONS: u32 = 1;
 
 /// One line found by a decision.
+#[derive(Clone, Copy, Default)]
 struct Candidate {
     frequency_hz: f32,
     multiplier: f32,
@@ -491,7 +492,9 @@ impl Run {
         // multiplier, lines between two cells, e.g. 630 Hz and 1 kHz, were
         // cut 2-5 dB less than macOS; with the deepest one they match
         // within 0.1 dB.)
-        let mut candidates: Vec<Candidate> = Vec::new();
+        // Fixed storage: the decision runs on the audio thread and never allocates.
+        let mut candidates = [Candidate::default(); TRACKS];
+        let mut count = 0usize;
         for bin in 1..=max_bin {
             let frequency = (bin as f64 + 0.5) * ANALYSIS_RATE / FFT as f64;
             let threshold = self.threshold(frequency) as f32;
@@ -506,7 +509,7 @@ impl Run {
             if !(frequency_hz as f64 > MIN_HZ && (frequency_hz as f64) < self.maximum_hz) {
                 continue;
             }
-            let same_line = candidates.iter_mut().find(|c| {
+            let same_line = candidates[..count].iter_mut().find(|c| {
                 frequency_hz > c.frequency_hz * CANDIDATE_LOWER && frequency_hz < c.frequency_hz * CANDIDATE_UPPER
             });
             if let Some(c) = same_line {
@@ -514,8 +517,9 @@ impl Run {
                     c.multiplier = multiplier;
                     c.bin = bin;
                 }
-            } else if candidates.len() < TRACKS {
-                candidates.push(Candidate { frequency_hz, multiplier, bin });
+            } else if count < TRACKS {
+                candidates[count] = Candidate { frequency_hz, multiplier, bin };
+                count += 1;
             }
         }
         // The cell record is updated from this decision's candidates after
@@ -523,7 +527,7 @@ impl Run {
         // its two neighbours by the square root.
         let mut cell_updates = [1.0f32; FFT / 2 + 1];
         let mut used = [false; TRACKS];
-        for c in candidates {
+        for c in candidates.into_iter().take(count) {
             let neighbour = libm::sqrtf(c.multiplier);
             cell_updates[c.bin] *= c.multiplier;
             cell_updates[c.bin - 1] *= neighbour;
