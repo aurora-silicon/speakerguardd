@@ -1,6 +1,6 @@
 [Unit]
 Description=Move the speakers to speakerguardd v2 with this Mac's own tuning
-Documentation=man:aurora-speaker-upgrade(8) https://github.com/aurora-silicon/speakerguardd/blob/v2/packaging/upgrade/README.md
+Documentation=https://github.com/aurora-silicon/speakerguardd/blob/v2/packaging/upgrade/README.md
 # Shipped disabled: users opt in (systemctl enable --now aurora-speaker-upgrade)
 # until the rollout is approved. Idempotent: a Mac already on v2 with its
 # bundle does nothing. Any failure leaves the legacy protection in charge.
