@@ -362,6 +362,130 @@ class LegacyStart(unittest.TestCase):
         self.assertEqual(started, ["speakersafetyd.service"])
 
 
+class RevertSettle(unittest.TestCase):
+    """A same-boot revert on a dual kernel restarts the seat user's
+    PipeWire, waits until the speaker PCMs keep their state, and only then
+    starts the older daemon, so the two never configure the I2S at once."""
+
+    def test_order(self):
+        import types
+        from unittest import mock
+        from aurora_speaker_upgrade import upgrade as up
+        order = []
+        store = types.SimpleNamespace(interface="/nonexistent/sgb6-interface", save=lambda st: None)
+        with mock.patch.object(up, "systemctl", lambda *a: order.append(("systemctl",) + a) or types.SimpleNamespace(returncode=0)), \
+                mock.patch.object(up, "interface_set", lambda c, v: order.append(("interface", v))), \
+                mock.patch.object(up, "graph_deactivate", lambda: order.append(("graph_deactivate",))), \
+                mock.patch.object(up, "pcm_settle", lambda card: order.append(("settle", card)) or True), \
+                mock.patch.object(up, "legacy_start", lambda: order.append(("legacy_start",))), \
+                mock.patch.object(up, "v2_unit", return_value="speakerguardd-v2.service"), \
+                mock.patch.object(up, "PROVISION_CONF", "/nonexistent/sgb6-provision.conf"):
+            up.back_to_legacy(store, {}, "dual", "AppleJ316")
+        names = [o[0] for o in order]
+        self.assertEqual(names[-4:], ["interface", "graph_deactivate", "settle", "legacy_start"])
+        self.assertIn(("settle", "AppleJ316"), order)
+
+    def test_settle_waits_for_a_steady_state(self):
+        from unittest import mock
+        from aurora_speaker_upgrade import upgrade as up
+        now = [0.0]
+        seq = iter(["closed"] * 3 + ["SETUP", "PREPARED"] + ["RUNNING"] * 100)
+        with mock.patch.object(up, "pcm_states", lambda card: {"p1": next(seq)}), \
+                mock.patch.object(up.time, "monotonic", lambda: now[0]), \
+                mock.patch.object(up.time, "sleep", lambda t: now.__setitem__(0, now[0] + t)):
+            self.assertTrue(up.pcm_settle("AppleJ316", wait=10, quiet=1.5))
+            self.assertGreaterEqual(now[0], 0.4 + 1.5 - 1e-9)
+        flip = iter(["closed", "RUNNING"] * 200)
+        now[0] = 0.0
+        with mock.patch.object(up, "pcm_states", lambda card: {"p1": next(flip)}), \
+                mock.patch.object(up.time, "monotonic", lambda: now[0]), \
+                mock.patch.object(up.time, "sleep", lambda t: now.__setitem__(0, now[0] + t)):
+            self.assertFalse(up.pcm_settle("AppleJ316", wait=2, quiet=1.5))
+
+    def test_pcm_states_reads_proc(self):
+        import tempfile
+        from unittest import mock
+        from aurora_speaker_upgrade import upgrade as up
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(f"{d}/pcm1p/sub0")
+            open(f"{d}/pcm1p/sub0/status", "w").write("state: RUNNING\nowner_pid   : 42\n")
+            os.makedirs(f"{d}/pcm0p/sub0")
+            open(f"{d}/pcm0p/sub0/status", "w").write("closed\n")
+            os.makedirs(f"{d}/pcm2c/sub0")
+            open(f"{d}/pcm2c/sub0/status", "w").write("state: SETUP\n")
+            real = up.glob.glob
+            with mock.patch.object(up.glob, "glob", lambda p: real(p.replace("/proc/asound/AppleJ316", d))):
+                self.assertEqual(sorted(up.pcm_states("AppleJ316").values()), ["RUNNING", "SETUP", "closed"])
+
+
+class CheckKeepsTheInterface(unittest.TestCase):
+    """--check is a dry run: on a Mac whose speakers v2 already owns it never
+    lends them to the switch test (that left the kernel on the legacy
+    interface, lease 0 and the speakers at the floor until a reboot), and
+    otherwise the switch test hands back the interface it found."""
+
+    def amixer(self, value):
+        import types
+        out = ("numid=9,iface=MIXER,name='Speaker Protection Interface'\n"
+               "  ; type=ENUMERATED,access=rw------,values=1,items=2\n"
+               "  ; Item #0 'Speaker Volume Unlock'\n  ; Item #1 'Speaker Protection'\n"
+               f"  : values={value}\n")
+        return types.SimpleNamespace(returncode=0, stdout=out, stderr="")
+
+    def test_interface_get(self):
+        from unittest import mock
+        from aurora_speaker_upgrade import upgrade as up
+        for v, want in (("1", up.IF_V2), ("0", up.IF_LEGACY)):
+            with mock.patch.object(up, "run", lambda argv, **kw: self.amixer(v)):
+                self.assertEqual(up.interface_get("AppleJ616"), want)
+
+    def test_switch_test_hands_back_what_it_found(self):
+        import types
+        from unittest import mock
+        from aurora_speaker_upgrade import upgrade as up
+        sets = []
+        for found in (up.IF_V2, up.IF_LEGACY):
+            sets.clear()
+            with mock.patch.object(up, "interface_get", return_value=found), \
+                    mock.patch.object(up, "interface_set", lambda c, v: sets.append(v)), \
+                    mock.patch.object(up, "legacy_units", return_value=[]), \
+                    mock.patch.object(up, "v2_tuning_args", return_value=[]), \
+                    mock.patch.object(up, "run", lambda argv, **kw: types.SimpleNamespace(returncode=2, stdout="", stderr="pcm1p stayed in use for 15 s")):
+                res, _ = up.check_hardware("/x/selfcheck", "AppleJ616", "/p", "/s", "/c")
+            self.assertEqual(res, "cannot-run")
+            self.assertEqual(sets, [found])
+
+    def test_check_does_not_take_the_speakers_from_v2(self):
+        import types, tempfile
+        from unittest import mock
+        from aurora_speaker_upgrade import upgrade as up
+        ident = types.SimpleNamespace(board="j616s", acoustic=35, matches_dt=lambda: True)
+        called = []
+        with tempfile.TemporaryDirectory() as d:
+            a = types.SimpleNamespace(adt=None, json=None, scratch=d)
+            def run(argv, **kw):
+                if argv[1:2] == ["--help"]:
+                    return types.SimpleNamespace(returncode=0, stdout="run --switch-interface verify --conf", stderr="")
+                if argv[1:2] == ["run"]:
+                    os.makedirs(os.path.join(argv[-1], up.PARAMS.lstrip("/")).rsplit("/", 1)[0], exist_ok=True)
+                    open(os.path.join(argv[-1], up.PARAMS.lstrip("/")), "wb").write(b"blob")
+                return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+            with mock.patch.object(up.collect, "Identity", return_value=ident), \
+                    mock.patch.object(up, "interface_mode", return_value=("dual", "AppleJ616")), \
+                    mock.patch.object(up, "acquire", return_value=({}, {"route": 0, "source": "test"})), \
+                    mock.patch.object(up, "digest", return_value="d"), \
+                    mock.patch.object(up.collect, "write_bundle", lambda b, p: os.makedirs(p, exist_ok=True)), \
+                    mock.patch.object(up, "tool", lambda n: "/x/" + n), \
+                    mock.patch.object(up, "run", run), \
+                    mock.patch.object(up, "interface_get", return_value=up.IF_V2), \
+                    mock.patch.object(up, "systemctl", lambda *x: types.SimpleNamespace(returncode=0, stdout="", stderr="")), \
+                    mock.patch.object(up, "check_hardware", lambda *x: called.append(x) or ("pass", "")), \
+                    mock.patch.object(up, "say", lambda m: None):
+                rc = up.cmd_check(a)
+        self.assertEqual(rc, up.EXIT_RETRY)
+        self.assertEqual(called, [])
+
+
 if __name__ == "__main__":
     unittest.main()
 

@@ -62,6 +62,11 @@ INTERFACE_CTL = "Speaker Protection Interface"
 IF_V2, IF_LEGACY = "Speaker Protection", "Speaker Volume Unlock"
 V2_UNITS = ("speakerguardd-v2.service", "speakerguardd.service")
 GRANT_WAIT_S = 30
+# After a revert restarts the seat user's PipeWire, the older daemon starts
+# once the speaker card's PCMs have kept their state this long
+# (at most PCM_SETTLE_S).
+PCM_SETTLE_S = 10
+PCM_QUIET_S = 1.5
 PARITY = ("/usr/share/speakerguardd/parity.json",)
 MARK = "# aurora-speaker-upgrade: the bundle collected for this Mac"
 
@@ -407,6 +412,15 @@ def interface_mode():
     return "none", None
 
 
+def interface_get(card):
+    """The kernel's current speaker protection interface (IF_V2, IF_LEGACY)
+    on a dual kernel, or None when it cannot be read."""
+    r = run(["amixer", "-c", card, "cget", f"name={INTERFACE_CTL}"])
+    items = dict(re.findall(r"Item #(\d+) '([^']*)'", r.stdout))
+    m = re.search(r"(?m)^\s*: values=(\d+)", r.stdout)
+    return items.get(m.group(1)) if r.returncode == 0 and m else None
+
+
 def interface_set(card, value):
     r = run(["amixer", "-c", card, "-q", "cset", f"name={INTERFACE_CTL}", value])
     if r.returncode != 0:
@@ -474,6 +488,34 @@ def legacy_wanted():
     return want
 
 
+def pcm_states(card):
+    """The state of each substream of the speaker card, playback and
+    capture (the sense PCM), from /proc/asound (closed, SETUP, PREPARED,
+    RUNNING, ...)."""
+    out = {}
+    for f in sorted(glob.glob(f"/proc/asound/{card}/pcm*[pc]/sub*/status")):
+        t = read_text(f) or ""
+        m = re.search(r"(?m)^state:\s*(\S+)", t)
+        out[f] = m.group(1) if m else t.strip()
+    return out
+
+
+def pcm_settle(card, wait=PCM_SETTLE_S, quiet=PCM_QUIET_S):
+    """Waits until the speaker card's PCMs keep their state for
+    `quiet` seconds, at most `wait`. False on a timeout; the caller goes on."""
+    end = time.monotonic() + wait
+    last, since = None, time.monotonic()
+    while True:
+        cur, now = pcm_states(card), time.monotonic()
+        if cur != last:
+            last, since = cur, now
+        elif now - since >= quiet:
+            return True
+        if now >= end:
+            return False
+        time.sleep(0.1)
+
+
 def legacy_start():
     """Puts the legacy daemon back, the one the packaged udev rules start
     for the speaker sense PCM; nothing else (on a Mac that is not a J700,
@@ -527,7 +569,9 @@ def cmd_check(a):
     On a dual kernel, where no hardware record of this kernel exists before
     a switch, the silent switch test runs into the private root: the older
     daemon is paused and the interface lent to the test for a few seconds,
-    then both are put back. Exit codes are the self-check's: 0 pass,
+    then both are put back. When speakerguardd v2 already owns the speakers
+    in this boot, the test does not run and the check cannot run (2): a dry
+    run never takes the speakers from v2. Exit codes are the self-check's: 0 pass,
     1 refused, 2 cannot run, 3 error."""
     out = {"result": "error", "kernel": os.uname().release, "steps": []}
 
@@ -583,6 +627,13 @@ def cmd_check(a):
         conf = os.path.join(root, V2_CONF.lstrip("/"))
         js = os.path.join(work, "selfcheck.json")
         h = run([sc_tool, "--help"])
+        if mode == "dual" and interface_get(card) == IF_V2 \
+                and systemctl("is-active", "-q", v2_unit()).returncode == 0:
+            # speakerguardd v2 already owns the speakers in this boot: the
+            # switch test would need them, and a dry run does not take them.
+            step("hardware switch test", "cannot-run", "speakerguardd v2 owns the speakers in this boot")
+            return finish("cannot-run", EXIT_RETRY, "speakerguardd v2 owns the speakers in this boot; "
+                          "a dry run does not take them (aurora-speaker-upgrade status shows the live setup)")
         if mode == "dual" and "--switch-interface" in h.stdout + h.stderr:
             # No hardware record of this kernel exists before a switch: make
             # one in the private root, the way 'run' does. The silent switch
@@ -629,6 +680,7 @@ def check_hardware(sc_tool, card, params, state, conf):
     """--check on a dual kernel: the silent switch test into the private
     state, with the speakers lent to it and given back. ('pass'|'refused'|
     'cannot-run', detail)."""
+    before = interface_get(card) or IF_LEGACY
     paused = [u for u in legacy_units() if systemctl("is-active", "-q", u).returncode == 0]
     for u in paused:
         systemctl("stop", u)
@@ -636,8 +688,9 @@ def check_hardware(sc_tool, card, params, state, conf):
         r = run([sc_tool, "run", "--switch-interface", "--force", "--params", params, "--state", state,
                  "--", *v2_tuning_args(conf)])
     finally:
+        # Back to the interface it found, not always the legacy one.
         with contextlib.suppress(Refused):
-            interface_set(card, IF_LEGACY)
+            interface_set(card, before)
         for u in paused:
             systemctl("reset-failed", u)
             systemctl("start", "--no-block", u)
@@ -790,6 +843,17 @@ def back_to_legacy(store, state, mode, card):
         with contextlib.suppress(Refused):
             interface_set(card, IF_LEGACY)
         graph_deactivate()
+        # speakersafetyd reads the sense PCM's rate range and then opens it
+        # at the lowest rate; when the restarted session's WirePlumber opened
+        # the speaker PCM at 48 kHz in between, the open failed on the I2S
+        # rate symmetry (EINVAL) and the daemon panicked and restarted. Wait
+        # for the session to finish opening the speaker first; its ALSA
+        # monitor can also hold the sense PCM for a moment while it starts
+        # (EBUSY), so every PCM of the card counts. (Starting the
+        # daemon before the restart does not work: v2's graph still holds
+        # the sense PCM, EBUSY.)
+        if card:
+            pcm_settle(card)
         legacy_start()
     else:
         # A fleet kernel (v2 interface only): the stack that ran before
