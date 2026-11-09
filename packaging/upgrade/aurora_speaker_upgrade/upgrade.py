@@ -411,6 +411,17 @@ def legacy_units():
     return [u for u in ("speakersafetyd.service", "speakerguardd.service") if u != v2]
 
 
+def graph_deactivate():
+    """v2's session graph goes too, so the seat user's running session plays
+    through the distribution's speaker graph again in this boot."""
+    p = tool("speakerguardd-provision")
+    if not p or "deactivate" not in run([p, "--help"]).stdout:
+        return
+    unit = "speakerguardd-v2-graph.service" if v2_unit() == "speakerguardd-v2.service" else "speakerguardd-graph.service"
+    r = run([p, "deactivate", "--graph-unit", unit])
+    sys.stderr.write(r.stderr[-1000:])
+
+
 def legacy_start():
     """Puts the legacy daemon back: the packaged udev rules start it for the
     speaker sense PCM."""
@@ -624,6 +635,7 @@ def back_to_legacy(store, state, mode, card):
         systemctl("stop", v2_unit())
         with contextlib.suppress(Refused):
             interface_set(card, IF_LEGACY)
+        graph_deactivate()
         legacy_start()
     else:
         # A fleet kernel (v2 interface only): the stack that ran before

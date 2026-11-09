@@ -788,6 +788,18 @@ class LV2Shadow(unittest.TestCase):
     def test_system_dirs_are_the_packaged_ones(self):
         self.assertEqual(self.scan(environ={"LV2_PATH": "/usr/lib64/lv2:/usr/lib/lv2"}), [])
 
+class Deactivate(Base):
+    def test_revert_removes_the_v2_graph(self):
+        os.makedirs(os.path.join(self.p.graph, "pipewire"), exist_ok=True)
+        f = os.path.join(self.p.graph, "pipewire", "sgv2-j316.conf")
+        prov.write_atomic(f, "context.modules = []\n")
+        prov.write_atomic(self.p.graph_state, "result=pass\nuser=ryan\n")
+        a = types.SimpleNamespace(graph_unit="speakerguardd-graph.service")
+        self.assertEqual(prov.cmd_deactivate(a, self.p), 0)
+        self.assertFalse(os.path.exists(f))
+        self.assertEqual(prov.read_kv(self.p.graph_state)["result"], "legacy")
+
+
 class Gate(Base):
     def decide(self, iface="v2", gate_data=None, cmd="v2"):
         g = os.path.join(self.t, "gate.json")
