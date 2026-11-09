@@ -4,6 +4,7 @@
     speakerguardd-gate prepare|v2      [--gate F] [--wait S]
     speakerguardd-gate legacy  [--gate F] [--wait S]
     speakerguardd-gate explain [--gate F] [--wait S]
+    speakerguardd-gate interface [--gate F] [--wait S]
 
 Every Mac carries both stacks: speakerguardd v2, and the older daemons
 (speakerguardd 0.1, speakersafetyd). This program is the ExecCondition of
@@ -20,10 +21,19 @@ both, so exactly one of them runs on a board, chosen at boot:
   An unqualified board on a v2 kernel runs neither, and the
   kernel holds its speakers at the floor.
 
-So the kernel is the switch. A fleet kernel without the v2 interface keeps
-every Mac on the older daemons; the kernel that brings the interface moves
-every gated Mac to v2 at once, and booting the older kernel again moves it
-back. The data (gate.json) comes from speakerguardd itself and is the same
+On a kernel with only one interface the kernel is the switch: without the
+v2 interface every Mac stays on the older daemons, and a v2-only kernel
+moves every gated Mac to v2. A dual kernel (linux 98cb6a86 and later: the
+card has "Speaker Protection Interface") serves both, with "Speaker Volume
+Unlock" in charge at boot. There the Mac's own upgrade decides: v2 runs only
+on a Mac aurora-speaker-upgrade switched (its root-only setting,
+/var/lib/aurora-speaker-upgrade/interface), and only with every proof above;
+every other Mac keeps the older daemons. On a switched Mac whose v2 is
+waiting for its silent check on a new kernel neither runs (the volume
+lock's ceiling holds); one the check refused goes back to the older
+daemons. `interface` (the ExecStartPre of speakerguardd.service) puts a
+dual kernel on the v2 lease right before the supervisor takes it; the
+kernel returns to the volume lock 30 s after the last owner closes. The data (gate.json) comes from speakerguardd itself and is the same
 in every distribution; everything about the hardware comes from the Mac.
 
 Exit 0: start the unit. Exit 1: skip it (systemd logs the condition).
@@ -105,8 +115,9 @@ def speaker_card(sysfs="/sys/class/sound"):
 
 
 def kernel_interface(wait):
-    """'v2' (the card has "Speaker Protection"), 'legacy' (a speaker card
-    without it) or None (no speaker card within the wait)."""
+    """'dual' (the card has "Speaker Protection Interface": both
+    interfaces), 'v2' (only "Speaker Protection"), 'legacy' (a speaker card
+    with neither) or None (no speaker card within the wait)."""
     deadline = time.monotonic() + wait
     while True:
         card = speaker_card()
@@ -116,11 +127,23 @@ def kernel_interface(wait):
             return None, None
         time.sleep(0.25)
     try:
+        if wiring.interface_get(card) is not None:
+            return "dual", card
         r = subprocess.run(["amixer", "-c", card, "cget", f"name={CONTROL}"], capture_output=True, timeout=10)
-    except (OSError, subprocess.TimeoutExpired) as e:
+    except (OSError, subprocess.TimeoutExpired, wiring.Refused) as e:
         log(f"amixer: {e}")
         return None, card
     return ("v2" if r.returncode == 0 else "legacy"), card
+
+
+def check_failed(state, board):
+    """True when this kernel's silent self-check ran on this board and
+    failed (not merely missing or stale)."""
+    try:
+        b = wiring.read_binding(os.path.join(state, "selfcheck.bind"))
+    except OSError:
+        return False
+    return b.get("result") == "fail" and b.get("board") == board and b.get("kernel") == os.uname().release
 
 
 def decide(args):
@@ -132,17 +155,33 @@ def decide(args):
         return False, True, "no Apple device tree: not an Apple Silicon Mac"
     units = []
     why_not = None
+    policy_ok = False
+    state = getattr(args, "state", "/var/lib/speakerguardd")
     try:
         units = tuning_units(args.tuning_cli)
         gen.qualification_policy(board, units, gate)
+        policy_ok = True
         if getattr(args, "cmd", "v2") != "prepare":
-            wiring.qualification(getattr(args, "state", "/var/lib/speakerguardd"), board,
-                                 os.uname().release, unit=wiring.unit_id(args.dt), units=units)
+            wiring.qualification(state, board, os.uname().release, unit=wiring.unit_id(args.dt), units=units)
     except (wiring.Refused, OSError, ValueError, TypeError, AttributeError, subprocess.TimeoutExpired) as e:
         why_not = f"{board} is unqualified: {e}"
     iface, card = kernel_interface(args.wait)
     if iface is None:
         return False, True, (why_not or f"{board} is gated") + "; no speaker card: the older daemons decide for themselves"
+    if iface == "dual":
+        dual = f"this kernel serves both speaker interfaces on {card}"
+        if not wiring.upgraded(getattr(args, "upgrade_setting", None)):
+            return False, True, (f"{dual} and this Mac was not switched to speakerguardd v2 (aurora-speaker-upgrade): "
+                                 "the older daemons protect the speakers")
+        if not policy_ok or check_failed(state, board):
+            why = why_not if not policy_ok else f"{board}: the silent self-check failed on this kernel"
+            return False, True, (f"{why}; {dual}: the older daemons protect the speakers "
+                                 "(aurora-speaker-upgrade run tries v2 again)")
+        if why_not:
+            return False, False, (f"{why_not}; {dual} and this Mac was switched to v2, which waits for its silent "
+                                  "self-check: the kernel's volume lock holds the speakers at its ceiling")
+        return True, False, (f"{board} ({','.join(units)}) is gated for v2, this Mac was switched to v2 "
+                             f"(aurora-speaker-upgrade) and {dual}: speakerguardd v2 protects the speakers")
     if why_not:
         if iface == "v2":
             return False, False, f"{why_not}; the kernel has the v2 interface ({card}), so the older daemons have nothing to own: the kernel holds the speakers at its floor"
@@ -152,15 +191,43 @@ def decide(args):
     return True, False, f"{board} ({','.join(units)}) is gated for v2 and the kernel has the v2 interface on {card}: speakerguardd v2 protects the speakers"
 
 
+def interface(args):
+    """speakerguardd.service ExecStartPre, after its ExecCondition (`v2`)
+    placed this Mac on v2: on a dual kernel, put the speakers on the v2
+    lease for the supervisor that starts next (every start, so a restart
+    after the kernel went back to the volume lock takes it again). A no-op
+    on a kernel with one interface and on a Mac that was not switched.
+    Fails (the start fails; Restart= tries again) only when the kernel
+    refuses the switch."""
+    iface, card = kernel_interface(args.wait)
+    if iface != "dual":
+        return 0
+    if not wiring.upgraded(args.upgrade_setting):
+        log("not switching the speaker interface: this Mac was not switched to v2 (aurora-speaker-upgrade)")
+        return 0
+    try:
+        if wiring.interface_lease(card):
+            log(f"{wiring.INTERFACE_CONTROL!r} = {wiring.IF_LEASE!r} on {card}: speakerguardd v2 takes the lease next")
+        else:
+            log(f"{wiring.INTERFACE_CONTROL!r} is already {wiring.IF_LEASE!r} on {card}")
+    except (wiring.Refused, OSError, subprocess.TimeoutExpired) as e:
+        log(f"the speaker interface switch failed: {e}")
+        return 1
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(prog="speakerguardd-gate")
-    ap.add_argument("cmd", choices=["prepare", "v2", "legacy", "explain"])
+    ap.add_argument("cmd", choices=["prepare", "v2", "legacy", "explain", "interface"])
+    ap.add_argument("--upgrade-setting", default=wiring.UPGRADE_SETTING, help=argparse.SUPPRESS)
     ap.add_argument("--gate", default="/usr/share/speakerguardd/gate.json")
     ap.add_argument("--dt", default=DT)
     ap.add_argument("--state", default="/var/lib/speakerguardd")
     ap.add_argument("--tuning-cli", default="aurora-speaker-tuning")
     ap.add_argument("--wait", type=float, default=15.0, help="seconds to wait for the speaker card")
     args = ap.parse_args()
+    if args.cmd == "interface":
+        return interface(args)
     try:
         v2, legacy, why = decide(args)
     except (OSError, ValueError) as e:

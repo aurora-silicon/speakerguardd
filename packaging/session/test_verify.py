@@ -62,9 +62,15 @@ class Verify(unittest.TestCase):
         with open(self.conf, "w") as f:
             f.write("SGV2_MACHINE=j414\nSGV2_UID=4242\nSGV2_TUNING=--bundle /x\n")
         self.out = os.path.join(self.d, "verify.json")
+        # The kernel: v2 interface only, unless a test says dual.
+        self.iface, self.v2ctl = None, True
         self.patches = [
             mock.patch.object(sgsc.wiring, "read_dt", lambda *a, **k: {"board": "j414s"}),
             mock.patch.object(sgsc, "CONF", self.conf),
+            mock.patch.object(sgsc, "find_card", lambda *a, **k: (0, "J414")),
+            mock.patch.object(sgsc.wiring, "interface_get", lambda card: self.iface),
+            mock.patch.object(sgsc, "amixer", lambda card, *a: subprocess.CompletedProcess(
+                a, 0 if self.v2ctl and a[-1] == "name=Speaker Protection" else 1, "", "")),
         ]
         for p in self.patches:
             p.start()
@@ -111,11 +117,12 @@ class Verify(unittest.TestCase):
         self.graph_conf()
         code, out = self.run_verify(voicing())
         self.assertEqual((code, out["result"]), (0, "pass"), out)
-        self.assertEqual([s["name"] for s in out["steps"]], ["hardware", "voicing", "graph"])
+        self.assertEqual([s["name"] for s in out["steps"]], ["kernel", "hardware", "voicing", "graph"])
+        self.assertEqual(out["kernel_interface"], "v2-only")
         self.assertEqual(out["wiring_hash"], "w1")
         # the tuning source comes from the units' configuration
         self.assertEqual(self.tool_cmd[-2:], ["--bundle", "/x"])
-        self.assertIn("no session PipeWire", out["steps"][2]["detail"])
+        self.assertIn("no session PipeWire", out["steps"][3]["detail"])
 
     def test_j414s_like_tuning_is_refused(self):
         self.bind()
@@ -149,7 +156,7 @@ class Verify(unittest.TestCase):
         self.graph_conf()
         code, out = self.run_verify(voicing())
         self.assertEqual(code, 1)
-        self.assertEqual(out["steps"][0]["name"], "hardware")
+        self.assertEqual(out["steps"][-1]["name"], "hardware")
 
     def test_unlocked_quantum_is_refused(self):
         self.bind()
@@ -162,6 +169,93 @@ class Verify(unittest.TestCase):
         self.bind()
         code, out = self.run_verify(voicing())
         self.assertEqual(code, 2)
+
+    # A dual kernel (linux 98cb6a86+): "Speaker Protection Interface".
+    def test_dual_kernel_on_the_lease_passes(self):
+        self.iface = "Speaker Protection"
+        self.bind()
+        self.graph_conf()
+        code, out = self.run_verify(voicing())
+        self.assertEqual((code, out["result"], out["kernel_interface"]), (0, "pass", "dual"), out)
+        self.assertIn("dual kernel", out["steps"][0]["detail"])
+
+    def test_dual_kernel_on_the_volume_lock_cannot_run(self):
+        self.iface = "Speaker Volume Unlock"
+        self.bind()
+        self.graph_conf()
+        code, out = self.run_verify(voicing())
+        self.assertEqual((code, out["result"]), (2, "cannot-run"))
+        self.assertEqual([s["name"] for s in out["steps"]], ["kernel"])
+        self.assertIn("Speaker Volume Unlock", out["steps"][0]["detail"])
+
+    def test_volume_lock_only_kernel_is_refused(self):
+        self.v2ctl = False
+        self.bind()
+        self.graph_conf()
+        code, out = self.run_verify(voicing())
+        self.assertEqual((code, out["result"]), (1, "refused"))
+        self.assertEqual(out["steps"][0]["name"], "kernel")
+
+
+class LeaseInterface(unittest.TestCase):
+    """The switch test takes "Speaker Protection" itself: on a dual kernel
+    it first needs the interface, which it switches only on a Mac
+    aurora-speaker-upgrade switched (or when that tool asks)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.setting = os.path.join(self.tmp.name, "interface")
+        self.cur, self.sets = "Speaker Volume Unlock", []
+
+        def amix(card, *a):
+            if a[0] == "cget":
+                if self.cur is None:
+                    return subprocess.CompletedProcess(a, 1, "", "no control")
+                n = 1 if self.cur == "Speaker Protection" else 0
+                return subprocess.CompletedProcess(
+                    a, 0, "numid=40,iface=MIXER,name='Speaker Protection Interface'\n"
+                          "  ; type=ENUMERATED,access=rw------,values=1,items=2\n"
+                          "  ; Item #0 'Speaker Volume Unlock'\n  ; Item #1 'Speaker Protection'\n"
+                          f"  : values={n}\n", "")
+            self.sets.append(a[-1])
+            self.cur = a[-1]
+            return subprocess.CompletedProcess(a, 0, "", "")
+        self.patches = [mock.patch.object(sgsc.wiring, "_amixer", amix),
+                        mock.patch.object(sgsc.wiring, "UPGRADE_SETTING", self.setting)]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+        self.tmp.cleanup()
+
+    def test_v2_only_kernel_is_left_alone(self):
+        self.cur = None
+        self.assertIsNone(sgsc.lease_interface(0))
+        self.assertEqual(self.sets, [])
+
+    def test_not_upgraded_refuses_and_leaves_the_volume_lock(self):
+        with self.assertRaises(sgsc.wiring.Refused):
+            sgsc.lease_interface(0)
+        self.assertEqual(self.sets, [])
+
+    def test_upgraded_switches_once(self):
+        with open(self.setting, "w") as f:
+            f.write("v2\n")
+        self.assertEqual(sgsc.lease_interface(0), "dual")
+        self.assertEqual(sgsc.lease_interface(0), "dual")
+        self.assertEqual(self.sets, ["Speaker Protection"])
+
+    def test_the_upgrade_tool_may_switch_before_its_setting(self):
+        self.assertEqual(sgsc.lease_interface(0, switch=True), "dual")
+        self.assertEqual(self.sets, ["Speaker Protection"])
+
+    def test_a_setting_other_than_v2_does_not_switch(self):
+        with open(self.setting, "w") as f:
+            f.write("legacy\n")
+        with self.assertRaises(sgsc.wiring.Refused):
+            sgsc.lease_interface(0)
 
 
 class Pilot(unittest.TestCase):

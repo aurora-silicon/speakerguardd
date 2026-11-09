@@ -2,7 +2,7 @@
 """speakerguardd-selfcheck: prove this Mac's speaker wiring, silently, before
 speakerguardd may grant.
 
-    speakerguardd-selfcheck run      --params BLOB [--force] [--defer] [-- TUNING-SOURCE...]
+    speakerguardd-selfcheck run      --params BLOB [--force] [--defer] [--switch-interface] [-- TUNING-SOURCE...]
     speakerguardd-selfcheck pending
     speakerguardd-selfcheck check    --params BLOB
     speakerguardd-selfcheck verify   --params BLOB [--json FILE] [--attestations FILE] [-- TUNING-SOURCE...]
@@ -79,6 +79,10 @@ the speakers at the kernel's floor.
 before it switches a Mac to v2. It changes nothing, plays only zero samples,
 and stops at the first failing step:
 
+0. **kernel**: the speaker interface. On a dual kernel ("Speaker Protection
+   Interface") it must be "Speaker Protection" (else cannot run, 2); a kernel
+   with only the volume lock is refused (1). The JSON says which
+   ("kernel_interface": "dual" or "v2-only").
 1. **hardware** (steps 1-3 above): a passing record bound to this board,
    kernel and blob. Without one (never run, or stale) it cannot run (2).
 2. **voicing** (`aurora-speaker-tuning voicing-check`): the Mac's own chain
@@ -100,8 +104,8 @@ and stops at the first failing step:
 Exit codes: 0 pass (the switch may proceed), 1 refused (stay on the legacy
 stack; reason on stderr), 2 cannot run (retry later; do not switch), 3
 internal error (treat as refused). `--json FILE`: {"result", "board",
-"kernel", "params_sha256", "wiring_hash", "steps": [{"name", "result",
-"detail"}]}.
+"kernel", "kernel_interface", "params_sha256", "wiring_hash", "steps":
+[{"name", "result", "detail"}]}.
 """
 import argparse
 import errno
@@ -246,7 +250,8 @@ def pcm_state(idx, dev, d):
 class Control:
     """The card's control device: "Speaker Protection" owned by this process."""
 
-    def __init__(self, idx):
+    def __init__(self, idx, switch=False):
+        lease_interface(idx, switch)
         self.fd = os.open(f"/dev/snd/controlC{idx}", os.O_RDWR | os.O_CLOEXEC)
         try:
             fcntl.ioctl(self.fd, _ELEM_LOCK, self._id("Speaker Protection"))
@@ -277,6 +282,27 @@ class Control:
         except OSError:
             pass
         os.close(self.fd)
+
+
+def lease_interface(card, switch=False):
+    """On a dual kernel ("Speaker Protection Interface", linux 98cb6a86 and
+    later) "Speaker Volume Unlock" is in charge at boot, and "Speaker
+    Protection" grants nothing until root switches the interface. The check
+    switches it only on a Mac aurora-speaker-upgrade switched (its setting),
+    or when that tool runs the check itself (`--switch-interface`); the
+    kernel goes back to the volume lock, at its floor, 30 s after the last
+    owner closes. Returns the interface ("dual" or None)."""
+    cur = wiring.interface_get(card)
+    if cur is None:
+        return None
+    if cur != wiring.IF_LEASE:
+        if not (switch or wiring.upgraded()):
+            raise wiring.Refused(
+                f"this kernel serves both speaker interfaces and {wiring.IF_UNLOCK!r} is in charge: this Mac was not "
+                "switched to speakerguardd v2 (aurora-speaker-upgrade), so the older daemons own the speakers")
+        wiring.interface_lease(card)
+        log(f"{wiring.INTERFACE_CONTROL!r} = {wiring.IF_LEASE!r} (the volume lock's floor first)")
+    return "dual"
 
 
 class Lease(threading.Thread):
@@ -966,7 +992,7 @@ def run_locked(args):
             errs += static(idx, w, report)
         elif w["method"] == "derived":
             try:
-                errs += active(idx, card, w, report)
+                errs += active(idx, card, w, report, args)
             finally:
                 try:
                     os.unlink(MARKER)
@@ -1016,7 +1042,7 @@ def static(idx, w, report):
     return []
 
 
-def active(idx, card, w, report):
+def active(idx, card, w, report, args=None):
     """The hardware half: registers, then the silent switch test."""
     errs = []
     ids = pcm_ids(idx)
@@ -1042,7 +1068,7 @@ def active(idx, card, w, report):
     old_mux = None
     ctl = None
     try:
-        ctl = Control(idx)
+        ctl = Control(idx, switch=getattr(args, "switch_interface", False))
         r = amixer(card, "cget", f"name={mux}")
         if r.returncode == 0:
             m = re.search(r": values=(\d+)", r.stdout)
@@ -1128,6 +1154,25 @@ def read_conf(path=None):
     except OSError:
         pass
     return out
+
+
+def verify_kernel(args):
+    """Step 0: the kernel's speaker interface. A dual kernel serves the v2
+    lease only once "Speaker Protection Interface" is "Speaker Protection";
+    while the volume lock is in charge nothing below proves what v2 would do,
+    so verify cannot run (aurora-speaker-upgrade switches first). A kernel
+    with only the volume lock can never run v2."""
+    hw = wiring.read_dt()
+    idx, card = find_card(hw)
+    cur = wiring.interface_get(idx)
+    if cur is not None:
+        if cur != wiring.IF_LEASE:
+            raise Cannot(f"dual kernel: {wiring.INTERFACE_CONTROL!r} is {cur!r} on {card}; switch it to "
+                         f"{wiring.IF_LEASE!r} first (aurora-speaker-upgrade does)")
+        return "dual", f"dual kernel: {wiring.INTERFACE_CONTROL!r} = {cur!r} on {card}"
+    if amixer(card, "cget", "name=Speaker Protection").returncode == 0:
+        return "v2-only", f"v2 interface only on {card}"
+    raise wiring.Refused(f"this kernel has only the volume lock on {card} (no \"Speaker Protection\"): v2 cannot own the speakers")
 
 
 def verify_hardware(args):
@@ -1294,14 +1339,15 @@ def _pilot(uid, sink, zeros):
 
 
 def cmd_verify(args):
-    out = {"result": "error", "board": "-", "kernel": os.uname().release, "params_sha256": "-",
+    out = {"result": "error", "board": "-", "kernel": os.uname().release, "kernel_interface": "-", "params_sha256": "-",
            "wiring_hash": "-", "steps": []}
     code = EXIT_ERROR
     try:
         out["board"] = wiring.read_dt()["board"]
         if os.path.exists(args.params):
             out["params_sha256"] = sha256(args.params)
-        for name, step in (("hardware", verify_hardware), ("voicing", verify_voicing), ("graph", verify_graph)):
+        for name, step in (("kernel", verify_kernel), ("hardware", verify_hardware), ("voicing", verify_voicing),
+                           ("graph", verify_graph)):
             try:
                 res = step(args)
             except Cannot as e:
@@ -1312,6 +1358,8 @@ def cmd_verify(args):
                 out["steps"].append({"name": name, "result": "refused", "detail": str(e)})
                 out["result"], code = "refused", EXIT_REFUSED
                 break
+            if name == "kernel":
+                out["kernel_interface"] = res[0]
             if name == "hardware":
                 out["wiring_hash"] = res[0].get("wiring", "-")
             detail = res[1] if isinstance(res, tuple) else res
@@ -1373,6 +1421,9 @@ def main():
                     help="run: before login, leave a needed switch test to speakerguardd-switchtest.service")
     ap.add_argument("--deferred", default=DEFERRED, help="the switch-test-pending file")
     ap.add_argument("--clear", action="store_true", help="pending: the switch test is done (pass or fail)")
+    ap.add_argument("--switch-interface", action="store_true",
+                    help="run: on a dual kernel, switch the speakers to the v2 lease for the switch test even before "
+                         "this Mac's upgrade setting exists (aurora-speaker-upgrade, which decides the switch)")
     ap.add_argument("--pipewire-dir")
     ap.add_argument("--wireplumber-dir")
     ap.add_argument("--json", help="verify: write the result here")

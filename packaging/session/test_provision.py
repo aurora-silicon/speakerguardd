@@ -795,8 +795,10 @@ class Gate(Base):
             json.dump(GATE if gate_data is None else gate_data, f)
         self.patch(gate, "kernel_interface", lambda wait: (iface, "AppleX") if iface else (None, None))
         self.patch(gate, "PROVISION_CONF", os.path.join(self.t, "provision.conf"))
-        a = types.SimpleNamespace(gate=g, dt=self.dt, tuning_cli=self.cli, wait=0, state=self.p.state, cmd=cmd)
+        a = types.SimpleNamespace(gate=g, dt=self.dt, tuning_cli=self.cli, wait=0, state=self.p.state, cmd=cmd,
+                                  upgrade_setting=os.path.join(self.t, "upgrade-interface"))
         v2, legacy, why = gate.decide(a)
+        self.why = why
         self.assertFalse(v2 and legacy, why)
         return v2, legacy
 
@@ -832,6 +834,79 @@ class Gate(Base):
         with open(self.p.params, "ab") as f:
             f.write(b"new-blob")
         self.assertEqual(self.decide(), (False, False))
+
+    def upgrade(self, value="v2\n"):
+        path = os.path.join(self.t, "upgrade-interface")
+        if value is None:
+            if os.path.exists(path):
+                os.unlink(path)
+            return
+        with open(path, "w") as f:
+            f.write(value)
+
+    def test_dual_kernel_runs_v2_only_on_an_upgraded_mac(self):
+        """linux 98cb6a86+: both interfaces on one card, the volume lock in
+        charge at boot. Only aurora-speaker-upgrade's setting moves a Mac to
+        v2; every other Mac keeps the older daemons."""
+        self.board("j999")
+        self.ctl({"board": "j999"})
+        self.assertEqual(self.run_(), 0)
+        self.checked()
+        # The same qualified Mac on a v2-only kernel runs v2 ...
+        self.assertEqual(self.decide("v2"), (True, False))
+        # ... but on a dual kernel only once it was switched.
+        self.assertEqual(self.decide("dual"), (False, True))
+        self.assertIn("not switched", self.why)
+        self.assertEqual(self.decide("dual", cmd="prepare"), (False, True))
+        self.upgrade("legacy\n")
+        self.assertEqual(self.decide("dual"), (False, True))
+        self.upgrade()
+        self.assertEqual(self.decide("dual"), (True, False))
+        self.assertEqual(self.decide("dual", cmd="prepare"), (True, False))
+        # A new kernel: the switch test is pending. Neither runs; the
+        # kernel's volume lock holds the speakers at its ceiling.
+        self.checked(kernel="another-kernel")
+        self.assertEqual(self.decide("dual"), (False, False))
+        self.assertEqual(self.decide("dual", cmd="prepare"), (True, False))
+        # The switch test failed on this kernel: back to the older daemons.
+        self.checked(result="fail")
+        self.assertEqual(self.decide("dual"), (False, True))
+        self.assertEqual(self.decide("dual", cmd="prepare"), (False, True))
+        # Reverted (the tool removes its setting): the older daemons.
+        self.checked()
+        self.upgrade(None)
+        self.assertEqual(self.decide("dual"), (False, True))
+
+    def test_dual_kernel_refused_board_keeps_the_older_daemons(self):
+        self.board("j999")
+        self.upgrade()
+        self.ctl({"board": "j999", "refusals": [{"code": "synthetic-refusal"}]})
+        self.assertEqual(self.run_(), 1)
+        self.assertEqual(self.decide("dual"), (False, True))
+        self.assertEqual(self.decide("dual", cmd="prepare"), (False, True))
+        # on a v2-only kernel the same board stays at the kernel's floor
+        self.assertEqual(self.decide("v2"), (False, False))
+
+    def test_interface_switches_only_dual_and_upgraded(self):
+        sets = []
+        state = {"iface": "dual"}
+        self.patch(gate, "kernel_interface", lambda wait: (state["iface"], "AppleX"))
+        self.patch(gate.wiring, "interface_lease", lambda card: sets.append(card) or True)
+        a = types.SimpleNamespace(wait=0, upgrade_setting=os.path.join(self.t, "upgrade-interface"))
+        self.assertEqual(gate.interface(a), 0)
+        self.assertEqual(sets, [])
+        self.upgrade()
+        self.assertEqual(gate.interface(a), 0)
+        self.assertEqual(sets, ["AppleX"])
+        state["iface"] = "v2"
+        self.assertEqual(gate.interface(a), 0)
+        self.assertEqual(sets, ["AppleX"])
+        state["iface"] = "dual"
+
+        def refuse(card):
+            raise gate.wiring.Refused("-EIO")
+        self.patch(gate.wiring, "interface_lease", refuse)
+        self.assertEqual(gate.interface(a), 1)
 
     def test_unlisted_board_silent_check_and_full_voicing_generation(self):
         import gen
