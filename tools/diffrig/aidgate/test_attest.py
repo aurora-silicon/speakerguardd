@@ -25,7 +25,7 @@ CASES = [
     ("AID26 Buzz", "step_down_2000", 0, 11.811, -51.79, "refused"),
     ("AID49 Tone2", "tone_4000_0", 1, 3.228, -4.59, "refused"),
     ("AID4 Comp", "burst_1000", 0, 1.685, -44.98, "refused"),
-    ("AID5/7 Tone3 quieter only", "tone_16000_0", 2, -0.089, -4.84, "refused"),
+    ("main-band cell quieter only", "tone_16000_0", 2, -0.089, -4.84, "refused"),
     ("just over the louder bound", "pink_-6", 0, 0.251, 0.0, "refused"),
     ("lab AID9", "step_down_2000", 0, 0.120, -0.377, "pass"),
     ("lab AID13", "tone_20_-12", 0, 0.106, -0.247, "pass"),
@@ -44,6 +44,31 @@ class Verdicts(unittest.TestCase):
             self.assertEqual(v["verdict"], want, f"{name}: {v}")
             if want == "refused":
                 self.assertIn(seg, v["reason"])
+
+    def test_floor_residue(self):
+        # (delta dB, macOS RMS) measurements on a lane whose own peak is 0.5 (about -6 dBFS)
+        peak = 0.5
+        deep = peak * 10 ** (-64 / 20)      # 64 dB under the lane's peak
+        edge = peak * 10 ** (-55 / 20)      # exactly at the edge: still main band
+        main = peak * 10 ** (-40 / 20)
+        ok = {"seg": "pink_-30", "lane": 0, "louder": 0.01, "quieter": -0.01, "floor_quieter": None}
+        # quieter than macOS deep under the lane's peak: reported, not refused
+        v = attest.verdict([ok, attest.cell("tone_16000_0", 2, [(-4.84, deep)], peak)])
+        self.assertEqual(v["verdict"], "pass", v)
+        self.assertEqual(v["floor_residue_cells"], 1)
+        self.assertEqual(v["worst_floor_residue_db"], -4.84)
+        self.assertIn("not refused", v["reason"])
+        # louder than macOS is refused at any level
+        v = attest.verdict([ok, attest.cell("tone_16000_0", 2, [(0.30, deep)], peak)])
+        self.assertEqual(v["verdict"], "refused", v)
+        # the same quieter delta in the main band is refused
+        for lv in (main, edge):
+            v = attest.verdict([ok, attest.cell("tone_16000_0", 2, [(-4.84, lv)], peak)])
+            self.assertEqual(v["verdict"], "refused", v)
+        # a cell with a deep quieter window and a main-band louder window keeps the louder one
+        c = attest.cell("burst_1000", 1, [(-3.0, deep), (0.4, main)], peak)
+        self.assertEqual((c["louder"], c["quieter"], c["floor_quieter"]), (0.4, 0.4, -3.0))
+        self.assertEqual(attest.verdict([ok, c])["verdict"], "refused")
 
     def test_nothing_measured_is_refused(self):
         self.assertEqual(attest.verdict([])["verdict"], "refused")

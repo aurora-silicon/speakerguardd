@@ -167,5 +167,68 @@ class SpeakerId(unittest.TestCase):
         self.assertIsNone(at.probe_speaker_id(collect.FakeRun(I(), "25C56", None)))
 
 
+class BootRefusalRecord(unittest.TestCase):
+    """The boot unit does not redo a refusal at every boot: same unit, kernel
+    and speakerguardd -> skipped (exit 0); a by-hand run, or any change of
+    the key, tries again; a success clears the record."""
+
+    def setUp(self):
+        import tempfile, types
+        from aurora_speaker_upgrade import upgrade as up
+        self.up, self.dir = up, tempfile.mkdtemp()
+        self.calls, self.result = 0, "refuse"
+        self.saved = (up._cmd_run, collect.Identity, up.refusal_key, up.Store.ensure)
+        test = self
+
+        def fake_run(a):
+            test.calls += 1
+            if test.result == "refuse":
+                raise up.Refused("the speaker self-check refused this Mac (exit 1)")
+            return up.EXIT_OK
+        up._cmd_run = fake_run
+        collect.Identity = lambda adt=None: types.SimpleNamespace(unit="u1")
+        self.key = "k1"
+        up.refusal_key = lambda identity: test.key
+        up.Store.ensure = lambda self: os.makedirs(self.root, mode=0o700, exist_ok=True)
+        self.a = lambda boot: types.SimpleNamespace(store=self.dir, adt=None, at_boot=boot)
+
+    def tearDown(self):
+        import shutil
+        up = self.up
+        up._cmd_run, collect.Identity, up.refusal_key, up.Store.ensure = self.saved
+        shutil.rmtree(self.dir)
+
+    def test_refusal_is_recorded_and_skipped_at_boot(self):
+        up = self.up
+        with self.assertRaises(up.Refused):
+            up.cmd_run(self.a(True))
+        rec = json.load(open(os.path.join(self.dir, "refused.json")))
+        self.assertEqual(rec["key"], "k1")
+        self.assertIn("self-check refused", rec["reason"])
+        self.assertEqual(oct(os.stat(os.path.join(self.dir, "refused.json")).st_mode & 0o777), "0o600")
+        self.assertEqual(up.cmd_run(self.a(True)), up.EXIT_OK)
+        self.assertEqual(self.calls, 1)
+
+    def test_by_hand_and_new_key_try_again(self):
+        up = self.up
+        with self.assertRaises(up.Refused):
+            up.cmd_run(self.a(True))
+        with self.assertRaises(up.Refused):
+            up.cmd_run(self.a(False))
+        self.assertEqual(self.calls, 2)
+        self.key = "k2"
+        self.result = "pass"
+        self.assertEqual(up.cmd_run(self.a(True)), up.EXIT_OK)
+        self.assertEqual(self.calls, 3)
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "refused.json")))
+
+    def test_key_covers_kernel_and_tools(self):
+        import types
+        up = self.up
+        k = self.saved[2](types.SimpleNamespace(unit="u1"))
+        self.assertRegex(k, r"^[0-9a-f]{64}$")
+        self.assertNotEqual(k, self.saved[2](types.SimpleNamespace(unit="u2")))
+
+
 if __name__ == "__main__":
     unittest.main()
