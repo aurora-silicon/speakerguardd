@@ -105,6 +105,53 @@ class SpeakerId(unittest.TestCase):
             os.unlink(p)
         self.assertIsNone(collect.chosen_speaker_id(p))
 
+    def test_invalid_strap_is_no_speaker_id(self):
+        # aura#121 publishes 65535 for an invalid strap read (macOS semantics):
+        # exactly like a missing ID, never a vendor index.
+        p = os.path.join(HERE, "spid-invalid.bin")
+        try:
+            with open(p, "wb") as f:
+                f.write(struct.pack(">I", 0xFFFF))
+            self.assertIsNone(collect.chosen_speaker_id(p))
+        finally:
+            os.unlink(p)
+        self.assertFalse(collect.valid_speaker_id(65535))
+        self.assertFalse(collect.valid_speaker_id(None))
+        self.assertTrue(collect.valid_speaker_id(0))
+        self.assertTrue(collect.valid_speaker_id(3))
+
+    def test_invalid_strap_falls_back_then_refuses(self):
+        import tempfile
+        from aurora_speaker_upgrade import upgrade
+        from aurora_speaker_upgrade.asahi_firmware import audio_tuning as at
+
+        class I:
+            unit = at.unit_id(b"S\0")
+        with tempfile.TemporaryDirectory() as t:
+            chosen = os.path.join(t, "spid")
+            with open(chosen, "wb") as f:
+                f.write(struct.pack(">I", 0xFFFF))
+            b1, b2 = os.path.join(t, "b1"), os.path.join(t, "b2")
+            for d, spid in ((b1, 0xFFFF), (b2, 3)):
+                os.makedirs(d)
+                with open(os.path.join(d, "manifest.json"), "w") as f:
+                    json.dump({"unit_id": I.unit, "speaker_id": spid}, f)
+            # chosen 65535 -> this unit's bundle (a bundle's 65535 is skipped too)
+            self.assertEqual(upgrade.speaker_id_source(I(), chosen, [b1, b2])[:2], (3, True))
+            # nothing valid anywhere -> unknown: the AID that selects by spid refuses
+            self.assertEqual(upgrade.speaker_id_source(I(), chosen, [b1])[:2], (None, False))
+        per_vendor = plistlib.dumps({"AID9": {"Built-in Speaker": [{"Selector": "spid", "Value": 3}]}})
+        with tempfile.TemporaryDirectory() as t:
+            tun = os.path.join(t, collect.TUNINGS)
+            os.makedirs(tun)
+            with open(os.path.join(tun, "DeviceDSPDatabase.plist"), "wb") as f:
+                f.write(per_vendor)
+
+            class J:
+                acoustic = 9
+            with self.assertRaises(collect.SpeakerIdUnknown):
+                collect.collect(t, J(), None, False)
+
     def test_fake_ioreg(self):
         class I:
             acoustic_raw, spts, target_type, serial = (9).to_bytes(4, "little"), b"x", b"J316sAP\0", b"S\0"

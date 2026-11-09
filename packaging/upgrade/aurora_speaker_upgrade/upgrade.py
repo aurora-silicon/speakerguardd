@@ -147,7 +147,7 @@ def speaker_id_source(identity, chosen=collect.CHOSEN_SPID, dirs=collect.INSTALL
                 m = json.load(f)
         except (OSError, ValueError):
             continue
-        if m.get("unit_id") == identity.unit and identity.unit and m.get("speaker_id") is not None:
+        if m.get("unit_id") == identity.unit and identity.unit and collect.valid_speaker_id(m.get("speaker_id")):
             return m["speaker_id"], True, f"this unit's installer bundle ({d})"
     return None, False, "none"
 

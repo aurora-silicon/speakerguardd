@@ -77,8 +77,20 @@ class Identity:
             return False
 
 
+# The HAL's invalid strap value. aura (aura#121) publishes it in
+# /chosen/asahi,speaker-id when the strap read is invalid, as macOS's
+# IORegistry reports it; the installer keeps it as reported in a bundle. It
+# is never a vendor index: it counts as no speaker ID.
+INVALID_SPEAKER_ID = 0xFFFF
+
+
+def valid_speaker_id(value):
+    return type(value) is int and 0 <= value <= 0xFFFFFFFF and value != INVALID_SPEAKER_ID
+
+
 def chosen_speaker_id(path=CHOSEN_SPID):
-    """/chosen/asahi,speaker-id (one big-endian u32 cell), or None."""
+    """/chosen/asahi,speaker-id (one big-endian u32 cell), or None (absent,
+    malformed, or the invalid strap value 65535)."""
     try:
         with open(path, "rb") as f:
             raw = f.read(16)
@@ -86,7 +98,8 @@ def chosen_speaker_id(path=CHOSEN_SPID):
         return None
     if len(raw) != 4:
         return None
-    return int.from_bytes(raw, "big")
+    value = int.from_bytes(raw, "big")
+    return value if valid_speaker_id(value) else None
 
 
 def selects_by_speaker_id(database_entry):
@@ -134,6 +147,12 @@ def installer_bundle(identity, dirs=INSTALLER_BUNDLES):
             continue
         if m.get("lsm2_mask_lattice") is None:
             reasons.append(f"{d}: collected before the installer read the lsm2 lattice")
+            continue
+        if not valid_speaker_id(m.get("speaker_id")) \
+                and selects_by_speaker_id(c.bundle[audio_tuning.DATABASE]):
+            # Its tuning selects by speaker ID, and the bundle has none (or the
+            # invalid strap value): the other routes, with the boot chain's ID.
+            reasons.append(f"{d}: no valid speaker ID, and AID{identity.acoustic} selects by it")
             continue
         return d, c.bundle
     return None, "; ".join(reasons) or "no installer bundle on this Mac"
