@@ -193,7 +193,8 @@ fn level_dependent_notch_is_carried_and_follows_level() {
         let mut run = Chain::new(c.spec.clone(), 48_000.0, 512).unwrap();
         let a = 10f64.powf(db / 20.0);
         let n = 48_000;
-        let x: Vec<f32> = (0..n).map(|i| (a * (2.0 * std::f64::consts::PI * f * i as f64 / 48_000.0).sin()) as f32).collect();
+        let x: Vec<f32> =
+            (0..n).map(|i| (a * (2.0 * std::f64::consts::PI * f * i as f64 / 48_000.0).sin()) as f32).collect();
         let mut out = vec![vec![0f32; n]; 4];
         for at in (0..n).step_by(512) {
             let m = 512.min(n - at);
