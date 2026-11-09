@@ -5,20 +5,8 @@ Moves an existing install's speakers from the legacy protection
 tuning, and back. It ships **disabled**. Turning it on for users waits for
 the maintainers.
 
-> **speakerguardd v2 is a preview.** It does not fully match macOS yet. The
-> legacy protection (speakersafetyd, speakerguardd 0.1) is the supported
-> default, and it stays installed. To go back at any time:
-> `sudo aurora-speaker-upgrade --revert`.
->
-> Every run that can switch the speakers prints this first. A run in a
-> terminal asks for confirmation; a run without one (the boot unit, a
-> script) needs `--i-understand-preview`, and without it exits 2 ("not now")
-> with nothing collected, stored or switched. `--check`, `status`,
-> `--revert` and `run --no-switch` never ask.
-
 ```sh
-sudo aurora-speaker-upgrade            # preview warning + confirmation, then collect, compile, self-check, switch (idempotent)
-sudo aurora-speaker-upgrade run --i-understand-preview   # the same without a prompt (scripts)
+sudo aurora-speaker-upgrade            # collect, compile, self-check, switch (idempotent)
 sudo aurora-speaker-upgrade status
 sudo aurora-speaker-upgrade --check [--json F]   # dry run: collect, compile, self-check in /run; nothing stored or switched
 sudo aurora-speaker-upgrade --revert   # back to the legacy protection (--purge drops the bundle)
@@ -74,11 +62,7 @@ aurora-speaker-upgrade guide           # the macOS route, when Linux cannot read
 Exit codes: 0 done (or nothing to do), 1 refused (the legacy protection
 keeps the speakers), 2 not now (retry), 3 internal error (nothing switched).
 
-At boot (`aurora-speaker-upgrade.service`, `run --at-boot`) the unit has no
-terminal, so while v2 is a preview it does nothing unless you add the flag:
-`systemctl edit aurora-speaker-upgrade` with
-`[Service]` / `ExecStart=` / `ExecStart=/usr/bin/aurora-speaker-upgrade run --at-boot --i-understand-preview`.
-A refusal is
+At boot (`aurora-speaker-upgrade.service`, `run --at-boot`), a refusal is
 recorded in `/var/lib/aurora-speaker-upgrade/refused.json` and not tried
 again until the kernel, speakerguardd v2's provisioning or self-check, the
 parity attestation or this tool changes; the unit counts a refusal as an
