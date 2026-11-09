@@ -521,20 +521,27 @@ pub const TONE_RAMP_STEP: usize = 16;
 
 /// macOS's ToneMeister applies a new automation input (parameter 3) as a
 /// per-frame glide: progress `clamp(n / len, 0, 1)^2` from the current value,
-/// `len` = 40 ms. A new value during a glide starts a new glide from where the
-/// value is.
+/// `len` = 40 ms. The glide begins `onset` frames after the change (two
+/// 512-frame host slices in the speaker graph: macOS starts it at a later
+/// slice boundary). A new value during a glide starts a new glide from where
+/// the value is.
 #[derive(Clone, Copy, Debug)]
 struct ToneRamp {
     from: f64,
     to: f64,
     n: usize,
     len: usize,
+    /// Frames left before the glide begins.
+    wait: usize,
+    onset: usize,
     started: bool,
 }
 
 impl ToneRamp {
     fn new(fs: f64) -> ToneRamp {
-        ToneRamp { from: 0.0, to: 0.0, n: 0, len: libm::round(0.040 * fs).max(1.0) as usize, started: false }
+        let len = libm::round(0.040 * fs).max(1.0) as usize;
+        let onset = libm::round(1024.0 * fs / 48_000.0) as usize;
+        ToneRamp { from: 0.0, to: 0.0, n: len, len, wait: 0, onset, started: false }
     }
     fn value_at(&self, n: f64) -> f64 {
         let p = (n / self.len as f64).clamp(0.0, 1.0);
@@ -552,11 +559,18 @@ impl ToneRamp {
             self.from = self.value_at(self.n as f64);
             self.to = v;
             self.n = 0;
+            self.wait = self.onset;
         }
         false
     }
     fn active(&self) -> bool {
         self.n < self.len
+    }
+    /// Frames (of `frames`) still to run before the glide begins.
+    fn waiting(&mut self, frames: usize) -> usize {
+        let w = self.wait.min(frames);
+        self.wait -= w;
+        w
     }
     /// The value for the next `frames` frames (at their middle), or None
     /// when the glide is over and the target is already applied.
@@ -850,6 +864,11 @@ impl Run {
                 if ramp.active() {
                     // the glide: sub-blocks with the glided automation value
                     let mut at = 0;
+                    let w = ramp.waiting(frames);
+                    if w > 0 {
+                        process_filters(stage, *dynamic, x, y, 0, w);
+                        at = w;
+                    }
                     while at < frames {
                         let n = if ramp.active() { TONE_RAMP_STEP.min(frames - at) } else { frames - at };
                         if let Some(v) = ramp.advance(n) {
