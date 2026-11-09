@@ -8,3 +8,5 @@ AID[0-9]*/
 audio-tuning-AID*
 speaker-thiele-small.bin
 /traces/
+__pycache__/
+*.pyc
