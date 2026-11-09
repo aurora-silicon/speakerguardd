@@ -257,6 +257,11 @@ pub struct Run {
     lookahead: usize,
     delay: Box<[f32]>,
     delay_at: usize,
+    /// Delayed audio for the decision block currently being collected.
+    block_audio: [f32; HOST_HOP * MAX_CHANNELS],
+    /// The completed previous decision block. Holding it for one host hop
+    /// makes the whole current block available before any of it is emitted.
+    block_output: [f32; HOST_HOP * MAX_CHANNELS],
     history: [f32; FFT],
     /// Per-cell gain record of the detector: what the moving sections have
     /// removed from each transform cell, as the analyser sees it.
@@ -297,6 +302,8 @@ impl Run {
             lookahead,
             delay: vec![0.0; lookahead * channels].into_boxed_slice(),
             delay_at: 0,
+            block_audio: [0.0; HOST_HOP * MAX_CHANNELS],
+            block_output: [0.0; HOST_HOP * MAX_CHANNELS],
             history: [0.0; FFT],
             bin_gains: [1.0; FFT / 2 + 1],
             history_at: 0,
@@ -331,6 +338,8 @@ impl Run {
     pub fn reset(&mut self) {
         self.delay.fill(0.0);
         self.delay_at = 0;
+        self.block_audio.fill(0.0);
+        self.block_output.fill(0.0);
         self.history.fill(0.0);
         self.bin_gains.fill(1.0);
         self.history_at = 0;
@@ -342,8 +351,9 @@ impl Run {
         self.tracks.fill(Track::default());
         self.warmup = WARMUP_DECISIONS;
     }
+    /// The saved look-ahead plus the fixed decision-block staging delay.
     pub fn latency(&self) -> usize {
-        self.lookahead
+        self.lookahead + HOST_HOP
     }
 
     fn threshold(&self, frequency_hz: f64) -> f64 {
@@ -527,11 +537,13 @@ impl Run {
         let frames = frames.min(buffers.iter().take(channels).map(|b| b.len()).min().unwrap_or(0));
         let mut at = 0;
         while at < frames {
-            // The native analyser returns one decision-sized block, updates
-            // the tracks, and only then runs the host-rate rejection bank on
-            // that block's delayed audio.  Buffer the transported samples in
-            // place so the decision at this boundary governs this whole
-            // look-ahead block rather than starting one block late.
+            // The analyser returns one decision-sized block, updates the
+            // tracks, and only then runs the host-rate rejection bank on that
+            // block's delayed audio. A callback may end inside the block, so
+            // retain the complete block and emit the previously completed
+            // one. This costs exactly one host hop and makes callback slicing
+            // irrelevant without allocating on the audio thread.
+            let block_at = HOST_HOP - self.hop;
             let count = (frames - at).min(self.hop);
             for frame in at..at + count {
                 let mut linked = 0.0f32;
@@ -541,8 +553,10 @@ impl Run {
                         linked = raw;
                     }
                     let slot = self.delay_at * self.channels + channel;
-                    buffer[frame] = self.delay[slot];
+                    let block_slot = (block_at + frame - at) * MAX_CHANNELS + channel;
+                    self.block_audio[block_slot] = self.delay[slot];
                     self.delay[slot] = raw;
+                    buffer[frame] = self.block_output[block_slot];
                 }
                 self.delay_at = (self.delay_at + 1) % self.lookahead;
                 let filtered = filter(self.analysis_lowpass, &mut self.analysis_state, ANALYSIS_GAIN * linked);
@@ -567,25 +581,26 @@ impl Run {
                     self.warmup -= 1;
                 }
                 self.hop = HOST_HOP;
-            }
-            let audio_wet_section = wet_smoother(self.fs);
-            for frame in at..at + count {
-                for (channel, buffer) in buffers.iter_mut().take(channels).enumerate() {
-                    let mut delayed = buffer[frame];
-                    for track in &mut self.tracks {
-                        let target_wet = 1.0 - track.gain;
-                        if target_wet > f32::EPSILON || track.audio_applied_wet[channel] > f32::EPSILON {
-                            track.audio_applied_wet[channel] =
-                                filter(audio_wet_section, &mut track.audio_wet[channel], target_wet);
-                            let rejected = filter(
-                                track.audio_section,
-                                &mut track.audio[channel],
-                                track.audio_applied_wet[channel] * delayed,
-                            );
-                            delayed -= rejected;
+                let audio_wet_section = wet_smoother(self.fs);
+                for block_frame in 0..HOST_HOP {
+                    for channel in 0..channels {
+                        let slot = block_frame * MAX_CHANNELS + channel;
+                        let mut delayed = self.block_audio[slot];
+                        for track in &mut self.tracks {
+                            let target_wet = 1.0 - track.gain;
+                            if target_wet > f32::EPSILON || track.audio_applied_wet[channel] > f32::EPSILON {
+                                track.audio_applied_wet[channel] =
+                                    filter(audio_wet_section, &mut track.audio_wet[channel], target_wet);
+                                let rejected = filter(
+                                    track.audio_section,
+                                    &mut track.audio[channel],
+                                    track.audio_applied_wet[channel] * delayed,
+                                );
+                                delayed -= rejected;
+                            }
                         }
+                        self.block_output[slot] = delayed;
                     }
-                    buffer[frame] = delayed;
                 }
             }
             at += count;
@@ -609,7 +624,7 @@ mod tests {
         let mut z = [0.0; 512];
         r.process(&mut [&mut z], 512);
         assert!(z.iter().all(|v| *v == 0.0));
-        assert_eq!(r.latency(), 383);
+        assert_eq!(r.latency(), 383 + HOST_HOP);
     }
 
     fn line(frequency_hz: f64, amplitude: f64, frames: usize) -> Vec<f32> {
@@ -642,6 +657,59 @@ mod tests {
         assert!(g <= m * 1.000_001, "{g} {m}");
         assert!(r.bin_gains[k - 1] < 1.0 && r.bin_gains[k + 1] < 1.0);
         assert!(r.bin_gains.iter().all(|g| *g > 0.0 && *g <= 1.0));
+    }
+
+    /// Two channels, a line that steps up by 12 dB after three blocks and a
+    /// second line that starts later, so the first decision, later decisions,
+    /// and track replacements all fall inside the render.
+    fn invariance_source(frames: usize) -> [Vec<f32>; 2] {
+        let step_at = 3 * HOST_HOP + HOST_HOP / 3;
+        let second_at = 5 * HOST_HOP + 17;
+        let mut left = line(400.0, 0.25, frames);
+        let mut right = line(160.0, 0.25, frames);
+        let late = line(1000.0, 0.2, frames);
+        for n in 0..frames {
+            if n >= step_at {
+                left[n] *= 4.0;
+            }
+            if n >= second_at {
+                right[n] += late[n - second_at];
+            }
+        }
+        [left, right]
+    }
+
+    fn render_in_buffers(p: &Params, sizes: &[usize], frames: usize) -> [Vec<f32>; 2] {
+        let [mut left, mut right] = invariance_source(frames);
+        let mut run = Run::new(p, 48_000.0, 2);
+        let (mut at, mut k) = (0, 0);
+        while at < frames {
+            let n = sizes[k % sizes.len()].min(frames - at);
+            run.process(&mut [&mut left[at..at + n], &mut right[at..at + n]], n);
+            at += n;
+            k += 1;
+        }
+        [left, right]
+    }
+
+    #[test]
+    fn output_is_identical_for_every_host_buffer_size() {
+        let p = Params { threshold_db: -100.0, ..Default::default() };
+        let frames = 8 * HOST_HOP;
+        let whole = render_in_buffers(&p, &[frames], frames);
+        for size in [1, 2, 3, 7, 64, 100, 128, 255, 256, 257, 511, 512, 513, 1000, 1024, 2048] {
+            assert_eq!(render_in_buffers(&p, &[size], frames), whole, "host buffer {size}");
+        }
+        let mixed = [1, 511, 3, 257, 64, 1000, 2, 129];
+        assert_eq!(render_in_buffers(&p, &mixed, frames), whole, "mixed host buffers");
+
+        // Compare with the equally delayed dry program: startup silence alone
+        // must not make this an empty invariance test.
+        let latency = Run::new(&p, 48_000.0, 2).latency();
+        let source = invariance_source(frames);
+        assert!(whole.iter().zip(&source).any(|(output, input)| {
+            output[latency..].iter().zip(&input[..frames - latency]).any(|(wet, dry)| wet.to_bits() != dry.to_bits())
+        }));
     }
 
     #[test]
