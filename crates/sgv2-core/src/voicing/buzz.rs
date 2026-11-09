@@ -17,7 +17,6 @@ const ANALYSIS_HOP: usize = 128;
 const ANALYSIS_RATE: f64 = 12_000.0;
 const DECIMATION: usize = 4;
 const HOST_HOP: usize = ANALYSIS_HOP * DECIMATION;
-const FIR: usize = 97;
 const MIN_HZ: f64 = 50.0;
 const MAX_HZ: [f64; 5] = [2500.0, 3000.0, 4000.0, 6000.0, 20_000.0];
 const MATCH_RELATIVE: f64 = 0.035_264_92;
@@ -38,109 +37,22 @@ struct Candidate {
     bin: usize,
 }
 
-// The analysis path is a 4:1, 97-tap low-pass resampler. Its gain of two is
-// intentional: the transformed-spectrum thresholds use this amplitude domain.
-// Normalising these coefficients to unity leaves full-level lines below the
-// saved threshold and prevents the tracker from engaging.
-const FIR_COEFFICIENTS: [f64; FIR] = [
-    1.72128143e-20,
-    1.13013757e-05,
-    2.97373317e-05,
-    4.88926635e-05,
-    5.23911403e-05,
-    2.08011879e-05,
-    -5.71931487e-05,
-    -0.000170382104,
-    -0.000275706348,
-    -0.000303400098,
-    -0.000182146425,
-    0.000119562086,
-    0.000551495876,
-    0.000963210419,
-    0.00113146496,
-    0.00084096007,
-    -1.36345804e-18,
-    -0.00125418056,
-    -0.00251949672,
-    -0.00320996833,
-    -0.00276050158,
-    -0.000903327367,
-    0.0020905328,
-    0.00533255469,
-    0.00749515882,
-    0.00725257676,
-    0.00386968628,
-    -0.00227897777,
-    -0.00951246265,
-    -0.015152527,
-    -0.0163532551,
-    -0.0112452758,
-    8.49141844e-18,
-    0.0146492897,
-    0.027784884,
-    0.0336582139,
-    0.0277282801,
-    0.00876332633,
-    -0.019767249,
-    -0.049669344,
-    -0.0696450695,
-    -0.068290472,
-    -0.0376776122,
-    0.0235835277,
-    0.108866006,
-    0.204281732,
-    0.291651368,
-    0.352952898,
-    0.374997437,
-    0.352952898,
-    0.291651368,
-    0.204281732,
-    0.108866006,
-    0.0235835258,
-    -0.0376776122,
-    -0.0682904795,
-    -0.0696450546,
-    -0.049669344,
-    -0.0197672509,
-    0.0087633254,
-    0.0277282801,
-    0.0336582251,
-    0.0277848784,
-    0.0146492915,
-    8.49142009e-18,
-    -0.011245274,
-    -0.0163532551,
-    -0.0151525298,
-    -0.00951245985,
-    -0.00227897801,
-    0.00386968697,
-    0.00725257582,
-    0.00749515928,
-    0.00533255469,
-    0.0020905328,
-    -0.000903327425,
-    -0.00276050158,
-    -0.00320996833,
-    -0.00251949672,
-    -0.00125418056,
-    -1.36345804e-18,
-    0.00084096007,
-    0.00113146461,
-    0.000963210594,
-    0.000551495876,
-    0.000119562086,
-    -0.00018214641,
-    -0.000303400069,
-    -0.000275706407,
-    -0.000170382074,
-    -5.71931487e-05,
-    2.08011879e-05,
-    5.23911403e-05,
-    4.88926635e-05,
-    2.97373335e-05,
-    1.13013757e-05,
-    1.72128159e-20,
-];
+// The analysis path low-passes the linked program at the operation limit
+// (a second-order Butterworth, bilinear) and keeps every fourth sample. The
+// gain of two puts lines in the amplitude domain the saved thresholds use.
+const ANALYSIS_GAIN: f32 = 2.0;
+
+fn analysis_lowpass(frequency_hz: f64, fs: f64) -> Section {
+    let k = libm::tan(core::f64::consts::PI * frequency_hz / fs);
+    let norm = 1.0 / (1.0 + core::f64::consts::SQRT_2 * k + k * k);
+    Section {
+        b0: k * k * norm,
+        b1: 2.0 * k * k * norm,
+        b2: k * k * norm,
+        a1: 2.0 * (k * k - 1.0) * norm,
+        a2: (1.0 - core::f64::consts::SQRT_2 * k + k * k) * norm,
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Band {
@@ -317,9 +229,8 @@ pub struct Run {
     history_len: usize,
     hop: usize,
     decimation_at: usize,
-    fir: [f64; FIR],
-    fir_state: [f32; FIR],
-    fir_at: usize,
+    analysis_lowpass: Section,
+    analysis_state: FilterState,
     threshold_db: f64,
     threshold_shape: [Section; BANDS],
     tracks: Vec<Track>,
@@ -341,10 +252,11 @@ impl Run {
         // host-rate timebase even though one decision advances 4*128 host
         // frames.  Keep those two counts distinct.
         let release = (1.0 - libm::exp(-(ANALYSIS_HOP as f64) / (0.050 * fs))) as f32;
+        let maximum_hz = MAX_HZ[p.operation_frequency.min(4) as usize].min(0.49 * fs);
         Run {
             channels,
             fs,
-            maximum_hz: MAX_HZ[p.operation_frequency.min(4) as usize].min(0.49 * fs),
+            maximum_hz,
             lookahead,
             delay: vec![0.0; lookahead * channels].into_boxed_slice(),
             delay_at: 0,
@@ -354,9 +266,8 @@ impl Run {
             history_len: 0,
             hop: HOST_HOP,
             decimation_at: 0,
-            fir: FIR_COEFFICIENTS,
-            fir_state: [0.0; FIR],
-            fir_at: 0,
+            analysis_lowpass: analysis_lowpass(maximum_hz, fs),
+            analysis_state: FilterState::default(),
             threshold_db: p.threshold_db,
             threshold_shape: core::array::from_fn(|i| {
                 let b = p.bands[i];
@@ -381,8 +292,7 @@ impl Run {
         self.history_len = 0;
         self.hop = HOST_HOP;
         self.decimation_at = 0;
-        self.fir_state.fill(0.0);
-        self.fir_at = 0;
+        self.analysis_state = FilterState::default();
         self.tracks.fill(Track::default());
         self.warmup = WARMUP_DECISIONS;
     }
@@ -564,14 +474,9 @@ impl Run {
                     self.delay[slot] = raw;
                 }
                 self.delay_at = (self.delay_at + 1) % self.lookahead;
-                self.fir_state[self.fir_at] = linked;
-                self.fir_at = (self.fir_at + 1) % FIR;
+                let filtered = ANALYSIS_GAIN * filter(self.analysis_lowpass, &mut self.analysis_state, linked);
                 self.decimation_at += 1;
                 if self.decimation_at == DECIMATION {
-                    let mut filtered = 0.0f32;
-                    for (tap, coefficient) in self.fir.iter().enumerate() {
-                        filtered += *coefficient as f32 * self.fir_state[(self.fir_at + FIR - 1 - tap) % FIR];
-                    }
                     self.history[self.history_at] = filtered;
                     self.history_at = (self.history_at + 1) % FFT;
                     self.history_len = (self.history_len + 1).min(FFT);
