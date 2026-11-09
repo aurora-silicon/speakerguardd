@@ -741,9 +741,15 @@ def cmd_deactivate(args, p):
     upgrade --revert on a dual kernel): remove v2's graph and bring the seat
     user's running session back onto the distribution's own speaker graph
     now, instead of at the next boot."""
+    import gen
+
     conf = read_kv(p.conf)
     clear_graph(p, result="legacy")
-    log(f"speaker graph removed from {p.graph}: the distribution's speaker graph returns")
+    # The raw-PCM rules and the UCM marker hide the distribution's own
+    # speaker device; they go too (provisioning writes them again).
+    for f in glob.glob(os.path.join(p.raw, "*.conf")) + [os.path.join(p.graph, gen.UCM_MARKER)]:
+        unlink(f)
+    log(f"speaker graph, raw-PCM rules and UCM marker removed from {p.graph}: the distribution's speaker graph returns")
     user = conf.get("SGV2_USER")
     if not user or p.root:
         return 0

@@ -5,6 +5,7 @@ with a stand-in tuning reader, device tree and speaker card.
     python3 -I packaging/session/test_provision.py
 """
 import contextlib
+import glob
 import hashlib
 import importlib.machinery
 import importlib.util
@@ -794,9 +795,14 @@ class Deactivate(Base):
         f = os.path.join(self.p.graph, "pipewire", "sgv2-j316.conf")
         prov.write_atomic(f, "context.modules = []\n")
         prov.write_atomic(self.p.graph_state, "result=pass\nuser=ryan\n")
+        prov.write_raw_rules(self.p, "AppleJ316")
+        raw = glob.glob(os.path.join(self.p.raw, "*.conf"))
+        self.assertTrue(raw)
         a = types.SimpleNamespace(graph_unit="speakerguardd-graph.service")
         self.assertEqual(prov.cmd_deactivate(a, self.p), 0)
         self.assertFalse(os.path.exists(f))
+        self.assertFalse(any(os.path.exists(r) for r in raw))
+        self.assertFalse(os.path.exists(os.path.join(self.p.graph, "speakerguardd-owns-speakers")))
         self.assertEqual(prov.read_kv(self.p.graph_state)["result"], "legacy")
 
 

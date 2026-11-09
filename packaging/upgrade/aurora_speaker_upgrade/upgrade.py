@@ -346,6 +346,12 @@ def selfcheck(a, mode=None):
         if r.returncode != 0:
             raise Refused(f"the silent hardware self-check failed on this kernel (exit {r.returncode}): "
                           "the legacy protection keeps the speakers")
+        # The boot did not prepare v2 on a Mac that was not switched yet (the
+        # gate kept the older daemons), and a revert removed the graph:
+        # generate it from the record just made and bring the session onto
+        # it (as speakerguardd-selfcheck.service's ExecStartPost does at
+        # boot), so verify's graph step sees it.
+        graph_activate()
     if re.search(r"\bverify\b", h.stdout + h.stderr):
         r = run([p, "verify", "--params", PARAMS, "--json", js])
         code = r.returncode
@@ -623,16 +629,6 @@ def _cmd_run(a):
     write_file(store.interface, "v2\n", 0o600)
     state["switched"] = True
     store.save(state)
-    if mode == "dual":
-        # On a dual kernel the boot did not prepare v2 (the gate kept the
-        # older daemons), or a revert removed its graph: generate it from the
-        # record the self-check just wrote and bring the session onto it,
-        # as speakerguardd-selfcheck.service's ExecStartPost does at boot.
-        try:
-            graph_activate()
-        except Refused:
-            back_to_legacy(store, state, mode, card)
-            raise
     systemctl("daemon-reload")
     systemctl("reset-failed", v2_unit())
     r = systemctl("restart", v2_unit())
