@@ -948,8 +948,32 @@ mod linux {
         let mut last_wiring: Option<Option<u64>> = None;
         notify.send("STATUS=supervising");
         let mut scheduled = true;
+        // CLOCK_BOOTTIME - CLOCK_MONOTONIC grows only while the system is
+        // suspended: a jump since the last tick means the engine's last beat
+        // predates a sleep (see observe's module notes).
+        // The kernel's suspend counters catch a pm_test sleep (the clocks
+        // keep running) too; reading them is two small sysfs files a tick.
+        let mut suspended = suspended_ns();
+        let mut slept = sleeps();
+        let mut waiting_after_sleep = false;
         loop {
+            let (s, n) = (suspended_ns(), sleeps());
+            if s > suspended.saturating_add(1_000_000) || n != slept {
+                observer.note_sleep();
+            }
+            (suspended, slept) = (s, n);
             let obs = observer.observe(&mut now_ns, &mut engine, &mut pcm_view, &mut session);
+            if observer.waiting_after_sleep() != waiting_after_sleep {
+                waiting_after_sleep = observer.waiting_after_sleep();
+                eprintln!(
+                    "{}",
+                    if waiting_after_sleep {
+                        "system sleep: waiting for the engine's first beat after the thaw before trusting its heartbeat"
+                    } else {
+                        "the engine beats again after the sleep"
+                    }
+                );
+            }
             let event = sup.tick(obs, &mut kernel);
             match event {
                 Ok(Event::Granted) => {
@@ -958,13 +982,19 @@ mod linux {
                 }
                 Ok(Event::Released { why }) => {
                     let session = observer.session_why();
+                    let (pcm, age) = observer.last_tick();
                     eprintln!(
-                        "protection released: {why:?}{}{session}",
+                        "protection released: {why:?}{}{session} (pcm {pcm:?}, engine beat {age:?} ms ago)",
                         if session.is_empty() { "" } else { "; session: " }
                     );
                 }
                 Ok(Event::HardFault(f)) => eprintln!("amp fault, protection withdrawn until restart: {f}"),
-                Ok(Event::Lapsed) => eprintln!("lease lapsed; re-qualifying"),
+                Ok(Event::Lapsed) => {
+                    // the kernel withdraws a lease at a system sleep: the next
+                    // grant waits for the engine to beat steadily after the thaw
+                    observer.note_sleep();
+                    eprintln!("lease lapsed; re-qualifying");
+                }
                 Ok(_) => {}
                 Err(Fatal::Kernel(e)) => {
                     eprintln!("kernel: {e:?}; exiting (the kernel floor holds)");
