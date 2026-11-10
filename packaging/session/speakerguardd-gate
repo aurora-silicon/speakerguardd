@@ -101,7 +101,8 @@ def tuning_units(cli, conf=None):
 
 def speaker_card(sysfs="/sys/class/sound"):
     """The speaker card's ALSA id: the card whose device tree node is a
-    macaudio sound node."""
+    macaudio sound node with the speaker link (the J614s/J616s/J713 also have
+    a jack-only macaudio card, and either may probe first)."""
     try:
         names = sorted(os.listdir(sysfs))
     except OSError:
@@ -109,12 +110,14 @@ def speaker_card(sysfs="/sys/class/sound"):
     for d in names:
         if not re.fullmatch(r"card\d+", d):
             continue
+        node = f"{sysfs}/{d}/device/of_node"
         try:
-            with open(f"{sysfs}/{d}/device/of_node/compatible", "rb") as f:
+            with open(f"{node}/compatible", "rb") as f:
                 compat = f.read().split(b"\0")
-            if b"apple,macaudio" in compat:
-                with open(f"/proc/asound/{d}/id") as f:
-                    return f.read().strip()
+            if b"apple,macaudio" not in compat or not wiring.has_speaker_link(node):
+                continue
+            with open(f"{sysfs}/{d}/id") as f:
+                return f.read().strip()
         except OSError:
             continue
     return None

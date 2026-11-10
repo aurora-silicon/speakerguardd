@@ -957,6 +957,16 @@ class Describe(unittest.TestCase):
         with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "pipewire", "sgv2-j700.conf")) as f:
             self.assertIn("api.alsa.disable-tsched = true", f.read())
 
+    def test_mca_without_generic_fallback(self):
+        expected = self.describe(self.hw())
+        for cpu in (("apple,t8103-mca",), ("apple,t6020-mca", "apple,t8103-mca")):
+            with self.subTest(cpu=cpu):
+                self.assertEqual(self.describe(self.hw(cpu=cpu)), expected)
+        h = self.hw()
+        link = [l for l in h["links"] if l["name"] in ("Speaker", "Speakers")][0]
+        link["cpu_compatible"] = [["apple,t8103-mca"], ["apple,mca"]]
+        self.assertEqual(self.describe(h), expected)
+
     def test_the_card_id_is_macaudios(self):
         self.assertEqual(wiring.card_id({"model": "Test Mac J999"}), "AppleJ999")
         self.assertEqual(wiring.card_id({"model": "A " + "x" * 20}), "Apple" + "x" * 10)
