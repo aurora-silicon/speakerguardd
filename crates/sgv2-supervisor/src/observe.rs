@@ -85,6 +85,34 @@
 //!
 //! A dead or stopped engine therefore releases within one staleness bound,
 //! and nothing renews without it.
+//!
+//! # After a system sleep
+//!
+//! CLOCK_MONOTONIC does not count the time the system spent suspended, so
+//! the engine's last beat before the sleep can look only a tick old at the
+//! thaw although the graph has not run since. Granting on that beat let
+//! the helper re-link the amps while PipeWire was still restarting its
+//! driver: the heartbeat went stale within the grant grace, the lease was
+//! released and granted again, and the sink's start failed (EPERM, then
+//! EPIPE) until the next resume left all five amps with a bad TDM clock
+//! (J316s, s2idle). So after the supervisor sees a sleep
+//! ([`Observer::note_sleep`]) the heartbeat counts as stale until the page's
+//! sequence advances past the value read on the first tick after it: a beat
+//! the engine made after the thaw. Nothing else changes: if no beat comes,
+//! no grant comes either.
+//!
+//! The first grant after a sleep is followed by a longer heartbeat pause
+//! than at boot: the helper re-links the amps and the sink opens and
+//! prepares the PCM on hardware that has just resumed (J316s, pm_test and
+//! s2idle: the engine had beaten after the thaw, the grant came, and the
+//! heartbeat was stale ~120 ms later with the PCM prepared, not running).
+//! Releasing there made the sink's start fail and the lease flap. So for
+//! that grant only, while the PCM is the engine's own and not running
+//! (Opening, or Open by the engine's process: nothing reaches the amps), the
+//! heartbeat may be up to [`RESUME_GRACE_NS`] old, until the first beat
+//! after the grant. RUNNING, Closed, any other owner or state, and every
+//! other check stay as strict as ever; once the window passes without a
+//! beat, the lease is released as before.
 
 use crate::lease::Observation;
 
@@ -251,6 +279,10 @@ pub const GRANT_GRACE_NS: u64 = 100_000_000;
 /// until the open returns. The J700's first open after a grant takes about
 /// 190 ms; the supervisor's view keeps Opening for at most this long.
 pub const OPENING_GRACE_NS: u64 = 500_000_000;
+/// Extra heartbeat age tolerated, after the first grant that follows a
+/// system sleep, while the engine's PCM is opening or open but not running
+/// and the engine has not beaten since that grant (see the module notes).
+pub const RESUME_GRACE_NS: u64 = 500_000_000;
 
 /// Freshness bound while the engine runs: two unit quanta (the
 /// architecture's "at most 2 quanta stale") plus one supervisor tick.
@@ -288,6 +320,13 @@ pub struct Observer {
     expected_wiring: Option<u64>,
     /// The last fresh report's wiring, when it was not the expected one.
     wrong_wiring: Option<Option<u64>>,
+    /// After a system sleep: `Some(None)` until the next tick reads the
+    /// page, then `Some(Some(seq))` until the sequence passes that value.
+    after_sleep: Option<Option<u64>>,
+    /// A sleep happened and no grant has followed it yet.
+    sleep_before_grant: bool,
+    /// The first grant after a sleep: when, and the sequence at that tick.
+    resume_grant: Option<(u64, u64)>,
 }
 
 impl Observer {
@@ -312,7 +351,24 @@ impl Observer {
             granted_at: None,
             expected_wiring: None,
             wrong_wiring: None,
+            after_sleep: None,
+            sleep_before_grant: false,
+            resume_grant: None,
         }
+    }
+
+    /// The system slept since the last tick (the kernel's suspend counters
+    /// or CLOCK_BOOTTIME ran ahead of CLOCK_MONOTONIC): no beat from before
+    /// it counts as fresh (see the module notes).
+    pub fn note_sleep(&mut self) {
+        self.after_sleep = Some(None);
+        self.sleep_before_grant = true;
+        self.resume_grant = None;
+    }
+
+    /// Whether the heartbeat is held stale for a beat made after a sleep.
+    pub fn waiting_after_sleep(&self) -> bool {
+        self.after_sleep.is_some()
     }
 
     /// The wiring a fresh session report named, when it is not the one the
@@ -330,6 +386,9 @@ impl Observer {
     /// that follow get [`GRANT_GRACE_NS`].
     pub fn note_grant(&mut self, now_ns: u64) {
         self.granted_at = Some(now_ns);
+        if std::mem::take(&mut self.sleep_before_grant) {
+            self.resume_grant = self.last_seq.map(|seq| (now_ns, seq));
+        }
     }
 
     /// Why the last tick's session report did not hold ("" if it did): for
@@ -382,6 +441,25 @@ impl Observer {
         }
         self.last_seq = Some(e.seq);
         self.last_frames = e.frames;
+        // after a sleep, only a beat made after the first post-sleep read counts
+        let held_after_sleep = match self.after_sleep {
+            Some(None) => {
+                self.after_sleep = Some(Some(e.seq));
+                true
+            }
+            Some(Some(floor)) if e.valid && e.seq > floor => {
+                self.after_sleep = None;
+                false
+            }
+            Some(Some(floor)) => {
+                // a restarted page counts again from its own sequence
+                if e.seq < floor {
+                    self.after_sleep = Some(Some(e.seq));
+                }
+                true
+            }
+            None => false,
+        };
 
         let closed = matches!(p, PcmState::Closed);
         let running = matches!(p, PcmState::Running { .. });
@@ -429,14 +507,27 @@ impl Observer {
                 0
             }
         };
-        let grace = start_grace.max(grant_grace).max(opening_handoff);
+        // the first grant after a sleep: the engine's own PCM, not running,
+        // until the first beat after the grant or the window ends
+        let resume_grace = match self.resume_grant {
+            Some((t, seq0)) if e.valid && e.seq == seq0 && now_ns.saturating_sub(t) < RESUME_GRACE_NS => match p {
+                PcmState::Opening => RESUME_GRACE_NS,
+                PcmState::Open { owner } if owner != 0 && owner == e.pid => RESUME_GRACE_NS,
+                _ => 0,
+            },
+            _ => {
+                self.resume_grant = None;
+                0
+            }
+        };
+        let grace = start_grace.max(grant_grace).max(opening_handoff).max(resume_grace);
 
         let heartbeat_fresh = match self.quantum.filter(|q| (1..=MAX_QUANTUM).contains(q)) {
             Some(q) => {
                 let bound = stale_ns(q, self.rate, self.tick_ns) + grace;
                 let advanced = self.last_advance_ns.is_some_and(|t| now_ns.saturating_sub(t) <= bound);
                 let recent = e.mono_ns <= now_ns && now_ns - e.mono_ns <= bound;
-                e.valid && advanced && recent
+                e.valid && advanced && recent && !held_after_sleep
             }
             None => false,
         };
@@ -1679,5 +1770,191 @@ mod tests {
         assert_eq!(why(session(now - SESSION_STALE_NS - 1)), "stale");
         assert_eq!(why(session(now + SESSION_SKEW_NS + 1)), "dated in the future");
         assert!(why(SessionReport { links_ok: false, ..session(now) }).starts_with("the helper reports"));
+    }
+
+    /// One tick of a 512-frame engine at 48 kHz whose last beat was `seq`
+    /// at `beat_ns`, the PCM running and the helper's report fresh.
+    fn sleep_tick(o: &mut Observer, now: u64, seq: u64, beat_ns: u64) -> bool {
+        let run = PcmState::Running { owner: PID };
+        o.observe(&mut || now, &mut E(beat(seq, 512, beat_ns)), &mut P(run), &mut S(session(now))).heartbeat_fresh
+    }
+
+    /// After a sleep the pre-sleep beat never counts, however recent it
+    /// looks on CLOCK_MONOTONIC: fresh again only after a beat made after
+    /// the first post-sleep read (J316s s2idle grant/release flap).
+    #[test]
+    fn a_beat_from_before_a_sleep_is_not_fresh() {
+        let mut o = Observer::new(7, 48_000, TICK);
+        let mut seq = 0;
+        let mut t = 0;
+        // a steady engine: fresh once the quantum is learnt
+        for k in 0..20 {
+            t += TICK;
+            seq += 1;
+            let fresh = sleep_tick(&mut o, t, seq, t - 1);
+            assert!(fresh || k < 2, "steady");
+        }
+        // the system sleeps; at the thaw CLOCK_MONOTONIC has not moved, so
+        // the last beat looks a tick old
+        o.note_sleep();
+        assert!(o.waiting_after_sleep());
+        for _ in 0..30 {
+            t += TICK;
+            assert!(!sleep_tick(&mut o, t, seq, t - TICK), "a pre-sleep beat counted");
+        }
+        // the engine beats again after the thaw: fresh, and the hold ends
+        t += TICK;
+        seq += 1;
+        assert!(sleep_tick(&mut o, t, seq, t - 1));
+        assert!(!o.waiting_after_sleep());
+    }
+
+    /// A beat that landed between the last tick and the sleep is read on
+    /// the first tick after it: it sets the floor and does not count.
+    #[test]
+    fn a_beat_read_first_after_the_sleep_does_not_count() {
+        let mut o = Observer::new(7, 48_000, TICK);
+        let (mut seq, mut t) = (0, 0);
+        for _ in 0..20 {
+            t += TICK;
+            seq += 1;
+            sleep_tick(&mut o, t, seq, t - 1);
+        }
+        o.note_sleep();
+        t += TICK;
+        seq += 1;
+        assert!(!sleep_tick(&mut o, t, seq, t - 1));
+        t += TICK;
+        assert!(!sleep_tick(&mut o, t, seq, t - TICK));
+        t += TICK;
+        seq += 1;
+        assert!(sleep_tick(&mut o, t, seq, t - 1));
+    }
+
+    /// No beat after a sleep: the heartbeat stays stale, so nothing grants.
+    #[test]
+    fn no_beat_after_a_sleep_stays_stale() {
+        let mut o = Observer::new(7, 48_000, TICK);
+        let (mut seq, mut t) = (0, 0);
+        for _ in 0..20 {
+            t += TICK;
+            seq += 1;
+            sleep_tick(&mut o, t, seq, t - 1);
+        }
+        o.note_sleep();
+        for _ in 0..1000 {
+            t += TICK;
+            assert!(!sleep_tick(&mut o, t, seq, t - 1));
+        }
+        assert!(o.waiting_after_sleep());
+    }
+
+    /// Ticks with the engine silent since `beat_ns` (its last beat `seq`)
+    /// and the PCM in state `p`, from `from` to `to`: whether every tick was
+    /// fresh, and the first stale tick.
+    fn silent_run(o: &mut Observer, from: u64, to: u64, seq: u64, beat_ns: u64, p: PcmState) -> Option<u64> {
+        let mut t = from;
+        while t <= to {
+            let fresh =
+                o.observe(&mut || t, &mut E(beat(seq, 512, beat_ns)), &mut P(p), &mut S(session(t))).heartbeat_fresh;
+            if !fresh {
+                return Some(t);
+            }
+            t += TICK;
+        }
+        None
+    }
+
+    /// A steady engine with the PCM `p`, the last beat at `t`; returns (seq, t).
+    fn steady(o: &mut Observer, p: PcmState) -> (u64, u64) {
+        let (mut seq, mut t) = (0, 0);
+        for _ in 0..30 {
+            t += TICK;
+            seq += 1;
+            o.observe(&mut || t, &mut E(beat(seq, 512, t - 1)), &mut P(p), &mut S(session(t)));
+        }
+        (seq, t)
+    }
+
+    /// The first grant after a sleep: the re-link and the sink's open and
+    /// prepare on just-resumed hardware pause the heartbeat for longer than
+    /// at boot. While the PCM is the engine's own and not running, the
+    /// heartbeat may be RESUME_GRACE_NS old until the first beat after the
+    /// grant (J316s: the lease flapped ~120 ms after every post-resume grant).
+    #[test]
+    fn the_first_grant_after_a_sleep_rides_out_the_reopen() {
+        let open = PcmState::Open { owner: PID };
+        let mut o = Observer::new(7, 48_000, TICK);
+        let (seq, t) = steady(&mut o, PcmState::Closed);
+        o.note_sleep();
+        // the engine beats after the thaw (the post-sleep hold ends), the grant follows
+        let (seq, t) = (seq + 1, t + TICK);
+        o.observe(&mut || t, &mut E(beat(seq, 512, t)), &mut P(PcmState::Closed), &mut S(session(t)));
+        let (seq, t) = (seq + 1, t + TICK);
+        assert!(
+            o.observe(&mut || t, &mut E(beat(seq, 512, t)), &mut P(PcmState::Closed), &mut S(session(t)))
+                .heartbeat_fresh
+        );
+        o.note_grant(t);
+        // no beat while the sink opens and prepares: fresh well past the boot-time bound
+        let stale =
+            silent_run(&mut o, t + TICK, t + 2_000_000_000, seq, t, open).expect("a silent engine never goes stale");
+        assert!(stale - t > 300_000_000, "released after {} ms", (stale - t) / 1_000_000);
+        assert!(stale - t <= RESUME_GRACE_NS + stale_ns(512, 48_000, TICK) + TICK, "the window is bounded");
+    }
+
+    /// The same pause with no sleep before the grant keeps the boot-time bound.
+    #[test]
+    fn without_a_sleep_the_grant_grace_is_unchanged() {
+        let open = PcmState::Open { owner: PID };
+        let mut o = Observer::new(7, 48_000, TICK);
+        let (seq, t) = steady(&mut o, PcmState::Closed);
+        o.note_grant(t);
+        let stale = silent_run(&mut o, t + TICK, t + 2_000_000_000, seq, t, open).unwrap();
+        assert!(stale - t <= GRANT_GRACE_NS + stale_ns(512, 48_000, TICK) + TICK);
+    }
+
+    /// A RUNNING PCM, a Closed one, or another owner never gets the resume
+    /// window: something could reach the amps.
+    #[test]
+    fn the_resume_window_never_covers_a_running_or_foreign_pcm() {
+        for p in [PcmState::Running { owner: PID }, PcmState::Closed, PcmState::Open { owner: PID + 1 }] {
+            let mut o = Observer::new(7, 48_000, TICK);
+            let (seq, t) = steady(&mut o, PcmState::Closed);
+            o.note_sleep();
+            let (seq, t) = (seq + 1, t + TICK);
+            o.observe(&mut || t, &mut E(beat(seq, 512, t)), &mut P(PcmState::Closed), &mut S(session(t)));
+            let (seq, t) = (seq + 1, t + TICK);
+            o.observe(&mut || t, &mut E(beat(seq, 512, t)), &mut P(PcmState::Closed), &mut S(session(t)));
+            o.note_grant(t);
+            let stale = silent_run(&mut o, t + TICK, t + 2_000_000_000, seq, t, p).unwrap();
+            assert!(stale - t <= GRANT_GRACE_NS + START_GRACE_NS + stale_ns(512, 48_000, TICK) + TICK, "{p:?}");
+        }
+    }
+
+    /// Only the first grant after the sleep gets the window, and a beat
+    /// after the grant ends it.
+    #[test]
+    fn the_resume_window_is_one_grant_and_ends_at_the_next_beat() {
+        let open = PcmState::Open { owner: PID };
+        let mut o = Observer::new(7, 48_000, TICK);
+        let (seq, t) = steady(&mut o, PcmState::Closed);
+        o.note_sleep();
+        let (seq, t) = (seq + 1, t + TICK);
+        o.observe(&mut || t, &mut E(beat(seq, 512, t)), &mut P(PcmState::Closed), &mut S(session(t)));
+        let (seq, t) = (seq + 1, t + TICK);
+        o.observe(&mut || t, &mut E(beat(seq, 512, t)), &mut P(PcmState::Closed), &mut S(session(t)));
+        o.note_grant(t);
+        // a beat after the grant: from here the boot-time rules apply
+        let (seq, t) = (seq + 1, t + TICK);
+        assert!(o.observe(&mut || t, &mut E(beat(seq, 512, t)), &mut P(open), &mut S(session(t))).heartbeat_fresh);
+        let stale = silent_run(&mut o, t + TICK, t + 2_000_000_000, seq, t, open).unwrap();
+        assert!(stale - t <= GRANT_GRACE_NS + stale_ns(512, 48_000, TICK) + TICK);
+        // a second grant in the same wake: no window either
+        let (seq, t) = (seq + 1, stale + TICK);
+        o.observe(&mut || t, &mut E(beat(seq, 512, t)), &mut P(PcmState::Closed), &mut S(session(t)));
+        o.note_grant(t);
+        let stale2 = silent_run(&mut o, t + TICK, t + 2_000_000_000, seq, t, open).unwrap();
+        assert!(stale2 - t <= GRANT_GRACE_NS + stale_ns(512, 48_000, TICK) + TICK);
     }
 }
