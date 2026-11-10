@@ -900,12 +900,20 @@ mod linux {
         let mut ticks = 0u64;
         let mut last_problem: Option<String> = None;
         let mut last_wiring: Option<Option<u64>> = None;
+        // every check holds and nothing plays: reported once per idle spell
+        let mut idle_ready = false;
         notify.send("STATUS=supervising");
         let mut scheduled = true;
         loop {
             let obs = observer.observe(&mut now_ns, &mut engine, &mut pcm_view, &mut session);
             let event = sup.tick(obs, &mut kernel);
+            let ready = obs.clean() && !obs.demand && sup.latched_fault().is_none() && sup.problem().is_none();
+            if ready && !idle_ready && !matches!(event, Ok(Event::Idle)) {
+                eprintln!("protection ready: every check holds, granted while a stream plays");
+            }
+            idle_ready = ready;
             match event {
+                Ok(Event::Idle) => eprintln!("nothing plays: protection released, granted again when a stream starts"),
                 Ok(Event::Granted) => {
                     observer.note_grant(now_ns());
                     eprintln!("protection granted");

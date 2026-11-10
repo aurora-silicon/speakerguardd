@@ -44,6 +44,14 @@
 //!    helper unlinks the amps, the protect stage falls back to the dummy
 //!    driver and beats again; the sink keeps the PCM PREPARED and retries its
 //!    start, and the sequence resumes at 3 from there.
+//! 6. With no client stream playing (the helper reports `play=0` once it has
+//!    unlinked and suspended the amps and the sense, so both PCMs are
+//!    Closed), a clean tick gives the grant back as idle: the kernel floors
+//!    the amps and refuses every start, so a closed PCM is never left
+//!    granted for anyone to open. The protect stage keeps beating on the
+//!    dummy driver and every check keeps running; on `play=1` the grant
+//!    comes back on that tick (the clean run has carried on) and the
+//!    sequence continues at 4.
 //!
 //! The heartbeat bound is two quanta plus a tick, plus [`START_GRACE_NS`]
 //! where the driver switch happens and nothing can play:
@@ -213,6 +221,9 @@ pub struct SessionReport {
     /// The wiring the protect stage was built with (its `sgv2.wiring`), as
     /// the helper read it from the graph.
     pub wiring: Option<u64>,
+    /// Whether a client stream plays into the protect stage (`play=`). A
+    /// helper that does not report it always wants the speakers.
+    pub demand: bool,
 }
 
 pub trait SessionView {
@@ -503,6 +514,7 @@ impl Observer {
             // the supervisor fills these from the kernel
             route_ok: false,
             amps_ok: false,
+            demand: session_fresh && s.demand,
         }
     }
 }
@@ -637,9 +649,10 @@ pub fn speaker_pcm_problem(info: &PcmInfo, card: u32, device: u32) -> Option<Str
 }
 
 /// Parse the helper's report,
-/// `links=<0|1> carrier=<0|1> mono_ns=<t> pid=<pid> start=<ticks>\n`.
-/// Anything else, including a report without its final newline or without
-/// its writer, is absent.
+/// `links=<0|1> carrier=<0|1> mono_ns=<t> pid=<pid> start=<ticks>\n`, with
+/// optional `wiring=<hash>` and `play=<0|1>` (absent: playing). Anything
+/// else, including a report without its final newline or without its
+/// writer, or a `play` other than 0 or 1, is absent.
 ///
 /// The view then sets `helper_alive` with [`helper_is`].
 pub fn parse_session(text: &str) -> SessionReport {
@@ -650,6 +663,7 @@ pub fn parse_session(text: &str) -> SessionReport {
     let mut pid = None;
     let mut start = None;
     let mut wiring = None;
+    let mut play = None;
     for w in body.split_whitespace() {
         let Some((k, v)) = w.split_once('=') else { return SessionReport::default() };
         let slot = match k {
@@ -658,6 +672,7 @@ pub fn parse_session(text: &str) -> SessionReport {
             "mono_ns" => &mut mono,
             "pid" => &mut pid,
             "start" => &mut start,
+            "play" => &mut play,
             "wiring" => {
                 if wiring.is_some() {
                     return SessionReport::default();
@@ -672,6 +687,12 @@ pub fn parse_session(text: &str) -> SessionReport {
         }
         *slot = Some(v.parse::<u64>().ok());
     }
+    let demand = match play {
+        None => true,
+        Some(Some(1)) => true,
+        Some(Some(0)) => false,
+        Some(_) => return SessionReport::default(),
+    };
     match (links.flatten(), carrier.flatten(), mono.flatten()) {
         (Some(l @ 0..=1), Some(c @ 0..=1), Some(m)) if m > 0 => match (pid.flatten(), start.flatten()) {
             (Some(p), Some(st)) if p > 0 && p <= u64::from(u32::MAX) => SessionReport {
@@ -682,6 +703,7 @@ pub fn parse_session(text: &str) -> SessionReport {
                 helper: Some((p as u32, st)),
                 helper_alive: false,
                 wiring: wiring.flatten(),
+                demand,
             },
             _ => SessionReport::default(),
         },
@@ -751,6 +773,7 @@ mod tests {
             helper: Some((77, 1234)),
             helper_alive: true,
             wiring: Some(0x0979_c55e_d5dd_f377),
+            demand: true,
         }
     }
 
@@ -1124,6 +1147,22 @@ mod tests {
     }
 
     #[test]
+    fn demand_comes_only_from_a_fresh_report_that_says_a_stream_plays() {
+        let mut o = Observer::new(7, 48_000, TICK);
+        let now = 10_000_000_000u64;
+        o.observe(&mut || 1, &mut E(EngineState::default()), &mut P(PcmState::Closed), &mut S(session(1)));
+        let mut at = |r: SessionReport| {
+            o.observe(&mut || now, &mut E(EngineState::default()), &mut P(PcmState::Closed), &mut S(r)).demand
+        };
+        assert!(at(session(now)));
+        assert!(!at(SessionReport { demand: false, ..session(now) }));
+        // a stale report or a dead writer asks for nothing
+        assert!(!at(session(now - SESSION_STALE_NS - 1)));
+        assert!(!at(SessionReport { helper_alive: false, ..session(now) }));
+        assert!(!at(SessionReport::default()));
+    }
+
+    #[test]
     fn links_count_only_for_the_wiring_the_self_check_proved() {
         let mut o = Observer::new(7, 48_000, TICK);
         o.expect_wiring(0x0979_c55e_d5dd_f377);
@@ -1156,8 +1195,17 @@ mod tests {
                 helper: Some((77, 1234)),
                 helper_alive: false,
                 wiring: None,
+                demand: true,
             }
         );
+        // play: whether a client stream plays (absent: an older helper,
+        // which always wants the speakers)
+        assert!(!parse_session(&format!("links=1 carrier=1 mono_ns=123{w} play=0\n")).demand);
+        let r = parse_session(&format!("links=1 carrier=1 mono_ns=123{w} play=1\n"));
+        assert!(r.present && r.demand);
+        for bad in ["play=2", "play=", "play=x", "play=0 play=1"] {
+            assert!(!parse_session(&format!("links=1 carrier=1 mono_ns=123{w} {bad}\n")).present, "{bad}");
+        }
         let r = parse_session(&format!("links=0 carrier=1 mono_ns=123{w}\n"));
         assert!(r.present && !r.links_ok);
         // the protect stage's wiring, when the graph names one
@@ -1585,6 +1633,7 @@ mod tests {
             pcm_state_ok: true,
             route_ok: false,
             amps_ok: false,
+            demand: true,
         };
         s.tick(clean, &mut k).unwrap();
         assert_eq!(s.tick(clean, &mut k), Ok(Event::Granted));

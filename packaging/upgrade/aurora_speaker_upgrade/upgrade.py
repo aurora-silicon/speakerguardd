@@ -547,7 +547,9 @@ def wait_v2_granted(since, wait=GRANT_WAIT_S):
         if systemctl("is-active", "-q", v2_unit()).returncode == 0:
             k = run(["journalctl", "-k", "--since", since, "--no-pager", "-o", "cat"])
             u = run(["journalctl", "-u", v2_unit(), "--since", since, "--no-pager", "-o", "cat"])
-            if re.search(r"protection granted|granted", k.stdout + u.stdout, re.I):
+            # with nothing playing the supervisor only reports that it
+            # would grant ("protection ready"): it grants while a stream plays
+            if re.search(r"protection granted|protection ready|granted", k.stdout + u.stdout, re.I):
                 return True
         time.sleep(0.5)
     return False
