@@ -28,6 +28,13 @@ class FakeGraph(sgs.Graph):
     def __init__(self):
         self.objs = {}
         self.next = 100
+        self._memo = {}
+
+    @property
+    def gen(self):
+        # tests edit objs directly: every read is a new generation
+        self._g = getattr(self, "_g", 0) + 1
+        return self._g
 
     def node(self, name, props=None, state=None, group=None):
         nid = self.next
@@ -405,6 +412,18 @@ class Idle(unittest.TestCase):
             with open(path) as f:
                 line = f.read()
             self.assertTrue(line.endswith(" amps=0 play=0\n"), line)
+
+
+class Memo(unittest.TestCase):
+    def test_graph_derivations_are_computed_once_per_change(self):
+        g = sgs.Graph.__new__(sgs.Graph)
+        g.objs, g.gen, g._memo = {}, 0, {}
+        calls = []
+        f = lambda: calls.append(1) or len(calls)
+        self.assertEqual(g.memo("k", f), 1)
+        self.assertEqual(g.memo("k", f), 1)
+        g.gen += 1
+        self.assertEqual(g.memo("k", f), 2)
 
 
 class Generated(unittest.TestCase):

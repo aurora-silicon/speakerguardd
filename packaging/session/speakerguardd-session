@@ -154,6 +154,19 @@ class Graph:
         self.buf = ""
         self.dec = json.JSONDecoder()
         self.objs = {}
+        # bumped on every update from the monitor: what is derived from the
+        # graph is computed once per change, not on every 50 ms period
+        self.gen = 0
+        self._memo = {}
+
+    def memo(self, key, fn):
+        """`fn()`, computed once per graph generation."""
+        hit = self._memo.get(key)
+        if hit is not None and hit[0] == self.gen:
+            return hit[1]
+        v = fn()
+        self._memo[key] = (self.gen, v)
+        return v
 
     def pump(self, timeout, extra=()):
         """Read the monitor's output for up to `timeout`; returns which of
@@ -179,6 +192,8 @@ class Graph:
                 self.buf = s
                 return ready
             self.buf = s[end:]
+            if isinstance(arr, list) and arr:
+                self.gen += 1
             for o in arr if isinstance(arr, list) else []:
                 if o.get("info") is None:
                     self.objs.pop(o.get("id"), None)
@@ -195,13 +210,16 @@ class Graph:
                         self.objs[o["id"]] = o
 
     def of_type(self, t):
-        return [o for o in self.objs.values() if o.get("type", "").endswith(":" + t)]
+        return self.memo(("type", t), lambda: [o for o in self.objs.values() if o.get("type", "").endswith(":" + t)])
 
     def node_id(self, name):
-        for o in self.of_type("Node"):
-            if (o["info"].get("props") or {}).get("node.name") == name:
-                return o["id"]
-        return None
+        def ids():
+            out = {}
+            for o in self.of_type("Node"):
+                out.setdefault((o["info"].get("props") or {}).get("node.name"), o["id"])
+            return out
+
+        return self.memo("node_ids", ids).get(name)
 
     def node_link_group(self, nid):
         props = ((self.objs.get(nid) or {}).get("info") or {}).get("props") or {}
@@ -290,6 +308,9 @@ class Session:
 
     def check(self, g):
         """(links_ok, carrier_ok) for the current graph."""
+        return g.memo("check", lambda: self._check(g))
+
+    def _check(self, g):
         protect = g.node_id(PROTECT_INPUT)
         pout = g.node_id(self.protect_out)
         spk = g.node_id(self.speaker)
@@ -379,7 +400,7 @@ class Session:
 
     def playing(self, g):
         """Whether a client stream runs into the protect stage now."""
-        return any(g.node_state(n) == "running" for n in self.clients(g))
+        return g.memo("playing", lambda: any(g.node_state(n) == "running" for n in self.clients(g)))
 
     def want(self, g, now):
         """Whether the speakers are wanted: a client plays, or one stopped
@@ -416,6 +437,9 @@ class Session:
 
     def amps_linked(self, g):
         """True while any link feeds the amps' sink."""
+        return g.memo("amps_linked", lambda: self._amps_linked(g))
+
+    def _amps_linked(self, g):
         spk = g.node_id(self.speaker)
         if spk is None:
             return False
