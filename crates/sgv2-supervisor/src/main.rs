@@ -429,6 +429,18 @@ mod linux {
         (ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64).saturating_sub(now_ns())
     }
 
+    /// The watch thread wakes every second. A wake that comes this much
+    /// later means the whole process was frozen (the system's freezer during
+    /// a sleep, including a pm_test sleep whose clocks keep running and which
+    /// the suspend counters do not count), not that the loop hung: a hung
+    /// loop leaves this thread running.
+    pub(crate) const FROZEN_GAP_NS: u64 = 3_000_000_000;
+
+    /// Whether the watch's own wake gap shows the process was frozen.
+    pub(crate) fn frozen(gap_ns: u64) -> bool {
+        gap_ns > FROZEN_GAP_NS
+    }
+
     /// The watch's decision: hung only when the heartbeat is older than the
     /// limit and no sleep happened since the last look (`slept`).
     pub(crate) fn hung(now: u64, heartbeat: u64, limit: u64, slept: bool) -> bool {
@@ -438,11 +450,14 @@ mod linux {
     fn spawn_hang_watch() -> std::io::Result<()> {
         std::thread::Builder::new().name("hang-watch".into()).spawn(|| {
             let (mut seen, mut asleep) = (sleeps(), suspended_ns());
+            let mut woke = now_ns();
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(1));
-                let (count, susp) = (sleeps(), suspended_ns());
-                // a sleep since the last look: its freeze is not a stall
-                let slept = count != seen || susp > asleep + 500_000_000;
+                let (count, susp, now) = (sleeps(), suspended_ns(), now_ns());
+                // a sleep since the last look, or a freeze of the whole
+                // process (this thread too): its stall is not the loop's
+                let slept = count != seen || susp > asleep + 500_000_000 || frozen(now.saturating_sub(woke));
+                woke = now;
                 if slept {
                     // the loop gets a full limit after the thaw
                     HEARTBEAT_NS.store(now_ns(), Ordering::Relaxed);
@@ -1052,6 +1067,10 @@ mod linux {
             assert!(!hung(140 * s, 99 * s, HANG_NS, true));
             // not started yet
             assert!(!hung(140 * s, 0, HANG_NS, false));
+            // the watch's own wake gap: a frozen process, not a hung loop
+            assert!(!frozen(s + s / 10));
+            assert!(frozen(25 * s));
+            assert!(!frozen(FROZEN_GAP_NS));
             // exactly at the limit: not yet
             assert!(!hung(109 * s, 99 * s, HANG_NS, false));
         }
