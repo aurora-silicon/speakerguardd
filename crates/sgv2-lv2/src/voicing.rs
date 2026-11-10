@@ -21,17 +21,37 @@ use sgv2_core::{blob, MAX_CHANNELS};
 pub const BLOCK: usize = 512;
 const FEATURE_OPTIONS: &[u8] = b"http://lv2plug.in/ns/ext/options#options\0";
 const FEATURE_URID_MAP: &[u8] = b"http://lv2plug.in/ns/ext/urid#map\0";
+#[cfg(test)]
 const FEATURE_FIXED_BLOCK: &[u8] = b"http://lv2plug.in/ns/ext/buf-size#fixedBlockLength\0";
+#[cfg(test)]
 const FEATURE_POWER_OF_TWO_BLOCK: &[u8] = b"http://lv2plug.in/ns/ext/buf-size#powerOf2BlockLength\0";
+#[cfg(test)]
+const FEATURE_BOUNDED_BLOCK: &[u8] = b"http://lv2plug.in/ns/ext/buf-size#boundedBlockLength\0";
+#[cfg(test)]
+const FEATURE_LOG: &[u8] = b"http://lv2plug.in/ns/ext/log#log\0";
+#[cfg(test)]
+const FEATURE_URID_UNMAP: &[u8] = b"http://lv2plug.in/ns/ext/urid#unmap\0";
 const OPTION_MIN_BLOCK: &[u8] = b"http://lv2plug.in/ns/ext/buf-size#minBlockLength\0";
 const OPTION_MAX_BLOCK: &[u8] = b"http://lv2plug.in/ns/ext/buf-size#maxBlockLength\0";
+#[cfg(test)]
 const OPTION_NOMINAL_BLOCK: &[u8] = b"http://lv2plug.in/ns/ext/buf-size#nominalBlockLength\0";
+#[cfg(test)]
+const OPTION_SEQUENCE_SIZE: &[u8] = b"http://lv2plug.in/ns/ext/buf-size#sequenceSize\0";
+#[cfg(test)]
+const OPTION_SAMPLE_RATE: &[u8] = b"http://lv2plug.in/ns/ext/parameters#sampleRate\0";
 const ATOM_INT: &[u8] = b"http://lv2plug.in/ns/ext/atom#Int\0";
-pub const VARIANTS: &[(&str, usize)] = &[
-    ("https://aurora-silicon.org/lv2/sgv2#voicing-1ch\0", 1),
-    ("https://aurora-silicon.org/lv2/sgv2#voicing-2ch\0", 2),
-    ("https://aurora-silicon.org/lv2/sgv2#voicing-4ch\0", 4),
-    ("https://aurora-silicon.org/lv2/sgv2#voicing-6ch\0", 6),
+#[cfg(test)]
+const ATOM_FLOAT: &[u8] = b"http://lv2plug.in/ns/ext/atom#Float\0";
+pub const VARIANTS: &[(&str, usize, BufferMode)] = &[
+    ("https://aurora-silicon.org/lv2/sgv2#voicing-1ch\0", 1, BufferMode::Direct),
+    ("https://aurora-silicon.org/lv2/sgv2#voicing-2ch\0", 2, BufferMode::Direct),
+    ("https://aurora-silicon.org/lv2/sgv2#voicing-4ch\0", 4, BufferMode::Direct),
+    ("https://aurora-silicon.org/lv2/sgv2#voicing-6ch\0", 6, BufferMode::Direct),
+    // Appended so every deployed descriptor index above stays unchanged.
+    ("https://aurora-silicon.org/lv2/sgv2#voicing-1ch-staged\0", 1, BufferMode::Staged),
+    ("https://aurora-silicon.org/lv2/sgv2#voicing-2ch-staged\0", 2, BufferMode::Staged),
+    ("https://aurora-silicon.org/lv2/sgv2#voicing-4ch-staged\0", 4, BufferMode::Staged),
+    ("https://aurora-silicon.org/lv2/sgv2#voicing-6ch-staged\0", 6, BufferMode::Staged),
 ];
 
 pub struct Voicing {
@@ -153,15 +173,19 @@ unsafe fn feature_is(feature: &Lv2Feature, uri: &[u8]) -> bool {
     !feature.uri.is_null() && unsafe { CStr::from_ptr(feature.uri) }.to_bytes_with_nul() == uri
 }
 
-/// Choose once at instantiation. A nominal size or power-of-two promise by
-/// itself is not an alignment guarantee: either may still yield callbacks
-/// shorter than 512. Only fixedBlockLength plus a declared fixed multiple of
-/// HOST_HOP can use the historical direct path without changing its output.
-unsafe fn buffer_mode(features: *const *const c_void) -> BufferMode {
-    if features.is_null() {
+/// Choose once at instantiation. The deployed URIs preserve the historical
+/// direct path unless the host proves it cannot provide a complete decision
+/// hop. A broad capability range or nominal length is not such proof: in
+/// particular PipeWire advertises a broad capability range even when the
+/// graph quantum is locked to one decision hop. The staged URIs are always
+/// staged.
+unsafe fn buffer_mode(requested: BufferMode, features: *const *const c_void) -> BufferMode {
+    if requested == BufferMode::Staged {
         return BufferMode::Staged;
     }
-    let (mut fixed, mut _power_of_two) = (false, false);
+    if features.is_null() {
+        return BufferMode::Direct;
+    }
     let (mut options, mut map) = (core::ptr::null(), core::ptr::null());
     let mut at = 0;
     loop {
@@ -172,8 +196,6 @@ unsafe fn buffer_mode(features: *const *const c_void) -> BufferMode {
         }
         // SAFETY: each non-null entry points to an LV2_Feature for instantiate.
         let feature = unsafe { &*feature };
-        fixed |= unsafe { feature_is(feature, FEATURE_FIXED_BLOCK) };
-        _power_of_two |= unsafe { feature_is(feature, FEATURE_POWER_OF_TWO_BLOCK) };
         if unsafe { feature_is(feature, FEATURE_OPTIONS) } {
             options = feature.data.cast::<Lv2Option>();
         } else if unsafe { feature_is(feature, FEATURE_URID_MAP) } {
@@ -181,18 +203,17 @@ unsafe fn buffer_mode(features: *const *const c_void) -> BufferMode {
         }
         at += 1;
     }
-    if !fixed || options.is_null() || map.is_null() {
-        return BufferMode::Staged;
+    if options.is_null() || map.is_null() {
+        return BufferMode::Direct;
     }
     // SAFETY: the map feature data has the LV2_URID_Map ABI.
     let map = unsafe { &*map };
     let urid = |uri: &[u8]| unsafe { (map.map)(map.handle, uri.as_ptr().cast()) };
-    let [min_key, max_key, nominal_key, int_type] =
-        [urid(OPTION_MIN_BLOCK), urid(OPTION_MAX_BLOCK), urid(OPTION_NOMINAL_BLOCK), urid(ATOM_INT)];
-    if [min_key, max_key, nominal_key, int_type].contains(&0) {
-        return BufferMode::Staged;
+    let [min_key, max_key, int_type] = [urid(OPTION_MIN_BLOCK), urid(OPTION_MAX_BLOCK), urid(ATOM_INT)];
+    if [min_key, max_key, int_type].contains(&0) {
+        return BufferMode::Direct;
     }
-    let (mut min, mut max, mut nominal) = (None, None, None);
+    let (mut min, mut max) = (None, None);
     let mut at = 0;
     loop {
         // SAFETY: options points to the host's zero-terminated LV2 options array.
@@ -207,24 +228,17 @@ unsafe fn buffer_mode(features: *const *const c_void) -> BufferMode {
             match option.key {
                 key if key == min_key => min = value,
                 key if key == max_key => max = value,
-                key if key == nominal_key => nominal = value,
                 _ => {}
             }
         }
         at += 1;
     }
-    let declared_fixed = match (min, max) {
-        (Some(a), Some(b)) if a == b => Some(a),
-        // fixedBlockLength requires equal min/max. The nominal fallback keeps
-        // compatible hosts that advertise the guarantee but omit those two
-        // redundant options on their older options implementation.
-        (None, None) => nominal,
-        _ => None,
-    };
-    if declared_fixed.is_some_and(|frames| frames % HOST_HOP == 0) {
-        BufferMode::Direct
-    } else {
+    let maximum_too_short = max.is_some_and(|frames| frames < HOST_HOP);
+    let fixed_misaligned = matches!((min, max), (Some(a), Some(b)) if a == b && a % HOST_HOP != 0);
+    if maximum_too_short || fixed_misaligned {
         BufferMode::Staged
+    } else {
+        BufferMode::Direct
     }
 }
 
@@ -240,12 +254,12 @@ unsafe extern "C" fn instantiate(
     features: *const *const c_void,
 ) -> *mut c_void {
     let Some(i) = DESCRIPTORS.iter().position(|v| core::ptr::eq(v, d)) else { return core::ptr::null_mut() };
-    let lanes = VARIANTS[i].1;
+    let (_, lanes, requested_mode) = VARIANTS[i];
     let path = std::env::var("SGV2_PARAMS").unwrap_or_else(|_| "/run/speakerguardd/params.bin".into());
     let bytes = std::fs::read(path).ok();
     let board = live_board().unwrap_or_default();
     // SAFETY: LV2 owns the feature array for the duration of instantiate.
-    let mode = unsafe { buffer_mode(features) };
+    let mode = unsafe { buffer_mode(requested_mode, features) };
     instantiate_offline_with_mode(bytes.as_deref(), &board, rate, lanes, mode)
 }
 
@@ -356,7 +370,17 @@ macro_rules! descriptor {
         }
     };
 }
-static DESCRIPTORS: [Lv2Descriptor; 4] = [descriptor!(0), descriptor!(1), descriptor!(2), descriptor!(3)];
+static DESCRIPTORS: [Lv2Descriptor; 8] = [
+    descriptor!(0),
+    descriptor!(1),
+    descriptor!(2),
+    descriptor!(3),
+    descriptor!(4),
+    descriptor!(5),
+    descriptor!(6),
+    descriptor!(7),
+];
+const _: () = assert!(DESCRIPTORS.len() == VARIANTS.len());
 pub fn descriptor(index: usize) -> *const Lv2Descriptor {
     DESCRIPTORS.get(index).map_or(core::ptr::null(), |d| d as *const _)
 }
@@ -365,33 +389,53 @@ pub fn descriptor(index: usize) -> *const Lv2Descriptor {
 mod tests {
     use super::*;
 
+    const URID_MIN_BLOCK: u32 = 1;
+    const URID_MAX_BLOCK: u32 = 2;
+    const URID_NOMINAL_BLOCK: u32 = 3;
+    const URID_ATOM_INT: u32 = 4;
+    const URID_SEQUENCE_SIZE: u32 = 5;
+    const URID_SAMPLE_RATE: u32 = 6;
+    const URID_ATOM_FLOAT: u32 = 7;
+    const PIPEWIRE_MIN_BLOCK: i32 = 1;
+    const PIPEWIRE_MAX_BLOCK: i32 = 8192;
+    const PIPEWIRE_NOMINAL_BLOCK: i32 = 1024;
+    const PIPEWIRE_SEQUENCE_SIZE: i32 = 32768;
+    const PIPEWIRE_SAMPLE_RATE: f32 = 48_000.0;
+
     unsafe extern "C" fn map_uri(_: *mut c_void, uri: *const c_char) -> u32 {
         // SAFETY: the parser calls the mock with one of its static URI strings.
         match unsafe { CStr::from_ptr(uri) }.to_bytes_with_nul() {
-            OPTION_MIN_BLOCK => 1,
-            OPTION_MAX_BLOCK => 2,
-            OPTION_NOMINAL_BLOCK => 3,
-            ATOM_INT => 4,
+            OPTION_MIN_BLOCK => URID_MIN_BLOCK,
+            OPTION_MAX_BLOCK => URID_MAX_BLOCK,
+            OPTION_NOMINAL_BLOCK => URID_NOMINAL_BLOCK,
+            ATOM_INT => URID_ATOM_INT,
+            OPTION_SEQUENCE_SIZE => URID_SEQUENCE_SIZE,
+            OPTION_SAMPLE_RATE => URID_SAMPLE_RATE,
+            ATOM_FLOAT => URID_ATOM_FLOAT,
             _ => 0,
         }
     }
 
     fn declared_mode(
+        requested: BufferMode,
         fixed: bool,
         power_of_two: bool,
+        bounded: bool,
         min: Option<i32>,
         max: Option<i32>,
         nominal: Option<i32>,
     ) -> BufferMode {
         let mut options = Vec::new();
-        for (key, value) in [(1, min.as_ref()), (2, max.as_ref()), (3, nominal.as_ref())] {
+        for (key, value) in
+            [(URID_MIN_BLOCK, min.as_ref()), (URID_MAX_BLOCK, max.as_ref()), (URID_NOMINAL_BLOCK, nominal.as_ref())]
+        {
             if let Some(value) = value {
                 options.push(Lv2Option {
                     context: 0,
                     subject: 0,
                     key,
                     size: 4,
-                    value_type: 4,
+                    value_type: URID_ATOM_INT,
                     value: (value as *const i32).cast(),
                 });
             }
@@ -408,21 +452,125 @@ mod tests {
         if power_of_two {
             features.push(Lv2Feature { uri: FEATURE_POWER_OF_TWO_BLOCK.as_ptr().cast(), data: core::ptr::null_mut() });
         }
+        if bounded {
+            features.push(Lv2Feature { uri: FEATURE_BOUNDED_BLOCK.as_ptr().cast(), data: core::ptr::null_mut() });
+        }
         let mut pointers: Vec<*const c_void> =
             features.iter().map(|feature| (feature as *const Lv2Feature).cast()).collect();
         pointers.push(core::ptr::null());
         // SAFETY: all mock feature and option storage remains live for this call.
-        unsafe { buffer_mode(pointers.as_ptr()) }
+        unsafe { buffer_mode(requested, pointers.as_ptr()) }
+    }
+
+    fn pipewire_1_6_7_mode(requested: BufferMode) -> BufferMode {
+        let mut options = [
+            Lv2Option {
+                context: 0,
+                subject: 0,
+                key: URID_MIN_BLOCK,
+                size: size_of::<i32>() as u32,
+                value_type: URID_ATOM_INT,
+                value: (&PIPEWIRE_MIN_BLOCK as *const i32).cast(),
+            },
+            Lv2Option {
+                context: 0,
+                subject: 0,
+                key: URID_MAX_BLOCK,
+                size: size_of::<i32>() as u32,
+                value_type: URID_ATOM_INT,
+                value: (&PIPEWIRE_MAX_BLOCK as *const i32).cast(),
+            },
+            Lv2Option {
+                context: 0,
+                subject: 0,
+                key: URID_SEQUENCE_SIZE,
+                size: size_of::<i32>() as u32,
+                value_type: URID_ATOM_INT,
+                value: (&PIPEWIRE_SEQUENCE_SIZE as *const i32).cast(),
+            },
+            Lv2Option {
+                context: 0,
+                subject: 0,
+                key: URID_NOMINAL_BLOCK,
+                size: size_of::<i32>() as u32,
+                value_type: URID_ATOM_INT,
+                value: (&PIPEWIRE_NOMINAL_BLOCK as *const i32).cast(),
+            },
+            Lv2Option {
+                context: 0,
+                subject: 0,
+                key: URID_SAMPLE_RATE,
+                size: size_of::<f32>() as u32,
+                value_type: URID_ATOM_FLOAT,
+                value: (&PIPEWIRE_SAMPLE_RATE as *const f32).cast(),
+            },
+            Lv2Option { context: 0, subject: 0, key: 0, size: 0, value_type: 0, value: core::ptr::null() },
+        ];
+        let mut map = UridMap { handle: core::ptr::null_mut(), map: map_uri };
+        let features = [
+            Lv2Feature { uri: FEATURE_LOG.as_ptr().cast(), data: core::ptr::null_mut() },
+            Lv2Feature { uri: FEATURE_URID_MAP.as_ptr().cast(), data: (&mut map as *mut UridMap).cast() },
+            Lv2Feature { uri: FEATURE_URID_UNMAP.as_ptr().cast(), data: core::ptr::null_mut() },
+            Lv2Feature { uri: FEATURE_FIXED_BLOCK.as_ptr().cast(), data: core::ptr::null_mut() },
+            Lv2Feature { uri: FEATURE_POWER_OF_TWO_BLOCK.as_ptr().cast(), data: core::ptr::null_mut() },
+            Lv2Feature { uri: FEATURE_BOUNDED_BLOCK.as_ptr().cast(), data: core::ptr::null_mut() },
+            Lv2Feature { uri: FEATURE_OPTIONS.as_ptr().cast(), data: options.as_mut_ptr().cast() },
+        ];
+        let mut pointers: Vec<*const c_void> =
+            features.iter().map(|feature| (feature as *const Lv2Feature).cast()).collect();
+        pointers.push(core::ptr::null());
+        // SAFETY: this is PipeWire 1.6.7's feature and option layout, with all
+        // pointed-to mock storage live for the call.
+        unsafe { buffer_mode(requested, pointers.as_ptr()) }
     }
 
     #[test]
-    fn direct_requires_a_fixed_declared_multiple_of_the_decision_hop() {
-        assert_eq!(declared_mode(true, true, Some(512), Some(512), Some(512)), BufferMode::Direct);
-        assert_eq!(declared_mode(true, false, Some(1024), Some(1024), Some(1024)), BufferMode::Direct);
-        assert_eq!(declared_mode(true, false, None, None, Some(512)), BufferMode::Direct);
-        assert_eq!(declared_mode(true, false, Some(513), Some(513), Some(513)), BufferMode::Staged);
-        assert_eq!(declared_mode(true, false, Some(512), Some(1024), Some(512)), BufferMode::Staged);
-        assert_eq!(declared_mode(false, true, None, None, Some(512)), BufferMode::Staged);
-        assert_eq!(declared_mode(false, false, None, None, Some(512)), BufferMode::Staged);
+    fn pipewire_1_6_7_features_keep_shipped_uris_direct() {
+        assert_eq!(pipewire_1_6_7_mode(BufferMode::Direct), BufferMode::Direct);
+    }
+
+    #[test]
+    fn only_explicit_staging_or_proven_misalignment_selects_staged() {
+        assert_eq!(pipewire_1_6_7_mode(BufferMode::Staged), BufferMode::Staged);
+        let aligned = HOST_HOP as i32;
+        let aligned_double = (2 * HOST_HOP) as i32;
+        let misaligned = (HOST_HOP + 1) as i32;
+        let too_short = (HOST_HOP - 1) as i32;
+        assert_eq!(
+            declared_mode(BufferMode::Direct, true, false, false, Some(aligned), Some(aligned), Some(aligned)),
+            BufferMode::Direct
+        );
+        assert_eq!(
+            declared_mode(
+                BufferMode::Direct,
+                true,
+                false,
+                false,
+                Some(aligned_double),
+                Some(aligned_double),
+                Some(aligned_double)
+            ),
+            BufferMode::Direct
+        );
+        assert_eq!(
+            declared_mode(BufferMode::Direct, true, false, false, Some(misaligned), Some(misaligned), Some(misaligned)),
+            BufferMode::Staged
+        );
+        assert_eq!(
+            declared_mode(BufferMode::Direct, false, false, true, Some(1), Some(too_short), Some(too_short)),
+            BufferMode::Staged
+        );
+        assert_eq!(
+            declared_mode(BufferMode::Direct, true, false, false, Some(aligned), Some(aligned_double), Some(aligned)),
+            BufferMode::Direct
+        );
+        assert_eq!(
+            declared_mode(BufferMode::Direct, false, true, false, None, None, Some(aligned)),
+            BufferMode::Direct
+        );
+        assert_eq!(
+            declared_mode(BufferMode::Direct, false, false, false, None, None, Some(misaligned)),
+            BufferMode::Direct
+        );
     }
 }

@@ -57,3 +57,23 @@
     a lv2:Plugin ;
     lv2:binary <libsgv2_lv2.so> ;
     rdfs:seeAlso <sgv2.ttl> .
+
+<https://aurora-silicon.org/lv2/sgv2#voicing-1ch-staged>
+    a lv2:Plugin ;
+    lv2:binary <libsgv2_lv2.so> ;
+    rdfs:seeAlso <sgv2.ttl> .
+
+<https://aurora-silicon.org/lv2/sgv2#voicing-2ch-staged>
+    a lv2:Plugin ;
+    lv2:binary <libsgv2_lv2.so> ;
+    rdfs:seeAlso <sgv2.ttl> .
+
+<https://aurora-silicon.org/lv2/sgv2#voicing-4ch-staged>
+    a lv2:Plugin ;
+    lv2:binary <libsgv2_lv2.so> ;
+    rdfs:seeAlso <sgv2.ttl> .
+
+<https://aurora-silicon.org/lv2/sgv2#voicing-6ch-staged>
+    a lv2:Plugin ;
+    lv2:binary <libsgv2_lv2.so> ;
+    rdfs:seeAlso <sgv2.ttl> .

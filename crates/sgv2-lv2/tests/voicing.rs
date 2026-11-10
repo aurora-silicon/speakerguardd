@@ -3,6 +3,7 @@
 //! Chain hosting sequence used by voicing-render, including control changes.
 #[path = "../../sgv2-core/tests/voicing_fixture/mod.rs"]
 mod fixture;
+use sgv2_core::voicing::buzz::{BufferMode, HOST_HOP};
 use sgv2_core::voicing::chain::{Chain, GraphParam};
 use sgv2_core::{blob, MAX_CHANNELS};
 use sgv2_lv2::voicing::{self, BLOCK};
@@ -42,6 +43,24 @@ unsafe impl GlobalAlloc for Counting {
 }
 #[global_allocator]
 static ALLOC: Counting = Counting;
+
+#[test]
+fn staged_variant_uris_add_exactly_one_host_hop_of_latency() {
+    assert!(voicing::VARIANTS[..4]
+        .iter()
+        .all(|(uri, _, mode)| { !uri.contains("-staged") && *mode == BufferMode::Direct }));
+    assert!(voicing::VARIANTS[4..]
+        .iter()
+        .all(|(uri, _, mode)| { uri.contains("-staged") && *mode == BufferMode::Staged }));
+
+    let board = "j413";
+    let lanes = 4;
+    let bytes = blob::with_voicing(&fixture::unit(board, lanes), &fixture::spec(lanes)).unwrap();
+    let direct = voicing::Voicing::load_with_buffer_mode(Some(&bytes), board, 48_000.0, lanes, BufferMode::Direct);
+    let staged = voicing::Voicing::load_with_buffer_mode(Some(&bytes), board, 48_000.0, lanes, BufferMode::Staged);
+    assert!(direct.ready() && staged.ready());
+    assert_eq!(staged.latency(), direct.latency() + HOST_HOP);
+}
 
 fn check(board: &str, lanes: usize) {
     let spec = fixture::spec(lanes);
