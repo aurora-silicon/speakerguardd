@@ -269,6 +269,20 @@ def _links(snd, root, phandles, sysfs):
     return links
 
 
+def has_speaker_link(node):
+    """Whether a macaudio device tree node has the link macaudio drives
+    speakers on ("Speaker" or "Speakers"); the J614s/J616s/J713 jack-only
+    card has none."""
+    for c in os.listdir(node):
+        try:
+            with open(os.path.join(node, c, "link-name"), "rb") as f:
+                if f.read().rstrip(b"\0") in (b"Speaker", b"Speakers"):
+                    return True
+        except OSError:
+            continue
+    return False
+
+
 def read_dt(root="/proc/device-tree", sysfs="/sys/bus/i2c/devices"):
     """The hardware description of the running Mac, from its device tree:
     the apple,macaudio card that has the speaker link (the J614s/J616s/J713
