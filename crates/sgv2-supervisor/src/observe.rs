@@ -283,6 +283,10 @@ pub const OPENING_GRACE_NS: u64 = 500_000_000;
 /// system sleep, while the engine's PCM is opening or open but not running
 /// and the engine has not beaten since that grant (see the module notes).
 pub const RESUME_GRACE_NS: u64 = 500_000_000;
+/// After a system sleep the heartbeat counts as fresh only once the engine
+/// has beaten steadily (every tick fresh) for this long: PipeWire resyncs
+/// its graph and drivers in the first moments after the thaw.
+pub const RESUME_SETTLE_NS: u64 = 500_000_000;
 
 /// Freshness bound while the engine runs: two unit quanta (the
 /// architecture's "at most 2 quanta stale") plus one supervisor tick.
@@ -323,6 +327,11 @@ pub struct Observer {
     /// After a system sleep: `Some(None)` until the next tick reads the
     /// page, then `Some(Some(seq))` until the sequence passes that value.
     after_sleep: Option<Option<u64>>,
+    /// After the first post-sleep beat: since when every tick was fresh.
+    settle_since: Option<u64>,
+    /// The last tick's PCM state and heartbeat age, for the release log.
+    last_pcm: Option<PcmState>,
+    last_beat_age_ns: Option<u64>,
     /// A sleep happened and no grant has followed it yet.
     sleep_before_grant: bool,
     /// The first grant after a sleep: when, and the sequence at that tick.
@@ -352,6 +361,9 @@ impl Observer {
             expected_wiring: None,
             wrong_wiring: None,
             after_sleep: None,
+            settle_since: None,
+            last_pcm: None,
+            last_beat_age_ns: None,
             sleep_before_grant: false,
             resume_grant: None,
         }
@@ -362,13 +374,20 @@ impl Observer {
     /// it counts as fresh (see the module notes).
     pub fn note_sleep(&mut self) {
         self.after_sleep = Some(None);
+        self.settle_since = None;
         self.sleep_before_grant = true;
         self.resume_grant = None;
     }
 
     /// Whether the heartbeat is held stale for a beat made after a sleep.
     pub fn waiting_after_sleep(&self) -> bool {
-        self.after_sleep.is_some()
+        self.after_sleep.is_some() || self.settle_since.is_some()
+    }
+
+    /// The last tick's speaker PCM state and engine heartbeat age (ms), for
+    /// the release log.
+    pub fn last_tick(&self) -> (Option<PcmState>, Option<u64>) {
+        (self.last_pcm, self.last_beat_age_ns.map(|a| a / 1_000_000))
     }
 
     /// The wiring a fresh session report named, when it is not the one the
@@ -448,8 +467,10 @@ impl Observer {
                 true
             }
             Some(Some(floor)) if e.valid && e.seq > floor => {
+                // a beat after the thaw: now it must keep beating for a while
                 self.after_sleep = None;
-                false
+                self.settle_since = None;
+                true
             }
             Some(Some(floor)) => {
                 // a restarted page counts again from its own sequence
@@ -527,10 +548,37 @@ impl Observer {
                 let bound = stale_ns(q, self.rate, self.tick_ns) + grace;
                 let advanced = self.last_advance_ns.is_some_and(|t| now_ns.saturating_sub(t) <= bound);
                 let recent = e.mono_ns <= now_ns && now_ns - e.mono_ns <= bound;
-                e.valid && advanced && recent && !held_after_sleep
+                e.valid && advanced && recent
             }
             None => false,
         };
+        self.last_pcm = Some(p);
+        self.last_beat_age_ns = self.last_advance_ns.map(|t| now_ns.saturating_sub(t));
+        // after a sleep: fresh only once every tick has been fresh for RESUME_SETTLE_NS
+        let settling = if held_after_sleep {
+            if self.after_sleep.is_none() {
+                if heartbeat_fresh {
+                    self.settle_since = Some(now_ns);
+                } else {
+                    self.after_sleep = Some(Some(e.seq));
+                }
+            }
+            true
+        } else if let Some(t0) = self.settle_since {
+            if !heartbeat_fresh {
+                self.settle_since = None;
+                self.after_sleep = Some(Some(e.seq));
+                true
+            } else if now_ns.saturating_sub(t0) >= RESUME_SETTLE_NS {
+                self.settle_since = None;
+                false
+            } else {
+                true
+            }
+        } else {
+            false
+        };
+        let heartbeat_fresh = heartbeat_fresh && !settling;
         // only the plugin's host process may hold the speaker PCM
         let pcm_owner_ok = match p.owner() {
             Some(owner) => owner == e.pid && e.pid != 0,
@@ -1802,10 +1850,18 @@ mod tests {
             t += TICK;
             assert!(!sleep_tick(&mut o, t, seq, t - TICK), "a pre-sleep beat counted");
         }
-        // the engine beats again after the thaw: fresh, and the hold ends
-        t += TICK;
-        seq += 1;
-        assert!(sleep_tick(&mut o, t, seq, t - 1));
+        // the engine beats again after the thaw: fresh once it has kept
+        // beating for RESUME_SETTLE_NS, and the hold ends
+        let first = t + TICK;
+        loop {
+            t += TICK;
+            seq += 1;
+            if sleep_tick(&mut o, t, seq, t - 1) {
+                break;
+            }
+            assert!(t - first <= RESUME_SETTLE_NS + TICK, "never fresh again");
+        }
+        assert!(t - first >= RESUME_SETTLE_NS, "fresh before the settle");
         assert!(!o.waiting_after_sleep());
     }
 
@@ -1828,7 +1884,7 @@ mod tests {
         assert!(!sleep_tick(&mut o, t, seq, t - TICK));
         t += TICK;
         seq += 1;
-        assert!(sleep_tick(&mut o, t, seq, t - 1));
+        assert!(!sleep_tick(&mut o, t, seq, t - 1), "fresh without the settle");
     }
 
     /// No beat after a sleep: the heartbeat stays stale, so nothing grants.
@@ -1865,6 +1921,49 @@ mod tests {
         None
     }
 
+    /// After a sleep: beats every tick until the heartbeat is fresh again
+    /// (the settle); returns (seq, t) of that fresh tick.
+    fn settle(o: &mut Observer, mut seq: u64, mut t: u64) -> (u64, u64) {
+        for _ in 0..200 {
+            t += TICK;
+            seq += 1;
+            let c = PcmState::Closed;
+            if o.observe(&mut || t, &mut E(beat(seq, 512, t)), &mut P(c), &mut S(session(t))).heartbeat_fresh {
+                return (seq, t);
+            }
+        }
+        panic!("never fresh after the sleep");
+    }
+
+    /// A stall during the settle starts it again from the next beat.
+    #[test]
+    fn a_stall_during_the_settle_starts_it_again() {
+        let mut o = Observer::new(7, 48_000, TICK);
+        let (mut seq, mut t) = steady(&mut o, PcmState::Closed);
+        o.note_sleep();
+        for _ in 0..20 {
+            t += TICK;
+            seq += 1;
+            assert!(!sleep_tick(&mut o, t, seq, t - 1));
+        }
+        // a 100 ms stall
+        let stall = t;
+        for _ in 0..10 {
+            t += TICK;
+            assert!(!sleep_tick(&mut o, t, seq, stall));
+        }
+        let restart = t;
+        loop {
+            t += TICK;
+            seq += 1;
+            if sleep_tick(&mut o, t, seq, t - 1) {
+                break;
+            }
+            assert!(t - restart < 2 * RESUME_SETTLE_NS, "never fresh again");
+        }
+        assert!(t - restart >= RESUME_SETTLE_NS);
+    }
+
     /// A steady engine with the PCM `p`, the last beat at `t`; returns (seq, t).
     fn steady(o: &mut Observer, p: PcmState) -> (u64, u64) {
         let (mut seq, mut t) = (0, 0);
@@ -1887,14 +1986,7 @@ mod tests {
         let mut o = Observer::new(7, 48_000, TICK);
         let (seq, t) = steady(&mut o, PcmState::Closed);
         o.note_sleep();
-        // the engine beats after the thaw (the post-sleep hold ends), the grant follows
-        let (seq, t) = (seq + 1, t + TICK);
-        o.observe(&mut || t, &mut E(beat(seq, 512, t)), &mut P(PcmState::Closed), &mut S(session(t)));
-        let (seq, t) = (seq + 1, t + TICK);
-        assert!(
-            o.observe(&mut || t, &mut E(beat(seq, 512, t)), &mut P(PcmState::Closed), &mut S(session(t)))
-                .heartbeat_fresh
-        );
+        let (seq, t) = settle(&mut o, seq, t);
         o.note_grant(t);
         // no beat while the sink opens and prepares: fresh well past the boot-time bound
         let stale =
@@ -1922,10 +2014,7 @@ mod tests {
             let mut o = Observer::new(7, 48_000, TICK);
             let (seq, t) = steady(&mut o, PcmState::Closed);
             o.note_sleep();
-            let (seq, t) = (seq + 1, t + TICK);
-            o.observe(&mut || t, &mut E(beat(seq, 512, t)), &mut P(PcmState::Closed), &mut S(session(t)));
-            let (seq, t) = (seq + 1, t + TICK);
-            o.observe(&mut || t, &mut E(beat(seq, 512, t)), &mut P(PcmState::Closed), &mut S(session(t)));
+            let (seq, t) = settle(&mut o, seq, t);
             o.note_grant(t);
             let stale = silent_run(&mut o, t + TICK, t + 2_000_000_000, seq, t, p).unwrap();
             assert!(stale - t <= GRANT_GRACE_NS + START_GRACE_NS + stale_ns(512, 48_000, TICK) + TICK, "{p:?}");
@@ -1940,10 +2029,7 @@ mod tests {
         let mut o = Observer::new(7, 48_000, TICK);
         let (seq, t) = steady(&mut o, PcmState::Closed);
         o.note_sleep();
-        let (seq, t) = (seq + 1, t + TICK);
-        o.observe(&mut || t, &mut E(beat(seq, 512, t)), &mut P(PcmState::Closed), &mut S(session(t)));
-        let (seq, t) = (seq + 1, t + TICK);
-        o.observe(&mut || t, &mut E(beat(seq, 512, t)), &mut P(PcmState::Closed), &mut S(session(t)));
+        let (seq, t) = settle(&mut o, seq, t);
         o.note_grant(t);
         // a beat after the grant: from here the boot-time rules apply
         let (seq, t) = (seq + 1, t + TICK);

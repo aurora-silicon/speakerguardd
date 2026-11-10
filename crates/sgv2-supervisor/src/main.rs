@@ -982,13 +982,19 @@ mod linux {
                 }
                 Ok(Event::Released { why }) => {
                     let session = observer.session_why();
+                    let (pcm, age) = observer.last_tick();
                     eprintln!(
-                        "protection released: {why:?}{}{session}",
+                        "protection released: {why:?}{}{session} (pcm {pcm:?}, engine beat {age:?} ms ago)",
                         if session.is_empty() { "" } else { "; session: " }
                     );
                 }
                 Ok(Event::HardFault(f)) => eprintln!("amp fault, protection withdrawn until restart: {f}"),
-                Ok(Event::Lapsed) => eprintln!("lease lapsed; re-qualifying"),
+                Ok(Event::Lapsed) => {
+                    // the kernel withdraws a lease at a system sleep: the next
+                    // grant waits for the engine to beat steadily after the thaw
+                    observer.note_sleep();
+                    eprintln!("lease lapsed; re-qualifying");
+                }
                 Ok(_) => {}
                 Err(Fatal::Kernel(e)) => {
                     eprintln!("kernel: {e:?}; exiting (the kernel floor holds)");
