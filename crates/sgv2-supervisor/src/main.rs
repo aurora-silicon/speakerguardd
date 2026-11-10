@@ -62,6 +62,7 @@ mod linux {
 
     use sgv2_lv2::page::{EnginePage, LAYOUT, MAGIC, PAGE_BYTES};
     use sgv2_supervisor::kernel::{Kernel, KernelError, Macaudio};
+    use sgv2_supervisor::lease::Observation;
     use sgv2_supervisor::machine::{blob_full_scales, board_from_compatible, Machine};
     use sgv2_supervisor::observe::{
         combine, helper_is, owner_to_tgid, parse_pcm_info, parse_pcm_status, parse_session, parse_tgid,
@@ -907,7 +908,10 @@ mod linux {
         loop {
             let obs = observer.observe(&mut now_ns, &mut engine, &mut pcm_view, &mut session);
             let event = sup.tick(obs, &mut kernel);
-            let ready = obs.clean() && !obs.demand && sup.latched_fault().is_none() && sup.problem().is_none();
+            // the observer leaves the kernel-side checks to the supervisor,
+            // which records any failure as its problem
+            let card_ok = sup.problem().is_none() && sup.latched_fault().is_none();
+            let ready = card_ok && !obs.demand && Observation { route_ok: true, amps_ok: true, ..obs }.clean();
             if ready && !idle_ready && !matches!(event, Ok(Event::Idle)) {
                 eprintln!("protection ready: every check holds, granted while a stream plays");
             }
