@@ -404,6 +404,9 @@ class Session:
         both PCMs closed rather than under a running stream."""
         if want:
             return True
+        if self.last_play is None:
+            # nothing has played since this helper started: nothing to take down
+            return False
         if self.idle_since is None or now - self.idle_since >= TEARDOWN_S:
             return False
         if self.amps_linked(g):

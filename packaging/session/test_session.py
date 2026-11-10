@@ -346,6 +346,12 @@ class Idle(unittest.TestCase):
         self.assertTrue(s.play_report(g, False, t + 0.3))
         self.assertFalse(s.play_report(g, False, t + sgs.TEARDOWN_S))
         self.assertTrue(s.play_report(g, True, t + sgs.TEARDOWN_S))
+        # a helper that starts with nothing playing asks for no grant at all
+        g, _, s, _, _ = self.voiced(state="idle")
+        for n in (g.node_id("sgv2.speaker.j316"), g.node_id("sgv2.sense.j316")):
+            g.objs[n]["info"]["state"] = "idle"
+        self.assertFalse(s.want(g, 1.0))
+        self.assertFalse(s.play_report(g, False, 1.0))
 
     def _reconcile(self, g, s, granted, play):
         ran = []
