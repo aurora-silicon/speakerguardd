@@ -102,6 +102,12 @@ pub enum ToneShape {
     /// its B endpoint this peak republishes frequency through the platform
     /// Float32 logarithm/exponential pair before construction.
     EndpointPublishedPeak,
+    /// A two-point peak in a high-pass/low-shelf box publishes the upper
+    /// frequency endpoint as the next Float32 word before construction.
+    UpperEndpointPeak,
+    /// A low shelf in the same automation object keeps its cancelling
+    /// section when the moving gain reaches zero.
+    AutomationLowShelf,
     /// A peak of the first ToneMeister algorithm version ([`super::tone::legacy_peak`]).
     LegacyPeak,
     LowPass(u32),
@@ -463,6 +469,11 @@ fn published_frequency(frequency_hz: f64) -> f64 {
     f64::from(crate::platform_math::expf(libm::log(f64::from(frequency_hz)) as f32))
 }
 
+fn upper_endpoint_frequency(frequency_hz: f64) -> f64 {
+    let frequency_hz = frequency_hz as f32;
+    f64::from(f32::from_bits(frequency_hz.to_bits() + 1))
+}
+
 /// The edge frequencies a Butterworth shelf (type 2: two; band shelf, type
 /// 0: four) takes at `scalar`, with the gain. The installed unit moves the
 /// shelf as a whole (black-box renders): the set points' frequency replaces
@@ -502,21 +513,29 @@ fn apply_tone_automation(stage: &mut PreStage, base: &[Channel], automation: &[T
                 }
                 ToneShape::Peak
                 | ToneShape::EndpointPublishedPeak
+                | ToneShape::UpperEndpointPeak
                 | ToneShape::LegacyPeak
                 | ToneShape::LowShelf
+                | ToneShape::AutomationLowShelf
                 | ToneShape::HighShelf => {
                     let section = match a.shape {
-                        ToneShape::Peak | ToneShape::EndpointPublishedPeak => {
-                            let frequency_hz =
-                                if a.shape == ToneShape::EndpointPublishedPeak && at_b_endpoint(a, scalar) {
-                                    published_frequency(frequency_hz)
-                                } else {
-                                    frequency_hz
-                                };
+                        ToneShape::Peak | ToneShape::EndpointPublishedPeak | ToneShape::UpperEndpointPeak => {
+                            let frequency_hz = if at_b_endpoint(a, scalar) {
+                                match a.shape {
+                                    ToneShape::EndpointPublishedPeak => published_frequency(frequency_hz),
+                                    ToneShape::UpperEndpointPeak => upper_endpoint_frequency(frequency_hz),
+                                    _ => frequency_hz,
+                                }
+                            } else {
+                                frequency_hz
+                            };
                             super::tone::peak(gain_db, frequency_hz, a.quality, fs)
                         }
                         ToneShape::LegacyPeak => super::tone::legacy_peak(gain_db, frequency_hz, a.quality, fs),
                         ToneShape::LowShelf => super::tone::low_shelf(gain_db, frequency_hz, a.quality, fs),
+                        ToneShape::AutomationLowShelf => {
+                            super::tone::automated_low_shelf(gain_db, frequency_hz, a.quality, fs)
+                        }
                         _ => super::tone::high_shelf(gain_db, frequency_hz, a.quality, fs),
                     };
                     if section.stable() {
@@ -1484,6 +1503,38 @@ mod tests {
         let published = crate::voicing::tone::peak(-12.0, published_frequency(333.0), 10.0, fs);
         assert_ne!(direct, published);
         assert_eq!(endpoint, published);
+    }
+
+    #[test]
+    fn upper_endpoint_peak_publishes_the_next_float32_frequency_only_at_b() {
+        let fs = 48_000.0;
+        let mut channel = Channel::IDENTITY;
+        channel.count = 1;
+        let automation = ToneAutomation {
+            shape: ToneShape::UpperEndpointPeak,
+            quality: 2.0,
+            fixed: [0.0; 3],
+            max_order: 10,
+            a: TonePoint { scalar: 0.0, gain_db: -2.0, frequency_hz: 700.0 },
+            b: TonePoint { scalar: 1.0, gain_db: -4.0, frequency_hz: 1_300.0 },
+            midpoint: None,
+            targets: vec![ToneTarget { channel: 0, section: 0 }],
+        };
+        let tone = Tone {
+            channels: vec![channel],
+            automation: vec![automation.clone()],
+            dynamic: Vec::new(),
+            dynamic_automation: Vec::new(),
+        };
+        let endpoint = tone.at_volume(fs, 1.0).channels[0].sections[0];
+        let published = crate::voicing::tone::peak(-4.0, upper_endpoint_frequency(1_300.0), 2.0, fs);
+        assert_eq!((upper_endpoint_frequency(1_300.0) as f32).to_bits(), 1_300.0f32.to_bits() + 1);
+        assert_eq!(endpoint, published);
+        let (gain_db, frequency_hz) = automated_values(&automation, 0.5);
+        assert_eq!(
+            tone.at_volume(fs, 0.5).channels[0].sections[0],
+            crate::voicing::tone::peak(gain_db, frequency_hz, 2.0, fs)
+        );
     }
 
     #[test]

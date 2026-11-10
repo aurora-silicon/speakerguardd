@@ -347,6 +347,13 @@ pub fn low_shelf(gain_db: f64, f0: f64, q: f64, fs: f64) -> Section {
     shelf(false, gain_db, f0, q, fs)
 }
 
+/// A low shelf rebuilt by the volume-automation object. Unlike a static
+/// zero-gain slot, the running object keeps its cancelling pole/zero words
+/// when its gain reaches zero.
+pub(crate) fn automated_low_shelf(gain_db: f64, f0: f64, q: f64, fs: f64) -> Section {
+    shelf(false, gain_db, f0, q, fs)
+}
+
 /// A decramped high-shelf section. A 0 dB high shelf keeps its section, a
 /// pole and zero pair that cancel up to its Float32 words.
 pub fn high_shelf(gain_db: f64, f0: f64, q: f64, fs: f64) -> Section {
@@ -767,6 +774,16 @@ mod tests {
         for f in [0.0, 20.0, 97.5, 1000.0, 8_000.0, 16_000.0, 20_000.0] {
             assert!((magnitude(flat, f, fs) - 1.0).abs() < 1e-3, "{f} {}", magnitude(flat, f, fs));
         }
+    }
+
+    #[test]
+    fn an_automated_zero_gain_low_shelf_keeps_its_cancelling_words() {
+        let direct = low_shelf(0.0, 420.0, 0.8, 48_000.0);
+        let automated = automated_low_shelf(0.0, 420.0, 0.8, 48_000.0);
+        assert_eq!(direct, Section::IDENTITY);
+        assert_ne!(automated, Section::IDENTITY);
+        assert!((automated.magnitude(20.0, 48_000.0) - 1.0).abs() < 1e-5);
+        assert!((automated.magnitude(20_000.0, 48_000.0) - 1.0).abs() < 1e-5);
     }
 
     fn cascade_db(c: &Cascade, f: f64, fs: f64) -> f64 {

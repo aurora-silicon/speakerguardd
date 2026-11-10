@@ -342,6 +342,10 @@ pub fn voicing_tone(
     let (mut out, mut partial, mut dynamic_automation) = (Vec::new(), Vec::new(), Vec::new());
     let dynamic = tone_dynamic(&parts, &ctx)?;
     let has_type_18 = dynamic.iter().any(|slot| slot.params.kind == DynamicKind::HighShelf);
+    let upper_endpoint_box = parts.first().is_some_and(|part| {
+        part.slots.iter().any(|slot| matches!(slot.shape, ToneShape::HighPass(_)))
+            && part.slots.iter().any(|slot| slot.shape == ToneShape::LowShelf)
+    });
     if mode == Realise::LeastPassing || stage.bypass {
         return Ok((Tone { channels, automation: out, dynamic, dynamic_automation }, partial));
     }
@@ -433,6 +437,10 @@ pub fn voicing_tone(
         // not a selector.
         let shape = if has_type_18 && e == 3 && saved.shape == ToneShape::Peak && midpoint.is_some() {
             ToneShape::EndpointPublishedPeak
+        } else if upper_endpoint_box && e == 3 && saved.shape == ToneShape::Peak && midpoint.is_none() {
+            ToneShape::UpperEndpointPeak
+        } else if upper_endpoint_box && saved.shape == ToneShape::LowShelf {
+            ToneShape::AutomationLowShelf
         } else {
             saved.shape
         };

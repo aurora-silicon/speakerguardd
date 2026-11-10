@@ -212,6 +212,8 @@ impl Wire for ToneShape {
             Self::ButterworthBandShelf => (8, 0),
             Self::LegacyPeak => (9, 0),
             Self::EndpointPublishedPeak => (10, 0),
+            Self::UpperEndpointPeak => (11, 0),
+            Self::AutomationLowShelf => (12, 0),
         };
         (tag as u32).put(o);
         arg.put(o);
@@ -231,6 +233,8 @@ impl Wire for ToneShape {
             (8, 0) => Self::ButterworthBandShelf,
             (9, 0) => Self::LegacyPeak,
             (10, 0) => Self::EndpointPublishedPeak,
+            (11, 0) => Self::UpperEndpointPeak,
+            (12, 0) => Self::AutomationLowShelf,
             _ => return Err(BlobError::Length),
         })
     }
@@ -593,11 +597,12 @@ mod tone_shape_tests {
 
     #[test]
     fn endpoint_published_peak_round_trips() {
-        let shape = ToneShape::EndpointPublishedPeak;
-        let mut bytes = Vec::new();
-        shape.put(&mut bytes);
-        let mut reader = Reader(&bytes);
-        assert_eq!(ToneShape::get(&mut reader), Ok(shape));
-        assert!(reader.0.is_empty());
+        for shape in [ToneShape::EndpointPublishedPeak, ToneShape::UpperEndpointPeak, ToneShape::AutomationLowShelf] {
+            let mut bytes = Vec::new();
+            shape.put(&mut bytes);
+            let mut reader = Reader(&bytes);
+            assert_eq!(ToneShape::get(&mut reader), Ok(shape));
+            assert!(reader.0.is_empty());
+        }
     }
 }
