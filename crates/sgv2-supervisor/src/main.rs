@@ -215,6 +215,7 @@ mod linux {
             if unsafe { libc::sched_setscheduler(0, libc::SCHED_FIFO, &sp) } != 0 {
                 eprintln!("PCM reader: SCHED_FIFO unavailable; normal priority");
             }
+            no_frequency_floor();
             let paths: Vec<String> = (0..subs).map(|s| format!("{dir}/sub{s}/status")).collect();
             let mut buf = String::with_capacity(1024);
             let mut tbuf = String::with_capacity(2048);
@@ -253,6 +254,7 @@ mod linux {
             if unsafe { libc::sched_setscheduler(0, libc::SCHED_FIFO, &sp) } != 0 {
                 eprintln!("helper checker: SCHED_FIFO unavailable; normal priority");
             }
+            no_frequency_floor();
             let mut hbuf = String::with_capacity(1024);
             loop {
                 let started = now_ns();
@@ -455,6 +457,50 @@ mod linux {
             }
         })?;
         Ok(())
+    }
+
+    /// The kernel's `sched_attr` up to the utilization clamps (size 56).
+    #[repr(C)]
+    struct SchedAttr {
+        size: u32,
+        sched_policy: u32,
+        sched_flags: u64,
+        sched_nice: i32,
+        sched_priority: u32,
+        sched_runtime: u64,
+        sched_deadline: u64,
+        sched_period: u64,
+        sched_util_min: u32,
+        sched_util_max: u32,
+    }
+    const SCHED_FLAG_KEEP_POLICY: u64 = 0x08;
+    const SCHED_FLAG_KEEP_PARAMS: u64 = 0x10;
+    const SCHED_FLAG_UTIL_CLAMP_MIN: u64 = 0x20;
+
+    /// Drop this thread's utilization floor to 0, keeping its policy and
+    /// priority. A real-time thread with no clamp of its own inherits
+    /// `sched_util_clamp_min_rt_default` (1024), and schedutil then runs its
+    /// cluster at the top frequency every time it wakes. The pollers wake
+    /// every millisecond for a few microseconds of /proc reads, which held
+    /// the M2's performance cluster at 2.4-3.2 GHz with nothing playing.
+    /// They need the CPU on time, not fast. Failure (no uclamp support) is
+    /// harmless and ignored.
+    fn no_frequency_floor() {
+        let attr = SchedAttr {
+            size: core::mem::size_of::<SchedAttr>() as u32,
+            sched_policy: 0,
+            sched_flags: SCHED_FLAG_KEEP_POLICY | SCHED_FLAG_KEEP_PARAMS | SCHED_FLAG_UTIL_CLAMP_MIN,
+            sched_nice: 0,
+            sched_priority: 0,
+            sched_runtime: 0,
+            sched_deadline: 0,
+            sched_period: 0,
+            sched_util_min: 0,
+            sched_util_max: 0,
+        };
+        // SAFETY: this thread's own attributes; a valid, fully initialised
+        // sched_attr whose size field matches the struct.
+        unsafe { libc::syscall(libc::SYS_sched_setattr, 0, &attr as *const SchedAttr, 0u32) };
     }
 
     fn sleep_until(t: u64) {
