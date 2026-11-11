@@ -204,26 +204,22 @@ fn realize_peak_window(dst: &mut [f32], previous: f32, bank: &[f32]) {
     }
 }
 
-/// Merge the ordinary request with the retarget solve. An upward lane
-/// normally takes a real cut made by the retarget solve. When velocity
-/// allocation reached `MaxVelocityAttenuation`, however, the floor-bound
-/// result is not a new request for that recovering lane: native leaves the
-/// ordinary recovery in place until the ordinary solve cuts it again.
-/// Non-upward lanes still take the floor-bound result, so the constrained
-/// band remains at the configured floor.
-fn merge_retarget_requests(
+/// Lanes whose existing recovery continues through a floor-limited
+/// retarget. The ordinary solve must leave the lane rising, while the
+/// retarget alone would turn it into an attack. Native keeps that follower's
+/// current recovery segment until an ordinary solve asks for a cut.
+fn retarget_recovery_mask(
     primary: [f32; BANDS],
     second: [f32; BANDS],
-    seed: [f32; BANDS],
-    upward: [bool; BANDS],
-    velocity_floor_bound: [bool; BANDS],
-) -> [f32; BANDS] {
+    applied: [f32; BANDS],
+    previous_request: [f32; BANDS],
+    primary_floor_limited: bool,
+) -> [bool; BANDS] {
     core::array::from_fn(|k| {
-        if upward[k] && (second[k] >= seed[k] || velocity_floor_bound[k]) {
-            primary[k]
-        } else {
-            second[k]
-        }
+        primary_floor_limited
+            && previous_request[k] >= applied[k]
+            && primary[k] >= applied[k]
+            && second[k] >= applied[k]
     })
 }
 
@@ -2539,10 +2535,11 @@ impl Run {
             let retained_room_bound = c.vel_bound_window[od..].iter().copied().fold(0.0f32, f32::max);
             let velocity_cut = core::cell::Cell::new(false);
             let retained_episode = core::cell::Cell::new(c.vel_episode && c.vel_episode_retained);
-            let chain = |c: &Chan, seed: [f32; BANDS]| -> ([f32; BANDS], [bool; BANDS]) {
+            let continue_recovery = core::cell::Cell::new([false; BANDS]);
+            let chain = |c: &Chan, seed: [f32; BANDS]| -> ([f32; BANDS], bool) {
                 let all = (0, BANDS);
                 let mut r = seed;
-                let mut velocity_floor_bound = [false; BANDS];
+                let mut velocity_floor_limited = false;
                 if disp_on {
                     let room = 0.25 * (c.disp_limit as f32 - c.disp_bound_new).max(0.0);
                     r = velocity_band_gains_window(
@@ -2582,7 +2579,7 @@ impl Run {
                     for k in c.vel_active.0..c.vel_active.1 {
                         let raw = q[k];
                         let v = (sg * raw).max(c.vel_floor as f32) / sg;
-                        velocity_floor_bound[k] = sg * raw < c.vel_floor as f32 && v < r[k];
+                        velocity_floor_limited |= sg * raw < c.vel_floor as f32;
                         velocity_cut.set(velocity_cut.get() || v < r[k]);
                         r[k] = r[k].min(v);
                     }
@@ -2590,14 +2587,14 @@ impl Run {
                 if peak_on {
                     r = velocity_band_gains(&c.peak_ab, &[], 0, c.amp_limit as f32, sg, all, r);
                 }
-                (r, velocity_floor_bound)
+                (r, velocity_floor_limited)
             };
             let req: [f32; BANDS] = if disp_on || vel_on || peak_on {
                 // The scalar shapes every allocator trial, but the fast
                 // follower's request stays in the band domain. The output
                 // applies the slow trajectory after the fast-gained sum;
                 // scaling the request by `sg` here would apply it twice.
-                let (p, _) = chain(c, [1.0; BANDS]);
+                let (p, primary_floor_limited) = chain(c, [1.0; BANDS]);
                 // residuals 5.2 (t-4713): upward lanes (primary above the
                 // applied gain); one second chain seeded from the predicted
                 // endpoint toward the complete primary request of upward
@@ -2618,8 +2615,17 @@ impl Run {
                             1.0
                         }
                     });
-                    let (q, floor_bound) = chain(c, seed);
-                    merge_retarget_requests(p, q, seed, up, floor_bound)
+                    let (q, _) = chain(c, seed);
+                    let applied = core::array::from_fn(|k| c.band[k].g);
+                    let previous_request = core::array::from_fn(|k| c.band[k].requested());
+                    continue_recovery.set(retarget_recovery_mask(
+                        p,
+                        q,
+                        applied,
+                        previous_request,
+                        primary_floor_limited,
+                    ));
+                    core::array::from_fn(|k| if up[k] && q[k] >= seed[k] { p[k] } else { q[k] })
                 } else {
                     p
                 }
@@ -2637,7 +2643,9 @@ impl Run {
             }
             c.vel_bound_release = c.vel_episode && c.vel_episode_retained;
             for k in 0..BANDS {
-                c.band[k].decide(req[k]);
+                if !continue_recovery.get()[k] {
+                    c.band[k].decide(req[k]);
+                }
             }
             c.cand[0] = g_peak;
             c.cand[1] = g_disp;
@@ -3201,17 +3209,14 @@ mod fault_tests {
 
     #[test]
     fn a_floor_bound_retarget_does_not_recut_a_recovering_neighbour() {
-        let primary = [0.8, 0.7, 0.5, 1.0, 1.0];
-        let second = [0.5, 0.6, 0.5, 1.0, 1.0];
-        let seed = [0.65, 0.65, 1.0, 1.0, 1.0];
-        let upward = [true, true, false, false, false];
-        let floor_bound = [true, false, true, false, false];
+        let primary = [0.5, 0.5, 0.5, 1.0, 1.0];
+        let applied = [0.49, 0.49, 0.495, 1.0, 1.0];
+        let recovery = retarget_recovery_mask(primary, primary, applied, primary, true);
+        assert_eq!(recovery, [true, true, true, true, true]);
 
-        // Band 0 is the recovering neighbour: its second solve reached the
-        // configured velocity floor, so it keeps recovering toward the
-        // ordinary request. Band 1 takes a genuine retarget cut, while the
-        // non-upward constrained band 2 remains at the floor.
-        assert_eq!(merge_retarget_requests(primary, second, seed, upward, floor_bound), [0.8, 0.6, 0.5, 1.0, 1.0]);
+        // Outside a floor-limited episode every follower decision is
+        // realigned, including an otherwise identical recovery request.
+        assert_eq!(retarget_recovery_mask(primary, primary, applied, primary, false), [false; BANDS]);
     }
 
     fn params() -> Params {
