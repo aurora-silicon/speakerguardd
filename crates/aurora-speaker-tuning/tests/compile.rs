@@ -569,3 +569,214 @@ fn the_shipped_prestage_is_pass_through() {
         (a, b) => panic!("derive {:?} vs compile {:?}", a.is_ok(), b.is_ok()),
     }
 }
+
+/// Capture schema with generated names/values; no live macOS data.
+fn fill_field(saved: &ParamState, full: &ParamState, change: impl Fn(&mut serde_json::Value)) -> Vec<u8> {
+    let carried: std::collections::BTreeSet<_> = saved.global().unwrap().params.iter().map(|p| p.0).collect();
+    let published: Vec<_> = full
+        .global()
+        .unwrap()
+        .params
+        .iter()
+        .rev()
+        .map(|&(id, v)| serde_json::json!({"id": id, "name": format!("generated {id}"), "bits": v.to_bits()}))
+        .collect();
+    let missing: Vec<_> =
+        full.global().unwrap().params.iter().map(|p| p.0).filter(|id| !carried.contains(id)).collect();
+    let mut value = serde_json::json!({"version": 1, "format": aurora_speaker_tuning::param_fill::FORMAT,
+        "aid": AID, "macos_build": "25G83", "unit_id": test_unit(),
+        "configuration_sha256": aurora_speaker_tuning::param_fill::configuration_digest(&files_with_state(saved), AID),
+        "presets": [{
+            "strip": format!("{AID}/DSP/Strips/builtin_speaker_out_general.austrip"),
+            "preset_sha256": aurora_speaker_tuning::manifest::sha256_hex(&saved.encode()),
+            "unit_version": 17, "published": published, "fill_ids": missing}]});
+    change(&mut value);
+    serde_json::to_vec(&value).unwrap()
+}
+
+fn full_and_short() -> (ParamState, ParamState) {
+    let full = lsm2_state(|m| {
+        for id in sgv2_core::lsm2::companion::base_ids() {
+            m.entry(id).or_insert(0.0);
+        }
+    });
+    assert_eq!(full.global().unwrap().params.len(), 1021);
+    let mut short = full.clone();
+    // 58 deliberately arbitrary missing IDs: no model's real omit list.
+    short.sections[0].params.drain(..58);
+    (full, short)
+}
+
+fn files_with_state(state: &ParamState) -> BTreeMap<String, Vec<u8>> {
+    let mut files = lsm2_files(|_| {});
+    files.insert(format!("{AID}/DSP/Strips/builtin_speaker_out_general.austrip"), strip_with_state("lsm2", state));
+    files
+}
+
+#[test]
+fn owner_fill_completes_short_state_without_changing_carried_records() {
+    let (full, short) = full_and_short();
+    let expected = compile(&tuning(&files_with_state(&full), "fill-full"), &mut Diagnostics::default()).unwrap();
+    let mut files = files_with_state(&short);
+    files.insert(aurora_speaker_tuning::param_fill::NAME.into(), fill_field(&short, &full, |_| {}));
+    let t = tuning(&files, "fill-short");
+    assert_eq!(t.protection.state, short, "saved state remains untouched");
+    let actual = compile(&t, &mut Diagnostics::default()).unwrap();
+    assert_eq!(actual.blob, expected.blob);
+    let mut guarded = t.clone();
+    guarded.lsid = Some(synthetic_legacy_companion());
+    let compiled = compile(&guarded, &mut Diagnostics::default()).unwrap();
+    let unit = sgv2_core::lsm2::Unit::from_blob(&compiled.blob).unwrap();
+    assert_eq!(unit.companion().unwrap().lsm2_records.len(), 1021);
+    assert!(unit.companion().unwrap().gates != 0);
+    assert_eq!(unit.params().ch[0].displacement_limit, 0.0005);
+    assert!(unit.is_failsafe(), "the fill never lifts companion release gates");
+    let mut extra_section = t.clone();
+    extra_section.protection.state.sections.push(ParamSection { scope: 1, element: 0, params: vec![(0, 1.0)] });
+    assert!(compile(&extra_section, &mut Diagnostics::default()).is_err());
+    let mut stale = files.clone();
+    let propstrip = format!("{AID}/DSP/Strips/builtin_speaker_out_general.propstrip");
+    // Preserve a valid plist while changing bytes outside the saved state.
+    stale.insert(propstrip, aurora_speaker_tuning::plist::binary::write(&dict(vec![("Boxes", Value::Array(vec![]))])));
+    let dir = scratch("fill-stale-configuration");
+    write_dir(&dir, &stale, &manifest_json(&stale, "25G83"));
+    let bundle = Bundle::open(&dir).unwrap();
+    assert!(Tuning::load(&bundle, &Options::default(), &mut Diagnostics::default()).is_err());
+    assert!(comp::compile(&t, &Machine::new("j413").unwrap(), &mut Diagnostics::default()).is_err());
+    // A full preset may carry private readback for a dry run; its payload
+    // remains bit-identical, including saved record order.
+    let mut files = files_with_state(&full);
+    files.insert(aurora_speaker_tuning::param_fill::NAME.into(), fill_field(&full, &full, |_| {}));
+    let actual = compile(&tuning(&files, "fill-full-dry"), &mut Diagnostics::default()).unwrap();
+    assert_eq!(actual.blob, expected.blob);
+}
+
+#[test]
+fn incomplete_extra_mismatched_and_wrongly_bound_fields_refuse_on_load() {
+    let (full, short) = full_and_short();
+    for case in 0..8 {
+        let data = fill_field(&short, &full, |v| match case {
+            0 => {
+                v["presets"][0]["fill_ids"].as_array_mut().unwrap().pop();
+            }
+            1 => {
+                v["presets"][0]["fill_ids"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(serde_json::json!(short.global().unwrap().params[0].0));
+            }
+            2 => {
+                v["presets"][0]["fill_ids"][0] = serde_json::json!(u32::MAX);
+            }
+            3 => {
+                v["aid"] = serde_json::json!("AID902");
+            }
+            4 => {
+                v["macos_build"] = serde_json::json!("00A001");
+            }
+            5 => {
+                v["unit_id"] = serde_json::json!(other_unit());
+            }
+            6 => {
+                v["presets"][0]["preset_sha256"] = serde_json::json!("0".repeat(64));
+            }
+            _ => {
+                v["presets"][0]["strip"] = serde_json::json!("another.austrip");
+            }
+        });
+        let mut files = files_with_state(&short);
+        files.insert(aurora_speaker_tuning::param_fill::NAME.into(), data);
+        let dir = scratch(&format!("fill-bad-{case}"));
+        write_dir(&dir, &files, &manifest_json(&files, "25G83"));
+        // The manifest may be self-consistent but the capture must still
+        // bind to the actual selected bundle, strip and saved state.
+        let rejected = match Bundle::open(&dir) {
+            Err(_) => true,
+            Ok(b) => Tuning::load(&b, &Options::default(), &mut Diagnostics::default()).is_err(),
+        };
+        assert!(rejected, "case {case}");
+    }
+}
+
+#[test]
+fn absent_fill_keeps_the_guarded_model_only_mute() {
+    // The opaque path still requires its original two controller flags
+    // and full-scale volts; omit other arbitrary records instead.
+    let short = lsm2_state(|m| {
+        for id in sgv2_core::lsm2::companion::base_ids() {
+            m.entry(id).or_insert(0.0);
+        }
+        let removable: Vec<_> = (3072..3130).filter(|id| m.contains_key(id)).collect();
+        for id in removable {
+            m.remove(&id);
+        }
+        for id in (4096..4154).take(21) {
+            m.remove(&id);
+        }
+    });
+    let mut t = tuning(&files_with_state(&short), "fill-absent");
+    t.lsid = Some(synthetic_legacy_companion());
+    let mut d = Diagnostics::default();
+    let compiled = compile(&t, &mut d).unwrap();
+    assert!(d.items.iter().any(|item| item.code == "lsm2-legacy-opaque"));
+    use sgv2_core::{Io, ProtectionUnit};
+    let mut unit = sgv2_core::lsm2::Unit::from_blob(&compiled.blob).unwrap();
+    assert_eq!(unit.params().model_only, 1);
+    let mut storage = [[1.0; 32]; 4];
+    let mut output: Vec<_> = storage.iter_mut().map(|s| s.as_mut_slice()).collect();
+    unit.process(Io { input: &[&[0.25; 32][..]; 4], output: &mut output, sense: &[], frames: 32 });
+    assert!(storage.iter().flatten().all(|&v| v == 0.0));
+}
+
+#[test]
+fn filled_reported_latency_does_not_set_filterbank_delay_or_override_saved_values() {
+    let (full, _) = full_and_short();
+    let omitted: std::collections::BTreeSet<_> =
+        full.global().unwrap().params.iter().take(57).map(|p| p.0).chain([id::controller(0)]).collect();
+    assert_eq!(omitted.len(), 58);
+    let mut short = full.clone();
+    short.sections[0].params.retain(|p| !omitted.contains(&p.0));
+    let bytes = fill_field(&short, &full, |v| {
+        for r in v["presets"][0]["published"].as_array_mut().unwrap() {
+            if r["id"] == id::controller(0) {
+                r["bits"] = serde_json::json!(12345.0f32.to_bits()); // made-up reported Latency
+            }
+            if r["id"] == id::channel(0, id::CH_VOLTS_FS) {
+                r["bits"] = serde_json::json!(0.125f32.to_bits()); // must not override saved full scale
+            }
+        }
+    });
+    let mut files = files_with_state(&short);
+    files.insert(aurora_speaker_tuning::param_fill::NAME.into(), bytes);
+    let actual = compile(&tuning(&files, "fill-latency"), &mut Diagnostics::default()).unwrap();
+    let expected =
+        compile(&tuning(&files_with_state(&full), "fill-latency-full"), &mut Diagnostics::default()).unwrap();
+    assert_eq!(actual.blob, expected.blob);
+    use sgv2_core::ProtectionUnit;
+    let unit = sgv2_core::lsm2::Unit::from_blob(&actual.blob).unwrap();
+    let p = unit.params();
+    let bank = sgv2_core::lsm2::filterbank(
+        p.sample_rate as f64,
+        &p.ch[0].band_center_hz,
+        p.ch[0].bandwidth,
+        p.filterbank_frames(),
+    );
+    let stage = bank[0].len().div_ceil(2);
+    assert_eq!(
+        unit.latency_frames() as usize,
+        2 * stage + p.lookahead_frames() + sgv2_core::lsm2::controller_frames(p.sample_rate)
+    );
+}
+
+fn synthetic_legacy_companion() -> aurora_speaker_tuning::lsid::Companion {
+    aurora_speaker_tuning::lsid::Companion {
+        box_name: "SyntheticEstimator".into(),
+        state: ParamState { sections: vec![ParamSection { scope: 0, element: 0, params: vec![(0, 1.0)] }] },
+        preset: None,
+        topology: None,
+        source_port: "sense".into(),
+        source_lanes: (0..8).collect(),
+        delay_frames: vec![0; 8],
+        adaptation_enabled: false,
+    }
+}

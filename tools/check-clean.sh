@@ -6,7 +6,7 @@ cd "$(git rev-parse --show-toplevel)"
 fail=0
 while IFS= read -r -d '' f; do
   case "$f" in
-    *.austrip|*.dspg|*.propstrip|*.aupreset|*speaker-thiele-small.bin|*aufx-*-appl.plist)
+    *lsm2-param-fill.bin|*.austrip|*.dspg|*.propstrip|*.aupreset|*speaker-thiele-small.bin|*aufx-*-appl.plist)
       echo "forbidden tuning file: $f"; fail=1 ;;
   esac
   case "/$f" in

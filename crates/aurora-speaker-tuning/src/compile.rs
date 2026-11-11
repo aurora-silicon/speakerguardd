@@ -196,6 +196,12 @@ fn preflight(t: &Tuning, m: &Machine, provenance: Provenance, diags: &mut Diagno
         ),
     }
     let calibration_trusted = unit_binding(t, m, diags)?;
+    if t.lsm2_param_fill.as_ref().is_some_and(|fill| !fill.is_empty())
+        && !matches!(&m.unit,
+        crate::machine::Unit::Known(unit) if Some(unit) == t.unit_id.as_ref())
+    {
+        return Err(bad("lsm2 fill requires a matching live unit identity"));
+    }
     let machine = machine_field(&m.board).ok_or_else(|| bad(format!("board {:?} does not fit the header", m.board)))?;
     Ok(Bound { machine, board: m.board.clone(), calibration_trusted })
 }
@@ -604,6 +610,18 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
     let rate = sample_rate(t)?;
     let guarded = t.lsid.is_some();
     let g = t.protection.state.section(SCOPE_GLOBAL, 0).ok_or_else(|| bad("lsm2 saved state has no global section"))?;
+    if g.params.len() < 1021 {
+        if let Some(fill) = &t.lsm2_param_fill {
+            if t.protection.state.sections.len() != 1 {
+                return Err(bad("LSM2 fill requires one global saved-state section"));
+            }
+            let merged = crate::param_fill::merge(g, fill)?;
+            let mut completed = t.clone();
+            completed.protection.state.sections = vec![merged];
+            completed.lsm2_param_fill = None;
+            return compile_lsm2(&completed, b, diags);
+        }
+    }
     if guarded || g.params.len() >= 1021 {
         if t.protection.state.sections.len() != 1 {
             return Err(bad("LSM2 requires one global saved-state section"));
@@ -755,6 +773,9 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
         fast_release_time_ms: get(id::controller(id::C_FAST_RELEASE))?,
         slow_release_time_ms: get(id::controller(id::C_SLOW_RELEASE))?,
         low_band_release_time_ms: get(id::controller(id::C_LOW_BAND_RELEASE))?,
+        // This sizes the FIR bank. The engine derives its delay from that
+        // structure plus look-ahead and cadence, never controller(0)'s
+        // reported total Latency (which a short-preset AU can misreport).
         filterbank_latency_ms: get(id::controller(id::C_FILTERBANK_LATENCY))?,
         speaker_response_lookahead_ms: get(id::controller(id::C_LOOKAHEAD))?,
         power_time_scale_s: [0.0; 4],

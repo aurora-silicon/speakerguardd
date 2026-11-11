@@ -2119,6 +2119,12 @@ impl Run {
                 cand: [1.0; 5],
             });
         }
+        // Derive the reported delay from the bank we actually constructed.
+        // A centred 2*F-1-tap FIR occupies an F-frame allocated stage (one
+        // frame beyond its centre); the reported saved Latency parameter is
+        // advisory and never supplies this geometry.
+        let filterbank_stage = ch[0].bank[0].len().div_ceil(2);
+        debug_assert_eq!(filterbank_stage, fb);
         let mut p_pole = [0.0; 4];
         let mut budget = [0.0; 4];
         for j in 0..4 {
@@ -2132,7 +2138,7 @@ impl Run {
             sub,
             fb,
             od,
-            latency: 2 * fb + geometry_lookahead + ctl,
+            latency: 2 * filterbank_stage + geometry_lookahead + ctl,
             ceiling_shift,
             fault: false,
             pos: 0,

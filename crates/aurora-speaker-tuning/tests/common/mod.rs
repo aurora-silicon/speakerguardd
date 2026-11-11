@@ -407,9 +407,22 @@ pub fn manifest_json_ident(
             sha256_hex(d)
         )
     });
+    let fill_name = aurora_speaker_tuning::param_fill::NAME;
+    let fill = files.get(fill_name).map_or(String::new(), |d| {
+        let data: serde_json::Value = serde_json::from_slice(d).unwrap();
+        let mut versions: Vec<_> =
+            data["presets"].as_array().unwrap().iter().map(|p| p["unit_version"].as_u64().unwrap()).collect();
+        versions.sort_unstable();
+        versions.dedup();
+        let field = serde_json::json!({"path": fill_name, "bytes": d.len(), "sha256": sha256_hex(d),
+            "version": 1, "format": aurora_speaker_tuning::param_fill::FORMAT,
+            "aid": data["aid"], "macos_build": data["macos_build"], "unit_id": data["unit_id"],
+            "unit_versions": versions});
+        format!(",\"lsm2_param_fill\":{field}")
+    });
     let list: Vec<String> = files
         .iter()
-        .filter(|(p, _)| *p != "speaker-thiele-small.bin" && *p != LATTICE)
+        .filter(|(p, _)| *p != "speaker-thiele-small.bin" && *p != LATTICE && *p != fill_name)
         .map(|(p, d)| rec(p, d))
         .collect();
     let count = files.keys().filter(|p| p.starts_with(&format!("{AID}/"))).count();
@@ -420,7 +433,7 @@ pub fn manifest_json_ident(
         r#"{{"schema":2,"kind":"aurora-audio-tuning","source_file_count":{count},"complete":true,
 "acoustic_id":{ACOUSTIC_ID},"aid":"{AID}","macos_build":"{build}",
 "speaker_thiele_small":{},"device_dsp_database":"DeviceDSPDatabase.plist","config":"Config/{AID}.plist",
-"files":[{}],"based_on":"test"{spid}{ident}{lattice}}}"#,
+"files":[{}],"based_on":"test"{spid}{ident}{lattice}{fill}}}"#,
         spts.unwrap_or_else(|| "null".into()),
         list.join(",")
     )

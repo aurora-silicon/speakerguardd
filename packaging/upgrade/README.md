@@ -52,6 +52,13 @@ aurora-speaker-upgrade guide           # the macOS route, when Linux cannot read
    (`/chosen/asahi,speaker-id`) or from this unit's installer bundle. If the
    tuning selects by speaker ID and neither source has it, the tool refuses
    and points to route 3. Nothing is guessed.
+   Short lsm2 presets also require the owner's live macOS parameter readback
+   (`lsm2-param-fill.bin`, manifest `lsm2_param_fill`). `status` and `--check`
+   report “collected before the installer read the lsm2 fill” when it is
+   missing and point to `aurora-speaker-upgrade guide` (route 3). Offline
+   routes cannot manufacture this field; collect it on this Mac's running
+   macOS with the current `tools/speaker-tuning/collect-macos.sh`. No tuning
+   values are packaged or uploaded. Full presets need no fill.
 2. **Storage.** The bundle goes to `/var/lib/aurora-speaker-upgrade/bundle`
    (0700, root). It is never packaged or sent anywhere.
    `/etc/speakerguardd/provision.conf` points provisioning at it
