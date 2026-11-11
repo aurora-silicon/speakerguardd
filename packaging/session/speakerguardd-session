@@ -627,13 +627,15 @@ class Session:
         elif not granted or not play:
             # Withdrawn, or nothing plays: take the amps and the sense out of
             # the graph, so the amps' sink is not started again until the
-            # next grant.
+            # next grant. That includes a capture of the amps' monitor: a
+            # link out of the sink wakes it as surely as one into it, and
+            # its start without a grant is refused.
             spk = g.node_id(self.speaker)
             sense = g.node_id(self.sense_name) if self.sense else None
             owners = {o["id"]: (o["info"].get("props") or {}).get("node.id") for o in g.of_type("Port")}
             linked = False
             for lid, o, i in g.links():
-                if owners.get(i) == spk or (sense is not None and owners.get(o) == sense):
+                if spk in (owners.get(i), owners.get(o)) or (sense is not None and owners.get(o) == sense):
                     linked = True
                     self._spawn(("unlink", lid), ["pw-link", "-d", str(lid)])
             if (os.path.exists(SLEEP_HOLD) or not play) and not linked:

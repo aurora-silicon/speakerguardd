@@ -62,7 +62,7 @@ mod linux {
 
     use sgv2_lv2::page::{EnginePage, LAYOUT, MAGIC, PAGE_BYTES};
     use sgv2_supervisor::kernel::{Kernel, KernelError, Macaudio};
-    use sgv2_supervisor::lease::Observation;
+    use sgv2_supervisor::lease::{Observation, Regrant};
     use sgv2_supervisor::machine::{blob_full_scales, board_from_compatible, Machine};
     use sgv2_supervisor::observe::{
         combine, helper_is, owner_to_tgid, parse_pcm_info, parse_pcm_status, parse_session, parse_tgid,
@@ -89,7 +89,19 @@ mod linux {
     /// ~190 ms to open (its first open after a grant).
     const PCM_OPENING_MAX_NS: u64 = sgv2_supervisor::observe::OPENING_GRACE_NS;
     /// A helper liveness check older than this vouches for nothing.
-    const HELPER_CHECK_MAX_NS: u64 = 12_000_000;
+    ///
+    /// The checker thread runs every millisecond, so a helper that died is
+    /// seen dead within one poll, and a "dead" verdict counts at once
+    /// however fresh it is. This bound only decides how long an "alive"
+    /// verdict stands while the checker itself is late: under host load
+    /// (j414s, load 16-38) the checker can miss its slot, and at 12 ms the
+    /// report counted as absent, released a live grant and refused the
+    /// next starts. The report carries only the graph's links, the
+    /// carrier and the demand, and is itself accepted for up to
+    /// `SESSION_STALE_NS` (500 ms) from a live but slow helper; the engine
+    /// heartbeat, the PCM's state and owner and the kernel-side checks,
+    /// which protect the speakers, are unchanged. Half that report bound.
+    const HELPER_CHECK_MAX_NS: u64 = sgv2_supervisor::observe::SESSION_STALE_NS / 2;
     /// Waiting for the card: 50 ms doubling to 2 s.
     const BACKOFF_MIN_MS: u64 = 50;
     const BACKOFF_MAX_MS: u64 = 2_000;
@@ -985,6 +997,9 @@ mod linux {
         let mut suspended = suspended_ns();
         let mut slept = sleeps();
         let mut waiting_after_sleep = false;
+        // grants that keep ending in a fault at once are spaced out
+        let mut regrant = Regrant::default();
+        let mut held_off = false;
         loop {
             let (s, n) = (suspended_ns(), sleeps());
             if s > suspended.saturating_add(1_000_000) || n != slept {
@@ -992,6 +1007,18 @@ mod linux {
             }
             (suspended, slept) = (s, n);
             let obs = observer.observe(&mut now_ns, &mut engine, &mut pcm_view, &mut session);
+            // a held-off re-grant: this tick counts as one without demand
+            // (every check still runs, so the grant comes on the first tick
+            // after the hold)
+            let demand_seen = obs.demand;
+            let holding = regrant.holding(now_ns());
+            if holding != held_off {
+                held_off = holding;
+                if !holding {
+                    eprintln!("re-grant hold over");
+                }
+            }
+            let obs = if holding { Observation { demand: false, ..obs } } else { obs };
             if observer.waiting_after_sleep() != waiting_after_sleep {
                 waiting_after_sleep = observer.waiting_after_sleep();
                 eprintln!(
@@ -1007,15 +1034,21 @@ mod linux {
             // the observer leaves the kernel-side checks to the supervisor,
             // which records any failure as its problem
             let card_ok = sup.problem().is_none() && sup.latched_fault().is_none();
-            let ready = card_ok && !obs.demand && Observation { route_ok: true, amps_ok: true, ..obs }.clean();
+            let ready = card_ok && !demand_seen && Observation { route_ok: true, amps_ok: true, ..obs }.clean();
             if ready && !idle_ready && !matches!(event, Ok(Event::Idle)) {
                 eprintln!("protection ready: every check holds, granted while a stream plays");
             }
             idle_ready = ready;
             match event {
-                Ok(Event::Idle) => eprintln!("nothing plays: protection released, granted again when a stream starts"),
+                Ok(Event::Idle) => {
+                    regrant.released(now_ns(), false);
+                    regrant.idle();
+                    eprintln!("nothing plays: protection released, granted again when a stream starts")
+                }
+                Ok(Event::StayedReleased) if !obs.demand && !holding => regrant.idle(),
                 Ok(Event::Granted) => {
                     observer.note_grant(now_ns());
+                    regrant.granted(now_ns());
                     eprintln!("protection granted");
                 }
                 Ok(Event::Released { why }) => {
@@ -1025,9 +1058,18 @@ mod linux {
                         "protection released: {why:?}{}{session} (pcm {pcm:?}, engine beat {age:?} ms ago)",
                         if session.is_empty() { "" } else { "; session: " }
                     );
+                    if let Some(hold) = regrant.released(now_ns(), true) {
+                        eprintln!(
+                            "{} grants in a row ended within {} ms: next grant held off {} ms",
+                            regrant.short_run(),
+                            sgv2_supervisor::lease::SHORT_GRANT_NS / 1_000_000,
+                            hold / 1_000_000
+                        );
+                    }
                 }
                 Ok(Event::HardFault(f)) => eprintln!("amp fault, protection withdrawn until restart: {f}"),
                 Ok(Event::Lapsed) => {
+                    regrant.released(now_ns(), false);
                     // the kernel withdraws a lease at a system sleep: the next
                     // grant waits for the engine to beat steadily after the thaw
                     observer.note_sleep();
