@@ -2,6 +2,15 @@
 //! it): every 50 ms drain the telemetry ring and check that it is gap-free,
 //! write every record as one CSV line, and print a one-line summary a
 //! second. Usage: `engine-watch <page> <out.csv> [seconds]`.
+//!
+//! `tcl` is the closed-loop (pilot-tone) coil temperature as the unit
+//! publishes it: it holds the calibration temperature until a window is
+//! accepted and then the last accepted value, so on its own it cannot tell
+//! a cool coil from a channel whose pilot is off (drive below the pilot's
+//! enable threshold, the usual state of the tweeters at moderate levels).
+//! The summary prints a stale estimate in parentheses and `clf` (1 = fresh)
+//! beside it; the CSV has `clf<c>` per channel. `tol` is the open-loop
+//! model the controller acts on in either case.
 
 use std::io::Write;
 use std::sync::atomic::Ordering;
@@ -22,6 +31,10 @@ fn main() {
     let _ = write!(csv, "mono_ns,frame,health,sense_delay");
     for c in 0..6 {
         let _ = write!(csv, ",g{c},sel{c},pmod{c},tol{c},tmg{c},tcl{c},tadj{c},cl{c},vms{c},ims{c},r{c}");
+    }
+    // appended, so readers that index the older columns by name still work
+    for c in 0..6 {
+        let _ = write!(csv, ",clf{c}");
     }
     let _ = writeln!(csv);
     let mut rd = Reader::new();
@@ -83,6 +96,9 @@ fn main() {
                     c.sense_r_ohm
                 );
             }
+            for c in &t.channels[..6] {
+                let _ = write!(csv, ",{}", c.cl_fresh);
+            }
             let _ = writeln!(csv);
         }
         if last_print.elapsed() >= Duration::from_secs(1) {
@@ -95,7 +111,7 @@ fn main() {
             let ch = &t.channels[..6];
             println!(
                 "t={:>3}s step={:?} pid={} crc={:08x} calls/s={} frames/s={} health={:#x} delay={} records={} lost={} gaps={} \
-                 stale_polls={} health_or={:#x} gain_db={:?} tol={:?} tcl={:?} r={:?}",
+                 stale_polls={} health_or={:#x} gain_db={:?} tol={:?} tcl=[{}] clf={:?} r={:?}",
                 start.elapsed().as_secs(),
                 step,
                 h.pid.load(Ordering::Relaxed),
@@ -111,7 +127,8 @@ fn main() {
                 health_or,
                 ch.iter().map(|c| (20.0 * c.gain.log10() * 100.0).round() / 100.0).collect::<Vec<_>>(),
                 ch.iter().map(|c| (c.ol_temp_c * 1000.0).round() / 1000.0).collect::<Vec<_>>(),
-                ch.iter().map(|c| (c.cl_temp_c * 100.0).round() / 100.0).collect::<Vec<_>>(),
+                ch.iter().map(tcl_text).collect::<Vec<_>>().join(", "),
+                ch.iter().map(|c| c.cl_fresh).collect::<Vec<_>>(),
                 ch.iter().map(|c| (c.sense_r_ohm * 1000.0).round() / 1000.0).collect::<Vec<_>>(),
             );
             last_seq = seq;
@@ -120,4 +137,18 @@ fn main() {
         }
     }
     let _ = csv.flush();
+}
+
+/// A channel's closed-loop temperature for the summary: plain when fresh,
+/// in parentheses when it is a held value (no window accepted lately),
+/// `-` without a closed-loop estimator.
+fn tcl_text(c: &sgv2_core::ChannelState) -> String {
+    let v = (c.cl_temp_c * 100.0).round() / 100.0;
+    if !c.closed_loop || !v.is_finite() {
+        "-".into()
+    } else if c.cl_fresh != 0 {
+        format!("{v}")
+    } else {
+        format!("({v})")
+    }
 }

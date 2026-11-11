@@ -20,7 +20,22 @@ pub struct ChannelState {
     pub tlim_adj_c: f32,
     /// lsm2: the temperature the controller's knee acts on.
     pub control_temp_c: f32,
+    /// spp3: the channel runs a closed-loop estimator (the kernel decision
+    /// the rig compares with macOS). It does not say the estimate is
+    /// current: see `cl_fresh`.
     pub closed_loop: bool,
+    /// spp3: 1 while `cl_temp_c` is a current measurement (a pilot-bin
+    /// window accepted within the last window plus one thermal update), 0
+    /// otherwise. `cl_temp_c` keeps the reference's value either way: the
+    /// calibration temperature before the first accepted window, then the
+    /// last accepted one, so a channel whose pilot is off (drive below
+    /// `PilotEnableThres`) shows a constant `cl_temp_c` with `cl_fresh` 0.
+    /// Only a fresh estimate is used by the controller.
+    ///
+    /// A byte, in what was padding after `closed_loop`: the record's size
+    /// and every other offset are unchanged (asserted below), so the engine
+    /// page keeps its layout; an engine that predates the field leaves 0.
+    pub cl_fresh: u8,
     // lsm2 mechanical and controller
     pub displacement_m: f32,
     pub velocity_m_s: f32,
@@ -54,6 +69,7 @@ impl ChannelState {
         tlim_adj_c: f32::NAN,
         control_temp_c: f32::NAN,
         closed_loop: false,
+        cl_fresh: 0,
         displacement_m: f32::NAN,
         velocity_m_s: f32::NAN,
         mask_db: f32::NAN,
@@ -66,6 +82,14 @@ impl ChannelState {
         sense_r_ohm: f32::NAN,
     };
 }
+
+// The engine page shares these records across versions: `cl_fresh` sits in
+// former padding and must not move anything.
+const _: () = {
+    assert!(core::mem::offset_of!(ChannelState, cl_fresh) == 33);
+    assert!(core::mem::offset_of!(ChannelState, displacement_m) == 36);
+    assert!(core::mem::size_of::<ChannelState>() == 108);
+};
 
 /// Unit-wide state (spp3 and lsm2 meters, the lsm2 controller). NaN when
 /// absent.
