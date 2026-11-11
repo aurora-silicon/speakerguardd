@@ -167,7 +167,17 @@ impl Supervisor {
         // a lease that lapsed shows the floor: only a live grant is checked
         if self.lease.held() && kernel.granted().map_err(Fatal::Kernel)? {
             if let Some(p) = self.volume_problem(kernel).map_err(Fatal::Kernel)? {
-                return self.latch(kernel, p);
+                // The lease can end between the two reads: a supervisor
+                // late for its tick under host load (J413, load 55) read
+                // the grant live, the kernel closed the gate and floored the
+                // amps, and the floor read as a wrong operating volume,
+                // latched until restart. The kernel closes the gate before
+                // it floors, so a grant still live after the volume read
+                // means the volume was wrong under it. Otherwise this is a
+                // lapse: the renew below reports it.
+                if kernel.granted().map_err(Fatal::Kernel)? {
+                    return self.latch(kernel, p);
+                }
             }
         }
         self.problem = self.card_problem(kernel, faults.len()).map_err(Fatal::Kernel)?;
@@ -563,6 +573,57 @@ mod tests {
         k.1 = true;
         assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Lapsed));
         assert!(s.latched_fault().is_none());
+    }
+
+    /// A lease that ends between the supervisor's grant read and its volume
+    /// read: the first `granted()` is live, the floor lands before the
+    /// volume read, and the renew finds the lease lapsed.
+    struct EndsMidTick(Recorder, u32);
+    impl Kernel for EndsMidTick {
+        fn renew(&mut self) -> Result<(), KernelError> {
+            if self.1 == 1 {
+                self.1 = 2;
+                return Err(KernelError::Lapsed);
+            }
+            self.0.renew()
+        }
+        fn release(&mut self) -> Result<(), KernelError> {
+            self.0.release()
+        }
+        fn granted(&mut self) -> Result<bool, KernelError> {
+            let g = self.0.granted();
+            if self.1 == 0 && self.0.held {
+                // this read sees the grant; the lease ends right after it
+                self.1 = 1;
+                self.0.held = false;
+            }
+            g
+        }
+        fn faults(&mut self) -> Result<Vec<AmpFault>, KernelError> {
+            self.0.faults()
+        }
+        fn levels(&mut self, suffix: &str) -> Result<Vec<AmpLevel>, KernelError> {
+            self.0.levels(suffix)
+        }
+        fn speaker_route(&mut self) -> Result<Option<String>, KernelError> {
+            self.0.speaker_route()
+        }
+    }
+
+    #[test]
+    fn a_lease_ending_between_the_grant_and_volume_reads_is_a_lapse_not_a_fault() {
+        let mut k = EndsMidTick(Recorder::healthy(6), 9);
+        let mut s = j316();
+        s.tick(CLEAN, &mut k).unwrap();
+        assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Granted));
+        k.1 = 0;
+        assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Lapsed));
+        assert!(s.latched_fault().is_none());
+        assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Granted));
+        // a volume that is wrong while the grant stays live still latches
+        k.0.volume = Some(("Speaker Volume".into(), (180, Some(-1050)), (0, None)));
+        assert!(matches!(s.tick(CLEAN, &mut k), Ok(Event::HardFault(_))));
+        assert!(!k.0.held);
     }
 
     struct Lost;
