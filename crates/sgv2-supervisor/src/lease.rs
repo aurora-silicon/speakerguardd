@@ -98,6 +98,75 @@ impl Lease {
     }
 }
 
+/// A grant that a fault ends sooner than this after it was given is short:
+/// the stream it was for never got going (its start failed, the engine
+/// stalled behind it). One short grant is re-granted at once, as before; a
+/// run of them is spaced out.
+pub const SHORT_GRANT_NS: u64 = 2_000_000_000;
+/// The hold before the re-grant after the second short grant in a row,
+/// doubled for each one after it up to [`MAX_REGRANT_HOLD_NS`].
+pub const FIRST_REGRANT_HOLD_NS: u64 = 250_000_000;
+pub const MAX_REGRANT_HOLD_NS: u64 = 4_000_000_000;
+
+/// Spaces re-grants after grants that keep ending in a fault at once.
+///
+/// When a stream cannot start under a grant (a sink left unable to start,
+/// an engine that stalls on every start), each grant is followed by a
+/// release a few hundred ms later and the next grant two clean ticks
+/// after that. Nothing plays in that loop (the kernel refuses every start
+/// outside a grant), but the audio server retries its start every cycle
+/// and logs every failure (J413, M1 Pro J316: ~15 lines a second until
+/// PipeWire restarted). A hold only ever delays a grant: every check keeps
+/// running, and a held-off tick is treated as a tick without demand.
+#[derive(Debug, Default)]
+pub struct Regrant {
+    granted_at: Option<u64>,
+    short_run: u32,
+    hold_until: u64,
+}
+
+impl Regrant {
+    /// The supervisor granted at `now_ns`.
+    pub fn granted(&mut self, now_ns: u64) {
+        self.granted_at = Some(now_ns);
+    }
+
+    /// The grant ended at `now_ns`: on a fault (`fault`), or otherwise
+    /// (nothing plays, a lapse, a sleep). Returns the hold before the next
+    /// grant, if one starts.
+    pub fn released(&mut self, now_ns: u64, fault: bool) -> Option<u64> {
+        let t = self.granted_at.take()?;
+        if !fault || now_ns.saturating_sub(t) >= SHORT_GRANT_NS {
+            self.short_run = 0;
+            self.hold_until = 0;
+            return None;
+        }
+        self.short_run = self.short_run.saturating_add(1);
+        if self.short_run < 2 {
+            return None;
+        }
+        let hold = FIRST_REGRANT_HOLD_NS.saturating_mul(1 << (self.short_run - 2).min(16)).min(MAX_REGRANT_HOLD_NS);
+        self.hold_until = now_ns.saturating_add(hold);
+        Some(hold)
+    }
+
+    /// Nothing plays: the next stream starts afresh.
+    pub fn idle(&mut self) {
+        self.short_run = 0;
+        self.hold_until = 0;
+    }
+
+    /// Whether a grant is held off at `now_ns`.
+    pub fn holding(&self, now_ns: u64) -> bool {
+        now_ns < self.hold_until
+    }
+
+    /// Short grants in a row so far.
+    pub fn short_run(&self) -> u32 {
+        self.short_run
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,5 +254,60 @@ mod tests {
         assert_eq!(l.tick(bad), Action::StayReleased);
         assert_eq!(l.tick(CLEAN), Action::StayReleased);
         assert!(!l.held());
+    }
+
+    const MS: u64 = 1_000_000;
+
+    #[test]
+    fn one_short_grant_regrants_at_once_and_a_run_of_them_is_spaced_out() {
+        let mut r = Regrant::default();
+        let mut now = 1_000 * MS;
+        // the first short grant: no hold, as before
+        r.granted(now);
+        now += 400 * MS;
+        assert_eq!(r.released(now, true), None);
+        assert!(!r.holding(now));
+        // then 250 ms, 500 ms, 1 s, 2 s, 4 s, and 4 s from then on
+        for want in [250, 500, 1_000, 2_000, 4_000, 4_000, 4_000] {
+            now += 20 * MS;
+            r.granted(now);
+            now += 400 * MS;
+            assert_eq!(r.released(now, true), Some(want * MS));
+            assert!(r.holding(now + want * MS - 1));
+            assert!(!r.holding(now + want * MS));
+            now += want * MS;
+        }
+    }
+
+    #[test]
+    fn a_grant_that_held_or_ended_without_a_fault_resets_the_run() {
+        for end in
+            [|r: &mut Regrant, t| r.released(t + SHORT_GRANT_NS, true), |r: &mut Regrant, t| r.released(t + MS, false)]
+        {
+            let mut r = Regrant::default();
+            let mut now = 0;
+            for _ in 0..4 {
+                r.granted(now);
+                now += 100 * MS;
+                r.released(now, true);
+            }
+            assert!(r.holding(now));
+            now += MAX_REGRANT_HOLD_NS;
+            r.granted(now);
+            assert_eq!(end(&mut r, now), None);
+            assert_eq!(r.short_run(), 0);
+            r.granted(now + 3 * SHORT_GRANT_NS);
+            assert_eq!(r.released(now + 3 * SHORT_GRANT_NS + MS, true), None, "the first short grant again");
+        }
+        // idle clears a hold at once; a release with no grant changes nothing
+        let mut r = Regrant::default();
+        for t in 0..3 {
+            r.granted(t * MS);
+            r.released(t * MS + MS, true);
+        }
+        assert!(r.holding(3 * MS));
+        r.idle();
+        assert!(!r.holding(3 * MS));
+        assert_eq!(r.released(10 * MS, true), None);
     }
 }
