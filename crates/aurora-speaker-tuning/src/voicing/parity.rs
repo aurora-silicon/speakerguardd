@@ -133,6 +133,26 @@ pub struct Entry {
     pub worst_louder_db: Option<f64>,
     #[serde(default)]
     pub worst_quieter_db: Option<f64>,
+    /// The tuning's verdict at each volume slider below full scale that its
+    /// release block was gated at (settled band levels per lane, both sides
+    /// fed the same `mvsc`/`mvol` pair).
+    #[serde(default)]
+    pub sliders: Vec<SliderVerdict>,
+}
+
+/// One volume slider's result for a tuning: the user scalar (`mvsc`) and
+/// the gate's verdict there.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SliderVerdict {
+    pub slider: f64,
+    /// "pass" or "refused".
+    pub verdict: String,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub worst_louder_db: Option<f64>,
+    #[serde(default)]
+    pub worst_quieter_db: Option<f64>,
 }
 
 /// The gate's result for one macOS release: its Tunings rendered through
@@ -143,6 +163,12 @@ pub struct Release {
     pub build: String,
     /// The Audio Units that were the reference, in words.
     pub reference: String,
+    /// The volume sliders below full scale this block was gated at. Every
+    /// entry must carry a passing verdict for each. Empty: the block was
+    /// gated at full volume only (a release with no host for slider
+    /// references).
+    #[serde(default)]
+    pub sliders: Vec<f64>,
     pub entries: Vec<Entry>,
 }
 
@@ -201,7 +227,37 @@ pub fn attested<'a>(
     if e.verdict != "pass" {
         return Err(format!("macOS parity gate ({}) refused this tuning: {}", r.reference, e.reason));
     }
+    for &s in &r.sliders {
+        match e.sliders.iter().find(|v| (v.slider - s).abs() < 1e-9) {
+            None => {
+                return Err(format!(
+                    "macOS parity gate ({}) has no verdict at volume slider {s} for this tuning (key {})",
+                    r.reference,
+                    short(key)
+                ))
+            }
+            Some(v) if v.verdict != "pass" => {
+                return Err(format!(
+                    "macOS parity gate ({}) refused this tuning at volume slider {s}: {}",
+                    r.reference, v.reason
+                ))
+            }
+            Some(_) => {}
+        }
+    }
     Ok((r, e))
+}
+
+/// What a passing check says about volume: the sliders the block covered and
+/// the worst settled deltas there, or that the block is full volume only.
+fn slider_note(r: &Release, e: &Entry) -> String {
+    if r.sliders.is_empty() {
+        return format!("; full volume only (the {} block has no volume-slider verdicts)", r.build);
+    }
+    let at: Vec<String> = r.sliders.iter().map(|s| format!("{s}")).collect();
+    let lo = e.sliders.iter().filter_map(|v| v.worst_louder_db).fold(0.0f64, f64::max);
+    let qu = e.sliders.iter().filter_map(|v| v.worst_quieter_db).fold(0.0f64, f64::min);
+    format!("; at volume sliders {}: worst louder {lo:+.3} dB, quieter {qu:+.3} dB", at.join(", "))
 }
 
 /// The note a passing check carries when the block it used is not the
@@ -501,12 +557,13 @@ pub fn run(t: &Tuning, attest: Option<&[u8]>, diags: &mut Diagnostics) -> (Optio
             Err(e) => Err(e.to_string()),
             Ok(a) => attested(&a, t.law_build.as_deref(), k).map(|(r, e)| {
                 format!(
-                    "{} (AID{}): worst louder {:+.3} dB, quieter {:+.3} dB vs {}{}",
+                    "{} (AID{}): worst louder {:+.3} dB, quieter {:+.3} dB vs {}{}{}",
                     short(k),
                     e.aid.map_or("?".into(), |v| v.to_string()),
                     e.worst_louder_db.unwrap_or(0.0),
                     e.worst_quieter_db.unwrap_or(0.0),
                     r.reference,
+                    slider_note(r, e),
                     via_reference(t.macos_build.as_deref(), &r.build)
                 )
             }),
@@ -539,9 +596,52 @@ mod tests {
                     reason: "lane 0 +4.35 dB louder than macOS (step_up_125)".into(),
                     worst_louder_db: Some(4.35),
                     worst_quieter_db: None,
+                    sliders: vec![],
                 }],
+                sliders: vec![],
             }],
         }
+    }
+
+    fn slider(s: f64, verdict: &str) -> SliderVerdict {
+        SliderVerdict {
+            slider: s,
+            verdict: verdict.into(),
+            reason: "1 cell(s) louder than macOS by more than 0.25 dB, worst +0.40 dB (lane 0, tone_100_-12)".into(),
+            worst_louder_db: Some(if verdict == "pass" { 0.02 } else { 0.4 }),
+            worst_quieter_db: Some(-0.05),
+        }
+    }
+
+    #[test]
+    fn every_gated_slider_must_pass() {
+        let b = Some("25G83");
+        let mut a = att(LAW, "pass");
+        a.releases[0].sliders = vec![0.7, 0.46, 0.25];
+        // a block gated at sliders needs a verdict for each
+        a.releases[0].entries[0].sliders = vec![slider(0.7, "pass"), slider(0.46, "pass")];
+        let e = attested(&a, b, "k1").unwrap_err();
+        assert!(e.contains("no verdict at volume slider 0.25"), "{e}");
+        // one refused slider refuses the tuning
+        a.releases[0].entries[0].sliders.push(slider(0.25, "refused"));
+        let e = attested(&a, b, "k1").unwrap_err();
+        assert!(e.contains("at volume slider 0.25") && e.contains("+0.40 dB"), "{e}");
+        a.releases[0].entries[0].sliders[2] = slider(0.25, "pass");
+        let (r, en) = attested(&a, b, "k1").unwrap();
+        let note = slider_note(r, en);
+        assert!(note.contains("sliders 0.7, 0.46, 0.25") && note.contains("+0.020 dB"), "{note}");
+        // a block gated at full volume only still decides on its own verdicts and says so
+        let a = att(LAW, "pass");
+        let (r, en) = attested(&a, b, "k1").unwrap();
+        assert!(slider_note(r, en).contains("full volume only"));
+    }
+
+    #[test]
+    fn a_file_without_slider_fields_still_parses() {
+        let j = br#"{"format":2,"law":"x","tolerance":{"louder_db":0.25,"quieter_db":1.0},
+            "releases":[{"build":"25G83","reference":"r","entries":[{"key":"k","verdict":"pass"}]}]}"#;
+        let a = Attestations::parse(j).unwrap();
+        assert!(a.releases[0].sliders.is_empty() && a.releases[0].entries[0].sliders.is_empty());
     }
 
     #[test]

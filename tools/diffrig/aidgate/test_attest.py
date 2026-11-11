@@ -129,5 +129,39 @@ class Releases(unittest.TestCase):
             self.assertEqual([x["build"] for x in attest.merge(p, "L2", r("26A428"))["releases"]], ["26A428"])
 
 
+class Sliders(unittest.TestCase):
+    """Every tuning is gated at volume sliders below full scale too (README, "Volume sliders")."""
+
+    # Releases attested without a host for slider references. Each needs a re-run with sliders
+    # once a host on that build exists; a new block may not join this list silently.
+    FULL_VOLUME_ONLY = {"26A428"}
+
+    def test_lane_worst(self):
+        rows = [{"lane": 0, "louder": 0.1, "quieter": -0.2}, {"lane": 0, "louder": -0.1, "quieter": -0.4},
+                {"lane": 1, "louder": 0.3, "quieter": 0.1}]
+        self.assertEqual(attest.lane_worst(rows), [[0.1, -0.4], [0.3, 0.0]])
+
+    def test_sliders_are_below_full_scale_and_ordered(self):
+        self.assertTrue(all(0.0 < s < 1.0 for s in attest.SLIDERS))
+        self.assertEqual(list(attest.SLIDERS), sorted(attest.SLIDERS, reverse=True))
+
+    def test_packaged_attestations_carry_every_slider(self):
+        import json
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "packaging", "session", "parity.json")
+        doc = json.load(open(p))
+        for r in doc["releases"]:
+            if not r.get("sliders"):
+                self.assertIn(r["build"], self.FULL_VOLUME_ONLY, f"{r['build']}: no volume-slider verdicts")
+                continue
+            self.assertEqual(sorted(r["sliders"]), sorted(attest.SLIDERS), r["build"])
+            for e in r["entries"]:
+                if e.get("reason", "").startswith(("no tuning key", "no macOS reference", "the macOS reference")):
+                    continue
+                got = {round(v["slider"], 6): v["verdict"] for v in e.get("sliders", [])}
+                if e["verdict"] == "pass":
+                    self.assertEqual(set(got), {round(s, 6) for s in attest.SLIDERS}, (r["build"], e["aid"]))
+                    self.assertTrue(all(v == "pass" for v in got.values()), (r["build"], e["aid"], got))
+
+
 if __name__ == "__main__":
     unittest.main()

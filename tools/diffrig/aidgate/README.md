@@ -33,7 +33,8 @@ box over the limit is named.
 
 Limits: the reference is the installed host build's units (25G83). States from the 27.2 tunings that
 run through those units are compatibility measurements, not native 27.2 qualification. The gate checks
-amplitude only, not sample identity. It runs at 48 kHz and full volume only. The protection unit is
+amplitude only, not sample identity. It runs at 48 kHz and full volume; `attest.py` also gates every tuning
+at lower volume sliders ("Volume sliders" below). The protection unit is
 outside this gate; it has its own rigs. Every output made from Apple tuning is Apple-derived: keep it
 in private directories and publish numbers only.
 
@@ -140,6 +141,45 @@ cells (`chaotic_held`) separately and counts a measurement outside macOS's sprea
 Exact parity stays the goal: the floor and spread rules only stop the gate from demanding more
 agreement than macOS has with itself.
 
+### Volume sliders
+
+The speaker graphs feed the system volume to volume-dependent stages: Tone automation (`tmst`
+SystemVolume), VarEQ, LowFlow, the VolumeTaper and its Comp relay, and the graph's gain box. A
+mapping error there shows only below full scale, so `attest.py` gates every tuning at sliders
+0.7, 0.46 and 0.25 (`SLIDERS`) besides full volume:
+
+- `attest.py variants` records, per tuning, the `(mvsc, mvol)` pair for each slider: `mvsc` is
+  the user scalar and `mvol` the dB the chain's volume law gives it (the HAL law over the Mac's
+  own range, `voicing-render --mvol auto`). That is the pair macOS's HAL hands the graph.
+- `attest_refs.sh` with `SLIDER=S` renders the macOS side at that pair (`gr.py --param mvsc=..
+  --param mvol=..`), one reference directory per slider.
+- `attest.py gate --slider S=DIR` renders v2 at the same pair and compares *settled* band
+  levels: every steady segment (the stepped third-octave sines and pink), per lane, second-half
+  RMS from 10 Hz up (`SETTLED_HP_HZ`), with the same tolerance (louder 0.25 dB, quieter 1.0 dB),
+  stop band, floor-residue and arithmetic-chaotic rules as full volume. Each entry gets
+  `sliders[]` (verdict and worst numbers per slider); a refusal at any slider refuses the
+  tuning. The release block lists the sliders it was gated at (`releases[].sliders`), and
+  `verify` requires a passing verdict at each (`parity.rs`).
+- Why from 10 Hz: the program's lowest tone is 20 Hz, so the cut removes no program content,
+  only subsonic drift. Below about 10 Hz the units' Float32 residue after a loud high tone sits
+  in the woofer lanes, and Tone automation lifts it at low volume. Measured 2026-11-12 on 25G83,
+  AID14 at slider 0.7, woofer lanes of `tone_16000_0`: broadband -76.4 dBFS on macOS and
+  -70.1 dBFS on v2, 65 dB under the tweeter lane, almost all of it in the two lowest FFT bins.
+  macOS does not reproduce that cell itself: under +-1 ULP program perturbations it moved by up
+  to 1.4 dB over 4 renders, 4.0 dB over 8, 6.7 dB over 16 and 32, and v2's sign flips between
+  sliders. From 10 Hz up the same cell is -81.8 dBFS on both sides (-0.05 dB). Tone automation's
+  steady response at 5-40 Hz matches macOS within 0.07 dB at sliders 1.0, 0.7 and 0.46.
+- Spread at a slider (`attest.py spread --slider S --perturbed ...`, `gate --slider-spread
+  S=FILE`): macOS's own +-1 ULP spread measured on the slider's references, settled the same
+  way, down to the absolute floor rather than the stop band (the stop band moves with volume, so
+  a cell can sit just under it in every macOS render and just over it in v2's). No release needs
+  one today. If a tuning is refused at a slider on deep cells only, render 16 or more perturbed
+  programs at that slider and gate again with the spread.
+- A release without a host for slider references (26A428 needs a Mac on 27.0) can only be
+  written with `--full-volume-only`. `verify` accepts such a block on its full-volume verdicts
+  and says "full volume only" in its detail; `test_attest.py` lists the builds allowed to be in
+  that state. Regenerate the block with sliders as soon as a host on that build exists.
+
 ### When it runs
 
 Run all three steps, in full, whenever:
@@ -157,12 +197,19 @@ Each run regenerates the spread file too (step 3 in `attest.py`), before the gat
 ```text
 # buildbox
 attest.py variants --bin BIN --build BUILD --tunings NEW_TREE --tunings-fallback HOST_TREE --out variants.json
-# host Mac on that release, under a host-heavy slot (about 2 s per tuning)
+# host Mac on that release, under a host-heavy slot (about 2 s per tuning and slider);
+# one SCRATCH per concurrent run (renders are named by tuning)
 BOXHOST=.../box_host SCRATCH=... PROG=prog.f32 attest_refs.sh SLOT variants.json
-# buildbox (about 1 min for 63 tunings with 12 jobs)
+for S in 0.7 0.46 0.25; do SLIDER=$S DEST=...REFS-$S BOXHOST=... SCRATCH=...-$S PROG=prog.f32 attest_refs.sh SLOT variants.json; done
+# buildbox (about 2 min for 63 tunings with 12 jobs)
 attest.py gate --variants variants.json --mac REFS --bin BIN --prog prog --reference "macOS <ver> <build> Audio Units" \
+    --slider 0.7=REFS-0.7 --slider 0.46=REFS-0.46 --slider 0.25=REFS-0.25 [--slider-spread S=spread-<build>-sS.json] \
     --out packaging/session/parity.json --details PRIVATE_DIR
 ```
+
+A tuning refused at a slider on deep cells only gets 16 or more perturbed renders at that slider (`perturb.py`
+seeds, `SLIDER=S PROG=prog-pN.f32 attest_refs.sh`), then `attest.py spread --slider S --variants V --mac REFS-S
+--perturbed P1 ... P16 --out spread-<build>-sS.json` and the gate again with `--slider-spread`.
 
 Commit the new `parity.json` in the same PR as the code change it attests. `test_verify.py` checks
 that the file is consistent with its own tolerance.
