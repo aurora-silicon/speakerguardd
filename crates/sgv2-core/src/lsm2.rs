@@ -2536,6 +2536,7 @@ impl Run {
             let velocity_cut = core::cell::Cell::new(false);
             let retained_episode = core::cell::Cell::new(c.vel_episode && c.vel_episode_retained);
             let continue_recovery = core::cell::Cell::new([false; BANDS]);
+            let ordinary_request = core::cell::Cell::new([1.0; BANDS]);
             let chain = |c: &Chan, seed: [f32; BANDS]| -> ([f32; BANDS], bool) {
                 let all = (0, BANDS);
                 let mut r = seed;
@@ -2595,6 +2596,7 @@ impl Run {
                 // applies the slow trajectory after the fast-gained sum;
                 // scaling the request by `sg` here would apply it twice.
                 let (p, primary_floor_limited) = chain(c, [1.0; BANDS]);
+                ordinary_request.set(p);
                 // residuals 5.2 (t-4713): upward lanes (primary above the
                 // applied gain); one second chain seeded from the predicted
                 // endpoint toward the complete primary request of upward
@@ -2643,7 +2645,12 @@ impl Run {
             }
             c.vel_bound_release = c.vel_episode && c.vel_episode_retained;
             for k in 0..BANDS {
-                if !continue_recovery.get()[k] {
+                if continue_recovery.get()[k] {
+                    let ordinary = ordinary_request.get()[k];
+                    if ordinary > c.band[k].requested() {
+                        c.band[k].decide(ordinary);
+                    }
+                } else {
                     c.band[k].decide(req[k]);
                 }
             }
