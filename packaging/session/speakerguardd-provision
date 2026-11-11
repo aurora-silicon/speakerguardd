@@ -672,7 +672,10 @@ def user_systemctl(user, *a):
            "XDG_RUNTIME_DIR": rt, "DBUS_SESSION_BUS_ADDRESS": f"unix:path={rt}/bus"}
     cmd = ["setpriv", f"--reuid={pw.pw_uid}", f"--regid={pw.pw_gid}", "--init-groups", "--",
            "systemctl", "--user", *a]
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=60, env=env, stdin=subprocess.DEVNULL)
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=60, env=env, stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(cmd, 124, "", f"systemctl --user {' '.join(a)} timed out after 60 s")
 
 
 def publish_voicing_parameters(p, previous_voicing=False):
@@ -742,6 +745,13 @@ def cmd_activate(args, p):
     mode = read_kv(p.bind).get("voicing_pre", "false")
     write_atomic(p.graph_state, f"result=pass\nuser={conf['SGV2_USER']}\ndigest={digest}\nchanged_us={changed_us}\nvoicing_pre={mode}\n")
     log(f"graph for {conf.get('SGV2_MACHINE')} in {p.graph} ({'unchanged' if before == digest else 'new'})")
+    if os.path.exists(p.deferred):
+        # The switch test passed (the record is current) and its streams are
+        # closed: it is no longer pending. Clear the marker before starting
+        # the seat user's graph unit, which waits while the marker exists;
+        # leaving it for ExecStopPost made that start wait on this activate.
+        unlink(p.deferred)
+        log("the switch test passed: sessions waiting for it start on the graph")
     if p.root:
         return 0
     refresh_session(conf["SGV2_USER"], int(changed_us), args.graph_unit)
@@ -787,8 +797,10 @@ def refresh_session(user, changed_us, graph_unit):
     if int(props.get("ActiveEnterTimestampMonotonic") or 0) >= changed_us:
         return
     log(f"{user}'s PipeWire started before the graph changed: restarting it on the new graph")
-    user_systemctl(user, "start", graph_unit)
-    user_systemctl(user, "try-restart", "pipewire.service", "wireplumber.service", "pipewire-pulse.service")
+    for cmd in (("start", graph_unit), ("try-restart", "pipewire.service", "wireplumber.service", "pipewire-pulse.service")):
+        r = user_systemctl(user, *cmd)
+        if r.returncode != 0:
+            log(f"{user}: systemctl --user {' '.join(cmd)} failed: {(r.stderr or '').strip()[-200:]}")
 
 
 def user_conf_dirs():

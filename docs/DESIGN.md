@@ -48,13 +48,13 @@ Unusable sense makes the affected channel run open loop, as on macOS. Invalid pa
 - loads and verifies the bundle, and publishes a compiled parameter blob that the plugin loads;
 - holds the kernel's speaker interlock, with the amplifier at the operating point the tuning assumes.
 
-It renews the interlock only while these all hold:
+It renews the interlock only while a client stream plays into the protect stage (the session helper reports it) and these all hold:
 - the plugin's heartbeat is fresh, and the plugin runs the published parameters;
 - the graph's links are exactly the configured set;
 - the sense carrier is at unity;
 - the speaker PCM belongs to the process hosting the plugin.
 
-Any failure releases the interlock at once, and the kernel's own safe level applies. That safe level is the hardware floor whenever no protection holds the amplifiers. There is no chaining to other daemons.
+Any failure releases the interlock at once, and the kernel's own safe level applies. With nothing playing the helper unlinks and suspends the amps and the sense (both PCMs close) and the supervisor gives the interlock back, so an idle Mac holds its speaker path at the floor with its PCMs and DMA stopped, as macOS powers it down. The protect stage keeps running on PipeWire's dummy driver, so its heartbeat, checks and thermal model carry on, and the next stream is granted within one tick of the helper's report. That safe level is the hardware floor whenever no protection holds the amplifiers. There is no chaining to other daemons.
 
 ## Binding a blob to its machine
 

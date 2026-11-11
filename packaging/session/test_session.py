@@ -28,11 +28,22 @@ class FakeGraph(sgs.Graph):
     def __init__(self):
         self.objs = {}
         self.next = 100
+        self._memo = {}
 
-    def node(self, name, props=None):
+    @property
+    def gen(self):
+        # tests edit objs directly: every read is a new generation
+        self._g = getattr(self, "_g", 0) + 1
+        return self._g
+
+    def node(self, name, props=None, state=None, group=None):
         nid = self.next
         self.next += 1
         info = {"props": {"node.name": name}}
+        if group is not None:
+            info["props"]["node.link-group"] = group
+        if state is not None:
+            info["state"] = state
         if props is not None:
             info["params"] = {"Props": [props]}
         self.objs[nid] = {"id": nid, "type": "PipeWire:Interface:Node", "info": info}
@@ -241,6 +252,178 @@ class Stop(unittest.TestCase):
         # bounded: a pw-link that does not finish is killed, not waited for
         self.assertLess(took, 1.0)
         self.assertEqual(s.pending, {})
+
+
+class Idle(unittest.TestCase):
+    """The speakers are wanted only while a client stream runs into the
+    protect stage; otherwise the amps and the sense are unlinked and
+    suspended, and the report asks for no grant."""
+
+    def voiced(self, m="j316", state="running"):
+        """The configured graph with the generated voicing (a filter-chain
+        pair: its sink and its output share a link group) and one client
+        playing into the voicing's sink."""
+        g, p, s = build(m, linked=True)
+        amps = MACHINES[m]["amps"]
+        # the build's plain voicing out is replaced by the pair
+        for lid, o, i in g.links():
+            if o in p["v"]:
+                del g.objs[lid]
+        vin = g.node(f"sgv2.voicing.{m}", state="running", group="filter-chain-1-32")
+        vout = g.node(f"sgv2.voicing.{m}.out", state="running", group="filter-chain-1-32")
+        vin_p = [g.port(vin, "in", ch) for ch in ("FL", "FR")]
+        vout_p = [g.port(vout, "out", f"AUX{i}") for i in range(amps)]
+        for i in range(amps):
+            g.link(vout_p[i], p["pin"][i])
+        app = g.node("Firefox", state=state)
+        app_p = [g.port(app, "out", ch) for ch in ("FL", "FR")]
+        for a, b in zip(app_p, vin_p):
+            g.link(a, b)
+        return g, p, s, app, vin
+
+    def test_a_client_through_the_voicing_is_found_and_plays_while_running(self):
+        g, _, s, app, vin = self.voiced()
+        self.assertEqual(s.clients(g), {app})
+        self.assertTrue(s.playing(g))
+        for st in ("idle", "suspended", "paused", None):
+            g.objs[app]["info"]["state"] = st
+            self.assertFalse(s.playing(g), st)
+
+    def test_the_stage_itself_the_sense_and_the_amps_are_never_clients(self):
+        # no client at all: the voicing pair and the sense run, nothing plays
+        g, _, s, app, _ = self.voiced()
+        for lid, o, i in g.links():
+            if (g.objs.get(o) or {}).get("info", {}).get("props", {}).get("node.id") == app:
+                del g.objs[lid]
+        self.assertEqual(s.clients(g), set())
+        self.assertFalse(s.playing(g))
+
+    def test_a_client_straight_into_the_protect_stage_counts(self):
+        g, p, s = build(linked=True)
+        ab = g.node("effect_output.some-ab-sink", state="running")
+        g.link(g.port(ab, "out", "AUX0"), p["pin"][0])
+        self.assertIn(ab, s.clients(g))
+        self.assertTrue(s.playing(g))
+
+    def test_a_recorder_of_the_voicing_is_not_a_client(self):
+        g, _, s, app, vin = self.voiced(state="idle")
+        rec = g.node("recorder", state="running")
+        g.link(g.port(vin, "out", "FL"), g.port(rec, "in", "FL"))
+        self.assertNotIn(rec, s.clients(g))
+        self.assertFalse(s.playing(g))
+
+    def test_the_speakers_stay_wanted_for_the_hold_after_the_last_stream(self):
+        g, _, s, app, _ = self.voiced()
+        self.assertTrue(s.want(g, 100.0))
+        g.objs[app]["info"]["state"] = "idle"
+        self.assertTrue(s.want(g, 100.0 + sgs.IDLE_HOLD_S - 0.01))
+        self.assertFalse(s.want(g, 100.0 + sgs.IDLE_HOLD_S))
+        # a fresh helper with nothing playing never wants them
+        g2, _, s2, app2, _ = self.voiced(state="idle")
+        self.assertFalse(s2.want(g2, 1.0))
+
+    def test_the_first_link_after_idle_is_not_rate_limited(self):
+        g, _, s, app, _ = self.voiced(state="idle")
+        s.want(g, 1.0)
+        s.last_try = 0.9
+        g.objs[app]["info"]["state"] = "running"
+        self.assertTrue(s.want(g, 1.1))
+        self.assertLess(s.last_try, 0.0)
+
+    def test_play_ends_only_once_the_pcms_are_suspended_or_after_the_bound(self):
+        g, _, s, app, _ = self.voiced()
+        spk, sense = g.node_id("sgv2.speaker.j316"), g.node_id("sgv2.sense.j316")
+        for n in (spk, sense):
+            g.objs[n]["info"]["state"] = "running"
+        s.want(g, 10.0)
+        g.objs[app]["info"]["state"] = "idle"
+        t = 10.0 + sgs.IDLE_HOLD_S
+        self.assertFalse(s.want(g, t))
+        # still linked: the grant stays while the helper takes them down
+        self.assertTrue(s.play_report(g, False, t))
+        for lid, o, i in g.links():
+            if (g.objs.get(i) or {}).get("info", {}).get("props", {}).get("node.id") == spk:
+                del g.objs[lid]
+        self.assertTrue(s.play_report(g, False, t + 0.1))
+        for n in (spk, sense):
+            g.objs[n]["info"]["state"] = "suspended"
+        self.assertFalse(s.play_report(g, False, t + 0.2))
+        # a node that never suspends does not hold the grant past the bound
+        g.objs[spk]["info"]["state"] = "idle"
+        self.assertTrue(s.play_report(g, False, t + 0.3))
+        self.assertFalse(s.play_report(g, False, t + sgs.TEARDOWN_S))
+        self.assertTrue(s.play_report(g, True, t + sgs.TEARDOWN_S))
+        # a helper that starts with nothing playing asks for no grant at all
+        g, _, s, _, _ = self.voiced(state="idle")
+        for n in (g.node_id("sgv2.speaker.j316"), g.node_id("sgv2.sense.j316")):
+            g.objs[n]["info"]["state"] = "idle"
+        self.assertFalse(s.want(g, 1.0))
+        self.assertFalse(s.play_report(g, False, 1.0))
+
+    def _reconcile(self, g, s, granted, play):
+        ran = []
+
+        class P:
+            def __init__(self, argv):
+                ran.append(argv)
+
+            def poll(self):
+                return 0
+
+        orig = sgs.subprocess.Popen
+        sgs.subprocess.Popen = lambda argv, **kw: P(argv)
+        try:
+            s.reconcile(g, granted, play)
+        finally:
+            sgs.subprocess.Popen = orig
+        return ran
+
+    def test_granted_but_idle_unlinks_the_amps_and_the_sense_then_suspends_them(self):
+        c = MACHINES["j616"]
+        g, p, s = build("j616", linked=True)
+        ran = self._reconcile(g, s, True, False)
+        self.assertEqual(len(ran), c["amps"] + c["sense"], ran)
+        self.assertTrue(all(a[:2] == ["pw-link", "-d"] for a in ran), ran)
+        # once nothing is linked: both nodes get the Suspend command
+        g, p, s = build("j616", linked=False)
+        for n in ("sgv2.speaker.j616", "sgv2.sense.j616"):
+            g.objs[g.node_id(n)]["info"]["state"] = "idle"
+        ran = self._reconcile(g, s, True, False)
+        self.assertEqual(sorted(a[2] for a in ran),
+                         sorted(str(g.node_id(n)) for n in ("sgv2.speaker.j616", "sgv2.sense.j616")))
+        self.assertTrue(all(a[:2] == ["pw-cli", "send-command"] and a[3] == "Suspend" for a in ran), ran)
+
+    def test_granted_and_playing_links_and_playing_alone_never_does(self):
+        c = MACHINES["j616"]
+        g, p, s = build("j616", linked=False)
+        ran = self._reconcile(g, s, True, True)
+        self.assertEqual(len(ran), c["amps"] + c["sense"], ran)
+        self.assertTrue(all(a[0] == "pw-link" and a[1] != "-d" for a in ran), ran)
+        g, p, s = build("j616", linked=False)
+        ran = self._reconcile(g, s, False, True)
+        self.assertEqual(ran, [])
+
+    def test_the_report_carries_play(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "session")
+            self.assertTrue(sgs.write_report(path, True, True, "0123456789abcdef", False, False))
+            with open(path) as f:
+                line = f.read()
+            self.assertTrue(line.endswith(" amps=0 play=0\n"), line)
+
+
+class Memo(unittest.TestCase):
+    def test_graph_derivations_are_computed_once_per_change(self):
+        g = sgs.Graph.__new__(sgs.Graph)
+        g.objs, g.gen, g._memo = {}, 0, {}
+        calls = []
+        f = lambda: calls.append(1) or len(calls)
+        self.assertEqual(g.memo("k", f), 1)
+        self.assertEqual(g.memo("k", f), 1)
+        g.gen += 1
+        self.assertEqual(g.memo("k", f), 2)
 
 
 class Generated(unittest.TestCase):

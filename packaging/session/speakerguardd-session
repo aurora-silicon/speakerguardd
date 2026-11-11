@@ -17,14 +17,16 @@ It runs in the user's session, beside PipeWire, and does three things:
    missing link is silence and is allowed; any other link is a fault. It
    also checks the carrier: the protect stage's input and the sense at unity
    volume, unmuted.
-3. **Report.** On every link or carrier change, and every 50 ms, it writes
-   `links=<0|1> carrier=<0|1> mono_ns=<t> pid=<pid> start=<ticks> wiring=<hash> amps=<0|1>`
+3. **Report.** On every link, carrier or playback change, and every 50 ms,
+   it writes
+   `links=<0|1> carrier=<0|1> mono_ns=<t> pid=<pid> start=<ticks> wiring=<hash> amps=<0|1> play=<0|1>`
    to /run/speakerguardd/<uid>/helper/session, where the wiring is the one
    the protect stage was built with (its `sgv2.wiring` property; the
    supervisor grants only for the wiring the self-check proved), by a write
    to a new file and a
    rename, so the supervisor never reads a partial report. `amps` says whether
-   anything is linked into the amps' sink (the sleep step waits for 0). A report older
+   anything is linked into the amps' sink (the sleep step waits for 0), and
+   `play` whether the speakers are wanted (5 below). A report older
    than 500 ms, dated in the future, or whose writer (pid, start time) is not
    this live process counts as absent, and the supervisor then releases.
 4. **The grant-before-start sequence.** The supervisor grants only on a
@@ -33,6 +35,16 @@ It runs in the user's session, beside PipeWire, and does three things:
    amps only once the kernel reads granted; the amps' sink then starts. On
    any withdrawal it unlinks the amps, the sink stops and closes, and the
    sequence starts again.
+5. **Idle.** The speakers are wanted only while a client stream runs into
+   the protect stage (through the voicing in front of it, or straight in),
+   and for IDLE_HOLD_S after the last one stops. With none, the amps and the
+   sense are unlinked and suspended, so both PCMs close, and the report says
+   `play=0` once they are; the supervisor then releases its grant and the
+   kernel holds the amps at its floor, as macOS powers the speaker path down
+   when nothing plays. The protect stage keeps running on the dummy driver
+   (its heartbeat and thermal model never stop), so when a client starts the
+   report says `play=1` at once, the supervisor grants within its two clean
+   ticks, and this helper links the amps on the grant as in 4.
 
 It reads the graph from `pw-dump --monitor` and makes or removes links with
 `pw-link`. It never touches the amps' volume: the kernel owns it.
@@ -49,6 +61,13 @@ import sys
 import time
 
 PERIOD = 0.050
+# How long the speakers stay up after the last client stream stops: the
+# default idle time before WirePlumber suspends a node, so a pause between
+# two sounds does not cycle the amps.
+IDLE_HOLD_S = 5.0
+# How long the helper waits for the amps and the sense to suspend before it
+# reports play=0 anyway (the supervisor's release then stops them).
+TEARDOWN_S = 2.0
 PROTECT_INPUT = "alsa_output.platform-sound.RawSpeakers"
 # While speakerguardd-selfcheck runs its silent check it holds a grant of
 # its own: nothing may be linked to the amps then.
@@ -135,6 +154,19 @@ class Graph:
         self.buf = ""
         self.dec = json.JSONDecoder()
         self.objs = {}
+        # bumped on every update from the monitor: what is derived from the
+        # graph is computed once per change, not on every 50 ms period
+        self.gen = 0
+        self._memo = {}
+
+    def memo(self, key, fn):
+        """`fn()`, computed once per graph generation."""
+        hit = self._memo.get(key)
+        if hit is not None and hit[0] == self.gen:
+            return hit[1]
+        v = fn()
+        self._memo[key] = (self.gen, v)
+        return v
 
     def pump(self, timeout, extra=()):
         """Read the monitor's output for up to `timeout`; returns which of
@@ -160,6 +192,8 @@ class Graph:
                 self.buf = s
                 return ready
             self.buf = s[end:]
+            if isinstance(arr, list) and arr:
+                self.gen += 1
             for o in arr if isinstance(arr, list) else []:
                 if o.get("info") is None:
                     self.objs.pop(o.get("id"), None)
@@ -176,13 +210,21 @@ class Graph:
                         self.objs[o["id"]] = o
 
     def of_type(self, t):
-        return [o for o in self.objs.values() if o.get("type", "").endswith(":" + t)]
+        return self.memo(("type", t), lambda: [o for o in self.objs.values() if o.get("type", "").endswith(":" + t)])
 
     def node_id(self, name):
-        for o in self.of_type("Node"):
-            if (o["info"].get("props") or {}).get("node.name") == name:
-                return o["id"]
-        return None
+        def ids():
+            out = {}
+            for o in self.of_type("Node"):
+                out.setdefault((o["info"].get("props") or {}).get("node.name"), o["id"])
+            return out
+
+        return self.memo("node_ids", ids).get(name)
+
+    def node_link_group(self, nid):
+        props = ((self.objs.get(nid) or {}).get("info") or {}).get("props") or {}
+        g = props.get("node.link-group")
+        return g if isinstance(g, str) and g else None
 
     def node_state(self, nid):
         """A node's state ("suspended", "idle", "running", ...), or None."""
@@ -233,6 +275,10 @@ class Session:
         self.last_suspend = -10.0
         self.last_unity = -10.0
         self.pending = {}
+        # when a client stream last ran into the protect stage
+        self.last_play = None
+        # when the speakers stopped being wanted
+        self.idle_since = None
 
     def wanted(self, g):
         """The links the helper owns: (out port, in port) pairs, or None if a node is missing."""
@@ -262,6 +308,9 @@ class Session:
 
     def check(self, g):
         """(links_ok, carrier_ok) for the current graph."""
+        return g.memo("check", lambda: self._check(g))
+
+    def _check(self, g):
         protect = g.node_id(PROTECT_INPUT)
         pout = g.node_id(self.protect_out)
         spk = g.node_id(self.speaker)
@@ -315,8 +364,82 @@ class Session:
         )
         return True
 
+    def clients(self, g):
+        """The client nodes that feed the protect stage's program. From the
+        protect stage upstream: a node linked into a stage node is part of
+        the stage when it is one half of a pair (a filter-chain or loopback
+        shares its node.link-group between its sink and its output, like the
+        voicing), and then its own sources are followed; any other node is a
+        client. The sense and the amps are never part of it."""
+        protect = g.node_id(PROTECT_INPUT)
+        if protect is None:
+            return set()
+        skip = {g.node_id(self.speaker), g.node_id(self.sense_name), g.node_id(self.protect_out)} - {None}
+        port_node = {o["id"]: (o["info"].get("props") or {}).get("node.id") for o in g.of_type("Port")}
+        groups = {}
+        for n in g.of_type("Node"):
+            lg = g.node_link_group(n["id"])
+            if lg:
+                groups.setdefault(lg, set()).add(n["id"])
+        edges = [(port_node.get(o), port_node.get(i)) for _, o, i in g.links()]
+        stage, todo, found = {protect}, [protect], set()
+        while todo:
+            n = todo.pop()
+            for src, dst in edges:
+                if dst != n or src is None or src in skip or src in stage:
+                    continue
+                pair = groups.get(g.node_link_group(src), set())
+                if len(pair) > 1:
+                    for x in pair - skip:
+                        if x not in stage:
+                            stage.add(x)
+                            todo.append(x)
+                else:
+                    found.add(src)
+        return found - stage
+
+    def playing(self, g):
+        """Whether a client stream runs into the protect stage now."""
+        return g.memo("playing", lambda: any(g.node_state(n) == "running" for n in self.clients(g)))
+
+    def want(self, g, now):
+        """Whether the speakers are wanted: a client plays, or one stopped
+        less than IDLE_HOLD_S ago."""
+        if self.playing(g):
+            if self.idle_since is not None or self.last_play is None:
+                # the first link attempt after idle is not rate-limited
+                self.last_try = -10.0
+            self.last_play = now
+            self.idle_since = None
+            return True
+        if self.last_play is not None and now - self.last_play < IDLE_HOLD_S:
+            return True
+        if self.idle_since is None:
+            self.idle_since = now
+        return False
+
+    def play_report(self, g, want, now):
+        """`play` for the report: 1 while the speakers are wanted, and
+        while the amps and the sense are still being taken down after they
+        stopped being wanted (at most TEARDOWN_S), so the grant ends with
+        both PCMs closed rather than under a running stream."""
+        if want:
+            return True
+        if self.last_play is None:
+            # nothing has played since this helper started: nothing to take down
+            return False
+        if self.idle_since is None or now - self.idle_since >= TEARDOWN_S:
+            return False
+        if self.amps_linked(g):
+            return True
+        nodes = (g.node_id(self.speaker), g.node_id(self.sense_name) if self.sense else None)
+        return any(n is not None and g.node_state(n) not in (None, "suspended") for n in nodes)
+
     def amps_linked(self, g):
         """True while any link feeds the amps' sink."""
+        return g.memo("amps_linked", lambda: self._amps_linked(g))
+
+    def _amps_linked(self, g):
         spk = g.node_id(self.speaker)
         if spk is None:
             return False
@@ -354,11 +477,11 @@ class Session:
             if p.poll() is not None:
                 del self.pending[k]
 
-    def reconcile(self, g, granted):
+    def reconcile(self, g, granted, play=True):
         self._reap()
         want = self.wanted(g)
         have = {(o, i): lid for lid, o, i in g.links()}
-        if granted and want:
+        if granted and play and want:
             # A link pw-link could not make is tried again once a second
             now = time.monotonic()
             missing = [w for w in want if w not in have]
@@ -366,9 +489,10 @@ class Session:
                 self.last_try = now
                 for o, i in missing:
                     self._spawn(("link", o, i), ["pw-link", str(o), str(i)])
-        elif not granted:
-            # Withdrawn: take the amps and the sense out of the graph, so the
-            # amps' sink is not started again until the next grant.
+        elif not granted or not play:
+            # Withdrawn, or nothing plays: take the amps and the sense out of
+            # the graph, so the amps' sink is not started again until the
+            # next grant.
             spk = g.node_id(self.speaker)
             sense = g.node_id(self.sense_name) if self.sense else None
             owners = {o["id"]: (o["info"].get("props") or {}).get("node.id") for o in g.of_type("Port")}
@@ -377,12 +501,13 @@ class Session:
                 if owners.get(i) == spk or (sense is not None and owners.get(o) == sense):
                     linked = True
                     self._spawn(("unlink", lid), ["pw-link", "-d", str(lid)])
-            if os.path.exists(SLEEP_HOLD) and not linked:
+            if (os.path.exists(SLEEP_HOLD) or not play) and not linked:
                 self.suspend_for_sleep(g, (spk, sense))
 
     def suspend_for_sleep(self, g, nodes):
-        """Under the sleep hold, once nothing is linked: suspend the amps'
-        sink and the sense, which closes their PCMs. Unlinked they are only
+        """Under the sleep hold, or with nothing playing, once nothing is
+        linked: suspend the amps' sink and the sense, which closes their
+        PCMs (and powers the amps down). Unlinked they are only
         paused, and WirePlumber closes an idle node after 5 s, after the
         sleep has begun; a PCM held open across a sleep is unmuted by the
         resume before its I2S clocks are back (the MCA loses its state in
@@ -420,7 +545,7 @@ def realtime():
         log("normal priority (no RLIMIT_RTPRIO or CAP_SYS_NICE)")
 
 
-def write_report(path, links, carrier, wiring=None, amps=None):
+def write_report(path, links, carrier, wiring=None, amps=None, play=None):
     """Write one report atomically: a new file in the helper's own
     directory, renamed over the last one. The supervisor reads either the
     whole new report or the whole previous one, never a partial write.
@@ -435,6 +560,10 @@ def write_report(path, links, carrier, wiring=None, amps=None):
     # waits for 0 before the supervisor stops)
     if amps is not None:
         w += f" amps={int(amps)}"
+    # play: whether the speakers are wanted (a client stream runs into the
+    # protect stage); without it the supervisor releases
+    if play is not None:
+        w += f" play={int(play)}"
     line = f"links={int(links)} carrier={int(carrier)} mono_ns={time.monotonic_ns()} pid={pid} start={start}{w}\n".encode()
     tmp = os.path.join(os.path.dirname(path), f".session.{os.getpid()}")
     try:
@@ -494,8 +623,9 @@ def main():
     realtime()
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
-    last = (None, None, None, None)
+    last = (None, None, None, None, None)
     was_granted = None
+    play = False
     nxt = time.monotonic()
     while True:
         ready = g.pump(max(0.0, nxt - time.monotonic()), [card.fd] if card.events else [])
@@ -503,12 +633,12 @@ def main():
             # a grant or a withdrawal: link or unlink now
             granted = card.granted()
             if granted != was_granted:
-                s.reconcile(g, granted)
+                s.reconcile(g, granted, play)
                 was_granted = granted
         if time.monotonic() < nxt:
-            # event-driven: a link or carrier change is reported at once,
-            # not at the next period
-            if ready is not None and s.check(g) != last[1:3]:
+            # event-driven: a link, carrier or playback change is reported
+            # at once, not at the next period
+            if ready is not None and (s.check(g) != last[1:3] or s.want(g, time.monotonic()) != play):
                 nxt = time.monotonic()
             else:
                 continue
@@ -516,14 +646,16 @@ def main():
         if nxt < time.monotonic():
             nxt = time.monotonic() + PERIOD
         granted = card.granted()
+        now = time.monotonic()
+        play = s.want(g, now)
         links, carrier = s.check(g)
-        wrote = write_report(report, links, carrier, s.wiring(g), s.amps_linked(g))
-        s.reconcile(g, granted)
+        wrote = write_report(report, links, carrier, s.wiring(g), s.amps_linked(g), s.play_report(g, play, now))
+        s.reconcile(g, granted, play)
         s.pin_amps_unity(g)
         was_granted = granted
-        state = (granted, links, carrier, wrote)
+        state = (granted, links, carrier, wrote, play)
         if state != last:
-            log(f"granted={int(granted)} links={int(links)} carrier={int(carrier)} report={'ok' if wrote else 'unwritable'}")
+            log(f"granted={int(granted)} links={int(links)} carrier={int(carrier)} play={int(play)} report={'ok' if wrote else 'unwritable'}")
             last = state
 
 

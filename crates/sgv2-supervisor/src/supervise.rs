@@ -33,7 +33,11 @@ use crate::machine::{full_scale_mv, same_operating_point, Amp, Machine};
 pub enum Event {
     Granted,
     Renewed,
-    Released { why: Observation },
+    Released {
+        why: Observation,
+    },
+    /// Nothing plays: the grant was given back with every check holding.
+    Idle,
     StayedReleased,
     HardFault(String),
     Lapsed,
@@ -189,6 +193,10 @@ impl Supervisor {
                 kernel.release().map_err(Fatal::Kernel)?;
                 Ok(Event::Released { why: obs })
             }
+            Action::Idle => {
+                kernel.release().map_err(Fatal::Kernel)?;
+                Ok(Event::Idle)
+            }
             Action::StayReleased => Ok(Event::StayedReleased),
         }
     }
@@ -225,6 +233,7 @@ mod tests {
         pcm_state_ok: true,
         route_ok: false,
         amps_ok: false,
+        demand: true,
     };
 
     /// The J316 with a blob for gain 15 (18.5 dBV, 11.89 V peak).
@@ -258,6 +267,42 @@ mod tests {
             assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::StayedReleased));
         }
         assert!(s.problem().unwrap().contains("operating point"), "{:?}", s.problem());
+    }
+
+    #[test]
+    fn nothing_playing_gives_the_grant_back_and_a_stream_takes_it_at_once() {
+        let mut k = Recorder::healthy(6);
+        let mut s = j316();
+        let idle = Observation { demand: false, ..CLEAN };
+        // idle from the start: the kernel floor holds, nothing is granted
+        assert_eq!(s.tick(idle, &mut k), Ok(Event::StayedReleased));
+        assert_eq!(s.tick(idle, &mut k), Ok(Event::StayedReleased));
+        assert!(!k.held);
+        assert_eq!(k.renewals, 0);
+        // a stream: granted on its first tick, the checks having held
+        assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Granted));
+        assert!(k.held);
+        assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Renewed));
+        // it stops: released to the floor, and not as a fault
+        let releases = k.releases;
+        assert_eq!(s.tick(idle, &mut k), Ok(Event::Idle));
+        assert!(!k.held);
+        assert_eq!(k.releases, releases + 1);
+        assert_eq!(s.tick(idle, &mut k), Ok(Event::StayedReleased));
+        // the kernel-side checks hold while idle too: a card off the
+        // operating point blocks the next grant
+        k.gain = Some((12, 1250));
+        assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::StayedReleased));
+        assert!(s.problem().unwrap().contains("operating point"), "{:?}", s.problem());
+        // and a hard amp fault while idle still latches
+        k.gain = Some((15, 1850));
+        k.amp_faults[0].bits = AmpFault::OVER_TEMPERATURE;
+        assert!(matches!(s.tick(idle, &mut k), Ok(Event::HardFault(_))));
+        k.amp_faults[0].bits = 0;
+        for _ in 0..3 {
+            assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::StayedReleased));
+        }
+        assert!(!k.held);
     }
 
     #[test]
