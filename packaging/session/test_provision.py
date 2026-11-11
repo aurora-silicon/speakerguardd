@@ -547,8 +547,11 @@ class Graph(Base):
             self.assertEqual(prov.cmd_activate(self.args("activate"), self.p), 0)
         self.assertIn("generate", run.call_args_list[0][0][0])
         self.assertEqual(prov.read_kv(self.p.graph_state)["result"], "pass")
+        # The passing activate ends the pending state itself.
+        self.assertFalse(os.path.exists(self.p.deferred))
         # A failed test: no pass, the graph stays down; the session starts
         # with the raw rules alone, and the helper does not start.
+        prov.write_atomic(self.p.deferred, "kernel=k\n")
         prov.write_atomic(os.path.join(self.p.state, "selfcheck.bind"), "result=fail\n")
         self.assertEqual(prov.cmd_activate(self.args("activate"), self.p), 0)
         self.assertEqual(prov.read_kv(self.p.graph_state)["result"], "pending")
@@ -557,6 +560,34 @@ class Graph(Base):
         wpd = os.path.join(home, "wireplumber", "wireplumber.conf.d")
         self.assertEqual(os.listdir(wpd), ["59-sgv2-raw.conf"])
         self.assertEqual(prov.cmd_is_seat(self.args("is-seat"), self.p), 1)
+
+    def test_switch_test_activate_does_not_wait_on_the_session(self):
+        """The switch test passed while the seat user's PipeWire runs (a
+        switch in a live session): activate starts the user's graph unit and
+        waits for it. That unit waits while the switch test is pending, so
+        activate must end the pending state first, or the two wait on each
+        other until the user manager's timeout and the switch test fails."""
+        home = self.provisioned()
+        prov.write_atomic(self.p.deferred, "kernel=k\n")
+        digest = prov.sha256_file(self.p.params)
+        prov.write_atomic(os.path.join(self.p.state, "selfcheck.bind"),
+                          f"result=pass\nkernel={os.uname().release}\nparams_sha256={digest}\n")
+        started = []
+
+        def refresh(user, changed_us, unit):
+            # systemctl --user start <unit>: runs graph-user to completion
+            t = time.monotonic()
+            self.assertEqual(prov.cmd_graph_user(self.args("graph-user", switch_test_wait=5), self.p), 0)
+            started.append(time.monotonic() - t)
+        self.patch(prov, "refresh_session", refresh)
+        self.p.root = ""  # the paths stay under the test root; take the live-session branch
+        from unittest import mock
+        done = types.SimpleNamespace(returncode=0, stderr="", stdout="")
+        with mock.patch.object(prov.subprocess, "run", return_value=done):
+            self.assertEqual(prov.cmd_activate(self.args("activate"), self.p), 0)
+        self.assertEqual(len(started), 1)
+        self.assertLess(started[0], 1.0)
+        self.assertTrue(os.path.islink(os.path.join(home, "pipewire", "pipewire.conf.d", "sgv2-j316.conf")))
 
     def test_sessions_wait_for_a_pending_switch_test(self):
         """No session's PipeWire (and so WirePlumber, whose device probe opens
