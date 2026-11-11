@@ -2600,32 +2600,40 @@ fn hostile_but_valid_blobs_do_not_pass_through() {
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
-/// FINDING 8 (decision for lane B): lsm2 parses and validates
-/// `TemperatureHardLimit` but never uses it: there is no hard path. With
-/// `MaxTemperatureAttenuation = 0 dB` (accepted) the coil runs past the hard
-/// limit at unity gain.
+/// FINDING 8, as decided: lsm2's temperature axis (candidate and the output
+/// ceiling at `TemperatureHardLimit` + headroom) cuts at most
+/// `MaxTemperatureAttenuation`, as the reference does (25G83 rig: a capped
+/// drive holds the cap while the model coil passes the hard limit). Within
+/// a cap that is deep enough the ceiling holds the coil at the hard limit;
+/// a 0 dB cap (accepted) means the axis applies no cut at all.
 #[test]
-fn lsm2_enforces_the_hard_temperature_limit() {
-    let mut p = lsm2_params(3, 1, 48_000, true);
-    (p.control_sample_peak, p.control_displacement, p.control_velocity, p.control_power) = (0, 0, 0, 0);
-    p.control_temperature = 1;
-    p.ch[0].max_temperature_attenuation_db = 0.0;
-    p.ch[0].temperature_soft_limit = p.ch[0].ambient + 5.0;
-    p.ch[0].temperature_hard_limit = p.ch[0].ambient + 10.0;
-    let mut u = lsm2::Unit::new(p);
-    assert!(!u.is_failsafe());
-    let x = vec![signal(9, 1, 48_000 * 20, 1.0, Hostility::Clean)[0].iter().map(|v| v.signum()).collect::<Vec<_>>()];
-    let rr = render(&mut u, &x, None, &[512], &mut no_sense, true);
-    let over = rr.tele.iter().filter(|(_, t)| t.channels[0].coil_temp_c > p.ch[0].temperature_hard_limit).count();
-    let (_, last) = rr.tele.last().unwrap();
-    assert!(over > 0, "precondition: the drive must reach the hard limit");
-    assert!(
-        last.channels[0].gain <= FAILSAFE_GAIN,
-        "coil {} C past the {} C hard limit for {over} calls at gain {}",
-        last.channels[0].coil_temp_c,
-        p.ch[0].temperature_hard_limit,
-        last.channels[0].gain
-    );
+fn lsm2_hard_temperature_limit_holds_within_the_cap() {
+    let run = |cap_db: f32| {
+        let mut p = lsm2_params(3, 1, 48_000, true);
+        (p.control_sample_peak, p.control_displacement, p.control_velocity, p.control_power) = (0, 0, 0, 0);
+        p.control_temperature = 1;
+        p.ch[0].max_temperature_attenuation_db = cap_db;
+        p.ch[0].temperature_soft_limit = p.ch[0].ambient + 5.0;
+        p.ch[0].temperature_hard_limit = p.ch[0].ambient + 10.0;
+        let mut u = lsm2::Unit::new(p);
+        assert!(!u.is_failsafe());
+        let x = vec![signal(9, 1, 48_000 * 20, 1.0, Hostility::Clean)[0].iter().map(|v| v.signum()).collect::<Vec<_>>()];
+        let rr = render(&mut u, &x, None, &[512], &mut no_sense, true);
+        let limit = p.ch[0].temperature_hard_limit + p.ch[0].temperature_headroom.max(0.0);
+        let n = rr.tele.len();
+        let tail = &rr.tele[2 * n / 3..];
+        let peak = tail.iter().map(|(_, t)| t.channels[0].coil_temp_c).fold(f32::MIN, f32::max);
+        let low = rr.tele.iter().map(|(_, t)| t.channels[0].gain).fold(1.0f32, f32::min);
+        (peak, limit, low)
+    };
+    // a deep cap: the ceiling holds the coil at the hard limit + headroom
+    let (peak, limit, low) = run(60.0);
+    assert!(peak <= limit + 0.5, "coil {peak} C past the {limit} C ceiling inside a 60 dB cap (gain {low})");
+    assert!(low < 1.0);
+    // 0 dB: no temperature cut, the model passes the limit at unity
+    let (peak, limit, low) = run(0.0);
+    assert!(peak > limit, "precondition: the drive must reach the hard limit ({peak} C)");
+    assert!(low >= 0.99 * (1.0 - 1e-5), "a 0 dB cap cut to {low}");
 }
 
 /// FINDING 9 (high): the thermal filters are the linear-decay recurrence
