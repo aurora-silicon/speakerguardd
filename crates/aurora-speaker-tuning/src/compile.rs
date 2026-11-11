@@ -931,7 +931,7 @@ fn finish_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics, p: lsm2::Params) 
     let mut payload = p.as_bytes().to_vec();
     let mut calibration_present = 0u32;
     let mut calibration_temperature = [0.0f32; MAX_CHANNELS];
-    if let Some(spts) = t.spts.as_ref().filter(|s| b.calibration_trusted && s.checksum_valid) {
+    if let Some(spts) = t.spts.as_ref().filter(|s| guarded && b.calibration_trusted && s.checksum_valid) {
         if spts.records.len() < n {
             return Err(bad(format!("SpTS has {} records for {n} LSM2 channels", spts.records.len())));
         }
