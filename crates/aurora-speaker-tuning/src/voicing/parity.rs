@@ -29,6 +29,15 @@
 //!   rendering code, or a failing one refuses. The file holds hashes,
 //!   verdicts and summary numbers only: no Apple data.
 //!
+//!   The build looked up is the tuning's [`Tuning::law_build`], not always
+//!   the build the Mac runs. v2 implements the laws of the reference
+//!   release, 25G83 ([`crate::reference`]). A tuning whose speaker files
+//!   for its AID are byte-identical to 25G83's is compiled with 25G83's
+//!   laws, so it renders exactly what the gate measured for that key in
+//!   the 25G83 block, on any macOS build, and is checked against that
+//!   block. Any other tuning keeps its own build and needs that build's
+//!   block.
+//!
 //! The attestation does not choose boards: it records, for every tuning of
 //! the release, whether this code renders it like macOS. A Mac nobody here
 //! has seen is checked exactly like the lab's.
@@ -157,11 +166,13 @@ impl Attestations {
     }
 }
 
-/// The attestation's answer for a tuning `key` taken from macOS `build`:
-/// Ok((release, entry)) when it passes for this code, else the refusal.
-/// A tuning from a build the gate has not run against refuses, even when
-/// another release holds the same key: that release's Audio Units, not
-/// this build's, were the reference.
+/// The attestation's answer for a tuning `key` whose law build is `build`
+/// ([`Tuning::law_build`]): Ok((release, entry)) when it passes for this
+/// code, else the refusal. A build the gate has not run against refuses,
+/// even when another release holds the same key: that release's Audio
+/// Units, not this build's, were the reference. (A tuning byte-identical to
+/// the reference release's arrives here with the reference build, see
+/// [`crate::reference::law_build`].)
 pub fn attested<'a>(
     a: &'a Attestations,
     build: Option<&str>,
@@ -191,6 +202,19 @@ pub fn attested<'a>(
         return Err(format!("macOS parity gate ({}) refused this tuning: {}", r.reference, e.reason));
     }
     Ok((r, e))
+}
+
+/// The note a passing check carries when the block it used is not the
+/// Mac's own build: the tuning's speaker files equal the reference
+/// release's, so that release's block applies.
+fn via_reference(macos_build: Option<&str>, block: &str) -> String {
+    match macos_build {
+        Some(b) if b == block => String::new(),
+        b => format!(
+            " (tuning from macOS {}: its speaker files are byte-identical to {block}'s, so v2 renders it with {block}'s laws and the {block} block applies)",
+            b.unwrap_or("unknown")
+        ),
+    }
 }
 
 fn short(s: &str) -> &str {
@@ -477,12 +501,13 @@ pub fn run(t: &Tuning, attest: Option<&[u8]>, diags: &mut Diagnostics) -> (Optio
             Err(e) => Err(e.to_string()),
             Ok(a) => attested(&a, t.law_build.as_deref(), k).map(|(r, e)| {
                 format!(
-                    "{} (AID{}): worst louder {:+.3} dB, quieter {:+.3} dB vs {}",
+                    "{} (AID{}): worst louder {:+.3} dB, quieter {:+.3} dB vs {}{}",
                     short(k),
                     e.aid.map_or("?".into(), |v| v.to_string()),
                     e.worst_louder_db.unwrap_or(0.0),
                     e.worst_quieter_db.unwrap_or(0.0),
-                    r.reference
+                    r.reference,
+                    via_reference(t.macos_build.as_deref(), &r.build)
                 )
             }),
         },
@@ -543,6 +568,22 @@ mod tests {
         r.build = "26A428".into();
         a.releases.push(r);
         assert_eq!(attested(&a, Some("26A428"), "k1").unwrap().0.build, "26A428");
+    }
+
+    #[test]
+    fn a_reference_identical_tuning_uses_the_reference_block() {
+        // A J713 on 26A434 (no block) whose AID37 speaker files equal
+        // 25G83's: Tuning::law_build is 25G83, so the 25G83 block decides.
+        let a = att(LAW, "pass");
+        let (r, _) = attested(&a, Some("25G83"), "k1").unwrap();
+        let note = via_reference(Some("26A434"), &r.build);
+        assert!(note.contains("macOS 26A434") && note.contains("byte-identical to 25G83's"), "{note}");
+        assert_eq!(via_reference(Some("25G83"), "25G83"), "");
+        // The same Mac with speaker files that differ keeps its own build
+        // and is refused until 26A434 has a block, even though the key
+        // passes in the 25G83 block.
+        let e = attested(&a, Some("26A434"), "k1").unwrap_err();
+        assert!(e.contains("macOS 26A434 has no parity attestation"), "{e}");
     }
 
     #[test]

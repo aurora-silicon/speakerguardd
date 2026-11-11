@@ -29,9 +29,16 @@ code (`law`, see parity.rs; a stale file refuses every Mac until it is regenerat
 
 BUILD is the macOS build whose Tunings and installed Audio Units the run uses (26A428). The
 gate writes one release block for it into parity.json and keeps the blocks of other releases
-already there (same law only). A Mac whose tuning bundle comes from a build without a block
-is refused by `verify`: every release needs its own run, never an assumption that an older
-release's Audio Units still render the same.
+already there (same law only). `verify` looks up the block of the tuning's law build
+(crates/aurora-speaker-tuning src/reference.rs). v2 implements the laws of the reference
+release, 25G83: a tuning whose speaker files for its AID (speaker strips and property strips,
+protection sidecars, speaker graphs, Config/AID<n>.plist) are byte-identical to 25G83's is
+compiled with 25G83's laws on any macOS build, so v2 renders exactly what the 25G83 block
+measured for its key, and that block decides. Any other tuning keeps the build its bundle came
+from, and a Mac whose bundle comes from a build without a block is refused by `verify`: such a
+release needs its own run, never an assumption that an older release's Audio Units render it
+the same. The reference mapping makes v2 render like 25G83, not like the newer release; how
+close a newer release's own units come is what that release's block (when one is run) shows.
 
 A tuning is refused when: the macOS reference failed or is missing; v2's chain does not
 compile, has a stub, an unwired graph parameter or a compiler gap; the lane counts

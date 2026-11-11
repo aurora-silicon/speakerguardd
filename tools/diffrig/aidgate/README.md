@@ -61,11 +61,22 @@ into the file a Mac checks before v2 may take its speakers (`packaging/session/p
   (`--details`) stay in private, tainted directories.
 
 - The file holds one block per macOS release (`releases[].build`, format 2). `verify` takes the
-  block whose build is the one the Mac's tuning bundle came from. A bundle from a build with no
-  block is refused ("macOS 26A428 has no parity attestation"), even when another release's block
-  holds the same tuning key: that release's Audio Units, not this build's, were the reference.
-  New macOS builds therefore get coverage by a run of the steps below on that build, never by
-  inheritance from an older one.
+  block of the tuning's law build (`Tuning::law_build`, `crates/aurora-speaker-tuning/src/reference.rs`):
+  - v2 implements the laws of the reference release, 25G83. A tuning whose speaker files for its
+    AID (speaker strips and property strips, protection sidecars, speaker graphs,
+    `Config/AID<n>.plist`; not mic, ADM or DSP-database files) are byte-identical to 25G83's is
+    compiled with 25G83's laws whatever build the Mac runs, so v2 renders exactly what the 25G83
+    block measured for that key, and the 25G83 block decides. `verify` says so in its detail
+    ("tuning from macOS 26A434: its speaker files are byte-identical to 25G83's ...").
+  - Any other tuning keeps the build its bundle came from. A bundle from a build with no block is
+    refused ("macOS 26A428 has no parity attestation"), even when another release's block holds
+    the same tuning key: that release's Audio Units, not this build's, were the reference.
+  New tunings on new macOS builds therefore get coverage by a run of the steps below on that
+  build, never by inheritance from an older one. The reference mapping is a choice of target (v2
+  renders like 25G83), not a claim about the newer release's units; a run on the newer build
+  measures that. Every 25G83 AID was byte-identical in 26A428, 26B123, 26B8125, 25C56 and 25G72
+  when the mapping went in, and keys that pass in several blocks do so within a few hundredths of
+  a dB of each other.
 
 ### Floor residue
 
