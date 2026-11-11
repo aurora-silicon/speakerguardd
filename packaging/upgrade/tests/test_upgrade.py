@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-import base64, hashlib, json, os, plistlib, struct, sys, unittest
+import base64, contextlib, hashlib, json, os, plistlib, struct, sys, unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
@@ -174,10 +174,69 @@ class DualKernelRun(unittest.TestCase):
     verifies), and only then the setting is written and v2 restarted."""
 
     def test_order_and_setting(self):
+        calls, rc, iface = self.dual_run()
+        self.assertEqual(rc, "ok")
+        self.assertEqual(iface, "v2\n")
+        names = self.names(calls)
+        i = names.index
+        # the session stops before the lease and starts on the new graph before verify
+        self.assertLess(i("speakerguardd-provision run"), i("session_stop"))
+        self.assertLess(i("session_stop"), i("iface"))
+        self.assertLess(i("speakerguardd-provision activate"), i("session_start"))
+        self.assertLess(i("session_start"), i("speakerguardd-selfcheck verify"))
+        self.assertEqual(names.count("session_stop"), 1)
+        self.assertEqual(names.count("session_start"), 1)
+
+    def test_rollback_starts_the_session_on_the_legacy_graph(self):
+        calls, rc, iface = self.dual_run(verify_rc=1)
+        self.assertEqual(rc, "refused")
+        self.assertIsNone(iface)
+        names = self.names(calls)
+        i = names.index
+        last = len(names) - 1 - names[::-1].index("session_start")
+        self.assertLess(i("session_stop"), i("iface"))
+        legacy = calls.index(("iface", "Speaker Volume Unlock"))
+        self.assertLess(legacy, last)
+        self.assertLess(names.index("speakerguardd-provision deactivate"), last)
+        self.assertLess(last, i("legacy_start"))
+        self.assertNotIn(("systemctl", "restart", "speakerguardd-v2.service"), calls)
+
+    def test_session_that_will_not_stop_refuses_before_the_switch(self):
+        calls, rc, iface = self.dual_run(session_stop_ok=False)
+        self.assertEqual(rc, "refused")
+        names = self.names(calls)
+        self.assertNotIn(("iface", "Speaker Protection"), calls)
+        self.assertNotIn("speakerguardd-selfcheck run", names)
+        self.assertIn("legacy_start", names)
+        self.assertIn("session_start", names)
+
+    def test_session_stop_timeout_is_a_refusal(self):
+        import subprocess
+        from unittest import mock
+        from aurora_speaker_upgrade import upgrade as up
+
+        def run(argv, **kw):
+            if argv[-1] == "--help":
+                import types
+                return types.SimpleNamespace(returncode=0, stdout="session-stop session-start", stderr="")
+            raise subprocess.TimeoutExpired(argv, kw.get("timeout"))
+        with mock.patch.object(up, "tool", lambda n: "/x/" + n), mock.patch.object(up, "run", run), \
+                mock.patch.object(up, "v2_unit", return_value="speakerguardd-v2.service"), \
+                mock.patch.object(up, "say", lambda m: None):
+            with self.assertRaises(up.Refused):
+                up.session_stop()
+            up.session_start()  # never raises
+        self.assertGreater(up.SESSION_STOP_LIMIT_S, 15 + 10 + 15)
+
+    def names(self, calls):
+        return [c[0] if c[0] != "run" else os.path.basename(c[1][0]) + " " + c[1][1] for c in calls]
+
+    def dual_run(self, verify_rc=0, session_stop_ok=True):
         import tempfile, types
         from unittest import mock
         from aurora_speaker_upgrade import upgrade as up
         calls = []
+        rc = iface = None
         with tempfile.TemporaryDirectory() as d:
             store = os.path.join(d, "store")
             conf = os.path.join(d, "speakerguardd.conf")
@@ -194,31 +253,48 @@ class DualKernelRun(unittest.TestCase):
                     return True
 
             def run(argv, **kw):
-                calls.append(("run", tuple(argv)))
                 if argv[-1] == "--help":
-                    return types.SimpleNamespace(returncode=0, stdout="run verify --switch-interface", stderr="")
-                return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+                    return types.SimpleNamespace(returncode=0, stdout="run verify --switch-interface deactivate", stderr="")
+                calls.append(("run", tuple(argv)))
+                code = verify_rc if argv[1:2] == ["verify"] else 0
+                return types.SimpleNamespace(returncode=code, stdout="", stderr="")
+
+            def stop():
+                calls.append(("session_stop",))
+                if not session_stop_ok:
+                    raise up.Refused("the seat user's audio session did not stop")
             a = types.SimpleNamespace(store=store, adt=None, no_switch=False, force=False, scratch=os.path.join(d, "s"))
-            with mock.patch.object(up.collect, "Identity", Ident), \
-                    mock.patch.object(up, "interface_mode", return_value=("dual", "1")), \
-                    mock.patch.object(up, "acquire", return_value=({}, {"route": 1, "aid": "AID9"})), \
-                    mock.patch.object(up, "digest", return_value="dg"), \
-                    mock.patch.object(up.Store, "put_bundle", lambda self, b: None), \
-                    mock.patch.object(up.Store, "read_bundle", lambda self: None), \
-                    mock.patch.object(up, "PROVISION_CONF", os.path.join(d, "provision.conf")), \
-                    mock.patch.object(up, "V2_CONF", conf), \
-                    mock.patch.object(up, "tool", lambda name: "/x/" + name), \
-                    mock.patch.object(up, "run", run), \
-                    mock.patch.object(up, "legacy_stop", lambda: calls.append(("legacy_stop",))), \
-                    mock.patch.object(up, "interface_set", lambda card, v: calls.append(("iface", v))), \
-                    mock.patch.object(up, "systemctl", lambda *x: calls.append(("systemctl",) + x) or
-                                      types.SimpleNamespace(returncode=0, stdout="", stderr="")), \
-                    mock.patch.object(up, "v2_unit", return_value="speakerguardd-v2.service"), \
-                    mock.patch.object(up, "wait_v2_granted", return_value=True):
-                self.assertEqual(up.cmd_run(a), up.EXIT_OK)
-                with open(os.path.join(store, "interface")) as f:
-                    self.assertEqual(f.read(), "v2\n")
-        names = [c[0] if c[0] != "run" else os.path.basename(c[1][0]) + " " + c[1][1] for c in calls]
+            with contextlib.ExitStack() as es:
+                es.enter_context(mock.patch.object(up.collect, "Identity", Ident))
+                es.enter_context(mock.patch.object(up, "interface_mode", return_value=("dual", "1")))
+                es.enter_context(mock.patch.object(up, "acquire", return_value=({}, {"route": 1, "aid": "AID9"})))
+                es.enter_context(mock.patch.object(up, "digest", return_value="dg"))
+                es.enter_context(mock.patch.object(up.Store, "put_bundle", lambda self, b: None))
+                es.enter_context(mock.patch.object(up.Store, "read_bundle", lambda self: None))
+                es.enter_context(mock.patch.object(up, "PROVISION_CONF", os.path.join(d, "provision.conf")))
+                es.enter_context(mock.patch.object(up, "V2_CONF", conf))
+                es.enter_context(mock.patch.object(up, "tool", lambda name: "/x/" + name))
+                es.enter_context(mock.patch.object(up, "run", run))
+                es.enter_context(mock.patch.object(up, "legacy_stop", lambda: calls.append(("legacy_stop",))))
+                es.enter_context(mock.patch.object(up, "legacy_start", lambda: calls.append(("legacy_start",))))
+                es.enter_context(mock.patch.object(up, "pcm_settle", lambda card: True))
+                es.enter_context(mock.patch.object(up, "session_stop", stop))
+                es.enter_context(mock.patch.object(up, "session_start", lambda: calls.append(("session_start",))))
+                es.enter_context(mock.patch.object(up, "interface_set", lambda card, v: calls.append(("iface", v))))
+                es.enter_context(mock.patch.object(up, "systemctl", lambda *x: calls.append(("systemctl",) + x) or types.SimpleNamespace(returncode=0, stdout="", stderr="")))
+                es.enter_context(mock.patch.object(up, "v2_unit", return_value="speakerguardd-v2.service"))
+                es.enter_context(mock.patch.object(up, "say", lambda m: None))
+                es.enter_context(mock.patch.object(up, "wait_v2_granted", return_value=True))
+                try:
+                    rc = "ok" if up.cmd_run(a) == up.EXIT_OK else "other"
+                except up.Refused:
+                    rc = "refused"
+                iface = up.read_text(os.path.join(store, "interface"))
+        return calls, rc, iface
+
+    def test_order_before_the_session_hooks(self):
+        calls, rc, _ = self.dual_run()
+        names = self.names(calls)
         i = names.index
         self.assertLess(i("legacy_stop"), i("speakerguardd-provision run"))
         self.assertLess(i("speakerguardd-provision run"), i("iface"))
@@ -376,13 +452,17 @@ class RevertSettle(unittest.TestCase):
         with mock.patch.object(up, "systemctl", lambda *a: order.append(("systemctl",) + a) or types.SimpleNamespace(returncode=0)), \
                 mock.patch.object(up, "interface_set", lambda c, v: order.append(("interface", v))), \
                 mock.patch.object(up, "graph_deactivate", lambda: order.append(("graph_deactivate",))), \
+                mock.patch.object(up, "session_stop", lambda: order.append(("session_stop",))), \
+                mock.patch.object(up, "session_start", lambda: order.append(("session_start",))), \
                 mock.patch.object(up, "pcm_settle", lambda card: order.append(("settle", card)) or True), \
                 mock.patch.object(up, "legacy_start", lambda: order.append(("legacy_start",))), \
                 mock.patch.object(up, "v2_unit", return_value="speakerguardd-v2.service"), \
                 mock.patch.object(up, "PROVISION_CONF", "/nonexistent/sgb6-provision.conf"):
             up.back_to_legacy(store, {}, "dual", "AppleJ316")
         names = [o[0] for o in order]
-        self.assertEqual(names[-4:], ["interface", "graph_deactivate", "settle", "legacy_start"])
+        self.assertEqual(names[0], "session_stop")
+        self.assertEqual(order[1], ("systemctl", "stop", "speakerguardd-v2.service"))
+        self.assertEqual(names[-5:], ["interface", "graph_deactivate", "session_start", "settle", "legacy_start"])
         self.assertIn(("settle", "AppleJ316"), order)
 
     def test_settle_waits_for_a_steady_state(self):
