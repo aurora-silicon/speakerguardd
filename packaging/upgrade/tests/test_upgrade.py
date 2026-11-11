@@ -167,6 +167,50 @@ class SpeakerId(unittest.TestCase):
         self.assertIsNone(at.probe_speaker_id(collect.FakeRun(I(), "25C56", None)))
 
 
+class UnknownSpeakerIdGoesToRoute3(unittest.TestCase):
+    """An AID that selects its tuning by speaker ID, with no speaker ID from
+    the boot chain: routes 1 and 2 read the same tuning and cannot select
+    it, but the macOS collection (route 3) records the ID and must still be
+    tried."""
+
+    def test_route3_after_unknown_speaker_id(self):
+        import tempfile, types
+        from unittest import mock
+        from aurora_speaker_upgrade import upgrade as up
+        from aurora_speaker_upgrade.asahi_firmware import audio_tuning as at
+        tried = []
+        unit = "u" * 64
+        bundle = {at.MANIFEST: json.dumps({"unit_id": unit, "aid": "AID40", "macos_build": "26A428",
+                                           "speaker_id": 3}).encode()}
+
+        def r0(identity, a):
+            tried.append("0")
+            raise collect.CollectError("no installer bundle on this Mac")
+
+        def r1(identity, a, spid, known, scratch):
+            tried.append("1")
+            raise collect.SpeakerIdUnknown("AID40 selects its speaker tuning by speaker ID")
+
+        def r2(identity, a, spid, known, scratch):
+            tried.append("2")
+            return bundle, {"route": "2", "source": "ipsw"}
+
+        def r3(identity, a):
+            tried.append("3")
+            return bundle, {"route": "3", "source": "collection"}
+
+        with tempfile.TemporaryDirectory() as d:
+            a = types.SimpleNamespace(route="auto", chosen=None, installer_dirs=[], scratch=d, collection="c.tar.gz")
+            ident = types.SimpleNamespace(unit=unit)
+            with mock.patch.object(up, "speaker_id_source", return_value=(None, False, None)), \
+                    mock.patch.object(up, "route0", r0), mock.patch.object(up, "route1", r1), \
+                    mock.patch.object(up, "route2", r2), mock.patch.object(up, "route3", r3):
+                b, prov = up.acquire(ident, a)
+        self.assertEqual(tried, ["0", "1", "3"])
+        self.assertEqual(prov["route"], "3")
+        self.assertEqual(prov["speaker_id"], 3)
+
+
 class DualKernelRun(unittest.TestCase):
     """cmd_run on a dual kernel (linux 98cb6a86+): legacy stops, the tuning
     compiles, the interface goes to the lease right before the self-check

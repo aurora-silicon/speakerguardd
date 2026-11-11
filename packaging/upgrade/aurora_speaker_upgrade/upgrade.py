@@ -251,7 +251,9 @@ def acquire(identity, a):
     os.makedirs(a.scratch, mode=0o700, exist_ok=True)
     scratch = tempfile.mkdtemp(prefix="scratch-", dir=a.scratch)
     try:
-        for r in routes:
+        todo = list(routes)
+        while todo:
+            r = todo.pop(0)
             try:
                 if r == "0":
                     b, prov = route0(identity, a)
@@ -263,7 +265,10 @@ def acquire(identity, a):
                     b, prov = route3(identity, a)
             except collect.SpeakerIdUnknown as e:
                 reasons.append(f"route {r}: {e}")
-                break  # every other route reads the same tuning: go to route 3
+                # Every other route reads the same tuning: only route 3 (the
+                # macOS collection, which records the speaker ID) can give it.
+                todo = [x for x in todo if x == "3"]
+                continue
             except Exception as e:
                 reasons.append(f"route {r}: {e}")
                 continue
