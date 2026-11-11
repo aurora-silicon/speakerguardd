@@ -20,6 +20,11 @@ TGT=${CARGO_TARGET_DIR:-$WT/target}
 CLI=$TGT/release/aurora-speaker-tuning
 FX=$WT/packaging/session/fixtures
 WIRING=$WT/packaging/session/wiring.py
+if command -v shasum >/dev/null 2>&1; then
+  SHA256=(shasum -a 256)
+else
+  SHA256=(sha256sum)
+fi
 
 for B in "$@"; do
   M=$(tar -xzOf "$B" audio-tuning/manifest.json 2>/dev/null)
@@ -36,7 +41,7 @@ for B in "$@"; do
   # Binding: own unit -> "unit calibration in use"; another unit must refuse; another board must refuse.
   BIND=-
   if [ -n "$UNIT" ]; then
-    OTHER=$(printf 'aurora-prov-other' | shasum -a 256 | cut -d' ' -f1)
+    OTHER=$(printf 'aurora-prov-other' | "${SHA256[@]}" | cut -d' ' -f1)
     "$CLI" compile --board "$PB" --unit-id "$OTHER" --bundle "$B" -o "$OUT/neg.blob" >"$OUT/$TAG.neg-unit.txt" 2>&1; NU=$?
     "$CLI" compile --board j000 --unit-id "$UNIT" --bundle "$B" -o "$OUT/neg.blob" >"$OUT/$TAG.neg-board.txt" 2>&1; NB=$?
     rm -f "$OUT/neg.blob"
