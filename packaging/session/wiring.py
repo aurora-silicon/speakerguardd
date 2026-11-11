@@ -116,9 +116,11 @@ TRANSPORTS = {
     # sound/soc/apple/mca.c: S16_LE, S24_LE, S32_LE
     "apple,mca": {"transport": "mca", "formats": ["S16_LE", "S24_LE", "S32_LE"], "sense_batch": True, "speaker_headroom": 0,
                   "speaker_irq": True},
-    # sound/soc/apple/aop_spkr.rs (T6040 speaker service): S24_LE playback, S16_LE sense
+    # sound/soc/apple/aop_spkr.rs (T6040 speaker service): S24_LE playback, S16_LE sense.
+    # Its PCMs have one width on every Mac, whatever the number of amps: six
+    # playback channels and twelve sense channels (see PCM widths below).
     "apple,t6041-aop-audio": {"transport": "aop-spkr", "formats": ["S24_LE"], "sense_batch": False, "speaker_headroom": 256,
-                              "speaker_irq": True},
+                              "speaker_irq": True, "speaker_channels": 6, "sense_channels": 12},
     # sound/soc/apple/aop_t8140.rs: S32_LE playback, no sense
     "apple,t8140-aop-audio": {"transport": "aop-t8140", "formats": ["S32_LE"], "sense_batch": True, "speaker_headroom": 0,
                               "speaker_irq": True},
@@ -130,6 +132,15 @@ TRANSPORTS = {
 # Newer device trees omit the generic MCA fallback. Both compatibles bind
 # mca.c; share the entry so back-ends using either name are the same driver.
 TRANSPORTS["apple,t8103-mca"] = TRANSPORTS["apple,mca"]
+# The T8132 AOP (MacBook Air M4) runs the same speaker service and binds the
+# same driver; its node lists the T6041 compatible as a fallback.
+TRANSPORTS["apple,t8132-aop-audio"] = TRANSPORTS["apple,t6041-aop-audio"]
+# PCM widths. A transport without "speaker_channels"/"sense_channels" offers
+# PCMs exactly as wide as the link's amps (one playback channel and one V/I
+# pair each). A transport with them offers that width only, and the amps'
+# lanes are the first ones: the amps' TDM slots and sense slots are checked to
+# be 0..n-1 and 0..2n-1 (speaker_amps), and the rest carry nothing of theirs.
+
 # The self-check's probe order on the speaker PCM.
 FORMAT_ORDER = ["S24_LE", "S32_LE", "S16_LE"]
 # ALSA format -> PipeWire audio.format (the 24-bit samples sit in 32-bit words).
@@ -434,6 +445,7 @@ def describe(hw, w):
     if plugin is None:
         raise Refused(f"no sgv2 plugin variant for {n} amps and {s} sense channels")
     fmt = speaker_format(t)
+    speaker_pcm, sense_pcm = pcm_widths(t, n, len(w["sense"]))
     return {
         "key": machine_key(hw),
         "board": hw["board"],
@@ -442,6 +454,9 @@ def describe(hw, w):
         "transport": t["transport"],
         "amps": n,
         "sense": s,
+        # the PCMs' own widths: the amps' lanes come first (PCM widths above)
+        "speaker_pcm": speaker_pcm,
+        "sense_pcm": sense_pcm,
         "rate": w["rate"],
         "plugin": plugin,
         "alsa_format": fmt,
@@ -451,6 +466,18 @@ def describe(hw, w):
         "sense_batch": t["sense_batch"],
         "speaker_irq": t["speaker_irq"],
     }
+
+
+def pcm_widths(t, amps, sense):
+    """The channel counts the speaker and sense PCMs open with, for `amps`
+    amps and `sense` sense lanes on transport `t` (PCM widths above)."""
+    speaker_pcm = t.get("speaker_channels", amps)
+    sense_pcm = t.get("sense_channels", sense) if sense else 0
+    if speaker_pcm < amps:
+        raise Refused(f"{amps} amps on a {speaker_pcm}-channel speaker PCM ({t['transport']})")
+    if sense_pcm < sense:
+        raise Refused(f"{sense} sense lanes on a {sense_pcm}-channel sense PCM ({t['transport']})")
+    return speaker_pcm, sense_pcm
 
 
 def _speaker_link(hw):

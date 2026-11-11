@@ -304,6 +304,10 @@ def pipewire_conf(m, c, w, source=None, voicing_pre=None):
     enabled = voicing_enabled(c.get("board", m)) if voicing_pre is None else voicing_pre
     n = names(m)
     amps, sense = c["amps"], c["sense"]
+    # The PCMs' own widths (wiring.pcm_widths). A self-check record written
+    # before the description carried them is of a Mac whose PCMs are as wide
+    # as its amps: nothing else passed the switch test.
+    speaker_pcm, sense_pcm = c.get("speaker_pcm", amps), c.get("sense_pcm", sense)
     uri = f"https://aurora-silicon.org/lv2/sgv2#{c['plugin']}"
     # filter-chain feeds capture channel i to inputs[i] and playback channel
     # j from outputs[j]: the lists put each physical channel on its unit port.
@@ -334,8 +338,8 @@ def pipewire_conf(m, c, w, source=None, voicing_pre=None):
             api.alsa.path          = "hw:CARD={c['card']},DEV=2"
             audio.format           = "S16LE"
             audio.rate             = {c['rate']}
-            audio.channels         = {sense}
-            audio.position         = {aux(sense)}
+            audio.channels         = {sense_pcm}
+            audio.position         = {aux(sense_pcm)}
             api.alsa.period-size   = {QUANTUM}
             api.alsa.headroom      = {c['sense_headroom']}{sense_batch}
             node.group             = "{n['group']}"
@@ -370,8 +374,8 @@ context.objects = [
             api.alsa.path          = "hw:CARD={c['card']},DEV=1"
             audio.format           = "{c['speaker_format']}"
             audio.rate             = {c['rate']}
-            audio.channels         = {amps}
-            audio.position         = {aux(amps)}
+            audio.channels         = {speaker_pcm}
+            audio.position         = {aux(speaker_pcm)}
             api.alsa.period-size   = {QUANTUM}
             api.alsa.headroom      = {c['speaker_headroom']}{speaker_irq}
             node.group             = "{n['group']}"

@@ -461,6 +461,12 @@ def stats(raw, n):
     return {"frames": f, "ch": out}
 
 
+def amp_lanes(st, amps):
+    """The amps' V/I lanes of a capture's statistics: the first 2 * amps
+    channels of a sense PCM that may be wider (wiring.pcm_widths)."""
+    return st and dict(st, ch=st["ch"][: 2 * amps])
+
+
 def classify(st):
     return ["live" if c["distinct"] >= LIVE else "quiet" if c["distinct"] <= QUIET else "unclear" for c in st["ch"]]
 
@@ -474,8 +480,11 @@ class Streams:
     order. Every playback sample is zero and the grant is held once.
     """
 
-    def __init__(self, ctl, card, spk_dev, sense_dev, amps, rate):
+    def __init__(self, ctl, card, spk_dev, sense_dev, amps, rate, widths=None):
         self.ctl, self.card, self.spk, self.sense, self.amps = ctl, card, spk_dev, sense_dev, amps
+        # The PCMs' own widths (wiring.pcm_widths): a transport may fix them
+        # wider than the amps' lanes, which then come first.
+        self.spk_ch, self.sense_ch = widths or (amps, 2 * amps)
         self.rate = rate
         self.fmt = None
         self.idx = None
@@ -487,13 +496,13 @@ class Streams:
         self.capture_data = bytearray()
         self.capture_total = 0
         self.capture_error = None
-        self.frame_bytes = 4 * amps  # V/I, S16_LE
+        self.frame_bytes = 2 * self.sense_ch  # S16_LE
         self.capture_limit = 2 * rate * self.frame_bytes
         self.capture_deadline = None
 
     def _play(self, fmt):
         return subprocess.Popen(
-            ["aplay", "--fatal-errors", "-q", "-D", f"hw:CARD={self.card},DEV={self.spk}", "-f", fmt, "-c", str(self.amps),
+            ["aplay", "--fatal-errors", "-q", "-D", f"hw:CARD={self.card},DEV={self.spk}", "-f", fmt, "-c", str(self.spk_ch),
              "-r", str(self.rate), "-t", "raw", "/dev/zero"],
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
         )
@@ -556,7 +565,7 @@ class Streams:
         self.capture_deadline = time.monotonic() + 30
         self.rec = subprocess.Popen(
             ["arecord", "--fatal-errors", "-q", "-D", f"hw:CARD={self.card},DEV={self.sense}",
-             "-f", "S16_LE", "-c", str(2 * self.amps), "-r", str(self.rate),
+             "-f", "S16_LE", "-c", str(self.sense_ch), "-r", str(self.rate),
              "--period-time=10000", "--buffer-time=80000", "-t", "raw", "-"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
@@ -617,7 +626,7 @@ class Streams:
                     raise wiring.Refused("sense capture did not deliver a complete window within five seconds")
                 self.capture_cv.wait(0.05)
         self._health()
-        return stats(raw, 2 * self.amps)
+        return amp_lanes(stats(raw, self.sense_ch), self.amps)
 
     def stop(self):
         """Release both streams and the grant, including partial startup."""
@@ -678,8 +687,9 @@ def switch_codes(n):
     return k, [frozenset(c) for c in itertools.combinations(range(k), 2)][:n]
 
 
-def check_sense(ctl, idx, card, devs, w, runs):
-    """The switch test. Returns (errors, speaker format)."""
+def check_sense(ctl, idx, card, devs, w, runs, widths=None):
+    """The switch test. Returns (errors, speaker format). `widths` are the
+    speaker and sense PCMs' channel counts where they are not the amps'."""
     errs = []
     amps = w["amps"]
     n = len(amps)
@@ -696,7 +706,7 @@ def check_sense(ctl, idx, card, devs, w, runs):
         saved[nm] = v
     switches = [(p, a, kind) for p, a in enumerate(amps) for kind in ("V", "I")]
     k, codes = switch_codes(len(switches))
-    st = Streams(ctl, card, devs[0], devs[1], n, w["rate"])
+    st = Streams(ctl, card, devs[0], devs[1], n, w["rate"], widths)
     try:
         for nm in saved:
             switch_set(ctl, nm, "on")
@@ -1079,7 +1089,7 @@ def active(idx, card, w, report, args=None):
             amixer(card, "-q", "cset", f"name={mux}", "Secondary")
         runs = {}
         report["runs"] = runs
-        sense_errs, fmt = check_sense(ctl, idx, card, (spk, sense), w, runs)
+        sense_errs, fmt = check_sense(ctl, idx, card, (spk, sense), w, runs, pcm_widths(report.get("machine")))
         errs += sense_errs
         report["speaker_format"] = fmt
         errs += format_errors(report.get("machine"), fmt)
@@ -1089,6 +1099,11 @@ def active(idx, card, w, report, args=None):
         if old_mux is not None:
             amixer(card, "-q", "cset", f"name={mux}", old_mux)
     return errs
+
+
+def pcm_widths(desc):
+    """The PCM widths of the machine description, when there is one."""
+    return (desc["speaker_pcm"], desc["sense_pcm"]) if desc else None
 
 
 def format_errors(desc, fmt):
