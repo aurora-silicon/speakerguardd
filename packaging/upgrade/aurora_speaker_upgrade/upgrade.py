@@ -72,6 +72,17 @@ GRANT_WAIT_S = 30
 # (at most PCM_SETTLE_S).
 PCM_SETTLE_S = 10
 PCM_QUIET_S = 1.5
+# The seat user's audio session stops before the kernel's speaker interface
+# switches and starts after it (speakerguardd-provision session-stop,
+# session-start). A session left running across the switch keeps starting
+# the speaker PCM the new interface refuses (EPERM): PipeWire raises a node
+# error for each refused start, and on a loaded host WirePlumber then
+# outlived its 90 s stop timeout, longer than the old 60 s restart bound.
+# Provisioning's stop is bounded (15 s grace, SIGKILL, 10 s, 15 s slack);
+# these limits are above its worst case.
+SESSION_STOP_LIMIT_S = 15 + 10 + 15 + 30
+# the graph unit (TimeoutStartSec=180) and the units' start wait (30 s)
+SESSION_START_LIMIT_S = 180 + 30 + 30
 PARITY = ("/usr/share/speakerguardd/parity.json",)
 MARK = "# aurora-speaker-upgrade: the bundle collected for this Mac"
 
@@ -380,8 +391,10 @@ def selfcheck(a, mode=None):
         # gate kept the older daemons), and a revert removed the graph:
         # generate it from the record just made and bring the session onto
         # it (as speakerguardd-selfcheck.service's ExecStartPost does at
-        # boot), so verify's graph step sees it.
+        # boot), so verify's graph step sees it. The session stopped before
+        # the switch (session_stop) starts on it.
         graph_activate()
+        session_start()
     if re.search(r"\bverify\b", h.stdout + h.stderr):
         r = run_v2([p, "verify", "--params", PARAMS, "--json", js])
         code = r.returncode
@@ -480,6 +493,35 @@ def graph_deactivate():
         return
     r = run_v2([p, "deactivate", "--graph-unit", graph_unit()])
     sys.stderr.write(r.stderr[-1000:])
+
+
+def _session(verb, limit):
+    p = tool("speakerguardd-provision")
+    if not p or verb not in run([p, "--help"]).stdout:
+        return None
+    argv = [p, verb] + (["--graph-unit", graph_unit()] if verb == "session-start" else [])
+    try:
+        r = run_v2(argv, timeout=limit)
+    except subprocess.TimeoutExpired:
+        say(f"speakerguardd-provision {verb} did not finish within {limit} s")
+        return False
+    sys.stderr.write(r.stderr[-2000:])
+    return r.returncode == 0
+
+
+def session_stop():
+    """The seat user's PipeWire, WirePlumber and pipewire-pulse stop before
+    the speaker interface switches. A unit that will not stop even after
+    SIGKILL refuses the switch."""
+    if _session("session-stop", SESSION_STOP_LIMIT_S) is False:
+        raise Refused("the seat user's audio session did not stop: the legacy protection keeps the speakers")
+
+
+def session_start():
+    """The session session_stop stopped starts again (on whatever graph is
+    in place now). Never fails: a session that does not come back only
+    means no sound until the user logs in again."""
+    _session("session-start", SESSION_START_LIMIT_S)
 
 
 def legacy_wanted():
@@ -697,13 +739,18 @@ def check_hardware(sc_tool, card, params, state, conf):
     paused = [u for u in legacy_units() if systemctl("is-active", "-q", u).returncode == 0]
     for u in paused:
         systemctl("stop", u)
+    stopped = False
     try:
+        session_stop()
+        stopped = True
         r = run([sc_tool, "run", "--switch-interface", "--force", "--params", params, "--state", state,
                  "--", *v2_tuning_args(conf)])
     finally:
         # Back to the interface it found, not always the legacy one.
         with contextlib.suppress(Refused):
             interface_set(card, before)
+        if stopped:
+            session_start()
         for u in paused:
             systemctl("reset-failed", u)
             systemctl("start", "--no-block", u)
@@ -770,6 +817,11 @@ def _cmd_run(a):
             legacy_stop()
         provision(store, a)
         if mode == "dual":
+            # No session may run across the switch: it would keep starting
+            # the speaker PCM the lease refuses. It starts again on v2's
+            # graph once the self-check made it (selfcheck), or on the
+            # distribution's on a rollback (back_to_legacy).
+            session_stop()
             # The self-check takes a v2 lease itself: v2 must own the
             # interface while it runs; the kernel falls back to legacy (from
             # the floor) 30 s after the last owner closes, and speakerguardd's
@@ -867,10 +919,17 @@ def back_to_legacy(store, state, mode, card):
     state["switched"] = False
     store.save(state)
     if mode == "dual":
+        # The session first (it would keep starting the speaker PCM once v2
+        # releases it), then v2, then the interface; the session starts
+        # again on the distribution's graph. After a session_stop on the
+        # way up this stops nothing and starts what ran before.
+        with contextlib.suppress(Refused):
+            session_stop()
         systemctl("stop", v2_unit())
         with contextlib.suppress(Refused):
             interface_set(card, IF_LEGACY)
         graph_deactivate()
+        session_start()
         # speakersafetyd reads the sense PCM's rate range and then opens it
         # at the lowest rate; when the restarted session's WirePlumber opened
         # the speaker PCM at 48 kHz in between, the open failed on the I2S

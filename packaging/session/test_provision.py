@@ -574,7 +574,7 @@ class Graph(Base):
                           f"result=pass\nkernel={os.uname().release}\nparams_sha256={digest}\n")
         started = []
 
-        def refresh(user, changed_us, unit):
+        def refresh(p, user, changed_us, unit):
             # systemctl --user start <unit>: runs graph-user to completion
             t = time.monotonic()
             self.assertEqual(prov.cmd_graph_user(self.args("graph-user", switch_test_wait=5), self.p), 0)
@@ -768,6 +768,187 @@ class UserManager(unittest.TestCase):
             prov.os.path.exists = real_exists
         self.assertNotEqual(r.returncode, 0)
 
+
+
+class FakeUserManager:
+    """A stand-in for the seat user's systemd --user (user_systemctl), on a
+    fake clock: units stop at once, or (hung) ignore SIGTERM and stay
+    "deactivating" until SIGKILL, as WirePlumber did on a swapping j414s."""
+
+    def __init__(self, active, hung=(), unkillable=(), session=True):
+        self.now = 0.0
+        self.state = {u: ("active" if u in active else "inactive") for u in prov.SESSION_UNITS}
+        self.hung, self.unkillable, self.session = set(hung), set(unkillable), session
+        self.calls = []
+        self.killed = []
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, t):
+        self.now += t
+
+    def __call__(self, user, *a, timeout=60):
+        self.calls.append((self.now, a))
+        self.now += 0.05
+        if not self.session:
+            return types.SimpleNamespace(returncode=1, stdout="", stderr="no user bus")
+        if a[0] == "show":
+            # PipeWire's stop waits for WirePlumber's (WirePlumber is ordered after it)
+            for u in ("pipewire.service", "pipewire.socket"):
+                if self.state.get(u) == "stopping" and self.state["wireplumber.service"] in ("inactive", "failed"):
+                    self.state[u] = "inactive"
+            units = [x for x in a[1:] if not x.startswith("--")]
+            shown = lambda u: "active" if self.state[u] == "stopping" else self.state[u]  # noqa: E731
+            out = "\n\n".join(f"Id={u}\nLoadState=loaded\nActiveState={shown(u)}" for u in units if u in self.state)
+            return types.SimpleNamespace(returncode=0, stdout=out + "\n", stderr="")
+        units = [x for x in a[1:] if not x.startswith("--")]
+        if a[0] == "stop":
+            for u in units:
+                if u in self.hung:
+                    self.state[u] = "deactivating"
+                elif u in ("pipewire.service", "pipewire.socket") and "wireplumber.service" in self.hung:
+                    self.state[u] = "stopping"  # queued behind WirePlumber, shown as active
+                else:
+                    self.state[u] = "inactive"
+        elif a[0] == "kill":
+            assert "--signal=SIGKILL" in a
+            self.killed += units
+            for u in units:
+                if u not in self.unkillable:
+                    self.state[u] = "failed"
+        elif a[0] == "reset-failed":
+            for u in units:
+                if self.state.get(u) == "failed":
+                    self.state[u] = "inactive"
+        elif a[0] == "start":
+            for u in units:
+                if u in self.state:
+                    self.state[u] = "active"
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def verbs(self):
+        return [c[1][0] for c in self.calls if c[1][0] != "show"]
+
+
+class SessionStopStart(unittest.TestCase):
+    """aurora-speaker-upgrade stops the seat user's audio session before the
+    kernel's speaker interface switches and starts it after: bounded, with
+    SIGKILL for a unit still stopping after the grace."""
+
+    ALL = prov.SESSION_UNITS
+
+    def setUp(self):
+        self.t = tempfile.mkdtemp()
+        self.p = prov.Paths(self.t)
+
+    def tearDown(self):
+        shutil.rmtree(self.t)
+
+    @contextlib.contextmanager
+    def manager(self, m):
+        from unittest import mock
+        with mock.patch.object(prov, "user_systemctl", m), mock.patch.object(prov.time, "monotonic", m.monotonic), \
+                mock.patch.object(prov.time, "sleep", m.sleep), mock.patch.object(prov, "log", lambda *a: None):
+            yield m
+
+    def test_normal_stop_then_start(self):
+        m = FakeUserManager(active=self.ALL)
+        with self.manager(m):
+            out = prov.session_stop(self.p, "u")
+            self.assertEqual(out["stopped"], list(self.ALL))
+            self.assertEqual((out["killed"], out["stuck"]), ([], []))
+            self.assertLess(out["seconds"], 2)
+            self.assertTrue(all(m.state[u] == "inactive" for u in self.ALL))
+            self.assertEqual(prov.read_session_record(self.p), ("u", list(self.ALL)))
+            self.assertNotIn("kill", m.verbs())
+            self.assertEqual(prov.session_start(self.p, "speakerguardd-graph.service"), [])
+        self.assertTrue(all(m.state[u] == "active" for u in self.ALL))
+        self.assertFalse(os.path.exists(self.p.session_stopped))
+        starts = [c[1] for c in m.calls if c[1][0] == "start"]
+        # the graph unit links the graph before PipeWire reads its configuration
+        self.assertEqual(starts[0], ("start", "speakerguardd-graph.service"))
+        self.assertEqual(starts[1][:2], ("start", "--no-block"))
+        self.assertNotIn("try-restart", m.verbs())
+
+    def test_hung_wireplumber_is_killed_after_the_grace(self):
+        m = FakeUserManager(active=self.ALL, hung={"wireplumber.service"})
+        with self.manager(m):
+            out = prov.session_stop(self.p, "u", grace=15, kill_wait=10)
+        # only the unit that ignored SIGTERM; PipeWire, queued behind it, stops by itself
+        self.assertEqual(out["killed"], ["wireplumber.service"])
+        self.assertEqual(m.killed, ["wireplumber.service"])
+        self.assertEqual(out["stuck"], [])
+        self.assertTrue(all(m.state[u] == "inactive" for u in self.ALL))
+        kill_at = [c[0] for c in m.calls if c[1][0] == "kill"]
+        self.assertEqual(len(kill_at), 1)
+        self.assertGreaterEqual(kill_at[0], 15)
+        self.assertLess(kill_at[0], 17)
+        self.assertLess(out["seconds"], 15 + 10 + prov.CALL_SLACK_S)
+        self.assertEqual(m.state["wireplumber.service"], "inactive")  # reset-failed after the kill
+        self.assertIn("reset-failed", m.verbs())
+
+    def test_unkillable_is_bounded_and_fails(self):
+        m = FakeUserManager(active=self.ALL, hung={"wireplumber.service"}, unkillable={"wireplumber.service"})
+        with self.manager(m):
+            out = prov.session_stop(self.p, "u", grace=15, kill_wait=10)
+            self.assertEqual(out["stuck"], ["wireplumber.service"])
+            self.assertLessEqual(m.now, 15 + 10 + prov.CALL_SLACK_S + 1)
+            a = types.SimpleNamespace(user="u", stop_grace=15, kill_wait=10, etc="/etc")
+            self.assertEqual(prov.cmd_session_stop(a, self.p), 1)
+
+    def test_only_what_ran_starts_again(self):
+        m = FakeUserManager(active={"pipewire.socket", "pipewire.service", "wireplumber.service"})
+        with self.manager(m):
+            prov.session_stop(self.p, "u")
+            self.assertEqual(prov.read_session_record(self.p)[1], ["pipewire.socket", "wireplumber.service", "pipewire.service"])
+            prov.session_start(self.p, "g.service")
+        self.assertEqual(m.state["pipewire-pulse.service"], "inactive")
+        self.assertEqual(m.state["pipewire-pulse.socket"], "inactive")
+        self.assertEqual(m.state["wireplumber.service"], "active")
+
+    def test_a_second_stop_keeps_the_first_record(self):
+        # the rollback stops again (nothing runs any more) and must still
+        # start what ran before the first stop
+        m = FakeUserManager(active=self.ALL)
+        with self.manager(m):
+            prov.session_stop(self.p, "u")
+            out = prov.session_stop(self.p, "u")
+            self.assertEqual(out["stopped"], [])
+            self.assertEqual(prov.read_session_record(self.p), ("u", list(self.ALL)))
+            prov.session_start(self.p, "g.service")
+        self.assertTrue(all(m.state[u] == "active" for u in self.ALL))
+
+    def test_no_session(self):
+        m = FakeUserManager(active=self.ALL, session=False)
+        with self.manager(m):
+            self.assertIsNone(prov.session_stop(self.p, "u"))
+            self.assertEqual(prov.session_start(self.p, "g.service"), [])
+        self.assertFalse(os.path.exists(self.p.session_stopped))
+        self.assertEqual(m.verbs(), [])
+
+    def test_start_without_a_record_does_nothing(self):
+        m = FakeUserManager(active=())
+        with self.manager(m):
+            self.assertEqual(prov.session_start(self.p, "g.service"), [])
+        self.assertEqual(m.calls, [])
+
+    def test_refresh_restarts_bounded_never_try_restart(self):
+        m = FakeUserManager(active=self.ALL, hung={"wireplumber.service"})
+        real = m.__call__
+
+        def mgr(user, *a, timeout=60):
+            if a[0] == "show" and "--property=ActiveEnterTimestampMonotonic" in a:
+                m.calls.append((m.now, a))
+                return types.SimpleNamespace(returncode=0, stdout="ActiveState=active\nActiveEnterTimestampMonotonic=5\n", stderr="")
+            return real(user, *a, timeout=timeout)
+        mgr.monotonic, mgr.sleep = m.monotonic, m.sleep
+        with self.manager(mgr):
+            prov.refresh_session(self.p, "u", 10, "g.service")
+        self.assertNotIn("try-restart", m.verbs())
+        self.assertIn("kill", m.verbs())
+        self.assertTrue(all(m.state[u] == "active" for u in self.ALL))
+        self.assertLess(m.now, 15 + 10 + prov.CALL_SLACK_S + prov.START_WAIT_S)
 
 class LV2Shadow(unittest.TestCase):
     """The self-check fails on any sgv2 plugin a session could load instead

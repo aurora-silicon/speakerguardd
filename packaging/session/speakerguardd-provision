@@ -12,6 +12,8 @@ manual step, before the self-check and the supervisor start.
     speakerguardd-provision sleep    --unit UNIT                (root, speakerguardd-sleep.service, before sleep)
     speakerguardd-provision wake     --unit UNIT                (root, the same unit's stop, after the resume)
     speakerguardd-provision status
+    speakerguardd-provision session-stop  [--user U]            (root, before a speaker interface switch)
+    speakerguardd-provision session-start [--graph-unit UNIT]   (root, after it)
 
 `run`:
 1. **Compile** the installer's tuning bundle (the vendor firmware tree, then
@@ -138,6 +140,9 @@ class Paths:
         # The self-check deferred its switch test until after login
         # (speakerguardd-selfcheck DEFERRED)
         self.deferred = os.path.join(self.graph, "selfcheck.deferred")
+        # The seat user's audio session units stopped for an interface switch
+        # (session-stop), for session-start
+        self.session_stopped = os.path.join(self.graph, "session.stopped")
         self.sleep = r("/run/speakerguardd-sleep")
         self.hold = os.path.join(self.sleep, "hold")
         self.proc_asound = r("/proc/asound")
@@ -654,7 +659,7 @@ def graph_digest(p):
     return h.hexdigest()
 
 
-def user_systemctl(user, *a):
+def user_systemctl(user, *a, timeout=60):
     """The user's own service manager, reached as that user on the user's
     bus. Not `systemctl --user --machine=USER@`: that goes through machined
     and the system bus broker, which has to write to the caller's output,
@@ -673,9 +678,155 @@ def user_systemctl(user, *a):
     cmd = ["setpriv", f"--reuid={pw.pw_uid}", f"--regid={pw.pw_gid}", "--init-groups", "--",
            "systemctl", "--user", *a]
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=60, env=env, stdin=subprocess.DEVNULL)
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env, stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
-        return subprocess.CompletedProcess(cmd, 124, "", f"systemctl --user {' '.join(a)} timed out after 60 s")
+        return subprocess.CompletedProcess(cmd, 124, "", f"systemctl --user {' '.join(a)} timed out after {timeout:.0f} s")
+
+
+# The seat user's audio session, in the order it is stopped: the clients'
+# servers first, PipeWire last; the sockets too, or the first client to
+# connect (the desktop shell, a browser) starts PipeWire again in the
+# middle of an interface switch.
+SESSION_SOCKETS = ("pipewire-pulse.socket", "pipewire.socket")
+SESSION_SERVICES = ("pipewire-pulse.service", "wireplumber.service", "pipewire.service")
+SESSION_UNITS = SESSION_SOCKETS + SESSION_SERVICES
+# A session manager that has not exited this long after SIGTERM is killed:
+# the units' own TimeoutStopSec (90 s by default) is far longer than anyone
+# should wait with the speakers between two owners. WirePlumber took the
+# whole 90 s on a swapping host while PipeWire flooded it with node errors
+# (each refused snd_pcm_start of the legacy speaker PCM is one).
+STOP_GRACE_S = 15.0
+KILL_WAIT_S = 10.0
+START_WAIT_S = 30.0
+# Slack on top of the waits for the systemctl calls themselves (a loaded
+# host answers slowly); session_stop never runs longer than the sum.
+CALL_SLACK_S = 15.0
+DOWN = ("inactive", "failed")
+
+
+def unit_states(user, units, timeout=20):
+    """{unit: ActiveState} of the units the user's manager has loaded, or
+    None when the manager cannot be asked (no session)."""
+    r = user_systemctl(user, "show", "--property=Id", "--property=LoadState", "--property=ActiveState", *units,
+                       timeout=timeout)
+    if r.returncode != 0:
+        return None
+    out = {}
+    for block in r.stdout.strip().split("\n\n"):
+        props = dict(l.split("=", 1) for l in block.splitlines() if "=" in l)
+        if props.get("Id") and props.get("LoadState") == "loaded":
+            out[props["Id"]] = props.get("ActiveState", "")
+    return out
+
+
+def read_session_record(p):
+    rec = read_kv(p.session_stopped)
+    return rec.get("user", ""), [u for u in rec.get("units", "").split(",") if u]
+
+
+def session_stop(p, user, grace=STOP_GRACE_S, kill_wait=KILL_WAIT_S):
+    """Stops the user's audio session (SESSION_UNITS) and records what ran,
+    for session_start. A unit still stopping after `grace` seconds is sent
+    SIGKILL and given `kill_wait` more. Bounded: it returns within grace +
+    kill_wait + CALL_SLACK_S. Returns a summary {stopped, killed, stuck,
+    seconds}, or None when the user has no session."""
+    t0 = time.monotonic()
+    end = t0 + grace + kill_wait + CALL_SLACK_S
+
+    def left():
+        return max(1.0, min(20.0, end - time.monotonic()))
+
+    states = unit_states(user, SESSION_UNITS, timeout=left())
+    if states is None:
+        log(f"{user} has no running session: no audio session to stop")
+        return None
+    running = [u for u in SESSION_UNITS if states.get(u, "inactive") not in DOWN]
+    # Recorded before anything stops, merged with an earlier record of this
+    # user (a rollback after a stop restarts what ran before either), so a
+    # failure on the way still starts the session again.
+    old_user, old_units = read_session_record(p)
+    keep = [u for u in SESSION_UNITS if u in running or (old_user == user and u in old_units)]
+    os.makedirs(p.graph, mode=0o755, exist_ok=True)
+    write_atomic(p.session_stopped, f"user={user}\nunits={','.join(keep)}\n")
+    out = {"stopped": running, "killed": [], "stuck": [], "seconds": 0.0}
+    if not running:
+        return out
+    log(f"stopping {user}'s audio session: {', '.join(running)}")
+    r = user_systemctl(user, "stop", "--no-block", *running, timeout=left())
+    if r.returncode != 0:
+        log(f"{user}: systemctl --user stop failed: {(r.stderr or '').strip()[-200:]}")
+
+    def wait(units, until):
+        while True:
+            st = unit_states(user, units, timeout=left()) or {}
+            up = [u for u in units if st.get(u, "inactive") not in DOWN]
+            if not up or time.monotonic() >= until:
+                return up, st
+            time.sleep(0.2)
+
+    up, st = wait(running, min(end, t0 + grace))
+    if up:
+        # The unit that ignores SIGTERM is "deactivating"; the ones ordered
+        # behind it (PipeWire behind WirePlumber) are still "active" with
+        # their stop queued, and stop by themselves once it is gone.
+        hung = [u for u in up if st.get(u) == "deactivating"] or up
+        log(f"{user}: {', '.join(f'{u} ({st.get(u)})' for u in up)} still running {grace:.0f} s after SIGTERM: "
+            f"SIGKILL to {', '.join(hung)}")
+        user_systemctl(user, "kill", "--signal=SIGKILL", *hung, timeout=left())
+        out["killed"] = list(hung)
+        up, st = wait(up, min(end, time.monotonic() + kill_wait / 2))
+        if up:
+            log(f"{user}: {', '.join(f'{u} ({st.get(u)})' for u in up)} still running after SIGKILL to the first: SIGKILL")
+            user_systemctl(user, "kill", "--signal=SIGKILL", *up, timeout=left())
+            out["killed"] += [u for u in up if u not in out["killed"]]
+            up, st = wait(up, end)
+        user_systemctl(user, "reset-failed", *out["killed"], timeout=left())
+    out["stuck"] = up
+    out["seconds"] = round(time.monotonic() - t0, 1)
+    if up:
+        log(f"{user}: {', '.join(f'{u} ({st.get(u)})' for u in up)} did not stop even after SIGKILL ({out['seconds']} s)")
+    else:
+        log(f"{user}'s audio session stopped in {out['seconds']} s" + (f" (killed: {', '.join(out['killed'])})" if out["killed"] else ""))
+    return out
+
+
+def session_start(p, graph_unit, wait=START_WAIT_S):
+    """Starts what session_stop recorded: the graph unit first (it links or
+    unlinks the speaker graph before PipeWire reads its configuration),
+    then the sockets and services, and waits up to `wait` seconds for them.
+    Without a record: nothing. Returns the units not active in time."""
+    user, units = read_session_record(p)
+    if not user:
+        return []
+    unlink(p.session_stopped)
+    if not units:
+        return []
+    r = user_systemctl(user, "start", graph_unit, timeout=200)
+    if r.returncode != 0:
+        log(f"{user}: systemctl --user start {graph_unit} failed: {(r.stderr or '').strip()[-200:]}")
+    order = [u for u in SESSION_SOCKETS[::-1] + SESSION_SERVICES[::-1] if u in units]
+    r = user_systemctl(user, "start", "--no-block", *order, timeout=20)
+    if r.returncode != 0:
+        log(f"{user}: systemctl --user start failed: {(r.stderr or '').strip()[-200:]}")
+    t0 = time.monotonic()
+    while True:
+        st = unit_states(user, order) or {}
+        down = [u for u in order if st.get(u) != "active"]
+        if not down or time.monotonic() - t0 >= wait:
+            break
+        time.sleep(0.2)
+    if down:
+        log(f"{user}'s audio session: {', '.join(f'{u} ({st.get(u)})' for u in down)} not active after {wait:.0f} s")
+    else:
+        log(f"{user}'s audio session started again ({', '.join(order)}) in {time.monotonic() - t0:.1f} s")
+    return down
+
+
+def session_restart(p, user, graph_unit):
+    """refresh_session's and deactivate's restart, bounded (session_stop),
+    in place of `try-restart`, which waits out the units' stop timeout."""
+    if session_stop(p, user) is not None:
+        session_start(p, graph_unit)
 
 
 def publish_voicing_parameters(p, previous_voicing=False):
@@ -754,7 +905,7 @@ def cmd_activate(args, p):
         log("the switch test passed: sessions waiting for it start on the graph")
     if p.root:
         return 0
-    refresh_session(conf["SGV2_USER"], int(changed_us), args.graph_unit)
+    refresh_session(p, conf["SGV2_USER"], int(changed_us), args.graph_unit)
     return 0
 
 
@@ -779,12 +930,11 @@ def cmd_deactivate(args, p):
     if r.returncode != 0 or "ActiveState=active" not in r.stdout:
         return 0
     log(f"restarting {user}'s PipeWire on the distribution's speaker graph")
-    user_systemctl(user, "restart", args.graph_unit)
-    user_systemctl(user, "try-restart", "pipewire.service", "wireplumber.service", "pipewire-pulse.service")
+    session_restart(p, user, args.graph_unit)
     return 0
 
 
-def refresh_session(user, changed_us, graph_unit):
+def refresh_session(p, user, changed_us, graph_unit):
     """If the seat user's PipeWire is running and started before the graph
     changed, link the graph and restart it, so it loads the graph now."""
     r = user_systemctl(user, "show", "pipewire.service", "--property=ActiveState", "--property=ActiveEnterTimestampMonotonic")
@@ -797,10 +947,7 @@ def refresh_session(user, changed_us, graph_unit):
     if int(props.get("ActiveEnterTimestampMonotonic") or 0) >= changed_us:
         return
     log(f"{user}'s PipeWire started before the graph changed: restarting it on the new graph")
-    for cmd in (("start", graph_unit), ("try-restart", "pipewire.service", "wireplumber.service", "pipewire-pulse.service")):
-        r = user_systemctl(user, *cmd)
-        if r.returncode != 0:
-            log(f"{user}: systemctl --user {' '.join(cmd)} failed: {(r.stderr or '').strip()[-200:]}")
+    session_restart(p, user, graph_unit)
 
 
 def user_conf_dirs():
@@ -1030,6 +1177,30 @@ def cmd_wake(args, p):
     return 0
 
 
+def session_user(args, p):
+    """--user, else the provisioned seat user, else seat0's."""
+    return args.user or read_kv(p.conf).get("SGV2_USER") or seat0_user(uid_range(os.path.join(args.etc, "login.defs")))
+
+
+def cmd_session_stop(args, p):
+    """Before the kernel's speaker interface switches (aurora-speaker-
+    upgrade): the seat user's audio session stops, so no session keeps
+    starting a speaker PCM the new interface refuses. Fails (exit 1) only
+    when a unit would not stop even after SIGKILL."""
+    user = session_user(args, p)
+    if not user:
+        log("no seat user: no audio session to stop")
+        return 0
+    out = session_stop(p, user, args.stop_grace, args.kill_wait)
+    return 1 if out and out["stuck"] else 0
+
+
+def cmd_session_start(args, p):
+    """After the switch: the session session-stop stopped starts again."""
+    session_start(p, args.graph_unit, args.start_wait)
+    return 0
+
+
 def cmd_status(args, p):
     for path in (p.report, p.selfcheck_json):
         try:
@@ -1042,7 +1213,8 @@ def cmd_status(args, p):
 
 def main():
     ap = argparse.ArgumentParser(prog="speakerguardd-provision")
-    ap.add_argument("cmd", choices=["run", "activate", "deactivate", "seat", "graph-user", "is-seat", "sleep", "wake", "status"])
+    ap.add_argument("cmd", choices=["run", "activate", "deactivate", "seat", "graph-user", "is-seat", "sleep", "wake", "status",
+                                    "session-stop", "session-start"])
     ap.add_argument("--bundle", help="the tuning source (default: the installer's bundle)")
     ap.add_argument("--force", action="store_true", help="compile even if the blob is bound")
     ap.add_argument("--unit", default="speakerguardd.service", help="the supervisor's unit (seat, sleep, wake)")
@@ -1050,6 +1222,11 @@ def main():
     ap.add_argument("--graph-unit", default="speakerguardd-graph.service", help="the user's graph unit (activate)")
     ap.add_argument("--switch-test-wait", type=float, default=150.0,
                     help="graph-user: how long to hold the session's PipeWire for a pending switch test")
+    ap.add_argument("--user", help="session-stop: this user's session (default: the seat user)")
+    ap.add_argument("--stop-grace", type=float, default=STOP_GRACE_S,
+                    help="session-stop: seconds after SIGTERM before a unit still stopping gets SIGKILL")
+    ap.add_argument("--kill-wait", type=float, default=KILL_WAIT_S, help="session-stop: seconds to wait after SIGKILL")
+    ap.add_argument("--start-wait", type=float, default=START_WAIT_S, help="session-start: seconds to wait for the units")
     ap.add_argument("--root", default=os.environ.get("SGV2_PROVISION_ROOT", ""), help="test root for every file written")
     ap.add_argument("--tuning-cli", default="aurora-speaker-tuning")
     ap.add_argument("--dt", default=DT)
@@ -1058,7 +1235,8 @@ def main():
     args = ap.parse_args()
     p = Paths(args.root)
     return {"run": cmd_run, "activate": cmd_activate, "deactivate": cmd_deactivate, "seat": cmd_seat, "graph-user": cmd_graph_user,
-            "is-seat": cmd_is_seat, "sleep": cmd_sleep, "wake": cmd_wake, "status": cmd_status}[args.cmd](args, p)
+            "is-seat": cmd_is_seat, "sleep": cmd_sleep, "wake": cmd_wake, "status": cmd_status,
+            "session-stop": cmd_session_stop, "session-start": cmd_session_start}[args.cmd](args, p)
 
 
 if __name__ == "__main__":
