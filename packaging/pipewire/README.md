@@ -53,6 +53,13 @@ applies the bundle's own curve and publishes its gain to Comp automation
 through the saved relay. Offline hosts can supply an explicit nonpositive
 `volume_db` control to match `voicing-render --mvsc S --mvol DB` exactly
 (`--mvol auto` applies the artifact's law).
+PipeWire moves the control only on a real volume or mute change, so
+`speakerguardd-session` brings the control back to the sink's volume when the
+two are apart (a nudge, then the volume again). WirePlumber keeps no volume
+for this sink; the session stores its channel volumes and mute in
+`$XDG_STATE_HOME/speakerguardd/voicing-<machine>.json` and restores them on
+every new sink. A first start with nothing stored begins at 30 % on the cubic
+slider (channel volume 0.027), not at 100 %.
 Zero/non-finite scalar mutes residual history as well as the input. Balance
 controls are not exposed; the chain uses its centred defaults.
 

@@ -214,6 +214,136 @@ class AmpsUnity(unittest.TestCase):
             self.assertEqual(ran, [], props)
 
 
+class VoicingVolume(unittest.TestCase):
+    """The voicing sink's volume: restore, first start, store, control re-sync."""
+
+    def setUp(self):
+        import tempfile
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.old_env = os.environ.get("XDG_STATE_HOME")
+        os.environ["XDG_STATE_HOME"] = self.tmp.name
+        self.ran = []
+        ran = self.ran
+
+        class P:
+            def __init__(self, argv):
+                ran.append(argv)
+
+            def poll(self):
+                return 0
+
+        self.orig = sgs.subprocess.Popen
+        sgs.subprocess.Popen = lambda argv, **kw: P(argv)
+
+    def tearDown(self):
+        sgs.subprocess.Popen = self.orig
+        if self.old_env is None:
+            os.environ.pop("XDG_STATE_HOME", None)
+        else:
+            os.environ["XDG_STATE_HOME"] = self.old_env
+        self.tmp.cleanup()
+
+    def sink(self, g, vols, mute=False, control=None):
+        nid = g.node_id("sgv2.voicing.j413")
+        if nid is None:
+            nid = g.node("sgv2.voicing.j413")
+        self.set(g, nid, vols, mute, control)
+        return nid
+
+    @staticmethod
+    def set(g, nid, vols, mute=False, control=None):
+        props = [{"volume": 1.0, "mute": mute, "channelVolumes": list(vols), "softVolumes": [1.0] * len(vols)}]
+        if control is not None:
+            props.append({"params": ["voicing:volume", control, "voicing:volume_db", 1.0]})
+        g.objs[nid]["info"]["params"] = {"Props": props}
+
+    def session(self):
+        g, _, _ = build("j413")
+        return g, sgs.Session("j413", MACHINES["j413"])
+
+    def test_first_start_with_nothing_stored_is_30_percent_not_100(self):
+        g, s = self.session()
+        nid = self.sink(g, [1.0, 1.0], control=1.0)
+        self.assertEqual(s.keep_voicing_volume(g, 0.0), "restore")
+        self.assertEqual(self.ran[-1][:4], ["pw-cli", "set-param", str(nid), "Props"])
+        self.assertIn("channelVolumes: [ 0.027, 0.027 ]", self.ran[-1][4])
+        self.assertIn("mute: false", self.ran[-1][4])
+        # not stored until the sink has taken it
+        self.assertFalse(os.path.exists(s.volume_file))
+        self.set(g, nid, [0.027, 0.027], control=0.3)
+        self.assertIsNone(s.keep_voicing_volume(g, 0.1))
+        with open(s.volume_file) as f:
+            self.assertEqual(sgs.json.load(f), {"channelVolumes": [0.027, 0.027], "mute": False})
+
+    def test_a_stored_volume_is_restored_on_every_new_sink(self):
+        g, s = self.session()
+        os.makedirs(os.path.dirname(s.volume_file))
+        with open(s.volume_file, "w") as f:
+            sgs.json.dump({"channelVolumes": [0.008, 0.008], "mute": True}, f)
+        nid = self.sink(g, [1.0, 1.0], control=1.0)
+        self.assertEqual(s.keep_voicing_volume(g, 0.0), "restore")
+        self.assertIn("mute: true, channelVolumes: [ 0.008, 0.008 ]", self.ran[-1][4])
+        # retried if the sink has not taken it, not before the retry time
+        self.assertIsNone(s.keep_voicing_volume(g, 1.0))
+        self.assertEqual(s.keep_voicing_volume(g, 2.5), "restore")
+        # a new sink (graph restart) is restored again
+        del g.objs[nid]
+        g.next += 1
+        nid2 = self.sink(g, [1.0, 1.0], control=1.0)
+        self.assertNotEqual(nid, nid2)
+        self.assertEqual(s.keep_voicing_volume(g, 3.0), "restore")
+        self.assertEqual(self.ran[-1][2], str(nid2))
+
+    def test_a_bad_record_is_ignored(self):
+        g, s = self.session()
+        os.makedirs(os.path.dirname(s.volume_file))
+        for rec in ({"channelVolumes": [2.0, 2.0]}, {"channelVolumes": [0.1]}, {"channelVolumes": [0.1, 0.1], "mute": 1}, []):
+            with open(s.volume_file, "w") as f:
+                sgs.json.dump(rec, f)
+            self.assertIsNone(s.load_volume(2), rec)
+
+    def test_user_changes_are_stored(self):
+        g, s = self.session()
+        nid = self.sink(g, [1.0, 1.0], control=1.0)
+        s.keep_voicing_volume(g, 0.0)
+        self.set(g, nid, [0.027, 0.027], control=0.3)
+        s.keep_voicing_volume(g, 0.1)
+        self.set(g, nid, [0.125, 0.125], mute=True, control=0.0)
+        self.assertIsNone(s.keep_voicing_volume(g, 0.2))
+        with open(s.volume_file) as f:
+            self.assertEqual(sgs.json.load(f), {"channelVolumes": [0.125, 0.125], "mute": True})
+
+    def test_a_control_apart_from_the_volume_gets_a_real_change(self):
+        g, s = self.session()
+        nid = self.sink(g, [0.008, 0.008], control=0.2)
+        s.vs_id, s.vs_settled = nid, True
+        self.assertIsNone(s.keep_voicing_volume(g, 0.0))  # 0.008 ** (1/3) = 0.2: in step
+        # the incident: control at its default under a lower volume
+        self.set(g, nid, [0.008, 0.008], control=1.0)
+        self.assertEqual(s.keep_voicing_volume(g, 1.0), "resync")
+        argv = self.ran[-1]
+        self.assertEqual(argv[:2], ["sh", "-c"])
+        self.assertEqual(argv[3], str(nid))
+        self.assertIn("0.0079992", argv[4])  # the nudge goes down, never up
+        self.assertIn("channelVolumes: [ 0.008, 0.008 ]", argv[5])
+        # at most once a second
+        self.assertIsNone(s.keep_voicing_volume(g, 1.5))
+        # muted, or volume 0: the control must read 0
+        self.set(g, nid, [0.3, 0.3], mute=True, control=0.0)
+        self.assertIsNone(s.keep_voicing_volume(g, 3.0))
+        self.set(g, nid, [0.0, 0.0], control=1.0)
+        self.assertEqual(s.keep_voicing_volume(g, 5.0), "resync")
+        self.assertIn("1e-09", self.ran[-1][4])
+
+    def test_no_generated_sink_or_no_volume_is_left_alone(self):
+        g, s = self.session()
+        self.assertIsNone(s.keep_voicing_volume(g, 0.0))
+        g.node("sgv2.voicing.j413")
+        self.assertIsNone(s.keep_voicing_volume(g, 0.0))
+        self.assertEqual(self.ran, [])
+
+
 class Stop(unittest.TestCase):
     def test_stopping_unlinks_the_amps_and_the_sense_within_its_bound(self):
         import time

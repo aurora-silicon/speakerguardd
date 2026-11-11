@@ -46,6 +46,19 @@ It runs in the user's session, beside PipeWire, and does three things:
    report says `play=1` at once, the supervisor grants within its two clean
    ticks, and this helper links the amps on the grant as in 4.
 
+6. **The user's volume.** The generated voicing sink (`sgv2.voicing.<m>`)
+   carries the user's volume: PipeWire's filter-chain maps its channel
+   volumes onto the plugin's `voicing:volume` control (cubic). PipeWire
+   updates the control only on a real volume or mute change, so a write that
+   changes nothing, or a direct write of the control, can leave the control
+   apart from the volume the desktop shows. When they differ, this helper
+   makes a real change (a nudge, then the volume again), so the control
+   follows the volume once more. WirePlumber keeps no volume for this sink,
+   so the helper stores its channel volumes and mute itself
+   (`$XDG_STATE_HOME/speakerguardd/voicing-<m>.json`) and puts them back
+   each time the sink is created; with nothing stored the sink starts at
+   FIRST_START_VOLUME, not at PipeWire's 100 %.
+
 It reads the graph from `pw-dump --monitor` and makes or removes links with
 `pw-link`. It never touches the amps' volume: the kernel owns it.
 """
@@ -76,6 +89,18 @@ SELFCHECK_ACTIVE = "/run/speakerguardd-selfcheck/active"
 # and the sense are unlinked and suspended (their PCMs close) before the
 # supervisor stops, and stay so until the resume clears it.
 SLEEP_HOLD = "/run/speakerguardd-sleep/hold"
+# The voicing sink's channel volume on a first start with nothing stored:
+# 30 % on a cubic desktop slider (0.3 ** 3).
+FIRST_START_VOLUME = 0.027
+# The voicing plugin's volume control and its mapping in the generated graph
+# (gen.py: capture.volumes, min 0, max 1, cubic).
+VOICING_CONTROL = "voicing:volume"
+# How far the control may sit from the volume's mapping before it counts as
+# apart (PipeWire hands both over as binary32).
+VOICING_TOLERANCE = 1e-4
+# A sink that has not taken the restored volume within this long is restored
+# again; until it has, its volume is not stored.
+RESTORE_RETRY_S = 2.0
 
 # ALSA control ioctls (include/uapi/sound/asound.h, 64-bit)
 _ID_FMT = "IiII44sI"
@@ -253,6 +278,61 @@ class Graph:
         ]
 
 
+def voicing_volume(g, nid):
+    """(channel volumes, mute, control) of the voicing sink: the first Props
+    object with channel volumes is the converter's, which holds the node's
+    volume (the adapter lists it before the follower's); the control comes
+    from the filter's `params`. Any of them may be None."""
+    params = ((g.objs.get(nid) or {}).get("info") or {}).get("params") or {}
+    vols = mute = control = None
+    for p in params.get("Props") or []:
+        if not isinstance(p, dict):
+            continue
+        cv = p.get("channelVolumes")
+        if vols is None and isinstance(cv, list) and cv and all(isinstance(v, (int, float)) for v in cv):
+            vols = [float(v) for v in cv]
+            mute = bool(p.get("mute", False))
+        pl = p.get("params")
+        if control is None and isinstance(pl, list):
+            for k, v in zip(pl[::2], pl[1::2]):
+                if k == VOICING_CONTROL and isinstance(v, (int, float)):
+                    control = float(v)
+    return vols, mute, control
+
+
+def voicing_control_for(vols, mute):
+    """The control value PipeWire's filter-graph derives from the volume:
+    each channel volume in turn onto the one control port, so the last one
+    wins; mute is 0."""
+    if mute:
+        return 0.0
+    return max(vols[-1], 0.0) ** (1.0 / 3.0)
+
+
+def valid_volume_record(rec, n):
+    """A stored {channelVolumes, mute} for n channels, or None."""
+    if not isinstance(rec, dict):
+        return None
+    vols = rec.get("channelVolumes")
+    if not isinstance(vols, list) or len(vols) != n:
+        return None
+    if not all(isinstance(v, (int, float)) and not isinstance(v, bool) and 0.0 <= v <= 1.0 for v in vols):
+        return None
+    mute = rec.get("mute", False)
+    if not isinstance(mute, bool):
+        return None
+    return {"channelVolumes": [float(v) for v in vols], "mute": mute}
+
+
+def state_dir():
+    base = os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state")
+    return os.path.join(base, "speakerguardd")
+
+
+def props_arg(vols, mute):
+    return "{ mute: %s, channelVolumes: [ %s ] }" % ("true" if mute else "false", ", ".join(repr(float(v)) for v in vols))
+
+
 def unity(props):
     if not props:
         return False
@@ -271,6 +351,16 @@ class Session:
         self.protect_out = f"sgv2.protect.{m}.out"
         self.speaker = f"sgv2.speaker.{m}"
         self.sense_name = f"sgv2.sense.{m}"
+        self.voicing_sink = f"sgv2.voicing.{m}"
+        self.volume_file = os.path.join(state_dir(), f"voicing-{m}.json")
+        # the voicing sink node the volume was restored to, what was
+        # restored and when, whether the sink has taken it, what is stored
+        self.vs_id = None
+        self.vs_restored = None
+        self.vs_restore_at = -10.0
+        self.vs_settled = False
+        self.vs_saved = None
+        self.last_resync = -10.0
         self.last_try = -10.0
         self.last_suspend = -10.0
         self.last_unity = -10.0
@@ -363,6 +453,81 @@ class Session:
             ["pw-cli", "set-param", str(spk), "Props", f"{{ mute: false, volume: 1.0, channelVolumes: [ {vols} ] }}"],
         )
         return True
+
+    def load_volume(self, n):
+        try:
+            with open(self.volume_file) as f:
+                return valid_volume_record(json.load(f), n)
+        except (OSError, ValueError):
+            return None
+
+    def save_volume(self, vols, mute):
+        rec = {"channelVolumes": vols, "mute": mute}
+        if rec == self.vs_saved:
+            return
+        try:
+            os.makedirs(os.path.dirname(self.volume_file), mode=0o700, exist_ok=True)
+            tmp = f"{self.volume_file}.{os.getpid()}.tmp"
+            with open(tmp, "w") as f:
+                json.dump(rec, f)
+            os.replace(tmp, self.volume_file)
+            self.vs_saved = rec
+        except OSError as e:
+            log(f"voicing volume not stored: {e}")
+
+    def keep_voicing_volume(self, g, now=None):
+        """Restore the voicing sink's stored volume when the sink is new,
+        store it when the user changes it, and bring the plugin's volume
+        control back to the volume when the two are apart. Returns what it
+        did: "restore", "resync", "store" or None."""
+        now = time.monotonic() if now is None else now
+        self._reap()
+        nid = g.node_id(self.voicing_sink)
+        if nid is None:
+            self.vs_id = None
+            return None
+        vols, mute, control = voicing_volume(g, nid)
+        if vols is None:
+            return None
+        if nid != self.vs_id:
+            self.vs_id, self.vs_settled = nid, False
+            rec = self.load_volume(len(vols))
+            if rec is None:
+                rec = {"channelVolumes": [FIRST_START_VOLUME] * len(vols), "mute": False}
+                log(f"voicing volume: nothing stored, first start at {FIRST_START_VOLUME ** (1 / 3):.2f}")
+            else:
+                self.vs_saved = rec
+            self.vs_restored = rec
+            self.vs_restore_at = -10.0
+        if not self.vs_settled:
+            want = self.vs_restored
+            if all(abs(a - b) <= 1e-6 for a, b in zip(vols, want["channelVolumes"])) and mute == want["mute"]:
+                self.vs_settled = True
+            elif now - self.vs_restore_at >= RESTORE_RETRY_S:
+                self.vs_restore_at = now
+                self._spawn(("voicing-restore", nid), ["pw-cli", "set-param", str(nid), "Props", props_arg(want["channelVolumes"], want["mute"])])
+                return "restore"
+            else:
+                return None
+        did = None
+        if control is not None and abs(control - voicing_control_for(vols, mute)) > VOICING_TOLERANCE:
+            if now - self.last_resync >= 1.0:
+                self.last_resync = now
+                log(f"voicing control {control:.4f} apart from volume {vols} mute={mute}: real change")
+                # the nudge never raises the level audibly: down by 0.01 %,
+                # or from 0 to 1e-9 (-60 dB on the control)
+                nudge = [v * 0.9999 if v > 0.0 else 1e-9 for v in vols]
+                # two real changes in order: the nudge, then the volume
+                self._spawn(
+                    ("voicing-resync", nid),
+                    ["sh", "-c", 'pw-cli set-param "$0" Props "$1" && pw-cli set-param "$0" Props "$2"',
+                     str(nid), props_arg(nudge, mute), props_arg(vols, mute)],
+                )
+                did = "resync"
+        if did is None and ("voicing-resync", nid) not in self.pending:
+            # never store the nudge
+            self.save_volume(vols, mute)
+        return did
 
     def clients(self, g):
         """The client nodes that feed the protect stage's program. From the
@@ -652,6 +817,7 @@ def main():
         wrote = write_report(report, links, carrier, s.wiring(g), s.amps_linked(g), s.play_report(g, play, now))
         s.reconcile(g, granted, play)
         s.pin_amps_unity(g)
+        s.keep_voicing_volume(g, now)
         was_granted = granted
         state = (granted, links, carrier, wrote, play)
         if state != last:
