@@ -18,6 +18,12 @@
 //!   audio server to restart the stream (it retries within a period), and
 //!   then ramps in over [`RAMP_IN_MS`]. Whatever the server buffered before
 //!   the restart is silence, and the program starts from a smooth ramp.
+//! - unless the program has been silent (digital zero, at least
+//!   [`crate::preroll::SILENT_RUN`] frames up to the grant): then nothing was
+//!   cut and nothing is mid-waveform, and the program passes from the grant
+//!   on. That is the wake from the idle power-down, where the first frames
+//!   of the stream that woke the speakers are held ahead of this ramp
+//!   ([`crate::preroll`]) and must not be muted.
 //!
 //! A watcher thread (not real time) follows the card's "Speaker Protection"
 //! control through its change events (the kernel notifies every grant and
@@ -102,6 +108,9 @@ pub struct Ramp {
     step_out: f32,
     hold: u32,
     epoch: Option<u32>,
+    /// Digital-zero frames in a row at the ramp's input, up to the last
+    /// call (saturating).
+    zero_run: u32,
 }
 
 /// The ramp's shape: smoothstep, flat at both ends.
@@ -120,6 +129,7 @@ impl Ramp {
             step_out: 1.0 / frames(RAMP_OUT_MS) as f32,
             hold: frames(HOLD_MS),
             epoch: None,
+            zero_run: 0,
         }
     }
 
@@ -164,7 +174,13 @@ impl Ramp {
             return;
         }
         // granted
-        if changed {
+        let regrant = changed || matches!(self.phase, Phase::Muted | Phase::Out);
+        if regrant && self.zero_run >= crate::preroll::SILENT_RUN && self.phase != Phase::Out {
+            // granted while the program is silent (a wake): nothing was cut,
+            // so nothing restarts mid-waveform; the program passes at once
+            self.x = 1.0;
+            self.phase = Phase::Open;
+        } else if changed {
             // a grant since the last call (perhaps after a withdrawal this
             // plugin never ran through): the stream restarts from silence
             self.x = 0.0;
@@ -174,6 +190,13 @@ impl Ramp {
             self.x = 0.0;
             self.phase = Phase::Hold(self.hold);
         }
+    }
+
+    /// Follow the silence at the ramp's input: trailing digital-zero frames.
+    fn note_silence(&mut self, bufs: &[&mut [f32]], frames: usize) {
+        let zero = |i: usize| bufs.iter().all(|b| b[i] == 0.0);
+        let trailing = (0..frames).rev().take_while(|&i| zero(i)).count();
+        self.zero_run = if trailing == frames { self.zero_run.saturating_add(frames as u32) } else { trailing as u32 };
     }
 
     /// The gain for the next frame.
@@ -207,6 +230,7 @@ impl Ramp {
 
     /// Real time: apply the gain to `frames` frames of every channel.
     pub fn apply(&mut self, bufs: &mut [&mut [f32]], frames: usize) {
+        self.note_silence(bufs, frames);
         if self.phase == Phase::Open {
             return;
         }
@@ -589,6 +613,39 @@ mod tests {
             n += 512;
         }
         assert!(n >= frames(HOLD_MS + RAMP_IN_MS));
+    }
+
+    fn run_with(r: &mut Ramp, g: Grant, input: &[f32]) -> Vec<f32> {
+        r.follow(g);
+        let mut a = input.to_vec();
+        let mut b: Vec<f32> = input.iter().map(|x| -x).collect();
+        let n = a.len();
+        let mut bufs: [&mut [f32]; 2] = [&mut a, &mut b];
+        r.apply(&mut bufs, n);
+        a
+    }
+
+    /// A grant while the program is silent (the wake from idle): no hold,
+    /// no ramp; the first program frames after it pass untouched.
+    #[test]
+    fn a_grant_over_silence_passes_the_program_at_once() {
+        let mut r = Ramp::new(RATE);
+        let off = Grant { known: true, granted: false, epoch: 0 };
+        let on = Grant { known: true, granted: true, epoch: 1 };
+        // muted while idle, the input silent
+        assert!(run_with(&mut r, off, &[0.0; 512]).iter().all(|&x| x == 0.0));
+        // granted: still silent, then the program starts
+        run_with(&mut r, on, &[0.0; 512]);
+        assert!(r.open());
+        let prog: Vec<f32> = (0..512).map(|i| 0.5 + i as f32 * 1e-3).collect();
+        assert_eq!(run_with(&mut r, on, &prog), prog);
+        // a grant over a silence shorter than SILENT_RUN still holds
+        let mut r = Ramp::new(RATE);
+        let mut tail = vec![0.7f32; 512];
+        tail[500..].fill(0.0);
+        run_with(&mut r, off, &tail);
+        run_with(&mut r, on, &[0.7; 512]);
+        assert!(!r.open());
     }
 
     /// The watcher losing the control never leaves the program muted.

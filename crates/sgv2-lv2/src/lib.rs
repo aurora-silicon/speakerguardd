@@ -47,6 +47,7 @@ pub mod attach;
 pub mod gate;
 pub mod handoff;
 pub mod page;
+pub mod preroll;
 pub mod ttl;
 pub mod voicing;
 
@@ -240,6 +241,8 @@ struct Instance {
     gate: gate::Gate,
     /// The gain the grant puts on the program.
     ramp: gate::Ramp,
+    /// The first frames of a wake, held until the amps play.
+    preroll: Box<preroll::PreRoll>,
 }
 
 fn env_or(var: &str, default: String) -> String {
@@ -297,6 +300,7 @@ unsafe extern "C" fn instantiate(
         out_scratch: Box::new([[0.0; SCRATCH_FRAMES]; MAX_CHANNELS]),
         gate: gate::Gate::watch(),
         ramp: gate::Ramp::new(rate),
+        preroll: Box::new(preroll::PreRoll::new(channels, rate)),
     });
     Box::into_raw(instance).cast()
 }
@@ -316,6 +320,7 @@ unsafe extern "C" fn activate(handle: *mut c_void) {
     instance.attach.leave();
     start_stream(instance.unit.as_dyn(), &handoff::SLOT, provided);
     instance.pre.reset();
+    instance.preroll.reset();
     // histories cleared under a program that may be mid-waveform: ramp in
     instance.ramp.restart();
     instance.last_frame = u64::MAX;
@@ -447,6 +452,10 @@ fn run_chunk(instance: &mut Instance, page: Option<&page::EnginePage>, off: usiz
         for (b, s) in bufs.iter_mut().zip(scratch.iter_mut()).take(n) {
             *b = &mut s[..frames];
         }
+        // a wake's first frames, held while the amps are not playing yet
+        // (see preroll), ahead of everything that models what they play
+        let amps = page.map_or(preroll::Amps::Unknown, |p| p.amps());
+        instance.preroll.process(&mut bufs[..n], frames, amps);
         // the kernel's grant: muted while withdrawn, ramped in after a
         // grant (see gate), ahead of every filter so none sees a step
         instance.ramp.follow(instance.gate.shared().load());
@@ -497,6 +506,8 @@ fn run_chunk(instance: &mut Instance, page: Option<&page::EnginePage>, off: usiz
             instance.last_frame = instance.telemetry.frame;
             page.push(&instance.telemetry);
         }
+        let w = &instance.preroll;
+        page.publish_wakes(w.wakes, w.last_wake, w.overflow);
         page.beat(instance.frames, health, delay);
     }
     for (port, value) in [(2 * n + s, latency), (2 * n + s + 1, health.0 as f32), (2 * n + s + 2, delay as f32)] {
@@ -661,6 +672,69 @@ mod tests {
             assert_eq!(health as u32 & Health::FAILSAFE, Health::FAILSAFE);
             ((*d).cleanup)(h);
         }
+    }
+
+    /// A wake from the idle power-down: while the supervisor says the amps
+    /// are not playing, the program is kept and the unit gets silence; once
+    /// they play, the kept frames come out first, from the stream's first
+    /// frame, with no ramp cutting into them.
+    #[test]
+    fn a_wake_plays_the_first_frames_once_the_amps_play() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("sgv2-wake-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("engine");
+        let sup = page::EnginePage::create(path.to_str().unwrap()).unwrap();
+        sup.set_amps(false);
+        std::env::set_var("SGV2_PARAMS", "/nonexistent/sgv2-test");
+        std::env::set_var("SGV2_ENGINE_PAGE", &path);
+        let d = lv2_descriptor(0);
+        unsafe {
+            let h = ((*d).instantiate)(d, 48_000.0, core::ptr::null(), core::ptr::null());
+            const N: usize = 512;
+            let mut l = [0.0f32; N];
+            let mut r = [0.0f32; N];
+            let mut ol = [0.0f32; N];
+            let mut or = [0.0f32; N];
+            let mut ctl = [0.0f32; 3];
+            for (p, buf) in [(0, l.as_mut_ptr()), (1, r.as_mut_ptr()), (2, ol.as_mut_ptr()), (3, or.as_mut_ptr())] {
+                ((*d).connect_port)(h, p, buf.cast());
+            }
+            for (k, c) in ctl.iter_mut().enumerate() {
+                ((*d).connect_port)(h, 4 + k as u32, (c as *mut f32).cast());
+            }
+            ((*d).activate.unwrap())(h);
+            // idle, then the stream starts at frame 700 with 1, 2, 3, ... (scaled)
+            let prog = |i: usize| if i < 700 { 0.0 } else { (i - 699) as f32 * 1e-4 };
+            let mut out = Vec::new();
+            let mut i = 0;
+            for call in 0..8 {
+                if call == 4 {
+                    sup.set_amps(true);
+                }
+                for k in 0..N {
+                    l[k] = prog(i + k);
+                    r[k] = -prog(i + k);
+                }
+                ((*d).run)(h, N as u32);
+                out.extend_from_slice(&ol);
+                assert!(ol.iter().zip(&or).all(|(a, b)| *a == -*b));
+                i += N;
+            }
+            // silence while held, then the program from its first frame (the
+            // fail-safe's 20 dB on it), in order
+            assert!(out[..4 * N].iter().all(|&x| x == 0.0));
+            for (k, &y) in out[4 * N..].iter().enumerate() {
+                let want = sgv2_core::dsp::bound1((k + 1) as f32 * 1e-4) * sgv2_core::FAILSAFE_GAIN;
+                assert!((y - want).abs() < 1e-9, "frame {k}: {y} != {want}");
+            }
+            let hd = sup.header();
+            assert_eq!(hd.wakes.load(core::sync::atomic::Ordering::Acquire), 1);
+            assert_eq!(hd.wake_frames.load(core::sync::atomic::Ordering::Relaxed), (4 * N - 700) as u32);
+            assert_eq!(hd.wake_overflow.load(core::sync::atomic::Ordering::Relaxed), 0);
+            ((*d).cleanup)(h);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Review finding 5 on PR #31: `activate` reset the thermal model, so a
