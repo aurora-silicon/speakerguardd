@@ -34,6 +34,11 @@
 //! Every function is checked against platform results for our own inputs in
 //! the tests. Outside the range the boxes use (`|x| > 10^4` for the sine and
 //! cosine) the correctly rounded value is returned instead.
+//!
+//! The `2^(j/128)` table is computed exactly; the polynomial, reciprocal
+//! table and reduction constants are the values that reproduce the
+//! platform's rounding bit for bit, and the tests check each one against
+//! platform results for our own arguments.
 
 /// `2^(j/128)` (correctly rounded binary64) minus `j << 45`, so that adding
 /// an integer `k`'s bits shifted by 45 gives `2^(k/128)`'s bits.
