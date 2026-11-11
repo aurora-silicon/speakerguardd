@@ -2153,6 +2153,7 @@ impl ProtectionUnit for Unit {
                 Some(cl) => {
                     s.cl_temp_c = cl.t_cl as f32;
                     s.closed_loop = true;
+                    s.cl_fresh = cl.valid as u8;
                     s.sense_v_ms = cl.last_pv;
                     s.sense_i_ms = cl.last_pi;
                     s.sense_r_ohm = cl.r_window;

@@ -1148,3 +1148,173 @@ fn plausibility_guard_trend_ignores_the_r_cal_seed_after_a_cold_start() {
         assert!(!o.2, "window {k}: T_CL {}", o.1);
     }
 }
+
+// Tweeter lanes on a six-channel MacBook Pro layout (synthetic values):
+// woofers 0..3 in one group, tweeters 4 and 5 in another, sense pairs in
+// the bus order (V on 2c, I on 2c + 1), every channel configured for the
+// pilot-tone closed loop. The sense comes from a resistive plant driven by
+// the unit's own output (pilot included), so a lane's pilot reaches its
+// own V/I pair only if the lane mapping and the sense indexing are right.
+
+const TW_N: usize = 6;
+const TW_WOOFER_HZ: f64 = 200.0;
+const TW_TWEETER_HZ: f64 = 5_000.0;
+
+fn tweeter_layout() -> Params {
+    let base = cl_params(4.0, 25.0).ch[0];
+    let mut p = Params { channels: TW_N as u32, ..cl_params(4.0, 25.0) };
+    for c in 0..TW_N {
+        p.ch[c] = ChannelParams {
+            source: c as u32,
+            group: if c < 4 { 1 } else { 0 },
+            sense_v: 2 * c as u32,
+            sense_i: 2 * c as u32 + 1,
+            pilot_tone_enabled: 1,
+            // the power floors gate the pilot bin; programme leakage into it
+            // stays far below them
+            v_pwr_thres: 1e-3,
+            i_pwr_thres: 1e-5,
+            tau_tvc: if c < 4 { 3.0 } else { 2.0 },
+            tau_tmg: if c < 4 { 30.0 } else { 20.0 },
+            ..base
+        };
+    }
+    p
+}
+
+/// The coil resistance (net Rshunt 0.2 ohm) of a coil at `t` C for the
+/// tuning's alpha at T_cal 25 C.
+fn tw_r_at(t: f64) -> f64 {
+    let alpha = 0.004 + (25.0 - 20.0) * (0.0038 - 0.004) / 15.0;
+    0.2 + (4.0 - 0.2) * (1.0 + alpha * (t - 25.0))
+}
+
+/// Drive the layout for `seconds`: woofers a 200 Hz sine of peak `aw`,
+/// tweeters a 5 kHz sine of peak `at`. Each block's sense is the plant's
+/// answer to the previous block's output (V = out * ag / VMONScale, I =
+/// V_volts / R / IMONScale), coils at `t_coil[c]` C; with `sense` false the
+/// bus carries nothing (open loop).
+fn tw_drive(u: &mut spp3::Unit, aw: f32, at: f32, t_coil: [f64; TW_N], seconds: f64, sense: bool) -> Telemetry {
+    let p = *u.params();
+    let blocks = (seconds * RATE as f64 / 512.0) as usize;
+    let mut prev = vec![vec![0.0f32; 512]; TW_N];
+    let mut out = vec![vec![0.0f32; 512]; TW_N];
+    let mut tele = vec![vec![0.0f32; 512]; 2 * TW_N];
+    let mut k = 0usize;
+    for _ in 0..blocks {
+        let ins: Vec<Vec<f32>> = (0..TW_N)
+            .map(|c| {
+                let (a, f) = if c < 4 { (aw, TW_WOOFER_HZ) } else { (at, TW_TWEETER_HZ) };
+                (0..512)
+                    .map(|j| a * (2.0 * std::f64::consts::PI * f * (k + j) as f64 / RATE as f64).sin() as f32)
+                    .collect()
+            })
+            .collect();
+        for c in 0..TW_N {
+            let ch = &p.ch[c];
+            let r = tw_r_at(t_coil[c]);
+            for j in 0..512 {
+                let volts = prev[c][j] as f64 * ch.ag as f64;
+                tele[ch.sense_v as usize][j] = (volts / ch.vmon_scale as f64) as f32;
+                tele[ch.sense_i as usize][j] = (volts / r / ch.imon_scale as f64) as f32;
+            }
+        }
+        let in_refs: Vec<&[f32]> = ins.iter().map(|b| &b[..]).collect();
+        let sense_refs: Vec<&[f32]> = if sense { tele.iter().map(|b| &b[..]).collect() } else { Vec::new() };
+        let mut outs: Vec<&mut [f32]> = out.iter_mut().map(|b| &mut b[..]).collect();
+        u.process(Io { frames: 512, input: &in_refs, sense: &sense_refs, output: &mut outs });
+        for c in 0..TW_N {
+            prev[c].copy_from_slice(&out[c]);
+        }
+        k += 512;
+    }
+    let mut t = Telemetry::new();
+    u.telemetry(&mut t);
+    t
+}
+
+/// The sine peak whose pre-gain drive power sits `db` above the pilot's
+/// enable threshold (Pdrv = elec * a^2 / 2).
+fn tw_peak(p: &Params, c: usize, db: f64) -> f32 {
+    let x = (2.0 * p.ch[c].pilot_enable_thres as f64 / elec(p, c)).sqrt();
+    (x * 10f64.powf(db / 20.0)) as f32
+}
+
+/// The field report's shape: the woofers carry enough programme to turn
+/// their pilot on, the tweeters' high band does not reach the pilot's
+/// enable threshold. The tweeters' T_CL then holds its calibration value
+/// (no window passes the pilot-bin floors), it is published as not fresh,
+/// and their open-loop model and gain keep running.
+#[test]
+fn tweeter_below_the_pilot_threshold_holds_t_cal_and_is_not_fresh() {
+    let p = tweeter_layout();
+    let mut u = spp3::Unit::new(p);
+    let (aw, at) = (tw_peak(&p, 0, 12.0), tw_peak(&p, 4, -6.0));
+    let coils = [60.0, 60.0, 60.0, 60.0, 70.0, 70.0];
+    let t = tw_drive(&mut u, aw, at, coils, 20.0, true);
+    for c in 0..4 {
+        assert_eq!(u.pilot_state(c).map(|s| s.0), Some(true), "woofer {c} pilot on");
+        assert!(u.cl_fresh(c), "woofer {c} fresh");
+        assert_eq!(t.channels[c].cl_fresh, 1, "woofer {c} published fresh");
+        assert!((t.channels[c].cl_temp_c - 60.0).abs() < 2.0, "woofer {c} T_CL {}", t.channels[c].cl_temp_c);
+    }
+    for c in 4..TW_N {
+        assert_eq!(u.pilot_state(c).map(|s| s.0), Some(false), "tweeter {c} pilot off");
+        assert!(t.channels[c].closed_loop, "tweeter {c} has a closed-loop estimator");
+        assert!(!u.cl_fresh(c), "tweeter {c} not fresh");
+        assert_eq!(t.channels[c].cl_fresh, 0, "tweeter {c} published stale");
+        assert_eq!(t.channels[c].cl_temp_c, 25.0, "tweeter {c} T_CL holds T_cal");
+        // the open-loop model runs: it heats above the ambient from the
+        // cold start
+        assert!(t.channels[c].ol_temp_c > 40.1, "tweeter {c} T_OL {}", t.channels[c].ol_temp_c);
+        // no relaxation from a stale estimate
+        assert_eq!(t.channels[c].tlim_adj_c, 0.0);
+        assert_eq!(u.effective_limit(c), 120.0);
+    }
+}
+
+/// The same tweeter lanes with programme above the threshold: their pilot
+/// turns on, reaches their own V/I pair through the plant and the estimate
+/// moves to the coil's temperature, apart from the woofers'.
+#[test]
+fn tweeter_above_the_pilot_threshold_reads_its_own_coil() {
+    let p = tweeter_layout();
+    let mut u = spp3::Unit::new(p);
+    let (aw, at) = (tw_peak(&p, 0, 12.0), tw_peak(&p, 4, 6.0));
+    let coils = [60.0, 60.0, 60.0, 60.0, 75.0, 85.0];
+    let t = tw_drive(&mut u, aw, at, coils, 20.0, true);
+    for (c, &coil) in coils.iter().enumerate() {
+        assert_eq!(u.pilot_state(c).map(|s| s.0), Some(true), "channel {c} pilot on");
+        assert!(u.cl_fresh(c), "channel {c} fresh");
+        assert_eq!(t.channels[c].cl_fresh, 1);
+        assert!(
+            (t.channels[c].cl_temp_c as f64 - coil).abs() < 2.0,
+            "channel {c} T_CL {} for a {coil} C coil",
+            t.channels[c].cl_temp_c
+        );
+    }
+}
+
+/// Open-loop protection of the tweeter lanes alone: no sense at all, the
+/// tweeters driven at full scale, the woofers silent. The tweeters' model
+/// heats toward the limit, their group's gain comes down and holds T_OL at
+/// the limit, and the woofer group is untouched.
+#[test]
+fn tweeter_open_loop_model_limits_without_sense() {
+    let mut p = tweeter_layout();
+    for c in 0..TW_N {
+        p.ch[c].cal_present = 0;
+    }
+    let mut u = spp3::Unit::new(p);
+    let t = tw_drive(&mut u, 0.0, 1.0, [25.0; TW_N], 30.0, false);
+    for c in 4..TW_N {
+        assert!(!t.channels[c].closed_loop, "tweeter {c} open loop");
+        assert_eq!(t.channels[c].cl_fresh, 0);
+        let tol = t.channels[c].ol_temp_c;
+        assert!(tol > 100.0 && tol <= 120.0 + 8.0, "tweeter {c} T_OL {tol}");
+        assert!(t.channels[c].gain < 0.9, "tweeter {c} gain {}", t.channels[c].gain);
+    }
+    for c in 0..4 {
+        assert_eq!(t.channels[c].gain, 1.0, "woofer {c} untouched");
+    }
+}
