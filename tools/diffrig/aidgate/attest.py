@@ -18,14 +18,19 @@ code (`law`, see parity.rs; a stale file refuses every Mac until it is regenerat
        attest.py variants --bin BIN --build BUILD --tunings TREE [--tunings-fallback TREE] --out variants.json
   2. macOS references (the host Mac running that release, under a host-heavy slot):
        attest_refs.sh SLOTDIR variants.json         (gr.py per variant, strip + property strip)
+     and once per volume slider below full scale (SLIDERS), into its own directory:
+       SLIDER=0.46 DEST=REFS-0.46 attest_refs.sh SLOTDIR variants.json
   3. macOS spread (host + buildbox): the same references rendered again from the program
      with every nonzero sample moved by one Float32 ULP (``perturb``, at least four seeds), then
        attest.py spread --variants variants.json --mac REFDIR --perturbed P1 P2 P3 P4 \
              --prog PROG --reference 25G83 --out spread-25G83.json
-  4. gate (buildbox): render each variant through v2 and compare with its reference:
+  4. gate (buildbox): render each variant through v2 and compare with its reference, at full
+     volume and at every slider (settled band levels, the same tolerance):
        attest.py gate --variants variants.json --mac REFDIR --bin BIN --prog PROG \
              --reference "macOS 27.0 26A428 Audio Units" [--spread spread-26A428.json] \
-             --out parity.json [--details DIR]
+             --slider 0.7=REFS-0.7 --slider 0.46=REFS-0.46 --slider 0.25=REFS-0.25 \
+             [--slider-spread 0.7=spread-26A428-s0.7.json] --out parity.json [--details DIR]
+     A release with no host for slider references needs --full-volume-only (README).
 
 BUILD is the macOS build whose Tunings and installed Audio Units the run uses (26A428). The
 gate writes one release block for it into parity.json and keeps the blocks of other releases
@@ -78,6 +83,15 @@ CHAOTIC_UNDER_PEAK_DB = 40.0
 MAIN_SPREAD_CAP_DB = 0.25
 SPREAD_FORMAT = 1
 FORMAT = 2
+# Volume slider positions (the user scalar, graph `mvsc`) every tuning is gated at besides full
+# volume. Each is rendered on both sides with the same (mvsc, mvol) pair: mvol is the dB the
+# chain's volume law (the HAL law over the Mac's own range, crates/sgv2-core voicing/volume.rs)
+# gives for that scalar, the value macOS's HAL hands the graph.
+SLIDERS = (0.7, 0.46, 0.25)
+# Settled band levels at a slider are measured from this frequency up (the program's lowest tone
+# is 20 Hz). Sample rate of the gate program.
+SETTLED_HP_HZ = 10.0
+FS = 48000
 
 
 def tool(bin_dir, name):
@@ -129,12 +143,36 @@ def variants(a):
             v = {"aid": aid, "speaker_id": spid, "also_speaker_ids": [], "tree": tree, "key": k["key"],
                  "strip": os.path.basename(s.get("strip") or ""),
                  "propstrip": os.path.basename(s.get("propstrip") or "") or None,
-                 "graph": os.path.basename(s.get("graph") or "")}
+                 "graph": os.path.basename(s.get("graph") or ""),
+                 "volume": volume_points(a.bin, base + extra, os.path.dirname(os.path.abspath(a.out)))}
             seen[k["key"]] = v
             out.append(v)
         print(f"AID{aid}: {len(seen)} tuning(s)", flush=True)
     json.dump({"law": law, "build": a.build, "variants": out}, open(a.out, "w"), indent=1)
     return 0
+
+
+def volume_points(bin_dir, args, work):
+    """[[scalar, mvol dB], ...] for SLIDERS: the dB the chain's volume law gives each scalar
+    (voicing-render --mvol auto on a 512-frame silent program)."""
+    os.makedirs(work, exist_ok=True)
+    z = os.path.join(work, "silence-512.f32")
+    if not os.path.exists(z):
+        with open(z, "wb") as f:
+            f.write(bytes(8 * 512))
+    out = []
+    for sl in SLIDERS:
+        r = subprocess.run([tool(bin_dir, "voicing-render")] + args + ["--in", z, "--out", os.devnull,
+                           "--mvsc", repr(sl), "--mvol", "auto"], capture_output=True, text=True, timeout=300,
+                           env={**os.environ, **BUILD_ENV})
+        db = None
+        for line in r.stderr.splitlines():
+            if line.startswith("mvol auto:") and "->" in line:
+                db = float(line.split("->")[1].split()[0])
+        if r.returncode or db is None:
+            return None
+        out.append([sl, db])
+    return out
 
 
 def ref_name(v):
@@ -147,9 +185,10 @@ def rms_of(np):
     return rms
 
 
-def measure(mac, v2, segs, np):
+def measure(mac, v2, segs, np, stopband=True):
     """Every measurement of the gate program, per segment x lane: (seg, lane, [(delta dB,
-    macOS RMS)]) with the lanes' own peaks."""
+    macOS RMS)]) with the lanes' own peaks. `stopband=False` measures crossover stop bands too
+    (down to FLOOR), for macOS's own spread at a slider."""
     rms = rms_of(np)
 
     def ddb(x, y, floor):
@@ -165,7 +204,7 @@ def measure(mac, v2, segs, np):
             continue
         s, n = sg["start"], sg["frames"]
         top = max(rms(mac[s + n // 2:s + n, c]) for c in range(mac.shape[1]))
-        floor = max(FLOOR, top * 10 ** (-STOPBAND / 20))
+        floor = max(FLOOR, top * 10 ** (-STOPBAND / 20)) if stopband else FLOOR
         for c in range(mac.shape[1]):
             x, y = mac[s:s + n, c], v2[s:s + n, c]
             d = [ddb(x[n // 2:], y[n // 2:], floor)]
@@ -201,6 +240,45 @@ def lane_peaks(mac, segs, rms):
                 lv += [rms(mac[s + at:s + at + 480, c]) for at in range(0, n - 479, 480)]
             peak[c] = max(peak[c], *lv)
     return peak
+
+
+def settled_view(x, segs, np):
+    """`x` with the second half of every steady segment high-passed at SETTLED_HP_HZ (FFT, each
+    lane): the settled band levels the slider gate compares. The program's lowest tone is 20 Hz,
+    so the cut removes only subsonic drift, never program content."""
+    y = np.array(x, dtype=np.float64, copy=True)
+    for sg in segs:
+        if sg["kind"] != "steady":
+            continue
+        a, b = sg["start"] + sg["frames"] // 2, sg["start"] + sg["frames"]
+        f = np.fft.rfftfreq(b - a, 1 / FS)
+        X = np.fft.rfft(y[a:b], axis=0)
+        X[f < SETTLED_HP_HZ] = 0
+        y[a:b] = np.fft.irfft(X, b - a, axis=0)
+    return y
+
+
+def settled(mac, v2, segs, np, spread=None):
+    """Settled band levels at a volume slider: per steady segment (stepped third-octave sines,
+    pink) x lane, the second-half RMS on both sides from SETTLED_HP_HZ up (`settled_view`).
+    Below that sits only subsonic drift: the units' Float32 residue, which Tone automation
+    lifts at low volume and macOS does not reproduce itself (README). The stop-band floor,
+    the floor-residue rule and the arithmetic-chaotic rule apply as at full volume, against the
+    lane's own settled peak; `spread` is macOS's own +-1 LSB spread measured at this slider
+    (`spread --slider`), {(seg, lane): dB}."""
+    steady = [sg for sg in segs if sg["kind"] == "steady"]
+    cells, peak = measure(settled_view(mac, steady, np), settled_view(v2, steady, np), steady, np)
+    spread = spread or {}
+    return [cell(seg, c, d, peak[c], spread.get((seg, c))) for seg, c, d in cells]
+
+
+def lane_worst(rows):
+    """Per lane: [largest louder, largest quieter] dB over its main-band cells."""
+    out = {}
+    for r in rows:
+        lo, qu = out.get(r["lane"], (0.0, 0.0))
+        out[r["lane"]] = (max(lo, r["louder"]), min(qu, r["quieter"]))
+    return [[round(out[c][0], 3), round(out[c][1], 3)] for c in sorted(out)]
 
 
 def is_floor_residue(db, mac_level, lane_peak):
@@ -307,25 +385,68 @@ def gate_one(a, v, segs, np):
     gm = json.load(open(os.path.join(md, "meta.json")))
     nch = gm["channels"]
     mac = np.fromfile(os.path.join(md, "unit_in.f32"), "<f4").reshape(-1, nch)
-    out = os.path.join(a.work, ref_name(v) + ".v2.f32")
-    r = subprocess.run([tool(a.bin, "voicing-render")] + root + extra +
-                       ["--in", a.prog + ".f32", "--out", out, "--mvsc", "1", "--mvol", "0"],
-                       capture_output=True, text=True, timeout=900, env={**os.environ, **BUILD_ENV})
-    if r.returncode:
-        e["reason"] = f"v2 does not render the chain: {(r.stderr or r.stdout)[-240:]}"
-        return e, None
-    v2 = np.fromfile(out, "<f4")
-    os.unlink(out)
-    if v2.size != mac.size:
-        e["reason"] = f"lane count or length differs from macOS ({v2.size} vs {mac.size} samples, {nch} lanes)"
-        return e, None
-    v2 = v2.reshape(-1, nch)
-    if not np.isfinite(v2).all():
-        e["reason"] = "non-finite output"
+    def render(mvsc, mvol, mac):
+        """v2's lanes at (mvsc, mvol), or the refusal reason."""
+        out = os.path.join(a.work, ref_name(v) + f".{mvsc!r}.v2.f32")
+        r = subprocess.run([tool(a.bin, "voicing-render")] + root + extra +
+                           ["--in", a.prog + ".f32", "--out", out, "--mvsc", repr(mvsc), "--mvol", repr(mvol)],
+                           capture_output=True, text=True, timeout=900, env={**os.environ, **BUILD_ENV})
+        if r.returncode:
+            return None, f"v2 does not render the chain: {(r.stderr or r.stdout)[-240:]}"
+        y = np.fromfile(out, "<f4")
+        os.unlink(out)
+        if y.size != mac.size:
+            return None, f"lane count or length differs from macOS ({y.size} vs {mac.size} samples, {nch} lanes)"
+        y = y.reshape(-1, nch)
+        if not np.isfinite(y).all():
+            return None, "non-finite output"
+        return y, None
+
+    v2, why = render(1.0, 0.0, mac)
+    if why:
+        e["reason"] = why
         return e, None
     rows = compare(mac, v2, segs, np, a.spread_cells.get(v["key"]))
     e.update(verdict(rows))
-    return e, rows
+    details = {"full": rows, "sliders": {}}
+    if a.slider_refs:
+        e["sliders"] = []
+        points = {sl: db for sl, db in (v.get("volume") or [])}
+        for sl, refdir in a.slider_refs:
+            s = {"slider": sl, "verdict": "refused"}
+            e["sliders"].append(s)
+            if sl not in points:
+                s["reason"] = "no volume law point for this slider (attest.py variants)"
+                continue
+            s["mvol_db"] = round(points[sl], 4)
+            sd = os.path.join(refdir, ref_name(v))
+            try:
+                sst = json.load(open(os.path.join(sd, "status.json")))
+                sm = json.load(open(os.path.join(sd, "meta.json")))
+            except OSError:
+                s["reason"] = "no macOS reference render at this slider"
+                continue
+            if sst.get("rc"):
+                s["reason"] = f"the macOS reference render failed (rc {sst['rc']})"
+                continue
+            if abs(sm["params"].get("mvsc", 1.0) - sl) > 1e-9 or abs(sm["params"].get("mvol", 0.0) - points[sl]) > 1e-6:
+                s["reason"] = "the macOS reference was rendered at another volume"
+                continue
+            ms = np.fromfile(os.path.join(sd, "unit_in.f32"), "<f4").reshape(-1, sm["channels"])
+            ys, why = render(sl, points[sl], ms)
+            if why:
+                s["reason"] = why
+                continue
+            srows = settled(ms, ys, segs, np, a.slider_spread.get(sl, {}).get(v["key"]))
+            s.update(verdict(srows))
+            details["sliders"][repr(sl)] = {"mvol_db": points[sl], "rows": srows, "lanes": lane_worst(srows)}
+        bad = [s for s in e["sliders"] if s["verdict"] != "pass"]
+        if bad and e["verdict"] == "pass":
+            e["verdict"] = "refused"
+            e["reason"] = "; ".join(f"slider {s['slider']:g}: {s['reason']}" for s in bad)
+        elif bad:
+            e["reason"] += "; " + "; ".join(f"slider {s['slider']:g}: {s['reason']}" for s in bad)
+    return e, details
 
 
 def load_spread(path):
@@ -358,7 +479,15 @@ def spread(a):
             continue
         worst = {}
         for r in runs:
-            cells, _ = measure(base, r, segs, np)
+            if a.slider is None:
+                cells, _ = measure(base, r, segs, np)
+            else:
+                # At a slider the crossover stop band moves with the volume: a cell can sit just
+                # under it in every macOS render and just over it in v2's. Measure macOS's own
+                # spread down to the absolute floor, so such a cell gets its spread recorded.
+                steady = [sg for sg in segs if sg["kind"] == "steady"]
+                cells, _ = measure(settled_view(base, steady, np), settled_view(r, steady, np), steady, np,
+                                   stopband=False)
             for seg, c, d in cells:
                 m = max(abs(db) for db, _ in d)
                 worst[(seg, c)] = max(worst.get((seg, c), 0.0), m)
@@ -369,6 +498,7 @@ def spread(a):
         print(f"{name:16s} {len(keep):3d} cell(s) with spread > 0.05 dB, max "
               f"{max([c[2] for c in keep], default=0.0):.3f}", flush=True)
     doc = {"format": SPREAD_FORMAT, "reference": a.reference, "perturbations": len(a.perturbed),
+           **({} if a.slider is None else {"slider": a.slider, "measurements": "settled: steady segments, second half"}),
            "method": "every nonzero program sample moved by one Float32 ULP, seeded; per cell the "
                      "largest |dB| of any measurement over all perturbed renders",
            "entries": entries}
@@ -390,6 +520,21 @@ def spread_id(path):
 def gate(a):
     import numpy as np
     a.spread_cells = load_spread(a.spread)
+    a.slider_refs = []
+    for x in a.slider or []:
+        sl, d = x.split("=", 1)
+        a.slider_refs.append((float(sl), d))
+    a.slider_spread, slider_spread_ids = {}, {}
+    for x in a.slider_spread_file or []:
+        sl, f = x.split("=", 1)
+        doc = json.load(open(f))
+        if doc.get("slider") != float(sl):
+            raise SystemExit(f"{f}: spread measured at slider {doc.get('slider')}, not {sl}")
+        a.slider_spread[float(sl)] = load_spread(f)
+        slider_spread_ids[repr(float(sl))] = spread_id(f)
+    if sorted(sl for sl, _ in a.slider_refs) != sorted(SLIDERS) and not a.full_volume_only:
+        raise SystemExit(f"gate needs macOS references at every slider {SLIDERS} (--slider S=DIR), "
+                         "or --full-volume-only with the reason in --reference")
     vs = json.load(open(a.variants))
     segs = json.load(open(a.prog + ".json"))["segments"]
     os.makedirs(a.work, exist_ok=True)
@@ -401,13 +546,20 @@ def gate(a):
     for (e, rows), v in zip(res, vs["variants"]):
         entries.append(e)
         if a.details and rows is not None:
-            json.dump(rows, open(os.path.join(a.details, ref_name(v) + ".json"), "w"))
+            json.dump(rows["full"], open(os.path.join(a.details, ref_name(v) + ".json"), "w"))
+            if rows["sliders"]:
+                json.dump(rows["sliders"], open(os.path.join(a.details, ref_name(v) + ".sliders.json"), "w"))
         print(f"{ref_name(v):16s} {e['verdict']:8s} {e['reason'][:160]}", flush=True)
+        for sv in e.get("sliders", []):
+            print(f"{'':16s}   slider {sv['slider']:<4g} {sv['verdict']:8s} louder {sv.get('worst_louder_db', float('nan')):+.3f}"
+                  f" quieter {sv.get('worst_quieter_db', float('nan')):+.3f}  {sv.get('reason', '')[:120]}", flush=True)
     release = {
         "build": vs["build"],
         "reference": a.reference,
         "rev": open(os.path.join(a.bin, "REV")).read().strip(),
         "spread": spread_id(a.spread),
+        "sliders": sorted((sl for sl, _ in a.slider_refs), reverse=True),
+        "slider_spread": slider_spread_ids,
         "entries": sorted(entries, key=lambda e: (e["aid"], -1 if e["speaker_id"] is None else e["speaker_id"])),
     }
     doc = merge(a.out, vs["law"], release)
@@ -448,12 +600,18 @@ def main():
         g.add_argument("--" + k, required=True)
     g.add_argument("--details")
     g.add_argument("--spread")
+    g.add_argument("--slider", action="append", help="S=DIR: macOS references rendered at slider S (attest_refs.sh SLIDER=S)")
+    g.add_argument("--slider-spread", dest="slider_spread_file", action="append",
+                   help="S=FILE: macOS's own spread at slider S (attest.py spread --slider S)")
+    g.add_argument("--full-volume-only", action="store_true",
+                   help="write a block without slider verdicts (a release with no host for slider references)")
     g.add_argument("--work", default="/tmp/attest-work")
     g.add_argument("--jobs", type=int, default=8)
     sp = sub.add_parser("spread")
     for k in ("variants", "mac", "prog", "reference", "out"):
         sp.add_argument("--" + k, required=True)
     sp.add_argument("--perturbed", nargs="+", required=True)
+    sp.add_argument("--slider", type=float, help="the references are at this volume slider: settled cells only")
     a = ap.parse_args()
     if a.cmd == "spread" and len(a.perturbed) < 4:
         raise SystemExit("spread needs at least four perturbed reference sets")
