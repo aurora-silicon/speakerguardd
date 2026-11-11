@@ -1758,7 +1758,9 @@ proptest! {
         let settle = 256 + (10.0 * p.attack_time_ms as f64 * 1e-3 * rate as f64) as usize;
         let rr = render(&mut u, &x, None, &[256], &mut no_sense, true);
         // spec 15.5: the applied slow gain follows the temperature axis's
-        // candidate (0.99 below it on a cut, at most it on a release)
+        // candidate (0.99 below it on a cut, at most it on a release); the
+        // logged candidate is not capped, the applied gain is held at
+        // MaxTemperatureAttenuation (25G83 rig)
         let window = settle.div_ceil(256) + 1;
         for (k, (done, t)) in rr.tele.iter().enumerate() {
             if *done < settle || k < window {
@@ -1766,7 +1768,7 @@ proptest! {
             }
             for c in &p.ch[..n] {
                 let s = &t.channels[c.source as usize];
-                let mut most = 0.0f64;
+                let mut most = libm::pow(10.0, -(c.max_temperature_attenuation_db as f64) / 20.0);
                 for (_, w) in &rr.tele[k - window..=k] {
                     most = most.max(w.channels[c.source as usize].axis_gain[4] as f64);
                 }

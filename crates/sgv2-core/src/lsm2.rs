@@ -1641,6 +1641,9 @@ struct Chan {
     t_soft: f64,
     t_hard: f64,
     t_headroom: f64,
+    /// `10^(-MaxTemperatureAttenuation/20)`: the lowest gain the temperature
+    /// candidate applies (the output ceiling is not capped).
+    temp_floor: f64,
     /// The logged candidates: peak, displacement, velocity, linked power,
     /// temperature.
     cand: [f64; 5],
@@ -2112,6 +2115,7 @@ impl Run {
                 t_soft: c.temperature_soft_limit as f64,
                 t_hard: c.temperature_hard_limit as f64,
                 t_headroom: c.temperature_headroom as f64,
+                temp_floor: db_to_lin(c.max_temperature_attenuation_db as f64),
                 cand: [1.0; 5],
             });
         }
@@ -2711,10 +2715,12 @@ impl Run {
         let n = self.n;
         let mut req = [1.0f64; MAX_CHANNELS];
         for (ci, c) in self.ch.iter().enumerate() {
+            // the applied gains are capped at MaxPowerAttenuation (spec 6.1;
+            // 25G83 rig: the logged candidate is not, the audio is) and at
+            // MaxTemperatureAttenuation (25G83 rig: a temperature-only ramp
+            // whose candidate asks for more holds the audio at the cap)
             let gt = if linked_temp { gt_all } else { c.gt };
-            // the applied power gain is capped at MaxPowerAttenuation (spec
-            // 6.1; 25G83 rig: the logged candidate is not, the audio is)
-            req[ci] = g_pow.max(self.power_floor).min(gt);
+            req[ci] = g_pow.max(self.power_floor).min(gt.max(c.temp_floor));
         }
         if self.link && n > 1 {
             let m = req[..n].iter().copied().fold(1.0f64, f64::min);
@@ -2739,6 +2745,11 @@ impl Run {
         }
         if self.axis[4] {
             for (ci, c) in self.ch.iter().enumerate() {
+                // The output ceiling at TemperatureHardLimit + headroom is
+                // not capped by MaxTemperatureAttenuation, although the
+                // 25G83 rig's is (a 0.5 dB cap holds the audio while the
+                // model coil passes the hard limit): the hard limit stays a
+                // backstop here.
                 want[ci] = c.ceiling_scale(want[ci], ctl, sub, self.fb, self.ceiling_shift);
             }
         }
