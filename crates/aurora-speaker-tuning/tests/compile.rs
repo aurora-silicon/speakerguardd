@@ -412,6 +412,30 @@ fn lsm2_masker_lattice_comes_from_the_bundle() {
 }
 
 #[test]
+fn buzzkill_matrix_comes_from_the_bundle() {
+    // Provisioned: the validated matrix reaches the tuning unchanged.
+    let m = synthetic_buzzkill();
+    let mut files = lsm2_files(|_| {});
+    files.insert(BUZZKILL.into(), buzzkill_bytes(&m));
+    let t = tuning(&files, "c-buzzkill");
+    assert_eq!(t.buzzkill, Some(m));
+    // Absent: none, and no error (only a Buzz box would need it).
+    let t = tuning(&lsm2_files(|_| {}), "c-no-buzzkill");
+    assert_eq!(t.buzzkill, None);
+    // A listed matrix that fails the structural rule is an error.
+    let mut bad = m;
+    bad[1][0] = 0.5;
+    let mut files = lsm2_files(|_| {});
+    files.insert(BUZZKILL.into(), buzzkill_bytes(&bad));
+    let dir = scratch("c-bad-buzzkill");
+    write_dir(&dir, &files, &manifest_json(&files, "25G83"));
+    let mut d = Diagnostics::default();
+    let t = Tuning::load(&Bundle::open(&dir).unwrap(), &Options::default(), &mut d).unwrap();
+    assert!(d.items.iter().any(|x| x.code == "buzzkill-matrix-invalid"));
+    assert_eq!(t.buzzkill, None);
+}
+
+#[test]
 fn lsm2_channels_keep_their_own_full_scale_within_one_operating_point() {
     // As on the J700 (7.30/7.33 V, 0.036 dB): the header takes channel 0's,
     // the payload keeps each channel's own.

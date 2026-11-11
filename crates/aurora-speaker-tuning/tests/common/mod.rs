@@ -353,6 +353,22 @@ pub fn spp3_files(channels: usize) -> BTreeMap<String, Vec<u8>> {
 
 /// Bundle path of the installer's lsm2 masker lattice.
 pub const LATTICE: &str = "lsm2-mask-lattice.bin";
+/// The installer's BuzzKill quadrature matrix file.
+pub const BUZZKILL: &str = "buzzkill-quadrature.bin";
+
+/// Made-up sections with the matrix's structure only (not macOS's values).
+pub fn synthetic_buzzkill() -> [[f32; 5]; 4] {
+    [
+        [0.25, -0.5, 1.0, 0.125, 0.25],
+        [0.375, -0.25, 1.0, -0.25, 0.375],
+        [0.75, 0.5, 1.0, 0.5, -0.125],
+        [1.125, -1.875, 0.875, -1.75, 0.8125],
+    ]
+}
+
+pub fn buzzkill_bytes(m: &[[f32; 5]; 4]) -> Vec<u8> {
+    m.iter().flatten().flat_map(|v| v.to_le_bytes()).collect()
+}
 
 /// A synthetic lsm2 masker lattice (not the macOS one): the 64 single bins,
 /// then 36 evenly widening ends up to 321, as 100 little-endian u64.
@@ -407,9 +423,17 @@ pub fn manifest_json_ident(
             sha256_hex(d)
         )
     });
+    // The installer's BuzzKill matrix record, when the files hold one.
+    let buzzkill = files.get(BUZZKILL).map_or(String::new(), |d| {
+        format!(
+            r#","buzzkill_quadrature":{{"path":"{BUZZKILL}","bytes":{},"sha256":"{}","version":1,"format":"f32le-sos4-output-major","sections":4}}"#,
+            d.len(),
+            sha256_hex(d)
+        )
+    });
     let list: Vec<String> = files
         .iter()
-        .filter(|(p, _)| *p != "speaker-thiele-small.bin" && *p != LATTICE)
+        .filter(|(p, _)| *p != "speaker-thiele-small.bin" && *p != LATTICE && *p != BUZZKILL)
         .map(|(p, d)| rec(p, d))
         .collect();
     let count = files.keys().filter(|p| p.starts_with(&format!("{AID}/"))).count();
@@ -420,7 +444,7 @@ pub fn manifest_json_ident(
         r#"{{"schema":2,"kind":"aurora-audio-tuning","source_file_count":{count},"complete":true,
 "acoustic_id":{ACOUSTIC_ID},"aid":"{AID}","macos_build":"{build}",
 "speaker_thiele_small":{},"device_dsp_database":"DeviceDSPDatabase.plist","config":"Config/{AID}.plist",
-"files":[{}],"based_on":"test"{spid}{ident}{lattice}}}"#,
+"files":[{}],"based_on":"test"{spid}{ident}{lattice}{buzzkill}}}"#,
         spts.unwrap_or_else(|| "null".into()),
         list.join(",")
     )

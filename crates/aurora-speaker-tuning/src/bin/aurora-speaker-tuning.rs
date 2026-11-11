@@ -431,6 +431,14 @@ fn identify(bundle: aurora_speaker_tuning::Result<Bundle>, json: bool) {
     }
 }
 
+/// The development BuzzKill matrix for raw tuning trees (`SGV2_BUZZKILL_MATRIX`).
+fn buzzkill_override() -> Option<aurora_speaker_tuning::buzzmatrix::Matrix> {
+    aurora_speaker_tuning::buzzmatrix::from_env().unwrap_or_else(|e| {
+        eprintln!("{e}");
+        exit(1)
+    })
+}
+
 fn main() {
     let a = parse_args();
     match a.cmd.as_str() {
@@ -510,7 +518,7 @@ fn main() {
     } else {
         None
     };
-    let opts = Options { speaker_id: a.speaker_id, device_tree_speaker_id };
+    let opts = Options { speaker_id: a.speaker_id, device_tree_speaker_id, buzzkill_matrix: buzzkill_override() };
     let result = bundle.and_then(|b| Tuning::load(&b, &opts, &mut diags));
     match result {
         Ok(t) => {
@@ -599,7 +607,7 @@ fn voicing_check(bundle: aurora_speaker_tuning::Result<Bundle>, a: &Args) -> ! {
     } else {
         None
     };
-    let opts = Options { speaker_id: a.speaker_id, device_tree_speaker_id };
+    let opts = Options { speaker_id: a.speaker_id, device_tree_speaker_id, buzzkill_matrix: buzzkill_override() };
     let mut t = match bundle.and_then(|b| Tuning::load(&b, &opts, &mut diags)) {
         Ok(t) => t,
         Err(e) => {
