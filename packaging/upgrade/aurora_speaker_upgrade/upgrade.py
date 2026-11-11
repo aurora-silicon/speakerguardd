@@ -268,6 +268,12 @@ def acquire(identity, a):
                 reasons.append(f"route {r}: {e}")
                 continue
             m = json.loads(b[audio_tuning.MANIFEST])
+            if collect.lsm2_fill.needs_fill(b) and m.get("lsm2_param_fill") is None:
+                reasons.append(f"route {r}: collected before the installer read the lsm2 fill; "
+                               "route 3: boot this Mac's macOS and collect (aurora-speaker-upgrade guide)")
+                # Offline routes cannot host this owner's macOS AudioUnit.
+                # Still try an explicitly supplied route-3 collection.
+                continue
             if m.get("unit_id") != identity.unit:
                 reasons.append(f"route {r}: the bundle does not name this unit")
                 continue
@@ -907,7 +913,11 @@ def cmd_status(a):
     mode, card = interface_mode()
     b = store.read_bundle()
     m = json.loads(b[audio_tuning.MANIFEST]) if b else {}
-    print(json.dumps({"kernel_interface": mode, "switched": bool(st.get("switched")),
+    fill_needed = bool(b) and collect.lsm2_fill.needs_fill(b) and m.get("lsm2_param_fill") is None
+    print(json.dumps({"lsm2_fill": "collected before the installer read the lsm2 fill" if fill_needed
+                      else "present" if m.get("lsm2_param_fill") is not None else "not required",
+                      "lsm2_fill_next": "route 3: aurora-speaker-upgrade guide" if fill_needed else None,
+                      "kernel_interface": mode, "switched": bool(st.get("switched")),
                       "setting": (read_text(store.interface) or "").strip() or None,
                       "route": st.get("route"), "aid": m.get("aid"), "macos_build": m.get("macos_build"),
                       "speaker_id": m.get("speaker_id"), "bundle_digest": st.get("digest")}, indent=2))

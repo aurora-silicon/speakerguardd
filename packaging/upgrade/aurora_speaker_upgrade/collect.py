@@ -24,7 +24,7 @@ import stat
 import subprocess
 
 from . import adt_ro, apfs_ro
-from .asahi_firmware import audio_tuning, lsm2_lattice
+from .asahi_firmware import audio_tuning, lsm2_lattice, lsm2_fill
 
 log = logging.getLogger("aurora-speaker-upgrade")
 
@@ -147,6 +147,10 @@ def installer_bundle(identity, dirs=INSTALLER_BUNDLES):
             continue
         if m.get("lsm2_mask_lattice") is None:
             reasons.append(f"{d}: collected before the installer read the lsm2 lattice")
+            continue
+        if lsm2_fill.needs_fill(c.bundle) and m.get("lsm2_param_fill") is None:
+            reasons.append(f"{d}: collected before the installer read the lsm2 fill; "
+                           "route 3: aurora-speaker-upgrade guide")
             continue
         if not valid_speaker_id(m.get("speaker_id")) \
                 and selects_by_speaker_id(c.bundle[audio_tuning.DATABASE]):

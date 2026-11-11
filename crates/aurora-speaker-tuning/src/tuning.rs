@@ -181,6 +181,9 @@ pub struct Tuning {
     #[serde(skip)]
     pub mask_lattice: Option<[u32; crate::lattice::ENTRIES]>,
     pub mask_lattice_present: bool,
+    /// Private owner-local missing records; excluded from tuning dumps.
+    #[serde(skip)]
+    pub lsm2_param_fill: Option<Vec<(u32, f32)>>,
     /// The speaker volume control's dB range from the bundle's device
     /// configuration ([`crate::hal_volume`]); `None` keeps the cubic law.
     pub volume_range: Option<crate::hal_volume::VolumeRange>,
@@ -536,6 +539,23 @@ impl Tuning {
             }
         };
 
+        let lsm2_param_fill = if kind == UnitKind::Lsm2 {
+            match &b.manifest.param_fill {
+                Some(record) => {
+                    let bytes = need(b, &record.path, "lsm2 fill")?;
+                    let saved = peffect
+                        .preset
+                        .state
+                        .global()
+                        .ok_or_else(|| Error::format(crate::param_fill::NAME, "no global lsm2 state"))?;
+                    crate::param_fill::read(bytes, b, &sel.strip, saved)?
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+
         Ok(Tuning {
             aid: b.manifest.aid.clone(),
             acoustic_id: b.manifest.acoustic_id,
@@ -569,6 +589,7 @@ impl Tuning {
             },
             spts,
             mask_lattice_present: mask_lattice.is_some(),
+            lsm2_param_fill,
             volume_range,
             mask_lattice,
             graph,

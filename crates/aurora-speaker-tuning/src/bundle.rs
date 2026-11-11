@@ -282,6 +282,8 @@ impl Bundle {
             files: Vec::new(),
             shared: Vec::new(),
             mask_lattice: None,
+            param_fill: None,
+            param_fill_unit_versions: Vec::new(),
         };
         Ok(Bundle { manifest, files, source: root.to_owned(), verified: false, unlisted: Vec::new() })
     }

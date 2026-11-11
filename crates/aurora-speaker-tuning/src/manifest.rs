@@ -111,6 +111,8 @@ pub struct Manifest {
     /// Mac's AudioDSP ([`crate::lattice`]); `None` in bundles collected
     /// before it.
     pub mask_lattice: Option<Record>,
+    pub param_fill: Option<Record>,
+    pub param_fill_unit_versions: Vec<u32>,
 }
 
 /// The installer's `lsm2_mask_lattice` record.
@@ -123,6 +125,20 @@ struct LatticeJson {
     version: u32,
     format: String,
     entries: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FillJson {
+    path: String,
+    bytes: u64,
+    sha256: String,
+    version: u32,
+    format: String,
+    aid: String,
+    macos_build: String,
+    unit_id: String,
+    unit_versions: Vec<u32>,
 }
 
 #[derive(Deserialize)]
@@ -163,6 +179,8 @@ struct InstallerJson {
     /// Optional: bundles collected before the installer read it have none.
     #[serde(default)]
     lsm2_mask_lattice: Option<LatticeJson>,
+    #[serde(default)]
+    lsm2_param_fill: Option<FillJson>,
 }
 
 #[derive(Deserialize)]
@@ -181,6 +199,7 @@ impl Manifest {
             .chain(self.speaker_thiele_small.iter())
             .chain(self.shared.iter())
             .chain(self.mask_lattice.iter())
+            .chain(self.param_fill.iter())
     }
 
     /// Parses `manifest.json` (installer).
@@ -276,6 +295,26 @@ impl Manifest {
                 Some(Record { path: l.path, bytes: l.bytes, sha256: l.sha256 })
             }
         };
+        let (param_fill, param_fill_unit_versions) = match j.lsm2_param_fill {
+            None => (None, Vec::new()),
+            Some(f) => {
+                use crate::param_fill;
+                if f.path != param_fill::NAME
+                    || f.bytes == 0
+                    || f.bytes > param_fill::MAX_BYTES as u64
+                    || f.version != param_fill::VERSION
+                    || f.format != param_fill::FORMAT
+                    || f.aid != j.aid
+                    || f.macos_build != j.macos_build
+                    || Some(&f.unit_id) != j.unit_id.as_ref()
+                    || f.unit_versions.is_empty()
+                    || f.unit_versions.windows(2).any(|w| w[0] >= w[1])
+                {
+                    return Err(Error::format(NAME, "malformed or incorrectly bound lsm2 fill record"));
+                }
+                (Some(Record { path: f.path, bytes: f.bytes, sha256: f.sha256 }), f.unit_versions)
+            }
+        };
         let prefix = format!("{}/", j.aid);
         let folder = j.files.iter().filter(|r| r.path.starts_with(&prefix)).count() as u64;
         if j.source_file_count == 0 || j.source_file_count != folder {
@@ -298,6 +337,8 @@ impl Manifest {
             files: j.files,
             shared,
             mask_lattice,
+            param_fill,
+            param_fill_unit_versions,
         };
         m.check(NAME)?;
         Ok(m)
@@ -330,6 +371,8 @@ impl Manifest {
             files,
             shared: Vec::new(),
             mask_lattice: None,
+            param_fill: None,
+            param_fill_unit_versions: Vec::new(),
         };
         m.check(COLLECTOR_NAME)?;
         Ok(m)

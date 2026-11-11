@@ -84,3 +84,27 @@ self-check and kernel ownership design. Acelogic performed the J813
 integration checks and added the T8142 transport description and continuous
 capture lifecycle fix. The tuning
 reader retains its existing aurora-audio-dsp and saku attribution.
+
+## Owner-local short-preset fill
+
+Short lsm2 presets remain model-only and mandatory muted without the optional
+`lsm2_param_fill` bundle record. The Python macOS collector obtains it from
+the owner's running AudioUnit after applying the strip and propstrip. It
+contains a full published ID/name readback, bound to the unit, AID, macOS
+build, strip, exact preset hash and complete source-configuration digest. Only the IDs absent from the preset may
+supply missing records; carried values are never overridden. The filled set
+must match the complete 1,021-ID schema. A saved append-map ID (21512 on the
+963-record presets) is accepted only when the unit publishes it, and stays out
+of the compiled model; any other unknown saved ID is refused. A unit that
+reports no version is recorded as version 0 and bound by the macOS build and
+the SHA-256 of its component executable. No tuning defaults are distributed.
+Existing companion/model/voicing release gates remain mandatory.
+
+The reported saved total `Latency` does not determine engine latency. The
+compiler uses the structural `FilterbankLatency` to construct the FIR bank;
+the engine derives delay from the constructed bank's tap count, look-ahead
+and controller buffering. Full-preset payload bytes are unaffected.
+
+For an older collection, `aurora-speaker-upgrade status` and `--check` point
+to `aurora-speaker-upgrade guide` (route 3), since a mounted system volume or
+restore image cannot host the owner's running macOS AudioUnit.

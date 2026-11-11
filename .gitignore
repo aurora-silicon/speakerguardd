@@ -10,3 +10,5 @@ speaker-thiele-small.bin
 /traces/
 __pycache__/
 *.pyc
+
+lsm2-param-fill.bin

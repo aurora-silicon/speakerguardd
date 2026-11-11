@@ -59,16 +59,19 @@ class FWPackage(object):
 
     def add_file(self, name, data):
         ti = tarfile.TarInfo(name)
+        if name == "apple/audio-tuning/lsm2-param-fill.bin":
+            ti.mode = 0o600
+        key = (data.sha, ti.mode)
         fd = None
-        if data.sha in self.hashes:
+        if key in self.hashes:
             ti.type = tarfile.LNKTYPE
-            ti.linkname = self.hashes[data.sha]
+            ti.linkname = self.hashes[key]
             self.manifest.append(f"LINK {name} {ti.linkname}")
         else:
             ti.type = tarfile.REGTYPE
             ti.size = len(data.data)
             fd = io.BytesIO(data.data)
-            self.hashes[data.sha] = name
+            self.hashes[key] = name
             self.manifest.append(f"FILE {name} SHA256 {data.sha}")
 
         logging.info(f"+ {self.manifest[-1]}")

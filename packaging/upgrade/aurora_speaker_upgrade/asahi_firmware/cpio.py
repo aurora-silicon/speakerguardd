@@ -70,9 +70,9 @@ class CPIO:
                 self.dirs.add(path)
 
         if ti.type == tarfile.LNKTYPE:
-            self.cpio_hdr(ti.name, self.FILE, 0, ti.linkname)
+            self.cpio_hdr(ti.name, 0o100000 | (ti.mode & 0o777), 0, ti.linkname)
         elif ti.type == tarfile.REGTYPE:
-            self.cpio_hdr(ti.name, self.FILE, ti.size)
+            self.cpio_hdr(ti.name, 0o100000 | (ti.mode & 0o777), ti.size)
             self.fd.write(fd.read())
         else:
             raise Exception(f"Unsupported file type {ti.type}")
