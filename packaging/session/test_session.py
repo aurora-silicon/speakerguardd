@@ -522,6 +522,27 @@ class Idle(unittest.TestCase):
                          sorted(str(g.node_id(n)) for n in ("sgv2.speaker.j616", "sgv2.sense.j616")))
         self.assertTrue(all(a[:2] == ["pw-cli", "send-command"] and a[3] == "Suspend" for a in ran), ran)
 
+    def test_a_capture_of_the_amps_is_unlinked_until_the_grant(self):
+        g, p, s = build("j616", linked=False)
+        spk = g.node_id("sgv2.speaker.j616")
+        mon = [g.port(spk, "out", f"AUX{i}") for i in range(2)]
+        g.objs[mon[0]]["info"]["props"]["port.monitor"] = True
+        g.objs[mon[1]]["info"]["props"]["port.monitor"] = True
+        rec = g.node("pw-record")
+        rec_p = [g.port(rec, "in", ch) for ch in ("FL", "FR")]
+        links = [g.link(a, b) for a, b in zip(mon, rec_p)]
+        # not granted, or granted with nothing playing: both links go, and
+        # the sink is not suspended while they are there
+        for granted, play in ((False, True), (False, False), (True, False)):
+            ran = self._reconcile(g, s, granted, play)
+            self.assertEqual(sorted(ran), sorted(["pw-link", "-d", str(l)] for l in links), (granted, play))
+            s.pending.clear()
+        # granted and playing: a capture of the protected output is left alone
+        ran = self._reconcile(g, s, True, True)
+        self.assertFalse(any(a[:2] == ["pw-link", "-d"] for a in ran), ran)
+        # it is not a fault either way
+        self.assertEqual(s.check(g), (True, True))
+
     def test_granted_and_playing_links_and_playing_alone_never_does(self):
         c = MACHINES["j616"]
         g, p, s = build("j616", linked=False)
