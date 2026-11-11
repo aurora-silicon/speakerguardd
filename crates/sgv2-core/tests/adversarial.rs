@@ -2617,7 +2617,8 @@ fn lsm2_hard_temperature_limit_holds_within_the_cap() {
         p.ch[0].temperature_hard_limit = p.ch[0].ambient + 10.0;
         let mut u = lsm2::Unit::new(p);
         assert!(!u.is_failsafe());
-        let x = vec![signal(9, 1, 48_000 * 20, 1.0, Hostility::Clean)[0].iter().map(|v| v.signum()).collect::<Vec<_>>()];
+        let x =
+            vec![signal(9, 1, 48_000 * 20, 1.0, Hostility::Clean)[0].iter().map(|v| v.signum()).collect::<Vec<_>>()];
         let rr = render(&mut u, &x, None, &[512], &mut no_sense, true);
         let limit = p.ch[0].temperature_hard_limit + p.ch[0].temperature_headroom.max(0.0);
         let n = rr.tele.len();
