@@ -766,10 +766,20 @@ def session_stop(p, user, grace=STOP_GRACE_S, kill_wait=KILL_WAIT_S):
 
     up, st = wait(running, min(end, t0 + grace))
     if up:
-        log(f"{user}: {', '.join(f'{u} ({st.get(u)})' for u in up)} still running {grace:.0f} s after SIGTERM: SIGKILL")
-        user_systemctl(user, "kill", "--signal=SIGKILL", *up, timeout=left())
-        out["killed"] = up
-        up, st = wait(up, end)
+        # The unit that ignores SIGTERM is "deactivating"; the ones ordered
+        # behind it (PipeWire behind WirePlumber) are still "active" with
+        # their stop queued, and stop by themselves once it is gone.
+        hung = [u for u in up if st.get(u) == "deactivating"] or up
+        log(f"{user}: {', '.join(f'{u} ({st.get(u)})' for u in up)} still running {grace:.0f} s after SIGTERM: "
+            f"SIGKILL to {', '.join(hung)}")
+        user_systemctl(user, "kill", "--signal=SIGKILL", *hung, timeout=left())
+        out["killed"] = list(hung)
+        up, st = wait(up, min(end, time.monotonic() + kill_wait / 2))
+        if up:
+            log(f"{user}: {', '.join(f'{u} ({st.get(u)})' for u in up)} still running after SIGKILL to the first: SIGKILL")
+            user_systemctl(user, "kill", "--signal=SIGKILL", *up, timeout=left())
+            out["killed"] += [u for u in up if u not in out["killed"]]
+            up, st = wait(up, end)
         user_systemctl(user, "reset-failed", *out["killed"], timeout=left())
     out["stuck"] = up
     out["seconds"] = round(time.monotonic() - t0, 1)

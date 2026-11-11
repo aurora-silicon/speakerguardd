@@ -780,6 +780,7 @@ class FakeUserManager:
         self.state = {u: ("active" if u in active else "inactive") for u in prov.SESSION_UNITS}
         self.hung, self.unkillable, self.session = set(hung), set(unkillable), session
         self.calls = []
+        self.killed = []
 
     def monotonic(self):
         return self.now
@@ -793,15 +794,26 @@ class FakeUserManager:
         if not self.session:
             return types.SimpleNamespace(returncode=1, stdout="", stderr="no user bus")
         if a[0] == "show":
+            # PipeWire's stop waits for WirePlumber's (WirePlumber is ordered after it)
+            for u in ("pipewire.service", "pipewire.socket"):
+                if self.state.get(u) == "stopping" and self.state["wireplumber.service"] in ("inactive", "failed"):
+                    self.state[u] = "inactive"
             units = [x for x in a[1:] if not x.startswith("--")]
-            out = "\n\n".join(f"Id={u}\nLoadState=loaded\nActiveState={self.state[u]}" for u in units if u in self.state)
+            shown = lambda u: "active" if self.state[u] == "stopping" else self.state[u]  # noqa: E731
+            out = "\n\n".join(f"Id={u}\nLoadState=loaded\nActiveState={shown(u)}" for u in units if u in self.state)
             return types.SimpleNamespace(returncode=0, stdout=out + "\n", stderr="")
         units = [x for x in a[1:] if not x.startswith("--")]
         if a[0] == "stop":
             for u in units:
-                self.state[u] = "deactivating" if u in self.hung else "inactive"
+                if u in self.hung:
+                    self.state[u] = "deactivating"
+                elif u in ("pipewire.service", "pipewire.socket") and "wireplumber.service" in self.hung:
+                    self.state[u] = "stopping"  # queued behind WirePlumber, shown as active
+                else:
+                    self.state[u] = "inactive"
         elif a[0] == "kill":
             assert "--signal=SIGKILL" in a
+            self.killed += units
             for u in units:
                 if u not in self.unkillable:
                     self.state[u] = "failed"
@@ -863,8 +875,11 @@ class SessionStopStart(unittest.TestCase):
         m = FakeUserManager(active=self.ALL, hung={"wireplumber.service"})
         with self.manager(m):
             out = prov.session_stop(self.p, "u", grace=15, kill_wait=10)
+        # only the unit that ignored SIGTERM; PipeWire, queued behind it, stops by itself
         self.assertEqual(out["killed"], ["wireplumber.service"])
+        self.assertEqual(m.killed, ["wireplumber.service"])
         self.assertEqual(out["stuck"], [])
+        self.assertTrue(all(m.state[u] == "inactive" for u in self.ALL))
         kill_at = [c[0] for c in m.calls if c[1][0] == "kill"]
         self.assertEqual(len(kill_at), 1)
         self.assertGreaterEqual(kill_at[0], 15)
