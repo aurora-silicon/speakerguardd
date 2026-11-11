@@ -929,6 +929,22 @@ fn finish_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics, p: lsm2::Params) 
     let vfs: Vec<f32> = p.ch[..n].iter().map(|c| c.volts_full_scale).collect();
     let full_scale_mv = operating_point("VoltsFullScale", &vfs)?;
     let mut payload = p.as_bytes().to_vec();
+    let mut calibration_present = 0u32;
+    let mut calibration_temperature = [0.0f32; MAX_CHANNELS];
+    if let Some(spts) = t.spts.as_ref().filter(|s| b.calibration_trusted && s.checksum_valid) {
+        if spts.records.len() < n {
+            return Err(bad(format!("SpTS has {} records for {n} LSM2 channels", spts.records.len())));
+        }
+        for (c, record) in spts.records[..n].iter().enumerate() {
+            calibration_present |= 1 << c;
+            calibration_temperature[c] = record.t_cal_c as f32;
+        }
+        diags.info(
+            "lsid-calibration-control-temperature",
+            "compile",
+            "trusted LSID calibration seeds each channel's control temperature; release gate remains mandatory",
+        );
+    }
     if let Some(lsid) = &t.lsid {
         use lsm2::companion::{Companion, LEGACY_ESTIMATOR, UNQUALIFIED_FLOW, UNQUALIFIED_MODEL, UNQUALIFIED_VOICING};
         let flow = t.protection.property_files.iter().find(|f| f.number == 6632);
@@ -958,8 +974,16 @@ fn finish_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics, p: lsm2::Params) 
             topology: lsid.topology,
             flow: flow.map(|f| crate::plist::binary::write(&f.value)).unwrap_or_default(),
             property_64004,
-            flow_roles: if n == 6 { Companion::six_flow_roles() } else { [[0; 2]; 6] },
+            flow_roles: if n == 6 {
+                Companion::six_flow_roles()
+            } else if n == 4 {
+                Companion::four_flow_roles()
+            } else {
+                [[0; 2]; 6]
+            },
             systems: if n == 6 { Companion::six_systems() } else { [0; MAX_CHANNELS] },
+            calibration_present,
+            calibration_temperature,
         };
         if let Some(why) = companion.geometry_error() {
             return Err(bad(why));
@@ -990,7 +1014,7 @@ fn finish_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics, p: lsm2::Params) 
         sample_rate: p.sample_rate,
         board: b.board.clone(),
         full_scale_mv,
-        calibration: false,
+        calibration: calibration_present.count_ones() as usize == n,
         blob,
     })
 }

@@ -12,7 +12,8 @@ use crate::{
 };
 use alloc::vec::Vec;
 
-const MAGIC: &[u8; 8] = b"LSIDBND1";
+const MAGIC_V1: &[u8; 8] = b"LSIDBND1";
+const MAGIC_V2: &[u8; 8] = b"LSIDBND2";
 pub const UNQUALIFIED_FLOW: u32 = 1;
 pub const UNQUALIFIED_MODEL: u32 = 2;
 pub const LEGACY_ESTIMATOR: u32 = 4;
@@ -149,6 +150,10 @@ pub struct Companion {
     /// Logical controller labels, independently of the preserved raw
     /// SystemNumber selectors whose label/base mapping is unqualified.
     pub systems: [u32; MAX_CHANNELS],
+    /// Per-channel calibration-temperature offsets used to seed the LSM2
+    /// control temperature. A set bit owns the corresponding finite value.
+    pub calibration_present: u32,
+    pub calibration_temperature: [f32; MAX_CHANNELS],
 }
 impl Companion {
     pub fn validate(&self) -> Result<(), BlobError> {
@@ -159,6 +164,18 @@ impl Companion {
             || self.gates & !15 != 0
         {
             return Err(BlobError::Channels);
+        }
+        let valid_mask = (1u32 << self.channels) - 1;
+        if self.calibration_present & !valid_mask != 0
+            || self.calibration_temperature.iter().enumerate().any(|(c, &v)| {
+                if self.calibration_present & (1 << c) != 0 {
+                    !v.is_finite()
+                } else {
+                    v != 0.0
+                }
+            })
+        {
+            return Err(BlobError::Unstable);
         }
         validate_records(&self.lsm2_records, self.channels == 6)?;
         if self.channels == 6 {
@@ -221,9 +238,17 @@ impl Companion {
     pub fn six_flow_roles() -> [[u32; 2]; 6] {
         [[0, 0], [1, 0], [0, 0], [1, 0], [0, 1], [1, 1]]
     }
+    /// LSID four-channel unit order: woofer, tweeter on each side.
+    pub fn four_flow_roles() -> [[u32; 2]; 6] {
+        [[0, 0], [0, 1], [1, 0], [1, 1], [0, 0], [0, 0]]
+    }
+    pub fn calibration_temperature(&self, channel: usize) -> Option<f32> {
+        (channel < self.channels as usize && self.calibration_present & (1 << channel) != 0)
+            .then_some(self.calibration_temperature[channel])
+    }
     pub fn encode(&self) -> Result<Vec<u8>, BlobError> {
         self.validate()?;
-        let mut out = MAGIC.to_vec();
+        let mut out = MAGIC_V2.to_vec();
         let push = |out: &mut Vec<u8>, v: u32| out.extend_from_slice(&v.to_le_bytes());
         for v in [
             self.gates,
@@ -243,6 +268,10 @@ impl Companion {
         }
         for v in self.systems {
             push(&mut out, v);
+        }
+        push(&mut out, self.calibration_present);
+        for v in self.calibration_temperature {
+            push(&mut out, v.to_bits());
         }
         if let Some(t) = self.topology {
             out.extend_from_slice(&t.source);
@@ -279,9 +308,14 @@ impl Companion {
             }
         }
         let mut r = Reader(bytes);
-        if r.take(8)? != MAGIC {
+        let magic = r.take(8)?;
+        let v2 = if magic == MAGIC_V2 {
+            true
+        } else if magic == MAGIC_V1 {
+            false
+        } else {
             return Err(BlobError::Magic);
-        }
+        };
         let gates = r.word()?;
         let channels = r.word()?;
         let n = r.word()? as usize;
@@ -302,6 +336,16 @@ impl Companion {
         for v in &mut systems {
             *v = r.word()?;
         }
+        let (calibration_present, calibration_temperature) = if v2 {
+            let present = r.word()?;
+            let mut temperature = [0.0; MAX_CHANNELS];
+            for v in &mut temperature {
+                *v = f32::from_bits(r.word()?);
+            }
+            (present, temperature)
+        } else {
+            (0, [0.0; MAX_CHANNELS])
+        };
         let topology = match has_topology {
             0 => None,
             1 => {
@@ -321,8 +365,19 @@ impl Companion {
         if !r.0.is_empty() {
             return Err(BlobError::Length);
         }
-        let out =
-            Self { gates, channels, lsm2_records, lsid_records, topology, flow, property_64004, flow_roles, systems };
+        let out = Self {
+            gates,
+            channels,
+            lsm2_records,
+            lsid_records,
+            topology,
+            flow,
+            property_64004,
+            flow_roles,
+            systems,
+            calibration_present,
+            calibration_temperature,
+        };
         out.validate()?;
         Ok(out)
     }

@@ -1,11 +1,13 @@
 # Single-resonator compensation component
 
 This component implements the finite-damping, single-resonator transfer
-observed through the native AudioUnit interface. It is not connected to the
-LSM2 protection unit. In particular, the placement relative to its nonlinear
-gain laws, its adaptive model updates, and the other J813 model features are
-not established by this component's small-signal verification. The compiler
-and fleet gate continue to refuse unsupported protection configurations.
+observed through the native AudioUnit interface. For an LSID companion that
+requests this supported single-resonator form, LSM2 applies it to the woofer
+lanes before every limiter model and gain decision. Tweeter lanes are
+unchanged. A host reset clears its history and failure latch. Adaptive model
+updates and the other J813 model features remain outside this component's
+scope, and the compiler and fleet gate continue to refuse or mute unsupported
+protection configurations.
 
 Given the runtime model's resistance R, force factor B, moving mass M,
 mechanical damping D and stiffness K, let:
@@ -24,11 +26,12 @@ discrete filter are refused. There is no fallback to an uncompensated signal.
 Processing has no allocation and retains history across blocks. Nonfinite
 input/output clears the current output block and latches a fault until reset.
 
-The equations were derived independently from controlled AudioUnit impulse
-observations. No Apple code, coefficients, tuning or recordings are included.
+The equations and placement were derived independently from controlled,
+offline AudioUnit observations. No Apple code, coefficients, tuning or
+recordings are included.
 The file-only `resonator-render` example and `verify-resonator.py` compare a
 fresh Rust binary against privately supplied native captures. The verifier
-checks five small-signal parameter/clamp cases, unchanged uncompensated
-channels, reset/block-size invariance and malformed-input refusal, and emits
+checks five small-signal parameter/clamp cases, unchanged tweeter channels,
+reset/block-size invariance and malformed-input refusal, and emits
 a JSON artifact with binary/input hashes and numerical errors. This evidence
-does not qualify a complete LSM2 engine or a speaker for audible use.
+does not qualify a complete LSM2/LSID engine or a speaker for audible use.

@@ -23,10 +23,12 @@ derivation. The subsequent physical silent check passed all nine phases
 classification thresholds and S24_LE playback. This does not establish
 protected playback or PipeWire timing.
 
-J813's native tuning selects LSM2 and requests mechanisms that the live
-engine cannot yet represent. The compiler must continue refusing that
-configuration; see [the compensation component](RESONATOR-COMPONENT.md) for
-its independently checked scope. LSM2 also remains outside
+J813's native tuning selects LSM2 with an LSID companion and still requests
+mechanisms that are not release-qualified. The compiler retains the supported
+single-resonator compensation at its native pre-limiter, woofer-only position
+and seeds control temperature from trusted per-unit calibration, but the
+companion gate keeps output muted. See [the compensation
+component](RESONATOR-COMPONENT.md) for its checked scope. LSID remains outside
 `units_at_parity`, and J813 is not added to the qualified-board list.
 
 The existing LSM2 graph takes program samples only. Detecting physical V/I

@@ -8,7 +8,7 @@ use sgv2_core::{
         self,
         companion::{self, Companion},
     },
-    Io, ProtectionUnit, UnitKind,
+    Io, ProtectionUnit, UnitKind, MAX_CHANNELS,
 };
 
 fn preset() -> Preset {
@@ -84,6 +84,8 @@ fn companion() -> Companion {
         property_64004: 1,
         flow_roles: Companion::six_flow_roles(),
         systems: Companion::six_systems(),
+        calibration_present: 0,
+        calibration_temperature: [0.0; MAX_CHANNELS],
     }
 }
 fn bundle() -> Vec<u8> {
