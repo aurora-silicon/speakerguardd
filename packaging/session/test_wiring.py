@@ -9,6 +9,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import re
 import sys
 import unittest
 from unittest import mock
@@ -994,6 +995,141 @@ class Describe(unittest.TestCase):
             c, w = gen.machine(m)
             self.assertEqual(c["key"], m)
             self.assertIn(f'hw:CARD={c["card"]},DEV=1', gen.pipewire_conf(m, c, w))
+
+
+class PcmWidths(unittest.TestCase):
+    """A transport whose PCMs are wider than the link's amps: the T6040
+    speaker service has six playback and twelve sense channels on every
+    Mac, and the MacBook Air M4 (T8132 AOP) puts four amps on it."""
+
+    CPU = ["apple,t8132-aop-audio", "apple,t6041-aop-audio", "apple,t6030-aop-audio"]
+
+    def hw(self):
+        """Four SN012776 amps on one I2C bus behind one AOP back-end, as the
+        device tree of the MacBook Air M4 describes them, on a made-up board."""
+        amps = (("Left Woofer", 0x38), ("Right Woofer", 0x3B), ("Left Tweeter", 0x39), ("Right Tweeter", 0x3C))
+        return {
+            "board": "j998", "compatible": ["apple,j998", "apple,t8132", "apple,arm-platform"], "sound": "sound",
+            "sound_compatible": ["apple,j998-macaudio", "apple,macaudio"], "model": "Test Mac J998",
+            "links": [{"name": "Speakers", "cpus": 1, "cpu_compatible": [list(self.CPU)], "codecs": [
+                {"node": f"soc/i2c@3ad01c000/codec@{addr:x}", "prefix": prefix, "compatible": ["ti,sn012776", "ti,tas2764"],
+                 "vmon": 4 * k + 2, "imon": 4 * k}
+                for k, (prefix, addr) in enumerate(amps)]}],
+        }
+
+    def machine(self, hw):
+        w = wiring.derive(hw, fx("j413")["tuning"])
+        return wiring.describe(hw, w), w
+
+    def test_from_a_device_tree(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            fake_dt(d, self.hw(), jack_card=True)
+            live = wiring.read_dt(d, sysfs=os.path.join(d, "nosysfs"))
+            path = os.path.join(d, "t.dtb")
+            with open(path, "wb") as f:
+                f.write(fdt(dir_tree(d)))
+            compiled = wiring.read_dtb(path)
+        for hw in (live, compiled):
+            c, w = self.machine(hw)
+            self.assertEqual(
+                {k: c[k] for k in ("card", "transport", "amps", "sense", "speaker_pcm", "sense_pcm", "plugin", "alsa_format")},
+                {"card": "AppleJ998", "transport": "aop-spkr", "amps": 4, "sense": 8, "speaker_pcm": 6, "sense_pcm": 12,
+                 "plugin": "4ch-vi", "alsa_format": "S24_LE"},
+            )
+            # the amps' lanes are the first ones of each PCM
+            self.assertEqual([a["slot"] for a in w["amps"]], [0, 1, 2, 3])
+            self.assertEqual([s["pcm"] for s in w["sense"]], list(range(8)))
+            self.assertEqual([s["kind"] for s in w["sense"]], ["I", "V"] * 4)
+
+    def test_the_specific_compatible_is_the_fallbacks_transport(self):
+        want, _ = self.machine(self.hw())
+        h = self.hw()
+        h["links"][0]["cpu_compatible"] = [self.CPU[1:]]
+        self.assertEqual(self.machine(h)[0], want)
+        h["links"][0]["cpu_compatible"] = [self.CPU[:1]]
+        self.assertEqual(self.machine(h)[0], want)
+
+    def test_other_transports_are_as_wide_as_their_amps(self):
+        for m in gen.machines():
+            c, _ = gen.machine(m)
+            f = fx(m)
+            self.assertEqual((c["speaker_pcm"], c["sense_pcm"]),
+                             (c["amps"], len(wiring.derive(f["hw"], f["tuning"])["sense"])), m)
+        # the six-amp Macs fill the speaker service's PCMs
+        c, _ = gen.machine("j616")
+        self.assertEqual((c["transport"], c["speaker_pcm"], c["sense_pcm"]), ("aop-spkr", 6, 12))
+
+    def test_a_unit_without_sense_ports_still_has_a_sense_pcm(self):
+        hw = self.hw()
+        w = wiring.derive(hw, fx("j413")["tuning"])
+        w["unit_kind"], w["sense_companion"] = "lsm2", False
+        c = wiring.describe(hw, w)
+        # the graph has no sense node; the self-check still captures twelve channels
+        self.assertEqual((c["sense"], c["plugin"], c["speaker_pcm"], c["sense_pcm"]), (0, "4ch", 6, 12))
+
+    def test_more_amps_than_channels_is_refused(self):
+        t = wiring.TRANSPORTS["apple,t6041-aop-audio"]
+        self.assertEqual(wiring.pcm_widths(t, 6, 12), (6, 12))
+        with self.assertRaises(wiring.Refused) as cm:
+            wiring.pcm_widths(t, 8, 16)
+        self.assertIn("8 amps on a 6-channel speaker PCM", str(cm.exception))
+        with self.assertRaises(wiring.Refused) as cm:
+            wiring.pcm_widths(dict(t, speaker_channels=8), 7, 14)
+        self.assertIn("14 sense lanes on a 12-channel sense PCM", str(cm.exception))
+        self.assertEqual(wiring.pcm_widths(wiring.TRANSPORTS["apple,mca"], 4, 8), (4, 8))
+        self.assertEqual(wiring.pcm_widths(wiring.TRANSPORTS["apple,t8140-aop-audio"], 2, 0), (2, 0))
+
+    def test_the_graph_opens_the_pcms_at_their_width(self):
+        c, w = self.machine(self.hw())
+        conf = gen.pipewire_conf("j998", c, (w["unit_channels"], w["sense_ports"], w["hash"]))
+
+        def node(name):
+            body = conf.split(f'"{name}"')[1]
+            return tuple(re.search(rf"audio\.{k}\s*=\s*(.+)", body).group(1).strip() for k in ("channels", "position"))
+
+        n = gen.names("j998")
+        self.assertEqual(node(n["speaker"]), ("6", "[ AUX0 AUX1 AUX2 AUX3 AUX4 AUX5 ]"))
+        self.assertEqual(node(n["sense"]), ("12", "[ " + " ".join(f"AUX{k}" for k in range(12)) + " ]"))
+        # the protect stage itself keeps one port per amp and per V/I lane
+        self.assertIn("audio.channels     = 12\n", conf)
+        self.assertIn('inputs  = [ "sgv2:in_0" "sgv2:in_1" "sgv2:in_2" "sgv2:in_3" ' + " ".join(
+            f'"sgv2:sense_{p}"' for p in w["sense_ports"]) + " ]", conf)
+
+    def test_the_self_check_opens_the_pcms_at_their_width(self):
+        c, _ = self.machine(self.hw())
+        self.assertEqual(sgsc.pcm_widths(c), (6, 12))
+        self.assertIsNone(sgsc.pcm_widths(None))
+        st = sgsc.Streams(None, "AppleJ998", 1, 2, 4, 48000, sgsc.pcm_widths(c))
+        self.assertEqual(st.frame_bytes, 24)
+        with mock.patch.object(sgsc.subprocess, "Popen") as popen:
+            st._play("S24_LE")
+        argv = popen.call_args[0][0]
+        self.assertEqual(argv[argv.index("-c") + 1], "6")
+        # without a description (no transport): as wide as the amps
+        st = sgsc.Streams(None, "AppleJ998", 1, 2, 4, 48000)
+        self.assertEqual((st.spk_ch, st.sense_ch, st.frame_bytes), (4, 8, 16))
+
+    def test_a_description_without_the_widths_generates_the_same_graph(self):
+        # a passing self-check record written before the description carried
+        # the widths is reused (same kernel and parameters): its Mac's PCMs
+        # are as wide as its amps
+        for m in gen.machines():
+            c, w = gen.machine(m)
+            old = {k: v for k, v in c.items() if k not in ("speaker_pcm", "sense_pcm")}
+            self.assertEqual(gen.pipewire_conf(m, old, w), gen.pipewire_conf(m, c, w), m)
+
+    def test_only_the_amps_lanes_are_judged(self):
+        import struct
+
+        frames = 480
+        raw = b"".join(struct.pack("<12h", *([f % 97 + k for k in range(8)] + [0, 0, f, -f])) for f in range(frames))
+        st = sgsc.amp_lanes(sgsc.stats(raw, 12), 4)
+        self.assertEqual((st["frames"], len(st["ch"])), (frames, 8))
+        self.assertEqual(sgsc.classify(st), ["live"] * 8)
+        self.assertIsNone(sgsc.amp_lanes(sgsc.stats(b"", 12), 4))
+        self.assertEqual(sgsc.amp_lanes(sgsc.stats(raw[: 16 * frames], 8), 4)["ch"], sgsc.stats(raw[: 16 * frames], 8)["ch"])
 
 
 class Record(unittest.TestCase):
