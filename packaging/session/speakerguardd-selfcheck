@@ -90,8 +90,10 @@ and stops at the first failing step:
    the macOS parity attestation for this tuning: the gate renders every
    tuning of the macOS release through Apple's own Audio Units and through
    this code (tools/diffrig/aidgate/attest.py), and this tuning must be
-   within its tolerance, for this build's rendering code. A tuning with no
-   attestation, or one for other code, is refused.
+   within its tolerance, for this build's rendering code. The block used is
+   the tuning's own macOS build's, or 25G83's when the tuning's speaker files
+   are byte-identical to 25G83's (v2 renders those with 25G83's laws). A
+   tuning with no attestation, or one for other code, is refused.
 3. **graph**: the speaker graph must hold the 512-frame quantum the gate
    measured (generated config); with a session up, the speaker and sense
    nodes must show no xrun since the graph started beyond one per grant
