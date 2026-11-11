@@ -216,6 +216,7 @@ mod linux {
             if unsafe { libc::sched_setscheduler(0, libc::SCHED_FIFO, &sp) } != 0 {
                 eprintln!("PCM reader: SCHED_FIFO unavailable; normal priority");
             }
+            no_frequency_floor();
             let paths: Vec<String> = (0..subs).map(|s| format!("{dir}/sub{s}/status")).collect();
             let mut buf = String::with_capacity(1024);
             let mut tbuf = String::with_capacity(2048);
@@ -254,6 +255,7 @@ mod linux {
             if unsafe { libc::sched_setscheduler(0, libc::SCHED_FIFO, &sp) } != 0 {
                 eprintln!("helper checker: SCHED_FIFO unavailable; normal priority");
             }
+            no_frequency_floor();
             let mut hbuf = String::with_capacity(1024);
             loop {
                 let started = now_ns();
@@ -428,6 +430,18 @@ mod linux {
         (ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64).saturating_sub(now_ns())
     }
 
+    /// The watch thread wakes every second. A wake that comes this much
+    /// later means the whole process was frozen (the system's freezer during
+    /// a sleep, including a pm_test sleep whose clocks keep running and which
+    /// the suspend counters do not count), not that the loop hung: a hung
+    /// loop leaves this thread running.
+    pub(crate) const FROZEN_GAP_NS: u64 = 3_000_000_000;
+
+    /// Whether the watch's own wake gap shows the process was frozen.
+    pub(crate) fn frozen(gap_ns: u64) -> bool {
+        gap_ns > FROZEN_GAP_NS
+    }
+
     /// The watch's decision: hung only when the heartbeat is older than the
     /// limit and no sleep happened since the last look (`slept`).
     pub(crate) fn hung(now: u64, heartbeat: u64, limit: u64, slept: bool) -> bool {
@@ -437,11 +451,14 @@ mod linux {
     fn spawn_hang_watch() -> std::io::Result<()> {
         std::thread::Builder::new().name("hang-watch".into()).spawn(|| {
             let (mut seen, mut asleep) = (sleeps(), suspended_ns());
+            let mut woke = now_ns();
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(1));
-                let (count, susp) = (sleeps(), suspended_ns());
-                // a sleep since the last look: its freeze is not a stall
-                let slept = count != seen || susp > asleep + 500_000_000;
+                let (count, susp, now) = (sleeps(), suspended_ns(), now_ns());
+                // a sleep since the last look, or a freeze of the whole
+                // process (this thread too): its stall is not the loop's
+                let slept = count != seen || susp > asleep + 500_000_000 || frozen(now.saturating_sub(woke));
+                woke = now;
                 if slept {
                     // the loop gets a full limit after the thaw
                     HEARTBEAT_NS.store(now_ns(), Ordering::Relaxed);
@@ -456,6 +473,50 @@ mod linux {
             }
         })?;
         Ok(())
+    }
+
+    /// The kernel's `sched_attr` up to the utilization clamps (size 56).
+    #[repr(C)]
+    struct SchedAttr {
+        size: u32,
+        sched_policy: u32,
+        sched_flags: u64,
+        sched_nice: i32,
+        sched_priority: u32,
+        sched_runtime: u64,
+        sched_deadline: u64,
+        sched_period: u64,
+        sched_util_min: u32,
+        sched_util_max: u32,
+    }
+    const SCHED_FLAG_KEEP_POLICY: u64 = 0x08;
+    const SCHED_FLAG_KEEP_PARAMS: u64 = 0x10;
+    const SCHED_FLAG_UTIL_CLAMP_MIN: u64 = 0x20;
+
+    /// Drop this thread's utilization floor to 0, keeping its policy and
+    /// priority. A real-time thread with no clamp of its own inherits
+    /// `sched_util_clamp_min_rt_default` (1024), and schedutil then runs its
+    /// cluster at the top frequency every time it wakes. The pollers wake
+    /// every millisecond for a few microseconds of /proc reads, which held
+    /// the M2's performance cluster at 2.4-3.2 GHz with nothing playing.
+    /// They need the CPU on time, not fast. Failure (no uclamp support) is
+    /// harmless and ignored.
+    fn no_frequency_floor() {
+        let attr = SchedAttr {
+            size: core::mem::size_of::<SchedAttr>() as u32,
+            sched_policy: 0,
+            sched_flags: SCHED_FLAG_KEEP_POLICY | SCHED_FLAG_KEEP_PARAMS | SCHED_FLAG_UTIL_CLAMP_MIN,
+            sched_nice: 0,
+            sched_priority: 0,
+            sched_runtime: 0,
+            sched_deadline: 0,
+            sched_period: 0,
+            sched_util_min: 0,
+            sched_util_max: 0,
+        };
+        // SAFETY: this thread's own attributes; a valid, fully initialised
+        // sched_attr whose size field matches the struct.
+        unsafe { libc::syscall(libc::SYS_sched_setattr, 0, &attr as *const SchedAttr, 0u32) };
     }
 
     fn sleep_until(t: u64) {
@@ -905,8 +966,32 @@ mod linux {
         let mut idle_ready = false;
         notify.send("STATUS=supervising");
         let mut scheduled = true;
+        // CLOCK_BOOTTIME - CLOCK_MONOTONIC grows only while the system is
+        // suspended: a jump since the last tick means the engine's last beat
+        // predates a sleep (see observe's module notes).
+        // The kernel's suspend counters catch a pm_test sleep (the clocks
+        // keep running) too; reading them is two small sysfs files a tick.
+        let mut suspended = suspended_ns();
+        let mut slept = sleeps();
+        let mut waiting_after_sleep = false;
         loop {
+            let (s, n) = (suspended_ns(), sleeps());
+            if s > suspended.saturating_add(1_000_000) || n != slept {
+                observer.note_sleep();
+            }
+            (suspended, slept) = (s, n);
             let obs = observer.observe(&mut now_ns, &mut engine, &mut pcm_view, &mut session);
+            if observer.waiting_after_sleep() != waiting_after_sleep {
+                waiting_after_sleep = observer.waiting_after_sleep();
+                eprintln!(
+                    "{}",
+                    if waiting_after_sleep {
+                        "system sleep: waiting for the engine's first beat after the thaw before trusting its heartbeat"
+                    } else {
+                        "the engine beats again after the sleep"
+                    }
+                );
+            }
             let event = sup.tick(obs, &mut kernel);
             // the observer leaves the kernel-side checks to the supervisor,
             // which records any failure as its problem
@@ -924,13 +1009,19 @@ mod linux {
                 }
                 Ok(Event::Released { why }) => {
                     let session = observer.session_why();
+                    let (pcm, age) = observer.last_tick();
                     eprintln!(
-                        "protection released: {why:?}{}{session}",
+                        "protection released: {why:?}{}{session} (pcm {pcm:?}, engine beat {age:?} ms ago)",
                         if session.is_empty() { "" } else { "; session: " }
                     );
                 }
                 Ok(Event::HardFault(f)) => eprintln!("amp fault, protection withdrawn until restart: {f}"),
-                Ok(Event::Lapsed) => eprintln!("lease lapsed; re-qualifying"),
+                Ok(Event::Lapsed) => {
+                    // the kernel withdraws a lease at a system sleep: the next
+                    // grant waits for the engine to beat steadily after the thaw
+                    observer.note_sleep();
+                    eprintln!("lease lapsed; re-qualifying");
+                }
                 Ok(_) => {}
                 Err(Fatal::Kernel(e)) => {
                     eprintln!("kernel: {e:?}; exiting (the kernel floor holds)");
@@ -988,6 +1079,10 @@ mod linux {
             assert!(!hung(140 * s, 99 * s, HANG_NS, true));
             // not started yet
             assert!(!hung(140 * s, 0, HANG_NS, false));
+            // the watch's own wake gap: a frozen process, not a hung loop
+            assert!(!frozen(s + s / 10));
+            assert!(frozen(25 * s));
+            assert!(!frozen(FROZEN_GAP_NS));
             // exactly at the limit: not yet
             assert!(!hung(109 * s, 99 * s, HANG_NS, false));
         }

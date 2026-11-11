@@ -127,6 +127,9 @@ TRANSPORTS = {
     "apple,t8142-aop-audio": {"transport": "aop-dma", "formats": ["S24_LE"], "sense_batch": False, "speaker_headroom": 0,
                               "speaker_irq": False},
 }
+# Newer device trees omit the generic MCA fallback. Both compatibles bind
+# mca.c; share the entry so back-ends using either name are the same driver.
+TRANSPORTS["apple,t8103-mca"] = TRANSPORTS["apple,mca"]
 # The self-check's probe order on the speaker PCM.
 FORMAT_ORDER = ["S24_LE", "S32_LE", "S16_LE"]
 # ALSA format -> PipeWire audio.format (the 24-bit samples sit in 32-bit words).
@@ -264,6 +267,20 @@ def _links(snd, root, phandles, sysfs):
             {"name": _str(_read(os.path.join(p, "link-name"))), "cpus": len(cpu), "cpu_compatible": cpu_compat, "codecs": codecs}
         )
     return links
+
+
+def has_speaker_link(node):
+    """Whether a macaudio device tree node has the link macaudio drives
+    speakers on ("Speaker" or "Speakers"); the J614s/J616s/J713 jack-only
+    card has none."""
+    for c in os.listdir(node):
+        try:
+            with open(os.path.join(node, c, "link-name"), "rb") as f:
+                if f.read().rstrip(b"\0") in (b"Speaker", b"Speakers"):
+                    return True
+        except OSError:
+            continue
+    return False
 
 
 def read_dt(root="/proc/device-tree", sysfs="/sys/bus/i2c/devices"):
