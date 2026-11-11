@@ -1661,7 +1661,7 @@ struct Chan {
     t_hard: f64,
     t_headroom: f64,
     /// `10^(-MaxTemperatureAttenuation/20)`: the lowest gain the temperature
-    /// candidate applies (the output ceiling is not capped).
+    /// axis applies, its candidate and the output ceiling together.
     temp_floor: f64,
     /// The logged candidates: peak, displacement, velocity, linked power,
     /// temperature.
@@ -2768,11 +2768,13 @@ impl Run {
         if self.axis[4] {
             for (ci, c) in self.ch.iter().enumerate() {
                 // The output ceiling at TemperatureHardLimit + headroom is
-                // not capped by MaxTemperatureAttenuation, although the
-                // 25G83 rig's is (a 0.5 dB cap holds the audio while the
-                // model coil passes the hard limit): the hard limit stays a
-                // backstop here.
-                want[ci] = c.ceiling_scale(want[ci], ctl, sub, self.fb, self.ceiling_shift);
+                // part of the temperature axis and capped with it: it never
+                // takes the gain below MaxTemperatureAttenuation (25G83 rig:
+                // a 0.5 dB cap holds the audio while the model coil passes
+                // the hard limit), and never lifts a lower request of
+                // another axis.
+                let floor = (c.temp_floor as f32).min(want[ci]);
+                want[ci] = c.ceiling_scale(want[ci], ctl, sub, self.fb, self.ceiling_shift).max(floor);
             }
         }
         if self.link && n > 1 {
