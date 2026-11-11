@@ -254,6 +254,7 @@ class Pilot(unittest.TestCase):
             f.write(f"SGV2_MACHINE=j414\nSGV2_UID={os.getuid()}\n")
         self.args = mock.Mock(graph_dir=self.tmp.name, conf=None)
         self.refused = 0
+        self.grants = 0
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -272,6 +273,7 @@ class Pilot(unittest.TestCase):
 
         with mock.patch.object(sgsc, "CONF", self.conf), mock.patch.object(sgsc.subprocess, "run", fake_run), \
                 mock.patch.object(sgsc, "refused_starts", lambda: self.refused), \
+                mock.patch.object(sgsc, "grants", lambda: self.grants), \
                 mock.patch.object(sgsc.time, "sleep", lambda s: None), \
                 mock.patch.object(sgsc.os.path, "exists", lambda p: True):
             try:
@@ -280,28 +282,44 @@ class Pilot(unittest.TestCase):
                 return e, pilots
 
     def test_clean(self):
-        r, pilots = self.live([self.top(0, 0), self.top(0, 0)])
+        r, pilots = self.live([self.top(0, 0), self.top(0, 0), self.top(0, 0)])
         self.assertIn("no xrun", r)
-        self.assertEqual(len(pilots), sgsc.PILOT_STARTS)
+        # one pilot wakes the path, then the counted ones
+        self.assertEqual(len(pilots), sgsc.PILOT_STARTS + 1)
         # silent: every pilot sample is zero
         self.assertTrue(all(p and not any(p) for p in pilots))
 
     def test_xrun_at_stream_start_is_refused(self):
-        r, _ = self.live([self.top(0, 0), self.top(3, 0)])
+        r, _ = self.live([self.top(0, 0), self.top(0, 0), self.top(3, 0)])
         self.assertIsInstance(r, sgsc.wiring.Refused)
         self.assertIn("sgv2.speaker.j414 +3", str(r))
+
+    def test_the_wake_pilot_is_not_counted(self):
+        # the path was powered down: its wake starts the sink and may count one
+        r, _ = self.live([self.top(0, 0), self.top(1, 0), self.top(1, 0)])
+        self.assertIn("no xrun", r)
 
     def test_refused_starts_before_the_grant_are_not_xruns(self):
         # the kernel refused one start before the grant: pw-top counts it once
         self.refused = 1
-        r, pilots = self.live([self.top(1, 0), self.top(1, 0)])
+        r, pilots = self.live([self.top(1, 0), self.top(1, 0), self.top(1, 0)])
         self.assertIn("no xrun", r)
         self.refused = 1
         r, _ = self.live([self.top(2, 0)])
         self.assertIsInstance(r, sgsc.wiring.Refused)
 
+    def test_one_count_per_sink_start_is_allowed(self):
+        # four grants this boot (four wakes from idle): up to one each
+        self.grants = 4
+        r, _ = self.live([self.top(3, 4), self.top(3, 4), self.top(3, 4)])
+        self.assertIn("no xrun", r)
+        r, _ = self.live([self.top(5, 0)])
+        self.assertIsInstance(r, sgsc.wiring.Refused)
+        self.assertIn("beyond one per start", str(r))
+
     def test_xruns_since_graph_start_are_refused(self):
         # DJKIT 11-09: ERR 44 on the M2's speaker node right after boot
+        self.grants = 1
         r, pilots = self.live([self.top(44, 0)])
         self.assertIsInstance(r, sgsc.wiring.Refused)
         self.assertIn("since it started", str(r))

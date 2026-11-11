@@ -94,10 +94,13 @@ and stops at the first failing step:
    attestation, or one for other code, is refused.
 3. **graph**: the speaker graph must hold the 512-frame quantum the gate
    measured (generated config); with a session up, the speaker and sense
-   nodes must show no xrun since the graph started, and a silent pilot
-   (zero-sample streams into the voicing input, started and stopped
-   PILOT_STARTS times) must leave their xrun counts unchanged. Without
-   a running v2 graph only the generated config is checked.
+   nodes must show no xrun since the graph started beyond one per grant
+   (with nothing playing the path is powered down, and the first cycle of a
+   sink that starts again may be counted while the plugin still holds the
+   wake; no frame is lost there), and a silent pilot (zero-sample streams
+   into the voicing input, started and stopped PILOT_STARTS times, after
+   one more that wakes the path) must leave their xrun counts unchanged.
+   Without a running v2 graph only the generated config is checked.
 
 Exit codes: 0 pass (the switch may proceed), 1 refused (stay on the legacy
 stack; reason on stderr), 2 cannot run (retry later; do not switch), 3
@@ -1263,6 +1266,18 @@ def refused_starts():
     return int(m.group(1)) if m else 0
 
 
+def grants():
+    """How many times the kernel granted speaker protection this boot: each
+    grant starts the speaker sink again (the path is powered down while
+    nothing plays)."""
+    try:
+        r = subprocess.run(["journalctl", "-k", "-b", "-o", "cat", "--no-pager", "-g", "Speaker protection granted"],
+                           capture_output=True, text=True, timeout=15)
+        return len(r.stdout.splitlines())
+    except (OSError, subprocess.TimeoutExpired):
+        return 0
+
+
 def generated_quantum(m, graph="/run/speakerguardd-graph"):
     """The force-quantum the generated speaker config sets, or None."""
     for d, _, files in os.walk(graph):
@@ -1301,15 +1316,22 @@ def verify_graph(args):
         return f"{QUANTUM}-frame quantum locked (config); the v2 graph is not running: no live pilot"
     # xruns since the graph started (PipeWire counts every one; pw-top's ERR).
     # A start the kernel refused before the grant (it logs how many) counts
-    # once on the speaker node and plays nothing: those are not xruns.
-    refused = refused_starts()
-    started = {k: v - (refused if k == n["speaker"] else 0) for k, v in before.items()}
+    # once on the speaker node and plays nothing: those are not xruns. Each
+    # grant starts the powered-down sink and the sense again, and a start may
+    # count its first cycle once while the plugin still holds the wake.
+    refused, starts = refused_starts(), grants()
+    started = {k: v - starts - (refused if k == n["speaker"] else 0) for k, v in before.items()}
     started = {k: v for k, v in started.items() if v > 0}
     if started:
         raise wiring.Refused("the speaker graph has xrun since it started: "
-                             + ", ".join(f"{k} {v}" for k, v in sorted(started.items())))
+                             + ", ".join(f"{k} {v} beyond one per start" for k, v in sorted(started.items())))
     sink = f"sgv2.voicing.{m}"
     zeros = bytes(int(48000 * PILOT_S) * 2 * 4)
+    # the first pilot wakes the path (if it is powered down); the counted
+    # starts follow it while the amps stay up
+    _pilot(uid, sink, zeros)
+    time.sleep(0.3)
+    before = pw_errors(uid, nodes) or before
     for _ in range(PILOT_STARTS):
         _pilot(uid, sink, zeros)
         time.sleep(0.3)
