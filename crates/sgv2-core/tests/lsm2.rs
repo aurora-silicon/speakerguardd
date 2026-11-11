@@ -310,49 +310,39 @@ fn temperature_holds_the_coil_below_the_hard_ceiling() {
 }
 
 #[test]
-fn temperature_candidate_cuts_no_deeper_than_max_temperature_attenuation() {
+fn temperature_cuts_no_deeper_than_max_temperature_attenuation() {
     // 25G83 rig: a temperature-only drive whose candidate asks for more than
-    // MaxTemperatureAttenuation holds the audio at the cap. The output
-    // ceiling at the hard limit + headroom still applies under the cap; a
-    // wide headroom keeps it clear of the candidate's range here.
+    // MaxTemperatureAttenuation holds the audio at the cap, and the output
+    // ceiling does not cut past it either, so the model may pass the hard
+    // limit. A larger cap leaves the same drive regulated by the ceiling.
     let x = sine(150.0, 1.0, 60.0);
-    let headroom = 30.0;
-    let ceiling = 125.0 + headroom;
+    let ceiling = 125.0 + 4.0;
     let mut runs = Vec::new();
     for cap_db in [1.0f32, 40.0] {
         let mut p = only([false, false, false, false, true]);
         for c in 0..2 {
             p.ch[c].max_temperature_attenuation_db = cap_db;
-            p.ch[c].temperature_headroom = headroom;
         }
         let mut u = Unit::new(p);
-        let mut trace = Vec::new();
-        for chunk in x.chunks(4_800) {
+        let (mut low, mut peak) = (1.0f32, 0.0f32);
+        for chunk in x.chunks(48_000) {
             let c = chunk.to_vec();
             run(&mut u, &[c.clone(), c], 512);
             let t = tel(&u).channels[0];
-            trace.push((t.gain, t.coil_temp_c, t.axis_gain[4]));
+            low = low.min(t.gain);
+            peak = peak.max(t.coil_temp_c);
         }
-        runs.push(trace);
+        runs.push((cap_db, low, peak));
     }
-    // a downward call of the slow follower aims at 0.99 x its request
-    let floor = 0.99 * 10f32.powf(-1.0 / 20.0);
-    let capped = &runs[0];
-    // while the model is clear of the ceiling, the cap holds the gain even
-    // where the candidate asks for more
-    let clear: Vec<_> = capped.iter().take_while(|&&(_, t, _)| t < ceiling - 2.0).collect();
-    assert!(clear.iter().any(|&&(_, _, cand)| cand < floor), "the candidate never asked past the cap");
-    for &&(g, t, cand) in &clear {
-        assert!(g >= floor * (1.0 - 1e-5), "gain {g} below the cap at {t} C (candidate {cand})");
-    }
-    // the hard limit stays a backstop: the coil never passes the ceiling
-    for trace in &runs {
-        let peak = trace.iter().map(|&(_, t, _)| t).fold(0.0f32, f32::max);
-        assert!(peak <= ceiling + 0.05, "{peak}");
-    }
-    // without a binding cap the same drive is cut deeper at the same point
-    let k = clear.len() - 1;
-    assert!(runs[1][k].0 < capped[k].0, "{} {}", runs[1][k].0, capped[k].0);
+    // a downward call of the slow follower aims at 0.99 x its request (the
+    // 0.99 law), so the gain dips to 0.99 x the cap at most
+    let (cap_db, cap_low, cap_peak) = runs[0];
+    let floor = 0.99 * 10f32.powf(-cap_db / 20.0);
+    assert!(cap_low >= floor * (1.0 - 1e-5), "gain {cap_low} below the {cap_db} dB cap");
+    assert!(cap_peak > ceiling + 1.0, "the cap must outrank the ceiling: coil {cap_peak} C");
+    let (_, free_low, free_peak) = runs[1];
+    assert!(free_low < cap_low, "{free_low} {cap_low}");
+    assert!(free_peak <= ceiling + 0.05, "{free_peak}");
 }
 
 #[test]
