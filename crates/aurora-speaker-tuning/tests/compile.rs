@@ -581,15 +581,26 @@ fn fill_field(saved: &ParamState, full: &ParamState, change: impl Fn(&mut serde_
         .rev()
         .map(|&(id, v)| serde_json::json!({"id": id, "name": format!("generated {id}"), "bits": v.to_bits()}))
         .collect();
-    let missing: Vec<_> =
-        full.global().unwrap().params.iter().map(|p| p.0).filter(|id| !carried.contains(id)).collect();
-    let mut value = serde_json::json!({"version": 1, "format": aurora_speaker_tuning::param_fill::FORMAT,
+    // As the collector does: fill_ids are base IDs only, whatever else the
+    // unit publishes.
+    let base: std::collections::BTreeSet<_> = sgv2_core::lsm2::companion::base_ids().into_iter().collect();
+    let missing: Vec<_> = full
+        .global()
+        .unwrap()
+        .params
+        .iter()
+        .map(|p| p.0)
+        .filter(|id| !carried.contains(id) && base.contains(id))
+        .collect();
+    let mut value = serde_json::json!({"version": aurora_speaker_tuning::param_fill::VERSION,
+        "format": aurora_speaker_tuning::param_fill::FORMAT,
         "aid": AID, "macos_build": "25G83", "unit_id": test_unit(),
         "configuration_sha256": aurora_speaker_tuning::param_fill::configuration_digest(&files_with_state(saved), AID),
         "presets": [{
             "strip": format!("{AID}/DSP/Strips/builtin_speaker_out_general.austrip"),
             "preset_sha256": aurora_speaker_tuning::manifest::sha256_hex(&saved.encode()),
-            "unit_version": 17, "published": published, "fill_ids": missing}]});
+            "unit_version": 17, "component_sha256": "c".repeat(64),
+            "published": published, "fill_ids": missing}]});
     change(&mut value);
     serde_json::to_vec(&value).unwrap()
 }
@@ -654,8 +665,14 @@ fn owner_fill_completes_short_state_without_changing_carried_records() {
 #[test]
 fn incomplete_extra_mismatched_and_wrongly_bound_fields_refuse_on_load() {
     let (full, short) = full_and_short();
-    for case in 0..8 {
+    for case in 0..10 {
         let data = fill_field(&short, &full, |v| match case {
+            8 => {
+                v["presets"][0]["component_sha256"] = serde_json::json!("not a digest");
+            }
+            9 => {
+                v["version"] = serde_json::json!(1);
+            }
             0 => {
                 v["presets"][0]["fill_ids"].as_array_mut().unwrap().pop();
             }
@@ -779,4 +796,77 @@ fn synthetic_legacy_companion() -> aurora_speaker_tuning::lsid::Companion {
         delay_frames: vec![0; 8],
         adaptation_enabled: false,
     }
+}
+
+/// J713-shaped short preset: generated values, counts and IDs only.
+const APPEND_ID: u32 = sgv2_core::lsm2::companion::extension::PILOT_TUNING_RESERVED;
+
+fn with_saved(state: &ParamState, id: u32) -> ParamState {
+    let mut out = state.clone();
+    out.sections[0].params.push((id, 0.25));
+    out
+}
+
+fn load_fill(short: &ParamState, data: Vec<u8>, name: &str) -> aurora_speaker_tuning::Result<Tuning> {
+    let mut files = files_with_state(short);
+    files.insert(aurora_speaker_tuning::param_fill::NAME.into(), data);
+    let dir = scratch(name);
+    write_dir(&dir, &files, &manifest_json(&files, "25G83"));
+    let bundle = Bundle::open(&dir)?;
+    Tuning::load(&bundle, &Options::default(), &mut Diagnostics::default())
+}
+
+#[test]
+fn short_preset_with_a_published_append_id_compiles_the_base_model() {
+    let (full, short) = full_and_short();
+    let short = with_saved(&short, APPEND_ID);
+    assert_eq!(short.global().unwrap().params.len(), 1021 - 58 + 1);
+    // The unit publishes the append ID plus more IDs than the preset saves.
+    let mut published = with_saved(&full, APPEND_ID);
+    for id in sgv2_core::lsm2::companion::extension_ids().into_iter().filter(|&i| i != APPEND_ID).take(20) {
+        published.sections[0].params.push((id, f32::from_bits(0x7fc0_0000))); // unused, may be NaN
+    }
+    let data = fill_field(&short, &published, |v| {
+        v["presets"][0]["unit_version"] = serde_json::json!(0); // unit reports no version
+        v["presets"][0]["published"][0]["name"] = serde_json::json!("");
+    });
+    let t = load_fill(&short, data, "fill-append-id").unwrap();
+    assert_eq!(t.protection.state, short, "saved state remains untouched");
+    let mut d = Diagnostics::default();
+    let actual = compile(&t, &mut d).unwrap();
+    assert!(d.items.iter().any(|i| i.code == "lsm2-append-ids-not-compiled"));
+    let expected = compile(&tuning(&files_with_state(&full), "fill-append-full"), &mut Diagnostics::default()).unwrap();
+    assert_eq!(actual.blob, expected.blob);
+    // Guarded: the fill and the append ID never lift the mandatory mute.
+    let mut guarded = t.clone();
+    guarded.lsid = Some(synthetic_legacy_companion());
+    let compiled = compile(&guarded, &mut Diagnostics::default()).unwrap();
+    let unit = sgv2_core::lsm2::Unit::from_blob(&compiled.blob).unwrap();
+    assert_eq!(unit.companion().unwrap().lsm2_records.len(), 1021);
+    assert!(unit.companion().unwrap().gates != 0);
+    assert!(unit.is_failsafe());
+}
+
+#[test]
+fn unpublished_append_id_and_unknown_saved_id_are_refused() {
+    let (full, short) = full_and_short();
+    // Append ID saved but not published by the unit.
+    let saved = with_saved(&short, APPEND_ID);
+    assert!(load_fill(&saved, fill_field(&saved, &full, |_| {}), "fill-append-unpublished").is_err());
+    // An ID in no schema, even when the unit publishes it.
+    let unknown = APPEND_ID + 1;
+    assert!(!sgv2_core::lsm2::companion::schema_ids().contains(&unknown));
+    let saved = with_saved(&short, unknown);
+    let published = with_saved(&full, unknown);
+    assert!(load_fill(&saved, fill_field(&saved, &published, |_| {}), "fill-unknown-id").is_err());
+    // A missing fill value that is not finite.
+    let data = fill_field(&short, &full, |v| {
+        let first = v["presets"][0]["fill_ids"][0].clone();
+        for r in v["presets"][0]["published"].as_array_mut().unwrap() {
+            if r["id"] == first {
+                r["bits"] = serde_json::json!(0x7f80_0000u32);
+            }
+        }
+    });
+    assert!(load_fill(&short, data, "fill-nonfinite").is_err());
 }

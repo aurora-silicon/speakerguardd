@@ -308,7 +308,6 @@ impl Manifest {
                     || f.macos_build != j.macos_build
                     || Some(&f.unit_id) != j.unit_id.as_ref()
                     || f.unit_versions.is_empty()
-                    || f.unit_versions.contains(&0)
                     || f.unit_versions.windows(2).any(|w| w[0] >= w[1])
                 {
                     return Err(Error::format(NAME, "malformed or incorrectly bound lsm2 fill record"));

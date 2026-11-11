@@ -610,12 +610,22 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
     let rate = sample_rate(t)?;
     let guarded = t.lsid.is_some();
     let g = t.protection.state.section(SCOPE_GLOBAL, 0).ok_or_else(|| bad("lsm2 saved state has no global section"))?;
-    if g.params.len() < 1021 {
+    if !crate::param_fill::missing_base(g).is_empty() {
         if let Some(fill) = &t.lsm2_param_fill {
             if t.protection.state.sections.len() != 1 {
                 return Err(bad("LSM2 fill requires one global saved-state section"));
             }
             let merged = crate::param_fill::merge(g, fill)?;
+            let appended = g.params.len() + fill.len() - merged.params.len();
+            if appended != 0 {
+                diags.warn(
+                    "lsm2-append-ids-not-compiled",
+                    "compile",
+                    format!(
+                        "{appended} saved append-map ID(s) published by the unit are kept out of the 1,021-ID model"
+                    ),
+                );
+            }
             let mut completed = t.clone();
             completed.protection.state.sections = vec![merged];
             completed.lsm2_param_fill = None;

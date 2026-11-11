@@ -415,7 +415,7 @@ pub fn manifest_json_ident(
         versions.sort_unstable();
         versions.dedup();
         let field = serde_json::json!({"path": fill_name, "bytes": d.len(), "sha256": sha256_hex(d),
-            "version": 1, "format": aurora_speaker_tuning::param_fill::FORMAT,
+            "version": aurora_speaker_tuning::param_fill::VERSION, "format": aurora_speaker_tuning::param_fill::FORMAT,
             "aid": data["aid"], "macos_build": data["macos_build"], "unit_id": data["unit_id"],
             "unit_versions": versions});
         format!(",\"lsm2_param_fill\":{field}")
