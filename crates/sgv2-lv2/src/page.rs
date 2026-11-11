@@ -59,7 +59,27 @@ pub struct PageHeader {
     pub provided: Slot,
     /// The blob payload CRC `provided` was saved under (0: none).
     pub provided_crc: AtomicU32,
+    /// Whether the amps play, written by the supervisor every tick:
+    /// [`AMPS_HELD`] (not granted, or their PCM not started yet) or
+    /// [`AMPS_PLAYING`]; 0 from a supervisor that does not say. The plugin
+    /// holds the first frames of a wake while it reads held ([`crate::preroll`]).
+    pub amps: AtomicU32,
+    /// CLOCK_MONOTONIC of the supervisor's last `amps` write, ns: an older
+    /// word than [`AMPS_STALE_NS`] says nothing.
+    pub amps_ns: AtomicU64,
+    /// Frames the last wake kept, written by the plugin when the amps start
+    /// playing, then `wakes` bumped (release).
+    pub wake_frames: AtomicU32,
+    pub wakes: AtomicU32,
+    /// Frames a wake could not keep (beyond its capacity), since the
+    /// plugin started.
+    pub wake_overflow: AtomicU64,
 }
+
+pub const AMPS_HELD: u32 = 1;
+pub const AMPS_PLAYING: u32 = 2;
+/// The supervisor ticks every 10 ms; a word older than this is no word.
+pub const AMPS_STALE_NS: u64 = 500_000_000;
 
 const _: () = assert!(core::mem::size_of::<PageHeader>() <= HEADER_BYTES);
 
@@ -170,6 +190,41 @@ impl EnginePage {
         h.provided_crc.store(0, Ordering::Release);
         h.provided.publish_at(rec, t_boottime_ns);
         h.provided_crc.store(params_crc, Ordering::Release);
+    }
+
+    /// The supervisor's side: whether the amps play.
+    pub fn set_amps(&self, playing: bool) {
+        let h = self.header();
+        h.amps.store(if playing { AMPS_PLAYING } else { AMPS_HELD }, Ordering::Relaxed);
+        h.amps_ns.store(mono_ns(), Ordering::Release);
+    }
+
+    /// Real time: the supervisor's word on the amps, if fresh.
+    #[inline]
+    pub fn amps(&self) -> crate::preroll::Amps {
+        use crate::preroll::Amps;
+        let h = self.header();
+        let at = h.amps_ns.load(Ordering::Acquire);
+        let word = h.amps.load(Ordering::Relaxed);
+        if at == 0 || mono_ns().saturating_sub(at) > AMPS_STALE_NS {
+            return Amps::Unknown;
+        }
+        match word {
+            AMPS_HELD => Amps::Held,
+            AMPS_PLAYING => Amps::Playing,
+            _ => Amps::Unknown,
+        }
+    }
+
+    /// Real time: what the wakes kept.
+    #[inline]
+    pub fn publish_wakes(&self, wakes: u32, last: u32, overflow: u64) {
+        let h = self.header();
+        h.wake_overflow.store(overflow, Ordering::Relaxed);
+        if h.wakes.load(Ordering::Relaxed) != wakes {
+            h.wake_frames.store(last, Ordering::Relaxed);
+            h.wakes.store(wakes, Ordering::Release);
+        }
     }
 
     /// Real time: the heartbeat, last.

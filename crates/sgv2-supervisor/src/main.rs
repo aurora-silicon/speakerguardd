@@ -72,6 +72,11 @@ mod linux {
     use sgv2_supervisor::supervise::{Event, Expect, Fatal, Supervisor};
 
     const TICK_NS: u64 = 10_000_000;
+    /// How long the speaker PCM runs before the plugin lets a wake's held
+    /// frames out: two quanta, about the lead macOS gives its speaker engine
+    /// before a client's first frame (1172 frames at 48 kHz,
+    /// traces/audio/20261111-m1pro-macos-speaker-wake).
+    const AMPS_SETTLE_FRAMES: u64 = 1024;
     const EX_CONFIG: i32 = 78;
     const EX_UNAVAILABLE: i32 = 69;
     /// The PCM reader's period.
@@ -964,6 +969,12 @@ mod linux {
         let mut last_wiring: Option<Option<u64>> = None;
         // every check holds and nothing plays: reported once per idle spell
         let mut idle_ready = false;
+        // when the speaker PCM was first seen running under this grant, and
+        // whether the amps play (told to the plugin every tick)
+        let mut running_since: Option<u64> = None;
+        let mut amps_playing = false;
+        let settle_ns = AMPS_SETTLE_FRAMES * 1_000_000_000 / u64::from(header.sample_rate.max(1));
+        let mut wakes_seen = engine.0.header().wakes.load(Ordering::Acquire);
         notify.send("STATUS=supervising");
         let mut scheduled = true;
         // CLOCK_BOOTTIME - CLOCK_MONOTONIC grows only while the system is
@@ -1028,6 +1039,29 @@ mod linux {
                     let _ = kernel.release();
                     return EX_UNAVAILABLE;
                 }
+            }
+            // The amps play once granted and their PCM has run for the
+            // settle (the plugin holds a wake's first frames until then);
+            // from then until the grant ends, whatever the PCM does.
+            let now = now_ns();
+            if !sup.granted() {
+                running_since = None;
+                amps_playing = false;
+            } else if !amps_playing && matches!(pcm_view.read(), PcmState::Running { .. }) {
+                let since = *running_since.get_or_insert(now);
+                amps_playing = now.saturating_sub(since) >= settle_ns;
+            }
+            engine.0.set_amps(amps_playing);
+            let wakes = engine.0.header().wakes.load(Ordering::Acquire);
+            if wakes != wakes_seen {
+                wakes_seen = wakes;
+                let h = engine.0.header();
+                let held = h.wake_frames.load(Ordering::Relaxed);
+                eprintln!(
+                    "wake: the first {held} frames ({:.1} ms) held until the amps played; {} frames over capacity since start",
+                    f64::from(held) * 1000.0 / f64::from(header.sample_rate.max(1)),
+                    h.wake_overflow.load(Ordering::Relaxed)
+                );
             }
             if observer.wrong_wiring() != last_wiring {
                 if let Some(w) = observer.wrong_wiring() {
