@@ -99,10 +99,14 @@ def tuning_units(cli, conf=None):
     return wiring.protection_units(wiring.tuning_dump([bundle] if bundle else [], cli, strict=True))
 
 
-def speaker_card(sysfs="/sys/class/sound"):
+SYSFS = "/sys/class/sound"
+
+
+def speaker_card(sysfs=SYSFS):
     """The speaker card's ALSA id: the card whose device tree node is a
-    macaudio sound node with the speaker link (the J614s/J616s/J713 also have
-    a jack-only macaudio card, and either may probe first)."""
+    macaudio sound node with the speaker link, looked for among all cards
+    (the J614s/J616s/J713 also have a jack-only macaudio card, and either may
+    probe first)."""
     try:
         names = sorted(os.listdir(sysfs))
     except OSError:
@@ -156,19 +160,25 @@ def has_control(card, name):
     return r.returncode == 0
 
 
-def kernel_interface(wait):
+def kernel_interface(wait, sysfs=SYSFS):
     """'dual' (the card has "Speaker Protection Interface": both interfaces,
     the volume lock by default), 'v2' (only "Speaker Protection"), 'legacy'
     (a speaker card with neither) or None (no speaker card within the
-    wait, or unreadable controls)."""
-    deadline = time.monotonic() + wait
+    wait, or unreadable controls). Only the speaker card's controls count:
+    another card that registers first (the jack-only card, HDMI) is no
+    answer, so the gate waits for the speaker card itself."""
+    start = time.monotonic()
+    deadline = start + wait
     while True:
-        card = speaker_card()
+        card = speaker_card(sysfs)
         if card:
             break
         if time.monotonic() >= deadline:
             return None, None
         time.sleep(0.25)
+    waited = time.monotonic() - start
+    if waited >= 0.5:
+        log(f"the speaker card {card} registered after {waited:.1f} s")
     dual = has_control(card, INTERFACE_CONTROL)
     if dual is None:
         return None, card

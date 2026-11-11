@@ -917,7 +917,7 @@ class Gate(Base):
         self.assertEqual(self.decide(), (False, False))
 
     def test_kernel_interface_reads_the_selector(self):
-        self.patch(gate, "speaker_card", lambda: "AppleX")
+        self.patch(gate, "speaker_card", lambda sysfs=None: "AppleX")
         for controls, want in (({"Speaker Protection Interface", "Speaker Protection"}, "dual"),
                                ({"Speaker Protection"}, "v2"), (set(), "legacy")):
             self.patch(gate, "has_control", lambda card, name, c=controls: name in c)
@@ -1223,6 +1223,75 @@ class SpeakerCard(unittest.TestCase):
         with tempfile.TemporaryDirectory() as sysfs:
             self.card(sysfs, 1, "AppleJack", JACK, b"Headphone Jack")
             self.assertIsNone(gate.speaker_card(sysfs))
+
+
+class CardOrder(unittest.TestCase):
+    """The gate reads the interface from the speaker card whatever order the
+    cards register in: the jack-only card first, the speaker card first, or
+    the speaker card seconds after the jack card (7.3.0-33 on a J616s: the
+    jack card was card1, the speaker card card2 2 s later)."""
+
+    SPEAKER = b"apple,j616-macaudio\0apple,macaudio\0"
+
+    def setUp(self):
+        self.sysfs = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.sysfs, True)
+        self.asked = []
+        # the jack card has no speaker controls; the speaker card has both
+        controls = {"AppleJ616": {"Speaker Protection Interface", "Speaker Protection"}}
+        orig = gate.has_control
+        gate.has_control = lambda card, name: self.asked.append(card) or name in controls.get(card, set())
+        self.addCleanup(setattr, gate, "has_control", orig)
+        orig_log = gate.log
+        gate.log = lambda *a: None
+        self.addCleanup(setattr, gate, "log", orig_log)
+
+    def card(self, n, ident, compat, link):
+        SpeakerCard.card(None, self.sysfs, n, ident, compat, link)
+
+    def jack(self, n):
+        self.card(n, "AppleJack", JACK, b"Headphone Jack")
+
+    def speaker(self, n):
+        self.card(n, "AppleJ616", self.SPEAKER, b"Speakers")
+
+    def test_jack_first(self):
+        self.card(0, "AppleJ616HPAI", b"apple,aop-audio\0", b"Speakers")
+        self.jack(1)
+        self.speaker(2)
+        self.assertEqual(gate.kernel_interface(0, self.sysfs), ("dual", "AppleJ616"))
+        self.assertEqual(set(self.asked), {"AppleJ616"})
+
+    def test_speaker_first(self):
+        self.speaker(1)
+        self.jack(2)
+        self.assertEqual(gate.kernel_interface(0, self.sysfs), ("dual", "AppleJ616"))
+        self.assertEqual(set(self.asked), {"AppleJ616"})
+
+    def test_speaker_late(self):
+        import threading
+        self.jack(1)
+        t = threading.Timer(0.6, self.speaker, (2,))
+        t.start()
+        self.addCleanup(t.cancel)
+        t0 = time.monotonic()
+        self.assertEqual(gate.kernel_interface(10, self.sysfs), ("dual", "AppleJ616"))
+        self.assertGreaterEqual(time.monotonic() - t0, 0.5)
+        self.assertEqual(set(self.asked), {"AppleJ616"})
+
+    def test_jack_only_is_no_speaker_card(self):
+        # the bounded wait ends without a speaker card: the caller keeps
+        # today's answer (the older daemons decide), and the jack card's
+        # missing controls never count as a kernel without the v2 interface
+        self.jack(1)
+        self.assertEqual(gate.kernel_interface(0.3, self.sysfs), (None, None))
+        self.assertEqual(self.asked, [])
+
+    def test_legacy_kernel_answer_comes_from_the_speaker_card(self):
+        self.jack(1)
+        self.card(2, "AppleJ413", b"apple,j413-macaudio\0apple,macaudio\0", b"Speaker")
+        self.assertEqual(gate.kernel_interface(0, self.sysfs), ("legacy", "AppleJ413"))
+        self.assertEqual(set(self.asked), {"AppleJ413"})
 
 
 class Units(unittest.TestCase):
