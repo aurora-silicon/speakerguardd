@@ -238,17 +238,23 @@ class LeaseInterface(unittest.TestCase):
 class Pilot(unittest.TestCase):
     """The live graph step against a fake pw-top."""
 
-    def top(self, err_speaker, err_sense):
+    def top(self, err_speaker, err_sense, missing=()):
         return ("S   ID  QUANT   RATE    WAIT    BUSY   W/Q   B/Q  ERR FORMAT           NAME\n"
                 f"R   60    512  48000  10.1us  20.2us  0.00  0.00  {err_speaker}   S24LE 6 48000 sgv2.speaker.j414\n"
-                f"R   61    512  48000  10.1us  20.2us  0.00  0.00  {err_sense}   S16LE 12 48000 sgv2.sense.j414\n")
+                f"R   61    512  48000  10.1us  20.2us  0.00  0.00  {err_sense}   S16LE 12 48000 sgv2.sense.j414\n"
+                + "".join(f"R   {i}    512  48000  10.1us  20.2us  0.00  0.00  0   F32LE 6 48000 {name}\n"
+                          for i, name in enumerate(self.stages, 62) if name not in missing))
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         g = os.path.join(self.tmp.name, "pipewire")
         os.makedirs(g)
+        self.stages = ("alsa_output.platform-sound.RawSpeakers", "sgv2.protect.j414.out",
+                       "sgv2.voicing.j414", "sgv2.voicing.j414.out")
         with open(os.path.join(g, "sgv2-j414.conf"), "w") as f:
             f.write("node.force-quantum = 512\nnode.lock-quantum = true\n")
+            for name in (*self.stages, "sgv2.speaker.j414", "sgv2.sense.j414"):
+                f.write(f'node.name = "{name}"\n')
         self.conf = os.path.join(self.tmp.name, "c.conf")
         with open(self.conf, "w") as f:
             f.write(f"SGV2_MACHINE=j414\nSGV2_UID={os.getuid()}\n")
@@ -288,6 +294,16 @@ class Pilot(unittest.TestCase):
         self.assertEqual(len(pilots), sgsc.PILOT_STARTS + 1)
         # silent: every pilot sample is zero
         self.assertTrue(all(p and not any(p) for p in pilots))
+
+    def test_missing_filter_stage_is_refused_before_any_pilot(self):
+        # ALSA nodes can load even when a missing LV2 plugin prevents the
+        # protection or voicing filter from being created.
+        for name in self.stages:
+            with self.subTest(name=name):
+                result, pilots = self.live([self.top(0, 0, missing=(name,))] * 3)
+                self.assertIsInstance(result, sgsc.wiring.Refused)
+                self.assertIn(name, str(result))
+                self.assertEqual(pilots, [])
 
     def test_xrun_at_stream_start_is_refused(self):
         r, _ = self.live([self.top(0, 0), self.top(0, 0), self.top(3, 0)])

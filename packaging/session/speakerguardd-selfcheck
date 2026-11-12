@@ -1295,8 +1295,8 @@ def grants():
         return 0
 
 
-def generated_quantum(m, graph="/run/speakerguardd-graph"):
-    """The force-quantum the generated speaker config sets, or None."""
+def generated_graph(m, graph="/run/speakerguardd-graph"):
+    """The generated graph's locked quantum and expected node names."""
     for d, _, files in os.walk(graph):
         for f in files:
             if f == f"sgv2-{m}.conf":
@@ -1304,8 +1304,9 @@ def generated_quantum(m, graph="/run/speakerguardd-graph"):
                     t = fh.read()
                 q = re.search(r"node\.force-quantum\s*=\s*(\d+)", t)
                 lock = re.search(r"node\.lock-quantum\s*=\s*true", t)
-                return int(q.group(1)) if q and lock else 0
-    return None
+                nodes = set(re.findall(r'node\.name\s*=\s*"([^"]+)"', t))
+                return int(q.group(1)) if q and lock else 0, nodes
+    return None, set()
 
 
 def verify_graph(args):
@@ -1314,7 +1315,7 @@ def verify_graph(args):
     m = conf.get("SGV2_MACHINE")
     if not m:
         raise Cannot(f"{getattr(args, 'conf', None) or CONF} names no machine: provision first")
-    q = generated_quantum(m, args.graph_dir)
+    q, expected = generated_graph(m, args.graph_dir)
     if q is None:
         raise Cannot(f"no generated speaker graph for {m} in {args.graph_dir}")
     if q != QUANTUM:
@@ -1328,9 +1329,13 @@ def verify_graph(args):
         return f"{QUANTUM}-frame quantum locked (config); no seat user: no live pilot"
     if not os.path.exists(f"/run/user/{uid}/pipewire-0"):
         return f"{QUANTUM}-frame quantum locked (config); no session PipeWire: no live pilot"
-    before = pw_errors(uid, nodes)
+    before = pw_errors(uid, nodes | expected)
     if not before or n["speaker"] not in before:
         return f"{QUANTUM}-frame quantum locked (config); the v2 graph is not running: no live pilot"
+    missing = expected - before.keys()
+    if missing:
+        raise wiring.Refused("the speaker graph did not load its configured nodes: " + ", ".join(sorted(missing)))
+    before = {k: v for k, v in before.items() if k in nodes}
     # xruns since the graph started (PipeWire counts every one; pw-top's ERR).
     # A start the kernel refused before the grant (it logs how many) counts
     # once on the speaker node and plays nothing: those are not xruns. Each

@@ -243,6 +243,43 @@ pub use alsa::Macaudio;
 
 /// The ALSA control-device implementation: raw ioctls, no alsa-lib.
 #[cfg(target_os = "linux")]
+trait SenseControls {
+    fn amp_names(&mut self, volume_suffix: &str) -> Result<Vec<String>, KernelError>;
+    fn sense_enabled(&mut self, name: &str) -> Result<bool, KernelError>;
+    fn enable_sense_switch(&mut self, name: &str) -> Result<(), KernelError>;
+}
+
+#[cfg(target_os = "linux")]
+fn initialize_sense(card: &mut impl SenseControls, machine: &crate::machine::Machine) -> Result<usize, KernelError> {
+    if !machine.amp.has_sense() {
+        return Ok(0);
+    }
+    let amps = card.amp_names(machine.amp.volume_suffix())?;
+    let unique: std::collections::BTreeSet<_> = amps.iter().collect();
+    if amps.len() != machine.amps || unique.len() != machine.amps {
+        return Err(KernelError::Control(format!("sense: expected {} distinct amps, found {:?}", machine.amps, amps)));
+    }
+    // Validate the complete set before changing any switch.
+    let mut switches = Vec::new();
+    for amp in amps {
+        for suffix in ["ISENSE Switch", "VSENSE Switch"] {
+            let name = if amp.is_empty() { suffix.to_owned() } else { format!("{amp} {suffix}") };
+            let enabled = card.sense_enabled(&name)?;
+            switches.push((name, enabled));
+        }
+    }
+    for (name, enabled) in &switches {
+        if !enabled {
+            card.enable_sense_switch(name)?;
+            if !card.sense_enabled(name)? {
+                return Err(KernelError::Control(format!("{name} stayed disabled after its write")));
+            }
+        }
+    }
+    Ok(switches.len())
+}
+
+#[cfg(target_os = "linux")]
 mod alsa {
     use super::*;
     use std::fs::{File, OpenOptions};
@@ -260,6 +297,7 @@ mod alsa {
     const EBUSY: i32 = 16;
     const ENODEV: i32 = 19;
     const ETIMEDOUT: i32 = 110;
+    const ELEM_TYPE_BOOLEAN: i32 = 1;
     const ELEM_TYPE_INTEGER: i32 = 2;
     const ELEM_TYPE_ENUMERATED: i32 = 3;
 
@@ -397,6 +435,13 @@ mod alsa {
             Ok(k)
         }
 
+        /// Enable the proved V/I paths before the first grant, through the
+        /// same control file that owns protection. Other files cannot write
+        /// these switches while this file owns the card.
+        pub fn enable_sense(&mut self, machine: &crate::machine::Machine) -> Result<usize, KernelError> {
+            initialize_sense(self, machine)
+        }
+
         /// Declare whether the engine runs the Mac's own crossover ahead of
         /// the amps (see the module documentation). Call after `open` and
         /// before the first grant. `Ok(false)` on a kernel without the
@@ -520,6 +565,35 @@ mod alsa {
             }
             ids.truncate(l.used as usize);
             Ok(ids)
+        }
+    }
+
+    impl SenseControls for Macaudio {
+        fn amp_names(&mut self, volume_suffix: &str) -> Result<Vec<String>, KernelError> {
+            Ok(self.levels(volume_suffix)?.into_iter().map(|level| level.amp).collect())
+        }
+
+        fn sense_enabled(&mut self, name: &str) -> Result<bool, KernelError> {
+            let id = elem_id(name);
+            let info = self.info(id, 0)?;
+            if info.kind != ELEM_TYPE_BOOLEAN || info.count != 1 {
+                return Err(KernelError::Control(format!("{name} is not one boolean switch")));
+            }
+            match self.read(id)?.value[0] {
+                0 => Ok(false),
+                1 => Ok(true),
+                value => Err(KernelError::Control(format!("{name} returned invalid boolean {value}"))),
+            }
+        }
+
+        fn enable_sense_switch(&mut self, name: &str) -> Result<(), KernelError> {
+            let mut v = Self::value(elem_id(name));
+            v.value[0] = 1;
+            // SAFETY: the owning fd and a live, correctly sized ElemValue.
+            if unsafe { ioctl(self.fd(), ELEM_WRITE, &mut *v as *mut ElemValue) } < 0 {
+                return Err(KernelError::Control(format!("enable {name}: errno {}", errno())));
+            }
+            Ok(())
         }
     }
 
@@ -703,5 +777,118 @@ mod tests {
         assert_eq!(k.levels(GAIN_CONTROL_SUFFIX).unwrap()[5].centi_db, Some(1850));
         assert_eq!(k.speaker_route().unwrap().as_deref(), Some("Secondary"));
         assert_eq!(k.faults().unwrap().len(), 6);
+    }
+
+    #[cfg(target_os = "linux")]
+    mod sense {
+        use super::*;
+        use crate::machine::{Amp, Machine};
+        use std::collections::BTreeMap;
+
+        #[derive(Default)]
+        struct Controls {
+            amps: Vec<String>,
+            switches: BTreeMap<String, bool>,
+            writes: Vec<String>,
+            reads: usize,
+            write_error: bool,
+            ineffective_write: bool,
+            readback_error: bool,
+        }
+
+        impl Controls {
+            fn off() -> Self {
+                let amps = vec!["Left".to_owned(), "Right".to_owned()];
+                let switches =
+                    ["Left ISENSE Switch", "Left VSENSE Switch", "Right ISENSE Switch", "Right VSENSE Switch"]
+                        .into_iter()
+                        .map(|s| (s.to_owned(), false))
+                        .collect();
+                Self { amps, switches, ..Self::default() }
+            }
+        }
+
+        impl SenseControls for Controls {
+            fn amp_names(&mut self, _: &str) -> Result<Vec<String>, KernelError> {
+                self.reads += 1;
+                Ok(self.amps.clone())
+            }
+            fn sense_enabled(&mut self, name: &str) -> Result<bool, KernelError> {
+                self.reads += 1;
+                if self.readback_error && self.writes.iter().any(|s| s == name) {
+                    return Err(KernelError::Control(format!("readback {name}")));
+                }
+                self.switches.get(name).copied().ok_or_else(|| KernelError::Control(format!("missing {name}")))
+            }
+            fn enable_sense_switch(&mut self, name: &str) -> Result<(), KernelError> {
+                self.writes.push(name.to_owned());
+                if self.write_error {
+                    return Err(KernelError::Control(format!("write {name}")));
+                }
+                if !self.ineffective_write {
+                    *self.switches.get_mut(name).unwrap() = true;
+                }
+                Ok(())
+            }
+        }
+
+        fn machine(amp: Amp) -> Machine {
+            Machine { board: "test", card_id: "Test", amps: 2, amp }
+        }
+
+        #[test]
+        fn enables_both_sense_switches_on_every_amp_and_reads_them_back() {
+            let mut c = Controls::off();
+            assert_eq!(initialize_sense(&mut c, &machine(Amp::Sn012776)), Ok(4));
+            assert!(c.switches.values().all(|on| *on));
+            assert_eq!(c.writes.len(), 4);
+            assert_eq!(c.reads, 9);
+        }
+
+        #[test]
+        fn already_enabled_switches_are_not_written() {
+            let mut c = Controls::off();
+            c.switches.insert("Left ISENSE Switch".into(), true);
+            initialize_sense(&mut c, &machine(Amp::Tas2770)).unwrap();
+            assert!(c.switches.values().all(|on| *on));
+            assert_eq!(c.writes.len(), 3);
+            assert!(!c.writes.iter().any(|name| name == "Left ISENSE Switch"));
+        }
+
+        #[test]
+        fn a_family_without_sense_never_touches_controls() {
+            let mut c = Controls::default();
+            assert_eq!(initialize_sense(&mut c, &machine(Amp::Max98360a)), Ok(0));
+            assert_eq!(c.reads, 0);
+            assert!(c.writes.is_empty());
+        }
+
+        #[test]
+        fn missing_or_duplicate_amps_are_refused_before_writes() {
+            for amps in [vec!["Left".into()], vec!["Left".into(), "Left".into()]] {
+                let mut c = Controls { amps, ..Controls::off() };
+                assert!(initialize_sense(&mut c, &machine(Amp::Sn012776)).is_err());
+                assert!(c.writes.is_empty());
+            }
+        }
+
+        #[test]
+        fn all_switches_must_exist_before_any_write() {
+            let mut c = Controls::off();
+            c.switches.remove("Right VSENSE Switch");
+            assert!(initialize_sense(&mut c, &machine(Amp::Sn012776)).is_err());
+            assert!(c.writes.is_empty());
+        }
+
+        #[test]
+        fn a_failed_write_or_readback_refuses_initialization() {
+            for mut c in [
+                Controls { write_error: true, ..Controls::off() },
+                Controls { ineffective_write: true, ..Controls::off() },
+                Controls { readback_error: true, ..Controls::off() },
+            ] {
+                assert!(initialize_sense(&mut c, &machine(Amp::Sn012776)).is_err());
+            }
+        }
     }
 }

@@ -900,6 +900,13 @@ mod linux {
         let (mut kernel, index, info) = loop {
             match try_card(machine, &card, pcm) {
                 Ok((mut k, index, info)) => {
+                    match k.enable_sense(machine) {
+                        Ok(n) => eprintln!("V/I sense initialized: {n} switches enabled and read back"),
+                        Err(e) => {
+                            eprintln!("initializing V/I sense: {e:?}; exiting (the kernel floor stays)");
+                            return EX_CONFIG;
+                        }
+                    }
                     // Before any grant: the tweeters' amp high-pass opens
                     // only for an engine that runs the Mac's crossover.
                     match k.declare_crossover(crossover) {

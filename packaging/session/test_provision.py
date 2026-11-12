@@ -1371,6 +1371,75 @@ class Gate(Base):
 JACK = b"apple,j616-macaudio-jack\0apple,macaudio\0"
 
 
+class SpeakerRouting(Base):
+    def setUp(self):
+        super().setUp()
+        self.route = "Primary"
+        self.writes = []
+        self.reads = 0
+        self.write_error = False
+        self.ignore_write = False
+        run = prov.subprocess.run
+
+        def amixer(argv, **kw):
+            if argv[0] != "amixer":
+                return run(argv, **kw)
+            self.assertEqual(argv[:3], ["amixer", "-c", "AppleJ316"])
+            self.assertEqual(argv[4], "name=Speaker Playback Mux")
+            if argv[3] == "cset":
+                self.assertEqual(argv[5:], ["Secondary"])
+                self.writes.append(argv[5])
+                if self.write_error:
+                    return types.SimpleNamespace(returncode=1, stdout="", stderr="Device or resource busy")
+                if not self.ignore_write:
+                    self.route = "Secondary"
+            else:
+                self.assertEqual(argv[3], "cget")
+                self.reads += 1
+            value = 1 if self.route == "Secondary" else 0
+            return types.SimpleNamespace(returncode=0, stderr="", stdout=(
+                "; type=ENUMERATED,access=rw------,values=1,items=2\n"
+                "; Item #0 'Primary'\n; Item #1 'Secondary'\n"
+                f": values={value}\n"))
+
+        self.patch(prov.subprocess, "run", amixer)
+
+    def live(self):
+        # Keep every path under the test root; exercise the hardware branch
+        # with only the mixer boundary replaced.
+        self.p.root = ""
+        return self.run_()
+
+    def test_fresh_card_routes_pcm1_before_the_graph_can_start(self):
+        self.assertEqual(self.live(), 0)
+        self.assertEqual(self.route, "Secondary")
+        self.assertEqual(self.writes, ["Secondary"])
+        self.assertEqual(self.reads, 2)
+
+    def test_existing_secondary_route_is_read_without_a_write(self):
+        self.route = "Secondary"
+        self.assertEqual(self.live(), 0)
+        self.assertEqual(self.writes, [])
+        self.assertEqual(self.reads, 1)
+
+    def test_busy_route_fails_closed(self):
+        self.write_error = True
+        self.assertEqual(self.live(), 1)
+        self.assertFalse(os.path.exists(self.p.conf))
+        self.assertFalse(os.path.exists(self.p.params))
+        self.assertEqual(self.record()["result"], "fail")
+
+    def test_unchanged_readback_fails_closed(self):
+        self.ignore_write = True
+        self.assertEqual(self.live(), 1)
+        self.assertFalse(os.path.exists(self.p.conf))
+        self.assertFalse(os.path.exists(self.p.params))
+
+    def test_test_root_never_touches_the_live_mixer(self):
+        self.assertEqual(self.run_(), 0)
+        self.assertEqual((self.reads, self.writes), (0, []))
+
+
 class SpeakerCard(unittest.TestCase):
     """The gate's speaker card is the macaudio card with the speaker link,
     whichever card number the jack-only card took."""
