@@ -68,6 +68,11 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
+use crate::platform_math;
+
+/// `ln 10 / 20` in Float32: the compressor's dB-to-exponent factor.
+const LN10_OVER_20: f32 = f32::from_bits(0x3deb_c8e3);
+
 /// One designed biquad (double): the reconstruction design and tests.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct Bq {
@@ -95,12 +100,14 @@ impl Cascade {
 }
 
 /// One stored section: `[b0, b1, b2, a1, a2]` as the object keeps it.
-type Words = [f32; 5];
+pub(crate) type Words = [f32; 5];
 
-/// The unit's Float32 Butterworth sections of order `n` at `fc` for a
-/// filter object at rate `fs` (both as the box keeps them, Float32), in
-/// pole-pair order with the first-order section last for odd `n`.
-fn butter_words(n: usize, fc: f32, fs: f32, kind: Kind, out: &mut Vec<Words>) {
+/// The platform voicing library's Float32 Butterworth sections of order `n`
+/// at `fc` for a filter object at rate `fs` (both as the box keeps them,
+/// Float32), in pole-pair order with the first-order section last for odd
+/// `n`. VirtualBass and the ToneMeister's Butterworth slots share it. The
+/// words go to `out` one by one (no allocation of its own).
+pub(crate) fn butter_words(n: usize, fc: f32, fs: f32, kind: Kind, out: &mut impl Extend<Words>) {
     let f = fc.min((fs * 0.5) * 0.9);
     let w = (f64::from(f) * (2.0 * core::f64::consts::PI) / f64::from(fs)) as f32;
     let s = libm::sin(f64::from(w)) as f32;
@@ -112,34 +119,48 @@ fn butter_words(n: usize, fc: f32, fs: f32, kind: Kind, out: &mut Vec<Words>) {
         let u = 1.0 + a2;
         let uc = u * c;
         let a1 = -uc;
-        out.push(match kind {
+        out.extend([match kind {
             Kind::Low => {
                 let g = (u - uc) * 0.25;
                 [g, g + g, g, a1, a2]
             }
             Kind::High => {
-                let g = ((1.0 - a1) + a2) * 0.25;
-                [g, -(g + g), g, a1, a2]
+                let g = (u - uc) * 0.25;
+                high_from_low([g, g + g, g], a1, a2)
             }
             Kind::AllPass => [a2, a1, 1.0, a1, a2],
-        });
+        }]);
     }
     if n % 2 == 1 {
         let q = (1.0 / libm::tan(f64::from(w) * 0.5)) as f32;
         let a1 = (1.0 - q) / (1.0 + q);
-        out.push(match kind {
+        out.extend([match kind {
             Kind::Low => {
                 let g = 1.0 / (2.0 / (1.0 + a1));
                 [g, g, 0.0, a1, 0.0]
             }
             Kind::High => {
-                let g = (1.0 - a1) * 0.5;
-                [g, -g, 0.0, a1, 0.0]
+                let g = 1.0 / (2.0 / (1.0 + a1));
+                high_from_low([g, g, 0.0], a1, 0.0)
             }
             // the one-frame-delayed first-order all-pass
             Kind::AllPass => [0.0, a1, 1.0, a1, 0.0],
-        });
+        }]);
     }
+}
+
+/// A high-pass section from the low-pass section on the same poles, as the
+/// platform library forms it: `z -> -z` on the stored low-pass numerator,
+/// then that numerator scaled by the Float32 ratio of the denominator at
+/// Nyquist to the low-pass numerator's sum at DC, so the section has unity
+/// gain at Nyquist. The ratio is rounded on its own before it scales each
+/// word, so the words can differ by a unit in the last place from the
+/// closed form `(1 - a1 + a2) / 4`.
+fn high_from_low(lp: [f32; 3], a1: f32, a2: f32) -> Words {
+    let d = (1.0 - a1) + a2;
+    let n = (lp[0] + lp[1]) + lp[2];
+    let k = d / n;
+    [lp[0] * k, -(lp[1] * k), lp[2] * k, a1, a2]
 }
 
 /// Scales a stored section's numerator (each word rounded on its own).
@@ -160,7 +181,7 @@ fn object(words: &[Words], multichannel: bool) -> crate::vdsp::Cascade {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Kind {
+pub(crate) enum Kind {
     Low,
     High,
     AllPass,
@@ -522,7 +543,7 @@ impl Follower {
 
     fn with_times(fs: f64, ratio: f64, attack_s: f64, release_s: f64, hold_s: f64, smooth_s: f64) -> Follower {
         let fs = fs as f32;
-        let pole = |t: f64| libm::expf(-1.0 / (t as f32 * fs));
+        let pole = |t: f64| crate::platform_math::expf(-1.0 / (t as f32 * fs));
         Follower {
             ratio: ratio as f32,
             tie: f32::INFINITY,
@@ -597,7 +618,7 @@ impl HarmonicCompressor {
     #[inline]
     fn run(&mut self, x: f64) -> f64 {
         let x = x as f32;
-        let level_db = 20.0 * libm::log10f(libm::fabsf(x) + law::COMP_DETECTOR_EPSILON as f32);
+        let level_db = 20.0 * platform_math::vlog10f(libm::fabsf(x) + law::COMP_DETECTOR_EPSILON as f32);
         let d = level_db - self.threshold_db;
         let half_knee = 0.5 * law::COMP_KNEE_DB as f32;
         let slope = 1.0 - 1.0 / self.ratio;
@@ -609,7 +630,7 @@ impl HarmonicCompressor {
             0.0
         };
         let reduction_db = self.follower.run(requested_db as f64) as f32;
-        (x * libm::powf(10.0, -reduction_db / 20.0)) as f64
+        (x * platform_math::vexpf(-reduction_db * LN10_OVER_20)) as f64
     }
 }
 
@@ -803,7 +824,7 @@ impl Run {
     #[inline]
     fn device(&self, u: f32) -> f32 {
         match self.p.device {
-            Device::Saturator3 => law::DEVICE3_AMP as f32 * libm::tanhf(law::DEVICE3_SLOPE as f32 * u),
+            Device::Saturator3 => law::DEVICE3_AMP as f32 * platform_math::vtanhf(law::DEVICE3_SLOPE as f32 * u),
         }
     }
 
@@ -841,7 +862,7 @@ impl Run {
                 } else {
                     (lo, p_in)
                 };
-                (x * (1.0 / Self::level(p_drive))).clamp(-clip, clip)
+                (x * platform_math::vdiv(1.0, Self::level(p_drive))).clamp(-clip, clip)
             } else {
                 lo
             };
@@ -853,7 +874,7 @@ impl Run {
             let mut h = self.harm[k];
             if self.p.level_control {
                 let p_out = Self::level(self.lc.output.run(f64::from(h)) as f32);
-                h *= self.p_in[k] as f32 / p_out;
+                h *= platform_math::vdiv(self.p_in[k] as f32, p_out);
             }
             h *= gain;
             if self.p.harmonic_compressor {

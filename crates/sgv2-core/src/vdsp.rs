@@ -58,10 +58,28 @@ impl Section {
         self.history = [0.0; 4];
     }
 
+    /// Installs new coefficients (rounded to Float32), keeping the state, as
+    /// a setup's coefficients are replaced between calls. Unchanged words
+    /// are left alone.
+    pub fn set(&mut self, c: Coefficients) {
+        let w = c.map(|v| v as f32);
+        if [self.b[0], self.b[1], self.b[2], self.a[0], self.a[1]].map(f32::to_bits) != w.map(f32::to_bits) {
+            self.install(w.map(f64::from));
+        }
+    }
+
     /// Installed Float32 coefficient words, for synthetic parity probes.
     #[doc(hidden)]
     pub fn coefficient_bits(&self) -> [u32; 5] {
         [self.b[0].to_bits(), self.b[1].to_bits(), self.b[2].to_bits(), self.a[0].to_bits(), self.a[1].to_bits()]
+    }
+
+    /// Clears the section and leaves it as if a constant input `x` had
+    /// settled its output at `y` (the state a group republishes after two
+    /// frames of `x` in and `y` out).
+    pub fn settle(&mut self, x: f32, y: f32) {
+        self.history = [x, x, y, y];
+        self.publish((x, x), (y, y));
     }
 
     fn install(&mut self, c: [f64; 5]) {
