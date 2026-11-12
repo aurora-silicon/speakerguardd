@@ -37,8 +37,8 @@ fn params() -> Params {
         low_rail_power_ratio: 1.1,
         ..Params::default()
     };
-    for c in 0..2 {
-        p.ch[c] = ChannelParams {
+    for (c, ch) in p.ch[..2].iter_mut().enumerate() {
+        *ch = ChannelParams {
             source: c as u32,
             volts_full_scale: 6.0,
             parasitic_resistance: 0.2,
@@ -320,8 +320,8 @@ fn temperature_cuts_no_deeper_than_max_temperature_attenuation() {
     let mut runs = Vec::new();
     for cap_db in [1.0f32, 40.0] {
         let mut p = only([false, false, false, false, true]);
-        for c in 0..2 {
-            p.ch[c].max_temperature_attenuation_db = cap_db;
+        for ch in &mut p.ch[..2] {
+            ch.max_temperature_attenuation_db = cap_db;
         }
         let mut u = Unit::new(p);
         let (mut low, mut peak) = (1.0f32, 0.0f32);
@@ -473,8 +473,8 @@ fn controller_cadence_is_a_time() {
 fn peak_reserves_the_pilot_amplitude() {
     // rig law 6: (AmplitudeLimit - pilot) / peak; -36 dB on a 1.0012 sine
     let mut p = only([true, false, false, false, true]);
-    for c in 0..2 {
-        p.ch[c].pilot_reserve = 10f32.powf(-36.0 / 20.0);
+    for ch in &mut p.ch[..2] {
+        ch.pilot_reserve = 10f32.powf(-36.0 / 20.0);
     }
     let mut u = Unit::new(p);
     let x: Vec<f32> = sine(1000.0, 1.0012, 0.2);
@@ -517,10 +517,10 @@ fn synthetic_lattice() -> [u32; 100] {
 }
 
 fn with_identity_pressure(mut p: Params) -> Params {
-    for c in 0..2 {
-        p.ch[c].pressure_taps = lsm2::PRESSURE_TAPS as u32;
-        p.ch[c].pressure_fir = [0.0; lsm2::PRESSURE_TAPS];
-        p.ch[c].pressure_fir[0] = 1.0;
+    for ch in &mut p.ch[..2] {
+        ch.pressure_taps = lsm2::PRESSURE_TAPS as u32;
+        ch.pressure_fir = [0.0; lsm2::PRESSURE_TAPS];
+        ch.pressure_fir[0] = 1.0;
     }
     p.mask_lattice_len = 100;
     p.mask_lattice = synthetic_lattice();
@@ -591,12 +591,12 @@ fn generic_flags_switch_a_model_to_the_family_row_at_run_time() {
     // spec 15.1: the flag selects the embedded family row; the block's own
     // field is kept for when the flag is cleared again
     let mut p = params();
-    for c in 0..2 {
-        p.ch[c].family = [3.0, 0.5, 0.0001, 0.1, 1000.0];
-        p.ch[c].explicit = [
-            [p.ch[c].rdc, p.ch[c].bl, p.ch[c].mms_kg, p.ch[c].rms, p.ch[c].kms],
-            [p.ch[c].disp_rdc, p.ch[c].disp_bl, p.ch[c].disp_mms_kg, p.ch[c].disp_rms, p.ch[c].disp_kms],
-            [p.ch[c].vel_rdc, p.ch[c].vel_bl, p.ch[c].vel_mms_kg, p.ch[c].vel_rms, p.ch[c].vel_kms],
+    for ch in &mut p.ch[..2] {
+        ch.family = [3.0, 0.5, 0.0001, 0.1, 1000.0];
+        ch.explicit = [
+            [ch.rdc, ch.bl, ch.mms_kg, ch.rms, ch.kms],
+            [ch.disp_rdc, ch.disp_bl, ch.disp_mms_kg, ch.disp_rms, ch.disp_kms],
+            [ch.vel_rdc, ch.vel_bl, ch.vel_mms_kg, ch.vel_rms, ch.vel_kms],
         ];
     }
     let vel = |m: u32, ty: u32, k: u32| 3072 + 1024 * (3 * m + ty) + k;

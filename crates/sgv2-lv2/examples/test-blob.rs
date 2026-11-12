@@ -37,8 +37,8 @@ fn main() {
         thermal_protection_enabled: 1,
         ..spp3::Params::default()
     };
-    for c in 0..n {
-        p.ch[c] = spp3::ChannelParams {
+    for (c, ch) in p.ch[..n].iter_mut().enumerate() {
+        *ch = spp3::ChannelParams {
             source: c as u32,
             group: 0,
             t_sett_vc: 20.0,

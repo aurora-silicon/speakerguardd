@@ -25,8 +25,8 @@ fn spp3_params(n: usize) -> spp3::Params {
         thermal_protection_enabled: 1,
         ..spp3::Params::default()
     };
-    for c in 0..n {
-        p.ch[c] = spp3::ChannelParams {
+    for (c, ch) in p.ch[..n].iter_mut().enumerate() {
+        *ch = spp3::ChannelParams {
             source: c as u32,
             group: (c / 4) as u32,
             t_sett_vc: 20.0,
@@ -80,8 +80,8 @@ fn lsm2_params() -> lsm2::Params {
     for (k, v) in fir.iter_mut().enumerate() {
         *v = (-(k as f32) / 40.0).exp() * if k % 2 == 0 { 1.0 } else { -0.5 };
     }
-    for c in 0..2 {
-        p.ch[c] = lsm2::ChannelParams {
+    for (c, ch) in p.ch[..2].iter_mut().enumerate() {
+        *ch = lsm2::ChannelParams {
             source: c as u32,
             volts_full_scale: 6.0,
             parasitic_resistance: 0.2,

@@ -75,8 +75,8 @@ fn spp3_synthetic() -> spp3::Params {
         thermal_protection_enabled: 1,
         ..spp3::Params::default()
     };
-    for c in 0..6 {
-        p.ch[c] = spp3::ChannelParams {
+    for (c, ch) in p.ch[..6].iter_mut().enumerate() {
+        *ch = spp3::ChannelParams {
             source: c as u32,
             group: (c / 4) as u32,
             t_sett_vc: 20.0,

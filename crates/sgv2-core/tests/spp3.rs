@@ -25,8 +25,8 @@ fn params() -> Params {
         thermal_state_override: spp3::THERMAL_STATE_COLD,
         ..Params::default()
     };
-    for c in 0..4 {
-        p.ch[c] = ChannelParams {
+    for (c, ch) in p.ch[..4].iter_mut().enumerate() {
+        *ch = ChannelParams {
             source: c as u32,
             group: if c < 2 { 7 } else { 3 },
             ignore_telemetry: 0,
@@ -406,10 +406,10 @@ fn limiting_holds_below_the_limit_and_links_the_group() {
 #[test]
 fn hard_path_arms_above_headroom_and_bypasses_the_attack() {
     let mut p = params();
-    for c in 0..4 {
+    for ch in &mut p.ch[..4] {
         // a slow attack and a feed-forward pole equal to the coil's, so the
         // ordinary path lets the coil overshoot into the hard path
-        p.ch[c].thermal_ff_speedup_factor = 1.0;
+        ch.thermal_ff_speedup_factor = 1.0;
     }
     p.thermal_gain_attack_time_s = 60.0;
     let mut u = spp3::Unit::new(p);
@@ -441,8 +441,8 @@ fn hard_path_arms_above_headroom_and_bypasses_the_attack() {
 #[test]
 fn zero_speedup_factor_holds_the_feed_forward_reduction_at_unity() {
     let mut p = params();
-    for c in 0..4 {
-        p.ch[c].thermal_ff_speedup_factor = 0.0;
+    for ch in &mut p.ch[..4] {
+        ch.thermal_ff_speedup_factor = 0.0;
     }
     let mut u = spp3::Unit::new(p);
     // steady state between the limit and the hard limit
@@ -455,8 +455,8 @@ fn zero_speedup_factor_holds_the_feed_forward_reduction_at_unity() {
 #[test]
 fn pilot_mode_reserves_program_headroom_from_the_first_sample() {
     let mut p = params();
-    for c in 0..4 {
-        p.ch[c].pilot_tone_enabled = 1;
+    for ch in &mut p.ch[..4] {
+        ch.pilot_tone_enabled = 1;
     }
     let mut u = spp3::Unit::new(p);
     let mut x = vec![0.0f32; 512];
@@ -524,10 +524,10 @@ fn run_cl(u: &mut spp3::Unit, x: f32, tele: &[Vec<f32>], from: usize, to: usize)
 
 fn cl_params(rc: f32, tc: f32) -> Params {
     let mut p = params();
-    for c in 0..4 {
-        p.ch[c].cal_present = 1;
-        p.ch[c].cal_r = rc;
-        p.ch[c].cal_t = tc;
+    for ch in &mut p.ch[..4] {
+        ch.cal_present = 1;
+        ch.cal_r = rc;
+        ch.cal_t = tc;
     }
     p
 }
@@ -738,8 +738,8 @@ fn safe_tlim_setup_clamps() {
 #[test]
 fn pilot_gates_on_drive_power_and_selects_by_t_ol() {
     let mut p = cl_params(4.0, 25.0);
-    for c in 0..4 {
-        p.ch[c].pilot_tone_enabled = 1;
+    for ch in &mut p.ch[..4] {
+        ch.pilot_tone_enabled = 1;
     }
     let mut u = spp3::Unit::new(p);
     // Pdrv = elec * x^2 for DC: the gate is >= PilotEnableThres (0.03 W)
@@ -782,8 +782,7 @@ fn fast_poles_settle_without_a_limit_cycle() {
     p.thermal_ambient_temp = 50.0;
     p.thermal_gain_attack_time_s = 2.0;
     p.thermal_gain_release_time_s = 5.0;
-    for c in 0..4 {
-        let ch = &mut p.ch[c];
+    for ch in &mut p.ch[..4] {
         ch.tau_tvc = 0.5;
         ch.tau_tmg = 5.0;
         ch.t_sett_vc = 26.06;
@@ -837,8 +836,7 @@ fn full_scale_drive_never_lowers_t_ol_abruptly() {
     p.thermal_ambient_temp = 50.0;
     p.thermal_gain_attack_time_s = 4.6;
     p.thermal_gain_release_time_s = 20.0;
-    for c in 0..4 {
-        let ch = &mut p.ch[c];
+    for ch in &mut p.ch[..4] {
         (ch.t_sett_vc, ch.t_sett_mg, ch.tau_tvc, ch.tau_tmg) = (26.06, 25.55, 5.532, 197.25);
         (ch.temperature_limit, ch.hard_temp_limit_headroom) = (140.0, 10.0);
         (ch.reb_ref, ch.rshunt, ch.ag, ch.thermal_ff_speedup_factor) = (2.7, 0.09, 11.89, 0.25);
@@ -879,9 +877,9 @@ fn full_scale_drive_never_lowers_t_ol_abruptly() {
 /// seconds as in the live incident.
 fn slow_cl_params() -> Params {
     let mut p = cl_params(4.0, 25.0);
-    for c in 0..4 {
-        p.ch[c].tau_tvc = 3.0;
-        p.ch[c].tau_tmg = 30.0;
+    for ch in &mut p.ch[..4] {
+        ch.tau_tvc = 3.0;
+        ch.tau_tmg = 30.0;
     }
     p
 }
@@ -970,8 +968,8 @@ fn plausibility_guard_allows_a_cold_start_below_a_warm_calibration() {
 fn plausibility_guard_bound_follows_cal_temp_range_min() {
     let mut p = cl_params(4.0, 31.0);
     p.thermal_ambient_temp = 50.0;
-    for c in 0..4 {
-        p.ch[c].cal_temp_range_min = 28.0;
+    for ch in &mut p.ch[..4] {
+        ch.cal_temp_range_min = 28.0;
     }
     let mut u = spp3::Unit::new(p);
     let n = 48_000 * 6;
@@ -1163,8 +1161,8 @@ const TW_TWEETER_HZ: f64 = 5_000.0;
 fn tweeter_layout() -> Params {
     let base = cl_params(4.0, 25.0).ch[0];
     let mut p = Params { channels: TW_N as u32, ..cl_params(4.0, 25.0) };
-    for c in 0..TW_N {
-        p.ch[c] = ChannelParams {
+    for (c, ch) in p.ch[..TW_N].iter_mut().enumerate() {
+        *ch = ChannelParams {
             source: c as u32,
             group: if c < 4 { 1 } else { 0 },
             sense_v: 2 * c as u32,
@@ -1252,23 +1250,23 @@ fn tweeter_below_the_pilot_threshold_holds_t_cal_and_is_not_fresh() {
     let (aw, at) = (tw_peak(&p, 0, 12.0), tw_peak(&p, 4, -6.0));
     let coils = [60.0, 60.0, 60.0, 60.0, 70.0, 70.0];
     let t = tw_drive(&mut u, aw, at, coils, 20.0, true);
-    for c in 0..4 {
+    for (c, ch) in t.channels[..4].iter().enumerate() {
         assert_eq!(u.pilot_state(c).map(|s| s.0), Some(true), "woofer {c} pilot on");
         assert!(u.cl_fresh(c), "woofer {c} fresh");
-        assert_eq!(t.channels[c].cl_fresh, 1, "woofer {c} published fresh");
-        assert!((t.channels[c].cl_temp_c - 60.0).abs() < 2.0, "woofer {c} T_CL {}", t.channels[c].cl_temp_c);
+        assert_eq!(ch.cl_fresh, 1, "woofer {c} published fresh");
+        assert!((ch.cl_temp_c - 60.0).abs() < 2.0, "woofer {c} T_CL {}", ch.cl_temp_c);
     }
-    for c in 4..TW_N {
+    for (c, ch) in t.channels[..TW_N].iter().enumerate().skip(4) {
         assert_eq!(u.pilot_state(c).map(|s| s.0), Some(false), "tweeter {c} pilot off");
-        assert!(t.channels[c].closed_loop, "tweeter {c} has a closed-loop estimator");
+        assert!(ch.closed_loop, "tweeter {c} has a closed-loop estimator");
         assert!(!u.cl_fresh(c), "tweeter {c} not fresh");
-        assert_eq!(t.channels[c].cl_fresh, 0, "tweeter {c} published stale");
-        assert_eq!(t.channels[c].cl_temp_c, 25.0, "tweeter {c} T_CL holds T_cal");
+        assert_eq!(ch.cl_fresh, 0, "tweeter {c} published stale");
+        assert_eq!(ch.cl_temp_c, 25.0, "tweeter {c} T_CL holds T_cal");
         // the open-loop model runs: it heats above the ambient from the
         // cold start
-        assert!(t.channels[c].ol_temp_c > 40.1, "tweeter {c} T_OL {}", t.channels[c].ol_temp_c);
+        assert!(ch.ol_temp_c > 40.1, "tweeter {c} T_OL {}", ch.ol_temp_c);
         // no relaxation from a stale estimate
-        assert_eq!(t.channels[c].tlim_adj_c, 0.0);
+        assert_eq!(ch.tlim_adj_c, 0.0);
         assert_eq!(u.effective_limit(c), 120.0);
     }
 }
@@ -1302,19 +1300,19 @@ fn tweeter_above_the_pilot_threshold_reads_its_own_coil() {
 #[test]
 fn tweeter_open_loop_model_limits_without_sense() {
     let mut p = tweeter_layout();
-    for c in 0..TW_N {
-        p.ch[c].cal_present = 0;
+    for ch in &mut p.ch[..TW_N] {
+        ch.cal_present = 0;
     }
     let mut u = spp3::Unit::new(p);
     let t = tw_drive(&mut u, 0.0, 1.0, [25.0; TW_N], 30.0, false);
-    for c in 4..TW_N {
-        assert!(!t.channels[c].closed_loop, "tweeter {c} open loop");
-        assert_eq!(t.channels[c].cl_fresh, 0);
-        let tol = t.channels[c].ol_temp_c;
+    for (c, ch) in t.channels[..TW_N].iter().enumerate().skip(4) {
+        assert!(!ch.closed_loop, "tweeter {c} open loop");
+        assert_eq!(ch.cl_fresh, 0);
+        let tol = ch.ol_temp_c;
         assert!(tol > 100.0 && tol <= 120.0 + 8.0, "tweeter {c} T_OL {tol}");
-        assert!(t.channels[c].gain < 0.9, "tweeter {c} gain {}", t.channels[c].gain);
+        assert!(ch.gain < 0.9, "tweeter {c} gain {}", ch.gain);
     }
-    for c in 0..4 {
-        assert_eq!(t.channels[c].gain, 1.0, "woofer {c} untouched");
+    for (c, ch) in t.channels[..4].iter().enumerate() {
+        assert_eq!(ch.gain, 1.0, "woofer {c} untouched");
     }
 }

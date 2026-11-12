@@ -11,10 +11,10 @@ use sgv2_core::spp3;
 #[test]
 fn spp3_reduces_below_twenty_db_when_the_limit_needs_it() {
     let mut p = spp3_params();
-    for c in 0..4 {
+    for ch in &mut p.ch[..4] {
         // 2 K of headroom over ambient: holding it at full scale takes
         // about -24 dB, inside the -40 dB floor, below the hard path
-        p.ch[c].temperature_limit = 42.0;
+        ch.temperature_limit = 42.0;
     }
     let mut u = spp3::Unit::new(p);
     let mut out = 1.0;

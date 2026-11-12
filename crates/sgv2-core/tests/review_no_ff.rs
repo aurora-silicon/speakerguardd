@@ -13,8 +13,8 @@ use sgv2_core::spp3;
 fn spp3_without_feed_forward_the_hard_path_holds_the_limit() {
     for ff in [0.0f32, -1.0] {
         let mut p = spp3_params();
-        for c in 0..4 {
-            p.ch[c].thermal_ff_speedup_factor = ff;
+        for ch in &mut p.ch[..4] {
+            ch.thermal_ff_speedup_factor = ff;
         }
         let hard_on = p.ch[0].temperature_limit + p.ch[0].hard_temp_limit_headroom;
         let mut u = spp3::Unit::new(p);

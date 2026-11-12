@@ -925,7 +925,7 @@ impl GainSrc {
             *value /= sum;
         }
         let mut out = Self { len, factor, ..Self::EMPTY };
-        for i in 0..len {
+        for (i, tap) in out.taps[..len].iter_mut().enumerate() {
             let mut value = 0.0f32;
             let first = i.saturating_sub(triangle_len - 1);
             let last = i.min(window_len - 1);
@@ -934,7 +934,7 @@ impl GainSrc {
                 let triangle = if k < factor { (k + 1) as f32 } else { (triangle_len - k) as f32 } / factor as f32;
                 value += *window_value * triangle;
             }
-            out.taps[i] = value;
+            *tap = value;
         }
         out.reset();
         out

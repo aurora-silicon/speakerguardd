@@ -301,12 +301,12 @@ impl Params {
             thermal_state_override: g("ThermalStateOverride")? as u32,
             ch: [ChannelParams::default(); MAX_CHANNELS],
         };
-        for c in 0..n {
+        for (c, ch) in p.ch[..n].iter_mut().enumerate() {
             let f = |k: &'static str| {
                 t.channel(c, k).filter(|v| v.is_finite()).map(|v| v as f32).ok_or(InitError::Invalid(k))
             };
             let (si, sv) = t.sense(c).ok_or(InitError::Invalid("sense order"))?;
-            p.ch[c] = ChannelParams {
+            *ch = ChannelParams {
                 source: t.source(c).ok_or(InitError::Invalid("channel source"))?,
                 group: f("SpeakerGroup")? as u32,
                 // Nonessential: a malformed ignore list is ignored, so
@@ -2254,8 +2254,8 @@ mod fault_tests {
             thermal_safe_tlim_time_min: 10.0,
             ..Params::default()
         };
-        for c in 0..2 {
-            p.ch[c] = ChannelParams {
+        for (c, ch) in p.ch[..2].iter_mut().enumerate() {
+            *ch = ChannelParams {
                 source: c as u32,
                 t_sett_vc: 20.0,
                 t_sett_mg: 10.0,

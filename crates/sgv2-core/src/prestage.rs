@@ -479,8 +479,8 @@ impl Params {
                 for v in [d.before_box as u32, d.active_mask, d.sidechain_mask, d.params.kind as u32] {
                     body.extend_from_slice(&v.to_le_bytes());
                 }
-                for c in 0..self.channels {
-                    body.extend_from_slice(&(d.split[c] as u32).to_le_bytes());
+                for &split in &d.split[..self.channels] {
+                    body.extend_from_slice(&(split as u32).to_le_bytes());
                 }
                 body.extend_from_slice(&(d.params.smooth as u32).to_le_bytes());
                 for v in [
