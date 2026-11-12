@@ -125,9 +125,9 @@ impl Params {
             }
         };
         let mut p = Self { count: integer(words[0])?, reported_latency: integer(words[1])?, ..Self::default() };
-        for m in 0..MATRIX {
+        for (m, taps) in p.taps.iter_mut().enumerate() {
             let at = HEADER_WORDS + m * MAX_TAPS;
-            p.taps[m].copy_from_slice(&words[at..at + MAX_TAPS]);
+            taps.copy_from_slice(&words[at..at + MAX_TAPS]);
         }
         p.valid().then_some(p)
     }

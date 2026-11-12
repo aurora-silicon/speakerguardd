@@ -1993,10 +1993,10 @@ proptest! {
     ) {
         let mut p = spp3_params(seed, n, blk, 48_000, ff, true);
         // every channel uses telemetry, with valid sense ports
-        for c in 0..n {
-            p.ch[c].ignore_telemetry = 0;
-            p.ch[c].sense_i = 2 * c as u32;
-            p.ch[c].sense_v = 2 * c as u32 + 1;
+        for (c, ch) in p.ch[..n].iter_mut().enumerate() {
+            ch.ignore_telemetry = 0;
+            ch.sense_i = 2 * c as u32;
+            ch.sense_v = 2 * c as u32 + 1;
         }
         let cl = p.ch[..n].iter().any(|c| c.cal_present != 0);
         let x = signal(seed ^ 1, n, len, amp, Hostility::Clean);

@@ -598,8 +598,8 @@ mod tests {
             thermal_protection_enabled: 1,
             ..Default::default()
         };
-        for c in 0..2 {
-            p.ch[c] = spp3::ChannelParams {
+        for (c, ch) in p.ch[..2].iter_mut().enumerate() {
+            *ch = spp3::ChannelParams {
                 source: c as u32,
                 t_sett_vc: 20.0,
                 t_sett_mg: 10.0,
@@ -755,8 +755,8 @@ mod tests {
             thermal_protection_enabled: 1,
             ..Default::default()
         };
-        for c in 0..2 {
-            p.ch[c] = spp3::ChannelParams {
+        for (c, ch) in p.ch[..2].iter_mut().enumerate() {
+            *ch = spp3::ChannelParams {
                 source: c as u32,
                 t_sett_vc: 20.0,
                 t_sett_mg: 10.0,
@@ -839,8 +839,8 @@ mod tests {
             thermal_protection_enabled: 1,
             ..Default::default()
         };
-        for c in 0..2 {
-            p.ch[c] = spp3::ChannelParams {
+        for (c, ch) in p.ch[..2].iter_mut().enumerate() {
+            *ch = spp3::ChannelParams {
                 source: c as u32,
                 t_sett_vc: 20.0,
                 t_sett_mg: 10.0,
@@ -980,8 +980,8 @@ mod tests {
             thermal_protection_enabled: 1,
             ..Default::default()
         };
-        for c in 0..2 {
-            p.ch[c] = spp3::ChannelParams {
+        for (c, ch) in p.ch[..2].iter_mut().enumerate() {
+            *ch = spp3::ChannelParams {
                 source: c as u32,
                 t_sett_vc: 20.0,
                 t_sett_mg: 10.0,
