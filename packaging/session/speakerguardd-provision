@@ -558,6 +558,8 @@ def cmd_run(args, p):
         rec.update(seat_user=user, seat_how=how)
         idx, card = find_card(want_card, args.card_wait)
         pcm = speaker_pcm(idx)
+        if live:
+            speaker_route(card)
         write_conf(p, conf_text(rec, key, user, pw.pw_uid, card, pcm, p, src))
         write_raw_rules(p, card, idx)
         if how == "seat0":
@@ -630,6 +632,33 @@ def write_conf(p, text):
             os.rename(p.conf, keep)
             log(f"{p.conf} was written by hand; kept as {keep}, and replaced")
     write_atomic(p.conf, text)
+
+
+def speaker_route(card):
+    """Route PCM1 before PipeWire opens it, while provisioning holds no lease.
+
+    WirePlumber's UCM verb runs too late for the generated ALSA adapter.
+    The silent self-check saves and restores this route, so set it first.
+    """
+    control = "name=Speaker Playback Mux"
+
+    def secondary():
+        r = subprocess.run(["amixer", "-c", card, "cget", control],
+                           capture_output=True, text=True, timeout=5)
+        value = re.search(r"^\s*: values=(\d+)\s*$", r.stdout, re.M)
+        item = re.search(r"^\s*; Item #(\d+) 'Secondary'\s*$", r.stdout, re.M)
+        if r.returncode != 0 or value is None or item is None:
+            raise Failed(f"{card}: cannot read Speaker Playback Mux: {r.stderr.strip()[-300:]}")
+        return value.group(1) == item.group(1)
+
+    if secondary():
+        return
+    r = subprocess.run(["amixer", "-c", card, "cset", control, "Secondary"],
+                       capture_output=True, text=True, timeout=5)
+    if r.returncode != 0:
+        raise Failed(f"{card}: cannot select Secondary speaker route: {r.stderr.strip()[-300:]}")
+    if not secondary():
+        raise Failed(f"{card}: Speaker Playback Mux did not retain Secondary")
 
 
 # ------------------------------------------------------------------ graph
