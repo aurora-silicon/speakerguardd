@@ -129,6 +129,9 @@ TRANSPORTS = {
     "apple,t8142-aop-audio": {"transport": "aop-dma", "formats": ["S24_LE"], "sense_batch": False, "speaker_headroom": 0,
                               "speaker_irq": False},
 }
+# The T6050 (J714s) is the same driver's T6050 configuration: six amps on the
+# T8142 transport.
+TRANSPORTS["apple,t6050-aop-audio"] = TRANSPORTS["apple,t8142-aop-audio"]
 # Newer device trees omit the generic MCA fallback. Both compatibles bind
 # mca.c; share the entry so back-ends using either name are the same driver.
 TRANSPORTS["apple,t8103-mca"] = TRANSPORTS["apple,mca"]
