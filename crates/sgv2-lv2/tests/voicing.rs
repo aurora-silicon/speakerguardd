@@ -231,3 +231,74 @@ fn the_artifact_volume_law_drives_mvol_and_the_port_still_overrides() {
     // No artifact: silent anyway, and the law falls back to cubic.
     assert_eq!(voicing::Voicing::load(None, board, 48_000.0, lanes).curve(), Curve::Cubic);
 }
+
+/// Connects a 4-lane instance to `buf` (two inputs then four outputs).
+/// SAFETY: the caller keeps `buf`, `scalar` and the handle alive while it runs.
+unsafe fn connect4(d: &sgv2_lv2::Lv2Descriptor, h: *mut core::ffi::c_void, buf: &mut [Vec<f32>; 6], scalar: &mut f32) {
+    // SAFETY: forwarded from the caller.
+    unsafe {
+        for (c, b) in buf.iter_mut().enumerate() {
+            (d.connect_port)(h, c as u32, b.as_mut_ptr().cast());
+        }
+        (d.connect_port)(h, 6, (scalar as *mut f32).cast());
+        (d.activate.unwrap())(h);
+    }
+}
+
+#[test]
+fn long_silence_stops_the_chain_and_a_new_program_renders_as_on_a_fresh_stream() {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            const Q: usize = 1024;
+            // SAFETY: static descriptor storage.
+            let d = unsafe { &*voicing::descriptor(2) };
+            let good = blob::with_voicing(&fixture::unit("j413", 4), &fixture::spec(4)).unwrap();
+            let a = voicing::instantiate_offline(Some(&good), "j413", 48000.0, 4);
+            let b = voicing::instantiate_offline(Some(&good), "j413", 48000.0, 4);
+            let mut ba: [Vec<f32>; 6] = core::array::from_fn(|_| vec![0.0; Q]);
+            let mut bb: [Vec<f32>; 6] = core::array::from_fn(|_| vec![0.0; Q]);
+            let (mut sa, mut sb) = (1.0f32, 1.0f32);
+            let tone = |k: usize, c: usize| (((k as f64) * if c == 0 { 0.071 } else { 0.133 }).sin() * 0.3) as f32;
+            let program = |b: &mut [Vec<f32>; 6], q: usize| {
+                for (c, ch) in b[..2].iter_mut().enumerate() {
+                    for (k, s) in ch.iter_mut().enumerate() {
+                        *s = tone(q * Q + k, c);
+                    }
+                }
+            };
+            // SAFETY: buffers, scalars and handles outlive every callback below.
+            unsafe {
+                connect4(d, a, &mut ba, &mut sa);
+                connect4(d, b, &mut bb, &mut sb);
+                // A plays, then goes quiet for longer than IDLE_AFTER.
+                for q in 0..8 {
+                    program(&mut ba, q);
+                    (d.run)(a, Q as u32);
+                }
+                let quiet = (voicing::IDLE_AFTER as usize).div_ceil(Q) + 4;
+                for _ in 0..quiet {
+                    ba[0].fill(0.0);
+                    ba[1].fill(0.0);
+                    let before = allocs();
+                    (d.run)(a, Q as u32);
+                    assert_eq!(allocs(), before);
+                }
+                assert!(ba[2..].iter().flatten().all(|v| *v == 0.0), "idle output is exact silence");
+                // A new program: A must render exactly as the fresh instance B.
+                for q in 0..6 {
+                    program(&mut ba, q);
+                    program(&mut bb, q);
+                    (d.run)(a, Q as u32);
+                    (d.run)(b, Q as u32);
+                    assert_eq!(&ba[2..], &bb[2..], "quantum {q}");
+                }
+                assert!(ba[2..].iter().flatten().any(|v| *v != 0.0));
+                (d.cleanup)(a);
+                (d.cleanup)(b);
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
