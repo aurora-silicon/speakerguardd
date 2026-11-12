@@ -22,8 +22,8 @@ pub fn spp3_params() -> spp3::Params {
         thermal_safe_tlim_time_min: 10.0,
         ..spp3::Params::default()
     };
-    for c in 0..4 {
-        p.ch[c] = spp3::ChannelParams {
+    for (c, ch) in p.ch[..4].iter_mut().enumerate() {
+        *ch = spp3::ChannelParams {
             source: c as u32,
             group: if c < 2 { 7 } else { 3 },
             ignore_telemetry: 0,
@@ -77,11 +77,11 @@ pub fn spp3_params() -> spp3::Params {
 /// Closed loop with a calibration of 4 ohm at 25 C on every channel.
 pub fn spp3_cl_params(cap: f32) -> spp3::Params {
     let mut p = spp3_params();
-    for c in 0..4 {
-        p.ch[c].cal_present = 1;
-        p.ch[c].cal_r = 4.0;
-        p.ch[c].cal_t = 25.0;
-        p.ch[c].tlim_adj_cap = cap;
+    for ch in &mut p.ch[..4] {
+        ch.cal_present = 1;
+        ch.cal_r = 4.0;
+        ch.cal_t = 25.0;
+        ch.tlim_adj_cap = cap;
     }
     p
 }
@@ -185,8 +185,8 @@ pub fn lsm2_params() -> lsm2::Params {
         low_rail_power_ratio: 1.0,
         ..lsm2::Params::default()
     };
-    for c in 0..2 {
-        p.ch[c] = lsm2::ChannelParams {
+    for (c, ch) in p.ch[..2].iter_mut().enumerate() {
+        *ch = lsm2::ChannelParams {
             source: c as u32,
             volts_full_scale: 6.0,
             parasitic_resistance: 0.2,
@@ -327,8 +327,8 @@ pub fn never_above_input_sensed(
             hist[c].drain(..n);
         }
         let t = tel(unit);
-        for c in 0..channels {
-            let g = t.channels[c].gain;
+        for ch in &t.channels[..channels] {
+            let g = ch.gain;
             assert!(g.is_finite() && (0.0..=1.0).contains(&g), "{:?} gain {g}", unit.kind());
         }
     }
@@ -359,8 +359,8 @@ pub fn never_above_full_scale(unit: &mut dyn ProtectionUnit, channels: usize, se
             }
         }
         let t = tel(unit);
-        for c in 0..channels {
-            let g = t.channels[c].gain;
+        for ch in &t.channels[..channels] {
+            let g = ch.gain;
             assert!(g.is_finite() && (0.0..=1.0).contains(&g), "{:?} gain {g}", unit.kind());
         }
     }

@@ -26,8 +26,8 @@ fn spp3_huge_finite_samples_never_unlock_full_scale() {
     };
     for ff in [0.5f32, 0.0] {
         let mut p = spp3_params();
-        for c in 0..4 {
-            p.ch[c].thermal_ff_speedup_factor = ff;
+        for ch in &mut p.ch[..4] {
+            ch.thermal_ff_speedup_factor = ff;
         }
         let want = tail(&mut spp3::Unit::new(p));
         let mut u = spp3::Unit::new(p);

@@ -77,8 +77,7 @@ fn spp3_fields_come_from_the_sidecar_and_state() {
     assert_eq!(p.thermal_protection_enabled, 1);
     // The fixture strip sets 64007 = 2: the cold start.
     assert_eq!(p.thermal_state_override, 2);
-    for ch in 0..4 {
-        let x = &p.ch[ch];
+    for (ch, x) in p.ch[..4].iter().enumerate() {
         assert_eq!(x.source, ch as u32);
         assert_eq!(x.group, (ch / 2) as u32);
         assert_eq!((x.sense_i, x.sense_v), (2 * ch as u32 + 1, 2 * ch as u32));
@@ -151,8 +150,7 @@ fn spp3_records_bind_by_position_not_by_id() {
     let sparse: Vec<_> =
         ["spA0", "spA1", "spA4", "spA5"].iter().enumerate().map(|(i, s)| (fcc(s), raw(i).0, raw(i).1)).collect();
     let p = compile_records(SizeForm::TotalLength, &sparse, "c-pos-sparse");
-    for c in 0..4 {
-        let x = &p.ch[c];
+    for (c, x) in p.ch[..4].iter().enumerate() {
         assert_eq!(x.cal_present, 1, "channel {c}");
         assert_eq!((x.cal_r, x.cal_t), (f32::from(raw(c).0) * 0.001, f32::from(raw(c).1) * 0.01), "channel {c}");
         // The sense pair follows the channel, never the record's ID.

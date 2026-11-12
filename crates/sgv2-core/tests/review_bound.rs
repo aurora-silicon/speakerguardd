@@ -14,8 +14,8 @@ fn no_input_ever_leaves_above_the_input_times_the_allowed_gain() {
         never_above_input(&mut spp3::Unit::new(spp3_params()), 4, 0, seed, 400);
         never_above_input_sensed(&mut spp3::Unit::new(spp3_cl_params(30.0)), 4, 8, 0, seed, 400);
         let mut p = spp3_params();
-        for c in 0..4 {
-            p.ch[c].thermal_ff_speedup_factor = 0.0;
+        for ch in &mut p.ch[..4] {
+            ch.thermal_ff_speedup_factor = 0.0;
         }
         never_above_input(&mut spp3::Unit::new(p), 4, 0, seed, 400);
         never_above_input(&mut atsp::Unit::new(atsp_params()), 4, 0, seed, 400);

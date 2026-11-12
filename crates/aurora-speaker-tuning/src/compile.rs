@@ -653,9 +653,9 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
             control_temperature: u32::from(get(id::controller(id::C_CONTROL_TEMPERATURE))? != 0.0),
             ..Default::default()
         };
-        for c in 0..n {
-            p.ch[c].source = c as u32;
-            p.ch[c].volts_full_scale = get(id::channel(c as u32, id::CH_VOLTS_FS))?;
+        for (c, ch) in p.ch[..n].iter_mut().enumerate() {
+            ch.source = c as u32;
+            ch.volts_full_scale = get(id::channel(c as u32, id::CH_VOLTS_FS))?;
         }
         diags.warn(
             "lsm2-legacy-opaque",

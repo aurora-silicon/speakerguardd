@@ -76,10 +76,10 @@ fn spp3_time_constants_below_the_documented_minimum_are_refused() {
     }
     // exactly the minimum is accepted, also as the feed-forward pole
     let mut p = spp3_params();
-    for c in 0..4 {
-        p.ch[c].tau_tvc = spp3::TAU_MIN_S;
-        p.ch[c].tau_tmg = spp3::TAU_MIN_S;
-        p.ch[c].thermal_ff_speedup_factor = 1.0;
+    for ch in &mut p.ch[..4] {
+        ch.tau_tvc = spp3::TAU_MIN_S;
+        ch.tau_tmg = spp3::TAU_MIN_S;
+        ch.thermal_ff_speedup_factor = 1.0;
     }
     assert!(!spp3::Unit::new(p).is_failsafe());
 }
