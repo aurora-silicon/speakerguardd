@@ -25,7 +25,7 @@ channels at S16, so the M5 Max config uses 2048.
 
 ### How it works
 
-Every period (4096 frames) the sense words of each channel are scaled to the
+Every period (4096 frames by default; `period` sets it) the sense words of each channel are scaled to the
 amplifier's output voltage (`vs_scale` volts at full scale) and squared into
 the power in the coil (`z_nominal`).  That power drives a two-stage lumped
 thermal model - voice coil into magnet (`tr_coil` K/W, `tau_coil` s), magnet
