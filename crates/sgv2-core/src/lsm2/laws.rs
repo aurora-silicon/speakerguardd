@@ -188,10 +188,13 @@ pub fn velocity_limit(e: f32, k: &[f32; 4], v: &[f32; 3], vmax: f32) -> f32 {
 /// band velocities `vb[k][n]` over `first..`, under the applied slow gain
 /// `s`, find the worst sample, orient every band's contribution to its sign
 /// and water-fill the active bands (`active`) into the room the ignored
-/// bands leave; repeat until the waveform is within `vlim`. Returns each
-/// band's gain relative to `s` (ignored bands 1), before the floor. The
-/// ordinary solve starts from unity; the post-retarget solve (residuals
-/// 5.2) from a lane-selective `seed`.
+/// bands leave; repeat until the waveform is within `vlim`. When `floor > 0`,
+/// a band at or below `floor` is treated as a fixed term and active cuts stop
+/// at `floor` (never raising a seed already below it). Returns each band's
+/// gain relative to `s` (ignored bands unchanged from `seed`). The ordinary
+/// solve starts from unity; the post-retarget solve (residuals 5.2) from a
+/// lane-selective `seed`.
+#[allow(clippy::too_many_arguments)]
 pub fn velocity_band_gains(
     vb: &[alloc::vec::Vec<f32>; 5],
     resid: &[f32],
@@ -200,6 +203,7 @@ pub fn velocity_band_gains(
     s: f32,
     active: (usize, usize),
     seed: [f32; 5],
+    floor: f32,
 ) -> [f32; 5] {
     let mut g = seed;
     let n = vb[0].len();
@@ -207,6 +211,7 @@ pub fn velocity_band_gains(
         return g;
     }
     let is_active = |k: usize| k >= active.0 && k < active.1;
+    let floor_on = floor > 0.0;
     loop {
         let (mut idx, mut worst) = (first, 0.0f32);
         for i in first..n {
@@ -223,15 +228,16 @@ pub fn velocity_band_gains(
             break;
         }
         let sign = if worst >= 0.0 { 1.0f32 } else { -1.0 };
+        let pinned: [bool; 5] = core::array::from_fn(|k| floor_on && g[k] <= floor);
         let mut fixed = if resid.is_empty() { 0.0f32 } else { resid[idx] };
-        for k in (0..5).filter(|&k| !is_active(k)) {
+        for k in (0..5).filter(|&k| !is_active(k) || pinned[k]) {
             fixed += (g[k] * s) * vb[k][idx];
         }
         let room = vlim - sign * fixed;
         let mut share = [0.0f32; 5];
         let mut sorted = [0.0f32; 5];
         let mut m = 0;
-        for k in (0..5).filter(|&k| is_active(k)) {
+        for k in (0..5).filter(|&k| is_active(k) && !pinned[k]) {
             share[k] = (sign * s) * (g[k] * vb[k][idx]);
             sorted[m] = share[k];
             m += 1;
@@ -252,10 +258,10 @@ pub fn velocity_band_gains(
             remain -= v;
         }
         let mut changed = false;
-        for k in (0..5).filter(|&k| is_active(k)) {
-            if share[k] > level {
+        for k in (0..5).filter(|&k| is_active(k) && !pinned[k]) {
+            if share[k] > level && (!floor_on || share[k] > 0.0) {
                 let r = (level / share[k]).clamp(0.0, 1.0);
-                let next = g[k] * r;
+                let next = if floor_on { (g[k] * r).max(floor.min(g[k])) } else { g[k] * r };
                 if next != g[k] {
                     g[k] = next;
                     changed = true;
@@ -291,7 +297,7 @@ pub fn velocity_band_gains_window(
     seed: [f32; 5],
 ) -> [f32; 5] {
     let n = vb[0].len();
-    velocity_band_gains_with_limits(vb, resid, first, room_floor, s, active, seed, |i| {
+    velocity_band_gains_with_limits(vb, resid, first, room_floor, s, active, seed, 0.0, |i| {
         if i < split {
             old_limit
         } else if new_limit >= old_limit {
@@ -316,9 +322,10 @@ pub fn velocity_band_gains_limit_window(
     s: f32,
     active: (usize, usize),
     seed: [f32; 5],
+    floor: f32,
 ) -> [f32; 5] {
     debug_assert_eq!(limits.len(), vb[0].len());
-    velocity_band_gains_with_limits(vb, resid, first, room_floor, s, active, seed, |i| limits[i])
+    velocity_band_gains_with_limits(vb, resid, first, room_floor, s, active, seed, floor, |i| limits[i])
 }
 
 /// Choose the producer for a newly admitted retained-window segment.
@@ -339,6 +346,7 @@ fn velocity_band_gains_with_limits(
     s: f32,
     active: (usize, usize),
     seed: [f32; 5],
+    floor: f32,
     limit_at: impl Fn(usize) -> f32,
 ) -> [f32; 5] {
     let mut g = seed;
@@ -347,6 +355,7 @@ fn velocity_band_gains_with_limits(
         return g;
     }
     let is_active = |k: usize| k >= active.0 && k < active.1;
+    let floor_on = floor > 0.0;
     loop {
         let (mut idx, mut worst) = (first, 0.0f32);
         for i in first..n {
@@ -364,15 +373,16 @@ fn velocity_band_gains_with_limits(
             break;
         }
         let sign = if worst >= 0.0 { 1.0 } else { -1.0 };
+        let pinned: [bool; 5] = core::array::from_fn(|k| floor_on && g[k] <= floor);
         let mut fixed = if resid.is_empty() { 0.0 } else { resid[idx] };
-        for k in (0..5).filter(|&k| !is_active(k)) {
+        for k in (0..5).filter(|&k| !is_active(k) || pinned[k]) {
             fixed += (g[k] * s) * vb[k][idx];
         }
         let room = (limit - sign * fixed).max(room_floor);
         let mut share = [0.0f32; 5];
         let mut sorted = [0.0f32; 5];
         let mut m = 0;
-        for k in (0..5).filter(|&k| is_active(k)) {
+        for k in (0..5).filter(|&k| is_active(k) && !pinned[k]) {
             share[k] = (sign * s) * (g[k] * vb[k][idx]);
             sorted[m] = share[k];
             m += 1;
@@ -393,9 +403,10 @@ fn velocity_band_gains_with_limits(
             remain -= v;
         }
         let mut changed = false;
-        for k in (0..5).filter(|&k| is_active(k)) {
-            if share[k] > level {
-                let next = g[k] * (level / share[k]).clamp(0.0, 1.0);
+        for k in (0..5).filter(|&k| is_active(k) && !pinned[k]) {
+            if share[k] > level && (!floor_on || share[k] > 0.0) {
+                let r = (level / share[k]).clamp(0.0, 1.0);
+                let next = if floor_on { (g[k] * r).max(floor.min(g[k])) } else { g[k] * r };
                 changed |= next != g[k];
                 g[k] = next;
             }
@@ -846,6 +857,52 @@ mod tests {
         assert!((velocity_limit(50.0, &k, &v, 2.0) - 3.0).abs() < 1e-6);
     }
 
+    /// A crossover tone: band 2 carries it, band 1 contributes 3 % with the
+    /// opposite sign, and the full-band carry of the earlier, floor-bound
+    /// output is itself over the limit, so the floor binds.
+    /// A band that reaches MaxVelocityAttenuation is a fixed term of the
+    /// water-fill: the opposite-sign neighbour, which lowers the peak, is
+    /// not cut. Flooring after an unbounded solve drove every band to zero
+    /// first and so put the neighbour on the floor too.
+    #[test]
+    fn the_velocity_floor_bounds_the_water_fill_and_spares_an_opposite_neighbour() {
+        let n = 96;
+        let tone = |a: f32, ph: f32| {
+            (0..n).map(|i| a * (core::f32::consts::TAU * i as f32 / 24.0 + ph).sin()).collect::<alloc::vec::Vec<f32>>()
+        };
+        let vb = [vec![0.0; n], tone(0.032, core::f32::consts::PI), tone(1.03, 0.0), tone(0.007, 0.1), vec![0.0; n]];
+        let carry = tone(0.4, 2.0);
+        let floor = 0.501_187_2;
+        let got = velocity_band_gains(&vb, &carry, 0, 0.05, 1.0, (0, 5), [1.0; 5], floor);
+        assert_eq!(got[2], floor);
+        assert_eq!(got[3], floor);
+        assert_eq!(got[1], 1.0, "{got:?}");
+        // the same floor rule holds on the retained-window solver too
+        let limits = vec![0.05f32; n];
+        let got_win = velocity_band_gains_limit_window(&vb, &carry, 0, &limits, 0.0, 1.0, (0, 5), [1.0; 5], floor);
+        assert_eq!(got_win[2], floor);
+        assert_eq!(got_win[1], 1.0, "{got_win:?}");
+        // the former rule: solve unbounded, then floor
+        let old = velocity_band_gains(&vb, &carry, 0, 0.05, 1.0, (0, 5), [1.0; 5], 0.0);
+        assert!(old[1] < floor && old[2] < floor, "old {old:?} new {got:?}");
+        // a floor that does not bind changes nothing
+        let free = velocity_band_gains(&vb, &[], 0, 0.9, 1.0, (0, 5), [1.0; 5], 0.0);
+        assert_eq!(velocity_band_gains(&vb, &[], 0, 0.9, 1.0, (0, 5), [1.0; 5], 0.1), free);
+    }
+
+    #[test]
+    fn zero_crossing_neighbour_is_not_cut_when_pinned_room_is_negative() {
+        let vb = [vec![4.0, 2.4], vec![0.0, -0.3], vec![0.0; 2], vec![0.0; 2], vec![0.0; 2]];
+        let got = velocity_band_gains(&vb, &[], 0, 1.0, 1.0, (0, 5), [1.0; 5], 0.5);
+        assert_eq!(got[0], 0.5);
+        assert_eq!(got[1], 1.0, "{got:?}");
+        assert!(got[0] * 2.4 + got[1] * -0.3 <= 1.0);
+        let got_win = velocity_band_gains_limit_window(&vb, &[], 0, &[1.0, 1.0], 0.0, 1.0, (0, 5), [1.0; 5], 0.5);
+        assert_eq!(got_win[0], 0.5);
+        assert_eq!(got_win[1], 1.0, "{got_win:?}");
+        assert!(got_win[0] * 2.4 + got_win[1] * -0.3 <= 1.0);
+    }
+
     #[test]
     fn retained_velocity_bounds_switch_at_the_handoff() {
         let vb = [vec![2.0, 2.0], vec![0.0, 0.0], vec![0.0, 0.0], vec![0.0, 0.0], vec![0.0, 0.0]];
@@ -856,7 +913,7 @@ mod tests {
     #[test]
     fn retained_velocity_uses_the_limit_at_the_selected_window_sample() {
         let vb = [vec![1.0, 2.0, 1.5], vec![0.0; 3], vec![0.0; 3], vec![0.0; 3], vec![0.0; 3]];
-        let got = velocity_band_gains_limit_window(&vb, &[], 0, &[0.2, 1.0, 0.3], 0.0, 1.0, (0, 5), [1.0; 5]);
+        let got = velocity_band_gains_limit_window(&vb, &[], 0, &[0.2, 1.0, 0.3], 0.0, 1.0, (0, 5), [1.0; 5], 0.0);
         assert_eq!(got, [0.5, 1.0, 1.0, 1.0, 1.0]);
     }
 
