@@ -19,6 +19,10 @@ only 16-bit samples (the MacBook Pro 14-inch with M5 Max does); the default is
 `S32_LE`.  S16 words are shifted to the top of a 32-bit word, so `vs_scale`
 still means volts at full scale in both.
 
+`period` must also fit the sense PCM's own limit, or the open fails with
+EINVAL: that PCM caps one period at 65520 bytes, which is 2730 frames of 12
+channels at S16, so the M5 Max config uses 2048.
+
 ### How it works
 
 Every period (4096 frames) the sense words of each channel are scaled to the
