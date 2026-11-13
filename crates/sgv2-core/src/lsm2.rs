@@ -296,6 +296,14 @@ pub struct ChannelParams {
     /// [`PRESSURE_TAPS`]).
     pub pressure_taps: u32,
     pub pressure_fir: [f32; PRESSURE_TAPS],
+    /// Resonator compensation ahead of the limiter ([`crate::resonator`]),
+    /// from the type's acceleration-manager block when CompensateResonators
+    /// is on and that block sets UseCompensation: enabled (0 or 1),
+    /// DesiredResonatorFrequency (Hz), DesiredResonatorQuality, MaxDCBoost
+    /// and MaxResonanceCut (dB), then that block's model resolved against
+    /// its generic flags like the other managers': Rdc, Bl, Mms (kg), Rms,
+    /// Kms.
+    pub compensation: [f32; 10],
 }
 
 impl ChannelParams {
@@ -370,6 +378,7 @@ impl Default for ChannelParams {
             explicit: [[0.0; 5]; 3],
             pressure_taps: 0,
             pressure_fir: [0.0; PRESSURE_TAPS],
+            compensation: [0.0; 10],
         }
     }
 }
@@ -425,7 +434,7 @@ unsafe impl Pod for Params {}
 // SAFETY: as above.
 unsafe impl Pod for ChannelParams {}
 
-const CH_WORDS: usize = 74 + PRESSURE_TAPS;
+const CH_WORDS: usize = 84 + PRESSURE_TAPS;
 const _: () = assert!(core::mem::size_of::<ChannelParams>() == CH_WORDS * 4);
 const _: () = assert!(core::mem::size_of::<Params>() == (40 + laws::MASK_BUCKETS + MAX_CHANNELS * CH_WORDS) * 4);
 
@@ -486,6 +495,7 @@ pub mod ids {
     pub const MANAGER_ADMITTANCE: u32 = 1;
     pub const MANAGER_DISPLACEMENT: u32 = 2;
     pub const MANAGER_VELOCITY: u32 = 3;
+    pub const MANAGER_ACCELERATION: u32 = 4;
     pub fn model(manager: u32, ty: u32, k: u32) -> u32 {
         3072 + 1024 * (3 * manager + ty) + k
     }
@@ -522,6 +532,10 @@ pub mod ids {
     pub const M_ENABLE_LR2: u32 = 13;
     pub const M_CREEP: u32 = 18;
     pub const M_USE_COMPENSATION: u32 = 24;
+    pub const M_DESIRED_RESONATOR_HZ: u32 = 25;
+    pub const M_DESIRED_RESONATOR_Q: u32 = 26;
+    pub const M_MAX_DC_BOOST_DB: u32 = 27;
+    pub const M_MAX_RESONANCE_CUT_DB: u32 = 28;
     pub const M_PASSIVE_RADIATOR: u32 = 29;
     // Thermal-block offsets.
     pub const T_RTH_VC: u32 = 3;
@@ -1852,6 +1866,8 @@ struct Run {
     power_floor: f64,
     /// Per channel: the frame's input and output (FIFO).
     xin: Vec<Vec<f32>>,
+    /// Per channel: its resonator compensation, if it has one.
+    compensation: Vec<Option<crate::resonator::Filter>>,
     yout: Vec<Vec<f32>>,
     ch: Vec<Chan>,
 }
@@ -2157,6 +2173,28 @@ impl Run {
             let b = if p.runtime_budget_present != 0 { p.runtime_budget_w[j] } else { p.power_hard_limit_w[j] };
             budget[j] = b as f64 * p.power_budgets_scale as f64;
         }
+        let mut compensation = Vec::with_capacity(n);
+        for c in &p.ch[..n] {
+            compensation.push(if c.compensation[0] != 0.0 {
+                let [_, desired_hz, desired_q, max_boost_db, max_cut_db, rdc, bl, mass_kg, damping, stiffness] =
+                    c.compensation.map(f64::from);
+                let params = crate::resonator::Params {
+                    rdc,
+                    bl,
+                    mass_kg,
+                    damping,
+                    stiffness,
+                    desired_hz,
+                    desired_q,
+                    max_boost_db,
+                    max_cut_db,
+                    rate,
+                };
+                Some(crate::resonator::Filter::new(params).map_err(|_| InitError::Invalid("resonator compensation"))?)
+            } else {
+                None
+            });
+        }
         Ok(Run {
             n,
             ctl,
@@ -2197,6 +2235,7 @@ impl Run {
             linked_power: 1.0,
             power_floor: db_to_lin(p.max_power_attenuation_db as f64),
             xin: vec![vec![0.0; ctl]; n],
+            compensation,
             yout: vec![vec![0.0; ctl]; n],
             ch,
         })
@@ -2204,6 +2243,9 @@ impl Run {
 
     fn reset(&mut self) {
         let ctl = self.ctl;
+        for f in self.compensation.iter_mut().flatten() {
+            f.reset();
+        }
         for c in self.ch.iter_mut() {
             c.xb.iter_mut().for_each(|v| *v = 0.0);
             c.ab.iter_mut().for_each(|b| b.iter_mut().for_each(|v| *v = 0.0));
@@ -2911,7 +2953,18 @@ impl Run {
                 let pos = self.pos + k - start;
                 for ci in 0..self.n {
                     let src = self.ch[ci].src;
-                    let x = io.input[src][k];
+                    let mut x = io.input[src][k];
+                    // the compensation runs ahead of the models and the limiter,
+                    // on the metered sample (a non-finite one is 0 to it too)
+                    if let Some(f) = self.compensation[ci].as_mut() {
+                        let mut one = [dsp::meter1(x)];
+                        if f.process(&mut one).is_err() {
+                            self.fault = true;
+                        }
+                        if x.is_finite() {
+                            x = one[0];
+                        }
+                    }
                     // a non-finite sample is 0 to the audio and the models;
                     // the peak axis sees it as the most restrictive
                     self.xin[ci][pos] = if x.is_finite() { dsp::meter1(x) } else { dsp::METER_FS };
