@@ -212,7 +212,8 @@ seeds, `SLIDER=S PROG=prog-pN.f32 attest_refs.sh`), then `attest.py spread --sli
 --perturbed P1 ... P16 --out spread-<build>-sS.json` and the gate again with `--slider-spread`.
 
 Commit the new `parity.json` in the same PR as the code change it attests. `test_verify.py` checks
-that the file is consistent with its own tolerance.
+that the file is consistent with its own tolerance, and `cargo test` (`crates/aurora-speaker-tuning/tests/parity_law.rs`)
+fails while the file's `law` differs from the code's.
 
 ### Builds without a Mac (`ipsw_units.py`)
 
