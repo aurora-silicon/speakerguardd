@@ -682,7 +682,6 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
         let mut unsupported = Vec::new();
         for (key, name) in [
             (id::controller(id::C_USE_FAST_PEAK), "UseFastPeakSampleControl"),
-            (id::controller(id::C_COMPENSATE_RESONATORS), "CompensateResonators integration"),
             (id::ENABLE_CLOSED_LOOP_TEMPERATURE, "closed-loop temperature"),
         ] {
             if get(key)? != 0.0 {
@@ -918,6 +917,45 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
             bandwidth: whole(id::channel(c, id::CH_BANDWIDTH), "Bandwidth")?,
             ..lsm2::ChannelParams::default()
         };
+        // CompensateResonators: the type's acceleration-manager block that sets
+        // UseCompensation runs the resonator compensation ahead of the limiter.
+        // Its model resolves against the block's generic flags like the other
+        // managers' (spec 15.1); a block whose model the single-resonator
+        // transfer cannot represent is refused.
+        if get(id::controller(id::C_COMPENSATE_RESONATORS))? != 0.0 {
+            let m = id::MANAGER_ACCELERATION;
+            let k = |o: u32| get(id::model(m, ty, o));
+            if k(id::M_USE_COMPENSATION)? != 0.0 {
+                if k(id::M_ENABLE_RES1)? == 0.0 {
+                    return Err(refuse(&format!("channel {c} compensation without resonator 1")));
+                }
+                for (o, what) in [
+                    (id::M_ENABLE_RES2, "resonator 2"),
+                    (id::M_ENABLE_LR2, "LR2 inductance"),
+                    (id::M_CREEP, "creep model"),
+                    (id::M_PASSIVE_RADIATOR, "passive radiator"),
+                ] {
+                    if k(o)? != 0.0 {
+                        return Err(refuse(&format!("channel {c} compensation with {what}")));
+                    }
+                }
+                let own = row(m, ty)?;
+                let rdc = if k(id::M_USE_GENERIC_RDC)? != 0.0 { family[0] } else { own[0] };
+                let res1 = if k(id::M_USE_GENERIC_RES1)? != 0.0 { family } else { own };
+                x.compensation = [
+                    1.0,
+                    k(id::M_DESIRED_RESONATOR_HZ)?,
+                    k(id::M_DESIRED_RESONATOR_Q)?,
+                    k(id::M_MAX_DC_BOOST_DB)?,
+                    k(id::M_MAX_RESONANCE_CUT_DB)?,
+                    rdc,
+                    res1[1],
+                    res1[2],
+                    res1[3],
+                    res1[4],
+                ];
+            }
+        }
         // rig law 6: the peak axis reserves the bank's pilot amplitude
         // (PilotToneAmplitude_dB, offset 2 of the bank's pilot block)
         let bank = whole(id::CH_TUNING + c, "ChTuning")?;

@@ -146,6 +146,46 @@ fn quiet_audio_is_the_input_delayed_bit_for_bit() {
 }
 
 #[test]
+fn resonator_compensation_runs_ahead_of_the_limiter() {
+    // a compensated channel's quiet output is its compensated input, delayed;
+    // the other channel is untouched (synthetic model and request)
+    let mut p = params();
+    p.ch[0].compensation = [1.0, 250.0, 1.0, 2.0, 6.0, 4.0, 0.8, 0.0002, 0.2, 1500.0];
+    let [rdc, bl, mass_kg, damping, stiffness] = [4.0f32, 0.8, 0.0002, 0.2, 1500.0].map(f64::from);
+    let mut filter = sgv2_core::resonator::Filter::new(sgv2_core::resonator::Params {
+        rdc,
+        bl,
+        mass_kg,
+        damping,
+        stiffness,
+        desired_hz: 250.0,
+        desired_q: 1.0,
+        max_boost_db: 2.0,
+        max_cut_db: 6.0,
+        rate: f64::from(RATE),
+    })
+    .unwrap();
+    let x = sine(1000.0, 0.01, 2.0);
+    let y = sine(70.0, 0.02, 2.0);
+    let mut compensated = x.clone();
+    filter.process(&mut compensated).unwrap();
+    let mut u = Unit::new(p);
+    assert!(!u.is_failsafe());
+    let out = run(&mut u, &[x.clone(), y.clone()], 512);
+    assert!(compensated.iter().zip(&x).any(|(a, b)| a != b));
+    for k in LATENCY..x.len() {
+        assert_eq!(out[0][k], compensated[k - LATENCY]);
+        assert_eq!(out[1][k], y[k - LATENCY]);
+    }
+    // reset clears the filter's history with the rest of the unit
+    u.reset();
+    assert!(run(&mut u, &[x.clone(), y.clone()], 160) == out);
+    // a request the filter refuses (a resonance above Nyquist) is the failsafe
+    p.ch[0].compensation[1] = 30_000.0;
+    assert!(Unit::new(p).is_failsafe());
+}
+
+#[test]
 fn filterbank_is_complementary_and_symmetric() {
     let c = params().ch[0].band_center_hz;
     for bw in 0..3 {

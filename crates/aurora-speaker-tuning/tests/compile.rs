@@ -478,6 +478,74 @@ fn lsm2_refuses_what_the_payload_cannot_carry() {
     }
 }
 
+/// CompensateResonators: the type's acceleration-manager block that sets
+/// UseCompensation gives the channel its resonator compensation, its model
+/// resolved against the block's generic flags; a model the single-resonator
+/// transfer cannot represent is refused.
+#[test]
+fn lsm2_carries_the_resonator_compensation() {
+    let request = |m: &mut BTreeMap<u32, f32>, on: f32, used: f32, generic: f32| {
+        m.insert(id::controller(id::C_COMPENSATE_RESONATORS), on);
+        for ty in 0..3 {
+            let k = |o| id::model(id::MANAGER_ACCELERATION, ty, o);
+            for o in 0..30 {
+                m.insert(k(o), 0.0);
+            }
+            for (o, v) in [
+                (id::M_USE_COMPENSATION, used),
+                (id::M_USE_GENERIC_RDC, generic),
+                (id::M_USE_GENERIC_RES1, generic),
+                (id::M_ENABLE_RES1, 1.0),
+                (id::M_RDC, 5.0),
+                (id::M_BL, 0.9),
+                (id::M_MMS_G, 0.3),
+                (id::M_RMS, 0.25),
+                (id::M_KMS, 1200.0),
+                (id::M_DESIRED_RESONATOR_HZ, 250.0),
+                (id::M_DESIRED_RESONATOR_Q, 1.0),
+                (id::M_MAX_DC_BOOST_DB, 2.0),
+                (id::M_MAX_RESONANCE_CUT_DB, 6.0),
+            ] {
+                m.insert(k(o), v);
+            }
+        }
+    };
+    let request_only = [250.0, 1.0, 2.0, 6.0];
+    let own = [5.0, 0.9, 0.3e-3, 0.25, 1200.0];
+    for (name, on, used, generic) in
+        [("own", 1.0, 1.0, 0.0), ("generic", 1.0, 1.0, 1.0), ("unused", 1.0, 0.0, 0.0), ("off", 0.0, 1.0, 0.0)]
+    {
+        let t = tuning(&lsm2_files(|m| request(m, on, used, generic)), &format!("c-lsm2-comp-{name}"));
+        let c = compile(&t, &mut Diagnostics::default()).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let p = sgv2_core::lsm2::Params::from_blob(&c.blob).unwrap();
+        for ch in &p.ch[..p.channels as usize] {
+            let mut want = [0.0f32; 10];
+            if on != 0.0 && used != 0.0 {
+                want[0] = 1.0;
+                want[1..5].copy_from_slice(&request_only);
+                want[5..].copy_from_slice(if generic != 0.0 { &ch.family } else { &own });
+            }
+            assert_eq!(ch.compensation, want, "{name}");
+        }
+    }
+    for (name, o, v) in [
+        ("res1", id::M_ENABLE_RES1, 0.0),
+        ("res2", id::M_ENABLE_RES2, 1.0),
+        ("lr2", id::M_ENABLE_LR2, 1.0),
+        ("creep", id::M_CREEP, 1.0),
+        ("radiator", id::M_PASSIVE_RADIATOR, 1.0),
+    ] {
+        let t = tuning(
+            &lsm2_files(|m| {
+                request(m, 1.0, 1.0, 0.0);
+                m.insert(id::model(id::MANAGER_ACCELERATION, 0, o), v);
+            }),
+            &format!("c-lsm2-comp-refuse-{name}"),
+        );
+        assert!(compile(&t, &mut Diagnostics::default()).is_err(), "{name}");
+    }
+}
+
 #[test]
 fn atsp_slots_from_the_id_map() {
     let mut params: Vec<(u32, f32)> = vec![(0, 0.0), (40, 1.0)];
