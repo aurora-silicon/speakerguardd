@@ -380,6 +380,75 @@ const PARAM_PERIODS: usize = 15 - 8;
 const ACCESS_RW_INTERLEAVED: u32 = 3;
 const FORMAT_S32_LE: u32 = 10;
 const SUBFORMAT_STD: u32 = 0;
+const FORMAT_S16_LE: u32 = 2;
+
+/// Sample format of the sense PCM.  The J700 captures S32_LE; the K114c
+/// offers S16_LE only.  Words are widened to i32 with full scale at the top
+/// (see `widen_s16`), so `vs_scale` means the same in both.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SenseFormat {
+    #[default]
+    S32Le,
+    S16Le,
+}
+
+impl SenseFormat {
+    pub fn parse(name: &str) -> Option<SenseFormat> {
+        match name {
+            "S32_LE" => Some(SenseFormat::S32Le),
+            "S16_LE" => Some(SenseFormat::S16Le),
+            _ => None,
+        }
+    }
+
+    /// The step between two adjacent words, in widened i32 units.
+    pub fn quantum(self) -> f64 {
+        match self {
+            SenseFormat::S32Le => 1.0,
+            SenseFormat::S16Le => 65536.0,
+        }
+    }
+
+    fn alsa(self) -> u32 {
+        match self {
+            SenseFormat::S32Le => FORMAT_S32_LE,
+            SenseFormat::S16Le => FORMAT_S16_LE,
+        }
+    }
+}
+
+/// S16 words shifted to the top of an i32: full scale is the same number as
+/// in S32_LE.
+pub fn widen_s16(src: &[i16], dst: &mut [i32]) {
+    for (d, s) in dst.iter_mut().zip(src) {
+        *d = i32::from(*s) << 16;
+    }
+}
+
+/// The hw_params request for the sense capture: one format, fixed geometry.
+fn sense_hw_params(format: SenseFormat, channels: usize, rate: u32, period: usize) -> HwParams {
+    // SAFETY: an all-ones/zeroed parameter block is the "unconstrained"
+    // request the kernel refines.
+    let mut hw: HwParams = unsafe { std::mem::zeroed() };
+    for m in hw.masks.iter_mut() {
+        m.bits = [0; 8];
+    }
+    for i in hw.intervals.iter_mut() {
+        *i = Interval { min: 0, max: u32::MAX, flags: 0 };
+    }
+    hw.masks[PARAM_ACCESS].bits[0] = 1 << ACCESS_RW_INTERLEAVED;
+    hw.masks[PARAM_FORMAT].bits[0] = 1 << format.alsa();
+    hw.masks[PARAM_SUBFORMAT].bits[0] = 1 << SUBFORMAT_STD;
+    let fixed = |i: &mut Interval, v: u32| {
+        *i = Interval { min: v, max: v, flags: INTERVAL_INTEGER };
+    };
+    fixed(&mut hw.intervals[PARAM_CHANNELS], channels as u32);
+    fixed(&mut hw.intervals[PARAM_RATE], rate);
+    fixed(&mut hw.intervals[PARAM_PERIOD_SIZE], period as u32);
+    fixed(&mut hw.intervals[PARAM_PERIODS], 4);
+    hw.rmask = u32::MAX;
+    hw
+}
 const INTERVAL_INTEGER: u32 = 1 << 2;
 
 const PCM_IOCTL_HW_PARAMS: libc::c_ulong = iowr::<HwParams>(b'A', 0x11);
@@ -409,6 +478,10 @@ pub trait PcmIo {
 /// The capture PCM file itself.
 pub struct PcmFile {
     file: File,
+    format: SenseFormat,
+    channels: usize,
+    /// Transfer buffer for S16_LE (unused for S32_LE).
+    raw: Vec<i16>,
 }
 
 impl PcmIo for PcmFile {
@@ -421,6 +494,14 @@ impl PcmIo for PcmFile {
     }
 
     fn readi(&mut self, buf: &mut [i32], frames: usize) -> io::Result<i64> {
+        if self.format == SenseFormat::S16Le {
+            self.raw.resize(frames * self.channels, 0);
+            let mut xfer = Xferi { result: 0, buf: self.raw.as_mut_ptr().cast(), frames: frames as u64 };
+            ioctl(&self.file, PCM_IOCTL_READI_FRAMES, &mut xfer)?;
+            let words = xfer.result.max(0) as usize * self.channels;
+            widen_s16(&self.raw[..words], &mut buf[..words]);
+            return Ok(xfer.result);
+        }
         let mut xfer = Xferi { result: 0, buf: buf.as_mut_ptr().cast(), frames: frames as u64 };
         ioctl(&self.file, PCM_IOCTL_READI_FRAMES, &mut xfer)?;
         Ok(xfer.result)
@@ -471,11 +552,11 @@ pub struct PeriodReader<P: PcmIo> {
     started: bool,
 }
 
-/// An interleaved S32_LE capture stream with fixed period geometry.
+/// An interleaved capture stream (S32_LE or S16_LE words, read as i32) with fixed period geometry.
 pub type Capture = PeriodReader<PcmFile>;
 
 impl Capture {
-    pub fn open(card: u32, device: u32, channels: usize, rate: u32, period: usize) -> io::Result<Capture> {
+    pub fn open(card: u32, device: u32, channels: usize, rate: u32, period: usize, format: SenseFormat) -> io::Result<Capture> {
         let path = format!("/dev/snd/pcmC{card}D{device}c");
         // A blocking open would wait, silently, for whoever holds the sense
         // PCM to let go, and the volume lock would time out meanwhile: ask
@@ -485,26 +566,7 @@ impl Capture {
             .write(true)
             .custom_flags(libc::O_NONBLOCK)
             .open(&path)?;
-        // SAFETY: an all-ones/zeroed parameter block is the "unconstrained"
-        // request the kernel refines.
-        let mut hw: HwParams = unsafe { std::mem::zeroed() };
-        for m in hw.masks.iter_mut() {
-            m.bits = [0; 8];
-        }
-        for i in hw.intervals.iter_mut() {
-            *i = Interval { min: 0, max: u32::MAX, flags: 0 };
-        }
-        hw.masks[PARAM_ACCESS].bits[0] = 1 << ACCESS_RW_INTERLEAVED;
-        hw.masks[PARAM_FORMAT].bits[0] = 1 << FORMAT_S32_LE;
-        hw.masks[PARAM_SUBFORMAT].bits[0] = 1 << SUBFORMAT_STD;
-        let fixed = |i: &mut Interval, v: u32| {
-            *i = Interval { min: v, max: v, flags: INTERVAL_INTEGER };
-        };
-        fixed(&mut hw.intervals[PARAM_CHANNELS], channels as u32);
-        fixed(&mut hw.intervals[PARAM_RATE], rate);
-        fixed(&mut hw.intervals[PARAM_PERIOD_SIZE], period as u32);
-        fixed(&mut hw.intervals[PARAM_PERIODS], 4);
-        hw.rmask = u32::MAX;
+        let mut hw = sense_hw_params(format, channels, rate, period);
         ioctl(&file, PCM_IOCTL_HW_PARAMS, &mut hw)?;
 
         // SAFETY: zeroed is a valid base; every field is set below.
@@ -521,7 +583,7 @@ impl Capture {
         sw.silence_size = 0;
         sw.boundary = (period * 4) as u64 * (1 << 20);
         ioctl(&file, PCM_IOCTL_SW_PARAMS, &mut sw)?;
-        let mut io = PcmFile { file };
+        let mut io = PcmFile { file, format, channels, raw: Vec::new() };
         io.prepare()?;
         Ok(PeriodReader::new(io, channels, period))
     }
@@ -630,6 +692,44 @@ mod tests {
         assert_eq!(std::mem::size_of::<HwParams>(), 608);
         assert_eq!(std::mem::size_of::<SwParams>(), 136);
         assert_eq!(std::mem::size_of::<Xferi>(), 24);
+    }
+
+    /// The K114c's sense PCM offers S16_LE only; a request for S32_LE alone
+    /// fails with EINVAL there, so the daemon never pings and the card
+    /// relocks.  The request must carry exactly the configured format.
+    #[test]
+    fn the_sense_request_names_only_the_configured_format() {
+        let hw = sense_hw_params(SenseFormat::S32Le, 12, 48000, 4096);
+        assert_eq!(hw.masks[PARAM_FORMAT].bits[0], 1 << 10);
+        let hw = sense_hw_params(SenseFormat::S16Le, 12, 48000, 4096);
+        assert_eq!(hw.masks[PARAM_FORMAT].bits[0], 1 << 2);
+        assert_eq!((hw.intervals[PARAM_CHANNELS].min, hw.intervals[PARAM_CHANNELS].max), (12, 12));
+        assert_eq!((hw.intervals[PARAM_RATE].min, hw.intervals[PARAM_RATE].max), (48000, 48000));
+        assert_eq!((hw.intervals[PARAM_PERIOD_SIZE].min, hw.intervals[PARAM_PERIOD_SIZE].max), (4096, 4096));
+    }
+
+    /// S16 words are shifted to the top of an i32 so that full scale is the
+    /// same number in both formats and `vs_scale` keeps one meaning.
+    #[test]
+    fn s16_words_widen_to_full_scale_s32() {
+        let mut dst = [0i32; 5];
+        widen_s16(&[0, 1, -1, i16::MAX, i16::MIN], &mut dst);
+        assert_eq!(dst, [0, 65536, -65536, 0x7fff_0000, i32::MIN]);
+    }
+
+    /// The step between two words, in widened i32 units.
+    #[test]
+    fn a_format_names_its_quantization_step() {
+        assert_eq!(SenseFormat::S32Le.quantum(), 1.0);
+        assert_eq!(SenseFormat::S16Le.quantum(), 65536.0);
+    }
+
+    #[test]
+    fn format_names_parse() {
+        assert_eq!(SenseFormat::parse("S32_LE"), Some(SenseFormat::S32Le));
+        assert_eq!(SenseFormat::parse("S16_LE"), Some(SenseFormat::S16Le));
+        assert_eq!(SenseFormat::parse("s16"), None);
+        assert_eq!(SenseFormat::default(), SenseFormat::S32Le);
     }
 
     #[test]
