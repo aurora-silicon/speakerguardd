@@ -645,3 +645,31 @@ fn ordinary_blob_decoding_keeps_stream_geometry_and_runtime_budgets() {
         }
     }
 }
+
+#[test]
+fn max_velocity_attenuation_bounds_the_retarget_solve_too() {
+    // a tone that needs a deeper velocity cut than the floor allows: bursts
+    // after silence send the lanes up and through the retarget solve, which
+    // keeps MaxVelocityAttenuation like the primary solve (the 0.99 law
+    // leaves the downward follower 1 % below its request)
+    for db in [3.0f32, 6.0] {
+        let mut p = only([false, false, true, false, true]);
+        for c in &mut p.ch[..2] {
+            c.max_velocity_attenuation_db = db;
+        }
+        let floor = 10f32.powf(-db / 20.0);
+        let mut u = Unit::new(p);
+        let mut x = vec![0.0f32; 24_000];
+        for amp in [0.3f32, 1.0, 0.2, 1.0] {
+            x.extend(sine(1000.0, amp, 0.6));
+            x.extend(vec![0.0; 4800]);
+        }
+        let mut low = f32::MAX;
+        for block in x.chunks(256) {
+            run(&mut u, &[block.to_vec(), block.to_vec()], block.len());
+            let t = tel(&u).channels[0];
+            low = t.band_gain.iter().fold(low, |l, &g| l.min(g * t.gain));
+        }
+        assert!(low >= 0.99 * floor * (1.0 - 1e-5), "{db} dB: band x slow gain {low} below the floor {floor}");
+    }
+}
