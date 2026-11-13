@@ -38,7 +38,9 @@ It runs in the user's session, beside PipeWire, and does three things:
    report beyond) it also links the protect stage's output to the hold, a
    sink with no device: that keeps the stage running when a short stream
    ends before the grant (its first frames are still held for the amps) and
-   after a withdrawal, so the grant can come back.
+   after a withdrawal, so the grant can come back. When the graph first appears
+   the hold is also linked for PRIME_S, so the stage negotiates and starts
+   once with no client and no amps.
 5. **Idle.** The speakers are wanted only while a client stream runs into
    the protect stage (through the voicing in front of it, or straight in),
    and for IDLE_HOLD_S after the last one stops. With none, the amps and the
@@ -84,6 +86,11 @@ PERIOD = 0.050
 # The report's period while nothing plays and nothing is linked: a change is
 # reported at once anyway, and the supervisor accepts a report for 500 ms.
 IDLE_PERIOD = 0.250
+# When the graph first appears the hold is linked for this long, so the
+# protect stage and the voicing negotiate and start once with no client and
+# no amps: the first stream after PipeWire starts then finds them prepared
+# (unprimed, their first link renegotiated and lost its first ~4096 frames).
+PRIME_S = 1.0
 # How long the speakers stay up after the last client stream stops: the
 # default idle time before WirePlumber suspends a node, so a pause between
 # two sounds does not cycle the amps.
@@ -347,6 +354,8 @@ class Session:
         self.last_hold_try = -10.0
         # the play value of the last report written
         self.reported_play = False
+        # until when the hold primes the stage (set when the graph appears)
+        self.prime_until = None
         self.volume_file = os.path.join(state_dir(), f"voicing-{m}.json")
         # the voicing sink node the volume was restored to, what was
         # restored and when, whether the sink has taken it, what is stored
@@ -701,6 +710,15 @@ class Session:
     def hold_linked(self, g):
         return bool(self.hold_links(g)[1])
 
+    def priming(self, g, now):
+        """Whether the hold primes the stage now: for PRIME_S once the
+        protect stage's output and the hold are first both there."""
+        if self.prime_until is None:
+            if self.hold_links(g)[0] is None:
+                return False
+            self.prime_until = now + PRIME_S
+        return now < self.prime_until
+
     def suspend_for_sleep(self, g, nodes):
         """Under the sleep hold, or with nothing playing, once nothing is
         linked: suspend the amps' sink and the sense, which closes their
@@ -850,8 +868,9 @@ def main():
         # the hold stays linked while this or the last report said play=1,
         # so the supervisor reads play=0 (and gives the grant back as idle)
         # while the stage still beats
-        s.keep_hold(g, reported or s.reported_play)
-        quiet = not (granted or reported or s.reported_play or amps or s.hold_linked(g))
+        priming = s.priming(g, now)
+        s.keep_hold(g, reported or s.reported_play or priming)
+        quiet = not (granted or reported or s.reported_play or priming or amps or s.hold_linked(g))
         s.reported_play = reported
         period = IDLE_PERIOD if quiet else PERIOD
         nxt += period

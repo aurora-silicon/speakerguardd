@@ -616,6 +616,20 @@ class Idle(unittest.TestCase):
         s.last_hold_try -= 1.0
         self.assertTrue(self._hold(g, s, True))
 
+    def test_the_hold_primes_the_stage_once_when_the_graph_appears(self):
+        g, p, s = build("j616", linked=False)
+        # no hold yet: nothing to prime
+        self.assertFalse(s.priming(g, 10.0))
+        amps = MACHINES["j616"]["amps"]
+        hold = g.node("sgv2.hold.j616")
+        for i in range(amps):
+            g.port(hold, "in", f"AUX{i}")
+        self.assertTrue(s.priming(g, 11.0))
+        self.assertTrue(s.priming(g, 11.0 + sgs.PRIME_S - 0.01))
+        self.assertFalse(s.priming(g, 11.0 + sgs.PRIME_S))
+        # once only
+        self.assertFalse(s.priming(g, 100.0))
+
     def test_a_graph_without_a_hold_leaves_it_alone(self):
         g, p, s = build("j616", linked=False)
         self.assertEqual(self._hold(g, s, True), [])
