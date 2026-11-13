@@ -366,6 +366,31 @@ fn refused_configurations_are_the_failsafe() {
 }
 
 #[test]
+fn power_only_models_are_refused_only_with_the_power_axis() {
+    // with ControlPower the unmodeled rails, battery input and soft knee refuse
+    let mut p = params();
+    p.other_power_features = 0b001;
+    assert!(Unit::new(p).is_failsafe());
+    let mut p = params();
+    p.power_soft_limit_pct[1] = 90.0;
+    assert!(Unit::new(p).is_failsafe());
+    // without it they change no gain: the audio is that of a unit without them
+    let mut base = params();
+    base.control_power = 0;
+    let mut with = base;
+    with.other_power_features = 0b101;
+    with.power_soft_limit_pct[1] = 90.0;
+    let (mut a, mut b) = (Unit::new(base), Unit::new(with));
+    assert!(!a.is_failsafe() && !b.is_failsafe());
+    let x = sine(200.0, 1.2, 3.0);
+    let y = sine(3000.0, 0.7, 3.0);
+    assert!(run(&mut a, &[x.clone(), y.clone()], 256) == run(&mut b, &[x, y], 256));
+    // the amplifier power it cannot model is not reported
+    assert!(tel(&a).global.modeled_amp_power_w.is_finite());
+    assert!(tel(&b).global.modeled_amp_power_w.is_nan() && tel(&b).global.amp_input_power_w.is_nan());
+}
+
+#[test]
 fn slicing_does_not_change_the_audio() {
     let x = sine(200.0, 1.2, 3.0);
     let y = sine(3000.0, 0.7, 3.0);
