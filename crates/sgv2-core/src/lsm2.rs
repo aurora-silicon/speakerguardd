@@ -1796,6 +1796,9 @@ pub struct Unit {
     companion: Option<companion::Companion>,
     estimator: Option<crate::lsid::Estimator>,
     handoff: Option<crate::lsid::Handoff>,
+    /// Sense source the host has bound to this unit's LSID companion (see
+    /// [`Unit::bind_sense_source`]); `None` means the host made no binding.
+    sense_source: Option<crate::lsid::Topology>,
     model_frames: u64,
     /// Geometry is fixed by AU initialisation. Runtime parameter writes may
     /// move the ceiling window inside it, but do not rebuild the audio delay.
@@ -1869,6 +1872,7 @@ impl Unit {
             companion: None,
             estimator: None,
             handoff: None,
+            sense_source: None,
             model_frames: 0,
         }
     }
@@ -1927,6 +1931,27 @@ impl Unit {
             // rejected stage can only be stale; retain the current generation.
             let _ = handoff.stage(candidate);
         }
+    }
+    /// Bind the sense input that the host has proven to be the companion's
+    /// graph source (the board's V/I lanes in the order the self-check
+    /// verified). Only a unit with an LSID companion accepts a binding, and
+    /// only for the source its topology names. The binding lets
+    /// [`ProtectionUnit::process`] feed the estimator; it does not touch the
+    /// companion's release gates, so a gated unit stays muted.
+    pub fn bind_sense_source(&mut self, source: &str) -> Result<(), crate::lsid::Error> {
+        let topology = self.companion.as_ref().and_then(|c| c.topology).ok_or(crate::lsid::Error::Unsupported)?;
+        if self.estimator.is_none() || !topology.source_matches(source) {
+            return Err(crate::lsid::Error::Geometry);
+        }
+        self.sense_source = Some(topology);
+        Ok(())
+    }
+    /// Drop the host's binding: the estimator sees no source identity again.
+    pub fn unbind_sense_source(&mut self) {
+        self.sense_source = None;
+    }
+    pub fn sense_source_bound(&self) -> bool {
+        self.sense_source.is_some()
     }
     pub fn set_runtime_budgets(&mut self, budgets: [f32; 4]) {
         self.params.runtime_budget_present = 1;
@@ -2974,9 +2999,14 @@ impl ProtectionUnit for Unit {
     }
     fn process(&mut self, mut io: Io<'_, '_>) -> Health {
         let frames = io.frames;
-        // Io has no authenticated source identity. Never infer it from port
-        // count: no candidate can be accepted, even with twelve sense ports.
-        self.observe_estimator("", io.sense, frames);
+        // Io carries no source identity. Never infer it from port count: only
+        // a source the host bound with bind_sense_source() is passed on, so
+        // without a binding no candidate is accepted, even with twelve sense
+        // ports.
+        let id = self.sense_source.map_or([0u8; 64], |t| t.source);
+        let end = id.iter().position(|&b| b == 0).unwrap_or(id.len());
+        let source = core::str::from_utf8(&id[..end]).unwrap_or("");
+        self.observe_estimator(source, io.sense, frames);
         let cadence = controller_frames(self.params.sample_rate) as u64;
         let end = self.model_frames.saturating_add(frames as u64);
         if self.model_frames % cadence == 0 || end / cadence > self.model_frames / cadence {

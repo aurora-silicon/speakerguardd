@@ -348,3 +348,62 @@ fn synthetic_resistive_windows_update_fast_slow_rdc_and_power() {
     assert_eq!(unit.model_generation().unwrap().generation(), 2);
     assert!(storage.iter().flatten().all(|&x| x == 0.0));
 }
+
+/// Twelve-lane resistive synthetic sense (6 ohm) that the default preset
+/// accepts, with lane 1 leading by the graph's one-frame alignment.
+fn resistive_sense() -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let mut current = vec![0.0f32; 65];
+    for (n, x) in current.iter_mut().enumerate() {
+        let phase = 2.0 * core::f32::consts::PI * n as f32 / 64.0;
+        *x = libm::sinf(3.0 * phase) + 0.4 * libm::sinf(11.0 * phase);
+    }
+    let voltage: Vec<f32> = current.iter().map(|x| x * 6.0).collect();
+    let leading: Vec<f32> = (0..65).map(|n| current[(n + 1) % 64]).collect();
+    (voltage, current, leading)
+}
+
+#[test]
+fn bound_sense_source_feeds_the_estimator_and_output_stays_muted() {
+    let (v, i, lead) = resistive_sense();
+    let sense = [&v[..], &lead[..], &v[..], &i[..], &v[..], &i[..], &v[..], &i[..], &v[..], &i[..], &v[..], &i[..]];
+    let input = [0.25f32; 65];
+
+    // No binding: twelve valid sense lanes still give no candidate.
+    let mut unit = lsm2::Unit::from_blob(&bundle()).unwrap();
+    assert!(!unit.sense_source_bound());
+    let mut storage = [[9.0f32; 65]; 6];
+    let mut out: Vec<_> = storage.iter_mut().map(|a| a.as_mut_slice()).collect();
+    assert!(unit.process(Io { frames: 65, input: &[&input[..]; 6], sense: &sense, output: &mut out }).is_failsafe());
+    assert_eq!(unit.model_generation().unwrap().generation(), 1);
+    assert!(storage.iter().flatten().all(|&x| x == 0.0));
+
+    // A source other than the companion's topology is refused.
+    assert_eq!(unit.bind_sense_source("other-sense"), Err(Error::Geometry));
+    assert_eq!(unit.bind_sense_source(""), Err(Error::Geometry));
+    assert!(!unit.sense_source_bound());
+
+    // Bound (fresh unit, so this quantum starts on a controller boundary):
+    // the estimator accepts the window and the generation commits, but the
+    // release gate keeps the output muted.
+    let mut unit = lsm2::Unit::from_blob(&bundle()).unwrap();
+    unit.bind_sense_source("synthetic-sense").unwrap();
+    assert!(unit.sense_source_bound());
+    let mut storage = [[9.0f32; 65]; 6];
+    let mut out: Vec<_> = storage.iter_mut().map(|a| a.as_mut_slice()).collect();
+    assert!(unit.process(Io { frames: 65, input: &[&input[..]; 6], sense: &sense, output: &mut out }).is_failsafe());
+    assert_eq!(unit.model_generation().unwrap().generation(), 2);
+    assert!(storage.iter().flatten().all(|&x| x == 0.0), "release gate still mutes");
+    assert_ne!(unit.companion().unwrap().gates, 0);
+
+    // Unbinding stops further acceptance.
+    unit.unbind_sense_source();
+    assert!(!unit.sense_source_bound());
+}
+
+#[test]
+fn units_without_an_lsid_companion_refuse_a_sense_binding() {
+    let params = lsm2::Params { channels: 2, sample_rate: 48000, ..Default::default() };
+    let mut unit = lsm2::Unit::new(params);
+    assert_eq!(unit.bind_sense_source("synthetic-sense"), Err(Error::Unsupported));
+    assert!(!unit.sense_source_bound());
+}
