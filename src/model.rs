@@ -129,7 +129,9 @@ impl SpeakerState {
     /// what was played: r fits iff r <= 20 log10(vs_scale / word).  What
     /// was played is within a step above the word: the step up is its
     /// power's bound (it matters only where the gain undone is deep).
-    pub fn frame_powers(&self, words: &[i32], channels: usize, possible: &[(f64, f64)]) -> (Vec<f64>, Vec<f64>) {
+    /// `quantum` is the step between two words of the sense format, in
+    /// the same widened units as `words`.
+    pub fn frame_powers(&self, words: &[i32], channels: usize, possible: &[(f64, f64)], quantum: f64) -> (Vec<f64>, Vec<f64>) {
         let ch = self.spec.vs_chan;
         let frames = words.len() / channels;
         let scale = self.spec.vs_scale / 2147483648.0;
@@ -142,7 +144,7 @@ impl SpeakerState {
             p.push(v * v / self.spec.z_nominal);
             let w = w.abs();
             let room = if w > 0.0 { 20.0 * (2147483648.0 / w).log10() } else { f64::INFINITY };
-            let up = (w + 1.0) * scale;
+            let up = (w + quantum) * scale;
             let pre = up * up / self.spec.z_nominal * 10f64.powf(converted_at(room, possible) / 10.0);
             q.push(if pre > full { full } else { pre });
         }
@@ -569,10 +571,24 @@ mod tests {
     #[test]
     fn a_quantized_word_is_undone_from_the_step_above() {
         let s = SpeakerState::new(spec(), 35.0);
-        let (_, pre) = s.frame_powers(&[1288, 1288], 2, &[(120.0, 120.0)]);
+        let (_, pre) = s.frame_powers(&[1288, 1288], 2, &[(120.0, 120.0)], 1.0);
         let up = 1289.0 * s.spec.vs_scale / 2147483648.0;
         let want = up * up / s.spec.z_nominal * 1e12;
         assert!(pre[0] >= want * (1.0 - 1e-12), "{} W before the gain, the step above gives {want} W", pre[0]);
+    }
+
+    /// Review of #177 (P2): an S16 sense word is 65536 units from its
+    /// neighbour once widened, so a word of 0 behind the 120 dB minimum can
+    /// have been a full-scale signal.  The budgets charge the step above
+    /// the word, whatever the format's step is.
+    #[test]
+    fn an_s16_zero_word_behind_deep_gain_charges_full_scale() {
+        let s = SpeakerState::new(spec(), 35.0);
+        let full = s.worst_case_power(0.0);
+        let (_, one) = s.frame_powers(&[0, 0], 2, &[(120.0, 120.0)], 1.0);
+        let (_, s16) = s.frame_powers(&[0, 0], 2, &[(120.0, 120.0)], 65536.0);
+        assert!(one[0] < full * 1e-3, "an S32 zero word is one unit of doubt: {} of {full} W", one[0]);
+        assert_eq!(s16[0], full, "an S16 zero word may have been full scale");
     }
 
     fn spec() -> Speaker {
@@ -594,7 +610,7 @@ mod tests {
     }
 
     fn globals() -> Globals {
-        Globals { sense_pcm: 2, t_ambient: 35.0, t_hysteresis: 5.0, t_window: 20.0, channels: 2, period: 4096, t_reduction_max: 20.0, safe_reduction: 20.0 }
+        Globals { sense_pcm: 2, t_ambient: 35.0, t_hysteresis: 5.0, t_window: 20.0, channels: 2, period: 4096, sense_format: Default::default(), t_reduction_max: 20.0, safe_reduction: 20.0 }
     }
 
     #[test]

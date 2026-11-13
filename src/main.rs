@@ -305,7 +305,7 @@ impl Hw for RealHw {
     }
     fn open_sense(&mut self, rate: u32) -> std::io::Result<()> {
         let g = self.globals.clone();
-        let c = self.timed(stats::Call::Open, |h| Capture::open(h.card.ctl.card, g.sense_pcm, g.channels, rate, g.period))?;
+        let c = self.timed(stats::Call::Open, |h| Capture::open(h.card.ctl.card, g.sense_pcm, g.channels, rate, g.period, g.sense_format))?;
         self.capture = Some(c);
         Ok(())
     }
