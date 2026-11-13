@@ -401,6 +401,14 @@ impl SenseFormat {
         }
     }
 
+    /// The step between two adjacent words, in widened i32 units.
+    pub fn quantum(self) -> f64 {
+        match self {
+            SenseFormat::S32Le => 1.0,
+            SenseFormat::S16Le => 65536.0,
+        }
+    }
+
     fn alsa(self) -> u32 {
         match self {
             SenseFormat::S32Le => FORMAT_S32_LE,
@@ -707,6 +715,13 @@ mod tests {
         let mut dst = [0i32; 5];
         widen_s16(&[0, 1, -1, i16::MAX, i16::MIN], &mut dst);
         assert_eq!(dst, [0, 65536, -65536, 0x7fff_0000, i32::MIN]);
+    }
+
+    /// The step between two words, in widened i32 units.
+    #[test]
+    fn a_format_names_its_quantization_step() {
+        assert_eq!(SenseFormat::S32Le.quantum(), 1.0);
+        assert_eq!(SenseFormat::S16Le.quantum(), 65536.0);
     }
 
     #[test]

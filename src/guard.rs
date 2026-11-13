@@ -1253,7 +1253,7 @@ impl Guard {
             }).collect()
         };
         for s in self.speakers.iter_mut() {
-            let (p, q) = s.frame_powers(all, ch, &possible);
+            let (p, q) = s.frame_powers(all, ch, &possible, globals.sense_format.quantum());
             if p.iter().any(|x| !x.is_finite()) || q.iter().any(|x| !x.is_finite() || *x < 0.0) {
                 return Err("invalid speaker sense voltage or power".into());
             }
