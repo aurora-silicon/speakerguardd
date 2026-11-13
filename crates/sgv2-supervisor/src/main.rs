@@ -132,6 +132,19 @@ mod linux {
         selfcheck::parse(&text).map_err(|e| format!("{path}: {e}"))
     }
 
+    /// The plugin's report on the sense binding, for the journal (`None`:
+    /// a plugin that does not report it).
+    fn sense_bound_words(state: u32) -> Option<&'static str> {
+        use sgv2_lv2::page::{SENSE_BOUND, SENSE_NO_COMPANION, SENSE_REFUSED, SENSE_UNBOUND};
+        match state {
+            SENSE_UNBOUND => Some("none"),
+            SENSE_BOUND => Some("bound to the LSID companion (its release gates still apply)"),
+            SENSE_NO_COMPANION => Some("not bound: the unit has no LSID companion"),
+            SENSE_REFUSED => Some("refused by the unit's LSID companion"),
+            _ => None,
+        }
+    }
+
     struct Page(EnginePage);
     impl EngineView for Page {
         fn read(&mut self) -> EngineState {
@@ -994,6 +1007,8 @@ mod linux {
         let mut amps_playing = false;
         let settle_ns = AMPS_SETTLE_FRAMES * 1_000_000_000 / u64::from(header.sample_rate.max(1));
         let mut wakes_seen = engine.0.header().wakes.load(Ordering::Acquire);
+        // the sense binding offered, and what the plugin last said about it
+        let mut last_sense = (false, 0u32);
         notify.send("STATUS=supervising");
         let mut scheduled = true;
         // CLOCK_BOOTTIME - CLOCK_MONOTONIC grows only while the system is
@@ -1101,6 +1116,32 @@ mod linux {
                 amps_playing = now.saturating_sub(since) >= settle_ns;
             }
             engine.0.set_amps(amps_playing);
+            // The sense binding (LSID): offered while this tick proved the
+            // engine's sense input for this blob, on a Mac whose self-check
+            // proved V/I sense. The plugin binds only a unit with an LSID
+            // companion; the companion's release gates still decide its
+            // output.
+            let offer = bind.sense > 0 && observer.sense_proven();
+            engine.0.set_sense_bind(offer.then_some(engine_crc));
+            let bound = engine.0.header().sense_bound.load(Ordering::Acquire);
+            if (offer, bound) != last_sense {
+                if offer != last_sense.0 {
+                    eprintln!(
+                        "{}",
+                        if offer {
+                            "sense binding offered: the engine's sense input is the one the self-check proved"
+                        } else {
+                            "sense binding withdrawn"
+                        }
+                    );
+                }
+                if bound != last_sense.1 {
+                    if let Some(what) = sense_bound_words(bound) {
+                        eprintln!("engine sense binding: {what}");
+                    }
+                }
+                last_sense = (offer, bound);
+            }
             let wakes = engine.0.header().wakes.load(Ordering::Acquire);
             if wakes != wakes_seen {
                 wakes_seen = wakes;

@@ -74,12 +74,35 @@ pub struct PageHeader {
     /// Frames a wake could not keep (beyond its capacity), since the
     /// plugin started.
     pub wake_overflow: AtomicU64,
+    /// The sense binding, written by the supervisor every tick: the blob
+    /// payload CRC whose sense input it has proven (the self-check's wiring,
+    /// reported linked and at unity by the session helper for the engine
+    /// running that blob), or 0 for none. See [`EnginePage::sense_bind`].
+    pub sense_bind_crc: AtomicU32,
+    /// CLOCK_MONOTONIC of the supervisor's last `sense_bind_crc` write, ns:
+    /// an older word than [`SENSE_BIND_STALE_NS`] binds nothing.
+    pub sense_bind_ns: AtomicU64,
+    /// What the plugin did with the binding ([`SENSE_UNBOUND`] ..
+    /// [`SENSE_REFUSED`]); 0 from a plugin that does not say.
+    pub sense_bound: AtomicU32,
 }
 
 pub const AMPS_HELD: u32 = 1;
 pub const AMPS_PLAYING: u32 = 2;
 /// The supervisor ticks every 10 ms; a word older than this is no word.
 pub const AMPS_STALE_NS: u64 = 500_000_000;
+/// A sense binding older than this binds nothing (the supervisor writes it
+/// every 10 ms tick).
+pub const SENSE_BIND_STALE_NS: u64 = 500_000_000;
+/// [`PageHeader::sense_bound`]: no binding offered, or it was withdrawn.
+pub const SENSE_UNBOUND: u32 = 1;
+/// The unit's LSID companion feeds its estimator from the bound source.
+pub const SENSE_BOUND: u32 = 2;
+/// Offered, but the unit has no LSID companion (nothing to bind).
+pub const SENSE_NO_COMPANION: u32 = 3;
+/// Offered, and the unit refused it (its companion has no estimator or
+/// names no source).
+pub const SENSE_REFUSED: u32 = 4;
 
 const _: () = assert!(core::mem::size_of::<PageHeader>() <= HEADER_BYTES);
 
@@ -213,6 +236,33 @@ impl EnginePage {
             AMPS_HELD => Amps::Held,
             AMPS_PLAYING => Amps::Playing,
             _ => Amps::Unknown,
+        }
+    }
+
+    /// The supervisor's side: offer the sense binding for blob `params_crc`
+    /// (`None`: withdraw it).
+    pub fn set_sense_bind(&self, params_crc: Option<u32>) {
+        let h = self.header();
+        h.sense_bind_crc.store(params_crc.unwrap_or(0), Ordering::Relaxed);
+        h.sense_bind_ns.store(mono_ns(), Ordering::Release);
+    }
+
+    /// Real time: whether the supervisor binds the sense input of blob
+    /// `params_crc` now: a fresh word naming exactly that blob.
+    #[inline]
+    pub fn sense_bind(&self, params_crc: u32) -> bool {
+        let h = self.header();
+        let at = h.sense_bind_ns.load(Ordering::Acquire);
+        let crc = h.sense_bind_crc.load(Ordering::Relaxed);
+        params_crc != 0 && crc == params_crc && at != 0 && mono_ns().saturating_sub(at) <= SENSE_BIND_STALE_NS
+    }
+
+    /// Real time: what the plugin did with the binding.
+    #[inline]
+    pub fn report_sense_bound(&self, state: u32) {
+        let h = self.header();
+        if h.sense_bound.load(Ordering::Relaxed) != state {
+            h.sense_bound.store(state, Ordering::Release);
         }
     }
 

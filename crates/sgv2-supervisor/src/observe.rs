@@ -347,6 +347,9 @@ pub struct Observer {
     sleep_before_grant: bool,
     /// The first grant after a sleep: when, and the sequence at that tick.
     resume_grant: Option<(u64, u64)>,
+    /// The last tick proved the engine's sense input (see
+    /// [`Observer::sense_proven`]).
+    sense_proven: bool,
 }
 
 impl Observer {
@@ -377,7 +380,20 @@ impl Observer {
             last_beat_age_ns: None,
             sleep_before_grant: false,
             resume_grant: None,
+            sense_proven: false,
         }
+    }
+
+    /// Whether the last tick proved that the engine's sense ports carry the
+    /// sense input the self-check verified: the page is valid and runs the
+    /// expected blob, and a fresh report from the live session helper says
+    /// the protect stage was built with the proven wiring, nothing but the
+    /// sense node feeds its sense ports (in order), and the sense node is at
+    /// unity. The engine's health is not part of it: a unit whose release
+    /// gates mute it (an unqualified LSID companion) still has a proven
+    /// sense input. With no expected wiring nothing is proven.
+    pub fn sense_proven(&self) -> bool {
+        self.sense_proven
     }
 
     /// The system slept since the last tick (the kernel's suspend counters
@@ -643,6 +659,13 @@ impl Observer {
         if session_fresh {
             self.wrong_wiring = (!wiring_ok).then_some(s.wiring);
         }
+        self.sense_proven = e.valid
+            && e.params_crc == self.expected_params_crc
+            && self.expected_wiring.is_some()
+            && session_fresh
+            && wiring_ok
+            && s.links_ok
+            && s.carrier_ok;
         Observation {
             heartbeat_fresh,
             plugin_ok,
@@ -1318,6 +1341,38 @@ mod tests {
         assert_eq!(o.wrong_wiring(), Some(None));
         o.observe(&mut || now, &mut E(EngineState::default()), &mut P(PcmState::Closed), &mut S(session(now)));
         assert_eq!(o.wrong_wiring(), None);
+    }
+
+    #[test]
+    fn the_sense_input_is_proven_only_for_this_blob_and_the_proven_wiring() {
+        let now = 1_000_000_000u64;
+        // health is not part of the proof: a release-gated (fail-safe) unit
+        // still has a proven sense input
+        let gated = sgv2_core::Health::FAILSAFE | sgv2_core::Health::NO_PARAMS;
+        let e = EngineState { valid: true, pid: PID, params_crc: 7, health: gated, ..Default::default() };
+        let proven = |o: &mut Observer, e: EngineState, r: SessionReport| {
+            o.observe(&mut || now, &mut E(e), &mut P(PcmState::Closed), &mut S(r));
+            o.sense_proven()
+        };
+        // no self-check wiring: nothing to prove against
+        let mut o = Observer::new(7, 48_000, TICK);
+        assert!(!proven(&mut o, e, session(now)));
+        let mut o = Observer::new(7, 48_000, TICK);
+        o.expect_wiring(0x0979_c55e_d5dd_f377);
+        o.observe(&mut || 1, &mut E(e), &mut P(PcmState::Closed), &mut S(session(1)));
+        assert!(proven(&mut o, e, session(now)));
+        // another blob, an invalid page
+        assert!(!proven(&mut o, EngineState { params_crc: 8, ..e }, session(now)));
+        assert!(!proven(&mut o, EngineState { valid: false, ..e }, session(now)));
+        // another wiring, a foreign link, a scaled sense node
+        assert!(!proven(&mut o, e, SessionReport { wiring: Some(0x291295bd06c656d0), ..session(now) }));
+        assert!(!proven(&mut o, e, SessionReport { links_ok: false, ..session(now) }));
+        assert!(!proven(&mut o, e, SessionReport { carrier_ok: false, ..session(now) }));
+        // a stale report or a writer not vouched alive
+        assert!(!proven(&mut o, e, session(now - SESSION_STALE_NS - 1)));
+        assert!(!proven(&mut o, e, SessionReport { helper_alive: false, ..session(now) }));
+        // and back
+        assert!(proven(&mut o, e, session(now)));
     }
 
     #[test]
