@@ -37,6 +37,13 @@
 //! which `run` applies to the program before the unit sees it) is unstable
 //! or would add drive.
 //!
+//! Sense binding: an lsm2 unit with an LSID companion feeds its estimator
+//! only from a source the host has bound. The supervisor offers the binding
+//! on the engine page once it has proven this blob's sense wiring (see
+//! [`page::EnginePage::sense_bind`]); `run` binds while that word is fresh
+//! and names this blob, drops it otherwise, and reports what it did. The
+//! companion's release gates are not touched: a gated unit stays muted.
+//!
 //! `activate` clears the audio histories but not the thermal model: `run`
 //! publishes the unit's thermal state after every call and `activate`
 //! restores the latest record that fits, cooled for the time since (see
@@ -129,6 +136,34 @@ impl AnyUnit {
         match self {
             AnyUnit::Spp3(u) => u.sense_delay(),
             _ => None,
+        }
+    }
+    /// Follow the supervisor's sense binding: with `bind`, bind the sense
+    /// input to the source the unit's LSID companion names (the plugin's
+    /// sense ports are that input once the supervisor has proven the
+    /// wiring); without, drop any binding. Returns the [`page`] `SENSE_*`
+    /// state. Only an lsm2 unit with an LSID companion binds; every other
+    /// unit runs as before. No allocation: real time safe.
+    pub fn follow_sense_bind(&mut self, bind: bool) -> u32 {
+        let AnyUnit::Lsm2(u) = self else {
+            return if bind { page::SENSE_NO_COMPANION } else { page::SENSE_UNBOUND };
+        };
+        if !bind {
+            u.unbind_sense_source();
+            return page::SENSE_UNBOUND;
+        }
+        if u.sense_source_bound() {
+            return page::SENSE_BOUND;
+        }
+        let Some(companion) = u.companion() else {
+            return page::SENSE_NO_COMPANION;
+        };
+        let id = companion.topology.map_or([0u8; 64], |t| t.source);
+        let end = id.iter().position(|&b| b == 0).unwrap_or(id.len());
+        let source = core::str::from_utf8(&id[..end]).unwrap_or("");
+        match u.bind_sense_source(source) {
+            Ok(()) => page::SENSE_BOUND,
+            Err(_) => page::SENSE_REFUSED,
         }
     }
 }
@@ -243,6 +278,10 @@ struct Instance {
     ramp: gate::Ramp,
     /// The first frames of a wake, held until the amps play.
     preroll: Box<preroll::PreRoll>,
+    /// The supervisor's sense binding as last followed (`None`: not yet),
+    /// and the `SENSE_*` state that gave.
+    sense_bind: Option<bool>,
+    sense_state: u32,
 }
 
 fn env_or(var: &str, default: String) -> String {
@@ -301,6 +340,8 @@ unsafe extern "C" fn instantiate(
         gate: gate::Gate::watch(),
         ramp: gate::Ramp::new(rate),
         preroll: Box::new(preroll::PreRoll::new(channels, rate)),
+        sense_bind: None,
+        sense_state: page::SENSE_UNBOUND,
     });
     Box::into_raw(instance).cast()
 }
@@ -474,6 +515,14 @@ fn run_chunk(instance: &mut Instance, page: Option<&page::EnginePage>, off: usiz
     }
     // An incomplete sense bus is no bus: the unit runs open loop.
     let sense_slice = if sense_n == s { &sense[..s] } else { &sense[..0] };
+    // The sense binding holds only while the attached page carries the
+    // supervisor's fresh word for exactly this blob: a re-attached page, a
+    // stopped supervisor or a broken proof drops it within the stale bound.
+    let bind = s > 0 && page.is_some_and(|p| p.sense_bind(instance.params_crc));
+    if instance.sense_bind != Some(bind) {
+        instance.sense_bind = Some(bind);
+        instance.sense_state = instance.unit.follow_sense_bind(bind);
+    }
     let unit = instance.unit.as_dyn();
     let latency = unit.latency_frames() as f32;
     let health = unit.process(Io { frames, input: &filtered[..n], sense: sense_slice, output: &mut out_store[..n] });
@@ -508,6 +557,7 @@ fn run_chunk(instance: &mut Instance, page: Option<&page::EnginePage>, off: usiz
         }
         let w = &instance.preroll;
         page.publish_wakes(w.wakes, w.last_wake, w.overflow);
+        page.report_sense_bound(instance.sense_state);
         page.beat(instance.frames, health, delay);
     }
     for (port, value) in [(2 * n + s, latency), (2 * n + s + 1, health.0 as f32), (2 * n + s + 2, delay as f32)] {
