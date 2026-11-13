@@ -260,6 +260,7 @@ def names(m):
         "speaker": f"sgv2.speaker.{m}",
         "sense": f"sgv2.sense.{m}",
         "group": f"sgv2.speakers.{m}",
+        "hold": f"sgv2.hold.{m}",
     }
 
 
@@ -398,6 +399,32 @@ context.objects = [
             monitor.channel-volumes = false
         }}
     }}{sense_obj}
+    {{   factory = adapter
+        args = {{
+            factory.name           = support.null-audio-sink
+            node.name              = "{n['hold']}"
+            node.description       = "{c['name']} speaker protection hold (no device)"
+            media.class            = "Audio/Sink/Internal"
+            # No device and no clock of its own (not a driver), outside the
+            # amps' group. The session helper links the protect stage's
+            # output here while the speakers are wanted, so the stage keeps
+            # running between a stream's end and the grant's end (the amps
+            # may not be linked yet); with nothing playing it is unlinked
+            # and the stage stops with the last stream.
+            audio.rate             = {c['rate']}
+            node.force-rate        = {c['rate']}
+            audio.channels         = {amps}
+            audio.position         = {aux(amps)}
+            node.driver            = false
+            priority.driver        = 0
+            priority.session       = 0
+            node.autoconnect       = false
+            node.pause-on-idle     = true
+            resample.disable       = true
+            channelmix.disable     = true
+            monitor.channel-volumes = false
+        }}
+    }}
 ]
 
 context.modules = [
@@ -429,10 +456,12 @@ context.modules = [
                 priority.driver    = 0
                 node.lock-quantum  = true
                 node.pause-on-idle = false
-                # Runs from the start, on any driver: the plugin is
-                # instantiated and beating before the grant, which waits for
-                # it, and before the amps are linked.
-                node.always-process = true
+                # Runs while anything feeds it or its output is linked (the
+                # amps, or the hold while the speakers are wanted), on
+                # whichever driver that brings: the plugin beats before the
+                # grant, which waits for it, and before the amps are linked.
+                # With nothing playing it stops, as macOS stops its speaker
+                # engine after the last client.
                 stream.dont-remix  = true
                 channelmix.disable = true
                 resample.disable   = true
@@ -451,9 +480,11 @@ context.modules = [
                 audio.position     = {aux(amps)}
                 node.autoconnect   = false
                 node.dont-reconnect = true
-                node.passive       = true
+                # Not passive: a link from here (to the amps, or to the hold)
+                # keeps the stage and the amps running with no client, until
+                # the session helper unlinks it.
+                node.passive       = false
                 node.pause-on-idle = false
-                node.always-process = true
                 stream.dont-remix  = true
                 channelmix.disable = true
                 resample.disable   = true

@@ -563,6 +563,103 @@ class Idle(unittest.TestCase):
                 line = f.read()
             self.assertTrue(line.endswith(" amps=0 play=0\n"), line)
 
+    def _hold(self, g, s, keep):
+        ran = []
+
+        class P:
+            def __init__(self, argv):
+                ran.append(argv)
+
+            def poll(self):
+                return 0
+
+        orig = sgs.subprocess.Popen
+        sgs.subprocess.Popen = lambda argv, **kw: P(argv)
+        try:
+            s.keep_hold(g, keep)
+        finally:
+            sgs.subprocess.Popen = orig
+        return ran
+
+    def with_hold(self, m="j616"):
+        g, p, s = build(m, linked=False)
+        amps = MACHINES[m]["amps"]
+        hold = g.node(f"sgv2.hold.{m}")
+        p["hold"] = [g.port(hold, "in", f"AUX{i}") for i in range(amps)]
+        return g, p, s
+
+    def test_the_hold_is_linked_channel_for_channel_while_wanted(self):
+        g, p, s = self.with_hold()
+        ran = self._hold(g, s, True)
+        self.assertEqual(sorted(ran), sorted(["pw-link", str(o), str(i)] for o, i in zip(p["pout"], p["hold"])))
+        # linked: nothing more to do, and it is not a fault (nor an amps link)
+        s.pending.clear()
+        for o, i in zip(p["pout"], p["hold"]):
+            g.link(o, i)
+        self.assertEqual(self._hold(g, s, True), [])
+        self.assertTrue(s.hold_linked(g))
+        self.assertFalse(s.amps_linked(g))
+        self.assertEqual(s.check(g), (True, True))
+
+    def test_the_hold_is_unlinked_when_not_wanted(self):
+        g, p, s = self.with_hold()
+        links = [g.link(o, i) for o, i in zip(p["pout"], p["hold"])]
+        ran = self._hold(g, s, False)
+        self.assertEqual(sorted(ran), sorted(["pw-link", "-d", str(l)] for l in links))
+
+    def test_a_failed_hold_link_is_retried_once_a_second(self):
+        g, p, s = self.with_hold()
+        self.assertTrue(self._hold(g, s, True))
+        s.pending.clear()
+        # the link did not appear: not again at once
+        self.assertEqual(self._hold(g, s, True), [])
+        s.last_hold_try -= 1.0
+        self.assertTrue(self._hold(g, s, True))
+
+    def test_the_hold_primes_the_stage_once_when_the_graph_appears(self):
+        g, p, s = build("j616", linked=False)
+        # no hold yet: nothing to prime
+        self.assertFalse(s.priming(g, 10.0))
+        amps = MACHINES["j616"]["amps"]
+        hold = g.node("sgv2.hold.j616")
+        for i in range(amps):
+            g.port(hold, "in", f"AUX{i}")
+        self.assertTrue(s.priming(g, 11.0))
+        self.assertTrue(s.priming(g, 11.0 + sgs.PRIME_S - 0.01))
+        self.assertFalse(s.priming(g, 11.0 + sgs.PRIME_S))
+        # once only
+        self.assertFalse(s.priming(g, 100.0))
+
+    def test_a_graph_without_a_hold_leaves_it_alone(self):
+        g, p, s = build("j616", linked=False)
+        self.assertEqual(self._hold(g, s, True), [])
+        self.assertEqual(self._hold(g, s, False), [])
+        self.assertFalse(s.hold_linked(g))
+
+    def test_a_stopping_helper_unlinks_the_hold_too(self):
+        g, p, s = self.with_hold()
+        links = [g.link(o, i) for o, i in zip(p["pout"], p["hold"])]
+        ran = []
+
+        class P:
+            def __init__(self, argv):
+                ran.append(argv)
+
+            def poll(self):
+                return 0
+
+            def wait(self, timeout=None):
+                return 0
+
+        orig = sgs.subprocess.Popen
+        sgs.subprocess.Popen = lambda argv, **kw: P(argv)
+        try:
+            s.unlink_all(g, 0.1)
+        finally:
+            sgs.subprocess.Popen = orig
+        for l in links:
+            self.assertIn(["pw-link", "-d", str(l)], ran)
+
 
 class Memo(unittest.TestCase):
     def test_graph_derivations_are_computed_once_per_change(self):
@@ -706,6 +803,31 @@ class Generated(unittest.TestCase):
                 if voicing_pre:
                     voicing = text.split(f'node.name = "sgv2.voicing.{m}"', 1)[1].split("}", 1)[0]
                     self.assertIn(f"node.force-rate = {c['rate']}", voicing)
+
+    def test_the_protect_stage_runs_only_while_fed_or_linked_and_the_hold_has_no_device(self):
+        # No always-process: with nothing playing the stage and the voicing
+        # stop. Its output is not passive, so a link to the amps or to the
+        # hold keeps it running without a client. The hold is a sink with no
+        # device and no clock of its own, outside the amps' group (a link to
+        # it never wakes the amps), at the PCM rate.
+        for m in gen.machines():
+            c, w = gen.machine(m)
+            n = gen.names(m)
+            for pre in (False, True):
+                text = gen.pipewire_conf(m, c, w, voicing_pre=pre)
+                self.assertNotIn("always-process", text)
+                out = text.split(f'node.name          = "{n["protect_out"]}"', 1)[1].split("}", 1)[0]
+                self.assertIn("node.passive       = false", out)
+                hold = text.split(f'node.name              = "{n["hold"]}"', 1)[1].split("}", 1)[0]
+                self.assertIn("support.null-audio-sink", text.split(f'node.name              = "{n["hold"]}"', 1)[0].rsplit("{", 2)[-1])
+                self.assertIn("node.driver            = false", hold)
+                self.assertIn('media.class            = "Audio/Sink/Internal"', hold)
+                self.assertIn("node.autoconnect       = false", hold)
+                self.assertIn(f"node.force-rate        = {c['rate']}", hold)
+                self.assertIn(f"audio.channels         = {c['amps']}", hold)
+                self.assertNotIn("node.group", hold)
+                self.assertNotIn("node.link-group", hold)
+                self.assertNotIn("api.alsa", hold)
 
     def test_generated_files_are_current(self):
         import subprocess

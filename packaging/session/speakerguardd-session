@@ -17,8 +17,8 @@ It runs in the user's session, beside PipeWire, and does three things:
    missing link is silence and is allowed; any other link is a fault. It
    also checks the carrier: the protect stage's input and the sense at unity
    volume, unmuted.
-3. **Report.** On every link, carrier or playback change, and every 50 ms,
-   it writes
+3. **Report.** On every link, carrier or playback change, and every 50 ms
+   (every IDLE_PERIOD while nothing plays and nothing is linked), it writes
    `links=<0|1> carrier=<0|1> mono_ns=<t> pid=<pid> start=<ticks> wiring=<hash> amps=<0|1> play=<0|1>`
    to /run/speakerguardd/<uid>/helper/session, where the wiring is the one
    the protect stage was built with (its `sgv2.wiring` property; the
@@ -34,17 +34,28 @@ It runs in the user's session, beside PipeWire, and does three things:
    while the amps are unlinked) and a fresh report; this helper links the
    amps only once the kernel reads granted; the amps' sink then starts. On
    any withdrawal it unlinks the amps, the sink stops and closes, and the
-   sequence starts again.
+   sequence starts again. While the speakers are wanted (`play=1`, and one
+   report beyond) it also links the protect stage's output to the hold, a
+   sink with no device: that keeps the stage running when a short stream
+   ends before the grant (its first frames are still held for the amps) and
+   after a withdrawal, so the grant can come back. When the graph first appears
+   the hold is also linked for PRIME_S, so the stage negotiates and starts
+   once with no client and no amps.
 5. **Idle.** The speakers are wanted only while a client stream runs into
    the protect stage (through the voicing in front of it, or straight in),
    and for IDLE_HOLD_S after the last one stops. With none, the amps and the
    sense are unlinked and suspended, so both PCMs close, and the report says
    `play=0` once they are; the supervisor then releases its grant and the
    kernel holds the amps at its floor, as macOS powers the speaker path down
-   when nothing plays. The protect stage keeps running on the dummy driver
-   (its heartbeat and thermal model never stop), so when a client starts the
-   report says `play=1` at once, the supervisor grants within its two clean
-   ticks, and this helper links the amps on the grant as in 4.
+   when nothing plays. The hold is unlinked too, so the protect stage and
+   the voicing stop with the last stream, as macOS stops its speaker engine.
+   The plugin keeps its thermal model across the pause: a stage PipeWire
+   reactivates restores it cooled for the time since, one that only paused
+   resumes it as it stopped. When a client starts, its
+   stream runs the stage on the dummy driver, the report says `play=1` at
+   once, the supervisor grants once the engine has beaten for its two clean
+   ticks, and this helper links the hold and, on the grant, the amps as
+   in 4.
 
 6. **The user's volume.** The generated voicing sink (`sgv2.voicing.<m>`)
    carries the user's volume (filter-chain maps its channel volumes onto
@@ -72,6 +83,14 @@ import sys
 import time
 
 PERIOD = 0.050
+# The report's period while nothing plays and nothing is linked: a change is
+# reported at once anyway, and the supervisor accepts a report for 500 ms.
+IDLE_PERIOD = 0.250
+# When the graph first appears the hold is linked for this long, so the
+# protect stage and the voicing negotiate and start once with no client and
+# no amps: the first stream after PipeWire starts then finds them prepared
+# (unprimed, their first link renegotiated and lost its first ~4096 frames).
+PRIME_S = 1.0
 # How long the speakers stay up after the last client stream stops: the
 # default idle time before WirePlumber suspends a node, so a pause between
 # two sounds does not cycle the amps.
@@ -329,6 +348,14 @@ class Session:
         self.speaker = f"sgv2.speaker.{m}"
         self.sense_name = f"sgv2.sense.{m}"
         self.voicing_sink = f"sgv2.voicing.{m}"
+        # a sink with no device: linked while the speakers are wanted, it
+        # keeps the protect stage running without a client (see 4)
+        self.hold = f"sgv2.hold.{m}"
+        self.last_hold_try = -10.0
+        # the play value of the last report written
+        self.reported_play = False
+        # until when the hold primes the stage (set when the graph appears)
+        self.prime_until = None
         self.volume_file = os.path.join(state_dir(), f"voicing-{m}.json")
         # the voicing sink node the volume was restored to, what was
         # restored and when, whether the sink has taken it, what is stored
@@ -595,11 +622,12 @@ class Session:
         self.pending[key] = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def unlink_all(self, g, timeout):
-        """Take the amps and the sense out of the graph and wait for it, at
-        most `timeout` seconds in all, so a stopping helper leaves nothing
-        linked and never hangs shutdown."""
+        """Take the amps, the sense and the hold out of the graph and wait
+        for it, at most `timeout` seconds in all, so a stopping helper leaves
+        nothing linked and never hangs shutdown."""
         deadline = time.monotonic() + timeout
         self.reconcile(g, False)
+        self.keep_hold(g, False)
         for p in list(self.pending.values()):
             try:
                 p.wait(max(0.0, deadline - time.monotonic()))
@@ -640,6 +668,56 @@ class Session:
                     self._spawn(("unlink", lid), ["pw-link", "-d", str(lid)])
             if (os.path.exists(SLEEP_HOLD) or not play) and not linked:
                 self.suspend_for_sleep(g, (spk, sense))
+
+    def hold_links(self, g):
+        """(wanted (out, in) pairs or None, existing links into the hold)."""
+        pout, hold = g.node_id(self.protect_out), g.node_id(self.hold)
+        if pout is None or hold is None:
+            return None, []
+        owners = {o["id"]: (o["info"].get("props") or {}).get("node.id") for o in g.of_type("Port")}
+        have = [(lid, o, i) for lid, o, i in g.links() if owners.get(i) == hold]
+        po, hi = g.ports(pout, "out"), g.ports(hold, "in")
+        want = []
+        for k in range(self.amps):
+            a = f"AUX{k}"
+            if a not in po or a not in hi:
+                return None, have
+            want.append((po[a], hi[a]))
+        return want, have
+
+    def keep_hold(self, g, keep):
+        """Link the protect stage's output to the hold while `keep`, unlink
+        it otherwise. A graph without a hold (an older generated graph)
+        has nothing to do."""
+        self._reap()
+        want, have = self.hold_links(g)
+        if keep:
+            if want is None:
+                return
+            present = {(o, i) for _, o, i in have}
+            missing = [w for w in want if w not in present]
+            now = time.monotonic()
+            # the first attempt at once, a failed one again once a second
+            if missing and now - self.last_hold_try >= 1.0:
+                self.last_hold_try = now
+                for o, i in missing:
+                    self._spawn(("link", o, i), ["pw-link", str(o), str(i)])
+        else:
+            self.last_hold_try = -10.0
+            for lid, _, _ in have:
+                self._spawn(("unlink", lid), ["pw-link", "-d", str(lid)])
+
+    def hold_linked(self, g):
+        return bool(self.hold_links(g)[1])
+
+    def priming(self, g, now):
+        """Whether the hold primes the stage now: for PRIME_S once the
+        protect stage's output and the hold are first both there."""
+        if self.prime_until is None:
+            if self.hold_links(g)[0] is None:
+                return False
+            self.prime_until = now + PRIME_S
+        return now < self.prime_until
 
     def suspend_for_sleep(self, g, nodes):
         """Under the sleep hold, or with nothing playing, once nothing is
@@ -779,15 +857,25 @@ def main():
                 nxt = time.monotonic()
             else:
                 continue
-        nxt += PERIOD
-        if nxt < time.monotonic():
-            nxt = time.monotonic() + PERIOD
         granted = card.granted()
         now = time.monotonic()
         play = s.want(g, now)
         links, carrier = s.check(g)
-        wrote = write_report(report, links, carrier, s.wiring(g), s.amps_linked(g), s.play_report(g, play, now))
+        amps = s.amps_linked(g)
+        reported = s.play_report(g, play, now)
+        wrote = write_report(report, links, carrier, s.wiring(g), amps, reported)
         s.reconcile(g, granted, play)
+        # the hold stays linked while this or the last report said play=1,
+        # so the supervisor reads play=0 (and gives the grant back as idle)
+        # while the stage still beats
+        priming = s.priming(g, now)
+        s.keep_hold(g, reported or s.reported_play or priming)
+        quiet = not (granted or reported or s.reported_play or priming or amps or s.hold_linked(g))
+        s.reported_play = reported
+        period = IDLE_PERIOD if quiet else PERIOD
+        nxt += period
+        if nxt < time.monotonic():
+            nxt = time.monotonic() + period
         s.pin_amps_unity(g)
         s.keep_voicing_volume(g, now)
         was_granted = granted
