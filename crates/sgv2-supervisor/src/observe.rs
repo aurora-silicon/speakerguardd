@@ -18,14 +18,16 @@
 //!
 //! The heartbeat must be fresh in every PCM state, Closed included: the
 //! lease is never renewed on a page that merely exists. That works because
-//! the protect stage runs before the amps are linked (`node.always-process`,
-//! driven by PipeWire's dummy driver until the amps' sink joins its graph).
-//! The grant-before-start sequence is:
+//! the protect stage runs before the amps are linked: a client stream runs
+//! it on PipeWire's dummy driver until the amps' sink joins its graph, and
+//! the session helper's link to the hold (a sink with no device) keeps it
+//! running while the speakers are wanted. The grant-before-start sequence
+//! is:
 //!
 //! 1. The supervisor owns "Speaker Protection"; the kernel holds the floor.
-//! 2. PipeWire instantiates the plugin, which maps the page, and the protect
-//!    stage runs on the dummy driver: the heartbeat advances while the
-//!    speaker PCM is Closed.
+//! 2. PipeWire instantiates the plugin, which maps the page. A client
+//!    stream starts and runs the protect stage on the dummy driver: the
+//!    heartbeat advances while the speaker PCM is Closed.
 //! 3. Two clean ticks (fresh heartbeat, plugin healthy with the published
 //!    parameters, the helper's report fresh with only allowed links, the
 //!    speaker mux on the watched PCM, the amps at the operating point) and
@@ -42,16 +44,20 @@
 //!    PAUSED, SUSPENDED, an unknown state, or an XRUN that outlasts the
 //!    heartbeat bound releases at once, as does any other fault. The kernel stops the stream, the
 //!    helper unlinks the amps, the protect stage falls back to the dummy
-//!    driver and beats again; the sink keeps the PCM PREPARED and retries its
-//!    start, and the sequence resumes at 3 from there.
+//!    driver (the hold or the client keeps it running) and beats again; the
+//!    sink keeps the PCM PREPARED and retries its start, and the sequence
+//!    resumes at 3 from there.
 //! 6. With no client stream playing (the helper reports `play=0` once it has
 //!    unlinked and suspended the amps and the sense, so both PCMs are
 //!    Closed), a clean tick gives the grant back as idle: the kernel floors
 //!    the amps and refuses every start, so a closed PCM is never left
-//!    granted for anyone to open. The protect stage keeps beating on the
-//!    dummy driver and every check keeps running; on `play=1` the grant
-//!    comes back on that tick (the clean run has carried on) and the
-//!    sequence continues at 4.
+//!    granted for anyone to open. The helper then unlinks the hold and the
+//!    protect stage stops with the last stream, as macOS stops its speaker
+//!    engine; the heartbeat goes stale, which grants nothing while nothing
+//!    is wanted, and every other check keeps running (at the idle pace, see
+//!    `pace`). The next stream runs the stage again from its first frame,
+//!    the report says `play=1`, and the grant comes once the engine has
+//!    beaten for two clean ticks; the sequence continues at 4.
 //!
 //! The heartbeat bound is two quanta plus a tick, plus [`START_GRACE_NS`]
 //! where the driver switch happens and nothing can play:
