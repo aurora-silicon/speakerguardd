@@ -14,6 +14,11 @@ play; if the daemon stops for any reason, the card locks the volume again
 within 250 ms.  The configuration files use the same keys, so a speaker
 description reads the same way in both projects.
 
+`[Globals]` may set `sense_format = S16_LE` for a card whose sense PCM offers
+only 16-bit samples (the MacBook Pro 14-inch with M5 Max does); the default is
+`S32_LE`.  S16 words are shifted to the top of a 32-bit word, so `vs_scale`
+still means volts at full scale in both.
+
 ### How it works
 
 Every period (4096 frames) the sense words of each channel are scaled to the

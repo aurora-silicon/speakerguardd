@@ -594,7 +594,7 @@ mod tests {
     }
 
     fn globals() -> Globals {
-        Globals { sense_pcm: 2, t_ambient: 35.0, t_hysteresis: 5.0, t_window: 20.0, channels: 2, period: 4096, t_reduction_max: 20.0, safe_reduction: 20.0 }
+        Globals { sense_pcm: 2, t_ambient: 35.0, t_hysteresis: 5.0, t_window: 20.0, channels: 2, period: 4096, sense_format: Default::default(), t_reduction_max: 20.0, safe_reduction: 20.0 }
     }
 
     #[test]

@@ -10,6 +10,8 @@ use std::fmt;
 use std::fs;
 use std::path::Path;
 
+use crate::alsa::SenseFormat;
+
 #[derive(Debug)]
 pub struct ConfigError(pub String);
 
@@ -36,6 +38,8 @@ pub struct Globals {
     pub channels: usize,
     /// Frames per model step.
     pub period: usize,
+    /// Sample format of the sense PCM (`sense_format`, S32_LE when absent).
+    pub sense_format: SenseFormat,
     /// Reduction the thermal governor reaches at the coil's working limit
     /// (dB); more than this means the model, not the music, is wrong.
     pub t_reduction_max: f64,
@@ -146,6 +150,11 @@ impl Config {
             t_window: num(g, "Globals", "t_window")?,
             channels: num(g, "Globals", "channels")?,
             period: num(g, "Globals", "period")?,
+            sense_format: match g.get("sense_format") {
+                None => SenseFormat::default(),
+                Some(v) => SenseFormat::parse(v)
+                    .ok_or_else(|| ConfigError(format!("[Globals] sense_format: {v} is not S32_LE or S16_LE")))?,
+            },
             t_reduction_max: match g.get("t_reduction_max") {
                 None => 12.0,
                 Some(_) => num(g, "Globals", "t_reduction_max")?,
@@ -281,6 +290,15 @@ mod tests {
         assert!((c.speakers[0].p_limit_1s - 2.8154).abs() < 1e-9);
         assert!((c.speakers[0].p_limit_60s - 2.5).abs() < 1e-9);
         assert!((c.globals.t_reduction_max - 12.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn sense_format_defaults_to_s32_and_accepts_s16() {
+        assert_eq!(Config::parse(J700).unwrap().globals.sense_format, SenseFormat::S32Le);
+        let s16 = J700.replace("period = 4096", "period = 4096\nsense_format = S16_LE");
+        assert_eq!(Config::parse(&s16).unwrap().globals.sense_format, SenseFormat::S16Le);
+        let bad = J700.replace("period = 4096", "period = 4096\nsense_format = S24_LE");
+        assert!(Config::parse(&bad).is_err());
     }
 
     #[test]
