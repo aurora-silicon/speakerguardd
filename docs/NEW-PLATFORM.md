@@ -277,6 +277,10 @@ on the J413. A boot that has a valid record only checks the binding.
   from the device tree alone; the template before 2c16d1c (`vi` by default)
   now fails the check. Its silent switch run on the hardware is still to
   do.
+- **The T8142 AOP path (J813, J815):** derived and proven on the hardware
+  with a continuous sense capture (`method=derived`). The J815 gives `[V, I]`
+  per amp. Its fixture's wiring hash is the one its self-check proved
+  ([J815-INTEGRATION.md](J815-INTEGRATION.md)).
 - **J700 (MAX98360A, no V/I):** derived, not proven (`method=derived-static`).
   It has no amp registers and no sense, and each amp's side is its SD_MODE
   strap, which no software can read. A zero-sample stream shows nothing.

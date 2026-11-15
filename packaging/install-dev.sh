@@ -2,7 +2,7 @@
 # Development install of the v2 session side, for one user, on a machine
 # booted into a kernel with the "Speaker Protection" interface.
 #
-#   packaging/install-dev.sh install <machine>    # j316, j616, j413, j700
+#   packaging/install-dev.sh install <machine>    # j316, j616, j413, j700, j815
 #   packaging/install-dev.sh remove  <machine>
 #
 # It installs only into the user's ~/.config and restarts the user's
