@@ -457,6 +457,27 @@ class StorePermissions(unittest.TestCase):
             os.umask(old)
 
 
+class ConfigDirPermissions(unittest.TestCase):
+    def test_a_config_dir_made_by_the_switch_is_world_readable(self):
+        """J815: the switch wrote /etc/speakerguardd/provision.conf before v2
+        had made /etc/speakerguardd; under this tool's umask 077 the directory
+        came out 0700 and the seat user's session could not read v2's
+        speakerguardd.conf (no speaker graph, no sound)."""
+        import stat, tempfile
+        from aurora_speaker_upgrade import upgrade as up
+        old = os.umask(0o077)  # what main() sets
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                conf = os.path.join(d, "etc", "speakerguardd", "provision.conf")
+                up.write_file(conf, "X=1\n")
+                for sub in ("etc", os.path.join("etc", "speakerguardd")):
+                    self.assertEqual(stat.S_IMODE(os.stat(os.path.join(d, sub)).st_mode), 0o755, sub)
+                self.assertEqual(stat.S_IMODE(os.stat(conf).st_mode), 0o644)
+                self.assertEqual(stat.S_IMODE(os.stat(d).st_mode), 0o700)  # an existing parent is left alone
+        finally:
+            os.umask(old)
+
+
 class LegacyStart(unittest.TestCase):
     """RC8 E2E B2: a revert starts the older daemon the packaged udev rules
     want for the sense PCM, never every installed one (speakerguardd 0.1

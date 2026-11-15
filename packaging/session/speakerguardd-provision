@@ -206,8 +206,16 @@ def unlink(path):
 def ensure_dir(path, mode, live):
     """A directory this program writes in. In production systemd creates
     it (StateDirectory=, RuntimeDirectory=) with its SELinux label; one made
-    here is relabelled, so the supervisor's domain can read what is in it."""
+    here is relabelled, so the supervisor's domain can read what is in it.
+    One that exists without the bits it needs gets them added: systemd's
+    ConfigurationDirectoryMode= only warns about an existing directory, and
+    /etc/speakerguardd made 0700 under aurora-speaker-upgrade's umask 077
+    hid speakerguardd.conf from the seat user's session for good (J815: the
+    session found "none provisioned", linked no graph, no sound)."""
     if os.path.isdir(path):
+        cur = os.stat(path).st_mode & 0o7777
+        if cur & mode != mode:
+            os.chmod(path, cur | mode)
         return
     os.makedirs(path, mode=mode, exist_ok=True)
     os.chmod(path, mode)  # whatever the caller's umask

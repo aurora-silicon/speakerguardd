@@ -1017,6 +1017,17 @@ class Umask(Base):
             self.assertEqual(stat.S_IMODE(os.stat(d).st_mode), 0o755, d)
 
 
+    def test_an_unreadable_config_dir_is_repaired(self):
+        """J815: /etc/speakerguardd left 0700 by aurora-speaker-upgrade's
+        umask 077; systemd only warns about it. The seat user's session read
+        no speakerguardd.conf ("none provisioned") and linked no graph."""
+        import stat
+        os.makedirs(self.p.etc, exist_ok=True)
+        os.chmod(self.p.etc, 0o700)
+        self.assertEqual(self.run_(force=True), 0)
+        self.assertEqual(stat.S_IMODE(os.stat(self.p.etc).st_mode), 0o755)
+        self.assertEqual(stat.S_IMODE(os.stat(self.p.conf).st_mode), 0o644)
+
     def test_the_blob_from_the_macs_own_tuning_stays_root_only(self):
         """The graph directories open up for the session; the compiled blob
         at rest does not, under the units' umask or the upgrade tool's."""

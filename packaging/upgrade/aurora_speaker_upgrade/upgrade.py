@@ -337,8 +337,24 @@ def provision_conf_with(text, path):
     return "\n".join(lines + [MARK, f"SGV2_BUNDLE={path}"]) + "\n"
 
 
+def make_parents(path, mode=0o755):
+    """The directories above a file this tool writes outside its store, at
+    `mode` whatever this tool's umask 077. /etc/speakerguardd made here (the
+    switch writes provision.conf before v2 ever provisioned) came out 0700,
+    and v2's speakerguardd.conf in it was then unreadable for the seat user's
+    session: no speaker graph, no sound (J815)."""
+    d = os.path.dirname(path)
+    missing = []
+    while d and not os.path.isdir(d):
+        missing.append(d)
+        d = os.path.dirname(d)
+    for d in reversed(missing):
+        os.makedirs(d, exist_ok=True)
+        os.chmod(d, mode)
+
+
 def write_file(path, text, mode=0o644):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    make_parents(path)
     tmp = path + ".aurora-speaker-upgrade.new"
     with open(tmp, "w") as f:
         f.write(text)
