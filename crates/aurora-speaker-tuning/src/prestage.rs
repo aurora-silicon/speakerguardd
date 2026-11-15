@@ -46,7 +46,9 @@
 //!
 //! A peak or shelf of 0 dB is left out (the identity). Every other type is
 //! refused, as is a slot whose values are out of range.
-//! Polarity flips are not carried: they change no level. A muted channel
+//! A polarity flip changes no level, so the pre-stage leaves it out. The
+//! voicing chain carries it as the sign of the channel's gain: the lanes'
+//! relative polarity decides how drivers sum at a crossover. A muted channel
 //! gets gain 0.
 //!
 //! Group bypass (parameter 1, a bit per group) removes every slot in the
@@ -304,7 +306,8 @@ fn rbj(kind: Rbj, gain_db: f64, f0: f64, q: f64, fs: f64) -> Section {
 /// The filters a filter box (`aufx/tmst`) applies to its channel `ch`, as
 /// the box runs them: sections, flat gain (dB) and mute, with no scaling
 /// to unity (the pre-stage scales its whole lane; the voicing chain runs
-/// each box as macOS does).
+/// each box as macOS does). The box's polarity flip is not part of this:
+/// it changes no level.
 ///
 /// A slot the box's volume automation moves is carried at the setting
 /// that passes least over every volume (as the pre-stage carries it), so
@@ -314,6 +317,28 @@ fn rbj(kind: Rbj, gain_db: f64, f0: f64, q: f64, fs: f64) -> Section {
 pub fn tone(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics) -> Result<(Vec<Section>, f64, bool, Vec<u32>)> {
     let p = part_with(stage, ch, fs, diags, Realise::LeastPassing)?;
     Ok((p.sections, p.gain_db, p.muted, automation(stage)))
+}
+
+/// The channels whose polarity a filter box flips (global parameter 9, a
+/// bit per channel), for the voicing chain only: the pre-stage summarises
+/// levels and never reads it. A bypassed box flips nothing. A saved state
+/// without the parameter flips nothing; a value that is not a bit mask is
+/// refused.
+fn polarity_flips(stage: &Stage) -> Result<u32> {
+    if stage.bypass {
+        return Ok(0);
+    }
+    let Some(g) = stage.state.as_ref().and_then(|s| s.global()) else {
+        return Ok(0);
+    };
+    if g.get(0).map(f64::from).unwrap_or(0.0) != 0.0 {
+        return Ok(0);
+    }
+    match g.get(9).map(f64::from) {
+        None => Ok(0),
+        Some(v) if (0.0..=65535.0).contains(&v) && v.fract() == 0.0 => Ok(v as u32),
+        Some(v) => Err(bad(format!("filter box {}: parameter 9 is {v}, not a bit mask", stage.name))),
+    }
 }
 
 /// A filter box for the whole-chain runner: every channel at the box's
@@ -337,6 +362,7 @@ pub fn voicing_tone(
 ) -> Result<(Tone, Vec<u32>)> {
     let ctx = format!("filter box {}", stage.name);
     let mode = if volume_wired { Realise::Saved } else { Realise::LeastPassing };
+    let flips = polarity_flips(stage)?;
     let mut parts = Vec::with_capacity(width);
     let mut channels = Vec::with_capacity(width);
     for c in 0..width {
@@ -347,7 +373,9 @@ pub fn voicing_tone(
         let mut ch = Channel::IDENTITY;
         ch.count = p.sections.len();
         ch.sections[..p.sections.len()].copy_from_slice(&p.sections);
-        ch.gain = if p.muted { 0.0 } else { 10f64.powf(p.gain_db / 20.0) };
+        // the box's polarity flip is the sign of the channel's gain
+        let sign = if c < 32 && flips >> c & 1 != 0 { -1.0 } else { 1.0 };
+        ch.gain = if p.muted { 0.0 } else { sign * 10f64.powf(p.gain_db / 20.0) };
         if !ch.gain.is_finite() {
             return Err(bad(format!("{ctx} channel {c}: gain {} dB", p.gain_db)));
         }
@@ -1957,6 +1985,24 @@ mod tests {
         let muted = tmst(&[(11, 1.0)], &[]);
         assert!(part(&muted, 0, fs, &mut d).unwrap().muted);
         assert!(!part(&muted, 1, fs, &mut d).unwrap().muted);
+        // a flipped channel keeps its level and changes sign in the voicing chain
+        let flipped = tmst(&[(9, 1.0), (13, -6.0)], &[]);
+        let level = 10f64.powf(-6.0 / 20.0);
+        for wired in [true, false] {
+            let (tone, _) = voicing_tone(&flipped, 2, wired, fs, &mut d).unwrap();
+            assert!((tone.channels[0].gain + level).abs() < 1e-12 && (tone.channels[1].gain - level).abs() < 1e-12);
+        }
+        // a bypassed box flips nothing (its own bypass parameter, or the strip's), and a value that is no
+        // bit mask is refused
+        let (bypassed, _) = voicing_tone(&tmst(&[(0, 1.0), (9, 1.0)], &[]), 2, true, fs, &mut d).unwrap();
+        assert_eq!(bypassed.channels[0].gain, 1.0);
+        let mut strip_bypassed = tmst(&[(9, 1.0)], &[]);
+        strip_bypassed.bypass = true;
+        assert_eq!(voicing_tone(&strip_bypassed, 2, true, fs, &mut d).unwrap().0.channels[0].gain, 1.0);
+        assert!(voicing_tone(&tmst(&[(9, 0.5)], &[]), 2, true, fs, &mut d).is_err());
+        // a muted channel stays silent whatever its flip bit says
+        let both = tmst(&[(9, 1.0), (11, 1.0)], &[]);
+        assert_eq!(voicing_tone(&both, 2, true, fs, &mut d).unwrap().0.channels[0].gain, 0.0);
         // the global shelf-order field does not cap a low/high pass; an
         // order over the crossover limit, or a frequency past Nyquist, is refused
         let deep = tmst(&[(5, 4.0)], &[(0, [3.0, 4.0, 0.0, 200.0, 0.7, 21.0, 3.0, 0.0])]);
