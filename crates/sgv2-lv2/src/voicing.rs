@@ -18,6 +18,12 @@ use sgv2_core::voicing::volume::Curve;
 use sgv2_core::{blob, MAX_CHANNELS};
 
 pub const BLOCK: usize = 512;
+/// Exact digital silence, in frames, after which the instance stops running
+/// the chain (5 s at 48 kHz: longer than any box's tail).
+pub const IDLE_AFTER: u64 = 240_000;
+/// The last processed block must also be this quiet (about -120 dBFS)
+/// before the chain stops, so stopping never cuts an audible tail.
+pub const IDLE_PEAK: f32 = 1.0e-6;
 pub const VARIANTS: &[(&str, usize)] = &[
     ("https://aurora-silicon.org/lv2/sgv2#voicing-1ch\0", 1),
     ("https://aurora-silicon.org/lv2/sgv2#voicing-2ch\0", 2),
@@ -103,6 +109,13 @@ struct Instance {
     ports: [*mut f32; MAX_CHANNELS + 5],
     input: [[f32; BLOCK]; 2],
     output: [[f32; BLOCK]; MAX_CHANNELS],
+    /// Frames of exact zero input in a row.
+    silent: u64,
+    /// The chain is reset and not running: the input has been exactly zero
+    /// for IDLE_AFTER frames and the output had decayed below IDLE_PEAK.
+    /// The first nonzero sample runs it again from the state a fresh
+    /// activate gives, so a resumed program renders as on a new stream.
+    idle: bool,
 }
 
 fn live_board() -> Option<String> {
@@ -136,6 +149,8 @@ pub fn instantiate_offline(bytes: Option<&[u8]>, board: &str, rate: f64, lanes: 
         ports: [core::ptr::null_mut(); MAX_CHANNELS + 5],
         input: [[0.0; BLOCK]; 2],
         output: [[0.0; BLOCK]; MAX_CHANNELS],
+        silent: 0,
+        idle: false,
     }))
     .cast()
 }
@@ -150,6 +165,8 @@ unsafe extern "C" fn activate(h: *mut c_void) {
     // SAFETY: LV2 serializes activate/run for this live instance handle.
     if let Some(i) = unsafe { h.cast::<Instance>().as_mut() } {
         i.engine.reset();
+        i.silent = 0;
+        i.idle = false;
     }
 }
 unsafe extern "C" fn run(h: *mut c_void, frames: u32) {
@@ -185,9 +202,31 @@ unsafe extern "C" fn run(h: *mut c_void, frames: u32) {
                 *d = if s.is_finite() { *s } else { 0.0 };
             }
         }
-        let mut it = i.output.iter_mut();
-        let mut out: [&mut [f32]; MAX_CHANNELS] = core::array::from_fn(|_| &mut it.next().unwrap()[..len]);
-        i.engine.process(&[&i.input[0][..len], &i.input[1][..len]], &mut out[..n], len, scalar, db);
+        let quiet = i.input.iter().all(|c| c[..len].iter().all(|&x| x == 0.0));
+        i.silent = if quiet { i.silent.saturating_add(len as u64) } else { 0 };
+        if !quiet {
+            i.idle = false;
+        }
+        if i.idle {
+            for o in &mut i.output[..n] {
+                o[..len].fill(0.0);
+            }
+        } else {
+            let mut it = i.output.iter_mut();
+            let mut out: [&mut [f32]; MAX_CHANNELS] = core::array::from_fn(|_| &mut it.next().unwrap()[..len]);
+            i.engine.process(&[&i.input[0][..len], &i.input[1][..len]], &mut out[..n], len, scalar, db);
+            // Nothing to play: stop running the chain (the protect stage
+            // downstream keeps running, and PipeWire keeps scheduling this
+            // node because of it, so without this the whole voicing runs on
+            // silence forever).
+            if i.silent >= IDLE_AFTER && i.output[..n].iter().all(|c| c[..len].iter().all(|x| x.abs() < IDLE_PEAK)) {
+                i.engine.reset();
+                i.idle = true;
+                for o in &mut i.output[..n] {
+                    o[..len].fill(0.0);
+                }
+            }
+        }
         for (c, src) in i.output[..n].iter().enumerate() {
             // SAFETY: the output is connected and covers frames samples;
             // only the private scratch is borrowed while writing, allowing in-place I/O.
