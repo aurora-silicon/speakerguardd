@@ -1837,6 +1837,9 @@ struct Run {
     /// whenever the axis is configured, also with EnableMitigation = 0
     /// (rig: the therm/meter law cases log it with unity audio).
     vel_logged: bool,
+    /// The amplifier power model is complete: no mid/high rail or battery
+    /// model is configured. Otherwise its power is not reported.
+    amp_power_known: bool,
     link: bool,
     unlink_temp: bool,
     p_pole: [f64; 4],
@@ -1996,10 +1999,14 @@ impl Run {
         if p.model_only == 0 {
             return Err(InitError::Unsupported("system ID or closed-loop temperature"));
         }
-        if p.other_power_features != 0 {
+        // The mid/high rail and battery amplifier models and the power soft
+        // knee act only on the power axis: with ControlPower off they change
+        // no gain, and the unit runs without them.
+        // TODO(SPEC): the mid/high rail and battery amplifier power models.
+        if p.control_power != 0 && p.other_power_features != 0 {
             return Err(InitError::Unsupported("mid/high rail or battery power model"));
         }
-        if p.power_soft_limit_pct.iter().any(|&v| v != 100.0) {
+        if p.control_power != 0 && p.power_soft_limit_pct.iter().any(|&v| v != 100.0) {
             return Err(InitError::Unsupported("power soft knee below 100 %"));
         }
         let n = p.channels as usize;
@@ -2184,6 +2191,7 @@ impl Run {
             ]
             .map(|f| f != 0 && p.enable_mitigation != 0),
             vel_logged: p.control_velocity != 0,
+            amp_power_known: p.other_power_features == 0,
             link: p.link_slow_gains != 0,
             unlink_temp: p.unlink_temperature_gains != 0,
             p_pole,
@@ -3101,8 +3109,10 @@ impl ProtectionUnit for Unit {
         let g = &mut out.global;
         g.power_hard_limit_w = run.budget.map(|b| b as f32);
         g.power_gain = run.linked_power as f32;
-        g.modeled_amp_power_w = amp_1s as f32;
-        g.amp_input_power_w = amp_now as f32;
+        if run.amp_power_known {
+            g.modeled_amp_power_w = amp_1s as f32;
+            g.amp_input_power_w = amp_now as f32;
+        }
     }
     fn reset(&mut self) {
         self.model_frames = 0;
