@@ -1316,3 +1316,42 @@ fn tweeter_open_loop_model_limits_without_sense() {
         assert_eq!(ch.gain, 1.0, "woofer {c} untouched");
     }
 }
+
+#[test]
+fn a_drive_scale_models_the_capped_amps_exactly_and_unity_is_the_reference() {
+    // The kernel's gain cap at -20 dB: the amps put out k = 0.1 of the
+    // blob's operating point, so the modelled power is k^2 of it.
+    let p = params();
+    let k = 10f32.powf(-20.0 / 20.0);
+    let mut capped = spp3::Unit::new(p);
+    assert!(capped.set_drive_scale(k));
+    assert!((capped.drive_scale() - k).abs() < 1e-6);
+    let (t, _) = drive(&mut capped, [0.5; 4], 60.0, 1024);
+    for c in 0..4 {
+        let pw = elec(&p, c) * f64::from(k) * f64::from(k) * 0.25;
+        let want = 40.0 + pw * (p.ch[c].t_sett_vc as f64 + p.ch[c].t_sett_mg as f64);
+        let got = t.channels[c].ol_temp_c as f64;
+        assert!((got - want).abs() < 0.01, "ch{c} {got} {want}");
+    }
+    // back to unity: bit for bit the unscaled unit from here on
+    let mut a = spp3::Unit::new(p);
+    let mut b = spp3::Unit::new(p);
+    assert!(b.set_drive_scale(0.25));
+    assert!(b.set_drive_scale(1.0));
+    let (ta, oa) = drive(&mut a, [0.3; 4], 5.0, 512);
+    let (tb, ob) = drive(&mut b, [0.3; 4], 5.0, 512);
+    assert_eq!(oa, ob);
+    for c in 0..4 {
+        assert_eq!(ta.channels[c].ol_temp_c.to_bits(), tb.channels[c].ol_temp_c.to_bits());
+    }
+    // nonsense is the most drive (the blob's own operating point), and a
+    // scale below the floor is held at it
+    for bad in [f32::NAN, f32::INFINITY, 0.0, -1.0, 2.0] {
+        let mut u = spp3::Unit::new(p);
+        assert!(u.set_drive_scale(bad));
+        assert_eq!(u.drive_scale(), 1.0, "{bad}");
+    }
+    let mut u = spp3::Unit::new(p);
+    u.set_drive_scale(1e-6);
+    assert!((u.drive_scale() - spp3::MIN_DRIVE_SCALE).abs() < 1e-9);
+}

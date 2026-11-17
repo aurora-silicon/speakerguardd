@@ -85,6 +85,44 @@ pub struct PageHeader {
     /// What the plugin did with the binding ([`SENSE_UNBOUND`] ..
     /// [`SENSE_REFUSED`]); 0 from a plugin that does not say.
     pub sense_bound: AtomicU32,
+    /// The drive the unit must model, written by the supervisor every tick
+    /// ([`EnginePage::set_drive_cap`]): the kernel's speaker gain cap the
+    /// supervisor may put the amps at, in 0.5 dB steps below the blob's
+    /// operating point, packed with the request's sequence number
+    /// ([`pack_drive_cap`]). 0: none (the blob's own operating point).
+    pub drive_cap: AtomicU64,
+    /// CLOCK_MONOTONIC of the supervisor's last `drive_cap` write, ns: an
+    /// older word than [`DRIVE_CAP_STALE_NS`] asks for nothing, and the unit
+    /// models the blob's own operating point (the most drive).
+    pub drive_cap_ns: AtomicU64,
+    /// What the unit models, written by the plugin on every call: the
+    /// request it applied, packed the same way; its level is 0 (the blob's
+    /// operating point) for a unit that cannot scale its model, or for no
+    /// fresh request. 0 from a plugin that does not say, which matches no
+    /// request: the supervisor then never raises the cap above its floor.
+    pub drive_cap_ack: AtomicU64,
+}
+
+/// A [`PageHeader::drive_cap`] word older than this asks for nothing.
+pub const DRIVE_CAP_STALE_NS: u64 = 500_000_000;
+/// The drive levels a request may name, 0.5 dB steps: -20 dB to 0 dB.
+pub const DRIVE_CAP_MIN: i32 = -40;
+pub const DRIVE_CAP_MAX: i32 = 0;
+
+/// `(seq, level)` packed: the sequence number high, the level (0.5 dB
+/// steps, two's complement) low.
+pub fn pack_drive_cap(seq: u32, half_db: i32) -> u64 {
+    u64::from(seq) << 32 | u64::from(half_db as u32)
+}
+
+/// The inverse of [`pack_drive_cap`].
+pub fn unpack_drive_cap(w: u64) -> (u32, i32) {
+    ((w >> 32) as u32, w as u32 as i32)
+}
+
+/// The linear amplitude of a level in 0.5 dB steps.
+pub fn drive_scale(half_db: i32) -> f32 {
+    10f32.powf(half_db as f32 / 40.0)
 }
 
 pub const AMPS_HELD: u32 = 1;
@@ -266,6 +304,40 @@ impl EnginePage {
         }
     }
 
+    /// The supervisor's side: the drive the unit must model (`seq`, the
+    /// level in 0.5 dB steps, [`DRIVE_CAP_MIN`]..=[`DRIVE_CAP_MAX`]).
+    pub fn set_drive_cap(&self, seq: u32, half_db: i32) {
+        let h = self.header();
+        h.drive_cap.store(pack_drive_cap(seq, half_db), Ordering::Relaxed);
+        h.drive_cap_ns.store(mono_ns(), Ordering::Release);
+    }
+
+    /// Real time: the supervisor's fresh request, if any: `(seq, level)`
+    /// with a nonzero sequence and the level in range.
+    #[inline]
+    pub fn drive_cap(&self) -> Option<(u32, i32)> {
+        let h = self.header();
+        let at = h.drive_cap_ns.load(Ordering::Acquire);
+        let (seq, level) = unpack_drive_cap(h.drive_cap.load(Ordering::Relaxed));
+        let fresh = at != 0 && mono_ns().saturating_sub(at) <= DRIVE_CAP_STALE_NS;
+        (fresh && seq != 0 && (DRIVE_CAP_MIN..=DRIVE_CAP_MAX).contains(&level)).then_some((seq, level))
+    }
+
+    /// Real time: what the unit models now.
+    #[inline]
+    pub fn report_drive_cap(&self, seq: u32, half_db: i32) {
+        let w = pack_drive_cap(seq, half_db);
+        let h = self.header();
+        if h.drive_cap_ack.load(Ordering::Relaxed) != w {
+            h.drive_cap_ack.store(w, Ordering::Release);
+        }
+    }
+
+    /// The supervisor's side: what the plugin says the unit models.
+    pub fn drive_cap_ack(&self) -> (u32, i32) {
+        unpack_drive_cap(self.header().drive_cap_ack.load(Ordering::Acquire))
+    }
+
     /// Real time: what the wakes kept.
     #[inline]
     pub fn publish_wakes(&self, wakes: u32, last: u32, overflow: u64) {
@@ -342,6 +414,36 @@ mod tests {
         let first = rd.poll(r.ring()).unwrap();
         assert!(first.frame >= (300 - RING as u64) * 512);
         assert!(rd.lost > 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_drive_cap_request_is_fresh_in_range_and_sequenced() {
+        let dir = std::env::temp_dir().join(format!("sgv2-page-cap-{}", std::process::id()));
+        let path = dir.to_str().unwrap().to_string();
+        let w = EnginePage::create(&path).unwrap();
+        let r = EnginePage::open(&path).unwrap();
+        // nothing written: no request, and an ack that names none
+        assert_eq!(r.drive_cap(), None);
+        assert_eq!(w.drive_cap_ack(), (0, 0));
+        w.set_drive_cap(7, -20);
+        assert_eq!(r.drive_cap(), Some((7, -20)));
+        r.report_drive_cap(7, -20);
+        assert_eq!(w.drive_cap_ack(), (7, -20));
+        // out of range or unsequenced: no request
+        w.set_drive_cap(8, 1);
+        assert_eq!(r.drive_cap(), None);
+        w.set_drive_cap(8, -41);
+        assert_eq!(r.drive_cap(), None);
+        w.set_drive_cap(0, -10);
+        assert_eq!(r.drive_cap(), None);
+        // stale
+        w.set_drive_cap(9, -10);
+        w.header().drive_cap_ns.store(1, Ordering::Release);
+        assert_eq!(r.drive_cap(), None);
+        assert_eq!(unpack_drive_cap(pack_drive_cap(u32::MAX, -40)), (u32::MAX, -40));
+        assert!((drive_scale(-40) - 0.1).abs() < 1e-6);
+        assert_eq!(drive_scale(0), 1.0);
         let _ = std::fs::remove_file(&path);
     }
 }

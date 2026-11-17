@@ -168,6 +168,26 @@ impl AnyUnit {
     }
 }
 
+impl AnyUnit {
+    /// Follow the supervisor's drive request ([`page::EnginePage::drive_cap`]):
+    /// the unit models the amps at `level` 0.5 dB steps below the blob's
+    /// operating point (the kernel's gain cap), or at the operating point
+    /// itself without a fresh request. Returns what it models, for the ack:
+    /// the request's sequence and its level, or level 0 when the unit
+    /// cannot scale its model (it then models the most drive). Real time
+    /// safe.
+    pub fn follow_drive_cap(&mut self, req: Option<(u32, i32)>) -> (u32, i32) {
+        let (seq, level) = req.unwrap_or((0, 0));
+        let applied = match self {
+            AnyUnit::Spp3(u) => u.set_drive_scale(page::drive_scale(level)),
+            // lsm2 and atsp keep the blob's own operating point (the most
+            // drive); the fail-safe and the placeholder model nothing
+            _ => false,
+        };
+        (seq, if applied { level } else { 0 })
+    }
+}
+
 /// Why `load_unit` fell back to the fail-safe.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoadError {
@@ -282,6 +302,10 @@ struct Instance {
     /// and the `SENSE_*` state that gave.
     sense_bind: Option<bool>,
     sense_state: u32,
+    /// The supervisor's drive request as last followed (`None`: not yet),
+    /// and what the unit models since: `(seq, level)` for the ack.
+    drive_req: Option<Option<(u32, i32)>>,
+    drive_ack: (u32, i32),
 }
 
 fn env_or(var: &str, default: String) -> String {
@@ -342,6 +366,8 @@ unsafe extern "C" fn instantiate(
         preroll: Box::new(preroll::PreRoll::new(channels, rate)),
         sense_bind: None,
         sense_state: page::SENSE_UNBOUND,
+        drive_req: None,
+        drive_ack: (0, 0),
     });
     Box::into_raw(instance).cast()
 }
@@ -522,6 +548,19 @@ fn run_chunk(instance: &mut Instance, page: Option<&page::EnginePage>, off: usiz
     if instance.sense_bind != Some(bind) {
         instance.sense_bind = Some(bind);
         instance.sense_state = instance.unit.follow_sense_bind(bind);
+    }
+    // The kernel's gain cap, as the supervisor asks the unit to model it:
+    // applied before this call's audio, then acknowledged (the ack never
+    // names a level the unit does not model yet). Without a
+    // fresh request the unit models the blob's own operating point, the
+    // most drive the amps can take.
+    let req = page.and_then(|p| p.drive_cap());
+    if instance.drive_req != Some(req) {
+        instance.drive_req = Some(req);
+        instance.drive_ack = instance.unit.follow_drive_cap(req);
+    }
+    if let Some(p) = page {
+        p.report_drive_cap(instance.drive_ack.0, instance.drive_ack.1);
     }
     let unit = instance.unit.as_dyn();
     let latency = unit.latency_frames() as f32;

@@ -457,6 +457,27 @@ class StorePermissions(unittest.TestCase):
             os.umask(old)
 
 
+class ConfigDirPermissions(unittest.TestCase):
+    def test_a_config_dir_made_by_the_switch_is_world_readable(self):
+        """J815: the switch wrote /etc/speakerguardd/provision.conf before v2
+        had made /etc/speakerguardd; under this tool's umask 077 the directory
+        came out 0700 and the seat user's session could not read v2's
+        speakerguardd.conf (no speaker graph, no sound)."""
+        import stat, tempfile
+        from aurora_speaker_upgrade import upgrade as up
+        old = os.umask(0o077)  # what main() sets
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                conf = os.path.join(d, "etc", "speakerguardd", "provision.conf")
+                up.write_file(conf, "X=1\n")
+                for sub in ("etc", os.path.join("etc", "speakerguardd")):
+                    self.assertEqual(stat.S_IMODE(os.stat(os.path.join(d, sub)).st_mode), 0o755, sub)
+                self.assertEqual(stat.S_IMODE(os.stat(conf).st_mode), 0o644)
+                self.assertEqual(stat.S_IMODE(os.stat(d).st_mode), 0o700)  # an existing parent is left alone
+        finally:
+            os.umask(old)
+
+
 class LegacyStart(unittest.TestCase):
     """RC8 E2E B2: a revert starts the older daemon the packaged udev rules
     want for the sense PCM, never every installed one (speakerguardd 0.1
@@ -657,15 +678,14 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class PreviewWarning(unittest.TestCase):
-    """Every switch is preceded by the preview warning; a
-    non-interactive run needs --i-understand-preview, else exit 2 with
-    nothing done; --check, status and --revert never ask."""
+class NoConfirmation(unittest.TestCase):
+    """A run switches without a prompt or a flag, from a terminal or not (the
+    boot unit); --i-understand-preview is still accepted and changes nothing."""
 
     def setUp(self):
-        import io, types
+        import io
         from aurora_speaker_upgrade import upgrade as up
-        self.up, self.types, self.io = up, types, io
+        self.up, self.io = up, io
         self.saved = (up.cmd_run, up.cmd_check, up.cmd_status, up.cmd_revert, up.locked, os.geteuid, sys.stdin)
         self.ran = []
         for name in ("run", "check", "status", "revert"):
@@ -686,43 +706,17 @@ class PreviewWarning(unittest.TestCase):
             rc = self.up.main(list(argv) + ["--scratch", "/nonexistent/sgb6-test-scratch"])
         return rc, err.getvalue()
 
-    def test_non_interactive_run_refuses_without_the_flag(self):
-        rc, err = self.main("run")
-        self.assertEqual(rc, self.up.EXIT_RETRY)
-        self.assertEqual(self.ran, [])
-        self.assertIn("PREVIEW", err)
-        self.assertIn("does not fully match macOS", err)
-        self.assertIn("supported", err)
-        self.assertIn("aurora-speaker-upgrade --revert", err)
-        self.assertIn("--i-understand-preview", err)
-        rc, _ = self.main("run", "--at-boot")
-        self.assertEqual((rc, self.ran), (self.up.EXIT_RETRY, []))
+    def test_non_interactive_run_switches(self):
+        for argv in (["run"], ["run", "--at-boot"], ["run", "--i-understand-preview"],
+                     ["run", "--at-boot", "--i-understand-preview"]):
+            self.ran.clear()
+            rc, err = self.main(*argv)
+            self.assertEqual((rc, self.ran), (self.up.EXIT_OK, ["run"]), argv)
+            self.assertNotIn("PREVIEW", err.upper(), argv)
 
-    def test_flag_runs_and_still_warns(self):
-        rc, err = self.main("run", "--i-understand-preview")
-        self.assertEqual((rc, self.ran), (self.up.EXIT_OK, ["run"]))
-        self.assertIn("PREVIEW", err)
-
-    def test_interactive_asks(self):
-        up = self.up
-        a = self.types.SimpleNamespace(i_understand_preview=False)
-        import contextlib
-        with contextlib.redirect_stderr(self.io.StringIO()):
-            self.assertTrue(up.preview_ack(a, ask=lambda q: "y", interactive=True))
-            self.assertTrue(up.preview_ack(a, ask=lambda q: "YES ", interactive=True))
-            for no in ("", "n", "no", "maybe"):
-                with self.assertRaises(up.Retry):
-                    up.preview_ack(a, ask=lambda q: no, interactive=True)
-
-            def eof(q):
-                raise EOFError
-            with self.assertRaises(up.Retry):
-                up.preview_ack(a, ask=eof, interactive=True)
-
-    def test_check_status_revert_never_ask(self):
+    def test_other_commands_unchanged(self):
         for argv, name in ((["--check"], "check"), (["status"], "status"), (["--revert"], "revert"),
                            (["run", "--no-switch"], "run")):
             self.ran.clear()
-            rc, err = self.main(*argv)
+            rc, _ = self.main(*argv)
             self.assertEqual((rc, self.ran), (self.up.EXIT_OK, [name]), argv)
-            self.assertNotIn("PREVIEW", err, argv)

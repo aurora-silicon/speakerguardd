@@ -115,6 +115,10 @@ use crate::{
     FAILSAFE_GAIN, MAX_CHANNELS,
 };
 
+/// The smallest drive scale [`Unit::set_drive_scale`] takes: -40 dB, below
+/// the lowest level the engine page can ask for (-20 dB).
+pub const MIN_DRIVE_SCALE: f32 = 0.01;
+
 /// CL temperature reported before any valid measurement (spec section 10).
 const T_CL_UNMEASURED: f32 = 20.0;
 
@@ -1291,7 +1295,13 @@ struct Chan {
     /// A non-finite program sample in the current thermal update: the rest
     /// of the update gets the meter-failure 20 dB.
     meter_failed: bool,
+    /// The modelled volts at full scale into the coil: the blob's
+    /// `loaded_amp_gain_full` times the host's drive scale
+    /// ([`Unit::set_drive_scale`]).
     loaded_amp_gain: f32,
+    /// `ag * Reb / (Reb + series)` from the parameters: the operating point
+    /// at the amps' 0 dB volume.
+    loaded_amp_gain_full: f32,
     inv_reb: f32,
     frame_recip: f32,
     headroom2: f64,
@@ -1529,6 +1539,38 @@ impl Unit {
     pub fn lookahead_frames(&self) -> usize {
         self.run.as_ref().map_or(0, |r| r.look)
     }
+    /// The drive scale the model runs at (1: the blob's own operating
+    /// point). See [`Unit::set_drive_scale`].
+    pub fn drive_scale(&self) -> f32 {
+        self.run.as_ref().and_then(|r| r.ch.first()).map_or(1.0, |c| {
+            if c.loaded_amp_gain_full > 0.0 {
+                c.loaded_amp_gain / c.loaded_amp_gain_full
+            } else {
+                1.0
+            }
+        })
+    }
+    /// The amps run `k` (0 < k <= 1) of the operating point the parameters
+    /// were compiled for: a kernel gain cap below the amps' 0 dB volume
+    /// (a kernel "Speaker Protection Gain Cap" control, as on the J804).
+    /// Every channel's modelled volts at full scale is the blob's `ag`
+    /// operating point times `k`,
+    /// so the open-loop power is exact under the cap (without this the
+    /// model overestimates it, which only protects more). Returns true. `k` is
+    /// clamped to [`MIN_DRIVE_SCALE`]..1; anything else (non-finite, <= 0)
+    /// is 1, the blob's own operating point, which only overestimates the
+    /// power. At 1 the arithmetic is the reference's, bit for bit. The
+    /// thermal state is kept: a scale change never cools the model.
+    /// Real-time safe; takes effect at the next thermal update.
+    pub fn set_drive_scale(&mut self, k: f32) -> bool {
+        let k = if k.is_finite() && k > 0.0 { k.clamp(MIN_DRIVE_SCALE, 1.0) } else { 1.0 };
+        if let Some(run) = self.run.as_mut() {
+            for c in run.ch.iter_mut() {
+                c.loaded_amp_gain = if k == 1.0 { c.loaded_amp_gain_full } else { c.loaded_amp_gain_full * k };
+            }
+        }
+        true
+    }
     /// The accepted program-to-sense delay, in frames.
     pub fn sense_delay(&self) -> Option<u32> {
         self.run.as_ref().and_then(|r| r.estimator.delay())
@@ -1698,6 +1740,7 @@ impl Run {
                 scratch: vec![0.0; MODEL_SCRATCH],
                 meter_failed: false,
                 loaded_amp_gain,
+                loaded_amp_gain_full: loaded_amp_gain,
                 inv_reb: 1.0 / c.reb_ref,
                 frame_recip: 1.0 / upd as f32,
                 headroom2: (headroom as f64) * (headroom as f64),

@@ -4,9 +4,6 @@ Documentation=https://github.com/aurora-silicon/speakerguardd/blob/v2/packaging/
 # Shipped disabled: users opt in (systemctl enable --now aurora-speaker-upgrade)
 # until the rollout is approved. Idempotent: a Mac already on v2 with its
 # bundle does nothing. Any failure leaves the legacy protection in charge.
-# speakerguardd v2 is a preview: without --i-understand-preview this unit
-# exits 2 ("not now") and switches nothing. Opting in through the unit takes
-# a drop-in that adds the flag (README.md).
 After=local-fs.target sound.target systemd-udev-settle.service network-online.target
 Wants=network-online.target
 ConditionPathExists=/proc/device-tree/compatible

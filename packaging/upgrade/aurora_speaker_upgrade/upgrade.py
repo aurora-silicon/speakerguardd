@@ -4,8 +4,8 @@
 protection (speakersafetyd, speakerguardd 0.1) to speakerguardd v2, with
 this Mac's own tuning, and back.
 
-    aurora-speaker-upgrade [run] [--i-understand-preview] [--route auto|0|1|2|3] [--ipsw URL]
-                                 [--macos-build B] [--collection TARBALL] [--no-switch]
+    aurora-speaker-upgrade [run] [--route auto|0|1|2|3] [--ipsw URL] [--macos-build B]
+                                 [--collection TARBALL] [--no-switch]
     aurora-speaker-upgrade --revert [--purge]
     aurora-speaker-upgrade --check [--json FILE]                (dry run: /run only, nothing stored or switched)
     aurora-speaker-upgrade status
@@ -28,11 +28,6 @@ this Mac's own tuning, and back.
 4. Only on a pass, the kernel's speaker protection interface switches to v2.
    The legacy stack stays installed; any failure leaves (or puts) it in
    charge, and `--revert` goes back to it.
-
-speakerguardd v2 is a preview: it does not fully match macOS yet, and the
-legacy protection is the supported default. A run that can switch says so
-first; interactively it asks, otherwise it needs --i-understand-preview
-(without it: exit 2, nothing changed).
 """
 import argparse
 import contextlib
@@ -337,8 +332,24 @@ def provision_conf_with(text, path):
     return "\n".join(lines + [MARK, f"SGV2_BUNDLE={path}"]) + "\n"
 
 
+def make_parents(path, mode=0o755):
+    """The directories above a file this tool writes outside its store, at
+    `mode` whatever this tool's umask 077. /etc/speakerguardd made here (the
+    switch writes provision.conf before v2 ever provisioned) came out 0700,
+    and v2's speakerguardd.conf in it was then unreadable for the seat user's
+    session: no speaker graph, no sound (J815)."""
+    d = os.path.dirname(path)
+    missing = []
+    while d and not os.path.isdir(d):
+        missing.append(d)
+        d = os.path.dirname(d)
+    for d in reversed(missing):
+        os.makedirs(d, exist_ok=True)
+        os.chmod(d, mode)
+
+
 def write_file(path, text, mode=0o644):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    make_parents(path)
     tmp = path + ".aurora-speaker-upgrade.new"
     with open(tmp, "w") as f:
         f.write(text)
@@ -1002,37 +1013,9 @@ def cmd_interface_apply(a):
     return EXIT_OK
 
 
-# v2 ships opt-in while it is a preview. The same text is in
-# the package descriptions and the distribution docs; keep them in step.
-PREVIEW_WARNING = """speakerguardd v2 is a PREVIEW.
-  - It does not fully match macOS yet.
-  - The legacy protection (speakersafetyd, speakerguardd 0.1) is the supported
-    default, and it stays installed.
-  - To go back at any time: sudo aurora-speaker-upgrade --revert"""
+# Accepted and ignored: the boot unit drop-ins and scripts that passed it
+# for the earlier confirmation step keep working.
 ACK_FLAG = "--i-understand-preview"
-
-
-def preview_ack(a, ask=None, interactive=None):
-    """Before a run that can switch the speakers to v2: say plainly that v2 is
-    a preview. An interactive run asks; a non-interactive one (the boot unit,
-    a script) needs --i-understand-preview, and without it is "not now"
-    (EXIT_RETRY): nothing is collected, stored or switched."""
-    print(PREVIEW_WARNING, file=sys.stderr, flush=True)
-    if a.i_understand_preview:
-        return True
-    if interactive is None:
-        interactive = sys.stdin.isatty() and sys.stderr.isatty()
-    if not interactive:
-        raise Retry(f"speakerguardd v2 is a preview: a non-interactive run needs {ACK_FLAG} "
-                    "(the legacy protection keeps the speakers)")
-    ask = ask or (lambda q: input(q))
-    try:
-        answer = ask("Switch this Mac's speakers to the speakerguardd v2 preview? [y/N] ")
-    except EOFError:
-        answer = ""
-    if answer.strip().lower() not in ("y", "yes"):
-        raise Retry("not confirmed (the legacy protection keeps the speakers)")
-    return True
 
 
 GUIDE = """Route 3: collect this Mac's speaker tuning on its own macOS, once.
@@ -1076,7 +1059,7 @@ def main(argv=None):
     ap.add_argument("--scratch", default=None)
     ap.add_argument("-v", "--verbose", action="store_true")
     ap.add_argument(ACK_FLAG, dest="i_understand_preview", action="store_true",
-                    help="run: accept that speakerguardd v2 is a preview (needed when not interactive)")
+                    help=argparse.SUPPRESS)
     a = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO if a.verbose else logging.WARNING,
                         format="aurora-speaker-upgrade: %(message)s")
@@ -1095,12 +1078,6 @@ def main(argv=None):
         return EXIT_RETRY
     if a.cmd == "collect" and not a.out:
         ap.error("collect needs --out")
-    if a.cmd == "run" and not a.no_switch:
-        try:
-            preview_ack(a)
-        except Retry as e:
-            say(f"not now: {e}")
-            return EXIT_RETRY
     os.umask(0o077)
     cmds = {"run": cmd_run, "check": cmd_check, "collect": cmd_collect, "status": cmd_status,
             "interface-apply": cmd_interface_apply, "revert": cmd_revert}

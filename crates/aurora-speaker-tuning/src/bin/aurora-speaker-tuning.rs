@@ -6,7 +6,7 @@
 //! ```text
 //! aurora-speaker-tuning dump     [--json] [--speaker-id N] [SOURCE]
 //! aurora-speaker-tuning validate [--json] [--speaker-id N] [SOURCE]
-//! aurora-speaker-tuning compile  [--speaker-id N] [--board B [--unit-id U]] [--development] [--voicing-pre] [--prestage identity|tuning] [SOURCE | --bundle PATH] -o BLOB
+//! aurora-speaker-tuning compile  [--speaker-id N] [--board B [--unit-id U | --unit-id-file F]] [--development] [--voicing-pre] [--prestage identity|tuning] [SOURCE | --bundle PATH] -o BLOB
 //! aurora-speaker-tuning identify [--json] [SOURCE]   (the bundle's identity, for provisioning)
 //! aurora-speaker-tuning blob     BLOB [BLOB]     (decode; with two, diff field by field)
 //! aurora-speaker-tuning units    [--json]
@@ -31,7 +31,11 @@
 //! The unit is this Mac's device tree's (`serial-number`), or with
 //! `--board` the `--unit-id` given (the bundle's own, to compile offline
 //! for the Mac it came from), else unknown: then per-unit calibration is
-//! not used (open loop).  See `compile` for the binding rules.
+//! not used (open loop).  `--unit-id-file F` reads the ID from the file `F`
+//! instead (its first line, surrounding white space ignored), so the unit
+//! ID (the domain-separated hash of the serial number, which binds a blob
+//! to its Mac) never sits on the command line where any local user could
+//! read it in `/proc/<pid>/cmdline`.  See `compile` for the binding rules.
 //! `--prestage` picks what runs ahead of the unit: `identity` (the default,
 //! pass-through: the voicing graph feeds the unit) or `tuning` (the Mac's
 //! own filtering, derived from the tuning; rigs and the full macOS chain).
@@ -70,7 +74,7 @@ struct Args {
 fn usage() -> ! {
     eprintln!(
         "usage: aurora-speaker-tuning {{dump|validate}} [--json] [--speaker-id N] [PATH | --tunings-root DIR --aid N]\n       \
-         aurora-speaker-tuning compile [--speaker-id N] [--board B [--unit-id U]] [--development] [--voicing-pre] [--prestage identity|tuning] [--bundle PATH | --tunings-root DIR --aid N] -o BLOB\n       \
+         aurora-speaker-tuning compile [--speaker-id N] [--board B [--unit-id U | --unit-id-file F]] [--development] [--voicing-pre] [--prestage identity|tuning] [--bundle PATH | --tunings-root DIR --aid N] -o BLOB\n       \
          aurora-speaker-tuning plan [--speaker-id N] [PATH | --tunings-root DIR --aid N]\n       \
          aurora-speaker-tuning identify [--json] [PATH | --tunings-root DIR --aid N]\n       \
          aurora-speaker-tuning blob BLOB [BLOB]\n       \
@@ -123,7 +127,20 @@ fn parse_args() -> Args {
             }
             "--bundle" => a.path = Some(it.next().map(PathBuf::from).unwrap_or_else(|| usage())),
             "--board" => a.board = Some(it.next().unwrap_or_else(|| usage())),
-            "--unit-id" => a.unit_id = Some(it.next().unwrap_or_else(|| usage())),
+            "--unit-id" if a.unit_id.is_none() => a.unit_id = Some(it.next().unwrap_or_else(|| usage())),
+            "--unit-id-file" if a.unit_id.is_none() => {
+                let f = it.next().unwrap_or_else(|| usage());
+                let text = std::fs::read_to_string(&f).unwrap_or_else(|e| {
+                    eprintln!("--unit-id-file {f}: {e}");
+                    exit(2)
+                });
+                let id = text.lines().next().unwrap_or("").trim().to_owned();
+                if !machine::valid_unit_id(&id) {
+                    eprintln!("--unit-id-file {f}: its first line is not a unit ID (64 lowercase hex digits)");
+                    exit(2)
+                }
+                a.unit_id = Some(id);
+            }
             "--development" => a.development = true,
             "--attestations" => a.attestations = Some(it.next().map(PathBuf::from).unwrap_or_else(|| usage())),
             "--key-only" => a.key_only = true,
