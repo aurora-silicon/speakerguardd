@@ -6,9 +6,10 @@
 //! consecutive clean ticks. With nothing playing (no demand) a clean tick
 //! releases too, as idle rather than a fault: the kernel holds the amps at
 //! its floor and refuses every start, as macOS powers the speaker path down
-//! when nothing plays. The checks keep running while idle, so the grant
-//! comes back on the first tick with demand once two clean ticks have
-//! passed.
+//! when nothing plays. The checks keep running while idle; the protect
+//! stage stops with the last stream, so the heartbeat check holds again
+//! only once the next stream runs it, and the grant comes on the second
+//! clean tick with demand.
 
 /// What one tick observed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

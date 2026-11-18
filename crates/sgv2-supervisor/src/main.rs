@@ -36,6 +36,11 @@
 //!   poll instead of at the next 10 ms tick (B2 measured 11.7 ms from XRUN
 //!   to release, 31.0 ms to the floor, on 0d7ee6c). An XRUN is now held
 //!   for the sink's recovery, up to the heartbeat bound (see `observe`).
+//! - With nothing playing (no grant, no demand) for half a second it goes
+//!   idle (see `pace`): the pollers read every 100 ms and the loop ticks
+//!   every 250 ms or when the helper renames a new report into place, and
+//!   the loop drops its frequency floor. A demand wakes everything to full
+//!   rate before it can lead to a grant.
 //! - Exits on losing ownership or any kernel error: closing the control file
 //!   withdraws protection at once.
 //!
@@ -57,7 +62,7 @@ mod linux {
     use std::io::Read;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Arc;
 
     use sgv2_lv2::page::{EnginePage, LAYOUT, MAGIC, PAGE_BYTES};
@@ -68,6 +73,7 @@ mod linux {
         combine, helper_is, owner_to_tgid, parse_pcm_info, parse_pcm_status, parse_session, parse_tgid,
         speaker_pcm_problem, EngineState, EngineView, Observer, PcmInfo, PcmState, PcmView, SessionReport, SessionView,
     };
+    use sgv2_supervisor::pace::{self, Change, Pace};
     use sgv2_supervisor::selfcheck;
     use sgv2_supervisor::supervise::{Event, Expect, Fatal, Supervisor};
 
@@ -221,6 +227,53 @@ mod linux {
         }
     }
 
+    /// The pollers' pace, set by the loop: every millisecond, or every
+    /// `pace::IDLE_POLL_NS` while idle. Leaving idle stores `idle` false and
+    /// kicks both pollers' eventfds, so a poller asleep at the idle pace
+    /// reads at once.
+    struct PollPace {
+        idle: AtomicBool,
+        kick_pcm: i32,
+        kick_helper: i32,
+        /// The PCM reader's wake for the loop (an extra tick at once).
+        wake_loop: i32,
+    }
+
+    impl PollPace {
+        fn new() -> std::io::Result<Self> {
+            let fd = || {
+                // SAFETY: a plain eventfd, non-blocking and close-on-exec.
+                let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+                if fd < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(fd)
+                }
+            };
+            Ok(PollPace { idle: AtomicBool::new(false), kick_pcm: fd()?, kick_helper: fd()?, wake_loop: fd()? })
+        }
+
+        fn set_idle(&self, idle: bool) {
+            self.idle.store(idle, Ordering::Release);
+            if !idle {
+                let one: u64 = 1;
+                for fd in [self.kick_pcm, self.kick_helper] {
+                    // SAFETY: an eventfd we own; an 8-byte counter write.
+                    unsafe { libc::write(fd, (&one as *const u64).cast(), 8) };
+                }
+            }
+        }
+
+        /// A poller's sleep after a read that began at `started`.
+        fn sleep(&self, started: u64, kick: i32) {
+            if self.idle.load(Ordering::Acquire) {
+                wait_until(started + pace::IDLE_POLL_NS, &[kick]);
+            } else {
+                sleep_until(started + PCM_POLL_NS);
+            }
+        }
+    }
+
     fn read_small(path: &str, buf: &mut String) -> bool {
         buf.clear();
         std::fs::File::open(path).and_then(|mut f| f.read_to_string(buf)).is_ok()
@@ -232,11 +285,12 @@ mod linux {
         dir: String,
         subs: u32,
         out: Arc<PcmSnapshot>,
-        wake: i32,
         report: std::ffi::CString,
         uid: u32,
         live: Arc<HelperLive>,
+        pace: Arc<PollPace>,
     ) -> std::io::Result<()> {
+        let pace2 = pace.clone();
         std::thread::Builder::new().name("sgv2-pcm".into()).spawn(move || {
             // SCHED_FIFO 10, below the loop's 70: desktop load (SCHED_OTHER)
             // cannot starve the snapshots the loop needs every tick. A
@@ -270,10 +324,10 @@ mod linux {
                 if wakes(last, now) {
                     let one: u64 = 1;
                     // SAFETY: an eventfd we own; an 8-byte counter write.
-                    unsafe { libc::write(wake, (&one as *const u64).cast(), 8) };
+                    unsafe { libc::write(pace.wake_loop, (&one as *const u64).cast(), 8) };
                 }
                 last = now;
-                sleep_until(started + PCM_POLL_NS);
+                pace.sleep(started, pace.kick_pcm);
             }
         })?;
         // The helper's liveness on its own thread: a PCM status read blocked
@@ -290,7 +344,7 @@ mod linux {
             loop {
                 let started = now_ns();
                 check_helper(&report, uid, &live, &mut hbuf);
-                sleep_until(started + PCM_POLL_NS);
+                pace2.sleep(started, pace2.kick_helper);
             }
         })?;
         Ok(())
@@ -304,8 +358,15 @@ mod linux {
         (bad(b) && !bad(a)) || (owner(b).is_some() && owner(a).is_some() && owner(a) != owner(b))
     }
 
-    /// Sleep until `deadline` or a wake from the PCM reader. True if woken.
-    fn wait_until(deadline: u64, wake: i32) -> bool {
+    /// Sleep until `deadline` or until one of `fds` (eventfds, or the
+    /// inotify watch) is readable; whatever is readable is drained. True if
+    /// woken.
+    fn wait_until(deadline: u64, fds: &[i32]) -> bool {
+        let mut pfds = [libc::pollfd { fd: -1, events: libc::POLLIN, revents: 0 }; 2];
+        let n = fds.len().min(pfds.len());
+        for (p, fd) in pfds.iter_mut().zip(fds) {
+            p.fd = *fd;
+        }
         loop {
             let now = now_ns();
             if now >= deadline {
@@ -313,15 +374,49 @@ mod linux {
             }
             let left = deadline - now;
             let ts = libc::timespec { tv_sec: (left / 1_000_000_000) as i64, tv_nsec: (left % 1_000_000_000) as i64 };
-            let mut pfd = libc::pollfd { fd: wake, events: libc::POLLIN, revents: 0 };
-            // SAFETY: one live pollfd and a valid timeout.
-            let r = unsafe { libc::ppoll(&mut pfd, 1, &ts, core::ptr::null()) };
-            if r > 0 && pfd.revents & libc::POLLIN != 0 {
-                let mut v: u64 = 0;
-                // SAFETY: clearing our eventfd's counter into a live u64.
-                unsafe { libc::read(wake, (&mut v as *mut u64).cast(), 8) };
-                return true;
+            // SAFETY: n live pollfds and a valid timeout.
+            let r = unsafe { libc::ppoll(pfds.as_mut_ptr(), n as libc::nfds_t, &ts, core::ptr::null()) };
+            if r > 0 {
+                let mut woke = false;
+                for p in &mut pfds[..n] {
+                    if p.revents & libc::POLLIN != 0 {
+                        drain(p.fd);
+                        woke = true;
+                    }
+                    p.revents = 0;
+                }
+                if woke {
+                    return true;
+                }
             }
+        }
+    }
+
+    /// Empty a non-blocking eventfd or inotify descriptor.
+    fn drain(fd: i32) {
+        let mut buf = [0u8; 512];
+        // SAFETY: reading into a live buffer from a non-blocking fd we own;
+        // an eventfd yields its 8-byte counter, inotify whole events.
+        while unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
+    }
+
+    /// A watch on the helper's directory: a new report (renamed into place)
+    /// wakes the idle loop at once. None where it cannot be watched; the
+    /// loop then keeps its 10 ms tick while idle.
+    fn watch_reports(dir: &Path) -> Option<i32> {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+        // SAFETY: plain syscalls on a descriptor we own.
+        unsafe {
+            let fd = libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC);
+            if fd < 0 {
+                return None;
+            }
+            if libc::inotify_add_watch(fd, path.as_ptr(), libc::IN_MOVED_TO | libc::IN_CLOSE_WRITE) < 0 {
+                libc::close(fd);
+                return None;
+            }
+            Some(fd)
         }
     }
 
@@ -522,6 +617,8 @@ mod linux {
     const SCHED_FLAG_KEEP_POLICY: u64 = 0x08;
     const SCHED_FLAG_KEEP_PARAMS: u64 = 0x10;
     const SCHED_FLAG_UTIL_CLAMP_MIN: u64 = 0x20;
+    /// `sched_util_min` = -1: reset the clamp to the default.
+    const UTIL_MIN_DEFAULT: u32 = u32::MAX;
 
     /// Drop this thread's utilization floor to 0, keeping its policy and
     /// priority. A real-time thread with no clamp of its own inherits
@@ -532,6 +629,13 @@ mod linux {
     /// They need the CPU on time, not fast. Failure (no uclamp support) is
     /// harmless and ignored.
     fn no_frequency_floor() {
+        set_util_min(0);
+    }
+
+    /// This thread's utilization floor: `UTIL_MIN_DEFAULT` gives it back
+    /// to the kernel's default (for a real-time thread
+    /// `sched_util_clamp_min_rt_default`). Failure is harmless and ignored.
+    fn set_util_min(util_min: u32) {
         let attr = SchedAttr {
             size: core::mem::size_of::<SchedAttr>() as u32,
             sched_policy: 0,
@@ -541,7 +645,7 @@ mod linux {
             sched_runtime: 0,
             sched_deadline: 0,
             sched_period: 0,
-            sched_util_min: 0,
+            sched_util_min: util_min,
             sched_util_max: 0,
         };
         // SAFETY: this thread's own attributes; a valid, fully initialised
@@ -665,9 +769,11 @@ mod linux {
     }
 
     /// The thermal hand-off across engine and PipeWire restarts (see the
-    /// `thermal` module): every 100 ms take the engine's `saved` record if it
-    /// is trusted, offer it in the page's `provided` slot, and persist it to
-    /// `<user dir>/thermal` (root's, 0600) at most once a second. At start,
+    /// `thermal` module): every 100 ms (every second once the engine has
+    /// published nothing new for a second: it is not running) take the
+    /// engine's `saved` record if it is trusted, offer it in the page's
+    /// `provided` slot, and persist it to `<user dir>/thermal` (root's,
+    /// 0600) at most once a second. At start,
     /// offer the persisted record if this boot, board, blob and geometry
     /// match and it is at most ten minutes old. Normal priority, off the RT
     /// loop.
@@ -707,9 +813,13 @@ mod linux {
             let tmp = file.with_extension("new");
             let mut last_stamp = 0u64;
             let mut last_write = 0u64;
+            let (mut seen, mut seen_at) = (0u64, now());
             loop {
                 let h = page.header();
                 if let Some((rec, stamp)) = h.saved.read() {
+                    if stamp != seen {
+                        (seen, seen_at) = (stamp, now());
+                    }
                     let ok = trusted(
                         &rec,
                         &engine_header,
@@ -741,7 +851,8 @@ mod linux {
                         }
                     }
                 }
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                let quiet = now().saturating_sub(seen_at) >= 1_000_000_000;
+                std::thread::sleep(std::time::Duration::from_millis(if quiet { 1000 } else { 100 }));
             }
         });
     }
@@ -965,20 +1076,32 @@ mod linux {
 
         let snapshot = Arc::new(PcmSnapshot::default());
         let live = Arc::new(HelperLive::default());
-        // SAFETY: a plain eventfd, non-blocking and close-on-exec.
-        let wake = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
-        if wake < 0 {
-            eprintln!("eventfd: {}", std::io::Error::last_os_error());
-            return EX_UNAVAILABLE;
+        let poll_pace = match PollPace::new() {
+            Ok(p) => Arc::new(p),
+            Err(e) => {
+                eprintln!("eventfd: {e}");
+                return EX_UNAVAILABLE;
+            }
+        };
+        let reports = watch_reports(&helper);
+        if reports.is_none() {
+            eprintln!("cannot watch {}: the loop keeps its 10 ms tick while idle", helper.display());
         }
         // before SCHED_FIFO: the reader runs at normal priority
         let pcm_dir = format!("/proc/asound/card{index}/pcm{pcm}p");
-        if let Err(e) =
-            spawn_pcm_reader(pcm_dir, info.subdevices, snapshot.clone(), wake, session_path.clone(), uid, live.clone())
-        {
+        if let Err(e) = spawn_pcm_reader(
+            pcm_dir,
+            info.subdevices,
+            snapshot.clone(),
+            session_path.clone(),
+            uid,
+            live.clone(),
+            poll_pace.clone(),
+        ) {
             eprintln!("PCM reader: {e}");
             return EX_UNAVAILABLE;
         }
+        let wake = poll_pace.wake_loop;
         // SAFETY: process-wide calls; failure is tolerated and logged.
         unsafe {
             if libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE) != 0 {
@@ -1022,6 +1145,9 @@ mod linux {
         // grants that keep ending in a fault at once are spaced out
         let mut regrant = Regrant::default();
         let mut held_off = false;
+        // nothing plays: slow pollers and loop (see `pace`)
+        let mut pace = Pace::default();
+        let mut idle_ready_said = false;
         loop {
             let (s, n) = (suspended_ns(), sleeps());
             if s > suspended.saturating_add(1_000_000) || n != slept {
@@ -1041,6 +1167,9 @@ mod linux {
                 }
             }
             let obs = if holding { Observation { demand: false, ..obs } } else { obs };
+            // a demand seen while idle wakes the pollers first; it counts
+            // from the next tick
+            let obs = Observation { demand: pace.demand(obs.demand), ..obs };
             if observer.waiting_after_sleep() != waiting_after_sleep {
                 waiting_after_sleep = observer.waiting_after_sleep();
                 eprintln!(
@@ -1169,22 +1298,61 @@ mod linux {
                 }
                 last_problem = sup.problem().map(str::to_owned);
             }
+            // The pace: idle after a quiet spell, full rate on a demand or
+            // a grant. Idle, the loop also drops its frequency floor: a
+            // real-time thread inherits the kernel's RT default (1024), and
+            // schedutil then raises the cluster to its top step on every
+            // tick, for nothing to do. With a stream it keeps the default.
+            let mut woke = false;
+            match pace.after_tick(now_ns(), sup.granted() || demand_seen) {
+                Change::Idle => {
+                    poll_pace.set_idle(true);
+                    set_util_min(0);
+                }
+                Change::Active => {
+                    poll_pace.set_idle(false);
+                    set_util_min(UTIL_MIN_DEFAULT);
+                    idle_ready_said = false;
+                    woke = true;
+                }
+                Change::None => {}
+            }
+            // Idle, the protect stage stops with the last stream, so there is
+            // no heartbeat to prove; that every other check holds is said once.
+            let idle_ok = card_ok && obs.plugin_ok && obs.links_ok && obs.carrier_ok;
+            if pace.idle() && idle_ok && !idle_ready && !idle_ready_said {
+                eprintln!("protection ready: every check holds; the protect stage idles until a stream starts");
+                idle_ready_said = true;
+            }
+            let slow = pace.idle() && reports.is_some();
+            let tick_ns = if slow { pace::IDLE_TICK_NS } else { TICK_NS };
             if scheduled {
-                if ticks % 20 == 0 {
-                    // every 200 ms: systemd and the hang watch
+                if slow || ticks % 20 == 0 {
+                    // every 200 ms (every idle tick): systemd and the hang watch
                     alive(&notify);
                 }
                 ticks += 1;
-                deadline += TICK_NS;
+                deadline += tick_ns;
                 let now = now_ns();
-                if now > deadline + TICK_NS {
+                if now > deadline + tick_ns {
                     // overran by more than a tick: resynchronise, never burst
                     deadline = now;
                 }
             }
-            // an extra tick when the PCM reader wakes us; the 10 ms deadlines
-            // are unchanged
-            scheduled = !wait_until(deadline, wake);
+            if woke {
+                // the woken pollers read now; tick once they have
+                deadline = now_ns() + pace::WAKE_TICK_NS;
+            }
+            // an extra tick when the PCM reader (or, idle, a new report)
+            // wakes us; the deadlines are unchanged
+            scheduled = match reports {
+                Some(r) if slow => !wait_until(deadline, &[wake, r]),
+                Some(r) => {
+                    drain(r);
+                    !wait_until(deadline, &[wake])
+                }
+                None => !wait_until(deadline, &[wake]),
+            };
         }
     }
 
