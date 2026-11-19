@@ -24,6 +24,7 @@ mod model;
 mod startup;
 mod state;
 mod stats;
+mod tlv;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -39,8 +40,6 @@ use log::Level;
 /// The value the card's "Speaker Volume Unlock" control expects: the kernel
 /// compares the written long with (s32)0xdec1be15.
 const UNLOCK_MAGIC: i64 = 0xdec1be15u32 as i32 as i64;
-/// Volume control steps per dB (t8140-aop-audio: 0.5 dB steps).
-const STEPS_PER_DB: f64 = 2.0;
 
 /// The version and the source it was built from (the Makefile and the
 /// packaging set SPEAKERGUARDD_COMMIT at build time), for `--version` and
@@ -132,6 +131,9 @@ struct Card {
     /// The most they accept while the volume is locked (macaudio limits
     /// the range to the card's safe level), read when the lock is taken.
     locked_max: Option<i64>,
+    /// Control values per dB, from the volume controls' own dB scale
+    /// (TLV): the attenuation is written in these steps.
+    steps_per_db: f64,
     unlock: ElemId,
     sample_rate: ElemId,
     /// Subscribed to the card's change events: the sample-rate control's
@@ -148,6 +150,14 @@ impl Card {
         if volume.is_empty() {
             return Err(format!("card {name} has no {:?} control", cfg.controls.volume).into());
         }
+        // The protective arithmetic is in control steps: their size is the
+        // card's, read from the controls.  No usable dB scale, and the lock
+        // is never taken (the speakers stay at the card's safe level).
+        let names: Vec<String> = volume.iter().map(ElemId::name).collect();
+        let tlvs: Vec<_> = volume.iter().map(|id| ctl.tlv(id)).collect();
+        let step = tlv::volume_step(&names, &tlvs).map_err(|e| format!("card {name}: refusing to protect speakers whose volume step is unknown: {e}"))?;
+        info!("{name}: volume step {:.2} dB{}", step.centi_db as f64 / 100.0, if step.mute_at_min { ", minimum mutes" } else { "" });
+        let steps_per_db = step.steps_per_db();
         let unlock = ctl.find_one(&cfg.controls.unlock)?;
         let sample_rate = ctl.find_one(&cfg.controls.sample_rate)?;
         let events = match ctl.subscribe() {
@@ -157,7 +167,7 @@ impl Card {
                 false
             }
         };
-        Ok((Card { ctl, volume, volume_max: None, volume_min: 0, locked_max: None, unlock, sample_rate, events, rate_event: false }, name))
+        Ok((Card { ctl, volume, volume_max: None, volume_min: 0, locked_max: None, steps_per_db, unlock, sample_rate, events, rate_event: false }, name))
     }
 
     /// Take the interlock: every volume control first, then the unlock
@@ -223,11 +233,11 @@ impl Card {
         let max = self.volume_max.ok_or_else(|| std::io::Error::from_raw_os_error(libc::EAGAIN))?;
         // round the reduction up to the control's step: the card never
         // applies less than the model asked for
-        let value = (max as f64 - (db * STEPS_PER_DB - 1e-9).ceil()).max(self.volume_min as f64) as i64;
+        let value = tlv::reduction_value(max, self.volume_min, db, self.steps_per_db);
         for id in &self.volume {
             self.ctl.write_int(id, value)?;
         }
-        Ok((max - value) as f64 / STEPS_PER_DB)
+        Ok(tlv::value_reduction(max, value, self.steps_per_db))
     }
 }
 
@@ -286,7 +296,7 @@ impl Hw for RealHw {
         self.timed(stats::Call::Write, |h| h.card.write_reduction(db))
     }
     fn step_db(&self) -> f64 {
-        1.0 / STEPS_PER_DB
+        1.0 / self.card.steps_per_db
     }
     fn set_safe(&mut self) -> std::io::Result<f64> {
         let safe = self.globals.safe_reduction;
@@ -294,7 +304,7 @@ impl Hw for RealHw {
     }
     fn card_safe_db(&self) -> Option<f64> {
         let (max, locked) = (self.card.volume_max?, self.card.locked_max?);
-        Some((max - locked) as f64 / STEPS_PER_DB)
+        Some(tlv::value_reduction(max, locked, self.card.steps_per_db))
     }
     fn relinquish(&mut self) -> std::io::Result<()> {
         self.stats.released();

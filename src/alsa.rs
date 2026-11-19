@@ -118,6 +118,12 @@ const CTL_IOCTL_ELEM_WRITE: libc::c_ulong = iowr::<ElemValue>(b'U', 0x13);
 const CTL_IOCTL_ELEM_LOCK: libc::c_ulong = iow::<ElemId>(b'U', 0x14);
 const CTL_IOCTL_ELEM_UNLOCK: libc::c_ulong = iow::<ElemId>(b'U', 0x15);
 const CTL_IOCTL_SUBSCRIBE_EVENTS: libc::c_ulong = iowr::<libc::c_int>(b'U', 0x16);
+/// `struct snd_ctl_tlv` is the numid and the buffer length (bytes) ahead of
+/// the TLV words; the request's size is the header's.
+const CTL_IOCTL_TLV_READ: libc::c_ulong = iowr::<[u32; 2]>(b'U', 0x1a);
+/// TLV words read at most (a dB scale is 4; a range of several, a few
+/// dozen).
+const TLV_MAX_WORDS: usize = 256;
 
 /// `struct snd_ctl_event` for SNDRV_CTL_EVENT_ELEM: the mask and the id.
 #[repr(C)]
@@ -233,6 +239,21 @@ impl Ctl {
         let min = i64::from_ne_bytes(info.value[0..8].try_into().unwrap());
         let max = i64::from_ne_bytes(info.value[8..16].try_into().unwrap());
         Ok((min, max))
+    }
+
+    /// The control's TLV (type, length in bytes, payload), as words.  A
+    /// control without one fails with the kernel's ENXIO.
+    pub fn tlv(&self, id: &ElemId) -> io::Result<Vec<u32>> {
+        let mut buf = vec![0u32; 2 + TLV_MAX_WORDS];
+        buf[0] = id.numid;
+        buf[1] = (TLV_MAX_WORDS * 4) as u32;
+        ioctl(&self.file, CTL_IOCTL_TLV_READ, buf.as_mut_ptr())?;
+        let mut words = buf.split_off(2);
+        // the kernel copies the item (its two header words and payload)
+        // and leaves the rest of the buffer as it was
+        let len = 2 + (words.get(1).copied().unwrap_or(0) as usize).div_ceil(4);
+        words.truncate(len.min(TLV_MAX_WORDS));
+        Ok(words)
     }
 
     /// Take the element lock: only this file descriptor may write it now.
@@ -643,6 +664,7 @@ mod tests {
         assert_eq!(PCM_IOCTL_DELAY, 0x8008_4121);
         assert_eq!(CTL_IOCTL_SUBSCRIBE_EVENTS, 0xc004_5516);
         assert_eq!(CTL_IOCTL_ELEM_UNLOCK, 0x4040_5515);
+        assert_eq!(CTL_IOCTL_TLV_READ, 0xc008_551a);
         assert_eq!(std::mem::size_of::<CtlEvent>(), 72);
     }
 }
