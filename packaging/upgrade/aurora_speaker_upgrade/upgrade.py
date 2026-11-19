@@ -471,6 +471,24 @@ def systemctl(*args):
     return run(["systemctl", *args])
 
 
+def starts_at_boot(unit):
+    """Whether the boot starts `unit`: it is enabled (a link in /etc, from
+    `systemctl enable` or a preset), or a target pulls it in through a link the
+    package ships in /usr/lib (Arch: pacman applies no presets, and
+    `systemctl is-enabled` says "disabled" there). Never a masked unit. The
+    same test as speakerguardd-provision's."""
+    if systemctl("is-enabled", "-q", unit).returncode == 0:
+        return True
+    r = systemctl("show", "--property=LoadState", "--property=UnitFileState",
+                  "--property=WantedBy", "--property=RequiredBy", unit)
+    if r.returncode != 0:
+        return False
+    props = dict(line.split("=", 1) for line in r.stdout.splitlines() if "=" in line)
+    if props.get("LoadState") != "loaded" or props.get("UnitFileState", "").startswith("masked"):
+        return False
+    return bool(props.get("WantedBy", "").split() or props.get("RequiredBy", "").split())
+
+
 def v2_unit():
     """The v2 supervisor's unit: the distributions name it
     speakerguardd-v2.service beside speakerguardd 0.1; upstream names it
@@ -961,7 +979,8 @@ def back_to_legacy(store, state, mode, card):
     else:
         # A fleet kernel (v2 interface only): the stack that ran before
         # (speakerguardd v2 with the installer's bundle, or nothing) again.
-        systemctl("restart", v2_unit()) if systemctl("is-enabled", "-q", v2_unit()).returncode == 0 else None
+        if starts_at_boot(v2_unit()):
+            systemctl("restart", v2_unit())
 
 
 def cmd_revert(a):
