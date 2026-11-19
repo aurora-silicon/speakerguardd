@@ -11,7 +11,8 @@
 //!     missing or short list is a fault, never "no faults");
 //!   - the operating point (KERNEL.md 2.3): every amp's analog gain, read
 //!     back with its dB scale, is the full-scale voltage the parameter blob
-//!     was compiled for, before every grant and on every tick;
+//!     was compiled for, within half that control's own TLV step (at most
+//!     0.25 dB), before every grant and on every tick;
 //! - any fault releases at once (no waiting for the lease to run out);
 //! - a hard amp fault (over-temperature, over-current, group off), or a
 //!   granted card whose amps are not at the operating volume, releases and
@@ -27,7 +28,9 @@
 
 use crate::kernel::{Kernel, KernelError, GAIN_CONTROL_SUFFIX};
 use crate::lease::{Action, Lease, Observation};
-use crate::machine::{full_scale_mv, same_operating_point, Amp, Machine};
+use crate::machine::{
+    full_scale_mv, gain_tolerance_db, same_operating_point_within, Amp, Machine, OPERATING_POINT_TOLERANCE_DB,
+};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Event {
@@ -109,7 +112,7 @@ impl Supervisor {
             Some(r) if r == x.route => {}
             r => return Ok(Some(format!("the speaker mux selects {r:?}, not \"{}\"", x.route))),
         }
-        let measured = if x.amp.has_gain_control() {
+        let (measured, tolerance) = if x.amp.has_gain_control() {
             let gains = kernel.levels(GAIN_CONTROL_SUFFIX)?;
             if gains.len() != x.amps {
                 return Ok(Some(format!("amp gain on {} of {} amps", gains.len(), x.amps)));
@@ -118,14 +121,26 @@ impl Supervisor {
             if let Some(g) = gains.iter().find(|g| g.centi_db != Some(db)) {
                 return Ok(Some(format!("{} gain {:?} cdB differs from {db} cdB", g.amp, g.centi_db)));
             }
-            full_scale_mv(db)
+            // the match is held to half the gain control's own step, read
+            // from its TLV: a card without a fixed step is not granted
+            let Some(step) = gains[0].step_centi_db else {
+                return Ok(Some("amp gain has no fixed dB step".into()));
+            };
+            if let Some(g) = gains.iter().find(|g| g.step_centi_db != Some(step)) {
+                return Ok(Some(format!("{} gain step {:?} cdB differs from {step} cdB", g.amp, g.step_centi_db)));
+            }
+            let Some(tolerance) = gain_tolerance_db(step) else {
+                return Ok(Some(format!("amp gain step {step} cdB")));
+            };
+            (full_scale_mv(db), tolerance)
         } else {
-            f64::from(x.fixed_full_scale_mv)
+            (f64::from(x.fixed_full_scale_mv), OPERATING_POINT_TOLERANCE_DB)
         };
         if x.full_scale_mv.len() != x.amps {
             return Ok(Some(format!("{} channel full scales for {} amps", x.full_scale_mv.len(), x.amps)));
         }
-        if let Some((c, mv)) = x.full_scale_mv.iter().enumerate().find(|(_, mv)| !same_operating_point(measured, **mv))
+        if let Some((c, mv)) =
+            x.full_scale_mv.iter().enumerate().find(|(_, mv)| !same_operating_point_within(measured, **mv, tolerance))
         {
             return Ok(Some(format!(
                 "operating point {measured:.0} mV full scale, the parameters assume {mv} mV (channel {c})"
@@ -465,7 +480,7 @@ mod tests {
         fn levels(&mut self, suffix: &str) -> Result<Vec<AmpLevel>, KernelError> {
             let mut v = self.0.levels(suffix)?;
             if suffix == GAIN_CONTROL_SUFFIX {
-                v[3] = AmpLevel { amp: "Amp 3".into(), value: 14, centi_db: Some(1800) };
+                v[3] = AmpLevel { amp: "Amp 3".into(), value: 14, centi_db: Some(1800), step_centi_db: Some(50) };
             }
             Ok(v)
         }
@@ -498,6 +513,96 @@ mod tests {
             assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::StayedReleased));
         }
         assert!(s.problem().unwrap().contains("Amp 3"));
+    }
+
+    /// The operating-point match is held to half the gain control's own
+    /// TLV step. At 0.5 dB (every tas2764/tas2770 card today) it grants and
+    /// refuses exactly as the fixed 0.25 dB did; a gain without a readable
+    /// fixed step, or amps that disagree on it, never grant.
+    #[test]
+    fn the_gain_match_uses_the_controls_own_step() {
+        // 0.5 dB a step: the J316s/J413/J616s shape grants as before
+        let mut k = Recorder::healthy(6);
+        let mut s = j316();
+        s.tick(CLEAN, &mut k).unwrap();
+        assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Granted));
+        // a 0.25 dB-step card one setting below the blob's gain (18.25
+        // dBV, 0.243 dB under 11.89 V): inside the old fixed 0.25 dB, but
+        // it is another gain setting, so it is refused now
+        let mut k = Recorder::healthy(6);
+        k.step_centi_db = Some(25);
+        k.gain = Some((29, 1825));
+        let mut s = j316();
+        for _ in 0..4 {
+            assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::StayedReleased));
+        }
+        assert!(s.problem().unwrap().contains("operating point"), "{:?}", s.problem());
+        assert_eq!(k.renewals, 0);
+        // the same card at the blob's own gain grants
+        k.gain = Some((30, 1850));
+        let mut s = j316();
+        s.tick(CLEAN, &mut k).unwrap();
+        assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Granted));
+        // no fixed step (no DB_SCALE TLV): refused before any grant
+        let mut k = Recorder::healthy(6);
+        k.step_centi_db = None;
+        let mut s = j316();
+        for _ in 0..4 {
+            assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::StayedReleased));
+        }
+        assert!(s.problem().unwrap().contains("no fixed dB step"), "{:?}", s.problem());
+        assert_eq!(k.renewals, 0);
+        // a grant held while the step stops reading releases at once
+        let mut k = Recorder::healthy(6);
+        let mut s = j316();
+        s.tick(CLEAN, &mut k).unwrap();
+        assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Granted));
+        k.step_centi_db = None;
+        assert!(matches!(s.tick(CLEAN, &mut k), Ok(Event::Released { .. })));
+        assert!(!k.held);
+        // one amp on another step
+        struct OtherStep(Recorder);
+        impl Kernel for OtherStep {
+            fn renew(&mut self) -> Result<(), KernelError> {
+                self.0.renew()
+            }
+            fn release(&mut self) -> Result<(), KernelError> {
+                self.0.release()
+            }
+            fn granted(&mut self) -> Result<bool, KernelError> {
+                self.0.granted()
+            }
+            fn faults(&mut self) -> Result<Vec<AmpFault>, KernelError> {
+                self.0.faults()
+            }
+            fn levels(&mut self, suffix: &str) -> Result<Vec<AmpLevel>, KernelError> {
+                let mut v = self.0.levels(suffix)?;
+                if suffix == GAIN_CONTROL_SUFFIX {
+                    v[2].step_centi_db = Some(100);
+                }
+                Ok(v)
+            }
+            fn speaker_route(&mut self) -> Result<Option<String>, KernelError> {
+                self.0.speaker_route()
+            }
+        }
+        let mut k = OtherStep(Recorder::healthy(6));
+        let mut s = j316();
+        for _ in 0..4 {
+            assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::StayedReleased));
+        }
+        assert!(s.problem().unwrap().contains("Amp 2 gain step"), "{:?}", s.problem());
+        // the J700 (no gain control) is unaffected: its channels are
+        // checked against the blob's own full scale as before
+        let mut k = Recorder::healthy(2);
+        k.amp_faults.clear();
+        k.gain = None;
+        k.step_centi_db = None;
+        k.amps = vec![String::new()];
+        k.volume = Some(("Speaker Playback Volume".into(), (127, Some(0)), (87, Some(-2000))));
+        let mut s = Supervisor::new(Expect::new(fixed2(), vec![7_300, 7_330], "Secondary"));
+        s.tick(CLEAN, &mut k).unwrap();
+        assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Granted));
     }
 
     #[test]
