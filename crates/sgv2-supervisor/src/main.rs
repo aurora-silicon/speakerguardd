@@ -41,6 +41,11 @@
 //!   every 250 ms or when the helper renames a new report into place, and
 //!   the loop drops its frequency floor. A demand wakes everything to full
 //!   rate before it can lead to a grant.
+//! - When only the engine's heartbeat goes stale under a grant, it stops
+//!   renewing and asks the session helper to unlink the amps first
+//!   (`/run/speakerguardd/<uid>/unlink`, renamed into place), then
+//!   releases on the helper's answer or when the lease runs out, whichever
+//!   is first (see `supervise`).
 //! - Exits on losing ownership or any kernel error: closing the control file
 //!   withdraws protection at once.
 //!
@@ -75,7 +80,7 @@ mod linux {
     };
     use sgv2_supervisor::pace::{self, Change, Pace};
     use sgv2_supervisor::selfcheck;
-    use sgv2_supervisor::supervise::{Event, Expect, Fatal, Supervisor};
+    use sgv2_supervisor::supervise::{Event, Expect, Fatal, Order, Supervisor};
 
     const TICK_NS: u64 = 10_000_000;
     /// How long the speaker PCM runs before the plugin lets a wake's held
@@ -857,6 +862,19 @@ mod linux {
         });
     }
 
+    /// Ask the session helper to unlink the amps now: one line naming the
+    /// time of the request, renamed into place in the user's directory
+    /// (which the helper watches), so the helper reads a whole request or
+    /// none. A tmpfs write and a rename, on a fault tick only. Best effort:
+    /// the release follows within the lease whether or not it lands.
+    fn ask_unlink(dir: &Path, now: u64) -> bool {
+        let tmp = dir.join(".unlink.new");
+        std::fs::write(&tmp, format!("mono_ns={now}\n"))
+            .and_then(|()| std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)))
+            .and_then(|()| std::fs::rename(&tmp, dir.join("unlink")))
+            .is_ok()
+    }
+
     /// The helper's own directory: the user's, group root, setgid, 02750,
     /// so its reports (created 0640) are readable by the supervisor through
     /// the group, without CAP_DAC_OVERRIDE.
@@ -1002,8 +1020,10 @@ mod linux {
             eprintln!("helper directory: {e}");
             return EX_UNAVAILABLE;
         }
-        // the in-place report and the granted flag of earlier versions
+        // the in-place report and the granted flag of earlier versions, and
+        // an unlink request from an earlier run
         let _ = std::fs::remove_file(user_dir.join("session"));
+        let _ = std::fs::remove_file(user_dir.join("unlink"));
         let _ = std::fs::remove_file(run_dir.join("granted"));
         let _ = std::fs::remove_file(run_dir.join(".granted.new"));
         let Ok(session_path) = std::ffi::CString::new(helper.join("session").to_string_lossy().into_owned()) else {
@@ -1142,6 +1162,8 @@ mod linux {
         let mut suspended = suspended_ns();
         let mut slept = sleeps();
         let mut waiting_after_sleep = false;
+        // after a fault release that rebuilt the graph (see observe)
+        let mut graph_settling = false;
         // grants that keep ending in a fault at once are spaced out
         let mut regrant = Regrant::default();
         let mut held_off = false;
@@ -1181,6 +1203,15 @@ mod linux {
                     }
                 );
             }
+            if observer.graph_settling() != graph_settling {
+                graph_settling = observer.graph_settling();
+                if !graph_settling {
+                    eprintln!(
+                        "the engine has beaten steadily for {} ms since the graph changed",
+                        sgv2_supervisor::observe::GRAPH_SETTLE_NS / 1_000_000
+                    );
+                }
+            }
             let event = sup.tick(obs, &mut kernel);
             // the observer leaves the kernel-side checks to the supervisor,
             // which records any failure as its problem
@@ -1202,13 +1233,35 @@ mod linux {
                     regrant.granted(now_ns());
                     eprintln!("protection granted");
                 }
-                Ok(Event::Released { why }) => {
-                    let session = observer.session_why();
+                Ok(Event::Withdrawing { first: true }) => {
+                    let now = now_ns();
+                    observer.note_unlink_request(now);
+                    let asked = ask_unlink(&user_dir, now);
                     let (pcm, age) = observer.last_tick();
                     eprintln!(
-                        "protection released: {why:?}{}{session} (pcm {pcm:?}, engine beat {age:?} ms ago)",
+                        "engine heartbeat stale (pcm {pcm:?}, engine beat {age:?} ms ago): lease not renewed, {}",
+                        if asked {
+                            "the session helper unlinks the amps before the release"
+                        } else {
+                            "the unlink request could not be written; released when the lease ends"
+                        }
+                    );
+                }
+                Ok(Event::Released { why, order }) => {
+                    let session = observer.session_why();
+                    let (pcm, age) = observer.last_tick();
+                    let order = match order {
+                        Order::AtOnce => "",
+                        Order::Unlinked => " after the session helper unlinked the amps",
+                        Order::Deadline => " at the lease's end (the session helper had not unlinked the amps)",
+                        Order::Escalated => " at once (another check failed while the amps were being unlinked)",
+                        Order::Closed => " (the speaker PCM closed while the amps were being unlinked)",
+                    };
+                    eprintln!(
+                        "protection released{order}: {why:?}{}{session} (pcm {pcm:?}, engine beat {age:?} ms ago)",
                         if session.is_empty() { "" } else { "; session: " }
                     );
+                    observer.note_fault_release(&why);
                     if let Some(hold) = regrant.released(now_ns(), true) {
                         eprintln!(
                             "{} grants in a row ended within {} ms: next grant held off {} ms",
@@ -1237,7 +1290,9 @@ mod linux {
             // settle (the plugin holds a wake's first frames until then);
             // from then until the grant ends, whatever the PCM does.
             let now = now_ns();
-            if !sup.granted() {
+            // the kernel may still grant while an ordered release waits:
+            // the plugin keeps modelling the amps as playing until it ends
+            if !sup.granted() && !sup.withdrawing() {
                 running_since = None;
                 amps_playing = false;
             } else if !amps_playing && matches!(pcm_view.read(), PcmState::Running { .. }) {
@@ -1304,7 +1359,7 @@ mod linux {
             // schedutil then raises the cluster to its top step on every
             // tick, for nothing to do. With a stream it keeps the default.
             let mut woke = false;
-            match pace.after_tick(now_ns(), sup.granted() || demand_seen) {
+            match pace.after_tick(now_ns(), sup.granted() || sup.withdrawing() || demand_seen) {
                 Change::Idle => {
                     poll_pace.set_idle(true);
                     set_util_min(0);

@@ -37,6 +37,13 @@ pub struct Observation {
     /// A client stream plays into the protect stage (the session helper's
     /// fresh report). Not a check: without it a clean tick is idle.
     pub demand: bool,
+    /// The session helper reports nothing linked into the amps' sink, in a
+    /// fresh report written since the supervisor asked it to unlink them
+    /// (see `supervise`'s ordered release). Not a check.
+    pub amps_unlinked: bool,
+    /// The speaker PCM is open by the engine's process (Open, Running, or in
+    /// an XRUN): the amps' sink is up. Not a check.
+    pub pcm_engine: bool,
 }
 
 impl Observation {
@@ -182,6 +189,8 @@ mod tests {
         route_ok: true,
         amps_ok: true,
         demand: true,
+        amps_unlinked: false,
+        pcm_engine: true,
     };
 
     #[test]

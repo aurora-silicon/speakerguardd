@@ -34,7 +34,15 @@ It runs in the user's session, beside PipeWire, and does three things:
    while the amps are unlinked) and a fresh report; this helper links the
    amps only once the kernel reads granted; the amps' sink then starts. On
    any withdrawal it unlinks the amps, the sink stops and closes, and the
-   sequence starts again. While the speakers are wanted (`play=1`, and one
+   sequence starts again. When the supervisor releases on its own account
+   (the engine's heartbeat went stale: WirePlumber restarted, the graph is
+   being rebuilt) it first stops renewing and asks for the unlink, by
+   renaming a request into /run/speakerguardd/<uid>/unlink; this helper
+   unlinks the amps and the sense at once, reports `amps=0` as soon as they
+   are, and keeps them unlinked until the kernel reads the withdrawal
+   (at most UNLINK_HOLD_S). The supervisor releases on that report or when
+   its lease runs out, whichever is first, so the amps' sink is no longer
+   running when the kernel refuses its starts. While the speakers are wanted (`play=1`, and one
    report beyond) it also links the protect stage's output to the hold, a
    sink with no device: that keeps the stage running when a short stream
    ends before the grant (its first frames are still held for the amps) and
@@ -72,6 +80,7 @@ It reads the graph from `pw-dump --monitor` and makes or removes links with
 `pw-link`. It never touches the amps' volume: the kernel owns it.
 """
 import argparse
+import ctypes
 import fcntl
 import json
 import os
@@ -106,6 +115,15 @@ SELFCHECK_ACTIVE = "/run/speakerguardd-selfcheck/active"
 # and the sense are unlinked and suspended (their PCMs close) before the
 # supervisor stops, and stay so until the resume clears it.
 SLEEP_HOLD = "/run/speakerguardd-sleep/hold"
+# The supervisor's request to unlink the amps before it releases (4).
+UNLINK_REQUEST = "/run/speakerguardd/{uid}/unlink"
+# A request read later than this after it was made is old news: the
+# supervisor's release has followed it within its 30 ms lease.
+UNLINK_FRESH_S = 0.100
+# How long a request keeps the amps unlinked while the kernel still reads
+# granted (the release follows within the lease, and its control event ends
+# the hold at once).
+UNLINK_HOLD_S = 0.250
 # The voicing sink's channel volume on a first start with nothing stored:
 # 30 % on a cubic desktop slider (0.3 ** 3).
 FIRST_START_VOLUME = 0.027
@@ -181,6 +199,98 @@ class Card:
         if os.path.exists(SELFCHECK_ACTIVE) or os.path.exists(SLEEP_HOLD):
             return False
         return struct.unpack_from("q", buf, 72)[0] == 1
+
+
+_IN_CLOSE_WRITE = 0x08
+_IN_MOVED_TO = 0x80
+_INOTIFY_EVENT = struct.Struct("iIII")
+
+
+def inotify_names(buf):
+    """The file names in a buffer of inotify events."""
+    names, off = [], 0
+    while off + _INOTIFY_EVENT.size <= len(buf):
+        _, _, _, n = _INOTIFY_EVENT.unpack_from(buf, off)
+        off += _INOTIFY_EVENT.size
+        names.append(bytes(buf[off:off + n]).split(b"\0", 1)[0].decode(errors="replace"))
+        off += n
+    return names
+
+
+class UnlinkRequests:
+    """The supervisor's requests to unlink the amps before it releases.
+
+    Each is one line, `mono_ns=<t>` (CLOCK_MONOTONIC of the request), renamed
+    into place, so a read sees a whole request or the one before. The
+    directory is watched (inotify) so a request is served at once, not at the
+    next period; where it cannot be watched the file is read every period.
+    """
+
+    def __init__(self, path, watch=True):
+        self.path = path
+        self.fd = None
+        self.seen = None
+        self.until = None
+        if watch:
+            self.fd = self._watch(os.path.dirname(path))
+
+    @staticmethod
+    def _watch(d):
+        try:
+            libc = ctypes.CDLL(None, use_errno=True)
+            fd = libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
+            if fd < 0:
+                return None
+            if libc.inotify_add_watch(fd, d.encode(), _IN_MOVED_TO | _IN_CLOSE_WRITE) < 0:
+                os.close(fd)
+                return None
+            return fd
+        except (OSError, AttributeError):
+            return None
+
+    def touched(self):
+        """Drain the watch: True if the request file was (re)placed."""
+        hit = False
+        while True:
+            try:
+                buf = os.read(self.fd, 4096)
+            except (BlockingIOError, OSError):
+                return hit
+            if not buf:
+                return hit
+            hit |= os.path.basename(self.path) in inotify_names(buf)
+
+    def take(self, now_ns, now):
+        """Read the request file: True for a new request made at most
+        UNLINK_FRESH_S ago, which starts the hold (`now`, time.monotonic())."""
+        try:
+            with open(self.path, "rb") as f:
+                line = f.read(64)
+        except OSError:
+            return False
+        try:
+            k, v = line.decode().strip().split("=", 1)
+            t = int(v) if k == "mono_ns" else None
+        except (ValueError, UnicodeDecodeError):
+            t = None
+        if t is None or t == self.seen:
+            return False
+        self.seen = t
+        if not 0 <= now_ns - t <= UNLINK_FRESH_S * 1e9:
+            return False
+        self.until = now + UNLINK_HOLD_S
+        return True
+
+    def granted(self, card_granted, now):
+        """The grant as the links follow it: withdrawn while a request
+        holds. The kernel's withdrawal ends the hold."""
+        if not card_granted:
+            self.until = None
+            return False
+        if self.until is not None and now < self.until:
+            return False
+        self.until = None
+        return True
 
 
 class Graph:
@@ -820,20 +930,26 @@ def main():
     s = Session(args.machine, c)
     report = f"/run/speakerguardd/{os.getuid()}/helper/session"
 
+    req = UnlinkRequests(UNLINK_REQUEST.format(uid=os.getuid()))
+
     def stop(*_):
-        # a stopped helper leaves no report behind (the supervisor releases
-        # at once), and no amps or sense linked, so the sink does not keep
-        # retrying a refused start until PipeWire restarts; the unlink is
-        # bounded to 1 s
-        try:
-            os.unlink(report)
-        except OSError:
-            pass
+        # a stopped helper leaves no amps or sense linked, so the sink does
+        # not keep retrying a refused start until PipeWire restarts, and no
+        # report behind (the supervisor releases at once). The unlink comes
+        # first, bounded to 1 s, so the release finds the amps' sink
+        # already stopped.
         try:
             s.unlink_all(g, 1.0)
         except Exception as e:  # noqa: BLE001 - shutting down regardless
             log(f"unlink on stop: {e}")
+        try:
+            os.unlink(report)
+        except OSError:
+            pass
         raise SystemExit(0)
+
+    def card_granted():
+        return req.granted(card.granted(), time.monotonic())
 
     realtime()
     signal.signal(signal.SIGTERM, stop)
@@ -841,23 +957,35 @@ def main():
     last = (None, None, None, None, None)
     was_granted = None
     play = False
+    amps = None
     nxt = time.monotonic()
     while True:
-        ready = g.pump(max(0.0, nxt - time.monotonic()), [card.fd] if card.events else [])
-        if ready and card.drain():
+        fds = ([card.fd] if card.events else []) + ([req.fd] if req.fd is not None else [])
+        ready = g.pump(max(0.0, nxt - time.monotonic()), fds)
+        if (req.fd in ready and req.touched()) or (req.fd is None and time.monotonic() >= nxt):
+            if req.take(time.monotonic_ns(), time.monotonic()):
+                # the supervisor releases next: unlink the amps and the
+                # sense now, while the kernel still grants
+                s.reconcile(g, False, play)
+                was_granted = False
+                log("the supervisor releases: amps and sense unlinked first")
+        if card.fd in ready and card.drain():
             # a grant or a withdrawal: link or unlink now
-            granted = card.granted()
+            granted = card_granted()
             if granted != was_granted:
                 s.reconcile(g, granted, play)
                 was_granted = granted
         if time.monotonic() < nxt:
-            # event-driven: a link, carrier or playback change is reported
-            # at once, not at the next period
-            if ready is not None and (s.check(g) != last[1:3] or s.want(g, time.monotonic()) != play):
+            # event-driven: a link, carrier, amps or playback change is
+            # reported at once, not at the next period (the supervisor's
+            # ordered release waits for amps=0)
+            if ready is not None and (
+                s.check(g) != last[1:3] or s.amps_linked(g) != amps or s.want(g, time.monotonic()) != play
+            ):
                 nxt = time.monotonic()
             else:
                 continue
-        granted = card.granted()
+        granted = card_granted()
         now = time.monotonic()
         play = s.want(g, now)
         links, carrier = s.check(g)

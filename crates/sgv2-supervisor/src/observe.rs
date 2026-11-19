@@ -127,6 +127,23 @@
 //! after the grant. RUNNING, Closed, any other owner or state, and every
 //! other check stay as strict as ever; once the window passes without a
 //! beat, the lease is released as before.
+//!
+//! # After a graph change
+//!
+//! A WirePlumber restart under a grant tears the graph down and builds it
+//! again: the protect stage stops beating, the supervisor releases, and
+//! while the graph settles the engine beats in bursts. Each burst gave two
+//! clean ticks and a grant that the next pause or a PCM reopened by the new
+//! graph ended again (J413: two or three grants in about 0.6 s per
+//! restart, each a possible click or gap). So after a fault release on a
+//! stale heartbeat or a PCM held by another process
+//! ([`Observer::note_fault_release`]) the heartbeat counts as stale until
+//! it has been fresh on every tick for [`GRAPH_SETTLE_NS`]: one graph
+//! change, one grant. A stale tick in that time starts the wait again.
+//! Nothing else changes, and it only delays a grant: the settle ends before
+//! the next grant can come, so it never touches a held lease. Releases on
+//! any other fault, and a stream starting from idle, keep the two clean
+//! ticks.
 
 use crate::lease::Observation;
 
@@ -258,6 +275,9 @@ pub struct SessionReport {
     /// Whether a client stream plays into the protect stage (`play=`). A
     /// helper that does not report it always wants the speakers.
     pub demand: bool,
+    /// Whether anything is linked into the amps' sink (`amps=`), if the
+    /// helper says.
+    pub amps: Option<bool>,
 }
 
 pub trait SessionView {
@@ -304,6 +324,12 @@ pub const RESUME_GRACE_NS: u64 = 500_000_000;
 /// has beaten steadily (every tick fresh) for this long: PipeWire resyncs
 /// its graph and drivers in the first moments after the thaw.
 pub const RESUME_SETTLE_NS: u64 = 500_000_000;
+/// After a fault release on a stale heartbeat or a foreign PCM owner (the
+/// graph was rebuilt under the grant: a WirePlumber restart, a driver
+/// change), the heartbeat counts as fresh only once the engine has beaten
+/// steadily (every tick fresh) for this long, so one graph change gives one
+/// grant rather than a grant for every quiet moment while it settles.
+pub const GRAPH_SETTLE_NS: u64 = 300_000_000;
 
 /// Freshness bound while the engine runs: two unit quanta (the
 /// architecture's "at most 2 quanta stale") plus one supervisor tick.
@@ -356,6 +382,14 @@ pub struct Observer {
     /// The last tick proved the engine's sense input (see
     /// [`Observer::sense_proven`]).
     sense_proven: bool,
+    /// When the supervisor last asked the session helper to unlink the
+    /// amps (its ordered release); a report counts as the answer only if
+    /// written since.
+    unlink_asked: Option<u64>,
+    /// After a fault release that rebuilt the graph: `Some(None)` until the
+    /// heartbeat is fresh, then `Some(Some(since))` while every tick stays
+    /// fresh, until [`GRAPH_SETTLE_NS`] has passed.
+    graph_settle: Option<Option<u64>>,
 }
 
 impl Observer {
@@ -387,6 +421,8 @@ impl Observer {
             sleep_before_grant: false,
             resume_grant: None,
             sense_proven: false,
+            unlink_asked: None,
+            graph_settle: None,
         }
     }
 
@@ -434,9 +470,36 @@ impl Observer {
         self.expected_wiring = Some(wiring);
     }
 
+    /// The supervisor asked the session helper at `now_ns` to unlink the
+    /// amps before it releases: a fresh report written since that says
+    /// nothing is linked into the amps' sink sets
+    /// [`Observation::amps_unlinked`].
+    pub fn note_unlink_request(&mut self, now_ns: u64) {
+        self.unlink_asked = Some(now_ns);
+    }
+
+    /// The supervisor released on a fault (`why`). A stale heartbeat or a
+    /// PCM held by another process means the graph changed under the
+    /// grant: the next grant waits until the engine has beaten steadily for
+    /// [`GRAPH_SETTLE_NS`] (see the module notes). Any other fault keeps
+    /// the plain two clean ticks.
+    pub fn note_fault_release(&mut self, why: &Observation) {
+        self.unlink_asked = None;
+        if !why.heartbeat_fresh || !why.pcm_owner_ok {
+            self.graph_settle = Some(None);
+        }
+    }
+
+    /// Whether the heartbeat is held stale while the graph settles after a
+    /// fault release.
+    pub fn graph_settling(&self) -> bool {
+        self.graph_settle.is_some()
+    }
+
     /// The supervisor granted at `now_ns`: the re-link and driver switch
     /// that follow get [`GRANT_GRACE_NS`].
     pub fn note_grant(&mut self, now_ns: u64) {
+        self.unlink_asked = None;
         self.granted_at = Some(now_ns);
         if std::mem::take(&mut self.sleep_before_grant) {
             self.resume_grant = self.last_seq.map(|seq| (now_ns, seq));
@@ -611,7 +674,25 @@ impl Observer {
         } else {
             false
         };
-        let heartbeat_fresh = heartbeat_fresh && !settling;
+        // after a fault release that rebuilt the graph: fresh only once
+        // every tick has been fresh for GRAPH_SETTLE_NS
+        let graph_settling = match self.graph_settle {
+            None => false,
+            Some(_) if !heartbeat_fresh => {
+                self.graph_settle = Some(None);
+                true
+            }
+            Some(None) => {
+                self.graph_settle = Some(Some(now_ns));
+                true
+            }
+            Some(Some(t0)) if now_ns.saturating_sub(t0) >= GRAPH_SETTLE_NS => {
+                self.graph_settle = None;
+                false
+            }
+            Some(Some(_)) => true,
+        };
+        let heartbeat_fresh = heartbeat_fresh && !settling && !graph_settling;
         // only the plugin's host process may hold the speaker PCM
         let pcm_owner_ok = match p.owner() {
             Some(owner) => owner == e.pid && e.pid != 0,
@@ -683,6 +764,9 @@ impl Observer {
             route_ok: false,
             amps_ok: false,
             demand: session_fresh && s.demand,
+            amps_unlinked: session_fresh && s.amps == Some(false) && self.unlink_asked.is_some_and(|t| s.mono_ns >= t),
+            pcm_engine: e.pid != 0
+                && matches!(p, PcmState::Open { owner } | PcmState::Running { owner } | PcmState::Xrun { owner } if owner == e.pid),
         }
     }
 }
@@ -832,6 +916,7 @@ pub fn parse_session(text: &str) -> SessionReport {
     let mut start = None;
     let mut wiring = None;
     let mut play = None;
+    let mut amps = None;
     for w in body.split_whitespace() {
         let Some((k, v)) = w.split_once('=') else { return SessionReport::default() };
         let slot = match k {
@@ -841,6 +926,7 @@ pub fn parse_session(text: &str) -> SessionReport {
             "pid" => &mut pid,
             "start" => &mut start,
             "play" => &mut play,
+            "amps" => &mut amps,
             "wiring" => {
                 if wiring.is_some() {
                     return SessionReport::default();
@@ -861,6 +947,11 @@ pub fn parse_session(text: &str) -> SessionReport {
         Some(Some(0)) => false,
         Some(_) => return SessionReport::default(),
     };
+    let amps = match amps {
+        None => None,
+        Some(Some(a @ 0..=1)) => Some(a == 1),
+        Some(_) => return SessionReport::default(),
+    };
     match (links.flatten(), carrier.flatten(), mono.flatten()) {
         (Some(l @ 0..=1), Some(c @ 0..=1), Some(m)) if m > 0 => match (pid.flatten(), start.flatten()) {
             (Some(p), Some(st)) if p > 0 && p <= u64::from(u32::MAX) => SessionReport {
@@ -872,6 +963,7 @@ pub fn parse_session(text: &str) -> SessionReport {
                 helper_alive: false,
                 wiring: wiring.flatten(),
                 demand,
+                amps,
             },
             _ => SessionReport::default(),
         },
@@ -942,6 +1034,7 @@ mod tests {
             helper_alive: true,
             wiring: Some(0x0979_c55e_d5dd_f377),
             demand: true,
+            amps: Some(true),
         }
     }
 
@@ -1396,6 +1489,7 @@ mod tests {
                 helper_alive: false,
                 wiring: None,
                 demand: true,
+                amps: None,
             }
         );
         // play: whether a client stream plays (absent: an older helper,
@@ -1403,7 +1497,10 @@ mod tests {
         assert!(!parse_session(&format!("links=1 carrier=1 mono_ns=123{w} play=0\n")).demand);
         let r = parse_session(&format!("links=1 carrier=1 mono_ns=123{w} play=1\n"));
         assert!(r.present && r.demand);
-        for bad in ["play=2", "play=", "play=x", "play=0 play=1"] {
+        // amps: whether anything is linked into the amps' sink
+        assert_eq!(parse_session(&format!("links=1 carrier=1 mono_ns=123{w} amps=0\n")).amps, Some(false));
+        assert_eq!(parse_session(&format!("links=1 carrier=1 mono_ns=123{w} amps=1\n")).amps, Some(true));
+        for bad in ["play=2", "play=", "play=x", "play=0 play=1", "amps=2", "amps=", "amps=0 amps=0"] {
             assert!(!parse_session(&format!("links=1 carrier=1 mono_ns=123{w} {bad}\n")).present, "{bad}");
         }
         let r = parse_session(&format!("links=0 carrier=1 mono_ns=123{w}\n"));
@@ -1834,6 +1931,8 @@ mod tests {
             route_ok: false,
             amps_ok: false,
             demand: true,
+            amps_unlinked: false,
+            pcm_engine: true,
         };
         s.tick(clean, &mut k).unwrap();
         assert_eq!(s.tick(clean, &mut k), Ok(Event::Granted));
@@ -2152,5 +2251,122 @@ mod tests {
         o.note_grant(t);
         let stale2 = silent_run(&mut o, t + TICK, t + 2_000_000_000, seq, t, open).unwrap();
         assert!(stale2 - t <= GRANT_GRACE_NS + stale_ns(512, 48_000, TICK) + TICK);
+    }
+
+    /// A WirePlumber restart under a grant (J413): the engine stops beating
+    /// while the graph is rebuilt, then beats in bursts while it settles.
+    /// After the fault release the heartbeat counts as fresh only once the
+    /// engine has beaten on every tick for GRAPH_SETTLE_NS, so the bursts
+    /// give one grant, not one each.
+    #[test]
+    fn after_a_stale_release_the_graph_settles_before_the_heartbeat_counts() {
+        let mut o = Observer::new(7, 48_000, TICK);
+        let (mut seq, mut t) = (0, 0);
+        for _ in 0..20 {
+            t += TICK;
+            seq += 1;
+            sleep_tick(&mut o, t, seq, t - 1);
+        }
+        let why = Observation { heartbeat_fresh: false, ..Observation::default() };
+        o.note_fault_release(&why);
+        assert!(o.graph_settling());
+        // bursts of beats shorter than the settle, each ended by a pause
+        for _ in 0..3 {
+            for _ in 0..(GRAPH_SETTLE_NS / TICK - 2) {
+                t += TICK;
+                seq += 1;
+                assert!(!sleep_tick(&mut o, t, seq, t - 1), "fresh while the graph settles");
+            }
+            for _ in 0..5 {
+                t += TICK;
+                assert!(!sleep_tick(&mut o, t, seq, t - 5 * TICK));
+            }
+        }
+        // then steady: fresh once it has beaten for the whole settle
+        let first = t + TICK;
+        loop {
+            t += TICK;
+            seq += 1;
+            if sleep_tick(&mut o, t, seq, t - 1) {
+                break;
+            }
+            assert!(t - first <= GRAPH_SETTLE_NS + TICK, "never fresh again");
+        }
+        assert!(t - first >= GRAPH_SETTLE_NS, "fresh before the settle");
+        assert!(!o.graph_settling());
+        // and from then on as before: one stale tick is just stale
+        for _ in 0..3 {
+            t += TICK;
+            seq += 1;
+            assert!(sleep_tick(&mut o, t, seq, t - 1));
+        }
+    }
+
+    /// A PCM opened by another process is a graph change too; every other
+    /// fault keeps the plain two clean ticks.
+    #[test]
+    fn only_a_stale_heartbeat_or_a_foreign_owner_waits_for_the_settle() {
+        let clean = Observation {
+            heartbeat_fresh: true,
+            plugin_ok: true,
+            links_ok: true,
+            carrier_ok: true,
+            pcm_owner_ok: true,
+            pcm_state_ok: true,
+            route_ok: true,
+            amps_ok: true,
+            demand: true,
+            amps_unlinked: false,
+            pcm_engine: true,
+        };
+        for (why, settles) in [
+            (Observation { pcm_owner_ok: false, ..clean }, true),
+            (Observation { heartbeat_fresh: false, links_ok: false, ..clean }, true),
+            (Observation { links_ok: false, ..clean }, false),
+            (Observation { pcm_state_ok: false, ..clean }, false),
+            (Observation { plugin_ok: false, ..clean }, false),
+        ] {
+            let mut o = Observer::new(7, 48_000, TICK);
+            let (mut seq, mut t) = (0, 0);
+            for _ in 0..20 {
+                t += TICK;
+                seq += 1;
+                sleep_tick(&mut o, t, seq, t - 1);
+            }
+            o.note_fault_release(&why);
+            assert_eq!(o.graph_settling(), settles, "{why:?}");
+            t += TICK;
+            seq += 1;
+            assert_eq!(sleep_tick(&mut o, t, seq, t - 1), !settles, "{why:?}");
+        }
+    }
+
+    /// The helper's answer to an unlink request: a fresh report written
+    /// since the request that says nothing is linked into the amps' sink.
+    #[test]
+    fn only_a_report_written_since_the_request_answers_it() {
+        let mut o = Observer::new(7, 48_000, TICK);
+        let run = PcmState::Running { owner: PID };
+        let tick = |o: &mut Observer, now: u64, r: SessionReport| {
+            o.observe(&mut || now, &mut E(beat(now / TICK, 512, now - 1)), &mut P(run), &mut S(r)).amps_unlinked
+        };
+        let t = 1_000 * TICK;
+        let unlinked = |at: u64| SessionReport { amps: Some(false), ..session(at) };
+        // no request: nothing to answer
+        assert!(!tick(&mut o, t, unlinked(t - 1)));
+        o.note_unlink_request(t);
+        // a report from before the request, or one with the amps linked
+        assert!(!tick(&mut o, t + TICK, unlinked(t - 1)));
+        assert!(!tick(&mut o, t + TICK, session(t + 1)));
+        // an older helper that does not say
+        assert!(!tick(&mut o, t + TICK, SessionReport { amps: None, ..session(t + 1) }));
+        // a stale, dead or future-dated writer never answers
+        assert!(!tick(&mut o, t + TICK, SessionReport { helper_alive: false, ..unlinked(t + 1) }));
+        assert!(!tick(&mut o, t + TICK, unlinked(t + 2 * TICK)));
+        // the answer
+        assert!(tick(&mut o, t + TICK, unlinked(t + 1)));
+        // a grant ends the request
+        o.note_grant(t + 2 * TICK);
+        assert!(!tick(&mut o, t + 3 * TICK, unlinked(t + 2 * TICK)));
     }
 }

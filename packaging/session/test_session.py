@@ -881,5 +881,93 @@ class Report(unittest.TestCase):
         self.assertFalse(sgs.write_report("/nonexistent-dir/session", True, True))
 
 
+class Unlink(unittest.TestCase):
+    """The supervisor's request to unlink the amps before it releases
+    (speakerguardd#86)."""
+
+    def request(self, d, t):
+        tmp = os.path.join(d, ".unlink.new")
+        with open(tmp, "w") as f:
+            f.write(f"mono_ns={t}\n")
+        os.rename(tmp, os.path.join(d, "unlink"))
+
+    def test_a_fresh_request_withdraws_the_links_until_the_kernel_does(self):
+        import tempfile
+        import time
+
+        with tempfile.TemporaryDirectory() as d:
+            r = sgs.UnlinkRequests(os.path.join(d, "unlink"), watch=False)
+            now = 100.0
+            self.assertTrue(r.granted(True, now))
+            self.request(d, time.monotonic_ns())
+            self.assertTrue(r.take(time.monotonic_ns(), now))
+            # the kernel still grants, the links follow the request
+            self.assertFalse(r.granted(True, now + 0.01))
+            # the kernel's withdrawal ends the hold; the next grant links
+            self.assertFalse(r.granted(False, now + 0.02))
+            self.assertTrue(r.granted(True, now + 0.03))
+            # the same request read again is not a new one
+            self.assertFalse(r.take(time.monotonic_ns(), now + 0.04))
+            self.assertTrue(r.granted(True, now + 0.04))
+
+    def test_a_hold_the_kernel_never_ends_runs_out(self):
+        import tempfile
+        import time
+
+        with tempfile.TemporaryDirectory() as d:
+            r = sgs.UnlinkRequests(os.path.join(d, "unlink"), watch=False)
+            self.request(d, time.monotonic_ns())
+            self.assertTrue(r.take(time.monotonic_ns(), 10.0))
+            self.assertFalse(r.granted(True, 10.0 + sgs.UNLINK_HOLD_S - 0.001))
+            self.assertTrue(r.granted(True, 10.0 + sgs.UNLINK_HOLD_S))
+
+    def test_old_future_or_malformed_requests_are_ignored(self):
+        import tempfile
+        import time
+
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "unlink")
+            r = sgs.UnlinkRequests(path, watch=False)
+            self.assertFalse(r.take(time.monotonic_ns(), 1.0), "no request")
+            now = time.monotonic_ns()
+            self.request(d, now - int(sgs.UNLINK_FRESH_S * 1e9) - 1)
+            self.assertFalse(r.take(now, 1.0), "old")
+            self.request(d, now + 1_000_000)
+            self.assertFalse(r.take(now, 1.0), "future")
+            for bad in ["", "mono_ns=", "mono_ns=x\n", "at=5\n", "\xff\n"]:
+                with open(path, "w") as f:
+                    f.write(bad)
+                self.assertFalse(r.take(now, 1.0), bad)
+            self.assertTrue(r.granted(True, 1.0))
+
+    def test_the_watch_sees_the_request_renamed_into_place_only(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            r = sgs.UnlinkRequests(os.path.join(d, "unlink"))
+            if r.fd is None:
+                self.skipTest("no inotify")
+            try:
+                self.assertFalse(r.touched())
+                # another file in the directory (the thermal state, the page)
+                with open(os.path.join(d, "thermal"), "w") as f:
+                    f.write("x")
+                self.assertFalse(r.touched())
+                self.request(d, 1)
+                self.assertTrue(r.touched())
+                self.assertFalse(r.touched())
+            finally:
+                os.close(r.fd)
+
+    def test_inotify_names(self):
+        import struct
+
+        ev = struct.pack("iIII", 1, 0x80, 0, 16) + b"unlink".ljust(16, b"\0")
+        ev += struct.pack("iIII", 1, 0x08, 0, 0)
+        ev += struct.pack("iIII", 1, 0x80, 0, 8) + b"thermal\0"
+        self.assertEqual(sgs.inotify_names(ev), ["unlink", "", "thermal"])
+        self.assertEqual(sgs.inotify_names(b""), [])
+
+
 if __name__ == "__main__":
     unittest.main()

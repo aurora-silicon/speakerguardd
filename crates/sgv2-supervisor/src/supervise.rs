@@ -12,7 +12,23 @@
 //!   - the operating point (KERNEL.md 2.3): every amp's analog gain, read
 //!     back with its dB scale, is the full-scale voltage the parameter blob
 //!     was compiled for, before every grant and on every tick;
-//! - any fault releases at once (no waiting for the lease to run out);
+//! - any fault releases at once (no waiting for the lease to run out),
+//!   with one exception, the ordered release below;
+//! - a lease held when only the engine's heartbeat went stale (the protect
+//!   stage stopped running: WirePlumber restarted, the graph is being
+//!   rebuilt) is not renewed, and the session helper is asked to unlink the
+//!   amps ([`Event::Withdrawing`]); the release follows its answer (a fresh
+//!   report with nothing linked into the amps' sink) or
+//!   [`ORDERED_RELEASE_TICKS`] ticks, whichever comes first. Released at
+//!   once, the amps' sink was still linked and running, and PipeWire's
+//!   start retries met the kernel's refusal until the helper's unlink
+//!   landed (`snd_pcm_start: Operation not permitted`, about five a
+//!   restart, J413). The wait never outlasts the lease: the last renewal
+//!   was a tick before the fault, so the explicit release lands when the
+//!   kernel's 30 ms lease runs out at the latest, and the kernel withdraws
+//!   then whatever the helper or this loop does. Any other failed check on
+//!   a tick in between releases at once, as does every fault but a stale
+//!   heartbeat in the first place;
 //! - a hard amp fault (over-temperature, over-current, group off), or a
 //!   granted card whose amps are not at the operating volume, releases and
 //!   latches released for the life of the process;
@@ -29,12 +45,44 @@ use crate::kernel::{Kernel, KernelError, GAIN_CONTROL_SUFFIX};
 use crate::lease::{Action, Lease, Observation};
 use crate::machine::{full_scale_mv, same_operating_point, Amp, Machine};
 
+/// Ticks an ordered release waits for the session helper's unlink after
+/// the tick that saw the fault. The lease was last renewed a tick before
+/// that, so the release lands when the 30 ms lease runs out at the latest
+/// ([`crate::kernel::LEASE_MS`]): a helper that never answers delays the
+/// withdrawal no longer than the kernel's own backstop would.
+pub const ORDERED_RELEASE_TICKS: u32 = (crate::kernel::LEASE_MS / 10) - 1;
+// the wait plus the tick before the fault is never longer than the lease
+const _: () = assert!(ORDERED_RELEASE_TICKS >= 1 && (ORDERED_RELEASE_TICKS + 1) * 10 <= crate::kernel::LEASE_MS);
+
+/// How a release ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Order {
+    /// At once, on the tick that saw the fault.
+    AtOnce,
+    /// After the session helper reported the amps unlinked.
+    Unlinked,
+    /// The helper did not answer within [`ORDERED_RELEASE_TICKS`].
+    Deadline,
+    /// Another check failed while the helper was unlinking.
+    Escalated,
+    /// The speaker PCM was no longer the engine's while the helper was
+    /// unlinking (the sink closed it): released at once.
+    Closed,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Event {
     Granted,
     Renewed,
     Released {
         why: Observation,
+        order: Order,
+    },
+    /// Only the heartbeat failed under a held lease: not renewed, and the
+    /// session helper is to unlink the amps before the release (the caller
+    /// asks it on the first such tick, `first`).
+    Withdrawing {
+        first: bool,
     },
     /// Nothing plays: the grant was given back with every check holding.
     Idle,
@@ -73,16 +121,49 @@ impl Expect {
     }
 }
 
+/// Whether a failed tick under a held lease may end in order: the
+/// heartbeat is the only check that failed, and the engine's own process
+/// holds the speaker PCM open (the amps' sink is up and linked, so a
+/// release at once meets its start retries). Every check that guards the
+/// path itself (the plugin and its parameters, the links, the carrier, the
+/// PCM's owner and state, the mux, the operating point) still holds, so
+/// what can reach the amps in the wait is what the protect stage already
+/// rendered. A closed PCM (an engine that exited, or one that never
+/// opened it) releases at once: anyone could open it under the grant.
+pub fn orderly(obs: &Observation) -> bool {
+    !obs.heartbeat_fresh && obs.pcm_engine && Observation { heartbeat_fresh: true, ..*obs }.clean()
+}
+
 pub struct Supervisor {
     expect: Expect,
     lease: Lease,
     latched: Option<String>,
     problem: Option<String>,
+    /// An ordered release in progress: the fault that began it, and the
+    /// ticks waited since.
+    ordered: Option<(Observation, u32)>,
 }
 
 impl Supervisor {
     pub fn new(expect: Expect) -> Self {
-        Supervisor { expect, lease: Lease::default(), latched: None, problem: None }
+        Supervisor { expect, lease: Lease::default(), latched: None, problem: None, ordered: None }
+    }
+
+    /// Whether an ordered release is in progress: the lease is no longer
+    /// renewed, and the release follows within [`ORDERED_RELEASE_TICKS`].
+    pub fn withdrawing(&self) -> bool {
+        self.ordered.is_some()
+    }
+
+    /// The release that ends an ordered release. A lease that ran out in
+    /// the meantime (a late tick) has already been withdrawn by the kernel,
+    /// and the write that says so (`ETIMEDOUT`) is that withdrawal.
+    fn finish(&mut self, kernel: &mut dyn Kernel, order: Order) -> Result<Event, Fatal> {
+        let (why, _) = self.ordered.take().expect("an ordered release in progress");
+        match kernel.release() {
+            Ok(()) | Err(KernelError::Lapsed) => Ok(Event::Released { why, order }),
+            Err(e) => Err(Fatal::Kernel(e)),
+        }
     }
 
     /// Whether the last tick left protection granted.
@@ -154,6 +235,7 @@ impl Supervisor {
 
     pub fn tick(&mut self, obs: Observation, kernel: &mut dyn Kernel) -> Result<Event, Fatal> {
         if self.latched.is_some() {
+            self.ordered = None;
             // stay at the kernel's floor; a release is idempotent
             if kernel.granted().map_err(Fatal::Kernel)? {
                 kernel.release().map_err(Fatal::Kernel)?;
@@ -165,7 +247,8 @@ impl Supervisor {
             return self.latch(kernel, format!("{} (bits {:#04x}, group off {})", f.amp, f.bits, f.group_off));
         }
         // a lease that lapsed shows the floor: only a live grant is checked
-        if self.lease.held() && kernel.granted().map_err(Fatal::Kernel)? {
+        // (one an ordered release still has to end included)
+        if (self.lease.held() || self.ordered.is_some()) && kernel.granted().map_err(Fatal::Kernel)? {
             if let Some(p) = self.volume_problem(kernel).map_err(Fatal::Kernel)? {
                 // The lease can end between the two reads: a supervisor
                 // late for its tick under host load (J413, load 55) read
@@ -183,6 +266,25 @@ impl Supervisor {
         self.problem = self.card_problem(kernel, faults.len()).map_err(Fatal::Kernel)?;
         let ok = self.problem.is_none();
         let obs = Observation { route_ok: ok, amps_ok: ok, ..obs };
+        if let Some((why, waited)) = self.ordered {
+            // never renewed, and no clean tick counts towards the next
+            // grant until the release is done
+            self.lease.tick(Observation::default());
+            if !(Observation { heartbeat_fresh: true, ..obs }).clean() {
+                return self.finish(kernel, Order::Escalated);
+            }
+            if !obs.pcm_engine {
+                return self.finish(kernel, Order::Closed);
+            }
+            if obs.amps_unlinked {
+                return self.finish(kernel, Order::Unlinked);
+            }
+            if waited + 1 >= ORDERED_RELEASE_TICKS {
+                return self.finish(kernel, Order::Deadline);
+            }
+            self.ordered = Some((why, waited + 1));
+            return Ok(Event::Withdrawing { first: false });
+        }
         let was_held = self.lease.held();
         match self.lease.tick(obs) {
             Action::Renew => match kernel.renew() {
@@ -199,9 +301,14 @@ impl Supervisor {
                 }
                 Err(e) => Err(Fatal::Kernel(e)),
             },
+            Action::Release if orderly(&obs) && !obs.amps_unlinked => {
+                // the lease is not renewed; the helper unlinks the amps first
+                self.ordered = Some((obs, 0));
+                Ok(Event::Withdrawing { first: true })
+            }
             Action::Release => {
                 kernel.release().map_err(Fatal::Kernel)?;
-                Ok(Event::Released { why: obs })
+                Ok(Event::Released { why: obs, order: Order::AtOnce })
             }
             Action::Idle => {
                 kernel.release().map_err(Fatal::Kernel)?;
@@ -213,6 +320,7 @@ impl Supervisor {
 
     fn latch(&mut self, kernel: &mut dyn Kernel, why: String) -> Result<Event, Fatal> {
         self.latched = Some(why.clone());
+        self.ordered = None;
         self.lease.tick(Observation::default());
         kernel.release().map_err(Fatal::Kernel)?;
         Ok(Event::HardFault(why))
@@ -244,6 +352,8 @@ mod tests {
         route_ok: false,
         amps_ok: false,
         demand: true,
+        amps_unlinked: false,
+        pcm_engine: true,
     };
 
     /// The J316 with a blob for gain 15 (18.5 dBV, 11.89 V peak).
@@ -324,10 +434,163 @@ mod tests {
         assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Granted));
         assert!(k.held);
         assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Renewed));
-        let bad = Observation { heartbeat_fresh: false, ..CLEAN };
-        assert!(matches!(s.tick(bad, &mut k), Ok(Event::Released { .. })));
+        let bad = Observation { links_ok: false, ..CLEAN };
+        assert!(matches!(s.tick(bad, &mut k), Ok(Event::Released { order: Order::AtOnce, .. })));
         assert!(!k.held);
         assert_eq!(k.releases, 1);
+    }
+
+    fn granted() -> (Supervisor, Recorder) {
+        let mut k = Recorder::healthy(6);
+        let mut s = j316();
+        s.tick(CLEAN, &mut k).unwrap();
+        assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Granted));
+        assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Renewed));
+        (s, k)
+    }
+
+    const STALE: Observation = Observation { heartbeat_fresh: false, ..CLEAN };
+
+    /// A stale heartbeat alone under a grant: not renewed, the helper asked
+    /// to unlink first, released on its answer (speakerguardd#86).
+    #[test]
+    fn a_stale_heartbeat_releases_after_the_helper_unlinks() {
+        let (mut s, mut k) = granted();
+        let renewals = k.renewals;
+        assert_eq!(s.tick(STALE, &mut k), Ok(Event::Withdrawing { first: true }));
+        assert!(s.withdrawing() && !s.granted());
+        // not renewed, not yet released
+        assert_eq!((k.renewals, k.releases), (renewals, 0));
+        let answered = Observation { amps_unlinked: true, ..STALE };
+        let why = Observation { route_ok: true, amps_ok: true, ..STALE };
+        assert_eq!(s.tick(answered, &mut k), Ok(Event::Released { why, order: Order::Unlinked }));
+        assert!(!k.held && !s.withdrawing());
+        assert_eq!((k.renewals, k.releases), (renewals, 1));
+        // the next grant takes two clean ticks again
+        assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::StayedReleased));
+        assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Granted));
+    }
+
+    /// A helper that never answers delays nothing past the lease.
+    #[test]
+    fn an_unanswered_unlink_releases_at_the_lease_end() {
+        let (mut s, mut k) = granted();
+        let renewals = k.renewals;
+        assert_eq!(s.tick(STALE, &mut k), Ok(Event::Withdrawing { first: true }));
+        for _ in 1..ORDERED_RELEASE_TICKS {
+            assert_eq!(s.tick(STALE, &mut k), Ok(Event::Withdrawing { first: false }));
+            assert!(k.releases == 0 && k.renewals == renewals);
+        }
+        let why = Observation { route_ok: true, amps_ok: true, ..STALE };
+        assert_eq!(s.tick(STALE, &mut k), Ok(Event::Released { why, order: Order::Deadline }));
+        assert!(!k.held);
+        assert_eq!(k.renewals, renewals);
+        // a heartbeat back while it waits changes nothing: still released at
+        // the lease's end, never renewed, and the grant needs two clean
+        // ticks after the release
+        let (mut s, mut k) = granted();
+        let renewals = k.renewals;
+        assert_eq!(s.tick(STALE, &mut k), Ok(Event::Withdrawing { first: true }));
+        for _ in 1..ORDERED_RELEASE_TICKS {
+            assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Withdrawing { first: false }));
+        }
+        assert!(matches!(s.tick(CLEAN, &mut k), Ok(Event::Released { order: Order::Deadline, .. })));
+        assert_eq!(k.renewals, renewals);
+        assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::StayedReleased));
+        assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Granted));
+    }
+
+    /// Every fault but a stale heartbeat alone releases at once, and any
+    /// other failed check while the helper unlinks ends the wait at once.
+    #[test]
+    fn any_other_fault_releases_at_once_even_while_unlinking() {
+        for other in [
+            Observation { pcm_owner_ok: false, ..CLEAN },
+            Observation { pcm_state_ok: false, ..CLEAN },
+            Observation { links_ok: false, ..CLEAN },
+            Observation { carrier_ok: false, ..CLEAN },
+            Observation { plugin_ok: false, ..CLEAN },
+        ] {
+            // with the heartbeat stale too: at once
+            let (mut s, mut k) = granted();
+            let both = Observation { heartbeat_fresh: false, ..other };
+            assert!(matches!(s.tick(both, &mut k), Ok(Event::Released { order: Order::AtOnce, .. })), "{other:?}");
+            assert!(!k.held);
+            // during the wait, stale or not: at once
+            for hb in [false, true] {
+                let (mut s, mut k) = granted();
+                assert_eq!(s.tick(STALE, &mut k), Ok(Event::Withdrawing { first: true }));
+                let o = Observation { heartbeat_fresh: hb, ..other };
+                assert!(matches!(s.tick(o, &mut k), Ok(Event::Released { order: Order::Escalated, .. })), "{o:?}");
+                assert!(!k.held && !s.withdrawing());
+            }
+        }
+        // the kernel side too: the mux switched while the helper unlinks
+        let (mut s, mut k) = granted();
+        assert_eq!(s.tick(STALE, &mut k), Ok(Event::Withdrawing { first: true }));
+        k.route = Some("Primary".into());
+        assert!(matches!(s.tick(STALE, &mut k), Ok(Event::Released { order: Order::Escalated, .. })));
+        assert!(!k.held);
+        // a hard amp fault latches
+        let (mut s, mut k) = granted();
+        assert_eq!(s.tick(STALE, &mut k), Ok(Event::Withdrawing { first: true }));
+        k.amp_faults[1].bits = AmpFault::OVER_TEMPERATURE;
+        assert!(matches!(s.tick(STALE, &mut k), Ok(Event::HardFault(_))));
+        assert!(!k.held && !s.withdrawing());
+        // and a granted volume off the operating point latches as before
+        let (mut s, mut k) = granted();
+        assert_eq!(s.tick(STALE, &mut k), Ok(Event::Withdrawing { first: true }));
+        k.volume = Some(("Speaker Volume".into(), (180, Some(-1050)), (0, None)));
+        assert!(matches!(s.tick(STALE, &mut k), Ok(Event::HardFault(_))));
+        assert!(!k.held);
+    }
+
+    /// A closed speaker PCM under a stale heartbeat (an engine that exited)
+    /// releases at once, and a PCM that closes during the wait ends it.
+    #[test]
+    fn a_pcm_the_engine_does_not_hold_is_never_released_in_order() {
+        let (mut s, mut k) = granted();
+        let closed = Observation { pcm_engine: false, ..STALE };
+        assert!(matches!(s.tick(closed, &mut k), Ok(Event::Released { order: Order::AtOnce, .. })));
+        assert!(!k.held);
+        let (mut s, mut k) = granted();
+        assert_eq!(s.tick(STALE, &mut k), Ok(Event::Withdrawing { first: true }));
+        assert!(matches!(s.tick(closed, &mut k), Ok(Event::Released { order: Order::Closed, .. })));
+        assert!(!k.held && !s.withdrawing());
+    }
+
+    /// Nothing is held: a stale heartbeat has nothing to release in order,
+    /// and an answer already in hand releases at once.
+    #[test]
+    fn only_a_held_lease_is_released_in_order() {
+        let mut k = Recorder::healthy(6);
+        let mut s = j316();
+        for _ in 0..3 {
+            assert_eq!(s.tick(STALE, &mut k), Ok(Event::StayedReleased));
+        }
+        assert!(!s.withdrawing());
+        let (mut s, mut k) = granted();
+        let answered = Observation { amps_unlinked: true, ..STALE };
+        assert!(matches!(s.tick(answered, &mut k), Ok(Event::Released { order: Order::AtOnce, .. })));
+        assert!(!k.held);
+    }
+
+    /// The lease ran out under a late tick before the ordered release: the
+    /// kernel has withdrawn already, and the release's ETIMEDOUT says so.
+    #[test]
+    fn an_ordered_release_after_the_lease_ran_out_is_not_fatal() {
+        let mut k = Lapsing(Recorder::healthy(6), false, false);
+        let mut s = j316();
+        s.tick(CLEAN, &mut k).unwrap();
+        assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Granted));
+        assert_eq!(s.tick(STALE, &mut k), Ok(Event::Withdrawing { first: true }));
+        k.0.held = false;
+        k.2 = true;
+        for _ in 1..ORDERED_RELEASE_TICKS {
+            s.tick(STALE, &mut k).unwrap();
+        }
+        assert!(matches!(s.tick(STALE, &mut k), Ok(Event::Released { order: Order::Deadline, .. })));
+        assert!(s.latched_fault().is_none());
     }
 
     #[test]
@@ -514,7 +777,8 @@ mod tests {
         }
     }
 
-    struct Lapsing(Recorder, bool);
+    /// Lapses the next renewal (`.1`) or the next release (`.2`).
+    struct Lapsing(Recorder, bool, bool);
     impl Kernel for Lapsing {
         fn renew(&mut self) -> Result<(), KernelError> {
             if self.1 {
@@ -525,6 +789,11 @@ mod tests {
             self.0.renew()
         }
         fn release(&mut self) -> Result<(), KernelError> {
+            if self.2 {
+                self.2 = false;
+                self.0.held = false;
+                return Err(KernelError::Lapsed);
+            }
             self.0.release()
         }
         fn granted(&mut self) -> Result<bool, KernelError> {
@@ -543,7 +812,7 @@ mod tests {
 
     #[test]
     fn a_lapse_or_a_resume_grants_again_on_the_next_clean_tick() {
-        let mut k = Lapsing(Recorder::healthy(6), false);
+        let mut k = Lapsing(Recorder::healthy(6), false, false);
         let mut s = j316();
         s.tick(CLEAN, &mut k).unwrap();
         assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Granted));
@@ -565,7 +834,7 @@ mod tests {
     fn a_lapsed_floor_is_not_read_as_a_wrong_operating_volume() {
         // the supervisor stalled: the kernel let the lease run out and
         // floored the amps; that is a lapse, not a latched fault
-        let mut k = Lapsing(Recorder::healthy(6), false);
+        let mut k = Lapsing(Recorder::healthy(6), false, false);
         let mut s = j316();
         s.tick(CLEAN, &mut k).unwrap();
         assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Granted));
