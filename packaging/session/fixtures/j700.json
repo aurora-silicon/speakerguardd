@@ -1,0 +1,100 @@
+{
+ "note": "MacBook Neo (J700): the sound node of arch/arm64/boot/dts/apple/t8140-j700.dts (public): one MAX98360A node for the stereo pair on the AOP speaker back-end, and the jack. Tuning lanes: the structure of the graph's input lanes only, with generic box names and no tuning values. The hardware half is wiring.py's reading of arch/arm64/boot/dts/apple/t8140-j700.dts (aurora-silicon/linux integration/aurora), with the I2C bindings of the booted Mac.",
+ "hw": {
+  "board": "j700",
+  "compatible": [
+   "apple,j700",
+   "apple,t8140",
+   "apple,arm-platform"
+  ],
+  "sound": "sound",
+  "sound_compatible": [
+   "apple,j700-macaudio",
+   "apple,macaudio"
+  ],
+  "model": "MacBook Neo J700",
+  "links": [
+   {
+    "name": "Headphone Jack",
+    "cpus": 1,
+    "cpu_compatible": [
+     [
+      "apple,t8140-aop-audio"
+     ]
+    ],
+    "codecs": [
+     {
+      "node": "soc/i2c@385010000/codec@48",
+      "prefix": "Jack",
+      "compatible": [
+       "cirrus,cs42l83"
+      ]
+     }
+    ]
+   },
+   {
+    "name": "Speaker",
+    "cpus": 1,
+    "cpu_compatible": [
+     [
+      "apple,t8140-aop-audio"
+     ]
+    ],
+    "codecs": [
+     {
+      "node": "audio-amplifier",
+      "prefix": "Speaker",
+      "compatible": [
+       "maxim,max98360a"
+      ]
+     }
+    ]
+   }
+  ]
+ },
+ "tuning": {
+  "tuning": {
+   "aid": "synthetic",
+   "selection": {
+    "sample_rate": 48000,
+    "substitutions": {
+     "fs": "48000"
+    }
+   },
+   "protection": {
+    "kind": "lsm2",
+    "strip_properties": [],
+    "lanes": [
+     {
+      "origin": {
+       "node": "in",
+       "port": 0,
+       "channel": 0
+      },
+      "hops": [
+       {
+        "join": "Split",
+        "input": 0,
+        "channel": 0
+       }
+      ]
+     },
+     {
+      "origin": {
+       "node": "in",
+       "port": 0,
+       "channel": 1
+      },
+      "hops": [
+       {
+        "join": "Split",
+        "input": 1,
+        "channel": 1
+       }
+      ]
+     }
+    ]
+   }
+  }
+ }
+}

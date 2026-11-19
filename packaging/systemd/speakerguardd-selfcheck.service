@@ -1,0 +1,49 @@
+[Unit]
+Description=Speaker wiring self-check, silent (speakerguardd v2)
+Documentation=https://github.com/aurora-silicon/speakerguardd/blob/v2/docs/NEW-PLATFORM.md
+# Before the supervisor, while the kernel holds the speakers at its floor:
+# it derives this Mac's speaker wiring from the device tree and the tuning,
+# proves it with zero-sample streams only, and binds the result to the
+# board, the kernel release, the parameter blob and the wiring. A passing
+# record for exactly this combination is kept, so a boot without a kernel
+# or tuning change only checks the binding. A failure leaves the floor.
+# Before user sessions too: its ExecStartPost puts this boot's graph in
+# /run/speakerguardd-graph, and the seat user's PipeWire and WirePlumber must
+# start with it. systemd-user-sessions.service gates every login, the
+# display manager's greeter and automatic login included.
+# Only the binding and the cheap checks run here (--defer). When the check
+# has to run again (a kernel or tuning change), its silent switch test,
+# about 0.5 s per sense switch, runs after login in
+# speakerguardd-switchtest.service, which loads the graph when it passes;
+# until then no graph is generated and the supervisor does not start. Every
+# session still starts with provisioning's raw-PCM rules
+# (/run/speakerguardd-graph/raw), so WirePlumber never creates nodes on the
+# raw speaker and sense PCMs: on the first boot after a kernel change an
+# automatic login once won that race, WirePlumber probed the raw speaker
+# PCM at the kernel's floor, and a tweeter amp latched a TDM clock fault.
+Before=speakerguardd.service systemd-user-sessions.service
+After=systemd-udev-settle.service speakerguardd-provision.service
+# Its parameter blob and configuration come from provisioning.
+Requires=speakerguardd-provision.service
+ConditionPathExists=/proc/device-tree/compatible
+
+[Service]
+Type=oneshot
+ExecCondition=/usr/libexec/speakerguardd/speakerguardd-gate prepare
+# SGV2_PARAMS: the parameter blob (as in SGV2_ARGS); SGV2_TUNING: the tuning
+# source the blob was compiled from, as aurora-speaker-tuning takes it
+# (empty: the installer's bundle in the vendor firmware).
+EnvironmentFile=-/etc/speakerguardd/speakerguardd.conf
+ExecStart=/usr/libexec/speakerguardd/speakerguardd-selfcheck run --defer --params ${SGV2_PARAMS} -- $SGV2_TUNING
+# Passed: generate the machine's PipeWire and WirePlumber files from the
+# record (/run/speakerguardd-graph) and bring the seat user's session onto
+# them; deferred: generate none. A failure here fails the check, so the
+# supervisor does not start.
+ExecStartPost=/usr/libexec/speakerguardd/speakerguardd-provision activate --graph-unit speakerguardd-graph.service
+StateDirectory=speakerguardd
+StateDirectoryMode=0755
+RuntimeDirectory=speakerguardd-selfcheck
+TimeoutStartSec=120
+
+[Install]
+RequiredBy=speakerguardd.service

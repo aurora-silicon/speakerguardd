@@ -1,0 +1,889 @@
+#!/usr/bin/python3 -I
+"""speakerguardd-session: the per-user half of speakerguardd v2.
+
+    speakerguardd-session --machine j316 [--selfcheck /var/lib/speakerguardd/selfcheck.json]
+
+It runs in the user's session, beside PipeWire, and does three things:
+
+1. **Ordering.** It links the speaker amps and the sense to the protect stage
+   only while the kernel grants protection ("Speaker Protection" reads 1), and
+   unlinks them as soon as it does not. The amps' sink is the driver of their
+   group, so it never starts before the grant: the kernel would refuse it.
+2. **Integrity.** It checks the link set: into the protect stage's program
+   ports anything but the sense, channel for channel (the voicing, or a
+   second voicing such as a tuning A/B sink); into its sense ports
+   only the sense, channel for channel; into the amps only the protect
+   stage's output, channel for channel; out of the sense nothing else. A
+   missing link is silence and is allowed; any other link is a fault. It
+   also checks the carrier: the protect stage's input and the sense at unity
+   volume, unmuted.
+3. **Report.** On every link, carrier or playback change, and every 50 ms
+   (every IDLE_PERIOD while nothing plays and nothing is linked), it writes
+   `links=<0|1> carrier=<0|1> mono_ns=<t> pid=<pid> start=<ticks> wiring=<hash> amps=<0|1> play=<0|1>`
+   to /run/speakerguardd/<uid>/helper/session, where the wiring is the one
+   the protect stage was built with (its `sgv2.wiring` property; the
+   supervisor grants only for the wiring the self-check proved), by a write
+   to a new file and a
+   rename, so the supervisor never reads a partial report. `amps` says whether
+   anything is linked into the amps' sink (the sleep step waits for 0), and
+   `play` whether the speakers are wanted (5 below). A report older
+   than 500 ms, dated in the future, or whose writer (pid, start time) is not
+   this live process counts as absent, and the supervisor then releases.
+4. **The grant-before-start sequence.** The supervisor grants only on a
+   live engine heartbeat (the protect stage runs on PipeWire's dummy driver
+   while the amps are unlinked) and a fresh report; this helper links the
+   amps only once the kernel reads granted; the amps' sink then starts. On
+   any withdrawal it unlinks the amps, the sink stops and closes, and the
+   sequence starts again. While the speakers are wanted (`play=1`, and one
+   report beyond) it also links the protect stage's output to the hold, a
+   sink with no device: that keeps the stage running when a short stream
+   ends before the grant (its first frames are still held for the amps) and
+   after a withdrawal, so the grant can come back. When the graph first appears
+   the hold is also linked for PRIME_S, so the stage negotiates and starts
+   once with no client and no amps.
+5. **Idle.** The speakers are wanted only while a client stream runs into
+   the protect stage (through the voicing in front of it, or straight in),
+   and for IDLE_HOLD_S after the last one stops. With none, the amps and the
+   sense are unlinked and suspended, so both PCMs close, and the report says
+   `play=0` once they are; the supervisor then releases its grant and the
+   kernel holds the amps at its floor, as macOS powers the speaker path down
+   when nothing plays. The hold is unlinked too, so the protect stage and
+   the voicing stop with the last stream, as macOS stops its speaker engine.
+   The plugin keeps its thermal model across the pause: a stage PipeWire
+   reactivates restores it cooled for the time since, one that only paused
+   resumes it as it stopped. When a client starts, its
+   stream runs the stage on the dummy driver, the report says `play=1` at
+   once, the supervisor grants once the engine has beaten for its two clean
+   ticks, and this helper links the hold and, on the grant, the amps as
+   in 4.
+
+6. **The user's volume.** The generated voicing sink (`sgv2.voicing.<m>`)
+   carries the user's volume (filter-chain maps its channel volumes onto
+   the plugin's `voicing:volume` control, cubic). WirePlumber may or may not
+   hold a record for this sink (its key depends on the node's names), and on
+   a first start it has none, so the sink would start at PipeWire's 100 %.
+   The helper stores the sink's channel volumes and mute itself
+   (`$XDG_STATE_HOME/speakerguardd/voicing-<m>.json`). A new sink that
+   WirePlumber restored keeps that volume; one still at the default after
+   RESTORE_GRACE_S gets the stored volume, or FIRST_START_VOLUME with
+   nothing stored.
+
+It reads the graph from `pw-dump --monitor` and makes or removes links with
+`pw-link`. It never touches the amps' volume: the kernel owns it.
+"""
+import argparse
+import fcntl
+import json
+import os
+import select
+import signal
+import struct
+import subprocess
+import sys
+import time
+
+PERIOD = 0.050
+# The report's period while nothing plays and nothing is linked: a change is
+# reported at once anyway, and the supervisor accepts a report for 500 ms.
+IDLE_PERIOD = 0.250
+# When the graph first appears the hold is linked for this long, so the
+# protect stage and the voicing negotiate and start once with no client and
+# no amps: the first stream after PipeWire starts then finds them prepared
+# (unprimed, their first link renegotiated and lost its first ~4096 frames).
+PRIME_S = 1.0
+# How long the speakers stay up after the last client stream stops: the
+# default idle time before WirePlumber suspends a node, so a pause between
+# two sounds does not cycle the amps.
+IDLE_HOLD_S = 5.0
+# How long the helper waits for the amps and the sense to suspend before it
+# reports play=0 anyway (the supervisor's release then stops them).
+TEARDOWN_S = 2.0
+PROTECT_INPUT = "alsa_output.platform-sound.RawSpeakers"
+# While speakerguardd-selfcheck runs its silent check it holds a grant of
+# its own: nothing may be linked to the amps then.
+SELFCHECK_ACTIVE = "/run/speakerguardd-selfcheck/active"
+# Before system sleep speakerguardd-sleep.service sets this hold: the amps
+# and the sense are unlinked and suspended (their PCMs close) before the
+# supervisor stops, and stay so until the resume clears it.
+SLEEP_HOLD = "/run/speakerguardd-sleep/hold"
+# The voicing sink's channel volume on a first start with nothing stored:
+# 30 % on a cubic desktop slider (0.3 ** 3).
+FIRST_START_VOLUME = 0.027
+# A sink that has not taken the restored volume within this long is restored
+# again; until it has, its volume is not stored.
+RESTORE_RETRY_S = 2.0
+# How long a new sink is left to WirePlumber's own restore before the
+# session's store (or the first-start volume) applies: a sink still at
+# PipeWire's default (100 %, unmuted) after this has had no restore.
+RESTORE_GRACE_S = 1.0
+
+# ALSA control ioctls (include/uapi/sound/asound.h, 64-bit)
+_ID_FMT = "IiII44sI"
+_VAL_SIZE = 1224
+_ELEM_READ = (3 << 30) | (_VAL_SIZE << 16) | (0x55 << 8) | 0x12
+_SUBSCRIBE_EVENTS = (3 << 30) | (4 << 16) | (0x55 << 8) | 0x16
+_EVENT_SIZE = 72
+_IFACE_MIXER = 2
+
+
+def own_start():
+    """This process's start time, /proc/self/stat field 22 (clock ticks
+    since boot). With the pid it names the writer of each report, so the
+    supervisor can tell a live helper from a stopped one's leftover report."""
+    with open("/proc/self/stat") as f:
+        stat = f.read()
+    return int(stat[stat.rindex(")") + 1 :].split()[19])
+
+
+def log(*a):
+    print("speakerguardd-session:", *a, file=sys.stderr, flush=True)
+
+
+class Card:
+    """Read-only access to the speaker card's "Speaker Protection" control."""
+
+    def __init__(self, card_id):
+        try:
+            # /proc/asound/<id> is a link to card<N>
+            self.index = int(os.readlink(f"/proc/asound/{card_id}").removeprefix("card"))
+        except (OSError, ValueError):
+            raise SystemExit(f"no ALSA card {card_id}")
+        self.fd = os.open(f"/dev/snd/controlC{self.index}", os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK)
+        # Control events: a withdrawal is seen at once, not at the next
+        # 50 ms period, so the amps are unlinked before the sink keeps
+        # retrying a start the kernel refuses.
+        try:
+            fcntl.ioctl(self.fd, _SUBSCRIBE_EVENTS, struct.pack("i", 1))
+            self.events = True
+        except OSError:
+            self.events = False
+
+    def drain(self):
+        """Discard pending control events; True if there were any."""
+        got = False
+        while True:
+            try:
+                if not os.read(self.fd, _EVENT_SIZE * 16):
+                    return got
+                got = True
+            except BlockingIOError:
+                return got
+            except OSError:
+                return got
+
+    def granted(self):
+        buf = bytearray(_VAL_SIZE)
+        buf[0:64] = struct.pack(_ID_FMT, 0, _IFACE_MIXER, 0, 0, b"Speaker Protection", 0)
+        try:
+            fcntl.ioctl(self.fd, _ELEM_READ, buf)
+        except OSError:
+            return False
+        if os.path.exists(SELFCHECK_ACTIVE) or os.path.exists(SLEEP_HOLD):
+            return False
+        return struct.unpack_from("q", buf, 72)[0] == 1
+
+
+class Graph:
+    """The PipeWire objects, kept current from `pw-dump --monitor`."""
+
+    def __init__(self):
+        self.proc = subprocess.Popen(
+            ["pw-dump", "--monitor", "--no-colors"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+        )
+        os.set_blocking(self.proc.stdout.fileno(), False)
+        self.buf = ""
+        self.dec = json.JSONDecoder()
+        self.objs = {}
+        # bumped on every update from the monitor: what is derived from the
+        # graph is computed once per change, not on every 50 ms period
+        self.gen = 0
+        self._memo = {}
+
+    def memo(self, key, fn):
+        """`fn()`, computed once per graph generation."""
+        hit = self._memo.get(key)
+        if hit is not None and hit[0] == self.gen:
+            return hit[1]
+        v = fn()
+        self._memo[key] = (self.gen, v)
+        return v
+
+    def pump(self, timeout, extra=()):
+        """Read the monitor's output for up to `timeout`; returns which of
+        the `extra` fds are readable."""
+        r, _, _ = select.select([self.proc.stdout, *extra], [], [], timeout)
+        ready = [fd for fd in extra if fd in r]
+        r = [x for x in r if x is self.proc.stdout]
+        if r:
+            chunk = self.proc.stdout.read()
+            if chunk is None:
+                return ready
+            if chunk == b"":
+                raise SystemExit("pw-dump exited")
+            self.buf += chunk.decode(errors="replace")
+        while True:
+            s = self.buf.lstrip()
+            if not s:
+                self.buf = ""
+                return ready
+            try:
+                arr, end = self.dec.raw_decode(s)
+            except ValueError:
+                self.buf = s
+                return ready
+            self.buf = s[end:]
+            if isinstance(arr, list) and arr:
+                self.gen += 1
+            for o in arr if isinstance(arr, list) else []:
+                if o.get("info") is None:
+                    self.objs.pop(o.get("id"), None)
+                else:
+                    old = self.objs.get(o["id"])
+                    if old is not None and o.get("type") == old.get("type"):
+                        # Updates carry only what changed
+                        for k, v in o["info"].items():
+                            if k == "params" and isinstance(v, dict):
+                                old["info"].setdefault("params", {}).update(v)
+                            else:
+                                old["info"][k] = v
+                    else:
+                        self.objs[o["id"]] = o
+
+    def of_type(self, t):
+        return self.memo(("type", t), lambda: [o for o in self.objs.values() if o.get("type", "").endswith(":" + t)])
+
+    def node_id(self, name):
+        def ids():
+            out = {}
+            for o in self.of_type("Node"):
+                out.setdefault((o["info"].get("props") or {}).get("node.name"), o["id"])
+            return out
+
+        return self.memo("node_ids", ids).get(name)
+
+    def node_link_group(self, nid):
+        props = ((self.objs.get(nid) or {}).get("info") or {}).get("props") or {}
+        g = props.get("node.link-group")
+        return g if isinstance(g, str) and g else None
+
+    def node_state(self, nid):
+        """A node's state ("suspended", "idle", "running", ...), or None."""
+        return ((self.objs.get(nid) or {}).get("info") or {}).get("state")
+
+    def node_props(self, nid):
+        o = self.objs.get(nid) or {}
+        params = (o.get("info") or {}).get("params") or {}
+        p = params.get("Props") or []
+        return p[0] if p else {}
+
+    def ports(self, nid, direction):
+        """{channel: port id} of a node's ports in one direction (no monitor ports)."""
+        out = {}
+        for o in self.of_type("Port"):
+            p = o["info"].get("props") or {}
+            if p.get("node.id") != nid or p.get("port.direction") != direction or p.get("port.monitor"):
+                continue
+            out[p.get("audio.channel")] = o["id"]
+        return out
+
+    def links(self):
+        return [
+            (o["id"], o["info"].get("output-port-id"), o["info"].get("input-port-id"))
+            for o in self.of_type("Link")
+        ]
+
+
+def voicing_volume(g, nid):
+    """(channel volumes, mute) of the voicing sink: the first Props object
+    with channel volumes is the converter's, which holds the node's volume
+    (the adapter lists it before the follower's). (None, None) without one."""
+    params = ((g.objs.get(nid) or {}).get("info") or {}).get("params") or {}
+    for p in params.get("Props") or []:
+        cv = p.get("channelVolumes") if isinstance(p, dict) else None
+        if isinstance(cv, list) and cv and all(isinstance(v, (int, float)) for v in cv):
+            return [float(v) for v in cv], bool(p.get("mute", False))
+    return None, None
+
+
+def valid_volume_record(rec, n):
+    """A stored {channelVolumes, mute} for n channels, or None."""
+    if not isinstance(rec, dict):
+        return None
+    vols = rec.get("channelVolumes")
+    if not isinstance(vols, list) or len(vols) != n:
+        return None
+    if not all(isinstance(v, (int, float)) and not isinstance(v, bool) and 0.0 <= v <= 1.0 for v in vols):
+        return None
+    mute = rec.get("mute", False)
+    if not isinstance(mute, bool):
+        return None
+    return {"channelVolumes": [float(v) for v in vols], "mute": mute}
+
+
+def state_dir():
+    base = os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state")
+    return os.path.join(base, "speakerguardd")
+
+
+def props_arg(vols, mute):
+    return "{ mute: %s, channelVolumes: [ %s ] }" % ("true" if mute else "false", ", ".join(repr(float(v)) for v in vols))
+
+
+def unity(props):
+    if not props:
+        return False
+    if props.get("mute", False):
+        return False
+    if abs(props.get("volume", 1.0) - 1.0) > 1e-6:
+        return False
+    return all(abs(v - 1.0) <= 1e-6 for v in props.get("channelVolumes", [1.0]))
+
+
+class Session:
+    def __init__(self, m, c):
+        self.m, self.c = m, c
+        self.amps, self.sense = c["amps"], c["sense"]
+        self.voicing = f"effect_output.{m}-convolver"
+        self.protect_out = f"sgv2.protect.{m}.out"
+        self.speaker = f"sgv2.speaker.{m}"
+        self.sense_name = f"sgv2.sense.{m}"
+        self.voicing_sink = f"sgv2.voicing.{m}"
+        # a sink with no device: linked while the speakers are wanted, it
+        # keeps the protect stage running without a client (see 4)
+        self.hold = f"sgv2.hold.{m}"
+        self.last_hold_try = -10.0
+        # the play value of the last report written
+        self.reported_play = False
+        # until when the hold primes the stage (set when the graph appears)
+        self.prime_until = None
+        self.volume_file = os.path.join(state_dir(), f"voicing-{m}.json")
+        # the voicing sink node the volume was restored to, what was
+        # restored and when, whether the sink has taken it, what is stored
+        self.vs_id = None
+        self.vs_restored = None
+        self.vs_restore_at = -10.0
+        self.vs_seen_at = 0.0
+        self.vs_settled = False
+        self.vs_saved = None
+        self.last_try = -10.0
+        self.last_suspend = -10.0
+        self.last_unity = -10.0
+        self.pending = {}
+        # when a client stream last ran into the protect stage
+        self.last_play = None
+        # when the speakers stopped being wanted
+        self.idle_since = None
+
+    def wanted(self, g):
+        """The links the helper owns: (out port, in port) pairs, or None if a node is missing."""
+        protect = g.node_id(PROTECT_INPUT)
+        pout = g.node_id(self.protect_out)
+        spk = g.node_id(self.speaker)
+        sense = g.node_id(self.sense_name) if self.sense else None
+        if None in (protect, pout, spk) or (self.sense and sense is None):
+            return None
+        pin = g.ports(protect, "in")
+        po = g.ports(pout, "out")
+        si = g.ports(spk, "in")
+        want = []
+        for i in range(self.amps):
+            a = f"AUX{i}"
+            if a not in po or a not in si:
+                return None
+            want.append((po[a], si[a]))
+        if self.sense:
+            so = g.ports(sense, "out")
+            for i in range(self.sense):
+                a, b = f"AUX{i}", f"AUX{self.amps + i}"
+                if a not in so or b not in pin:
+                    return None
+                want.append((so[a], pin[b]))
+        return want
+
+    def check(self, g):
+        """(links_ok, carrier_ok) for the current graph."""
+        return g.memo("check", lambda: self._check(g))
+
+    def _check(self, g):
+        protect = g.node_id(PROTECT_INPUT)
+        pout = g.node_id(self.protect_out)
+        spk = g.node_id(self.speaker)
+        sense = g.node_id(self.sense_name) if self.sense else None
+        if protect is None or pout is None or spk is None:
+            return False, False
+        port_info = {}
+        for o in g.of_type("Port"):
+            p = o["info"].get("props") or {}
+            port_info[o["id"]] = (p.get("node.id"), p.get("audio.channel"))
+        ok = True
+        for _, out_p, in_p in g.links():
+            on, oc = port_info.get(out_p, (None, None))
+            inn, ic = port_info.get(in_p, (None, None))
+            if inn == protect:
+                k = int(ic[3:]) if ic and ic.startswith("AUX") else -1
+                if 0 <= k < self.amps:
+                    # Program: whatever plays into the protect stage is
+                    # protected; only its channel must match, and it must not
+                    # be the sense.
+                    ok &= on != sense and oc == ic
+                else:
+                    ok &= sense is not None and on == sense and oc == f"AUX{k - self.amps}"
+            elif inn == spk:
+                ok &= on == pout and oc == ic
+            elif sense is not None and on == sense:
+                ok = False
+        carrier = unity(g.node_props(protect)) and (sense is None or unity(g.node_props(sense)))
+        return ok, carrier
+
+    def pin_amps_unity(self, g):
+        """The amps' sink carries no volume: the protect stage models exactly
+        what reaches the amps, and the user's volume lives in the voicing in
+        front of it. A volume or mute set on it (by a session restore, a
+        mixer or a script) is put back to unity, at most once a second.
+        Returns True when a reset was started."""
+        spk = g.node_id(self.speaker)
+        props = g.node_props(spk) if spk is not None else {}
+        if not props or unity(props):
+            return False
+        now = time.monotonic()
+        if now - self.last_unity < 1.0:
+            return False
+        self.last_unity = now
+        n = max(len(props.get("channelVolumes", [])), self.amps)
+        vols = ", ".join(["1.0"] * n)
+        log(f"amps sink volume {props.get('volume')} {props.get('channelVolumes')} mute={props.get('mute')}: reset to unity")
+        self._spawn(
+            ("unity", spk),
+            ["pw-cli", "set-param", str(spk), "Props", f"{{ mute: false, volume: 1.0, channelVolumes: [ {vols} ] }}"],
+        )
+        return True
+
+    def load_volume(self, n):
+        try:
+            with open(self.volume_file) as f:
+                return valid_volume_record(json.load(f), n)
+        except (OSError, ValueError):
+            return None
+
+    def save_volume(self, vols, mute):
+        rec = {"channelVolumes": vols, "mute": mute}
+        if rec == self.vs_saved:
+            return
+        try:
+            os.makedirs(os.path.dirname(self.volume_file), mode=0o700, exist_ok=True)
+            tmp = f"{self.volume_file}.{os.getpid()}.tmp"
+            with open(tmp, "w") as f:
+                json.dump(rec, f)
+            os.replace(tmp, self.volume_file)
+            self.vs_saved = rec
+        except OSError as e:
+            log(f"voicing volume not stored: {e}")
+
+    def keep_voicing_volume(self, g, now=None):
+        """Give a new voicing sink its volume (WirePlumber's restore, else
+        the stored one, else the first-start volume) and store the user's
+        changes. Returns "restore" when it set the volume, else None."""
+        now = time.monotonic() if now is None else now
+        self._reap()
+        nid = g.node_id(self.voicing_sink)
+        if nid is None:
+            self.vs_id = None
+            return None
+        vols, mute = voicing_volume(g, nid)
+        if vols is None:
+            return None
+        if nid != self.vs_id:
+            # a new sink: give WirePlumber's own restore (when it has a
+            # record, under whichever key) RESTORE_GRACE_S to land first
+            self.vs_id, self.vs_settled, self.vs_restored = nid, False, None
+            self.vs_seen_at = now
+        if not self.vs_settled:
+            if self.vs_restored is None:
+                default = not mute and all(abs(v - 1.0) <= 1e-6 for v in vols)
+                if not default:
+                    # the session (WirePlumber) restored a volume: it is the
+                    # user's latest, keep it and store it
+                    self.vs_settled = True
+                elif now - self.vs_seen_at < RESTORE_GRACE_S:
+                    return None
+                else:
+                    rec = self.load_volume(len(vols))
+                    if rec is None:
+                        rec = {"channelVolumes": [FIRST_START_VOLUME] * len(vols), "mute": False}
+                        log(f"voicing volume: nothing stored, first start at {FIRST_START_VOLUME ** (1 / 3):.2f}")
+                    self.vs_restored = rec
+                    self.vs_restore_at = -10.0
+            if not self.vs_settled:
+                want = self.vs_restored
+                if all(abs(a - b) <= 1e-6 for a, b in zip(vols, want["channelVolumes"])) and mute == want["mute"]:
+                    self.vs_settled = True
+                elif now - self.vs_restore_at >= RESTORE_RETRY_S:
+                    self.vs_restore_at = now
+                    self._spawn(("voicing-restore", nid), ["pw-cli", "set-param", str(nid), "Props", props_arg(want["channelVolumes"], want["mute"])])
+                    return "restore"
+                else:
+                    return None
+        self.save_volume(vols, mute)
+        return None
+
+    def clients(self, g):
+        """The client nodes that feed the protect stage's program. From the
+        protect stage upstream: a node linked into a stage node is part of
+        the stage when it is one half of a pair (a filter-chain or loopback
+        shares its node.link-group between its sink and its output, like the
+        voicing), and then its own sources are followed; any other node is a
+        client. The sense and the amps are never part of it."""
+        protect = g.node_id(PROTECT_INPUT)
+        if protect is None:
+            return set()
+        skip = {g.node_id(self.speaker), g.node_id(self.sense_name), g.node_id(self.protect_out)} - {None}
+        port_node = {o["id"]: (o["info"].get("props") or {}).get("node.id") for o in g.of_type("Port")}
+        groups = {}
+        for n in g.of_type("Node"):
+            lg = g.node_link_group(n["id"])
+            if lg:
+                groups.setdefault(lg, set()).add(n["id"])
+        edges = [(port_node.get(o), port_node.get(i)) for _, o, i in g.links()]
+        stage, todo, found = {protect}, [protect], set()
+        while todo:
+            n = todo.pop()
+            for src, dst in edges:
+                if dst != n or src is None or src in skip or src in stage:
+                    continue
+                pair = groups.get(g.node_link_group(src), set())
+                if len(pair) > 1:
+                    for x in pair - skip:
+                        if x not in stage:
+                            stage.add(x)
+                            todo.append(x)
+                else:
+                    found.add(src)
+        return found - stage
+
+    def playing(self, g):
+        """Whether a client stream runs into the protect stage now."""
+        return g.memo("playing", lambda: any(g.node_state(n) == "running" for n in self.clients(g)))
+
+    def want(self, g, now):
+        """Whether the speakers are wanted: a client plays, or one stopped
+        less than IDLE_HOLD_S ago."""
+        if self.playing(g):
+            if self.idle_since is not None or self.last_play is None:
+                # the first link attempt after idle is not rate-limited
+                self.last_try = -10.0
+            self.last_play = now
+            self.idle_since = None
+            return True
+        if self.last_play is not None and now - self.last_play < IDLE_HOLD_S:
+            return True
+        if self.idle_since is None:
+            self.idle_since = now
+        return False
+
+    def play_report(self, g, want, now):
+        """`play` for the report: 1 while the speakers are wanted, and
+        while the amps and the sense are still being taken down after they
+        stopped being wanted (at most TEARDOWN_S), so the grant ends with
+        both PCMs closed rather than under a running stream."""
+        if want:
+            return True
+        if self.last_play is None:
+            # nothing has played since this helper started: nothing to take down
+            return False
+        if self.idle_since is None or now - self.idle_since >= TEARDOWN_S:
+            return False
+        if self.amps_linked(g):
+            return True
+        nodes = (g.node_id(self.speaker), g.node_id(self.sense_name) if self.sense else None)
+        return any(n is not None and g.node_state(n) not in (None, "suspended") for n in nodes)
+
+    def amps_linked(self, g):
+        """True while any link feeds the amps' sink."""
+        return g.memo("amps_linked", lambda: self._amps_linked(g))
+
+    def _amps_linked(self, g):
+        spk = g.node_id(self.speaker)
+        if spk is None:
+            return False
+        owners = {o["id"]: (o["info"].get("props") or {}).get("node.id") for o in g.of_type("Port")}
+        return any(owners.get(i) == spk for _, _, i in g.links())
+
+    def wiring(self, g):
+        """The protect stage's `sgv2.wiring` (16 hex digits), or None."""
+        protect = g.node_id(PROTECT_INPUT)
+        props = ((g.objs.get(protect) or {}).get("info") or {}).get("props") or {}
+        w = props.get("sgv2.wiring")
+        return w if isinstance(w, str) and len(w) == 16 and all(ch in "0123456789abcdef" for ch in w) else None
+
+    def _spawn(self, key, argv):
+        """Run pw-link without waiting: the report must not stall behind it."""
+        if key in self.pending:
+            return
+        self.pending[key] = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def unlink_all(self, g, timeout):
+        """Take the amps, the sense and the hold out of the graph and wait
+        for it, at most `timeout` seconds in all, so a stopping helper leaves
+        nothing linked and never hangs shutdown."""
+        deadline = time.monotonic() + timeout
+        self.reconcile(g, False)
+        self.keep_hold(g, False)
+        for p in list(self.pending.values()):
+            try:
+                p.wait(max(0.0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                p.kill()
+        self._reap()
+
+    def _reap(self):
+        for k, p in list(self.pending.items()):
+            if p.poll() is not None:
+                del self.pending[k]
+
+    def reconcile(self, g, granted, play=True):
+        self._reap()
+        want = self.wanted(g)
+        have = {(o, i): lid for lid, o, i in g.links()}
+        if granted and play and want:
+            # A link pw-link could not make is tried again once a second
+            now = time.monotonic()
+            missing = [w for w in want if w not in have]
+            if missing and now - self.last_try >= 1.0:
+                self.last_try = now
+                for o, i in missing:
+                    self._spawn(("link", o, i), ["pw-link", str(o), str(i)])
+        elif not granted or not play:
+            # Withdrawn, or nothing plays: take the amps and the sense out of
+            # the graph, so the amps' sink is not started again until the
+            # next grant. That includes a capture of the amps' monitor: a
+            # link out of the sink wakes it as surely as one into it, and
+            # its start without a grant is refused.
+            spk = g.node_id(self.speaker)
+            sense = g.node_id(self.sense_name) if self.sense else None
+            owners = {o["id"]: (o["info"].get("props") or {}).get("node.id") for o in g.of_type("Port")}
+            linked = False
+            for lid, o, i in g.links():
+                if spk in (owners.get(i), owners.get(o)) or (sense is not None and owners.get(o) == sense):
+                    linked = True
+                    self._spawn(("unlink", lid), ["pw-link", "-d", str(lid)])
+            if (os.path.exists(SLEEP_HOLD) or not play) and not linked:
+                self.suspend_for_sleep(g, (spk, sense))
+
+    def hold_links(self, g):
+        """(wanted (out, in) pairs or None, existing links into the hold)."""
+        pout, hold = g.node_id(self.protect_out), g.node_id(self.hold)
+        if pout is None or hold is None:
+            return None, []
+        owners = {o["id"]: (o["info"].get("props") or {}).get("node.id") for o in g.of_type("Port")}
+        have = [(lid, o, i) for lid, o, i in g.links() if owners.get(i) == hold]
+        po, hi = g.ports(pout, "out"), g.ports(hold, "in")
+        want = []
+        for k in range(self.amps):
+            a = f"AUX{k}"
+            if a not in po or a not in hi:
+                return None, have
+            want.append((po[a], hi[a]))
+        return want, have
+
+    def keep_hold(self, g, keep):
+        """Link the protect stage's output to the hold while `keep`, unlink
+        it otherwise. A graph without a hold (an older generated graph)
+        has nothing to do."""
+        self._reap()
+        want, have = self.hold_links(g)
+        if keep:
+            if want is None:
+                return
+            present = {(o, i) for _, o, i in have}
+            missing = [w for w in want if w not in present]
+            now = time.monotonic()
+            # the first attempt at once, a failed one again once a second
+            if missing and now - self.last_hold_try >= 1.0:
+                self.last_hold_try = now
+                for o, i in missing:
+                    self._spawn(("link", o, i), ["pw-link", str(o), str(i)])
+        else:
+            self.last_hold_try = -10.0
+            for lid, _, _ in have:
+                self._spawn(("unlink", lid), ["pw-link", "-d", str(lid)])
+
+    def hold_linked(self, g):
+        return bool(self.hold_links(g)[1])
+
+    def priming(self, g, now):
+        """Whether the hold primes the stage now: for PRIME_S once the
+        protect stage's output and the hold are first both there."""
+        if self.prime_until is None:
+            if self.hold_links(g)[0] is None:
+                return False
+            self.prime_until = now + PRIME_S
+        return now < self.prime_until
+
+    def suspend_for_sleep(self, g, nodes):
+        """Under the sleep hold, or with nothing playing, once nothing is
+        linked: suspend the amps' sink and the sense, which closes their
+        PCMs (and powers the amps down). Unlinked they are only
+        paused, and WirePlumber closes an idle node after 5 s, after the
+        sleep has begun; a PCM held open across a sleep is unmuted by the
+        resume before its I2S clocks are back (the MCA loses its state in
+        sleep). speakerguardd-provision sleep waits for the PCMs to read
+        closed. Sent again every 0.5 s while a node is not suspended."""
+        now = time.monotonic()
+        if now - self.last_suspend < 0.5:
+            return
+        for nid in nodes:
+            if nid is not None and g.node_state(nid) not in (None, "suspended"):
+                self.last_suspend = now
+                # the node's Suspend command (pw-cli 1.x: id, command, args)
+                self._spawn(("suspend", nid), ["pw-cli", "send-command", str(nid), "Suspend", "{}"])
+
+
+_WRITER = None
+
+
+def realtime():
+    """Best effort: low SCHED_FIFO if RLIMIT_RTPRIO allows it (PipeWire's
+    limits.d grants it to its group), else a higher nice if allowed. Either
+    keeps the report on time under desktop load; without them the
+    supervisor's 500 ms report bound absorbs a late report. The engine,
+    PCM and owner checks never depend on this process's timing."""
+    try:
+        os.sched_setscheduler(0, os.SCHED_FIFO, os.sched_param(5))
+        log("SCHED_FIFO 5")
+        return
+    except (OSError, AttributeError):
+        pass
+    try:
+        os.nice(-10)
+        log("nice -10")
+    except OSError:
+        log("normal priority (no RLIMIT_RTPRIO or CAP_SYS_NICE)")
+
+
+def write_report(path, links, carrier, wiring=None, amps=None, play=None):
+    """Write one report atomically: a new file in the helper's own
+    directory, renamed over the last one. The supervisor reads either the
+    whole new report or the whole previous one, never a partial write.
+    It names its writer (pid, start time): the supervisor ignores a report
+    whose writer is not alive."""
+    global _WRITER
+    if _WRITER is None:
+        _WRITER = (os.getpid(), own_start())
+    pid, start = _WRITER
+    w = f" wiring={wiring}" if wiring else ""
+    # amps: whether anything is linked into the amps' sink (speakerguardd-sleep
+    # waits for 0 before the supervisor stops)
+    if amps is not None:
+        w += f" amps={int(amps)}"
+    # play: whether the speakers are wanted (a client stream runs into the
+    # protect stage); without it the supervisor releases
+    if play is not None:
+        w += f" play={int(play)}"
+    line = f"links={int(links)} carrier={int(carrier)} mono_ns={time.monotonic_ns()} pid={pid} start={start}{w}\n".encode()
+    tmp = os.path.join(os.path.dirname(path), f".session.{os.getpid()}")
+    try:
+        # 0640: the directory is setgid root, so the supervisor reads it
+        # through the group (it runs without CAP_DAC_OVERRIDE)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_CLOEXEC | os.O_NOFOLLOW, 0o640)
+        try:
+            os.fchmod(fd, 0o640)
+            os.write(fd, line)
+        finally:
+            os.close(fd)
+        os.rename(tmp, path)
+        return True
+    except OSError:
+        return False
+
+
+def machine(args):
+    """The machine's card and channel counts, from the self-check's record
+    (derived from this Mac's device tree and proven on it)."""
+    try:
+        with open(args.selfcheck) as f:
+            rec = json.load(f)["record"]
+    except (OSError, ValueError, KeyError) as e:
+        raise SystemExit(f"{args.machine}: no self-check record ({e})")
+    if rec.get("key") != args.machine or rec.get("result") != "pass":
+        raise SystemExit(f"{args.machine}: the self-check record is for {rec.get('key')} ({rec.get('result')})")
+    return {"card": rec["card"], "amps": rec["amps"], "sense": rec["sense"]}
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--machine", required=True)
+    ap.add_argument("--selfcheck", default="/var/lib/speakerguardd/selfcheck.json")
+    args = ap.parse_args()
+    c = machine(args)
+    card = Card(c["card"])
+    g = Graph()
+    s = Session(args.machine, c)
+    report = f"/run/speakerguardd/{os.getuid()}/helper/session"
+
+    def stop(*_):
+        # a stopped helper leaves no report behind (the supervisor releases
+        # at once), and no amps or sense linked, so the sink does not keep
+        # retrying a refused start until PipeWire restarts; the unlink is
+        # bounded to 1 s
+        try:
+            os.unlink(report)
+        except OSError:
+            pass
+        try:
+            s.unlink_all(g, 1.0)
+        except Exception as e:  # noqa: BLE001 - shutting down regardless
+            log(f"unlink on stop: {e}")
+        raise SystemExit(0)
+
+    realtime()
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    last = (None, None, None, None, None)
+    was_granted = None
+    play = False
+    nxt = time.monotonic()
+    while True:
+        ready = g.pump(max(0.0, nxt - time.monotonic()), [card.fd] if card.events else [])
+        if ready and card.drain():
+            # a grant or a withdrawal: link or unlink now
+            granted = card.granted()
+            if granted != was_granted:
+                s.reconcile(g, granted, play)
+                was_granted = granted
+        if time.monotonic() < nxt:
+            # event-driven: a link, carrier or playback change is reported
+            # at once, not at the next period
+            if ready is not None and (s.check(g) != last[1:3] or s.want(g, time.monotonic()) != play):
+                nxt = time.monotonic()
+            else:
+                continue
+        granted = card.granted()
+        now = time.monotonic()
+        play = s.want(g, now)
+        links, carrier = s.check(g)
+        amps = s.amps_linked(g)
+        reported = s.play_report(g, play, now)
+        wrote = write_report(report, links, carrier, s.wiring(g), amps, reported)
+        s.reconcile(g, granted, play)
+        # the hold stays linked while this or the last report said play=1,
+        # so the supervisor reads play=0 (and gives the grant back as idle)
+        # while the stage still beats
+        priming = s.priming(g, now)
+        s.keep_hold(g, reported or s.reported_play or priming)
+        quiet = not (granted or reported or s.reported_play or priming or amps or s.hold_linked(g))
+        s.reported_play = reported
+        period = IDLE_PERIOD if quiet else PERIOD
+        nxt += period
+        if nxt < time.monotonic():
+            nxt = time.monotonic() + period
+        s.pin_amps_unity(g)
+        s.keep_voicing_volume(g, now)
+        was_granted = granted
+        state = (granted, links, carrier, wrote, play)
+        if state != last:
+            log(f"granted={int(granted)} links={int(links)} carrier={int(carrier)} play={int(play)} report={'ok' if wrote else 'unwritable'}")
+            last = state
+
+
+if __name__ == "__main__":
+    main()

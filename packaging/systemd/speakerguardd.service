@@ -1,0 +1,78 @@
+[Unit]
+Description=Speaker protection supervisor (in-graph, macOS-parity)
+Documentation=https://github.com/aurora-silicon/speakerguardd/tree/v2
+# Without this service no protection holds the amplifiers, and the kernel's
+# own safe level applies. There is deliberately no OnFailure= chain.
+After=systemd-udev-settle.service speakerguardd-provision.service speakerguardd-selfcheck.service
+After=speakerguardd-switchtest.service
+# Stopped only after every user session (and its PipeWire) is gone, at
+# shutdown and reboot: no speaker stream is left running into the
+# withdrawal, so no start is refused.
+After=systemd-user-sessions.service
+# Provisioning (the parameter blob from this Mac's tuning, the seat user,
+# this unit's configuration) and the first-boot wiring self-check: the
+# supervisor grants only with a passing record of both for this board,
+# kernel and parameter blob. The self-check's switch test, when it has to
+# run, runs after login (speakerguardd-switchtest.service).
+Requires=speakerguardd-provision.service speakerguardd-selfcheck.service
+Requires=speakerguardd-switchtest.service
+ConditionPathExists=/proc/device-tree/compatible
+
+[Service]
+Type=notify
+# Only on a board the fleet gate places on v2, with the v2 kernel interface.
+ExecCondition=/usr/libexec/speakerguardd/speakerguardd-gate v2
+# A dual kernel ("Speaker Protection Interface", linux 98cb6a86 and later)
+# starts every boot on "Speaker Volume Unlock": on a Mac aurora-speaker-
+# upgrade switched to v2, put it on the lease right before the supervisor
+# takes it (the kernel goes back to the volume lock 30 s after the last
+# owner closes, so this runs on every start). A no-op on other kernels.
+ExecStartPre=/usr/libexec/speakerguardd/speakerguardd-gate interface
+# Written by speakerguardd-provision: SGV2_ARGS="--card <ID> --pcm <D>
+# --uid <UID> --params <blob>", the seat user's uid resolved by name.
+# Optional ("-"), so that on a board or kernel the gate skips, the unit is
+# skipped cleanly rather than failed. Here it always exists: provisioning,
+# which this unit requires, writes it or fails, and without it the
+# supervisor exits with EX_CONFIG (no restart) and the kernel's floor holds.
+EnvironmentFile=-/etc/speakerguardd/speakerguardd.conf
+ExecStart=/usr/bin/speakerguardd $SGV2_ARGS
+Restart=on-failure
+# The kernel's floor holds while it is down: come back quickly. A crash
+# loop still ends in the unit's start limit, at the floor.
+RestartSec=100ms
+RestartPreventExitStatus=78
+# A stall itself is caught by the kernel, whose 30 ms lease floors the amps
+# when it is not renewed. A hung supervisor is aborted by its own hang watch
+# after 10 s, which does not count a system sleep: systemd's watchdog clock
+# keeps running while userspace is frozen (the freezer, device suspend and
+# resume, a pm_test delay), so a frozen supervisor looked hung at every thaw
+# of a sleep entered without speakerguardd-sleep.service (a direct write to
+# /sys/power/state). systemd's watchdog stays only as the last resort for a
+# wedged process, far above any freeze.
+WatchdogSec=10min
+RuntimeDirectory=speakerguardd
+RuntimeDirectoryMode=0755
+# Kept over every stop and start, not only an automatic restart: the plugin
+# keeps the engine page mapped, and the supervisor reopens the same file
+# (never truncating it). If the file is replaced anyway, the plugin's page
+# watcher re-attaches to the new one (crates/sgv2-lv2/src/attach.rs).
+RuntimeDirectoryPreserve=yes
+# The speaker card's control device only: it owns "Speaker Protection"
+# there, and closing it (any exit) withdraws protection at once.
+DevicePolicy=closed
+DeviceAllow=char-alsa rw
+# Real-time scheduling and locked memory for the 10 ms loop; chown hands the
+# engine page and the session report to the session user. CAP_SYS_ADMIN: the
+# kernel (sgv2k2) requires it to lock "Speaker Protection" and to write it,
+# so a seat user with the control device's uaccess ACL cannot own the
+# speakers. The service runs as root, so the bounding set is what it keeps.
+CapabilityBoundingSet=CAP_SYS_NICE CAP_IPC_LOCK CAP_CHOWN CAP_FOWNER CAP_SYS_ADMIN
+LimitRTPRIO=99
+LimitMEMLOCK=infinity
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

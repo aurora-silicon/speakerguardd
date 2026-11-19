@@ -1,0 +1,1357 @@
+//! spp3 against the behaviour specification's equations, on synthetic
+//! parameters only (no Mac's tuning appears here).
+
+use sgv2_core::spp3::{self, ChannelParams, Params};
+use sgv2_core::{Health, Io, ProtectionUnit, Telemetry};
+
+const RATE: u32 = 48_000;
+const BLOCK: u32 = 512;
+
+/// Synthetic two-group, four-channel parameter set with short time
+/// constants so the tests settle quickly.
+fn params() -> Params {
+    let mut p = Params {
+        channels: 4,
+        sample_rate: RATE,
+        block_frames: BLOCK,
+        thermal_ambient_temp: 40.0,
+        thermal_gain_attack_time_s: 0.5,
+        thermal_gain_release_time_s: 2.0,
+        thermal_lookahead_delay_ms: 1.5,
+        thermal_protection_enabled: 1,
+        thermal_safe_tlim: 100.0,
+        thermal_safe_tlim_offset: -15.0,
+        thermal_safe_tlim_time_min: 10.0,
+        thermal_state_override: spp3::THERMAL_STATE_COLD,
+        ..Params::default()
+    };
+    for (c, ch) in p.ch[..4].iter_mut().enumerate() {
+        *ch = ChannelParams {
+            source: c as u32,
+            group: if c < 2 { 7 } else { 3 },
+            ignore_telemetry: 0,
+            t_sett_vc: 20.0 + c as f32,
+            t_sett_mg: 10.0,
+            tau_tvc: 0.4,
+            tau_tmg: 3.0,
+            temperature_limit: 120.0,
+            hard_temp_limit_headroom: 8.0,
+            reb_ref: 4.0,
+            rshunt: 0.2,
+            thermal_ff_speedup_factor: 0.5,
+            cl_thermal_feedback_enabled: 1,
+            rampout: 0.0,
+            ag: 10.0,
+            imon_scale: 2.0,
+            vmon_scale: 12.0,
+            i_pwr_thres: 0.0,
+            v_pwr_thres: 0.0,
+            sense_i: 2 * c as u32,
+            sense_v: 2 * c as u32 + 1,
+            pilot_tone_enabled: 0,
+            pilot_ampl_hi_db: -30.0,
+            pilot_ampl_lo_db: -40.0,
+            pilot_upper_thres: 90.0,
+            pilot_lower_thres: 80.0,
+            pilot_decay_time_s: 0.03,
+            pilot_decay_time_stage2_s: 0.03,
+            pilot_freq: 43.0664,
+            pilot_enable_thres: 0.03,
+            thermal_measurement_method: spp3::METHOD_PILOT_TONE,
+            temp_sense_window_time_s: 0.1,
+            temp_sense_smoothing_tau_s: 0.5,
+            rdc_scale: 1.0,
+            reb_range_min: 2.0,
+            reb_range_max: 8.0,
+            cal_temp_range_min: 10.0,
+            cal_temp_range_max: 50.0,
+            a_t_20c: 0.004,
+            a_t_35c: 0.0038,
+            tlim_err_decay_time_s: 5.0,
+            tlim_adj_cap: 30.0,
+            cal_present: 0,
+            cal_r: 0.0,
+            cal_t: 0.0,
+        };
+    }
+    p
+}
+
+const U: usize = spp3::THERMAL_FRAMES;
+const LOOK: usize = 72; // 1.5 ms at 48 kHz
+
+fn dt() -> f64 {
+    U as f64 / RATE as f64
+}
+
+fn elec(p: &Params, c: usize) -> f64 {
+    let ch = &p.ch[c];
+    let (ag, reb, rs) = (ch.ag as f64, ch.reb_ref as f64, ch.rshunt as f64);
+    ag * ag * reb / ((reb + rs) * (reb + rs))
+}
+
+/// Run `seconds` of constant-level drive `x[c]` through the unit in host
+/// slices of `slice` frames; return the final telemetry and the last output
+/// sample per channel.
+fn drive(unit: &mut spp3::Unit, x: [f32; 4], seconds: f64, slice: usize) -> (Telemetry, [f32; 4]) {
+    let total = (seconds * RATE as f64) as usize;
+    let input: Vec<Vec<f32>> = (0..4).map(|c| vec![x[c]; slice]).collect();
+    let mut output = vec![vec![0.0f32; slice]; 4];
+    let mut done = 0;
+    while done < total {
+        let n = slice.min(total - done);
+        let ins: Vec<&[f32]> = input.iter().map(|b| &b[..n]).collect();
+        let mut outs: Vec<&mut [f32]> = output.iter_mut().map(|b| &mut b[..n]).collect();
+        unit.process(Io { frames: n, input: &ins, sense: &[], output: &mut outs });
+        done += n;
+    }
+    let mut t = Telemetry::new();
+    unit.telemetry(&mut t);
+    let last = [0, 1, 2, 3].map(|c| output[c][(total - 1) % slice]);
+    (t, last)
+}
+
+#[test]
+fn steady_state_temperature() {
+    let p = params();
+    let mut u = spp3::Unit::new(p);
+    let (t, _) = drive(&mut u, [0.08; 4], 60.0, 1024);
+    for c in 0..4 {
+        let pw = elec(&p, c) * 0.0064;
+        let want = 40.0 + pw * (p.ch[c].t_sett_vc as f64 + p.ch[c].t_sett_mg as f64);
+        let got = t.channels[c].ol_temp_c as f64;
+        assert!((got - want).abs() < 0.01, "ch{c} {got} {want}");
+    }
+}
+
+#[test]
+fn host_slicing_follows_the_dezipper_snap() {
+    let p = params();
+    let n = 48_000 * 3;
+    let sig: Vec<Vec<f32>> = (0..4)
+        .map(|c| {
+            let mut s = 17u32 + c;
+            (0..n)
+                .map(|k| {
+                    s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+                    let env = if (k / 9000) % 2 == 0 { 0.9 } else { 0.05 };
+                    ((s >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 2.0 * env
+                })
+                .collect()
+        })
+        .collect();
+    let render = |slice: usize| {
+        let mut u = spp3::Unit::new(p);
+        let mut out = vec![vec![0.0f32; n]; 4];
+        let mut t = Telemetry::new();
+        let mut done = 0;
+        while done < n {
+            let m = slice.min(n - done);
+            let ins: Vec<&[f32]> = sig.iter().map(|b| &b[done..done + m]).collect();
+            let mut outs: Vec<&mut [f32]> = out.iter_mut().map(|b| &mut b[done..done + m]).collect();
+            u.process(Io { frames: m, input: &ins, sense: &[], output: &mut outs });
+            done += m;
+        }
+        u.telemetry(&mut t);
+        let state: Vec<(f32, f32, f32)> =
+            (0..4).map(|c| (t.channels[c].ol_temp_c, t.channels[c].magnet_temp_c, t.channels[c].gain)).collect();
+        (out, (t.frame, state))
+    };
+    // Each call starts its dezipper at the selected target (rig dezipper
+    // law), so slices that divide the 256-frame update hold the gain
+    // constant per update and all agree; longer slices glide inside the
+    // call and differ, as the reference does.
+    let (ref_out, ref_t) = render(256);
+    // the limiter must actually have engaged for this to mean anything
+    assert!(ref_t.1[0].2 < 0.999, "{:?}", ref_t);
+    for slice in [1usize, 2, 64, 128] {
+        let (o, t) = render(slice);
+        assert!(o == ref_out, "audio differs at slice {slice}");
+        assert_eq!(t, ref_t, "state differs at slice {slice}");
+    }
+    let (o512, _) = render(512);
+    assert!(o512 != ref_out, "a 512-frame call glides inside the call");
+    // and a given slicing is deterministic
+    assert!(render(512).0 == o512);
+}
+
+#[test]
+fn audio_is_not_delayed_and_unity_is_bit_exact() {
+    let p = params();
+    let mut u = spp3::Unit::new(p);
+    let mut x = vec![0.0f32; 512];
+    x[10] = 0.25;
+    x[11] = -0.123_456_79;
+    let ins: Vec<&[f32]> = (0..4).map(|_| &x[..]).collect();
+    let mut ob = vec![vec![0.0f32; 512]; 4];
+    let mut outs: Vec<&mut [f32]> = ob.iter_mut().map(|b| &mut b[..]).collect();
+    u.process(Io { frames: 512, input: &ins, sense: &[], output: &mut outs });
+    for o in &ob {
+        assert_eq!(o, &x);
+    }
+}
+
+#[test]
+fn failsafe_cases_are_exactly_twenty_db() {
+    let x = [0.5f32; 64];
+    let mut o = [[0.0f32; 64]; 4];
+    // channel-count mismatch
+    let mut u = spp3::Unit::new(params());
+    let ins: [&[f32]; 3] = [&x, &x, &x];
+    {
+        let [a, b, c, _] = &mut o;
+        let mut outs: [&mut [f32]; 3] = [a, b, c];
+        let h = u.process(Io { frames: 64, input: &ins, sense: &[], output: &mut outs });
+        assert!(h.is_failsafe() && h.0 & Health::CHANNEL_MISMATCH != 0);
+    }
+    assert!(o[0].iter().all(|&v| (v - 0.05).abs() < 1e-7));
+    // invalid essential parameters
+    let mut bad = params();
+    bad.ch[2].tau_tvc = f32::NAN;
+    assert!(spp3::Unit::init_error(&bad).is_some());
+    // a controller the implementation does not have
+    let mut cl = params();
+    cl.enable_cpms_control = 1;
+    assert_eq!(spp3::Unit::init_error(&cl), Some(spp3::InitError::Unsupported("EnableCPMSControl")));
+    for p in [bad, cl, Params::default()] {
+        let mut u = spp3::Unit::new(p);
+        assert!(u.is_failsafe());
+        let ins: [&[f32]; 4] = [&x; 4];
+        let [a, b, c, d] = &mut o;
+        let mut outs: [&mut [f32]; 4] = [a, b, c, d];
+        let h = u.process(Io { frames: 64, input: &ins, sense: &[], output: &mut outs });
+        assert!(h.is_failsafe() && h.0 & Health::NO_PARAMS != 0);
+        assert!(o[3].iter().all(|&v| (v - 0.05).abs() < 1e-7));
+    }
+}
+
+#[test]
+fn non_finite_input_never_reaches_the_output_or_the_model() {
+    let p = params();
+    let mut u = spp3::Unit::new(p);
+    let mut x = vec![0.1f32; 512];
+    x[5] = f32::NAN;
+    x[6] = f32::INFINITY;
+    let ins: Vec<&[f32]> = (0..4).map(|_| &x[..]).collect();
+    let mut ob = vec![vec![0.0f32; 512]; 4];
+    let mut any_fs = false;
+    for _ in 0..3 {
+        let mut outs: Vec<&mut [f32]> = ob.iter_mut().map(|b| &mut b[..]).collect();
+        let h = u.process(Io { frames: 512, input: &ins, sense: &[], output: &mut outs });
+        any_fs |= h.is_failsafe();
+        assert!(ob.iter().flatten().all(|v| v.is_finite()));
+    }
+    assert!(any_fs);
+    let mut t = Telemetry::new();
+    u.telemetry(&mut t);
+    assert!(t.channels[0].ol_temp_c.is_finite() && t.channels[0].gain.is_finite());
+}
+
+#[test]
+fn blob_roundtrip() {
+    use sgv2_core::blob::{build, Pod};
+    let p = params();
+    let b = build(sgv2_core::UnitKind::Spp3, 4, 8, RATE, p.as_bytes());
+    assert_eq!(Params::from_blob(&b).unwrap(), p);
+    let mut bad = b.clone();
+    let n = bad.len();
+    bad[n - 3] ^= 0x40;
+    assert!(Params::from_blob(&bad).is_err());
+}
+
+#[test]
+fn measured_power_and_sense_geometry() {
+    let p = params();
+    let mut u = spp3::Unit::new(p);
+    let x = vec![0.1f32; 512];
+    let i = vec![0.05f32; 512];
+    let v = vec![0.2f32; 512];
+    let ins: Vec<&[f32]> = (0..4).map(|_| &x[..]).collect();
+    let sense: Vec<&[f32]> = (0..8).map(|k| if k % 2 == 0 { &i[..] } else { &v[..] }).collect();
+    let mut ob = vec![vec![0.0f32; 512]; 4];
+    let mut outs: Vec<&mut [f32]> = ob.iter_mut().map(|b| &mut b[..]).collect();
+    let h = u.process(Io { frames: 512, input: &ins, sense: &sense, output: &mut outs });
+    assert_eq!(h, Health::OK);
+    let mut t = Telemetry::new();
+    u.telemetry(&mut t);
+    // the published meter reads 0 W without the closed loop
+    assert_eq!(t.channels[0].measured_power_w, 0.0);
+    let want = 0.05 * 2.0 * 0.2 * 12.0;
+    assert!((u.sense_power(0) - want).abs() < 1e-6);
+    // too few sense ports: open loop, never fail-safe
+    let mut outs: Vec<&mut [f32]> = ob.iter_mut().map(|b| &mut b[..]).collect();
+    let h = u.process(Io { frames: 512, input: &ins, sense: &sense[..3], output: &mut outs });
+    assert_eq!(h.0, Health::OPEN_LOOP);
+}
+
+#[test]
+fn disabled_thermal_protection_is_refused() {
+    let mut p = params();
+    p.thermal_protection_enabled = 0;
+    assert!(spp3::Unit::new(p).is_failsafe());
+}
+
+#[test]
+fn power_topology_has_no_history_shift() {
+    // Pcoil and Pdrv are the update's own frames (spec 4, 16): the 2 ms
+    // history does not shorten the first update
+    let p = params();
+    let mut u = spp3::Unit::new(p);
+    assert!(!u.is_failsafe());
+    assert_eq!(u.latency_frames(), 0);
+    assert_eq!(u.lookahead_frames(), LOOK);
+    let (t, _) = drive(&mut u, [0.1; 4], U as f64 / RATE as f64, U);
+    let want = elec(&p, 0) * 0.01;
+    assert!((t.channels[0].modeled_power_w as f64 - want).abs() < 1e-6 * want, "{}", t.channels[0].modeled_power_w);
+    assert!((u.drive_power(0) - want).abs() < 1e-6 * want);
+}
+
+#[test]
+fn rampout_is_series_resistance() {
+    let mut p = params();
+    p.ch[0].rampout = 0.05;
+    let mut u = spp3::Unit::new(p);
+    assert!(!u.is_failsafe());
+    let (t, _) = drive(&mut u, [0.1; 4], 2.0 * U as f64 / RATE as f64, U);
+    let c = &p.ch[0];
+    let (ag, reb) = (c.ag as f64, c.reb_ref as f64);
+    let r = reb + c.rshunt as f64 + 0.05;
+    let want = (ag * 0.1 / r).powi(2) * reb;
+    assert!((t.channels[0].modeled_power_w as f64 - want).abs() < 1e-6 * want);
+}
+
+#[test]
+fn trapezoidal_thermal_recurrence() {
+    let p = params();
+    let mut u = spp3::Unit::new(p);
+    let x = 0.05f64;
+    let c = &p.ch[1];
+    let (a_vc, b_vc) = (1.0 - dt() / c.tau_tvc as f64, 0.5 * c.t_sett_vc as f64 * dt() / c.tau_tvc as f64);
+    let (a_mg, b_mg) = (1.0 - dt() / c.tau_tmg as f64, 0.5 * c.t_sett_mg as f64 * dt() / c.tau_tmg as f64);
+    let (mut vc, mut mg, mut prev) = (0.0f64, 0.0f64, 0.0f64);
+    for k in 0..800 {
+        let fill = if k == 0 { (U - LOOK) as f64 / U as f64 } else { 1.0 };
+        let pw = elec(&p, 1) * x * x * fill;
+        vc = a_vc * vc + b_vc * (pw + prev);
+        mg = a_mg * mg + b_mg * (pw + prev);
+        prev = pw;
+    }
+    let (t, _) = drive(&mut u, [x as f32; 4], 800.0 * dt(), 333);
+    assert!(
+        (t.channels[1].ol_temp_c as f64 - (40.0 + vc + mg)).abs() < 1e-3,
+        "{} {}",
+        t.channels[1].ol_temp_c,
+        40.0 + vc + mg
+    );
+    assert!((t.channels[1].magnet_temp_c as f64 - (40.0 + mg)).abs() < 1e-3);
+    assert_eq!(t.channels[1].gain, 1.0, "well under the limit: no attenuation");
+}
+
+#[test]
+fn coefficient_law_is_99_percent_settling() {
+    let k = spp3::settle99(4.6, 48_000.0 / 256.0);
+    assert!((k - 0.005_325_098_88).abs() < 1e-10, "{k}");
+    let k = spp3::settle99(20.0, 48_000.0 / 256.0);
+    assert!((k - 0.001_227_291_64).abs() < 1e-10, "{k}");
+    let k = spp3::settle99(0.005, 48_000.0);
+    assert!((k - 0.019_005_287_3).abs() < 1e-9, "{k}");
+}
+
+#[test]
+fn feed_forward_onset_is_the_virtual_coil_plus_one_degree() {
+    let p = params();
+    let mut u = spp3::Unit::new(p);
+    // ch0 alone, loud: find the first update with a target below unity and
+    // check the onset condition there with an independent recurrence
+    let c = &p.ch[0];
+    let tau_ff = c.thermal_ff_speedup_factor as f64 * c.tau_tvc as f64;
+    let (a_ff, b_ff) = (1.0 - dt() / tau_ff, 0.5 * c.t_sett_vc as f64 * dt() / tau_ff);
+    let (a_mg, b_mg) = (1.0 - dt() / c.tau_tmg as f64, 0.5 * c.t_sett_mg as f64 * dt() / c.tau_tmg as f64);
+    let (mut ff, mut mg, mut prev) = (0.0f64, 0.0f64, 0.0f64);
+    let x = 0.6f64;
+    let mut t = Telemetry::new();
+    for k in 0..4000 {
+        let fill = if k == 0 { (U - LOOK) as f64 / U as f64 } else { 1.0 };
+        let gain = t.channels[0].gain as f64; // at most unity before onset
+        let pw = elec(&p, 0) * x * x * fill * if k == 0 { 1.0 } else { gain * gain };
+        ff = a_ff * ff + b_ff * (pw + prev);
+        mg = a_mg * mg + b_mg * (pw + prev);
+        prev = pw;
+        let (tt, _) = drive(&mut u, [x as f32, 0.0, 0.0, 0.0], dt(), U);
+        t = tt;
+        let predicted = 40.0 + mg + ff + 1.0;
+        // the selected target (the published thermal meter is the applied
+        // gain, one call behind)
+        if u.controller_state(0)[1] < 1.0 {
+            assert!(predicted > c.temperature_limit as f64, "onset at {predicted}");
+            return;
+        }
+        assert!(predicted <= c.temperature_limit as f64 + 1e-6, "missed onset at {predicted}");
+    }
+    panic!("no onset");
+}
+
+#[test]
+fn limiting_holds_below_the_limit_and_links_the_group() {
+    let p = params();
+    let mut u = spp3::Unit::new(p);
+    let (t, _) = drive(&mut u, [0.5, 0.0, 0.0, 0.0], 120.0, 1024);
+    let temp = t.channels[0].ol_temp_c;
+    assert!(temp < 120.0 && temp > 115.0, "{temp}");
+    assert!(t.channels[0].gain < 0.9);
+    assert_eq!(t.channels[1].gain, t.channels[0].gain);
+    assert_eq!(t.channels[2].gain, 1.0);
+}
+
+#[test]
+fn hard_path_arms_above_headroom_and_bypasses_the_attack() {
+    let mut p = params();
+    for ch in &mut p.ch[..4] {
+        // a slow attack and a feed-forward pole equal to the coil's, so the
+        // ordinary path lets the coil overshoot into the hard path
+        ch.thermal_ff_speedup_factor = 1.0;
+    }
+    p.thermal_gain_attack_time_s = 60.0;
+    let mut u = spp3::Unit::new(p);
+    let mut armed_at = None;
+    let mut pre = 1.0f32;
+    let mut peak: f32 = 0.0;
+    for k in 0..(30.0 / dt()) as usize {
+        let (t, _) = drive(&mut u, [1.0; 4], dt(), U);
+        peak = peak.max(t.channels[0].ol_temp_c);
+        if armed_at.is_none() && t.channels[0].ol_temp_c > 128.0 {
+            armed_at = Some(k);
+            pre = t.channels[0].gain;
+        }
+        if let Some(a) = armed_at {
+            if k == a + 2 {
+                // the hard target is selected at once and reached through the
+                // ~7 ms dezipper within the next decision interval
+                assert!(t.channels[0].axis_gain[4] < 0.9, "{}", t.channels[0].axis_gain[4]);
+                assert!(t.channels[0].gain < pre - 0.05, "{} {pre}", t.channels[0].gain);
+            }
+        }
+    }
+    assert!(armed_at.is_some());
+    // the hard path pulls the coil back down below its own peak
+    let (t, _) = drive(&mut u, [1.0; 4], 30.0, U);
+    assert!(t.channels[0].ol_temp_c < peak);
+}
+
+#[test]
+fn zero_speedup_factor_holds_the_feed_forward_reduction_at_unity() {
+    let mut p = params();
+    for ch in &mut p.ch[..4] {
+        ch.thermal_ff_speedup_factor = 0.0;
+    }
+    let mut u = spp3::Unit::new(p);
+    // steady state between the limit and the hard limit
+    let (t, _) = drive(&mut u, [0.355, 0.0, 0.0, 0.0], 40.0, 1024);
+    assert!(t.channels[0].ol_temp_c > 120.0, "{}", t.channels[0].ol_temp_c);
+    assert_eq!(t.channels[0].axis_gain[4], 1.0);
+    assert_eq!(t.channels[0].gain, 1.0);
+}
+
+#[test]
+fn pilot_mode_reserves_program_headroom_from_the_first_sample() {
+    let mut p = params();
+    for ch in &mut p.ch[..4] {
+        ch.pilot_tone_enabled = 1;
+    }
+    let mut u = spp3::Unit::new(p);
+    let mut x = vec![0.0f32; 512];
+    x[0] = 0.5;
+    let ins: Vec<&[f32]> = (0..4).map(|_| &x[..]).collect();
+    let mut ob = vec![vec![0.0f32; 512]; 4];
+    let mut outs: Vec<&mut [f32]> = ob.iter_mut().map(|b| &mut b[..]).collect();
+    u.process(Io { frames: 512, input: &ins, sense: &[], output: &mut outs });
+    let want = 0.5 * (1.0 - 10f32.powf(-30.0 / 20.0));
+    assert!((ob[0][0] - want).abs() < 1e-7, "{} {want}", ob[0][0]);
+}
+
+#[test]
+fn hot_fallback_seeds_the_steady_state_split_at_the_limit() {
+    // 64007 other than 2 (spec 10): theta_vc0 = P0 T_sett_vc, theta_mg0 =
+    // P0 T_sett_mg, theta_ff0 = theta_vc0 with P0 = (Tlim - ambient) /
+    // (T_sett_vc + T_sett_mg); the previous power is zero
+    for ovr in [0u32, 1, 3, 7] {
+        let mut p = params();
+        p.thermal_state_override = ovr;
+        let mut u = spp3::Unit::new(p);
+        for _ in 0..2 {
+            let (t, _) = drive(&mut u, [0.0; 4], dt(), U);
+            for c in 0..4 {
+                let ch = &p.ch[c];
+                let (tvc, tmg) = (ch.t_sett_vc as f64, ch.t_sett_mg as f64);
+                let p0 = (120.0 - 40.0) / (tvc + tmg);
+                let want =
+                    40.0 + p0 * tvc * (1.0 - dt() / ch.tau_tvc as f64) + p0 * tmg * (1.0 - dt() / ch.tau_tmg as f64);
+                assert!((t.channels[c].ol_temp_c as f64 - want).abs() < 1e-3, "64007={ovr} ch{c}");
+            }
+            // kernel reconstruction reseeds
+            u.reset();
+        }
+    }
+}
+
+/// Program and pilot-bin telemetry for the closed-loop tests: V is a sine
+/// on the analyser bin (N = 8192 for 0.1 s, bin m = round(43.0664 N / fs)),
+/// I = V / R.
+fn pilot_sense(r: f64, frames: usize) -> Vec<Vec<f32>> {
+    let n = 8192.0;
+    let m = (43.0664f64 * n / RATE as f64).round();
+    let v: Vec<f32> =
+        (0..frames).map(|k| (0.05 * (2.0 * std::f64::consts::PI * m * k as f64 / n).sin()) as f32).collect();
+    let i: Vec<f32> = v.iter().map(|&x| ((x as f64 * 12.0 / r) / 2.0) as f32).collect();
+    (0..8).map(|k| if k % 2 == 0 { i.clone() } else { v.clone() }).collect()
+}
+
+fn run_cl(u: &mut spp3::Unit, x: f32, tele: &[Vec<f32>], from: usize, to: usize) -> Telemetry {
+    let xs = vec![x; 512];
+    let mut ob = vec![vec![0.0f32; 512]; 4];
+    let mut f = from;
+    while f + 512 <= to {
+        let ins: Vec<&[f32]> = (0..4).map(|_| &xs[..]).collect();
+        let sense: Vec<&[f32]> = tele.iter().map(|b| &b[f..f + 512]).collect();
+        let mut outs: Vec<&mut [f32]> = ob.iter_mut().map(|b| &mut b[..]).collect();
+        u.process(Io { frames: 512, input: &ins, sense: &sense, output: &mut outs });
+        f += 512;
+    }
+    let mut t = Telemetry::new();
+    u.telemetry(&mut t);
+    t
+}
+
+fn cl_params(rc: f32, tc: f32) -> Params {
+    let mut p = params();
+    for ch in &mut p.ch[..4] {
+        ch.cal_present = 1;
+        ch.cal_r = rc;
+        ch.cal_t = tc;
+    }
+    p
+}
+
+#[test]
+fn closed_loop_reads_coil_temperature_from_the_pilot_bin_and_never_relaxes() {
+    let (rc, tc) = (4.0f32, 25.0f32);
+    let p = cl_params(rc, tc);
+    let mut u = spp3::Unit::new(p);
+    // a resistive plant whose coil (net of Rshunt 0.2) sits at 60 C:
+    // T_CL = T_cal + ((R - Rs) / (Rc - Rs) - 1) * invTempCo (rig law 3)
+    let alpha = 0.004 + (25.0 - 20.0) * (0.0038 - 0.004) / 15.0;
+    let rs = 0.2;
+    let r = rs + (rc as f64 - rs) * (1.0 + alpha * (60.0 - 25.0));
+    let n = 48_000 * 20;
+    let tele = pilot_sense(r, n);
+    let t = run_cl(&mut u, 0.3, &tele, 0, n);
+    assert!(t.channels[0].closed_loop);
+    // the reference's Float32 Goertzel (fused, rig law (a)) cancels heavily
+    // and reads R a few 1e-3 low on this signal
+    assert!((t.channels[0].cl_temp_c - 60.0).abs() < 1.5, "T_CL {}", t.channels[0].cl_temp_c);
+    assert_eq!(u.controller_state(0)[9], 1.0, "window accepted");
+    // the model runs hotter than the sensed 60 C, but a unit for no proven
+    // board keeps the correction capped at the base
+    assert_eq!(t.channels[0].tlim_adj_c, 0.0);
+    assert_eq!(u.effective_limit(0), 120.0);
+}
+
+/// The closed loop relaxes the limit only on a board whose relaxed closed
+/// loop is proven live (sgv2_core::machine): on the same signal, every
+/// other board, and a blob naming none, stays capped at the base.
+#[test]
+fn closed_loop_relaxes_only_on_a_proven_board() {
+    let (rc, tc) = (4.0f32, 25.0f32);
+    let alpha = 0.004 + (25.0 - 20.0) * (0.0038 - 0.004) / 15.0;
+    let rs = 0.2;
+    let r = rs + (rc as f64 - rs) * (1.0 + alpha * (60.0 - 25.0));
+    let n = 48_000 * 20;
+    let tele = pilot_sense(r, n);
+    let run = |board: Option<&str>| {
+        let mut u = spp3::Unit::for_machine(cl_params(rc, tc), board);
+        let t = run_cl(&mut u, 0.3, &tele, 0, n);
+        assert!(t.channels[0].closed_loop, "{board:?}: the closed loop runs");
+        assert_eq!(u.controller_state(0)[9], 1.0, "{board:?}: window accepted");
+        (t.channels[0].tlim_adj_c, u.effective_limit(0))
+    };
+    for board in [None, Some("j316s"), Some("j316c"), Some("j413"), Some("j614s"), Some("j700"), Some("j999")] {
+        assert_eq!(run(board), (0.0, 120.0), "{board:?} must never relax");
+    }
+    // the proven J616s: the model runs hotter than the sensed coil, so the
+    // limit relaxes, within the cap
+    let (adj, lim) = run(Some("j616s"));
+    assert!(adj > 0.0 && adj <= 30.0 + 1e-3, "j616s TlimAdj {adj}");
+    assert!(lim > 120.0 && lim <= 150.0 + 1e-3, "j616s limit {lim}");
+}
+
+#[test]
+fn closed_loop_range_is_on_the_smoothed_resistance_and_rejection_holds_the_published_temperature() {
+    let p = cl_params(4.0, 25.0);
+    let mut u = spp3::Unit::new(p);
+    let alpha = 0.004 + (25.0 - 20.0) * (0.0038 - 0.004) / 15.0;
+    let n = 48_000 * 20;
+    let tele = pilot_sense(4.0 * (1.0 + alpha * 35.0), n);
+    run_cl(&mut u, 0.3, &tele, 0, n);
+    assert_eq!(u.controller_state(0)[9], 1.0);
+    // implausible windows (R above RebRange) drive the smoothed R out of
+    // range and are rejected; the published temperature still follows it
+    let bad = pilot_sense(20.0, n);
+    let t = run_cl(&mut u, 0.3, &bad, 0, 48_000 * 2);
+    assert!(t.channels[0].closed_loop);
+    assert_eq!(u.controller_state(0)[9], 0.0);
+    assert!(t.channels[0].cl_temp_c > 100.0);
+    // the raw limit returns to the base; the smoothed limit decays toward it
+    assert!(u.effective_limit(0) >= 120.0);
+    // recovery is accepted once the smoothed resistance is back in range
+    run_cl(&mut u, 0.3, &tele, 0, 48_000 * 3);
+    assert_eq!(u.controller_state(0)[9], 1.0);
+}
+
+#[test]
+fn audio_unit_reset_clears_only_the_closed_loop() {
+    let p = cl_params(4.0, 25.0);
+    let mut u = spp3::Unit::new(p);
+    let alpha = 0.004 + (25.0 - 20.0) * (0.0038 - 0.004) / 15.0;
+    let n = 48_000 * 10;
+    let tele = pilot_sense(4.0 * (1.0 + alpha * 35.0), n);
+    let t0 = run_cl(&mut u, 0.3, &tele, 0, n);
+    let s0 = u.controller_state(0);
+    u.host_reset();
+    let mut t = Telemetry::new();
+    u.telemetry(&mut t);
+    // OL state and gains continue; CL back to the calibration and the base
+    assert_eq!(t.channels[0].ol_temp_c, t0.channels[0].ol_temp_c);
+    assert_eq!(t.channels[0].gain, t0.channels[0].gain);
+    assert_eq!(u.controller_state(0)[1], s0[1]);
+    assert_eq!(t.channels[0].cl_temp_c, 25.0);
+    assert_eq!(t.channels[0].tlim_adj_c, 0.0);
+    // an open-loop kernel is unchanged by it
+    let mut q = spp3::Unit::new(params());
+    drive(&mut q, [0.2; 4], 2.0, 512);
+    let (mut a, mut b) = (Telemetry::new(), Telemetry::new());
+    q.telemetry(&mut a);
+    q.host_reset();
+    q.telemetry(&mut b);
+    assert_eq!(a.channels[0].ol_temp_c, b.channels[0].ol_temp_c);
+    assert_eq!(a.channels[0].gain, b.channels[0].gain);
+    // kernel reconstruction reseeds
+    q.reset();
+    q.telemetry(&mut b);
+    assert_eq!(b.channels[0].ol_temp_c, 40.0);
+}
+
+#[test]
+fn safe_tlim_count_is_minutes_in_float32() {
+    assert_eq!(spp3::safe_count_init(10.0, 48_000), Some(112_500));
+    assert_eq!(spp3::safe_count_init(0.1, 48_000), Some(1125));
+    assert_eq!(spp3::safe_count_init(0.0, 48_000), Some(0));
+}
+
+/// Hold `x` for `updates` thermal updates; return how many updates ran
+/// before channel 0 latched, or `None`.
+fn hold_until_latched(u: &mut spp3::Unit, x: f32, updates: usize) -> Option<usize> {
+    let xs = vec![x; U];
+    let mut ob = vec![vec![0.0f32; U]; 4];
+    for k in 0..updates {
+        let ins: Vec<&[f32]> = (0..4).map(|_| &xs[..]).collect();
+        let mut outs: Vec<&mut [f32]> = ob.iter_mut().map(|b| &mut b[..]).collect();
+        u.process(Io { frames: U, input: &ins, sense: &[], output: &mut outs });
+        if u.safe_tlim_latched(0) {
+            return Some(k);
+        }
+    }
+    None
+}
+
+#[test]
+fn safe_tlim_latches_after_ten_continuous_minutes() {
+    // a long synthetic case: 1 FS keeps T_OL above Tlim + offset (105 C)
+    // under limiting; 112 500 consecutive true updates latch, one-way
+    let p = params();
+    let mut u = spp3::Unit::new(p);
+    let n = 112_500 + 4000;
+    let k = hold_until_latched(&mut u, 1.0, n).expect("latched within the run");
+    // predicate first true at update q; latch after the 112 500th true one
+    let mut v = spp3::Unit::new(p);
+    let q = (0..4000)
+        .find(|_| {
+            hold_until_latched(&mut v, 1.0, 1);
+            let s = v.controller_state(0);
+            40.0 + s[4] + s[5] > 105.0
+        })
+        .unwrap();
+    assert_eq!(k, q + 112_500 - 1, "q {q} k {k}");
+    // the new base applies from the next update
+    assert_eq!(u.effective_limit(0), 120.0);
+    hold_until_latched(&mut u, 1.0, 1);
+    assert_eq!(u.effective_limit(0), 100.0);
+    // no runtime exit: ten minutes of silence keep it
+    hold_until_latched(&mut u, 0.0, 112_600);
+    assert!(u.safe_tlim_latched(0));
+    assert_eq!(u.effective_limit(0), 100.0);
+    // AudioUnitReset keeps it; reconstruction restores the ordinary base
+    u.host_reset();
+    assert!(u.safe_tlim_latched(0));
+    u.reset();
+    assert!(!u.safe_tlim_latched(0));
+    // other channels latched on their own predicates
+    assert!(p.ch[1].temperature_limit == 120.0);
+}
+
+#[test]
+fn safe_tlim_reloads_on_equality_or_cooling() {
+    // TimeMin 0.1 (1125 updates): 1000 hot updates, cool, then hot again;
+    // the count restarts from the full value
+    let mut p = params();
+    p.thermal_safe_tlim_time_min = 0.1;
+    let mut u = spp3::Unit::new(p);
+    assert_eq!(hold_until_latched(&mut u, 1.0, 1000), None);
+    assert_eq!(hold_until_latched(&mut u, 0.0, 3000), None);
+    let mut v = spp3::Unit::new(p);
+    let fresh = hold_until_latched(&mut v, 1.0, 5000).unwrap();
+    let again = hold_until_latched(&mut u, 1.0, 5000).unwrap();
+    // from a hotter start the predicate turns true sooner, never later than
+    // a full reload allows
+    assert!(again >= 1124 && again <= fresh, "{again} {fresh}");
+}
+
+#[test]
+fn safe_tlim_setup_clamps() {
+    // SafeTlim above TemperatureLimit is clamped down; a positive offset is 0
+    let mut p = params();
+    p.thermal_safe_tlim = 200.0;
+    p.thermal_safe_tlim_offset = 5.0;
+    p.thermal_safe_tlim_time_min = 0.01;
+    let mut u = spp3::Unit::new(p);
+    hold_until_latched(&mut u, 1.0, 20000);
+    hold_until_latched(&mut u, 1.0, 1);
+    if u.safe_tlim_latched(0) {
+        assert_eq!(u.effective_limit(0), 120.0);
+    }
+    // TimeMin 0 latches on the first update
+    let mut p = params();
+    p.thermal_safe_tlim_time_min = 0.0;
+    let mut u = spp3::Unit::new(p);
+    assert_eq!(hold_until_latched(&mut u, 0.0, 1), Some(0));
+}
+
+#[test]
+fn pilot_gates_on_drive_power_and_selects_by_t_ol() {
+    let mut p = cl_params(4.0, 25.0);
+    for ch in &mut p.ch[..4] {
+        ch.pilot_tone_enabled = 1;
+    }
+    let mut u = spp3::Unit::new(p);
+    // Pdrv = elec * x^2 for DC: the gate is >= PilotEnableThres (0.03 W)
+    let e = elec(&p, 0);
+    let x0 = (0.03f64 / e).sqrt() as f32;
+    let below = f32::from_bits(x0.to_bits() - 64);
+    drive(&mut u, [below; 4], dt(), U);
+    assert_eq!(u.pilot_state(0), Some((false, false)));
+    drive(&mut u, [x0 * 1.0001; 4], dt(), U);
+    assert_eq!(u.pilot_state(0), Some((true, false)));
+    // above PilotUpperThres the high level; held through the band
+    drive(&mut u, [1.0; 4], 0.5, U);
+    let s = u.controller_state(0);
+    assert!(40.0 + s[4] + s[5] > 90.0);
+    assert_eq!(u.pilot_state(0), Some((true, true)));
+    // without the calibration vector there is no generator
+    let mut q = params();
+    q.ch[0].pilot_tone_enabled = 1;
+    assert_eq!(spp3::Unit::new(q).pilot_state(0), None);
+}
+
+#[test]
+fn closed_loop_needs_a_calibration_inside_its_ranges() {
+    let mut p = params();
+    p.ch[0].cal_present = 1;
+    p.ch[0].cal_r = 4.0;
+    p.ch[0].cal_t = 60.0; // outside 10..50
+    let mut u = spp3::Unit::new(p);
+    let (t, _) = drive(&mut u, [0.1; 4], 0.5, 512);
+    assert!(!t.channels[0].closed_loop);
+}
+
+/// Rig finding 15 (b)-like: fast thermal poles, a fast release and a hard
+/// limit close above the limit. After the cold-start onset the reference
+/// settles at or below the limit with no re-arm; the 1 s release hold
+/// (rig law 5, `>=` on the floor tie) is what prevents a limit cycle.
+#[test]
+fn fast_poles_settle_without_a_limit_cycle() {
+    let mut p = params();
+    p.thermal_ambient_temp = 50.0;
+    p.thermal_gain_attack_time_s = 2.0;
+    p.thermal_gain_release_time_s = 5.0;
+    for ch in &mut p.ch[..4] {
+        ch.tau_tvc = 0.5;
+        ch.tau_tmg = 5.0;
+        ch.t_sett_vc = 26.06;
+        ch.t_sett_mg = 25.55;
+        ch.temperature_limit = 90.0;
+        ch.hard_temp_limit_headroom = 11.9;
+        ch.thermal_ff_speedup_factor = 0.25;
+        ch.reb_ref = 2.7;
+        ch.rshunt = 0.09;
+        ch.ag = 11.89;
+    }
+    let mut u = spp3::Unit::new(p);
+    assert!(!u.is_failsafe());
+    let n = 512;
+    let w = 2.0 * std::f64::consts::PI * 1012.14 / RATE as f64;
+    let mut ob = vec![vec![0.0f32; n]; 4];
+    let mut peak_late = 0.0f32;
+    let mut peak_settle = 0.0f32;
+    let mut k = 0usize;
+    for blk in 0..(30 * RATE as usize / n) {
+        let x: Vec<f32> = (0..n).map(|j| (0.999 * ((k + j) as f64 * w).sin()) as f32).collect();
+        k += n;
+        let ins: Vec<&[f32]> = (0..4).map(|_| &x[..]).collect();
+        let mut outs: Vec<&mut [f32]> = ob.iter_mut().map(|b| &mut b[..]).collect();
+        u.process(Io { frames: n, input: &ins, sense: &[], output: &mut outs });
+        let mut t = Telemetry::new();
+        u.telemetry(&mut t);
+        let tol = t.channels[0].ol_temp_c;
+        if blk * n > 3 * RATE as usize / 2 {
+            peak_settle = peak_settle.max(tol);
+        }
+        if blk * n > 10 * RATE as usize {
+            peak_late = peak_late.max(tol);
+        }
+    }
+    // after the onset it never cycles back toward the hard limit (101.9 C)
+    // and settles at or below the limit
+    assert!(peak_settle < 92.0, "peak after the onset {peak_settle}");
+    assert!(peak_late <= 90.2, "late peak {peak_late}");
+}
+
+/// Rig law 6a, by policy not reproduced: at full-scale drive (49 W) an
+/// AID35-like woofer's feed-forward node passes 1000 K (steady Pdrv x
+/// T_sett_vc is about 1277 K), where the reference re-seeds its nodes and T_OL snaps down to
+/// about the limit. Here the state keeps integrating, T_OL never drops
+/// abruptly under constant drive, and the hard path holds while the node is
+/// out of range, flagged MODEL_RANGE.
+#[test]
+fn full_scale_drive_never_lowers_t_ol_abruptly() {
+    let mut p = params();
+    p.thermal_ambient_temp = 50.0;
+    p.thermal_gain_attack_time_s = 4.6;
+    p.thermal_gain_release_time_s = 20.0;
+    for ch in &mut p.ch[..4] {
+        (ch.t_sett_vc, ch.t_sett_mg, ch.tau_tvc, ch.tau_tmg) = (26.06, 25.55, 5.532, 197.25);
+        (ch.temperature_limit, ch.hard_temp_limit_headroom) = (140.0, 10.0);
+        (ch.reb_ref, ch.rshunt, ch.ag, ch.thermal_ff_speedup_factor) = (2.7, 0.09, 11.89, 0.25);
+    }
+    let mut u = spp3::Unit::new(p);
+    assert!(!u.is_failsafe());
+    let n = 512;
+    let w = 2.0 * std::f64::consts::PI * 1000.0 / RATE as f64;
+    let mut ob = vec![vec![0.0f32; n]; 4];
+    let (mut prev, mut k, mut flagged, mut worst_drop) = (f32::NAN, 0usize, false, 0.0f32);
+    for _ in 0..(20 * RATE as usize / n) {
+        // a full-scale square: Pdrv = ag^2 Reb / (Reb + Rshunt)^2 = 49 W
+        let x: Vec<f32> = (0..n).map(|j| ((k + j) as f64 * w).sin().signum() as f32).collect();
+        k += n;
+        let ins: Vec<&[f32]> = (0..4).map(|_| &x[..]).collect();
+        let mut outs: Vec<&mut [f32]> = ob.iter_mut().map(|b| &mut b[..]).collect();
+        let h = u.process(Io { frames: n, input: &ins, sense: &[], output: &mut outs });
+        let mut t = Telemetry::new();
+        u.telemetry(&mut t);
+        let tol = t.channels[0].ol_temp_c;
+        if prev.is_finite() {
+            worst_drop = worst_drop.max(prev - tol);
+        }
+        prev = tol;
+        if h.0 & Health::MODEL_RANGE != 0 {
+            flagged = true;
+            // the hard path holds while the node is out of range: its
+            // candidate (the node is huge) keeps the gain well down
+            assert!(u.controller_state(0)[1] < 0.5, "{}", u.controller_state(0)[1]);
+        }
+    }
+    assert!(flagged, "the feed-forward node never left its range");
+    // cooling under constant drive is slow (tau_vc 5.5 s): no snap
+    assert!(worst_drop < 0.5, "T_OL dropped {worst_drop} C in one call");
+}
+
+/// Closed-loop parameters with a slow coil, so the model heats over
+/// seconds as in the live incident.
+fn slow_cl_params() -> Params {
+    let mut p = cl_params(4.0, 25.0);
+    for ch in &mut p.ch[..4] {
+        ch.tau_tvc = 3.0;
+        ch.tau_tmg = 30.0;
+    }
+    p
+}
+
+/// Pilot-bin sense whose resistance follows `r(frame)` (I = V / R).
+fn pilot_sense_r(r: impl Fn(usize) -> f64, frames: usize) -> Vec<Vec<f32>> {
+    let n = 8192.0;
+    let m = (43.0664f64 * n / RATE as f64).round();
+    let v: Vec<f32> =
+        (0..frames).map(|k| (0.05 * (2.0 * std::f64::consts::PI * m * k as f64 / n).sin()) as f32).collect();
+    let i: Vec<f32> = v.iter().enumerate().map(|(k, &x)| ((x as f64 * 12.0 / r(k)) / 2.0) as f32).collect();
+    (0..8).map(|k| if k % 2 == 0 { i.clone() } else { v.clone() }).collect()
+}
+
+/// The J616s live-test shape: loud drive heats the model by tens of kelvin
+/// while the accepted windows' resistance FALLS (V and I swapped in the
+/// live routing). The guard trips, flags SENSE_IMPLAUSIBLE, and the
+/// correction can no longer relax; AudioUnitReset does not clear it, a
+/// rebuild does.
+#[test]
+fn plausibility_guard_trips_on_resistance_falling_while_heating() {
+    let p = slow_cl_params();
+    let mut u = spp3::Unit::new(p);
+    let n = 48_000 * 12;
+    // 4.6 ohm cold, falling to 4.0 ohm over the run, as the model heats
+    let tele = pilot_sense_r(|k| 4.6 - 0.6 * k as f64 / n as f64, n);
+    let t = run_cl(&mut u, 0.6, &tele, 0, n);
+    assert!(t.channels[0].ol_temp_c > 80.0, "the model heated: {}", t.channels[0].ol_temp_c);
+    assert!(u.sense_implausible(0), "T_OL {} T_CL {}", t.channels[0].ol_temp_c, t.channels[0].cl_temp_c);
+    assert!(t.health.0 & Health::SENSE_IMPLAUSIBLE != 0);
+    assert_eq!(t.channels[0].tlim_adj_c, 0.0);
+    u.host_reset();
+    assert!(u.sense_implausible(0), "AudioUnitReset keeps the verdict");
+    u.reset();
+    assert!(!u.sense_implausible(0), "a rebuild clears it");
+}
+
+#[test]
+fn plausibility_guard_passes_a_heating_coil() {
+    // R rising with the coil (alpha 0.0039, +40 K over the run)
+    let p = slow_cl_params();
+    let mut u = spp3::Unit::new(p);
+    let n = 48_000 * 12;
+    let tele = pilot_sense_r(|k| 4.0 * (1.0 + 0.0039 * (5.0 + 40.0 * k as f64 / n as f64)), n);
+    let t = run_cl(&mut u, 0.6, &tele, 0, n);
+    assert!(t.channels[0].ol_temp_c > 80.0, "{}", t.channels[0].ol_temp_c);
+    assert!(!u.sense_implausible(0));
+    assert_eq!(t.health.0 & Health::SENSE_IMPLAUSIBLE, 0);
+}
+
+#[test]
+fn plausibility_guard_trips_on_a_coil_far_below_its_calibration() {
+    // a constant reading 35 K below T_cal (-10 C) under drive: past the
+    // margin below the tuning's coldest valid coil temperature (10 C)
+    let p = cl_params(4.0, 25.0);
+    let mut u = spp3::Unit::new(p);
+    let n = 48_000 * 6;
+    let alpha = 0.004 + (25.0 - 20.0) * (0.0038 - 0.004) / 15.0;
+    let tele = pilot_sense_r(|_| 0.2 + 3.8 * (1.0 - alpha * 35.0), n);
+    run_cl(&mut u, 0.3, &tele, 0, n);
+    assert!(u.sense_implausible(0));
+}
+
+/// The M2 tweeter shape (11-05 live run): calibrated warm (about 31 C), the
+/// model's ambient above that (50 C), and a cold start in a cooler room
+/// reading about 16 C, 15 K below T_cal. An honest coil: no trip. The old
+/// bound, min(T_cal, ambient) - 10 K = 21 C, tripped it within 2 s of the
+/// pilot starting.
+#[test]
+fn plausibility_guard_allows_a_cold_start_below_a_warm_calibration() {
+    let mut p = cl_params(4.0, 31.0);
+    p.thermal_ambient_temp = 50.0;
+    let mut u = spp3::Unit::new(p);
+    let n = 48_000 * 6;
+    let alpha = 0.004 + (31.0 - 20.0) * (0.0038 - 0.004) / 15.0;
+    let tele = pilot_sense_r(|_| 0.2 + 3.8 * (1.0 - alpha * 15.0), n);
+    let t = run_cl(&mut u, 0.3, &tele, 0, n);
+    assert!(t.channels[0].cl_temp_c < 21.0, "the reading is below the old bound: {}", t.channels[0].cl_temp_c);
+    assert!(!u.sense_implausible(0), "T_OL {} T_CL {}", t.channels[0].ol_temp_c, t.channels[0].cl_temp_c);
+    assert_eq!(t.health.0 & Health::SENSE_IMPLAUSIBLE, 0);
+}
+
+/// The bound follows the tuning's own CalTempRangeMin: the same reading
+/// trips once the tuning says no coil is valid that cold.
+#[test]
+fn plausibility_guard_bound_follows_cal_temp_range_min() {
+    let mut p = cl_params(4.0, 31.0);
+    p.thermal_ambient_temp = 50.0;
+    for ch in &mut p.ch[..4] {
+        ch.cal_temp_range_min = 28.0;
+    }
+    let mut u = spp3::Unit::new(p);
+    let n = 48_000 * 6;
+    let alpha = 0.004 + (31.0 - 20.0) * (0.0038 - 0.004) / 15.0;
+    let tele = pilot_sense_r(|_| 0.2 + 3.8 * (1.0 - alpha * 15.0), n);
+    run_cl(&mut u, 0.3, &tele, 0, n);
+    assert!(u.sense_implausible(0));
+}
+
+#[test]
+fn plausibility_guard_allows_a_cold_room() {
+    // a 5 C room: the coil honestly reads 20 K below its 25 C calibration;
+    // the bound is relative to the colder of T_cal and the model's ambient
+    let mut p = cl_params(4.0, 25.0);
+    p.thermal_ambient_temp = 5.0;
+    let mut u = spp3::Unit::new(p);
+    let n = 48_000 * 6;
+    let alpha = 0.004 + (25.0 - 20.0) * (0.0038 - 0.004) / 15.0;
+    let tele = pilot_sense_r(|_| 0.2 + 3.8 * (1.0 - alpha * 20.0), n);
+    let t = run_cl(&mut u, 0.3, &tele, 0, n);
+    assert!(!u.sense_implausible(0), "T_OL {} T_CL {}", t.channels[0].ol_temp_c, t.channels[0].cl_temp_c);
+}
+
+/// The post-stop shape of the J616s relaxed run: the pilot stops, no window
+/// is accepted any more and the published T_CL holds its last value while
+/// the model cools below it. Only a fresh T_CL is used: the relaxation
+/// returns to the base, and the guard never judges the stale value.
+#[test]
+fn stale_closed_loop_after_the_pilot_stops_is_not_used() {
+    for bus_lost in [false, true] {
+        let p = cl_params(4.0, 25.0);
+        let mut r = spp3::ClReplay::new(&p, 0, true).unwrap();
+        let upw = r.updates_per_window().round() as usize;
+        let mut tcl = 0.0;
+        let mut adj = 0.0;
+        for _ in 0..40 {
+            assert!(r.window(4.6 * 4.6, 1.0));
+            for _ in 0..upw {
+                let o = r.update(tcl + 40.0, 10.0);
+                (adj, tcl) = (o.0, o.1);
+            }
+        }
+        assert!(r.t_cl_fresh() && adj > 10.0, "relaxing while fresh: {adj}");
+        // stop: T_OL decays from T_CL + 40 to T_CL - 40 over 30 s
+        let n = (30.0 * 48_000.0 / 256.0) as usize;
+        let mut prev = adj;
+        for k in 0..n {
+            if !bus_lost && k % upw == 0 {
+                assert!(!r.window(0.0, 0.0), "a silent window is rejected");
+            }
+            let t_ol = tcl + 40.0 - 80.0 * k as f64 / n as f64;
+            let (a, t, bad) = r.update(t_ol, 0.0);
+            assert_eq!(t, tcl, "the published T_CL holds");
+            assert!(!bad, "the guard never judges a stale T_CL");
+            if !r.t_cl_fresh() {
+                assert!(a <= prev + 1e-9, "no relaxation from a stale T_CL");
+            }
+            prev = a;
+            if k > upw + 1 {
+                assert!(!r.t_cl_fresh(), "stale after one window plus one update");
+            }
+        }
+        assert!(prev < 1e-3, "back at the base: {prev}");
+    }
+}
+
+/// Window resistance of the `cl_params(4.0, tc)` coil (Rshunt 0.2) at
+/// `t` C: R_cal (1 + alpha (t - T_cal)) net of the shunt, alpha at T_cal.
+fn coil_r(tc: f64, t: f64) -> f64 {
+    let alpha = 0.004 + (tc - 20.0) * (0.0038 - 0.004) / 15.0;
+    0.2 + 3.8 * (1.0 + alpha * (t - tc))
+}
+
+/// Feed one window of resistance `r` and then its updates at `t_ol`,
+/// driven; returns the last update's (TlimAdj, T_CL, implausible).
+fn replay_window(rp: &mut spp3::ClReplay, upw: usize, r: f64, t_ol: f64) -> (f64, f64, bool) {
+    assert!(rp.window((r * r) as f32, 1.0), "window {r} accepted");
+    let mut o = (0.0, 0.0, false);
+    for _ in 0..upw {
+        o = rp.update(t_ol, 10.0);
+    }
+    o
+}
+
+/// The J616s full-volume ladder shape (lane T, 11-05, volume 1.0): the
+/// model's T_OL runs some 55 K ahead of coils that have levelled off near
+/// 120 C and keeps climbing while the music swings it, and the windows'
+/// resistance carries its ordinary noise. One ring of eight windows
+/// across which T_OL rose 10.8 K ended on a low window: judged on the
+/// single windows it fell at about a quarter of an honest coil's rise and
+/// tripped SENSE_IMPLAUSIBLE 77 s into the step. Judged on the smoothed
+/// R_s, as the reference accepts, the coil is flat: no trip, and the
+/// relaxation stays at its cap.
+#[test]
+fn plausibility_guard_ignores_window_noise_on_a_levelled_coil() {
+    let tc = 25.0;
+    let p = cl_params(4.0, tc as f32);
+    let mut rp = spp3::ClReplay::new(&p, 0, true).unwrap();
+    let upw = rp.updates_per_window().round() as usize;
+    // the coil heats honestly to 120 C, the model ahead of it
+    for k in 0..60 {
+        let t = tc + (120.0 - tc) * k as f64 / 59.0;
+        let (_, _, bad) = replay_window(&mut rp, upw, coil_r(tc, t), t + 55.0 * k as f64 / 59.0);
+        assert!(!bad, "heating, window {k}");
+    }
+    // levelled at 120 C: the model wanders about 175 C, then the ring that
+    // tripped the window rule (T_OL offsets, K, and window noise, ohm)
+    let r0 = coil_r(tc, 120.0);
+    let wander = [0.0, 0.8, -0.6, 0.3, -0.2, 0.5, -0.9, 0.4];
+    let noise = [0.011, -0.025, 0.020, -0.012, 0.016, -0.018, 0.022, -0.014];
+    let ring_t = [0.0, 2.3, -0.2, 3.0, 0.4, 3.7, 7.5, 10.8];
+    let ring_r = [0.032, -0.027, 0.039, 0.021, 0.028, -0.084, 0.146, -0.094];
+    let mut adj = 0.0;
+    for rep in 0..20 {
+        for k in 0..8 {
+            let o = replay_window(&mut rp, upw, r0 + noise[k], 175.0 + wander[k]);
+            assert!(!o.2, "levelled, ring {rep} window {k}");
+            adj = o.0;
+        }
+    }
+    assert!(adj > 25.0, "relaxing on the levelled coil: {adj}");
+    for k in 0..8 {
+        let o = replay_window(&mut rp, upw, r0 + ring_r[k], 175.0 + ring_t[k]);
+        assert!(!o.2, "the noisy rising ring, window {k}: T_CL {}", o.1);
+        adj = o.0;
+    }
+    // the rule judges the ring (T_OL rose by the span) and finds R_s flat
+    for k in 0..40 {
+        let o = replay_window(&mut rp, upw, r0 + noise[k % 8], 186.0 + 0.1 * k as f64);
+        assert!(!o.2, "still levelled, window {k}");
+        adj = o.0;
+    }
+    assert!(adj > 25.0, "the relaxation holds: {adj}");
+}
+
+/// The trend's other side: the [V,I]-swap shape (J616s z1, 11-05), a
+/// sensed resistance falling at half an honest coil's rise while the model
+/// heats, still trips on the smoothed R_s and drops the relaxation.
+#[test]
+fn plausibility_guard_trips_on_a_smoothed_fall_while_heating() {
+    let tc = 25.0;
+    let p = cl_params(4.0, tc as f32);
+    let mut rp = spp3::ClReplay::new(&p, 0, true).unwrap();
+    let upw = rp.updates_per_window().round() as usize;
+    let mut tripped = None;
+    for k in 0..40 {
+        // T_OL +1.5 K per window; the reading 0.5 K-equivalent colder each
+        let o = replay_window(&mut rp, upw, coil_r(tc, tc - 0.5 * k as f64), 50.0 + 1.5 * k as f64);
+        if o.2 {
+            tripped = Some(k);
+            assert_eq!(o.0, 0.0, "a tripped guard drops the relaxation");
+            break;
+        }
+    }
+    let k = tripped.expect("the falling sense trips");
+    // the ring fills (8 windows) and the smoother follows the fall
+    assert!(k <= 20, "tripped late: window {k}");
+}
+
+/// A cold start in a room colder than calibration: R_s e-folds down from
+/// R_cal while the model heats, which the trend must not read as a fall.
+/// The trend smoother starts at the first window, not at R_cal.
+#[test]
+fn plausibility_guard_trend_ignores_the_r_cal_seed_after_a_cold_start() {
+    let tc = 31.0;
+    let mut p = cl_params(4.0, tc as f32);
+    p.thermal_ambient_temp = 50.0;
+    let mut rp = spp3::ClReplay::new(&p, 0, true).unwrap();
+    let upw = rp.updates_per_window().round() as usize;
+    for k in 0..80 {
+        // the coil from 16 C, honestly warming 0.5 K per window; the model
+        // from its 50 C ambient at 1.5 K per window
+        let o = replay_window(&mut rp, upw, coil_r(tc, 16.0 + 0.5 * k as f64), 50.0 + 1.5 * k as f64);
+        assert!(!o.2, "window {k}: T_CL {}", o.1);
+    }
+}
+
+// Tweeter lanes on a six-channel MacBook Pro layout (synthetic values):
+// woofers 0..3 in one group, tweeters 4 and 5 in another, sense pairs in
+// the bus order (V on 2c, I on 2c + 1), every channel configured for the
+// pilot-tone closed loop. The sense comes from a resistive plant driven by
+// the unit's own output (pilot included), so a lane's pilot reaches its
+// own V/I pair only if the lane mapping and the sense indexing are right.
+
+const TW_N: usize = 6;
+const TW_WOOFER_HZ: f64 = 200.0;
+const TW_TWEETER_HZ: f64 = 5_000.0;
+
+fn tweeter_layout() -> Params {
+    let base = cl_params(4.0, 25.0).ch[0];
+    let mut p = Params { channels: TW_N as u32, ..cl_params(4.0, 25.0) };
+    for (c, ch) in p.ch[..TW_N].iter_mut().enumerate() {
+        *ch = ChannelParams {
+            source: c as u32,
+            group: if c < 4 { 1 } else { 0 },
+            sense_v: 2 * c as u32,
+            sense_i: 2 * c as u32 + 1,
+            pilot_tone_enabled: 1,
+            // the power floors gate the pilot bin; programme leakage into it
+            // stays far below them
+            v_pwr_thres: 1e-3,
+            i_pwr_thres: 1e-5,
+            tau_tvc: if c < 4 { 3.0 } else { 2.0 },
+            tau_tmg: if c < 4 { 30.0 } else { 20.0 },
+            ..base
+        };
+    }
+    p
+}
+
+/// The coil resistance (net Rshunt 0.2 ohm) of a coil at `t` C for the
+/// tuning's alpha at T_cal 25 C.
+fn tw_r_at(t: f64) -> f64 {
+    let alpha = 0.004 + (25.0 - 20.0) * (0.0038 - 0.004) / 15.0;
+    0.2 + (4.0 - 0.2) * (1.0 + alpha * (t - 25.0))
+}
+
+/// Drive the layout for `seconds`: woofers a 200 Hz sine of peak `aw`,
+/// tweeters a 5 kHz sine of peak `at`. Each block's sense is the plant's
+/// answer to the previous block's output (V = out * ag / VMONScale, I =
+/// V_volts / R / IMONScale), coils at `t_coil[c]` C; with `sense` false the
+/// bus carries nothing (open loop).
+fn tw_drive(u: &mut spp3::Unit, aw: f32, at: f32, t_coil: [f64; TW_N], seconds: f64, sense: bool) -> Telemetry {
+    let p = *u.params();
+    let blocks = (seconds * RATE as f64 / 512.0) as usize;
+    let mut prev = vec![vec![0.0f32; 512]; TW_N];
+    let mut out = vec![vec![0.0f32; 512]; TW_N];
+    let mut tele = vec![vec![0.0f32; 512]; 2 * TW_N];
+    let mut k = 0usize;
+    for _ in 0..blocks {
+        let ins: Vec<Vec<f32>> = (0..TW_N)
+            .map(|c| {
+                let (a, f) = if c < 4 { (aw, TW_WOOFER_HZ) } else { (at, TW_TWEETER_HZ) };
+                (0..512)
+                    .map(|j| a * (2.0 * std::f64::consts::PI * f * (k + j) as f64 / RATE as f64).sin() as f32)
+                    .collect()
+            })
+            .collect();
+        for c in 0..TW_N {
+            let ch = &p.ch[c];
+            let r = tw_r_at(t_coil[c]);
+            for j in 0..512 {
+                let volts = prev[c][j] as f64 * ch.ag as f64;
+                tele[ch.sense_v as usize][j] = (volts / ch.vmon_scale as f64) as f32;
+                tele[ch.sense_i as usize][j] = (volts / r / ch.imon_scale as f64) as f32;
+            }
+        }
+        let in_refs: Vec<&[f32]> = ins.iter().map(|b| &b[..]).collect();
+        let sense_refs: Vec<&[f32]> = if sense { tele.iter().map(|b| &b[..]).collect() } else { Vec::new() };
+        let mut outs: Vec<&mut [f32]> = out.iter_mut().map(|b| &mut b[..]).collect();
+        u.process(Io { frames: 512, input: &in_refs, sense: &sense_refs, output: &mut outs });
+        for c in 0..TW_N {
+            prev[c].copy_from_slice(&out[c]);
+        }
+        k += 512;
+    }
+    let mut t = Telemetry::new();
+    u.telemetry(&mut t);
+    t
+}
+
+/// The sine peak whose pre-gain drive power sits `db` above the pilot's
+/// enable threshold (Pdrv = elec * a^2 / 2).
+fn tw_peak(p: &Params, c: usize, db: f64) -> f32 {
+    let x = (2.0 * p.ch[c].pilot_enable_thres as f64 / elec(p, c)).sqrt();
+    (x * 10f64.powf(db / 20.0)) as f32
+}
+
+/// The field report's shape: the woofers carry enough programme to turn
+/// their pilot on, the tweeters' high band does not reach the pilot's
+/// enable threshold. The tweeters' T_CL then holds its calibration value
+/// (no window passes the pilot-bin floors), it is published as not fresh,
+/// and their open-loop model and gain keep running.
+#[test]
+fn tweeter_below_the_pilot_threshold_holds_t_cal_and_is_not_fresh() {
+    let p = tweeter_layout();
+    let mut u = spp3::Unit::new(p);
+    let (aw, at) = (tw_peak(&p, 0, 12.0), tw_peak(&p, 4, -6.0));
+    let coils = [60.0, 60.0, 60.0, 60.0, 70.0, 70.0];
+    let t = tw_drive(&mut u, aw, at, coils, 20.0, true);
+    for (c, ch) in t.channels[..4].iter().enumerate() {
+        assert_eq!(u.pilot_state(c).map(|s| s.0), Some(true), "woofer {c} pilot on");
+        assert!(u.cl_fresh(c), "woofer {c} fresh");
+        assert_eq!(ch.cl_fresh, 1, "woofer {c} published fresh");
+        assert!((ch.cl_temp_c - 60.0).abs() < 2.0, "woofer {c} T_CL {}", ch.cl_temp_c);
+    }
+    for (c, ch) in t.channels[..TW_N].iter().enumerate().skip(4) {
+        assert_eq!(u.pilot_state(c).map(|s| s.0), Some(false), "tweeter {c} pilot off");
+        assert!(ch.closed_loop, "tweeter {c} has a closed-loop estimator");
+        assert!(!u.cl_fresh(c), "tweeter {c} not fresh");
+        assert_eq!(ch.cl_fresh, 0, "tweeter {c} published stale");
+        assert_eq!(ch.cl_temp_c, 25.0, "tweeter {c} T_CL holds T_cal");
+        // the open-loop model runs: it heats above the ambient from the
+        // cold start
+        assert!(ch.ol_temp_c > 40.1, "tweeter {c} T_OL {}", ch.ol_temp_c);
+        // no relaxation from a stale estimate
+        assert_eq!(ch.tlim_adj_c, 0.0);
+        assert_eq!(u.effective_limit(c), 120.0);
+    }
+}
+
+/// The same tweeter lanes with programme above the threshold: their pilot
+/// turns on, reaches their own V/I pair through the plant and the estimate
+/// moves to the coil's temperature, apart from the woofers'.
+#[test]
+fn tweeter_above_the_pilot_threshold_reads_its_own_coil() {
+    let p = tweeter_layout();
+    let mut u = spp3::Unit::new(p);
+    let (aw, at) = (tw_peak(&p, 0, 12.0), tw_peak(&p, 4, 6.0));
+    let coils = [60.0, 60.0, 60.0, 60.0, 75.0, 85.0];
+    let t = tw_drive(&mut u, aw, at, coils, 20.0, true);
+    for (c, &coil) in coils.iter().enumerate() {
+        assert_eq!(u.pilot_state(c).map(|s| s.0), Some(true), "channel {c} pilot on");
+        assert!(u.cl_fresh(c), "channel {c} fresh");
+        assert_eq!(t.channels[c].cl_fresh, 1);
+        assert!(
+            (t.channels[c].cl_temp_c as f64 - coil).abs() < 2.0,
+            "channel {c} T_CL {} for a {coil} C coil",
+            t.channels[c].cl_temp_c
+        );
+    }
+}
+
+/// Open-loop protection of the tweeter lanes alone: no sense at all, the
+/// tweeters driven at full scale, the woofers silent. The tweeters' model
+/// heats toward the limit, their group's gain comes down and holds T_OL at
+/// the limit, and the woofer group is untouched.
+#[test]
+fn tweeter_open_loop_model_limits_without_sense() {
+    let mut p = tweeter_layout();
+    for ch in &mut p.ch[..TW_N] {
+        ch.cal_present = 0;
+    }
+    let mut u = spp3::Unit::new(p);
+    let t = tw_drive(&mut u, 0.0, 1.0, [25.0; TW_N], 30.0, false);
+    for (c, ch) in t.channels[..TW_N].iter().enumerate().skip(4) {
+        assert!(!ch.closed_loop, "tweeter {c} open loop");
+        assert_eq!(ch.cl_fresh, 0);
+        let tol = ch.ol_temp_c;
+        assert!(tol > 100.0 && tol <= 120.0 + 8.0, "tweeter {c} T_OL {tol}");
+        assert!(ch.gain < 0.9, "tweeter {c} gain {}", ch.gain);
+    }
+    for (c, ch) in t.channels[..4].iter().enumerate() {
+        assert_eq!(ch.gain, 1.0, "woofer {c} untouched");
+    }
+}
+
+#[test]
+fn a_drive_scale_models_the_capped_amps_exactly_and_unity_is_the_reference() {
+    // The kernel's gain cap at -20 dB: the amps put out k = 0.1 of the
+    // blob's operating point, so the modelled power is k^2 of it.
+    let p = params();
+    let k = 10f32.powf(-20.0 / 20.0);
+    let mut capped = spp3::Unit::new(p);
+    assert!(capped.set_drive_scale(k));
+    assert!((capped.drive_scale() - k).abs() < 1e-6);
+    let (t, _) = drive(&mut capped, [0.5; 4], 60.0, 1024);
+    for c in 0..4 {
+        let pw = elec(&p, c) * f64::from(k) * f64::from(k) * 0.25;
+        let want = 40.0 + pw * (p.ch[c].t_sett_vc as f64 + p.ch[c].t_sett_mg as f64);
+        let got = t.channels[c].ol_temp_c as f64;
+        assert!((got - want).abs() < 0.01, "ch{c} {got} {want}");
+    }
+    // back to unity: bit for bit the unscaled unit from here on
+    let mut a = spp3::Unit::new(p);
+    let mut b = spp3::Unit::new(p);
+    assert!(b.set_drive_scale(0.25));
+    assert!(b.set_drive_scale(1.0));
+    let (ta, oa) = drive(&mut a, [0.3; 4], 5.0, 512);
+    let (tb, ob) = drive(&mut b, [0.3; 4], 5.0, 512);
+    assert_eq!(oa, ob);
+    for c in 0..4 {
+        assert_eq!(ta.channels[c].ol_temp_c.to_bits(), tb.channels[c].ol_temp_c.to_bits());
+    }
+    // nonsense is the most drive (the blob's own operating point), and a
+    // scale below the floor is held at it
+    for bad in [f32::NAN, f32::INFINITY, 0.0, -1.0, 2.0] {
+        let mut u = spp3::Unit::new(p);
+        assert!(u.set_drive_scale(bad));
+        assert_eq!(u.drive_scale(), 1.0, "{bad}");
+    }
+    let mut u = spp3::Unit::new(p);
+    u.set_drive_scale(1e-6);
+    assert!((u.drive_scale() - spp3::MIN_DRIVE_SCALE).abs() < 1e-9);
+}

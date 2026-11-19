@@ -1,0 +1,53 @@
+[package]
+name = "sgv2-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+license = "MIT"
+description = "cargo-fuzz targets for the sgv2 protection core"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = "1"
+sgv2-core = { path = "..", features = ["std"] }
+sgv2-lv2 = { path = "../../sgv2-lv2" }
+
+# Not a member of the repository workspace: cargo-fuzz builds it on its own
+# (it needs `-Zsanitizer`, so RUSTC_BOOTSTRAP=1 on a stable toolchain).
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+panic = "unwind"
+
+[[bin]]
+name = "blob"
+path = "fuzz_targets/blob.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "spp3"
+path = "fuzz_targets/spp3.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "atsp"
+path = "fuzz_targets/atsp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lsm2"
+path = "fuzz_targets/lsm2.rs"
+test = false
+doc = false
+bench = false

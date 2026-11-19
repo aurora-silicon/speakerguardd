@@ -1,0 +1,69 @@
+name: v2
+
+on:
+  push:
+    branches: [main, v2, "v2-*/**", v2-switch-main]
+  pull_request:
+    branches: [main, v2]
+
+permissions:
+  contents: read
+
+jobs:
+  clean:
+    name: Clean-publish check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: tools/check-clean.sh
+
+  rust:
+    name: Rust (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - run: cargo test --workspace --release
+      - run: cargo build --workspace --release
+
+  diffrig:
+    name: Rig tools
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -m py_compile tools/diffrig/compare.py
+      - run: python3 -I tools/diffrig/compare.py --self-test
+      - run: python3 -I tools/diffrig/run.py --self-test
+      - run: python3 -I tools/diffrig/macos/capture.py --self-test
+      - run: python3 -I tools/diffrig/aidgate/test_attest.py
+      # The voicing rig analyses with numpy (Ubuntu's package, so the isolated -I interpreter sees it).
+      - run: sudo apt-get update -q && sudo apt-get install -y -q python3-numpy
+      - run: python3 -I tools/diffrig/voicing/rig.py --self-test
+
+  session:
+    name: Session side (wiring derivation, self-check verdicts, helper)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -I packaging/session/gen.py --check
+      - run: python3 -I packaging/session/test_wiring.py
+      - run: python3 -I packaging/session/test_session.py
+      - run: python3 -I packaging/session/test_provision.py
+      - run: python3 -I packaging/session/test_verify.py
+
+  upgrade:
+    name: aurora-speaker-upgrade (AEA range port vs the Go reference vectors)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -q && sudo apt-get install -y -q python3-cryptography liblzfse1
+      - run: python3 -I -m unittest discover -s packaging/upgrade/tests -v

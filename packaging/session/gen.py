@@ -1,0 +1,633 @@
+#!/usr/bin/env python3
+"""Generate the per-machine PipeWire and WirePlumber files of the v2 speaker graph.
+
+    python3 -I packaging/session/gen.py            # rewrite the files
+    python3 -I packaging/session/gen.py --check    # fail if any file is stale
+
+Every value comes from the machine's own device tree and tuning, recorded in
+fixtures/<machine>.json (public device-tree facts and the lane structure of
+the tuning's graph, no tuning values): the channel map (wiring.derive) and
+the rest of the description (wiring.describe: the card, the model, the amp
+and sense counts, the plugin variant, the speaker format and the
+transport's buffering). Nothing is written by hand per board. On a Mac with
+no fixture, speakerguardd-selfcheck derives the same from the live device
+tree, checks it against ALSA, and generates the files.
+
+The graph, per machine:
+
+    voicing sink (the user's speakers) ──► protect stage ──► speaker amps (ALSA)
+                                               ▲
+                                  sense (ALSA) ┘
+
+- The voicing stage is the machine's voicing graph, loaded by WirePlumber's
+  software-dsp in front of the protect stage. Its output stream targets the
+  node named alsa_output.platform-sound.RawSpeakers, which on v2 is the
+  protect stage's input.
+- The protect stage is a filter-chain around one sgv2 LV2 instance: the
+  program on AUX0.. and the amps' V/I sense after it.
+- The speaker amps and the sense are ALSA nodes of their own on the speaker
+  card's PCMs 1 and 2 (hw:CARD=<card>,DEV=<n>, a name no aurora-audio rule
+  matches), in one node.group, so the amps' sink drives the sense at the
+  same 512-frame quantum. Their class is internal: no client or policy
+  links to them.
+- WirePlumber's own node for the speaker PCM is disabled, so aurora-audio's
+  rules for it never create a second path to the amps.
+- speakerguardd-session makes the links to the amps and the sense only while
+  the kernel grants protection, and reports the link set and the carrier to
+  the supervisor.
+"""
+import json
+import math
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import wiring  # noqa: E402
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+PKG = os.path.dirname(HERE)
+QUANTUM = 512
+PROTECT_INPUT = "alsa_output.platform-sound.RawSpeakers"
+
+
+# Where gate.json is: beside this file in the source tree, else where every
+# distribution installs it (speakerguardd-gate's default). SGV2_GATE overrides.
+GATE_PATHS = (os.path.join(HERE, "gate.json"), "/usr/share/speakerguardd/gate.json")
+
+
+def load_gate():
+    env = os.environ.get("SGV2_GATE")
+    for path in ((env,) if env else ()) + GATE_PATHS:
+        if os.path.exists(path):
+            with open(path) as f:
+                return json.load(f)
+    raise FileNotFoundError("gate.json: none of " + ", ".join(((env,) if env else ()) + GATE_PATHS))
+
+
+def qualification_policy(board, units, gate=None):
+    """Build-wide parity plus board policy. An allow never replaces proofs."""
+    gate = load_gate() if gate is None else gate
+    overrides = gate.get("board_overrides", {})
+    denied = gate.get("denied_boards", [])
+    if not isinstance(overrides, dict) or not isinstance(denied, list) or not all(isinstance(b, str) for b in denied):
+        raise wiring.Refused("malformed board qualification policy")
+    override = overrides.get(board)
+    if board in denied or override == "deny":
+        raise wiring.Refused(f"{board} is denied by board policy")
+    if override not in (None, "allow"):
+        raise wiring.Refused(f"invalid board override for {board}")
+    parity = gate.get("units_at_parity", [])
+    if not isinstance(parity, list) or any(u not in wiring.PROTECTION_UNITS for u in parity):
+        raise wiring.Refused("malformed build parity policy")
+    if not units or any(u not in parity for u in units):
+        raise wiring.Refused(f"protection types not at parity: {', '.join(u for u in units if u not in parity)}")
+
+
+def voicing_enabled(board, gate=None):
+    """Per-board deployment gate. Missing keys/boards keep the interim graph.
+    Values must be literal JSON booleans; strings never enable a board.
+    This also selects the historical mode of offline fixture artifacts;
+    runtime_voicing_enabled supplies the automatic first-boot default.
+    """
+    if gate is None:
+        gate = load_gate()
+    return gate.get("voicing_pre", {}).get(board) is True
+
+
+def runtime_voicing_enabled(board):
+    """New boards compile their own full voicing chain automatically.
+
+    Existing explicit deployment choices remain overrides. Offline fixture
+    generation keeps its recorded mode; the live generator uses the mode
+    actually compiled and bound by provisioning.
+    """
+    gate = load_gate()
+    overrides = gate.get("voicing_pre", {})
+    if not isinstance(overrides, dict):
+        raise wiring.Refused("malformed voicing deployment overrides")
+    if board in overrides:
+        return voicing_enabled(board)
+    return True
+
+
+def voicing_bound(board, gate=None):
+    """Interim never-louder bound for a board's generated voicing: one gain
+    in dB (<= 0) per unit lane, applied after the voicing plugin, from
+    gate.json voicing_pre_bound_db. It exists only while a voicing law is
+    still open (it keeps every lane at or below macOS on the full-chain
+    safety scan) and goes when the law is exact. Anything malformed, any
+    positive value or a wrong lane count refuses the board's voicing.
+    """
+    if gate is None:
+        gate = load_gate()
+    b = gate.get("voicing_pre_bound_db", {}).get(board)
+    if b is None:
+        return None
+    if not isinstance(b, list) or not all(isinstance(x, (int, float)) and not isinstance(x, bool) and -12.0 <= x <= 0.0 for x in b):
+        raise ValueError(f"voicing_pre_bound_db for {board}: want a list of dB values in [-12, 0]")
+    return [float(x) for x in b]
+
+
+LOWPASS_ORDERS = (2, 4, 6, 8, 10, 12)
+
+
+def voicing_lowpass(board, gate=None):
+    """INTERIM never-louder band limit for a board's generated voicing, from
+    gate.json voicing_pre_lowpass: {"hz": corner, "order": even Butterworth
+    order}. It is not a macOS law. It exists only because one voicing law is
+    still open and makes a board louder than macOS in a band no lane trim
+    can hold: on the j700 (AID44) v2's ControlFreak lacks the AU's
+    reconstruction low-pass, so above ~17 kHz the box is up to +23 dB
+    (+30 dB at full scale) louder than macOS, and its saturation folds a
+    loud high-frequency input back into the band (aliases at 9-16.5 kHz).
+    The low-pass therefore sits in front of the voicing plugin, so neither
+    the excess band nor the aliases reach the output; a filter after the
+    plugin cannot remove the aliases. Each section is PipeWire's builtin
+    bq_lowpass (RBJ) at the corner with the Butterworth Q of its pole pair,
+    so the cascade is the bilinear Butterworth response, monotonic and
+    never above 0 dB. It goes when the ControlFreak law is exact. Anything
+    malformed refuses the board's voicing.
+    """
+    if gate is None:
+        gate = load_gate()
+    lp = gate.get("voicing_pre_lowpass", {}).get(board)
+    if lp is None:
+        return None
+    hz = lp.get("hz") if isinstance(lp, dict) else None
+    order = lp.get("order") if isinstance(lp, dict) else None
+    if (
+        not isinstance(lp, dict)
+        or set(lp) != {"hz", "order"}
+        or not isinstance(hz, (int, float))
+        or isinstance(hz, bool)
+        or not 1000.0 <= hz <= 23000.0
+        or not isinstance(order, int)
+        or isinstance(order, bool)
+        or order not in LOWPASS_ORDERS
+    ):
+        raise ValueError(f"voicing_pre_lowpass for {board}: want {{\"hz\": 1000..23000, \"order\": one of {LOWPASS_ORDERS}}}")
+    return float(hz), order
+
+
+def butterworth_q(order):
+    """Q of each pole pair of an even-order Butterworth low-pass."""
+    return [1.0 / (2.0 * math.sin((2 * k - 1) * math.pi / (2 * order))) for k in range(1, order // 2 + 1)]
+
+
+def voicing_conf(m, c, w):
+    """One stereo chain, in unit-lane order, mapped to physical AUX ports
+    with the same map as the protection input. Volume is handled by the
+    chain control, so PipeWire must not attenuate the audio a second time.
+    """
+    amps = c["amps"]
+    unit = w[0]
+    bound = voicing_bound(c.get("board", m))
+    if bound is not None and len(bound) != amps:
+        raise ValueError(f"voicing_pre_bound_db for {c.get('board', m)}: {len(bound)} lanes, the board has {amps}")
+    trims = {k: bound[k] for k in range(amps) if bound and bound[k] < 0.0}
+    outputs = " ".join(f'"b{unit[p]}:Out"' if unit[p] in trims else f'"voicing:out_{unit[p]}"' for p in range(amps))
+    extra_nodes = "".join(
+        f' {{ type = builtin name = b{k} label = linear control = {{ "Mult" = {10.0 ** (t / 20.0):.9f} "Add" = 0.0 }} }}'
+        for k, t in sorted(trims.items())
+    )
+    links = "".join(f' {{ output = "voicing:out_{k}" input = "b{k}:In" }}' for k in sorted(trims))
+    inputs = '"voicing:in_0" "voicing:in_1"'
+    pre_nodes = ""
+    lp = voicing_lowpass(c.get("board", m))
+    if lp is not None:
+        hz, order = lp
+        if hz >= c["rate"] / 2:
+            raise ValueError(f"voicing_pre_lowpass for {c.get('board', m)}: {hz} Hz is not below Nyquist at {c['rate']} Hz")
+        qs = butterworth_q(order)
+        for ch in (0, 1):
+            pre_nodes += "".join(
+                f' {{ type = builtin name = lp{ch}s{k} label = bq_lowpass control = {{ "Freq" = {hz:.1f} "Q" = {q:.9f} }} }}'
+                for k, q in enumerate(qs)
+            )
+            chain = [f"lp{ch}s{k}" for k in range(len(qs))]
+            links += "".join(f' {{ output = "{a}:Out" input = "{b}:In" }}' for a, b in zip(chain, chain[1:]))
+            links += f' {{ output = "{chain[-1]}:Out" input = "voicing:in_{ch}" }}'
+        inputs = '"lp0s0:In" "lp1s0:In"'
+    links_line = f"\n               links = [{links} ]" if links else ""
+    return f"""
+    {{ name = libpipewire-module-filter-chain
+       flags = [ nofail ]
+       args = {{
+           node.description = "{c['name']} speakers"
+           media.name = "{c['name']} speakers"
+           filter.graph = {{
+               nodes = [{pre_nodes} {{ type = lv2 name = voicing plugin = "https://aurora-silicon.org/lv2/sgv2#voicing-{amps}ch" }}{extra_nodes} ]{links_line}
+               inputs = [ {inputs} ]
+               outputs = [ {outputs} ]
+               capture.volumes = [ {{ control = "voicing:volume" min = 0.0 max = 1.0 scale = cubic }} ]
+           }}
+           capture.props = {{
+               node.name = "sgv2.voicing.{m}"
+               node.description = "{c['name']} speakers"
+               media.class = "Audio/Sink"
+               audio.rate = {c['rate']}
+               # Held at the PCM rate like the amps' sink: while the amps
+               # wait for a grant this sink runs on another driver, which
+               # takes a playing client's rate (44.1 kHz), and the amps can
+               # then never start (resampling is off).
+               node.force-rate = {c['rate']}
+               audio.channels = 2
+               audio.position = [ FL FR ]
+               priority.session = 1000
+               sgv2.stage = "voicing-pre"
+               sgv2.machine = "{m}"
+           }}
+           playback.props = {{
+               node.name = "sgv2.voicing.{m}.out"
+               target.object = "{PROTECT_INPUT}"
+               audio.rate = {c['rate']}
+               audio.channels = {amps}
+               audio.position = {aux(amps)}
+               node.passive = true
+               stream.dont-remix = true
+               channelmix.disable = true
+               resample.disable = true
+           }}
+       }}
+    }}
+"""
+
+
+def names(m):
+    return {
+        "protect": PROTECT_INPUT,
+        "protect_out": f"sgv2.protect.{m}.out",
+        "speaker": f"sgv2.speaker.{m}",
+        "sense": f"sgv2.sense.{m}",
+        "group": f"sgv2.speakers.{m}",
+        "hold": f"sgv2.hold.{m}",
+    }
+
+
+def aux(n, base=0):
+    return "[ " + " ".join(f"AUX{base + i}" for i in range(n)) + " ]"
+
+
+def fixture(m):
+    """The machine's recorded device tree and tuning trace, if any."""
+    path = os.path.join(HERE, "fixtures", f"{m}.json")
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        return json.load(f)
+
+
+def machines():
+    """The machines with a fixture, by key."""
+    d = os.path.join(HERE, "fixtures")
+    return sorted(f[: -len(".json")] for f in os.listdir(d) if f.endswith(".json"))
+
+
+def machine(m):
+    """(description, (unit_channels, sense_ports, wiring hash)) of a
+    machine, derived from its fixture."""
+    fx = fixture(m)
+    if fx is None:
+        raise SystemExit(f"{m}: no fixture")
+    try:
+        w = wiring.derive(fx["hw"], fx["tuning"])
+        c = wiring.describe(fx["hw"], w)
+    except wiring.Refused as e:
+        raise SystemExit(f"{m}: {e}")
+    if c["key"] != m:
+        raise SystemExit(f"fixtures/{m}.json: its device tree names machine {c['key']}")
+    return c, (w["unit_channels"], w["sense_ports"], w["hash"])
+
+
+def pipewire_conf(m, c, w, source=None, voicing_pre=None):
+    """The PipeWire file for description `c` (wiring.describe) and map `w`
+    (unit_channels, sense_ports, wiring hash)."""
+    enabled = voicing_enabled(c.get("board", m)) if voicing_pre is None else voicing_pre
+    n = names(m)
+    amps, sense = c["amps"], c["sense"]
+    # The PCMs' own widths (wiring.pcm_widths). A self-check record written
+    # before the description carried them is of a Mac whose PCMs are as wide
+    # as its amps: nothing else passed the switch test.
+    speaker_pcm, sense_pcm = c.get("speaker_pcm", amps), c.get("sense_pcm", sense)
+    uri = f"https://aurora-silicon.org/lv2/sgv2#{c['plugin']}"
+    # filter-chain feeds capture channel i to inputs[i] and playback channel
+    # j from outputs[j]: the lists put each physical channel on its unit port.
+    unit, sense_ports, whash = w[:3]
+    # the graph carries sense only to a unit that takes it (wiring.describe)
+    sense_ports = sense_ports if sense else []
+    inputs = [f'"sgv2:in_{unit[p]}"' for p in range(amps)] + [f'"sgv2:sense_{s}"' for s in sense_ports]
+    outputs = [f'"sgv2:out_{unit[p]}"' for p in range(amps)]
+    sense_obj = ""
+    # A sense PCM whose pointer advances in small chunks (the AOP sense ring:
+    # 120 frames) is not period-batched: PipeWire's batch handling would
+    # halve its period to 256 and add 256 frames of headroom, and its
+    # follower then resyncs (drops frames) on ordinary chunk jitter.
+    sense_batch = "" if c["sense_batch"] else "\n            api.alsa.disable-batch = true"
+    # The sense is a follower without resampling: PipeWire resyncs it (drops
+    # or skips frames, shifting it against the program) when its delay is off
+    # target by more than max((quantum + headroom) / 2, 256) frames, so the
+    # headroom sets how late a graph cycle may run before the sense shifts.
+    if sense:
+        sense_obj = f"""
+    {{   factory = adapter
+        args = {{
+            factory.name           = api.alsa.pcm.source
+            node.name              = "{n['sense']}"
+            node.description       = "{c['name']} speaker sense (protection only)"
+            media.class            = "Audio/Source/Internal"
+            node.link-group        = "{n['group']}"
+            api.alsa.path          = "hw:CARD={c['card']},DEV=2"
+            audio.format           = "S16LE"
+            audio.rate             = {c['rate']}
+            audio.channels         = {sense_pcm}
+            audio.position         = {aux(sense_pcm)}
+            api.alsa.period-size   = {QUANTUM}
+            api.alsa.headroom      = {c['sense_headroom']}{sense_batch}
+            node.group             = "{n['group']}"
+            node.passive           = true
+            priority.driver        = 0
+            priority.session       = 0
+            node.autoconnect       = false
+            node.pause-on-idle     = false
+            resample.disable       = true
+            channelmix.disable     = true
+            monitor.channel-volumes = false
+        }}
+    }}"""
+    # The speaker driver wakes on the audio clock where the transport raises
+    # period interrupts (wiring.TRANSPORTS speaker_irq): an NTP slew of the
+    # system clock then cannot drift the sense follower against it.
+    speaker_irq = "\n            api.alsa.disable-tsched = true" if c.get("speaker_irq") else ""
+    text = f"""# Generated by packaging/session/gen.py from {source or f'fixtures/{m}.json'}; do not edit.
+# speakerguardd v2: the protect stage, the speaker amps and the sense of the {c['name']}.
+
+context.objects = [
+    {{   factory = adapter
+        args = {{
+            factory.name           = api.alsa.pcm.sink
+            node.name              = "{n['speaker']}"
+            node.description       = "{c['name']} speaker amps (protected path only)"
+            media.class            = "Audio/Sink/Internal"
+            # One link group with the sense (the same set as node.group, so
+            # scheduling is unchanged): session tools list the pair as part
+            # of the protection graph, never as a device sink or source.
+            node.link-group        = "{n['group']}"
+            api.alsa.path          = "hw:CARD={c['card']},DEV=1"
+            audio.format           = "{c['speaker_format']}"
+            audio.rate             = {c['rate']}
+            audio.channels         = {speaker_pcm}
+            audio.position         = {aux(speaker_pcm)}
+            api.alsa.period-size   = {QUANTUM}
+            api.alsa.headroom      = {c['speaker_headroom']}{speaker_irq}
+            node.group             = "{n['group']}"
+            node.force-quantum     = {QUANTUM}
+            node.lock-quantum      = true
+            # The PCM runs at audio.rate only and resampling is off. A
+            # node's allowed rates do not hold the graph rate: a driver that
+            # (re)starts takes the highest rate of its followers, so a lone
+            # 44.1 kHz client would move the graph to 44.1 kHz.
+            node.force-rate        = {c['rate']}
+            priority.driver        = 2000
+            priority.session       = 0
+            node.autoconnect       = false
+            # Idle (unlinked) means paused: the kernel refuses every start
+            # without a grant, and a driver kept running here retried its
+            # start every quantum after each withdrawal.
+            node.pause-on-idle     = true
+            resample.disable       = true
+            channelmix.disable     = true
+            monitor.channel-volumes = false
+        }}
+    }}{sense_obj}
+    {{   factory = adapter
+        args = {{
+            factory.name           = support.null-audio-sink
+            node.name              = "{n['hold']}"
+            node.description       = "{c['name']} speaker protection hold (no device)"
+            media.class            = "Audio/Sink/Internal"
+            # No device and no clock of its own (not a driver), outside the
+            # amps' group. The session helper links the protect stage's
+            # output here while the speakers are wanted, so the stage keeps
+            # running between a stream's end and the grant's end (the amps
+            # may not be linked yet); with nothing playing it is unlinked
+            # and the stage stops with the last stream.
+            audio.rate             = {c['rate']}
+            node.force-rate        = {c['rate']}
+            audio.channels         = {amps}
+            audio.position         = {aux(amps)}
+            node.driver            = false
+            priority.driver        = 0
+            priority.session       = 0
+            node.autoconnect       = false
+            node.pause-on-idle     = true
+            resample.disable       = true
+            channelmix.disable     = true
+            monitor.channel-volumes = false
+        }}
+    }}
+]
+
+context.modules = [
+    {{   name = libpipewire-module-filter-chain
+        flags = [ nofail ]
+        args = {{
+            node.description = "{c['name']} speaker protection"
+            media.name       = "{c['name']} speaker protection"
+            filter.graph = {{
+                nodes = [
+                    {{ type = lv2 name = sgv2 plugin = "{uri}" }}
+                ]
+                inputs  = [ {" ".join(inputs)} ]
+                outputs = [ {" ".join(outputs)} ]
+            }}
+            capture.props = {{
+                node.name          = "{n['protect']}"
+                node.description   = "{c['name']} speaker protection input (internal)"
+                # Internal, like the amps' sink: desktops neither offer it as
+                # an output nor resolve their volume keys through the voicing
+                # to it (its name looks like hardware), where any volume or
+                # mute drops the carrier and the grant.
+                media.class        = "Audio/Sink/Internal"
+                audio.rate         = {c['rate']}
+                node.force-rate    = {c['rate']}
+                audio.channels     = {amps + sense}
+                audio.position     = {aux(amps + sense)}
+                priority.session   = 0
+                priority.driver    = 0
+                node.lock-quantum  = true
+                node.pause-on-idle = false
+                # Runs while anything feeds it or its output is linked (the
+                # amps, or the hold while the speakers are wanted), on
+                # whichever driver that brings: the plugin beats before the
+                # grant, which waits for it, and before the amps are linked.
+                # With nothing playing it stops, as macOS stops its speaker
+                # engine after the last client.
+                stream.dont-remix  = true
+                channelmix.disable = true
+                resample.disable   = true
+                sgv2.stage         = "protect"
+                sgv2.machine       = "{m}"
+                # The wiring this stage was built with; the session helper
+                # reports it, and the supervisor grants only for the wiring
+                # the self-check proved.
+                sgv2.wiring        = "{whash}"
+            }}
+            playback.props = {{
+                node.name          = "{n['protect_out']}"
+                node.description   = "{c['name']} speaker protection output"
+                audio.rate         = {c['rate']}
+                audio.channels     = {amps}
+                audio.position     = {aux(amps)}
+                node.autoconnect   = false
+                node.dont-reconnect = true
+                # Not passive: a link from here (to the amps, or to the hold)
+                # keeps the stage and the amps running with no client, until
+                # the session helper unlinks it.
+                node.passive       = false
+                node.pause-on-idle = false
+                stream.dont-remix  = true
+                channelmix.disable = true
+                resample.disable   = true
+            }}
+        }}
+    }}
+]
+"""
+    return text.rsplit("]", 1)[0] + voicing_conf(m, c, w) + "]\n" if enabled else text
+
+
+RAW_RULES = "59-sgv2-raw.conf"
+# Exists while this boot's raw-PCM rules are in force: speakerguardd v2 owns
+# the speaker PCM. alsa-ucm-conf-asahi's macaudio HiFi verb then has no
+# Speaker device (its node would be disabled anyway), so desktops list no
+# "Speakers" port of the card beside the voicing sink, and WirePlumber's UCM
+# probe never opens the raw speaker PCM.
+UCM_MARKER = "speakerguardd-owns-speakers"
+
+
+def wireplumber_raw_conf(card, card_name=None, speakers_only=False):
+    """Only the rules that keep WirePlumber off the raw speaker and sense
+    PCMs (devices 1 and 2 of the speaker card): written by provisioning on
+    every v2 boot and linked for every user from the start of the session,
+    before the self-check has generated the graph. Without them a session
+    that starts during the self-check probes the raw PCMs (open, hw_params,
+    prepare, close on the shared speaker port), which latched 'bad TDM
+    clock' on an amp of the MacBook Air M2 (KFIX 11-07).
+
+    With the card's name (api.alsa.card.name, the macaudio card's short
+    name), the card's ALSA device gets no pro-audio profile: it offers only
+    the same raw PCMs again, and probing it opens every PCM of the card.
+    A card with no PCM but the speaker and sense ones (speakers_only, the
+    J616s: its jack is a card of its own) is hidden from clients as well
+    (asahi.hide-device, asahi-audio's asahi-hide-devices.lua): its only
+    port is the speakers, which the voicing sink is. WirePlumber keeps the
+    device and its profile, whose verb sets the speaker front-end's mux."""
+    device = ""
+    if card_name:
+        hide = "\n                asahi.hide-device = true" if speakers_only else ""
+        device = f"""
+    # The speaker card's ALSA device{" (speakers and sense only)" if speakers_only else ""}.
+    {{
+        matches = [
+            {{ device.name = "~alsa_card.*", api.alsa.card.name = "{card_name}" }}
+        ]
+        actions = {{
+            update-props = {{
+                api.acp.disable-pro-audio = true{hide}
+            }}
+        }}
+    }}"""
+    return f"""# Generated by speakerguardd-provision; do not edit.
+# speakerguardd v2 owns the speaker card {card}: no WirePlumber node for its raw speaker or sense PCM.
+
+monitor.alsa.rules = [
+    {{
+        matches = [
+            {{ api.alsa.path = "hw:{card},1" }}
+            {{ api.alsa.path = "hw:{card},2" }}
+            {{ alsa.id = "{card}", alsa.device = 1 }}
+            {{ alsa.id = "{card}", alsa.device = 2 }}
+        ]
+        actions = {{
+            update-props = {{
+                node.disabled = true
+            }}
+        }}
+    }}{device}
+]
+"""
+
+
+def wireplumber_conf(m, c, source=None, voicing_pre=None):
+    enabled = voicing_enabled(c.get("board", m)) if voicing_pre is None else voicing_pre
+    card = c["card"]
+    text = f"""# Generated by packaging/session/gen.py from {source or f'fixtures/{m}.json'}; do not edit.
+# speakerguardd v2 on the {c['name']}: the only path to the speaker amps is the protect stage.
+
+monitor.alsa.rules = [
+    # WirePlumber's own nodes for the speaker PCM and the sense PCM (UCM and
+    # pro-audio profiles alike): never created, so no rule (aurora-audio's
+    # software-dsp, volume locks) can make a second path to the amps. These
+    # rules see only the ALSA monitor's nodes, never sgv2's own.
+    {{
+        matches = [
+            {{ api.alsa.path = "hw:{card},1" }}
+            {{ api.alsa.path = "hw:{card},2" }}
+            {{ alsa.id = "{card}", alsa.device = 1 }}
+            {{ alsa.id = "{card}", alsa.device = 2 }}
+        ]
+        actions = {{
+            update-props = {{
+                node.disabled = true
+            }}
+        }}
+    }}
+]
+
+node.software-dsp.rules = [
+    # The machine's voicing in front of the protect stage. Not hidden: the
+    # session helper must see the protect stage's ports.
+    {{
+        matches = [
+            {{ node.name = "{PROTECT_INPUT}", sgv2.stage = "protect", sgv2.machine = "{m}" }}
+        ]
+        actions = {{
+            create-filter = {{
+                filter-path = "/usr/share/asahi-audio/{m}/graph.json"
+            }}
+        }}
+    }}
+]
+"""
+    if enabled:
+        # Do not create the interim software-dsp filter as well.
+        text = text[:text.index("node.software-dsp.rules = [")] + "node.software-dsp.rules = []\n"
+    return text
+
+
+def outputs():
+    for m in machines():
+        c, w = machine(m)
+        yield os.path.join(PKG, "pipewire", f"sgv2-{m}.conf"), pipewire_conf(m, c, w)
+        yield os.path.join(PKG, "wireplumber", f"60-sgv2-{m}.conf"), wireplumber_conf(m, c)
+
+
+def main():
+    check = "--check" in sys.argv[1:]
+    stale = 0
+    for path, text in outputs():
+        old = open(path).read() if os.path.exists(path) else None
+        if old == text:
+            continue
+        if check:
+            print(f"stale: {os.path.relpath(path, PKG)}")
+            stale += 1
+        else:
+            with open(path, "w") as f:
+                f.write(text)
+            print(f"wrote {os.path.relpath(path, PKG)}")
+    return 1 if stale else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,23 @@
+[Unit]
+Description=Speaker protection across system sleep (speakerguardd v2)
+Documentation=https://github.com/aurora-silicon/speakerguardd/blob/v2/docs/NEW-PLATFORM.md
+# Before every sleep (suspend, hibernate, hybrid), while everything is still
+# awake: the session helper unlinks the amps, their PCM closes, and the
+# supervisor stops and releases its ownership. The kernel holds its floor
+# over the sleep with no stream running and no owner to freeze. After the
+# resume sleep.target goes, this unit is no longer needed and its stop starts
+# the supervisor again, which grants as at boot.
+Before=sleep.target
+StopWhenUnneeded=yes
+ConditionPathExists=/proc/device-tree/compatible
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecCondition=/usr/libexec/speakerguardd/speakerguardd-gate v2
+ExecStart=/usr/libexec/speakerguardd/speakerguardd-provision sleep --unit speakerguardd.service
+ExecStop=/usr/libexec/speakerguardd/speakerguardd-provision wake --unit speakerguardd.service
+TimeoutSec=15
+
+[Install]
+WantedBy=sleep.target

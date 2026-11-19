@@ -1,0 +1,25 @@
+[Unit]
+Description=Speaker protection session helper (speakerguardd v2)
+Documentation=https://github.com/aurora-silicon/speakerguardd/tree/v2
+# It links the speaker amps into the graph only while the kernel grants
+# protection, and reports the graph to the supervisor. Without it the report
+# goes stale, the supervisor releases, and the kernel's safe level applies.
+After=pipewire.service wireplumber.service speakerguardd-graph.service
+BindsTo=pipewire.service
+# As PipeWire itself: never for root (an ssh login as root starts root's
+# user manager, where pipewire.service is skipped and this unit's BindsTo
+# reported 'Dependency failed').
+ConditionUser=!root
+
+[Service]
+# Only for the seat user, and only once provisioning and the self-check
+# passed in this boot (the graph is in place).
+ExecCondition=/usr/libexec/speakerguardd/speakerguardd-provision is-seat
+# Written by speakerguardd-provision: SGV2_MACHINE, the machine.
+EnvironmentFile=-/etc/speakerguardd/speakerguardd.conf
+ExecStart=/usr/libexec/speakerguardd/speakerguardd-session --machine ${SGV2_MACHINE}
+Restart=always
+RestartSec=1s
+
+[Install]
+WantedBy=pipewire.service

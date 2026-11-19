@@ -1,0 +1,15 @@
+[package]
+name = "sgv2-bench"
+description = "CPU benchmark of the sgv2 units: time per channel per quantum"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+sgv2-core = { path = "../sgv2-core", features = ["std"] }
+
+[lints]
+workspace = true

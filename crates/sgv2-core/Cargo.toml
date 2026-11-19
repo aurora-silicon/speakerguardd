@@ -1,0 +1,33 @@
+[package]
+name = "sgv2-core"
+description = "In-graph speaker protection core: one framework for spp3, lsm2 and atsp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[features]
+# Host-side helpers (blob building); the plugin and the RT path never need it.
+std = []
+# PROVISIONAL (rig law 5, not yet confirmed on held-out cases): velocity
+# band gains water-filled across the bands instead of the full-band
+# candidate on every band. Off by default.
+lsm2-waterfill = []
+# Deliberately quieter LowFlow fallback. This replaces the unresolved
+# detector/state approximation with a fixed, guarded attenuation ceiling.
+# It is intended only for bundles whose exact LowFlow law has not passed the
+# differential rig; see the module documentation for the bound.
+lowflow-conservative = []
+
+[dependencies]
+# Pure-Rust, no_std, correctly rounded sqrt and a portable exp: the same
+# results on every target, which the differential rig depends on.
+libm = "0.2"
+
+[dev-dependencies]
+sgv2-core = { path = ".", features = ["std"] }
+proptest = { version = "1", default-features = false, features = ["std"] }
+
+[lints]
+workspace = true

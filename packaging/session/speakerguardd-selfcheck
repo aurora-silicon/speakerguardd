@@ -1,0 +1,1488 @@
+#!/usr/bin/python3 -I
+"""speakerguardd-selfcheck: prove this Mac's speaker wiring, silently, before
+speakerguardd may grant.
+
+    speakerguardd-selfcheck run      --params BLOB [--force] [--defer] [--switch-interface] [-- TUNING-SOURCE...]
+    speakerguardd-selfcheck pending
+    speakerguardd-selfcheck check    --params BLOB
+    speakerguardd-selfcheck verify   --params BLOB [--json FILE] [--attestations FILE] [-- TUNING-SOURCE...]
+    speakerguardd-selfcheck generate --pipewire-dir D --wireplumber-dir D
+
+It runs as root, before the supervisor, while the kernel holds the speakers
+at its floor, in two units:
+
+- speakerguardd-selfcheck.service, before any login, runs `run --defer`. A
+  passing record bound to this board, kernel, blob and wiring (every boot
+  without a kernel or tuning change) is reused, and its ExecStartPost puts
+  the graph in place before the session starts. The cheap checks (steps 1
+  and 2, the card) run here too. Only the silent switch test (step 3), which
+  takes about 0.5 s per sense switch, is deferred: the run leaves
+  /run/speakerguardd-graph/selfcheck.deferred, writes no record, and no
+  graph is generated, so the seat user's session starts with the raw-PCM
+  rules alone (provisioning's raw/59-sgv2-raw.conf: no WirePlumber node on
+  the raw speaker or sense PCMs, for every user).
+- speakerguardd-switchtest.service, after systemd-user-sessions.service and
+  before the supervisor, runs `run` only while that file exists (`pending`
+  is its ExecCondition). It runs the whole check and writes the record; its
+  ExecStartPost generates the graph, and its ExecStopPost (`pending
+  --clear`) removes the file, pass or fail. The supervisor requires both
+  units, so it grants only after the switch test passed.
+
+While the file exists, no session's PipeWire or WirePlumber starts: their
+speakerguardd-graph.service (speakerguardd-provision graph-user, ordered
+before both) waits for it to go. WirePlumber's ALSA device probe opens and
+prepares every PCM of the speaker card, the raw speaker and sense PCMs
+included, whatever its node rules say (the UCM Speaker device and the
+pro-audio profile); during the switch test's streams that latched a TDM
+clock fault on an amp, and it would take the PCMs the test needs. So the
+login is not held, and the session's audio starts once the test is done,
+with the graph when it passed.
+
+A board without V/I sense has no switch test (its check is static) and is
+never deferred. Runs take an exclusive lock (selfcheck.lock in the state
+directory), so the two units never overlap.
+
+1. **Derive** the wiring (wiring.py) from the device tree and the tuning's
+   graph (`aurora-speaker-tuning dump --json` on the same source the
+   parameters were compiled from), and the rest of the machine description
+   (wiring.describe) from the same device tree. Nothing is hand-written per
+   board; a board the derivation cannot place fails.
+2. **Check the map against the tuning**: every physical channel's amp (its
+   device-tree side and role) is the speaker its unit channel models.
+3. **Check the map against the hardware**, silently:
+   - the ALSA card is the one the device tree's model names, and (with V/I
+     sense) the speaker PCM takes the format the transport gives;
+   - every amp's registers (regmap): its RX slot is its speaker PCM
+     channel, and its V/I sense TX slots are the device tree's;
+   - with a zero-sample stream on the speaker PCM (every sample is 0, so
+     nothing is audible), it turns each amp's VSENSE and then its ISENSE
+     switch off in turn and records the sense PCM: exactly the one sense
+     channel the map gives that amp's V (or I) must go quiet or fixed
+     (an idle pattern), and every other channel must stay live.
+   The kernel admits the stream only under a grant, so the check takes
+   "Speaker Protection" itself: one grant, renewed as a 50 ms lease only
+   while its own zero-sample stream owns the speaker PCM, for the whole
+   switch test (the kernel logs one grant and one release). It keeps the
+   PCMs to itself and tells the session helper not to link
+   (/run/speakerguardd-selfcheck/active).
+4. **Bind** the result to the board, the kernel release, the parameter
+   blob's SHA-256 and the wiring hash, in /var/lib/speakerguardd/selfcheck.bind
+   (and a readable report beside it). The supervisor grants only with a
+   passing record for exactly that combination, and only while the graph
+   reports the same wiring. A kernel or tuning change makes the record
+   stale, and the next start runs the check again.
+
+Any failure writes a failing record with every reason, exits 1, and leaves
+the speakers at the kernel's floor.
+
+`verify` is the whole proof another tool (aurora-speaker-upgrade) asks for
+before it switches a Mac to v2. It changes nothing, plays only zero samples,
+and stops at the first failing step:
+
+0. **kernel**: the v2 interface, alone or beside the volume lock (the dual
+   kernel's "Speaker Protection Interface"); a legacy-only kernel cannot run.
+1. **hardware** (steps 1-3 above): a passing record bound to this board,
+   kernel and blob. Without one (never run, or stale) it cannot run (2).
+2. **voicing** (`aurora-speaker-tuning voicing-check`): the Mac's own chain
+   compiled from its own tuning, with no stub, unwired parameter or compiler
+   gap; the render invariants on this Mac (finite at the clip edge, silence
+   in is silence out, the limiter's saved ceiling holds, deterministic); and
+   the macOS parity attestation for this tuning: the gate renders every
+   tuning of the macOS release through Apple's own Audio Units and through
+   this code (tools/diffrig/aidgate/attest.py), and this tuning must be
+   within its tolerance, for this build's rendering code. The block used is
+   the tuning's own macOS build's, or 25G83's when the tuning's speaker files
+   are byte-identical to 25G83's (v2 renders those with 25G83's laws). A
+   tuning with no attestation, or one for other code, is refused.
+3. **graph**: the speaker graph must hold the 512-frame quantum the gate
+   measured (generated config); with a session up, the speaker and sense
+   nodes must show no xrun since the graph started beyond one per grant
+   (with nothing playing the path is powered down, and the first cycle of a
+   sink that starts again may be counted while the plugin still holds the
+   wake; no frame is lost there), and a silent pilot (zero-sample streams
+   into the voicing input, started and stopped PILOT_STARTS times, after
+   one more that wakes the path) must leave their xrun counts unchanged.
+   Without a running v2 graph only the generated config is checked.
+
+Exit codes: 0 pass (the switch may proceed), 1 refused (stay on the legacy
+stack; reason on stderr), 2 cannot run (retry later; do not switch), 3
+internal error (treat as refused). `--json FILE`: {"result", "board",
+"kernel", "params_sha256", "wiring_hash", "steps": [{"name", "result",
+"detail"}]}.
+"""
+import argparse
+import errno
+import fcntl
+import hashlib
+import itertools
+import json
+import math
+import os
+import re
+import struct
+import subprocess
+import sys
+import threading
+import time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, HERE)
+# The modules beside this program are the package's: never write a __pycache__
+# into the package's directory, where nothing owns it and it outlives the package.
+sys.dont_write_bytecode = True
+import wiring  # noqa: E402
+
+# 2: the record carries the derived machine description (report "machine").
+# 3: the description carries speaker_irq (the speaker sink's period-interrupt
+# scheduling, wiring.TRANSPORTS): records of 2 are checked again.
+VERSION = 3
+STATE = "/var/lib/speakerguardd"
+MARKER = "/run/speakerguardd-selfcheck/active"
+# The switch test is pending: written by `run --defer` (before login),
+# removed by `pending --clear` when speakerguardd-switchtest.service ends,
+# and by a `run --defer` that does not defer. In provisioning's runtime
+# directory, which outlives each self-check unit (theirs is removed when
+# they stop), where every session's graph-user reads it.
+DEFERRED = "/run/speakerguardd-graph/selfcheck.deferred"
+CAPTURE_S = 0.4
+# After a sense switch turns, before the next capture opens.
+SETTLE_S = 0.05
+LEASE_MS = 50
+TICK_S = 0.010
+PCM_WAIT_S = 15
+# A sense channel is live with at least LIVE distinct values in a capture,
+# quiet (an amp's sense switched off: zeros, or a fixed idle pattern) with
+# at most QUIET. Measured on the J316 and J413 with digital silence: live
+# channels show 40-80 distinct values in 0.4-1 s, switched-off ones 1-3.
+LIVE = 16
+QUIET = 4
+
+# ALSA control ioctls (include/uapi/sound/asound.h, 64-bit)
+_ID_FMT = "IiII44sI"
+_ID_SIZE = 64
+_VAL_SIZE = 1224
+_IFACE_MIXER = 2
+_ELEM_WRITE = (3 << 30) | (_VAL_SIZE << 16) | (0x55 << 8) | 0x13
+_ELEM_LOCK = (1 << 30) | (_ID_SIZE << 16) | (0x55 << 8) | 0x14
+
+# TAS2764/SN012776 registers (page 0): TDM_CFG3 (RX slots), TDM_CFG5 (VSNS
+# slot + enable), TDM_CFG6 (ISNS slot + enable).
+TAS2764_RX = 0x0C
+TAS2764_VSNS = 0x0E
+TAS2764_ISNS = 0x0F
+# TAS2770 (sound/soc/codecs/tas2770.h): TDM_CFG_REG3 holds the left RX
+# slot in bits 3:0 (macaudio gives each amp a one-slot mask, so left is
+# its slot); TDM_CFG_REG5/6 the V and I sense TX slots, enable bit 6.
+TAS2770_RX = 0x0D
+TAS2770_VSNS = 0x0F
+TAS2770_ISNS = 0x10
+# Per amp family: (RX register, RX slot mask, V sense register, I sense register).
+AMP_REGS = {
+    "sn012776": (TAS2764_RX, 0x0F, TAS2764_VSNS, TAS2764_ISNS),
+    "tas2770": (TAS2770_RX, 0x0F, TAS2770_VSNS, TAS2770_ISNS),
+}
+
+
+def log(*a):
+    print("speakerguardd-selfcheck:", *a, file=sys.stderr, flush=True)
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(1 << 16), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+# ------------------------------------------------------------------ card
+
+
+def find_card(hw, dt="/proc/device-tree"):
+    """(index, id) of the ALSA card whose device is the DT sound node."""
+    want = os.path.realpath(os.path.join(dt, hw["sound"]))
+    for d in sorted(os.listdir("/sys/class/sound")):
+        if not re.fullmatch(r"card\d+", d):
+            continue
+        of = f"/sys/class/sound/{d}/device/of_node"
+        if os.path.exists(of) and os.path.realpath(of) == want:
+            idx = int(d[4:])
+            with open(f"/proc/asound/card{idx}/id") as f:
+                return idx, f.read().strip()
+    raise wiring.Refused(f"no ALSA card for the device tree's {hw['sound']} node (is the kernel's macaudio driver loaded?)")
+
+
+def pcm_ids(idx):
+    out = {}
+    for d in os.listdir(f"/proc/asound/card{idx}"):
+        m = re.fullmatch(r"pcm(\d+)([pc])", d)
+        if m:
+            with open(f"/proc/asound/card{idx}/{d}/info") as f:
+                info = dict(l.split(": ", 1) for l in f.read().splitlines() if ": " in l)
+            # "id: Secondary (*)": the id, then ALSA's marks
+            pid = re.sub(r"\s*\(\*\)$", "", info.get("id", "").strip())
+            out[(pid, m.group(2))] = int(m.group(1))
+    return out
+
+
+def pcm_status(idx, dev, d):
+    """The substream's /proc status as a dict ({"state": "closed"} when
+    closed, {} when unreadable)."""
+    try:
+        with open(f"/proc/asound/card{idx}/pcm{dev}{d}/sub0/status") as f:
+            t = f.read()
+    except OSError:
+        return {}
+    if t.strip() == "closed":
+        return {"state": "closed"}
+    out = {}
+    for line in t.splitlines():
+        k, sep, v = line.partition(":")
+        if sep:
+            out.setdefault(k.strip(), v.strip())
+    return out
+
+
+def pcm_state(idx, dev, d):
+    st = pcm_status(idx, dev, d)
+    if not st:
+        return "unknown"
+    return st.get("state", "open")
+
+
+class Control:
+    """The card's control device: "Speaker Protection" owned by this process."""
+
+    def __init__(self, idx, switch=False):
+        lease_interface(idx, switch)
+        self.fd = os.open(f"/dev/snd/controlC{idx}", os.O_RDWR | os.O_CLOEXEC)
+        try:
+            fcntl.ioctl(self.fd, _ELEM_LOCK, self._id("Speaker Protection"))
+        except OSError as e:
+            os.close(self.fd)
+            if e.errno == errno.EBUSY:
+                raise wiring.Refused("\"Speaker Protection\" is owned by another process (stop speakerguardd first)")
+            if e.errno == errno.EPERM:
+                raise wiring.Refused("taking \"Speaker Protection\" needs root (CAP_SYS_ADMIN)")
+            if e.errno == errno.ENOENT:
+                raise wiring.Refused("the card has no \"Speaker Protection\" control: not a v2 kernel")
+            raise
+
+    @staticmethod
+    def _id(name):
+        return struct.pack(_ID_FMT, 0, _IFACE_MIXER, 0, 0, name.encode(), 0)
+
+    def write(self, v, name="Speaker Protection"):
+        buf = bytearray(_VAL_SIZE)
+        buf[0:_ID_SIZE] = self._id(name)
+        struct.pack_into("q", buf, 72, v)
+        fcntl.ioctl(self.fd, _ELEM_WRITE, buf)
+
+    def close(self):
+        # closing the owner's file withdraws any grant at once
+        try:
+            self.write(0)
+        except OSError:
+            pass
+        os.close(self.fd)
+
+
+def lease_interface(card, switch=False):
+    """On a dual kernel ("Speaker Protection Interface", linux 98cb6a86 and
+    later) "Speaker Volume Unlock" is in charge at boot, and "Speaker
+    Protection" grants nothing until root switches the interface. The check
+    switches it only on a Mac aurora-speaker-upgrade switched (its setting),
+    or when that tool runs the check itself (`--switch-interface`); the
+    kernel goes back to the volume lock, at its floor, 30 s after the last
+    owner closes. Returns the interface ("dual" or None)."""
+    cur = wiring.interface_get(card)
+    if cur is None:
+        return None
+    if cur != wiring.IF_LEASE:
+        if not (switch or wiring.upgraded()):
+            raise wiring.Refused(
+                f"this kernel serves both speaker interfaces and {wiring.IF_UNLOCK!r} is in charge: this Mac was not "
+                "switched to speakerguardd v2 (aurora-speaker-upgrade), so the older daemons own the speakers")
+        wiring.interface_lease(card)
+        log(f"{wiring.INTERFACE_CONTROL!r} = {wiring.IF_LEASE!r} (the volume lock's floor first)")
+    return "dual"
+
+
+class Lease(threading.Thread):
+    """Renews a LEASE_MS grant every TICK_S until stopped. A lapse (the
+    kernel's -ETIMEDOUT) is recorded and the run it spans is void."""
+
+    def __init__(self, ctl):
+        super().__init__(daemon=True)
+        self.ctl, self.stop_ev, self.lapsed, self.err = ctl, threading.Event(), False, None
+
+    def run(self):
+        try:
+            os.sched_setscheduler(0, os.SCHED_FIFO, os.sched_param(50))
+        except (OSError, AttributeError):
+            pass
+        while not self.stop_ev.is_set():
+            try:
+                self.ctl.write(LEASE_MS)
+            except OSError as e:
+                if e.errno == errno.ETIMEDOUT:
+                    self.lapsed = True
+                else:
+                    self.err = e
+                    return
+            self.stop_ev.wait(TICK_S)
+
+    def end(self):
+        self.stop_ev.set()
+        self.join(1.0)
+        self.ctl.write(0)
+
+
+def amixer(card, *args):
+    return subprocess.run(["amixer", "-c", card, *args], capture_output=True, text=True, timeout=10)
+
+
+def switch_get(card, name):
+    r = amixer(card, "cget", f"name={name}")
+    m = re.search(r": values=(\w+)", r.stdout)
+    return m.group(1) if m else None
+
+
+def switch_set(ctl, name, v):
+    # Sense switches are writable only through the protection owner's file.
+    # amixer opens another file and is deliberately refused while we own it.
+    if v not in ("on", "off"):
+        raise wiring.Refused(f"setting {name!r}: invalid switch value {v!r}")
+    try:
+        ctl.write(int(v == "on"), name=name)
+    except OSError as e:
+        raise wiring.Refused(f"setting {name!r}: {e}") from e
+
+
+# ---------------------------------------------------------------- checks
+
+
+REGMAP = "/sys/kernel/debug/regmap"
+
+
+def _regmap_dump(path, regs):
+    """{reg: value} from the whole debugfs dump (every readable register)."""
+    try:
+        with open(path) as f:
+            text = f.read()
+    except OSError as e:
+        raise wiring.Refused(f"cannot read {path}: {e.strerror} (debugfs is needed for the slot check)")
+    out = {}
+    for line in text.splitlines():
+        k, _, v = line.partition(":")
+        try:
+            r = int(k, 16)
+        except ValueError:
+            continue
+        if r in regs:
+            out[r] = int(v.strip(), 16)
+    return out
+
+
+def regmap_values(i2c, regs):
+    """{reg: value} from the amp's regmap in debugfs, reading only `regs`.
+
+    The dump is fixed-width lines ("<reg>: <value>"), and the kernel reads
+    only the registers whose lines a read covers. Reading it whole reads
+    every register of every page over I2C (about 0.33 s per amp on the
+    J616s, 2 s of every check) and fills the register cache with all of
+    them. So each wanted register's line is read on its own, at its offset
+    if every register before it is in the dump (the line names its
+    register, and is checked); anything else reads the whole dump."""
+    path = f"{REGMAP}/{i2c}/registers"
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+    except OSError as e:
+        raise wiring.Refused(f"cannot read {path}: {e.strerror} (debugfs is needed for the slot check)")
+    try:
+        first = os.pread(fd, 64, 0).decode(errors="replace").split("\n", 1)[0]
+        k, sep, _ = first.partition(": ")
+        if not sep or int(k, 16) != 0:
+            raise ValueError(first)
+        width = len(first) + 1
+        out = {}
+        for r in sorted(regs):
+            line = os.pread(fd, width, r * width).decode(errors="replace")
+            k, sep, v = line.rstrip("\n").partition(": ")
+            if not sep or int(k, 16) != r:
+                raise ValueError(line)
+            out[r] = int(v, 16)
+        return out
+    except (OSError, ValueError):
+        return _regmap_dump(path, regs)
+    finally:
+        os.close(fd)
+
+
+def check_registers(w):
+    """Every amp answers on the slots the map gives it."""
+    errs, seen = [], []
+    for p, a in enumerate(w["amps"]):
+        regs = AMP_REGS.get(a["family"])
+        if regs is None:
+            errs.append(f"{a['prefix']}: no register check for {a['family']} amps")
+            continue
+        rx_reg, rx_mask, vsns, isns = regs
+        if not a.get("i2c"):
+            errs.append(f"{a['prefix']}: not bound to an I2C device")
+            continue
+        r = regmap_values(a["i2c"], {rx_reg, vsns, isns})
+        if len(r) != 3:
+            errs.append(f"{a['prefix']} ({a['i2c']}): registers {sorted(r)} only")
+            continue
+        rx = r[rx_reg] & rx_mask
+        seen.append((a["prefix"], a["i2c"], r[rx_reg], r[vsns], r[isns]))
+        if rx != p:
+            errs.append(f"{a['prefix']} ({a['i2c']}) receives TDM slot {rx}, the map plays it on speaker channel {p}")
+        for reg, ch, what in ((vsns, a["v_ch"], "V"), (isns, a["i_ch"], "I")):
+            v = r[reg]
+            if not v & 0x40:
+                errs.append(f"{a['prefix']}: {what} sense transmit is disabled")
+            elif (v & 0x3F) * 8 // wiring.SENSE_BITS != ch or (v & 0x3F) * 8 % wiring.SENSE_BITS:
+                errs.append(f"{a['prefix']}: {what} sense on TX slot {v & 0x3F}, the device tree gives sense channel {ch}")
+    return errs, seen
+
+
+def stats(raw, n):
+    f = len(raw) // (2 * n)
+    if f == 0:
+        return None
+    x = struct.unpack("<%dh" % (f * n), raw[: f * n * 2])
+    out = []
+    for c in range(n):
+        s = x[c::n]
+        m = sum(s) / f
+        out.append({"distinct": len(set(s)), "rms": round(math.sqrt(sum((v - m) ** 2 for v in s) / f), 2), "mean": round(m, 2)})
+    return {"frames": f, "ch": out}
+
+
+def amp_lanes(st, amps):
+    """The amps' V/I lanes of a capture's statistics: the first 2 * amps
+    channels of a sense PCM that may be wider (wiring.pcm_widths)."""
+    return st and dict(st, ch=st["ch"][: 2 * amps])
+
+
+def classify(st):
+    return ["live" if c["distinct"] >= LIVE else "quiet" if c["distinct"] <= QUIET else "unclear" for c in st["ch"]]
+
+
+class Streams:
+    """One capture, armed before playback, spans the entire silent test.
+
+    A new capture cannot assume a frame boundary in an already running AOP
+    serializer. Keep the capture across all switch steps and playback format
+    fallbacks. This proves this lifecycle only, not arbitrary graph reopen
+    order. Every playback sample is zero and the grant is held once.
+    """
+
+    def __init__(self, ctl, card, spk_dev, sense_dev, amps, rate, widths=None):
+        self.ctl, self.card, self.spk, self.sense, self.amps = ctl, card, spk_dev, sense_dev, amps
+        # The PCMs' own widths (wiring.pcm_widths): a transport may fix them
+        # wider than the amps' lanes, which then come first.
+        self.spk_ch, self.sense_ch = widths or (amps, 2 * amps)
+        self.rate = rate
+        self.fmt = None
+        self.idx = None
+        self.lease = None
+        self.play = None
+        self.rec = None
+        self.reader = None
+        self.capture_cv = threading.Condition()
+        self.capture_data = bytearray()
+        self.capture_total = 0
+        self.capture_error = None
+        self.frame_bytes = 2 * self.sense_ch  # S16_LE
+        self.capture_limit = 2 * rate * self.frame_bytes
+        self.capture_deadline = None
+
+    def _play(self, fmt):
+        return subprocess.Popen(
+            ["aplay", "--fatal-errors", "-q", "-D", f"hw:CARD={self.card},DEV={self.spk}", "-f", fmt, "-c", str(self.spk_ch),
+             "-r", str(self.rate), "-t", "raw", "/dev/zero"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+        )
+
+    def _owned(self, proc, dev, direction):
+        if proc is None or proc.poll() is not None:
+            return False
+        st = pcm_status(self.idx, dev, direction)
+        return st.get("state") == "RUNNING" and st.get("owner_pid") == str(proc.pid)
+
+    def _ours(self):
+        return self._owned(self.play, self.spk, "p")
+
+    def _drain(self):
+        try:
+            while True:
+                chunk = os.read(self.rec.stdout.fileno(), 65536)
+                if not chunk:
+                    raise EOFError("sense capture ended")
+                with self.capture_cv:
+                    self.capture_total += len(chunk)
+                    self.capture_data.extend(chunk)
+                    if len(self.capture_data) > self.capture_limit:
+                        del self.capture_data[:-self.capture_limit]
+                    self.capture_cv.notify_all()
+        except Exception as e:
+            with self.capture_cv:
+                self.capture_error = str(e)
+                self.capture_cv.notify_all()
+
+    def _health(self):
+        if self.capture_error:
+            raise wiring.Refused(f"sense capture failed: {self.capture_error}")
+        if time.monotonic() >= self.capture_deadline:
+            raise wiring.Refused("silent switch test exceeded its 30-second capture deadline")
+        if not self._owned(self.rec, self.sense, "c"):
+            raise wiring.Refused("sense capture stopped or is not owned by the self-check")
+        if not self._ours():
+            raise wiring.Refused(f"the zero-sample stream on hw:{self.card},{self.spk} stopped during the switch test")
+        if self.lease.lapsed or self.lease.err:
+            raise wiring.Refused(f"the self-check's own lease lapsed during the switch test ({self.lease.err or 'ETIMEDOUT'})")
+
+    @staticmethod
+    def _stop_process(proc, kill=False):
+        if proc is None:
+            return
+        if proc.poll() is None:
+            if kill:
+                proc.kill()
+            else:
+                proc.terminate()
+            try:
+                proc.wait(2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(2)
+
+    def start(self, idx):
+        self.idx = idx
+        self.capture_deadline = time.monotonic() + 30
+        self.rec = subprocess.Popen(
+            ["arecord", "--fatal-errors", "-q", "-D", f"hw:CARD={self.card},DEV={self.sense}",
+             "-f", "S16_LE", "-c", str(self.sense_ch), "-r", str(self.rate),
+             "--period-time=10000", "--buffer-time=80000", "-t", "raw", "-"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.reader = threading.Thread(target=self._drain, daemon=True)
+        self.reader.start()
+        deadline = time.monotonic() + 2
+        while not self._owned(self.rec, self.sense, "c"):
+            if self.rec.poll() is not None:
+                err = self.rec.stderr.read().decode(errors="replace").strip()
+                raise wiring.Refused(f"sense capture could not start before playback: {err}")
+            if time.monotonic() >= deadline:
+                raise wiring.Refused("sense capture did not become owned/RUNNING before playback")
+            time.sleep(0.01)
+        self.lease = Lease(self.ctl)
+        self.lease.start()
+        log("holding \"Speaker Protection\" for the silent switch test (zero samples only)")
+        last = None
+        for fmt in [self.fmt] if self.fmt else ["S24_LE", "S32_LE", "S16_LE"]:
+            self.play = self._play(fmt)
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline and self.play.poll() is None:
+                if pcm_state(idx, self.spk, "p") == "RUNNING":
+                    break
+                time.sleep(0.01)
+            if self._ours():
+                self.fmt = fmt
+                break
+            if self.play.poll() is None and pcm_state(idx, self.spk, "p") == "RUNNING":
+                raise wiring.Refused(f"hw:{self.card},{self.spk} runs, but not for the self-check's own stream")
+            err = (self.play.communicate(timeout=2)[1] or "").strip() if self.play.poll() is not None else "did not start"
+            self._stop_process(self.play)
+            self.play.stderr.close()
+            self.play = None
+            last = err
+        if self.play is None:
+            raise wiring.Refused(f"the zero-sample stream does not start on hw:{self.card},{self.spk}: {last}")
+        time.sleep(0.1)
+        self._health()
+
+    def capture(self):
+        """Take a fresh, complete-frame window from the continuous capture."""
+        time.sleep(SETTLE_S)
+        self._health()
+        with self.capture_cv:
+            start = ((self.capture_total + self.frame_bytes - 1) // self.frame_bytes) * self.frame_bytes
+        end = start + round(self.rate * CAPTURE_S) * self.frame_bytes
+        deadline = time.monotonic() + 5
+        while True:
+            self._health()
+            with self.capture_cv:
+                base = self.capture_total - len(self.capture_data)
+                if start < base:
+                    raise wiring.Refused("sense capture window was overwritten before it could be checked")
+                if self.capture_total >= end:
+                    raw = bytes(self.capture_data[start - base:end - base])
+                    break
+                if time.monotonic() >= deadline:
+                    raise wiring.Refused("sense capture did not deliver a complete window within five seconds")
+                self.capture_cv.wait(0.05)
+        self._health()
+        return amp_lanes(stats(raw, self.sense_ch), self.amps)
+
+    def stop(self):
+        """Release both streams and the grant, including partial startup."""
+        errors = []
+        try:
+            self._stop_process(self.play)
+        except Exception as e:
+            errors.append(str(e))
+        try:
+            if self.lease is not None:
+                self.lease.end()
+                self.lease = None
+                log("released \"Speaker Protection\" after the switch test")
+        except Exception as e:
+            errors.append(str(e))
+        try:
+            # Its data is no longer needed, and once the zero-sample stream
+            # has stopped, the sense capture can stall (the MCA Macs: no
+            # more frames), where arecord does not act on SIGTERM: it was
+            # killed after the full 2 s wait on every such run. End it at
+            # once; the kernel closes the substream either way.
+            self._stop_process(self.rec, kill=True)
+            if self.reader is not None:
+                self.reader.join(2)
+                if self.reader.is_alive():
+                    raise wiring.Refused("sense capture drain did not stop")
+        except Exception as e:
+            errors.append(str(e))
+        for proc in (self.play, self.rec):
+            if proc is not None:
+                for stream in (proc.stdout, proc.stderr):
+                    if stream is not None:
+                        stream.close()
+        self.play = self.rec = None
+        if errors:
+            raise wiring.Refused("silent stream cleanup failed: " + "; ".join(errors))
+
+
+def switch_codes(n):
+    """Each of n sense switches' captures: (k, codes), where switch i is off
+    in exactly the captures in codes[i]. Every code has two of k captures,
+    so no code contains another: a channel quiet in exactly its switch's
+    code is quieted by that switch alone. If a second switch also quieted
+    it (or the claimed one did not), the channel's quiet captures would be
+    the union of two codes (or another code, or none), never the claimed
+    code; and a switch that quieted a second channel would show in that
+    channel's captures the same way. So the coded test proves what one
+    switch at a time does: each switch quiets exactly its claimed channel,
+    and every other channel stays live. Measured on every amp of the J413,
+    J316s and J616s: with several switches off at once (V and I of one amp
+    included) every channel reads as with one switch off (speakerguardd#102).
+    k = 0 (one switch at a time) when coding saves no capture."""
+    k = 2
+    while math.comb(k, 2) < n:
+        k += 1
+    if k >= n:
+        return 0, []
+    return k, [frozenset(c) for c in itertools.combinations(range(k), 2)][:n]
+
+
+def check_sense(ctl, idx, card, devs, w, runs, widths=None):
+    """The switch test. Returns (errors, speaker format). `widths` are the
+    speaker and sense PCMs' channel counts where they are not the amps'."""
+    errs = []
+    amps = w["amps"]
+    n = len(amps)
+    claims = {(s["amp"], s["kind"]): s["pcm"] for s in w["sense"]}
+    names = {}
+    for a in amps:
+        for kind in ("V", "I"):
+            names[(a["prefix"], kind)] = f"{a['prefix']} {kind}SENSE Switch"
+    saved = {}
+    for nm in names.values():
+        v = switch_get(card, nm)
+        if v is None:
+            return [f"no {nm!r} control"], None
+        saved[nm] = v
+    switches = [(p, a, kind) for p, a in enumerate(amps) for kind in ("V", "I")]
+    k, codes = switch_codes(len(switches))
+    st = Streams(ctl, card, devs[0], devs[1], n, w["rate"], widths)
+    try:
+        for nm in saved:
+            switch_set(ctl, nm, "on")
+        st.start(idx)
+        base = st.capture()
+        runs["baseline"] = base
+        cls = classify(base)
+        if any(c != "live" for c in cls):
+            errs.append(f"with every sense switch on, sense channels {[k for k, c in enumerate(cls) if c != 'live']} are not live")
+            return errs, st.fmt
+        if not k:
+            for p, a, kind in switches:
+                nm = names[(a["prefix"], kind)]
+                switch_set(ctl, nm, "off")
+                try:
+                    s = st.capture()
+                finally:
+                    switch_set(ctl, nm, "on")
+                runs[f"{a['prefix']} {kind}SENSE off"] = s
+                cls = classify(s)
+                quiet = [k for k, c in enumerate(cls) if c == "quiet"]
+                unclear = [k for k, c in enumerate(cls) if c == "unclear"]
+                want = claims.get((p, kind))
+                if unclear:
+                    errs.append(f"{a['prefix']} {kind}SENSE off: sense channels {unclear} neither live nor quiet")
+                elif quiet != [want]:
+                    errs.append(
+                        f"{a['prefix']} {kind}SENSE off quietened sense channel(s) {quiet}; the map has its {kind} on channel {want}"
+                    )
+        else:
+            # Coded: capture j has every switch whose code holds j off.
+            quiet_in = {c: set() for c in range(len(cls))}
+            unclear_any = False
+            for j in range(k):
+                off = [i for i, c in enumerate(codes) if j in c]
+                for i in off:
+                    switch_set(ctl, names[(switches[i][1]["prefix"], switches[i][2])], "off")
+                try:
+                    s = st.capture()
+                finally:
+                    for i in off:
+                        switch_set(ctl, names[(switches[i][1]["prefix"], switches[i][2])], "on")
+                label = ", ".join(f"{switches[i][1]['prefix']} {switches[i][2]}" for i in off)
+                runs[f"coded {j}: {label} SENSE off"] = s
+                cls = classify(s)
+                unclear = [c for c, v in enumerate(cls) if v == "unclear"]
+                if unclear:
+                    unclear_any = True
+                    errs.append(f"coded capture {j} ({label} SENSE off): sense channels {unclear} neither live nor quiet")
+                for c, v in enumerate(cls):
+                    if v == "quiet":
+                        quiet_in[c].add(j)
+            if not unclear_any:
+                follows = {code: f"{a['prefix']} {kind}" for (p, a, kind), code in zip(switches, codes)}
+                claimed = set()
+                for (p, a, kind), code in zip(switches, codes):
+                    want = claims.get((p, kind))
+                    claimed.add(want)
+                    got = quiet_in.get(want, set())
+                    if got != code:
+                        who = follows.get(frozenset(got), "no single switch" if got else "no switch")
+                        errs.append(f"{a['prefix']} {kind}SENSE: the map has its {kind} on channel {want}, which went quiet in "
+                                    f"captures {sorted(got)}, the switch's are {sorted(code)} (channel {want} follows {who})")
+                for c in sorted(set(quiet_in) - claimed):
+                    if quiet_in[c]:
+                        errs.append(f"sense channel {c}, which the map gives no switch, went quiet in captures {sorted(quiet_in[c])}")
+    finally:
+        try:
+            st.stop()
+        finally:
+            for nm, v in saved.items():
+                try:
+                    switch_set(ctl, nm, v)
+                    actual = switch_get(card, nm)
+                    if actual != v:
+                        raise wiring.Refused(f"read back {actual!r}, expected {v!r}")
+                except Exception as e:  # every restoration must still be attempted
+                    reason = f"restoring {nm}: {e}"
+                    log(reason)
+                    errs.append(reason)
+    return errs, st.fmt
+
+
+# ------------------------------------------------------------------ record
+
+
+
+# ------------------------------------------------------------------ plugin
+
+PLUGIN_URI = "https://aurora-silicon.org/lv2/sgv2#"
+# Where distributions install LV2 bundles; the packaged sgv2.lv2 lives in one.
+SYSTEM_LV2 = ("/usr/lib64/lv2", "/usr/lib/lv2", "/usr/local/lib64/lv2", "/usr/local/lib/lv2",
+              "/run/current-system/sw/lib/lv2", "/nix/var/nix/profiles/default/lib/lv2")
+
+
+def _env_lv2_paths(files):
+    """LV2_PATH values set in environment files (KEY=VALUE lines)."""
+    out = []
+    for f in files:
+        try:
+            with open(f, errors="replace") as fh:
+                for line in fh:
+                    m = re.match(r"\s*(?:export\s+)?LV2_PATH\s*=\s*['\"]?([^'\"\n]*)", line)
+                    if m:
+                        out.append((m.group(1), f))
+        except OSError:
+            pass
+    return out
+
+
+def lv2_shadows(users=None, etc="/etc", environ=None):
+    """Every copy of the sgv2 plugin that a user's PipeWire could load
+    instead of the packaged one: a bundle in any user's ~/.lv2 (lilv searches
+    it before the system directories), or in a directory an LV2_PATH names
+    (system-wide, in a user's environment.d, or in this environment) that
+    is not a system LV2 directory. Hand installs from bring-up leave such
+    copies behind, and an old plugin there runs the speakers with code no
+    package shipped. Returns (path, why) pairs."""
+    import glob as _glob
+    import pwd as _pwd
+    environ = os.environ if environ is None else environ
+    if users is None:
+        users = [(u.pw_name, u.pw_dir) for u in _pwd.getpwall() if u.pw_dir and u.pw_dir not in ("/", "")]
+    dirs = []
+    for name, home in users:
+        dirs.append((os.path.join(home, ".lv2"), f"{name}'s ~/.lv2"))
+        envd = sorted(_glob.glob(os.path.join(home, ".config", "environment.d", "*.conf")))
+        dirs += [(d, f"LV2_PATH in {f}") for v, f in _env_lv2_paths(envd) for d in v.split(":")]
+    etcf = [os.path.join(etc, "environment")] + sorted(_glob.glob(os.path.join(etc, "environment.d", "*.conf")))
+    dirs += [(d, f"LV2_PATH in {f}") for v, f in _env_lv2_paths(etcf) for d in v.split(":")]
+    if environ.get("LV2_PATH"):
+        dirs += [(d, "LV2_PATH in this environment") for d in environ["LV2_PATH"].split(":")]
+    system = {os.path.realpath(d) for d in SYSTEM_LV2}
+    found, seen = [], set()
+    for d, why in dirs:
+        if not d or "$" in d or os.path.realpath(d) in system:
+            continue
+        for man in sorted(_glob.glob(os.path.join(d, "*", "manifest.ttl"))):
+            real = os.path.realpath(os.path.dirname(man))
+            if real in seen or os.path.dirname(real) in system:
+                continue
+            try:
+                with open(man, errors="replace") as fh:
+                    if PLUGIN_URI not in fh.read():
+                        continue
+            except OSError:
+                continue
+            seen.add(real)
+            found.append((os.path.dirname(man), why))
+    return found
+
+
+def bind_lines(rec):
+    keys = ["schema", "version", "result", "board", "kernel", "params_sha256", "wiring", "card", "amps", "sense", "family", "key", "method"]
+    out = [f"{k}={rec[k]}" for k in keys]
+    if rec["reasons"]:
+        out.append("reason=" + rec["reasons"][0].replace("\n", " "))
+    return "\n".join(out) + "\n"
+
+
+def read_bind(path):
+    try:
+        with open(path) as f:
+            return dict(l.split("=", 1) for l in f.read().splitlines() if "=" in l)
+    except OSError:
+        return {}
+
+
+def write_atomic(path, text, mode=0o644):
+    tmp = path + ".new"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_CLOEXEC | os.O_NOFOLLOW, mode)
+    try:
+        os.fchmod(fd, mode)
+        os.write(fd, text.encode())
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.rename(tmp, path)
+
+
+def blob_rate(path):
+    """The sample rate a parameter blob was compiled for (its header,
+    crates/sgv2-core/src/blob.rs: "SGV2PRM\\0" at 0, sample_rate at 24)."""
+    with open(path, "rb") as f:
+        head = f.read(28)
+    if len(head) < 28 or head[:8] != b"SGV2PRM\0":
+        raise wiring.Refused(f"{path} is not a speakerguardd parameter blob")
+    return int.from_bytes(head[24:28], "little")
+
+
+def derive_live(args):
+    """(hw, wiring, machine description, errors), all from this Mac's
+    device tree and tuning. A refusal (an unreadable device tree, a missing
+    or old tuning reader, a tuning the derivation cannot place) fails the
+    self-check: nothing runs on an unproven map."""
+    hw = wiring.read_dt()
+    dump = wiring.tuning_dump(args.tuning, args.tuning_cli, strict=True)
+    units = wiring.roles(dump)["channels"]
+    w = wiring.derive(hw, dump)
+    w["method"] = "derived" if w["sense"] else "derived-static"
+    desc = wiring.describe(hw, w)
+    return hw, w, desc, wiring.role_errors(w, units)
+
+
+def report_matches(path, bind):
+    """The self-check record at `path` is a pass for the same board,
+    kernel, parameters and wiring as `bind`."""
+    try:
+        with open(path) as f:
+            r = json.load(f)["record"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    return r.get("result") == "pass" and all(str(r.get(k)) == bind.get(k) for k in ("board", "kernel", "params_sha256", "wiring"))
+
+
+def set_deferred(path, text=None):
+    """Write (text) or remove (None) the switch-test-pending file."""
+    if text is None:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    write_atomic(path, text)
+
+
+def cmd_run(args):
+    """`run`, under an exclusive lock on the state directory: the
+    before-login and after-login units never run the check at the same time,
+    and never interleave their records."""
+    os.makedirs(args.state, exist_ok=True)
+    fd = os.open(os.path.join(args.state, "selfcheck.lock"), os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return run_locked(args)
+    finally:
+        os.close(fd)
+
+
+def run_locked(args):
+    bind_path = os.path.join(args.state, "selfcheck.bind")
+    report_path = os.path.join(args.state, "selfcheck.json")
+    kernel = os.uname().release
+    rec = {
+        "schema": 1, "version": VERSION, "result": "fail", "board": "-", "kernel": kernel,
+        "params_sha256": "-", "wiring": "-", "card": "-", "amps": 0, "sense": 0, "family": "-", "key": "-",
+        "method": "-", "reasons": [], "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    report = {"record": rec}
+    errs = []
+    try:
+        # Checked on every boot, before a bound pass is reused: the plugin a
+        # session loads must be the packaged one.
+        for path, why in lv2_shadows():
+            errs.append(f"an unpackaged sgv2 LV2 plugin is at {path} ({why}); PipeWire would load it instead of "
+                        f"the packaged one. Remove it (a leftover hand install) and reboot")
+        rec["params_sha256"] = sha256(args.params)
+        hw, w, desc, derr = derive_live(args)
+        errs += derr
+        if blob_rate(args.params) != w["rate"]:
+            errs.append(f"the parameters are compiled for {blob_rate(args.params)} Hz, the tuning's graph runs at {w['rate']} Hz")
+        report["machine"] = desc
+        rec.update(board=hw["board"], wiring=w["hash"], amps=len(w["amps"]), sense=len(w["sense"]),
+                   family=w["family"], key=w["key"], method=w["method"])
+        report["wiring"] = w
+        old = read_bind(bind_path)
+        if (
+            not args.force and not errs
+            and old.get("result") == "pass" and old.get("version") == str(VERSION)
+            and all(old.get(k) == str(rec[k]) for k in ("board", "kernel", "params_sha256", "wiring"))
+            # the graph is generated from the record: a bind without its
+            # record (lost or removed) is checked again, not reused
+            and report_matches(report_path, old)
+        ):
+            set_deferred(args.deferred)
+            log(f"a passing self-check is bound to {hw['board']}, {kernel}, params {rec['params_sha256'][:12]}, wiring {w['hash']}: nothing to do")
+            return 0
+        idx, card = find_card(hw)
+        rec["card"] = card
+        if card != desc["card"]:
+            errs.append(f"the speaker card is {card}; macaudio names it {desc['card']} from the device tree's model")
+        if args.defer and w["method"] == "derived":
+            if not errs:
+                # No record is written: the previous one stays (stale for
+                # this kernel or blob, so neither the supervisor nor the gate
+                # accepts it), and no graph is generated (provision activate).
+                set_deferred(args.deferred, f"board={hw['board']}\nkernel={kernel}\nparams_sha256={rec['params_sha256']}\n"
+                                            f"wiring={w['hash']}\n")
+                log(f"no passing self-check for {hw['board']}, {kernel}, params {rec['params_sha256'][:12]}: the silent switch "
+                    "test runs after login (speakerguardd-switchtest); no speaker graph and no grant until it passes")
+                return 0
+            # The cheap checks failed already: the record fails now, before
+            # login, without the switch test.
+        elif w["method"] == "derived-static":
+            errs += static(idx, w, report)
+        elif w["method"] == "derived":
+            try:
+                errs += active(idx, card, w, report, args)
+            finally:
+                try:
+                    os.unlink(MARKER)
+                except OSError:
+                    pass
+    except wiring.Refused as e:
+        errs.append(str(e))
+    except Exception as e:  # noqa: BLE001 - every failure is a failing record
+        errs.append(f"internal error: {type(e).__name__}: {e}")
+    rec["reasons"] = errs
+    rec["result"] = "fail" if errs else "pass"
+    if args.defer:
+        # Before login and not deferred (a failure, or a board without
+        # sense): nothing is pending. After login the file stays until the
+        # unit's ExecStopPost, once the graph is generated.
+        try:
+            set_deferred(args.deferred)
+        except OSError as e:
+            log(f"removing {args.deferred}: {e}")
+    try:
+        write_atomic(report_path, json.dumps(report, indent=1, default=str) + "\n")
+        write_atomic(bind_path, bind_lines(rec))
+    except OSError as e:
+        log(f"writing the record: {e}")
+        return 1
+    if errs:
+        log(f"FAILED on {rec['board']} ({kernel}); the speakers stay at the kernel's floor:")
+        for e in errs:
+            log(f"  - {e}")
+        return 1
+    log(f"passed on {rec['board']} ({kernel}, {rec['method']}): wiring {rec['wiring']}, params {rec['params_sha256'][:12]}")
+    return 0
+
+
+def static(idx, w, report):
+    """A board without V/I sense (the J700's MAX98360As): no register and
+    no sense to read, so nothing about its channel order is observable
+    with zero samples. The map is the device tree's and the tuning's, and
+    the record says "derived-static". Only the PCM is checked."""
+    ids = pcm_ids(idx)
+    if ids.get(("Secondary", "p")) != 1:
+        raise wiring.Refused(f"the speaker PCM is {ids.get(('Secondary', 'p'))}; the graph expects 1")
+    report["static"] = (
+        "no V/I sense and no amp registers: the channel order is derived from the device tree and the tuning, "
+        "and each amp's side is its SD_MODE strap, which no software can read"
+    )
+    return []
+
+
+def active(idx, card, w, report, args=None):
+    """The hardware half: registers, then the silent switch test."""
+    errs = []
+    ids = pcm_ids(idx)
+    spk, sense = ids.get(("Secondary", "p")), ids.get(("Speaker Sense", "c"))
+    if spk != 1 or (w["sense"] and sense != 2):
+        raise wiring.Refused(f"the speaker PCM is {spk} and the sense PCM {sense}; the graph expects 1 and 2")
+    # The session helper links nothing while the check runs; a speaker sink
+    # PipeWire still holds from before closes once its session manager
+    # suspends it (5 s idle by default).
+    pcms = ((spk, "p"), (sense, "c")) if w["sense"] else ((spk, "p"),)
+    os.makedirs(os.path.dirname(MARKER), exist_ok=True)
+    write_atomic(MARKER, f"{os.getpid()}\n")
+    deadline = time.monotonic() + PCM_WAIT_S
+    while any(pcm_state(idx, dev, d) != "closed" for dev, d in pcms):
+        if time.monotonic() > deadline:
+            busy = [f"pcm{dev}{d}" for dev, d in pcms if pcm_state(idx, dev, d) != "closed"]
+            raise wiring.Refused(f"{', '.join(busy)} stayed in use for {PCM_WAIT_S} s; the self-check needs it to itself")
+        time.sleep(0.2)
+    reg_errs, regs = check_registers(w)
+    errs += reg_errs
+    report["registers"] = regs
+    mux = "Speaker Playback Mux"
+    old_mux = None
+    ctl = None
+    try:
+        ctl = Control(idx, switch=getattr(args, "switch_interface", False))
+        r = amixer(card, "cget", f"name={mux}")
+        if r.returncode == 0:
+            m = re.search(r": values=(\d+)", r.stdout)
+            old_mux = m.group(1) if m else None
+            amixer(card, "-q", "cset", f"name={mux}", "Secondary")
+        runs = {}
+        report["runs"] = runs
+        sense_errs, fmt = check_sense(ctl, idx, card, (spk, sense), w, runs, pcm_widths(report.get("machine")))
+        errs += sense_errs
+        report["speaker_format"] = fmt
+        errs += format_errors(report.get("machine"), fmt)
+    finally:
+        if ctl is not None:
+            ctl.close()
+        if old_mux is not None:
+            amixer(card, "-q", "cset", f"name={mux}", old_mux)
+    return errs
+
+
+def pcm_widths(desc):
+    """The PCM widths of the machine description, when there is one."""
+    return (desc["speaker_pcm"], desc["sense_pcm"]) if desc else None
+
+
+def format_errors(desc, fmt):
+    """The speaker PCM's format, as ALSA took it, against the transport's
+    (wiring.describe), which the generated graph will use."""
+    if not desc:
+        return ["no machine description to check the speaker format against"]
+    if fmt is None:
+        return [f"the speaker PCM took none of {wiring.FORMAT_ORDER}"]
+    if fmt != desc["alsa_format"]:
+        return [f"the speaker PCM took {fmt}; the {desc['transport']} transport gives {desc['alsa_format']}"]
+    return []
+
+
+def cmd_pending(args):
+    """speakerguardd-switchtest.service's ExecCondition: 0 (run) when the
+    run before login deferred the switch test in this boot, 1 (skip)
+    otherwise. With --clear (its ExecStopPost, after the graph is generated
+    or the check failed): the test is no longer pending, and the sessions
+    waiting for it start."""
+    if args.clear:
+        set_deferred(args.deferred)
+        return 0
+    if not os.path.exists(args.deferred):
+        return 1
+    log("the switch test was deferred until after login: running it now")
+    return 0
+
+
+def cmd_check(args):
+    b = read_bind(os.path.join(args.state, "selfcheck.bind"))
+    want = {"board": wiring.read_dt()["board"], "kernel": os.uname().release, "params_sha256": sha256(args.params)}
+    bad = [k for k, v in want.items() if b.get(k) != v]
+    if b.get("result") != "pass" or bad or not report_matches(os.path.join(args.state, "selfcheck.json"), b):
+        log(f"no passing self-check for this kernel and these parameters (result {b.get('result')}, stale {bad})")
+        return 1
+    log(f"bound: {b.get('board')} {b.get('kernel')} wiring {b.get('wiring')}")
+    return 0
+
+
+# ------------------------------------------------------------------ verify
+
+EXIT_PASS, EXIT_REFUSED, EXIT_CANNOT, EXIT_ERROR = 0, 1, 2, 3
+CONF = "/etc/speakerguardd/speakerguardd.conf"
+ATTESTATIONS = (os.path.join(HERE, "parity.json"), "/usr/share/speakerguardd/parity.json")
+QUANTUM = 512
+PILOT_STARTS = 5
+PILOT_S = 0.6
+
+
+class Cannot(Exception):
+    """A step cannot run now (exit 2)."""
+
+
+def read_conf(path=None):
+    """The units' environment file, as a dict of strings."""
+    import shlex
+    out = {}
+    try:
+        with open(path or CONF) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    out[k] = " ".join(shlex.split(v))
+    except OSError:
+        pass
+    return out
+
+
+def kernel_interface(wait=5.0):
+    """speakerguardd-gate's reading of the kernel: 'dual', 'v2', 'legacy' or None."""
+    import importlib.machinery
+    import importlib.util
+    loader = importlib.machinery.SourceFileLoader("sgv2_gate", os.path.join(HERE, "speakerguardd-gate"))
+    spec = importlib.util.spec_from_loader("sgv2_gate", loader)
+    gate = importlib.util.module_from_spec(spec)
+    loader.exec_module(gate)
+    return gate.kernel_interface(wait)
+
+
+def verify_kernel(args):
+    """Step 0: the kernel serves the v2 interface (alone, or beside the
+    volume lock behind "Speaker Protection Interface")."""
+    iface, card = kernel_interface()
+    if iface in (None, "legacy"):
+        raise Cannot(f"this kernel has no v2 speaker interface ({card or 'no speaker card'}): the legacy protection keeps the speakers")
+    return f"{card}: " + ("both interfaces (Speaker Protection Interface)" if iface == "dual" else "v2 interface only")
+
+
+def verify_hardware(args):
+    """Step 1: the bound hardware record (this board, kernel and blob)."""
+    if not os.path.exists(args.params):
+        raise Cannot(f"no parameter blob at {args.params}: provision first")
+    b = read_bind(os.path.join(args.state, "selfcheck.bind"))
+    want = {"board": wiring.read_dt()["board"], "kernel": os.uname().release, "params_sha256": sha256(args.params)}
+    if not b:
+        raise Cannot("the silent hardware self-check has not run (speakerguardd-selfcheck run)")
+    stale = [k for k, v in want.items() if b.get(k) != v]
+    if stale:
+        raise Cannot(f"the hardware self-check record is for another {', '.join(stale)}: run it again")
+    if b.get("result") != "pass" or not report_matches(os.path.join(args.state, "selfcheck.json"), b):
+        raise wiring.Refused(f"the silent hardware self-check failed: {b.get('reason', 'see selfcheck.json')}")
+    return b, f"{b.get('board')} {b.get('kernel')} wiring {b.get('wiring')} ({b.get('method')})"
+
+
+def find_attestations(path=None):
+    for p in ([path] if path else ATTESTATIONS):
+        if p and os.path.isfile(p):
+            return p
+    return None
+
+
+def verify_voicing(args):
+    """Step 2: `aurora-speaker-tuning voicing-check` on this Mac's tuning."""
+    src = args.tuning or (read_conf(getattr(args, "conf", None)).get("SGV2_TUNING", "").split() if not args.tuning else [])
+    att = find_attestations(args.attestations)
+    cmd = [args.tuning_cli, "voicing-check", "--json"] + (["--attestations", att] if att else []) + list(src)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise RuntimeError(f"{args.tuning_cli} voicing-check: {e}")
+    try:
+        out = json.loads(r.stdout)
+    except ValueError:
+        # an older reader without voicing-check (usage, exit 2) or a crash
+        raise RuntimeError(f"{args.tuning_cli} voicing-check gave no result (exit {r.returncode}): {r.stderr.strip()[-300:]}")
+    failed = [st for st in out.get("steps", []) if st.get("result") == "refused"]
+    if r.returncode == 0 and out.get("result") == "pass" and not failed:
+        parity = next((st["detail"] for st in out["steps"] if st["name"] == "macos-parity"), "")
+        return out, f"tuning {str(out.get('key'))[:12]} (AID{out.get('aid')}): {parity}"
+    if r.returncode == 1 or failed:
+        raise wiring.Refused("; ".join(f"{st['name']}: {st['detail']}" for st in failed) or "voicing-check refused")
+    raise RuntimeError(f"voicing-check exit {r.returncode}: {r.stderr.strip()[-300:]}")
+
+
+def as_user(uid, cmd, timeout=20, **kw):
+    """`cmd` as the seat user, against that user's PipeWire."""
+    import pwd as _pwd
+    name = _pwd.getpwuid(uid).pw_name
+    env = ["env", f"XDG_RUNTIME_DIR=/run/user/{uid}"]
+    pre = [] if os.getuid() == uid else ["runuser", "-u", name, "--"]
+    return subprocess.run(pre + env + cmd, capture_output=True, text=True, timeout=timeout, **kw)
+
+
+def pw_errors(uid, nodes):
+    """xrun counts (pw-top's ERR column) of the named nodes, or None when
+    pw-top cannot read the graph."""
+    r = as_user(uid, ["pw-top", "-b", "-n", "2"], timeout=15)
+    if r.returncode:
+        return None
+    errs = {}
+    for line in r.stdout.splitlines():
+        f = line.split()
+        # S ID QUANT RATE WAIT BUSY W/Q B/Q ERR [FORMAT] NAME (a follower's
+        # name is prefixed with ' + ')
+        if len(f) >= 10 and f[-1] in nodes:
+            try:
+                errs[f[-1]] = int(f[8])
+            except ValueError:
+                pass
+    return errs
+
+
+def refused_starts():
+    """How many speaker starts the kernel refused before its latest grant
+    ("Speaker protection granted (N speaker starts refused before)")."""
+    try:
+        r = subprocess.run(["journalctl", "-k", "-b", "-o", "cat", "--no-pager", "-g", "Speaker protection granted"],
+                           capture_output=True, text=True, timeout=15)
+        lines = r.stdout.splitlines()
+    except (OSError, subprocess.TimeoutExpired):
+        lines = []
+    if not lines:
+        return 0
+    m = re.search(r"\((\d+) speaker starts? refused before\)", lines[-1])
+    return int(m.group(1)) if m else 0
+
+
+def grants():
+    """How many times the kernel granted speaker protection this boot: each
+    grant starts the speaker sink again (the path is powered down while
+    nothing plays)."""
+    try:
+        r = subprocess.run(["journalctl", "-k", "-b", "-o", "cat", "--no-pager", "-g", "Speaker protection granted"],
+                           capture_output=True, text=True, timeout=15)
+        return len(r.stdout.splitlines())
+    except (OSError, subprocess.TimeoutExpired):
+        return 0
+
+
+def generated_graph(m, graph="/run/speakerguardd-graph"):
+    """The generated graph's locked quantum and expected node names."""
+    for d, _, files in os.walk(graph):
+        for f in files:
+            if f == f"sgv2-{m}.conf":
+                with open(os.path.join(d, f)) as fh:
+                    t = fh.read()
+                q = re.search(r"node\.force-quantum\s*=\s*(\d+)", t)
+                lock = re.search(r"node\.lock-quantum\s*=\s*true", t)
+                nodes = set(re.findall(r'node\.name\s*=\s*"([^"]+)"', t))
+                return int(q.group(1)) if q and lock else 0, nodes
+    return None, set()
+
+
+def verify_graph(args):
+    """Step 3: the quantum the gate measured, and no xrun at stream start."""
+    conf = read_conf(getattr(args, "conf", None))
+    m = conf.get("SGV2_MACHINE")
+    if not m:
+        raise Cannot(f"{getattr(args, 'conf', None) or CONF} names no machine: provision first")
+    q, expected = generated_graph(m, args.graph_dir)
+    if q is None:
+        raise Cannot(f"no generated speaker graph for {m} in {args.graph_dir}")
+    if q != QUANTUM:
+        raise wiring.Refused(f"the speaker graph does not lock the {QUANTUM}-frame quantum the parity gate measured (config: {q})")
+    import gen
+    n = gen.names(m)
+    nodes = {n["speaker"], n["sense"]}
+    try:
+        uid = int(conf.get("SGV2_UID", ""))
+    except ValueError:
+        return f"{QUANTUM}-frame quantum locked (config); no seat user: no live pilot"
+    if not os.path.exists(f"/run/user/{uid}/pipewire-0"):
+        return f"{QUANTUM}-frame quantum locked (config); no session PipeWire: no live pilot"
+    before = pw_errors(uid, nodes | expected)
+    if not before or n["speaker"] not in before:
+        return f"{QUANTUM}-frame quantum locked (config); the v2 graph is not running: no live pilot"
+    missing = expected - before.keys()
+    if missing:
+        raise wiring.Refused("the speaker graph did not load its configured nodes: " + ", ".join(sorted(missing)))
+    before = {k: v for k, v in before.items() if k in nodes}
+    # xruns since the graph started (PipeWire counts every one; pw-top's ERR).
+    # A start the kernel refused before the grant (it logs how many) counts
+    # once on the speaker node and plays nothing: those are not xruns. Each
+    # grant starts the powered-down sink and the sense again, and a start may
+    # count its first cycle once while the plugin still holds the wake.
+    refused, starts = refused_starts(), grants()
+    started = {k: v - starts - (refused if k == n["speaker"] else 0) for k, v in before.items()}
+    started = {k: v for k, v in started.items() if v > 0}
+    if started:
+        raise wiring.Refused("the speaker graph has xrun since it started: "
+                             + ", ".join(f"{k} {v} beyond one per start" for k, v in sorted(started.items())))
+    sink = f"sgv2.voicing.{m}"
+    zeros = bytes(int(48000 * PILOT_S) * 2 * 4)
+    # the first pilot wakes the path (if it is powered down); the counted
+    # starts follow it while the amps stay up
+    _pilot(uid, sink, zeros)
+    time.sleep(0.3)
+    before = pw_errors(uid, nodes) or before
+    for _ in range(PILOT_STARTS):
+        _pilot(uid, sink, zeros)
+        time.sleep(0.3)
+    time.sleep(0.5)
+    after = pw_errors(uid, nodes) or {}
+    grew = {k: after.get(k, 0) - before.get(k, 0) for k in nodes if k in before}
+    bad = {k: v for k, v in grew.items() if v != 0}
+    if bad:
+        raise wiring.Refused("the speaker graph xruns when a stream starts: "
+                             + ", ".join(f"{k} +{v}" for k, v in sorted(bad.items()))
+                             + f" over {PILOT_STARTS} silent pilot starts")
+    return f"{QUANTUM}-frame quantum locked; {PILOT_STARTS} silent pilot starts, no xrun on {', '.join(sorted(grew))}"
+
+
+def _pilot(uid, sink, zeros):
+    """One zero-sample stream into the voicing input: start, play, stop."""
+    import pwd as _pwd
+    name = _pwd.getpwuid(uid).pw_name
+    pre = [] if os.getuid() == uid else ["runuser", "-u", name, "--"]
+    cmd = pre + ["env", f"XDG_RUNTIME_DIR=/run/user/{uid}", "pw-cat", "--playback", "--raw", "--target", sink,
+                 "--rate", "48000", "--channels", "2", "--format", "f32", "-"]
+    p = subprocess.run(cmd, input=zeros, capture_output=True, timeout=15)
+    if p.returncode:
+        raise Cannot(f"the silent pilot stream did not run: {p.stderr.decode(errors='replace').strip()[-200:]}")
+    return p
+
+
+def cmd_verify(args):
+    out = {"result": "error", "board": "-", "kernel": os.uname().release, "params_sha256": "-",
+           "wiring_hash": "-", "steps": []}
+    code = EXIT_ERROR
+    try:
+        out["board"] = wiring.read_dt()["board"]
+        if os.path.exists(args.params):
+            out["params_sha256"] = sha256(args.params)
+        for name, step in (("kernel", verify_kernel), ("hardware", verify_hardware), ("voicing", verify_voicing),
+                           ("graph", verify_graph)):
+            try:
+                res = step(args)
+            except Cannot as e:
+                out["steps"].append({"name": name, "result": "cannot-run", "detail": str(e)})
+                out["result"], code = "cannot-run", EXIT_CANNOT
+                break
+            except wiring.Refused as e:
+                out["steps"].append({"name": name, "result": "refused", "detail": str(e)})
+                out["result"], code = "refused", EXIT_REFUSED
+                break
+            if name == "hardware":
+                out["wiring_hash"] = res[0].get("wiring", "-")
+            detail = res[1] if isinstance(res, tuple) else res
+            out["steps"].append({"name": name, "result": "pass", "detail": detail})
+        else:
+            out["result"], code = "pass", EXIT_PASS
+    except Exception as e:  # noqa: BLE001 - an internal error refuses
+        out["steps"].append({"name": "internal", "result": "error", "detail": f"{type(e).__name__}: {e}"})
+        out["result"], code = "error", EXIT_ERROR
+    if args.json:
+        write_atomic(args.json, json.dumps(out, indent=1) + "\n")
+    for st in out["steps"]:
+        log(f"verify {st['name']}: {st['result']}: {st['detail']}")
+    log(f"verify: {out['result']} ({out['board']}, {out['kernel']})")
+    return code
+
+
+def cmd_generate(args):
+    import gen
+
+    with open(os.path.join(args.state, "selfcheck.json")) as f:
+        report = json.load(f)
+    rec, w, c = report["record"], report["wiring"], report.get("machine")
+    if rec["result"] != "pass":
+        raise SystemExit("the self-check has not passed: nothing to generate")
+    if not c:
+        raise SystemExit("the self-check record has no machine description: run it again")
+    units = wiring.qualification(args.state, rec["board"], os.uname().release)
+    gen.qualification_policy(rec["board"], units)
+    m = rec["key"]
+    c = dict(c, board=rec["board"])
+    enabled = gen.runtime_voicing_enabled(rec["board"])
+    bind_path = os.path.join(args.state, "provision.bind")
+    bound_mode = False
+    if os.path.exists(bind_path):
+        with open(bind_path) as f:
+            bound_mode = any(line.strip() == "voicing_pre=true" for line in f)
+    if enabled != bound_mode:
+        raise SystemExit("voicing gate changed since compilation: run speakerguardd-provision again")
+    src = f"the self-check of {rec['board']} ({rec['kernel']})"
+    for d, name, text in (
+        (args.pipewire_dir, f"sgv2-{m}.conf", gen.pipewire_conf(m, c, (w["unit_channels"], w["sense_ports"], w["hash"]), src, voicing_pre=enabled)),
+        (args.wireplumber_dir, f"60-sgv2-{m}.conf", gen.wireplumber_conf(m, c, src, voicing_pre=enabled)),
+    ):
+        os.makedirs(d, mode=0o755, exist_ok=True)
+        os.chmod(d, 0o755)  # the seat user's PipeWire and WirePlumber read it, whatever the caller's umask
+        write_atomic(os.path.join(d, name), text)
+        log(f"wrote {os.path.join(d, name)}")
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="speakerguardd-selfcheck")
+    ap.add_argument("cmd", choices=["run", "pending", "check", "generate", "verify"])
+    ap.add_argument("--params")
+    ap.add_argument("--state", default=STATE)
+    ap.add_argument("--tuning-cli", default="aurora-speaker-tuning")
+    ap.add_argument("--force", action="store_true")
+    ap.add_argument("--defer", action="store_true",
+                    help="run: before login, leave a needed switch test to speakerguardd-switchtest.service")
+    ap.add_argument("--deferred", default=DEFERRED, help="the switch-test-pending file")
+    ap.add_argument("--clear", action="store_true", help="pending: the switch test is done (pass or fail)")
+    ap.add_argument("--switch-interface", action="store_true",
+                    help="run: on a dual kernel, switch the speakers to the v2 lease for the switch test even before "
+                         "this Mac's upgrade setting exists (aurora-speaker-upgrade, which decides the switch)")
+    ap.add_argument("--pipewire-dir")
+    ap.add_argument("--wireplumber-dir")
+    ap.add_argument("--json", help="verify: write the result here")
+    ap.add_argument("--attestations", help="verify: the macOS parity attestations (default: the packaged parity.json)")
+    ap.add_argument("--graph-dir", default="/run/speakerguardd-graph", help="verify: the generated graph")
+    ap.add_argument("--conf", default=None,
+                    help="verify: the units' environment file (default /etc/speakerguardd/speakerguardd.conf; "
+                         "aurora-speaker-upgrade --check passes its private root's)")
+    ap.add_argument("tuning", nargs="*", help="after --: the tuning source, as aurora-speaker-tuning takes it")
+    args = ap.parse_args()
+    if args.cmd in ("run", "check", "verify") and not args.params:
+        ap.error("--params is required")
+    if args.cmd == "generate" and not (args.pipewire_dir and args.wireplumber_dir):
+        ap.error("--pipewire-dir and --wireplumber-dir are required")
+    return {"run": cmd_run, "pending": cmd_pending, "check": cmd_check, "generate": cmd_generate,
+            "verify": cmd_verify}[args.cmd](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
