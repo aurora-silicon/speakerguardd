@@ -283,6 +283,7 @@ fn lsm2_state(tweak: impl Fn(&mut BTreeMap<u32, f32>)) -> ParamState {
         (id::C_ATTACK, 4.0),
         (id::C_FAST_RELEASE, 150.0),
         (id::C_SLOW_RELEASE, 15000.0),
+        (id::C_LATENCY, 22.0 / 3.0),
         (id::C_FILTERBANK_LATENCY, 10.0 / 3.0),
         (id::C_LOOKAHEAD, 2.0 / 3.0),
         (id::C_UNLINK_TEMPERATURE, 0.0),
@@ -743,18 +744,21 @@ fn absent_fill_keeps_the_guarded_model_only_mute() {
     assert!(storage.iter().flatten().all(|&v| v == 0.0));
 }
 
-#[test]
-fn filled_reported_latency_does_not_set_filterbank_delay_or_override_saved_values() {
+/// A short preset without FilterbankLatency, filled with a published value
+/// the unit does not run (speakerguardd#182): the blob is the full preset's,
+/// whose stage the total Latency gives.
+fn short_without_filterbank_latency(published_ms: f32) -> BTreeMap<String, Vec<u8>> {
     let (full, _) = full_and_short();
+    let fb = id::controller(id::C_FILTERBANK_LATENCY);
     let omitted: std::collections::BTreeSet<_> =
-        full.global().unwrap().params.iter().take(57).map(|p| p.0).chain([id::controller(0)]).collect();
+        full.global().unwrap().params.iter().map(|p| p.0).filter(|&i| i != fb).take(57).chain([fb]).collect();
     assert_eq!(omitted.len(), 58);
     let mut short = full.clone();
     short.sections[0].params.retain(|p| !omitted.contains(&p.0));
     let bytes = fill_field(&short, &full, |v| {
         for r in v["presets"][0]["published"].as_array_mut().unwrap() {
-            if r["id"] == id::controller(0) {
-                r["bits"] = serde_json::json!(12345.0f32.to_bits()); // made-up reported Latency
+            if r["id"] == fb {
+                r["bits"] = serde_json::json!(published_ms.to_bits());
             }
             if r["id"] == id::channel(0, id::CH_VOLTS_FS) {
                 r["bits"] = serde_json::json!(0.125f32.to_bits()); // must not override saved full scale
@@ -763,12 +767,25 @@ fn filled_reported_latency_does_not_set_filterbank_delay_or_override_saved_value
     });
     let mut files = files_with_state(&short);
     files.insert(aurora_speaker_tuning::param_fill::NAME.into(), bytes);
-    let actual = compile(&tuning(&files, "fill-latency"), &mut Diagnostics::default()).unwrap();
+    files
+}
+
+#[test]
+fn published_filterbank_latency_does_not_set_the_stage_or_override_saved_values() {
     let expected =
-        compile(&tuning(&files_with_state(&full), "fill-latency-full"), &mut Diagnostics::default()).unwrap();
-    assert_eq!(actual.blob, expected.blob);
+        compile(&tuning(&files_with_state(&full_and_short().0), "fill-latency-full"), &mut Diagnostics::default())
+            .unwrap();
+    // Below the controller cadence (the issue's 2 ms) and above the stage run.
+    for published in [2.0f32, 5.0] {
+        let mut d = Diagnostics::default();
+        let actual = compile(&tuning(&short_without_filterbank_latency(published), "fill-latency"), &mut d).unwrap();
+        assert_eq!(actual.blob, expected.blob, "published {published} ms");
+        assert!(d.items.iter().any(|x| x.code == "lsm2-filterbank-latency-derived"));
+        let p = sgv2_core::lsm2::Params::from_blob(&actual.blob).unwrap();
+        assert_eq!((p.filterbank_latency_ms, p.filterbank_frames(), p.latency_frames()), (10.0 / 3.0, 160, 352));
+    }
     use sgv2_core::ProtectionUnit;
-    let unit = sgv2_core::lsm2::Unit::from_blob(&actual.blob).unwrap();
+    let unit = sgv2_core::lsm2::Unit::from_blob(&expected.blob).unwrap();
     let p = unit.params();
     let bank = sgv2_core::lsm2::filterbank(
         p.sample_rate as f64,
@@ -781,6 +798,33 @@ fn filled_reported_latency_does_not_set_filterbank_delay_or_override_saved_value
         unit.latency_frames() as usize,
         2 * stage + p.lookahead_frames() + sgv2_core::lsm2::controller_frames(p.sample_rate)
     );
+}
+
+#[test]
+fn the_total_latency_sets_the_filterbank_stage() {
+    let derived = |latency: f32, filterbank: f32| {
+        let t = tuning(
+            &lsm2_files(|m| {
+                m.insert(id::controller(id::C_LATENCY), latency);
+                m.insert(id::controller(id::C_FILTERBANK_LATENCY), filterbank);
+            }),
+            "c-lsm2-latency",
+        );
+        let mut d = Diagnostics::default();
+        let c = compile(&t, &mut d);
+        let noted = d.items.iter().any(|x| x.code == "lsm2-filterbank-latency-derived");
+        c.map(|c| (sgv2_core::lsm2::Params::from_blob(&c.blob).unwrap().latency_frames(), noted))
+    };
+    // A full preset whose records agree compiles unchanged and quietly.
+    assert_eq!(derived(22.0 / 3.0, 10.0 / 3.0).unwrap(), (352, false));
+    // The stage follows Latency, whatever FilterbankLatency says.
+    assert_eq!(derived(9.0, 10.0 / 3.0).unwrap(), (416, true));
+    assert_eq!(derived(8.0, 2.0).unwrap(), (384, true));
+    // A total below the controller cadence is still refused, not padded.
+    assert!(derived(5.0, 10.0 / 3.0).is_err());
+    // No usable total: refused, never replaced by the FilterbankLatency record
+    // (the loader already refuses a non-finite one).
+    assert!(derived(12345.0, 10.0 / 3.0).is_err());
 }
 
 fn synthetic_legacy_companion() -> aurora_speaker_tuning::lsid::Companion {
