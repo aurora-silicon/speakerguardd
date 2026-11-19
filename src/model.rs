@@ -48,9 +48,6 @@ pub struct SpeakerState {
     history_s: f64,
 }
 
-/// How long samples converted at an earlier gain can keep playing (s): the
-/// guard's QUEUE_BOUND.
-pub const DRAIN_S: f64 = 0.5;
 /// Longest single integration step (s).
 pub const MAX_SUB_DT: f64 = 0.01;
 /// A sense period is integrated in this many blocks of its own power.
@@ -292,11 +289,12 @@ impl SpeakerState {
     /// Unknown history can leave either node at the hard limit. Bound
     /// them independently, then cover a possible queued full-scale drain.
     /// The J700 safe-level equilibrium is colder than this envelope.
-    pub fn assume_latched(&mut self, t_ambient: f64) {
+    /// `drain_s` is the profile's `drain`: how long the queue can play.
+    pub fn assume_latched(&mut self, t_ambient: f64, drain_s: f64) {
         self.t_coil = self.spec.t_limit;
         self.t_magnet = self.spec.t_limit;
         self.t_peak = self.spec.t_limit;
-        self.heat(self.worst_case_power(0.0), DRAIN_S, t_ambient);
+        self.heat(self.worst_case_power(0.0), drain_s, t_ambient);
         self.t_coil = self.t_peak;
         self.hard = true;
         // nor is the power before the gain: a minute of full scale for the
@@ -594,7 +592,7 @@ mod tests {
     }
 
     fn globals() -> Globals {
-        Globals { sense_pcm: 2, t_ambient: 35.0, t_hysteresis: 5.0, t_window: 20.0, channels: 2, period: 4096, t_reduction_max: 20.0, safe_reduction: 20.0 }
+        Globals { sense_pcm: 2, t_ambient: 35.0, t_hysteresis: 5.0, t_window: 20.0, channels: 2, period: 4096, t_reduction_max: 20.0, safe_reduction: 20.0, copy_queue_frames: 16384, drain: 0.5, default_rate: 48000 }
     }
 
     #[test]
@@ -758,14 +756,14 @@ mod independent_start_tests {
         let cfg = crate::config::Config::parse(include_str!("../conf/apple/j700.conf")).unwrap();
         for spec in cfg.speakers {
             let mut bound = SpeakerState::new(spec.clone(), cfg.globals.t_ambient);
-            bound.assume_latched(cfg.globals.t_ambient);
+            bound.assume_latched(cfg.globals.t_ambient, cfg.globals.drain);
             assert!(bound.hard);
             assert!(bound.t_coil >= spec.t_limit && bound.t_magnet >= spec.t_limit);
             let full = bound.worst_case_power(0.0);
             let safe = bound.worst_case_power(cfg.globals.safe_reduction);
             for c in [cfg.globals.t_ambient, spec.t_limit] {
                 for m in [cfg.globals.t_ambient, spec.t_limit] {
-                    for drain in [0.0, 0.1, DRAIN_S] {
+                    for drain in [0.0, 0.1, cfg.globals.drain] {
                         let mut actual = SpeakerState::new(spec.clone(), c);
                         actual.t_magnet = m;
                         actual.step(full, drain, cfg.globals.t_ambient);

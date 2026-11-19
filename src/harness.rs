@@ -66,7 +66,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
-use crate::guard::{Guard, Hw, BLIND_LIMIT, DRAIN, KERNEL_LOCK_TIMEOUT, MUTE_DB};
+use crate::guard::{Guard, Hw, BLIND_LIMIT, KERNEL_LOCK_TIMEOUT, MUTE_DB};
+
+/// The simulated card's drain: the J700's (j700.conf `drain`), checked
+/// against the profile by `the_world_drains_as_the_profile_says`.
+const DRAIN: Duration = Duration::from_millis(500);
 use crate::model::SpeakerState;
 use crate::state;
 
@@ -1265,6 +1269,12 @@ mod tests {
 
     fn first_seed() -> u64 {
         std::env::var("SPEAKERGUARDD_SEED").ok().and_then(|v| v.parse().ok()).unwrap_or(1)
+    }
+
+    /// The simulated card drains as the J700's profile says.
+    #[test]
+    fn the_world_drains_as_the_profile_says() {
+        assert_eq!(DRAIN, Config::parse(J700).unwrap().globals.drain_duration());
     }
 
     #[test]
