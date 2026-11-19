@@ -294,6 +294,33 @@ mod tests {
         assert!(s.problem().unwrap().contains("operating point"), "{:?}", s.problem());
     }
 
+    /// The J316s row with no stream: an engine that beats while nothing is
+    /// granted reads fresh and stale on alternate idle ticks. With a steady
+    /// 0.5 dB gain TLV the kernel-side checks hold on every one of them (no
+    /// problem, so no "not granting" and no new ready spell), nothing is
+    /// granted or released, and "protection ready" is said exactly once.
+    #[test]
+    fn a_steady_card_with_a_flickering_idle_engine_is_ready_once() {
+        use crate::pace::{ReadyNote, Spell};
+        let mut k = Recorder::healthy(6);
+        let mut s = j316();
+        let mut note = ReadyNote::default();
+        let mut last_problem: Option<String> = None;
+        let mut said = 0;
+        for i in 0..420 {
+            let obs = Observation { demand: false, heartbeat_fresh: i % 2 == 0, ..CLEAN };
+            let event = s.tick(obs, &mut k);
+            assert!(matches!(event, Ok(Event::StayedReleased)), "tick {i}: {event:?}");
+            assert_eq!(s.problem(), None, "tick {i}");
+            let ready = s.problem().is_none() && Observation { route_ok: true, amps_ok: true, ..obs }.clean();
+            let spell = if s.problem() != last_problem.as_deref() { Spell::New } else { Spell::Same };
+            last_problem = s.problem().map(str::to_owned);
+            said += usize::from(note.tick(ready, spell));
+        }
+        assert_eq!(said, 1);
+        assert_eq!((k.renewals, k.releases), (0, 0));
+    }
+
     #[test]
     fn nothing_playing_gives_the_grant_back_and_a_stream_takes_it_at_once() {
         let mut k = Recorder::healthy(6);

@@ -73,7 +73,7 @@ mod linux {
         combine, helper_is, owner_to_tgid, parse_pcm_info, parse_pcm_status, parse_session, parse_tgid,
         speaker_pcm_problem, EngineState, EngineView, Observer, PcmInfo, PcmState, PcmView, SessionReport, SessionView,
     };
-    use sgv2_supervisor::pace::{self, Change, Pace};
+    use sgv2_supervisor::pace::{self, Change, Pace, ReadyNote, Spell};
     use sgv2_supervisor::selfcheck;
     use sgv2_supervisor::supervise::{Event, Expect, Fatal, Supervisor};
 
@@ -1122,8 +1122,8 @@ mod linux {
         let mut ticks = 0u64;
         let mut last_problem: Option<String> = None;
         let mut last_wiring: Option<Option<u64>> = None;
-        // every check holds and nothing plays: reported once per idle spell
-        let mut idle_ready = false;
+        // "protection ready", once per spell (see `pace::ReadyNote`)
+        let mut ready_note = ReadyNote::default();
         // when the speaker PCM was first seen running under this grant, and
         // whether the amps play (told to the plugin every tick)
         let mut running_since: Option<u64> = None;
@@ -1186,10 +1186,15 @@ mod linux {
             // which records any failure as its problem
             let card_ok = sup.problem().is_none() && sup.latched_fault().is_none();
             let ready = card_ok && !demand_seen && Observation { route_ok: true, amps_ok: true, ..obs }.clean();
-            if ready && !idle_ready && !matches!(event, Ok(Event::Idle)) {
+            let spell = match event {
+                Ok(Event::Idle) => Spell::GivenBack,
+                Ok(Event::Granted | Event::Released { .. } | Event::HardFault(_) | Event::Lapsed) => Spell::New,
+                _ if demand_seen || sup.problem() != last_problem.as_deref() => Spell::New,
+                _ => Spell::Same,
+            };
+            if ready_note.tick(ready, spell) {
                 eprintln!("protection ready: every check holds, granted while a stream plays");
             }
-            idle_ready = ready;
             match event {
                 Ok(Event::Idle) => {
                     regrant.released(now_ns(), false);
@@ -1320,7 +1325,7 @@ mod linux {
             // Idle, the protect stage stops with the last stream, so there is
             // no heartbeat to prove; that every other check holds is said once.
             let idle_ok = card_ok && obs.plugin_ok && obs.links_ok && obs.carrier_ok;
-            if pace.idle() && idle_ok && !idle_ready && !idle_ready_said {
+            if pace.idle() && idle_ok && !ready && !idle_ready_said {
                 eprintln!("protection ready: every check holds; the protect stage idles until a stream starts");
                 idle_ready_said = true;
             }
