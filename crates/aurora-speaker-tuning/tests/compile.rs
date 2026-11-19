@@ -868,3 +868,54 @@ fn unpublished_append_id_and_unknown_saved_id_are_refused() {
     });
     assert!(load_fill(&short, data, "fill-nonfinite").is_err());
 }
+
+/// The lsm2 bundle with property 6632: one `ChannelData` record per entry
+/// of `marks`, its `PressureResponse` a synthetic impulse of that height.
+fn flow_files(state: &ParamState, marks: &[f32]) -> BTreeMap<String, Vec<u8>> {
+    use aurora_speaker_tuning::plist::binary;
+    let mut files = files_with_state(state);
+    let records = marks
+        .iter()
+        .map(|&m| {
+            let mut taps = vec![0u8; 4 * sgv2_core::lsm2::PRESSURE_TAPS];
+            taps[..4].copy_from_slice(&m.to_le_bytes());
+            dict(vec![("PressureResponse", Value::Data(taps))])
+        })
+        .collect();
+    let flow = "synthetic-flow.plist";
+    files
+        .insert(format!("{AID}/DSP/Strips/{flow}"), binary::write(&dict(vec![("ChannelData", Value::Array(records))])));
+    let property =
+        dict(vec![("Number", i(6632)), ("Path", s(&format!("/System/Library/Audio/Tunings/{AID}/DSP/Strips/{flow}")))]);
+    files.insert(propstrip_path(), propstrip_extra(&sidecar_name(), Some(2), vec![property]));
+    files
+}
+
+#[test]
+fn lsm2_pressure_records_follow_the_lane_sides() {
+    let (full, _) = full_and_short();
+    let first_taps = |blob: &[u8]| -> Vec<f32> {
+        let (p, _) = sgv2_core::lsm2::companion::decode_blob(blob).unwrap();
+        p.ch[..4].iter().map(|c| if c.pressure_taps == 0 { 0.0 } else { c.pressure_fir[0] }).collect()
+    };
+    // Without a companion: one record per lane.
+    let t = tuning(&flow_files(&full, &[1.0, 2.0, 3.0, 4.0]), "c-lsm2-flow-per-lane");
+    assert_eq!(first_taps(&compile(&t, &mut Diagnostics::default()).unwrap().blob), [1.0, 2.0, 3.0, 4.0]);
+    // With a companion and one record per side: the synthetic graph feeds
+    // lanes 0 and 2 from source channel 0, lanes 1 and 3 from channel 1.
+    let mut guarded = tuning(&flow_files(&full, &[1.0, 2.0]), "c-lsm2-flow-per-side");
+    guarded.lsid = Some(synthetic_legacy_companion());
+    let c = compile(&guarded, &mut Diagnostics::default()).unwrap();
+    assert_eq!(first_taps(&c.blob), [1.0, 2.0, 1.0, 2.0]);
+    // The masking path never lifts the companion's mute.
+    let unit = sgv2_core::lsm2::Unit::from_blob(&c.blob).unwrap();
+    assert!(unit.companion().unwrap().gates != 0);
+    assert!(unit.is_failsafe());
+    // Any other record count with a companion: no masking path, as before.
+    for marks in [&[1.0][..], &[1.0, 2.0, 3.0], &[1.0, 2.0, 3.0, 4.0]] {
+        let mut guarded = tuning(&flow_files(&full, marks), &format!("c-lsm2-flow-{}", marks.len()));
+        guarded.lsid = Some(synthetic_legacy_companion());
+        let c = compile(&guarded, &mut Diagnostics::default()).unwrap();
+        assert_eq!(first_taps(&c.blob), [0.0; 4], "{} records", marks.len());
+    }
+}
