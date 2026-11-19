@@ -816,6 +816,7 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
         p.power_soft_limit_pct[j as usize] = get(id::amp0(id::A_SOFT_LIMIT + j))?;
     }
     let mut amp_model = None;
+    let pressure = pressure_records(guarded, pressure_record_count(t), &lane_sides(t, n));
     for c in 0..n as u32 {
         if whole(id::CH_TUNING + c, "ChTuning")? > if guarded { 2 } else { 0 } {
             return Err(refuse(&format!("Ch{c}Tuning selects a bank other than 0 (TODO(SPEC) banks)")));
@@ -927,7 +928,7 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
         arr(id::CH_VELOCITY_LIMIT0, &mut x.velocity_limit)?;
         arr(id::CH_MASK_ENERGY0, &mut x.mask_energy_db)?;
         arr(id::CH_BAND_CENTER0, &mut x.band_center_hz)?;
-        if let Some(fir) = (!guarded).then(|| pressure_response(t, c as usize, diags)).flatten() {
+        if let Some(fir) = pressure[c as usize].and_then(|r| pressure_response(t, r, diags)) {
             x.pressure_taps = lsm2::PRESSURE_TAPS as u32;
             x.pressure_fir = fir;
         }
@@ -1028,6 +1029,53 @@ fn finish_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics, p: lsm2::Params) 
 
 fn libm_pow10(x: f64) -> f64 {
     10f64.powf(x)
+}
+
+/// The number of `ChannelData` records in property 6632, 0 without one.
+fn pressure_record_count(t: &Tuning) -> usize {
+    t.protection
+        .property_files
+        .iter()
+        .find(|f| f.number == 6632)
+        .and_then(|f| f.value.as_dict())
+        .and_then(|d| d.get("ChannelData"))
+        .and_then(|v| v.as_array())
+        .map_or(0, |a| a.len())
+}
+
+/// The source channel feeding each of the unit's `n` lanes, when every
+/// lane starts at the same graph input port; `None` otherwise.
+fn lane_sides(t: &Tuning, n: usize) -> Vec<Option<u32>> {
+    let lanes = &t.protection.lanes;
+    let one_source = lanes.len() == n
+        && lanes.iter().all(|l| (&l.origin.node, l.origin.port) == (&lanes[0].origin.node, lanes[0].origin.port));
+    (0..n).map(|c| one_source.then(|| lanes[c].origin.channel)).collect()
+}
+
+/// Which `ChannelData` record of property 6632 each lane takes its
+/// `PressureResponse` from, chosen by the tuning's structure (never by
+/// board):
+/// - without an LSID companion, one record per lane: lane `c` takes
+///   record `c`;
+/// - with a companion and two records, when one two-channel source feeds
+///   the lanes and each source channel feeds exactly two of them (a
+///   woofer and a tweeter per side, four lanes): the records are per side,
+///   so a lane takes the record of the source channel that feeds it. Each
+///   record also carries its side's tweeter fields. The native unit's
+///   output matches with a record on every lane, not with records on the
+///   woofer lanes only (speakerguardd#185);
+/// - any other tuning with a companion (six lanes, other record counts,
+///   other sources): no record, so no masking path, as before. Nothing
+///   has been measured for those layouts.
+fn pressure_records(guarded: bool, records: usize, sides: &[Option<u32>]) -> Vec<Option<usize>> {
+    if !guarded {
+        return (0..sides.len()).map(Some).collect();
+    }
+    let per_side = |s: u32| sides.iter().filter(|&&x| x == Some(s)).count();
+    if records == 2 && sides.iter().all(|s| matches!(s, Some(0 | 1))) && per_side(0) == 2 && per_side(1) == 2 {
+        return sides.iter().map(|s| s.map(|s| s as usize)).collect();
+    }
+    vec![None; sides.len()]
 }
 
 /// Property 6632's `ChannelData[c].PressureResponse` (spec 9.8): 1,024
@@ -1149,4 +1197,51 @@ fn compile_atsp(t: &Tuning, b: &Bound) -> Result<Compiled> {
         calibration: false,
         blob,
     })
+}
+
+#[cfg(test)]
+mod pressure_record_tests {
+    use super::pressure_records;
+
+    #[test]
+    fn unguarded_lanes_take_their_own_record() {
+        assert_eq!(
+            pressure_records(false, 4, &[Some(0), Some(1), Some(0), Some(1)]),
+            [Some(0), Some(1), Some(2), Some(3)]
+        );
+        // the record count and the routing do not matter without a companion
+        assert_eq!(pressure_records(false, 0, &[None, None]), [Some(0), Some(1)]);
+    }
+
+    #[test]
+    fn guarded_four_lanes_take_their_side_record() {
+        // woofer L, woofer R, tweeter L, tweeter R (J713/J813 routing)
+        assert_eq!(
+            pressure_records(true, 2, &[Some(0), Some(1), Some(0), Some(1)]),
+            [Some(0), Some(1), Some(0), Some(1)]
+        );
+        // the side comes from the routing, not the lane index
+        assert_eq!(
+            pressure_records(true, 2, &[Some(0), Some(0), Some(1), Some(1)]),
+            [Some(0), Some(0), Some(1), Some(1)]
+        );
+    }
+
+    #[test]
+    fn other_guarded_layouts_get_no_record() {
+        let six = [Some(0), Some(1), Some(0), Some(1), Some(0), Some(1)];
+        assert_eq!(pressure_records(true, 2, &six), [None; 6]);
+        let four = [Some(0), Some(1), Some(0), Some(1)];
+        for records in [0, 1, 3, 4] {
+            assert_eq!(pressure_records(true, records, &four), [None; 4], "{records} records");
+        }
+        for sides in [
+            [Some(0), Some(1), None, Some(1)],
+            [Some(0), Some(0), Some(0), Some(1)],
+            [Some(0), Some(1), Some(2), Some(3)],
+        ] {
+            assert_eq!(pressure_records(true, 2, &sides), [None; 4], "{sides:?}");
+        }
+        assert_eq!(pressure_records(true, 2, &[Some(0), Some(1)]), [None; 2]);
+    }
 }
