@@ -1,3 +1,7 @@
+> **Legacy branch.** This is the frozen 0.1.x daemon, kept for security and
+> safety fixes only. The main line is speakerguardd 2 on `main`. See
+> [LEGACY.md](LEGACY.md).
+
 ## speakerguardd - feed-forward speaker protection
 
 speakerguardd is a userspace daemon, written in Rust, that protects the
