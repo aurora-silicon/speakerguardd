@@ -127,6 +127,41 @@ def speaker_card(sysfs=SYSFS):
     return None
 
 
+def dt_speaker_node(dt=DT):
+    """Whether the live device tree describes a speaker card at all: True
+    for an enabled apple,macaudio node at the root with the speaker link
+    (where wiring.read_dt looks), False when the tree is readable and has
+    none, None when the tree cannot be read. With False no speaker card can
+    register, so there is nothing to wait for."""
+    try:
+        names = os.listdir(dt)
+    except OSError:
+        return None
+    for d in names:
+        p = os.path.join(dt, d)
+        try:
+            with open(os.path.join(p, "compatible"), "rb") as f:
+                compat = f.read().split(b"\0")
+        except OSError:
+            continue
+        if b"apple,macaudio" not in compat:
+            continue
+        try:
+            with open(os.path.join(p, "status"), "rb") as f:
+                if f.read().rstrip(b"\0") not in (b"okay", b"ok"):
+                    continue
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return None
+        try:
+            if wiring.has_speaker_link(p):
+                return True
+        except OSError:
+            return None
+    return False
+
+
 def upgrade_setting(path=None):
     """The upgrade's persistent interface choice: "v2", None (not switched),
     or "unreadable" (it exists but this process may not read it: the
@@ -160,19 +195,24 @@ def has_control(card, name):
     return r.returncode == 0
 
 
-def kernel_interface(wait, sysfs=SYSFS):
+def kernel_interface(wait, sysfs=SYSFS, dt=DT):
     """'dual' (the card has "Speaker Protection Interface": both interfaces,
     the volume lock by default), 'v2' (only "Speaker Protection"), 'legacy'
     (a speaker card with neither) or None (no speaker card within the
     wait, or unreadable controls). Only the speaker card's controls count:
     another card that registers first (the jack-only card, HDMI) is no
-    answer, so the gate waits for the speaker card itself."""
+    answer, so the gate waits for the speaker card itself. It waits only
+    while the device tree describes one: a tree with no enabled macaudio
+    node with the speaker link answers None at once."""
     start = time.monotonic()
     deadline = start + wait
     while True:
         card = speaker_card(sysfs)
         if card:
             break
+        if dt_speaker_node(dt) is False:
+            log("the device tree describes no speaker card (no enabled apple,macaudio node with a speaker link): not waiting for one")
+            return None, None
         if time.monotonic() >= deadline:
             return None, None
         time.sleep(0.25)
@@ -208,7 +248,7 @@ def interface(args):
     on a kernel with one interface and on a Mac the upgrade did not switch.
     Fails (the start fails; Restart= tries again) only when the kernel
     refuses the switch."""
-    iface, card = kernel_interface(args.wait)
+    iface, card = kernel_interface(args.wait, dt=getattr(args, "dt", DT))
     if iface != "dual":
         return 0
     if upgrade_setting(args.setting) != "v2":
@@ -279,7 +319,7 @@ def _decide(args):
         why_not = f"{board} is unqualified: {e}"
         # only a refusal by a gate that could read everything is definite
         definite = isinstance(e, (wiring.Refused, ValueError)) and privileged()
-    iface, card = kernel_interface(args.wait)
+    iface, card = kernel_interface(args.wait, dt=getattr(args, "dt", DT))
     if iface is None:
         return False, True, (why_not or f"{board} is gated") + "; no speaker card: the older daemons decide for themselves", _info(iface, definite)
     if why_not:
@@ -327,7 +367,7 @@ def main():
     except (OSError, ValueError) as e:
         # Without its data the gate cannot place v2: the older daemons keep
         # the speakers, as before v2 was installed.
-        iface, _ = kernel_interface(args.wait)
+        iface, _ = kernel_interface(args.wait, dt=getattr(args, "dt", DT))
         v2, legacy, why = False, iface != "v2", f"cannot read the gate data: {e}"
     if args.cmd == "explain":
         print(f"v2={int(v2)} legacy={int(legacy)}: {why}")

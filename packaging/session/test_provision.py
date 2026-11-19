@@ -1100,7 +1100,7 @@ class Gate(Base):
         g = os.path.join(self.t, "gate.json")
         with open(g, "w") as f:
             json.dump(GATE if gate_data is None else gate_data, f)
-        self.patch(gate, "kernel_interface", lambda wait: (iface, "AppleX") if iface else (None, None))
+        self.patch(gate, "kernel_interface", lambda wait, **kw: (iface, "AppleX") if iface else (None, None))
         self.patch(gate, "PROVISION_CONF", os.path.join(self.t, "provision.conf"))
         # the gate runs as root on a Mac (ExecCondition=+...); no waits here
         self.patch(gate, "privileged", lambda: True)
@@ -1250,7 +1250,7 @@ class Gate(Base):
         sets = []
         state = {"iface": "dual"}
         setting = os.path.join(self.t, "upgrade-interface")
-        self.patch(gate, "kernel_interface", lambda wait: (state["iface"], "AppleX"))
+        self.patch(gate, "kernel_interface", lambda wait, **kw: (state["iface"], "AppleX"))
         self.patch(gate.wiring, "interface_lease", lambda card: sets.append(card) or True)
         a = types.SimpleNamespace(wait=0, setting=setting)
         self.assertEqual(gate.interface(a), 0)
@@ -1590,6 +1590,75 @@ class CardOrder(unittest.TestCase):
         self.card(2, "AppleJ413", b"apple,j413-macaudio\0apple,macaudio\0", b"Speaker")
         self.assertEqual(gate.kernel_interface(0, self.sysfs), ("legacy", "AppleJ413"))
         self.assertEqual(set(self.asked), {"AppleJ413"})
+
+    def dt(self, nodes):
+        """A live device tree with the given root nodes:
+        {name: (compatible, link names, status or None)}."""
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        with open(os.path.join(root, "compatible"), "wb") as f:
+            f.write(b"apple,j999\0apple,arm-platform\0")
+        for name, (compat, links, status) in nodes.items():
+            n = os.path.join(root, name)
+            os.makedirs(n)
+            with open(os.path.join(n, "compatible"), "wb") as f:
+                f.write(compat)
+            if status is not None:
+                with open(os.path.join(n, "status"), "wb") as f:
+                    f.write(status + b"\0")
+            for i, link in enumerate(links):
+                os.makedirs(os.path.join(n, f"dai-link@{i}"))
+                with open(os.path.join(n, f"dai-link@{i}", "link-name"), "wb") as f:
+                    f.write(link + b"\0")
+        return root
+
+    def timed(self, wait, dt):
+        t0 = time.monotonic()
+        r = gate.kernel_interface(wait, self.sysfs, dt=dt)
+        return r, time.monotonic() - t0
+
+    def test_no_sound_node_answers_at_once(self):
+        # speakerguardd#183: a tree that describes no speaker card cannot
+        # get one, so the gate does not wait out --wait for it
+        for nodes in ({},
+                      {"sound": (JACK, [b"Headphone Jack"], None)},
+                      {"sound": (self.SPEAKER, [b"Speakers"], b"disabled")},
+                      {"i2c@0": (b"apple,i2c\0", [], None)}):
+            r, took = self.timed(10, self.dt(nodes))
+            self.assertEqual(r, (None, None), nodes)
+            self.assertLess(took, 1.0, nodes)
+        self.assertEqual(self.asked, [])
+
+    def test_a_described_speaker_card_is_still_waited_for(self):
+        import threading
+        dt = self.dt({"sound": (self.SPEAKER, [b"Speakers"], b"okay"),
+                      "sound-jack": (JACK, [b"Headphone Jack"], None)})
+        self.assertIs(gate.dt_speaker_node(dt), True)
+        self.jack(1)
+        t = threading.Timer(0.6, self.speaker, (2,))
+        t.start()
+        self.addCleanup(t.cancel)
+        r, took = self.timed(10, dt)
+        self.assertEqual(r, ("dual", "AppleJ616"))
+        self.assertGreaterEqual(took, 0.5)
+        # and with no card at all it waits the full bound, as before
+        shutil.rmtree(self.sysfs)
+        os.makedirs(self.sysfs)
+        r, took = self.timed(0.6, dt)
+        self.assertEqual(r, (None, None))
+        self.assertGreaterEqual(took, 0.6)
+
+    def test_an_unreadable_tree_keeps_the_wait(self):
+        missing = os.path.join(self.sysfs, "no-device-tree")
+        self.assertIsNone(gate.dt_speaker_node(missing))
+        r, took = self.timed(0.6, missing)
+        self.assertEqual(r, (None, None))
+        self.assertGreaterEqual(took, 0.6)
+
+    def test_the_card_is_read_before_the_tree(self):
+        # a registered speaker card answers whatever the tree scan says
+        self.speaker(1)
+        self.assertEqual(gate.kernel_interface(0, self.sysfs, dt=self.dt({})), ("dual", "AppleJ616"))
 
 
 class Units(unittest.TestCase):
