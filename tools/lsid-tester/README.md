@@ -20,7 +20,9 @@ qualify LSID ourselves. One run on your Mac tells us what we need.
 hold pass/fail lines, numbers, hashes, error text and the exact OS build. No
 audio, recordings, tuning files or personal data. Your tuning bundle stays on
 your Mac. Each script ends by running `redact-check.sh` on its log, which
-looks for your user name, host name, serial number and similar. Read the logs
+looks for your user name, host name, serial number and similar. Before that,
+the Linux script writes the host name (a locally built kernel's version
+string may carry it) as `<host>` and home-directory paths as `~`. Read the logs
 before sending them; edit out anything you don't want to share.
 
 It takes about 10 minutes (plus a one-time Rust build). **Saying no is fine**,
