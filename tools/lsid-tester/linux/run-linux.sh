@@ -224,6 +224,19 @@ log "DATA avc_denials_during_run=$AVC failed_units=$(systemctl --failed --no-leg
 FAILS=$(grep -c -E '^RESULT [^ ]+ FAIL' "$OUT")
 res summary "$([ "$FAILS" = 0 ] && echo PASS || echo FAIL)" "$FAILS failing step(s); LSID $LSID"
 echo
+# The kit's own lines can carry the host name (a locally built kernel's
+# version string) and a home-directory path (the build tree's wiring.py and
+# compiler). Write those as <host> and ~ before the check, so the check only
+# flags what the kit cannot know to replace.
+scrub_log() {
+    for h in "$(hostname 2>/dev/null)" "$(hostname -s 2>/dev/null)"; do
+        [ "${#h}" -ge 3 ] || continue
+        e=$(printf '%s' "$h" | sed 's/[][\\.*^$/]/\\&/g')
+        sed -i "s/$e/<host>/gI" "$1"
+    done
+    sed -i -E 's#(/home|/Users)/[^/ ]+#~#g' "$1"
+}
+scrub_log "$OUT"
 sh "$KIT/redact-check.sh" "$OUT"; RRC=$?
 echo "log: $OUT"
 [ "$FAILS" = 0 ] && [ $RRC = 0 ]
