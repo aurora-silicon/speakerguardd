@@ -1,6 +1,6 @@
 policy_module(speakerguardd, 0.1.0)
 
-# TODO(lane D): complete and test in enforcing mode on every machine; the
+# TODO(lane D, #211): complete and test in enforcing mode on every machine; the
 # gate is zero AVCs (ausearch -m AVC,USER_AVC -ts boot) after the full
 # qualification suite, including fault injection.
 
