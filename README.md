@@ -8,7 +8,9 @@ Speaker protection for Apple Silicon Macs that works the way macOS's does: the s
 
 The acceptance bar is 1:1 parity: on identical input, the unit's internal state (power, coil and magnet temperatures, closed-loop correction, every constraint and the final gain) matches macOS's own, quantum by quantum, including the failure cases.
 
-**Status:** 1.0.0-alpha, under development on the `v2` branch. Not for use yet. (The unrelated 0.1.x daemon is archived on `legacy/v0.1`.)
+**Status:** 1.0.0-alpha. Not for use yet.
+
+**Branches:** `main` is speakerguardd 2. It was developed on the `v2` branch, which now follows `main` for anyone still tracking it; open pull requests against `main`. The unrelated 0.1.x daemon is frozen on `legacy/v0.1` (security and safety fixes only, last release tagged `v0.1-final`).
 
 ## Layout
 

@@ -1,9 +1,10 @@
-# Conventions for the v2 branch
+# Conventions
 
 ## Branches and merging
 
-- `v2` is the integration branch. Work lands through pull requests into `v2`, as merge commits. Never force-push `v2` or anyone else's branch.
-- Name branches `v2-<lane>/<topic>`, for example `v2-A/plist`, `v2-B/neon-thermal`, `v2-C/rig` or `v2-D/lease` (git cannot hold `v2/...` branches while `v2` exists).
+- `main` is the integration branch. Work lands through pull requests into `main`, as merge commits. Never force-push `main`, `v2` or anyone else's branch.
+- `v2` is kept as an alias that follows `main`; do not open pull requests against it.
+- Name branches `<lane>/<topic>`, for example `v2-A/plist`, `v2-B/neon-thermal`, `v2-C/rig` or `v2-D/lease` (git cannot hold `v2/...` branches while `v2` exists).
 - Every PR gets a review. A PR that changes behaviour states its parity numbers (rig cases and worst error per field) in its body.
 - PR bodies end with the generator attribution line the project uses.
 

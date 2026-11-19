@@ -128,4 +128,6 @@ git commit --amend --no-edit                                                    
 git push origin main                                                               # fast-forward: main's old history stays reachable
 ```
 
-The result is one merge commit whose first parent is the old `main` and second parent is `v2`, and whose tree is exactly `v2`'s. That commit lands as a pull request from a `v2-switch-main` branch, so it is reviewed like any other change, and the `main` push is a fast-forward. Afterwards `v2` is retired, and work continues on `main`.
+The result is one merge commit whose first parent is the old `main` and second parent is `v2`, and whose tree is exactly `v2`'s. That commit lands as a pull request from a `v2-switch-main` branch, so it is reviewed like any other change, and the `main` push is a fast-forward. Afterwards work continues on `main`, and `v2` is kept as an alias that follows `main` for those who track it.
+
+The switch has been made. The last 0.1.x commit on the old `main` is tagged `v0.1-final`, and `legacy/v0.1` carries that line on for security and safety fixes only.

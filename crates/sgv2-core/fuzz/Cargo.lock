@@ -83,7 +83,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "sgv2-core"
-version = "1.0.0-alpha.1"
+version = "1.0.0-alpha.2"
 dependencies = [
  "libm",
 ]
@@ -100,7 +100,7 @@ dependencies = [
 
 [[package]]
 name = "sgv2-lv2"
-version = "1.0.0-alpha.1"
+version = "1.0.0-alpha.2"
 dependencies = [
  "libc",
  "sgv2-core",
