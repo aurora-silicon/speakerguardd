@@ -43,6 +43,26 @@ pub struct Globals {
     /// control's maximum (macaudio's safe_vol): what the speakers get once
     /// the lock lapses.
     pub safe_reduction: f64,
+    /// The most frames the speaker playback path can hold already converted
+    /// through the volume control (the speaker front-end's buffer limit):
+    /// what the card converted can play at most this long after it, at the
+    /// stream's rate.  Required: it bounds every gain change and handoff.
+    pub copy_queue_frames: u32,
+    /// How long samples converted at an earlier gain can keep playing after
+    /// a gain change, and after the lock is given up until they are
+    /// certainly gone (the card's stop work, then the queue), with margin
+    /// (s).  Required, and at least the queue at `default_rate`.
+    pub drain: f64,
+    /// The rate the queue and the period are timed at before the first
+    /// stream shows its own (Hz).  Required.
+    pub default_rate: u32,
+}
+
+impl Globals {
+    /// `drain` as a duration (whole milliseconds, as the guard counts it).
+    pub fn drain_duration(&self) -> std::time::Duration {
+        std::time::Duration::from_millis((self.drain * 1000.0) as u64)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -154,6 +174,11 @@ impl Config {
                 None => 20.0,
                 Some(_) => num(g, "Globals", "safe_reduction")?,
             },
+            // the queue timing has no default: it is the card's, and a
+            // profile without it is refused
+            copy_queue_frames: num(g, "Globals", "copy_queue_frames")?,
+            drain: num(g, "Globals", "drain")?,
+            default_rate: num(g, "Globals", "default_rate")?,
         };
         for (key, value) in [
             ("t_ambient", globals.t_ambient),
@@ -161,6 +186,7 @@ impl Config {
             ("t_window", globals.t_window),
             ("t_reduction_max", globals.t_reduction_max),
             ("safe_reduction", globals.safe_reduction),
+            ("drain", globals.drain),
         ] {
             if !value.is_finite() {
                 return Err(ConfigError(format!("[Globals] {key} must be finite")));
@@ -252,6 +278,17 @@ impl Config {
         if !(globals.safe_reduction > 0.0) {
             return Err(ConfigError("[Globals] safe_reduction must be positive".into()));
         }
+        if globals.copy_queue_frames == 0 || globals.default_rate == 0 {
+            return Err(ConfigError("[Globals] copy_queue_frames and default_rate must be positive".into()));
+        }
+        // the drain covers at least the whole queue at the default rate
+        let queue_s = f64::from(globals.copy_queue_frames) / f64::from(globals.default_rate);
+        if !(globals.drain >= queue_s) {
+            return Err(ConfigError(format!(
+                "[Globals] drain {} s is shorter than the copy queue ({} frames at {} Hz, {queue_s:.3} s)",
+                globals.drain, globals.copy_queue_frames, globals.default_rate
+            )));
+        }
         Ok(Config { globals, controls, speakers })
     }
 
@@ -281,6 +318,47 @@ mod tests {
         assert!((c.speakers[0].p_limit_1s - 2.8154).abs() < 1e-9);
         assert!((c.speakers[0].p_limit_60s - 2.5).abs() < 1e-9);
         assert!((c.globals.t_reduction_max - 12.0).abs() < 1e-9);
+    }
+
+    /// The J700's queue timing is the daemon's former constants exactly
+    /// (COPY_QUEUE_FRAMES 16384, QUEUE_BOUND = DRAIN = 500 ms from
+    /// DRAIN_S 0.5, DEFAULT_RATE 48000), so nothing changes there.
+    #[test]
+    fn j700_queue_timing_is_the_former_constants() {
+        let g = Config::parse(J700).unwrap().globals;
+        assert_eq!(g.copy_queue_frames, 16384);
+        assert_eq!(g.drain.to_bits(), 0.5f64.to_bits());
+        assert_eq!(g.default_rate, 48000);
+        assert_eq!(g.drain_duration(), std::time::Duration::from_millis((0.5f64 * 1000.0) as u64));
+        assert_eq!(g.drain_duration(), std::time::Duration::from_millis(500));
+    }
+
+    /// The queue timing is the card's: a profile without any one of the
+    /// keys is refused, and so is one whose drain is shorter than its queue.
+    #[test]
+    fn queue_timing_is_required() {
+        for line in ["copy_queue_frames = 16384\n", "drain = 0.5\n", "default_rate = 48000\n"] {
+            assert!(J700.contains(line), "{line}");
+            let key = line.split(' ').next().unwrap();
+            let err = Config::parse(&J700.replace(line, "")).unwrap_err().to_string();
+            assert_eq!(err, format!("[Globals] is missing {key}"));
+        }
+        for (from, to) in [
+            ("copy_queue_frames = 16384", "copy_queue_frames = 0"),
+            ("copy_queue_frames = 16384", "copy_queue_frames = -1"),
+            ("default_rate = 48000", "default_rate = 0"),
+            ("drain = 0.5", "drain = nan"),
+            ("drain = 0.5", "drain = inf"),
+            ("drain = 0.5", "drain = -0.5"),
+            // 16384 frames at 48 kHz are 0.341 s
+            ("drain = 0.5", "drain = 0.34"),
+            // a deeper queue than the drain covers
+            ("copy_queue_frames = 16384", "copy_queue_frames = 32768"),
+            ("default_rate = 48000", "default_rate = 22050"),
+        ] {
+            assert!(Config::parse(&J700.replace(from, to)).is_err(), "{to}");
+        }
+        assert!(Config::parse(&J700.replace("drain = 0.5", "drain = 0.35")).is_ok());
     }
 
     #[test]

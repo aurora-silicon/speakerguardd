@@ -28,7 +28,7 @@
 //!   span is charged.
 //! * The budgets' power before the gain: each measured frame at the most
 //!   reduction that can have converted it (any the controls may have held
-//!   from QUEUE_BOUND before it, rounded to their steps, the card's safe
+//!   from the drain before it, rounded to their steps, the card's safe
 //!   level from where the lease may have run out), never above full scale.
 //! * The lock.  Not taken before the model allows it and the daemon can see:
 //!   no unlock at start, and while the speakers play not before
@@ -95,13 +95,6 @@ pub const SAVE_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_CONTROL_FAILURES: u32 = 600;
 /// Sense data missing for this long means the stream is gone, not late.
 pub const STALL_TIMEOUT: Duration = Duration::from_millis(500);
-/// How long the card can keep playing samples converted at an earlier gain
-/// after a gain change: the J700 converts on copy into a playback queue of
-/// up to 16384 frames, 341 ms at 48 kHz.  With margin.
-pub const QUEUE_BOUND: Duration = Duration::from_millis((model::DRAIN_S * 1000.0) as u64);
-/// After the lock is given up, the time until samples converted at the old
-/// gain are certainly gone (macaudio's stop work, then the queue).
-pub const DRAIN: Duration = QUEUE_BOUND;
 /// A change event can reach the daemon this long after the change: a look
 /// at closed speakers vouches only for the time up to this before it (the
 /// rest is the next look's to vouch for or charge).
@@ -362,13 +355,6 @@ pub const FLUSH_MARGIN_K: f64 = 3.0;
 /// limit in this long, at full scale through the least reduction the card
 /// may be playing, is handed off now rather than at the next look.
 pub const REACH_HORIZON: Duration = PING_INTERVAL;
-/// The speakers' copy queue in frames: what the card converted plays at
-/// most this long after it (the J700's 16384 frames, 341 ms at 48 kHz;
-/// QUEUE_BOUND is the same with margin).
-pub const COPY_QUEUE_FRAMES: u32 = 16384;
-/// The rate the queue and the period are timed at before the first stream
-/// shows its own (the J700's).
-const DEFAULT_RATE: u32 = 48000;
 /// macaudio's stop of the streams converted at the old gain once the lock
 /// is given up or lapses: a work item, milliseconds.
 pub const STOP_LATENCY: Duration = Duration::from_millis(5);
@@ -472,7 +458,7 @@ pub struct Guard {
     applied: f64,
     /// What the controls held: (from, the least and the most of it, the
     /// card's own safe level may have applied instead), oldest first, back
-    /// to QUEUE_BOUND + GAIN_RETAIN before the last verified boundary.  The
+    /// to the drain + GAIN_RETAIN before the last verified boundary.  The
     /// card applies its safe level whenever the daemon does not hold a live
     /// lease.
     gains: Vec<Gain>,
@@ -540,7 +526,7 @@ impl Guard {
         let mut speakers: Vec<SpeakerState> = cfg.speakers.iter().map(|s| SpeakerState::new(s.clone(), globals.t_ambient)).collect();
         let latched = |speakers: &mut Vec<SpeakerState>| {
             for s in speakers.iter_mut() {
-                s.assume_latched(globals.t_ambient);
+                s.assume_latched(globals.t_ambient, globals.drain);
             }
         };
         // what the card applied before this run: after a clean stop the
@@ -780,7 +766,7 @@ impl Guard {
     /// The lock was given up for the stop and the samples converted at the
     /// old gain have drained.
     pub fn released<H: Hw>(&self, hw: &H) -> bool {
-        !self.armed && self.relinquished_at.is_some_and(|t| hw.now() >= t + DRAIN)
+        !self.armed && self.relinquished_at.is_some_and(|t| hw.now() >= t + self.drain())
     }
 
     /// The state a restart may resume: everything up to now accounted, the
@@ -890,11 +876,11 @@ impl Guard {
         }
     }
 
-    /// A verified boundary at `at`: only the gains held from QUEUE_BOUND
+    /// A verified boundary at `at`: only the gains held from the drain
     /// before it on can still be playing (kept GAIN_RETAIN longer).
     fn verify(&mut self, at: Instant) {
         self.verified_at = at;
-        let Some(from) = at.checked_sub(QUEUE_BOUND + GAIN_RETAIN) else { return };
+        let Some(from) = at.checked_sub(self.drain() + GAIN_RETAIN) else { return };
         let keep = self.gains.iter().rposition(|e| e.at <= from).unwrap_or(0);
         self.gains.drain(..keep);
     }
@@ -916,13 +902,20 @@ impl Guard {
     }
 
     /// The speakers' rate, the default before the first stream.
+    /// How long samples converted at an earlier gain can keep playing after
+    /// a gain change, and after the lock is given up until they are gone:
+    /// the profile's `drain` (the card's copy queue with margin).
+    pub fn drain(&self) -> Duration {
+        self.globals.drain_duration()
+    }
+
     fn timing_rate(&self) -> f64 {
-        f64::from(if self.rate > 0 { self.rate } else { DEFAULT_RATE })
+        f64::from(if self.rate > 0 { self.rate } else { self.globals.default_rate })
     }
 
     /// How long audio the card converted can still play: the copy queue.
     fn copy_queue(&self) -> Duration {
-        Duration::from_secs_f64(f64::from(COPY_QUEUE_FRAMES) / self.timing_rate())
+        Duration::from_secs_f64(f64::from(self.globals.copy_queue_frames) / self.timing_rate())
     }
 
     /// The longest the guard goes between looks at the program while it
@@ -933,15 +926,15 @@ impl Guard {
 
     /// The least reduction the card may have applied to samples playing
     /// after `from` (unknown counts as full gain): the controls' least
-    /// since QUEUE_BOUND before it.
+    /// since the drain before it.
     fn least_since(&self, from: Instant) -> f64 {
-        let from = from.checked_sub(QUEUE_BOUND).unwrap_or(from);
+        let from = from.checked_sub(self.drain()).unwrap_or(from);
         let far = from + Duration::from_secs(1 << 20);
         self.held_over(from, far).map(|e| if e.lo.is_finite() { e.lo } else { 0.0 }).fold(self.written_db(), f64::min)
     }
 
     /// Review r6 W1: the card converts on copy, ahead of a queue of up to
-    /// QUEUE_BOUND, so audio already converted at a lower reduction keeps
+    /// the drain, so audio already converted at a lower reduction keeps
     /// playing whatever is written now; only a hand-off stops it (macaudio's
     /// stop work).  Two rules, the first that finds a coil within
     /// FLUSH_MARGIN_K of its limit:
@@ -952,14 +945,14 @@ impl Guard {
     ///   FLUSH_JUMP_DB over that least, and the audio converted at it, at
     ///   the level the program was last seen to deliver, plays on until a
     ///   copy queue after the controls stopped holding it (review r7 Y1: not
-    ///   a whole QUEUE_BOUND from now, which stopped bursts the queue no
+    ///   a whole drain from now, which stopped bursts the queue no
     ///   longer held).
     ///
     /// The speaker, how hot and by which rule, if so.  What the card
     /// converted before the lock was last taken was at its safe level, or
     /// was stopped then.
     fn queue_threat(&self, now: Instant) -> Option<(usize, f64, Threat)> {
-        let from = now.checked_sub(QUEUE_BOUND).unwrap_or(now).max(self.unlocked_at);
+        let from = now.checked_sub(self.drain()).unwrap_or(now).max(self.unlocked_at);
         let lo_of = |e: &Gain| if e.lo.is_finite() { e.lo } else { 0.0 };
         let (least, most) = self
             .held_over(from, now)
@@ -980,7 +973,7 @@ impl Guard {
             return None;
         }
         let held_to = self.held_spans(from, now).filter(|&(e, _)| lo_of(e) <= least).map(|(_, to)| to).max().unwrap_or(from);
-        let plays = (held_to + self.copy_queue()).saturating_duration_since(now).min(QUEUE_BOUND).as_secs_f64();
+        let plays = (held_to + self.copy_queue()).saturating_duration_since(now).min(self.drain()).as_secs_f64();
         self.hottest(|s| {
             // the program as last seen may have come through as much as the
             // most reduction in the window: the least can deliver it louder
@@ -1232,11 +1225,11 @@ impl Guard {
         let first = (new - (k - 1) as f64).clamp(f64::MIN_POSITIVE, 1.0);
         let all = &self.words[..frames * ch];
         // The budgets' power before the gain: these frames played up to
-        // `end`, converted up to QUEUE_BOUND before they played, each at any
+        // `end`, converted up to the drain before they played, each at any
         // reduction the card may have applied then (the most that can have
         // delivered the frame is the safer guess).
         let played = end.checked_sub(Duration::from_secs_f64(k as f64 / rate)).unwrap_or(end);
-        let converted = played.checked_sub(QUEUE_BOUND).unwrap_or(played);
+        let converted = played.checked_sub(self.drain()).unwrap_or(played);
         let possible = self.possible_reductions(converted, late_end);
         let parts: &[(usize, usize, f64)] = if first < 1.0 { &[(0, 1, first), (1, k, 1.0)] } else { &[(0, k, 1.0)] };
         // Block powers of a run of per-frame values.  The models give every
@@ -2510,8 +2503,8 @@ mod tests {
     /// Review r7 Y1: audio converted at the least gain plays only until a
     /// copy queue (341 ms) after the controls stopped holding it.  0 dB was
     /// replaced 0.4 s ago: none of it can still be playing, though it lies
-    /// inside QUEUE_BOUND, and the burst is not stopped (0.1.11 stopped it,
-    /// at 172 C over a whole QUEUE_BOUND from now).
+    /// inside the drain, and the burst is not stopped (0.1.11 stopped it,
+    /// at 172 C over a whole drain from now).
     #[test]
     fn audio_queued_at_a_replaced_gain_plays_only_a_queue_after_it() {
         let (mut g, now) = w1_state(110.0, 70.0, &[(0.45, 0.0), (0.4, 6.0)], 1.0);
@@ -2544,7 +2537,7 @@ mod tests {
     #[test]
     fn the_floor_keeps_a_held_up_full_scale_under_the_limit() {
         let cfg = j700();
-        let secs_held = f64::from(COPY_QUEUE_FRAMES) / 48000.0 + 0.25 + 4096.0 / 48000.0 + 0.005;
+        let secs_held = f64::from(cfg.globals.copy_queue_frames) / 48000.0 + 0.25 + 4096.0 / 48000.0 + 0.005;
         for (t, cost) in [(50.0, 0.46), (60.0, 0.96), (70.0, 1.53), (85.0, 2.54), (100.0, 3.86), (110.0, 5.04), (120.0, 6.66)] {
             let ta = cfg.globals.t_ambient;
             let magnet = ta + (t - ta) * 26.0 / 64.0;
@@ -4463,7 +4456,7 @@ mod tests {
             g.verified_at = hw.now();
             g.account_to = hw.now();
             g.stop(&mut hw).unwrap();
-            hw.sleep(DRAIN);
+            hw.sleep(g.drain());
             let before = g.speakers[0].clone();
             let from = g.account_to;
             hw.inject.set(true);

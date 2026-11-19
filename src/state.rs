@@ -158,7 +158,7 @@ pub fn restore(speakers: &mut [SpeakerState], saved: &Saved, now: Duration, glob
         let x = match saved.speakers.iter().find(|x| x.name == s.spec.name) {
             Some(x) if proven => x,
             _ => {
-                s.assume_latched(globals.t_ambient);
+                s.assume_latched(globals.t_ambient, globals.drain);
                 continue;
             }
         };

@@ -38,7 +38,13 @@ modelling from the sense data and takes the lock back once the reduction is
 The J700 converts on copy, ahead of a playback queue of up to 341 ms, so a
 written reduction reaches only what is converted after it.  Audio already
 queued at a lower gain keeps playing, and only giving the lock up stops it
-(macaudio stops the old-gain stream at once).  The daemon gives the lock up
+(macaudio stops the old-gain stream at once).  The queue is the card's, so each
+profile states it in `[Globals]`, with no default: `copy_queue_frames` (the
+most frames the speaker path holds already converted), `drain` (seconds
+until audio converted at an earlier gain is certainly gone, at least the
+queue at `default_rate`) and `default_rate` (the rate the queue is timed at
+before a stream shows its own).  A profile without them is refused.  The
+J700's are 16384 frames, 0.5 s and 48000 Hz.  The daemon gives the lock up
 for that reason too, in two cases, each logged as itself:
 * Any program at all could take a coil within 3 K of its limit before its
   next look, through the least reduction the card may be playing.  This is
