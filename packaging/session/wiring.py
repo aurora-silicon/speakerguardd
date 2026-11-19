@@ -119,8 +119,11 @@ TRANSPORTS = {
     # sound/soc/apple/aop_spkr.rs (T6040 speaker service): S24_LE playback, S16_LE sense.
     # Its PCMs have one width on every Mac, whatever the number of amps: six
     # playback channels and twelve sense channels (see PCM widths below).
+    # Its sense is the back-end's "sense" DMA channel: a Mac whose AOP
+    # carries no V/I sense (the J773g's ADT audio-speaker has a TX channel
+    # only) names none, and its amps' sense is not read (transport_senses).
     "apple,t6041-aop-audio": {"transport": "aop-spkr", "formats": ["S24_LE"], "sense_batch": False, "speaker_headroom": 256,
-                              "speaker_irq": True, "speaker_channels": 6, "sense_channels": 12},
+                              "speaker_irq": True, "speaker_channels": 6, "sense_channels": 12, "sense_dma": "sense"},
     # sound/soc/apple/aop_t8140.rs: S32_LE playback, no sense
     "apple,t8140-aop-audio": {"transport": "aop-t8140", "formats": ["S32_LE"], "sense_batch": True, "speaker_headroom": 0,
                               "speaker_irq": True},
@@ -273,12 +276,15 @@ def _links(snd, root, phandles, sysfs):
             if i2c:
                 c["i2c"] = i2c
             codecs.append(c)
-        cpu_compat = []
+        cpu_compat, cpu_dmas = [], []
         for node in cpu:
             f = os.path.join(node, "compatible")
             cpu_compat.append(_strs(_read(f)) if os.path.exists(f) else [])
+            f = os.path.join(node, "dma-names")
+            cpu_dmas.append(_strs(_read(f)) if os.path.exists(f) else None)
         links.append(
-            {"name": _str(_read(os.path.join(p, "link-name"))), "cpus": len(cpu), "cpu_compatible": cpu_compat, "codecs": codecs}
+            {"name": _str(_read(os.path.join(p, "link-name"))), "cpus": len(cpu), "cpu_compatible": cpu_compat,
+             "cpu_dma_names": cpu_dmas, "codecs": codecs}
         )
     return links
 
@@ -509,6 +515,24 @@ def tdm_slots(n_codecs, n_bes):
     return slots
 
 
+def transport_senses(hw):
+    """Whether the speaker link's transport carries the amps' V/I sense on
+    this Mac. A transport whose sense is a named DMA channel ("sense_dma")
+    carries none when its back-end nodes name their channels without it.
+    A back-end with no dma-names, or a device-tree read from before they
+    were recorded, keeps the sense the amps' family offers. (transport()
+    refuses unknown or mixed back-ends; this only reads the ones it knows.)"""
+    link = _speaker_link(hw)
+    dmas = link.get("cpu_dma_names")
+    if not dmas or any(d is None for d in dmas):
+        return True
+    for compat, names in zip(link.get("cpu_compatible") or [], dmas):
+        t = next((TRANSPORTS[c] for c in compat if c in TRANSPORTS), None)
+        if t and t.get("sense_dma") and t["sense_dma"] not in names:
+            return False
+    return True
+
+
 def hardware(hw):
     """The speaker amps in physical (speaker PCM) order, each with its
     side, role, ordinal, slot and sense channels."""
@@ -517,6 +541,10 @@ def hardware(hw):
     if not codecs:
         raise Refused("the speaker dai-link lists no amps")
     slots = tdm_slots(len(codecs), link["cpus"])
+    # An amp family's V/I sense counts only where the transport carries it:
+    # without, the amps are wired without it, and the record says why
+    # ("no_sense_path", method "derived-nosense").
+    sensed = transport_senses(hw)
     amps, families = [], set()
     # A lone amp with no sound-name-prefix is the one full-range speaker of
     # a desktop Mac (J274, J375, J473, J474, J475: macaudio's mono speaker
@@ -535,7 +563,9 @@ def hardware(hw):
         a = {"prefix": c["prefix"], "family": fam[0], "slot": slot, "side": side, "role": role, "ordinal": ordinal}
         if c.get("i2c"):
             a["i2c"] = c["i2c"]
-        if fam[1]:
+        if fam[1] and not sensed:
+            a["no_sense_path"] = True
+        elif fam[1]:
             for k in ("vmon", "imon"):
                 if k not in c:
                     raise Refused(f"amp {c['prefix']} has V/I sense but no ti,{k}-slot-no")
@@ -567,7 +597,7 @@ def hardware(hw):
     keys = [(a["side"], a["role"], a["ordinal"]) for a in amps]
     if len(set(keys)) != len(keys):
         raise Refused(f"two amps share a side, role and ordinal: {[a['prefix'] for a in amps]}")
-    if next(iter(families))[1]:
+    if next(iter(families))[1] and sensed:
         chans = sorted(ch for a in amps for ch in (a["v_ch"], a["i_ch"]))
         if chans != list(range(2 * len(amps))):
             raise Refused(f"the sense slots give channels {chans}, not 0..{2 * len(amps) - 1} once each")
@@ -799,6 +829,9 @@ def derive(hw, dump, key=None):
     the sense map."""
     amps = hardware(hw)
     rl = roles(dump)
+    no_sense_path = any(a.get("no_sense_path") for a in amps)
+    if no_sense_path and rl["kind"] in SENSE_UNITS:
+        raise Refused(f"the tuning's {rl['kind']} protection reads V/I sense, and this Mac's speaker transport carries none")
     units = rl["channels"]
     if len(units) != len(amps):
         raise Refused(f"the tuning's unit has {len(units)} channels, the board {len(amps)} amps")
@@ -838,6 +871,10 @@ def derive(hw, dump, key=None):
         "unit_channels": [a["unit"] for a in amps],
         "sense": sense,
         "sense_ports": [s["port"] for s in sense],
+        # A sense-capable amp family on a transport that carries no sense
+        # (transport_senses): proven like a family without sense, and the
+        # record says why (method "derived-nosense").
+        "no_sense_path": no_sense_path,
     }
     if rl.get("sense_companion"):
         if len(sense) != 2 * len(amps):

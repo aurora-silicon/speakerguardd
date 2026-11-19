@@ -906,7 +906,7 @@ def derive_live(args):
     dump = wiring.tuning_dump(args.tuning, args.tuning_cli, strict=True)
     units = wiring.roles(dump)["channels"]
     w = wiring.derive(hw, dump)
-    w["method"] = "derived" if w["sense"] else "derived-static"
+    w["method"] = "derived" if w["sense"] else "derived-nosense" if w.get("no_sense_path") else "derived-static"
     desc = wiring.describe(hw, w)
     return hw, w, desc, wiring.role_errors(w, units)
 
@@ -1001,7 +1001,7 @@ def run_locked(args):
                 return 0
             # The cheap checks failed already: the record fails now, before
             # login, without the switch test.
-        elif w["method"] == "derived-static":
+        elif w["method"] in ("derived-static", "derived-nosense"):
             errs += static(idx, w, report)
         elif w["method"] == "derived":
             try:
@@ -1044,7 +1044,9 @@ def static(idx, w, report):
     """A board without V/I sense (the J700's MAX98360As): no register and
     no sense to read, so nothing about its channel order is observable
     with zero samples. The map is the device tree's and the tuning's, and
-    the record says "derived-static". Only the PCM is checked."""
+    the record says "derived-static". A family with sense on a transport
+    that carries none (the J773g's AOP) has none to read either: the
+    record says "derived-nosense". Only the PCM is checked."""
     ids = pcm_ids(idx)
     if ids.get(("Secondary", "p")) != 1:
         raise wiring.Refused(f"the speaker PCM is {ids.get(('Secondary', 'p'))}; the graph expects 1")

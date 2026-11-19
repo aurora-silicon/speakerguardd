@@ -114,8 +114,11 @@ pub fn covers(bind: &Bind, board: &str, kernel: &str, params_sha256: &str) -> Re
 /// count and the amp family the self-check derived from this Mac's device
 /// tree and proved on its card. There is no table of boards: a new Mac
 /// runs on its own record. A family with V/I sense must have been proven
-/// with it (`method=derived`, two sense channels an amp); one without has
-/// nothing to prove silently (`method=derived-static`, no sense).
+/// with it (`method=derived`, two sense channels an amp), unless the
+/// self-check found that this Mac's speaker transport carries no sense
+/// (`method=derived-nosense`, no sense: the J773g's AOP, whose device tree
+/// names no sense DMA). One without has nothing to prove silently
+/// (`method=derived-static`, no sense).
 pub fn machine_for(board: &str, bind: &Bind) -> Result<&'static Machine, String> {
     if bind.board != board {
         return Err(format!("the self-check ran on {}, this Mac is {board}", bind.board));
@@ -126,7 +129,11 @@ pub fn machine_for(board: &str, bind: &Bind) -> Result<&'static Machine, String>
     if bind.amps == 0 {
         return Err(format!("{board}: the self-check found no amps"));
     }
-    let (method, sense) = if amp.has_sense() { ("derived", 2 * bind.amps) } else { ("derived-static", 0) };
+    let (method, sense) = match (amp.has_sense(), bind.method.as_str()) {
+        (true, "derived-nosense") => ("derived-nosense", 0),
+        (true, _) => ("derived", 2 * bind.amps),
+        (false, _) => ("derived-static", 0),
+    };
     if bind.method != method {
         return Err(format!("{board}: {} amps need a {method} wiring, the record says {}", bind.family, bind.method));
     }
@@ -209,6 +216,12 @@ mod tests {
             Bind { amps: 2, sense: 0, family: "max98360a".into(), method: "derived-static".into(), ..new.clone() };
         assert_eq!(machine_for("j999", &pair).unwrap().amp, Amp::Max98360a);
         assert!(machine_for("j999", &Bind { sense: 4, ..pair.clone() }).is_err());
-        assert!(machine_for("j999", &Bind { method: "derived".into(), ..pair }).is_err());
+        assert!(machine_for("j999", &Bind { method: "derived".into(), ..pair.clone() }).is_err());
+        assert!(machine_for("j999", &Bind { method: "derived-nosense".into(), ..pair }).is_err());
+        // a sense family on a transport without sense (the J773g): no sense
+        let mono = Bind { amps: 1, sense: 0, method: "derived-nosense".into(), ..new.clone() };
+        assert_eq!(machine_for("j999", &mono).unwrap().amp, Amp::Sn012776);
+        assert!(machine_for("j999", &Bind { sense: 2, ..mono.clone() }).is_err());
+        assert!(machine_for("j999", &Bind { method: "derived-static".into(), ..mono }).is_err());
     }
 }
