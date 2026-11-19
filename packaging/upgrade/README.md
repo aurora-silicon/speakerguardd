@@ -47,6 +47,11 @@ aurora-speaker-upgrade guide           # the macOS route, when Linux cannot read
    routes cannot manufacture this field; collect it on this Mac's running
    macOS with the current `tools/speaker-tuning/collect-macos.sh`. No tuning
    values are packaged or uploaded. Full presets need no fill.
+   A bundle that carries a record speakerguardd v2 does not read yet (today
+   `buzzkill_quadrature`, which the installer's collector wrote by default
+   from 2026-11-13; speakerguardd#138 adds its reader) is stored without that
+   record and its file, and the tool says so: the tuning reader refuses any
+   manifest key it does not know.
 2. **Storage.** The bundle goes to `/var/lib/aurora-speaker-upgrade/bundle`
    (0700, root). It is never packaged or sent anywhere.
    `/etc/speakerguardd/provision.conf` points provisioning at it
