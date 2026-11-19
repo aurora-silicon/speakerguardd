@@ -1142,6 +1142,8 @@ mod linux {
         let mut suspended = suspended_ns();
         let mut slept = sleeps();
         let mut waiting_after_sleep = false;
+        // after a fault release that changed the graph (see observe)
+        let mut graph_settling = false;
         // grants that keep ending in a fault at once are spaced out
         let mut regrant = Regrant::default();
         let mut held_off = false;
@@ -1181,6 +1183,15 @@ mod linux {
                     }
                 );
             }
+            if observer.graph_settling() != graph_settling {
+                graph_settling = observer.graph_settling();
+                if !graph_settling {
+                    eprintln!(
+                        "the engine has beaten steadily for {} ms since the graph changed",
+                        sgv2_supervisor::observe::GRAPH_SETTLE_NS / 1_000_000
+                    );
+                }
+            }
             let event = sup.tick(obs, &mut kernel);
             // the observer leaves the kernel-side checks to the supervisor,
             // which records any failure as its problem
@@ -1209,6 +1220,7 @@ mod linux {
                         "protection released: {why:?}{}{session} (pcm {pcm:?}, engine beat {age:?} ms ago)",
                         if session.is_empty() { "" } else { "; session: " }
                     );
+                    observer.note_fault_release(&why);
                     if let Some(hold) = regrant.released(now_ns(), true) {
                         eprintln!(
                             "{} grants in a row ended within {} ms: next grant held off {} ms",

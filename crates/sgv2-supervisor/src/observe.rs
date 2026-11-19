@@ -127,6 +127,22 @@
 //! after the grant. RUNNING, Closed, any other owner or state, and every
 //! other check stay as strict as ever; once the window passes without a
 //! beat, the lease is released as before.
+//!
+//! # After a graph change
+//!
+//! A WirePlumber restart under a grant takes the graph down and builds it
+//! again: the protect stage stops beating and the supervisor releases.
+//! While the graph comes back the engine beats in short runs. Each run gave
+//! two clean ticks and a grant, and the next pause or a transient link
+//! report ended it again (J413: 17 grants for 10 restarts, each a possible
+//! click or gap). So after a fault release on a stale heartbeat or a PCM
+//! held by another process ([`Observer::note_fault_release`]) the heartbeat
+//! counts as stale until it has been fresh on every tick for
+//! [`GRAPH_SETTLE_NS`]. One graph change gives one grant. A stale tick in
+//! that time starts the wait again. This only delays a grant: the settle
+//! is over before the next grant can come, so it never touches a held
+//! lease. Releases on any other fault, and a stream starting from idle,
+//! still need just the two clean ticks.
 
 use crate::lease::Observation;
 
@@ -304,6 +320,10 @@ pub const RESUME_GRACE_NS: u64 = 500_000_000;
 /// has beaten steadily (every tick fresh) for this long: PipeWire resyncs
 /// its graph and drivers in the first moments after the thaw.
 pub const RESUME_SETTLE_NS: u64 = 500_000_000;
+/// After a fault release on a stale heartbeat or a foreign PCM owner (the
+/// graph changed under the grant), the heartbeat counts as fresh only once
+/// the engine has beaten steadily (every tick fresh) for this long.
+pub const GRAPH_SETTLE_NS: u64 = 300_000_000;
 
 /// Freshness bound while the engine runs: two unit quanta (the
 /// architecture's "at most 2 quanta stale") plus one supervisor tick.
@@ -356,6 +376,10 @@ pub struct Observer {
     /// The last tick proved the engine's sense input (see
     /// [`Observer::sense_proven`]).
     sense_proven: bool,
+    /// After a fault release that changed the graph: `Some(None)` until the
+    /// heartbeat is fresh, then `Some(Some(since))` while every tick stays
+    /// fresh, until [`GRAPH_SETTLE_NS`] has passed.
+    graph_settle: Option<Option<u64>>,
 }
 
 impl Observer {
@@ -387,6 +411,7 @@ impl Observer {
             sleep_before_grant: false,
             resume_grant: None,
             sense_proven: false,
+            graph_settle: None,
         }
     }
 
@@ -432,6 +457,23 @@ impl Observer {
     /// Links count only while the session helper reports this wiring.
     pub fn expect_wiring(&mut self, wiring: u64) {
         self.expected_wiring = Some(wiring);
+    }
+
+    /// The supervisor released on a fault (`why`). A stale heartbeat or a
+    /// PCM held by another process means the graph changed under the
+    /// grant: the next grant waits until the engine has beaten steadily for
+    /// [`GRAPH_SETTLE_NS`] (see the module notes). Any other fault keeps
+    /// the plain two clean ticks.
+    pub fn note_fault_release(&mut self, why: &Observation) {
+        if !why.heartbeat_fresh || !why.pcm_owner_ok {
+            self.graph_settle = Some(None);
+        }
+    }
+
+    /// Whether the heartbeat is held stale while the graph settles after a
+    /// fault release.
+    pub fn graph_settling(&self) -> bool {
+        self.graph_settle.is_some()
     }
 
     /// The supervisor granted at `now_ns`: the re-link and driver switch
@@ -611,7 +653,25 @@ impl Observer {
         } else {
             false
         };
-        let heartbeat_fresh = heartbeat_fresh && !settling;
+        // after a fault release that changed the graph: fresh only once
+        // every tick has been fresh for GRAPH_SETTLE_NS
+        let graph_settling = match self.graph_settle {
+            None => false,
+            Some(_) if !heartbeat_fresh => {
+                self.graph_settle = Some(None);
+                true
+            }
+            Some(None) => {
+                self.graph_settle = Some(Some(now_ns));
+                true
+            }
+            Some(Some(t0)) if now_ns.saturating_sub(t0) >= GRAPH_SETTLE_NS => {
+                self.graph_settle = None;
+                false
+            }
+            Some(Some(_)) => true,
+        };
+        let heartbeat_fresh = heartbeat_fresh && !settling && !graph_settling;
         // only the plugin's host process may hold the speaker PCM
         let pcm_owner_ok = match p.owner() {
             Some(owner) => owner == e.pid && e.pid != 0,
@@ -2152,5 +2212,107 @@ mod tests {
         o.note_grant(t);
         let stale2 = silent_run(&mut o, t + TICK, t + 2_000_000_000, seq, t, open).unwrap();
         assert!(stale2 - t <= GRANT_GRACE_NS + stale_ns(512, 48_000, TICK) + TICK);
+    }
+
+    /// A WirePlumber restart under a grant (J413): the engine stops beating
+    /// while the graph is rebuilt, then beats in short runs while it comes
+    /// back. After the fault release the heartbeat counts as fresh only once
+    /// the engine has beaten on every tick for GRAPH_SETTLE_NS, so the runs
+    /// give one grant, not one each.
+    #[test]
+    fn after_a_stale_release_the_graph_settles_before_the_heartbeat_counts() {
+        let mut o = Observer::new(7, 48_000, TICK);
+        let (mut seq, mut t) = (0, 0);
+        for _ in 0..20 {
+            t += TICK;
+            seq += 1;
+            sleep_tick(&mut o, t, seq, t - 1);
+        }
+        let why = Observation { heartbeat_fresh: false, ..Observation::default() };
+        o.note_fault_release(&why);
+        assert!(o.graph_settling());
+        // runs of beats shorter than the settle, each ended by a pause
+        for _ in 0..3 {
+            for _ in 0..(GRAPH_SETTLE_NS / TICK - 2) {
+                t += TICK;
+                seq += 1;
+                assert!(!sleep_tick(&mut o, t, seq, t - 1), "fresh while the graph settles");
+            }
+            for _ in 0..5 {
+                t += TICK;
+                assert!(!sleep_tick(&mut o, t, seq, t - 5 * TICK));
+            }
+        }
+        // then steady: fresh once it has beaten for the whole settle
+        let first = t + TICK;
+        loop {
+            t += TICK;
+            seq += 1;
+            if sleep_tick(&mut o, t, seq, t - 1) {
+                break;
+            }
+            assert!(t - first <= GRAPH_SETTLE_NS + TICK, "never fresh again");
+        }
+        assert!(t - first >= GRAPH_SETTLE_NS, "fresh before the settle");
+        assert!(!o.graph_settling());
+        // and from then on as before
+        for _ in 0..3 {
+            t += TICK;
+            seq += 1;
+            assert!(sleep_tick(&mut o, t, seq, t - 1));
+        }
+    }
+
+    /// A PCM opened by another process is a graph change too; every other
+    /// fault keeps the plain two clean ticks.
+    #[test]
+    fn only_a_stale_heartbeat_or_a_foreign_owner_waits_for_the_settle() {
+        let clean = Observation {
+            heartbeat_fresh: true,
+            plugin_ok: true,
+            links_ok: true,
+            carrier_ok: true,
+            pcm_owner_ok: true,
+            pcm_state_ok: true,
+            route_ok: true,
+            amps_ok: true,
+            demand: true,
+        };
+        for (why, settles) in [
+            (Observation { heartbeat_fresh: false, ..clean }, true),
+            (Observation { pcm_owner_ok: false, ..clean }, true),
+            (Observation { heartbeat_fresh: false, links_ok: false, ..clean }, true),
+            (Observation { links_ok: false, ..clean }, false),
+            (Observation { pcm_state_ok: false, ..clean }, false),
+            (Observation { plugin_ok: false, ..clean }, false),
+        ] {
+            let mut o = Observer::new(7, 48_000, TICK);
+            let (mut seq, mut t) = (0, 0);
+            for _ in 0..20 {
+                t += TICK;
+                seq += 1;
+                sleep_tick(&mut o, t, seq, t - 1);
+            }
+            o.note_fault_release(&why);
+            assert_eq!(o.graph_settling(), settles, "{why:?}");
+            t += TICK;
+            seq += 1;
+            assert_eq!(sleep_tick(&mut o, t, seq, t - 1), !settles, "{why:?}");
+        }
+    }
+
+    /// A stream that starts from idle is not a graph change: it still needs
+    /// only the two clean ticks.
+    #[test]
+    fn a_stream_from_idle_does_not_wait_for_the_settle() {
+        let mut o = Observer::new(7, 48_000, TICK);
+        let (mut seq, mut t) = (0, 0);
+        for k in 0..20 {
+            t += TICK;
+            seq += 1;
+            let fresh = sleep_tick(&mut o, t, seq, t - 1);
+            assert!(fresh || k < 2);
+        }
+        assert!(!o.graph_settling());
     }
 }
