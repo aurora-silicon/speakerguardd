@@ -2142,7 +2142,8 @@ impl Run {
                 amp_limit: c.amplitude_limit as f64 - c.pilot_reserve as f64,
                 disp_limit: c.displacement_limit as f64,
                 vel_floor: db_to_lin(c.max_velocity_attenuation_db as f64),
-                // rig law 10: Bandwidth 2 gives no velocity attenuation
+                // rig law 10: Bandwidth 2 gives no velocity attenuation,
+                // and no sample-peak attenuation either (#208)
                 vel_off: c.bandwidth == 2,
                 t_soft: c.temperature_soft_limit as f64,
                 t_hard: c.temperature_hard_limit as f64,
@@ -2438,7 +2439,11 @@ impl Run {
                 (e as f64).clamp(EPS, 1.0) as f32
             };
             let disp_on = self.axis[1];
-            let peak_on = self.axis[0];
+            // Bandwidth 2 switches the sample-peak attenuation off with the
+            // velocity attenuation (25G83 rig, speakerguardd#208): a lane at
+            // Bandwidth 2 passes its peaks, one moved to Bandwidth 1 limits
+            // them, and a woofer moved to Bandwidth 2 stops limiting.
+            let peak_on = self.axis[0] && !c.vel_off;
             let vfs = c.vfs as f64;
             if vel_on {
                 // five fresh zero-state velocity models over the retained
