@@ -1,5 +1,9 @@
+# One instance per speaker card, named by its ALSA card id (AppleJ700):
+# the udev rule starts it for every macaudio card's sense PCM, and the start
+# condition below lets it run only where this daemon ships the card's
+# profile (apple/j700.conf for AppleJ700) and speakersafetyd ships none.
 [Unit]
-Description=Speaker Protection Daemon (feed-forward)
+Description=Speaker Protection Daemon (feed-forward) for %I
 # Restarts are safe: until the daemon renews the card's volume lock the
 # speakers sit at the card's safe level.  A restarted daemon resumes the
 # thermal model from /run/speakerguardd/state only after a clean stop, and
@@ -13,9 +17,12 @@ Type=simple
 # Boot-target and PCM udev activation can precede ALSA card discovery.
 # Wait inside the daemon before touching the interlock; the kernel keeps
 # the speakers at its safe level until the daemon takes the volume lock.
-# The udev rule starts this unit only for the J700's card, and the daemon
-# binds only that card.
-ExecStart=/usr/bin/speakerguardd -c /usr/share/speakerguardd -C AppleJ700 --wait-for-card 30
+# A card without a profile here, or one speakersafetyd describes, is
+# skipped (exit 1, not a failure): the daemon never opens it, and the card
+# keeps its speakers at the kernel's safe level unless speakersafetyd
+# takes them.  The daemon binds only the instance's card.
+ExecCondition=/usr/bin/speakerguardd -c /usr/share/speakerguardd -C %I --owns-card
+ExecStart=/usr/bin/speakerguardd -c /usr/share/speakerguardd -C %I --wait-for-card 30
 UMask=0066
 # Time the daemon is held up is bounded only by the card's 250 ms lease: run
 # ahead of normal tasks (below PipeWire's audio threads, 83-88), keep every
@@ -29,5 +36,3 @@ RuntimeDirectoryPreserve=yes
 Restart=on-failure
 RestartSec=1
 
-[Install]
-WantedBy=multi-user.target

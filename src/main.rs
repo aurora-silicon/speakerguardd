@@ -58,6 +58,9 @@ struct Args {
     state: Option<PathBuf>,
     persist: Option<PathBuf>,
     verbosity: Level,
+    /// Only answer whether this daemon protects the card (`--owns-card`).
+    owns_card: bool,
+    defer_to: Option<PathBuf>,
 }
 
 fn usage() -> ! {
@@ -72,6 +75,8 @@ fn usage() -> ! {
          --persist <FILE>                The last run's record for the next boot (default /var/lib/speakerguardd/state; empty: every boot starts latched)\n  \
          -v, --verbose                   More logging (repeatable)\n  \
          -q, --quiet                     Less logging\n  \
+         --owns-card                     Exit 0 if this daemon protects card -C (its profile exists and speakersafetyd has none), 1 if not; touches no device\n  \
+         --defer-to <DIR>                speakersafetyd's profile directory for --owns-card (default /usr/share/speakersafetyd; empty: none)\n  \
          -V, --version                   The version and source commit\n  \
          -h, --help                      This text"
     );
@@ -79,7 +84,7 @@ fn usage() -> ! {
 }
 
 fn parse_args() -> Args {
-    let mut args = Args { config_path: PathBuf::from("/usr/share/speakerguardd"), max_reduction: 20.0, card: None, card_wait: Duration::from_secs(30), state: Some(PathBuf::from("/run/speakerguardd/state")), persist: Some(PathBuf::from("/var/lib/speakerguardd/state")), verbosity: Level::Info };
+    let mut args = Args { config_path: PathBuf::from("/usr/share/speakerguardd"), max_reduction: 20.0, card: None, card_wait: Duration::from_secs(30), state: Some(PathBuf::from("/run/speakerguardd/state")), persist: Some(PathBuf::from("/var/lib/speakerguardd/state")), verbosity: Level::Info, owns_card: false, defer_to: Some(PathBuf::from("/usr/share/speakersafetyd")) };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -96,6 +101,11 @@ fn parse_args() -> Args {
             }
             "-m" | "--max-reduction" => {
                 args.max_reduction = it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage());
+            }
+            "--owns-card" => args.owns_card = true,
+            "--defer-to" => {
+                let v = it.next().unwrap_or_else(|| usage());
+                args.defer_to = if v.is_empty() { None } else { Some(PathBuf::from(v)) };
             }
             "-v" | "--verbose" => args.verbosity = Level::Debug,
             "-q" | "--quiet" => args.verbosity = Level::Warn,
@@ -410,7 +420,6 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     if unsafe { libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE) } != 0 {
         warn!("mlockall: {}; page faults can hold the daemon up", std::io::Error::last_os_error());
     }
-    // the model file is named after the card: AppleJ700 -> apple/j700.conf
     // Discovery only: no controls are locked or written until it succeeds,
     // the configuration is loaded and Guard::start takes the interlock.
     let mut waiting = false;
@@ -425,8 +434,8 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         result
     })?;
     drop(ctl);
-    let model = name.strip_prefix("Apple").unwrap_or(&name).to_lowercase();
-    let path = args.config_path.join("apple").join(format!("{model}.conf"));
+    // the model file is named after the card: AppleJ700 -> apple/j700.conf
+    let path = startup::profile_path(&args.config_path, &name);
     let cfg = Config::load(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     info!("{}: {} speakers, sense PCM {}, period {} frames", path.display(), cfg.speakers.len(), cfg.globals.sense_pcm, cfg.globals.period);
     let (card, card_name) = Card::open(Some(&name), &cfg)?;
@@ -466,6 +475,21 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 fn main() -> ExitCode {
     let args = parse_args();
     log::set_verbosity(args.verbosity);
+    if args.owns_card {
+        // the unit's start condition: 0 starts it, 1 skips it (systemd's
+        // ExecCondition), and no card is opened
+        let Some(card) = args.card.as_deref() else { usage() };
+        return match startup::owns_card(&args.config_path, args.defer_to.as_deref(), card) {
+            Ok(path) => {
+                info!("{card}: {}", path.display());
+                ExitCode::SUCCESS
+            }
+            Err(why) => {
+                info!("{why}; not starting");
+                ExitCode::from(1)
+            }
+        };
+    }
     match run(&args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
