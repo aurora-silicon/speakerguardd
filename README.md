@@ -259,6 +259,20 @@ The binary talks to the ALSA kernel interface directly (no alsa-lib).
 installs the binary, `conf/apple/*.conf`, the systemd unit and the udev
 rule that starts it when a supported card's sense PCM appears.
 
+The unit is a template, one instance per card, named by the ALSA card id
+(`speakerguardd@AppleJ700.service`).  The udev rule wants an instance for
+the sense PCM of every macaudio card; the instance's start condition
+(`speakerguardd -C <id> --owns-card`) runs it only where this package ships
+the card's profile (`apple/j700.conf` for `AppleJ700`) and speakersafetyd
+ships none (`--defer-to`, default `/usr/share/speakersafetyd`; a package
+that installs speakersafetyd's profiles elsewhere passes that directory).
+Every other card is skipped without being opened: speakersafetyd keeps
+the cards it describes, and a card neither daemon describes keeps its
+speakers at the kernel's safe level.  Adding a machine is adding its
+profile.  Drop-ins for the unit go in `speakerguardd@.service.d/`.  The
+state paths (`-s`, `--persist`) are per machine, not per card: one card
+per machine has a profile.
+
 Keep the unit's `RuntimeDirectory=speakerguardd` and
 `RuntimeDirectoryPreserve=yes` when packaging: they give the daemon
 `/run/speakerguardd` for its model state and keep it across restarts.  A unit

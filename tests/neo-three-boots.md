@@ -11,7 +11,8 @@ Preserve the previous package, unit, overrides and their hashes in the
 controller's private evidence area for rollback. Preserve PR #2's protection
 changes and `Restart=on-failure`. Do not alter kernel lock controls, delete
 the model state, disable the daemon, or use an `ExecStartPre` workaround.
-If an overriding `/etc/systemd/system/speakerguardd.service` is present,
+If an overriding `/etc/systemd/system/speakerguardd@.service` or
+`speakerguardd@AppleJ700.service` is present,
 review it: replacing only the vendor unit may not change the effective unit.
 The patched binary defaults to the same 30-second wait with older units.
 

@@ -18,7 +18,7 @@ import shutil
 import subprocess
 import time
 
-UNIT = "speakerguardd.service"
+UNIT = "speakerguardd@AppleJ700.service"
 PROPERTIES = (
     "ActiveState", "SubState", "Result", "NRestarts", "MainPID", "InvocationID",
     "ExecMainStatus", "ExecMainStartTimestampMonotonic", "FragmentPath", "DropInPaths",
@@ -131,7 +131,7 @@ def collect(args):
         allowed = ("MESSAGE", "__MONOTONIC_TIMESTAMP", "_COMM", "_SYSTEMD_INVOCATION_ID")
         record["journal"] = [{k: j[k] for k in allowed if k in j}
                              for j in map(json.loads, text.splitlines())]
-        paths = ("/usr/bin/speakerguardd", "/usr/lib/systemd/system/speakerguardd.service",
+        paths = ("/usr/bin/speakerguardd", "/usr/lib/systemd/system/speakerguardd@.service",
                  "/usr/lib/udev/rules.d/95-speakerguardd.rules")
         effective = record["snapshots"][-1].get("FragmentPath")
         if effective and effective not in paths:

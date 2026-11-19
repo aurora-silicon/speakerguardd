@@ -4,6 +4,9 @@ GOTO="speakerguardd_end"
 LABEL="speakerguardd_macaudio"
 KERNEL=="pcmC*D2c", ATTRS{id}=="AppleJ*", ENV{ACP_IGNORE}="1"
 
-KERNEL=="pcmC*D2c", ATTRS{id}=="AppleJ700", TAG+="systemd", ENV{SYSTEMD_WANTS}="speakerguardd.service"
+# Every macaudio card's sense PCM wants the card's instance
+# (speakerguardd@AppleJ700.service); the unit's start condition runs it only
+# for a card this daemon has a profile for and speakersafetyd has none.
+KERNEL=="pcmC*D2c", ATTRS{id}=="?*", TAG+="systemd", ENV{SYSTEMD_WANTS}+="speakerguardd@$attr{id}.service"
 
 LABEL="speakerguardd_end"

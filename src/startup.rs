@@ -2,6 +2,7 @@
 //! Bounded card discovery, before any speaker interlock operation.
 
 use std::io;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const POLL: Duration = Duration::from_millis(100);
@@ -61,6 +62,36 @@ pub fn macaudio_card(cards: &str) -> Option<String> {
         let driver = rest.strip_prefix(':')?.split(" - ").next()?.trim();
         (driver == "macaudio").then(|| id.trim().to_string())
     })
+}
+
+/// The profile file a card id names: Apple's ADT-derived "AppleJ<model>"
+/// to `apple/j<model>.conf` (AppleJ700 -> apple/j700.conf).
+pub fn profile_path(dir: &Path, card: &str) -> PathBuf {
+    let model = card.strip_prefix("Apple").unwrap_or(card).to_lowercase();
+    dir.join("apple").join(format!("{model}.conf"))
+}
+
+/// Whether this daemon is the one to protect `card`'s speakers (the unit's
+/// start condition): it ships a profile for the card, and speakersafetyd
+/// (profiles under `defer_to`) does not.  A card speakersafetyd describes
+/// is left to it, so the udev rule can start the unit for every macaudio
+/// card without taking one over; a card neither describes keeps its
+/// speakers at the kernel's safe level.  Err carries why not.
+pub fn owns_card(dir: &Path, defer_to: Option<&Path>, card: &str) -> Result<PathBuf, String> {
+    let ours = profile_path(dir, card);
+    if !ours.is_file() {
+        return Err(format!("{card}: no speakerguardd profile ({} absent)", ours.display()));
+    }
+    if let Some(other) = defer_to.map(|d| profile_path(d, card)) {
+        // anything there but a clear absence (a file, or one we cannot
+        // check) leaves the card to speakersafetyd
+        match std::fs::symlink_metadata(&other) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Ok(_) => return Err(format!("{card}: speakersafetyd has a profile ({}); leaving the card to it", other.display())),
+            Err(e) => return Err(format!("{card}: {}: {e}; leaving the card to speakersafetyd", other.display())),
+        }
+    }
+    Ok(ours)
 }
 
 #[cfg(test)]
@@ -225,6 +256,56 @@ mod tests {
         .is_err());
         assert_eq!(probes, 2);
         assert_eq!(clock.sleeps, vec![POLL]);
+    }
+
+    fn tree(files: &[&str]) -> PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!("sg-owns-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+        let _ = std::fs::remove_dir_all(&root);
+        for f in files {
+            let p = root.join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, "").unwrap();
+        }
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn profile_follows_the_card_id() {
+        let d = Path::new("/usr/share/speakerguardd");
+        assert_eq!(profile_path(d, "AppleJ700"), d.join("apple/j700.conf"));
+        assert_eq!(profile_path(d, "AppleJ616"), d.join("apple/j616.conf"));
+        assert_eq!(profile_path(d, "AppleJack"), d.join("apple/jack.conf"));
+    }
+
+    /// The J700 starts as before: our profile, none of speakersafetyd's.
+    #[test]
+    fn the_j700_is_ours() {
+        let root = tree(&["sg/apple/j700.conf", "ss/apple/j316.conf", "ss/apple/j616.conf"]);
+        let (sg, ss) = (root.join("sg"), root.join("ss"));
+        assert_eq!(owns_card(&sg, Some(&ss), "AppleJ700").unwrap(), sg.join("apple/j700.conf"));
+        assert!(owns_card(&sg, None, "AppleJ700").is_ok());
+        // no speakersafetyd installed at all
+        assert!(owns_card(&sg, Some(&root.join("absent")), "AppleJ700").is_ok());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Cards without a profile here (the other Macs, the J616s jack card)
+    /// and cards speakersafetyd describes are not started.
+    #[test]
+    fn other_cards_are_left_alone() {
+        let root = tree(&["sg/apple/j700.conf", "sg/apple/j413.conf", "ss/apple/j413.conf", "ss/apple/j316.conf"]);
+        let (sg, ss) = (root.join("sg"), root.join("ss"));
+        assert!(owns_card(&sg, Some(&ss), "AppleJ316").unwrap_err().contains("no speakerguardd profile"));
+        assert!(owns_card(&sg, Some(&ss), "AppleJack").unwrap_err().contains("no speakerguardd profile"));
+        // both describe it: speakersafetyd keeps it
+        assert!(owns_card(&sg, Some(&ss), "AppleJ413").unwrap_err().contains("speakersafetyd has a profile"));
+        // a profile that is a directory is not a profile
+        std::fs::create_dir_all(sg.join("apple/j999.conf")).unwrap();
+        assert!(owns_card(&sg, Some(&ss), "AppleJ999").is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
