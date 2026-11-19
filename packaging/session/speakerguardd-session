@@ -34,7 +34,15 @@ It runs in the user's session, beside PipeWire, and does three things:
    while the amps are unlinked) and a fresh report; this helper links the
    amps only once the kernel reads granted; the amps' sink then starts. On
    any withdrawal it unlinks the amps, the sink stops and closes, and the
-   sequence starts again. While the speakers are wanted (`play=1`, and one
+   sequence starts again. The unlink goes through one PipeWire connection
+   the helper keeps open (a `pw-cli` reading commands from a pipe), so it
+   is a single request on a live connection. A `pw-link -d` per link is a
+   new client each time, and after a WirePlumber restart its handshake
+   queued behind the new WirePlumber's burst: the links outlived the
+   withdrawal by about 400 ms, and the graph's restart tried to start the
+   still-linked amps' sink without a grant every 55 ms until they went
+   (speakerguardd#86, J413). `pw-link -d` remains the fallback, and a link
+   still there after UNLINK_RETRY_S is removed that way. While the speakers are wanted (`play=1`, and one
    report beyond) it also links the protect stage's output to the hold, a
    sink with no device: that keeps the stage running when a short stream
    ends before the grant (its first frames are still held for the amps) and
@@ -106,6 +114,9 @@ SELFCHECK_ACTIVE = "/run/speakerguardd-selfcheck/active"
 # and the sense are unlinked and suspended (their PCMs close) before the
 # supervisor stops, and stay so until the resume clears it.
 SLEEP_HOLD = "/run/speakerguardd-sleep/hold"
+# A link the persistent connection was asked to remove and that is still
+# in the graph after this long is removed again with pw-link -d.
+UNLINK_RETRY_S = 0.5
 # The voicing sink's channel volume on a first start with nothing stored:
 # 30 % on a cubic desktop slider (0.3 ** 3).
 FIRST_START_VOLUME = 0.027
@@ -181,6 +192,60 @@ class Card:
         if os.path.exists(SELFCHECK_ACTIVE) or os.path.exists(SLEEP_HOLD):
             return False
         return struct.unpack_from("q", buf, 72)[0] == 1
+
+
+class PwCli:
+    """One PipeWire connection kept open for the withdrawal's unlinks: a
+    `pw-cli` reading commands from a pipe. Writes never block (a full pipe
+    or a dead pw-cli reports failure, and the caller falls back to
+    pw-link -d); a dead pw-cli is started again on the next use."""
+
+    def __init__(self, argv=("pw-cli",)):
+        self.argv = list(argv)
+        self.proc = None
+        # a failed start is tried again at most once a second
+        self.next_start = 0.0
+
+    def _start(self):
+        if time.monotonic() < self.next_start:
+            return
+        try:
+            self.proc = subprocess.Popen(
+                self.argv, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            os.set_blocking(self.proc.stdin.fileno(), False)
+        except (OSError, AttributeError, ValueError):
+            self.proc = None
+            self.next_start = time.monotonic() + 1.0
+
+    def ensure(self):
+        """Have the connection up before it is needed: a pw-cli started
+        only at the withdrawal would make its own handshake behind a busy
+        daemon, which is what it is there to avoid."""
+        if self.proc is None or self.proc.poll() is not None:
+            self._start()
+
+    def send(self, line):
+        """Queue one command; True if it was written whole."""
+        if self.proc is None or self.proc.poll() is not None:
+            self._start()
+        if self.proc is None:
+            return False
+        data = (line + "\n").encode()
+        try:
+            return os.write(self.proc.stdin.fileno(), data) == len(data)
+        except (BlockingIOError, BrokenPipeError, OSError):
+            self.close()
+            return False
+
+    def close(self):
+        if self.proc is not None:
+            try:
+                self.proc.kill()
+                self.proc.wait(1)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        self.proc = None
 
 
 class Graph:
@@ -369,6 +434,10 @@ class Session:
         self.last_suspend = -10.0
         self.last_unity = -10.0
         self.pending = {}
+        # the persistent connection for unlinks, and when each link was
+        # last asked to go through it
+        self.cli = PwCli()
+        self.unlink_sent = {}
         # when a client stream last ran into the protect stage
         self.last_play = None
         # when the speakers stopped being wanted
@@ -621,11 +690,31 @@ class Session:
             return
         self.pending[key] = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
+    def _unlink(self, lid):
+        """Remove link `lid` now: through the persistent connection, or with
+        pw-link -d if that fails or the link outlived UNLINK_RETRY_S."""
+        now = time.monotonic()
+        sent = self.unlink_sent.get(lid)
+        if self.cli is None:
+            pass
+        elif sent is None:
+            self.unlink_sent[lid] = now
+            if self.cli.send(f"destroy {lid}"):
+                return
+        elif now - sent < UNLINK_RETRY_S:
+            return
+        self._spawn(("unlink", lid), ["pw-link", "-d", str(lid)])
+
     def unlink_all(self, g, timeout):
         """Take the amps, the sense and the hold out of the graph and wait
         for it, at most `timeout` seconds in all, so a stopping helper leaves
         nothing linked and never hangs shutdown."""
         deadline = time.monotonic() + timeout
+        # pw-link -d, waited for: the persistent connection goes with this
+        # process
+        if self.cli is not None:
+            self.cli.close()
+            self.cli = None
         self.reconcile(g, False)
         self.keep_hold(g, False)
         for p in list(self.pending.values()):
@@ -642,6 +731,10 @@ class Session:
 
     def reconcile(self, g, granted, play=True):
         self._reap()
+        # forget unlinks of links that are gone
+        if self.unlink_sent:
+            present = {lid for lid, _, _ in g.links()}
+            self.unlink_sent = {k: v for k, v in self.unlink_sent.items() if k in present}
         want = self.wanted(g)
         have = {(o, i): lid for lid, o, i in g.links()}
         if granted and play and want:
@@ -665,7 +758,7 @@ class Session:
             for lid, o, i in g.links():
                 if spk in (owners.get(i), owners.get(o)) or (sense is not None and owners.get(o) == sense):
                     linked = True
-                    self._spawn(("unlink", lid), ["pw-link", "-d", str(lid)])
+                    self._unlink(lid)
             if (os.path.exists(SLEEP_HOLD) or not play) and not linked:
                 self.suspend_for_sleep(g, (spk, sense))
 
@@ -836,6 +929,7 @@ def main():
         raise SystemExit(0)
 
     realtime()
+    s.cli.ensure()
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     last = (None, None, None, None, None)
@@ -878,6 +972,8 @@ def main():
             nxt = time.monotonic() + period
         s.pin_amps_unity(g)
         s.keep_voicing_volume(g, now)
+        if s.cli is not None:
+            s.cli.ensure()
         was_granted = granted
         state = (granted, links, carrier, wrote, play)
         if state != last:

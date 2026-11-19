@@ -752,6 +752,8 @@ class Sleep(Base):
         s = ses.Session("j413", {"card": "AppleJ413", "amps": 4, "sense": 8})
         spawned = []
         s._spawn = lambda key, argv: spawned.append(argv)
+        # unlinks as pw-link -d (no persistent connection here)
+        s.cli = None
         os.makedirs(self.p.sleep, exist_ok=True)
         hold = self.p.hold
         ses.SLEEP_HOLD = hold

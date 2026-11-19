@@ -96,7 +96,11 @@ def build(m="j316", carrier=UNITY, linked=True):
             g.link(p["pout"][i], p["spk"][i])
         for i in range(sense):
             g.link(p["sense"][i], p["pin"][amps + i])
-    return g, p, sgs.Session(m, c)
+    s = sgs.Session(m, c)
+    # no persistent connection in the synthetic graphs: the unlinks are
+    # pw-link -d (FastUnlink tests the connection)
+    s.cli = None
+    return g, p, s
 
 
 class Checks(unittest.TestCase):
@@ -381,6 +385,111 @@ class Stop(unittest.TestCase):
         # bounded: a pw-link that does not finish is killed, not waited for
         self.assertLess(took, 1.0)
         self.assertEqual(s.pending, {})
+
+
+class FastUnlink(unittest.TestCase):
+    """A withdrawal's unlinks go through one persistent PipeWire connection,
+    not a pw-link client per link (speakerguardd#86)."""
+
+    class Cli:
+        def __init__(self, ok=True):
+            self.lines, self.ok = [], ok
+
+        def send(self, line):
+            self.lines.append(line)
+            return self.ok
+
+        def close(self):
+            pass
+
+    def withdrawn(self, ok=True):
+        g, p, s = build("j316")
+        c = MACHINES["j316"]
+        s.cli = self.Cli(ok)
+        ran = []
+
+        class P:
+            def __init__(self, argv):
+                ran.append(argv)
+
+            def poll(self):
+                return None
+
+        orig = sgs.subprocess.Popen
+        sgs.subprocess.Popen = lambda argv, **kw: P(argv)
+        self.addCleanup(setattr, sgs.subprocess, "Popen", orig)
+        return g, s, c, ran
+
+    def test_a_withdrawal_destroys_every_amp_and_sense_link_through_the_connection(self):
+        g, s, c, ran = self.withdrawn()
+        s.reconcile(g, False)
+        self.assertEqual(len(s.cli.lines), c["amps"] + c["sense"], s.cli.lines)
+        self.assertTrue(all(line.startswith("destroy ") for line in s.cli.lines))
+        self.assertEqual(ran, [], "no pw-link client when the connection took it")
+        # asked once: the next period does not ask again
+        s.reconcile(g, False)
+        self.assertEqual(len(s.cli.lines), c["amps"] + c["sense"])
+        self.assertEqual(ran, [])
+
+    def test_a_link_that_outlives_the_retry_bound_goes_with_pw_link(self):
+        g, s, c, ran = self.withdrawn()
+        s.reconcile(g, False)
+        for k in s.unlink_sent:
+            s.unlink_sent[k] -= sgs.UNLINK_RETRY_S
+        s.reconcile(g, False)
+        self.assertEqual(len(ran), c["amps"] + c["sense"])
+        self.assertTrue(all(a[:2] == ["pw-link", "-d"] for a in ran), ran)
+
+    def test_a_failed_write_falls_back_to_pw_link_at_once(self):
+        g, s, c, ran = self.withdrawn(ok=False)
+        s.reconcile(g, False)
+        self.assertEqual(len(ran), c["amps"] + c["sense"])
+        self.assertTrue(all(a[:2] == ["pw-link", "-d"] for a in ran), ran)
+
+    def test_links_that_are_gone_are_forgotten(self):
+        g, s, c, ran = self.withdrawn()
+        s.reconcile(g, False)
+        for lid in list(s.unlink_sent):
+            del g.objs[lid]
+        s.reconcile(g, False)
+        self.assertEqual(s.unlink_sent, {})
+
+    def test_the_connection_writes_whole_lines_and_restarts_a_dead_one(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "out")
+            cli = sgs.PwCli(["sh", "-c", f"cat >> {out}"])
+            self.assertTrue(cli.send("destroy 41"))
+            import time
+
+            for _ in range(500):
+                if os.path.exists(out) and open(out).read():
+                    break
+                time.sleep(0.01)
+            # a dead connection is started again (a command it had not read
+            # is lost; UNLINK_RETRY_S covers that)
+            cli.proc.kill()
+            cli.proc.wait()
+            self.assertTrue(cli.send("destroy 42"))
+            cli.proc.stdin.close()
+            cli.proc.wait(5)
+            self.assertEqual(open(out).read(), "destroy 41\ndestroy 42\n")
+        self.assertFalse(sgs.PwCli(["/nonexistent/pw-cli"]).send("destroy 1"))
+
+    def test_the_connection_is_opened_before_it_is_needed(self):
+        cli = sgs.PwCli(["sleep", "30"])
+        self.assertIsNone(cli.proc)
+        cli.ensure()
+        self.assertIsNotNone(cli.proc)
+        first = cli.proc
+        cli.ensure()
+        self.assertIs(cli.proc, first, "a live connection is kept")
+        first.kill()
+        first.wait()
+        cli.ensure()
+        self.assertIsNot(cli.proc, first, "a dead one is started again")
+        cli.close()
 
 
 class Idle(unittest.TestCase):
