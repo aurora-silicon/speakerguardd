@@ -771,6 +771,22 @@ class AopAndJ700(unittest.TestCase):
         self.assertEqual([s["kind"] for s in w["sense"]], ["I", "V"] * 6)
         self.assertEqual(w["sense_ports"], [1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10])
 
+    def test_j815_t8142_derives_vi_and_the_tweeters_in_the_middle(self):
+        # the J815's own derivation, as its silent self-check proved it on the Mac
+        f = fx("j815")
+        w = wiring.derive(f["hw"], f["tuning"])
+        self.assertEqual(
+            [a["prefix"] for a in w["amps"]],
+            ["Left Woofer 1", "Right Woofer 1", "Left Tweeter", "Right Tweeter", "Left Woofer 2", "Right Woofer 2"],
+        )
+        self.assertEqual(w["unit_channels"], [0, 1, 2, 3, 4, 5])
+        # each amp is [V, I] on the sense PCM (vmon slot below imon)
+        self.assertEqual([s["kind"] for s in w["sense"]], ["V", "I"] * 6)
+        self.assertEqual(w["sense_ports"], list(range(12)))
+        self.assertEqual(w["hash"], "725f518662e42388")
+        c = gen.machine("j815")[0]
+        self.assertEqual((c["card"], c["transport"], c["plugin"], c["speaker_irq"]), ("AppleJ815", "aop-dma", "6ch-vi", False))
+
     def test_j700_stereo_pair_from_one_node(self):
         f = fx("j700")
         w = wiring.derive(f["hw"], f["tuning"])
