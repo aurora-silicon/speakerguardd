@@ -596,10 +596,13 @@ def fake_dt(root, hw, jack_card=False):
         f.write(strs(*hw["compatible"]))
     bes = {}
 
-    def backend(compat):
-        key = tuple(compat)
+    def backend(compat, names=None):
+        key = (tuple(compat), tuple(names) if names is not None else None)
         if key not in bes:
-            bes[key] = node(f"soc/backend{len(bes)}", {"#sound-dai-cells": u32(1), "compatible": strs(*compat)})
+            props = {"#sound-dai-cells": u32(1), "compatible": strs(*compat)}
+            if names is not None:
+                props["dma-names"] = strs(*names)
+            bes[key] = node(f"soc/backend{len(bes)}", props)
         return bes[key]
 
     def card(name, links, model, compat):
@@ -608,7 +611,8 @@ def fake_dt(root, hw, jack_card=False):
             d = f"{name}/dai-link@{i}"
             node(d, {"link-name": strs(l["name"])})
             cpus = l.get("cpu_compatible") or [["apple,mca"]] * l["cpus"]
-            node(d + "/cpu", {"sound-dai": u32(*[w for b, c in enumerate(cpus) for w in (backend(c), b)])})
+            dmas = l.get("cpu_dma_names") or [None] * len(cpus)
+            node(d + "/cpu", {"sound-dai": u32(*[w for b, (c, n) in enumerate(zip(cpus, dmas)) for w in (backend(c, n), b)])})
             phs = []
             for c in l["codecs"]:
                 props = {"compatible": strs(*c["compatible"]), "#sound-dai-cells": u32(0)}
@@ -809,6 +813,125 @@ class AopAndJ700(unittest.TestCase):
                 sgsc.static(0, w, {})
         finally:
             sgsc.pcm_ids = saved
+
+
+def j773g(names=("spkr", "cout", "cin")):
+    """The M4 Mac mini (J773g) as its device tree describes it: one
+    SN012776 behind the T8132 AOP, whose speaker back-end names a TX channel
+    and no sense (its ADT audio-speaker is TX only), and the J473's atsp
+    mono tuning. names=None: a back-end without dma-names."""
+    f = fx("j473")
+    h = f["hw"]
+    h.update(board="j773g", compatible=["apple,j773g", "apple,t8132", "apple,arm-platform"],
+             sound_compatible=["apple,j773g-macaudio", "apple,macaudio"], model="Mac mini J773g")
+    link = next(l for l in h["links"] if l["name"] == "Speaker")
+    link["cpu_compatible"] = [["apple,t8132-aop-audio", "apple,t6041-aop-audio"]]
+    link["cpu_dma_names"] = [list(names) if names is not None else None]
+    return f
+
+
+class NoSensePath(unittest.TestCase):
+    """A sense-capable amp family on a speaker transport that carries no
+    V/I sense (the J773g's AOP): proven like a family without sense, for
+    one amp only."""
+
+    def test_j773g_derives_without_sense(self):
+        f = j773g()
+        w = wiring.derive(f["hw"], f["tuning"])
+        c = wiring.describe(f["hw"], w)
+        self.assertTrue(w["no_sense_path"])
+        self.assertEqual((w["family"], w["unit_kind"], w["unit_channels"], w["sense"]), ("sn012776", "atsp", [0], []))
+        self.assertEqual((c["plugin"], c["sense"]), ("1ch", 0))
+        self.assertEqual(sgsc.method_of(w), "derived-nosense")
+        # the wiring the J773g's self-check recorded on the Mac
+        self.assertEqual(w["hash"], "d1d62e8a0aaaef3d")
+
+    def test_a_named_sense_channel_keeps_sense(self):
+        for names in (("dma", "spkr", "sense", "cout", "cin"), ("spkr", "sense")):
+            f = j773g(names)
+            w = wiring.derive(f["hw"], f["tuning"])
+            self.assertFalse(w["no_sense_path"], names)
+            self.assertEqual(len(w["sense"]), 2, names)
+            self.assertEqual(sgsc.method_of(w), "derived", names)
+            self.assertNotEqual(w["hash"], "d1d62e8a0aaaef3d", names)
+
+    def test_missing_or_partial_dma_names_keep_sense(self):
+        # no dma-names, a record from before they were read, or a node that
+        # does not name its speaker channel (the base T8132 node: "dma")
+        for names in (None, ("dma",), ()):
+            f = j773g(names)
+            self.assertTrue(wiring.transport_senses(f["hw"]), names)
+            w = wiring.derive(f["hw"], f["tuning"])
+            self.assertEqual((w["no_sense_path"], len(w["sense"])), (False, 2), names)
+        f = j773g()
+        next(l for l in f["hw"]["links"] if l["name"] == "Speaker").pop("cpu_dma_names")
+        self.assertTrue(wiring.transport_senses(f["hw"]))
+        self.assertFalse(wiring.derive(f["hw"], f["tuning"])["no_sense_path"])
+
+    def test_other_transports_are_unaffected(self):
+        # a back-end whose transport has no sense channel name keeps its family's sense
+        for m in ("j316", "j473", "j616", "j815"):
+            f = fx(m)
+            link = next(l for l in f["hw"]["links"] if l["name"] in ("Speaker", "Speakers"))
+            link["cpu_dma_names"] = [["tx"]] * link["cpus"]
+            if m == "j616":
+                continue  # an aop-spkr back-end: see test_several_amps_without_sense_are_refused
+            self.assertTrue(wiring.transport_senses(f["hw"]), m)
+        # J616s keeps its hash with or without the recorded names
+        f = fx("j616")
+        before = wiring.derive(f["hw"], f["tuning"])["hash"]
+        f["hw"]["links"][0]["cpu_dma_names"] = [["dma", "spkr", "sense", "cout", "cin"]]
+        self.assertEqual(wiring.derive(f["hw"], f["tuning"])["hash"], before)
+        self.assertEqual(before, "164e7a0d23003bab")
+
+    def test_sense_units_are_refused(self):
+        f = j773g()
+        f["tuning"]["tuning"]["protection"]["kind"] = "spp3"
+        with self.assertRaises(wiring.Refused) as cm:
+            wiring.derive(f["hw"], f["tuning"])
+        self.assertIn("carries none", str(cm.exception))
+        f = j773g()
+        t = f["tuning"]["tuning"]
+        t["protection"]["kind"] = "lsm2"
+        t["lsid"] = {"adaptation_enabled": False, "source_port": "synthetic-sense", "source_lanes": [0, 1],
+                     "delay_frames": [0, 0]}
+        with self.assertRaises(wiring.Refused) as cm:
+            wiring.derive(f["hw"], f["tuning"])
+        self.assertIn("V/I sense", str(cm.exception))
+
+    def test_several_amps_without_sense_are_refused(self):
+        # A multi-amp Mac whose device tree lost its sense channel (plain
+        # lsm2, no LSID): its channel order would rest on the device tree
+        # alone, so it fails rather than runs unproven.
+        f = fx("j616")
+        f["hw"]["links"][0]["cpu_dma_names"] = [["dma", "spkr", "cout", "cin"]]
+        f["tuning"]["tuning"]["protection"]["kind"] = "lsm2"
+        self.assertFalse(wiring.transport_senses(f["hw"]))
+        with self.assertRaises(wiring.Refused) as cm:
+            wiring.derive(f["hw"], f["tuning"])
+        self.assertIn("one amp only", str(cm.exception))
+
+    def test_static_report_names_the_no_sense_case(self):
+        f = j773g()
+        w = wiring.derive(f["hw"], f["tuning"])
+        w["method"] = sgsc.method_of(w)
+        report = {}
+        with mock.patch.object(sgsc, "pcm_ids", return_value={("Secondary", "p"): 1}):
+            self.assertEqual(sgsc.static(None, w, report), [])
+        self.assertIn("no V/I sense", report["static"])
+        self.assertNotIn("SD_MODE", report["static"])
+
+    def test_read_dt_records_dma_names(self):
+        import tempfile
+
+        want = j773g()["hw"]
+        with tempfile.TemporaryDirectory() as d:
+            fake_dt(d, want, jack_card=False)
+            got = wiring.read_dt(d, sysfs=os.path.join(d, "nosysfs"))
+        link = next(l for l in got["links"] if l["name"] == "Speaker")
+        self.assertEqual(link["cpu_dma_names"], [["spkr", "cout", "cin"]])
+        self.assertFalse(wiring.transport_senses(got))
+        self.assertEqual(wiring.derive(got, j773g()["tuning"])["hash"], "d1d62e8a0aaaef3d")
 
 
 class NoHandMap(unittest.TestCase):

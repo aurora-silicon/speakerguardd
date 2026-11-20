@@ -123,7 +123,8 @@ TRANSPORTS = {
     # carries no V/I sense (the J773g's ADT audio-speaker has a TX channel
     # only) names none, and its amps' sense is not read (transport_senses).
     "apple,t6041-aop-audio": {"transport": "aop-spkr", "formats": ["S24_LE"], "sense_batch": False, "speaker_headroom": 256,
-                              "speaker_irq": True, "speaker_channels": 6, "sense_channels": 12, "sense_dma": "sense"},
+                              "speaker_irq": True, "speaker_channels": 6, "sense_channels": 12,
+                              "speaker_dma": "spkr", "sense_dma": "sense"},
     # sound/soc/apple/aop_t8140.rs: S32_LE playback, no sense
     "apple,t8140-aop-audio": {"transport": "aop-t8140", "formats": ["S32_LE"], "sense_batch": True, "speaker_headroom": 0,
                               "speaker_irq": True},
@@ -518,17 +519,19 @@ def tdm_slots(n_codecs, n_bes):
 def transport_senses(hw):
     """Whether the speaker link's transport carries the amps' V/I sense on
     this Mac. A transport whose sense is a named DMA channel ("sense_dma")
-    carries none when its back-end nodes name their channels without it.
-    A back-end with no dma-names, or a device-tree read from before they
-    were recorded, keeps the sense the amps' family offers. (transport()
-    refuses unknown or mixed back-ends; this only reads the ones it knows.)"""
+    carries none when its back-end nodes name their speaker channel
+    ("speaker_dma") and not that one. A back-end with no dma-names, one
+    that does not name its speaker channel either (a node not yet
+    described for this Mac), or a device-tree read from before they were
+    recorded, keeps the sense the amps' family offers. (transport() refuses
+    unknown or mixed back-ends; this only reads the ones it knows.)"""
     link = _speaker_link(hw)
     dmas = link.get("cpu_dma_names")
     if not dmas or any(d is None for d in dmas):
         return True
     for compat, names in zip(link.get("cpu_compatible") or [], dmas):
         t = next((TRANSPORTS[c] for c in compat if c in TRANSPORTS), None)
-        if t and t.get("sense_dma") and t["sense_dma"] not in names:
+        if t and t.get("sense_dma") and t.get("speaker_dma") in names and t["sense_dma"] not in names:
             return False
     return True
 
@@ -832,6 +835,15 @@ def derive(hw, dump, key=None):
     no_sense_path = any(a.get("no_sense_path") for a in amps)
     if no_sense_path and rl["kind"] in SENSE_UNITS:
         raise Refused(f"the tuning's {rl['kind']} protection reads V/I sense, and this Mac's speaker transport carries none")
+    # Without sense, nothing checks which amp plays which unit channel: one
+    # amp has no order to get wrong, several would rest on the device tree
+    # alone. A sense-capable Mac whose device tree lost its sense channel
+    # must fail here, not run unproven.
+    if no_sense_path and len(amps) != 1:
+        raise Refused(
+            f"this Mac's speaker transport carries no V/I sense, which is admitted for one amp only; "
+            f"the order of its {len(amps)} amps would rest on the device tree alone"
+        )
     units = rl["channels"]
     if len(units) != len(amps):
         raise Refused(f"the tuning's unit has {len(units)} channels, the board {len(amps)} amps")

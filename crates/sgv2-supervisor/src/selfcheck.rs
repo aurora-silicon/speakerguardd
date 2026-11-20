@@ -117,8 +117,9 @@ pub fn covers(bind: &Bind, board: &str, kernel: &str, params_sha256: &str) -> Re
 /// with it (`method=derived`, two sense channels an amp), unless the
 /// self-check found that this Mac's speaker transport carries no sense
 /// (`method=derived-nosense`, no sense: the J773g's AOP, whose device tree
-/// names no sense DMA). One without has nothing to prove silently
-/// (`method=derived-static`, no sense).
+/// names no sense DMA). That is admitted for one amp only: without sense
+/// nothing proves which of several amps plays which channel. One without
+/// has nothing to prove silently (`method=derived-static`, no sense).
 pub fn machine_for(board: &str, bind: &Bind) -> Result<&'static Machine, String> {
     if bind.board != board {
         return Err(format!("the self-check ran on {}, this Mac is {board}", bind.board));
@@ -130,7 +131,13 @@ pub fn machine_for(board: &str, bind: &Bind) -> Result<&'static Machine, String>
         return Err(format!("{board}: the self-check found no amps"));
     }
     let (method, sense) = match (amp.has_sense(), bind.method.as_str()) {
-        (true, "derived-nosense") => ("derived-nosense", 0),
+        (true, "derived-nosense") if bind.amps == 1 => ("derived-nosense", 0),
+        (true, "derived-nosense") => {
+            return Err(format!(
+                "{board}: {} amps were proven without V/I sense, which is admitted for one amp only",
+                bind.amps
+            ))
+        }
         (true, _) => ("derived", 2 * bind.amps),
         (false, _) => ("derived-static", 0),
     };
@@ -222,6 +229,9 @@ mod tests {
         let mono = Bind { amps: 1, sense: 0, method: "derived-nosense".into(), ..new.clone() };
         assert_eq!(machine_for("j999", &mono).unwrap().amp, Amp::Sn012776);
         assert!(machine_for("j999", &Bind { sense: 2, ..mono.clone() }).is_err());
-        assert!(machine_for("j999", &Bind { method: "derived-static".into(), ..mono }).is_err());
+        assert!(machine_for("j999", &Bind { method: "derived-static".into(), ..mono.clone() }).is_err());
+        // several sense amps without sense: their order would be unproven
+        let several = machine_for("j999", &Bind { amps: 4, ..mono }).unwrap_err();
+        assert!(several.contains("one amp only"), "{several}");
     }
 }
