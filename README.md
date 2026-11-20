@@ -14,18 +14,19 @@ play; if the daemon stops for any reason, the card locks the volume again
 within 250 ms.  The configuration files use the same keys, so a speaker
 description reads the same way in both projects.
 
-`[Globals]` may set `sense_format = S16_LE` for a card whose sense PCM offers
-only 16-bit samples (the MacBook Pro 14-inch with M5 Max does); the default is
-`S32_LE`.  S16 words are shifted to the top of a 32-bit word, so `vs_scale`
-still means volts at full scale in both.
+The sense PCM's word width is negotiated at open: the daemon offers S32_LE
+and S16_LE and keeps whichever the card accepts, preferring S32_LE.  S16
+words are shifted to the top of a 32-bit word, so `vs_scale` still means
+volts at full scale in both.
 
-`period` must also fit the sense PCM's own limit, or the open fails with
-EINVAL: that PCM caps one period at 65520 bytes, which is 2730 frames of 12
-channels at S16, so the M5 Max config uses 2048.
+`period` is a request, not a demand: the open clamps it to the sense PCM's
+own limit.  That PCM caps one period at 65520 bytes - 2730 frames of 12
+channels at S16 - so the MacBook Pro 14-inch with M5 Max runs 2730-frame
+periods from the default 4096 with no per-machine setting.
 
 ### How it works
 
-Every period (4096 frames by default; `period` sets it) the sense words of each channel are scaled to the
+Every period (4096 frames by default, clamped to what the sense PCM accepts) the sense words of each channel are scaled to the
 amplifier's output voltage (`vs_scale` volts at full scale) and squared into
 the power in the coil (`z_nominal`).  That power drives a two-stage lumped
 thermal model - voice coil into magnet (`tr_coil` K/W, `tau_coil` s), magnet

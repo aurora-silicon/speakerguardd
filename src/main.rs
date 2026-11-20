@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use alsa::{Capture, Ctl, ElemId};
+use alsa::{Capture, Ctl, ElemId, SenseFormat};
 use config::{Config, Globals};
 use guard::{Guard, Hw};
 use log::Level;
@@ -236,6 +236,8 @@ struct RealHw {
     card: Card,
     globals: Globals,
     capture: Option<Capture>,
+    /// The period and word width the sense PCM accepted at open.
+    sense: Option<(usize, SenseFormat)>,
     /// How long its calls hold the daemon up (summarised to the journal).
     stats: stats::Stats,
 }
@@ -305,9 +307,13 @@ impl Hw for RealHw {
     }
     fn open_sense(&mut self, rate: u32) -> std::io::Result<()> {
         let g = self.globals.clone();
-        let c = self.timed(stats::Call::Open, |h| Capture::open(h.card.ctl.card, g.sense_pcm, g.channels, rate, g.period, g.sense_format))?;
+        let c = self.timed(stats::Call::Open, |h| Capture::open(h.card.ctl.card, g.sense_pcm, g.channels, rate, g.period))?;
+        self.sense = Some((c.period, c.format()));
         self.capture = Some(c);
         Ok(())
+    }
+    fn sense_negotiated(&mut self) -> Option<(usize, SenseFormat)> {
+        self.sense
     }
     fn close_sense(&mut self) {
         self.capture = None;
@@ -430,7 +436,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let cfg = Config::load(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     info!("{}: {} speakers, sense PCM {}, period {} frames", path.display(), cfg.speakers.len(), cfg.globals.sense_pcm, cfg.globals.period);
     let (card, card_name) = Card::open(Some(&name), &cfg)?;
-    let mut hw = RealHw { card, globals: cfg.globals.clone(), capture: None, stats: stats::Stats::new(Instant::now()) };
+    let mut hw = RealHw { card, globals: cfg.globals.clone(), capture: None, sense: None, stats: stats::Stats::new(Instant::now()) };
     catch_stop_signals();
     let mut guard = Guard::start_persist(&mut hw, &cfg, args.max_reduction, args.state.clone(), args.persist.clone())?;
     info!("{card_name}: {} volume control(s) and the unlock control locked", hw.card.volume.len());

@@ -71,6 +71,7 @@ use std::io;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use crate::alsa::SenseFormat;
 use crate::config::{Config, Globals};
 use crate::model::{self, SpeakerState, SUB_BLOCKS};
 use crate::state;
@@ -174,6 +175,12 @@ pub trait Hw {
     /// The speakers' sample rate, 0 while they are closed.
     fn sample_rate(&mut self) -> io::Result<i64>;
     fn open_sense(&mut self, rate: u32) -> io::Result<()>;
+    /// The period and word width the card accepted at open, when the
+    /// implementation negotiates them.  None leaves the config values
+    /// standing (every mock and the fixed-geometry impls).
+    fn sense_negotiated(&mut self) -> Option<(usize, SenseFormat)> {
+        None
+    }
     fn close_sense(&mut self);
     /// One sense period: `Some(true)` complete, `Some(false)` short or
     /// overrun, `None` nothing within one poll (at most 50 ms).
@@ -413,6 +420,9 @@ fn placement(before: Instant, after: Instant, queued: u64, rate: u32) -> (Instan
 
 pub struct Guard {
     globals: Globals,
+    /// Step between two sense words, in widened i32 units: 1.0 for the
+    /// S32_LE the config names, 65536.0 once a card negotiates S16_LE.
+    sense_quantum: f64,
     pub speakers: Vec<SpeakerState>,
     max_reduction: f64,
     /// True while the daemon renews the card's volume lock.
@@ -635,6 +645,7 @@ impl Guard {
         let mut g = Guard {
             words: vec![0i32; globals.period * globals.channels],
             globals,
+            sense_quantum: 1.0,
             speakers,
             max_reduction,
             armed: false,
@@ -1253,7 +1264,7 @@ impl Guard {
             }).collect()
         };
         for s in self.speakers.iter_mut() {
-            let (p, q) = s.frame_powers(all, ch, &possible, globals.sense_format.quantum());
+            let (p, q) = s.frame_powers(all, ch, &possible, self.sense_quantum);
             if p.iter().any(|x| !x.is_finite()) || q.iter().any(|x| !x.is_finite() || *x < 0.0) {
                 return Err("invalid speaker sense voltage or power".into());
             }
@@ -1439,6 +1450,15 @@ impl Guard {
             }
             match hw.open_sense(rate) {
                 Ok(()) => {
+                    if let Some((period, format)) = hw.sense_negotiated() {
+                        info!(
+                            "sense capture accepted {} frames per period, {} words",
+                            period,
+                            if format == SenseFormat::S16Le { "16-bit" } else { "32-bit" }
+                        );
+                        self.globals.period = period;
+                        self.sense_quantum = format.quantum();
+                    }
                     info!("speakers open at {rate} Hz, sense capture running");
                     self.stall = Some(StallClock::default());
                 }

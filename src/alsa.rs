@@ -393,11 +393,14 @@ pub enum SenseFormat {
 }
 
 impl SenseFormat {
-    pub fn parse(name: &str) -> Option<SenseFormat> {
-        match name {
-            "S32_LE" => Some(SenseFormat::S32Le),
-            "S16_LE" => Some(SenseFormat::S16Le),
-            _ => None,
+    /// The refined format mask keeps only the widths the card offers; take
+    /// S32_LE whenever the card left it in (prefer the wide word), else the
+    /// 16-bit word a K114c-class sense PCM is left with.
+    pub fn from_mask(bits: u32) -> SenseFormat {
+        if bits & (1 << FORMAT_S32_LE) != 0 {
+            SenseFormat::S32Le
+        } else {
+            SenseFormat::S16Le
         }
     }
 
@@ -425,8 +428,8 @@ pub fn widen_s16(src: &[i16], dst: &mut [i32]) {
     }
 }
 
-/// The hw_params request for the sense capture: one format, fixed geometry.
-fn sense_hw_params(format: SenseFormat, channels: usize, rate: u32, period: usize) -> HwParams {
+/// The hw_params skeleton the request and the applied form share.
+fn sense_params_skeleton() -> HwParams {
     // SAFETY: an all-ones/zeroed parameter block is the "unconstrained"
     // request the kernel refines.
     let mut hw: HwParams = unsafe { std::mem::zeroed() };
@@ -437,8 +440,32 @@ fn sense_hw_params(format: SenseFormat, channels: usize, rate: u32, period: usiz
         *i = Interval { min: 0, max: u32::MAX, flags: 0 };
     }
     hw.masks[PARAM_ACCESS].bits[0] = 1 << ACCESS_RW_INTERLEAVED;
-    hw.masks[PARAM_FORMAT].bits[0] = 1 << format.alsa();
     hw.masks[PARAM_SUBFORMAT].bits[0] = 1 << SUBFORMAT_STD;
+    hw.rmask = u32::MAX;
+    hw
+}
+
+/// The open-ended request: both word widths, the period as an upper bound.
+/// The kernel refines it to what the card accepts and the refined block
+/// names the format and the largest feasible period at or under the bound.
+fn sense_request(channels: usize, rate: u32, period: usize) -> HwParams {
+    let mut hw = sense_params_skeleton();
+    hw.masks[PARAM_FORMAT].bits[0] = (1 << FORMAT_S32_LE) | (1 << FORMAT_S16_LE);
+    let fixed = |i: &mut Interval, v: u32| {
+        *i = Interval { min: v, max: v, flags: INTERVAL_INTEGER };
+    };
+    fixed(&mut hw.intervals[PARAM_CHANNELS], channels as u32);
+    fixed(&mut hw.intervals[PARAM_RATE], rate);
+    hw.intervals[PARAM_PERIOD_SIZE] =
+        Interval { min: 1, max: period as u32, flags: INTERVAL_INTEGER };
+    fixed(&mut hw.intervals[PARAM_PERIODS], 4);
+    hw
+}
+
+/// The applied form: one format, fixed geometry, the period the card named.
+fn sense_hw_params(format: SenseFormat, channels: usize, rate: u32, period: usize) -> HwParams {
+    let mut hw = sense_params_skeleton();
+    hw.masks[PARAM_FORMAT].bits[0] = 1 << format.alsa();
     let fixed = |i: &mut Interval, v: u32| {
         *i = Interval { min: v, max: v, flags: INTERVAL_INTEGER };
     };
@@ -446,9 +473,9 @@ fn sense_hw_params(format: SenseFormat, channels: usize, rate: u32, period: usiz
     fixed(&mut hw.intervals[PARAM_RATE], rate);
     fixed(&mut hw.intervals[PARAM_PERIOD_SIZE], period as u32);
     fixed(&mut hw.intervals[PARAM_PERIODS], 4);
-    hw.rmask = u32::MAX;
     hw
 }
+
 const INTERVAL_INTEGER: u32 = 1 << 2;
 
 const PCM_IOCTL_HW_PARAMS: libc::c_ulong = iowr::<HwParams>(b'A', 0x11);
@@ -556,7 +583,13 @@ pub struct PeriodReader<P: PcmIo> {
 pub type Capture = PeriodReader<PcmFile>;
 
 impl Capture {
-    pub fn open(card: u32, device: u32, channels: usize, rate: u32, period: usize, format: SenseFormat) -> io::Result<Capture> {
+    /// The word width the card accepted at open: the model's quantum
+    /// follows it (the guard reads this through the Hw layer).
+    pub fn format(&self) -> SenseFormat {
+        self.io.format
+    }
+
+    pub fn open(card: u32, device: u32, channels: usize, rate: u32, period: usize) -> io::Result<Capture> {
         let path = format!("/dev/snd/pcmC{card}D{device}c");
         // A blocking open would wait, silently, for whoever holds the sense
         // PCM to let go, and the volume lock would time out meanwhile: ask
@@ -566,6 +599,14 @@ impl Capture {
             .write(true)
             .custom_flags(libc::O_NONBLOCK)
             .open(&path)?;
+        // The card decides: refine the both-widths request and read back the
+        // format it kept and the largest period at or under the request (a
+        // 65520-byte period cap makes that 2730 frames of 12 S16 channels).
+        // The refined values are then applied fixed, as libasound does.
+        let mut hw = sense_request(channels, rate, period);
+        ioctl(&file, PCM_IOCTL_HW_PARAMS, &mut hw)?;
+        let format = SenseFormat::from_mask(hw.masks[PARAM_FORMAT].bits[0]);
+        let period = hw.intervals[PARAM_PERIOD_SIZE].max as usize;
         let mut hw = sense_hw_params(format, channels, rate, period);
         ioctl(&file, PCM_IOCTL_HW_PARAMS, &mut hw)?;
 
@@ -694,18 +735,36 @@ mod tests {
         assert_eq!(std::mem::size_of::<Xferi>(), 24);
     }
 
-    /// The K114c's sense PCM offers S16_LE only; a request for S32_LE alone
-    /// fails with EINVAL there, so the daemon never pings and the card
-    /// relocks.  The request must carry exactly the configured format.
+    /// The open request offers both word widths and names the period as a
+    /// ceiling: the kernel refines it to what the card accepts (a 16-bit-only
+    /// sense PCM keeps S16_LE and its own period cap), so no config key and
+    /// no hand-set period is needed.
     #[test]
-    fn the_sense_request_names_only_the_configured_format() {
-        let hw = sense_hw_params(SenseFormat::S32Le, 12, 48000, 4096);
-        assert_eq!(hw.masks[PARAM_FORMAT].bits[0], 1 << 10);
-        let hw = sense_hw_params(SenseFormat::S16Le, 12, 48000, 4096);
-        assert_eq!(hw.masks[PARAM_FORMAT].bits[0], 1 << 2);
+    fn the_sense_request_offers_both_widths_and_clamps_the_period() {
+        let hw = sense_request(12, 48000, 4096);
+        assert_eq!(hw.masks[PARAM_FORMAT].bits[0], (1 << 10) | (1 << 2));
         assert_eq!((hw.intervals[PARAM_CHANNELS].min, hw.intervals[PARAM_CHANNELS].max), (12, 12));
         assert_eq!((hw.intervals[PARAM_RATE].min, hw.intervals[PARAM_RATE].max), (48000, 48000));
-        assert_eq!((hw.intervals[PARAM_PERIOD_SIZE].min, hw.intervals[PARAM_PERIOD_SIZE].max), (4096, 4096));
+        assert_eq!((hw.intervals[PARAM_PERIOD_SIZE].min, hw.intervals[PARAM_PERIOD_SIZE].max), (1, 4096));
+        assert_eq!(hw.intervals[PARAM_PERIOD_SIZE].flags, INTERVAL_INTEGER);
+    }
+
+    /// The refined mask decides: prefer S32_LE while the card offers it,
+    /// fall to the 16-bit word it narrows to otherwise.
+    #[test]
+    fn the_refined_format_mask_prefers_the_wide_word() {
+        assert_eq!(SenseFormat::from_mask((1 << 10) | (1 << 2)), SenseFormat::S32Le);
+        assert_eq!(SenseFormat::from_mask(1 << 2), SenseFormat::S16Le);
+    }
+
+    /// The applied params fix one format and the negotiated geometry.
+    #[test]
+    fn the_applied_params_fix_one_format_and_geometry() {
+        let hw = sense_hw_params(SenseFormat::S32Le, 12, 48000, 4096);
+        assert_eq!(hw.masks[PARAM_FORMAT].bits[0], 1 << 10);
+        let hw = sense_hw_params(SenseFormat::S16Le, 12, 48000, 2730);
+        assert_eq!(hw.masks[PARAM_FORMAT].bits[0], 1 << 2);
+        assert_eq!((hw.intervals[PARAM_PERIOD_SIZE].min, hw.intervals[PARAM_PERIOD_SIZE].max), (2730, 2730));
     }
 
     /// S16 words are shifted to the top of an i32 so that full scale is the
@@ -722,14 +781,6 @@ mod tests {
     fn a_format_names_its_quantization_step() {
         assert_eq!(SenseFormat::S32Le.quantum(), 1.0);
         assert_eq!(SenseFormat::S16Le.quantum(), 65536.0);
-    }
-
-    #[test]
-    fn format_names_parse() {
-        assert_eq!(SenseFormat::parse("S32_LE"), Some(SenseFormat::S32Le));
-        assert_eq!(SenseFormat::parse("S16_LE"), Some(SenseFormat::S16Le));
-        assert_eq!(SenseFormat::parse("s16"), None);
-        assert_eq!(SenseFormat::default(), SenseFormat::S32Le);
     }
 
     #[test]
