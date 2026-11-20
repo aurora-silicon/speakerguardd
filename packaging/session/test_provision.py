@@ -379,6 +379,71 @@ class Seat(Base):
             f.write("[Autologin]\nSession=plasma\nUser=chloe\n")
         self.assertEqual(prov.autologin_user(etc), "chloe")
 
+    def seat_change(self, is_enabled, show):
+        """seat0 changes to a regular user nobody provisioned (the first
+        login on a fresh install). `is_enabled` is `systemctl is-enabled`'s
+        exit status, `show` the unit's `systemctl show` properties. The
+        systemctl calls made, in order."""
+        calls = []
+
+        def run(cmd, **kw):
+            calls.append(cmd)
+            if cmd[1] == "is-enabled":
+                return prov.subprocess.CompletedProcess(cmd, is_enabled)
+            if cmd[1] == "show":
+                out = "".join(f"{k}={v}\n" for k, v in show.items())
+                return prov.subprocess.CompletedProcess(cmd, 0, out, "")
+            return prov.subprocess.CompletedProcess(cmd, 0)
+        self.patch(prov, "seat0_user", lambda rng: "alice")
+        self.patch(prov.subprocess, "run", run)
+        os.makedirs(self.p.state, exist_ok=True)
+        self.assertEqual(prov.cmd_seat(self.args("seat"), self.p), 0)
+        return calls
+
+    def restarted(self, calls):
+        return ["systemctl", "restart", "--no-block", "speakerguardd.service"] in calls
+
+    def test_seat_restarts_a_unit_the_package_wants_without_enabling_it(self):
+        # Arch (alarm-aurora): pacman applies no presets, so the package ships
+        # its multi-user.target.wants link in /usr/lib. `is-enabled` says
+        # "disabled", but multi-user.target starts the unit every boot: the
+        # first login must provision, not wait for the next boot.
+        calls = self.seat_change(1, {"LoadState": "loaded", "UnitFileState": "disabled",
+                                     "WantedBy": "multi-user.target", "RequiredBy": ""})
+        self.assertTrue(self.restarted(calls))
+
+    def test_seat_restarts_an_enabled_unit(self):
+        # Fedora (presets) and `systemctl enable`: the link is in /etc.
+        calls = self.seat_change(0, {})
+        self.assertTrue(self.restarted(calls))
+
+    def test_seat_leaves_a_unit_nothing_starts(self):
+        # Disabled by the administrator where the link was in /etc: nothing
+        # pulls the unit in, so nothing is provisioned.
+        calls = self.seat_change(1, {"LoadState": "loaded", "UnitFileState": "disabled",
+                                     "WantedBy": "", "RequiredBy": ""})
+        self.assertFalse(self.restarted(calls))
+
+    def test_seat_leaves_a_masked_unit(self):
+        # Masked over the package's own link (the only way to turn it off on
+        # Arch): the target still lists it, but it never starts.
+        for load, state in (("masked", "masked"), ("loaded", "masked-runtime")):
+            calls = self.seat_change(1, {"LoadState": load, "UnitFileState": state,
+                                         "WantedBy": "multi-user.target", "RequiredBy": ""})
+            self.assertFalse(self.restarted(calls))
+
+    def test_seat_leaves_a_unit_systemctl_cannot_show(self):
+        calls = []
+
+        def run(cmd, **kw):
+            calls.append(cmd)
+            return prov.subprocess.CompletedProcess(cmd, 1 if cmd[1] in ("is-enabled", "show") else 0, "", "")
+        self.patch(prov, "seat0_user", lambda rng: "alice")
+        self.patch(prov.subprocess, "run", run)
+        os.makedirs(self.p.state, exist_ok=True)
+        self.assertEqual(prov.cmd_seat(self.args("seat"), self.p), 0)
+        self.assertFalse(self.restarted(calls))
+
     def test_uid_range(self):
         f = os.path.join(self.t, "login.defs")
         with open(f, "w") as fh:
