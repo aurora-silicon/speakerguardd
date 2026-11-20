@@ -114,7 +114,7 @@ pub enum ToneShape {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ToneTarget {
     pub channel: usize,
-    /// First section occupied by the slot. Ignored for [`ToneShape::Gain`].
+    /// First section occupied by the slot (a gain slot's gain section).
     pub section: usize,
 }
 
@@ -386,7 +386,7 @@ impl Spec {
 fn shape_sections(shape: ToneShape, max_order: u32) -> usize {
     match shape {
         ToneShape::LowPass(n) | ToneShape::HighPass(n) => (n as usize).div_ceil(2),
-        ToneShape::Gain => 0,
+        ToneShape::Gain => 1,
         ToneShape::ButterworthShelf => super::tone::shelf_sections(max_order),
         ToneShape::ButterworthBandShelf => 2 * super::tone::shelf_sections(max_order),
         _ => 1,
@@ -430,6 +430,13 @@ fn automation_valid(a: &ToneAutomation, channels: &[Channel]) -> bool {
 
 fn interpolate(a: TonePoint, b: TonePoint, scalar: f64) -> (f64, f64) {
     let t = ((scalar - a.scalar) / (b.scalar - a.scalar)).clamp(0.0, 1.0);
+    // At a set point the slot takes that point's own saved values exactly.
+    if t == 0.0 {
+        return (a.gain_db, a.frequency_hz);
+    }
+    if t == 1.0 {
+        return (b.gain_db, b.frequency_hz);
+    }
     let gain = a.gain_db + t * (b.gain_db - a.gain_db);
     let frequency = libm::exp(libm::log(a.frequency_hz) + t * (libm::log(b.frequency_hz) - libm::log(a.frequency_hz)));
     (gain, frequency)
@@ -474,7 +481,7 @@ fn apply_tone_automation(stage: &mut PreStage, base: &[Channel], automation: &[T
             let Some(channel) = stage.channel_mut(target.channel) else { continue };
             match a.shape {
                 ToneShape::Gain => {
-                    channel.gain *= libm::pow(10.0, (gain_db - a.a.gain_db) / 20.0);
+                    channel.sections[target.section] = super::tone::gain_section(gain_db);
                 }
                 ToneShape::Peak | ToneShape::LegacyPeak | ToneShape::LowShelf | ToneShape::HighShelf => {
                     let section = match a.shape {
@@ -1341,8 +1348,8 @@ mod tests {
         c.set_param(GraphParam::VolumeScalar, 0.35);
         let ch = tone_channel(&c);
         let dc_db = 20.0 * libm::log10(ch.magnitude(0.0, fs));
-        // the matched-Z shelf's DC gain is exact to about 1e-7 dB
-        assert!((dc_db - 10.5).abs() < 1e-6, "{dc_db}");
+        // the matched-Z shelf's DC gain, to within its Float32 words
+        assert!((dc_db - 10.5).abs() < 1e-3, "{dc_db}");
         // Halfway from A to M: gain is halfway in dB, frequency is the
         // geometric mean. A Butterworth-shaped shelf is half its gain there.
         let f = libm::sqrt(100.0 * 200.0);
@@ -1351,7 +1358,7 @@ mod tests {
 
         c.set_param(GraphParam::VolumeScalar, -10.0);
         let below = 20.0 * libm::log10(tone_channel(&c).magnitude(0.0, fs));
-        assert!((below - 12.0).abs() < 1e-6, "{below}");
+        assert!((below - 12.0).abs() < 1e-3, "{below}");
         c.set_param(GraphParam::VolumeScalar, 10.0);
         assert!(tone_channel(&c).magnitude(0.0, fs).log10().abs() < 1e-10);
     }
