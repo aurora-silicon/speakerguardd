@@ -307,6 +307,10 @@ on the J413. A boot that has a valid record only checks the binding.
    build (including LSID when present).
 3. Confirm the amp count has an LV2 variant (1, 2, 4 or 6), and the speaker
    link's CPU DAI driver is in `wiring.py` TRANSPORTS.
+   If the kernel lifts the speaker under the lease only to a fixed ceiling
+   below 0 dB (`macaudio` spk_fixed_ceiling: the J873g), add that ceiling to
+   `gate.json` `operating_volume_db`. The self-check records it, and the
+   supervisor grants only while every amp sits exactly there.
 4. The installer collects the tuning on this Mac's own macOS with board and
    unit provenance. Provisioning compiles and binds it, the first-boot
    silent self-check derives and proves the wiring, and the graph is

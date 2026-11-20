@@ -63,13 +63,30 @@ pub struct Expect {
     pub fixed_full_scale_mv: u32,
     /// The front-end the speaker mux must select: the watched PCM's id.
     pub route: String,
+    /// The volume every amp must show while granted, cdB on the control's
+    /// own TLV: 0 dB, or the board's fixed ceiling from the self-check's
+    /// record (`volume_cdb`, the J873g's -16 dB). Anything else latches.
+    pub volume_cdb: i32,
 }
 
 impl Expect {
     pub fn new(machine: &Machine, full_scale_mv: Vec<u32>, route: &str) -> Self {
         let fixed_full_scale_mv =
             if machine.amp.has_gain_control() { 0 } else { full_scale_mv.iter().copied().min().unwrap_or(0) };
-        Expect { amps: machine.amps, amp: machine.amp, full_scale_mv, fixed_full_scale_mv, route: route.to_owned() }
+        Expect {
+            amps: machine.amps,
+            amp: machine.amp,
+            full_scale_mv,
+            fixed_full_scale_mv,
+            route: route.to_owned(),
+            volume_cdb: 0,
+        }
+    }
+
+    /// The same, for a board whose grant holds its amps at a fixed ceiling
+    /// below 0 dB (the self-check record's `volume_cdb`).
+    pub fn with_volume_cdb(self, volume_cdb: i32) -> Self {
+        Expect { volume_cdb, ..self }
     }
 }
 
@@ -140,6 +157,14 @@ impl Supervisor {
     /// value that is 0 dB is the driver's scale, read from the card, not
     /// a number kept here. A volume without a dB scale is not proven to be
     /// at the operating point, and latches like a wrong one.
+    ///
+    /// A board whose kernel lifts the speaker only to a fixed ceiling under
+    /// the lease (macaudio's spk_fixed_ceiling, the J873g) has that ceiling
+    /// as its operating volume (`Expect::volume_cdb`, from the self-check's
+    /// record): its hard cap. The amps must sit exactly there, so a kernel
+    /// that put them louder, or anywhere else, latches. The operating
+    /// point is still the amp gain's full scale: the model is computed for
+    /// that drive, which is the ceiling's dB more than the speaker gets.
     fn volume_problem(&self, kernel: &mut dyn Kernel) -> Result<Option<String>, KernelError> {
         let x = &self.expect;
         let v = kernel.levels(x.amp.volume_suffix())?;
@@ -147,9 +172,15 @@ impl Supervisor {
         if v.len() != n {
             return Ok(Some(format!("granted, but {} of {n} amp volumes", v.len())));
         }
-        Ok(v.iter()
-            .find(|l| l.centi_db != Some(0))
-            .map(|l| format!("granted, but {} is at {} ({:?} cdB), not 0 dB", l.amp, l.value, l.centi_db)))
+        Ok(v.iter().find(|l| l.centi_db != Some(x.volume_cdb)).map(|l| {
+            format!(
+                "granted, but {} is at {} ({:?} cdB), not {} dB",
+                l.amp,
+                l.value,
+                l.centi_db,
+                f64::from(x.volume_cdb) / 100.0
+            )
+        }))
     }
 
     pub fn tick(&mut self, obs: Observation, kernel: &mut dyn Kernel) -> Result<Event, Fatal> {
@@ -429,6 +460,44 @@ mod tests {
             assert!(matches!(s.tick(CLEAN, &mut k), Ok(Event::HardFault(_))), "{held:?}");
             assert!(!k.held);
         }
+    }
+
+    /// The J873g's shape: one SN012776 whose kernel lifts it under the
+    /// lease only to its fixed ceiling, -16 dB on the DVC (raw 169), and a
+    /// blob for amp gain 15 (11.89 V peak).
+    #[test]
+    fn a_fixed_ceiling_board_grants_only_at_its_ceiling() {
+        let m = &Machine { board: "j873g", card_id: "AppleJ873", amps: 1, amp: Amp::Sn012776 };
+        let card = |held: crate::kernel::Level| {
+            let mut k = Recorder::healthy(1);
+            k.volume = Some(("Speaker Volume".into(), held, (1, Some(-10000))));
+            k
+        };
+        let expect = || Expect::new(m, vec![11_890], "Secondary").with_volume_cdb(-1600);
+        let mut k = card((169, Some(-1600)));
+        let mut s = Supervisor::new(expect());
+        assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::StayedReleased));
+        assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Granted));
+        assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Renewed));
+        // granted above the ceiling (0 dB, the unlocked level of other
+        // boards), just above it, below it, or without a dB scale: latched
+        for held in [(201, Some(0)), (170, Some(-1550)), (168, Some(-1650)), (169, None)] {
+            let mut k = card(held);
+            let mut s = Supervisor::new(expect());
+            s.tick(CLEAN, &mut k).unwrap();
+            assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Granted), "{held:?}");
+            match s.tick(CLEAN, &mut k) {
+                Ok(Event::HardFault(why)) => assert!(why.contains("not -16 dB"), "{held:?}: {why}"),
+                e => panic!("{held:?}: {e:?}"),
+            }
+            assert!(!k.held, "{held:?}");
+        }
+        // without the record's ceiling the same card at -16 dB latches too
+        let mut k = card((169, Some(-1600)));
+        let mut s = Supervisor::new(Expect::new(m, vec![11_890], "Secondary"));
+        s.tick(CLEAN, &mut k).unwrap();
+        assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Granted));
+        assert!(matches!(s.tick(CLEAN, &mut k), Ok(Event::HardFault(_))));
     }
 
     #[test]

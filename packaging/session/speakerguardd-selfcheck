@@ -862,6 +862,10 @@ def lv2_shadows(users=None, etc="/etc", environ=None):
 def bind_lines(rec):
     keys = ["schema", "version", "result", "board", "kernel", "params_sha256", "wiring", "card", "amps", "sense", "family", "key", "method"]
     out = [f"{k}={rec[k]}" for k in keys]
+    # 0 dB, every board but a fixed-ceiling one, is the line's absence: the
+    # supervisor reads a missing volume_cdb as 0
+    if rec.get("volume_cdb"):
+        out.append(f"volume_cdb={rec['volume_cdb']}")
     if rec["reasons"]:
         out.append("reason=" + rec["reasons"][0].replace("\n", " "))
     return "\n".join(out) + "\n"
@@ -954,7 +958,7 @@ def run_locked(args):
     rec = {
         "schema": 1, "version": VERSION, "result": "fail", "board": "-", "kernel": kernel,
         "params_sha256": "-", "wiring": "-", "card": "-", "amps": 0, "sense": 0, "family": "-", "key": "-",
-        "method": "-", "reasons": [], "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "method": "-", "volume_cdb": 0, "reasons": [], "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
     report = {"record": rec}
     errs = []
@@ -972,12 +976,24 @@ def run_locked(args):
         report["machine"] = desc
         rec.update(board=hw["board"], wiring=w["hash"], amps=len(w["amps"]), sense=len(w["sense"]),
                    family=w["family"], key=w["key"], method=w["method"])
+        # The volume a grant holds this board's amps at, below 0 dB only on a
+        # board whose kernel lifts the speaker to a fixed ceiling (gate.json
+        # operating_volume_db): the supervisor grants at exactly that volume.
+        import gen
+
+        try:
+            rec["volume_cdb"] = round(100 * gen.operating_volume_db(hw["board"]))
+        except (wiring.Refused, OSError, ValueError) as e:
+            errs.append(f"gate.json: {e}")
         report["wiring"] = w
         old = read_bind(bind_path)
         if (
             not args.force and not errs
             and old.get("result") == "pass" and old.get("version") == str(VERSION)
             and all(old.get(k) == str(rec[k]) for k in ("board", "kernel", "params_sha256", "wiring"))
+            # a record from before the board's fixed volume (or of another one)
+            # is checked again
+            and old.get("volume_cdb", "0") == str(rec["volume_cdb"])
             # the graph is generated from the record: a bind without its
             # record (lost or removed) is checked again, not reused
             and report_matches(report_path, old)

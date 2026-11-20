@@ -934,6 +934,69 @@ class NoSensePath(unittest.TestCase):
         self.assertEqual(wiring.derive(got, j773g()["tuning"])["hash"], "d1d62e8a0aaaef3d")
 
 
+
+def j873g(names=("cout", "cin", "spkr", "sense")):
+    """The M6 Mac mini (J873g) as its device tree describes it: one SN012776
+    (ti,vmon-slot-no 0, ti,imon-slot-no 2, no sound-name-prefix) behind the
+    T8152 AOP, whose node names the shared driver's four channels, sense
+    included, and the J473's atsp mono tuning (the J873's AID48 is atsp
+    too)."""
+    f = fx("j473")
+    h = f["hw"]
+    h.update(board="j873g", compatible=["apple,j873g", "apple,t8152", "apple,arm-platform"],
+             sound_compatible=["apple,j873-macaudio", "apple,macaudio"], model="Mac mini J873")
+    link = next(l for l in h["links"] if l["name"] == "Speaker")
+    link["cpu_compatible"] = [["apple,t8152-aop-audio"]]
+    link["cpu_dma_names"] = [list(names) if names is not None else None]
+    link["codecs"] = [{"node": "soc/i2c@33101c000/codec@38", "compatible": ["ti,sn012776", "ti,tas2764"],
+                       "vmon": 0, "imon": 2, "i2c": "1-0038"}]
+    return f
+
+
+class T8152NoSense(unittest.TestCase):
+    """The T8152 AOP's speaker stream sends nothing back (HW_CFG_T8152): the
+    J873g's one SN012776 is wired without sense whatever its node's
+    dma-names say, and proven like the J773g's."""
+
+    def test_j873g_derives_without_sense(self):
+        for names in (("cout", "cin", "spkr", "sense"), ("cout", "cin", "spkr"), None):
+            f = j873g(names)
+            self.assertFalse(wiring.transport_senses(f["hw"]), names)
+            w = wiring.derive(f["hw"], f["tuning"])
+            c = wiring.describe(f["hw"], w)
+            self.assertTrue(w["no_sense_path"], names)
+            self.assertEqual((w["family"], w["unit_kind"], w["unit_channels"], w["sense"]),
+                             ("sn012776", "atsp", [0], []), names)
+            self.assertEqual((c["transport"], c["plugin"], c["sense"], c["alsa_format"], c["speaker_pcm"]),
+                             ("aop-t8152", "1ch", 0, "S24_LE", 1), names)
+            self.assertFalse(c["speaker_irq"], names)
+            self.assertEqual(sgsc.method_of(w), "derived-nosense", names)
+            # one full-range amp on slot 0 without sense: the J773g's map
+            self.assertEqual(w["hash"], "d1d62e8a0aaaef3d", names)
+
+    def test_sense_units_and_several_amps_are_refused(self):
+        f = j873g()
+        f["tuning"]["tuning"]["protection"]["kind"] = "spp3"
+        with self.assertRaises(wiring.Refused) as cm:
+            wiring.derive(f["hw"], f["tuning"])
+        self.assertIn("carries none", str(cm.exception))
+        f = j873g()
+        link = next(l for l in f["hw"]["links"] if l["name"] == "Speaker")
+        link["codecs"] = [dict(link["codecs"][0], prefix=p) for p in ("Left Speaker", "Right Speaker")]
+        with self.assertRaises(wiring.Refused) as cm:
+            wiring.derive(f["hw"], f["tuning"])
+        self.assertIn("one amp only", str(cm.exception))
+
+    def test_t8142_keeps_its_sense_before_the_t8152_fallback(self):
+        # The J815's node lists "apple,t8142-aop-audio" first and the T8152
+        # compatible as its fallback: the T8142 transport, with its sense.
+        f = fx("j815")
+        self.assertTrue(wiring.transport_senses(f["hw"]))
+        w = wiring.derive(f["hw"], f["tuning"])
+        self.assertEqual((w["no_sense_path"], len(w["sense"]), w["hash"]), (False, 12, "725f518662e42388"))
+        self.assertEqual(wiring.describe(f["hw"], w)["transport"], "aop-dma")
+
+
 class NoHandMap(unittest.TestCase):
     """There is no hand map to fall back on: a Mac whose wiring the
     derivation cannot read fails the self-check."""
@@ -1282,6 +1345,100 @@ class Record(unittest.TestCase):
         self.assertEqual(len([l for l in lines if l.startswith("reason=")]), 1)
         self.assertTrue(all("=" in l for l in lines))
 
+
+    def test_a_fixed_ceiling_board_records_its_volume(self):
+        # 0 dB is no line (the supervisor reads its absence as 0); the
+        # J873g's -16 dB ceiling is volume_cdb=-1600
+        rec = {"schema": 1, "version": 3, "result": "pass", "board": "j873g", "kernel": "k", "params_sha256": "ab",
+               "wiring": "d1d62e8a0aaaef3d", "card": "AppleJ873", "amps": 1, "sense": 0, "family": "sn012776",
+               "key": "j873", "method": "derived-nosense", "reasons": []}
+        self.assertFalse(any(l.startswith("volume_cdb=") for l in sgsc.bind_lines(rec).splitlines()))
+        self.assertFalse(any(l.startswith("volume_cdb=") for l in sgsc.bind_lines(dict(rec, volume_cdb=0)).splitlines()))
+        lines = sgsc.bind_lines(dict(rec, volume_cdb=-1600)).splitlines()
+        self.assertEqual([l for l in lines if l.startswith("volume_cdb=")], ["volume_cdb=-1600"])
+
+
+class OperatingVolume(unittest.TestCase):
+    """gate.json operating_volume_db: the volume a grant holds a board's
+    amps at, below 0 dB only where the kernel lifts the speaker to a fixed
+    ceiling (the J873g), and the supervisor's hard cap for that board."""
+
+    def test_shipped_gate(self):
+        self.assertEqual(gen.operating_volume_db("j873g"), -16.0)
+        for board in ("j316s", "j413", "j616s", "j700", "j773g", "j813", "j815"):
+            self.assertEqual(gen.operating_volume_db(board), 0.0, board)
+        self.assertEqual(round(100 * gen.operating_volume_db("j873g")), -1600)
+
+    def test_malformed_values_refuse_the_board(self):
+        for v in (1.0, 0.5, -40.5, True, "-16", None, [-16]):
+            with self.assertRaises(wiring.Refused, msg=repr(v)):
+                gen.operating_volume_db("j873g", {"operating_volume_db": {"j873g": v}})
+        with self.assertRaises(wiring.Refused):
+            gen.operating_volume_db("j873g", {"operating_volume_db": [-16]})
+        self.assertEqual(gen.operating_volume_db("j873g", {}), 0.0)
+        self.assertEqual(gen.operating_volume_db("j873g", {"operating_volume_db": {"j873g": -40}}), -40.0)
+
+
+class ProtectHighpass(unittest.TestCase):
+    """gate.json protect_highpass: the J873g's 4th-order Butterworth at
+    100 Hz (asahi-audio#28) in the protect stage, ahead of its unit."""
+
+    @staticmethod
+    def conf(f):
+        w = wiring.derive(f["hw"], f["tuning"])
+        c = wiring.describe(f["hw"], w)
+        return gen.pipewire_conf(c["key"], c, (w["unit_channels"], w["sense_ports"], w["hash"]))
+
+    def test_shipped_gate(self):
+        self.assertEqual(gen.protect_highpass("j873g"), (100.0, 4))
+        for board in ("j316s", "j413", "j473", "j616s", "j700", "j773g", "j813", "j815"):
+            self.assertIsNone(gen.protect_highpass(board), board)
+
+    def test_j873g_protect_stage(self):
+        text = self.conf(j873g())
+        self.assertIn('{ type = builtin name = hp0s0 label = bq_highpass control = { "Freq" = 100.0 "Q" = 1.306562965 } }', text)
+        self.assertIn('{ type = builtin name = hp0s1 label = bq_highpass control = { "Freq" = 100.0 "Q" = 0.541196100 } }', text)
+        self.assertIn('{ output = "hp0s0:Out" input = "hp0s1:In" }', text)
+        self.assertIn('{ output = "hp0s1:Out" input = "sgv2:in_0" }', text)
+        self.assertIn('inputs  = [ "hp0s0:In" ]', text)
+        self.assertIn('outputs = [ "sgv2:out_0" ]', text)
+        # nothing else of the stage moves: without the gate entry it is the
+        # stage every other board gets
+        with mock.patch.object(gen, "protect_highpass", return_value=None):
+            plain = self.conf(j873g())
+        self.assertNotIn("bq_highpass", plain)
+        self.assertNotIn("links", plain[plain.index("filter.graph"):plain.index("capture.props")])
+        self.assertIn('inputs  = [ "sgv2:in_0" ]', plain)
+        self.assertNotIn("bq_highpass", self.conf(j773g()))
+
+    def test_the_cascade_is_asahi_audio_28s_response(self):
+        # RBJ bq_highpass sections at the generated Q, 48 kHz: the response
+        # asahi-audio#28 recorded on the J873g, and never above 0 dB
+        import cmath
+        import math
+
+        hz, order = gen.protect_highpass("j873g")
+
+        def db(f):
+            h = 1
+            for q in gen.butterworth_q(order):
+                w0 = 2 * math.pi * hz / 48000
+                a, cw = math.sin(w0) / (2 * q), math.cos(w0)
+                z = cmath.exp(-2j * math.pi * f / 48000)
+                h *= ((1 + cw) / 2 * (1 - 2 * z + z * z)) / ((1 + a) - 2 * cw * z + (1 - a) * z * z)
+            return 20 * math.log10(abs(h))
+
+        for f, want in ((30, -41.8), (50, -24.1), (70, -12.6), (100, -3.0)):
+            self.assertAlmostEqual(db(f), want, delta=0.1, msg=f)
+        self.assertLess(max(db(f) for f in range(10, 24000, 10)), 1e-6)
+
+    def test_malformed_entries_refuse(self):
+        for hp in ({"hz": 100.0}, {"hz": 100.0, "order": 3}, {"hz": 100.0, "order": 10}, {"hz": 10.0, "order": 4},
+                   {"hz": 2000.0, "order": 4}, {"hz": True, "order": 4}, {"hz": 100.0, "order": 4.0},
+                   {"hz": 100.0, "order": 4, "q": 0.7}, [100.0, 4], "100"):
+            with self.assertRaises(ValueError, msg=repr(hp)):
+                gen.protect_highpass("j873g", {"protect_highpass": {"j873g": hp}})
+        self.assertIsNone(gen.protect_highpass("j873g", {}))
 
 class BoundRecord(unittest.TestCase):
     """A bound pass is reused only with its record (the graph is generated
