@@ -1378,6 +1378,68 @@ class OperatingVolume(unittest.TestCase):
         self.assertEqual(gen.operating_volume_db("j873g", {}), 0.0)
         self.assertEqual(gen.operating_volume_db("j873g", {"operating_volume_db": {"j873g": -40}}), -40.0)
 
+
+class ProtectHighpass(unittest.TestCase):
+    """gate.json protect_highpass: the J873g's 4th-order Butterworth at
+    100 Hz (asahi-audio#28) in the protect stage, ahead of its unit."""
+
+    @staticmethod
+    def conf(f):
+        w = wiring.derive(f["hw"], f["tuning"])
+        c = wiring.describe(f["hw"], w)
+        return gen.pipewire_conf(c["key"], c, (w["unit_channels"], w["sense_ports"], w["hash"]))
+
+    def test_shipped_gate(self):
+        self.assertEqual(gen.protect_highpass("j873g"), (100.0, 4))
+        for board in ("j316s", "j413", "j473", "j616s", "j700", "j773g", "j813", "j815"):
+            self.assertIsNone(gen.protect_highpass(board), board)
+
+    def test_j873g_protect_stage(self):
+        text = self.conf(j873g())
+        self.assertIn('{ type = builtin name = hp0s0 label = bq_highpass control = { "Freq" = 100.0 "Q" = 1.306562965 } }', text)
+        self.assertIn('{ type = builtin name = hp0s1 label = bq_highpass control = { "Freq" = 100.0 "Q" = 0.541196100 } }', text)
+        self.assertIn('{ output = "hp0s0:Out" input = "hp0s1:In" }', text)
+        self.assertIn('{ output = "hp0s1:Out" input = "sgv2:in_0" }', text)
+        self.assertIn('inputs  = [ "hp0s0:In" ]', text)
+        self.assertIn('outputs = [ "sgv2:out_0" ]', text)
+        # nothing else of the stage moves: without the gate entry it is the
+        # stage every other board gets
+        with mock.patch.object(gen, "protect_highpass", return_value=None):
+            plain = self.conf(j873g())
+        self.assertNotIn("bq_highpass", plain)
+        self.assertNotIn("links", plain[plain.index("filter.graph"):plain.index("capture.props")])
+        self.assertIn('inputs  = [ "sgv2:in_0" ]', plain)
+        self.assertNotIn("bq_highpass", self.conf(j773g()))
+
+    def test_the_cascade_is_asahi_audio_28s_response(self):
+        # RBJ bq_highpass sections at the generated Q, 48 kHz: the response
+        # asahi-audio#28 recorded on the J873g, and never above 0 dB
+        import cmath
+        import math
+
+        hz, order = gen.protect_highpass("j873g")
+
+        def db(f):
+            h = 1
+            for q in gen.butterworth_q(order):
+                w0 = 2 * math.pi * hz / 48000
+                a, cw = math.sin(w0) / (2 * q), math.cos(w0)
+                z = cmath.exp(-2j * math.pi * f / 48000)
+                h *= ((1 + cw) / 2 * (1 - 2 * z + z * z)) / ((1 + a) - 2 * cw * z + (1 - a) * z * z)
+            return 20 * math.log10(abs(h))
+
+        for f, want in ((30, -41.8), (50, -24.1), (70, -12.6), (100, -3.0)):
+            self.assertAlmostEqual(db(f), want, delta=0.1, msg=f)
+        self.assertLess(max(db(f) for f in range(10, 24000, 10)), 1e-6)
+
+    def test_malformed_entries_refuse(self):
+        for hp in ({"hz": 100.0}, {"hz": 100.0, "order": 3}, {"hz": 100.0, "order": 10}, {"hz": 10.0, "order": 4},
+                   {"hz": 2000.0, "order": 4}, {"hz": True, "order": 4}, {"hz": 100.0, "order": 4.0},
+                   {"hz": 100.0, "order": 4, "q": 0.7}, [100.0, 4], "100"):
+            with self.assertRaises(ValueError, msg=repr(hp)):
+                gen.protect_highpass("j873g", {"protect_highpass": {"j873g": hp}})
+        self.assertIsNone(gen.protect_highpass("j873g", {}))
+
 class BoundRecord(unittest.TestCase):
     """A bound pass is reused only with its record (the graph is generated
     from it): a bind without one is checked again (11-07: a removed
