@@ -295,8 +295,8 @@ def audio_stack(sound, root="/proc/device-tree", modules="/sys/module"):
     words on this boot, beyond the kernel release: the speaker card's node
     `sound` (relative to `root`, with everything under it), the nodes its
     links' `sound-dai` lists point at (the serializer and amp nodes, their
-    own properties), and the srcversion of every loaded sound module (and
-    of the AOP core). A
+    own properties), and the build ID of every loaded sound module (and of
+    the AOP core). A
     rebuilt module or a changed device tree under the same release (the
     J615's MCA receiver moved one bit clock by a module and a DT property)
     changes it. "-" when `sound` is not in the tree."""
@@ -342,12 +342,15 @@ def audio_stack(sound, root="/proc/device-tree", modules="/sys/module"):
         # sense rings run through (not its sensor clients)
         if not (m.startswith("snd") or m == "aop"):
             continue
-        try:
-            with open(os.path.join(modules, m, "srcversion")) as f:
-                v = f.read().strip()
-        except OSError:
-            v = "-"
-        h.update(f"module {m} {v}\0".encode())
+        h.update(f"module {m}\0".encode())
+        # the loaded binary: its GNU build ID note (srcversion exists only
+        # for modules with a MODULE_VERSION or CONFIG_MODULE_SRCVERSION_ALL)
+        for f in ("notes/.note.gnu.build-id", "srcversion"):
+            try:
+                h.update(_read(os.path.join(modules, m, f)))
+            except OSError:
+                h.update(b"-")
+            h.update(b"\0")
     return h.hexdigest()[:16]
 
 

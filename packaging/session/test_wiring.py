@@ -1320,10 +1320,10 @@ class AudioStack(unittest.TestCase):
         node("sound/dai-link@0", {"link-name": b"Speakers\0"})
         node("sound/dai-link@0/cpu", {"sound-dai": be(1, 0)})
         node("sound/dai-link@0/codec", {"sound-dai": be(2)})
-        for m, v in (("snd_soc_apple_mca", "AAAA"), ("snd_soc_macaudio", "BBBB"), ("nvme", "CCCC")):
-            os.makedirs(os.path.join(mods, m))
-            with open(os.path.join(mods, m, "srcversion"), "w") as f:
-                f.write(v + "\n")
+        for m, v in (("snd_soc_apple_mca", b"\xaa" * 20), ("snd_soc_macaudio", b"\xbb" * 20), ("nvme", b"\xcc" * 20)):
+            os.makedirs(os.path.join(mods, m, "notes"))
+            with open(os.path.join(mods, m, "notes", ".note.gnu.build-id"), "wb") as f:
+                f.write(b"\x04\0\0\0\x14\0\0\0\x03\0\0\0GNU\0" + v)
         return root, mods
 
     def test_what_changes_the_fingerprint(self):
@@ -1340,17 +1340,24 @@ class AudioStack(unittest.TestCase):
             # unrelated: another node, another module
             with open(os.path.join(root, "soc/gpu@0/status"), "wb") as f:
                 f.write(b"okay\0")
-            with open(os.path.join(mods, "nvme", "srcversion"), "w") as f:
-                f.write("DDDD\n")
+            with open(os.path.join(mods, "nvme", "notes", ".note.gnu.build-id"), "ab") as f:
+                f.write(b"\xdd")
             self.assertEqual(fp(), base)
             # the serializer node a link points at (the J615's receiver delay)
             with open(os.path.join(root, "soc/i2s@2a3400000/apple,rx-delay-bclks"), "wb") as f:
                 f.write(bytes.fromhex("00000001000000010000000000000000"))
             with_prop = fp()
             self.assertNotEqual(with_prop, base)
-            # a rebuilt sound module under the same kernel release
+            # a rebuilt sound module under the same kernel release (its
+            # build ID; srcversion where the module has one)
+            with open(os.path.join(mods, "snd_soc_apple_mca", "notes", ".note.gnu.build-id"), "r+b") as f:
+                f.seek(16)
+                f.write(b"\xee" * 20)
+            rebuilt_id = fp()
+            self.assertNotEqual(rebuilt_id, with_prop)
             with open(os.path.join(mods, "snd_soc_apple_mca", "srcversion"), "w") as f:
                 f.write("EEEE\n")
+            self.assertNotEqual(fp(), rebuilt_id)
             rebuilt = fp()
             self.assertNotEqual(rebuilt, with_prop)
             # an amp node a link points at
